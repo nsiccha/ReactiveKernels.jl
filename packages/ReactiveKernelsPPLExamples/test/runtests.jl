@@ -28,6 +28,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     GLMM1ModelExample, Bym2OffsetOnlyExample, BonesModelExample, MultiOccupancyExample
 using Test
 
+include(joinpath(@__DIR__, "..", "..", "..", "test", "test_native_ode.jl"))
 include("test_gp_first_use.jl")
 include("test_startup_initialization.jl")
 include("test_ppl_workflow.jl")
@@ -148,11 +149,15 @@ include("test_glmm1_model_example.jl")
 include("test_bym2_offset_only_example.jl")
 include("test_bones_model_example.jl")
 include("test_multi_occupancy_example.jl")
-# posteriordb dynamics batch (four models; lotka unblocked by core fix 96eaf14d)
+# posteriordb dynamics batch (three models; lotka unblocked by core fix 96eaf14d)
 include("test_lotka_volterra_example.jl")
 include("test_sir_example.jl")
-include("test_one_comp_mm_elim_abs_example.jl")
 include("test_soil_incubation_example.jl")
+# posteriordb structured batch
+include("test_hmm_drive_1_example.jl")
+include("test_hmm_drive_0_example.jl")
+include("test_grsm_latent_reg_irt_example.jl")
+include("test_kronecker_gp_example.jl")
 include("test_ppl_macro.jl")
 include("test_ppl_posteriordb_parity.jl")
 include("test_ppl_gibbs.jl")

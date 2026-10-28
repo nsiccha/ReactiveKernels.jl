@@ -291,6 +291,43 @@ end
         @test RKS._kernel_stmt_method_form(:((a, b) = f(x))) === nothing
     end
 
+    @testset "pure-endpoint straightness: authored plate cells are RK subgraphs" begin
+        straight = RKS._kernel_endpoint_has_nonstraight
+        # A `plate(...) do` cell is lowered by the recipe pass, not an opaque
+        # closure: it keeps the method a pure endpoint (lazy `?:` inside).
+        @test !straight(:(plate(y, eta) do observed, e
+            cell::Float64 = observed == 1 ? log(cuts[1] - e) : log(cuts[observed] - e)
+            cell
+        end))
+        @test !straight(:(ReactiveKernels.plate(y, mu) do observed, m
+            observed - m
+        end))
+        # Control flow inside the cell, or in a threaded argument, is still
+        # control flow; an ordinary closure or another do-block stays opaque.
+        @test straight(:(plate(y, eta) do observed, e
+            for i in 1:3; e = e + i; end
+            e
+        end))
+        @test straight(:(plate(map(x -> x + 1, y), eta) do observed, e
+            observed - e
+        end))
+        @test straight(:(mapreduce(y, eta) do observed, e
+            observed - e
+        end))
+        @test straight(:(map(x -> x + 1, y)))
+        # A `let` only scopes its bindings; what it contains still decides.
+        @test !straight(:(observed == 0 ? let a = n * x, b = a + 1
+            a <= 700 ? log(b) : a
+        end : 0.0))
+        @test straight(:(let a = x
+            if a > 0; a = 1.0; end
+            a
+        end))
+        @test straight(:(let f = y -> y + 1
+            f(x)
+        end))
+    end
+
     @testset "(1)+(2) short/long extraction with kwargs/typed/where/return-ann" begin
         ms = RKS.kernel_methods(StatefulSigFixture)
         @test length(ms) == 3
@@ -875,7 +912,12 @@ end
         # unchanged by the stateful routing guard. Compare the macro's expansion to
         # the stateless helper's output built from the SAME parsed definition parts,
         # with line numbers stripped and per-expansion gensym counters normalized.
-        norm(ex) = replace(string(Base.remove_linenums!(deepcopy(ex))), r"#\d+" => "#N")
+        # Generated source retains its lexical Module as an identity-bearing
+        # quoted leaf. Copy only AST nodes before stripping their line numbers.
+        copy_ast(ex) = ex
+        copy_ast(ex::Expr) = Expr(ex.head, map(copy_ast, ex.args)...)
+        copy_ast(ex::QuoteNode) = QuoteNode(copy_ast(ex.value))
+        norm(ex) = replace(string(Base.remove_linenums!(copy_ast(ex))), r"#\d+" => "#N")
         def = :(plain(f, x) = begin
             y = f(x)
         end)
@@ -883,7 +925,7 @@ end
             y = f(x)
         end
         nm, inp, sig, posn, rawsig, blk = RKS._kernel_definition_parts(def)
-        ref = Expr(:(=), nm, RKS._kernel_expand(blk, inp, sig))
+        ref = Expr(:(=), nm, RKS._kernel_expand(blk, inp, sig, @__MODULE__))
         @test norm(actual) == norm(ref)
         # and no stateful codegen leaked into the methodless expansion
         @test !occursin("_StatefulKernelSkeleton", string(actual))

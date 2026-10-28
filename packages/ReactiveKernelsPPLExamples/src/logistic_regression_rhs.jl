@@ -88,10 +88,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     parameters = (; beta0, z, tau, lambda, caux)
     (parameters, log_jacobian::Float64) =
         ((; beta0, z, tau, lambda, caux), log_tau + sum_log_lambda + log_caux)
-    (beta0::Float64, z::AbstractVector{Float64}, tau::Float64,
-     lambda::Vector{Float64}, caux::Float64) =
-        (parameters.beta0, parameters.z, parameters.tau, parameters.lambda,
-         parameters.caux)
 
     # Regularized-horseshoe transformed coefficients (Stan `transformed
     # parameters`): the slab width c, the truncated local scale lambda_tilde, and

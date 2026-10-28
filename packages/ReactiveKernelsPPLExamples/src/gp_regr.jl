@@ -49,8 +49,6 @@ _gp_regr_sq_dist(x::Vector{Float64}) =
     # expose its components — so a query can start from `parameters` (constrained
     # space) as well as from `unconstrained`.
     parameters = (; rho, alpha, sigma)
-    (rho::Float64, alpha::Float64, sigma::Float64) =
-        (parameters.rho, parameters.alpha, parameters.sigma)
 
     # gp_exp_quad_cov(x, alpha, rho) + diag_matrix(rep_vector(sigma, N)):
     # K[i,j] = alpha^2 · exp(-0.5 · (x_i - x_j)^2 / rho^2), with the `sigma`

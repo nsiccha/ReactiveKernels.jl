@@ -58,11 +58,6 @@ using LogExpFunctions: logistic, log1pexp
     (parameters, log_jacobian::Float64) =
         ((; a, b, mu_a, mu_b, sigma_a, sigma_b, sigma_y),
          jac_sigma_a + jac_sigma_b + jac_sigma_y)
-    (a::AbstractVector{Float64}, b::AbstractVector{Float64},
-     mu_a::Float64, mu_b::Float64,
-     sigma_a::Float64, sigma_b::Float64, sigma_y::Float64) =
-        (parameters.a, parameters.b, parameters.mu_a, parameters.mu_b,
-         parameters.sigma_a, parameters.sigma_b, parameters.sigma_y)
 
     # Hyperpriors: mu_a ~ Normal(0, 1), mu_b ~ Normal(0, 1). The three sigmas
     # have NO `~` statement (implicit uniform over [0, 100]); an unwritten prior

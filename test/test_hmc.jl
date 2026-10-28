@@ -4,6 +4,7 @@ using LinearAlgebra
 using Random
 using ReactiveKernels
 using ReactiveKernelsNUTSExamples
+using SHA
 using StableRNGs
 using Statistics
 using Test
@@ -214,6 +215,37 @@ end
         length(first_chain.diagnostics)
 end
 
+function _hmc_eight_schools_fixture(model, observations, scales, log_tau_index)
+    kernel = prepare(
+        model.graph;
+        have = (model.unconstrained, model.observations, model.observation_scales),
+        want = (model.posterior,),
+    )
+    initial = zeros(length(observations) + 2)
+    initial[log_tau_index] = log(5.0)
+    ad = prepare_ad(
+        kernel, _HMC_ENZYME_BACKEND, copy(initial), observations, scales;
+        active = :unconstrained,
+    )
+    (; kernel, initial, ad)
+end
+
+function _hmc_quality_hashes(chain, seed)
+    # Hash independent controls, not draws from the sampler's live RNG. A
+    # recurrence can distinguish a changed draw tape from a changed trajectory.
+    uniform = rand(StableRNG(seed), 512)
+    normal = randn(StableRNG(seed), 512)
+    transitions = IOBuffer()
+    for diagnostic in chain.diagnostics
+        write(transitions, Int64(diagnostic.depth), Int64(diagnostic.n_steps),
+              Float64(diagnostic.energy_error), Float64(diagnostic.acceptance_rate),
+              UInt8(diagnostic.diverged))
+    end
+    digest(values) = bytes2hex(sha256(reinterpret(UInt8, vec(values))))
+    (; uniform = digest(uniform), normal = digest(normal),
+       samples = digest(chain.samples), transitions = bytes2hex(sha256(take!(transitions))))
+end
+
 @testset "eight-schools graph and DI+Enzyme inside NUTS" begin
     if !isdefined(Main, :ReactiveKernelsPPLExamples)
         if samefile(Base.active_project(), joinpath(@__DIR__, "..", "Project.toml"))
@@ -222,17 +254,51 @@ end
         end
         Base.eval(Main, :(using ReactiveKernelsPPLExamples))
     end
-    eight_schools = Main.ReactiveKernelsPPLExamples.EightSchoolsExample
-    model = eight_schools.build_eight_schools_graph()
-    observations = eight_schools.EIGHT_SCHOOLS_Y
-    scales = eight_schools.EIGHT_SCHOOLS_SIGMA
-    density_kernel = prepare(
-        model.graph;
-        have = (
-            model.unconstrained, model.observations, model.observation_scales,
-        ),
-        want = (model.posterior,),
+    centered_example = Main.ReactiveKernelsPPLExamples.EightSchoolsExample
+    noncentered_example = Main.ReactiveKernelsPPLExamples.EightSchoolsNoncenteredExample
+    observations = centered_example.EIGHT_SCHOOLS_Y
+    scales = centered_example.EIGHT_SCHOOLS_SIGMA
+    n_schools = length(observations)
+    @test observations == noncentered_example.ES_NC_Y
+    @test scales == noncentered_example.ES_NC_SIGMA
+    centered = _hmc_eight_schools_fixture(
+        centered_example.build_eight_schools_graph(), observations, scales, 2,
     )
+    noncentered = _hmc_eight_schools_fixture(
+        noncentered_example.build_eight_schools_noncentered_graph(),
+        observations, scales, n_schools + 2,
+    )
+
+    @testset "centered and noncentered density/gradient parity" begin
+        centered_gradient = zeros(n_schools + 2)
+        noncentered_gradient = similar(centered_gradient)
+        offsets = collect(range(-1.7, 2.3; length = n_schools))
+        # Exercise both the narrow funnel and its bulk. The change of variables
+        # theta = mu + tau*z adds n_schools*log_tau to the log density; its chain
+        # rule relates the two ordinary generated DI+Enzyme gradients.
+        for log_tau in (-4.0, 0.0, log(5.0), log(20.0)), mu in (-1.5, 2.0)
+            tau = exp(log_tau)
+            effects = mu .+ tau .* offsets
+            centered_position = vcat(mu, log_tau, effects)
+            noncentered_position = vcat(offsets, mu, log_tau)
+            centered_density = first(ad_value_and_gradient!(
+                centered.ad, centered_gradient, centered_position, observations, scales))
+            noncentered_density = first(ad_value_and_gradient!(
+                noncentered.ad, noncentered_gradient, noncentered_position, observations, scales))
+            @test noncentered_density ≈ centered_density + n_schools*log_tau atol=1e-10 rtol=1e-12
+            @test noncentered_gradient[1:n_schools] ≈ tau .* centered_gradient[3:end] atol=1e-10 rtol=1e-12
+            @test noncentered_gradient[end-1] ≈ centered_gradient[1] + sum(centered_gradient[3:end]) atol=1e-10 rtol=1e-12
+            @test noncentered_gradient[end] ≈ centered_gradient[2] + dot(effects .- mu, centered_gradient[3:end]) + n_schools atol=1e-10 rtol=1e-12
+        end
+    end
+
+    # Short centered-funnel chains are sensitive to roundoff even with a stable
+    # RNG tape. Use the equivalent noncentered hierarchy for the quality gate;
+    # the centered generated density/gradient remains covered above.
+    fixture = noncentered
+    density_kernel = fixture.kernel
+    initial = fixture.initial
+    posterior_ad = fixture.ad
     density_calls = Ref(0)
     potential_calls = Ref(0)
     gradient_calls = Ref(0)
@@ -250,12 +316,6 @@ end
     # only the sampler-facing sign convention is applied here. Model data are
     # rebound as DI Constants on every call, with plain reverse mode and no
     # runtime-activity or function annotation.
-    initial = zeros(10)
-    initial[2] = log(5.0)
-    posterior_ad = prepare_ad(
-        density_kernel, _HMC_ENZYME_BACKEND,
-        copy(initial), observations, scales; active = :unconstrained,
-    )
     potential_gradient!(gradient, position) = begin
         gradient_calls[] += 1
         density_calls[] += 1
@@ -264,39 +324,38 @@ end
         gradient .*= -1
         -posterior
     end
-    group = reactive_nuts_group(
-        potential_gradient!, Diagonal(ones(10)), initial, zeros(10))
-    state = nuts_state(
-        group;
-        rng = StableRNG(8008),
-        step_f = partial(leapfrog!; stepsize = 0.03),
-        max_depth = 6,
-    )
-    # A 300-transition adaptation window keeps this difficult centered-funnel
-    # quality gate stable across Julia 1.10–1.12 without weakening its divergence
-    # or acceptance thresholds (1.12 evidence: 0 divergences, mean acceptance 0.908).
-    warmup = warmup!(state, 300; target_accept = 0.9)
-    chain = sample!(state, 100)
-    densities = [logdensity(view(chain.samples, :, draw))
-                 for draw in axes(chain.samples, 2)]
+    @testset "quality seed $seed" for seed in (8008, 8009, 8010)
+        group = reactive_nuts_group(
+            potential_gradient!, Diagonal(ones(10)), copy(initial), zeros(10))
+        state = nuts_state(
+            group;
+            rng = StableRNG(seed),
+            step_f = partial(leapfrog!; stepsize = 0.03),
+            max_depth = 6,
+        )
+        warmup = warmup!(state, 300; target_accept = 0.9)
+        chain = sample!(state, 100)
+        densities = [logdensity(view(chain.samples, :, draw))
+                     for draw in axes(chain.samples, 2)]
+        divergences = count(diagnostic -> diagnostic.diverged, chain.diagnostics)
+        acceptance = mean(d.acceptance_rate for d in chain.diagnostics)
+        hashes = _hmc_quality_hashes(chain, seed)
+        @info "eight-schools NUTS quality" parameterization="noncentered" julia=VERSION machine=Sys.MACHINE seed divergences acceptance stepsize=warmup.final_stepsize hashes
 
-    @test size(chain.samples) == (10, 100)
-    @test all(isfinite, chain.samples)
-    @test all(isfinite, densities)
-    divergences = count(diagnostic -> diagnostic.diverged, chain.diagnostics)
-    @test divergences <= 5
-    # The centered funnel is intentionally difficult; require a usable,
-    # non-degenerate post-warmup chain without pretending it reaches the
-    # nominal target acceptance in only 150 warmup transitions.
-    @test mean(diagnostic.acceptance_rate for diagnostic in chain.diagnostics) > 0.7
-    @test warmup.final_stepsize > 0
-    @test all(>(0), diag(warmup.metric))
-    @test maximum(vec(std(chain.samples; dims = 2))) > 0.01
-    # The prepared RK/DI boundary owns potential+gradient; the separate
-    # potential-only alternative must never be called in NUTS.
-    @test potential_calls[] == 0
-    @test gradient_calls[] > 1
-    @test density_calls[] > gradient_calls[]
+        @test size(chain.samples) == (10, 100)
+        @test all(isfinite, chain.samples)
+        @test all(isfinite, densities)
+        @test divergences <= 5
+        @test acceptance > 0.7
+        @test warmup.final_stepsize > 0
+        @test all(>(0), diag(warmup.metric))
+        @test all(>(0.01), vec(std(chain.samples; dims = 2)))
+        # The prepared RK/DI boundary owns potential+gradient; the separate
+        # potential-only alternative must never be called in NUTS.
+        @test potential_calls[] == 0
+        @test gradient_calls[] > 1
+        @test density_calls[] > gradient_calls[]
+    end
 end
 
 @testset "ReactiveHMC adaptation utilities" begin

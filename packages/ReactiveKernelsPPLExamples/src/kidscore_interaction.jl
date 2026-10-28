@@ -55,10 +55,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     parameters = (; beta1, beta2, beta3, beta4, sigma)
     (parameters, log_jacobian::Float64) =
         ((; beta1, beta2, beta3, beta4, sigma), log_sigma)
-    (beta1::Float64, beta2::Float64, beta3::Float64, beta4::Float64,
-     sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.beta3, parameters.beta4,
-         parameters.sigma)
 
     # Transformed data: the mom_hs×mom_iq interaction as a named node (Stan's
     # `transformed data`), hoisted once by partial evaluation when the data are bound.

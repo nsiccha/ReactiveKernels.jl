@@ -221,7 +221,7 @@ function main(bundle, output; limit=typemax(Int), native_enabled=true)
         bytes2hex(sha256(read(joinpath(bundle,file)))) == expected || error("bundle hash mismatch: $file")
     end
     BLAS.set_num_threads(1)
-    data = BRMHSGPExample.motorcycle_data(joinpath(@__DIR__, "..", "..", "examples", "data", "mcycle.csv"))
+    data = BRMHSGPExample.motorcycle_data()
     prep_seconds = @elapsed kernel = BRMHSGPExample.prepare_model(data)
     q = zeros(44); q[[1,23]] .= -2
     c = zeros(40)
@@ -242,8 +242,10 @@ function main(bundle, output; limit=typemax(Int), native_enabled=true)
         "bundle_hashes"=>BUNDLE_HASHES,
         "posterior_provenance"=>TOML.parsefile(joinpath(bundle,"provenance.toml")),
         "benchmark_source_sha256"=>bytes2hex(sha256(read(@__FILE__))),
+        "rk_statistical_model_owner"=>"BayesianRegressionModels.rk_model(:dual_hsgp)",
+        "rk_statistical_model_source_sha256"=>bytes2hex(sha256(read(BRMHSGPExample.MODEL_SOURCE))),
         "kernel_source_sha256"=>bytes2hex(sha256(read(joinpath(@__DIR__,"..","..","examples","brm_hsgp.jl")))))
-    relevant = Set(("ReactiveKernels", "BayesianRegressionModels", "StanBlocks", "WarmupHMC",
+    relevant = Set(("ReactiveKernels", "ReactiveKernelsPPL", "BayesianRegressionModels", "StanBlocks", "WarmupHMC",
         "Reactant", "Reactant_jll", "Enzyme", "Enzyme_jll", "DifferentiationInterface",
         "DynamicPPL", "Turing", "Distributions", "BridgeStan", "MutatingFunctions",
         "OutputSignatures", "LogDensityProblems", "BenchmarkTools"))

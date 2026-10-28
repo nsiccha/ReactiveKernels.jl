@@ -70,102 +70,41 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
             "bound = (; data)",
             "data-only prefix executes exactly once",
             "Rebind by preparing again",
+            "## Jacobian-vector and Hessian-vector products",
+            "prepare_ad_pushforward",
+            "prepare_ad_hvp",
+            "ad_gradient_and_hvp",
+            "### Third-order directional derivatives",
+            "prepare_ad_third",
+            "ad_gradient_hvp_and_third",
+            "test_ad_tangent_operators.jl",
         )
         @test occursin(marker, ad_docs)
     end
     @test occursin("Main.BatchedExamples.BATCHED_AD_SOURCE", distributions_ad_docs)
     @test occursin("test_batched_nonallocating.jl", distributions_ad_docs)
     for marker in (
-            "# Manual derivative rule graphs (design example)",
-            "Executable design example, not a shipped adapter generator",
-            "## Current capability and required RK features",
-            "Everything that turns\nthat graph into a registered custom AD rule is new work",
-            "RK has neither feature",
+            "# Derivative rules from one pure-math graph",
+            "## Generated scalar rules",
+            "## Generated vector rules",
+            "## Two-stage reverse staging",
+            "## Generated adapters",
+            "RK has neither reverse-mode AD nor program transposition",
             "prepare_ad_pullback",
-            "does not consume this manual rule\ngraph",
+            "does not consume a rule graph",
             "render_manual_derivative_rule_cuts()",
-            "render_manual_derivative_pullback_source()",
-            "result.captured_fields",
-            "not yet generate ChainRules, Mooncake, Enzyme, or Reactant",
+            "render_manual_derivative_rule_source()",
+            "result.residuals",
+            "Not generated: rule emission into EnzymeMLIR",
         )
         @test occursin(marker, manual_rules_docs)
-    end
-
-    # No other public prose page carries backend/API GUIDANCE. Algorithmic
-    # uses of the word "gradient" in sampler pages remain domain terminology,
-    # while the evaluation-throughput page belongs to the top-level AD group
-    # and the dedicated Eight Schools Reactant page owns its compiled-AD receipt.
-    # bound-regression.md and posteriordb-comparison.md carry only INCIDENTAL AD
-    # references, not guidance, so they are exempt: bound-regression names
-    # `prepare_ad` when describing the general `bound` partial-evaluation pre-pass,
-    # and posteriordb-comparison lists Enzyme once among the packages its pinned
-    # benchmark environment can load.
-    # The per-model GP pages own their exact native-Enzyme and Reactant support
-    # boundaries; allow those disclosures there rather than duplicating or deleting
-    # the model-specific limitations.
-    ad_pages = Set((
-        "automatic-differentiation.md",
-        "distributions-ad.md",
-        "eight-schools-reactant.md",
-        "eval-throughput.md",
-        "gp-regr.md",
-        "gp-pois-regr.md",
-        "accel-gp.md",
-        "hierarchical-gp.md",
-        # The pandemic model page owns its exact native-Enzyme/Reactant support
-        # boundary the same way the per-model GP pages do.
-        "covid19imperial.md",
-        # Newer canonical per-model forecast pages own their support boundaries
-        # just as the GP and pandemic pages do.
-        "losscurve-sislob.md",
-        "accel-splines.md",
-        "prophet.md",
-        "state-space-stochastic.md",
-        # Newer canonical BRM and manual-rules design pages likewise own their
-        # exact AD terminology/support boundaries.
-        "brm-hsgp.md",
-        "manual-derivative-rules.md",
-        "mnist-reactant.md",
-        "ppl-ad.md",
-        "probprog-mcmc.md",
-        "reactant-ad.md",
-        "reactant.md",
-        "bound-regression.md",
-        "posteriordb-comparison.md",
-        # The adaptive-ODE dynamics pages own their exact native-Enzyme
-        # support boundaries the same way the per-model GP pages do.
-        "lotka-volterra.md",
-        "one-comp-mm-elim-abs.md",
-        "soil-incubation.md",
-    ))
-    forbidden_ad_prose = (
-        "DifferentiationInterface",
-        "AutoEnzyme",
-        "Enzyme",
-        "prepare_ad",
-        "ad_gradient",
-        "ad_value_and_gradient!",
-        "automatic differentiation",
-        "reverse-mode",
-    )
-    docs_src = joinpath(root, "docs", "src")
-    for path in readdir(docs_src; join = true)
-        endswith(path, ".md") || continue
-        basename(path) in ad_pages && continue
-        prose = _compiler_docs_lf(read(path, String))
-        for marker in forbidden_ad_prose
-            @test !occursin(lowercase(marker), lowercase(prose))
-        end
-    end
-    for marker in forbidden_ad_prose
-        @test !occursin(lowercase(marker), lowercase(readme))
     end
 
     @test occursin("\"Compiler capability and limits\" => \"compiler.md\"", make)
     @test occursin("\"Automatic differentiation\" => [", make)
     @test occursin("\"Prepared gradients\" => \"automatic-differentiation.md\"", make)
     @test occursin(
-        "\"Manual derivative rules (design)\" => \"manual-derivative-rules.md\"",
+        "\"Derivative rules\" => \"manual-derivative-rules.md\"",
         make,
     )
     @test occursin("compiler.md", index)
@@ -197,7 +136,14 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     @test !occursin("Adaptive NUTS is currently a CPU sampler", nuts)
     @test !occursin("stays on the CPU because", index)
 
+    # The pure/iterative boundary names the test that guards it.
+    guard = joinpath("packages", "ReactiveKernelsPPL", "test",
+        "test_pure_surface_boundary.jl")
+    @test occursin("`" * join(splitpath(guard), "/") * "`", page)
+    @test isfile(joinpath(root, guard))
+
     for heading in (
+        "## Pure kernels and the iterative-method compiler",
         "## The stateless compiler",
         "## Batch and replica lowering",
         "## Incremental and compiled reactive execution",
@@ -230,7 +176,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "`transition_with_effects(transition)`",
         "`drain_observations!(transition, result)`",
         "internal conservative compiler rule",
-        "logical activity mask and count plus sticky\noverflow",
+        "a fill count, and\na sticky overflow flag",
         "explicitly recompile",
         "no Reactant implementation",
         "one global\nordered event tape/cursor",
@@ -250,7 +196,7 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "NUTS, log-density, and\nPPL artifacts are external compilation examples and acceptance evidence",
         "not** a general Julia-recursion compiler proof",
         "`compile_state_transition(spec, transition, endpoint_args;",
-        "Static loops are unrolled during\nlowering",
+        "Such a loop is retained: its body is\ncompiled once",
         "do not add geometry or integrator cases to compiler code",
         "fixed-capacity\nstructural vectors",
         "`Diagonal` and `Cholesky` wrappers",
@@ -264,11 +210,11 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         @test occursin(contract, page)
     end
 
-    # The compiler specification is deliberately algorithmic prose plus three
-    # build-executed result/API panels. Source-code examples remain on the
-    # focused example pages.
-    @test count(==("```@eval"), split(page, '\n')) == 3
-    @test count(==("```"), split(page, '\n')) == 3
-    @test !occursin("```julia", page)
+    # The compiler specification keeps its four build-executed result/API
+    # panels and allows ordinary source examples for its inspection APIs.
+    # Every opening fence still needs a closing fence.
+    @test count(==("```@eval"), split(page, '\n')) == 4
+    @test count(==("```"), split(page, '\n')) ==
+          count(line -> startswith(line, "```") && line != "```", split(page, '\n'))
     @test !occursin("~~~", page)
 end

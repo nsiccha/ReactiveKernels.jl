@@ -65,8 +65,6 @@ using LogExpFunctions: logistic, log1pexp
     # constrain-only producer omits the Jacobian; the joint producer emits it.
     parameters = (; alpha, beta, sigma_y)
     (parameters, log_jacobian::Float64) = ((; alpha, beta, sigma_y), log_sigma_y)
-    (alpha::Float64, beta::Float64, sigma_y::Float64) =
-        (parameters.alpha, parameters.beta, parameters.sigma_y)
 
     # Priors from the model block (all proper, so they show up in value AND
     # gradient parity): alpha ~ Normal(0, 10), beta ~ Normal(0, 10),

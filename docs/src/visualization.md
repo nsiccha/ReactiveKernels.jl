@@ -74,6 +74,31 @@ complete, trusted JavaScript or CSS payloads. Use an ordinary layout container
 rather than a presentational `SemanticCard`, because the DAG contains
 interactive buttons.
 
+## Text views
+
+`show` of a `Graph` in plain text lists its values (structurally equal values
+joined by `≡`) and its recipes, with each authored plate or scan body nested
+under its recipe. A recipe captured from `@kernel` source reads as
+`(inputs) -> source`, as it does in `explain(plan)` and in the diagram labels.
+The same walk is available as data: `recipe_inventory` returns one `(; kind,
+depth, parent, recipe)` entry per listed recipe, and `recipe_kind` classifies a
+single recipe as `:plate`, `:scan` or `:ordinary` (see [Inspecting
+structure](compiler.md#Inspecting-structure)).
+
+`code_expr(spec_or_plan)` and `code_expr(prepared)` return the generated
+Julia expression itself. Print that expression with Julia's ordinary printer;
+for a cleaner listing, remove only line-number nodes from a copy. Calls retain
+their actual `__ops__[k]` slots. The operation tuple is available separately
+as `prepared.ops`; a printed expression that embeds an operation object may
+not parse on its own. The structural graph view explains names and recipes
+without altering this executable expression.
+
+```julia
+graph = kernel_graph(spec)
+show(stdout, MIME"text/plain"(), graph)   # values and recipes
+print(Base.remove_linenums!(deepcopy(code_expr(spec)))) # the planned program
+```
+
 ## Reading a diagram
 
 The diagram has two kinds of node: values are ellipses and recipes are boxes,

@@ -91,8 +91,8 @@ end
         beta(10.0, 1.0).logpdf(gamma) +
         cauchy(0.0, 1.0).logpdf(sigma)
 
-    evolution_pointwise = plate(eco2_mean, evolved, Ref(sigma)) do observation, mu, s
-        normal(mu, s).logpdf(observation)
+    evolution_pointwise = plate(eco2_mean, evolved) do observation, mu
+        normal(mu, sigma).logpdf(observation)
     end
     likelihood::Float64 = sum(evolution_pointwise)
 

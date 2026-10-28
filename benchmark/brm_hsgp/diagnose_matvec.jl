@@ -31,7 +31,7 @@ end
 function matrix_diagnostics(bundle, output)
     mkpath(output)
     BLAS.set_num_threads(1)
-    data = BRMHSGPExample.motorcycle_data(joinpath(@__DIR__, "..", "..", "examples", "data", "mcycle.csv"))
+    data = BRMHSGPExample.motorcycle_data()
     q = copy(deserialize(joinpath(bundle,"noncentered.jls")).posterior_position[:,5000])
     c = zeros(40)
     A = BRMHSGPExample.prepare_model(data; want=:basis)(q,c)
@@ -51,7 +51,9 @@ function matrix_diagnostics(bundle, output)
     gv,gg = grouped_rvg(rq,rc)
     @assert isapprox(Float64(gv),v; rtol=2e-12,atol=2e-12)
     @assert isapprox(Array(gg),g; rtol=2e-12,atol=2e-12)
-    result = Dict("source_sha256"=>bytes2hex(sha256(read(@__FILE__))),
+    result = Dict("rk_statistical_model_owner"=>"BayesianRegressionModels.rk_model(:dual_hsgp)",
+        "rk_statistical_model_source_sha256"=>bytes2hex(sha256(read(BRMHSGPExample.MODEL_SOURCE))),
+        "source_sha256"=>bytes2hex(sha256(read(@__FILE__))),
         "native_primal"=>measure(() -> primal(q,c)),
         "native_value_gradient"=>measure(() -> vg(q,c)),
         "reactant_primal"=>measure(() -> rp(rq,rc)),

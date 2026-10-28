@@ -102,10 +102,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     parameters = (; beta1, beta2, beta3, beta4, beta5, beta6, beta7, sigma)
     (parameters, log_jacobian::Float64) =
         ((; beta1, beta2, beta3, beta4, beta5, beta6, beta7, sigma), u_sigma)
-    (beta1::Float64, beta2::Float64, beta3::Float64, beta4::Float64,
-     beta5::Float64, beta6::Float64, beta7::Float64, sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.beta3, parameters.beta4,
-         parameters.beta5, parameters.beta6, parameters.beta7, parameters.sigma)
 
     # Transformed parameter: the log-scale linear predictor
     # μ = β₁ + β₂·log(diam1) + β₃·log(diam2) + β₄·log(canopy_height)

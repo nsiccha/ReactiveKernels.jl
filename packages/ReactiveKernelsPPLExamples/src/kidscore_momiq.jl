@@ -44,8 +44,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
 
     parameters = (; beta1, beta2, sigma)
     (parameters, log_jacobian::Float64) = ((; beta1, beta2, sigma), log_sigma)
-    (beta1::Float64, beta2::Float64, sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.sigma)
 
     # Transformed parameter: the fitted mean μ = β₁ + β₂·mom_iq. Captured scalars
     # ride the plate as explicit shared arguments (a scalar plate argument

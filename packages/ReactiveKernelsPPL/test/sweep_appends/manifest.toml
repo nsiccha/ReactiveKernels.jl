@@ -1,0 +1,22 @@
+[meta]
+pins = { rk = "fixture", brm = "fixture" }
+
+[[case]]
+id = "corpus/demo_gaussian"
+kind = "surface"
+surface = "demo_gaussian.jl"
+data = "demo_gaussian_data.jl"
+u_probes = [[0.5, -0.25, 0.1]]
+expected = [-15.886646898631646]
+
+[[case]]
+id = "corpus/demo_factor"
+kind = "surface"
+surface = "demo_factor.jl"
+data = "demo_factor_data.jl"
+
+[[case]]
+id = "corpus/demo_poisson"
+kind = "surface"
+surface = "demo_poisson.jl"
+data = "demo_poisson_data.jl"

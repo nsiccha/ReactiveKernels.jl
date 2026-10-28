@@ -1,4 +1,5 @@
 using ReactiveKernels
+using LogExpFunctions: log1pexp
 using Test
 
 isdefined(@__MODULE__, :AuthoredPlateChains) ||
@@ -31,7 +32,13 @@ isdefined(@__MODULE__, :AuthoredPlateChains) ||
     @test prepare(C.chain; want = :mu)(q, x, y) == mu
     @test prepare(C.chain; want = :pointwise)(q, x, y) == pw
     both = prepare(C.chain; want = (:mu, :pointwise, :total))
-    @test both(q, x, y) == (mu, pw, kernel(q, x, y))
+    # A total-only plate sums its cells in a `@simd` loop, which may
+    # reassociate; with `pointwise` wanted, the total sums the stored cells in
+    # order. The two agree to rounding, and bitwise only where the fused loop
+    # does not vectorize.
+    both_mu, both_pw, both_total = both(q, x, y)
+    @test (both_mu, both_pw) == (mu, pw)
+    @test both_total ≈ kernel(q, x, y) rtol = 1e-14
     shared = prepare(C.chain; want = (:total, :extra))
     @test first(shared(q, x, y)) == kernel(q, x, y)
     @test last(shared(q, x, y)) ≈ sum(mu) atol = 1e-10
@@ -90,6 +97,49 @@ end
     # bound/unbound consistent.
     bound_mid = prepare(C.ref_atomic_chain; want = :middle, bound = (; x, y))
     @test bound_mid(q) == middle
+end
+
+@testset "embedded prepared plate: bound axis with untyped live array HAVE" begin
+    C = AuthoredPlateChains
+    schedule = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]   # nobs = 6 plate-axis rows
+    dose = [0.5, 1.5, 2.5]                        # ndoses = 3 ≠ nobs
+    plan_axis = collect(1.0:length(schedule))
+    ref = 2 .* plan_axis .+ dose[1]
+
+    # Untyped (`Any`) live dose port with a bound schedule-derived axis. This
+    # used to throw "an embedded plate requires an array-valued HAVE port in
+    # the outer kernel" because the fallback marker search only admitted
+    # array-TYPED ports.
+    outer = C.embedded_dose_outer_graph()
+    unbound = prepare(outer.graph; have = (outer.schedule, outer.dose),
+                      want = outer.result)
+    @test unbound(schedule, dose) ≈ ref
+    bound = prepare(outer.graph; have = (outer.schedule, outer.dose),
+                    want = outer.result, bound = [outer.schedule => schedule])
+    @test bound.f isa ReactiveKernels._DynamicEmbeddedFunctionPair
+    got = bound(dose)
+    @test got ≈ ref
+    # The plate axis is the bound nobs plan, never the ndoses live dose extent.
+    @test length(got) == length(schedule)
+    # The live dose dependence is real: changed doses change the result.
+    @test bound(dose .+ 1.0) ≈ 2 .* plan_axis .+ (dose[1] + 1.0)
+    @test !(bound(dose .+ 1.0) ≈ got)
+
+    # A typed dose port keeps the static backend marker.
+    touter = C.embedded_dose_outer_graph(; dose_type = Vector{Float64})
+    tbound = prepare(touter.graph; have = (touter.schedule, touter.dose),
+                     want = touter.result,
+                     bound = [touter.schedule => schedule])
+    @test tbound.f isa ReactiveKernels._EmbeddedFunctionPair
+    @test tbound(dose) ≈ ref
+
+    # The axis is already bound. A scalar live port needs no runtime array
+    # marker; it selects the native body while retaining the bound axis.
+    souter = C.embedded_dose_outer_graph(; dose_type = Float64)
+    sbound = prepare(
+        souter.graph; have = (souter.schedule, souter.dose),
+        want = souter.result, bound = [souter.schedule => schedule])
+    @test sbound(0.5) ≈ 2 .* plan_axis .+ 0.5
 end
 
 @kernel authored_standard_normal() = begin
@@ -943,8 +993,8 @@ module TupleAxisNative
 using ReactiveKernels
 
 @kernel broadcast_axes(q::Vector{Float64}, x, y) = begin
-    pointwise = plate(x, Ref(q), y) do xi, whole, yi
-        xi + sum(whole) * yi
+    pointwise = plate(x, y) do xi, yi
+        xi + sum(q) * yi
     end
     total::Float64 = sum(pointwise)
     return total
@@ -952,8 +1002,8 @@ end
 
 # A plate whose ONLY batched axis is a tuple (no array co-operand).
 @kernel tuple_only(q::Vector{Float64}, x) = begin
-    pointwise = plate(x, Ref(q)) do xi, whole
-        xi + sum(whole)
+    pointwise = plate(x) do xi
+        xi + sum(q)
     end
     total::Float64 = sum(pointwise)
     return total
@@ -997,6 +1047,135 @@ end
     reference = collect(x) .+ sum(q)
     @test result isa Vector{Float64}
     @test result ≈ reference
+end
+
+module UninferredPlateCells
+using ReactiveKernels
+
+# Hides the cell's result type from inference, as Julia's inference can for a
+# nested prepared kernel called in a lazy arm (`_declare_typed_output!`).
+opaque(x) = Base.inferencebarrier(x)
+
+@kernel group_total(groups) = begin
+    cells = plate(groups) do xs
+        opaque(2.0 * sum(xs))
+    end
+    total = sum(cells)
+    return total
+end
+
+@kernel indexed_total(idx, values) = begin
+    cells = plate(idx) do i
+        opaque(values[i])
+    end
+    total = sum(cells)
+    return total
+end
+
+@kernel scan_total(xs) = begin
+    trajectory = scan(xs; init = 0.0) do carry, x
+        next = carry + x
+        (next, next)
+    end
+    cells = plate(trajectory) do t
+        opaque(2.0 * t)
+    end
+    total = sum(cells)
+    return total
+end
+end
+
+@testset "authored plate total: cells whose result type does not infer" begin
+    # Regression (todo `1a2te8d`): the fused total of a cell inferred as `Any`
+    # was seeded with `zero(eltype(axis))`, which fails for an axis of vectors
+    # with `zero(::Type{Vector{Float64}})`. The first cell now starts the total.
+    U = UninferredPlateCells
+    groups = prepare(U.group_total)
+    @test groups([[1.0, 2.0], [0.5], Float64[]]) === 7.0
+    # refused: like Base's `sum(Any[])`, an empty sum of cells without an
+    # inferred element type has no zero; the error names the declaration.
+    @test_throws "Declare the cell's result type" groups(Vector{Float64}[])
+
+    # An empty numeric axis keeps its element type's zero.
+    indexed = prepare(U.indexed_total)
+    @test indexed([1, 3], [0.5, 1.0, 2.0]) === 2.5
+    @test indexed(Int[], [0.5]) === 0
+
+    # The same seed when a summed plate consumes a scan in its loop.
+    scanned = prepare(U.scan_total)
+    @test !occursin("trajectory", string(code_expr(scanned)))
+    @test scanned([1.0, 2.0]) === 8.0
+    @test scanned(Float64[]) === 0.0
+end
+
+module ArrayPlateCells
+using ReactiveKernels
+
+@kernel scaled_total(groups, b) = begin
+    cells = plate(groups) do xs
+        b .* xs
+    end
+    total = sum(cells)
+    return total
+end
+
+@kernel pair_total(x1, x2, b) = begin
+    cells = plate(x1, x2) do u, v
+        [b * u, b * v]
+    end
+    total = sum(cells)
+    return total
+end
+
+@kernel outer_total(groups) = begin
+    cells = plate(groups) do xs
+        xs * xs'
+    end
+    total = sum(cells)
+    return total
+end
+
+@kernel scan_pair_total(xs) = begin
+    trajectory = scan(xs; init = 0.0) do carry, x
+        next = carry + x
+        (next, next)
+    end
+    cells = plate(trajectory) do t
+        [t, 2.0 * t]
+    end
+    total = sum(cells)
+    return total
+end
+end
+
+@testset "authored plate total: cells that hold arrays" begin
+    # Regression (snag `summing-a-plate-eba2648d`): the fused total of cells
+    # inferred as a concrete array type was seeded with `zero(T)`, which
+    # `Vector{Float64}` lacks. As Julia's `sum`, the first cell starts it.
+    P = ArrayPlateCells
+    groups = [[1.0, 2.0], [3.0, -1.0], [0.5, 0.25]]
+    scaled = prepare(P.scaled_total)
+    @test occursin("_plate_total_seed", string(code_expr(scaled)))
+    @test scaled(groups, 0.3) ≈ sum([0.3 .* xs for xs in groups])
+    @test scaled([[1.0, 2.0]], 2.0) == [2.0, 4.0]
+    @test groups == [[1.0, 2.0], [3.0, -1.0], [0.5, 0.25]]
+    # refused: as Julia's `sum`, cells of different lengths do not add.
+    @test_throws DimensionMismatch scaled([[1.0, 2.0], [3.0]], 1.0)
+    # refused: as `sum(Vector{Float64}[])`, a sum of no arrays has no zero.
+    @test_throws MethodError sum(Vector{Float64}[])
+    @test_throws "zero(::Type{Vector{Float64}})" scaled(Vector{Float64}[], 1.0)
+
+    pairs = prepare(P.pair_total)
+    @test pairs([1.0, 3.0, 0.5], [2.0, -1.0, 0.25], 0.3) ≈ [0.3 * 4.5, 0.3 * 1.25]
+
+    outer = prepare(P.outer_total)
+    @test outer(groups) ≈ sum(xs * xs' for xs in groups)
+
+    # The same first-cell total when a summed plate consumes a scan.
+    scanned = prepare(P.scan_pair_total)
+    @test !occursin("trajectory", string(code_expr(scanned)))
+    @test scanned([1.0, 2.0, 0.5]) ≈ [1.0 + 3.0 + 3.5, 2.0 * (1.0 + 3.0 + 3.5)]
+    @test_throws "zero(::Type{Vector{Float64}})" scanned(Float64[])
 end
 
 @testset "authored plate chain: redundant axis-check elision + preserved domain guards" begin
@@ -1071,4 +1250,1392 @@ end
     end
     krp = prepare(_ce_ref_producer)
     @test_throws MethodError krp(2.0, y)
+end
+
+@testset "authored plate block: automatic caller-scalar threading" begin
+    @kernel _free_scalar_plate(
+            y::Vector{Float64}, mu::Vector{Float64}, s::Float64) = begin
+        pointwise = plate(y, mu) do yi, mui
+            (mui + s)^2 + yi
+        end
+        total::Float64 = sum(pointwise)
+    end
+
+    y = [0.2, -0.4, 1.1]
+    mu = [0.0, 0.3, -0.2]
+    kernel = prepare(_free_scalar_plate; want = :total)
+    @test kernel(y, mu, 0.7) ≈ sum(((m + 0.7)^2 + obs)
+                                   for (obs, m) in zip(y, mu))
+end
+
+# A module global that a kernel-local below shadows: the cell must read the
+# kernel-local, as a Julia closure would, never this binding.
+const _captured_shadowed = [100.0, 200.0, 300.0]
+
+@testset "authored plate block: a captured enclosing name is the whole value" begin
+    # A cell reads an enclosing name as a Julia closure does. Only the plate's
+    # explicit non-`Ref` arguments are zipped; a capture enters whole, like an
+    # explicit `Ref(name)` (snag rk-plate-body-ca-091ef037).
+    @kernel _captured_vector_plate(x, d) = begin
+        cells = plate(eachindex(d), d) do s, dd
+            x[s] + dd
+        end
+        return cells
+    end
+    @kernel _reffed_vector_plate(x, d) = begin
+        cells = plate(eachindex(d), Ref(x), d) do s, xs, dd
+            xs[s] + dd
+        end
+        return cells
+    end
+    @kernel _captured_whole_plate(x, d) = begin
+        cells = plate(d) do dd
+            x[1] + length(x) + dd
+        end
+        return cells
+    end
+    @kernel _captured_derived_plate(x, d) = begin
+        _captured_shadowed = x .+ 1.0
+        cells = plate(eachindex(d), d) do s, dd
+            _captured_shadowed[s] + dd
+        end
+        return cells
+    end
+    @kernel _captured_container_plate(t, p, d) = begin
+        cells = plate(d) do dd
+            t[2] + p.a + dd
+        end
+        return cells
+    end
+    @kernel _captured_nested_plate(groups, w) = begin
+        group_totals = plate(groups) do observations
+            scaled = observations .* 2.0
+            inner = plate(eachindex(observations)) do i
+                scaled[i] + w[i]
+            end
+            sum(inner)
+        end
+        return group_totals
+    end
+
+    x, d = [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]
+    captured = prepare(_captured_vector_plate)
+    @test captured(x, d) == map((s, dd) -> x[s] + dd, eachindex(d), d)
+    @test captured(x, d) == prepare(_reffed_vector_plate)(x, d)
+    plate_ops = [r.op for r in plan(_captured_vector_plate).recipes
+                 if r.op isa ReactiveKernels._AuthoredPlateOp]
+    @test length(plate_ops) == 1
+    # Arguments: the materialized `eachindex(d)`, `d`, then the capture `x`.
+    @test typeof(only(plate_ops)).parameters[2] == (3,)
+
+    whole = prepare(_captured_whole_plate)
+    @test whole(x, d) == map(dd -> x[1] + length(x) + dd, d)
+    # A capture shorter than the plate axis is not broadcast against it.
+    y = [1.0, 2.0]
+    @test whole(y, d) == map(dd -> y[1] + length(y) + dd, d)
+
+    # A kernel-local the cell reads is captured too; a same-named module
+    # global does not leak in.
+    @test prepare(_captured_derived_plate)(x, d) ==
+          map((s, dd) -> x[s] + 1.0 + dd, eachindex(d), d)
+    @test prepare(_captured_container_plate)((1.0, 2.0, 3.0), (; a = 5.0), d) ==
+          d .+ 7.0
+
+    # An inner cell captures an outer cell's local and a kernel port.
+    groups = [[1.0, 2.0], [4.0]]
+    w = [0.5, 0.25]
+    @test prepare(_captured_nested_plate)(groups, w) ==
+          [sum(2.0 .* g .+ w[eachindex(g)]) for g in groups]
+end
+
+@testset "authored plate block: keyword-call authoring without semicolon" begin
+    scale_logpdf(; logit) = -log1pexp(-logit)
+    @kernel _kw_call_plate(e::Vector{Float64}) = begin
+        pointwise = plate(e) do ei
+            scale_logpdf(logit = ei) * ei
+        end
+        total::Float64 = sum(pointwise)
+    end
+
+    e = [-1.0, 0.0, 0.25, 2.0]
+    expected = map(e) do x
+        -log1pexp(-x) * x
+    end
+    @test prepare(_kw_call_plate; want = :pointwise)(e) ≈ expected
+end
+
+# A plate cell whose fused closure carries a LOOP — a `sum(generator)` over an
+# inner host axis, the dose-superposition shape — was a real function call on
+# every plate coordinate on Julia 1.10: the inlining heuristic refuses a
+# loop-carrying closure, so the cell's loop invariants (`plan.shifts`,
+# `eachindex`) were recomputed per observation, at 2× the time of the same
+# body written inline. `_kernel_source_call` now callsite-inlines the native
+# fused closure (snag `generator-plate-e160f4c2`). Julia 1.12 inlines this
+# closure on its own, so the plain-call control is asserted only where the
+# heuristic refuses it.
+@testset "authored plate cell: a loop-carrying cell closure is inlined into the native loop" begin
+    plan = (; shifts = [0, 4, 9], nobs = 4096)
+    _slots(plan) = eachindex(plan.shifts)
+    _lookup(observation, plan, i) = observation - plan.shifts[i]
+    @kernel _generator_cell(plan, units, weights) = begin
+        observations::UnitRange{Int} = 1:plan.nobs
+        concentration::Vector{Float64} = plate(observations) do observation
+            sum((ifelse(_lookup(observation, plan, i) > 0,
+                        units[max(_lookup(observation, plan, i), 1)] * weights[i],
+                        0.0)
+                 for i in _slots(plan)); init = 0.0)
+        end
+        return concentration
+    end
+    units = [sin(0.01k) + 1.5 for k in 1:plan.nobs]
+    weights = [0.5, 1.25, 0.75]
+    kernel = prepare(_generator_cell)
+    reference = [sum(observation - s > 0 ? units[observation - s] * w : 0.0
+                     for (s, w) in zip(plan.shifts, weights))
+                 for observation in 1:plan.nobs]
+    @test kernel(plan, units, weights) ≈ reference
+    # Output-only allocation: a per-cell allocation would add ≥ 32 B per observation.
+    kernel(plan, units, weights)
+    @test (@allocated kernel(plan, units, weights)) < 3 * sizeof(Float64) * plan.nobs
+
+    # The cell op is the fused closure whose recipe yields the plate value; its
+    # closure arguments are the do-block formals in recipe-input order.
+    cell_index = only(i for (i, recipe) in enumerate(kernel.lowered_recipes)
+                      if [v.name for v in recipe.outputs] == [:__plate_value__])
+    op = kernel.ops[cell_index]
+    @test op isa ReactiveKernels._KernelSourceOp
+    formal_types = Dict(:plan => typeof(plan), :observation => Int,
+                        :units => typeof(units), :weights => typeof(weights))
+    argtypes = Tuple(formal_types[v.name] for v in kernel.lowered_recipes[cell_index].inputs)
+    invokes_closure(f, types) = any(only(Base.code_typed(f, types; optimize = true))[1].code) do stmt
+        stmt isa Expr && stmt.head === :invoke || return false
+        callee = stmt.args[1]
+        callee isa Core.CodeInstance && (callee = callee.def)
+        callee isa Core.MethodInstance || return false
+        # The specialized signature names the concrete closure type (a cell
+        # closure over local helpers is parametric; the method's own `sig` is not).
+        callee.specTypes isa DataType && callee.specTypes.parameters[1] in
+            (typeof(op.f), typeof(ReactiveKernels._kernel_native_source(op.f)))
+    end
+    @test !invokes_closure(ReactiveKernels._kernel_source_call,
+                           (Val{:native}, typeof(op), argtypes...))
+    # Negative control: explicitly keep the same source callable as an invoke,
+    # independently of the Julia version's ordinary inlining heuristic.
+    # Fixed arity on purpose: a forwarded `args...` splat is left unspecialized
+    # and lowers to a dynamic apply, which the `invoke` scan cannot see.
+    retained_call(op, a, b, c, d) = Base.@noinline op.f(a, b, c, d)
+    @test length(argtypes) == 4
+    @test invokes_closure(retained_call, (typeof(op), argtypes...))
+end
+
+# --- RK's own plate reads and stores carry no bounds checks (snag native-lowering-948c4ab6)
+# The native plate loop reads each cell argument at a coordinate of
+# `CartesianIndices(combine_axes(arguments))` and stores the cell value at the
+# same coordinate of a buffer with those axes: both are in bounds by
+# construction, as in Base's broadcast `copyto!`. Checked, they kept LLVM from
+# vectorizing even an arithmetic cell; a fixed-degree polynomial cell with tuple
+# coefficients ran 2.6x its hand loop. The cell body keeps its own checks.
+import InteractiveUtils
+@kernel _unchecked_affine_plate(xs::Vector{Float64}) = begin
+    ys::Vector{Float64} = plate(xs) do x
+        muladd(x, 2.0, 1.0)
+    end
+    return ys
+end
+@kernel _unchecked_poly_plate(xs::Vector{Float64}, c) = begin
+    ys::Vector{Float64} = plate(xs) do x
+        evalpoly(x, c)
+    end
+    return ys
+end
+@kernel _unchecked_broadcast_plate(a::Matrix{Float64}, b::Matrix{Float64}) = begin
+    ys = plate(a, b) do x, y
+        x - 2y
+    end
+    return ys
+end
+@kernel _checked_cell_plate(xs::Vector{Float64}, idx::Vector{Int}, table::Vector{Float64}) = begin
+    ys::Vector{Float64} = plate(xs, idx) do x, i
+        x * table[i]
+    end
+    return ys
+end
+
+# A bounds check's throw: `ijl_bounds_error_*` on Julia 1.10, a call to
+# `throw_boundserror` from 1.12.
+const _BOUNDS_THROW = r"bounds_?error"
+
+# The unchecked-access and vectorization assertions describe code built with
+# Julia's default flags. `Pkg.test` in CI runs with `--check-bounds=yes`, which
+# disables `@inbounds`, and with line coverage, whose counters keep loops
+# scalar. Under those flags the assertions are recorded as skipped; the control
+# that a cell's own indexing stays checked holds under every flag.
+const _DEFAULT_CODEGEN = Base.JLOptions().check_bounds != 1 &&
+                         Base.JLOptions().code_coverage == 0
+const _VECTOR_CODEGEN = _DEFAULT_CODEGEN && Sys.ARCH in (:x86_64, :aarch64)
+
+function _plate_entry_llvm(kernel, args...)
+    kernel(args...)
+    sprint(io -> InteractiveUtils.code_llvm(io,
+        ReactiveKernels.RuntimeGeneratedFunctions.generated_callfunc,
+        Tuple{typeof(kernel.f.native), typeof(kernel.ops), map(typeof, args)...};
+        debuginfo = :none))
+end
+
+@testset "authored plate native: RK's own cell reads and stores are unchecked" begin
+    xs = [1 / (k + 0.5) for k in 0:999]
+    coefficients = [1.0, -0.25, 0.125, 0.3, -0.07, 0.011]
+    affine = prepare(_unchecked_affine_plate)
+    poly = prepare(_unchecked_poly_plate)
+    @test affine(xs) == muladd.(xs, 2.0, 1.0)
+    # `muladd` leaves contraction to the compiler, so compare to rounding.
+    @test poly(xs, Tuple(coefficients)) ≈ evalpoly.(xs, Ref(Tuple(coefficients))) rtol = 1e-14
+    @test poly(xs, coefficients) ≈ evalpoly.(xs, Ref(coefficients)) rtol = 1e-14
+    @test affine(Float64[]) == Float64[]
+
+    # Singleton expansion reads through Base's extruded projection unchanged.
+    broadcast_plate = prepare(_unchecked_broadcast_plate)
+    a, b = reshape([0.5, 1.5, -2.0], 3, 1), reshape([1.0, 2.0, 3.0, 4.0], 1, 4)
+    @test broadcast_plate(a, b) == a .- 2 .* b
+    @test broadcast_plate(a, repeat(b, 3)) == a .- 2 .* b
+
+    # Neither the plate's projection nor its store is checked, so the cell loop
+    # vectorizes like the hand loop.
+    for (kernel, args) in ((affine, (xs,)), (poly, (xs, Tuple(coefficients))))
+        llvm = _plate_entry_llvm(kernel, args...)
+        if _DEFAULT_CODEGEN
+            @test !occursin(_BOUNDS_THROW, llvm)
+        else
+            @test_skip !occursin(_BOUNDS_THROW, llvm)
+        end
+        if _VECTOR_CODEGEN
+            @test occursin(r"<\d+ x double>", llvm)
+        elseif Sys.ARCH in (:x86_64, :aarch64)
+            @test_skip occursin(r"<\d+ x double>", llvm)
+        end
+    end
+
+    # Control: the cell body's own indexing keeps its bounds check.
+    checked = prepare(_checked_cell_plate)
+    table = [2.0, 3.0, 5.0]
+    @test checked([1.0, 2.0, 3.0], [3, 1, 2], table) == [5.0, 4.0, 9.0]
+    @test occursin(_BOUNDS_THROW, _plate_entry_llvm(checked, [1.0], [1], table))
+    @test_throws BoundsError checked([1.0, 2.0], [1, 4], table)
+end
+
+# --- a source-function cell asks for its method without a per-cell loop
+# (snags native-lowering-948c4ab6, guarded-kernelso-e7baca4c)
+@kernel _two_statement_plate(xs::Vector{Float64}, c::Float64) = begin
+    ys::Vector{Float64} = plate(xs) do x
+        u = x * c
+        u * u + x
+    end
+    return ys
+end
+@kernel _gathered_residual_plate(a::Vector{Float64}, idx::Vector{Int},
+                                 x::Vector{Float64}, y::Vector{Float64}) = begin
+    gathered = ReactiveKernels._readonly_gather(a, idx)
+    terms = plate(gathered, x, y) do ai, xi, yi
+        -0.5 * (yi - ai * xi)^2
+    end
+    total::Float64 = sum(terms)
+    return total
+end
+
+@testset "authored plate native: a source-function cell has no per-call method query" begin
+    # A cell body runs through RK's source callable, which asks whether its
+    # method is visible in the caller's world. On Julia 1.12 and 1.13
+    # `hasmethod` kept a loop over the argument types in every cell
+    # (`jl_f__svec_ref`), so these loops stayed scalar.
+    xs = [1 / (k + 0.5) for k in 0:999]
+    two_statement = prepare(_two_statement_plate)
+    @test two_statement(xs, 1.5) == [(x * 1.5) * (x * 1.5) + x for x in xs]
+    llvm = _plate_entry_llvm(two_statement, xs, 1.5)
+    @test !occursin("svec_ref", llvm)
+    if _VECTOR_CODEGEN
+        @test occursin(r"<\d+ x double>", llvm)
+    elseif Sys.ARCH in (:x86_64, :aarch64)
+        @test_skip occursin(r"<\d+ x double>", llvm)
+    end
+    checked = prepare(_checked_cell_plate)
+    @test !occursin("svec_ref", _plate_entry_llvm(checked, [1.0], [1], [2.0]))
+
+    idx = [mod1(7k, 5) for k in 1:64]
+    x, y, a = sin.(1:64), cos.(1:64), [0.5, -1.0, 2.0, 0.25, 1.5]
+    residual = prepare(_gathered_residual_plate; bound = (; idx, x, y))
+    @test residual(a) ≈ sum(-0.5 .* (y .- a[idx] .* x) .^ 2) rtol = 1e-14
+    llvm = sprint(io -> InteractiveUtils.code_llvm(io, residual, (Vector{Float64},);
+                                                  debuginfo = :none))
+    @test !occursin("svec_ref", llvm)
+    if _VECTOR_CODEGEN
+        @test occursin(r"fmul[^\n]*<\d+ x double>", llvm)
+    elseif Sys.ARCH in (:x86_64, :aarch64)
+        @test_skip occursin(r"fmul[^\n]*<\d+ x double>", llvm)
+    end
+end
+
+# --- each cell recipe is emitted once (snag prepared-kernel-ae180d1a)
+# A plate argument whose declared type does not say it is one-dimensional (an
+# untyped port, bound or live) used to emit every cell recipe it reaches twice:
+# above the loop for a value that holds no axis, and inside the loop for one
+# that does. A scan in such a cell appeared four times. Each recipe is now
+# emitted once, inside the loop; a group whose roots hold no axis runs at the
+# first coordinate and is reused.
+@kernel _emitted_once_untyped(xs, scale::Float64) = begin
+    pointwise = plate(xs) do x
+        shifted = x * scale + 0.75
+        shifted * shifted
+    end
+    return sum(pointwise)
+end
+@kernel _emitted_once_typed(xs::Vector{Float64}, scale::Float64) = begin
+    pointwise = plate(xs) do x
+        shifted = x * scale + 0.75
+        shifted * shifted
+    end
+    return sum(pointwise)
+end
+const _EMITTED_ONCE_CALLS = Ref(0)
+_emitted_once_log(s) = (_EMITTED_ONCE_CALLS[] += 1; log(s))
+@kernel _emitted_once_invariant(xs::Vector{Float64}, s) = begin
+    pointwise = plate(xs, s) do x, si
+        ls = _emitted_once_log(si)
+        x * ls
+    end
+    return sum(pointwise)
+end
+@kernel _emitted_once_scan_cell(groups, scale::Float64) = begin
+    pointwise = plate(groups) do g
+        path = scan(g; init = 0.0) do carry, y
+            next = carry * 0.125 + y * scale
+            (next, next)
+        end
+        sum(path)
+    end
+    return sum(pointwise)
+end
+@kernel _emitted_once_scan_alone(g, s::Float64) = begin
+    path = scan(g; init = 0.0) do carry, y
+        next = carry * 0.125 + y * s
+        (next, next)
+    end
+    return sum(path)
+end
+_emitted_count(kernel, literal) =
+    count(_ -> true, eachmatch(literal,
+        string(ReactiveKernels._readable_expr(code_expr(kernel), kernel))))
+
+@testset "authored plate native: each cell recipe is emitted once" begin
+    xs = collect(range(-1.0, 2.0; length = 7))
+    reference = sum((xs .* 0.5 .+ 0.75) .^ 2)
+    typed = prepare(_emitted_once_typed)
+    @test _emitted_count(typed, r"0\.75") == 1
+    for kernel in (prepare(_emitted_once_untyped),
+                   prepare(_emitted_once_untyped; bound = (; xs)),
+                   prepare(_emitted_once_untyped; bound = (; xs = 1:4)))
+        @test _emitted_count(kernel, r"0\.75") == 1
+    end
+    untyped = prepare(_emitted_once_untyped)
+    @test untyped(xs, 0.5) == typed(xs, 0.5) ≈ reference
+    @test untyped(1:4, 0.5) == typed(collect(1.0:4.0), 0.5)
+    @test untyped(Tuple(xs), 0.5) == typed(xs, 0.5)
+    @test untyped(Float64[], 0.5) == 0.0
+    @test prepare(_emitted_once_untyped; bound = (; xs = 1:4))(0.5) ==
+          typed(collect(1.0:4.0), 0.5)
+
+    # A group whose only root is a scalar in an untyped port is a plate
+    # invariant: it runs once per call. A value that holds no axis reaches it
+    # as its broadcast element, as it reaches every other cell recipe.
+    invariant = prepare(_emitted_once_invariant)
+    @test _emitted_count(invariant, r"_emitted_once_log\(") == 1
+    expected = sum(xs .* log(1.7))
+    for s in (1.7, fill(1.7), Ref(1.7))
+        _EMITTED_ONCE_CALLS[] = 0
+        @test invariant(xs, s) ≈ expected
+        @test _EMITTED_ONCE_CALLS[] == 1
+    end
+    # An axis-valued operand runs it at every coordinate.
+    scales = collect(range(0.5, 2.0; length = length(xs)))
+    _EMITTED_ONCE_CALLS[] = 0
+    @test invariant(xs, scales) ≈ sum(xs .* log.(scales))
+    @test _EMITTED_ONCE_CALLS[] == length(xs)
+
+    # A scan in such a cell keeps only its own emission.
+    groups = [[1.0, 2.0], [3.0], [0.5, 0.25, 4.0]]
+    alone = prepare(_emitted_once_scan_alone)
+    for kernel in (prepare(_emitted_once_scan_cell),
+                   prepare(_emitted_once_scan_cell; bound = (; groups)))
+        @test _emitted_count(kernel, r"0\.125") == _emitted_count(alone, r"0\.125")
+    end
+    @test prepare(_emitted_once_scan_cell)(groups, 0.5) ≈
+          sum(alone(g, 0.5) for g in groups)
+end
+
+# --- bound plate arguments lower as their class declares (todo 0hc187j,
+# follow-up to snag prepared-kernel-ae180d1a)
+# A bound plate argument is a constant, so preparation knows its value's class
+# even when its port declares no type. A bound `1:n` domain lowers exactly like
+# a declared `UnitRange` (no runtime axis guard, no per-coordinate bookkeeping),
+# a bound scalar operand like a declared `Float64` (computed once, above the
+# loop). The compiled residual is kept per class: another element type or
+# extent of the same class reuses it, another class lowers its own.
+@kernel _bound_class_matrix(x, scale) = begin
+    pointwise = plate(x, scale) do xi, si
+        log_scale = log(si) + 0.0625
+        xi * log_scale
+    end
+    return sum(pointwise)
+end
+@kernel _declared_class_matrix(x, scale::Matrix{Float64}) = begin
+    pointwise = plate(x, scale) do xi, si
+        log_scale = log(si) + 0.0625
+        xi * log_scale
+    end
+    return sum(pointwise)
+end
+function _generated_code_text(kernel)
+    parts = String[string(code_expr(kernel))]
+    for op in kernel.ops
+        (op isa ReactiveKernels._AuthoredPlateOp ||
+         op isa ReactiveKernels._AuthoredScanOp) || continue
+        push!(parts, _generated_code_text(op.kernel))
+    end
+    join(parts, "\n")
+end
+_unguarded(kernel) = (code = _generated_code_text(kernel);
+    !occursin("_authored_plate_is_axis", code) && !occursin("plate_first", code) &&
+    !occursin("plate_previous", code))
+# The generated body with gensym counters and the argument line removed: a
+# bound port is a constant line instead of an argument.
+_lowered_body(kernel) = [replace(line, r"#\d+" => "#")
+    for line in split(string(ReactiveKernels._readable_expr(
+        code_expr(kernel), kernel)), '\n')
+    if !startswith(line, "function") && !occursin(r"^\s*xs = ", line)]
+
+@testset "authored plate native: bound plate arguments lower as their class" begin
+    typed = prepare(_emitted_once_typed)
+    for xs in (1:4, collect(1.0:4.0), (1.0, 2.0, 3.0, 4.0))
+        kernel = prepare(_emitted_once_untyped; bound = (; xs))
+        @test _unguarded(kernel)
+        @test _emitted_count(kernel, r"0\.75") == 1
+        @test kernel(0.5) == typed(collect(Float64, xs), 0.5)
+    end
+    # Identical to the declared-type lowering, line for line.
+    @test _lowered_body(prepare(_emitted_once_untyped; bound = (; xs = collect(1.0:4.0)))) ==
+          _lowered_body(typed)
+    # A live untyped domain keeps its runtime guard.
+    @test !_unguarded(prepare(_emitted_once_untyped))
+
+    # A bound scalar operand is a plate invariant computed above the loop.
+    xs = collect(range(-1.0, 2.0; length = 7))
+    scalar = prepare(_emitted_once_invariant; bound = (; s = 1.7))
+    @test _unguarded(scalar)
+    @test _emitted_count(scalar, r"_emitted_once_log\(") == 1
+    _EMITTED_ONCE_CALLS[] = 0
+    @test scalar(xs) ≈ sum(xs .* log(1.7))
+    @test _EMITTED_ONCE_CALLS[] == 1
+    # A rank-0 array holds no axis but is not a scalar: it keeps the guard and
+    # is still computed once per call.
+    zerodim = prepare(_emitted_once_invariant; bound = (; s = fill(1.7)))
+    @test !_unguarded(zerodim)
+    _EMITTED_ONCE_CALLS[] = 0
+    @test zerodim(xs) ≈ sum(xs .* log(1.7))
+    @test _EMITTED_ONCE_CALLS[] == 1
+
+    # A bound matrix operand lowers like a declared `Matrix`: a rank-2 axis
+    # with no runtime axis test of its own, where the live untyped port keeps
+    # one. (`x` is live and untyped, so the inner-plate pass leaves the
+    # scale-only recipe in the cell.)
+    x = [0.5, 1.5, 2.5]
+    scale = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+    scale_guard = "_authored_plate_is_axis(scale)"
+    matrix = prepare(_bound_class_matrix; bound = (; scale))
+    declared = prepare(_declared_class_matrix)
+    @test !occursin(scale_guard, _generated_code_text(matrix))
+    @test !occursin(scale_guard, _generated_code_text(declared))
+    @test occursin(scale_guard, _generated_code_text(prepare(_bound_class_matrix)))
+    @test matrix(x) ≈ declared(x, scale) ≈ sum(x .* (log.(scale) .+ 0.0625))
+
+    # One compiled residual per class through a cache.
+    cache = PreparationCache()
+    range_kernel = prepare!(cache, _emitted_once_untyped; bound = (; xs = 1:4))
+    vector_kernel = prepare!(cache, _emitted_once_untyped; bound = (; xs = [0.25, 3.0]))
+    tuple_kernel = prepare!(cache, _emitted_once_untyped; bound = (; xs = (0.25, 3.0)))
+    @test vector_kernel.f === range_kernel.f && vector_kernel.ast === range_kernel.ast
+    @test tuple_kernel.ast !== range_kernel.ast
+    @test range_kernel(0.5) == typed(collect(1.0:4.0), 0.5)
+    @test vector_kernel(0.5) == tuple_kernel(0.5) == typed([0.25, 3.0], 0.5)
+    @test length(only(values(cache.bound)).templates) == 2
+
+    cache = PreparationCache()
+    first_scalar = prepare!(cache, _emitted_once_invariant; bound = (; s = 1.7))
+    narrow_scalar = prepare!(cache, _emitted_once_invariant; bound = (; s = 2.5f0))
+    rank0 = prepare!(cache, _emitted_once_invariant; bound = (; s = fill(1.7)))
+    @test narrow_scalar.ast === first_scalar.ast
+    @test rank0.ast !== first_scalar.ast
+    @test first_scalar(xs) ≈ rank0(xs) ≈ sum(xs .* log(1.7))
+    @test narrow_scalar(xs) ≈ sum(xs .* log(2.5f0))
+    # Rebinding a class seen earlier reuses its residual.
+    @test prepare!(cache, _emitted_once_invariant; bound = (; s = 0.3)).ast === first_scalar.ast
+end
+
+# --- per-cell reductions over a few host indices (snag plate-cell-gathe-94d4a929)
+# A plate cell that superposes a few dose responses per observation. The
+# reporter authored it as vector temporaries (`observation .- shifts`,
+# `max.(row, 1)`, a gather, a mask, a fused product, `sum`): every temporary is
+# an ordinary per-cell Julia allocation, so the prepared plate allocated ~336 B
+# per cell and ran ~50× slower than a hand loop. A scalar generator over the
+# per-dose index is allocation-free natively AND lowers per lane under Reactant
+# (`test_ref_array_plate_reactant.jl`), with either plan representation behind a
+# per-dose accessor: index arithmetic on host data for the lattice plan, and the
+# one-element reduction `sum(view(row, i:i))` for a stored row (the same
+# normalization the tensorized `row[i]` lowering uses, so it never trips
+# Reactant's scalar-indexing guard inside an opaque helper).
+struct _PlateGatherLattice
+    shifts::Vector{Int}
+    nobs::Int
+end
+struct _PlateGatherExact
+    rows::Matrix{Int}
+end
+_plate_gather_domain(plan::_PlateGatherLattice) = collect(1:plan.nobs)
+_plate_gather_domain(plan::_PlateGatherExact) = eachrow(plan.rows)
+_plate_gather_slots(plan::_PlateGatherLattice) = eachindex(plan.shifts)
+_plate_gather_slots(plan::_PlateGatherExact) = axes(plan.rows, 2)
+_plate_gather_index(observation, plan::_PlateGatherLattice, i) =
+    observation - plan.shifts[i]
+_plate_gather_index(row, ::_PlateGatherExact, i) = sum(view(row, i:i))
+
+@kernel authored_gather_generator_plate(plan, units, weights) = begin
+    observations = _plate_gather_domain(plan)
+    concentration::Vector{Float64} = plate(observations) do observation
+        sum(ifelse(_plate_gather_index(observation, plan, i) > 0,
+                   units[max(_plate_gather_index(observation, plan, i), 1)] *
+                       weights[i], 0.0)
+            for i in _plate_gather_slots(plan))
+    end
+    return concentration
+end
+
+# The reporter's vector-temporary cell, kept as the value reference and as the
+# allocation control this testset contrasts against.
+_plate_gather_row(row, response, amounts) =
+    sum(response[max.(row, 1)] .* (row .> 0) .* amounts)
+@kernel authored_gather_broadcast_plate(plan, units, weights) = begin
+    observations = collect(1:plan.nobs)
+    concentration::Vector{Float64} = plate(observations) do observation
+        row = observation .- plan.shifts
+        _plate_gather_row(row, units, weights)
+    end
+    return concentration
+end
+
+# Function barrier so `@allocated` measures the kernel, not global-ref boxing.
+_plate_gather_allocated(k, plan, units, weights) = @allocated k(plan, units, weights)
+
+@testset "authored plate block: per-cell generator reduction over host indices" begin
+    shifts = [0, 40, 100]
+    weights = [3.0, 1.5, 0.25]
+    generator = prepare(authored_gather_generator_plate)
+    broadcast_cell = prepare(authored_gather_broadcast_plate)
+    # Bytes per call at two lane counts: the growth between them is the
+    # per-cell cost, independent of the fixed call overhead.
+    bytes = Dict{Tuple{Symbol,Int},Int}()
+    for nobs in (257, 513)
+        lattice = _PlateGatherLattice(shifts, nobs)
+        exact = _PlateGatherExact([o - s for o in 1:nobs, s in shifts])
+        units = collect(range(0.5, 2.0; length = nobs))
+        expected = [sum(o - s > 0 ? units[o - s] * w : 0.0
+                        for (s, w) in zip(shifts, weights)) for o in 1:nobs]
+        @test generator(lattice, units, weights) ≈ expected
+        @test generator(exact, units, weights) ≈ expected
+        @test broadcast_cell(lattice, units, weights) ≈ expected
+        _plate_gather_allocated(generator, lattice, units, weights)
+        _plate_gather_allocated(generator, exact, units, weights)
+        _plate_gather_allocated(broadcast_cell, lattice, units, weights)
+        bytes[(:lattice, nobs)] = _plate_gather_allocated(generator, lattice, units, weights)
+        bytes[(:exact, nobs)] = _plate_gather_allocated(generator, exact, units, weights)
+        bytes[(:broadcast, nobs)] = _plate_gather_allocated(broadcast_cell, lattice, units, weights)
+    end
+    growth(kind) = bytes[(kind, 513)] - bytes[(kind, 257)]
+    per_cell_output = sizeof(Float64) * (513 - 257)
+    # Lattice: the output plus the `collect(1:nobs)` domain recipe grow with
+    # the lane count; exact rows (`eachrow` is lazy): the output only. Nothing
+    # per cell in either case.
+    @test growth(:lattice) <= 2 * per_cell_output + 64
+    @test growth(:exact) <= per_cell_output + 64
+    # The vector-temporary cell allocates several small arrays per cell.
+    @test growth(:broadcast) > 100 * (513 - 257)
+end
+
+# --- the natural superposition cell (snag one-natural-supe-39da86a4)
+# The concentration at observation t is the sum, over the doses already given,
+# of the dose weight times the unit response at the lag since that dose. Two
+# natural spellings state exactly that: the unit response extended by zero
+# before its dose (`get(units, lag, 0.0)`, Base's total gather), and the sum
+# over the doses given (a filtered generator). Both are ordinary Julia natively;
+# the tensorized companion keeps each branch lazy (`test_ref_array_plate_reactant.jl`).
+# One graph serves both plan types through dispatching helpers: its domain port
+# carries no declared type, and the native lowering schedules it from the
+# concrete value it receives.
+struct _NaturalSupLattice
+    shifts::Vector{Int}
+    nobs::Int
+end
+struct _NaturalSupExact
+    rows::Matrix{Int}
+end
+_natural_sup_domain(plan::_NaturalSupLattice) = 1:plan.nobs
+_natural_sup_domain(plan::_NaturalSupExact) = eachrow(plan.rows)
+_natural_sup_doses(plan::_NaturalSupLattice) = eachindex(plan.shifts)
+_natural_sup_doses(plan::_NaturalSupExact) = axes(plan.rows, 2)
+_natural_sup_lag(t, plan::_NaturalSupLattice, j) = t - plan.shifts[j]
+_natural_sup_lag(row, ::_NaturalSupExact, j) = row[j]
+
+@kernel natural_sup_get(plan, units, weights) = begin
+    observations::UnitRange{Int} = 1:plan.nobs
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * get(units, t - plan.shifts[j], 0.0) for j in eachindex(plan.shifts); init = 0.0)
+    end
+    return concentration
+end
+@kernel natural_sup_filter(plan, units, weights) = begin
+    observations::UnitRange{Int} = 1:plan.nobs
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * units[t - plan.shifts[j]] for j in eachindex(plan.shifts) if t > plan.shifts[j]; init = 0.0)
+    end
+    return concentration
+end
+@kernel natural_sup_one_graph(plan, units, weights) = begin
+    observations = _natural_sup_domain(plan)
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * get(units, _natural_sup_lag(t, plan, j), 0.0) for j in _natural_sup_doses(plan); init = 0.0)
+    end
+    return concentration
+end
+# The same one-graph cell with the domain port declared, the per-plan-type
+# split this graph replaces; the allocation control below.
+@kernel natural_sup_lattice_typed(plan, units, weights) = begin
+    observations::UnitRange{Int} = 1:plan.nobs
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * get(units, _natural_sup_lag(t, plan, j), 0.0) for j in _natural_sup_doses(plan); init = 0.0)
+    end
+    return concentration
+end
+
+_natural_sup_allocated(k, plan, units, weights) = @allocated k(plan, units, weights)
+_natural_sup_slots(s) = eachindex(s)
+# Slack for the cross-kernel allocation comparisons below. Exact byte identity
+# between differently-lowered kernels is not portable: Windows Julia 1.13.1
+# measured +32/+48 B for the undeclared-domain kernel against the declared one
+# (CI run 36811107488; the declared baseline itself reads 2183 B there against
+# 2184 B on Linux), while both execute identical allocation sequences on Linux.
+# The slack absorbs such platform constants while keeping the documented
+# regressions detectable: the 304 B runtime marker and any per-cell allocation
+# (at least 16 B per observation here).
+_natural_sup_parity_margin = 128
+
+@testset "authored plate block: natural superposition cell (get, filtered sum, one graph)" begin
+    nobs = 257
+    units = collect(range(0.5, 2.0; length = nobs))
+    kernels = map(prepare, (natural_sup_get, natural_sup_filter, natural_sup_one_graph,
+                            natural_sup_lattice_typed))
+    get_cell, filter_cell, one_graph, typed = kernels
+    for shifts in ([0, 40, 100], [3, 3, 250], Int[])
+        weights = collect(range(0.75, 1.5; length = length(shifts)))
+        expected = [sum((t > s ? w * units[t - s] : 0.0 for (s, w) in zip(shifts, weights));
+                        init = 0.0) for t in 1:nobs]
+        lattice = _NaturalSupLattice(shifts, nobs)
+        exact = _NaturalSupExact([max(t - s, 0) for t in 1:nobs, s in shifts])
+        @test get_cell(lattice, units, weights) == expected
+        @test filter_cell(lattice, units, weights) == expected
+        @test one_graph(lattice, units, weights) == expected
+        @test one_graph(exact, units, weights) == expected
+        @test typed(lattice, units, weights) == expected
+    end
+
+    # The undeclared domain schedules like the declared one: the output is the
+    # only allocation, on both plan types (before, the runtime axis marker
+    # allocated 304 B per call and every cell carried the axis-changed guard).
+    shifts = [0, 40, 100]
+    weights = [3.0, 1.5, 0.25]
+    lattice = _NaturalSupLattice(shifts, nobs)
+    exact = _NaturalSupExact([max(t - s, 0) for t in 1:nobs, s in shifts])
+    for (k, plan) in ((one_graph, lattice), (one_graph, exact), (typed, lattice))
+        _natural_sup_allocated(k, plan, units, weights)
+    end
+    output_bytes = _natural_sup_allocated(typed, lattice, units, weights)
+    # A per-cell allocation would add at least 16 B per observation.
+    @test output_bytes < 2 * sizeof(Float64) * nobs
+    # Bounded parity (slack above): the undeclared domain adds no per-call
+    # scheduling allocation on either plan type.
+    @test _natural_sup_allocated(one_graph, lattice, units, weights) <=
+          output_bytes + _natural_sup_parity_margin
+    @test _natural_sup_allocated(one_graph, exact, units, weights) <=
+          output_bytes + _natural_sup_parity_margin
+end
+
+# Dose-outer lowering of a gathered generator sum (`_KernelReduction`). The
+# control reads through an alias of `get` that the lowering does not recognize,
+# so it keeps the observation-outer cell loop; every value must match it
+# bitwise, including the NaN an infinite weight makes outside the window.
+const _dose_outer_fetch = Base.get
+@kernel dose_outer_cell(plan, units, weights) = begin
+    observations = _natural_sup_domain(plan)
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * get(units, _natural_sup_lag(t, plan, j), 0.0) for j in eachindex(weights); init = 0.0)
+    end
+    total = sum(concentration)
+    return concentration, total
+end
+@kernel dose_outer_control(plan, units, weights) = begin
+    observations = _natural_sup_domain(plan)
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * _dose_outer_fetch(units, _natural_sup_lag(t, plan, j), 0.0) for j in eachindex(weights); init = 0.0)
+    end
+    total = sum(concentration)
+    return concentration, total
+end
+# An `Int` seed against `Float64` terms changes the accumulator type after the
+# first dose: the lowering keeps the cell loop.
+@kernel dose_outer_int_seed(plan, units, weights) = begin
+    observations = _natural_sup_domain(plan)
+    concentration = plate(observations) do t
+        sum(weights[j] * get(units, _natural_sup_lag(t, plan, j), 0.0) for j in eachindex(weights); init = 0)
+    end
+    return concentration
+end
+# A dose loop whose range reads the cell is not a plate invariant.
+@kernel dose_outer_cell_range(plan, units, weights) = begin
+    observations = _natural_sup_domain(plan)
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * get(units, _natural_sup_lag(t, plan, j), 0.0) for j in 1:min(t, length(weights)); init = 0.0)
+    end
+    return concentration
+end
+_dose_outer_reductions(kernel) = count(op -> op isa ReactiveKernels._KernelSourceOp &&
+                                             op.f isa ReactiveKernels._KernelReduction, kernel.ops)
+_dose_outer_same(a, b) = length(a) == length(b) && all(map(===, a, b))
+
+@testset "authored plate block: a gathered generator sum runs dose-outer, bitwise" begin
+    cell, control = prepare(dose_outer_cell), prepare(dose_outer_control)
+    @test _dose_outer_reductions(cell) == 1
+    @test _dose_outer_reductions(control) == 0
+    # The filtered sum skips the term (and its index): no dose-outer parts.
+    @test _dose_outer_reductions(prepare(natural_sup_filter)) == 0
+    nobs = 257
+    for (shifts, weights, nunits) in (
+            ([0, 40, 100], [3.0, 1.5, 0.25], nobs),
+            ([3, 3, 250], [0.75, -1.0, 2.0], nobs),
+            ([300, 0], [1.0, 2.0], nobs),               # a dose after the horizon
+            ([-5, 10], [1.0, 2.0], nobs),               # lags past the response
+            ([0, 40], [-0.0, Inf], nobs),               # NaN outside the window
+            ([0, 40, 100], [3.0, 1.5, 0.25], 50),       # a shorter response
+            ([0, 40], [1.0, 2.0], 0),                   # an empty response
+            (Int[], Float64[], nobs))
+        units = nunits == 0 ? Float64[] : collect(range(0.5, 2.0; length = nunits))
+        lattice = _NaturalSupLattice(shifts, nobs)
+        exact = _NaturalSupExact([max(t - s, 0) for t in 1:nobs, s in shifts])
+        for plan in (lattice, exact)
+            got, expected = cell(plan, units, weights), control(plan, units, weights)
+            @test _dose_outer_same(got[1], expected[1])
+            @test got[2] === expected[2]
+        end
+    end
+    # The authored values, for the plain cases.
+    units = collect(range(0.5, 2.0; length = nobs))
+    shifts, weights = [3, 3, 250], [0.75, -1.0, 2.0]
+    @test cell(_NaturalSupLattice(shifts, nobs), units, weights)[1] ==
+          [sum((t > s ? w * units[t - s] : 0.0 for (s, w) in zip(shifts, weights)); init = 0.0)
+           for t in 1:nobs]
+    # An empty plate.
+    @test cell(_NaturalSupLattice([0, 4], 0), units, [1.0, 2.0]) == (Float64[], 0.0)
+    # Not split, same values: a non-`Vector` response, an `Int` seed, a dose
+    # range that reads the cell.
+    lattice = _NaturalSupLattice([0, 40, 100], nobs)
+    weights = [3.0, 1.5, 0.25]
+    @test _dose_outer_same(cell(lattice, view(units, :), weights)[1],
+                           control(lattice, view(units, :), weights)[1])
+    int_seed = prepare(dose_outer_int_seed)
+    @test _dose_outer_reductions(int_seed) == 1
+    @test int_seed(lattice, units, weights) == control(lattice, units, weights)[1]
+    @test _dose_outer_reductions(prepare(dose_outer_cell_range)) == 1
+    @test prepare(dose_outer_cell_range)(lattice, units, weights) ==
+          [sum((w * get(units, t - s, 0.0) for (s, w) in
+                Iterators.take(zip(lattice.shifts, weights), min(t, 3))); init = 0.0)
+           for t in 1:nobs]
+    # The output is the only allocation, as for the cell loop (bounded parity,
+    # same slack: the two lowerings differ, so exact identity is not portable).
+    _natural_sup_allocated(cell, lattice, units, weights)
+    _natural_sup_allocated(control, lattice, units, weights)
+    @test _natural_sup_allocated(cell, lattice, units, weights) <=
+          _natural_sup_allocated(control, lattice, units, weights) +
+          _natural_sup_parity_margin
+end
+
+# A domain with two axes runs the same passes over its Cartesian cells
+# (`_plate_cells`), in coordinate order.
+@kernel dose_outer_grid(observations, shifts, units, weights) = begin
+    concentration = plate(observations) do t
+        sum(weights[j] * get(units, t - shifts[j], 0.0) for j in eachindex(weights); init = 0.0)
+    end
+    total = sum(concentration)
+    return concentration, total
+end
+@kernel dose_outer_grid_control(observations, shifts, units, weights) = begin
+    concentration = plate(observations) do t
+        sum(weights[j] * _dose_outer_fetch(units, t - shifts[j], 0.0) for j in eachindex(weights); init = 0.0)
+    end
+    total = sum(concentration)
+    return concentration, total
+end
+
+@testset "authored plate block: dose-outer over a two-axis domain" begin
+    grid, control = prepare(dose_outer_grid), prepare(dose_outer_grid_control)
+    @test _dose_outer_reductions(grid) == 1
+    units = collect(range(0.5, 2.0; length = 200))
+    for (shifts, weights) in (([0, 40, 100], [3.0, 1.5, 0.25]), ([0, 40], [-0.0, Inf]))
+        observations = reshape(collect(1:255), 15, 17)
+        got, expected = grid(observations, shifts, units, weights),
+                        control(observations, shifts, units, weights)
+        @test size(got[1]) == (15, 17)
+        @test _dose_outer_same(vec(got[1]), vec(expected[1]))
+        @test got[2] === expected[2]
+    end
+end
+
+# Coefficient-outer lowering of an `evalpoly(x, c)` cell over shared
+# coefficients (snags native-lowering-948c4ab6, evalpoly-per-cel-cea5fcf5).
+# Base's `evalpoly` over a vector is a per-cell runtime Horner loop; the
+# lowering runs chunks of cells side by side, their accumulators in registers
+# across the coefficients (`_plate_evalpoly_chunks!`), with Base's operations
+# in Base's order. The control calls the same `evalpoly` through a function
+# the lowering does not recognize, so it keeps the cell loop.
+_plate_horner(x, c) = evalpoly(x, c)
+@kernel evalpoly_cell(xs, c) = begin
+    ys = plate(xs) do x
+        evalpoly(x, c)
+    end
+    total = sum(ys)
+    return ys, total
+end
+@kernel evalpoly_cell_reordered(xs, c) = begin
+    ys = plate(Ref(c), xs) do c, x
+        evalpoly(x, c)
+    end
+    return ys
+end
+@kernel evalpoly_control(xs, c) = begin
+    ys = plate(xs) do x
+        _plate_horner(x, c)
+    end
+    total = sum(ys)
+    return ys, total
+end
+# `x` read beside a second lane: a one-element `xs` expands to `ws`'s axes.
+@kernel evalpoly_cell_expanded(xs, ws, c) = begin
+    ys = plate(xs, ws) do x, w
+        evalpoly(x, c) + 0 * w
+    end
+    return ys
+end
+_evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(kernel)))
+
+@testset "authored plate block: an evalpoly cell over shared coefficients runs coefficient-outer" begin
+    cell, control = prepare(evalpoly_cell), prepare(evalpoly_control)
+    @test _evalpoly_lowered(cell)
+    @test !_evalpoly_lowered(control)
+    @test _evalpoly_lowered(prepare(evalpoly_cell_reordered))
+    coefficients = [1.0, -0.25, 0.125, 0.3, -0.07, 0.011, 2.5e-3, -4.0e-4, 1.0e-5, 3.0e-6, -7.0e-7]
+    # Lengths around the chunk, and degrees down to a constant.
+    chunk = ReactiveKernels._PLATE_HORNER_CHUNK
+    lengths = (0, 1, chunk - 1, chunk, chunk + 1, 2chunk - 1, 2chunk + 1, 255, 1000)
+    for n in lengths, c in (coefficients, coefficients[1:2], [2.5])
+        xs = [1 / (k + 0.5) for k in 0:n-1]
+        got, expected = cell(xs, c), control(xs, c)
+        @test got[1] == expected[1] == evalpoly.(xs, Ref(c))
+        @test got[2] === expected[2]
+        @test prepare(evalpoly_cell_reordered)(xs, c) == expected[1]
+    end
+    xs = collect(range(-2.0, 2.0; length = 300))
+    # Not lowered, same values: integer coefficients (the seed's type is not
+    # the cell's), a tuple (Base's unrolled method), a two-axis domain.
+    @test cell(xs, [1, 2, 3])[1] == evalpoly.(xs, Ref([1, 2, 3]))
+    @test cell(xs, Tuple(coefficients))[1] == evalpoly.(xs, Ref(Tuple(coefficients)))
+    grid = reshape(xs, 15, 20)
+    @test cell(grid, coefficients)[1] == evalpoly.(grid, Ref(coefficients))
+    # A one-based view is lowered like a vector.
+    @test cell(xs, view(coefficients, 2:6))[1] == evalpoly.(xs, Ref(view(coefficients, 2:6)))
+    # Base evaluates a complex `x` with its own recurrence, so it keeps the
+    # cell loop; a real `x` over complex coefficients is Horner's and lowered.
+    zs = complex.(xs, reverse(xs) ./ 3)
+    zc = complex.(coefficients, 0.1 .* reverse(coefficients))
+    @test cell(zs, zc)[1] == evalpoly.(zs, Ref(zc))
+    @test cell(xs, zc)[1] == evalpoly.(xs, Ref(zc))
+    # An `x` expanded from one element is not read directly; same values.
+    expanded = prepare(evalpoly_cell_expanded)
+    @test expanded([0.3], xs, coefficients) == fill(evalpoly(0.3, coefficients), length(xs))
+    @test expanded(xs, [1.0], coefficients) == evalpoly.(xs, Ref(coefficients))
+    # Base's errors: empty coefficients have no `c[end]`.
+    @test_throws BoundsError cell(xs, Float64[])
+    @test cell(Float64[], Float64[]) == (Float64[], 0.0)
+    # The output is the only allocation, as for the cell loop.
+    allocated(k, xs, c) = @allocated k(xs, c)
+    allocated(cell, xs, coefficients)
+    allocated(control, xs, coefficients)
+    @test allocated(cell, xs, coefficients) <= allocated(control, xs, coefficients) +
+                                                _natural_sup_parity_margin
+    # The kernel calls the chunked helper, whose chunk runs as vector
+    # operations across its cells.
+    @test occursin("_plate_evalpoly_chunks!", _plate_entry_llvm(cell, xs, coefficients))
+    if Sys.ARCH in (:x86_64, :aarch64)
+        chunk_llvm = sprint(io -> InteractiveUtils.code_llvm(io,
+            ReactiveKernels._plate_evalpoly_chunk!,
+            Tuple{Vector{Float64}, Vector{Float64}, Vector{Float64}, Int, Float64, Int,
+                  Val{chunk}}; debuginfo = :none))
+        if _VECTOR_CODEGEN
+            @test occursin(r"<\d+ x double>", chunk_llvm)
+        else
+            @test_skip occursin(r"<\d+ x double>", chunk_llvm)
+        end
+    end
+end
+
+# Plates that only feed a lockstep scan run strip by strip with it (snag
+# native-lowering-948c4ab6): `_PLATE_STRIP` cells of every such plate, then the
+# scan's steps over them, so no plate output is stored at full length. A
+# domain that is not a vector (here a tuple) keeps the materialized plates.
+# `muladd` leaves contraction to the compiler, so the two lowerings agree to
+# rounding.
+using ReactiveKernels: scan
+@kernel strip_recurrence(steps, pa, pb, q, ea, eb, ca, cb, g0, a0, b0) = begin
+    xs = plate(steps) do k
+        1 / (k + 0.5)
+    end
+    sa = plate(xs) do x
+        evalpoly(x, pa)
+    end
+    sb = plate(xs) do x
+        evalpoly(x, pb)
+    end
+    ratio = plate(xs) do x
+        evalpoly(x, q)
+    end
+    out = scan(sa, sb, ratio;
+               init = (g = g0, a = a0, b = b0)) do carry, pa_k, pb_k, q_k
+        a = muladd(ea, carry.a, carry.g * pa_k)
+        b = muladd(eb, carry.b, carry.g * pb_k)
+        ((g = carry.g * q_k, a = a, b = b), ca * a + cb * b)
+    end
+    return out
+end
+# The same recurrence with a second, ordinary sequence in lockstep.
+@kernel strip_lockstep(steps, weights, pa) = begin
+    xs = plate(steps) do k
+        1 / (k + 0.5)
+    end
+    sa = plate(xs) do x
+        evalpoly(x, pa)
+    end
+    out = scan(sa, weights; init = 0.0) do carry, s, w
+        next = muladd(w, carry, s)
+        (next, next)
+    end
+    return out
+end
+# Not strip-fused: an init-including scan, and a plate whose output is also summed.
+@kernel strip_include_init(steps, pa) = begin
+    sa = plate(steps) do k
+        evalpoly(1 / (k + 0.5), pa)
+    end
+    out = scan(sa; init = 0.0, include_init = true) do carry, s
+        (carry + s, carry + s)
+    end
+    return out
+end
+@kernel strip_shared_output(steps, pa) = begin
+    sa = plate(steps) do k
+        evalpoly(1 / (k + 0.5), pa)
+    end
+    total = sum(sa)
+    out = scan(sa; init = 0.0) do carry, s
+        (carry + s, carry + s)
+    end
+    return out, total
+end
+function _strip_reference(steps, pa, pb, q, ea, eb, ca, cb, g, a, b)
+    out = Float64[]
+    for k in steps
+        x = 1 / (k + 0.5)
+        a = muladd(ea, a, g * evalpoly(x, pa))
+        b = muladd(eb, b, g * evalpoly(x, pb))
+        push!(out, ca * a + cb * b)
+        g *= evalpoly(x, q)
+    end
+    out
+end
+_strip_fused(kernel) = occursin("_plate_strip_ready", string(code_expr(kernel)))
+
+@testset "authored plate block: plates that only feed a scan run strip by strip" begin
+    kernel = prepare(strip_recurrence)
+    @test _strip_fused(kernel)
+    @test _strip_fused(prepare(strip_lockstep))
+    @test !_strip_fused(prepare(strip_include_init))
+    @test !_strip_fused(prepare(strip_shared_output))
+    pa = [1.0, 0.3, -0.2, 0.05, 0.01]
+    pb = [0.8, -0.1, 0.04]
+    q = [0.99, 0.002, -0.001]
+    coefficients = (pa, pb, q, exp(-0.01), exp(-0.12), 0.3, 0.7, 1.0, 0.0, 0.0)
+    for n in (0, 1, 127, 128, 129, 257, 1000)
+        steps = 0:n-1
+        got = kernel(steps, coefficients...)
+        expected = _strip_reference(steps, coefficients...)
+        @test length(got) == n
+        @test isapprox(got, expected; rtol = 1e-13)
+        # The materialized lowering (a tuple domain) agrees.
+        # (An empty tuple is type-erased and has no reduction identity.)
+        1 <= n <= 300 && @test isapprox(got, kernel(Tuple(steps), coefficients...); rtol = 1e-13)
+        # Tuple coefficients take Base's unrolled `evalpoly` in the same strips.
+        @test isapprox(kernel(steps, Tuple(pa), Tuple(pb), Tuple(q), coefficients[4:end]...),
+                       expected; rtol = 1e-13)
+    end
+    # A second sequence in lockstep reads the same steps.
+    steps, weights = 0:299, collect(range(0.1, 0.9; length = 300))
+    lockstep = prepare(strip_lockstep)
+    expected = accumulate((c, (s, w)) -> muladd(w, c, s),
+                          zip(evalpoly.(1 ./ (steps .+ 0.5), Ref(pa)), weights); init = 0.0)
+    @test isapprox(lockstep(steps, weights, pa), expected; rtol = 1e-13)
+    @test_throws DimensionMismatch lockstep(steps, weights[1:end-1], pa)
+    # Not strip-fused, same values as authored.
+    @test prepare(strip_include_init)(0:9, pa) ==
+        [0.0; cumsum(evalpoly.(1 ./ ((0:9) .+ 0.5), Ref(pa)))]
+    shared = prepare(strip_shared_output)(0:9, pa)
+    @test shared[1] == cumsum(evalpoly.(1 ./ ((0:9) .+ 0.5), Ref(pa)))
+    # No full-length intermediates: the output plus strip buffers, against the
+    # four full-length plate outputs of the materialized lowering.
+    steps = 0:6527
+    allocated(k, steps) = @allocated k(steps, coefficients...)
+    allocated(kernel, steps)
+    @test allocated(kernel, steps) < 2 * sizeof(Float64) * length(steps)
+end
+
+# A plain scan step's carry-independent statements that read the step's
+# elements run as one-cell plates in the scan's strip region (snag
+# native-lowering-948c4ab6): the step reads their values from the strip.
+# Statements that read the carry, and values that are not concrete numbers,
+# stay in the step.
+@kernel fission_recurrence(steps, pa, pb, q, ea, eb, ca, cb, g0, a0, b0) = begin
+    out = scan(steps;
+               init = (g = g0, a = a0, b = b0)) do carry, k
+        x = 1 / (k + 0.5)
+        pa_k = evalpoly(x, pa)
+        pb_k = evalpoly(x, pb)
+        q_k = evalpoly(x, q)
+        a = muladd(ea, carry.a, carry.g * pa_k)
+        b = muladd(eb, carry.b, carry.g * pb_k)
+        ((g = carry.g * q_k, a = a, b = b), ca * a + cb * b)
+    end
+    return out
+end
+# A hoisted value that is a tuple keeps the step as authored.
+@kernel fission_tuple_value(steps, w) = begin
+    out = scan(steps; init = 0.0) do carry, k
+        pair = (k * w, k + w)
+        (carry + pair[1] * pair[2], carry)
+    end
+    return out
+end
+_fission_hoisted(kernel) = occursin("scan_hoisted", string(code_expr(kernel)))
+
+@testset "authored scan: carry-independent step statements run in the strip region" begin
+    kernel = prepare(fission_recurrence)
+    @test _fission_hoisted(kernel)
+    @test _strip_fused(kernel)
+    pa = [1.0, 0.3, -0.2, 0.05, 0.01]
+    pb = [0.8, -0.1, 0.04]
+    q = [0.99, 0.002, -0.001]
+    coefficients = (pa, pb, q, exp(-0.01), exp(-0.12), 0.3, 0.7, 1.0, 0.0, 0.0)
+    for n in (0, 1, 127, 128, 129, 257, 1000)
+        steps = 0:n-1
+        expected = _strip_reference(steps, coefficients...)
+        got = kernel(steps, coefficients...)
+        @test length(got) == n
+        @test isapprox(got, expected; rtol = 1e-13)
+        @test isapprox(kernel(steps, Tuple(pa), Tuple(pb), Tuple(q), coefficients[4:end]...),
+                       expected; rtol = 1e-13)
+    end
+    # Without a fold, the step stays as authored (cheap carry-independent work
+    # already runs beside the carry chain).
+    @test !_fission_hoisted(prepare(fission_tuple_value))
+    tuple_kernel = prepare(fission_tuple_value)
+    @test tuple_kernel(0:9, 0.5) ==
+          [sum((k * 0.5) * (k + 0.5) for k in 0:j-1; init = 0.0) for j in 0:9]
+    # The output plus strip buffers only.
+    steps = 0:6527
+    allocated(k, steps) = @allocated k(steps, coefficients...)
+    allocated(kernel, steps)
+    @test allocated(kernel, steps) < 2 * sizeof(Float64) * length(steps)
+end
+
+# A gather-free generator sum whose term is plain arithmetic runs fold-outer
+# over tiles of cells (snag native-lowering-948c4ab6, todo 16mekxc): one pass
+# over a tile per element, each cell accumulating `add_sum` in the authored
+# order. The control calls a function the lowering does not recognize, so it
+# keeps the cell loop; every value must match it bitwise. A term that calls
+# anything but Base's arithmetic (`exp` here) keeps the cell loop.
+_fold_sum_div(a, b) = a / b
+@kernel fold_sum_cell(ts, w, s) = begin
+    out::Vector{Float64} = plate(ts) do t
+        sum(w[j] / (t + s[j]) for j in eachindex(w); init = 0.0)
+    end
+    total = sum(out)
+    return out, total
+end
+@kernel fold_sum_control(ts, w, s) = begin
+    out::Vector{Float64} = plate(ts) do t
+        sum(_fold_sum_div(w[j], t + s[j]) for j in eachindex(w); init = 0.0)
+    end
+    total = sum(out)
+    return out, total
+end
+# A tuple or two-axis domain keeps the cell loop.
+@kernel fold_sum_any(ts, w, s) = begin
+    out = plate(ts) do t
+        sum(w[j] / (t + s[j]) for j in eachindex(w); init = 0.0)
+    end
+    return out
+end
+@kernel fold_sum_exp(ts, w, s) = begin
+    out::Vector{Float64} = plate(ts) do t
+        sum(w[j] * exp(-(t - s[j])^2) for j in eachindex(w); init = 0.0)
+    end
+    return out
+end
+# The guarded gather of §4e's traceable spelling: arithmetic, comparisons,
+# `ifelse`, `max` and indexing.
+@kernel fold_sum_guard(ti, w, s, u) = begin
+    out::Vector{Float64} = plate(ti) do t
+        sum(ifelse(t - s[j] > 0, u[max(t - s[j], 1)] * w[j], 0.0) for j in eachindex(w); init = 0.0)
+    end
+    return out
+end
+# An `Int` seed against `Float64` terms changes the accumulator type after the
+# first element, and a range that reads the cell is not shared by every cell:
+# both keep the cell loop.
+@kernel fold_sum_int_seed(ts, w, s) = begin
+    out = plate(ts) do t
+        sum(w[j] / (t + s[j]) for j in eachindex(w); init = 0)
+    end
+    return out
+end
+@kernel fold_sum_cell_range(ts, w, s) = begin
+    out::Vector{Float64} = plate(ts) do t
+        sum(w[j] / (t + s[j]) for j in 1:min(round(Int, t), length(w)); init = 0.0)
+    end
+    return out
+end
+@kernel fold_sum_range(n, w, s) = begin
+    out::Vector{Float64} = plate(1:n) do k
+        sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0)
+    end
+    return out
+end
+# An arithmetic sum in a plain scan step is a fold the strip region runs.
+@kernel fold_sum_scan(steps, w, s, decay) = begin
+    out = scan(steps; init = 0.0) do carry, k
+        r = sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0)
+        next = muladd(decay, carry, r)
+        (next, next)
+    end
+    return out
+end
+_fold_sum_passes(kernel) = occursin("_plate_one_axis", string(code_expr(kernel)))
+
+@testset "authored plate: an arithmetic generator sum runs fold-outer, bitwise" begin
+    cell, control = prepare(fold_sum_cell), prepare(fold_sum_control)
+    @test _dose_outer_reductions(cell) == 1
+    @test _fold_sum_passes(cell)
+    @test _dose_outer_reductions(control) == 0
+    @test _dose_outer_reductions(prepare(fold_sum_exp)) == 0
+    for n in (0, 1, 255, 256, 257, 1000), m in (0, 1, 3, 12)
+        ts = n == 1 ? [0.1] : collect(range(0.1, 50.0; length = n))
+        w, s = [0.5 + 0.1j for j in 1:m], [1.0 + 2.5j for j in 1:m]
+        got, expected = cell(ts, w, s), control(ts, w, s)
+        @test _dose_outer_same(got[1], expected[1])
+        @test got[2] === expected[2]
+    end
+    w, s = [0.5, -0.25, 2.0], [1.0, 3.5, 6.0]
+    ts = collect(range(0.1, 50.0; length = 300))
+    expected = control(ts, w, s)[1]
+    any_domain = prepare(fold_sum_any)
+    @test _dose_outer_same(any_domain(ts, w, s), expected)
+    @test _dose_outer_same(collect(any_domain(Tuple(ts[1:20]), w, s)), expected[1:20])
+    @test _dose_outer_same(vec(any_domain(reshape(ts, 20, 15), w, s)), expected)
+    @test _dose_outer_same(prepare(fold_sum_exp)(ts, w, s),
+        [sum(w[j] * exp(-(t - s[j])^2) for j in eachindex(w); init = 0.0) for t in ts])
+    int_seed = prepare(fold_sum_int_seed)
+    @test _dose_outer_reductions(int_seed) == 1
+    @test _dose_outer_same(int_seed(ts, w, s), expected)
+    cell_range = prepare(fold_sum_cell_range)
+    @test _dose_outer_same(cell_range(ts, w, s),
+        [sum(w[j] / (t + s[j]) for j in 1:min(round(Int, t), length(w)); init = 0.0) for t in ts])
+    ranged = prepare(fold_sum_range)
+    @test _dose_outer_reductions(ranged) == 1
+    @test _dose_outer_same(ranged(1000, w, s),
+        [sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0) for k in 1:1000])
+    guard = prepare(fold_sum_guard)
+    @test _dose_outer_reductions(guard) == 1
+    ti, si, wi = collect(1:300), [1, 50, 120], [0.5, 0.25, 2.0]
+    u = [exp(-0.01i) for i in 1:300]
+    @test _dose_outer_same(guard(ti, wi, si, u),
+        [sum(ifelse(t - si[j] > 0, u[max(t - si[j], 1)] * wi[j], 0.0) for j in eachindex(wi); init = 0.0)
+         for t in ti])
+end
+
+@testset "authored scan: an arithmetic step sum runs in the strip region" begin
+    kernel = prepare(fold_sum_scan)
+    @test _fission_hoisted(kernel)
+    w, s, decay = [0.5, -0.25, 2.0], [1.0, 3.5, 6.0], 0.9
+    for n in (0, 1, 127, 128, 129, 1000)
+        steps = 0:n-1
+        carry = 0.0
+        expected = Float64[]
+        for k in steps
+            carry = muladd(decay, carry, sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0))
+            push!(expected, carry)
+        end
+        @test isapprox(kernel(steps, w, s, decay), expected; rtol = 1e-13)
+    end
+end
+
+@testset "tensorized companion: filtered sums and get keep their branches lazy" begin
+    # The tensorized rewrite, evaluated on host values, is Base's own fold: the
+    # filter is a branch on the accumulator and `get` stays `Base.get`. Over a
+    # data-length iterator the fold is one authored loop (retained under a
+    # tracing backend); over a helper-produced iterator it is `foldl`.
+    native(t, s, u, w, z) = sum(w[j] * u[t - s[j]] for j in eachindex(s) if t > s[j]; init = z)
+    looped = ReactiveKernels._kernel_tensorized_rhs(
+        :(sum(w[j] * u[t - s[j]] for j in eachindex(s) if t > s[j]; init = z)),
+        Set{Symbol}(), nothing, Set([:t, :s, :u, :w, :z]))
+    @test looped.head === :let && occursin("@trace", string(looped))
+    folded = ReactiveKernels._kernel_tensorized_rhs(
+        :(sum(w[j] * u[t - s[j]] for j in _natural_sup_slots(s) if t > s[j]; init = z)))
+    @test folded.head === :call && folded.args[1] == GlobalRef(Base, :foldl)
+    @test occursin("_recurrence_branch", string(folded))
+    u = [1.5, -2.25, 0.125, 7.0, 3.5]
+    cases = ((5, [0, 2, 4], [1.0, 0.5, 2.0], 0.0),
+             (1, [0, 2, 4], [1.0, 0.5, 2.0], 0.0),     # one dose given
+             (1, [1, 2, 4], [1.0, 0.5, 2.0], 0.0),     # none given: init
+             (3, Int[], Float64[], 0.0),               # no doses
+             (5, [0, 2, 4], [1.0, 0.5, 2.0], 0),       # Int init, Float64 terms
+             (5, [0, 2, 4], [1.0, 0.5, 2.0], -0.0))
+    for lowered in (looped, folded)
+        companion = Core.eval(@__MODULE__, :((t, s, u, w, z) -> $lowered))
+        # The closure is defined in a newer world than this running testset;
+        # Julia 1.12 and later refuse the direct call (`MethodError`).
+        for (t, s, w, z) in cases
+            @test Base.invokelatest(companion, t, s, u, w, z) === native(t, s, u, w, z)
+        end
+    end
+    # Only the `init` form is rewritten: without it Base seeds the sum with the
+    # first ACCEPTED element, which a traced condition cannot select.
+    plain = ReactiveKernels._kernel_tensorized_rhs(:(sum(u[j] for j in r if c[j])))
+    @test !occursin("foldl", string(plain))
+    # `get` routes through the tensorized hook, whose fallback is `Base.get`.
+    @test occursin("_tensorized_get", string(ReactiveKernels._kernel_tensorized_rhs(:(get(u, i, 0.0)))))
+    @test ReactiveKernels._tensorized_get(u, 9, 0.0) === 0.0
+    @test ReactiveKernels._tensorized_get(u, 2, 0.0) === -2.25
+    @test ReactiveKernels._tensorized_get(Dict(:a => 1), :b, 0) === 0
+end
+
+module TraceableHelperFixtures
+using ReactiveKernels
+struct Lattice
+    shifts::Vector{Int}
+end
+struct Exact end
+"The observation's row under the plan's shifts."
+@traceable row_index(t, p::Lattice, i) = t - p.shifts[i]
+@traceable row_index(row, ::Exact, i) = row[i]
+"The distance above the lower bound, or zero."
+@traceable function clipped(x, lo = 0.0)::Float64
+    y = x - lo
+    if y > 0
+        return y
+    else
+        return 0.0
+    end
+end
+"The value scaled by the factor."
+@traceable scaled(x::T, s) where {T<:Real} = s * x
+# A hand-written tracing method: the native method is an opaque in-place loop,
+# the traced one a different implementation of the same mathematics.
+function superpose(plan::Lattice, units, weights, nobs)
+    out = zeros(nobs)
+    for (s, w) in zip(plan.shifts, weights), t in (s + 1):nobs
+        out[t] += w * units[t - s]
+    end
+    out
+end
+plain_helper(plan, units, weights, nobs) = superpose(plan, units, weights, nobs)
+ReactiveKernels.traced(::typeof(superpose), plan::Lattice, units, weights, nobs) =
+    [sum(weights[j] * get(units, t - plan.shifts[j], 0.0) for j in eachindex(weights); init = 0.0)
+     for t in 1:nobs]
+end
+
+@testset "@traceable: the method as written, plus the rewritten one for tracing" begin
+    H = TraceableHelperFixtures
+    lattice = H.Lattice([0, 2, 5])
+    # The native method is the authored one.
+    @test H.row_index(7, lattice, 2) == 5
+    @test H.row_index([4, 9, 1], H.Exact(), 2) == 9
+    @test H.clipped(2.5, 1.0) === 1.5 && H.clipped(0.5, 1.0) === 0.0 && H.clipped(2.0) === 2.0
+    @test H.scaled(2, 1.5) == 3.0
+    # A preceding docstring documents the authored method.
+    @test occursin("plan's shifts", string(@doc H.row_index))
+    @test occursin("above the lower bound", string(@doc H.clipped))
+    @test occursin("scaled by the factor", string(@doc H.scaled))
+    # The tensorized hook dispatches to the rewritten body by the authored
+    # signature; on host values it computes what the method computes.
+    call = ReactiveKernels.traced
+    @test call(H.row_index, 7, lattice, 2) == 5
+    @test call(H.row_index, [4, 9, 1], H.Exact(), 2) == 9
+    @test call(H.clipped, 2.5, 1.0) === 1.5 && call(H.clipped, 0.5, 1.0) === 0.0
+    @test call(H.clipped, 2.0) === 2.0
+    @test call(H.scaled, 2, 1.5) == 3.0
+    @test call(+, 1, 2) == 3
+    # A hand-written method is reached the same way and agrees with the native one.
+    units = [1.0, 0.5, 0.25, 0.125, 2.0, 4.0]
+    @test call(H.superpose, lattice, units, [1.0, 2.0, 3.0], 6) ==
+          H.superpose(lattice, units, [1.0, 2.0, 3.0], 6)
+    # The rewritten body carries the recipe rewrites (a traced index reads
+    # through `_tensorized_getindex`; a branch is lazy).
+    rewritten = string(ReactiveKernels._traceable_definition(
+        :(row_index(t, p::Lattice, i) = t - p.shifts[i]), H))
+    @test occursin("_tensorized_getindex", rewritten)
+    @test occursin("_recurrence_branch", string(ReactiveKernels._traceable_definition(
+        :(f(x) = x > 0 ? x : zero(x)), H)))
+    # A recipe routes calls to helpers through the hook; Base and package
+    # calls, and calls with keyword arguments, keep their form.
+    lower(ex) = string(ReactiveKernels._kernel_tensorized_rhs(ex, Set{Symbol}(), H,
+                                                              Set([:t, :p, :i, :x])))
+    @test occursin("ReactiveKernels.traced", lower(:(row_index(t, p, i))))
+    @test occursin("ReactiveKernels.traced", lower(:(not_yet_defined(t))))
+    @test !occursin("ReactiveKernels.traced", lower(:(exp(x) + sum(x))))
+    @test !occursin("ReactiveKernels.traced", lower(:(plate(x))))
+    @test !occursin("ReactiveKernels.traced", lower(:(row_index(t, p; i = i))))
+    # A whole recipe `x = f(ports...)` keeps `f` as its raw operation unless
+    # `f` has a `traced` method, which sends it through the tracing companion.
+    operation(ex) = ReactiveKernels._kernel_operation(
+        ex, Symbol[ex.args[2:end]...], Set{Symbol}(ex.args[2:end]); mod = H)
+    @test operation(:(superpose(plan, u, w, n))) isa Expr
+    @test operation(:(row_index(t, p, i))) isa Expr          # @traceable defines one
+    @test operation(:(plain_helper(plan, u, w, n))) === :plain_helper
+    # Loud refusals.
+    define(ex) = ReactiveKernels._traceable_definition(ex, H)
+    @test_throws ArgumentError define(:(sum(x::Lattice) = 0))
+    @test_throws ArgumentError define(:(g(x; k = 1) = x))
+    @test_throws ArgumentError define(:(g(x) = (x > 0 && return 1; 2)))
+    @test_throws ArgumentError define(:(g(x)))
+    @test_throws ArgumentError define(:((x -> x)(y) = y))
 end

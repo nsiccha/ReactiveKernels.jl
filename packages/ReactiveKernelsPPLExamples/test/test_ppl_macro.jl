@@ -8,7 +8,8 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
 
 # RK-native, StanBlocks-faithful `@ppl` front-end (experimental, first cut):
 # typed-LHS `name` / `name::real` / `name::vector[size]`; support constraints use
-# the rk-native `positive(dist(…))` combinator (PROVISIONAL, decision 1uczi8y).
+# the rk-native `positive(dist(…))` / `stan_positive(dist(…))` combinators
+# (PROVISIONAL, decision 1uczi8y).
 # Validated by density parity, against direct formulas and against the
 # hand-written example graphs.
 @testset "RK-native @ppl macro (experimental, first cut)" begin
@@ -183,7 +184,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
         @ppl es(observations::Vector{Float64}, observation_scales::Vector{Float64},
                 J::Int) = begin
             mu ~ normal(0.0, 5.0)
-            tau ~ positive(cauchy(0.0, 5.0))       # half-Cauchy(0, 5)
+            tau ~ stan_positive(cauchy(0.0, 5.0))  # Stan lower-bound Cauchy
             theta::vector[J] ~ normal(mu, tau)
             observations ~ normal(theta, observation_scales)
         end
@@ -211,6 +212,22 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
                       want = :posterior)(Float64[1.0, 2.0, log(0.5)],
                 collect(X), collect(Yr))
         @test got ≈ ref_density
+    end
+
+    @testset "proper half versus Stan lower-bound half" begin
+        @ppl proper_half(y::Vector{Float64}) = begin
+            sigma ~ positive(normal(0.0, 5.0))
+            y ~ normal(0.0, sigma)
+        end
+        @ppl stan_half(y::Vector{Float64}) = begin
+            sigma ~ stan_positive(normal(0.0, 5.0))
+            y ~ normal(0.0, sigma)
+        end
+        q = Float64[log(0.5)]
+        y = Float64[0.1, -0.2]
+        prior(v) = prepare(v; have = (:unconstrained, :y),
+                           want = :prior)(q, y)
+        @test prior(stan_half) ≈ prior(proper_half) - log(2.0)
     end
 
     @testset "improper/flat prior (real support) — 0 prior contribution" begin

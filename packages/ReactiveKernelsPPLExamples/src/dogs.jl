@@ -81,8 +81,6 @@ using LogExpFunctions: logistic
     log_jacobian::Float64 = 0.0
 
     parameters = (; beta1, beta2, beta3)
-    (beta1::Float64, beta2::Float64, beta3::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.beta3)
 
     # Prior: the Stan model block statement `beta ~ normal(0, 100)` applies to
     # every component. It is PROPER, so (unlike the sibling dogs_log uniform

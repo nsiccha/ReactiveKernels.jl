@@ -1,3 +1,7 @@
+include("test_native_broadcast.jl")
+include("test_native_concat.jl")
+include("test_native_mul.jl")
+
 module AuthoringScopeFixture
 using ..ReactiveKernels
 
@@ -83,9 +87,150 @@ end
     total::Float64 = x + y
     return total
 end
+
+# A two-output child bound at module scope, so a caller's macro expansion can
+# resolve it and lift `qualified_pair(x)[1]` out of a larger expression.
+@kernel qualified_pair(x::Float64) = begin
+    shifted::Float64 = x + 1
+    squared::Float64 = abs2(shifted)
+    return (shifted, squared)
+end
+end
+
+module AuthoringLoweredCallFixture
+const exp_alias = Base.exp
+mutable_exp = Base.exp
+end
+
+module AuthoringChangingCallBindingFixture
+using ReactiveKernels
+call = Base.exp
+@kernel before(x::Float64) = begin
+    a::Float64 = call(x)
+    return a
+end
+call = Base.sin
+@kernel after(x::Float64) = begin
+    b::Float64 = sin(x)
+    return b
+end
+end
+
+module AuthoringCapturedCallBindingFixture
+using ReactiveKernels
+@traceable call(x) = x + 1
+function make_before()
+    call = AuthoringCapturedCallBindingFixture.call
+    spec = @kernel begin
+        x::Float64
+        a::Float64 = call(x)
+        return a
+    end
+    call = x -> x + 2
+    spec
+end
+@kernel after(x::Float64) = begin
+    b::Float64 = call(x)
+    return b
+end
+end
+
+module AuthoringShadowedCallIdentityFixture
+using ReactiveKernels
+const call = Base.exp
+function make_before()
+    call = Base.sin
+    @kernel begin
+        x::Float64
+        a::Float64 = call(x)
+        return a
+    end
+end
+@kernel after(x::Float64) = begin
+    b::Float64 = Base.sin(x)
+    return b
+end
+end
+
+function _authoring_chunk_capture_expr(recipe_count)
+    capture = :original_read_indices
+    statements = Any[:(x::Int)]
+    for index in 1:recipe_count
+        output = Symbol(:chunked_y_, index)
+        push!(statements, Expr(:(=), output,
+                               :(x + sum($capture) + $index)))
+    end
+    push!(statements, Expr(:return, Symbol(:chunked_y_, recipe_count)))
+    kernel = Expr(:macrocall,
+                  GlobalRef(ReactiveKernels, Symbol("@kernel")),
+                  LineNumberNode(0), Expr(:block, statements...))
+    Expr(:let, Expr(:(=), capture, QuoteNode((1, 2, 3))), kernel)
+end
+
+function _authoring_count_chunk_forms(ex)
+    ex isa Expr || return (named = 0, direct = 0)
+    named = ex.head === :(=) && length(ex.args) == 2 &&
+            ex.args[1] isa Symbol &&
+            occursin("kernel_expand_chunk", string(ex.args[1])) &&
+            ex.args[2] isa Expr && ex.args[2].head === :->
+    direct = ex.head === :call && length(ex.args) == 1 &&
+             ex.args[1] isa Expr && ex.args[1].head === :-> &&
+             ex.args[1].args[1] == Expr(:tuple)
+    nested = map(_authoring_count_chunk_forms, ex.args)
+    (
+        named = Int(named) + sum((part.named for part in nested); init = 0),
+        direct = Int(direct) + sum((part.direct for part in nested); init = 0),
+    )
 end
 
 @testset "Declarative kernel authoring" begin
+    @testset "large authored captures keep direct chunk scopes" begin
+        source = _authoring_chunk_capture_expr(51)
+        expanded = macroexpand(@__MODULE__, source)
+        forms = _authoring_count_chunk_forms(expanded)
+        @test forms == (named = 0,
+                        direct = cld(51, ReactiveKernels._KERNEL_EXPAND_CHUNK))
+
+        captured = Core.eval(@__MODULE__, expanded)
+        @test length(kernel_graph(captured).recipes) == 51
+        @test prepare(captured)(4) == 61
+
+        operation = first(kernel_graph(captured).recipes).op
+        source_function = operation.f
+        @test source_function.runtime_f !== nothing
+        @test ReactiveKernels.RuntimeGeneratedFunctions.generated_callfunc(
+            source_function.runtime_f, source_function.captures, 4,
+        ) == 11
+    end
+
+    @testset "generator definitions evaluate without binding a name" begin
+        # Program generators (RKPPL `build_kernel`) evaluate a definition at
+        # top level; recipe closures are evaluated one by one, so the spec must
+        # match what `@kernel` builds, across several recipe groups.
+        count = 3 * ReactiveKernels._KERNEL_EXPAND_CHUNK + 1
+        statements = Any[Expr(:(=), Symbol(:gen_y_, index),
+                              :(x + sum(gen_offsets) + $index)) for index in 1:count]
+        definition = :(gen_model(x::Int) = begin
+            $(statements...)
+            return $(Symbol(:gen_y_, count))
+        end)
+        generated = Module(gensym(:GeneratedDefinition))
+        Core.eval(generated, :(using ReactiveKernels; const gen_offsets = (1, 2, 3)))
+        spec = ReactiveKernels._kernel_eval_definition(generated, definition)
+        @test spec isa KernelSpec
+        @test !isdefined(generated, :gen_model)
+        @test length(kernel_graph(spec).recipes) == count
+        @test Base.invokelatest(prepare(spec), 4) == 4 + 6 + count
+
+        authored = Module(gensym(:AuthoredDefinition))
+        Core.eval(authored, :(using ReactiveKernels; const gen_offsets = (1, 2, 3)))
+        macro_spec = Core.eval(authored, Expr(:macrocall, Symbol("@kernel"),
+                                              LineNumberNode(0), definition))
+        @test keys(spec) == keys(macro_spec)
+        @test Base.invokelatest(prepare(spec; want = :gen_y_7), 2) ==
+              Base.invokelatest(prepare(macro_spec; want = :gen_y_7), 2) == 2 + 6 + 7
+    end
+
     @testset "function-shaped definitions, optional types, and exposed ports" begin
         f_calls = Ref(0)
         h_calls = Ref(0)
@@ -194,6 +339,22 @@ end
         indexed_counter_kernel = prepare(indexed_counter)
         @test indexed_counter_kernel(2.0) == 3.0
         @test calls[:out][] == 1
+
+        # The tensorized companion turns indexing into calls, so `begin`/`end`
+        # inside an index must already be resolved against the indexed array
+        # (a traced body otherwise fails with `UndefVarError: end`). Natively
+        # its wrappers reduce to Base, so evaluating the rewrite checks it.
+        tensorized(body) = eval(Expr(:->, :(u, M, v),
+            ReactiveKernels._kernel_tensorized_rhs(body)))
+        u = [1.0, 2.0, 3.0]; M = [1.0 2.0; 3.0 4.0; 5.0 6.0]; v = [2, 3]
+        for body in (:(u[end:-1:1]), :(u[end]), :(u[begin]), :(u[begin+1:end]),
+                     :(M[end, 1]), :(M[1, end]), :(M[end, :]), :(u[v[end]]),
+                     :(u[end - v[begin]]), :((2 .* u)[end]),
+                     :(let w = copy(u); w[end] = 0.0; w end))
+            @test Base.invokelatest(tensorized(body), u, M, v) ==
+                Base.invokelatest(eval(Expr(:->, :(u, M, v), body)), u, M, v)
+        end
+        @test u == [1.0, 2.0, 3.0]
 
         @test_throws ArgumentError macroexpand(@__MODULE__, quote
             @kernel same_name(same_name) = same_name
@@ -366,13 +527,14 @@ end
             return y
         end
         @test @inferred(prepare(repeated_argument_model)(2.0)) == 4.0
-        @test_throws ArgumentError macroexpand(@__MODULE__, quote
-            @kernel nested_expression_argument(x::Float64) = begin
-                y::Float64 =
-                    AuthoringNestedKernelFixture.qualified_sum(x, x + 1)
-                return y
-            end
-        end)
+        @kernel nested_expression_argument(x::Float64) = begin
+            y::Float64 =
+                AuthoringNestedKernelFixture.qualified_sum(x, x + 1)
+            return y
+        end
+        @test prepare(nested_expression_argument)(2.0) == 5.0
+        @test !occursin("qualified_sum(",
+            sprint(show, code_expr(prepare(nested_expression_argument))))
 
         @kernel nested_cse_piece(x::Float64) = begin
             @recipe (cse_key = :nested_increment) y::Float64 = x + 1
@@ -385,6 +547,30 @@ end
         end
         @test length(kernel_graph(nested_cse_model).recipes) == 1
         @test @inferred(prepare(nested_cse_model)(2.0)) == (3.0, 3.0)
+
+        # Plain operations (no explicit cse_key) merge across repeated
+        # splices too (planner-branch-a-380e2405): without this, N repeated
+        # calls manufacture N alternative producers and the exact planner
+        # search goes exponential in N.
+        @kernel nested_plain_piece(x::Float64) = begin
+            y::Float64 = exp(x)
+            return y
+        end
+        @kernel nested_plain_twice(u::Float64) = begin
+            a::Float64 = nested_plain_piece(u)
+            b::Float64 = nested_plain_piece(u)
+            s::Float64 = a + b
+            return s
+        end
+        plain_graph = kernel_graph(nested_plain_twice)
+        # Native lowering can wrap exp; the shared value still has one producer.
+        @test length(ReactiveKernels.producers_of(
+            plain_graph, nested_plain_twice[:a].id,
+        )) == 1
+        @test ReactiveKernels.canon_id(plain_graph, nested_plain_twice[:a].id) ==
+              ReactiveKernels.canon_id(plain_graph, nested_plain_twice[:b].id)
+        @test @inferred(prepare(plan(nested_plain_twice; want = :s))(1.0)) ==
+              2 * exp(1.0)
 
         @kernel nested_identity(x::Int) = begin
             y::Int = x
@@ -412,12 +598,104 @@ end
                 return shifted
             end
         end
+        # A multi-output call bound to one name is the tuple `nested_piece(x)`
+        # returns at runtime: the child is spliced and its outputs packed.
+        # (`nested_piece` is a testset local, so the splice happens when the
+        # recipe is added rather than while the macro expands.)
+        @kernel nested_tuple_value(x::Float64) = begin
+            packed = nested_piece(x)
+            return packed
+        end
+        @test @inferred(prepare(nested_tuple_value)(2.0)) == (3.0, 9.0)
+        @test !occursin("nested_piece",
+                        sprint(show, code_expr(plan(nested_tuple_value))))
+        @kernel nested_tuple_typed(x::Float64) = begin
+            packed::Tuple{Float64,Float64} = nested_piece(x)
+            return packed
+        end
+        @test @inferred(prepare(nested_tuple_typed)(2.0)) == (3.0, 9.0)
+        @kernel nested_tuple_read(x::Float64) = begin
+            packed = nested_piece(x)
+            total::Float64 = packed[1] + packed[2]
+            return total
+        end
+        @test @inferred(prepare(nested_tuple_read)(2.0)) == 12.0
+        produces(p, name) = any(r -> any(o -> o.name === name, r.outputs), p.recipes)
+
+        # A module binding resolves while the macro expands: the one-name port
+        # takes the child's tuple type, and a strict subexpression lifts the
+        # call to its tuple value. The pack reads every output, so the whole
+        # child boundary is computed though one element is used.
+        @kernel qualified_tuple_value(x::Float64) = begin
+            packed = AuthoringNestedKernelFixture.qualified_pair(x)
+            return packed
+        end
+        @test ReactiveKernels.valtype(qualified_tuple_value[:packed]) ==
+              Tuple{Float64,Float64}
+        @test @inferred(prepare(qualified_tuple_value)(2.0)) == (3.0, 9.0)
+        @kernel qualified_tuple_projection(x::Float64) = begin
+            lead::Float64 = AuthoringNestedKernelFixture.qualified_pair(x)[1] + 1
+            return lead
+        end
+        projection_plan = plan(qualified_tuple_projection; want = :lead)
+        @test @inferred(prepare(projection_plan)(2.0)) == 4.0
+        @test produces(projection_plan, :squared)
+        # No runtime call remains; the lifted value is named for the call.
+        projection_code = sprint(show, code_expr(projection_plan))
+        @test !occursin("qualified_pair(", projection_code)
+        @test occursin("var\"lead.qualified_pair\" =", projection_code)
+        @kernel qualified_tuple_cells(xs) = begin
+            ys = plate(xs) do x
+                AuthoringNestedKernelFixture.qualified_pair(x)[1] *
+                    AuthoringNestedKernelFixture.qualified_pair(x)[2]
+            end
+            return ys
+        end
+        @test prepare(qualified_tuple_cells)([1.0, 2.0]) == [8.0, 27.0]
+
+        # Julia's `(a,) = t` binds the leading element; the unnamed trailing
+        # output stays prunable.
+        @kernel nested_partial(x::Float64) = begin
+            (shifted::Float64,) = nested_piece(x)
+            return shifted
+        end
+        partial_plan = plan(nested_partial; want = :shifted)
+        @test @inferred(prepare(partial_plan)(2.0)) == 3.0
+        @test !produces(partial_plan, :squared)
+        @kernel nested_partial_untyped(x::Float64) = begin
+            (lead,) = nested_piece(x)
+            return lead
+        end
+        @test @inferred(prepare(nested_partial_untyped)(2.0)) == 3.0
+        # A single-output child returns its one value, so `(a,) = child(x)`
+        # binds that value's first element.
+        @kernel nested_pair_value(x::Float64) = begin
+            pair = (x + 1, x * x)
+            return pair
+        end
+        @kernel nested_single_partial(x::Float64) = begin
+            (lead,) = nested_pair_value(x)
+            return lead
+        end
+        @test @inferred(prepare(nested_single_partial)(2.0)) == 3.0
+
+        # refused: a Float64 port cannot hold the two-output tuple; Julia's
+        # `s::Float64 = (3.0, 9.0)` fails the same conversion.
         @test_throws ArgumentError begin
-            @kernel nested_bad_arity(x::Float64) = begin
+            @kernel nested_scalar_target(x::Float64) = begin
                 shifted::Float64 = nested_piece(x)
                 return shifted
             end
         end
+        # refused: more names than outputs; Julia's destructuring throws a
+        # BoundsError for `(a, b, c) = (3.0, 9.0)`.
+        @test_throws ArgumentError begin
+            @kernel nested_long_destructure(x::Float64) = begin
+                (a::Float64, b::Float64, c::Float64) = nested_piece(x)
+                return a
+            end
+        end
+
         @test_throws ArgumentError begin
             @kernel nested_bad_metadata(x::Float64) = begin
                 @recipe (cost = 2) (shifted::Float64, squared::Float64) =
@@ -441,6 +719,72 @@ end
                 return y
             end
         end
+    end
+
+    @testset "a one-name tuple left side binds the first element" begin
+        # Julia lowers `(a,) = value` to `getfield(Base.indexed_iterate(value, 1), 1)`.
+        pair_of(x) = (x, 2x)
+        @kernel short_port(x::Float64) = begin
+            t = (x, 2x)
+            (a,) = t
+            return a
+        end
+        @test @inferred(prepare(short_port)(2.0)) == 2.0
+        # The element read is its own recipe, never an alias of the whole `t`.
+        short_graph = kernel_graph(short_port)
+        @test ReactiveKernels.canon_id(short_graph, short_port[:a].id) !=
+              ReactiveKernels.canon_id(short_graph, short_port[:t].id)
+        @test occursin("a = _kernel_destructure_first(t)", explain(plan(short_port)))
+
+        @kernel short_literal(x::Float64) = begin
+            (a,) = (x, 2x)
+            return a
+        end
+        @test @inferred(prepare(short_literal)(2.0)) == 2.0
+        @kernel short_call(x::Float64) = begin
+            (a::Float64,) = pair_of(x)
+            b = a + 1
+            return b
+        end
+        @test @inferred(prepare(short_call)(2.0)) == 3.0
+        @kernel short_trailing_comma(x::Float64) = begin
+            a, = pair_of(x)
+            return a
+        end
+        @test @inferred(prepare(short_trailing_comma)(2.0)) == 2.0
+        @kernel short_containers(x::Float64) = begin
+            (v,) = [x, 2x]
+            (n,) = (p = 3x, q = 4x)
+            (s,) = x
+            total = v + n + s
+            return total
+        end
+        @test @inferred(prepare(short_containers)(2.0)) == 2.0 + 6.0 + 2.0
+        # Several names keep the multi-output recipe's own destructuring.
+        @kernel short_mixed(x::Float64) = begin
+            t = (x, 2x, 3x)
+            (a,) = t
+            (b, c) = t
+            total = a + b + c
+            return total
+        end
+        @test @inferred(prepare(short_mixed)(2.0)) == 2.0 + 2.0 + 4.0
+        @kernel short_in_cell(xs) = begin
+            ys = plate(xs) do x
+                (a,) = (x, 2x)
+                a + 1
+            end
+            return ys
+        end
+        @test prepare(short_in_cell)([1.0, 2.0]) == [2.0, 3.0]
+        # A destructured plate binds its first cell, not the array.
+        @kernel short_plate(xs) = begin
+            (lead,) = plate(xs) do x
+                2x
+            end
+            return lead
+        end
+        @test prepare(short_plate)([1.0, 2.0]) == 2.0
     end
 
     @testset "typed ports, zero-execution construction, and metadata" begin
@@ -1028,9 +1372,13 @@ end
             y::NamedTuple{(:a,:b),Tuple{Int,Int}} = (a = x, b = a)
             return y
         end
-        @test Set(v.name for v in only(
+        # The pack recipe is one of several: automatic unpack edges (x = y.a,
+        # a = y.b) share the graph, so select the recipe producing `y`.
+        named_tuple_pack = only(filter(
+            r -> any(o -> o.name === :y, r.outputs),
             kernel_graph(named_tuple_assignment).recipes,
-        ).inputs) == Set((:a, :x))
+        ))
+        @test Set(v.name for v in named_tuple_pack.inputs) == Set((:a, :x))
         @test prepare(named_tuple_assignment)(3, 4) == (a = 4, b = 3)
 
         semicolon_named_tuple = @kernel begin
@@ -1039,9 +1387,11 @@ end
             y::NamedTuple{(:a,:b),Tuple{Int,Int}} = (; a = x, b = a)
             return y
         end
-        @test Set(v.name for v in only(
+        semicolon_pack = only(filter(
+            r -> any(o -> o.name === :y, r.outputs),
             kernel_graph(semicolon_named_tuple).recipes,
-        ).inputs) == Set((:a, :x))
+        ))
+        @test Set(v.name for v in semicolon_pack.inputs) == Set((:a, :x))
         @test prepare(semicolon_named_tuple)(3, 4) == (a = 4, b = 3)
 
         destructuring_assignment = @kernel begin
@@ -1331,6 +1681,169 @@ end
         @test prepare(cse_combined; want = :b)(3) == 3
         @test prepare(cse_combined; want = :doubled)(3) == 6
 
+        # Same merge, plain operations without an explicit cse_key
+        # (planner-branch-a-380e2405): the shared `exp` still collapses.
+        plain_merge_base = @kernel begin
+            x::Float64
+            y::Float64 = exp(x)
+            return y
+        end
+        plain_merge_fragment = @kernel begin
+            x::Float64
+            y::Float64 = exp(x)
+            z::Float64 = y + 1
+            return z
+        end
+        plain_merged = merge(plain_merge_base, plain_merge_fragment)
+        @test length(ReactiveKernels.producers_of(
+            kernel_graph(plain_merged), plain_merged[:y].id,
+        )) == 1
+        @test prepare(plain_merged; want = :z)(1.0) == exp(1.0) + 1
+
+        @testset "lowered exact calls retain composition identity" begin
+            shadowed_binding = AuthoringShadowedCallIdentityFixture
+            shadowed_before = shadowed_binding.make_before()
+            independent_values = (prepare(shadowed_before)(0.3),
+                                  prepare(shadowed_binding.after)(0.3))
+            combined_shadow = merge(shadowed_before, shadowed_binding.after)
+            @test prepare(combined_shadow; want = (:a, :b))(0.3) == independent_values
+
+            captured_binding = AuthoringCapturedCallBindingFixture
+            captured_before = captured_binding.make_before()
+            @test prepare(captured_before)(0.3) == 2.3
+            @test prepare(captured_binding.after)(0.3) == 1.3
+            combined_capture = merge(captured_before, captured_binding.after)
+            @test prepare(combined_capture; want = (:a, :b))(0.3) == (2.3, 1.3)
+
+            changed_binding = AuthoringChangingCallBindingFixture
+            @test prepare(changed_binding.before)(0.3) == exp(0.3)
+            @test prepare(changed_binding.after)(0.3) == sin(0.3)
+            combined_binding = merge(changed_binding.before, changed_binding.after)
+            @test prepare(combined_binding; want = (:a, :b))(0.3) ==
+                  (exp(0.3), sin(0.3))
+
+            qualified = @kernel begin
+                x::Float64
+                y::Float64 = Base.exp(x)
+                return y
+            end
+            aliased = @kernel begin
+                x::Float64
+                y::Float64 = AuthoringLoweredCallFixture.exp_alias(x)
+                return y
+            end
+            generated = @eval @kernel begin
+                x::Float64
+                y::Float64 = $(GlobalRef(Base, :exp))(x)
+                return y
+            end
+            for fragment in (qualified, aliased, generated)
+                shared = merge(plain_merge_base, fragment)
+                @test length(ReactiveKernels.producers_of(
+                    kernel_graph(shared), shared.y.id,
+                )) == 1
+                @test prepare(shared)(0.4) == exp(0.4)
+            end
+
+            cats = @kernel begin
+                left::Vector{Float64}
+                right::Vector{Float64}
+                result::Matrix{Float64} = hcat(left, right)
+                return result
+            end
+            same_cat = @kernel begin
+                left::Vector{Float64}
+                right::Vector{Float64}
+                result::Matrix{Float64} = Base.hcat(left, right)
+                return result
+            end
+            reversed_cat = @kernel begin
+                left::Vector{Float64}
+                right::Vector{Float64}
+                result::Matrix{Float64} = hcat(right, left)
+                return result
+            end
+            shared_cat = merge(cats, same_cat)
+            @test length(ReactiveKernels.producers_of(
+                kernel_graph(shared_cat), shared_cat.result.id,
+            )) == 1
+            @test prepare(shared_cat)([1.0, 2.0], [3.0, 4.0]) == [1.0 3.0; 2.0 4.0]
+            ordered_cat = merge(cats, reversed_cat)
+            @test length(ReactiveKernels.producers_of(
+                kernel_graph(ordered_cat), ordered_cat.result.id,
+            )) == 2
+
+            cheaper = @kernel begin
+                x::Float64
+                @recipe (cost = 0.25) y::Float64 = exp(x)
+                return y
+            end
+            alternatives = merge(plain_merge_base, cheaper)
+            @test length(ReactiveKernels.producers_of(
+                kernel_graph(alternatives), alternatives.y.id,
+            )) == 2
+            @test plan(alternatives).cost == 0.25
+
+            wider = @kernel begin
+                x::Float64
+                other::Any = exp(x)
+                return other
+            end
+            typed = merge(plain_merge_base, wider)
+            @test ReactiveKernels.canon_id(kernel_graph(typed), typed.y.id) !=
+                  ReactiveKernels.canon_id(kernel_graph(typed), typed.other.id)
+            @test prepare(typed; want = (:y, :other))(0.4) == (exp(0.4), exp(0.4))
+
+            # Formula definitions and dynamic callees still have separate
+            # provenance. An explicit key or effectful flag keeps its meaning.
+            fused_a = @kernel begin
+                x::Float64
+                y::Float64 = exp(x) + 1
+                return y
+            end
+            fused_b = @kernel begin
+                x::Float64
+                y::Float64 = exp(x) + 1
+                return y
+            end
+            fused = merge(fused_a, fused_b)
+            @test length(ReactiveKernels.producers_of(
+                kernel_graph(fused), fused.y.id,
+            )) == 2
+            mutable_a = @kernel begin
+                x::Float64
+                y::Float64 = AuthoringLoweredCallFixture.mutable_exp(x)
+                return y
+            end
+            mutable_b = @kernel begin
+                x::Float64
+                y::Float64 = AuthoringLoweredCallFixture.mutable_exp(x)
+                return y
+            end
+            dynamic = merge(mutable_a, mutable_b)
+            @test length(ReactiveKernels.producers_of(
+                kernel_graph(dynamic), dynamic.y.id,
+            )) == 2
+            keyed = @kernel begin
+                x::Float64
+                @recipe (cse_key = :distinct_exp) y::Float64 = exp(x)
+                return y
+            end
+            explicit = merge(plain_merge_base, keyed)
+            @test length(ReactiveKernels.producers_of(
+                kernel_graph(explicit), explicit.y.id,
+            )) == 2
+            effectful = @kernel begin
+                x::Float64
+                @recipe (effectful = true) y::Float64 = exp(x)
+                return y
+            end
+            effects = merge(effectful, effectful)
+            @test length(ReactiveKernels.producers_of(
+                kernel_graph(effects), effects.y.id,
+            )) == 2
+        end
+
         single_alias = @kernel begin
             x::Int
             @recipe (cost = 0) y::Int = x + 1
@@ -1351,7 +1864,13 @@ end
             @recipe (cse_key = :repeated_output) y = identity(x)
             return y
         end
-        @test length(kernel_graph(repeated_output).recipes) == 1
+        # Structural CSE still collapses the duplicate authored producers of
+        # `y` to one; the second graph recipe is the automatic `identity`
+        # inverse edge (`x = identity(y)`), which produces `x`, not `y`.
+        @test count(
+            r -> any(o -> o.name === :y, r.outputs),
+            kernel_graph(repeated_output).recipes,
+        ) == 1
         @test !haskey(kernel_graph(repeated_output).aliases, repeated_output.y.id)
         @test prepare(repeated_output)(3) == 3
 

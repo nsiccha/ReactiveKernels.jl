@@ -26,7 +26,7 @@ function eight_schools_reference_density(q)
         likelihood += normal(EIGHT_SCHOOLS_Y[j], θ[j], EIGHT_SCHOOLS_SIGMA[j])
     end
     prior = normal(μ, 0.0, 5.0)
-    prior += log(2) - log(π) - log(5.0) - log1p((τ / 5.0)^2)
+    prior += -log(π) - log(5.0) - log1p((τ / 5.0)^2)
     @inbounds for θj in θ
         prior += normal(θj, μ, τ)
     end

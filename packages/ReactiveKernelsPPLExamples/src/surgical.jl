@@ -40,8 +40,6 @@ using LogExpFunctions: logistic
     parameters = (; mu, sigmasq, b)
     (parameters, log_jacobian::Float64) =
         ((; mu, sigmasq, b), u_sigmasq)
-    (mu::Float64, sigmasq::Float64, b::AbstractVector{Float64}) =
-        (parameters.mu, parameters.sigmasq, parameters.b)
 
     # Transformed parameter: sigma = sqrt(sigmasq) (deterministic; no Jacobian).
     sigma::Float64 = sqrt(sigmasq)

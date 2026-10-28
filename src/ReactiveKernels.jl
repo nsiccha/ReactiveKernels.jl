@@ -17,20 +17,42 @@ See the design brief this package implements for the full rationale.
 module ReactiveKernels
 
 using RuntimeGeneratedFunctions
+import ReactantCore
+import OutputSignatures
+using InverseFunctions: inverse, NoInverse
 using LinearAlgebra
 using LogExpFunctions
 using Random
 import DifferentiationInterface
+import Preferences
+using PrecompileTools: @setup_workload, @compile_workload
 RuntimeGeneratedFunctions.init(@__MODULE__)
 
 include("core.jl")
 include("planner.jl")
 include("codegen.jl")
+include("native_scheduling.jl")
+include("inverse_edges.jl")
 include("partial_evaluation.jl")
+include("bound_vectorize.jl")
+include("position_cells.jl")
+include("index_runs.jl")
 include("nonallocating.jl")
+include("type_stability_audit.jl")
+include("type_stability.jl")
 include("graphops.jl")
+include("scan_history.jl")
+include("authored_loops.jl")
 include("authoring.jl")
+include("execution_sources.jl")
+include("value_metadata.jl")
+include("cells.jl")
+include("cell_windows.jl")
+include("lane_sources.jl")
+include("cell_arrays.jl")
+include("error_policy.jl")
 include("ad.jl")
+include("derivative_rules.jl")
 include("kernel_stateful.jl")
 include("kernel_methodir.jl")
 include("kernel_factory.jl")
@@ -46,24 +68,51 @@ using .NativeSlotCompiler: prepare_transpiled, initial_transpiled_state, transpi
 include("reactive.jl")
 include("stateful.jl")
 include("visualization.jl")
+include("display.jl")
+include("expm_rule.jl")
+include("symmetric_eigen_rules.jl")
+include("affine_logistic.jl")
+include("cholesky.jl")
+include("native_ode.jl")
+include("jax.jl")
+include("jax_host.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, PreparedADPullback, ReplicatedKernel, NonAllocatingKernel, PlanningError
-export value, value!, add!, plan, prepare, prepare_nonallocating, plate, scan
+export TypeInstabilityError
+export PreparedADOperator, PreparedADPushforward, PreparedADHVP, PreparedADThird
+export value, value!, add!, plan, prepare, prepare_nonallocating, plate, scan, @plate, @scan
 export partial_evaluation
 export prepare_ad, ad_gradient, ad_value_and_gradient, ad_value_and_gradient!
+export ad_value_gradient_and_retained, ad_value_gradient_and_retained!,
+    ad_retains_primal_sweep
 export prepare_ad_pullback, ad_pullback
+export ScalarDerivativeRule, scalar_derivative_rule, derivative_cut
+export DerivativeRule, derivative_rule, forward_cut, reverse_cut, reverse_residuals
+export rk_expm, rk_symmetric_eigvals, rk_symmetric_eigvecs
+export rk_affine_logistic
+export rk_cholesky_lower
+export rk_ode_bdf_tol, rk_ode_rk45_tol
+export has_forward_branch, has_reverse_branch, rule_inputs
+export stage_primal, stage_reverse, stage_residuals
 export ad_value_and_pullback, ad_value_and_pullback!
+export prepare_ad_pushforward, ad_pushforward, ad_value_and_pushforward
+export prepare_ad_hvp, ad_hvp, ad_hvp!, ad_gradient_and_hvp, ad_gradient_and_hvp!
+export prepare_ad_third, ad_third, ad_third!, ad_gradient_hvp_and_third,
+    ad_gradient_hvp_and_third!
 export compile_ad_gradient, compile_ad_value_and_gradient
-export lower, lower_batched, replica, plate_body, scan_body, transform, compile
+export lower, lower_with_ops, lower_batched, replica, plate_body, plate_cell, scan_body, transform, compile
 export prepare_batched, vectorize
+export NativeScheduling
 export batched_ports, scalar_kernel
 export explain, code_expr, inputs, outputs, valtype
 export compose, extract, PreparationCache, prepare!, canon_id
-export KernelSpec, KernelObjectSpec, @kernel, @node, kernel_graph, port, copy!!
+export KernelSpec, KernelObjectSpec, @kernel, @node, @traceable, kernel_graph, port, copy!!
 export PartialFunction, partial
 # Experimental captured-control consumer interface.
 export prepare_transpiled, initial_transpiled_state, transpiled_endpoint
+export jax_source, JAXSource, JAXFunction, JAXEmissionError
 export DAGVisualization, visualize, dot_source, save_visualization
+export recipe_kind, recipe_inventory
 # Reactive layer
 export ReactiveState, set!, get!, freeze!, unfreeze!, checkpoint, materialize!
 export ReactiveProgram, CompiledReactiveState, ReactiveValue
@@ -79,5 +128,9 @@ export drain_observations!
 export ValidatedCompiledTransition, validated_compiled_transition
 export StatefulControlBounds, stateful_control_bounds
 export functionalize_stateful, stateful_snapshot
+
+_mark_source_call_recursion!()
+
+include("precompile.jl")
 
 end # module ReactiveKernels

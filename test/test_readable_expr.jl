@@ -84,7 +84,11 @@ using Test
             Val(:legacy), Val(:fused), identity,
         )
         @test legacy(2) == 2
-        @test fieldcount(typeof(legacy)) == 2
+        @test ReactiveKernels._kernel_source_call(Val(:native), legacy, 2) == 2
+        @test ReactiveKernels._kernel_source_call(Val(:tensorized), legacy, 2) == 2
+        # The legacy constructor has no throw-stripped alternate body.
+        @test legacy.ignored_throws === nothing
+        @test ReactiveKernels._kernel_ignore_throw_op(legacy) === legacy
     end
 
     @testset "partially-evaluated bound constants render as literals" begin

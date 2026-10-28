@@ -441,7 +441,7 @@ const DISTRIBUTION_ENZYME_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
     @testset "interactive lowering panels build and self-assert" begin
         # Each panel carries build-executed `@assert`s proving its lowering
-        # property (HAVE-route recipes, shared-standardized CSE, Ref broadcast,
+        # property (HAVE-route recipes, shared-standardized CSE, closure broadcast,
         # hoisted scale-only invariant). Running it fails closed on regression.
         panels = DistributionExamples.lowering_sources()
         @test length(panels) == 4

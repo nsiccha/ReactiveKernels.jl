@@ -100,12 +100,16 @@ end
         RHMC_INTEGRATORS.generalized_leapfrog!,
         (pos, mom),
     )
-    @test_throws ReactiveKernels._LLowerReject compile_state_transition(
+    # A large bound iteration count is a retained loop, not an unrolled one:
+    # the compiled transition runs it without any replication cap.
+    many_steps = compile_state_transition(
         _IntegratorCompilerEndpoint.endpoint,
         partial(RHMC_INTEGRATORS.generalized_leapfrog!;
                 stepsize, n_fi_steps=1025),
         (pos, mom),
     )
+    many_state = initial_transition_state(many_steps)
+    @test all(isfinite, many_steps(many_state).pos)
 end
 
 @testset "ReactiveHMC integrator source and independent receipt" begin

@@ -1,94 +1,161 @@
-# Manual derivative rule graphs (design example)
+# Derivative rules from one pure-math graph
 
-One pure ReactiveKernels graph can own the primal, forward-direction, and
-reverse-direction mathematics of a small numerical function. Different
-HAVE→WANT cuts then remove every branch that a particular rule invocation does
-not need.
+A small numerical function's derivatives are authored once, as an ordinary
+pure `@kernel` graph that computes the primal *and* its derivative branches.
+ReactiveKernels generates everything else from that graph: an RK-owned
+callable, one HAVE→WANT cut per activity pattern, and the AD-protocol
+adapters. The authoring boundary contains ordinary arrays and formulas. It
+does not contain backend tangent types, activity annotations, thunks,
+accumulation conventions, or registration declarations, and no rule attaches
+to a function this repository does not own (the rule constraint on
+[Core constraints](constraints.md)).
 
-!!! note "Executable design example, not a shipped adapter generator"
-    This page executes current public `@kernel` and `prepare` behavior. The
-    backend adapters discussed below are the approved design target; RK does
-    not yet generate ChainRules, Mooncake, Enzyme, or Reactant rule methods.
+Two generators cover two shapes of graph:
 
-The authoring boundary contains ordinary arrays and formulas. It does not
-contain backend tangent types, activity annotations, thunks, accumulation
-conventions, or registration declarations.
+- [`scalar_derivative_rule`](@ref) — scalar inputs and a scalar result; the
+  graph authors the primal plus one partial derivative per input.
+- [`derivative_rule`](@ref) — array or scalar inputs and results; the graph
+  authors a forward branch (one direction per input → the tangent), a reverse
+  branch (the output covector → one cotangent per input), or both.
 
-## Current capability and required RK features
+The docstrings of both generators, their callables and cut accessors are on
+the [API reference](api.md) page.
 
-Two parts of this page work in RK today: one graph can contain explicitly
-authored primal/JVP/VJP formulas, and `prepare` can prune it when the caller
-manually supplies the corresponding HAVE and WANT ports. Everything that turns
-that graph into a registered custom AD rule is new work.
+## Generated scalar rules
 
-Even when the VJP formula is already present, an RK rule generator still needs
-to add:
+A scalar numerical primitive is authored once as a graph whose WANT ports are
+its value and one partial derivative per input:
 
-- backend-neutral roles that map graph ports to primal arguments, directions,
-  output covectors, input covectors, and retainable residuals;
-- activity-driven selection of the appropriate graph cut;
-- two-stage reverse planning that computes and retains a residual environment
-  before the output covector exists;
-- a generated pullback or equivalent backend residual ABI; and
-- ChainRules, Mooncake, Enzyme, and—once its upstream bridge exists—Reactant
-  registration and tangent-conversion code.
+```julia
+@kernel loggamma_graph(x::Float64) = begin
+    y::Float64 = SpecialFunctions.loggamma(x)
+    dy_dx::Float64 = SpecialFunctions.digamma(x)
+    return y, dy_dx
+end
+const loggamma = scalar_derivative_rule(
+    loggamma_graph; primal = :y, partials = (x = :dy_dx,), name = :loggamma)
+```
 
-The distinction between two meanings of “pure mathematical formulation” is
-important. This example manually supplies both the JVP and VJP mathematics in a
-pure graph. If the input were only a primal formula, generating its VJP would
-also require reverse-mode AD or program transposition. RK has neither feature,
-and this design does not propose reimplementing them.
+`loggamma(x)` runs the primal cut (`want = :y`; the partial is pruned), and
+its signature is generic, so the same cut traces under Reactant. The activity
+pattern of a differentiated call selects the cut
+`want = (:y, partials of the active inputs...)` through
+[`derivative_cut`](@ref), and the scalar chain rule combines those partials
+with the backend's covector (reverse) or directions (forward, including batch
+width). `ReactiveKernelsDistributionKernels` uses exactly this for `loggamma`
+and `logbeta`.
 
-The existing `prepare_ad_pullback` API is a different boundary: it asks a
-`DifferentiationInterface` backend to differentiate a selected primal kernel
-and evaluates the VJP for a supplied seed. It does not consume this manual rule
-graph, generate a reusable `rrule`-style closure, or register a custom rule.
+## Generated vector rules
 
-## One graph, three selected cuts
+The matrix–vector product below authors both branches in one graph. The
+exact source is read from
+[`examples/manual_derivative_rule.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/manual_derivative_rule.jl):
 
-The panels below read the exact graph from
-[`examples/manual_derivative_rule.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/manual_derivative_rule.jl),
-execute each prepared cut during the documentation build, and show its generated
-Julia and selected compute DAG.
+```@eval
+Main.ReactiveKernelsDocs.render_manual_derivative_rule_source()
+```
+
+[`derivative_rule`](@ref) names the graph's ports into roles and validates
+them against its HAVE/WANT boundary. Inputs are the HAVE ports that are
+neither directions nor the covector, in HAVE order (`A`, `x`). The returned
+`matvec` is an ordinary callable owned by this repository:
+
+- `matvec(A, x)` runs the primal cut;
+- [`forward_cut`](@ref)`(matvec, A, x, A_dot, x_dot)` runs the JVP branch
+  and returns `(y, y_dot)`; an inactive input takes a zero direction;
+- [`reverse_cut`](@ref)`(matvec, Val(mask), A, x, y_bar)` runs the VJP branch
+  for one activity mask (bit `i` set when input `i` is active) and returns
+  the cotangents of the active inputs only.
+
+## One graph, selected cuts
+
+Rule graphs support ordinary multi-output recipes. A mathematical primitive
+can offer a value-only recipe alongside a joint recipe that shares work between
+the value and partials:
+
+```julia
+@kernel sine_graph(x::Float64) = begin
+    y::Float64 = sin(x)
+    (y, dy::Float64) = sincos(x)
+    return y, dy
+end
+const sine = scalar_derivative_rule(sine_graph;
+    primal = :y, partials = (x = :dy,))
+```
+
+The ordinary planner selects `sin` for the primal and one `sincos` call when
+both value and partial are needed. The same tuple-output support applies to
+vector rules and their reverse stages: joint outputs are available together,
+and covector-dependent outputs remain in the reverse stage. Neither the AD
+adapter nor the caller chooses a separate implementation.
+
+This does not inspect the body of an opaque recipe or discover equivalent
+algorithms. The graph must expose the value-only and joint mathematical
+recipes. Returning a tuple from one opaque helper and then indexing its first
+element still executes that helper's complete body. For example, the native
+transit response graph offers its existing value recurrence and the joint
+value/partial recurrence; a plain call omits derivative arrays, while reverse
+staging computes the joint recurrence once and retains the partials.
+
+The panels below prepare the same HAVE→WANT boundaries explicitly, execute
+each cut during the documentation build, and show its generated Julia and
+selected compute DAG.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_manual_derivative_rule_cuts()
 ```
 
 The primal cut has only `A` and `x`; the forward cut adds `A_dot` and `x_dot`;
-the reverse cut instead adds `y_bar`. Consequently the generated forward
-kernel has no output-covector path, while the generated reverse kernel has no
-input-direction path.
+the reverse cut instead adds `y_bar`. Consequently the forward kernel has no
+output-covector path, while the reverse kernel has no input-direction path.
 
-The example writes both the JVP and VJP mathematics in the same source graph.
-It does not derive one from the other. An adjoint-pairing test keeps the two
-branches consistent without requiring RK to implement a general AD or program
-transposition system.
+The graph writes both the JVP and the VJP mathematics. It does not derive one
+from the other: RK has neither reverse-mode AD nor program transposition, and
+this design does not propose reimplementing them. Generating a VJP from a
+primal-only graph is a different, much larger feature. An adjoint-pairing
+check keeps the two authored branches consistent instead.
 
-## Value plus a generated-style pullback
+## Two-stage reverse staging
 
-A reverse-rule protocol receives the output covector only after the primal has
-returned. The backend adapter must therefore stage the one graph: run the
-primal cut, return the value and a pullback object, then run the VJP cut when
-that object receives `y_bar`.
+A reverse protocol receives the output covector only after the primal has
+returned, so every generated reverse adapter stages the one graph in two cuts
+per activity pattern:
 
-The example manually owns the following backend-neutral oracle for the desired
-staging shape. RK does not generate this code today; a future adapter generator
-would replace it with the target backend's exact closure or residual ABI.
+- [`stage_primal`](@ref)`(matvec, Val(mask), A, x)` returns the primal together
+  with the residuals the reverse stage needs;
+- [`stage_reverse`](@ref)`(matvec, Val(mask), residuals, y_bar)` returns the
+  cotangents of the active inputs once the covector arrives.
 
-```@eval
-Main.ReactiveKernelsDocs.render_manual_derivative_pullback_source()
-```
+The residuals, named by [`stage_residuals`](@ref), come from cross-stage
+liveness on the lowered reverse cut: they are the covector-independent values
+its covector-dependent statements read. That can be an input, the primal output,
+or a graph intermediate, which is then computed once in the primal stage instead
+of being recomputed from the inputs. For `matvec`, `A_bar` reads only `x` and
+`x_bar` only `A`, so an `x`-only pullback retains `A` alone. For a softmax graph
+the VJP reads the primal output, so the pullback retains `y`, not `x`, and the
+reverse stage does not rebuild the exponentials.
 
-This build-executed receipt checks both the full and `x`-only pullbacks:
+The self-contained [`reverse_cut`](@ref) remains for callers that hold the
+inputs anyway: it recomputes from the inputs, and
+[`reverse_residuals`](@ref) names the inputs it reads (an input it does not
+read may be passed as `nothing`).
+
+This build-executed receipt checks the cuts, the residual sets and the
+adjoint pairing:
 
 ```@example manual_derivative_rules
 result = Main.ManualDerivativeRuleExample.run()
 
-@assert result.y == result.y_forward == result.y_reverse == result.y_x_only
-@assert result.pullback_A_bar == result.A_bar
-@assert result.pullback_x_bar == result.x_bar == result.x_only_bar
+@assert result.y == result.y_forward == result.prepared.y
+@assert result.x_bar == result.x_only_bar
 @assert result.adjoint_pair[1] ≈ result.adjoint_pair[2]
+@assert result.residuals == (
+    A_only = (false, true),
+    x_only = (true, false),
+    both = (true, true),
+)
+@assert result.staged_residuals == (A_only = (:x,), x_only = (:A,), both = (:A, :x))
+@assert result.staged_x_bar == result.x_bar
 @assert result.recipe_ids == (
     primal = (1,),
     forward = (1, 2, 3, 4),
@@ -97,25 +164,131 @@ result = Main.ManualDerivativeRuleExample.run()
 )
 
 (;
+    result.residuals,
+    result.staged_residuals,
     result.recipe_ids,
-    result.captured_fields,
     result.adjoint_pair,
 )
 ```
 
-With both inputs active, the reference pullback retains the VJP handle, `A`,
-and `x`. The `x`-only cut needs `A` but not `x`, so its pullback is smaller and
-its plan contains only the `x_bar` recipe. An actual generator needs a new
-cross-stage liveness/residualization pass to discover this capture set and to
-retain a compact stable residual instead of an original input when the graph
-provides one.
+## Plates, scans and embedded kernels in a rule graph
 
-## Backend boundary
+A rule graph may compute its primal, or any branch, with authored plates,
+scans and embedded kernels, for example a primal that splices a child graph
+holding a plate over its time points, or a lazy branch between a recurrence
+child and a closed-form child. A cut that runs one of them lowers to loops,
+which the type-level encoding above does not carry, so it is compiled from
+the cut's native lowering, exactly as `prepare(graph; have, want)` lowers it,
+and the encoded cut calls that body as its only operation. Its values are that
+prepared kernel's. The body reads only the inputs the cut's plan reads, so
+[`reverse_residuals`](@ref) is unchanged, and the staging reads its residuals
+off the plan's top-level recipes, so a primal plate's output is retained
+rather than recomputed: a reverse branch that reads `y` stages with residuals
+`(inputs..., :y)`. The compiled body's operation table keeps only the slots it
+reads, so the rule stays an `isbits` value when its other operations are
+singletons. The body is native Julia: tracing such a cut under Reactant throws
+an `ArgumentError`.
 
-Generated ChainRules, Mooncake, and Enzyme adapters would translate the selected
-numeric inputs and outputs into their respective rule protocols. Reactant rule
-emission additionally depends on the upstream EnzymeMLIR custom-rule bridge;
-see [Automatic differentiation through Reactant](reactant-ad.md). Until those
-generators exist, this page is executable evidence for graph pruning plus a
-manually authored staging oracle—not a claim that registering `matvec_rule`
-changes any AD backend or that RK can currently synthesize the pullback.
+In a position residual (`vectorize`, `prepare_batched`) the rule's primal cut
+fills lane buffers instead of allocating its result at every cell and position
+(see [position batching](position-batching.md)). Every other call, AD
+included, runs the cuts above.
+
+## Generated adapters
+
+Each adapter is generic over the rule and is loaded with its AD package:
+
+- **Enzyme** (`ext/ReactiveKernelsEnzymeExt.jl`). Reverse mode runs the
+  primal stage of the call's activity pattern in the augmented primal, hands
+  Enzyme a zero shadow for an array result, and retains the staged residuals.
+  An input is copied when Enzyme reports it may be overwritten before the
+  reverse pass, and so is a residual that is the returned array itself. The
+  reverse pass runs the reverse stage and accumulates the cotangents into the
+  argument shadows; `Active`, `Duplicated` and batched arguments are
+  supported. Forward mode runs the forward cut with Enzyme's directions,
+  once per batch lane. `DifferentiationInterface` with `AutoEnzyme` reaches
+  the same rules.
+- **ChainRules** (`ext/ReactiveKernelsChainRulesCoreExt.jl`, loaded with
+  `ChainRulesCore`). `rrule` returns the primal and a concretely typed
+  pullback that holds the all-active pattern's staged residuals; `frule` runs the
+  forward cut, with a zero direction for a `ZeroTangent`.
+
+Not generated: rule emission into EnzymeMLIR. Under Reactant a rule's callable
+and cuts trace into the compiled program as plain graph mathematics, but no
+custom rule is emitted, so Enzyme under Reactant differentiates the traced
+primal cut (see [Automatic differentiation through Reactant](reactant-ad.md)).
+The upstream mechanism is
+[EnzymeAD/Enzyme#2516](https://github.com/EnzymeAD/Enzyme/pull/2516)
+(`[mlir] Split mode & custom rules`). It is open, and no Reactant release
+carries it. Its `enzyme.custom_reverse_rule` augmented-primal and reverse
+regions correspond to `stage_primal` and `stage_reverse`, attached through
+`enzyme.custom_rule` on a callee that is not inlined. As proposed, it has no
+rule sets, so only the all-active activity pattern can be attached. It is
+reverse-only at batch width 1, and Reactant's pipeline does not yet run its
+lowering. ReactiveKernels generates this adapter once a Reactant release
+carries the mechanism.
+
+The first vector consumer is the backsolve adjoint of
+`ReactiveKernelsReactantODESolvers`: its right-hand side is a
+`DerivativeRule`, and the augmented adjoint system evaluates the rule's
+reverse cut once per stage, so nothing differentiates the adaptive loop or
+the right-hand side.
+
+The linear-algebra primitive is `ReactiveKernels.rk_expm`: ordinary reverse
+Enzyme through `LinearAlgebra.exp` fails on its LAPACK `ccall`, so the owned
+callable authors the primal plus JVP/VJP branches — each an augmented-matrix
+exponential with top-right-block extraction — in one graph, and both Enzyme
+directions verify against finite differences. Its implementation and generic
+numerical tests live in RK proper; the existing `ReactiveKernelsPPL.rk_expm`
+binding imports the same callable. Native `@kernel` and `@traceable` source
+resolving to Base's `exp` selects this primitive for `Matrix{Float64}`,
+including calls inside lazy branches, plates and scans. Scalar and dotted
+calls, other matrix types and locally shadowed bindings retain their Julia
+behavior. Calls hidden inside an ordinary Julia helper are outside this
+source lowering; use `@traceable` or the explicit owned `rk_expm` there.
+The tensorized path still needs backend matrix-exponential support.
+The raw Enzyme boundary has a backend-only reproducer at
+`benchmark/repro_enzyme_matrix_exp.jl` and is also reported in
+[EnzymeAD/Enzyme.jl#1222](https://github.com/EnzymeAD/Enzyme.jl/issues/1222).
+
+The native pure-Julia lower Cholesky
+callable `ReactiveKernels.rk_cholesky_lower(A)` needs no custom rule: ordinary
+Enzyme differentiates its authored arithmetic. It returns
+`LowerTriangular{Float64}` over fresh owned storage, interpreting only the
+lower triangle as a symmetric matrix and leaving `A` unchanged. Non-square
+inputs throw `ArgumentError`; non-positive or NaN pivots throw
+`LinearAlgebra.PosDefException` with the failing index in `info`. Its source
+and generic value/ordinary-reverse tests are `src/cholesky.jl` and
+`test/test_cholesky.jl`. This extraction preserves the native factorization
+used by BRM's `StatisticalPreparation.gp_chol_latent` wrapper, which translates the pivot
+failure to its existing GP `ArgumentError` and jitter message. Statistical
+wrappers are owned by BRM. This callable provides no compiled lowering; native
+factorization evidence does not certify compiled Cholesky gradients.
+
+The second linear-algebra consumer is the symmetric-eigendecomposition pair
+`rk_symmetric_eigvals` / `rk_symmetric_eigvecs`, defined in
+ReactiveKernels itself (`src/symmetric_eigen_rules.jl`). Existing
+`ReactiveKernelsDistributionKernels.DistributionKernelSources` and
+`ReactiveKernelsPPL` bindings import the same callables and rule graphs:
+ordinary reverse Enzyme through
+`eigen(::Symmetric)` fails on the LAPACK `syevr!` `ccall`
+(`EnzymeNoDerivativeError` for `dsyevr_64_`; Enzyme's derivative table covers
+BLAS plus `potrf` only), so each output is an owned callable whose graph
+authors the symmetric-perturbation JVP and VJP branches
+(`R_dot = diag(Q' * A_dot * Q)` and `A_bar = Q * Diagonal(R_bar) * Q'` for
+values; `Q_dot = Q * (F .* (Q' * A_dot * Q))` and
+`A_bar = Q * Symmetric(F .* (Q' * Q_bar)) * Q'` with
+`F[i, j] = 1 / (R[j] - R[i])` off the diagonal for vectors). Both Enzyme
+directions verify against finite differences, the two branches agree by
+adjoint pairing, and reverse staging retains `Q` (values) and `Q` plus `F`
+(vectors). The rules read only the upper triangle and need distinct
+eigenvalues; eigenvector columns are defined up to sign. A
+symmetric-eigendecomposition-based density calls these names in-graph instead
+of raw `eigen(Symmetric(...))`.
+
+## A different boundary: `prepare_ad_pullback`
+
+The existing `prepare_ad_pullback` API asks a `DifferentiationInterface`
+backend to differentiate a selected primal kernel and evaluates the VJP for a
+supplied seed. It does not consume a rule graph or register a custom rule; the
+two surfaces are independent.

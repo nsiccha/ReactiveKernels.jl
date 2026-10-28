@@ -1,8 +1,12 @@
 # Exact BRM motorcycle HSGP benchmark
 
-The model is authored once in [`examples/brm_hsgp.jl`](../../examples/brm_hsgp.jl).
-It uses ordinary `@kernel` recipes and an observation `plate`. `prepare(...;
-bound=...)` folds the data-only basis and squared frequencies; the 44-vector
+The statistical model is owned by
+[BRM's `ext/rk_statistical_gp.jl`](https://github.com/nsiccha/BayesianRegressionModels.jl/blob/ns/devibe/ext/rk_statistical_gp.jl).
+Load RK and RKPPL, then use `BayesianRegressionModels.rk_model(:dual_hsgp)` and
+`BayesianRegressionModels.StatisticalPreparation.prepare_dual_hsgp` from
+published BRM `1f296dac2c086347525194887500948edb213228` or a compatible descendant.
+[`examples/brm_hsgp.jl`](../../examples/brm_hsgp.jl) is a thin consumer and fixture
+loader. Owned preparation folds the data-only basis and squared frequencies; the 44-vector
 `q` and 40-vector of centeredness controls remain live. The benchmark separately
 prepares native Enzyme AD, compiles the primal through Reactant, and compiles
 value plus gradient through `compile_ad_value_and_gradient`. `compare.jl`
@@ -104,21 +108,22 @@ used for differentiation here.
 
 ## Reproduce
 
-Use Julia 1.10 and the benchmark project. Reactant is pinned to 0.2.284.
-BRM must contain `5b8c9c6b1c2c7dbd0e222194d41387f0e509381f`; the initial audited
-snapshot was descendant `8dfe41253af3043482cb3270cf513b50a1de5437` (ancestry
-counts `0 12`). The receipt records all measured package versions and SHAs.
+Use Julia 1.10 and the benchmark project. Reactant is pinned to 0.2.289.
+The runnable consumer requires the published BRM adoption above. Historical
+receipts retain their measured sources and versions; the cleanup does not rerun
+the original posterior, gradient, timing or sampling campaigns.
 
 BRM has unregistered dependencies. Prepare this consumer project using the
 ecosystem's canonical resolver, supplying exact `Name=path=40hexsha` overlays
-for the BRM and MutatingFunctions snapshots and `ReactiveKernels=<this repo>`.
+for each local snapshot, including RK, RKPPL and BRM.
 For example, from this repository in a provisioned KB environment:
 
 ```sh
 RESOLVE_ACCEPTANCE=1 bash -c 'set -euo pipefail
-source /home/n/github/nsiccha/Claude/lib-repos.sh
-source /home/n/github/nsiccha/Claude/lib-resolve.sh
-julia --startup-file=no --project="$1" -e "$(resolve_script "$1" ReactiveKernels "$2" "ReactiveKernels=$2" "${@:3}")"
+source "${CLAUDE_REPO:?}/lib-repos.sh"
+source "$CLAUDE_REPO/lib-resolve.sh"
+rk_tip=$(git -C "$2" rev-parse HEAD)
+julia --startup-file=no --project="$1" -e "$(resolve_script "$1" ReactiveKernels "$2" "ReactiveKernels=$2=$rk_tip" "ReactiveKernelsPPL=$2/packages/ReactiveKernelsPPL=$rk_tip" "${@:3}")"
 ' _ "$PWD/benchmark/brm_hsgp" "$PWD" \
   "BayesianRegressionModels=<snapshot path>=<full SHA>" \
   "MutatingFunctions=<snapshot path>=<full SHA>"
@@ -135,13 +140,24 @@ each with all 44 coordinates. Expected SHA-256 hashes:
 | `noncentered.jls` | `9f0b2513dd9762d54360c26548322e6349fa4e834691d0a92ae210d951435c50` |
 | `partial.jls` | `ad667cb50ddf28faff727cc73bdf22556ddaff54d5384dd4337556a22fca9247` |
 | `centeredness.tsv` | `e882c5b7a906275bbff370291c686ba8284272fdf7aa5102bccba3323468e289` |
-| `examples/data/mcycle.csv` | `b89a1e4eb0391a982b32be3e378df00e8593ff9971e9425e9c5d7929b74f9801` |
+| BRM `research/adaptive_centering/mcycle.csv` | `b89a1e4eb0391a982b32be3e378df00e8593ff9971e9425e9c5d7929b74f9801` |
 
 ```sh
-julia --startup-file=no --project=benchmark/brm_hsgp test/test_brm_hsgp_reactant.jl
+julia --startup-file=no --project=benchmark/brm_hsgp benchmark/brm_hsgp/test_gp_binding.jl
+julia --startup-file=no --project=benchmark/brm_hsgp benchmark/brm_hsgp/test_gp_pair_plate_reactant.jl
 julia --startup-file=no --project=benchmark/brm_hsgp \
   benchmark/brm_hsgp/compare.jl BUNDLE_DIR OUTPUT_DIR
 ```
+
+The optional GP checks exercise ordinary name binding, graph composition, data
+folding and compiled covariance/AD cuts using BRM's owned graphs. The two plain
+PPL consumer programs in `corpus/` use BRM helpers; they no longer participate
+in the default dependency-light PPL syntax corpus. Scientific GP/HSGP acceptance
+is owned by BRM (`test/rk_gp_covariance.jl`, `test/rk_dual_hsgp.jl`).
+Opaque prepared covariance callbacks with bound locations reach an existing
+Enzyme activity error (Julia 1.10.12 / Enzyme 0.13.210); these compiler checks
+use assigned owner graphs. The synthetic RK-only reproducer is
+`../repro_enzyme_prepared_pair_callback.jl`.
 
 A final optional positional argument limits posterior points for smoke runs;
 these are never full acceptance receipts. `RK_HSGP_NATIVE=0` explicitly runs

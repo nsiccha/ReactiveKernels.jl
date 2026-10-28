@@ -89,7 +89,7 @@ using LogExpFunctions: logsumexp
     W::Matrix{Float64}    = reshape(w_flat, M, K)
     Breg::Matrix{Float64} = reshape(b_flat, M, K)
     unA::Matrix{Float64}  = u * W                              # T×K
-    rowlse::Vector{Float64} = vec(mapslices(logsumexp, unA; dims = 2))
+    rowlse::Vector{Float64} = vec(logsumexp(unA; dims = 2))
     logA::Matrix{Float64} = unA .- rowlse                      # T×K, logA[t,j]
     means::Matrix{Float64} = u * Breg                          # T×K, means[t,j] = u[t]·b[j]
 

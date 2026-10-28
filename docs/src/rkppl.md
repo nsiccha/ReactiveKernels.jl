@@ -1,0 +1,1574 @@
+# Writing models with `@rkppl`
+
+`ReactiveKernelsPPL` is a small probabilistic-programming layer on top of
+ReactiveKernels. It lives in the nested package
+`packages/ReactiveKernelsPPL`, and ReactiveKernels core does not depend on it.
+A model is an ordinary Julia block of `~` statements and assignments. The layer
+turns it into a `@kernel` graph with a packed unconstrained parameter vector,
+the transforms and their log-Jacobians, data preprocessing done inside the
+graph, and the canonical `likelihood` / `prior` / `log_jacobian` / `posterior`
+nodes.
+
+The same language is what BayesianRegressionModels' `RKBRMI` backend emits for
+an `@brm` formula. Hand-written and BRM-emitted models go through one pipeline:
+
+```
+@rkppl block ─ lower_rkppl ─▶ StructuralPlan ─ bind_data ─▶ bound plan
+   ─ build_kernel ─▶ (; spec, layout) ─ prepare_query / prepare_sampler
+```
+
+Every example panel on this page runs at docs-build time, exactly as displayed. The
+canonical programs come verbatim from the package's corpus
+(`packages/ReactiveKernelsPPL/test/corpus/`), which also pins how each one
+lowers.
+
+## A first model
+
+Bind inputs by keyword, then observe responses with `model(; x) | (; y)`.
+`condition(model(; x); y)` is the same operation. A call keyword naming a
+declared variable pins it: `model(; x, sigma = 0.3) | (; y)` removes the
+`sigma` declaration and its density. Observing it instead,
+`model(; x) | (; y, sigma = 0.3)`, keeps its density as likelihood.
+`build_kernel` generates the program, and `prepare_query(built, plan, :sampler)`
+returns the log-posterior over the packed unconstrained coordinates.
+
+A model with nothing left to observe needs no `|`: a prior-only model, or one
+whose responses are definitions computed from data. Its call returns the
+binding, and every step that takes a bound plan (`build_kernel`,
+`kernel_expr`, `assign_layout`, the `prepare_*` queries and
+`model_view(built; bound)`) takes the binding too, reading the plan
+`bind_data(binding)` lowers it to. Each step lowers it again; bind once with
+`plan = bind_data(binding)` to share one plan.
+
+Rebinding one lowered plan to other data, as a prediction design or a
+simulation scenario does (`bind_data(plan, data)`), reuses what the plan's
+structure decides from its first binding: which definitions are data, which
+inputs are model-level, the axes of array values, the structure checks, and
+which names each definition reads and where it reads them. Each further
+binding pays for its data alone: it evaluates the definitions that read only
+data (a kernel such a definition calls is prepared once per lowering) and
+validates the values, such as a gather index's element type and range or a
+column's numbers.
+
+A model can fit its preprocessing in the graph from a fit-role copy of its
+data (`x_mean = fit_mean(x_fit)`, then `z = (x .- x_mean) ./ x_sd`) and
+freeze it by value for later designs, so a design binds without the training
+data. `frozen_values(fit, (:x_mean, :x_sd))` reads those definitions' values
+from the fit's binding, together with the type and size (never the values)
+of each data input they read. `bind_data(plan, design; frozen = state)`
+then takes each value exactly where binding would have evaluated it, and
+leaves out an input only frozen definitions read. The design generates the
+fit's program, so a kernel built for the fit evaluates it, with equal values,
+densities and gradients. A whole value that RK preparation folds (one a
+parameter-dependent call reads, such as an HSGP interval) freezes the same
+way: preparation receives its frozen value at its own graph node, and
+computes neither it nor what only it reads. A design lowered without the
+training data passes the record to lowering too,
+`lower_rkppl(ast, design; frozen = state)`, which then knows the omitted
+input is data, and `bind_data` binds the lowered plan's record by default.
+Supplying a computed definition as plain data stays refused.
+
+An explicitly observed empty vector has zero observations and contributes
+zero log-likelihood. Scalar priors and their transforms still contribute as
+authored. An elementwise declaration such as `z[1:0] .~ Normal.(0, 1)` is an
+empty vector with no coordinates and zero prior and log-Jacobian. The same
+identity applies to empty matrix axes and empty data-sized elementwise arrays;
+negative declared sizes and out-of-bounds gathers remain errors.
+Native gradients also support a completely empty coordinate pack. Compiled
+values support it; compiled gradients currently fail at the backend's empty
+tensor export boundary (see [Core constraints](constraints.md)).
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_corpus_example("01_gaussian.jl", :rkppl_first_model; preamble = "using ReactiveKernelsPPL")
+```
+
+This is the `@kernel` program `build_kernel` generates for the model above —
+the graph that the sampler cut is prepared from:
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_kernel_program("01_gaussian.jl")
+```
+
+Elementwise observations follow Julia broadcasting. A singleton input such as
+`x = [0.5]` can serve a longer response, and matrix or tensor responses keep
+their axes. For `mu = a .+ b .* x; y .~ Normal.(mu, 1)`, an `x` of size
+`(2, 1)` broadcasts beside a `y` of size `(2, 3)`. The likelihood sums every
+broadcast cell. Incompatible non-singleton dimensions fail during binding.
+Shared singleton inputs can also serve independent responses of different
+sizes. Explicit `@plate` indexing keeps its authored indexing requirements;
+`x[i]` does not stretch a singleton `x`.
+
+## Every parameter is declared
+
+Declarations are strict: every parameter needs an explicit prior statement. A
+name that is not a data column, a definition, or a declared parameter is an
+error, so a typo can never become a parameter:
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_strict_error()
+```
+
+Coefficient vectors are declared the same way, sized by their design matrix:
+`b[axes(X, 2)] .~ Normal.(0, 1)`.
+
+A scalar deterministic definition can carry a density factor without adding
+a sampled coordinate. For example, `beta_last = -sum(beta_free)` followed by
+`beta_last ~ Normal(0, 3)` adds `logpdf(Normal(0, 3), beta_last)` to the prior.
+The factor uses an admitted scalar distribution and the definition keeps its
+ordinary value for later reads, such as `beta = vcat(beta_free, beta_last)`.
+The definition is still assigned once; a second factor on the same name is
+rejected. Vector observations use `.~`. A caller-owned law instead observes
+the definition as one whole event (see caller-owned sampling laws below).
+
+Computing a scalar from data does not automatically condition its density.
+For `z = sum(log.(raw)); z ~ Normal(mu, 3)`, use
+`lower_rkppl(ast, (; raw); conditioned=(:z,))` to select an observation, or
+`bind_data(plan, (; raw); conditioned=(:z,))` after lowering. The definition
+stays in the graph and reads `raw`; do not supply a second value for `z`.
+Its density then contributes to `likelihood` and the scalar entry `pointwise.z`,
+with no coordinate or transform Jacobian. Conditioning selects the density's
+role and preserves the definition's dependencies, including any dependence
+on free parameters. Data-only work can be frozen by RK preparation regardless
+of whether the density is conditioned; freezing and conditioning are separate
+choices.
+
+## Parameter priors
+
+Scalar parameter priors include `Normal`, `Cauchy`, `Exponential`, `Gamma`,
+`LogNormal`, `Beta`, `InverseGamma`, `StudentT`, `TDist`, `Laplace`, `Logistic`,
+`Uniform` and `Weibull`. Arguments can read data, sampled parameters and
+ordinary definitions; scalar expressions such as `1 + exp(a)` are values too.
+Omitted positional arguments use Distributions.jl defaults: `Normal()` is
+standard normal, `Gamma(k)` has unit scale, `Beta(k)` has two equal shape
+parameters, and `TDist(nu)` is the standard Student t distribution.
+
+Positive priors have the same normalized meaning in every slot:
+`HalfNormal(s)`, `HalfCauchy(s)` and their equivalent truncated Normal/Cauchy
+forms work for sampled parameters and the built-in varying and smooth scales. A bare
+`Normal(0, s)` or `Cauchy(0, s)` keeps its full support and is rejected in a
+positive scale slot. Write the explicit half or truncation instead.
+
+Support keywords on distribution constructors, such as
+`Normal(0, s; lower=0)`, are rejected. Use normalized
+`truncated(Normal(0, s), 0, Inf)` or the density-preserving `restricted` form
+below according to the intended model.
+`Flat()` is an improper real prior and accepts no support keywords; choose
+`Exponential(s)` for a positive prior or `Uniform(lo, hi)` for a bounded
+uniform. These are proper densities and change an improper prior's model.
+
+`x ~ truncated(D, lo, hi)` uses the normalized Distributions.jl density for
+any of these univariate families. Bounds may be literals, model-level data,
+sampled values or scalar expressions; use `-Inf` or `Inf` for an open end.
+The transform uses the intersection with the base distribution's support.
+A parameter-dependent bound also determines `constrain`, `unconstrain` and
+`logjac`, independent of declaration order. Array and plate priors accept
+shared scalar bounds. Per-element bounds are not built yet.
+
+```julia
+a ~ Normal(0, 1)
+x ~ truncated(Weibull(2 + exp(a), 1), exp(a), 3 + exp(a))
+p ~ Dirichlet(3, exp(a))
+y .~ Normal.(x, 1)
+```
+
+`x ~ restricted(D, lo, hi)` declares the same support intersection and
+coordinate transform, while preserving `D`'s original log density. It does
+not divide by the probability mass inside the bounds. This is a dedicated
+`@rkppl` prior form for bounded density kernels, distinct from normalized
+`truncated`. The original family arguments and literal, data or sampled
+scalar bounds stay live. The existing normalized half prior retains its
+`log(2)` constant when used as `D`.
+
+```julia
+scale ~ restricted(Normal(0, 1), 0, Inf)
+invdf ~ restricted(Exponential(0.125), 0, 0.5)
+```
+
+At the same physical point these priors have the original Normal and
+Exponential densities. Normalized truncation instead adds `log(2)` and
+`-log1p(-exp(-4))`, respectively. Both forms have the same coordinates and
+Jacobians; a live bound or family argument can make the normalization
+parameter dependent, so their gradients need not agree in general.
+
+`restricted(Flat(), lo, hi)` has zero log density inside its support and
+uses only the transform Jacobian. It supplies an improper flat density
+kernel, without a uniform normalizer. Scalar conditioning keeps the original
+density and returns `-Inf` outside the declared support; pinning removes the
+density as usual. Array and plate priors accept shared scalar bounds with
+`restricted.(D.(args...), lo, hi)` or a per-cell `restricted(D, lo, hi)`.
+Assign a computed array bound to a name first (`hi = 2 + exp(a)`), as
+with `truncated` array priors. Per-element bounds and nested
+restrictions/truncations are not built yet.
+
+`Dirichlet(alpha)` takes a concentration vector from data, a sampled array,
+a vector literal containing live values, or an array-valued definition.
+`Dirichlet(K, a)` takes a literal dimension and a live scalar concentration.
+The concentration shape determines the simplex size at binding; it does not
+replicate the density body. Concentrations must be positive.
+
+Dynamic Normal, Cauchy and Weibull truncation supports native and Reactant
+primal and reverse execution. Gamma, Beta and InverseGamma truncation calls
+incomplete gamma or beta functions whose traced methods are still unavailable;
+those normalizers support native execution. Hierarchical Dirichlet supports
+native and compiled primal and reverse execution.
+
+## Distribution arguments are values
+
+Locations, scales, StudentT degrees of freedom and zero-inflation
+probabilities may be scalar or per-observation expressions. Naming an
+expression keeps the same density. Scalar calls stay scalar, and vector
+operations use Julia's dots:
+
+```julia
+a ~ Normal(0, 1)
+b ~ Normal(0, 1)
+s ~ Normal(0, 1)
+nu ~ Exponential(1)
+mu = exp.(a .+ b .* x)
+y .~ StudentT.(2 + nu, mu, exp(s))
+```
+
+Data-computed scales such as `exp.(x)` and mixed plate-latent locations
+such as `theta .+ b .* x` also use their written values. Literal and named
+scalar offsets add directly to a predictor. Gaussian mixture components also
+accept these value locations, including scalar aliases; explicit component
+links such as `Poisson.(exp.(a))` apply to sampled scalars.
+
+`Beta.(alpha, beta)` accepts two ordinary shape values. Circular
+VonMises endpoints may be named, bound as data or sampled; they must define
+a finite interval of width `2pi`. A live lower endpoint can use
+`hi = lo + 2pi`. The interval and support are checked before wrapping the
+location or evaluating the density.
+
+Count trials are data. `Binomial.(n, …)`, `ZeroInflatedBinomial.(n, …)`,
+`BetaBinomial2.(n, …)`, Binomial mixture components and
+`Multinomial.(N, Ref(s))` read an Int literal, bound Int data (a number or
+an array) or a definition that reads only data. A bound number such as
+`m(; n = 5)` gives every observation the same trials, as
+`fill(5, length(y))` would, and a definition such as `n = t .+ 1` is
+evaluated once at binding. Trials computed from a sampled value fail at
+lowering.
+
+A sampled scalar on `(0, 1)` retains its unconstrained coordinate for a
+direct `logit(q)` call and for `1 - q` when that complement is the
+zero-inflation input of `ZeroInflatedBinomial`. For example:
+
+```julia
+q ~ Uniform(0, 1)
+eta = logit(q) .+ x
+y .~ ZeroInflatedBinomial.(n, logistic.(eta), 1 - q)
+```
+
+The transform Jacobian and count likelihood use the source logit at finite
+tails even when the constrained `Float64` probability rounds to an endpoint.
+Other sampled priors must also have finite density at that rounded value.
+Other probability expressions retain their authored arithmetic.
+
+An ordered vector may use Normal, Cauchy, Laplace, Logistic or StudentT
+element priors with live scalar arguments, for example
+`c ~ Ordered(Normal(m, 2s), 2)`. Its density is the sum of the element log
+densities on increasing vectors, with no factorial normalizer.
+`c ~ Ordered(Flat(), n)` is Stan's `ordered[n] c;` with no prior statement:
+its elements have zero density, leaving the ordering transform's Jacobian.
+
+Ordered extents may be data-only expressions, including
+`length(levels(x)) - 1`, `length(levels(y)) - 2` and
+`length(unique(y)) - 1`. Binding evaluates the actual nonnegative integer
+extent even when a Gaussian response reads the vector. An ordinal response
+has support `1:length(c)+1`; an observed category outside it fails at bind.
+`levels` includes a declared DataAPI level pool; `unique` counts observed
+values. The prior and support come from the declaration: cumulative
+cutpoints may have an ordinary Normal or Flat vector prior (non-increasing
+values give `-Inf`), and stopping-ratio thresholds may have an Ordered or
+ordinary Normal/Cauchy/Laplace/Logistic/StudentT/Flat prior.
+
+A per-cell `Flat()` prior contributes zero density and retains its layout
+coordinates. Its posterior may be proper through the likelihood; density
+evaluation requests no draw from the unnormalizable prior.
+
+Scalar observations also keep their declaration's density. For
+`m = @rkppl begin theta ~ Beta(1, 1); k ~ Binomial(n, theta) end`,
+`m(; n=5) | (; k=2)` packs only `theta`. Direct lowering with
+`conditioned=(:k,)` has the same density and Jacobian. Trials must be a
+nonnegative integer value, and the observed `k` must be scalar; use `.~`
+for an observation vector.
+
+Uniform bounds may be live scalar values, including in factor arrays:
+`lo ~ Normal(0, 1); c[levels(g)] .~ Uniform.(lo, lo + 3)`.
+
+## Caller-owned sampling RHS definitions
+
+Sampling RHS definitions are open Julia bindings. Built-in spellings select
+the existing specialized lowerings; other bindings use the following public
+protocol. An observation needs only a constrained-value log density:
+
+```julia
+struct MyNormal{T}
+    mu::T
+end
+ReactiveKernelsPPL.sampling_logdensity(d::MyNormal, x) =
+    -log(2pi)/2 - (x-d.mu)^2/2
+
+normal_lpdf(x, mu) = -log(2pi)/2 - (x-mu)^2/2
+# Inside an @rkppl model with a declared parameter a:
+y .~ MyNormal.(a)
+# The convenience wrapper has the same density:
+y .~ LogDensity.(normal_lpdf, a)
+```
+
+With `Distributions` loaded, any `Distributions.Distribution` object uses its
+ordinary `Distributions.logpdf` method automatically, including custom types.
+Other types extend `sampling_logdensity`. A module-visible RHS object can be
+used directly; a definition can also construct an RHS value. Undotted `~`
+evaluates one whole-event density; `.~` applies it over Julia broadcast cells,
+retains the broadcast axes in `:pointwise`, and sums those cells. Independent
+custom broadcasts need not share another response's row count. Observations
+acquire no packed coordinates and need no transform or random generator. As
+under a built-in family, an observed number is one observation, and an
+observed definition reading only data (`y = v[positions(rows)]`,
+`y = sum(f(raw))`, `y = hcat(u, v)`) is evaluated once by `bind_data` and
+validated as the response, exactly like the same value bound as data.
+Undotted, `ys = log.(raw); ys ~ LogDensity(f, m)` evaluates `f(ys, m)` once
+on the whole value, whether it is a vector, a number or a matrix. A
+caller-owned law observing a definition that reads a sampled value reads it
+as the graph computes it, dotted or undotted.
+
+An undotted external constructor keeps each argument whole:
+`y .~ some_distribution(parameters)` shares the vector `parameters` across
+the observations. To broadcast constructor arguments, write the constructor
+call with a dot, for example `y .~ some_distribution.(means, Ref(covariance))`.
+Inside an authored plate, `y[i] ~ some_distribution(parameters, x[i])`
+shares `parameters` and reads `x` at the authored index, including its ordinary
+bounds checks. A dotted observation within a cell applies the resulting
+distribution to that cell's observations.
+
+A parameter declaration additionally needs structural geometry. The method
+receives the constructor binding, authored argument expressions and declared
+constrained shape; it must not evaluate active statistical arguments. For
+example, a positive exponential residual above a live lower bound:
+
+```julia
+struct ShiftedExp{T}
+    lower::T
+end
+ReactiveKernelsPPL.sampling_logdensity(d::ShiftedExp, x) =
+    x > d.lower ? -(x-d.lower) : -Inf
+function ReactiveKernelsPPL.sampling_geometry(::Type{ShiftedExp}, args, shape)
+    ParameterGeometry(shape, 1; support=(:lower, args[1]),
+        constrain=(u, shape, lower)->lower + exp(u[1]),
+        unconstrain=(x, shape, lower)->[log(x-lower)],
+        logjac=(u, shape, lower)->u[1])
+end
+# Inside a model:
+a ~ Normal(0, 1)
+b ~ ShiftedExp(a + 0.7)
+```
+
+The endpoints receive current argument **values**, including sampled parent
+values, on both the host layout path and the generated kernel path.
+`ParameterGeometry` specifies constrained `shape`, packed dimension,
+support metadata, constrain, inverse and log absolute Jacobian. Shape and
+packed dimension may differ: a two-component simplex can pack one coordinate.
+Declare constrained array dimensions on the LHS, for example `p[1:2] ~ D()`;
+dimensions and packed extents may depend on bound data, never sampled values.
+Optional `coordinate_names` names every packed coordinate. In a `@plate` cell,
+`b[i] ~ D(…)` with scalar geometry and one packed coordinate is one number per
+index; any other geometry makes it a joint latent per index (see "One joint
+latent per index"). The density and inverse must enforce the declared support;
+metadata alone adds no support check.
+
+An external frontend can supply a submodel without defining it through
+`@rkppl`: extend `sampling_fragment(binding)` to return a stable
+`RKPPLSubmodel(name, argument_names, body_ast, defining_module)`. Its ordinary
+sampling statements, definitions and authored loops then follow the same
+scope, nesting and conditioning expansion as RKPPL submodels. The adapter
+does not execute an opaque model or modify compiler internals. It returns
+`nothing` for bindings that are densities rather than model fragments.
+
+Density bodies and geometry endpoints are pure ordinary Julia and use standard
+backend AD. Statistical bodies remain caller-owned. Model-sized iteration
+belongs in visible submodel statements or retained plates/scans, following
+[Core constraints](constraints.md). The initial custom RHS acceptance tests
+cover native values, ordinary Enzyme Reverse, host/kernel transforms and
+printed-source replay; compiled backend support depends on the caller's Julia
+operations and requires its own retained-loop acceptance. Custom scan-state
+geometry is not yet implemented. Ordinary RHS keyword arguments are preserved;
+geometry endpoints receive those same keyword values. Structural argument
+expressions retain Julia's `Expr(:parameters, ...)` keyword representation.
+
+This protocol computes log densities. Posterior-predictive draws of the
+built-in response families are available through `prepare_predictive`
+("Predictive draws" below); draws from caller-owned RHS definitions,
+generated-only declarations and prior resampling remain future work. They
+will need a draw capability separate from parameter geometry, without adding
+generated values to sampler coordinates.
+
+## Julia semantics, written out
+
+- Use Distributions.jl constructors (`Normal`, `Exponential`, `Gamma`, …).
+- Response constructor defaults have their ordinary meaning: `Normal.(mu)`
+  and `LogNormal.(mu)` use unit scale, `NegativeBinomial.(exp.(eta))` uses
+  probability `0.5`, `InverseGaussian.(exp.(eta))` uses unit shape,
+  `Weibull.(k)` uses unit scale, and `VonMises.(exp.(eta))` has zero mean
+  and concentration `exp.(eta)`. Plate observations accept `Normal.(mu)` too.
+  Live VonMises concentration supports native values and derivatives;
+  Reactant compilation still encounters its existing traced `besseli` gap.
+- `Bool` response values retain their numeric meaning, zero or one.
+  Responses with a strictly positive data domain require `true`.
+- `MixtureModel.(vcat.(C1, C2))` gives the components equal weights.
+  Explicit shared weights use `MixtureModel.(vcat.(C1, C2), Ref(w))`.
+- `Beta.(alpha, beta)` preserves argument order. Swapping the arguments in
+  `Beta.(logistic.(eta) .* k, (1 .- logistic.(eta)) .* k)` changes its mean
+  from `logistic.(eta)` to `1 .- logistic.(eta)`.
+- Broadcasting is explicit: `mu = a .+ b .* x`.
+- A reduction's one-argument form (`sum(x)`, `mean(z)`) is the built-in
+  whole-column reduction. It reads its argument whole, as
+  `Statistics.mean(z)` does, so an array that only reductions read has no
+  observation axis: `xs = (x .- mean(x_fit)) ./ std(x_fit)` binds an
+  `x_fit` of any length beside the observations of `x`.
+  Called with keywords or a function argument it is
+  Julia's own function, as its qualified spelling `Base.sum` is: with
+  `dims = 2`, `P = exp.(U .- log.(sum(exp.(U); dims = 2)))` normalizes each
+  row of `U`, and `std(x; corrected = false)`, `sum(z; init = 0.0)` and
+  `sum(abs2, W)` keep their Julia meaning.
+- Distribution arguments use their ordinary values. `exp.`, `logistic.`,
+  `normcdf.` and `cexpexp.` apply at each use, including means, rates,
+  probabilities, scales, shapes, Student degrees of freedom and zero
+  inflation. One predictor may feed several slots or responses under
+  different links, with its original parameter names and priors.
+  Values outside parameter support contribute `-Inf` through a lazy
+  density branch. Mixture components may use independent links.
+  A computed coefficient such as `b = z * lambda * tau` reads its
+  declared parameters, so using it as a scale retains the same priors.
+  Native value and reverse checks cover this form. With Reactant 0.2.290,
+  some shared scalar density guards fail during tracing with
+  `isless(::Int64, ::Reactant.EnsureReturnType{Any})`, before the compiled
+  primal runs. The generic RK reproducer is
+  `benchmark/repro_reactant_shared_scale_guard.jl`; this also reproduces
+  outside the PPL and predates the construct removal.
+- Plate cells accept `BernoulliLogit.(eta)` and `PoissonLog.(eta)` directly
+  on the logit and log-rate scales. A bare modeled `VonMises.(kappa)` uses
+  zero mean. Live concentration supports native density and AD; compiled
+  execution remains gated by the missing traced `besseli` method.
+- A vector response uses the dotted tilde, `y .~ Normal.(mu, sigma)`. A plain
+  `y ~ Normal(...)` on a data vector is rejected.
+- A `~` whose left-hand side is a bound data column is an observation. On an
+  existing scalar definition a built-in family adds a density factor, while a
+  caller-owned law observes the definition's whole value; otherwise it
+  declares a parameter.
+- `Ordinal` permits an intercept alongside its thresholds, for both
+  cumulative and stopping-ratio responses. Both declarations and their
+  priors are translated as written.
+  `OrderedLogistic` and `Ordinal` require an explicit threshold argument
+  such as `Ref(c)`; declare the modeled vector and its prior in the body.
+  Omitting the argument is rejected.
+- Single assignment, no `target +=`. Loops are written as `@plate` cells or
+  `@scan` recurrences (see [Plates](#Plates)). A definition's value may be a
+  lazy branch, as in Julia and in a plate cell: `m = c ? a : b`,
+  `if`/`elseif`/`else` (an arm may bind locals that its later statements
+  read), `&&` and `||`. Only the arm the condition selects runs; a data-only
+  branch runs once, at binding. A local named like a model value is refused,
+  since a name is assigned once. Types are values (`convert(Float64, a)`,
+  `eltype(cells) <: Number`), so the flatten of
+  [position batching](position-batching.md) is written as a definition:
+
+  ```julia
+  loc = eltype(loc_cells) <: Number ? loc_cells :
+      isempty(loc_cells) ? eltype(eltype(loc_cells))[] : reduce(vcat, loc_cells)
+  ```
+
+  An `if` statement that defines no name does not lower.
+
+Joint `MvNormalCholesky` responses use explicitly declared covariance pieces:
+
+```julia
+sd[1:2] .~ Exponential.(1)
+C ~ LKJCholesky(2, 2)
+F = sd .* C
+[y1, y2] ~ MvNormalCholesky([mu1, mu2], F)
+```
+
+`LKJCovarianceFactor` no longer creates implicit priors or names. The scale
+prior and factor names are the author's; ordinary positive-support scale
+priors and a sampled `LKJCholesky` shape are supported.
+
+The implicit `r2d2(...)` statement and `b ~ Horseshoe(...)` coefficient
+shortcut are retired. State priors and coefficient arithmetic explicitly,
+or obtain the BRM-owned bodies with
+`BayesianRegressionModels.rkppl_model(:r2d2_coefs)` and
+`BayesianRegressionModels.rkppl_model(:horseshoe_coefs)`. Their statistical
+preparation and model construction belong to BRM.
+
+A definition may call a function-shaped ReactiveKernels `@kernel` in the model
+module. A positional call such as `loc = recurrence(x, a)` splices the child's
+graph into the generated model, including its authored plates and scans.
+Imported, aliased and qualified bindings use the same composition. Omitted
+child port annotations accept the caller's declared types; declared boundaries
+keep their types. The emitted `kernel_expr` remains the source of the graph,
+so evaluating that expression retains the same child operations.
+
+A kernel with several outputs (`return PHI, omega2`) composes through Julia's
+destructuring: `(P, om) = basis(x)` stays one statement in the generated
+program and splices the child at its whole output boundary. Destructuring an
+ordinary function likewise calls it once per evaluation. Binding the call to
+one name, `bt = basis(x)`, or indexing it in place, `P = basis(x)[1]`, splices
+the same child and binds the tuple the call returns, so every output is
+computed even when one element is read.
+
+Composition exposes the child's execution capabilities. Ordinary native
+Enzyme reverse covers empty and nonempty child scans, including inside a bound
+`eachcol` subject plate. The default compiled backend expands small subject
+plates into copies of the child scan, so those shapes still lack retained-loop
+structural acceptance. The composition tests keep that gap visible; larger
+compiled subject plates are covered separately.
+
+A data-only call used only by a parameter-dependent function runs once when
+`prepare_query` or `prepare_sampler` prepares the graph. It may return a tuple or
+named tuple containing arrays. Named definitions, aliases and inline
+calls follow the same rule, including beside declared vector or matrix
+parameters. A value also needed during binding, such as a prior argument or an
+array dimension, keeps its bind-time evaluation and validation.
+
+## Factor levels
+
+`c[levels(g)] .~ Normal.(0, 2)` declares one coefficient per level of `g`, and
+`c[g]` gathers them per observation. A full-cover factor may appear alongside
+an intercept, with the fixed or hierarchical priors written in the model.
+RK-PPL translates these declarations without imposing an identifiability or
+posterior-propriety test. Offsets are plain data or scalar value summands.
+A grouping axis may be computed from data, for example
+`z = x .+ 1; c[levels(z)] .~ Normal.(0, s); mu = c[z]`. Binding computes
+these grouping values once and preserves the caller's data.
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_corpus_example("10_levels_prior.jl", :rkppl_levels)
+```
+
+## Group-level effects
+
+Statistical varying-effect bodies and their defaults are owned by
+BayesianRegressionModels. Obtain a body with
+`BayesianRegressionModels.rkppl_model(:varying_coefs)` or its correlated,
+centered, multi-membership or stratified counterpart, then bind that ordinary
+submodel in the defining module. RK-PPL compiles the author's declared arrays,
+priors, gathers and matrix arithmetic.
+
+For hand-authored arrays, `b[levels(g)] .~ Normal.(0, scale)` declares one
+value per group and `b[g]` gathers it per observation. Multi-membership can
+use `gg = vcat(g1, g2)` as a data-only definition, declare one array over
+`levels(gg)`, and combine its gathers with the authored weights.
+
+Multivariate rows use
+`eachrow(B[levels(g), 1:K]) .~ MvNormalCholesky(mu, F)`;
+columns use `eachcol(B[1:K, levels(g)]) .~ MvNormalCholesky(mu, F)`.
+The mean, factor and their priors are declared values. Read rows with
+`B[g, 1]`, or columns with `B[:, g]`. Integer axes use positive integer
+positions; level axes map the authored labels.
+
+Multivariate priors read their arguments as values, so a mean, covariance
+or factor written inline means its named definition. A whole vector drawn
+from one multivariate normal, such as the response of a Gaussian-process
+regression, builds its covariance from data and parameters with ordinary
+Julia arithmetic:
+
+```julia
+using LinearAlgebra: I
+gp = @rkppl begin
+    rho ~ LogNormal(0, 0.5)
+    alpha ~ HalfNormal(2)
+    sigma ~ HalfNormal(1)
+    K = alpha^2 .* exp.(-0.5 .* D ./ rho^2) + sigma * I
+    y[axes(D, 1)] ~ MvNormal(zeros(N), K)
+end
+gp(; D, N = size(D, 1)) | (; y)
+```
+
+`D` holds squared distances. The model reads it only for the declared axis
+and inside the covariance, so it has no observation axis. `sigma * I` is
+Julia's `UniformScaling`, added to the diagonal. The factor spellings
+`MvNormalCholesky(zeros(N), cholesky(Symmetric(K)).L)` and
+`MvNormalCholesky(zeros(N), rk_cholesky_lower(K))` state the same density.
+
+Valid multivariate priors compile with Reactant when prepared with
+`on_error = :ignore`. This explicit preparation policy strips visible
+throws and assertions; native preparation checks the factor or covariance.
+The shared solve retains its loops and ordinary reverse AD. Compiled empty
+gradients remain subject to the [Reactant export limitation](constraints.md#acceptance-and-existing-limitations).
+
+## Declared arrays as values
+
+`z[levels(g), 1:K] .~ Normal.(0, 1)` declares a groups × K matrix;
+`L ~ LKJCholesky(K, eta)` declares a lower-triangular matrix; an explicit
+third argument `'U'` returns its upper-triangular counterpart. Sized vectors
+(`sd[1:K] .~ HalfNormal.(1)`) and multivariate rows
+(`eachrow(c[levels(g), 1:K]) .~ MvNormalCholesky(zeros(K), F)`) are also plain
+Julia values. Their priors are explicit, and their dimensions determine their
+packed coordinates.
+
+The LKJ shape `eta` is a scalar value: it can be a positive literal, bound
+data, a sampled parameter, or a definition using those values. A per-level
+LKJ prior can share that same value across all its factors.
+
+Compiled reverse mode currently fails for a data-sized whole factor with a
+live shape when its retained diagonal prior and shared response expressions
+both read the factor. Native density and gradients and compiled primal pass.
+The literal two-dimensional and per-level forms have compiled reverse coverage;
+see the [backend limitation](constraints.md#acceptance-and-existing-limitations).
+
+Joint correlated responses can also use explicit factor priors:
+declare `sd[1:2] .~ Gamma.(2, 1)` and `C ~ LKJCholesky(2, eta)`,
+then bind `F = sd .* C` and use
+`[y1, y2] ~ MvNormalCholesky([mu1, mu2], F)`. The scale vector has
+positive support and the factor width matches the outcome count.
+
+Array-valued definitions retain known axes: `b = z * (sd .* L)'` is groups ×
+K, so `b[g, 1]` gathers one margin per observation. Positional reads such as
+`L[2, 1]` and `M[:, 1]` remain ordinary Julia reads. A submodel's returned
+array follows the same rule, and so does the expression written inline:
+`(z * (sd .* L)')[g, 1]` gathers exactly as `b[g, 1]`, level lookup included. A data-only definition can size a declared array
+through `levels(gg)`, as in the multi-membership example above.
+
+Bound per-observation gathers also retain their result dimensions. A vector
+read `a[g]` has `length(g)` entries; `A[g, :]` and `A[:, g]` retain the
+unselected matrix dimension. This information follows named and computed
+array definitions, so scalar-plus-gather locations can use ordinary graph
+fusion without an opaque row-broadcast wrapper. Unbound indices and opaque
+array results keep unknown dimensions. Known dimensions enable fusion;
+matrix-column gathers and surrounding design products or sums can still
+materialize.
+
+Level axes preserve the order of their source. `z[levels(g)]` uses the
+`DataAPI.levels` pool, including unobserved categorical levels;
+`z[unique(g)]` uses first occurrence order. A supplied vector or range
+`lv`, or a data-only definition such as `lv = reverse(unique(g))`, can
+declare `z[lv]` in that order. Selections such as
+`levels(g)[1:2:end]` and `unique(g)[3:-2:1]` select positions in the
+source pool. Labels compare with `isequal`, including `missing`, `NaN`,
+and array values. A column read only as labels may contain `missing`;
+numeric responses follow the provisional automatic missing-observation
+handling described under Plates.
+
+A level axis is keyed by its labels, so a data index gathering along it
+holds labels, integer labels included. To read a data-sized block at
+positions the model computes, declare that axis positionally with the same
+extent: `z[1:length(levels(g)), 1:K] .~ Normal.(0, 1)` has one row per level
+of `g`, which may be data or a definition computed from data such as
+`gg = vcat(g1, g2)`. Like a level axis, it reads `g` as one pool of values,
+so `g` may be a per-group table of its own length beside the observations.
+With `i` holding integer positions, `b[i, 1]` is then
+plain Julia indexing, whether `b` is the declaration, a definition such as
+`b = z .* tau` or a submodel's return. A level axis indexed by integers that
+are not its labels fails binding, and the message names the positional
+declaration.
+
+For paired crossed effects, index each axis by one observation's label
+inside a plate: `mu[i] = a + b[g[i], h[i]]`. Julia's `b[g, h]` with two
+vectors selects a Cartesian matrix.
+
+BRM's `StatisticalPreparation.gp_exp_quad_cov` and `gp_periodic_cov` functions
+build covariance
+with an RK plate over two location axes. Data-only locations cache pair
+distances during preparation; locations derived from parameters retain live
+distance calculations. The covariance matrix remains dense and diagonal jitter
+depends on position, including when two locations are equal. Dense Cholesky in
+`gp_chol_latent` delegates its factorization to the general RK-proper
+`rk_cholesky_lower` callable, preserving native gradient support;
+compiled covariance support does not imply compiled Cholesky gradients.
+Import these helpers into the model module as ordinary Julia functions. For
+explicit graph composition, load RK and RKPPL and use
+`BayesianRegressionModels.rk_model(:gp_exp_quad_cov)` or
+`rk_model(:gp_periodic_cov)`; an assigned graph call follows the general
+composition path. The adopted owner API is available at BRM
+`1f296dac2c086347525194887500948edb213228`.
+Opaque prepared covariance callbacks with bound locations currently reach an
+Enzyme activity error on Julia 1.10.12 / Enzyme 0.13.210. Assigned owned graph
+calls pass native Reverse with bound or live locations. The generic
+`benchmark/repro_enzyme_prepared_pair_callback.jl` reproduces the callback
+boundary using a synthetic pair grid; this limitation precedes the ownership
+cleanup.
+
+A single index on a multi-axis definition is linear and positional:
+`b = (z * sd)'` makes a row, and `b[g]` reads its column-major positions.
+A module function's result has no tracked level axes: `b = identity(z)`
+followed by `b[g, 1]` uses integer positions too. Binding checks that positional
+indices are positive integers and within known sizes. If the result's size
+depends on a function call, Julia checks its bounds when the result is read.
+Linear indexing of an adjoint row currently supports native execution and
+Enzyme gradients; Reactant tracing fails on that wrapper. Linear indexing of
+a plain matrix and positional gathers from module-produced arrays compile.
+See [backend limitations](constraints.md#acceptance-and-existing-limitations).
+
+Gathering by a derived column is not supported yet. Pass a declared array
+whole to a model-level Julia function when it needs the full value; a bare
+array combined directly with observation data must first be indexed to the
+observation axis.
+
+A declared array with a real-support prior, such as `Normal`, `StudentT` or
+`Flat`, and a real-support plate latent read the sampler's packed
+coordinates in place, so no native evaluation copies them. Such a value is a
+read-only `AbstractVector{Float64}` view; a two-axis array is a reshaped view
+(`AbstractMatrix{Float64}`). Compiled execution traces the same block as a
+slice. An array with a constrained prior is its transform's fresh output. A
+function that receives one whole should accept `AbstractVector` or
+`AbstractMatrix`, and must not write into it.
+
+### Intrinsic CAR fields
+
+`phi[1:N] ~ ICAR(node1, node2)` declares one value per node of an undirected
+graph with the intrinsic conditional autoregressive (ICAR) prior. Edge `e`
+joins nodes `node1[e]` and `node2[e]`, and each edge is listed once. The log
+density is the pairwise-difference penalty
+`-1/2 * sum((phi[node1] .- phi[node2]) .^ 2)`, the Gaussian Markov random
+field whose precision is the graph Laplacian. The field has unit scale; scale
+it outside the prior, as BYM2 does.
+
+The prior is improper: adding a constant to every node of a connected
+component leaves the density unchanged. State the identifying constraint as
+its own statement. A soft sum-to-zero constraint is a density factor on a
+scalar definition:
+
+```julia
+beta0 ~ Normal(0, 1)
+sigma ~ truncated(Normal(0, 1), 0, Inf)
+rho ~ Beta(0.5, 0.5)
+theta[1:N] .~ Normal.(0, 1)
+phi[1:N] ~ ICAR(node1, node2)
+phi_sum = sum(phi)
+phi_sum ~ Normal(0, 0.001 * N)
+convolved_re = sqrt(1 - rho) .* theta .+ sqrt(rho / scaling_factor) .* phi
+y .~ Poisson.(exp.(log.(E) .+ beta0 .+ sigma .* convolved_re))
+```
+
+The declaration sizes the field, so a node on no edge adds no term. The node
+vectors are integer data or data-only expressions such as `edges[:, 1]`.
+Binding checks that both have one entry per edge and that every entry is a
+node of the field. The entries of `phi` are its coordinates
+(`phi.1 … phi.N`), read in place. The density is the graph law
+`icar_logdensity` (see [Distributions](distributions.md)), one retained plate
+over the edges, and native Enzyme Reverse differentiates it without a custom
+rule. Rows or columns of independent ICAR fields are not built yet.
+
+## Design matrices
+
+Bind the matrix once with `hcat` and size the coefficients with an axes prior.
+Use `ones(length(x1))` for an intercept column. Scalar prior arguments are
+shared across elements; literal vectors give one value per element.
+
+Direct `X * b` reads can use the affine design path. A product passed to a
+function, such as `f(X * b)`, reads the matrix as an ordinary Julia value.
+Naming it first (`p = X * b; mu = f(p)`) or returning it from a submodel
+preserves the inline expression's density, priors and coefficient coordinates.
+A direct product can also be an affine component in a composed predictor,
+such as `p = X * b; mu = p .+ q` with another component `q`.
+
+An `hcat` of model-level values, such as declared vectors or sampled scalars,
+is a model-level matrix, as a declared matrix is: `u * hcat(w1, w2)` means
+`u * W` for `W[axes(u, 2), 1:2]`. Elementwise maps over it keep their Julia
+meaning, named or inline: `E = exp.(u * hcat(w1, w2)); P = E ./ sum.(eachrow(E))`
+normalizes each row. An `hcat` with an observation column, such as
+`hcat(ones(length(x)), x)`, has one row per observation.
+
+A value the model computes with one row per observation is the matrix of a
+product too, as in Julia. With `A[axes(x, 2), 1:J]`, `a1[1:J]`,
+`B[1:J, 1:K]` and `b1[1:K]` declared, the hidden layer
+`hidden = tanh.(a1' .+ x * A)` is N × J: the adjoint `a1'` is a 1 × J row
+that broadcasts against the N × J product. `v = b1' .+ hidden * B` then
+contracts the columns of `hidden` and keeps its rows. Named or inline, it has
+the density of the append-column spelling
+`hcat(ones(size(x, 1)), hidden) * vcat(b1', B)`, and a data-only elementwise
+matrix such as `X = x .- c` reads the same way in `X * b`. Julia checks the
+dimensions of a computed product where it computes it.
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_corpus_example("46_matrix_gaussian.jl", :rkppl_matrix)
+```
+
+Spline and approximate GP preparation and model bodies belong to BRM.
+RK-PPL accepts their supplied matrices and ordinary declared coefficient
+priors. See [Statistical model ownership](rkppl-smooths.md).
+
+## Plates
+
+`@plate for i in R … end` writes a loop whose cells each mean one iteration
+of that Julia loop. Scalar arithmetic needs no dots; vector and matrix
+intermediates use ordinary Julia broadcasts and matrix products.
+Shapes come from named data (the range, a data index column), never from a
+separate size argument. A cell holds observations, per-cell latents, per-cell
+submodel calls and cell locals. A loop of scalar arithmetic lowers at once,
+exactly like its broadcast spelling.
+
+A per-index value may itself be an array, such as `t[i]` holding one vector
+per subject. The cell still means one iteration of the loop, whatever
+ordinary Julia it applies: undotted vector-scalar arithmetic (`t[i] * a`,
+`t[i] / exp(a)`, `-t[i]`), vector sums (`t[i] * a - b * t[i]`) and matrix
+products (`M[i] * w`) mean what they mean in Julia. When the model is lowered
+with its data values (the model call, `lower_rkppl(ast, data)`), a cell that
+reads such a value at the loop index, directly or through a definition, a
+cell local or an earlier plate's output computed from one, runs as a retained
+RK plate whose body is the cell, as an explicit `plate(...) do` reader would
+be. So do an authored broadcast over a per-index value
+(`exp(la[i]) .* t[i]`), indexing into one or into a cell local
+(`t[i][picks[i]]`, `ti = t[i]; ti[sel]`), a gather with an index vector per
+subject (`v[rows[i]]`), a reduction (`sum(v[rows[i]])`) and an ordinary
+function or function-shaped `@kernel` called on per-index values. RK composes
+a `@kernel` callee into that body. A plan lowered from data names alone
+cannot see that a value holds arrays; binding it refuses the arrays and names
+the value-aware lowering. Data-only cell work runs once, when the query or sampler is prepared,
+if the plate iterates data or a value whose shape bound data establish
+(`eachindex(la)` with `la = a .+ x`); over an opaque module-call result the
+plate reads its live iterator.
+
+Cell locals belong to their cell, as a Julia loop body's locals do: two
+plates may each bind `m`. A statement outside the plate cannot read a cell
+local; assign it to an indexed output (`c[i] = m`) and read `c`.
+
+A cell runs once per index however many values it defines. Indexed outputs
+that share cell locals (`m = f(t[i], a); c[i] = m; r[i] = 2 .* m`), the
+components of a row output and computed observation arguments come from one
+RK plate whose cell runs those statements once and returns the values
+together; each output reads its own entry. A query runs only the statements
+of the values it reads: a value that no density reads, such as a derived
+`res[i] = (yin[i] .- m) ./ s` read only by `all_res = flatten(res)`, runs in a
+query of it and never in the sampler, its gradient or the pointwise and cell
+queries. A value reading only data keeps
+its own plate, which runs once when the query or sampler is prepared, and
+reads only the cell statements it needs: an output such as
+`wt[i] = 0.5 .* w[i]` beside outputs that read parameters is a data-only
+definition, usable as `weighted` weights.
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_32_gaussian.jl", :rkppl_plate)
+```
+
+Observation statements cover their whole response. Write `y .~ Normal.(mu, sigma)`
+or a plate over the full response indices. Binding automatically skips entries
+equal to `missing`; authors do not select the present rows manually. An authored
+subset such as `@plate for i in 2:6` over a six-element response is refused,
+including when the omitted entry is missing. An empty loop covers only an empty
+response. Indexing outside the bound array still fails.
+
+This missing-observation behavior is **provisional** (user decision `1uhcm3b`,
+October 5, 2026). Binding owns concrete numeric response arrays and presence masks;
+the likelihood plate skips absent entries, leaving zero at those positions in
+pointwise output. Response axes, intermediate values and declared parameter sizes
+remain unchanged, and caller arrays are not modified. No missing-response latent
+is introduced. Missing responses read elsewhere as model values and missing
+components of joint outcomes still need richer handling; those uses fail rather
+than silently inventing values or discarding supplied joint components.
+
+The current default Reactant runtime can fail compilation when a matrix-vector
+predictor feeds a strided presence gather. The backend-only reproducer is
+`benchmark/repro_reactant_strided_dot_gather.jl`; native execution remains
+available. This compiler repair is tracked separately from missing-response
+binding. Successful compiled checks for other shapes do not establish support
+for this affected shape.
+
+Some short guarded likelihood batches expand into repeated scalar work during
+backend optimization. RK must emit retained loops or batched array structure;
+subsequent semantics-preserving backend unrolling is diagnostic, following the
+user's October 5 scope clarification in [Core constraints](constraints.md).
+The Beta and Binomial checks record emitted traces, optimized MLIR and actual
+executable HLO alongside values and ordinary reverse results.
+
+Responses may have different row counts. Each statement reads columns on its
+own observation axis; statements that read a common observation column must
+agree on its rows. A latent plate follows its authored iterator's own extent,
+including an iterator over a definition, a scan trajectory or a declared
+parameter. Binding resolves declared axes and data-only call results; a scan
+trajectory uses its authored bound. These extents do not come from an unrelated
+response. Indexed prior arguments select those authored cells, and rebinding
+recomputes their sizes from the new data.
+
+An opaque parameter-dependent iterator whose shape cannot be inferred from
+bound data remains a sizing capability gap. Binding names the iterator and
+unavailable extent, rather than silently borrowing response rows or evaluating
+sampled values on the host. The historical scan form with an unsupplied length
+name still uses its direct response consumers; a latent iterator over that scan
+needs an established bound.
+
+Design matrices follow their input rows.
+Declared `axes(X, 1)` arrays have X's rows; `axes(X, 2)` coefficient vectors
+have X's width. The total `n_obs` does not size these values. A trajectory used
+by responses of different lengths fails binding because its axis is ambiguous.
+The legacy panel sampling do-block and `@plate result for ...` forms are
+retired. Write indexed observations and explicit array dimensions; binding
+no longer infers panel shapes from `dims` keys.
+
+Per-level and per-observation cells compose through declared arrays. `L[k] ~ LKJCholesky(K, eta)` inside a plate over `levels(s)` declares
+one factor per stratum. An observation cell can then read `sd[s[i], :]`,
+`L[s[i]]` and `z[g[i], :]`, compute a matrix-vector product, and name a
+scalar output with `r[i] = ...` or a row with `b[i, 1:K] = ...`. Shared arrays
+enter the generated RK plates through `Ref`; increasing observations or
+strata does not multiply their compiled cell regions.
+
+A per-level row statement, `b[j, :] ~ MvNormalCholesky(zeros(2), F)` inside a
+plate over `levels(g)`, is equivalent to
+`eachrow(b[levels(g), 1:2]) .~ MvNormalCholesky(zeros(2), F)`.
+`b[j, 1:2]` and `MvNormal` also work; these multivariate priors use shared
+arguments. Scalar priors can vary by level, and a level cell can define
+deterministic values:
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_corpus_example("101_level_plate_values.jl", :rkppl_level_values)
+```
+
+`c[k] ~ Normal(m[k], 1)` also works with a bound Julia array `m`.
+Here `m[k]` uses the authored Julia index; a declared `z[levels(g)]` instead
+uses its level axis, so noncontiguous and string labels gather the correct
+coordinate. Deterministic outputs retain that axis for later reads such as
+`d[g]`. Each cell remains one RK plate body as the number of levels grows.
+Declared array reads inside a level cell are aligned by label before entering
+the plate. With `z[levels(g)[2:end]]`, `z[k]` is zero for the omitted first
+level and reads the selected coordinate for every other level. A declaration
+on `levels(h)` also works when every loop label occurs on that full axis;
+the order and number of its coordinates can differ from `levels(g)`.
+Matrix row reads follow the same rule. Raw bound-array reads and lazy
+branches keep their authored Julia semantics.
+Reactant's remaining limitation for an invalid host-constant index inside
+an inactive live branch is recorded in the [core constraints](constraints.md).
+
+In an array cell, an observation must read a named per-index output
+(`y[i] ~ Normal(r[i], sigma)`), rather than a cell local directly.
+
+`@scan begin … end` writes a sequential recurrence, such as an AR(1) state
+(corpus `38_scan_ar.jl`). Its sampled seeds and steps take the scalar priors a
+declaration takes, including `Flat()`, half priors, `truncated(D, lo, hi)` and
+`restricted(D, lo, hi)` with bounds fixed across steps. For example,
+`h[t] ~ restricted(Normal(h[t - 1], s), lo, hi)` is a random walk on `(lo, hi)`
+that keeps the Normal density.
+
+A step reads a carried array at a backward lag
+`a[t - k]`, at `a[t]` after writing it, or at any earlier entry whose index
+provably lies in `1:(t - 1)`, so a renewal equation over the whole earlier
+trajectory is written as stated:
+
+```julia
+@scan begin
+    infections[1] = i0
+    for t in 2:T
+        infections[t] = r * sum(infections[s] * w[t - s] for s in 1:(t - 1))
+    end
+end
+```
+
+The index may be `s` or `t - s` under a generator `for s in 1:(t - 1)`, a
+seed position, or a window `a[(t - k):(t - 1)]`. A scan body also reads other
+model values whole, so a delay convolution of `infections` can be a second
+`@scan`. A deterministic `@scan` inside a `@plate` cell runs one recurrence
+per index, retained as an RK scan inside the plate cell; its carried arrays
+hold one array per index. All carried arrays share one retained recurrence,
+including arrays that read each other's earlier entries. History-reading
+recurrences keep the seeds and outputs in one buffer per trajectory (see
+[Scans](scan.md), "Reading earlier entries"). Native values and ordinary
+Enzyme reverse gradients are supported. Innovation densities use a separately
+selectable plate reading the completed trajectories, so the prior does not
+replay the carried updates.
+
+A carried array whose name is observed data is observed. Each of its seed and
+step `~` statements is an observation: its density at the observed entry is
+that entry's conditional density given the earlier ones, and every read of the
+array reads the data. With the array unbound, the same block is a latent
+trajectory. In a `@plate` cell the observed array is the loop index's array,
+one series per index, as in AR(1) errors per group:
+
+```julia
+@plate for g in eachindex(y)          # y[g]: group g's observed series
+    @scan begin
+        y[g][1] ~ Normal(mu[g][1], sigma / sqrt(1 - phi^2))
+        for t in 2:length(y[g])
+            y[g][t] ~ Normal(mu[g][t] + phi * (y[g][t - 1] - mu[g][t - 1]), sigma)
+        end
+    end
+end
+```
+
+A submodel may hold the scan and return the carried array. A per-cell call
+`y[g] ~ sm(…)` then observes `y[g]` exactly as the cell scan above, and a
+top-level call `y ~ sm(…)` observes `y` as a top-level scan does; each keeps
+its own loop-bound rules (a cell's bound may be data such as
+`length(mu[g])`).
+
+The densities enter `likelihood`, and `:pointwise` holds one density per
+entry; the observed array adds no coordinates. Latent and deterministic
+carried arrays may share the recurrence, such as a stochastic volatility
+`h[t]` or an ARMA residual. An observed array is written only by `~`
+statements and has one entry per scan index; missing entries are not
+supported yet.
+
+### One array per index
+
+A dotted cell broadcasts over its own iteration's values, as the loop it
+writes does in Julia. When the response holds one array per index, such as
+ragged groups including empty ones, each cell observes that index's entries:
+
+```julia
+# y = [[0.7, 0.3, 0.1], [1.4, 0.6], Float64[]]; x has the same shape
+@plate for i in eachindex(y)
+    y[i] .~ Normal.(a .+ b .* x[i], sigma)
+end
+```
+
+Values the cell reads per index supply that index's array or number. Examples
+are `x[i]`, a per-group scalar `mu[i]`, or the per-group result `loc[i]` of a
+function-shaped kernel. Every other value is shared by all indices, and each
+per-index value broadcasts against its response array as Julia requires. The
+loop may iterate another array's indices, such as `eachindex(t)` or
+`axes(t, 1)` for a `t` holding one longer array per index. That array supplies
+the indices only, so its arrays need not broadcast with the response's; a cell
+local computed from it, such as `m = f(t[i], picks[i], a)`, supplies that
+index's value. The observation lowers to RK's nested group and observation plates: one retained
+observation plate runs inside the group plate, with no copy per group. The
+`:pointwise` query returns one array of densities per index, and empty arrays
+contribute zero. Native values and ordinary Enzyme reverse gradients are
+supported; RK does not implement compiled nested plate regions.
+
+Every observation a flat response admits runs on each index's entries the
+same way. This includes link families such as `BernoulliLogit.(eta[i])` and
+caller-owned sampling laws such as `LogDensity.(score, loc[i], sigma)`, where
+a visible `KernelSpec` law runs inside the inner observation plate. A
+per-index value may combine with shared values in any distribution argument,
+as in `Normal.(loc[i], dose[i] * sigma)`. The response may also be a
+definition that reads only data, such as `y = group_cells(raw, rows)` or a
+gather `y = cells[perm]`; binding evaluates it once and validates its arrays
+as the response. The data the definition reads are its inputs, not
+observation operands.
+
+Outside a dotted cell, Julia refuses this shape, and so does binding.
+`y .~ Normal.(loc, sigma)` broadcasts `Normal` over the arrays of `y`, and an
+undotted cell `y[i] ~ Normal(…)` observes the array `y[i]` with a univariate
+distribution; the error names the dotted cell. Missing entries inside the
+arrays and `mi()` packing are not built yet.
+
+### One vector per index, observed jointly
+
+An undotted multivariate normal in a cell observes that index's vector as one
+joint draw, as the Julia loop does. The cell computes its mean and covariance
+like any other arguments, from parameters, data read per index and the observed
+vector itself:
+
+```julia
+# y = [[0.3, -0.2, 1.1], Float64[], [0.5, 0.9]]; x has the same shape
+@plate for s in eachindex(y)
+    m = a .+ b .* x[s]
+    v = exp(2ls) .* (1.0 .+ x[s] .^ 2)
+    y[s] ~ MvNormal(m, Diagonal(v) .+ rho .* (x[s] * x[s]') ./ length(x[s]))
+end
+```
+
+`MvNormalCholesky(m, L)` takes the lower Cholesky factor of the covariance
+instead. Each index adds one joint log density, the one the whole-vector
+declaration `b[1:K] ~ MvNormal(mu, Sigma)` uses, and an empty vector adds
+zero. `:pointwise` holds one density per index. The covariance must be
+symmetric (within `1e-8`) and positive definite; a mean or matrix whose size is
+not the vector's raises `DimensionMismatch`. A dotted cell `y[s] .~
+MvNormal.(…)` is refused, because it would draw the vector law once per entry.
+Native values and ordinary Enzyme reverse gradients are supported. Predictive
+draws of these vectors are not built yet.
+
+### One latent array per index
+
+A dotted latent in a cell, `v[i] .~ D.(args…)` with `v` not data, holds at
+each index the broadcast of `D` over its arguments' values there, as the
+Julia loop does. That is one value per element of a per-index array whose
+length may vary by index, or a number at an index where the arguments are
+numbers:
+
+```julia
+# mu = [[10.0, 20.0, 5.0], [7.0, 3.0]]; obs and y hold one vector per index
+@plate for i in eachindex(total)
+    loc = log.(mu[i])
+    log_T[i] .~ Normal.(loc, 0.5)       # 3 values in cell 1, 2 in cell 2
+    T = exp.(log_T[i])
+    y[i] .~ Normal.(T[obs[i]], sigma)
+    total[i] ~ Normal(sum(T), 0.01 * total[i])
+end
+```
+
+Each element has the declaration's prior, with its transform and Jacobian
+(`LogNormal`, `Exponential` and `truncated` bounds shared by every index
+included). The arguments may read sampled values, as in
+`Normal.(log.(mu[i]) .+ b, s)`, but their shapes must follow from data:
+from data read per index, from cell locals computed from data, from scalar
+parameters and from the dotted arithmetic between them. A shared array
+argument gives every index its entries, and a matrix per index keeps its
+dimensions. Outside the plate, `log_T` holds one array per index.
+`coordinate_names` reads `log_T.1.1 … log_T.2.2` (index, then entry,
+column-major), `constrain` returns one array per index, and `unconstrain`
+and `restore_draws` take and give that shape. Arguments that are numbers at
+every index give one scalar per index, exactly as `v[i] ~ D(…)`. Dimensions
+that differ by index are valid but make the cells type unstable, so binding
+warns. Not built yet: an argument whose shape a call of sampled values
+decides, and such latents over `levels(…)`.
+
+### One joint latent per index
+
+An undotted latent in a cell, `c[i] ~ F(args…)`, whose caller-owned `F` has a
+geometry other than one scalar coordinate, holds at each index one draw of
+`F(args…)` there: a value of the geometry's shape, under one density of the
+whole value. Its length may follow from the index's data. For example, a
+vector per sector sampled in total coordinates (its first coordinate is the
+log of the sum of `exp.(eta)`), so an observed total pins one coordinate:
+
+```julia
+struct TotalCoordinates{L,S}
+    loc::L
+    scale::S
+end
+ReactiveKernelsPPL.sampling_logdensity(d::TotalCoordinates, eta) =
+    sum(logpdf.(Normal.(d.loc, d.scale), eta))
+ReactiveKernelsPPL.sampling_geometry(::Type{TotalCoordinates}, args, shape) =
+    ParameterGeometry((:(length($(args[1]))),), :(length($(args[1]))); support = :real,
+        constrain = (u, shape, args...) -> total_values(u),        # (a, y) -> eta
+        unconstrain = (eta, shape, args...) -> total_coordinates(eta),
+        logjac = (u, shape, args...) -> log(length(u)) / 2)
+# Inside a model:
+@plate for i in eachindex(total)
+    eta[i] ~ TotalCoordinates(log.(mu[i]), 0.5)    # length(mu[i]) values
+    total[i] ~ Normal(sum(exp.(eta[i])), 0.002 * total[i])
+end
+```
+
+In a cell, `sampling_geometry` receives the declared shape `()`: return the
+shape and packed dimension as data-only expressions of the authored argument
+expressions (`length(loc)`, `m[i]`, a literal), which binding evaluates at every
+index. Each index packs its own coordinates, in plate order; the cell
+constrains them with the geometry's `constrain`, and adds the density of
+`F(args…)` at that value to `prior` and the geometry's `logjac` to
+`log_jacobian`. The endpoints receive the index's argument values, sampled
+parents and keywords included, and its packed block as an `AbstractVector`
+read in place. Outside the plate, `c` holds one value per index.
+`coordinate_names` reads `c.1.1 … c.2.3` (index, then packed coordinate, or
+the geometry's `coordinate_names`), `constrain` returns one constrained value
+per index, and `unconstrain` and `restore_draws` take and give that shape. A
+dotted latent of the same cell may read `c[i]`, which has the geometry's shape
+there. A geometry whose shape reads a sampled value is refused at binding.
+Native values and ordinary Enzyme Reverse gradients are supported. Not built
+yet: such latents over `levels(…)`, and predictive draws, `jax_source` and
+compiled execution of them.
+
+Two properties of the law keep its density differentiable by native Enzyme
+Reverse. Pass a distribution family as a type parameter, not a field: with
+`struct L{F,…}; family::F; …` holding `Normal` (a `UnionAll`), the density
+is not concretely typed, preparation warns, and the gradient fails. And a law
+holding data beside a sampled value (`TotalCoordinates(log.(mu[i]), s)`, with
+`s` sampled) fails Enzyme's static activity analysis when its
+`sampling_logdensity` is not inlined (see [Core constraints](constraints.md)):
+mark that method `@inline`, or prepare with
+`AutoEnzyme(mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`.
+
+## Submodels
+
+`@rkppl name(args...) = begin … end` defines a reusable block. Using it,
+`sigma ~ half_scale(1.0)`, expands it inline under the left-hand side's name, so
+it lowers exactly like the hand-inlined program. A submodel whose result is a
+response pointer is used as an observation stream: `y ~ stream(x, g)`.
+`Base.merge(model, override)` replaces or appends statements by name.
+Submodels also accept declared keyword defaults and statement replacements.
+For a caller-defined `half_scale`, `custom = merge(half_scale,
+:(tau ~ HalfCauchy(0.5)))` derives a reusable variant.
+
+Submodel calls accept only their declared keywords. The legacy undeclared
+`predictor = name` shortcut is rejected. Bind a returned quantity with an
+ordinary assignment or declaration to give it an explicit use-site name;
+a declared keyword named `predictor` keeps its ordinary argument meaning.
+Catalogue spellings such as `r2d2`, `spline_basis`, and `dummy` are also
+ordinary quantity names in declarations and assignments.
+
+Each call owns a lexical namespace. For `z ~ sm(x)`, `z.b` reads the
+submodel's local `b`, and bare `z` is the actual returned Julia value in
+arithmetic and function arguments. Nested calls compose paths: `z.w.b`.
+Locals never create caller bindings, so `a.b_c`, `a_b.c`, and a caller
+parameter or data value `a_b_c` coexist.
+
+Property access checks the local namespace first. If the scope has no local
+with that name, it reads a property of the returned value. Explicit
+`getproperty(z, :b)` always reads the returned value, even when `z.b` names
+a local. The caller can read sampled and deterministic locals, including
+data-only definitions. Ordinary caller assignments cannot redefine them;
+explicit `merge` operations replace their declarations. Loop variables remain local
+to their loop. Per-cell calls support `theta[i].b` and the whole local array
+`theta.b`. A per-cell body holds what a hand-written cell holds: `~` / `=`
+statements over bare names and `@scan` blocks. A returned carried array of a
+body `@scan` is the cell's per-index array `theta[i]`: observed in place when
+`theta` is data, exactly as the per-index cell scan below, and the latent
+trajectory per index otherwise. The scan's loop variable and step locals stay
+inside the scan.
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_submodel_example()
+```
+
+### Consumer-owned models
+
+Statistical model bodies belong to BayesianRegressionModels, and PK-specific
+bodies belong to downstream RKPPLBench. Import the consumer-owned body into
+the model module and use it as an ordinary submodel. RK-PPL supplies lexical
+namespaces, declared priors, arrays, plates, scans and standard AD.
+
+## Replace, pin, and condition
+
+Each operation returns a new model. The original program and shared submodel
+remain reusable. A statement replacement changes the declaration in place;
+an indexed replacement must match its complete left-hand side.
+
+For example, `merge(model, :(b[axes(X, 2)] .~ Normal.(0, 2)))` changes an
+array prior, and `merge(model, :(z.w.tau ~ HalfCauchy(0.5)))` changes a
+nested local's prior.
+
+Scoped replacements use the same dotted paths as ordinary reads. Derive a
+reusable submodel variant with `merge(submodel, :(tau ~ HalfNormal(2)))`;
+relative paths in a nested variant are expanded separately at each call.
+
+A pin removes the entire declaration and stores its number or array as input
+data. It adds no density and no sampled coordinate. A call keyword naming a
+declaration has the same meaning.
+
+Scoped keyword pins use `var"z.w.tau" = 0.3`.
+
+Conditioning keeps the sampling statement. Its density at the given
+constrained value contributes to `likelihood`; the observed variable has no
+sampled coordinate and no transform Jacobian. For example, observing
+`tau ~ HalfNormal(1)` at `0.3` contributes
+`logpdf(truncated(Normal(), 0, Inf), 0.3)`. A pin of `tau` contributes nothing.
+
+`model(; x) | (; y, tau = 0.3)` and
+`condition(model(; x); y, tau = 0.3)` are equivalent.
+`condition(plan; tau = 0.6)` rebinds that observation in a new bound plan.
+
+This example executes all four operations and checks the density retained by
+conditioning against Distributions.jl:
+
+```@eval
+Main.ReactiveKernelsDocs.render_rkppl_rewrites_example()
+```
+
+Direct lowering declares observation roles separately from supplied data:
+`lower_rkppl(ast, data; conditioned = (:y, :tau))`, then `bind_data(plan, data)`.
+Both calls accept a `NamedTuple` or a symbol-keyed `AbstractDict` of data values;
+the same container can pass through the pipeline. Binding returns a new plan
+and also supports rebinding an already-bound plan with either container.
+Pass a captured model to `lower_rkppl` when it carries scoped merge edits.
+Sized array observations must have the declaration's shape. Partial indexed
+writes do not replace a complete declaration and fail explicitly.
+
+## Querying and fitting
+
+`prepare_sampler` adds a gradient over the same cut. The
+gradient's executable authority is the package test suite, so it is shown here
+as source:
+
+```julia
+using Enzyme
+using DifferentiationInterface: AutoEnzyme
+
+q = prepare_sampler(built, plan, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+q(u)                                   # log posterior (world-age safe)
+g = similar(u)
+value, _ = sampler_value_and_gradient!(q, g, u)
+prepare_query(built, plan, :likelihood)  # presets: :sampler | :likelihood | :prior | :log_jacobian
+constrain(built.layout, u)               # named constrained values
+restore_draws(built.layout, U)           # U: layout.total × draws
+```
+
+An explicit `AutoEnzyme(mode=Reverse)` always uses reverse mode. Native forward
+batching is disabled by default. To request that optimization explicitly, use
+`AutoEnzyme()` without a mode together with `native_forward_batch=true`.
+For an eligible pure summed plate with one to four active coordinates, Enzyme
+then computes partials in one batched traversal of the unchanged primal.
+Wider, effectful, scan and retained-output programs keep ordinary reverse.
+The optional path can allocate more tangent storage; measure both on the
+model you fit, and identify the mode used when reporting results.
+
+`prepare_sampler(...; nonallocating = true)` (with `using MutatingFunctions`)
+prepares the density and its gradient over
+`ReactiveKernels.prepare_nonallocating`. The query owns the buffers its
+operations write into, so repeated evaluations reuse the same memory instead
+of allocating observation-length intermediates on every call. That matters
+most when several sampler processes share a host, for example one process per
+chain. Values and gradients equal the ordinary sampler's; the density is
+usually faster, while the reverse gradient is faster on some programs and
+slower on others, so measure both on the model you fit.
+
+- `:sampler` is the posterior preset; `:posterior` is the generated node's
+  name, not a preset.
+- `constrain`, `unconstrain` and `logjac` follow the number type of their
+  input: `BigFloat` input gives `BigFloat` values, and other number types,
+  such as dual numbers, pass through the transforms unchanged. Plain reals
+  give `Float64` values, as before. Caller-owned parameter geometry receives
+  the same numbers in its endpoints. Generic number support does not establish
+  native Enzyme support for these layout-based calls; use `prepare_sampler`
+  for posterior gradients through the model graph.
+- Explicit parameter declarations keep their authored names. For
+  `a ~ Normal(0, 1); b ~ Normal(0, 2); mu = a .+ b .* x`, the coordinates
+  are `a`, `b` and the constrained values are `nt.a`, `nt.b`.
+  A level-sized declaration `c[levels(g)]` gives `c.1`, `c.2`, … and `nt.c`.
+  Adding another reader preserves those names and the single declared prior.
+  A submodel parameter `b` in call `z` has coordinate `z.b` (a vector has
+  `z.b.1`, `z.b.2`, …) and constrained value `nt.z.b`. Nested calls return
+  nested NamedTuples, such as `nt.z.w.b`; `unconstrain` accepts that same
+  structure, and `restore_draws` stacks its leaves across draws. These
+  containers include sampled locals; deterministic locals, observed slots,
+  and submodel return values are read in the model itself.
+  Generated draw blocks keep their existing names under the call. If an
+  author local claims that name, the generated block gets the first free
+  numeric suffix; the author local keeps its name. Read `coordinate_names`
+  for the resulting block labels.
+  Rebuild prepared layouts and draw mappings when migrating from old
+  flattened names such as `z_b`. Unusual identifiers use Julia's `var"…"`
+  spelling in coordinate labels, so a literal name `var"z.b"` stays distinct
+  from the scoped path `z.b`.
+  Read `coordinate_names(built.layout)` and `constrain`; rebuild old
+  prepared models and packed-draw mappings when migrating.
+- A kernel returned by `prepare_query` closes over code generated at build time.
+  Call it from top level or through `Base.invokelatest`; `SamplerQuery` calls
+  already carry that barrier.
+
+### Predicting without the response
+
+A binding may omit an observation's value. The observation keeps its
+statement, so the binding generates the program a binding with the value
+generates, and a graph built from the fit evaluates it. Every query leaves
+the absent value out of its inputs:
+
+```julia
+fit = bind_data(lower_rkppl(src, (; x, y); conditioned = (:y,)), (; x, y))
+built = build_kernel(fit)
+design = bind_data(fit, (; x = xnew))         # y absent
+prepare_query(built, design, :observations)   # (y = (location = …, scale = …),)
+prepare_query(built, design, :sampler)        # refused: `y` is absent
+```
+
+- An observation is absent when a binding supplies no value for it: a
+  response, a joint response's outcome, a Multinomial count column, a
+  caller-owned law's observation (`y .~ LogDensity.(f, …)`, including an
+  observed `@scan` array), or the observed value of a conditioned
+  declaration. `lower_rkppl` keeps a name
+  that `conditioned` lists as an observation when the data omit it, and a
+  model call leaves a response it does not supply absent (`m(; x)` beside
+  `y .~ Normal.(mu, s)`; `m(; x) | (; y)` observes it). Other data stay
+  required.
+- Values that do not read the absent observation evaluate as with a supplied
+  one: authored values such as `mu`, and the `:observations`, `:prior` and
+  `:log_jacobian` presets. `:sampler`, `:likelihood`, `:pointwise`,
+  `prepare_sampler` and cell queries read it and are refused with a
+  `ContractValidationError` naming it.
+- A data-only definition computed from an absent observation
+  (`ybar = mean(y)`) is absent too, so only the queries that read it are
+  refused. A program shape that would come from its values, such as an
+  extent `length(levels(y)) - 1` or an inferred number of categories, is
+  refused at binding; rebinding a binding that sized it keeps that size.
+- A response that is a definition reading only data
+  (`y = gather(yraw, rows)`, observed) is absent when the binding omits data
+  that only observed definitions read (`yraw`, directly or through
+  definitions only they read): those data are its value. Refused queries
+  name the response and the data to supply. Data another value reads stay
+  required, such as `g` in `rows = part(g, cells)` when a location reads
+  `rows` too. Rebind the fit, or a lowering from names that include the raw
+  data: a lowering without them cannot tell that the name is data.
+- A response holding one array per index (`y[i] .~ D.(…)` cells) can be
+  absent too. Each index's cell takes the shape of the data the cell reads
+  per index (`x[i]`). When the cell reads only computed values, the graph
+  built from the fit says the response holds arrays. `:observations` and
+  predictive draws compute each index's arguments in a plate over the
+  per-index values the cell reads besides the response (`x[i]`, `loc[i]`),
+  so they evaluate on a design without the response. A cell that reads no
+  per-index value but the response (`y[i] .~ Normal.(mu, s)` with shared
+  `mu` and `s`) has no other indices to go by, and those queries read it.
+- Program identity is checked as for any other binding (other levels or
+  data types need their own build). An absent value takes the type its input
+  has in the built graph. Building from a binding without the response uses
+  `Float64`, or `Int` for counts and categories. It also reads one value per
+  index unless the data read per index hold arrays.
+- The raw `ReactiveKernels.prepare(built.spec; …, bound)` cut over
+  `design.columns` evaluates the available values too; reading an absent
+  value raises `AbsentObservationError` naming it.
+
+### Predictive draws
+
+`prepare_predictive` draws every observation from the law the model gives
+it at given parameter values: posterior-predictive draws when the values are
+posterior draws, on the fitted binding or on a prediction design without the
+response. The graph computes each observation's law arguments, the same
+values its density reads, as an ordinary query with no randomness in it.
+Drawing happens in plain Julia at the query boundary: with Distributions.jl
+loaded, its package extension builds each observation's law, and
+`rand(rng, law)` draws it.
+
+```julia
+using Distributions, Random
+x = [0.1, 0.5, 1.0, 2.0]; y = [1.2, 0.5, 2.5, 4.0]; lloq = 0.5
+m = @rkppl begin
+    a ~ Normal(0, 1); b ~ Normal(0, 1); add ~ Exponential(1); prop ~ Exponential(1)
+    mu = exp.(a .+ b .* x)
+    sd = hypot.(add, mu .* prop)
+    y .~ censored.(Normal.(mu, sd), lloq, Inf)
+end
+fit = m(; x, lloq) | (; y)
+built = build_kernel(fit)
+design = bind_data(fit, (; x = [0.0, 3.0, 5.0], lloq))   # y absent
+pred = prepare_predictive(built, design)
+draws = pred(u, Xoshiro(1))           # (y = [...],): one draw per design row
+predictive_draws!(draws, pred, u, rng) # in place, reusing `draws`
+laws = predictive_laws(pred, u)        # lazy: laws.y[i] isa Distributions.Censored
+```
+
+- **Laws.** Each response's law is the Distributions.jl law of the RK
+  distribution object its density evaluates: `Normal`, `LogNormal`,
+  `μ + σ * TDist(ν)`, `Poisson`, `Bernoulli`, `Binomial`, `NegativeBinomial`,
+  `Gamma`, `Weibull`, `Exponential`, `BetaBinomial`, zero-inflated Poisson
+  and Binomial (a mixture with a structural zero), with the link the model
+  wrote. `censored` and `truncated` evidence wrap it as RKPPL observes it:
+  `Distributions.censored` is the clamp law, `Distributions.truncated` the
+  law renormalized on its inclusive bounds. The extension's adapter methods
+  are the only place Distributions.jl enters.
+- **Shapes.** Draws are keyed like `:pointwise` and shaped like the
+  responses, with one array per index for a response holding one array per
+  `@plate` index. A response left absent takes the shape binding gave it:
+  the operands it broadcasts with, and for one array per index each index's
+  operands (`x[i]`). A shared location or scale broadcasts over the entries.
+- **Randomness stays outside RK kernels.** `pred(u, rng)` draws the entries
+  in order (column-major, then index by index) with the caller's RNG, so a
+  seeded RNG reproduces the draws, and passing a copy of one RNG at every
+  posterior draw reuses one stream. The sampler's coordinates, density and
+  gradients are unchanged; the law node is a separate query.
+- **Memory.** The graph returns the law arguments, about one number per
+  argument and entry; a law is built per entry when it is read and not
+  stored. `predictive_draws!` reuses one output across posterior draws.
+- **Not covered yet.** Mixtures, hurdle models, Beta, inverse Gaussian,
+  von Mises, categorical and ordinal responses, joint multivariate
+  observations (`MvNormal` / `MvNormalCholesky` vectors, whole or one per
+  `@plate` index), caller-owned sampling laws (`LogDensity`), scalar `~`
+  observations and conditioned declarations: a
+  model with any of them is refused at `prepare_predictive`, naming them.
+  Weighted likelihoods, interval-censored evidence and packed (`mi`)
+  responses define no single draw and are refused the same way.
+- Native execution. Pinned by `test_predictive_draws.jl`: each entry's law
+  has the model's own `:pointwise` density at the observed value, at
+  several parameter points.
+
+**In your own cut.** The law arguments are a graph value like any other:
+`predictive_node(built)` names it. WANT it in any cut of `built.spec`, or of
+a graph composed from it, beside other values and with any HAVE that
+determines it, and vectorize that cut over draws. A simulator whose random
+effects, interventions and design data are runtime inputs then draws
+observations from the same evaluation that computes its summaries:
+
+```julia
+node = predictive_node(built)
+targets = predictive_targets(built, design)   # each response's shape on the design
+graph = ReactiveKernels.compose(built.spec, summary)
+cut = ReactiveKernels.prepare(graph; have = (:unconstrained, :b, data_ports...),
+    want = (node, :summary))
+reader = ReactiveKernels.vectorize(cut; batched = (:unconstrained, :b))
+value, summaries = reader(U, B, data...)       # draws stacked on the last axis
+for k in axes(U, 2)
+    laws = predictive_laws(value, targets; position = k)        # draw k's laws
+    predictive_draws!(out, value, targets, rng; position = k)   # or its draws
+end
+```
+
+- `predictive_targets(built, design)` takes the binding the cut's data come
+  from (a fit, or a design that leaves the responses absent).
+  `predictive_laws(value, targets)` and `predictive_draws(value, targets,
+  rng)` read one evaluation's value; `position = k` reads draw `k` of a
+  vectorized cut's value, in place. `prepare_predictive(built, design)` is
+  this with HAVE `:unconstrained` and the design's data bound.
+- The value holds numbers only, one array per law argument, which is what
+  lets a vectorized cut stack it; its layout is otherwise not part of the
+  interface. With `vectorize(…; reuse = true)` the laws read the reader's
+  output buffers, so draw from them before its next call.
+- Pinned by `test_predictive_draws.jl` ("the law node in a caller's
+  vectorized cut", "ranged and per-index laws in a vectorized cut"): a
+  random-effect block as a runtime input of a composed cut, against
+  independent laws at every draw, with and without native scheduling.
+
+### One cell of an observation
+
+`prepare_cell_query` evaluates ONE cell of the plates that observe the named
+observations: one iteration of an `@plate for` loop, such as one group's or one
+subject's observations, or one entry of an elementwise observation `y .~ …`.
+Only that cell runs. Predictor vectors the cell reads at its own index are
+computed at that index only: for `log_k = a .+ b .* w .+ R[group, 1]` with
+`R = Z * F'`, read as `log_k[i]`, the cell computes `log_k[i]` from row
+`group[i]` of `R` (see "One cell of a plate" in the compiler guide for the
+supported forms). Its cost is then what one iteration costs, independent of the
+number of groups. A predictor computed through a module function call, or read
+whole elsewhere in the program, is still computed for every index.
+When the queried observations read one shared cell (two outputs of one loop),
+each observation's cell runs that shared cell at the same index. An output of
+an earlier `@plate for` loop that the observation reads at its own index
+(`pred[i]`) is computed at that index too, whatever law observes it: a
+`Normal` observation and a caller-owned law such as
+`y[i] .~ LogDensity.(score, pred[i], sigma)` both run that earlier loop's
+iteration `i` only.
+
+```julia
+q = prepare_cell_query(built, plan, :y)          # or (:y, :z): one loop's observations
+q(u, i)                                          # Σ of iteration i's densities
+s = prepare_cell_sampler(built, plan, :y, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+value, g = cell_value_and_gradient!(s, similar(u), u, i)
+```
+
+- Cell `i` is entry `i` of the observation's `:pointwise` array: summing the
+  cells gives that observation's likelihood. For an `@plate for` loop holding
+  one array per index, entry `i` is the sum of iteration `i`'s densities.
+- The gradient is with respect to the whole packed vector; it is nonzero only
+  on the coordinates cell `i` reads.
+- Observations without a pointwise plate (a scalar `~` observation, a joint
+  multivariate response) are refused, naming the observation.
+- Queries are not thread-safe: prepare one per thread.
+
+## Programs emitted by BRM
+
+`RKBRMI(brmi)` lowers an `@brm` formula to this same surface. The emitted
+program is ordinary `@rkppl` source: shared submodel definitions such as
+`popefs_normal_i_c_r(...)` for an intercept + slope + group effect, plus a main
+block. For plain population, group-level and GLM models, evaluating the printed
+source by hand reproduces the backend's density exactly. Some BRM features
+(ordinal discrimination, per-threshold coefficients, missing-data `mi()`) are
+still patched into the lowered plan after lowering, so for those the printed
+source is not yet the whole model. See the BRM documentation for the formula
+side.
+
+## Debugging
+
+- `model_view(built)` displays an existing build: its coordinates, the planned
+  ReactiveKernels program (`code_expr(built.spec)`) and its structural
+  graph (`kernel_graph(built.spec)`), as labeled sections in plain text or
+  HTML. `built` is the `(; spec, layout)` returned by `build_kernel`, including
+  the built model a BRM `RKBRMI` retains as `backend.model`. Pass
+  `bound = plan` to add the generated pre-build kernel definition and
+  `query = prepare_query(...)` to add that prepared program. The view only
+  derives the planned expression from the stored spec and reads the other
+  supplied values; nothing is bound, built, prepared or evaluated again.
+- `recipe_inventory` lists a program's plates and scans with their nesting, so a
+  structure check reads the public contract rather than internal operation
+  types. For a model whose subject plate holds a child scan, beside its
+  observation plate:
+
+  ```julia
+  structure(program) = [(e.kind, e.depth) for e in recipe_inventory(program)
+                        if e.kind !== :ordinary]
+  structure(built.spec)                         # [(:plate, 0), (:scan, 1), (:plate, 0)]
+  structure(prepare_sampler(built, plan, u; backend).kernel)   # the same, data bound
+  ```
+
+  `recipe_kind(recipe)` classifies one recipe, and `plate_body`/`scan_body`
+  return a body plan; see the ReactiveKernels compiler page.
+- `kernel_expr(plan, built.layout)` returns the generated kernel definition
+  shown above. It reads with the model's names: a plate cell names each
+  argument after the value it iterates (`y .~ Normal.(loc, s)` is
+  `plate(y, loc, s) do y, loc, s ... normal(loc, s).logpdf(y)`), a prior cell
+  reads an argument value it generated by its role
+  (`normal(location, scale).logpdf(c)`), and a value computed for a
+  distribution argument is named after its owner and role
+  (`y .~ Normal.(loc, f(x))` defines `y_scale = f(x)`; `b ~ Normal(0, 2s)`
+  defines `b_scale = 2s`). A name the model or its data already use takes the
+  first free `_k`. Densities, gradients and coordinates do not depend on these
+  names.
+- `packages/ReactiveKernelsPPL/report/transpile_report.jl --surface model.jl
+  --data data.jl` writes a markdown report of the real pipeline: the plan, the
+  generated program, and the posterior at a probe point. With
+  `--artifact model.jls` it reports on a serialized BRM emission instead.
+- `SurfaceLoweringError` means the spelling is not admitted, and its message
+  names the fix. `ContractValidationError` comes from the IR or binding layer.

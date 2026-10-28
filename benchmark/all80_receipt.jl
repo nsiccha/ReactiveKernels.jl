@@ -184,7 +184,12 @@ function certify_loaded_modules!(modules::AbstractDict)
             isfile(conventional) && (path = conventional)
         end
         path === nothing && error("loaded module has no source path: $key")
-        root = normpath(String(info["root"]))
+        # normpath keeps a trailing separator when the input resolves through ".."
+        # (normpath("…/benchmark/..") == "…/" on Julia 1.10) — the frozen roots ARE that
+        # shape (normpath(joinpath(@__DIR__, ".."))). Strip it or the join below doubles
+        # the separator and rejects every in-root path (live DISCOVER failure: the printed
+        # path visibly inside the printed root still failed).
+        root = rstrip(normpath(String(info["root"])), '/')
         startswith(normpath(path), root * Base.Filesystem.path_separator) ||
             error("loaded module root mismatch for $key: $path is outside $root")
         paths[key] = normpath(path)

@@ -10,36 +10,54 @@ what step `t−1` produced.
 Its purpose is Reactant lowering. A recurrence authored the obvious way — a
 `for` loop that reads `x[t-1]` and writes `out[t]` element by element — evaluates
 fine natively but does **not** lower through Reactant, because XLA forbids scalar
-indexing of a traced array. `scan` lowers the same recurrence to a single
-`stablehlo.while` carry loop: one traced loop, no unrolling, no per-step scalar
-indexing. So the natural sequential form compiles under Reactant with no manual
-reformulation into a vectorized closed form.
+indexing of a traced array. On its supported traced shapes — traced 1-D
+sequences, or `eachrow` over a traced matrix — `scan` lowers the same recurrence
+to a single `stablehlo.while` carry loop in the emitted trace, with dynamic
+indexing. The default optimizer can subsequently expand short scans; see
+[the compiled-structure boundary](#Default-optimized-short-scans).
+The natural sequential form needs no manual reformulation into a closed form.
 
 ## Syntax
 
 ```julia
-result = scan(xs₁, xs₂, …, Ref(shared₁), Ref(shared₂), …; init = c₀) do carry, x₁, x₂, …, s₁, s₂, …
-    # … compute with carry, the per-step elements x₁, x₂, …, and the shared operands …
+result = scan(xs₁, xs₂, …; init = c₀) do carry, x₁, x₂, …
+    # … compute with carry, the per-step elements x₁, x₂, …, and any enclosing
+    #   value (a parameter, bound data, another port), read whole as a closure …
     (new_carry, output)          # the do-block must END with this 2-tuple
 end
+# optional: `include_init = true` returns [c₀, output₁, output₂, …]
+# optional: `history = h₀` appends one do-block argument, the outputs so far
 ```
 
-- **`xs₁, xs₂, …`** — one or more **iterated sequences**, the leading non-`Ref`
-  positionals. They are advanced together in **lockstep**: step `t` receives
+- **`xs₁, xs₂, …`** — one or more **iterated sequences**, the bare positional
+  arguments before any trailing `Ref` operands. They are advanced together in
+  **lockstep**: step `t` receives
   `xs₁[t], xs₂[t], …`. With a single sequence this is the ordinary
   `scan(xs; …) do carry, x`. Every iterated sequence must share axes; a length
-  mismatch throws `DimensionMismatch`.
+  mismatch throws `DimensionMismatch`. The sequences may be empty: no step
+  runs and `scan` returns an empty vector (see [Empty sequences](#Empty-sequences)).
 - **`init`** — seeds the threaded `carry`. Required keyword.
-- **`Ref(shared)` operands** — broadcast-invariant scalars passed unchanged to
-  every step, exactly like [`plate`](compiler.md)'s atomic `Ref`
-  arguments. Every `Ref(...)` operand must follow the iterated sequences; a bare
-  (non-`Ref`) positional after a `Ref(...)` is rejected.
-- **The do-block** receives `(carry, x₁, x₂, …, shared...)` and must end with the
-  2-tuple `(new_carry, output)`. `scan` returns the vector `[output₁, output₂, …]`
-  (one entry per step); the final carry is internal.
+- **Shared values** — the step reads enclosing names as a Julia closure does.
+  An enclosing name the step reads is captured whole: a `@kernel` signature
+  port, a name the kernel body assigns, or a name of an enclosing plate cell
+  or scan step. A trailing `Ref(value)` positional with a matching do-block
+  formal also passes the value whole. Bare positionals before it are the
+  iterated sequences; the first positional must be one of those sequences.
+  A `Ref` operand prepares the same kernel as the corresponding capture.
+- **The do-block** receives `(carry, x₁, x₂, …)` and must end with the 2-tuple
+  `(new_carry, output)`. `scan` returns the vector `[output₁, output₂, …]` (one
+  entry per step); the final carry is internal.
+- **`include_init = true`** (a literal; default `false`) returns
+  `[init, output₁, output₂, …]` instead: one element longer than the sequences,
+  in one buffer. See [The initial value in the result](#The-initial-value-in-the-result).
+- **`history = h₀`** (a number) gives the do-block one more, last argument: the
+  outputs written so far, `h₀` at and after the current step. A vector
+  `history = leading` puts those entries first: the result is
+  `[leading; output₁, …]`. See [Reading earlier outputs](#Reading-earlier-outputs).
 
-The carry may be a scalar or a **`NamedTuple`** when several values must be
-threaded together:
+The carry may be a scalar, a **`NamedTuple`**, or a vector (an HMM forward
+pass threads its belief-state vector; see the `eachrow` shape below) when
+several values must be threaded together:
 
 ```julia
 init = (; y_prev = μ, err_prev = 0.0)     # a compound carry
@@ -48,7 +66,82 @@ init = (; y_prev = μ, err_prev = 0.0)     # a compound carry
 
 `scan` is macro sugar recognised inside a `@kernel` / `@ppl` body; it is not a
 callable runtime function outside one (calling it directly throws with a pointer
-to this page).
+to this page). Like an authored `plate`, a scan is an ordinary recipe of the
+graph it is written in: write it as the right-hand side of a named port, next to
+any other recipes, plates and scans of that graph. It needs no kernel of its own.
+
+## Loop syntax: `@scan`
+
+A scan can also be written as a loop over its trajectory:
+
+```julia
+@kernel ar1(x, phi, s) = begin
+    @scan begin
+        a[1] = s
+        for t in 2:length(x)
+            a[t] = phi * a[t - 1] + x[t]
+        end
+    end
+    return a
+end
+```
+
+- **Carried arrays.** Every array the loop writes at `t` is carried. Seed it
+  at `1..m` before the loop, at the same depth `m` for every carried array. A
+  seed may read earlier seeds by literal index.
+- **Reads in a step.** A step reads earlier values through literal lags
+  `a[t - k]` with `1 ≤ k ≤ m`, the current `a[t]` after its write, and any
+  earlier entry whose index provably lies in `1:(t - 1)` (below). Other
+  values are closures, including `x[t]` and `t` itself.
+- **The result.** `a` is the whole trajectory `[a[1], …, a[T]]`.
+
+One carried array with one seed prepares exactly `a = scan(2:length(x);
+init = s, include_init = true) do a_prev, t … end`. Several carried arrays
+(a `level` driven by an `increment`, say) share one scan. Its step returns
+all columns together; retained projection plates expose each trajectory with
+its seeds prepended. Requesting several trajectories does not replay the step.
+When the projections are the only readers of the rows, the native lowering
+writes each projected column directly from the scan loop and never stores the
+rows; the tensorized lowering keeps the plates.
+
+### Reading earlier entries
+
+A step may read every earlier entry of a carried array, as a renewal equation
+does: each day's infections are a reproduction number times the convolution of
+all earlier infections with a generation-interval kernel `w`.
+
+```julia
+@kernel renewal(i0, r::Vector{Float64}, w::Vector{Float64}, T::Int) = begin
+    @scan begin
+        infections[1] = i0
+        for t in 2:T
+            infections[t] = r[t] * sum(infections[s] * w[t - s] for s in 1:(t - 1))
+        end
+    end
+    return infections
+end
+```
+
+- An earlier entry's index is an integer sum or difference of literals, the
+  loop index and generator variables (`for s in lo:hi`) that lies in
+  `1:(t - 1)` at every step: `a[s]` or `a[t - s]` under
+  `for s in 1:(t - 1)`, a literal seed position `a[1]`, or a window
+  `a[(t - k):(t - 1)]` (a view). An index that is not provably earlier, such
+  as `a[s]` under `for s in 1:t`, is an `ArgumentError` when the kernel is
+  defined. The loop must start one past the seeds, written `for t in (m + 1):…`.
+- A carried array that reads its own earlier entries is one scan with
+  `history = [<its seeds>…]`, whose step reads the trajectory written so far
+  (see [Reading earlier outputs](#Reading-earlier-outputs)). Its seeds and
+  outputs live in one vector, which is also the result.
+- Several carried arrays share one scan with a named history buffer per array.
+  The step executes once in source order and can read every column's earlier
+  entries, including mutually dependent histories. Current-step reads still
+  require an earlier write in the step. The graph exposes each trajectory
+  separately, and separately authored scans remain independent.
+- A `@scan` inside a `@plate for` cell runs one such recurrence per index, as
+  an RK scan retained inside the plate. Native values and ordinary Enzyme
+  reverse gradients are supported; a vector `history` is not built under
+  Reactant.
 
 ## Example: an ARMA(1,1) error recursion
 
@@ -64,9 +157,8 @@ which threads the previous observation and the previous error. Carry both in a
 `ν₁ = μ + φ·μ` at `t = 1`:
 
 ```julia
-errors = scan(series, Ref(μ), Ref(φ), Ref(θ);
-              init = (; y_prev = μ, err_prev = 0.0)) do carry, y, m, f, t
-    ν = m + f * carry.y_prev + t * carry.err_prev
+errors = scan(series; init = (; y_prev = μ, err_prev = 0.0)) do carry, y
+    ν = μ + φ * carry.y_prev + θ * carry.err_prev
     e = y - ν
     ((; y_prev = y, err_prev = e), e)
 end
@@ -113,8 +205,283 @@ m = scan(tchange, r; init = m0) do carry, tc, rr
 end
 ```
 
-Shared broadcast-invariant scalars still ride along as trailing `Ref`s:
-`scan(a, b, Ref(gain); init = 0.0) do carry, aₜ, bₜ, g … end`.
+A shared value such as a `gain` port is read directly in the step:
+`scan(a, b; init = 0.0) do carry, aₜ, bₜ … gain … end`.
+
+Pass the sequences a step reads as separate positionals rather than packing
+them into matrix rows. A piecewise-exact turnover recurrence
+`R[t] = (R[t-1] - Rss)·exp(-c₂·dt[t]) + Rss` over midpoint concentrations and
+step sizes reads both directly:
+
+```julia
+trajectory = scan(conc_mid, dts;
+                  init = pd.baseline, include_init = true) do previous, concentration, dt
+    c2 = pd.kout * (1 + concentration / (pd.theta1 * concentration + pd.theta2))
+    steady = kin / c2
+    next = (previous - steady) * exp(-c2 * dt) + steady
+    (next, next)
+end
+```
+
+This form gives exactly the same result as `scan(eachrow(hcat(conc_mid, dts)), …)`
+reading `row[1]` and `row[2]`, but it does not build the packed matrix. On a
+3264-step schedule the per-step spelling (`include_init` omitted, then
+`vcat([pd.baseline], updated)`) allocated 52,448 B against 104,720 B for the
+packed form, and took 15.8 µs against 20.2 µs. Under Reactant both forms keep
+one `stablehlo.while`.
+
+## The initial value in the result
+
+A trajectory `[R₀, R₁, …, Rₙ]` of a recurrence whose output is its next carry
+starts with the carry seed. `include_init = true` writes that seed and the `n`
+per-step outputs into one buffer of length `n + 1`, the seed first:
+
+```julia
+trajectory = scan(xs; init = r₀, include_init = true) do previous, x
+    next = update(previous, x)
+    (next, next)
+end
+# == vcat([r₀], scan(xs; init = r₀) do previous, x … end), without the second vector
+```
+
+The value is exactly that of `vcat([init], outputs)`, element type included:
+`promote_type(typeof(init), output type)`, so an `Int` seed beside `Float64`
+outputs gives a `Vector{Float64}`. An empty sequence returns `[init]`. The
+literal is part of the authored graph — the result's length depends on it — so
+`include_init` must be written `true` or `false`, not computed.
+
+On the 3264-step turnover above (strato2, x86-64, Julia 1.10.11, minimum of
+5000 calls), `include_init = true` allocates the 26,224 B trajectory once and
+takes 14.3 µs. The `vcat` form allocates 52,448 B (the per-step vector plus its
+copy) and takes 15.5 µs, and a hand-written loop filling one `n + 1` buffer
+takes 13.7 µs with the same 26,224 B. Values are bitwise identical across all
+three.
+
+Natively, terminal `minimum` reductions can stream through an init-including
+scan, including the seed. This covers a trajectory declared as `Vector{T}` or
+`AbstractVector{T}` for `T` equal to `Float16`, `Float32` or `Float64`, with a
+dense first input sequence and an inferred floating output type. Direct minima
+and minima of one source-authored dotted expression (including `@.`) using
+`+`, `-`, `*`, `/`,
+the trajectory, `trajectory[1]`, and available primitive scalar inputs share
+the scan loop. For example, `minimum(100 .* (trajectory .- trajectory[1]) ./
+trajectory[1])`, authored as a transform followed by a reduction, needs no
+trajectory or transformed vector. Arithmetic nesting and declared conversions
+are preserved; the transform is evaluated for every sample before its minimum.
+Requesting either vector as a WANT, adding another reader, or using unsupported
+storage or expressions retains the ordinary materialized path. This also
+applies inside native position batching, including borrowed readers.
+
+Natively, a scan whose trajectory is read only by one slice,
+`trajectory[lo:hi]`, runs only the steps that slice reads and writes their
+outputs directly into the slice's result; the trajectory is never stored. The
+loop stops after the last demanded step. When the step reads neither its carry
+nor `history`, so that each output depends on its own step only, the steps
+before the first demanded one are skipped too. The bounds may be expressions of
+other values, for example a plate cell's observation window
+`expected[epidemic_start[m]:last_day[m]]`, with `begin` and `end` meaning the
+trajectory's first and last index. The result's value, type and errors are the
+slice's: an empty slice runs no step, and an out-of-bounds slice throws the
+`BoundsError` that slicing the whole trajectory throws. A skipped step only
+computes a value nothing reads, and, as for other unread values, it is not
+evaluated, so an error it would have raised does not occur. The ordinary
+materialized path is kept in any of these cases:
+
+- the trajectory is requested as a WANT, or has another reader;
+- the scan uses `history`, or its step is effectful;
+- the trajectory element type is not concrete;
+- the bounds are not `Int`s;
+- the sequence is neither a vector nor a range.
+
+The tensorized product computes the whole trajectory.
+
+A reducing `plate` over an init-including scan still reads the stored
+trajectory (the per-step form's fusion is described under
+[Lowering and semantics](#Lowering-and-semantics)). Under Reactant the seed is
+element 1 of the traced output buffer and step `i` writes element `i + 1` from
+the same single `stablehlo.while`; the program contains no concatenation. The
+seed must be a scalar there, like every per-step output; a compound seed is a
+loud `ArgumentError`. An empty traced sequence emits no loop and returns the
+one-element `[init]`, which exports even as the compiled program's own output.
+
+A scan over matrix rows iterates `eachrow` of the matrix — one row per step —
+with whatever carry the recurrence threads (here a 2-vector belief state):
+
+```julia
+forward = scan(eachrow(scan_rows); init = seed) do carry, row
+    newg = gain .* (row[1] .+ carry .* row[2]) .+ row[3]
+    (newg, sum(newg))
+end
+```
+
+## Reading earlier outputs
+
+Some recurrences read every earlier output, not one carried value: each dose
+weight of a dose-feedback model depends on the exposure the earlier weighted
+doses produce, `w[j] = f(mg[j], Σ_{i<j} w[i] · u[lag(j, i)])`. With
+`history = h₀` the do-block receives, as its last argument, the result vector
+the scan is writing:
+
+```julia
+weights = scan(dose_mgs, eachindex(dose_mgs);
+               init = 0, history = 0.0) do carry, mg, j, earlier
+    exposure = sum(earlier[i] * get(units, lag(plan, j, i), 0.0) for i in 1:j-1; init = 0.0)
+    (carry, mg == 0 ? 0.0 : effective_amount(mg, exposure))
+end
+```
+
+- At step `j`, `earlier[i]` is step `i`'s output for `i < j` and `h₀` for
+  `i ≥ j`, on every backend. The vector has the sequences' full length, so a
+  step that needs its own index takes it from a lockstep sequence
+  (`eachindex(dose_mgs)` above).
+- `h₀` must be a number. It is the element type of the result: each output is
+  stored converted to `typeof(h₀)`. An empty sequence returns an empty vector of
+  that type.
+- A vector `history = leading` starts the result with those entries: the result
+  is `[leading; output₁, …]`, step `j` writes entry `length(leading) + j`, and
+  `earlier` is that whole vector, with entries not written yet at zero of the
+  leading entries' element type. An empty sequence returns a copy of
+  `leading`. A recurrence seeded with `a[1:m]` reads `a[s]` as `earlier[s]`
+  whether `s` is a seed or an earlier step, from one buffer; selecting between
+  a separate seed vector and the outputs would make native Enzyme reverse need
+  runtime activity when the seeds are constants. Natively only: the Reactant
+  lowering refuses a vector `history`.
+- A named tuple `history = (a = a_seeds, b = b_seeds)` returns a named tuple
+  of trajectory vectors. The step receives matching read-only columns
+  (`earlier.a`, `earlier.b`) and returns a named tuple of outputs with the same
+  keys. Each column follows the scalar-fill or leading-vector rules above;
+  its element type and seed offset are independent of the other columns.
+  This form supports coupled trajectories natively.
+- The history is read-only and belongs to its step. An indexed write in a
+  step is rejected when the kernel is defined, the native view has no
+  `setindex!`, and a carry that holds it is an `ArgumentError`: natively it is
+  a view of the vector the scan is still writing.
+- `include_init = true` and `history` cannot be combined.
+
+The carry is no longer a copy of the outputs. Before, a graph that needed them
+carried the whole vector plus a step index, rebuilt it every step
+(`ifelse.(positions .== carry.index, w, carry.prior)`), and pre-gathered an
+`n × n` matrix of feedback terms. Natively, the history scan is the in-place
+hand loop: the result vector, filled with `h₀`, is written step by step, and
+the step reads it. On the ShinyRK dose-weight step (14 doses, 4 × 4
+effectiveness surface; strato2, x86-64, Julia 1.10.11, minimum over
+BenchmarkTools samples) the history form takes 1.71 µs and allocates 176 B,
+the result vector only, against 1.65 µs and 176 B for the hand-written loop,
+with bitwise-equal values. The carried-vector form takes 2.42 µs and 5,456 B,
+plus 8,160 B for its gathered matrix. In that step a broadcast
+`sin.(…)`/`W * basis` effectiveness helper costs more than either: 5,376 B and
+about 7 µs over the 14 doses. A scan step runs its statements as written, so a
+per-step broadcast allocates every step.
+
+A nested reduction is the exception. Natively, a generator fold over a
+data-length iterator in the step, or in a `@traceable` helper the step calls,
+runs as its explicit loop (the [compiler](compiler.md) page, "Lowering and
+emitted ABI"). With the 4 × 4 surface written as a nested generator sum in a
+`@traceable` helper, the 14-dose step allocates its result vector only (176 B,
+synthetic step, Julia 1.10.11). Written in a plain helper, the same nest is
+left to Base's `sum`, which Julia 1.10 infers as `Any`: 6,208 B per call, the
+same as a hand-written loop calling that helper.
+
+Under Reactant the result buffer is the `while` loop's output buffer, filled
+with `h₀` before the loop; each step reads it before its own output is written.
+The step's sum over `1:j-1` is one retained loop with a traced bound (a
+`stablehlo.while` per step body), and the program does not grow with the number
+of steps: the dose-weight graph emits the same program for 3 and 6 doses, and a
+position batch the same program for 3 and 6 lanes.
+
+## Empty sequences
+
+An empty schedule needs no special case. When the iterated sequences are empty,
+no step runs and `scan` returns an empty vector. The vector's element type is
+the step's output type for the carry seed, one element of each sequence and the
+shared operands. It is inferred without running the step, the way Julia's
+`accumulate` types an empty result, and it is `Any` only when inference cannot
+tell. A plate that sums the scan totals zero. In the turnover example above, an
+empty schedule gives `trajectory == [pd.baseline]`: an init-including scan
+returns `[init]`. A dose-feedback recurrence
+over zero doses gives `weights == Float64[]` and `total == 1.0`:
+
+```julia
+using ReactiveKernels: scan
+
+@kernel dose_weights(mgs::Vector{Float64}, units::Matrix{Float64}, n::Int) = begin
+    slots = collect(1:n)
+    weights = scan(mgs, eachrow(units);
+            init = (; prior = zeros(Float64, n), index = 1)) do carry, mg, u
+        weight = mg / (1 + sum(carry.prior .* u))
+        next = ifelse.(slots .== carry.index, weight, carry.prior)
+        ((; prior = next, index = carry.index + 1), weight)
+    end
+    total::Float64 = 1.0 + sum(weights)
+    return total
+end
+```
+
+A traced empty sequence compiles to a program with no `stablehlo.while`. A
+nonempty one keeps its single loop.
+
+Ordinary native Enzyme reverse differentiates through an empty scan, including
+one inside a plate cell; the empty steps contribute nothing. The native
+lowering infers the step's output type from the step's own operations without
+running it. A step containing a plate, a scan or an embedded kernel is inferred
+from that nested body's operations in the same way, never by querying the
+nested prepared kernel as a whole. When the inferred type is concrete, the
+native lowering allocates the result once, before testing for emptiness, so the
+empty and nonempty results are the same allocation. Separate allocations for
+the two cases would meet in one value, which Enzyme's static activity analysis
+rejects (`benchmark/repro_enzyme_branch_allocation_phi.jl`). When inference
+gives no concrete output type, each case still allocates its own result, and
+native reverse through such an empty scan is not covered by this lowering.
+
+A step can keep its carry through a lazy branch, for example
+`isempty(us) ? previous : inner[end]` after an inner scan over `us`. When the
+seed is a constant array, the carry is then constant memory on the paths that
+keep it and active memory on the others, and Enzyme's static activity analysis
+rejects it (`EnzymeRuntimeActivityError`;
+`benchmark/repro_enzyme_branch_kept_seed_carry.jl`, issue #47). The lowering
+keeps the branch as authored. Registered Enzyme 0.13.216 still rejects it on
+Julia 1.10; the Enzyme dogfood line differentiates it from `d2892e7`, which
+gives a fresh allocation that no active data reaches a zero shadow (see
+`constraints.md`, the lazy branch whose arms differ in activity). Native scans
+iterate the indices after their peeled first step as a unit range. Iterating
+them with `Iterators.drop` made Enzyme raise `OutOfMemoryError` from the
+second outer step on whenever the inner sequence was empty and the same at
+every outer step (`benchmark/repro_enzyme_guarded_inner_loop_cache.jl`).
+On Julia 1.12 and later, registered Enzyme (0.13.216) fails the unit-range
+loop of that shape too: it sizes the skipped inner loop's reverse cache with a
+negative count, which throws `OutOfMemoryError` from two outer steps on and
+writes past an allocation at exactly one
+(`benchmark/repro_enzyme_skipped_inner_loop_count.jl`, EnzymeAD/Enzyme.jl#3787).
+Julia 1.10 and the Enzyme `dogfood` line differentiate it.
+
+Plain `Enzyme.autodiff` of a closure that captures the sequence meets a
+separate Enzyme boundary on Julia 1.12 and later. Enzyme must prove the
+closure is never written. On Julia 1.12 that proof rejects the scan's result
+stores with `EnzymeMutabilityException`; the same prepared-scan call on Julia
+1.13 can either differentiate exactly or raise that exception, depending on
+its optimized IR. In one loop shape without RK it silently returns 0.0
+instead (`benchmark/repro_enzyme_closure_float_store_readonly.jl`).
+Pass the data as a `Const` argument, annotate the closure `Const(f)`, or use
+`prepare_ad`, which passes data as `Constant` contexts
+([constraints](constraints.md)).
+
+A recurrence authored in its own kernel, prepared once and called from a lazy
+branch arm, still works. The arm then runs through an ordinary callable
+boundary, not transparent graph splicing. Declare that arm's result type
+(`weights::Vector{Float64} = if … end`). A prepared child called inside a
+recipe re-enters the generic call operators the enclosing kernel is already
+being inferred through, so Julia widens the nested call. Without the
+declaration, every consumer of the value in a kernel that also owns a plate, a
+scan or an embedded prepared kernel dispatches dynamically: inside an embedded
+plate loop, once per cell.
+
+`scan(...) do … end` is recognized only as a recipe's top-level right-hand side,
+as `plate` is. Written inside a branch arm or another expression, it reaches
+the runtime placeholder instead. Scan recognition also requires the actual
+`ReactiveKernels.scan` binding. With `import ReactiveKernels` alone, spell the
+callee `ReactiveKernels.scan`, or add `using ReactiveKernels: scan` before
+using bare `scan`. A bare, unbound `scan` remains an ordinary call and raises
+`UndefVarError` when executed; a typed assignment does not change this.
 
 ## Lowering and semantics
 
@@ -123,33 +490,122 @@ Shared broadcast-invariant scalars still ride along as trailing `Ref`s:
   outputs in a vector. When that port feeds only one authored `plate` with a
   selected `sum`, native preparation can run the plate cell inside the same
   carry loop and omit the intermediate scan vector. The plate's other inputs
-  must be declared numeric scalars or explicit `Ref` operands. Its shared
+  must be declared numeric scalars or captured enclosing values. Its shared
   computations run once outside the loop. Requesting the pointwise plate port
   still returns its vector; requesting the scan port, adding another consumer,
   supplying another broadcast array, or composing multiple plates preserves
   ordinary scan materialization and broadcast shape checks.
-- **Reactant.** When the iterated sequences are traced arrays, `scan` emits a
-  single `stablehlo.while` carry loop over **all** of them: the carry (scalar or
-  `NamedTuple`) is threaded as a loop-carried value and the per-step outputs are
-  written into a preallocated traced buffer with a dynamic-update-slice. Each
-  sequence is gathered inside the loop by the loop counter, so **every iterated
-  sequence must be traced** — pass a data sequence as `Reactant.to_rarray(data)`
-  rather than as bound host data, since a host array has no exposed counter to
-  index in the `while` (a host iterated sequence is a loud, reported error). The
-  first step runs eagerly to fix the output element type; the `while` runs the
-  rest. Native and Reactant results match to floating-point tolerance (see
-  `test/test_ppl_examples_reactant.jl`).
+- **Reactant.** `scan` emits a single `stablehlo.while` carry loop for supported
+  nonempty iterated-sequence shapes. This describes the emitted trace;
+  [default optimization](#Default-optimized-short-scans) may expand short scans
+  while preserving their semantics. The lowering is selected whenever any
+  scan operand is traced (the carry seed, an iterated sequence looked through its
+  `eachrow` wrapper, or a captured shared value), and every
+  iterated sequence is then carried as a traced array: a 1-D sequence is
+  gathered element by element by the loop counter, an `eachrow` matrix
+  contributes its parent and row `i` is one traced dynamic slice (so the
+  step's row arithmetic stays vector-valued whatever the row width), and a
+  host (`bound=`) sequence is lifted into the traced program as a constant
+  exactly as bound plate data is. Sequences of different kinds may be
+  iterated together, and several lockstep sequences share the one loop.
+  Captured shared values are read the way an authored loop reads its
+  captures:
+  traced values enter the loop as fresh tracers and host values cross it
+  unchanged, field by field for a tuple or named tuple. So a host schedule
+  plan (a struct holding a `Vector{Int}`) reaches the step as itself, and a
+  host matrix or `Int` in a partly traced model stays host instead of becoming
+  traced scalars, in the step and in the retained loops of a `@traceable`
+  helper the step passes the model to. The carry — scalar, `NamedTuple`, or
+  vector — is threaded as a loop-carried value, the per-step outputs are
+  written into a preallocated traced buffer with a dynamic-update-slice, and
+  the first step runs eagerly to seed the carry and fix the output element
+  type (`N == 1` runs with an empty loop body). The emitted program is
+  independent of the sequence length and of the row width, as the [core
+  constraints](constraints.md) require; native and Reactant results match to
+  floating-point tolerance (see `test/test_authored_scan_reactant.jl` and
+  `test/test_ppl_examples_reactant.jl`). A scan whose every operand is host
+  data runs the native loop as ordinary host precomputation and emits no
+  program structure. A traced sequence's length is static, so an empty one
+  emits no loop. Its result is an empty traced vector of the step's scalar
+  output type. When a traced 1-D input sequence already has that type, it is
+  forwarded; otherwise the result is a zero-sized constant. That constant works
+  as an intermediate, but XLA export still rejects it when it is itself the
+  compiled program's output (an upstream gap, `reactivekernels-use` §7l).
+
+## Nested plates and compound values
+
+An authored scan may run inside an RK plate. The generic nested plate/scan
+path has compiled primal and reverse parity and a fixed backend operation
+inventory as both lane counts and sequence lengths grow
+(`test/test_scan_plate_reactant.jl`).
+
+Fixed-size matrix and named carry intermediates batch through the authored
+cell graph. Each traced leaf keeps its element type and tensor shape;
+metadata restores the matrix or named tuple in the next cell. The matrix
+portion has compiled primal/default-reverse parity and fixed backend
+structure across lane counts in
+`packages/ReactiveKernelsPPL/test/test_compound_plate_reactant.jl`.
+Compound results currently require a one-dimensional lane axis and immutable
+fixed structure or traced tensor leaves; unsupported host collections fail
+explicitly.
+
+PK and TGI model recurrences and their scientific acceptance belong to
+RKPPLBench. The compiler's retained loops, lazy branches, shape preservation
+and standard AD contracts apply to those ordinary consumer programs. The
+standalone CPU reproducers in `benchmark/joint_stan_tiled/` preserve two
+historical upstream reverse defects, fixed in Reactant 0.2.289+.
+
+## Default optimized short scans
+
+RK emits a scan loop whose body does not grow with sequence length. This is
+what [the retained-iteration requirement](constraints.md) governs; subsequent
+backend optimization may unroll that loop while preserving its semantics.
+
+On Julia 1.10.12 with Reactant 0.2.290 and Enzyme 0.13.210,
+`benchmark/repro_reactant_small_scan_growth.jl` emits one raw loop at sequence
+lengths 3, 4, 8 and 16. Default optimization expands the length-3 and length-4
+recurrences into successive scalar multiply/add stages, followed by array
+concatenation. Lengths 8 and 16 retain recurrence loops in primal and reverse.
+Both executables agree with an independent recurrence and its ordinary Enzyme
+reverse at changed inputs, and preserve caller inputs. The authored endpoint
+scan behaves the same way with runtime or bound sequences
+(`test/test_scan_endpoint_scope_reactant.jl`). These are supported tested cases,
+not a minimum-length cutoff or an unmet RK structure requirement.
+
+The tests assert the emitted loop and numerical semantics. Complete default
+optimized MLIR, executable HLO and operation inventories are diagnostics;
+final loop retention is not an acceptance condition. No performance regression
+or need for a backend repair has been demonstrated by this observation.
+
+The reproducer's optional `--isolate-unroll` diagnostic uses the public custom
+pipeline option to compare HLO simplification alone with the same simplification
+followed by `enzyme_hlo_unroll(4)`. The control retains both length-3 and length-8
+loops; adding the rewrite expands only the length-3 loop. This isolates a
+sufficient backend transformation without changing either default executable.
+
+A prior optimization-barrier probe retained the primal loop but ordinary
+reverse failed exporting `stablehlo.dynamic_pad` with a
+non-statically-known-loop-bound diagnostic. That probe remains rejected;
+forcing final loop retention is unnecessary for the RK emission contract.
+Native iteration remains an ordinary loop.
 
 ## Limitations
 
-- **The iterated sequences must be non-empty and share axes** (an empty sequence
-  throws — the output element type is otherwise undetermined — and a length
-  mismatch between sequences throws `DimensionMismatch`).
-- **Iterated sequences precede shared operands.** All bare (iterated) positionals
-  come first; every `Ref(...)` shared operand follows. A non-`Ref` positional
-  after a `Ref(...)` is rejected.
-- **Per-step output is a scalar** under the Reactant lowering. A non-scalar
-  per-step output is a loud, reported error, never a silent mis-lowering; author
-  the output as a scalar (or open an issue for the shape you need).
+- **The iterated sequences must share axes.** A length mismatch between
+  sequences throws `DimensionMismatch`. Empty sequences are supported (see
+  [Empty sequences](#Empty-sequences)).
+- **Bare positionals are iterated.** A shared value may instead be captured or
+  passed as a trailing `Ref(...)` operand. A bare positional after a `Ref(...)`
+  is rejected.
+- **Per-step output is a scalar** on the Reactant `while` path. A non-scalar
+  per-step output there is a loud, reported error, never a silent mis-lowering;
+  author the output as a scalar (or open an issue for the shape you need).
+- **`history` excludes `include_init`.** Its value is a number, a vector of
+  leading entries, or a named tuple of such columns. Leading vectors and
+  named columns are native only. It cannot be combined with
+  `include_init = true`.
+- **A directly iterated N-D array is rejected** on the Reactant path (its
+  native semantics are linear element iteration); iterate `eachrow(M)` or
+  `vec(M)` explicitly.
 - **RK-macro-only.** `scan` is recognised by the `@kernel` macro; it does not
   change Reactant itself.

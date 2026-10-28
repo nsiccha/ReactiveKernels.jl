@@ -86,11 +86,11 @@ struct _VizModel
     edges::Vector{_VizEdge}
 end
 
-_value_node_id(id::Int) = "v_$id"
+_value_node_id(id::ValueId) = "v_$(id.number)_$(string(id.namespace.key; base = 16))"
 _recipe_node_id(id::Int) = "r_$id"
 
 function _value_groups(g::Graph)
-    groups = Dict{Int,Vector{Value}}()
+    groups = Dict{ValueId,Vector{Value}}()
     for value in values(g.values)
         push!(get!(groups, canon_id(g, value.id), Value[]), value)
     end
@@ -100,13 +100,13 @@ function _value_groups(g::Graph)
     groups
 end
 
-function _value_text(aliases::Vector{Value}, id::Int)
+function _value_text(aliases::Vector{Value}, id::ValueId)
     labels = unique(string(v.name) for v in aliases)
     types = unique(string(valtype(v)) for v in aliases)
-    join(labels, " ≡ "), "::" * join(types, " ≡ ") * " · value $id"
+    join(labels, " ≡ "), "::" * join(types, " ≡ ") * " · value $(id.number)"
 end
 
-function _value_state(id::Int, have::Set{Int}, want::Set{Int})
+function _value_state(id::ValueId, have::Set{ValueId}, want::Set{ValueId})
     id in have && id in want && return :havewant
     id in have && return :have
     id in want && return :want
@@ -119,10 +119,10 @@ function _viz_model(v::DAGVisualization)
     recipes = subject isa Plan ?
         (v.alternatives ? subject.candidates : subject.recipes) : g.recipes
     selected = subject isa Plan ? Set(r.id for r in subject.recipes) : Set{Int}()
-    have = subject isa Plan ? Set(canon_id(g, x.id) for x in subject.have) : Set{Int}()
-    want = subject isa Plan ? Set(canon_id(g, x.id) for x in subject.want) : Set{Int}()
+    have = subject isa Plan ? Set(canon_id(g, x.id) for x in subject.have) : Set{ValueId}()
+    want = subject isa Plan ? Set(canon_id(g, x.id) for x in subject.want) : Set{ValueId}()
 
-    value_ids = Set{Int}()
+    value_ids = Set{ValueId}()
     if subject isa Graph
         for x in values(g.values)
             push!(value_ids, canon_id(g, x.id))
@@ -165,7 +165,7 @@ function _viz_model(v::DAGVisualization)
             ""
         end
         detail = status * "cost $(r.cost) · recipe $(r.id)" * plate_detail
-        push!(nodes, _VizNode(_recipe_node_id(r.id), _opname(r.op), detail,
+        push!(nodes, _VizNode(_recipe_node_id(r.id), _recipe_label(r), detail,
                              :recipe, state))
     end
 

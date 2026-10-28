@@ -1,0 +1,656 @@
+using Distributions: Categorical, Exponential, Gamma, Multinomial, Normal, logpdf
+using ReactiveKernelsPPL
+using Test
+
+# Real matrix-term IR (decision 11m6cwo chose Build): `DesignMatrix`
+# plan table + `MatrixTerm`, validated at the contract level with
+# hand-built plans, at the design level with column layouts, and at
+# the surface level with `hcat`/`X * b`/axes-prior programs (no
+# generator yet — later phases extend this file). Builders reused from
+# test_contract.jl (_columns, _none_evidence).
+
+_mx_cols(n = 6) = Dict{Symbol,AbstractVector}(
+    :y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],
+    :x1 => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0],
+    :x2 => [1.0, 1.0, -0.5, 0.25, 2.0, -1.5],
+)
+
+_mx_matrix() = DesignMatrix(:X, Union{Nothing,Symbol}[nothing, :x1, :x2], :X)
+
+_mx_term() = TermSpec(MatrixTerm, [:x1, :x2], (matrix = :X,), :X, :X_term)
+
+_mx_priors(lp = :mu) = PopulationPrior[
+    PopulationPrior(lp, :Intercept, 0.0, 1.0),
+    PopulationPrior(lp, :x1, 0.0, 2.0),
+    PopulationPrior(lp, :x2, 0.0, 3.0),
+]
+
+function _mx_plan(; matrices = DesignMatrix[_mx_matrix()],
+        terms = TermSpec[_mx_term()], priors = _mx_priors(:mu),
+        params = SampledParameter[SampledParameter(:sigma, :exponential,
+            (arg1 = 1.0,), nothing, :sigma)],
+        extra...)
+    cols = _mx_cols()
+    n = length(cols[:y])
+    return StructuralPlan(
+        [LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma, nothing,
+            _none_evidence(), :y_resp)],
+        [PredictorSpec(:mu, IdentityLink, terms, :mu)],
+        priors, params, AssignmentSpec[], cols, n;
+        matrices = matrices, extra...)
+end
+
+@testset "matrix handshake" begin
+    @test MatrixTerm in admitted_terms()
+    @test supports_term(:matrix)
+end
+
+@testset "matrix contract valid plan" begin
+    plan = _mx_plan()
+    @test validate_structure(plan) === nothing
+    @test validate_data(plan) === nothing
+    @test validate_plan(plan) === nothing
+    bound = bind_data(_unbind(plan), _mx_cols())
+    @test bound.matrices == plan.matrices
+    # Element addressees in column order.
+    @test ReactiveKernelsPPL._matrix_element_addressees(_mx_matrix()) ==
+        [:Intercept, :x1, :x2]
+end
+
+@testset "matrix design shape" begin
+    plan = _mx_plan()
+    shape = design_shape(plan.predictors[1], plan.columns;
+        matrices = plan.matrices)
+    @test shape.width == 3
+    @test length(shape.blocks) == 1
+    b = only(shape.blocks)
+    @test b.kind === MatrixTerm
+    @test b.column === :X && b.addressee === :X
+    @test b.width == 3
+    # Labels match the affine spelling exactly (twins report identically).
+    @test b.labels == [:Intercept, :x1, :x2]
+    @test b.elements == Union{Nothing,Symbol}[nothing, :x1, :x2]
+    # Per-element prior expansion in column order.
+    loc, sca = coefficient_priors(shape, plan.population_priors)
+    @test loc == [0.0, 0.0, 0.0]
+    @test sca == [1.0, 2.0, 3.0]
+    # Missing table entry fails loudly (defense in depth).
+    # refused: MatrixTerm with no matrices table entry (IR contract)
+    @test_throws ContractValidationError design_shape(plan.predictors[1],
+        plan.columns)
+    # Cross-term duplicate columns fail at design time (behind the
+    # surface one-coefficient-per-column rule and the prior duplicate
+    # row): matrix over x1 plus an affine term over x1.
+    dup = _mx_plan(terms = TermSpec[
+        TermSpec(MatrixTerm, [:x1], (matrix = :Y,), :Y, :Y_term),
+        TermSpec(ContinuousTerm, [:x1], NamedTuple(), :x1, :x1_term)],
+        matrices = DesignMatrix[DesignMatrix(:Y,
+            Union{Nothing,Symbol}[:x1], :Y)])
+    # refused: duplicate column across matrix and affine term (one coefficient per column) (IR contract)
+    @test_throws ContractValidationError design_shape(dup.predictors[1],
+        dup.columns; matrices = dup.matrices)
+end
+
+@testset "matrix contract fail-closed" begin
+    # Unknown matrix.
+    bad = _mx_plan(terms = TermSpec[TermSpec(MatrixTerm, [:x1, :x2],
+        (matrix = :Z,), :Z, :Z_term)])
+    # refused: MatrixTerm names an unknown matrix (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Malformed options.
+    bad = _mx_plan(terms = TermSpec[TermSpec(MatrixTerm, [:x1, :x2],
+        (matrix = :X, extra = 1), :X, :X_term)])
+    # refused: malformed MatrixTerm options (extra key) (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    bad = _mx_plan(terms = TermSpec[TermSpec(MatrixTerm, [:x1, :x2],
+        NamedTuple(), :X, :X_term)])
+    # refused: MatrixTerm options missing :matrix (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Non-symbol matrix ref.
+    bad = _mx_plan(terms = TermSpec[TermSpec(MatrixTerm, [:x1, :x2],
+        (matrix = 42,), :X, :X_term)])
+    # refused: non-Symbol matrix ref (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Term columns must match the matrix data columns in order.
+    bad = _mx_plan(terms = TermSpec[TermSpec(MatrixTerm, [:x2, :x1],
+        (matrix = :X,), :X, :X_term)])
+    # refused: term columns must match matrix columns in order (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    bad = _mx_plan(terms = TermSpec[TermSpec(MatrixTerm, [:x1],
+        (matrix = :X,), :X, :X_term)])
+    # refused: term columns must match matrix columns (missing column) (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Addressee must be the matrix name.
+    bad = _mx_plan(terms = TermSpec[TermSpec(MatrixTerm, [:x1, :x2],
+        (matrix = :X,), :x1, :X_term)])
+    # refused: MatrixTerm addressee must be the matrix name (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Empty matrix.
+    bad = _mx_plan(
+        matrices = DesignMatrix[DesignMatrix(:X, Union{Nothing,Symbol}[], :X)])
+    # refused: empty DesignMatrix (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Duplicate matrix names.
+    bad = _mx_plan(matrices = DesignMatrix[_mx_matrix(), _mx_matrix()])
+    # refused: duplicate matrix names (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Duplicate column within one matrix.
+    bad = _mx_plan(matrices = DesignMatrix[DesignMatrix(:X,
+        Union{Nothing,Symbol}[nothing, :x1, :x1], :X)])
+    # refused: duplicate column within one matrix (identifiability) (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Two intercept positions.
+    bad = _mx_plan(matrices = DesignMatrix[DesignMatrix(:X,
+        Union{Nothing,Symbol}[nothing, nothing, :x1], :X)])
+    # refused: two intercept columns (identifiability) (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Nested matrix.
+    bad = _mx_plan(matrices = DesignMatrix[
+        DesignMatrix(:X, Union{Nothing,Symbol}[nothing, :x1], :X),
+        DesignMatrix(:Y, Union{Nothing,Symbol}[:X, :x2], :Y)])
+    # refused: nested matrix column (DesignMatrix columns are data columns) (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Latent column (me mirror stays affine).
+    bad = _mx_plan(
+        matrices = DesignMatrix[DesignMatrix(:X,
+            Union{Nothing,Symbol}[nothing, :x_true], :X)],
+        terms = TermSpec[TermSpec(MatrixTerm, [:x_true],
+            (matrix = :X,), :X, :X_term)],
+        plate_parameters = PlateParameter[PlateParameter(:x_true, :normal,
+            (arg1 = 0.0, arg2 = 1.0), nothing)])
+    # refused: latent column in a DesignMatrix (data-only table) (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Sampled-parameter column.
+    bad = _mx_plan(matrices = DesignMatrix[DesignMatrix(:X,
+        Union{Nothing,Symbol}[nothing, :sigma], :X)])
+    # refused: sampled-parameter column in a DesignMatrix (data-only table) (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Scalar-assignment column.
+    bad = _mx_plan()
+    push!(bad.assignments, AssignmentSpec(:s, :(1.0 + 0.0)))
+    bad.matrices[1] = DesignMatrix(:X,
+        Union{Nothing,Symbol}[nothing, :s], :X)
+    # refused: scalar-assignment column in a DesignMatrix (data-only table) (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Missing element prior (x2 row dropped).
+    bad = _mx_plan(priors = PopulationPrior[
+        PopulationPrior(:mu, :Intercept, 0.0, 1.0),
+        PopulationPrior(:mu, :x1, 0.0, 2.0)])
+    # refused: missing per-element prior (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Duplicate element prior.
+    bad = _mx_plan(priors = PopulationPrior[
+        _mx_priors(:mu)...,
+        PopulationPrior(:mu, :x1, 0.0, 5.0)])
+    # refused: duplicate per-element prior (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Matrix name collides with a parameter name.
+    bad = _mx_plan(
+        matrices = DesignMatrix[DesignMatrix(:sigma,
+            Union{Nothing,Symbol}[nothing, :x1], :sigma)])
+    # refused: matrix name collides with a parameter name (IR contract)
+    @test_throws ContractValidationError validate_structure(bad)
+    # Non-numeric data column.
+    bad = _mx_plan()
+    bad.columns[:x1] = ["a", "b", "c", "d", "e", "f"]
+    # refused: non-numeric data column under a matrix (IR contract)
+    @test_throws ContractValidationError validate_data(bad)
+    # Missing data column.
+    bad = _mx_plan()
+    delete!(bad.columns, :x2)
+    # refused: missing data column referenced by a matrix (IR contract)
+    @test_throws ContractValidationError validate_data(bad)
+end
+
+# D2 surface: `X = hcat(ones(length(x)), x, ...)` definitions lower to the plan
+# table, `mu = X * b` matmuls to MatrixTerms, and
+# `b[axes(X, 2)] .~ Normal.(...)` to per-element priors. Every
+# non-matmul matrix position fails loudly naming the spelling.
+_mx_err(ast, data) = try
+    lower_rkppl(ast, data; conditioned = data)
+    nothing
+catch e
+    e
+end
+
+@rkppl _mx_stream(eta, sigma) = begin
+    slot .~ Normal.(eta, sigma)
+    slot
+end
+
+@testset "matrix surface happy path" begin
+    plan = lower_rkppl(quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        sigma ~ Exponential(1)
+        X = hcat(ones(length(x1)), x1, x2)
+        mu = X * b
+        y .~ Normal.(mu, sigma)
+    end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2))
+    @test length(plan.matrices) == 1
+    @test plan.matrices[1].name === :X
+    @test plan.matrices[1].columns == Union{Nothing,Symbol}[nothing, :x1, :x2]
+    @test plan.matrices[1].label === :X
+    @test length(only(plan.predictors).terms) == 1
+    t = only(only(plan.predictors).terms)
+    @test t.kind === MatrixTerm
+    @test t.columns == [:x1, :x2]
+    @test t.options == (matrix = :X, parameter = :b, sign = 1)
+    @test t.addressee === :X
+    @test t.label === :X_term
+    @test isempty(plan.population_priors)
+    @test only(plan.array_parameters).name === :b
+    @test only(plan.array_parameters).args == (arg1 = 0, arg2 = 1)
+    # Per-element literal priors (real broadcast semantics).
+    plan = lower_rkppl(quote
+        b[axes(X, 2)] .~ Normal.([0, 0, 0], [1, 2, 3])
+        X = hcat(ones(length(x1)), x1, x2)
+        mu = X * b
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2))
+    @test isempty(plan.population_priors)
+    @test repr(only(plan.array_parameters).args.arg1) == repr(:([0, 0, 0]))
+    @test repr(only(plan.array_parameters).args.arg2) == repr(:([1, 2, 3]))
+    # Sized declarations keep their ordinary array priors.
+    plan = lower_rkppl(quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        X = hcat(ones(length(x1)), x1)
+        mu = X * b
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x1); conditioned = (:y, :x1))
+    @test isempty(plan.population_priors)
+    # Dotted subtraction changes the use, preserving the declared prior.
+    plan = lower_rkppl(quote
+        b[axes(X, 2)] .~ Normal.(1.0, 2.0)
+        a ~ Normal(0, 1)
+        X = hcat(x1)
+        mu = a .- X * b
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x1); conditioned = (:y, :x1))
+    @test isempty(plan.population_priors)
+    @test only(plan.parameters).name === :a
+    @test only(plan.array_parameters).args == (arg1 = 1.0, arg2 = 2.0)
+    @test only(plan.predictors).terms[2].options.sign == -1
+    # Dotted negation, disjoint matrices, reuse, factor combo.
+    plan = lower_rkppl(quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        X = hcat(ones(length(x1)), x1)
+        mu = .-(X * b)
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x1); conditioned = (:y, :x1))
+    @test isempty(plan.population_priors)
+    # Undotted negation folds the sign (affine unary-minus precedent).
+    plan = lower_rkppl(quote
+        b[axes(X, 2)] .~ Normal.(1.0, 2.0)
+        X = hcat(ones(length(x1)), x1)
+        mu = -(X * b)
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x1); conditioned = (:y, :x1))
+    @test isempty(plan.population_priors)
+    @test only(plan.array_parameters).args == (arg1 = 1.0, arg2 = 2.0)
+    @test only(only(plan.predictors).terms).options.sign == -1
+    plan = lower_rkppl(quote
+        b1[axes(X, 2)] .~ Normal.(0, 1)
+        b2[axes(Y, 2)] .~ Normal.(0, 1)
+        X = hcat(ones(length(x1)), x1)
+        Y = hcat(x2)
+        mu = X * b1 .+ Y * b2
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2))
+    @test length(plan.matrices) == 2
+    @test isempty(plan.population_priors)
+    plan = lower_rkppl(quote
+        b1[axes(X, 2)] .~ Normal.(0, 1)
+        b2[axes(X, 2)] .~ Normal.(0, 1)
+        X = hcat(ones(length(x1)), x1)
+        mu = X * b1
+        nu = X * b2
+        y .~ Normal.(mu, 1.0)
+        z .~ Normal.(nu, 1.0)
+    end, (:y, :z, :x1); conditioned = (:y, :z, :x1))
+    @test length(plan.matrices) == 1
+    @test length(plan.predictors) == 2
+    plan = lower_rkppl(quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        c[levels(g)] .~ Normal.(0, 2)
+        X = hcat(x1)
+        mu = X * b .+ c[g]
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x1, :g); conditioned = (:y, :x1, :g))
+    @test only(plan.predictors).terms[1].kind === MatrixTerm
+    @test only(plan.predictors).terms[2].kind === FactorTerm
+    # Links, inline locations, leveled responses, submodel streams.
+    for ast in (quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        X = hcat(ones(length(x1)), x1)
+        mu = X * b
+        y .~ Bernoulli.(logistic.(mu))
+    end, quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        X = hcat(ones(length(x1)), x1)
+        y .~ Normal.(X * b, 1.0)
+    end, quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        X = hcat(ones(length(x1)), x1)
+        mu = X * b
+        y .~ CategoricalLogit.(mu)
+    end)
+        @test lower_rkppl(ast, (:y, :x1); conditioned = (:y, :x1)) isa StructuralPlan
+    end
+    m = @rkppl begin
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        X = hcat(ones(length(x)), x)
+        mu = X * b
+        y ~ _mx_stream(mu, 1.0)
+    end
+    @test lower_rkppl(m.ast, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x)) isa StructuralPlan
+end
+
+@testset "matrix surface definition errors" begin
+    D = (:y, :x1)
+    cases = [
+        ("no columns", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        ("nests matrix", quote b[axes(Y, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); Y = hcat(X, x1); mu = Y * b; y .~ Normal.(mu, 1.0) end),
+        ("which is scalar", quote b[axes(X, 2)] .~ Normal.(0, 1); s = 1.0; X = hcat(s, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        ("over sampled parameter", quote b[axes(X, 2)] .~ Normal.(0, 1); s ~ Normal(0, 1); X = hcat(s, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        ("over unknown name", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(foo)), foo); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        ("non-column argument", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(2, x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        ("outside a matrix definition", quote b[1:2] .~ Normal.(0, 1); mu = hcat(ones(length(x1)), x1) * b; y .~ Normal.(mu, 1.0) end),
+        ("never used in a predictor matmul", quote X = hcat(ones(length(x1)), x1); mu = a .+ c .* x1; a ~ Normal(0, 1); c ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
+        ("never used in a predictor", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = a .+ c .* x1; a ~ Normal(0, 1); c ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
+    ]
+    for (msg, ast) in cases
+        err = _mx_err(ast, D)
+        if msg != "over unknown name"
+            # Lowering preserves Julia's construction. Matched controls and
+            # original dimension failures are numerical tests in
+            # test_matrix_values.jl; hcat() itself returns a vector.
+            @test lower_rkppl(ast, D; conditioned = D) isa StructuralPlan
+        else
+            # An unknown column remains a source-scope error.
+            @test err isa SurfaceLoweringError && occursin(msg, err.message)
+        end
+    end
+end
+
+@testset "matrix surface use errors" begin
+    D = (:y, :x1, :x2)
+    Dz = (:y, :z, :x1)
+    cases = [
+        (D, "needs a bare 2-element coefficient vector", quote X = hcat(ones(length(x1)), x1); mu = X * x1; y .~ Normal.(mu, 1.0) end),
+        (D, "is a sampled name", quote s ~ Normal(0, 1); X = hcat(ones(length(x1)), x1); mu = X * s; y .~ Normal.(mu, 1.0) end),
+        (D, "is a sampled name", quote b ~ Normal(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        (D, "is a design matrix", quote X = hcat(ones(length(x1)), x1); Y = hcat(x2); y .~ Normal.(X * Y, 1.0) end),
+        (D, "got 2", quote X = hcat(ones(length(x1)), x1); y .~ Normal.(X * 2, 1.0) end),
+        (D, "has 2 elements (sized by `S`) but matrix `X` has 3 columns", quote b[axes(S, 2)] .~ Normal.(0, 1); S = hcat(ones(length(x1)), x1); X = hcat(ones(length(x1)), x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        (D, "sized by `Z`, which is not a design matrix", quote b[axes(Z, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Normal.(mu, 1.0) end),
+        (Dz, "shared across predictors", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; nu = X * b; y .~ Normal.(mu, 1.0); z .~ Normal.(nu, 1.0) end),
+        (D, "literal scaling of a matmul", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = 2 * (X * b); y .~ Normal.(mu, 1.0) end),
+        (D, "composes a matmul outside a term", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = x2 .* (X * b); y .~ Normal.(mu, 1.0) end),
+        (D, "composes a matmul outside a term", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = exp.(X * b); y .~ Normal.(mu, 1.0) end),
+        (D, "composes a matmul outside a term", quote b[axes(X, 2)] .~ Normal.(0, 1); s ~ Exponential(1); X = hcat(ones(length(x1)), x1); mu = s .* (X * b); y .~ Normal.(mu, 1.0) end),
+    ]
+    for (data, msg, ast) in cases
+        err = _mx_err(ast, data)
+        if !(occursin("has 2 elements", msg) || occursin("sized by `Z`", msg) || occursin("two coefficients", msg))
+            if msg in ("shared across predictors", "literal scaling of a matmul",
+                    "composes a matmul outside a term")
+                # Admitted: ordinary coefficient vectors retain all value readers.
+                @test (lower_rkppl(ast, data; conditioned = data); true)
+            else
+                # Whole matrix arithmetic retains its ordinary dimensions.
+                # Numeric controls and mismatches live in test_matrix_values.jl.
+                @test lower_rkppl(ast, data; conditioned = data) isa StructuralPlan
+            end
+        else
+            # refused: coefficient dimensions or sizing source violate
+            # the declared matrix contract (P3/P6).
+            @test err isa SurfaceLoweringError && occursin(msg, sprint(showerror, err))
+        end
+    end
+    # Named-definition RHS violations screen at extraction.
+    err = _mx_err(quote X = hcat(ones(length(x1)), x1); mu = X * 2; y .~ Normal.(mu, 1.0) end, D)
+    @test err === nothing
+end
+
+@testset "matrix surface stray positions" begin
+    D = (:y, :x1)
+    Dm = (:c1, :c2, :x1)
+    cases = [
+        (D, "location X is a design matrix", quote X = hcat(ones(length(x1)), x1); y .~ Normal.(X, 1.0) end),
+        (D, "calls `hcat` outside a matrix definition", quote b[1:2] .~ Normal.(0, 1); y .~ Normal.(hcat(ones(length(x1)), x1) * b, 1.0) end),
+        (D, "outside a predictor matmul", quote X = hcat(ones(length(x1)), x1); mu = X; y .~ Normal.(mu, 1.0) end),
+        (D, "combines a matrix outside a matmul", quote X = hcat(ones(length(x1)), x1); mu = a .+ X; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
+        (D, "combines a matrix outside a matmul", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X .* b; y .~ Normal.(mu, 1.0) end),
+        # `sum(X)` already reads the matrix as a scalar value.
+        (D, "is a scalar summand", quote X = hcat(ones(length(x1)), x1); w = sum(X); mu = a .+ w; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
+        (D, "combines a matrix outside a matmul", quote X = hcat(ones(length(x1)), x1); w = X; mu = a .+ w; a ~ Normal(0, 1); y .~ Normal.(mu, 1.0) end),
+        (D, "scale X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Normal.(mu, X) end),
+        (D, "argument X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); s ~ Normal(X, 1); mu = X * b; y .~ Normal.(mu, s) end),
+        (D, "argument X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); s ~ HalfNormal(X); mu = X * b; y .~ Normal.(mu, s) end),
+        (Dm, "multinomial probs X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; eachrow(hcat(c1, c2)) .~ Multinomial.(10, Ref(X)) end),
+        (D, "categorical probs X is a design matrix", quote b[axes(X, 2)] .~ Normal.(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Categorical(X) end),
+    ]
+    for (data, msg, ast) in cases
+        err = _mx_err(ast, data)
+        if msg == "is a scalar summand"
+            # admitted: a matrix reduction is an ordinary scalar value (P3/P10a).
+            @test (lower_rkppl(ast, data; conditioned = data); true)
+        elseif !(occursin("argument X", msg) || occursin("multinomial probs", msg) || occursin("categorical probs", msg))
+            # These slots retain Julia broadcasting over the matrix value.
+            @test lower_rkppl(ast, data; conditioned = data) isa StructuralPlan
+        else
+            # These constructors require scalar arguments or a probability
+            # vector; preserving a matrix value does not change their arity.
+            if occursin("argument X", msg)
+                @test err isa ContractValidationError &&
+                    occursin("matrix value X", sprint(showerror, err))
+                @test_throws MethodError Normal(ones(2,2), 1.0)
+                @test_throws MethodError Normal(0.0, ones(2,2))
+            else
+                @test err isa ContractValidationError &&
+                    occursin("simplex response", sprint(showerror, err))
+                if occursin("multinomial", msg)
+                    @test_throws MethodError Multinomial(10, ones(2,2))
+                else
+                    @test_throws MethodError Categorical(ones(2,2))
+                end
+            end
+        end
+    end
+    # Submodel inlining routes matrices to the same arms.
+    m = @rkppl begin
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        X = hcat(ones(length(x)), x)
+        mu = X * b
+        y ~ _mx_stream(X, 1.0)
+    end
+    err = try
+        lower_rkppl(m.ast, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
+        nothing
+    catch e
+        e
+    end
+    # The original fixture had an undeclared b. Keep that separate from
+    # matrix argument semantics and retain b's prior in the numerical case.
+    @test err === nothing
+end
+
+@testset "matrix surface prior errors" begin
+    D = (:y, :x1, :x2)
+    # `Cauchy.(0, 1)` broadcast was rejected under Normal-only admission;
+    # the prior-vocab slice admits per-addressee Cauchy (see
+    # test_prior_vocab.jl). A non-coefficient family (`Gamma.(1, 1)`) now
+    # makes `b` an array over `X` read as a value ("matrix read as a
+    # value" below). Likewise `Normal.(0, s)` with sampled `s`
+    # was rejected before the shared-hyperparameter slice; it is now
+    # the admitted hierarchical spelling (see "matrix hierarchical
+    # prior values vs oracle" below), so the arg-gate rejection case
+    # moves to an unknown hyper name.
+    ast = quote b[axes(X, 2)] ~ Normal(0, 1); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Normal.(mu, 1.0) end
+    err = _mx_err(ast, D)
+    # refused: a vector prior requires .~ (scalar/broadcast arity, P3).
+    @test err isa SurfaceLoweringError && occursin("is a vector — use `.~`", err.message)
+    for ast in (quote b[axes(X, 2)] .~ Normal.(0, nope); X = hcat(ones(length(x1)), x1); mu = X * b; y .~ Normal.(mu, 1.0) end,
+            quote b[axes(X, 2)] .~ Normal.([0, 0], [1, 1]); X = hcat(ones(length(x1)), x1, x2); mu = X * b; y .~ Normal.(mu, 1.0) end)
+        plan = lower_rkppl(ast, D; conditioned = D)
+        # refused: unresolved prior name nope or width 2 against 3 coefficients (P3/P6).
+        @test_throws ContractValidationError bind_data(plan, _mx_cols())
+    end
+end
+
+@testset "matrix read as a value: declared arrays and array priors" begin
+    # `X * b` with `b` a declared array, or `b[axes(X, 2)]` under a prior
+    # the matrix term does not carry (a positive-support family), reads
+    # the `hcat` matrix as a value: a bound data matrix built at bind
+    # (`1` = a ones column) times an array (test_library_shrinkage.jl
+    # covers the rule).
+    Y = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
+    X1 = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+    cols = Dict{Symbol,AbstractVector}(:y => Y, :x1 => X1)
+    Xv = hcat(ones(6), X1)
+    for (prior, decl) in (
+            (b -> sum(logpdf.(Normal(0, 1), b)),
+                :(b[1:2] .~ Normal.(0, 1))),
+            (b -> sum(logpdf.(Gamma(1, 1), b)),
+                :(b[axes(X, 2)] .~ Gamma.(1, 1))))
+        plan = lower_rkppl(quote
+                $decl
+                X = hcat(ones(length(x1)), x1)
+                mu = X * b
+                y .~ Normal.(mu, 1.0)
+            end, (:y, :x1); conditioned = (:y, :x1))
+        @test isempty(plan.population_priors)
+        @test ReactiveKernelsPPL._value_design_matrix_names(plan) == Set([:X])
+        bound = bind_data(plan, cols)
+        @test bound.columns[:X] == Xv
+        built = build_kernel(bound)
+        u = [0.3, -0.2]
+        b = constrain(built.layout, u).b
+        @test _query(built.spec, bound, :prior, u) ≈ prior(b)
+        @test _query(built.spec, bound, :likelihood, u) ≈
+            sum(logpdf.(Normal.(Xv * b, 1.0), Y))
+    end
+end
+
+@testset "matrix hierarchical prior values vs oracle" begin
+    # The admitted hierarchical spelling: a sampled scale threads into
+    # per-element `PopulationPrior` scales and the emitter reads it
+    # back per evaluation (posterior matches a Distributions.jl oracle
+    # bit-for-bit and moves with the hyper).
+    prog = quote
+        s ~ Exponential(1)
+        b[axes(X, 2)] .~ Normal.(0, s)
+        X = hcat(ones(length(x1)), x1)
+        mu = X * b
+        y .~ Normal.(mu, s)
+    end
+    Y = [1.0, 2.0, 1.5, 2.5, 3.0, 2.0]
+    X1 = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+    cols = Dict{Symbol,AbstractVector}(:y => Y, :x1 => X1)
+    plan = lower_rkppl(prog, (:y, :x1); conditioned = (:y, :x1))
+    @test only(plan.array_parameters).args.arg2 === :s
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    kern = prepare_query(built, bound, :sampler)
+    oracle(b, s) = logpdf(Exponential(1), s) +
+        sum(logpdf(Normal(0, s), bj) for bj in b) +
+        sum(logpdf(Normal(b[1] + b[2] * x, s), y)
+            for (x, y) in zip(X1, Y)) + log(s)
+    for q in ((b = [0.5, -0.25], s = 1.3), (b = [0.5, -0.25], s = 0.7))
+        @test Base.invokelatest(kern, unconstrain(built.layout, q)) ≈
+            oracle(q.b, q.s)
+    end
+end
+
+# D3 emission: matrix blocks materialize per-element design parts, the
+# fused `design * coef` matvec covers them untouched, and the
+# monotonic path splices a data-matrix × coefficient-slice matvec.
+# Twins (matrix vs affine spellings of one model) evaluate
+# bit-identically. Generator helpers (_query, _check_gradient,
+# _eval_recipe) come from the earlier includes.
+@testset "matrix design recipe" begin
+    plan = _mx_plan()
+    shape = design_shape(plan.predictors[1], plan.columns;
+        matrices = plan.matrices)
+    ex = design_recipe(shape, plan.n_obs)
+    @test ex !== nothing
+    @test _eval_recipe(ex, plan.columns) ==
+        hcat(ones(6), plan.columns[:x1], plan.columns[:x2])
+end
+
+@testset "matrix twin parity" begin
+    cols = _mx_cols()
+    mmat = lower_rkppl(quote
+        b[axes(X, 2)] .~ Normal.([0.0, 0.0], [1.0, 2.0])
+        sigma ~ Exponential(1.0)
+        X = hcat(ones(length(x1)), x1)
+        mu = X * b
+        y .~ Normal.(mu, sigma)
+    end, (:y, :x1); conditioned = (:y, :x1))
+    maff = lower_rkppl(quote
+        a ~ Normal(0.0, 1.0)
+        c ~ Normal(0.0, 2.0)
+        sigma ~ Exponential(1.0)
+        mu = a .+ c .* x1
+        y .~ Normal.(mu, sigma)
+    end, (:y, :x1); conditioned = (:y, :x1))
+    sub = Dict{Symbol,AbstractVector}(:y => cols[:y], :x1 => cols[:x1])
+    pmat = bind_data(mmat, sub)
+    paff = bind_data(maff, sub)
+    bmat = build_kernel(pmat)
+    baff = build_kernel(paff)
+    @test bmat.layout.total == baff.layout.total == 3
+    umat = unconstrain(bmat.layout, (b = [0.5, -0.25], sigma = 1.3))
+    uaff = unconstrain(baff.layout, (a = 0.5, c = -0.25, sigma = 1.3))
+    for query in (:likelihood, :prior, :posterior)
+        @test _query(bmat.spec, pmat, query, umat) ≈
+            _query(baff.spec, paff, query, uaff)
+    end
+end
+
+@testset "matrix gradient" begin
+    cols = _mx_cols()
+    sub = Dict{Symbol,AbstractVector}(:y => cols[:y], :x1 => cols[:x1])
+    plan = bind_data(lower_rkppl(quote
+        b[axes(X, 2)] .~ Normal.([0.0, 0.0], [1.0, 2.0])
+        sigma ~ Exponential(1.0)
+        X = hcat(ones(length(x1)), x1)
+        mu = X * b
+        y .~ Normal.(mu, sigma)
+    end, (:y, :x1); conditioned = (:y, :x1)), sub)
+    built = build_kernel(plan)
+    _check_gradient(built.spec, plan, [0.5, -0.25, 0.1])
+end
+
+@testset "matrix prefix-sum gather parity" begin
+    cols = Dict{Symbol,AbstractVector}(
+        :y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],
+        :x1 => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0],
+        :c => [1, 2, 1, 3, 2, 3],
+    )
+    mmat = lower_rkppl(quote
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        s ~ Dirichlet([1.0, 2.0])
+        d ~ Normal(0, 1)
+        X = hcat(ones(length(x1)), x1)
+        mu = X * b .+ d .* cumsum(vcat(0.0, s))[c]
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x1, :c); conditioned = (:y, :x1, :c))
+    maff = lower_rkppl(quote
+        s ~ Dirichlet([1.0, 2.0])
+        d ~ Normal(0, 1)
+        a ~ Normal(0, 1)
+        e ~ Normal(0, 1)
+        mu = a .+ e .* x1 .+ d .* cumsum(vcat(0.0, s))[c]
+        y .~ Normal.(mu, 1.0)
+    end, (:y, :x1, :c); conditioned = (:y, :x1, :c))
+    pmat = bind_data(mmat, cols)
+    paff = bind_data(maff, cols)
+    bmat = build_kernel(pmat)
+    baff = build_kernel(paff)
+    @test bmat.layout.total == baff.layout.total == 4
+    umat = unconstrain(bmat.layout, (b = [0.5, -0.25], d = 0.1, s = [0.4, 0.6]))
+    uaff = unconstrain(baff.layout, (a = 0.5, e = -0.25, d = 0.1, s = [0.4, 0.6]))
+    @test _query(bmat.spec, pmat, :posterior, umat) ≈
+        _query(baff.spec, paff, :posterior, uaff)
+end

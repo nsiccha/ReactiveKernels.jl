@@ -142,7 +142,7 @@ end
         μ, τ = q[1], exp(q[2])
         reference_prior =
             _eight_schools_reference_normal(μ, 0.0, 5.0) +
-            log(2.0) + _eight_schools_reference_cauchy(τ, 0.0, 5.0) +
+            _eight_schools_reference_cauchy(τ, 0.0, 5.0) +
             sum(_eight_schools_reference_normal(value, μ, τ) for value in θ)
         reference_likelihood = sum(
             _eight_schools_reference_normal(

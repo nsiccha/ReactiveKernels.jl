@@ -1,6 +1,20 @@
 using ReactiveKernelsPPLExamples.MultiOccupancyExample
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: cauchy, beta
 using LogExpFunctions: logistic, log1pexp, logaddexp
+using DifferentiationInterface
+import Enzyme
+
+const _OCC_AE = AutoEnzyme(mode = Enzyme.Reverse)
+
+function _occ_fd(f, q; h = 1e-6)
+    g = similar(q)
+    for i in eachindex(q)
+        qp = copy(q); qp[i] += h
+        qm = copy(q); qm[i] -= h
+        g[i] = (f(qp) - f(qm)) / (2h)
+    end
+    g
+end
 
 # Graph-independent oracle for the Dorazio-Royle marginalized occupancy model,
 # computed from the raw n×J detection matrix X (lchoose via exact Base.binomial).
@@ -121,5 +135,17 @@ end
             have = (:unconstrained, :X, :n, :J, :K),
             want = :posterior, bound = inp)
         @test k(qs) ≈ _occ_reference(qs, Xsmall, 2, 2, 5).posterior
+    end
+
+    @testset "native primal + plain-Enzyme gradient vs finite differences" begin
+        pk = prepare(model;
+            have = (:unconstrained, :X, :n, :J, :K), want = :posterior,
+            bound = _bound())
+        prep = prepare_ad(pk, _OCC_AE, q; active = :unconstrained)
+        value, g = ReactiveKernels.ad_value_and_gradient!(prep, similar(q), q)
+        @test value ≈ reference.posterior
+        @test all(isfinite, g)
+        gfd = _occ_fd(qq -> _occ_reference(qq, X, n, J, K).posterior, q)
+        @test g ≈ gfd rtol = 1e-5
     end
 end

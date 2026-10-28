@@ -85,15 +85,9 @@ function _display_code(label::AbstractString, code::AbstractString;
     ), '\n')
 end
 
-function _readable_generated_source(expr::Expr, context, label)
-    readable = ReactiveKernels._readable_expr(expr, context)
-    occursin(r"__ops__\[\d+\]", string(readable)) && error(
-        "$label readable generated view retained an opaque operation slot",
-    )
-    occursin(r"\boperation\(", string(readable)) && error(
-        "$label readable generated view retained an unnamed operation",
-    )
-    _generated_source(readable)
+function _generated_source(expr::Expr, context, label)
+    expr == code_expr(context) || error("$label generated expression changed")
+    sprint(print, Base.remove_linenums!(deepcopy(expr)))
 end
 
 # --- eval-throughput visualization ----------------------------------------
@@ -413,6 +407,19 @@ function setup_normal_mixture_k!(mod::Module)
     nothing
 end
 
+function setup_hmm_drive_1!(mod::Module)
+    if !isdefined(mod, :HmmDrive1Example)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: HmmDrive1Example))
+    end
+    # Bind only the raw data. The displayed PPL assembly imports and reuses the
+    # shared `normal` and `dirichlet` distribution objects directly and authors
+    # the forward-algorithm `scan` inline; no helper evaluator is injected.
+    Core.eval(mod, :(using .HmmDrive1Example:
+        HMM_DRIVE_1_U, HMM_DRIVE_1_V, HMM_DRIVE_1_ALPHA, HMM_DRIVE_1_TAU,
+        HMM_DRIVE_1_RHO))
+    nothing
+end
+
 function setup_dogs_nonhierarchical!(mod::Module)
     if !isdefined(mod, :DogsNonhierarchicalExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: DogsNonhierarchicalExample))
@@ -596,6 +603,29 @@ function setup_gpcm_latent_reg_irt!(mod::Module)
     nothing
 end
 
+function setup_grsm_latent_reg_irt!(mod::Module)
+    if !isdefined(mod, :GrsmLatentRegIrtExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: GrsmLatentRegIrtExample))
+    end
+    # Bind the raw long-form ii/jj/y (ordinal), the covariate matrix W, and the
+    # item count. The displayed PPL assembly derives the category count, the
+    # covariate design, and both sum-to-zero maps in-graph.
+    Core.eval(mod, :(using .GrsmLatentRegIrtExample:
+        GRSM_LR_II, GRSM_LR_JJ, GRSM_LR_Y, GRSM_LR_W, GRSM_LR_I))
+    nothing
+end
+
+function setup_kronecker_gp!(mod::Module)
+    if !isdefined(mod, :KroneckerGpExample)
+        Core.eval(mod, :(using ReactiveKernelsPPLExamples: KroneckerGpExample))
+    end
+    # Bind the grid locations x1 and the observation matrix y; the squared-
+    # distance matrix, both margin eigendecompositions, and the LKJ-Cholesky
+    # transform are derived in-graph.
+    Core.eval(mod, :(using .KroneckerGpExample: KRON_X1, KRON_Y))
+    nothing
+end
+
 function setup_glmm1!(mod::Module)
     if !isdefined(mod, :GLMM1ModelExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: GLMM1ModelExample))
@@ -653,16 +683,6 @@ function setup_sir!(mod::Module)
     end
     Core.eval(mod, :(using .SIRExample:
         SIR_T, SIR_Y0, SIR_STOI_HAT, SIR_B_HAT))
-    nothing
-end
-
-function setup_one_comp_mm_elim_abs!(mod::Module)
-    if !isdefined(mod, :OneCompMMElimAbsExample)
-        Core.eval(mod, :(using ReactiveKernelsPPLExamples: OneCompMMElimAbsExample))
-    end
-    Core.eval(mod, :(using .OneCompMMElimAbsExample:
-        ONECOMP_T0, ONECOMP_D, ONECOMP_V, ONECOMP_TIMES, ONECOMP_C0,
-        ONECOMP_C_HAT))
     nothing
 end
 
@@ -888,7 +908,7 @@ function render_examples(artifacts)
             "# Executed input\n", _plain_repr(artifact.inputs), "\n\n",
             "# Actual output\n", _plain_repr(artifact.output),
         )
-        generated = _readable_generated_source(
+        generated = _generated_source(
             artifact.generated, artifact.kernel, artifact.name,
         )
         _three_pane_blocks!(
@@ -909,12 +929,12 @@ function _manual_derivative_rule_sources()
         "@kernel matvec_rule(",
         "# -- END DOCS: pure mathematical derivative rule --",
     )
-    pullback = _source_between(
+    rule = _source_between(
         source,
-        "struct MatvecPullback",
-        "# -- END DOCS: generated-style pullback staging --",
+        "const matvec = derivative_rule(",
+        "# -- END DOCS: generated rule --",
     )
-    (; path, graph, pullback)
+    (; path, graph, rule)
 end
 
 """
@@ -973,10 +993,11 @@ function render_manual_derivative_rule_cuts()
     render_examples(artifacts)
 end
 
-"""Render the exact example-owned value-plus-pullback staging source."""
-function render_manual_derivative_pullback_source()
+"""Render the example's exact rule graph and its `derivative_rule` declaration."""
+function render_manual_derivative_rule_source()
+    sources = _manual_derivative_rule_sources()
     Markdown.MD(Any[Markdown.Code(
-        "julia", _manual_derivative_rule_sources().pullback,
+        "julia", string(sources.graph, "\n\n", sources.rule),
     )])
 end
 
@@ -1028,6 +1049,14 @@ toolchain (user decision `00jueci`).
 """
 render_inert_source(source::AbstractString) =
     Markdown.MD(Markdown.Code("julia", strip(source, '\n')))
+
+# The public Normal observation example is the same source replayed in native
+# acceptance. All three panels come from the kernel executed in this sandbox.
+function render_nested_plate_example(mod::Module)
+    fixture = joinpath(pkgdir(ReactiveKernels), "test", "fixtures", "nested_plates.jl")
+    isdefined(mod, :NestedPlates) || Base.include(mod, fixture)
+    execute_example(mod, getfield(mod, :NestedPlates).DOCS_SOURCE)
+end
 
 # Pathfinder is an external compiler-acceptance artifact, so the documentation
 # loads its reviewed benchmark fixture instead of maintaining a second copy of
@@ -1200,14 +1229,16 @@ const EXPECTED_PPL_EXAMPLES = (
     :two_pl_latent_reg_irt_posterior,
     :hier_2pl_posterior,
     :gpcm_latent_reg_irt_posterior,
+    :grsm_latent_reg_irt_posterior,
+    :kronecker_gp_posterior,
     :glmm1_model_posterior,
     :bym2_offset_only_posterior,
     :bones_model_posterior,
     :multi_occupancy_posterior,
     :lotka_volterra_posterior,
     :sir_posterior,
-    :one_comp_mm_elim_abs_posterior,
     :soil_incubation_posterior,
+    :hmm_drive_1_density,
 )
 const _PPL_EXECUTION_COUNTS = Dict(name => 0 for name in EXPECTED_PPL_EXAMPLES)
 

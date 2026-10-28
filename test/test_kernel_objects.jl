@@ -77,10 +77,42 @@ end
     return logdensity
 end
 
+@kernel basis_methods(t) = begin
+    basis_matrix()::Vector{Float64} = t
+end
+
+@kernel untyped_data_owner(t) = begin
+    P = basis_methods(t).basis_matrix()
+    return P
+end
+
+@kernel typed_data_owner(t::Vector{Float64}) = begin
+    P = basis_methods(t).basis_matrix()
+    return P
+end
+
 @kernel compatibility_factor_logpdf(
         x::Float64, μ::Float64, σ::Float64, log_σ::Float64) = begin
     logdensity::Float64 = normal_factor(x, μ, σ, log_σ)
     return logdensity
+end
+
+@kernel same_body_broadcasts(X::Matrix{Float64}, beta::Vector{Float64}) = begin
+    eta::Vector{Float64} = X * beta
+
+    direct(y::Vector{Int})::Float64 = begin
+        t::Vector{Float64} = y .* eta
+        sum(exp.(t))
+    end
+    chained(y::Vector{Int})::Float64 = begin
+        t::Vector{Float64} = y .* eta
+        u::Vector{Float64} = exp.(t)
+        sum(u)
+    end
+    scalar(y::Vector{Int})::Float64 = begin
+        t::Float64 = sum(y .* eta)
+        exp.(t)
+    end
 end
 
 end
@@ -133,6 +165,23 @@ end
     @test prepare(P.qualified_external.endpoint)(2.0) == 4.25
     @test isempty(ReactiveKernels.kernel_endpoint_names(P.qualified_effect))
 
+    @testset "dotted calls depend on same-body endpoint temporaries" begin
+        X = [1.0 2.0; 1.0 3.0]
+        beta = [0.5, 0.5]
+        y = [1, 0]
+        expected = sum(exp.(y .* (X * beta)))
+
+        @test prepare(F.same_body_broadcasts.direct)(X, beta, y) ≈ expected
+        @test prepare(F.same_body_broadcasts.chained)(X, beta, y) ≈ expected
+        @test prepare(F.same_body_broadcasts.scalar)(X, beta, y) ≈
+              exp(sum(y .* (X * beta)))
+
+        direct_recipe = only(recipe for recipe in
+            F.same_body_broadcasts.direct.graph.recipes
+            if only(recipe.outputs).name === :direct)
+        @test only(direct_recipe.inputs).name === :direct__t
+    end
+
     @test_throws ArgumentError @macroexpand @kernel duplicate_endpoints() = begin
         endpoint(x::Float64)::Float64 = x
         endpoint(y::Float64)::Float64 = y
@@ -181,9 +230,17 @@ end
         @test compatibility(1.0, 0.0, 2.0, log(2.0)) ≈
               named(1.0, 0.0, 2.0, log(2.0))
 
+        data = [1.0, 2.0]
+        @test ReactiveKernels.valtype(F.untyped_data_owner[:t]) === Any
+        @test ReactiveKernels.valtype(F.typed_data_owner[:t]) === Vector{Float64}
+        @test prepare(F.untyped_data_owner)(data) == data
+        @test prepare(F.typed_data_owner)(data) == data
+
+        # The endpoint's own values are named under the caller's result
+        # `logdensity`; its result keeps its name and joins `logdensity`.
         named_outputs = outputs_of(plan(F.named_constructed_logpdf))
-        @test named_outputs ==
-              [:standardized, Symbol("standard.logpdf"), :logpdf]
+        @test named_outputs == [Symbol("logdensity.standardized"),
+                                Symbol("logdensity.standard.logpdf"), :logpdf]
         @test length(plan(F.compatibility_factor_logpdf).recipes) == 1
         @test only(plan(F.compatibility_factor_logpdf).recipes).op isa PreparedKernel
         @test all(!(recipe.op isa PreparedKernel)
@@ -203,6 +260,11 @@ end
     end
 
     @testset "constructed endpoint diagnostics" begin
+        @test_throws ArgumentError @eval @kernel incompatible_constructed_owner(
+                x::Float64, location::String, scale::Float64) = begin
+            y = KernelObjectAuthoringFixture.normal(location, scale).logpdf(x)
+            return y
+        end
         @test_throws ArgumentError @macroexpand @kernel unknown_object_binding(
                 x::Float64) = begin
             y::Float64 = KernelObjectAuthoringFixture.normal(;
@@ -271,9 +333,9 @@ end
             return total
         end
         g = multi_site_logpdf.graph
-        have_ids = Set(ReactiveKernels.canon_id(g, multi_site_logpdf.v.id))
+        have_ids = Set((ReactiveKernels.canon_id(g, multi_site_logpdf.v.id),))
         want_ids = [ReactiveKernels.canon_id(g, multi_site_logpdf.total.id)]
-        counts = Dict{Int,Int}()
+        counts = Dict{ReactiveKernels.ValueId,Int}()
         for rid in ReactiveKernels._candidate_recipes(g, have_ids, want_ids)
             for o in g.recipes[rid].outputs
                 cid = ReactiveKernels.canon_id(g, o.id)

@@ -1,10 +1,10 @@
-# have/want planning: select the minimum-cost acyclic set of recipes turning
+# have/want planning: select the minimum-cost executable set of recipes turning
 # `have` into `want`, accounting for shared work and multi-output producers.
 #
 # The search is an exact branch-and-bound over the backward-reachable recipe
-# frontier. This is exact for acyclic graphs with additive non-negative costs
-# (gist §7); it is intended for the modest graphs a PoC exercises, not for
-# large-scale optimization.
+# frontier, including external producers needed to ground cyclic alternatives.
+# Costs are additive and non-negative (gist §7); shared alternatives can still
+# require exponential search.
 
 """
     PlanningError
@@ -29,7 +29,7 @@ struct Plan
     have::Vector{Value}
     want::Vector{Value}
     recipes::Vector{Recipe}          # selected, in execution order
-    producer::Dict{Int,Recipe}       # value id => the recipe that produces it
+    producer::Dict{ValueId,Recipe}   # value id => the recipe that produces it
     cost::Float64
     candidates::Vector{Recipe}       # all backward-reachable candidates (for explain)
 end
@@ -39,11 +39,11 @@ end
 # Candidate recipes: those reachable backward from `want`, stopping at `have`.
 # Effectful recipes are excluded (never selected); if that makes a want
 # unreachable the ordinary impossible-query diagnostic fires (gist §12).
-function _candidate_recipes(g::Graph, have::Set{Int}, want::Vector{Int})
+function _candidate_recipes(g::Graph, have::Set{ValueId}, want::Vector{ValueId})
     cand = Int[]
     seen_recipe = Set{Int}()
-    seen_value = Set{Int}()
-    stack = Int[]
+    seen_value = Set{ValueId}()
+    stack = ValueId[]
     for w in want
         (w in have) || push!(stack, w)
     end
@@ -66,15 +66,107 @@ function _candidate_recipes(g::Graph, have::Set{Int}, want::Vector{Int})
         end
     end
     sort!(cand)
+    _prune_dominated_candidates!(g, have, cand)
+    _prune_ungroundable_candidates!(g, have, cand)
     cand
+end
+
+# HAVE-direct dominance pruning. A candidate producer `P` of a value `v`
+# (outside HAVE) that makes nothing but `v` is dominated when another
+# candidate `Q` produces `v` straight from HAVE at a strictly smaller
+# `(cost, id)`: any complete selection using `P` can swap `P` for `Q` (plus
+# dead-recipe pruning) without losing completeness or gaining cost, so `P`
+# appears in no optimal plan. The `(cost, id)` order is strict, hence the
+# minimum always survives and no value loses its last producer. This keeps
+# backward (inverse-route) producers from multiplying the exact search
+# whenever the direct HAVE route exists at no greater cost.
+function _prune_dominated_candidates!(g::Graph, have::Set{ValueId}, cand::Vector{Int})
+    by_value = Dict{ValueId,Vector{Int}}()
+    for rid in cand, o in g.recipes[rid].outputs
+        cid = canon_id(g, o.id)
+        cid in have && continue
+        push!(get!(by_value, cid, Int[]), rid)
+    end
+    dominated = Set{Int}()
+    for vid in sort!(collect(keys(by_value)))
+        producers = by_value[vid]
+        length(producers) > 1 || continue
+        best_key = nothing
+        best_rid = 0
+        for rid in producers
+            r = g.recipes[rid]
+            all(inp -> canon_id(g, inp.id) in have, r.inputs) || continue
+            key = (r.cost, rid)
+            if best_key === nothing || key < best_key
+                best_key = key
+                best_rid = rid
+            end
+        end
+        best_key === nothing && continue
+        for rid in producers
+            rid == best_rid && continue
+            r = g.recipes[rid]
+            all(o -> (cid = canon_id(g, o.id); cid == vid || cid in have),
+                r.outputs) || continue
+            (r.cost, rid) > best_key && push!(dominated, rid)
+        end
+    end
+    isempty(dominated) && return cand
+    filter!(rid -> !(rid in dominated), cand)
+end
+
+# A recipe whose only non-HAVE output is v cannot help an optimal plan if
+# its inputs cannot be reached without v. It can never be the first producer
+# of v; after another recipe produces v, it adds no value and only increases
+# cost or recipe count. Test this with forward reachability while withholding
+# v. Multi-output recipes remain candidates whenever they can add other values.
+# Reachability deliberately ignores costs and may overestimate what is possible;
+# failure to reach an input is therefore a proof, not a greedy route choice.
+function _prune_ungroundable_candidates!(g::Graph, have::Set{ValueId}, cand::Vector{Int})
+    by_value = Dict{ValueId,Vector{Int}}()
+    for rid in cand, output in g.recipes[rid].outputs
+        cid = canon_id(g, output.id)
+        cid in have && continue
+        ids = get!(by_value, cid, Int[])
+        rid in ids || push!(ids, rid)
+    end
+    rejected = Set{Int}()
+    for vid in sort!(collect(keys(by_value)))
+        ids = by_value[vid]
+        length(ids) > 1 || continue
+        available = copy(have)
+        changed = true
+        while changed
+            changed = false
+            for rid in cand
+                r = g.recipes[rid]
+                all(input -> canon_id(g, input.id) in available, r.inputs) || continue
+                for output in r.outputs
+                    cid = canon_id(g, output.id)
+                    cid == vid && continue
+                    cid in available && continue
+                    push!(available, cid)
+                    changed = true
+                end
+            end
+        end
+        for rid in ids
+            r = g.recipes[rid]
+            all(output -> (cid = canon_id(g, output.id); cid == vid || cid in have),
+                r.outputs) || continue
+            all(input -> canon_id(g, input.id) in available, r.inputs) ||
+                push!(rejected, rid)
+        end
+    end
+    filter!(rid -> !(rid in rejected), cand)
 end
 
 # --- branch-and-bound selection -------------------------------------------
 
 mutable struct _Search
     g::Graph
-    have::Set{Int}
-    want::Vector{Int}
+    have::Set{ValueId}
+    want::Vector{ValueId}
     candidates::Vector{Int}
     best_sel::Union{Nothing,Vector{Int}}
     best_cost::Float64
@@ -82,7 +174,7 @@ mutable struct _Search
     saw_cyclic_complete::Bool
 end
 
-# The set of value ids available given `have` plus the outputs of `selected`.
+# Syntactic coverage by HAVE plus selected outputs, not executable availability.
 function _produced(s::_Search, selected::Vector{Int})
     p = copy(s.have)
     for rid in selected, o in s.g.recipes[rid].outputs
@@ -91,8 +183,8 @@ function _produced(s::_Search, selected::Vector{Int})
     p
 end
 
-function _frontier(s::_Search, selected::Vector{Int}, produced::Set{Int})
-    f = Int[]
+function _frontier(s::_Search, selected::Vector{Int}, produced::Set{ValueId})
+    f = ValueId[]
     for w in s.want
         (w in produced) || (w in f) || push!(f, w)
     end
@@ -103,15 +195,18 @@ function _frontier(s::_Search, selected::Vector{Int}, produced::Set{Int})
     f
 end
 
-function _search!(s::_Search, selected::Vector{Int}, cost::Float64)
+function _search!(s::_Search, selected::Vector{Int}, cost::Float64,
+                  excluded::Set{Int} = Set{Int}())
     # Prune: costs are non-negative, so a branch cannot beat the incumbent.
     (cost > s.best_cost) && return
     (cost == s.best_cost && length(selected) >= s.best_len) && return
     produced = _produced(s, selected)
     frontier = _frontier(s, selected, produced)
     if isempty(frontier)
-        # A complete selection. Accept only if it can be topologically ordered.
-        if _is_acyclic(s.g, selected, s.have)
+        # Output coverage alone can hide a cycle. Execute the selected prefix
+        # from HAVE; only a fully executable selection may become the incumbent.
+        order, available = _executable_prefix(s.g, selected, s.have)
+        if length(order) == length(selected)
             better = cost < s.best_cost ||
                      (cost == s.best_cost && length(selected) < s.best_len)
             if better
@@ -119,25 +214,49 @@ function _search!(s::_Search, selected::Vector{Int}, cost::Float64)
                 s.best_len = length(selected)
                 s.best_sel = copy(selected)
             end
-        else
-            s.saw_cyclic_complete = true
+            return
         end
-        return
+        s.saw_cyclic_complete = true
+        frontier = _frontier(s, selected, available)
+
+        # Any executable completion must add a producer of at least one value
+        # on this stalled frontier. It need not produce its FIRST value: a
+        # cycle may be grounded at any of its inputs. First rule out branches
+        # whose excluded recipes make completion impossible even with every
+        # remaining candidate. This also cuts independent deadlocks as soon as
+        # their last grounding route is excluded.
+        allowed = [rid for rid in s.candidates if !(rid in excluded)]
+        _, reachable = _executable_prefix(s.g, allowed, s.have)
+        all(v -> v in reachable, frontier) || return
+    else
+        # Ordinary backward expansion only needs one uncovered obligation.
+        resize!(frontier, 1)
     end
-    v = frontier[1]
+    alternatives = Int[]
     for rid in s.candidates
         (rid in selected) && continue
-        any(o -> canon_id(s.g, o.id) == v, s.g.recipes[rid].outputs) || continue
+        (rid in excluded) && continue
+        any(o -> canon_id(s.g, o.id) in frontier, s.g.recipes[rid].outputs) || continue
+        push!(alternatives, rid)
+    end
+    for rid in alternatives
         push!(selected, rid)
-        _search!(s, selected, cost + s.g.recipes[rid].cost)
+        _search!(s, selected, cost + s.g.recipes[rid].cost, excluded)
         pop!(selected)
+        # Partition completions by their first included alternative. Later
+        # branches exclude earlier alternatives, avoiding factorial revisits
+        # of the same subset through different grounding orders.
+        push!(excluded, rid)
+    end
+    for rid in alternatives
+        delete!(excluded, rid)
     end
     return
 end
 
 # --- topological ordering / cycle detection --------------------------------
 
-function _is_acyclic(g::Graph, selected::Vector{Int}, have::Set{Int})
+function _is_acyclic(g::Graph, selected::Vector{Int}, have::Set{ValueId})
     _topo(g, selected, have) !== nothing
 end
 
@@ -146,8 +265,8 @@ end
 # "first producer" can manufacture a cycle even when another producer makes a
 # valid order possible. Instead, execute any recipe whose inputs are currently
 # available, adding all of its outputs to the availability frontier.
-# Returns ordered recipe ids, or `nothing` when no valid order exists.
-function _topo(g::Graph, selected::Vector{Int}, have::Set{Int})
+# Returns the executable prefix and its available values, including on a stall.
+function _executable_prefix(g::Graph, selected::Vector{Int}, have::Set{ValueId})
     available = copy(have)
     remaining = Set(selected)
     order = Int[]
@@ -156,7 +275,7 @@ function _topo(g::Graph, selected::Vector{Int}, have::Set{Int})
             rid for rid in remaining
             if all(inp -> canon_id(g, inp.id) in available, g.recipes[rid].inputs)
         ])
-        isempty(ready) && return nothing
+        isempty(ready) && break
         rid = first(ready)
         delete!(remaining, rid)
         push!(order, rid)
@@ -164,17 +283,21 @@ function _topo(g::Graph, selected::Vector{Int}, have::Set{Int})
             push!(available, canon_id(g, output.id))
         end
     end
-    order
+    order, available
+end
+
+# Full-plan validation still requires every selected recipe to execute.
+function _topo(g::Graph, selected::Vector{Int}, have::Set{ValueId})
+    order, _ = _executable_prefix(g, selected, have)
+    length(order) == length(selected) ? order : nothing
 end
 
 # --- greedy incumbent ------------------------------------------------------
 
 # Polynomial cheapest-producer fixpoint used ONLY to seed the exact
-# branch-and-bound incumbent. The traversal order and prune rules of `_search!`
-# are unchanged, so the final selection is identical to the unseeded search;
-# branches that cannot beat the incumbent are pruned from the start instead
-# of only after the first complete leaf is found (exponential in the number
-# of alternative producers when every recipe shares one cost).
+# branch-and-bound incumbent. Branches that cannot beat it are pruned from the
+# start instead of only after the first complete leaf is found (exponential in
+# the number of alternative producers when every recipe shares one cost).
 # Returns `nothing` when no complete acyclic selection is reachable this way,
 # in which case planning proceeds exactly as before.
 function _seed_greedy_incumbent!(s::_Search)
@@ -219,15 +342,16 @@ end
 """
     plan(g; have, want) -> Plan
 
-Select the minimum-cost acyclic set of recipes producing every value in `want`
+Select the minimum-cost executable set of recipes producing every value in `want`
 from the boundary `have`. Values in `have` are authoritative and are never
-recomputed (gist §7). Throws `PlanningError` for impossible or cyclic queries.
+recomputed (gist §7). Cyclic alternatives may use external grounding producers;
+throws `PlanningError` when no executable selection exists.
 """
 function plan(g::Graph; have = (), want = ())
     # HAVE is set-like. Preserve first-seen order for the positional API while
     # collapsing repeated and structural-CSE-aliased identities to one input.
     haves = Value[]
-    seen_have = Set{Int}()
+    seen_have = Set{ValueId}()
     for v in _astuple(have)
         cid = canon_id(g, v.id)
         cid in seen_have && continue
@@ -255,7 +379,7 @@ function plan(g::Graph; have = (), want = ())
     order === nothing && throw(PlanningError("selected computation contains a cycle"))
 
     recipes = [g.recipes[rid] for rid in order]
-    producer = Dict{Int,Recipe}()
+    producer = Dict{ValueId,Recipe}()
     for r in recipes, o in r.outputs
         cid = canon_id(g, o.id)
         cid in have_ids && continue
@@ -267,7 +391,7 @@ end
 
 # Diagnose why `want` cannot be produced: report the values on the missing
 # frontier that have no available producer (gist §16).
-function _impossible_message(g::Graph, have::Set{Int}, want::Vector{Int}, cand::Vector{Int})
+function _impossible_message(g::Graph, have::Set{ValueId}, want::Vector{ValueId}, cand::Vector{Int})
     # A value is reachable if in `have` or produced by a candidate whose inputs
     # are (transitively) reachable.
     reachable = copy(have)
@@ -294,7 +418,7 @@ function _impossible_message(g::Graph, have::Set{Int}, want::Vector{Int}, cand::
             " from available values {", havestr, "}.")
     println(io, "Missing frontier:")
     # Report unreachable values that block progress.
-    blocked = Set{Int}()
+    blocked = Set{ValueId}()
     for w in missing_wants
         _collect_blocked!(blocked, g, w, reachable, have)
     end

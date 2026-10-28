@@ -127,6 +127,49 @@ end
 end
 
 
+struct _FSCRSlotProgram{C}
+    contract::C
+end
+function (operation::_FSCRSlotProgram)(raw, index, replacement)
+    read = _FSCR_RK._sm_finite_structural_read(
+        operation.contract, raw, index)
+    written = _FSCR_RK._sm_finite_structural_write(
+        operation.contract, raw, index, replacement)
+    (; read, written)
+end
+@testset "a traced slot read emits one gather independent of the capacity" begin
+    # The capacity is the bound container's length — a data length — so a
+    # slot read/write must not enumerate it (docs/src/constraints.md).  The
+    # packed columns are the traced inputs; only their tensor shapes may
+    # differ between the two programs.
+    sizes = Int[]
+    for capacity in (3, 6)
+        prototype = [(;
+            scalar=Float64(index),
+            flag=isodd(index),
+            vector=Float64[index, index + 1],
+        ) for index in 1:capacity]
+        contract = _FSCR_RK._sm_finite_structural_contract(prototype)
+        raw = _fscr_trace_raw(
+            _FSCR_RK._sm_finite_structural_pack(contract, prototype))
+        traced_index = _fscr_traced(2)
+        replacement = _fscr_trace_value(prototype[capacity])
+        operation = _FSCRSlotProgram(contract)
+        hlo = repr(Reactant.@code_hlo optimize = false operation(
+            raw, traced_index, replacement))
+        push!(sizes, count("\n", hlo))
+        compiled = @compile operation(raw, traced_index, replacement)
+        packed = compiled(raw, traced_index, replacement)
+        @test Float64(packed.read.value.scalar) == prototype[2].scalar
+        @test Bool(packed.read.value.flag) == prototype[2].flag
+        @test Array(packed.read.value.vector) == prototype[2].vector
+        written = _FSCR_RK._sm_finite_structural_unpack(
+            contract, _fscr_host_raw(packed.written.storage))
+        @test written[2] == prototype[capacity]
+        @test written[1] == prototype[1]
+    end
+    @test sizes[1] == sizes[2]
+end
 @testset "mixed structural leaves retain one traced carry type" begin
     prototype = [(;
         scalar=Float64(index),

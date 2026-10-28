@@ -67,8 +67,6 @@ using LogExpFunctions: logistic
 
     parameters = (; alpha, theta, beta)
     (parameters, log_jacobian::Float64) = ((; alpha, theta, beta), u_beta)
-    (alpha::AbstractVector{Float64}, theta::AbstractVector{Float64}, beta::Float64) =
-        (parameters.alpha, parameters.theta, parameters.beta)
 
     # Priors: alpha_k ~ Normal(0, 100), theta_j ~ Normal(0, 1),
     # beta ~ Normal(0, 100) (half-normal via beta>0; Stan adds the plain

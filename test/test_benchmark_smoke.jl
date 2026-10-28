@@ -1,6 +1,7 @@
 using ReactiveKernels
 using LinearAlgebra
 using Random
+import Pkg
 import SHA
 import TOML
 using Test
@@ -70,6 +71,8 @@ end
     for name in ("nuts_comparison.jl", "nuts_comparison_body.jl",
                  "nuts_microbench.jl", "nuts_microbench_ca9.jl",
                  "_ca9_microbench_body.jl", "_repro_guard.jl",
+                 "_enzyme_variants.jl", "enzyme_variants.jl",
+                 "gradient_probe.jl",
                  "distributions_comparison.jl",
                  "scalar_distribution_gallery_comparison.jl",
                  "structured_distributions_comparison.jl",
@@ -136,6 +139,110 @@ end
         path = joinpath(_BENCH_DIR, name)
         @test isfile(path)
         @test _parses(path)
+    end
+end
+
+# Parsing alone misses lowering-time syntax errors, such as mixing `,` and `;`
+# in one array literal. Lower each top-level statement (and module body)
+# without evaluating it.
+function _lowering_errors(path)
+    errors = String[]
+    function check(statements)
+        for stmt in statements
+            stmt isa Expr || continue
+            if stmt.head === :module
+                check(stmt.args[3].args)
+                continue
+            end
+            lowered = Meta.lower(Module(), stmt)
+            lowered isa Expr && lowered.head === :error &&
+                push!(errors, string(lowered.args[1]))
+        end
+    end
+    check(Meta.parseall(read(path, String); filename = path).args)
+    errors
+end
+
+@testset "Enzyme variant benchmark entry points lower" begin
+    for name in ("_enzyme_variants.jl", "enzyme_variants.jl",
+                 "eight_schools_ad_comparison.jl", "sum_to_zero_comparison.jl",
+                 "mnist_logistic_ad_comparison.jl", "nuts_comparison.jl",
+                 "practicalbayes_comparison.jl", "gradient_probe.jl")
+        @test isempty(_lowering_errors(joinpath(_BENCH_DIR, name)))
+    end
+end
+
+const _PIN_CONST_PATTERN =
+    r"""^const\s+(\w*REACTANT\w*VERSION\w*)\s*=\s*v"([^"]+)"""
+
+function _reactant_pin_consts(path)
+    pins = Tuple{String,VersionNumber}[]
+    for line in eachline(path)
+        matched = match(_PIN_CONST_PATTERN, strip(line))
+        matched === nothing && continue
+        push!(pins, (String(matched.captures[1]),
+                      VersionNumber(matched.captures[2])))
+    end
+    pins
+end
+
+function _reactant_bound_projects()
+    projects = String[]
+    for name in readdir(_BENCH_DIR)
+        project = joinpath(_BENCH_DIR, name, "Project.toml")
+        isfile(project) && push!(projects, project)
+    end
+    packages = joinpath(_REPOSITORY_ROOT, "packages")
+    for name in readdir(packages)
+        project = joinpath(packages, name, "Project.toml")
+        isfile(project) && push!(projects, project)
+    end
+    projects
+end
+
+function _reactant_compat_bound(project)
+    parsed = TOML.parsefile(project)
+    compat = get(parsed, "compat", Dict{String,Any}())
+    get(compat, "Reactant", nothing)
+end
+
+function _manifest_reactant_version(manifest)
+    parsed = TOML.parsefile(manifest)
+    recorded = get(get(parsed, "deps", Dict{String,Any}()), "Reactant", nothing)
+    recorded === nothing && return nothing
+    VersionNumber(only(recorded)["version"])
+end
+
+@testset "benchmark Reactant pins satisfy root [compat]" begin
+    root_project = TOML.parsefile(joinpath(_REPOSITORY_ROOT, "Project.toml"))
+    root_spec = Pkg.Types.semver_spec(root_project["compat"]["Reactant"])
+    pin_files = vcat(
+        [joinpath(_BENCH_DIR, name)
+         for name in readdir(_BENCH_DIR) if endswith(name, ".jl")],
+        [joinpath(_REPOSITORY_ROOT, "test", "run_reactant_integration.jl")],
+    )
+    found = 0
+    for path in pin_files
+        for (_, version) in _reactant_pin_consts(path)
+            found += 1
+            @test version in root_spec
+        end
+    end
+    # 8 comparison entrypoints + the CI integration runner: a smaller count
+    # means the pin pattern above no longer matches the entrypoint shape.
+    @test found >= 9
+    for project in _reactant_bound_projects()
+        bound = _reactant_compat_bound(project)
+        bound === nothing && continue
+        @test !isempty(intersect(
+            root_spec, Pkg.Types.semver_spec(bound)))
+    end
+    for project in _reactant_bound_projects()
+        manifest = joinpath(dirname(project), "Manifest.toml")
+        isfile(manifest) || continue
+        recorded = _manifest_reactant_version(manifest)
+        recorded === nothing && continue
+        @test recorded in root_spec
     end
 end
 
@@ -366,13 +473,18 @@ end
 @testset "incremental producer selection and resume isolation" begin
     native = read(joinpath(_BENCH_DIR, "all80_posteriordb_body.jl"), String)
     reactant = read(joinpath(_BENCH_DIR, "all80_reactant_body.jl"), String)
-    selector = "setdiff(keys(RK), All80Registry.BATCH1_KEYS)"
+    selector = "setdiff(keys(RK), All80Registry.BATCH_KEYS)"
     @test occursin(selector, native) && occursin(selector, reactant)
     registry = read(joinpath(_BENCH_DIR, "all80_registry.jl"), String)
     @test occursin("const BATCH1_KEYS = Set([", registry)
+    @test occursin("const IRT_KEYS = Set([", registry)
+    @test occursin("const BATCH_KEYS = union(BATCH1_KEYS, IRT_KEYS)", registry)
     @test count(key -> occursin("\"$key\"", registry), (
         "diamonds-diamonds", "dogs-dogs_nonhierarchical",
         "ovarian-logistic_regression_rhs", "normal_5-normal_mixture_k")) == 4
+    @test count(key -> occursin("\"$key\"", registry), (
+        "irt_2pl-irt_2pl", "fims_Aus_Jpn_irt-2pl_latent_reg_irt",
+        "sat-hier_2pl", "timssAusTwn_irt-gpcm_latent_reg_irt")) == 4
     @test occursin("count(==(name), _req) > 1", native)
     @test occursin("count(==(name), requested) > 1", reactant)
     @test occursin("All80Receipt.assert_batch_resume!", native)

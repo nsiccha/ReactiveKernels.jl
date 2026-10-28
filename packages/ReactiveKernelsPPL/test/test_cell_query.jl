@@ -1,0 +1,541 @@
+using ReactiveKernels, ReactiveKernelsPPL, Distributions, Enzyme, Test
+using DifferentiationInterface: AutoEnzyme
+
+# One cell of an observation plate: one iteration of an `@plate for` loop
+# (one group's observations), or one entry of an elementwise observation
+# (snag `rkppl-per-subjec-a3d6e6d8`, user decision `06z2prg`, option 1a).
+
+# Grouped exponential-decay curves: per-group predictors with a correlated
+# non-centred group block, one loop iteration per group observing that group's
+# series (ragged, one group empty).
+const _CQ_GROUPED = quote
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    bw ~ Normal(0, 1)
+    v0 ~ Normal(0, 1)
+    sd[1:2] .~ Exponential.(1)
+    L ~ LKJCholesky(2, 2.0)
+    Z[levels(group), 1:2] .~ Normal.(0, 1)
+    F = sd .* L
+    R = Z * F'
+    log_k = a .+ bw .* w .+ R[group, 1]
+    log_v = v0 .+ R[group, 2]
+    @plate for i in eachindex(y)
+        k = exp(log_k[i])
+        v = exp(log_v[i])
+        y[i] .~ Normal.(amount[i] / v .* exp.(-k .* t[i]), sigma)
+    end
+end
+
+function _cq_grouped_data()
+    t = [[0.5, 1.0, 2.0], [0.5, 3.0], Float64[], [1.0, 2.0, 4.0, 8.0], [0.25]]
+    y = [[1.8, 1.5, 1.1], [2.0, 0.8], Float64[], [1.6, 1.2, 0.7, 0.3], [2.4]]
+    (; group = ["g1", "g2", "g3", "g4", "g5"], w = [0.1, -0.2, 0.3, 0.0, 0.5],
+       amount = [10.0, 8.0, 12.0, 9.0, 11.0], t, y)
+end
+
+function _cq_bound(ast, data, conditioned)
+    plan = lower_rkppl(ast, data; conditioned, mod = @__MODULE__)
+    bound = bind_data(plan, data)
+    bound, build_kernel(bound)
+end
+
+_cq_central(f, u, j; h = 1e-6) =
+    (f(setindex!(copy(u), u[j] + h, j)) - f(setindex!(copy(u), u[j] - h, j))) / (2h)
+
+_cq_direct_compact_value(q, base, active, indices, cell) =
+    q(ReactiveKernelsPPL._CompactCellPoint(base, active, indices), cell)
+
+@testset "cell query: one group of an @plate for loop" begin
+    data = _cq_grouped_data()
+    bound, built = _cq_bound(_CQ_GROUPED, data, (:y,))
+    u = collect(range(-0.4, 0.5; length = built.layout.total))
+    pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+    likelihood = Base.invokelatest(prepare_query(built, bound, :likelihood), u)
+    q = prepare_cell_query(built, bound, :y)
+    @test q isa CellQuery
+    cells = [q(u, i) for i in eachindex(data.y)]
+    @test cells ≈ [sum(x; init = 0.0) for x in pointwise.y]
+    @test q(u, 3) == 0.0
+    @test sum(cells) ≈ likelihood
+    @test_throws BoundsError q(u, length(data.y) + 1)
+
+    # The gradient of one group's density is the full likelihood gradient on
+    # that group's block, and zero on every other group's block.
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    s = prepare_cell_sampler(built, bound, :y, u; backend)
+    full = prepare_ad(prepare_query(built, bound, :likelihood), backend, u;
+        active = :unconstrained)
+    _, gfull = Base.invokelatest(ad_value_and_gradient, full, u)
+    names = coordinate_names(built.layout)
+    block(i) = findall(n -> startswith(String(n), "Z.$i."), names)
+    compact = prepare_compact_cell_sampler(built, bound, :y, u,
+        sort!([2; block(1)]);
+        backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)))
+    for i in (1, 4)
+        g = similar(u)
+        value, _ = cell_value_and_gradient!(s, g, u, i)
+        @test value ≈ cells[i]
+        @test g[block(i)] ≈ gfull[block(i)]
+        @test all(iszero, g[block(j)] for j in eachindex(data.y) if j != i)
+        for j in (2, first(block(i)))
+            @test g[j] ≈ _cq_central(x -> q(x, i), u, j) rtol = 1e-5
+        end
+        indices = sort!([2; block(i)])
+        base = copy(u)
+        active = u[indices]
+        active[1] += 0.1
+        overlaid = copy(u)
+        overlaid[indices] = active
+        compact_gradient = similar(active)
+        compact_value, returned = cell_value_and_gradient!(
+            compact, compact_gradient, base, active, indices, i)
+        full_gradient = similar(u)
+        full_value, _ = cell_value_and_gradient!(s, full_gradient, overlaid, i)
+        @test compact_value ≈ full_value ≈ q(overlaid, i)
+        @test returned === compact_gradient
+        @test compact_gradient ≈ full_gradient[indices]
+        @test base == u
+        @test active == overlaid[indices]
+        if i == 1
+            # BRM's direct-Enzyme workaround differentiates the compact η
+            # vector and then evaluates the cell again for its value.
+            direct_gradient = zeros(length(active))
+            Enzyme.autodiff(Enzyme.set_runtime_activity(Enzyme.Reverse),
+                _cq_direct_compact_value, Enzyme.Active, Enzyme.Const(q),
+                Enzyme.Const(base), Enzyme.Duplicated(active, direct_gradient),
+                Enzyme.Const(indices), Enzyme.Const(i))
+            direct_value = _cq_direct_compact_value(q, base, active, indices, i)
+            @test compact_value ≈ direct_value
+            @test compact_gradient ≈ direct_gradient
+        end
+    end
+    @test_throws ReactiveKernelsPPL.ContractValidationError cell_value_and_gradient!(
+        compact, zeros(2), u, zeros(2), [2, 2], 1)
+    # Gradients leave the bound per-group arrays and later values unchanged.
+    @test data == _cq_grouped_data()
+    @test [q(u, i) for i in eachindex(data.y)] ≈ cells
+end
+
+@testset "cell query: a group's cost does not grow with the number of groups" begin
+    # The predictors `log_k`, `log_v` and the group block `R` are computed at the
+    # queried group only (increment 1b), so a cell allocates the same at 10
+    # groups as at 2,000.
+    function data(n)
+        (; group = ["g$j" for j in 1:n], w = collect(range(-0.3, 0.3; length = n)),
+           amount = fill(10.0, n), t = [[0.5, 1.0, 2.0] for _ in 1:n],
+           y = [[1.8, 1.5, 1.1] for _ in 1:n])
+    end
+    measured = map((10, 2_000)) do n
+        bound, built = _cq_bound(_CQ_GROUPED, data(n), (:y,))
+        q = prepare_cell_query(built, bound, :y)
+        u = collect(range(-0.4, 0.5; length = built.layout.total))
+        uview = view(u, :)
+        pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+        q(u, 2); q(uview, 2)
+        names = coordinate_names(built.layout)
+        indices = sort!([2; findall(name -> startswith(String(name), "Z.2."), names)])
+        active = u[indices]
+        compact = prepare_compact_cell_sampler(built, bound, :y, u, indices;
+            backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)))
+        compact_gradient = similar(active)
+        compact_value, _ = cell_value_and_gradient!(
+            compact, compact_gradient, u, active, indices, 2)
+        (; value = q(u, 2), viewed = q(uview, 2),
+           reference = sum(pointwise.y[2]), compact_value,
+           bytes = (@allocated q(u, 2)), view_bytes = (@allocated q(uview, 2)),
+           compact_bytes = (@allocated cell_value_and_gradient!(
+               compact, compact_gradient, u, active, indices, 2)))
+    end
+    @test all(m -> m.value ≈ m.reference, measured)
+    @test all(m -> m.viewed ≈ m.reference, measured)
+    @test measured[1].bytes == measured[2].bytes
+    @test measured[1].view_bytes == measured[2].view_bytes
+    @test all(m -> m.compact_value ≈ m.reference, measured)
+    @test measured[2].compact_bytes <= measured[1].compact_bytes + 1024
+    # The group row of `R = Z * F'` reads `Z` through the compact overlay, which
+    # is not strided; RK's native product computes it with its own loop, where
+    # LinearAlgebra's generic `mul!` allocated 88 KB per gradient on
+    # Julia 1.10 (snag `compact-cell-gra-ebf0a114`).
+    @test all(m -> m.compact_bytes < 8_192, measured)
+end
+
+# BRM's NLME emission for a caller-provided scalar law: a kernel plate writes
+# each subject's prediction, and the observation plate reads it per subject
+# through `LogDensity` (snag `brm-s-nlme-subje-f6f0efd3`). A subject's cell
+# runs the kernel plate, and the predictors it reads, at that subject only, as
+# the same program observed by `Normal` does.
+ReactiveKernels.@kernel _cq_scalar_law(value, location, scale) = begin
+    residual = (value - location) / scale
+    density = -0.5 * log(2 * pi) - log(scale) - 0.5 * residual * residual
+    return density
+end
+_cq_flatten_cells(cells) = reduce(vcat, cells; init = Float64[])
+
+_cq_kernel_plate(observation) = quote
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
+    s1 ~ Exponential(1)
+    s2 ~ Exponential(1)
+    z1[levels(subject)] .~ Normal.(0, 1)
+    z2[levels(subject)] .~ Normal.(0, 1)
+    log_CL = a .+ s1 .* z1[subject]
+    log_V = b .+ s2 .* z2[subject]
+    @plate for i = eachindex(log_CL)
+        CL = exp(log_CL[i])
+        Vc = exp(log_V[i])
+        pred_cell = (dose[i] / Vc) .* exp.(-(CL / Vc) .* t[i])
+        pred_cells[i] = pred_cell
+        pred_argument_dv_1[i] = pred_cell
+    end
+    pred = _cq_flatten_cells(pred_cells)
+    @plate for i = eachindex(dv)
+        $observation
+    end
+end
+
+function _cq_pk_data(n)
+    t = [[0.5, 1.0, 2.0, 4.0][1:mod1(j, 4)] for j in 1:n]
+    (; subject = ["s$j" for j in 1:n], dose = fill(100.0, n), t,
+       dv = [5 .* exp.(-0.15 .* tj) .* (1 .+ 0.05 .* sin.(j .+ tj))
+             for (j, tj) in enumerate(t)])
+end
+
+@testset "cell query: a caller-owned law reads a kernel plate's row" begin
+    law = :(dv[i] .~ LogDensity.(_cq_scalar_law, pred_argument_dv_1[i], sigma))
+    normal = :(dv[i] .~ Normal.(pred_argument_dv_1[i], sigma))
+    data = _cq_pk_data(5)
+    bound, built = _cq_bound(_cq_kernel_plate(law), data, (:dv,))
+    nbound, nbuilt = _cq_bound(_cq_kernel_plate(normal), data, (:dv,))
+    @test coordinate_names(built.layout) == coordinate_names(nbuilt.layout)
+    u = collect(range(-0.4, 0.5; length = built.layout.total))
+    pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+    q = prepare_cell_query(built, bound, :dv)
+    nq = prepare_cell_query(nbuilt, nbound, :dv)
+    cells = [q(u, i) for i in eachindex(data.dv)]
+    @test cells ≈ [sum(x; init = 0.0) for x in pointwise.dv]
+    @test cells ≈ [nq(u, i) for i in eachindex(data.dv)]
+    @test_throws BoundsError q(u, length(data.dv) + 1)
+
+    names = coordinate_names(built.layout)
+    block(i) = findall(n -> n in (Symbol("z1.$i"), Symbol("z2.$i")), names)
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    s = prepare_cell_sampler(built, bound, :dv, u; backend)
+    full = prepare_ad(prepare_query(built, bound, :likelihood), backend, u;
+        active = :unconstrained)
+    _, gfull = Base.invokelatest(ad_value_and_gradient, full, u)
+    compact = prepare_compact_cell_sampler(built, bound, :dv, u,
+        sort!([1:5; block(1)]);
+        backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)))
+    for i in (1, 4)
+        g = similar(u)
+        value, _ = cell_value_and_gradient!(s, g, u, i)
+        @test value ≈ cells[i]
+        @test g[block(i)] ≈ gfull[block(i)]
+        @test all(iszero, g[block(j)] for j in eachindex(data.dv) if j != i)
+        for j in (1, 2, first(block(i)))
+            @test g[j] ≈ _cq_central(x -> q(x, i), u, j) rtol = 1e-5
+        end
+        indices = sort!([1:5; block(i)])
+        active = u[indices]
+        compact_gradient = similar(active)
+        compact_value, _ = cell_value_and_gradient!(
+            compact, compact_gradient, u, active, indices, i)
+        @test compact_value ≈ value
+        @test compact_gradient ≈ g[indices]
+    end
+    @test data == _cq_pk_data(5)
+
+    # One subject's cell allocates the same at 10 subjects as at 2,000.
+    measured = map((10, 2_000)) do n
+        data = _cq_pk_data(n)
+        bound, built = _cq_bound(_cq_kernel_plate(law), data, (:dv,))
+        u = collect(range(-0.4, 0.5; length = built.layout.total))
+        q = prepare_cell_query(built, bound, :dv)
+        names = coordinate_names(built.layout)
+        indices = sort!([1:5; findall(n -> n in (Symbol("z1.2"), Symbol("z2.2")), names)])
+        active = u[indices]
+        compact = prepare_compact_cell_sampler(built, bound, :dv, u, indices;
+            backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)))
+        compact_gradient = similar(active)
+        cell_value_and_gradient!(compact, compact_gradient, u, active, indices, 2)
+        q(u, 2)
+        (; bytes = (@allocated q(u, 2)),
+           compact_bytes = (@allocated cell_value_and_gradient!(
+               compact, compact_gradient, u, active, indices, 2)))
+    end
+    @test measured[1].bytes == measured[2].bytes
+    @test measured[1].compact_bytes == measured[2].compact_bytes
+end
+
+@testset "cell query: elementwise and scalar-cell observations" begin
+    x = [0.2, -0.4, 1.1, 0.7]
+    y = [0.5, -0.1, 1.8, 1.0]
+    ast = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        s ~ Exponential(1)
+        y .~ Normal.(a .+ b .* x, s)
+    end
+    bound, built = _cq_bound(ast, (; x, y), (:y,))
+    u = [0.3, -0.2, 0.1]
+    pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+    q = prepare_cell_query(built, bound, (:y,))
+    @test [q(u, i) for i in eachindex(y)] ≈ pointwise.y
+
+    looped = quote
+        a ~ Normal(0, 1)
+        s ~ Exponential(1)
+        @plate for i in eachindex(y)
+            y[i] ~ Normal(a * x[i], s)
+            z[i] ~ Normal(a + x[i], 2s)
+        end
+    end
+    z = [0.1, 0.4, -0.6, 0.9]
+    bound, built = _cq_bound(looped, (; x, y, z), (:y, :z))
+    u = [0.4, -0.3]
+    pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+    both = prepare_cell_query(built, bound, (:y, :z))
+    @test [both(u, i) for i in eachindex(y)] ≈ pointwise.y .+ pointwise.z
+    only_z = prepare_cell_query(built, bound, :z)
+    @test [only_z(u, i) for i in eachindex(z)] ≈ pointwise.z
+end
+
+# An observation in an `@plate for` cell whose argument the cell computes
+# (`m = f(w[i], la[i])`) reads that argument's plate at the cell's own index,
+# so a cell query composes the plate and calls `f` once per observation (snag
+# `prepare-cell-que-30f4f1bf`: the plate iterated the resolved
+# `Base.eachindex(y1)`, the response range kept `eachindex(y1)`, and a whole
+# gather between them ran the plate at every index).
+const _CQ_CALLS = Ref(0)
+_cq_scaled(w, rate) = (_CQ_CALLS[] += 1; w * exp(rate))
+
+@testset "cell query: an in-cell observation's computed argument runs at that cell" begin
+    n = 9
+    w = collect(range(0.3, 1.1; length = n))
+    x = collect(range(-0.4, 0.6; length = n))
+    data = (; w, x, y1 = w .+ 0.1, y2 = 2 .* w)
+    u = [0.2, 0.1]
+    m = w .* exp.(u[1] .+ x)
+    s = exp(u[2])
+    one_observation(iterator) = quote
+        a ~ Normal(0, 1)
+        s ~ Exponential(1.0)
+        la = a .+ x
+        @plate for i in $iterator
+            m = _cq_scaled(w[i], la[i])
+            y1[i] ~ Normal(m, s)
+        end
+        y2 .~ Normal.(2 .* w, s)
+    end
+    two_observations = quote
+        a ~ Normal(0, 1)
+        s ~ Exponential(1.0)
+        la = a .+ x
+        @plate for i in eachindex(y1)
+            m = _cq_scaled(w[i], la[i])
+            y1[i] ~ Normal(m, s)
+            y2[i] ~ Normal(2 * m, s)
+        end
+    end
+    y1_density(i) = logpdf(Normal(m[i], s), data.y1[i])
+    y2_density(i) = logpdf(Normal(2 * m[i], s), data.y2[i])
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for (ast, observations, calls, density) in (
+            (one_observation(:(eachindex(y1))), (:y1,), 1, y1_density),
+            (one_observation(:(axes(y1, 1))), (:y1,), 1, y1_density),
+            (two_observations, (:y1,), 1, y1_density),
+            # Each observation's argument has its own plate: one call each.
+            (two_observations, (:y1, :y2), 2, i -> y1_density(i) + y2_density(i)))
+        bound, built = _cq_bound(ast, data, (:y1, :y2))
+        pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+        q = prepare_cell_query(built, bound, observations)
+        cells = [q(u, i) for i in 1:n]
+        @test cells ≈ [density(i) for i in 1:n] rtol = 1e-12
+        @test cells ≈ sum(vec(getfield(pointwise, o)) for o in observations) rtol = 1e-12
+        for i in (1, 5, 9)
+            _CQ_CALLS[] = 0
+            q(u, i)
+            @test _CQ_CALLS[] == calls
+        end
+        sampler = prepare_cell_sampler(built, bound, observations, u; backend)
+        for i in (2, 7)
+            g = similar(u)
+            value, _ = cell_value_and_gradient!(sampler, g, u, i)
+            @test value ≈ cells[i] rtol = 1e-12
+            @test g ≈ [_cq_central(v -> q(v, i), u, j) for j in eachindex(u)] rtol = 1e-6
+        end
+    end
+    @test data.w == collect(range(0.3, 1.1; length = n))
+    @test data.y1 == data.w .+ 0.1
+end
+
+@testset "cell query: computed scale and missing observation cells" begin
+    n = 9
+    w = collect(range(0.3, 1.1; length = n))
+    x = collect(range(-0.4, 0.6; length = n))
+    u = [0.2]
+    scale_model = quote
+        a ~ Normal(0, 1)
+        la = a .+ x
+        @plate for i in eachindex(y)
+            s = _cq_scaled(w[i], la[i])
+            y[i] ~ Normal(x[i], s)
+        end
+    end
+    complete = (; w, x, y = w .+ 0.1)
+    bound, built = _cq_bound(scale_model, complete, (:y,))
+    q = prepare_cell_query(built, bound, :y)
+    for i in (1, 5, 9)
+        _CQ_CALLS[] = 0
+        @test q(u, i) ≈ logpdf(Normal(x[i], w[i] * exp(u[1] + x[i])), complete.y[i])
+        @test _CQ_CALLS[] == 1
+    end
+    sampler = prepare_cell_sampler(built, bound, :y, u;
+        backend = AutoEnzyme(; mode = Enzyme.Reverse))
+    g = similar(u)
+    value, _ = cell_value_and_gradient!(sampler, g, u, 5)
+    @test value ≈ q(u, 5)
+    @test g[1] ≈ _cq_central(v -> q(v, 5), u, 1) rtol = 1e-6
+
+    missing_y = Union{Missing,Float64}[complete.y...]
+    missing_y[3] = missing
+    incomplete = (; w, x, y = missing_y)
+    location_model = quote
+        a ~ Normal(0, 1)
+        la = a .+ x
+        @plate for i in eachindex(y)
+            m = _cq_scaled(w[i], la[i])
+            y[i] ~ Normal(m, 1.3)
+        end
+    end
+    bound, built = _cq_bound(location_model, incomplete, (:y,))
+    q = prepare_cell_query(built, bound, :y)
+    for i in (1, 3, 5, 9)
+        _CQ_CALLS[] = 0
+        expected = ismissing(incomplete.y[i]) ? 0.0 :
+            logpdf(Normal(w[i] * exp(u[1] + x[i]), 1.3), incomplete.y[i])
+        @test q(u, i) ≈ expected
+        @test _CQ_CALLS[] == (ismissing(incomplete.y[i]) ? 0 : 1)
+    end
+    sampler = prepare_cell_sampler(built, bound, :y, u;
+        backend = AutoEnzyme(; mode = Enzyme.Reverse))
+    for i in (3, 5)
+        g = similar(u)
+        value, _ = cell_value_and_gradient!(sampler, g, u, i)
+        @test value ≈ q(u, i)
+        @test g[1] ≈ _cq_central(v -> q(v, i), u, 1) atol = 1e-10 rtol = 1e-6
+    end
+    @test ismissing(incomplete.y[3])
+end
+
+@testset "cell query: refusals" begin
+    data = _cq_grouped_data()
+    bound, built = _cq_bound(_CQ_GROUPED, data, (:y,))
+    @test_throws ContractValidationError prepare_cell_query(built, bound, :amount)
+    @test_throws ContractValidationError prepare_cell_query(built, bound, ())
+    scalar = quote
+        theta ~ Beta(1, 1)
+        k ~ Binomial(n, theta)
+    end
+    plan = lower_rkppl(scalar, (; n = 5, k = 2); conditioned = (:k,), mod = @__MODULE__)
+    sbound = bind_data(plan, (; n = 5, k = 2))
+    @test_throws ContractValidationError prepare_cell_query(build_kernel(sbound), sbound, :k)
+end
+
+# The cell groups of a regional panel (snag `compact-cell-sam-d85d96ae`): a
+# total reads its rows of a predictor whose design has a computed column, and
+# an observation reads a mean with a per-row stratified effect. Each cell costs
+# its own rows, however many rows the model has.
+const _CQ_TOTALS = quote
+    sigma_t ~ Exponential(1)
+    beta[1:3] .~ Normal.(0, 1)
+    tau ~ Exponential(1)
+    u[levels(g)] .~ Normal.(0, 1)
+    c0 ~ Normal(4, 1)
+    c = lx .- c0
+    X = hcat(one, c, year)
+    log_w = X * beta .+ tau .* u[g]
+    @plate for k in eachindex(total)
+        total[k] ~ Normal(sum(exp.(log_w[rows[k]])), sigma_t * total[k])
+    end
+end
+
+const _CQ_STRATA = quote
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    ts[levels(s), 1:1] .~ Exponential.(1)
+    zg[levels(g), 1:1] .~ Normal.(0, 1)
+    @plate for i in eachindex(g)
+        b[i, 1:1] = ts[s[i], :] .* zg[g[i], :]
+    end
+    mu = a .+ b[:, 1]
+    xo .~ Normal.(mu[obs], sigma)
+end
+
+function _cq_panel_data(n; size = 4)
+    rows = [collect(j:min(j + size - 1, n)) for j in 1:size:n]
+    (; lx = 4.0 .+ 0.1 .* sin.(1:n), one = ones(n),
+       year = collect(range(-1.0, 1.0; length = n)),
+       g = [string("g", 1 + (j - 1) ÷ 2) for j in 1:n], rows,
+       total = [10.0 + k for k in eachindex(rows)],
+       s = [isodd(j) ? "a" : "b" for j in 1:n], obs = collect(1:2:n),
+       xo = [0.1 * j for j in 1:2:n])
+end
+
+# The totals' design as a data matrix: the cell gradient, compact and dense.
+const _CQ_TOTALS_DATA = quote
+    sigma_t ~ Exponential(1)
+    beta[1:3] .~ Normal.(0, 1)
+    tau ~ Exponential(1)
+    u[levels(g)] .~ Normal.(0, 1)
+    log_w = X * beta .+ tau .* u[g]
+    @plate for k in eachindex(total)
+        total[k] ~ Normal(sum(exp.(log_w[rows[k]])), sigma_t * total[k])
+    end
+end
+
+_cq_panel_data_matrix(n) = let d = _cq_panel_data(n)
+    (; X = hcat(d.one, d.lx, d.year), d.g, d.rows, d.total)
+end
+
+@testset "cell query: totals over rows and stratified effects cost their own rows" begin
+    backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    function measure(ast, data, obs; gradients)
+        map((40, 4_000)) do n
+            bound, built = _cq_bound(ast, data(n), (obs,))
+            q = prepare_cell_query(built, bound, obs)
+            u = collect(range(-0.4, 0.5; length = built.layout.total))
+            pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+            q(u, 2)
+            measured = (; value = q(u, 2), reference = getproperty(pointwise, obs)[2],
+                bytes = (@allocated q(u, 2)))
+            gradients || return measured
+            dense = prepare_cell_sampler(built, bound, obs, u; backend)
+            dense_value, dense_gradient = cell_value_and_gradient!(dense, similar(u), u, 2)
+            indices = collect(1:6)
+            active = u[indices]
+            compact = prepare_compact_cell_sampler(built, bound, obs, u, indices; backend)
+            compact_gradient = similar(active)
+            compact_value, _ = cell_value_and_gradient!(
+                compact, compact_gradient, u, active, indices, 2)
+            (; measured..., dense_value, compact_value,
+               parity = compact_gradient ≈ dense_gradient[indices],
+               compact_bytes = (@allocated cell_value_and_gradient!(
+                   compact, compact_gradient, u, active, indices, 2)))
+        end
+    end
+    for (ast, data, obs, gradients) in (
+            (_CQ_TOTALS, _cq_panel_data, :total, false),
+            (_CQ_TOTALS_DATA, _cq_panel_data_matrix, :total, true),
+            (_CQ_STRATA, _cq_panel_data, :xo, true))
+        measured = measure(ast, data, obs; gradients)
+        @test all(m -> m.value ≈ m.reference, measured)
+        @test measured[1].bytes == measured[2].bytes
+        gradients || continue
+        @test all(m -> m.value ≈ m.dense_value ≈ m.compact_value, measured)
+        @test all(m -> m.parity, measured)
+        @test measured[1].compact_bytes == measured[2].compact_bytes
+    end
+end

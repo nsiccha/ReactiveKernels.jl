@@ -5,10 +5,39 @@ if !isdefined(@__MODULE__, :AuthoredScanFixtures)
     include(joinpath(@__DIR__, "fixtures", "authored_scan.jl"))
 end
 using .AuthoredScanFixtures: authored_scan_arma, _authored_scan_reference,
-    authored_scan_lockstep, _authored_scan_lockstep_reference
+    authored_scan_lockstep, _authored_scan_lockstep_reference,
+    authored_scan_lazy_branch, prepared_authored_scan_nonempty
 
 _authored_scan_allocated(k, args::Vararg{Any,N}) where {N} = @allocated k(args...)
+# Specialized on a plain function's type, which Julia does not do for `k` above.
+_authored_scan_allocated_function(f::F, args::Vararg{Any,N}) where {F,N} =
+    @allocated f(args...)
+_authored_scan_output_buffer(xs, n) = similar(xs, eltype(xs), n)
 _authored_scan_mixed(x) = Base.inferencebarrier(x > 2 ? 1.5 : 1)
+
+@testset "authored scan composes with a lazy empty branch" begin
+    mat = [1.0 0.2 0.1; 2.0 0.3 0.4; 3.0 0.5 0.6]
+    positions = collect(1:3)
+    expected = [1.0, 3.0, 7.0]
+    weights = prepare(authored_scan_lazy_branch; want = :weights)
+    total = prepare(authored_scan_lazy_branch; want = :total)
+    @test prepared_authored_scan_nonempty(mat, positions) == expected
+    @test weights(mat, positions, 3) == expected
+    @test total(mat, positions, 3) == sum(expected)
+
+    empty_mat, empty_positions = zeros(Float64, 0, 1), Int[]
+    @test weights(empty_mat, empty_positions, 0) == Float64[]
+    @test total(empty_mat, empty_positions, 0) == 0.0
+    # The prepared scan itself accepts the empty schedule the live arm passes.
+    @test weights(empty_mat, empty_positions, 1) == Float64[]
+
+    qualified = AuthoredScanFixtures.QualifiedScanBinding.prepared
+    @test qualified([1.0, 2.0, 3.0]) == [1.0, 3.0, 6.0]
+    @test count(r -> r.op isa ReactiveKernels._AuthoredScanOp,
+                qualified.plan.recipes) == 1
+    unbound = AuthoredScanFixtures.BareScanWithoutBinding.prepared
+    @test_throws UndefVarError unbound([1.0, 2.0, 3.0])
+end
 
 @testset "authored scan native step lowering" begin
     q = [0.2, 0.7, -0.3]
@@ -39,7 +68,8 @@ _authored_scan_mixed(x) = Base.inferencebarrier(x > 2 ? 1.5 : 1)
     scalar = prepare(scalar_carry_scan)
     @test scalar([0.5, 1.0, 2.0]) == [0.5, 1.5, 3.5]
     @test scalar([1, 2, 3]) == [1, 3, 6]
-    @test_throws ArgumentError scalar(Float64[])
+    @test scalar(Float64[]) isa Vector{Float64} && isempty(scalar(Float64[]))
+    @test scalar(Int[]) isa Vector{Int} && isempty(scalar(Int[]))
 
     # Only the returned vector should allocate, never per-step boxed carries.
     series = sin.(1:200)
@@ -57,7 +87,7 @@ end
         k(args...)
         _authored_scan_allocated(k, args...)
         @test _authored_scan_allocated(k, args...) == 0
-        @test_throws ArgumentError prepare(authored_scan_arma)(q, Float64[])
+        @test prepare(authored_scan_arma)(q, Float64[]) === 0.0
     end
 
     @kernel scan_broadcast_consumer(xs, weights, offset::Float64) = begin
@@ -91,8 +121,8 @@ end
             next = carry + x
             (next, next)
         end
-        pointwise = plate(xs, Ref(cumulative)) do x, all_values
-            x + sum(all_values)
+        pointwise = plate(xs) do x
+            x + sum(cumulative)
         end
         return sum(pointwise)
     end
@@ -117,9 +147,9 @@ end
     @test _authored_scan_allocated(scalar, xs, 0.5) == 0
 
     @kernel scan_inside_plate(xs::Vector{Float64}, shifts::Vector{Float64}) = begin
-        totals = plate(Ref(xs), shifts) do data, m
-            values = scan(data, Ref(m); init = 0.0) do carry, x, shift
-                next = carry + x + shift
+        totals = plate(shifts) do m
+            values = scan(xs; init = 0.0) do carry, x
+                next = carry + x + m
                 (next, next)
             end
             sum(values)
@@ -205,8 +235,8 @@ end
 
     # Two iterated sequences PLUS a Ref-shared scalar gain.
     @kernel linrec(a::Vector{Float64}, b::Vector{Float64}, g::Float64) = begin
-        s = scan(a, b, Ref(g); init = 0.0) do carry, ai, bi, gain
-            next = gain * (ai * carry + bi)
+        s = scan(a, b; init = 0.0) do carry, ai, bi
+            next = g * (ai * carry + bi)
             (next, next)
         end
         return s
@@ -244,4 +274,450 @@ end
         end
         return s
     end)
+end
+
+@testset "authored scan over an empty sequence" begin
+    q = [0.2, 0.7, -0.3]
+    # The scan port is an empty vector of the step's output type, a fused plate
+    # consumer sums nothing, and every output stays concretely inferred.
+    for (want, expected) in (
+            (:errors, Float64[]), (:total, 0.0),
+            ((:pointwise, :total), (Float64[], 0.0)),
+            ((:errors, :pointwise, :total), (Float64[], Float64[], 0.0)))
+        k = prepare(authored_scan_arma; want)
+        actual = k(q, Float64[])
+        @test actual == expected
+        @test typeof(actual) == typeof(expected)
+        @test only(Base.return_types(k, Tuple{Vector{Float64},Vector{Float64}})) ==
+            typeof(expected)
+    end
+    @test prepare(authored_scan_arma; bound = (; series = Float64[]))(q) === 0.0
+    @test prepare(authored_scan_lockstep; want = (:seq, :total))(
+        Float64[], Float64[]) == (Float64[], 0.0)
+    @test_throws DimensionMismatch prepare(authored_scan_lockstep)(Float64[], [1.0])
+
+    # A NamedTuple carry holding a vector, iterating matrix rows.
+    empty_weights = prepared_authored_scan_nonempty(zeros(Float64, 0, 1), Int[])
+    @test empty_weights isa Vector{Float64} && isempty(empty_weights)
+    @test only(Base.return_types(prepared_authored_scan_nonempty,
+                                 Tuple{Matrix{Float64},Vector{Int}})) == Vector{Float64}
+
+    # Position batching runs the scan through its operation, not the inlined loop.
+    @kernel positioned_scan(xs::Vector{Float64}, position::Float64) = begin
+        values = scan(xs; init = 0.0) do carry, x
+            next = carry + position * x
+            (next, next)
+        end
+        total::Float64 = sum(values)
+        return total
+    end
+    batch = vectorize(positioned_scan; batched = :position, want = :total)
+    @test batch(Float64[], [1.0, 2.0]) == [0.0, 0.0]
+    @test batch([1.0, 2.0], [1.0, 2.0]) == [4.0, 8.0]
+end
+
+# The PD-turnover recurrence written inline in its graph over the two sequences
+# it consumes: an empty schedule yields the init-only trajectory without a lazy
+# arm, and the lockstep form matches the packed `eachrow(hcat(...))` spelling.
+@kernel authored_scan_turnover(pd, conc_mid::Vector{Float64}, dts::Vector{Float64}) = begin
+    kin = pd.baseline * pd.kout
+    updated = scan(conc_mid, dts;
+            init = pd.baseline) do previous, concentration, dt
+        c2 = pd.kout * (1 + concentration /
+            (pd.theta1 * concentration + pd.theta2))
+        steady = kin / c2
+        next = (previous - steady) * exp(-c2 * dt) + steady
+        (next, next)
+    end
+    trajectory = vcat([pd.baseline], updated)
+    return trajectory
+end
+
+@kernel authored_scan_turnover_packed(pd, conc_mid::Vector{Float64}, dts::Vector{Float64}) = begin
+    kin = pd.baseline * pd.kout
+    steps = hcat(conc_mid, dts)
+    updated = scan(eachrow(steps);
+            init = pd.baseline) do previous, row
+        concentration = row[1]
+        dt = row[2]
+        c2 = pd.kout * (1 + concentration /
+            (pd.theta1 * concentration + pd.theta2))
+        steady = kin / c2
+        next = (previous - steady) * exp(-c2 * dt) + steady
+        (next, next)
+    end
+    trajectory = vcat([pd.baseline], updated)
+    return trajectory
+end
+
+@testset "a lockstep scan recurrence lives inline in its graph" begin
+    pd = (; baseline = 100.0, kout = 0.3, theta1 = 1.2, theta2 = 40.0)
+    lockstep = prepare(authored_scan_turnover)
+    packed = prepare(authored_scan_turnover_packed)
+    @test lockstep(pd, Float64[], Float64[]) == [pd.baseline]
+    @test packed(pd, Float64[], Float64[]) == [pd.baseline]
+    conc, dts = abs.(sin.(1:40)) .* 50, fill(0.1, 40)
+    @test lockstep(pd, conc, dts) == packed(pd, conc, dts)
+    @test only(Base.return_types(lockstep,
+        Tuple{typeof(pd),Vector{Float64},Vector{Float64}})) == Vector{Float64}
+    # The lockstep form does not build the packed matrix.
+    lockstep(pd, conc, dts); packed(pd, conc, dts)
+    @test _authored_scan_allocated(lockstep, pd, conc, dts) <
+        _authored_scan_allocated(packed, pd, conc, dts)
+end
+
+# The same trajectory with the initial value inside the scan: one n + 1 buffer,
+# `[pd.baseline, R₁, …, Rₙ]`, instead of the per-step vector plus a `vcat` copy.
+@kernel authored_scan_turnover_init(pd, conc_mid::Vector{Float64}, dts::Vector{Float64}) = begin
+    kin = pd.baseline * pd.kout
+    trajectory = scan(conc_mid, dts;
+            init = pd.baseline, include_init = true) do previous, concentration, dt
+        c2 = pd.kout * (1 + concentration /
+            (pd.theta1 * concentration + pd.theta2))
+        steady = kin / c2
+        next = (previous - steady) * exp(-c2 * dt) + steady
+        (next, next)
+    end
+    return trajectory
+end
+
+@testset "an init-including scan writes [init, outputs...] into one buffer" begin
+    pd = (; baseline = 100.0, kout = 0.3, theta1 = 1.2, theta2 = 40.0)
+    included = prepare(authored_scan_turnover_init)
+    concatenated = prepare(authored_scan_turnover)
+    for n in (0, 1, 2, 40)
+        conc, dts = abs.(sin.(1:n)) .* 50, fill(0.1, n)
+        @test included(pd, conc, dts) == concatenated(pd, conc, dts)
+        @test length(included(pd, conc, dts)) == n + 1
+        bound = prepare(authored_scan_turnover_init; bound = (; conc_mid = conc, dts))
+        @test bound(pd) == concatenated(pd, conc, dts)
+    end
+    @test included(pd, Float64[], Float64[]) == [pd.baseline]
+    @test only(Base.return_types(included,
+        Tuple{typeof(pd),Vector{Float64},Vector{Float64}})) == Vector{Float64}
+    # Compare each scan with a plain buffer of the SAME length. Allocator
+    # rounding can make n + 1 elements cost more than n elements plus 64 bytes
+    # (Windows/Julia 1.13 at n = 400), without an extra allocation in the scan.
+    # The vcat control should use substantially more memory than the included
+    # scan, but its fixed overhead need not equal two separate `similar` calls.
+    per_step = prepare(authored_scan_turnover; want = :updated)
+    for n in (400, 401, 4096)
+        conc, dts = abs.(sin.(1:n)) .* 50, fill(0.1, n)
+        included(pd, conc, dts); concatenated(pd, conc, dts); per_step(pd, conc, dts)
+        _authored_scan_allocated_function(_authored_scan_output_buffer, conc, n)
+        _authored_scan_allocated_function(_authored_scan_output_buffer, conc, n + 1)
+        step_buffer = _authored_scan_allocated_function(
+            _authored_scan_output_buffer, conc, n)
+        trajectory_buffer = _authored_scan_allocated_function(
+            _authored_scan_output_buffer, conc, n + 1)
+        included_bytes = _authored_scan_allocated(included, pd, conc, dts)
+        concatenated_bytes = _authored_scan_allocated(concatenated, pd, conc, dts)
+        @test _authored_scan_allocated(per_step, pd, conc, dts) <= step_buffer + 64
+        @test included_bytes <= trajectory_buffer + 64
+        @test concatenated_bytes >= included_bytes + step_buffer ÷ 2
+    end
+
+    # The element type is the seed's and the outputs' promotion, as the vcat's.
+    @kernel int_seed_scan(xs) = begin
+        cumulative = scan(xs; init = 0, include_init = true) do carry, x
+            next = carry + x
+            (next, next)
+        end
+        return cumulative
+    end
+    seeded = prepare(int_seed_scan)
+    @test seeded([0.5, 1.0]) == [0.0, 0.5, 1.5]
+    @test seeded([0.5, 1.0]) isa Vector{Float64}
+    @test seeded([1, 2]) == [0, 1, 3] && seeded([1, 2]) isa Vector{Int}
+    @test seeded(Float64[]) == [0.0] && seeded(Float64[]) isa Vector{Float64}
+    @test seeded(Int[]) == [0] && seeded(Int[]) isa Vector{Int}
+
+    # `include_init = false` is the default per-step form.
+    @kernel explicit_default_scan(xs) = begin
+        cumulative = scan(xs; init = 0.0, include_init = false) do carry, x
+            next = carry + x
+            (next, next)
+        end
+        return cumulative
+    end
+    @test prepare(explicit_default_scan)([1.0, 2.0]) == [1.0, 3.0]
+
+    # A reducing plate over the trajectory sees the seed too (no streaming fusion).
+    @kernel included_scan_consumer(xs, offset::Float64) = begin
+        cumulative = scan(xs; init = 1.0, include_init = true) do carry, x
+            next = carry + x
+            (next, next)
+        end
+        pointwise = plate(cumulative, offset) do x, o
+            x + o
+        end
+        return sum(pointwise)
+    end
+    @test prepare(included_scan_consumer)([1.0, 2.0], 0.5) == sum([1.0, 2.0, 4.0] .+ 0.5)
+    @test prepare(included_scan_consumer)(Float64[], 0.5) == 1.5
+
+    # Position batching runs the scan operation rather than the inlined loop.
+    @kernel positioned_included_scan(xs::Vector{Float64}, position::Float64) = begin
+        values = scan(xs; init = position, include_init = true) do carry, x
+            next = carry + position * x
+            (next, next)
+        end
+        total::Float64 = sum(values)
+        return total
+    end
+    batch = vectorize(positioned_included_scan; batched = :position, want = :total)
+    @test batch(Float64[], [1.0, 2.0]) == [1.0, 2.0]
+    @test batch([1.0, 2.0], [1.0, 2.0]) == [1.0 + 2.0 + 4.0, 2.0 + 4.0 + 8.0]
+
+    @test_throws "must be the literal `true` or `false`" (@eval @kernel nonliteral_scan(
+            xs, flag) = begin
+        s = scan(xs; init = 0.0, include_init = flag) do carry, x
+            (carry + x, carry + x)
+        end
+        return s
+    end)
+    @test_throws "accepts only the `init =`, `include_init =` and `history =` keywords" (
+        @eval @kernel unknown_keyword_scan(xs) = begin
+        s = scan(xs; init = 0.0, reverse = true) do carry, x
+            (carry + x, carry + x)
+        end
+        return s
+    end)
+end
+@testset "a history scan reads its own earlier outputs" begin
+    F = AuthoredScanFixtures
+    amounts = [2.0, 0.0, 1.5, 3.0, 1.0]
+    plan = F.HistoryLattice([0, 2, 3, 7, 12])     # later lags run past `units`
+    units = [exp(-0.3 * (l - 1)) for l in 1:10]
+    expected = F._authored_scan_history_reference(amounts, plan, units)
+    weights = prepare(F.authored_scan_history)
+    # The generator sum folds in the hand loop's order, so the values are bitwise.
+    @test weights(amounts, plan, units) == expected
+    @test prepare(F.authored_scan_history; want = :total)(amounts, plan, units) ==
+        sum(expected)
+    @test only(Base.return_types(weights,
+        Tuple{Vector{Float64},F.HistoryLattice,Vector{Float64}})) == Vector{Float64}
+    # The step reads the result vector itself: nothing is allocated beside it.
+    _authored_scan_allocated(weights, amounts, plan, units)
+    _authored_scan_allocated(similar, amounts)
+    @test _authored_scan_allocated(weights, amounts, plan, units) ==
+        _authored_scan_allocated(similar, amounts)
+    # The op called outside a generated body (the host lowering) agrees. Its
+    # shared operands are the step's captures in first-read order (`units`, then
+    # `plan`), before the history fill.
+    recipe = only(r for r in weights.plan.recipes
+                  if r.op isa ReactiveKernels._AuthoredScanOp)
+    @test recipe.op(0, amounts, eachindex(amounts), units, plan, 0.0) == expected
+
+    # No step runs on an empty sequence: an empty vector of the history's type.
+    empty = weights(Float64[], F.HistoryLattice(Int[]), units)
+    @test empty == Float64[] && empty isa Vector{Float64}
+    @test prepare(F.authored_scan_history; want = :total)(
+        Float64[], F.HistoryLattice(Int[]), units) === 0.0
+
+    # Entries at and after the current step read the history value.
+    xs = [1.0, 2.0, 3.0]
+    buffer = fill(-1.0, 3)
+    for j in eachindex(xs)
+        buffer[j] = xs[j] + sum(buffer)
+    end
+    @test prepare(F.authored_scan_history_ahead)(xs) == buffer
+
+    # A position batch runs the history scan at every position.
+    U = [exp(-0.3 * (l - 1)) * s for l in 1:10, s in (1.0, 0.5, 2.0)]
+    batch = vectorize(F.authored_scan_history; batched = :units, want = :weights)
+    @test batch(amounts, plan, U) == reduce(hcat,
+        [F._authored_scan_history_reference(amounts, plan, U[:, s]) for s in 1:3])
+end
+
+@testset "nested generator folds run natively as loops" begin
+    F = AuthoredScanFixtures
+    W = [sin(a + 2b) / (a + b) for a in 1:4, b in 1:4]
+    k = (; W)
+    # The `@traceable` nest infers its element type and allocates nothing, with
+    # Base's value (on Julia 1.10 the unrewritten nest infers `Any` and boxes).
+    @test only(Base.return_types(F._scan_surface, Tuple{typeof(k),Float64,Float64})) ==
+        Float64
+    _authored_scan_allocated_function(F._scan_surface, k, 0.3, 0.8)
+    @test _authored_scan_allocated_function(F._scan_surface, k, 0.3, 0.8) == 0
+    @test F._scan_surface(k, 0.3, 0.8) === F._scan_surface_base(k, 0.3, 0.8)
+
+    # A history scan whose step calls it allocates its result vector only.
+    amounts = [2.0, 0.0, 1.5, 3.0, 1.0, 0.5, 2.5]
+    plan = F.HistoryLattice([0, 2, 3, 7, 12, 13, 18])
+    units = [exp(-0.3 * (l - 1)) for l in 1:10]
+    weights = prepare(F.authored_scan_history_surface)
+    @test weights(amounts, plan, units, k) ==
+        F._authored_scan_history_surface_reference(amounts, plan, units, k)
+    _authored_scan_allocated(weights, amounts, plan, units, k)
+    @test _authored_scan_allocated(weights, amounts, plan, units, k) ==
+        _authored_scan_allocated(similar, amounts)
+
+    # The nest written inline in a scan step and in a plate cell.
+    xs = collect(range(0.1, 1.4; length = 14))
+    expected = [F._scan_surface_base(k, x, x + 0.5) for x in xs]
+    for spec in (F.authored_scan_nested_inline, F.authored_plate_nested_inline)
+        values = prepare(spec)
+        @test values(xs, k) == expected
+        _authored_scan_allocated(values, xs, k)
+        @test _authored_scan_allocated(values, xs, k) == _authored_scan_allocated(similar, xs)
+    end
+
+    # Base's value and type: a filter, an empty range, an `Int` seed.
+    @test F._fold_filtered([1.5, -2.0, 0.25], 3) === 1.75
+    @test F._fold_filtered([1.5, -2.0, 0.25], 0) === 0
+    # Kept as written: a term that assigns, a fold over a tuple, another `sum`.
+    @test F._fold_assigning([1.0, 2.0]) === 5.0
+    @test F._fold_tuple((1, 2.5)) === 3.5
+    @test F.OwnSum.total([1.0, 2.0]) === -1.0
+
+    # A range head resolved to its binding, as `@rkppl` lowering emits `1:n`
+    # (`GlobalRef(<model module>, :(:))`), is the same iterator; a resolved
+    # head bound to another function keeps Base's `sum`.
+    folds(head) = :(sum((x[i] for i = $head(1, n)); init = 0.0))
+    generator(ex) = ex isa Expr && (ex.head === :generator || any(generator, ex.args))
+    native(ex) = ReactiveKernels._kernel_native_body(ex, F, Set{Symbol}())
+    @test generator(folds(GlobalRef(F, :(:))))
+    @test !generator(native(folds(GlobalRef(F, :(:)))))
+    @test !generator(native(folds(:(:))))
+    @test generator(native(folds(GlobalRef(F, :_fold_steps))))
+end
+
+@testset "history scan contract" begin
+    escape = @kernel escape_history(xs::Vector{Float64}) = begin
+        ys = scan(xs; init = 0.0, history = 0.0) do carry, x, earlier
+            (earlier, x)
+        end
+        return ys
+    end
+    # The native history aliases the vector the scan is still writing.
+    @test_throws ArgumentError prepare(escape)([1.0, 2.0])
+    @test_throws CanonicalIndexError (ReactiveKernels._ScanHistory([1.0])[1] = 2.0)
+    # A vector `history =` gives the leading entries: the result is
+    # `[leading; outputs]`, and the step reads that whole vector, with entries
+    # not written yet at zero.
+    leading = @kernel leading_history(xs::Vector{Float64}) = begin
+        ys = scan(xs; init = 0.0, history = [1.0, 2.0]) do carry, x, earlier
+            (carry, x + sum(earlier))
+        end
+        return ys
+    end
+    @test prepare(leading)([0.5, 1.0]) == [1.0, 2.0, 3.5, 7.5]
+    @test prepare(leading)(Float64[]) == [1.0, 2.0]
+    # refused: a history value is a number or a vector of leading entries
+    # (its type fixes the result's element type)
+    nonnumber = @kernel nonnumber_history(xs::Vector{Float64}) = begin
+        ys = scan(xs; init = 0.0, history = "zero") do carry, x, earlier
+            (carry, x)
+        end
+        return ys
+    end
+    @test_throws ArgumentError prepare(nonnumber)([1.0])
+    # Outputs are stored as the history value's type.
+    converted = @kernel converted_history(xs::Vector{Float64}) = begin
+        ys = scan(xs; init = 0, history = 0.0) do carry, x, earlier
+            (carry + 1, carry + 1)
+        end
+        return ys
+    end
+    @test prepare(converted)([5.0, 6.0]) == [1.0, 2.0]
+    @test prepare(converted)([5.0, 6.0]) isa Vector{Float64}
+
+    # The history is the do-block's last argument, after the shared operands.
+    @test_throws ArgumentError macroexpand(@__MODULE__, quote
+        @kernel missing_history(xs::Vector{Float64}) = begin
+            ys = scan(xs; init = 0.0, history = 0.0) do carry, x
+                (carry, x)
+            end
+            return ys
+        end
+    end)
+    @test_throws ArgumentError macroexpand(@__MODULE__, quote
+        @kernel twice_history(xs::Vector{Float64}) = begin
+            ys = scan(xs; init = 0.0, history = 0.0, history = 1.0) do carry, x, earlier
+                (carry, x)
+            end
+            return ys
+        end
+    end)
+    @test_throws ArgumentError macroexpand(@__MODULE__, quote
+        @kernel history_with_init(xs::Vector{Float64}) = begin
+            ys = scan(xs; init = 0.0, include_init = true, history = 0.0) do carry, x, earlier
+                (carry, x)
+            end
+            return ys
+        end
+    end)
+    @test_throws ArgumentError macroexpand(@__MODULE__, quote
+        @kernel unknown_keyword(xs::Vector{Float64}) = begin
+            ys = scan(xs; init = 0.0, buffer = 0.0) do carry, x, earlier
+                (carry, x)
+            end
+            return ys
+        end
+    end)
+end
+
+@testset "a scan shares host structs by Ref" begin
+    F = AuthoredScanFixtures
+    xs = [1.0, 2.0, 3.0]
+    plan, cfg = F.HistoryLattice([1, 5, 9]), (; W = [2.0 0.0; 0.0 3.0], m = 2)
+    expected = cumsum([xs[j] * plan.shifts[j] + 5.0 * xs[j] for j in eachindex(xs)])
+    @test prepare(F.authored_scan_host_shared)(xs, plan, cfg) == expected
+end
+
+# A module global that a kernel-local below shadows: the step must read the
+# kernel-local, as a Julia closure would, never this binding.
+const _scan_captured_shadowed = [100.0]
+
+@testset "a scan step captures enclosing names whole, as a closure does" begin
+    # An enclosing name the step reads without passing it enters whole as one
+    # more shared (atomic) operand, like an explicit `Ref(name)` (snag
+    # rk-plate-body-ca-091ef037). Only the explicit non-`Ref` positionals are
+    # iterated.
+    @kernel _scan_captured_ports(xs, w, v) = begin
+        out = scan(xs; init = 0.0) do carry, x
+            next = carry + x * w + v[1] + length(v)
+            (next, next)
+        end
+        return out
+    end
+    @kernel _scan_captured_derived(xs, a) = begin
+        _scan_captured_shadowed = a .* 2.0
+        out = scan(xs; init = 0.0) do carry, x
+            next = carry + x * _scan_captured_shadowed[1] + a[2]
+            (next, next)
+        end
+        return out
+    end
+    @kernel _scan_captured_history(xs, w) = begin
+        out = scan(xs; init = 0.0, history = 0.0) do carry, x, h
+            next = carry + x * w
+            (next, next)
+        end
+        return out
+    end
+    @kernel _scan_captured_in_plate(groups, w) = begin
+        totals = plate(groups) do g
+            trajectory = scan(g; init = 0.0) do carry, x
+                next = carry + x * w[1]
+                (next, next)
+            end
+            sum(trajectory)
+        end
+        return totals
+    end
+
+    xs = [1.0, 2.0, 3.0]
+    @test prepare(_scan_captured_ports)(xs, 2.0, [0.5, 9.0]) ==
+          cumsum(xs .* 2.0 .+ 0.5 .+ 2)
+    scans = [r.op for r in plan(_scan_captured_ports).recipes
+             if r.op isa ReactiveKernels._AuthoredScanOp]
+    # Arguments: the carry seed, `xs`, then the captures `w` and `v`.
+    @test typeof(only(scans)).parameters[2] == (1, 3, 4)
+    @test prepare(_scan_captured_derived)(xs, [1.0, 1.0]) ==
+          cumsum(xs .* 2.0 .+ 1.0)
+    @test prepare(_scan_captured_history)(xs, 2.0) == cumsum(xs .* 2.0)
+    @test prepare(_scan_captured_in_plate)([[1.0, 2.0], [2.0]], [2.0, 9.0]) ==
+          [sum(cumsum([1.0, 2.0] .* 2.0)), sum(cumsum([2.0] .* 2.0))]
 end

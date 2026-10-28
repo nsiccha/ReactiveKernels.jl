@@ -1,3 +1,5 @@
+include("evidence.jl")
+
 # Program generator: StructuralPlan → self-contained `@kernel` program.
 #
 # Emission order per program: layout transforms (unconstrained →
@@ -10,177 +12,2851 @@
 # nothing for data-only recipes. Plates compile to allocation-free loops
 # with shared work hoisted; constraining stays hand-rolled (no bijectors).
 # The `@kernel` def is evaluated in the dedicated `PPLGeneratedModels` scope
-# (counter-suffixed binding per build).
+# without binding a name there.
+
 
 """
-    build_kernel(plan) -> (; spec, layout)
+    build_kernel(plan) -> (; spec, layout, program)
 
 Validate, assign layout, emit, and evaluate a self-contained `@kernel`
 program for `plan`. `spec` is the `KernelSpec` (callable after `prepare`
 with `have=(:unconstrained, data…)`); `layout` is its
-[`LayoutTable`](@ref) (R10 read API for the sampler side).
+[`LayoutTable`](@ref) (R10 read API for the sampler side). `program` is the
+generated program the graph evaluates: [`prepare_query`](@ref) accepts any
+bound plan that generates the same program, with other row counts and data
+values or an equivalent lowering in another gensym-created isolation module,
+and refuses one that generates another.
+
+Concurrency: `build_kernel` is concurrency-safe. Independent plans may be
+built from concurrent tasks with no caller-side synchronization: a build
+binds nothing in a shared module and takes no package lock. Construction
+compiles little per-model code, so concurrent builds largely run in
+parallel; Julia serializes only the compilation that remains (1.10: all
+compilation; 1.12 and 1.13: type inference).
+
+The returned spec closes over build-time
+eval'd code. Construction resolves module bindings in a package-owned
+latest-world scope, including just-evaluated kernels; subsequent execution
+uses its own boundary: `prepare` it and call it through [`prepare_query`](@ref) /
+[`prepare_sampler`](@ref) (which carry the `Base.invokelatest` world-age
+barrier) or wrap those calls in `Base.invokelatest` yourself.
 """
-function build_kernel(plan::StructuralPlan)
+build_kernel(plan::StructuralPlan) = Base.invokelatest(_build_kernel_latest, plan)
+
+function _build_kernel_latest(plan::StructuralPlan)
     validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] build_kernel requires a bound plan (bind_data first)"))
     layout = assign_layout(plan)
     def = kernel_expr(plan, layout)
     spec = _eval_kernel_def(def)
-    return (; spec, layout)
+    return (; spec, layout, program = _program_identity(def))
 end
 
 """
     kernel_expr(plan, layout; name=:ppl_model) -> Expr
 
 The `@kernel` definition expression (`Expr(:(=), signature, body)`).
-Pure (no eval): the generator tests inspect and evaluate it.
+Pure (no eval): the generator tests inspect and evaluate it. `plan` may also
+be a binding with nothing left to observe (`model(; x)`), read as
+`bind_data(binding)`, exactly as [`build_kernel`](@ref) reads it.
 """
 function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model)
+    def = Base.invokelatest(_kernel_expr_latest, plan, layout; name)
+    def = _elide_named_location_aliases(plan, def)
+    def = _pointwise_arithmetic_plates(plan, def)
+    return _name_plate_cells(def, _location_value_aliases(plan, def))
+end
+
+function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model)
     validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] kernel_expr requires a bound plan (bind_data first)"))
     stmts = Expr[]
+    # Level gathers (`z[g]` over a `levels(h)` axis) read level-code
+    # vectors; collect them from every expression before emitting.
+    gathers = Set{Tuple{Symbol,Symbol,Int}}()
+    assigns = _assignment_statements(plan; layout, gathers)
+    free = _density_selection(plan, n -> n ∉ plan.conditioned)
+    priors = _prior_statements(free, layout; gathers, context = plan)
+    transforms = Expr[]
     for e in layout.entries
-        append!(stmts, transform_statements(e))
+        append!(transforms, transform_statements(e))
     end
-    append!(stmts, _assignment_statements(plan))
-    append!(stmts, preprocessing_recipes(plan))
-    append!(stmts, _predictor_statements(plan))
-    append!(stmts, _likelihood_statements(plan))
-    append!(stmts, _prior_statements(plan))
-    push!(stmts, _log_jacobian_statement(layout))
+    coefs = _coef_reassembly_statements(plan, layout)
+    conditioned = _conditioned_value_statements(plan)
+    values = Expr[assigns..., preprocessing_recipes(plan)...,
+        _scan_reconstruction_statements(plan, layout)...,
+        _affine_coefficient_statements(plan, layout)...,
+        _predictor_statements(plan)...]
+    likelihoods = _likelihood_statements(plan, layout; gathers,
+        upstream = Expr[transforms..., coefs..., conditioned..., values...])
+    append!(stmts, transforms)
+    append!(stmts, coefs)
+    append!(stmts, conditioned)
+    append!(stmts, _array_level_index_statements(plan, gathers))
+    append!(stmts, values)
+    args = Expr[:(unconstrained::AbstractVector{Float64});
+        [_data_arg(colname, col) for (colname, col) in _ordered_columns(plan)]]
+    append!(stmts, _named_value_statements(plan,
+        Expr[args..., transforms..., coefs..., conditioned..., values...]))
+    append!(stmts, likelihoods)
+    append!(stmts, priors)
+    append!(stmts, _log_jacobian_statements(plan, layout))
     push!(stmts, :(posterior::Float64 = prior + likelihood + log_jacobian))
     push!(stmts, :(return posterior))
-    sig = Expr(:call, name, :(unconstrained::Vector{Float64}),
-        (_data_arg(colname, col) for (colname, col) in _ordered_columns(plan))...)
+    sig = Expr(:call, name, args...)
     return Expr(:(=), sig, Expr(:block, stmts...))
+end
+
+# An authored alias the lowering absorbed into the value it names keeps its
+# name (`plan.named_values`): a bare alias of that node. With the node's
+# declared type, RK collapses the alias onto it, so it adds no recipe and no
+# work. `defined` holds the kernel arguments and the statements the aliases
+# may read.
+function _named_value_statements(plan::StructuralPlan, defined::Vector{Expr})
+    isempty(plan.named_values) && return Expr[]
+    types = Dict{Symbol,Any}()
+    for ex in defined
+        lhs = Meta.isexpr(ex, :(=), 2) ? ex.args[1] : ex
+        Meta.isexpr(lhs, :(::), 2) ? (types[lhs.args[1]] = lhs.args[2]) :
+            lhs isa Symbol && (types[lhs] = nothing)
+    end
+    out = Expr[]
+    for (name, node) in plan.named_values
+        haskey(types, name) && throw(ContractValidationError(
+            "[generator] authored name $name is already a graph value"))
+        haskey(types, node) || throw(ContractValidationError(
+            "[generator] authored name $name reads $node, which no statement defines"))
+        T = types[node]
+        push!(out, T === nothing ? :($name = $node) : :($name::$T = $node))
+        types[name] = T
+    end
+    return out
+end
+
+# A generated definition with its private names (`gensym`s, which differ
+# between lowerings) renamed in order of first appearance. References owned
+# by a gensym-created lowering module get the same treatment: the module is an
+# isolation namespace, not part of the emitted program. That holds for such a
+# module held as a value or inside quoted data too: a caller-owned law's
+# authored argument expressions are rebuilt as data, so a function of the
+# model module they call is a quoted `GlobalRef` (cell latents) or a
+# `GlobalRef(module, name)` call (model-level latents). Other names in quoted
+# data are data and keep their spelling. Stable named modules remain part of
+# the identity. Compare the results with `_same_program`: Julia's Expr
+# equality need not compare embedded array literals by value.
+function _program_identity(def)
+    names = Dict{Symbol,Symbol}()
+    modules = IdDict{Module,Symbol}()
+    generated(m::Module) =
+        get!(() -> Symbol("_rkppl_generated_module_", length(modules) + 1), modules, m)
+    owner(x::Module) = Base.isgensym(nameof(x)) ? generated(x) : x
+    owner(x::GlobalRef) = Base.isgensym(nameof(x.mod)) ?
+        Expr(:., generated(x.mod), QuoteNode(x.name)) : x
+    quoted(x::Union{Module,GlobalRef}) = owner(x)
+    quoted(x::QuoteNode) = QuoteNode(quoted(x.value))
+    quoted(x::Expr) = Expr(x.head, Any[quoted(a) for a in x.args]...)
+    quoted(x) = x
+    rename(x::Symbol) = Base.isgensym(x) ?
+        get!(() -> Symbol("##", length(names) + 1), names, x) : x
+    rename(x::Union{Module,GlobalRef}) = owner(x)
+    rename(x::QuoteNode) = QuoteNode(quoted(x.value))
+    rename(x::Expr) = Expr(x.head, Any[rename(a) for a in x.args]...)
+    rename(x) = x
+    return rename(def)
+end
+
+# Missing-observation guards contain freshly allocated quoted Bool arrays.
+# On Julia 1.13, Expr/QuoteNode equality compares such literals by object
+# identity. Their type, shape and contents determine this read-only program;
+# allocation identity does not. Types still matter for dispatch, and symbols
+# inside quoted data are not private bindings to rename.
+_same_program(x, y) = typeof(x) === typeof(y) && isequal(x, y)
+_same_program(x::QuoteNode, y::QuoteNode) = _same_program(x.value, y.value)
+_same_program(x::Expr, y::Expr) = x.head === y.head &&
+    length(x.args) == length(y.args) && all(_same_program(a, b) for (a, b) in zip(x.args, y.args))
+_same_program(x::Array, y::Array) = typeof(x) === typeof(y) &&
+    axes(x) == axes(y) && all(_same_program(a, b) for (a, b) in zip(x, y))
+
+# The source surface admits ordinary dotted scalar math, but an opaque array
+# assignment hides each producer from RK's plate-to-plate reduction fusion.
+# OutputSignatures proves the ordinary scalar/vector operations and broadcast
+# axes; PPL separately tracks sampled-value dependence. Every operand is read
+# once. Other ranks, axes and callable leaves keep their authored expression.
+const _POINTWISE_ARITHMETIC = Dict(Symbol(".+") => :+, Symbol(".-") => :-,
+    Symbol(".*") => :*, Symbol("./") => :/, Symbol(".^") => :^)
+
+struct _PointwiseValue
+    info::ReactiveKernels.OutputSignatures.ValueInfo
+    live::Bool                        # reads a sampled value
+end
+const _OS = ReactiveKernels.OutputSignatures
+const _POINTWISE_UNKNOWN = _PointwiseValue(_OS.ValueInfo(), false)
+
+_pointwise_live(ex, values) = ex isa Symbol ?
+    get(values, ex, _POINTWISE_UNKNOWN).live :
+    ex isa Expr && any(a -> _pointwise_live(a, values), ex.args)
+_pointwise_unknown(ex, values) = _PointwiseValue(_OS.ValueInfo(), _pointwise_live(ex, values))
+
+_pointwise_vector(state::_PointwiseValue) = _OS.value_rank(state.info) === 1
+function _pointwise_known(state::_PointwiseValue)
+    _OS.value_rank(state.info) === 0 && return true
+    _pointwise_vector(state) || return false
+    ax = _OS.value_axes(state.info)
+    return ax !== nothing && only(ax) isa Base.OneTo
+end
+
+function _pointwise_call(ex, states, bound_names)
+    info = ReactiveKernels._call_value_info(ex,
+        _OS.ValueInfo[s.info for s in states], @__MODULE__, bound_names)
+    return _PointwiseValue(info, any(s.live for s in states))
+end
+
+function _pointwise_leaf(ex, values::Dict{Symbol,_PointwiseValue})
+    ex isa Symbol && return get(values, ex, _POINTWISE_UNKNOWN)
+    ex isa Number && return _PointwiseValue(_OS.known_info(ex), false)
+    if Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol &&
+            ex.args[2] isa Integer
+        base = get(values, ex.args[1], _POINTWISE_UNKNOWN)
+        return _pointwise_call(ex,
+            [base, _PointwiseValue(_OS.known_info(ex.args[2]), false)], keys(values))
+    end
+    return _pointwise_unknown(ex, values)
+end
+
+# A concatenated numeric value may subsequently be gathered by observation
+# indices. Its length is structural metadata for the pointwise pass; the
+# concatenation itself remains the authored Julia call and runs once.
+function _pointwise_concat_part(ex, values, bound_names)
+    state = _pointwise_leaf(ex, values)
+    _pointwise_known(state) && return state
+    Meta.isexpr(ex, :call) && !isempty(ex.args) || return state
+    fn = ex.args[1]
+    if fn === :sum && :sum ∉ bound_names && length(ex.args) == 2
+        part = _pointwise_concat_part(ex.args[2], values, bound_names)
+        return _pointwise_call(ex, [part], bound_names)
+    elseif fn in (:+, :-) && length(ex.args) == 2
+        part = _pointwise_concat_part(ex.args[2], values, bound_names)
+        return _pointwise_call(ex, [part], bound_names)
+    end
+    return _pointwise_unknown(ex, values)
+end
+
+function _pointwise_concat_state(rhs, values, bound_names)
+    Meta.isexpr(rhs, :call) && length(rhs.args) >= 2 || return _POINTWISE_UNKNOWN
+    fn = rhs.args[1]
+    is_base_vcat = fn isa GlobalRef && isdefined(fn.mod, fn.name) &&
+        getglobal(fn.mod, fn.name) === Base.vcat
+    is_base_vcat || return _POINTWISE_UNKNOWN
+    parts = [_pointwise_concat_part(a, values, bound_names) for a in rhs.args[2:end]]
+    return _pointwise_call(rhs, parts, bound_names)
+end
+
+function _pointwise_tree!(inputs, formals, ex, values, columns, gathers, bound_names)
+    if ex isa Symbol && haskey(gathers, ex)
+        return _pointwise_tree!(inputs, formals, gathers[ex], values, columns, gathers, bound_names)
+    end
+    if Meta.isexpr(ex, :., 2) && ex.args[1] === :exp &&
+            Meta.isexpr(ex.args[2], :tuple, 1)
+        term, state = _pointwise_tree!(inputs, formals, only(ex.args[2].args),
+            values, columns, gathers, bound_names)
+        result = _pointwise_call(ex, [state], bound_names)
+        _pointwise_known(result) || return nothing, result
+        return Expr(:call, :exp, term), result
+    end
+    if Meta.isexpr(ex, :call) && !isempty(ex.args) &&
+            haskey(_POINTWISE_ARITHMETIC, ex.args[1]) &&
+            length(ex.args) in (2, 3)
+        terms = Any[]
+        states = _PointwiseValue[]
+        for a in ex.args[2:end]
+            term, state = _pointwise_tree!(inputs, formals, a, values, columns, gathers, bound_names)
+            _pointwise_known(state) || return nothing, state
+            push!(terms, term)
+            push!(states, state)
+        end
+        result = _pointwise_call(ex, states, bound_names)
+        _pointwise_known(result) || return nothing, result
+        return Expr(:call, _POINTWISE_ARITHMETIC[ex.args[1]], terms...),
+            result
+    end
+    leaf, state = if Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol &&
+            ex.args[2] isa Symbol
+        base = get(values, ex.args[1], _POINTWISE_UNKNOWN)
+        idx = get(columns, ex.args[2], nothing)
+        if _pointwise_vector(base) &&
+                idx isa Vector{<:Integer} && !(eltype(idx) <: Bool) &&
+                axes(idx, 1) == Base.OneTo(length(idx))
+            # This arithmetic cell reads scalar entries from the borrowed view.
+            :(ReactiveKernels._readonly_gather($(ex.args...))),
+                _pointwise_call(ex,
+                    [base, _PointwiseValue(_OS.value_info(idx), false)], bound_names)
+        else
+            ex, _pointwise_unknown(ex, values)
+        end
+    else
+        ex, _pointwise_leaf(ex, values)
+    end
+    _pointwise_known(state) || return nothing, state
+    leaf isa Number && return leaf, state
+    i = findfirst(x -> isequal(x, leaf), inputs)
+    if i === nothing
+        push!(inputs, leaf)
+        push!(formals, Symbol(:_ppl_c, length(formals) + 1))
+        i = length(inputs)
+    end
+    return formals[i], state
+end
+
+function _pointwise_rhs(ex, values, columns, gathers, bound_names)
+    inputs, formals = Any[], Symbol[]
+    body, state = _pointwise_tree!(inputs, formals, ex, values, columns, gathers, bound_names)
+    # A failed numerical query may have stopped before visiting a live operand.
+    # Dependence follows the whole source expression independently of shape.
+    state = _PointwiseValue(state.info, _pointwise_live(ex, values))
+    _pointwise_vector(state) && state.live && _pointwise_known(state) || return ex, state
+    plate = Expr(:do, Expr(:call, :plate, inputs...),
+        Expr(:->, Expr(:tuple, formals...), Expr(:block, body)))
+    named = _name_plate_cell(plate, (_, input) -> input isa Symbol ? input :
+        Meta.isexpr(input, :ref, 2) ? Symbol(input.args[1], :_, input.args[2]) :
+        :value)
+    return named, state
+end
+
+_pointwise_occurrences(ex, name) = ex === name ? 1 :
+    ex isa Expr ? sum(_pointwise_occurrences(a, name) for a in ex.args; init = 0) : 0
+
+# Whether a use can observe a gather's container representation. Arithmetic
+# consumers have already been recognized and rewritten below. A plate iterates
+# Float64 entries, whereas an opaque call may dispatch on Vector or inspect its
+# parent/type even when it is pure. Aliases and query containers propagate the
+# borrowed representation, so follow their readers as well.
+function _pointwise_container(ex, name)
+    _pointwise_occurrences(ex, name) == 0 && return true
+    ex === name && return true
+    ex isa Expr || return false
+    ex.head in (:kw, :(=)) && return _pointwise_container(ex.args[2], name)
+    return ex.head === :tuple && all(a -> _pointwise_container(a, name), ex.args)
+end
+
+function _pointwise_readonly_use(rhs, name, vector)
+    _pointwise_container(rhs, name) && return :borrow
+    if Meta.isexpr(rhs, :return, 1) && _pointwise_container(rhs.args[1], name)
+        return :value
+    elseif vector && Meta.isexpr(rhs, :ref, 2) && rhs.args[1] === name && rhs.args[2] isa Integer
+        return :value
+    elseif vector && Meta.isexpr(rhs, :do, 2)
+        call, cell = rhs.args
+        Meta.isexpr(call, :call) && call.args[1] === :plate || return :sensitive
+        all(a -> _pointwise_occurrences(a, name) == 0 || a === name,
+            call.args[2:end]) || return :sensitive
+        Meta.isexpr(cell, :->, 2) || return :sensitive
+        args = Meta.isexpr(cell.args[1], :tuple) ? cell.args[1].args : Any[cell.args[1]]
+        name in args || _pointwise_occurrences(cell.args[2], name) == 0 || return :sensitive
+        return :value
+    end
+    return :sensitive
+end
+
+function _pointwise_readonly_uses(stmts, name, seen = Set{Symbol}(); vector = true)
+    name in seen && return true
+    push!(seen, name)
+    for st in stmts
+        rhs = Meta.isexpr(st, :(=), 2) ? st.args[2] : st
+        _pointwise_occurrences(rhs, name) == 0 && continue
+        use = _pointwise_readonly_use(rhs, name, vector)
+        use === :sensitive && return false
+        if use === :borrow && Meta.isexpr(st, :(=), 2)
+            # A concrete container annotation is itself a representation boundary.
+            lhs = st.args[1]
+            lhs isa Symbol || return false
+            # Indexing a tuple that contains the view can expose the array
+            # itself; only direct vector aliases yield scalars when indexed.
+            _pointwise_readonly_uses(stmts, lhs, seen;
+                vector = vector && rhs === name) || return false
+        end
+    end
+    return true
+end
+
+function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
+    stmts = def.args[2].args
+    values = Dict{Symbol,_PointwiseValue}()
+    bound_names = Set{Symbol}(keys(plan.columns))
+    for st in stmts
+        Meta.isexpr(st, :(=), 2) || continue
+        lhs = st.args[1]
+        name = Meta.isexpr(lhs, :(::), 2) ? lhs.args[1] : lhs
+        name isa Symbol && push!(bound_names, name)
+    end
+    gathers = Dict{Symbol,Expr}()
+    gather_stmts = Dict{Symbol,Expr}()
+    for (name, value) in plan.columns
+        values[name] = _PointwiseValue(_OS.value_info(value), false)
+    end
+    for st in stmts
+        Meta.isexpr(st, :(=), 2) || continue
+        lhs, rhs = st.args
+        name = Meta.isexpr(lhs, :(::), 2) ? lhs.args[1] : lhs
+        name isa Symbol || continue
+        declared = Meta.isexpr(lhs, :(::), 2) ? lhs.args[2] : nothing
+        if declared === :Float64
+            values[name] = _PointwiseValue(_OS.scalar_info(Float64), true)
+            continue
+        elseif Meta.isexpr(declared, :curly) &&
+                declared.args == Any[:AbstractVector, :Float64]
+            dims = _value_axes(plan, name; data_axes = true)
+            if dims !== nothing && length(dims) == 1 && only(dims) isa Int
+                values[name] = _PointwiseValue(_OS.vector_info(Float64, only(dims);
+                    container_type = AbstractVector{Float64}), true)
+            else
+                values[name] = _PointwiseValue(_OS.vector_info(Float64;
+                    container_type = AbstractVector{Float64}), true)
+            end
+            continue
+        end
+        if Meta.isexpr(rhs, :ref, 2) &&
+                rhs.args[1] isa Symbol && rhs.args[2] isa Symbol
+            base = get(values, rhs.args[1], _POINTWISE_UNKNOWN)
+            idx = get(plan.columns, rhs.args[2], nothing)
+            state = idx === nothing ? _POINTWISE_UNKNOWN : _pointwise_call(rhs,
+                [base, _PointwiseValue(_OS.value_info(idx), false)], bound_names)
+            if _pointwise_vector(state) && _pointwise_known(state) &&
+                    idx isa Vector{<:Integer} && !(eltype(idx) <: Bool) &&
+                    axes(idx, 1) == Base.OneTo(length(idx))
+                # Recognition is transactional: substitute inside arithmetic
+                # only when the entire consumer lowers to a typed plate.
+                gathers[name] = rhs
+                gather_stmts[name] = st
+                values[name] = state
+                continue
+            end
+        end
+        concat = _pointwise_concat_state(rhs, values, bound_names)
+        if _pointwise_vector(concat) && _pointwise_known(concat)
+            values[name] = concat
+            continue
+        end
+        if Meta.isexpr(rhs, :call) && !isempty(rhs.args) &&
+                haskey(_POINTWISE_ARITHMETIC, rhs.args[1])
+            candidate, state = _pointwise_rhs(rhs, values, plan.columns, gathers, bound_names)
+            values[name] = state
+            st.args[2] = candidate
+        elseif rhs isa Symbol && haskey(values, rhs)
+            values[name] = values[rhs]
+        else
+            # A scalar coordinate remains a shared plate input. Its ordinary
+            # indexed read retains the original bounds check.
+            state = _pointwise_concat_part(rhs, values, bound_names)
+            values[name] = state
+        end
+    end
+    for (name, rhs) in gathers
+        # Read-only queries and any number of value consumers may share a view.
+        # A representation-sensitive consumer retains the ordinary copied node;
+        # recognized arithmetic still borrows directly from its parent.
+        _pointwise_readonly_uses(stmts, name) || continue
+        gather_stmts[name].args[2] = :(ReactiveKernels._readonly_gather($(rhs.args...)))
+    end
+    return def
+end
+
+# Conditioning selects the same declaration-density graph as a prior. Its
+# constrained value is a read-only input or a graph definition, with
+# no layout entry or Jacobian.
+function _density_selection(plan, selected)
+    return _with(plan;
+        parameters = filter(p -> selected(p.name), plan.parameters),
+        factors = filter(p -> selected(p.name), plan.factors),
+        array_parameters = filter(p -> selected(p.name), plan.array_parameters),
+        vector_parameters = filter(p -> selected(p.name), plan.vector_parameters),
+        plate_parameters = filter(p -> selected(p.name), plan.plate_parameters))
+end
+
+function _conditioned_value_statements(plan)
+    stmts = Expr[]
+    for name in sort!(collect(_conditioned_inputs(plan)))
+        push!(stmts, :($name = $(_conditioned_input(name))))
+        for p in plan.array_parameters
+            p.name === name || continue
+            nd = length(_array_dims(plan, p))
+            if p.family === :lkj_cholesky_stack
+                # Only the intrinsic factor width expands; a stack's data axis
+                # stays a vector read and reduction in the existing LKJ graph.
+                K = _array_dims(plan, p)[1]
+                for i in 2:K
+                    rhs = nd == 3 ? :($name[$i, $i, :]) : :($name[$i, $i])
+                    push!(stmts, :($(_rl_name(name, i, i)) = $rhs))
+                end
+            elseif nd > 1 && !_is_structured_array(p)
+                push!(stmts, :($(_array_flat_name(name, nd)) = vec($name)))
+            end
+        end
+    end
+    return stmts
+end
+
+# Pack references to constrained parameter values for the affine matmul.
+# Only authored terms are expanded; array sizes remain array operations.
+function _affine_coefficient_statements(plan::StructuralPlan, layout::LayoutTable)
+    stmts = Expr[]
+    for p in plan.predictors
+        _parameter_terms(p) || continue
+        shape = design_shape(p, plan.columns; levelmaps = plan.levelmaps,
+            matrices = plan.matrices)
+        chunks = Any[]
+        scalar_chunks = Any[]
+        legacy_offset = 0
+        for (t, b) in zip(p.terms, shape.blocks)
+            b.width == 0 && continue
+            if _parameter_term(t)
+                value = t.options.parameter
+                value = t.options.sign == 1 ? value : :(-$value)
+                push!(scalar_chunks, value)
+                # All concatenation inputs are vectors. Mixing a traced
+                # scalar with a vector takes Julia's scalar-fill cat path.
+                push!(chunks, t.kind in (FactorTerm, MatrixTerm) ?
+                    :(Float64.($value)) : :([$value]))
+            else
+                push!(scalar_chunks, nothing)
+                coef = block_name(p.name)
+                slice = Expr(:ref, coef,
+                    Expr(:call, :(:), legacy_offset + 1,
+                        legacy_offset + b.width))
+                push!(chunks, :(Float64.($slice)))
+                legacy_offset += b.width
+            end
+        end
+        terms = [t for (t, b) in zip(p.terms, shape.blocks) if b.width > 0]
+        if _scalar_column_plate_eligible(plan, p, shape) &&
+                all(!isnothing, scalar_chunks)
+            # This path reads only scalar coordinates; no matrix consumer
+            # needs an allocated coefficient vector.
+            rhs = Expr(:tuple, scalar_chunks...)
+        elseif length(chunks) == 1 && any(t -> _parameter_term(t) &&
+                t.kind in (FactorTerm, MatrixTerm), terms)
+            t = only(t for t in terms if _parameter_term(t))
+            value = t.options.parameter
+            rhs = t.options.sign == 1 ? value : :(-$value)
+        else
+            rhs = _affine_coordinate_view(p, shape, layout)
+            rhs === nothing && (rhs = :(vcat($(chunks...))))
+        end
+        push!(stmts, :($(_affine_block_name(p)) = $rhs))
+    end
+    return stmts
+end
+
+# A contiguous run of identity-transformed declarations needs no packing
+# allocation. This is an optimization of parameter reads, not their layout.
+function _affine_coordinate_view(pred, shape, layout)
+    reads = Tuple{Symbol,Int}[]
+    for (t, b) in zip(pred.terms, shape.blocks)
+        b.width == 0 && continue
+        _parameter_term(t) && t.options.sign == 1 || return nothing
+        push!(reads, (t.options.parameter, b.width))
+    end
+    return _parameter_coordinate_view(reads, layout)
+end
+
+function _parameter_coordinate_view(reads, layout)
+    start = nothing
+    stop = nothing
+    for (name, width) in reads
+        i = findfirst(e -> e.name === name, layout.entries)
+        i === nothing && return nothing
+        e = layout.entries[i]
+        e.transform === :identity && e.size == width || return nothing
+        stop === nothing || e.offset == stop + 1 || return nothing
+        start === nothing && (start = e.offset)
+        stop = e.offset + e.size - 1
+    end
+    start === nothing && return nothing
+    return :(view(unconstrained, $start:$stop))
+end
+
+# Reassemble split coefficient blocks: predictors whose layout holds
+# several `:coefficient` entries (identity/interval runs from uniform
+# priors) rejoin into the block name by offset order. Single-entry
+# predictors emit nothing (their entry already binds the block name).
+# Every segment is materialized with `Float64.(…)`: a `vcat` mixing a
+# `SubArray` and a `Vector` lowers through a Union-typed path the
+# native Enzyme reverse pass rejects (same rule as the leveled vector
+# edges in `_vector_transform_statements`).
+function _coef_reassembly_statements(plan::StructuralPlan, layout::LayoutTable)
+    stmts = Expr[]
+    for pred in plan.predictors
+        segs = [e for e in layout.entries
+            if e.kind === :coefficient && e.predictor === pred.name]
+        length(segs) <= 1 && continue
+        sort!(segs; by = e -> e.offset)
+        mats = [:(Float64.($(s.name))) for s in segs]
+        push!(stmts, :($(block_name(pred.name))::AbstractVector{Float64} =
+            vcat($(mats...))))
+    end
+    return stmts
 end
 
 _ordered_columns(plan::StructuralPlan) =
     sort!(collect(plan.columns); by = first)
 
-_data_arg(name::Symbol, col::AbstractVector) =
-    Expr(:(::), name, Vector{eltype(col)})
+# The element type and rank come from the column's type parameters, so this
+# compiles no generic `eltype`/`ndims` call that other packages' array methods
+# could invalidate.
+_data_arg(name::Symbol, ::AbstractVector{T}) where {T} = Expr(:(::), name, Vector{T})
+_data_arg(name::Symbol, ::AbstractMatrix{T}) where {T} = Expr(:(::), name, Matrix{T})
+_data_arg(name::Symbol, v::Number) = Expr(:(::), name, typeof(v))
+_data_arg(name::Symbol, v::_AbsentNumber) = Expr(:(::), name, _value_type(v))
+_data_arg(name::Symbol, ::AbstractArray{T,N}) where {T,N} = Expr(:(::), name, Array{T,N})
 
 # Dedicated eval scope for generated models. The `using` lines resolve via
 # this package's own Project (by file location), so generated code loads in
-# ANY consumer session with no LOAD_PATH dependence. One counter-suffixed
-# binding per build; slice-1 scale makes interning harmless.
+# ANY consumer session with no LOAD_PATH dependence. Builds bind nothing
+# here (see `_eval_kernel_def`).
 module PPLGeneratedModels
 using ReactiveKernels
+import ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
-    beta, inverse_gamma, binomial, negative_binomial2
+    beta, inverse_gamma, binomial, negative_binomial2, beta_binomial,
+    negative_binomial, weibull,
+    uniform, laplace, logistic,
+    student_t, zero_inflated_poisson, zero_inflated_binomial,
+    zero_inflated_binomial_logit_zi,
+    normal_id_glm, bernoulli_logit_glm, poisson_log_glm,
+    rk_inverse_gaussian_tail, rk_von_mises_cdf, rk_logprob_tail,
+    rk_von_mises_periodic_cdf, rk_ordinal_stopping_logpdf, rk_ordinal_stopping_tail,
+    _half_normal_logpdf_on_support, _half_cauchy_logpdf_on_support
+# This copy is used only by generated PPL code. Its cuts were created at
+# package load, before any model built by a caller; generated model methods
+# still require the query's documented latest-world entry.
+const normal_id_glm_lpdf = ReactiveKernels._kernel_latest_rule(
+    DistributionKernelSources.normal_id_glm_lpdf)
+using SpecialFunctions: besseli, besselix, erfc, loggamma
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: logbeta
 # Selective (explicit imports win over any re-export chain, so no `using`
 # ambiguity if ReactiveKernels ever exports these too): the only Statistics
 # names in the assignment allowlist.
 using Statistics: mean, std, var
+using LinearAlgebra: dot
+using LogExpFunctions: log1pexp, logaddexp
+# Plain `logistic` here is the Logistic distribution kernel object. Keep the
+# inverse link as ordinary stable math, including its differentiated graph:
+# differentiating a positive-tail exp(x)/(1 + exp(x)) produces Inf/Inf.
+import LogExpFunctions: cexpexp as _ppl_cexpexp
+_ppl_logistic(x) = exp(-log1pexp(-x))
+_ppl_normcdf(x) = 0.5 * erfc(-x / sqrt(2))
+# Bijector objects the generated program splices (constrained-parameter
+# transforms); imported from the enclosing module so the emitted
+# `positive_bijector()` / `unit_bijector()` calls resolve.
+import ..positive_bijector, ..unit_bijector
+# In-model grouping encoder (`_ppl_gidx_<group>` nodes call it with the
+# raw column + literal declared levels).
+import .._declared_codes
+# Stopping-ratio stage-lane tables (data-only recipes over the bound
+# response; `preprocessing.jl`).
+import .._ordinal_stage_obs, .._ordinal_stage_idx, .._ordinal_effects_matrix
+import .._broadcast_gather
+# Per-element prior arguments of a two-axis array, in packed order.
+import .._array_prior_cells
+# Multivariate slice priors (`mv_slices.jl`): orientations, per-slice
+# arguments, simplex / ordered slice transforms and the slice densities.
+import .._SliceRows, .._SliceCols, .._SliceWhole, .._PerSlice
+import .._mvnormal_cholesky_slices_logpdf, .._mvnormal_slices_logpdf
+import .._dirichlet_slices_logpdf, .._ordered_normal_slices_logpdf
+import .._check_slice_vector_arg
+import .._mvnormal_cholesky_slices_pointwise, .._mvnormal_slices_pointwise
+import .._dirichlet_slices_pointwise, .._ordered_normal_slices_pointwise
+import .._simplex_slices_constrain, .._simplex_slices_logjac
+import .._ordered_slices_constrain, .._ordered_slices_logjac
 end
 
-const _MODEL_COUNTER = Ref(0)
-
-function _eval_kernel_def(def::Expr)
-    _MODEL_COUNTER[] += 1
-    name = Symbol(:ppl_model_, _MODEL_COUNTER[])
-    sig = def.args[1]
-    renamed = Expr(:(=), Expr(:call, name, sig.args[2:end]...), def.args[2])
-    call =
-        Expr(:macrocall, Symbol("@kernel"), LineNumberNode(1, :generator), renamed)
-    Core.eval(PPLGeneratedModels, call)
-    return Core.eval(PPLGeneratedModels, name)
-end
+# Evaluate the generated `@kernel` definition and return its spec. Nothing is
+# bound in `PPLGeneratedModels`: concurrent builds share no package state (no
+# lock, no counter) and a built spec is retained only by its caller. RK
+# evaluates the recipe closures separately so construction compiles no
+# per-model code (`ReactiveKernels._kernel_eval_definition`).
+_eval_kernel_def(def::Expr) =
+    ReactiveKernels._kernel_eval_definition(PPLGeneratedModels, def;
+        latest_world_native_sources = true)
 
 # Scalar + derived assignments in topo order (params already constrained
 # above, so every scalar name resolves; derived columns resolve as locals
 # for the recipes below). Unannotated: Int temporaries (e.g. `length`)
 # must not meet a Float64 assertion.
-function _assignment_statements(plan::StructuralPlan)
+function _assignment_statements(plan::StructuralPlan;
+        layout::LayoutTable,
+        gathers::Set{Tuple{Symbol,Symbol,Int}} = Set{Tuple{Symbol,Symbol,Int}}())
     by_name = Dict{Symbol,Any}(a.name => a for a in plan.assignments)
     for d in plan.derived
         by_name[d.name] = d
     end
-    return Expr[:($(name) = $(by_name[name].expr))
-        for name in topological_order(plan) if haskey(by_name, name)]
+    # A selected argument plate always produces a vector, even when its
+    # private name has no declared type. Give a directly used scale column
+    # the same axis declaration as its scale use below, so the latter is an
+    # alias and a cell query can compose the producer into its observation.
+    selected_scales = Dict{Symbol,Symbol}()
+    for r in plan.responses
+        s = r.scale
+        s isa ScalePredictorRef && s.link === IdentityLink || continue
+        pred = _predictor(plan, s.predictor)
+        _selected_cell_value(plan, r, pred.name) || continue
+        selected_scales[only(only(pred.terms).columns)] = _predictor_value_type(plan, pred)
+    end
+    # Data definitions needed at bind (including reduced scales) were
+    # evaluated once and arrive as data arguments; the kernel never recomputes them.
+    computed = _bound_module_data_names(plan)
+    dataonly = Set{Symbol}(keys(plan.columns))
+    order = Symbol[]
+    rewritten = Dict{Symbol,Any}()
+    for name in topological_order(plan)
+        (haskey(by_name, name) && name ∉ computed) || continue
+        ex = _guard_missing_observation_argument(name, by_name[name].expr, plan, plan.columns)
+        ex === by_name[name].expr || !_guarded_argument_is_bound(ex, plan.columns) ||
+            (ex = _concrete_guarded_argument(ex))
+        push!(order, name)
+        rewritten[name] = _bound_extent_indices(name,
+            _unit_logit_rewrite(_value_math_rewrite(
+                _array_gather_rewrite(ex, plan, gathers)), layout), plan)
+    end
+    destructured = _destructuring_statements(order, rewritten)
+    stmts = Expr[]
+    for name in order
+        targets, ex = get(destructured, name, ((name,), rewritten[name]))
+        isempty(targets) && continue
+        if _expr_value_symbols(ex) ⊆ dataonly
+            union!(dataonly, targets)
+        else
+            ex = _observation_slice_views(
+                _split_data_calls!(stmts, name, ex, dataonly), plan, dataonly)
+        end
+        lhs = length(targets) == 1 && targets[1] === name ? name : Expr(:tuple, targets...)
+        if lhs isa Symbol && haskey(selected_scales, lhs)
+            lhs = Expr(:(::), lhs, selected_scales[lhs])
+        end
+        push!(stmts, :($(lhs) = $(ex)))
+    end
+    return stmts
 end
 
-_lp_name(pred::PredictorSpec) = Symbol(:_ppl_lp_, pred.name)
+# A column read `P[:, j]` of a per-observation value (`_is_observation_slice`)
+# reads that value in place. Julia's `getindex` copies every row of the slice,
+# and native reverse mode then adds the copy's adjoint back into the value's,
+# so separate reads of one product cost more than separate products. The
+# value is never written after it is made, so the view reads the same numbers.
+# Compiled tracing reads the same slice (`ReactiveKernels._tensorized_view`).
+# A data-only value keeps Julia's copy: `bound=` folds the read once at
+# preparation, outside the evaluated program, and a view would hold the
+# caller's data.
+function _observation_slice_views(ex, plan::StructuralPlan, dataonly::Set{Symbol})
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert) && return ex
+    _is_plate_column_expr(ex) && return ex
+    if ex.head === :ref && ex.args[1] isa Symbol && ex.args[1] ∉ dataonly &&
+            _is_observation_slice(plan, ex)
+        base = ex.args[1]
+        indices = (_slice_view_index(i, base, k) for (k, i) in enumerate(ex.args[2:end]))
+        return :(ReactiveKernels._tensorized_view($base, $(indices...)))
+    end
+    return Expr(ex.head, (_observation_slice_views(a, plan, dataonly) for a in ex.args)...)
+end
+
+# One index of a slice read as a call argument: `:` is the whole axis, and
+# `end`/`begin` (alone or in integer arithmetic) resolve against axis `k` of
+# the sliced value, as Julia's indexing syntax resolves them.
+_slice_view_index(i, base::Symbol, k::Int) =
+    i === :(:) ? Expr(:call, GlobalRef(Base, :Colon)) : _slice_view_endpoint(i, base, k)
+_slice_view_endpoint(i, base::Symbol, k::Int) =
+    i === :end ? Expr(:call, GlobalRef(Base, :lastindex), base, k) :
+    i === :begin ? Expr(:call, GlobalRef(Base, :firstindex), base, k) :
+    i isa Expr ? Expr(i.head, (_slice_view_endpoint(a, base, k) for a in i.args)...) : i
+
+# Destructuring `(a, b) = rhs` reaches the plan as one element read per name
+# (`_desugar_destructuring`). Emit the reads of one `rhs` as Julia's single
+# statement, at the first read's place in the topological order (every read
+# has the same dependencies), so `rhs` runs once per evaluation. A
+# function-shaped `KernelSpec` with several WANT ports is destructured at
+# that whole boundary, which RK splices into the generated graph; a
+# single-output `KernelSpec` returns its one value, so its element reads stay
+# ordinary reads of that value. An element bound as data at bind takes a
+# private name. Returns `name => (targets, rhs)`; the other reads of a
+# reassembled statement map to `(), nothing`.
+function _destructuring_statements(order::Vector{Symbol}, rewritten::Dict{Symbol,Any})
+    groups = Dict{Any,Vector{Dict{Int,Symbol}}}()
+    leaders = Dict{Symbol,Dict{Int,Symbol}}()
+    for name in order
+        read = _destructured_read(rewritten[name])
+        read === nothing && continue
+        rhs, i = read
+        rhs isa Expr && rhs.head === :call || continue
+        candidates = get!(() -> Dict{Int,Symbol}[], groups, rhs)
+        k = findfirst(g -> !haskey(g, i), candidates)
+        if k === nothing
+            push!(candidates, Dict{Int,Symbol}())
+            k = length(candidates)
+            leaders[name] = candidates[k]
+        end
+        candidates[k][i] = name
+    end
+    out = Dict{Symbol,Tuple{Tuple,Any}}()
+    for (leader, members) in leaders
+        rhs, _ = _destructured_read(rewritten[leader])
+        width = _destructured_width(rhs, maximum(keys(members)))
+        width === nothing && continue
+        targets = Tuple(get(members, i, Symbol(:_rkppl_, leader, :_unused_, i))
+            for i in 1:width)
+        out[leader] = (targets, rhs)
+        for name in values(members)
+            name === leader || (out[name] = ((), nothing))
+        end
+    end
+    return out
+end
+
+# How many names a reassembled destructuring statement binds, or `nothing`
+# to keep its element reads: a multi-output `KernelSpec` binds its whole WANT
+# boundary (more reads than ports keep Julia's `BoundsError` at the read); any
+# other call binds up to its last read, when that is past the first.
+function _destructured_width(rhs::Expr, last::Int)
+    spec = _called_kernel_spec(rhs)
+    if spec !== nothing
+        any(a -> Meta.isexpr(a, (:parameters, :kw, Symbol("..."))), rhs.args[2:end]) &&
+            return nothing
+        width = length(ReactiveKernels.outputs(spec))
+        return width > 1 && last <= width ? width : nothing
+    end
+    return last > 1 ? last : nothing
+end
+
+function _called_kernel_spec(rhs::Expr)
+    head = rhs.args[1]
+    head isa GlobalRef && isdefined(head.mod, head.name) || return nothing
+    value = getglobal(head.mod, head.name)
+    return value isa KernelSpec ? value : nothing
+end
+
+# A retained plate column over a value whose extent binding supplied
+# (`_bind_plate_extents!`) iterates `1:extent`, a data lane, instead of the
+# live value's indices.
+function _bound_extent_indices(name::Symbol, ex, plan::StructuralPlan)
+    it = _value_plate_iterator(name, ex)
+    it === nothing && return ex
+    input = _value_extent_input(it)
+    haskey(plan.columns, input) && !haskey(plan.columns, it.args[2]) || return ex
+    call = ex.args[1]
+    indices = Expr(:call, GlobalRef(Base, :collect), Expr(:call, :(:), 1, input))
+    return Expr(:do, Expr(:call, call.args[1], indices, call.args[3:end]...), ex.args[2])
+end
+
+# The generated scope's `logistic` names a distribution kernel. Values
+# use the inverse-logit function, including inside reductions.
+_value_math_rewrite(ex) = ex
+function _value_math_rewrite(ex::Expr)
+    args = Any[_value_math_rewrite(a) for a in ex.args]
+    if ex.head in (:call, :.) && !isempty(args) && args[1] === :logistic
+        args[1] = :_ppl_logistic
+    end
+    return Expr(ex.head, args...)
+end
+
+# A unit-interval sampled parameter has two exact representations in the
+# built graph: its rounded constrained value and its source logit coordinate.
+# Only a call to the resolved LogExpFunctions.logit on that sampled value
+# selects the latter. Other functions and arbitrary probability expressions
+# keep their authored operations.
+function _unit_sample_coordinate(layout::LayoutTable, name::Symbol)
+    for e in layout.entries
+        e.kind === :sampled && e.name === name || continue
+        (e.transform === :logistic ||
+            (e.transform === :interval && e.lo isa Real && e.hi isa Real &&
+                iszero(e.lo) && isone(e.hi))) ||
+            return nothing
+        return coordinate_read(e.offset)
+    end
+    return nothing
+end
+
+_unit_logit_rewrite(ex, ::LayoutTable) = ex
+function _unit_logit_rewrite(ex::Expr, layout::LayoutTable)
+    # Do not rewrite a lexically scoped local that happens to share a sampled
+    # parameter's name.
+    ex.head in (:do, :->, :function, :let) && return ex
+    if ex.head === :call && length(ex.args) == 2 &&
+            ex.args[1] isa GlobalRef && ex.args[1].name === :logit &&
+            isdefined(ex.args[1].mod, :logit) &&
+            getglobal(ex.args[1].mod, :logit) === logit &&
+            ex.args[2] isa Symbol
+        coord = _unit_sample_coordinate(layout, ex.args[2])
+        coord === nothing || return coord
+    end
+    return Expr(ex.head, Any[_unit_logit_rewrite(a, layout) for a in ex.args]...)
+end
+
+function _unit_complement_logit(plan::StructuralPlan, zi)
+    zi isa Symbol || return nothing
+    for a in plan.assignments
+        a.name === zi || continue
+        ex = a.expr
+        ex isa Expr && ex.head === :call && length(ex.args) == 3 || return nothing
+        f = ex.args[1]
+        (f === :- || (f isa GlobalRef && f.mod === Base && f.name === :-)) ||
+            return nothing
+        ex.args[2] isa Real && isone(ex.args[2]) || return nothing
+        ex.args[3] isa Symbol || return nothing
+        coord = _unit_sample_coordinate(assign_layout(plan), ex.args[3])
+        return coord === nothing ? nothing : :(-$coord)
+    end
+    return nothing
+end
+
+# Functions as values: a data-only module call nested in a parameter-
+# dependent statement — a data-only definition inlined into the call that
+# consumes it (`reads = f(g(s), b)`), or a gathered `(b .* g(gx))[oi]` —
+# becomes its own statement. Preparation's `bound=` folding then
+# evaluates it once, outside the differentiated program, rather than on
+# every evaluation inside it. Only value compositions are entered: an
+# operand of a lazy branch, a loop or a generator keeps its own
+# evaluation (snag `interpolated-err-41772e14`).
+function _split_data_calls!(stmts::Vector{Expr}, name::Symbol, ex,
+        dataonly::Set{Symbol})
+    count = 0
+    function walk(node)
+        node isa Expr || return node
+        _is_plate_column_expr(node) && return node
+        if node.head in (:call, :ref, :.) && !_constructed_endpoint_call(node) &&
+                _contains_module_call(node) &&
+                _expr_value_symbols(node) ⊆ dataonly
+            count += 1
+            tmp = Symbol(:_ppl_data_, name, :_, count)
+            push!(stmts, :($(tmp) = $(node)))
+            return tmp
+        end
+        if node.head === :call
+            head = node.args[1]
+            if _constructed_endpoint_head(head)
+                constructor = head.args[1]
+                # Owner arguments are value positions. Keep the constructor
+                # itself for RK's endpoint splicer, while folding data-only
+                # helper calls inside its arguments at preparation.
+                owner = Expr(:call, constructor.args[1],
+                    map(walk, constructor.args[2:end])...)
+                head = Expr(:., owner, head.args[2])
+            end
+            return Expr(:call, head, map(walk, node.args[2:end])...)
+        elseif node.head === :. && length(node.args) == 2 &&
+                Meta.isexpr(node.args[2], :tuple)
+            return Expr(:., node.args[1],
+                Expr(:tuple, map(walk, node.args[2].args)...))
+        elseif node.head === :kw && length(node.args) == 2
+            return Expr(:kw, node.args[1], walk(node.args[2]))
+        elseif node.head in (:ref, :parameters, :tuple, :vect)
+            return Expr(node.head, map(walk, node.args)...)
+        end
+        return node
+    end
+    return walk(ex)
+end
+
+# Each predictor's value is the graph node named after the predictor: the
+# authored definition it lowers (`mu = a .+ b .* x` emits `mu`), or the
+# fresh name the lowering gave an inline one (`y_eta`).
+function _predictor_plate_addition(plan::StructuralPlan, pred::PredictorSpec,
+        terms, rows::Bool)
+    rows && return false
+    length(terms) > 1 && length(terms) == length(pred.terms) || return false
+    _broadcast_affine(plan, pred) || return false
+    # One plate needs one row count: responses observing different rows
+    # through a shared predictor keep its ordinary broadcast.
+    located = unique!([_response_rows(plan, r) for r in plan.responses
+        if _response_uses_predictor(r, pred.name)])
+    length(located) == 1 || return false
+    n = only(located)
+    axes = map(pred.terms) do t
+        t.kind === InterceptTerm && return Any[]
+        t.kind === OffsetTerm && length(t.columns) == 1 &&
+            return _value_axes(plan, only(t.columns); data_axes = true)
+        t.kind === ComposedTerm &&
+            return _value_axes(plan, _composed_expr(plan, pred, t);
+                data_axes = true)
+        return nothing
+    end
+    any(a -> a == Any[n], axes) &&
+        all(a -> a == Any[] || a == Any[n], axes)
+end
 
 function _predictor_statements(plan::StructuralPlan)
     stmts = Expr[]
     for pred in plan.predictors
-        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
-        lp = _lp_name(pred)
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
+            matrices = plan.matrices)
+        lp = pred.name
+        if _scalar_column_plate_eligible(plan, pred, shape)
+            coef = _affine_block_name(pred)
+            inputs = Any[]
+            formals = Symbol[]
+            cell_terms = Any[]
+            k = 1
+            for b in shape.blocks
+                if b.kind === OffsetTerm
+                    offset = _dovar(length(formals) + 1)
+                    push!(inputs, b.column)
+                    push!(formals, offset)
+                    push!(cell_terms, offset)
+                    continue
+                end
+                c = _dovar(length(formals) + 1)
+                push!(inputs, _coef_coord(coef, k))
+                push!(formals, c)
+                k += 1
+                if b.kind === InterceptTerm
+                    push!(cell_terms, c)
+                else
+                    x = _dovar(length(formals) + 1)
+                    push!(inputs, b.column)
+                    push!(formals, x)
+                    push!(cell_terms, :($c * $x))
+                end
+            end
+            cell = foldl((a, b) -> :($a + $b), cell_terms)
+            rhs = Expr(:do, Expr(:call, :plate, inputs...),
+                Expr(:->, Expr(:tuple, formals...), Expr(:block, cell)))
+            push!(stmts, :($lp = $rhs))
+            continue
+        end
         terms = Any[]
-        if shape.width > 0
-            push!(terms, :($(design_name(pred.name)) * $(block_name(pred.name))))
+        if _broadcast_affine(plan, pred)
+            append!(terms, _affine_block_terms(plan, shape; broadcast = true))
+        elseif shape.width > 0
+            push!(terms, :($(design_name(pred.name)) * $(_affine_block_name(pred))))
         end
         if any(b -> b.kind === OffsetTerm, shape.blocks)
             push!(terms, offset_name(pred.name))
         end
+        # A latent term contributes the per-cell latent VECTOR directly
+        # (identity design): `lp = theta` on its own, or added to fixed-effect
+        # design/offset terms for a random-intercept-plus-covariates predictor.
+        for b in shape.blocks
+            b.kind === LatentTerm && push!(terms, b.column)
+        end
+        # A scan summand contributes its state's direct scaled expression
+        # (`state .* coef`, SB's `ar` latent path with its free beta),
+        # resolved from the TERMS like any summand.
+        for t in pred.terms
+            t.kind === ScanSummandTerm &&
+                push!(terms, _scan_summand_expr(plan, pred, t))
+        end
+        # A composed term evaluates its combination tree in-graph:
+        # sub-predictors resolve to their LP nodes (emitted above —
+        # contract orders subs first), scalars to their constrained
+        # locals (params constrained above, assignments emitted above).
+        # Plain broadcast math: ordinary reverse mode on every backend.
+        rows = false
+        for t in pred.terms
+            t.kind === ComposedTerm || continue
+            ex = _composed_expr(plan, pred, t)
+            rows |= _composed_needs_rows(plan, pred, t, ex)
+            push!(terms, ex)
+        end
         # Degenerate (e.g. single-level-factor-only) predictors carry a scalar
         # zero LP, which broadcasts everywhere a vector LP would.
-        rhs = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
-        push!(stmts, :($lp = $rhs))
+        rhs = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a .+ $b), terms)
+        # A known one-axis predictor can add its summands per observation.
+        # The authored plate then composes with a sole plate consumer, so the
+        # intermediate predictor vector need not be materialized. Require a
+        # bound rank/extent proof for every summand and keep scalar and
+        # row-expanding predictors on their existing broadcast path.
+        if _predictor_plate_addition(plan, pred, terms, rows)
+            formals = [_dovar(i) for i in eachindex(terms)]
+            cell = foldl((a, b) -> Expr(:call, :+, a, b), formals)
+            rhs = Expr(:do, Expr(:call, :plate, terms...),
+                Expr(:->, Expr(:tuple, formals...), Expr(:block, cell)))
+        end
+        # Full-length vector plans read one location entry per row. A value
+        # of unknown shape gets those rows once, as Julia broadcasting
+        # against the rows would, rather than a ones vector per summand.
+        # A value of known extent other than the rows (a one-entry declared
+        # array) broadcasts to them directly: its type then does not depend
+        # on `_ppl_rows`'s run-time length test.
+        if rows
+            n = _located_rows_source(plan, pred)
+            rhs = _known_row_mismatch(plan, pred, rhs) ?
+                Expr(:call, :.*, Expr(:call, :ones, n), rhs) :
+                Expr(:call, GlobalRef(@__MODULE__, :_ppl_rows), rhs, n)
+        end
+        # A proven scalar declares its type, so plates statically read it
+        # as a shared argument rather than through a runtime axis test.
+        push!(stmts, _predictor_value_type(plan, pred) === :Number &&
+            _scalar_valued_predictor(plan, pred) ?
+            :($lp::Number = $rhs) : :($lp = $rhs))
     end
     return stmts
 end
 
+# Scalar coefficient-coordinate read (`coef[k]`, the `coordinate_read` shape
+# over a coefficient block rather than the packed vector).
+_coef_coord(coef::Symbol, k::Int) = :($coef[$k])
+
+# Broadcast affine blocks against their coefficient coordinates while
+# retaining the authored axes. Factor and matrix blocks use their own
+# coefficient slices in design order.
+function _affine_block_terms(plan::StructuralPlan, shape::DesignShape;
+        broadcast::Bool = false)
+    pred = only(p for p in plan.predictors if p.name === shape.predictor)
+    coef = _affine_block_name(pred)
+    terms = Any[]
+    k = 1
+    for b in shape.blocks
+        if b.kind === InterceptTerm
+            push!(terms, broadcast ? _coef_coord(coef, k) :
+                Expr(:call, :.*, Expr(:call, :ones, _predictor_rows_source(plan, shape.predictor)),
+                    _coef_coord(coef, k)))
+            k += 1
+        elseif b.kind === ContinuousTerm
+            push!(terms, :($(b.column) .* $(_coef_coord(coef, k))))
+            k += 1
+        elseif b.kind === FactorTerm
+            w = b.width
+            push!(terms, :($(_contrast_expr(b)) *
+                $(:(view($coef, $k:$(k + w - 1))))))
+            k += w
+        elseif b.kind === MatrixTerm
+            w = b.width
+            push!(terms, :($(_matrix_block_expr(b, _predictor_rows_source(plan, shape.predictor))) *
+                $(:(view($coef, $k:$(k + w - 1))))))
+            k += w
+        end
+    end
+    return terms
+end
+
+
+function _scan_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
+    o = t.options
+    any(s -> o.scan_id in s.states, plan.scans) || throw(ContractValidationError(
+        "[generator] scan summand in predictor $(pred.name) addresses " *
+        "unknown scan :$(o.scan_id)"))
+    o.coef === nothing && return o.scan_id
+    o.coef in _union_names(plan) || throw(ContractValidationError(
+        "[generator] scan summand coef :$(o.coef) is not a scalar name"))
+    return Expr(:call, :.*, o.scan_id, o.coef)
+end
+
+const _COMPOSED_MAP_EMIT = Dict{Symbol,Symbol}(:exp => :exp,
+    :logistic => :_ppl_logistic, :normcdf => :_ppl_normcdf,
+    :cexpexp => :_ppl_cexpexp)
+
+_composed_map_emit(f::Symbol) = get(_COMPOSED_MAP_EMIT, f, f)
+_composed_map_emit(f) = f
+
+"""Rewrite a composed tree to in-graph nodes (contract validated it)."""
+function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
+        pred::Symbol)
+    if _is_plate_column_expr(node)
+        original = node
+        node = _guard_missing_observation_argument(pred, node, plan, plan.columns)
+        value = Expr(:do, Expr(:call, :plate, node.args[1].args[2:end]...),
+            node.args[2])
+        return node !== original && _guarded_argument_is_bound(node, plan.columns) ?
+            _concrete_guarded_argument(value) : value
+    end
+    if node isa Symbol
+        node in subs || return node
+        any(p -> p.name === node, plan.predictors) || throw(ContractValidationError(
+            "[generator] composed term in predictor $pred addresses " *
+            "unknown sub-predictor $node"))
+        return node
+    end
+    # Dotted map `f.(x, ...)`: `Expr(:., f, Expr(:tuple, x, ...))`, the
+    # map renamed to its generated-module math binding.
+    node.head === :. && return Expr(:., _composed_map_emit(node.args[1]),
+        Expr(:tuple, (_composed_rewrite(a, subs, plan, pred)
+            for a in node.args[2].args)...))
+    return Expr(node.head, node.args[1],
+        (_composed_rewrite(a, subs, plan, pred) for a in node.args[2:end])...)
+end
+
+_composed_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec) =
+    _composed_rewrite(t.options.tree, t.options.subs, plan, pred.name)
+
+# A composition reading no sub-predictor and no column has no row axis of
+# its own, and neither does one whose columns are proven scalars (a scalar
+# definition another definition also reads, `la = a; l = exp(la)`, is a
+# retained value read by name). Scalar shape is retained when observation
+# operands need broadcasting; ordinary full-length vector plans, such as a
+# plan with a design matrix, scan or latent plate, give it the location's rows.
+function _composed_needs_rows(plan::StructuralPlan, pred::PredictorSpec,
+        t::TermSpec, ex)
+    !_is_plate_column_expr(ex) && isempty(t.options.subs) &&
+        all(c -> _proven_scalar(plan, c), t.columns) &&
+        !_broadcast_affine(plan, pred) || return false
+    # A composed scalar leaf can be a full-row view of an observation matrix.
+    # Its derived column already has the response row axis; normalizing it again
+    # adds a runtime union of the view and broadcast fallback to every plate.
+    if ex isa Symbol
+        i = findfirst(a -> a.name === ex, plan.assignments)
+        i !== nothing && _full_observation_view(plan, plan.assignments[i].expr) &&
+            return false
+        i !== nothing && _authored_plate_result(plan.assignments[i].expr) &&
+            return false
+    end
+    # A value with the located responses' own axes (a declared array
+    # `theta[axes(y, 1)]` read whole by `Normal.(theta, s)`) already holds
+    # one entry per row. It reads in place, as `_ppl_rows` would return it,
+    # without that call's run-time choice between it and a broadcast copy.
+    _has_located_axes(plan, pred, ex) && return false
+    return true
+end
+
+function _has_located_axes(plan::StructuralPlan, pred::PredictorSpec, ex)
+    a = _known_axes(plan, ex)
+    a === nothing && return false
+    located = _located_responses(plan, pred.name)
+    return !isempty(located) && all(located) do r
+        haskey(plan.columns, r.response) && r.range === nothing &&
+            _value_axes(plan, r.response; data_axes = true) == a
+    end
+end
+
+# A value whose known extent is not the location's rows (a one-entry
+# declared array), so `_ppl_rows` would always take its broadcast branch.
+function _known_row_mismatch(plan::StructuralPlan, pred::PredictorSpec, ex)
+    a = _known_axes(plan, ex)
+    return a !== nothing && prod(a) != _located_rows(plan, pred)
+end
+
+# The bound integer axes of an array value, or `nothing` when a scalar,
+# unbound or of unknown shape.
+function _known_axes(plan::StructuralPlan, ex)
+    isbound(plan) || return nothing
+    a = _value_axes(plan, ex; data_axes = true)
+    a isa Vector && !isempty(a) && all(d -> d isa Int, a) || return nothing
+    return a
+end
+
+# A called @kernel whose single result is an authored plate already has an
+# array axis. Keeping that result directly in the observation lets RK compose
+# its plate into a queried cell; wrapping it in `_ppl_rows` would make the
+# entire plate an input to a separate recipe and force every row to run.
+function _authored_plate_result(ex)
+    Meta.isexpr(ex, :call) || return false
+    fn = ex.args[1]
+    fn isa GlobalRef && isdefined(fn.mod, fn.name) || return false
+    spec = getfield(fn.mod, fn.name)
+    spec isa KernelSpec || return false
+    wants = outputs(spec)
+    length(wants) == 1 || return false
+    graph = kernel_graph(spec)
+    producers = ReactiveKernels.producers_of(graph, only(wants).id)
+    length(producers) == 1 || return false
+    try
+        plate_body(graph.recipes[only(producers)])
+        return true
+    catch err
+        err isa ArgumentError || rethrow()
+        return false
+    end
+end
+
+function _full_observation_view(plan::StructuralPlan, ex)
+    Meta.isexpr(ex, :call, 4) || return false
+    f = ex.args[1]
+    (f isa GlobalRef && f.name === :view && isdefined(f.mod, f.name) &&
+        getfield(f.mod, f.name) === Base.view) ||
+        return false
+    axis = ex.args[3]
+    (axis === :(:) || axis isa GlobalRef && axis.name === Symbol(":")) ||
+        return false
+    base = ex.args[2]
+    base isa Symbol && any(d -> d.name === base, plan.derived) &&
+        _is_matrix_value(base, plan) || return false
+    return _is_observation_slice(plan, Expr(:ref, base, :(:), ex.args[4]))
+end
+
+# The responses a predictor locates: those reading it directly and, for a
+# composed predictor's sub-predictor (`th` in `mu = be .* th`), those its
+# reader locates, since the combination is elementwise over their rows.
+function _located_responses(plan::StructuralPlan, name::Symbol,
+        seen::Set{Symbol} = Set{Symbol}())
+    name in seen && return LikelihoodSpec[]
+    push!(seen, name)
+    located = LikelihoodSpec[r for r in plan.responses
+        if _response_uses_predictor(r, name)]
+    for p in plan.predictors, t in p.terms
+        t.kind === ComposedTerm && name in t.options.subs || continue
+        for r in _located_responses(plan, p.name, seen)
+            any(l -> l === r, located) || push!(located, r)
+        end
+    end
+    return located
+end
+
+# Rows of the responses a predictor locates — their own observation axis,
+# which is not `n_obs` when responses observe different rows.
+function _located_rows(plan::StructuralPlan, pred::PredictorSpec)
+    rows = unique!([_response_rows(plan, r)
+        for r in _located_responses(plan, pred.name)])
+    length(rows) == 1 || throw(ContractValidationError("[generator] " *
+        "predictor $(pred.name) locates responses with rows $rows " *
+        "(one row count per scalar-valued predictor)"))
+    return only(rows)
+end
+
+# Row counts as graph source. A row count the lowering resolved from the
+# bound data is emitted as `_observation_rows(anchors...)` over those same
+# bound values, never as the build's number, so a built graph evaluates any
+# binding of its program (snag rkppl-opaque-loc-37de7b80). The anchors
+# mirror the row resolvers (`_located_rows`, `_response_rows`,
+# `_value_rows`), which keep validating and measuring; `_rows_source`
+# checks that the call reproduces their count on this binding. A count no
+# bound value carries (no data anchor) stays a literal.
+function _rows_source(n::Int, anchors::Vector)
+    isempty(anchors) && return n
+    values = Any[last(a) for a in anchors]
+    _observation_rows_compatible(values) && _observation_rows(values...) == n ||
+        return n
+    return Expr(:call, GlobalRef(@__MODULE__, :_observation_rows),
+        Any[first(a) for a in anchors]...)
+end
+
+_located_rows_source(plan::StructuralPlan, pred::PredictorSpec) =
+    _rows_source(_located_rows(plan, pred), _response_rows_anchors(plan,
+        first(_located_responses(plan, pred.name))))
+
+_response_rows_source(plan::StructuralPlan, r::LikelihoodSpec) =
+    _rows_source(_response_rows(plan, r), _response_rows_anchors(plan, r))
+
+_predictor_rows_source(plan::StructuralPlan, name::Symbol) =
+    _rows_source(_predictor_rows(plan, name), _value_rows_anchors(plan, name))
+
+# The bound values `_value_rows` measures: the value itself when bound, else
+# the per-observation columns it reads, else the rows of the responses that
+# read it (of every response, when none does).
+function _value_rows_anchors(plan::StructuralPlan, name::Symbol)
+    haskey(plan.columns, name) && return Any[_column_anchor(plan, name)]
+    reads = _response_reads(plan, name, _row_columns(plan))
+    isempty(reads) || return Any[_column_anchor(plan, c) for c in sort!(collect(reads))]
+    names = Set{Symbol}([name])
+    users = [r for r in plan.responses if name in _response_reads(plan, r, names)]
+    isempty(users) && (users = plan.responses)
+    isempty(users) && return Any[]
+    return _response_rows_anchors(plan, first(users))
+end
+
+_column_anchor(plan::StructuralPlan, c::Symbol) = c => plan.columns[c]
+
+# A ranged response's selection, as its likelihood statements index it.
+_selection_anchor(plan::StructuralPlan, r::LikelihoodSpec) =
+    Expr(:ref, r.response, _range_index_expr(r), r.range.args[3:end]...) =>
+        _selected_response_column(plan, r)
+
+_range_index_expr(r::LikelihoodSpec) = r.range.args[2] === :(:) ?
+    Expr(:call, :eachindex, r.response) : r.range.args[2]
+
+# The bound values whose broadcast rows `_response_rows` measures: the
+# response (or its selection) and the per-observation columns its
+# broadcast domain reads; structured responses keep their row contract.
+function _response_rows_anchors(plan::StructuralPlan, r::LikelihoodSpec)
+    if !_uses_structured_observation_axes(plan) && haskey(plan.columns, r.response) &&
+            _observation_axes(plan) !== nothing
+        modelvals, managed = _axis_exempt_columns(plan)
+        perobs = Set{Symbol}(k for (k, v) in plan.columns
+            if k ∉ modelvals && k ∉ managed && v isa AbstractArray)
+        head = r.range isa Expr ? _selection_anchor(plan, r) :
+            _column_anchor(plan, r.response)
+        # Indexed operands are validated to the selection's own axis.
+        r.range isa Expr && r.response in plan.indexed_observations && return Any[head]
+        reads = _response_reads(plan, r, perobs)
+        values = r.range isa Expr ?
+            _response_reads(plan, _with(r; range = nothing), perobs) : reads
+        return Any[head; [_column_anchor(plan, c)
+            for c in sort!(collect(setdiff(reads, (r.response,)))) if c in values]]
+    end
+    r.range isa Expr && return Any[_selection_anchor(plan, r)]
+    r.mi_jobs === nothing && haskey(plan.columns, r.response) &&
+        return Any[_column_anchor(plan, r.response)]
+    reads = _response_reads(plan, r, _row_columns(plan))
+    return Any[_column_anchor(plan, c) for c in sort!(collect(reads))]
+end
+
+
+
 _lik_name(label::Symbol) = Symbol(:_ppl_lik_, label)
 
-function _likelihood_statements(plan::StructuralPlan)
+function _ordinal_pointwise_stmts(r, plan; grouped = false)
+    pw = _pw_name(r.label)
+    if !(r.family === OrdinalFam && r.ordinal_structure === :stopping &&
+            r.evidence.kind === :none && r.n_levels > 1 &&
+            _response_rows(plan, r) > 0 && _has_observed_response(plan, r))
+        return Expr[], pw
+    end
+    # A stopping-ratio lane represents a visited stage. Zero-threshold
+    # observations visit no stage; the padded prefix also covers these.
+    ends = Symbol(pw, :_ends)
+    cumulative = Symbol(pw, :_cumulative)
+    values = Symbol(pw, :_observations)
+    observed = !grouped && r.range isa Expr ? Symbol(:_ppl_range_response_, r.label) :
+        !grouped && r.mi_jobs !== nothing ? Symbol(:_ppl_mi_response_, r.label) : r.response
+    endexpr = if r.thresholds isa ThresholdRows
+        # Stage membership is prepared after any response selection.
+        obs = _stage_lane(r.label, :obs)
+        :(searchsortedlast.(Ref($obs), eachindex($observed)))
+    else
+        stages = _group_thresholds(plan, r) ? :(length($(r.thresholds))) : r.n_levels - 1
+        :(cumsum(min.($observed, $stages)))
+    end
+    return Expr[:($ends = $endexpr),
+        :($cumulative = vcat(0.0, cumsum($pw))[$ends .+ 1]),
+        :($values = $cumulative .- vcat(0.0, $cumulative)[1:end-1])], values
+end
+
+function _likelihood_statements(plan::StructuralPlan, layout; gathers,
+        upstream::Vector{Expr} = Expr[])
     stmts = Expr[]
     terms = Any[]
+    points = Pair{Symbol,Any}[]
+    arguments = Pair{Symbol,Any}[]
+    laws = Pair{Symbol,Any}[]
     for r in plan.responses
-        append!(stmts, _response_likelihood_stmts(r, plan))
+        # A plate loop covers its whole response, so a cell-broadcast
+        # response observes every entry of each index's array.
+        rs = _cell_broadcast_response(plan, r) ?
+            _cell_broadcast_stmts(r, plan,
+                _response_likelihood_stmts(_with(r; range = nothing), plan), upstream) :
+            _response_likelihood_stmts(r, plan)
+        append!(stmts, rs)
+        args = _observation_arguments(r, plan, rs)
+        args === nothing || push!(arguments, r.response => args)
+        law = _law_entry(r, plan, rs)
+        law === nothing || push!(laws, r.response => law)
         push!(terms, _lik_name(r.label))
+        pw = _pw_name(r.label)
+        if !_cell_broadcast_response(plan, r)
+            pointstmts, pw = _ordinal_pointwise_stmts(r, plan)
+            append!(stmts, pointstmts)
+        end
+        push!(points, r.response => pw)
     end
-    joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
-    push!(stmts, :(likelihood::Float64 = $joint))
+    for p in plan.external_observations
+        observation = get(p.args, :observation, p.name)
+        selected = observation === p.name ? p.name :
+            Symbol(:_ppl_external_observed_, p.name)
+        selection = observation === p.name ? Expr[] : Expr[:($selected = $observation)]
+        ps = _external_density_statements(p; observation=selected)
+        # Select the authored observation axis before entering a grouped
+        # cell. Its inner observations must not reuse those outer indices.
+        append!(stmts, selection)
+        append!(stmts, _cell_broadcast_observation(plan, p.name) ?
+            _cell_broadcast_stmts(p, plan, ps, vcat(upstream, selection)) : ps)
+        push!(terms, Symbol(:_ppl_prior_, p.name))
+        # An undotted observation is one whole-event density.
+        push!(points, p.name => Symbol(
+            p.args.broadcast ? :_ppl_pw_prior_ : :_ppl_prior_, p.name))
+    end
+    observed = _density_selection(plan, n -> n in plan.conditioned)
+    _factor_density_statements!(stmts, terms, observed; context = plan, pointwise = points)
+    _parameter_prior_statements!(stmts, terms, observed, layout;
+        prefix = :_ppl_condition_, group_scalars = false)
+    for p in observed.parameters
+        push!(points, p.name => Symbol(
+            p.family === :external && p.args.broadcast ? :_ppl_pw_prior_ : :_ppl_prior_, p.name))
+    end
+    for p in observed.vector_parameters
+        _vector_parameter_prior_stmts!(stmts, terms, p)
+        value = p.family === :vector_normal ?
+            (p.size == 0 ? :(zeros(0)) : Symbol(:_ppl_pw_prior_, p.name)) :
+            Symbol(:_ppl_prior_, p.name)
+        push!(points, p.name => value)
+    end
+    for p in observed.plate_parameters
+        if p.family === :external
+            append!(stmts, _external_density_statements(p))
+            push!(terms, Symbol(:_ppl_prior_, p.name))
+        else
+            _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
+                p.support_override; conditioned = true, rows = _plate_rows(plan, p),
+                float64_inputs = _float64_inputs(plan, values(p.args)))
+        end
+        push!(points, p.name => Symbol(:_ppl_pw_prior_, p.name))
+    end
+    _array_prior_stmts!(stmts, terms, observed, gathers; context = plan, pointwise = points)
+    push!(stmts, :(likelihood::Float64 = $(_sum_terms(terms))))
+    names = first.(points)
+    length(unique(names)) == length(names) || throw(ContractValidationError(
+        "[query] pointwise observation names must be unique, got $names"))
+    values = isempty(points) ? :(NamedTuple()) :
+        Expr(:tuple, (Expr(:(=), name, value) for (name, value) in points)...)
+    push!(stmts, Expr(:(=), :pointwise, values))
+    push!(stmts, _observations_statement(points, arguments))
+    push!(stmts, _predictive_statement(points, laws))
     return stmts
+end
+
+# The `:observations` query: per observation, the arguments its distribution
+# receives, for every response of a location-scale family. They are read off
+# the response's final pointwise plate, whose inputs 1-2 are always the
+# response and its location (`_plate_sum_stmts`); these families thread a
+# non-literal scale as input 3 (`_scale_plate_arg`). Range selection, presence
+# masks, evidence and weights rewrite or append inputs without moving these,
+# so entry `i` of each argument belongs to entry `i` of the response's
+# `:pointwise` densities. A location or scale shared by every observation stays
+# a scalar.
+const _OBSERVATION_LOCATION_SCALE_FAMILIES = (GaussianFam, StudentTFam, LogNormalFam)
+
+function _observation_arguments(r::LikelihoodSpec, plan::StructuralPlan,
+        rs::Vector{Expr})
+    r.family in _OBSERVATION_LOCATION_SCALE_FAMILIES || return nothing
+    if _cell_broadcast_response(plan, r)
+        name = Symbol(:_ppl_obsargs_, r.label)
+        return any(st -> _assigned_name(st) === name, rs) ? name : nothing
+    end
+    inputs = _observation_argument_inputs(r, rs)
+    inputs === nothing && return nothing
+    location, scale = inputs
+    return :((location = $location, scale = $scale))
+end
+
+function _observation_argument_inputs(r::LikelihoodSpec, rs::Vector{Expr})
+    r.family in _OBSERVATION_LOCATION_SCALE_FAMILIES || return nothing
+    pw = _pw_name(r.label)
+    i = findlast(st -> Meta.isexpr(st, :(=), 2) && st.args[1] === pw, rs)
+    i === nothing && return nothing
+    rhs = rs[i].args[2]
+    (Meta.isexpr(rhs, :do) && Meta.isexpr(rhs.args[1], :call) &&
+        rhs.args[1].args[1] === :plate) || return nothing
+    inputs = rhs.args[1].args[2:end]
+    scale = r.scale isa Real ? Float64(r.scale) : deepcopy(inputs[3])
+    return deepcopy(inputs[2]), scale
+end
+
+function _observations_statement(points::Vector{Pair{Symbol,Any}},
+        arguments::Vector{Pair{Symbol,Any}})
+    covered = Set(first.(arguments))
+    missing = Tuple(name for (name, _) in points if !(name in covered))
+    # A tuple literal of quoted names, so the printed program (`kernel_expr`)
+    # parses back to the same call; a `QuoteNode` holding the tuple prints as
+    # `$(QuoteNode(...))`, which `@kernel` cannot evaluate.
+    isempty(missing) || return Expr(:(=), :_ppl_observations, Expr(:call,
+        GlobalRef(@__MODULE__, :_ppl_observations_unsupported),
+        Expr(:tuple, QuoteNode.(missing)...)))
+    values = isempty(arguments) ? :(NamedTuple()) :
+        Expr(:tuple, (Expr(:(=), name, value) for (name, value) in arguments)...)
+    return Expr(:(=), :_ppl_observations, values)
+end
+
+_ppl_observations_unsupported(names::Tuple) = throw(ContractValidationError(
+    "[query] :observations covers responses of the Normal, Student t and " *
+    "LogNormal families observed through a flat, ranged or in-cell plate; " *
+    "this program has no location/scale arguments for " * join(names, ", ")))
+
+# A dotted `@plate` cell (`y[i] .~ D.(v[i], s)`) broadcasts over its own
+# iteration's values, as Julia does. When the bound response holds one array
+# per index, the response's ordinary statements run once per index inside an
+# outer RK plate, giving RK's nested group and observation plates
+# (`reactivekernels-use` §4e1). Values the cell reads per index, and values
+# computed from them, supply that index's array or number; the cell reads
+# every other value whole by closing over it. The pointwise result keeps the
+# response's shape: one array of observation densities per index.
+function _cell_broadcast_stmts(r::LikelihoodSpec, plan::StructuralPlan,
+        stmts::Vector{Expr}, upstream::Vector{Expr})
+    # No index: the ordinary empty-domain statements already sum to zero.
+    if _response_rows(plan, r) == 0
+        r.family in _OBSERVATION_LOCATION_SCALE_FAMILIES || return stmts
+        full = _response_likelihood_stmts_full(_with(r; range = nothing), plan)
+        arguments = _observation_argument_inputs(r, full)
+        arguments === nothing && return stmts
+        generated = _cell_broadcast_group(plan, r.response, _lik_name(r.label),
+            _pw_name(r.label), full, upstream, [p.name for p in plan.predictors],
+            "response $(r.label) observes one array per index, and its $(r.family) statements";
+            arguments, argument_node = Symbol(:_ppl_obsargs_, r.label))
+        return Expr[stmts..., generated[4:end]...]
+    end
+    # The response's predictor nodes lie on its observation axis, here the
+    # indices.
+    pointstmts, pointvalue = _ordinal_pointwise_stmts(r, plan; grouped = true)
+    return _cell_broadcast_group(plan, r.response, _lik_name(r.label), _pw_name(r.label),
+        stmts, upstream, [p.name for p in plan.predictors],
+        "response $(r.label) observes one array per index, and its $(r.family) statements";
+        arguments = _observation_argument_inputs(r, stmts),
+        argument_node = Symbol(:_ppl_obsargs_, r.label), pointstmts, pointvalue,
+        law = _law_name(r.label))
+end
+
+# A caller-owned sampling RHS (`y[i] .~ LogDensity.(f, loc[i], s)`) in the
+# same cell: its law, including a visible `KernelSpec` density, runs on each
+# index's entries exactly as the flat observation plate runs on the entries
+# of a numeric response.
+function _cell_broadcast_stmts(p::SampledParameter, plan::StructuralPlan,
+        stmts::Vector{Expr}, upstream::Vector{Expr})
+    # Keep the outer cell even for an empty response: a constructor may read
+    # per-group values, which must not become whole shared arguments merely
+    # because this invocation has no groups.
+    return _cell_broadcast_group(plan, p.name, Symbol(:_ppl_prior_, p.name),
+        Symbol(:_ppl_pw_prior_, p.name), stmts, upstream, Symbol[],
+        "observation $(p.name) holds one array per index, and its sampling-RHS statements")
+end
+
+function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Symbol,
+        pw::Symbol, stmts::Vector{Expr}, upstream::Vector{Expr},
+        axisnodes::Vector{Symbol}, what::String; arguments = nothing,
+        argument_node::Symbol = :_ppl_unused_observation_arguments,
+        pointstmts = Expr[], pointvalue = pw, law::Union{Nothing,Symbol} = nothing)
+    k = findall(st -> Meta.isexpr(st, :(=), 2) && st.args[1] == :($node::Float64), stmts)
+    (length(k) == 1 && stmts[only(k)].args[2] == :(sum($pw))) ||
+        throw(ContractValidationError("[generator] $what have no summed " *
+            "pointwise plate to run per index"))
+    body = Expr[st for (i, st) in enumerate(stmts) if i != only(k)]
+    # The law gets its own group plate below, zipping only what it reads.
+    lawi = law === nothing ? nothing : findfirst(st -> _assigned_name(st) === law, body)
+    lawstmt = lawi === nothing ? nothing : popat!(body, lawi)
+    append!(body, pointstmts)
+    defined = Set{Symbol}(something.(_assigned_name.(body), :_))
+    known = Set{Symbol}(keys(plan.columns))
+    for st in upstream
+        union!(known, _assigned_names(st))
+    end
+    reads = Set{Symbol}()
+    foreach(st -> _statement_value_reads!(reads,
+        Meta.isexpr(st, :(=), 2) ? st.args[2] : st), body)
+    inputs = sort!(collect(intersect(setdiff!(reads, defined), known)))
+    # Per-index values: the response, the cell's indexed reads, nodes on the
+    # response's observation axis and every upstream definition computed
+    # from them.
+    pergroup = Set{Symbol}([response; plan.cell_broadcasts[response]; axisnodes])
+    # A named identity location may be elided below, leaving its authored
+    # plate result as the actual argument of the observation cell.
+    for node in axisnodes
+        value = _identity_location_value(plan, node)
+        value === nothing && continue
+        i = findfirst(a -> a.name === value, plan.assignments)
+        i !== nothing && _authored_plate_result(plan.assignments[i].expr) &&
+            push!(pergroup, value)
+    end
+    for st in upstream
+        names = _assigned_names(st)
+        isempty(names) && continue
+        used = _statement_value_reads!(Set{Symbol}(), st.args[2])
+        isempty(intersect(used, pergroup)) || union!(pergroup, names)
+    end
+    # The ordinary response statements compute their location/scale before
+    # the inner pointwise plate. Carry that dependency classification through
+    # those statements as well, so a scale shared by all groups remains a
+    # scalar while an indexed scale keeps its group/entry shape.
+    shared_argument_pre = Expr[]
+    group_argument_pre = Expr[]
+    argument_pergroup = copy(pergroup)
+    if arguments !== nothing
+        # A predictor proven scalar may be shared even though the density
+        # cell treats every response predictor as an index-axis input.
+        # Its upstream dependencies still make it per-group when it reads
+        # an indexed cell value.
+        for pred in plan.predictors
+            _predictor_value_type(plan, pred) === :Number &&
+                _scalar_valued_predictor(plan, pred) &&
+                delete!(argument_pergroup, pred.name)
+        end
+        for st in upstream
+            names = _assigned_names(st)
+            isempty(names) && continue
+            used = _statement_value_reads!(Set{Symbol}(), st.args[2])
+            isempty(intersect(used, argument_pergroup)) ||
+                union!(argument_pergroup, names)
+        end
+        for st in body[1:end-1]
+            name = _assigned_name(st)
+            name === nothing && throw(ContractValidationError(
+                "[generator] $what have an unrecognized argument statement"))
+            used = _statement_value_reads!(Set{Symbol}(), st.args[2])
+            if !isempty(intersect(used, argument_pergroup))
+                push!(argument_pergroup, name)
+                push!(group_argument_pre, deepcopy(st))
+            else
+                push!(shared_argument_pre, deepcopy(st))
+            end
+        end
+    end
+    # The plate zips the per-index values; the cell reads every other input
+    # whole by closing over it.
+    lanes = Symbol[v for v in inputs if v in pergroup]
+    aliases = Dict{Symbol,Symbol}(v => Symbol(:_ppl_group_, v) for v in lanes)
+    group = Symbol(pw, :_group)
+    aliases[pw] = group
+    cell = Expr[_hsubst(st, aliases) for st in body]
+    _cell_value_types!(cell, Set{Symbol}(aliases[v] for v in lanes))
+    # Densities are Float64; declaring the observation cell's result also
+    # types an empty index's densities (RK's empty-domain result evidence).
+    for st in cell
+        Meta.isexpr(st, :(=), 2) && st.args[1] === group &&
+            Meta.isexpr(st.args[2], :do) && _declare_cell_result!(st.args[2].args[2])
+    end
+    # The pointwise query reads each index's densities and the likelihood
+    # its per-index totals; RK evaluates only the plate a query selects. The
+    # declared total type also seeds RK's summed plate when the operands'
+    # element types are known only at run time (a composed child's output).
+    groupplate_on(sub, statements, result...) = Expr(:do, Expr(:call, :plate, sub...),
+        Expr(:(->), Expr(:tuple, (aliases[v] for v in sub)...),
+            Expr(:block, LineNumberNode(0, :generator), deepcopy(statements)..., result...)))
+    groupplate(statements, result...) = groupplate_on(lanes, statements, result...)
+    # A value the observation's arguments determine (its law, its location
+    # and scale) zips only the per-index values it reads: the response is
+    # not among them, so a binding that leaves the response absent evaluates
+    # it, with the indices the cell's other per-index values give.
+    function readlanes(statements, value)
+        reads = _statement_value_reads!(Set{Symbol}(), value)
+        foreach(st -> _statement_value_reads!(reads, st.args[2]), statements)
+        sub = Symbol[v for v in lanes if aliases[v] in reads]
+        return isempty(sub) ? lanes : sub
+    end
+    totals = Symbol(pw, :_totals)
+    result = Expr[
+        :($pw = $(groupplate(cell, Expr(:call, GlobalRef(Base, :identity),
+            _hsubst(pointvalue, aliases))))),
+        :($totals = $(groupplate(cell, :(_ppl_group_total::Float64 = sum($group)),
+            :_ppl_group_total))),
+        :($node::Float64 = sum($totals))]
+    if lawstmt !== nothing
+        lawgroup = Symbol(law, :_group)
+        la = copy(aliases)
+        la[law] = lawgroup
+        lawcell, _ = _needed_statements(
+            Expr[(_hsubst(st, la) for st in body)..., _hsubst(lawstmt, la)])
+        lawvalue = Expr(:call, GlobalRef(Base, :identity), lawgroup)
+        sub = readlanes(lawcell, lawvalue)
+        _cell_value_types!(lawcell, Set{Symbol}(aliases[v] for v in sub))
+        push!(result, :($law = $(groupplate_on(sub, lawcell, lawvalue))))
+    end
+    if arguments !== nothing
+        location, scale = arguments
+        grouped(x) = x isa Symbol && x in argument_pergroup
+        append!(result, shared_argument_pre)
+        location_grouped, scale_grouped = grouped(location), grouped(scale)
+        if location_grouped || scale_grouped
+            argument_cell = Expr[_hsubst(st, aliases) for st in group_argument_pre]
+            _cell_value_types!(argument_cell, Set{Symbol}(aliases[v] for v in lanes))
+            loc = _hsubst(location, aliases)
+            sc = _hsubst(scale, aliases)
+            value = location_grouped && scale_grouped ?
+                :((location = $loc, scale = $sc)) : location_grouped ? loc : sc
+            grouped_node = Symbol(argument_node, :_groups)
+            push!(result, :($grouped_node = $(groupplate_on(
+                readlanes(argument_cell, value), argument_cell, value))))
+            project(field) = :(plate($grouped_node) do argument
+                getproperty(argument, $(QuoteNode(field)))
+            end)
+            location_grouped && (location = scale_grouped ?
+                project(:location) : grouped_node)
+            scale_grouped && (scale = location_grouped ?
+                project(:scale) : grouped_node)
+        end
+        push!(result, :($argument_node = (location = $location, scale = $scale)))
+    end
+    return result
+end
+
+# The ordinary statements declare array types for values on the response's
+# observation axis (`_ppl_sc_y::AbstractVector = …`). In a group cell such a
+# value holds one index's value: an array, or a number when the cell reads a
+# per-group scalar (`dose[i] * sigma`). Those statements keep their values
+# and drop the axis declaration; scalar declarations and statements reading
+# only shared values are unchanged.
+function _cell_value_types!(cell::Vector{Expr}, pervalue::Set{Symbol})
+    for st in cell
+        Meta.isexpr(st, :(=), 2) || continue
+        reads = _statement_value_reads!(Set{Symbol}(), st.args[2])
+        isempty(intersect(reads, pervalue)) && continue
+        lhs = st.args[1]
+        if Meta.isexpr(lhs, :(::), 2) && _array_type_annotation(lhs.args[2])
+            st.args[1] = lhs = lhs.args[1]
+        end
+        name = _assigned_name(st)
+        name === nothing || push!(pervalue, name)
+    end
+    return cell
+end
+
+_array_type_annotation(T) = false
+_array_type_annotation(T::Type) = T <: AbstractArray
+_array_type_annotation(T::Symbol) =
+    T in (:AbstractArray, :AbstractVector, :AbstractMatrix, :Array, :Vector, :Matrix)
+_array_type_annotation(T::Expr) =
+    Meta.isexpr(T, :curly) && _array_type_annotation(T.args[1])
+
+function _declare_cell_result!(lambda::Expr)
+    body = lambda.args[2]
+    k = findlast(a -> !(a isa LineNumberNode), body.args)
+    body.args[k] = Expr(:(=), :(_ppl_density::Float64), body.args[k])
+    push!(body.args, :_ppl_density)
+    return lambda
+end
+
+_assigned_name(st) = nothing
+function _assigned_name(st::Expr)
+    Meta.isexpr(st, :(=), 2) || return nothing
+    lhs = st.args[1]
+    Meta.isexpr(lhs, :(::), 2) && (lhs = lhs.args[1])
+    return lhs isa Symbol ? lhs : nothing
+end
+
+# Every name a statement binds, including each name of a destructuring
+# statement (`(a, b) = f(x)`).
+function _assigned_names(st)
+    Meta.isexpr(st, :(=), 2) && Meta.isexpr(st.args[1], :tuple) &&
+        return Symbol[t for t in st.args[1].args if t isa Symbol]
+    name = _assigned_name(st)
+    return name === nothing ? Symbol[] : Symbol[name]
+end
+
+# Value names a generated statement reads: call heads and keyword names are
+# skipped. A plate cell or scan step reads the enclosing names it closes
+# over (`_closure_reads`).
+_statement_value_reads!(out, ex) = out
+_statement_value_reads!(out, ex::Symbol) = push!(out, ex)
+function _statement_value_reads!(out, ex::Expr)
+    if ex.head === :do
+        _statement_value_reads!(out, ex.args[1])
+        _statement_value_reads!(out, ex.args[2])
+    elseif ex.head === :(=) && length(ex.args) == 2 && _assigned_name(ex) !== nothing
+        _statement_value_reads!(out, ex.args[2])
+    elseif ex.head === :call && !isempty(ex.args)
+        foreach(a -> _statement_value_reads!(out, a), ex.args[2:end])
+    elseif ex.head === :. && length(ex.args) == 2
+        ex.args[2] isa QuoteNode && _statement_value_reads!(out, ex.args[1])
+        ex.args[2] isa Expr && foreach(a -> _statement_value_reads!(out, a),
+            ex.args[2].args)
+    elseif ex.head === :kw
+        _statement_value_reads!(out, ex.args[2])
+    elseif ex.head === :(->)
+        union!(out, _closure_reads(ex))
+    else
+        foreach(a -> _statement_value_reads!(out, a), ex.args)
+    end
+    return out
+end
+
+# The enclosing names a cell or step body reads, as a Julia closure does: the
+# names it reads less its arguments and the locals it assigns.
+function _closure_reads(lambda::Expr)
+    params = lambda.args[1]
+    bound = Set{Symbol}()
+    for p in (Meta.isexpr(params, :tuple) ? params.args : Any[params])
+        Meta.isexpr(p, :(::)) && (p = p.args[1])
+        p isa Symbol && push!(bound, p)
+    end
+    _assigned_names!(bound, lambda.args[2])
+    return setdiff!(_statement_value_reads!(Set{Symbol}(), lambda.args[2]), bound)
+end
+
+# Locals a body assigns, outside its nested cells.
+function _assigned_names!(out::Set{Symbol}, ex)
+    ex isa Expr && ex.head !== :(->) || return out
+    name = _assigned_name(ex)
+    name === nothing || push!(out, name)
+    if Meta.isexpr(ex, :(=), 2) && Meta.isexpr(ex.args[1], :tuple)
+        foreach(a -> a isa Symbol && push!(out, a), ex.args[1].args)
+    end
+    foreach(a -> _assigned_names!(out, a), ex.args)
+    return out
+end
+
+# Packed observations keep their own axis. Every other observation input
+# uses the same retained gather plate, including bounds, weights and trials.
+_mi_row_value(x::Number, i) = x
+@traceable _mi_row_value(x::AbstractVector, i) = x[i]
+
+_ppl_range_values(x::Number, indices) = x
+_ppl_range_values(x::AbstractArray, indices) = x[indices]
+
+# `ones(n) .* x` without the ones operand: a number fills the rows, and a
+# vector already holding one Float64 per row is that location value itself,
+# including a view. Other values (traced, integer, singleton or mismatched)
+# keep Julia's broadcast against the rows, including its dimension errors.
+@inline _ppl_rows(x::Float64, n::Int) = fill(x, n)
+@inline _ppl_rows(x::AbstractVector{Float64}, n::Int) =
+    axes(x, 1) == Base.OneTo(n) ? x : ones(n) .* x
+@inline _ppl_rows(x, n::Int) = ones(n) .* x
+
+# A selected plate column already holds one value per selected response cell
+# (`_selected_plate_indices`); only whole operands are gathered at the
+# authored indices. Positions and indices differ for a literal `a:b`. Read
+# without a gather, the observation plate consumes the column's plate
+# directly, so a cell query composes it and runs only that cell.
+function _ranged_response_stmts(r, plan, stmts)
+    idx = Symbol(:_ppl_range_indices_, r.label)
+    selected = Symbol(:_ppl_range_response_, r.label)
+    pre = Expr[:($idx = collect($(_range_index_expr(r))))]
+    if _response_rows(plan, r) == 0 && r.response in plan.indexed_observations
+        push!(pre, :($selected = zeros(0)))
+    else
+        push!(pre, Expr(:(=), selected, Expr(:ref, r.response, idx, r.range.args[3:end]...)))
+    end
+    aliases = Dict{Symbol,Symbol}(r.response => selected)
+    if r.response in plan.indexed_observations
+        rows = Set{Symbol}()
+        # Select ordinary row values before family-specific conversions or
+        # ordinal stage expansion. Simplexes and covariance factors stay whole.
+        if r.family ∉ (CategoricalFam, MultinomialFam)
+            push!(rows, _location_node(r, plan))
+            union!(rows, r.extra_predictors)
+        end
+        for slot in (r.scale, r.nu, r.zi, r.discrimination, r.weights, r.trials,
+                r.evidence.lower, r.evidence.upper, r.threshold_columns...,
+                r.count_columns..., r.extra_responses...)
+            if slot isa ScalePredictorRef
+                push!(rows, slot.predictor)
+            elseif slot isa Symbol
+                push!(rows, slot)
+            end
+        end
+        r.thresholds isa ThresholdRows && push!(rows, r.thresholds.name)
+        for (i, value) in enumerate(sort!(collect(rows)))
+            value === r.response && continue
+            _selected_cell_value(plan, r, value) && continue
+            alias = Symbol(:_ppl_range_operand_, r.label, :_, i)
+            getter = GlobalRef(@__MODULE__, :_ppl_range_values)
+            push!(pre, :($alias = $getter($value, $idx)))
+            aliases[value] = alias
+        end
+    end
+    stmts = Expr[_hsubst(st, aliases) for st in stmts]
+    return Expr[pre..., stmts...]
+end
+
+# Pure scalar math keeps the CDF inside the selected censoring arm; endpoint
+# expansion currently cannot splice the normal CDF's multi-recipe graph there.
+_mixture_normal_cdf(x, mu, sigma) = 0.5 * erfc((mu - x) / (sqrt(2.0) * sigma))
+
+function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
+    # No cell is evaluated on an empty bound observation domain. Its sum is
+    # the additive identity, independently of the response family.
+    if _response_rows(plan, r) == 0 || !_has_observed_response(plan, r)
+        obs = _observation_axes(plan)
+        shape = obs !== nothing && hasproperty(obs, :domains) ?
+            length.(obs.domains[r.label]) :
+            r.range isa Expr ? size(_selected_response_column(plan, r)) : size(plan.columns[r.response])
+        stmts = Expr[
+        :($(_pw_name(r.label)) = zeros($shape)),
+        :($(_lik_name(r.label))::Float64 = 0.0)]
+        # An empty response draws nothing, so its law reads nothing.
+        _response_rows(plan, r) == 0 && push!(stmts, :($(_law_name(r.label)) = ()))
+        return stmts
+    end
+    stmts = _response_likelihood_stmts_full(r, plan)
+    # The law each observation is drawn from (`prepare_predictive`) is read
+    # off the density's own plate before range, presence and packing rewrite
+    # it, so those rewrites reach the law exactly as they reach the density.
+    law = _law_statement(r, stmts)
+    law === nothing || push!(stmts, law)
+    if r.range isa Expr
+        return _mask_response_stmts(r, plan, _ranged_response_stmts(r, plan, stmts))
+    end
+    stmts = _mask_response_stmts(r, plan, stmts)
+    r.mi_jobs === nothing && return stmts
+    if r.family === OrdinalFam && r.ordinal_structure === :stopping
+        return _mi_stopping_response_stmts(r, plan, stmts)
+    end
+    _is_glm_family(r.family) && r.evidence.kind === :none && return stmts # fused design selects Jobs before eta
+    pre = Expr[]
+    jobs = r.mi_jobs
+    packed = nothing
+    if r.range !== nothing
+        packed = Symbol(:_ppl_mi_packed_, r.label)
+        selected = Symbol(:_ppl_mi_rows_, r.label)
+        # Data-only selection runs at preparation; it never emits one body
+        # per selected row. Jobs address the full axis, y the packed axis.
+        rng = r.range
+        push!(pre, :($packed = findall(j -> j in $rng, $jobs)))
+        push!(pre, :($selected = $jobs[$packed]))
+        jobs = selected
+    end
+    obsidx = findfirst(st -> st.head === :(=) && st.args[1] === _pw_name(r.label), stmts)
+    obsidx === nothing && throw(ContractValidationError(
+        "[generator] mi response $(r.label) has no observation plate"))
+    let st = stmts[obsidx]
+        call = st.args[2].args[1]
+        call.args[1] === :plate || throw(ContractValidationError(
+            "[generator] mi response $(r.label) needs an observation plate"))
+        for i in 2:length(call.args)
+            ref = call.args[i]
+            # Shared whole values (e.g. a simplex) are read by the cell, not
+            # zipped; only named inputs are rows.
+            ref isa Symbol || continue
+            ispacked = i == 2 || ref in _mi_packed_columns(r)
+            ispacked && packed === nothing && continue
+            rows = ispacked ? packed : jobs
+            call.args[i] = _mi_gather_node!(pre, rows, ref, r.label)
+        end
+    end
+    return Expr[stmts[1:obsidx-1]..., pre..., stmts[obsidx:end]...]
+end
+
+# Presence is bound data. RK's ordinary plate branch lowering partitions the
+# lanes before density evaluation, so Missing/union values never enter RK or AD.
+# Full response axes and all model declarations remain intact.
+function _mask_response_stmts(r, plan, stmts)
+    mask = _observed_mask_name(r.response)
+    haskey(plan.columns, mask) || return stmts
+    pre = Expr[]
+    if r.range isa Expr
+        selected = Symbol(:_ppl_present_range_, r.label)
+        idx = Symbol(:_ppl_range_indices_, r.label)
+        push!(pre, Expr(:(=), selected, Expr(:ref, mask, idx, r.range.args[3:end]...)))
+        mask = selected
+    end
+    if r.family === OrdinalFam && r.ordinal_structure === :stopping &&
+            r.evidence.kind === :none && r.n_levels > 1
+        stages = Symbol(:_ppl_present_stages_, r.label)
+        obs = _stage_lane(r.label, :obs)
+        push!(pre, :($stages = $mask[$obs]))
+        mask = stages
+    end
+    pw = _pw_name(r.label)
+    i = findfirst(st -> st.head === :(=) && st.args[1] === pw, stmts)
+    i === nothing && throw(ContractValidationError("[generator] response $(r.label) has no pointwise observation"))
+    st = deepcopy(stmts[i])
+    rhs = st.args[2]
+    if Meta.isexpr(rhs, :do) && rhs.args[1].args[1] === :plate
+        inputs, lambda = rhs.args[1], rhs.args[2]
+        # A shared input has no dovar: take the first one the cell lacks.
+        used = _statement_value_reads!(_bound_names!(Set{Symbol}(), lambda),
+            lambda.args[2])
+        k = 1
+        while _dovar(k) in used
+            k += 1
+        end
+        present = _dovar(k)
+        push!(inputs.args, mask)
+        push!(lambda.args[1].args, present)
+        lambda.args[2] = Expr(:block, LineNumberNode(0, :generator),
+            Expr(:if, present, lambda.args[2], 0.0))
+        return Expr[stmts[1:i-1]..., pre..., st, stmts[i+1:end]...]
+    end
+    throw(ContractValidationError(
+        "[generator] response $(r.label) needs an observation plate for presence guards"))
+end
+
+# Stopping-ratio inputs must be packed before stage expansion. Selecting
+# its final plate would mistake stage lanes for full observation rows.
+function _mi_stopping_response_stmts(r, plan, stmts)
+    pre = Expr[]
+    jobs = r.mi_jobs
+    observed = Symbol(:_ppl_mi_response_, r.label)
+    if r.range === nothing
+        push!(pre, :($observed = $(r.response)))
+    else
+        packed = Symbol(:_ppl_mi_packed_, r.label)
+        selected = Symbol(:_ppl_mi_rows_, r.label)
+        push!(pre, :($packed = findall(j -> j in $(r.range), $jobs)),
+            :($selected = $jobs[$packed]),
+            :($observed = $(r.response)[$packed]))
+        jobs = selected
+    end
+    aliases = Dict{Symbol,Symbol}(r.response => observed)
+    rows = Set{Symbol}([_location_node(r, plan)])
+    r.thresholds isa ThresholdRows && push!(rows, r.thresholds.name)
+    for ref in (r.weights, r.discrimination, r.evidence.lower, r.evidence.upper,
+            r.threshold_columns...)
+        if ref isa ScalePredictorRef
+            push!(rows, ref.predictor)
+        elseif ref isa Symbol
+            push!(rows, ref)
+        end
+    end
+    for ref in sort!(collect(rows))
+        aliases[ref] = _mi_gather_node!(pre, jobs, ref, r.label)
+    end
+    if r.threshold_effects !== nothing
+        matrix = Symbol(:_ppl_mi_effects_, r.label)
+        push!(pre, :($matrix = $(r.threshold_effects)[$jobs, :]))
+        aliases[r.threshold_effects] = matrix
+    end
+    return Expr[pre..., (_hsubst(st, aliases) for st in stmts)...]
 end
 
 # One plate likelihood per response (pointwise plate + scalar sum node).
 # Triples 2 and 3 (Bernoulli-logit) lower identically; the triple only
 # selects the form. Branches are explicit per family; the else is a
 # fail-closed guard for enum members without an emitter (never silent).
-function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
+function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan)
     node = _lik_name(r.label)
     pw = _pw_name(r.label)
     if r.family === GaussianFam
+        # Every location, a data-matrix product `M * v` included, sums its
+        # cells in the observation plate. RK reduces a total-only plate in one
+        # loop with the scale's invariants hoisted, so the reverse pass reads
+        # the location in place instead of a materialized residual vector.
         return _gaussian_plate_stmts(r, plan, node, pw)
+    elseif r.family === StudentTFam
+        return _student_plate_stmts(r, plan, node, pw)
+    elseif r.family === LogNormalFam
+        return _lognormal_plate_stmts(r, plan, node, pw)
     elseif r.family === BernoulliLogitFam
+        # Keep stable scalar arithmetic through the summed plate. The
+        # algebraic dot(y, eta) - sum(log1pexp, eta) loses representable
+        # positive tails. RK can fuse the predictor into this same plate.
         return _bernoulli_plate_stmts(r, plan, node, pw)
     elseif r.family === PoissonLogFam
+        # Base GLM case (no evidence, no weights, no literal range): fused
+        # whole-vector reduction (faster native + Reactant; the per-cell
+        # plate handles evidence/weights/ranges).
+        r.evidence.kind === :none && r.weights === nothing &&
+            r.range === nothing && r.mi_jobs === nothing && r.link === LogLink &&
+            !haskey(plan.columns, _observed_mask_name(r.response)) &&
+            !_is_bare_param_location(r, plan) &&
+            !_cell_broadcast_response(plan, r) &&
+            _wholevec_location(r, plan) &&
+            return _poisson_wholevec_stmts(r, plan, node)
         return _poisson_plate_stmts(r, plan, node, pw)
+    elseif r.family === HurdlePoissonFam
+        return _hurdle_plate_stmts(r, plan, node, pw)
+    elseif r.family === ZeroInflatedPoissonFam
+        return _zip_plate_stmts(r, plan, node, pw)
+    elseif r.family === InverseGaussianFam
+        return _ig_plate_stmts(r, plan, node, pw)
+    elseif r.family === ExponentialLogFam
+        return _exponential_plate_stmts(r, plan, node, pw)
+    elseif r.family === VonMisesFam
+        return _vonmises_plate_stmts(r, plan, node, pw)
     elseif r.family === BinomialLogitFam
+        # Base GLM case: fused whole-vector reduction with the data-only
+        # binomial coefficient a named recipe that preparation folds.
+        r.evidence.kind === :none && r.weights === nothing &&
+            r.range === nothing && r.mi_jobs === nothing && r.link === LogitLink &&
+            !haskey(plan.columns, _observed_mask_name(r.response)) &&
+            !_is_bare_param_location(r, plan) &&
+            !_cell_broadcast_response(plan, r) &&
+            _wholevec_location(r, plan) && _wholevec_trials(r, plan) &&
+            return _binomial_wholevec_stmts(r, plan, node)
         return _binomial_plate_stmts(r, plan, node, pw)
+    elseif r.family === BinomialProbFam
+        return _binomial_prob_plate_stmts(r, plan, node, pw)
+    elseif r.family === ZeroInflatedBinomialFam
+        return _zib_plate_stmts(r, plan, node, pw)
     elseif r.family === NegativeBinomial2Fam
         return _nb2_plate_stmts(r, plan, node, pw)
-    elseif r.family === GammaLogFam
+    elseif r.family === NegativeBinomialFam
+        return _nb1_plate_stmts(r, plan, node, pw)
+    elseif r.family === WeibullFam || r.family === WeibullValueFam
+        return _weibull_plate_stmts(r, plan, node, pw)
+    elseif r.family === GammaLogFam || r.family === GammaValueFam
         return _gamma_plate_stmts(r, plan, node, pw)
+    elseif r.family === BernoulliProbitFam
+        return _bernoulli_probit_plate_stmts(r, plan, node, pw)
+    elseif r.family === BernoulliCloglogFam
+        return _bernoulli_cloglog_plate_stmts(r, plan, node, pw)
+    elseif r.family === BinomialProbitFam
+        return _binomial_probit_plate_stmts(r, plan, node, pw)
+    elseif r.family === BinomialCloglogFam
+        return _binomial_cloglog_plate_stmts(r, plan, node, pw)
+    elseif r.family === BetaLogitFam
+        return _beta_plate_stmts(r, plan, node, pw)
+    elseif r.family === BetaShapeFam
+        return _beta_shape_plate_stmts(r, plan, node, pw)
+    elseif r.family === BetaBinomial2Fam
+        return _betabinomial2_plate_stmts(r, plan, node, pw)
+    elseif r.family === CategoricalLogitFam
+        return _categorical_plate_stmts(r, plan, node, pw)
+    elseif r.family === OrderedLogisticFam || r.family === OrdinalFam
+        return _ordinal_plate_stmts(r, plan, node, pw)
+    elseif r.family === MultinomialFam
+        return _multinomial_plate_stmts(r, plan, node, pw)
+    elseif r.family === CategoricalFam
+        return _categorical_plain_plate_stmts(r, plan, node, pw)
+    elseif r.family === MvNormalCholeskyFam
+        return _mvn_cholesky_plate_stmts(r, plan, node, pw)
+    elseif r.family === MixtureFam
+        return _mixture_plate_stmts(r, plan, node, pw)
+    elseif _is_glm_family(r.family)
+        return _glm_object_stmts(r, plan, node, pw)
     else
         throw(ContractValidationError(
             "[generator] response family $(r.family) has no emitter"))
     end
 end
 
+# Finite-mixture likelihood (SB `MixtureModel` mirror): K same-family
+# components over dedicated slots lower to ONE plate; each row contributes
+# a stable logaddexp fold over `logw_k + lpdf_k` (linear in K).
+# Predictor locations ride their LP nodes
+# (link-space, inverted per the component link like the single-family
+# builders); sampled params thread scalar (broadcast) and literals inline
+# (both constrained-scale, no inversion). K=1 uses the general form
+# (exact: the single component contribution).
+function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
+        node::Symbol, pw::Symbol)
+    f = r.mixture_family
+    K = length(r.mixture_locs)
+    y = r.response
+    inputs = Any[y]
+    yv = _dovar(1)
+    pre = Expr[]
+    # Bernoulli widths: validated Bool-or-0/1-Int; the endpoint takes
+    # Bool lanes (bind-folded `_ppl_yb_` recipe, never an in-cell
+    # comparison — `_bernoulli_yplate!`).
+    yref = yv
+    if f === BernoulliLogitFam
+        yin, yref = _bernoulli_yplate!(pre, plan, y, r.label, yv)
+        inputs[1] = yin
+    end
+    # Equal trial arguments share one input; distinct arguments thread per component.
+    nref = nothing
+    if f === BinomialLogitFam
+        inputs[1] = _count_yplate!(pre, plan, y, r.label)
+        if r.trials !== nothing
+            nref = _thread_ref!(inputs, r.trials, true)
+        end
+    end
+    # Weights: literals fold at codegen; a simplex parameter binds one
+    # log-vector hoisted out of the plate, which every cell reads whole
+    # (the multinomial-plate precedent) — K logs, not n×K.
+    w = r.mixture_weights
+    logw_lit = w isa Vector ? log.(w) : nothing
+    lwv = nothing
+    logw_comp = nothing
+    if w isa Symbol
+        logp = _logp_name(r.label)
+        push!(pre, :($logp::AbstractVector{Float64} = log.($w)))
+        push!(inputs, :(Ref($logp)))
+        lwv = _dovar(length(inputs))
+    elseif w isa MixtureComplementWeights
+        # Complement pair (K == 2 by contract): both log weights are
+        # model-level scalars hoisted out of the plate, like the simplex
+        # log-vector above — 2 logs, not 2n. `log1p(-p)` is the stable
+        # `log(1-p)` arm.
+        logp = Symbol(:_ppl_mix_logw_, r.label)
+        logq = Symbol(:_ppl_mix_logw_complement_, r.label)
+        push!(pre, :($logp::Float64 = log($(w.param))),
+            :($logq::Float64 = log1p(-$(w.param))))
+        pv, qv = _thread_ref!(inputs, logp), _thread_ref!(inputs, logq)
+        logw_comp = w.param_first ? (pv, qv) : (qv, pv)
+    end
+    terms = Expr[]
+    distributions = Any[]
+    logweights = Any[]
+    parameter_guards = Any[]
+    for k in 1:K
+        klab = Symbol(r.label, :_mix, k)
+        locref, is_lp = _mixture_loc_ref(r, plan, k)
+        nk = isempty(r.mixture_trials) ? nref :
+            _thread_ref!(inputs, r.mixture_trials[k], true)
+        normal_params = Any[]
+        lpdf = _mixture_component_lpdf(f, r, plan, pre, inputs, k, klab,
+            locref, is_lp, yv, yref, nk; normal_params)
+        if lpdf.head === :if
+            push!(parameter_guards, lpdf.args[1])
+            # One lazy domain guard encloses the entire mixture, including
+            # its evidence corrections. Each component is evaluated only in
+            # that valid arm, so repeating its guard inside the arm adds no
+            # semantics and needlessly nests the differentiated branches.
+            lpdf = lpdf.args[2]
+        end
+        logw_k = logw_lit === nothing ?
+            (logw_comp === nothing ? :($lwv[$k]) : logw_comp[k]) :
+            logw_lit[k]
+        push!(terms, :($logw_k + $lpdf))
+        push!(distributions, _evidence_endpoint(lpdf))
+        push!(logweights, logw_k)
+    end
+    cell = foldl((a, b) -> :(logaddexp($a, $b)), terms)
+    function tail(b, upper)
+        pieces = map(eachindex(distributions)) do k
+            dist = distributions[k]
+            t = if f === BernoulliLogitFam
+                upper ? :($b < 0 ? 1.0 : ($b >= 1 ? 0.0 : $dist.cdf(true) - $dist.cdf(false))) :
+                    :($b < 0 ? 0.0 : ($b >= 1 ? 1.0 : $dist.cdf(false)))
+            else
+                upper ? :($dist.ccdf($b)) : :($dist.cdf($b))
+            end
+            :(exp($(logweights[k])) * $t)
+        end
+        foldl((a, b) -> :($a + $b), pieces)
+    end
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell;
+        cdf=b -> tail(b, false), ccdf=b -> tail(b, true))
+    if !isempty(parameter_guards)
+        valid = foldl((a, b) -> :($a && $b), parameter_guards)
+        shared = r.weights === nothing && r.range === nothing && r.mi_jobs === nothing ?
+            _shared_mixture_guard(valid, inputs, plan, pre) : nothing
+        if shared !== nothing
+            # Compute model-level support once; the observation cell still
+            # takes a lazy branch, retaining its own native/compiled loop.
+            support = Symbol(:_ppl_mix_valid_, r.label)
+            push!(pre, :($support::Bool = $shared))
+            valid = _thread_ref!(inputs, support)
+        end
+        cell = :($valid ? $cell : -Inf)
+    end
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+function _shared_mixture_guard(valid, inputs, plan, pre)
+    refs = _expr_value_symbols(valid)
+    replacements = Dict{Symbol,Symbol}()
+    for (i, input) in enumerate(inputs)
+        ref = _dovar(i)
+        ref in refs || continue
+        input isa Symbol || return nothing
+        scalar = any(p -> p.name === input, plan.parameters) ||
+            get(plan.columns, input, nothing) isa Number ||
+            any(p -> p.name === input &&
+                _predictor_value_type(plan, p) === :Number, plan.predictors) ||
+            any(pre) do st
+                st.head === :(=) && st.args[1] isa Expr &&
+                    st.args[1].head === :(::) && st.args[1].args == Any[input, :Number]
+            end
+        scalar || return nothing
+        replacements[ref] = input
+    end
+    length(replacements) == length(refs) || return nothing
+    return _subst_syms(valid, replacements)
+end
+
+# One mixture location slot → `(ref, is_lp)`: a predictor yields its LP
+# node (link-space); a sampled parameter yields its name (threaded scalar
+# at the use site); a literal yields its Float64 (inlined). Threading
+# happens at the use site via `_thread_ref!`, never here: pre-statements
+# need layout-legal refs (nodes, params, literals), not plate do-vars.
+function _mixture_loc_ref(r::LikelihoodSpec, plan::StructuralPlan, k::Int)
+    loc = r.mixture_locs[k]
+    loc isa Real && return Float64(loc), false
+    return loc, any(p -> p.name === loc, plan.predictors)
+end
+
+# One mixture component's scalar log-density: the single-family endpoint
+# spelling over that component's slots (per-component precompute labels).
+function _mixture_component_lpdf(f::LikelihoodFamily, r::LikelihoodSpec,
+        plan::StructuralPlan, pre::Vector{Expr}, inputs::Vector{Any}, k::Int,
+        klab::Symbol, locref, is_lp::Bool, yv::Symbol, yref, nref;
+        normal_params::Vector{Any} = Any[])
+    if f === BernoulliLogitFam && is_lp && r.link === LogitLink
+        eta = _thread_ref!(inputs, locref)
+        return :(bernoulli(; logit = $eta).logpdf($yref))
+    elseif f === PoissonLogFam && is_lp && r.link === LogLink
+        eta = _thread_ref!(inputs, locref)
+        return :(poisson(; log_rate = $eta).logpdf($yv))
+    elseif f === BinomialLogitFam && is_lp && r.link === LogitLink
+        eta = _thread_ref!(inputs, locref)
+        return :(binomial(; n = $nref, logit = $eta).logpdf($yv))
+    end
+    value = locref
+    if is_lp && r.link !== IdentityLink
+        value = _mu_name(klab)
+        typ = _predictor_value_type(plan, _predictor(plan, r.mixture_locs[k]))
+        push!(pre, :($value::$typ = $(_inverse_link_expr(r.link, locref))))
+    end
+    locv = _thread_ref!(inputs, value)
+    if f === GaussianFam
+        sarg = _scale_use_plate_arg(r, plan, pre, r.mixture_scales[k], klab)
+        sref = _thread_ref!(inputs, sarg)
+        append!(normal_params, (locv, sref))
+        return :($sref > 0 ? normal($locv, $sref).logpdf($yv) : -Inf)
+    elseif f === BernoulliLogitFam
+        return :((($locv >= 0) & ($locv <= 1)) ? bernoulli($locv).logpdf($yref) : -Inf)
+    elseif f === PoissonLogFam
+        return :($locv >= 0 ? poisson($locv).logpdf($yv) : -Inf)
+    elseif f === BinomialLogitFam
+        return :((($locv >= 0) & ($locv <= 1)) ? binomial($nref, $locv).logpdf($yv) : -Inf)
+    elseif f === NegativeBinomial2Fam
+        sarg = _scale_use_plate_arg(r, plan, pre, r.mixture_scales[k], klab)
+        phiref = _thread_ref!(inputs, sarg)
+        return :($phiref > 0 && $locv >= 0 ?
+            negative_binomial2($locv, $phiref).logpdf($yv) : -Inf)
+    elseif f === GammaLogFam
+        sarg = _scale_use_plate_arg(r, plan, pre, r.mixture_scales[k], klab)
+        aref = _thread_ref!(inputs, sarg)
+        return :($aref > 0 && $locv > 0 ? gamma($aref, $aref / $locv).logpdf($yv) : -Inf)
+    elseif f === BetaLogitFam
+        sarg = _scale_use_plate_arg(r, plan, pre, r.mixture_scales[k], klab)
+        kap = sarg isa Symbol ? sarg : Float64(sarg)
+        a = _shape_a_name(klab)
+        b = _shape_b_name(klab)
+        push!(pre, :($a = $value .* $kap), :($b = (1 .- $value) .* $kap))
+        avv = _thread_ref!(inputs, a)
+        bvv = _thread_ref!(inputs, b)
+        return :($avv > 0 && $bvv > 0 ? beta($avv, $bvv).logpdf($yv) : -Inf)
+    end
+    throw(ContractValidationError("[generator] mixture over $f has no cell emitter"))
+end
+
+# A GLM-object response: fused constructed-endpoint applications
+# over the whole column (no plate — the object owns eta). The
+# intercept-free design matrix gains its ones column from the bound
+# row count (data-only, folds at prepare) and the split coefficients
+# rejoin as `beta_full = [alpha; beta]` (the validated P2 spelling).
+function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
+        pw::Symbol)
+    if r.evidence.kind !== :none || haskey(plan.columns, _observed_mask_name(r.response))
+        lp = Symbol(:_ppl_glm_eta_, r.label)
+        pre = Expr[:($lp = $(r.glm_alpha) .+ $(r.predictor) * $(r.glm_beta))]
+        inputs = Any[r.response, lp]
+        yv, etav = _dovar(1), _dovar(2)
+        base = if r.family === NormalIDGLMFam
+            sv = _thread_ref!(inputs, r.scale)
+            :(normal($etav, $sv).logpdf($yv))
+        elseif r.family === BernoulliLogitGLMFam
+            :(bernoulli(; logit=$etav).logpdf($yv == 1))
+        else
+            :(poisson(; log_rate=$etav).logpdf($yv))
+        end
+        cell = _wrap_evidence!(r, plan, pre, inputs, base)
+        return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+    end
+    obj = r.family === NormalIDGLMFam ? :normal_id_glm :
+        r.family === BernoulliLogitGLMFam ? :bernoulli_logit_glm :
+        :poisson_log_glm
+    y, X = r.response, r.predictor
+    yf = _yfloat_name(r.label)
+    xaug = Symbol(:_ppl_glm_X_, r.label)
+    bfull = Symbol(:_ppl_glm_b_, r.label)
+    yconv = r.family === NormalIDGLMFam ? :Float64 : :Int
+    s = r.scale isa Symbol ? r.scale : :(Float64($(r.scale)))
+    o = r.family === NormalIDGLMFam ? :($obj($xaug, $bfull, $s)) : :($obj($xaug, $bfull))
+    design = r.mi_jobs === nothing ? X : Expr(:ref, X, r.mi_jobs, :(:))
+    n = r.mi_jobs === nothing ? _response_rows_source(plan, r) : Expr(:call, :length, r.mi_jobs)
+    xaug_expr, bfull_expr = _glm_design_args(design, r.glm_alpha, r.glm_beta, n)
+    head = Expr[
+        :($yf = $yconv.($y)),
+        :($xaug = $xaug_expr),
+        :($bfull = $bfull_expr),
+    ]
+    r.family === PoissonLogGLMFam &&
+        return Expr[head..., _poisson_glm_split_stmts(r, o, yf, pw, node)...]
+    # Call the owned Normal rule directly, as the equivalent per-observation
+    # design-product path does. The object remains for pointwise queries, but
+    # the sampler need not enter its constructed `logpdf` endpoint. Its
+    # reverse branch is one X'r product; Bernoulli still sums its pointwise
+    # vector.
+    density = r.family === NormalIDGLMFam ?
+        :(normal_id_glm_lpdf($xaug, $bfull, $s, $yf)) : :(sum($pw))
+    return Expr[head..., :($pw = $o.pointwise($yf)), :($node::Float64 = $density)]
+end
+
+# The GLM design and coefficients over `n` rows. A literal zero intercept adds
+# nothing: the object reads X and beta as they are, with no ones column; any
+# other intercept prepends a ones column (data-only, folded at preparation)
+# and its coefficient.
+_glm_design_args(design, alpha, beta, n) = alpha isa Real && iszero(alpha) ?
+    (:(Float64.($design)), :([$beta;])) :
+    (:(hcat(ones($n), $design)), :([$alpha; $beta]))
+
+# The Poisson-log object's density in its two endpoint parts, as a count plate
+# sums them (`_count_plate_stmts!`): `logkernel` reads eta, and
+# `lognormalizer`, `-log(y!)`, reads the bound response only, so preparation
+# folds it and its sum and no `loggamma` runs per evaluation. The pointwise
+# vector adds the two, so a sweep that retains it evaluates the kernel once.
+function _poisson_glm_split_stmts(r::LikelihoodSpec, o::Expr, yf::Symbol,
+        pw::Symbol, node::Symbol)
+    pwk, kern = Symbol(:_ppl_pwk_, r.label), Symbol(:_ppl_kernel_, r.label)
+    pwn, norm = Symbol(:_ppl_pwn_, r.label), Symbol(:_ppl_lnorm_, r.label)
+    return Expr[
+        :($pwk = $o.logkernel($yf)),
+        :($pwn = $o.lognormalizer($yf)),
+        :($pw = $pwk .+ $pwn),
+        :($kern::Float64 = sum($pwk)),
+        :($norm = sum($pwn)),
+        :($node::Float64 = $kern + $norm),
+    ]
+end
+
 _predictor(plan::StructuralPlan, name::Symbol) =
     only(p for p in plan.predictors if p.name === name)
+
+# A scan-state or per-cell (plate) latent vector read directly as the
+# location: `r.predictor` names that vector, not a PredictorSpec.
+_is_latent_location(r::LikelihoodSpec, plan::StructuralPlan) =
+    any(s -> r.predictor in s.states, plan.scans) || _is_plate_param(plan, r.predictor)
+
+# A pure identity predictor over an authored value has no computation of its
+# own. The value is available before predictors, so its graph node is the
+# response location. Other predictors, including unnamed inline
+# locations, keep their own nodes.
+function _identity_location_value(plan::StructuralPlan, name::Symbol)
+    any(r -> r.predictor === name || name in r.extra_predictors,
+        plan.responses) || return nothing
+    i = findfirst(p -> p.name === name, plan.predictors)
+    i === nothing && return nothing
+    pred = plan.predictors[i]
+    length(pred.terms) == 1 || return nothing
+    term = only(pred.terms)
+    term.kind === ComposedTerm && term.options.tree isa Symbol || return nothing
+    value = term.options.tree
+    any(a -> a.name === value, plan.assignments) ||
+        any(d -> d.name === value, plan.derived) || return nothing
+    return value
+end
+
+function _location_node(r::LikelihoodSpec, plan::StructuralPlan)
+    value = _identity_location_value(plan, r.predictor)
+    value === nothing && return r.predictor
+    pred = _predictor(plan, r.predictor)
+    term = only(pred.terms)
+    # Unknown-shape values still need the existing row normalization before
+    # the plate; the generator will inline it at the read, under `value`.
+    _composed_needs_rows(plan, pred, term, value) && return r.predictor
+    return value
+end
+
+# The value shape of a response's location (see `_predictor_value_type`).
+_location_value_type(r::LikelihoodSpec, plan::StructuralPlan) =
+    _is_latent_location(r, plan) ? :AbstractVector :
+        _predictor_value_type(plan, _predictor(plan, r.predictor))
+
+# Entry count of a latent vector: a scan trajectory or a plate latent.
+function _latent_rows(plan::StructuralPlan, name::Symbol)
+    for s in plan.scans
+        name in s.states && return _scan_length(plan, s)
+    end
+    i = findfirst(p -> p.name === name, plan.plate_parameters)
+    return i === nothing ? nothing : _plate_rows(plan, plan.plate_parameters[i])
+end
+
+# The fused whole-vector likelihoods (`dot(y, η)`, `sum(exp, η)`) need one
+# location entry per response entry. A latent vector keeps its own length and
+# broadcasts as a Julia array does (one entry stretches over every row), and so
+# does a response: a number or one-entry `y` stretches over a longer location.
+# The plate path evaluates that, so fusion requires equal lengths.
+function _wholevec_location(r::LikelihoodSpec, plan::StructuralPlan)
+    _is_latent_location(r, plan) || !_broadcast_affine(plan, _predictor(plan, r.predictor)) ||
+        return false
+    return _wholevec_rows(r, plan)
+end
+
+# The location has one row per response entry. A predictor that broadcasts a
+# scalar intercept over a vector summand still has those rows; whether that
+# predictor is read whole is the caller's choice.
+function _wholevec_rows(r::LikelihoodSpec, plan::StructuralPlan)
+    y = get(plan.columns, r.response, nothing)
+    rows = y isa AbstractVector ? length(y) : nothing
+    _is_latent_location(r, plan) && return _latent_rows(plan, r.predictor) == rows
+    pred = _predictor(plan, r.predictor)
+    # A predictor that reads or feeds several row counts (singleton operands
+    # broadcast over responses of different lengths) has no single row
+    # count, so it is not read whole.
+    length(_value_row_counts(plan, pred.name)) > 1 && return false
+    _predictor_rows(plan, pred.name) == rows || return false
+    return all(pred.terms) do t
+        t.kind === LatentTerm || return true
+        n = _latent_rows(plan, only(t.columns))
+        return n === nothing || n == rows
+    end
+end
+
+# A bare sampled-parameter location (constrained-scale, no link inversion):
+# `r.predictor` names a scalar parameter, not a PredictorSpec.
+_is_bare_param_location(r::LikelihoodSpec, plan::StructuralPlan) =
+    any(p -> p.name === r.predictor, plan.parameters)
+
+# The predictor emits its raw Julia value; only this parameter use owns
+# the inverse. Bare sampled locations already carry constrained values.
+function _response_value_node!(pre::Vector{Expr}, r::LikelihoodSpec,
+        plan::StructuralPlan)
+    _is_bare_param_location(r, plan) && return r.predictor
+    lp = _location_node(r, plan)
+    r.link === IdentityLink && return lp
+    value = _mu_name(r.label)
+    rhs = _inverse_link_expr(r.link, lp)
+    typ = _location_value_type(r, plan)
+    push!(pre, :($value::$typ = $rhs))
+    return value
+end
 
 _dovar(i::Int) = Symbol(:_ppl_c, i)
 _pw_name(label::Symbol) = Symbol(:_ppl_pw_, label)
 
+# A plate cell's arguments are named after the values the plate iterates,
+# as a broadcast reads them: `y .~ Normal.(loc, s)` observes
+# `plate(y, loc, s) do y, loc, s ... normal(loc, s).logpdf(y) ... end`.
+# Emitters number the arguments (`_dovar`); `kernel_expr` names them here,
+# once. An emitter may name an argument over a value it generated by the
+# role it fills instead (`_plate_sum_stmts`' `names`: a prior's
+# `normal(location, scale)`). An argument may shadow the array it iterates;
+# a name the cell body already spells (a function, a captured value, a
+# nested cell's argument) takes the first free `name_k` instead. An argument
+# over an unnamed input (`view(...)`, a literal) keeps its number.
+_is_dovar(x) = x isa Symbol && match(r"^_ppl_c\d+$", String(x)) !== nothing
+_cell_argument_name(input::Symbol) = something(_array_flat_source(input), input)
+function _cell_argument_name(input::Expr)
+    if Meta.isexpr(input, :call, 2) && input.args[1] === :Ref
+        return _cell_argument_name(input.args[2])
+    end
+    if Meta.isexpr(input, :call, 3) && input.args[1] isa GlobalRef &&
+            input.args[1].mod === (@__MODULE__) &&
+            input.args[1].name === :_ppl_rows
+        return _cell_argument_name(input.args[2])
+    end
+    return nothing
+end
+_cell_argument_name(input) = nothing
+
+_is_plate_do(ex) = Meta.isexpr(ex, :do, 2) && Meta.isexpr(ex.args[1], :call) &&
+    ex.args[1].args[1] === :plate && Meta.isexpr(ex.args[2], :->) &&
+    Meta.isexpr(ex.args[2].args[1], :tuple)
+
+_name_plate_cells(x, aliases) = x
+function _name_plate_cells(ex::Expr, aliases)
+    ex = Expr(ex.head, Any[_name_plate_cells(a, aliases) for a in ex.args]...)
+    _is_plate_do(ex) || return ex
+    return _name_plate_cell(ex, (p, input) ->
+        _cell_argument_name(input isa Symbol ? get(aliases, input, input) : input))
+end
+
+# A response location that merely names an already emitted definition reads
+# that definition directly. Keep the predictor in the structural plan (its
+# shape and layout still describe the response), but omit the generated
+# `y_eta = loc` statement and use `loc` at every later read. The synthesized
+# predictor for an inline expression, and aliases of sampled parameters, keep
+# their own graph names. A cell parameter that shares the alias's name (the
+# role-named `do value, location, scale` cells) is its own variable and keeps it.
+function _elide_named_location_aliases(plan::StructuralPlan, def::Expr)
+    aliases = Dict{Symbol,Symbol}()
+    for pred in plan.predictors
+        value = _identity_location_value(plan, pred.name)
+        value === nothing || (aliases[pred.name] = value)
+    end
+    isempty(aliases) && return def
+    defined = Set{Symbol}(keys(plan.columns))
+    active = Dict{Symbol,Any}()
+    stmts = Any[]
+    for st in def.args[2].args
+        lhs = _location_assignment_name(st)
+        value = lhs === nothing ? nothing : get(aliases, lhs, nothing)
+        if value !== nothing && value in defined &&
+                _location_alias_rhs(st.args[2], value)
+            active[lhs] = st.args[2]
+            continue
+        end
+        push!(stmts, isempty(active) ? st : _hsubst(st, active; shadow = true))
+        lhs === nothing || push!(defined, lhs)
+    end
+    return Expr(:(=), def.args[1], Expr(:block, stmts...))
+end
+
+_location_alias_rhs(rhs, value::Symbol) = rhs === value ||
+    (Meta.isexpr(rhs, :call, 3) && rhs.args[1] isa GlobalRef &&
+        rhs.args[1].mod === (@__MODULE__) &&
+        rhs.args[1].name === :_ppl_rows && rhs.args[2] === value)
+
+_location_assignment_name(st) = nothing
+function _location_assignment_name(st::Expr)
+    Meta.isexpr(st, :(=), 2) || return nothing
+    lhs = st.args[1]
+    Meta.isexpr(lhs, :(::), 2) && (lhs = lhs.args[1])
+    return lhs isa Symbol ? lhs : nothing
+end
+
+# Remaining pure location aliases (such as a sampled scalar's `y_eta = mu`)
+# give a plate cell argument the name of the value it reads.
+function _location_value_aliases(plan::StructuralPlan, def::Expr)
+    values = Dict{Symbol,Symbol}()
+    for p in plan.predictors
+        length(p.terms) == 1 || continue
+        t = only(p.terms)
+        t.kind === ComposedTerm && t.options.tree isa Symbol &&
+            t.options.tree in t.columns && (values[p.name] = t.options.tree)
+    end
+    aliases = Dict{Symbol,Symbol}()
+    !isempty(values) && Meta.isexpr(def, :(=), 2) &&
+        Meta.isexpr(def.args[2], :block) || return aliases
+    for st in def.args[2].args
+        lhs = _location_assignment_name(st)
+        lhs !== nothing && get(values, lhs, nothing) === st.args[2] &&
+            (aliases[lhs] = st.args[2])
+    end
+    return aliases
+end
+
+# Name the numbered arguments of one `plate(...) do` cell: `choose(p, input)`
+# gives the name for argument `p` over `input`, or `nothing` to keep it.
+function _name_plate_cell(ex::Expr, choose)
+    call, (params, body) = ex.args[1], ex.args[2].args
+    inputs = call.args[2:end]
+    length(params.args) == length(inputs) || return ex
+    used = union!(setdiff!(_all_symbols!(Set{Symbol}(), body), params.args),
+        filter(!_is_dovar, params.args))
+    names = Dict{Symbol,Symbol}()
+    for (p, input) in zip(params.args, inputs)
+        _is_dovar(p) || continue
+        base = choose(p, input)
+        base === nothing && continue
+        nm, k = base, 1
+        while nm in used
+            k += 1
+            nm = Symbol(base, :_, k)
+        end
+        push!(used, nm)
+        names[p] = nm
+    end
+    isempty(names) && return ex
+    named = Expr(:tuple, Any[get(names, p, p) for p in params.args]...)
+    return Expr(:do, call, Expr(:->, named, _rename_cell_arguments(body, names)))
+end
+
+# Rename cell arguments in a cell body; a nested cell that rebinds a name
+# keeps its own argument.
+_rename_cell_arguments(x::Symbol, names) = get(names, x, x)
+_rename_cell_arguments(x, names) = x
+function _rename_cell_arguments(ex::Expr, names)
+    if ex.head === :->
+        params = Meta.isexpr(ex.args[1], :tuple) ? ex.args[1].args : Any[ex.args[1]]
+        inner = filter(kv -> !(first(kv) in params), names)
+        return Expr(:->, ex.args[1], _rename_cell_arguments(ex.args[2], inner))
+    end
+    return Expr(ex.head, Any[_rename_cell_arguments(a, names) for a in ex.args]...)
+end
+
+# The sum of density terms as written, `a + b + c`; no terms is `0.0`.
+_sum_terms(terms) = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
+
 # `pointwise = plate(inputs...) do dovars...; cell; end` + scalar sum node.
 # A plate must be a whole recipe RHS (never nested under `sum`), and the
 # do-block body carries a LineNumberNode or the cell types as Any. Response
-# `y` and predictor `lp` are always inputs 1-2 (`_ppl_c1/_ppl_c2`).
-function _plate_sum_stmts(pointwise::Symbol, node::Symbol, inputs::Vector{Any}, cell::Expr)
-    dovars = [_dovar(i) for i in eachindex(inputs)]
-    body = Expr(:block, LineNumberNode(0, :generator), cell)
-    lambda = Expr(:(->), Expr(:tuple, dovars...), body)
-    doex = Expr(:do, Expr(:call, :plate, inputs...), lambda)
+# `y` and predictor `lp` are always inputs 1-2 (`_ppl_c1/_ppl_c2`). A
+# builder marks a value every cell shares as a `Ref(value)` input; the cell
+# reads it whole by closing over it (`_plate_closure`).
+function _plate_sum_stmts(pointwise::Symbol, node::Symbol, inputs::Vector{Any},
+        cell::Union{Expr,Vector{Expr}}; names = Dict{Symbol,Symbol}())
+    doex = _plate_closure(inputs, cell isa Expr ? Expr[cell] : cell)
+    isempty(names) || (doex = _name_plate_cell(doex, (p, _) -> get(names, p, nothing)))
     return Expr[:($pointwise = $doex), :($node::Float64 = sum($pointwise))]
+end
+
+# A count likelihood whose distribution object splits `logpdf` into the
+# parameter-dependent `logkernel` and the data-only `lognormalizer`.
+# `law(method)` is the cell's density call through that endpoint, over
+# `inputs`; `normalizer` is the `lognormalizer` call over `ninputs`, which hold
+# only the response and the data the normalizer reads (its trials). The
+# pointwise plate keeps the whole `logpdf`. The summed node adds the kernel
+# plate to the normalizer plate, which reads bound data only, so preparation
+# folds its sum to one constant and no `loggamma` runs per evaluation.
+# Evidence, presence masks, packed rows, ranges and arrays per index rewrite
+# the pointwise plate alone; they keep the whole-`logpdf` sum. So does a
+# response that stretches over a longer location (a number or one entry
+# beside more rows): the normalizer plate iterates the response, so it covers
+# the kernel plate's cells only when the response spans the domain.
+function _count_plate_stmts!(pre::Vector{Expr}, r::LikelihoodSpec,
+        plan::StructuralPlan, node::Symbol, pw::Symbol, inputs::Vector{Any},
+        law, ninputs::Vector{Any}, normalizer::Expr)
+    y = get(plan.columns, r.response, nothing)
+    split = r.evidence.kind === :none && r.mi_jobs === nothing &&
+        r.range === nothing &&
+        !haskey(plan.columns, _observed_mask_name(r.response)) &&
+        !_cell_broadcast_response(plan, r) &&
+        y isa AbstractArray && length(y) == _response_rows(plan, r)
+    cell = _wrap_evidence!(r, plan, pre, inputs, law(:logpdf))
+    kernel = split ? law(:logkernel) : nothing
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
+        if split
+            kernel = _weighted_cell(wv, kernel)
+            normalizer = :($(_thread_ref!(ninputs, r.weights)) * $normalizer)
+        end
+    end
+    stmts = _plate_sum_stmts(pw, node, inputs, cell)
+    split || return stmts
+    # Each sum is its own statement: a plate whose only consumer is `sum`
+    # reduces in place, and the data-only normalizer sum folds by itself.
+    pwk, kern = Symbol(:_ppl_pwk_, r.label), Symbol(:_ppl_kernel_, r.label)
+    pwn, norm = Symbol(:_ppl_pwn_, r.label), Symbol(:_ppl_lnorm_, r.label)
+    return Expr[stmts[1],
+        :($pwk = $(_plate_closure(inputs, kernel isa Expr ? Expr[kernel] : kernel))),
+        :($kern::Float64 = sum($pwk)),
+        :($pwn = $(_plate_closure(ninputs, Expr[normalizer]))),
+        :($norm = sum($pwn)),
+        :($node::Float64 = $kern + $norm)]
+end
+
+_is_shared_input(x) = Meta.isexpr(x, :call, 2) &&
+    (x.args[1] === :Ref || x.args[1] == GlobalRef(Base, :Ref))
+
+# `plate(lanes...) do lane dovars...; cell; end`: the plate zips the inputs
+# other than shared `Ref(value)` ones, and the cell reads each shared value in
+# place of its dovar. A shared name is read directly; a shared expression is
+# a cell statement reading only shared names, which RK evaluates once,
+# outside the loop.
+function _plate_closure(inputs::Vector{Any}, cell::Vector{Expr})
+    lanes, dovars = Any[], Symbol[]
+    names, prefix = Dict{Symbol,Any}(), Expr[]
+    body = Expr(:block, cell...)
+    bound = _bound_names!(Set{Symbol}(), body)
+    for (i, x) in enumerate(inputs)
+        if !_is_shared_input(x)
+            push!(lanes, x)
+            push!(dovars, _dovar(i))
+            continue
+        end
+        value = x.args[2]
+        reads = _statement_value_reads!(Set{Symbol}(), value)
+        isempty(intersect(reads, bound)) || throw(ContractValidationError(
+            "[generator] a plate cell rebinds $(join(intersect(reads, bound), ", ")), " *
+            "which it reads as a shared value"))
+        value isa Expr ? push!(prefix, :($(_dovar(i)) = $value)) :
+            (names[_dovar(i)] = value)
+    end
+    lambda = Expr(:(->), Expr(:tuple, dovars...),
+        Expr(:block, LineNumberNode(0, :generator), prefix...,
+            _replace_dovars(body, names).args...))
+    return Expr(:do, Expr(:call, :plate, lanes...), lambda)
+end
+
+# Every name a cell binds: the locals it assigns and the arguments of the
+# cells nested in it.
+function _bound_names!(out::Set{Symbol}, ex)
+    ex isa Expr || return out
+    name = _assigned_name(ex)
+    name === nothing || push!(out, name)
+    if ex.head === :(->)
+        params = ex.args[1]
+        for p in (Meta.isexpr(params, :tuple) ? params.args : Any[params])
+            Meta.isexpr(p, :(::)) && (p = p.args[1])
+            p isa Symbol && push!(out, p)
+        end
+    end
+    foreach(a -> _bound_names!(out, a), ex.args)
+    return out
+end
+
+# Replace each dovar by its shared value, except under a nested cell that
+# takes an argument of the same name.
+_replace_dovars(ex, names) = ex
+_replace_dovars(ex::Symbol, names) = get(names, ex, ex)
+function _replace_dovars(ex::Expr, names)
+    isempty(names) && return ex
+    if ex.head === :(->)
+        inner = copy(names)
+        params = ex.args[1]
+        for p in (Meta.isexpr(params, :tuple) ? params.args : Any[params])
+            Meta.isexpr(p, :(::)) && (p = p.args[1])
+            p isa Symbol && delete!(inner, p)
+        end
+        return Expr(:(->), ex.args[1], _replace_dovars(ex.args[2], inner))
+    end
+    return Expr(ex.head, Any[_replace_dovars(a, names) for a in ex.args]...)
+end
+
+# Case-A `mi()` gather naming, per response (`_ppl_mi_<label>_<ref>`):
+# twin responses sharing one predictor gather through distinct nodes.
+_mi_gather_name(label::Symbol, ref::Symbol) = Symbol(:_ppl_mi_, label, :_, ref)
+
+# Gather a computed full-length node by `Jobs` (an lp/rate/shape/scale
+# node the emitter created), returning the short node. Scalars broadcast.
+# The gather is its own short plate over `Jobs` whose cell closes over the
+# source (the ordinal `c[yv]` per-lane-gather precedent): a caller-level
+# fancy `node[Jobs]` does not trace under Reactant (`TracedRArray[Vector{Int}]`
+# shape-inference failure), while per-lane scalar gathers do.
+function _mi_gather_node!(pre::Vector{Expr}, jobs::Symbol, node::Symbol,
+        label::Symbol)
+    g = _mi_gather_name(label, node)
+    jv = _dovar(1)
+    getter = GlobalRef(@__MODULE__, :_mi_row_value)
+    body = Expr(:block, LineNumberNode(0, :generator), :($getter($node, $jv)))
+    lambda = Expr(:(->), Expr(:tuple, jv), body)
+    doex = Expr(:do, Expr(:call, :plate, jobs), lambda)
+    push!(pre, :($g = $doex))
+    return g
 end
 
 # Thread a Symbol ref as a plate input (returning its do-var); Real
@@ -193,145 +2869,580 @@ function _thread_ref!(inputs::Vector{Any}, ref, as_int::Bool = false)
     return as_int ? Int(ref) : Float64(ref)
 end
 
-# Thread Symbol bounds (do-vars), inline Real bounds; nothing stays nothing.
-function _thread_bounds!(inputs::Vector{Any}, ev::ResponseEvidence, as_int::Bool)
-    lb = ev.lower === nothing ? nothing : _thread_ref!(inputs, ev.lower, as_int)
-    ub = ev.upper === nothing ? nothing : _thread_ref!(inputs, ev.upper, as_int)
-    return (lb, ub)
+# A weighted cell. A cell that is a lazy branch keeps the branch as its own
+# cell statement (`_ppl_arm = c ? a : b`) with the weight applied after it:
+# only a top-level branch is visible to plate lowering, which splits the
+# lanes when the condition reads bound data only.
+function _weighted_cell(wv, cell::Expr)
+    cell.head === :if || return :($wv * $cell)
+    return Expr[:(_ppl_arm::Float64 = $cell), :($wv * _ppl_arm)]
 end
 
 function _gaussian_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    pre = Expr[]
+    lp = _response_value_node!(pre, r, plan)
+    sarg = _scale_plate_arg(r, plan, pre)
     inputs = Any[y, lp]
     yv, lpv = _dovar(1), _dovar(2)
-    sref = _thread_ref!(inputs, r.scale)
-    lb, ub = _thread_bounds!(inputs, r.evidence, false)
+    sref = _thread_ref!(inputs, sarg)
     base = :(normal($lpv, $sref).logpdf($yv))
-    cell = _gaussian_cell(r.evidence.kind, base, yv, lb, ub, lpv, sref)
+    cell = base
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
+    cell = :($sref > 0 ? $cell : -Inf)
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
-        cell = :($wv * $cell)
+        cell = _weighted_cell(wv, cell)
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
-function _gaussian_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, lpv::Symbol, sref)
-    kind === :none && return base
-    nccdf(b) = :(normal($lpv, $sref).cdf($b))
-    if kind === :truncated
-        corr = if lb === nothing && ub === nothing
-            return base
-        elseif lb === nothing
-            :(log($(nccdf(ub))))
-        elseif ub === nothing
-            :(log(1.0 - $(nccdf(lb))))
-        else
-            :(log($(nccdf(ub)) - $(nccdf(lb))))
-        end
-        return :($base - $corr)
-    elseif kind === :censored
-        if lb === nothing && ub === nothing
-            return base
-        elseif lb === nothing
-            return :(ifelse($yv > $ub, log1p(-$(nccdf(ub))), $base))
-        elseif ub === nothing
-            return :(ifelse($yv < $lb, log($(nccdf(lb))), $base))
-        else
-            return :(ifelse($yv < $lb, log($(nccdf(lb))),
-                ifelse($yv > $ub, log1p(-$(nccdf(ub))), $base)))
-        end
-    else # :interval_censored
-        return :(log($(nccdf(ub)) - $(nccdf(yv))))
+_gaussian_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, lpv::Symbol, sref) =
+    _evidence_cell(Val(kind), base, yv, lb, ub,
+        b -> :(normal($lpv, $sref).cdf($b)),
+        b -> :(normal($lpv, $sref).ccdf($b)), false)
+
+# Student-t plate: the Gaussian shape with a df argument — validation
+# guarantees `nu` (a sampled name, a literal, or a predictor-fed
+# per-observation nu) and sigma; evidence arms mirror the Gaussian
+# clamp law over the `student_t` cdf (`_student_cell`), plus optional
+# weights. A predictor-fed nu binds its own `_ppl_sc_<label>_nu` node
+# (the `_nu`-suffixed label cannot collide with any `<lhs>_resp` scale
+# node), so scale and nu predictors coexist.
+function _student_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    pre = Expr[]
+    lp = _response_value_node!(pre, r, plan)
+    sarg = _scale_plate_arg(r, plan, pre)
+    nuarg = _scale_use_plate_arg(r, plan, pre, r.nu, Symbol(r.label, :_nu))
+    inputs = Any[y, lp]
+    yv, lpv = _dovar(1), _dovar(2)
+    sref = _thread_ref!(inputs, sarg)
+    nuv = _thread_ref!(inputs, nuarg)
+    base = :(student_t($nuv, $lpv, $sref).logpdf($yv))
+    cell = base
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
+    cell = :($sref > 0 && $nuv > 0 ? $cell : -Inf)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
     end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
+
+# LogNormal likelihood (Stan `lognormal_lpdf` mirror): the cell calls
+# the prior-proven `lognormal` distribution endpoint
+# (`LOGNORMAL_KERNEL_SOURCE`, Distributions.jl `LogNormal(mu, sigma)`
+# order) — no closed-form respelling, so SB parity is by shared
+# operation order. Mu reads its argument value; sigma threads scalar
+# or per observation via `_scale_plate_arg`, including a modeled sigma.
+# The endpoint's lazy `y > 0` guard returns
+# -Inf off support; `y` is bound data so preparation splits the plate
+# per taken arm and no backend receives the branch. The shared evidence
+# algebra wraps its density and tails before optional weights.
+function _lognormal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    pre = Expr[]
+    lp = _response_value_node!(pre, r, plan)
+    sarg = _scale_plate_arg(r, plan, pre)
+    inputs = Any[y, lp]
+    yv, lpv = _dovar(1), _dovar(2)
+    sref = _thread_ref!(inputs, sarg)
+    cell = :(lognormal($lpv, $sref).logpdf($yv))
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
+    cell = :($sref > 0 ? $cell : -Inf)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Bernoulli Bool normalization (snag `bernoulli-int-la-78487520`): a
+# non-Bool validated 0/1 response column reads through a NAMED
+# `_ppl_yb_<label>` recipe instead of an in-cell `yv != 0` comparison.
+# The recipe is data-only so `bound=` folds it exactly once (the
+# `_ppl_yf_` precedent — zero per-eval alloc, verified); the plate then
+# reads Bool lanes and the endpoint's lazy branch never sees a computed
+# comparison, which misdifferentiates under native Enzyme in some plate
+# shapes (observed: -10.10 vs true -4.97, NaN on perturbation; the same
+# math inline or over Bool lanes is exact). Dense `Vector{Bool}`:
+# broadcast comparison yields a BitVector and BitArrays are
+# overlay-hostile (the kernel-plate twin precedent). Bool columns skip
+# the recipe. Returns the plate input symbol and the cell lane ref.
+_ybool_name(label::Symbol) = Symbol(:_ppl_yb_, label)
+
+# A column whose element type is exactly Bool. Type tests rather than an
+# `eltype` call keep this check concretely inferred.
+_is_bool_column(col) = col isa Bool || col isa AbstractArray{Bool}
+
+# Count endpoints take integer values. Keep the caller's Bool column available
+# to every other reader and form a separate zero/one integer value for the
+# density. This data-only recipe is shared by native and compiled execution.
+function _count_yplate!(pre::Vector{Expr}, plan::StructuralPlan,
+        y::Symbol, label::Symbol)
+    _is_bool_column(plan.columns[y]) || return y
+    yi = Symbol(:_ppl_yi_, label)
+    push!(pre, :($yi = Int.($y)))
+    return yi
+end
+
+function _bernoulli_yplate!(pre::Vector{Expr}, plan::StructuralPlan,
+        y::Symbol, label::Symbol, yv::Symbol)
+    col = plan.columns[y]
+    _is_bool_column(col) && return y, yv
+    yb = _ybool_name(label)
+    push!(pre, :($yb = Array{Bool}($y .!= 0)))
+    return yb, yv
+end
+
+# Student-t evidence arms: the Gaussian clamp law over the `student_t`
+# cdf (continuous bounds, non-strict censored arms).
+_student_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, nuv, lpv::Symbol, sref) =
+    _evidence_cell(Val(kind), base, yv, lb, ub,
+        b -> :(student_t($nuv, $lpv, $sref).cdf($b)),
+        b -> :(student_t($nuv, $lpv, $sref).ccdf($b)), false)
 
 function _bernoulli_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
-    inputs = Any[y, lp]
-    yv, etav = _dovar(1), _dovar(2)
-    col = plan.columns[y]
-    # Validated Bool-or-0/1-Int; the endpoint takes Bool.
-    yref = eltype(col) === Bool ? yv : :($yv != 0)
-    cell = :(bernoulli(; logit = $etav).logpdf($yref))
+    yv = _dovar(1)
+    pre = Expr[]
+    yin, yref = _bernoulli_yplate!(pre, plan, y, r.label, yv)
+    inputs = Any[yin]
+    if _is_bare_param_location(r, plan) || r.link !== LogitLink
+        p = _response_value_node!(pre, r, plan)
+        pv = _thread_ref!(inputs, p)
+        cell = :((($pv >= 0) & ($pv <= 1)) ? bernoulli($pv).logpdf($yref) : -Inf)
+    else
+        lp = _location_node(r, plan)
+        push!(inputs, lp)
+        etav = _dovar(2)
+        cell = :(bernoulli(; logit = $etav).logpdf($yref))
+    end
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
-        cell = :($wv * $cell)
+        cell = _weighted_cell(wv, cell)
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Fused whole-vector Poisson-log likelihood (base case: no evidence, no
+# weights). Value-identical to `Σ poisson(; log_rate=ηᵢ).logpdf(yᵢ)` for the
+# contract's nonnegative-integer `y`: `Σ yᵢ·ηᵢ − Σ exp(ηᵢ) − C`, with
+# `C = Σ loggamma(yᵢ+1)` a NAMED data-only recipe over the bound response
+# (`_ppl_lfact_<label>`), never on the gradient tape. `bound=` folds it to a
+# constant, and a binding with other counts computes its own (it is not a
+# build-time literal). `_ppl_yf_<label> = Float64.(y)` is a NAMED
+# recipe so `bound=` folds it to a constant Float vector (no per-eval alloc)
+# AND gives the fused `dot` a Float operand (Reactant `dot_general` type match).
+# `sum(exp, η)` reduces without materialising the intermediate. Gradient stays
+# ordinary Enzyme/Reactant AD — no analytic adjoint.
+_yfloat_name(label::Symbol) = Symbol(:_ppl_yf_, label)
+
+# A fused form keeps its emitter's statements through the pointwise plate,
+# which `:pointwise` queries read, and replaces the summed node.
+function _through_pointwise(stmts::Vector{Expr}, r::LikelihoodSpec)
+    pw = _pw_name(r.label)
+    return stmts[1:findfirst(st -> st.head === :(=) && st.args[1] === pw, stmts)]
+end
+
+function _poisson_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
+    y = r.response
+    lp = _location_node(r, plan)
+    yf = _yfloat_name(r.label)
+    cterm = Symbol(:_ppl_lfact_, r.label)
+    return Expr[
+        _through_pointwise(_poisson_plate_stmts(r, plan, node, _pw_name(r.label)), r)...,
+        :($yf = Float64.($y)),
+        :($cterm = sum(loggamma.($yf .+ 1.0))),
+        :($node::Float64 = dot($yf, $lp) - sum(exp, $lp) - $cterm),
+    ]
+end
+
+# Fused whole-vector Binomial-logit likelihood (base case). For counts the
+# contract keeps within `0..n`, `Σ binomial(; n = nᵢ, logit = ηᵢ).logpdf(yᵢ)`
+# is `Σ yᵢ·ηᵢ − Σ nᵢ·log1pexp(ηᵢ) + C`, with `C = Σ log C(nᵢ, yᵢ)` a NAMED
+# data-only recipe over the bound response and trials (`_ppl_lchoose_<label>`):
+# `bound=` folds it to a constant, so no `loggamma` runs per evaluation, and
+# a binding with other counts computes its own. Trials are a number (a
+# literal or bound data), which scales one `sum(log1pexp, η)`, or a column
+# with one entry per response entry (`_wholevec_trials`). Gradient stays
+# ordinary AD.
+function _binomial_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
+    y = r.response
+    lp = _location_node(r, plan)
+    yf = _yfloat_name(r.label)
+    nf = Symbol(:_ppl_nf_, r.label)
+    cterm = Symbol(:_ppl_lchoose_, r.label)
+    scalar = r.trials isa Int || get(plan.columns, r.trials, nothing) isa Number
+    trials = r.trials isa Int ? Float64(r.trials) :
+        scalar ? :(Float64($(r.trials))) : :(Float64.($(r.trials)))
+    tail = scalar ?
+        :($nf * sum(log1pexp, $lp)) : :(dot($nf, log1pexp.($lp)))
+    return Expr[
+        _through_pointwise(_binomial_plate_stmts(r, plan, node, _pw_name(r.label)), r)...,
+        :($yf = Float64.($y)),
+        :($nf = $trials),
+        :($cterm = sum(loggamma.($nf .+ 1.0) .- loggamma.($yf .+ 1.0) .-
+            loggamma.($nf .- $yf .+ 1.0))),
+        :($node::Float64 = dot($yf, $lp) - $tail + $cterm),
+    ]
+end
+
+# Trials the fused Binomial form reads: a number (a literal or bound data),
+# or a column with one entry per response entry. A one-entry column
+# stretching over the rows keeps the plate path, which broadcasts it.
+function _wholevec_trials(r::LikelihoodSpec, plan::StructuralPlan)
+    r.trials isa Int && return true
+    t = get(plan.columns, r.trials, nothing)
+    y = get(plan.columns, r.response, nothing)
+    y isa AbstractVector || return false
+    return t isa Integer || t isa AbstractVector && length(t) == length(y)
 end
 
 function _poisson_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    pre = Expr[]
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
-    inputs = Any[y, lp]
+    pre = Expr[]
+    inputs = Any[y]
+    yv = _dovar(1)
+    if _is_bare_param_location(r, plan) || r.link !== LogLink
+        rate = _response_value_node!(pre, r, plan)
+        ratev = _thread_ref!(inputs, rate)
+        law = m -> :($ratev >= 0 ? poisson($ratev).$m($yv) : -Inf)
+    else
+        lp = _location_node(r, plan)
+        push!(inputs, lp)
+        etav = _dovar(2)
+        law = m -> :(poisson(; log_rate = $etav).$m($yv))
+    end
+    # The keyword form binds no owner port: the normalizer reads none.
+    normalizer = :(poisson(; ).lognormalizer($(_dovar(1))))
+    stmts = _count_plate_stmts!(pre, r, plan, node, pw, inputs, law, Any[y], normalizer)
+    return Expr[pre..., stmts...]
+end
+
+# ZIP plate: the Poisson-plate shape with a zero-inflation argument —
+# validation guarantees `zi` (a sampled name, a literal, or a
+# predictor-fed zi submodel). The shared evidence algebra wraps the
+# `zero_inflated_poisson` endpoint before optional weights. A zi
+# predictor binds its constrained vector once (`_ppl_sc_`, the
+# scale-predictor precedent — linked per use at the contract gate) and the
+# plate iterates it per cell.
+function _zip_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _location_node(r, plan)
+    pre = Expr[]
+    ziarg = _scale_use_plate_arg(r, plan, pre, r.zi, r.label)
+    loc = r.link === LogLink ? lp : _response_value_node!(pre, r, plan)
+    inputs = Any[y, loc]
     yv, etav = _dovar(1), _dovar(2)
-    lb, ub = _thread_bounds!(inputs, r.evidence, true)
-    base = :(poisson(; log_rate = $etav).logpdf($yv))
-    cell = _poisson_cell(r.evidence.kind, base, yv, lb, ub, etav)
+    ziref = _thread_ref!(inputs, ziarg)
+    # All-keyword: the object constructor cannot mix positional and named
+    # owner bindings (matches the `:observed/:log_rate/:zi` HAVE ports).
+    cell = if r.link === LogLink
+        :((($ziref >= 0) & ($ziref <= 1)) ?
+            zero_inflated_poisson(; log_rate = $etav, zi = $ziref).logpdf($yv) : -Inf)
+    else
+        :($etav >= 0 && (($ziref >= 0) & ($ziref <= 1)) ?
+            zero_inflated_poisson($etav, $ziref).logpdf($yv) : -Inf)
+    end
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
-        cell = :($wv * $cell)
+        cell = _weighted_cell(wv, cell)
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Lower-side cdf argument for the inclusive discrete cdf: the mass below
-# lb is F(lb - 1), so truncated/censored low arms and interval cells shift
-# their lower argument by one. Int literals fold; do-vars convert via Int
-# (cdf takes Int, which also hardens non-Int Integer columns). The kernel's
-# `observed >= 0` guard maps -1 to 0.0, so no clamp is needed.
-_poisson_below(b::Int) = b - 1
-_poisson_below(b::Symbol) = :(Int($b) - 1)
+# lb is F(lb - 1), so TRUNCATED low arms shift their lower argument by one
+# (interval cells stay unshifted — the response is the open lower
+# endpoint). The shared evidence algebra distinguishes real-valued
+# inclusive and exclusive endpoints with floor/ceil.
 
-function _poisson_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, etav::Symbol)
-    kind === :none && return base
-    pcdf(b) = :(poisson(; log_rate = $etav).cdf($b))
-    if kind === :truncated
-        corr = if lb === nothing && ub === nothing
-            return base
-        elseif lb === nothing
-            :(log($(pcdf(ub))))
-        elseif ub === nothing
-            :(log(1.0 - $(pcdf(_poisson_below(lb)))))
-        else
-            :(log($(pcdf(ub)) - $(pcdf(_poisson_below(lb)))))
-        end
-        return :($base - $corr)
-    elseif kind === :censored
-        if lb === nothing && ub === nothing
-            return base
-        elseif lb === nothing
-            return :(ifelse($yv > $ub, log1p(-$(pcdf(ub))), $base))
-        elseif ub === nothing
-            return :(ifelse($yv < $lb, log($(pcdf(_poisson_below(lb)))), $base))
-        else
-            return :(ifelse($yv < $lb, log($(pcdf(_poisson_below(lb)))),
-                ifelse($yv > $ub, log1p(-$(pcdf(ub))), $base)))
-        end
-    else # :interval_censored
-        return :(log($(pcdf(ub)) - $(pcdf(_poisson_below(yv)))))
+_poisson_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, etav::Symbol) =
+    _evidence_cell(Val(kind), base, yv, lb, ub,
+        b -> :(poisson(; log_rate = $etav).cdf($b)),
+        b -> :(poisson(; log_rate = $etav).ccdf($b)), true)
+
+# Hurdle-Poisson likelihood (SB `hurdle_poisson` mirror): a zero part
+# plus a zero-truncated Poisson positive part. Per cell:
+# `y == 0 ? log(p0) : log1p(-p0) + poisson_logpdf - log(1 - e^-λ)`.
+# The Poisson factor reuses the `poisson(; log_rate)` endpoint HAVE
+# (the Poisson-plate precedent). The truncation correction is the
+# closed form `log(-expm1(-λ))` (Poisson cdf(0) is exactly e^-λ; SB
+# subtracts `poisson_lccdf(0 | λ)` — the same quantity) — NOT the
+# `.cdf(0)` endpoint, whose `gamma_inc` has no Reactant tracing rule
+# (`MethodError` on compile; the truncated/censored Poisson cells
+# carry the same gap). The `y == 0` select is lazy, so the positive
+# count's density and truncation correction remain inactive at zero.
+# p_zero threads scalar or via the `_ppl_sc_` node
+# (the scale-predictor precedent — a hurdle p_zero predictor is
+# linked per use at the contract gate). The shared evidence algebra supplies
+# the hurdle tails before optional weights. No whole-vector fusion yet: both parts carry
+# per-cell parameter-dependent work (the truncation correction varies
+# with λ even for scalar p_zero) — a perf-lane follow-up, not this
+# slice.
+function _hurdle_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _location_node(r, plan)
+    pre = Expr[]
+    sarg = _scale_plate_arg(r, plan, pre)
+    loc = r.link === LogLink ? lp : _response_value_node!(pre, r, plan)
+    inputs = Any[y, loc]
+    yv, etav = _dovar(1), _dovar(2)
+    p0v = _thread_ref!(inputs, sarg)
+    rate = r.link === LogLink ? :(exp($etav)) : etav
+    base = r.link === LogLink ? :(poisson(; log_rate = $etav).logpdf($yv)) :
+        :(poisson($etav).logpdf($yv))
+    trunc = :(log(-expm1(-$rate)))
+    cell = :($yv == 0 ? log($p0v) : log1p(-$p0v) + $base - $trunc)
+    cell = :($rate > 0 && (($p0v >= 0) & ($p0v <= 1)) ? $cell : -Inf)
+    distribution = r.link === LogLink ? :(poisson(; log_rate = $etav)) :
+        :(poisson($etav))
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell;
+        cdf = b -> :($b < 0 ? 0.0 : ($b == 0 ? $p0v :
+            $p0v + (1 - $p0v) * ($distribution.cdf($b) - exp(-$rate)) / (-expm1(-$rate)))),
+        ccdf = b -> :($b < 0 ? 1.0 : (1 - $p0v) * $distribution.ccdf($b) / (-expm1(-$rate))))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
     end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Inverse-Gaussian / Wald likelihood (SB `brm_inverse_gaussian_lpdf`
+# mirror): the closed form spelled operation-for-operation —
+# `(log(λ) - (log2π + 3*log(y)) - λ*(y-μ)²/(μ²*y))/2` — with the SB
+# `log2π` literal `1.8378770664093456` (`Float64(Distributions.log2π)`
+# exactly). The mean precomputes outside the cell (`_ppl_mu_`, the NB2
+# precedent — a computed `exp` constructor arg miscompiles the Enzyme
+# pullback); lambda threads via `_scale_plate_arg` (scalar
+# sampled/literal/assignment/column, or a log-link predictor — the
+# VonMises-kappa precedent, linked per use at the contract gate).
+# The `y > 0` guard is lazy `?:` (the DK gamma precedent, not eager
+# `ifelse`); `y` is bound data so preparation splits the plate per
+# taken arm and no backend receives the branch. μ/λ positivity is
+# guarded outside the evidence wrapper, including raw live values.
+# Evidence uses
+# the shared wrapper algebra and stable scaled-erfc tails before optional
+# weights. No whole-vector fusion yet
+# (the `3*log(y)` normalizer is data-only and would hoist) — a
+# perf-lane follow-up, not this slice.
+function _ig_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _location_node(r, plan)
+    mu = _mu_name(r.label)
+    typ = _location_value_type(r, plan)
+    pre = Expr[:($mu::$typ = $(_inverse_link_expr(r.link, lp)))]
+    sarg = _scale_plate_arg(r, plan, pre)
+    inputs = Any[y, mu]
+    yv, muv = _dovar(1), _dovar(2)
+    lamv = _thread_ref!(inputs, sarg)
+    base = :((log($lamv) - (1.8378770664093456 + 3.0 * log($yv)) -
+        $lamv * ($yv - $muv) * ($yv - $muv) / ($muv * $muv * $yv)) / 2.0)
+    cell = :($yv > 0 ? $base : -Inf)
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell;
+        cdf = b -> :(rk_inverse_gaussian_tail($muv, $lamv, $b, false)),
+        ccdf = b -> :(rk_inverse_gaussian_tail($muv, $lamv, $b, true)))
+    cell = :($lamv > 0 && $muv > 0 ? $cell : -Inf)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Exponential likelihood (SB `exponential_lpdf` mirror): the existing
+# `exponential` distribution-kernel endpoint (prior-proven, Enzyme-covered),
+# spliced per cell with the log-link mean (the Gamma-plate precedent).
+# The mean precomputes outside the cell (`_ppl_mu_`, the NB2 precedent —
+# a computed `exp` constructor arg miscompiles the Enzyme pullback).
+# The `y >= 0` guard lives in the endpoint (`ifelse`, DK-owned); `y` is
+# bound data so preparation splits the plate per taken arm and no
+# backend receives the branch. μ positivity is guarded outside evidence,
+# including raw live values. The family takes no scale
+# (Poisson-shaped; SB's rate is `1 ./ mu`, carried inside the kernel's
+# `-log(μ) - y/μ` spelling). Evidence uses the shared wrapper algebra
+# before optional weights.
+# No whole-vector fusion yet — a perf-lane follow-up, not this slice.
+function _exponential_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _location_node(r, plan)
+    mu = _mu_name(r.label)
+    typ = _location_value_type(r, plan)
+    pre = Expr[:($mu::$typ = $(_inverse_link_expr(r.link, lp)))]
+    inputs = Any[y, mu]
+    yv, muv = _dovar(1), _dovar(2)
+    cell = :($muv > 0 ? exponential($muv).logpdf($yv) : -Inf)
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Von-Mises likelihood (SB `brm_von_mises_lpdf` mirror): the branch
+# structure spelled exactly — `kappa <= 0 → -Inf` outermost, then the
+# support guard (exact: `y` outside inclusive `[mu - pi, mu + pi]`;
+# circular: `y` outside half-open `[lo, hi)`), then the Stan-native
+# in-support value `-log2π - log(I0(κ)) + κ*cos(y - mu)` with the SB
+# `log2π` literal `1.8378770664093456` and the SB pi literal
+# `3.141592653589793`. The circular mu wrap is the SB fmod spelling
+# `lo + rem(rem(mu - lo, w) + w, w)`. The identity link needs no mu
+# precompute (the lp node IS mu); kappa threads via `_scale_plate_arg`
+# (scalar sampled/literal/assignment/column, or a log-link predictor —
+# the hurdle precedent, linked per use at the contract gate). All guards are
+# lazy `?:` (never eager `ifelse`); bound-data conditions (circular
+# support, literal/column kappa) split the plate per taken arm at
+# prepare, while live conditions (sampled/predictor kappa, exact
+# moving support) keep their authored branch to the backend. Weights
+# multiply the cell (the NB2 precedent). Evidence uses the shared wrapper algebra. No whole-vector fusion yet —
+# a perf-lane follow-up, not this slice.
+function _vonmises_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    pre = Expr[]
+    lp = _response_value_node!(pre, r, plan)
+    sarg = _scale_plate_arg(r, plan, pre)
+    inputs = Any[y, lp]
+    yv, muv = _dovar(1), _dovar(2)
+    kapv = _thread_ref!(inputs, sarg)
+    if r.interval === nothing
+        base = :(-1.8378770664093456 - log(besseli(0, $kapv)) +
+            $kapv * cos($yv - $muv))
+        inner = :($yv > $muv + 3.141592653589793 ? -Inf : $base)
+        sup = :($yv < $muv - 3.141592653589793 ? -Inf : $inner)
+    else
+        lo = _thread_ref!(inputs, r.interval[1])
+        hi = _thread_ref!(inputs, r.interval[2])
+        w = :($hi - $lo)
+        wmu = :($lo + rem(rem($muv - $lo, $w) + $w, $w))
+        base = :(-1.8378770664093456 - log(besseli(0, $kapv)) +
+            $kapv * cos($yv - $wmu))
+        inner = :($yv >= $hi ? -Inf : $base)
+        support = :($yv < $lo ? -Inf : $inner)
+        valid = :(isfinite($lo) && isfinite($hi) && $lo < $hi &&
+            abs($w - $(2 * Float64(pi))) <= $(8eps(Float64) * 2 * Float64(pi)))
+        sup = :($valid ? $support : -Inf)
+    end
+    cell = :($kapv <= 0 ? -Inf : $sup)
+    ecdf = if r.interval === nothing
+        b -> :(rk_von_mises_cdf($muv, $kapv, $b))
+    else
+        lo, hi = r.interval
+        b -> :(rk_von_mises_periodic_cdf($muv, $kapv, $b, $lo, $hi))
+    end
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell; cdf=ecdf, ccdf=b -> :(1.0 - $(ecdf(b))))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    pre = Expr[]
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
-    inputs = Any[y, lp]
-    yv, etav = _dovar(1), _dovar(2)
-    nref = _thread_ref!(inputs, r.trials, true)
-    # All-keyword: the object constructor cannot mix positional and named
-    # owner bindings (matches the `:observed/:n/:logit` HAVE ports).
-    cell = :(binomial(; n = $nref, logit = $etav).logpdf($yv))
-    if r.weights !== nothing
-        wv = _thread_ref!(inputs, r.weights)
-        cell = :($wv * $cell)
+    pre = Expr[]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin]
+    yv = _dovar(1)
+    if _is_bare_param_location(r, plan) || r.link !== LogitLink
+        nref = _thread_ref!(inputs, r.trials, true)
+        p = _response_value_node!(pre, r, plan)
+        pv = _thread_ref!(inputs, p)
+        law = m -> :((($pv >= 0) & ($pv <= 1)) ? binomial($nref, $pv).$m($yv) : -Inf)
+    else
+        lp = _location_node(r, plan)
+        push!(inputs, lp)
+        etav = _dovar(2)
+        nref = _thread_ref!(inputs, r.trials, true)
+        # All-keyword: the object constructor cannot mix positional and named
+        # owner bindings (matches the `:observed/:n/:logit` HAVE ports).
+        law = m -> :(binomial(; n = $nref, logit = $etav).$m($yv))
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    ninputs, normalizer = _binomial_normalizer(yin, r, :binomial)
+    stmts = _count_plate_stmts!(pre, r, plan, node, pw, inputs, law, ninputs, normalizer)
+    return Expr[pre..., stmts...]
 end
 
-# Mean/rate vectors are precomputed statements (like `_ppl_lp_*`): plate
+# The `lognormalizer` cell of a Binomial-coefficient family (`binomial`,
+# `zero_inflated_binomial`, or its logit-zi companion): it reads the response
+# and the trials only.
+function _binomial_normalizer(yin, r::LikelihoodSpec, family::Symbol)
+    ninputs = Any[yin]
+    nn = _thread_ref!(ninputs, r.trials, true)
+    return ninputs, :($family(; n = $nn).lognormalizer($(_dovar(1))))
+end
+
+# Prob-space Binomial (SB `binomial(n, theta)` with a Beta prior — the Rate
+# family): the location is the Beta parameter name itself (no LP node —
+# the Categorical `r.predictor`-as-symbol precedent), threaded scalar
+# through the plate against the positional prob-space kernel.
+function _binomial_prob_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    pre = Expr[]
+    y = r.response
+    pre = Expr[]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin]
+    yv = _dovar(1)
+    nref = _thread_ref!(inputs, r.trials, true)
+    pref = _thread_ref!(inputs, r.predictor)
+    law = m -> :(binomial($nref, $pref).$m($yv))
+    ninputs, normalizer = _binomial_normalizer(yin, r, :binomial)
+    stmts = _count_plate_stmts!(pre, r, plan, node, pw, inputs, law, ninputs, normalizer)
+    return Expr[pre..., stmts...]
+end
+
+# Zero-inflated-Binomial plate (the ZIB head): prob-space scalar p (the
+# BinomialProb precedent) plus the zi slot (the ZIP precedent). The
+# kernel endpoint takes all three positionally; weights multiply the
+# cell (the NB2 precedent).
+function _zib_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    pre = Expr[]
+    y = r.response
+    pre = Expr[]
+    # A logit-link location is the endpoint's `logit` HAVE (the ZIP
+    # `log_rate` precedent): no probability vector, no `log(p)` round trip.
+    logit = r.link === LogitLink && !_is_bare_param_location(r, plan)
+    p = logit ? _location_node(r, plan) : _response_value_node!(pre, r, plan)
+    zi_logit = _unit_complement_logit(plan, r.zi)
+    if zi_logit === nothing
+        ziarg = _scale_use_plate_arg(r, plan, pre, r.zi, Symbol(r.label, :_zi))
+    else
+        ziarg = Symbol(:_ppl_zilogit_, r.label)
+        push!(pre, :($ziarg::Float64 = $zi_logit))
+    end
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin]
+    yv = _dovar(1)
+    nref = _thread_ref!(inputs, r.trials, true)
+    pref = _thread_ref!(inputs, p)
+    ziref = _thread_ref!(inputs, ziarg)
+    law = zi_logit !== nothing ?
+        (logit ?
+            (m -> :(zero_inflated_binomial_logit_zi(;
+                n = $nref, logit = $pref, zi_logit = $ziref).$m($yv))) :
+            (m -> :((($pref >= 0) & ($pref <= 1)) ?
+                zero_inflated_binomial_logit_zi(;
+                    n = $nref, p = $pref, zi_logit = $ziref).$m($yv) : -Inf))) :
+        (logit ?
+            (m -> :((($ziref >= 0) & ($ziref <= 1)) ?
+                zero_inflated_binomial(; n = $nref, logit = $pref, zi = $ziref).$m($yv) :
+                -Inf)) :
+            (m -> :((($pref >= 0) & ($pref <= 1)) && (($ziref >= 0) & ($ziref <= 1)) ?
+                zero_inflated_binomial($nref, $pref, $ziref).$m($yv) : -Inf)))
+    normalizer_family = zi_logit === nothing ? :zero_inflated_binomial :
+        :zero_inflated_binomial_logit_zi
+    ninputs, normalizer = _binomial_normalizer(yin, r, normalizer_family)
+    stmts = _count_plate_stmts!(pre, r, plan, node, pw, inputs, law, ninputs, normalizer)
+    return Expr[pre..., stmts...]
+end
+
+# Mean/rate vectors are precomputed statements (like predictor nodes): plate
 # cells take plain do-vars — a computed `exp` constructor arg miscompiles
 # the Enzyme pullback (NB2 eta-gradient, found by test).
 _mu_name(label::Symbol) = Symbol(:_ppl_mu_, label)
@@ -339,112 +3450,2054 @@ _rate_name(label::Symbol) = Symbol(:_ppl_rate_, label)
 
 function _nb2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     mu = _mu_name(r.label)
-    pre = :($mu = exp.($lp))
+    typ = _location_value_type(r, plan)
+    pre = Expr[:($mu::$typ = $(_inverse_link_expr(r.link, lp)))]
+    sarg = _scale_plate_arg(r, plan, pre)
     inputs = Any[y, mu]
     yv, muv = _dovar(1), _dovar(2)
-    phiref = _thread_ref!(inputs, r.scale)
+    phiref = _thread_ref!(inputs, sarg)
     cell = :(negative_binomial2($muv, $phiref).logpdf($yv))
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
+    cell = :($phiref > 0 && $muv >= 0 ? $cell : -Inf)
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
-        cell = :($wv * $cell)
+        cell = _weighted_cell(wv, cell)
     end
-    return Expr[pre, _plate_sum_stmts(pw, node, inputs, cell)...]
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# NB1 likelihood (SB `neg_binomial` mirror): the successes-shape r
+# precomputes outside the cell (`_ppl_r_`, the NB2 `_ppl_mu_`
+# precedent — a computed `exp` constructor arg miscompiles the Enzyme
+# pullback); the success probability p threads scalar, per-obs, or
+# predictor-fed (linked per use, the hurdle precedent) via
+# `_scale_plate_arg`. Weights multiply the cell (the
+# NB2 precedent). No whole-vector fusion yet — a perf-lane follow-up,
+# not this slice.
+_nb1_r_name(label::Symbol) = Symbol(:_ppl_r_, label)
+
+function _nb1_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _location_node(r, plan)
+    rr = _nb1_r_name(r.label)
+    typ = _location_value_type(r, plan)
+    pre = Expr[:($rr::$typ = $(_inverse_link_expr(r.link, lp)))]
+    sarg = _scale_plate_arg(r, plan, pre)
+    inputs = Any[y, rr]
+    yv, rv = _dovar(1), _dovar(2)
+    pref = _thread_ref!(inputs, sarg)
+    cell = :(negative_binomial($rv, $pref).logpdf($yv))
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
+    cell = :($rv > 0 && (($pref >= 0) & ($pref <= 1)) ? $cell : -Inf)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Weibull likelihood (SB `weibull` mirror): the scale's `log_theta` HAVE
+# route takes the link predictor directly (the Poisson/ZIP precedent —
+# no `exp` precompute, no `log(exp())` round trip); the shape k threads
+# scalar or per observation via `_scale_plate_arg`, including modeled
+# shapes under their own links. Weights multiply the
+# cell (the NB2 precedent). No whole-vector fusion yet — a perf-lane
+# follow-up, not this slice.
+function _weibull_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _location_node(r, plan)
+    pre = Expr[]
+    sarg = _scale_plate_arg(r, plan, pre)
+    theta = r.link === LogLink ? lp : _response_value_node!(pre, r, plan)
+    inputs = Any[y, theta]
+    yv, etav = _dovar(1), _dovar(2)
+    kref = _thread_ref!(inputs, sarg)
+    # All-keyword: the object constructor cannot mix positional and named
+    # owner bindings (the ZIP precedent).
+    cell = if r.link === LogLink
+        :($kref > 0 ? weibull(; k = $kref, log_theta = $etav).logpdf($yv) : -Inf)
+    else
+        :($kref > 0 && $etav > 0 ? weibull($kref, $etav).logpdf($yv) : -Inf)
+    end
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 function _gamma_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    pre = Expr[]
+    mu = _response_value_node!(pre, r, plan)
+    sarg = _scale_plate_arg(r, plan, pre)
+    inputs = Any[r.response, mu]
+    yv, muv = _dovar(1), _dovar(2)
+    aref = _thread_ref!(inputs, sarg)
+    rate = r.family === GammaValueFam ? :(1.0 / $muv) : :($aref / $muv)
+    cell = :($aref > 0 && $muv > 0 ?
+        gamma($aref, $rate).logpdf($yv) : -Inf)
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
+    if r.weights !== nothing
+        cell = _weighted_cell(_thread_ref!(inputs, r.weights), cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+
+end
+
+# The scale argument a likelihood plate threads per cell: scalar scales
+# (parameter, assignment, literal, raw data column) pass through untouched;
+# a predictor-fed scale binds its constrained vector once
+# (`_ppl_sc_<label>`, the `_ppl_mu_`/`_ppl_rate_` precompute precedent —
+# the link inverts here, never inside the cell) and the plate iterates
+# the node. Link inversion reuses the shared ordinary inverse-link
+# mathematics used by generated arguments.
+_sc_name(label::Symbol) = Symbol(:_ppl_sc_, label)
+
+function _scale_plate_arg(r::LikelihoodSpec, plan::StructuralPlan, pre::Vector{Expr})
+    return _scale_use_plate_arg(r, plan, pre, r.scale, r.label)
+end
+
+# One scale-slot use over a likelihood plate: scalar scales pass through
+# untouched; a predictor-fed scale binds its constrained vector once
+# (`_ppl_sc_<label>`) and the plate iterates the node. Mixture
+# components pass their own use + per-component label.
+function _scale_use_plate_arg(r::LikelihoodSpec, plan::StructuralPlan,
+        pre::Vector{Expr}, s, label::Symbol)
+    s isa ScalePredictorRef || return s
+    pred = _predictor(plan, s.predictor)
+    lp = pred.name
+    sc = _sc_name(label)
+    rhs = _inverse_link_expr(s.link, lp)
+    # The annotation is load-bearing for AD, not decoration: it proves the
+    # plate input `:axis` statically, so `prepare` lowers the straight-line
+    # plate form. Unannotated (metadata-`Any`) vector inputs lower with the
+    # runtime `_authored_plate_is_axis` / `_plate_dependency_changed` guards,
+    # whose form defeats Enzyme's static-activity analysis on some endpoint
+    # bodies (NB2, found by test: silently wrong gradients). The eltype-free
+    # array annotation retains matrix/tensor axes and integer offset LPs;
+    # a parameter-only composed expression retains scalar metadata.
+    typ = _predictor_value_type(plan, pred)
+    push!(pre, :($sc::$typ = $rhs))
+    return sc
+end
+
+# Linked values retain the raw predictor's broadcast shape. The explicit
+# scalar/array type also lets plate AD determine activity without a runtime
+# shape guard. Ordinary vector designs keep their existing annotation.
+function _predictor_value_type(plan::StructuralPlan, pred::PredictorSpec)
+    _broadcast_affine(plan, pred) || return :AbstractVector
+    _scalar_valued_predictor(plan, pred) && return :Number
+    scalar = all(pred.terms) do t
+        t.kind === InterceptTerm && return true
+        t.kind in (ContinuousTerm, OffsetTerm) &&
+            return all(c -> get(plan.columns, c, nothing) isa Number, t.columns)
+        t.kind === ComposedTerm || return false
+        isempty(t.columns) || return false
+        return all(q -> _predictor_value_type(plan, _predictor(plan, q)) === :Number,
+            t.options.subs)
+    end
+    return scalar ? :Number : :AbstractArray
+end
+
+# Inverse links are ordinary pure arithmetic in every slot. The same
+# expression feeds primal, native AD and compiled AD.
+_inverse_link_expr(link::LinkFunction, value) =
+    _inverse_link_expr(Val(link), value)
+_inverse_link_expr(::Val{IdentityLink}, value) = value
+_inverse_link_expr(::Val{LogLink}, value) = :(exp.($value))
+_inverse_link_expr(::Val{LogitLink}, value) = :(_ppl_logistic.($value))
+_inverse_link_expr(::Val{ProbitLink}, value) = :(0.5 .* erfc.(-$value ./ sqrt(2)))
+_inverse_link_expr(::Val{CloglogLink}, value) = :(-expm1.(-exp.($value)))
+
+_prob_name(label::Symbol) = Symbol(:_ppl_p_, label)
+_logitp_name(label::Symbol) = Symbol(:_ppl_logitp_, label)
+_shape_a_name(label::Symbol) = Symbol(:_ppl_a_, label)
+_shape_b_name(label::Symbol) = Symbol(:_ppl_b_, label)
+
+# Bernoulli probit: Phi precompute as pure Base arithmetic (Gamma-pre
+# pattern). Phi is 0.5*erfc(-z/sqrt(2)), exactly the `standard_normal.cdf`
+# formula — inlined rather than broadcast through the endpoint object
+# because Enzyme cannot differentiate the object-broadcast (runtime
+# activity on the const kernel object). Positional-p cell (primary form).
+function _bernoulli_probit_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
-    # Surface is Distributions-SCALE `Gamma(alpha, mu/alpha)`; the kernel
-    # takes rate, so the boundary inverts (same as the sampled-gamma prior).
-    av = r.scale isa Symbol ? r.scale : Float64(r.scale)
-    rate = _rate_name(r.label)
-    pre = :($rate = $av ./ exp.($lp))
-    inputs = Any[y, rate]
-    yv, ratev = _dovar(1), _dovar(2)
-    aref = _thread_ref!(inputs, r.scale)
-    cell = :(gamma($aref, $ratev).logpdf($yv))
+    lp = _location_node(r, plan)
+    p = _prob_name(r.label)
+    pre = Expr[:($p = 0.5 .* erfc.(-$lp ./ sqrt(2)))]
+    yv, pv = _dovar(1), _dovar(2)
+    yin, yref = _bernoulli_yplate!(pre, plan, y, r.label, yv)
+    inputs = Any[yin, p]
+    cell = :(bernoulli($pv).logpdf($yref))
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Bernoulli cloglog: pure-arithmetic p precompute, positional-p cell.
+function _bernoulli_cloglog_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _location_node(r, plan)
+    p = _prob_name(r.label)
+    pre = Expr[:($p = 1 .- exp.(-exp.($lp)))]
+    yv, pv = _dovar(1), _dovar(2)
+    yin, yref = _bernoulli_yplate!(pre, plan, y, r.label, yv)
+    inputs = Any[yin, p]
+    cell = :(bernoulli($pv).logpdf($yref))
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Binomial probit/cloglog: precompute p, then logit(p), and reuse the
+# proven logit route — the binomial kernel's p port is unverified, while
+# the (:n, :logit) route is what slice-1 Binomial emits.
+function _binomial_probit_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    pre = Expr[]
+    y = r.response
+    lp = _location_node(r, plan)
+    p = _prob_name(r.label)
+    logitp = _logitp_name(r.label)
+    pre = Expr[]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin, logitp]
+    yv, lpv = _dovar(1), _dovar(2)
+    nref = _thread_ref!(inputs, r.trials, true)
+    law = m -> :(binomial(; n = $nref, logit = $lpv).$m($yv))
+    ninputs, normalizer = _binomial_normalizer(yin, r, :binomial)
+    stmts = _count_plate_stmts!(pre, r, plan, node, pw, inputs, law, ninputs, normalizer)
+    return Expr[pre..., :($p = 0.5 .* erfc.(-$lp ./ sqrt(2))),
+        :($logitp = log.($p) .- log1p.(-$p)),
+        stmts...]
+end
+
+function _binomial_cloglog_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    pre = Expr[]
+    y = r.response
+    lp = _location_node(r, plan)
+    p = _prob_name(r.label)
+    logitp = _logitp_name(r.label)
+    pre = Expr[]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin, logitp]
+    yv, lpv = _dovar(1), _dovar(2)
+    nref = _thread_ref!(inputs, r.trials, true)
+    law = m -> :(binomial(; n = $nref, logit = $lpv).$m($yv))
+    ninputs, normalizer = _binomial_normalizer(yin, r, :binomial)
+    stmts = _count_plate_stmts!(pre, r, plan, node, pw, inputs, law, ninputs, normalizer)
+    return Expr[pre..., :($p = 1 .- exp.(-exp.($lp))),
+        :($logitp = log.($p) .- log1p.(-$p)),
+        stmts...]
+end
+
+# Beta mean-concentration: mu/a/b precomputes (Gamma-pre pattern), kappa
+# by name (Symbol), inlined (literal), or bound once (`_ppl_sc_<label>`
+# via `_scale_plate_arg` for a log-link predictor — the vector folds
+# into the a/b precomputes through broadcast); cell needs only (y, a,
+# b), so kappa is never a plate input. Positional beta cell (primary
+# form).
+function _beta_shape_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
+        node::Symbol, pw::Symbol)
+    pre = Expr[]
+    inputs = Any[r.response, _location_node(r, plan)]
+    y, alpha = _dovar(1), _dovar(2)
+    beta_arg = _thread_ref!(inputs, _scale_plate_arg(r, plan, pre))
+    valid = :(isfinite($alpha) && $alpha > 0 &&
+        isfinite($beta_arg) && $beta_arg > 0)
+    # The ordinary Beta density stays inside the domain branch. The
+    # existing owned logbeta callable carries its generated derivative
+    # rule; endpoint expansion cannot currently bind that global here.
+    density = :(($alpha - 1) * log($y) +
+        ($beta_arg - 1) * log1p(-$y) - logbeta($alpha, $beta_arg))
+    density = _wrap_evidence!(r, plan, pre, inputs, density;
+        cdf = b -> :(beta($alpha, $beta_arg).cdf($b)),
+        ccdf = b -> :(beta($alpha, $beta_arg).ccdf($b)))
+    cell = :($valid ? $density : -Inf)
+    if r.weights !== nothing
+        weight = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(weight, cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+function _beta_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _location_node(r, plan)
+    mu = _mu_name(r.label)
+    a = _shape_a_name(r.label)
+    b = _shape_b_name(r.label)
+    typ = _location_value_type(r, plan)
+    pre = Expr[:($mu::$typ = $(_inverse_link_expr(r.link, lp)))]
+    sarg = _scale_plate_arg(r, plan, pre)
+    k = sarg isa Symbol ? sarg : Float64(sarg)
+    push!(pre, :($a = $mu .* $k), :($b = (1 .- $mu) .* $k))
+    inputs = Any[y, a, b]
+    yv, avv, bvv = _dovar(1), _dovar(2), _dovar(3)
+    cell = :(beta($avv, $bvv).logpdf($yv))
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
+    cell = :($avv > 0 && $bvv > 0 ? $cell : -Inf)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# BetaBinomial2 mean-precision: mu/a/b precomputes (the Beta-plate
+# pattern) plus trials threading (the Binomial-plate pattern); the cell
+# is the Stan-native `beta_binomial(n, alpha, beta)` endpoint. phi is
+# never a plate input: a Symbol threads through the precomputes (scalar
+# parameter or per-observation column, both broadcast), a literal
+# inlines, and a predictor-fed phi binds its constrained vector once
+# (`_ppl_sc_`, the NB2 precedent) and broadcasts through `a`/`b`.
+function _betabinomial2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    y = r.response
+    lp = _location_node(r, plan)
+    pre = Expr[]
+    sarg = _scale_plate_arg(r, plan, pre)
+    k = sarg isa Symbol ? sarg : Float64(sarg)
+    mu = _mu_name(r.label)
+    a = _shape_a_name(r.label)
+    b = _shape_b_name(r.label)
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin, a, b]
+    yv, avv, bvv = _dovar(1), _dovar(2), _dovar(3)
+    nref = _thread_ref!(inputs, r.trials, true)
+    cell = :(beta_binomial($nref, $avv, $bvv).logpdf($yv))
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
+    cell = :($avv > 0 && $bvv > 0 ? $cell : -Inf)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
+    end
+    typ = _location_value_type(r, plan)
+    return Expr[pre...,
+        :($mu::$typ = $(_inverse_link_expr(r.link, lp))),
+        :($a = $mu .* $k),
+        :($b = (1 .- $mu) .* $k),
+        _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Reference-coded multi-logit categorical (SB `CategoricalLogit`): K−1
+# linear predictors supply the non-reference logits; class 1 is the
+# implicit zero reference. The cell is the `categorical_logit_ref` math
+# in scalar form (per-row logit vectors would need matrix assembly):
+# the observed term selects by `y` (ifelse chain) and the normalizer is
+# a max-shifted log-sum-exp over (0, etas...) — linear-size in K (a
+# nested logaddexp chain would double nodes per level; the max chain is
+# re-embedded per term, so K² worst case — K is small).
+function _categorical_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    pre = Expr[]
+    preds = [r.predictor; r.extra_predictors...]
+    inputs = Any[r.response, preds...]
+    yv = _dovar(1)
+    etas = [_dovar(i) for i in 2:length(inputs)]
+    K = length(preds) + 1
+    obs = :(0.0)
+    for j in K:-1:2
+        obs = :(ifelse($yv == $j, $(etas[j-1]), $obs))
+    end
+    m = :(0.0)
+    for e in etas
+        m = :(max($m, $e))
+    end
+    sumexp = :(exp(0.0 - $m))
+    for e in etas
+        sumexp = :($sumexp + exp($e - $m))
+    end
+    cell = :($obs - ($m + log($sumexp)))
+    function categorical_tail(b, upper)
+        terms = Any[upper ? :($b < 1 ? exp(-$m) : 0.0) : :($b >= 1 ? exp(-$m) : 0.0)]
+        for j in 2:K
+            t = upper ? :($b < $j ? exp($(etas[j-1]) - $m) : 0.0) :
+                :($b >= $j ? exp($(etas[j-1]) - $m) : 0.0)
+            push!(terms,t)
+        end
+        numerator=foldl((a,b)->:($a+$b),terms)
+        :($numerator / $sumexp)
+    end
+    cell = _wrap_evidence!(r,plan,pre,inputs,cell;
+        cdf=b->categorical_tail(b,false),ccdf=b->categorical_tail(b,true))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv,cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw,node,inputs,cell)...]
+end
+
+# Stable log-logistic (Stan `log_inv_logit`): `-log1pexp(-z)`, the RK
+# Bernoulli-logit law's form. Its lazy branches evaluate one `exp` and one
+# `log1p`, with no overflow in either tail. An eager `ifelse` of the two
+# one-sided forms evaluated both, doubling every ordinal cell's work.
+_log_inv_logit(z) = :(-log1pexp(-$z))
+
+# Ordinal link log-CDF / log-CCDF over a scalar z (SB `brm_ordinal_logcdf`
+# / `brm_ordinal_logccdf`). Probit uses the slice-1 erfc treatment
+# (`0.5*erfc(∓z/√2)` under a log — accurate in moderate ranges; extreme
+# tails round, the accepted slice-1 probit caveat).
+function _ordinal_logF(link::LinkFunction, z)
+    link === LogitLink && return _log_inv_logit(z)
+    link === ProbitLink && return :(log(0.5 * erfc(-$z / sqrt(2))))
+    return :(log(-expm1(-exp($z))))
+end
+function _ordinal_logCC(link::LinkFunction, z)
+    link === LogitLink && return _log_inv_logit(:(-$z))
+    link === ProbitLink && return :(log(0.5 * erfc($z / sqrt(2))))
+    return :(-exp($z))
+end
+
+# Log-difference of log-probs (a ≥ b): `a + log1p(-exp(b - a))`. It
+# cancels as b - a → 0⁻; only the probit and cloglog interior levels use it,
+# and their log-CDFs already round away the upper-tail mass it would need.
+_log_diff_exp(a, b) = :($a + log1p(-exp($b - $a)))
+
+# Interior cumulative level `F(hi) - F(lo)` (hi = d*(c[y] - eta) ≥
+# lo = d*(c[y-1] - eta); `gap` = d*(c[y-1] - c[y]) = lo - hi ≤ 0). Logit
+# takes the exact identity F(hi) - F(lo) = F(hi) (1 - F(lo)) (1 - exp(gap))
+# (Stan `log_inv_logit_diff`): log-CDF plus log-CCDF, each exact in both
+# tails, plus a term that reads only the scaled cutpoint gap — absolute
+# error ~eps for any gap, and no eta in it, so with data cutpoints the
+# reverse pass skips it. `log_diff_exp` of two log-CDFs instead cancels when
+# both cutpoints lie far above eta (both log-CDFs near 0).
+function _ordinal_interior_logmass(link::LinkFunction, hi, lo, gap)
+    link === LogitLink && return :($(_ordinal_logF(link, hi)) +
+        $(_ordinal_logCC(link, lo)) + log(-expm1($gap)))
+    return _log_diff_exp(_ordinal_logF(link, hi), _ordinal_logF(link, lo))
+end
+
+# Modeled-scale precompute name (response `label`).
+_disc_name(label::Symbol) = Symbol(:_ppl_disc_, label)
+
+# Ordinal per-observation reference as a plate do-var: `nothing` inlines
+# `absent`, a literal inlines, and a Symbol (data column / precompute)
+# threads — directly for the per-observation cumulative plate
+# (`rows === nothing`), or gathered onto the stopping-ratio stage lanes
+# (`<lane> = ref[rows]`, emitted into `prests`).
+function _ordinal_lane_ref!(inputs::Vector{Any}, prests::Vector{Expr}, ref,
+        rows, lane::Symbol; absent = 1.0)
+    ref === nothing && return absent
+    ref isa Symbol || return Float64(ref)
+    rows === nothing && return _thread_ref!(inputs, ref)
+    push!(prests, :($lane = _broadcast_gather($ref, $rows)))
+    return _thread_ref!(inputs, lane)
+end
+
+# Ordinal latent scale source: absent (`nothing` — the 3-positional form),
+# a literal, a data column, or a log-link predictor's `exp` precompute
+# (structural positivity — the Poisson `exp.(lp)` precedent).
+function _ordinal_scale_source!(prests::Vector{Expr}, r::LikelihoodSpec,
+        plan::StructuralPlan)
+    d = r.discrimination
+    if d isa ScalePredictorRef
+        return _scale_use_plate_arg(r, plan, prests, d, Symbol(r.label, :_disc))
+    end
+    if d isa Symbol && any(p -> p.name === d, plan.predictors)
+        return _disc_pre!(prests, r, plan, d)
+    end
+    return d
+end
+
+# Modeled-scale column: `exp` over the scale predictor's lp node (the
+# predictor statements run before the likelihood, so the node exists;
+# validation proved the link is LogLink). Explicit dotted form, evaluated
+# once and threaded like the stage-effect columns.
+function _disc_pre!(prests::Vector{Expr}, r::LikelihoodSpec,
+        plan::StructuralPlan, sname::Symbol)
+    pred = _predictor(plan, sname)
+    lp = pred.name
+    name = _disc_name(r.label)
+    typ = _predictor_value_type(plan, pred)
+    push!(prests, :($name::$typ = $(_inverse_link_expr(pred.link, lp))))
+    return name
+end
+
+# Ordered response plate (OrderedLogistic + Ordinal; OrderedLogistic is
+# cumulative-logit with d = 1 and no threshold effects). The thresholds
+# are ONE shared vector that each cell reads whole and gathers by its own
+# level, so nothing in the emitted program — statements or cell — grows
+# with the level count K. K=1 lowers to a zero cell (SB's
+# zero-information likelihood).
+# A guarded data-only plate may leave a scalar placeholder at a missing
+# observation; validate its shape before attempting any vector reads.
+_ordinal_cutpoints_valid(c) = c isa AbstractVector && all(c[2:end] .> c[1:end-1])
+_threshold_input(name::Symbol) = :(Ref($name))
+_threshold_input(rows::ThresholdRows) = rows.name
+_threshold_validity(name::Symbol) =
+    Expr(:call, GlobalRef(@__MODULE__, :_ordinal_cutpoints_valid), name)
+_threshold_validity(rows::ThresholdRows) =
+    Expr(:., GlobalRef(@__MODULE__, :_ordinal_cutpoints_valid), Expr(:tuple, rows.name))
+_threshold_stages(name::Symbol, obs, stage) = :($name[$stage])
+_threshold_stages(rows::ThresholdRows, obs, stage) =
+    :(getindex.(_broadcast_gather($(rows.name), $obs), $stage))
+
+function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    K = _group_thresholds(plan, r) ? :(length($(r.thresholds)) + 1) : r.n_levels
+    K === nothing && throw(ContractValidationError(
+        "[generator] ordered response $(r.label) has unresolved n_levels " *
+        "(bind_data infers it)"))
+    structure = r.family === OrderedLogisticFam ? :cumulative : r.ordinal_structure
+    structure === :cumulative ||
+        return _ordinal_stopping_stmts(r, plan, node, pw, K)
+    lp = _location_node(r, plan)
+    inputs = Any[r.response, lp]
+    yv, etav = _dovar(1), _dovar(2)
+    prests = Expr[]
+    cutref = nothing
+    validref = nothing
+    dref = _ordinal_lane_ref!(inputs, prests,
+        _ordinal_scale_source!(prests, r, plan), nothing, :_)
+    cell = if K == 1
+        # SB's zero-information likelihood; the cell stays a real Expr
+        # over the (integer) response do-var (`:(0.0)` would quote to a
+        # bare Float64, which the plate builder does not take).
+        :(0.0 * $yv)
+    else
+        push!(inputs, _threshold_input(r.thresholds))
+        cutref = _dovar(length(inputs))
+        levels = r.thresholds isa ThresholdRows ? :(length($cutref) + 1) : K
+        cumulative = _ordinal_cumulative_cell(r.link, levels, yv, etav, dref, cutref)
+        (r.thresholds isa ThresholdRows || _group_thresholds(plan, r)) &&
+            (cumulative = :(isempty($cutref) ? 0.0 * $yv : $cumulative))
+        # A response reads the authored vector; it does not impose an
+        # Ordered transform or replace its prior. Guard before logarithms,
+        # including when only boundary categories are observed.
+        pi = findfirst(p -> p.name === r.thresholds, plan.vector_parameters)
+        parameter = pi === nothing ? nothing : plan.vector_parameters[pi]
+        if parameter !== nothing && _is_ordered_parameter(parameter.family) &&
+                parameter.name ∉ plan.conditioned
+            cumulative
+        else
+            valid = Symbol(:_ppl_cutpoints_valid_,r.label)
+            check = _threshold_validity(r.thresholds)
+            push!(prests,:($valid = $check))
+            push!(inputs,valid)
+            validref = _dovar(length(inputs))
+            cumulative
+        end
+    end
+    if r.discrimination !== nothing
+        cell = :(isfinite($dref) && $dref > 0 ? $cell : -Inf)
+    end
+    c = cutref
+    function ordinal_tail(b, upper)
+        K == 1 && return upper ? :($b < 1 ? 1.0 : 0.0) : :($b < 1 ? 0.0 : 1.0)
+        levels = r.thresholds isa ThresholdRows ? :(length($c) + 1) : K
+        logtail=upper ? _ordinal_logCC(r.link,:($dref * ($c[$b]-$etav))) :
+            _ordinal_logF(r.link,:($dref * ($c[$b]-$etav)))
+        :($b < 1 ? $(upper ? 1.0 : 0.0) : ($b >= $levels ? $(upper ? 0.0 : 1.0) : exp($logtail)))
+    end
+    cell=_wrap_evidence!(r,plan,prests,inputs,cell;
+        cdf=b->ordinal_tail(b,false),ccdf=b->ordinal_tail(b,true))
+    validref === nothing || (cell = :($validref ? $cell : -Inf))
+    if r.weights !== nothing
+        cell = _weighted_cell(_thread_ref!(inputs, r.weights), cell)
+    end
+    return Expr[prests..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Cumulative cell over the shared threshold vector `c`: the first level
+# takes logF at `c[1]`, the last logCC at `c[K-1]`, an interior level `y`
+# the log mass between `c[y-1]` and `c[y]` (`_ordinal_interior_logmass`;
+# thresholds are ordered, so hi ≥ lo). Authored as lazy branches on the observed
+# level: only the observation's own arm runs, so every gather is in bounds
+# by construction; the branch condition reads bound data only, so plate
+# lowering splits the lanes by arm before any backend sees a branch.
+function _ordinal_cumulative_cell(link::LinkFunction, K, yv::Symbol,
+        etav::Symbol, dref, c::Symbol)
+    first = _ordinal_logF(link, :($dref * ($c[1] - $etav)))
+    last = _ordinal_logCC(link, :($dref * ($c[$K - 1] - $etav)))
+    K == 2 && return :($yv == 1 ? $first : $last)
+    interior = _ordinal_interior_logmass(link, :($dref * ($c[$yv] - $etav)),
+        :($dref * ($c[$yv - 1] - $etav)), :($dref * ($c[$yv - 1] - $c[$yv])))
+    return :($yv == 1 ? $first :
+        ($yv == $K ? $last : $interior))
+end
+
+# Stage-lane names for response `label`.
+_stage_lane(label::Symbol, what::Symbol) = Symbol(:_ppl_srl_, what, :_, label)
+
+# Stopping-ratio plate over the stage lanes: every lane column is gathered
+# once by the (bound) lane tables — the observation's predictor/scale/weight,
+# the stage's threshold `t[stage]`, and with per_threshold effects the
+# stage's coefficient pack entries (stage-major: stage j occupies
+# `(j-1)*p+1 .. j*p`) — so the cell itself reads only scalars. The cell survives (logCC) or stops
+# (logF) by a lazy branch on the bound stage/level pair, which plate
+# lowering splits by arm. K=1 runs zero stages (SB's zero-information
+# likelihood) and lowers to a zero cell over the observations.
+function _ordinal_stopping_stmts(r::LikelihoodSpec, plan::StructuralPlan,
+        node::Symbol, pw::Symbol, K)
+    r.evidence.kind === :none || return _ordinal_stopping_evidence_stmts(r, plan, node, pw, K)
+    y = r.response
+    if K == 1
+        return _plate_sum_stmts(pw, node, Any[y], :(0.0 * $(_dovar(1))))
+    end
+    lp = _location_node(r, plan)
+    obs, stage = _stage_lane(r.label, :obs), _stage_lane(r.label, :stage)
+    levels = r.thresholds isa ThresholdRows ? :(length.($(r.thresholds.name)) .+ 1) : K
+    prests = Expr[:($obs = _ordinal_stage_obs($y, $levels)),
+        :($stage = _ordinal_stage_idx($y, $levels))]
+    level = _stage_lane(r.label, :y)
+    eta = _stage_lane(r.label, :eta)
+    thr = _stage_lane(r.label, :t)
+    push!(prests, :($level = $y[$obs]), :($eta = _broadcast_gather($lp, $obs)),
+        :($thr = $(_threshold_stages(r.thresholds, obs, stage))))
+    inputs = Any[stage, level, eta, thr]
+    sv, yv, etav, tv = _dovar(1), _dovar(2), _dovar(3), _dovar(4)
+    dref = _ordinal_lane_ref!(inputs, prests,
+        _ordinal_scale_source!(prests, r, plan), obs, _stage_lane(r.label, :d))
+    z = if r.threshold_effects !== nothing
+        matrix = _stage_lane(r.label, :effects_matrix)
+        eff = _stage_lane(r.label, :eff)
+        push!(prests,
+            :($matrix = _ordinal_effects_matrix($(r.threshold_effects), $y, $K)),
+            :($eff = $matrix[$obs .+ ($stage .- 1) .* length($y)]))
+        push!(inputs, eff)
+        :($dref * ($tv - $etav - $(_dovar(length(inputs)))))
+    elseif isempty(r.threshold_columns)
+        :($dref * ($tv - $etav))
+    else
+        eff = _stage_lane(r.label, :eff)
+        p = length(r.threshold_columns)
+        terms = Any[:($col[$obs] .* $(r.threshold_coefs)[($stage .- 1) .* $p .+ $ci])
+            for (ci, col) in enumerate(r.threshold_columns)]
+        push!(prests, :($eff = $(foldl((a, b) -> :($a .+ $b), terms))))
+        push!(inputs, eff)
+        :($dref * ($tv - $etav - $(_dovar(length(inputs)))))
+    end
+    cell = :($sv < $yv ? $(_ordinal_logCC(r.link, z)) : $(_ordinal_logF(r.link, z)))
+    if r.discrimination !== nothing
+        cell = :(isfinite($dref) && $dref > 0 ? $cell : -Inf)
+    end
+    if r.weights !== nothing
+        cell = _weighted_cell(_ordinal_lane_ref!(inputs, prests, r.weights,
+            obs, _stage_lane(r.label, :w)), cell)
+    end
+    return Expr[prests..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+function _ordinal_stopping_evidence_stmts(r, plan, node, pw, K)
+    # One plate lane per observation; the helper retains the stage loop.
+    # Evidence describes the whole ordinal law, rather than individual stops.
+    K == 1 && return _ordinal_single_evidence_stmts(r, plan, node, pw)
+    pre = Expr[]
+    lp = _location_node(r, plan)
+    row = _stage_lane(r.label, :evidence_row)
+    push!(pre, :($row = collect(eachindex($(r.response)))))
+    inputs = Any[r.response, lp, _threshold_input(r.thresholds), row]
+    yv, eta, t, iv = (_dovar(i) for i in 1:4)
+    d = _ordinal_lane_ref!(inputs, pre, _ordinal_scale_source!(pre, r, plan), nothing, :_)
+    effects = nothing
+    if r.threshold_effects !== nothing
+        matrix = _stage_lane(r.label, :effects_matrix)
+        push!(pre, :($matrix = _ordinal_effects_matrix($(r.threshold_effects), $(r.response), $K)))
+        push!(inputs, :(Ref($matrix)))
+        effects = _dovar(length(inputs))
+    elseif !isempty(r.threshold_columns)
+        matrix = _stage_lane(r.label, :effects_matrix)
+        p = length(r.threshold_columns)
+        push!(pre, :($matrix = hcat($(r.threshold_columns...)) * reshape($(r.threshold_coefs), $p, $K - 1)))
+        push!(inputs, :(Ref($matrix)))
+        effects = _dovar(length(inputs))
+    end
+    link = r.link === LogitLink ? :(Val(:logit)) :
+        r.link === ProbitLink ? :(Val(:probit)) : :(Val(:cloglog))
+    cell = :(rk_ordinal_stopping_logpdf($t, $eta, $d, $effects, $iv, ReactiveKernels._tensorized_trunc(Int, $yv), $link))
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell;
+        cdf=b -> :(rk_ordinal_stopping_tail($t, $eta, $d, $effects, $iv, $b, $link, false)),
+        ccdf=b -> :(rk_ordinal_stopping_tail($t, $eta, $d, $effects, $iv, $b, $link, true)))
+    if r.discrimination isa ScalePredictorRef
+        cell = :(isfinite($d) && $d > 0 ? $cell : -Inf)
+    end
+    r.weights === nothing || (cell = _weighted_cell(_thread_ref!(inputs, r.weights), cell))
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+function _ordinal_single_evidence_stmts(r, plan, node, pw)
+    pre, inputs = Expr[], Any[r.response]
+    cell = _wrap_evidence!(r, plan, pre, inputs, :(0.0 * $(_dovar(1)));
+        cdf=b -> :($b < 1 ? 0.0 : 1.0), ccdf=b -> :($b < 1 ? 1.0 : 0.0))
+    r.weights === nothing || (cell = _weighted_cell(_thread_ref!(inputs, r.weights), cell))
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Shared-simplex multinomial (SB `brm_multinomial` vector[K] method): the
+# count matrix crosses as K raw columns — program structure (the count
+# columns the model names), not a data-inferred size — and the level
+# probabilities thread as one shared vector the cell reads per column.
+# The cell is Stan's `multinomial_lpmf` in scalar form —
+# `lgamma(N+1) − Σ lgamma(c+1) + Σ c*log(p)` — with the `0*log(0) = 0`
+# convention guarded per term (Stan treats a zero count at a zero
+# probability as 0, not NaN). A literal N folds its `lgamma(N+1)`
+# host-side (exact same value, computed once).
+function _multinomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    counts = [r.response; r.count_columns...]
+    K = length(counts)
+    inputs = Any[counts...]
+    cvs = [_dovar(i) for i in 1:K]
+    nref = _thread_ref!(inputs, r.trials, true)
+    push!(inputs, :(Ref($(r.predictor))))
+    pv = _dovar(length(inputs))
+    lfact = r.trials isa Int ? loggamma(r.trials + 1.0) : :(loggamma($nref + 1.0))
+    cell = :($lfact)
+    stmts = Expr[]
+    for (i, cv) in enumerate(cvs)
+        term = Symbol(:_ppl_multinomial_term_, r.label, :_, i)
+        # Bound zero counts take the constant arm during plate preparation.
+        # Their logarithm and its derivative must never be evaluated.
+        push!(stmts, :($term = if $cv == 0
+            0.0
+        else
+            $cv * log($pv[$i])
+        end))
+        cell = :($cell - loggamma($cv + 1.0) + $term)
+    end
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[pre, _plate_sum_stmts(pw, node, inputs, cell)...]
+    push!(stmts, cell)
+    return _plate_sum_stmts(pw, node, inputs, stmts)
 end
 
-function _prior_statements(plan::StructuralPlan)
+# Plain categorical over shared-simplex probabilities (Stan
+# `categorical_lpmf`): the level log-probabilities `log.(p)` are one
+# vector statement, and each cell gathers its observed level's entry
+# (`logp[y]`) — no per-level work in the cell. K=1 lowers to
+# `log(1.0) = 0` uniformly.
+_logp_name(label::Symbol) = Symbol(:_ppl_logp_, label)
+
+function _categorical_plain_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    r.n_levels === nothing && throw(ContractValidationError(
+        "[generator] categorical response $(r.label) has unresolved n_levels " *
+        "(bind_data infers it)"))
+    pre=Expr[]
+    logp = _logp_name(r.label)
+    inputs = Any[r.response, :(Ref($logp))]
+    yv, lv = _dovar(1), _dovar(2)
+    cell = :($lv[$yv])
+    cell = _wrap_evidence!(r,plan,pre,inputs,cell;
+        cdf=b -> :(rk_logprob_tail($lv,$b,false)),
+        ccdf=b -> :(rk_logprob_tail($lv,$b,true)))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv,cell)
+    end
+    return Expr[pre..., :($logp::AbstractVector{Float64} = log.($(r.predictor))),
+        _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# Joint correlated-outcomes likelihood (SB's per-row
+# `multi_normal_cholesky(mean_row, L)` with
+# `L = diag_pre_multiply(scales, L_corr)`): one plate over the K outcome
+# columns + K mean LPs sums the per-row density. The row cell is scalar
+# forward substitution over threaded do-vars (the multinomial-cell shape —
+# no matrix, no triangular solve in the cell, so the tensorized plate
+# traces; a core-`mvnormal` splice was probed and fails Reactant primal
+# inside the plate — the in-cell `\` hits scalar indexing in Reactant's
+# `generic_trimatdiv!`, a primal gap distinct from the §7f gradient gap).
+# The L entries materialize as `_ppl_mvn_Le_` scalars (row-scaled layout
+# temps) and thread as shared scalar plate inputs.
+function _mvn_cholesky_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
+        node::Symbol, pw::Symbol)
+    outcomes = [r.response; r.extra_responses...]
+    preds = [r.predictor; r.extra_predictors...]
+    K = length(outcomes)
+    ap = _joint_factor_arrays(r, plan)
+    if ap === nothing
+        si = findfirst(p -> p.name === r.factor_scales, plan.vector_parameters)
+        ci = findfirst(p -> p.name === r.factor_corr, plan.vector_parameters)
+        (si === nothing || ci === nothing) && throw(ContractValidationError(
+            "[generator] joint response $(r.label) factor pieces unresolved " *
+            "(validate_plan links them)"))
+        sc, cr = plan.vector_parameters[si], plan.vector_parameters[ci]
+        (sc.size == K && cr.size == K) || throw(ContractValidationError(
+            "[generator] joint response $(r.label) factor sizes disagree " *
+            "with the $K outcomes (validate_plan checks this)"))
+    else
+        sc, cr = ap
+    end
     stmts = Expr[]
-    terms = Any[]
-    for pred in plan.predictors
-        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps)
-        shape.width == 0 && continue
-        node = Symbol(:_ppl_prior_, pred.name)
-        pw = Symbol(:_ppl_pw_prior_, pred.name)
-        loc, sca = coefficient_priors(shape, plan.population_priors)
-        mut = Symbol(:_ppl_prmu_, pred.name)
-        sdt = Symbol(:_ppl_prsd_, pred.name)
-        push!(stmts, :($mut = Float64[$(loc...)]))
-        push!(stmts, :($sdt = Float64[$(sca...)]))
-        coef = block_name(pred.name)
-        cv, mv, sv = _dovar(1), _dovar(2), _dovar(3)
-        cell = :(normal($mv, $sv).logpdf($cv))
-        append!(stmts, _plate_sum_stmts(pw, node, Any[coef, mut, sdt], cell))
-        push!(terms, node)
+    # L[i,j] = scales[i] * L_corr[i,j] (j ≤ i), one scalar per lower entry.
+    for i in 1:K, j in 1:i
+        scale = ap === nothing ? _vector_elt_name(sc.name, i) : :($(sc.name)[$i])
+        corr = ap === nothing ? _rl_name(cr.name, i, j) : :($(cr.name)[$i, $j])
+        push!(stmts, :($(_mvn_L_entry(r.label, i, j))::Float64 = $scale * $corr))
     end
-    for p in plan.parameters
-        node = Symbol(:_ppl_prior_, p.name)
-        push!(stmts, :($node::Float64 = $(_sampled_prior_expr(p))))
-        push!(terms, node)
+    inputs = Any[outcomes...; preds...]
+    yvs = [_dovar(i) for i in 1:K]
+    mvs = [_dovar(K + i) for i in 1:K]
+    Ld = Dict{Tuple{Int,Int},Symbol}()
+    for i in 1:K, j in 1:i
+        Ld[(i, j)] = _thread_ref!(inputs, _mvn_L_entry(r.label, i, j))
     end
-    joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
-    push!(stmts, :(prior::Float64 = $joint))
+    cell = _mvn_row_cell(K, yvs, mvs, Ld)
+    append!(stmts, _plate_sum_stmts(pw, node, inputs, cell))
     return stmts
 end
 
-# Scalar prior log-density per family via distribution-kernel endpoints
-# (Distributions.jl semantics). Args are literals (inlined) or
-# parameter/assignment refs (body locals, fine in scalar position).
-# Half-Normal/half-Cauchy (the only overrides) renormalize by exactly
-# +log(2) (symmetry at 0). `gamma` takes rate, so the contract's scale
-# inverts.
-function _sampled_prior_expr(p::SampledParameter)
-    x = p.name
-    a = [v for v in values(p.args)]
-    base = if p.family === :normal
-        mu, s = a
-        :(normal($mu, $s).logpdf($x))
-    elseif p.family === :cauchy
-        mu, s = a
-        :(cauchy($mu, $s).logpdf($x))
-    elseif p.family === :exponential
-        (th,) = a
-        :(exponential($th).logpdf($x))
-    elseif p.family === :gamma
-        al, th = a
-        :(gamma($al, 1 / $th).logpdf($x))
-    elseif p.family === :lognormal
-        mu, s = a
-        :(lognormal($mu, $s).logpdf($x))
-    elseif p.family === :beta
-        al, be = a
-        :(beta($al, $be).logpdf($x))
-    elseif p.family === :inverse_gamma
-        al, th = a
-        :(inverse_gamma($al, $th).logpdf($x))
-    else # :flat
-        :(0.0)
+# In-graph L-entry name for a joint response (`_ppl_mvn_Le_<label>_<i>_<j>`,
+# j ≤ i). All `_ppl_`-hygienic.
+_mvn_L_entry(label::Symbol, i::Int, j::Int) =
+    Symbol(:_ppl_mvn_Le_, label, :_, i, :_, j)
+
+# One joint row's log-density as a single scalar expression: residuals,
+# forward substitution (`z[i] = (d[i] − Σ L[i,j]·z[j]) / L[i,i]`, inlined —
+# K is small), quadratic form, and the row constant. Pointwise-pure: each
+# lane evaluates its row's full `multi_normal_cholesky` log-density.
+function _mvn_row_cell(K::Int, yvs::Vector{Symbol}, mvs::Vector{Symbol},
+        Ld::Dict{Tuple{Int,Int},Symbol})
+    ds = [:( $(yvs[i]) - $(mvs[i]) ) for i in 1:K]
+    zs = Any[]
+    for i in 1:K
+        num = ds[i]
+        for j in 1:i-1
+            num = :( $num - $(Ld[(i, j)]) * $(zs[j]) )
+        end
+        push!(zs, :( ($num) / $(Ld[(i, i)]) ))
     end
-    p.support_override === nothing && return base
-    return :($base + log(2))
+    quad = _sum_terms([:($z * $z) for z in zs])
+    logdet = _sum_terms([:(log($(Ld[(i, i)]))) for i in 1:K])
+    row_const = -0.5 * K * log(2 * pi)
+    return :( $row_const - $logdet - 0.5 * $quad )
 end
 
-function _log_jacobian_statement(layout::LayoutTable)
+# One homogeneous coefficient plate over `coefaccess` (the block symbol or
+# a static-range slice) with per-lane (location, scale[, nu]) vectors.
+# A lane is a `Vector{Float64}` (literal lane, bound here) or a `Symbol`
+# (shared hyperparameter, aliased here and threaded as a plate scalar —
+# RK auto-threads an unthreaded signature scalar read by the cell — so
+# the centered shape keeps one plate, O(1) in levels).
+# The cell is the table-driven endpoint splice; only the 2-vs-3 arg
+# plate shape differs (StudentT threads a nu vector; nu is always a
+# literal — validation pins it).
+# Bind one plate-prior lane: a literal lane vector, or a shared-hyper
+# alias (the hyper name reads its constrained value — transforms and
+# assignments all precede the prior statements in the generated body).
+_bind_plate_prior_arg!(stmts::Vector{Expr}, name::Symbol,
+    v::Vector{Float64}) = push!(stmts, :($name = Float64[$(v...)]))
+_bind_plate_prior_arg!(stmts::Vector{Expr}, name::Symbol, v::Symbol) =
+    push!(stmts, :($name = $v))
+# A per-element lane mixing literals and names (`Normal.(0, [s1, 2.0])`):
+# one in-graph vector over the constrained names.
+_bind_plate_prior_arg!(stmts::Vector{Expr}, name::Symbol, v::Vector{Any}) =
+    push!(stmts, :($name = [$(v...)]))
+
+# Collapse one prior-arg position across a block's rows to its plate
+# lane: all-literal rows give the literal lane vector; rows sharing one
+# hyper name give the name; per-element names (or names mixed with
+# literals) give one element per row.
+function _plate_prior_lane(rows::Vector{PopulationPrior}, field::Symbol,
+        what::String)
+    vals = map(r -> getfield(r, field), rows)
+    all(v -> v isa Real, vals) &&
+        return Float64[v for v in vals]
+    all(v -> v isa Symbol, vals) && allequal(vals) &&
+        return vals[1]
+    return Any[v isa Symbol ? v : Float64(v) for v in vals]
+end
+
+function _append_coef_plate!(stmts::Vector{Expr}, coefaccess::Any,
+        node::Symbol, pw::Symbol, mut::Symbol, sdt::Symbol, nut::Symbol,
+        loc::Union{Vector{Float64},Symbol,Vector{Any}},
+        sca::Union{Vector{Float64},Symbol,Vector{Any}},
+        nus::Vector{Float64}, fam::Symbol)
+    fam === :flat && throw(ContractValidationError(
+        "[generator] internal: flat coefficients contribute no plate"))
+    _bind_plate_prior_arg!(stmts, mut, loc)
+    _bind_plate_prior_arg!(stmts, sdt, sca)
+    # The coefficients are sampled `Float64` coordinates, and a literal lane
+    # is a `Float64[...]` vector; a cell reads both by their roles.
+    float64_args = Set{Symbol}()
+    if fam === :student_t
+        push!(stmts, :($nut = Float64[$(nus...)]))
+        cv, nuv, mv, sv = _dovar(1), _dovar(2), _dovar(3), _dovar(4)
+        push!(float64_args, nuv)
+        inputs = Any[coefaccess, nut, mut, sdt]
+        args = Any[nuv, mv, sv]
+    else
+        cv, mv, sv = _dovar(1), _dovar(2), _dovar(3)
+        inputs = Any[coefaccess, mut, sdt]
+        args = Any[mv, sv]
+    end
+    loc isa Vector{Float64} && push!(float64_args, mv)
+    sca isa Vector{Float64} && push!(float64_args, sv)
+    cell = _family_logpdf_expr(fam, args, cv; float64_variate = true, float64_args)
+    names = Dict{Symbol,Symbol}(cv => :value, mv => :location, sv => :scale)
+    fam === :student_t && (names[nuv] = :nu)
+    append!(stmts, _plate_sum_stmts(pw, node, inputs, cell; names))
+    return nothing
+end
+
+# Endpoint args for one population row: a literal, or a parameter /
+# assignment name read as its constrained local (transforms and
+# assignments precede the prior statements). StudentT carries nu.
+_prior_endpoint(v::Symbol) = v
+_prior_endpoint(v::Real) = Float64(v)
+_population_endpoint_args(pr::PopulationPrior) = pr.family === :student_t ?
+    Any[Float64(pr.nu), _prior_endpoint(pr.location),
+        _prior_endpoint(pr.scale)] :
+    Any[_prior_endpoint(pr.location), _prior_endpoint(pr.scale)]
+
+# Per-addressee emission for a MIXED predictor (the homogeneous fast path
+# in `_prior_statements` keeps today's exact plate): width-1 blocks become
+# scalar density nodes over literal coefficient reads (the heterogeneous
+# sd-prior margins precedent); wide Factor/MatrixTerm blocks — one family
+# per block, validated — become one plate each over a static-range slice
+# (data-derived widths stay in loops); flat addressees contribute nothing.
+function _mixed_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
+        pred::PredictorSpec, shape::DesignShape,
+        priors::Vector{PopulationPrior})
+    by_addressee = Dict{Symbol,PopulationPrior}()
+    for pr in priors
+        pr.predictor === pred.name || continue
+        by_addressee[pr.addressee] = pr
+    end
+    coef = block_name(pred.name)
+    offset = 0
+    for b in shape.blocks
+        b.width == 0 && continue
+        if b.kind === FactorTerm || b.kind === MatrixTerm
+            elrows = b.kind === FactorTerm ?
+                fill(by_addressee[b.addressee], b.width) :
+                [by_addressee[e === nothing ? :Intercept : e]
+                    for e in b.elements]
+            fam = elrows[1].family
+            fam === :flat || _mixed_wide_block_stmts!(stmts, terms,
+                pred.name, b, coef, offset, elrows, fam)
+        else
+            b.width == 1 || throw(ContractValidationError(
+                "[generator] internal: mixed-prior scalar block " *
+                "$(b.addressee) of $(pred.name) has width $(b.width)"))
+            pr = by_addressee[b.addressee]
+            # Flat scalars contribute no node but still occupy their
+            # design position — the offset accumulates below for every
+            # block (a `continue` here would misalign every later
+            # read).
+            if pr.family !== :flat
+                node = Symbol(:_ppl_prior_, pred.name, :_, b.addressee)
+                expr = _family_logpdf_expr(pr.family,
+                    _population_endpoint_args(pr),
+                    Expr(:ref, coef, offset + 1))
+                push!(stmts, :($node::Float64 = $expr))
+                push!(terms, node)
+            end
+        end
+        offset += b.width
+    end
+    return nothing
+end
+
+# One wide homogeneous block of a mixed predictor: a plate over the
+# block's static-range slice with the block family's cell.
+function _mixed_wide_block_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
+        pname::Symbol, b::DesignBlock, coef::Symbol, offset::Int,
+        elrows::Vector{PopulationPrior}, fam::Symbol)
+    tag = b.kind === FactorTerm ? b.addressee : b.column
+    node = Symbol(:_ppl_prior_, pname, :_, tag)
+    pw = Symbol(:_ppl_pw_prior_, pname, :_, tag)
+    mut = Symbol(:_ppl_prmu_, pname, :_, tag)
+    sdt = Symbol(:_ppl_prsd_, pname, :_, tag)
+    nut = Symbol(:_ppl_prnu_, pname, :_, tag)
+    slice = Expr(:ref, coef,
+        Expr(:call, :(:), offset + 1, offset + b.width))
+    what = "$(b.kind) block $tag of $pname"
+    loc = _plate_prior_lane(elrows, :location, what)
+    sca = _plate_prior_lane(elrows, :scale, what)
+    nus = [Float64(r.nu) for r in elrows]
+    _append_coef_plate!(stmts, slice, node, pw, mut, sdt, nut, loc, sca,
+        nus, fam)
+    push!(terms, node)
+    return nothing
+end
+
+# Group compatible literal scalar priors as an evaluation optimization.
+# Declarations remain the owners of names, transforms and prior arguments.
+function _parameter_prior_groups(plan)
+    groups = Vector{SampledParameter}[]
+    for family in (:normal, :cauchy, :laplace, :logistic, :student_t)
+        ps = SampledParameter[p for p in plan.parameters
+            if p.family === family && p.support_override === nothing &&
+                all(v -> v isa Real, values(p.args))]
+        length(ps) > 1 && push!(groups, ps)
+    end
+    return groups
+end
+
+function _parameter_prior_input(ps, plan, layout)
+    names = [p.name for p in ps]
+    for pred in plan.predictors
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
+            matrices = plan.matrices)
+        terms = [t for (t, b) in zip(pred.terms, shape.blocks) if b.width > 0]
+        all(t -> _parameter_term(t) && t.options.sign == 1, terms) || continue
+        [t.options.parameter for t in terms] == names || continue
+        all(b -> b.width <= 1, shape.blocks) || continue
+        return _affine_block_name(pred)
+    end
+    view = _parameter_coordinate_view([(n, 1) for n in names], layout)
+    # A prior only reads these scalar values. An immutable pack keeps that
+    # fact visible to ordinary Reverse; a temporary vector can obscure
+    # invariance and induce native tapes in downstream observation loops.
+    return view === nothing ? :(($(names...),)) : view
+end
+
+function _parameter_prior_statements!(stmts, terms, plan, layout;
+        prefix = :_ppl_prior_, group_scalars = true)
+    grouped = Set{Symbol}()
+    for ps in (group_scalars ? _parameter_prior_groups(plan) : Vector{SampledParameter}[])
+        family = first(ps).family
+        _, li, si, ni = _COEF_SHAPES[family]
+        args = [collect(values(p.args)) for p in ps]
+        loc = Float64[a[li] for a in args]
+        sca = Float64[a[si] for a in args]
+        nus = ni == 0 ? fill(NaN, length(ps)) : Float64[a[ni] for a in args]
+        node = Symbol(prefix, :parameters_, family)
+        _append_coef_plate!(stmts, _parameter_prior_input(ps, plan, layout),
+            node, Symbol(node, :_pw), Symbol(node, :_mu), Symbol(node, :_sd),
+            Symbol(node, :_nu), loc, sca, nus, family)
+        push!(terms, node)
+        union!(grouped, (p.name for p in ps))
+    end
+    for p in plan.parameters
+        p.name in grouped && continue
+        node = Symbol(:_ppl_prior_, p.name)
+        if p.family === :external
+            append!(stmts, _external_density_statements(p))
+            push!(terms, node)
+            continue
+        end
+        prior = _sampled_prior_expr(p; pre = stmts, conditioned = p.name in plan.conditioned,
+            float64_args = _float64_inputs(plan, values(p.args)))
+        push!(stmts, :($node::Float64 = $prior))
+        push!(terms, node)
+    end
+    return nothing
+end
+
+function _factor_density_statements!(stmts, terms, plan; context = plan, pointwise = nothing)
+    for factor in plan.factors
+        node = Symbol(:_ppl_factor_, factor.name)
+        density = _sampled_prior_expr(factor; conditioned = true,
+            float64_args = _float64_inputs(context, values(factor.args)))
+        push!(stmts, :($node::Float64 = $density))
+        push!(terms, node)
+        pointwise === nothing || push!(pointwise, factor.name => node)
+    end
+    return nothing
+end
+
+function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
+        gathers::Set{Tuple{Symbol,Symbol,Int}} = Set{Tuple{Symbol,Symbol,Int}}(), context = plan)
+    stmts = Expr[]
+    terms = Any[]
+    for pred in plan.predictors
+        pred = _legacy_predictor(pred)
+        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
+            matrices = plan.matrices)
+        shape.width == 0 && continue
+        node = Symbol(:_ppl_prior_, pred.name)
+        pw = Symbol(:_ppl_pw_prior_, pred.name)
+        mut = Symbol(:_ppl_prmu_, pred.name)
+        sdt = Symbol(:_ppl_prsd_, pred.name)
+        specs = coefficient_prior_specs(shape, plan.population_priors)
+        fams = map(s -> s.family, specs)
+        alllit = all(s -> s.location isa Real && s.scale isa Real, specs)
+        if all(==(fams[1]), fams) && fams[1] !== :flat && alllit
+            # Homogeneous fast path: today's exact plate, family cell.
+            nut = Symbol(:_ppl_prnu_, pred.name)
+            loc = [Float64(s.location) for s in specs]
+            sca = [Float64(s.scale) for s in specs]
+            nus = [Float64(s.nu) for s in specs]
+            _append_coef_plate!(stmts, block_name(pred.name), node, pw,
+                mut, sdt, nut, loc, sca, nus, fams[1])
+            push!(terms, node)
+        elseif all(==(:flat), fams)
+            push!(stmts, :($node::Float64 = 0.0))
+            push!(terms, node)
+        else
+            _mixed_prior_stmts!(stmts, terms, pred, shape,
+                plan.population_priors)
+        end
+    end
+    _parameter_prior_statements!(stmts, terms, plan, layout)
+    append!(terms, plan.cell_priors)
+    _factor_density_statements!(stmts, terms, plan; context)
+    # GLM-object coefficient vectors: the same plate-prior shape as a
+    # population-prior coefficient block, driven by the response matrix
+    # columns (priors addressed by response label — validation pins
+    # full coverage).
+    for r in plan.responses
+        _is_glm_family(r.family) && _glm_coefficient_block(plan, r) || continue
+        m = _find_matrix(plan, r.predictor)
+        cols = Symbol[c for c in m.columns if c !== nothing]
+        loc = Float64[]
+        sca = Float64[]
+        for c in cols
+            i = findfirst(p -> p.predictor === r.label && p.addressee === c,
+                plan.population_priors)
+            pr = plan.population_priors[i]
+            (pr.location isa Real && pr.scale isa Real) ||
+                throw(ContractValidationError(
+                    "[generator] internal: GLM beta prior for " *
+                    "$(r.label).$c carries a hyperparameter " *
+                    "(hierarchical GLM priors are not in slice 1)"))
+            push!(loc, Float64(pr.location))
+            push!(sca, Float64(pr.scale))
+        end
+        node = Symbol(:_ppl_prior_, r.label)
+        pw = Symbol(:_ppl_pw_prior_, r.label)
+        mut = Symbol(:_ppl_prmu_, r.label)
+        sdt = Symbol(:_ppl_prsd_, r.label)
+        push!(stmts, :($mut = Float64[$(loc...)]))
+        push!(stmts, :($sdt = Float64[$(sca...)]))
+        cv, mv, sv = _dovar(1), _dovar(2), _dovar(3)
+        cell = :(normal($mv, $sv).logpdf($cv))
+        append!(stmts, _plate_sum_stmts(pw, node,
+            Any[r.glm_beta, mut, sdt], cell))
+        push!(terms, node)
+    end
+    # Vector latents (cutpoints/thresholds/simplexes/coefficient packs,
+    # joint-factor scales/Cholesky): one plate-sum or broadcast per vector
+    # (bound plans carry concrete sizes). Empty packs contribute 0.0.
+    for p in plan.vector_parameters
+        _vector_parameter_prior_stmts!(stmts, terms, p)
+    end
+    # Per-cell latent (plate) parameters: one plate over the block, summing the
+    # shared-prior log-density across cells (the same plate-sum shape as a
+    # population-prior coefficient block, generalized to any standard family).
+    # Every value the cell reads is threaded as a plate PORT (the latent vector
+    # plus each scalar prior arg) — captured free names are rejected by the
+    # `@kernel` plate expander, exactly as the Gaussian-likelihood scale is
+    # threaded.
+    for p in plan.plate_parameters
+        if p.family === :external
+            append!(stmts, _external_density_statements(p))
+            push!(terms, Symbol(:_ppl_prior_, p.name))
+        else
+            _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
+                p.support_override; rows = _plate_rows(plan, p),
+                float64_variate = p.name ∉ plan.conditioned,
+                float64_inputs = _float64_inputs(plan, values(p.args)))
+        end
+    end
+    # Sequential-recurrence (scan) latents: setup + recurrence density.
+    scanstmts, scannodes = _scan_prior_statements(plan, layout)
+    append!(stmts, scanstmts)
+    append!(terms, scannodes)
+    # Declared array parameters (`arrays.jl`).
+    _array_prior_stmts!(stmts, terms, plan, gathers; context)
+    push!(stmts, :(prior::Float64 = $(_sum_terms(terms))))
+    return stmts
+end
+
+# Shared LKJ-prior node body (Stan `lkj_corr_cholesky_lpdf` op order,
+# preserved verbatim from the host `lkj_corr_cholesky_logpdf`: constant
+# literal first, then per-diagonal terms in row order — `(K-i)*log(L[i,i])`
+# at `eta == 1.0`, else `a*log + b*log` with emission-time coefficients).
+# Reads the named `_ppl_rl_` diagonal scalars — no matrix materializes, and
+# the scalar-only form keeps the native Enzyme reverse pass on the same
+# straight-line shape as every other prior. K=1 is the `0.0` literal
+# (Stan's K=1 LKJ term is ±0.0 — no diagonal, zero constant).
+# `nstack = S` is the stratified form: the diagonal edges are S-vectors
+# (one entry per stratum), so the constant counts S times and each `log`
+# term sums its vector.
+function _lkj_prior_terms(L::Symbol, K::Int, eta::Float64;
+        nstack::Union{Nothing,Int} = nothing, pointwise = false)
+    K == 1 && return pointwise ? :(zeros($nstack)) : :(0.0)
+    c = lkj_logconst(K, eta)
+    terms = Any[pointwise ? :(fill($c, $nstack)) : nstack === nothing ? c : nstack * c]
+    lg(i) = nstack === nothing ? :(log($(_rl_name(L, i, i)))) :
+        pointwise ? :(log.($(_rl_name(L, i, i)))) : :(sum(log.($(_rl_name(L, i, i)))))
+    for i in 2:K
+        push!(terms, _lkj_prior_diagonal(lg(i), K, i, eta))
+    end
+    return foldl((a, c) -> pointwise ? :($a .+ $c) : :($a + $c), terms)
+end
+
+# Live eta uses the differentiable normalizer, including at eta == 1.
+# Only the intrinsic factor width expands; stack/observation lengths are
+# reductions over arrays. loggamma's adapters come from its owned math graph.
+function _lkj_prior_terms(L::Symbol, K::Int, eta::Symbol;
+        nstack::Union{Nothing,Int} = nothing)
+    lgamma = GlobalRef(DistributionKernelSources, :loggamma)
+    constant = :($(K - 1) * $lgamma($eta + $(0.5 * (K - 1))))
+    for k in 1:(K - 1)
+        constant = :($constant - $(0.5 * k * log(pi)) -
+            $lgamma($eta + $(0.5 * (K - 1 - k))))
+    end
+    rhs = nstack === nothing ? constant : :($nstack * $constant)
+    for i in 2:K
+        diagonal = _rl_name(L, i, i)
+        term = nstack === nothing ? :(log($diagonal)) : :(sum(log.($diagonal)))
+        rhs = :($rhs + ($(K - i) + 2 * $eta - 2) * $term)
+    end
+    return :(if isfinite($eta) && $eta > 0
+        $rhs
+    else
+        -Inf
+    end)
+end
+
+function _lkj_prior_diagonal(ld, K, i, eta)
+    coefficient = i isa Int ? K - i : :($K - $i)
+    return eta == 1.0 ? :($coefficient * $ld) :
+        :($coefficient * $ld + $(2 * eta - 2) * $ld)
+end
+
+# One plate over a latent vector parameter,
+# summing the shared-prior log-density across cells. The vector and each
+# named scalar prior arg are plate arguments (a scalar repeats across
+# cells), exactly as the Gaussian-likelihood scale is threaded.
+function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
+        name::Symbol, family::Symbol, args::NamedTuple,
+        support::SupportOverride; conditioned = false, rows = nothing,
+        float64_variate::Bool = false, label::Symbol = name,
+        float64_inputs = (), cell_names = Dict{Symbol,Symbol}())
+    node = Symbol(:_ppl_prior_, label)
+    pw = Symbol(:_ppl_pw_prior_, label)
+    if family === :flat
+        # An improper density contributes zero; evaluating a posterior does
+        # not request a draw from the unnormalizable prior.
+        push!(stmts, :($pw = zero.($name)), :($node::Float64 = 0.0))
+        push!(terms, node)
+        return nothing
+    end
+    if rows === 0
+        # An empty authored loop evaluates no prior arguments or cell body.
+        # Keep its pointwise identity so conditioned declarations retain shape.
+        push!(stmts, :($pw = zeros(0)), :($node::Float64 = 0.0))
+        push!(terms, node)
+        return nothing
+    end
+    inputs = Any[name]
+    tv = _dovar(1)
+    argvals = Any[_thread_ref!(inputs, v) for v in values(args)]
+    float64_args = Set{Symbol}(t for (v, t) in zip(values(args), argvals)
+        if v isa Symbol && v in float64_inputs)
+    cell = _family_logpdf_expr(family, argvals, tv; float64_variate, float64_args)
+    thread(x) = x isa Expr ? Expr(x.head,
+        (i == 1 && x.head === :call ? a : thread(a) for (i, a) in enumerate(x.args))...) :
+        _thread_ref!(inputs, x)
+    threaded_support = support isa Tuple ?
+        (support[1], map(thread, support[2:end])...) : support
+    pre = Expr[]
+    corr = _support_correction(family, threaded_support, argvals; pre, stem = name)
+    corr === nothing || (cell = :($cell + $corr))
+    if conditioned
+        cell = _conditioned_support_guard(tv, threaded_support,
+            isempty(pre) ? cell : Expr(:block, pre..., cell))
+        empty!(pre)
+    end
+    names = Dict{Symbol,Symbol}(t => cell_names[v] for (v, t) in zip(values(args), argvals)
+        if v isa Symbol && haskey(cell_names, v))
+    plate = _plate_sum_stmts(pw, node, inputs, Expr[pre..., cell]; names)
+    # Keep the ordinary scalar plate for the sum as well as pointwise values.
+    # A standardized temporary followed by dot(z,z) makes ordinary reverse AD
+    # allocate that temporary and call BLAS twice for the same self-product.
+    append!(stmts, plate)
+    push!(terms, node)
+    return nothing
+end
+
+# Sampled/prior family → distribution-kernel endpoint object. One row per
+# family — a future family adds a row, never a branch.
+const _PRIOR_ENDPOINTS = Dict{Symbol,Symbol}(
+    :normal => :normal, :cauchy => :cauchy,
+    :exponential => :exponential, :gamma => :gamma,
+    :lognormal => :lognormal, :beta => :beta,
+    :inverse_gamma => :inverse_gamma, :student_t => :student_t,
+    :laplace => :laplace, :logistic => :logistic, :uniform => :uniform,
+    :weibull => :weibull,
+)
+
+# Shared `<endpoint>(remapped args…).logpdf(x)` splice for a variate
+# expression `x` (a scalar parameter name, a plate do-var, a scan
+# setup/recurrence read, or a coefficient element read). Args are literals
+# (inlined) or parameter/assignment/threaded refs (Distributions.jl
+# semantics). Shared by scalar priors, per-cell plate priors, population
+# priors, and the scan density. Gamma takes rate, so the contract's scale
+# inverts; Flat() contributes zero. Explicit support is normalized below.
+# Distribution kernels use Float64 ports. Promote at that boundary rather
+# than redeclaring the source name: bound data and ordinary Julia helpers
+# must retain their original numeric types. The same boundary applies to
+# density and truncation endpoints, including threaded plate arguments.
+# Multiplication by a floating unit preserves the value (and signed zero)
+# through ordinary Julia numeric promotion and backend arithmetic. A numeric
+# literal takes the same promotion (and Gamma's reciprocal) at emission. A
+# variate the caller knows is a Float64 parameter (`float64_variate`), and an
+# argument it knows is `Float64` (`float64_args`: a literal `Float64[...]`
+# prior argument, `Float64` data, a sampled scalar), are read as they are.
+_float64_port(v) = :(1.0 * $v)
+_float64_port(v::Union{Bool,Base.BitInteger,Base.IEEEFloat}) = 1.0 * v
+
+# The names among `values` the kernel reads as `Float64`: a sampled scalar
+# with a built-in transform (its constrained value) or bound `Float64` data.
+# A caller-owned geometry (`:external`) constrains through caller code.
+_float64_inputs(plan::StructuralPlan, values) = Set{Symbol}(v for v in values
+    if v isa Symbol && _reads_float64(plan, v))
+_reads_float64(plan::StructuralPlan, x::Symbol) =
+    (x ∉ plan.conditioned &&
+        any(p -> p.name === x && p.family !== :external, plan.parameters)) ||
+    _value_type(get(plan.columns, x, nothing)) <: Union{Float64,AbstractArray{Float64}}
+_gamma_rate(v) = :(1 / $v)
+_gamma_rate(v::Union{Bool,Base.BitInteger,Base.IEEEFloat}) = 1 / v
+
+function _prior_endpoint_expr(family::Symbol, a, method::Symbol, x;
+        float64_variate::Bool = false, float64_args = ())
+    ep = get(_PRIOR_ENDPOINTS, family, nothing)
+    ep === nothing && throw(ContractValidationError(
+        "[generator] prior family $family has no endpoint object"))
+    args = family === :gamma ? (a[1], _gamma_rate(a[2])) : Tuple(a)
+    known = map(v -> v in float64_args, Tuple(a))
+    args = map((v, k) -> k ? v : _float64_port(v), args, known)
+    # These endpoints also enter authored cell expressions before module
+    # resolution. Keep their library binding explicit there, independently
+    # of similarly named functions in the model's module.
+    endpoint = GlobalRef(PPLGeneratedModels, ep)
+    return Expr(:call, Expr(:., Expr(:call, endpoint, args...), QuoteNode(method)),
+        float64_variate ? x : _float64_port(x))
+end
+
+function _family_logpdf_expr(family::Symbol, a, x; float64_variate::Bool = false,
+        float64_args = ())
+    family === :flat && return :(0.0)
+    family === :binomial && return :((isfinite($x) && floor($x) == $x &&
+        isfinite($(a[2])) && 0 <= $(a[2]) && $(a[2]) <= 1) ?
+        binomial(Int($(a[1])), $(a[2] in float64_args ? a[2] : _float64_port(a[2]))).logpdf(Int($x)) : -Inf)
+    return _prior_endpoint_expr(family, a, :logpdf, x; float64_variate, float64_args)
+end
+
+# Normalize the base density over the declared support. Symmetric halves
+# at literal zero add log(2); general bounds use the owned CDF endpoints.
+function _support_correction(family::Symbol, ov::SupportOverride, argvals;
+        pre::Vector{Expr} = Expr[], stem::Symbol = :prior)
+    ov === nothing && return nothing
+    ov isa Tuple && ov[1] === :restricted && return nothing
+    ov isa Tuple && ov[1] === :restricted_half && return :(log(2))
+    if ov isa Tuple && ov[1] === :truncated
+        lo, hi = ov[2], ov[3]
+        cdf(x) = _prior_endpoint_expr(family, argvals, :cdf, x)
+        ccdf(x) = _prior_endpoint_expr(family, argvals, :ccdf, x)
+        lo == -Inf && hi == Inf && return nothing
+        lo == -Inf && return :(-log($(cdf(hi))))
+        hi == Inf && return :(-log($(ccdf(lo))))
+        # Use the upper tails when both endpoints are in that tail. The
+        # branch is lazy, so an unused difference is never differentiated.
+        fl, fh, sl, sh = (Symbol(:_ppl_tail_, stem, suffix)
+            for suffix in (:_fl, :_fh, :_sl, :_sh))
+        append!(pre, Expr[:($fl::Float64 = $(cdf(lo))),
+            :($fh::Float64 = $(cdf(hi))), :($sl::Float64 = $(ccdf(lo))),
+            :($sh::Float64 = $(ccdf(hi)))])
+        # The CDF values are defined on both sides. Keep log itself lazy:
+        # a rounded-to-zero inactive difference must never be logged or AD'd.
+        return :($fl > 0.5 ? -log($sl - $sh) : -log($fh - $fl))
+    end
+    if ov isa Tuple
+        if ov[1] === :lower
+            # `truncated(LogNormal(m, s), lo, Inf)`: `-log P(X > lo)` =
+            # `-log Φ((m - log(lo)) / s)`; nothing at `lo == 0`. A data
+            # name `lo` is a bound kernel argument.
+            lo = ov[2]
+            lo isa Real && lo == 0 && return nothing
+            m, s = argvals[1], argvals[2]
+            tail = _prior_endpoint_expr(:normal, Any[:(-$m), s], :cdf, :(-log($lo)))
+            return :(-log($tail))
+        end
+        if ov[1] === :upper
+            family === :flat && return nothing
+            return :(-log($(_prior_endpoint_expr(family, argvals, :cdf, ov[2]))))
+        end
+        ov[1] === :interval || throw(ContractValidationError(
+            "[generator] tuple support override must be (:interval, lo, hi), " *
+            "or (:upper, hi), got $ov"))
+        family === :flat && return nothing  # improper: Jacobian only
+        lo, hi = ov[2], ov[3]
+        mu, s = argvals[1], argvals[2]
+        upper = _prior_endpoint_expr(:normal, Any[mu, s], :cdf, hi)
+        lower = _prior_endpoint_expr(:normal, Any[mu, s], :cdf, lo)
+        return :(-log($upper - $lower))
+    end
+    ov === :positive || throw(ContractValidationError(
+        "[generator] support override must be :positive, got $ov"))
+    return :(log(2))  # :positive half
+end
+
+# One normalized scalar prior body, shared by parameter and hyper-prior slots.
+function _sampled_prior_expr(p::SampledParameter; pre::Vector{Expr} = Expr[], conditioned = false,
+        float64_args = ())
+    argvals = Any[v for v in values(p.args)]
+    if p.support_override === :positive && p.family in (:normal, :cauchy) &&
+            argvals[1] isa Real && iszero(argvals[1])
+        # HalfNormal/HalfCauchy are scalar priors. Preserve the existing
+        # support guard and evaluate the same distribution graph behind one
+        # named operation instead of splicing its internals into this model.
+        call = p.family === :normal ? :_half_normal_logpdf_on_support :
+            :_half_cauchy_logpdf_on_support
+        x = conditioned ? _float64_port(p.name) : p.name
+        scale = argvals[2] in float64_args ? argvals[2] : _float64_port(argvals[2])
+        density = Expr(:call, call, x, scale)
+        return conditioned ? _conditioned_support_guard(p.name, p.support_override,
+            density) : density
+    end
+    base = _family_logpdf_expr(p.family, argvals, p.name; float64_variate = !conditioned,
+        float64_args)
+    local_pre = conditioned ? Expr[] : pre
+    corr = _support_correction(p.family, p.support_override, argvals; pre = local_pre, stem = p.name)
+    rhs = corr === nothing ? base : :($base + $corr)
+    return conditioned ? _conditioned_support_guard(p.name, p.support_override,
+        isempty(local_pre) ? rhs : Expr(:block, local_pre..., rhs)) : rhs
+end
+
+# Sampling transforms enforce support; observations use a lazy density guard.
+function _untyped_branch_locals(ex::Expr)
+    # Branch locals are ordinary Julia assignments. Their annotations would
+    # convert traced numbers to Float64 during compiled execution; the enclosing
+    # kernel node already supplies the result type. Endpoint calls such as
+    # `normal(m, s).cdf(x)` stay source: ReactiveKernels lowers an object
+    # endpoint under a branch arm inside that arm.
+    if ex.head === :(=) && first(ex.args) isa Expr && first(ex.args).head === :(::)
+        return Expr(:(=), first(first(ex.args).args),
+            _untyped_branch_locals(ex.args[2]))
+    end
+    return Expr(ex.head, map(_untyped_branch_locals, ex.args)...)
+end
+_untyped_branch_locals(ex) = ex
+
+function _conditioned_support_guard(value, support, density)
+    support === nothing && return density
+    valid = if support === :positive
+        :($value >= 0)
+    elseif support[1] === :lower
+        :($value >= $(support[2]))
+    elseif support[1] === :upper
+        :($value <= $(support[2]))
+    else
+        :($(support[2]) <= $value && $value <= $(support[3]))
+    end
+    density = _untyped_branch_locals(density)
+    return :(if $valid
+        $density
+    else
+        -Inf
+    end)
+end
+
+# Vector-latent prior node `_ppl_prior_<name>`: elementwise Normal for
+# threshold/coefficient packs as one plate-sum over the vector (Stan
+# `ordered`/`vector` semantics — no factorial normalizer, matching
+# `_BRMThresholdPrior`), Dirichlet for simplexes as vector reductions (Stan
+# `dirichlet_lpdf`: the log-multivariate-Beta normalizer and α−1 are
+# separate graph values, so bound concentrations fold during preparation),
+# and — for the
+# structural joint factor, whose size is the joint outcome count —
+# elementwise Exponential over the scale scalars (a literal scale inlines;
+# a sampled hyperparameter resolves as a body local) and the shared LKJ
+# node over the Cholesky scalars. None of the leveled (data-sized) forms
+# grows with the vector length.
+function _vector_parameter_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
+        p::VectorParameter)
+    m = p.size
+    m === nothing && throw(ContractValidationError(
+        "[generator] vector parameter $(p.name) has unresolved size " *
+        "(bind_data infers it)"))
+    node = Symbol(:_ppl_prior_, p.name)
+    if haskey(_VECTOR_ELEMENT_FAMILIES, p.family)
+        if m == 0
+            push!(stmts, :($node::Float64 = 0.0))
+            push!(terms, node)
+            return nothing
+        end
+        _vector_prior_stmts!(stmts, terms, p.name,
+            _VECTOR_ELEMENT_FAMILIES[p.family], p.args, nothing)
+        return nothing
+    end
+    rhs = if p.family === :simplex_dirichlet
+        alpha = p.args.arg1
+        arg = alpha isa AbstractVector ? :(Float64[$(alpha...)]) : alpha
+        concentration = Symbol(:_ppl_dirichlet_alpha_, p.name)
+        valid = Symbol(:_ppl_dirichlet_valid_, p.name)
+        normalizer = Symbol(:_ppl_dirichlet_normalizer_, p.name)
+        powers = Symbol(:_ppl_dirichlet_powers_, p.name)
+        lgamma = GlobalRef(DistributionKernelSources, :loggamma)
+        push!(stmts, :($concentration = $arg))
+        push!(stmts, :($valid = begin
+            _check_slice_vector_arg("the Dirichlet concentration", $concentration, 1, $m)
+            all(isfinite.($concentration) .& ($concentration .> 0))
+        end))
+        push!(stmts, :($normalizer = if $valid
+            $lgamma(sum($concentration)) - sum($lgamma.($concentration))
+        else
+            -Inf
+        end))
+        push!(stmts, :($powers = $concentration .- 1.0))
+        :(if $valid
+            $normalizer + sum($powers .* log.($(p.name)))
+        else
+            -Inf
+        end)
+    elseif p.family === :cholesky_corr_lkj
+        _lkj_prior_terms(p.name, m, Float64(p.args.arg1))
+    elseif p.family === :positive_exponential
+        th = p.args.arg1
+        theta = th isa Symbol ? th : Float64(th)
+        _sum_terms(Any[:(exponential($theta).logpdf($(_vector_elt_name(p.name, i))))
+            for i in 1:m])
+    else
+        throw(ContractValidationError(
+            "[generator] vector parameter $(p.name) family $(p.family) " *
+            "has no prior form"))
+    end
+    push!(stmts, :($node::Float64 = $rhs))
+    push!(terms, node)
+    return nothing
+end
+
+# --- Sequential-recurrence (scan) density (slice 1: CENTERED) ---
+
+# Replace each `state[loopvar-j]` lag read with its aligned-slice do-var.
+function _subst_scan_lags(ex, state::Symbol, loopvar::Symbol, dovar::Dict{Int,Symbol})
+    ex isa Expr || return ex
+    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] === state
+        idx = ex.args[2]
+        if idx isa Expr && idx.head === :call && length(idx.args) == 3 &&
+           idx.args[1] === :- && idx.args[2] === loopvar && idx.args[3] isa Int
+            return dovar[idx.args[3]]
+        end
+    end
+    return Expr(ex.head,
+        (_subst_scan_lags(a, state, loopvar, dovar) for a in ex.args)...)
+end
+
+# Value symbols in a (lag-substituted) recurrence arg that must be threaded as
+# plate inputs: captured scalars (params/assignments). Excludes call heads,
+# generator variables and the already-substituted lag do-vars (`_ppl_c…`).
+function _scan_cell_caps!(caps::Vector{Symbol}, ex, bound = Set{Symbol}())
+    if ex isa Symbol
+        (startswith(string(ex), "_ppl_c") || ex in caps || ex in bound) ||
+            push!(caps, ex)
+        return nothing
+    end
+    ex isa Expr || return nothing
+    if ex.head === :generator
+        clauses, conds = _scan_generator_clauses(ex)
+        inner = copy(bound)
+        for (v, rng) in clauses
+            _scan_cell_caps!(caps, rng, inner)
+            v isa Symbol && push!(inner, v)
+        end
+        for c in (ex.args[1], conds...)
+            _scan_cell_caps!(caps, c, inner)
+        end
+        return nothing
+    end
+    args = ex.head === :call ? ex.args[2:end] : ex.args
+    for a in args
+        _scan_cell_caps!(caps, a, bound)
+    end
+    return nothing
+end
+
+# Replace symbols per `map` (leaves call heads alone — they never appear in the
+# capture map).
+function _subst_syms(ex, map::Dict{Symbol,Symbol})
+    ex isa Symbol && return get(map, ex, ex)
+    ex isa Expr || return ex
+    return Expr(ex.head, (_subst_syms(a, map) for a in ex.args)...)
+end
+
+# --- Non-centered scan reconstruction (tuple carry) ---
+
+_scan_where(s::ScanSpec) = "[generator] scan $(join(s.states, ", "))"
+
+# A sampled seed's or step's stated density at `x`: the family density plus
+# its support normalizer (`truncated` subtracts the interval mass, a half
+# prior adds log(2); `restricted` and `Flat` keep the family density).
+# `translate` maps the statement's argument and bound expressions into the
+# enclosing block; the normalizer's intermediates go to `pre`.
+function _scan_density!(pre::Vector{Expr}, st, translate, x, stem::Symbol)
+    args = Any[translate(a) for a in st.args]
+    support = st.support isa Tuple ?
+        (st.support[1], map(translate, st.support[2:end])...) : st.support
+    base = _family_logpdf_expr(st.family, args, x)
+    corr = _support_correction(st.family, support, args; pre, stem)
+    return corr === nothing ? base : :($base + $corr)
+end
+
+# The model values a scan's seeds and steps may read by name: parameters,
+# definitions, supplied data, and whole values such as declared arrays and
+# other scans' trajectories, indexed by the body as in a Julia loop. The
+# scan's own carried arrays are read through their seeds, lags and history.
+_scan_readable_names(plan::StructuralPlan, s::ScanSpec) = setdiff(
+    union(_all_name_set(plan), Set{Symbol}(keys(plan.columns))),
+    Set{Symbol}(s.states))
+
+# The innovation steps of an emittable non-centered scan, in body order; a
+# shape the emitter does not build (`_scan_shape_gap`) throws
+# `ContractValidationError` naming the gap.
+function _scan_innovations(s::ScanSpec)
+    gap = _scan_shape_gap(s)
+    gap === nothing || throw(ContractValidationError("[generator] " * gap))
+    return ScanStep[st for st in s.step if st.kind === :sample]
+end
+
+# Positions in the latent slice: sampled seeds first (setup order), then each
+# innovation's `n = T - m` per-step block (body order). Returns
+# (seedpos::Dict{(state, index) => position}, innovation ranges).
+function _scan_latent_positions(s::ScanSpec, innov, T::Int)
+    seedpos = Dict{Tuple{Symbol,Int},Int}()
+    pos = 0
+    for f in s.setup
+        f.kind === :sample || continue
+        pos += 1
+        seedpos[(f.target, f.index)] = pos
+    end
+    n = T - (s.lo - 1)
+    ranges = UnitRange{Int}[(pos + (j - 1) * n + 1):(pos + j * n)
+        for j in eachindex(innov)]
+    return seedpos, ranges
+end
+
+# In-graph name of a seed's value (`_ppl_scan_init_<state>_<k>`).
+_scan_init_name(a::Symbol, k::Int) = Symbol(:_ppl_scan_init_, a, :_, k)
+
+# Translate a seed expression: an earlier seed `a[j]` becomes its value name;
+# every other leaf must be a scalar parameter or definition.
+function _scan_translate_seed(ex, s::ScanSpec, scalars)
+    if ex isa Symbol
+        ex in scalars || throw(ContractValidationError(
+            "$(_scan_where(s)): seed leaf `$(ex)` is not a scalar parameter " *
+            "or definition"))
+        return ex
+    end
+    ex isa Expr || return ex
+    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] in s.states &&
+            ex.args[2] isa Int
+        return _scan_init_name(ex.args[1], ex.args[2])
+    end
+    args = ex.head === :call ? ex.args[2:end] : ex.args
+    newargs = Any[_scan_translate_seed(a, s, scalars) for a in args]
+    return ex.head === :call ?
+        Expr(:call, _scan_translate_head(ex.args[1],
+            h -> _scan_translate_seed(h, s, scalars)), newargs...) :
+        Expr(ex.head, newargs...)
+end
+
+# A call head computed from values (`normal(m, s).logpdf(x)`, `f(a)(x)`)
+# reads the same scope as the arguments, as in Julia. A function name or a
+# module path (`Base.sqrt`) stays as written.
+_scan_computed_head(h) = h isa Expr &&
+    (h.head === :call || (h.head === :. && _scan_computed_head(h.args[1])))
+_scan_translate_head(h, translate) = _scan_computed_head(h) ? translate(h) : h
+
+# The carry window: each carried array read at backward lags keeps its last
+# `L` values as `<state>_lag1 … <state>_lagL` fields of a NamedTuple carry.
+_scan_lag_field(a::Symbol, k::Int) = Symbol(a, :_lag, k)
+
+function _scan_windows(s::ScanSpec; active = s.states)
+    lags = _scan_lags(s.step, s.states, s.loopvar)
+    return [(a, isempty(lags[a]) ? 0 : max(s.maxlag, maximum(lags[a])))
+        for a in s.states if a in active]
+end
+
+# Translate a step expression into the reconstruction's do-block: a lag read
+# `a[t - k]` becomes its carry field, a current read `a[t]` the value written
+# earlier this step, a history read an index into the fold's `history` (the
+# trajectory so far), a read of a `completed` array an index into its finished
+# trajectory, a local its in-step
+# binding, and every other leaf must be a scalar parameter or definition,
+# which the step reads by closing over it. Generator variables are local to
+# their generator. The contract never inspects step expressions, so these
+# leaves are the only screen for hand-built plans — everything else fails
+# closed.
+function _scan_translate_step(ex, s::ScanSpec, env, scalars)
+    where = _scan_where(s)
+    if ex isa Symbol
+        haskey(env.binders, ex) && return ex
+        haskey(env.locals, ex) && return env.locals[ex]
+        ex in s.states && throw(ContractValidationError(
+            "$where: bare read of the carried array `$(ex)` — read the " *
+            "backward lag `$(ex)[$(s.loopvar) - 1]`"))
+        ex in scalars || throw(ContractValidationError(
+            "$where: step leaf `$(ex)` is not a scalar parameter or " *
+            "definition or supplied data value"))
+        return ex
+    end
+    ex isa Expr || return ex
+    if ex.head === :generator
+        clauses, _ = _scan_generator_clauses(ex)
+        for (v, _) in clauses
+            v isa Symbol || throw(ContractValidationError(
+                "$where: a generator iterates one name, got $(repr(v))"))
+            (v === s.loopvar || v in s.states || haskey(env.locals, v)) &&
+                throw(ContractValidationError(
+                    "$where: the generator variable `$(v)` shadows a scan name"))
+        end
+        sub(x, binders) = _scan_translate_step(x, s, merge(env, (; binders)), scalars)
+        return ReactiveKernels._history_map_generator(sub, sub, ex, s.loopvar,
+            env.binders)
+    end
+    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] in s.states
+        a, idx = ex.args[1], ex.args[2]
+        if idx === s.loopvar
+            a in env.completed && return :($a[_ppl_scan_index])
+            haskey(env.current, a) || throw(ContractValidationError(
+                "$where: `$(a)[$(s.loopvar)]` is read before the step that " *
+                "writes it"))
+            return env.current[a]
+        end
+        tidx = _scan_translate_step(idx, s, env, scalars)
+        if _history_lag_form(idx, s.loopvar, env.binders) !== nothing
+            a in env.completed && return Expr(:ref, a, tidx)
+            k = _scan_lag_of(idx, a, s.loopvar)
+            k isa Int || throw(ContractValidationError(
+                "$where: lag `$(idx)` of `$(a)` is not resolved to an integer"))
+            return Expr(:., :_ppl_carry, QuoteNode(_scan_lag_field(a, k)))
+        end
+        slice = _history_is_slice(idx)
+        _history_is_earlier(idx, s.loopvar, s.lo, env.binders) ||
+            throw(ContractValidationError("$where: `$(a)[$(idx)]` is not a " *
+                "lag, a current read or an entry provably before the loop index"))
+        available = env.hist isa AbstractVector ? a in env.hist : a === env.hist
+        a in env.completed || available || throw(ContractValidationError(
+            "$where: the history of `$(a)` is not available in the fold for " *
+            "`$(something(env.hist, :density))`"))
+        # A finished trajectory, or the fold's own `history`: the whole
+        # trajectory `[seeds; outputs so far]`.
+        source = a in env.completed ? a : env.hist isa AbstractVector ?
+            Expr(:., :_ppl_hist, QuoteNode(a)) : :_ppl_hist
+        return slice ? Expr(:call, GlobalRef(Base, :view), source, tidx) :
+            Expr(:ref, source, tidx)
+    end
+    args = ex.head === :call ? ex.args[2:end] : ex.args
+    newargs = Any[_scan_translate_step(a, s, env, scalars) for a in args]
+    return ex.head === :call ?
+        Expr(:call, _scan_translate_head(ex.args[1],
+            h -> _scan_translate_step(h, s, env, scalars)), newargs...) :
+        Expr(ex.head, newargs...)
+end
+
+# The do-block body of one reconstruction: the steps in order, the next carry
+# window, and `(next, <output>)`, or just the density for a plate. The step
+# reads parameters and data values by closing over them. `completed` arrays
+# are read from their trajectories
+# and their writes are skipped; `exec` (statement indices) limits the body to
+# the statements this fold needs; `hist` names the arrays whose earlier entries
+# come from the scan's `history` argument.
+function _scan_step_block(s::ScanSpec, innov, output, scalars;
+        completed = Set{Symbol}(), exec = nothing, hist = nothing)
+    env = (; locals = Dict{Symbol,Any}(s.loopvar => :_ppl_scan_index),
+        current = Dict{Symbol,Symbol}(), binders = Dict{Symbol,Any}(),
+        completed, hist)
+    samples = Dict(st.target => Symbol(:_ppl_e, j) for (j, st) in enumerate(innov))
+    body, logps = Expr[], Symbol[]
+    for (i, st) in enumerate(s.step)
+        exec === nothing || i in exec || continue
+        (st.indexed && st.target in completed && output !== nothing) && continue
+        rhs = if st.kind === :sample
+            value = samples[st.target]
+            if output === nothing
+                lp = Symbol(:_ppl_scan_lp_, st.target)
+                density = _scan_density!(body, st,
+                    a -> _scan_translate_step(a, s, env, scalars), value, lp)
+                push!(body, :($lp::Float64 = $density))
+                push!(logps, lp)
+            end
+            value
+        else
+            _scan_translate_step(st.expr, s, env, scalars)
+        end
+        if st.indexed
+            nm = Symbol(:_ppl_scan_n_, st.target)
+            push!(body, :($nm = $rhs))
+            env.current[st.target] = nm
+        else
+            nm = Symbol(:_ppl_scan_l_, st.target)
+            push!(body, :($nm = $rhs))
+            env.locals[st.target] = nm
+        end
+    end
+    if output === nothing
+        return Any[body..., _sum_terms(logps)]
+    end
+    active = exec === nothing ? setdiff(Set(s.states), completed) :
+        Set(s.step[i].target for i in exec if s.step[i].indexed &&
+            !(s.step[i].target in completed))
+    fields = Expr[]
+    for (a, L) in _scan_windows(s; active), k in 1:L
+        val = k == 1 ? env.current[a] :
+            Expr(:., :_ppl_carry, QuoteNode(_scan_lag_field(a, k - 1)))
+        push!(fields, Expr(:(=), _scan_lag_field(a, k), val))
+    end
+    push!(body, :(_ppl_next = $(Expr(:tuple, fields...))))
+    result = output isa AbstractVector ?
+        ReactiveKernels._scan_named_tuple_expr(output, a -> env.current[a]) : env.current[output]
+    push!(body, :((_ppl_next, $result)))
+    return body
+end
+
+function _scan_fold(s, innov, ranges, zname, T, output, scalars;
+        completed = Set{Symbol}(), exec = nothing, hist = nothing)
+    m = s.lo - 1
+    active = exec === nothing ? setdiff(Set(s.states), completed) :
+        Set(s.step[i].target for i in exec if s.step[i].indexed &&
+            !(s.step[i].target in completed))
+    init = Expr[Expr(:(=), _scan_lag_field(a, k), _scan_init_name(a, m - k + 1))
+        for (a, L) in _scan_windows(s; active) for k in 1:L]
+    seqs = Any[:($(s.lo):$T), [:(view($zname, $(first(r)):$(last(r)))) for r in ranges]...]
+    elems = Symbol[:_ppl_scan_index, [Symbol(:_ppl_e, j) for j in eachindex(innov)]...]
+    hist === nothing || push!(elems, :_ppl_hist)
+    body = _scan_step_block(s, innov, output, scalars; completed, exec, hist)
+    lambda = Expr(:->, Expr(:tuple, :_ppl_carry, elems...), Expr(:block, body...))
+    kws = Any[Expr(:kw, :init, Expr(:tuple, init...))]
+    if hist !== nothing
+        seed(a) = Expr(:vect, (_scan_init_name(a, k) for k in 1:m)...)
+        leading = hist isa AbstractVector ?
+            ReactiveKernels._scan_named_tuple_expr(output, seed) : seed(hist)
+        push!(kws, Expr(:kw, :history, leading))
+    end
+    call = Expr(:call, :scan, Expr(:parameters, kws...), seqs...)
+    return Expr(:do, call, lambda)
+end
+
+# All trajectories share one retained scan.
+# Column projections give each trajectory its own graph value without replaying
+# the recurrence when several outputs or the prior are requested together.
+function _scan_reconstruction_statements(plan::StructuralPlan,
+        layout::LayoutTable)
+    stmts = Expr[]
+    for raw in plan.scans
+        s = _resolve_scan(plan, raw)
+        _is_noncentered_scan(s) || continue
+        scalars = _scan_readable_names(plan, s)
+        innov = _scan_innovations(s)
+        T = _scan_length(plan, s)
+        zname = _scan_innovation_name(s)
+        (_scan_latent_size(s, T) == 0 ||
+            any(e -> e.kind === :scan && e.name === zname, layout.entries)) ||
+            throw(ContractValidationError("$(_scan_where(s)): layout has no " *
+                "latent slice :$zname"))
+        seedpos, ranges = _scan_latent_positions(s, innov, T)
+        for f in s.setup
+            nm = _scan_init_name(f.target, f.index)
+            val = f.kind === :sample ? :($zname[$(seedpos[(f.target, f.index)])]) :
+                _scan_translate_seed(f.expr, s, scalars)
+            push!(stmts, :($nm::Float64 = $val))
+        end
+        m = s.lo - 1
+        if T == m
+            for a in s.states
+                seeds = [_scan_init_name(a, k) for k in 1:m]
+                push!(stmts, :($a = [$(seeds...)]))
+            end
+            continue
+        end
+        history = _scan_has_history(s)
+        if length(s.states) == 1
+            a = only(s.states)
+            fold = _scan_fold(s, innov, ranges, zname, T, a, scalars;
+                hist = history ? a : nothing)
+            if history
+                push!(stmts, :($a = $fold))
+            else
+                rest = Symbol(:_ppl_scan_rest_, a)
+                seeds = [_scan_init_name(a, k) for k in 1:m]
+                push!(stmts, :($rest = $fold))
+                push!(stmts, :($a = vcat([$(seeds...)], $rest)))
+            end
+            continue
+        end
+        outputs = s.states
+        shared = Symbol(:_ppl_scan_outputs_, first(s.states))
+        fold = _scan_fold(s, innov, ranges, zname, T, outputs, scalars;
+            hist = history ? s.states : nothing)
+        push!(stmts, :($shared = $fold))
+        for a in outputs
+            column = history ? Expr(:., shared, QuoteNode(a)) :
+                ReactiveKernels._scan_column_expr(shared, a)
+            if history
+                push!(stmts, :($a = $column))
+            else
+                rest = Symbol(:_ppl_scan_rest_, a)
+                seeds = [_scan_init_name(a, k) for k in 1:m]
+                push!(stmts, :($rest = $column))
+                push!(stmts, :($a = vcat([$(seeds...)], $rest)))
+            end
+        end
+    end
+    return stmts
+end
+
+# Conditional densities read the completed trajectories. Only the sampled
+# statements and their local dependencies execute: no carried update is replayed.
+# A plate keeps these densities independently selectable from state outputs.
+function _scan_density_plate(s, innov, ranges, zname, T, scalars)
+    completed = Set(s.states)
+    exec = _history_fold_closure(_scan_fold_statements(s),
+        _scan_statement_reads(s), nothing, completed)
+    body = _scan_step_block(s, innov, nothing, scalars; completed, exec)
+    seqs = Any[:($(s.lo):$T), [:(view($zname, $(first(r)):$(last(r)))) for r in ranges]...]
+    elems = Symbol[:_ppl_scan_index, [Symbol(:_ppl_e, j) for j in eachindex(innov)]...]
+    Expr(:do, Expr(:call, :plate, seqs...),
+        Expr(:->, Expr(:tuple, elems...), Expr(:block, body...)))
+end
+
+# Seeds contribute their stated density once; the plate supplies each per-step
+# sample's conditional density. Innovation scales may read carried values,
+# locals, data and time in the original statement order.
+function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
+        s::ScanSpec, plan::StructuralPlan)
+    s = _resolve_scan(plan, s)
+    innov = _scan_innovations(s)
+    T = _scan_length(plan, s)
+    scalars = _scan_readable_names(plan, s)
+    zname = _scan_innovation_name(s)
+    seedpos, ranges = _scan_latent_positions(s, innov, T)
+    head = first(s.states)
+    terms = Any[]
+    for f in s.setup
+        f.kind === :sample || continue
+        lp = Symbol(:_ppl_scan_seedlp_, f.target, :_, f.index)
+        density = _scan_density!(stmts, f, a -> _scan_translate_seed(a, s, scalars),
+            :($zname[$(seedpos[(f.target, f.index)])]), lp)
+        push!(stmts, :($lp::Float64 = $density))
+        push!(terms, lp)
+    end
+    if T >= s.lo && !isempty(innov)
+        pointwise = Symbol(:_ppl_scan_density_, head)
+        node = Symbol(:_ppl_scan_stepslp_, head)
+        push!(stmts, :($pointwise = $(_scan_density_plate(s, innov, ranges,
+            zname, T, scalars))))
+        push!(stmts, :($node::Float64 = sum($pointwise)))
+        push!(terms, node)
+    end
+    total = Symbol(:_ppl_scan_, head)
+    push!(stmts, :($total::Float64 = $(_sum_terms(terms))))
+    push!(nodes, total)
+    return nothing
+end
+
+_scan_reads_carried(ex, s::ScanSpec) = ex isa Expr &&
+    ((ex.head === :ref && !isempty(ex.args) && ex.args[1] in s.states) ||
+     any(a -> _scan_reads_carried(a, s), ex.args))
+
+# Prior-density statements for every scan plus the total-node names to add to
+# the prior sum. Centered: the recurrence body is exactly one indexed `~` of
+# the carried state (`state[t] ~ dist`); the density is the seed term(s) plus
+# a plate over aligned lagged slices (the recurrence factorizes given the
+# state). Non-centered: conditional innovation densities over the `_ppl_scan_z_`
+# slice, with any state-dependent arguments reading the trajectories from
+# `_scan_reconstruction_statements`.
+function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
+    stmts = Expr[]
+    nodes = Symbol[]
+    for raw in plan.scans
+        sc = _resolve_scan(plan, raw)
+        if _is_noncentered_scan(sc)
+            _scan_noncentered_prior!(stmts, nodes, sc, plan)
+            continue
+        end
+        gap = _scan_shape_gap(sc)
+        gap === nothing || throw(ContractValidationError("[generator] " * gap))
+        state = only(sc.states)
+        step = sc.step[1]
+        entry = only(e for e in layout.entries
+                     if e.kind === :scan && e.name === state)
+        T = entry.size
+        scalars = _scan_readable_names(plan, sc)
+        m = length(sc.setup)
+        terms = Any[]
+        for (k, f) in enumerate(sc.setup)
+            push!(stmts, :($(_scan_init_name(state, k)) = $state[$k]))
+            seed = Symbol(:_ppl_scan_seed_, state, :_, k)
+            density = _scan_density!(stmts, f, a -> _scan_translate_seed(a, sc, scalars),
+                :($(state)[$k]), seed)
+            push!(stmts, :($seed::Float64 = $density))
+            push!(terms, seed)
+        end
+        lags = sort!(collect(_scan_lags([step], [state], sc.loopvar)[state]))
+        inputs = Any[:(view($(state), $(m + 1):$T))]     # hcur → do-var _ppl_c1
+        dovar = Dict{Int,Symbol}()
+        for (i, j) in enumerate(lags)
+            push!(inputs, :(view($(state), $(m + 1 - j):$(T - j))))
+            dovar[j] = _dovar(i + 1)
+        end
+        # Substitute the lag reads; the cell reads the recurrence's other
+        # scalars (params/assignments) by closing over them.
+        push!(inputs, :($(sc.lo):$T))
+        cellarg(a) = _subst_syms(_subst_scan_lags(a, state, sc.loopvar, dovar),
+            Dict(sc.loopvar => _dovar(length(inputs))))
+        # History reads (`h[s]` under `for s in 1:(t - 1)`) read the sampled
+        # state whole; their bounds are re-checked for hand-built plans.
+        history = _scan_has_history(sc)
+        for a in _scan_reads(step)
+            _history_foreach_read(a, sc.states, sc.loopvar) do _, idx, env
+                (idx === sc.loopvar || _history_lag_form(idx, sc.loopvar, env) !== nothing) &&
+                    return nothing
+                _history_is_earlier(idx, sc.loopvar, sc.lo, env) ||
+                    throw(ContractValidationError("$(_scan_where(sc)): " *
+                        "`$(state)[$(idx)]` is not a lag or an entry provably " *
+                        "before the loop index"))
+            end
+        end
+        caps = Symbol[]
+        for a in _scan_reads(step)
+            _scan_cell_caps!(caps, cellarg(a))
+        end
+        sc.loopvar in caps && throw(ContractValidationError(
+            "[generator] scan $(state): the recurrence uses the loop index " *
+            "`$(sc.loopvar)` directly — not supported in slice 1"))
+        for c in caps
+            (c in scalars || (history && c === state)) ||
+                throw(ContractValidationError("$(_scan_where(sc)): unknown captured value $c"))
+        end
+        recnode = Symbol(:_ppl_scan_rec_, state)
+        recpw = Symbol(:_ppl_scan_pw_, state)
+        pre = Expr[]
+        cell = _scan_density!(pre, step, cellarg, _dovar(1), recnode)
+        append!(stmts, _plate_sum_stmts(recpw, recnode, inputs, Expr[pre..., cell]))
+        push!(terms, recnode)
+        total = Symbol(:_ppl_scan_, state)
+        push!(stmts, :($total::Float64 = $(foldl((a, b) -> :($a + $b), terms))))
+        push!(nodes, total)
+    end
+    return stmts, nodes
+end
+
+# A scalar constrained parameter's bijector `logjac` term is its own value
+# named after the parameter (`var"sigma.logjac"`), so the built program reads
+# `log_jacobian = var"sigma.logjac" + …` with that term's definition shown,
+# not a value named after the sum.
+function _log_jacobian_statements(plan::StructuralPlan, layout::LayoutTable)
+    stmts = Expr[]
     terms = Any[]
     for e in layout.entries
         t = jacobian_term(e)
-        t === nothing || push!(terms, t)
+        t === nothing && continue
+        if _bijector_logjac_call(t)
+            name = Symbol(e.name, ".logjac")
+            push!(stmts, :($name::Float64 = $t))
+            t = name
+        end
+        push!(terms, t)
+    end
+    # A joint cell latent's cells add its geometry's log-Jacobians
+    # (`cell_latent.jl`); its packed array itself is untransformed.
+    for site in sort!(collect(keys(plan.cell_geometries)))
+        push!(terms, plan.cell_geometries[site].logjac)
     end
     jac = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
-    return :(log_jacobian::Float64 = $jac)
+    push!(stmts, :(log_jacobian::Float64 = $jac))
+    return stmts
 end
 
+_bijector_logjac_call(t) = t isa Expr && t.head === :call && !isempty(t.args) &&
+    t.args[1] isa Expr && t.args[1].head === :. &&
+    t.args[1].args[2] == QuoteNode(:logjac)

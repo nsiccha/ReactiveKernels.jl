@@ -68,8 +68,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     # constrain-only producer omits the Jacobian; the joint producer emits it.
     parameters = (; alpha, beta, sigma)
     (parameters, log_jacobian::Float64) = ((; alpha, beta, sigma), u_sigma)
-    (alpha::Float64, beta::Float64, sigma::Float64) =
-        (parameters.alpha, parameters.beta, parameters.sigma)
 
     # Priors: α ~ Normal(pmualpha, psalpha), β ~ Normal(pmubeta, psbeta) with the
     # data-supplied "adjustable-prior" hyperparameters, reusing the shared Normal

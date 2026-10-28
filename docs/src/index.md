@@ -32,6 +32,10 @@ features:
 
 ## Overview
 
+All lowering work follows the [core constraints](constraints.md): retain
+data-dependent iteration and preserve lazy branch semantics, including for
+data bound during preparation.
+
 `ReactiveKernels.jl` is a **have → want** computational-graph kernel layer. You
 describe a computation once as a transparent graph of named values and the
 operations connecting them; you declare what you already **have** and what you
@@ -63,13 +67,23 @@ The definition uses ordinary function syntax (as in ReactiveObjects.jl), and
 its argument list is the default set of inputs. Functions like `f` and `h` are
 inputs too: they run only when the prepared kernel is called. Type annotations
 are optional; leaving them off does not stop the generated function from
-specializing on the concrete values you pass. Every named value is reachable as
+specializing on the concrete values you pass. A type on an assigned name
+(`weights::Vector{Float64} = …`) is a declared contract: in the native body of a
+kernel that also owns a plate, a scan or an embedded prepared kernel it becomes
+a typed local, so the assigned value is converted to that type (an identity for
+a value already of that type) and stays concretely typed for every consumer —
+in particular across a prepared child called inside a lazy `if` arm, where
+Julia's inference would otherwise widen the nested call and every consumer of
+the result, an embedded plate's per-cell call above all, would dispatch
+dynamically. Every named value is reachable as
 a port (`model.f`, `model.x`, `model.a`, `model.out`). With no explicit
 `return`, the derived values such as `out` are the default outputs; a `return`
 can pick different defaults without hiding any port. You may refer to a value
 before the line that defines it, a tuple assignment is one recipe with several
 outputs, and `@recipe (cost = ..., cse_key = ...)` sets a recipe's cost and
-reuse hints without dropping to the lower-level graph API.
+reuse hints without dropping to the lower-level graph API. Tuple assignments
+destructure as in Julia: `(a, b) = t` binds the leading elements of a longer
+`t`, and `(a,) = t` (or `a, = t`) binds the first element, not `t` itself.
 
 Trailing positional defaults and fixed keyword arguments follow ordinary Julia
 call syntax. A default is evaluated only when you omit that argument, may refer
@@ -93,8 +107,10 @@ rejected.
 This function-shaped form describes a graph, not a new object type. Compiled
 reactive state lets you change inputs in place through `set!`, `mutate!`, and
 `touch!`. A `@kernel` that contains its own inner methods can expose pure,
-straight-line methods as transparent endpoints. Methods with mutation or control
-flow remain on the separate, stricter stateful compiler: it reads their source
+straight-line methods as transparent endpoints; a branch in value position, a
+`let` and an authored `plate(...) do` cell are straight-line, since the recipe
+lowering owns them. Methods with mutation, loops, or statement-position control flow
+remain on the separate, stricter stateful compiler: it reads their source
 directly and only allows calls whose effects it can account for.
 The [compiler capability and limits](compiler.md) page covers the full planning,
 code-generation, state, control-flow, NUTS, and rejection rules.
@@ -115,6 +131,30 @@ prepare(extended; want = (:out, :squared))(f, h, 1.0, 2.0)
 the base boundary by default. That makes an extended kernel a drop-in for the
 base while extra requested outputs opt into extra work. The explicit
 `boundary = :fragment` option replaces both defaults when that is intentional.
+
+When the value a fragment should read has another name, rename the fragment's
+port first. A summary written once against a port `prediction` composes onto a
+model whose prediction value is named at run time:
+
+```julia
+@kernel summaries(prediction, rows) = begin
+    cells = plate(eachindex(rows)) do s
+        cell::Float64 = sum(prediction[rows[s]])
+    end
+    total::Float64 = sum(cells)
+end
+
+node = :mu   # e.g. read from the model
+graph = compose(model_graph, ReactiveKernels.rename(summaries, :prediction => node))
+```
+
+`ReactiveKernels.rename(spec, old => new, ...)` returns a fresh kernel with the
+same recipes and the ports renamed, positions kept: the default boundary and
+the call signature use the new names, and a renamed keyword port takes its new
+name as the keyword. It evaluates no source, so it works in a downstream
+package's precompile workload too. A renamed port must exist, be named once and
+not take a name another port keeps: join same-name ports with `compose`.
+`rename` is not exported, since `DataFrames` exports a function of that name.
 
 ## Reuse a kernel inside another kernel
 
@@ -146,12 +186,28 @@ preparing only `:log_jacobian` omits the probability recipe; requesting both
 shares `magnitude` and `tail`. The generated kernel contains no nested call.
 
 Nested graph calls currently take all default HAVE boundary ports positionally
-(supply optional positional values explicitly), must destructure the nested
-output boundary exactly, and require exact declared types at the outer input
-and output ports. Arguments are existing graph ports; assign a larger expression
-to its own recipe first. Put `@recipe` metadata inside the reusable kernel rather
-than on the call site. Each restriction is checked while the outer graph is
-constructed.
+(supply optional positional values explicitly) and require exact declared types
+at the outer input and output ports. A value the kernel computes without a
+declaration takes the declared type of the formal it is passed to, so the
+formal reads that value directly. The kernel's own inputs and returned values
+keep their declarations, so an undeclared one is still converted at the formal,
+as is a value passed to formals of different types. A call
+inside a larger expression becomes its own value named for the call under the
+assignment: `mu = a .* rise(a)` computes `var"mu.rise"`, and the child's values
+are named `var"mu.rise.xi"`. A destructuring assignment binds the nested
+outputs in order, `(a, b) = child(x)`; as in Julia, a shorter `(a,) = child(x)`
+binds the leading outputs and leaves the rest prunable, and a longer one is
+refused. A single-output child returns its one value, so `(a,) = child(x)` binds
+that value's first element.
+A child with several outputs may instead be bound to one name, `t = child(x)`,
+or used inside a larger expression, `child(x)[1]`; that value is the tuple the
+runtime call `child(x)` returns, spliced the same way and packed by one recipe.
+The pack reads every output, so the tuple form computes the whole output
+boundary even when one element is used; destructure when you need only some of
+the outputs. A declared one-name target must admit that tuple type. Arguments
+are existing graph ports; assign a larger expression to its own recipe first.
+Put `@recipe` metadata inside the reusable kernel rather than on the call site.
+Each restriction is checked while the outer graph is constructed.
 
 The dedicated [Bijectors and constrained parameters](bijectors.md) page applies
 this composition rule to reusable support transforms, shows parameters-only and
@@ -170,7 +226,6 @@ end
 
 @kernel location_scale(standard, location::Float64, scale::Float64) = begin
     log_scale::Float64 = log(scale)
-    scale::Float64 = exp(log_scale)
 
     standardized(x::Float64)::Float64 = (x - location) / scale
     inv(standardized, z::Float64)::Float64 = location + scale * z
@@ -225,18 +280,50 @@ constructed, and the endpoint is still transparently spliced with no runtime
 hygienic internal recipes, so natural calls such as
 `normal(0.0, 5.0).logpdf(x)` remain transparent too.
 
-Named relations stay available as alternate cuts. Here `scale = exp(log_scale)`
-and `log_scale = log(scale)` are ordinary bidirectional recipes: the natural
-constructor has `scale`, while this view starts from `log_scale` instead:
+A constructed endpoint may also appear under a lazy branch arm, such as
+`mp == 0 ? normal(lpi, 1.5).logpdf(yf) : 0.0` in a plate cell. No recipe
+position exists inside the arm, so the endpoint's planned recipes are rendered
+as source in the arm itself: each arm evaluates its own endpoint copy exactly
+when taken, and a data-bound branch still splits per arm at preparation. The
+copy is one `let` over the endpoint's own value names,
+`let log_scale = log(s), standardized = (x - 0.0) / s; … end`. An
+endpoint whose lowered form binds locals, runs a plate or scan, or reads a
+non-`Base` global is rejected at authoring time with an action to call it in
+its own recipe, where it splices as usual.
+
+The same in-place copy serves an endpoint call inside a generator term,
+comprehension, closure, `do` block, local function, loop, `let` or `try`
+body. Julia evaluates such a position zero or more times, and it may read
+the names its scope binds, so the endpoint stays where it is written:
+`sum(normal(m[s], 1.0).logpdf(x[1]) for s in eachindex(m); init = 0.0)`
+evaluates one endpoint per element and reads that element's `m[s]`, and a
+bare scope-bound name such as `normal(m[s], s)` is read in place too. A
+generator `sum` with `init` over such terms still runs as one explicit loop
+natively, as for any other term.
+
+Inside an object's own method bodies, a straight-position call of a sibling,
+a bound child or `inv` splices the same way. In a lazy arm, or with an
+argument a `let` binds, the call stays where it is written: the object's
+builder prepares the callee's graph once, and `code_expr` contains the call as
+`var"prepared standardized"(location, scale, x)`. The arm evaluates it only
+when taken.
+
+Named relations stay available as alternate cuts. Authoring one direction is
+enough: a unary call such as `log_scale = log(scale)` gains the reverse edge
+(`scale = exp(log_scale)`, via InverseFunctions.jl) automatically, so the
+natural constructor has `scale` while this view starts from `log_scale`
+instead:
 
 ```julia
 from_log_scale = extract(normal;
     have = (:x, :location, :log_scale), want = :logpdf)
 ```
 
-If both sides are in `have`, the planner treats both as authoritative and runs
-neither conversion. `inv(standardized, z)` is an explicit authored inverse edge,
-not symbolic inversion. Joint extraction such as
+Tuple packs unpack the same way: `params = (; x, y)` lets a caller holding
+only `params` recover `x` and `y` individually, with no explicit unpacking
+recipes. If both sides are in `have`, the planner treats both as authoritative
+and runs neither conversion. `inv(standardized, z)` is an explicit authored
+inverse edge, not symbolic inversion. Joint extraction such as
 `want = (:logpdf, :standardized)` shares the same standardized value
 automatically; separately authored or effectful work is never merged merely
 because its expressions look alike.

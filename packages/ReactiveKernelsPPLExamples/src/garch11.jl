@@ -64,8 +64,6 @@ using LogExpFunctions: logistic, log1pexp
     # authoritative HAVE boundary (a deterministic query can start from the
     # constrained parameters, e.g. the one-step-ahead volatility forecast).
     parameters = (; mu, alpha0, alpha1, beta1)
-    (mu::Float64, alpha0::Float64, alpha1::Float64, beta1::Float64) =
-        (parameters.mu, parameters.alpha0, parameters.alpha1, parameters.beta1)
 
     # Sequential GARCH(1,1) conditional-sd recursion:
     #   σ₁ = sigma1 (data);  σₜ = sqrt(α0 + α1·(y_{t−1} − μ)² + β1·σ_{t−1}²)  (t ≥ 2).
@@ -77,9 +75,8 @@ using LogExpFunctions: logistic, log1pexp
     T::Int = length(y)
     y_lag::Vector{Float64} = y[1:(T - 1)]                 # y_{t−1}, in-graph shape prep
     sigma_tail::Vector{Float64} =
-        scan(y_lag, Ref(mu), Ref(alpha0), Ref(alpha1), Ref(beta1);
-             init = sigma1) do sprev, yprev, m, a0, a1, b1
-            st = sqrt(a0 + a1 * (yprev - m)^2 + b1 * sprev^2)
+        scan(y_lag; init = sigma1) do sprev, yprev
+            st = sqrt(alpha0 + alpha1 * (yprev - mu)^2 + beta1 * sprev^2)
             (st, st)
         end
     sigma::Vector{Float64} = vcat(sigma1, sigma_tail)      # σ₁ .. σ_T

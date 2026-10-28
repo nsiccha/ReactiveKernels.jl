@@ -10,8 +10,19 @@ import LambertW
 import TOML
 import Reactant: @compile, @jit
 
-include("test_authored_plate_chains_reactant.jl")
-include("test_ref_array_plate_reactant.jl")
+include("reactant_suite_selector.jl")
+
+# Suite gate: with no `ARGS` selector every suite below runs (the historical
+# full behavior); otherwise only the selected suites run, in suite order.
+# Global setup (imports, fixtures, kernels) always runs.
+const _SELECTED_REACTANT_SUITES = _select_reactant_suites(ARGS)
+
+if "plate-chains" in _SELECTED_REACTANT_SUITES
+    include("test_authored_plate_chains_reactant.jl")
+end
+if "ref-array-plate" in _SELECTED_REACTANT_SUITES
+    include("test_ref_array_plate_reactant.jl")
+end
 
 module _ReactantStatefulFix
 include(joinpath(@__DIR__, "..", "benchmark", "nuts_kernel_authoring_fixture.jl"))
@@ -187,6 +198,53 @@ end
     end : -Inf
 end
 
+# Host RHS against a traced Cholesky factor (snag `reactant-cholesk-407afd9e`):
+# a bound host right-hand side must promote to a traced constant before
+# Reactant's triangular solve sees it — upstream promotes elementwise to
+# `Matrix{TracedRNumber}` and dies in scalar indexing.
+@kernel reactant_cholesky_bound_rhs(
+        Sigma::Matrix{Float64}, E::Matrix{Float64}) = begin
+    F = cholesky(Symmetric(Sigma))
+    S::Matrix{Float64} = F \ E
+    return S
+end
+
+@kernel reactant_cholesky_bound_rhs_vec(
+        Sigma::Matrix{Float64}, b::Vector{Float64}) = begin
+    F = cholesky(Symmetric(Sigma))
+    x::Vector{Float64} = F \ b
+    return x
+end
+
+# Nested dotted calls stay fused in the tensorized lowering (snag
+# `reactant-traced-ff8ff365`): the Φ-style blend `tril(X,-1) .+ 0.5 .*
+# Diagonal(diag(X))` must compile as one dense broadcast, not split into an
+# isolated structured `0.5 .* Diagonal(...)`.
+@kernel reactant_fused_diagonal_blend(X::Matrix{Float64}) = begin
+    Phi::Matrix{Float64} = tril(X, -1) .+ 0.5 .* Diagonal(diag(X))
+    return Phi
+end
+
+# A nested dotted broadcast over dense operands (no structured wrapper):
+# compiled before the fusion fix and must stay exact after it.
+@kernel reactant_nested_dense_blend(
+        A::Matrix{Float64}, B::Matrix{Float64}) = begin
+    C::Matrix{Float64} = A .+ B .* 2.0 .- 1.0
+    return C
+end
+
+# A host-only `Bool` nest fused inside a traced broadcast whose outermost
+# call has NO direct traced operand (snag `dummy-varying-xl-3b05117e`): the
+# promotion marker is then the host `Broadcasted` wrapper itself, so the
+# mask keeps its host style and must dense-materialize (`Array{Bool}`) at
+# the lazy level instead of reaching the backend as a `BitArray` (whose
+# `copyto!` overlay recurses without termination).
+@kernel reactant_fused_host_bool_nest(
+        u::Vector{Float64}, c::Vector{Int64}) = begin
+    z::Vector{Float64} = (c .== 2) .* (u .+ 1.0)
+    return sum(z)
+end
+
 _rk_call(k, x, μ, scale) = k(x, μ, scale)
 _rk_allocated(k, x, μ, scale) = @allocated k(x, μ, scale)
 _rk_output_allocated(x) = @allocated similar(x, Float64)
@@ -260,6 +318,12 @@ end
     density::Float64 = sum(q .* data)
 end
 
+# Suite gate: the core testset keeps its historical indentation so this gate
+# reads as a two-line diff instead of an 850-line re-indent.
+if "core" in _SELECTED_REACTANT_SUITES
+include("test_error_policy_reactant.jl")
+include("test_precompiled_prepared_reactant.jl")
+include("test_source_world_age_reactant.jl")
 @testset "Reactant optional compiler integration" begin
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt) !== nothing
 
@@ -317,6 +381,67 @@ end
         splat_padded, splat_total = compiled_splat(scores_traced)
         @test Array(splat_padded) ≈ native_splat_padded
         @test_broken splat_total ≈ native_splat_total
+    end
+
+    @testset "bound host RHS of a traced Cholesky solve promotes" begin
+        K_host = [4.0 1.0 0.5; 1.0 3.0 0.2; 0.5 0.2 2.0]
+        I3 = Matrix{Float64}(I, 3, 3)
+        b_host = [1.0, 2.0, 3.0]
+        K_traced = Reactant.to_rarray(K_host)
+
+        bound_matrix = prepare(reactant_cholesky_bound_rhs;
+            have = (:Sigma, :E), want = :S, bound = (; E = I3))
+        native_matrix = bound_matrix(K_host)
+        @test native_matrix ≈ inv(K_host)
+        compiled_matrix = @compile bound_matrix(K_traced)
+        @test Array(compiled_matrix(K_traced)) ≈ native_matrix
+
+        bound_vector = prepare(reactant_cholesky_bound_rhs_vec;
+            have = (:Sigma, :b), want = :x, bound = (; b = b_host))
+        native_vector = bound_vector(K_host)
+        compiled_vector = @compile bound_vector(K_traced)
+        @test Array(compiled_vector(K_traced)) ≈ native_vector
+
+        # A traced RHS lowers identically (promotion is an identity there).
+        traced = prepare(reactant_cholesky_bound_rhs;
+            have = (:Sigma, :E), want = :S)
+        native_traced = traced(K_host, I3)
+        E_traced = Reactant.to_rarray(I3)
+        compiled_traced = @compile traced(K_traced, E_traced)
+        @test Array(compiled_traced(K_traced, E_traced)) ≈ native_traced
+    end
+
+    @testset "nested dotted calls stay fused in tensorized bodies" begin
+        X_host = [1.0 2.0 3.0; 4.0 5.0 6.0; 7.0 8.0 9.0]
+        A_host = [1.0 2.0; 3.0 4.0]
+        B_host = [5.0 6.0; 7.0 8.0]
+
+        fused = prepare(reactant_fused_diagonal_blend; have = (:X,), want = :Phi)
+        native_fused = fused(X_host)
+        @test native_fused ≈ tril(X_host, -1) + Diagonal(diag(X_host)) / 2
+        rX = Reactant.to_rarray(X_host)
+        compiled_fused = @compile fused(rX)
+        @test Array(compiled_fused(rX)) ≈ native_fused
+
+        nested = prepare(reactant_nested_dense_blend; have = (:A, :B), want = :C)
+        native_nested = nested(A_host, B_host)
+        @test native_nested ≈ A_host .+ B_host .* 2.0 .- 1.0
+        rA = Reactant.to_rarray(A_host)
+        rB = Reactant.to_rarray(B_host)
+        compiled_nested = @compile nested(rA, rB)
+        @test Array(compiled_nested(rA, rB)) ≈ native_nested
+    end
+
+    @testset "nested host Bool mask without a direct traced operand" begin
+        u_host = [0.5, -1.0, 1.5, 2.0]
+        c_host = [1, 2, 2, 1]
+        kernel = prepare(reactant_fused_host_bool_nest; have = (:u, :c),
+            want = :__return__, bound = (; c = c_host))
+        native = kernel(u_host)
+        @test native ≈ sum((c_host .== 2) .* (u_host .+ 1.0))
+        ru = Reactant.to_rarray(u_host)
+        compiled = @compile kernel(ru)
+        @test Float64(compiled(ru)) ≈ native
     end
 
     @testset "source-derived functional state transition" begin
@@ -603,6 +728,41 @@ end
             Reactant.to_rarray(log(1.2); track_numbers = true))
         @test Array(values) ≈ vector_reference[1]
         @test Array(gradients) ≈ vector_reference[2]
+
+        # The replica axis is a data length: one retained loop carries the
+        # autodiff, so the emitted program does not grow with the replica
+        # count (docs/src/constraints.md).
+        program_lines(replicated, positions) = begin
+            hlo = repr(Reactant.@code_hlo optimize = false replicated(
+                Reactant.to_rarray(positions),
+                Reactant.to_rarray(0.1; track_numbers = true),
+                Reactant.to_rarray(log(1.2); track_numbers = true)))
+            @test count("stablehlo.while", hlo) == 1
+            @test count("enzyme.autodiff", hlo) == 1
+            count("\n", hlo)
+        end
+        @test program_lines(scalar_replicated, [0.0, 0.4, 0.9]) ==
+              program_lines(scalar_replicated, [0.0, 0.4, 0.9, 1.3, -0.2, 0.7])
+        @test program_lines(vector_replicated, reshape(collect(0.0:0.05:1.15), 6, 4)) ==
+              program_lines(vector_replicated, reshape(collect(0.0:0.05:2.35), 6, 8))
+    end
+
+    @testset "graph-native position batching compiles under Reactant" begin
+        kernel = prepare_batched(
+            reactant_replica_normal;
+            batched = :x, want = :total)
+        @test kernel isa ReactiveKernels.GraphReplicatedKernel
+        positions = reshape(collect(0.0:0.05:1.15), 6, 4)
+        reference = kernel(positions, 0.3, log(1.2))
+        compiled = @compile kernel(
+            Reactant.to_rarray(positions),
+            Reactant.to_rarray(0.3; track_numbers = true),
+            Reactant.to_rarray(log(1.2); track_numbers = true))
+        observed = compiled(
+            Reactant.to_rarray(positions),
+            Reactant.to_rarray(0.3; track_numbers = true),
+            Reactant.to_rarray(log(1.2); track_numbers = true))
+        @test Array(observed) ≈ reference
     end
 
     @testset "scalar-source HMC compiles once and replicas without a rewrite" begin
@@ -853,75 +1013,68 @@ end
         @test !occursin("for ", string(both.f.tensorized_ast))
     end
 
-    @testset "small static plates lower as scalar lanes" begin
-        ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt)
-        lane_limit = ext._REACTANT_SMALL_STATIC_PLATE_LANES
-        optimized_hlo(kernel, args...) =
-            repr(Reactant.@code_hlo optimize = true kernel(args...))
-
-        x_host = collect(range(-1.0, 1.0; length = 12))
-        locations_host = collect(range(-0.2, 0.4; length = 12))
-        scales_host = collect(range(0.8, 1.1; length = 12))
-        reference = @. -0.5 * log(2π) - log(scales_host) -
-            0.5 * ((x_host - locations_host) / scales_host)^2
+    @testset "plates never unroll into per-lane scalar programs" begin
+        # A plate's lane count is a data length, so the emitted program must
+        # not replicate the cell body per lane even for a small,
+        # preparation-known count (docs/src/constraints.md).  Compare the
+        # unoptimized HLO across two lane counts: only tensor shapes differ.
+        program_lines(kernel, args...) = count(
+            "\n", repr(Reactant.@code_hlo optimize = false kernel(args...)))
+        function normal_inputs(n)
+            x_host = collect(range(-1.0, 1.0; length = n))
+            locations_host = collect(range(-0.2, 0.4; length = n))
+            scales_host = collect(range(0.8, 1.1; length = n))
+            reference = @. -0.5 * log(2π) - log(scales_host) -
+                0.5 * ((x_host - locations_host) / scales_host)^2
+            (x_host, locations_host, scales_host, reference)
+        end
         total = prepare(reactant_authored_normal_loglik)
         both = prepare(extract(
             reactant_authored_normal_loglik;
             want = (:pointwise, :__return__)))
-        x = Reactant.to_rarray(x_host)
-        locations = Reactant.to_rarray(locations_host)
-        scales = Reactant.to_rarray(scales_host)
-        @test length(x_host) <= lane_limit[]
-
-        # A total-only cut of a small plate is a scalar program: no batched
-        # region, no vector reduction, and no lane vector materialized.
-        lane_hlo = optimized_hlo(total, x, locations, scales)
-        @test !occursin("enzyme.batch", lane_hlo)
-        @test !occursin("stablehlo.reduce", lane_hlo)
-        @test !occursin("stablehlo.concatenate", lane_hlo)
-        lane_total = @compile total(x, locations, scales)
-        @test lane_total(x, locations, scales) ≈ sum(reference)
-        lane_both = @compile both(x, locations, scales)
-        lane_pointwise, lane_sum = lane_both(x, locations, scales)
-        @test Array(lane_pointwise) ≈ reference
-        @test lane_sum ≈ sum(reference)
-
-        # Above the lane limit the same plate keeps the batched lowering.
-        previous_limit = lane_limit[]
-        try
-            lane_limit[] = length(x_host) - 1
-            batched_hlo = optimized_hlo(total, x, locations, scales)
-            @test occursin("stablehlo.reduce", batched_hlo)
-            batched_total = @compile total(x, locations, scales)
-            @test batched_total(x, locations, scales) ≈ sum(reference)
-        finally
-            lane_limit[] = previous_limit
+        sizes = Int[]
+        for n in (6, 12)
+            x_host, locations_host, scales_host, reference = normal_inputs(n)
+            x = Reactant.to_rarray(x_host)
+            locations = Reactant.to_rarray(locations_host)
+            scales = Reactant.to_rarray(scales_host)
+            push!(sizes, program_lines(total, x, locations, scales))
+            compiled_total = @compile total(x, locations, scales)
+            @test compiled_total(x, locations, scales) ≈ sum(reference)
+            compiled_both = @compile both(x, locations, scales)
+            pointwise, plate_sum = compiled_both(x, locations, scales)
+            @test Array(pointwise) ≈ reference
+            @test plate_sum ≈ sum(reference)
         end
+        @test sizes[1] == sizes[2]
 
-        # Column lanes of a small eachcol plate take the same scalar path.
-        scores_host = reshape(collect(1.0:15.0) ./ 7, 3, 5)
-        weights_host = collect(range(0.5, 1.5; length = 5))
+        # Column plates over a small eachcol matrix keep the batched lowering.
         eachcol_kernel = prepare(reactant_small_eachcol_plate)
-        eachcol_reference = sum(
-            weights_host[j] * sum(scores_host[:, j]) for j in 1:5)
-        @test eachcol_kernel(scores_host, weights_host) ≈ eachcol_reference
-        scores = Reactant.to_rarray(scores_host)
-        weights = Reactant.to_rarray(weights_host)
-        @test !occursin("enzyme.batch", optimized_hlo(eachcol_kernel, scores, weights))
-        compiled_eachcol = @compile eachcol_kernel(scores, weights)
-        @test compiled_eachcol(scores, weights) ≈ eachcol_reference
+        column_sizes = Int[]
+        for columns in (5, 10)
+            scores_host = reshape(collect(1.0:(3 * columns)) ./ 7, 3, columns)
+            weights_host = collect(range(0.5, 1.5; length = columns))
+            eachcol_reference = sum(
+                weights_host[j] * sum(scores_host[:, j]) for j in 1:columns)
+            @test eachcol_kernel(scores_host, weights_host) ≈ eachcol_reference
+            scores = Reactant.to_rarray(scores_host)
+            weights = Reactant.to_rarray(weights_host)
+            push!(column_sizes, program_lines(eachcol_kernel, scores, weights))
+            compiled_eachcol = @compile eachcol_kernel(scores, weights)
+            @test compiled_eachcol(scores, weights) ≈ eachcol_reference
+        end
+        @test column_sizes[1] == column_sizes[2]
     end
 
-    @testset "bound host data arrays in plates above the lane limit" begin
-        # `bound=` data stays a host array inside the traced program.  Above
-        # the scalar-lanes limit both large-plate lowerings must promote it:
-        # the broadcast lowering deduces its eltype from the RAW host element
-        # type (a guarded count cell then infers `Number`, which has no traced
-        # `similar`), and the batched lowering only recognizes traced arrays as
-        # explicit batch inputs (a host lane vector was captured as a SHARED
-        # closure value, handing the whole vector to every lane's cell).
-        ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt)
-        n = ext._REACTANT_SMALL_STATIC_PLATE_LANES[] + 4
+    @testset "bound host data arrays in plates" begin
+        # `bound=` data stays a host array inside the traced program.  Both
+        # plate lowerings must promote it: the broadcast lowering deduces its
+        # eltype from the RAW host element type (a guarded count cell then
+        # infers `Number`, which has no traced `similar`), and the batched
+        # lowering only recognizes traced arrays as explicit batch inputs (a
+        # host lane vector was captured as a SHARED closure value, handing the
+        # whole vector to every lane's cell).
+        n = 20
 
         counts_host = collect(0:(n - 1))
         rates_host = collect(range(0.5, 4.0; length = n))
@@ -1029,10 +1182,23 @@ end
         @test gradient[3] ≈ reference_σ
     end
 end
+end
 
-include("test_nutpie_reactant.jl")
-include("test_reactivehmc_statistics_reactant.jl")
-include("test_reactivehmc_hmc_reactant.jl")
-include("test_finite_structural_container_reactant.jl")
-include("test_kernel_nuts_reactant.jl")
-include("test_pathfinder_reactant.jl")
+if "nutpie" in _SELECTED_REACTANT_SUITES
+    include("test_nutpie_reactant.jl")
+end
+if "reactivehmc-statistics" in _SELECTED_REACTANT_SUITES
+    include("test_reactivehmc_statistics_reactant.jl")
+end
+if "reactivehmc-hmc" in _SELECTED_REACTANT_SUITES
+    include("test_reactivehmc_hmc_reactant.jl")
+end
+if "finite-structural-container" in _SELECTED_REACTANT_SUITES
+    include("test_finite_structural_container_reactant.jl")
+end
+if "kernel-nuts" in _SELECTED_REACTANT_SUITES
+    include("test_kernel_nuts_reactant.jl")
+end
+if "pathfinder" in _SELECTED_REACTANT_SUITES
+    include("test_pathfinder_reactant.jl")
+end

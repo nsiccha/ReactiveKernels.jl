@@ -20,15 +20,17 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
 # have/want/bound surface and the identical q = [μ, log_τ, θ…] packing as
 # `build_eight_schools_graph()`:
 #
-#   μ ~ Normal(0, 5); τ ~ HalfCauchy(0, 5); θⱼ ~ Normal(μ, τ); yⱼ ~ Normal(θⱼ, σⱼ)
+#   μ ~ Normal(0, 5); τ positive by Stan's lower-bound kernel (bare Cauchy);
+#   θⱼ ~ Normal(μ, τ); yⱼ ~ Normal(θⱼ, σⱼ)
 #
-# `positive(cauchy(…))` supplies the half-Cauchy (+log 2 normalization and
-# log/exp transform with Jacobian log_τ). Density-equivalent to the hand-authored
-# kernel to machine precision — see test/test_ppl_posteriordb_parity.jl.
+# `stan_positive(cauchy(…))` supplies the log/exp transform and Jacobian
+# log_τ while keeping Stan's bare lower-bound prior (no proper-half `+log 2`).
+# Density-equivalent to the hand-authored kernel to machine precision — see
+# test/test_ppl_posteriordb_parity.jl.
 @ppl _ppl_eight_schools(observations::Vector{Float64},
                         observation_scales::Vector{Float64}) = begin
     mu ~ normal(0.0, 5.0)
-    tau ~ positive(cauchy(0.0, 5.0))
+    tau ~ stan_positive(cauchy(0.0, 5.0))
     theta::vector[8] ~ normal(mu, tau)
     observations ~ normal(theta, observation_scales)
 end

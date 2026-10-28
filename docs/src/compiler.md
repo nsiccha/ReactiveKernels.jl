@@ -25,6 +25,138 @@ boundary. In particular, a stateless recipe may contain arbitrary ordinary
 Julia behind an opaque recipe call, while a source-captured state-machine method
 must stay inside the compiler's inspectable and registered subset.
 
+## Pure kernels and the iterative-method compiler
+
+ReactiveKernels has two halves, and they have different status.
+
+**Pure kernels** are where development is focused. This half is everything a
+stateless graph needs, from authoring to execution:
+
+- function-shaped `@kernel` specifications (`KernelSpec`) and pure
+   method-bearing kernel objects (`KernelObjectSpec`), including every
+   DistributionKernels family;
+- have→want planning and lowering: `plan`, `prepare`, `explain`, `code_expr`,
+   `compose`, `extract` and preparation-time partial evaluation;
+- plates and scans: `plate`, `scan`, `@plate`, `@scan`, `plate_cell`,
+   `plate_body`, `scan_body` and `replica`;
+- position batching with `vectorize` and `prepare_batched`;
+- differentiation: `prepare_ad` with its gradient, pullback, pushforward and
+   Hessian-vector entry points, and scalar and vector derivative rules;
+- `prepare_nonallocating`, and the owned primitives such as `rk_expm`,
+   `rk_cholesky_lower` and `rk_ode_bdf_tol`.
+
+ReactiveKernelsPPL is built entirely on this half. So are the reactive
+execution layers, `ReactiveState` and `prepare_reactive` with
+`CompiledReactiveState`: they run prepared pure kernels with
+provenance-aware invalidation and do not use the iterative-method compiler.
+
+**The iterative-method compiler** is the third pipeline listed above. It
+compiles stateful object kernels and free update methods (see [Two stateful
+authoring modes](#Two-stateful-authoring-modes)) into state machines. It is
+**frozen**: its tests stay green, but it takes no new features and no Reactant
+work until it is revisited. Its public entry points are:
+
+- `compile_stateful`, `stateful_compiler_bindings`, `functionalize_stateful`,
+   `stateful_snapshot`, `compile_state_transition`, `initial_transition_state`,
+   `validated_compiled_transition` and `stateful_control_bounds`, with their
+   result types;
+- effect ports and host-drained observations: `pure_callable_port`,
+   `effect_callable_port`, `effect_lowering_port`, `structured_state_port`,
+   `total_functional_lowering`, `initial_transition_effects`,
+   `transition_with_effects` and `drain_observations!`;
+- functionalized randomness: `rng_provider` and `OrderedRNGReplay`;
+- the experimental captured-program interface: `prepare_transpiled`,
+   `initial_transpiled_state` and `transpiled_endpoint`;
+- the token-preserving binder `partial` (`PartialFunction`).
+
+Its consumers are the NUTS and HMC compiler examples
+(`ReactiveKernelsNUTSExamples` and the [HMC transpiler](hmc-transpiler.md)
+page) and the compiled accumulators of `ReactiveKernelsStreamingStats`.
+
+The two halves share one front end. The `@kernel` mode discrimination, method
+extraction and endpoint templates in `src/kernel_stateful.jl` build pure kernel
+objects as well as stateful ones. No other pure source file, and nothing in
+ReactiveKernelsPPL or DistributionKernels, calls into the compiler's source
+files. A test keeps it that way:
+`packages/ReactiveKernelsPPL/test/test_pure_surface_boundary.jl` runs a pure
+workload in a fresh process: an `@rkppl` model with a native Reverse sampler,
+a DistributionKernels family object, a pure kernel object, `prepare`,
+`prepare_ad` and `vectorize`. It fails, naming the method, when the workload
+compiles any method of the compiler's source files. Its fixture,
+`pure_surface_census.jl`, lists those files.
+
+## Numerical metadata and its consumers
+
+OutputSignatures owns numerical transfer rules for compiler-visible calls.
+RK's internal `src/value_metadata.jl` adapter resolves callable identities and
+translates indexing, broadcast and literal-power syntax into metadata queries.
+It does not execute a helper, manufacture an example input, or ask Julia to
+infer an arbitrary helper body. Descriptors are ordinary data; graph contents,
+array lengths and literal exponents are not metadata type parameters.
+
+The first consumer is PPL's pointwise arithmetic emission. Its former
+`_PointwiseValue.rank` and `.length` rules have been removed: indexing,
+scalar/vector arithmetic, broadcast axes, `sum` and numeric `vcat` now obtain
+their numerical facts from OS. PPL still owns the separate fact that an
+expression reads a sampled value. Density roles, conditioning, observation
+domains and parameter layout remain PPL responsibilities. A scalar numerical
+result does not imply any of those roles.
+
+The second consumer is PPL's declaration and observation shape inference,
+`_value_axes` (`packages/ReactiveKernelsPPL/src/arrays.jl`). Its own broadcast,
+product, reduction, concatenation and adjoint rules have been removed; every
+numerical axis fact now comes from OS through the same adapter, which also
+reports a call's status and any sound partial facts. A literal size enters as a
+known extent and any other declared dimension (`levels(g)`, `axes(M, d)`) as a
+named `SymbolicAxis`, which comes back in its declared form. Bound data and a
+caller's values enter with their actual types; sampled values are `Float64`.
+Two PPL rules remain on top of the OS facts:
+
+- A broadcast keeps a declared axis that an operand carries, a level axis
+  first, so that a later level gather on the result stays possible.
+- A per-observation gather reads its bound index column as positions, whatever
+  the column's values (a level gather reads labels).
+
+Where OS proves a shape conflict, the shape is unavailable and Julia's own error
+appears when the value is computed. The exception is a declared axis sized from
+the value (`axes(M, d)`), which raises the `DimensionMismatch` at once. Where OS
+has no rule, the shape stays unknown: a whole reduction of an operand whose
+facts are unknown is not assumed to be a scalar.
+
+The pointwise adapter accepts a supported OS result only. Unknown or incompatible
+analysis retains the original Julia expression; it does not invent a scalar
+or copy an input's shape/type. A supported result is conditional on ordinary
+Julia execution succeeding, so bounds and broadcast compatibility checks must
+remain. A descriptor for an abstract vector is not permission to assume Base
+semantics for an arbitrary custom array. Literal `x .^ -1` is queried as
+`literal_pow`, preserving its distinction from `broadcast(^, x, -1)`.
+
+Further compiler changes should follow these rules:
+
+- Add numerical operation rules to OS, with independent Julia result checks;
+  keep source binding/normalization in RK and statistical meaning in PPL.
+- Preserve unknown facts and sampled dependence independently. Partial axes
+  alone do not authorize fusion of an unsupported callable.
+- Replace and delete one duplicated rule at a time. Each slice needs numerical,
+  observation-scope and ordinary-Reverse checks, plus separate construction,
+  preparation and first-call measurements on exact source/dependency pins.
+- Keep metadata as cold data structures and retain runtime loops over data.
+  Do not expand graph-wide compiler inference or encode observation lengths
+  in generated program structure to make an analysis appear precise.
+
+These consumers do not replace RK's general recipe typing or PPL's whole-model
+shape classifier. Scans, planner migration and a general opaque-call tracing
+protocol remain separate work. The next slice should name
+its numerical duplicate and acceptance examples before expanding the interface.
+The runnable [`benchmark/compiler_metadata_slice.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/compiler_metadata_slice.jl)
+shows the complete model, query/gradient interaction and separate timing stages;
+`test/test_value_metadata.jl` exercises the corresponding kernel directly.
+The [recorded comparison](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/results/compiler_metadata_slice_20261015.json)
+pins the isolated before/after trees and dependency versions. Both runs pass
+32 value/gradient checks. Emitted size is unchanged at 238/252 nodes for the
+two expression widths, at both 8 and 256 observations. These are single-run
+compiler-cost checks, not evidence of a speedup.
+
 ## API map
 
 ```@eval
@@ -41,13 +173,17 @@ PPL artifacts are external compilation examples and acceptance evidence, not
 domain APIs owned by ReactiveKernels. The NUTS runtime and domain surface live
 in the `ReactiveKernelsNUTSExamples` nested package; a bare `using ReactiveKernels` does not load or
 export them. See [What the NUTS proof does and does not
-establish](#what-the-nuts-proof-does-and-does-not-establish).
+establish](#What-the-NUTS-proof-does-and-does-not-establish).
 
 ## The stateless compiler
 
 ### 1. Graph construction
 
-A `Value` has a stable process-unique identity and a declared Julia value type.
+A `Value` has a stable identity and a declared Julia value type. The identity
+is the namespace that allocated the value plus a number within it. Every
+process, and every package image, allocates in a namespace of its own, so
+values from different images and from the running process never coincide, and
+a value that one image refers to from another keeps its identity after loading.
 Its name is only a diagnostic hint. Two values with the same name are distinct;
 generated local variables therefore never use a name as identity.
 
@@ -97,12 +233,21 @@ The planner then performs these steps:
    backward until reaching HAVE. This forms the candidate-recipe frontier.
    Effectful recipes are excluded.
 - **Exact subset search.** Search exact subsets of that frontier with branch-and-bound. A search state
-   contains selected recipes. Its available set is HAVE plus every selected
-   output; its unresolved frontier is the unsatisfied WANTS plus inputs of
-   selected recipes that are not yet available.
-- **Branching.** Pick the first unresolved value and branch over every candidate recipe that
-   can produce it. Non-negative costs allow pruning any branch already more
-   expensive than the incumbent.
+   contains selected recipes and excluded alternatives. HAVE plus every selected
+   output gives syntactic coverage; its unresolved frontier is the WANTS and
+   selected inputs outside that coverage. Coverage alone does not establish
+   executable availability.
+- **Groundability.** For a value with alternative producers, test forward
+   reachability from HAVE while withholding that value. A recipe whose only
+   non-HAVE output is that value cannot be its first producer if one of its
+   inputs remains unreachable. Such a recipe adds no value after another
+   producer has run, so discard it. Multi-output recipes that can supply other
+   non-HAVE values remain candidates.
+- **Branching.** Pick the first unresolved value and branch over every remaining
+   candidate recipe that can produce it. Non-negative costs allow pruning any
+   branch already more expensive than the incumbent. Each branch excludes the
+   alternatives explored before it, partitioning subsets instead of revisiting
+   them in different selection orders.
 - **Ranking.** Rank complete selections lexicographically by total declared cost and then
    by number of recipes. Recipe identifiers provide deterministic traversal
    order; the cost is an author-supplied planning weight, not a timing estimate.
@@ -110,16 +255,42 @@ The planner then performs these steps:
    execute it. Each ready recipe adds all of its outputs to the available set.
    This avoids inventing a cycle when overlapping multi-output recipes admit a
    valid order through a different producer.
+- **Grounding a stalled selection.** If outputs cover every obligation but
+   execution stalls, branch over external producers of any still-unavailable
+   WANT or selected input. A cycle can be grounded at different inputs, so
+   choosing only the first unavailable value would lose valid plans. Forward
+   reachability with every non-excluded candidate rules out a branch if even
+   those candidates cannot supply the stalled frontier.
 - **Recorded result.** Record the topological recipe order and one selected owner recipe for each
    produced canonical value. Collateral outputs from a non-owner recipe may be
    computed, but they never overwrite HAVE or an earlier selected owner.
 
-The result is exact for the implemented domain: a finite, acyclic graph with
-additive finite non-negative recipe costs. Search is exponential in the worst
-case and is intended for modest kernel graphs, not large-scale mathematical
-optimization. Cycles, impossible wants, and an effectful-only route fail with a
-`PlanningError`; impossible-query diagnostics report the missing producer
-frontier.
+Groundability pruning removes inverse routes that depend on their own result,
+without choosing a heuristic plan or executing any recipe body. Exact
+optimization with arbitrary shared alternatives can still require exponential
+search; topology and declared costs determine that work, rather than parameter
+or observation counts alone. The pass preserves authored plates, scans and
+scalar laws.
+
+The result minimizes total declared cost, then recipe count, over executable
+subsets of a finite graph with additive finite non-negative recipe costs.
+The graph may contain cycles. For example, with `x → a` at cost 1,
+`a → (a, b)` at cost 0 and `x → b` at cost 2, HAVE `x` / WANT `b` selects
+the first two recipes at cost 1. The independent producer of `a` grounds the
+self-output recipe. Without a grounding route, that recipe cannot execute.
+
+Completeness follows from the frontier obligations. An uncovered value needs
+a producer in any executable completion. At a cyclic stall, some additional
+recipe must produce a currently unavailable frontier value before all selected
+recipes can run. Branching over those producers retains every possible
+completion, partitioned by its first included alternative. The reachability
+check uses all non-excluded candidates and therefore cannot discard an
+executable completion. Every accepted subset still passes the full execution
+check; the greedy incumbent also passes that check before it can prune search.
+
+Search remains exponential in the worst case. An impossible query, including
+a cycle with no executable grounding or an effectful-only route, fails with a
+`PlanningError`; impossible-query diagnostics report the missing producer frontier.
 
 The planner does not do algebraic simplification, constant folding, common
 subexpression discovery from Julia code, shape inference, symbolic
@@ -158,12 +329,74 @@ collateral result to a discard local rather than changing the logical value.
 The generated function closes over no graph object and does not resolve
 operations through module globals.
 
-`RuntimeGeneratedFunctions` compiles the expression. The resulting
+`RuntimeGeneratedFunctions` compiles the expression. Lowering's scratch locals
+(plate axes and indices, scan carries, the renamed locals of a spliced embedded
+kernel) are alpha-renamed to canonical names before the expression reaches its
+content-addressed cache, so an unchanged plan lowers to one callable type:
+preparing the same graph shape again — including a `bound=` rebinding to data
+of the same types — reuses that type and compiles once per process rather than
+once per preparation. A program compiled while a package image is generated
+belongs to that image's cache instead, and an image records the generated
+function it made for each program under the identity the same expression has
+in ReactiveKernels' cache: its argument names and content id. Loading the image
+registers that record, so preparing an identical program afterwards returns the
+image's generated function and runs the code the image compiled for it, rather
+than compiling the program again in every process. The cache, not the callable,
+retains the expression:
+the callable is identified by its type alone, so a prepared callable holds no
+mutable `Expr` for Enzyme to prove read-only where its call is not inlined, as
+for a prepared lazy-arm child. The resulting
 `PreparedKernel` stores the compiled callable, its concrete operation tuple,
 and inspection metadata. Calling it performs no graph traversal, producer
 selection, topological sort, cache lookup, or dynamic scheduling. Julia still
 specializes and executes the recipe callables normally; their own dispatch,
 allocations, exceptions, and side effects are not erased by the graph compiler.
+
+Fresh authored definitions retain distinct provenance even when their source is
+identical. At prepared-kernel assembly, execution uses the existing generated
+source companion and its concrete lexical captures. The execution copy carries
+no definition token: the original operations, with their tokens, remain in the
+plan, source recipes and `lowered_recipes`. This lets identical fresh builds
+reuse operation and derivative types without merging their graph identities or
+caching bound data. The execution copy holds no provenance value either, so a
+capture-free operation table stays free of heap references that Enzyme would
+otherwise have to prove read-only in the differentiated callable. Bodies with
+local functions, generators, exception scopes, or boxed lexical cells retain
+Julia's native closure path. A companion compiled while a package image is
+built, before the image's generated method is visible, is wrapped for a
+latest-world call. Once that method is visible, as in every process that loads
+the image, the execution copy holds the generated function itself, so a graph
+defined in a package image runs its cells as one built at run time does.
+Before then, preparation keeps the guarded closure, whose method query selects
+the native closure after loading. Private generated
+names in the derivative operand pack are canonicalized in that actual pack;
+the operands and their positional reads are unchanged. Construction, planning,
+and preparation still perform work, so reusing a build remains useful.
+Colliding local names receive suffixes from their stable plan order, rather
+than fresh graph IDs, so repeated child composition can also reuse code.
+
+One rewrite reaches into those callables. Natively, a generator fold over a
+data-length iterator, `sum(term for i in iter [if condition]; init = x)` with
+`iter` an `eachindex`, `axes`, `range` or `a:b` call, runs as its
+explicit-accumulator loop in every recipe, plate cell, scan step and
+`@traceable` method body. A call head resolved to its binding, as `@rkppl`
+lowering emits `1:P` (a `GlobalRef` to Base's `:` in the model module), is the
+same iterator. Base evaluates `sum` with `init` as the left fold
+`foldl(add_sum, …; init)` on Julia 1.10 through 1.13, so the loop returns
+Base's value bitwise, in Base's order: the iterator, then `init`, then the
+condition and the term for each element. The rewrite exists for Julia 1.10's
+inference. When a Base fold is inferred inside another fold's term (a nested
+sum, or a sum in a helper that the term calls), it re-enters `mapfoldl` with a
+larger signature, inference widens that call to `Any`, and every element then
+dispatches dynamically and boxes. A 4 × 4 nested sum allocates 10 times (about
+300 B) per call, and a 14-step scan whose step evaluates one allocates 4,256 B
+beside its 176 B result vector. Julia 1.12 infers the same nest concretely. Some folds keep the
+authored call: one whose term or condition assigns, declares, returns, jumps,
+loops or holds a macro call, one without `init`, one over another iterator (a
+tuple's fold is Base's unrolled one), and one whose `sum` is not Base's. A
+plain helper's own nested sum also keeps it, because RK never sees that body:
+define the helper with `@traceable`, or write it with loops. The tensorized
+companion keeps its own lowering of the same folds.
 
 `transform` applies user-supplied expression passes between lowering and
 compilation. The compiler preserves pass order but cannot prove that a pass
@@ -174,6 +407,127 @@ trusted compilation boundary.
 HAVE/WANT signatures, and pass identities. Mutating a graph increments its
 version, so a cache entry for the old graph cannot be returned. Cache lookup is
 preparation-time work only.
+
+### Visible throw policy
+
+`prepare(spec; on_error = :ignore)` opts into a source transform that replaces
+visible `throw(...)` sites with `nothing`, including the throws in expanded
+`@assert`s. The default `on_error = nothing` retains normal throwing behavior.
+The same option is available for graphs, plans and `prepare!`; caches keep
+the two policies separate. Bound-data mathematics uses the selected policy
+before its first evaluation.
+
+The transform sees captured `@kernel` source and the bodies of `@traceable`
+helpers. It keeps the original methods and selects separate stripped bodies
+only for an opted-in prepared call. Ordinary opaque function bodies stay
+opaque and their errors remain errors. It preserves unrelated lazy branches
+and retained loops, and does not evaluate a removed throw's message arguments.
+
+This first policy simply continues execution after a removed throw. It does
+not map failure to a fallback value, provide exception recovery, or make
+invalid mathematical inputs valid. Further policies are not implemented yet.
+
+### Concretely typed programs
+
+RK tries to prepare programs in which every value infers a concrete type.
+When one value is not concretely typed, every recipe and plate cell that reads
+it dispatches dynamically on each evaluation, and native reverse-mode AD can
+refuse the program after a long derivative compilation.
+
+RK's own lowering is held to this by a gate test, `test/test_type_stability.jl`.
+Its corpus covers plates, nested and chained plates, scans, embedded kernels
+and endpoints, design matrices, concatenation and bound data, all with
+concretely typed client code. For each kernel the test infers the prepared
+native body and the prepared gradient call for concrete arguments, follows
+every statically invoked RK callee, and requires that no used value is
+non-concrete and that no call is dispatched at run time, outside paths that
+only throw. A small union of concrete types, such as the `Union{Nothing,Tuple}`
+of Julia's iteration protocol, is accepted. A kernel calling a function whose
+result is uninferred is the test's negative control.
+
+An RK-introduced residue that cannot be removed would be exempted with its
+reason in `src/type_stability_audit.jl` (`_CODE_FINDINGS_JUSTIFIED`); none is
+exempt.
+
+Client code is checked when it is prepared, with the same audit.
+`prepare` checks from the declared types of the HAVE ports where they are
+concrete and from bound data; `prepare_ad`, and so `prepare_sampler`, checks
+from the exemplar arguments and audits the callable its backend
+differentiates. How far the check reaches is `type_stability_level`:
+
+| level | checks |
+|---|---|
+| `:values` | every value of the program: a recipe whose inputs are concretely typed but whose result Julia does not infer concretely (`Any`, an abstract type, a `Union`, or an array of such elements) is reported, naming the value and its recipe. Values computed from such a value, or from a HAVE port whose type is not known, are not reported again. |
+| `:rk` | also the code of the prepared program: the body ReactiveKernels generates and the functions of ReactiveKernels' packages it calls. A used value Julia does not infer concretely, or a call dispatched at run time, is reported with its method. Every other function is a leaf: its call must dispatch statically and return a concrete type. |
+| `:all` (default) | also every function that code calls, a client helper's body included, except Julia's own Base, Core and standard libraries, which stay leaves. |
+
+So at `:all`, a helper that dispatches at run time but asserts its result
+(`f(x) = (g(x))::Float64` over an uninferred `g`) is reported, and so is a
+declared local (`mu::Vector{Float64} = f(x)`) over a helper whose result is
+not inferred; at `:values` neither is.
+
+`type_stability` is what preparation does with a finding. By default (`:warn`)
+it logs a warning once per process and succeeds, so the primal of such a
+kernel keeps working. `:error` refuses the program: every preparation throws a
+`TypeInstabilityError` listing each finding. Both settings are keywords of
+`prepare`, `prepare!` and the `prepare_ad*` functions, which take precedence
+for one call and the preparations nested in it, and ReactiveKernels
+preferences of the same name, which a project sets once:
+
+```julia
+using Preferences, ReactiveKernels
+Preferences.set_preferences!(ReactiveKernels, "type_stability" => "error")
+Preferences.set_preferences!(ReactiveKernels, "type_stability_level" => "rk")
+```
+
+This writes `[ReactiveKernels] type_stability = "error"` (and the level) to the
+project's `LocalPreferences.toml`. Every preparation in that project then
+follows it, including preparations that other packages make for it (RKPPL's
+`prepare_sampler`), its tests (`Pkg.test` copies the preferences), scripts and
+precompile workloads. The preferences are read at the first preparation of a
+Julia session; a new session picks up a change without recompiling anything.
+Cached preparations are kept per setting, so a kernel prepared under `:warn`
+or a lower level is never returned to a stricter call.
+
+When an abstract HAVE declaration hides a concrete input type needed to infer
+an authored plate's rank, `prepare(...; exemplars = (x, ...))` opts the native
+lowering into type evidence from one exemplar per remaining positional HAVE
+port. Calls with different input types are refused; prepare again for those
+types. No exemplar length or value is baked into the loop. RKPPL's
+`prepare_sampler` uses the converted `Vector{Float64}` exemplar by default,
+and its public calls convert other real vectors to that type. Tensorized
+lowering retains the declared input types. A graph prepared with exemplars
+compiles afresh rather than reusing its bound-preparation cache.
+The authored `AbstractVector{Float64}` boundary remains broad; for example,
+a coefficient slice can be a concrete `SubArray` view. Native plate inference
+uses that concrete inferred subtype when available and keeps the declaration
+when inference is weaker.
+
+```julia
+uninferred_curve(t, a) = Base.inferencebarrier(t .* exp(a))
+
+@kernel location(a::Float64, s::Float64, t::Vector{Float64},
+                 y::Vector{Float64}) = begin
+    mu = uninferred_curve(t, a)
+    pointwise = plate(y, mu) do yi, mi
+        -0.5 * ((yi - mi) / s)^2 - log(s)
+    end
+    total::Float64 = sum(pointwise)
+end
+
+prepare(location)
+# ┌ Warning: ReactiveKernels: `mu` is not concretely typed. Its recipe
+# │ `mu = uninferred_curve(t, a)` infers `Any` from input types
+# │ (Vector{Float64}, Float64). …
+```
+
+The remedy is in the client function: make its result inferable, or assert it
+inside the function (`f(x) = (...)::Vector{Float64}`). In a kernel that
+contains a plate, a scan or an embedded kernel, a concrete declaration on the
+assignment (`mu::Vector{Float64} = uninferred_curve(t, a)`) also asserts the
+value, because those kernels declare their typed locals. Each warning is
+issued once per process. It is logged in the group `:type_stability`, so a
+logger can filter it.
 
 ### Preparation-time partial evaluation
 
@@ -196,14 +550,228 @@ path performs no graph traversal or data-only recomputation.
 
 Binding freezes values for that preparation; changing or mutating the data is
 not an invalidation signal. Rebind by preparing again from the original graph
-or plan. The pass does not symbolically inspect recipe bodies, rewrite
-mathematics, or mutate the shared graph. The default `bound = ()`/`bound = (;)`
-path is unchanged.
+or plan. The pass does not rewrite mathematics or mutate the shared graph; it
+splits a recipe only along the structure its author wrote (see
+[Data-only subexpressions](#Data-only-subexpressions)). The default
+`bound = ()`/`bound = (;)` path is unchanged.
 
 The same named `bound` contract is available on `prepare_nonallocating`, whose
 lowering rewrites only the residual work. Optional downstream preparation
 surfaces consume that same residual plan rather than implementing another
 partial evaluator.
+
+#### Rebinding
+
+Most of what a bound preparation does is independent of the bound values:
+planning, the prefix's lowering and compilation, and the residual's lowering
+and compilation. When one graph is bound again and again with fresh data — a
+request-time binding per user interaction — that fixed cost can exceed the
+bound-data mathematics itself. So `prepare(spec; have, want, bound)` (and the
+`Graph` form) keeps that value-independent work per graph version, boundary,
+bound port set and passes: the plan, the prepared prefix kernel, and the
+compiled residual. A later binding of new values to the same ports runs the
+prefix on those values and returns the residual kernel around the same
+compiled callable with a fresh constant table; only what is recomputed per
+binding changes. The entry is keyed on the bound ports, not on the bound
+values or their types: a later binding of differently typed data on the same
+ports (a different plan struct, an integer vector for a float one) reuses the
+entry, and its generic compiled bodies specialize per concrete type on first
+use as any Julia call does; a lazy branch on a hoisted constant remains a
+per-call branch and follows each binding's value.
+
+The graph holds these entries itself, so they live exactly as long as the
+graph: a graph authored as a module constant keeps them for the process, a
+graph built per request drops them with it, and a mutation of the graph starts
+afresh. A binding made while a package image is produced — a module-level
+`const K = prepare(graph; bound = …)` or a precompile workload — is kept in
+that image, so the first binding after loading it compiles nothing. Passes
+that are not singletons (closures) are not retained: such a binding is prepared
+afresh, like a `Plan`, which is always prepared afresh.
+
+`prepare!(cache, spec; have, want, bound)` does the same through a
+caller-owned `PreparationCache`, for a caller who wants the entries' lifetime
+decoupled from the graph's (dropped with the cache, or shared across graphs).
+
+Position batching of a rebound kernel is reused the same way. `vectorize`
+lowers and compiles position drivers for the whole graph: the owning driver,
+and with `reuse = true` or a `NativeScheduling` the borrowed driver, the
+shared prefix and the per-worker residual. For a kernel rebound from a cached
+residual, the first `vectorize` keeps those drivers per batched ports,
+`reuse`, scheduling and operation-table type, without the binding's
+constants. A later binding's `vectorize` with the same key rebuilds them
+around its own constants, without lowering or compiling, so binding and
+vectorizing again costs what the rebinding `prepare` costs. Each call still
+returns an independent instance with its own buffers, and the kept drivers
+retain no binding's values. A residual specialized per binding (below) is
+vectorized afresh for each binding. (Before, every `vectorize` of a rebound
+kernel lowered and compiled the graph again: 52–68 ms and 26–30 MB per
+binding on a 12-port synthetic composed graph whose rebinding `prepare` took
+0.3 ms. On a large composed simulation graph whose plates the inner-plate
+pass rewrites, binding a design and vectorizing its reader took 490–520 ms
+and 170 MB, 400–440 ms of it in `vectorize`; it now takes 4.5–4.9 ms and
+5–6 MB, with `vectorize` at 0.3–0.5 ms. Snag `rebinding-a-comp-d03576ab`.)
+
+For a residual containing authored plates the inner-plate pass below runs on
+every binding (it declines before evaluating anything when a plate has
+nothing bound to specialize). A plate it rewrites to read bound-only cell
+values cached at preparation follows from the pass's caching decisions, not
+from the cached values, so the entry keeps that rewrite: a later binding that
+decides alike has the same residual up to its cached values and shares the
+compiled residual, as a binding the pass leaves alone does. A plate the pass
+partitions by a data-bound branch, or replaces by a bind-time value, bakes
+that binding's structure in: such a binding is still specialized and compiled
+per binding and reuses only the plan and prefix. (Before, every binding the
+pass rewrote was prepared, lowered and compiled afresh: 63–88 ms per design
+on the composed simulation graph above, now 1.6–4.1 ms.) Every other binding shares
+the compiled residual of its class and plate rewrites, whatever the bound
+values' element types or array lengths: an inline plate over a bound domain
+rebinds to a new domain length at the cost of the prefix, exactly as the same
+plate in a separately prepared child does. A plate that reads a bound
+argument lowers for that argument's class — scalar, vector or range, rank-N
+array, or tuple — as a port declaring that class would, even when the port is untyped: a bound
+`1:n` domain has no runtime axis guard or per-coordinate bookkeeping, and a
+recipe that reads only a bound scalar runs once above the loop. So each class
+has its own compiled residual; a rank-0 array or any other bound value keeps
+the undeclared port's runtime guard.
+(Before, such a residual was templated per bound-value type and array-shape
+signature, so each new bound array length lowered the residual again and kept
+another template: 2.6 ms and 1.16 MB more per new schedule length on the
+ShinyRK simulation graph, and about 43 kB retained per length.) The entries
+never observe bound values after preparation
+and keep none of them: a template holds the compiled callable and the
+value-independent tail of the operation table, not the kernel of the binding it
+was built from. Binding freshness remains the caller's responsibility as for
+`prepare`.
+
+Rebinding itself is not specialized on the graph's kernel types. Its code is
+compiled once, for every graph, into the ReactiveKernels package image, so the
+first rebinding of a graph in a process compiles nothing and costs what any
+later one does. (Before, the first rebinding of each graph in a process
+compiled the rebinding path for that graph's prefix and residual kernel types:
+290 ms and 40 MB for the ShinyRK simulation graph, whose steady-state
+rebinding costs about 1 ms. Later, while that untyped path was compiled only
+incidentally with the first binding, a change to its arguments moved its
+compilation back to the first rebinding in each process: about 40 ms and
+0.55 MB on the same graph.)
+
+#### Data-bound branches in plate cells
+
+A plate cell statement whose right-hand side is a lazy branch (`c ? a : b`,
+`if`/`elseif`/`else`, `a && b`, `a || b`) is split during preparation when its
+condition reads only bound data. The condition may read a bound plate argument,
+or a bound-only cell value that the pass has already evaluated per lane.
+
+1. The condition is evaluated once per lane, and the lanes are grouped by
+   outcome.
+2. The plate becomes one plate per taken arm, each over that arm's lanes.
+3. The plate's arguments follow the arm's lanes:
+   - bound arguments are gathered during preparation;
+   - live arguments are gathered at run time by constant lane indices; native
+     execution reads an array argument's lanes through a view of it rather
+     than a copy;
+   - a singleton or scalar argument broadcasts over the lanes.
+4. A nested arm is split again over its own lanes only, so an inner condition
+   is never evaluated for a lane that does not reach it.
+5. The results are combined:
+   - a sole `sum(pointwise)` consumer becomes a sum of the arm sums;
+   - any other use of the pointwise vector reassembles it in lane order with
+     one gather. Like the lane indices, its constant lane order is a bound
+     operand rather than data held by the operation, so a backend receives it
+     as an inactive array. The arm vectors are concatenated as the native
+     kernel body concatenates (see the [core constraints](constraints.md)),
+     so an arm that reads no live value, such as a constant fallback, can sit
+     beside a live arm under native reverse.
+
+A lane-invariant condition selects its arm without splitting.
+
+An arm with its own graph (a plain arm expression, authored as a cell of its
+own as described below) becomes that graph's recipes in its plate, as in the
+native shared-condition lowering. Its work over shared plate arguments
+therefore runs once per call, above the lane loop, and only when some lane
+takes the arm. An arm without a graph, or one reading no lane value, runs as
+its closure on each of its lanes.
+
+The prepared program contains no branch for that condition, so no backend
+receives one:
+
+- every lane evaluates exactly the arm it takes;
+- gathers inside an arm are in bounds by construction;
+- Reactant reverse mode compiles at every lane count, so the batched
+  lazy-branch limitation in the [core constraints](constraints.md) does not
+  arise.
+
+An empty bound domain has no lanes to group. It runs no cell and evaluates no
+condition. Its result is empty, with the element type inferred from the
+authored native cell, as in Julia's empty broadcast. Reactant compiles it
+without reading the zero-length operand.
+
+The number of arm plates is bounded by the cell's branch structure, never by
+the data. A condition that reads a live value stays an ordinary lazy branch.
+This includes the shape of a live array, such as `length(c)` of a runtime
+input. Only one-dimensional plate domains are split.
+
+An arm may contain a constructed object endpoint, such as
+`normal(lpi, 1.5).logpdf(yf)` under a missingness guard. The endpoint's
+recipes are rendered as source inside the arm, so each arm plate evaluates its
+own endpoint copy and no backend receives the branch.
+
+Without a binding, the cell runs its authored lazy branch unchanged.
+
+#### Data-only subexpressions
+
+A recipe that reads bound data and a live value runs whole on every call, and
+in a plate cell, in every cell. Authoring therefore records, beside each
+recipe's ordinary body, the strict subexpressions that some binding could make
+data-only while the expression around them is not: calls, field reads and
+indexing that read fewer of the recipe's arguments than the subexpression
+enclosing them, and that call more than cheap arithmetic (comparison,
+`+`/`-`/`*`/`/`, `min`/`max`/`abs`, conversions and literal integer powers).
+Under `bound=`, each maximal one whose arguments are all bound becomes a recipe
+of its own. At top level it joins the data-only prefix and runs once per
+binding; in a plate cell it is cached per lane like any bound-only cell value.
+The rest of the recipe reads its value.
+
+```julia
+@kernel binomial_loglik(logit, y, n) = begin
+    pointwise = plate(y, n, logit) do yi, ni, li
+        loggamma(ni + 1.0) - loggamma(yi + 1.0) - loggamma(ni - yi + 1.0) +
+            yi * li - ni * log1pexp(li)
+    end
+    total::Float64 = sum(pointwise)
+end
+```
+
+With `bound = (; y, n)` the log binomial coefficient is one cached value per
+lane. Each cell computes only `yi * li - ni * log1pexp(li)` and adds it. With
+`y` alone bound, `loggamma(yi + 1.0)` is the cached value instead.
+
+- Only strict positions are entered: call and broadcast arguments, field reads,
+  indexing and tuple elements. Branch arms, short-circuit operands,
+  generators, closures and macro calls keep their own evaluation, although
+  the whole call that holds one can be a cached node. A dotted call is cached
+  only whole, which keeps Base's broadcast fusion.
+- A data-bound branch arm is split after the plate partitions its lanes, so
+  each lane caches only what its own arm computes.
+- An arm of a branch whose condition reads a live value — a validity check
+  such as `(y >= 0) & (phi > 0)` around a count likelihood — runs only where
+  the condition holds on that call. Its data-only nodes are computed for every
+  lane at preparation all the same; the branch stays lazy, and the arm reads
+  the cached value where it is taken. A node whose computation throws on any
+  lane stays in its arm, so preparation never raises an error the original
+  program would not.
+- The same split applies to sequential bindings and constructed endpoints in
+  those arms. Their retained arm graphs supply the dependencies of local
+  bindings, including live locals inside an inline `let`. Preparation caches
+  the pure data-only prefix and keeps the selected residual plan beneath its
+  original guards. A speculative value that cannot cross the cache boundary
+  also stays inside its arm. This includes RKPPL's parameter-support guards
+  around distribution endpoints, without rewriting individual families.
+- The parts apply the authored operations to the same operands in the same
+  order, so values and derivatives are unchanged; nothing is reassociated or
+  simplified.
+
+`code_expr` contains a cached part as `bound_plate_<name>` in a cell, or as a
+hoisted constant at top level, and the remaining recipe reading it by name.
 
 ### 5. Composition
 
@@ -225,6 +793,14 @@ name collisions and leaves no residual runtime call: planning, CSE, lowering,
 reactive preparation, visualization, and batching all operate on the one
 fused graph.
 
+Computed arguments and a single-output child used inside a larger expression
+compose through named, aliased, qualified (at any depth, `Pkg.Sub.child`) and
+`GlobalRef` bindings. A builder
+that authors such a graph with `Core.eval` can immediately prepare and call it
+from its existing world; callers need no `invokelatest` barrier. Computed scalar
+compositions also retain ordinary Enzyme reverse from that builder. Lexical
+captures stay live and lazy arms evaluate only the selected branch.
+
 ## Batch and replica lowering
 
 ### Plate: fuse a scalar density across observations
@@ -238,8 +814,10 @@ recipes are excluded by the planner and cannot form a plate plan.
 
 Plated HAVE values follow Julia broadcasting. Compatible dimensions zip,
 singleton dimensions expand, scalars repeat, and `Ref(value)` makes an
-array-valued input atomic. The complete broadcast shape is instantiated before
-any recipe executes or output is mutated.
+array-valued input atomic. An authored `plate(...) do` cell shares a value
+across cells by closing over it, never through a `Ref` argument
+([Plate-cell scope](batched.md#Plate-cell-scope)). The complete broadcast shape
+is instantiated before any recipe executes or output is mutated.
 
 Lowering propagates each selected recipe's transitive plated HAVE dependencies.
 Native Cartesian traversal recomputes a recipe only when a broadcast dimension
@@ -247,7 +825,60 @@ kept by one of those roots changes. This is the dynamic equivalent of placing
 the recipe at its narrowest valid nested-loop boundary: work depending only on
 an outer scale dimension runs once per scale coordinate, with its last scalar
 result reused through inner dimensions and no axis-sized cache. Recipes with no
-plated dependency are emitted once above the traversal. The per-element WANT is
+plated dependency are emitted once above the traversal.
+
+An authored cell is split into recipes before planning. Besides its
+statements, each maximal subexpression that reads only shared values (closure
+captures, `Ref` operands, plate arguments whose port is annotated with a
+`Number` type, and cell locals computed from them) becomes a recipe of its own.
+In `f(t, exp(log_k))`, `exp(log_k)` therefore runs once, above the traversal,
+exactly as in `k = exp(log_k); f(t, k)`. Such an annotated argument stays a
+zipped operand; its split-off recipe runs once because a number has no plate
+dimension. An unannotated plate argument is not known to be a number when the
+cell is split: annotate its port, or name the value as a cell local, which the
+traversal runs once when the argument is a number. Only positions that Julia
+evaluates whenever the cell runs are split: call and broadcast arguments, field
+reads, indexing and tuple elements. A branch arm, loop, generator term,
+closure or macro call keeps its own evaluation, as do the arguments of a
+mutating (`!`) call and an index expression reading `end`. Like a named
+invariant, a split-off one runs once per call even when the plate has no
+cells. A `scan` step is not split: its native lowering evaluates every step
+statement at every step, named or not.
+
+A cell statement whose right-hand side is a lazy branch keeps each arm's own
+evaluation, but a branch whose condition reads only shared values (closure
+captures, `Ref` operands and `Number` plate arguments, including scalar results
+inferred from unannotated caller recipes) takes the same arm at
+every cell. The native lowering decides such a condition once per call, above
+the traversal, and then runs the cells of the taken arm alone. Each plain arm
+expression is also authored as a cell of its own, so its shared work is
+lifted like any other invariant: the support guard
+`sigma > 0 ? normal(mu, sigma).logpdf(y) : -Inf` computes `log(sigma)` once
+per call, and only when `sigma > 0`. An empty domain evaluates neither the
+condition nor an arm. A condition that reads the cell, including a combined
+one such as `s > 0 && x > 0`, keeps its branch in every cell. An arm with
+shared work is inlined into the cell loop, and that work runs at the first
+cell that takes the arm and is reused by the later ones: an arm no cell takes
+evaluates nothing, and a shared value that throws does so at the same cell as
+before. An arm without shared work keeps its own evaluation. Constructed
+endpoints spliced into a plate cell get the same treatment: their authored
+branch-arm recipes are exposed to the plate lowering, so `loggamma(shape)` in
+a Gamma density or `log1p(-zi)` in a zero-inflated count density runs once at
+the first lane that takes its arm when its input is shared. Local bindings
+inside an arm remain separate recipes. The graph keeps the authored branch;
+the tensorized body decides a shared condition in its own batch dispatch.
+
+A cell may return a tuple of its locals, `(m, s, d)`, that other plates read
+entry by entry (`c[2]`). Each query then runs only the cell statements of the
+entries its plan reads: an unread entry takes the value of a read one, so the
+cell keeps its arity and its readers are unchanged, and statements that only
+unread entries need leave the cell. A query of that entry still computes it,
+and a reader that takes the tuple other than by a literal entry (`first(c)`, a
+`Ref(cell)` operand) keeps every entry. RKPPL's shared `@plate` cells are such
+plates, so a per-index value that no density reads costs the sampler and its
+gradient nothing, and adds none of its AD requirements to them.
+
+The per-element WANT is
 either accumulated with a reducer (sum by default) or collected in the one
 requested broadcast-shaped output.
 
@@ -260,7 +891,10 @@ loop.
 The current plate domain is deliberately narrow:
 
 - at least one non-`Ref` HAVE value must instantiate a broadcast axis;
-- every selected recipe must have exactly one output;
+- every recipe the cell lowers has exactly one output: a destructuring
+  `(a, b) = f(x)` in the cell, or in a kernel the cell calls, is planned as one
+  recipe with several outputs and then lowered as one recipe computing `f(x)`
+  plus one element read per name, as Julia's `Base.indexed_iterate` binds it;
 - there must be exactly one scalar WANT, and it must transitively depend on a
   batched port;
 - the native dependency scheduler assumes the scalar recipe contract is pure;
@@ -271,6 +905,164 @@ The current plate domain is deliberately narrow:
 This is dependency-stratified map-plus-reduce/collect. It is not a general scan,
 fold with loop-carried state, segmented reduction, parallel reduction,
 associative tree reduction, or an effect-ordering construct.
+
+### Nested observation plates
+
+An authored plate cell can contain another authored plate. Native lowering
+retains each axis as a runtime loop and fuses a selected `sum` into its plate;
+a total-only reader needs no intermediate pointwise arrays. A plate read only
+by `LogExpFunctions.logsumexp` streams the same way, folding each cell into the
+running log-sum-exp with `logaddexp` from `-Inf`, the empty plate's value. Ragged groups,
+empty groups, and array views use the same graph and generated loop structure.
+A cell reads an enclosing value whole, as a Julia closure does: the observation
+cells below read the kernel's `scale` directly, with no `Ref` argument.
+
+The example below keeps the complete normalized scalar Normal law visible in
+the inner graph. Its source is shared with native acceptance; the documentation
+build executes it and renders that reader's generated kernel and compute DAG.
+
+```@eval
+Main.ReactiveKernelsDocs.render_nested_plate_example(@__MODULE__)
+```
+
+`plate_body` exposes the nested scalar plans, and `recipe_inventory` lists a
+program's plates and scans recursively (see [Inspecting
+structure](#Inspecting-structure)). `prepare` supports bound group
+data with a live scalar scale, and `prepare_ad` with ordinary native Enzyme
+Reverse differentiates the scale through both loops. No custom derivative
+rule is required. The native acceptance suite also replays the displayed
+authoring source in a fresh module without its producer's operation table.
+
+Compiled nested plate regions are not implemented yet: traced execution reports
+that capability gap explicitly. In native execution, a cell containing another
+plate computes work that reads only shared values (captured or `Ref` arrays,
+scalars, and values computed from them alone) once before its outer loop. The
+cell reads those results whole; the rest of its graph, including inner loops,
+runs per outer coordinate.
+
+Work that varies per outer coordinate cannot move out of the loop. When such a
+cell computes an `hcat` or a broadcast whose only readers index it or query
+its shape, including readers in an embedded kernel's nested plates, native
+lowering reads its entries through those readers instead of storing it per
+cell. A value computed before the loop and read only that way in its cells is
+composed the same way. For example, `present = p .* offsets[event]` followed by
+`components = hcat(present, absent)` builds neither array per event. The graph
+and its queries keep both authored values, and ordinary Enzyme Reverse
+differentiates the composed reads without a derivative rule. Shape checks and
+declarations still run at the authored statement, and scalar reads keep bounds
+checks. A reader that indexes the value with an integer vector, a range, a
+colon or a mask computes the entries it selects into a fresh array of Julia's
+result shape, so a group cell's `x[rows[g]]` computes that group's rows only.
+Before ReactiveKernels 0.1.4, such a read computed the whole value at every
+read, once per group. The composition covers dense `Float32`/`Float64` arrays and real
+scalars, `hcat` of vectors and matrices, and one-dimensional broadcasts of
+total arithmetic (`+ - * /`, `exp`, `abs`, `abs2`, `logistic`, `log1pexp`,
+`identity`). Other values,
+whole-array readers, custom storage, broadcasts that may throw (such as `log.`)
+and effectful regions keep their stored arrays. A higher-rank broadcast is also
+stored: on Julia 1.10, ordinary Enzyme Reverse of composed matrix-broadcast
+reads fails with an internal error in Enzyme 0.13.216
+([EnzymeAD/Enzyme.jl#3822](https://github.com/EnzymeAD/Enzyme.jl/issues/3822)).
+`test/test_cell_arrays.jl` covers these cases and the event-count-independent
+allocations.
+
+An empty native plate evaluates no cell work, including shared expressions.
+For inferable cells, pointwise readers still return a concretely typed empty
+array; total readers return the reduction identity. This applies separately at each nesting level:
+an expression written in an outer cell runs when that cell is visited, even if
+its inner plate is empty; an expression written inside the inner cell runs only
+when the inner domain has cells. Expressions authored outside a plate retain
+their ordinary evaluation. Nonempty plates retain once-per-call shared work,
+and visited cells retain ordinary bounds and domain errors.
+
+### One cell of a plate
+
+`plate_cell(spec, :pointwise; index = :i)` returns a kernel whose value
+`pointwise_cell` is ONE cell of the authored plate producing `pointwise`, at the
+position held by the new HAVE port `i` (a linear position or a
+`CartesianIndex`). The cell runs the plate's own scalar body over the one-cell
+slices of the plate's arguments, through the same native plate lowering, so it
+equals the plate's element at that position and differentiates with ordinary
+native Enzyme Reverse. A plate whose only consumer is this one composes into
+the cell, as plate chains compose, and runs at that cell only. So does a plate
+read only by cells at one position (several `plate_cell` values sharing an
+index port): each of those cells runs it at that position. A position
+outside the domain throws `BoundsError`. Several plates can share one index
+port by passing the same `index` to successive `plate_cell` calls.
+
+A whole array the cell captures and reads only at its own position, `v[i]`
+with `i` an integer element of a batched argument, is computed at that row
+only when its producer computes it row by row. So is one the cell reads at
+several rows: `v[r]` with `r` an integer-vector element of a batched argument,
+or `v[rows[k]]` through a shared index array `rows` (one integer vector per
+cell, as a total over a group of rows reads them). The native lowering
+supports these producers:
+
+- a dotted expression of inputs, numeric literals, gathers `A[I]` or
+  `A[I, k]` (an integer vector input `I`, integer literals `k`), column reads
+  `A[:, k]`, products `A * w` of two inputs, and literal-position reads `a[1]`
+  of an array of numbers (read whole, as in `z .* tau[1]`);
+- such a gather alone, and such a column read alone;
+- `hcat(a, b, ...)` of inputs, such as a design matrix with a computed column;
+- a product `A * W` whose left factor is an array input, a column read or an
+  `hcat` (row `r` is `A[r:r, :] * W`). A product of two operands whose right
+  operand is an array or a number, such as `X * beta`, can be read like any
+  other value; other products only by gathers `R[g, k]`, since their full
+  shape is not known before they run;
+- an authored plate. Row `r` of its value is the plate over row `r` of each
+  batched argument, so the cell runs that plate's body at row `r` only. A
+  shared array the plate reads only at its own position, `u[j]` with `j` an
+  integer element of one of its batched arguments, is in turn computed at that
+  row by these rules. So a later plate reading `pred[i]` from
+  `pred = plate(rows) do r; f(log_k[r]) end` computes `pred` and `log_k` at
+  row `i` only.
+
+The producer's own operation runs on views of its row-aligned operands at the
+rows read; an operand that broadcasting extrudes is passed whole, or repeated
+at several rows. A value it gathers from is computed at the gathered rows by
+the same rule. So for `R = Z * F'` and `log_k = a .+ b .* w .+ R[g, 1]` read
+as `log_k[i]`, the cell computes `log_k` at `i` and `R` at row `g[i]`, at a
+cost that does not grow with the domain; a population term `pop = X * beta`
+in `log_k = pop .+ …` is computed at row `i` the same way, also when
+`X = hcat(one, c, year)` has a computed column `c`. A stratified group effect
+written by a per-row plate as one matrix column and read back as `b[:, 1]`,
+and a group block `z .* tau[1]` gathered as `b[g, 1]`, are computed at the
+rows read. A value is computed at rows only when every reader reads it this
+way. A value read whole anywhere, wanted, or produced any other way (including
+through an opaque function call) is computed whole as before.
+
+The full broadcast shape of each such expression, and the full shape of each
+`hcat`, is still checked from its operands' axes (`DimensionMismatch`), and the
+cell's own reads and the factor rows are bounds-checked. An error that only
+another row would raise, such as an out-of-range gather index at another
+position, is not raised, just as the cell does not run other cells. The
+tensorized lowering computes these values whole.
+
+Native Enzyme Reverse through an `hcat` read at several rows of a cell fails
+with `IllegalTypeAnalysisException` in Base's `_typed_hcat`: those rows are
+views, and Enzyme rejects Base `hcat` of views beside dense arrays (Enzyme snag
+`native-reverse-t-6d51cae6`). Values are exact; the gradient waits on that
+Enzyme fix (`test_plate_cell.jl` pins it broken).
+
+### Inspecting structure
+
+`recipe_kind(recipe)` classifies a recipe as `:plate`, `:scan` or `:ordinary`
+without throwing; `plate_body(recipe)` and `scan_body(recipe)` return the body
+plan of a plate or scan. `recipe_inventory` walks a `KernelSpec` (its graph), a
+`Graph`, a `Plan` or a `PreparedKernel` (its plan; with `bound=` data, the
+residual plan) and every plate and scan body below it, returning `(; kind,
+depth, parent, recipe)` entries in depth-first order. `depth` counts the
+enclosing plates and scans, and `parent` is the index of the enclosing entry, or
+`0` at top level. Structural acceptance can then state the retained nesting
+without depending on internal operation types:
+
+```julia
+[(entry.kind, entry.depth) for entry in recipe_inventory(prepare(spec; bound))
+ if entry.kind !== :ordinary]   # for example [(:plate, 0), (:scan, 1)]
+```
+
+The inventory only reads its argument. The `Graph` text listing renders the
+same walk.
 
 ### Prepared-kernel composition is flattened
 
@@ -311,6 +1103,10 @@ The same transform accepts a scalar `PreparedADKernel`. `replica(ad; batched =
 :position)` slices each selected HAVE, runs the scalar reverse pass, and stacks
 the objective and active-port gradient along the replica axis. The scalar AD
 preparation remains the derivative authority; it is not re-prepared per replica.
+Under Reactant the replica axis is one retained loop: each iteration gathers
+its replica's slices dynamically, differentiates once, and writes the value and
+gradient into preallocated buffers, so the emitted program is independent of
+the replica count (the batching primitive cannot yet carry a reverse pass).
 See [Position batching](position-batching.md) for the full public contract.
 
 ## Incremental and compiled reactive execution
@@ -380,26 +1176,37 @@ The optional MutatingFunctions extension changes call lowering, not graph
 semantics or producer selection.
 
 `prepare_nonallocating` requires every selected recipe to have one output. It
-gives each recipe a persistent typed cache. The first invocation seeds the
-cache; later invocations offer it to `MutatingFunctions.apply!!`. The generic
-fallback may still allocate, so zero allocation is a property of the complete
-selected operation set and runtime types, never a planner theorem.
+gives a step a persistent typed cache only where a destination-passing method
+fills storage the kernel owns: its own decomposed steps, authored plates and
+scans, and operations with a registered `apply!!` method for their concrete
+types. The first invocation seeds the cache; later invocations offer it to
+`MutatingFunctions.apply!!`. Every other operation is called directly, because
+its first result may be caller-owned storage that the generic fallback would
+overwrite. Zero allocation is a property of the complete selected operation
+set and runtime types, never a planner theorem. Exemplar arguments
+(`prepare_nonallocating(spec, args...)`) type the step program from runtime
+argument types where HAVE ports are undeclared.
 
-The cached result is borrowed. An aliasing operation may retain caller-owned
-input storage, and the next call may overwrite the prior returned object. A
-`NonAllocatingKernel` instance is not reentrant, thread-safe, or suitable for
-concurrent callers.
+The returned result is borrowed. A directly called operation may return
+caller-owned input storage, and the next call may overwrite the prior returned
+object. A `NonAllocatingKernel` instance is not reentrant, thread-safe, or
+suitable for concurrent callers.
 
 `prepare_reactive_nonallocating` instead uses each compiled-state output slot as
-the per-instance cache for selected mutable single-output recipes. Invalidation
-clears validity without clearing storage, allowing a later recomputation to
-reuse the buffer. Multi-output and immutable-output recipes remain on the pure
+the per-instance cache for selected mutable single-output recipes that have a
+registered `apply!!` method for their declared port types. Invalidation clears
+validity without clearing storage, allowing a later recomputation to reuse the
+buffer. Multi-output, immutable-output and other recipes remain on the pure
 path. Independent state instances own independent buffers, but a returned
 mutable value is still borrowed from its state.
 
 ## Source-captured method compiler
 
-Method-bearing `@kernel` definitions enter a stricter compiler. They are not
+This is the frozen iterative-method compiler (see [Pure kernels and the
+iterative-method compiler](#Pure-kernels-and-the-iterative-method-compiler)).
+Compiled as state machines, method-bearing `@kernel` definitions enter a
+stricter compiler. Their pure, straight-line methods are also endpoint graphs
+of the pure half, which need nothing from this section. They are not
 opaque recipe closures and are not analyzed through Julia's compiled IR.
 
 ### Authoritative input is captured source
@@ -554,9 +1361,14 @@ conversion, including Float64 intermediates written into Float32 storage.
 The initial public source subset is intentionally finite. It admits direct
 owned-field writes, exact captured `map(copy, tuple)`, tuple and named
 destructuring, bound non-Boolean numeric controls, and integer `Base.Colon`
-loops whose bounds are entirely static. Static loops are unrolled during
-lowering so validity is propagated through every authored iteration; this is
-not a host loop around traced execution. Indexed destinations,
+loops whose bounds are entirely static. Such a loop is retained: its body is
+compiled once as its own program over a carry of every canonical field value
+and lexical local, and runs natively as an ordinary loop or as one retained
+loop region on a tracing backend, whatever the bound — a bound may be bound
+numeric data, so the body is never replicated per iteration
+([core constraints](constraints.md)). Derived-field currentness is a loop
+invariant: every slot the body reads is repaired before the loop and at the
+end of each iteration. Indexed destinations,
 data-dependent branches/loops, arbitrary higher-order calls, and opaque
 callbacks reject. Callback computations used by endpoint recipes must be
 explicit endpoint ports so their authority is auditable and their identity is
@@ -593,9 +1405,11 @@ a meaningful value is causal: its state stays in the fixed compiled ABI, and
 host feedback can affect a later transition only after an explicit barrier and
 re-entry as a separately typed input. A source-backed port with no written
 arguments and `Nothing` result has no causal channel, so the compiler generates
-a split kernel automatically. The Reactant region emits source-order records
-into fixed-capacity slots with a logical activity mask and count plus sticky
-overflow; ordinary Julia then calls
+a split kernel automatically. The compiled region writes source-order records
+into structure-of-arrays storage of fixed capacity: one column per numeric
+leaf of the declared record type with a trailing slot axis, a fill count, and
+a sticky overflow flag, written by one dynamic slot write per call site (the
+program never enumerates the capacity); ordinary Julia then calls
 `drain_observations!(transition, result)` after the compiled call returns. No
 `push!`, callback invocation, allocation-driven shape growth, or implicit host
 round trip occurs inside the compiled invocation, and callers may schedule the
@@ -679,21 +1493,37 @@ flattened buffer ABI cannot represent Julia object identity. Straight-line and
 state-machine gates both prove valid repeated execution, identity-preserving
 outputs, and rejection of an independently converted counterfeit alias.
 
-Nonrecursive unit-range loops in methods with void returns retain one generated
-body when their observational effects have functional lowerings. Native execution
-uses an ordinary loop; Reactant receives a traced while-region. Compilation does
-not duplicate that body for each permitted iteration. Lexical locals, early
-returns, structured aliases, and effect state travel through the generated loop
-operands. Validated external callable identities are recovered from compiler
-bindings rather than copied through those operands; numeric and array external
-values remain operands. Methods with value returns or host-drained observational records retain
-the existing bounded unrolling path.
+Every structured state-machine method with authored control flow — branches,
+guards, short circuits, `for` and `while` loops — lowers through the control
+program: the method's CFG becomes a set of blocks, and one retained loop
+(native `while`; a `stablehlo.while` region under Reactant) dispatches exactly
+one block per step by its (method, pc) address (`stablehlo.case` under
+Reactant). A branch therefore evaluates only its taken side and a loop body is
+emitted once, whatever the admitted iteration count; each loop carries a
+counter checked against `max_iterations`, and exceeding it sets control
+overflow and rolls the transition back, exactly as before. Returned values
+travel in the root frame, so value-returning methods take the same path.
+Lexical locals, early returns, structured aliases, and effect state travel
+through the loop carry. Validated external callable identities are recovered
+from compiler bindings rather than copied through those operands; numeric and
+array external values remain operands. This is the lowering the
+[core constraints](constraints.md) require; the earlier per-iteration
+replication and predicated both-branch emission are no longer used for these
+methods.
 
-The retained loop checks its finite allowance with an unsigned distance, which
-represents the mathematical distance even when signed subtraction wraps. Its
-successor step stays in the authored integer type and runs only below the upper
-bound. The unrolled path uses guarded successor probes. Both preserve the
-explicit overflow/rollback result at extreme bounds and with small integers.
+Host-drained observational records (`drain_observations!`) travel in that
+loop carry as the structured outbox described above: the storage is seeded
+once before the loop from the record's declared type (a `__self__` argument
+records the whole state; static callable fields are carried by reference and
+restored from the compiler bindings at the drain), each call site writes the
+next slot lazily inside its block, and the fill count and overflow flag are
+scalar carry slots. Slots fill sequentially, so the drain replays `1:count` in
+emission order without an activity mask.
+
+The control program's loop counters preserve the explicit overflow/rollback
+result at extreme bounds and with small integers; the earlier bounded
+predicated path (per-iteration replication with an unsigned finite allowance)
+is gone.
 
 Ordered RNG is one typed internal effect authority. Authored kernels keep the
 ordinary Julia expressions `Random.randn!(rng, destination)`,

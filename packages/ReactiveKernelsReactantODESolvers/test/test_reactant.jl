@@ -1,0 +1,225 @@
+# Reactant-compiled adaptive solve: primal parity, IR shape, status flags,
+# and backsolve adjoint gradients (the only `Enzyme.autodiff` differentiates
+# the loop-free RHS inside the step; nothing differentiates through the
+# retained adaptive loop — see the extension header for the limitation).
+include("test_reactant_helpers.jl")
+@testset "reactant extension loads" begin
+    @test RExt !== nothing
+end
+
+@testset "traceable Lotka reformulation" begin
+    # The vectorized form is exactly the native RHS (same operations, same
+    # order, commuting exact negations), checked natively before compiling.
+    for u in ([1.0, 1.0], [2.5, 0.25], [0.1, 4.0])
+        @test lotka_traceable(u, nothing, 0.0) ==
+              lotka_volterra(u, LOTKA_PARAMS, 0.7)
+    end
+end
+
+@testset "traced config validation" begin
+    good = ReactantTsit5Config((0.0, 3.0); dt=0.05, saveat=[1.0, 2.0])
+    @test good.tdir == 1.0
+    @test good.saveat == [1.0, 2.0]
+    @test good.dtmax == 3.0
+    back = ReactantTsit5Config((3.0, 0.0); dt=0.05, saveat=[2.0, 1.0])
+    @test back.tdir == -1.0
+    @test back.saveat == [2.0, 1.0]
+
+    @test_throws ArgumentError ReactantTsit5Config((0.0, 3.0); dt=0.0,
+        saveat=[1.0])
+    @test_throws ArgumentError ReactantTsit5Config((0.0, 3.0); dt=0.05,
+        saveat=[4.0])
+    @test_throws ArgumentError ReactantTsit5Config((0.0, 3.0); dt=0.05,
+        saveat=Float64[])
+    @test_throws ArgumentError ReactantTsit5Config((0.0, 3.0); dt=0.05,
+        saveat=[0.0, 3.0])
+    @test_throws ArgumentError ReactantTsit5Config((0.0, 3.0); dt=0.05,
+        dtmax=0.0, saveat=[1.0])
+    @test_throws ArgumentError ReactantTsit5Config((0.0, 3.0); dt=0.05,
+        maxiters=-1, saveat=[1.0])
+end
+
+@testset "compiled decay primal" begin
+    solved = compile_ode_solve(decay_traceable, DECAY_R_U0, DECAY_R_P, Tsit5(),
+        DECAY_R_CFG)
+    endpoint, smat, status = solved(DECAY_R_U0, DECAY_R_P)
+    @test status == 0
+    @test size(smat) == (2, 2)
+
+    # Analytic reference (exact): decay has a closed form, so no ODE
+    # saveat-semantics guessing is needed here.
+    exact(t) = DECAY_R_U0 .* exp.(-DECAY_R_P .* t)
+    bar = agreement_bar(1e-10, 1e-8, 2.0)
+    @test max_abs_diff([endpoint], [exact(3.0)]) < bar
+    @test max_abs_diff([smat[:, j] for j in 1:2],
+        [exact(t) for t in DECAY_R_SAVEAT]) < bar
+
+    # Same fixed initial step on both drivers: the formulations agree to
+    # near roundoff (any divergence here is a real formulation mismatch).
+    native = solve_ode(exponential_decay, DECAY_R_U0, DECAY_R_TSPAN, Tsit5();
+        p=DECAY_R_P, abstol=1e-10, reltol=1e-8, dt=0.05, saveat=DECAY_R_SAVEAT)
+    @test native.retcode == :Success
+    @test endpoint ≈ native.u[end] rtol = 1e-9
+    for (j, k) in enumerate(2:3)
+        @test smat[:, j] ≈ native.u[k] rtol = 1e-9
+    end
+end
+
+@testset "compiled Lotka primal" begin
+    saveat = collect(0.5:0.5:9.5)
+    cfg = ReactantTsit5Config(LOTKA_TSPAN; abstol=1e-10, reltol=1e-8, dt=0.01,
+        maxiters=5000, saveat=saveat)
+    solved = compile_ode_solve(lotka_traceable, LOTKA_U0, nothing, Tsit5(),
+        cfg)
+    endpoint, smat, status = solved(LOTKA_U0)
+    @test status == 0
+    @test size(smat) == (2, length(saveat))
+    # The OrdinaryDiffEq reference saves exactly the requested points (no
+    # automatic endpoints in this configuration); assert the times loudly
+    # so a semantics change fails here instead of silently misaligning.
+    ref_saveat = vcat(saveat, [10.0])
+    ref = ode_reference(lotka_volterra, LOTKA_U0, LOTKA_TSPAN, LOTKA_PARAMS;
+        saveat=ref_saveat)
+    @test ref.t == ref_saveat
+    bar = agreement_bar(1e-10, 1e-8, solution_scale(ref.u))
+    @test max_abs_diff([endpoint], [ref.u[end]]) < bar
+    cols = [smat[:, j] for j in 1:length(saveat)]
+    @test max_abs_diff(cols, ref.u[1:end-1]) < bar
+end
+
+@testset "compiled program IR shape" begin
+    # One retained data-dependent `while`; the program size is independent
+    # of the iteration bound and of the number of saveat points (the dense
+    # buffer is one masked matrix update, not one column per point).
+    sizes = Int[]
+    for (maxiters, saveat) in ((80, [1.0, 2.0]), (1000, [1.0, 2.0]),
+            (1000, [0.5, 1.0, 1.5, 2.0, 2.5, 2.75]))
+        cfg = ReactantTsit5Config(DECAY_R_TSPAN; abstol=1e-10, reltol=1e-8,
+            dt=0.05, maxiters=maxiters, saveat=saveat)
+        closure = RKRO.traceable_ode_closure(decay_traceable, cfg,
+            DECAY_R_U0, DECAY_R_P)
+        ir = repr(Reactant.@code_hlo optimize = false closure(TR(DECAY_R_U0),
+            TR(DECAY_R_P)))
+        @test occursin("stablehlo", ir)
+        @test count("stablehlo.while", ir) == 1
+        push!(sizes, count("\n", ir))
+    end
+    @test allequal(sizes)
+end
+
+@testset "backsolve endpoint gradient" begin
+    # Forward compiled solve records the trajectory; the pullback re-solves
+    # the augmented adjoint ODE backward in a second early-exit compiled
+    # program — no differentiation through the adaptive while loop.
+    grad = compile_backsolve_gradient(decay_rule, DECAY_R_U0, DECAY_R_P,
+        Tsit5(), DECAY_R_CFG; loss=:endpoint)
+    du0_ad, dp_ad = grad(DECAY_R_U0, DECAY_R_P)
+    solved = compile_ode_solve(decay_traceable, DECAY_R_U0, DECAY_R_P, Tsit5(),
+        DECAY_R_CFG)
+    @test dp_ad ≈ central_gradient(
+        p -> sum(first(solved(DECAY_R_U0, p))), DECAY_R_P) atol = 1e-6
+    @test du0_ad ≈ central_gradient(
+        x -> sum(first(solved(x, DECAY_R_P))), DECAY_R_U0) atol = 1e-6
+    # Analytic cross-check (exact): L = Σ u0_i e^{-p_i t1}.
+    t1 = DECAY_R_TSPAN[2]
+    @test du0_ad ≈ exp.(-DECAY_R_P .* t1) atol = 1e-6
+    @test dp_ad ≈ -t1 .* DECAY_R_U0 .* exp.(-DECAY_R_P .* t1) atol = 1e-6
+end
+
+@testset "backsolve saveat gradient" begin
+    # Multi-segment backward journey with an adjoint jump at each saveat
+    # point (sum loss).
+    grad = compile_backsolve_gradient(decay_rule, DECAY_R_U0, DECAY_R_P,
+        Tsit5(), DECAY_R_CFG; loss=:saveat)
+    du0_ad, dp_ad = grad(DECAY_R_U0, DECAY_R_P)
+    solved = compile_ode_solve(decay_traceable, DECAY_R_U0, DECAY_R_P, Tsit5(),
+        DECAY_R_CFG)
+    @test dp_ad ≈ central_gradient(p -> sum(solved(DECAY_R_U0, p)[2]),
+        DECAY_R_P) atol = 1e-6
+    @test du0_ad ≈ central_gradient(x -> sum(solved(x, DECAY_R_P)[2]),
+        DECAY_R_U0) atol = 1e-6
+    # Analytic cross-check (exact): L = Σ_j Σ_i u0_i e^{-p_i s_j}.
+    n = length(DECAY_R_U0)
+    @test du0_ad ≈ [sum(exp(-DECAY_R_P[i] * s) for s in DECAY_R_SAVEAT)
+        for i in 1:n] atol = 1e-6
+    @test dp_ad ≈ [-DECAY_R_U0[i] *
+        sum(s * exp(-DECAY_R_P[i] * s) for s in DECAY_R_SAVEAT) for i in 1:n] atol = 1e-6
+end
+
+@testset "backsolve endpoint gradient without parameters" begin
+    # Nonlinear RHS, parameters closed over: no μ block, `grad_p === nothing`.
+    cfg = ReactantTsit5Config(LOTKA_TSPAN; abstol=1e-10, reltol=1e-8, dt=0.01,
+        maxiters=5000, saveat=[5.0])
+    grad = compile_backsolve_gradient(lotka_rule, LOTKA_U0, nothing,
+        Tsit5(), cfg; loss=:endpoint)
+    du0_ad, dp_ad = grad(LOTKA_U0)
+    @test dp_ad === nothing
+    solved = compile_ode_solve(lotka_traceable, LOTKA_U0, nothing, Tsit5(),
+        cfg)
+    @test du0_ad ≈ central_gradient(x -> sum(first(solved(x))), LOTKA_U0) atol = 1e-6
+end
+
+@testset "backsolve saveat gradient without parameters" begin
+    # Multi-segment saveat journey on a nonlinear non-toy system, no μ block.
+    # Reference: central differences of the compiled solve on the same loss.
+    # The bar is the repo's tolerance-scaled convention: backsolve re-solves
+    # rather than differentiating the trajectory, so optimise-vs-discretise
+    # error at the ~1e-6 level is expected (measured 2.5e-6 here).
+    cfg = ReactantTsit5Config(LOTKA_TSPAN; abstol=1e-10, reltol=1e-8, dt=0.01,
+        maxiters=5000, saveat=[3.0, 6.0])
+    grad = compile_backsolve_gradient(lotka_rule, LOTKA_U0, nothing,
+        Tsit5(), cfg; loss=:saveat)
+    du0_ad, dp_ad = grad(LOTKA_U0)
+    @test dp_ad === nothing
+    solved = compile_ode_solve(lotka_traceable, LOTKA_U0, nothing, Tsit5(),
+        cfg)
+    du0_fd = central_gradient(x -> sum(solved(x)[2]), LOTKA_U0)
+    bar = agreement_bar(1e-10, 1e-8, maximum(abs, du0_fd))
+    @test max_abs_diff([du0_ad], [du0_fd]) < bar
+end
+
+@testset "backsolve loss validation" begin
+    @test_throws ArgumentError compile_backsolve_gradient(decay_rule,
+        DECAY_R_U0, DECAY_R_P, Tsit5(), DECAY_R_CFG; loss=:bogus)
+    # A plain function has no reverse mathematics to hand the adjoint.
+    @test_throws ArgumentError compile_backsolve_gradient(decay_traceable,
+        DECAY_R_U0, DECAY_R_P, Tsit5(), DECAY_R_CFG)
+    # The rule's inputs must match the driver's shape.
+    @test_throws ArgumentError compile_backsolve_gradient(lotka_rule,
+        DECAY_R_U0, DECAY_R_P, Tsit5(), DECAY_R_CFG)
+    # The authored rules agree with the traceable functions they replace.
+    @test decay_rule(DECAY_R_U0, DECAY_R_P, 0.3) == decay_traceable(DECAY_R_U0, DECAY_R_P, 0.3)
+    @test lotka_rule(LOTKA_U0, 0.7) == lotka_traceable(LOTKA_U0, nothing, 0.7)
+end
+
+@testset "compiled status flags" begin
+    # Exhausted iteration bound reports the last-good state, not success.
+    short_cfg = ReactantTsit5Config(DECAY_R_TSPAN; abstol=1e-10, reltol=1e-8,
+        dt=0.05, maxiters=2, saveat=DECAY_R_SAVEAT)
+    short_solved = compile_ode_solve(decay_traceable, DECAY_R_U0, DECAY_R_P,
+        Tsit5(), short_cfg)
+    _, _, short_status = short_solved(DECAY_R_U0, DECAY_R_P)
+    @test short_status == 1
+
+    # NaN error estimates flag status 2 and freeze the state.
+    nan_solved = compile_ode_solve((u, p, t) -> u .* NaN, DECAY_R_U0,
+        DECAY_R_P, Tsit5(), DECAY_R_CFG)
+    nan_end, _, nan_status = nan_solved(DECAY_R_U0, DECAY_R_P)
+    @test nan_status == 2
+    @test nan_end == DECAY_R_U0
+end
+
+@testset "compiled backward primal" begin
+    forward = solve_ode(exponential_decay, DECAY_R_U0, DECAY_R_TSPAN, Tsit5();
+        p=DECAY_R_P, abstol=1e-10, reltol=1e-8)
+    u_at_3 = forward.u[end]
+    cfg = ReactantTsit5Config((3.0, 0.0); abstol=1e-10, reltol=1e-8, dt=0.05,
+        maxiters=1000, saveat=[2.0, 1.0])
+    solved = compile_ode_solve(decay_traceable, u_at_3, DECAY_R_P, Tsit5(),
+        cfg)
+    endpoint, smat, status = solved(u_at_3, DECAY_R_P)
+    @test status == 0
+    @test max_abs_diff([endpoint], [DECAY_R_U0]) <
+          agreement_bar(1e-10, 1e-8, 2.0)
+    @test size(smat) == (2, 2)
+end

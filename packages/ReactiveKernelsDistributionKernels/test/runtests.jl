@@ -1,11 +1,13 @@
-using Distributions: Bernoulli, Cauchy, Dirichlet, Exponential, Geometric,
-    InverseGamma, Laplace, LKJCholesky, Logistic, LogNormal, MvNormal,
-    NegativeBinomial, Normal,
-    TDist, Uniform, cdf, logpdf, quantile
-using LinearAlgebra: Cholesky, LowerTriangular, Symmetric, cholesky
+using DifferentiationInterface: AutoEnzyme, gradient
+using Distributions: Bernoulli, BetaBinomial, Binomial, Cauchy, Dirichlet, Exponential,
+    Geometric, InverseGamma, Laplace, LKJCholesky, Logistic, LogNormal,
+    MvNormal, NegativeBinomial, Normal, Poisson,
+    TDist, Uniform, Weibull, cdf, logpdf, quantile
+import Enzyme
+using LinearAlgebra: Cholesky, LowerTriangular, Symmetric, cholesky, norm
 using LogExpFunctions: log1pexp
-using ReactiveKernels: @kernel, KernelObjectSpec, KernelSpec, code_expr, explain,
-    extract, plan, plate, prepare
+using ReactiveKernels: @kernel, KernelObjectSpec, KernelSpec, ad_gradient, code_expr,
+    explain, extract, plan, plate, prepare, prepare_ad
 using ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     LOCATION_SCALE_SOURCE,
@@ -15,13 +17,18 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     EXPONENTIAL_KERNEL_SOURCE, GEOMETRIC_KERNEL_SOURCE, UNIFORM_KERNEL_SOURCE,
     MVNORMAL_KERNEL_SOURCE, AR1_KERNEL_SOURCE,
     CATEGORICAL_LOGIT_KERNEL_SOURCE, CATEGORICAL_LOGIT_REF_KERNEL_SOURCE,
+    BETA_BINOMIAL_KERNEL_SOURCE,
     INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE,
     LKJ_CORR_CHOLESKY_KERNEL_SOURCE,
-    normal, cauchy, laplace, logistic, bernoulli, lognormal,
+    NEGATIVE_BINOMIAL_KERNEL_SOURCE,
+    WEIBULL_KERNEL_SOURCE,
+    ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE,
+    normal, cauchy, laplace, logistic, bernoulli, binomial, poisson, lognormal,
     exponential, geometric, uniform, mvnormal, ar1,
     categorical_logit, categorical_logit_ref,
-    negative_binomial2,
-    inverse_gamma, dirichlet, lkj_corr_cholesky,
+    negative_binomial2, beta_binomial, negative_binomial, weibull,
+    inverse_gamma, dirichlet, lkj_corr_cholesky, zero_inflated_poisson,
+    zero_inflated_binomial,
     NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 using Test
 
@@ -30,6 +37,13 @@ using Test
         scale::Vector{Float64}) = begin
     pointwise = plate(x, location, scale) do xi, li, si
         normal(li, si).logpdf(xi)
+    end
+    return sum(pointwise)
+end
+
+@kernel _binomial_normalizer_total(observed::Vector{Int}, n::Vector{Int}) = begin
+    pointwise = plate(observed, n) do y, trials
+        binomial(; n = trials).lognormalizer(y)
     end
     return sum(pointwise)
 end
@@ -349,6 +363,30 @@ end
         @test kernel(L, 2.0) ≈ logpdf(LKJCholesky(2, 2.0, :L),
                                       Cholesky(LowerTriangular(L)))
     end
+    # Native reverse Enzyme through the LKJ density (snag lkj-corr-cholesk-44503bef):
+    # the index vectors are materialized before float scaling, so no TwicePrecision
+    # StepRangeLen is built. Oracle: d/dL[i,i] Σⱼ wⱼ log L[j,j] = wᵢ/L[i,i] with
+    # wᵢ = K + 2(eta - 1) - i; off-diagonals are 0. K = 2 covers the empty
+    # normalizer sum; K = 3 the nonempty one. With eta active the oracle is a
+    # central difference of Distributions' density in eta (the range spelling
+    # failed this leg too, at every K).
+    @testset "native Enzyme gradient" begin
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)
+        for (L, eta) in (([1.0 0.0; 0.6 0.8], 2.0),
+                ([1.0 0.0 0.0; 0.6 0.8 0.0; 0.3 0.4 0.8660254037844386], 2.0))
+            K = size(L, 1)
+            w = (K + 2 * (eta - 1)) .- collect(1:K)
+            expected = [i == j ? w[i] / L[i, i] : 0.0 for i in 1:K, j in 1:K]
+            @test gradient(L_ -> kernel(L_, eta), backend, L) ≈ expected
+            prepared = prepare_ad(kernel, backend, L, eta; active = :L)
+            @test ad_gradient(prepared, L, eta) ≈ expected
+            density_at(e) = logpdf(LKJCholesky(K, e, :L), Cholesky(LowerTriangular(L)))
+            h = 1e-6
+            prepared_eta = prepare_ad(kernel, backend, L, eta; active = :eta)
+            @test ad_gradient(prepared_eta, L, eta) ≈
+                  (density_at(eta + h) - density_at(eta - h)) / (2h) rtol = 1e-6
+        end
+    end
     @test occursin("@kernel lkj_corr_cholesky", LKJ_CORR_CHOLESKY_KERNEL_SOURCE)
     @test !occursin("Distributions", string(code_expr(kernel)))
 end
@@ -408,6 +446,95 @@ end
     end
 end
 
+@testset "poisson and binomial selected HAVE tails" begin
+    bm = prepare(binomial.logpdf; have = (:observed, :n, :logit), want = :logpdf)
+    ps = prepare(poisson.logpdf; have = (:observed, :log_rate), want = :logpdf)
+    for eta in (-1000.0, -80.0, 80.0, 1000.0), y in (0, 1, 3)
+        combination = y == 1 ? log(3.0) : 0.0
+        expected = combination - y * log1pexp(-eta) - (3 - y) * log1pexp(eta)
+        @test bm(y, 3, eta) ≈ expected
+    end
+    @test ps(1, 1000.0) == -Inf
+    @test ps(1, -1000.0) ≈ -1000.0
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    bm_ad = prepare_ad(bm, backend, 1, 3, 0.0; active = :logit)
+    zib = prepare(zero_inflated_binomial.logpdf;
+        have = (:observed, :n, :logit, :zi), want = :logpdf)
+    zib_ad = prepare_ad(zib, backend, 1, 3, 0.0, 0.2; active = :logit)
+    # `±0.0` is where the interior count arm switches which `log1pexp` it
+    # evaluates; its value and score match on both sides.
+    for eta in (-1000.0, -80.0, -0.0, 0.0, 80.0, 1000.0), y in (0, 1, 3)
+        p = 1 / (1 + exp(-eta))
+        combination = y == 1 ? log(3.0) : 0.0
+        binomial_mass = combination - y * log1pexp(-eta) - (3 - y) * log1pexp(eta)
+        score = y / (1 + exp(eta)) - (3 - y) * p
+        @test ad_gradient(bm_ad, y, 3, eta) ≈ score
+        binomial_arm = log1p(-0.2) + binomial_mass
+        expected = y == 0 ? log1p(0.8 * expm1(binomial_mass)) : binomial_arm
+        @test zib(y, 3, eta, 0.2) ≈ expected
+        expected_gradient = y == 0 ?
+            -3p * exp(binomial_arm - expected) : score
+        @test ad_gradient(zib_ad, y, 3, eta, 0.2) ≈ expected_gradient atol = 1e-13
+    end
+    for eta in (-1000.0, 1000.0), zi in (0.0, 1.0)
+        @test bm(0, 0, eta) == 0.0
+        @test zib(0, 0, eta, zi) == 0.0
+    end
+    # An interior count has zero mass at an infinite logit, on either side.
+    for eta in (-Inf, Inf)
+        @test bm(1, 3, eta) == -Inf
+        @test zib(1, 3, eta, 0.2) == -Inf
+        @test isnan(bm(1, 3, NaN)) && isnan(zib(1, 3, NaN, 0.2))
+    end
+end
+
+@testset "count objects split logpdf into logkernel and data-only lognormalizer" begin
+    # `logpdf == logkernel + lognormalizer` on every HAVE route (`logpdf` is
+    # written out, so equal to rounding). The normalizer
+    # reads only the count and the trials, and it is zero wherever `logpdf`
+    # never forms it (zero, full and invalid counts).
+    sigmoid(x) = 1 / (1 + exp(-x))
+    lchoose(n, y) = logpdf(Binomial(n, 0.5), y) + n * log(2)  # log C(n, y)
+    lfactorial(y) = -(logpdf(Poisson(1.0), y) + 1.0)          # log(y!)
+    zib_mass(n, p, zi, y) = 0 <= y <= n ?
+        log((y == 0) * zi + (1 - zi) * exp(logpdf(Binomial(n, p), y))) : -Inf
+    binomial_norm(n) = y -> 0 < y < n ? lchoose(n, y) : 0.0
+    cases = (
+        (binomial, (:observed, :n, :logit), (5, 0.4), (5,),
+            y -> logpdf(Binomial(5, sigmoid(0.4)), y), binomial_norm(5)),
+        (binomial, (:observed, :n, :p), (5, 0.3), (5,),
+            y -> logpdf(Binomial(5, 0.3), y), binomial_norm(5)),
+        (poisson, (:observed, :log_rate), (0.4,), (),
+            y -> logpdf(Poisson(exp(0.4)), y), y -> y > 0 ? -lfactorial(y) : 0.0),
+        (poisson, (:observed, :rate), (1.5,), (),
+            y -> logpdf(Poisson(1.5), y), y -> y > 0 ? -lfactorial(y) : 0.0),
+        (zero_inflated_binomial, (:observed, :n, :logit, :zi), (5, 0.4, 0.2), (5,),
+            y -> zib_mass(5, sigmoid(0.4), 0.2, y), binomial_norm(5)),
+        (zero_inflated_binomial, (:observed, :n, :p, :zi), (5, 0.3, 0.2), (5,),
+            y -> zib_mass(5, 0.3, 0.2, y), binomial_norm(5)),
+    )
+    for (object, have, args, norm_args, oracle, normalizer) in cases
+        full = prepare(object.logpdf; have, want = :logpdf)
+        kernel = prepare(object.logkernel; have, want = :logkernel)
+        norm = prepare(object.lognormalizer;
+            have = (:observed, have[2:1+length(norm_args)]...), want = :lognormalizer)
+        for y in (-1, 0, 1, 3, 5, 6)
+            @test full(y, args...) ≈ oracle(y) atol = 1e-12
+            @test norm(y, norm_args...) ≈ normalizer(y) atol = 1e-12
+            @test full(y, args...) ≈ kernel(y, args...) + norm(y, norm_args...) atol = 1e-12
+        end
+        @test norm(0, norm_args...) === 0.0
+        @test norm(-1, norm_args...) === 0.0
+    end
+    # Over bound counts and trials a plate of normalizers is a bind-time
+    # value: the prepared program evaluates no `loggamma`.
+    counts, trials = [0, 1, 3, 5, 2], [5, 5, 4, 5, 2]
+    folded = prepare(_binomial_normalizer_total;
+        bound = (; observed = counts, n = trials))
+    @test folded() ≈ sum(binomial_norm(n)(y) for (y, n) in zip(counts, trials))
+    @test !occursin("loggamma", string(code_expr(folded)))
+end
+
 @testset "negative_binomial2 Stan lpmf parity" begin
     # NB2(mu, phi) is Stan's neg_binomial_2: var = mu + mu^2/phi, which is
     # exactly NegativeBinomial(phi, phi/(phi+mu)) — the independent oracle.
@@ -431,3 +558,198 @@ end
         @test !isnan(v)
     end
 end
+
+@testset "negative_binomial Stan lpmf parity" begin
+    # NB1(r, p) is Stan's neg_binomial(alpha = r, beta = p/(1-p)):
+    # failures before r successes — Distributions.NegativeBinomial is
+    # the direct independent oracle.
+    nb1 = prepare(negative_binomial.logpdf;
+        have = (:observed, :r, :p), want = :logpdf)
+    for (y, r, p) in ((0, 2.5, 0.4), (3, 2.5, 0.4), (7, 0.4, 0.9),
+            (1, 10.0, 0.05), (5, 3.0, 0.7))
+        @test nb1(y, r, p) ≈ logpdf(NegativeBinomial(r, p), y)
+    end
+    # Impossible events are -Inf, never NaN (lazy support guard).
+    @test nb1(-1, 2.5, 0.4) == -Inf
+    @test nb1(2, 0.0, 0.4) == -Inf
+    @test nb1(2, -1.0, 0.4) == -Inf
+    @test nb1(2, 2.5, 0.0) == -Inf
+    @test nb1(2, 2.5, 1.0) == -Inf
+    @test nb1(0, 2.5, 1.0) == -Inf
+    @test nb1(2, 2.5, 1.5) == -Inf
+    for v in (nb1(-1, 2.5, 0.4), nb1(2, 0.0, 0.4), nb1(2, -1.0, 0.4),
+            nb1(2, 2.5, 0.0), nb1(2, 2.5, 1.0), nb1(2, 2.5, 1.5))
+        @test !isnan(v)
+    end
+    @test occursin("@kernel negative_binomial", NEGATIVE_BINOMIAL_KERNEL_SOURCE)
+end
+
+@testset "weibull Stan lpdf parity" begin
+    # Weibull(k, theta) is Stan's weibull(alpha = k, sigma = theta):
+    # Julia→Stan passthrough — Distributions.Weibull is the direct
+    # independent oracle.
+    wb = prepare(weibull.logpdf;
+        have = (:x, :k, :theta), want = :logpdf)
+    for (x, k, th) in ((1.5, 2.0, 1.2), (0.5, 0.7, 2.0), (3.0, 5.0, 0.5),
+            (0.1, 1.0, 1.0), (2.0, 3.0, 4.0))
+        @test wb(x, k, th) ≈ logpdf(Weibull(k, th), x)
+    end
+    # The log_theta HAVE route agrees (the Poisson log_rate precedent).
+    wbl = prepare(weibull.logpdf;
+        have = (:x, :k, :log_theta), want = :logpdf)
+    for (x, k, th) in ((1.5, 2.0, 1.2), (0.5, 0.7, 2.0), (3.0, 5.0, 0.5))
+        @test wbl(x, k, log(th)) ≈ logpdf(Weibull(k, th), x)
+    end
+    # Closed-form cdf/quantile (the exponential precedent). The
+    # roundtrip points keep cdf strictly inside (0, 1) (at (3.0, 5.0,
+    # 0.5) cdf saturates to exactly 1.0 and quantile rightly returns
+    # Inf, like Distributions').
+    wbc = prepare(weibull.cdf; have = (:x, :k, :theta), want = :cdf)
+    wbq = prepare(weibull.quantile; have = (:p, :k, :theta), want = :quantile)
+    for (x, k, th) in ((1.5, 2.0, 1.2), (0.5, 0.7, 2.0), (3.0, 5.0, 0.5))
+        @test wbc(x, k, th) ≈ cdf(Weibull(k, th), x)
+    end
+    for (x, k, th) in ((1.5, 2.0, 1.2), (0.5, 0.7, 2.0))
+        @test wbq(cdf(Weibull(k, th), x), k, th) ≈ x
+    end
+    for (p, k, th) in ((0.1, 2.0, 1.2), (0.5, 0.7, 2.0), (0.9, 5.0, 0.5))
+        @test wbq(p, k, th) ≈ quantile(Weibull(k, th), p)
+    end
+    @test wbc(0.0, 2.0, 1.2) == 0.0
+    @test wbc(-1.0, 2.0, 1.2) == 0.0
+    # Impossible events are -Inf, never NaN (lazy support guard). A
+    # negative theta throws DomainError from the eager `log_theta`
+    # derivation instead (the Poisson `log_rate` precedent — in-plan
+    # theta = exp(lp) > 0 always).
+    @test wb(0.0, 2.0, 1.2) == -Inf
+    @test wb(-1.0, 2.0, 1.2) == -Inf
+    @test wb(1.5, 0.0, 1.2) == -Inf
+    @test wb(1.5, -1.0, 1.2) == -Inf
+    @test wb(1.5, 2.0, 0.0) == -Inf
+    @test_throws DomainError wb(1.5, 2.0, -1.0)
+    for v in (wb(0.0, 2.0, 1.2), wb(-1.0, 2.0, 1.2), wb(1.5, 0.0, 1.2),
+            wb(1.5, -1.0, 1.2), wb(1.5, 2.0, 0.0))
+        @test !isnan(v)
+    end
+    # Generic-Enzyme reverse through the prepared kernel (no rule: the
+    # body is transparent math) vs the closed-form partials — which are
+    # Stan's published `weibull_lpdf` partials
+    # (`stan/math/prim/prob/weibull_lpdf.hpp`).
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for (x, k, th) in ((1.5, 2.0, 1.2), (0.5, 0.7, 2.0), (3.0, 5.0, 0.5))
+        z = x / th
+        P = z^k
+        lz = log(z)
+        @test gradient(v -> wb(v, k, th), backend, x) ≈ ((k - 1) - k * P) / x
+        @test gradient(v -> wb(x, v, th), backend, k) ≈ 1 / k + (1 - P) * lz
+        @test gradient(v -> wb(x, k, v), backend, th) ≈ k * (P - 1) / th
+        @test gradient(v -> wbl(v, k, log(th)), backend, x) ≈
+            ((k - 1) - k * P) / x
+    end
+    @test occursin("@kernel weibull", WEIBULL_KERNEL_SOURCE)
+end
+
+@testset "zero_inflated_poisson Stan lpmf parity" begin
+    # ZIP(rate, zi) is Stan's zero_inflated_poisson: a structural-zero
+    # mass zi mixed with Poisson(rate) counts — the independent oracle
+    # is the stable two-arm form over Distributions' Poisson.
+    zip = prepare(zero_inflated_poisson.logpdf;
+        have = (:observed, :log_rate, :zi), want = :logpdf)
+    _zip_logaddexp(a, b) = max(a, b) + log1p(exp(-abs(a - b)))
+    for (y, lam, zi) in ((0, 2.5, 0.2), (3, 2.5, 0.2), (0, 0.0, 0.2),
+            (1, 10.0, 0.0), (0, 1.0, 0.0), (2, 0.4, 0.9), (0, 3.0, 1.0))
+        pp = logpdf(Poisson(lam), y)
+        ref = y == 0 ? _zip_logaddexp(log(zi), log1p(-zi) + pp) :
+            log1p(-zi) + pp
+        @test zip(y, log(lam), zi) ≈ ref
+    end
+    # A certain structural zero forbids positive counts.
+    @test zip(3, log(3.0), 1.0) == -Inf
+    # Impossible events are -Inf, never NaN (lazy support guard).
+    @test zip(-1, log(2.5), 0.2) == -Inf
+    @test zip(2, log(2.5), -0.1) == -Inf
+    @test zip(2, log(2.5), 1.5) == -Inf
+    @test zip(0, log(2.5), NaN) == -Inf
+    for v in (zip(-1, log(2.5), 0.2),
+            zip(2, log(2.5), -0.1), zip(2, log(2.5), 1.5),
+            zip(0, log(2.5), NaN))
+        @test !isnan(v)
+    end
+    # Direct rate inputs use the lazy parameter guard, including NaN
+    # and negative rates, without evaluating log(rate) in the inactive arm.
+    zip_rate = prepare(zero_inflated_poisson.logpdf;
+        have = (:observed, :rate, :zi), want = :logpdf)
+    @test zip_rate(2, NaN, 0.2) == -Inf
+    @test !isnan(zip_rate(2, NaN, 0.2))
+    @test zip_rate(2, -1.0, 0.2) == -Inf
+end
+
+@testset "zero_inflated_binomial Stan lpmf parity" begin
+    # ZIB(n, p, zi) is a structural-zero mass zi mixed with Binomial(n, p)
+    # counts (the m0 capture-recapture marginal shape) — the independent
+    # oracle is the stable two-arm form over Distributions' Binomial.
+    zib = prepare(zero_inflated_binomial.logpdf;
+        have = (:observed, :n, :p, :zi), want = :logpdf)
+    _zib_logaddexp(a, b) = max(a, b) + log1p(exp(-abs(a - b)))
+    for (y, n, p, zi) in ((0, 3, 0.5, 0.2), (2, 3, 0.5, 0.2),
+            (0, 3, 0.5, 0.0), (1, 10, 0.3, 0.0), (0, 5, 0.9, 0.0),
+            (3, 3, 0.4, 0.9), (0, 3, 0.5, 1.0))
+        bb = logpdf(Binomial(n, p), y)
+        ref = y == 0 ? _zib_logaddexp(log(zi), log1p(-zi) + bb) :
+            log1p(-zi) + bb
+        @test zib(y, n, p, zi) ≈ ref
+    end
+    # A tiny ordinary-binomial zero mass stays finite in log space.
+    @test zib(0, 2000, 0.5, 0.0) ≈ 2000log1p(-0.5)
+    @test zib(0, 2000, 0.5, 1e-20) ≈ log(1e-20)
+    # A certain structural zero forbids positive counts.
+    @test zib(2, 3, 0.5, 1.0) == -Inf
+    # Impossible events are -Inf, never NaN (lazy support guard).
+    @test zib(-1, 3, 0.5, 0.2) == -Inf
+    @test zib(4, 3, 0.5, 0.2) == -Inf
+    @test zib(2, 3, 0.5, -0.1) == -Inf
+    @test zib(2, 3, 0.5, 1.5) == -Inf
+    @test zib(0, 3, 0.5, NaN) == -Inf
+    for v in (zib(-1, 3, 0.5, 0.2), zib(4, 3, 0.5, 0.2),
+            zib(2, 3, 0.5, -0.1), zib(2, 3, 0.5, 1.5),
+            zib(0, 3, 0.5, NaN))
+        @test !isnan(v)
+    end
+    @test occursin("@kernel zero_inflated_binomial",
+        ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE)
+end
+
+include("test_zero_inflated_binomial_logit_zi.jl")
+
+@testset "beta_binomial Stan lpmf parity" begin
+    # beta_binomial(n, alpha, beta) is Stan's beta_binomial: the FULL
+    # lpmf (binomial coefficient + lbeta terms), checked against
+    # Distributions.BetaBinomial — the independent oracle.
+    bb = prepare(beta_binomial.logpdf;
+        have = (:observed, :n, :alpha, :beta), want = :logpdf)
+    for (y, n, a, b) in ((3, 10, 2.0, 5.0), (0, 10, 2.0, 5.0),
+            (10, 10, 2.0, 5.0), (7, 12, 0.5, 0.5), (1, 4, 8.0, 3.0))
+        @test bb(y, n, a, b) ≈ logpdf(BetaBinomial(n, a, b), y)
+    end
+    # Out-of-support observations are -Inf, never NaN.
+    @test bb(-1, 10, 2.0, 5.0) == -Inf
+    @test bb(11, 10, 2.0, 5.0) == -Inf
+    # Lifts through the generic plate path; the compiled kernel is
+    # Distributions.jl-free.
+    plated = plate(beta_binomial.logpdf;
+        have = (:observed, :n, :alpha, :beta), want = :logpdf,
+        batched = (:observed,))
+    observations = [0, 3, 7, 10]
+    @test plated(observations, 10, 2.0, 5.0) ≈
+        sum(logpdf(BetaBinomial(10, 2.0, 5.0), y) for y in observations)
+    @test !occursin("Distributions", string(code_expr(plated)))
+    @test occursin("@kernel beta_binomial", BETA_BINOMIAL_KERNEL_SOURCE)
+end
+
+include("test_glm.jl")
+include("test_enzyme_rules.jl")
+include("test_rk_beta_inc.jl")
+include("test_product_mixture.jl")
+include("test_zero_inflated_product_mixture.jl")
+include("test_hmm.jl")
+include("test_icar.jl")

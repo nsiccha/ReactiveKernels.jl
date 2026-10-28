@@ -6,16 +6,18 @@ using ReactiveKernelsKernelExamples
 using ReactiveKernelsHMCDiagnostics
 using ReactiveKernelsNUTSExamples
 using ReactiveKernelsPPLExamples
+using ReactiveKernelsPPL
 using ReactiveKernelsStreamingStats
+using ReactiveKernelsReactantODESolvers
 
 # Opt into the standalone nutpie/nuts-rs diagonal-adaptation compiler corpus.
 # It remains an external mathematical example rather than a package API.
 include(joinpath(@__DIR__, "..", "examples", "nutpie_diagonal_adaptation.jl"))
 import .NutpieDiagonalAdaptationExample
 
-# Load the executable manual-rule design example. It uses only today's public
-# HAVE→WANT preparation surface; the page labels backend adapter generation as
-# the proposed layer rather than presenting it as an existing package API.
+# Load the executable derivative-rule example: one pure-math graph, the
+# `derivative_rule` it generates, and the same cuts prepared explicitly so the
+# page can render each one.
 include(joinpath(@__DIR__, "..", "examples", "manual_derivative_rule.jl"))
 import .ManualDerivativeRuleExample
 
@@ -36,6 +38,7 @@ include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_docs_interactions.jl"
 
 include("kernel_examples.jl")
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "result_views.jl"))
+Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "rkppl_page.jl"))
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "all80_comparison_tables.jl"))
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "all80_benchmark_plots.jl"))
 include("check_rendered.jl")
@@ -45,6 +48,7 @@ include("gibbs_page.jl")
 
 site_pages = [
     "Home" => "index.md",
+    "Core constraints" => "constraints.md",
     "Compiler capability and limits" => "compiler.md",
     "Position batching (vectorize)" => "position-batching.md",
     "Sequential recurrences (scan)" => "scan.md",
@@ -53,6 +57,8 @@ site_pages = [
         "Batched log densities" => "batched.md",
     ],
     "Probabilistic programming" => [
+        "Writing models with @rkppl" => "rkppl.md",
+        "Smooths and HSGPs with @rkppl" => "rkppl-smooths.md",
         "Eight schools" => "eight-schools.md",
         "Sum-to-zero recovery" => "sum-to-zero.md",
         "MNIST multinomial logistic" => "mnist-logistic.md",
@@ -83,13 +89,13 @@ site_pages = [
             "IRT 2PL + latent regression" => "2pl-latent-reg-irt.md",
             "IRT hierarchical 2PL (correlated items)" => "hier-2pl.md",
             "IRT GPCM (ordinal + latent regression)" => "gpcm-latent-reg-irt.md",
+            "IRT rating scale (GRSM + latent regression)" => "grsm-latent-reg-irt.md",
             "GLMM1 (per-site Poisson-log GLMM)" => "glmm1.md",
             "BYM2 (spatial-Poisson convolution)" => "bym2-offset-only.md",
             "Bones (graded-response latent trait)" => "bones.md",
             "Multi-occupancy (marginalized)" => "multi-occupancy.md",
             "Lotka–Volterra adaptive ODE" => "lotka-volterra.md",
             "SIR with environmental bacteria" => "sir.md",
-            "One-compartment Michaelis–Menten" => "one-comp-mm-elim-abs.md",
             "Soil incubation two-pool carbon" => "soil-incubation.md",
         ],
         "Gaussian processes" => [
@@ -98,12 +104,14 @@ site_pages = [
             "Approximate GP (HSGP, distributional)" => "accel-gp.md",
             "BRM motorcycle (partial HSGP coordinates)" => "brm-hsgp.md",
             "Hierarchical GP" => "hierarchical-gp.md",
+            "Kronecker-structured GP (grid)" => "kronecker-gp.md",
+            "Basketball-drive HMM (hmm_drive_1)" => "hmm-drive-1.md",
         ],
         "Declarative @ppl front-end + Gibbs (experimental)" => "ppl-front-end.md",
     ],
     "Automatic differentiation" => [
         "Prepared gradients" => "automatic-differentiation.md",
-        "Manual derivative rules (design)" => "manual-derivative-rules.md",
+        "Derivative rules" => "manual-derivative-rules.md",
         "Distributions: scalar and batched" => "distributions-ad.md",
         "PPL: Eight Schools and MNIST" => "ppl-ad.md",
     ],
@@ -123,6 +131,7 @@ site_pages = [
     "posteriordb benchmark (RK vs Stan vs Turing)" => "posteriordb-comparison.md",
     "Tools and reference" => [
         "DAG visualization" => "visualization.md",
+        "JAX target" => "jax.md",
         "API" => "api.md",
     ],
     "Bijectors" => "bijectors.md",
@@ -151,6 +160,7 @@ makedocs(
         ReactiveKernelsNUTSExamples,
         ReactiveKernelsStreamingStats,
         ReactiveKernelsHMCDiagnostics,
+        ReactiveKernelsReactantODESolvers,
     ],
     format   = DocumenterVitepress.MarkdownVitepress(
         repo = "github.com/nsiccha/ReactiveKernels.jl",

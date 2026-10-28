@@ -11,26 +11,68 @@ const _OPS_ARG = :__ops__
 const _CACHES_ARG = :__caches__
 const _CACHE_APPLY_ARG = :__cache_apply__
 
+# Names a `@kernel` generates rather than authors: gensyms and the synthesized
+# result ports of a computed `return` and of a plate cell's final expression.
+_generated_value_name(name::Symbol) =
+    name === _KERNEL_RETURN_PORT || name === _KERNEL_PLATE_VALUE_PORT ||
+    startswith(String(name), '#')
+
+# The value whose name each alias class is shown by: its first-declared member
+# with an authored name. A kernel declares its ports before it clones a
+# composed child, so the caller's name for a child boundary (the argument it
+# passes, the name it assigns the result to) precedes the child's own formal
+# and result names. A class with no authored name keeps its canonical value's.
+function _class_name_values(g::Graph)
+    chosen = Dict{ValueId,ValueId}()
+    for (id, value) in g.values
+        _generated_value_name(value.name) && continue
+        root = canon_id(g, id)
+        first = get(chosen, root, nothing)
+        (first === nothing || id < first) && (chosen[root] = id)
+    end
+    chosen
+end
+
+# A value's name can be a `gensym` minted by another process: a package image
+# keeps the names its kernels were authored with (`##plate_argument#6015`),
+# and each process counts its `gensym`s from the start again. Lowering mints
+# its scratch locals with `gensym` (so does the `@simd` it expands), and every
+# `gensym` begins with `##`, so a value bound under such a name could share
+# one variable with a fresh scratch local: the later assignment silently
+# replaces the value (snag `in-a-fresh-julia-19d79835`, where an outer plate's
+# argument replaced an inner plate's hoisted `1:length(observed)`). A value is
+# therefore never bound under a name that begins with `##`; such a name keeps
+# one leading `#` (`#plate_argument#6015`).
+function _value_local_name(name::Symbol)
+    text = String(name)
+    startswith(text, "##") ? Symbol('#', lstrip(text, '#')) : name
+end
+
 # Assign a globally unique source-variable Symbol to every canonical value in
 # the plan. User names are diagnostic hints, not binding authority: they may
-# collide with one another, with a generated disambiguation such as `a_12`, or
-# with the hidden `__ops__` argument.
+# collide with one another, with a generated disambiguation such as `a_12`,
+# with the hidden `__ops__` argument, or with a scratch local the lowering
+# mints (`_value_local_name`).
 function _varnames(p::Plan)
     g = p.graph
-    ids = Int[]
+    ids = ValueId[]
     for v in p.have; push!(ids, canon_id(g, v.id)); end
     for r in p.recipes, o in r.outputs; push!(ids, canon_id(g, o.id)); end
     for w in p.want; push!(ids, canon_id(g, w.id)); end
     unique!(ids)
     used = Set{Symbol}((_OPS_ARG, _CACHES_ARG, _CACHE_APPLY_ARG))
-    out = Dict{Int,Symbol}()
-    for id in ids
-        base = p.graph.values[id].name
+    out = Dict{ValueId,Symbol}()
+    named = _class_name_values(g)
+    # Plan order is stable across equivalent graphs; graph IDs are not. Use
+    # that order to disambiguate locals without changing compilation identity
+    # whenever a composed child receives fresh value IDs.
+    for (position, id) in enumerate(ids)
+        base = _value_local_name(g.values[get(named, id, id)].name)
         candidate = base
         suffix = 0
         while candidate in used
-            candidate = suffix == 0 ? Symbol(base, :_, id) :
-                        Symbol(base, :_, id, :_, suffix)
+            candidate = suffix == 0 ? Symbol(base, :_, position) :
+                        Symbol(base, :_, position, :_, suffix)
             suffix += 1
         end
         out[id] = candidate
@@ -113,16 +155,135 @@ end
     Base.Broadcast.instantiate(broadcasted)
 end
 
-function _authored_plate_marker(::Val{A}, args...) where {A}
-    index = findfirst(eachindex(args)) do position
-        !(position in A) && _authored_plate_is_axis(getfield(args, position))
+# The first non-atomic argument that is an axis, as an unrolled conditional
+# chain over the argument positions. `_authored_plate_is_axis` is decided by
+# the argument's type for every collection the lowering accepts, so the chain
+# folds to one argument when the generated body is compiled for concrete types;
+# a `findfirst` closure over the argument tuple instead allocated per call
+# (304 bytes for a three-port plate whose domain port carries no declared type).
+@generated function _authored_plate_marker(::Val{A}, args...) where {A}
+    body = :(throw(ArgumentError(
+        "an authored plate requires at least one batched argument")))
+    for position in reverse(eachindex(args))
+        position in A && continue
+        body = :(_authored_plate_is_axis(getfield(args, $position)) ?
+            getfield(args, $position) : $body)
     end
-    index === nothing && throw(ArgumentError(
-        "an authored plate requires at least one batched argument"))
-    getfield(args, index)
+    body
 end
-@inline _authored_plate_zero(::Type{T}, marker) where {T} = zero(T)
-@inline _authored_plate_zero(::Type{Any}, marker) = zero(eltype(marker))
+# The running total of a fused summed plate. It starts at `zero(T)` for the
+# cells' inferred element type `T` when that type is numeric. Any other cell
+# type starts from its first cell, as Julia's `sum` does: cells that hold
+# arrays (`zero(Vector{Float64})` has no method) add elementwise, with
+# Julia's `DimensionMismatch` for unequal shapes. `_PlateFirstCell{T}` holds
+# the place of a concrete `T`, and an empty plate's total is then Julia's sum
+# of no `T` values, `zero(T)`, which fails exactly as `sum(T[])` does.
+# A non-numeric abstract `T` (usually `Any`, which Julia's inference can produce
+# for a cell that calls a nested prepared kernel; see `_declare_typed_output!`)
+# says nothing about the cells, so `_PlateTotalSeed` holds the place instead.
+# An empty plate still needs a zero without any cell: that seed carries the
+# fallback element type `F` (the axis marker's element type, or a scan
+# consumer's output type), whose zero the total then takes, and a non-numeric
+# `F` asks for the cell type to be declared. The fallback is passed as the
+# marker itself (or the type) and its element type is taken only for a
+# non-concrete `T`: an unconditional `eltype(marker)` in the lowered code is a
+# runtime call under native Enzyme when the marker is not an array (Julia 1.12
+# fails to compile it).
+struct _PlateTotalSeed{F} end
+struct _PlateFirstCell{T} end
+
+@inline _plate_fallback_eltype(::Type{F}) where {F} = F
+@inline _plate_fallback_eltype(marker) = eltype(marker)
+
+@inline _plate_total_seed(::Type{T}, fallback) where {T<:Number} = zero(T)
+@inline _plate_total_seed(::Type{T}, fallback) where {T} = isconcretetype(T) ?
+    _PlateFirstCell{T}() : _PlateTotalSeed{_plate_fallback_eltype(fallback)}()
+
+@inline _plate_total_add(total, cell) = total + cell
+@inline _plate_total_add(::Union{_PlateTotalSeed,_PlateFirstCell}, cell) = cell
+
+@inline _plate_total_value(total) = total
+@inline _plate_total_value(::_PlateTotalSeed{F}) where {F} = _plate_empty_total(F)
+@inline _plate_total_value(::_PlateFirstCell{T}) where {T} = zero(T)
+
+# The partial total of one index run (`index_runs.jl`) starts as the plate
+# total does: at the numeric total's zero, or from the run's first cell.
+@inline _plate_run_seed(total) = zero(total)
+@inline _plate_run_seed(total::Union{_PlateTotalSeed,_PlateFirstCell}) = total
+@inline _plate_run_seed(total::AbstractArray) = _PlateFirstCell{typeof(total)}()
+
+_plate_empty_total(::Type{F}) where {F<:Number} = zero(F)
+_plate_empty_total(::Type{F}) where {F} = throw(ArgumentError(
+    "an empty summed plate has no total: its cell result type was not " *
+    "inferred to a concrete type, and the fallback element type $F has no " *
+    "zero. Declare the cell's result type, for example " *
+    "`cell::Float64 = ...`, so that the empty total is its zero."))
+
+# `log(exp(x) + exp(y))` with the values of `LogExpFunctions.logaddexp`,
+# non-finite inputs included. Each arm is the smooth `x + log1pexp(y - x)` with
+# the larger argument outside `log1pexp`, so ordinary reverse mode returns the
+# exact gradient (1/2, 1/2) at a finite tie; `LogExpFunctions.logaddexp` zeroes
+# the difference at every tie and returns (1, 0). Only the infinite tie, whose
+# difference is NaN, returns the shared infinity.
+@inline _tie_exact_logaddexp(x, y) = x >= y ?
+    (isinf(x) & (x == y) ? x : x + log1pexp(y - x)) : y + log1pexp(x - y)
+
+# A plate whose only consumer is `LogExpFunctions.logsumexp` streams too: the
+# accumulator folds each cell into the running log-sum-exp with
+# `_tie_exact_logaddexp`, starting from `-Inf`, the log-sum-exp of no cells.
+# That left fold can differ from `logsumexp` over the materialized vector by
+# rounding only, as a streamed sum does from Base's pairwise `sum`; at tied
+# cells its derivatives are those of `logsumexp` (the softmax), which
+# LogExpFunctions returns from 1.0.2. The accumulator is the plain
+# running value; only the cell loop adds to it, through the fold-aware
+# `_plate_total_add`. The SIMD and tiled reduction loops sum, so a plate with
+# another fold keeps the plain cell loop. The fold step stays out of line:
+# inlined into the cell loop, native Enzyme Reverse records every step's
+# branch and intermediate values, which made a streamed 318-event whole-event
+# mixture gradient slower than reducing a materialized vector (177 versus
+# 158 us); out of line it is 137 us.
+struct _PlateLogSumExpSeed{F} end
+
+@inline _plate_total_seed(::typeof(LogExpFunctions.logsumexp), ::Type{T},
+                          fallback) where {T} =
+    T <: Real && isconcretetype(T) ? convert(float(T), -Inf) :
+        _PlateLogSumExpSeed{_plate_fallback_eltype(fallback)}()
+
+@noinline _plate_total_add(::typeof(LogExpFunctions.logsumexp), total, cell) =
+    _tie_exact_logaddexp(total, cell)
+@inline _plate_total_add(::typeof(LogExpFunctions.logsumexp),
+                         ::_PlateLogSumExpSeed, cell) = cell
+
+@inline _plate_total_value(::_PlateLogSumExpSeed{F}) where {F} =
+    _plate_empty_logsumexp(F)
+
+_plate_empty_logsumexp(::Type{F}) where {F<:Real} = convert(float(F), -Inf)
+_plate_empty_logsumexp(::Type{F}) where {F} = throw(ArgumentError(
+    "an empty log-sum-exp plate has no total: its cell result type was not " *
+    "inferred to a concrete type, and the fallback element type $F is not " *
+    "real. Declare the cell's result type, for example " *
+    "`cell::Float64 = ...`, so that the empty total is `-Inf`."))
+
+# The fold a plate's selected total consumer streams, or `nothing`. A sum is
+# its bare operation or a captured source spelled `sum`. A log-sum-exp is an
+# exact call of `LogExpFunctions.logsumexp` itself, bare or qualified
+# (`_kernel_operation_identity`), never another function that shares its name.
+function _plate_total_consumer_fold(recipe::Recipe)
+    callee = recipe.source.args[1]
+    (callee === :sum || callee === GlobalRef(Base, :sum)) &&
+        (recipe.op === sum || recipe.op isa _KernelSourceOp) && return sum
+    _kernel_operation_identity(recipe) === LogExpFunctions.logsumexp &&
+        return LogExpFunctions.logsumexp
+    nothing
+end
+
+# The generated-code reference of a streamed fold other than `sum`.
+_plate_fold_ref(::typeof(LogExpFunctions.logsumexp)) =
+    GlobalRef(LogExpFunctions, :logsumexp)
+
+# The materialized tensor lanes of a plate reduced by its streamed fold.
+@inline _tensorized_plate_total(::typeof(LogExpFunctions.logsumexp), value) =
+    LogExpFunctions.logsumexp(_tensorized_plate_materialize(value))
 
 # The pointwise buffer's container type and shape come from the axis marker. For
 # an array marker `similar(marker, T, output_axes)` is the single-allocation fast
@@ -141,6 +302,11 @@ end
     similar(marker, T, output_axes)
 @inline _plate_similar_output(marker::Tuple, ::Type{T}, output_axes) where {T} =
     similar(Array{T}, output_axes)
+
+# A column projection's element type: the field's type in a concrete
+# named-tuple scan output, else `Any`, as the projection plate infers it.
+@inline _scan_column_eltype(::Type{T}, ::Val{name}) where {T,name} =
+    T <: NamedTuple && isconcretetype(T) && hasfield(T, name) ? fieldtype(T, name) : Any
 
 # An untyped plate cell exposes its result through a metadata-`Any` boundary
 # port (type annotations are optional metadata in an authored kernel), so the
@@ -196,10 +362,13 @@ function _authored_plate_result_eltype(op::_AuthoredPlateOp{K,A},
         (position in A || argtype <: Number) ? argtype : eltype(argtype)
     end
     T = Base.promote_op(op.kernel, element_types...)
+    _plate_result_eltype(T, valtype(only(outputs(op.kernel))))
+end
+
+@inline function _plate_result_eltype(::Type{T}, ::Type{D}) where {T,D}
     isconcretetype(T) && return T
-    declared = valtype(only(outputs(op.kernel)))
-    isconcretetype(declared) && return declared
-    T === Union{} ? declared : T
+    isconcretetype(D) && return D
+    T === Union{} ? D : T
 end
 
 # A plate is a pure graph map/reduction. Once Julia has instantiated the
@@ -240,6 +409,60 @@ end
     output_axes
 end
 
+# Base's `combine_axes(a1, a2, …)` for a lowered plate's batched operands. The
+# lowered body reads each operand's `axes` and passes only those integer axis
+# tuples to `_plate_broadcast_shape`, which folds them exactly as Base does.
+# Base's own `combine_axes(A, B...)` recursion splats the operands themselves:
+# past 33 operands Julia lowers its inner step to a dynamic `_apply_iterate`
+# over one tuple holding every remaining operand, and native Reverse rejects
+# the constant arrays of arrays stored there beside live vectors (snag
+# `rk-cached-bound-aa544610`). With no operand this stays `combine_axes()`,
+# which rejects the axis-less plate.
+function _plate_combined_axes_expr(arguments)
+    isempty(arguments) &&
+        return Expr(:call, GlobalRef(Base.Broadcast, :combine_axes))
+    shapes = Expr(:tuple, Any[Expr(:call, GlobalRef(Base, :axes), argument)
+                              for argument in arguments]...)
+    Expr(:call, GlobalRef(@__MODULE__, :_plate_broadcast_shape), shapes)
+end
+
+# The right fold `broadcast_shape(s1, broadcast_shape(s2, …))` of Base's
+# `combine_axes`, so results and `DimensionMismatch` messages are unchanged.
+# Inline the identity and single binary shape operation: hiding their result
+# behind a call hides invariant loop extents from native Reverse and can make
+# a nested plate allocate a separate tape per outer cell. Longer folds stay
+# out of line: inlined, one 50-operand reader plate's fold kept a large model's
+# native Reverse gradient compiling for over 33 minutes; out of line the same
+# gradient compiled in about a minute.
+@generated function _plate_broadcast_shape(shapes::Tuple)
+    fold = foldr(Any[:(getfield(shapes, $index))
+                     for index in 1:fieldcount(shapes)]) do shape, rest
+        Expr(:call, GlobalRef(Base.Broadcast, :broadcast_shape), shape, rest)
+    end
+    Expr(:block, Expr(:meta, fieldcount(shapes) <= 2 ? :inline : :noinline), fold)
+end
+
+# The body of `_promote_op` over `f` and `N` argument types `types`.
+function _promote_op_body(N)
+    arguments = Any[:(getfield(types, $index)) for index in 1:N]
+    bottom = foldr((argument, rest) -> :($argument === Union{} || $rest),
+                   arguments; init = false)
+    quote
+        $bottom && return Union{}
+        Base._return_type(f, Core.apply_type(Tuple, $(arguments...)))
+    end
+end
+
+# `Base.promote_op(f, T1, …, Tn)` for the types an emitted body computes: the
+# same result (`Union{}` when an argument type is `Union{}`, otherwise the
+# inferred return type over `Tuple{T1, …, Tn}`). Base forms that tuple type
+# through two splats (`promote_op(f, S...)`, `TupleOrBottom(tt...)`), which past
+# 32 types (`max_tuple_splat`) stay runtime `Core._apply_iterate` calls: a plate
+# cell with 33 or more operands then computed its element type on every call,
+# allocating about 900 B per plate call. Spelled out positionally, the tuple
+# type folds at compile time for any number of types.
+@inline @generated _promote_op(f, types::Vararg{Type,N}) where {N} = _promote_op_body(N)
+
 function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
     batch = _authored_plate_broadcast(Val(A), args...)
     marker = _authored_plate_marker(Val(A), args...)
@@ -260,6 +483,61 @@ function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
     _narrow_plate_output(result)
 end
 
+# One cell of an authored plate at a runtime index (`plate_cell`, cells.jl):
+# the recipe's first input is the index, the rest are the plate's arguments.
+# Lowering slices every batched argument to that cell and lowers the plate over
+# the one-cell domain, so the cell runs exactly the plate's own scalar body. A
+# single-consumer plate upstream composes into it (`_fuse_authored_plate_chains`)
+# and so runs at that cell only as well.
+struct _AuthoredPlateCellOp{K,A}
+    plate::_AuthoredPlateOp{K,A}
+end
+
+function (op::_AuthoredPlateCellOp{K,A})(index, args...) where {K,A}
+    only(op.plate(_plate_cell_slices(Val(A), index, args...)...))
+end
+
+# The plate's batched arguments restricted to the cell at `index` (a linear or
+# Cartesian position in the plate's broadcast domain), shared arguments
+# unchanged. The domain is Base's `combine_axes` of the batched arguments, as
+# the plate's own loop computes it (`_plate_combined_axes_expr`), and indexing
+# its `CartesianIndices` keeps Julia's bounds check. An argument extruded along
+# a dimension keeps that singleton dimension, so the one-cell broadcast reads
+# exactly the elements the cell reads in the plate. Only axes are combined: a
+# tuple wrapping the shared arguments beside the batched ones would put
+# constant and active arrays in one value, which native Enzyme Reverse rejects.
+# Lowered cells emit the same steps per argument (`_lower_authored_plate_cell!`);
+# this is the operation's ordinary call.
+@generated function _plate_cell_slices(::Val{A}, index, args::Vararg{Any,N}) where {A,N}
+    batched = [position for position in 1:N if !(position in A)]
+    raw(position) = :($(GlobalRef(Base, :broadcastable))(getfield(args, $position)))
+    shape = _plate_combined_axes_expr(Any[raw(position) for position in batched])
+    slices = Any[position in A ? :(getfield(args, $position)) :
+                 :(_plate_cell_slice($(raw(position)), cell)) for position in 1:N]
+    quote
+        cell = _plate_cell_position(_plate_require_axes($shape), index)
+        ($(slices...),)
+    end
+end
+
+@inline _plate_cell_position(shape, index) = CartesianIndices(shape)[index]
+
+@inline _plate_cell_slice(arg, cell) = arg
+@inline _plate_cell_slice(arg::Tuple, cell) =
+    length(arg) == 1 ? arg : (arg[cell[1]],)
+# A view, never a copy: a fresh container holding the caller's element arrays
+# (one array per cell) gives native Reverse a shadow that aliases them, and the
+# gradient then accumulates into the caller's data.
+@inline function _plate_cell_slice(arg::AbstractArray{<:Any,N}, cell) where {N}
+    N == 0 && return arg
+    ranges = ntuple(N) do dimension
+        axis = axes(arg, dimension)
+        position = length(axis) == 1 ? first(axis) : cell[dimension]
+        position:position
+    end
+    view(arg, ranges...)
+end
+
 # A first-class authored SEQUENTIAL scan.  Unlike `plate` (a pure broadcast map),
 # it threads a carry through an ordered loop; its scalar step is a 2-`want` kernel
 # `(carry, x, shared...) -> (new_carry, output)`. Native lowering inlines that
@@ -267,10 +545,18 @@ end
 # calls `_tensorized_scan`, specialized by a backend to a `stablehlo.while`.
 # The op's argument order is fixed by authoring: index 1 = carry seed, index 2 =
 # the sequence `xs`, index 3+ = Ref-shared operands; `A` records the atomic
-# (broadcast-invariant) indices {1, 3, 4, …}.
-struct _AuthoredScanOp{K,A}
+# (broadcast-invariant) indices {1, 3, 4, …}. `I` is the authored
+# `include_init` literal: when `true` the result is `[init, output…]`, one
+# element longer than the sequences, written into one buffer. `H` is true for
+# `history = h0`: then `h0` is the LAST argument (atomic) and the step's last
+# formal reads the outputs written so far.
+struct _AuthoredScanOp{K,A,I,H}
     kernel::K
 end
+_AuthoredScanOp{K,A}(kernel::K) where {K,A} = _AuthoredScanOp{K,A,false,false}(kernel)
+_scan_has_history(::_AuthoredScanOp{K,A,I,H}) where {K,A,I,H} = H
+
+_scan_includes_init(::_AuthoredScanOp{K,A,I}) where {K,A,I} = I
 
 "The transparent scalar step plan captured by an authored `scan(...) do` recipe."
 function scan_body(recipe::Recipe)
@@ -284,13 +570,16 @@ end
 # The iterated sequences are the remaining operand indices (>= 2, not in `A`).
 # Split them at compile time so `_tensorized_scan` receives the sequence tuple and
 # the shared tuple explicitly.
-@generated function (op::_AuthoredScanOp{K,A})(args...) where {K,A}
+@generated function (op::_AuthoredScanOp{K,A,I,H})(args...) where {K,A,I,H}
     n = length(args)
-    n >= 2 || return :(throw(ArgumentError(
+    n >= 2 + H || return :(throw(ArgumentError(
         "an authored scan expects (init, sequence, shared...) arguments")))
-    iterated = Expr(:tuple, (:(args[$i]) for i in 2:n if !(i in A))...)
-    shared = Expr(:tuple, (:(args[$i]) for i in 2:n if i in A)...)
-    :(_tensorized_scan(op.kernel, args[1], $iterated, $shared))
+    last_shared = H ? n - 1 : n
+    iterated = Expr(:tuple, (:(args[$i]) for i in 2:last_shared if !(i in A))...)
+    shared = Expr(:tuple, (:(args[$i]) for i in 2:last_shared if i in A)...)
+    H && return :(_tensorized_scan_history(op.kernel, args[1], args[$n],
+                                           $iterated, $shared))
+    :(_tensorized_scan(op.kernel, args[1], $iterated, $shared, Val($I)))
 end
 
 function _lhs_symbols!(symbols::Set{Symbol}, lhs)
@@ -345,9 +634,20 @@ function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int)
     length(params) == length(callargs) || throw(ArgumentError(
         "embedded kernel expected $(length(params)) inputs, got $(length(callargs))"))
 
+    statements = Any[]
     names = Dict{Symbol,Any}()
     for (param, callarg) in zip(params, callargs)
-        names[_signature_name(param)] = callarg
+        name = _signature_name(param)
+        # A call evaluates each argument once, before entering its body.
+        # Preserve that boundary when embedding: substituting an array
+        # projection at each use can move its load into nested loops.
+        if callarg isa Expr
+            binding = gensym(Symbol(:embedded_argument_, name))
+            push!(statements, Expr(:(=), binding, callarg))
+            names[name] = binding
+        else
+            names[name] = callarg
+        end
     end
     locals = _local_symbols!(Set{Symbol}(), body)
     for local_name in locals
@@ -355,7 +655,6 @@ function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int)
             (names[local_name] = gensym(Symbol(:embedded_, local_name)))
     end
 
-    statements = Any[]
     bodyargs = body.args
     return_index = findlast(statement ->
         statement isa Expr && statement.head === :return, bodyargs)
@@ -374,44 +673,585 @@ function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int)
     statements
 end
 
-function _authored_plate_sum_recipe(p::Plan, plate_recipe::Recipe)
+# Whether a recipe is the authored one-argument call `f(x)` of its one input.
+# Its source spells the input by the name the source reads it by
+# (`_recipe_source_names`), which is not the value's name in a composed child:
+# the child's `sum(squares)` reads the value `p.squares` scoped under the
+# caller's result `p`.
+function _unary_source_call(recipe::Recipe)
+    recipe.effectful && return false
+    length(recipe.inputs) == 1 || return false
+    source = recipe.source
+    source isa Expr && source.head === :call && length(source.args) == 2 || return false
+    source.args[2] === only(_recipe_source_names(recipe))
+end
+
+# Whether a recipe is the authored `sum(x)` of its one input.
+_plain_sum_recipe(recipe::Recipe) =
+    _unary_source_call(recipe) && _plate_total_consumer_fold(recipe) === sum
+
+# The selected recipe that reduces an authored plate's pointwise port by a
+# streamed fold (`_plate_total_consumer_fold`), or `nothing`.
+function _authored_plate_total_recipe(p::Plan, plate_recipe::Recipe)
     pointwise = only(plate_recipe.outputs)
     pointwise_id = canon_id(p.graph, pointwise.id)
     matches = Recipe[]
     for recipe in p.recipes
         recipe === plate_recipe && continue
-        recipe.effectful && continue
-        length(recipe.inputs) == 1 || continue
+        _unary_source_call(recipe) || continue
         canon_id(p.graph, only(recipe.inputs).id) == pointwise_id || continue
-        source = recipe.source
-        source isa Expr && source.head === :call && length(source.args) == 2 || continue
-        callee = source.args[1]
-        (callee === :sum || callee === GlobalRef(Base, :sum)) || continue
-        source.args[2] === pointwise.name || continue
-        (recipe.op === sum || recipe.op isa _KernelSourceOp) || continue
+        _plate_total_consumer_fold(recipe) === nothing && continue
         push!(matches, recipe)
     end
     length(matches) <= 1 || throw(ArgumentError(
-        "an authored plate pointwise port has more than one selected sum consumer"))
+        "an authored plate pointwise port has more than one selected total consumer"))
     isempty(matches) ? nothing : only(matches)
 end
 
-# Inline the scalar step into the ordered native loop. Calling the nested
-# PreparedKernel from a loop with a changing carry defeats inference across the
-# RGF boundary; the same step AST and operation table specialize normally here.
-function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
-                                      offset; consumer = nothing)
+# The selected summing consumer of an authored plate, or `nothing`.
+function _authored_plate_sum_recipe(p::Plan, plate_recipe::Recipe)
+    recipe = _authored_plate_total_recipe(p, plate_recipe)
+    recipe === nothing && return nothing
+    _plate_total_consumer_fold(recipe) === sum ? recipe : nothing
+end
+
+# A scan step whose own operation table holds one plain operation per recipe.
+# Preparing a step lowers a nested plate, scan or embedded kernel into the
+# step's table, whose slots then no longer line up with the step's recipes.
+_scan_step_is_plain(step) =
+    length(step.ops) == length(step.plan.recipes) &&
+    !any(op -> op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
+         _embedded_kernel(op) !== nothing, step.ops)
+
+# The step operands of a scan from its argument types `(init, operand...)`:
+# the carry seed, one element of each iterated sequence, then the shared
+# operands. A `history = h0` scan's last argument is the fill value.
+function _scan_step_input_types(op::_AuthoredScanOp, input_types)
+    atomic = typeof(op).parameters[2]
+    last_shared = length(input_types) - _scan_has_history(op)
+    Any[input_types[1],
+        (Expr(:call, GlobalRef(Base, :eltype), input_types[i])
+         for i in 2:last_shared if !(i in atomic))...,
+        (input_types[i] for i in 2:last_shared if i in atomic)...]
+end
+
+# The type of a scan's result from its argument types and the step's
+# output type `element`: the seed promoted in for `include_init = true`, or
+# the history column types (independent of `element`).
+function _scan_result_type_expr(op::_AuthoredScanOp, input_types, element)
+    _scan_has_history(op) && return Expr(:call,
+        GlobalRef(@__MODULE__, :_scan_history_result_type), input_types[end])
+    element = _scan_includes_init(op) ?
+            Expr(:call, GlobalRef(Base, :promote_type), input_types[1], element) :
+            element
+    Expr(:curly, GlobalRef(Base, :Vector), element)
+end
+
+# The leaf-operation type of a scan step's per-step output (its second WANT).
+# Each recipe of the step's plan gets a cold type-only slot, nested plates and
+# scans recursing (`_body_types!`). A step that owns a plate, scan or embedded
+# kernel declares its typed locals (`_lower_with_ops`), so a concrete declared
+# type is the value's type there.
+function _scan_step_output_type!(runtime_ops, runtime_recipes, step, input_types,
+                                 base)
+    p = step.plan
+    types = _body_types!(runtime_ops, runtime_recipes, p,
+        Any[recipe.op for recipe in p.recipes], p.recipes, input_types, base;
+        declared = _needs_embedded_tensorization(p))
+    types[canon_id(p.graph, p.want[2].id)]
+end
+
+# Cold type-only slots for a scan step that is not plain, appended by both
+# backend products right after the step's own operations so their tables stay
+# equal. Only the native product reads them: they type a nested step's output
+# from its leaf operations. Querying the scan operation itself instead would
+# pass its complete step PreparedKernel, with the graph and `Expr` metadata, to
+# a runtime type query that ordinary Reverse cannot prove readonly
+# (`EnzymeMutabilityException`), and an empty sequence would have no output
+# type. Returns the slots' table offset, or `nothing` when the step needs none.
+function _scan_type_slots!(runtime_ops, runtime_recipes, op::_AuthoredScanOp)
+    (_scan_has_history(op) || _scan_step_is_plain(op.kernel)) && return nothing
+    offset = length(runtime_ops)
+    _scan_step_output_type!(runtime_ops, runtime_recipes, op.kernel,
+        Any[GlobalRef(Core, :Any) for _ in op.kernel.plan.have], 0)
+    offset
+end
+
+# The static type of an inlined scan step's per-step output, as a chain of
+# `_promote_op` over the step's own operations: the type the first step's
+# output would have, without running it. The authored-plate element type uses
+# the same chain; unlike inferring the nested PreparedKernel as a whole, each
+# operation infers exactly inside the enclosing generated body. A step that is
+# not plain is typed from the cold slots `_scan_type_slots!` placed at
+# `type_offset`, re-deriving the same layout; `nothing` without them.
+function _authored_scan_step_output_type(step, input_types, offset;
+                                         type_offset = nothing)
+    p = step.plan
+    if !_scan_step_is_plain(step)
+        type_offset === nothing && return nothing
+        return _scan_step_output_type!(Any[], Recipe[], step, input_types,
+                                       type_offset)
+    end
+    types = Dict{ValueId,Any}(canon_id(p.graph, v.id) => T
+                          for (v, T) in zip(p.have, input_types))
+    for (i, recipe) in enumerate(p.recipes)
+        all(v -> haskey(types, canon_id(p.graph, v.id)), recipe.inputs) ||
+            return nothing
+        T = Expr(:call, GlobalRef(@__MODULE__, :_promote_op), Expr(:ref, _OPS_ARG, offset + i),
+                 (types[canon_id(p.graph, v.id)] for v in recipe.inputs)...)
+        if length(recipe.outputs) == 1
+            types[canon_id(p.graph, only(recipe.outputs).id)] = T
+        else
+            for (j, output) in enumerate(recipe.outputs)
+                types[canon_id(p.graph, output.id)] =
+                    Expr(:call, GlobalRef(Base, :fieldtype), T, j)
+            end
+        end
+    end
+    length(p.want) == 2 || return nothing
+    get(types, canon_id(p.graph, p.want[2].id), nothing)
+end
+
+# These roots are compiler-generated type queries, not arbitrary user code.
+# Their Expr objects form a DAG: substituting a shared predecessor at every
+# use turns a sequence of diamonds into an exponentially large Julia AST.
+# Emit each reachable query once, in dependency order and in the block where
+# the root already executes. Identity memoization visits the DAG once; after
+# replacing children with locals, structural interning also shares separately
+# constructed identical queries without hashing their expanded trees.
+function _bind_native_type_exprs!(body, roots)
+    nodes = IdDict{Expr,Any}()
+    queries = Dict{Expr,Symbol}()
+    bind(x) = x
+    function bind(ex::Expr)
+        get!(nodes, ex) do
+            ex.head in (:call, :curly) || return ex
+            query = Expr(ex.head, map(bind, ex.args)...)
+            get!(queries, query) do
+                name = gensym(:native_type)
+                push!(body.args, Expr(:(=), name, query))
+                name
+            end
+        end
+    end
+    map(bind, roots)
+end
+
+# The inlined scalar step of a scan without `history`, shared by its native
+# lowerings: the iterated sequences `seqs` (`xs` defines the axis), the step
+# body reading one element of each sequence at `index` and binding
+# `(carry, output)`, and the step's static output type. The step reads the
+# carry and the sequence elements by the names given; shared operands pass
+# whole.
+function _authored_scan_step(op::_AuthoredScanOp, callargs, offset, index, carry,
+                             output; strips = nothing, type_offset = nothing)
     step = op.kernel
-    indices, index, carry, output = gensym.((:scan_indices, :scan_index,
-                                            :scan_carry, :scan_output))
     # `A` marks the atomic operands: index 1 (the carry seed) plus the `Ref`
     # shareds.  The iterated sequences are the remaining operand indices; each is
     # indexed by the loop counter per step, while shared operands pass whole.
     atomic = typeof(op).parameters[2]
     iterated_positions = [i for i in 2:length(callargs) if !(i in atomic)]
     shared_positions = [i for i in 2:length(callargs) if i in atomic]
-    seqs = Any[callargs[i] for i in iterated_positions]
+    # A strip-fused sequence (`strips`, `_lower_authored_scan_strips!`) holds
+    # only the current strip, `strips.lo:strips.hi`; the domain it spans stands
+    # in for it wherever the whole sequence is meant.
+    fused(i) = strips !== nothing && i in strips.positions
+    domain = strips === nothing ? nothing :
+        Expr(:call, GlobalRef(Base, :LinearIndices), Expr(:tuple, strips.axis))
+    seqs = Any[fused(i) ? domain : callargs[i] for i in iterated_positions]
     xs = first(seqs)                                    # the axis-defining sequence
+    arguments = Any[carry]
+    # One element of each sequence per step. The index comes from
+    # `eachindex(seqs...)`, valid for every sequence, so the read needs no
+    # bounds check (the hand loop's `@inbounds`); a strip read is offset into
+    # the strip, which always covers the step.
+    elements = Any[]
+    for i in iterated_positions
+        element = gensym(:scan_element)
+        position = fused(i) ? :($index - $(strips.lo) + 1) : index
+        push!(elements, :($element = $(_inbounds_value(:($(callargs[i])[$position])))))
+        push!(arguments, element)
+    end
+    for i in shared_positions
+        push!(arguments, callargs[i])
+    end
+    step_statements = _embedded_statements(
+        step.ast, arguments, Expr(:tuple, carry, output), offset)
+    if strips !== nothing && !isempty(strips.hoisted)
+        # A hoisted statement's value is already in its strip buffer.
+        step_statements = Any[_scan_hoisted_read(statement, strips, index)
+                              for statement in step_statements]
+    end
+    step_body = Expr(:block, elements..., step_statements...)
+    # The step's static output type for an empty sequence: the step's argument
+    # types are the carry seed, one element of each sequence and the shared
+    # operands, exactly as the first step would receive them.
+    typeof_ref, eltype_ref = GlobalRef(Base, :typeof), GlobalRef(Base, :eltype)
+    step_input_types = Any[Expr(:call, typeof_ref, callargs[1])]
+    for i in iterated_positions
+        push!(step_input_types, Expr(:call, eltype_ref, callargs[i]))
+    end
+    for i in shared_positions
+        push!(step_input_types, Expr(:call, typeof_ref, callargs[i]))
+    end
+    inferred_output_type = something(
+        _authored_scan_step_output_type(step, step_input_types, offset;
+                                        type_offset), Any)
+    (; seqs, xs, step_body, inferred_output_type)
+end
+
+# Inline the scalar step into the ordered native loop. Calling the nested
+# PreparedKernel from a loop with a changing carry defeats inference across the
+# RGF boundary; the same step AST and operation table specialize normally here.
+# An empty sequence runs no step: the scan port is an empty vector of the
+# step's output type and a fused plate consumer sums nothing. An
+# `include_init = true` scan writes the carry seed and then each output into
+# one buffer one element longer than the sequences (`[init]` when empty).
+#
+# When the step's inferred output type is concrete, the first output has
+# exactly that type, so each buffer is allocated once with it, before the
+# emptiness branch, and both arms return that one allocation. Two buffers
+# allocated in separate arms would meet in one SSA value, which Enzyme's
+# static activity analysis rejects once the empty arm's buffer is never
+# written with active data (`EnzymeRuntimeActivityError`;
+# `benchmark/repro_enzyme_branch_allocation_phi.jl`). Allocating after a
+# branch that peels the first step to type the buffer does not avoid it: the
+# optimizer splits that allocation back into the arms. An inferred type that
+# is not concrete keeps one allocation per arm, typed by the first output when
+# there is one. A step with a nested plate, scan or embedded kernel is typed
+# from the cold slots at `type_offset` (`_scan_type_slots!`); without them its
+# type is `Any`.
+function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
+                                      offset; consumer = nothing, recycled = nothing,
+                                      pointwise_recycled = nothing,
+                                      type_offset = nothing, strips = nothing,
+                                      terminals = nothing, columns = nothing)
+    _scan_has_history(op) && return _lower_authored_scan_history_native!(
+        body, op, callargs, lhs, offset; recycled)
+    indices, index, carry, output, output_type, position = gensym.((:scan_indices,
+        :scan_index, :scan_carry, :scan_output, :scan_output_type, :scan_position))
+    (; seqs, xs, step_body, inferred_output_type) = _authored_scan_step(
+        op, callargs, offset, index, carry, output; strips, type_offset)
+    typeof_ref = GlobalRef(Base, :typeof)
+    invariant = Any[]
+    # `typing` runs before the emptiness branch: it binds the inferred output
+    # type and, when that type is concrete, preallocates every buffer into its
+    # own untyped local. Each arm binds the buffer to that preallocation, or
+    # allocates when there is none; with a concrete type the test folds away
+    # and both arms bind the one preallocated buffer. The buffer's own name is
+    # never bound to `nothing`: a declared output type converts every
+    # assignment to it.
+    typing = Expr(:block)
+    empty_output, initial_output = Expr(:block), Expr(:block)
+    loop_output, final_output = Expr(:block), Expr(:block)
+    inferred_output_type = only(_bind_native_type_exprs!(typing, [inferred_output_type]))
+    push!(typing.args, :($output_type = $inferred_output_type))
+    concrete = gensym(:scan_concrete_output)
+    push!(typing.args, :($concrete = $(GlobalRef(Base, :isconcretetype))($output_type)))
+    push!(initial_output.args, :($output_type = $typeof_ref($output)))
+    function buffer!(name, allocation)
+        preallocated = gensym(:scan_preallocated)
+        push!(typing.args, :($preallocated = $concrete ? $allocation : nothing))
+        for block in (empty_output, initial_output)
+            push!(block.args,
+                  :($name = $preallocated === nothing ? $allocation : $preallocated))
+        end
+    end
+    axes_ref = GlobalRef(Base, :axes)
+    if lhs !== nothing && _scan_includes_init(op)
+        seed, similar_ref = callargs[1], GlobalRef(Base, :similar)
+        promote_ref, length_ref = GlobalRef(Base, :promote_type), GlobalRef(Base, :length)
+        trajectory_type = :($promote_ref($typeof_ref($seed), $output_type))
+        allocation = :($similar_ref($xs, $trajectory_type, $length_ref($indices) + 1))
+        buffer!(lhs, recycled === nothing ? allocation : _lane_allocation(recycled,
+            trajectory_type, :(($(GlobalRef(Base, :OneTo))($length_ref($indices) + 1),)),
+            allocation))
+        for block in (empty_output, initial_output)
+            push!(block.args, :($lhs[1] = $seed))
+        end
+        push!(initial_output.args, :($lhs[2] = $output))
+        push!(initial_output.args, :($position = 2))
+        push!(loop_output.args, :($position += 1))
+        # `position` stays within the `length(indices) + 1` buffer.
+        push!(loop_output.args, _inbounds_expr(:($lhs[$position] = $output)))
+    elseif lhs !== nothing
+        allocation = :($(GlobalRef(Base, :similar))($xs, $output_type))
+        buffer!(lhs, recycled === nothing ? allocation :
+            _lane_allocation(recycled, output_type, :($axes_ref($xs)), allocation))
+        push!(initial_output.args, :($lhs[$index] = $output))
+        # The buffer shares the sequences' axes, which `index` comes from.
+        push!(loop_output.args, _inbounds_expr(:($lhs[$index] = $output)))
+    end
+    if columns !== nothing
+        # Each projected field of the named-tuple output goes straight into its
+        # column's buffer, typed and narrowed as the projection plate's own
+        # pointwise buffer (`_authored_scan_column_projections`).
+        for column in columns
+            field = QuoteNode(column.field)
+            column_type = :($(GlobalRef(@__MODULE__, :_scan_column_eltype))(
+                $output_type, $(GlobalRef(Base, :Val))($field)))
+            allocation = :($(GlobalRef(Base, :similar))($xs, $column_type))
+            buffer!(column.lhs, column.recycled === nothing ? allocation :
+                _lane_allocation(column.recycled, column_type, :($axes_ref($xs)),
+                                 allocation))
+            value = :($(GlobalRef(Base, :getproperty))($output, $field))
+            push!(initial_output.args, :($(column.lhs)[$index] = $value))
+            push!(loop_output.args, _inbounds_expr(:($(column.lhs)[$index] = $value)))
+            push!(final_output.args, :($(column.lhs) =
+                $(GlobalRef(@__MODULE__, :_narrow_plate_output))($(column.lhs))))
+        end
+    end
+    if consumer !== nothing
+        cell, args, positions, cell_offset, pointwise_lhs, total_lhs = consumer
+        cell_output = gensym(:scan_cell)
+        cell_args = Any[i in positions ? output : arg for (i, arg) in enumerate(args)]
+        invariant, dynamic, cell_type = _authored_scan_cell_statements(
+            cell, cell_args, positions, cell_output, cell_offset; output_type)
+        append!(step_body.args, dynamic)
+        # Match ordinary plate lowering's inferred result type, including
+        # heterogeneous cells; the first value alone cannot type that buffer.
+        plate_eltype = gensym(:scan_plate_eltype)
+        for block in (typing, initial_output)
+            push!(block.args, :($plate_eltype = $cell_type))
+        end
+        if pointwise_lhs !== nothing
+            allocation = :($(GlobalRef(Base, :similar))($xs, $plate_eltype))
+            buffer!(pointwise_lhs, pointwise_recycled === nothing ? allocation :
+                _lane_allocation(pointwise_recycled, plate_eltype,
+                    :($axes_ref($xs)), allocation))
+            push!(initial_output.args, :($pointwise_lhs[$index] = $cell_output))
+            push!(loop_output.args, :($pointwise_lhs[$index] = $cell_output))
+            push!(final_output.args, :($pointwise_lhs =
+                $(GlobalRef(@__MODULE__, :_narrow_plate_output))($pointwise_lhs)))
+        end
+        total_seed = :($(GlobalRef(@__MODULE__, :_plate_total_seed))(
+            $plate_eltype, $output_type))
+        push!(initial_output.args, :($total_lhs =
+            $(GlobalRef(@__MODULE__, :_plate_total_add))($total_seed, $cell_output)))
+        push!(empty_output.args, :($total_lhs =
+            $(GlobalRef(@__MODULE__, :_plate_total_value))($total_seed)))
+        push!(loop_output.args, :($total_lhs = $total_lhs + $cell_output))
+    end
+    terminal_init = Expr(:block)
+    if terminals !== nothing
+        seed_sample, sample = gensym.((:scan_terminal_seed, :scan_terminal_sample))
+        storage_type = gensym(:scan_terminal_storage_type)
+        push!(typing.args, :($storage_type = $(GlobalRef(Base, :promote_type))(
+            $typeof_ref($(callargs[1])), $output_type)))
+        # The declared local converts the allocated vector before any writes.
+        # Its element type therefore controls each seed/output conversion.
+        converted(value) = terminals.eltype === nothing ?
+            :($(GlobalRef(Base, :convert))($storage_type, $value)) :
+            _scan_terminal_convert(terminals.eltype, value)
+        push!(terminal_init.args, :($seed_sample = $(converted(callargs[1]))))
+        for block in (initial_output, loop_output)
+            push!(block.args, :($sample = $(converted(output))))
+        end
+        for term in terminals.items
+            cell(value) = term.transform === nothing ? value :
+                _scan_terminal_convert(term.eltype, _scan_terminal_scalar(
+                    term.source, term.bindings, term.scan_names,
+                    value, seed_sample, term.mod))
+            accumulator = gensym(:scan_minimum)
+            push!(terminal_init.args, :($accumulator = $(cell(seed_sample))))
+            for block in (initial_output, loop_output)
+                push!(block.args, :($accumulator = $(GlobalRef(Base, :min))(
+                    $accumulator, $(cell(sample)))))
+            end
+            # A declared reduction result converts once, after the reduction.
+            push!(final_output.args, :($(term.lhs) = $accumulator))
+        end
+    end
+    # `eachindex(seqs...)` throws `DimensionMismatch` unless every iterated
+    # sequence shares axes, giving the lockstep length check for free.
+    push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($(seqs...))))
+    append!(body.args, invariant)
+    append!(body.args, typing.args)
+    outer_body = body
+    if terminals !== nothing
+        # Dense vector storage has ordinary element conversion and indexing.
+        # Custom/non-vector storage and uninferred step types retain exactly
+        # the materialized scan and its original source callables.
+        fallback = Expr(:block)
+        _lower_authored_scan_native!(fallback, op, callargs, terminals.scan_lhs,
+            offset; recycled, type_offset)
+        for term in terminals.items
+            input = terminals.scan_lhs
+            if term.transform !== nothing
+                input = term.transform_lhs
+                term.eltype === nothing || push!(fallback.args,
+                    Expr(:local, Expr(:(::), input, valtype(only(term.transform.outputs)))))
+                call = term.recycled === nothing ? nothing :
+                    _lane_source_expr(term.transform, term.args, term.recycled)
+                call === nothing && (call = Expr(:call,
+                    Expr(:ref, _OPS_ARG, term.slot), term.args...))
+                push!(fallback.args, :($input = $call))
+            end
+            push!(fallback.args, :($(term.lhs) = $(GlobalRef(Base, :minimum))($input)))
+        end
+        ready = :($xs isa $(Vector) && $storage_type <: $(Union{Float16,Float32,Float64}))
+        for seq in seqs[2:end]
+            ready = :($ready && $seq isa $(AbstractVector))
+        end
+        body = Expr(:block, terminal_init.args...)
+        push!(outer_body.args, Expr(:if, ready, body, fallback))
+    end
+    nonempty = Expr(:block)
+    push!(nonempty.args, :($carry = $(callargs[1])))
+    push!(nonempty.args, :($index = $(GlobalRef(Base, :first))($indices)))
+    append!(nonempty.args, step_body.args)
+    append!(nonempty.args, initial_output.args)
+    if strips === nothing
+        push!(nonempty.args, Expr(:for,
+            :($index = $(GlobalRef(@__MODULE__, :_scan_rest))($indices)),
+            Expr(:block, step_body.args..., loop_output.args...)))
+    else
+        # The rest of the first strip, then one strip at a time: refill the
+        # strip, then run its steps in a loop of their own, so the refill
+        # never sits inside the loop that carries the recurrence.
+        lo, hi, last_index = strips.lo, strips.hi, gensym(:scan_last)
+        steps(range) = Expr(:for, :($index = $range),
+            Expr(:block, copy(step_body).args..., copy(Expr(:block, loop_output.args...)).args...))
+        push!(nonempty.args, :($last_index = $(GlobalRef(Base, :last))($indices)))
+        push!(nonempty.args, steps(:(($(GlobalRef(Base, :first))($indices) + 1):$hi)))
+        push!(nonempty.args, :($lo = $hi + 1))
+        push!(nonempty.args, Expr(:while, :($lo <= $last_index), Expr(:block,
+            :($hi = $(GlobalRef(Base, :min))(
+                $lo + $(GlobalRef(@__MODULE__, :_PLATE_STRIP)) - 1, $last_index)),
+            copy(strips.refill).args...,
+            steps(:($lo:$hi)),
+            :($lo = $hi + 1))))
+    end
+    push!(body.args, Expr(:if, :($(GlobalRef(Base, :isempty))($indices)),
+                          empty_output, nonempty))
+    append!(body.args, final_output.args)
+    outer_body
+end
+
+# A scan read only through `trajectory[lo:hi]` (`_authored_scan_slice_demand`)
+# runs only the steps that slice reads and writes their outputs straight into
+# the slice's result, emitted where the reader is. It stops after the last
+# demanded step; a `carry_free` step (one that reads neither its carry nor
+# history) also skips every step before the first demanded one. The steps it
+# skips compute only values nothing reads, as plan selection drops unread
+# values elsewhere. The result is the reader's: the same bounds, an
+# out-of-bounds slice throws the `BoundsError` that slicing the whole
+# trajectory throws, and an empty slice runs no step. The demand loop needs a
+# concrete trajectory element type, `Int` bounds, unit-range step indices and
+# a vector or range sequence (whose trajectory is a `Vector`), all decided
+# when the body is compiled; otherwise the ordinary scan and the reader's own
+# call `reader_call` run.
+function _lower_authored_scan_slice_native!(body, op::_AuthoredScanOp, callargs,
+        offset, demand, reader_args, lhs, reader_call; type_offset = nothing)
+    indices, index, carry, output = gensym.((:scan_indices, :scan_index,
+        :scan_carry, :scan_output))
+    (; seqs, xs, step_body, inferred_output_type) = _authored_scan_step(
+        op, callargs, offset, index, carry, output; type_offset)
+    init = Int(_scan_includes_init(op))
+    seed = callargs[1]
+    # Evaluate each reader argument once, as its call would.
+    reader_args = Any[reader_args...]
+    for (i, arg) in enumerate(reader_args)
+        (i == demand.position || arg isa Symbol) && continue
+        name = gensym(:scan_slice_argument)
+        push!(body.args, :($name = $arg))
+        reader_args[i] = name
+    end
+    trajectory_length, lo, hi, element_type, slot, position = gensym.((
+        :scan_trajectory_length, :scan_slice_lo, :scan_slice_hi,
+        :scan_trajectory_eltype, :scan_slice_slot, :scan_slice_position))
+    lo_ex, hi_ex = _scan_slice_bound_exprs(demand, reader_args, trajectory_length)
+
+    ordinary = Expr(:block)
+    trajectory = gensym(:scan_trajectory)
+    _lower_authored_scan_native!(ordinary, op, callargs, trajectory, offset; type_offset)
+    ordinary_args = copy(reader_args)
+    ordinary_args[demand.position] = trajectory
+    push!(ordinary.args, Expr(:(=), lhs, Expr(:call, reader_call, ordinary_args...)))
+
+    typing = Expr(:block)
+    output_type = only(_bind_native_type_exprs!(typing, [inferred_output_type]))
+    append!(body.args, typing.args)
+    push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($(seqs...))))
+    push!(body.args, :($element_type = $(init == 1 ?
+        :($(GlobalRef(Base, :promote_type))($(GlobalRef(Base, :typeof))($seed), $output_type)) :
+        output_type)))
+    push!(body.args, :($trajectory_length = $(GlobalRef(Base, :length))($indices) + $init))
+    push!(body.args, :($lo = $lo_ex))
+    push!(body.args, :($hi = $hi_ex))
+
+    vector_ref = GlobalRef(Base, :Vector)
+    store(at, value) = _inbounds_expr(:($lhs[$at - $lo + 1] = $value))
+    demanded = Expr(:block)
+    push!(demanded.args, :($lo <= $hi && !(1 <= $lo && $hi <= $trajectory_length) &&
+        $(GlobalRef(Core, :throw))($(GlobalRef(Core, :BoundsError))(
+            $vector_ref{$element_type}(undef, $trajectory_length), ($lo:$hi,)))))
+    push!(demanded.args, :($lhs = $vector_ref{$element_type}(undef,
+        $(GlobalRef(Base, :max))($hi - $lo + 1, 0))))
+    init == 1 && push!(demanded.args, :($lo == 1 && $hi >= 1 && $(store(1, seed))))
+    step_at(k) = Expr(:block, :($index = $(_inbounds_value(:($indices[$k])))),
+                      copy(step_body).args...)
+    if demand.carry_free
+        # Each output depends on its own step: run exactly the demanded ones.
+        first_position = :($(GlobalRef(Base, :max))($lo, $(1 + init)))
+        push!(demanded.args, :($carry = $seed))
+        push!(demanded.args, Expr(:for, Expr(:(=), position, :($first_position:$hi)),
+            Expr(:block, step_at(:($position - $init)).args..., store(position, output))))
+    else
+        # Steps 1 through the last demanded one, the first peeled so the carry
+        # takes the step's type, as in the ordinary loop.
+        last_step = gensym(:scan_slice_last_step)
+        steps = Expr(:block, :($carry = $seed), step_at(1).args...,
+            :($position = $(1 + init)),
+            :($position >= $lo && $(store(position, output))),
+            Expr(:for, :($slot = 2:$last_step), Expr(:block, step_at(slot).args...,
+                :($position = $slot + $init),
+                :($position >= $lo && $(store(position, output))))))
+        push!(demanded.args, :($last_step = $hi - $init))
+        push!(demanded.args, Expr(:if, :($lo <= $hi && $last_step >= 1), steps))
+    end
+    ready = :($(GlobalRef(Base, :isconcretetype))($element_type) &&
+              $lo isa $Int && $hi isa $Int &&
+              $indices isa $(AbstractUnitRange{Int}) &&
+              $xs isa $(Union{AbstractRange,Vector}))
+    push!(body.args, Expr(:if, ready, demanded, ordinary))
+    body
+end
+
+# `local = __ops__[slot](...)` for a hoisted step statement becomes a read of
+# its strip buffer at the step (`_lower_authored_scan_strips!`).
+function _scan_hoisted_read(statement, strips, index)
+    statement isa Expr && statement.head === :(=) || return statement
+    call = statement.args[2]
+    call isa Expr && call.head === :call || return statement
+    callee = call.args[1]
+    callee isa Expr && callee.head === :ref && length(callee.args) == 2 &&
+        callee.args[1] === _OPS_ARG || return statement
+    buffer = get(strips.hoisted, callee.args[2], nothing)
+    buffer === nothing && return statement
+    Expr(:(=), statement.args[1],
+         _inbounds_value(:($buffer[$index - $(strips.lo) + 1])))
+end
+
+# A `history = h0` scan: the result vector is filled with `h0` before the first
+# step and each step writes its output into it, so the step's last argument —
+# a read-only view of that vector — holds the outputs of the earlier steps and
+# `h0` at and after the current one: the in-place hand loop. Its element type
+# is `typeof(h0)`; an empty sequence runs no step and yields an empty vector.
+# A vector `history = leading` starts the result with those entries and writes
+# each output after them (`_scan_history_offset`).
+function _lower_authored_scan_history_native!(body, op::_AuthoredScanOp, callargs,
+                                              lhs, offset; recycled = nothing)
+    lhs === nothing && throw(ArgumentError(
+        "a `history =` scan materializes its output vector"))
+    step = op.kernel
+    indices, index, carry, output, earlier = gensym.((:scan_indices,
+        :scan_index, :scan_carry, :scan_output, :scan_history))
+    atomic = typeof(op).parameters[2]
+    fill_value = callargs[end]
+    iterated_positions = [i for i in 2:(length(callargs) - 1) if !(i in atomic)]
+    shared_positions = [i for i in 2:(length(callargs) - 1) if i in atomic]
+    seqs = Any[callargs[i] for i in iterated_positions]
     arguments = Any[carry]
     for i in iterated_positions
         push!(arguments, Expr(:ref, callargs[i], index))
@@ -419,59 +1259,32 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     for i in shared_positions
         push!(arguments, callargs[i])
     end
-    step_body = Expr(:block, _embedded_statements(
-        step.ast, arguments, Expr(:tuple, carry, output), offset)...)
-    invariant = Any[]
-    initial_output, loop_output, final_output = Expr(:block), Expr(:block), Expr(:block)
-    if lhs !== nothing
-        push!(initial_output.args, :($lhs = $(GlobalRef(Base, :similar))(
-            $xs, $(GlobalRef(Base, :typeof))($output))))
-        push!(initial_output.args, :($lhs[$index] = $output))
-        push!(loop_output.args, :($lhs[$index] = $output))
-    end
-    if consumer !== nothing
-        cell, args, positions, cell_offset, pointwise_lhs, total_lhs = consumer
-        cell_output = gensym(:scan_cell)
-        cell_args = Any[i in positions ? output : arg for (i, arg) in enumerate(args)]
-        invariant, dynamic, cell_type = _authored_scan_cell_statements(
-            cell, cell_args, positions, cell_output, cell_offset)
-        append!(step_body.args, dynamic)
-        # Match ordinary plate lowering's inferred result type, including
-        # heterogeneous cells; the first value alone cannot type that buffer.
-        plate_eltype = gensym(:scan_plate_eltype)
-        push!(initial_output.args, :($plate_eltype = $cell_type))
-        if pointwise_lhs !== nothing
-            push!(initial_output.args, :($pointwise_lhs = $(GlobalRef(Base, :similar))(
-                $xs, $plate_eltype)))
-            push!(initial_output.args, :($pointwise_lhs[$index] = $cell_output))
-            push!(loop_output.args, :($pointwise_lhs[$index] = $cell_output))
-            push!(final_output.args, :($pointwise_lhs =
-                $(GlobalRef(@__MODULE__, :_narrow_plate_output))($pointwise_lhs)))
-        end
-        push!(initial_output.args,
-              :($total_lhs = $(GlobalRef(Base, :zero))(
-                  $plate_eltype === Any ? $(GlobalRef(Base, :typeof))($output) :
-                  $plate_eltype) + $cell_output))
-        push!(loop_output.args, :($total_lhs = $total_lhs + $cell_output))
-    end
-    # `eachindex(seqs...)` throws `DimensionMismatch` unless every iterated
-    # sequence shares axes, giving the lockstep length check for free.
+    push!(arguments, earlier)
+    step_body = _embedded_statements(
+        step.ast, arguments, Expr(:tuple, carry, output), offset)
+    module_ref(name) = GlobalRef(@__MODULE__, name)
+    start = gensym(:scan_history_offset)
+    record = Any[
+        :($carry = $(module_ref(:_scan_history_carry))($carry)),
+        :($(module_ref(:_scan_history_record!))($lhs, $start, $index, $output))]
     push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($(seqs...))))
-    push!(body.args, :($(GlobalRef(Base, :isempty))($indices) &&
-        throw(ArgumentError("scan requires a non-empty sequence"))))
-    append!(body.args, invariant)
-    push!(body.args, :($carry = $(callargs[1])))
-    push!(body.args, :($index = $(GlobalRef(Base, :first))($indices)))
-    append!(body.args, step_body.args)
-    append!(body.args, initial_output.args)
-    push!(body.args, Expr(:for,
-        :($index = $(GlobalRef(Base.Iterators, :drop))($indices, 1)),
-        Expr(:block, step_body.args..., loop_output.args...)))
-    append!(body.args, final_output.args)
+    push!(body.args, :($lhs = $(module_ref(:_scan_history_buffer))(
+        $((recycled === nothing ? () : (recycled,))...), $(first(seqs)), $fill_value)))
+    push!(body.args, :($start = $(module_ref(:_scan_history_offset))($fill_value)))
+    push!(body.args, :($earlier = $(module_ref(:_scan_history_views))($lhs)))
+    nonempty = Expr(:block,
+        :($carry = $(callargs[1])),
+        :($index = $(GlobalRef(Base, :first))($indices)),
+        step_body..., record...,
+        Expr(:for, :($index = $(GlobalRef(@__MODULE__, :_scan_rest))($indices)),
+             Expr(:block, step_body..., record...)))
+    push!(body.args, Expr(:if,
+        :(!$(GlobalRef(Base, :isempty))($indices)), nonempty))
     body
 end
 
-function _authored_scan_cell_statements(cell, args, positions, output, offset)
+function _authored_scan_cell_statements(cell, args, positions, output, offset;
+                                        output_type = nothing)
     inner = cell.plan
     length(cell.ops) == length(inner.recipes) || throw(ArgumentError(
         "an authored plate body must lower to one operation per transparent scalar recipe"))
@@ -479,8 +1292,12 @@ function _authored_scan_cell_statements(cell, args, positions, output, offset)
     dependencies = _plate_dependencies(inner, roots).recipes
     locals = Dict(canon_id(inner.graph, v.id) => arg
                   for (v, arg) in zip(inner.have, args))
-    types = Dict{Int,Any}(canon_id(inner.graph, v.id) =>
-        Expr(:call, GlobalRef(Base, :typeof), arg) for (v, arg) in zip(inner.have, args))
+    # The scan output's type is supplied by the caller when given, so the empty
+    # sequence (which has no output value) types the plate the same way.
+    types = Dict{ValueId,Any}(canon_id(inner.graph, v.id) =>
+        (output_type !== nothing && i in positions ? output_type :
+         Expr(:call, GlobalRef(Base, :typeof), arg))
+        for (i, (v, arg)) in enumerate(zip(inner.have, args)))
     invariant, dynamic = Any[], Any[]
     for (i, recipe) in enumerate(inner.recipes)
         length(recipe.outputs) == 1 || throw(ArgumentError(
@@ -493,7 +1310,7 @@ function _authored_scan_cell_statements(cell, args, positions, output, offset)
         locals[canon_id(inner.graph, value.id)] = result
         input_types = Any[types[canon_id(inner.graph, v.id)] for v in recipe.inputs]
         types[canon_id(inner.graph, value.id)] = Expr(:call,
-            GlobalRef(Base, :promote_op), Expr(:ref, _OPS_ARG, offset + i), input_types...)
+            GlobalRef(@__MODULE__, :_promote_op), Expr(:ref, _OPS_ARG, offset + i), input_types...)
     end
     push!(dynamic, :($output = $(locals[canon_id(inner.graph, only(inner.want).id)])))
     invariant, dynamic, types[canon_id(inner.graph, only(inner.want).id)]
@@ -503,6 +1320,11 @@ end
 # operands need full broadcast-axis validation; other consumers or WANTs need
 # the materialized scan. In either case ordinary native scan lowering applies.
 function _authored_scan_sum_consumer(p::Plan, scan_recipe::Recipe)
+    # The fused loop streams one cell per step; the seed slot of an
+    # init-including scan would need a cell of its own, and a history scan
+    # reads its own output vector, so both materialize.
+    (_scan_includes_init(scan_recipe.op) || _scan_has_history(scan_recipe.op)) &&
+        return nothing
     output_id = canon_id(p.graph, only(scan_recipe.outputs).id)
     any(w -> canon_id(p.graph, w.id) == output_id, p.want) && return nothing
     consumers = filter(p.recipes) do recipe
@@ -526,6 +1348,564 @@ function _authored_scan_sum_consumer(p::Plan, scan_recipe::Recipe)
     consumer
 end
 
+# The field `name` when `recipe` is a column projection of the scan output
+# `rows_id`, `plate(rows) do row; row.name end` (`_scan_column_expr`), else
+# `nothing`. The cell is exactly the undeclared field read of its one lane.
+function _scan_column_projection_field(p::Plan, recipe::Recipe, rows_id)
+    recipe.op isa _AuthoredPlateOp && length(recipe.inputs) == 1 &&
+        length(recipe.outputs) == 1 || return nothing
+    canon_id(p.graph, only(recipe.inputs).id) == rows_id || return nothing
+    1 in typeof(recipe.op).parameters[2] && return nothing # Ref(rows) is whole.
+    isempty(recipe.op.axis_checks) || return nothing
+    inner = recipe.op.kernel.plan
+    length(inner.have) == 1 && length(inner.recipes) == 1 &&
+        length(inner.want) == 1 || return nothing
+    cell = only(inner.recipes)
+    length(cell.inputs) == 1 && length(cell.outputs) == 1 || return nothing
+    canon_id(inner.graph, only(cell.inputs).id) ==
+        canon_id(inner.graph, only(inner.have).id) || return nothing
+    canon_id(inner.graph, only(cell.outputs).id) ==
+        canon_id(inner.graph, only(inner.want).id) || return nothing
+    valtype(only(inner.want)) === Any || return nothing
+    cell.op isa _KernelSourceOp || return nothing
+    source = cell.source
+    source isa Expr && source.head === :. && length(source.args) == 2 &&
+        source.args[2] isa QuoteNode && source.args[2].value isa Symbol &&
+        source.args[1] === only(_recipe_source_names(cell)) || return nothing
+    source.args[2].value
+end
+
+# A scan whose rows are read only through column projections writes each
+# projected column directly, so neither the row vector nor a projection pass
+# is materialized. Each projection's output must be needed and unsummed: a
+# selected total would need the plate's own streamed fold. Returns
+# `[(; recipe, field)]` in plan order, or `nothing`.
+function _authored_scan_column_projections(p::Plan, scan_recipe::Recipe)
+    op = scan_recipe.op
+    (_scan_includes_init(op) || _scan_has_history(op)) && return nothing
+    g = p.graph
+    rows_id = canon_id(g, only(scan_recipe.outputs).id)
+    any(v -> canon_id(g, v.id) == rows_id, (p.want..., p.have...)) && return nothing
+    columns = Any[]
+    for recipe in p.recipes
+        any(v -> canon_id(g, v.id) == rows_id, recipe.inputs) || continue
+        field = _scan_column_projection_field(p, recipe, rows_id)
+        field === nothing && return nothing
+        _authored_plate_total_recipe(p, recipe) === nothing || return nothing
+        push!(columns, (; recipe, field))
+    end
+    isempty(columns) ? nothing : columns
+end
+
+# Scalarize only a verified Base arithmetic broadcast over primitive scalar
+# operands. Preserve expression nesting, including division after multiplication;
+# no monotonicity identity is used to move a transform outside its minimum.
+function _scan_terminal_scalar(ex, bindings, scan_names, sample, seed, mod)
+    ex isa Real && isprimitivetype(typeof(ex)) && return ex
+    ex isa Symbol && return ex in scan_names ? sample : get(bindings, ex, nothing)
+    ex isa Expr || return nothing
+    if ex.head === :ref
+        return length(ex.args) == 2 && ex.args[1] in scan_names &&
+            ex.args[2] === 1 ? seed : nothing
+    end
+    name, operands = if ex.head === :call
+        callee = ex.args[1]
+        callee isa Symbol && _is_broadcast_operator(callee) || return nothing
+        Symbol(String(callee)[2:end]), ex.args[2:end]
+    elseif ex.head === :. && length(ex.args) == 2 &&
+           ex.args[2] isa Expr && ex.args[2].head === :tuple
+        # Base's @. expansion spells arithmetic as (+).(a, b), rather
+        # than the :call node used by explicitly written a .+ b.
+        ex.args[1], ex.args[2].args
+    else
+        return nothing
+    end
+    name in (:+, :-, :*, :/) || return nothing
+    isdefined(mod, name) && isconst(mod, name) || return nothing
+    _kernel_resolve_binding(mod, name) === getglobal(Base, name) || return nothing
+    args = Any[_scan_terminal_scalar(arg, bindings, scan_names, sample, seed, mod)
+               for arg in operands]
+    any(isnothing, args) && return nothing
+    Expr(:call, GlobalRef(Base, name), args...)
+end
+
+_scan_terminal_convert(::Nothing, value) = value
+_scan_terminal_convert(T::Type, value) = Expr(:call, GlobalRef(Base, :convert), T, value)
+
+function _scan_terminal_eltype(T)
+    T <: AbstractVector || return nothing
+    E = eltype(T)
+    isconcretetype(E) && E <: Union{Float16,Float32,Float64} &&
+        (T === Vector{E} || T === AbstractVector{E}) ? E : nothing
+end
+
+# A scan may feed several direct minima and one-level dotted transforms, each
+# used only by a minimum. Requesting the trajectory or a transform, or giving
+# either another consumer, retains the ordinary buffers. Restrict to a typed
+# floating trajectory with ordinary vector conversions. Other declarations,
+# captured callables and whole-array reads keep the materialized path.
+function _authored_scan_terminal_minima(p::Plan, scan_recipe::Recipe)
+    op = scan_recipe.op
+    (_scan_includes_init(op) && !_scan_has_history(op)) || return nothing
+    scan_value = only(scan_recipe.outputs)
+    _scan_terminal_eltype(valtype(scan_value)) === nothing && return nothing
+    g = p.graph
+    scan_id = canon_id(g, scan_value.id)
+    any(w -> canon_id(g, w.id) == scan_id, p.want) && return nothing
+    scan_index = findfirst(==(scan_recipe), p.recipes)
+    available = Set(canon_id(g, v.id) for v in p.have)
+    for r in p.recipes[1:scan_index-1], v in r.outputs
+        push!(available, canon_id(g, v.id))
+    end
+    readers(id) = [r for r in p.recipes if any(v -> canon_id(g, v.id) == id, r.inputs)]
+    terminal = Any[]
+    for reader in readers(scan_id)
+        reader.effectful && return nothing
+        if reader.op === Base.minimum && length(reader.inputs) == 1
+            push!(terminal, (; reduction = reader, transform = nothing, source = nothing))
+            continue
+        end
+        length(reader.outputs) == 1 && reader.op isa _KernelSourceOp || return nothing
+        closure = _lane_source_closure(reader)
+        closure === nothing && return nothing
+        _, _, mod = closure
+        source = _lane_expand_dot(_lane_strip_lines(reader.source), mod)
+        declared = valtype(only(reader.outputs))
+        declared === Any || _scan_terminal_eltype(declared) !== nothing || return nothing
+        transform_id = canon_id(g, only(reader.outputs).id)
+        any(w -> canon_id(g, w.id) == transform_id, p.want) && return nothing
+        names = _recipe_source_names(reader)
+        scalar_names, scan_names = Dict{Symbol,Any}(), Set{Symbol}()
+        for (name, v) in zip(names, reader.inputs)
+            cid = canon_id(g, v.id)
+            if cid == scan_id
+                push!(scan_names, name)
+            else
+                T = valtype(v)
+                cid in available && T <: Real && isprimitivetype(T) || return nothing
+                scalar_names[name] = name
+            end
+        end
+        _scan_terminal_scalar(source, scalar_names, scan_names, :sample, :seed,
+            mod) === nothing && return nothing
+        downstream = readers(transform_id)
+        length(downstream) == 1 || return nothing
+        reduction = only(downstream)
+        reduction.op === Base.minimum && length(reduction.inputs) == 1 &&
+            !reduction.effectful || return nothing
+        push!(terminal, (; reduction, transform = reader, source))
+    end
+    isempty(terminal) && return nothing
+    last_index = maximum(findfirst(==(term.reduction), p.recipes) for term in terminal)
+    any(r -> r.effectful, p.recipes[scan_index:last_index]) && return nothing
+    terminal
+end
+
+# A scan read only through one slice `trajectory[lo:hi]`, whose other steps
+# compute nothing that is read (`_lower_authored_scan_slice_native!`). Returns
+# `(; reader, position, lo, hi, params, mod, carry_free)` or `nothing`.
+#
+# The scan has no `history` and a pure step; its result is no WANT and is read
+# by exactly one recipe, as exactly one of that recipe's inputs (`position`).
+# The reader is a pure ordinary source operation (`_lane_source_closure`)
+# whose native body is `x[lo:hi]` for the scan's parameter `x`, with Base's
+# `:` and bounds that do not read `x` (`begin`/`end` there are the
+# trajectory's first and last index). No effectful recipe runs between the
+# scan and its reader, where the slice is emitted. `carry_free`: the step
+# reads neither its carry nor history, so each output depends on its own step
+# only.
+function _authored_scan_slice_demand(p::Plan, scan_recipe::Recipe)
+    op = scan_recipe.op
+    op isa _AuthoredScanOp && !_scan_has_history(op) || return nothing
+    step = op.kernel.plan
+    any(r -> r.effectful, step.recipes) && return nothing
+    g = p.graph
+    scan_id = canon_id(g, only(scan_recipe.outputs).id)
+    any(w -> canon_id(g, w.id) == scan_id, p.want) && return nothing
+    readers = [r for r in p.recipes if any(v -> canon_id(g, v.id) == scan_id, r.inputs)]
+    length(readers) == 1 || return nothing
+    reader = only(readers)
+    !reader.effectful && length(reader.outputs) == 1 || return nothing
+    positions = findall(v -> canon_id(g, v.id) == scan_id, reader.inputs)
+    length(positions) == 1 || return nothing
+    position = only(positions)
+    closure = _lane_source_closure(reader)
+    closure === nothing && return nothing
+    _, params, mod = closure
+    source = _lane_expand_dot(_lane_strip_lines(reader.source), mod)
+    source isa Expr && !_lane_has_macro(source) || return nothing
+    native = _lane_strip_lines(_kernel_native_body(source, mod, Set{Symbol}(params)))
+    native isa Expr && native.head === :ref && length(native.args) == 2 &&
+        native.args[1] === params[position] || return nothing
+    range = native.args[2]
+    range isa Expr && range.head === :call && length(range.args) == 3 &&
+        _kernel_resolve_binding(mod, range.args[1]) === Base.:(:) || return nothing
+    lo, hi = range.args[2], range.args[3]
+    params[position] in _source_symbols!(Set{Symbol}(), Expr(:tuple, lo, hi)) &&
+        return nothing
+    demand = (; reader, position, lo, hi, params, mod, carry_free = false)
+    # The bounds must be expressible over the reader's arguments.
+    placeholders = Any[gensym(:argument) for _ in reader.inputs]
+    any(isnothing, _scan_slice_bound_exprs(demand, placeholders, :length)) &&
+        return nothing
+    scan_index = findfirst(r -> r === scan_recipe, p.recipes)
+    reader_index = findfirst(r -> r === reader, p.recipes)
+    scan_index !== nothing && reader_index !== nothing && scan_index < reader_index ||
+        return nothing
+    any(r -> r.effectful, p.recipes[(scan_index + 1):(reader_index - 1)]) &&
+        return nothing
+    carry = canon_id(step.graph, first(step.have).id)
+    carry_free = canon_id(step.graph, step.want[2].id) != carry &&
+        !any(r -> any(v -> canon_id(step.graph, v.id) == carry, r.inputs), step.recipes)
+    (; demand..., carry_free)
+end
+
+# The slice bounds of `demand` over the reader's call arguments, with `end`
+# meaning `trajectory_length`; `nothing` for a bound outside the source grammar
+# (`_lane_source_node`).
+function _scan_slice_bound_exprs(demand, reader_args, trajectory_length)
+    ctx = _LaneSourceContext(demand.mod, Dict{Symbol,Any}(zip(demand.params, reader_args)))
+    ends = (trajectory_length, 1)
+    (_lane_source_node(ctx, demand.lo, ends), _lane_source_node(ctx, demand.hi, ends))
+end
+
+# Plates that compute a scan's per-step sequences, and that only that scan (or
+# another such plate) consumes, run strip by strip with it: the generated loop
+# fills a strip of `_PLATE_STRIP` cells of every such plate, then advances the
+# scan over the strip, so their outputs are never stored at full length
+# (`_lower_authored_scan_strips!`). A plate qualifies when its output is no
+# WANT or HAVE, every use of it is a lane (not `Ref`) argument of a plate in
+# the region or an iterated sequence of the scan, and it has no nested plate or
+# scan. A composed chain qualifies too: every outer lane shares the strip axis
+# (`_plate_strip_ready`), so each absorbed plate's domain is that axis, and its
+# own domain checks run on every strip. Returns the region's plate recipes in
+# plan order, or `nothing`. An init-including or history scan reads its own output and
+# keeps the materialized sequences.
+function _authored_scan_strip_region(p::Plan, scan_recipe::Recipe)
+    op = scan_recipe.op
+    (_scan_includes_init(op) || _scan_has_history(op)) && return nothing
+    g = p.graph
+    cid(v) = canon_id(g, v.id)
+    outside = Set(cid(v) for v in (p.want..., p.have...))
+    producer = Dict{ValueId,Recipe}()
+    for r in p.recipes, output in r.outputs
+        producer[cid(output)] = r
+    end
+    lanes(r) = r.op isa _AuthoredScanOp ?
+        Set(i for i in 2:length(r.inputs) if !(i in typeof(r.op).parameters[2])) :
+        Set(i for i in eachindex(r.inputs) if !(i in typeof(r.op).parameters[2]))
+    eligible(r) = r.op isa _AuthoredPlateOp && length(r.outputs) == 1 &&
+        !(cid(only(r.outputs)) in outside) &&
+        !any(x -> x.op isa _AuthoredPlateOp || x.op isa _AuthoredScanOp,
+             r.op.kernel.plan.recipes)
+    region = Dict{Int,Recipe}()
+    frontier = Recipe[]
+    for i in lanes(scan_recipe)
+        r = get(producer, cid(scan_recipe.inputs[i]), nothing)
+        r === nothing || push!(frontier, r)
+    end
+    while !isempty(frontier)
+        r = pop!(frontier)
+        (haskey(region, r.id) || !eligible(r)) && continue
+        region[r.id] = r
+        for i in lanes(r)
+            q = get(producer, cid(r.inputs[i]), nothing)
+            q === nothing || push!(frontier, q)
+        end
+    end
+    # Keep only plates whose every use is a lane of the scan or of a kept plate.
+    changed = true
+    while changed
+        changed = false
+        for (id, r) in collect(region)
+            output = cid(only(r.outputs))
+            contained = all(p.recipes) do c
+                uses = findall(v -> cid(v) == output, c.inputs)
+                isempty(uses) && return true
+                (c === scan_recipe || haskey(region, c.id)) && issubset(uses, lanes(c))
+            end
+            contained && continue
+            delete!(region, id)
+            changed = true
+        end
+    end
+    any(i -> haskey(producer, cid(scan_recipe.inputs[i])) &&
+             haskey(region, producer[cid(scan_recipe.inputs[i])].id),
+        lanes(scan_recipe)) || return nothing
+    [r for r in p.recipes if haskey(region, r.id)]
+end
+
+# The carry-independent statements of a plain scan step (`_scan_step_is_plain`)
+# that read at least one per-step element: each reads only the step's
+# elements, its shared operands and earlier such statements, never the carry
+# or a `history` vector. Those that are, or feed, a fold over shared operands
+# run as one-cell plates in the scan's strip region (`_scan_hoisted_plate`),
+# the step reading their values from the strip. Returns the step recipe
+# indices in order, or an empty vector.
+function _authored_scan_hoistable(op::_AuthoredScanOp)
+    hoisted = Int[]
+    (_scan_includes_init(op) || _scan_has_history(op)) && return hoisted
+    step = op.kernel
+    _scan_step_is_plain(step) || return hoisted
+    sp = step.plan
+    cid(v) = canon_id(sp.graph, v.id)
+    atomic = typeof(op).parameters[2]
+    count = length(sp.have)
+    iterated = [i for i in 2:count if !(i in atomic)]
+    lanes = Set(cid(sp.have[1 + t]) for t in eachindex(iterated))
+    shared = Set(cid(v) for v in sp.have[2 + length(iterated):end])
+    candidates = Int[]
+    candidate_of = Dict{ValueId,Int}()
+    for (index, r) in enumerate(sp.recipes)
+        length(r.outputs) == 1 && !r.effectful || continue
+        inputs = [cid(v) for v in r.inputs]
+        all(c -> c in lanes || c in shared || haskey(candidate_of, c), inputs) || continue
+        any(c -> c in lanes || haskey(candidate_of, c), inputs) || continue
+        push!(candidates, index)
+        candidate_of[cid(only(r.outputs))] = index
+    end
+    # Hoist only a fold over shared operands (`_scan_step_fold`) and the
+    # carry-independent statements it reads: cheaper work already runs beside
+    # the carry chain, and moving it out would only add strip buffers.
+    keep = Set{Int}()
+    pending = [index for index in candidates if _scan_step_fold(step.ops[index])]
+    while !isempty(pending)
+        index = pop!(pending)
+        index in keep && continue
+        push!(keep, index)
+        for v in sp.recipes[index].inputs
+            producer = get(candidate_of, cid(v), nothing)
+            producer === nothing || push!(pending, producer)
+        end
+    end
+    append!(hoisted, (index for index in candidates if index in keep))
+    hoisted
+end
+
+# A step operation that folds over a shared operand, which the strip region
+# runs across steps: Base's `evalpoly` (the coefficient-outer chunks) or a
+# gathered generator sum (the dose-outer passes).
+_scan_step_fold(op) = false
+_scan_step_fold(::typeof(evalpoly)) = true
+_scan_step_fold(op::_KernelSourceOp) = op.f isa _KernelReduction
+
+# Step recipe `index` as a one-cell plate: lanes are scan sequences
+# (`lane_of`) or earlier hoisted strip buffers (`hoisted_of`), `Ref` operands
+# the step's shared ones (`shared_of`). Its one operation is the step's own,
+# so a plate lowering whose table is cut at the step's slot reads that slot.
+function _scan_hoisted_plate(step, index, lane_of, shared_of, hoisted_of)
+    sp = step.plan
+    recipe = sp.recipes[index]
+    graph = Graph()
+    have, callargs, callvalues, atomic = Value[], Any[], Value[], Int[]
+    mapped = Dict{ValueId,Value}()
+    for v in recipe.inputs
+        cid = canon_id(sp.graph, v.id)
+        haskey(mapped, cid) && continue
+        local_value = value!(graph, v.name, valtype(v))
+        mapped[cid] = local_value
+        push!(have, local_value)
+        if haskey(lane_of, cid)
+            push!(callargs, lane_of[cid].arg)
+            push!(callvalues, lane_of[cid].value)
+        elseif haskey(hoisted_of, cid)
+            push!(callargs, hoisted_of[cid])
+            push!(callvalues, Value(v.name, Vector))
+        else
+            push!(callargs, shared_of[cid].arg)
+            push!(callvalues, shared_of[cid].value)
+            push!(atomic, length(callargs))
+        end
+    end
+    output = only(recipe.outputs)
+    result = value!(graph, output.name, valtype(output))
+    add!(graph, Tuple(mapped[canon_id(sp.graph, v.id)] for v in recipe.inputs) =>
+         (result,), recipe.op; cost = recipe.cost, effectful = recipe.effectful,
+         source = recipe.source)
+    cell_plan = plan(graph; have, want = (result,))
+    kernel = _prepare(cell_plan, _lower_with_ops(cell_plan; inline_embedded = false)...)
+    kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
+        kernel.plan, kernel.ast, (step.lowered_recipes[index],))
+    (; op = _AuthoredPlateOp{typeof(kernel),Tuple(atomic)}(kernel, ()), callargs,
+       callvalues)
+end
+
+# Append a strip record for each hoisted step statement of `scan_recipe`
+# (`_authored_scan_hoistable`) and return the step slots they replace, each
+# mapped to its strip buffer. A statement's lanes are the scan sequences its
+# step elements come from (a region plate's sequence is that plate's strip
+# buffer) and earlier hoisted buffers; its shared operands stay whole.
+function _scan_hoisted_records!(records, scan_recipe::Recipe, callargs, hoisted,
+                                offset)
+    slots = Dict{Int,Symbol}()
+    isempty(hoisted) && return (; slots, types = Any[])
+    op = scan_recipe.op
+    step = op.kernel
+    sp = step.plan
+    cid(v) = canon_id(sp.graph, v.id)
+    atomic = typeof(op).parameters[2]
+    count = length(sp.have)
+    iterated = [i for i in 2:count if !(i in atomic)]
+    shared_positions = [i for i in 2:count if i in atomic]
+    lane_of = Dict(cid(sp.have[1 + t]) =>
+        (; arg = callargs[position], value = scan_recipe.inputs[position])
+        for (t, position) in enumerate(iterated))
+    shared_of = Dict(cid(sp.have[1 + length(iterated) + s]) =>
+        (; arg = callargs[position], value = scan_recipe.inputs[position])
+        for (s, position) in enumerate(shared_positions))
+    hoisted_of = Dict{ValueId,Symbol}()
+    # The type of each hoisted value, from its step slot over the element,
+    # shared and earlier hoisted types: only concrete numbers are strip-filled
+    # (`_scan_hoisted_numbers`), the rest of the step stays as authored.
+    types = Dict{ValueId,Any}()
+    for (c, lane) in lane_of
+        types[c] = Expr(:call, GlobalRef(Base, :eltype), lane.arg)
+    end
+    for (c, shared) in shared_of
+        types[c] = Expr(:call, GlobalRef(Base, :typeof), shared.arg)
+    end
+    hoisted_types = Any[]
+    for index in hoisted
+        cell = _scan_hoisted_plate(step, index, lane_of, shared_of, hoisted_of)
+        output = only(sp.recipes[index].outputs)
+        buffer = gensym(Symbol(:scan_hoisted_, output.name))
+        push!(records, (; cell..., lhs = buffer, hints = nothing, recycled = nothing,
+                          offset = offset + index - 1, hoisted = true))
+        hoisted_of[cid(output)] = buffer
+        slots[offset + index] = buffer
+        types[cid(output)] = Expr(:call, GlobalRef(@__MODULE__, :_promote_op),
+            Expr(:ref, _OPS_ARG, offset + index),
+            (types[cid(v)] for v in sp.recipes[index].inputs)...)
+        push!(hoisted_types, types[cid(output)])
+    end
+    (; slots, types = hoisted_types)
+end
+
+# Whether every hoisted step value is a concrete number, so its strip buffer
+# is a plain numeric vector (types folded when the kernel compiles).
+@inline _scan_hoisted_numbers() = true
+@inline _scan_hoisted_numbers(::Type{T}, rest...) where {T} =
+    isconcretetype(T) && T <: Number && _scan_hoisted_numbers(rest...)
+
+# Lower a scan together with its strip region: the plates of
+# `_authored_scan_strip_region` and the hoisted step statements of
+# `_authored_scan_hoistable`. Each record names a plate operation, its call
+# arguments and values, its output local, input type hints, recycled buffer
+# and the operation-table offset its plate lowering reads from (a region
+# plate's slots are reserved at its own position, a hoisted statement's are
+# the step's own, so both backend products keep one table). When every lane
+# the region reads from outside it, and every other scan sequence, is a vector
+# over one axis, the plates run over views of those lanes, one strip at a
+# time: the first strip allocates each plate's buffer and every later strip,
+# never longer, refills it in place (one allocation, so native reverse AD sees
+# no allocate-or-reuse merge), and the step reads hoisted values from their
+# strip buffers. Otherwise the plates materialize and the scan runs as usual.
+# Values are the same either way: every cell and step is computed as authored,
+# in order (only an error a hoisted statement raises can name a later step).
+function _lower_authored_scan_strips!(body, scan_recipe::Recipe, records,
+                                      hoisting, callargs, lhs, offset,
+                                      runtime_ops, runtime_recipes;
+                                      type_offset = nothing, recycled = nothing,
+                                      columns = nothing)
+    op = scan_recipe.op
+    region_outputs = Dict{Symbol,Nothing}()
+    for record in records
+        region_outputs[record.lhs] = nothing
+    end
+    outer = Any[]
+    for record in records
+        atomic = typeof(record.op).parameters[2]
+        for (i, arg) in enumerate(record.callargs)
+            (i in atomic || valtype(record.callvalues[i]) <: Number ||
+             haskey(region_outputs, arg) || arg in outer) && continue
+            push!(outer, arg)
+        end
+    end
+    scan_atomic = typeof(op).parameters[2]
+    positions = Set(i for i in 2:length(callargs)
+                    if !(i in scan_atomic) && haskey(region_outputs, callargs[i]))
+    others = Any[callargs[i] for i in 2:length(callargs)
+                 if !(i in scan_atomic) && !(i in positions)]
+    function emit_plates!(block, strip::Bool, reuse::Bool; ordinary = false)
+        for record in records
+            ordinary && record.hoisted && continue
+            args = Any[strip && haskey(views, arg) ? views[arg] : arg
+                       for arg in record.callargs]
+            _lower_authored_plate_native!(block,
+                runtime_ops[1:record.offset], runtime_recipes[1:record.offset],
+                record.op, args, record.callvalues, record.lhs, nothing;
+                recycled = strip ? nothing : record.recycled,
+                input_type_hints = record.hints, into = strip && reuse)
+        end
+        block
+    end
+    if isempty(outer)
+        emit_plates!(body, false, false; ordinary = true)
+        return _lower_authored_scan_native!(body, op, callargs, lhs, offset;
+                                            type_offset, recycled, columns)
+    end
+    lo, hi, axis = gensym(:strip_lo), gensym(:strip_hi), gensym(:strip_axis)
+    views = Dict(arg => gensym(:strip_lane) for arg in outer)
+    bind_views(block) = (for arg in outer
+        push!(block.args, :($(views[arg]) =
+            $(GlobalRef(Base, :view))($arg, $lo:$hi)))
+    end; block)
+    refill = emit_plates!(bind_views(Expr(:block)), true, true)
+    fused = Expr(:block,
+        :($axis = $(GlobalRef(Base, :axes))($(first(outer)), 1)),
+        :($lo = $(GlobalRef(Base, :first))($axis)),
+        :($hi = $(GlobalRef(Base, :min))(
+            $lo + $(GlobalRef(@__MODULE__, :_PLATE_STRIP)) - 1,
+            $(GlobalRef(Base, :last))($axis))))
+    emit_plates!(bind_views(fused), true, false)
+    _lower_authored_scan_native!(fused, op, callargs, lhs, offset; type_offset,
+        recycled, columns, strips = (; positions, lo, hi, axis, refill,
+                                       hoisted = hoisting.slots))
+    ordinary = emit_plates!(Expr(:block), false, false; ordinary = true)
+    _lower_authored_scan_native!(ordinary, op, callargs, lhs, offset; type_offset,
+                                 recycled, columns)
+    ready = Expr(:call, GlobalRef(@__MODULE__, :_plate_strip_ready), outer..., others...)
+    isempty(hoisting.types) || (ready = Expr(:&&, ready,
+        Expr(:call, GlobalRef(@__MODULE__, :_scan_hoisted_numbers), hoisting.types...)))
+    push!(body.args, Expr(:if, ready, fused, ordinary))
+    body
+end
+
+# A composed plate whose scalar plan is settled but not yet lowered. A later
+# scheduling pass may compose it again, so `_fuse_authored_plate_chains` builds
+# one `_AuthoredPlateOp` (lowering and compilation) per recipe that remains,
+# rather than one per intermediate composition.
+struct _AuthoredPlateDraft{A}
+    plan::Plan
+    lowered_recipes::Tuple
+    axis_checks::Tuple
+end
+struct _AuthoredPlateCellDraft{A}
+    plate::_AuthoredPlateDraft{A}
+end
+const _AuthoredPlateLike = Union{_AuthoredPlateOp,_AuthoredPlateDraft}
+const _AuthoredPlateCellLike = Union{_AuthoredPlateCellOp,_AuthoredPlateCellDraft}
+_plate_atomic(::_AuthoredPlateOp{K,A}) where {K,A} = A
+_plate_atomic(::_AuthoredPlateDraft{A}) where {A} = A
+_plate_body(op::_AuthoredPlateOp) = op.kernel
+_plate_body(op::_AuthoredPlateDraft) = op
+
+function _built_plate_op(draft::_AuthoredPlateDraft{A}) where {A}
+    kernel = _prepare(draft.plan, _lower_with_ops(draft.plan; inline_embedded = false)...)
+    # Source RHSs use the original scalar formal names. Keep their original
+    # recipe metadata in operation-table order so readable code binds those
+    # names to the newly projected scalar arguments, including across chains.
+    kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
+        kernel.plan, kernel.ast, draft.lowered_recipes)
+    _AuthoredPlateOp{typeof(kernel),A}(kernel, draft.axis_checks)
+end
+_built_plate_op(draft::_AuthoredPlateCellDraft) =
+    _AuthoredPlateCellOp(_built_plate_op(draft.plate))
+_built_plate_recipe(r::Recipe) =
+    r.op isa Union{_AuthoredPlateDraft,_AuthoredPlateCellDraft} ?
+    Recipe(r.id, r.inputs, r.outputs, _built_plate_op(r.op), r.cost, r.cse_key,
+           r.effectful, r.source) : r
+
 # Compose selected scalar DAGs only at code generation. The public graph and
 # Plan retain every named array node, so another WANT/HAVE query can still
 # materialize it or cut the graph there. A whole-array/Ref use is a boundary,
@@ -535,16 +1915,17 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
     callvalues = Value[]
     scalar_have = Value[]
     atomic = Int[]
-    positions = Dict{Tuple{Int,Bool},Int}()
+    positions = Dict{Tuple{ValueId,Bool},Int}()
     checks = Tuple[]
     readable_recipes = Dict{Int,Recipe}()
     producer_id = canon_id(g, only(producer.outputs).id)
 
     function append_body(recipe, replacement = nothing)
         op = recipe.op
-        inner = op.kernel.plan
-        old_atomic = typeof(op).parameters[2]
-        mapped = Dict{Int,Value}()
+        body = _plate_body(op)
+        inner = body.plan
+        old_atomic = _plate_atomic(op)
+        mapped = Dict{ValueId,Value}()
         input_positions = Vector{Tuple}(undef, length(recipe.inputs))
         for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
             cid = canon_id(g, outer.id)
@@ -578,7 +1959,7 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
             end for v in r.outputs)
             copied = add!(scalar_graph, ins => outs, r.op; cost = r.cost,
                           effectful = r.effectful, source = r.source)
-            readable_recipes[copied.id] = op.kernel.lowered_recipes[recipe_index]
+            readable_recipes[copied.id] = body.lowered_recipes[recipe_index]
         end
         (; value = mapped[canon_id(inner.graph, only(inner.want).id)], axes)
     end
@@ -587,64 +1968,285 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
     result = append_body(consumer, intermediate)
     # Keep the complete HAVE boundary, including unused axis arguments.
     scalar_plan = plan(scalar_graph; have = scalar_have, want = (result.value,))
-    kernel = prepare(scalar_plan)
-    # Source RHSs use the original scalar formal names. Keep their original
-    # recipe metadata in operation-table order so readable code binds those
-    # names to the newly projected scalar arguments, including across chains.
-    kernel = PreparedKernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
-        kernel.plan, kernel.ast,
-        Tuple(readable_recipes[r.id] for r in scalar_plan.recipes))
-    op = _AuthoredPlateOp{typeof(kernel),Tuple(atomic)}(kernel, Tuple(unique(checks)))
-    Recipe(consumer.id, Tuple(callvalues), consumer.outputs, op,
+    draft = _AuthoredPlateDraft{Tuple(atomic)}(scalar_plan,
+        Tuple(readable_recipes[r.id] for r in scalar_plan.recipes), Tuple(unique(checks)))
+    Recipe(consumer.id, Tuple(callvalues), consumer.outputs, draft,
            producer.cost + consumer.cost, nothing, false, consumer.source)
 end
 
-function _fuse_authored_plate_chains(p::Plan)
+# A plate whose cell returns a tuple (`(a, b, c)`) that other plates read only
+# through constant entries (`t[2]`) keeps, in one query's plan, only the work of
+# the entries that plan reads: a query computes a value only when asked, and a
+# cell sharing its locals among several values (one evaluation per index) must
+# not make every query pay for all of them. An unread entry takes the value of a
+# read one, so the cell keeps its arity and its readers are unchanged, and the
+# statements only unread entries need leave the cell. Effectful work stays.
+function _drop_unread_plate_entries(p::Plan)
+    g = p.graph
+    boundary = Set(canon_id(g, v.id) for v in (p.have..., p.want...))
+    recipes = collect(p.recipes)
+    changed = false
+    for (index, producer) in enumerate(recipes)
+        producer.op isa _AuthoredPlateLike && length(producer.outputs) == 1 || continue
+        cid = canon_id(g, only(producer.outputs).id)
+        cid in boundary && continue
+        read = _plate_entries_read(g, recipes, cid)
+        read === nothing && continue
+        sliced = _plate_keeping_entries(producer, read)
+        sliced === nothing && continue
+        recipes[index] = sliced
+        changed = true
+    end
+    changed || return p
+    producer = Dict(canon_id(g, v.id) => r for r in recipes for v in r.outputs)
+    Plan(g, p.have, p.want, recipes, producer, p.cost, p.candidates)
+end
+
+# The tuple entries the readers of plate output `cid` read, or `nothing` when
+# one reads it otherwise: every reader must be a plate (or one cell of one)
+# zipping it, whose cell reads it only as `t[k]` with a literal `k`.
+function _plate_entries_read(g::Graph, recipes, cid)
+    read = Set{Int}()
+    found = false
+    for r in recipes
+        any(v -> canon_id(g, v.id) == cid, r.inputs) || continue
+        found = true
+        cell = r.op isa _AuthoredPlateCellLike
+        cell && canon_id(g, first(r.inputs).id) == cid && return nothing
+        op = cell ? r.op.plate : r.op
+        op isa _AuthoredPlateLike || return nothing
+        inputs = cell ? r.inputs[2:end] : r.inputs
+        inner = _plate_body(op).plan
+        ig = inner.graph
+        results = Set(canon_id(ig, v.id) for v in inner.want)
+        for (position, outer) in enumerate(inputs)
+            canon_id(g, outer.id) == cid || continue
+            position in _plate_atomic(op) && return nothing
+            have = canon_id(ig, inner.have[position].id)
+            have in results && return nothing
+            for q in inner.recipes
+                any(v -> canon_id(ig, v.id) == have, q.inputs) || continue
+                k = _constant_tuple_entry(q)
+                k === nothing && return nothing
+                push!(read, k)
+            end
+        end
+    end
+    found ? read : nothing
+end
+
+# `k` when recipe `q` is the source `t[k]` of its one input with a literal
+# integer `k`, otherwise `nothing`.
+function _constant_tuple_entry(q::Recipe)
+    q.op isa _KernelSourceOp && length(q.inputs) == 1 && length(q.outputs) == 1 &&
+        !q.effectful || return nothing
+    source = q.source
+    Meta.isexpr(source, :ref, 2) && source.args[2] isa Int || return nothing
+    source.args[1] === only(_recipe_source_names(q)) || return nothing
+    source.args[2]
+end
+
+# `producer` with a cell computing only tuple entries `read`, or `nothing` when
+# its cell is not a source tuple of its inputs, every entry is read, or the
+# entries left unread need effectful work.
+function _plate_keeping_entries(producer::Recipe, read::Set{Int})
+    op = producer.op
+    body = _plate_body(op)
+    inner = body.plan
+    ig = inner.graph
+    length(body.lowered_recipes) == length(inner.recipes) || return nothing
+    result = canon_id(ig, only(inner.want).id)
+    at = findfirst(q -> any(v -> canon_id(ig, v.id) == result, q.outputs), inner.recipes)
+    at === nothing && return nothing
+    tuple = inner.recipes[at]
+    tuple.op isa _KernelSourceOp && length(tuple.outputs) == 1 && !tuple.effectful ||
+        return nothing
+    n = length(tuple.inputs)
+    Meta.isexpr(tuple.source, :tuple, n) &&
+        tuple.source.args == _recipe_source_names(tuple) || return nothing
+    !isempty(read) && issubset(read, 1:n) && length(read) < n || return nothing
+    stand_in = tuple.inputs[minimum(read)]
+    inputs = Tuple(k in read ? tuple.inputs[k] : stand_in for k in 1:n)
+    recipes = Recipe[q for q in inner.recipes]
+    recipes[at] = Recipe(tuple.id, inputs, tuple.outputs, tuple.op, tuple.cost,
+                         nothing, false, tuple.source)
+    needed = Set((result,))
+    keep = falses(length(recipes))
+    for index in reverse(eachindex(recipes))
+        q = recipes[index]
+        any(v -> canon_id(ig, v.id) in needed, q.outputs) || continue
+        keep[index] = true
+        foreach(v -> push!(needed, canon_id(ig, v.id)), q.inputs)
+    end
+    any(index -> !keep[index] && recipes[index].effectful, eachindex(recipes)) &&
+        return nothing
+    sliced = _partial_subplan(inner, inner.have, inner.want, recipes[keep])
+    draft = _AuthoredPlateDraft{_plate_atomic(op)}(sliced,
+        Tuple(body.lowered_recipes[keep]), op.axis_checks)
+    Recipe(producer.id, producer.inputs, producer.outputs, draft, producer.cost,
+           nothing, producer.effectful, producer.source)
+end
+
+function _fuse_authored_plate_chains(original::Plan; cells_only = false)
+    p = _drop_unread_plate_entries(original)
     recipes = Union{Nothing,Recipe}[p.recipes...]
     boundary = Set(canon_id(p.graph, v.id) for v in (p.have..., p.want...))
-    changed = false
-    for index in eachindex(recipes)
+    changed = p !== original
+    # A plate's output, unless it is a boundary value, and the recipes that
+    # read it.
+    function consumers_of(index)
         producer = recipes[index]
-        producer === nothing && continue
-        producer.op isa _AuthoredPlateOp || continue
-        length(producer.outputs) == 1 || continue
+        producer === nothing && return nothing
+        producer.op isa _AuthoredPlateLike || return nothing
+        length(producer.outputs) == 1 || return nothing
         cid = canon_id(p.graph, only(producer.outputs).id)
-        cid in boundary && continue
+        cid in boundary && return nothing
         consumers = findall(recipes) do candidate
             candidate === nothing && return false
             any(input -> canon_id(p.graph, input.id) == cid, candidate.inputs)
         end
-        length(consumers) == 1 || continue
-        consumer_index = only(consumers)
-        consumer_index > index || continue
-        consumer = recipes[consumer_index]
-        consumer.op isa _AuthoredPlateOp || continue
-        consumer_atomic = typeof(consumer.op).parameters[2]
-        any(position -> position in consumer_atomic &&
-            canon_id(p.graph, consumer.inputs[position].id) == cid,
-            eachindex(consumer.inputs)) && continue
-        recipes[consumer_index] = _compose_authored_plates(p.graph, producer, consumer)
-        recipes[index] = nothing
-        changed = true
+        all(>(index), consumers) || return nothing
+        return cid, consumers
+    end
+    # Composing a consumer can leave an earlier producer with fewer readers: a
+    # branch composed into the plate it reconverges into leaves their shared
+    # producer read by that plate alone. Both passes therefore repeat until
+    # neither composes. Each composition removes a recipe, so this terminates,
+    # and a producer body is copied only into its sole remaining reader(s).
+    progressed = true
+    while progressed
+        progressed = false
+        for index in eachindex(recipes)
+            found = consumers_of(index)
+            found === nothing && continue
+            cid, consumers = found
+            length(consumers) == 1 || continue
+            cells_only && !(recipes[only(consumers)].op isa _AuthoredPlateCellLike) && continue
+            composed = _compose_plate_into(p.graph, recipes[index], recipes[only(consumers)], cid)
+            composed === nothing && continue
+            recipes[only(consumers)] = composed
+            recipes[index] = nothing
+            progressed = true
+        end
+        # A plate read only by cells of other plates at one position
+        # (`plate_cell` values sharing an index port: one cell of several
+        # observations) composes into each of those cells, so each runs the
+        # plate's cell at that position instead of the whole plate.
+        for index in eachindex(recipes)
+            found = consumers_of(index)
+            found === nothing && continue
+            cid, consumers = found
+            length(consumers) >= 2 || continue
+            all(c -> recipes[c].op isa _AuthoredPlateCellLike, consumers) || continue
+            length(unique(canon_id(p.graph, first(recipes[c].inputs).id)
+                for c in consumers)) == 1 || continue
+            composed = [_compose_plate_into(p.graph, recipes[index], recipes[c], cid)
+                for c in consumers]
+            any(isnothing, composed) && continue
+            recipes[consumers] = composed
+            recipes[index] = nothing
+            progressed = true
+        end
+        changed |= progressed
     end
     changed || return p
-    selected = Recipe[r for r in recipes if r !== nothing]
+    selected = Recipe[_built_plate_recipe(r) for r in recipes if r !== nothing]
     producer = Dict(canon_id(p.graph, v.id) => r for r in selected for v in r.outputs)
     Plan(p.graph, p.have, p.want, selected, producer, p.cost, p.candidates)
 end
 
-function _plate_dependencies(plan::Plan, root_ids::Set{Int})
+# Both backend products keep plate boundaries until lowering. Shared cell work
+# belongs inside its plate's nonempty-domain guard, not in the enclosing plan.
+_lowering_plan(p::Plan) = _fuse_authored_plate_chains(p)
+
+# Shared recipes of a cell that contains another plate. The native lowering
+# emits them once inside the outer plate's nonempty guard; their frontier is
+# passed to the residual cell without crossing the plate's evaluation boundary.
+function _nested_plate_invariants(inner::Plan, atomic, callvalues)
+    ig = inner.graph
+    loop(q) = q.op isa Union{_AuthoredPlateOp,_AuthoredScanOp,_AuthoredPlateCellOp}
+    # The cells `_lower_authored_plate_loop_native!` lowers whole (`nested`);
+    # every other cell keeps its codegen-time invariant grouping.
+    any(q -> q.op isa _AuthoredPlateOp, inner.recipes) || return nothing
+    shared = Set{ValueId}()
+    for (position, input) in enumerate(inner.have)
+        (position in atomic || valtype(callvalues[position]) <: Number) &&
+            push!(shared, canon_id(ig, input.id))
+    end
+    results = Set(canon_id(ig, v.id) for v in inner.want)
+    moved = Int[]
+    for (index, q) in enumerate(inner.recipes)
+        (q.effectful || loop(q) || isempty(q.inputs)) && continue
+        all(v -> canon_id(ig, v.id) in shared, q.inputs) || continue
+        any(v -> canon_id(ig, v.id) in results, q.outputs) && continue
+        push!(moved, index)
+        foreach(v -> push!(shared, canon_id(ig, v.id)), q.outputs)
+    end
+    isempty(moved) && return nothing
+    produced = Set(canon_id(ig, v.id) for i in moved for v in inner.recipes[i].outputs)
+    frontier = Value[]
+    for (index, q) in enumerate(inner.recipes)
+        index in moved && continue
+        for v in q.inputs
+            cid = canon_id(ig, v.id)
+            cid in produced && !any(f -> canon_id(ig, f.id) == cid, frontier) &&
+                push!(frontier, v)
+        end
+    end
+    residual = Recipe[q for (index, q) in enumerate(inner.recipes)
+                      if !(index in moved)]
+    (; moved, frontier, residual)
+end
+
+# `producer` (an authored plate with output `cid`) composed into `consumer`, an
+# authored plate or one cell of one, or `nothing` when the consumer reads that
+# output other than per cell.
+function _compose_plate_into(g::Graph, producer::Recipe, consumer::Recipe, cid)
+    # A plate cell composes its producer as its plate does; its first input is
+    # the cell index, which the producer never is.
+    cell = consumer.op isa _AuthoredPlateCellLike
+    cell && canon_id(g, first(consumer.inputs).id) == cid && return nothing
+    plate = cell ? Recipe(consumer.id, consumer.inputs[2:end], consumer.outputs,
+        consumer.op.plate, consumer.cost, nothing, false, consumer.source) : consumer
+    plate.op isa _AuthoredPlateLike || return nothing
+    atomic = _plate_atomic(plate.op)
+    any(position -> position in atomic && canon_id(g, plate.inputs[position].id) == cid,
+        eachindex(plate.inputs)) && return nothing
+    composed = _compose_authored_plates(g, producer, plate)
+    cell || return composed
+    Recipe(composed.id, (first(consumer.inputs), composed.inputs...), composed.outputs,
+        _AuthoredPlateCellDraft(composed.op), composed.cost, nothing, false, composed.source)
+end
+
+# Is a plate's pointwise value read only by other plates, each zipping it, and
+# returned by no WANT? Its tensorized lanes then pass to them as they are
+# (`_tensorized_plate_lanes`).
+function _plate_read_by_plates(p::Plan, pointwise_id, sum_recipe)
+    g = p.graph
+    any(w -> canon_id(g, w.id) == pointwise_id, p.want) && return false
+    readers = [r for r in p.recipes if r !== sum_recipe &&
+        any(input -> canon_id(g, input.id) == pointwise_id, r.inputs)]
+    isempty(readers) && return false
+    all(readers) do r
+        r.op isa _AuthoredPlateOp || return false
+        atomic = typeof(r.op).parameters[2]
+        all(k -> !(k in atomic) || canon_id(g, r.inputs[k].id) != pointwise_id,
+            eachindex(r.inputs))
+    end
+end
+
+function _plate_dependencies(plan::Plan, root_ids::Set{ValueId})
     graph = plan.graph
-    dependencies = Dict{Int,Set{Int}}()
+    dependencies = Dict{ValueId,Set{ValueId}}()
     for input in plan.have
         cid = canon_id(graph, input.id)
-        dependencies[cid] = cid in root_ids ? Set((cid,)) : Set{Int}()
+        dependencies[cid] = cid in root_ids ? Set((cid,)) : Set{ValueId}()
     end
-    recipe_dependencies = Vector{Set{Int}}(undef, length(plan.recipes))
+    recipe_dependencies = Vector{Set{ValueId}}(undef, length(plan.recipes))
     for (recipe_index, recipe) in enumerate(plan.recipes)
-        roots = Set{Int}()
+        roots = Set{ValueId}()
         for input in recipe.inputs
-            union!(roots, get(dependencies, canon_id(graph, input.id), Set{Int}()))
+            union!(roots, get(dependencies, canon_id(graph, input.id), Set{ValueId}()))
         end
         recipe_dependencies[recipe_index] = roots
         for output in recipe.outputs
@@ -657,10 +2259,34 @@ end
 
 function _authored_plate_condition(callargs, roots, positions, atomic)
     tests = Any[Expr(:call, GlobalRef(@__MODULE__, :_authored_plate_is_axis),
-                     callargs[positions[root]]) for root in sort!(collect(roots))
+                     callargs[positions[root]])
+                for root in sort!(collect(roots); by = root -> positions[root])
                 if !(positions[root] in atomic)]
     isempty(tests) && return false
     foldl((left, right) -> Expr(:||, left, right), tests)
+end
+
+# The coordinates at which a scheduled recipe group runs. The group is emitted
+# once, inside the cell loop. A root that is one-dimensional when called runs
+# it at every coordinate. Otherwise it runs at the first coordinate and, when a
+# root holds an axis, again wherever a dimension that root keeps changes. A
+# group whose roots hold no axis (a scalar passed through an untyped port) is a
+# plate invariant: computed at the first coordinate and reused at every later
+# one. A root whose declared type is an array of rank two or more is an axis
+# and never one-dimensional, so its runtime tests are left out.
+function _authored_plate_schedule(callargs, roots, positions, atomic, callvalues,
+                                  index, previous, first_coordinate)
+    declared_axis(root) =
+        _static_plate_axis_class(valtype(callvalues[positions[root]])) === :axis
+    undeclared = Set(root for root in roots if !declared_axis(root))
+    unconditional = _authored_plate_runtime_unconditional(
+        callargs, undeclared, positions, atomic)
+    changed = _authored_plate_changed(
+        callargs, roots, positions, atomic, index, previous)
+    rerun = length(undeclared) < length(roots) ? changed : Expr(:&&,
+        _authored_plate_condition(callargs, roots, positions, atomic), changed)
+    condition = Expr(:||, first_coordinate, rerun)
+    unconditional === false ? condition : Expr(:||, unconditional, condition)
 end
 
 function _authored_plate_changed(callargs, roots, positions, atomic,
@@ -668,7 +2294,8 @@ function _authored_plate_changed(callargs, roots, positions, atomic,
     tests = Any[
         Expr(:call, GlobalRef(@__MODULE__, :_plate_dependency_changed),
              index, previous, callargs[positions[root]])
-        for root in sort!(collect(roots)) if !(positions[root] in atomic)
+        for root in sort!(collect(roots); by = root -> positions[root])
+        if !(positions[root] in atomic)
     ]
     isempty(tests) && return false
     foldl((left, right) -> Expr(:||, left, right), tests)
@@ -676,12 +2303,12 @@ end
 
 function _authored_plate_recipe_groups(inner::Plan, dependencies,
                                        positions, atomic, callvalues)
-    groups = Tuple{Set{Int},Vector{Int}}[]
+    groups = Tuple{Set{ValueId},Vector{Int}}[]
     for (recipe_index, recipe) in enumerate(inner.recipes)
         length(recipe.outputs) == 1 || throw(ArgumentError(
             "an authored plate currently requires single-output scalar recipes"))
         roots = get(dependencies,
-                    canon_id(inner.graph, only(recipe.outputs).id), Set{Int}())
+                    canon_id(inner.graph, only(recipe.outputs).id), Set{ValueId}())
         dynamic = Set(root for root in roots
                       if !(positions[root] in atomic) &&
                          !(valtype(callvalues[positions[root]]) <: Number))
@@ -711,6 +2338,26 @@ function _authored_plate_unconditional_group(
     end
 end
 
+# The same decision from the VALUE a call receives. A port without a declared
+# type (`observations = domain(plan)`, one graph serving several plan types)
+# keeps the scheduling guard above at lowering time, but the generated body is
+# compiled for the concrete argument types: this trait is a constant there, so
+# a one-dimensional domain drops the guard and its per-coordinate bookkeeping
+# exactly as a declared `UnitRange`/`Vector` domain does, while a runtime
+# scalar keeps the guard (and its value, computed at the first coordinate).
+@inline _plate_unconditional_root(::AbstractVector) = true
+@inline _plate_unconditional_root(::Tuple) = true
+@inline _plate_unconditional_root(_) = false
+
+function _authored_plate_runtime_unconditional(callargs, roots, positions, atomic)
+    tests = Any[Expr(:call, GlobalRef(@__MODULE__, :_plate_unconditional_root),
+                     callargs[positions[root]])
+                for root in sort!(collect(roots); by = root -> positions[root])
+                if !(positions[root] in atomic)]
+    isempty(tests) && return false
+    foldl((left, right) -> Expr(:||, left, right), tests)
+end
+
 function _authored_plate_scalar_ref(inner::Plan, locals, callargs,
                                     callvalues, prepared_arguments, atomic,
                                     input::Value, index, looped::Bool)
@@ -724,16 +2371,1172 @@ function _authored_plate_scalar_ref(inner::Plan, locals, callargs,
         # broadcast wrapper and indexed projection on every coordinate.
         statically_scalar = have_index in atomic ||
                             valtype(callvalues[have_index]) <: Number
+        # Every looped coordinate comes from `CartesianIndices(output_axes)`,
+        # with `output_axes` the `combine_axes` of these same preprocessed
+        # arguments, so the read is in bounds by construction — Base's own
+        # broadcast `copyto!` reads `bc[I]` under `@inbounds` on the same
+        # contract. Only this projection is unchecked; the cell body keeps
+        # its own bounds checks. A checked read keeps LLVM from vectorizing
+        # the cell loop.
         return looped && !statically_scalar ?
-            Expr(:call, GlobalRef(Base.Broadcast, :_broadcast_getindex),
-                 prepared_arguments[have_index], index) : arg
+            _inbounds_value(Expr(:call, GlobalRef(Base.Broadcast, :_broadcast_getindex),
+                                 prepared_arguments[have_index], index)) : arg
     end
     locals[cid]
 end
 
-function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
-                                       op::_AuthoredPlateOp, callargs, callvalues,
-                                       pointwise_lhs, total_lhs)
+# Dose-outer lowering of a gathered generator-sum cell (`_KernelReduction`).
+#
+# A cell `sum(w[j] * get(u, t - s[j], 0.0) for j in eachindex(s); init = 0.0)`
+# runs observation-outer as authored: per cell, one pass over the doses, each
+# testing whether its lag is in range. With the doses and `u` shared by every
+# cell, the same sum runs dose-outer — one pass over the cells per dose, each
+# cell accumulating `add_sum(acc, term)` in the authored dose order, so every
+# cell's value is the authored fold, bitwise — and when the gather index moves
+# by exactly one per cell (checked at run time, `_plate_affine_index`), each
+# pass splits at the window where the index is in range: a contiguous read of
+# `u` without the test there, the default outside. That is the shape of a
+# hand-written shifted-slice accumulation loop.
+#
+# The plan is static: the materialized pointwise result is the reduction
+# recipe's output, every other cell recipe is a plate invariant (computed once
+# above the loop), and the iterator and gather source read invariants only.
+# The types are checked when the body is compiled (`_plate_reduction_ready`);
+# otherwise the ordinary cell loop runs.
+function _plate_reduction_plan(inner::Plan, inner_kernel, dependencies,
+                               root_positions, atomic, callvalues, pointwise_lhs)
+    pointwise_lhs === nothing && return nothing
+    graph = inner.graph
+    want = canon_id(graph, only(inner.want).id)
+    dynamic(cid) = Set(root for root in get(dependencies, cid, Set{ValueId}())
+                       if !(root_positions[root] in atomic) &&
+                          !(valtype(callvalues[root_positions[root]]) <: Number))
+    recipe_index = nothing
+    for (position, recipe) in enumerate(inner.recipes)
+        length(recipe.outputs) == 1 || return nothing
+        output = canon_id(graph, only(recipe.outputs).id)
+        if output == want
+            recipe_index = position
+        elseif !isempty(dynamic(output))
+            return nothing
+        end
+    end
+    recipe_index === nothing && return nothing
+    recipe = inner.recipes[recipe_index]
+    roots = dynamic(want)
+    isempty(roots) && return nothing
+    _plate_reduction_kind(inner_kernel.ops[recipe_index], recipe, recipe_index,
+                          roots, input -> dynamic(canon_id(graph, input.id)))
+end
+
+# Which fold-outer lowering the plate's value recipe admits, from its
+# operation, or `nothing`. `dynamic(input)` names the plate roots an input
+# varies with; the fold's iterator and coefficients must vary with none.
+_plate_reduction_kind(op, recipe, recipe_index, roots, dynamic) = nothing
+# A generator sum: gathered (`get(A, K, D)`, dose-outer) or gather-free.
+function _plate_reduction_kind(op::_KernelSourceOp, recipe, recipe_index, roots,
+                               dynamic)
+    op.f isa _KernelReduction || return nothing
+    II, XI, KI, AI = typeof(op.f).parameters
+    for position in (II..., AI...)
+        isempty(dynamic(recipe.inputs[position])) || return nothing
+    end
+    (; kind = Val(op.f.index === nothing ? :sum : :gather), recipe_index, recipe,
+       roots, iterator = II, init = XI, index = KI, source = AI)
+end
+# A cell that is exactly Base's `evalpoly(x, c)` (an authored `evalpoly(x, c)`
+# over two ports is stored as the bare function, inputs in argument order)
+# with coefficients `c` shared by every cell.
+function _plate_reduction_kind(::typeof(evalpoly), recipe, recipe_index, roots,
+                               dynamic)
+    length(recipe.inputs) == 2 || return nothing
+    isempty(dynamic(recipe.inputs[2])) || return nothing
+    (; kind = Val(:evalpoly), recipe_index, recipe, roots)
+end
+
+# Fill a recycled lane buffer (`_lane_reuse`) instead of evaluating
+# `allocation`, a call, when it fits; `recycled` is a recycle argument of
+# `_lower_with_ops`. A lane slot keeps a fresh allocation (`_lane_keep!`).
+# The choice between the two buffers is made inside `_lane_acquire`, so the
+# program receives one array from one call (see there).
+function _lane_allocation(recycled, eltype, output_axes, allocation)
+    allocation isa Expr && allocation.head === :call &&
+        length(allocation.args) - 1 in _LANE_ACQUIRE_ARITIES &&
+        !any(arg -> arg isa Expr && arg.head in (:parameters, :kw, :...),
+             allocation.args) || throw(ArgumentError(
+        "a lane allocation must be a positional call with " *
+        "$(_LANE_ACQUIRE_ARITIES) arguments; got $allocation"))
+    Expr(:call, GlobalRef(@__MODULE__, :_lane_acquire), recycled, eltype,
+         output_axes, allocation.args...)
+end
+
+# `@inbounds` for generated code, which carries no macro calls.
+_inbounds_expr(ex) = Expr(:block, Expr(:inbounds, true), ex, Expr(:inbounds, :pop))
+function _inbounds_value(ex)
+    value = gensym(:inbounds_value)
+    Expr(:block, Expr(:inbounds, true), Expr(:local, Expr(:(=), value, ex)),
+         Expr(:inbounds, :pop), value)
+end
+
+# The compile-time check of a generator-sum reduction (`_plate_reduction_ready`)
+# over the recipe's argument types: a HAVE port's per-cell element (or atomic
+# value) type, an invariant local's own type.
+function _plate_reduction_ready_call(reduction, inner::Plan, locals, root_positions,
+                                     plate_type_exprs, op_offset, plate_eltype)
+    graph = inner.graph
+    types = Any[haskey(root_positions, canon_id(graph, input.id)) ?
+                plate_type_exprs[canon_id(graph, input.id)] :
+                Expr(:call, GlobalRef(Base, :typeof), locals[canon_id(graph, input.id)])
+                for input in reduction.recipe.inputs]
+    Expr(:call, GlobalRef(@__MODULE__, :_plate_reduction_ready),
+         :($(Expr(:ref, _OPS_ARG, op_offset + reduction.recipe_index)).f),
+         plate_eltype, Expr(:curly, GlobalRef(Core, :Tuple), types...))
+end
+
+# A fold-outer pass computes the cell at every coordinate, so the plate's value
+# recipe must run at every coordinate, as it does for a domain value that is a
+# vector or tuple when called.
+function _plate_reduction_every_cell(ready, reduction, callargs, root_positions,
+                                     atomic, callvalues)
+    _authored_plate_unconditional_group(
+        reduction.roots, root_positions, atomic, callvalues) && return ready
+    Expr(:&&, _authored_plate_runtime_unconditional(
+        callargs, reduction.roots, root_positions, atomic), ready)
+end
+
+# The tiles of a fold-outer pass over a one-axis plate: `body` runs per tile
+# with `lo:hi` its positions in `cells`; `tile_cells(body)` runs `body` per cell
+# of the tile. A tile of `_PLATE_FOLD_TILE` cells keeps its accumulators and
+# cell values in the first-level cache across the passes.
+function _plate_fold_tiles(count, lo, hi, body)
+    tile = GlobalRef(@__MODULE__, :_PLATE_FOLD_TILE)
+    Expr(:for, :($lo = 1:$tile:$count), Expr(:block,
+        :($hi = $(GlobalRef(Base, :min))($lo + $tile - 1, $count)), body))
+end
+_plate_tile_cells(cells, position, lo, hi, cell, body) =
+    Expr(:for, :($position = $lo:$hi),
+        Expr(:block, :($cell = $(_inbounds_value(:($cells[$position])))), body))
+# The plate total adds the cells in coordinate order, as the cell loop does.
+_plate_fold_total(accumulator, cells, count, position, cell, entry) =
+    Expr(:for, :($position = 1:$count), Expr(:block,
+        :($cell = $(_inbounds_value(:($cells[$position])))),
+        :($accumulator = $(GlobalRef(@__MODULE__, :_plate_total_add))(
+            $accumulator, $(_inbounds_value(entry))))))
+
+function _lower_plate_reduction_native(::Val{:gather}, reduction, inner::Plan,
+                                       locals, callargs,
+                                       callvalues, raw_arguments, prepared_arguments,
+                                       atomic, root_positions, plate_type_exprs, op_offset,
+                                       plate_eltype, output_axes, pointwise_lhs,
+                                       accumulator, cell_loop)
+    recipe = reduction.recipe
+    graph = inner.graph
+    arguments(cell) = Any[_authored_plate_scalar_ref(
+        inner, locals, callargs, callvalues, prepared_arguments, atomic,
+        input, cell, true) for input in recipe.inputs]
+    select(positions, cell) = arguments(cell)[collect(Int, positions)]
+    ready = _plate_reduction_every_cell(
+        _plate_reduction_ready_call(reduction, inner, locals, root_positions,
+                                    plate_type_exprs, op_offset, plate_eltype),
+        reduction, callargs, root_positions, atomic, callvalues)
+
+    parts = gensym(:plate_reduction)
+    cells = gensym(:plate_cells)
+    count = gensym(:plate_count)
+    iterator = gensym(:plate_iterator)
+    source = gensym(:plate_source)
+    element = gensym(:plate_element)
+    index_of = gensym(:plate_index_of)
+    affine = gensym(:plate_affine)
+    first_index = gensym(:plate_first_index)
+    lo = gensym(:plate_lo)
+    hi = gensym(:plate_hi)
+    position = gensym(:plate_position)
+    cell = gensym(:plate_cell)
+    entry = :($pointwise_lhs[$cell])
+    step(f, extra...) = _inbounds_expr(:($entry = $parts.$f(
+        $entry, $element, $(extra...), $(arguments(cell)...))))
+    window(range, body) = Expr(:for, Expr(:(=), position, range),
+        Expr(:block, Expr(:(=), cell, _inbounds_value(:($cells[$position]))), body))
+    every(body) = Expr(:for, Expr(:(=), cell,
+        :($(GlobalRef(@__MODULE__, :_plate_cells))($cells))), Expr(:block, body))
+    # The index function passed to the out-of-line check (`_PlateCellIndex`).
+    # Its per-cell arguments are the raw plate arguments, read at the cell:
+    # each must span the plate's axes (no singleton expansion), which also
+    # puts every cell in bounds.
+    index_arguments = Any[]
+    spanning = Any[]
+    for position in reduction.index
+        cid = canon_id(graph, recipe.inputs[position].id)
+        have_index = get(root_positions, cid, nothing)
+        if have_index === nothing
+            push!(index_arguments, Expr(:call,
+                GlobalRef(@__MODULE__, :_PlateSharedArgument), locals[cid]))
+        elseif have_index in atomic || valtype(callvalues[have_index]) <: Number
+            push!(index_arguments, Expr(:call,
+                GlobalRef(@__MODULE__, :_PlateSharedArgument), callargs[have_index]))
+        else
+            push!(index_arguments, Expr(:call,
+                GlobalRef(@__MODULE__, :_PlateCellArgument), raw_arguments[have_index]))
+            push!(spanning, raw_arguments[have_index])
+        end
+    end
+    isempty(spanning) || (ready = Expr(:&&, ready, Expr(:call,
+        GlobalRef(@__MODULE__, :_plate_spans), output_axes, spanning...)))
+    index_function = Expr(:call, GlobalRef(@__MODULE__, :_PlateCellIndex),
+        :($parts.index), element, Expr(:tuple, index_arguments...))
+    gathered = _inbounds_value(:($source[$first_index + ($position - 1)]))
+    passes = quote
+        $iterator = $parts.iterator($(select(reduction.iterator, nothing)...))
+        $source = $parts.array($(select(reduction.source, nothing)...))
+        $(every(_inbounds_expr(:($entry = $parts.init($(select(reduction.init, cell)...))))))
+        for $element in $iterator
+            $index_of = $index_function
+            ($affine, $first_index) =
+                $(GlobalRef(@__MODULE__, :_plate_affine_index))($index_of, $cells)
+            if $affine
+                ($lo, $hi) = $(GlobalRef(@__MODULE__, :_plate_gather_window))(
+                    $source, $first_index, $count)
+                $(window(:(1:($lo - 1)), step(:step_out)))
+                $(window(:($lo:$hi), step(:step_in, gathered)))
+                $(window(:(($hi + 1):$count), step(:step_out)))
+            else
+                $(every(step(:step)))
+            end
+        end
+    end
+    interchanged = quote
+        $parts = $(Expr(:ref, _OPS_ARG, op_offset + reduction.recipe_index)).f
+        $cells = $(GlobalRef(Base, :CartesianIndices))($output_axes)
+        $count = length($cells)
+        $count > 0 && $passes
+    end
+    if accumulator !== nothing
+        # The total adds the cells in coordinate order, as the cell loop does.
+        push!(interchanged.args, every(:($accumulator =
+            $(GlobalRef(@__MODULE__, :_plate_total_add))(
+                $accumulator, $(_inbounds_value(entry))))))
+    end
+    Expr(:if, ready, interchanged, cell_loop)
+end
+
+# Coefficient-outer lowering of an `evalpoly(x, c)` cell over coefficients
+# shared by every cell. Per cell, Base's `evalpoly(x, c::AbstractVector)` is a
+# runtime Horner loop, `ex = c[end]`, then `ex = muladd(x, ex, c[i])` for
+# `i = length(c)-1:-1:1`: a chain of dependent multiply-adds that cannot run
+# across cells. Here the cells run side by side, a chunk of them at a time,
+# with their accumulators held in registers across the coefficients
+# (`_plate_evalpoly_chunks!`). Every cell performs Base's operations in
+# Base's order. The types are checked when the body is compiled
+# (`_plate_evalpoly_ready`); coefficients with offset axes, which Base's
+# `evalpoly` rejects, domains with more than one axis, and an `x` whose axes
+# are not the plate's keep the cell loop.
+function _lower_plate_reduction_native(::Val{:evalpoly}, reduction, inner::Plan,
+                                       locals, callargs, callvalues, raw_arguments,
+                                       prepared_arguments, atomic, root_positions,
+                                       plate_type_exprs, op_offset, plate_eltype,
+                                       output_axes, pointwise_lhs, accumulator,
+                                       cell_loop)
+    graph = inner.graph
+    x_input, c_input = reduction.recipe.inputs
+    argument(input, cell) = _authored_plate_scalar_ref(
+        inner, locals, callargs, callvalues, prepared_arguments, atomic,
+        input, cell, true)
+    type_of(input) = let cid = canon_id(graph, input.id)
+        haskey(root_positions, cid) ? plate_type_exprs[cid] :
+            Expr(:call, GlobalRef(Base, :typeof), locals[cid])
+    end
+    coefficients = argument(c_input, nothing)
+    ready = Expr(:&&,
+        Expr(:call, GlobalRef(@__MODULE__, :_plate_evalpoly_ready), plate_eltype,
+             type_of(x_input), type_of(c_input), output_axes),
+        Expr(:call, GlobalRef(Base, :!),
+             Expr(:call, GlobalRef(Base, :has_offset_axes), coefficients)))
+    ready = _plate_reduction_every_cell(ready, reduction, callargs, root_positions,
+                                        atomic, callvalues)
+    # `x` varies per cell, so it is a plate argument (an invariant `x` would
+    # make the cell invariant). When its axes are the plate's, the chunks read
+    # it directly: the broadcast projection selects its index per read.
+    x_have = root_positions[canon_id(graph, x_input.id)]
+    raw_x = raw_arguments[x_have]
+    raw_x === nothing && return cell_loop
+    ready = Expr(:&&, ready, Expr(:call,
+        GlobalRef(@__MODULE__, :_plate_spans), output_axes, raw_x))
+    c, axis, position = gensym.((:plate_coefficients, :plate_axis_range, :plate_position))
+    base(name) = GlobalRef(Base, name)
+    interchanged = quote
+        $c = $coefficients
+        $axis = $(base(:only))($output_axes)
+        $(base(:isempty))($axis) ||
+            $(GlobalRef(@__MODULE__, :_plate_evalpoly_chunks!))($pointwise_lhs, $raw_x, $c, $axis)
+    end
+    if accumulator !== nothing
+        # The total adds the cells in coordinate order, as the cell loop does.
+        push!(interchanged.args, Expr(:for, :($position = $axis), Expr(:block,
+            :($accumulator = $(GlobalRef(@__MODULE__, :_plate_total_add))(
+                $accumulator, $(_inbounds_value(:($pointwise_lhs[$position]))))))))
+    end
+    Expr(:if, ready, interchanged, cell_loop)
+end
+
+# Fold-outer lowering of a gather-free generator-sum cell whose term is plain
+# arithmetic (`_kernel_fold_arithmetic`), `sum(term for j in iterator; init)`
+# over an iterator shared by every cell. Per cell, the sum is a chain of
+# dependent `add_sum`s, which cannot run across cells; across cells, the terms
+# of one element are independent. Here the cells of one tile take their seed,
+# then each element in turn: one contiguous pass `acc = add_sum(acc, term)`
+# over the tile per element, which vectorizes across cells. Every cell's value
+# is the authored fold in the authored order, bitwise. Measured on gordito
+# (Julia 1.10.12, 16321 cells): `w[j] / (t + s[j])` 3.2-3.5 -> 0.32-0.35
+# ns/cell over 3 elements and 8.9-9.3 -> 1.16-1.24 over 12; a term calling
+# `exp` gains nothing and loses up to 13 % over 12 elements, which is why only
+# arithmetic terms are recognized. The types are checked when the body is
+# compiled (`_plate_reduction_ready`); a domain with more than one axis keeps
+# the cell loop.
+function _lower_plate_reduction_native(::Val{:sum}, reduction, inner::Plan,
+                                       locals, callargs, callvalues, raw_arguments,
+                                       prepared_arguments, atomic, root_positions,
+                                       plate_type_exprs, op_offset, plate_eltype,
+                                       output_axes, pointwise_lhs, accumulator,
+                                       cell_loop)
+    arguments(cell) = Any[_authored_plate_scalar_ref(
+        inner, locals, callargs, callvalues, prepared_arguments, atomic,
+        input, cell, true) for input in reduction.recipe.inputs]
+    select(positions, cell) = arguments(cell)[collect(Int, positions)]
+    ready = _plate_reduction_every_cell(
+        Expr(:&&,
+             Expr(:call, GlobalRef(@__MODULE__, :_plate_one_axis), output_axes),
+             _plate_reduction_ready_call(reduction, inner, locals, root_positions,
+                                         plate_type_exprs, op_offset, plate_eltype)),
+        reduction, callargs, root_positions, atomic, callvalues)
+    parts, cells, count, iterator, element, lo, hi, position, cell = gensym.((
+        :plate_reduction, :plate_cells, :plate_count, :plate_iterator,
+        :plate_element, :plate_tile_lo, :plate_tile_hi, :plate_position,
+        :plate_cell))
+    entry = :($pointwise_lhs[$cell])
+    tile_cells(body) = _plate_tile_cells(cells, position, lo, hi, cell, body)
+    passes = quote
+        $iterator = $parts.iterator($(select(reduction.iterator, nothing)...))
+        $(_plate_fold_tiles(count, lo, hi, quote
+            $(tile_cells(_inbounds_expr(
+                :($entry = $parts.init($(select(reduction.init, cell)...))))))
+            for $element in $iterator
+                $(tile_cells(_inbounds_expr(
+                    :($entry = $parts.step($entry, $element, $(arguments(cell)...))))))
+            end
+        end))
+    end
+    interchanged = quote
+        $parts = $(Expr(:ref, _OPS_ARG, op_offset + reduction.recipe_index)).f
+        $cells = $(GlobalRef(Base, :CartesianIndices))($output_axes)
+        $count = $(GlobalRef(Base, :length))($cells)
+        $count > 0 && $passes
+    end
+    accumulator === nothing || push!(interchanged.args,
+        _plate_fold_total(accumulator, cells, count, position, cell, entry))
+    Expr(:if, ready, interchanged, cell_loop)
+end
+
+# Each authored scan of a plate body: its step operations, then any cold
+# type-only slots of a step that is not plain (`_scan_type_slots!`). Both
+# backend products append them in this order.
+# The scans of a plate cell that run only the steps their one slice reader
+# reads (`_lower_authored_scan_slice_native!`): reader index => (scan index,
+# demand). The scan then runs where, and as often as, its reader does. The
+# reader's dynamic roots include the scan's, so that is correct wherever it
+# sits; it adds no evaluations when both groups have the same roots, or when
+# both are dynamic groups evaluated at every coordinate (`unconditional`).
+# Neither may be a lane branch.
+function _plate_scan_slice_pairs(inner::Plan, groups, lane_arms, unconditional)
+    roots_of = Dict{Int,Any}()
+    for (roots, recipe_indices) in groups, recipe_index in recipe_indices
+        roots_of[recipe_index] = roots
+    end
+    pairs = Dict{Int,Tuple{Int,Any}}()
+    for (scan_index, recipe) in enumerate(inner.recipes)
+        recipe.op isa _AuthoredScanOp || continue
+        haskey(roots_of, scan_index) && !haskey(lane_arms, scan_index) || continue
+        demand = _authored_scan_slice_demand(inner, recipe)
+        demand === nothing && continue
+        reader_index = findfirst(r -> r === demand.reader, inner.recipes)
+        haskey(roots_of, reader_index) && !haskey(lane_arms, reader_index) || continue
+        scan_roots, reader_roots = roots_of[scan_index], roots_of[reader_index]
+        scan_roots == reader_roots ||
+            unconditional(scan_roots) && unconditional(reader_roots) || continue
+        pairs[reader_index] = (scan_index, demand)
+    end
+    pairs
+end
+
+function _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
+    offsets = Dict{Int,NamedTuple{(:offset, :type_offset),
+                                  Tuple{Int,Union{Nothing,Int}}}}()
+    for (index, recipe) in enumerate(inner.recipes)
+        recipe.op isa _AuthoredScanOp || continue
+        step = recipe.op.kernel
+        offset = length(runtime_ops)
+        append!(runtime_ops, step.ops)
+        append!(runtime_recipes, step.lowered_recipes)
+        offsets[index] = (; offset,
+            type_offset = _scan_type_slots!(runtime_ops, runtime_recipes, recipe.op))
+    end
+    offsets
+end
+
+# Keep an authored branch in the containing native plate loop. Calling its
+# all-in-one source closure can make Enzyme Reverse enter a composed endpoint's
+# inactive logarithm when the condition reads a shared scalar. The condition
+# and arm callables are the same branch parts used by plate partitioning and
+# tensorized execution; emitting them here retains the authored lazy choice.
+function _native_plate_branch_expr(
+        branch::_KernelBranch{CI,TI,EI}, reference, args) where {CI,TI,EI}
+    condition = Expr(:call, :(getfield($reference, :condition)),
+                     (args[i] for i in CI)...)
+    arm_expr(arm, field, indices) = begin
+        arm_reference = :(getfield($reference, $(QuoteNode(field))))
+        selected = Any[args[i] for i in indices]
+        arm isa _KernelBranch ? _native_plate_branch_expr(arm, arm_reference, selected) :
+            Expr(:call, arm_reference, selected...)
+    end
+    Expr(:if, condition,
+         arm_expr(branch.then_arm, :then_arm, TI),
+         arm_expr(branch.else_arm, :else_arm, EI))
+end
+
+# A cell whose top-level lazy branch reads only shared operands takes the same
+# arm at every cell. The native lowering then decides it once per call, above
+# the loop, and runs the cells of the taken arm alone: a variant of the cell
+# kernel whose branch recipe is replaced by that arm. An arm with its own graph
+# (`_KernelBranch` `then_spec`/`else_spec`) is spliced as recipes, so its
+# shared work (the `log(scale)` of a density, say) is hoisted above the loop
+# like any other cell invariant, and evaluated only when that arm is taken.
+# Each lane still evaluates only its own arm, and an empty domain evaluates no
+# condition and no arm, so the authored lazy semantics are unchanged. This is
+# the native counterpart of the tensorized shared-condition dispatch
+# (`_tensorized_plate_dispatch`, docs/src/constraints.md "Preserve lazy
+# branches").
+#
+# The condition must read plate arguments that are statically shared: an
+# atomic operand or a `Number`. A cell holding a nested plate or scan, an
+# embedded kernel or an effectful recipe keeps its per-cell branch, as does a
+# branch none of whose arms has a graph (nothing would be hoisted).
+Base.@nospecializeinfer function _plate_shared_branch(
+        @nospecialize(inner_kernel), @nospecialize(atomic), @nospecialize(callargs),
+        @nospecialize(callvalues))
+    inner = inner_kernel.plan
+    for r in inner.recipes
+        (r.effectful || length(r.outputs) != 1 ||
+         r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
+         _embedded_kernel(r.op) !== nothing) && return nothing
+    end
+    g = inner.graph
+    root_positions = Dict(canon_id(g, v.id) => position
+                          for (position, v) in enumerate(inner.have))
+    dependencies = _plate_dependencies(inner, Set(keys(root_positions))).values
+    for (index, r) in enumerate(inner.recipes)
+        _plate_branch_operation(r.op) || continue
+        condition_positions = _plate_branch_shared_condition(inner, r, atomic,
+                                                             callvalues)
+        condition_positions === nothing && continue
+        names, shared = _plate_branch_source_inputs(inner, r, atomic,
+            callvalues, dependencies, root_positions)
+        branch = _plate_branch_source_graphs(r, names, shared)
+        _plate_branch_has_graph(branch) || continue
+        then_kernel = _plate_branch_arm_kernel(inner, index, :then, branch, names)
+        else_kernel = _plate_branch_arm_kernel(inner, index, :else, branch, names)
+        (then_kernel === nothing || else_kernel === nothing) && continue
+        return _PlateSharedBranch(index,
+            Any[callargs[p] for p in condition_positions], then_kernel, else_kernel)
+    end
+    nothing
+end
+
+function _plate_branch_source_inputs(inner::Plan, r::Recipe, atomic, callvalues,
+                                     dependencies, root_positions)
+    g = inner.graph
+    names = _recipe_source_names(r)
+    shared_root(root) = root_positions[root] in atomic ||
+        valtype(callvalues[root_positions[root]]) <: Number
+    shared = Set{Symbol}(name for (name, v) in zip(names, r.inputs)
+        if all(shared_root, get(dependencies, canon_id(g, v.id), Set{ValueId}())))
+    names, shared
+end
+
+# A constructed endpoint's branch is spliced into the cell as recipes, so its
+# authored branch operation does not carry the arm graphs made for a cell's own
+# source. Recover those graphs only when a plate lowers it, with the actual
+# shared inputs of that plate. The operation's source module owns its globals;
+# the graphs remain cold metadata and the original lazy closures execute.
+Base.@nospecializeinfer function _plate_branch_source_graphs(
+        r::Recipe, names, shared::Set{Symbol})
+    branch = getfield(r.op, :f)
+    (_plate_branch_has_graph(branch) || isempty(shared) ||
+     _kernel_branch_parts(r.source) === nothing) && return branch
+    mod = _kernel_endpoint_source_module(r.op)
+    key = (Tuple(names), Tuple(sort!(collect(shared))), mod)
+    # Native and tensorized lowerings must append the SAME arm operation
+    # objects to their tables. Key by source identity: equal expressions in
+    # different plans have independent lifetimes. WeakKeyDict compares Exprs
+    # structurally, so its entry could belong to a dead earlier plan and be
+    # collected between the two lowerings of the live plan.
+    lock(_PLATE_BRANCH_SOURCE_GRAPHS_LOCK) do
+        if Threads.atomic_xchg!(_PLATE_BRANCH_SOURCE_GRAPHS_DIRTY, false)
+            filter!(entry -> entry.first.source.value !== nothing,
+                    _PLATE_BRANCH_SOURCE_GRAPHS)
+        end
+        source = r.source::Expr
+        by_op = get!(_PLATE_BRANCH_SOURCE_GRAPHS, _PlateBranchSourceKey(source)) do
+            # Finalizers only mark the cache for cleanup; dictionary mutation
+            # stays under the lowering lock, outside the finalizer.
+            finalizer(_ -> (_PLATE_BRANCH_SOURCE_GRAPHS_DIRTY[] = true), source)
+            IdDict{Any,Any}()
+        end
+        by_inputs = get!(by_op, r.op) do
+            Dict{Any,Any}()
+        end
+        get!(by_inputs, key) do
+            inputs = Set(names)
+            entries = _kernel_plate_arm_entries(r.source, inputs, shared, mod,
+                inputs; endpoint_cache = IdDict{Any,Dict{Any,KernelSpec}}())
+            entries === nothing ? branch :
+                _plate_branch_with_source_graphs(branch, entries, mod)
+        end
+    end
+end
+
+# A stable hash plus weak identity keeps this cold cache from retaining a
+# prepared model. Include the hash in equality even after both refs expire.
+struct _PlateBranchSourceKey
+    source::WeakRef
+    id::UInt
+end
+_PlateBranchSourceKey(source::Expr) = _PlateBranchSourceKey(WeakRef(source), objectid(source))
+Base.hash(key::_PlateBranchSourceKey, h::UInt) = hash(key.id, h)
+Base.isequal(a::_PlateBranchSourceKey, b::_PlateBranchSourceKey) =
+    a.id == b.id && a.source.value === b.source.value
+
+const _PLATE_BRANCH_SOURCE_GRAPHS = Dict{_PlateBranchSourceKey,Any}()
+const _PLATE_BRANCH_SOURCE_GRAPHS_DIRTY = Threads.Atomic{Bool}(false)
+const _PLATE_BRANCH_SOURCE_GRAPHS_LOCK = ReentrantLock()
+
+Base.@nospecializeinfer function _plate_branch_with_source_graphs(
+        @nospecialize(branch), entries, mod::Module)
+    CI, TI, EI = (typeof(branch)::DataType).parameters
+    child(arm, entry) = arm isa _KernelBranch && entry isa NamedTuple ?
+        _plate_branch_with_source_graphs(arm, entry, mod) : arm
+    spec(arm, entry) = arm isa _KernelBranch ? nothing :
+        (entry isa Expr ? _kernel_eval_construction(mod, entry) : nothing)
+    _KernelBranch(Val(CI), Val(TI), Val(EI), branch.call, branch.condition,
+        child(branch.then_arm, entries.then_arm),
+        child(branch.else_arm, entries.else_arm),
+        spec(branch.then_arm, entries.then_arm),
+        spec(branch.else_arm, entries.else_arm))
+end
+
+# The plate argument positions a branch recipe's condition reads, when each is
+# statically shared (atomic, or a `Number`); `nothing` otherwise.
+Base.@nospecializeinfer function _plate_branch_shared_condition(
+        inner::Plan, r::Recipe, @nospecialize(atomic), @nospecialize(callvalues))
+    g = inner.graph
+    positions = Int[]
+    for i in (typeof(getfield(r.op, :f))::DataType).parameters[1]
+        cid = canon_id(g, r.inputs[i].id)
+        position = findfirst(v -> canon_id(g, v.id) == cid, inner.have)
+        position !== nothing && (position in atomic ||
+            valtype(callvalues[position]) <: Number) || return nothing
+        push!(positions, position)
+    end
+    positions
+end
+
+# The shared branch a cell decides once per call, and its two arm variants of
+# the cell kernel. Abstract fields keep the lowering from compiling per model.
+struct _PlateSharedBranch
+    index::Int
+    condition_args::Vector{Any}
+    then_kernel::Any
+    else_kernel::Any
+end
+
+# A cell kernel variant: the fields of a `PreparedKernel` the native plate
+# lowering reads.
+struct _PlateArmVariant
+    plan::Plan
+    ops::Tuple
+    lowered_recipes::Tuple
+end
+
+# Preparation may cut an arm's already selected plan at cached values. Keep
+# that exact recipe selection instead of asking the planner to choose again.
+_plate_arm_plan(spec) = plan(spec)
+_plate_arm_plan(p::Plan) = p
+
+# A branch whose condition reads the cell takes its arm per cell, but an arm
+# with its own graph is inlined into the cell loop. Its recipes that read only
+# shared values run at the first cell that takes the arm and are reused by the
+# later ones: an arm nobody takes evaluates nothing, and a shared value that
+# throws does so at the same cell as before. The arm recipes take operation
+# table slots after the cell's own, in recipe order, in both lowerings. The
+# result maps a branch recipe's index to its arms: `(; then_arm, else_arm)`,
+# each `nothing` (the arm's closure), `(; offset, plan)` (an inlined graph) or
+# a nested branch's own pair.
+Base.@nospecializeinfer function _plate_lane_arm_slots!(
+        runtime_ops, runtime_recipes, inner::Plan, @nospecialize(atomic),
+        @nospecialize(callvalues))
+    arms = Dict{Int,Any}()
+    for r in inner.recipes
+        (r.effectful || length(r.outputs) != 1 ||
+         r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
+         _embedded_kernel(r.op) !== nothing) && return arms
+    end
+    g = inner.graph
+    root_positions = Dict(canon_id(g, v.id) => position
+                          for (position, v) in enumerate(inner.have))
+    dependencies = _plate_dependencies(inner, Set(keys(root_positions))).values
+    for (index, r) in enumerate(inner.recipes)
+        _plate_branch_operation(r.op) || continue
+        # A shared condition is decided once per call instead.
+        _plate_branch_shared_condition(inner, r, atomic, callvalues) === nothing ||
+            continue
+        names, shared = _plate_branch_source_inputs(inner, r, atomic,
+            callvalues, dependencies, root_positions)
+        branch = _plate_branch_source_graphs(r, names, shared)
+        _plate_branch_has_graph(branch) || continue
+        length(unique(names)) == length(names) ||
+            continue
+        slots = _plate_lane_branch_slots!(runtime_ops, runtime_recipes,
+                                         branch, Set(names), shared)
+        arms[index] = (; branch, names, slots)
+    end
+    arms
+end
+
+# Whether an arm's graph has a recipe worth running once: one with inputs, all
+# of them shared (constants are left to Julia).
+function _plate_arm_has_shared_work(armplan::Plan, shared::Set{Symbol})
+    g = armplan.graph
+    invariant = Set{ValueId}(canon_id(g, port.id) for port in armplan.have
+                         if port.name in shared)
+    found = false
+    for q in armplan.recipes
+        all(v -> canon_id(g, v.id) in invariant, q.inputs) || continue
+        push!(invariant, canon_id(g, only(q.outputs).id))
+        found |= !isempty(q.inputs)
+    end
+    found
+end
+
+Base.@nospecializeinfer function _plate_lane_branch_slots!(
+        runtime_ops, runtime_recipes, @nospecialize(branch), names, shared)
+    side(@nospecialize(arm), @nospecialize(spec)) = if arm isa _KernelBranch
+        _plate_lane_branch_slots!(runtime_ops, runtime_recipes, arm, names, shared)
+    elseif spec === nothing
+        nothing
+    else
+        armplan = _plate_arm_plan(spec)
+        fits = all(port -> port.name in names, armplan.have) &&
+            !any(port -> canon_id(armplan.graph, port.id) ==
+                         canon_id(armplan.graph, only(armplan.want).id),
+                 armplan.have) &&
+            all(q -> !q.effectful && length(q.outputs) == 1 &&
+                     !(q.op isa Union{_AuthoredPlateOp,_AuthoredScanOp}) &&
+                     _embedded_kernel(q.op) === nothing, armplan.recipes) &&
+            _plate_arm_has_shared_work(armplan, shared)
+        fits || return nothing
+        offset = length(runtime_ops)
+        for q in armplan.recipes
+            push!(runtime_ops, q.op)
+            push!(runtime_recipes, q)
+        end
+        (; offset, plan = armplan)
+    end
+    (; then_arm = side(getfield(branch, :then_arm), getfield(branch, :then_spec)),
+       else_arm = side(getfield(branch, :else_arm), getfield(branch, :else_spec)))
+end
+
+# The cell-loop expression of a lane branch with inlined arms (above). `args`
+# are the branch recipe's per-cell argument expressions and `inputs` its
+# values; `shared(v)` says whether a branch input reads only shared values.
+# First-use flags and the arms' shared locals are declared in `declarations`,
+# above the loop.
+Base.@nospecializeinfer function _native_plate_lane_branch_expr(
+        @nospecialize(branch), reference, args, inputs, names, slots, shared,
+        declarations)
+    CI, TI, EI = (typeof(branch)::DataType).parameters
+    by_name = Dict(name => (arg, shared(v))
+                   for (name, arg, v) in zip(names, args, inputs))
+    condition = Expr(:call, :(getfield($reference, :condition)),
+                     (args[i] for i in CI)...)
+    arm_expr(@nospecialize(arm), field, indices, entry) = begin
+        arm_reference = :(getfield($reference, $(QuoteNode(field))))
+        if arm isa _KernelBranch
+            _native_plate_lane_branch_expr(arm, arm_reference, args, inputs,
+                                           names, entry, shared, declarations)
+        elseif entry === nothing
+            Expr(:call, arm_reference, (args[i] for i in indices)...)
+        else
+            _native_plate_inline_arm(entry, by_name, declarations)
+        end
+    end
+    Expr(:if, condition,
+         arm_expr(getfield(branch, :then_arm), :then_arm, TI, slots.then_arm),
+         arm_expr(getfield(branch, :else_arm), :else_arm, EI, slots.else_arm))
+end
+
+function _native_plate_inline_arm(entry, by_name, declarations)
+    armplan = entry.plan
+    g = armplan.graph
+    values = Dict{ValueId,Any}()
+    invariant = Set{ValueId}()
+    for port in armplan.have
+        arg, is_shared = by_name[port.name]
+        cid = canon_id(g, port.id)
+        values[cid] = arg
+        is_shared && push!(invariant, cid)
+    end
+    ready = gensym(:arm_ready)
+    once = Expr(:block)
+    cell = Expr(:block)
+    for (k, q) in enumerate(armplan.recipes)
+        output = canon_id(g, only(q.outputs).id)
+        local_name = gensym(Symbol(:arm_, only(q.outputs).name))
+        call = Expr(:call, Expr(:ref, _OPS_ARG, entry.offset + k),
+                    Any[values[canon_id(g, v.id)] for v in q.inputs]...)
+        if all(v -> canon_id(g, v.id) in invariant, q.inputs)
+            push!(invariant, output)
+            push!(declarations, Expr(:local, local_name))
+            push!(once.args, Expr(:(=), local_name, call))
+        else
+            push!(cell.args, Expr(:(=), local_name, call))
+        end
+        values[output] = local_name
+    end
+    if !isempty(once.args)
+        push!(declarations, Expr(:(=), ready, false))
+        push!(once.args, Expr(:(=), ready, true))
+        pushfirst!(cell.args, Expr(:if, Expr(:call, GlobalRef(Base, :!), ready), once))
+    end
+    push!(cell.args, values[canon_id(g, only(armplan.want).id)])
+    cell
+end
+
+# Branch metadata is read with the `getfield` builtin and without specializing:
+# every authored branch is a new concrete type, and these lowering queries must
+# not compile per model (the construction rule of the primer's cold-construction
+# section).
+Base.@nospecializeinfer _plate_branch_operation(@nospecialize(op)) =
+    op isa _KernelSourceOp && getfield(op, :f) isa _KernelBranch &&
+    getfield(op, :tensor_f) isa _KernelBranch
+Base.@nospecializeinfer function _plate_branch_has_graph(@nospecialize(arm))
+    arm isa _KernelBranch || return false
+    getfield(arm, :then_spec) !== nothing || getfield(arm, :else_spec) !== nothing ||
+        _plate_branch_has_graph(getfield(arm, :then_arm)) ||
+        _plate_branch_has_graph(getfield(arm, :else_arm))
+end
+
+# The cell kernel with branch recipe `index` replaced by one arm, as a
+# `_PlateArmVariant`, or `nothing` when that arm's graph does not
+# fit the recipe. An arm with a graph becomes its recipes; any other arm is its
+# closure over its own ports (a nested branch stays a branch over every
+# argument, and is examined again), as in `_partition_plate_recipe`.
+Base.@nospecializeinfer function _plate_branch_arm_kernel(
+        inner::Plan, index::Int, side::Symbol, @nospecialize(native), names)
+    r = inner.recipes[index]
+    tensor = getfield(r.op, :tensor_f)
+    then = side === :then
+    positions = (typeof(native)::DataType).parameters[then ? 2 : 3]
+    spec = getfield(native, then ? :then_spec : :else_spec)
+    g = inner.graph
+    # A shallow structural copy keeps the cell's values and operations; only its
+    # registry gains the arm's values.
+    copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers),
+                   copy(g.aliases), g.version)
+    next_id = Ref(minimum((q.id for q in inner.recipes); init = 0) - 1)
+    fresh() = (id = next_id[]; next_id[] -= 1; id)
+    replacement = if spec === nothing
+        token, form = (typeof(r.op)::DataType).parameters
+        arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form),
+            getfield(native, then ? :then_arm : :else_arm),
+            getfield(tensor, then ? :then_arm : :else_arm))
+        Recipe[Recipe(r.id, Tuple(r.inputs[i] for i in positions), r.outputs,
+                      arm_op, r.cost, nothing, false, r.source)]
+    else
+        _plate_branch_arm_recipes!(copied, spec, r, names, fresh)
+    end
+    replacement === nothing && return nothing
+    recipes = Recipe[]
+    for (i, q) in enumerate(inner.recipes)
+        i == index ? append!(recipes, replacement) : push!(recipes, q)
+    end
+    template = Plan(copied, inner.have, inner.want, inner.recipes,
+                    inner.producer, inner.cost, inner.candidates)
+    variant = _partial_subplan(template, inner.have, inner.want, recipes)
+    _, ops, lowered = _lower_with_ops(variant; inline_embedded = false)
+    length(ops) == length(variant.recipes) || return nothing
+    _PlateArmVariant(variant, Tuple(ops), Tuple(lowered))
+end
+
+# The recipes of an arm's graph over the branch recipe `r`: the arm's ports
+# read the branch inputs of the same name and its value is the branch output.
+Base.@nospecializeinfer function _plate_branch_arm_recipes!(
+        copied::Graph, @nospecialize(spec), r::Recipe, names, fresh)
+    arm = _plate_arm_plan(spec)
+    ag = arm.graph
+    inputs = Dict{Symbol,Value}()
+    for (name, v) in zip(names, r.inputs)
+        get(inputs, name, v) == v || return nothing
+        inputs[name] = v
+    end
+    mapping = Dict{ValueId,Value}()
+    for port in arm.have
+        target = get(inputs, port.name, nothing)
+        target === nothing && return nothing
+        mapping[canon_id(ag, port.id)] = target
+    end
+    value = canon_id(ag, only(arm.want).id)
+    haskey(mapping, value) && return nothing
+    mapping[value] = only(r.outputs)
+    for (id, v) in ag.values
+        existing = get(copied.values, id, nothing)
+        existing === nothing || existing === v || return nothing
+        _register!(copied, v)
+    end
+    for (id, target) in ag.aliases
+        get(copied.aliases, id, target) == target || return nothing
+        copied.aliases[id] = target
+    end
+    mapped(v) = get(mapping, canon_id(ag, v.id), v)
+    recipes = Recipe[]
+    for q in arm.recipes
+        (q.effectful || length(q.outputs) != 1 ||
+         q.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
+         _embedded_kernel(q.op) !== nothing) && return nothing
+        push!(recipes, Recipe(fresh(), Tuple(mapped(v) for v in q.inputs),
+            (mapped(only(q.outputs)),), q.op, q.cost, nothing, false, q.source))
+    end
+    recipes
+end
+
+Base.@nospecializeinfer function _lower_plate_shared_branch_native!(
+        body, runtime_ops, runtime_recipes, @nospecialize(inner_kernel),
+        @nospecialize(branch), @nospecialize(atomic), @nospecialize(callargs),
+        @nospecialize(callvalues), raw_arguments, prepared_arguments, marker,
+        output_axes, pointwise_lhs, total_lhs; recycled, input_type_hints,
+        element_type, into, nonempty::Bool, total_fold = sum)
+    # The cell's own operations come first, where the tensorized lowering
+    # places them (`_lower_authored_plate_tensorized!`); the condition and the
+    # empty-domain cells read them there. Every arm stores into one container
+    # type and seeds one total: the element type the cell's branch gives.
+    types = _plate_cell_types!(runtime_ops, runtime_recipes, inner_kernel, atomic,
+        callargs, callvalues, raw_arguments, input_type_hints)
+    if element_type === nothing
+        inner = inner_kernel.plan
+        inferred = only(_bind_native_type_exprs!(body, Any[get(types.plate_type_exprs,
+            canon_id(inner.graph, only(inner.want).id), GlobalRef(Core, :Any))]))
+        element_type = gensym(:plate_eltype)
+        push!(body.args, Expr(:(=), element_type,
+            Expr(:call, GlobalRef(@__MODULE__, :_plate_result_eltype),
+                 inferred, valtype(only(inner.want)))))
+    end
+    # One pointwise buffer for every arm, which each arm fills in place: an
+    # arm-local buffer would leave native Reverse a value that is active in
+    # one arm and constant in another (a constant fallback such as `-Inf`),
+    # which its static activity analysis rejects.
+    allocate = !nonempty && pointwise_lhs !== nothing && !into
+    if allocate
+        allocation = :($(GlobalRef(@__MODULE__, :_plate_similar_output))(
+            $marker, $element_type, $output_axes))
+        push!(body.args, Expr(:(=), pointwise_lhs, recycled === nothing ? allocation :
+            _lane_allocation(recycled, element_type, output_axes, allocation)))
+    end
+    _lower_plate_shared_branch_arms!(body, runtime_ops, runtime_recipes,
+        inner_kernel, branch, atomic, callargs, callvalues, raw_arguments,
+        prepared_arguments, marker, output_axes, pointwise_lhs, total_lhs;
+        recycled, input_type_hints, element_type, into = into || allocate,
+        nonempty, types, total_fold)
+    allocate && push!(body.args, :($pointwise_lhs =
+        $(GlobalRef(@__MODULE__, :_narrow_plate_output))($pointwise_lhs)))
+    body
+end
+
+# The tensorized lowering keeps the shared condition in its batch dispatch,
+# but both lowerings share one operation table: reserve the slots the native
+# arms take, in the same order.
+Base.@nospecializeinfer function _plate_shared_branch_reserve!(
+        runtime_ops, runtime_recipes, @nospecialize(inner_kernel),
+        @nospecialize(atomic), @nospecialize(callargs), @nospecialize(callvalues),
+        pointwise_lhs, total_lhs)
+    branch = _plate_shared_branch(inner_kernel, atomic, callargs, callvalues)
+    branch === nothing && return nothing
+    # The tensorized lowering has just appended the cell's own operations, as
+    # the native shared path does first; only the arms' slots remain.
+    placeholders = Any[gensym(:plate_argument) for _ in callargs]
+    types = (; op_offset = 0, scan_offsets = Dict{Int,Any}(),
+             plate_type_exprs = Dict{ValueId,Any}(), nested = nothing,
+             lane_arms = Dict{Int,Any}())
+    _lower_plate_shared_branch_arms!(Expr(:block), runtime_ops, runtime_recipes,
+        inner_kernel, branch, atomic, callargs, callvalues, placeholders,
+        placeholders, gensym(:plate_axis), gensym(:plate_axes), pointwise_lhs,
+        total_lhs; recycled = nothing, input_type_hints = nothing,
+        element_type = gensym(:plate_eltype), into = false, nonempty = false,
+        types)
+    nothing
+end
+
+Base.@nospecializeinfer function _lower_plate_shared_branch_arms!(
+        body, runtime_ops, runtime_recipes, @nospecialize(inner_kernel),
+        @nospecialize(branch), @nospecialize(atomic), @nospecialize(callargs),
+        @nospecialize(callvalues), raw_arguments, prepared_arguments, marker,
+        output_axes, pointwise_lhs, total_lhs; recycled, input_type_hints,
+        element_type, into, nonempty::Bool, types, total_fold = sum)
+    operation = Expr(:ref, _OPS_ARG, types.op_offset + branch.index)
+    condition = Expr(:call, :(getfield(getfield($operation, :f), :condition)),
+                     branch.condition_args...)
+    arm(@nospecialize(kernel)) = _lower_authored_plate_cells_native!(
+        Expr(:block), runtime_ops, runtime_recipes, kernel, atomic, callargs,
+        callvalues, raw_arguments, prepared_arguments, marker, output_axes,
+        pointwise_lhs, total_lhs; recycled, input_type_hints, element_type,
+        into, nonempty = true, total_fold)
+    then_block = arm(branch.then_kernel)
+    else_block = arm(branch.else_kernel)
+    selected = Expr(:if, condition, then_block, else_block)
+    if nonempty
+        push!(body.args, selected)
+        return body
+    end
+    # An empty domain evaluates neither the condition, an arm, nor any
+    # other cell recipe.
+    empty_block = _lower_authored_plate_cells_native!(Expr(:block), runtime_ops,
+        runtime_recipes, inner_kernel, atomic, callargs, callvalues,
+        raw_arguments, prepared_arguments, marker, output_axes, pointwise_lhs,
+        total_lhs; recycled, input_type_hints, element_type, into,
+        unswitch = false, cells = false, types, total_fold)
+    has_cells = Expr(:call, GlobalRef(Base, :!), Expr(:call, GlobalRef(Base, :isempty),
+        Expr(:call, GlobalRef(Base, :CartesianIndices), output_axes)))
+    push!(body.args, Expr(:if, has_cells, selected, empty_block))
+    body
+end
+
+# `recycled`: the lane slot of the recipe's value (`_lower_authored_plate_loop_native!`),
+# which a scan, dotted call or slice fills instead of allocating.
+function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots;
+                                     recycled = nothing)
+    if recipe.op isa _AuthoredScanOp
+        _lower_authored_scan_native!(body, recipe.op, args, out, slots.offset;
+                                     slots.type_offset, recycled)
+        return body
+    end
+    # The destination form reads each argument where its source does, so
+    # evaluate the cell's argument expressions once, as the call would. A lazy
+    # branch's form keeps the branch (`_lane_source_expr`); only a position
+    # residual, which is never differentiated, gives a cell recipe a slot.
+    names = Any[gensym(:plate_lane_argument) for _ in args]
+    destination = recycled === nothing ? nothing :
+        _lane_source_expr(recipe, names, recycled)
+    if destination !== nothing
+        append!(body.args, (Expr(:(=), name, arg) for (name, arg) in zip(names, args)))
+        push!(body.args, Expr(:(=), out, destination))
+    elseif recipe.op isa _KernelSourceOp && recipe.op.f isa _KernelBranch
+        push!(body.args, Expr(:(=), out,
+            _native_plate_branch_expr(recipe.op.f, :(getfield($operation, :f)), args)))
+    else
+        push!(body.args, Expr(:(=), out, Expr(:call, operation, args...)))
+    end
+    body
+end
+
+# Infer nested regions from their leaf operations, never from a recursive
+# PreparedKernel call. Keep these cold type-only slots in the same order in
+# both products; ordinary reverse AD removes slots unused by execution. `base`
+# is the table length before `runtime_ops`, so the same layout can be
+# re-derived over slots that are already in the table.
+function _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types;
+                            base = 0)
+    _body_types!(runtime_ops, runtime_recipes, kernel.plan, kernel.ops,
+                 kernel.lowered_recipes, input_types, base)
+end
+
+# One slot per recipe of `p` (`ops`, `recipes`). A nested plate or scan is typed
+# from its own body's leaf operations; a scan operation, like a plate, carries
+# its body's whole PreparedKernel and is never itself the subject of a type
+# query. Where the lowering declares typed locals (`declared`), a concrete
+# declared type is the value's type.
+function _body_types!(runtime_ops, runtime_recipes, p, ops, recipes, input_types,
+                      base; declared = false)
+    offset = base + length(runtime_ops)
+    append!(runtime_ops, ops)
+    append!(runtime_recipes, recipes)
+    types = Dict{ValueId,Any}(canon_id(p.graph, v.id) => T
+                         for (v, T) in zip(p.have, input_types))
+    for (i, recipe) in enumerate(p.recipes)
+        args = Any[types[canon_id(p.graph, v.id)] for v in recipe.inputs]
+        T = if recipe.op isa _AuthoredPlateOp
+            atomic = typeof(recipe.op).parameters[2]
+            elements = Any[Expr(:call, GlobalRef(@__MODULE__, :_plate_argument_type),
+                arg, position in atomic) for (position, arg) in enumerate(args)]
+            element = only(_plate_body_type!(runtime_ops, runtime_recipes,
+                                            recipe.op.kernel, elements; base))
+            element = Expr(:call, GlobalRef(@__MODULE__, :_plate_result_eltype),
+                element, valtype(only(recipe.op.kernel.plan.want)))
+            Expr(:call, GlobalRef(@__MODULE__, :_plate_array_type), element,
+                Expr(:call, GlobalRef(Base, :Val), QuoteNode(atomic)), args...)
+        elseif recipe.op isa _AuthoredScanOp
+            element = _scan_has_history(recipe.op) ? nothing :
+                _scan_step_output_type!(runtime_ops, runtime_recipes,
+                    recipe.op.kernel, _scan_step_input_types(recipe.op, args), base)
+            _scan_result_type_expr(recipe.op, args, element)
+        else
+            Expr(:call, GlobalRef(@__MODULE__, :_promote_op),
+                 Expr(:ref, _OPS_ARG, offset + i), args...)
+        end
+        if length(recipe.outputs) == 1
+            types[canon_id(p.graph, only(recipe.outputs).id)] =
+                _declared_body_type(declared, recipe, only(recipe.outputs), T)
+        else
+            for (j, output) in enumerate(recipe.outputs)
+                types[canon_id(p.graph, output.id)] = _declared_body_type(
+                    declared, recipe, output,
+                    Expr(:call, GlobalRef(Base, :fieldtype), T, j))
+            end
+        end
+    end
+    types
+end
+
+# `_declare_typed_output!` converts every assignment to a declared local, so a
+# concrete declaration fixes the value's type; a bound constant is exempt.
+_declared_body_type(declared, recipe, output, T) =
+    declared && !(recipe.op isa _BoundConstant) &&
+    isconcretetype(valtype(output)) ? valtype(output) : T
+
+function _plate_body_type!(runtime_ops, runtime_recipes, kernel, input_types;
+                           base = 0)
+    types = _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types;
+                               base)
+    Any[types[canon_id(kernel.plan.graph, v.id)] for v in kernel.plan.want]
+end
+
+@inline _plate_argument_type(::Type{T}, atomic) where {T} =
+    atomic || T <: Number ? T : eltype(T)
+# An empty tuple has no coordinate type of its own. Its enclosing collection
+# can still supply one (e.g. Tuple{Vararg{Float64}}). Use that evidence only
+# for bottom; concrete nonempty lanes keep their ordinary inferred types.
+@inline _plate_coordinate_type(::Type{T}, hint) where {T} = T
+@inline _plate_coordinate_type(::Type{Union{}}, hint) = hint
+@inline _plate_marker_type(::Tuple{}) = Nothing
+# Inlining each branch of this recursive search expands the broad DataType
+# specialization exponentially before constant propagation selects a marker.
+@noinline function _plate_marker_type(args::Tuple)
+    class = _static_plate_axis_class(first(args))
+    class === :axis && return first(args)
+    class === :not_axis && return _plate_marker_type(Base.tail(args))
+    axes_type = Base.promote_op(axes, first(args))
+    axes_type <: Tuple || return Any
+    fieldcount(axes_type) > 0 ? first(args) :
+        _plate_marker_type(Base.tail(args))
+end
+@inline @generated function _plate_array_type(::Type{T}, ::Val{A},
+                                              args::Vararg{Type,N}) where {T,A,N}
+    # Mirror the emitted allocation: select the batched operands, infer their
+    # axes individually, and type RK's splat-free broadcast-shape fold. Inferring
+    # Base.combine_axes over a wide operand list can take minutes and gigabytes.
+    # Keep every type operand positional as well: a forwarded splat or Base's
+    # promote_op leaves runtime inference once Julia's tuple-splat limit is hit.
+    batched = Any[:(getfield(args, $j)) for j in 1:N if !(j in A)]
+    shapes = Any[:(_promote_op(axes, $arg)) for arg in batched]
+    quote
+        marker = _plate_marker_type(($(batched...),))
+        (marker === Nothing || marker === Any) && return Any # the region validates its axis
+        axes_type = _promote_op(_plate_broadcast_shape,
+                               Core.apply_type(Tuple, $(shapes...)))
+        _promote_op(_plate_similar_output, marker, Type{T}, axes_type)
+    end
+end
+
+# The scalar plan of a cell containing another plate: its shared work hoisted
+# (`_nested_plate_invariants`) and its plate chains composed. Composing gives the
+# composed values fresh identities (`_compose_authored_plates`). Both backend
+# products of one preparation lower the same cells, and one product can lower a
+# cell more than once, so within a preparation (`_sharing_cell_plans`) every
+# lowering of a cell reuses one plan: they name the same values and compose once.
+# The plan depends only on the cell kernel, the atomic positions and which call
+# values are scalars.
+const _SHARED_CELL_PLANS = :ReactiveKernels_shared_cell_plans
+
+_sharing_cell_plans(f) = haskey(task_local_storage(), _SHARED_CELL_PLANS) ? f() :
+    task_local_storage(f, _SHARED_CELL_PLANS, IdDict{Any,Any}())
+
+function _nested_cell_plan(kernel, atomic, callvalues)
+    function compose()
+        inner = kernel.plan
+        hoisted = _nested_plate_invariants(inner, atomic, callvalues)
+        scalar = hoisted === nothing ? inner : _partial_subplan(inner,
+            vcat(inner.have, hoisted.frontier), inner.want, hoisted.residual)
+        (hoisted, _fuse_authored_plate_chains(scalar))
+    end
+    shared = get(task_local_storage(), _SHARED_CELL_PLANS, nothing)
+    shared === nothing && return compose()
+    scalar_calls = Tuple(valtype(v) <: Number for v in callvalues)
+    get!(compose, shared, (kernel, atomic, scalar_calls))
+end
+
+# A cell containing another plate is lowered by the same graph compiler as a
+# top-level kernel. Splicing that AST retains each nested runtime loop, fuses
+# selected sum consumers, and preserves all named scalar recipes for replay.
+# Type-only arguments carry the enclosing DAG's coordinate evidence through
+# embedding without rebasing its operation-table references a second time.
+# Within a lowering that collects cell slots (`_lower_with_ops(...; cell_slots)`,
+# a position residual), every value of the cell other than its result that has a
+# destination form keeps a lane slot across cells: `slots` are the slot names
+# the cell's AST takes after its inputs, and the collection gains them.
+# `result_slot`: the cell's result keeps a slot too, because the plate keeps a
+# per-cell table for it (`_plate_stores_cells`).
+# The plates of the cell's own lowering keep per-cell tables as well: `tables`
+# names them, which the collection gains for binding, and the outer cell's
+# result releases them (`_lane_tables_release!`).
+function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types,
+                                atomic, callvalues; result_slot::Bool = false)
+    hoisted, scalar = _nested_cell_plan(kernel, atomic, callvalues)
+    types = _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
+    hint_ids = _declaration_order(kernel.plan, keys(types))
+    type_hints = Pair{ValueId,Symbol}[cid => gensym(:plate_input_type) for cid in hint_ids]
+    cell_slots = get(task_local_storage(), _CELL_SLOTS, nothing)
+    recycle = Pair{ValueId,Symbol}[]
+    cell_tables = cell_slots === nothing ? nothing : Symbol[]
+    if cell_slots !== nothing
+        excluded = Set(canon_id(scalar.graph, v.id) for v in
+                       (result_slot ? scalar.have : vcat(scalar.want, scalar.have)))
+        for v in _lane_slot_values(scalar, excluded)
+            push!(recycle, canon_id(scalar.graph, v.id) => gensym(Symbol(v.name, :_cell_slot)))
+        end
+        append!(cell_slots, (last(pair) for pair in recycle))
+    end
+    ast, ops, recipes = _lower_with_ops(scalar; type_hints, recycle, cell_slots,
+                                        cell_tables)
+    cell_tables === nothing || append!(cell_slots, cell_tables)
+    offset = length(runtime_ops)
+    append!(runtime_ops, ops)
+    append!(runtime_recipes, recipes)
+    T = types[canon_id(kernel.plan.graph, only(kernel.plan.want).id)]
+    (; ast, offset, type = T, inputs = scalar.have,
+       slots = Symbol[last(pair) for pair in recycle],
+       tables = cell_tables === nothing ? Symbol[] : cell_tables,
+       invariants = hoisted === nothing ? Int[] : hoisted.moved,
+       input_types = Any[types[cid] for cid in hint_ids])
+end
+
+# Each authored plate carries a generated kernel type. The lowering itself is
+# structural, so specializing this orchestration method for every plate only
+# recompiles the transpiler; it does not improve the emitted callable.
+Base.@nospecializeinfer function _lower_authored_plate_native!(
+        body, runtime_ops, runtime_recipes,
+        @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
+        pointwise_lhs, total_lhs; recycled = nothing,
+        input_type_hints = nothing, element_type = nothing, into::Bool = false,
+        total_fold = sum)
+    # `into`: `pointwise_lhs` already holds a buffer at least as long as the
+    # plate, of its element type; the cells are written into it in place and
+    # the binding is left alone (a strip refill, `_lower_authored_scan_strips!`).
     inner_kernel = op.kernel
     inner = inner_kernel.plan
     length(inner.want) == 1 || throw(ArgumentError(
@@ -752,16 +3555,13 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
     # `Vector{Int}` axis then seeds `zero(eltype(marker)) = zero(Int)` against
     # `Float64` cells, producing a `Union` accumulator Enzyme rejects). Recover the
     # concrete element type by inferring the scalar body kernel over the actual
-    # per-coordinate argument types (`plate_eltype`, bound below), deferring to the
-    # runtime `eltype(marker)` seed only when the body is genuinely uninferrable.
+    # per-coordinate argument types (`plate_eltype`, bound below). When the body
+    # is genuinely uninferrable the first cell starts the total, and only an
+    # empty plate falls back to `zero(eltype(marker))` (`_plate_total_seed`).
     # (`_narrow_plate_output` after the loop still recovers a homogeneous element
     # type at runtime in that residual `Any` case.)
-    plate_eltype = gensym(:plate_eltype)
     needs_marker = pointwise_lhs !== nothing || total_lhs !== nothing
     marker = gensym(:plate_axis)
-    index = gensym(:plate_index)
-    previous = gensym(:plate_previous)
-    first_coordinate = gensym(:plate_first)
     atomic_val = Expr(:call, GlobalRef(Base, :Val), QuoteNode(atomic))
     if needs_marker
         # The marker supplies only the pointwise buffer's container type/shape and
@@ -873,115 +3673,306 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
                group_positions)
             continue
         end
-        group_axes = Expr(:call, GlobalRef(Base.Broadcast, :combine_axes),
-            (raw_arguments[position] for position in group_positions)...)
+        group_axes = _plate_combined_axes_expr(
+            [raw_arguments[position] for position in group_positions])
         push!(body.args, Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes),
                               group_axes))
     end
-    combined_axes = Expr(:call, GlobalRef(Base.Broadcast, :combine_axes),
-                         (arg for arg in raw_arguments if arg !== nothing)...)
+    combined_axes = _plate_combined_axes_expr(
+        [arg for arg in raw_arguments if arg !== nothing])
     push!(body.args, Expr(:(=), output_axes,
         Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes), combined_axes)))
+    _lower_authored_plate_cells_native!(body, runtime_ops, runtime_recipes,
+        inner_kernel, atomic, callargs, callvalues, raw_arguments,
+        prepared_arguments, marker, output_axes, pointwise_lhs, total_lhs;
+        recycled, input_type_hints, element_type, into, total_fold)
+end
 
+# The cells of an authored plate, once its arguments, axes and marker are
+# bound: the invariants above the loop, the cell loop, the pointwise buffer and
+# the total. `inner_kernel` is the plate's cell kernel or a branch-arm variant
+# of it (`_PlateArmVariant`). With `cells = false` the domain is
+# known to be empty: only the empty result is emitted, with no cell work.
+Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
+        body, runtime_ops, runtime_recipes, @nospecialize(inner_kernel),
+        @nospecialize(atomic), @nospecialize(callargs), @nospecialize(callvalues),
+        raw_arguments, prepared_arguments, marker,
+        output_axes, pointwise_lhs, total_lhs; recycled = nothing,
+        input_type_hints = nothing, element_type = nothing, into::Bool = false,
+        unswitch::Bool = true, cells::Bool = true, nonempty::Bool = false,
+        types = nothing, total_fold = sum)
+    inner = inner_kernel.plan
+    if unswitch
+        branch = _plate_shared_branch(inner_kernel, atomic, callargs, callvalues)
+        branch === nothing || return _lower_plate_shared_branch_native!(
+            body, runtime_ops, runtime_recipes, inner_kernel, branch, atomic,
+            callargs, callvalues, raw_arguments, prepared_arguments, marker,
+            output_axes, pointwise_lhs, total_lhs; recycled, input_type_hints,
+            element_type, into, nonempty, total_fold)
+    end
+    plate_eltype = gensym(:plate_eltype)
+    index = gensym(:plate_index)
+    previous = gensym(:plate_previous)
+    first_coordinate = gensym(:plate_first)
     root_positions = Dict(
         canon_id(inner.graph, input.id) => position
         for (position, input) in enumerate(inner.have)
     )
     root_ids = Set(keys(root_positions))
     dependencies = _plate_dependencies(inner, root_ids).values
-    locals = Dict{Int,Symbol}()
+    locals = Dict{ValueId,Symbol}()
     for recipe in inner.recipes, output in recipe.outputs
         cid = canon_id(inner.graph, output.id)
         get!(locals, cid) do
             gensym(Symbol(:plate_, output.name))
         end
     end
+    # `types`: this kernel's operations are already in the table there.
+    (; op_offset, scan_offsets, plate_type_exprs, nested, lane_arms) =
+        types === nothing ? _plate_cell_types!(runtime_ops, runtime_recipes,
+            inner_kernel, atomic, callargs, callvalues, raw_arguments,
+            input_type_hints;
+            result_slot = _plate_stores_cells(pointwise_lhs, into, cells)) : types
+    inferred_eltype = nested === nothing ?
+        get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
+            GlobalRef(Core, :Any)) : nested.type
+    inferred_eltype = only(_bind_native_type_exprs!(body, [inferred_eltype]))
+    # A caller that already fixes the element type (the non-allocating step of
+    # a declared `Array{T}` plate output, whose cache is an `Array{T}`) passes
+    # it as `element_type`: each cell then converts on store, as the declared
+    # typed local converts the whole result in the ordinary native kernel.
+    push!(body.args, Expr(:(=), plate_eltype, element_type !== nothing ? element_type :
+        Expr(:call, GlobalRef(@__MODULE__, :_plate_result_eltype),
+             inferred_eltype, valtype(only(inner.want)))))
+    _lower_authored_plate_loop_native!(body, inner, inner_kernel, atomic,
+        callargs, callvalues, raw_arguments, prepared_arguments, marker,
+        output_axes, pointwise_lhs, total_lhs, recycled, into, cells,
+        plate_eltype, index, previous, first_coordinate, root_positions,
+        dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
+        lane_arms; nonempty, total_fold)
+end
+
+# Append a cell kernel's operations to the table and build the type expression
+# of every cell value from the argument types.
+Base.@nospecializeinfer function _plate_cell_types!(
+        runtime_ops, runtime_recipes, @nospecialize(inner_kernel),
+        @nospecialize(atomic), @nospecialize(callargs), @nospecialize(callvalues),
+        raw_arguments, input_type_hints; result_slot::Bool = false)
+    inner = inner_kernel.plan
     op_offset = length(runtime_ops)
     append!(runtime_ops, inner_kernel.ops)
     append!(runtime_recipes, inner_kernel.lowered_recipes)
+    scan_offsets = _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
+    lane_arms = _plate_lane_arm_slots!(runtime_ops, runtime_recipes, inner,
+                                       atomic, callvalues)
     # Bind the concrete pointwise element type by propagating inferred types
     # through the plate body's scalar recipe DAG. Each individual `__ops__`
     # recipe op is an ordinary callable (a `_KernelSourceOp`, not the opaque
-    # nested `PreparedKernel`), so `Base.promote_op` over it const-folds inside
+    # nested `PreparedKernel`), so `_promote_op` over it const-folds inside
     # the generated function from the actual per-coordinate argument types Julia
     # infers here — the `Vector{Int}`-axis element / atomic scalar types — rather
     # than the plan-level `Any`. Seeding `promote_op` over the whole plate body
     # kernel instead does NOT fold (nested-RGF inference is opaque) and would
     # inject a runtime inference call. This is a compile-time expression, so it
     # also covers an empty axis with no representative element. A genuinely
-    # uninferrable recipe yields `Any`, reproducing the previous `Vector{Any}` /
-    # `_authored_plate_zero(Any, marker)` behavior (then narrowed at runtime by
-    # `_narrow_plate_output`) rather than regressing.
-    plate_type_exprs = Dict{Int,Any}()
+    # uninferrable recipe yields `Any`: the pointwise buffer is a `Vector{Any}`
+    # narrowed at runtime by `_narrow_plate_output`, and a total starts from its
+    # first cell (`_plate_total_seed`).
+    plate_type_exprs = Dict{ValueId,Any}()
     for (position, input) in enumerate(inner.have)
         cid = canon_id(inner.graph, input.id)
         plate_type_exprs[cid] =
             (position in atomic || valtype(callvalues[position]) <: Number) ?
                 Expr(:call, GlobalRef(Base, :typeof), callargs[position]) :
                 Expr(:call, GlobalRef(Base, :eltype), raw_arguments[position])
+        if input_type_hints !== nothing
+            hint = Expr(:call, GlobalRef(@__MODULE__, :_plate_argument_type),
+                        input_type_hints[position], position in atomic)
+            plate_type_exprs[cid] = Expr(:call,
+                GlobalRef(@__MODULE__, :_plate_coordinate_type),
+                plate_type_exprs[cid], hint)
+        end
     end
+    nested = any(r -> r.op isa _AuthoredPlateOp, inner.recipes) ?
+        _plate_nested_native!(runtime_ops, runtime_recipes, inner_kernel,
+            Any[plate_type_exprs[canon_id(inner.graph, v.id)] for v in inner.have],
+            atomic, callvalues; result_slot) :
+        nothing
     for (recipe_index, recipe) in enumerate(inner.recipes)
         input_type_exprs = Any[
             get(plate_type_exprs, canon_id(inner.graph, input.id),
                 GlobalRef(Core, :Any)) for input in recipe.inputs]
         output_cid = canon_id(inner.graph, only(recipe.outputs).id)
-        plate_type_exprs[output_cid] = Expr(:call, GlobalRef(Base, :promote_op),
-            Expr(:ref, _OPS_ARG, op_offset + recipe_index), input_type_exprs...)
+        scan_type = nothing
+        if recipe.op isa _AuthoredScanOp
+            # Never query the scan operation itself: it carries the step's
+            # whole PreparedKernel (`_scan_type_slots!`).
+            slots = scan_offsets[recipe_index]
+            element = _scan_has_history(recipe.op) ? nothing :
+                _authored_scan_step_output_type(recipe.op.kernel,
+                    _scan_step_input_types(recipe.op, input_type_exprs),
+                    slots.offset; slots.type_offset)
+            if _scan_has_history(recipe.op) || element !== nothing
+                scan_type = _scan_result_type_expr(recipe.op, input_type_exprs, element)
+            end
+        end
+        plate_type_exprs[output_cid] = scan_type === nothing ?
+            Expr(:call, GlobalRef(@__MODULE__, :_promote_op),
+                Expr(:ref, _OPS_ARG, op_offset + recipe_index), input_type_exprs...) : scan_type
     end
-    push!(body.args, Expr(:(=), plate_eltype,
-        get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
-            GlobalRef(Core, :Any))))
-    groups = _authored_plate_recipe_groups(
-        inner, dependencies, root_positions, atomic, callvalues)
+    (; op_offset, scan_offsets, plate_type_exprs, nested, lane_arms)
+end
+
+Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
+        body, inner::Plan, @nospecialize(inner_kernel), @nospecialize(atomic),
+        @nospecialize(callargs), @nospecialize(callvalues), raw_arguments,
+        prepared_arguments, marker, output_axes,
+        pointwise_lhs, total_lhs, recycled, into::Bool, cells::Bool,
+        plate_eltype, index, previous, first_coordinate, root_positions,
+        dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
+        lane_arms; nonempty::Bool = false, total_fold = sum)
+    groups = nested === nothing ? _authored_plate_recipe_groups(
+        inner, dependencies, root_positions, atomic, callvalues) :
+        [(Set{ValueId}(), nested.invariants)]
+    slices = _plate_scan_slice_pairs(inner, groups, lane_arms, roots ->
+        !isempty(roots) && _authored_plate_unconditional_group(
+            roots, root_positions, atomic, callvalues))
+    sliced_scans = Set(first(pair) for pair in values(slices))
+    # A plate that stores its cells with tables (`_plate_stores_cells`) keeps,
+    # per cell, the buffers its stored result holds (below). Only values
+    # computed at every cell take part: `every_cell` maps each to the condition
+    # under which it is, `true` for an unconditional group, and for a scheduled
+    # group the test that its roots are one-dimensional domains at run time
+    # (`_authored_plate_runtime_unconditional`, a constant of the compiled
+    # body; otherwise the group's value serves several cells). A plate
+    # invariant is computed once for all cells.
+    tables = get(task_local_storage(), _CELL_TABLES, nothing)
+    stores_cells = _plate_stores_cells(pointwise_lhs, into, cells)
+    every_cell = Dict{Int,Any}()
+    for (roots, indices) in groups
+        isempty(roots) && continue
+        condition = _authored_plate_unconditional_group(
+            roots, root_positions, atomic, callvalues) ||
+            _authored_plate_runtime_unconditional(callargs, roots, root_positions, atomic)
+        condition === false && continue
+        for i in indices
+            every_cell[i] = condition
+        end
+    end
+    # Within a lowering that collects cell slots (a position residual), each
+    # destination-form value these recipes produce keeps a lane slot across
+    # cells, as a nested-bearing cell's own values do (`_plate_nested_native!`).
+    # The cell's result is stored by reference, so it keeps one only where a
+    # per-cell table keeps its buffer for that cell.
+    cell_slots = get(task_local_storage(), _CELL_SLOTS, nothing)
+    slotted = Pair{Int,Symbol}[]
+    if cell_slots !== nothing
+        emitted = Set(i for (_, indices) in groups for i in indices)
+        excluded = Set(canon_id(inner.graph, v.id) for v in inner.have)
+        result_ids = Set(canon_id(inner.graph, v.id) for v in inner.want)
+        for i in _lane_slot_recipes(inner, excluded)
+            i in emitted && !haskey(lane_arms, i) && !(i in sliced_scans) &&
+                !haskey(slices, i) || continue
+            canon_id(inner.graph, only(inner.recipes[i].outputs).id) in result_ids &&
+                !(stores_cells && haskey(every_cell, i)) && continue
+            push!(slotted, i => gensym(Symbol(only(inner.recipes[i].outputs).name,
+                                              :_cell_slot)))
+        end
+        append!(cell_slots, (last(pair) for pair in slotted))
+    end
+    slot_of(i) = (k = findfirst(pair -> first(pair) == i, slotted);
+                  k === nothing ? nothing : last(slotted[k]))
+    # A scan read only through one slice is emitted where that slice is read
+    # (`_lower_authored_scan_slice_native!`).
+    function lower_recipe!(block, recipe_index, args, out, operation, looped)
+        recipe_index in sliced_scans && return block
+        haskey(slices, recipe_index) || return _lower_plate_recipe_native!(
+            block, inner.recipes[recipe_index], args, out, operation,
+            get(scan_offsets, recipe_index, nothing); recycled = slot_of(recipe_index))
+        scan_index, demand = slices[recipe_index]
+        scan_recipe = inner.recipes[scan_index]
+        scan_args = Any[_authored_plate_scalar_ref(
+            inner, locals, callargs, callvalues, prepared_arguments, atomic,
+            input, index, looped) for input in scan_recipe.inputs]
+        slots = scan_offsets[scan_index]
+        _lower_authored_scan_slice_native!(block, scan_recipe.op, scan_args,
+            slots.offset, demand, args, out, operation; slots.type_offset)
+    end
     has_scheduled_groups = any(groups) do (roots, _)
         !isempty(roots) && !_authored_plate_unconditional_group(
             roots, root_positions, atomic, callvalues)
     end
 
-    # Recipes with the same dynamic root set share one scheduling guard. This
-    # preserves partial-dimension invariant caching. Common vector-plate groups
-    # are known to be safe to recompute at every coordinate and need no guard in
+    # Every cell recipe is emitted once. A group without dynamic roots is a
+    # plate invariant, computed above the loop only when it has cells.
+    # Recipes with the same
+    # dynamic root set share one scheduling guard inside the loop
+    # (`_authored_plate_schedule`), which preserves partial-dimension invariant
+    # caching; their outputs are declared here, so a value computed at one
+    # coordinate is still bound at the next. Common vector-plate groups are
+    # known to be safe to recompute at every coordinate and need no guard in
     # either the primal or differentiated native kernel.
+    invariants = Expr(:block)
     for (roots, recipe_indices) in groups
         _authored_plate_unconditional_group(
             roots, root_positions, atomic, callvalues) && continue
-        assignments = Expr(:block)
         for recipe_index in recipe_indices
             recipe = inner.recipes[recipe_index]
             length(recipe.outputs) == 1 || throw(ArgumentError(
                 "an authored plate currently requires single-output scalar recipes"))
             output = only(recipe.outputs)
             out = locals[canon_id(inner.graph, output.id)]
+            if !isempty(roots)
+                push!(body.args, Expr(:local, out))
+                continue
+            end
             args = Any[_authored_plate_scalar_ref(
                 inner, locals, callargs, callvalues, prepared_arguments, atomic,
                 input, index, false) for input in recipe.inputs]
-            call = Expr(:call, Expr(:ref, _OPS_ARG, op_offset + recipe_index),
-                        args...)
-            push!(assignments.args, Expr(:(=), out, call))
+            lower_recipe!(invariants, recipe_index, args, out,
+                Expr(:ref, _OPS_ARG, op_offset + recipe_index), false)
         end
-        condition = _authored_plate_condition(
-            callargs, roots, root_positions, atomic)
-        push!(body.args, Expr(:if,
-            Expr(:call, GlobalRef(Base, :!), condition), assignments))
     end
 
-    if pointwise_lhs !== nothing
-        push!(body.args,
-            :($pointwise_lhs = $(GlobalRef(@__MODULE__, :_plate_similar_output))(
-                $marker, $plate_eltype, $output_axes)))
+    if pointwise_lhs !== nothing && !into
+        allocation = :($(GlobalRef(@__MODULE__, :_plate_similar_output))(
+            $marker, $plate_eltype, $output_axes))
+        push!(body.args, Expr(:(=), pointwise_lhs, recycled === nothing ? allocation :
+            _lane_allocation(recycled, plate_eltype, output_axes, allocation)))
     end
     accumulator = total_lhs === nothing ? nothing : gensym(:plate_total)
     if accumulator !== nothing
-        # `_authored_plate_zero(::Type{T}, marker) = zero(T)` for the inferred
-        # concrete `T`, and falls back to `zero(eltype(marker))` only when
-        # inference yielded `Any` — never a `zero(Int)` seed against `Float64`
-        # cells.
-        push!(body.args, Expr(:(=), accumulator,
-            Expr(:call, GlobalRef(@__MODULE__, :_authored_plate_zero),
-                 plate_eltype, marker)))
+        # `zero(T)` for the inferred concrete `T` — never a `zero(Int)` seed
+        # against `Float64` cells. Without a concrete or numeric `T`, the first
+        # cell starts the total, and only an empty plate falls back to
+        # `zero(eltype(marker))`.
+        seed = Expr(:call, GlobalRef(@__MODULE__, :_plate_total_seed),
+                    plate_eltype, marker)
+        total_fold === sum || insert!(seed.args, 2, _plate_fold_ref(total_fold))
+        push!(body.args, Expr(:(=), accumulator, seed))
     end
 
     loopbody = Expr(:block)
+    nested_result = gensym(:plate_nested_result)
+    if nested !== nothing
+        args = Any[_authored_plate_scalar_ref(
+            inner, locals, callargs, callvalues, prepared_arguments, atomic,
+            input, index, true) for input in nested.inputs]
+        # Hint queries used only by a cell stay inside its loop: an empty outer
+        # domain must not evaluate new queries merely to bind an unused hint.
+        input_types = _bind_native_type_exprs!(loopbody, nested.input_types)
+        append!(loopbody.args,
+            _embedded_statements(nested.ast, [args; nested.slots; input_types],
+                                 nested_result, nested.offset))
+    end
+    # A lane branch with arm graphs is inlined with first-use shared work
+    # (`_plate_lane_arm_slots!`); its flags and shared locals are declared
+    # above the loop.
+    declarations = Any[]
+    shared(v) = all(get(dependencies, canon_id(inner.graph, v.id), Set{ValueId}())) do root
+        root_positions[root] in atomic ||
+            valtype(callvalues[root_positions[root]]) <: Number
+    end
     for (roots, recipe_indices) in groups
         isempty(roots) && continue
         assignments = Expr(:block)
@@ -992,21 +3983,24 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
             args = Any[_authored_plate_scalar_ref(
                 inner, locals, callargs, callvalues, prepared_arguments, atomic,
                 input, index, true) for input in recipe.inputs]
-            call = Expr(:call, Expr(:ref, _OPS_ARG, op_offset + recipe_index),
-                        args...)
-            push!(assignments.args, Expr(:(=), out, call))
+            operation = Expr(:ref, _OPS_ARG, op_offset + recipe_index)
+            if haskey(lane_arms, recipe_index)
+                arm = lane_arms[recipe_index]
+                push!(assignments.args, Expr(:(=), out,
+                    _native_plate_lane_branch_expr(arm.branch,
+                        :(getfield($operation, :f)), args, recipe.inputs,
+                        arm.names, arm.slots, shared, declarations)))
+            else
+                lower_recipe!(assignments, recipe_index, args, out, operation, true)
+            end
         end
         if _authored_plate_unconditional_group(
                 roots, root_positions, atomic, callvalues)
             append!(loopbody.args, assignments.args)
         else
-            has_axis = _authored_plate_condition(
-                callargs, roots, root_positions, atomic)
-            changed = _authored_plate_changed(
-                callargs, roots, root_positions, atomic, index, previous)
-            condition = Expr(:&&, has_axis,
-                Expr(:||, first_coordinate, changed))
-            push!(loopbody.args, Expr(:if, condition, assignments))
+            push!(loopbody.args, Expr(:if, _authored_plate_schedule(
+                callargs, roots, root_positions, atomic, callvalues,
+                index, previous, first_coordinate), assignments))
         end
     end
     # The distinguished result is usually a recipe output bound in `locals`, but
@@ -1014,42 +4008,251 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
     # result. That input never appears in `locals`, so reuse the shared scalar
     # projection, which resolves a HAVE input to its per-coordinate reference and
     # otherwise falls back to `locals`.
-    scalar_result = _authored_plate_scalar_ref(
+    scalar_result = nested === nothing ? _authored_plate_scalar_ref(
         inner, locals, callargs, callvalues, prepared_arguments, atomic,
-        only(inner.want), index, true)
+        only(inner.want), index, true) : nested_result
+    # The result leaves the cell: it takes any slot buffer it shares memory
+    # with or holds (`_lane_release!`).
+    released = Symbol[(nested === nothing ? Symbol[] : nested.slots); last.(slotted)]
+    # A plate that stores its cells with tables (`stores_cells`, above) gives
+    # each slot of a value computed at every cell a table
+    # (`_lane_cell_take!`, `_lane_cell_release!`): cell `k` of the next position
+    # or borrowed call refills the buffers cell `k`'s stored result holds.
+    # Where the value's condition fails, its slot is released instead.
+    table_entries = Tuple{Symbol,Symbol,Any}[]
+    if stores_cells
+        per_cell = Pair{Symbol,Any}[(nested === nothing ? Pair{Symbol,Any}[] :
+                                     Pair{Symbol,Any}[slot => true for slot in nested.slots]);
+                                    Pair{Symbol,Any}[slot => every_cell[i]
+                                     for (i, slot) in slotted if haskey(every_cell, i)]]
+        for (slot, condition) in per_cell
+            table = gensym(Symbol(slot, :_cells))
+            push!(tables, table)
+            push!(table_entries, (slot, table, condition))
+        end
+    end
+    cell_number = gensym(:plate_cell_number)
+    # Whether a cell takes its table entry depends on the plate's arguments
+    # and element type only, so it is decided once per run of the plate, before
+    # its cells (`take_flags`, bound with `cell_number` below). Passed the
+    # element type instead, the take was looked up at run time at every cell
+    # whenever that type is a run-time value (snag lane-cell-take-e-45c66e49).
+    take_flags = Any[:($(gensym(Symbol(slot, :_takes))) =
+                       $condition && $(GlobalRef(@__MODULE__, :_replicated_may_contain_array))(
+                           $plate_eltype))
+                     for (slot, _, condition) in table_entries]
+    if !isempty(table_entries)
+        prepend!(loopbody.args, Any[:($cell_number += 1);
+            Any[:($(GlobalRef(@__MODULE__, :_lane_cell_take!))(
+                    $slot, $table, $cell_number, $(first(flag.args))))
+                for ((slot, table, _), flag) in zip(table_entries, take_flags)]])
+        kept = Expr(:call, GlobalRef(@__MODULE__, :_lane_cell_release!), scalar_result,
+                    cell_number, (Expr(:tuple, entry...) for entry in table_entries)...)
+        result = gensym(:plate_cell_result)
+        push!(loopbody.args, :($result = $kept))
+        scalar_result = result
+        released = setdiff(released, Symbol[first(entry) for entry in table_entries])
+    end
+    if !isempty(released)
+        result = gensym(:plate_cell_result)
+        push!(loopbody.args, :($result = $(GlobalRef(@__MODULE__, :_lane_release!))(
+            $scalar_result, $(released...))))
+        scalar_result = result
+    end
+    # The plates inside the cell keep per-cell tables (`_plate_nested_native!`):
+    # the result drops the entries it may hold before the next cell reuses them.
+    if nested !== nothing && !isempty(nested.tables)
+        result = gensym(:plate_cell_result)
+        push!(loopbody.args, :($result = $(GlobalRef(@__MODULE__, :_lane_tables_release!))(
+            $scalar_result, $(nested.tables...))))
+        scalar_result = result
+    end
+    # The pointwise buffer has the plate's axes (allocated or recycled for
+    # `output_axes`), so this store is in bounds, as the dose-outer passes
+    # (`_lower_plate_reduction_native`) already assume.
     pointwise_lhs === nothing ||
-        push!(loopbody.args, :($pointwise_lhs[$index] = $scalar_result))
-    accumulator === nothing ||
-        push!(loopbody.args, :($accumulator += $scalar_result))
+        push!(loopbody.args, _inbounds_expr(:($pointwise_lhs[$index] = $scalar_result)))
+    if accumulator !== nothing
+        add = Expr(:call, GlobalRef(@__MODULE__, :_plate_total_add),
+                   accumulator, scalar_result)
+        total_fold === sum || insert!(add.args, 2, _plate_fold_ref(total_fold))
+        push!(loopbody.args, :($accumulator = $add))
+    end
     if has_scheduled_groups
         push!(loopbody.args, :($previous = $index))
         push!(loopbody.args, :($first_coordinate = false))
     end
-    iteration = Expr(:call, GlobalRef(Base, :CartesianIndices), output_axes)
-    if has_scheduled_groups
+    # A one-axis domain iterates its range directly (`_plate_cells`):
+    # `CartesianIndices` iteration carries an overflow test into the exit
+    # condition that keeps LLVM from computing the trip count, so the cell
+    # loop would not vectorize.
+    iteration = Expr(:call, GlobalRef(@__MODULE__, :_plate_cells),
+                     Expr(:call, GlobalRef(Base, :CartesianIndices), output_axes))
+    if has_scheduled_groups && cells
         push!(body.args, :($previous = nothing))
         push!(body.args, :($first_coordinate = true))
     end
-    push!(body.args, Expr(:for, Expr(:(=), index, iteration), loopbody))
+    cell_loop = Expr(:for, Expr(:(=), index, iteration), loopbody)
+    isempty(table_entries) ||
+        (cell_loop = Expr(:block, :($cell_number = 0), take_flags..., cell_loop))
+    # A pure total-only plate is a scalar reduction, so it runs under `@simd`.
+    # SIMD needs an indexable iteration space, whereas `_plate_cells` returns
+    # a Generator for one axis: `_plate_simd_cells` iterates that axis's range
+    # directly (and several axes as their `CartesianIndices`), and the body
+    # reconstructs the same cell index. This replaces the plain loop rather
+    # than branching beside it, so the cell body is emitted once. Expand
+    # before an embedded kernel renames locals: late macro expansion can
+    # interpret its renamed index as a module global.
+    # A cell that fills lane slots carries state from one cell to the next.
+    if accumulator !== nothing && pointwise_lhs === nothing && total_fold === sum &&
+            !has_scheduled_groups && nested === nothing && isempty(released) &&
+            all(r -> !r.effectful, inner.recipes)
+        linear = gensym(:plate_linear)
+        simd_body = Expr(:block,
+            Expr(:(=), index, Expr(:call, GlobalRef(Base, :CartesianIndex), linear)),
+            loopbody.args...)
+        simd_loop = Expr(:for, Expr(:(=), linear,
+            Expr(:call, GlobalRef(@__MODULE__, :_plate_simd_cells), output_axes)),
+            simd_body)
+        simd = Expr(:macrocall, GlobalRef(Base, Symbol("@simd")),
+            LineNumberNode(0), simd_loop)
+        cell_loop = macroexpand(@__MODULE__, simd)
+    end
+    reduction = cells && nested === nothing &&
+            (accumulator === nothing || total_fold === sum) ? _plate_reduction_plan(
+        inner, inner_kernel, dependencies, root_positions, atomic, callvalues,
+        pointwise_lhs) : nothing
+    if cells
+        append!(body.args, declarations)
+        execution = Expr(:block, invariants.args...)
+        if reduction === nothing
+            push!(execution.args, cell_loop)
+        else
+            push!(execution.args, _lower_plate_reduction_native(reduction.kind,
+                reduction, inner, locals, callargs, callvalues, raw_arguments,
+                prepared_arguments, atomic, root_positions, plate_type_exprs, op_offset, plate_eltype,
+                output_axes, pointwise_lhs, accumulator, cell_loop))
+        end
+        # Allocate the concrete pointwise buffer and seed the total before the
+        # guard. Invariants and cells share one guarded scope, so an empty
+        # plate neither evaluates a cell recipe nor needs a sentinel value for
+        # its result. The same buffer reaches both paths under ordinary Reverse.
+        if nonempty || isempty(invariants.args)
+            append!(body.args, execution.args)
+        else
+            has_cells = Expr(:call, GlobalRef(Base, :!),
+                Expr(:call, GlobalRef(Base, :isempty),
+                    Expr(:call, GlobalRef(Base, :CartesianIndices), output_axes)))
+            push!(body.args, Expr(:if, has_cells, execution))
+        end
+    end
     # Fallback runtime narrowing of the pointwise container. `plate_eltype`
     # already types the buffer up front, so for an inferable body this is a
     # compile-time no-op (`_narrow_plate_output` dispatches on `eltype`); it only
     # does work in the residual case where inference yielded `Any` and the buffer
     # is a boxed `Vector{Any}`, recovering a homogeneous element type so a
     # transformed-data plate over bound data stays promotable at the Reactant
-    # host-operand boundary. The total accumulator is already typed via
-    # `_authored_plate_zero`, so this touches only the pointwise materialization.
-    if pointwise_lhs !== nothing
+    # host-operand boundary. The total is seeded by `_plate_total_seed`, so this
+    # touches only the pointwise materialization.
+    if pointwise_lhs !== nothing && !into
         push!(body.args, :($pointwise_lhs =
             $(GlobalRef(@__MODULE__, :_narrow_plate_output))($pointwise_lhs)))
     end
-    total_lhs === nothing || push!(body.args, :($total_lhs = $accumulator))
+    total_lhs === nothing || push!(body.args, :($total_lhs =
+        $(GlobalRef(@__MODULE__, :_plate_total_value))($accumulator)))
     body
 end
 
-function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
-                                           op::_AuthoredPlateOp, callargs,
-                                           pointwise_lhs, total_lhs)
+# Keep tensorized lowering on the same non-specializing boundary as native.
+# A plate cell lowers as its plate over the one-cell slices of the plate's
+# arguments (`_plate_cell_slices`), with the same native or tensorized plate
+# lowering and the same operation-table entries as the plate itself.
+Base.@nospecializeinfer function _lower_authored_plate_cell!(
+        body, runtime_ops, runtime_recipes, @nospecialize(recipe::Recipe),
+        callargs, lhs, tensorized::Bool; windows = nothing)
+    op = recipe.op::_AuthoredPlateCellOp
+    plate = op.plate
+    atomic = typeof(plate).parameters[2]
+    index_arg = first(callargs)
+    plate_args = callargs[2:end]
+    plate_values = recipe.inputs[2:end]
+    pushed_lanes = Dict{Int,ValueId}()
+    if windows !== nothing
+        d = windows.pushdowns
+        for position in get(d.batched, recipe.id, Set{Int}())
+            value = canon_id(d.graph, plate_values[position].id)
+            value in d.pushed && (pushed_lanes[position] = value)
+        end
+    end
+    # The steps of `_plate_cell_slices`, one argument at a time.
+    raw = Dict{Int,Symbol}()
+    for (position, arg) in enumerate(plate_args)
+        (position in atomic || haskey(pushed_lanes, position)) && continue
+        raw[position] = gensym(:cell_raw)
+        push!(body.args, Expr(:(=), raw[position],
+            Expr(:call, GlobalRef(Base, :broadcastable), arg)))
+    end
+    cell = gensym(:cell_position)
+    axes = Any[haskey(pushed_lanes, position) ?
+        _cell_shape!(windows, pushed_lanes[position]) :
+        Expr(:call, GlobalRef(Base, :axes), raw[position])
+        for position in eachindex(plate_args) if !(position in atomic)]
+    shape = Expr(:call, GlobalRef(@__MODULE__, :_plate_broadcast_shape),
+        Expr(:tuple, axes...))
+    push!(body.args, Expr(:(=), cell,
+        Expr(:call, GlobalRef(@__MODULE__, :_plate_cell_position),
+             Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes), shape), index_arg)))
+    row = isempty(pushed_lanes) ? nothing : _cell_bind!(windows, :cell_row,
+        Expr(:call, GlobalRef(Base, :getindex), cell, 1))
+    slices = Any[]
+    for (position, arg) in enumerate(plate_args)
+        if position in atomic
+            push!(slices, arg)
+            continue
+        end
+        if haskey(pushed_lanes, position)
+            value = pushed_lanes[position]
+            lane_row = _cell_bind!(windows, :cell_row,
+                Expr(:call, GlobalRef(@__MODULE__, :_cell_leaf_row),
+                    _cell_shape!(windows, value), row))
+            window = _cell_window!(windows, value, lane_row)
+            push!(slices, Expr(:call, GlobalRef(@__MODULE__, :_cell_batched_slice),
+                window, cell))
+            continue
+        end
+        slice = gensym(:cell_argument)
+        push!(body.args, Expr(:(=), slice,
+            Expr(:call, GlobalRef(@__MODULE__, :_plate_cell_slice), raw[position], cell)))
+        push!(slices, slice)
+    end
+    # A shared array read only at the cell's own rows whose producer computes
+    # it row by row is computed at those rows (`_CellEmitter`, cell_windows.jl).
+    if windows !== nothing
+        d = windows.pushdowns
+        for (position, (batched, via)) in sort!(collect(get(d.captures, recipe.id,
+                Dict{Int,Tuple{Int,Int}}())))
+            value = canon_id(d.graph, plate_values[position].id)
+            value in d.pushed || continue
+            slices[position] = _cell_capture!(windows, value, slices[batched],
+                via == 0 ? nothing : slices[via])
+        end
+    end
+    pointwise = gensym(:cell_pointwise)
+    if tensorized
+        _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
+            plate, slices, plate_values, pointwise, nothing)
+    else
+        _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
+            plate, slices, plate_values, pointwise, nothing)
+    end
+    push!(body.args, Expr(:(=), lhs, Expr(:call, GlobalRef(Base, :only), pointwise)))
+    body
+end
+
+Base.@nospecializeinfer function _lower_authored_plate_tensorized!(
+        body, runtime_ops, runtime_recipes,
+        @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
+        pointwise_lhs, total_lhs; lanes::Bool = false, total_fold = sum)
     inner_kernel = op.kernel
     inner = inner_kernel.plan
     length(inner.want) == 1 || throw(ArgumentError(
@@ -1058,40 +4261,291 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
         "an authored plate body must lower to one operation per transparent scalar recipe"))
 
     atomic = typeof(op).parameters[2]
-    locals = Dict{Int,Any}()
+    # A cell recipe whose transitive roots are all atomic (`Ref`) arguments or
+    # statically scalar ports is loop-invariant: the native lowering evaluates
+    # it ONCE above the cell loop (an empty-`dynamic` group in
+    # `_lower_authored_plate_native!`). The tensorized body must give its value
+    # the same standing. A cell-local ARRAY built from atomic operands only
+    # (`shifts = schedule_plan.shifts` read from a `Ref`-wrapped host plan) is
+    # one shared value, not a lane axis, so it is evaluated once with the
+    # unwrapped atomic operands and re-enters every downstream tensorized plate
+    # call wrapped in `Ref`, exactly like an atomic argument. Before this, the
+    # bare invariant array met the lane axis in `combine_axes` and the whole
+    # plate failed with `DimensionMismatch` under Reactant while the native
+    # kernel was correct (snag `plate-cell-gathe-94d4a929`). The distinguished
+    # result retains the whole plate domain, even when it reads no lane input.
+    root_positions = Dict(
+        canon_id(inner.graph, input.id) => position
+        for (position, input) in enumerate(inner.have))
+    dependencies = _plate_dependencies(inner, Set(keys(root_positions)))
+    # Statically scalar means the OUTER argument's value type (`callvalues`),
+    # exactly as the native lowering decides — never the cell formal's inferred
+    # element type, which is scalar for the batched axis itself.
+    invariant_root(root) = root_positions[root] in atomic ||
+        valtype(callvalues[root_positions[root]]) <: Number
+    result_cid = canon_id(inner.graph, only(inner.want).id)
+    locals = Dict{ValueId,Any}()
+    shared = Dict{ValueId,Any}()
     for (index, input) in enumerate(inner.have)
         arg = callargs[index]
-        locals[canon_id(inner.graph, input.id)] = index in atomic ?
+        cid = canon_id(inner.graph, input.id)
+        locals[cid] = index in atomic ?
             Expr(:call, GlobalRef(Base, :Ref), arg) : arg
+        shared[cid] = arg
     end
     op_offset = length(runtime_ops)
     append!(runtime_ops, inner_kernel.ops)
     append!(runtime_recipes, inner_kernel.lowered_recipes)
+    _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
+    _plate_lane_arm_slots!(runtime_ops, runtime_recipes, inner, atomic, callvalues)
+    _plate_shared_branch_reserve!(runtime_ops, runtime_recipes, inner_kernel,
+        atomic, callargs, callvalues, pointwise_lhs, total_lhs)
+    if any(r -> r.op isa _AuthoredPlateOp, inner.recipes)
+        _plate_nested_native!(runtime_ops, runtime_recipes, inner_kernel,
+            Any[GlobalRef(Core, :Any) for _ in inner.have], atomic, callvalues)
+        # The current tensor product batches individual scalar recipes. Calling
+        # a nested plate's host fallback there would trace a data-sized loop.
+        # Keep this capability gap explicit until nested backend regions exist.
+        push!(body.args, :(throw(ArgumentError(
+            "nested authored plates currently support native execution and native reverse AD; " *
+            "compiled nested plate regions are not implemented"))))
+        return body
+    end
     for (recipe_index, recipe) in enumerate(inner.recipes)
         length(recipe.outputs) == 1 || throw(ArgumentError(
             "an authored plate currently requires single-output scalar recipes"))
         output = only(recipe.outputs)
+        output_cid = canon_id(inner.graph, output.id)
         out = gensym(Symbol(:plate_, output.name))
-        args = Any[locals[canon_id(inner.graph, input.id)] for input in recipe.inputs]
         operation = Expr(:ref, _OPS_ARG, op_offset + recipe_index)
+        if output_cid != result_cid &&
+           all(invariant_root, dependencies.recipes[recipe_index])
+            args = Any[shared[canon_id(inner.graph, input.id)]
+                       for input in recipe.inputs]
+            push!(body.args, Expr(:(=), out, Expr(:call, operation, args...)))
+            locals[output_cid] = Expr(:call, GlobalRef(Base, :Ref), out)
+            shared[output_cid] = out
+            continue
+        end
+        args = Any[locals[canon_id(inner.graph, input.id)] for input in recipe.inputs]
+        if output_cid == result_cid &&
+           all(invariant_root, dependencies.recipes[recipe_index])
+            # The terminal recipe can read only shared values while unused
+            # lane arguments still determine its broadcast domain. Retain
+            # every lane axis through ignored arguments; no cell is unrolled.
+            for index in eachindex(inner.have)
+                index in atomic && continue
+                valtype(callvalues[index]) <: Number && continue
+                operation = Expr(:call, GlobalRef(@__MODULE__, :_LaneAnchored), operation)
+                pushfirst!(args, callargs[index])
+            end
+        end
         call = Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_call),
                     operation, args...)
         push!(body.args, Expr(:(=), out, call))
-        locals[canon_id(inner.graph, output.id)] = out
+        locals[output_cid] = out
     end
-    scalar_result = locals[canon_id(inner.graph, only(inner.want).id)]
-    materialized = Expr(:call,
-        GlobalRef(@__MODULE__, :_tensorized_plate_materialize), scalar_result)
+    scalar_result = locals[result_cid]
+    pointwise = Expr(:call, GlobalRef(@__MODULE__,
+        lanes ? :_tensorized_plate_lanes : :_tensorized_plate_pointwise), scalar_result)
     pointwise_lhs === nothing ||
-        push!(body.args, :($pointwise_lhs = $materialized))
-    total = Expr(:call,
-        GlobalRef(@__MODULE__, :_tensorized_plate_sum), scalar_result)
+        push!(body.args, :($pointwise_lhs = $pointwise))
+    total = total_fold === sum ?
+        Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_sum), scalar_result) :
+        Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_total),
+             _plate_fold_ref(total_fold), scalar_result)
     total_lhs === nothing || push!(body.args, :($total_lhs = $total))
     body
 end
 
-function _lower_with_ops(p::Plan; tensorized::Bool = false,
-                         inline_embedded::Bool = true)
+# A recipe output authored with a type (`weights::Vector{Float64} = ...`) is
+# emitted as a typed local of the NATIVE product: Julia converts the assigned
+# value to the declared type (an identity for a value already of that type, a
+# loud error for an inconvertible one) and, decisively, keeps the value's type
+# known to inference for every consumer. Without it a nested prepared kernel
+# called from inside a recipe -- a prepared scan child in a lazy arm, a prepared
+# plate child -- re-enters the same generic RK call operators that are already
+# on the inference stack (`_KernelSourceOp`, `_kernel_source_call`,
+# `_prepared_call`, RGF `generated_callfunc`); Julia's recursion heuristic then
+# widens the re-entered signatures and the child's result reaches the parent as
+# an abstract type (`Vector`, `Any`) even though the child alone infers exactly.
+# Every consumer of that value dispatches dynamically -- inside an embedded plate
+# loop once per cell, boxing the coordinate and the result (measured on the
+# ShinyRK simulation graph: 2.4x the read time and 3x the bytes of the children's
+# sum; snag `embedded-prepare-612e5944`). The declaration restores the authored
+# contract at the assignment. Only a product that is host-only by construction
+# may declare: the tensorized product binds traced arrays to the same names, and
+# a PLAIN prepared kernel (no plate, scan or embedded pair, hence no tensorized
+# product) has its native body traced by Reactant directly, where a host-typed
+# local would `convert` a traced array. So `_lower_with_ops` declares only in
+# the native body of a kernel that `prepare` builds as a native/tensorized pair
+# (`_needs_embedded_tensorization`), `lower_batched` in its native loop, and
+# the position driver (`_lower_replicated_with_ops`) in both of its parts.
+# A bound constant (`_BoundConstant`) is exempt: inference already knows its
+# exact value type, and a declaration would only convert a deliberately bound
+# view or range into an owning copy. `Any` declares nothing.
+function _declare_typed_output!(body::Expr, value::Value, name, declared::Set{Symbol})
+    name isa Symbol || return
+    name in declared && return
+    T = valtype(value)
+    T === Any && return
+    push!(declared, name)
+    push!(body.args, Expr(:local, Expr(:(::), name, T)))
+end
+
+# An unannotated outer recipe can still have a provably scalar result. RKPPL
+# uses such values for synthesized distribution arguments (`1 - omega`, for
+# example), and a plate must classify them as shared without asserting a
+# particular numeric type or changing the authored assignment. An opt-in
+# exemplar also proves array rank from the parent DAG. This reads types only;
+# no recipe or sample value is evaluated to obtain evidence.
+function _plate_inferred_input_types(p::Plan; exemplar_types = nothing)
+    g = p.graph
+    target = Set(canon_id(g, v.id) for r in p.recipes
+        if r.op isa _AuthoredPlateOp &&
+           (exemplar_types !== nothing ||
+            any(q -> _plate_branch_operation(q.op), r.op.kernel.plan.recipes))
+        for v in r.inputs if exemplar_types !== nothing || valtype(v) === Any)
+    producer = Dict(canon_id(g, v.id) => r for r in p.recipes for v in r.outputs)
+    needed = Set{Int}()
+    while !isempty(target)
+        cid = pop!(target)
+        recipe = get(producer, cid, nothing)
+        recipe === nothing && continue
+        recipe.id in needed && continue
+        push!(needed, recipe.id)
+        union!(target, (canon_id(g, v.id) for v in recipe.inputs))
+    end
+    types = Dict{ValueId,Any}(canon_id(g, v.id) =>
+        (exemplar_types === nothing ? valtype(v) : exemplar_types[i])
+        for (i, v) in enumerate(p.have))
+    for recipe in p.recipes
+        recipe.id in needed || continue
+        inputs = Any[get(types, canon_id(g, v.id), Any) for v in recipe.inputs]
+        T = if recipe.op isa _BoundConstant
+            typeof(recipe.op.value)
+        elseif recipe.op isa Union{_AuthoredPlateOp,_AuthoredScanOp}
+            Any
+        elseif all(t -> t isa Type, inputs)
+            _promote_op(recipe.op, inputs...)
+        else
+            Any
+        end
+        for (v, output_type) in zip(recipe.outputs, _recipe_output_types(recipe, T))
+            declared = valtype(v)
+            # The parent lowering enforces concretely declared locals. Keep
+            # that fact when inference of an earlier source closure is weaker;
+            # otherwise a later unannotated scalar such as `1 - omega` loses
+            # its Number proof even though `omega::Float64` is authoritative.
+            types[canon_id(g, v.id)] = if exemplar_types === nothing
+                _concrete_value_type(declared) &&
+                    !(recipe.op isa _BoundConstant) ? declared : output_type
+            else
+                declared !== Any && !(recipe.op isa _BoundConstant) &&
+                    !(output_type <: declared) ? declared : output_type
+            end
+        end
+    end
+    types
+end
+
+function _plate_inferred_values(g::Graph, values, scalar_types; rank_types = nothing)
+    result = Any[]
+    for v in values
+        cid = canon_id(g, v.id)
+        scalar = get(scalar_types, cid, Any)
+        rank = rank_types === nothing ? Any : get(rank_types, cid, Any)
+        T = if scalar isa Type && scalar !== Union{} && scalar <: Number
+            scalar
+        elseif rank isa Type && rank !== Union{} &&
+                (rank <: AbstractVector || rank <: Tuple)
+            rank
+        else
+            Any
+        end
+        push!(result, T !== Any && !(valtype(v) <: T) ?
+            Value{T}(v.id, v.name) : v)
+    end
+    result
+end
+
+# `recycle` lists (value id => argument name) pairs, appended to the signature
+# after the HAVE ports: each argument is `nothing` or a buffer that the value's
+# authored plate or scan may fill instead of allocating its output (the
+# position driver hands back the previous position's lane buffer,
+# `_lower_replicated_with_ops`). Any other producer ignores it.
+# `pushdowns` computes values plate cells read only at their own row inside
+# those cells (`_cell_pushdowns`); a value computed there never fills its
+# recycled buffer. The position driver keeps it off.
+# `plate_element_types` fills a plate's buffer with the element type of its
+# declared array output (`y::Vector{Float64} = plate(...)`), each cell
+# converting on store, instead of converting a buffer of the cells' own type
+# into the declaration afterwards.
+# `type_hints` pairs logical value ids with extra type-only arguments of an
+# embedded native region, in the order of those arguments. Empty coordinates can use the enclosing DAG's types;
+# no sample value or scalar recipe is evaluated to discover them.
+# `cell_slots` collects the lane slots that the cells of this lowering's plates
+# give their own intermediates (`_plate_nested_native!`), at every nesting
+# depth. They are free names of the returned AST, which its caller binds to
+# `Ref{Any}` slots (`_lower_replicated_with_ops`). Every other lowering,
+# including one started while this one runs, collects none.
+# `cell_tables` collects, the same way, the per-cell tables of the plates at
+# this lowering's own top level (`_lane_cell_take!`); a cell's own lowering
+# collects those of its own plates (`_plate_nested_native!`).
+#
+# Lowering recurses: plate cells, parts and partial-evaluation arms lower
+# their own plans through this function, with keywords of other types.
+# Inferred through, that recursion reaches Julia's recursion limit, and Julia
+# 1.10 then caches the lowering for its return type only, without its code, so
+# a package image that prepared a program held no compiled lowering and every
+# process inferred and compiled it again at its first preparation. Behind the
+# barrier each lowering is inferred on its own, and an image keeps its code.
+function _lower_with_ops(p::Plan; cell_slots::Union{Nothing,Vector{Symbol}} = nothing,
+                         cell_tables::Union{Nothing,Vector{Symbol}} = nothing,
+                         kwargs...)
+    task_local_storage(_CELL_TABLES, cell_tables) do
+        task_local_storage(_CELL_SLOTS, cell_slots) do
+            Base.inferencebarrier(_lower_with_ops_collecting)(p; kwargs...)::Tuple{Expr,Tuple,Tuple}
+        end
+    end
+end
+const _CELL_SLOTS = :ReactiveKernels_cell_slots
+const _CELL_TABLES = :ReactiveKernels_cell_tables
+
+# Whether a plate keeps per-cell tables (`_lane_cell_take!`): a plate of a
+# lowering that collects them (`_CELL_TABLES`: the position residual's top
+# level, or a cell of one of its plates, `_plate_nested_native!`) that stores
+# its cells in a buffer of its own.
+_plate_stores_cells(pointwise_lhs, into::Bool, cells::Bool) =
+    get(task_local_storage(), _CELL_TABLES, nothing) !== nothing &&
+    pointwise_lhs !== nothing && !into && cells
+
+# The positions in `p.recipes` of the recipes whose value keeps a lane slot:
+# each single-output producer with a destination form
+# (`_replicated_lane_producer`) of a value other than an `excluded` id.
+function _lane_slot_recipes(p::Plan, excluded)
+    positions = Int[]
+    for (position, r) in enumerate(p.recipes)
+        length(r.outputs) == 1 || continue
+        cid = canon_id(p.graph, only(r.outputs).id)
+        cid in excluded && continue
+        get(p.producer, cid, nothing) === r || continue
+        _replicated_lane_producer(r) || continue
+        push!(positions, position)
+    end
+    positions
+end
+_lane_slot_values(p::Plan, excluded) =
+    Value[only(p.recipes[position].outputs) for position in _lane_slot_recipes(p, excluded)]
+
+function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
+                         inline_embedded::Bool = true,
+                         declare::Bool = !tensorized && inline_embedded &&
+                                         _needs_embedded_tensorization(p),
+                         recycle::Vector{Pair{ValueId,Symbol}} = Pair{ValueId,Symbol}[],
+                         pushdowns::Bool = isempty(recycle),
+                         plate_element_types::Bool = false,
+                         type_hints = nothing, exemplar_types = nothing)
     g = p.graph
     names = _varnames(p)
     nm(v) = names[canon_id(g, v.id)]
@@ -1099,39 +4553,143 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     for v in p.have
         push!(argexprs, :($(nm(v))::$(valtype(v))))
     end
+    append!(argexprs, (last(pair) for pair in recycle))
+    type_hints === nothing || append!(argexprs, (last(pair) for pair in type_hints))
+    type_hints = type_hints === nothing ? nothing : Dict{ValueId,Symbol}(type_hints)
+    recycled(cid) = (index = findfirst(pair -> first(pair) == cid, recycle);
+                     index === nothing ? nothing : last(recycle[index]))
     body = Expr(:block)
     runtime_ops = Any[]
     runtime_recipes = Recipe[]
     skipped_recipes = Set{Int}()
+    terminal_skips = Set{Int}()
     pending_scans = Dict{Int,Any}()
+    # Scans read only through one slice, emitted at that reader (native only).
+    pending_slices = Dict{Int,Any}()
+    inferred_plate_types = nothing
+    inferred_exemplar_types = nothing
+    declared = Set{Symbol}()
+    declare_types = declare
     # HAVE is authoritative, and the first selected producer of any other
     # logical value owns its binding. Later recipes may emit that value as a
     # collateral multi-output; execute the recipe but discard the duplicate so
     # neither authoritative inputs nor earlier logical values are overwritten.
     assigned = Set(canon_id(g, v.id) for v in p.have)
+    # Plates strip-fused with the scan they feed (native only): each keeps its
+    # operation-table slots at its own position and is emitted at the scan.
+    strip_regions = Dict{Int,Vector{Recipe}}()
+    strip_plates = Dict{Int,Any}()
+    if !tensorized && inline_embedded
+        for r in p.recipes
+            r.op isa _AuthoredScanOp && _authored_scan_sum_consumer(p, r) === nothing ||
+                continue
+            region = _authored_scan_strip_region(p, r)
+            region === nothing || (strip_regions[r.id] = region)
+        end
+    end
+    strip_members = Set(x.id for region in values(strip_regions) for x in region)
+    # Column projections a native scan writes directly
+    # (`_authored_scan_column_projections`); each keeps its table slots.
+    scan_columns = Set{Int}()
+    # Values plate cells read only at their own row, computed there
+    # (`_cell_pushdowns`, cell_windows.jl). Native only: the tensorized product
+    # computes them whole, and both keep the same operation table.
+    cells = !tensorized && inline_embedded && pushdowns &&
+        type_hints === nothing ? _cell_pushdowns(p) : nothing
     for r in p.recipes
         r.id in skipped_recipes && continue
+        if r.id in terminal_skips
+            # The native scan computed this value. Keep the original slots in
+            # both products so their operation tables remain identical.
+            push!(runtime_ops, r.op)
+            push!(runtime_recipes, r)
+            continue
+        end
         callargs = Any[nm(inp) for inp in r.inputs]
+        if cells !== nothing && r.id in cells.recipes && !(r.op isa _AuthoredPlateOp)
+            # Its table slot stays here; its consumer cell calls it per row.
+            push!(runtime_ops, r.op)
+            push!(runtime_recipes, r)
+            cells.slots[r.id] = length(runtime_ops)
+            foreach(output -> push!(assigned, canon_id(g, output.id)), r.outputs)
+            continue
+        end
 
         if inline_embedded && r.op isa _AuthoredPlateOp
+            callvalues = r.inputs
+            # Shared-branch arm slots belong to the common operation table,
+            # so both lowerings use source-inferred scalar inputs. Exemplar
+            # rank evidence is native-only; exemplar-only scalar evidence
+            # cannot change a branch table shared with the tensorized kernel.
+            branch = any(q -> _plate_branch_operation(q.op),
+                         r.op.kernel.plan.recipes)
+            if type_hints === nothing &&
+                    ((!tensorized && exemplar_types !== nothing) || branch)
+                inferred_plate_types === nothing &&
+                    (inferred_plate_types = _plate_inferred_input_types(p))
+                if !tensorized && exemplar_types !== nothing
+                    inferred_exemplar_types === nothing &&
+                        (inferred_exemplar_types =
+                            _plate_inferred_input_types(p; exemplar_types))
+                end
+                scalars = branch ? inferred_plate_types :
+                    something(inferred_exemplar_types, inferred_plate_types)
+                callvalues = _plate_inferred_values(g, r.inputs, scalars;
+                    rank_types = inferred_exemplar_types)
+            end
             length(r.outputs) == 1 || throw(ArgumentError(
                 "an authored plate recipe must have exactly one pointwise output"))
             pointwise = only(r.outputs)
             pointwise_id = canon_id(g, pointwise.id)
-            sum_recipe = _authored_plate_sum_recipe(p, r)
+            if cells !== nothing && r.id in cells.recipes
+                # Computed only at the rows its reading cells read
+                # (`_cell_window!`): reserve its table slots here, as for a
+                # strip member, and lower it at each of those rows.
+                cells.slots[r.id] = length(runtime_ops)
+                cells.plates[r.id] = callvalues
+                _lower_authored_plate_native!(
+                    Expr(:block), runtime_ops, runtime_recipes, r.op, callargs,
+                    callvalues, nm(pointwise), nothing)
+                push!(assigned, pointwise_id)
+                continue
+            end
+            total_recipe = _authored_plate_total_recipe(p, r)
+            total_fold = total_recipe === nothing ? sum :
+                _plate_total_consumer_fold(total_recipe)
+            # Scan consumers and strip refills stream sums only; another fold
+            # reads its materialized pointwise port there.
+            if total_fold !== sum && (haskey(pending_scans, r.id) || r.id in strip_members)
+                total_recipe, total_fold = nothing, sum
+            end
             pointwise_needed = pointwise_id in Set(canon_id(g, w.id) for w in p.want) ||
-                any(candidate -> candidate !== sum_recipe &&
+                any(candidate -> candidate !== total_recipe &&
                     any(input -> canon_id(g, input.id) == pointwise_id,
                         candidate.inputs), p.recipes)
             pointwise_lhs = pointwise_needed ? nm(pointwise) : nothing
-            total_lhs = sum_recipe === nothing ? nothing : nm(only(sum_recipe.outputs))
+            total_lhs = total_recipe === nothing ? nothing : nm(only(total_recipe.outputs))
             pointwise_lhs === nothing || push!(assigned, pointwise_id)
-            if sum_recipe !== nothing
-                push!(assigned, canon_id(g, only(sum_recipe.outputs).id))
-                push!(skipped_recipes, sum_recipe.id)
+            if total_recipe !== nothing
+                push!(assigned, canon_id(g, only(total_recipe.outputs).id))
+                push!(skipped_recipes, total_recipe.id)
             end
-            if !tensorized && haskey(pending_scans, r.id)
-                scan_recipe, scan_args, scan_offset = pending_scans[r.id]
+            if declare_types
+                pointwise_lhs === nothing ||
+                    _declare_typed_output!(body, pointwise, pointwise_lhs, declared)
+                total_lhs === nothing || _declare_typed_output!(
+                    body, only(total_recipe.outputs), total_lhs, declared)
+            end
+            if !tensorized && r.id in scan_columns
+                # The scan wrote this column; reserve the projection's table
+                # slots here, as for a strip member.
+                _lower_authored_plate_native!(
+                    Expr(:block), runtime_ops, runtime_recipes, r.op, callargs,
+                    callvalues, pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
+                    total_fold,
+                    input_type_hints = type_hints === nothing ? nothing :
+                        Any[type_hints[canon_id(g, v.id)] for v in r.inputs])
+            elseif !tensorized && haskey(pending_scans, r.id)
+                scan_recipe, scan_args, scan_offset, scan_type_offset =
+                    pending_scans[r.id]
                 output_id = canon_id(g, only(scan_recipe.outputs).id)
                 positions = findall(
                     v -> canon_id(g, v.id) == output_id, r.inputs)
@@ -1141,15 +4699,36 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                 consumer = (r.op.kernel, callargs, positions, cell_offset,
                             pointwise_lhs, total_lhs)
                 _lower_authored_scan_native!(
-                    body, scan_recipe.op, scan_args, nothing, scan_offset; consumer)
+                    body, scan_recipe.op, scan_args, nothing, scan_offset; consumer,
+                    pointwise_recycled = recycled(pointwise_id),
+                    type_offset = scan_type_offset)
             elseif tensorized
                 _lower_authored_plate_tensorized!(
-                    body, runtime_ops, runtime_recipes, r.op, callargs,
-                    pointwise_lhs, total_lhs)
+                    body, runtime_ops, runtime_recipes, r.op, callargs, callvalues,
+                    pointwise_lhs, total_lhs; total_fold,
+                    lanes = pointwise_lhs !== nothing &&
+                        _plate_read_by_plates(p, pointwise_id, total_recipe))
+            elseif r.id in strip_members
+                hints = type_hints === nothing ? nothing :
+                    Any[type_hints[canon_id(g, v.id)] for v in r.inputs]
+                strip_plates[r.id] = (; op = r.op, callargs, callvalues,
+                    lhs = pointwise_lhs, hints, recycled = recycled(pointwise_id),
+                    offset = length(runtime_ops), hoisted = false)
+                # Reserve this plate's table slots here; its code is emitted
+                # with the scan (`_lower_authored_scan_strips!`).
+                _lower_authored_plate_native!(
+                    Expr(:block), runtime_ops, runtime_recipes, r.op, callargs,
+                    callvalues, pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
+                    input_type_hints = hints)
             else
                 _lower_authored_plate_native!(
-                    body, runtime_ops, runtime_recipes, r.op, callargs, r.inputs,
-                    pointwise_lhs, total_lhs)
+                    body, runtime_ops, runtime_recipes, r.op, callargs, callvalues,
+                    pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
+                    total_fold,
+                    element_type = plate_element_types ?
+                        first(_declared_array_layout(valtype(pointwise))) : nothing,
+                    input_type_hints = type_hints === nothing ? nothing :
+                        Any[type_hints[canon_id(g, v.id)] for v in r.inputs])
             end
             continue
         end
@@ -1162,9 +4741,18 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             else
                 push!(assigned, cid)
                 push!(lhsnames, nm(output))
+                declare_types && !(r.op isa _BoundConstant) &&
+                    _declare_typed_output!(body, output, nm(output), declared)
             end
         end
         lhs = length(lhsnames) == 1 ? only(lhsnames) : Expr(:tuple, lhsnames...)
+        if inline_embedded && r.op isa _AuthoredPlateCellOp
+            _lower_authored_plate_cell!(body, runtime_ops, runtime_recipes, r,
+                callargs, lhs, tensorized;
+                windows = cells === nothing ? nothing :
+                    _CellEmitter(body, cells, names, runtime_ops, runtime_recipes))
+            continue
+        end
         if inline_embedded && r.op isa _AuthoredScanOp
             # Both products keep the same table: the traced path calls the scan
             # op, while the native path calls its inlined scalar operations.
@@ -1173,18 +4761,114 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             scan_index = length(runtime_ops)
             append!(runtime_ops, r.op.kernel.ops)
             append!(runtime_recipes, r.op.kernel.lowered_recipes)
+            type_offset = _scan_type_slots!(runtime_ops, runtime_recipes, r.op)
+            terminal = _authored_scan_terminal_minima(p, r)
+            terminal_records = Any[]
+            if terminal !== nothing
+                scan_id = canon_id(g, only(r.outputs).id)
+                for item in terminal
+                    transform = item.transform
+                    slot = if transform === nothing
+                        nothing
+                    else
+                        push!(runtime_ops, transform.op)
+                        push!(runtime_recipes, transform)
+                        length(runtime_ops)
+                    end
+                    reduction = item.reduction
+                    reduction_value = only(reduction.outputs)
+                    reduction_id = canon_id(g, reduction_value.id)
+                    args = transform === nothing ? Any[] : Any[nm(v) for v in transform.inputs]
+                    source_names = transform === nothing ? Symbol[] : _recipe_source_names(transform)
+                    push!(terminal_records, (; slot, lhs = nm(reduction_value),
+                        transform, args, source = item.source,
+                        transform_lhs = transform === nothing ? nothing : nm(only(transform.outputs)),
+                        eltype = transform === nothing || !declare_types ? nothing :
+                            _scan_terminal_eltype(valtype(only(transform.outputs))),
+                        bindings = Dict{Symbol,Any}(name => arg for (name, arg) in zip(source_names, args)),
+                        scan_names = transform === nothing ? Set{Symbol}() :
+                            Set(name for (name, v) in zip(source_names, transform.inputs)
+                                if canon_id(g, v.id) == scan_id),
+                        mod = transform === nothing ? nothing : _kernel_endpoint_source_module(transform.op),
+                        recycled = transform === nothing ? nothing :
+                            recycled(canon_id(g, only(transform.outputs).id))))
+                    if !tensorized
+                        transform === nothing || push!(terminal_skips, transform.id)
+                        push!(terminal_skips, reduction.id)
+                        push!(assigned, reduction_id)
+                        declare_types && _declare_typed_output!(body,
+                            reduction_value, nm(reduction_value), declared)
+                    end
+                end
+            end
             if tensorized
                 call = Expr(:call, Expr(:ref, _OPS_ARG, scan_index),
                             callargs...)
                 push!(body.args, Expr(:(=), lhs, call))
             else
                 consumer = _authored_scan_sum_consumer(p, r)
-                if consumer === nothing
-                    _lower_authored_scan_native!(body, r.op, callargs, lhs, scan_index)
+                hoisted = consumer === nothing ? _authored_scan_hoistable(r.op) : Int[]
+                slice = consumer === nothing && terminal === nothing &&
+                    !haskey(strip_regions, r.id) &&
+                    recycled(canon_id(g, only(r.outputs).id)) === nothing ?
+                    _authored_scan_slice_demand(p, r) : nothing
+                if slice !== nothing &&
+                        (recycled(canon_id(g, only(slice.reader.outputs).id)) !== nothing ||
+                         cells !== nothing && slice.reader.id in cells.recipes)
+                    slice = nothing
+                end
+                projections = slice === nothing && terminal === nothing &&
+                    consumer === nothing ?
+                    _authored_scan_column_projections(p, r) : nothing
+                if projections !== nothing && any(c -> c.recipe.id in strip_members ||
+                        (cells !== nothing && c.recipe.id in cells.recipes), projections)
+                    projections = nothing
+                end
+                columns = nothing
+                if projections !== nothing
+                    columns = Any[]
+                    for projection in projections
+                        column = only(projection.recipe.outputs)
+                        column_id = canon_id(g, column.id)
+                        push!(scan_columns, projection.recipe.id)
+                        push!(assigned, column_id)
+                        declare_types &&
+                            _declare_typed_output!(body, column, nm(column), declared)
+                        push!(columns, (; projection.field, lhs = nm(column),
+                                        recycled = recycled(column_id)))
+                    end
+                    # Nothing reads the rows themselves.
+                    lhs = nothing
+                end
+                if slice !== nothing
+                    # Its reader's arguments are ready only there.
+                    pending_slices[slice.reader.id] =
+                        (r, callargs, scan_index, type_offset, slice)
+                elseif terminal !== nothing
+                    _lower_authored_scan_native!(body, r.op, callargs, nothing,
+                        scan_index; type_offset,
+                        recycled = recycled(canon_id(g, only(r.outputs).id)),
+                        terminals = (; items = terminal_records, scan_lhs = lhs,
+                            eltype = declare_types ? _scan_terminal_eltype(valtype(only(r.outputs))) : nothing))
+                elseif haskey(strip_regions, r.id) || !isempty(hoisted)
+                    output = only(r.outputs)
+                    records = Any[strip_plates[x.id]
+                                  for x in get(strip_regions, r.id, Recipe[])]
+                    hoisting = _scan_hoisted_records!(records, r, callargs,
+                        hoisted, scan_index)
+                    _lower_authored_scan_strips!(body, r, records, hoisting,
+                        callargs, lhs, scan_index, runtime_ops,
+                        runtime_recipes; type_offset, recycled = lhs === nm(output) ?
+                            recycled(canon_id(g, output.id)) : nothing, columns)
+                elseif consumer === nothing
+                    output = only(r.outputs)
+                    _lower_authored_scan_native!(body, r.op, callargs, lhs, scan_index;
+                        type_offset, recycled = lhs === nm(output) ?
+                            recycled(canon_id(g, output.id)) : nothing, columns)
                 else
                     # Emit at the plate, where all its scalar inputs are ready.
                     # The reserved table slots keep both backend products equal.
-                    pending_scans[consumer.id] = (r, callargs, scan_index)
+                    pending_scans[consumer.id] = (r, callargs, scan_index, type_offset)
                 end
             end
             continue
@@ -1193,8 +4877,25 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         if embedded === nothing
             push!(runtime_ops, r.op)
             push!(runtime_recipes, r)
-            call = Expr(:call, Expr(:ref, _OPS_ARG, length(runtime_ops)),
-                        callargs...)
+            if !tensorized && haskey(pending_slices, r.id)
+                scan_recipe, scan_args, scan_offset, scan_type_offset, slice =
+                    pending_slices[r.id]
+                _lower_authored_scan_slice_native!(body, scan_recipe.op, scan_args,
+                    scan_offset, slice, callargs, lhs,
+                    Expr(:ref, _OPS_ARG, length(runtime_ops));
+                    type_offset = scan_type_offset)
+                continue
+            end
+            # A recycled dotted-call or slice result fills its lane buffer
+            # (`_lane_source_expr`); the table keeps the operation either way.
+            destination = !tensorized && length(r.outputs) == 1 &&
+                lhs === nm(only(r.outputs)) ?
+                recycled(canon_id(g, only(r.outputs).id)) : nothing
+            destination === nothing ||
+                (destination = _lane_source_expr(r, callargs, destination))
+            call = destination === nothing ?
+                Expr(:call, Expr(:ref, _OPS_ARG, length(runtime_ops)), callargs...) :
+                destination
             push!(body.args, Expr(:(=), lhs, call))
         else
             inner_ast = _embedded_ast(embedded, tensorized)
@@ -1205,9 +4906,16 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                     _embedded_statements(inner_ast, callargs, lhs, op_offset))
         end
     end
-    retval = length(p.want) == 1 ? nm(p.want[1]) :
-             Expr(:tuple, (nm(w) for w in p.want)...)
+    output(w) = tensorized ? Expr(:call,
+        GlobalRef(@__MODULE__, :_tensorized_plate_materialize), nm(w)) : nm(w)
+    retval = length(p.want) == 1 ? output(p.want[1]) :
+             Expr(:tuple, (output(w) for w in p.want)...)
     push!(body.args, Expr(:return, retval))
+    # Compose before index runs duplicate a cell body into grouped/flat arms;
+    # otherwise those mutually exclusive definitions appear to escape here.
+    !tensorized && inline_embedded &&
+        (body = _lower_cell_arrays_native(body, runtime_recipes))
+    !tensorized && inline_embedded && (body = _lower_index_runs_native(body, runtime_ops))
     Expr(:function, Expr(:tuple, argexprs...), body),
     Tuple(runtime_ops), Tuple(runtime_recipes)
 end
@@ -1224,10 +4932,38 @@ Lower a plan to an ordinary anonymous-function `Expr` of the form
     end
 
 This `Expr` is a first-class artifact: it may be inspected (`code_expr`) and
-rewritten (`transform`) before compilation (gist §9).
+rewritten (`transform`) before compilation (gist §9). Pair it with its
+operation table via [`lower_with_ops`](@ref).
 """
 lower(p::Plan) = first(_lower_with_ops(p; inline_embedded = false))
 _lower_unembedded(p::Plan) = lower(p)
+
+"""
+    lower_with_ops(p::Plan; tensorized=false, inline_embedded=false) -> (ast, ops, recipes)
+
+Lower a plan to an executable straight-line function `Expr` plus the operation
+table it closes over. `ast` is `function (__ops__, ports...) ... end` over the
+plan HAVE ports in order; `ops` is the tuple of callables with `ops[i]`
+evaluating the `__ops__[i]` references in the body; `recipes` is the parallel
+human-readable recipe metadata.
+
+Evaluate functionally with [`compile`](@ref) (or `eval`) and call with the ops
+tuple first:
+
+    ast, ops, _ = lower_with_ops(p)
+    f = compile(ast)
+    f(ops, port_values...)
+
+`lower(p)` is `first(lower_with_ops(p))`. With `tensorized = true` the body
+takes the backend tensorized form over the same operation table; with
+`inline_embedded = true` embedded prepared kernels are spliced as statements
+(the form [`prepare`](@ref) compiles) instead of opaque `__ops__` calls.
+"""
+function lower_with_ops(p::Plan; tensorized::Bool = false,
+                        inline_embedded::Bool = false)
+    _lower_with_ops(
+        p; tensorized = tensorized, inline_embedded = inline_embedded)
+end
 
 function _batched_dependency_analysis(p::Plan, batched)
     graph = p.graph
@@ -1251,12 +4987,537 @@ function _batched_dependency_analysis(p::Plan, batched)
     dependencies = _plate_dependencies(p, mapped_ids)
     want = only(p.want)
     want_dependencies = get(
-        dependencies.values, canon_id(graph, want.id), Set{Int}())
+        dependencies.values, canon_id(graph, want.id), Set{ValueId}())
     isempty(want_dependencies) && throw(ArgumentError(
         "lower_batched: want :$(want.name) is loop-invariant (does not depend on a batched port); nothing to vectorize"))
     (; mapped = Tuple(mapped), mapped_ids,
        recipe_dependencies = dependencies.recipes, want)
 end
+
+
+_replicated_graph_plan(p::Plan) = all(!recipe.effectful for recipe in p.recipes)
+
+function _replicated_dependency_analysis(p::Plan, batched)
+    graph = p.graph
+    names = Tuple(batched isa Symbol ? (batched,) : batched)
+    isempty(names) && throw(ArgumentError(
+        "position batching requires at least one batched HAVE port"))
+    all(name -> name isa Symbol, names) || throw(ArgumentError(
+        "position batching batched ports must be Symbols; got $(names)"))
+    length(unique(names)) == length(names) || throw(ArgumentError(
+        "position batching batched ports must be unique; got $(names)"))
+    have_by_name = Dict(value.name => value for value in p.have)
+    mapped = Value[]
+    for name in names
+        value = get(have_by_name, name, nothing)
+        value === nothing && throw(ArgumentError(
+            "position batching port :$name is not in the plan HAVE boundary"))
+        push!(mapped, value)
+    end
+    mapped_ids = Set(canon_id(graph, value.id) for value in mapped)
+    dependencies = _plate_dependencies(p, mapped_ids)
+    positions = Tuple(
+        findfirst(value -> value.name === name, p.have) for name in names)
+    input_types = Tuple{(valtype(p.have[index]) for index in positions)...}
+    foreach(_replica_expected_rank, input_types.parameters)
+    (; mapped = Tuple(mapped), mapped_ids,
+       recipe_dependencies = dependencies.recipes, positions, input_types)
+end
+
+@inline function _replicated_validate_axes(
+        args::Tuple, ::Val{B}, ::Type{BT})::Int where {B,BT}
+    replica_count = _replica_batch_count(getfield(args, first(B)), BT.parameters[1])
+    for (position, index) in enumerate(B)
+        count = _replica_batch_count(getfield(args, index), BT.parameters[position])
+        count == replica_count || throw(DimensionMismatch(
+            "position-batched ports disagree on batch length; got " *
+            "$count and $replica_count"))
+    end
+    replica_count
+end
+
+@inline _replicated_project(arg::AbstractVector, replica_index) = arg[replica_index]
+@inline function _replicated_project(
+        arg::AbstractArray{T,N}, replica_index) where {T,N}
+    copy(selectdim(arg, N, replica_index))
+end
+# Expand only the record's type-defined fields. Recursing through `map` at
+# runtime can widen nested leaf types inside a generated position residual,
+# turning the authored arithmetic loops into boxed dynamic dispatch. Array
+# lengths and the position count never participate in this structural walk.
+function _replicated_record_projection(arg, T, index, lane = nothing)
+    (T <: Union{Tuple,NamedTuple} && isconcretetype(T)) || return lane === nothing ?
+        :(_replicated_project($arg, $index)) :
+        :(_replicated_project!($lane, $arg, $index))
+    fields = Any[_replicated_record_projection(
+        :(getfield($arg, $i)), fieldtype(T, i), index,
+        lane === nothing ? nothing : :(getfield($lane, $i))) for i in 1:fieldcount(T)]
+    values = Expr(:tuple, fields...)
+    T <: NamedTuple ? :(NamedTuple{$(QuoteNode(fieldnames(T)))}($values)) : values
+end
+@inline @generated function _replicated_project(arg::T, index) where {T<:Union{Tuple,NamedTuple}}
+    isconcretetype(T) ? _replicated_record_projection(:arg, T, :index) :
+        :(map(value -> _replicated_project(value, index), arg))
+end
+
+# A batched dense numeric array port projects every position into one lane
+# buffer of the projection's own type (`Array{T,N-1}`), so the scalar residual
+# sees exactly what `_replicated_project` gives it without allocating per
+# position. The driver copies every WANT into the stacked result before the
+# next position overwrites the lane, and a residual recipe is pure, so no
+# position's value is read after its lane is reused. Other leaves keep the
+# ordinary projection (`nothing` lane).
+_replicated_lane(arg) = nothing
+_replicated_lane(arg::Vector{<:Number}) = nothing
+_replicated_lane(arg::Array{T,N}) where {T<:Number,N} =
+    Array{T,N - 1}(undef, Base.front(size(arg)))
+_replicated_lane(arg::Union{Tuple,NamedTuple}) = map(_replicated_lane, arg)
+
+# Dense trailing-axis slices are contiguous. Only expose one when the scalar
+# port admits its type; concrete Array ports retain their copying lane.
+struct _ReplicatedViewLane end
+_replicated_lane(arg, ::Type) = _replicated_lane(arg)
+@inline @generated function _replicated_lane(arg::Array{T,N}, ::Type{V}) where {T<:Number,N,V}
+    _replicated_column_admitted(Array{T,N}, V) ?
+        :(_ReplicatedViewLane()) : :(_replicated_lane(arg))
+end
+# A borrowed reader keeps its dense lanes between calls (`_borrowed_batch`).
+_replicated_lane!(slot, arg) = _replicated_lane(arg)
+_replicated_lane!(slot, arg::Vector{<:Number}) = nothing
+@inline function _replicated_lane!(slot, arg::Array{T,N}) where {T<:Number,N}
+    lane = slot[]
+    lane isa Array{T,N - 1} && size(lane) == Base.front(size(arg)) && return lane
+    fresh = _replicated_lane(arg)
+    slot[] = fresh
+    fresh
+end
+_replicated_lane!(slot, arg, ::Type) = _replicated_lane!(slot, arg)
+@inline @generated function _replicated_lane!(slot, arg::Array{T,N}, ::Type{V}) where {T<:Number,N,V}
+    _replicated_column_admitted(Array{T,N}, V) ?
+        :(_ReplicatedViewLane()) : :(_replicated_lane!(slot, arg))
+end
+@inline _replicated_project!(::Nothing, arg, index) = _replicated_project(arg, index)
+@inline _replicated_project!(::_ReplicatedViewLane, arg::Array{T,N}, index) where {T,N} =
+    selectdim(arg, N, index)
+@inline function _replicated_project!(lane::Array{T}, arg::Array{T,N}, index) where {T,N}
+    count = length(lane)
+    copyto!(lane, 1, arg, (index - 1) * count + 1, count)
+end
+@inline @generated function _replicated_project!(lane::Tuple, arg::T, index) where {T<:Tuple}
+    isconcretetype(T) ? _replicated_record_projection(:arg, T, :index, :lane) :
+        :(map((item, value) -> _replicated_project!(item, value, index), lane, arg))
+end
+@inline @generated function _replicated_project!(lane::NamedTuple{K}, arg::T, index) where {K,T<:NamedTuple{K}}
+    isconcretetype(T) ? _replicated_record_projection(:arg, T, :index, :lane) :
+        :(map((item, value) -> _replicated_project!(item, value, index), lane, arg))
+end
+
+# A borrowed reader's first-position scratch. Its producer checks element
+# type and shape in `_lane_reuse`, including for undeclared array WANTs.
+@inline function _replicated_recycled(slot, ::Type{V}) where {V}
+    buffer = slot[]
+    buffer isa V ? buffer : nothing
+end
+_replicated_output_lane(destination, ::Type, index) = nothing
+@inline @generated function _replicated_output_lane(destination::Array{T,N}, ::Type{V}, index) where {T,N,V}
+    _replicated_column_admitted(Array{T,N}, V) ?
+        :(selectdim(destination, $N, index)) : nothing
+end
+
+@inline _replicated_same_column(value, destination, index) = false
+@inline function _replicated_same_column(value::SubArray, destination, index)
+    parent(value) === destination &&
+        parentindices(value) == (ntuple(d -> Base.Slice(Base.OneTo(size(destination, d))), ndims(destination) - 1)..., index)
+end
+
+@inline function _replicated_output(::Type{T}, replica_count) where {T<:Number}
+    Vector{T}(undef, replica_count)
+end
+@inline function _replicated_output(
+        ::Type{A}, replica_count) where {T,N,A<:AbstractArray{T,N}}
+    Array{T,N + 1}(undef, ntuple(_ -> 0, N)..., replica_count)
+end
+@inline function _replicated_output(
+        ::Type{A}, replica_count) where {A<:AbstractArray}
+    size = ntuple(_ -> 0, ndims(A))
+    similar(A, (size..., replica_count))
+end
+
+@inline function _replicated_store!(destination, replica_index, value)
+    size(selectdim(destination, ndims(destination), replica_index)) == size(value) ||
+        throw(DimensionMismatch("position outputs must have the same shape at every position"))
+    eltype(destination) === eltype(value) || throw(ArgumentError(
+        "position outputs must have the same numeric element type at every position"))
+    _replicated_same_column(value, destination, replica_index) && return destination
+    copyto!(selectdim(destination, ndims(destination), replica_index), value)
+    destination
+end
+@inline function _replicated_store!(destination::Tuple, index, value::Tuple)
+    length(destination) == length(value) || throw(ArgumentError(
+        "position outputs must have the same tuple length"))
+    foreach((out, item) -> _replicated_store!(out, index, item), destination, value)
+    destination
+end
+@inline function _replicated_store!(destination::NamedTuple{K}, index,
+                                    value::NamedTuple{L}) where {K,L}
+    K == L || throw(ArgumentError("position outputs must have the same record fields"))
+    foreach((out, item) -> _replicated_store!(out, index, item), destination, value)
+    destination
+end
+@inline _replicated_output(value::Number, replica_count) =
+    Vector{typeof(value)}(undef, replica_count)
+@inline function _replicated_output(value::AbstractArray, replica_count)
+    eltype(value) <: Number || throw(ArgumentError(
+        "position output arrays must have numeric elements; put record fields in a tuple or named tuple"))
+    similar(value, (size(value)..., replica_count))
+end
+@inline _replicated_output(value::NamedTuple, count) =
+    map(item -> _replicated_output(item, count), value)
+@inline _replicated_output(value::Tuple, count) =
+    map(item -> _replicated_output(item, count), value)
+_replicated_output(value, count) = throw(ArgumentError(
+    "position outputs must contain numbers, arrays, tuples or named tuples; got $(typeof(value))"))
+_replicated_output(::Type{T}, count) where {T} = throw(ArgumentError(
+    "an empty position batch needs declared output types; cannot infer $T without a position"))
+_replicated_output(::Type{T}, count) where {T<:Tuple} =
+    map(type -> _replicated_output(type, count), fieldtypes(T))
+_replicated_output(::Type{T}, count) where {T<:NamedTuple} =
+    NamedTuple{fieldnames(T)}(map(type -> _replicated_output(type, count), fieldtypes(T)))
+
+# A recipe-free batched HAVE already has the desired stacked layout when its
+# leaves are dense numeric arrays. Vectors of scalar records and custom arrays
+# still need ordinary projection and stacking; copying their outer container
+# would change the output layout or scalar representation.
+_replicated_passthrough_compatible(value) = false
+_replicated_passthrough_compatible(::Array{T,N}) where {T,N} =
+    T <: Number && (N > 1 || (N == 1 && isconcretetype(T)))
+_replicated_passthrough_compatible(value::Union{Tuple,NamedTuple}) =
+    all(_replicated_passthrough_compatible, value)
+
+_replicated_passthrough_output(value::Array) = copy(value)
+_replicated_passthrough_output(value::Union{Tuple,NamedTuple}) =
+    map(_replicated_passthrough_output, value)
+_replicated_passthrough_reuse(cache, value) = _replicated_passthrough_output(value)
+@inline function _replicated_passthrough_reuse(cache, value::Array)
+    cache isa typeof(value) && size(cache) == size(value) ?
+        copyto!(cache, value) : _replicated_passthrough_output(value)
+end
+@inline function _replicated_passthrough_reuse(cache::Tuple, value::Tuple)
+    length(cache) == length(value) || return _replicated_passthrough_output(value)
+    map(_replicated_passthrough_reuse, cache, value)
+end
+@inline function _replicated_passthrough_reuse(
+        cache::NamedTuple{K}, value::NamedTuple{L}) where {K,L}
+    K == L || return _replicated_passthrough_output(value)
+    map(_replicated_passthrough_reuse, cache, value)
+end
+@inline function _replicated_passthrough_output!(slot, value)
+    output = _replicated_passthrough_reuse(slot[], value)
+    slot[] = output
+    # Mapping may concretize explicitly abstract NamedTuple fields, just as
+    # ordinary projection/stacking does. Its result need not have input's type.
+    output
+end
+@inline function _replicated_passthrough_output!(slot, value::Array{T,N}) where {T,N}
+    output = _replicated_passthrough_reuse(slot[], value)::Array{T,N}
+    slot[] = output
+    output
+end
+@inline function _replicated_fill!(output, value, count)
+    for index in Base.OneTo(count)
+        _replicated_store!(output, index, value)
+    end
+    output
+end
+
+"""
+    lower_replicated(p::Plan; batched, reuse = false) -> Expr
+
+Lower a scalar plan over a shared trailing **position axis**. Recipes that
+transitively depend on a batched HAVE port execute once per position; recipes
+independent of every batched port execute once above the loop. This is position
+batching, not broadcast data batching: each batched array port is projected to
+its scalar-kernel argument at one position.
+
+The plan is split at its batched HAVE ports exactly as `bound=` partial
+evaluation splits it at bound ports (`_replicated_parts`): a shared prefix and
+a per-position residual. A residual plate's cell values that read only its
+non-batched arguments join the prefix as a plate of their own
+(`_replicated_shared_cells`). Each part is lowered by the ordinary native scalar
+lowering (`_lower_with_ops`) and spliced into the position driver, so authored
+plates emit their fused loops, scans inline their step, and embedded kernels
+splice, exactly as [`prepare`](@ref) lowers the same recipes. Their internal
+runtime control flow stays inside that per-position body. The operation table
+the returned function expects is the second result of
+`_lower_replicated_with_ops`.
+"""
+lower_replicated(p::Plan; batched, reuse = false) =
+    first(_lower_replicated_with_ops(p; batched, reuse))
+
+# The shared prefix is every recipe computable from the non-batched HAVE ports
+# alone (the same first-producer-wins split `bound=` partial evaluation uses,
+# `_partial_split`); the residual is the rest. The residual's HAVE boundary is
+# the batched ports plus every prefix-owned value it or the WANT list reads,
+# so a shared-only WANT passes through the residual unchanged.
+function _replicated_parts(p::Plan, analysis)
+    g = p.graph
+    mapped_have = Value[v for v in p.have if canon_id(g, v.id) in analysis.mapped_ids]
+    shared_have = Value[v for v in p.have if !(canon_id(g, v.id) in analysis.mapped_ids)]
+    shared = Set(canon_id(g, v.id) for v in shared_have)
+    # Position-invariant cell values of position-dependent plates join the
+    # prefix as plates of their own (`_replicated_shared_cells`).
+    p = _replicated_shared_cells(p, shared)
+    prefix, residual, prefix_owned = _partial_split(p, shared)
+    constants = _partial_constants(p, prefix_owned, residual)
+    have_ids = Set(canon_id(g, v.id) for v in p.have)
+    prefix_want = Value[v for v in constants if !(canon_id(g, v.id) in have_ids)]
+    (; plan = p, prefix = _partial_subplan(p, shared_have, prefix_want, prefix),
+       residual = _partial_subplan(p, vcat(mapped_have, constants), p.want, residual))
+end
+
+# Lower one part as `prepare` lowers a scalar kernel. Every output is declared,
+# as the position driver always did: its body is host-only by construction
+# (a traced batch calls the scalar target through `_replica`).
+_replicated_part_ast(part::Plan; recycle = Pair{ValueId,Symbol}[],
+                     cell_slots = nothing, cell_tables = nothing) =
+    _lower_with_ops(_lowering_plan(part); declare = true, recycle, cell_slots,
+                    cell_tables)
+
+# A bound constant keeps its exact value type (a bound view stays a view).
+function _replicated_declares(p::Plan, value::Value)
+    producer = get(p.producer, canon_id(p.graph, value.id), nothing)
+    !(producer isa Recipe && producer.op isa _BoundConstant)
+end
+
+function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
+    _replicated_graph_plan(p) || throw(ArgumentError(
+        "position batching requires pure recipes"))
+    analysis = _replicated_dependency_analysis(p, batched)
+    parts = _replicated_parts(p, analysis)
+    p = parts.plan
+    g = p.graph
+    names = _varnames(p)
+    nm(v) = names[canon_id(g, v.id)]
+    mapped(cid) = cid in analysis.mapped_ids
+    have_ids = Set(canon_id(g, v.id) for v in p.have)
+    declared = Set{Symbol}()
+
+    prefix_ast, prefix_ops = if isempty(parts.prefix.want)
+        nothing, ()
+    else
+        ast, ops, _ = _replicated_part_ast(parts.prefix)
+        ast, ops
+    end
+    # A WANT whose residual producer has a destination form (an authored plate
+    # or scan, a top-level dotted call or slice) receives the first position's
+    # value as scratch (`recycle`, see `_lower_with_ops`). Later positions
+    # reuse the scratch; a plate or scan writes into the owned destination
+    # column instead when its type admits a view. A dotted call or slice keeps
+    # a dense array, as its consumers always saw. A borrowed reader keeps that
+    # scratch between calls, with its producer checking element type and axes.
+    nout, nhave = length(p.want), length(p.have)
+    recycle = Pair{ValueId,Symbol}[]
+    recycle_wants = Int[]
+    column_wants = Set{Int}()
+    for (output_index, v) in enumerate(p.want)
+        cid = canon_id(g, v.id)
+        cid in have_ids && continue
+        any(pair -> first(pair) == cid, recycle) && continue
+        producer = get(parts.residual.producer, cid, nothing)
+        producer isa Recipe && _replicated_lane_producer(producer) || continue
+        push!(recycle, cid => gensym(Symbol(v.name, :_recycled)))
+        push!(recycle_wants, output_index)
+        producer.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} &&
+            push!(column_wants, output_index)
+    end
+    recycle_vars = Any[gensym(Symbol(p.want[k].name, :_lane)) for k in recycle_wants]
+    # Every other residual value with a destination form keeps its buffer in a
+    # lane slot (`_lane_reuse(::Base.RefValue{Any}, ...)`) across positions and,
+    # for a borrowed reader, across calls. A value the residual lowering fuses
+    # away (a summed plate, a scan feeding a plate) never touches its slot.
+    excluded = Set(canon_id(g, v.id) for v in vcat(p.want, parts.residual.have))
+    scratch_vars = Any[]
+    for v in _lane_slot_values(parts.residual, excluded)
+        push!(recycle, canon_id(g, v.id) => gensym(Symbol(v.name, :_recycled)))
+        push!(scratch_vars, gensym(Symbol(v.name, :_scratch)))
+    end
+    # The intermediates inside its plates' cells keep lane slots too, across
+    # cells as well as positions (`_plate_nested_native!`): the residual AST
+    # reads each by its collected name, bound below with the scratch slots.
+    cell_slots = Symbol[]
+    cell_tables = Symbol[]
+    residual_ast, residual_ops, _ = _replicated_part_ast(parts.residual; recycle,
+                                                         cell_slots, cell_tables)
+    residual_offset = length(prefix_ops)
+    lane_vars = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_lane))
+                     for v in parts.residual.have if mapped(canon_id(g, v.id)))
+
+    # One per-position block: project the batched ports into their lanes, then
+    # the spliced residual body binds one fresh local per WANT.
+    # `_embedded_statements` renames every residual local, so the
+    # first-position block and the loop body are independent copies of the
+    # same scalar program.
+    function position_block!(destination, replica_index, want_vars, recycled)
+        callargs = Any[]
+        for v in parts.residual.have
+            if mapped(canon_id(g, v.id))
+                projected = gensym(Symbol(v.name, :_position))
+                push!(destination.args, :($projected = $(GlobalRef(@__MODULE__,
+                    :_replicated_project!))($(lane_vars[canon_id(g, v.id)]),
+                    $(nm(v)), $replica_index)))
+                push!(callargs, projected)
+            else
+                push!(callargs, nm(v))
+            end
+        end
+        append!(callargs, recycled)
+        append!(callargs, scratch_vars)
+        for (v, variable) in zip(p.want, want_vars)
+            canon_id(g, v.id) in have_ids && continue
+            _replicated_declares(p, v) &&
+                _declare_typed_output!(destination, v, variable, declared)
+        end
+        lhs = length(want_vars) == 1 ? only(want_vars) : Expr(:tuple, want_vars...)
+        append!(destination.args,
+                _embedded_statements(residual_ast, callargs, lhs, residual_offset))
+    end
+
+    argexprs = Any[_OPS_ARG]
+    reuse && push!(argexprs, :__output_caches__)
+    for v in p.have
+        push!(argexprs, nm(v))
+    end
+    body = Expr(:block)
+    runtime_args = Expr(:tuple, (nm(v) for v in p.have)...)
+    push!(body.args, :(replica_count = _replicated_validate_axes(
+        $runtime_args, Val($(analysis.positions)),
+        $(analysis.input_types))))
+    empty_outputs = Any[Expr(:call, GlobalRef(@__MODULE__, :_replicated_output),
+                            valtype(v), 0) for v in p.want]
+    empty_result = length(empty_outputs) == 1 ? only(empty_outputs) :
+                   Expr(:tuple, empty_outputs...)
+    push!(body.args, :(if replica_count == 0
+        return $empty_result
+    end))
+    if isempty(p.recipes)
+        compatible = Expr(:call, GlobalRef(Base, :all),
+            GlobalRef(@__MODULE__, :_replicated_passthrough_compatible),
+            Expr(:tuple, (nm(v) for v in p.want if mapped(canon_id(g, v.id)))...))
+        passthrough_outputs = map(enumerate(p.want)) do (output_index, v)
+            value = nm(v)
+            if mapped(canon_id(g, v.id))
+                reuse ? Expr(:call, GlobalRef(@__MODULE__, :_replicated_passthrough_output!),
+                             Expr(:ref, :__output_caches__, output_index), value) :
+                        Expr(:call, GlobalRef(@__MODULE__, :_replicated_passthrough_output), value)
+            else
+                allocation = reuse ?
+                    Expr(:call, GlobalRef(@__MODULE__, :_replicated_output!),
+                         Expr(:ref, :__output_caches__, output_index), value, :replica_count) :
+                    Expr(:call, GlobalRef(@__MODULE__, :_replicated_output), value, :replica_count)
+                Expr(:call, GlobalRef(@__MODULE__, :_replicated_fill!),
+                     allocation, value, :replica_count)
+            end
+        end
+        passthrough_result = length(p.want) == 1 ? only(passthrough_outputs) :
+                             Expr(:tuple, passthrough_outputs...)
+        push!(body.args, Expr(:if, compatible, Expr(:return, passthrough_result)))
+    end
+    if prefix_ast !== nothing
+        prefix_names = Any[nm(v) for v in parts.prefix.want]
+        for v in parts.prefix.want
+            _replicated_declares(p, v) &&
+                _declare_typed_output!(body, v, nm(v), declared)
+        end
+        lhs = length(prefix_names) == 1 ? only(prefix_names) :
+              Expr(:tuple, prefix_names...)
+        append!(body.args, _embedded_statements(
+            prefix_ast, Any[nm(v) for v in parts.prefix.have], lhs, 0))
+    end
+
+    # Borrowed cache slots: the stacked outputs, then one lane per HAVE port,
+    # then one recycled buffer per WANT, then one slot per intermediate
+    # (`_borrowed_batch`). An owning call keeps its intermediate
+    # slots for that call only.
+    slot(index) = Expr(:ref, :__output_caches__, index)
+    for (position, v) in enumerate(p.have)
+        lane = get(lane_vars, canon_id(g, v.id), nothing)
+        lane === nothing && continue
+        allocation = reuse ?
+            Expr(:call, GlobalRef(@__MODULE__, :_replicated_lane!),
+                 slot(nout + position), nm(v), valtype(v)) :
+            Expr(:call, GlobalRef(@__MODULE__, :_replicated_lane), nm(v), valtype(v))
+        push!(body.args, Expr(:(=), lane, allocation))
+    end
+    for (index, scratch) in enumerate([scratch_vars; cell_slots; cell_tables])
+        push!(body.args, Expr(:(=), scratch, reuse ? slot(2 * nout + nhave + index) :
+            Expr(:call, Expr(:curly, GlobalRef(Base, :RefValue), GlobalRef(Core, :Any)),
+                 GlobalRef(Core, :nothing))))
+    end
+    first_recycled = Any[reuse ?
+        :($(GlobalRef(@__MODULE__, :_replicated_recycled))(
+            $(slot(nout + nhave + k)), $(valtype(p.want[k])))) :
+        nothing for k in recycle_wants]
+
+    output_vars = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_batched))
+                       for v in p.want)
+    first_index = gensym(:replica_index)
+    first_vars = Any[gensym(Symbol(v.name, :_first)) for v in p.want]
+    push!(body.args, :($first_index = 1))
+    position_block!(body, first_index, first_vars, first_recycled)
+    for (lane, k) in zip(recycle_vars, recycle_wants)
+        push!(body.args, :($lane = $(first_vars[k])))
+    end
+    for (output_index, v) in enumerate(p.want)
+        cid = canon_id(g, v.id)
+        value = first_vars[output_index]
+        allocation = reuse ?
+            Expr(:call, GlobalRef(@__MODULE__, :_replicated_output!),
+                 Expr(:ref, :__output_caches__, output_index), value, :replica_count) :
+            Expr(:call, GlobalRef(@__MODULE__, :_replicated_output), value, :replica_count)
+        push!(body.args, Expr(:(=), output_vars[cid], allocation))
+        push!(body.args,
+              Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
+                   output_vars[cid], first_index, value))
+    end
+
+    rest_body = Expr(:block)
+    rest_vars = Any[gensym(Symbol(v.name, :_position)) for v in p.want]
+    rest_recycled = Any[k in column_wants ?
+        :(let column = $(GlobalRef(@__MODULE__, :_replicated_output_lane))(
+            $(output_vars[canon_id(g, p.want[k].id)]), $(valtype(p.want[k])), replica_index)
+            column === nothing ? $lane : column
+        end) : lane for (lane, k) in zip(recycle_vars, recycle_wants)]
+    position_block!(rest_body, :replica_index, rest_vars, rest_recycled)
+    for (output_index, v) in enumerate(p.want)
+        push!(rest_body.args,
+              Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
+                   output_vars[canon_id(g, v.id)], :replica_index,
+                   rest_vars[output_index]))
+    end
+    # Keep the first lane as scratch across calls, never a view of an escaped
+    # output. All later positions use it or their own destination column.
+    push!(body.args, Expr(:for,
+        Expr(:(=), :replica_index,
+             Expr(:call, GlobalRef(Base, :OneTo), :replica_count)),
+        Expr(:if, Expr(:call, GlobalRef(Base, :(==)), :replica_index, 1),
+             Expr(:block, Expr(:continue)), rest_body)))
+    if reuse
+        for (lane, k) in zip(recycle_vars, recycle_wants)
+            push!(body.args, :($(slot(nout + nhave + k))[] = $lane))
+        end
+    end
+    retval = length(p.want) == 1 ? only(values(output_vars)) :
+             Expr(:tuple, (output_vars[canon_id(g, v.id)] for v in p.want)...)
+    push!(body.args, Expr(:return, retval))
+    Expr(:function, Expr(:tuple, argexprs...), body),
+    (prefix_ops..., residual_ops...),
+    2 * nout + nhave + length(scratch_vars) + length(cell_slots) + length(cell_tables)
+end
+
+# Destination-form producers of a position value: authored plates and scans,
+# and source recipes whose result is a top-level dotted call or array slice.
+_replicated_lane_producer(r::Recipe) =
+    r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} || _lane_source_eligible(r)
 
 """
     lower_batched(p::Plan; batched, reduce = :+) -> Expr
@@ -1299,8 +5560,9 @@ function lower_batched(p::Plan; batched, reduce = :+)
     index = gensym(:plate_index)
     previous = gensym(:plate_previous)
     first_coordinate = gensym(:plate_first)
-    raw_arguments = Dict{Int,Symbol}()
-    prepared_arguments = Dict{Int,Symbol}()
+    raw_arguments = Dict{ValueId,Symbol}()
+    prepared_arguments = Dict{ValueId,Symbol}()
+    have_rank = Dict{ValueId,Int}(canon_id(g, v.id) => i for (i, v) in enumerate(p.have))
     for value in analysis.mapped
         cid = canon_id(g, value.id)
         raw_arguments[cid] = gensym(Symbol(:plate_argument_, value.name))
@@ -1337,20 +5599,21 @@ function lower_batched(p::Plan; batched, reduce = :+)
         :tuple, (raw_arguments[canon_id(g, value.id)]
                  for value in analysis.mapped)...)
     output_axes = gensym(:plate_axes)
-    combined_axes = Expr(:call, GlobalRef(Base.Broadcast, :combine_axes),
-        (raw_arguments[canon_id(g, value.id)]
-         for value in analysis.mapped)...)
+    combined_axes = _plate_combined_axes_expr(
+        [raw_arguments[canon_id(g, value.id)] for value in analysis.mapped])
     push!(body.args, Expr(:(=), output_axes,
         Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes),
              combined_axes)))
 
     assigned = Set(canon_id(g, v.id) for v in p.have)
+    declared = Set{Symbol}()
     for (k, r) in enumerate(p.recipes)
         isempty(analysis.recipe_dependencies[k]) || continue
         out = only(r.outputs)
         cid = canon_id(g, out.id)
         cid in assigned && continue
         push!(assigned, cid)
+        r.op isa _BoundConstant || _declare_typed_output!(body, out, nm(out), declared)
         push!(body.args, Expr(:(=), nm(out), callexpr(k, r)))
     end
 
@@ -1367,7 +5630,7 @@ function lower_batched(p::Plan; batched, reduce = :+)
         changed = foldl((left, right) -> Expr(:||, left, right),
             (Expr(:call, GlobalRef(@__MODULE__, :_plate_dependency_changed),
                   index, previous, prepared_arguments[root])
-             for root in sort!(collect(roots))))
+             for root in sort!(collect(roots); by = root -> have_rank[root])))
         condition = Expr(:||, first_coordinate, changed)
         push!(loopbody.args,
               Expr(:if, condition, Expr(:(=), nm(out), callexpr(k, r))))
@@ -1419,14 +5682,14 @@ function _lower_batched_tensorized(p::Plan; batched, reduce = :+)
     names = _varnames(p)
     nm(v) = names[canon_id(g, v.id)]
 
-    batched_input_ids = Set{Int}()
+    batched_input_ids = Set{ValueId}()
     for v in p.have
         v.name in batched_names && push!(batched_input_ids, canon_id(g, v.id))
     end
     isempty(batched_input_ids) && throw(ArgumentError(
         "lower_batched: none of the have ports are batched (batched = $(sort(collect(batched_names))))"))
 
-    batched_vals = Set{Int}(batched_input_ids)
+    batched_vals = Set{ValueId}(batched_input_ids)
     recipe_is_batched = falses(length(p.recipes))
     for (k, r) in enumerate(p.recipes)
         dependent = any(canon_id(g, inp.id) in batched_vals for inp in r.inputs)
@@ -1455,18 +5718,37 @@ function _lower_batched_tensorized(p::Plan; batched, reduce = :+)
         push!(assigned, cid)
         op = Expr(:ref, _OPS_ARG, k)
         args = Any[nm(inp) for inp in r.inputs]
-        call = recipe_is_batched[k] ?
-               Expr(:call, GlobalRef(Base, :broadcast), op, args...) :
-               Expr(:call, op, args...)
+        if recipe_is_batched[k]
+            # A batched recipe maps over the lane axis; every operand that is
+            # NOT batched — a shared scalar, or a shared ARRAY port such as the
+            # whole unit-response vector a per-dose cell gathers from — is one
+            # atomic value per lane. It enters the call wrapped in `Ref`, and
+            # the call routes through `_tensorized_plate_call`, whose backend
+            # extension batches a shared array payload (`Ops.batch`) instead
+            # of expanding it as a broadcast axis. Before this, a shared array
+            # HAVE was broadcast as an axis (`DimensionMismatch`, snag
+            # `plate-cell-gathe-94d4a929`) while `lower_batched` hoisted it
+            # correctly natively.
+            shared = Any[
+                canon_id(g, inp.id) in batched_vals ? nm(inp) :
+                    Expr(:call, GlobalRef(Base, :Ref), nm(inp))
+                for inp in r.inputs]
+            call = Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_call),
+                        op, shared...)
+        else
+            call = Expr(:call, op, args...)
+        end
         push!(body.args, Expr(:(=), nm(out), call))
     end
 
+    materialized = Expr(:call,
+        GlobalRef(@__MODULE__, :_tensorized_plate_materialize), nm(want))
     retval = if reduce === nothing
-        nm(want)
+        materialized
     elseif reduce === :+
-        Expr(:call, GlobalRef(Base, :sum), nm(want))
+        Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_sum), nm(want))
     else
-        Expr(:call, GlobalRef(Base, :reduce), reduce, nm(want))
+        Expr(:call, GlobalRef(Base, :reduce), reduce, materialized)
     end
     push!(body.args, Expr(:return, retval))
     Expr(:function, Expr(:tuple, argexprs...), body)
@@ -1486,8 +5768,402 @@ transform(ast::Expr, passes...) = foldl((a, pass) -> pass(a), passes; init = ast
 
 Compile a lowered `Expr` into a native Julia function via
 `RuntimeGeneratedFunctions`. The returned callable takes `(__ops__, args...)`.
+Prepared callables may be stored as package-level constants: during package
+precompilation, the package being compiled owns the generated expression cache.
+Global names in the lowered body still resolve in `ReactiveKernels`. The
+callable does not hold the expression; the cache retains it for
+`RuntimeGeneratedFunctions.get_expression`. A program that a loaded package
+image compiled returns that image's generated function, with the code the
+image compiled for it.
 """
-compile(ast::Expr) = @RuntimeGeneratedFunction(ast)
+function compile(ast::Expr)
+    ast = _canonical_locals(_canonical_globals(ast))
+    f = RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, ast)
+    image = _image_program(f)
+    image === nothing || return image
+    cache_module = _generated_function_cache_module()
+    cache_module === (@__MODULE__) && return RuntimeGeneratedFunctions.drop_expr(f)
+    Base.invokelatest(RuntimeGeneratedFunctions.init, cache_module)
+    # The cache and generated method must share an owner on Julia 1.12: a
+    # generator defined in an older dependency cannot read new global bindings.
+    # Julia's macro hygiene resolves globals in RK while preserving lexical
+    # scopes, rather than guessing which symbols in the body are free names.
+    qualified = macroexpand(@__MODULE__, Expr(:macrocall,
+        GlobalRef(@__MODULE__, Symbol("@_native_context")), LineNumberNode(0), ast))
+    # Hygiene renames every local through the global `gensym` counter again.
+    qualified = _canonical_locals(_native_parameter_names(ast, qualified))
+    native = Base.invokelatest(RuntimeGeneratedFunction, cache_module, cache_module, qualified)
+    # The call needs only the callable's type. A retained body is a mutable
+    # `Expr` in every prepared callable, and wherever the generated call is not
+    # inlined, such as a prepared lazy-arm child, Julia passes the callable by
+    # reference; ordinary Enzyme reverse then cannot prove it read-only.
+    native = Base.invokelatest(RuntimeGeneratedFunctions.drop_expr, native)
+    _record_image_program!(cache_module, f, native)
+    # Only functions prepared before the new context method becomes visible
+    # need this barrier, e.g. a builder that immediately warms its first kernel.
+    applicable(RuntimeGeneratedFunctions.generated_callfunc, native) ? native :
+        _PrecompileWarmFunction(native)
+end
+
+macro _native_context(ast)
+    ast
+end
+
+# Lowering mints its scratch locals with `gensym` (plate axes and indices, scan
+# carries, the renamed locals of a spliced embedded kernel), and `gensym` draws
+# on a process-global counter: two lowerings of one unchanged plan differ in
+# exactly those names. `RuntimeGeneratedFunctions` keys its body cache on a
+# content hash of the expression and carries that hash in the callable's TYPE,
+# so every fresh lowering would otherwise mint a new `RuntimeGeneratedFunction`
+# type — and with it a new `PreparedKernel`/`_EmbeddedFunctionPair` constructor
+# specialization at `prepare` time plus a new `generated_callfunc` expansion at
+# the first call — on EVERY `prepare` of an unchanged graph (snag
+# `prepare-with-bou-2b4faf57`: ~15–60 ms of compilation per request-time
+# `prepare(...; bound = ...)` of a graph embedding a prepared plate child).
+# Alpha-rename the gensym'd locals in first-occurrence order before the body
+# reaches the cache: identical lowerings then produce byte-identical bodies,
+# one callable type, and one compilation per graph shape. Distinct originals
+# map to distinct names (the map is a bijection on the symbols it touches), so
+# hygiene is preserved; quoted data and every other symbol are untouched. A
+# name derived from a gensym carries its counter too (a bound lazy-arm lane,
+# `lane_then_##plate_argument#245`), so a `##` anywhere marks one; an authored
+# identifier cannot contain it (snag `compiled-reader-be3cadbb`).
+_lowering_gensym(s::Symbol) =
+    (str = String(s); !isempty(str) && (str[1] == '#' || occursin("##", str)))
+
+function _canonical_locals(ast::Expr)
+    names = Dict{Symbol,Symbol}()
+    function canonical(s::Symbol)
+        get!(names, s) do
+            Symbol(replace(String(s), r"#\d+" => ""), '#', length(names) + 1)
+        end
+    end
+    function walk(node)
+        node isa Symbol && return _lowering_gensym(node) ? canonical(node) : node
+        node isa Expr || return node
+        node.head === :quote && return node
+        Expr(node.head, map(walk, node.args)...)
+    end
+    walk(ast)
+end
+
+# A program generator evaluates each lowering in a module of its own (BRM's
+# `##RKEmittedModels#N`; RKPPL's `PPLGeneratedModels`, or while an image is
+# generated a scope module standing in for it), and hygiene qualifies every
+# global a body reads in that module: `ones`, `eltype` and an imported helper
+# become `##RKEmittedModels#231.ones`, and so on. The body then differs between
+# lowerings of one program, and so does the callable's type (snag
+# `compiled-reader-be3cadbb`). Name each global by the module that owns its
+# binding instead; a scope module's alias by the binding it stands in for; and
+# a constant bound to a module, a named function or a named type by that
+# value's own binding: the same reference in every lowering and every process.
+# A binding a lowering module itself owns otherwise stays as qualified.
+_anonymous_module(m::Module) = (name = String(nameof(m)); !isempty(name) && name[1] == '#')
+
+# Lowering reads the bindings of the modules a program is lowered in: a caller's
+# module or a docs page's sandbox, BRM's and RKPPL's generated modules. Before
+# Julia 1.12 the first read of a name a module has only from a `using` binds
+# the name to that import for good (`isdefined`, `isconst` and `binding_module`
+# read it too), and the module can no longer define the name itself. A docs
+# page that prepared the uniform example after another module had lowered the
+# same kernel, whose branch closure has a parameter `lower`, then failed on
+# `lower = -1.0`: "cannot assign a value to imported variable
+# ReactiveKernels.lower" (snag `docs-distributio-30373f1f`). So lowering reads
+# what a name denotes without binding it: before 1.12 by Julia's own lookup of
+# a module's imports (`jl_resolve_owner` and `using_resolve_binding`,
+# `src/module.c`, the same in 1.10 and 1.11), recording nothing. From 1.12 a
+# read binds nothing for good, and the ordinary reflection applies.
+@static if VERSION < v"1.12.0-"
+    # The module owning the binding `name` denotes in `m`, or `m` when it
+    # denotes none, as `Base.binding_module` answers.
+    function _binding_owner(m::Module, name::Symbol)
+        Base.isbindingresolved(m, name) && return Base.binding_module(m, name)
+        something(_imported_binding_owner(m, name, ()), m)
+    end
+
+    # The owner of the binding `m`'s `using`s give `name`, or `nothing`: imports
+    # that export different bindings give none, and among equal ones the oldest
+    # import wins, a deprecated one only when no other exports the name.
+    function _imported_binding_owner(m::Module, name::Symbol, visiting::Tuple)
+        m in visiting && return nothing
+        found = nothing
+        # Newest import first, as Julia searches them.
+        for imported in ccall(:jl_module_usings, Any, (Any,), m)::Vector{Any}
+            imported = imported::Module
+            Base.isexported(imported, name) || continue
+            owner = Base.isbindingresolved(imported, name) ?
+                Base.binding_module(imported, name) :
+                _imported_binding_owner(imported, name, (visiting..., m))
+            owner === nothing && continue
+            deprecated = Base.isdeprecated(owner, name)
+            found === nothing || deprecated || Base.isdeprecated(found, name) ||
+                _same_binding(found, owner, name) || return nothing
+            (found === nothing || !deprecated) && (found = owner)
+        end
+        # Julia skips a deprecated binding whose value is `nothing`.
+        found === nothing || !Base.isdeprecated(found, name) || !isdefined(found, name) ||
+            getglobal(found, name) !== nothing || return nothing
+        found
+    end
+
+    # The bindings two owners own are the same, or constants of one value.
+    _same_binding(a::Module, b::Module, name::Symbol) = a === b ||
+        isconst(a, name) && isconst(b, name) && isdefined(a, name) && isdefined(b, name) &&
+        getglobal(a, name) === getglobal(b, name)
+
+    # The module whose own binding `name` reads in `m`, or `nothing`.
+    function _binding_holder(m::Module, name::Symbol)
+        owner = _binding_owner(m, name)
+        Base.isbindingresolved(owner, name) ? owner : nothing
+    end
+else
+    _binding_owner(m::Module, name::Symbol) =
+        Base.invokelatest(Base.binding_module, m, name)::Module
+    _binding_holder(m::Module, ::Symbol) = m
+end
+
+# `Some(value)` of the binding `name` denotes in `m`, or `nothing` when it
+# denotes no defined one. Binds nothing in `m`.
+function _global_value(m::Module, name::Symbol)
+    holder = _binding_holder(m, name)
+    (holder !== nothing && Base.invokelatest(isdefined, holder, name)) || return nothing
+    Some(Base.invokelatest(getglobal, holder, name))
+end
+
+function _global_isconst(m::Module, name::Symbol)
+    holder = _binding_holder(m, name)
+    holder !== nothing && Base.invokelatest(isconst, holder, name)
+end
+
+Base.@nospecializeinfer function _canonical_global(ref::GlobalRef)
+    m, name = ref.mod, ref.name
+    (m === Base || m === Core) && return ref
+    owner = _binding_owner(m, name)
+    owner === m || return _canonical_global(GlobalRef(owner, name))
+    value = _global_value(m, name)
+    (value !== nothing && _global_isconst(m, name)) || return ref
+    value = something(value)
+    origin = _kernel_scope_origin(m)
+    origin === m || _global_value(origin, name) !== Some(value) ||
+        return _canonical_global(GlobalRef(origin, name))
+    named = value isa Type ? Base.unwrap_unionall(value) : nothing
+    home = value isa Module ? value :
+        value isa Function && Base.issingletontype(typeof(value)) ?
+            parentmodule(typeof(value)) :
+        named isa DataType ? named.name.module : nothing
+    home === nothing && return ref
+    own = named isa DataType ? named.name.name : nameof(value)
+    (home !== m && !_anonymous_module(home) && _global_value(home, own) === Some(value)) ||
+        return ref
+    _canonical_global(GlobalRef(home, own))
+end
+
+function _canonical_globals(ast::Expr)
+    seen = Dict{GlobalRef,GlobalRef}()
+    function walk(node)
+        node isa GlobalRef && return get!(() -> _canonical_global(node), seen, node)
+        node isa Expr || return node
+        node.head === :quote && return node
+        Expr(node.head, Any[walk(arg) for arg in node.args]...)
+    end
+    walk(ast)
+end
+
+# The ids of `p`'s values in declaration order: its HAVE ports, then each
+# recipe's outputs. Generated code orders values this way, never by identity: a
+# `ValueId` orders by the key of the namespace that allocated it, and that key
+# differs in every process. A program composed of values a package image made
+# and values made at run time (Bruno's simulator: its summary graph and its
+# model) ordered them one way while the image was generated and another at run
+# time, so the image's compiled reader did not apply (snag
+# `compiled-reader-be3cadbb`).
+function _declaration_order(p::Plan, ids)
+    wanted = Set{ValueId}(ids)
+    order = ValueId[]
+    function take(v)
+        cid = canon_id(p.graph, v.id)
+        cid in wanted && !(cid in order) && push!(order, cid)
+    end
+    foreach(take, p.have)
+    for r in p.recipes
+        foreach(take, r.outputs)
+    end
+    length(order) == length(wanted) || throw(ArgumentError(
+        "values to order are not all values of the plan"))
+    order
+end
+
+# Preserve the lowered argument names used by operation-table inspection.
+# Macro hygiene still owns every local binding and qualifies every global.
+function _native_parameter_names(original, qualified)
+    original.args[1] isa Expr && original.args[1].head === :tuple &&
+        qualified.args[1] isa Expr && qualified.args[1].head === :tuple ||
+        return qualified
+    names = Dict{Symbol,Symbol}()
+    for (old, new) in zip(original.args[1].args, qualified.args[1].args)
+        old = old isa Expr && old.head === :(::) ? old.args[1] : old
+        new = new isa Expr && new.head === :(::) ? new.args[1] : new
+        old isa Symbol && new isa Symbol && (names[new] = old)
+    end
+    function restore(node)
+        node isa Symbol && return get(names, node, node)
+        node isa Expr || return node
+        node.head === :quote && return node
+        Expr(node.head, map(restore, node.args)...)
+    end
+    restore(qualified)
+end
+
+struct _PrecompileWarmFunction{F} <: Function
+    f::F
+end
+
+@inline function (f::_PrecompileWarmFunction)(args...)
+    # During ordinary execution the image's context method is already loaded.
+    # Keep latest-world dispatch confined to execution while building an image.
+    ccall(:jl_generating_output, Cint, ()) == 0 ? f.f(args...) :
+        _precompile_warm_call(f.f, args...)
+end
+
+@inline function _precompile_warm_call(f, args...)
+    result_type = Core.Compiler.return_type(f, typeof(args))
+    # The first call can precede the new method's world. After load, retain
+    # the native return type rather than leaking invokelatest's Any result.
+    Base.invokelatest(f, args...)::(result_type === Union{} ? Any : result_type)
+end
+
+_native_generated_function(f) = f
+_native_generated_function(f::_PrecompileWarmFunction) = f.f
+RuntimeGeneratedFunctions.get_expression(f::_PrecompileWarmFunction) =
+    Base.invokelatest(RuntimeGeneratedFunctions.get_expression, f.f)
+RuntimeGeneratedFunctions.drop_expr(f::_PrecompileWarmFunction) =
+    _PrecompileWarmFunction(Base.invokelatest(RuntimeGeneratedFunctions.drop_expr, f.f))
+@inline RuntimeGeneratedFunctions.generated_callfunc(f::_PrecompileWarmFunction, args...) =
+    f(args...)
+
+# RGF caches created in an already-loaded dependency are not part of a
+# consumer's package image. Use Julia's actual precompilation target rather
+# than the graph's author module: consumers can prepare imported graphs, and
+# preparation can run inside helpers or submodules. This is cold-path loader
+# state only. Ordinary runtime preparation still uses RK's existing context.
+_generated_function_cache_module() = something(_image_target_module(), @__MODULE__)
+
+# The root module of the package whose image Julia is generating, or `nothing`
+# outside incremental package precompilation.
+function _image_target_module()
+    (ccall(:jl_generating_output, Cint, ()) == 0 ||
+     Base.JLOptions().incremental == 0) && return nothing
+    target = @static if isdefined(Base, :precompilation_target)
+        # Julia 1.10 / 1.11.
+        Base.precompilation_target
+    elseif isdefined(Base, :precompilation_stack)
+        # Julia 1.12+ records nested package precompilation in order.
+        isempty(Base.precompilation_stack) ? nothing : last(Base.precompilation_stack)
+    else
+        error("cannot identify the package owning generated functions during precompilation")
+    end
+    # Non-package output generation has no package-loader target.
+    target === nothing ? nothing : Base.root_module(target)
+end
+
+# A program compiled while a package image is generated gets a generated
+# function tagged with that image's cache, so an identical program prepared
+# after loading the image would mint a new RuntimeGeneratedFunction type and
+# compile it again in every process. The image therefore keeps, in its root
+# module, the function it made for each program, keyed by the identity of the
+# function `compile` makes from the same lowered expression in RK's own cache:
+# its argument names and the content id RuntimeGeneratedFunctions computes from
+# the body, which is the same in every process. Loading the image registers
+# that table, and `compile` returns the image's function for a program in it.
+struct _ImagePrograms
+    functions::Dict{Any,Any}
+end
+
+const _IMAGE_PROGRAMS = Symbol("#_ReactiveKernels_image_programs")
+
+mutable struct _LoadedImagePrograms
+    # Replaced, never mutated, so `compile` reads it without the lock.
+    @atomic tables::Vector{_ImagePrograms}
+    const lock::ReentrantLock
+end
+
+const _LOADED_IMAGE_PROGRAMS = _LoadedImagePrograms(_ImagePrograms[], ReentrantLock())
+
+# Its argument names and body id. These helpers read type parameters rather
+# than dispatch on them, and the key has one type for every argument count, so
+# they compile once, not once per program.
+Base.@nospecializeinfer function _image_program_key(@nospecialize(f::RuntimeGeneratedFunction))
+    parameters = typeof(f).parameters
+    argnames = parameters[1]::Tuple
+    names = Vector{Symbol}(undef, nfields(argnames))
+    for i in eachindex(names)
+        names[i] = getfield(argnames, i)::Symbol
+    end
+    (names, parameters[4])
+end
+
+# The generated function a loaded image compiled for the program `f` names.
+Base.@nospecializeinfer function _image_program(@nospecialize(f::RuntimeGeneratedFunction))
+    tables = @atomic :acquire _LOADED_IMAGE_PROGRAMS.tables
+    isempty(tables) && return nothing
+    key = _image_program_key(f)
+    for table in tables
+        native = get(table.functions, key, nothing)
+        # A caller whose world predates the image cannot call its function.
+        native !== nothing &&
+            applicable(RuntimeGeneratedFunctions.generated_callfunc, native) &&
+            return native
+    end
+    nothing
+end
+
+# Record, in the image being generated, its function for the program `f` names.
+Base.@nospecializeinfer function _record_image_program!(target::Module,
+        @nospecialize(f::RuntimeGeneratedFunction), @nospecialize(native))
+    @lock _LOADED_IMAGE_PROGRAMS.lock begin
+        Base.invokelatest(isdefined, target, _IMAGE_PROGRAMS) ||
+            Core.eval(target, :(const $_IMAGE_PROGRAMS = $(_ImagePrograms(Dict{Any,Any}()))))
+        table = Base.invokelatest(getglobal, target, _IMAGE_PROGRAMS)::_ImagePrograms
+        table.functions[_image_program_key(f)] = native
+    end
+    nothing
+end
+
+# Record, in the image being generated, a closure type `_kernel_shared_closure`
+# shares, and find the one a loaded image recorded for a closure of `home`.
+Base.@nospecializeinfer function _record_image_closure!(target::Module, @nospecialize(key),
+                                                        @nospecialize(entry))
+    @lock _LOADED_IMAGE_PROGRAMS.lock begin
+        Base.invokelatest(isdefined, target, _IMAGE_PROGRAMS) ||
+            Core.eval(target, :(const $_IMAGE_PROGRAMS = $(_ImagePrograms(Dict{Any,Any}()))))
+        table = Base.invokelatest(getglobal, target, _IMAGE_PROGRAMS)::_ImagePrograms
+        entries = get!(() -> Any[], table.functions, key)
+        any(e -> e === entry, entries) || push!(entries, entry)
+    end
+    nothing
+end
+
+Base.@nospecializeinfer function _image_shared_closure(@nospecialize(key), home::Module,
+                                                       names::Set{Symbol})
+    tables = @atomic :acquire _LOADED_IMAGE_PROGRAMS.tables
+    for table in tables, entry in get(table.functions, key, ())
+        _kernel_same_scope(first(entry), home, names) && return entry
+    end
+    nothing
+end
+
+# A `Base.package_callbacks` entry, installed by `__init__`: registers the
+# programs table of each package image loaded after ReactiveKernels.
+function _register_image_programs(package::Base.PkgId)
+    mod = Base.root_module(package)
+    isdefined(mod, _IMAGE_PROGRAMS) || return nothing
+    table = getglobal(mod, _IMAGE_PROGRAMS)::_ImagePrograms
+    @lock _LOADED_IMAGE_PROGRAMS.lock begin
+        tables = @atomic :acquire _LOADED_IMAGE_PROGRAMS.tables
+        @atomic :release _LOADED_IMAGE_PROGRAMS.tables = push!(copy(tables), table)
+    end
+    nothing
+end
 
 # A plated kernel owns two compiled bodies but presents exactly the same
 # PreparedKernel API as every scalar kernel.  The batched input position is a
@@ -1527,9 +6203,10 @@ end
 # back to a non-axis sentinel.  Atomic `Ref(port)` inputs are excluded from the
 # axis candidates, so an array-valued atom cannot be mistaken for the plate
 # axis; but when every axis operand is bound and no axis candidate remains,
-# `_embedded_marker_candidates` admits array-valued HAVE ports (atomic ones
-# included) as backend markers, since only the marker TYPE — never its axis —
-# selects native vs. tensorized execution there.
+# `_embedded_marker_candidates` admits every HAVE port not provably scalar
+# (array-valued and ambiguous/`Any` ones, atomic ones included) as backend
+# markers, since only the marker TYPE — never its axis — selects native vs.
+# tensorized execution there.
 struct _DynamicEmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
     native::N
     tensorized::T
@@ -1545,6 +6222,16 @@ end
 # their own transparent runtime carrier.
 @inline _embedded_marker_values(x) = ()
 @inline _embedded_marker_values(x::NamedTuple) = values(x)
+# A view or other array wrapper must not hide its traced storage from dispatch.
+# An array whose parent has its own type is unwrapped storage. Deciding that by
+# type keeps the marker search inferable: a runtime `parent(x) === x` left the
+# array's own type in the result, so the search re-entered itself with the
+# same signature, and from Julia 1.12 inference gave up and dispatched every
+# kernel call's marker search at run time. Traced-ness is a property of the
+# type (`_requires_tensorized_marker`), so a same-typed parent adds nothing.
+@inline _embedded_marker_values(x::AbstractArray) = _embedded_parent_values(x, parent(x))
+@inline _embedded_parent_values(::A, ::A) where {A<:AbstractArray} = ()
+@inline _embedded_parent_values(x, parent) = (parent,)
 
 @inline function _embedded_axis_marker(value)
     _authored_plate_is_axis(value) && return value
@@ -1587,7 +6274,7 @@ end
 end
 
 @inline _batched_call(f::_ArrayFunctionPair, ops, args, marker) =
-    f.native(ops, args...)
+    _native_array_body_call(f.native, ops, args)
 
 """
     PreparedKernel
@@ -1596,7 +6283,7 @@ A small callable object holding the RGF-generated function, the positional
 `ops` tuple, and metadata (graph values in call/return order, the plan, and the
 lowered AST). Runtime invocation does not consult any planning logic.
 """
-struct PreparedKernel{F,O,IN,OUT,RR}
+struct PreparedKernel{F,O,IN,OUT,RR,S}
     f::F
     ops::O
     inputs::IN
@@ -1604,7 +6291,131 @@ struct PreparedKernel{F,O,IN,OUT,RR}
     plan::Plan
     ast::Expr
     lowered_recipes::RR
+    # The vectorized lowerings shared by every binding of the bound template
+    # this kernel instantiates (`_BoundVectorizations`, partial_evaluation.jl),
+    # or `nothing`. Never read on the call path.
+    rebinding::Any
 end
+
+# Assemble new prepared types without compiling a constructor for each one;
+# equivalent generated bodies and operation types can reuse their existing
+# specializations. Calls still dispatch on the exact prepared type.
+Base.@nospecializeinfer function _prepared_kernel(
+        @nospecialize(f), @nospecialize(ops::Tuple), @nospecialize(inputs::Tuple),
+        @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
+        @nospecialize(lowered_recipes::Tuple); exact_signature::Type = Nothing,
+        @nospecialize(rebinding = nothing))
+    _executed_prepared_kernel(f, _execution_source(ops), inputs, outputs, plan, ast,
+                              lowered_recipes, exact_signature, rebinding)
+end
+
+# The same, over an operation table that is already the execution copy
+# (`_execution_source`), as a rebinding keeps it (`_ExecutableTable`).
+Base.@nospecializeinfer function _executed_prepared_kernel(
+        @nospecialize(f), @nospecialize(ops::Tuple), @nospecialize(inputs::Tuple),
+        @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
+        @nospecialize(lowered_recipes::Tuple), exact_signature::Type,
+        @nospecialize(rebinding))
+    T = PreparedKernel{typeof(f),typeof(ops),typeof(inputs),typeof(outputs),
+                       typeof(lowered_recipes),exact_signature}
+    _kernel_new_instance(T, (f, ops, inputs, outputs, plan, ast,
+                             lowered_recipes, rebinding))::PreparedKernel
+end
+
+# The `exact_signature` a prepared kernel was built with.
+_exact_signature(@nospecialize(kernel::PreparedKernel)) =
+    (typeof(kernel)::DataType).parameters[6]
+
+# A caller that guarantees execution through a latest-world entry may use the
+# authored closure directly. Ordinary prepare retains its world-age fallback.
+_kernel_latest_source(x) = x
+_kernel_latest_source(xs::Tuple) = map(_kernel_latest_source, xs)
+
+# A generated kernel whose public entry guarantees a latest-world barrier can
+# carry that guarantee into literal source calls within its native recipe
+# bodies and retained arm plans. Only the native argument of a source-op
+# construction is visited; the tensorized body and quoted source/provenance
+# expressions remain unchanged.
+function _kernel_latest_native_source_literals(ex)
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert) && return ex
+    args = map(_kernel_latest_native_source_literals, ex.args)
+    if ex.head === :call && length(args) >= 4 &&
+       args[1] == GlobalRef(@__MODULE__, :_KernelSourceOp)
+        args[4] = _kernel_latest_literal_calls(args[4])
+    end
+    Expr(ex.head, args...)
+end
+
+function _kernel_latest_literal_calls(ex)
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert) && return ex
+    args = map(_kernel_latest_literal_calls, ex.args)
+    if ex.head === :call && !isempty(args) && args[1] isa QuoteNode &&
+       args[1].value isa Union{_KernelSourceOp,_KernelSourceFunction,_KernelBranch,_KernelSplit}
+        args[1] = QuoteNode(_kernel_latest_source(args[1].value))
+    end
+    result = Expr(ex.head, args...)
+    _kernel_is_branch_arm_graph(result) ?
+        Expr(:call, GlobalRef(@__MODULE__, :_kernel_latest_arm_plan), result) : result
+end
+function _kernel_latest_source(f::_KernelSourceFunction{F,RF,C}) where {F,RF,C}
+    _KernelSourceFunction{F,RF,C,Val{:latest_world}}(
+        f.f, f.runtime_f, f.captures)
+end
+function _kernel_latest_source(op::_KernelSourceOp)
+    _KernelSourceOp(Val(kernel_sourceop_token(op)), Val(kernel_sourceop_form(op)),
+        _kernel_latest_source(op.f), _kernel_latest_source(op.tensor_f),
+        _kernel_latest_source(op.ignored_throws), op.call_identity)
+end
+function _kernel_latest_source(split::_KernelSplit)
+    _KernelSplit(Val(_kernel_split_spec(split)),
+        _kernel_latest_source(split.call),
+        map(_kernel_latest_source, split.wholes),
+        map(_kernel_latest_source, split.splits),
+        _kernel_latest_source(split.root))
+end
+function _kernel_latest_source(branch::_KernelBranch{CI,TI,EI}) where {CI,TI,EI}
+    _KernelBranch(Val(CI), Val(TI), Val(EI),
+        _kernel_latest_source(branch.call),
+        _kernel_latest_source(branch.condition),
+        _kernel_latest_source(branch.then_arm),
+        _kernel_latest_source(branch.else_arm),
+        _kernel_latest_arm_plan(branch.then_spec),
+        _kernel_latest_arm_plan(branch.else_spec))
+end
+
+# Arm graphs are executable metadata: partial evaluation or shared-arm
+# lowering can use them instead of the original closure. Preserve the same
+# caller guarantee there, or each newly exposed source call would regain a
+# runtime method query. Keep the exact selection and leave the graph untouched.
+function _kernel_latest_arm_plan(spec)
+    spec === nothing && return nothing
+    p = _plate_arm_plan(spec)
+    recipes = Recipe[Recipe(r.id, r.inputs, r.outputs, _kernel_latest_source(r.op),
+        r.cost, r.cse_key, r.effectful, r.source) for r in p.recipes]
+    _partial_subplan(p, p.have, p.want, recipes)
+end
+function _kernel_latest_source(op::_AuthoredPlateOp{K,A}) where {K,A}
+    kernel = _kernel_latest_prepared(op.kernel)
+    _AuthoredPlateOp{typeof(kernel),A}(kernel, op.axis_checks)
+end
+function _kernel_latest_prepared(kernel::PreparedKernel{F,O,IN,OUT,RR,S}) where {F,O,IN,OUT,RR,S}
+    _prepared_kernel(kernel.f, map(_kernel_latest_source, kernel.ops),
+                     kernel.inputs, kernel.outputs, kernel.plan, kernel.ast,
+                     kernel.lowered_recipes; exact_signature = S)
+end
+
+# A prepared kernel is statically untraced. `Recipe.cse_key` provenance tuples
+# carry output `Type`s as data (authoring.jl `_kernel_provenance_key`), and
+# ReactantCore's `::Type` `is_traced` early-out covers only the 1-arg call
+# while the structural recursion is 2-arg, so walking a kernel reaches type
+# internals and throws `type DataType has no field var` (upstream ReactantCore
+# gap). Kernels are immutable compile-time metadata built before tracing and
+# never contain tracers; `@trace` still takes the traced path when a loop's
+# DATA operands are traced.
+ReactantCore.is_traced(::PreparedKernel) = false
+ReactantCore.is_traced(::PreparedKernel, ::Base.IdSet) = false
 
 # Partial evaluation deliberately stores hoisted values in the prepared
 # operation tuple so the public residual kernel has only its unbound HAVE
@@ -1612,22 +6423,73 @@ end
 # receive array-valued constants as explicit inactive operands: capturing them
 # in the callable can either turn a whole dataset into source-level literals or
 # obscure its read-only activity. This compact call boundary replaces only
-# array-valued `_BoundConstant`s with trailing hidden operands. The public
+# array-containing `_BoundConstant`s with trailing hidden operands. The public
 # PreparedKernel is unchanged; ordinary execution and inspection retain the
 # residual ABI.
 struct _ExternalBoundArraySlot{I} end
 
-struct _ExternalizedBoundArrayCall{F,O,I}
+struct _ExternalizedBoundArrayCall{F,O,I,H,C}
     f::F
     ops::O
 end
 
-@generated function (call::_ExternalizedBoundArrayCall{F,O,I})(
-        args::Vararg{Any,N}) where {F,O,I,N}
-    external_count = length(I)
+# Build a call to the existing body, with `args` its complete positional
+# operands, without the RGF vararg wrapper, which packs all operands into one
+# tuple. Keeping readonly structured operands beside live storage in that
+# temporary obscures their activity. Past 32 operands (`max_tuple_splat`) the
+# wrapper's splat also stays a dynamic `Core._apply_iterate` over a heap tuple,
+# which allocates on every call and which native Reverse rejects when constant
+# arrays share it with active storage. This changes only the call boundary, not
+# the generated model body or its operands.
+function _native_body_call_expr(::Type{F}, f, args) where {F}
+    if F <: RuntimeGeneratedFunctions.RuntimeGeneratedFunction
+        return :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
+            $f, $(args...)))
+    elseif F <: _PrecompileWarmFunction
+        # Preserve latest-world execution while building a consumer image;
+        # after loading it, enter the wrapped generated body directly.
+        direct = :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
+            getfield($f, :f), $(args...)))
+        return :(ccall(:jl_generating_output, Cint, ()) == 0 ?
+                 $direct : $f($(args...)))
+    end
+    :($f($(args...)))
+end
+
+# A differentiated call boundary enters a warm wrapper's generated body
+# directly. The image-build branch above hands the operation table to a
+# latest-world dynamic call, which boxes a copy of the table read from the
+# differentiated callable. Once the table holds heap references, such as a
+# captured `Ref` or array, plain Enzyme Reverse can no longer prove that
+# callable read-only. Enzyme compiles in the caller's world, so differentiating
+# while an image is being built requires the context method to be visible there.
+_differentiated_body_call_expr(::Type{F}, f, args) where {F} =
+    _native_body_call_expr(F, f, args)
+_differentiated_body_call_expr(::Type{<:_PrecompileWarmFunction}, f, args) =
+    :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
+        getfield($f, :f), $(args...)))
+
+# Enter the existing generated body with positional operands. Together with
+# the inline prepared call, this keeps captured readonly operations out of a
+# temporary aggregate that ordinary Reverse otherwise treats as writable.
+@inline @generated function _native_array_body_call(f::F, ops, args::A) where {F,A<:Tuple}
+    forwarded = [:(getfield(args, $index)) for index in 1:fieldcount(A)]
+    _native_body_call_expr(F, :f, Any[:ops, forwarded...])
+end
+
+@generated function (call::_ExternalizedBoundArrayCall{F,O,I,H,C})(
+        args::Vararg{Any,N}) where {F,O,I,H,C,N}
+    # Replaced slots and trailing operands differ in a rewritten body:
+    # records contribute each array leaf, while numeric slots become literals.
+    external_count = C
     public_count = N - external_count
     public_count >= 0 || return :(throw(ArgumentError(
         "externalized bound-array call is missing hidden operands")))
+    if H
+        forwarded = Any[:(getfield(args,$index)) for index in 1:N]
+        return _native_body_call_expr(
+            F, :(getfield(call,:f)), Any[:(getfield(call,:ops)), forwarded...])
+    end
     replacements = Dict(index => slot for (slot, index) in enumerate(I))
     operations = Any[]
     for index in 1:fieldcount(O)
@@ -1642,19 +6504,26 @@ end
     end
     public_args = Any[
         :(getfield(args, $index)) for index in 1:public_count]
-    :(getfield(call, :f)(($(operations...),), $(public_args...)))
+    _native_body_call_expr(
+        F, :(getfield(call, :f)), Any[Expr(:tuple, operations...), public_args...])
 end
 
 """
     _externalize_bound_arrays(kernel; min_elements = 0) -> (call, values)
 
-Return an internal backend call plus the array-valued partial-evaluation
+Return an internal backend call plus the array-containing partial-evaluation
 constants it expects as trailing hidden operands. If the kernel contains no
 such constants, return the kernel itself and an empty tuple. Scalar and other
 small static constants remain in the operation table; `min_elements` lets a
 backend keep arrays below that element count in the table as well, so a small
 static dataset stays a compiler literal it can fold rather than a runtime
-operand it must read. By default every array is externalized.
+operand it must read. By default every array is externalized. A tuple or named
+tuple containing arrays crosses without capturing the arrays in the
+differentiated callable, and it crosses when any of its array leaves meets
+`min_elements`. When the compiled body reads the operation table at literal
+positions, each array leaf crosses as its own operand (depth-first order) and
+the body rebuilds the tuple where it was read, with non-array leaves as
+literals; otherwise the value crosses as one structured operand.
 
 This is a backend ABI adapter, not a different model boundary: `kernel` keeps
 its original public inputs, and `call(public_args..., values...)` is exactly
@@ -1662,17 +6531,27 @@ equivalent to `kernel(public_args...)`.
 
 With `materialize_view_copies`, a bound `SubArray` crosses as an owning copy
 (`collect`) of its elements instead of the prebuilt view. A `SubArray`-typed
-`Constant` operand defeats reverse-mode Enzyme static activity analysis (it
+`Constant` operand defeats static-activity analysis under reverse-mode
+automatic differentiation (it
 unboxes the parent pointer into an active slot), while an owning array with
 identical contents differentiates cleanly (snag plain-enzyme-rev-3dc5d563).
+
+With `externalize_scalars`, bound numeric values also leave the callable's
+operation table. They follow the literal rebuilding rule above for a rewritten
+structured body, and otherwise cross as inactive operands. Leaving their fields
+in the callable can defeat native Enzyme's readonly analysis when it
+reconstructs that callable beside active values; moving the same fixed values
+out of those fields preserves the public kernel boundary.
 """
 function _externalize_bound_array_call(f, ops;
                                        min_elements::Integer = 0,
-                                       materialize_view_copies::Bool = false)
+                                       materialize_view_copies::Bool = false,
+                                       externalize_scalars::Bool = false)
     positions = Tuple(
         index for (index, op) in pairs(ops)
-        if op isa _BoundConstant && op.value isa AbstractArray &&
-           length(op.value) >= min_elements)
+        if op isa _BoundConstant &&
+           (_has_external_bound_array(op.value, min_elements) ||
+            externalize_scalars && op.value isa Number))
     isempty(positions) && return nothing, ()
     values = Tuple(
         _externalize_bound_value(ops[index].value, materialize_view_copies)
@@ -1682,16 +6561,119 @@ function _externalize_bound_array_call(f, ops;
         slot === nothing ? ops[index] :
             _ExternalBoundArraySlot{slot}()
     end
+    structured = any(value -> value isa Union{Tuple,NamedTuple} ||
+                              _bound_record(value), values)
+    external_body = structured ?
+        _externalize_bound_array_body(f, positions, values) : nothing
+    callable = external_body === nothing ? f : external_body
+    external_values = external_body === nothing ? values : _bound_array_leaves(values)
     call = _ExternalizedBoundArrayCall{
-        typeof(f),typeof(stripped),positions}(f, stripped)
-    call, values
+        typeof(callable),typeof(stripped),positions,
+        external_body !== nothing,length(external_values)}(callable, stripped)
+    call, external_values
 end
+
+# A rewritten body takes every array leaf of a structured bound value as its
+# own operand and rebuilds the tuple or named tuple where the table was read;
+# non-array leaves stay literals of that rebuild. A multi-field structure
+# crossing as one operand beside a view of the active input fails native
+# Enzyme's static activity analysis, while its leaves cross cleanly (snag
+# `interpolated-err-41772e14`).
+_bound_array_leaves(values::Tuple) =
+    Tuple(Iterators.flatten(map(_bound_array_leaves, values)))
+_bound_array_leaves(value::NamedTuple) = _bound_array_leaves(Tuple(value))
+_bound_array_leaves(value::AbstractArray) = (value,)
+_bound_array_leaves(value) = _bound_record(value) ?
+    _bound_array_leaves(_bound_record_fields(value)) : ()
+
+# A bound immutable struct whose fields hold arrays (a model's wrapper around
+# a data matrix, say) is a record: its array leaves leave the callable like a
+# named tuple's, and the body rebuilds it with `new` from the same field
+# values. Left in the operation table, the arrays are part of the callable,
+# whose readonly proof native Reverse cannot then always complete.
+_bound_record(value) = _bound_record_type(typeof(value)) &&
+    _has_external_bound_array(_bound_record_fields(value), 0)
+_bound_record_type(T::DataType) = isconcretetype(T) && isstructtype(T) &&
+    !ismutabletype(T) && fieldcount(T) > 0 &&
+    !(T <: Union{Tuple,NamedTuple,AbstractArray,Number,Function,Type,
+                 Module,Symbol,AbstractString})
+_bound_record_type(T) = false
+_bound_record_fields(value) =
+    ntuple(i -> getfield(value, i), Val(fieldcount(typeof(value))))
+
+function _bound_rebuild_expr(value::NamedTuple, ports, next::Ref{Int})
+    fields = Any[_bound_rebuild_expr(v, ports, next) for v in value]
+    :(NamedTuple{$(keys(value))}(($(fields...),)))
+end
+_bound_rebuild_expr(value::Tuple, ports, next::Ref{Int}) =
+    Expr(:tuple, Any[_bound_rebuild_expr(v, ports, next) for v in value]...)
+_bound_rebuild_expr(::AbstractArray, ports, next::Ref{Int}) =
+    ports[next[] += 1]
+function _bound_rebuild_expr(value, ports, next::Ref{Int})
+    _bound_record(value) || return QuoteNode(value)
+    fields = Any[_bound_rebuild_expr(v, ports, next) for v in _bound_record_fields(value)]
+    Expr(:new, typeof(value), fields...)
+end
+
+# A compiled body whose operation-table accesses are literal can load hidden
+# bound operands directly. This changes only its internal argument boundary;
+# every loop, branch and arithmetic expression stays intact. Rebuilding an
+# array-containing operation tuple beside an active argument can obscure its
+# activity before the tuple is optimized away. Source transforms that inspect
+# or dynamically access the table keep the reconstruction path above.
+_externalize_bound_array_body(f, positions, values) = nothing
+function _externalize_bound_array_body(
+        f::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction,
+                 _PrecompileWarmFunction}, positions, values)
+    ast = deepcopy(RuntimeGeneratedFunctions.get_expression(f))
+    operands = Symbol[]
+    loads = Dict{Int,Any}()
+    for (index, value) in zip(positions, values)
+        ports = [gensym(:_rk_bound_operand)
+                 for _ in 1:length(_bound_array_leaves(value))]
+        append!(operands, ports)
+        loads[index] = _bound_rebuild_expr(value, ports, Ref(0))
+    end
+    valid = true
+    function replace_load(node)
+        if node === _OPS_ARG
+            valid = false
+            return node
+        end
+        node isa Expr || return node
+        node.head === :quote && return node
+        if node.head === :call && length(node.args) == 1
+            slot = _operation_slot(node.args[1])
+            haskey(loads,slot) && return loads[slot]
+        end
+        slot = _operation_slot(node)
+        if slot !== nothing
+            haskey(loads,slot) && (valid = false)
+            return node
+        end
+        Expr(node.head,map(replace_load,node.args)...)
+    end
+    body = replace_load(ast.args[2])
+    valid || return nothing
+    append!(ast.args[1].args, operands)
+    ast.args[2] = body
+    compile(ast)
+end
+
+_has_external_bound_array(value, min_elements) =
+    _bound_record_type(typeof(value)) &&
+    _has_external_bound_array(_bound_record_fields(value), min_elements)
+_has_external_bound_array(value::AbstractArray, min_elements) =
+    length(value) >= min_elements
+_has_external_bound_array(value::Union{Tuple,NamedTuple}, min_elements) =
+    any(v -> _has_external_bound_array(v, min_elements), value)
 
 function _externalize_bound_arrays(kernel::PreparedKernel;
                                    min_elements::Integer = 0,
-                                   materialize_view_copies::Bool = false)
+                                   materialize_view_copies::Bool = false,
+                                   externalize_scalars::Bool = false)
     call, values = _externalize_bound_array_call(
-        kernel.f, kernel.ops; min_elements, materialize_view_copies)
+        kernel.f, kernel.ops; min_elements, materialize_view_copies, externalize_scalars)
     call === nothing ? (kernel, ()) : (call, values)
 end
 
@@ -1709,6 +6691,11 @@ function _externalize_bound_value(value::AbstractArray,
     axes(collected) == axes(value) || return value
     collected
 end
+
+_externalize_bound_value(value, materialize_view_copies::Bool) = value
+_externalize_bound_value(value::Union{Tuple,NamedTuple},
+                         materialize_view_copies::Bool) =
+    map(v -> _externalize_bound_value(v, materialize_view_copies), value)
 
 # Prepared RK kernels are compiler-owned program structure when used as recipe
 # operations. Flatten them automatically so ordinary composition of `plate`
@@ -1772,7 +6759,8 @@ function _embedded_marker_candidates(p::Plan)
         for position in positions
             input = recipe.inputs[position]
             roots = sort!(collect(get(
-                dependencies, canon_id(p.graph, input.id), Set{Int}())))
+                dependencies, canon_id(p.graph, input.id), Set{ValueId}()));
+                by = root -> root_positions[root])
             for root in roots
                 position = root_positions[root]
                 position in candidates || push!(candidates, position)
@@ -1784,14 +6772,19 @@ function _embedded_marker_candidates(p::Plan)
         # HAVE port: every axis operand is bound (`bound=`), so the plate axis is
         # a compile-time constant baked into both bodies (the native body derives
         # its own axis; the tensorized body takes the marker-less axis fallback).
-        # Backend selection still needs a runtime marker, so admit any
-        # array-valued active HAVE port as one — including a whole-vector
-        # `Ref`-captured parameter that is atomic for broadcasting yet remains a
-        # live array HAVE. Only the marker TYPE is consulted (`_batched_call`
-        # dispatches native vs. tensorized on it), never its axis, so an atomic
-        # array admitted here cannot be mistaken for the plate axis.
+        # Backend selection still needs a runtime marker, so admit every active
+        # HAVE port the static axis class does not PROVE scalar (`:not_axis`) —
+        # including a whole-vector `Ref`-captured parameter that is atomic for
+        # broadcasting yet remains a live array HAVE, and an untyped (`Any`)
+        # port whose live values are arrays. Only the marker TYPE is consulted
+        # (`_batched_call` dispatches native vs. tensorized on it), never its
+        # axis, so an admitted port can never be mistaken for the plate axis;
+        # the dynamic runtime selection skips scalar values. Only provably
+        # scalar live ports (e.g. `::Float64`) use the non-axis native sentinel;
+        # a traced scalar is detected separately at the call boundary.
         for (position, input) in enumerate(p.have)
-            valtype(input) <: AbstractArray && push!(candidates, position)
+            _static_plate_axis_class(valtype(input)) === :not_axis ||
+                push!(candidates, position)
         end
     end
     Tuple(candidates)
@@ -1812,12 +6805,18 @@ end
 
 @inline function (k::ReplicatedKernel{B})(args...) where {B}
     length(args) == length(k.inputs) || throw(MethodError(k, args))
-    _replica_call(k, args, getfield(args, first(B)))
+    marker = _dynamic_tensorized_marker(args)
+    _replica_call(k, args, marker === nothing ? getfield(args, first(B)) : marker)
 end
 
 inputs(k::ReplicatedKernel) = k.inputs
 outputs(k::ReplicatedKernel) = k.outputs
 code_expr(k::ReplicatedKernel) = code_expr(k.target)
+
+# Same statically-untraced contract as `PreparedKernel` above: the whole
+# object is captured by the `@trace` loop in `_replica_call`.
+ReactantCore.is_traced(::ReplicatedKernel) = false
+ReactantCore.is_traced(::ReplicatedKernel, ::Base.IdSet) = false
 
 function Base.show(io::IO, k::ReplicatedKernel{B}) where {B}
     names = Tuple(k.inputs[i].name for i in B)
@@ -1830,6 +6829,57 @@ _replica_rank(::Type{T}) where {T<:Number} = 0
 _replica_rank(::Type{T}) where {T<:AbstractArray} = ndims(T)
 _replica_rank(::Type{T}) where {T} = throw(ArgumentError(
     "replica batched ports must be Numbers or AbstractArrays; got $T"))
+
+# Known numeric ranks retain their validation. Untyped and record boundaries
+# derive their layout from the runtime container, without narrowing the scalar
+# graph's HAVE types or inventing a second mathematical graph. A declared rank
+# is known whatever the element type: `AbstractVector` checks like
+# `Vector{Float64}` (an element type bound outside the `<:` skipped the check
+# for it; snag rk-declared-rank-317aa725).
+_replica_expected_rank(::Type{T}) where {T<:Number} = 1
+_replica_expected_rank(::Type{<:AbstractArray{<:Any,N}}) where {N} = N + 1
+_replica_expected_rank(::Type{<:AbstractArray}) = nothing
+_replica_expected_rank(::Type{Any}) = nothing
+_replica_expected_rank(::Type{T}) where {T<:Union{Tuple,NamedTuple}} = nothing
+_replica_expected_rank(::Type{T}) where {T} = throw(ArgumentError(
+    "position-batched ports must be numeric, tuple or named-tuple values; got $T"))
+
+@inline function _replica_batch_count(arg::AbstractArray, ::Type{T}) where {T}
+    expected = _replica_expected_rank(T)
+    ndims(arg) > 0 || throw(DimensionMismatch("a position batch needs a trailing axis"))
+    expected === nothing || ndims(arg) == expected || throw(DimensionMismatch(
+        "position-batched input has rank $(ndims(arg)); expected $expected"))
+    Base.require_one_based_indexing(arg)
+    size(arg, ndims(arg))
+end
+@inline _replica_field_types(::Type{Any}, arg) = map(_ -> Any, arg)
+@inline _replica_field_types(::Type{T}, arg::Tuple) where {T<:Tuple} =
+    isconcretetype(T) ? fieldtypes(T) : map(_ -> Any, arg)
+@inline function _replica_field_types(::Type{T}, arg::NamedTuple{K}) where
+        {K,T<:NamedTuple}
+    isconcretetype(T) || return map(_ -> Any, arg)
+    fieldnames(T) == K || throw(ArgumentError("position record fields differ from the scalar port"))
+    NamedTuple{K}(fieldtypes(T))
+end
+@inline function _replica_batch_count(arg::Union{Tuple,NamedTuple}, ::Type{T}) where {T}
+    isempty(arg) && throw(ArgumentError("a position record needs at least one batched leaf"))
+    types = _replica_field_types(T, arg)
+    length(types) == length(arg) || throw(ArgumentError(
+        "position tuple length differs from the scalar port"))
+    counts = map(_replica_batch_count, arg, types)
+    count = first(counts)
+    all(==(count), counts) || throw(DimensionMismatch(
+        "position record leaves disagree on batch length"))
+    count
+end
+_replica_batch_count(arg, ::Type{T}) where {T} = throw(ArgumentError(
+    "position batches need arrays or tuple/named-tuple trees of arrays; got $(typeof(arg))"))
+
+_replica_output_type(::Type{Any}) = true
+_replica_output_type(::Type{T}) where {T<:Union{Number,AbstractArray}} = true
+_replica_output_type(::Type{T}) where {T<:Union{Tuple,NamedTuple}} =
+    !isconcretetype(T) || all(_replica_output_type, fieldtypes(T))
+_replica_output_type(::Type) = false
 
 function _replica_batch_indices(boundary, batched)
     names = Tuple(batched isa Symbol ? (batched,) : batched)
@@ -1852,11 +6902,11 @@ function _replica(target, batched)
     boundary = inputs(target)
     indices = _replica_batch_indices(boundary, batched)
     input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
-    foreach(_replica_rank, input_types.parameters)
+    foreach(_replica_expected_rank, input_types.parameters)
     output_types = Tuple{(valtype(value) for value in outputs(target))...}
-    all(type -> type <: Union{Number,AbstractArray}, output_types.parameters) ||
+    all(_replica_output_type, output_types.parameters) ||
         throw(ArgumentError(
-            "replica outputs must be Numbers or AbstractArrays; got $(output_types.parameters)"))
+            "replica outputs must be numeric or tuple/named-tuple trees; got $(output_types.parameters)"))
     ReplicatedKernel{indices,input_types,output_types,typeof(target),
                      typeof(boundary),typeof(outputs(target))}(
         target, boundary, outputs(target))
@@ -1880,10 +6930,231 @@ primitive.
 """
 replica(kernel::PreparedKernel; batched) = _replica(kernel, batched)
 
+"""
+    GraphReplicatedKernel
+
+Native position-batched lowering for a straight-line scalar plan. Shared-only
+recipes are evaluated once above the position loop; recipes depending on a
+batched HAVE port execute once per position. The scalar `PreparedKernel` is
+retained as the mathematical authority and as the fallback for array-compiler
+batching.
+"""
+struct GraphReplicatedKernel{B,BT,OT,F,O,P,K,IN,OUT}
+    target::K
+    native::F
+    ops::O
+    plan::P
+    ast::Expr
+    inputs::IN
+    outputs::OUT
+end
+
+function _replicated_backend_call end
+
+@inline function (k::GraphReplicatedKernel{B})(args...) where {B}
+    length(args) == length(k.inputs) || throw(MethodError(k, args))
+    if _dynamic_tensorized_marker(args) !== nothing
+        return _replicated_backend_call(k, args)
+    end
+    k.native(k.ops, args...)
+end
+
+inputs(k::GraphReplicatedKernel) = k.inputs
+outputs(k::GraphReplicatedKernel) = k.outputs
+code_expr(k::GraphReplicatedKernel) = k.ast
+plan(k::GraphReplicatedKernel) = k.plan
+
+function Base.show(io::IO, k::GraphReplicatedKernel{B}) where {B}
+    names = Tuple(k.inputs[i].name for i in B)
+    print(io, "GraphReplicatedKernel(batched=", names, ", target=")
+    show(io, k.target)
+    print(io, ")")
+end
+
+# Like the other construction helpers, these compile once rather than once per
+# kernel type: specialized, a large program's reader compiled its constructors
+# for seconds each (snag `compiled-reader-be3cadbb`).
+Base.@nospecializeinfer function _replica_graph(@nospecialize(target::PreparedKernel),
+                                                @nospecialize(batched))
+    plan = getfield(target, :plan)::Plan
+    boundary = getfield(target, :inputs)::Tuple
+    wants = getfield(target, :outputs)::Tuple
+    indices = _replica_batch_indices(boundary, batched)
+    _replicated_graph_plan(plan) || throw(ArgumentError(
+        "scalar kernel requires the complete-callable replica fallback"))
+    ast, ops = _lower_replicated_with_ops(plan; batched)
+    ops = _execution_source(ops)
+    native = compile(ast)
+    input_types = Tuple{Any[valtype(boundary[i]) for i in indices]...}
+    output_types = Tuple{Any[valtype(value) for value in wants]...}
+    T = GraphReplicatedKernel{indices,input_types,output_types,
+                              typeof(native),typeof(ops),Plan,
+                              typeof(target),typeof(boundary),typeof(wants)}
+    _kernel_new_instance(T, (target, native, ops, plan, ast, boundary, wants))
+end
+
+function replica_graph(kernel::PreparedKernel; batched)
+    _replica_graph(kernel, batched)
+end
+
+# Reuse only the final stacked buffers; the owning surface has no mutable
+# cache. Position intermediates use lane slots (`_lower_replicated_with_ops`).
+_replicated_reuse(cache, value, count) = _replicated_output(value, count)
+@inline function _replicated_reuse(cache::AbstractArray, value::Number, count)
+    cache isa Vector{typeof(value)} && length(cache) == count ?
+        cache : _replicated_output(value, count)
+end
+@inline function _replicated_reuse(cache::AbstractArray, value::Array{T,N}, count) where {T,N}
+    cache isa Array{T,N+1} && size(cache) == (size(value)..., count) ?
+        cache : _replicated_output(value, count)
+end
+@inline function _replicated_reuse(cache::AbstractArray, value::SubArray{T,N,P}, count) where {T,N,P<:Array}
+    cache isa Array{T,N+1} && size(cache) == (size(value)..., count) ?
+        cache : _replicated_output(value, count)
+end
+@inline function _replicated_reuse(cache::Tuple, value::Tuple, count)
+    length(cache) == length(value) || return _replicated_output(value, count)
+    map((out, item) -> _replicated_reuse(out, item, count), cache, value)
+end
+@inline function _replicated_reuse(cache::NamedTuple{K}, value::NamedTuple{L}, count) where {K,L}
+    K == L || return _replicated_output(value, count)
+    map((out, item) -> _replicated_reuse(out, item, count), cache, value)
+end
+_replicated_destination_type(::Type) = Any
+_replicated_destination_type(::Type{T}) where {T<:Number} =
+    isconcretetype(T) ? Vector{T} : Any
+_replicated_destination_type(::Type{Array{T,N}}) where {T,N} = Array{T,N+1}
+_replicated_destination_type(::Type{<:SubArray{T,N,P}}) where {T,N,P<:Array} = Array{T,N+1}
+function _replicated_destination_type(::Type{T}) where {T<:Tuple}
+    isconcretetype(T) || return Any
+    Tuple{map(_replicated_destination_type, fieldtypes(T))...}
+end
+function _replicated_destination_type(::Type{T}) where {T<:NamedTuple}
+    isconcretetype(T) || return Any
+    leaves = Tuple{map(_replicated_destination_type, fieldtypes(T))...}
+    # NamedTuple's tuple parameter is invariant: a predicted Any field would
+    # reject a concrete custom-array destination. Keep such records broad.
+    isconcretetype(leaves) ? NamedTuple{fieldnames(T),leaves} : Any
+end
+
+@inline @generated function _replicated_output!(slot, value::V, count) where {V}
+    # Only the scalar value's structural type determines this assertion, never
+    # a data length or shape. Cache slots still accept later shapes/types, and
+    # custom `similar` results retain the broad fallback. Emit the type itself
+    # so nested native records stay concrete before the retained position loop.
+    destination = _replicated_destination_type(V)
+    quote
+        output = _replicated_reuse(slot[], value, count)
+        slot[] = output
+        output::$destination
+    end
+end
+
+# An array of concrete numeric records cannot hide an array that aliases an
+# output. Keep the outer-array check, and walk elements when their type leaves
+# room for a nested array (including abstract fields and custom records).
+# The answer depends on the type alone, so the walk runs once per type, when a
+# caller compiles, and the predicate is a constant there. Walked at run time,
+# `any` over `fieldtypes(T)`, a tuple of `DataType` values, dispatched on every
+# field at every call: 17 % of a borrowed population read whose plate cells
+# are records (`_lane_cell_take!`, snag lane-cell-take-e-45c66e49). An element
+# type with no values (`Union{}`) holds no array.
+_replicated_type_may_contain_array(::Type) = true
+_replicated_type_may_contain_array(::Type{<:Number}) = false
+_replicated_type_may_contain_array(::Type{Union{}}) = false
+function _replicated_type_may_contain_array(::Type{T}) where {T<:Union{Tuple,NamedTuple}}
+    isconcretetype(T) || return true
+    any(_replicated_type_may_contain_array, fieldtypes(T))
+end
+@generated _replicated_may_contain_array(::Type{T}) where {T} =
+    _replicated_type_may_contain_array(T)
+
+# These walks run on every borrowed call, over every input. They unroll tuples
+# by their type and loop over arrays, so the walk allocates nothing: `any` with
+# a closure over a heterogeneous tuple dispatched and boxed at every element
+# (over a million allocations per call over a ragged population design, snag
+# reuse-readers-al-25b23112).
+function _replicated_alias(cache::AbstractArray, arg::AbstractArray)
+    Base.mightalias(cache, arg) && return true
+    _replicated_may_contain_array(eltype(arg)) || return false
+    for item in arg
+        _replicated_alias(cache, item) && return true
+    end
+    false
+end
+_replicated_alias(cache::AbstractArray, arg::NamedTuple) =
+    _replicated_alias(cache, values(arg))
+_replicated_alias(cache::AbstractArray, arg::Tuple) = _replicated_alias_any(cache, arg)
+_replicated_alias(cache, arg) = false
+@generated function _replicated_alias_any(cache, items::Tuple)
+    foldr((i, rest) -> :(_replicated_alias(cache, getfield(items, $i)) || $rest),
+          1:fieldcount(items); init = false)
+end
+_replicated_aliases(cache::AbstractArray, args::Tuple) = _replicated_alias_any(cache, args)
+_replicated_aliases(cache::AbstractArray, args) = _replicated_alias(cache, args)
+_replicated_aliases(cache::NamedTuple, args) = _replicated_aliases(values(cache), args)
+@generated function _replicated_aliases(cache::Tuple, args)
+    foldr((i, rest) -> :(_replicated_aliases(getfield(cache, $i), args) || $rest),
+          1:fieldcount(cache); init = false)
+end
+_replicated_aliases(cache, args) = false
+
+struct BorrowedBatchedKernel{K,F,O,C}
+    target::K
+    native::F
+    ops::O
+    caches::C
+    ast::Expr
+end
+# One slot per stacked output, then one input lane per HAVE port, one recycled
+# lane buffer per WANT and one slot per position intermediate with a
+# destination form; `_lower_replicated_with_ops` returns the count.
+_borrowed_batch_caches(count::Int) = ntuple(_ -> Ref{Any}(nothing), count)
+Base.@nospecializeinfer _borrowed_batch(@nospecialize(target::GraphReplicatedKernel)) =
+    _borrowed_batch(target, getfield(target, :plan)::Plan, batched_ports(target))
+# `target` answers `inputs`, `outputs` and `plan` for the borrowed driver of `p`.
+Base.@nospecializeinfer function _borrowed_batch(@nospecialize(target), p::Plan,
+                                                 @nospecialize(batched))
+    ast, ops, slot_count = _lower_replicated_with_ops(p; batched, reuse=true)
+    native = compile(ast)
+    ops = _execution_source(ops)
+    caches = _borrowed_batch_caches(slot_count)
+    T = BorrowedBatchedKernel{typeof(target),typeof(native),typeof(ops),typeof(caches)}
+    _kernel_new_instance(T, (target, native, ops, caches, ast))
+end
+
+# A new native execution instance shares the read-only computation, not the
+# buffers of an earlier call. No planning, lowering or compilation occurs, and
+# the copy itself compiles once rather than once per reader type.
+Base.@nospecializeinfer Base.copy(@nospecialize(kernel::BorrowedBatchedKernel)) =
+    _kernel_new_instance(typeof(kernel), (getfield(kernel, :target), getfield(kernel, :native),
+        getfield(kernel, :ops), _borrowed_batch_caches(length(getfield(kernel, :caches))),
+        getfield(kernel, :ast)))
+
+@inline function (kernel::BorrowedBatchedKernel)(args::Vararg{Any,N}) where {N}
+    length(args) == length(inputs(kernel)) || throw(MethodError(kernel, args))
+    _dynamic_tensorized_marker(args) === nothing || throw(ArgumentError(
+        "reuse=true borrows native output buffers; compile the owning batch instead"))
+    for index in 1:length(outputs(kernel))
+        # A caller may feed an earlier borrowed output into the next call.
+        # Detach in that case so no input is modified through an output alias.
+        # The lane slots after the outputs never leave the call.
+        slot = kernel.caches[index]
+        _replicated_aliases(slot[], args) && (slot[] = nothing)
+    end
+    kernel.native(kernel.ops, kernel.caches, args...)
+end
+inputs(kernel::BorrowedBatchedKernel) = inputs(kernel.target)
+outputs(kernel::BorrowedBatchedKernel) = outputs(kernel.target)
+plan(kernel::BorrowedBatchedKernel) = plan(kernel.target)
+code_expr(kernel::BorrowedBatchedKernel) = kernel.ast
+
 @inline _replica_native_arg(arg, ::Type{T}, replica_index) where {T<:Number} =
     arg[replica_index]
 @inline _replica_native_arg(arg, ::Type{T}, replica_index) where {T<:AbstractArray} =
     copy(selectdim(arg, ndims(arg), replica_index))
+@inline _replica_native_arg(arg, ::Type{T}, index) where {T} =
+    _replicated_project(arg, index)
 
 @generated function _replica_native_inputs(
         ::Val{B}, ::Type{BT}, args::A, replica_index) where {B,BT,A}
@@ -1903,6 +7174,14 @@ end
 
 _replica_stack(values, ::Type{T}) where {T<:Number} = collect(values)
 _replica_stack(values, ::Type{T}) where {T<:AbstractArray} = stack(values)
+function _replica_stack(values, ::Type{T}) where {T}
+    isempty(values) && return _replicated_output(T, 0)
+    result = _replicated_output(first(values), length(values))
+    for (index, value) in enumerate(values)
+        _replicated_store!(result, index, value)
+    end
+    result
+end
 
 function _replica_native_outputs(results, ::Type{OT}) where {OT<:Tuple}
     output_types = OT.parameters
@@ -1916,17 +7195,7 @@ function _replica_native_outputs(results, ::Type{OT}) where {OT<:Tuple}
 end
 
 function _replica_call(k::ReplicatedKernel{B,BT,OT}, args, marker) where {B,BT,OT}
-    replica_count = size(marker, ndims(marker))
-    for index in B
-        arg = getfield(args, index)
-        expected_rank = _replica_rank(valtype(k.inputs[index])) + 1
-        ndims(arg) == expected_rank || throw(DimensionMismatch(
-            "replica port :$(k.inputs[index].name) has rank $(ndims(arg)); " *
-            "expected $expected_rank (scalar rank plus one trailing replica axis)"))
-        size(arg, ndims(arg)) == replica_count || throw(DimensionMismatch(
-            "replica port :$(k.inputs[index].name) has " *
-            "$(size(arg, ndims(arg))) replicas; expected $replica_count"))
-    end
+    replica_count = _replicated_validate_axes(args, Val(B), BT)
     results = map(1:replica_count) do replica_index
         scalar_args = _replica_native_inputs(
             Val(B), BT, args, replica_index)
@@ -1939,20 +7208,33 @@ end
 # `args` tuple into some RGF call shapes allocates even though the emitted
 # function itself is allocation-free. Keep the public call nongenerated so
 # reflection over it continues to accept abstract argument types.
-@generated function _prepared_call(k::PreparedKernel, args::A, ::Val{N}) where {A<:Tuple,N}
+@inline @generated function _prepared_call(k::PreparedKernel, args::A, ::Val{N}) where {A<:Tuple,N}
     positional = [:(getfield(args, $index)) for index in 1:N]
-    :(k.f(k.ops, $(positional...)))
+    :(Base.@inline k.f(k.ops, $(positional...)))
 end
 
-@inline function (k::PreparedKernel{F,O,IN,OUT})(
-        args::Vararg{Any,N}) where {F,O,IN,OUT,N}
+@inline function (k::PreparedKernel{F,O,IN,OUT,RR,S})(
+        args::Vararg{Any,N}) where {F,O,IN,OUT,RR,S,N}
     N == fieldcount(IN) || throw(MethodError(k, args))
+    S === Nothing || args isa S ||
+        _dynamic_tensorized_marker(args) !== nothing ||
+        _prepared_argument_types_error(k, S, args)
     _prepared_call(k, args, Val(N))
 end
 
-function _prepare(p::Plan, ast::Expr, ops::Tuple, recipes::Tuple)
-    f = compile(ast)
-    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, ast, recipes)
+@noinline _prepared_argument_types_error(k, ::Type{S}, args) where {S} =
+    throw(ArgumentError("this kernel was prepared from exemplar argument " *
+        "types $(Tuple(fieldtypes(S))) and was called with $(map(typeof, args)); " *
+        "prepare another kernel for the new types"))
+
+# The compiled body's type is new for every prepared kernel, so specializing
+# this assembly step on it would compile code that is never reused.
+Base.@nospecializeinfer function _prepare(p::Plan, ast::Expr,
+                                          @nospecialize(ops::Tuple),
+                                          @nospecialize(recipes::Tuple);
+                                          exact_signature::Type = Nothing)
+    _prepared_kernel(compile(ast), ops, Tuple(p.have), Tuple(p.want), p, ast,
+        recipes; exact_signature)
 end
 
 """
@@ -1978,8 +7260,8 @@ function _prepare_batched(p::Plan; batched, reduce = :+)
         input_index,batched_ports,reduce,typeof(native),typeof(tensorized)}(
             native, tensorized)
     ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
-    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast,
-                   Tuple(p.recipes))
+    _prepared_kernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast,
+                     Tuple(p.recipes))
 end
 
 # The optional MutatingFunctions extension uses one typed cache cell per
@@ -2029,8 +7311,13 @@ inputs, and a no-recipe plan returns its `have` value directly. Treat mutable
 results as borrowed values that may alias inputs or be overwritten by later
 calls. A kernel instance is therefore neither reentrant nor safe for concurrent
 calls; prepare one instance per independent caller.
+
+A kernel prepared from exemplar arguments (`prepare_nonallocating(spec,
+args...)`) is typed for exactly those argument types (`S`, a `Tuple` type);
+calling it with arguments of other types is an `ArgumentError`. `S` is
+`Nothing` for a kernel typed by its declared HAVE port types.
 """
-struct NonAllocatingKernel{F,O,C,A,IN,OUT}
+struct NonAllocatingKernel{F,O,C,A,IN,OUT,S}
     f::F
     ops::O
     caches::C
@@ -2041,17 +7328,47 @@ struct NonAllocatingKernel{F,O,C,A,IN,OUT}
     ast::Expr
 end
 
-@inline function (k::NonAllocatingKernel)(args...)
-    length(args) == length(k.inputs) || throw(MethodError(k, args))
-    k.f(args...)
+NonAllocatingKernel{S}(f::F, ops::O, caches::C, cache_apply::A, inputs::IN,
+                       outputs::OUT, plan::Plan, ast::Expr) where {F,O,C,A,IN,OUT,S} =
+    NonAllocatingKernel{F,O,C,A,IN,OUT,S}(f, ops, caches, cache_apply, inputs,
+                                          outputs, plan, ast)
+
+# Emit positional arguments explicitly: splatting the captured `args` tuple
+# into the RGF call allocates (one tuple box per call) even though the emitted
+# program itself is allocation-free. The body is entered without the RGF vararg
+# wrapper, whose own splat allocates per call past 32 HAVE ports
+# (`_native_body_call_expr`). Keep the public call nongenerated so reflection
+# over it continues to accept abstract argument types.
+@generated function _nonallocating_call(
+        k::NonAllocatingKernel{F}, args::A, ::Val{N}) where {F,A<:Tuple,N}
+    positional = Any[:(getfield(args, $index)) for index in 1:N]
+    _native_body_call_expr(F, :(k.f), positional)
 end
 
-function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply)
+@inline function (k::NonAllocatingKernel{F,O,C,A,IN,OUT,S})(
+        args::Vararg{Any,N}) where {F,O,C,A,IN,OUT,S,N}
+    N == fieldcount(IN) || throw(MethodError(k, args))
+    S === Nothing || args isa S || _nonallocating_argument_types_error(k, S, args)
+    _nonallocating_call(k, args, Val(N))
+end
+
+@noinline _nonallocating_argument_types_error(k, ::Type{S}, args) where {S} =
+    throw(ArgumentError(
+        "this NonAllocatingKernel was prepared from exemplar arguments of types " *
+        "$(Tuple(fieldtypes(S))) and is typed for exactly those; it was called " *
+        "with $(map(typeof, args)). Prepare another kernel from exemplars of " *
+        "the new types"))
+
+function _prepare_nonallocating(p::Plan, cache_apply; have_types=nothing,
+                                exact_signature::Bool=false, passes=())
     for r in p.recipes
         length(r.outputs) == 1 || throw(ArgumentError(
             "prepare_nonallocating requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
     end
-    rewritten, ops, caches = _nonallocating_program(p, ast)
+    rewritten, ops, caches = _nonallocating_program(p; have_types,
+                                                    cache_apply, passes)
+    exact_signature &&
+        (rewritten = _nonalloc_exact_signature(rewritten, have_types))
     # Compile with the operation and cache tuples bound as constants inside the
     # body. Passing them as call arguments re-tuples the non-isbits operation
     # table on every invocation at the runtime-generated call boundary — a
@@ -2060,8 +7377,9 @@ function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply)
     # cheap and the compiled body sees them as constants.
     f = compile(_bind_nonallocating_constants(rewritten, ops, caches,
                                               cache_apply))
-    NonAllocatingKernel(f, ops, caches, cache_apply, Tuple(p.have),
-                        Tuple(p.want), p, rewritten)
+    S = exact_signature ? Tuple{have_types...} : Nothing
+    NonAllocatingKernel{S}(f, ops, caches, cache_apply, Tuple(p.have),
+                           Tuple(p.want), p, rewritten)
 end
 
 function _bind_nonallocating_constants(ast::Expr, ops::Tuple, caches::Tuple,
@@ -2071,6 +7389,12 @@ function _bind_nonallocating_constants(ast::Expr, ops::Tuple, caches::Tuple,
     body = ast.args[2]
     Expr(:function, Expr(:tuple, runtime_args...),
          Expr(:block,
+              # RGF caches bodies by content. Equal-looking unseeded cache
+              # tuples still belong to different kernels: reusing the first
+              # body would bind its slots into every later callable. A quoted
+              # per-binding token preserves that identity through local-name
+              # canonicalization and disappears from executable code.
+              QuoteNode(gensym(:_rk_nonallocating_binding)),
               Expr(:(=), _OPS_ARG, ops),
               Expr(:(=), _CACHES_ARG, caches),
               Expr(:(=), _CACHE_APPLY_ARG, cache_apply),
@@ -2078,8 +7402,8 @@ function _bind_nonallocating_constants(ast::Expr, ops::Tuple, caches::Tuple,
 end
 
 """
-    prepare(p::Plan; passes=(), bound=()) -> PreparedKernel
-    prepare(g::Graph; have, want, passes=(), bound=()) -> PreparedKernel
+    prepare(p::Plan; passes=(), bound=(), on_error=nothing, exemplars=nothing, type_stability=nothing, type_stability_level=nothing) -> PreparedKernel
+    prepare(g::Graph; have, want, passes=(), bound=(), on_error=nothing, exemplars=nothing, type_stability=nothing, type_stability_level=nothing) -> PreparedKernel
 
 Ergonomic composition of `plan -> lower -> transform -> compile`. `passes` is a
 tuple of AST passes applied before compilation.
@@ -2092,34 +7416,154 @@ remaining HAVE ports positionally (in their original relative order); the
 hoisted values are baked in as constants. With `bound = ()` (the default)
 behavior is unchanged. `passes` apply to the residual (per-call) kernel.
 
+Preparing a `Graph` (or an authored `KernelSpec`) with a non-empty `bound`
+reuses everything that does not depend on the bound values — the plan, the
+compiled data-only prefix and the compiled residual — from earlier bindings of
+the same graph version, HAVE/WANT boundary, bound port set and passes, exactly
+as [`prepare!`](@ref) does with a [`PreparationCache`](@ref). A binding of new
+values then costs the prefix's execution, not a fresh planning, lowering and
+compilation. The graph holds these entries, so they live as long as the graph,
+a mutation of the graph starts afresh, and they keep no bound values. Passes
+that are not singletons (closures) are not retained: such a binding is
+prepared afresh. A `Plan` is always prepared afresh.
+
+`exemplars = (x, ...)` opts into native type evidence from one value per
+remaining positional HAVE port. Native calls then require those exact input
+types; prepare another kernel for different types. The tensorized body keeps
+the declared port types, as does the native signature; only native plate
+lowering reads the exemplar evidence. Lengths and values are not baked into
+the program. A graph prepared with exemplars is compiled afresh.
+
 Selected authored plates with a single plate consumer are composed during
 lowering, eliminating the intermediate array. Named ports remain in `p`: asking
 for an intermediate, supplying it as HAVE, or selecting another consumer keeps
 that boundary. Whole-array (`Ref`) consumers and opaque intervening recipes
 also retain their materialization boundary.
-"""
-function prepare(p::Plan; passes = (), bound = ())
-    p = _partial_apply(p, bound)
-    lowered_plan = _fuse_authored_plate_chains(p)
-    native_ast, ops, recipes = _lower_with_ops(lowered_plan)
-    isempty(passes) || (native_ast = transform(native_ast, passes...))
-    if !_needs_embedded_tensorization(p)
-        return _prepare(p, native_ast, ops, recipes)
-    end
 
-    tensorized_ast, tensorized_ops, tensorized_recipes =
-        _lower_with_ops(lowered_plan; tensorized = true)
+Preparation checks that the program is type stable, from the declared types of
+the HAVE ports where those are concrete and from the bound data. How far it
+checks is `type_stability_level`:
+
+- `:values` checks that every value of the program infers a concrete type. A
+  recipe whose inputs are concretely typed but whose result Julia does not
+  infer concretely (`Any`, an abstract type, a `Union`, or an array of such
+  elements), such as a call to a function whose result is not inferable, is
+  reported, naming the value and its recipe.
+- `:rk` also audits the code of the prepared program: the body ReactiveKernels
+  generates and the functions of ReactiveKernels' packages it calls. A used
+  value Julia does not infer concretely, or a call dispatched at run time, is
+  reported with its method. Every other function the code calls is a leaf: its
+  call must be dispatched statically and return a concrete type.
+- `:all` (the default) also audits every function that code calls, a client
+  function's body included, except Julia's own Base, Core and standard
+  libraries, which stay leaves.
+
+Every recipe and plate cell that reads a non-concrete value dispatches
+dynamically, and native reverse-mode AD may refuse the program.
+[`prepare_ad`](@ref) repeats the check with the types of its exemplar
+arguments, auditing the callable its backend differentiates.
+
+`type_stability` is what preparation does with a finding: `:warn` (the
+default) logs a warning once per process and preparation succeeds; `:error`
+throws a [`TypeInstabilityError`](@ref) naming every finding, at every
+preparation. Either keyword's default `nothing` takes the setting of an
+enclosing preparation, else the project's ReactiveKernels preference of the
+same name (read at the first preparation of a Julia session), else the default.
+A project sets them for every preparation, including those other packages make
+for it, with for example
+`Preferences.set_preferences!(ReactiveKernels, "type_stability" => "error")`,
+which writes `[ReactiveKernels] type_stability = "error"` to its
+`LocalPreferences.toml`. A keyword applies to the preparations its call makes,
+nested ones included, and cached preparations are kept per setting.
+"""
+function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
+                 exemplars = nothing, type_stability = nothing,
+                 type_stability_level = nothing)
+    _with_type_stability(type_stability, type_stability_level) do
+        kernel = _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
+                               exemplars)
+        _check_uninferred_values(kernel)
+        kernel
+    end
+end
+
+# The two backend products of one preparation reuse each nested cell's composed
+# plan (`_nested_cell_plan`); other intermediates they create independently can
+# carry fresh Value identities. Accept only a consistent renaming: source,
+# operations, order and all graph edges must still agree.
+function _same_readable_recipes(a, b)
+    length(a) == length(b) || return false
+    forward = Dict{ValueId,ValueId}()
+    backward = Dict{ValueId,ValueId}()
+    for (left, right) in zip(a, b)
+        for field in (:id, :op, :cost, :cse_key, :effectful, :source)
+            isequal(getfield(left, field), getfield(right, field)) || return false
+        end
+        for field in (:inputs, :outputs)
+            x, y = getfield(left, field), getfield(right, field)
+            length(x) == length(y) || return false
+            for (lv, rv) in zip(x, y)
+                lv.name == rv.name && valtype(lv) == valtype(rv) || return false
+                get(forward, lv.id, rv.id) == rv.id || return false
+                get(backward, rv.id, lv.id) == lv.id || return false
+                forward[lv.id] = rv.id
+                backward[rv.id] = lv.id
+            end
+        end
+    end
+    true
+end
+
+# `prepare` without the type-stability check, for a program RK runs once while
+# it prepares another (the data-only prefix of a bound preparation): its values
+# feed the checked program as bound data of their runtime types.
+function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing,
+                       exemplars = nothing)
+    p = _kernel_error_policy(p, on_error)
+    # Compose cell-only producers before the top-level bound split. Other
+    # eligible chains compose after that split but before guarded cells are
+    # partitioned, so data-only producers can still be cached.
+    bound === () || (p = _fuse_authored_plate_chains(p; cells_only = true))
+    p = _partial_apply(p, bound)
+    exemplar_types = if exemplars === nothing
+        nothing
+    else
+        exemplars isa Tuple || throw(ArgumentError(
+            "prepare exemplars must be a tuple in positional HAVE order"))
+        length(exemplars) == length(p.have) || throw(ArgumentError(
+            "prepare received $(length(exemplars)) exemplars for " *
+            "$(length(p.have)) remaining HAVE ports"))
+        map(Tuple(p.have), exemplars) do port, value
+            typeof(value) <: valtype(port) || throw(ArgumentError(
+                "the exemplar for HAVE port `$(port.name)` has type " *
+                "$(typeof(value)), which is not a $(valtype(port))"))
+            typeof(value)
+        end
+    end
+    lowered_plan = _lowering_plan(p)
+    exact_signature = exemplar_types === nothing ? Nothing : Tuple{exemplar_types...}
+    embedded = _needs_embedded_tensorization(p)
+    (native_ast, ops, recipes), tensorized_lowering = _sharing_cell_plans() do
+        native_lowering = _lower_with_ops(lowered_plan; exemplar_types)
+        embedded || return (native_lowering, nothing)
+        (native_lowering, _lower_with_ops(lowered_plan; tensorized = true))
+    end
+    isempty(passes) || (native_ast = transform(native_ast, passes...))
+    embedded || return _prepare(p, native_ast, ops, recipes; exact_signature)
+
+    tensorized_ast, tensorized_ops, tensorized_recipes = tensorized_lowering
     tensorized_ops == ops || throw(ArgumentError(
         "embedded native and tensorized kernels produced different operation tables"))
-    tensorized_recipes == recipes || throw(ArgumentError(
+    _same_readable_recipes(tensorized_recipes, recipes) || throw(ArgumentError(
         "embedded native and tensorized kernels produced different readable recipes"))
     isempty(passes) ||
         (tensorized_ast = transform(tensorized_ast, passes...))
     native = compile(native_ast)
     tensorized = compile(tensorized_ast)
     candidates = _embedded_marker_candidates(p)
-    isempty(candidates) && throw(ArgumentError(
-        "an embedded plate requires an array-valued HAVE port in the outer kernel"))
+    # Every axis may be bound while the remaining HAVE ports are scalars.
+    # The dynamic pair selects native execution with its non-axis sentinel,
+    # and a traced scalar still selects the tensor product at call time.
     typed_candidate = findfirst(
         index -> valtype(p.have[index]) <: AbstractArray, candidates)
     f = if typed_candidate === nothing
@@ -2132,47 +7576,74 @@ function prepare(p::Plan; passes = (), bound = ())
             input_index,typeof(native),typeof(tensorized),typeof(tensorized_ast)}(
                 native, tensorized, tensorized_ast)
     end
-    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast, recipes)
+    _prepared_kernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast,
+        recipes; exact_signature)
 end
 
-function prepare(g::Graph; have = (), want = (), passes = (), bound = ())
-    p = plan(g; have = have, want = want)
-    prepare(p; passes = passes, bound = bound)
+function prepare(g::Graph; have = (), want = (), passes = (), bound = (),
+                 on_error = nothing, exemplars = nothing, type_stability = nothing,
+                 type_stability_level = nothing)
+    _with_type_stability(type_stability, type_stability_level) do
+        exemplars === nothing && _reuses_bound_preparation(bound, passes) &&
+            return _graph_bound_preparation(g, have, want, passes, bound, on_error)
+        p = plan(g; have = have, want = want)
+        prepare(p; passes = passes, bound = bound, on_error = on_error, exemplars)
+    end
 end
 
 """
-    prepare_nonallocating(p::Plan; passes=()) -> NonAllocatingKernel
-    prepare_nonallocating(g::Graph; have, want, passes=()) -> NonAllocatingKernel
+    prepare_nonallocating(p::Plan, exemplars...; passes=()) -> NonAllocatingKernel
+    prepare_nonallocating(g::Graph, exemplars...; have, want, passes=()) -> NonAllocatingKernel
 
 Optional MutatingFunctions-backed preparation interface. Install and load
 `MutatingFunctions` alongside `ReactiveKernels` to activate the package
-extension that supplies these methods (for a `Plan`, a `Graph`, or an
-already-prepared `PreparedKernel`'s plan). The extension prepares the same
-straight-line plan as [`prepare`](@ref), then applies a final AST transform
-that routes every selected operation through `MutatingFunctions.apply!!` and a
-persistent per-step cache. User `passes` run before this final transform.
+extension that supplies these methods (for a `Plan`, a `Graph`, an authored
+`KernelSpec`, or an already-prepared `PreparedKernel`'s plan). The extension
+lowers the same native program as [`prepare`](@ref): plate chains compose,
+summed plates fold into running totals, scans stream into the plates they
+feed. It then routes the program's remaining allocations to storage the kernel
+keeps: each materialized authored plate or scan output fills a buffer kept
+across calls, and every other operation with a destination-passing form goes
+through `MutatingFunctions.apply!!` and a persistent per-step cache. User
+`passes` run on the native program before this final transform.
+
+A step keeps a cache only when its result is fresh storage that a
+destination-passing method fills: the decomposition's own steps below, or an
+operation with a registered `apply!!` method for its concrete cache and
+argument types. Every other operation is called directly, and its result is
+never written into: a cached value may alias caller data (a field read, row
+slices of a caller matrix), and `apply!!`'s generic fallback would copy the
+next call's result into it.
 
 Operations synthesized from captured `@kernel` source are decomposed into
 destination-passing steps where the captured expression allows: lazy wrappers
 and isbits-valued calls run inline, broadcast materializations, `vcat`, range
 `getindex`, and `zeros`/`ones` reuse typed destination buffers, and every
-other resolved call becomes its own cache step so registered `apply!!`
-coverage (e.g. `mul!`-backed `*`) applies per step. Source shapes outside
-that grammar keep the whole-recipe cache step.
+other resolved call with a registered `apply!!` method (e.g. `mul!`-backed
+`*`) becomes its own cache step. Source shapes outside that grammar run as one
+operation.
+
+Cache types and step selection are fixed at preparation from static types. A
+HAVE port without a concrete declared type leaves everything computed from it
+untyped. Pass `exemplars`, one value per positional HAVE port in `inputs`
+order, to type the program from those values' types instead; the returned
+kernel then accepts exactly those argument types (any other is an
+`ArgumentError`). A declared array output of an authored plate
+(`y::Vector{Float64} = plate(...)`) fixes the element type of its buffer, as
+the native kernel's typed local does.
 
 The first invocation populates the caches and may allocate. Later invocations
 reuse them when the selected operations provide allocation-free `apply!!`
-methods for the runtime argument and cache types. MutatingFunctions' generic
-fallback preserves semantics but may still allocate, so allocation freedom is
-a property of the complete lowered operation set rather than a planner
+methods for the runtime argument and cache types. Operations without one
+allocate their result as the ordinary kernel does, so allocation freedom is a
+property of the complete lowered operation set rather than a planner
 guarantee.
 
-Every selected recipe must have exactly one output. Each slot retains the first
-object returned by its operation: that is fresh kernel-retained storage for
-ordinary allocating/registered operations, but it may be a caller-owned input
-for aliasing operations. A no-recipe plan returns its input directly. Treat
-mutable results as borrowed values that may alias inputs or be overwritten by
-the next call; a prepared instance is not reentrant or thread-safe.
+Every selected recipe must have exactly one output. A no-recipe plan returns
+its input directly, and a directly called operation's result may alias an
+input. Treat mutable results as borrowed values that may alias inputs or be
+overwritten by the next call; a prepared instance is not reentrant or
+thread-safe.
 """
 function prepare_nonallocating(args...; kwargs...)
     throw(ArgumentError(
@@ -2192,11 +7663,12 @@ outputs(k::NonAllocatingKernel) = k.outputs
 outputs(p::Plan) = Tuple(p.want)
 
 """
-    code_expr(p) -> Expr
+    code_expr(spec_or_plan_or_kernel) -> Expr
 
-The generated Julia `Expr` before RGF compilation. Accepts a `Plan` or a
-`PreparedKernel`. Useful for asserting that unused operations are literally
-absent from the kernel (gist §20).
+The generated Julia `Expr` before RGF compilation. A `KernelSpec` or `Graph`
+is planned at its default boundary unless `have`/`want` are given. A `Plan`
+is lowered to its generated expression; a prepared kernel returns its stored
+expression. Useful for asserting that unused operations are literally absent.
 """
 code_expr(p::Plan) = lower(p)
 code_expr(k::PreparedKernel) = k.ast
@@ -2212,6 +7684,10 @@ catch
 end
 _opname(::_AuthoredPlateOp) = "plate"
 _opname(::_AuthoredScanOp) = "scan"
+_opname(op::_TypeOperation) = _opname(_type_operation_type(op))
+# Captured `@kernel` source is shown through its recipe's retained source
+# (`_recipe_label`, display.jl); the operation object itself is only "source".
+_opname(::_KernelSourceOp) = "source"
 
 function _readable_callee(op)
     name = try
@@ -2221,6 +7697,7 @@ function _readable_callee(op)
     end
     name isa Symbol && !startswith(string(name), "#") ? name : :operation
 end
+_readable_callee(op::_TypeOperation) = _readable_callee(_type_operation_type(op))
 
 function _operation_slot(node)
     node isa Expr && node.head === :ref && length(node.args) == 2 &&
@@ -2238,17 +7715,264 @@ end
 # `code_expr` still lowers the constant through the executable `__ops__` slot.
 _readable_bound_constant(value) = value
 
+# --- display-only value inlining ---------------------------------------------------
+#
+# This internal source-aware recipe view shows a recipe's source with each authored name it reads in
+# place of the program variable that holds it, as a human writes an inlined
+# call: `exp(unconstrained[2])`, not `let u = unconstrained[2]; exp(u) end`. A
+# name, literal or once-read value takes the name's place. A computed value
+# read more than once, a name read inside a function, loop, comprehension or
+# macro body, and anything a substitution could capture (a name the source
+# itself binds) stay `let` bindings. Display only: `code_expr` keeps the ports.
+_readable_literal(x) = x isa Union{Number,AbstractString,Char,Nothing,QuoteNode}
+
+const _READABLE_SCOPE_HEADS = (:->, :function, :for, :while, :generator,
+    :comprehension, :typed_comprehension, :macrocall, :struct, :module)
+
+_readable_let_bindings(header) =
+    header isa Expr && header.head === :block ? header.args : Any[header]
+
+_readable_symbols!(names, x::Symbol) = push!(names, x)
+_readable_symbols!(names, x) = names
+function _readable_symbols!(names, ex::Expr)
+    ex.head in (:quote, :inert) && return names
+    foreach(arg -> _readable_symbols!(names, arg), ex.args)
+    names
+end
+
+# Every name `ex` binds where a substitution can reach: assignment, `let` and
+# `local` targets, function parameters, loop and generator variables. A
+# do-block's body is never substituted into, so its parameters and locals bind
+# nothing a substitution could be captured by.
+function _readable_bound_names!(names, ex)
+    ex isa Expr || return names
+    ex.head in (:quote, :inert) && return names
+    ex.head === :do && length(ex.args) == 2 &&
+        return _readable_bound_names!(names, ex.args[1])
+    if ex.head === :kw
+        return _readable_bound_names!(names, ex.args[end])
+    elseif ex.head in (:(=), :->, :function) && !isempty(ex.args)
+        _readable_symbols!(names, ex.args[1])
+    elseif ex.head in (:local, :global)
+        _readable_symbols!(names, ex)
+    elseif ex.head === :let
+        for binding in _readable_let_bindings(ex.args[1])
+            binding isa Symbol && push!(names, binding)
+        end
+    end
+    foreach(arg -> _readable_bound_names!(names, arg), ex.args)
+    names
+end
+
+# The number of free reads of `name` in `ex`, or `nothing` when one sits in a
+# scope this display rewrite does not analyze. An assignment target, keyword
+# or named-field label is not a read; a do-block's call arguments are, and
+# its body reads `name` only when no parameter of the block shadows it.
+function _readable_free_uses(ex, name::Symbol)
+    ex === name && return 1
+    ex isa Expr || return 0
+    ex.head in (:quote, :inert) && return 0
+    if ex.head in _READABLE_SCOPE_HEADS
+        return _readable_mentions(ex, name) ? nothing : 0
+    elseif ex.head === :do && length(ex.args) == 2
+        block = ex.args[2]
+        shadowed = block isa Expr && block.head === :-> && !isempty(block.args) &&
+            name in _readable_symbols!(Set{Symbol}(), block.args[1])
+        !shadowed && _readable_mentions(block, name) && return nothing
+        return _readable_free_uses(ex.args[1], name)
+    end
+    args = ex.head in (:(=), :kw) && length(ex.args) == 2 ? ex.args[2:2] : ex.args
+    uses = 0
+    for arg in args
+        n = _readable_free_uses(arg, name)
+        n === nothing && return nothing
+        uses += n
+    end
+    uses
+end
+
+_readable_mentions(ex, name::Symbol) =
+    ex === name || ex isa Expr && any(arg -> _readable_mentions(arg, name), ex.args)
+
+# Simultaneous substitution of the free names in `subst`, at the positions
+# `_readable_free_uses` counts.
+function _readable_substitute(ex, subst::AbstractDict)
+    ex isa Symbol && return get(subst, ex, ex)
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert) && return ex
+    ex.head in _READABLE_SCOPE_HEADS && return ex
+    ex.head === :do && length(ex.args) == 2 &&
+        return Expr(:do, _readable_substitute(ex.args[1], subst), ex.args[2])
+    ex.head in (:(=), :kw) && length(ex.args) == 2 &&
+        return Expr(ex.head, ex.args[1], _readable_substitute(ex.args[2], subst))
+    Expr(ex.head, Any[_readable_substitute(arg, subst) for arg in ex.args]...)
+end
+
+# Whether `value` is the program variable codegen made of the authored `name`
+# to avoid a collision (`_varnames`: `name_<position>` or `name_<position>_<k>`). Such a
+# name stays an explicit binding, so the authored spelling remains visible.
+_readable_collision_rename(name::Symbol, value) =
+    value isa Symbol &&
+    occursin(Regex("^\\Q" * String(name) * "\\E_\\d+(_\\d+)?\$"), String(value))
+
+# `ex` with as many of the `name => value` pairs substituted as is safe, and
+# the pairs that stay bindings, in their given order.
+function _readable_inline_values(ex, pairs)
+    bound = _readable_bound_names!(Set{Symbol}(), ex)
+    inline = falses(length(pairs))
+    for (index, (name, value)) in enumerate(pairs)
+        name in bound && continue
+        _readable_collision_rename(name, value) && continue
+        uses = _readable_free_uses(ex, name)
+        inline[index] = uses !== nothing &&
+            (uses <= 1 || value isa Symbol || _readable_literal(value))
+    end
+    # A substituted value must not read a name the source binds or a name that
+    # stays a binding: it would then read that binding instead.
+    changed = true
+    while changed
+        changed = false
+        blocked = copy(bound)
+        for (index, (name, _)) in enumerate(pairs)
+            inline[index] || push!(blocked, name)
+        end
+        for (index, (_, value)) in enumerate(pairs)
+            inline[index] || continue
+            isdisjoint(_readable_symbols!(Set{Symbol}(), value), blocked) && continue
+            inline[index] = false
+            changed = true
+        end
+    end
+    subst = Dict{Symbol,Any}(pairs[index] for index in eachindex(pairs) if inline[index])
+    (isempty(subst) ? ex : _readable_substitute(ex, subst)), pairs[.!inline]
+end
+
+# Show, in place, the values RK materialized into ports it named: an argument
+# of a composed call (`exponential(4.0).logpdf(x)` passes `4.0` through a
+# hygienic port) or a value with no authored name at all. A literal or name is
+# shown at every use, another value read once at its use, and one read nowhere
+# in the shown program (a plate argument its authored source already spells)
+# not at all.
+function _readable_inline_generated(ex::Expr, p::Plan)
+    ex.head === :function && length(ex.args) == 2 && ex.args[2] isa Expr &&
+        ex.args[2].head === :block || return ex
+    g = p.graph
+    names = _varnames(p)
+    candidates = Set{Symbol}()
+    for r in p.recipes, o in r.outputs
+        r.source isa _NoKernelSource && continue
+        name = names[canon_id(g, o.id)]
+        # A hygienic port (a gensym) or a class with no authored name at all.
+        (startswith(String(o.name), '#') || _generated_value_name(name)) &&
+            push!(candidates, name)
+    end
+    for w in p.want
+        delete!(candidates, names[canon_id(g, w.id)])
+    end
+    statements = Any[ex.args[2].args...]
+    index = 1
+    while index <= length(statements)
+        statement = statements[index]
+        if statement isa Expr && statement.head === :(=) &&
+           statement.args[1] isa Symbol && statement.args[1] in candidates
+            name, value = statement.args
+            later = statements[(index + 1):end]
+            bound = foldl(_readable_bound_names!, later; init = Set{Symbol}())
+            counts = [_readable_free_uses(statement, name) for statement in later]
+            safe = !(name in bound) && all(!isnothing, counts) &&
+                isdisjoint(_readable_symbols!(Set{Symbol}(), value), bound)
+            if safe && (sum(counts; init = 0) <= 1 || value isa Symbol ||
+                        _readable_literal(value))
+                subst = Dict{Symbol,Any}(name => value)
+                for later_index in (index + 1):length(statements)
+                    statements[later_index] =
+                        _readable_substitute(statements[later_index], subst)
+                end
+                deleteat!(statements, index)
+                continue
+            end
+        end
+        index += 1
+    end
+    Expr(:function, ex.args[1], Expr(:block, statements...))
+end
+
+# The names a recipe's authored source reads its inputs by. They are its input
+# values' names except where the graph renamed those values: a bound child
+# endpoint scoped under its owner port (`standard.z`), or a composed child's
+# value scoped under the caller's result (`lp.scale`), keeps its source, which
+# still reads `z` or `scale`. The operation keeps the authored names as the
+# parameters of its source closure, or as the arguments of an exact bare call.
+# Any other operation (a plate, a scan) reads a scoped input by the part of its
+# name after a scope prefix that its source spells.
+function _recipe_source_names(recipe::Recipe)
+    spelled = Set{Symbol}()
+    _source_symbols!(spelled, recipe.source)
+    names = _source_parameter_names(recipe.op, recipe.source, length(recipe.inputs))
+    names === nothing ||
+        return Symbol[_spelled_parameter_name(name, spelled) for name in names]
+    Symbol[_unscoped_source_name(value.name, spelled) for value in recipe.inputs]
+end
+# Julia's lowering reports a gensym parameter (`##endpoint_value#7`) without
+# its leading `##` (`endpoint_value#7`), while the source still spells the
+# gensym; an unmapped name would leave that gensym in the display.
+function _spelled_parameter_name(name::Symbol, spelled)
+    name in spelled && return name
+    gensym_name = Symbol("##", name)
+    gensym_name in spelled ? gensym_name : name
+end
+_source_symbols!(names, x::Symbol) = push!(names, x)
+_source_symbols!(names, x) = names
+function _source_symbols!(names, ex::Expr)
+    ex.head in (:quote, :inert) && return names
+    foreach(arg -> _source_symbols!(names, arg), ex.args)
+    names
+end
+function _unscoped_source_name(name::Symbol, spelled)
+    name in spelled && return name
+    text = String(name)
+    for index in findall(==('.'), text)
+        suffix = Symbol(text[(index + 1):end])
+        suffix in spelled && return suffix
+    end
+    name
+end
+function _source_parameter_names(op::_KernelSourceOp, source, n)
+    # A branch preparation rebuilt names its arguments itself.
+    names = _branch_call_names(op.f)
+    names === nothing || return length(names) == n ? names : nothing
+    _closure_parameter_names(_source_closure(op.f), n)
+end
+_source_closure(f) = f
+_source_closure(f::_KernelSourceFunction) = _source_closure(f.f)
+_source_closure(branch::_KernelBranch) = _source_closure(branch.call)
+_source_closure(split::_KernelSplit) = _source_closure(split.call)
+_source_closure(apply::_KernelSplitApply) = _source_closure(apply.split)
+_source_closure(reduction::_KernelReduction) = _source_closure(reduction.call)
+_source_parameter_names(op::Function, source::Expr, n) =
+    source.head === :call && length(source.args) == n + 1 &&
+        all(arg -> arg isa Symbol, source.args[2:end]) ?
+        Symbol[source.args[2:end]...] : nothing
+_source_parameter_names(op, source, n) = nothing
+function _closure_parameter_names(f, n)
+    f isa Function || return nothing
+    candidates = methods(f)
+    length(candidates) == 1 || return nothing
+    method = only(candidates)
+    method.isva && return nothing
+    names = Base.method_argnames(method)[2:end]
+    length(names) == n ? names : nothing
+end
+
 function _readable_recipe_call(recipe::Recipe, args)
     op = recipe.op
     op isa _BoundConstant && return _readable_bound_constant(op.value)
     source = recipe.source
     if !(source isa _NoKernelSource)
-        rhs = deepcopy(source)
-        bindings = Any[]
-        for (input, arg) in zip(recipe.inputs, args)
-            input.name === arg && continue
-            push!(bindings, Expr(:(=), input.name, arg))
-        end
+        pairs = Pair{Symbol,Any}[name => arg for (name, arg) in
+                                 zip(_recipe_source_names(recipe), args) if name !== arg]
+        rhs, kept = _readable_inline_values(deepcopy(source), pairs)
+        bindings = Any[Expr(:(=), name, arg) for (name, arg) in kept]
         isempty(bindings) && return rhs
         header = length(bindings) == 1 ? only(bindings) : Expr(:block, bindings...)
         return Expr(:let, header, Expr(:block, rhs))
@@ -2262,7 +7986,7 @@ function _readable_expr(node, recipes)
     # A BARE operation slot — `__ops__[k]` passed as a value rather than invoked
     # — renders as its readable operation name, not the raw index. The authored
     # plate lowering does this when it seeds the pointwise element type with
-    # `Base.promote_op(__ops__[k], …)`; without this branch the reference would
+    # `_promote_op(__ops__[k], …)`; without this branch the reference would
     # survive the readable rewrite as `__ops__[\d+]`.
     let slot = _operation_slot(node)
         slot !== nothing && 1 <= slot <= length(recipes) &&
@@ -2301,13 +8025,13 @@ function _readable_expr(node, recipes)
     Expr(node.head, args...)
 end
 
-# Build a display-only copy of a lowered kernel or reactive getter. Positional
+# Build a source-aware explanatory copy of a lowered kernel or reactive getter. Positional
 # `__ops__[k]` calls become the selected recipe's named operation or its retained
 # authored RHS, and hidden operation/cache arguments are removed from the shown
 # signature. Passing a PreparedKernel uses its flattened recipe sequence, so a
 # nested generated kernel never leaves mismatched or opaque operation slots.
-# This internal explanatory expression is not executable authority; `code_expr`
-# remains the exact compiled AST.
+# This internal explanatory expression is not executable authority or a code
+# display; `code_expr` remains the exact compiled AST.
 _readable_expr(ast::Expr, plan::Plan) = _readable_expr(ast, plan.recipes)
 _readable_expr(ast::Expr, kernel::PreparedKernel) =
     _readable_expr(ast, kernel.lowered_recipes)
@@ -2316,6 +8040,12 @@ function _recipe_line(r::Recipe)
     ins = join([string(v.name) for v in r.inputs], ", ")
     outs = length(r.outputs) == 1 ? string(r.outputs[1].name) :
            "(" * join([string(v.name) for v in r.outputs], ", ") * ")"
+    # Synthesized tuple unpacks read as field access, not as accessor calls.
+    if length(r.inputs) == 1
+        suffix = _unpack_access_suffix(r.op)
+        suffix !== nothing && return "$outs = $(only(r.inputs).name)$suffix"
+    end
+    r.op isa _KernelSourceOp && _has_source(r) && return "$outs = $(_recipe_label(r))"
     "$outs = $(_opname(r.op))($ins)"
 end
 

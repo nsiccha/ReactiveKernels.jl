@@ -37,6 +37,9 @@ likelihood terms, pointwise log likelihoods, total log density, and new-group
 prediction. Different `want` sets prune density or generated-quantity work from
 the same graph.
 
+The repository-wide [core constraints](docs/src/constraints.md) require retained
+data-dependent iteration and lazy branch semantics in every lowering.
+
 ## Pipeline
 
 ```
@@ -51,6 +54,13 @@ straight-line Julia Expr  ──►  (optional AST passes)  ──►  RuntimeGe
 ```
 
 ## Quick start
+
+From a source checkout, resolve the pinned OutputSignatures dependency before
+loading ReactiveKernels (this also works with Julia 1.10):
+
+```sh
+julia --startup-file=no --project=. deps/source_dependencies.jl
+```
 
 ```julia
 using ReactiveKernels
@@ -301,9 +311,8 @@ visualize(artifact.dag) # structured HAVE/WANT/recipe DAG
 ## Non-allocating preparation
 
 `prepare_nonallocating` keeps the same graph and plan, but applies one final AST
-pass that routes each selected operation through
-`MutatingFunctions.apply!!`. Every single-output recipe gets a typed persistent
-cache. MutatingFunctions is currently unregistered, so install the reviewed
+pass that routes each operation with an in-place form through
+`MutatingFunctions.apply!!` and a typed persistent cache. MutatingFunctions is currently unregistered, so install the reviewed
 revision explicitly and load it to activate ReactiveKernels' optional extension:
 
 ```julia
@@ -335,11 +344,16 @@ This path deliberately inherits the `apply!!` contract:
   fallback is correct but may allocate;
 - selected recipes must each have one output, matching `apply!!`'s one-cache /
   one-result interface;
-- each cache slot retains whatever its operation first returns: registered
-  allocating operations normally seed fresh kernel-retained storage, but an
-  aliasing operation may retain caller-owned input, and a no-recipe plan returns
-  its `have` value directly; treat mutable results as borrowed values that may
-  alias inputs or be overwritten by the next call;
+- an operation keeps a cache only when a registered `apply!!` method (or one of
+  the kernel's own decomposed steps) fills storage the kernel owns; any other
+  operation is called directly, so its result may alias a caller input and is
+  never written into, and a no-recipe plan returns its `have` value directly;
+  treat mutable results as borrowed values that may alias inputs or be
+  overwritten by the next call;
+- caches are typed at preparation; pass example arguments
+  (`prepare_nonallocating(spec, args...)`) to type them from runtime argument
+  types when HAVE ports are undeclared — the kernel then accepts exactly those
+  argument types;
 - a prepared instance is stateful, non-reentrant, and not safe for concurrent
   calls — prepare one per independent caller;
 - custom `passes` run on the ordinary lowered AST before the cache rewrite.

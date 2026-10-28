@@ -19,7 +19,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: gamma, poiss
     # Either the rate λ or log_rate may be the authoritative HAVE value; the
     # support transform is λ = exp(log_rate) with log|dλ/dlog_rate| = log_rate.
     log_rate::Float64 = log(rate)
-    rate::Float64 = exp(log_rate)
     log_jacobian::Float64 = log_rate
 
     parameters = (; rate)

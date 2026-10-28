@@ -75,8 +75,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 
     parameters = (; beta1, beta2, sigma)
     (parameters, log_jacobian::Float64) = ((; beta1, beta2, sigma), u_sigma)
-    (beta1::Float64, beta2::Float64, sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.sigma)
 
     # Transformed parameter: the log-scale linear predictor over the canopy
     # volume, μ = β₁ + β₂·log(diam1·diam2·canopy_height). The log-volume predictor

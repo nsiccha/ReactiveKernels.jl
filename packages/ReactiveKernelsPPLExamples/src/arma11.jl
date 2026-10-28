@@ -64,8 +64,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     # NamedTuple is also an authoritative input boundary.
     parameters = (; μ, φ, θ, σ)
     (parameters, log_jacobian::Float64) = ((; μ, φ, θ, σ), log_σ)
-    (μ::Float64, φ::Float64, θ::Float64, σ::Float64) =
-        (parameters.μ, parameters.φ, parameters.θ, parameters.σ)
 
     # The latent one-step-ahead errors are the sequential heart of the model:
     #   ν₁ = μ + φ·μ (err₀ ≡ 0), errₜ = yₜ − νₜ,
@@ -79,9 +77,8 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     # this natural form DOES lower through Reactant. The likelihood/density reduce
     # it directly; `errors_closed` below is an independent vectorized cross-check.
     errors::Vector{Float64} =
-        scan(series, Ref(μ), Ref(φ), Ref(θ);
-             init = (; y_prev = μ, err_prev = 0.0)) do carry, y, m, f, t
-            ν = m + f * carry.y_prev + t * carry.err_prev
+        scan(series; init = (; y_prev = μ, err_prev = 0.0)) do carry, y
+            ν = μ + φ * carry.y_prev + θ * carry.err_prev
             e = y - ν
             ((; y_prev = y, err_prev = e), e)
         end

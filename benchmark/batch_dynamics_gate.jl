@@ -1,8 +1,8 @@
 #!/usr/bin/env julia
 
-# batch_dynamics_gate.jl — correctness gate for the four adaptive-ODE
-# posteriordb `@kernel` PPL translations (lotka_volterra, one_comp_mm_elim_abs,
-# sir, soil_incubation; lotka back in after core fix 96eaf14d).
+# batch_dynamics_gate.jl — correctness gate for the three adaptive-ODE
+# posteriordb `@kernel` PPL translations (lotka_volterra, sir,
+# soil_incubation; lotka back in after core fix 96eaf14d).
 # Each model is checked, on its FULL real posteriordb
 # data, against the ACTUAL reference `.stan` via BridgeStan (propto = false,
 # jacobian = true) along four axes:
@@ -37,7 +37,7 @@
 # in the all80 environment):
 #   julia --project=benchmark/all80-env benchmark/batch_dynamics_gate.jl
 #
-# Optional: DYNAMICS_MODELS=sir,onecomp,soil restricts the set.
+# Optional: DYNAMICS_MODELS=sir,soil restricts the set.
 #
 # Accepted evidence path: native value + ordinary-Reverse gradient with
 # Reactant genuinely absent. Compiled Reactant primal/gradient is unsupported
@@ -169,9 +169,9 @@ else
 end
 
 # ---- model registry -------------------------------------------------------
-# Four-model successor: lotka back in after core fix 96eaf14d (was excluded
-# on the three-model branch while blocked by snag prepare-on-the-c-5e366cf6).
-const KNOWN_MODELS = ("lotka", "sir", "onecomp", "soil")
+# The pharmacokinetic example and its scientific oracle now live in
+# RKPPLBench/examples/posteriordb_pk/.
+const KNOWN_MODELS = ("lotka", "sir", "soil")
 const SEL = strip.(split(get(ENV, "DYNAMICS_MODELS", join(KNOWN_MODELS, ',')), ','))
 for s in SEL
     isempty(s) && error("DYNAMICS_MODELS has an empty entry")
@@ -190,12 +190,6 @@ _want("lotka") && gate("hudson_lynx_hare-lotka_volterra";
     have = (:unconstrained, :ts, :y_init, :y),
     bind = d -> (ts = Float64.(d["ts"]), y_init = Float64.(d["y_init"]),
                  y = Float64.(d["y"])))
-
-_want("onecomp") && gate("one_comp_mm_elim_abs-one_comp_mm_elim_abs";
-    graph = PE.OneCompMMElimAbsExample.build_one_comp_mm_elim_abs_graph(),
-    have = (:unconstrained, :times, :c0, :c_hat),
-    bind = d -> (times = Float64.(d["times"]), c0 = [0.0],
-                 c_hat = Float64.(d["C_hat"])))
 
 # sir: the posterior is concentrated away from the origin (0/20000
 # reference-finite at scale 0.3 around zeros; 1739/2000 around the demo

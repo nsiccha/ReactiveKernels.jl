@@ -1,4 +1,5 @@
 [deps]
+BayesianRegressionModels = "cdd3e328-398d-47a6-a87b-6047aaf4b4bc"
 AlgebraOfVega = "a2420894-485a-4f42-a4fc-c4323ec6fb2b"
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
@@ -19,11 +20,13 @@ ReactiveKernelsDistributionKernels = "4b169cd9-fc12-43fd-ba39-43e54ed8db7a"
 ReactiveKernelsKernelExamples = "c1a917b0-63b1-4b16-afa9-60dbf16f95f3"
 ReactiveKernelsHMCDiagnostics = "7283f29e-af9b-44bd-b98f-4e6318e8ac2b"
 ReactiveKernelsNUTSExamples = "1bd07bcb-ec6f-4af5-8d58-21805f68d06f"
+ReactiveKernelsPPL = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 ReactiveKernelsPPLExamples = "a4d4be3d-45c5-49cc-80d7-34e606a16bce"
 SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
 SciMLSensitivity = "1ed8b502-d754-442c-8d5d-10ac956f44a1"
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 ReactiveKernelsStreamingStats = "fe060097-a659-4245-b1df-751eb37b739a"
+ReactiveKernelsReactantODESolvers = "03eb76aa-2b23-4fab-a762-f0290f039ac9"
 Treebars = "e1e568c4-3a56-40a4-95fa-9b9c6c16fccb"
 
 [compat]
@@ -53,8 +56,14 @@ path = "../packages/ReactiveKernelsHMCDiagnostics"
 [sources.ReactiveKernelsNUTSExamples]
 path = "../packages/ReactiveKernelsNUTSExamples"
 
+[sources.ReactiveKernelsPPL]
+path = "../packages/ReactiveKernelsPPL"
+
 [sources.ReactiveKernelsPPLExamples]
 path = "../packages/ReactiveKernelsPPLExamples"
 
 [sources.ReactiveKernelsStreamingStats]
 path = "../packages/ReactiveKernelsStreamingStats"
+
+[sources.ReactiveKernelsReactantODESolvers]
+path = "../packages/ReactiveKernelsReactantODESolvers"

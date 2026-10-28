@@ -23,9 +23,16 @@ function _have(plan::StructuralPlan)
     return (:unconstrained, _sorted_cols(plan)...)
 end
 
+# World-age barrier (Julia 1.12+): `build_kernel` evals fresh recipe
+# closures (new methods) per build, and 1.12 Test pins the testset
+# body's world, so raw `prepare` / kernel calls from these helpers throw
+# "method too new" (1.10 runs them at latest world and stays green).
+# Same remedy as `prepare_query`/`prepare_sampler` (src/query.jl) and the
+# per-family `Base.invokelatest(kern, ...)` probes.
 function _query(spec, plan, want::Symbol, u)
-    kern = prepare(spec; have = _have(plan), want = want, bound = _bound_nt(plan))
-    return kern(u)
+    kern = Base.invokelatest(prepare, spec; have = _have(plan), want = want,
+        bound = _bound_nt(plan))
+    return Base.invokelatest(kern, u)
 end
 
 function _findiff_grad(f, u; h = cbrt(eps(Float64)))
@@ -41,13 +48,22 @@ function _findiff_grad(f, u; h = cbrt(eps(Float64)))
 end
 
 function _check_gradient(spec, plan, u)
-    kern = prepare(spec; have = _have(plan), want = :posterior,
-        bound = _bound_nt(plan))
-    prep = prepare_ad(kern, _GEN_BACKEND, u; active = :unconstrained)
-    g = ReactiveKernels.ad_value_and_gradient!(prep, similar(u), u)[2]
+    kern = Base.invokelatest(prepare, spec; have = _have(plan),
+        want = :posterior, bound = _bound_nt(plan))
+    prep = Base.invokelatest(prepare_ad, kern, _GEN_BACKEND, u;
+        active = :unconstrained)
+    g = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!, prep,
+        similar(u), u)[2]
     @test all(isfinite, g)
-    @test isapprox(g, _findiff_grad(kern, u); rtol = 1e-5, atol = 1e-7)
+    @test isapprox(g, _findiff_grad(w -> Base.invokelatest(kern, w), u);
+        rtol = 1e-5, atol = 1e-7)
     return g
+end
+
+function _check_model_math(built, bound, u, oracle)
+    @test _query(built.spec, bound, :posterior, u) ≈ oracle(u)
+    gradient = _check_gradient(built.spec, bound, u)
+    @test gradient ≈ _findiff_grad(oracle, u) rtol = 1e-5 atol = 1e-7
 end
 
 function _gen_columns()
@@ -100,7 +116,8 @@ end
     built = build_kernel(plan)
     @test built.spec isa ReactiveKernels.KernelSpec
     @test built.layout.total == 3
-    # Likelihoods lower to plate calls (Expr(:do)), never fused broadcasts.
+    # Gaussian and Bernoulli-logit likelihoods lower to plate calls
+    # (Expr(:do)); Poisson-log base GLMs use whole-vector reductions.
     _has_do(ex::Expr) = ex.head === :do ||
         any(a -> a isa Expr && _has_do(a), ex.args)
     _has_do(_) = false
@@ -181,6 +198,189 @@ end
     pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
     @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
     _check_gradient(built.spec, plan, u)
+end
+
+_has_call(ex::Expr, fn::Symbol) =
+    (ex.head === :call && !isempty(ex.args) && ex.args[1] === fn) ||
+    any(a -> a isa Expr && _has_call(a, fn), ex.args)
+_has_call(_, ::Symbol) = false
+_has_sym(ex::Expr, s::Symbol) =
+    any(a -> (a isa Symbol && a === s) || (a isa Expr && _has_sym(a, s)),
+        ex.args)
+_has_sym(_, ::Symbol) = false
+
+function _gen_query_outputs(spec, plan, want)
+    kern = Base.invokelatest(prepare, spec; have = _have(plan), want,
+        bound = _bound_nt(plan))
+    return Set(out.name for recipe in kern.plan.recipes for out in recipe.outputs)
+end
+
+function _gen_query_has_response_plate(spec, plan, want)
+    # Bound lazy guards can split the observation plate into arm plates.
+    # A density cut sums those arms without assembling the pointwise vector.
+    names = _gen_query_outputs(spec, plan, want)
+    return any(name -> name === :_ppl_pw_y_resp ||
+        startswith(String(name), "_ppl_pw_y_resp_"), names)
+end
+
+# Bernoulli-logit keeps stable cells; base Poisson-log uses a whole-vector
+# reduction (`dot` + `sum(f, x)`). Ranged ≡ bare up to summation order
+# (the cover rule), with pointwise queries retaining the same densities.
+function _gen_ranged_plan(base::StructuralPlan, range::UnitRange{Int})
+    r = base.responses[1]
+    rr = LikelihoodSpec(r.family, r.link, r.response, r.predictor, r.scale,
+        r.weights, r.evidence, r.label, r.trials, range)
+    plan = StructuralPlan([rr],
+        base.predictors, base.population_priors, base.parameters,
+        base.assignments, base.columns, base.n_obs; roles = base.roles,
+        derived = base.derived, levelmaps = base.levelmaps,
+        plate_parameters = base.plate_parameters, scans = base.scans)
+    validate_plan(plan)
+    return plan
+end
+
+@testset "stable Bernoulli cells and Poisson whole-vector fusion" begin
+    # Base Bernoulli keeps the stable endpoint through its reduction.
+    plan = _gen_bernoulli_plan(repeat([false, true], 3))
+    built = build_kernel(plan)
+    ex = kernel_expr(plan, built.layout)
+    @test !_has_call(ex, :dot)
+    # Density and pointwise cuts both use the stable observation plate.
+    @test _has_sym(ex, :_ppl_pw_y_resp)
+    for want in (:likelihood, :posterior)
+        @test _gen_query_has_response_plate(built.spec, plan, want)
+    end
+    @test _gen_query_has_response_plate(built.spec, plan, :pointwise)
+    # Ranged Bernoulli matches the whole response's density.
+    rplan = _gen_ranged_plan(plan, 1:6)
+    rbuilt = build_kernel(rplan)
+    rex = kernel_expr(rplan, rbuilt.layout)
+    @test !_has_call(rex, :dot)
+    @test _has_sym(rex, :_ppl_pw_y_resp)
+    for want in (:likelihood, :posterior)
+        @test _gen_query_has_response_plate(rbuilt.spec, rplan, want)
+    end
+    u = [0.25, 0.5]
+    eta = u[1] .+ u[2] .* plan.columns[:x]
+    points = _query(built.spec, plan, :pointwise, u)
+    @test keys(points) == (:y,)
+    @test size(points.y) == size(plan.columns[:y])
+    @test points.y ≈ logpdf.(Bernoulli.(1 ./ (1 .+ exp.(-eta))), plan.columns[:y])
+    @test sum(points.y) ≈ _query(built.spec, plan, :likelihood, u)
+    @test _query(rbuilt.spec, rplan, :posterior, u) ≈
+        _query(built.spec, plan, :posterior, u)
+    _check_gradient(rbuilt.spec, rplan, u)
+    # Base Poisson routes fused.
+    pplan = _gen_poisson_plan()
+    pbuilt = build_kernel(pplan)
+    pex = kernel_expr(pplan, pbuilt.layout)
+    @test _has_call(pex, :dot)
+    @test _has_sym(pex, :_ppl_pw_y_resp)
+    for want in (:likelihood, :posterior)
+        @test !_gen_query_has_response_plate(pbuilt.spec, pplan, want)
+    end
+    @test _gen_query_has_response_plate(pbuilt.spec, pplan, :pointwise)
+    # Ranged Poisson routes plate and matches the fused density.
+    rpplan = _gen_ranged_plan(pplan, 1:6)
+    rpbuilt = build_kernel(rpplan)
+    rpex = kernel_expr(rpplan, rpbuilt.layout)
+    @test !_has_call(rpex, :dot)
+    @test _has_sym(rpex, :_ppl_pw_y_resp)
+    for want in (:likelihood, :posterior)
+        @test _gen_query_has_response_plate(rpbuilt.spec, rpplan, want)
+    end
+    up = [0.1, -0.2]
+    peta = up[1] .+ up[2] .* pplan.columns[:x]
+    ppoints = _query(pbuilt.spec, pplan, :pointwise, up)
+    @test keys(ppoints) == (:y,)
+    @test size(ppoints.y) == size(pplan.columns[:y])
+    @test ppoints.y ≈ logpdf.(Poisson.(exp.(peta)), pplan.columns[:y])
+    @test sum(ppoints.y) ≈ _query(pbuilt.spec, pplan, :likelihood, up)
+    @test _query(rpbuilt.spec, rpplan, :posterior, up) ≈
+        _query(pbuilt.spec, pplan, :posterior, up)
+    _check_gradient(rpbuilt.spec, rpplan, up)
+    # Weighted Bernoulli stays on the plate path.
+    cols, n = _gen_columns()
+    cols[:y] = repeat([false, true], 3)
+    cols[:w] = [1.0, 2.0, 1.0, 1.0, 2.0, 1.0]
+    wplan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BernoulliLogitFam, LogitLink, :y, :eta,
+            nothing, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(wplan)
+    wbuilt = build_kernel(wplan)
+    wex = kernel_expr(wplan, wbuilt.layout)
+    @test !_has_call(wex, :dot)
+    @test _has_sym(wex, :_ppl_pw_y_resp)
+    for want in (:likelihood, :posterior)
+        @test _gen_query_has_response_plate(wbuilt.spec, wplan, want)
+    end
+    @test _query(wbuilt.spec, wplan, :likelihood, u) ≈
+        sum(cols[:w] .* logpdf.(Bernoulli.(1 ./ (1 .+ exp.(-eta))), cols[:y]))
+    _check_gradient(wbuilt.spec, wplan, u)
+end
+
+function _gen_weighted_bernoulli_plan(y, fam = BernoulliLogitFam,
+        link = LogitLink)
+    cols, n = _gen_columns()
+    cols[:y] = y
+    cols[:w] = [1.0, 2.0, 1.0, 1.0, 2.0, 1.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(fam, link, :y, :eta, nothing, :w,
+            _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+# Bernoulli plate Bool normalization (snag `bernoulli-int-la-78487520`):
+# Int 0/1 responses read Bool lanes through a bind-folded `_ppl_yb_`
+# recipe — never an in-cell `yv != 0` comparison, which
+# misdifferentiates under native Enzyme in some plate shapes (-10.10 vs
+# true -4.97, NaN on perturbation). Bool columns skip the recipe.
+@testset "bernoulli plate Int-y Bool normalization" begin
+    u = [0.25, 0.5]
+    # Weighted logit Int: recipe present, no scalar comparison in the
+    # program, values match the Bool twin, gradient matches findiff.
+    iplan = _gen_weighted_bernoulli_plan(repeat([0, 1], 3))
+    ibuilt = build_kernel(iplan)
+    iex = kernel_expr(iplan, ibuilt.layout)
+    @test _has_sym(iex, :_ppl_yb_y_resp)
+    @test !_has_call(iex, :!=)
+    bplan = _gen_weighted_bernoulli_plan(repeat([false, true], 3))
+    bbuilt = build_kernel(bplan)
+    bex = kernel_expr(bplan, bbuilt.layout)
+    @test !_has_sym(bex, :_ppl_yb_y_resp)
+    @test _query(ibuilt.spec, iplan, :posterior, u) ≈
+        _query(bbuilt.spec, bplan, :posterior, u)
+    _check_gradient(ibuilt.spec, iplan, u)
+    # Ranged logit Int: plate route matches the fused density, gradient
+    # matches findiff.
+    fplan = _gen_bernoulli_plan(repeat([0, 1], 3))
+    fbuilt = build_kernel(fplan)
+    rplan = _gen_ranged_plan(fplan, 1:6)
+    rbuilt = build_kernel(rplan)
+    rex = kernel_expr(rplan, rbuilt.layout)
+    @test _has_sym(rex, :_ppl_yb_y_resp)
+    @test !_has_call(rex, :!=)
+    @test _query(rbuilt.spec, rplan, :posterior, u) ≈
+        _query(fbuilt.spec, fplan, :posterior, u)
+    _check_gradient(rbuilt.spec, rplan, u)
+    # Weighted probit/cloglog Int: recipe present, no scalar
+    # comparison, gradient matches findiff.
+    for (fam, link) in
+            ((BernoulliProbitFam, ProbitLink), (BernoulliCloglogFam, CloglogLink))
+        lplan = _gen_weighted_bernoulli_plan(repeat([0, 1], 3), fam, link)
+        lbuilt = build_kernel(lplan)
+        lex = kernel_expr(lplan, lbuilt.layout)
+        @test _has_sym(lex, :_ppl_yb_y_resp)
+        @test !_has_call(lex, :!=)
+        _check_gradient(lbuilt.spec, lplan, u)
+    end
 end
 
 function _gen_binomial_plan(y, trials)
@@ -291,6 +491,740 @@ end
     _check_gradient(built.spec, plan, u)
 end
 
+function _gen_student_plan(; nu = :nu)
+    cols, n = _gen_columns()
+    params = SampledParameter[
+        SampledParameter(:sigma, :exponential, (arg1 = 1.0,), nothing, :sigma)]
+    nu isa Symbol && push!(params,
+        SampledParameter(:nu, :gamma, (arg1 = 2.0, arg2 = 0.1), nothing, :nu))
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu,
+            :sigma, nothing, _none_evidence(), :y_resp, nothing, nothing; nu = nu)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_student(cols, coef, sigma, nu)
+    mu = coef[1] .+ coef[2] .* cols[:x]
+    ll = sum(logpdf(LocationScale(m, sigma, TDist(nu)), y)
+        for (m, y) in zip(mu, cols[:y]))
+    pr = logpdf(Normal(0, 1), coef[1]) + logpdf(Normal(0, 2), coef[2]) +
+        logpdf(Exponential(1), sigma) + logpdf(Gamma(2.0, 0.1), nu)
+    return (; ll, pr)
+end
+
+@testset "student values and gradient" begin
+    plan = _gen_student_plan()
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3, 0.5]
+    nt = constrain(built.layout, u)
+    ref = _ref_student(plan.columns, Vector(nt.mu), nt.sigma, nt.nu)
+    @test _query(built.spec, plan, :posterior, u) ≈ ref.ll + ref.pr + u[3] + u[4]
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "student literal-nu values" begin
+    plan = _gen_student_plan(; nu = 4.0)
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3]
+    nt = constrain(built.layout, u)
+    mu = Vector(nt.mu)[1] .+ Vector(nt.mu)[2] .* plan.columns[:x]
+    ll = sum(logpdf(LocationScale(m, nt.sigma, TDist(4.0)), y)
+        for (m, y) in zip(mu, plan.columns[:y]))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Exponential(1), nt.sigma)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[3]
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted student values" begin
+    cols, n = _gen_columns()
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma,
+            :w, _none_evidence(), :y_resp, nothing, nothing; nu = :nu)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        SampledParameter[SampledParameter(:sigma, :exponential, (arg1 = 1.0,),
+                nothing, :sigma),
+            SampledParameter(:nu, :gamma, (arg1 = 2.0, arg2 = 0.1), nothing, :nu)],
+        AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3, 0.5]
+    nt = constrain(built.layout, u)
+    mu = Vector(nt.mu)[1] .+ Vector(nt.mu)[2] .* cols[:x]
+    ll = sum(cols[:w] .*
+        [logpdf(LocationScale(m, nt.sigma, TDist(nt.nu)), y)
+            for (m, y) in zip(mu, cols[:y])])
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Exponential(1), nt.sigma) + logpdf(Gamma(2.0, 0.1), nt.nu)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[3] + u[4]
+    _check_gradient(built.spec, plan, u)
+end
+
+function _gen_hurdle_plan(; p_zero = :p_zero)
+    cols, n = _gen_columns()
+    cols[:y] = [0, 1, 2, 0, 3, 1]
+    params = p_zero isa Symbol ? SampledParameter[
+        SampledParameter(:p_zero, :beta, (arg1 = 2.0, arg2 = 2.0), nothing, :p_zero)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta,
+            p_zero, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _gen_zip_plan(; zi = :zi)
+    cols, n = _gen_columns()
+    cols[:y] = [0, 1, 2, 0, 3, 1]
+    params = SampledParameter[]
+    zi isa Symbol && push!(params,
+        SampledParameter(:zi, :beta, (arg1 = 2.0, arg2 = 2.0), nothing, :zi))
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp, nothing, nothing; zi = zi)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_hurdle(cols, coef, p0)
+    lam = exp.(coef[1] .+ coef[2] .* cols[:x])
+    ll = sum(zip(cols[:y], lam)) do (y, l)
+        y == 0 ? log(p0) :
+            log1p(-p0) + logpdf(Poisson(l), y) - log(-expm1(-l))
+    end
+    return ll
+end
+
+@testset "hurdle values and gradient" begin
+    plan = _gen_hurdle_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u)
+    ll = _ref_hurdle(plan.columns, Vector(nt.eta), nt.p_zero)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(Beta(2.0, 2.0), nt.p_zero)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "hurdle literal-p_zero values" begin
+    plan = _gen_hurdle_plan(; p_zero = 0.35)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_hurdle(plan.columns, Vector(nt.eta), 0.35)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+function _gen_nb1_plan(; p = :p)
+    cols, n = _gen_columns()
+    cols[:y] = [0, 1, 2, 0, 3, 1]
+    params = p isa Symbol ? SampledParameter[
+        SampledParameter(:p, :beta, (arg1 = 2.0, arg2 = 2.0), nothing, :p)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(NegativeBinomialFam, LogLink, :y, :eta,
+            p, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_nb1(cols, coef, p)
+    rr = exp.(coef[1] .+ coef[2] .* cols[:x])
+    return sum(logpdf(NegativeBinomial(v, p), y)
+        for (y, v) in zip(cols[:y], rr))
+end
+
+@testset "nb1 values and gradient" begin
+    plan = _gen_nb1_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u)
+    ll = _ref_nb1(plan.columns, Vector(nt.eta), nt.p)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(Beta(2.0, 2.0), nt.p)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "nb1 literal-p values" begin
+    plan = _gen_nb1_plan(; p = 0.4)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_nb1(plan.columns, Vector(nt.eta), 0.4)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+# Two-term log-sum-exp for the zero-arm oracle (stable; no new test dep).
+_zi_logaddexp(a::Real, b::Real) = max(a, b) + log1p(exp(-abs(a - b)))
+
+function _ref_zip(cols, coef, zi)
+    eta = coef[1] .+ coef[2] .* cols[:x]
+    ll = sum(zip(eta, cols[:y])) do (e, y)
+        pp = logpdf(Poisson(exp(e)), y)
+        y == 0 ? _zi_logaddexp(log(zi), log1p(-zi) + pp) : log1p(-zi) + pp
+    end
+    pr = logpdf(Normal(0, 1), coef[1]) + logpdf(Normal(0, 2), coef[2]) +
+        logpdf(Beta(2.0, 2.0), zi)
+    return (; ll, pr)
+end
+
+# Unit-support (logistic) log-Jacobian from the constrained value.
+_zi_unit_jac(zi) = log(zi) + log1p(-zi)
+
+@testset "zip values and gradient" begin
+    plan = _gen_zip_plan()
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3]
+    nt = constrain(built.layout, u)
+    ref = _ref_zip(plan.columns, Vector(nt.eta), nt.zi)
+    @test _query(built.spec, plan, :likelihood, u) ≈ ref.ll
+    @test _query(built.spec, plan, :prior, u) ≈ ref.pr
+    @test _query(built.spec, plan, :posterior, u) ≈
+        ref.ll + ref.pr + _zi_unit_jac(nt.zi)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "zip literal-zi values" begin
+    plan = _gen_zip_plan(; zi = 0.25)
+    built = build_kernel(plan)
+    u = [0.1, -0.2]
+    nt = constrain(built.layout, u)
+    eta = Vector(nt.eta)[1] .+ Vector(nt.eta)[2] .* plan.columns[:x]
+    ll = sum(zip(eta, plan.columns[:y])) do (e, y)
+        pp = logpdf(Poisson(exp(e)), y)
+        y == 0 ? _zi_logaddexp(log(0.25), log1p(-0.25) + pp) :
+            log1p(-0.25) + pp
+    end
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted hurdle values" begin
+    cols, n = _gen_columns()
+    cols[:y] = [0, 1, 2, 0, 3, 1]
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(HurdlePoissonFam, LogLink, :y, :eta,
+            0.35, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    lam = exp.(Vector(nt.eta)[1] .+ Vector(nt.eta)[2] .* cols[:x])
+    ll = sum(cols[:w] .*
+        [y == 0 ? log(0.35) :
+            log1p(-0.35) + logpdf(Poisson(l), y) - log(-expm1(-l))
+            for (y, l) in zip(cols[:y], lam)])
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted zip values" begin
+    cols, n = _gen_columns()
+    cols[:y] = [0, 1, 2, 0, 3, 1]
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta,
+            nothing, :w, _none_evidence(), :y_resp, nothing, nothing; zi = :zi)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[SampledParameter(:zi, :beta, (arg1 = 2.0, arg2 = 2.0),
+                nothing, :zi)],
+        AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3]
+    nt = constrain(built.layout, u)
+    eta = Vector(nt.eta)[1] .+ Vector(nt.eta)[2] .* cols[:x]
+    ll = sum(cols[:w] .*
+        [let pp = logpdf(Poisson(exp(e)), y)
+             y == 0 ? _zi_logaddexp(log(nt.zi), log1p(-nt.zi) + pp) :
+                 log1p(-nt.zi) + pp
+         end for (e, y) in zip(eta, cols[:y])])
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(Beta(2.0, 2.0), nt.zi)
+    @test _query(built.spec, plan, :posterior, u) ≈
+        ll + pr + _zi_unit_jac(nt.zi)
+    _check_gradient(built.spec, plan, u)
+end
+
+function _gen_ig_plan(; lam = :lam)
+    cols, n = _gen_columns()
+    params = lam isa Symbol ? SampledParameter[
+        SampledParameter(:lam, :lognormal, (arg1 = -0.3, arg2 = 1.0), nothing, :lam)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta,
+            lam, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _gen_weibull_plan(; k = :k)
+    cols, n = _gen_columns()
+    params = k isa Symbol ? SampledParameter[
+        SampledParameter(:k, :lognormal, (arg1 = 0.0, arg2 = 0.3), nothing, :k)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(WeibullFam, LogLink, :y, :eta,
+            k, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_weibull(cols, coef, k)
+    th = exp.(coef[1] .+ coef[2] .* cols[:x])
+    return sum(logpdf(Weibull(k, t), y) for (y, t) in zip(cols[:y], th))
+end
+
+function _gen_betabinomial2_plan(; phi = :phi, trials = :n)
+    cols, n = _gen_columns()
+    cols[:y] = [6, 8, 5, 9, 4, 7]
+    cols[:n] = [10, 12, 8, 15, 9, 11]
+    params = phi isa Symbol ? SampledParameter[
+        SampledParameter(:phi, :gamma, (arg1 = 2.0, arg2 = 0.1), nothing, :phi)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu,
+            phi, nothing, _none_evidence(), :y_resp, trials, nothing)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_ig(cols, coef, lam)
+    mu = exp.(coef[1] .+ coef[2] .* cols[:x])
+    lvals = lam isa Real ? fill(Float64(lam), length(mu)) : lam
+    return sum(logpdf(InverseGaussian(m, l), y)
+        for (y, m, l) in zip(cols[:y], mu, lvals))
+end
+
+function _gen_vm_plan(; kappa = :kappa, interval = nothing)
+    cols, n = _gen_columns()
+    cols[:y] = [0.3, -1.1, 2.0, -2.0, 0.5, 1.1]
+    params = kappa isa Symbol ? SampledParameter[
+        SampledParameter(:kappa, :gamma, (arg1 = 2.0, arg2 = 0.1), nothing, :kappa)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu,
+            kappa, nothing, _none_evidence(), :y_resp, nothing, nothing;
+            interval = interval)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_vm(cols, coef, kap)
+    mu = coef[1] .+ coef[2] .* cols[:x]
+    kvals = kap isa Real ? fill(Float64(kap), length(mu)) : kap
+    return sum(logpdf(VonMises(m, k), y)
+        for (y, m, k) in zip(cols[:y], mu, kvals))
+end
+
+# Circular oracle on the BRM `CircularVonMises` path (wrap mu into the
+# interval, wrap y into the moving support, Distributions base) —
+# independent of the kernel's rem-based spelling.
+function _ref_vm_circ(cols, coef, kap, lo, hi)
+    mu = coef[1] .+ coef[2] .* cols[:x]
+    kvals = kap isa Real ? fill(Float64(kap), length(mu)) : kap
+    w = hi - lo
+    return sum(zip(cols[:y], mu, kvals)) do (y, m, k)
+        wm = lo + mod(m - lo, w)
+        r = (wm - pi) + mod(y - (wm - pi), 2pi)
+        logpdf(VonMises(wm, k), r)
+    end
+end
+
+function _gen_exp_plan()
+    cols, n = _gen_columns()
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(ExponentialLogFam, LogLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _gen_ln_plan(; sigma = :sigma)
+    cols, n = _gen_columns()
+    params = sigma isa Symbol ? SampledParameter[
+        SampledParameter(:sigma, :exponential, (arg1 = 1.0,), nothing, :sigma)] :
+        SampledParameter[]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(LogNormalFam, IdentityLink, :y, :mu,
+            sigma, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        params,
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+function _ref_exp(cols, coef)
+    mu = exp.(coef[1] .+ coef[2] .* cols[:x])
+    return sum(logpdf(Exponential(m), y) for (y, m) in zip(cols[:y], mu))
+end
+
+function _ref_ln(cols, coef, sig)
+    mu = coef[1] .+ coef[2] .* cols[:x]
+    return sum(logpdf(LogNormal(m, sig), y) for (y, m) in zip(cols[:y], mu))
+end
+
+@testset "ig values and gradient" begin
+    plan = _gen_ig_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u)
+    ll = _ref_ig(plan.columns, Vector(nt.eta), nt.lam)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(LogNormal(-0.3, 1.0), nt.lam)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+function _ref_betabinomial2(cols, coef, phi; trials = cols[:n])
+    mu = 1 ./ (1 .+ exp.(.-(coef[1] .+ coef[2] .* cols[:x])))
+    return sum(zip(cols[:y], trials, mu)) do (y, t, m)
+        logpdf(BetaBinomial(t, m * phi, (1 - m) * phi), y)
+    end
+end
+
+@testset "betabinomial2 values and gradient" begin
+    plan = _gen_betabinomial2_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 1.0]
+    nt = constrain(built.layout, u)
+    ll = _ref_betabinomial2(plan.columns, Vector(nt.mu), nt.phi)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Gamma(2.0, 0.1), nt.phi)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "ig literal-lambda values" begin
+    plan = _gen_ig_plan(; lam = 1.5)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_ig(plan.columns, Vector(nt.eta), 1.5)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weibull values and gradient" begin
+    plan = _gen_weibull_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u)
+    ll = _ref_weibull(plan.columns, Vector(nt.eta), nt.k)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(LogNormal(0.0, 0.3), nt.k)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weibull literal-k values" begin
+    plan = _gen_weibull_plan(; k = 2.0)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_weibull(plan.columns, Vector(nt.eta), 2.0)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted weibull values" begin
+    cols, n = _gen_columns()
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(WeibullFam, LogLink, :y, :eta,
+            2.0, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    th = exp.(Vector(nt.eta)[1] .+ Vector(nt.eta)[2] .* cols[:x])
+    ll = sum(cols[:w] .*
+        [logpdf(Weibull(2.0, t), y) for (y, t) in zip(cols[:y], th)])
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "ig predictor-lambda values" begin
+    cols, n = _gen_columns()
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta,
+            ScalePredictorRef(:ls, LogLink), nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta),
+            PredictorSpec(:ls, LogLink, _gen_terms(), :ls)],
+        [_gen_priors(:eta); _gen_priors(:ls)],
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.3, -0.1]
+    nt = constrain(built.layout, u)
+    lam = exp.(Vector(nt.ls)[1] .+ Vector(nt.ls)[2] .* cols[:x])
+    ll = _ref_ig(plan.columns, Vector(nt.eta), lam)
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(Normal(0, 1), nt.ls[1]) + logpdf(Normal(0, 2), nt.ls[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "betabinomial2 literal-phi values" begin
+    plan = _gen_betabinomial2_plan(; phi = 4.0)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_betabinomial2(plan.columns, Vector(nt.mu), 4.0)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted ig values" begin
+    cols, n = _gen_columns()
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(InverseGaussianFam, LogLink, :y, :eta,
+            1.5, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = exp.(Vector(nt.eta)[1] .+ Vector(nt.eta)[2] .* cols[:x])
+    ll = sum(cols[:w] .*
+        [logpdf(InverseGaussian(m, 1.5), y) for (y, m) in zip(cols[:y], mu)])
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted betabinomial2 values" begin
+    cols, n = _gen_columns()
+    cols[:y] = [6, 8, 5, 9, 4, 7]
+    cols[:n] = [10, 12, 8, 15, 9, 11]
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BetaBinomial2Fam, LogitLink, :y, :mu,
+            4.0, :w, _none_evidence(), :y_resp, :n, nothing)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = 1 ./ (1 .+ exp.(.-(Vector(nt.mu)[1] .+ Vector(nt.mu)[2] .* cols[:x])))
+    ll = sum(cols[:w] .*
+        [logpdf(BetaBinomial(t, m * 4.0, (1 - m) * 4.0), y)
+            for (y, t, m) in zip(cols[:y], cols[:n], mu)])
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "vm values and gradient" begin
+    plan = _gen_vm_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 1.0]
+    nt = constrain(built.layout, u)
+    ll = _ref_vm(plan.columns, Vector(nt.mu), nt.kappa)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Gamma(2.0, 0.1), nt.kappa)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "vm circular values and gradient" begin
+    plan = _gen_vm_plan(; interval = (-Float64(pi), Float64(pi)))
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 1.0]
+    nt = constrain(built.layout, u)
+    ll = _ref_vm_circ(plan.columns, Vector(nt.mu), nt.kappa, -Float64(pi),
+        Float64(pi))
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Gamma(2.0, 0.1), nt.kappa)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "vm literal-kappa values" begin
+    plan = _gen_vm_plan(; kappa = 1.7)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_vm(plan.columns, Vector(nt.mu), 1.7)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "vm predictor-kappa values" begin
+    cols, n = _gen_columns()
+    cols[:y] = [0.3, -1.1, 2.0, -2.0, 0.5, 1.1]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu,
+            ScalePredictorRef(:lk, LogLink), nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu),
+            PredictorSpec(:lk, LogLink, _gen_terms(), :lk)],
+        [_gen_priors(:mu); _gen_priors(:lk)],
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.3, -0.1]
+    nt = constrain(built.layout, u)
+    kap = exp.(Vector(nt.lk)[1] .+ Vector(nt.lk)[2] .* cols[:x])
+    ll = _ref_vm(plan.columns, Vector(nt.mu), kap)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Normal(0, 1), nt.lk[1]) + logpdf(Normal(0, 2), nt.lk[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted vm values" begin
+    cols, n = _gen_columns()
+    cols[:y] = [0.3, -1.1, 2.0, -2.0, 0.5, 1.1]
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(VonMisesFam, IdentityLink, :y, :mu,
+            1.7, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = Vector(nt.mu)[1] .+ Vector(nt.mu)[2] .* cols[:x]
+    ll = sum(cols[:w] .*
+        [logpdf(VonMises(m, 1.7), y) for (y, m) in zip(cols[:y], mu)])
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "exponential values and gradient" begin
+    plan = _gen_exp_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_exp(plan.columns, Vector(nt.eta))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "lognormal values and gradient" begin
+    plan = _gen_ln_plan()
+    built = build_kernel(plan)
+    u = [0.5, -0.25, 0.1]
+    nt = constrain(built.layout, u)
+    ll = _ref_ln(plan.columns, Vector(nt.mu), nt.sigma)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2]) +
+        logpdf(Exponential(1), nt.sigma)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + logjac(built.layout, u)
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "lognormal literal-sigma values" begin
+    plan = _gen_ln_plan(; sigma = 0.5)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    ll = _ref_ln(plan.columns, Vector(nt.mu), 0.5)
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted exponential values" begin
+    cols, n = _gen_columns()
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(ExponentialLogFam, LogLink, :y, :eta,
+            nothing, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = exp.(Vector(nt.eta)[1] .+ Vector(nt.eta)[2] .* cols[:x])
+    ll = sum(cols[:w] .*
+        [logpdf(Exponential(m), y) for (y, m) in zip(cols[:y], mu)])
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "weighted lognormal values" begin
+    cols, n = _gen_columns()
+    cols[:w] = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(LogNormalFam, IdentityLink, :y, :mu,
+            0.5, :w, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    built = build_kernel(plan)
+    u = [0.5, -0.25]
+    nt = constrain(built.layout, u)
+    mu = Vector(nt.mu)[1] .+ Vector(nt.mu)[2] .* cols[:x]
+    ll = sum(cols[:w] .*
+        [logpdf(LogNormal(m, 0.5), y) for (y, m) in zip(cols[:y], mu)])
+    pr = logpdf(Normal(0, 1), nt.mu[1]) + logpdf(Normal(0, 2), nt.mu[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
 @testset "factor values (int and string groupings)" begin
     for g in ([1, 2, 1, 3, 2, 3], ["a", "b", "a", "c", "b", "c"])
         cols, n = _gen_columns()
@@ -379,22 +1313,32 @@ end
         logpdf(Exponential(1), s)
     @test _query(built.spec, plan, :posterior, u) ≈ base - corr + pr + u[3]
     _check_gradient(built.spec, plan, u)
-    # Censored [0, 5] with breaches both sides.
+    # refused: out-of-bounds observed evidence (0tz0qfu evidence prong).
     yc = [-1.0, 2.0, 1.5, 9.0, 3.0, 2.0]
-    planc = _gen_evidence_plan(:censored, 0.0, 5.0, yc)
-    builtc = build_kernel(planc)
-    ntc = constrain(builtc.layout, u)
-    muc = ntc.mu[1] .+ ntc.mu[2] .* planc.columns[:x]
-    sc = ntc.sigma
-    ll = 0.0
-    for i in eachindex(yc)
-        d = Normal(muc[i], sc)
-        ll += yc[i] < 0.0 ? logcdf(d, 0.0) :
-            yc[i] > 5.0 ? logccdf(d, 5.0) : logpdf(d, yc[i])
+    @test_throws ContractValidationError build_kernel(
+        _gen_evidence_plan(:censored, 0.0, 5.0, yc))
+    # Censored [0, 5] with rows AT the bounds (SB-parity pair mod-weights
+    # twin C1b): at-bound rows are censored observations (clamp law —
+    # CDF mass, not density).
+    ycb = [0.0, 2.0, 1.5, 5.0, 3.0, 2.0]
+    plancb = _gen_evidence_plan(:censored, 0.0, 5.0, ycb)
+    builtcb = build_kernel(plancb)
+    ntcb = constrain(builtcb.layout, u)
+    mucb = ntcb.mu[1] .+ ntcb.mu[2] .* plancb.columns[:x]
+    scb = ntcb.sigma
+    llb = 0.0
+    for i in eachindex(ycb)
+        d = Normal(mucb[i], scb)
+        llb += ycb[i] <= 0.0 ? logcdf(d, 0.0) :
+            ycb[i] >= 5.0 ? logccdf(d, 5.0) : logpdf(d, ycb[i])
     end
-    prc = logpdf(Normal(0, 1), ntc.mu[1]) + logpdf(Normal(0, 2), ntc.mu[2]) +
-        logpdf(Exponential(1), sc)
-    @test _query(builtc.spec, planc, :posterior, u) ≈ ll + prc + u[3]
+    prcb = logpdf(Normal(0, 1), ntcb.mu[1]) + logpdf(Normal(0, 2), ntcb.mu[2]) +
+        logpdf(Exponential(1), scb)
+    valcb = _query(builtcb.spec, plancb, :posterior, u)
+    @test valcb ≈ llb + prcb + u[3]
+    # SB pin (BridgeStan, BRM a3865fa, StanBlocks 24578c3, propto=false).
+    @test isapprox(valcb, -24.388817517971585; atol = 1e-12, rtol = 1e-12)
+    _check_gradient(builtcb.spec, plancb, u)
     # Interval (response is lower, upper 5).
     plani = _gen_evidence_plan(:interval_censored, nothing, 5.0, y)
     builti = build_kernel(plani)
@@ -430,22 +1374,26 @@ end
 end
 
 @testset "poisson evidence lower bounds shift by one (inclusive cdf)" begin
-    # poisson.cdf(k) = P(Y ≤ k): lower-side masses cover Y < lb, i.e. F(lb-1),
-    # and interval cells cover [yv, ub], i.e. F(ub) - F(yv-1). Oracles are
-    # Distributions.jl cdf/logpdf arithmetic (F(-1) = 0 definitionally),
-    # never the emitted forms.
+    # poisson.cdf(k) = P(Y ≤ k): TRUNCATED lower-side masses cover Y < lb,
+    # i.e. F(lb-1), while CENSORED arms follow the clamp law (Y = clamp(X)):
+    # yv ≤ lb takes F(lb) and yv ≥ ub takes 1 - F(ub-1) — at-bound rows are
+    # the censored observations (SB parity pair mod-weights). Interval cells
+    # stay open below ((yv, ub], i.e. F(ub) - F(yv) — the brm-use contract).
+    # Oracles are Distributions.jl cdf/logpdf arithmetic (F(-1) = 0
+    # definitionally), never the emitted forms.
     _F(lam, k) = k < 0 ? 0.0 : cdf(Poisson(lam), k)
     cols, n = _gen_columns()
-    cols[:y] = [0, 1, 2, 1, 3, 2]
+    cols[:y] = [2, 2, 2, 2, 3, 2]
     cols[:lo] = [0, 1, 0, 2, 1, 0]
     u = [0.1, -0.2]
-    function _run(ev)
+    function _run(ev; response = cols[:y])
+        values = merge(cols, Dict(:y => response))
         plan = StructuralPlan(
             LikelihoodSpec[LikelihoodSpec(PoissonLogFam, LogLink, :y, :eta,
                 nothing, nothing, ev, :y_resp)],
             PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
             _gen_priors(:eta),
-            SampledParameter[], AssignmentSpec[], cols, n)
+            SampledParameter[], AssignmentSpec[], values, n)
         built = build_kernel(plan)
         nt = constrain(built.layout, u)
         lam = exp.(nt.eta[1] .+ nt.eta[2] .* cols[:x])
@@ -470,21 +1418,46 @@ end
     corr = sum(log.(_F.(lam, 4) .- _F.(lam, cols[:lo] .- 1)))
     @test _query(built.spec, plan, :posterior, u) ≈ base - corr + pr
     _check_gradient(built.spec, plan, u)
-    # Censored lower-only at 2: yv < 2 contributes log(F(1)).
+    # Censored lower-only at 2: yv ≤ 2 contributes log(F(2)) (clamp law).
     built, plan, lam, pr = _run(ResponseEvidence(:censored, 2, nothing))
-    cell = ifelse.(y .< 2, log.(_F.(lam, 1)), logpdf.(Poisson.(lam), y))
+    cell = ifelse.(y .<= 2, log.(_F.(lam, 2)), logpdf.(Poisson.(lam), y))
     @test _query(built.spec, plan, :posterior, u) ≈ sum(cell) + pr
     _check_gradient(built.spec, plan, u)
-    # Censored two-sided [1,2].
-    built, plan, lam, pr = _run(ResponseEvidence(:censored, 1, 2))
-    cell = ifelse.(y .< 1, log.(_F.(lam, 0)),
-        ifelse.(y .> 2, log.(1 .- _F.(lam, 2)), logpdf.(Poisson.(lam), y)))
+    # Censored two-sided [1,2]: yv ≤ 1 takes F(1), yv ≥ 2 takes 1 - F(1).
+    built, plan, lam, pr = _run(ResponseEvidence(:censored, 1, 2); response = [1, 1, 2, 1, 2, 2])
+    y = plan.columns[:y]
+    cell = ifelse.(y .<= 1, log.(_F.(lam, 1)),
+        ifelse.(y .>= 2, log.(1 .- _F.(lam, 1)), logpdf.(Poisson.(lam), y)))
     @test _query(built.spec, plan, :posterior, u) ≈ sum(cell) + pr
     _check_gradient(built.spec, plan, u)
-    # Interval [yv,4]: log(F(4) - F(yv-1)); the y = 0 row pins F(-1) = 0.
+    # Censored at-bounds twin C2b (SB-parity pair mod-weights): every row is
+    # a censored observation (y == bound takes the CDF mass, not density).
+    cols2 = _gen_columns()[1]
+    cols2[:y] = [1, 1, 2, 1, 2, 2]
+    plan2 = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(PoissonLogFam, LogLink, :y, :eta,
+            nothing, nothing, ResponseEvidence(:censored, 1, 2), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, LogLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols2, n)
+    built2 = build_kernel(plan2)
+    nt2 = constrain(built2.layout, u)
+    lam2 = exp.(nt2.eta[1] .+ nt2.eta[2] .* cols2[:x])
+    pr2 = logpdf(Normal(0, 1), nt2.eta[1]) + logpdf(Normal(0, 2), nt2.eta[2])
+    y2 = cols2[:y]
+    cell2 = ifelse.(y2 .<= 1, log.(_F.(lam2, 1)),
+        ifelse.(y2 .>= 2, log.(1 .- _F.(lam2, 1)), logpdf.(Poisson.(lam2), y2)))
+    val2 = _query(built2.spec, plan2, :posterior, u)
+    @test val2 ≈ sum(cell2) + pr2
+    # SB pin (BridgeStan, BRM a3865fa, StanBlocks 24578c3, propto=false).
+    @test isapprox(val2, -7.8605785148131275; atol = 1e-12, rtol = 1e-12)
+    _check_gradient(built2.spec, plan2, u)
+    # Interval (yv,4]: log(F(4) - F(yv)) — open below per the brm-use
+    # contract (the response is the exclusive lower endpoint).
     built, plan, lam, pr =
         _run(ResponseEvidence(:interval_censored, nothing, 4))
-    ival = sum(log.(_F.(lam, 4) .- _F.(lam, y .- 1)))
+    y = plan.columns[:y]
+    ival = sum(log.(_F.(lam, 4) .- _F.(lam, y)))
     @test _query(built.spec, plan, :posterior, u) ≈ ival + pr
     _check_gradient(built.spec, plan, u)
 end
@@ -598,9 +1571,13 @@ end
     plan = _gen_gaussian_plan()
     built = build_kernel(plan)
     u = _unbind(plan)
+    # refused: codegen/query entry requires a bound plan (IR contract)
     @test_throws ContractValidationError build_kernel(u)
+    # refused: codegen/query entry requires a bound plan (IR contract)
     @test_throws ContractValidationError kernel_expr(u, built.layout)
+    # refused: codegen/query entry requires a bound plan (IR contract)
     @test_throws ContractValidationError assign_layout(u)
+    # refused: codegen/query entry requires a bound plan (IR contract)
     @test_throws ContractValidationError prepare_query(built, u, :sampler)
     # Rebinding the same columns reproduces the direct-build posterior.
     b = bind_data(u, plan.columns)
@@ -609,4 +1586,991 @@ end
     v = [0.5, -0.25, 0.1]
     @test _query(bb.spec, b, :posterior, v) ≈
         _query(built.spec, plan, :posterior, v)
+end
+
+# Per-cell latent (plate) parameters: `theta ~ Normal(mu, tau)` sampled once
+# per observation and read as the response location via a LatentTerm predictor
+# (`lp = theta`). References are independent Distributions.jl loops.
+function _gen_re_plan()
+    cols, n = _gen_columns()
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :loc, :sigma,
+            nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:loc, IdentityLink,
+            TermSpec[TermSpec(LatentTerm, [:theta], NamedTuple(), :theta,
+                :theta_lat)], :loc)],
+        PopulationPrior[],
+        SampledParameter[
+            SampledParameter(:mu, :normal, (arg1 = 0.0, arg2 = 5.0), nothing, :mu),
+            SampledParameter(:sigma, :exponential, (arg1 = 1.0,), nothing, :sigma),
+            SampledParameter(:tau, :exponential, (arg1 = 1.0,), nothing, :tau)],
+        AssignmentSpec[], cols, n;
+        plate_parameters = PlateParameter[
+            PlateParameter(:theta, :normal, (arg1 = :mu, arg2 = :tau), nothing)])
+    validate_plan(plan)
+    return plan
+end
+
+@testset "plate parameter random-effects values and gradient" begin
+    plan = _gen_re_plan()
+    built = build_kernel(plan)
+    # layout: mu, sigma, tau (3 scalars) + theta (n cells).
+    @test built.layout.total == 3 + plan.n_obs
+    @test coordinate_names(built.layout)[4] == Symbol("theta.1")
+    u = [0.3, -0.2, 0.1, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2]
+    nt = constrain(built.layout, u)
+    mu, sigma, tau, theta = nt.mu, nt.sigma, nt.tau, Vector(nt.theta)
+    ll = sum(logpdf.(Normal.(theta, sigma), plan.columns[:y]))
+    pr = logpdf(Normal(0, 5), mu) + logpdf(Exponential(1), sigma) +
+        logpdf(Exponential(1), tau) + sum(logpdf.(Normal(mu, tau), theta))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    # log-jacobian: exp for sigma (u[2]) and tau (u[3]); theta is identity.
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[2] + u[3]
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "plate parameter positive-support latent" begin
+    cols, n = _gen_columns()
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :loc, :sigma,
+            nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:loc, IdentityLink,
+            TermSpec[TermSpec(LatentTerm, [:b], NamedTuple(), :b, :b_lat)], :loc)],
+        PopulationPrior[],
+        SampledParameter[SampledParameter(:sigma, :exponential, (arg1 = 1.0,),
+            nothing, :sigma)],
+        AssignmentSpec[], cols, n;
+        plate_parameters = PlateParameter[
+            PlateParameter(:b, :exponential, (arg1 = 1.0,), nothing)])
+    validate_plan(plan)
+    built = build_kernel(plan)
+    @test built.layout.total == 1 + n
+    u = [-0.1, 0.2, -0.3, 0.1, 0.0, 0.4, -0.2]
+    nt = constrain(built.layout, u)
+    b, sigma = Vector(nt.b), nt.sigma
+    # Constrained values are all positive (broadcast exp transform).
+    @test all(>(0), b)
+    ll = sum(logpdf.(Normal.(b, sigma), plan.columns[:y]))
+    pr = logpdf(Exponential(1), sigma) + sum(logpdf.(Exponential(1), b))
+    # log-jacobian: exp for sigma (u[1]) plus each b cell (u[2:end]).
+    lj = u[1] + sum(u[2:end])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + lj
+    _check_gradient(built.spec, plan, u)
+end
+
+# Eight schools (the canonical parity acceptance case): a per-cell latent
+# `theta[i] ~ Normal(mu, tau)` observed with a PER-OBSERVATION KNOWN SCALE
+# `y[i] ~ Normal(theta[i], se[i])`, where `se` is a raw data column. The
+# response scale threads through the likelihood plate per cell exactly like a
+# per-obs weight. Oracle is an independent Distributions.jl loop.
+@testset "plate parameter eight-schools per-obs known scale" begin
+    y = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
+    se = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
+    n = length(y)
+    expr = Expr(:block,
+        :(mu ~ Normal(0, 5)),
+        :(tau ~ HalfNormal(5)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block,
+                    :(theta[i] ~ Normal(mu, tau)),
+                    :(y[i] ~ Normal.(theta[i], se[i]))))))
+    plan0 = lower_rkppl(expr, (:y, :se); conditioned = (:y, :se))
+    # The per-obs scale rides the response as a data-column name, not a scalar.
+    @test plan0.responses[1].scale == :se
+    plan = bind_data(plan0, Dict{Symbol,AbstractVector}(:y => y, :se => se))
+    built = build_kernel(plan)
+    # layout: mu (identity), tau (exp), theta (n identity cells).
+    @test built.layout.total == 2 + n
+    @test coordinate_names(built.layout)[3] == Symbol("theta.1")
+    u = vcat([0.4, 0.3], [0.1, -0.2, 0.05, 0.15, -0.1, 0.0, 0.2, -0.05])
+    nt = constrain(built.layout, u)
+    mu, tau, theta = nt.mu, nt.tau, Vector(nt.theta)
+    ll = sum(logpdf.(Normal.(theta, se), y))
+    pr = logpdf(Normal(0, 5), mu) + (logpdf(Normal(0, 5), tau) + log(2)) +
+        sum(logpdf.(Normal(mu, tau), theta))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    # log-jacobian: exp for tau (u[2]) only; mu and theta are identity.
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[2]
+    _check_gradient(built.spec, plan, u)
+end
+
+# The per-observation scale generalizes past Gaussian: an NB2 dispersion `phi`
+# (and, symmetrically, a Gamma shape `alpha`) may also be a per-obs data column.
+# It threads through the NB2 likelihood plate per cell exactly like the scale.
+@testset "NB2 per-observation dispersion column" begin
+    x = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
+    ycount = [3, 1, 6, 2, 1, 4]
+    phicol = [2.0, 3.0, 1.5, 2.5, 4.0, 1.0]
+    plan0 = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        mu = a .+ b .* x
+        y .~ NegativeBinomial2.(exp.(mu), phi)
+    end, (:y, :x, :phi); conditioned = (:y, :x, :phi))
+    @test only(plan0.responses).scale === :phi
+    plan = bind_data(plan0,
+        Dict{Symbol,AbstractVector}(:y => ycount, :x => x, :phi => phicol))
+    built = build_kernel(plan)
+    u = [0.2, -0.1]
+    nt = constrain(built.layout, u)
+    mu = exp.(nt.a .+ nt.b .* x)
+    ll = sum(logpdf.(NegativeBinomial.(phicol, phicol ./ (phicol .+ mu)), ycount))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    _check_gradient(built.spec, plan, u)
+end
+
+# A per-cell latent with a two-sided FINITE truncated-Normal support:
+# `theta[i] ~ truncated(Normal(mu, tau), lo, hi)` constrains each cell to
+# (lo, hi) via an affine-logistic transform and carries the exact
+# -log(cdf(hi)-cdf(lo)) renormalization. Oracle is Distributions.jl `truncated`.
+@testset "plate parameter interval-truncated latent" begin
+    y = [0.3, 1.2, -0.5, 2.1, 0.0, 1.7]
+    n = length(y)
+    lo, hi = -2.0, 5.0
+    expr = Expr(:block,
+        :(mu ~ Normal(0, 3)),
+        :(tau ~ HalfNormal(2)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block,
+                    :(theta[i] ~ truncated(Normal(mu, tau), $lo, $hi)),
+                    :(y[i] ~ Normal.(theta[i], 1.0))))))
+    plan = bind_data(lower_rkppl(expr, (:y,); conditioned = (:y,)),
+        Dict{Symbol,AbstractVector}(:y => y))
+    built = build_kernel(plan)
+    @test built.layout.total == 2 + n
+    u = vcat([0.3, 0.2], [0.1, -0.4, 0.7, -0.2, 0.5, 0.0])
+    nt = constrain(built.layout, u)
+    mu, tau, theta = nt.mu, nt.tau, Vector(nt.theta)
+    @test all(t -> lo < t < hi, theta)
+    ll = sum(logpdf.(Normal.(theta, 1.0), y))
+    pr = logpdf(Normal(0, 3), mu) + (logpdf(Normal(0, 2), tau) + log(2)) +
+        sum(logpdf.(truncated(Normal(mu, tau), lo, hi), theta))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    # log-jacobian: exp for tau (u[2]) + affine-logistic per theta cell.
+    ljtheta = sum(log(t - lo) + log(hi - t) - log(hi - lo) for t in theta)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[2] + ljtheta
+    _check_gradient(built.spec, plan, u)
+end
+
+# An upper-only scalar latent (a negative location under a negative ceiling)
+# carries the normalized truncated distribution plus the exp Jacobian.
+@testset "upper-truncated scalar latent end to end" begin
+    hi = -0.5
+    x = [0.5, -1.0, 0.25, 1.5, -0.75, 0.0]
+    y = [0.3, 1.2, -0.5, 2.1, 0.0, 1.7]
+    cols = Dict{Symbol,AbstractVector}(:x => x, :y => y)
+    expr = Expr(:block,
+        :(w ~ truncated(Normal(-1.0, 1.0), -Inf, $hi)),
+        :(a ~ Normal(0, 1)),
+        :(b ~ Normal(0, 1)),
+        :(mu = a .+ b .* x),
+        :(y .~ Normal.(mu, s)),
+        :(s ~ Exponential(1)))
+    plan = bind_data(lower_rkppl(expr, (:y, :x); conditioned = (:y, :x)), cols)
+    built = build_kernel(plan)
+    @test coordinate_names(built.layout) == [:w, :a, :b, :s]
+    u = [0.1, 0.3, -0.2, 0.25]
+    nt = constrain(built.layout, u)
+    a, b, c, s = nt.a, nt.b, nt.w, nt.s
+    @test c ≈ hi - exp(u[1])
+    @test c < hi
+    mu = a .+ b .* x
+    ll = sum(logpdf.(Normal.(mu, s), y))
+    pr = logpdf(Normal(0, 1), a) + logpdf(Normal(0, 1), b) +
+        logpdf(truncated(Normal(-1.0, 1.0), -Inf, hi), c) + logpdf(Exponential(1), s)
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[1] + u[4]
+    _check_gradient(built.spec, plan, u)
+    # Compared with the plain Normal, truncation adds its normalization
+    # and the coordinate transform adds its Jacobian.
+    interim = bind_data(lower_rkppl(Expr(:block,
+            :(w ~ Normal(-1.0, 1.0)),
+            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
+            :(mu = a .+ b .* x),
+            :(y .~ Normal.(mu, s)),
+            :(s ~ Exponential(1))), (:y, :x); conditioned = (:y, :x)), cols)
+    built_i = build_kernel(interim)
+    u_i = unconstrain(built_i.layout, (; w = c, a, b, s))
+    @test _query(built.spec, plan, :prior, u) ≈
+        _query(built_i.spec, interim, :prior, u_i) - logcdf(Normal(-1, 1), hi)
+    @test (_query(built.spec, plan, :posterior, u) -
+           _query(built_i.spec, interim, :posterior, u_i)) ≈ u[1] - logcdf(Normal(-1, 1), hi)
+end
+
+@testset "plate parameter upper-truncated latent" begin
+    y = [0.3, 1.2, -0.5, 2.1, 0.0, 1.7]
+    n = length(y)
+    hi = 2.0
+    expr = Expr(:block,
+        :(mu ~ Normal(0, 3)),
+        :(tau ~ HalfNormal(2)),
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
+            Expr(:for, Expr(:(=), :i, :(eachindex(y))),
+                Expr(:block,
+                    :(theta[i] ~ truncated(Normal(mu, tau), -Inf, $hi)),
+                    :(y[i] ~ Normal.(theta[i], 1.0))))))
+    plan = bind_data(lower_rkppl(expr, (:y,); conditioned = (:y,)),
+        Dict{Symbol,AbstractVector}(:y => y))
+    built = build_kernel(plan)
+    @test built.layout.total == 2 + n
+    u = vcat([0.3, 0.2], [0.1, -0.4, 0.7, -0.2, 0.5, 0.0])
+    nt = constrain(built.layout, u)
+    mu, tau, theta = nt.mu, nt.tau, Vector(nt.theta)
+    @test all(t -> t < hi, theta)
+    ll = sum(logpdf.(Normal.(theta, 1.0), y))
+    pr = logpdf(Normal(0, 3), mu) + (logpdf(Normal(0, 2), tau) + log(2)) +
+        sum(logpdf.(truncated(Normal(mu, tau), -Inf, hi), theta))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    # log-jacobian: exp for tau (u[2]) + bare-u per theta cell.
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[2] + sum(u[3:end])
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "scan: centered AR(1) end to end" begin
+    m = @rkppl begin
+        phi ~ Normal(0, 1)
+        s ~ Exponential(1)
+        sigma ~ Exponential(1)
+        @scan begin
+            h[1] ~ Normal(0, 1)
+            for t in 2:T
+                h[t] ~ Normal(phi * h[t - 1], s)
+            end
+        end
+        y .~ Normal.(h, sigma)
+    end
+    ydata = [0.3, -0.1, 0.5, 0.2, -0.4]
+    plan = (m() | (; y = ydata))
+    built = build_kernel(plan)
+    @test built.layout.total == 8            # phi, s, sigma, h[1..5]
+
+    # independent Distributions.jl oracle (per-step loop, never the plate form)
+    function ar1_oracle(u, y)
+        T = length(y)
+        phi = u[1]; s = exp(u[2]); sigma = exp(u[3]); h = u[4:(4 + T - 1)]
+        lp = logpdf(Normal(0, 1), phi) + logpdf(Exponential(1), s) +
+             logpdf(Exponential(1), sigma) + logpdf(Normal(0, 1), h[1])
+        for t in 2:T
+            lp += logpdf(Normal(phi * h[t - 1], s), h[t])
+        end
+        lp += sum(logpdf(Normal(h[t], sigma), y[t]) for t in 1:T)
+        return lp + u[2] + u[3]              # + log-Jacobian (s, sigma :exp)
+    end
+
+    for u in ([0.2, -0.3, -0.1, 0.1, -0.2, 0.3, 0.0, 0.15],
+              [-0.5, 0.4, 0.2, -0.3, 0.1, 0.0, 0.25, -0.1])
+        @test _query(built.spec, plan, :posterior, u) ≈ ar1_oracle(u, ydata)
+        _check_gradient(built.spec, plan, u)
+    end
+
+    # AR(2): two seeds, two lags — the recurrence reads h[t-1] and h[t-2]
+    m2 = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        s ~ Exponential(1)
+        sigma ~ Exponential(1)
+        @scan begin
+            h[1] ~ Normal(0, 1)
+            h[2] ~ Normal(0, 1)
+            for t in 3:T
+                h[t] ~ Normal(a * h[t - 1] + b * h[t - 2], s)
+            end
+        end
+        y .~ Normal.(h, sigma)
+    end
+    y2 = [0.1, -0.2, 0.3, 0.0, -0.1, 0.25]
+    p2 = (m2() | (; y = y2))
+    b2 = build_kernel(p2)
+    @test b2.layout.total == 4 + length(y2)   # a, b, s, sigma, h[1..6]
+    function ar2_oracle(u, y)
+        T = length(y)
+        a = u[1]; b = u[2]; s = exp(u[3]); sigma = exp(u[4]); h = u[5:(5 + T - 1)]
+        lp = logpdf(Normal(0, 1), a) + logpdf(Normal(0, 1), b) +
+             logpdf(Exponential(1), s) + logpdf(Exponential(1), sigma) +
+             logpdf(Normal(0, 1), h[1]) + logpdf(Normal(0, 1), h[2])
+        for t in 3:T
+            lp += logpdf(Normal(a * h[t - 1] + b * h[t - 2], s), h[t])
+        end
+        lp += sum(logpdf(Normal(h[t], sigma), y[t]) for t in 1:T)
+        return lp + u[3] + u[4]
+    end
+    u2 = [0.3, -0.2, -0.1, 0.0, 0.1, -0.1, 0.2, 0.05, -0.15, 0.1]
+    @test _query(b2.spec, p2, :posterior, u2) ≈ ar2_oracle(u2, y2)
+    _check_gradient(b2.spec, p2, u2)
+
+    # non-centered recurrence emits via the RK-core `scan(...)` carry-fold
+    # (AR(1) slice): the layout slice holds the iid innovations, the state
+    # reconstructs in-graph, and the density is the innovation prior. The
+    # scaled step (`s * eps`) exercises multi-`Ref` threading.
+    mnc = @rkppl begin
+        phi ~ Normal(0, 1)
+        s ~ Exponential(1)
+        sigma ~ Exponential(1)
+        @scan begin
+            h[1] ~ Normal(0, 1)
+            for t in 2:T
+                eps ~ Normal(0, 1)
+                h[t] = phi * h[t - 1] + s * eps
+            end
+        end
+        y .~ Normal.(h, sigma)
+    end
+    pnc = (mnc() | (; y = ydata))
+    bnc = build_kernel(pnc)
+    @test bnc.layout.total == 3 + length(ydata)   # phi, s, sigma, z[1..5]
+    @test only(e for e in bnc.layout.entries if e.kind === :scan).name ===
+        :_ppl_scan_z_h
+    function nc_oracle(u, y)
+        T = length(y)
+        phi = u[1]; s = exp(u[2]); sigma = exp(u[3]); z = u[4:(4 + T - 1)]
+        h = Vector{Float64}(undef, T)
+        h[1] = z[1]
+        for t in 2:T
+            h[t] = phi * h[t - 1] + s * z[t]
+        end
+        lp = logpdf(Normal(0, 1), phi) + logpdf(Exponential(1), s) +
+             logpdf(Exponential(1), sigma) +
+             sum(logpdf(Normal(0, 1), zt) for zt in z) +
+             sum(logpdf(Normal(h[t], sigma), y[t]) for t in 1:T)
+        return lp + u[2] + u[3]
+    end
+    unc = [0.3, -0.2, -0.1, 0.1, 0.25, -0.15, 0.05, -0.3]
+    @test _query(bnc.spec, pnc, :posterior, unc) ≈ nc_oracle(unc, ydata)
+    _check_gradient(bnc.spec, pnc, unc)
+end
+
+@testset "scan: SB-ar latent path end to end (non-centered + LP summand)" begin
+    # SB `_sb_ar1` mirror: `phi_raw ~ std_normal`, `phi = tanh(phi_raw)`,
+    # `epsilon ~ std_normal`, `u[1] = eps[1]`, `u[t] = phi*u[t-1] + eps[t]`,
+    # with the path taking a free Normal beta in the linear predictor.
+    m = @rkppl begin
+        phi_raw ~ Normal(0, 1)
+        beta_ar ~ Normal(0, 2)
+        a ~ Normal(0, 1)
+        sigma ~ Exponential(1)
+        @scan begin
+            u[1] ~ Normal(0, 1)
+            for t in 2:T
+                eps ~ Normal(0, 1)
+                u[t] = phi * u[t - 1] + eps
+            end
+        end
+        phi = tanh(phi_raw)
+        mu = a .+ beta_ar .* u
+        y .~ Normal.(mu, sigma)
+    end
+    ydata = [0.3, -0.1, 0.5, 0.2, -0.4]
+    plan = (m() | (; y = ydata))
+    @test only(plan.predictors).terms[2].kind === ScanSummandTerm
+    built = build_kernel(plan)
+    # Ordinary declaration order: phi_raw, beta_ar, a, sigma, z[1..5].
+    @test built.layout.total == 4 + length(ydata)
+    @test coordinate_names(built.layout)[1:4] == [:phi_raw, :beta_ar, :a, :sigma]
+
+    # independent oracle: SB `ar1_recurse` ported line-for-line, priors and
+    # likelihood via Distributions.jl (never the emitted forms)
+    function ar_oracle(u, y)
+        T = length(y)
+        phi_raw = u[1]; beta = u[2]; aa = u[3]; lsig = u[4]
+        z = u[5:(5 + T - 1)]
+        phi = tanh(phi_raw)
+        sigma = exp(lsig)
+        uu = Vector{Float64}(undef, T)
+        uu[1] = z[1]
+        for t in 2:T
+            uu[t] = phi * uu[t - 1] + z[t]
+        end
+        mu = aa .+ beta .* uu
+        lp = logpdf(Normal(0, 1), aa) + logpdf(Normal(0, 1), phi_raw) +
+             logpdf(Normal(0, 2), beta) + logpdf(Exponential(1), sigma) +
+             sum(logpdf(Normal(0, 1), zt) for zt in z) +
+             sum(logpdf(Normal(mu[t], sigma), y[t]) for t in 1:T)
+        return lp + lsig
+    end
+
+    for u in ([0.1, 0.3, 0.5, -0.4, 0.2, -0.1, 0.4, 0.0, 0.15],
+              [-0.2, -0.6, 1.1, 0.3, -0.4, 0.2, -0.3, 0.1, 0.0])
+        @test _query(built.spec, plan, :posterior, u) ≈ ar_oracle(u, ydata)
+        _check_gradient(built.spec, plan, u)
+    end
+end
+
+function _gen_bernoulli_probit_plan(y)
+    cols, n = _gen_columns()
+    cols[:y] = y
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BernoulliProbitFam, ProbitLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+@testset "bernoulli probit values and gradient" begin
+    for y in (repeat([false, true], 3), repeat([0, 1], 3))
+        plan = _gen_bernoulli_probit_plan(y)
+        built = build_kernel(plan)
+        u = [0.25, 0.5]
+        nt = constrain(built.layout, u)
+        eta = nt.eta[1] .+ nt.eta[2] .* plan.columns[:x]
+        ll = sum(logpdf.(Bernoulli.(cdf.(Ref(Normal()), eta)), plan.columns[:y]))
+        pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+        @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    end
+    plan = _gen_bernoulli_probit_plan(repeat([false, true], 3))
+    built = build_kernel(plan)
+    _check_gradient(built.spec, plan, [0.25, 0.5])
+end
+
+function _gen_bernoulli_cloglog_plan(y)
+    cols, n = _gen_columns()
+    cols[:y] = y
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BernoulliCloglogFam, CloglogLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+@testset "bernoulli cloglog values and gradient" begin
+    for y in (repeat([false, true], 3), repeat([0, 1], 3))
+        plan = _gen_bernoulli_cloglog_plan(y)
+        built = build_kernel(plan)
+        u = [0.25, 0.5]
+        nt = constrain(built.layout, u)
+        eta = nt.eta[1] .+ nt.eta[2] .* plan.columns[:x]
+        ll = sum(logpdf.(Bernoulli.(1 .- exp.(-exp.(eta))), plan.columns[:y]))
+        pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+        @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    end
+    plan = _gen_bernoulli_cloglog_plan(repeat([false, true], 3))
+    built = build_kernel(plan)
+    _check_gradient(built.spec, plan, [0.25, 0.5])
+end
+
+function _gen_binomial_probit_plan(y, ntrials)
+    cols, n = _gen_columns()
+    cols[:y] = y
+    cols[:n] = ntrials
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BinomialProbitFam, ProbitLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp, :n, nothing)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+@testset "binomial probit values and gradient" begin
+    plan = _gen_binomial_probit_plan([1, 0, 2, 1, 3, 2], [3, 2, 4, 3, 5, 4])
+    built = build_kernel(plan)
+    u = [0.25, 0.5]
+    nt = constrain(built.layout, u)
+    eta = nt.eta[1] .+ nt.eta[2] .* plan.columns[:x]
+    ll = sum(logpdf.(Binomial.(plan.columns[:n], cdf.(Ref(Normal()), eta)),
+        plan.columns[:y]))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+function _gen_binomial_cloglog_plan(y, ntrials)
+    cols, n = _gen_columns()
+    cols[:y] = y
+    cols[:n] = ntrials
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BinomialCloglogFam, CloglogLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp, :n, nothing)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[], AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+@testset "binomial cloglog values and gradient" begin
+    plan = _gen_binomial_cloglog_plan([1, 0, 2, 1, 3, 2], [3, 2, 4, 3, 5, 4])
+    built = build_kernel(plan)
+    u = [0.25, 0.5]
+    nt = constrain(built.layout, u)
+    eta = nt.eta[1] .+ nt.eta[2] .* plan.columns[:x]
+    ll = sum(logpdf.(Binomial.(plan.columns[:n], 1 .- exp.(-exp.(eta))),
+        plan.columns[:y]))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2])
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+function _gen_beta_plan(y)
+    cols, n = _gen_columns()
+    cols[:y] = y
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BetaLogitFam, LogitLink, :y, :eta, :kappa,
+            nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[PredictorSpec(:eta, IdentityLink, _gen_terms(), :eta)],
+        _gen_priors(:eta),
+        SampledParameter[SampledParameter(:kappa, :gamma,
+            (arg1 = 2.0, arg2 = 1000.0), nothing, :kappa)],
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+@testset "beta values and gradient" begin
+    plan = _gen_beta_plan([0.2, 0.7, 0.4, 0.6, 0.3, 0.8])
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3]
+    nt = constrain(built.layout, u)
+    eta = nt.eta[1] .+ nt.eta[2] .* plan.columns[:x]
+    mu = 1 ./ (1 .+ exp.(-eta))
+    k = nt.kappa
+    ll = sum(logpdf.(Beta.(mu .* k, (1 .- mu) .* k), plan.columns[:y]))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(Gamma(2.0, 1000.0), k)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[3]
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "beta weighted values" begin
+    plan = _gen_beta_plan([0.2, 0.7, 0.4, 0.6, 0.3, 0.8])
+    plan.columns[:w] = [1.0, 2.0, 1.0, 2.0, 1.0, 2.0]
+    plan.responses[1] = LikelihoodSpec(BetaLogitFam, LogitLink, :y, :eta, :kappa,
+        :w, _none_evidence(), :y_resp)
+    validate_plan(plan)
+    built = build_kernel(plan)
+    u = [0.1, -0.2, 0.3]
+    nt = constrain(built.layout, u)
+    eta = nt.eta[1] .+ nt.eta[2] .* plan.columns[:x]
+    mu = 1 ./ (1 .+ exp.(-eta))
+    k = nt.kappa
+    ll = sum(plan.columns[:w] .*
+        logpdf.(Beta.(mu .* k, (1 .- mu) .* k), plan.columns[:y]))
+    pr = logpdf(Normal(0, 1), nt.eta[1]) + logpdf(Normal(0, 2), nt.eta[2]) +
+        logpdf(Gamma(2.0, 1000.0), k)
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[3]
+    _check_gradient(built.spec, plan, u)
+end
+
+# Leveled parity references (SB Stan-semantics oracles, written
+# independently of the emitted cells): reference-coded softmax for
+# categorical, Stan's ordered_logistic definition, SB's brm_ordinal
+# composition (2 structures × 3 links), and Distributions.jl oracles
+# for multinomial / categorical / Dirichlet.
+function _leveled_columns()
+    n = 6
+    cols = Dict{Symbol,AbstractVector}(
+        :y => [1, 2, 3, 2, 1, 3],
+        :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0],
+    )
+    return cols, n
+end
+
+_softmax_ref(v) = (m = maximum(v); e = exp.(v .- m); e ./ sum(e))
+
+function _gen_categorical_plan()
+    cols, n = _leveled_columns()
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(CategoricalLogitFam, LogitLink, :y,
+            :mu2, nothing, nothing, _none_evidence(), :y_resp, nothing,
+            nothing; extra_predictors = [:mu3])],
+        PredictorSpec[PredictorSpec(:mu2, IdentityLink, _gen_terms(), :mu2),
+            PredictorSpec(:mu3, IdentityLink, _gen_terms(), :mu3)],
+        vcat(_gen_priors(:mu2), _gen_priors(:mu3)),
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(),
+        0)
+    return bind_data(unbound, cols)
+end
+
+@testset "categorical likelihood parity" begin
+    plan = _gen_categorical_plan()
+    built = build_kernel(plan)
+    @test built.layout.total == 4
+    u = [0.5, -0.25, 0.1, 0.3]
+    nt = constrain(built.layout, u)
+    eta2 = Vector(nt.mu2)[1] .+ Vector(nt.mu2)[2] .* plan.columns[:x]
+    eta3 = Vector(nt.mu3)[1] .+ Vector(nt.mu3)[2] .* plan.columns[:x]
+    ll = sum(logpdf(Categorical(_softmax_ref([0.0, e2, e3])), y)
+        for (y, e2, e3) in zip(plan.columns[:y], eta2, eta3))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    pr = sum(logpdf(Normal(0, 1), b[1]) + logpdf(Normal(0, 2), b[2])
+        for b in (Vector(nt.mu2), Vector(nt.mu3)))
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
+end
+
+function _gen_ordered_plan()
+    cols, n = _leveled_columns()
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
+            nothing, nothing, _none_evidence(), :y_resp, nothing, nothing;
+            thresholds = :y_cutpoints)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(),
+        0; vector_parameters = VectorParameter[VectorParameter(:y_cutpoints,
+        :ordered_normal, (arg1 = 0.0, arg2 = 1.0), nothing, :y_cutpoints)])
+    return bind_data(unbound, cols)
+end
+
+# Stan ordered_logistic: P(y=k) = F(t_k − η) − F(t_{k−1} − η),
+# F logistic, t_0 = −Inf, t_K = +Inf.
+function _ref_ordered_logistic(y, eta, t)
+    σ(z) = 1 / (1 + exp(-z))
+    K = length(t) + 1
+    Fhi = y == K ? 1.0 : σ(t[y] - eta)
+    Flo = y == 1 ? 0.0 : σ(t[y-1] - eta)
+    return log(Fhi - Flo)
+end
+
+@testset "ordered logistic parity" begin
+    plan = _gen_ordered_plan()
+    built = build_kernel(plan)
+    @test built.layout.total == 4 # 2 coefficients + 2 cutpoints
+    u = [0.5, -0.25, 0.1, 0.3]
+    nt = constrain(built.layout, u)
+    b = Vector(nt.mu)
+    eta = b[1] .+ b[2] .* plan.columns[:x]
+    t = Vector(nt.y_cutpoints)
+    ll = sum(_ref_ordered_logistic(y, e, t)
+        for (y, e) in zip(plan.columns[:y], eta))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    # Cutpoint prior is elementwise std-normal with NO factorial
+    # normalizer (Stan ordered semantics); the Jacobian is Σ u[2:end].
+    pr = sum(logpdf(Normal(), v) for v in t) +
+        logpdf(Normal(0, 1), b[1]) + logpdf(Normal(0, 2), b[2])
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    @test _query(built.spec, plan, :log_jacobian, u) ≈ u[4]
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr + u[4]
+    _check_gradient(built.spec, plan, u)
+end
+
+# SB brm_ordinal composition (structures × links), written from the
+# Stan-function definitions: cumulative takes adjacent CDF differences,
+# stopping-ratio accumulates per-stage survive/fail terms.
+function _ref_ordinal(y, eta, t, d, structure, link, eff = zeros(length(t)))
+    F(z) = link === LogitLink ? 1 / (1 + exp(-z)) :
+        link === ProbitLink ? cdf(Normal(), z) : -expm1(-exp(z))
+    logF(z) = log(F(z))
+    logCC(z) = link === LogitLink ? logF(-z) :
+        link === ProbitLink ? log(cdf(Normal(), -z)) : -exp(z)
+    K = length(t) + 1
+    if structure === :cumulative
+        if y == 1
+            return logF(d * (t[1] - eta))
+        elseif y == K
+            return logCC(d * (t[K-1] - eta))
+        end
+        return log(exp(logF(d * (t[y] - eta))) -
+            exp(logF(d * (t[y-1] - eta))))
+    end
+    total = 0.0
+    for j in 1:K-1
+        z = d * (t[j] - eta - eff[j])
+        total += j < y ? logCC(z) : j == y ? logF(z) : 0.0
+    end
+    return total
+end
+
+function _gen_ordinal_plan(link, structure; discrimination = 1.5)
+    cols, n = _leveled_columns()
+    terms = TermSpec[TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term)]
+    vfam = structure === :cumulative ? :ordered_normal : :vector_normal
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(OrdinalFam, link, :y, :mu, nothing,
+            nothing, _none_evidence(), :y_resp, nothing, nothing;
+            thresholds = :y_thresholds, ordinal_structure = structure,
+            discrimination = discrimination)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, terms, :mu)],
+        PopulationPrior[PopulationPrior(:mu, :x, 0.0, 2.0)],
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(),
+        0; vector_parameters = VectorParameter[VectorParameter(:y_thresholds,
+        vfam, (arg1 = 0.0, arg2 = 1.0), nothing, :y_thresholds)])
+    return bind_data(unbound, cols)
+end
+
+@testset "ordinal parity" begin
+    for link in (LogitLink, ProbitLink, CloglogLink),
+            structure in (:cumulative, :stopping)
+        plan = _gen_ordinal_plan(link, structure)
+        built = build_kernel(plan)
+        u = [0.4, -0.2, 0.25]
+        nt = constrain(built.layout, u)
+        b = only(Vector(nt.mu))
+        eta = b .* plan.columns[:x]
+        t = Vector(nt.y_thresholds)
+        ll = sum(_ref_ordinal(y, e, t, 1.5, structure, link)
+            for (y, e) in zip(plan.columns[:y], eta))
+        @test _query(built.spec, plan, :likelihood, u) ≈ ll
+        if (link, structure) in
+                ((LogitLink, :cumulative), (ProbitLink, :stopping))
+            _check_gradient(built.spec, plan, u)
+        end
+    end
+end
+
+function _gen_multinomial_plan()
+    c1 = [2, 0, 1, 3]
+    c2 = [1, 2, 0, 1]
+    c3 = [0, 1, 2, 0]
+    N = c1 .+ c2 .+ c3
+    cols = Dict{Symbol,AbstractVector}(:c1 => c1, :c2 => c2, :c3 => c3,
+        :N => N)
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(MultinomialFam, IdentityLink, :c1, :s,
+            nothing, nothing, _none_evidence(), :y_resp, :N, nothing;
+            count_columns = [:c2, :c3])],
+        PredictorSpec[], PopulationPrior[], SampledParameter[],
+        AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
+        vector_parameters = VectorParameter[VectorParameter(:s,
+        :simplex_dirichlet, (arg1 = [2.0, 2.0, 2.0],), nothing, :s)])
+    return bind_data(unbound, cols)
+end
+
+@testset "multinomial parity" begin
+    plan = _gen_multinomial_plan()
+    built = build_kernel(plan)
+    @test built.layout.total == 2 # K−1 stick-breaking logits
+    u = [0.4, -0.3]
+    nt = constrain(built.layout, u)
+    p = Vector(nt.s)
+    N = plan.columns[:N]
+    ll = sum(logpdf(Multinomial(n, p), [a, b, c])
+        for (n, a, b, c) in zip(N, plan.columns[:c1], plan.columns[:c2],
+        plan.columns[:c3]))
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    pr = logpdf(Dirichlet([2.0, 2.0, 2.0]), p)
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    @test _query(built.spec, plan, :log_jacobian, u) ≈ simplex_logjac(u)
+    _check_gradient(built.spec, plan, u)
+    # A literal N folds identically (same value, computed once).
+    cols3 = Dict{Symbol,AbstractVector}(:c1 => [1, 1, 1, 0],
+        :c2 => [1, 1, 0, 2], :c3 => [1, 1, 2, 1])
+    unbound3 = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(MultinomialFam, IdentityLink, :c1, :s,
+            nothing, nothing, _none_evidence(), :y_resp, 3, nothing;
+            count_columns = [:c2, :c3])],
+        PredictorSpec[], PopulationPrior[], SampledParameter[],
+        AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
+        vector_parameters = VectorParameter[VectorParameter(:s,
+        :simplex_dirichlet, (arg1 = [2.0, 2.0, 2.0],), nothing, :s)])
+    plan3 = bind_data(unbound3, cols3)
+    built3 = build_kernel(plan3)
+    ll3 = _query(built3.spec, plan3, :likelihood, u)
+    @test ll3 ≈ sum(logpdf(Multinomial(3, p), [a, b, c])
+        for (a, b, c) in zip([1, 1, 1, 0], [1, 1, 0, 2], [1, 1, 2, 1]))
+end
+
+function _gen_categorical_plain_plan()
+    cols, n = _leveled_columns()
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(CategoricalFam, IdentityLink, :y, :s,
+            nothing, nothing, _none_evidence(), :y_resp, nothing, nothing)],
+        PredictorSpec[], PopulationPrior[], SampledParameter[],
+        AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
+        vector_parameters = VectorParameter[VectorParameter(:s,
+        :simplex_dirichlet, (arg1 = [1.0, 1.0, 1.0],), nothing, :s)])
+    return bind_data(unbound, cols)
+end
+
+@testset "categorical-simplex parity" begin
+    plan = _gen_categorical_plain_plan()
+    built = build_kernel(plan)
+    u = [0.2, 0.1]
+    nt = constrain(built.layout, u)
+    p = Vector(nt.s)
+    ll = sum(logpdf(Categorical(p), y) for y in plan.columns[:y])
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    _check_gradient(built.spec, plan, u)
+end
+
+function _gen_per_threshold_plan()
+    cols = Dict{Symbol,AbstractVector}(
+        :y => [1, 2, 3, 2, 1, 3],
+        :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0],
+        :w => [0.5, 1.0, 1.5, 0.0, 2.0, 1.0],
+        :z1 => [1.0, 0.0, -1.0, 0.5, 0.5, -0.5],
+        :z2 => [0.0, 1.0, 1.0, -1.0, 0.0, 1.0],
+        :d => [0.5, 1.0, 1.5, 2.0, 1.0, 0.8],
+    )
+    terms = TermSpec[TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term)]
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(OrdinalFam, LogitLink, :y, :mu, nothing,
+            :w, _none_evidence(), :y_resp, nothing, nothing;
+            thresholds = :y_thresholds, ordinal_structure = :stopping,
+            discrimination = :d, threshold_columns = [:z1, :z2],
+            threshold_coefs = :y_beta)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, terms, :mu)],
+        PopulationPrior[PopulationPrior(:mu, :x, 0.0, 2.0)],
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(),
+        0; vector_parameters = VectorParameter[
+            VectorParameter(:y_thresholds, :vector_normal,
+                (arg1 = 0.0, arg2 = 1.0), nothing, :y_thresholds),
+            VectorParameter(:y_beta, :vector_normal, (arg1 = 0.0, arg2 = 1.0),
+                nothing, :y_beta),
+        ])
+    return bind_data(unbound, cols)
+end
+
+@testset "per-threshold ordinal parity" begin
+    plan = _gen_per_threshold_plan()
+    built = build_kernel(plan)
+    @test built.layout.total == 7 # eta + 2 thresholds + 4 coefs
+    u = [0.4, -0.2, 0.25, 0.1, -0.1, 0.05, 0.15]
+    nt = constrain(built.layout, u)
+    b = only(Vector(nt.mu))
+    eta = b .* plan.columns[:x]
+    t = Vector(nt.y_thresholds)
+    beta = Vector(nt.y_beta)
+    # Stage-major pack: stage j occupies beta[(j−1)*p+1 .. j*p].
+    X = hcat(plan.columns[:z1], plan.columns[:z2])
+    E = [sum(X[i, c] * beta[(j-1)*2+c] for c in 1:2)
+        for i in 1:6, j in 1:2]
+    ll = 0.0
+    for (i, y) in enumerate(plan.columns[:y])
+        ll += plan.columns[:w][i] * _ref_ordinal(y, eta[i], t,
+            plan.columns[:d][i], :stopping, LogitLink, E[i, :])
+    end
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    _check_gradient(built.spec, plan, u)
+end
+
+@testset "leveled K=1 edges" begin
+    # Ordered K=1: empty cutpoints, zero likelihood/Jacobian, live gradient.
+    cols = Dict{Symbol,AbstractVector}(:y => [1, 1, 1],
+        :x => [0.5, -1.0, 1.0])
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
+            nothing, nothing, _none_evidence(), :y_resp, nothing, nothing;
+            thresholds = :y_cutpoints)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink, _gen_terms(), :mu)],
+        _gen_priors(:mu),
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(),
+        0; vector_parameters = VectorParameter[VectorParameter(:y_cutpoints,
+        :ordered_normal, (arg1 = 0.0, arg2 = 1.0), nothing, :y_cutpoints)])
+    plan = bind_data(unbound, cols)
+    built = build_kernel(plan)
+    @test built.layout.total == 2
+    u = [0.5, -0.25]
+    @test _query(built.spec, plan, :likelihood, u) == 0.0
+    @test _query(built.spec, plan, :log_jacobian, u) == 0.0
+    _check_gradient(built.spec, plan, u)
+    # Multinomial K=1: a zero-dimensional model with zero likelihood.
+    colsM = Dict{Symbol,AbstractVector}(:c1 => [3, 2], :N => [3, 2])
+    unboundM = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(MultinomialFam, IdentityLink, :c1, :s,
+            nothing, nothing, _none_evidence(), :y_resp, :N, nothing)],
+        PredictorSpec[], PopulationPrior[], SampledParameter[],
+        AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
+        vector_parameters = VectorParameter[VectorParameter(:s,
+        :simplex_dirichlet, (arg1 = [1.5],), nothing, :s)])
+    planM = bind_data(unboundM, colsM)
+    builtM = build_kernel(planM)
+    @test builtM.layout.total == 0
+    @test _query(builtM.spec, planM, :likelihood, Float64[]) == 0.0
+    @test _query(builtM.spec, planM, :log_jacobian, Float64[]) == 0.0
+end
+
+# The parameterized interval_bijector(lo,hi) library entry (todo 0ube9da,
+# decision 16c7aea = B). Endpoints are the affine-logistic ℝ→(lo,hi) map; the
+# host prepares them with bounds `bound=` in, the generator splices them with
+# literal bounds. The consumer :interval refactor lands separately (plate:breadth).
+@testset "interval_bijector library entry" begin
+    lo, hi, u = -2.0, 5.0, 0.3
+    x = lo + (hi - lo) / (1 + exp(-u))
+    lj = log(x - lo) + log(hi - x) - log(hi - lo)
+    # host-prepared endpoints (bounds bound in) match the affine-logistic math
+    @test ReactiveKernelsPPL._prepared_interval_endpoint(lo, hi, :constrain)(u) ≈ x
+    @test ReactiveKernelsPPL._prepared_interval_endpoint(lo, hi, :logjac)(u) ≈ lj
+    @test ReactiveKernelsPPL._prepared_interval_endpoint(lo, hi, :unconstrain)(x) ≈ u
+    @test lo < ReactiveKernelsPPL._prepared_interval_endpoint(lo, hi, :constrain)(u) < hi
+    # graph splice removes the interval_bijector wrapper and evaluates
+    spec = @kernel _itest(unconstrained::Vector{Float64}) = begin
+        q::Float64 = interval_bijector(-2.0, 5.0).constrain(sum(view(unconstrained, 1:1)))
+        qlj::Float64 = interval_bijector(-2.0, 5.0).logjac(sum(view(unconstrained, 1:1)))
+        posterior::Float64 = q + qlj
+    end
+    pl = plan(spec; want = :posterior)
+    @test prepare(pl)([u]) ≈ x + lj
+    @test !occursin("interval_bijector", sprint(show, code_expr(pl)))
+end
+
+# The parameterized upper_bijector(hi) library entry (the floored mirror).
+# Endpoints are the offset-exp ℝ→(-∞,hi) map (`hi - exp(u)`, Stan's
+# upper-bound kernel); the host prepares them with the bound `bound=` in, the
+# generator splices them with a literal bound. The log-Jacobian is the bare
+# `u` — no truncation renormalizer.
+@testset "upper_bijector library entry" begin
+    hi, u = 2.0, 0.3
+    x = hi - exp(u)
+    # host-prepared endpoints (bound bound in) match the offset-exp math
+    @test ReactiveKernelsPPL._prepared_upper_endpoint(hi, :constrain)(u) ≈ x
+    @test ReactiveKernelsPPL._prepared_upper_endpoint(hi, :logjac)(u) ≈ u
+    @test ReactiveKernelsPPL._prepared_upper_endpoint(hi, :unconstrain)(x) ≈ u
+    @test ReactiveKernelsPPL._prepared_upper_endpoint(hi, :constrain)(u) < hi
+    # graph splice with a literal bound inlines (no runtime call) and evaluates
+    spec = @kernel _utest(unconstrained::Vector{Float64}) = begin
+        q::Float64 = upper_bijector(2.0).constrain(sum(view(unconstrained, 1:1)))
+        qlj::Float64 = upper_bijector(2.0).logjac(sum(view(unconstrained, 1:1)))
+        posterior::Float64 = q + qlj
+    end
+    pl = plan(spec; want = :posterior)
+    @test prepare(pl)([u]) ≈ x + u
+    @test !occursin("upper_bijector", sprint(show, code_expr(pl)))
+end
+
+# Composed predictors evaluate their combination tree in-graph: sub-LPs
+# resolve to their LP nodes, scalars to constrained locals — plain
+# broadcast math under ordinary reverse mode.
+function _gen_composed_plan()
+    cols, n = _gen_columns()
+    cols[:y] = [false, true, true, false, true, false]
+    plan = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(BernoulliLogitFam, LogitLink, :y, :eta,
+            nothing, nothing, _none_evidence(), :y_resp)],
+        PredictorSpec[
+            PredictorSpec(:th, IdentityLink, _gen_terms(), :th),
+            PredictorSpec(:al, IdentityLink, _gen_terms(), :al),
+            PredictorSpec(:eta, IdentityLink,
+                TermSpec[TermSpec(ComposedTerm, ColumnRef[],
+                    (tree = :(be .* (th .- al)), subs = [:th, :al],
+                        scalars = [:be]),
+                    :eta_composed, :eta_composed)], :eta)],
+        PopulationPrior[vcat(_gen_priors(:th), _gen_priors(:al))...],
+        SampledParameter[SampledParameter(:be, :normal,
+            (arg1 = 0.0, arg2 = 5.0), nothing, :be)],
+        AssignmentSpec[], cols, n)
+    validate_plan(plan)
+    return plan
+end
+
+@testset "composed values and gradient" begin
+    plan = _gen_composed_plan()
+    built = build_kernel(plan)
+    u = [0.25, 0.5, -0.1, 0.3, 0.7]
+    nt = constrain(built.layout, u)
+    cth, cal, be = Vector(nt.th), Vector(nt.al), nt.be
+    th = cth[1] .+ cth[2] .* plan.columns[:x]
+    al = cal[1] .+ cal[2] .* plan.columns[:x]
+    eta = be .* (th .- al)
+    ll = sum(logpdf.(Bernoulli.(1 ./ (1 .+ exp.(-eta))), plan.columns[:y]))
+    pr = sum(logpdf(Normal(0, 1), c) for c in (cth[1], cal[1])) +
+        sum(logpdf(Normal(0, 2), c) for c in (cth[2], cal[2])) +
+        logpdf(Normal(0, 5), be)
+    @test _query(built.spec, plan, :likelihood, u) ≈ ll
+    @test _query(built.spec, plan, :prior, u) ≈ pr
+    @test _query(built.spec, plan, :posterior, u) ≈ ll + pr
+    _check_gradient(built.spec, plan, u)
 end

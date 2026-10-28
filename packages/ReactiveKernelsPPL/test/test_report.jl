@@ -54,7 +54,7 @@ const _REPORT_POSTERIOR = "posterior(u) = -15.886646898631646"
     @test occursin("scale :sigma", md)
     @test occursin("Dict(:y => :response, :x => :predictor)", md)
     @test occursin("## Layer 4 — emitted RK kernel (verbatim)", md)
-    @test occursin("ppl_model(unconstrained::Vector{Float64}", md)
+    @test occursin("ppl_model(unconstrained::AbstractVector{Float64}", md)
     # Bit-for-bit vs the peer's old-spelling oracle: same IR, same kernel.
     @test occursin(_REPORT_POSTERIOR, md)
     @test occursin("gradient cross-check: AD vs central differences", md)
@@ -92,7 +92,79 @@ end
         # Malformed artifacts fail closed.
         bad = joinpath(dir, "bad.jls")
         Serialization.serialize(bad, (; nope = 1))
+        # refused: malformed report artifact (artifact schema contract)
         @test_throws ArgumentError load_artifact(bad)
+    end
+end
+
+@testset "report bound-prepare split: behavior preserved" begin
+    # The multi-probe internals reproduce the single-probe numbers exactly.
+    cols = _norm_cols(_report_demo_data())
+    ast = _surface_block(_REPORT_SURFACE)
+    bound = bind_data(lower_rkppl(ast, keys(cols); conditioned = keys(cols)), cols)
+    prep = _prepare_bound_report(bound)
+    @test prep.n == 3
+    pr = _run_report_probe(prep, _REPORT_U; backend = _GEN_BACKEND)
+    @test repr(pr.val) == "-15.886646898631646"
+    @test pr.grad_ok === true
+    @test pr.grad_maxdiff isa Float64 && isfinite(pr.grad_maxdiff)
+    pr0 = _run_report_probe(prep, nothing)
+    @test isfinite(pr0.val)
+    @test pr0.grad_ok === nothing
+    @test pr0.grad_maxdiff === nothing
+    md = join([
+        _layer3_block("X", "f")...,
+        _boundary_block(bound)...,
+        _layer4_block(kernel_expr(bound, prep.built.layout))...,
+        _verification_multi_block([pr])...,
+    ], "\n")
+    @test occursin("n_obs = 6", md)
+    @test occursin("ppl_model(unconstrained::AbstractVector{Float64}", md)
+    @test occursin("- probes: 1", md)
+    @test occursin("- probe 1: `posterior(u) = -15.886646898631646`", md)
+end
+
+@testset "report v2 shape: load + fail-closed without BRM" begin
+    mktempdir() do dir
+        ast = _surface_block(_REPORT_SURFACE)
+        good = (; case_id = "demo", ast, defs = Expr[],
+            plan = nothing, meta = (; case_id = "demo", provenance = "test"))
+        v2 = joinpath(dir, "v2.jls")
+        Serialization.serialize(v2, good)
+        loaded = load_artifact(v2)
+        @test _is_v2_artifact(loaded)
+        @test loaded.case_id == "demo"
+        @test !_is_v2_artifact((; ast, data = _report_demo_data()))
+        # This env has no BRM: the translate seam fails closed with guidance.
+        err = try
+            transpile_report_v2(loaded)
+            nothing
+        catch e
+            e
+        end
+        # refused: the v2 translation seam requires the BRM package in this environment (dependency contract).
+        @test err isa ArgumentError
+        @test occursin("BayesianRegressionModels", sprint(showerror, err))
+        # Malformed v2 fails closed at load.
+        bad = joinpath(dir, "bad.jls")
+        Serialization.serialize(bad,
+            (; case_id = "x", ast, defs = Expr[], plan = nothing))
+        # refused: v2 artifact missing meta (artifact schema contract)
+        @test_throws ArgumentError load_artifact(bad)
+        Serialization.serialize(bad, (; case_id = "x", ast = "not-expr",
+            defs = Expr[], plan = nothing, meta = (;)))
+        # refused: v2 artifact ast is not an Expr (artifact schema contract)
+        @test_throws ArgumentError load_artifact(bad)
+        # CLI --artifact dispatches v2 (and fails closed without BRM here).
+        # refused: v2 translate seam needs BRM, absent in this env (fails closed with guidance)
+        @test_throws ArgumentError main(["--artifact", v2])
+        try
+            main(["--artifact", v2])
+            @test false
+        catch e
+            # refused: the v2 translation seam requires BRM (dependency contract).
+            @test occursin("BayesianRegressionModels", sprint(showerror, e))
+        end
     end
 end
 
@@ -116,12 +188,17 @@ end
         @test main(["--surface", model, "--data", data, "--out", out]) == 0
         @test occursin("n_obs = 2", read(out, String))
         # Errors fail closed, never half a report.
+        # refused: mutually exclusive CLI flags --artifact and --surface
         @test_throws ArgumentError main(
             ["--artifact", "a", "--surface", model, "--data", data])
+        # refused: missing required --data argument
         @test_throws ArgumentError main(["--surface", model])
+        # refused: unknown CLI flag
         @test_throws ArgumentError main(["--bogus"])
         write(data, "NOTDATA = 1\n")
+        # refused: data file defines no DATA
         @test_throws ArgumentError load_surface_files(model, data)
+        # refused: u length != layout dimension
         @test_throws ArgumentError transpile_report(
             _REPORT_SURFACE, _report_demo_data(); u = [0.0])
     end

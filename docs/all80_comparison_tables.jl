@@ -195,3 +195,66 @@ function render_all80_batch1_tables(path = _ALL80_BATCH1_PATH)
             title = "Historical batch-1 HMC — observed-load µs/transition", note = hmc_note),
     ])
 end
+
+# --- IRT incremental additions (todo 0wsjovm): SEPARATE receipt, rendered ALONGSIDE ---
+# Same contract shape as batch-1 (own path, own `irt-*` ids, honest note when absent), but this
+# run IS ordinary-AE certified: both phases recorded backend configuration + loaded-module
+# certification under one run id, so the labels say certified, not historical/uncertified.
+const _ALL80_IRT_PATH = joinpath(
+    dirname(@__DIR__), "benchmark", "receipts", "all80-irt-v1.toml")
+
+function _all80_irt_configuration_note(path)
+    receipt = TOML.parsefile(path)
+    provenance = get(get(receipt, "meta", Dict()), "provenance", Dict())
+    native = get(provenance, "native", nothing)
+    reactant = get(provenance, "reactant", nothing)
+    native_ok = native !== nothing && !isempty(get(native, "ad_backend", "")) &&
+        get(native, "loaded_modules_certified", false) === true
+    reactant_ok = reactant !== nothing && !isempty(get(reactant, "ad_backend", "")) &&
+        get(reactant, "loaded_modules_certified", false) === true
+    native_ok && reactant_ok ?
+        "Certified ordinary-AE run: native + Reactant phases each recorded backend configuration " *
+        "and loaded-module certification under one run id." :
+        "NOT certified: native $(native_ok ? "recorded" : "MISSING") / Reactant " *
+        "$(reactant_ok ? "recorded" : "MISSING") backend-configuration + loaded-module certification."
+end
+
+"""One-line IRT batch gate summary (distinct from the immutable 82-row checkpoint summary)."""
+function render_all80_irt_summary(path = _ALL80_IRT_PATH)
+    isfile(path) || return Markdown.parse(
+        "The IRT additions are registered and wired; the SEPARATE receipt " *
+        "(`all80-irt-v1.toml`) populates on the focused 4-model run.")
+    models = get(TOML.parsefile(path), "models", Dict())
+    failures = count(m -> haskey(m, "error"), values(models))
+    passing = count(m -> get(m, "parity_pass", false) === true, values(models))
+    pending = length(models) - failures - passing
+    Markdown.parse("""
+    **IRT receipt:** $(length(models)) incremental posteriordb model(s) measured into the
+    SEPARATE `all80-irt-v1.toml` (a union alongside the immutable 82, never merged into it);
+    **$passing** pass the complete declared-offset/value/gradient/support gate, **$pending** await a
+    source-declared constant replay, **$failures** retain an exact structural/AD diagnostic.
+
+    $(_all80_irt_configuration_note(path))
+    """)
+end
+
+"""Render the three IRT comparison tables from the SEPARATE IRT receipt (or an honest note)."""
+function render_all80_irt_tables(path = _ALL80_IRT_PATH)
+    isfile(path) || return Markdown.parse(
+        "!!! note \"IRT tables pending\"\n\n" *
+        "    No IRT receipt at `$(basename(path))` yet — run the focused IRT benchmark " *
+        "(`RK_ALL80_BATCH=irt … <keys>`) to populate these tables.")
+    models = get(TOML.parsefile(path), "models", Dict())
+    certified = "Certified ordinary-AE IRT measurement (both phases backend-recorded + loaded-module certified, one run id)."
+    native_t = sort(unique(Int[m["hmc_transitions"] for m in values(models)]))
+    reactant_t = sort(unique(Int[m["hmc_reactant_transitions"] for m in values(models)]))
+    hmc_note = "Observed-load results. Recorded transitions — native: $(join(native_t, ", ")); Reactant: $(join(reactant_t, ", ")). Different T counts make this capability/end-to-end evidence, not a matched-T claim."
+    Markdown.MD(Any[
+        all80_primal_table(models; id = "irt-primal",
+            title = "IRT batch primal — median, lower is faster", note = certified),
+        all80_gradient_table(models; id = "irt-gradient",
+            title = "IRT batch value+gradient — median, lower is faster", note = certified),
+        all80_hmc_table(models; id = "irt-hmc",
+            title = "IRT batch HMC — observed-load µs/transition", note = hmc_note),
+    ])
+end

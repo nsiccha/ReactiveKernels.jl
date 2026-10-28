@@ -46,8 +46,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     parameters = (; α, β, λ, σ)
     # Inverse edges: the constrained NamedTuple is also an authoritative input
     # boundary for the prior and prediction queries.
-    (α::Float64, β::Float64, λ::Float64, σ::Float64) =
-        (parameters.α, parameters.β, parameters.λ, parameters.σ)
 
     # Priors: α, β ~ Normal(0, 1000); λ ~ Uniform(0.5, 1); τ ~ Gamma(1e-4, 1e-4).
     α_prior::Float64 = normal(0.0, 1000.0).logpdf(α)

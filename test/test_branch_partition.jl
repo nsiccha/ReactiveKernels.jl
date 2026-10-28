@@ -1,0 +1,469 @@
+using ReactiveKernels
+using DifferentiationInterface
+using Enzyme
+using Test
+
+isdefined(@__MODULE__, :BranchPartition) ||
+    include("fixtures/branch_partition.jl")
+
+@testset "branch partitions borrow indexed views" begin
+    RK = ReactiveKernels
+    C = BranchPartition
+    allocation(f::F, args::Vararg{Any,N}) where {F,N} =
+        (f(args...); @allocated f(args...))
+    lane_sum(x, lanes) = sum(ReactiveKernels._LaneGather(length(x))(x, lanes))
+    values = collect(0.5:0.5:4.0)
+    packed = vcat(11.0, values, 13.0)
+    matrix = hcat(fill(11.0, 8), values, fill(13.0, 8))
+    for parent in (values, view(packed, 2:9), view(matrix, :, 2)),
+        n in (0, 1, 31, 1024)
+        groups = mod1.(3 .* (1:n), 8)
+        gathered = Base.SubArray(parent, (groups,))
+        lanes = reverse(collect(1:2:n))
+        before = deepcopy((parent, groups, lanes))
+        selected = RK._LaneGather(n)(gathered, lanes)
+        @test collect(selected) == parent[groups[lanes]]
+        @test (parent, groups, lanes) == before
+        # A singleton may broadcast to an arbitrary number of lanes; its
+        # existing repeated-index buffer is outside this composition check.
+        n == 1 || @test allocation(lane_sum, gathered, lanes) == 0
+    end
+
+    # Values and ordinary Reverse exercise the prepared graph, including
+    # repeated indices and an inactive log of a negative value.
+    values[2:2:end] .*= -1
+    packed = vcat(11.0, values, 13.0)
+    matrix = hcat(fill(11.0, 8), values, fill(13.0, 8))
+    for (spec, input, embed) in (
+            (C.gathered_guard, values, identity),
+            (C.packed_gathered_guard, packed, g -> vcat(0.0, g, 0.0)),
+            (C.matrix_gathered_guard, matrix, g -> hcat(zeros(8), g, zeros(8))))
+        bytes = Int[]
+        structures = Int[]
+        for n in (31, 1024)
+            groups = mod1.(3 .* (1:n), 8)
+            flags = [isodd(g) for g in groups]
+            saved = deepcopy((input, groups, flags))
+            k = prepare(spec; have=(:values, :groups, :flags),
+                bound=(; groups, flags))
+            expected = sum(flags[i] ? log(values[groups[i]]) : -values[groups[i]]
+                           for i in eachindex(groups))
+            partial = [sum(flags[i] ? inv(values[j]) : -1.0
+                           for i in eachindex(groups) if groups[i] == j; init=0.0)
+                       for j in eachindex(values)]
+            @test k(input) ≈ expected
+            ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), input; active=:values)
+            value, gradient = RK.ad_value_and_gradient(ad, input)
+            @test value ≈ expected
+            @test gradient ≈ embed(partial)
+            @test (input, groups, flags) == saved
+            push!(bytes, allocation(k, input))
+            push!(structures, length(recipe_inventory(k)))
+        end
+        # Small constant bookkeeping may differ across Julia versions; no
+        # lane-count-sized index composition is needed in either program.
+        @test bytes[2] <= bytes[1] + 128
+        @test structures[2] == structures[1]
+    end
+end
+
+# A plate cell whose lazy branch reads bound data only is split at preparation
+# into one branch-free plate per taken arm (docs/src/constraints.md).
+@testset "data-bound branch partitioning of authored plates" begin
+    C = BranchPartition
+    RK = ReactiveKernels
+    plates(p) = filter(r -> r.op isa RK._AuthoredPlateOp, p.recipes)
+    has_branch(p) = any(r -> r.op isa RK._KernelSourceOp &&
+                             r.op.f isa RK._KernelBranch, p.recipes)
+
+    x = [0.5, 1.5, 2.0, 0.25, 3.0, 1.25, 0.75]
+    y = [1.0, -2.0, 0.5, -1.0, 2.0, -0.5, 1.5]
+    reference_guarded(x, y) = sum(yi > 0 ? log(xi * yi) : xi - 1.0
+                                  for (xi, yi) in zip(x, y))
+
+    @testset "two arms, each over its own lanes" begin
+        C.arm_calls[] = 0
+        plain = prepare(C.guarded; have = (:x, :y), want = :total)
+        @test plain(x, y) ≈ reference_guarded(x, y)
+        @test C.arm_calls[] == count(>(0), y) # lazy per lane when unbound
+        bound = prepare(C.guarded; have = (:x, :y), want = :total, bound = (; y))
+        @test length(plates(bound.plan)) == 2
+        @test !any(r -> has_branch(plate_body(r)), plates(bound.plan))
+        C.arm_calls[] = 0
+        @test bound(x) ≈ reference_guarded(x, y)
+        @test C.arm_calls[] == count(>(0), y)
+        # A one-sided condition selects its arm statically: one plate, no branch.
+        ypos = abs.(y) .+ 0.5
+        one = prepare(C.guarded; have = (:x, :y), want = :total, bound = (; y = ypos))
+        @test length(plates(one.plan)) == 1
+        @test !has_branch(plate_body(only(plates(one.plan))))
+        @test one(x) ≈ reference_guarded(x, ypos)
+    end
+
+    @testset "a taken arm's shared work runs once per call" begin
+        ref(x, y, s) = sum(yi > 0 ? xi * log(s) : xi - 1.0 for (xi, yi) in zip(x, y))
+        have = (:x, :y, :s)
+        bound = prepare(C.guarded_counted_shared; have, want = :total, bound = (; y))
+        @test length(plates(bound.plan)) == 2
+        C.arm_calls[] = 0
+        @test bound(x, 2.5) ≈ ref(x, y, 2.5)
+        @test C.arm_calls[] == 1
+        ypos = abs.(y) .+ 0.5
+        one = prepare(C.guarded_counted_shared; have, want = :total, bound = (; y = ypos))
+        @test length(plates(one.plan)) == 1
+        C.arm_calls[] = 0
+        @test one(x, 2.5) ≈ ref(x, ypos, 2.5)
+        @test C.arm_calls[] == 1
+        # No lane takes the arm: its shared work is not evaluated.
+        yneg = -abs.(y)
+        none = prepare(C.guarded_counted_shared; have, want = :total, bound = (; y = yneg))
+        C.arm_calls[] = 0
+        @test none(x, -1.0) ≈ ref(x, yneg, 1.0)
+        @test C.arm_calls[] == 0
+        # Native Reverse through the hoisted value of the active shared number.
+        for (prepared, ys) in ((bound, y), (one, ypos))
+            pb = prepare_ad(prepared, AutoEnzyme(; mode = Enzyme.Reverse), x, 2.5;
+                            active = :s)
+            value, grad = RK.ad_value_and_gradient(pb, x, 2.5)
+            @test value ≈ ref(x, ys, 2.5)
+            @test grad ≈ sum(xi for (xi, yi) in zip(x, ys) if yi > 0) / 2.5
+        end
+    end
+
+    @testset "a composed child's sum splits into per-arm sums" begin
+        bound = prepare(C.guarded_caller; have = (:x, :y), bound = (; y))
+        @test length(plates(bound.plan)) == 2
+        @test !any(r -> r.op isa RK._LaneAssemble, bound.plan.recipes)
+        @test !occursin("similar", string(code_expr(bound)))
+        @test bound(x) ≈ 3 * reference_guarded(x, y)
+    end
+
+    @testset "pointwise output is reassembled in lane order" begin
+        bound = prepare(C.guarded; have = (:x, :y), want = :pointwise, bound = (; y))
+        @test length(plates(bound.plan)) == 2
+        @test bound(x) ≈ [yi > 0 ? log(xi * yi) : xi - 1.0 for (xi, yi) in zip(x, y)]
+    end
+
+    @testset "nested arms and in-bounds gathers" begin
+        cuts = [-1.0, 0.0, 1.5]
+        level = [1, 2, 4, 3, 1, 4, 2, 3]
+        eta = [0.3, -0.2, 0.9, 0.1, -0.4, 0.6, 0.2, -0.7]
+        w = [1.0, 0.5, 2.0, 1.5, 1.0, 0.25, 1.0, 2.0]
+        K = length(cuts) + 1
+        ref(eta, level, cuts, w) = sum(wi * (l == 1 ? cuts[1] - e :
+            (l == K ? e - cuts[end] : cuts[l] * e - cuts[l - 1]))
+            for (l, e, wi) in zip(level, eta, w))
+        have = (:eta, :level, :cuts, :w, :nlev)
+        plain = prepare(C.leveled; have, want = :total)
+        @test plain(eta, level, cuts, w, K) ≈ ref(eta, level, cuts, w)
+        bound = prepare(C.leveled; have, want = :total,
+                        bound = (; level, w, nlev = K))
+        @test length(plates(bound.plan)) == 3
+        @test !any(r -> has_branch(plate_body(r)), plates(bound.plan))
+        @test bound(eta, cuts) ≈ ref(eta, level, cuts, w)
+        # The same program for any threshold count: arms depend on the cell,
+        # never on the number of levels.
+        cuts6 = [-2.0, -1.0, 0.0, 0.5, 1.5, 3.0]
+        level6 = [1, 7, 3, 5, 2, 7, 4, 6]
+        K6 = length(cuts6) + 1
+        bound6 = prepare(C.leveled; have, want = :total,
+                         bound = (; level = level6, w, nlev = K6))
+        @test length(plates(bound6.plan)) == 3
+        @test bound6(eta, cuts6) ≈ sum(wi * (l == 1 ? cuts6[1] - e :
+            (l == K6 ? e - cuts6[end] : cuts6[l] * e - cuts6[l - 1]))
+            for (l, e, wi) in zip(level6, eta, w))
+        # Reverse through the partitioned plates: the analytic score.
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)
+        live_eta = prepare(C.leveled; have, want = :total,
+                           bound = (; level, w, nlev = K, cuts))
+        @test length(plates(live_eta.plan)) == 3
+        pb = prepare_ad(live_eta, backend, eta; active = :eta)
+        value, grad = ReactiveKernels.ad_value_and_gradient!(pb, similar(eta), eta)
+        @test value ≈ ref(eta, level, cuts, w)
+        @test grad ≈ [wi * (l == 1 ? -1.0 : l == K ? 1.0 : cuts[l])
+                      for (l, wi) in zip(level, w)]
+    end
+
+    @testset "reverse through a reassembled plate gathered by a second split plate" begin
+        mu = [0.3, -0.1, 0.2, 0.05, 0.7]
+        xc = [0.2, -1.0, 0.5, 1.5, -0.3]
+        yc = [0.1, 0.0, 0.4, -0.2, 0.0]
+        obs = [true, false, true, true, false]
+        ref(mu) = sum(o ? -0.5 * (yi - (m + sqrt(xi)))^2 : 0.0
+                      for (m, xi, yi, o) in zip(mu, xc, yc, obs))
+        bound = prepare(C.chained_arms; bound = (; x = xc, y = yc, obs))
+        @test length(plates(bound.plan)) == 4
+        @test any(op -> op isa RK._LaneAssemble, bound.ops)
+        @test bound(mu) ≈ ref(mu)
+        pb = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), mu; active = :mu)
+        value, grad = RK.ad_value_and_gradient!(pb, similar(mu), mu)
+        @test value ≈ ref(mu)
+        @test grad ≈ [o ? yi - (m + sqrt(xi)) : 0.0
+                      for (m, xi, yi, o) in zip(mu, xc, yc, obs)]
+    end
+
+    @testset "reverse through a reassembled constant arm beside captured live values" begin
+        # Base's vcat of the constant arm's vector beside the live arm's fails
+        # native Reverse (EnzymeRuntimeActivityError, Enzyme 0.13.216); the
+        # reassembly concatenates as the native kernel body does.
+        xc = [0.2, -1.0, 0.5]
+        yc = [0.1, 0.0, 0.4]
+        obs = [true, false, true]
+        ref(u) = sum(o ? -0.5 * (yi - (u[1] + u[2] * sqrt(xi)))^2 : 0.0
+                     for (xi, yi, o) in zip(xc, yc, obs))
+        bound = prepare(C.guarded_location;
+                        bound = (; x = xc, y = yc, idx = collect(1:3), obs))
+        @test any(op -> op isa RK._LaneAssemble, bound.ops)
+        u = [0.2, -0.3]
+        @test bound(u) ≈ ref(u)
+        pb = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), u; active = :u)
+        value, grad = RK.ad_value_and_gradient!(pb, similar(u), u)
+        @test value ≈ ref(u)
+        @test grad ≈ [sum(o ? (yi - (u[1] + u[2] * sqrt(xi))) * d : 0.0
+                          for (xi, yi, o, d) in zip(xc, yc, obs,
+                              j == 1 ? ones(3) : sqrt.(abs.(xc))))
+                      for j in 1:2]
+    end
+
+    @testset "reverse with an inactive live lane vector and an active scalar" begin
+        # Each arm reads live `x` through `_LaneGather`'s view. A local typed
+        # as the authored `Vector{Float64}` converted that view into a copy
+        # through `Base.unalias`, which native Reverse rejected for inactive
+        # `x` (EnzymeRuntimeActivityError, Enzyme 0.13.216; snag
+        # `native-enzyme-re-fdecb734`).
+        s = 2.5
+        ref(x, s) = sum(yi > 0 ? xi * log(s) : xi - 1.0 for (xi, yi) in zip(x, y))
+        bound = prepare(C.guarded_shared; have = (:x, :y, :s), want = :total,
+                        bound = (; y))
+        @test length(plates(bound.plan)) == 2
+        @test count(op -> op isa RK._LaneGather, bound.ops) == 4
+        @test bound(x, s) ≈ ref(x, s)
+        # No arm copies its lanes of `x`: the evaluation allocates the same
+        # at twenty times the lane count.
+        allocated(f, args...) = (f(args...); @allocated f(args...))
+        xl, yl = repeat(x, 20), repeat(y, 20)
+        large = prepare(C.guarded_shared; have = (:x, :y, :s), want = :total,
+                        bound = (; y = yl))
+        @test large(xl, s) ≈ sum(yi > 0 ? xi * log(s) : xi - 1.0
+                                 for (xi, yi) in zip(xl, yl))
+        @test allocated(bound, x, s) == allocated(large, xl, s)
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)
+        ps = prepare_ad(bound, backend, x, s; active = :s)
+        value, grad = RK.ad_value_and_gradient(ps, x, s)
+        @test value ≈ ref(x, s)
+        @test grad ≈ sum(x[y .> 0]) / s
+        px = prepare_ad(bound, backend, x, s; active = :x)
+        value, grad = RK.ad_value_and_gradient!(px, similar(x), x, s)
+        @test value ≈ ref(x, s)
+        @test grad ≈ [yi > 0 ? log(s) : 1.0 for yi in y]
+    end
+
+    @testset "a bound-only cell condition partitions after caching" begin
+        yv = [2.0, 0.5, 1.0, 3.0, 0.1]
+        xv = [1.5, 2.5, 3.5, 0.5, 1.0]
+        ref = sum(yi >= 1.0 ? log(xi) * yi : 2xi for (xi, yi) in zip(xv, yv))
+        bound = prepare(C.derived_condition; have = (:x, :y), want = :total,
+                        bound = (; y = yv))
+        @test length(plates(bound.plan)) == 2
+        C.arm_calls[] = 0
+        @test bound(xv) ≈ ref
+        @test C.arm_calls[] == count(>=(1.0), yv)
+    end
+
+    @testset "a constant arm contributes once per lane" begin
+        ref(x, y) = sum(yi > 0 ? xi * yi : 1.0 for (xi, yi) in zip(x, y))
+        bound = prepare(C.constant_fallback; have = (:x, :y), want = :total,
+                        bound = (; y))
+        @test length(plates(bound.plan)) == 2
+        @test bound(x) ≈ ref(x, y)
+        pointwise = prepare(C.constant_fallback; have = (:x, :y),
+                            want = :pointwise, bound = (; y))
+        @test pointwise(x) ≈ [yi > 0 ? xi * yi : 1.0 for (xi, yi) in zip(x, y)]
+        # All lanes take the constant arm: selected statically, still per lane.
+        yneg = -abs.(y)
+        allconst = prepare(C.constant_fallback; have = (:x, :y), want = :total,
+                           bound = (; y = yneg))
+        @test length(plates(allconst.plan)) == 1
+        @test allconst(x) ≈ length(x)
+    end
+
+    @testset "a live condition stays a lazy branch" begin
+        bound = prepare(C.live_condition; have = (:x, :s), want = :total,
+                        bound = (; s = 1.0))
+        # `s` is bound but broadcast: the condition still reads live `x`.
+        @test length(plates(bound.plan)) == 1
+        @test has_branch(plate_body(only(plates(bound.plan))))
+        @test bound(x) ≈ sum(abs(xi - 1.0) for xi in x)
+    end
+
+    @testset "partitioned code display keeps the executed slots" begin
+        for want in (:total, :pointwise)
+            bound = prepare(C.guarded; have = (:x, :y), want, bound = (; y))
+            code = code_expr(bound)
+            @test code === bound.ast
+            @test occursin("__ops__", string(code))
+            @test !occursin("yi > 0", string(code))
+            for recipe in plates(bound.plan)
+                inner = recipe.op.kernel
+                inner_code = code_expr(inner)
+                @test inner_code === inner.ast
+                @test !occursin("yi > 0", string(inner_code))
+            end
+            expected = want === :total ? reference_guarded(x, y) :
+                [yi > 0 ? log(xi * yi) : xi - 1.0 for (xi, yi) in zip(x, y)]
+            @test bound(x) ≈ expected
+        end
+    end
+end
+
+# A constructed endpoint under a lazy branch arm lowers in its arm: each taken
+# arm carries its own endpoint evaluation, the arm stays lazy (an endpoint
+# that is invalid off-arm never evaluates there), and the inlined math keeps
+# the backend's ordinary reverse mode.
+@testset "constructed endpoints under branch arms" begin
+    C = BranchPartition
+    RK = ReactiveKernels
+    plates(p) = filter(r -> r.op isa RK._AuthoredPlateOp, p.recipes)
+    has_branch(p) = any(r -> r.op isa RK._KernelSourceOp &&
+                             r.op.f isa RK._KernelBranch, p.recipes)
+    nlogpdf(x, m, s) = -0.5 * log(2π) - log(s) - 0.5 * ((x - m) / s)^2
+
+    y_full = [0.5, -1.0, 2.0, 0.25]
+    lp = [0.0, 1.0, -0.5, 0.75]
+    mis_pos = [0, 1, 0, 1]
+    ref_guarded = sum(mp == 0 ? nlogpdf(yf, lpi, 1.5) : 0.0 * yf
+                      for (yf, lpi, mp) in zip(y_full, lp, mis_pos))
+
+    @testset "missingness guard splits per arm" begin
+        plain = prepare(C.guarded_endpoint; have = (:y_full, :lp, :mis_pos),
+                        want = :total)
+        @test plain(y_full, lp, mis_pos) ≈ ref_guarded
+        bound = prepare(C.guarded_endpoint; have = (:y_full, :lp, :mis_pos),
+                        want = :total, bound = (; y_full, mis_pos))
+        @test length(plates(bound.plan)) == 2
+        @test !any(r -> has_branch(plate_body(r)), plates(bound.plan))
+        @test bound(lp) ≈ ref_guarded
+        pointwise = prepare(C.guarded_endpoint; have = (:y_full, :lp, :mis_pos),
+                            want = :pointwise, bound = (; y_full, mis_pos))
+        @test pointwise(lp) ≈
+            [mp == 0 ? nlogpdf(yf, lpi, 1.5) : 0.0 * yf
+             for (yf, lpi, mp) in zip(y_full, lp, mis_pos)]
+    end
+
+    @testset "an invalid-off-arm endpoint stays lazy" begin
+        # `scale = yf` is nonpositive on else-lanes: `log` there throws iff
+        # the endpoint evaluates off-arm, through either path.
+        yy = [1.5, -1.0, 2.0, -0.5]
+        mm = [0.1, 0.2, 0.3, 0.4]
+        gg = [0, 1, 0, 1]
+        ref = nlogpdf(0.1, 0.0, 1.5) + nlogpdf(0.3, 0.0, 2.0)
+        plain = prepare(C.lazy_endpoint_arm; have = (:y, :m, :g), want = :total)
+        @test plain(yy, mm, gg) ≈ ref
+        bound = prepare(C.lazy_endpoint_arm; have = (:y, :m, :g), want = :total,
+                        bound = (; y = yy, g = gg))
+        @test length(plates(bound.plan)) == 2
+        @test bound(mm) ≈ ref
+        nested = prepare(C.nested_endpoint_arm; have = (:y, :m, :g),
+                         want = :total)
+        @test nested(yy, mm, gg) ≈ 2ref
+    end
+
+    @testset "else arm, named and computed bindings, && guard" begin
+        ref_else = sum(mp == 0 ? 0.0 : nlogpdf(yf, lpi, 1.5)
+                       for (yf, lpi, mp) in zip(y_full, lp, mis_pos))
+        bound_else = prepare(C.else_endpoint_arm; have = (:y, :m, :g),
+                             want = :total, bound = (; y = y_full, g = mis_pos))
+        @test bound_else(lp) ≈ ref_else
+        sg = [1.0, 2.0, 1.5, 0.5]
+        ref_named = sum(gf == 0 ? nlogpdf(yf, mf, sf) : 0.0
+                        for (yf, mf, sf, gf) in zip(y_full, lp, sg, mis_pos))
+        named = prepare(C.named_endpoint_arm; have = (:y, :m, :s, :g),
+                        want = :total, bound = (; y = y_full, g = mis_pos))
+        @test named(lp, sg) ≈ ref_named
+        ref_computed =
+            sum(gf == 0 ? nlogpdf(log(abs(yf) + 1), mf + 0.25, exp(mf)) : 0.0
+                for (yf, mf, gf) in zip(y_full, lp, mis_pos))
+        computed = prepare(C.computed_endpoint_arm; have = (:y, :m, :g),
+                           want = :total)
+        @test computed(y_full, lp, mis_pos) ≈ ref_computed
+        ref_and = sum((gf == 0 && yf > 0) ? nlogpdf(yf, mf, 1.5) : 0.0
+                      for (yf, mf, gf) in zip(y_full, lp, mis_pos))
+        anded = prepare(C.and_endpoint_arm; have = (:y, :m, :g), want = :total,
+                        bound = (; y = y_full, g = mis_pos))
+        @test anded(lp) ≈ ref_and
+    end
+
+    @testset "condition position and top level" begin
+        ref_cond = sum(nlogpdf(yf, mf, 1.5) > -2.0 ? 1.0 : -1.0
+                       for (yf, mf) in zip(y_full, lp))
+        conded = prepare(C.condition_endpoint; have = (:y, :m), want = :total)
+        @test conded(y_full, lp) ≈ ref_cond
+        top = prepare(C.toplevel_endpoint_arm)
+        @test top(0.5, 0.0, 0) ≈ nlogpdf(0.5, 0.0, 1.5)
+        @test top(0.5, 0.0, 1) ≈ 0.0
+    end
+
+    @testset "reverse through the split arm plates" begin
+        bound = prepare(C.guarded_endpoint; have = (:y_full, :lp, :mis_pos),
+                        want = :total, bound = (; y_full, mis_pos))
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)
+        pb = prepare_ad(bound, backend, lp; active = :lp)
+        value, grad =
+            ReactiveKernels.ad_value_and_gradient!(pb, similar(lp), lp)
+        @test value ≈ ref_guarded
+        @test grad ≈ [(mp == 0 ? (yf - lpi) / 1.5^2 : 0.0)
+                      for (yf, lpi, mp) in zip(y_full, lp, mis_pos)]
+    end
+
+    @testset "defining-module globals remain callable in a lazy arm" begin
+        raw = prepare(C.bare_helper_branch; have=(:x,:flag), want=:total,
+            bound=(flag=mis_pos,))
+        @test raw(y_full) ≈ sum(mp == 0 ? 2yf : 0.0 for (yf,mp) in zip(y_full,mis_pos))
+        rawad = prepare_ad(raw, AutoEnzyme(; mode=Enzyme.Reverse), y_full; active=:x)
+        _, rawgrad = RK.ad_value_and_gradient!(rawad, similar(y_full), y_full)
+        @test rawgrad ≈ [mp == 0 ? 2.0 : 0.0 for mp in mis_pos]
+        ex = :(@kernel module_endpoint_arm(y::Vector{Float64},
+                                           m::Vector{Float64},
+                                           g::Vector{Int}) = begin
+            pointwise = plate(y, m, g) do yf, mf, gf
+                cell::Float64 = gf == 0 ?
+                    helper_normal(mf, 1.5).logpdf(yf) : 0.0
+                cell
+            end
+            total::Float64 = sum(pointwise)
+        end)
+        Core.eval(C, ex)
+        spec = getproperty(C, :module_endpoint_arm)
+        kernel = prepare(spec; have=(:y, :m, :g), want=:total)
+        expected = sum(mp == 0 ? 2(yf-lpi)/1.5 - 0.5log(2pi) - log(1.5) : 0.0
+            for (yf, lpi, mp) in zip(y_full, lp, mis_pos))
+        @test Base.invokelatest(kernel, y_full, lp, mis_pos) ≈ expected
+        # An inactive negative scale still remains inactive through the
+        # original defining-module helper, including native reverse mode.
+        bound = prepare(spec; have=(:y, :m, :g), want=:total,
+            bound=(y=y_full, g=mis_pos))
+        pb = prepare_ad(bound, AutoEnzyme(; mode=Enzyme.Reverse), lp; active=:m)
+        value, grad = Base.invokelatest(RK.ad_value_and_gradient!, pb, similar(lp), lp)
+        @test value ≈ expected
+        @test grad ≈ [(mp == 0 ? -2/1.5 : 0.0)
+            for (yf,lpi,mp) in zip(y_full,lp,mis_pos)]
+    end
+
+    @testset "endpoint helpers keep their defining module" begin
+        k = prepare(EndpointBranchCaller.scoped_endpoint_arm;
+            have = (:y, :m, :g), want = :total)
+        oracle = sum(g == 0 ? 2 * (y - m) / 1.5 -
+            0.5 * log(2π) - log(1.5) : 0.0
+            for (y, m, g) in zip(y_full, lp, mis_pos))
+        @test k(y_full, lp, mis_pos) ≈ oracle
+        bound = prepare(EndpointBranchCaller.scoped_endpoint_arm;
+            have = (:y, :m, :g), want = :total,
+            bound = (; y = y_full, g = mis_pos))
+        @test bound(lp) ≈ oracle
+        ad = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), lp;
+            active = :m)
+        val, grad = ReactiveKernels.ad_value_and_gradient!(ad, similar(lp), lp)
+        @test val ≈ oracle
+        @test grad ≈ [-2 / 1.5, 0, -2 / 1.5, 0]
+    end
+end

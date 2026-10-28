@@ -3,6 +3,58 @@ module ReactiveKernelsMutatingFunctionsExt
 using ReactiveKernels
 import MutatingFunctions
 
+mutable struct _NestedPlateCache{K,R}
+    kernel::K
+    result::R
+end
+
+function ReactiveKernels._nested_plate_cache(op::ReactiveKernels._AuthoredPlateOp{K,A},
+        argtypes, ::Type{T}, N) where {K,A,T<:AbstractArray}
+    isconcretetype(T) && N !== nothing || return nothing
+    celltypes = Tuple((i in A || argtypes[i] <: Number) ? argtypes[i] :
+        eltype(argtypes[i]) for i in eachindex(argtypes))
+    all(isconcretetype, celltypes) || return nothing
+    p = op.kernel.plan
+    all(r -> length(r.outputs) == 1, p.recipes) || return nothing
+    cell = ReactiveKernels._prepare_nonallocating(p, cache_apply!;
+        have_types=celltypes)
+    result = Array{T,N}(undef, ntuple(_ -> 0, N)...)
+    Ref(_NestedPlateCache(cell, result))
+end
+
+@generated function cache_apply!(slot::Base.RefValue{C},
+        op::ReactiveKernels._AuthoredPlateOp{K,A}, args::Vararg{Any,N}) where {C<:_NestedPlateCache,K,A,N}
+    wrapped = gensym.([Symbol(:plate_operand_, i) for i in 1:N])
+    bindings = [:($(wrapped[i]) = args[$i]) for i in 1:N]
+    # Ref operands have no broadcast axes and enter the cell unchanged.
+    # Fold the remaining axes explicitly: a wide varargs combine_axes call
+    # loses inference on Julia 1.10 and makes those temporary Refs escape.
+    combined = foldl((ax, i) -> :(Base.Broadcast.broadcast_shape(
+        $ax, Base.axes($(wrapped[i])))), (i for i in 1:N if !(i in A)); init=:(()))
+    index = gensym(:plate_index)
+    cellargs = [i in A ? wrapped[i] :
+        :(Base.Broadcast._broadcast_getindex($(wrapped[i]), $index)) for i in 1:N]
+    quote
+        $(Expr(:meta, :inline))
+        $(bindings...)
+        cache = slot[]
+        combined_axes = $combined
+        isempty(combined_axes) && throw(ArgumentError(
+            "an authored plate requires at least one non-Ref batched argument"))
+        result = _authored_plate_array_cache(cache.result, combined_axes)
+        for $index in CartesianIndices(combined_axes)
+            value = cache.kernel.f($(cellargs...))
+            if isassigned(result, $index) && axes(result[$index]) == axes(value)
+                copyto!(result[$index], value)
+            else
+                result[$index] = copy(value)
+            end
+        end
+        cache.result = result
+        result
+    end
+end
+
 @inline function cache_apply!(slot::Base.RefValue, op, args...)
     slot[] = MutatingFunctions.apply!!(slot[], op, args...)
 end
@@ -17,13 +69,6 @@ end
 # An authored plate's pointwise result is one ordinary single-output recipe.
 # Reuse that recipe's borrowed cache after the first call while preserving the
 # exact broadcast/Ref argument semantics used by allocating execution.
-@inline function _authored_plate_array_cache(
-        cache::Array{T}, combined_axes::Tuple{Vararg{Any,N}}) where {T,N}
-    result = cache isa Array{T,N} && Base.axes(cache) == combined_axes ?
-             cache : similar(cache, T, combined_axes)
-    result::Array{T,N}
-end
-
 @inline function _apply_authored_plate!(
         cache, op::ReactiveKernels._AuthoredPlateOp{K,A}, args...) where {K,A}
     wrapped = ReactiveKernels._authored_plate_arguments(Val(A), args...)
@@ -48,6 +93,13 @@ end
     result
 end
 
+@inline function _authored_plate_array_cache(
+        cache::Array{T}, combined_axes::Tuple{Vararg{Any,N}}) where {T,N}
+    result = cache isa Array{T,N} && Base.axes(cache) == combined_axes ?
+             cache : similar(cache, T, combined_axes)
+    result::Array{T,N}
+end
+
 
 @inline MutatingFunctions.apply!!(
     cache::AbstractArray, op::ReactiveKernels._AuthoredPlateOp, args...) =
@@ -65,6 +117,46 @@ end
     result = _apply_authored_plate!(slot[], op, args...)
     slot[] = result
     result
+end
+
+# Fixed-arity plate steps: the slurped `args...` tuple above round-trips
+# through `ntuple` construction and two splats, which boxes one tuple per call
+# on Julia 1.10 even though every element is stack-allocatable. Bind every
+# argument explicitly for the arities programs actually emit; the varargs
+# methods stay as the fallback for degenerate (0-argument, which throws) and
+# very wide plates. The Array branch still refines through
+# `_authored_plate_array_cache`, which recovers the rank from the inferred
+# axes-tuple type: an untyped batched port seeds the unranked `Ref{Array{T}}`
+# slot, and `ndims` on that rank-unknown cache dynamically dispatches (and
+# leaves `broadcast!` rank-unknown), allocating hundreds of bytes per call.
+for _PLATE_N in 1:8
+    _a = [Symbol(:_plate_a_, i) for i in 1:_PLATE_N]
+    _w = [Symbol(:_plate_w_, i) for i in 1:_PLATE_N]
+    _binds = [quote
+        $(_w[i]) = ReactiveKernels._authored_plate_argument(Val(A), $i,
+            $(_a[i]))
+    end for i in 1:_PLATE_N]
+    @eval @inline function cache_apply!(slot::Base.RefValue{SA},
+            op::ReactiveKernels._AuthoredPlateOp{K,A},
+            $(_a...)) where {K,A,SA<:Array}
+        $(_binds...)
+        combined_axes = Base.Broadcast.combine_axes($(_w...))
+        isempty(combined_axes) && throw(ArgumentError(
+            "an authored plate requires at least one non-Ref batched argument"))
+        cache = slot[]
+        output_type = eltype(cache)
+        result = if cache isa Array{output_type}
+            _authored_plate_array_cache(cache, combined_axes)
+        elseif Base.axes(cache) == combined_axes &&
+               eltype(cache) == output_type
+            cache
+        else
+            similar(cache, output_type, combined_axes)
+        end
+        Base.Broadcast.broadcast!(op.kernel, result, $(_w...))
+        slot[] = result
+        result
+    end
 end
 
 # --- destination-passing step coverage --------------------------------------
@@ -118,6 +210,55 @@ end
     size(cache, 1) == rows
 end
 
+# Elementwise `+`/`-` over dense arrays. `Base.+`/`Base.-` on arrays check
+# exact shape agreement and then broadcast (`arraymath.jl`), so on matching
+# shapes `broadcast!` into the cache computes bit-identical values with no
+# temporary; anything else (shape mismatch, mixed eltypes, exotic operands)
+# falls back to the twin call, preserving its exact result and errors. Only
+# `+` has an N-ary method (`-(a, b, c)` is a `MethodError`), so only `+` gets
+# the 3-argument and slurped forms. Restricted to exact `Array` operands: a
+# structured array could shadow the generic method with non-elementwise
+# semantics, and those stay on the allocating fallback.
+@inline function _add_destination_matches(cache::Array{T,N}, args) where {T,N}
+    length(args) >= 2 || return false
+    all(a -> a isa Array{T,N}, args) || return false
+    ax = axes(args[1])
+    all(a -> axes(a) == ax, args) || return false
+    axes(cache) == ax
+end
+
+@inline function MutatingFunctions.apply!!(
+        cache::Array{T,N}, ::typeof(+), a::Array{T,N}, b::Array{T,N}) where {T,N}
+    _add_destination_matches(cache, (a, b)) || return a + b
+    Base.Broadcast.broadcast!(+, cache, a, b)
+    cache
+end
+
+@inline function MutatingFunctions.apply!!(
+        cache::Array{T,N}, ::typeof(+),
+        a::Array{T,N}, b::Array{T,N}, c::Array{T,N}) where {T,N}
+    _add_destination_matches(cache, (a, b, c)) || return a + b + c
+    Base.Broadcast.broadcast!(+, cache, a, b, c)
+    cache
+end
+
+@inline function MutatingFunctions.apply!!(
+        cache::Array{T,N}, ::typeof(+),
+        a::Array{T,N}, b::Array{T,N}, c::Array{T,N}, d::Array{T,N},
+        rest::Array{T,N}...) where {T,N}
+    args = (a, b, c, d, rest...)
+    _add_destination_matches(cache, args) || return +(args...)
+    Base.Broadcast.broadcast!(+, cache, args...)
+    cache
+end
+
+@inline function MutatingFunctions.apply!!(
+        cache::Array{T,N}, ::typeof(-), a::Array{T,N}, b::Array{T,N}) where {T,N}
+    _add_destination_matches(cache, (a, b)) || return a - b
+    Base.Broadcast.broadcast!(-, cache, a, b)
+    cache
+end
+
 @inline function MutatingFunctions.apply!!(
         cache::Array{T,N}, op::ReactiveKernels._ConcatenateStep{typeof(vcat)},
         args...) where {T,N}
@@ -132,6 +273,88 @@ end
     cache
 end
 
+# One-dimensional gather without constructing the view object: contiguous
+# ranges copy with offsets, anything else 1-D copies elementwise in index
+# order — both bit-identical to `x[idx]`, whose bounds behavior they preserve
+# (`copyto!`/scalar indexing throw the same `BoundsError`). Any shape the loop
+# does not cover (non-vectors, empty-vs-nonempty mismatches, exotic indices)
+# falls back to the twin call, which reseeds the cache.
+@inline function MutatingFunctions.apply!!(
+        cache::Vector{T}, ::ReactiveKernels._GatherStep,
+        x::AbstractVector{T}, idx::AbstractRange) where {T}
+    n = length(idx)
+    n == 0 && return length(cache) == 0 ? cache : x[idx]
+    length(cache) == n || return x[idx]
+    if idx isa Union{UnitRange,Base.OneTo}
+        return copyto!(cache, 1, x, first(idx), n)
+    end
+    for (i, j) in enumerate(idx)
+        cache[i] = x[j]
+    end
+    cache
+end
+
+@inline function MutatingFunctions.apply!!(
+        cache::Vector{T}, ::ReactiveKernels._GatherStep,
+        x::AbstractVector{T}, idx::AbstractVector{<:Integer}) where {T}
+    eltype(idx) === Bool && return _gather_slow!(cache, x, idx)
+    n = length(idx)
+    n == 0 && return length(cache) == 0 ? cache : x[idx]
+    length(cache) == n || return x[idx]
+    for i in 1:n
+        cache[i] = x[idx[i]]
+    end
+    cache
+end
+
+# Shapes the fast loops do not cover (non-vectors, multiple indices, logical
+# masks, exotic ranges): the previous view-plus-materialize computation,
+# reusing the tested `_MaterializeStep` method, so behavior never regresses
+# from before `_GatherStep` existed.
+@inline function _gather_slow!(cache, x, idx...)
+    MutatingFunctions.apply!!(cache, ReactiveKernels._MaterializeStep(),
+        Base.Broadcast.broadcasted(Base.identity, view(x, idx...)))
+end
+
+@inline function MutatingFunctions.apply!!(
+        cache::AbstractArray, ::ReactiveKernels._GatherStep, x, idx...)
+    _gather_slow!(cache, x, idx...)
+end
+
+# Partitioned-plate lane gathers: `x[lanes]` elementwise into the cache, or a
+# fill when the argument is a singleton (the twin's indexed-view branch).
+# The guards mirror the twin's branch order exactly — the singleton check
+# first, so out-of-range lane indices on a length-1 argument fill rather than
+# throwing. Resize the owned vector when the lane count changes; shape errors
+# still call the twin, preserving its error. Bool lane masks use the twin's
+# selection and copy its view into owned storage.
+#
+# The gather loop itself is `@inbounds`, with the twin's `BoundsError` on
+# out-of-range lanes preserved by an explicit integer-range validation (pinned
+# by tests): the guards above establish `length(cache) == length(lanes)`, so
+# only the data-driven `x[lane]` index needs the manual check. Spelled-out
+# integer comparisons stay allocation-free where the per-element `checkbounds`
+# calls do not: under reverse-mode Enzyme on Julia 1.12 those checks allocate
+# (~17.6 bytes/element measured), defeating the non-allocating gradient.
+@inline function MutatingFunctions.apply!!(
+        cache::Vector{T}, gather::ReactiveKernels._LaneGather,
+        x::AbstractVector{T}, lanes::AbstractVector{<:Integer}) where {T}
+    eltype(lanes) === Bool && return copy(gather(x, lanes))
+    if length(x) == 1
+        length(cache) == length(lanes) || resize!(cache, length(lanes))
+        fill!(cache, x[1])
+        return cache
+    end
+    ndims(x) == 1 && length(x) == gather.n || return copy(gather(x, lanes))
+    length(cache) == length(lanes) || resize!(cache, length(lanes))
+    n = length(x)
+    @inbounds for (i, lane) in enumerate(lanes)
+        (1 <= lane <= n) || throw(BoundsError(x, lane))
+        cache[i] = x[lane]
+    end
+    cache
+end
+
 @inline function MutatingFunctions.apply!!(
         cache::Array{Float64,N}, op::ReactiveKernels._FillConstructorStep,
         dims::Vararg{Integer,N}) where {N}
@@ -139,6 +362,58 @@ end
     fill!(cache, ReactiveKernels._fill_constructor_value(op))
     cache
 end
+
+# Row/column reduction with a preparation-constant `dims`. Base's
+# `sum!`/`prod!`/`minimum!`/`maximum!` run the same per-lane `mapreducedim`
+# pass the allocating twin (`f(A; dims = ...)` uses, so values are
+# bit-identical; the cache must already have the exact result shape and
+# eltype, and anything else reseeds through the twin call.
+@inline function MutatingFunctions.apply!!(
+        cache::Array{T}, op::ReactiveKernels._RowReduceStep, A::Array) where {T}
+    T === Base.promote_op(getfield(op, :f), eltype(A)) || return op(A)
+    axes(cache) == Base.reduced_indices(axes(A), getfield(op, :dims)) ||
+        return op(A)
+    _rk_rowreduce_inplace!(getfield(op, :f), cache, A)
+    cache
+end
+
+@inline _rk_rowreduce_inplace!(::typeof(sum), r, A) = Base.sum!(r, A)
+@inline _rk_rowreduce_inplace!(::typeof(prod), r, A) = Base.prod!(r, A)
+@inline _rk_rowreduce_inplace!(::typeof(minimum), r, A) = Base.minimum!(r, A)
+@inline _rk_rowreduce_inplace!(::typeof(maximum), r, A) = Base.maximum!(r, A)
+
+# --- cache ownership ---------------------------------------------------------
+# A step keeps a cache slot only when a destination-passing method fills owned
+# storage (`ReactiveKernels._nonalloc_destination`). Besides the core's own
+# fresh-storage steps, that is a registered `apply!!` method selected for the
+# step's concrete cache and argument types: its first result is the operation's
+# own fresh result, and later calls fill it in place. MutatingFunctions' generic
+# fallback is not one: it allocates the result and copies it into whatever the
+# slot holds, which may be caller data.
+const _GENERIC_APPLY = which(MutatingFunctions.apply!!, Tuple{Any,Any,Vararg{Any}})
+
+function ReactiveKernels._nonalloc_destination(::typeof(cache_apply!), op,
+                                               T, argtypes)
+    ReactiveKernels._nonalloc_fresh_step(op) && return true
+    argtypes === nothing && return false
+    T isa Type && isconcretetype(T) &&
+        all(t -> t isa Type && isconcretetype(t), argtypes) || return false
+    method = try
+        which(MutatingFunctions.apply!!, Tuple{T,typeof(op),argtypes...})
+    catch
+        return false
+    end
+    method !== _GENERIC_APPLY
+end
+
+# The reactive layer seeds a slot with its recipe's first result in the same
+# way, so it reuses a slot in place under the same rule, typed by the recipe's
+# declared port types.
+ReactiveKernels._reactive_inplace_destination(::typeof(reactive_cache_apply),
+                                              recipe::ReactiveKernels.Recipe) =
+    ReactiveKernels._nonalloc_destination(cache_apply!, recipe.op,
+        ReactiveKernels.valtype(only(recipe.outputs)),
+        map(ReactiveKernels.valtype, Tuple(recipe.inputs)))
 
 # --- public entry points ----------------------------------------------------
 
@@ -156,29 +431,32 @@ function ReactiveKernels.prepare_reactive_nonallocating(spec::ReactiveKernels.Ke
         cache_apply = reactive_cache_apply, is_mutating = is_mutating, kwargs...)
 end
 
-function ReactiveKernels.prepare_nonallocating(p::ReactiveKernels.Plan;
+function ReactiveKernels.prepare_nonallocating(p::ReactiveKernels.Plan,
+                                               exemplars...;
                                                passes = (), bound = ())
+    # As ordinary `prepare`: cell-only producers compose before the bound split.
+    bound === () ||
+        (p = ReactiveKernels._fuse_authored_plate_chains(p; cells_only = true))
     p = ReactiveKernels._partial_apply(p, bound)
-    # Embedded prepared recipes are already allocation-free executable kernels.
-    # Keep them as one cache operation here; ordinary `prepare` is the boundary
-    # that splices their generated bodies into a flat operation table.
-    ast = ReactiveKernels._lower_unembedded(p)
-    isempty(passes) || (ast = ReactiveKernels.transform(ast, passes...))
-    ReactiveKernels._prepare_nonallocating(p, ast, cache_apply!)
+    have_types = ReactiveKernels._nonalloc_exemplar_types(p, exemplars)
+    ReactiveKernels._prepare_nonallocating(p, cache_apply!; have_types,
+        exact_signature = have_types !== nothing, passes)
 end
 
-function ReactiveKernels.prepare_nonallocating(g::ReactiveKernels.Graph;
+function ReactiveKernels.prepare_nonallocating(g::ReactiveKernels.Graph,
+                                                exemplars...;
                                                 have = (), want = (), passes = (),
                                                 bound = ())
     p = ReactiveKernels.plan(g; have = have, want = want)
-    ReactiveKernels.prepare_nonallocating(p; passes = passes, bound = bound)
+    ReactiveKernels.prepare_nonallocating(p, exemplars...; passes = passes,
+                                          bound = bound)
 end
 
 # The natural consumer call after benchmarking an ordinary prepared kernel:
 # reuse its already-selected plan.
-function ReactiveKernels.prepare_nonallocating(k::ReactiveKernels.PreparedKernel;
-                                                passes = ())
-    ReactiveKernels.prepare_nonallocating(k.plan; passes = passes)
+function ReactiveKernels.prepare_nonallocating(k::ReactiveKernels.PreparedKernel,
+                                                exemplars...; passes = ())
+    ReactiveKernels.prepare_nonallocating(k.plan, exemplars...; passes = passes)
 end
 
 end # module ReactiveKernelsMutatingFunctionsExt

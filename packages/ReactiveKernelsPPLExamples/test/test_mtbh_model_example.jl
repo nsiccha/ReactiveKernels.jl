@@ -1,6 +1,20 @@
 using ReactiveKernelsPPLExamples.MtbhModelExample
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 using LogExpFunctions: logistic, log1pexp, logaddexp
+using DifferentiationInterface
+import Enzyme
+
+const _MTBH_AE = AutoEnzyme(mode = Enzyme.Reverse)
+
+function _mtbh_fd(f, q; h = 1e-6)
+    g = similar(q)
+    for i in eachindex(q)
+        qp = copy(q); qp[i] += h
+        qm = copy(q); qm[i] -= h
+        g[i] = (f(qp) - f(qm)) / (2h)
+    end
+    g
+end
 
 # Graph-independent oracle for Mtbh (capture-recapture, time-varying detection +
 # individual heterogeneity + behavioural recapture, data-augmentation log_sum_exp
@@ -120,5 +134,19 @@ end
             bound = (; Y = MTBH_Y, Yprev = MTBH_YPREV, s = MTBH_S,
                       T = MTBH_T, M = MTBH_M))
         @test occursin("similar", string(code_expr(likelihood_kernel)))
+    end
+
+    @testset "native primal + plain-Enzyme gradient vs finite differences" begin
+        pk = prepare(model;
+            have = (:unconstrained, :Y, :Yprev, :s, :T, :M), want = :posterior,
+            bound = (; Y = MTBH_Y, Yprev = MTBH_YPREV, s = MTBH_S,
+                      T = MTBH_T, M = MTBH_M))
+        prep = prepare_ad(pk, _MTBH_AE, q; active = :unconstrained)
+        value, g = ReactiveKernels.ad_value_and_gradient!(prep, similar(q), q)
+        @test value ≈ reference.posterior
+        @test all(isfinite, g)
+        gfd = _mtbh_fd(qq -> _mtbh_reference(qq, MTBH_Y, MTBH_YPREV, MTBH_S,
+                                             MTBH_T, MTBH_M).posterior, q)
+        @test g ≈ gfd rtol = 1e-5
     end
 end

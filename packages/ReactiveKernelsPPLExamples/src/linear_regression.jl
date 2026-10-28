@@ -37,8 +37,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     # boundary; the inverse edges expose its components when it is supplied.
     parameters = (; α, β, σ)
     (parameters, log_jacobian::Float64) = ((; α, β, σ), log_σ)
-    (α::Float64, β::Float64, σ::Float64) =
-        (parameters.α, parameters.β, parameters.σ)
 
     # Log prior: α, β ~ Normal(0, 10) and σ ~ HalfNormal(5). The half-normal
     # folds the reusable Normal endpoint with the log(2) truncation constant, so

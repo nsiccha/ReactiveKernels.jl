@@ -1,5 +1,7 @@
 using ReactiveKernels, Reactant, DifferentiationInterface, Test
 import Enzyme
+include("test_invariant_plate_reactant.jl")
+include("test_shared_host_array_branches_reactant.jl")
 isdefined(@__MODULE__, :AuthoredPlateChains) ||
     include("fixtures/authored_plate_chains.jl")
 
@@ -47,6 +49,68 @@ end
     end
     total::Float64 = sum(pointwise)
     return total
+end
+end
+
+module NestedLanePlateFixtures
+using ReactiveKernels
+
+# A host schedule with a compact per-dose plan, embedded as one prepared plate
+# child in a batched outer graph: the cell's first recipe is all-host data, so
+# the tensorized lowering materializes one row vector per lane before the
+# traced gather recipe runs.
+struct GatherSchedule
+    nobs::Int
+    shifts::Vector{Int}
+end
+
+_superpose_row(row, response, amounts) =
+    sum(response[max.(row, 1)] .* (row .> 0) .* amounts)
+
+@kernel superposition(plan, units, weights) = begin
+    observations = collect(1:plan.nobs)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do observation, schedule_plan, response, amounts
+        row = observation .- schedule_plan.shifts
+        _superpose_row(row, response, amounts)
+    end
+    return concentration
+end
+const SUPERPOSITION_PREPARED = prepare(superposition)
+
+@kernel amount_outer(units, weights, schedule) = begin
+    plan = schedule.plan
+    concentration = SUPERPOSITION_PREPARED(plan, units, weights)
+    return concentration
+end
+
+@kernel traced_superposition(obs, shifts, units, weights) = begin
+    concentration::Vector{Float64} = plate(obs, Ref(shifts), Ref(units), Ref(weights)) do observation, sh, response, amounts
+        row = observation .- sh
+        _superpose_row(row, response, amounts)
+    end
+    return concentration
+end
+const TRACED_SUPERPOSITION_PREPARED = prepare(traced_superposition)
+
+@kernel traced_amount_outer(obs, shifts, units, weights) = begin
+    concentration = TRACED_SUPERPOSITION_PREPARED(obs, shifts, units, weights)
+    return concentration
+end
+
+_ragged_rows(n) = [collect(1:i) for i in 1:n]
+
+@kernel ragged_inner(n, units) = begin
+    rows = _ragged_rows(n)
+    out::Vector{Float64} = plate(rows, Ref(units)) do row, response
+        sum(response[row])
+    end
+    return out
+end
+const RAGGED_PREPARED = prepare(ragged_inner)
+
+@kernel ragged_outer(n, units) = begin
+    out = RAGGED_PREPARED(n, units)
+    return out
 end
 end
 
@@ -159,4 +223,506 @@ end
             @test Array(gradient) ≈ reference_gradient
         end
     end
+
+    @testset "host-plan masked gather keeps lane structure under batching" begin
+        # Lane count (6), dose count (2), and subject batch (3) are all
+        # distinct, so any lane/batch confusion changes shapes or values.
+        plan = NestedLanePlateFixtures.GatherSchedule(6, [0, 3])
+        schedule = (; plan)
+        units = reshape(collect(1.0:18.0), 6, 3)
+        weights = [1.0 2.0 3.0; 4.0 5.0 6.0]
+        B = prepare_batched(NestedLanePlateFixtures.amount_outer;
+            have = (:units, :weights, :schedule),
+            batched = (:units, :weights), want = :concentration)
+        reference = B(units, weights, schedule)
+        expected = Matrix{Float64}(undef, 6, 3)
+        for s in 1:3, o in 1:6
+            row = o .- plan.shifts
+            expected[o, s] = sum(units[max.(row, 1), s] .* (row .> 0) .* weights[:, s])
+        end
+        @test reference ≈ expected
+        f = (u, w, s) -> B(u, w, s)
+        runits, rweights = Reactant.to_rarray(units), Reactant.to_rarray(weights)
+        hlo = repr(Reactant.@code_hlo optimize = :none f(runits, rweights, schedule))
+        @test occursin("stablehlo.while", hlo)
+        compiled = Reactant.@compile sync = true f(runits, rweights, schedule)
+        @test Array(compiled(runits, rweights, schedule)) ≈ reference
+        # Changed inputs reuse the same program with fresh values.
+        units2 = units .* 1.5 .+ 1.0
+        weights2 = weights .+ 2.0
+        runits2 = Reactant.to_rarray(units2)
+        rweights2 = Reactant.to_rarray(weights2)
+        reference2 = B(units2, weights2, schedule)
+        @test reference2 != reference
+        @test Array(compiled(runits2, rweights2, schedule)) ≈ reference2
+        # Doubling the lane count must not replicate the program.
+        plan12 = NestedLanePlateFixtures.GatherSchedule(12, [0, 3])
+        schedule12 = (; plan = plan12)
+        units12 = reshape(collect(1.0:36.0), 12, 3)
+        runits12 = Reactant.to_rarray(units12)
+        hlo12 = repr(Reactant.@code_hlo optimize = :none f(runits12, rweights, schedule12))
+        @test count("stablehlo.while", hlo12) == count("stablehlo.while", hlo)
+        @test count("\n", hlo12) == count("\n", hlo)
+        compiled12 = Reactant.@compile sync = true f(runits12, rweights, schedule12)
+        @test Array(compiled12(runits12, rweights, schedule12)) ≈
+            B(units12, weights, schedule12)
+    end
+
+    @testset "traced lane axis keeps vector lanes whole" begin
+        obs = collect(1:6)
+        shifts = [0, 2, 4]
+        units = reshape(collect(1.0:18.0), 6, 3)
+        weights = [5.0, 6.0, 7.0]
+        B = prepare_batched(NestedLanePlateFixtures.traced_amount_outer;
+            have = (:obs, :shifts, :units, :weights),
+            batched = (:units,), want = :concentration)
+        reference = B(obs, shifts, units, weights)
+        @test size(reference) == (6, 3)
+        f = (o, s, u, w) -> B(o, s, u, w)
+        robs = Reactant.to_rarray(obs)
+        runits = Reactant.to_rarray(units)
+        compiled = Reactant.@compile sync = true f(robs, shifts, runits, weights)
+        got = Array(compiled(robs, shifts, runits, weights))
+        @test size(got) == (6, 3)
+        @test got ≈ reference
+    end
+
+    @testset "ragged and empty per-lane values raise loudly" begin
+        units = [10.0 20.0; 30.0 40.0; 50.0 60.0]
+        B = prepare_batched(NestedLanePlateFixtures.ragged_outer;
+            have = (:n, :units), batched = (:units,), want = :out)
+        @test B(3, units) ≈ [10.0 20.0; 40.0 60.0; 90.0 120.0]
+        f = (nn, u) -> B(nn, u)
+        runits = Reactant.to_rarray(units)
+        @test_throws ArgumentError Reactant.@compile sync = true f(3, runits)
+        @test isempty(B(0, units))
+        @test_throws ArgumentError Reactant.@compile sync = true f(0, runits)
+    end
 end
+
+# --- per-cell reductions over a few host indices (snag plate-cell-gathe-94d4a929)
+module GatherGeneratorFixtures
+using ReactiveKernels
+
+struct Lattice
+    shifts::Vector{Int}
+    nobs::Int
+end
+struct Exact
+    rows::Matrix{Int}
+end
+_domain(plan::Lattice) = collect(1:plan.nobs)
+_domain(plan::Exact) = eachrow(plan.rows)
+_slots(plan::Lattice) = eachindex(plan.shifts)
+_slots(plan::Exact) = axes(plan.rows, 2)
+_index(observation, plan::Lattice, i) = observation - plan.shifts[i]
+# A stored per-lane row reaches the cell as a traced slice under batching;
+# an opaque helper reads one element as a one-element reduction rather than
+# `row[i]`, which Reactant's scalar-indexing guard refuses outside the
+# `@kernel`-lowered `_tensorized_getindex` rewrite.
+_index(row, ::Exact, i) = sum(view(row, i:i))
+
+@kernel generator_cell(plan, units, weights) = begin
+    observations = _domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do observation, schedule_plan, response, amounts
+        sum(ifelse(_index(observation, schedule_plan, i) > 0,
+                   response[max(_index(observation, schedule_plan, i), 1)] * amounts[i], 0.0)
+            for i in _slots(schedule_plan))
+    end
+    return concentration
+end
+
+# The natural spelling with a cell-local copy of the shared host vector: that
+# local is loop-invariant (its only root is the `Ref`-atomic plan), so it must
+# stay atomic under the tensorized lowering instead of becoming a lane axis.
+@kernel invariant_local_cell(plan, units, weights) = begin
+    observations = collect(1:plan.nobs)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do observation, schedule_plan, response, amounts
+        shifts = schedule_plan.shifts
+        sum(ifelse(observation - shifts[i] > 0,
+                   response[max(observation - shifts[i], 1)] * amounts[i], 0.0)
+            for i in eachindex(shifts))
+    end
+    return concentration
+end
+
+@kernel invariant_local(xs, shared) = begin
+    ys::Vector{Float64} = plate(xs, Ref(shared)) do x, s
+        w = s.vec
+        x * w[1] + w[2]
+    end
+    return ys
+end
+
+# The inner reduction prepared as its own reducing plate: `resp` is a shared
+# array HAVE that must reach every lane whole, not as a broadcast axis.
+@kernel row_cell(shift, amount, obs, resp) = begin
+    row = obs - shift
+    contribution::Float64 = resp[max(row, 1)] * (row > 0) * amount
+    return contribution
+end
+const ROW_TOTAL = plate(row_cell; have = (:shift, :amount, :obs, :resp),
+                        want = :contribution, batched = (:shift, :amount),
+                        reduce = :+)
+end
+
+@testset "per-cell generator reductions over host indices lower under batching" begin
+    F = GatherGeneratorFixtures
+    nobs = 40
+    shifts = [0, 7, 19]
+    units = collect(range(0.5, 2.0; length = nobs))
+    weights = [3.0, 1.5, 0.25]
+    expected = [sum(o - s > 0 ? units[o - s] * w : 0.0
+                    for (s, w) in zip(shifts, weights)) for o in 1:nobs]
+    runits, rweights = Reactant.to_rarray(units), Reactant.to_rarray(weights)
+    units2 = units .* 1.5 .+ 1.0
+    runits2 = Reactant.to_rarray(units2)
+
+    @testset "generator cell: $(nameof(typeof(plan)))" for plan in (
+            F.Lattice(shifts, nobs), F.Exact([o - s for o in 1:nobs, s in shifts]))
+        k = prepare(F.generator_cell)
+        @test k(plan, units, weights) ≈ expected
+        compiled = Reactant.@compile sync = true k(plan, runits, rweights)
+        @test Array(compiled(plan, runits, rweights)) ≈ expected
+        @test Array(compiled(plan, runits2, rweights)) ≈ k(plan, units2, weights)
+    end
+
+    @testset "doubling the lane count does not replicate the program" begin
+        k = prepare(F.generator_cell)
+        plan = F.Lattice(shifts, nobs)
+        plan2 = F.Lattice(shifts, 2 * nobs)
+        runits_double = Reactant.to_rarray(vcat(units, units))
+        hlo = repr(Reactant.@code_hlo optimize = :none k(plan, runits, rweights))
+        hlo2 = repr(Reactant.@code_hlo optimize = :none k(plan2, runits_double, rweights))
+        @test count("\n", hlo2) == count("\n", hlo)
+        @test count("stablehlo.while", hlo2) == count("stablehlo.while", hlo)
+    end
+
+    @testset "loop-invariant cell-local array stays atomic" begin
+        plan = F.Lattice(shifts, nobs)
+        k = prepare(F.invariant_local_cell)
+        @test k(plan, units, weights) ≈ expected
+        compiled = Reactant.@compile sync = true k(plan, runits, rweights)
+        @test Array(compiled(plan, runits, rweights)) ≈ expected
+
+        ki = prepare(F.invariant_local)
+        xs = collect(1.0:20.0)
+        shared = (; vec = [2.0, 0.5])
+        rxs = Reactant.to_rarray(xs)
+        compiled_local = Reactant.@compile sync = true ki(rxs, shared)
+        @test Array(compiled_local(rxs, shared)) ≈ ki(xs, shared)
+        @test ki(xs, shared) ≈ xs .* 2.0 .+ 0.5
+    end
+
+    @testset "plate(spec; batched) keeps a shared array HAVE whole" begin
+        amounts = [1.0, 2.0, 3.0]
+        resp = collect(1.0:10.0)
+        obs = 6
+        native = F.ROW_TOTAL(shifts, amounts, obs, resp)
+        @test native ≈ sum(obs - s > 0 ? resp[obs - s] * a : 0.0
+                           for (s, a) in zip(shifts, amounts))
+        ramounts, rresp = Reactant.to_rarray(amounts), Reactant.to_rarray(resp)
+        compiled = Reactant.@compile sync = true F.ROW_TOTAL(shifts, ramounts, obs, rresp)
+        @test Float64(compiled(shifts, ramounts, obs, rresp)) ≈ native
+        rshifts = Reactant.to_rarray(shifts)
+        compiled_traced = Reactant.@compile sync = true F.ROW_TOTAL(rshifts, ramounts, obs, rresp)
+        @test Float64(compiled_traced(rshifts, ramounts, obs, rresp)) ≈ native
+    end
+end
+
+# --- the natural superposition cell (snag one-natural-supe-39da86a4)
+module NaturalSuperpositionFixtures
+using ReactiveKernels
+
+struct Lattice
+    shifts::Vector{Int}
+    nobs::Int
+end
+struct Exact
+    rows::Matrix{Int}
+end
+_domain(plan::Lattice) = 1:plan.nobs
+_domain(plan::Exact) = eachrow(plan.rows)
+_doses(plan::Lattice) = eachindex(plan.shifts)
+_doses(plan::Exact) = axes(plan.rows, 2)
+_lag(t, plan::Lattice, j) = t - plan.shifts[j]
+# Inside an opaque helper a stored lane row still needs the one-element
+# reduction under Reactant (its scalar-indexing guard); inline `row[j]` in the
+# cell body is lowered by RK.
+_lag(row, ::Exact, j) = sum(view(row, j:j))
+
+@kernel get_cell(plan, units, weights) = begin
+    observations::UnitRange{Int} = 1:plan.nobs
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, t - p.shifts[j], 0.0) for j in eachindex(p.shifts); init = 0.0)
+    end
+    return concentration
+end
+@kernel filter_cell(plan, units, weights) = begin
+    observations::UnitRange{Int} = 1:plan.nobs
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * u[t - p.shifts[j]] for j in eachindex(p.shifts) if t > p.shifts[j]; init = 0.0)
+    end
+    return concentration
+end
+@kernel exact_row_cell(plan, units, weights) = begin
+    observations = eachrow(plan.rows)
+    concentration::Vector{Float64} = plate(observations, Ref(units), Ref(weights)) do row, u, w
+        sum(w[j] * get(u, row[j], 0.0) for j in eachindex(row); init = 0.0)
+    end
+    return concentration
+end
+# A nonzero `init` for the empty-domain broadcast below: it distinguishes the
+# probed constant from a zeros fallback.
+@kernel get_cell_offset(plan, units, weights) = begin
+    observations::UnitRange{Int} = 1:plan.nobs
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, t - p.shifts[j], 0.0) for j in eachindex(p.shifts); init = 1.5)
+    end
+    return concentration
+end
+@kernel one_graph_cell(plan, units, weights) = begin
+    observations = _domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, _lag(t, p, j), 0.0) for j in _doses(p); init = 0.0)
+    end
+    return concentration
+end
+# One graph over both plan types with the per-type rule in a dispatching
+# helper, summed over `eachindex` of the doses (snag
+# `retained-dose-lo-08380b54`). `@traceable` gives the helper the recipe
+# rewrites, so its reads at the traced dose index lower as they do inline and
+# the dose axis stays one retained loop. The inline cells are the references.
+@traceable _row(t, plan::Lattice, j) = t - plan.shifts[j]
+@traceable _row(row, ::Exact, j) = row[j]
+@kernel traceable_cell(plan, units, weights) = begin
+    observations = _domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, _row(t, p, j), 0.0) for j in eachindex(w); init = 0.0)
+    end
+    return concentration
+end
+@kernel inline_lattice_cell(plan, units, weights) = begin
+    observations = _domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, t - p.shifts[j], 0.0) for j in eachindex(w); init = 0.0)
+    end
+    return concentration
+end
+@kernel inline_exact_cell(plan, units, weights) = begin
+    observations = _domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, t[j], 0.0) for j in eachindex(w); init = 0.0)
+    end
+    return concentration
+end
+# The same helper without `@traceable`: Reactant refuses its read at the
+# traced index.
+_plain_row(t, plan::Lattice, j) = t - plan.shifts[j]
+_plain_row(row, ::Exact, j) = row[j]
+@kernel plain_helper_cell(plan, units, weights) = begin
+    observations = _domain(plan)
+    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
+        sum(w[j] * get(u, _plain_row(t, p, j), 0.0) for j in eachindex(w); init = 0.0)
+    end
+    return concentration
+end
+# An opaque component with a hand-written tracing method: natively the
+# dose-outer in-place loop (not traceable), under tracing the natural plate
+# cell. `MIRROR_CALLS` counts entries into the tracing method.
+function _superpose(plan::Lattice, units, weights)
+    out = zeros(eltype(units), plan.nobs)
+    for (s, w) in zip(plan.shifts, weights), t in (s + 1):plan.nobs
+        out[t] += w * units[t - s]
+    end
+    out
+end
+const MIRROR_CALLS = Ref(0)
+const GET_CELL = prepare(get_cell)
+function ReactiveKernels.traced(::typeof(_superpose), plan::Lattice, units, weights)
+    MIRROR_CALLS[] += 1
+    GET_CELL(plan, units, weights)
+end
+@kernel opaque_superposition(plan, units, weights) = begin
+    concentration = _superpose(plan, units, weights)
+    return concentration
+end
+# `get` outside a plate: every recipe op selects its tensorized companion on
+# traced arguments, so a plain kernel reads a traced or host table the same way.
+@kernel table_read(index, table::Vector{Float64}, hosted::Vector{Float64}) = begin
+    value = get(table, index, -1.0) + get(hosted, index, -1.0) + get(table, 2, -1.0)
+    return value
+end
+end
+
+@testset "natural superposition cell: get and filtered sums lower with lazy branches" begin
+    F = NaturalSuperpositionFixtures
+    nobs = 40
+    shifts = [0, 7, 19]
+    units = collect(range(0.5, 2.0; length = nobs))
+    weights = [3.0, 1.5, 0.25]
+    expected = [sum(t > s ? w * units[t - s] : 0.0 for (s, w) in zip(shifts, weights))
+                for t in 1:nobs]
+    runits, rweights = Reactant.to_rarray(units), Reactant.to_rarray(weights)
+    units2 = units .* 1.5 .+ 1.0
+    runits2 = Reactant.to_rarray(units2)
+    lattice = F.Lattice(shifts, nobs)
+    exact = F.Exact([max(t - s, 0) for t in 1:nobs, s in shifts])
+    cases = ((F.get_cell, lattice), (F.filter_cell, lattice), (F.exact_row_cell, exact),
+             (F.one_graph_cell, lattice), (F.one_graph_cell, exact))
+    @testset "$(nameof(typeof(plan))) $(k)" for (k, plan) in cases
+        kernel = prepare(k)
+        @test kernel(plan, units, weights) ≈ expected
+        compiled = Reactant.@compile sync = true kernel(plan, runits, rweights)
+        @test Array(compiled(plan, runits, rweights)) ≈ expected
+        @test Array(compiled(plan, runits2, rweights)) ≈ kernel(plan, units2, weights)
+        # The in-range test stays a lazy branch: an out-of-range lag (a dose not
+        # yet given) is never read, not clamped and selected away.
+        hlo = repr(Reactant.@code_hlo optimize = :none kernel(plan, runits, rweights))
+        @test occursin("stablehlo.if", hlo)
+    end
+
+    @testset "doubling the lane count does not replicate the program" begin
+        kernel = prepare(F.get_cell)
+        runits_double = Reactant.to_rarray(vcat(units, units))
+        hlo = repr(Reactant.@code_hlo optimize = :none kernel(lattice, runits, rweights))
+        hlo2 = repr(Reactant.@code_hlo optimize = :none kernel(
+            F.Lattice(shifts, 2 * nobs), runits_double, rweights))
+        @test count("\n", hlo2) == count("\n", hlo)
+    end
+
+    # A sum over `eachindex` of the doses is one retained loop: the program is
+    # the same for three doses and for six (`docs/src/constraints.md`). A sum
+    # over a helper-produced iterator (the one-graph cell's `_doses(p)`) keeps
+    # its per-element trace, so helper indexing stays valid there.
+    @testset "the dose axis is one retained loop" begin
+        for k in (F.get_cell, F.filter_cell)
+            kernel = prepare(k)
+            programs = map((3, 6)) do ndoses
+                s = [div((i - 1) * nobs, ndoses) + 1 for i in 1:ndoses]
+                w = collect(range(1.0, 2.0; length = ndoses))
+                plan = F.Lattice(s, nobs)
+                rw = Reactant.to_rarray(w)
+                compiled = Reactant.@compile sync = true kernel(plan, runits, rw)
+                @test Array(compiled(plan, runits, rw)) ≈ kernel(plan, units, w)
+                repr(Reactant.@code_hlo optimize = :none kernel(plan, runits, rw))
+            end
+            @test occursin("stablehlo.while", programs[1])
+            @test count("\n", programs[1]) == count("\n", programs[2])
+        end
+        kernel = prepare(F.exact_row_cell)
+        programs = map((3, 6)) do ndoses
+            s = [div((i - 1) * nobs, ndoses) + 1 for i in 1:ndoses]
+            w = collect(range(1.0, 2.0; length = ndoses))
+            plan = F.Exact([max(t - si, 0) for t in 1:nobs, si in s])
+            rw = Reactant.to_rarray(w)
+            compiled = Reactant.@compile sync = true kernel(plan, runits, rw)
+            @test Array(compiled(plan, runits, rw)) ≈ kernel(plan, units, w)
+            repr(Reactant.@code_hlo optimize = :none kernel(plan, runits, rw))
+        end
+        @test count("\n", programs[1]) == count("\n", programs[2])
+    end
+
+    @testset "a @traceable dispatching helper keeps the dose axis one retained loop" begin
+        traceable = prepare(F.traceable_cell)
+        plans(ndoses) = let s = [div((i - 1) * nobs, ndoses) + 1 for i in 1:ndoses]
+            (F.Lattice(s, nobs), F.Exact([max(t - si, 0) for t in 1:nobs, si in s]))
+        end
+        for (index, reference) in ((1, prepare(F.inline_lattice_cell)),
+                                   (2, prepare(F.inline_exact_cell)))
+            programs = map((3, 6)) do ndoses
+                plan = plans(ndoses)[index]
+                w = collect(range(1.0, 2.0; length = ndoses))
+                rw = Reactant.to_rarray(w)
+                inline_values = reference(plan, units, w)
+                @test traceable(plan, units, w) == inline_values
+                compiled = Reactant.@compile sync = true traceable(plan, runits, rw)
+                @test Array(compiled(plan, runits, rw)) ≈ inline_values
+                @test Array(compiled(plan, runits2, rw)) ≈ reference(plan, units2, w)
+                hlo = repr(Reactant.@code_hlo optimize = :none traceable(plan, runits, rw))
+                inline = repr(Reactant.@code_hlo optimize = :none reference(plan, runits, rw))
+                @test count("\n", hlo) == count("\n", inline)
+                @test count("stablehlo.while", hlo) == count("stablehlo.while", inline)
+                hlo
+            end
+            @test occursin("stablehlo.while", programs[1])
+            @test count("\n", programs[1]) == count("\n", programs[2])
+            plain = prepare(F.plain_helper_cell)
+            plan = plans(3)[index]
+            rw = Reactant.to_rarray([1.0, 1.5, 2.0])
+            @test_throws "Scalar indexing is disallowed" Reactant.@compile plain(plan, runits, rw)
+        end
+    end
+
+    @testset "a hand-written traced method stands in for an opaque helper" begin
+        kernel = prepare(F.opaque_superposition)
+        F.MIRROR_CALLS[] = 0
+        @test kernel(lattice, units, weights) ≈ expected
+        @test F.MIRROR_CALLS[] == 0              # native runs the method as written
+        programs = map((3, 6)) do ndoses
+            s = [div((i - 1) * nobs, ndoses) + 1 for i in 1:ndoses]
+            w = collect(range(1.0, 2.0; length = ndoses))
+            plan = F.Lattice(s, nobs)
+            rw = Reactant.to_rarray(w)
+            compiled = Reactant.@compile sync = true kernel(plan, runits, rw)
+            @test Array(compiled(plan, runits, rw)) ≈ kernel(plan, units, w)
+            @test Array(compiled(plan, runits2, rw)) ≈ kernel(plan, units2, w)
+            repr(Reactant.@code_hlo optimize = :none kernel(plan, runits, rw))
+        end
+        @test F.MIRROR_CALLS[] > 0
+        @test occursin("stablehlo.while", programs[1])
+        @test count("\n", programs[1]) == count("\n", programs[2])
+    end
+
+    @testset "get in a plain kernel: traced index, host table, concrete index" begin
+        kernel = prepare(F.table_read)
+        table = [1.0, 2.0, 4.0]
+        hosted = [10.0, 20.0, 40.0]
+        rtable = Reactant.to_rarray(table)
+        for i in (0, 1, 3, 4)
+            ri = Reactant.to_rarray(i; track_numbers = true)
+            compiled = Reactant.@compile sync = true kernel(ri, rtable, hosted)
+            @test Float64(compiled(ri, rtable, hosted)) == kernel(i, table, hosted)
+        end
+    end
+end
+
+# --- an empty dose domain (snag reactant-plate-c-508dc1e3)
+# A plate whose cell is a compile-time constant — the superposition sum over
+# zero doses is `init` for every lane — has no traced output leaf, so
+# `Ops.batch` returns no outputs. The lowering broadcasts the probed constant
+# over the observation domain instead of assuming one traced leaf.
+@testset "empty dose domain: a constant superposition cell broadcasts" begin
+    F = NaturalSuperpositionFixtures
+    nobs = 97
+    plan = F.Lattice(Int[], nobs)
+    units = collect(range(0.5, 2.0; length = nobs))
+    weights = Float64[]
+    runits, rweights = Reactant.to_rarray(units), Reactant.to_rarray(weights)
+    units2 = units .* 1.5 .+ 1.0
+    runits2 = Reactant.to_rarray(units2)
+    for (k, expected) in ((F.get_cell, zeros(nobs)),
+            (F.filter_cell, zeros(nobs)),
+            (F.get_cell_offset, fill(1.5, nobs)))
+        kernel = prepare(k)
+        @test kernel(plan, units, weights) ≈ expected
+        compiled = Reactant.@compile sync = true kernel(plan, runits, rweights)
+        @test Array(compiled(plan, runits, rweights)) ≈ expected
+        # Changed inputs reuse the compiled program; the constant depends on
+        # none of them.
+        @test Array(compiled(plan, runits2, rweights)) ≈
+            kernel(plan, units2, weights)
+    end
+
+    @testset "doubling the lane count does not replicate the program" begin
+        kernel = prepare(F.get_cell)
+        hlo = repr(Reactant.@code_hlo optimize = :none kernel(plan, runits, rweights))
+        plan2 = F.Lattice(Int[], 2 * nobs)
+        runits_double = Reactant.to_rarray(vcat(units, units))
+        hlo2 = repr(Reactant.@code_hlo optimize = :none kernel(
+            plan2, runits_double, rweights))
+        @test count("\n", hlo2) == count("\n", hlo)
+    end
+end
+
+include("test_compound_plate_reactant.jl")

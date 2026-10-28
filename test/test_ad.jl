@@ -1,10 +1,44 @@
 using DifferentiationInterface
 import Enzyme
+using InteractiveUtils: code_llvm
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: bernoulli
 
 include("test_authored_plate_chains_ad.jl")
+include("test_plate_fusion_reconvergence_ad.jl")
+include("test_scan_plate_ad.jl")
+include("test_scan_terminal_minima_ad.jl")
+include("test_scan_slice_demand_ad.jl")
+include("test_plate_consumer_native_ad.jl")
+include("test_uninferred_plate_operand_ad.jl")
+include("test_native_concat_ad.jl")
+include("test_ad_bound_operand_counts.jl")
+include("test_ad_tangent_operators.jl")
+include("test_prepared_callback_ad.jl")
+include("test_lazy_arm_child_ad.jl")
+include("test_ad_retained_outputs.jl")
+include("test_ad_warm.jl")
 
 const TEST_AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
+
+# Wide-splat regression closures, evaluated once at file scope (world-safe:
+# no eval happens inside the testset body). Forty distinct one-input lanes
+# plus one 40-input fused sum, mirroring the memo joint's 43-argument
+# log-Jacobian (snag `joint-decl-memo-9642bb45`).
+const _WIDE_SPLAT_LANES = [
+    Core.eval(@__MODULE__, :(v -> sum(v) + $(Float64(i)))) for i in 1:40
+]
+const _WIDE_SPLAT_SUM = let names = [Symbol(:w_, i) for i in 1:40]
+    Core.eval(@__MODULE__, Expr(:->, Expr(:tuple, names...),
+        Expr(:call, :+, names...)))
+end
+# A 33-input fused op mixing one constant array with 32 active lanes, summed
+# pairwise so the closure body itself never splats (snag
+# `rkppl-module-cal-79cad594`).
+const _WIDE_MIXED_SUM = let names = [Symbol(:m_, i) for i in 1:32]
+    Core.eval(@__MODULE__, Expr(:->, Expr(:tuple, :data, names...),
+        foldl((a, b) -> Expr(:call, :+, a, b), names;
+              init = Expr(:call, :sum, :data))))
+end
 
 _test_ad_value_gradient_allocated(prepared, gradient, q, data) =
     @allocated ad_value_and_gradient!(prepared, gradient, q, data)
@@ -103,6 +137,197 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
             kernel, TEST_AD_BACKEND, true, 0.4;
             active = :logit, unsupported = 1,
         )
+    end
+
+    @testset "wide fused closure differentiates past the 1.12 splat cliff" begin
+        # Julia 1.12 inference refuses to unsplat a forwarded tuple of more
+        # than 32 elements into a fixed-arity callee (snag
+        # `joint-decl-memo-9642bb45`): the memo joint's 43-argument
+        # log-Jacobian devolved to dynamic `jl_apply_generic` dispatch and
+        # Enzyme aborted the gradient. `_kernel_source_call` forwards
+        # positionally, so a 40-input fused closure differentiates on every
+        # version. One vector HAVE keeps the top-level boundary narrow (the
+        # memo shape); the width lives only in the fused op's inputs.
+        graph = Graph()
+        q = value!(graph, :q, Vector{Float64})
+        lanes = [value!(graph, Symbol(:w_, i), Float64) for i in 1:40]
+        for (lane, shift) in zip(lanes, _WIDE_SPLAT_LANES)
+            add!(graph, (q,) => lane, shift)
+        end
+        total = value!(graph, :total, Float64)
+        add!(graph, Tuple(lanes) => total,
+            ReactiveKernels._KernelSourceOp(
+                Val(:wide_splat_regression), Val(:fused), _WIDE_SPLAT_SUM))
+        kernel = prepare(graph; have = (q,), want = total)
+        # 40 lanes plus the wide op, all surviving preparation: a future
+        # pass must not silently shrink the fused call below the cliff.
+        @test length(kernel.ops) == 41
+        point = fill(0.25, 40)
+        @test kernel(point) ≈ 0.25 * 40^2 + 40 * 41 / 2
+        # Static-dispatch pin (fast; the memo e2e covers Enzyme end to
+        # end): pre-fix, 1.12 emitted `jl_apply_generic` for this call and
+        # Enzyme aborted the gradient.
+        op = only(
+            o for o in kernel.ops if o isa ReactiveKernels._KernelSourceOp)
+        llvm = sprint(code_llvm, ReactiveKernels._kernel_source_call,
+            Tuple{Val{:native},typeof(op),ntuple(_ -> Float64, 40)...})
+        @test !occursin("jl_apply_generic", llvm)
+    end
+
+    @testset "wide fused op mixing a constant array with active lanes" begin
+        # Julia's inliner rewrites an `args...` splat into a direct call only
+        # up to 32 elements; the op's own entry call splatted its arguments,
+        # so a 33-input op stayed a dynamic `Core._apply_iterate` whose
+        # argument tuple held the constant `data` next to active lanes, and
+        # reverse mode failed with `EnzymeRuntimeActivityError` (snag
+        # `rkppl-module-cal-79cad594`; a 32-argument module call over a bound
+        # data vector).
+        graph = Graph()
+        q = value!(graph, :q, Vector{Float64})
+        data = value!(graph, :data, Vector{Float64})
+        lanes = [value!(graph, Symbol(:m_, i), Float64) for i in 1:32]
+        for (lane, shift) in zip(lanes, _WIDE_SPLAT_LANES)
+            add!(graph, (q,) => lane, shift)
+        end
+        total = value!(graph, :total, Float64)
+        add!(graph, (data, lanes...) => total,
+            ReactiveKernels._KernelSourceOp(
+                Val(:wide_mixed_regression), Val(:fused), _WIDE_MIXED_SUM))
+        kernel = prepare(graph; have = (q, data), want = total)
+        point = [0.25, -0.5, 1.0]
+        observed = [1.0, 2.0, 3.0]
+        expected_value = sum(observed) + 32 * sum(point) + 32 * 33 / 2
+        @test kernel(point, observed) ≈ expected_value
+        @test ad_gradient(kernel, TEST_AD_BACKEND, point, observed;
+                          active = :q) ≈ fill(32.0, 3)
+        prepared = prepare_ad(kernel, TEST_AD_BACKEND, point, observed;
+                              active = :q)
+        destination = fill(NaN, 3)
+        value, _ = ad_value_and_gradient!(
+            prepared, destination, point, observed)
+        @test value ≈ expected_value
+        @test destination ≈ fill(32.0, 3)
+        # The op's entry call itself forwards statically.
+        op = only(
+            o for o in kernel.ops if o isa ReactiveKernels._KernelSourceOp)
+        llvm = sprint(code_llvm, op,
+            Tuple{Vector{Float64},ntuple(_ -> Float64, 32)...})
+        @test !occursin("jl_f__apply_iterate", llvm)
+        @test !occursin("jl_apply_generic", llvm)
+    end
+
+    @testset "multiple active ports share one structured reverse pass" begin
+        @kernel multi_active_objective(
+                alpha::Vector{Float64}, beta::Vector{Float64},
+                data::Vector{Float64}; offset::Float64 = 0.0) = begin
+            objective::Float64 =
+                sum(abs2, alpha) + sum(beta .* data) + offset
+        end
+
+        alpha = [0.3, -0.4, 0.2]
+        beta = [-0.1, 0.7, 0.5]
+        data = [2.0, -1.0, 0.5]
+        expected = (copy(data), 2 .* alpha)
+
+        # The selector order, not authored HAVE order, defines the structured
+        # point and returned cotangent order.
+        one_shot = ad_gradient(
+            multi_active_objective, TEST_AD_BACKEND, alpha, beta, data;
+            active = (:beta, :alpha), want = :objective,
+        )
+        @test one_shot isa Tuple
+        @test one_shot[1] ≈ expected[1]
+        @test one_shot[2] ≈ expected[2]
+
+        prepared = prepare_ad(
+            multi_active_objective, TEST_AD_BACKEND, alpha, beta, data;
+            active = (multi_active_objective.beta,
+                      multi_active_objective.alpha),
+            want = :objective,
+        )
+        @test typeof(prepared).parameters[1] == (2, 1)
+        @test occursin("active=(:beta, :alpha)", sprint(show, prepared))
+
+        changed_alpha = [-0.2, 0.6, 0.4]
+        changed_beta = [0.8, -0.3, 0.1]
+        changed_data = [-0.5, 0.25, 3.0]
+        value, gradient = ad_value_and_gradient(
+            prepared, changed_alpha, changed_beta, changed_data; offset = 1.5)
+        @test value ≈ sum(abs2, changed_alpha) +
+              sum(changed_beta .* changed_data) + 1.5
+        @test gradient[1] ≈ changed_data
+        @test gradient[2] ≈ 2 .* changed_alpha
+
+        destinations = (similar(changed_beta), similar(changed_alpha))
+        inplace_value, returned = ad_value_and_gradient!(
+            prepared, destinations,
+            changed_alpha, changed_beta, changed_data; offset = 1.5)
+        @test inplace_value ≈ value
+        @test returned === destinations
+        @test destinations[1] ≈ gradient[1]
+        @test destinations[2] ≈ gradient[2]
+
+        # An explicit one-element tuple deliberately preserves a one-tuple
+        # result, while the historical scalar selector stays unwrapped.
+        singleton = ad_gradient(
+            multi_active_objective, TEST_AD_BACKEND, alpha, beta, data;
+            active = (:alpha,), want = :objective)
+        @test singleton isa Tuple
+        @test only(singleton) ≈ 2 .* alpha
+        @test ad_gradient(
+            multi_active_objective, TEST_AD_BACKEND, alpha, beta, data;
+            active = :alpha, want = :objective) ≈ 2 .* alpha
+
+        @test_throws ArgumentError prepare_ad(
+            multi_active_objective, TEST_AD_BACKEND, alpha, beta, data;
+            active = (), want = :objective)
+        @test_throws ArgumentError prepare_ad(
+            multi_active_objective, TEST_AD_BACKEND, alpha, beta, data;
+            active = (:alpha, :alpha), want = :objective)
+
+        # Heterogeneous active storage (the GLM beta+dispersion shape) is
+        # normalized internally without changing the public scalar cotangent.
+        @kernel mixed_active_objective(
+                coefficients::Vector{Float64}, dispersion::Float64) = begin
+            objective::Float64 =
+                sum(abs2, coefficients) + dispersion^2
+        end
+        coefficients = [0.2, -0.5]
+        dispersion = 1.7
+        mixed = prepare_ad(
+            mixed_active_objective, TEST_AD_BACKEND,
+            coefficients, dispersion;
+            active = (:coefficients, :dispersion), want = :objective)
+        mixed_value, mixed_gradient = ad_value_and_gradient(
+            mixed, coefficients, dispersion)
+        @test mixed_value ≈ sum(abs2, coefficients) + dispersion^2
+        @test mixed_gradient[1] ≈ 2 .* coefficients
+        @test mixed_gradient[2] ≈ 2dispersion
+        mixed_destination = (similar(coefficients), Ref(NaN))
+        _, mixed_returned = ad_value_and_gradient!(
+            mixed, mixed_destination, coefficients, dispersion)
+        @test mixed_returned === mixed_destination
+        @test mixed_destination[1] ≈ mixed_gradient[1]
+        @test mixed_destination[2][] ≈ mixed_gradient[2]
+
+        # Pullback preparation shares the same ordered multi-active point and
+        # restores scalar cotangents at the public boundary.
+        mixed_pullback = prepare_ad_pullback(
+            mixed_active_objective, TEST_AD_BACKEND, 1.0,
+            coefficients, dispersion;
+            active = (:coefficients, :dispersion), want = :objective)
+        pullback_value, mixed_cotangent = ad_value_and_pullback(
+            mixed_pullback, 1.0, coefficients, dispersion)
+        @test pullback_value ≈ mixed_value
+        @test mixed_cotangent[1] ≈ mixed_gradient[1]
+        @test mixed_cotangent[2] ≈ mixed_gradient[2]
+        cotangent_destination = (similar(coefficients), Ref(NaN))
+        _, returned_cotangent = ad_value_and_pullback!(
+            mixed_pullback, cotangent_destination, 1.0,
+            coefficients, dispersion)
+        @test returned_cotangent === cotangent_destination
+        @test cotangent_destination[1] ≈ mixed_gradient[1]
+        @test cotangent_destination[2][] ≈ mixed_gradient[2]
     end
 
     @testset "active dependency boundary" begin
@@ -349,6 +574,43 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         @test rk_allocated <= backend_allocated
     end
 
+    @testset "authored plate AD: captured enclosing parameters" begin
+        # A cell's captured names enter whole as atomic operands (snag
+        # rk-plate-body-ca-091ef037). Reverse mode differentiates a captured
+        # active vector and a captured derived scalar exactly as the explicit
+        # `Ref`/threaded spelling.
+        @kernel captured_objective(q::Vector{Float64},
+                                   data::Vector{Float64}) = begin
+            scale::Float64 = q[1]
+            pointwise = plate(eachindex(data), data) do i, di
+                q[i + 1] * di * scale
+            end
+            objective::Float64 = sum(pointwise)
+        end
+        @kernel threaded_objective(q::Vector{Float64},
+                                   data::Vector{Float64}) = begin
+            scale::Float64 = q[1]
+            pointwise = plate(eachindex(data), Ref(q), data,
+                              scale) do i, qq, di, sc
+                qq[i + 1] * di * sc
+            end
+            objective::Float64 = sum(pointwise)
+        end
+
+        q = [0.5, 0.2, -0.4, 0.7]
+        data = [1.5, -0.5, 0.25]
+        expected = vcat(sum(q[2:end] .* data), q[1] .* data)
+        for spec in (captured_objective, threaded_objective)
+            kernel = prepare(spec; have = (:q, :data), want = :objective)
+            prepared = prepare_ad(
+                kernel, TEST_AD_BACKEND, q, data; active = :q)
+            gradient = similar(q)
+            value, _ = ad_value_and_gradient!(prepared, gradient, q, data)
+            @test value ≈ q[1] * sum(q[2:end] .* data)
+            @test gradient ≈ expected
+        end
+    end
+
     @testset "authored plate AD: Int data-axis in a capture-recapture plate" begin
         # A likelihood plate whose axis is a data-only `Vector{Int}` sitting
         # beside a `Vector{Float64}` data array and several parameter-derived
@@ -421,6 +683,65 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         @test gradient ≈ ref_grad
     end
 
+    @testset "bound structured arrays stay outside the derivative callable" begin
+        structured_objective(q, data) = sum(
+            data.weights[i] * q[data.rows[i]]^2 for i in eachindex(data.rows)) +
+            data.nested[2]
+        @kernel structured_bound_like(q::Vector{Float64}, y::Matrix{Float64}) = begin
+            data = (weights=view(y,:,1),rows=[2,1,2],nested=(view(y,:,2),0.5))
+            objective::Float64 = structured_objective(q,data)
+        end
+        q, y = [0.3,-0.4], [1.0 4.0;2.0 5.0;3.0 6.0]
+        kernel = prepare(structured_bound_like;
+                         have=(:q,:y),want=:objective,bound=(;y))
+        # Each array leaf crosses as its own operand (depth-first); the
+        # scalar leaf stays a literal of the in-body rebuild.
+        external, values = ReactiveKernels._externalize_bound_arrays(kernel)
+        @test length(values) == 3
+        @test values[1] isa SubArray && values[3] isa SubArray
+        @test values[2] == [2,1,2]
+        @test external(q,values...) == kernel(q)
+        unchanged, none = ReactiveKernels._externalize_bound_arrays(
+            kernel;min_elements=4)
+        @test unchanged === kernel && isempty(none)
+        prepared = prepare_ad(kernel,TEST_AD_BACKEND,q;active=:q)
+        weights, rows, nested = ReactiveKernels._ad_hidden_operands(prepared)
+        @test weights isa Vector && nested isa Vector
+        @test weights == y[:,1] && rows == [2,1,2] && nested == y[:,2]
+        g = zeros(length(q))
+        value,returned = ad_value_and_gradient!(prepared,g,q)
+        @test value ≈ 2q[1]^2+4q[2]^2+0.5
+        @test returned === g
+        @test g ≈ [4q[1],8q[2]]
+    end
+
+    @testset "a folded multi-field schedule beside a view-read parameter" begin
+        # A data-only recipe folds to a named tuple of arrays; a parameter is
+        # read through `sum(view(u, i:i))` (the PPL layout read). Crossing as
+        # one structured operand, the pair failed native static activity
+        # analysis (EnzymeRuntimeActivityError) although plain Enzyme
+        # differentiates the same math; leaf operands cross cleanly (snag
+        # `interpolated-err-41772e14`).
+        schedule_reads(sched, b) = b .* sched.a .+ sched.k
+        @kernel folded_schedule_like(u::Vector{Float64},
+                s::Vector{@NamedTuple{a::Vector{Float64},k::Vector{Int}}}) = begin
+            b::Float64 = sum(view(u, 2:2))
+            sched = only(s)
+            objective::Float64 = sum(schedule_reads(sched, b))
+        end
+        s = [(; a = [1.0, 2.0], k = [1, 2])]
+        kernel = prepare(folded_schedule_like;
+                         have = (:u, :s), want = :objective, bound = (; s))
+        u = [0.3, 0.1]
+        prepared = prepare_ad(kernel, TEST_AD_BACKEND, u; active = :u)
+        @test ReactiveKernels._ad_hidden_operands(prepared) == (s[1].a, s[1].k)
+        g = zeros(2)
+        value, _ = ad_value_and_gradient!(prepared, g, u)
+        @test value ≈ kernel(u)
+        @test g ≈ [0.0, 3.0]
+        @test s == [(; a = [1.0, 2.0], k = [1, 2])]
+    end
+
     @testset "bound matrix views externalize as owning copies" begin
         # Likelihood plates over bind-time `view(y, :, j)` columns are the
         # posteriordb lotka-volterra shape: observation columns beside an
@@ -444,21 +765,22 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
 
         x = [0.3, -0.4, 0.2, 0.1, -0.2]
         y = [1.0 6.0; 2.0 7.0; 3.0 8.0; 4.0 9.0; 5.0 10.0]
-        reference = let y = y
-            function (x)
-                m = exp.(x)
-                sum(view(y, :, 1) .* m) + sum(view(y, :, 2) .* m)
-            end
-        end
+        # Explicit `Constant` activity: a `let`-captured matrix defeats
+        # Enzyme's readonly analysis on Julia 1.12
+        # (`EnzymeMutabilityException`) while passing on 1.10; the annotated
+        # form differentiates the identical math on both.
+        reference(x, y) = (m = exp.(x);
+            sum(view(y, :, 1) .* m) + sum(view(y, :, 2) .* m))
         ref_value, ref_grad = DifferentiationInterface.value_and_gradient(
-            reference, TEST_AD_BACKEND, x)
+            reference, TEST_AD_BACKEND, x, DifferentiationInterface.Constant(y))
 
         kernel = prepare(twin_column_like;
                          have = (:x, :y), want = :objective,
                          bound = (; y = y))
         prepared = prepare_ad(kernel, TEST_AD_BACKEND, x; active = :x)
-        @test all(value -> value isa Array, prepared.external_values)
-        @test prepared.external_values == (y[:, 1], y[:, 2])
+        hidden = ReactiveKernels._ad_hidden_operands(prepared)
+        @test all(value -> value isa Array, hidden)
+        @test hidden == (y[:, 1], y[:, 2])
 
         gradient = similar(x)
         value, returned = ad_value_and_gradient!(prepared, gradient, x)
@@ -498,6 +820,49 @@ end
     end
 end
 
+@testset "authored scan reverse AD through captured parameters" begin
+    # A step's captured names enter whole as shared operands (snag
+    # rk-plate-body-ca-091ef037); Reverse differentiates them exactly as the
+    # explicit `Ref` spelling.
+    @kernel captured_scan_objective(q::Vector{Float64},
+                                    series::Vector{Float64}) = begin
+        decay::Float64 = q[1]
+        trajectory = scan(series; init = 0.0) do carry, x
+            next = decay * carry + q[2] * x
+            (next, next)
+        end
+        total::Float64 = sum(trajectory)
+    end
+    @kernel reffed_scan_objective(q::Vector{Float64},
+                                  series::Vector{Float64}) = begin
+        decay::Float64 = q[1]
+        trajectory = scan(series, Ref(q), Ref(decay);
+                          init = 0.0) do carry, x, qq, d
+            next = d * carry + qq[2] * x
+            (next, next)
+        end
+        total::Float64 = sum(trajectory)
+    end
+    reference(q, series) = sum(accumulate(
+        (carry, x) -> q[1] * carry + q[2] * x, series; init = 0.0))
+    q = [0.6, 1.5]
+    series = [0.5, -1.0, 2.0, 0.25]
+    expected = map(eachindex(q)) do i
+        left, right = copy(q), copy(q)
+        left[i] -= 1e-6
+        right[i] += 1e-6
+        (reference(right, series) - reference(left, series)) / 2e-6
+    end
+    for spec in (captured_scan_objective, reffed_scan_objective)
+        k = prepare(spec; want = :total)
+        prepared = prepare_ad(k, TEST_AD_BACKEND, q, series; active = :q)
+        gradient = zeros(2)
+        value, _ = ad_value_and_gradient!(prepared, gradient, q, series)
+        @test value ≈ reference(q, series)
+        @test gradient ≈ expected rtol = 1e-6
+    end
+end
+
 @testset "authored scan lockstep reverse AD" begin
     spec = AuthoredScanFixtures.authored_scan_lockstep
     reference(a, b) = -0.5 * sum(abs2,
@@ -520,6 +885,52 @@ end
         gradient = zeros(length(x0))
         value, returned = ad_value_and_gradient!(prepared, gradient, x0)
         @test value ≈ reference(a0, b0)
+        @test returned === gradient
+        @test gradient ≈ fd(objective, x0) rtol = 1e-6 atol = 1e-8
+    end
+end
+
+@testset "authored scan reverse AD over an empty sequence" begin
+    # No step runs, so the value is the empty reduction and the gradient is zero.
+    q = [0.2, 0.7, -0.3]
+    k = prepare(AuthoredScanFixtures.authored_scan_arma;
+                bound = (; series = Float64[]), want = :total)
+    prepared = prepare_ad(k, TEST_AD_BACKEND, q; active = :q)
+    gradient = fill(NaN, length(q))
+    value, returned = ad_value_and_gradient!(prepared, gradient, q)
+    @test value === 0.0
+    @test returned === gradient
+    @test gradient == zeros(length(q))
+end
+
+@testset "history scan reverse AD" begin
+    # The steps read the result vector the scan writes; reverse mode
+    # differentiates through those reads with respect to either input.
+    F = AuthoredScanFixtures
+    plan = F.HistoryLattice([0, 2, 3, 7, 12])
+    amounts0 = [2.0, 0.5, 1.5, 3.0, 1.0]
+    units0 = [exp(-0.3 * (l - 1)) for l in 1:10]
+    reference(a, u) = sum(F._authored_scan_history_reference(a, plan, u))
+    fd(f, x0) = map(eachindex(x0)) do i
+        l, r = copy(x0), copy(x0)
+        l[i] -= 1e-5
+        r[i] += 1e-5
+        (f(r) - f(l)) / 2e-5
+    end
+    k = prepare(F.authored_scan_history; want = :total)
+    # With `units` constant, Base's `get(units, lag, 0.0)` times an active value
+    # fails Enzyme's static activity analysis with or without a scan (a plain
+    # recipe `sum(a[i] * get(units, …, 0.0) for i …)` does too), so that case
+    # runs with runtime activity.
+    runtime_activity = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    for (active, x0, objective, backend) in (
+            (:amounts, amounts0, a -> reference(a, units0), runtime_activity),
+            (:units, units0, u -> reference(amounts0, u), TEST_AD_BACKEND))
+        prepared = prepare_ad(k, backend, amounts0, plan, units0; active)
+        gradient = zeros(length(x0))
+        value, returned = ad_value_and_gradient!(prepared, gradient,
+                                                 amounts0, plan, units0)
+        @test value ≈ reference(amounts0, units0)
         @test returned === gradient
         @test gradient ≈ fd(objective, x0) rtol = 1e-6 atol = 1e-8
     end
@@ -581,4 +992,41 @@ end
         @test isfinite(grad_logit(true, logit))
         @test isfinite(grad_logit(false, logit))
     end
+end
+
+# A backend value alone does not load DifferentiationInterface's backend
+# extension: without `using Enzyme`, `prepare_ad` died inside
+# DifferentiationInterface with a bare `MethodError` on an internal
+# `_prepare_pullback_aux` symbol. Every entry point that hands a caller
+# backend to DifferentiationInterface now names the missing `using` instead.
+struct AutoNotLoadedTestPackage <: DifferentiationInterface.AbstractADType end
+
+@testset "unloaded backend packages fail loudly" begin
+    @test ReactiveKernels._ad_required_packages(AutoEnzyme()) == ["Enzyme"]
+    @test ReactiveKernels._ad_required_packages(AutoForwardDiff()) ==
+        ["ForwardDiff"]
+    @test ReactiveKernels._ad_required_packages(AutoNotLoadedTestPackage()) ==
+        ["NotLoadedTestPackage"]
+
+    @kernel unloaded_backend_objective(q::Float64) = q^2
+    backend = AutoNotLoadedTestPackage()
+    failure = try
+        prepare_ad(unloaded_backend_objective, backend, 2.0;
+            active = :q, want = :unloaded_backend_objective)
+        nothing
+    catch exception
+        exception
+    end
+    @test failure isa ArgumentError
+    @test occursin("using NotLoadedTestPackage", sprint(showerror, failure))
+
+    @test_throws ArgumentError ad_gradient(
+        unloaded_backend_objective, backend, 2.0;
+        active = :q, want = :unloaded_backend_objective)
+    @test_throws ArgumentError prepare_ad_pullback(
+        unloaded_backend_objective, backend, 1.0, 2.0;
+        active = :q, want = :unloaded_backend_objective)
+    @test_throws ArgumentError ad_pullback(
+        unloaded_backend_objective, backend, 1.0, 2.0;
+        active = :q, want = :unloaded_backend_objective)
 end

@@ -326,11 +326,13 @@ end
                               bound = (; data = dval))
         @test prepared isa PreparedADKernel
         @test Tuple(v.name for v in inputs(prepared.kernel)) == (:q,)
-        @test prepared.external_values == (dval .- 1.0,)
+        @test ReactiveKernels._ad_hidden_operands(prepared) == (dval .- 1.0,)
         @test prepared.call isa ReactiveKernels._ADKernelCall
-        @test prepared.call.kernel isa
+        @test prepared.call.kernel isa ReactiveKernels._PackedOperandCall
+        @test keys(only(prepared.external_values)) == (:shifted,)
+        @test prepared.call.kernel.call isa
               ReactiveKernels._ExternalizedBoundArrayCall
-        @test all(prepared.call.kernel.ops) do op
+        @test all(prepared.call.kernel.call.ops) do op
             !(op isa ReactiveKernels._BoundConstant &&
               op.value isa AbstractArray)
         end
@@ -354,10 +356,11 @@ end
             plated, PE_TEST_AD_BACKEND, qv;
             active = :q, want = :density, bound = (; data = dval))
         @test plated_prepared.call isa ReactiveKernels._ADKernelCall
-        @test plated_prepared.call.kernel isa
+        @test plated_prepared.call.kernel.call isa
               ReactiveKernels._ExternalizedBoundArrayCall
-        @test plated_prepared.call.kernel.f === plated_prepared.kernel.f.native
-        @test plated_prepared.external_values == (dval,)
+        @test plated_prepared.call.kernel.call.f ===
+              plated_prepared.kernel.f.native
+        @test ReactiveKernels._ad_hidden_operands(plated_prepared) == (dval,)
         @test ad_gradient(plated_prepared, q2) ≈ dval .- q2
 
         @test_throws ArgumentError prepare_ad(

@@ -1,0 +1,317 @@
+using Test, ReactiveKernelsPPL
+using DifferentiationInterface: AutoEnzyme
+import Enzyme
+import ReactiveKernels
+import Distributions as D
+
+# Independent constrained-density oracle; the layout supplies only the
+# change-of-variables term and must round-trip the authored values.
+function _parameter_prior_check(expr, columns, q, density)
+    names = ReactiveKernelsPPL._value_symbols(expr)
+    columns = Dict(k => v for (k, v) in columns if k in names)
+    plan = lower_rkppl(expr, columns; conditioned = columns)
+    bound = bind_data(plan, columns)
+    built = build_kernel(bound)
+    u = unconstrain(built.layout, q)
+    restored = constrain(built.layout, u)
+    for name in keys(q)
+        @test restored[name] ≈ q[name] atol = 1e-12 rtol = 1e-12
+    end
+    kernel = prepare_query(built, bound, :sampler)
+    actual = Base.invokelatest(kernel, u)
+    expected = density(q) + logjac(built.layout, u)
+    @test actual ≈ expected atol = 1e-12 rtol = 1e-12
+    return bound, built, kernel, u
+end
+
+@testset "bounded Poisson-log coefficient keeps a finite native gradient" begin
+    data = Dict(:year => [-1000.0], :counts => [1])
+    plan = lower_rkppl(quote
+        alpha ~ Normal(0, 1)
+        beta ~ Uniform(-10, 10)
+        eta = alpha .+ beta .* year
+        counts .~ Poisson.(exp.(eta))
+    end, keys(data); conditioned = keys(data))
+    bound = bind_data(plan, data)
+    built = build_kernel(bound)
+    @test coordinate_names(built.layout) == [:alpha, :beta]
+    u = unconstrain(built.layout, (alpha = 0.0, beta = -0.7))
+    sampler = prepare_sampler(built, bound, u;
+        backend = AutoEnzyme(; mode = Enzyme.Reverse), warm = true)
+    g = similar(u)
+    value, _ = sampler_value_and_gradient!(sampler, g, u)
+    rate = exp(700.0)
+    slope = 20.0 * 0.465 * 0.535
+    expected = (1.0 - rate) * (-1000.0) * slope
+    @test isfinite(value)
+    @test value ≈ 700.0 - rate rtol = 1e-11
+    @test isfinite(g[2])
+    @test g[2] ≈ expected rtol = 1e-10
+end
+
+_numeric_prior_scale(x) = 2x
+_numeric_prior_readtype(::Integer, x) = x + 1
+_numeric_prior_readtype(::AbstractFloat, x) = x - 1
+
+@testset "numeric prior arguments preserve their source values" begin
+    for seed in (2, 2.0, Float32(2), 2//1)
+        expr = quote
+            sd = _numeric_prior_scale(seed)
+            x ~ Normal(0, sd)
+            y .~ Normal.(x, 1)
+        end
+        data = Dict{Symbol,Any}(:seed => seed, :y => [0.2, -0.4])
+        bound, built, _, _ = _parameter_prior_check(expr, data, (x=0.3,),
+            q -> D.logpdf(D.Normal(0.0, 2seed), q.x) +
+                sum(D.logpdf.(D.Normal(q.x, 1), data[:y])))
+        @test bound.columns[:sd] === 2seed
+        @test ReactiveKernels.valtype(built.spec[:sd]) === typeof(2seed)
+        @test data[:seed] === seed
+        @test data[:y] == [0.2, -0.4]
+    end
+    # A prior's floating boundary must not change dispatch in another use
+    # of the same Julia value, including a parameter-dependent helper.
+    for sd in (4, 4.0)
+        expr = quote
+            x ~ Normal(0, sd)
+            mu = _numeric_prior_readtype(sd, x)
+            y .~ Normal.(mu, 1)
+        end
+        data = Dict{Symbol,Any}(:sd => sd, :y => [0.2, -0.4])
+        _parameter_prior_check(expr, data, (x=0.3,), q ->
+            D.logpdf(D.Normal(0, sd), q.x) +
+            sum(D.logpdf.(D.Normal(_numeric_prior_readtype(sd, q.x), 1), data[:y])))
+    end
+end
+
+@testset "shared numeric boundary for scalar prior families and truncation" begin
+    families = [
+        (:(Normal(a, s)), D.Normal(2, 4), -1, 5, 0.4),
+        (:(Cauchy(a, s)), D.Cauchy(2, 4), -1, 5, 0.4),
+        (:(Exponential(s)), D.Exponential(4), 0, 5, 0.4),
+        (:(Gamma(a, s)), D.Gamma(2, 4), 0, 5, 0.4),
+        (:(LogNormal(a, s)), D.LogNormal(2, 4), 0, 5, 0.4),
+        (:(Beta(a, s)), D.Beta(2, 4), 0, 1, 0.4),
+        (:(InverseGamma(a, s)), D.InverseGamma(2, 4), 0, 5, 0.4),
+        (:(StudentT(s, a, s)), D.LocationScale(2, 4, D.TDist(4)), -1, 5, 0.4),
+        (:(Laplace(a, s)), D.Laplace(2, 4), -1, 5, 0.4),
+        (:(Logistic(a, s)), D.Logistic(2, 4), -1, 5, 0.4),
+        (:(Uniform(a, s)), D.Uniform(2, 4), 2, 3, 2.4),
+        (:(Weibull(a, s)), D.Weibull(2, 4), 0, 5, 0.4)]
+    for (ctor, dist, lo, hi, x) in families, truncated in (false, true)
+        prior = truncated ? :(truncated($ctor, lo, hi)) : ctor
+        data = Dict{Symbol,Any}(:a=>2, :s=>4, :lo=>lo, :hi=>hi, :y=>[0.2])
+        expected = truncated ? D.truncated(dist, lo, hi) : dist
+        _parameter_prior_check(quote x ~ $prior; y .~ Normal.(x, 1) end,
+            data, (x=x,), q -> D.logpdf(expected, q.x) + D.logpdf(D.Normal(q.x, 1), 0.2))
+    end
+    # Per-element integer arguments take the same boundary inside a plate.
+    data = Dict(:s => [2, 4], :y => [0.2, -0.4])
+    before = deepcopy(data)
+    _parameter_prior_check(quote
+        x[1:2] .~ Normal.(0, s)
+        y .~ Normal.(x[1], 1)
+    end, data, (x=[0.3, 0.7],), q -> sum(D.logpdf.(D.Normal.(0, data[:s]), q.x)) +
+        sum(D.logpdf.(D.Normal(q.x[1], 1), data[:y])))
+    @test data == before
+end
+
+@testset "general parameter truncation" begin
+    columns = Dict(:y => [0.2, -0.4, 0.7])
+    families = [
+        (:(Normal(0.3, 1.2)), D.Normal(0.3, 1.2), -1.0, 2.0, 0.4),
+        (:(Cauchy(0.3, 1.2)), D.Cauchy(0.3, 1.2), -1.0, 2.0, 0.4),
+        (:(Exponential(1.2)), D.Exponential(1.2), 0.1, 2.0, 0.4),
+        (:(Gamma(2.3, 1.2)), D.Gamma(2.3, 1.2), 0.1, 2.0, 0.4),
+        (:(LogNormal(0.3, 1.2)), D.LogNormal(0.3, 1.2), 0.1, 2.0, 0.4),
+        (:(Beta(2.3, 1.2)), D.Beta(2.3, 1.2), 0.1, 0.9, 0.4),
+        (:(InverseGamma(2.3, 1.2)), D.InverseGamma(2.3, 1.2), 0.1, 2.0, 0.4),
+        (:(StudentT(5, 0.3, 1.2)), D.LocationScale(0.3, 1.2, D.TDist(5)), -1.0, 2.0, 0.4),
+        (:(Laplace(0.3, 1.2)), D.Laplace(0.3, 1.2), -1.0, 2.0, 0.4),
+        (:(Logistic(0.3, 1.2)), D.Logistic(0.3, 1.2), -1.0, 2.0, 0.4),
+        (:(Uniform(-1, 3)), D.Uniform(-1, 3), -0.5, 2.0, 0.4),
+        (:(Weibull(2.3, 1.2)), D.Weibull(2.3, 1.2), 0.1, 2.0, 0.4)]
+    for (ctor, dist, lower, upper, value) in families
+        for (lo, hi) in ((lower, upper), (lower, Inf), (-Inf, upper), (-Inf, Inf))
+            expr = quote
+                x ~ truncated($ctor, $lo, $hi)
+                y .~ Normal.(x, 1)
+            end
+            _parameter_prior_check(expr, columns, (x = value,),
+                q -> D.logpdf(D.truncated(dist, lo, hi), q.x) +
+                    sum(D.logpdf.(D.Normal(q.x, 1), columns[:y])))
+        end
+    end
+end
+
+@testset "bounds read data, definitions and sampled values" begin
+    columns = Dict{Symbol,Any}(:y => [0.2, -0.4, 0.7], :limits => [-1.0, 2.0])
+    _parameter_prior_check(quote
+        x ~ truncated(Cauchy(0.3, 1.2), minimum(limits), maximum(limits))
+        y .~ Normal.(x, 1)
+    end, columns, (x = 0.4,), q -> D.logpdf(D.truncated(D.Cauchy(0.3, 1.2), -1, 2), q.x) +
+        sum(D.logpdf.(D.Normal(q.x, 1), columns[:y])))
+    # The bound's sampled value is deliberately declared after its user:
+    # coordinate order must not determine evaluation order.
+    _parameter_prior_check(quote
+        x ~ truncated(Normal(a, 1 + exp(a)), a - 1, a + 2)
+        a ~ Normal(0, 1)
+        y .~ Normal.(x, 1)
+    end, columns, (x = 0.4, a = 0.2), q -> D.logpdf(D.Normal(), q.a) +
+        D.logpdf(D.truncated(D.Normal(q.a, 1 + exp(q.a)), q.a - 1, q.a + 2), q.x) +
+        sum(D.logpdf.(D.Normal(q.x, 1), columns[:y])))
+    _parameter_prior_check(quote
+        a ~ Normal(0, 1)
+        x ~ Uniform(a - 1, a + 2)
+        y .~ Normal.(x, 1)
+    end, columns, (a = 0.2, x = 0.4), q -> D.logpdf(D.Normal(), q.a) +
+        D.logpdf(D.Uniform(q.a - 1, q.a + 2), q.x) +
+        sum(D.logpdf.(D.Normal(q.x, 1), columns[:y])))
+    for expr in (:(truncated(Normal(0, 1), 1, 0)),
+            :(truncated(Exponential(1), -2, -1)),
+            :(truncated(Normal(0, 1), NaN, 1)),
+            :(truncated(Flat(), 0, 1)))
+        @test_throws Union{ContractValidationError,SurfaceLoweringError} begin
+            plan = lower_rkppl(quote x ~ $expr; y .~ Normal.(x, 1) end, [:y], conditioned = [:y])
+            build_kernel(bind_data(plan, Dict(:y => [0.1])))
+        end
+    end
+end
+
+@testset "hierarchical Dirichlet concentration" begin
+    columns = Dict{Symbol,Any}(:y => [0.2, -0.4, 0.7, 0.3, -0.1], :z => ones(5), :alpha => [1.2, 2.3, 3.4])
+    for (expr, q, prior) in [
+            (quote p ~ Dirichlet(alpha); m = p[1] .* z; y .~ Normal.(m, 1) end,
+                (p = [0.2, 0.3, 0.5],), q -> D.logpdf(D.Dirichlet(columns[:alpha]), q.p)),
+            (quote a ~ Exponential(1); p ~ Dirichlet(3, a); m = p[1] .* z; y .~ Normal.(m, 1) end,
+                (a = 1.7, p = [0.2, 0.3, 0.5]), q -> D.logpdf(D.Exponential(), q.a) + D.logpdf(D.Dirichlet(3, q.a), q.p)),
+            (quote a[1:3] .~ Exponential.(1); alpha2 = a .+ 0.5; p ~ Dirichlet(alpha2); m = p[1] .* z; y .~ Normal.(m, 1) end,
+                (a = [0.7, 1.8, 2.9], p = [0.2, 0.3, 0.5]), q -> sum(D.logpdf.(D.Exponential(), q.a)) + D.logpdf(D.Dirichlet(q.a .+ 0.5), q.p)),
+            (quote a ~ Exponential(1); alpha2 = alpha .* a; p ~ Dirichlet(alpha2); m = p[1] .* z; y .~ Normal.(m, 1) end,
+                (a = 1.7, p = [0.2, 0.3, 0.5]), q -> D.logpdf(D.Exponential(), q.a) + D.logpdf(D.Dirichlet(columns[:alpha] .* q.a), q.p)),
+            (quote a ~ Exponential(1); p ~ Dirichlet([a, 2*a, 3]); m = p[1] .* z; y .~ Normal.(m, 1) end,
+                (a = 1.7, p = [0.2, 0.3, 0.5]), q -> D.logpdf(D.Exponential(), q.a) + D.logpdf(D.Dirichlet([q.a, 2*q.a, 3]), q.p))]
+        _parameter_prior_check(expr, columns, q, q -> prior(q) +
+            sum(D.logpdf.(D.Normal(q.p[1], 1), columns[:y])))
+    end
+end
+
+@testset "truncation on array and plate parameters" begin
+    columns = Dict(:y => [0.2, -0.4, 0.7], :z => ones(3))
+    _parameter_prior_check(quote
+        a ~ Normal(0, 1)
+        x[1:3] .~ truncated.(Cauchy.(0, 1), a, Inf)
+        m = x[1] .* z
+        y .~ Normal.(m, 1)
+    end, columns, (a = 0.2, x = [0.3, 0.6, 1.2]), q -> D.logpdf(D.Normal(), q.a) +
+        sum(D.logpdf.(D.truncated(D.Cauchy(), q.a, Inf), q.x)) +
+        sum(D.logpdf.(D.Normal(q.x[1], 1), columns[:y])))
+    _parameter_prior_check(quote
+        a ~ Normal(0, 1)
+        @plate for i in eachindex(y)
+            x[i] ~ truncated(Cauchy(0, 1), a, Inf)
+            y[i] ~ Normal(x[i], 1)
+        end
+    end, columns, (a = 0.2, x = [0.3, 0.6, 1.2]), q -> D.logpdf(D.Normal(), q.a) +
+        sum(D.logpdf.(D.truncated(D.Cauchy(), q.a, Inf), q.x)) +
+        sum(D.logpdf.(D.Normal.(q.x, 1), columns[:y])))
+end
+
+@testset "truncation tail normalization" begin
+    for (ctor, dist, lo, hi, x) in (
+            (:(Normal(0,1)), D.Normal(), 9.0, Inf, 9.4),
+            (:(Normal(0,1)), D.Normal(), 9.0, 10.0, 9.4),
+            (:(LogNormal(0,1)), D.LogNormal(), exp(9.0), Inf, exp(9.4)),
+            (:(Exponential(1)), D.Exponential(), 40.0, 42.0, 40.4),
+            (:(Weibull(2,1)), D.Weibull(2,1), 7.0, Inf, 7.2))
+        data = Dict(:y => [0.1])
+        _parameter_prior_check(quote x ~ truncated($ctor, $lo, $hi); y .~ Normal.(0,1) end,
+            data, (x=x,), q -> D.logpdf(D.truncated(dist,lo,hi),q.x) + D.logpdf(D.Normal(),0.1))
+    end
+end
+
+@testset "invalid Dirichlet concentration" begin
+    expr = quote p ~ Dirichlet(alpha); mu = p[1] .* z; y .~ Normal.(mu, 1) end
+    for alpha in ([-1.0, 2.0], [NaN, 2.0], Float64[], [0.0, 2.0])
+        data = Dict(:alpha => alpha, :z => ones(3), :y => zeros(3))
+        @test_throws ContractValidationError bind_data(lower_rkppl(expr,data; conditioned = data),data)
+    end
+    _parameter_prior_check(quote
+        a ~ Normal(0, 1)
+        p ~ Dirichlet(3, a)
+        mu = p[1] .* z
+        y .~ Normal.(mu, 1)
+    end, Dict(:z => ones(3), :y => zeros(3)), (a=-1.2, p=[0.2,0.3,0.5]), q -> -Inf)
+end
+
+@testset "whole-vector Dirichlet folds bound factors with native reverse" begin
+    model = @rkppl begin p ~ Dirichlet(alpha) end
+    for K in (3, 32, 256)
+        alpha = fill(1.3, K)
+        plan = bind_data(model(; alpha))
+        built = build_kernel(plan)
+        p = fill(1.0 / K, K)
+        u = collect(Float64, unconstrain(built.layout, (; p)))
+        sampler = prepare_sampler(built, plan, u;
+            backend = AutoEnzyme(; mode = Enzyme.Reverse), warm = true)
+        g = similar(u)
+        value, _ = sampler_value_and_gradient!(sampler, g, u)
+        @test value ≈ D.logpdf(D.Dirichlet(alpha), p) + logjac(built.layout, u)
+        @test all(isfinite, g)
+        source = sprint(show, built.program)
+        prepared = sprint(show, MIME"text/plain"(),
+            Base.remove_linenums!(deepcopy(ReactiveKernels.code_expr(sampler.kernel))))
+        @test occursin("_simplex_constrain_logjac_kernel", source)
+        @test !occursin("_dirichlet_slices_logpdf", source)
+        @test occursin("_ppl_dirichlet_normalizer_p", prepared)
+        for j in unique((1, length(u)))
+            h = 1e-5
+            plus, minus = copy(u), copy(u)
+            plus[j] += h
+            minus[j] -= h
+            @test g[j] ≈ (sampler(plus) - sampler(minus)) / (2h) rtol = 1e-5 atol = 1e-5
+        end
+
+        # A nonuniform interior point exercises the full prefix recurrence.
+        varying = u .+ 0.15 .* sin.(1:(K - 1))
+        original = copy(varying)
+        q = constrain(built.layout, varying)
+        value, _ = sampler_value_and_gradient!(sampler, g, varying)
+        @test all(>(0), q.p)
+        @test isfinite(value) && all(isfinite, g)
+        @test varying == original
+        @test value ≈ D.logpdf(D.Dirichlet(alpha), q.p) +
+            logjac(built.layout, varying) rtol = 1e-10 atol = 1e-10
+        for j in unique((1, max(1, length(varying) ÷ 2), length(varying)))
+            h = 1e-5
+            plus, minus = copy(varying), copy(varying)
+            plus[j] += h
+            minus[j] -= h
+            @test g[j] ≈ (sampler(plus) - sampler(minus)) / (2h) rtol = 1e-5 atol = 1e-5
+        end
+    end
+
+    active = @rkppl begin
+        a ~ Normal(0, 1)
+        p ~ Dirichlet(3, a)
+    end
+    plan = bind_data(active())
+    built = build_kernel(plan)
+    u = collect(Float64, unconstrain(built.layout, (a = 1.7, p = [0.2, 0.3, 0.5])))
+    sampler = prepare_sampler(built, plan, u;
+        backend = AutoEnzyme(; mode = Enzyme.Reverse), warm = true)
+    g = similar(u)
+    value, _ = sampler_value_and_gradient!(sampler, g, u)
+    @test isfinite(value) && all(isfinite, g)
+    h = 1e-5
+    plus, minus = copy(u), copy(u)
+    plus[1] += h
+    minus[1] -= h
+    @test g[1] ≈ (sampler(plus) - sampler(minus)) / (2h) rtol = 1e-5 atol = 1e-5
+    bad = copy(u)
+    bad[1] = -1.2
+    bad_gradient = similar(u)
+    bad_value, _ = sampler_value_and_gradient!(sampler, bad_gradient, bad)
+    @test bad_value == -Inf
+    @test all(isfinite, bad_gradient)
+end

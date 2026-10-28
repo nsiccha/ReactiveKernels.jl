@@ -42,8 +42,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 
     parameters = (; beta1, beta2, beta3, sigma)
     (parameters, log_jacobian::Float64) = ((; beta1, beta2, beta3, sigma), log_sigma)
-    (beta1::Float64, beta2::Float64, beta3::Float64, sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.beta3, parameters.sigma)
 
     # Transformed DATA: log-response and log-height as an in-graph preprocessing
     # subgraph. Both are hoisted once by partial evaluation when `earn`/`height`

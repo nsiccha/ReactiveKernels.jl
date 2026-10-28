@@ -16,15 +16,15 @@ export SUM_TO_ZERO_MODEL_SOURCE_CURRENT_DELTA
 const COMPARATOR_SOURCE_CURRENT_DELTA =
     "long-form native/bound/nonallocating matrix around byte-preserved Turing/manual baselines plus terminal definition-only guard"
 const EIGHT_SCHOOLS_MODEL_SOURCE_CURRENT_DELTA =
-    "published centered hierarchy and every public boundary are preserved; additive scalar-index-free packed extraction and a single-output Jacobian recipe enable Reactant and nonallocating configurations"
+    "published centered hierarchy and every public boundary are preserved; additive scalar-index-free packed extraction and a single-output Jacobian recipe enable Reactant and nonallocating configurations; the hand-written parameters unpack is removed in favor of automatic tuple-unpack edges; the centered half-Cauchy uses Stan's lower-bound kernel (bare Cauchy, no proper-half normalization)"
 const MNIST_COMPARATOR_SOURCE_CURRENT_DELTA =
     "additive two-model native/bound/nonallocating matrix; published Turing/manual AD baselines unchanged; documentation markers plus terminal definition-only include guard"
 const MNIST_MODEL_SOURCE_CURRENT_DELTA =
     "published idiomatic model source is byte-preserved; the additive optimized model uses the same natural each-column plate with the reference-coded categorical object"
 const SUM_TO_ZERO_MODEL_SOURCE_CURRENT_DELTA =
-    "published model body is preserved; scalar-indexed packed extraction and the model_only evaluator/init path are the only current-source deltas"
+    "published model body is preserved; scalar-indexed packed extraction, the model_only evaluator/init path, and automatic tuple-unpack edges (hand-written parameters unpack removed) are the only current-source deltas"
 const EIGHT_SCHOOLS_RECORDED_TO_CURRENT_MODEL_SOURCE_DELTA =
-    "recorded model body is preserved; artifact-backed real data, scalar-indexed packed extraction, and the model_only evaluator/init path are the only recorded-to-current deltas"
+    "recorded model body is preserved; artifact-backed real data, scalar-indexed packed extraction, the model_only evaluator/init path, automatic tuple-unpack edges (hand-written parameters unpack removed), and Stan's lower-bound half-Cauchy kernel (bare Cauchy, no proper-half normalization) are the only recorded-to-current deltas"
 const _DOCS_BASELINE_MARKERS = (
     "# DOCS-BASELINE-BEGIN: turing",
     "# DOCS-BASELINE-END: turing",
@@ -181,6 +181,39 @@ function eight_schools_model_source_preserves_published_authority(current, publi
             "    _EIGHT_SCHOOLS_GRAPH_TEMPLATE[] = evaluate_eight_schools_source(; model_only = true).model\n",
             "    _EIGHT_SCHOOLS_GRAPH_TEMPLATE[] = evaluate_eight_schools_source().model\n",
         ),
+        # The centered half-Cauchy spelling follows Stan's lower-bound
+        # kernel (bare Cauchy, no proper-half `+log(2)`); the constraint
+        # and Jacobian are unchanged, so the measured benchmark is the
+        # same program up to an additive constant.
+        (
+            "    # Log prior: μ ~ Normal(0, 5), τ constrained positive with Stan's\n" *
+            "    # lower-bound kernel (bare Cauchy, no proper-half `+log(2)`), and\n" *
+            "    # θⱼ ~ Normal(μ, τ). The scale keeps its fixed 5. Supplying both τ and\n" *
+            "    # log_τ to each effects Normal makes both graph values authoritative HAVE\n" *
+            "    # inputs: neither is recomputed or checked.\n" *
+            "    μ_prior::Float64 = normal(0.0, 5.0).logpdf(μ)\n" *
+            "    τ_prior::Float64 = cauchy(0.0, 5.0).logpdf(τ)\n",
+            "    # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),\n" *
+            "    # and θⱼ ~ Normal(μ, τ). The half-Cauchy keeps its fixed scale 5. Supplying\n" *
+            "    # both τ and log_τ to each effects Normal makes both graph values\n" *
+            "    # authoritative HAVE inputs: neither is recomputed or checked.\n" *
+            "    μ_prior::Float64 = normal(0.0, 5.0).logpdf(μ)\n" *
+            "    τ_cauchy::Float64 = cauchy(0.0, 5.0).logpdf(τ)\n" *
+            "    τ_prior::Float64 = log(2.0) + τ_cauchy\n",
+        ),
+        # The hand-written `parameters` unpack is gone from the authored
+        # source: automatic tuple-unpack edges reproduce it exactly, so the
+        # prepared graph — and the measured benchmark — is unchanged.
+        (
+            "    # HAVE authority cuts the inverse edges.\n" *
+            "\n" *
+            "    # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),\n",
+            "    # HAVE authority cuts the inverse edges.\n" *
+            "    (μ::Float64, τ::Float64, θ::AbstractVector{Float64}) =\n" *
+            "        (parameters.μ, parameters.τ, parameters.θ)\n" *
+            "\n" *
+            "    # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),\n",
+        ),
     )
     transformed = current
     for (replacement, original) in replacements
@@ -218,6 +251,39 @@ function eight_schools_model_source_matches_recorded_current(current, recorded)
         (
             "    _EIGHT_SCHOOLS_GRAPH_TEMPLATE[] = evaluate_eight_schools_source(; model_only = true).model\n",
             "    _EIGHT_SCHOOLS_GRAPH_TEMPLATE[] = evaluate_eight_schools_source().model\n",
+        ),
+        # The centered half-Cauchy spelling follows Stan's lower-bound
+        # kernel (bare Cauchy, no proper-half `+log(2)`); the constraint
+        # and Jacobian are unchanged, so the measured benchmark is the
+        # same program up to an additive constant.
+        (
+            "    # Log prior: μ ~ Normal(0, 5), τ constrained positive with Stan's\n" *
+            "    # lower-bound kernel (bare Cauchy, no proper-half `+log(2)`), and\n" *
+            "    # θⱼ ~ Normal(μ, τ). The scale keeps its fixed 5. Supplying both τ and\n" *
+            "    # log_τ to each effects Normal makes both graph values authoritative HAVE\n" *
+            "    # inputs: neither is recomputed or checked.\n" *
+            "    μ_prior::Float64 = normal(0.0, 5.0).logpdf(μ)\n" *
+            "    τ_prior::Float64 = cauchy(0.0, 5.0).logpdf(τ)\n",
+            "    # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),\n" *
+            "    # and θⱼ ~ Normal(μ, τ). The half-Cauchy keeps its fixed scale 5. Supplying\n" *
+            "    # both τ and log_τ to each effects Normal makes both graph values\n" *
+            "    # authoritative HAVE inputs: neither is recomputed or checked.\n" *
+            "    μ_prior::Float64 = normal(0.0, 5.0).logpdf(μ)\n" *
+            "    τ_cauchy::Float64 = cauchy(0.0, 5.0).logpdf(τ)\n" *
+            "    τ_prior::Float64 = log(2.0) + τ_cauchy\n",
+        ),
+        # The hand-written `parameters` unpack is gone from the authored
+        # source: automatic tuple-unpack edges reproduce it exactly, so the
+        # prepared graph — and the measured benchmark — is unchanged.
+        (
+            "    # HAVE authority cuts the inverse edges.\n" *
+            "\n" *
+            "    # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),\n",
+            "    # HAVE authority cuts the inverse edges.\n" *
+            "    (μ::Float64, τ::Float64, θ::AbstractVector{Float64}) =\n" *
+            "        (parameters.μ, parameters.τ, parameters.θ)\n" *
+            "\n" *
+            "    # Log prior: μ ~ Normal(0, 5), τ ~ HalfCauchy(0, 5),\n",
         ),
     )
     transformed = current
@@ -303,6 +369,60 @@ function sum_to_zero_model_source_preserves_published_authority(current, publish
         (
             "    _SUM_TO_ZERO_GRAPH_TEMPLATE[] = evaluate_sum_to_zero_source(; model_only = true).model\n",
             "    _SUM_TO_ZERO_GRAPH_TEMPLATE[] = evaluate_sum_to_zero_source().model\n",
+        ),
+        # The hand-written `parameters` unpack is gone from the authored
+        # source: automatic tuple-unpack edges reproduce it exactly, so the
+        # prepared graph — and the measured benchmark — is unchanged.
+        (
+            "         log_τ + sum_to_zero_log_jacobian)\n" *
+            "\n" *
+            "    K::Int = length(effects_s2z)\n",
+            "         log_τ + sum_to_zero_log_jacobian)\n" *
+            "    (α_s2z::Float64,\n" *
+            "     τ::Float64,\n" *
+            "     effects_s2z::AbstractVector{Float64}) =\n" *
+            "        (parameters.α_s2z, parameters.τ, parameters.effects_s2z)\n" *
+            "\n" *
+            "    K::Int = length(effects_s2z)\n",
+        ),
+        # The pivot-coordinate transform is vectorized (`w`, suffix sum via
+        # `cumsum`, tail rule) so that no loop over the data-derived number
+        # of free coordinates reaches a tensorizing backend
+        # (`docs/src/constraints.md`); the values are identical.  The prepared
+        # graph differs from the one the published v1 measurements ran, so
+        # those measurements stay attributed to the pinned blob and this
+        # delta stays explicit here.
+        (
+            "    # Vectorized: `w[i] = y[i] / sqrt(i (i + 1))`, the running sum from the\n" *
+            "    # top is the suffix sum `sum(w) - cumsum(w) + w` (spelled without\n" *
+            "    # `reverse`, whose traced lowering reverses its input buffer in place),\n" *
+            "    # and each `constrained[i + 1]` is the running sum at `i` minus\n" *
+            "    # `(i + 1) w[i]`; the last entry is the tail of that rule and the first\n" *
+            "    # is the full sum.  No loop over the (data-derived) number of free\n" *
+            "    # coordinates reaches a tensorizing backend.\n" *
+            "    effects_s2z::AbstractVector{Float64} = let\n" *
+            "        nfree = length(effects_free)\n" *
+            "        index = 1:nfree\n" *
+            "        w = effects_free ./ sqrt.(index .* (index .+ 1))\n" *
+            "        running = sum(w) .- cumsum(w) .+ w\n" *
+            "        tail = running .- (index .+ 1) .* w\n" *
+            "        vcat(running[1], tail)\n" *
+            "    end\n" *
+            "\n",
+            "    effects_s2z::AbstractVector{Float64} = let\n" *
+            "        nfree = length(effects_free)\n" *
+            "        constrained = Vector{Float64}(undef, nfree + 1)\n" *
+            "        running_sum = 0.0\n" *
+            "        for offset in 1:nfree\n" *
+            "            i = nfree - offset + 1\n" *
+            "            w = effects_free[i] / sqrt(i * (i + 1))\n" *
+            "            running_sum += w\n" *
+            "            constrained[i] = running_sum\n" *
+            "            constrained[i + 1] = running_sum - (i + 1) * w\n" *
+            "        end\n" *
+            "        constrained\n" *
+            "    end\n" *
+            "\n",
         ),
     )
     transformed = current

@@ -1,5 +1,6 @@
 using Pkg
 using UUIDs
+include(joinpath(@__DIR__, "..", "deps", "source_dependencies.jl"))
 
 const MUTATING_FUNCTIONS_URL = "https://github.com/nsiccha/MutatingFunctions.jl"
 const MUTATING_FUNCTIONS_REV = "4fc41b1c7b774133ceaacc4ff3c34c67b15b87b2"
@@ -8,6 +9,13 @@ const MUTATING_FUNCTIONS_UUID = UUID("8a4c2d94-4b3b-4f9e-be63-a3c0cd816e3a")
 root = normpath(joinpath(@__DIR__, ".."))
 testfiles = [joinpath(@__DIR__, "test_nonallocating.jl"),
              joinpath(@__DIR__, "test_nonallocating_mnist.jl"),
+             joinpath(@__DIR__, "test_nonallocating_ad.jl"),
+             joinpath(@__DIR__, "test_nonallocating_repeated.jl"),
+             joinpath(@__DIR__, "test_nonallocating_ownership.jl"),
+             joinpath(@__DIR__, "test_nonallocating_plate_steps.jl"),
+             joinpath(@__DIR__, "test_ppl_glm_nonallocating_ad.jl"),
+             joinpath(@__DIR__, "test_ppl_nonallocating_sampler.jl"),
+             joinpath(@__DIR__, "test_scan_plate_nonallocating.jl"),
              joinpath(@__DIR__, "test_reactive_nonallocating.jl"),
              joinpath(root, "packages", "ReactiveKernelsBatchingExamples",
                       "test", "test_batched_nonallocating.jl")]
@@ -21,12 +29,16 @@ mktempdir() do env
         "expected MutatingFunctions revision $(MUTATING_FUNCTIONS_REV), got $(dep.git_revision)")
     # test_batched_nonallocating.jl exercises the reverse-mode gradient path, so
     # the integration environment also needs the AD and benchmarking stack.
-    Pkg.add(["DifferentiationInterface", "Enzyme", "BenchmarkTools"])
-    Pkg.develop(path = root)
+    # test_ppl_glm_nonallocating_ad.jl needs the PPL surface plus Distributions
+    # oracles for its independent references.
+    Pkg.add(["DifferentiationInterface", "Enzyme", "BenchmarkTools",
+             "Distributions"])
+    Pkg.develop([PackageSpec(path = root); rk_source_dependencies()])
     # test_nonallocating_mnist.jl runs the real MNIST example graph. Julia 1.10
     # ignores [sources], so the nested example packages are developed by path.
     Pkg.develop(path = joinpath(root, "packages",
                                 "ReactiveKernelsDistributionKernels"))
+    Pkg.develop(path = joinpath(root, "packages", "ReactiveKernelsPPL"))
     Pkg.develop(path = joinpath(root, "packages", "ReactiveKernelsPPLExamples"))
     Pkg.instantiate()
 

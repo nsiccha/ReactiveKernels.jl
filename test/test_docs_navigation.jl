@@ -30,7 +30,7 @@ using Test
               "\"Prepared gradients\" => \"automatic-differentiation.md\"", make,
           )) <
           first(findfirst(
-              "\"Manual derivative rules (design)\" => \"manual-derivative-rules.md\"",
+              "\"Derivative rules\" => \"manual-derivative-rules.md\"",
               make,
           )) <
           first(findfirst(

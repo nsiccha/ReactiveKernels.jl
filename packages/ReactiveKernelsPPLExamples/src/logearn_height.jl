@@ -40,8 +40,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 
     parameters = (; beta1, beta2, sigma)
     (parameters, log_jacobian::Float64) = ((; beta1, beta2, sigma), log_sigma)
-    (beta1::Float64, beta2::Float64, sigma::Float64) =
-        (parameters.beta1, parameters.beta2, parameters.sigma)
 
     # Transformed DATA: the log-response, computed once from the data (Stan's
     # `transformed data { log_earn = log(earn); }`). This is a named node read as

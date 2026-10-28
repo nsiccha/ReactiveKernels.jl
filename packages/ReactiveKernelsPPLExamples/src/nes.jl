@@ -114,8 +114,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
     # constrain-only producer omits the Jacobian; the joint producer emits it.
     parameters = (; beta, sigma)
     (parameters, log_jacobian::Float64) = ((; beta, sigma), log_sigma)
-    (beta::AbstractVector{Float64}, sigma::Float64) =
-        (parameters.beta, parameters.sigma)
 
     # Linear predictor eta = X * beta (named transformed-parameter node). The
     # design matrix already carries the intercept column and the age-band

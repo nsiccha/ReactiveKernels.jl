@@ -48,12 +48,14 @@ end
     @test PPL_NODES.posterior === :posterior
     @test PPL_NODES.log_jacobian === :log_jacobian
     @test Tuple(values(PPL_NODES)) ===
-        (:likelihood, :prior, :log_jacobian, :posterior)
+        (:likelihood, :prior, :log_jacobian, :posterior, :pointwise, :_ppl_observations)
     @test workflow_wants(:sampler) === :posterior
     @test workflow_wants(:likelihood) === :likelihood
     @test workflow_wants(:prior) === :prior
     @test workflow_wants(:log_jacobian) === :log_jacobian
-    @test_throws ArgumentError workflow_wants(:pointwise)
+    @test workflow_wants(:pointwise) === :pointwise
+    @test workflow_wants(:observations) === :_ppl_observations
+    @test_throws ArgumentError workflow_wants(:nonsense_preset)
 end
 
 @testset "prepare_query cuts" begin
@@ -70,7 +72,11 @@ end
             bound = (; x = plan.columns[:x], y = plan.columns[:y]))
         @test prepare_query(built, plan, preset)(u) ≈ ref(u)
     end
-    @test_throws ArgumentError prepare_query(built, plan, :pointwise)
+    pointwise = prepare_query(built, plan, :pointwise)(u)
+    @test keys(pointwise) == (:y,)
+    @test size(pointwise.y) == size(plan.columns[:y])
+    @test sum(pointwise.y) ≈ prepare_query(built, plan, :likelihood)(u)
+    @test_throws ArgumentError prepare_query(built, plan, :nonsense_preset)
 end
 
 @testset "sampler value and gradient" begin
@@ -95,6 +101,7 @@ end
     # Friendly path: views convert.
     uv = view([9.9, 0.5, -0.25, 0.1, 9.9], 2:4)
     @test q(uv) ≈ ref(u)
+    # refused: unconstrained vector length mismatches layout
     @test_throws ContractValidationError prepare_sampler(built, plan, [0.1, 0.2];
         backend = _QUERY_BACKEND)
 end
@@ -121,7 +128,41 @@ end
     @test Tuple(keys(empty_nt)) === (:mu, :sigma)
     @test size(empty_nt.mu) == (2, 0)
     @test length(empty_nt.sigma) == 0
+    # refused: draws matrix row count mismatches layout
     @test_throws ContractValidationError restore_draws(built.layout, U[1:2, :])
+end
+
+@testset "restore_draws leveled vectors" begin
+    cols = Dict{Symbol,AbstractVector}(:y => [1, 2, 3, 2, 1, 3],
+        :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0])
+    unbound = StructuralPlan(
+        LikelihoodSpec[LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
+            nothing, nothing, ResponseEvidence(:none, nothing, nothing),
+            :y_resp, nothing, nothing; thresholds = :y_cutpoints)],
+        PredictorSpec[PredictorSpec(:mu, IdentityLink,
+            TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
+                    :Intercept, :intercept),
+                TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term)],
+            :mu)],
+        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
+            PopulationPrior(:mu, :x, 0.0, 2.0)],
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(),
+        0; vector_parameters = VectorParameter[VectorParameter(:y_cutpoints,
+        :ordered_normal, (arg1 = 0.0, arg2 = 1.0), nothing, :y_cutpoints)])
+    plan = bind_data(unbound, cols)
+    built = build_kernel(plan)
+    U = [0.5 -0.3; -0.25 0.7; 0.1 -0.2; 0.3 0.0]
+    nt = restore_draws(built.layout, U)
+    @test Tuple(keys(nt)) === (:mu, :y_cutpoints)
+    @test size(nt.mu) == (2, 2)
+    @test size(nt.y_cutpoints) == (2, 2)
+    for j in 1:2
+        c = constrain(built.layout, U[:, j])
+        @test nt.mu[:, j] ≈ Vector(c.mu)
+        @test nt.y_cutpoints[:, j] ≈ Vector(c.y_cutpoints)
+    end
+    # Cutpoints restore ordered in every draw.
+    @test all(nt.y_cutpoints[1, :] .< nt.y_cutpoints[2, :])
 end
 
 # Compiled-caller shape (world-age regression): build + prepare + evaluate

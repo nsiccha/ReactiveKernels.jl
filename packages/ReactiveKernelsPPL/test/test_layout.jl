@@ -4,6 +4,15 @@ using Test
 # Self-contained builders (mirror the contract shapes; independent of
 # test_contract.jl).
 
+# Closed-form determinants (the findiff-Jacobian checks need no
+# LinearAlgebra — the Pkg.test sandbox resolves test deps offline).
+_det2(J) = J[1, 1] * J[2, 2] - J[1, 2] * J[2, 1]
+function _det3(J)
+    return J[1, 1] * (J[2, 2] * J[3, 3] - J[2, 3] * J[3, 2]) -
+        J[1, 2] * (J[2, 1] * J[3, 3] - J[2, 3] * J[3, 1]) +
+        J[1, 3] * (J[2, 1] * J[3, 2] - J[2, 2] * J[3, 1])
+end
+
 function _layout_columns()
     n = 6
     Dict{Symbol,AbstractVector}(
@@ -57,12 +66,14 @@ end
     shape2 = design_shape(pred2, plan.columns; levelmaps = maps2)
     @test shape2.blocks[1].labels == [:g_1, :g_3]
     # Factor terms without a map are loud.
+    # refused: FactorTerm without a LevelMap (IR contract)
     @test_throws ContractValidationError design_shape(pred2, plan.columns)
     # Duplicate coefficient labels are loud.
     preddup = PredictorSpec(:mu, IdentityLink,
         TermSpec[TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x1),
             TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x2)],
         :mu)
+    # refused: duplicate coefficient labels (IR contract)
     @test_throws ContractValidationError design_shape(preddup, plan.columns)
 end
 
@@ -70,8 +81,24 @@ end
     @test support_of(:normal, nothing) === :real
     @test support_of(:beta, nothing) === :unit
     @test support_of(:exponential, nothing) === :positive
+    @test support_of(:student_t, nothing) === :real
+    @test support_of(:laplace, nothing) === :real
+    @test support_of(:logistic, nothing) === :real
+    @test support_of(:uniform, nothing) === :interval
     @test support_of(:normal, :positive) === :positive
+    @test support_of(:normal, (:interval, -1.0, 2.0)) === :interval
+    @test support_of(:normal, (:upper, 2.0)) === :upper
+    # refused: support override :positive on a non-real family (support_of contract)
     @test_throws ContractValidationError support_of(:exponential, :positive)
+    # refused: support override :positive on Uniform (support_of contract)
+    @test_throws ContractValidationError support_of(:uniform, :positive)
+    # An :interval override needs a real-support family.
+    # refused: interval override needs a real-support family (support_of contract)
+    @test_throws ContractValidationError support_of(:exponential, (:interval, 0.0, 1.0))
+    # So does an :upper override.
+    # refused: upper override needs a real-support family (support_of contract)
+    @test_throws ContractValidationError support_of(:exponential, (:upper, 1.0))
+    # refused: unknown family :nope (support_of contract)
     @test_throws ContractValidationError support_of(:nope, nothing)
 end
 
@@ -106,6 +133,28 @@ end
     @test constrain(ulayout, uu).p ≈ x
     @test unconstrain(ulayout, constrain(ulayout, uu)) ≈ uu
     @test logjac(ulayout, uu) ≈ log(x) + log1p(-x)
+    # Interval support exercises the affine-logistic branch (bounds on the entry).
+    ilo, ihi = -2.0, 3.0
+    ilayout = LayoutTable(
+        [LayoutEntry(:sampled, nothing, :q, [:q], 1, 1, :interval, ilo, ihi)], 1)
+    iu = [0.4]
+    xq = ilo + (ihi - ilo) / (1 + exp(-0.4))
+    @test ilo < constrain(ilayout, iu).q < ihi
+    @test constrain(ilayout, iu).q ≈ xq
+    @test unconstrain(ilayout, constrain(ilayout, iu)) ≈ iu
+    @test logjac(ilayout, iu) ≈ log(xq - ilo) + log(ihi - xq) - log(ihi - ilo)
+    # Upper support exercises Stan's upper-bound kernel (ceiling on the entry;
+    # the Jacobian is the bare unconstrained value — no renormalizer).
+    uhi = log(0.5)
+    clay = LayoutTable(
+        [LayoutEntry(:sampled, nothing, :c, [:c], 1, 1, :upper, NaN, uhi)], 1)
+    cu = [0.4]
+    xc = uhi - exp(0.4)
+    @test constrain(clay, cu).c ≈ xc
+    @test constrain(clay, cu).c < uhi
+    @test unconstrain(clay, constrain(clay, cu)) ≈ cu
+    @test logjac(clay, cu) ≈ 0.4
+    # refused: constrain with wrong-length unconstrained vector (layout contract)
     @test_throws ContractValidationError constrain(layout, [1.0])
 end
 
@@ -116,24 +165,111 @@ end
     @test transform_statements(block) ==
         Expr[:(mu_coef::AbstractVector{Float64} = view(unconstrained, 1:4))]
     @test jacobian_term(block) === nothing
+    # Constrained supports splice the bijector `constrain`/`logjac` endpoints
+    # over the packed coordinate (the planner inlines them, sharing the
+    # coordinate read with the Jacobian term via structural CSE).
     @test transform_statements(sig) == Expr[
-        :(_ppl_log_sigma::Float64 = sum(view(unconstrained, 5:5))),
-        :(sigma::Float64 = exp(_ppl_log_sigma)),
-        :(_ppl_log_sigma::Float64 = log(sigma)),
+        :(sigma::Float64 = positive_bijector().constrain(unconstrained[5])),
     ]
-    @test jacobian_term(sig) == :_ppl_log_sigma
+    @test jacobian_term(sig) ==
+        :(positive_bijector().logjac(unconstrained[5]))
     @test transform_statements(nu) ==
-        Expr[:(nu::Float64 = sum(view(unconstrained, 6:6)))]
+        Expr[:(nu::Float64 = unconstrained[6])]
     @test jacobian_term(nu) === nothing
     uentry = LayoutEntry(:sampled, nothing, :p, [:p], 2, 1, :logistic)
     @test transform_statements(uentry) == Expr[
-        :(_ppl_logit_p::Float64 = sum(view(unconstrained, 2:2))),
-        :(p::Float64 = 1 / (1 + exp(-_ppl_logit_p))),
-        :(_ppl_logit_p::Float64 = log(p) - log1p(-p)),
+        :(p::Float64 = unit_bijector().constrain(unconstrained[2])),
     ]
-    @test jacobian_term(uentry) == :(log(p) + log1p(-p))
-    @test coordinate_read(3) == :(sum(view(unconstrained, 3:3)))
+    @test jacobian_term(uentry) ==
+        :(unit_bijector().logjac(unconstrained[2]))
+    # Interval transform: parameterized bounds ⇒ RK's owned affine-logistic
+    # forward rule, the log-ratio inverse and source-coordinate Jacobian.
+    # Literal arithmetic in the inverse folds (`q - -2.0` is `q + 2.0`).
+    blo, bhi = -2.0, 3.0
+    ientry = LayoutEntry(:sampled, nothing, :q, [:q], 3, 1, :interval, blo, bhi)
+    @test transform_statements(ientry) == Expr[
+        :(_ppl_int_q::Float64 = unconstrained[3]),
+        :(q::Float64 = rk_affine_logistic(-2.0, 3.0, _ppl_int_q)),
+        :(_ppl_int_q::Float64 = log(q + 2.0) - log(3.0 - q)),
+    ]
+    @test jacobian_term(ientry) ==
+        :(log(5.0) - log1pexp(-unconstrained[3]) - log1pexp(unconstrained[3]))
+    # A literal zero bound contributes nothing to an edge: a zero lower end
+    # drops out of the interval, a zero floor is `exp(u)` itself, a zero
+    # ceiling negates, and a unit width has no `log(1.0)` term.
+    zentry = LayoutEntry(:sampled, nothing, :q, [:q], 3, 1, :interval, 0.0, 0.5)
+    @test transform_statements(zentry) == Expr[
+        :(_ppl_int_q::Float64 = unconstrained[3]),
+        :(q::Float64 = rk_affine_logistic(0.0, 0.5, _ppl_int_q)),
+        :(_ppl_int_q::Float64 = log(q) - log(0.5 - q)),
+    ]
+    @test jacobian_term(zentry) ==
+        :(log(0.5) - log1pexp(-unconstrained[3]) - log1pexp(unconstrained[3]))
+    uentry01 = LayoutEntry(:sampled, nothing, :q, [:q], 3, 1, :interval, -1.0, 0.0)
+    @test transform_statements(uentry01)[2:3] == Expr[
+        :(q::Float64 = rk_affine_logistic(-1.0, 0.0, _ppl_int_q)),
+        :(_ppl_int_q::Float64 = log(q + 1.0) - log(-q)),
+    ]
+    @test jacobian_term(uentry01) ==
+        :(0.0 - log1pexp(-unconstrained[3]) - log1pexp(unconstrained[3]))
+    fentry = LayoutEntry(:sampled, nothing, :s, [:s], 2, 1, :floored, 0.0, NaN)
+    @test transform_statements(fentry) == Expr[
+        :(_ppl_fl_s::Float64 = unconstrained[2]),
+        :(s::Float64 = exp(_ppl_fl_s)),
+        :(_ppl_fl_s::Float64 = log(s)),
+    ]
+    zcentry = LayoutEntry(:sampled, nothing, :c, [:c], 4, 1, :upper, NaN, 0.0)
+    @test transform_statements(zcentry)[2:3] == Expr[
+        :(c::Float64 = -(exp(_ppl_up_c))),
+        :(_ppl_up_c::Float64 = log(-c)),
+    ]
+    # Plate blocks broadcast the same rule.
+    pentry = LayoutEntry(:plate, nothing, :d, [:d1, :d2], 1, 2, :interval, 0.0, 0.5)
+    @test transform_statements(pentry)[2:3] == Expr[
+        :(d::AbstractVector{Float64} = rk_affine_logistic.(0.0, 0.5, _ppl_int_d)),
+        :(_ppl_int_d::AbstractVector{Float64} = log.(d) .- log.(0.5 .- d)),
+    ]
+    @test jacobian_term(pentry) ==
+        :(sum(log(0.5) .- log1pexp.(-view(unconstrained, 1:2)) .-
+            log1pexp.(view(unconstrained, 1:2))))
+    # A sampled bound stays as authored.
+    dentry = LayoutEntry(:sampled, nothing, :w, [:w], 2, 1, :interval, 0.0, :w_hi)
+    @test transform_statements(dentry)[2:3] == Expr[
+        :(w::Float64 = rk_affine_logistic(0.0, w_hi, _ppl_int_w)),
+        :(_ppl_int_w::Float64 = log(w) - log(w_hi - w)),
+    ]
+    @test jacobian_term(dentry) ==
+        :(log(w_hi) - log1pexp(-unconstrained[2]) - log1pexp(unconstrained[2]))
+    # Upper transform: parameterized ceiling ⇒ hand-rolled forward/inverse
+    # edges; the Jacobian is the bare unconstrained coordinate (Stan kernel).
+    centry = LayoutEntry(:sampled, nothing, :c, [:c], 4, 1, :upper, NaN, bhi)
+    @test transform_statements(centry) == Expr[
+        :(_ppl_up_c::Float64 = unconstrained[4]),
+        :(c::Float64 = $bhi - exp(_ppl_up_c)),
+        :(_ppl_up_c::Float64 = log($bhi - c)),
+    ]
+    @test jacobian_term(centry) == :(unconstrained[4])
+    @test coordinate_read(3) == :(unconstrained[3])
     @test block_read(2, 4) == :(view(unconstrained, 2:5))
+    # Real-support arrays and per-cell latents read their packed coordinates
+    # in place; a two-axis array reshapes that view, so no evaluation copies.
+    zentry = LayoutEntry(:array, nothing, :Z, Symbol.("Z.", 1:6), 7, 6,
+        :identity, NaN, NaN, [2, 3], LayoutEntry[], nothing)
+    @test transform_statements(zentry) == Expr[
+        :(_ppl_arrflat_Z::AbstractVector{Float64} =
+            ReactiveKernels._tensorized_view(unconstrained, 7:12)),
+        :(Z::AbstractMatrix{Float64} = reshape(_ppl_arrflat_Z, 2, 3)),
+    ]
+    ventry = LayoutEntry(:array, nothing, :v, Symbol.("v.", 1:3), 2, 3,
+        :identity, NaN, NaN, [3], LayoutEntry[], nothing)
+    @test transform_statements(ventry) ==
+        Expr[:(v::AbstractVector{Float64} =
+            ReactiveKernels._tensorized_view(unconstrained, 2:4))]
+    pentry = LayoutEntry(:plate, nothing, :theta, Symbol.("theta.", 1:4), 5, 4,
+        :identity)
+    @test transform_statements(pentry) ==
+        Expr[:(theta::AbstractVector{Float64} =
+            ReactiveKernels._tensorized_view(unconstrained, 5:8))]
 end
 
 @testset "name hygiene" begin
@@ -141,9 +277,160 @@ end
     bad = StructuralPlan(plan.responses, plan.predictors, plan.population_priors,
         [SampledParameter(:mu_coef, :exponential, (arg1 = 1.0,), nothing, :m)],
         plan.assignments, plan.columns, plan.n_obs)
+    # refused: parameter name collides with layout-internal name mu_coef (name hygiene, IR contract)
     @test_throws ContractValidationError validate_plan(bad)
     bad = StructuralPlan(plan.responses, plan.predictors, plan.population_priors,
         [SampledParameter(:_ppl_x, :exponential, (arg1 = 1.0,), nothing, :m)],
         plan.assignments, plan.columns, plan.n_obs)
+    # refused: parameter uses reserved _ppl_ prefix (name hygiene, IR contract)
     @test_throws ContractValidationError validate_plan(bad)
+end
+
+@testset "ordered host transform" begin
+    u = [0.5, -0.25, 1.2]
+    y = ordered_constrain(u)
+    @test y[1] == u[1]
+    @test y[2] ≈ u[1] + exp(u[2])
+    @test y[3] ≈ y[2] + exp(u[3])
+    @test all(y[i] < y[i+1] for i in 1:length(y)-1)
+    @test ordered_unconstrain(y) ≈ u
+    @test ordered_logjac(u) ≈ u[2] + u[3]
+    # Degenerate sizes: empty constrains to empty, scalar has zero Jacobian.
+    @test ordered_constrain(Float64[]) == Float64[]
+    @test ordered_unconstrain(Float64[]) == Float64[]
+    @test ordered_logjac(Float64[]) == 0.0
+    @test ordered_logjac([2.0]) == 0.0
+    # Jacobian vs finite differences of the log-abs-det (first K−1 free
+    # coordinates of the ordered map).
+    h = 1e-6
+    J = zeros(3, 3)
+    for j in 1:3
+        up, dn = copy(u), copy(u)
+        up[j] += h
+        dn[j] -= h
+        J[:, j] = (ordered_constrain(up) .- ordered_constrain(dn)) ./ (2h)
+    end
+    @test ordered_logjac(u) ≈ log(abs(_det3(J))) rtol = 1e-5
+end
+
+@testset "simplex host transform" begin
+    u = [0.3, -0.7]
+    s = simplex_constrain(u)
+    @test sum(s) ≈ 1.0
+    @test all(>(0), s)
+    @test simplex_unconstrain(s) ≈ u
+    # K=2 closed form: z = σ(u[1] + log(1)) = σ(u[1]).
+    @test simplex_constrain([0.0]) ≈ [0.5, 0.5]
+    # Jacobian vs finite differences of the log-abs-det over the free
+    # K−1 simplex coordinates.
+    h = 1e-6
+    J = zeros(2, 2)
+    for j in 1:2
+        up, dn = copy(u), copy(u)
+        up[j] += h
+        dn[j] -= h
+        J[:, j] = (simplex_constrain(up)[1:2] .- simplex_constrain(dn)[1:2]) ./ (2h)
+    end
+    @test simplex_logjac(u) ≈ log(abs(_det2(J))) rtol = 1e-5
+    # Deterministic 1-simplex: empty packs, constant constrains.
+    @test simplex_constrain(Float64[]) == [1.0]
+    @test simplex_unconstrain([1.0]) == Float64[]
+    @test simplex_logjac(Float64[]) == 0.0
+end
+
+function _vector_layout_plan()
+    cols = Dict{Symbol,AbstractVector}(
+        :y => [1, 2, 3, 2, 1, 3],
+        :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0],
+    )
+    preds = PredictorSpec[PredictorSpec(:mu, IdentityLink,
+        TermSpec[TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term)],
+        :mu)]
+    priors = PopulationPrior[PopulationPrior(:mu, :x, 0.0, 2.0)]
+    resps = LikelihoodSpec[LikelihoodSpec(OrderedLogisticFam, LogitLink, :y,
+        :mu, nothing, nothing, ResponseEvidence(:none, nothing, nothing),
+        :y_resp, nothing, nothing; thresholds = :y_cutpoints)]
+    vecs = VectorParameter[VectorParameter(:y_cutpoints, :ordered_normal,
+        (arg1 = 0.0, arg2 = 1.0), nothing, :y_cutpoints)]
+    unbound = StructuralPlan(resps, preds, priors, SampledParameter[],
+        AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
+        vector_parameters = vecs)
+    return bind_data(unbound, cols)
+end
+
+@testset "vector layout entries" begin
+    plan = _vector_layout_plan()
+    @test plan.vector_parameters[1].size == 2
+    layout = assign_layout(plan)
+    @test layout.total == 3 # 1 coefficient + 2 cutpoints
+    kinds = [e.kind for e in layout.entries]
+    @test kinds == [:coefficient, :vector]
+    @test [e.offset for e in layout.entries] == [1, 2]
+    @test [e.size for e in layout.entries] == [1, 2]
+    @test [e.transform for e in layout.entries] == [:identity, :ordered]
+    @test coordinate_names(layout) ==
+        Symbol[Symbol("mu.x"), Symbol("y_cutpoints.1"), Symbol("y_cutpoints.2")]
+    u = [0.4, -0.2, 0.25]
+    nt = constrain(layout, u)
+    @test Vector(nt.mu) == [0.4]
+    @test Vector(nt.y_cutpoints) ≈ ordered_constrain([-0.2, 0.25])
+    @test unconstrain(layout, nt) ≈ u
+    @test logjac(layout, u) ≈ 0.25
+    # A 1-simplex packs zero coordinates; an empty threshold pack constrains
+    # to an empty vector with zero Jacobian.
+    solo = LayoutTable(
+        [LayoutEntry(:vector, nothing, :s, Symbol[], 1, 0, :simplex)], 0)
+    @test constrain(solo, Float64[]).s == [1.0]
+    @test logjac(solo, Float64[]) == 0.0
+    empty = LayoutTable(
+        [LayoutEntry(:vector, nothing, :t, Symbol[], 1, 0, :ordered)], 0)
+    @test constrain(empty, Float64[]).t == Float64[]
+    @test logjac(empty, Float64[]) == 0.0
+    # Length mismatches are loud.
+    badnt = (mu = [0.4], y_cutpoints = [1.0])
+    # refused: unconstrain with wrong-length value (layout contract)
+    @test_throws ContractValidationError unconstrain(layout, badnt)
+end
+
+@testset "vector transform statement shapes" begin
+    plan = _vector_layout_plan()
+    layout = assign_layout(plan)
+    entry = layout.entries[2]
+    # Ordered: one call of the native ordered kernel over the packed slice.
+    @test transform_statements(entry) == Expr[
+        :(y_cutpoints::AbstractVector{Float64} =
+            $(GlobalRef(ReactiveKernelsPPL, :_ordered_constrain_kernel))(
+                unconstrained, 2, 3)),
+    ]
+    @test jacobian_term(entry) == :(sum(view(unconstrained, 3:3)))
+    one_ord = LayoutEntry(:vector, nothing, :o, [:o_1], 7, 1, :ordered)
+    @test transform_statements(one_ord) == Expr[
+        :(o::AbstractVector{Float64} = view(unconstrained, 7:7))]
+    @test jacobian_term(one_ord) === nothing
+    # Identity vector: one ordinary packed slice, no Jacobian.
+    ientry = LayoutEntry(:vector, nothing, :t, [:t_1, :t_2], 4, 2, :identity)
+    @test transform_statements(ientry) == Expr[
+        :(t::AbstractVector{Float64} = unconstrained[4:5])]
+    @test jacobian_term(ientry) === nothing
+    # Simplex: one native stick-breaking kernel returns the simplex and its
+    # break Jacobian together (K=3 here).
+    sentry = LayoutEntry(:vector, nothing, :s, [:s_1, :s_2], 6, 2, :simplex)
+    @test transform_statements(sentry) == Expr[
+        :(_ppl_simplex_pair_s =
+            $(GlobalRef(ReactiveKernelsPPL, :_simplex_constrain_logjac_kernel))(
+                unconstrained, 6, 7)),
+        :(s::AbstractVector{Float64} = _ppl_simplex_pair_s[1]),
+        :(_ppl_simplex_logjac_s::Float64 = _ppl_simplex_pair_s[2]),
+    ]
+    @test jacobian_term(sentry) === :_ppl_simplex_logjac_s
+    # A 1-simplex emits its constant; an empty ordered/identity pack emits
+    # nothing.
+    one = LayoutEntry(:vector, nothing, :s1, Symbol[], 9, 0, :simplex)
+    @test transform_statements(one) == Expr[:(s1::AbstractVector{Float64} = ones(1))]
+    @test jacobian_term(one) === nothing
+    mt = LayoutEntry(:vector, nothing, :e, Symbol[], 9, 0, :ordered)
+    @test transform_statements(mt) == Expr[]
+    @test jacobian_term(mt) === nothing
+    mi = LayoutEntry(:vector, nothing, :e, Symbol[], 9, 0, :identity)
+    @test transform_statements(mi) == Expr[]
 end

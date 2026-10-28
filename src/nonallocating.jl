@@ -16,24 +16,29 @@
 # reused for:
 #
 # - identity-preserving wrappers (`view`, `reshape`, `transpose`, `eachcol`,
-#   ranges, scalar arithmetic, …) and isbits-valued calls are emitted inline —
-#   they never owned a buffer worth caching;
+#   postfix `'`/`.'`, ranges, scalar arithmetic, …) and isbits-valued calls
+#   are emitted inline — they never owned a buffer worth caching;
 # - broadcast materializations (dotted calls, and array `getindex` with
 #   range/vector indices via `view`) become `_MaterializeStep` destination
 #   steps;
 # - `vcat` becomes `_ConcatenateStep` and `zeros`/`ones` become
-#   `_FillConstructorStep`;
+#   `_FillConstructorStep`; `sum`/`prod`/`minimum`/`maximum` with a
+#   preparation-constant `dims` keyword become `_RowReduceStep`;
 # - every other resolved call stays a generic per-step cache operation, so
 #   registered in-place coverage (e.g. `mul!`-backed `*`) applies per step.
 #
 # Soundness: the fused operation's callable is a module-anonymous function
 # with no captured fields, so its free symbols resolve in
-# `parentmodule(op.f)`. Decomposition resolves every free symbol against that
-# module, requires the binding to be `const`, and emits `GlobalRef`s to those
-# exact bindings — never name-based guesses. Any source shape outside the
-# grammar (or any resolution failure) falls back to the previous whole-recipe
-# cache step, so decomposition never widens behavior; it only exposes the same
-# computation at a granularity the in-place layer can reuse.
+# the native source closure's defining module. Decomposition resolves every
+# free symbol against that module, requires the binding to be `const`, and emits
+# `GlobalRef`s to those exact bindings — never name-based guesses. Module-qualified callees
+# (`Pkg.f`) resolve through the same rule, requiring every path segment to be
+# a `const` module binding. Any source shape outside the grammar (keyword
+# calls other than constant-`dims` reductions, a non-`const` global, a call
+# through a port — including `dims` read from a port) falls back to the
+# previous whole-recipe cache step, so decomposition never widens behavior;
+# it only exposes the same computation at a granularity the in-place layer
+# can reuse.
 
 # --- destination step operations -------------------------------------------
 # Core-owned; CALLING one is the exact allocating semantics, so a hand-written
@@ -63,6 +68,23 @@ struct _MatMulStep end
 struct _FillConstructorStep{F}
     f::F
 end
+
+"""
+Row/column reduction with a preparation-constant `dims` keyword
+(`sum`/`prod`/`minimum`/`maximum`). The callable is the exact allocating
+semantics (`f(A; dims = ...)`); the MutatingFunctions extension reuses the
+destination through Base's `reducedim!` family, which runs the same
+per-lane `mapreducedim` pass as the allocating twin.
+"""
+struct _RowReduceStep{F,D}
+    f::F
+    dims::D
+end
+@inline (op::_RowReduceStep)(A) = op.f(A; dims = op.dims)
+
+"One-dimensional gather (`x[idx]`); in-place layers may copy into a destination."
+struct _GatherStep end
+@inline (::_GatherStep)(x, idx...) = x[idx...]
 @inline (op::_FillConstructorStep)(dims::Integer...) = op.f(dims...)
 _fill_constructor_value(::_FillConstructorStep{typeof(zeros)}) = 0.0
 _fill_constructor_value(::_FillConstructorStep{typeof(ones)}) = 1.0
@@ -72,7 +94,38 @@ _fill_constructor_value(::_FillConstructorStep{typeof(ones)}) = 1.0
 mutable struct _StepProgram
     ops::Vector{Any}
     caches::Vector{Any}
+    # The extension's `cache_apply` callable; `_nonalloc_destination`
+    # dispatches on it to ask which steps fill an owned destination.
+    cache_apply::Any
 end
+
+# --- cache ownership --------------------------------------------------------
+# A cache slot holds its step's first result, and every later call offers that
+# value to `apply!!` as the destination of the new result. Only storage the
+# kernel owns may be offered: `apply!!`'s generic fallback copies the new
+# result INTO the cached value, so a first result that aliases caller data (a
+# field read such as `sched.xs`, `eachrow` slices of a caller matrix) would
+# receive the next call's input — the previous call's caller-owned arrays
+# silently overwritten — and an immutable first result (a range) would throw.
+# A step therefore keeps a slot only when its result is fresh storage that a
+# destination-passing method fills. Every other step is a plain call: its
+# result is returned as a borrowed value that may alias an input, and is never
+# written into. The generic fallback allocates the result before copying it,
+# so the plain call does no more work.
+#
+# The decomposition's own step operations carry destination-passing methods in
+# the extension. `_LaneGather` is the exception to their fresh ordinary result:
+# it returns a view, so its non-allocating slot is seeded with an owned vector
+# by `_nonalloc_slot` below.
+_nonalloc_fresh_step(op) = false
+_nonalloc_fresh_step(::Union{_MaterializeStep,_GatherStep,_MatMulStep,
+                             _ConcatenateStep,_FillConstructorStep,
+                             _RowReduceStep,_LaneGather}) = true
+
+# Whether a step with operation `op`, inferred result type `T` and argument
+# types `argtypes` keeps a cache slot. The extension adds the method for its
+# `cache_apply` callable that also recognizes registered `apply!!` methods.
+_nonalloc_destination(cache_apply, op, T, argtypes) = _nonalloc_fresh_step(op)
 
 function _step!(prog::_StepProgram, op, cache)
     push!(prog.ops, op)
@@ -99,17 +152,64 @@ end
 
 _nonalloc_slot(::Type{T}) where {T} = Ref{Union{Nothing,T}}(nothing)
 
+# `_LaneGather` returns a view for ordinary execution. Its non-allocating
+# destination must instead own storage: caching that view would make the next
+# call write through it into the caller's input. Keep a concrete vector slot
+# for the extension's elementwise gather, even though the ordinary result type
+# is a SubArray.
+_nonalloc_slot(op, ::Type{T}) where {T} = _nonalloc_slot(T)
+function _nonalloc_slot(::_LaneGather, ::Type{T}) where {T<:AbstractVector}
+    E = eltype(T)
+    isconcretetype(E) ? Ref(Vector{E}()) : nothing
+end
+_nonalloc_slot(::_LaneGather, ::Type) = nothing
+
 # Identity-preserving wrappers that are cheaper to rebuild inline than to
 # cache: caching them buys no buffer reuse and may force conversion copies.
 const _NONALLOC_LAZY_CALLEES = (
     view, reshape, transpose, adjoint, vec, eachcol, eachrow, identity,
 )
 _nonalloc_is_lazy(f) = any(l -> l === f, _NONALLOC_LAZY_CALLEES)
+_nonalloc_is_lazy(::_BoundConstant) = true
 
 function _nonalloc_resolve_const(mod::Module, s::Symbol)
     isdefined(mod, s) || return nothing
     isconst(mod, s) || return nothing
     Some(getglobal(mod, s))
+end
+
+# Resolve a callee that is either a bare name or a module-qualified path
+# (`LogExpFunctions.logistic`, `A.B.f`). Every step must name a `const`
+# binding — the same rule bare names follow — and the owner of each path
+# segment must itself be a `const` module binding, so the emitted `GlobalRef`
+# always names the exact function the fused closure would call. Returns
+# `(function value, GlobalRef)` or `nothing`.
+function _nonalloc_resolve_function(mod::Module, callee)
+    if callee isa Symbol
+        r = _nonalloc_resolve_const(mod, callee)
+        r === nothing && return nothing
+        return (something(r), GlobalRef(mod, callee))
+    end
+    callee isa Expr && callee.head === :. && length(callee.args) == 2 &&
+        callee.args[2] isa QuoteNode || return nothing
+    owner = if callee.args[1] isa Symbol
+        r = _nonalloc_resolve_const(mod, callee.args[1])
+        if r === nothing
+            return nothing
+        end
+        something(r)
+    else
+        r = _nonalloc_resolve_function(mod, callee.args[1])
+        if r === nothing
+            return nothing
+        end
+        first(r)
+    end
+    owner isa Module || return nothing
+    name = callee.args[2].value
+    name isa Symbol && isdefined(owner, name) && isconst(owner, name) ||
+        return nothing
+    (getglobal(owner, name), GlobalRef(owner, name))
 end
 
 function _nonalloc_undotted(s::Symbol)
@@ -129,6 +229,7 @@ struct _FusedDecomposition
     ops::Vector{Any}
     caches::Vector{Any}
     offset::Int
+    cache_apply::Any
 end
 
 function _emit_step!(ctx::_FusedDecomposition, op, ::Type{T}, args...) where {T}
@@ -155,16 +256,46 @@ function _decompose(ctx::_FusedDecomposition, node, allow_lazy_broadcast::Bool)
     node isa Expr || return (node, typeof(node))
     if node.head === :call && !isempty(node.args)
         callee = node.args[1]
-        callee isa Symbol || return nothing
-        base = _nonalloc_undotted(callee)
+        callee isa Symbol || callee isa Expr || return nothing
+        callee isa Expr &&
+            _nonalloc_resolve_function(ctx.mod, callee) === nothing &&
+            return nothing
+        base = callee isa Symbol ? _nonalloc_undotted(callee) : nothing
         base === nothing ||
             return _decompose_broadcast(ctx, base, node.args[2:end],
                                         allow_lazy_broadcast)
         return _decompose_call(ctx, callee, node.args[2:end])
     end
+    # Postfix `'` parses as `Expr(:')` and `.'` as `Expr(:.')` — unary
+    # operator-expression heads, not `:call`s with an operator callee. Route
+    # them through the ordinary call path under their exact Base names.
+    (node.head === Symbol("'") || node.head === Symbol(".'")) &&
+        length(node.args) == 1 &&
+        return _decompose_call(ctx,
+            node.head === Symbol("'") ? :adjoint : :transpose,
+            Any[node.args[1]])
     node.head === :ref && length(node.args) >= 2 &&
         return _decompose_getindex(ctx, node.args[1], node.args[2:end])
+    node.head === :. && length(node.args) == 2 &&
+        return _decompose_dotcall(ctx, node.args[1], node.args[2],
+                                  allow_lazy_broadcast)
     nothing
+end
+
+# `f.(args)` parses as `Expr(:., f, Expr(:tuple, ...))` — unlike operator-dot
+# `a .+ b`, which is a `:call` with a dotted callee. Same broadcast
+# semantics, same treatment; `f` may be a bare name or a module-qualified
+# path. Anything else in dot position (field access into a non-module value,
+# a non-`const` binding) falls back safely.
+function _decompose_dotcall(ctx::_FusedDecomposition, func, tup,
+                             allow_lazy_broadcast::Bool)
+    tup isa Expr && tup.head === :tuple || return nothing
+    if func isa Symbol
+        return _decompose_broadcast(ctx, func, tup.args, allow_lazy_broadcast)
+    end
+    rf = _nonalloc_resolve_function(ctx.mod, func)
+    rf === nothing && return nothing
+    _decompose_broadcast(ctx, rf[1], rf[2], tup.args, allow_lazy_broadcast)
 end
 
 function _decompose_arguments(ctx::_FusedDecomposition, rawargs,
@@ -182,15 +313,75 @@ end
 
 function _decompose_call(ctx::_FusedDecomposition, callee::Symbol, rawargs)
     haskey(ctx.argmap, callee) && return nothing        # call through a port
-    resolved = _nonalloc_resolve_const(ctx.mod, callee)
-    resolved === nothing && return nothing
-    f = something(resolved)
+    rf = _nonalloc_resolve_function(ctx.mod, callee)
+    rf === nothing && return nothing
+    _decompose_call_resolved(ctx, callee, rf[1], rf[2], rawargs)
+end
+
+function _decompose_call(ctx::_FusedDecomposition, callee, rawargs)
+    rf = _nonalloc_resolve_function(ctx.mod, callee)
+    rf === nothing && return nothing
+    _decompose_call_resolved(ctx, callee, rf[1], rf[2], rawargs)
+end
+
+function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
+                                  rawargs)
+    if callee isa Symbol
+        haskey(ctx.argmap, callee) && return nothing
+    end
+    # Keyword calls: only the reduction family with a preparation-constant
+    # `dims` keyword leaves the whole-recipe fallback, via `_RowReduceStep`.
+    # Every other keyword shape (including port-valued `dims`) is outside the
+    # step grammar and keeps the fused closure, which applies the keywords
+    # with its original semantics.
+    kwargs = nothing
+    positional = rawargs
+    if !isempty(rawargs) && rawargs[1] isa Expr &&
+       rawargs[1].head === :parameters
+        kwargs = rawargs[1].args
+        positional = rawargs[2:end]
+        for kw in kwargs
+            kw isa Expr && kw.head === :kw && length(kw.args) == 2 &&
+                kw.args[1] === :dims || return nothing
+        end
+    end
+    if kwargs !== nothing
+        (f === Base.sum || f === Base.prod ||
+         f === Base.minimum || f === Base.maximum) &&
+            length(positional) == 1 || return nothing
+        dimsval = _nonalloc_dims_const(only(kwargs))
+        dimsval === nothing && return nothing
+        reduced = _decompose_singleton_reduction(ctx, positional[1])
+        reduced !== nothing && return reduced
+        decomposed = _decompose_arguments(ctx, positional, false)
+        decomposed === nothing && return nothing
+        args, types = decomposed
+        length(types) == 1 && types[1] isa Type || return nothing
+        D = something(dimsval)
+        T = _static_type(A -> f(A; dims = D), only(types))
+        T isa DataType && isconcretetype(T) && T <: AbstractArray ||
+            return nothing
+        return (_emit_step!(ctx, _RowReduceStep(f, D), T, args...), T)
+    end
+    rawargs = positional
+    if (f === Base.sum || f === Base.prod ||
+        f === Base.minimum || f === Base.maximum) && length(rawargs) == 1
+        reduced = _decompose_singleton_reduction(ctx, rawargs[1])
+        reduced !== nothing && return reduced
+    end
     decomposed = _decompose_arguments(ctx, rawargs, false)
     decomposed === nothing && return nothing
     args, types = decomposed
     T = _static_type(f, types...)
-    fref = GlobalRef(ctx.mod, callee)
     if (isconcretetype(T) && isbitstype(T)) || _nonalloc_is_lazy(f)
+        return (Expr(:call, fref, args...), T)
+    end
+    if T isa DataType && isconcretetype(T) && !ismutabletype(T)
+        # An immutable value owns no reusable buffer: a cache step would only
+        # store it back through the passthrough fallback, so emit the
+        # construction inline exactly as the fused closure would run it. This
+        # covers wrapper structs, tuples, and other immutable constructors;
+        # mutable results (arrays, refs, dicts) keep their cache steps below.
         return (Expr(:call, fref, args...), T)
     end
     T isa Type || return nothing
@@ -211,20 +402,101 @@ function _decompose_call(ctx::_FusedDecomposition, callee::Symbol, rawargs)
     # destination convention; without a guarded step, keep the whole-recipe
     # fallback rather than risking a stale destination on a shape change.
     (f === Base.:\ || f === Base.:/) && return nothing
+    # A call without a destination-passing method returns its own result,
+    # which may alias an argument: run it inline, never as a cache step.
+    _nonalloc_destination(ctx.cache_apply, f, T, types) ||
+        return (Expr(:call, fref, args...), T)
     (_emit_step!(ctx, f, T, args...), T)
+end
+
+# A preparation-constant reduction axis: an `Int`, `Colon`, or a tuple of
+# `Int`s written as a literal in the source. Anything computed (a port read,
+# a call) would freeze a preparation-time value into the step table and is
+# therefore outside the grammar.
+function _nonalloc_dims_const(kw)
+    kw isa Expr && kw.head === :kw && length(kw.args) == 2 || return nothing
+    v = kw.args[2]
+    v isa Int && return Some(v)
+    v === Colon() && return Some(Colon())
+    v isa Expr && v.head === :tuple && all(a -> a isa Integer, v.args) &&
+        return Some(Tuple(v.args))
+    nothing
+end
+
+# A scalar reduction (`sum`/`prod`/`minimum`/`maximum`) over a provably
+# single-element view is exactly that element — no summation algorithm runs, so
+# there is no rounding to preserve. Match `view(x, a:a, ...)` with every index
+# a syntactic `lo:lo` range over side-effect-free bounds (a Symbol or Number
+# used twice evaluates identically, and evaluates once in the rewritten form),
+# and only when the view call itself statically resolves to an array (so the
+# fused closure's `view` would have succeeded, with identical bounds behavior:
+# `a:a` in-bounds ⟺ `a` in-bounds). Anything else returns `nothing` and the
+# reduction decomposes normally. This is the packed-read spelling
+# `sum(view(unconstrained, i:i))` the query layer generates per scalar layout
+# entry, which otherwise boxes one view object per entry per call.
+function _decompose_singleton_reduction(ctx::_FusedDecomposition, raw)
+    raw isa Expr && raw.head === :call && length(raw.args) >= 3 || return nothing
+    vcallee = raw.args[1]
+    vcallee isa Symbol || return nothing
+    haskey(ctx.argmap, vcallee) && return nothing
+    vresolved = _nonalloc_resolve_const(ctx.mod, vcallee)
+    vresolved === nothing || something(vresolved) !== Base.view && return nothing
+    xraw = raw.args[2]
+    vidx = raw.args[3:end]
+    # Every index is a syntactic `lo:lo` range over provably idempotent bounds
+    # (a name or literal evaluates identically every time, and is evaluated
+    # once in the rewritten form).
+    for idx in vidx
+        idx isa Expr && idx.head === :call && length(idx.args) == 3 &&
+            idx.args[1] === Symbol(":") || return nothing
+        lo, hi = idx.args[2], idx.args[3]
+        lo == hi && lo isa Union{Symbol,Number} || return nothing
+    end
+    colonresolved = _nonalloc_resolve_const(ctx.mod, Symbol(":"))
+    colonresolved === nothing && return nothing
+    colonfn = something(colonresolved)
+    dx = _decompose(ctx, xraw, false)
+    dx === nothing && return nothing
+    dx[2] isa Type || return nothing
+    # The twin's range construction and `view` call must statically resolve to
+    # concrete range and array types: then the twin's `view` provably succeeds
+    # (with identical bounds behavior: `a:a` in-bounds ⟺ `a` in-bounds), the
+    # view holds exactly one element, and scalar `getindex` is that element.
+    trngs = Any[]
+    loexprs = Any[]
+    lotypes = Any[]
+    for idx in vidx
+        lo = idx.args[2]
+        dlo = _decompose(ctx, lo, false)
+        dlo === nothing && return nothing
+        push!(loexprs, dlo[1])
+        push!(lotypes, dlo[2])
+        trng = _static_type(colonfn, dlo[2], dlo[2])
+        trng isa DataType && trng <: AbstractRange || return nothing
+        push!(trngs, trng)
+    end
+    tview = _static_type(Base.view, dx[2], trngs...)
+    tview isa DataType && tview <: AbstractArray || return nothing
+    getexpr = Expr(:call, GlobalRef(Base, :getindex), dx[1], loexprs...)
+    T = _static_type(Base.getindex, dx[2], lotypes...)
+    (getexpr, T)
 end
 
 function _decompose_broadcast(ctx::_FusedDecomposition, base::Symbol, rawargs,
                               allow_lazy_broadcast::Bool)
     haskey(ctx.argmap, base) && return nothing
-    resolved = _nonalloc_resolve_const(ctx.mod, base)
-    resolved === nothing && return nothing
-    f = something(resolved)
+    rf = _nonalloc_resolve_function(ctx.mod, base)
+    rf === nothing && return nothing
+    _decompose_broadcast(ctx, rf[1], rf[2], rawargs, allow_lazy_broadcast)
+end
+
+function _decompose_broadcast(ctx::_FusedDecomposition, f, fref::GlobalRef,
+                              rawargs, allow_lazy_broadcast::Bool)
     decomposed = _decompose_arguments(ctx, rawargs, true)
     decomposed === nothing && return nothing
     args, types = decomposed
     bc = Expr(:call, GlobalRef(Base.Broadcast, :broadcasted),
-              GlobalRef(ctx.mod, base), args...)
+              fref, args...)
     BT = _static_type(Base.Broadcast.broadcasted, typeof(f), types...)
     allow_lazy_broadcast && return (bc, BT)
     T = _static_type(Base.Broadcast.materialize, BT)
@@ -247,14 +519,14 @@ function _decompose_getindex(ctx::_FusedDecomposition, xraw, idxraws)
     all(t -> t isa Type &&
              (t <: AbstractRange || t <: AbstractVector{<:Integer} ||
               t <: Colon), itypes) || return nothing
-    view_expr = Expr(:call, GlobalRef(Base, :view), dx[1], idxs...)
-    VT = _static_type(Base.view, dx[2], itypes...)
-    bc = Expr(:call, GlobalRef(Base.Broadcast, :broadcasted),
-              GlobalRef(Base, :identity), view_expr)
-    BT = _static_type(Base.Broadcast.broadcasted, typeof(identity), VT)
-    MT = _static_type(Base.Broadcast.materialize, BT)
-    MT isa Type || return nothing
-    (_emit_step!(ctx, _MaterializeStep(), MT, bc), MT)
+    # A dedicated gather step whose arguments are the array and the index
+    # values: one-dimensional vector gathers copy without constructing the
+    # intermediate view object (which otherwise escapes once per call), while
+    # every other shape takes the same view-plus-materialize computation the
+    # in-place layer applies below, so behavior never regresses.
+    GT = _static_type(Base.getindex, dx[2], itypes...)
+    GT isa Type || return nothing
+    (_emit_step!(ctx, _GatherStep(), GT, dx[1], idxs...), GT)
 end
 
 # Try to decompose one fused-source recipe statement. Returns
@@ -263,15 +535,17 @@ function _decompose_fused_recipe!(prog::_StepProgram, r::Recipe, callargs,
                                   input_types, lhs)
     op = r.op
     kernel_sourceop_form(op) === :fused || return nothing
-    fieldcount(typeof(op.f)) == 0 || return nothing     # capturing closure
-    argmap = Dict{Symbol,Any}()
-    argtypes = Dict{Symbol,Any}()
-    for (v, aexpr, at) in zip(r.inputs, callargs, input_types)
-        argmap[v.name] = aexpr
-        argtypes[v.name] = at
-    end
-    ctx = _FusedDecomposition(parentmodule(typeof(op.f)), argmap, argtypes,
-                              Any[], Any[], Any[], length(prog.ops))
+    source_f = _kernel_native_source(op.f)
+    fieldcount(typeof(source_f)) == 0 || return nothing # capturing closure
+    # The source reads its inputs by the closure's parameter names, not by the
+    # input values' names (`_lane_source_params`).
+    params = _lane_source_params(source_f, length(r.inputs))
+    params === nothing && return nothing
+    ctx = _FusedDecomposition(parentmodule(typeof(source_f)),
+                              _lane_source_arguments(params, callargs),
+                              _lane_source_arguments(params, input_types),
+                              Any[], Any[], Any[], length(prog.ops),
+                              prog.cache_apply)
     d = _decompose(ctx, r.source, false)
     d === nothing && return nothing
     append!(prog.ops, ctx.ops)
@@ -291,142 +565,306 @@ end
 function _plate_broadcast_rank(::Val{A}, argtypes) where {A}
     all(t -> t isa Type && isconcretetype(t), argtypes) || return nothing
     BT = _static_type(_authored_plate_broadcast, Val{A}, argtypes...)
-    BT <: Base.Broadcast.Broadcasted && isconcretetype(BT) || return nothing
-    axes_type = BT.parameters[2]
-    axes_type <: Tuple || return nothing
-    length(axes_type.parameters)
+    if BT <: Base.Broadcast.Broadcasted && isconcretetype(BT)
+        axes_type = BT.parameters[2]
+        axes_type <: Tuple && return length(axes_type.parameters)
+    end
+    # Wide tuples of operands can defeat inference of Broadcasted itself.
+    # Dense array, tuple and scalar types still prove Julia's result rank.
+    ranks = Int[]
+    for (i, T) in enumerate(argtypes)
+        (i in A || T <: Number) && continue
+        if T <: AbstractArray
+            push!(ranks, ndims(T))
+        elseif T <: Tuple
+            push!(ranks, 1)
+        else
+            return nothing
+        end
+    end
+    maximum(ranks; init=0)
 end
 
-# The cache slot and recorded result type use the inferred concrete element
-# type (`_authored_plate_result_eltype`) rather than the plan-level `Any` of an
-# unannotated body, so an untyped plate materializes a typed buffer here exactly
-# as the ordinary native lowering now does — no boxed `Vector{Any}`, and both
-# execution paths agree bit-for-bit on the materialized pointwise vector.
-function _plate_cache_slot(op::_AuthoredPlateOp{K,A}, argtypes) where {K,A}
-    T = _authored_plate_result_eltype(op, argtypes)
-    N = _plate_broadcast_rank(Val(A), argtypes)
-    N === nothing && return Ref{Array{T}}(Vector{T}())
-    Ref{Array{T,N}}(Array{T,N}(undef, ntuple(_ -> 0, N)...))
+# The recorded result type of an authored plate uses the inferred concrete
+# element type (`_authored_plate_result_eltype`) rather than the plan-level
+# `Any` of an unannotated body, as the ordinary native lowering does.
+_nested_plate_cache(op, argtypes, T, N) = nothing
+function _nonalloc_plan_result_types(kernel, argument_types)
+    p = kernel.plan
+    types = _nonalloc_value_types(p, argument_types)
+    Tuple(get(types, canon_id(p.graph, v.id), Any) for v in p.want)
+end
+# Static types of every value of `p`, keyed by canonical value id, from the
+# HAVE argument types.
+function _nonalloc_value_types(p::Plan, argument_types)
+    _plan_value_types(p, argument_types) do recipe, inputs
+        _recipe_output_types(recipe, _nonalloc_recipe_type(recipe.op, inputs,
+            length(recipe.outputs) == 1 ? valtype(only(recipe.outputs)) : Any))
+    end
+end
+_nonalloc_recipe_type(op, types, declared::Type = Any) = _static_type(op, types...)
+function _nonalloc_recipe_type(op::_AuthoredScanOp{K,A,I,H}, types,
+                               declared::Type = Any) where {K,A,I,H}
+    H && return _static_type(op, types...)
+    output = last(_nonalloc_plan_result_types(op.kernel,
+                                              _scan_step_argument_types(op, types)))
+    _scan_result_type(op, types, output)
+end
+_nonalloc_recipe_type(op::_AuthoredPlateOp, types, declared::Type = Any) =
+    _plate_result_type(op, types, declared)
+
+# A declared array output (`y::Vector{Float64} = plate(...)`) fixes the
+# element type and rank the native kernel's typed local converts the plate's
+# result to (`_declare_typed_output!`). Returns `(eltype, rank)`, either
+# `nothing` when the declaration leaves it open.
+function _declared_array_layout(::Type{D}) where {D}
+    D <: AbstractArray || return (nothing, nothing)
+    E = eltype(D)
+    rank = findfirst(n -> D <: AbstractArray{<:Any,n}, 0:16)
+    (isconcretetype(E) ? E : nothing, rank === nothing ? nothing : rank - 1)
 end
 
-function _plate_result_type(op::_AuthoredPlateOp{K,A}, argtypes) where {K,A}
+function _nonalloc_plate_eltype(op::_AuthoredPlateOp{K,A}, argtypes,
+                                declared::Type = Any) where {K,A}
     T = _authored_plate_result_eltype(op, argtypes)
+    E = first(_declared_array_layout(declared))
+    E === nothing || return E
+    isconcretetype(T) && return T
+    elements = [(i in A || argtypes[i] <: Number) ? argtypes[i] : eltype(argtypes[i])
+        for i in eachindex(argtypes)]
+    only(_nonalloc_plan_result_types(op.kernel, elements))
+end
+function _nonalloc_plate_rank(op::_AuthoredPlateOp{K,A}, argtypes,
+                              declared::Type) where {K,A}
     N = _plate_broadcast_rank(Val(A), argtypes)
+    N === nothing ? last(_declared_array_layout(declared)) : N
+end
+
+function _plate_result_type(op::_AuthoredPlateOp{K,A}, argtypes,
+                            declared::Type = Any) where {K,A}
+    T = _nonalloc_plate_eltype(op, argtypes, declared)
+    N = _nonalloc_plate_rank(op, argtypes, declared)
     N === nothing ? Array{T} : Array{T,N}
 end
 
-# --- statement-level program builder ----------------------------------------
+# --- program builder ---------------------------------------------------------
+
+# A plate whose cells return arrays stays one cache step: its slot
+# (`_nested_plate_cache`, the MutatingFunctions extension) reuses the cells'
+# arrays as well as the outer array, where the native plate lowering would
+# allocate every cell's array afresh. Wrapping the plate keeps the lowering
+# from inlining it; calling the wrapper is the plate's own call.
+struct _NonallocNestedPlate{P,S}
+    plate::P
+    slot::S
+end
+(op::_NonallocNestedPlate)(args...) = op.plate(args...)
+
+function _nonalloc_nested_plates(p::Plan, types::AbstractDict)
+    g = p.graph
+    changed = false
+    recipes = map(p.recipes) do r
+        r.op isa _AuthoredPlateOp && length(r.outputs) == 1 || return r
+        argtypes = Any[get(types, canon_id(g, v.id), Any) for v in r.inputs]
+        declared = valtype(only(r.outputs))
+        slot = _nested_plate_cache(r.op, argtypes,
+            _nonalloc_plate_eltype(r.op, argtypes, declared),
+            _nonalloc_plate_rank(r.op, argtypes, declared))
+        slot === nothing && return r
+        changed = true
+        Recipe(r.id, r.inputs, r.outputs, _NonallocNestedPlate(r.op, slot),
+               r.cost, r.cse_key, r.effectful, r.source)
+    end
+    changed || return p
+    producer = Dict(canon_id(g, v.id) => r for r in recipes for v in r.outputs)
+    Plan(g, p.have, p.want, recipes, producer, p.cost, p.candidates)
+end
+
+# A lane slot: the kernel-owned buffer of one materialized authored plate or
+# scan output, top-level dotted call or array slice (the `recycle` protocol of
+# `_lower_with_ops`, `_lane_reuse`/`_lane_keep!`). Its producer fills it in
+# place once it holds a buffer of the right element type and axes, and keeps
+# its first allocation otherwise. Its operation-table entry is never called.
+struct _NonallocLane end
+
+function _nonalloc_lanes(p::Plan, types::AbstractDict)
+    g = p.graph
+    have_ids = Set(canon_id(g, v.id) for v in p.have)
+    recycle = Pair{ValueId,Symbol}[]
+    for r in p.recipes
+        # An effect may retain the value it was given; its storage stays fresh.
+        length(r.outputs) == 1 && !r.effectful || continue
+        cid = canon_id(g, only(r.outputs).id)
+        cid in have_ids && continue
+        # A scalar slice `x[i]` is a value, not storage.
+        T = get(types, cid, Any)
+        T isa Type && isconcretetype(T) && isbitstype(T) && continue
+        get(p.producer, cid, nothing) === r || continue
+        any(pair -> first(pair) == cid, recycle) && continue
+        # Fused sources take the step rule instead: their decomposition also
+        # reuses the buffers of the calls inside a dotted expression.
+        r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} || continue
+        push!(recycle, cid => gensym(Symbol(only(r.outputs).name, :_lane)))
+    end
+    recycle
+end
 
 function _nonalloc_argument_types(types::Dict{Symbol,Any}, callargs)
     Any[a isa Symbol ? get(types, a, Any) :
         a isa Expr ? Any : typeof(a) for a in callargs]
 end
 
-function _nonalloc_rewrite_recipe!(newbody, prog::_StepProgram, r::Recipe,
-                                   types::Dict{Symbol,Any}, lhs, callargs)
+# One top-level statement of the native program. An operation call
+# `lhs = __ops__[i](callargs...)` takes the step rule; everything else (the
+# inlined plates, scans and cells, lane-filling sources, control flow) is kept.
+function _nonalloc_statement!(prog::_StepProgram, recipes::Tuple,
+                              types::Dict{Symbol,Any}, stmt)
+    stmt isa Expr && stmt.head === :(=) && stmt.args[1] isa Symbol &&
+        stmt.args[2] isa Expr && stmt.args[2].head === :call || return Any[stmt]
+    call = stmt.args[2]
+    i = _operation_slot(call.args[1])
+    i !== nothing && 1 <= i <= length(recipes) &&
+        length(recipes[i].outputs) == 1 || return Any[stmt]
+    _nonalloc_step!(prog, recipes[i], i, types, stmt.args[1],
+                    call.args[2:end], stmt)
+end
+
+# The step rule: fused captured sources decompose into destination-passing
+# steps where the grammar allows; isbits results and identity-preserving
+# wrappers are called directly; an operation whose result is fresh storage that
+# a destination-passing method fills (`_nonalloc_destination`) keeps a cache
+# slot at its own table index; every other operation is called directly.
+function _nonalloc_step!(prog::_StepProgram, r::Recipe, i::Int,
+                         types::Dict{Symbol,Any}, lhs::Symbol, callargs, stmt)
+    op = prog.ops[i]
+    if op isa _NonallocNestedPlate
+        prog.ops[i] = op.plate
+        prog.caches[i] = op.slot
+        return Any[Expr(:(=), lhs, _step_call(i, callargs...))]
+    end
     argtypes = _nonalloc_argument_types(types, callargs)
-    record!(T) = lhs isa Symbol && (types[lhs] = T)
-    op = r.op
-    if !r.effectful
-        if op isa _AuthoredPlateOp
-            j = _step!(prog, op, _plate_cache_slot(op, argtypes))
-            push!(newbody.args,
-                  Expr(:(=), lhs, _step_call(j, callargs...)))
-            record!(_plate_result_type(op, argtypes))
-            return
-        end
-        if op isa _KernelSourceOp
-            if !(r.source isa _NoKernelSource)
-                dec = _decompose_fused_recipe!(prog, r, callargs, argtypes, lhs)
-                if dec !== nothing
-                    append!(newbody.args, dec[1])
-                    record!(dec[2])
-                    return
-                end
-            end
-        else
-            # A bare identity operation: isbits results and identity-preserving
-            # wrappers need no cache at all.
-            T = _static_type(op, argtypes...)
-            if (isconcretetype(T) && isbitstype(T)) || _nonalloc_is_lazy(op)
-                j = _step!(prog, op, nothing)
-                push!(newbody.args, Expr(:(=), lhs, _plain_call(j, callargs...)))
-                record!(T)
-                return
-            end
-        end
-    end
-    # Whole-recipe cache step (the previous behavior). The slot is typed by the
-    # inferred result when concrete, so storing a lazy wrapper result never
-    # forces a `convert` copy into the declared port type.
     T = _static_type(op, argtypes...)
-    slot_type = T isa Type && isconcretetype(T) ? T : valtype(only(r.outputs))
-    j = _step!(prog, op, _nonalloc_slot(slot_type))
-    push!(newbody.args, Expr(:(=), lhs, _step_call(j, callargs...)))
-    record!(T isa Type && T !== Any ? T : valtype(only(r.outputs)))
-    nothing
-end
-
-# Safety net for statement shapes the builder does not model: every embedded
-# `__ops__[i](...)` call still becomes a whole-recipe cache step.
-function _nonalloc_rewrite_nested(prog::_StepProgram, p::Plan, node)
-    node isa Expr || return node
-    args = map(a -> _nonalloc_rewrite_nested(prog, p, a), node.args)
-    rewritten = Expr(node.head, args...)
-    if rewritten.head === :call && !isempty(rewritten.args)
-        slot = _operation_slot(rewritten.args[1])
-        if slot !== nothing && 1 <= slot <= length(p.recipes)
-            r = p.recipes[slot]
-            j = _step!(prog, r.op, _cache_slot(only(r.outputs)))
-            return _step_call(j, rewritten.args[2:end]...)
-        end
-    end
-    rewritten
-end
-
-"""
-    _nonallocating_program(p::Plan, ast::Expr) -> (ast, ops, caches)
-
-Rewrite the un-embedded lowering of `p` into the non-allocating step program:
-per-step operations and typed persistent caches, with fused captured sources
-decomposed into destination-passing steps where the grammar allows, and the
-previous whole-recipe cache step as the universal fallback.
-"""
-function _nonallocating_program(p::Plan, ast::Expr)
-    ast.head === :function ||
-        throw(ArgumentError("non-allocating preparation requires a function Expr"))
-    signature = ast.args[1]
-    signature isa Expr && signature.head === :tuple &&
-        !isempty(signature.args) && first(signature.args) === _OPS_ARG ||
-        throw(ArgumentError("non-allocating preparation requires the lowered __ops__ signature"))
-
-    prog = _StepProgram(Any[], Any[])
-    types = Dict{Symbol,Any}()
-    for (v, argexpr) in zip(p.have, signature.args[2:end])
-        name = argexpr isa Expr && argexpr.head === :(::) ?
-               argexpr.args[1] : argexpr
-        name isa Symbol && (types[name] = valtype(v))
-    end
-
-    body = ast.args[2]
-    newbody = Expr(:block)
-    for stmt in body.args
-        handled = false
-        if stmt isa Expr && stmt.head === :(=) && stmt.args[2] isa Expr &&
-           stmt.args[2].head === :call
-            call = stmt.args[2]
-            slot = _operation_slot(call.args[1])
-            if slot !== nothing && 1 <= slot <= length(p.recipes)
-                _nonalloc_rewrite_recipe!(newbody, prog, p.recipes[slot],
-                                          types, stmt.args[1],
-                                          call.args[2:end])
-                handled = true
+    if !r.effectful
+        if op isa _KernelSourceOp && !(r.source isa _NoKernelSource)
+            dec = _decompose_fused_recipe!(prog, r, callargs, argtypes, lhs)
+            if dec !== nothing
+                types[lhs] = dec[2]
+                return dec[1]
             end
         end
-        handled ||
-            push!(newbody.args, _nonalloc_rewrite_nested(prog, p, stmt))
+        isconcretetype(T) && isbitstype(T) && return Any[stmt]
+        !(op isa _KernelSourceOp) && _nonalloc_is_lazy(op) && return Any[stmt]
     end
-    args = Expr(:tuple, _OPS_ARG, _CACHES_ARG, _CACHE_APPLY_ARG,
-                signature.args[2:end]...)
-    (Expr(:function, args, newbody), Tuple(prog.ops), Tuple(prog.caches))
+    slot_type = T isa Type && isconcretetype(T) ? T : valtype(only(r.outputs))
+    slot = _nonalloc_destination(prog.cache_apply, op, slot_type, argtypes) ?
+           _nonalloc_slot(op, slot_type) : nothing
+    slot === nothing && return Any[stmt]
+    prog.caches[i] = slot
+    Any[Expr(:(=), lhs, _step_call(i, callargs...))]
+end
+
+function _nonalloc_mentions!(names::Set{Symbol}, node)
+    if node isa Symbol
+        push!(names, node)
+    elseif node isa Expr
+        foreach(arg -> _nonalloc_mentions!(names, arg), node.args)
+    end
+    names
+end
+
+# --- exemplar-typed preparation ---------------------------------------------
+# Cache slots and step selection are fixed at preparation from static types.
+# A HAVE port without a concrete declared type leaves everything computed from
+# it `Any`-typed, where the native kernel is specialized on the runtime
+# argument types instead. Exemplar arguments supply those runtime types: they
+# type the program exactly as the arguments of later calls will be typed.
+function _nonalloc_exemplar_types(p::Plan, exemplars::Tuple)
+    isempty(exemplars) && return nothing
+    length(exemplars) == length(p.have) || throw(ArgumentError(
+        "prepare_nonallocating received $(length(exemplars)) exemplar " *
+        "arguments for $(length(p.have)) HAVE ports " *
+        "($(join((v.name for v in p.have), ", "))); pass one value per " *
+        "positional HAVE port, in that order"))
+    map(Tuple(p.have), exemplars) do port, value
+        typeof(value) <: valtype(port) || throw(ArgumentError(
+            "the exemplar for HAVE port `$(port.name)` has type " *
+            "$(typeof(value)), which is not a $(valtype(port))"))
+        typeof(value)
+    end
+end
+
+# An exemplar-typed program only accepts arguments of the exemplars' types:
+# its cache slots are typed for them, so annotate the HAVE signature with them.
+function _nonalloc_exact_signature(ast::Expr, have_types::Tuple)
+    signature = ast.args[1]
+    ports = signature.args[4:end]
+    length(ports) == length(have_types) || throw(ArgumentError(
+        "non-allocating preparation produced $(length(ports)) HAVE arguments " *
+        "for $(length(have_types)) exemplar types"))
+    typed = map(ports, have_types) do port, T
+        name = port isa Expr && port.head === :(::) ? port.args[1] : port
+        Expr(:(::), name, T)
+    end
+    Expr(:function, Expr(:tuple, signature.args[1:3]..., typed...), ast.args[2])
+end
+
+"""
+    _nonallocating_program(p::Plan; have_types, cache_apply, passes) -> (ast, ops, caches)
+
+The non-allocating step program of `p`. It is the native program ordinary
+`prepare` compiles (`_lower_with_ops` over `_lowering_plan(p)`): plate chains
+compose, summed plates fold their totals, scans stream into the plates they
+feed, and plate cells compute the rows they read. Its remaining allocation
+sites are routed to kernel-owned storage:
+
+- each materialized authored plate or scan output, top-level dotted call or
+  array slice fills a lane slot that keeps its buffer across calls
+  (`_nonalloc_lanes`);
+- each other top-level operation call takes the step rule
+  (`_nonalloc_step!`);
+- a plate whose cells return arrays stays one cache step
+  (`_nonalloc_nested_plates`).
+
+The operation table is the native one, so every inlined `__ops__[i]`
+reference keeps its meaning; decomposition steps and lane slots are appended.
+"""
+function _nonallocating_program(p::Plan; have_types = nothing,
+                                cache_apply = nothing, passes = ())
+    lowered = _lowering_plan(p)
+    argument_types = have_types === nothing ?
+        map(valtype, Tuple(lowered.have)) : have_types
+    values = _nonalloc_value_types(lowered, argument_types)
+    lowered = _nonalloc_nested_plates(lowered, values)
+    recycle = _nonalloc_lanes(lowered, values)
+    # No typed local declarations: the program is host-only, and declaring
+    # `W::Matrix{Float64} = reshape(view(u, r), a, b)` would copy the lazy
+    # value into a fresh matrix on every call. Declared plate outputs still
+    # fix their buffers' element types.
+    ast, ops, recipes = _lower_with_ops(lowered; exemplar_types = have_types,
+                                        declare = false, recycle,
+                                        pushdowns = true,
+                                        plate_element_types = true)
+    isempty(passes) || (ast = transform(ast, passes...))
+    names = _varnames(lowered)
+    types = Dict{Symbol,Any}(names[cid] => T for (cid, T) in values
+                             if haskey(names, cid))
+    prog = _StepProgram(Any[ops...], Any[nothing for _ in ops], cache_apply)
+    body = Expr(:block)
+    for stmt in ast.args[2].args
+        append!(body.args, _nonalloc_statement!(prog, recipes, types, stmt))
+    end
+    # A value the native lowering never materializes (a summed plate, a scan
+    # streamed into its plate, a row computed in a cell) leaves its lane unused.
+    mentioned = _nonalloc_mentions!(Set{Symbol}(), body)
+    lanes = Any[]
+    for (_, lane) in recycle
+        lane in mentioned || continue
+        j = _step!(prog, _NonallocLane(), Ref{Any}(nothing))
+        push!(lanes, Expr(:(=), lane, Expr(:ref, _CACHES_ARG, j)))
+    end
+    prepend!(body.args, lanes)
+    ports = ast.args[1].args[2:1 + length(lowered.have)]
+    (Expr(:function, Expr(:tuple, _OPS_ARG, _CACHES_ARG, _CACHE_APPLY_ARG,
+                          ports...), body),
+     Tuple(prog.ops), Tuple(prog.caches))
 end

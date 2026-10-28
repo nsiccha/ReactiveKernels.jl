@@ -14,39 +14,104 @@ BRM–RK backend plan; the emitter→layer input contract lives in
 module ReactiveKernelsPPL
 
 using ReactiveKernels
+using ReactiveKernels: rk_expm_rule, rk_symmetric_eigvals_rule,
+    rk_symmetric_eigvecs_rule
+using ReactiveKernels: _history_generator_env, _history_interval,
+    _history_range_interval, _history_proves_earlier, _history_is_earlier,
+    _history_is_slice, _history_lag_form, _history_foreach_read,
+    _history_statement_reads, _history_has_reads, _history_fold_closure
+import DataAPI
+import SpecialFunctions
+using SpecialFunctions: erfc, loggamma
+using LogExpFunctions: logaddexp, log1pexp, logit
+using Statistics: mean, std, var
+using PrecompileTools: @setup_workload, @compile_workload
 
-export ColumnRef, ParamName
+export ColumnRef, ParamName, ColumnData
 export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
-    BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam
-export LinkFunction, IdentityLink, LogitLink, LogLink
-export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm
+    BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
+    BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
+    BinomialCloglogFam, BinomialProbFam, BetaLogitFam, BetaShapeFam, CategoricalLogitFam,
+    OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
+    MvNormalCholeskyFam, CensoredAddpropnormalFam, NormalIDGLMFam, BernoulliLogitGLMFam,
+    PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
+    ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
+    NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
+    GammaValueFam, WeibullValueFam, CauchyFam,
+    ZeroInflatedBinomialFam
+export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
+export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm,
+    ScanSummandTerm, MatrixTerm,
+    ComposedTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
-export PopulationPrior, SampledParameter, AssignmentSpec, VectorAssignmentSpec
+export ScalePredictorRef, MixtureComplementWeights
+export PopulationPrior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec, ArrayParameter
 export LevelMap
-export StructuralPlan
+export DesignMatrix
+export StructuralPlan, SubmodelScope
 export ContractValidationError, validate_plan, validate_structure, validate_data
 export topological_order, isbound, bind_data, COLUMN_ROLES
+export FrozenValues, frozen_values
 export admitted_families, admitted_terms, admitted_functions, admitted_elementwise
 export supports_term
 export block_name
 export build_kernel, kernel_expr
+export jax_source
+export model_view, RKPPLModelView
 export DesignShape, DesignBlock, design_shape, coefficient_priors
 export LayoutTable, LayoutEntry, assign_layout, coordinate_names
 export constrain, unconstrain, logjac, support_of
+export ordered_constrain, ordered_unconstrain, ordered_logjac
+export simplex_constrain, simplex_unconstrain, simplex_logjac
+export lkj_chol_constrain, lkj_chol_unconstrain, lkj_chol_logjac,
+    lkj_chol_constrain_hyperspherical, lkj_chol_unconstrain_hyperspherical,
+    lkj_chol_logjac_hyperspherical
+export lkj_logconst, lkj_corr_cholesky_logpdf
+export positive_bijector, unit_bijector, interval_bijector, floored_bijector,
+    upper_bijector, BIJECTORS
 export coordinate_read, block_read, transform_statements, jacobian_term
 export design_name, offset_name, design_recipe, offset_recipe
 export preprocessing_recipes
 export PPL_NODES, WORKFLOW_WANTS, workflow_wants
-export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
+export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!,
+    sampler_value_gradient_and_retained!
+export QueryAD, prepare_query_ad
+export prepare_cell_query, CellQuery, prepare_cell_sampler, CellSampler, cell_value_and_gradient!
+export prepare_compact_cell_sampler, CompactCellSampler
+export prepare_predictive, PredictiveQuery, PredictiveLaws, predictive_laws, predictive_draws!,
+    predictive_draws, predictive_node, predictive_targets
 export restore_draws
-export RKPPLModel, lower_rkppl, @rkppl, SurfaceLoweringError
+export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
+export RKPPLModel, RKPPLBoundModel, RKPPLSubmodel, lower_rkppl, condition, @rkppl, SurfaceLoweringError
+export ScanSpec, ScanStep, ScanSetup, parse_scan_block
+export rk_expm
+export rk_symmetric_eigvals, rk_symmetric_eigvecs
 
 include("contract.jl")
+include("structural_cache.jl")
+include("frozen.jl")
+include("sampling.jl")
+import ReactiveKernelsDistributionKernels: DistributionKernelSources
+# The general numerical callables and rule graphs are owned by RK proper;
+# existing PPL-qualified names import those same bindings for compatibility.
 include("design.jl")
+include("bijectors.jl")
+include("mv_slices.jl")
 include("layout.jl")
 include("preprocessing.jl")
 include("generator.jl")
+include("arrays.jl")
 include("query.jl")
+include("predictive.jl")
+include("jax.jl")
+include("display.jl")
+include("distribution_defaults.jl")
 include("surface.jl")
+include("scan.jl")
+include("cell_scan.jl")
+include("cell_latent.jl")
+include("observed_scan.jl")
+
+include("precompile.jl")
 
 end # module ReactiveKernelsPPL

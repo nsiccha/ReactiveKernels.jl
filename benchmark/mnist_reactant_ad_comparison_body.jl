@@ -331,6 +331,9 @@ function run_comparison()
             "reactant_version" => _package_version("Reactant"),
             "reactant_jll_version" => _package_version("Reactant_jll"),
             "enzyme_version" => _package_version("Enzyme"),
+            "enzyme_jll_version" => _package_version("Enzyme_jll"),
+            "gpucompiler_version" => _package_version("GPUCompiler"),
+            "llvm_version" => _package_version("LLVM"),
             "differentiationinterface_version" =>
                 _package_version("DifferentiationInterface"),
             "benchmarktools_version" => _package_version("BenchmarkTools"),

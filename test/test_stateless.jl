@@ -2,6 +2,37 @@
 using ReactiveKernels
 using Test
 
+@testset "extending restored graph identities" begin
+    RK = ReactiveKernels
+    # A package image keeps the identities another process allocated. Its
+    # numbers can be any this process will also count to; its namespace is its
+    # own, so a value made here never takes one of its identities.
+    imported = RK.ValueNamespace(rand(UInt))
+    for build in (identity, compose)
+        number = RK._VALUE_NAMESPACE[].count + 1
+        id = RK.ValueId(imported, number)
+        retained = Value{Float64}(id, :retained)
+        g = Graph(Dict(id => retained), Recipe[], Dict{RK.ValueId,Vector{Int}}(),
+                  Dict{RK.ValueId,RK.ValueId}(), 0)
+        extended = build(g)
+        fresh = value!(extended, :fresh, Float64)
+        @test fresh.id.number == number
+        @test fresh.id != id && fresh != retained
+        @test extended.values[id] === retained
+        @test length(extended.values) == 2
+        @test value(:standalone, Float64).id.number > fresh.id.number
+    end
+    # Identity is the namespace object, never an equal-looking copy of it.
+    @test RK.ValueId(RK.ValueNamespace(imported.key), 1) != RK.ValueId(imported, 1)
+    @test RK.ValueId(imported, 1) == RK.ValueId(imported, 1)
+    @test hash(RK.ValueId(imported, 1)) == hash(RK.ValueId(imported, 1))
+    # A deep copy refers to the same values: it keeps their namespace.
+    v = value(:copied, Float64)
+    table = Dict(v.id => [1], RK.ValueId(imported, 1) => [2])
+    @test deepcopy(v) == v && deepcopy(v).id.namespace === v.id.namespace
+    @test deepcopy(table) == table
+end
+
 # Positional operations deliberately have no global names in lowered code.
 # Inspect the Expr structurally so generated-code assertions prove exactly
 # which operation slots are called instead of searching for absent op names.

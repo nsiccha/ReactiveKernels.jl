@@ -45,8 +45,9 @@ Main.ReactiveKernelsDocs.execute_example(
 ```
 
 `quantile(p)` follows the explicit inverse edge `inv(standardized, z)`. The graph
-also contains both `log_scale = log(scale)` and `scale = exp(log_scale)`, so a
-caller may start from either representation. Explicit HAVE is authoritative:
+also contains both directions of `log_scale = log(scale)` — the reverse edge
+is provisioned automatically — so a caller may start from either
+representation. Explicit HAVE is authoritative:
 supplying `scale` derives `log_scale`, supplying `log_scale` derives `scale`, and
 supplying both recomputes and validates neither. The next panel prepares all
 three routes into the same `normal.logpdf` and asserts, during the build, that
@@ -87,8 +88,8 @@ fills `pointwise` and accumulates the total in that same traversal.
 
 Plate arguments use Julia broadcast semantics: scalars repeat, compatible array
 dimensions zip or expand, and incompatible shapes fail before endpoint
-execution. Wrap an array-valued atom in `Ref(x)` so the complete array is passed
-to each scalar body invocation.
+execution. A whole array that every scalar body invocation reads is not a plate
+argument: the cell closes over it.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -98,22 +99,24 @@ Main.ReactiveKernelsDocs.execute_example(
 
 The broadcast rules are worth making concrete. In the panel below one plate zips
 the observation vector with a per-observation location, repeats the scalar scale,
-and receives a whole vector atomically through `Ref`. The build checks the result
+and reads a whole vector by closing over it. The build checks the result
 against the equivalent hand-written broadcast:
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
-    @__MODULE__, Main.DistributionExamples.BROADCAST_REF_SOURCE,
+    @__MODULE__, Main.DistributionExamples.BROADCAST_CLOSURE_SOURCE,
 )
 ```
 
 Dependency-aware lowering also hoists complete invariants out of the broadcast
-loop. When `location` and `scale` are shared across the batch, the scale-only
-`log_scale` term is emitted once in the loop preamble, while the
+loop. When `location` and `scale` are declared scalars shared across the batch,
+the scale-only `log_scale` term is emitted once in the loop preamble, while the
 observation-dependent standardization stays in the loop at the shallowest
-boundary that binds it. The generated-kernel pane below is the exact plan built
-during this docs build; the source asserts the hoisted `log_scale` op precedes
-the loop:
+boundary that binds it. Through a port without a declared type, whose value can
+be a scalar or an axis, the term is still emitted once, inside the loop: it runs
+at the first coordinate when the value holds no axis and is reused after that.
+The generated-kernel pane below is the exact plan built during this docs build;
+the source asserts the hoisted `log_scale` op precedes the loop:
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -155,10 +158,25 @@ Main.ReactiveKernelsDocs.execute_example(
 `poisson` and `binomial` are the count families. `poisson.logpdf` accepts the
 rate or its log—the canonical log link—and `binomial.logpdf` accepts a fixed
 trial count `n` with either the success probability or its logit. Both guard the
-observation domain to `-Inf` with a branch-free `ifelse` and expose `logpdf` and
-`cdf`; neither exposes a `quantile`, because a discrete quantile needs an
+observation domain to `-Inf` with a lazy branch and expose `logpdf`, `cdf` and
+`ccdf`; neither exposes a `quantile`, because a discrete quantile needs an
 iterative search rather than a pure straight-line endpoint. The generic `plate`
 API lifts each `.logpdf` over independent counts without family-specific code.
+
+Their `logpdf` equals the sum of two further endpoints: `lognormalizer(y)`, the
+data-only term (the log binomial coefficient, or `-log(y!)`), and
+`logkernel(y)`, the terms that read the parameters. `zero_inflated_binomial` has
+the same pair. `zero_inflated_binomial_logit_zi(; n, logit, zi_logit)` accepts a
+zero-inflation logit directly and composes the existing Binomial graph with
+log-scale mixture weights. Its `logkernel`, `lognormalizer` and `logpdf`
+endpoints keep finite source logits through rounded probability tails. The
+ordinary `zero_inflated_binomial(; n, logit, zi)` accepts a probability,
+including exact `zi=0` and `zi=1` inputs. A plate of `lognormalizer` cells
+over bound counts and trials is a bind-time value, so a likelihood that sums
+`logkernel` cells and adds that
+plate evaluates no `loggamma` per call. Keep the two in separate plates:
+summing them inside one differentiated cell trips a released-Enzyme reverse
+compilation failure, which is also why `logpdf` is written out.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -171,6 +189,183 @@ Main.ReactiveKernelsDocs.execute_example(
     @__MODULE__, Main.DistributionExamples.BINOMIAL_SOURCE,
 )
 ```
+
+## One mixture component for a whole observed event
+
+`bernoulli_product_mixture_logdensity` and
+`binomial_product_mixture_logdensity` are function-shaped graph kernels in
+`ReactiveKernelsDistributionKernels.DistributionKernelSources`. Each accepts
+one observed vector, a probability matrix whose rows are observation
+positions and columns are components, and one weight per column. The Binomial
+version also accepts a trial-count matrix of the same shape. Each component
+adds its cell log densities first; the outer mixture then computes
+`logsumexp(log(weight[k]) + component_score[k])`. Thus one component governs
+the complete vector. The lower-level `product_mixture_logdensity(scores,
+weights)` performs the outer fold when component scores come from another
+family. All three are transparent RK kernels with data-sized loops. The
+weights' logs are taken once, before the weighting loop, so observed in a plate
+over events that share the weights they are computed once per call, not once
+per event, whether the probabilities are shared or vary by event. Weights that
+vary by event allocate those `K` logs once per event.
+
+```julia
+using ReactiveKernels
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    bernoulli_product_mixture_logdensity
+
+event = Bool[true, false, true]
+probabilities = [0.8 0.1; 0.2 0.7; 0.5 0.3]
+weights = [0.4, 0.6]
+loglik = prepare(bernoulli_product_mixture_logdensity)
+loglik(event, probabilities, weights)
+```
+
+A PPL model can pass one complete response vector to `LogDensity` with this
+kernel. An outer `@plate` may select several such vectors; each outer cell
+then has its own marginalized component, and the inner RK plates retain the
+positions within that event. The component scores stream through the outer
+`logsumexp` fold, so an event allocates no score vector, and an argument that
+does not vary by event (a shared probability matrix or weight vector written
+in the cell) is computed once, before the outer loop.
+
+`bernoulli_logit_product_mixture_logdensity(observed, logits, weights)` and
+`binomial_logit_product_mixture_logdensity(observed, trials, logits, weights)`
+take a log-odds matrix of the same shape instead of probabilities. Each cell
+reads the logit route of `bernoulli(; logit)` or `binomial(; n, logit)`, so a
+component defined on the logit scale stays in log space. Passing
+`logistic.(eta)` to the probability laws rounds the probability first: the
+absent outcome's `log1p(-p)` loses accuracy as `eta` grows and is `-Inf` from
+about `eta = 37`, where the exact log mass is `-eta`. A component that can
+never produce a success (a structural zero) has logit `-Inf`:
+
+```julia
+using ReactiveKernels
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    bernoulli_logit_product_mixture_logdensity
+
+event = Bool[true, false, true]
+logits = [0.5 -Inf; 40.0 -Inf; 2.0 -Inf]
+loglik = prepare(bernoulli_logit_product_mixture_logdensity)
+loglik(event, logits, [0.6, 0.4])
+```
+
+`zero_inflated_binomial_logit_product_mixture_logdensity(observed, trials,
+logits, zi_logits, weights)` gives each component zero-inflated Binomial
+cells. `logits[i, k]` is the success log-odds and `zi_logits[i, k]` the
+log-odds of a structural zero, both read through
+`zero_inflated_binomial_logit_zi(; n, logit, zi_logit)`, so neither
+probability is rounded. A data-augmented community occupancy model uses it
+for each species row: a member species occupies each site with occupancy
+log-odds `psi` (zero-inflation log-odds `-psi`) and is then detected with
+log-odds `theta` on each of `K` visits, while a non-member is never
+detected (success logit `-Inf`):
+
+```julia
+using ReactiveKernels
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    zero_inflated_binomial_logit_product_mixture_logdensity
+
+counts = [0, 3, 0, 1]                      # detections at four sites
+psi, theta, omega = 0.8, -0.4, 0.6         # occupancy, detection, membership
+loglik = prepare(zero_inflated_binomial_logit_product_mixture_logdensity)
+loglik(counts, fill(18, 4, 2), hcat(fill(theta, 4), fill(-Inf, 4)),
+    hcat(fill(-psi, 4), fill(-Inf, 4)), [omega, 1 - omega])
+```
+
+## Hidden Markov sequences
+
+`hmm_logdensity(log_emissions, transition, initial)` is the forward
+algorithm: the log density of one observed sequence, summed over every path of
+a hidden state that moves as a Markov chain. `log_emissions[t, k]` is step
+`t`'s emission log density under state `k`. `transition[i, j]` weighs a move
+from state `i` to state `j`, as a row-stochastic matrix; a
+`states × states × (steps - 1)` array gives the move into step `t` at index
+`t - 1`. `initial[k]` weighs the first state. Weights are used as given, so
+all-ones initial weights reproduce a forward pass that starts from the bare
+first emission, and singleton axes broadcast: a `states × 1 × (steps - 1)`
+array weighs each move by the previous state only.
+
+`normal_hmm_logdensity(observed, locations, scales, transition, initial)` and
+`exponential_hmm_logdensity(observed, scales, transition, initial)` compute
+the emissions with the Normal and Exponential families and pass them to
+`hmm_logdensity`. `observed` is a vector, or a `steps × streams` matrix whose
+streams are independent given the state. Emission parameters broadcast over
+`states × streams × steps`: a vector holds one value per state, a matrix one
+per state and stream, and a third axis lets a parameter change with the step.
+Exponential parameters are scales, as for `exponential`. Each scale's log is
+taken once per element, before the emission plate, and reaches the cells
+through the family object's `log_scale` port, so a per-state scale costs one
+log per state rather than one per step.
+
+```julia
+using ReactiveKernels
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    normal_hmm_logdensity
+
+y = [0.3, 2.9, 3.1, 0.2, -0.1]
+transition = [0.8 0.2; 0.3 0.7]
+loglik = prepare(normal_hmm_logdensity)
+loglik(y, [0.0, 3.0], [1.0, 0.5], transition, [0.5, 0.5])
+```
+
+Each law has a log-weights twin that takes both weights on the log scale:
+`hmm_log_weights_logdensity(log_emissions, log_transition, log_initial)`,
+`normal_hmm_log_weights_logdensity(observed, locations, scales, log_transition,
+log_initial)` and `exponential_hmm_log_weights_logdensity(observed, scales,
+log_transition, log_initial)`. Use a twin when the weights are defined on the
+log scale, as a per-step log-softmax is: no probability is formed, so the
+weights are neither rounded nor taken back to the log scale, and a weight
+below Float64's smallest positive number keeps its value. `-Inf` is a
+structural zero, and all-zero initial log weights start from the bare first
+emission. Each probability law is its twin at the logarithms of its weights.
+
+```julia
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    normal_hmm_log_weights_logdensity
+
+scores = [0.4 -1.3 2.2 0.1; 1.7 0.3 -0.6 -2.4]    # states × (steps - 1)
+log_moves = reshape(scores .- log.(sum(exp.(scores); dims = 1)), 2, 1, 4)
+loglik = prepare(normal_hmm_log_weights_logdensity)
+loglik(y, [0.0, 3.0], [1.0, 0.5], log_moves, log.([0.5, 0.5]))
+```
+
+Here the move into step `t` weighs the previous state `i` by
+`softmax(scores[:, t - 1])[i]`, whatever the destination.
+
+The pass is one `scan` with a `history` (see [the scan page](scan.md)) over the
+`(step, state)` cells: each cell reads the previous step's cells from the scan's
+own output, so no step allocates a carried vector, and the derivatives are
+ordinary Enzyme derivatives of these graphs, with no hand-written rule. A PPL
+model passes the whole sequence to `LogDensity` with one of these kernels. For
+another emission family, author a kernel that fills the `steps × states`
+log-emission matrix in a plate and returns `hmm_logdensity`, or
+`hmm_log_weights_logdensity` for log-scale weights.
+
+## Intrinsic CAR fields
+
+`icar_logdensity(phi, node1, node2)` is the unit-scale intrinsic conditional
+autoregressive (ICAR) log density of a node vector `phi` on an undirected graph
+whose edge `e` joins nodes `node1[e]` and `node2[e]`, each edge listed once:
+`-1/2 * sum((phi[node1] .- phi[node2]) .^ 2)`. It is the Gaussian Markov random
+field whose precision is the graph Laplacian. The law is improper, because
+adding a constant to every node of a connected component leaves it unchanged,
+so it has no normalizer. A model identifies the field with a sum-to-zero
+constraint or through its likelihood.
+
+```julia
+using ReactiveKernels
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    icar_logdensity
+
+phi = [0.3, -0.1, 0.7, 0.2]
+logprior = prepare(icar_logdensity)
+logprior(phi, [1, 1, 2, 3], [2, 3, 3, 4])
+```
+
+One plate runs over the edges, and each cell reads `phi` whole, so no gathered
+vector is built. The derivatives are ordinary Enzyme derivatives of this
+graph. In a PPL model, `phi[1:N] ~ ICAR(node1, node2)` declares the field with
+this prior.
 
 ## Positive-support and bounded families
 

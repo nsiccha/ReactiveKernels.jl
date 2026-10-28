@@ -1,37 +1,73 @@
 name = "ReactiveKernels"
 uuid = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.0"
+version = "0.1.6"
 
 [deps]
 DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
+InverseFunctions = "3587e190-3f89-42d0-90ee-14403ec27112"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 LogExpFunctions = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
+OutputSignatures = "86cfaae4-1704-4c69-ba62-d919d81ae5f8"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+Preferences = "21216c6a-2e73-6563-6e65-726566657250"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+ReactantCore = "a3311ec8-5e00-46d5-b541-4f83e724a433"
 RuntimeGeneratedFunctions = "7e49a35a-f44a-4d26-94aa-eba1b4ca6b47"
 
 [weakdeps]
+ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
+Enzyme_jll = "7cc45869-7501-5eee-bdea-0790c847d4ef"
 MutatingFunctions = "8a4c2d94-4b3b-4f9e-be63-a3c0cd816e3a"
+OrdinaryDiffEqBDF = "6ad6398a-0878-4a85-9266-38940aa047c8"
+OrdinaryDiffEqLowOrderRK = "1344f307-1e59-4825-a18e-ace9aa3fa4c6"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
+SciMLSensitivity = "1ed8b502-d754-442c-8d5d-10ac956f44a1"
+SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 
 [extensions]
+ReactiveKernelsBDFExt = ["OrdinaryDiffEqBDF", "SciMLBase", "SciMLSensitivity"]
+ReactiveKernelsChainRulesCoreExt = "ChainRulesCore"
+ReactiveKernelsEnzymeExt = "Enzyme"
+ReactiveKernelsLowOrderRKExt = ["OrdinaryDiffEqLowOrderRK", "SciMLBase", "SciMLSensitivity"]
 ReactiveKernelsMutatingFunctionsExt = "MutatingFunctions"
 ReactiveKernelsReactantExt = "Reactant"
+ReactiveKernelsSciMLODEExt = ["SciMLBase", "SciMLSensitivity"]
+ReactiveKernelsSpecialFunctionsExt = "SpecialFunctions"
+
+[sources]
+OutputSignatures = {url = "https://github.com/nsiccha/OutputSignatures.jl.git", rev = "d16c4efb72b963f45de9d6f632c38d46706c23e1"}
 
 [compat]
+ChainRulesCore = "1"
 DifferentiationInterface = "0.7"
 Distributions = "0.25"
 Enzyme = "0.13"
+Enzyme_jll = "0.0.0 - 0.0.301, 0.0.303 - 0.0"
+InverseFunctions = "0.1"
 LambertW = "1"
-LogExpFunctions = "0.3"
+LogExpFunctions = "0.3, 1.0.2"
+OutputSignatures = "0.1.5"
 MutatingFunctions = "0.1"
-Reactant = "0.2.284"
+OrdinaryDiffEqBDF = "2.4"
+OrdinaryDiffEqLowOrderRK = "2.2"
+PrecompileTools = "1.2"
+Preferences = "1"
+Reactant = "0.2.289"
+ReactantCore = "0.1"
 RuntimeGeneratedFunctions = "0.5"
+# Core does not use SciMLBase; current BDF and sensitivity weakdeps require 3.x.
+SciMLBase = "2.150, 3.46"
+SciMLSensitivity = "7.119"
+SpecialFunctions = "2"
 StableRNGs = "1"
 julia = "1.10"
 
 [extras]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
 Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 InteractiveUtils = "b77e0a4c-d291-57a0-90e8-8db25a27a240"
@@ -45,4 +81,4 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["BenchmarkTools", "Distributions", "Enzyme", "InteractiveUtils", "LambertW", "LinearAlgebra", "Pkg", "SHA", "StableRNGs", "Statistics", "TOML", "Test"]
+test = ["BenchmarkTools", "ChainRulesCore", "Distributions", "Enzyme", "InteractiveUtils", "LambertW", "LinearAlgebra", "Pkg", "SHA", "StableRNGs", "Statistics", "TOML", "Test"]

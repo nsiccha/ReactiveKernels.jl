@@ -71,7 +71,7 @@ struct ReactiveProgram{H,G,V,IN,OUT}
     values::V
     inputs::IN
     outputs::OUT
-    index::Dict{Int,Int}
+    index::Dict{ValueId,Int}
     dependents::Vector{Vector{Int}}
     sources::BitVector
     plan::Plan
@@ -92,7 +92,7 @@ mutable struct CompiledReactiveState{P,S}
     stack::Vector{Int}
 end
 
-function _owned_output(plan::Plan, recipe::Recipe, id::Int)
+function _owned_output(plan::Plan, recipe::Recipe, id::ValueId)
     any(value -> canon_id(plan.graph, value.id) == id, plan.have) && return false
     owner = get(plan.producer, id, nothing)
     owner !== nothing && owner.id == recipe.id
@@ -101,7 +101,7 @@ end
 function _state_values(plan::Plan)
     graph = plan.graph
     result = Value[]
-    seen = Set{Int}()
+    seen = Set{ValueId}()
     for value in plan.have
         id = canon_id(graph, value.id)
         id in seen && continue
@@ -146,7 +146,7 @@ end
 # `prepare_reactive` program, so that program's AST is byte-identical to before
 # this hook existed. For a slot in the set, the store site is routed through the
 # injected `__cache_apply__` helper (see `_ReactiveGetterInPlace`).
-function _ensure_expr(plan::Plan, index, recipe_index, id::Int,
+function _ensure_expr(plan::Plan, index, recipe_index, id::ValueId,
                       mutating_slots::Set{Int} = Set{Int}())
     graph = plan.graph
     slot_index = index[id]
@@ -234,7 +234,7 @@ function _ensure_expr(plan::Plan, index, recipe_index, id::Int,
     end
 end
 
-function _getter_ast(plan::Plan, index, recipe_index, id::Int;
+function _getter_ast(plan::Plan, index, recipe_index, id::ValueId;
                      in_place::Bool = false,
                      mutating_slots::Set{Int} = Set{Int}())
     slot_index = index[id]
@@ -247,7 +247,7 @@ function _getter_ast(plan::Plan, index, recipe_index, id::Int;
     Expr(:function, signature, body)
 end
 
-function _prepare_getter(plan::Plan, index, recipe_index, id::Int;
+function _prepare_getter(plan::Plan, index, recipe_index, id::ValueId;
                          cache_apply = nothing,
                          mutating_slots::Set{Int} = Set{Int}())
     in_place = cache_apply !== nothing
@@ -293,6 +293,15 @@ specific recipes in-place while sharing the same getter codegen.
 """
 _default_is_mutating(recipe::Recipe) = _mutable_like(valtype(only(recipe.outputs)))
 
+# Whether the injected `cache_apply` may be handed this recipe's slot value as
+# a destination. A hand-written hook owns that decision under its documented
+# contract. The MutatingFunctions extension narrows it to recipes whose seeded
+# value is fresh storage a destination-passing method fills: the slot is seeded
+# with the recipe's first result, which may alias caller data (a field read),
+# and `apply!!`'s generic fallback copies later results into it
+# (`_nonalloc_destination`).
+_reactive_inplace_destination(cache_apply, recipe::Recipe) = true
+
 # The slot indices whose single-output, owned producer recipe is selected for
 # in-place evaluation. Empty (so the AST is byte-identical to the pure program)
 # whenever no `cache_apply` was injected.
@@ -304,6 +313,7 @@ function _mutating_slots(plan::Plan, graph::Graph, index, cache_apply, is_mutati
         output_id = canon_id(graph, only(recipe.outputs).id)
         _owned_output(plan, recipe, output_id) || continue
         is_mutating(recipe) || continue
+        _reactive_inplace_destination(cache_apply, recipe) || continue
         push!(slots, index[output_id])
     end
     slots
@@ -325,7 +335,11 @@ their per-instance slot buffer in place through `MutatingFunctions.apply!!`
 instead of allocating a fresh recipe return on every recomputation.
 
 Selection is per recipe via `is_mutating(recipe)::Bool` (default: mutable/
-array-like outputs). The injected core hook is a single MF-agnostic callable
+array-like outputs). With the MutatingFunctions hook a selected recipe is
+reused in place only when a registered `apply!!` method fills its slot for its
+declared port types; any other recipe recomputes on the pure path, because its
+first result may alias caller data that the generic fallback would overwrite.
+The injected core hook is a single MF-agnostic callable
 `cache_apply(cache, op, args...) -> newcache`; `MutatingFunctions.apply!!`
 supplies it, and any conforming hand-written mutating op (including a
 non-MutatingFunctions one) fits the same codegen. **Contract on `cache_apply`:**
@@ -679,7 +693,7 @@ _handle_tuple(values::AbstractVector) = Tuple(values)
 
 "Checkpoint valid derived values for a later `program(...; frozen=cp)` instance."
 function checkpoint(state::CompiledReactiveState, values)
-    result = Dict{Int,Any}()
+    result = Dict{ValueId,Any}()
     for value in _handle_tuple(values)
         handle = value isa ReactiveValue ? value : statevalue(state, value)
         _check_handle(state, handle)

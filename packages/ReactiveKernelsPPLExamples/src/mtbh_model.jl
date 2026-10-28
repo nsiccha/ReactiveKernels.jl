@@ -86,10 +86,6 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
     (parameters, log_jacobian::Float64) =
         ((; omega, mean_p, gamma, sigma, eps_raw),
          jac_omega + jac_mean_p + jac_sigma)
-    (omega::Float64, mean_p::AbstractVector{Float64}, gamma::Float64,
-     sigma::Float64, eps_raw::AbstractVector{Float64}) =
-        (parameters.omega, parameters.mean_p, parameters.gamma,
-         parameters.sigma, parameters.eps_raw)
 
     # Proper priors: gamma ~ Normal(0, 10) (behavioural recapture),
     # eps_rawᵢ ~ Normal(0, 1) (random effect).

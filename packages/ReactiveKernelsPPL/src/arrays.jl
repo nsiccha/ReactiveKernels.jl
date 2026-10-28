@@ -1,0 +1,1906 @@
+# Declared array-valued parameters ([`ArrayParameter`](@ref)): validation,
+# bind-time sizing, the packed layout entries, and the in-graph value,
+# gather and prior statements.
+#
+# An array parameter is a VALUE the model reads by name, with standard
+# Julia semantics: `z` is an `AbstractVector{Float64}` (an
+# `AbstractMatrix{Float64}` for a two-axis declaration; a real-support array
+# is a read-only view of its packed coordinates), `L` is the lower-triangular
+# `Matrix{Float64}` Cholesky factor. Expressions over them are ordinary Julia (`z[1]`,
+# `L[2, 1]`, `sd .* z`, `B * w` with a bound data matrix
+# `B`). The one non-positional read is the level lookup: an axis declared
+# as `levels(g)` is indexed by the grouping column's VALUES, so `z[g]`
+# reads, for every observation, the element of `z` on that observation's
+# level (the established `c[levels(g)]` / `c[g]` meaning).
+
+# ── names ────────────────────────────────────────────────────────────
+
+_array_names(plan::StructuralPlan) = Symbol[p.name for p in plan.array_parameters]
+
+_is_array_param(plan::StructuralPlan, name) =
+    name isa Symbol && any(p -> p.name === name, plan.array_parameters)
+
+function _array_param(plan::StructuralPlan, name::Symbol)
+    i = findfirst(p -> p.name === name, plan.array_parameters)
+    i === nothing && throw(ContractValidationError(
+        "[arrays] $name is not an array parameter"))
+    return plan.array_parameters[i]
+end
+
+# Multivariate slice families (`mv_slices.jl`): family → (stem,
+# slices). `:rows` / `:cols` slice a two-axis array, `:vector` is a
+# one-axis array drawn once; simplex and ordered slices are two-axis only
+# (their one-vector forms are `phi ~ Dirichlet(alpha)`,
+# `c ~ Ordered(Normal(m, s), K)`), and an ICAR field is one vector only.
+const _MV_SLICE_FAMILIES = Dict{Symbol,Tuple{Symbol,Symbol}}(
+    Symbol(stem, :_, sl) => (stem, sl)
+    for (stem, sls) in ((:mvnormal_cholesky, (:rows, :cols, :vector)),
+        (:mvnormal, (:rows, :cols, :vector)), (:dirichlet, (:rows, :cols)),
+        (:ordered_normal, (:rows, :cols)), (:icar, (:vector,)))
+    for sl in sls)
+
+_is_slice_array(p::ArrayParameter) = haskey(_MV_SLICE_FAMILIES, p.family)
+_slice_stem(p::ArrayParameter) = _MV_SLICE_FAMILIES[p.family][1]
+_slice_kind(p::ArrayParameter) = _MV_SLICE_FAMILIES[p.family][2]
+
+_is_structured_array(p::ArrayParameter) =
+    p.family in (:lkj_cholesky, :lkj_cholesky_stack) || _is_slice_array(p)
+
+# The flat (column-major) packed vector an elementwise array constrains
+# into: the array's own name for one axis, a hygienic local reshaped into
+# the matrix for two.
+_array_flat_name(name::Symbol, ndims::Int) =
+    ndims == 1 ? name : Symbol(:_ppl_arrflat_, name)
+# The array whose flat block `name` is, or `nothing`.
+_array_flat_source(name::Symbol) = startswith(String(name), "_ppl_arrflat_") ?
+    Symbol(chopprefix(String(name), "_ppl_arrflat_")) : nothing
+
+# ── dims: forms and bind-time sizes ──────────────────────────────────
+
+_is_levels_dim(d) = d isa Expr && d.head === :call &&
+    length(d.args) in (2, 3) && d.args[1] in (:levels, :unique, :_ppl_axis_values) &&
+    d.args[2] isa Symbol && (length(d.args) == 2 || d.args[3] isa QuoteNode)
+_levels_subset(d) = length(d.args) == 2 ? Colon() : d.args[3].value
+# The level source `g` an axis enumerates whole: a label axis
+# (`levels(g)`, `unique(g)`, a data vector) or its positional twin
+# `length(levels(g)) - k`; `nothing` for any other dim. Both read `g` as one
+# pool of values, never one value per observation, so `g` may have any length.
+function _level_pool_source(d)
+    _is_levels_dim(d) && return d.args[2]
+    cnt = _levels_count(d)
+    return cnt === nothing ? nothing : first(cnt)
+end
+_is_axis_dim(d) = d isa Expr && d.head === :call && length(d.args) == 3 &&
+    (d.args[1] === :axes || d.args[1] === :size) && d.args[2] isa Symbol &&
+    (d.args[3] === 1 || d.args[3] === 2)
+_is_bound_extent_dim(d) = d isa Symbol ||
+    (d isa Expr && !_is_levels_dim(d) && !_is_axis_dim(d) &&
+        _levels_count(d) === nothing)
+
+function _validate_array_dim(p::ArrayParameter, d)
+    d isa Int && d >= 0 && return nothing
+    if _is_levels_dim(d)
+        _validate_subset_shape(LevelMap(p.name, d.args[2], [], :levels,
+            _levels_subset(d)))
+        return nothing
+    end
+    (_is_levels_dim(d) || _is_axis_dim(d) || _levels_count(d) !== nothing ||
+        _is_bound_extent_dim(d)) &&
+        return nothing
+    _fail(p.label, "array $(p.name) axis $(repr(d)) is not a size: axes " *
+          "are `1:K` with a nonnegative bound-data extent, " *
+          "`1:length(levels(g)) - k`, " *
+          "`levels(g)`, or `axes(M, d)` / `size(M, d)` of a matrix `M` " *
+          "(d = 1 or 2)")
+end
+
+# Distinct values of a `levels(g)` axis, in the `levels` order every other
+# `c[levels(g)]` declaration uses. `g` is a bound column: raw data or a
+# data definition `bind_data` evaluated (`gg = vcat(g1, g2)`). `name` /
+# `label` name the array value the axis belongs to (messages only).
+function _array_axis_levels(plan::StructuralPlan, name::Symbol, label,
+        g::Symbol)
+    haskey(plan.columns, g) || _fail(label, "array $name axis " *
+        "`levels($g)` needs the bound grouping column $g")
+    col = _vector_column(plan.columns, g, label, "`levels()` grouping column")
+    return _grouping_levels(col)
+end
+_array_axis_levels(plan::StructuralPlan, p::ArrayParameter, g::Symbol) =
+    _array_axis_levels(plan, p.name, p.label, g)
+
+function _array_axis_levels(plan::StructuralPlan, name::Symbol, label, d::Expr)
+    d.args[1] === :levels && return _array_axis_levels(plan, name, label, d.args[2])
+    g = d.args[2]
+    haskey(plan.columns, g) || _fail(label, "array $name axis needs bound data $g")
+    values = _vector_column(plan.columns, g, label, "array level values")
+    return d.args[1] === :unique ? unique(values) : collect(values)
+end
+
+function _array_dim_size(plan::StructuralPlan, name::Symbol, label, d;
+        active::Union{Set{Symbol},Nothing} = nothing)
+    d isa Int && return d
+    if _is_levels_dim(d)
+        levels = _array_axis_levels(plan, name, label, d)
+        return length(_apply_subset(levels,
+            LevelMap(name, d.args[2], [], :levels, _levels_subset(d))))
+    end
+    cnt = _levels_count(d)
+    if cnt !== nothing
+        g, k = cnt
+        n = length(_array_axis_levels(plan, name, label, g)) - k
+        n >= 0 || _fail(label, "array $name axis `1:$(repr(d))` has " *
+            "negative size $n on the bound data ($g has $(n + k) levels)")
+        return n
+    end
+    _is_bound_extent_dim(d) && return _sampling_extent(plan, d, name;
+        what = "array $name axis $(repr(d))")
+    fn, M, k = d.args[1], d.args[2], d.args[3]
+    m = _find_matrix(plan, M)
+    if m !== nothing
+        return k == 2 ? length(m.columns) : _value_rows(plan, M)
+    end
+    if !haskey(plan.columns, M)
+        # Sizing a declared axis needs the shape: a proved conflict in the
+        # definition of M is Julia's dimension error, not a missing matrix.
+        shape = _value_axes(plan, M, something(active, Set{Symbol}()); data_axes = true,
+            throw_conflicts = true)
+        # Julia supplies singleton dimensions beyond an array's rank.
+        shape === nothing || return k <= length(shape) ? shape[k] : 1
+    end
+    haskey(plan.columns, M) || _fail(label, "array $name axis " *
+        "`$fn($M, $k)` needs a bound matrix $M")
+    col = plan.columns[M]
+    col isa AbstractArray || _fail(label, "array $name axis " *
+        "`$fn($M, $k)` needs an array, got $(summary(col))")
+    return size(col, k)
+end
+
+_array_dim_size(plan::StructuralPlan, p::ArrayParameter, d; kwargs...) =
+    _array_dim_size(plan, p.name, p.label, d; kwargs...)
+
+"""Concrete axis lengths of an array parameter on a bound plan."""
+function _array_dims(plan::StructuralPlan, p::ArrayParameter)
+    p.family === :external && return Int[_sampling_extent(plan, d, p.name) for d in p.dims]
+    isbound(plan) || throw(ContractValidationError(
+        "[arrays] array $(p.name) sizes resolve on a bound plan only"))
+    return Int[_array_dim_size(plan, p, d) for d in p.dims]
+end
+
+# ── structure validation ─────────────────────────────────────────────
+
+# Julia's literal array syntax: a vector `[a, b]`, a matrix
+# `[a b; c d]` (`vcat` of `row`s), a one-row `[a b]` (`hcat`) and its
+# rows. Entries are values; the literal's shape is Julia's.
+_is_array_literal(a) = a isa Expr && a.head in (:vect, :vcat, :hcat, :row)
+
+# The statically known size of an array literal: a vector literal has one
+# entry per element, whatever they hold; a concatenation's size is known
+# when every entry is a number (`nothing` otherwise: entries that are
+# arrays concatenate by their own shapes, and Julia checks them).
+function _array_literal_size(a::Expr)
+    a.head === :vect && return (length(a.args),)
+    isrow(r) = r isa Expr && r.head === :row
+    all(x -> x isa Real, _array_literal_entries(a)) || return nothing
+    a.head in (:hcat, :row) && return (1, length(a.args))
+    all(isrow, a.args) || return any(isrow, a.args) ? nothing : (length(a.args),)
+    widths = unique!([length(r.args) for r in a.args])
+    return length(widths) == 1 ? (length(a.args), only(widths)) : nothing
+end
+
+# The entries of an array literal, row by row.
+_array_literal_entries(a::Expr) = Any[x for r in a.args
+    for x in (r isa Expr && r.head === :row ? r.args : (r,))]
+
+# The same literal with `Float64` element type (`Float64[a b; c d]`), so
+# integer entries promote at emission, as a literal vector's do.
+function _float64_array_literal(a::Expr)
+    a.head === :vect && return :(Float64[$(a.args...)])
+    a.head === :hcat && return Expr(:typed_hcat, :Float64, a.args...)
+    return Expr(:typed_vcat, :Float64, a.args...)
+end
+
+# Value-expression arguments of an elementwise prior (per element):
+# literals, names, literal arrays, or expressions over values.
+function _validate_array_arg(p::ArrayParameter, key::Symbol, a)
+    if a isa Real
+        isfinite(a) || _fail(p.label, "array $(p.name) prior $key must " *
+            "be finite, got $(repr(a))")
+        return nothing
+    end
+    a isa Symbol && return nothing
+    if _is_array_literal(a)
+        for x in a.args
+            _validate_array_arg(p, key, x)
+        end
+        return nothing
+    end
+    a isa Expr && return nothing
+    _fail(p.label, "array $(p.name) prior $key must be a literal, a " *
+          "name, a literal vector or an expression, got $(repr(a))")
+end
+
+function _validate_array_parameters(plan::StructuralPlan)
+    for p in plan.array_parameters
+        _check_name_hygiene(p.name)
+        if p.family === :external
+            _validate_external_parameter(plan, p)
+            continue
+        end
+        nd = length(p.dims)
+        stack = p.family === :lkj_cholesky_stack
+        (1 <= nd <= 2 || (stack && nd == 3)) || _fail(p.label,
+            "array $(p.name) has $nd axes (arrays have one or two; a " *
+            "per-level LKJ stack three)")
+        for d in p.dims
+            _validate_array_dim(p, d)
+        end
+        if stack
+            p.dims[1] isa Int && p.dims[1] >= 2 && p.dims[1] == p.dims[2] &&
+                _is_levels_dim(p.dims[3]) || _fail(p.label,
+                "per-level LKJCholesky factors $(p.name) have axes " *
+                "[K, K, levels(g)] with a literal K ≥ 2, got " *
+                "$(repr(p.dims))")
+            _validate_lkj_args(p)
+            eta = p.args.arg1
+            _validate_lkj_eta(p, eta)
+            p.support_override === nothing || _fail(p.label,
+                "per-level LKJCholesky factors $(p.name) carry no support " *
+                "override")
+        elseif p.family === :lkj_cholesky
+            nd == 2 && p.dims[1] == p.dims[2] || _fail(p.label,
+                "LKJCholesky factor $(p.name) is square (K×K), got axes " *
+                "$(repr(p.dims))")
+            _validate_lkj_args(p)
+            eta = p.args.arg1
+            _validate_lkj_eta(p, eta)
+            p.support_override === nothing || _fail(p.label,
+                "LKJCholesky factor $(p.name) carries no support override")
+        elseif _is_slice_array(p)
+            _validate_array_slices(plan, p)
+        else
+            haskey(SAMPLED_ARITY, p.family) || _fail(p.label,
+                "array $(p.name) family $(p.family) unknown (admitted: " *
+                "$(join(sort!(collect(keys(SAMPLED_ARITY))), ", ")), " *
+                "lkj_cholesky)")
+            want = ntuple(i -> Symbol(:arg, i), SAMPLED_ARITY[p.family])
+            Tuple(keys(p.args)) == want || _fail(p.label,
+                "array $(p.name) family $(p.family) takes positional keys " *
+                "$want, got $(Tuple(keys(p.args)))")
+            try
+                support_of(p.family, p.support_override)
+            catch err
+                err isa ContractValidationError || rethrow()
+                _fail(p.label, "array $(p.name): " * err.message)
+            end
+            for (k, a) in pairs(p.args)
+                _validate_array_arg(p, k, a)
+            end
+            if p.family === :uniform
+                lo, hi = p.args.arg1, p.args.arg2
+                all(x -> !(x isa Real) || isfinite(x), (lo, hi)) ||
+                    _fail(p.label, "array $(p.name): Uniform bounds must be finite")
+                if lo isa Real && hi isa Real
+                    lo < hi || _fail(p.label, "array $(p.name): " *
+                        "Uniform bounds need lo < hi")
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+_lkj_uplo(p::ArrayParameter) = get(p.args, :uplo, 'L')
+_is_lkj_stack(t::Symbol) = t in (:lkj_stack, :lkj_stack_upper)
+_is_upper_lkj(t::Symbol) = t in (:lkj_upper, :lkj_stack_upper)
+
+function _validate_lkj_args(p::ArrayParameter)
+    keys(p.args) in ((:arg1,), (:arg1, :uplo)) || _fail(p.label,
+        "LKJCholesky factor $(p.name) takes eta and optional uplo")
+    _lkj_uplo(p) in ('L', 'U') || _fail(p.label,
+        "LKJCholesky factor $(p.name): uplo is 'L' or 'U'")
+end
+
+function _validate_lkj_eta(p::ArrayParameter, eta)
+    eta isa Symbol && return nothing
+    eta isa Real && !(eta isa Bool) && isfinite(eta) && eta > 0 &&
+        return nothing
+    _fail(p.label, "LKJCholesky factor $(p.name): `eta` must be a " *
+        "positive scalar literal or a declared value, got $(repr(eta))")
+end
+
+# ── data validation ──────────────────────────────────────────────────
+
+function _validate_array_parameters_data(plan::StructuralPlan)
+    names = _all_name_set(plan)
+    known(n) = n in names || haskey(plan.columns, n)
+    # Whether every name the priors read is known: once per structure and
+    # column names. When one is not, the loop below names it.
+    reads_known = _structural(plan, (:array_prior_reads_known,)) do
+        all(p -> all(known, (n for a in values(p.args) for n in _expr_value_symbols(a))),
+            plan.array_parameters)
+    end
+    for p in plan.array_parameters
+        dims = _array_dims(plan, p)
+        p.family === :external && continue
+        all(>=(0), dims) || _fail(p.label, "array $(p.name) has a negative " *
+            "axis size (sizes $(repr(dims)))")
+        _is_structured_array(p) && !all(>=(1), dims) && _fail(p.label,
+            "structured array $(p.name) has an empty axis (sizes $(repr(dims)))")
+        if p.family in (:lkj_cholesky, :lkj_cholesky_stack)
+            dims[1] == dims[2] || _fail(p.label, "LKJCholesky factor " *
+                "$(p.name) is not square: $(repr(dims))")
+            eta = p.args.arg1
+            if eta isa Symbol
+                known(eta) || _fail(p.label, "LKJCholesky factor " *
+                    "$(p.name) references unknown eta $eta")
+                if haskey(plan.columns, eta)
+                    v = plan.columns[eta]
+                    v isa Real && !(v isa Bool) || _fail(p.label,
+                        "LKJCholesky factor $(p.name): eta $eta must be a scalar")
+                end
+            end
+            continue
+        end
+        if _is_slice_array(p)
+            _validate_array_slices_data(plan, p, dims)
+            continue
+        end
+        _is_structured_array(p) && continue
+        if !reads_known
+            for (key, arg) in pairs(p.args), name in _expr_value_symbols(arg)
+                known(name) || _fail(p.label,
+                    "array $(p.name) prior $key references unknown name $name")
+            end
+        end
+        for (k, a) in pairs(p.args)
+            n = _array_arg_size(plan, a)
+            n === nothing || n == Tuple(dims) || _fail(p.label,
+                _array_arg_mismatch(p.name, k, Tuple(dims), n))
+        end
+    end
+    return nothing
+end
+
+# Per-element arguments have the declared array's own shape (an argument
+# of a two-axis `B[a, b]` is a matrix of `B`'s size); shared ones are
+# numbers.
+_array_arg_mismatch(name, k, dims::Tuple{Int}, n) = "array $name has " *
+    "$(only(dims)) elements but its prior $k has " *
+    (length(n) == 1 ? "$(only(n))" : "size $n") * " (per-element " *
+    "arguments match the array; shared ones are scalars)"
+_array_arg_mismatch(name, k, dims::Tuple, n) = "array $name has size " *
+    "$dims but its prior $k has size $n (per-element arguments have the " *
+    "array's size, one value per element; shared ones are scalars)"
+
+# Statically known size of a per-element prior argument (`nothing` = a
+# number, or only known at run time, where the prior checks it).
+function _array_arg_size(plan::StructuralPlan, a)
+    _is_array_literal(a) && return _array_literal_size(a)
+    a isa Symbol || return nothing
+    _is_array_param(plan, a) &&
+        return Tuple(_array_dims(plan, _array_param(plan, a)))
+    _is_derived(plan, a) && return (_value_rows(plan, a),)
+    if haskey(plan.columns, a)
+        col = plan.columns[a]
+        col isa Real && return nothing
+        col isa AbstractArray || _fail(:plan, "prior argument $a is " *
+            "neither a number nor an array")
+        return size(col)
+    end
+    return nothing
+end
+
+# ── multivariate slices ──────────────────────────────────────────────
+
+# `zeros(K)` / `fill(a, K)`: a literal-length constant vector (`fill` is
+# the symmetric `Dirichlet(K, a)` concentration).
+_is_zeros_call(a) = a isa Expr && a.head === :call && length(a.args) == 2 &&
+    a.args[1] === :zeros && a.args[2] isa Int && a.args[2] >= 1
+_is_fill_call(a) = a isa Expr && a.head === :call && length(a.args) == 3 &&
+    a.args[1] === :fill && a.args[3] isa Int && a.args[3] >= 1
+
+# The family argument roles of each slice stem, in positional-key order:
+# `:vector` (a K-vector, shared or per slice), `:matrix` (a shared K×K
+# matrix), `:scalar` (a shared scalar), `:count` (the literal slice
+# length), `:edges` (an integer node vector of a graph's edge list, one
+# entry per edge, read whole).
+_slice_roles(::Val{:mvnormal_cholesky}) = (arg1 = :vector, arg2 = :matrix)
+_slice_roles(::Val{:mvnormal}) = (arg1 = :vector, arg2 = :matrix)
+_slice_roles(::Val{:dirichlet}) = (arg1 = :vector,)
+_slice_roles(::Val{:ordered_normal}) =
+    (arg1 = :scalar, arg2 = :scalar, arg3 = :count)
+_slice_roles(::Val{:icar}) = (arg1 = :edges, arg2 = :edges)
+_slice_roles(p::ArrayParameter) = _slice_roles(Val(_slice_stem(p)))
+
+_slice_noun(p::ArrayParameter) = _slice_kind(p) === :rows ? "rows" :
+    _slice_kind(p) === :cols ? "columns" : "draw"
+
+# A slice array's arguments are model-level values — literal vectors,
+# `zeros(K)` / `fill(a, K)`, array names or expressions over them, a
+# per-slice `eachrow(M)` / `eachcol(M)` of one — never per-observation
+# data or gathers.
+function _validate_array_slices(plan::StructuralPlan, p::ArrayParameter)
+    want = _slice_kind(p) === :vector ? 1 : 2
+    length(p.dims) == want || _fail(p.label, "array $(p.name) " *
+        "$(_slice_noun(p)) need $want axes, got $(length(p.dims))")
+    roles = _slice_roles(p)
+    keys(p.args) == keys(roles) || _fail(p.label, "array $(p.name) " *
+        "family $(p.family) takes keys $(keys(roles)), got " *
+        "$(Tuple(keys(p.args)))")
+    p.support_override === nothing || _fail(p.label, "array $(p.name) " *
+        "carries no support override")
+    for (k, a) in pairs(p.args)
+        role = roles[k]
+        if role === :count
+            a isa Int && a >= 1 || _fail(p.label, "array $(p.name): the " *
+                "slice length is a literal ≥ 1, got $(repr(a))")
+            continue
+        end
+        if role === :edges
+            # An edge list is data: a name or a data-only expression, or a
+            # literal vector of node indices. Binding checks its values.
+            if a isa Expr && a.head === :vect
+                all(x -> x isa Integer && !(x isa Bool) && x >= 1, a.args) ||
+                    _fail(p.label, "array $(p.name): an `ICAR` node vector " *
+                        "holds positive integer node indices, got $(repr(a))")
+                continue
+            end
+            a isa Symbol && a === p.name && _fail(p.label, "array " *
+                "$(p.name) cannot index its own ICAR edge list")
+            continue
+        end
+        if _is_slice_iterator(a)
+            role === :vector && _slice_kind(p) !== :vector || _fail(p.label,
+                "array $(p.name): argument $k is shared by every slice, " *
+                "got the per-slice $(repr(a))")
+            a = a.args[2]
+        end
+        if a isa Real || a isa Bool
+            role === :scalar && !(a isa Bool) && isfinite(a) ||
+                _fail(p.label, "array $(p.name): argument $k is a " *
+                    "$role, got the scalar $(repr(a))")
+            continue
+        end
+        if _is_zeros_call(a) || _is_fill_call(a)
+            role === :vector || _fail(p.label, "array $(p.name): " *
+                "argument $k is a $role, got the vector $(repr(a))")
+            _is_fill_call(a) && !(a.args[2] isa Real) &&
+                _collect_array_value_refs!(Symbol[], a.args[2], plan,
+                    p.label, isbound(plan))
+            continue
+        end
+        if a isa Expr && a.head === :vect
+            role === :vector || _fail(p.label, "array $(p.name): argument " *
+                "$k is a $role, got the vector $(repr(a))")
+            all(x -> x isa Real && !(x isa Bool) && isfinite(x), a.args) ||
+                _fail(p.label, "array $(p.name): a literal vector holds " *
+                    "finite numbers, got $(repr(a))")
+            continue
+        end
+        a isa Symbol && a === p.name && _fail(p.label, "array $(p.name) " *
+            "cannot parameterize its own prior")
+        _collect_array_value_refs!(Symbol[], a, plan, p.label,
+            isbound(plan))
+    end
+    if _slice_stem(p) === :dirichlet
+        alpha = p.args.arg1
+        _is_slice_iterator(alpha) && (alpha = alpha.args[2])
+        lits = _is_array_literal(alpha) ?
+            filter(x -> x isa Real, _array_literal_entries(alpha)) :
+            _is_fill_call(alpha) && alpha.args[2] isa Real ? [alpha.args[2]] :
+            Any[]
+        all(x -> x > 0, lits) || _fail(p.label, "array $(p.name): Dirichlet " *
+            "concentrations are positive, got $(repr(p.args.arg1))")
+    end
+    if _slice_stem(p) === :ordered_normal
+        sd = p.args.arg2
+        sd isa Real && !(sd > 0) && _fail(p.label, "array $(p.name): the " *
+            "`Normal` scale is positive, got $(repr(sd))")
+    end
+    return nothing
+end
+
+# Statically known size of a slice argument (`nothing` when only known
+# at run time): literal vectors, `zeros(K)` / `fill(a, K)`, declared
+# arrays, bound data values.
+function _slice_arg_size(plan::StructuralPlan, a)
+    _is_array_literal(a) && return _array_literal_size(a)
+    _is_zeros_call(a) && return (a.args[2],)
+    _is_fill_call(a) && return (a.args[3],)
+    _is_array_param(plan, a) &&
+        return Tuple(_array_dims(plan, _array_param(plan, a)))
+    a isa Symbol && haskey(plan.columns, a) && return size(plan.columns[a])
+    return nothing
+end
+
+# Statically known shapes must agree with the slices: slice length K,
+# slice count G (`eachrow`: dims = (G, K); `eachcol`: (K, G); a vector:
+# (K,), G = 1). A shared vector argument has size (K,), a per-slice
+# `eachrow(M)` (G, K) and `eachcol(M)` (K, G), a matrix (K, K), the
+# `Ordered` length K. Computed values are checked when the density runs.
+function _validate_array_slices_data(plan::StructuralPlan, p::ArrayParameter,
+        dims::Vector{Int})
+    kind = _slice_kind(p)
+    G, K = kind === :rows ? (dims[1], dims[2]) :
+        kind === :cols ? (dims[2], dims[1]) : (1, dims[1])
+    roles = _slice_roles(p)
+    _slice_stem(p) === :icar && return _validate_icar_edges(plan, p, K)
+    for (k, a) in pairs(p.args)
+        role = roles[k]
+        if role === :count
+            a == K || _fail(p.label, "array $(p.name) has $(_slice_noun(p)) " *
+                "of length $K, but `Ordered` declares length $a")
+            continue
+        end
+        role === :scalar && continue
+        want, b = if _is_slice_iterator(a)
+            (a.args[1] === :eachrow ? (G, K) : (K, G)), a.args[2]
+        else
+            (role === :vector ? (K,) : (K, K)), a
+        end
+        sz = _slice_arg_size(plan, b)
+        sz === nothing || sz == want || _fail(p.label, "array $(p.name) " *
+            "has $G slice(s) of length $K, so its argument $(repr(a)) has " *
+            "size $(repr(want)), but $(repr(b)) has size $(repr(sz))")
+    end
+    return nothing
+end
+
+# The edge list of `phi[1:N] ~ ICAR(node1, node2)` is bound data: two
+# integer vectors of one length whose entries are node indices of `phi`.
+# Data-only expressions evaluate here, as for any other data-only value.
+function _validate_icar_edges(plan::StructuralPlan, p::ArrayParameter, N::Int)
+    edges = map(values(p.args)) do a
+        v = a isa Expr && a.head === :vect ? Int[a.args...] :
+            _bound_data_value(plan, a, p.name, "the `ICAR` edge list")
+        v isa AbstractVector{<:Integer} && !(eltype(v) <: Bool) ||
+            _fail(p.label, "array $(p.name): an `ICAR` node vector is an " *
+                "integer vector, got $(repr(a)) = $(summary(v))")
+        bad = findfirst(i -> !(1 <= i <= N), v)
+        bad === nothing || _fail(p.label, "array $(p.name): `ICAR` node " *
+            "index $(v[bad]) (entry $bad of $(repr(a))) is not a node of " *
+            "$(p.name), which has $N")
+        v
+    end
+    length(edges[1]) == length(edges[2]) || _fail(p.label, "array " *
+        "$(p.name): the `ICAR` node vectors list one entry per edge, but " *
+        "$(repr(p.args.arg1)) has $(length(edges[1])) and " *
+        "$(repr(p.args.arg2)) has $(length(edges[2]))")
+    return nothing
+end
+
+# ── value expressions over arrays ────────────────────────────────────
+
+# True when `ex` constructs an array value or reads an array parameter,
+# directly or through assignments.
+# For indexed assignments, `opaque` also includes module results: a Julia
+# call may produce an array without reading a declared one.
+function _mentions_array(ex, plan::StructuralPlan,
+        seen::Set{Symbol} = Set{Symbol}(); opaque::Bool = false)
+    _is_bound_array_value_call(ex) && return true
+    opaque && _contains_module_call(ex) && !_is_bound_value_call(ex) && return true
+    if ex isa Symbol
+        _is_array_param(plan, ex) && return true
+        ex in seen && return false
+        push!(seen, ex)
+        i = findfirst(a -> a.name === ex, plan.assignments)
+        return i !== nothing &&
+            _mentions_array(plan.assignments[i].expr, plan, seen; opaque)
+    end
+    ex isa Expr || return false
+    ex.head === :vect && return true
+    _level_plate_axis(ex) === nothing || return true
+    return any(a -> _mentions_array(ex.head === :tuple ?
+        _tuple_field_value(a) : a, plan, seen; opaque), ex.args)
+end
+
+# An assignment computed from array parameters or module calls is a
+# Julia value too: readable by position, and per observation along an axis
+# its expression carries (`b = z * (sd .* L)'` keeps `z`'s `levels(g)`
+# rows, so `b[g, 1]` reads each observation's level).
+_is_array_assignment(plan::StructuralPlan, name) = name isa Symbol &&
+    _structural(plan, (:is_array_assignment, name); columns = :none) do
+        any(a -> a.name === name && _mentions_array(a.expr, plan; opaque=true),
+            plan.assignments)
+    end
+
+# ── axes of array values ─────────────────────────────────────────────
+
+# The axes of an array-valued expression, in the dim forms declarations
+# use (a literal `K`, `levels(g)`, `axes(M, d)`, ...). OutputSignatures owns
+# the numerical rules (broadcasting, products, adjoints, indexing,
+# reductions, concatenation), queried through RK's source adapter: a literal
+# size enters as a known extent, any other declared dimension as a named
+# `SymbolicAxis` that comes back in its declared form. PPL adds what its
+# declarations mean (`_declared_broadcast`) and which reads are per-
+# observation gathers. `Any[]` is a scalar; `nothing` means the shape is
+# unavailable (for example, an opaque module call). With bound data,
+# data_axes resolves declared dimensions to concrete lengths as well, without
+# evaluating any sampled value. A proved shape conflict reads as unavailable,
+# leaving Julia's own error to the evaluation, unless `throw_conflicts` asks
+# for it now (`DimensionMismatch`).
+_value_axes(plan::StructuralPlan, ex, seen::Set{Symbol} = Set{Symbol}();
+        data_axes::Bool = false, throw_conflicts::Bool = false) =
+    _declared_dims(_value_metadata(plan, ex, seen; data_axes, throw_conflicts))
+# A name's declared axes read the structure alone: once per structure.
+_value_axes(plan::StructuralPlan, ex::Symbol, seen::Set{Symbol} = Set{Symbol}();
+        data_axes::Bool = false, throw_conflicts::Bool = false) =
+    data_axes || !isempty(seen) ?
+        _declared_dims(_value_metadata(plan, ex, seen; data_axes, throw_conflicts)) :
+        _structural(plan, (:value_axes, ex, throw_conflicts); columns = :none) do
+            _declared_dims(_value_metadata(plan, ex, seen; data_axes, throw_conflicts))
+        end
+
+_metadata_axis(d::Int) = d >= 0 ? d : _OS.SymbolicAxis(d)
+_metadata_axis(::Nothing) = nothing
+_metadata_axis(d) = _OS.SymbolicAxis(d)
+_declared_dim(ax::Base.OneTo) = length(ax)
+_declared_dim(ax::_OS.SymbolicAxis) = ax.name
+_declared_dim(ax) = nothing
+# An OutputSignatures axis as an `array_info` dimension.
+_array_info_dim(ax::Base.OneTo) = length(ax)
+_array_info_dim(ax) = ax
+
+function _declared_dims(info::_OS.ValueInfo)
+    axs = _OS.value_axes(info)
+    axs === nothing && return nothing
+    dims = Any[_declared_dim(a) for a in axs]
+    return any(isnothing, dims) ? nothing : dims
+end
+
+# A sampled value of these dims: a Float64 scalar or a Base array view
+# (packed parameters are read through views).
+_sampled_metadata(dims) = isempty(dims) ? _OS.scalar_info(Float64) :
+    _OS.array_info(Float64, (_metadata_axis(d) for d in dims)...;
+        container_type = AbstractArray{Float64,length(dims)})
+
+# A call's result facts. A proved conflict has none; an unsupported call may
+# still know some (a broadcast's axes).
+function _metadata_result(r::_OS.CallInfo, ex, throw_conflicts::Bool)
+    r.status === :incompatible || return r.value
+    throw_conflicts && throw(DimensionMismatch("$(repr(ex)): $(r.reason)"))
+    return _OS.ValueInfo()
+end
+
+_source_call_metadata(ex::Expr, args; kwargs = Pair{Symbol,_OS.ValueInfo}[]) =
+    ReactiveKernels._call_metadata(ex, _OS.ValueInfo[args...], @__MODULE__, ();
+        kwargs)
+
+_position_metadata(i) = i === :(:) ? _OS.known_info(Colon()) :
+    i isa Int ? _OS.known_info(i) : _OS.scalar_info(Int)
+
+_is_dotted_operator_call(ex) = Meta.isexpr(ex, :call) && !isempty(ex.args) &&
+    ex.args[1] isa Symbol && ex.args[1] !== :. && startswith(String(ex.args[1]), ".")
+
+function _value_metadata(plan::StructuralPlan, ex, seen::Set{Symbol};
+        data_axes::Bool, throw_conflicts::Bool = false)
+    ex isa Number && return _OS.known_info(ex)
+    if _is_bound_value_call(ex)
+        # A caller's value: bound data supplies its type and shape.
+        input = ex.args[2]
+        data_axes && input isa Symbol && haskey(plan.columns, input) &&
+            return _OS.value_info(plan.columns[input])
+        return _is_bound_array_value_call(ex) ? _OS.ValueInfo() :
+            _OS.ValueInfo(; axes = ())
+    end
+    if ex isa Symbol
+        ex in seen && return _OS.ValueInfo()
+        data_axes && haskey(plan.columns, ex) &&
+            return _OS.value_info(plan.columns[ex])
+        if _is_array_param(plan, ex)
+            p = _array_param(plan, ex)
+            (data_axes && isbound(plan)) || return _sampled_metadata(p.dims)
+            push!(seen, ex)
+            r = p.family === :external ?
+                Any[_sampling_extent(plan, d, p.name) for d in p.dims] :
+                Any[_array_dim_size(plan, p, d; active = seen) for d in p.dims]
+            delete!(seen, ex)
+            return _sampled_metadata(r)
+        end
+        i = findfirst(v -> v.name === ex, plan.vector_parameters)
+        if i !== nothing
+            p = plan.vector_parameters[i]
+            sz = data_axes ? _resolve_vector_extent(p, plan, plan.columns,
+                plan.responses).size : p.size
+            data_axes && sz === nothing && p.family === :simplex_dirichlet &&
+                (sz = _dirichlet_size(plan, p.args.arg1, p.label))
+            return _sampled_metadata(Any[sz])
+        end
+        if data_axes
+            i = findfirst(p -> p.name === ex, plan.plate_parameters)
+            if i !== nothing
+                push!(seen, ex)
+                n = _plate_rows(plan, plan.plate_parameters[i]; active = seen)
+                delete!(seen, ex)
+                return _sampled_metadata(Any[n])
+            end
+            i = findfirst(s -> ex in s.states, plan.scans)
+            if i !== nothing
+                s = plan.scans[i]
+                # A trajectory owns its authored bound, not the row count
+                # of a response that happens to consume another value.
+                (s.hi isa Int || haskey(plan.columns, s.hi)) ||
+                    return _OS.ValueInfo()
+                return _sampled_metadata(Any[_scan_length(plan, s)])
+            end
+        end
+        any(p -> p.name === ex, plan.parameters) && return _OS.scalar_info(Float64)
+        d = _find_definition(plan, ex; derived = data_axes)
+        d === nothing && return _OS.ValueInfo()
+        push!(seen, ex)
+        r = _value_metadata(plan, d.expr, seen; data_axes,
+            throw_conflicts)
+        delete!(seen, ex)
+        return r
+    end
+    ex isa Expr || return _OS.ValueInfo()
+    levelaxis = _level_plate_axis(ex)
+    levelaxis === nothing || return _sampled_metadata(Any[:(levels($levelaxis))])
+    meta(a) = _value_metadata(plan, a, seen; data_axes, throw_conflicts)
+    anchor = _matrix_intercept_anchor(ex)
+    if anchor !== nothing
+        a = _declared_dims(meta(anchor))
+        a === nothing && return _OS.ValueInfo()
+        all(d -> d isa Int, a) && return _sampled_metadata(Any[prod(a; init = 1)])
+        length(a) == 1 && return _sampled_metadata(a)
+        return _OS.ValueInfo()
+    end
+    Meta.isexpr(ex, :tuple) && all(a -> a isa Int, ex.args) &&
+        return _OS.known_info(Tuple(ex.args))
+    # A vector literal keeps its outer axis even when its entries are live
+    # scalars. Matrix products contract that axis rather than broadcasting
+    # the matrix's columns into the observation domain.
+    entries = ex.head === :vect ? ex.args :
+        Meta.isexpr(ex, :call) && !isempty(ex.args) &&
+            ex.args[1] === GlobalRef(Base, :vect) &&
+            !any(a -> Meta.isexpr(a, :...), ex.args[2:end]) ? ex.args[2:end] :
+        nothing
+    entries === nothing ||
+        return _vector_literal_metadata(ex, map(meta, entries), throw_conflicts)
+    head = ex.head
+    head === Symbol("'") && return _metadata_result(
+        _OS.infer_call(adjoint, _OS.ValueInfo[meta(ex.args[1])]), ex, throw_conflicts)
+    if head === :.
+        _is_dotted_call(ex) || return _OS.ValueInfo()
+        args = map(meta, ex.args[2].args)
+        return _declared_broadcast(_source_call_metadata(ex, args), args, ex,
+            throw_conflicts)
+    end
+    head === :ref && return _ref_metadata(plan, ex, meta, throw_conflicts)
+    head === :call && !isempty(ex.args) || return _OS.ValueInfo()
+    args = _OS.ValueInfo[]
+    kwargs = Pair{Symbol,_OS.ValueInfo}[]
+    for a in ex.args[2:end], kw in (Meta.isexpr(a, :parameters) ? a.args : (a,))
+        if Meta.isexpr(kw, :kw, 2) && kw.args[1] isa Symbol
+            push!(kwargs, kw.args[1] => meta(kw.args[2]))
+        elseif kw isa Symbol && a !== kw
+            push!(kwargs, kw => meta(kw))  # `f(x; dims)` reads `dims`
+        else
+            push!(args, meta(kw))
+        end
+    end
+    r = _source_call_metadata(ex, args; kwargs)
+    return _is_dotted_operator_call(ex) ?
+        _declared_broadcast(r, args, ex, throw_conflicts) :
+        _metadata_result(r, ex, throw_conflicts)
+end
+
+# A vector literal of scalars is the vcat of its entries; entries that are
+# arrays make a vector of arrays, with only its outer axis known.
+function _vector_literal_metadata(ex, entries, throw_conflicts::Bool)
+    all(e -> _OS.value_rank(e) == 0, entries) && return _metadata_result(
+        _OS.infer_call(vcat, _OS.ValueInfo[entries...]), ex, throw_conflicts)
+    return _OS.ValueInfo(; type_bound = AbstractVector,
+        axes = (Base.OneTo(length(entries)),))
+end
+
+# `A[...]` reads literal positions or `:` (one per axis), or gathers per
+# observation (`a[g]`, `A[g, :]`, `A[:, g]`): the bound index column holds one
+# position per row, whatever its values (a level gather reads labels), and a
+# single index is linear.
+function _ref_metadata(plan::StructuralPlan, ex::Expr, meta, throw_conflicts::Bool)
+    base = meta(ex.args[1])
+    idx = ex.args[2:end]
+    if all(_is_position, idx)
+        _OS.value_rank(base) === length(idx) || return _OS.ValueInfo()
+        return _metadata_result(_OS.infer_call(getindex,
+            _OS.ValueInfo[base; map(_position_metadata, idx)]), ex, throw_conflicts)
+    end
+    _array_index_kind(plan, ex) === :gather || return _OS.ValueInfo()
+    k = _gather_index_axis(plan, ex)
+    rows = _OS.value_axes(meta(idx[k]))
+    rows === nothing && return _OS.ValueInfo()
+    length(idx) == 1 || _OS.value_rank(base) === length(idx) ||
+        return _OS.ValueInfo()
+    positions = _OS.array_info(Int, map(_array_info_dim, rows)...)
+    return _metadata_result(_OS.infer_call(getindex, _OS.ValueInfo[base;
+        [i == k ? positions : _position_metadata(idx[i]) for i in eachindex(idx)]]),
+        ex, throw_conflicts)
+end
+
+# PPL reads each declared dimension as an axis of its own, never a singleton
+# that a broadcast stretches. Where an operand carries one, the result keeps
+# it — a level axis first, so a level gather on the result stays possible —
+# even where lengths alone cannot prove which named (or literal) axis the
+# broadcast has.
+function _declared_broadcast(r::_OS.CallInfo, args, ex, throw_conflicts::Bool)
+    result = _metadata_result(r, ex, throw_conflicts)
+    rax = _OS.value_axes(result)
+    rax === nothing && return result
+    out = collect(Any, rax)
+    for i in eachindex(out)
+        named = _OS.SymbolicAxis[]
+        for a in args
+            axs = _OS.value_axes(a)
+            axs !== nothing && i <= length(axs) && axs[i] isa _OS.SymbolicAxis &&
+                push!(named, axs[i])
+        end
+        isempty(named) && continue
+        j = findfirst(a -> _is_levels_dim(a.name), named)
+        (j === nothing && out[i] !== nothing) && continue
+        out[i] = named[j === nothing ? 1 : j]
+    end
+    out == collect(Any, rax) && return result
+    r.status === :supported && return _OS.array_info(_OS.element_type(result),
+        map(_array_info_dim, out)...; container_type = _OS.type_bound(result))
+    return _OS.ValueInfo(; type_bound = _OS.type_bound(result),
+        element_type = _OS.element_type(result), axes = Tuple(out))
+end
+
+# The axes a per-observation read `A[g, ...]` gathers along: a declared
+# array's own, an array-valued definition's inferred ones (`nothing` when
+# `A` is neither, or its axes are not known).
+function _gather_axes(plan::StructuralPlan, base)
+    base isa Symbol || return nothing
+    _is_array_param(plan, base) && return Any[_array_param(plan, base).dims...]
+    _is_array_assignment(plan, base) && return _value_axes(plan, base)
+    return nothing
+end
+
+# Level lookup applies only to a read with one index per known axis.
+# A single index on a matrix is linear, and an opaque call's result has
+# no declared axis metadata: both use ordinary Julia positions.
+function _gather_axis(plan::StructuralPlan, ex::Expr)
+    axs = _gather_axes(plan, ex.args[1])
+    return axs !== nothing && !isempty(axs) &&
+        length(ex.args) - 1 == length(axs) ?
+            axs[_gather_index_axis(plan, ex)] : nothing
+end
+
+# A per-observation gather over either axis of a declared array or an
+# array-valued definition.
+_is_gather_ref(plan::StructuralPlan, ex) =
+    ex isa Expr && ex.head === :ref && ex.args[1] isa Symbol &&
+    (_is_array_param(plan, ex.args[1]) ||
+        _is_array_assignment(plan, ex.args[1])) &&
+    _array_index_kind(plan, ex) === :gather
+
+# `end` / `begin` in an index, alone or in integer arithmetic (`end - 1`),
+# is one literal position of the indexed array, as in Julia. The parser
+# produces these symbols only inside an index, so they are never names.
+# RK lowers them to `lastindex` / `firstindex` of the array they index.
+_is_endpoint(i) = i === :end || i === :begin
+
+const _ENDPOINT_OPS = (:+, :-, :*, :÷)
+
+function _is_endpoint_position(i)
+    _is_endpoint(i) && return true
+    Meta.isexpr(i, :call) && length(i.args) >= 2 &&
+        i.args[1] in _ENDPOINT_OPS || return false
+    args = i.args[2:end]
+    return all(a -> a isa Int || _is_endpoint_position(a), args) &&
+        any(_is_endpoint_position, args)
+end
+
+# The position an endpoint index denotes on an axis `first:last`.
+_endpoint_value(i::Int, first::Int, last::Int) = i
+_endpoint_value(i::Symbol, first::Int, last::Int) =
+    i === :end ? last : i === :begin ? first :
+    throw(ArgumentError("not an index endpoint: $i"))
+_endpoint_value(i::Expr, first::Int, last::Int) =
+    getfield(Base, i.args[1])(
+        (_endpoint_value(a, first, last) for a in i.args[2:end])...)
+
+# A literal position of one element.
+_is_scalar_position(i) = (i isa Int && i >= 1) || _is_endpoint_position(i)
+
+# A literal position or a whole axis.
+_is_position(i) = _is_scalar_position(i) || i === :(:)
+
+# A per-observation index: a column name (data or derived), including a
+# definition computed from data only (`i = positions(g)`), which binding
+# evaluates into a column.
+_is_row_index(plan::StructuralPlan, i) =
+    i isa Symbol && i !== :(:) && !_is_endpoint(i) &&
+    _structural(plan, (:is_row_index, i); columns = :none) do
+        !_is_array_param(plan, i) &&
+            (!(i in _union_name_set(plan)) || _is_data_only_assignment(plan, i))
+    end
+_is_data_only_assignment(plan::StructuralPlan, i::Symbol) =
+    any(a -> a.name === i, plan.assignments) &&
+    _reads_data_only(plan, i, _all_name_set(plan), Set{Symbol}())
+# In a model-level definition, a gather by a data index is ordinary Julia
+# indexing with a model-level result, so naming the definition never
+# changes its legality.
+_model_level_gather(plan::StructuralPlan, g) = g isa Symbol &&
+    _reads_data_only(plan, g, _all_name_set(plan), Set{Symbol}())
+
+# Index forms of `A[...]` over an array parameter `A`:
+# `:scalar` (every index a literal Int), `:slice` (literal Ints and `:`),
+# `:gather` (one index a data column — one value per observation,
+# the rest literal positions or `:`), or `:invalid`.
+_gather_index_axis(plan::StructuralPlan, ex::Expr) =
+    findfirst(i -> _is_row_index(plan, i), ex.args[2:end])
+
+function _array_index_kind(plan::StructuralPlan, ex::Expr)
+    idx = ex.args[2:end]
+    isempty(idx) && return :invalid
+    all(_is_scalar_position, idx) && return :scalar
+    all(_is_position, idx) && return :slice
+    count(i -> _is_row_index(plan, i), idx) == 1 &&
+        all(i -> _is_position(i) || _is_row_index(plan, i), idx) &&
+        return :gather
+    return :invalid
+end
+
+# Validate one `A[...]` read and record its references. `allow_gather`:
+# only per-observation (derived-column) expressions may gather.
+function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
+        bound::Bool; allow_gather::Bool)
+    base = ex.args[1]
+    if _is_array_assignment(plan, base)
+        idx = ex.args[2:end]
+        if !isempty(idx) && all(_is_position, idx)
+            push!(refs, base)
+            return true
+        end
+        _array_index_kind(plan, ex) === :gather || _fail(label,
+            "`$(repr(ex))` reads the array value $base by literal " *
+            "positions or `:` (`$base[1]`, `$base[:, 1]`) or, in a " *
+            "per-observation expression, by one data column " *
+            "(`$base[g]`, `$base[g, 1]`)")
+        g = ex.args[1 + _gather_index_axis(plan, ex)]
+        allow_gather || _model_level_gather(plan, g) || _fail(label,
+            "`$(repr(ex))` gathers per observation — write it in a vector " *
+            "(per-observation) definition, not a scalar one")
+        axs = _value_axes(plan, base)
+        axs === nothing || length(idx) == 1 ||
+            length(idx) == length(axs) || _fail(label, "`$(repr(ex))` " *
+            "gathers from the $(length(axs))-axis array value $base with " *
+            "$(length(idx)) indices. Give one index per axis or one " *
+            "linear index")
+        _reads_data_only(plan, g, _all_name_set(plan), Set{Symbol}()) ||
+            _fail(label, "`$(repr(ex))` gather index $g must be data")
+        push!(refs, base)
+        if bound
+            d = _gather_axis(plan, ex)
+            _data_check(plan) do plan
+                if d === nothing
+                    # An opaque result can depend on parameter values; its
+                    # size is checked by Julia indexing at evaluation time.
+                    K = axs === nothing ? nothing : prod(
+                        _array_dim_size(plan, base, label, a) for a in axs)
+                    _validate_positional_gather(plan, base, label, g, K)
+                else
+                    _validate_gather_axis(plan, base, label, d, g)
+                end
+            end
+        end
+        return true
+    end
+    _is_array_param(plan, base) || return false
+    p = _array_param(plan, base)
+    kind = _array_index_kind(plan, ex)
+    kind === :invalid && _fail(label, "indexing `$(repr(ex))` reads array " *
+        "$(base) by literal positions (`$(base)[1]`, `$(base)[2, 1]`, " *
+        "`$(base)[:, 1]`) or, in a per-observation expression, by one " *
+        "data column (`$(base)[g]`)")
+    kind === :gather && !allow_gather &&
+        !_model_level_gather(plan, ex.args[1 + _gather_index_axis(plan, ex)]) &&
+        _fail(label, "`$(repr(ex))` gathers per observation — write it in " *
+            "a vector (per-observation) definition, not a scalar one")
+    push!(refs, base)
+    if kind === :gather
+        length(ex.args) - 1 == length(p.dims) || _fail(label,
+            "`$(repr(ex))` gathers from the $(length(p.dims))-axis array " *
+            "$(base) with $(length(ex.args) - 1) indices (one per axis)")
+        p.family === :lkj_cholesky && _fail(label,
+            "`$(repr(ex))` gathers from the LKJCholesky factor $(base)")
+        axis = _gather_index_axis(plan, ex)
+        g = ex.args[1 + axis]
+        _reads_data_only(plan, g, _all_name_set(plan), Set{Symbol}()) ||
+            _fail(label, "`$(repr(ex))` gather index $g must be data")
+        bound && _data_check(plan) do plan
+            _validate_gather_axis(plan, p.name, label, p.dims[axis], g)
+        end
+    elseif bound
+        _data_check(plan) do plan
+            dims = _array_dims(plan, p)
+            idx = ex.args[2:end]
+            inbounds(i, d) = !_is_scalar_position(i) ||
+                1 <= _endpoint_value(i, 1, d) <= d
+            if length(idx) == length(dims)
+                for (i, d) in zip(idx, dims)
+                    inbounds(i, d) || _fail(label, "`$(repr(ex))` is out of " *
+                        "bounds: $(base) has size $(repr(Tuple(dims)))")
+                end
+            elseif !(length(idx) == 1 && _is_scalar_position(idx[1]) &&
+                    inbounds(idx[1], prod(dims)))
+                _fail(label, "`$(repr(ex))` indexes $(length(idx)) axes of the " *
+                    "$(length(dims))-axis array $(base)")
+            end
+        end
+    end
+    return true
+end
+
+# A gather at bind, along the indexed axis `d` of the array value
+# `name`: a `levels(h)` axis needs every value of `g` on that axis; an
+# integer axis (`1:K`, `axes(M, d)`) needs integer `g` in range — plain
+# Julia indexing.
+function _validate_gather_axis(plan::StructuralPlan, name::Symbol, label,
+        d, g::Symbol)
+    _is_levels_dim(d) || return _validate_positional_gather(plan, name,
+        label, g, _array_dim_size(plan, name, label, d))
+    col = _gather_index_column(plan, name, label, g)
+    return _validate_level_gather(plan, name, label, d, g, col)
+end
+
+# A `levels(h)` / `unique(h)` / data-vector axis is keyed by its labels:
+# a gather looks each index value up among them. Integer positions on a
+# label axis are a different reading, so the refusal names the positional
+# declaration of the same extent (`1:length(levels(h))`).
+function _validate_level_gather(plan::StructuralPlan, name::Symbol, label,
+        d, g::Symbol, col::AbstractVector)
+    lv = _array_axis_levels(plan, name, label, d)
+    codes = _declared_codes(col, lv)
+    i = findfirst(==(0), codes)
+    i === nothing && return nothing
+    axis = d.args[1] === :_ppl_axis_values ? string(d.args[2]) :
+        string(d.args[1], "(", d.args[2], ")")
+    positions = d.args[1] === :levels && length(d.args) == 2 &&
+        eltype(col) <: Integer && !(eltype(col) <: Bool) &&
+        all(c -> 1 <= c <= length(lv), col)
+    _fail(label, "gather index $g of $name looks its values up among " *
+        "the labels of the axis `$axis` of $name, but $g holds " *
+        "$(repr(col[i])), which is not a label on that axis" *
+        (positions ? ". $g holds positions 1:$(length(lv)): to gather " *
+            "by position, declare that axis `1:length($axis)` instead " *
+            "of `$axis`" : ""))
+end
+
+function _gather_index_column(plan::StructuralPlan, name::Symbol, label,
+        g::Symbol)
+    haskey(plan.columns, g) || _fail(label, "array $name is read by " *
+        "`$name[$g]`, but $g is not a bound column")
+    return _vector_column(plan.columns, g, label, "gather index")
+end
+
+function _validate_positional_gather(plan::StructuralPlan, name::Symbol,
+        label, g::Symbol, K::Union{Int,Nothing})
+    col = _gather_index_column(plan, name, label, g)
+    _holds_integers(col) || _fail(label,
+        "`$name[$g]` indexes $name by position, but $g does not hold " *
+        "integers — declare an axis `levels($g)` to look values up by level")
+    _within_positions(col, K) || _fail(label,
+        "`$name[$g]`: $g holds indices outside " *
+        (K === nothing ? "the positive integers" : "1:$K"))
+    return nothing
+end
+
+# Function barriers: one dispatch on the column's type, not one per test.
+_holds_integers(col::AbstractArray{T}) where {T} = T <: Integer && T !== Bool
+_within_positions(col::AbstractArray, K::Union{Int,Nothing}) =
+    all(i -> i >= 1 && (K === nothing || i <= K), col)
+
+# Array-valued expressions (`sd .* z`, `L[:, 1]`, `phi[1] * 2`): every
+# leaf is a literal, a scalar name or an array parameter (never a
+# per-observation column); dotted and undotted arithmetic, the scalar
+# math allowlist (dotted or not), reductions over an array, indexing and
+# adjoints admitted. Records references.
+function _collect_array_value_refs!(refs, ex, plan::StructuralPlan, label,
+        bound::Bool)
+    ex isa Number && return nothing
+    ex isa LineNumberNode && return nothing
+    ex isa GlobalRef && return nothing  # a module constant
+    if ex isa Symbol
+        (_is_array_param(plan, ex) || ex in _union_name_set(plan)) &&
+            return push!(refs, ex)
+        # Whole-value data have no observation axis. An array definition
+        # retained by lowering reads these as bound operands, just like a
+        # scalar assignment or an undotted module call.
+        bound && haskey(plan.columns, ex) &&
+            ex in _bound_model_level_input_set(plan) && return nothing
+        _is_derived(plan, ex) && _fail(label, "derived column $ex is " *
+            "per-observation — it does not combine with arrays here")
+        bound && haskey(plan.columns, ex) && _fail(label, "column $ex is " *
+            "per-observation — it does not combine with arrays here")
+        return push!(refs, ex)
+    end
+    ex isa Expr || _fail(label, "unsupported literal $(repr(ex))")
+    _is_lazy_value(ex) && return _collect_lazy_refs!(refs, ex, plan, label, bound)
+    _is_plate_column_expr(ex) &&
+        return _collect_plate_column_refs!(refs, ex, plan, label, bound)
+    head = ex.head
+    if head === :tuple || _is_array_literal(ex)
+        for a in ex.args
+            head === :tuple && (a = _tuple_field_value(a))
+            _collect_array_value_refs!(refs, a, plan, label, bound)
+        end
+        return nothing
+    end
+    if head === :ref
+        return _collect_model_value_ref!(refs, ex, plan, label, bound)
+    end
+    if head === Symbol("'")
+        for a in ex.args
+            _collect_array_value_refs!(refs, a, plan, label, bound)
+        end
+        return nothing
+    end
+    if head === :call
+        fn = ex.args[1]
+        # A module call takes and returns whole values, just as it does
+        # inside scalar and observation expressions (functions as values).
+        (fn isa GlobalRef || _constructed_endpoint_head(fn)) &&
+            return _collect_opaque_refs!(refs, ex, plan, label, bound)
+        # A reduction over a data column inside an array expression is a
+        # scalar subterm (`mean(x) .* z`).
+        fn isa Symbol && fn in REDUCTION_FNS && length(ex.args) == 2 &&
+            !_mentions_array(ex.args[2], plan) &&
+            return _collect_assignment_refs!(refs, ex, plan, label, bound)
+        fn isa Symbol && (fn in ASSIGNMENT_FNS || fn in ELEMENTWISE_OPS ||
+            fn === :transpose) || _fail(label, "call `$fn` is not in the " *
+            "array-value vocabulary (arithmetic, dotted arithmetic, the " *
+            "scalar math functions, reductions, `transpose`)")
+        for a in ex.args[2:end]
+            _collect_array_value_refs!(refs, a, plan, label, bound)
+        end
+        return nothing
+    end
+    if head === :.
+        length(ex.args) == 2 && ex.args[1] isa Union{Symbol,GlobalRef} &&
+            ex.args[2] isa Expr && ex.args[2].head === :tuple || _fail(label,
+            "field access does not lower in array expressions")
+        (ex.args[1] isa GlobalRef || ex.args[1] in ELEMENTWISE_FNS) ||
+            _fail(label, "`$(ex.args[1]).` " *
+            "is not in the elementwise vocabulary")
+        for a in ex.args[2].args
+            _collect_array_value_refs!(refs, a, plan, label, bound)
+        end
+        return nothing
+    end
+    _fail(label, "unsupported expression head $head in an array expression")
+end
+
+# `B * w`: a per-observation matrix — a bound data matrix `B` (supplied, or
+# a data-only module value the model computes at bind), or the rows of an
+# array gathered per observation (`z[g, :]`) — times an array-valued
+# expression: one value or row per observation (standard Julia
+# matrix-vector or matrix-matrix product).
+function _is_data_matvec(ex, plan::StructuralPlan)
+    ex isa Expr && ex.head === :call && length(ex.args) == 3 &&
+        ex.args[1] === :* || return false
+    B, w = ex.args[2], ex.args[3]
+    rows = (B isa Symbol && !_is_array_param(plan, B) &&
+            !(B in _union_name_set(plan)) &&
+            (!_is_derived(plan, B) || _is_bind_data_derived(plan, B))) ||
+        _is_row_gather(plan, B)
+    return rows && _mentions_array(w, plan)
+end
+
+# `D * w`: a per-observation value the graph computes (`hidden =
+# tanh.(x * W)`, named or inline) times a model-level value. Julia's
+# product contracts `D`'s columns and keeps its rows, one per observation,
+# as for a bound data matrix (`B * w` above); `w` is read whole. The
+# dimensions are checked where Julia computes the product.
+function _is_computed_row_product(ex, plan::StructuralPlan)
+    ex isa Expr && ex.head === :call && length(ex.args) == 3 &&
+        ex.args[1] === :* || return false
+    D, w = ex.args[2], ex.args[3]
+    computed = D isa Symbol ? _is_derived(plan, D) && !_is_bind_data_derived(plan, D) :
+        _is_vector_valued(D, plan)
+    return computed && !_is_vector_valued(w, plan)
+end
+
+# A derived column the model computes at bind from data alone (a module
+# call reading only raw columns or other such columns): bound data, so
+# its value may be a matrix with one row per observation.
+_is_bind_data_derived(plan::StructuralPlan, name::Symbol) =
+    any(d -> d.name === name, plan.derived) &&
+        name in _module_data_names(plan; unbound=true)
+
+# `z[g, :]` or `z[:, g]'`: one row per observation. Adjoint preserves
+# the author's Julia orientation, rather than changing the gather itself.
+function _row_gather_ref(plan::StructuralPlan, ex)
+    ex isa Expr || return nothing
+    if ex.head === :ref && length(ex.args) == 3 &&
+            ex.args[3] === :(:) && _is_gather_ref(plan, ex)
+        return ex
+    elseif ex.head === Symbol("'") && length(ex.args) == 1
+        col = ex.args[1]
+        col isa Expr && col.head === :ref && length(col.args) == 3 &&
+            col.args[2] === :(:) && _is_gather_ref(plan, col) && return col
+    end
+    return nothing
+end
+
+_is_row_gather(plan::StructuralPlan, ex) =
+    _row_gather_ref(plan, ex) !== nothing
+
+function _collect_data_matvec!(refs, ex::Expr, plan::StructuralPlan, label,
+        bound::Bool)
+    B, w = ex.args[2], ex.args[3]
+    _collect_array_value_refs!(refs, w, plan, label, bound)
+    if B isa Expr
+        _collect_array_ref!(refs, _row_gather_ref(plan, B), plan, label,
+            bound; allow_gather = true)
+        return nothing
+    end
+    bound || return nothing
+    haskey(plan.columns, B) || _fail(label, "`$(repr(ex))`: $B is not a " *
+        "bound column")
+    _data_check(plan) do plan
+        col = plan.columns[B]
+        col isa AbstractMatrix || _fail(label, "`$(repr(ex))` multiplies $B by " *
+            "an array — $B must be a bound matrix (a vector times a vector is " *
+            "not a product in Julia; write elementwise math dotted)")
+        eltype(col) <: Real || _fail(label, "matrix $B is not numeric")
+        if w isa Symbol && _is_array_param(plan, w)
+            dims = _array_dims(plan, _array_param(plan, w))
+            length(dims) in (1, 2) && dims[1] == size(col, 2) || _fail(label,
+                "`$(repr(ex))`: $B has $(size(col, 2)) columns but $w has " *
+                "size $(repr(Tuple(dims)))")
+        end
+    end
+    return nothing
+end
+
+# ── layout ───────────────────────────────────────────────────────────
+
+# Per-coordinate labels: `z.i` for one axis, Stan's `z.i.j` (row i,
+# column j, column-major packing) for two.
+function _array_labels(name::Symbol, dims::Vector{Int})
+    length(dims) == 1 && return [Symbol(name, ".", i) for i in 1:dims[1]]
+    return [Symbol(name, ".", i, ".", j) for j in 1:dims[2] for i in 1:dims[1]]
+end
+
+"""Append the packed layout entries of the plan's array parameters
+starting at `offset`; returns the next free offset."""
+function _array_layout_entries!(entries::Vector{LayoutEntry},
+        plan::StructuralPlan, offset::Int)
+    for p in plan.array_parameters
+        p.name in plan.conditioned && continue
+        dims = _array_dims(plan, p)
+        if p.family === :external
+            entry = _external_layout_entry(plan, p, offset, dims)
+            push!(entries, entry)
+            offset += entry.size
+        elseif p.family === :lkj_cholesky
+            K = dims[1]
+            packed = K * (K - 1) ÷ 2
+            labels = [Symbol(p.name, ".", i) for i in 1:packed]
+            transform = _lkj_uplo(p) === 'U' ? :lkj_upper : :lkj
+            push!(entries, LayoutEntry(:cholesky_corr, nothing, p.name,
+                labels, offset, packed, transform, NaN, NaN, dims))
+            offset += packed
+        elseif p.family === :lkj_cholesky_stack
+            # Level k's K(K-1)/2 vine partials are contiguous (`L.p.k`,
+            # P × S column-major): partial p of every level is a strided
+            # view, so one broadcast vine serves all S levels.
+            K, S = dims[1], dims[3]
+            P = K * (K - 1) ÷ 2
+            labels = [Symbol(p.name, ".", i, ".", k) for k in 1:S for i in 1:P]
+            transform = _lkj_uplo(p) === 'U' ? :lkj_stack_upper : :lkj_stack
+            push!(entries, LayoutEntry(:array, nothing, p.name, labels,
+                offset, P * S, transform, NaN, NaN, dims))
+            offset += P * S
+        elseif _is_slice_array(p)
+            # Multivariate normal slices are centered: the array's entries
+            # are its coordinates. Simplex / ordered slices pack their
+            # unconstrained coordinates (K − 1 / K per slice) in the
+            # array's orientation.
+            transform = _slice_transform(Val(_slice_stem(p)), _slice_kind(p))
+            pd = _slice_packed_dims(transform, dims)
+            n = prod(pd)
+            push!(entries, LayoutEntry(:array, nothing, p.name,
+                _array_labels(p.name, pd), offset, n, transform, NaN, NaN,
+                dims))
+            offset += n
+        else
+            transform, lo, hi =
+                _entry_transform(p.family, _bound_override(plan, p.support_override),
+                    p.family === :uniform ? map(x -> _layout_bound(plan, x), p.args) : p.args)
+            n = prod(dims)
+            push!(entries, LayoutEntry(:array, nothing, p.name,
+                _array_labels(p.name, dims), offset, n, transform, lo, hi,
+                dims))
+            offset += n
+        end
+    end
+    return offset
+end
+
+# Layout transform of a slice array: centered multivariate normals are
+# the identity; simplex / ordered slices transform along each slice.
+_slice_transform(::Val{:mvnormal_cholesky}, kind) = :identity
+_slice_transform(::Val{:mvnormal}, kind) = :identity
+_slice_transform(::Val{:dirichlet}, kind) = Symbol(:simplex_, kind)
+_slice_transform(::Val{:ordered_normal}, kind) = Symbol(:ordered_, kind)
+_slice_transform(::Val{:icar}, kind) = :identity
+
+const _SLICE_TRANSFORMS = (:simplex_rows, :simplex_cols, :ordered_rows,
+    :ordered_cols)
+_is_slice_transform(t::Symbol) = t in _SLICE_TRANSFORMS
+
+# The orientation a slice transform runs along (an `mv_slices.jl` value,
+# spliced as a constructor call in the graph).
+_slice_transform_orientation(t::Symbol) =
+    t in (:simplex_rows, :ordered_rows) ? _SliceRows() : _SliceCols()
+_orientation_expr(::_SliceRows) = :(_SliceRows())
+_orientation_expr(::_SliceCols) = :(_SliceCols())
+_orientation_expr(::_SliceWhole) = :(_SliceWhole())
+
+# Packed (unconstrained) axes of a slice transform over the constrained
+# axes `dims`: a simplex slice of length K packs K − 1 coordinates.
+_slice_packed_dims(t::Symbol, dims) =
+    t === :simplex_rows ? [dims[1], dims[2] - 1] :
+    t === :simplex_cols ? [dims[1] - 1, dims[2]] : collect(dims)
+
+_slice_constrain(t::Symbol, o, U) = startswith(String(t), "simplex") ?
+    _simplex_slices_constrain(o, U) : _ordered_slices_constrain(o, U)
+_slice_unconstrain(t::Symbol, o, X) = startswith(String(t), "simplex") ?
+    _simplex_slices_unconstrain(o, X) : _ordered_slices_unconstrain(o, X)
+_slice_logjac(t::Symbol, o, U) = startswith(String(t), "simplex") ?
+    _simplex_slices_logjac(o, U) : _ordered_slices_logjac(o, U)
+_slice_function_names(t::Symbol) = startswith(String(t), "simplex") ?
+    (:_simplex_slices_constrain, :_simplex_slices_logjac) :
+    (:_ordered_slices_constrain, :_ordered_slices_logjac)
+
+# Host edges of a slice-transformed array entry (the same functions the
+# graph calls, so host and graph agree bit-for-bit).
+function _array_slices_constrain(e::LayoutEntry, seg)
+    U = reshape(Vector{_host_eltype(seg)}(seg), _slice_packed_dims(e.transform, e.dims)...)
+    return _slice_constrain(e.transform,
+        _slice_transform_orientation(e.transform), U)
+end
+_array_slices_unconstrain(e::LayoutEntry, X) =
+    vec(_slice_unconstrain(e.transform,
+        _slice_transform_orientation(e.transform), Matrix{_host_eltype(X)}(X)))
+function _array_slices_logjac(e::LayoutEntry, seg)
+    U = reshape(Vector{_host_eltype(seg)}(seg), _slice_packed_dims(e.transform, e.dims)...)
+    return _slice_logjac(e.transform,
+        _slice_transform_orientation(e.transform), U)
+end
+
+_array_slices_packed_name(name::Symbol) = Symbol(:_ppl_arru_, name)
+
+# In-graph constrain edges of an elementwise array: the plate edges over
+# its flat packed block, then (two axes) the column-major reshape. A
+# slice-transformed array reshapes its packed block and transforms every
+# slice in one call.
+function _array_transform_statements(e::LayoutEntry)
+    # There are no bijector cells in an empty elementwise array. Preserve its
+    # value shape with an owned empty output, without evaluating a cell.
+    e.size == 0 && !_is_slice_transform(e.transform) &&
+        !_is_lkj_stack(e.transform) && return Expr[:($(e.name)::Array{Float64,$(length(e.dims))} =
+        zeros(Float64, $(e.dims...)))]
+    _is_lkj_stack(e.transform) && return _lkj_stack_transform_statements(e)
+    if _is_slice_transform(e.transform)
+        U = _array_slices_packed_name(e.name)
+        lo, hi = e.offset, e.offset + e.size - 1
+        cfn, _ = _slice_function_names(e.transform)
+        o = _orientation_expr(_slice_transform_orientation(e.transform))
+        return Expr[
+            :($U::Matrix{Float64} = reshape(Float64.(view(unconstrained,
+                $lo:$hi)), $(_slice_packed_dims(e.transform, e.dims)...))),
+            :($(e.name)::Matrix{Float64} = $cfn($o, $U)),
+        ]
+    end
+    flat = _array_flat_name(e.name, length(e.dims))
+    fe = LayoutEntry(:plate, nothing, flat, e.labels, e.offset, e.size,
+        e.transform, e.lo, e.hi)
+    stmts = _plate_transform_statements(fe)
+    length(e.dims) == 1 && return stmts
+    # The column-major reshape shares the flat block's storage: the packed
+    # coordinates themselves, or the transform's fresh output. A `Matrix`
+    # declaration would copy the former on every evaluation.
+    push!(stmts, :($(e.name)::AbstractMatrix{Float64} = reshape($flat, $(e.dims...))))
+    return stmts
+end
+
+function _array_jacobian_term(e::LayoutEntry)
+    e.size == 0 && return nothing
+    _is_lkj_stack(e.transform) &&
+        return _lkj_vine_logjac(e.name, e.dims[1]; stacked = true)
+    if _is_slice_transform(e.transform)
+        _, jfn = _slice_function_names(e.transform)
+        o = _orientation_expr(_slice_transform_orientation(e.transform))
+        return :($jfn($o, $(_array_slices_packed_name(e.name))))
+    end
+    flat = _array_flat_name(e.name, length(e.dims))
+    return jacobian_term(LayoutEntry(:plate, nothing, flat, e.labels,
+        e.offset, e.size, e.transform, e.lo, e.hi))
+end
+
+# A per-level LKJ stack (`:lkj_stack`, dims `[K, K, S]`): the stacked
+# vine over partial p of every level (a strided view of its packed block,
+# core constraint 1: S never multiplies statements), then the value
+# `L::Array{Float64,3}` (`L[:, :, k]` is level k's factor) assembled from
+# the S-vector entries, column-major over (i, j).
+function _lkj_stack_transform_statements(e::LayoutEntry)
+    K, S = e.dims[1], e.dims[3]
+    P = K * (K - 1) ÷ 2
+    read(p) = (lo = e.offset + p - 1;
+        :(view(unconstrained, $lo:$P:$(lo + (S - 1) * P))))
+    stmts = _lkj_vine_statements(e.name, K, read; stacked = true)
+    cols = Any[]
+    for j in 1:K, i in 1:K
+        row, col = _is_upper_lkj(e.transform) ? (j, i) : (i, j)
+        push!(cols, row == 1 && col == 1 ? :(fill(1.0, $S)) :
+            row >= col ? _rl_name(e.name, row, col) : :(zeros($S)))
+    end
+    push!(stmts, :($(e.name)::Array{Float64,3} =
+        reshape(permutedims(hcat($(cols...))), $K, $K, $S)))
+    return stmts
+end
+
+# Host edges of a per-level LKJ stack: level by level, the single-factor
+# host functions (the same vine as the stacked graph edges).
+function _lkj_stack_constrain(e::LayoutEntry, seg)
+    K, S = e.dims[1], e.dims[3]
+    P = K * (K - 1) ÷ 2
+    T = _host_eltype(seg)
+    U = reshape(Vector{T}(seg), P, S)
+    out = Array{T,3}(undef, K, K, S)
+    for k in 1:S
+        L = lkj_chol_constrain(U[:, k], K)
+        out[:, :, k] = _is_upper_lkj(e.transform) ? permutedims(L) : L
+    end
+    return out
+end
+function _lkj_stack_unconstrain(e::LayoutEntry, X)
+    K, S = e.dims[1], e.dims[3]
+    return reduce(vcat, [lkj_chol_unconstrain(
+        _is_upper_lkj(e.transform) ? permutedims(X[:, :, k]) : X[:, :, k], K)
+        for k in 1:S])
+end
+function _lkj_stack_logjac(e::LayoutEntry, seg)
+    K, S = e.dims[1], e.dims[3]
+    P = K * (K - 1) ÷ 2
+    U = reshape(Vector{_host_eltype(seg)}(seg), P, S)
+    return sum(lkj_chol_logjac(U[:, k], K) for k in 1:S)
+end
+
+# ── generator ────────────────────────────────────────────────────────
+
+# One triangular transform graph for every declared factor. Preparation fixes
+# K and the packed slice; neither a literal nor a data-derived K replicates
+# the body. The partials follow Stan's column-block order. Column block j
+# carries the running product of √(1 - z²) over its j - 1 partials, starting
+# at 1: entry i is its partial times the product so far, and the diagonal is
+# the final product. This is the left-associated order of the host
+# `lkj_chol_constrain`, so the two agree bit for bit. Each pass is one loop
+# over the K(K-1)/2 packed partials, carrying the entry's position (i, j);
+# the last partial of a column moves it to the next column. No iteration is
+# spent on a masked-out entry. The trip count is fixed at preparation, so a
+# compiled reverse pass keeps a statically sized tape, which a column loop
+# with an inner `1:(j - 1)` range does not.
+_lkj_array_partials(L::Symbol) = Symbol(:_ppl_lkj_partials_, L)
+_lkj_array_logjac(L::Symbol) = Symbol(:_ppl_lkj_logjac_, L)
+_lkj_array_diagonal(L::Symbol) = Symbol(:_ppl_lkj_diagonal_, L)
+
+function _lkj_array_transform_statements(e::LayoutEntry)
+    L, K = e.name, e.dims[1]
+    P = K * (K - 1) ÷ 2
+    row, col = _is_upper_lkj(e.transform) ? (:i, :j) : (:j, :i)
+    z, lj = _lkj_array_partials(L), _lkj_array_logjac(L)
+    diagonal = _lkj_array_diagonal(L)
+    return Expr[
+        :($z::Vector{Float64} = tanh.($(block_read(e.offset, e.size)))),
+        # The diagonal is part of constructing the factor. Publish it as a
+        # graph value so a guarded prior need not share the whole matrix with
+        # response products. Each diagonal entry is still computed once.
+        :($diagonal::Vector{Float64} = let
+            out = ones(Float64, $K)
+            i, j, d = 1, 2, 1.0
+            for p in 1:$P
+                d = d * sqrt(1 - $z[p]^2)
+                if i + 1 < j
+                    i = i + 1
+                else
+                    out[j] = d
+                    i, j, d = 1, j + 1, 1.0
+                end
+            end
+            out
+        end),
+        :($L::Matrix{Float64} = let
+            out = zeros(Float64, $K, $K)
+            out[1, 1] = 1.0
+            i, j, w = 1, 2, 1.0
+            for p in 1:$P
+                out[$row, $col] = $z[p] * w
+                w = w * sqrt(1 - $z[p]^2)
+                if i + 1 < j
+                    i = i + 1
+                else
+                    out[j, j] = $diagonal[j]
+                    i, j, w = 1, j + 1, 1.0
+                end
+            end
+            out
+        end),
+        :($lj::Float64 = let
+            total = 0.0
+            i, j = 1, 2
+            for p in 1:$P
+                total = total + ((j - i + 1) / 2) * log(1 - $z[p]^2)
+                i, j = i + 1 < j ? (i + 1, j) : (1, j + 1)
+            end
+            total
+        end),
+    ]
+end
+
+# The normalization constant is preparation-only metadata. The diagonal sum
+# remains a retained recipe loop even for a conditioned, caller-owned factor.
+function _lkj_array_prior_terms(L::Symbol, K::Int, eta::Float64;
+        diagonal::Union{Nothing,Symbol} = nothing)
+    c = lkj_logconst(K, eta)
+    entry = diagonal === nothing ? :($L[i, i]) : :($diagonal[i])
+    term = _lkj_prior_diagonal(:(log($entry)), K, :i, eta)
+    return :(let
+        total = $c
+        for i in 2:$K
+            total += $term
+        end
+        total
+    end)
+end
+
+# Normalization depends only on eta, so keep it separate from the factor's
+# diagonal. Preparation evaluates it once when eta is bound or constant;
+# live shapes retain their own loop and ordinary generated derivatives.
+function _lkj_array_normalizer_terms(K::Int, eta::Symbol)
+    lgamma = GlobalRef(DistributionKernelSources, :loggamma)
+    return :(if isfinite($eta) && $eta > 0
+        let
+            total = $(K - 1) * $lgamma($eta + $(0.5 * (K - 1)))
+            for k in 1:$(K - 1)
+                total = total - 0.5 * k * $(log(pi)) -
+                    $lgamma($eta + 0.5 * ($(K - 1) - k))
+            end
+            total
+        end
+    else
+        -Inf
+    end)
+end
+
+function _lkj_array_diagonal_terms(L::Symbol, K::Int, eta::Symbol;
+        intrinsic_pair::Bool = false, diagonal::Union{Nothing,Symbol} = nothing)
+    entry = diagonal === nothing ? :($L[i, i]) : :($diagonal[i])
+    # A declared literal 2 × 2 factor has one diagonal contribution. Its
+    # scalar equation avoids a second retained loop reading the same factor
+    # that downstream matrix products consume. A bound shape, even K = 2,
+    # still uses the retained diagonal loop below.
+    if intrinsic_pair
+        pair_entry = diagonal === nothing ? :($L[2, 2]) : :($diagonal[2])
+        return :(if isfinite($eta) && $eta > 0
+            (2 * $eta - 2) * log($pair_entry)
+        else
+            0.0
+        end)
+    end
+    return :(if isfinite($eta) && $eta > 0
+        let
+            total = 0.0
+            for i in 2:$K
+                total += ($K - i + 2 * $eta - 2) * log($entry)
+            end
+            total
+        end
+    else
+        0.0
+    end)
+end
+
+# Name of the level-code vector for gathers by column `g` on the
+# `levels(h)` axis.
+_array_level_index_name(g::Symbol, h::Symbol, axis::Int) =
+    Symbol(:_ppl_lvx_, h, :_, g, :_axis_, axis)
+
+# Rewrite every level gather `z[g]` (a `levels(h)` axis) to an integer
+# gather over the level codes; integer axes stay plain Julia indexing.
+# Records the (index column, array value, axis) code vectors it needs. The value
+# identifies its declared axes, including a selected subset of levels.
+function _array_gather_rewrite(ex, plan::StructuralPlan,
+        needed::Set{Tuple{Symbol,Symbol,Int}})
+    ex isa Expr || return ex
+    # An array-cell plate column: its inputs carry the level codes; the
+    # cell body indexes by those codes and is RK's to plan.
+    _is_plate_column_expr(ex) && return Expr(:do,
+        _array_gather_rewrite(ex.args[1], plan, needed), ex.args[2])
+    if ex.head === :call && length(ex.args) == 4 &&
+            ex.args[1] === :_ppl_level_gather
+        name, g, ld = ex.args[2:end]
+        axs = _gather_axes(plan, name)
+        d = axs[ld]
+        lv = _array_axis_levels(plan, name, :plan, d)
+        lv = _apply_subset(lv, LevelMap(name, d.args[2], [], :levels,
+            _levels_subset(d)))
+        # These codes depend only on bound labels, not the number of cells
+        # in the graph. Omitted selected levels use the usual zero row.
+        codes = _declared_codes(_array_axis_levels(plan, name, :plan, g), lv)
+        source = name
+        if _levels_subset(d) !== Colon()
+            source = length(axs) == 1 ? :(vcat(0.0, $name)) :
+                ld == 1 ? :(vcat(zeros(1, size($name, 2)), $name)) :
+                :(cat(zeros(size($name, 1), size($name, 2), 1), $name; dims = 3))
+            codes = codes .+ 1
+        end
+        ix = Expr(:vect, codes...)
+        length(axs) == 1 && return Expr(:ref, source, ix)
+        if ld == 1
+            aligned = Expr(:ref, source, ix, :(:))
+            return :(eachcol(permutedims($aligned)))
+        end
+        aligned = Expr(:ref, source, :(:), :(:), ix)
+        return :(eachcol(reshape($aligned, size($name, 1) * size($name, 2), :)))
+    end
+    if ex.head === :call && !isempty(ex.args) &&
+            ex.args[1] in (:_ppl_level_indices, :_ppl_level_values)
+        g = ex.args[2]
+        lv = _array_axis_levels(plan, g, :plan, g)
+        if ex.args[1] === :_ppl_level_indices
+            return :(collect(1:$(length(lv))))
+        elseif ex.args[1] === :_ppl_level_values
+            return Expr(:vect, map(_level_literal, lv)...)
+        end
+    end
+    if ex.head === :call && length(ex.args) == 3 && ex.args[1] === :_ppl_codes
+        g, h = ex.args[2], ex.args[3]
+        push!(needed, (g, h, 0))
+        return _array_level_index_name(g, h, 0)
+    end
+    if ex.head === :call && length(ex.args) == 4 && ex.args[1] === :_ppl_axis_codes
+        g, name, axis = ex.args[2:end]
+        push!(needed, (g, name, axis))
+        return _array_level_index_name(g, name, axis)
+    end
+    if _is_gather_ref(plan, ex)
+        d = _gather_axis(plan, ex)
+        if _is_levels_dim(d)
+            axis = _gather_index_axis(plan, ex)
+            g, name = ex.args[1 + axis], ex.args[1]
+            push!(needed, (g, name, axis))
+            codes = _array_level_index_name(g, name, axis)
+            idx = copy(ex.args[2:end])
+            idx[axis] = codes
+            if _levels_subset(d) !== Colon()
+                zero = length(_gather_axes(plan, name)) == 1 ? 0.0 :
+                    axis == 1 ? :(zeros(1, size($name, 2))) :
+                        :(zeros(size($name, 1), 1))
+                cat = axis == 1 ? :vcat : :hcat
+                idx[axis] = Expr(:call, :.+, codes, 1)
+                return Expr(:ref, Expr(:call, cat, zero, name), idx...)
+            end
+            return Expr(:ref, name, idx...)
+        end
+        return ex
+    end
+    return Expr(ex.head,
+        (_array_gather_rewrite(a, plan, needed) for a in ex.args)...)
+end
+
+# The level-code vectors a plan's gathers read (data-only: `bound=` folds
+# them), keyed by an array value or a plate cell's levels column.
+function _array_level_index_statements(plan::StructuralPlan,
+        needed::Set{Tuple{Symbol,Symbol,Int}})
+    stmts = Expr[]
+    for (g, name, axis) in sort!(collect(needed))
+        axes = _gather_axes(plan, name)
+        d = axis == 0 ? Expr(:call, :levels, name) : axes[axis]
+        h = d.args[2]
+        lv = _array_axis_levels(plan, name, :plan, d)
+        lv = _apply_subset(lv, LevelMap(name, h, [], :levels,
+            _levels_subset(d)))
+        lvlvec = Expr(:vect, (_level_literal(l) for l in lv)...)
+        push!(stmts, :($(_array_level_index_name(g, name, axis)) =
+            _declared_codes($g, $lvlvec)))
+    end
+    return stmts
+end
+
+# Prior nodes `_ppl_prior_<name>` of the plan's array parameters.
+function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
+        plan::StructuralPlan, needed::Set{Tuple{Symbol,Symbol,Int}};
+        context = plan, pointwise = Pair{Symbol,Any}[])
+    for p in plan.array_parameters
+        dims = _array_dims(plan, p)
+        node = Symbol(:_ppl_prior_, p.name)
+        if p.family === :external
+            append!(stmts, _external_density_statements(p))
+            push!(terms, node)
+            push!(pointwise, p.name => Symbol(p.args.broadcast ? :_ppl_pw_prior_ : :_ppl_prior_, p.name))
+            continue
+        end
+        if prod(dims) == 0
+            # An elementwise declaration over no elements has no density
+            # cells. Scalar priors elsewhere in the model remain intact.
+            push!(stmts, :($node::Float64 = 0.0))
+            push!(terms, node)
+            value = if _is_slice_array(p)
+                kind = _slice_kind(p)
+                kind === :vector ? node :
+                    :(zeros($(kind === :rows ? dims[1] : dims[2])))
+            elseif p.family === :lkj_cholesky_stack
+                :(zeros($(dims[3])))
+            else
+                :(zeros($(dims...)))
+            end
+            push!(pointwise, p.name => value)
+            continue
+        end
+        if p.family === :lkj_cholesky
+            factor_diagonal = p.name in plan.conditioned ? nothing :
+                _lkj_array_diagonal(p.name)
+            eta = p.args.arg1
+            if eta isa Symbol
+                normalizer, diagonal = Symbol(node, :_normalizer), Symbol(node, :_diagonal)
+                push!(stmts, :($normalizer::Float64 = $(_lkj_array_normalizer_terms(dims[1], eta))),
+                    :($diagonal::Float64 = $(_lkj_array_diagonal_terms(p.name, dims[1], eta;
+                        intrinsic_pair = p.dims == Any[2, 2], diagonal = factor_diagonal))),
+                    :($node::Float64 = $normalizer + $diagonal))
+            else
+                push!(stmts, :($node::Float64 =
+                    $(_lkj_array_prior_terms(p.name, dims[1], eta;
+                        diagonal = factor_diagonal))))
+            end
+            push!(terms, node)
+            push!(pointwise, p.name => node)
+            continue
+        end
+        if p.family === :lkj_cholesky_stack
+            push!(stmts, :($node::Float64 = $(_lkj_prior_terms(p.name,
+                dims[1], p.args.arg1; nstack = dims[3]))))
+            push!(terms, node)
+            # A stack is a broadcast of factor draws, one density per slice.
+            if p.name in plan.conditioned
+                value = Symbol(:_ppl_pointwise_, p.name)
+                push!(stmts, :($value = $(_lkj_prior_terms(p.name,
+                    dims[1], Float64(p.args.arg1); nstack = dims[3], pointwise = true))))
+                push!(pointwise, p.name => value)
+            end
+            continue
+        end
+        if p.family === :flat
+            push!(stmts, :($node::Float64 = 0.0))
+            push!(terms, node)
+            push!(pointwise, p.name => :(0.0 .* $(p.name)))
+            continue
+        end
+        if _is_slice_array(p)
+            density = _slice_prior_call!(stmts, p)
+            push!(stmts, :($node::Float64 =
+                $density))
+            push!(terms, node)
+            if _slice_kind(p) === :vector
+                push!(pointwise, p.name => node)
+            elseif p.name in plan.conditioned
+                value = Symbol(:_ppl_pointwise_, p.name)
+                density = copy(density)
+                density.args[1] = Symbol(replace(string(density.args[1]), "_logpdf" => "_pointwise"))
+                push!(stmts, :($value = $density))
+                push!(pointwise, p.name => value)
+            end
+            continue
+        end
+        flat = _array_flat_name(p.name, length(dims))
+        arg_names = Symbol[]
+        arg_values = Any[]
+        float64_inputs = _float64_inputs(context, values(p.args))
+        # A cell reads an argument value it generated by its role
+        # (`normal(location, scale)`).
+        cell_names = Dict{Symbol,Symbol}()
+        # A two-axis array reads a per-element argument in its packed
+        # column-major order (`_array_prior_cells`); a number stays shared.
+        cells = length(dims) == 2
+        for (i, (k, a)) in enumerate(pairs(p.args))
+            push!(arg_names, k)
+            if a isa Real || a isa Symbol && !(cells &&
+                    _value_axes(context, a; data_axes = true) != Any[])
+                push!(arg_values, a)
+                continue
+            end
+            local_name = Symbol(:_ppl_parg_, p.name, :_, i)
+            role = _family_role(p.family, i, length(p.args))
+            role === nothing || (cell_names[local_name] = role)
+            val = if a isa Symbol
+                a in float64_inputs && push!(float64_inputs, local_name)
+                a
+            elseif _is_array_literal(a)
+                push!(float64_inputs, local_name)
+                _float64_array_literal(a)
+            else
+                _array_gather_rewrite(a, context, needed)
+            end
+            cells && (val = :(_array_prior_cells($val, $(Tuple(dims)))))
+            push!(stmts, :($local_name = $val))
+            push!(arg_values, local_name)
+        end
+        _vector_prior_stmts!(stmts, terms, flat, p.family,
+            NamedTuple{Tuple(arg_names)}(Tuple(arg_values)),
+            p.support_override; conditioned = p.name in context.conditioned,
+            float64_variate = p.name ∉ context.conditioned, label = p.name,
+            float64_inputs, cell_names)
+        push!(pointwise, p.name => :(reshape($(Symbol(:_ppl_pw_prior_, p.name)), size($(p.name)))))
+    end
+    return nothing
+end
+
+# The slice density of a slice array (`mv_slices.jl`), its arguments bound
+# to hygienic locals: a shared value as itself (literal vectors and
+# `zeros(K)` / `fill(a, K)` as `Float64` vectors), a per-slice
+# `eachrow(M)` / `eachcol(M)` as a `_PerSlice` of `M`. The literal
+# `Ordered` length is structural and not passed.
+_slice_density(::Val{:mvnormal_cholesky}) = :_mvnormal_cholesky_slices_logpdf
+_slice_density(::Val{:mvnormal}) = :_mvnormal_slices_logpdf
+_slice_density(::Val{:dirichlet}) = :_dirichlet_slices_logpdf
+_slice_density(::Val{:ordered_normal}) = :_ordered_normal_slices_logpdf
+
+function _slice_prior_call!(stmts::Vector{Expr}, p::ArrayParameter)
+    _slice_stem(p) === :icar && return _icar_prior_call!(stmts, p)
+    roles = _slice_roles(p)
+    vals = Any[]
+    for (i, (k, a)) in enumerate(pairs(p.args))
+        roles[k] === :count && continue
+        local_name = Symbol(:_ppl_parg_, p.name, :_, i)
+        if _is_slice_iterator(a)
+            # The density call wraps the value itself: a data-only value
+            # then reaches AD as an ordinary constant array operand, never
+            # folded inside a wrapper whose fields AD cannot prove readonly.
+            o = _orientation_expr(a.args[1] === :eachrow ? _SliceRows() :
+                _SliceCols())
+            v = a.args[2]
+            if !(v isa Symbol)
+                push!(stmts, :($local_name = $(_slice_value_expr(v))))
+                v = local_name
+            end
+            push!(vals, :(_PerSlice($o, $v)))
+        elseif a isa Symbol
+            push!(vals, a)
+        elseif a isa Real
+            push!(vals, Float64(a))
+        else
+            push!(stmts, :($local_name = $(_slice_value_expr(a))))
+            push!(vals, local_name)
+        end
+    end
+    o = _orientation_expr(_slice_orientation(_slice_kind(p)))
+    return :($(_slice_density(Val(_slice_stem(p))))($o, $(p.name), $(vals...)))
+end
+
+# An ICAR field's density is RK's graph law `icar_logdensity`, called
+# directly so its edge plate composes into the model graph. Its ports are
+# names: the field, then the two node vectors.
+function _icar_prior_call!(stmts::Vector{Expr}, p::ArrayParameter)
+    ports = Any[p.name]
+    for (i, a) in enumerate(values(p.args))
+        if a isa Symbol
+            push!(ports, a)
+        else
+            local_name = Symbol(:_ppl_parg_, p.name, :_, i)
+            push!(stmts, :($local_name = $a))
+            push!(ports, local_name)
+        end
+    end
+    return Expr(:call, GlobalRef(DistributionKernelSources, :icar_logdensity),
+        ports...)
+end
+
+_slice_value_expr(a) = _is_array_literal(a) ? _float64_array_literal(a) :
+    _is_zeros_call(a) ? :(zeros(Float64, $(a.args[2]))) :
+    _is_fill_call(a) ? :(fill($(a.args[2] isa Real ? Float64(a.args[2]) :
+        a.args[2]), $(a.args[3]))) : a

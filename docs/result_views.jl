@@ -3090,8 +3090,8 @@ function render_compiler_api_map()
          result = "CompiledStateTransition", runtime = "Authored writes, statically unrolled control, and demand-driven derived-field repairs"),
         (stage = "Compile a bounded stateful method", surface = "compile_stateful, stateful_compiler_bindings, functionalize_stateful, stateful_snapshot",
          result = "Typed native state plus a backend-neutral functional transition", runtime = "Source-ordered structured control, canonical nested-state repairs, typed effects, and explicit overflow"),
-        (stage = "Inspect the selected graph", surface = "visualize, dot_source, save_visualization",
-         result = "Plan/DAG view", runtime = "No effect on compilation"),
+        (stage = "Inspect the selected graph", surface = "recipe_kind, recipe_inventory, plate_body, scan_body, visualize, dot_source, save_visualization",
+         result = "Structural inventory or Plan/DAG view", runtime = "No effect on compilation"),
     ]
     cards = [
         h.li(; class = "rk-pipeline-step")(

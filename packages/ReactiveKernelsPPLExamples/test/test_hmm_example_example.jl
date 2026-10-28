@@ -78,7 +78,7 @@ end
     @testset "authored on the current baseline surface" begin
         @test occursin("scan(y[2:T]", HMM_EXAMPLE_SOURCE)
         @test occursin("bound = (; K))", HMM_EXAMPLE_SOURCE)
-        @test occursin("mapslices(logsumexp", HMM_EXAMPLE_SOURCE)
+        @test occursin("vec(logsumexp(M; dims = 1))", HMM_EXAMPLE_SOURCE)
         @test occursin("normal(3.0, 1.0).logpdf", HMM_EXAMPLE_SOURCE)
         @test !occursin("struct ", HMM_EXAMPLE_SOURCE)
     end

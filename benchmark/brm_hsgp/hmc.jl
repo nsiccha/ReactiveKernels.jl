@@ -28,14 +28,14 @@ function main()
     end
     rows = split.(readlines(joinpath(bundle, "centeredness.tsv"))[2:end], '\t')
     selected = vcat(parse.(Float64, getindex.(rows, 2)), parse.(Float64, getindex.(rows, 3)))
-    data = BRMHSGPExample.motorcycle_data(joinpath(ROOT, "examples", "data", "mcycle.csv"))
+    data = BRMHSGPExample.motorcycle_data()
     model_prepare_seconds = @elapsed density = BRMHSGPExample.prepare_model(data)
     backend = AutoEnzyme(; mode=Enzyme.Reverse, function_annotation=Enzyme.Const)
     make_rng(i) = BACKEND_NAME === :native ? Xoshiro(91+i) :
         Reactant.ReactantRNG(Reactant.to_rarray(UInt64[91+i, 77]))
     packages = Dict{String,Any}()
     for (_, info) in Pkg.dependencies()
-        info.name in ("ReactiveKernels", "Reactant", "Enzyme", "DifferentiationInterface",
+        info.name in ("ReactiveKernels", "ReactiveKernelsPPL", "BayesianRegressionModels", "Reactant", "Enzyme", "DifferentiationInterface",
             "MutatingFunctions", "OutputSignatures", "LogExpFunctions") || continue
         entry = Dict{String,Any}("version"=>string(info.version), "source"=>something(info.source, ""))
         if info.source !== nothing && isdir(joinpath(info.source, ".git")) ||
@@ -53,6 +53,8 @@ function main()
         "generated_at_utc"=>string(now(UTC)), "backend"=>string(BACKEND_NAME),
         "rk_head"=>strip(read(`git -C $ROOT rev-parse HEAD`, String)),
         "rk_worktree_status"=>read(`git -C $ROOT status --short`, String),
+        "rk_statistical_model_owner"=>"BayesianRegressionModels.rk_model(:dual_hsgp)",
+        "rk_statistical_model_source_sha256"=>hashfile(BRMHSGPExample.MODEL_SOURCE),
         "source_sha256"=>Dict(f=>hashfile(joinpath(ROOT, f)) for f in source_files),
         "bundle_sha256"=>hashes, "packages"=>packages,
         "julia_version"=>string(VERSION), "julia_threads"=>Threads.nthreads(),

@@ -70,7 +70,8 @@ end
         @test occursin(
             "const SOIL_PROBLEM = SciMLBase.ODEProblem", SOIL_INCUBATION_SOURCE)
         @test occursin("logistic(gamma_unc)", SOIL_INCUBATION_SOURCE)
-        @test occursin("Ref(sigma)", SOIL_INCUBATION_SOURCE)
+        @test occursin("normal(mu, sigma).logpdf(observation)", SOIL_INCUBATION_SOURCE)
+        @test !occursin("Ref(", SOIL_INCUBATION_SOURCE)
         @test occursin("u0 = c_t0", SOIL_INCUBATION_SOURCE)
         @test occursin("p = p", SOIL_INCUBATION_SOURCE)
         @test occursin("reltol = 1e-6", SOIL_INCUBATION_SOURCE)

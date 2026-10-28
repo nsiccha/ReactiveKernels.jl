@@ -38,7 +38,7 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         bound = prepare(p; bound = p.have[2] => data)
         @test C.calls[] == length(data)
         @test bound(2.0) == expected
-        @test bound(3.0) == 3sum(log, data)
+        @test bound(3.0) ≈ 3sum(log, data)
         @test C.calls[] == length(data)
         @test inputs(bound) == (p.have[1],)
         @test outputs(bound) == Tuple(p.want)
@@ -70,8 +70,10 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         plain = prepare(C.projected)
         C.calls[] = 0
         bound = prepare(C.projected; bound = (; data))
-        @test C.calls[] == 0 # untyped live inputs can make the domain empty
-        @test isempty(caches(bound.plan))
+        # Untyped live inputs could make the domain smaller than the bound
+        # one: the cache is computed over the bound domain under protection.
+        @test C.calls[] == 3
+        @test size(only(caches(bound.plan)).op.value) == (3, 1)
         @test bound(q, shift) == sum((log.(data) .+ shift) .* q)
         @test bound(2.0, shift) == plain(2.0, data, shift)
         @test_throws DimensionMismatch bound(ones(2, 2), shift)
@@ -100,21 +102,24 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
 
         # Source-identical ON/OFF controls: neither unknown rank nor a known
         # rank may turn a skipped invalid-data cell into a preparation error.
-        C.calls[] = 0
-        for spec in (C.projected, C.vector_live)
+        # Preparation may try the cell's pure data-only work; when it throws,
+        # the plate keeps its original execution and visits no cell.
+        for spec in (C.projected, C.vector_live, C.vector_live_rank)
             empty_args = spec === C.projected ? (Float64[], 1.0) : (Float64[],)
             invalid = prepare(spec; bound = (; data = [-1.0]))
             @test isempty(caches(invalid.plan))
+            C.calls[] = 0
             @test invalid(empty_args...) == 0.0
             @test prepare(spec)(Float64[], [-1.0], empty_args[2:end]...) == 0.0
             @test C.calls[] == 0
         end
         # A non-singleton bound vector does not constrain a new live matrix
         # dimension. In particular, 3×0 is compatible and visits no cells.
-        for spec in (C.projected, C.projected_matrix)
+        for spec in (C.projected, C.projected_matrix, C.matrix_live_rank)
             bad_data, shift = [-1.0, -2.0, -3.0], 0.0
             extra_axis = prepare(spec; bound = (; data = bad_data, shift))
             @test isempty(caches(extra_axis.plan))
+            C.calls[] = 0
             @test extra_axis(zeros(3, 0)) == 0.0
             @test prepare(spec)(zeros(3, 0), bad_data, shift) == 0.0
             @test C.calls[] == 0
@@ -123,6 +128,36 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         @test length(caches(vector.plan)) == 1
         @test vector(ones(3)) == sum(log, [1.0, 2.0, 4.0])
         @test_throws DimensionMismatch vector(Float64[])
+
+        # Only the declared rank decides: an abstract element type qualifies
+        # like a concrete one, and the cache serves any element type the
+        # declaration admits (snag rk-declared-rank-317aa725).
+        rank_data = [1.0, 2.0, 4.0]
+        for spec in (C.vector_live_rank, C.vector_live_real, C.vector_live_local)
+            C.calls[] = 0
+            rank_only = prepare(spec; bound = (; data = rank_data))
+            @test C.calls[] == 3
+            @test length(caches(rank_only.plan)) == 1
+            @test rank_only([0.5, 2.0, 3.0]) == vector([0.5, 2.0, 3.0])
+            @test rank_only([1, 2, 3]) == sum(log.(rank_data) .* [1, 2, 3])
+            @test C.calls[] == 3
+            @test_throws DimensionMismatch rank_only(Float64[])
+        end
+        matrix_bound = (; data = reshape(rank_data, 3, 1),
+                          shift = reshape([0.1, 0.3], 1, 2))
+        C.calls[] = 0
+        rank_matrix = prepare(C.matrix_live_rank; bound = matrix_bound)
+        @test C.calls[] == 3
+        @test size(only(caches(rank_matrix.plan)).op.value) == (3, 2)
+        @test rank_matrix(fill(2.0, 3, 2)) ==
+              prepare(C.projected_matrix; bound = matrix_bound)(fill(2.0, 3, 2))
+        @test_throws DimensionMismatch rank_matrix(ones(2, 2))
+        C.calls[] = 0
+        rankless = prepare(C.vector_live_rankless; bound = (; data = rank_data))
+        @test C.calls[] == 3 # an open rank caches under protection as well
+        @test length(caches(rankless.plan)) == 1
+        @test rankless([0.5, 2.0, 3.0]) == vector([0.5, 2.0, 3.0])
+        @test C.calls[] == 3
     end
 
     @testset "numeric scalars, atomic data and source granularity" begin
@@ -133,17 +168,24 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         atomic = prepare(C.atomic; bound = (; data, coefficients = coefs))
         @test atomic(2.0) == prepare(C.atomic)(2.0, data, coefs)
         @test length(caches(atomic.plan)) == 1
+        expected_inline = prepare(C.inline)(2.0, data)
         C.calls[] = 0
         inline = prepare(C.inline; bound = (; data))
-        @test C.calls[] == 0
-        @test isempty(caches(inline.plan))
-        inline(2.0)
-        @test C.calls[] == 3 # the mixed recipe is deliberately indivisible
+        @test C.calls[] == 3 # the mixed recipe's data-only call is split out
+        @test only(caches(inline.plan)).op.value == log.(data)
+        @test inline(2.0) == expected_inline
+        @test C.calls[] == 3
+        # The cell reads its per-cell array only through `sum`, so the split
+        # caches that sum rather than the array.
         mutable_result = prepare(C.mutable_result; bound = (; data))
-        @test isempty(caches(mutable_result.plan))
+        @test only(caches(mutable_result.plan)).op.value == 2 .* data
         @test mutable_result(2.0) == prepare(C.mutable_result)(2.0, data)
+        # A tuple cell value is cached by its fields (todo 0r1g1v3).
         tuple_result = prepare(C.tuple_result; bound = (; data))
-        @test isempty(caches(tuple_result.plan))
+        tuple_caches = Dict(only(r.outputs).name => r.op.value
+                            for r in caches(tuple_result.plan))
+        @test tuple_caches == Dict(:bound_plate_transformed_1 => data,
+                                   :bound_plate_transformed_2 => data .+ 1.0)
         @test tuple_result(2.0) == prepare(C.tuple_result)(2.0, data)
         bool_data = [-2, 0, 3]
         boolean = prepare(C.boolean; bound = (; data = bool_data))
@@ -151,6 +193,198 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         @test only(caches(boolean.plan)).op.value == Bool[false, true, true]
         @test boolean([2.0]) == prepare(C.boolean)([2.0], bool_data)
         @test_throws ArgumentError prepare(C.counted; bound = (; data=2.0))(3.0)
+    end
+
+    @testset "array-valued cell values: ragged index lists" begin
+        kinds = [[1, 2, 1, 1, 3], [2, 1, 1, 3, 1, 1], [3, 3]]
+        read_idx = [[1, 3], [2, 4], Int[]]
+        subjects = 1:3
+        for spec in (C.ragged_reads, C.composed_reads)
+            plain = prepare(spec)
+            C.calls[] = 0
+            bound = prepare(spec; bound = (; kinds_by_subject = kinds, read_idx, subjects))
+            @test C.calls[] == length(subjects)
+            cache = only(caches(bound.plan))
+            @test cache.op.value isa Vector{Vector{Int}}
+            @test cache.op.value == [[1, 4], [3, 6], Int[]]
+            @test !occursin("counted_findall", string(code_expr(bound)))
+            lives = (collect(1.0:6.0), [0.5, -1.0, 2.0, 3.0, 0.0, 7.0])
+            results = [bound(live) for live in lives]
+            @test C.calls[] == length(subjects)
+            @test results == [plain(live, kinds, read_idx, subjects) for live in lives]
+            @test first(results) == 14.0
+            rebound = prepare(spec; bound = (; kinds_by_subject = [[1, 1]],
+                                             read_idx = [[2]], subjects = 1:1))
+            @test only(caches(rebound.plan)).op.value == [[2]]
+            @test rebound(first(lives)) == 2.0
+            @test bound(first(lives)) == 14.0
+            external, values = RK._externalize_bound_arrays(bound)
+            @test external(first(lives), values...) == 14.0
+        end
+        # A condition on the cached array partitions the plate by lane.
+        guard_kinds = [[1, 2, 1], [3, 3], [1]]
+        C.calls[] = 0
+        guarded = prepare(C.guarded_reads;
+                          bound = (; kinds_by_subject = guard_kinds, subjects))
+        @test C.calls[] == length(subjects)
+        @test count(r -> r.op isa RK._AuthoredPlateOp, guarded.plan.recipes) == 2
+        for q in ([0.5, 0.25], [-1.0, 2.0])
+            @test guarded(q) == prepare(C.guarded_reads)(q, guard_kinds, subjects) ==
+                  sum(q) * 5
+        end
+        @test C.calls[] == length(subjects) + 2length(subjects)
+    end
+
+    @testset "nested plates, scans and prepared kernels stay in the cell" begin
+        kinds = [[1, 2, 1, 1, 2, 1], [2, 2, 1, 2, 1], Int[], [1, 1]]
+        steps = [[0.5, 1.0, 0.25, 2.0, 1.5, 0.75], [0.0, 1.5, 0.5, 1.0, 2.0],
+                 Float64[], [0.5, 0.5]]
+        read_idx = [[3, 1, 4], [2, 1, 2], Int[], Int[]]
+        subjects = 1:4
+        selection = [[4, 1, 6], [5, 3, 5], Int[], Int[]]
+        cache_names(p) = sort([only(r.outputs).name for r in caches(p)])
+        structure(k) = [(e.kind, e.depth) for e in recipe_inventory(k) if e.kind !== :ordinary]
+        cases = (
+            (C.scan_reads, (; kinds_by_subject = kinds, steps_by_subject = steps,
+                            read_idx, subjects),
+             [:bound_plate_kinds, :bound_plate_observation_operations, :bound_plate_steps],
+             [(:plate, 0), (:scan, 1)]),
+            (C.nested_reads, (; kinds_by_subject = kinds, read_idx, subjects),
+             [:bound_plate_observation_operations], [(:plate, 0), (:plate, 1)]),
+            (C.embedded_reads, (; kinds_by_subject = kinds, read_idx, subjects),
+             [:bound_plate_kinds, :bound_plate_observation_operations], [(:plate, 0)]))
+        for (spec, data, names, nesting) in cases
+            plain = prepare(spec)
+            C.calls[] = 0
+            bound = prepare(spec; bound = data)
+            @test C.calls[] == length(subjects)
+            @test cache_names(bound.plan) == names
+            @test only(filter(r -> only(r.outputs).name === :bound_plate_observation_operations,
+                              caches(bound.plan))).op.value == selection
+            @test structure(bound) == nesting
+            body = plate_body(only(plates(bound.plan)))
+            @test any(r -> r.op isa Union{RK._AuthoredPlateOp,RK._AuthoredScanOp} ||
+                           RK._embedded_kernel(r.op) !== nothing, body.recipes)
+            @test !occursin("counted_findall", string(code_expr(bound)))
+            for live in ([0.3, 0.7, 1.1, 0.2, -0.4, 0.9], [1.2, -0.4, 0.0, 2.0, 0.5, 0.1])
+                expected = plain(live, data...)
+                C.calls[] = 0
+                @test bound(live) == expected
+                @test C.calls[] == 0
+            end
+        end
+    end
+
+    @testset "record cell values: cached by their leaves (todo 0r1g1v3)" begin
+        times = [[0.0, 0.5, 1.5, 2.0], [0.0, 1.0], [0.0], [0.0, 0.25, 0.75]]
+        subjects = 1:4
+        data = (; times_by_subject = times, subjects)
+        designs = [(; idx = findall(>(0.0), t), dt = diff(t)) for t in times]
+        cache_names(p) = sort([only(r.outputs).name for r in caches(p)])
+        cases = (
+            (C.record_reads, 1, [:bound_plate_design_dt, :bound_plate_design_idx]),
+            (C.tuple_reads, 1, [:bound_plate_design_1, :bound_plate_design_2]),
+            # the record's own constructor counts too, and is not run again
+            (C.struct_reads, 2, [:bound_plate_design_dt, :bound_plate_design_idx]),
+            (C.nested_record_reads, 1,
+             [:bound_plate_design_scale, :bound_plate_design_steps_dt,
+              :bound_plate_design_steps_idx]))
+        lives = ([0.3, 0.7, 1.1, 0.2], [1.2, -0.4, 0.0, 2.0])
+        for (spec, per_cell, names) in cases
+            plain = prepare(spec)
+            C.calls[] = 0
+            bound = prepare(spec; bound = data)
+            @test C.calls[] == per_cell * length(subjects)
+            @test cache_names(bound.plan) == names
+            for live in lives
+                expected = plain(live, times, subjects)
+                C.calls[] = 0
+                @test bound(live) == expected
+                @test C.calls[] == 0
+            end
+            @test !occursin("counted_", string(code_expr(bound)))
+            external, values = RK._externalize_bound_arrays(bound)
+            @test external(first(lives), values...) == plain(first(lives), times, subjects)
+            # A position batch reads the same cached leaves.
+            batch = vectorize(bound; batched = :rates)
+            positions = reduce(hcat, lives)
+            expected = [plain(live, times, subjects) for live in lives]
+            C.calls[] = 0
+            @test batch(positions) == expected
+            @test C.calls[] == 0
+        end
+        record = only(filter(r -> only(r.outputs).name === :bound_plate_design_idx,
+                             caches(prepare(C.record_reads; bound = data).plan)))
+        @test record.op.value == getproperty.(designs, :idx)
+        @test record.op.value isa Vector{Vector{Int}}
+        # A range field is no cache leaf, so the record stays in the cell; the
+        # per-subject times it reads are cached instead.
+        plain = prepare(C.ranged_record_reads)
+        bound = prepare(C.ranged_record_reads; bound = data)
+        @test cache_names(bound.plan) == [:bound_plate_times]
+        expected = plain(first(lives), times, subjects)
+        C.calls[] = 0
+        @test bound(first(lives)) == expected
+        @test C.calls[] == length(subjects)
+        # Rebinding to records of the same type reuses the rewritten plate
+        # (`_PlateRewrites`) with the new binding's leaves.
+        first_bound = prepare(C.record_reads; bound = data)
+        other = (; times_by_subject = [[0.0, 2.0, 3.0], [0.0, 0.5]], subjects = 1:2)
+        rebound = prepare(C.record_reads; bound = other)
+        @test only(filter(r -> only(r.outputs).name === :bound_plate_design_dt,
+                          caches(rebound.plan))).op.value == [[2.0, 1.0], [0.5]]
+        @test rebound([0.5, 0.25]) == prepare(C.record_reads)([0.5, 0.25], other...)
+        @test first_bound(first(lives)) ==
+              prepare(C.record_reads)(first(lives), times, subjects)
+    end
+
+    @testset "data-only cell results" begin
+        limits = [0.5, 1.0, 1.0, 0.5, 1.0, 1.0]
+        rows = [[1, 2, 3], [4], [5, 6]]
+        subjects = 1:3
+        lives = ([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], [1.2, -0.4, 0.0, 2.0, 0.5, 0.1])
+        plain = prepare(C.data_only_result)
+        expected = [plain(live, limits, rows, subjects) for live in lives]
+        C.calls[] = 0
+        bound = prepare(C.data_only_result; bound = (; limits, rows, subjects))
+        @test C.calls[] == length(subjects)
+        # Bound inputs alone fix the domain, so the whole plate result is one
+        # hoisted value: no plate and no per-cell cache remain. Its only
+        # consumer, `flat`, then reads only bind-time values and is hoisted
+        # too, so no evaluation concatenates the shared cells.
+        @test isempty(plates(bound.plan))
+        @test isempty(caches(bound.plan))
+        @test !any(r -> only(r.outputs).name === :weights, bound.plan.recipes)
+        hoisted = only(r for r in bound.plan.recipes
+                       if r.op isa RK._BoundConstant &&
+                          only(r.outputs).name === :flat)
+        @test hoisted.op.value isa Vector{Float64}
+        @test hoisted.op.value == reduce(vcat, [limits[r] for r in rows])
+        @test [bound(live) for live in lives] == expected
+        @test C.calls[] == length(subjects)
+        @test hoisted.op.value == reduce(vcat, [limits[r] for r in rows])
+        # More subjects change only the hoisted value, not the emitted residual.
+        more = prepare(C.data_only_result; bound = (; limits = repeat(limits, 2),
+            rows = vcat(rows, [r .+ 6 for r in rows]), subjects = 1:6))
+        @test isempty(plates(more.plan))
+        @test [typeof(r.op) for r in more.plan.recipes] ==
+              [typeof(r.op) for r in bound.plan.recipes]
+        @test more(repeat(first(lives), 2)) ==
+              plain(repeat(first(lives), 2), repeat(limits, 2),
+                    vcat(rows, [r .+ 6 for r in rows]), 1:6)
+
+        # A live non-atomic input keeps the plate, its runtime domain check
+        # and a result allocated per evaluation.
+        axis_plain = prepare(C.data_only_result_live_axis)
+        axis = prepare(C.data_only_result_live_axis; bound = (; limits, rows))
+        @test length(plates(axis.plan)) == 1
+        @test isempty(caches(axis.plan))
+        x = [1.0, 2.0, 3.0]
+        axis_expected = axis_plain(x, limits, rows)
+        C.calls[] = 0
+        @test axis(x) == axis_expected
+        @test C.calls[] == length(rows)
+        @test_throws DimensionMismatch axis([1.0, 2.0])
     end
 
     @testset "demanded intermediates and composed consumers" begin
@@ -180,4 +414,121 @@ import Enzyme
     @test ad_value_and_gradient(bound, q) == ad_value_and_gradient(plain, q, data)
     @test ad_gradient(bound, q) ≈ fill(sum(log, data), length(q))
     @test ad_gradient(bound, 2q) == ad_gradient(bound, q)
+
+    # A live port declaring only its rank caches and differentiates like one
+    # declaring its element type (snag rk-declared-rank-317aa725).
+    live_q = [0.5, 2.0, 3.0]
+    rank_plain = prepare_ad(C.vector_live_rank, backend, live_q, data;
+                            active=:q, want=:total)
+    rank_bound = prepare_ad(C.vector_live_rank, backend, live_q; active=:q,
+                            want=:total, bound=(; data))
+    @test length(filter(r -> r.op isa ReactiveKernels._BoundConstant &&
+        startswith(String(only(r.outputs).name), "bound_plate_"),
+        rank_bound.kernel.plan.recipes)) == 1
+    @test ad_value_and_gradient(rank_bound, live_q) ==
+          ad_value_and_gradient(rank_plain, live_q, data)
+    @test ad_gradient(rank_bound, live_q) == log.(data)
+
+    xs = [[1.0, 2.0], [4.0], Float64[]]
+    plain = prepare_ad(C.array_weights, backend, q, xs; active=:q, want=:total)
+    bound = prepare_ad(C.array_weights, backend, q; active=:q, want=:total,
+                       bound=(; xs))
+    cached = filter(r -> r.op isa ReactiveKernels._BoundConstant &&
+        startswith(String(only(r.outputs).name), "bound_plate_"), bound.kernel.plan.recipes)
+    # The cell reads its per-cell array only through `sum`, so the split
+    # caches that sum rather than the array.
+    @test only(cached).op.value == [sum(log.(x)) for x in xs]
+    @test ad_value_and_gradient(bound, q) == ad_value_and_gradient(plain, q, xs)
+    @test ad_gradient(bound, q) ≈ fill(sum(sum(log, x; init = 0.0) for x in xs), length(q))
+
+    # A data-only cell result must not reach native reverse mode as cached
+    # arrays stored into the plate's output (snag native-reverse-r-79fb001d).
+    limits = [0.5, 1.0, 1.0, 0.5, 1.0, 1.0]
+    rows = [[1, 2, 3], [4], [5, 6]]
+    subjects = 1:3
+    live = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    plain = prepare_ad(C.data_only_result, backend, live, limits, rows, subjects;
+                       active=:live, want=:total)
+    bound = prepare_ad(C.data_only_result, backend, live; active=:live,
+                       want=:total, bound=(; limits, rows, subjects))
+    @test ad_value_and_gradient(bound, live) ==
+          ad_value_and_gradient(plain, live, limits, rows, subjects)
+    @test ad_gradient(bound, live) == reduce(vcat, [limits[r] for r in rows])
+    # The hoisted plate's consumer `reduce(vcat, …)` is hoisted too. Left in
+    # the residual, it concatenated the shared constant cells on every
+    # evaluation, which native reverse mode rejected for this inlined spelling
+    # (snag native-reverse-a-8009a109).
+    flat = reduce(vcat, [limits[r] for r in rows])
+    inline = prepare(C.data_only_result_inline; want=:total,
+                     bound=(; limits, rows, subjects))
+    for ad in (prepare_ad(C.data_only_result_inline, backend, live; active=:live,
+                          want=:total, bound=(; limits, rows, subjects)),
+               prepare_ad(inline, backend, live; active=:live))
+        @test ad_value_and_gradient(ad, live) == (sum(flat .* live), flat)
+    end
+    @test live == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    x = [1.0, 2.0, 3.0]
+    plain = prepare_ad(C.data_only_result_live_axis, backend, x, limits, rows;
+                       active=:live, want=:total)
+    bound = prepare_ad(C.data_only_result_live_axis, backend, x; active=:live,
+                       want=:total, bound=(; limits, rows))
+    @test ad_value_and_gradient(bound, x) ==
+          ad_value_and_gradient(plain, x, limits, rows)
+    @test ad_gradient(bound, x) == fill(sum(limits), length(x))
+
+    # A scan beside the cached index chain differentiates in the residual cell.
+    data = (; kinds_by_subject = [[1, 2, 1, 1, 2, 1], [2, 2, 1, 2, 1], Int[]],
+            steps_by_subject = [[0.5, 1.0, 0.25, 2.0, 1.5, 0.75], [0.0, 1.5, 0.5, 1.0, 2.0],
+                                Float64[]],
+            read_idx = [[3, 1, 4], [2, 1, 2], Int[]], subjects = 1:3)
+    rates = [0.3, 0.7, 1.1]
+    plain = prepare_ad(C.scan_reads, backend, rates, data...; active=:rates, want=:total)
+    bound = prepare_ad(C.scan_reads, backend, rates; active=:rates, want=:total,
+                       bound=data)
+    @test length(filter(r -> r.op isa ReactiveKernels._BoundConstant &&
+        startswith(String(only(r.outputs).name), "bound_plate_"),
+        bound.kernel.plan.recipes)) == 3
+    for point in (rates, [1.2, -0.4, 0.5])
+        value, gradient = ad_value_and_gradient(bound, point)
+        expected_value, expected_gradient = ad_value_and_gradient(plain, point, data...)
+        @test value == expected_value
+        @test gradient ≈ expected_gradient
+        primal = prepare(C.scan_reads; bound=data)
+        h = 1e-6
+        central = [(primal(point .+ h .* (1:3 .== i)) -
+                    primal(point .- h .* (1:3 .== i))) / 2h for i in 1:3]
+        @test isapprox(gradient, central; rtol=1e-6, atol=1e-8)
+        C.calls[] = 0
+        ad_value_and_gradient(bound, point)
+        @test C.calls[] == 0
+    end
+
+    # Records rebuilt in the cell from cached leaves differentiate under plain
+    # Reverse (todo 0r1g1v3). The unbound cell, which builds the record from
+    # constant data in every evaluation, is not the reference: registered
+    # Enzyme rejects it ("Constant memory is stored (or returned) to a
+    # differentiable variable"), so the reference is the analytic derivative.
+    times = [[0.0, 0.5, 1.5, 2.0], [0.0, 1.0], [0.0], [0.0, 0.25, 0.75]]
+    data = (; times_by_subject = times, subjects = 1:4)
+    rates = [0.3, 0.7, 1.1, 0.2]
+    steps = diff.(times)
+    for (spec, scale) in ((C.record_reads, ones(4)), (C.tuple_reads, ones(4)),
+                          (C.struct_reads, ones(4)),
+                          (C.nested_record_reads, 2.0 .+ length.(times)))
+        primal = prepare(spec)
+        bound = prepare_ad(spec, backend, rates; active=:rates, want=:total, bound=data)
+        @test !isempty(filter(r -> r.op isa ReactiveKernels._BoundConstant &&
+            startswith(String(only(r.outputs).name), "bound_plate_design"),
+            bound.kernel.plan.recipes))
+        for point in (rates, [1.2, -0.4, 0.5, 2.0])
+            expected_value = primal(point, data...)
+            expected_gradient = [-scale[s] * sum(steps[s] .* exp.(-point[s] .* steps[s]);
+                                                 init = 0.0) for s in 1:4]
+            C.calls[] = 0
+            value, gradient = ad_value_and_gradient(bound, point)
+            @test C.calls[] == 0
+            @test value == expected_value
+            @test gradient ≈ expected_gradient
+        end
+    end
 end

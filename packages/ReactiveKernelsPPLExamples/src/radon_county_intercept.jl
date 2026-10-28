@@ -71,8 +71,6 @@ using LogExpFunctions: logistic, log1pexp
 
     parameters = (; alpha, beta, sigma_y)
     (parameters, log_jacobian::Float64) = ((; alpha, beta, sigma_y), log_sigma_y)
-    (alpha::AbstractVector{Float64}, beta::Float64, sigma_y::Float64) =
-        (parameters.alpha, parameters.beta, parameters.sigma_y)
 
     # Fixed priors (all proper): beta ~ Normal(0, 10) and sigma_y ~ Normal(0, 1)
     # (half-normal = plain normal_lpdf; the lower=0 constraint carries the half,

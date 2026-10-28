@@ -69,7 +69,7 @@ and `ahmc 1000`, to compare the same number of chained transitions. The
 positive leapfrog count; the default is four. The comparison always uses that
 same count for AdvancedHMC.
 
-The environment pins Reactant 0.2.284 and Enzyme 0.13.199 and develops the local
+The environment pins Reactant 0.2.289 and Enzyme 0.13.199 and develops the local
 compiler, distribution kernels, and PPL example packages. Setup creates a local
 Manifest; it does not change the root project.
 

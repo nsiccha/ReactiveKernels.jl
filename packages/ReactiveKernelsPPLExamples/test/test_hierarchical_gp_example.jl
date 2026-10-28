@@ -5,6 +5,20 @@ using ReactiveKernelsPPLExamples.HierarchicalGPExample:
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, gamma, dirichlet
 using LinearAlgebra
 using SpecialFunctions: loggamma
+using DifferentiationInterface
+import Enzyme
+
+const _HGP_AE = AutoEnzyme(mode = Enzyme.Reverse)
+
+function _hgp_fd(f, q; h = 1e-6)
+    g = similar(q)
+    for i in eachindex(q)
+        qp = copy(q); qp[i] += h
+        qm = copy(q); qm[i] -= h
+        g[i] = (f(qp) - f(qm)) / (2h)
+    end
+    g
+end
 
 # Graph-independent reference oracle for posteriordb hierarchical_gp: the ILR
 # simplex variance decomposition, dual per-year Cholesky GPs, year/state/region
@@ -92,5 +106,24 @@ end
         @test log_jacobian ≈ ref.log_jacobian
         @test posterior ≈ ref.posterior
         @test posterior ≈ log_prior + likelihood + log_jacobian
+    end
+
+    @testset "native primal + plain-Enzyme gradient vs finite differences" begin
+        q = 0.25 .* [sin(0.5 * i) for i in 1:dim]
+        q[nyr * nrg + nyr * nst + nyo + nst + nrg + 18] = 0.5   # mu
+        _ref(qq) = _hgp_reference(qq, HGP_Y, HGP_YEAR_IND, HGP_STATE_IND,
+            HGP_REGION_IND, HGP_STATE_REGION_IND, nyr, nrg, nst, nyo).posterior
+        pk = prepare(model;
+            have = (:unconstrained, :y, :year_ind, :state_ind, :region_ind, :state_region_ind,
+                    :N_years, :N_regions, :N_states, :N_years_obs),
+            want = :posterior,
+            bound = (; y = HGP_Y, year_ind = HGP_YEAR_IND, state_ind = HGP_STATE_IND,
+                region_ind = HGP_REGION_IND, state_region_ind = HGP_STATE_REGION_IND,
+                N_years = nyr, N_regions = nrg, N_states = nst, N_years_obs = nyo))
+        prep = prepare_ad(pk, _HGP_AE, q; active = :unconstrained)
+        value, g = ReactiveKernels.ad_value_and_gradient!(prep, similar(q), q)
+        @test value ≈ _ref(q)
+        @test all(isfinite, g)
+        @test g ≈ _hgp_fd(_ref, q) rtol = 1e-5
     end
 end

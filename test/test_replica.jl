@@ -2,6 +2,7 @@ using ReactiveKernels
 using DifferentiationInterface
 using Enzyme
 using LinearAlgebra
+using ReactantCore
 
 @kernel replica_transition(
         q::Vector{Float64}, p0::Vector{Float64}, u::Float64,
@@ -82,6 +83,34 @@ end
     @test_throws DimensionMismatch both(positions, [2.0, 3.0, 4.0])
 end
 
+@testset "graph-native position invariant hoisting" begin
+    @kernel invariant_source(theta::Float64, data::Vector{Float64}) = begin
+        transformed::Vector{Float64} = log.(data)
+        total::Float64 = theta * sum(transformed)
+        pointwise::Vector{Float64} = theta .* transformed
+        return (total, pointwise)
+    end
+
+    kernel = prepare_batched(invariant_source;
+                             batched = :theta, want = (:total, :pointwise))
+    @test kernel isa ReactiveKernels.GraphReplicatedKernel
+    data = collect(1.0:4.0)
+    totals, pointwise = kernel([2.0, 3.0], data)
+    transformed = log.(data)
+    @test totals ≈ [2sum(transformed), 3sum(transformed)]
+    @test pointwise ≈ [2 .* transformed 3 .* transformed]
+    # The shared recipe runs once on the shared data above the position loop,
+    # never on a projected position inside it.
+    expression = code_expr(kernel)
+    loop_index = findlast(node -> node isa Expr && node.head === :for,
+                          expression.args[2].args)
+    before_loop = string(Expr(:block, expression.args[2].args[1:loop_index-1]...))
+    loop = string(expression.args[2].args[loop_index])
+    @test occursin("(__ops__[1])(data)", before_loop)
+    @test !occursin("(__ops__[1])", loop)
+    @test !occursin("(__ops__[1])(var\"##theta_position", before_loop)
+end
+
 @kernel replica_defaulted(x::Float64, offset::Float64 = 1.0) = begin
     y::Float64 = x + offset
 end
@@ -120,4 +149,39 @@ end
     defaulted = replica(replica_defaulted; batched = :x)
     @test defaulted([2.0, 3.0]) == [3.0, 4.0]
     @test defaulted([2.0, 3.0], 0.5) == [2.5, 3.5]
+end
+
+@testset "prepared kernels are statically untraced" begin
+    # A nested plain op (`\`) splices a `:kernel_plain_op` provenance key
+    # carrying output `Type`s into the lowered recipes; ReactantCore's
+    # structural `is_traced` walk used to reach those types and throw
+    # `type DataType has no field var` instead of returning `false`.
+    @kernel untraced_ldiv_piece(A::Matrix{Float64}, b::Vector{Float64}) = begin
+        z::Vector{Float64} = A \ b
+        return z
+    end
+    @kernel untraced_ldiv_model(A::Matrix{Float64}, b::Vector{Float64}) = begin
+        z::Vector{Float64} = untraced_ldiv_piece(A, b)
+        total::Float64 = sum(z)
+        return total
+    end
+
+    prepared = prepare(untraced_ldiv_model; want = :total)
+    @test any(prepared.lowered_recipes) do recipe
+        key = recipe.cse_key
+        key isa Tuple && length(key) == 4 &&
+            key[1] === :kernel_plain_op && any(t -> t isa Type, key[4])
+    end
+    @test ReactantCore.is_traced(prepared) == false
+    @test ReactantCore.is_traced(prepared, Base.IdSet{Any}()) == false
+
+    replicated = replica(prepared; batched = :b)
+    @test ReactantCore.is_traced(replicated) == false
+    @test ReactantCore.is_traced(replicated, Base.IdSet{Any}()) == false
+
+    prepared_ad = prepare_ad(untraced_ldiv_model,
+        AutoEnzyme(mode = Enzyme.Reverse),
+        [2.0 0.5; 0.5 1.0], [1.0, 2.0]; active = :b, want = :total)
+    @test ReactantCore.is_traced(prepared_ad) == false
+    @test ReactantCore.is_traced(prepared_ad, Base.IdSet{Any}()) == false
 end

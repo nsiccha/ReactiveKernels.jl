@@ -8,7 +8,7 @@ module DistributionExamples
 export CONTINUOUS_SOURCE, DISCRETE_SOURCE, VECTORIZED_SOURCE
 export CAUCHY_SOURCE, LAPLACE_SOURCE, LOGNORMAL_SOURCE
 export HAVE_ROUTES_SOURCE, EXTRACT_JOINT_SOURCE
-export BROADCAST_REF_SOURCE, INVARIANT_HOISTING_SOURCE
+export BROADCAST_CLOSURE_SOURCE, INVARIANT_HOISTING_SOURCE
 export lowering_sources, run_lowering_source
 export LOCATION_SCALE_SOURCE
 export normal, cauchy, laplace, bernoulli, lognormal
@@ -183,15 +183,15 @@ docs_example = (; name = :normal_extract_joint,
     kernel = joint_kernel, output = (lp, c))
 """
 
-# C3: natural broadcast semantics with a Ref-wrapped atomic array argument.
-const BROADCAST_REF_SOURCE = raw"""
+# C3: natural broadcast semantics, with a whole array read by closure.
+const BROADCAST_CLOSURE_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 
-# x zips with mu (both length-N); scale repeats (scalar); baseline is a whole
-# vector passed atomically with Ref, so each body call sees all of it.
-@kernel broadcast_ref_demo(x, mu, scale, baseline) = begin
-    pointwise = plate(x, mu, scale, Ref(baseline)) do xi, mui, si, base
-        normal(mui + sum(base), si).logpdf(xi)
+# x zips with mu (both length-N); scale repeats (scalar); the cell closes over
+# the whole baseline vector, so each body call sees all of it.
+@kernel broadcast_closure_demo(x, mu, scale, baseline) = begin
+    pointwise = plate(x, mu, scale) do xi, mui, si
+        normal(mui + sum(baseline), si).logpdf(xi)
     end
     return sum(pointwise)
 end
@@ -200,12 +200,12 @@ x = [0.4, -1.1, 0.7, 0.2]
 mu = [0.0, 0.5, -0.3, 0.1]
 scale = 1.2
 baseline = [0.1, -0.2, 0.05]
-kernel = prepare(broadcast_ref_demo)
+kernel = prepare(broadcast_closure_demo)
 output = kernel(x, mu, scale, baseline)
 
-docs_example = (; name = :normal_broadcast_ref,
-    origin = "plate with zipped observations, a repeated scalar, and a Ref atom (build executed)",
-    inputs = (; x, mu, scale, baseline), spec = broadcast_ref_demo,
+docs_example = (; name = :normal_broadcast_closure,
+    origin = "plate with zipped observations, a repeated scalar, and a closure over a whole vector (build executed)",
+    inputs = (; x, mu, scale, baseline), spec = broadcast_closure_demo,
     kernel = kernel, output = output)
 """
 
@@ -214,9 +214,10 @@ const INVARIANT_HOISTING_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 
 # Batched Normal log-likelihood: x varies over the batch; location and scale are
-# shared. Scale-only work (log_scale) is a complete invariant and is hoisted to
-# the loop preamble; standardization depends on x and stays in the loop.
-@kernel normal_batch_loglik(x, location, scale) = begin
+# declared scalars shared by every cell. Scale-only work (log_scale) is a
+# complete invariant and is hoisted to the loop preamble; standardization
+# depends on x and stays in the loop.
+@kernel normal_batch_loglik(x::Vector{Float64}, location::Float64, scale::Float64) = begin
     pointwise = plate(x, location, scale) do xi, li, si
         normal(li, si).logpdf(xi)
     end
@@ -228,9 +229,10 @@ kernel = prepare(normal_batch_loglik)
 output = kernel(x, location, scale)
 
 # The generated kernel is dependency-aware: the scale-only log_scale op is
-# emitted ONCE in the hoisted preamble, before the batch loop.
+# emitted ONCE, in the hoisted preamble before the batch loop. The declared
+# types leave no runtime axis test in the kernel.
 generated = string(code_expr(kernel))
-@assert occursin("_authored_plate_is_axis", generated)
+@assert !occursin("_authored_plate_is_axis", generated)
 @assert first(findfirst("plate_log_scale", generated)) < first(findfirst("for ", generated))
 
 docs_example = (; name = :normal_invariant_hoisting,
@@ -241,7 +243,7 @@ docs_example = (; name = :normal_invariant_hoisting,
 
 lowering_sources() = (
     HAVE_ROUTES_SOURCE, EXTRACT_JOINT_SOURCE,
-    BROADCAST_REF_SOURCE, INVARIANT_HOISTING_SOURCE,
+    BROADCAST_CLOSURE_SOURCE, INVARIANT_HOISTING_SOURCE,
 )
 
 # Sandbox-evaluate a lowering panel exactly as the docs render it; the source's

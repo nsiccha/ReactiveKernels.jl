@@ -68,8 +68,8 @@ deterministic and backend-neutral; RNG ownership stays with the caller.
     mean::Vector{Float64} = position .+ covariance * gradient
     covariance_factorization = cholesky(Symmetric(covariance))
     # Use the factorization's generic packed-factor surface. Native Cholesky
-    # and Reactant's BatchedCholesky both store the authoritative upper factor
-    # there, whereas only the native object provides the convenience `.L`.
+    # and the Reactant extension's traced Cholesky both store the
+    # authoritative upper factor there.
     covariance_factor = UpperTriangular(covariance_factorization.factors)
     elbo_draws::Matrix{Float64} =
         mean .+ transpose(covariance_factor) * elbo_standard_draws

@@ -203,7 +203,7 @@ unknown = [name for name in requested if !haskey(RK, name)]
 isempty(unknown) || error("all80 reactant: unknown key(s): $(join(unknown, ", "))")
 # Match the native default: the immutable frozen-82 sweep excludes incremental batch keys.
 targets = isempty(requested) ?
-    sort(collect(setdiff(keys(RK), All80Registry.BATCH1_KEYS))) : requested
+    sort(collect(setdiff(keys(RK), All80Registry.BATCH_KEYS))) : requested
 retry_requested = get(ENV, "RK_ALL80_RETRY", "") == "1"
 retry_requested && isempty(requested) &&
     error("RK_ALL80_RETRY=1 requires explicit model keys; refusing to replay all 82 implicitly")

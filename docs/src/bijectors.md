@@ -90,7 +90,9 @@ Reusable child kernels currently have a deliberately static splice boundary:
 
 - the callee resolves to a global stateless `KernelSpec`;
 - arguments are existing parent graph ports and are passed positionally;
-- the child HAVE and WANT boundaries are supplied and destructured exactly;
+- the child HAVE boundary is supplied exactly, and its WANT boundary is
+  destructured (a shorter left side binds the leading outputs) or bound whole
+  to one name as a tuple (which computes every output);
 - corresponding parent and child ports have exact declared types; and
 - recipe cost/CSE metadata belongs inside the reusable child, not at the call
   site.

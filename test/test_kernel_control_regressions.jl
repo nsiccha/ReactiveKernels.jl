@@ -145,3 +145,34 @@ end
     @test effreg !== nothing
     @test_throws ErrorException RKC._argmap(callee, _call(:h, [effreg]))
 end
+
+module _CtlGuardValue  # guard condition = acyclic helper whose trailing statement is a ternary
+  using ReactiveKernels
+  @kernel adv(s;) = begin
+    flip(v) = v > 0 ? true : v < -1
+    step!(v) = begin
+      flip(__self__, v) && (s.count = s.count + 1)
+      return nothing
+    end
+  end
+end
+
+@testset "control regression — inlined value-position helper ending in a ternary binds its guard value" begin
+    # MethodIR marks a method's trailing EXPRESSION as a `_Return`, but a trailing `if`/ternary stays an
+    # `_If` whose arms are bare `_ExprStmt`s.  Inlining such a helper as a guard value (`flip(...) && ...`)
+    # therefore emitted the arm values as discarded effects and the branch read `__rk_guard_value_<pc>`
+    # before any assignment (the HMC fixture's `randbernoullilog(__self__, rng, dham) && copy!!(init, fwd)`).
+    program = RKC._control_program(_CtlGuardValue.adv; root_name=:step!, lower_all_loops=true)
+    effects = reduce(vcat, [collect(b.effects) for b in program.blocks]; init=Any[])
+    is_guard_local(name) = startswith(String(name), "__rk_guard_value_")
+    guard_assigns = [e for e in effects if e isa RKC._LocalAssign && is_guard_local(only(e.lhs))]
+    @test length(guard_assigns) == 2                                   # one per arm of the trailing ternary
+    @test any(e -> e.rhs isa RKC._Lit && e.rhs.value === true, guard_assigns)
+    @test !any(e -> e isa RKC._ExprStmt && e.expr isa RKC._Lit && e.expr.value === true, effects)
+    @test any(block -> block.term === :branch && block.condition isa RKC._LocalRef &&
+                       is_guard_local(block.condition.name), program.blocks)
+    @test any(is_guard_local, program.stored[program.root_mid])           # the frame carries it
+    # The conversion itself: a trailing `_If` gets `_Return` arms (a discarded call never asks for it).
+    plain = RKC._control_value_body(Any[RKC._If(RKC._Lit(true), (RKC._ExprStmt(RKC._Lit(1)),), (RKC._ExprStmt(RKC._Lit(2)),))])
+    @test only(plain) isa RKC._If && only(only(plain).thenb) isa RKC._Return && only(only(plain).elseb) isa RKC._Return
+end

@@ -91,13 +91,13 @@ using LogExpFunctions: logsumexp
         sum(LOG_THETA) + M * (0.5 * log(K)) +
         sum(LOG_PHI) + K * (0.5 * log(V))
 
-    # Dirichlet priors (shared `dirichlet` object per simplex column; the shared
-    # concentration vector is passed via Ref so it is a declared caller port)
-    theta_prior_terms = plate(eachcol(THETA), Ref(alpha)) do th, a
-        dirichlet(a).logpdf(th)
+    # Dirichlet priors (shared `dirichlet` object per simplex column; each cell
+    # closes over the shared concentration vector)
+    theta_prior_terms = plate(eachcol(THETA)) do th
+        dirichlet(alpha).logpdf(th)
     end
-    phi_prior_terms = plate(eachcol(PHI), Ref(beta)) do ph, b
-        dirichlet(b).logpdf(ph)
+    phi_prior_terms = plate(eachcol(PHI)) do ph
+        dirichlet(beta).logpdf(ph)
     end
     prior::Float64 = sum(theta_prior_terms) + sum(phi_prior_terms)
 

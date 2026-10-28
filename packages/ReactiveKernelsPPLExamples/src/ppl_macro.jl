@@ -22,9 +22,10 @@ in ReactiveKernels core.
 
 The surface mirrors StanBlocks (`@slic`) for typed-LHS `name` / `name::real` /
 `name::vector[size]`; support constraints use the rk-native `positive(dist(…))`
-combinator (PROVISIONAL — decision `1uczi8y` resolved "no preference; do whatever
-for now, mark provisional"). No invented `::positive` / `name[size]` forms, and
-(per user review) no `lower=` distribution keyword.
+and `stan_positive(dist(…))` combinators (PROVISIONAL — decision `1uczi8y`
+resolved "no preference; do whatever for now, mark provisional"). No invented
+`::positive` / `name[size]` forms, and (per user review) no `lower=`
+distribution keyword.
 
 Decisions: build GO `2026-09-06T14-20-02-559-1r5p4j1`; scope MINIMAL
 `2026-09-06T14-20-27-206-0wqzaq4`.
@@ -45,13 +46,15 @@ Decisions: build GO `2026-09-06T14-20-02-559-1r5p4j1`; scope MINIMAL
   (real support) — take a packed slice of `size` coordinates (`size` a data
   argument or literal; the packed layout tracks a running offset), and their
   prior is the summed per-element authored `plate`.
-- **Support constraints use the rk-native `positive(dist(…))` combinator**
-  (PROVISIONAL, decision `1uczi8y`): a naturally-positive family
-  (`exponential`/`gamma`/`lognormal`) already implies positive support, and
-  `positive(<real family>)` is a **half distribution** whose prior adds
-  `-log(1 - cdf(0))` via the family's own `.cdf` — e.g.
-  `sigma ~ positive(normal(0, 5))` (half-Normal),
-  `tau ~ positive(cauchy(0, 5))` (half-Cauchy).
+- **Support constraints use the rk-native `positive(dist(…))` and
+  `stan_positive(dist(…))` combinators** (PROVISIONAL, decision `1uczi8y`):
+  a naturally-positive family (`exponential`/`gamma`/`lognormal`) already
+  implies positive support. For a real-support family, `positive(...)` is a
+  **proper half distribution** whose prior adds `-log(1 - cdf(0))` via the
+  family's own `.cdf` — e.g. `sigma ~ positive(normal(0, 5))` (half-Normal),
+  `tau ~ positive(cauchy(0, 5))` (half-Cauchy). `stan_positive(...)`
+  constrains support identically but keeps Stan's lower-bound kernel
+  convention: the bare symmetric prior, with no `+log(2)`.
 - **Improper / flat priors** (Stan's "no prior statement"): `x ~ flat()` declares
   a real-support latent with a ZERO prior contribution — it still takes an
   unconstrained coordinate (identity transform). `positive(flat())` gives
@@ -135,6 +138,9 @@ struct _Param
     improper::Bool   # a flat/improper prior (`flat()`): the latent is declared —
                      # it takes an unconstrained coordinate, the support transform,
                      # and the transform's log-Jacobian — but contributes 0 to :prior
+    stan_half::Bool  # a constrained real-support prior under Stan's lower-bound
+                     # kernel convention: keep the bare symmetric density and add
+                     # no `-log(1 - cdf(0))` normalization
 end
 
 # Running packed-offset arithmetic that stays a literal while every preceding
@@ -224,14 +230,23 @@ end
 
 # Parse the `~` right-hand side. A bare `dist(args...)` uses the family's natural
 # support; the rk-native `positive(dist(args...))` combinator constrains it to
-# positive support (a half distribution when the family's natural support is the
-# whole line). Returns (dist-head, positional RK dist call, constraint).
+# positive support as a proper half when the family's natural support is the
+# whole line. `stan_positive(dist(args...))` uses the same constraint but Stan's
+# lower-bound kernel prior (no normalization). Returns (dist-head, positional RK
+# dist call, constraint).
 #
 # PROVISIONAL constraint spelling — decision `1uczi8y` resolved "(no preference);
 # do whatever for now, mark it provisional". The `positive(…)` combinator is the
 # recommended rk-native form (it composes transparent kernel objects rather than
 # bolting a keyword onto the dist call); the final spelling may still change.
 function _parse_dist(rhs)
+    if rhs isa Expr && rhs.head === :call && rhs.args[1] === :stan_positive
+        length(rhs.args) == 2 || error(
+            "@ppl: `stan_positive(dist(…))` takes exactly one distribution " *
+            "argument, got `$(rhs)`.")
+        (head, call) = _dist_call(rhs.args[2])
+        return (head, call, :stan_positive)
+    end
     if rhs isa Expr && rhs.head === :call && rhs.args[1] === :positive
         length(rhs.args) == 2 || error(
             "@ppl: `positive(dist(…))` takes exactly one distribution argument, " *
@@ -248,7 +263,8 @@ function _dist_call(rhs)
         error("@ppl: expected a distribution call, got `$(rhs)`.")
     any(a -> a isa Expr && a.head in (:parameters, :kw), @view rhs.args[2:end]) &&
         error("@ppl: distribution keywords are not supported; constrain support " *
-              "with the `positive(dist(…))` combinator.")
+              "with the `positive(dist(…))` or `stan_positive(dist(…))` " *
+              "combinator.")
     (rhs.args[1], rhs)
 end
 
@@ -298,7 +314,8 @@ function _parse(def)
                         "@ppl: discrete latent `$(lname) ~ $(dist)(…)` cannot carry a " *
                         "support constraint.")
                     dsize = kind === :vector ? lsize : nothing
-                    push!(params, _Param(lname, dist_call, :discrete, dsize, false, true, false))
+                    push!(params, _Param(lname, dist_call, :discrete, dsize,
+                                         false, true, false, false))
                     continue
                 end
                 if dist === :flat
@@ -313,7 +330,9 @@ function _parse(def)
                     # provisional"), parallel to the `positive(dist(…))` combinator.
                     isempty(_call_args(dist_call)) || error(
                         "@ppl: `flat()` takes no arguments, got `$(dist_call)`.")
-                    effective = constraint === nothing ? :real : constraint
+                    effective = constraint === nothing ? :real :
+                                constraint === :stan_positive ? :positive :
+                                constraint
                     effective in (:real, :positive) || error(
                         "@ppl: a `$(constraint)` constraint on `flat()` is not " *
                         "supported; use `flat()` (real support) or `positive(flat())` " *
@@ -322,7 +341,8 @@ function _parse(def)
                     (fsize === nothing || effective === :real) || error(
                         "@ppl (first cut): only real-support vector parameters are " *
                         "supported yet (`$(lname)::vector[…]`).")
-                    push!(params, _Param(lname, dist_call, effective, fsize, false, false, true))
+                    push!(params, _Param(lname, dist_call, effective, fsize,
+                                         false, false, true, false))
                     continue
                 end
                 haskey(_SUPPORT, dist) || error(
@@ -331,7 +351,8 @@ function _parse(def)
                     "$(sort(collect(keys(_SUPPORT)))); discrete latents are " *
                     "$(sort(collect(_DISCRETE))); other families are a follow-up increment.")
                 natural = _SUPPORT[dist]
-                effective = constraint === nothing ? natural : constraint
+                effective = constraint === :stan_positive ? :positive :
+                            constraint === nothing ? natural : constraint
                 truncate = false
                 if constraint !== nothing
                     if effective === natural
@@ -347,7 +368,9 @@ function _parse(def)
                 (size === nothing || effective === :real) || error(
                     "@ppl (first cut): only real-support vector parameters are " *
                     "supported yet (`$(lname)::vector[…]`).")
-                push!(params, _Param(lname, dist_call, effective, size, truncate, false, false))
+                stan_half = constraint === :stan_positive
+                push!(params, _Param(lname, dist_call, effective, size,
+                                     truncate, false, false, stan_half))
             end
         elseif stmt isa Expr && stmt.head === :(=)
             push!(passthrough, stmt)
@@ -507,9 +530,11 @@ function _lower(name, dataargs, params, obs, passthrough)
     #    observation, with the parameter itself in the sliced position). The plate
     #    is bound to its own variable first — a constructed-endpoint plate must be
     #    a whole recipe RHS, not a sub-expression of `sum(…)`.
-    # A truncated (half) prior renormalizes by -log(1 - cdf(0)). The truncation
-    # point 0 must reach the `.cdf` endpoint as a NAMED caller port (an endpoint's
-    # explicit argument cannot be a bare literal), so bind it once.
+    # A proper truncated (half) prior renormalizes by -log(1 - cdf(0)); a
+    # `stan_positive` half keeps Stan's bare lower-bound kernel and adds no
+    # normalization. The truncation point 0 must reach the `.cdf` endpoint as a
+    # NAMED caller port (an endpoint's explicit argument cannot be a bare
+    # literal), so bind it once.
     if any(p -> p.truncate, params)
         push!(stmts, :( _ppl_zero::Float64 = 0.0 ))
     end
@@ -518,7 +543,7 @@ function _lower(name, dataargs, params, obs, passthrough)
         p.improper && continue      # flat/improper prior: 0 contribution to :prior
         if p.size === nothing
             term = :( $(p.dist).logpdf($(p.name)) )
-            if p.truncate
+            if p.truncate && !p.stan_half
                 # Half distribution (lower-truncated at 0): renormalize by
                 # -log P(X > 0) = -log(1 - cdf(0)). For a symmetric-at-0 family
                 # this is +log(2), matching the hand-written half-Normal /

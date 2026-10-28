@@ -8,7 +8,7 @@ using ReactiveKernelsPPLExamples.EightSchoolsExample:
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: bernoulli
 
 # Reactant-compiled AD is the AD analog of the primal Reactant path: it takes a
-# native `PreparedADKernel` (which owns the scalar-WANT / single-active-port
+# native `PreparedADKernel` (which owns the scalar-WANT / active-port
 # validation and the authored-order reorder) and compiles a
 # DifferentiationInterface gradient / value-and-gradient through Reactant. The
 # differentiation engine stays the caller's DI backend — `AutoEnzyme` here —
@@ -19,6 +19,8 @@ const AD_REACTANT_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 _trace(x) = Reactant.to_rarray(x)
 
 include("test_ad_fused_reactant.jl")
+include("test_ad_retained_count_reactant.jl")
+include("test_ad_bound_contexts_reactant.jl")
 
 @testset "Reactant-compiled AD" begin
     @testset "standalone objective: authored defaults, keywords, parity" begin
@@ -58,6 +60,61 @@ include("test_ad_fused_reactant.jl")
         # ArgumentError rather than a bare MethodError.
         @test_throws ArgumentError compile_ad_gradient(prepared, q)
         @test_throws ArgumentError compile_ad_gradient(prepared, _trace(q), _trace(data))
+    end
+
+
+    @testset "multiple active ports compile as one structured point" begin
+        @kernel multi_active_reactant(
+                alpha::Vector{Float64}, beta::Vector{Float64},
+                data::Vector{Float64}) = begin
+            objective::Float64 = sum(abs2, alpha) + sum(beta .* data)
+        end
+
+        alpha = [0.3, -0.4, 0.2]
+        beta = [-0.1, 0.7, 0.5]
+        data = [2.0, -1.0, 0.5]
+        prepared = prepare_ad(
+            multi_active_reactant, AD_REACTANT_BACKEND, alpha, beta, data;
+            active = (:beta, :alpha), want = :objective)
+
+        traced = map(_trace, (alpha, beta, data))
+        compiled = compile_ad_value_and_gradient(prepared, traced...)
+        value, gradient = compiled(traced...)
+        @test Float64(value) ≈ sum(abs2, alpha) + sum(beta .* data)
+        @test Array(gradient[1]) ≈ data
+        @test Array(gradient[2]) ≈ 2 .* alpha
+
+        staged = let prepared = prepared
+            (a, b, d) -> ad_value_and_gradient(prepared, a, b, d)
+        end
+        staged_compiled = Reactant.compile(staged, traced)
+        staged_value, staged_gradient = staged_compiled(traced...)
+        @test Float64(staged_value) ≈ Float64(value)
+        @test Array(staged_gradient[1]) ≈ data
+        @test Array(staged_gradient[2]) ≈ 2 .* alpha
+
+        @kernel mixed_active_reactant(
+                coefficients::Vector{Float64}, dispersion::Float64) = begin
+            objective::Float64 =
+                sum(abs2, coefficients) + dispersion^2
+        end
+        coefficients = [0.2, -0.5]
+        dispersion = 1.7
+        mixed = prepare_ad(
+            mixed_active_reactant, AD_REACTANT_BACKEND,
+            coefficients, dispersion;
+            active = (:coefficients, :dispersion), want = :objective)
+        mixed_traced = (
+            _trace(coefficients),
+            Reactant.to_rarray(dispersion; track_numbers = true),
+        )
+        mixed_compiled = compile_ad_value_and_gradient(
+            mixed, mixed_traced...)
+        mixed_value, mixed_gradient = mixed_compiled(mixed_traced...)
+        @test Float64(mixed_value) ≈
+              sum(abs2, coefficients) + dispersion^2
+        @test Array(mixed_gradient[1]) ≈ 2 .* coefficients
+        @test Float64(mixed_gradient[2]) ≈ 2dispersion
     end
 
     @testset "partially-evaluated AD kernels compile over the remaining ports" begin
@@ -220,6 +277,84 @@ include("test_ad_fused_reactant.jl")
             compile_ad_value_and_gradient(prepared, traced...)(traced...)
         @test Float64(compiled_value) ≈ value
         @test Array(compiled_gradient) ≈ reference
+    end
+
+    # reactant-full-pr-f9f453e4: a 2-deep chain over a strided slice
+    # miscompiles under Reactant's default pipeline (`slice_slice` fuses the
+    # nested slices into a shape that breaks `slice_elementwise` with an
+    # invalid slice, or Enzyme's reverse with a mismatched add, SIGABRTing
+    # the compile). The `:no_slice_slice` pipeline compiles it with
+    # native-identical results. (The default-pipeline crash is fatal, so only
+    # the workaround path is asserted here.)
+    @testset "chained strided-slice consumers (:no_slice_slice)" begin
+        @kernel chain_plate(u::Vector{Float64}, tmap, off) = begin
+            s = u[1]
+            reads = exp.(s .+ off)
+            r = reads[tmap]
+            m1 = min(r[1], r[2])
+            m2 = min(m1, r[3])
+            total::Float64 = m1 + m2
+        end
+        u = [2.0]
+        tmap = [2, 4, 6]
+        off = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        kernel = prepare(chain_plate; have = (:u, :tmap, :off),
+                         want = :total, bound = (; tmap, off))
+        prepared = prepare_ad(kernel, AD_REACTANT_BACKEND, u; active = :u)
+
+        reference = similar(u)
+        value, reference = ad_value_and_gradient!(prepared, reference, u)
+
+        traced_u = _trace(u)
+        compiled_value, compiled_gradient = compile_ad_value_and_gradient(
+            prepared, traced_u; optimize = :no_slice_slice)(traced_u)
+        @test Float64(compiled_value) ≈ value
+        @test Array(compiled_gradient) ≈ reference
+
+        gradient_only = Array(compile_ad_gradient(
+            prepared, traced_u; optimize = :no_slice_slice)(traced_u))
+        @test gradient_only ≈ reference
+    end
+
+    # An explicit `:all` pipeline matches the default path exactly; this
+    # guards the `optimize` keyword's verbatim forwarding to Reactant.
+    @testset "explicit :all pipeline matches the default" begin
+        @kernel fill_plate(u::Vector{Float64}, tmap) = begin
+            s = u[1]
+            reads = fill(s, 6)
+            r = reads[tmap]
+            m1 = min(r[1], r[2])
+            m2 = min(m1, r[3])
+            total::Float64 = m1 + m2
+        end
+        u = [2.0]
+        tmap = [2, 4, 6]
+        kernel = prepare(fill_plate; have = (:u, :tmap), want = :total,
+                         bound = (; tmap))
+        prepared = prepare_ad(kernel, AD_REACTANT_BACKEND, u; active = :u)
+
+        reference = similar(u)
+        value, reference = ad_value_and_gradient!(prepared, reference, u)
+
+        traced_u = _trace(u)
+        default_value, default_gradient =
+            compile_ad_value_and_gradient(prepared, traced_u)(traced_u)
+        @test Float64(default_value) ≈ value
+        @test Array(default_gradient) ≈ reference
+        explicit_value, explicit_gradient = compile_ad_value_and_gradient(
+            prepared, traced_u; optimize = :all)(traced_u)
+        @test Float64(explicit_value) ≈ value
+        @test Array(explicit_gradient) ≈ reference
+    end
+
+    @testset "pipeline builder preserves loops and unfused slices" begin
+        ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt)
+        pipe = ext._rk_reactant_pipeline_no_slice_slice()
+        @test pipe isa String
+        @test occursin("enzyme{", pipe)
+        @test !occursin(r"slice_slice<\d+>;", pipe)
+        @test !occursin("enzyme_hlo_unroll", pipe)
+        @test occursin("slice_elementwise", pipe)
     end
 end
 
