@@ -168,6 +168,105 @@ end
     end
 end
 
+@testset "lowering reads a module's names as Julia resolves them, binding none" begin
+    # Before Julia 1.12 the first read of a name a module has only from a
+    # `using` binds it to that import for good, and the module can then not
+    # define the name (snag `docs-distributio-30373f1f`). Each reader answers
+    # what `Base.binding_module` answers in a twin module that binds the name.
+    function readers(usings)
+        parent = Module(gensym(:Bindings))
+        Core.eval(parent, Expr(:toplevel, (quote
+            module A
+                export f, c, shared, unset
+                f(x) = x
+                const c = 1
+                const shared = 2
+            end
+            module B
+                export c, shared, g
+                const c = 3
+                const shared = 2
+                g = 4
+            end
+            module Reexport
+                using ..A
+                export f
+            end
+            module X
+                export h
+            end
+            module Y
+                using ..X
+                export h
+            end
+        end).args...))
+        latest(name) = Base.invokelatest(getglobal, parent, name)
+        Core.eval(latest(:X), :(using ..Y))
+        twins = map((:Reader, :Twin)) do name
+            Core.eval(parent, Meta.parse(
+                "module $name; using " * join(("..$u" for u in usings), ", ") * "; end"))
+        end
+        latest(:Reexport), twins...
+    end
+    # What `name` denotes in `m`, binding it.
+    resolve(m, name) = (Base.binding_module(m, name), isdefined(m, name) ?
+        Some(getglobal(m, name)) : nothing, isdefined(m, name) && isconst(m, name))
+    cases = [
+        ((:A,), (:f, :c, :shared, :unset, :g, :absent)),
+        ((:A, :B), (:c, :f, :g)),              # `c` is ambiguous
+        ((:Reexport,), (:f,)),                 # an export Reexport has only from a `using`
+        ((:Reexport, :A), (:f,)),
+        ((:X,), (:h,)),                        # imports that cycle without a definition
+    ]
+    # One constant two imports export; Julia 1.12 names no owner for it.
+    VERSION < v"1.12.0-" && push!(cases, ((:A, :B), (:shared,)), ((:B, :A), (:shared,)))
+    for (usings, names) in cases, name in names
+        reexport, reader, twin = readers(usings)
+        owner = RK._binding_owner(reader, name)
+        value = RK._global_value(reader, name)
+        isconstant = RK._global_isconst(reader, name)
+        @static if VERSION < v"1.12.0-"
+            @test !Base.isbindingresolved(reader, name)
+            @test !Base.isbindingresolved(reexport, :f)
+        end
+        resolved = redirect_stderr(() -> Base.invokelatest(resolve, twin, name), devnull)
+        # A name that denotes no binding answers the module itself.
+        @test (owner === reader ? twin : owner) === resolved[1]
+        @test value === resolved[2]
+        @test isconstant === resolved[3]
+        Core.eval(reader, :($name = :own))
+        @test RK._global_value(reader, name) === Some(:own)
+    end
+end
+
+@testset "a kernel another module lowered leaves this module's names free" begin
+    # A docs page prepared the uniform example after another module had lowered
+    # the same kernel; comparing the two modules' bindings for its branch
+    # closure, which has a parameter `lower`, bound the page's `lower` to the
+    # exported `ReactiveKernels.lower`, and `lower = -1.0` then failed (snag
+    # `docs-distributio-30373f1f`). The closure is still shared.
+    source = :(@kernel bounded(lower::Float64, upper::Float64) = begin
+        ccdf(x::Float64)::Float64 =
+            x < lower ? 1.0 : (x >= upper ? 0.0 : (upper - x) / (upper - lower))
+    end)
+    modules = [Module(gensym(:BoundedPage)) for _ in 1:2]
+    kernels = map(modules) do mod
+        Core.eval(mod, :(using ReactiveKernels))
+        Core.eval(mod, deepcopy(source))
+        Core.eval(mod, :(prepare(bounded.ccdf; have = (:x, :lower, :upper), want = :ccdf)))
+    end
+    @test typeof(kernels[1].ops) === typeof(kernels[2].ops)
+    for mod in modules
+        Core.eval(mod, :(lower = -1.0))
+        @test Base.invokelatest(getglobal, mod, :lower) === -1.0
+    end
+    for kernel in kernels
+        @test Base.invokelatest(kernel, 0.5, -1.0, 2.0) == 0.5
+        @test Base.invokelatest(kernel, -2.0, -1.0, 2.0) == 1.0
+        @test Base.invokelatest(kernel, 3.0, -1.0, 2.0) == 0.0
+    end
+end
+
 @testset "execution branch metadata preserves host branch behavior" begin
     call(x, scale) = scale > 0 ? x * log(scale) : -x
     branch = RK._KernelBranch(Val((2,)), Val((1, 2)), Val((1,)), call,
