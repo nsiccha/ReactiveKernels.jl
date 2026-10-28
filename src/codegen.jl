@@ -4032,11 +4032,20 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         end
     end
     cell_number = gensym(:plate_cell_number)
+    # Whether a cell takes its table entry depends on the plate's arguments
+    # and element type only, so it is decided once per run of the plate, before
+    # its cells (`take_flags`, bound with `cell_number` below). Passed the
+    # element type instead, the take was looked up at run time at every cell
+    # whenever that type is a run-time value (snag lane-cell-take-e-45c66e49).
+    take_flags = Any[:($(gensym(Symbol(slot, :_takes))) =
+                       $condition && $(GlobalRef(@__MODULE__, :_replicated_may_contain_array))(
+                           $plate_eltype))
+                     for (slot, _, condition) in table_entries]
     if !isempty(table_entries)
         prepend!(loopbody.args, Any[:($cell_number += 1);
             Any[:($(GlobalRef(@__MODULE__, :_lane_cell_take!))(
-                    $slot, $table, $cell_number, $plate_eltype, $condition))
-                for (slot, table, condition) in table_entries]])
+                    $slot, $table, $cell_number, $(first(flag.args))))
+                for ((slot, table, _), flag) in zip(table_entries, take_flags)]])
         kept = Expr(:call, GlobalRef(@__MODULE__, :_lane_cell_release!), scalar_result,
                     cell_number, (Expr(:tuple, entry...) for entry in table_entries)...)
         result = gensym(:plate_cell_result)
@@ -4084,7 +4093,8 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         push!(body.args, :($first_coordinate = true))
     end
     cell_loop = Expr(:for, Expr(:(=), index, iteration), loopbody)
-    isempty(table_entries) || (cell_loop = Expr(:block, :($cell_number = 0), cell_loop))
+    isempty(table_entries) ||
+        (cell_loop = Expr(:block, :($cell_number = 0), take_flags..., cell_loop))
     # A pure total-only plate is a scalar reduction, so it runs under `@simd`.
     # SIMD needs an indexable iteration space, whereas `_plate_cells` returns
     # a Generator for one axis: `_plate_simd_cells` iterates that axis's range
@@ -6958,12 +6968,21 @@ end
 # An array of concrete numeric records cannot hide an array that aliases an
 # output. Keep the outer-array check, and walk elements when their type leaves
 # room for a nested array (including abstract fields and custom records).
-_replicated_may_contain_array(::Type) = true
-_replicated_may_contain_array(::Type{<:Number}) = false
-@inline function _replicated_may_contain_array(::Type{T}) where {T<:Union{Tuple,NamedTuple}}
+# The answer depends on the type alone, so the walk runs once per type, when a
+# caller compiles, and the predicate is a constant there. Walked at run time,
+# `any` over `fieldtypes(T)`, a tuple of `DataType` values, dispatched on every
+# field at every call: 17 % of a borrowed population read whose plate cells
+# are records (`_lane_cell_take!`, snag lane-cell-take-e-45c66e49). An element
+# type with no values (`Union{}`) holds no array.
+_replicated_type_may_contain_array(::Type) = true
+_replicated_type_may_contain_array(::Type{<:Number}) = false
+_replicated_type_may_contain_array(::Type{Union{}}) = false
+function _replicated_type_may_contain_array(::Type{T}) where {T<:Union{Tuple,NamedTuple}}
     isconcretetype(T) || return true
-    any(_replicated_may_contain_array, fieldtypes(T))
+    any(_replicated_type_may_contain_array, fieldtypes(T))
 end
+@generated _replicated_may_contain_array(::Type{T}) where {T} =
+    _replicated_type_may_contain_array(T)
 
 # These walks run on every borrowed call, over every input. They unroll tuples
 # by their type and loop over arrays, so the walk allocates nothing: `any` with
