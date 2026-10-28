@@ -2259,7 +2259,8 @@ end
 
 function _authored_plate_condition(callargs, roots, positions, atomic)
     tests = Any[Expr(:call, GlobalRef(@__MODULE__, :_authored_plate_is_axis),
-                     callargs[positions[root]]) for root in sort!(collect(roots))
+                     callargs[positions[root]])
+                for root in sort!(collect(roots); by = root -> positions[root])
                 if !(positions[root] in atomic)]
     isempty(tests) && return false
     foldl((left, right) -> Expr(:||, left, right), tests)
@@ -2293,7 +2294,8 @@ function _authored_plate_changed(callargs, roots, positions, atomic,
     tests = Any[
         Expr(:call, GlobalRef(@__MODULE__, :_plate_dependency_changed),
              index, previous, callargs[positions[root]])
-        for root in sort!(collect(roots)) if !(positions[root] in atomic)
+        for root in sort!(collect(roots); by = root -> positions[root])
+        if !(positions[root] in atomic)
     ]
     isempty(tests) && return false
     foldl((left, right) -> Expr(:||, left, right), tests)
@@ -2349,7 +2351,8 @@ end
 
 function _authored_plate_runtime_unconditional(callargs, roots, positions, atomic)
     tests = Any[Expr(:call, GlobalRef(@__MODULE__, :_plate_unconditional_root),
-                     callargs[positions[root]]) for root in sort!(collect(roots))
+                     callargs[positions[root]])
+                for root in sort!(collect(roots); by = root -> positions[root])
                 if !(positions[root] in atomic)]
     isempty(tests) && return false
     foldl((left, right) -> Expr(:||, left, right), tests)
@@ -3495,8 +3498,8 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
                                 atomic, callvalues; result_slot::Bool = false)
     hoisted, scalar = _nested_cell_plan(kernel, atomic, callvalues)
     types = _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
-    hint_ids = sort!(collect(keys(types)))
-    type_hints = Dict(cid => gensym(:plate_input_type) for cid in hint_ids)
+    hint_ids = _declaration_order(kernel.plan, keys(types))
+    type_hints = Pair{ValueId,Symbol}[cid => gensym(:plate_input_type) for cid in hint_ids]
     cell_slots = get(task_local_storage(), _CELL_SLOTS, nothing)
     recycle = Pair{ValueId,Symbol}[]
     cell_tables = cell_slots === nothing ? nothing : Symbol[]
@@ -4029,11 +4032,20 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         end
     end
     cell_number = gensym(:plate_cell_number)
+    # Whether a cell takes its table entry depends on the plate's arguments
+    # and element type only, so it is decided once per run of the plate, before
+    # its cells (`take_flags`, bound with `cell_number` below). Passed the
+    # element type instead, the take was looked up at run time at every cell
+    # whenever that type is a run-time value (snag lane-cell-take-e-45c66e49).
+    take_flags = Any[:($(gensym(Symbol(slot, :_takes))) =
+                       $condition && $(GlobalRef(@__MODULE__, :_replicated_may_contain_array))(
+                           $plate_eltype))
+                     for (slot, _, condition) in table_entries]
     if !isempty(table_entries)
         prepend!(loopbody.args, Any[:($cell_number += 1);
             Any[:($(GlobalRef(@__MODULE__, :_lane_cell_take!))(
-                    $slot, $table, $cell_number, $plate_eltype, $condition))
-                for (slot, table, condition) in table_entries]])
+                    $slot, $table, $cell_number, $(first(flag.args))))
+                for ((slot, table, _), flag) in zip(table_entries, take_flags)]])
         kept = Expr(:call, GlobalRef(@__MODULE__, :_lane_cell_release!), scalar_result,
                     cell_number, (Expr(:tuple, entry...) for entry in table_entries)...)
         result = gensym(:plate_cell_result)
@@ -4081,7 +4093,8 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         push!(body.args, :($first_coordinate = true))
     end
     cell_loop = Expr(:for, Expr(:(=), index, iteration), loopbody)
-    isempty(table_entries) || (cell_loop = Expr(:block, :($cell_number = 0), cell_loop))
+    isempty(table_entries) ||
+        (cell_loop = Expr(:block, :($cell_number = 0), take_flags..., cell_loop))
     # A pure total-only plate is a scalar reduction, so it runs under `@simd`.
     # SIMD needs an indexable iteration space, whereas `_plate_cells` returns
     # a Generator for one axis: `_plate_simd_cells` iterates that axis's range
@@ -4467,8 +4480,8 @@ end
 # declared array output (`y::Vector{Float64} = plate(...)`), each cell
 # converting on store, instead of converting a buffer of the cells' own type
 # into the declaration afterwards.
-# `type_hints` maps logical value ids to extra type-only arguments in an
-# embedded native region. Empty coordinates can use the enclosing DAG's types;
+# `type_hints` pairs logical value ids with extra type-only arguments of an
+# embedded native region, in the order of those arguments. Empty coordinates can use the enclosing DAG's types;
 # no sample value or scalar recipe is evaluated to discover them.
 # `cell_slots` collects the lane slots that the cells of this lowering's plates
 # give their own intermediates (`_plate_nested_native!`), at every nesting
@@ -4540,8 +4553,8 @@ function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
         push!(argexprs, :($(nm(v))::$(valtype(v))))
     end
     append!(argexprs, (last(pair) for pair in recycle))
-    type_hints === nothing ||
-        append!(argexprs, (type_hints[cid] for cid in sort!(collect(keys(type_hints)))))
+    type_hints === nothing || append!(argexprs, (last(pair) for pair in type_hints))
+    type_hints = type_hints === nothing ? nothing : Dict{ValueId,Symbol}(type_hints)
     recycled(cid) = (index = findfirst(pair -> first(pair) == cid, recycle);
                      index === nothing ? nothing : last(recycle[index]))
     body = Expr(:block)
@@ -5548,6 +5561,7 @@ function lower_batched(p::Plan; batched, reduce = :+)
     first_coordinate = gensym(:plate_first)
     raw_arguments = Dict{ValueId,Symbol}()
     prepared_arguments = Dict{ValueId,Symbol}()
+    have_rank = Dict{ValueId,Int}(canon_id(g, v.id) => i for (i, v) in enumerate(p.have))
     for value in analysis.mapped
         cid = canon_id(g, value.id)
         raw_arguments[cid] = gensym(Symbol(:plate_argument_, value.name))
@@ -5615,7 +5629,7 @@ function lower_batched(p::Plan; batched, reduce = :+)
         changed = foldl((left, right) -> Expr(:||, left, right),
             (Expr(:call, GlobalRef(@__MODULE__, :_plate_dependency_changed),
                   index, previous, prepared_arguments[root])
-             for root in sort!(collect(roots))))
+             for root in sort!(collect(roots); by = root -> have_rank[root])))
         condition = Expr(:||, first_coordinate, changed)
         push!(loopbody.args,
               Expr(:if, condition, Expr(:(=), nm(out), callexpr(k, r))))
@@ -5762,7 +5776,7 @@ image compiled returns that image's generated function, with the code the
 image compiled for it.
 """
 function compile(ast::Expr)
-    ast = _canonical_locals(ast)
+    ast = _canonical_locals(_canonical_globals(ast))
     f = RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, ast)
     image = _image_program(f)
     image === nothing || return image
@@ -5809,8 +5823,12 @@ end
 # reaches the cache: identical lowerings then produce byte-identical bodies,
 # one callable type, and one compilation per graph shape. Distinct originals
 # map to distinct names (the map is a bijection on the symbols it touches), so
-# hygiene is preserved; quoted data and every non-`#` symbol are untouched.
-_lowering_gensym(s::Symbol) = (str = String(s); !isempty(str) && str[1] == '#')
+# hygiene is preserved; quoted data and every other symbol are untouched. A
+# name derived from a gensym carries its counter too (a bound lazy-arm lane,
+# `lane_then_##plate_argument#245`), so a `##` anywhere marks one; an authored
+# identifier cannot contain it (snag `compiled-reader-be3cadbb`).
+_lowering_gensym(s::Symbol) =
+    (str = String(s); !isempty(str) && (str[1] == '#' || occursin("##", str)))
 
 function _canonical_locals(ast::Expr)
     names = Dict{Symbol,Symbol}()
@@ -5826,6 +5844,78 @@ function _canonical_locals(ast::Expr)
         Expr(node.head, map(walk, node.args)...)
     end
     walk(ast)
+end
+
+# A program generator evaluates each lowering in a module of its own (BRM's
+# `##RKEmittedModels#N`; RKPPL's `PPLGeneratedModels`, or while an image is
+# generated a scope module standing in for it), and hygiene qualifies every
+# global a body reads in that module: `ones`, `eltype` and an imported helper
+# become `##RKEmittedModels#231.ones`, and so on. The body then differs between
+# lowerings of one program, and so does the callable's type (snag
+# `compiled-reader-be3cadbb`). Name each global by the module that owns its
+# binding instead; a scope module's alias by the binding it stands in for; and
+# a constant bound to a module, a named function or a named type by that
+# value's own binding: the same reference in every lowering and every process.
+# A binding a lowering module itself owns otherwise stays as qualified.
+_anonymous_module(m::Module) = (name = String(nameof(m)); !isempty(name) && name[1] == '#')
+
+Base.@nospecializeinfer function _canonical_global(ref::GlobalRef)
+    m, name = ref.mod, ref.name
+    (m === Base || m === Core) && return ref
+    owner = Base.invokelatest(Base.binding_module, m, name)::Module
+    owner === m || return _canonical_global(GlobalRef(owner, name))
+    (Base.invokelatest(isdefined, m, name) && Base.invokelatest(isconst, m, name)) ||
+        return ref
+    value = Base.invokelatest(getglobal, m, name)
+    origin = _kernel_scope_origin(m)
+    origin === m || !Base.invokelatest(isdefined, origin, name) ||
+        Base.invokelatest(getglobal, origin, name) !== value ||
+        return _canonical_global(GlobalRef(origin, name))
+    named = value isa Type ? Base.unwrap_unionall(value) : nothing
+    home = value isa Module ? value :
+        value isa Function && Base.issingletontype(typeof(value)) ?
+            parentmodule(typeof(value)) :
+        named isa DataType ? named.name.module : nothing
+    home === nothing && return ref
+    own = named isa DataType ? named.name.name : nameof(value)
+    (home !== m && !_anonymous_module(home) && Base.invokelatest(isdefined, home, own) &&
+     Base.invokelatest(getglobal, home, own) === value) || return ref
+    _canonical_global(GlobalRef(home, own))
+end
+
+function _canonical_globals(ast::Expr)
+    seen = Dict{GlobalRef,GlobalRef}()
+    function walk(node)
+        node isa GlobalRef && return get!(() -> _canonical_global(node), seen, node)
+        node isa Expr || return node
+        node.head === :quote && return node
+        Expr(node.head, Any[walk(arg) for arg in node.args]...)
+    end
+    walk(ast)
+end
+
+# The ids of `p`'s values in declaration order: its HAVE ports, then each
+# recipe's outputs. Generated code orders values this way, never by identity: a
+# `ValueId` orders by the key of the namespace that allocated it, and that key
+# differs in every process. A program composed of values a package image made
+# and values made at run time (Bruno's simulator: its summary graph and its
+# model) ordered them one way while the image was generated and another at run
+# time, so the image's compiled reader did not apply (snag
+# `compiled-reader-be3cadbb`).
+function _declaration_order(p::Plan, ids)
+    wanted = Set{ValueId}(ids)
+    order = ValueId[]
+    function take(v)
+        cid = canon_id(p.graph, v.id)
+        cid in wanted && !(cid in order) && push!(order, cid)
+    end
+    foreach(take, p.have)
+    for r in p.recipes
+        foreach(take, r.outputs)
+    end
+    length(order) == length(wanted) || throw(ArgumentError(
+        "values to order are not all values of the plan"))
+    order
 end
 
 # Preserve the lowered argument names used by operation-table inspection.
@@ -5960,6 +6050,29 @@ Base.@nospecializeinfer function _record_image_program!(target::Module,
             Core.eval(target, :(const $_IMAGE_PROGRAMS = $(_ImagePrograms(Dict{Any,Any}()))))
         table = Base.invokelatest(getglobal, target, _IMAGE_PROGRAMS)::_ImagePrograms
         table.functions[_image_program_key(f)] = native
+    end
+    nothing
+end
+
+# Record, in the image being generated, a closure type `_kernel_shared_closure`
+# shares, and find the one a loaded image recorded for a closure of `home`.
+Base.@nospecializeinfer function _record_image_closure!(target::Module, @nospecialize(key),
+                                                        @nospecialize(entry))
+    @lock _LOADED_IMAGE_PROGRAMS.lock begin
+        Base.invokelatest(isdefined, target, _IMAGE_PROGRAMS) ||
+            Core.eval(target, :(const $_IMAGE_PROGRAMS = $(_ImagePrograms(Dict{Any,Any}()))))
+        table = Base.invokelatest(getglobal, target, _IMAGE_PROGRAMS)::_ImagePrograms
+        entries = get!(() -> Any[], table.functions, key)
+        any(e -> e === entry, entries) || push!(entries, entry)
+    end
+    nothing
+end
+
+Base.@nospecializeinfer function _image_shared_closure(@nospecialize(key), home::Module,
+                                                       names::Set{Symbol})
+    tables = @atomic :acquire _LOADED_IMAGE_PROGRAMS.tables
+    for table in tables, entry in get(table.functions, key, ())
+        _kernel_same_scope(first(entry), home, names) && return entry
     end
     nothing
 end
@@ -6561,7 +6674,8 @@ function _embedded_marker_candidates(p::Plan)
         for position in positions
             input = recipe.inputs[position]
             roots = sort!(collect(get(
-                dependencies, canon_id(p.graph, input.id), Set{ValueId}())))
+                dependencies, canon_id(p.graph, input.id), Set{ValueId}()));
+                by = root -> root_positions[root])
             for root in roots
                 position = root_positions[root]
                 position in candidates || push!(candidates, position)
@@ -6772,21 +6886,26 @@ function Base.show(io::IO, k::GraphReplicatedKernel{B}) where {B}
     print(io, ")")
 end
 
-function _replica_graph(target::PreparedKernel, batched)
-    indices = _replica_batch_indices(inputs(target), batched)
-    _replicated_graph_plan(target.plan) || throw(ArgumentError(
+# Like the other construction helpers, these compile once rather than once per
+# kernel type: specialized, a large program's reader compiled its constructors
+# for seconds each (snag `compiled-reader-be3cadbb`).
+Base.@nospecializeinfer function _replica_graph(@nospecialize(target::PreparedKernel),
+                                                @nospecialize(batched))
+    plan = getfield(target, :plan)::Plan
+    boundary = getfield(target, :inputs)::Tuple
+    wants = getfield(target, :outputs)::Tuple
+    indices = _replica_batch_indices(boundary, batched)
+    _replicated_graph_plan(plan) || throw(ArgumentError(
         "scalar kernel requires the complete-callable replica fallback"))
-    ast, ops = _lower_replicated_with_ops(target.plan; batched)
+    ast, ops = _lower_replicated_with_ops(plan; batched)
+    ops = _execution_source(ops)
     native = compile(ast)
-    boundary = inputs(target)
-    input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
-    output_types = Tuple{(valtype(value) for value in outputs(target))...}
-    GraphReplicatedKernel{indices,input_types,output_types,
-                          typeof(native),typeof(ops),typeof(target.plan),
-                          typeof(target),typeof(boundary),
-                          typeof(outputs(target))}(
-        target, native, ops, target.plan, ast,
-        boundary, outputs(target))
+    input_types = Tuple{Any[valtype(boundary[i]) for i in indices]...}
+    output_types = Tuple{Any[valtype(value) for value in wants]...}
+    T = GraphReplicatedKernel{indices,input_types,output_types,
+                              typeof(native),typeof(ops),Plan,
+                              typeof(target),typeof(boundary),typeof(wants)}
+    _kernel_new_instance(T, (target, native, ops, plan, ast, boundary, wants))
 end
 
 function replica_graph(kernel::PreparedKernel; batched)
@@ -6849,12 +6968,21 @@ end
 # An array of concrete numeric records cannot hide an array that aliases an
 # output. Keep the outer-array check, and walk elements when their type leaves
 # room for a nested array (including abstract fields and custom records).
-_replicated_may_contain_array(::Type) = true
-_replicated_may_contain_array(::Type{<:Number}) = false
-@inline function _replicated_may_contain_array(::Type{T}) where {T<:Union{Tuple,NamedTuple}}
+# The answer depends on the type alone, so the walk runs once per type, when a
+# caller compiles, and the predicate is a constant there. Walked at run time,
+# `any` over `fieldtypes(T)`, a tuple of `DataType` values, dispatched on every
+# field at every call: 17 % of a borrowed population read whose plate cells
+# are records (`_lane_cell_take!`, snag lane-cell-take-e-45c66e49). An element
+# type with no values (`Union{}`) holds no array.
+_replicated_type_may_contain_array(::Type) = true
+_replicated_type_may_contain_array(::Type{<:Number}) = false
+_replicated_type_may_contain_array(::Type{Union{}}) = false
+function _replicated_type_may_contain_array(::Type{T}) where {T<:Union{Tuple,NamedTuple}}
     isconcretetype(T) || return true
-    any(_replicated_may_contain_array, fieldtypes(T))
+    any(_replicated_type_may_contain_array, fieldtypes(T))
 end
+@generated _replicated_may_contain_array(::Type{T}) where {T} =
+    _replicated_type_may_contain_array(T)
 
 # These walks run on every borrowed call, over every input. They unroll tuples
 # by their type and loop over arrays, so the walk allocates nothing: `any` with
@@ -6897,20 +7025,26 @@ end
 # lane buffer per WANT and one slot per position intermediate with a
 # destination form; `_lower_replicated_with_ops` returns the count.
 _borrowed_batch_caches(count::Int) = ntuple(_ -> Ref{Any}(nothing), count)
-_borrowed_batch(target::GraphReplicatedKernel) =
-    _borrowed_batch(target, target.plan, batched_ports(target))
+Base.@nospecializeinfer _borrowed_batch(@nospecialize(target::GraphReplicatedKernel)) =
+    _borrowed_batch(target, getfield(target, :plan)::Plan, batched_ports(target))
 # `target` answers `inputs`, `outputs` and `plan` for the borrowed driver of `p`.
-function _borrowed_batch(@nospecialize(target), p::Plan, batched)
+Base.@nospecializeinfer function _borrowed_batch(@nospecialize(target), p::Plan,
+                                                 @nospecialize(batched))
     ast, ops, slot_count = _lower_replicated_with_ops(p; batched, reuse=true)
-    BorrowedBatchedKernel(target, compile(ast), ops,
-        _borrowed_batch_caches(slot_count), ast)
+    native = compile(ast)
+    ops = _execution_source(ops)
+    caches = _borrowed_batch_caches(slot_count)
+    T = BorrowedBatchedKernel{typeof(target),typeof(native),typeof(ops),typeof(caches)}
+    _kernel_new_instance(T, (target, native, ops, caches, ast))
 end
 
 # A new native execution instance shares the read-only computation, not the
-# buffers of an earlier call. No planning, lowering or compilation occurs.
-Base.copy(kernel::BorrowedBatchedKernel) =
-    BorrowedBatchedKernel(kernel.target, kernel.native, kernel.ops,
-                         _borrowed_batch_caches(length(kernel.caches)), kernel.ast)
+# buffers of an earlier call. No planning, lowering or compilation occurs, and
+# the copy itself compiles once rather than once per reader type.
+Base.@nospecializeinfer Base.copy(@nospecialize(kernel::BorrowedBatchedKernel)) =
+    _kernel_new_instance(typeof(kernel), (getfield(kernel, :target), getfield(kernel, :native),
+        getfield(kernel, :ops), _borrowed_batch_caches(length(getfield(kernel, :caches))),
+        getfield(kernel, :ast)))
 
 @inline function (kernel::BorrowedBatchedKernel)(args::Vararg{Any,N}) where {N}
     length(args) == length(inputs(kernel)) || throw(MethodError(kernel, args))
@@ -7261,9 +7395,10 @@ function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
                  exemplars = nothing, type_stability = nothing,
                  type_stability_level = nothing)
     _with_type_stability(type_stability, type_stability_level) do
-        _check_uninferred_values(
-            _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
-                          exemplars))
+        kernel = _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
+                               exemplars)
+        _check_uninferred_values(kernel)
+        kernel
     end
 end
 

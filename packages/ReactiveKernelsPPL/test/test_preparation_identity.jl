@@ -1,5 +1,5 @@
 module PreparationIdentityTests
-using ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzyme, Test
+using ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Distributions, Enzyme, Test
 
 function model(kind)
     kind === :plate && return @rkppl begin
@@ -57,6 +57,17 @@ end
                 @test typeof(q.kernel.f) === typeof(first_query.kernel.f)
                 @test typeof(q.kernel.ops) === typeof(first_query.kernel.ops)
                 @test typeof(q.ad) === typeof(first_query.ad)
+                # The position reader of a rebuild reuses the first build's
+                # compiled reader (snag `compiled-reader-be3cadbb`).
+                readers = map((first_built, built)) do b
+                    kernel = prepare_predictive(b, plan).kernel
+                    Base.invokelatest(ReactiveKernels.vectorize, kernel;
+                        batched = :unconstrained, reuse = true)
+                end
+                @test typeof(readers[1]) === typeof(readers[2])
+                draws = [0.3 -0.1; -0.2 0.4]
+                @test Base.invokelatest(readers[1], draws) ==
+                    Base.invokelatest(readers[2], draws)
                 rebound = prepare_sampler(first_built, plan, [0.3, -0.2]; backend,
                     native_forward_batch=false)
                 check(rebound, x, y, 1.3)
@@ -90,5 +101,56 @@ end
         @test actual_value ≈ expected_value - 0.2
         @test gradient ≈ expected_gradient + [1.0, 0.0]
     end
+end
+
+@testset "a lazy branch over bound lanes rebuilds to the same reader" begin
+    # The bound lanes of a lazy arm are named after a generated plate argument
+    # (`lane_then_##plate_argument#N`). The reader's generated body must not
+    # keep that counter, or each rebuild compiles its reader again (snag
+    # `compiled-reader-be3cadbb`).
+    model = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        @plate for i in eachindex(y)
+            mu = x[i] > 0 ? a + b * x[i] : a - exp(b) * x[i]
+            y[i] ~ Normal(mu, 1.0)
+        end
+    end
+    x = collect(range(-1, 1; length = 12))
+    y = collect(range(0, 1; length = 12))
+    readers = map(1:2) do _
+        plan = model(; x) | (; y)
+        kernel = prepare_predictive(build_kernel(plan), plan).kernel
+        Base.invokelatest(ReactiveKernels.vectorize, kernel;
+            batched = :unconstrained, reuse = true)
+    end
+    @test typeof(readers[1]) === typeof(readers[2])
+    draws = [0.3 -0.1; -0.2 0.4]
+    @test Base.invokelatest(readers[1], draws) == Base.invokelatest(readers[2], draws)
+end
+
+@testset "a positive prior's support branch rebuilds to the same query" begin
+    # The tensorized arm of the support branch is a closure Julia lowers
+    # itself (`ReactantCore.@trace`); each build defined a new closure type, so
+    # the query and the readers had new types (snag `compiled-reader-be3cadbb`).
+    model = @rkppl begin
+        a ~ Normal(0, 5)
+        b ~ Normal(0, 2)
+        sigma ~ Exponential(1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, sigma)
+    end
+    x, y = [0.0, 1.0, 2.0], [0.1, 0.9, 2.2]
+    queries = map(1:2) do _
+        plan = model(; x) | (; y)
+        prepare_query(build_kernel(plan), plan, :sampler)
+    end
+    @test typeof(queries[1]) === typeof(queries[2])
+    u = [0.3, -0.2, 0.1]
+    @test Base.invokelatest(queries[1], u) == Base.invokelatest(queries[2], u)
+    s = exp(u[3])
+    expected = logpdf(Normal(0, 5), u[1]) + logpdf(Normal(0, 2), u[2]) +
+        logpdf(Exponential(1.0), s) + u[3] + sum(logpdf.(Normal.(u[1] .+ u[2] .* x, s), y))
+    @test Base.invokelatest(queries[2], u) ≈ expected
 end
 end

@@ -159,6 +159,12 @@ using ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels, T
             for plan in (B.PLAN, P.PLAN)
                 @test typeof(prepare_query(B.BUILT, plan, :sampler)) === typeof(B.QUERY)
             end
+            # A rebuild of the program at run time is evaluated in
+            # `PPLGeneratedModels`, the image's build in a scope module of B.
+            # Neither module enters an executable type, so the rebuild prepares
+            # to the image query's type as well (snag `compiled-reader-be3cadbb`).
+            rebuilt = build_kernel(B.PLAN)
+            @test typeof(prepare_query(rebuilt, B.PLAN, :sampler)) === typeof(B.QUERY)
             backend = AutoEnzyme(; mode = Enzyme.Reverse)
             for (plan, x, y) in ((B.PLAN, x, y), (P.PLAN, x2, y2)),
                     u in ([0.3, -0.2, 0.1], [-1.1, 0.7, -0.4])
