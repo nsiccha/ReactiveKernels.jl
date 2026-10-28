@@ -72,7 +72,16 @@ PreparationCache() = PreparationCache(Dict{Any,PreparedKernel}(),
 
 Base.length(c::PreparationCache) = length(c.kernels) + length(c.bound)
 
-_sig(g::Graph, vs) = Tuple(canon_id(g, v.id) for v in _astuple(vs))
+# A loop, not a generator over the (heterogeneous) value tuple, which
+# allocated at every element of a rebinding's three signatures.
+function _sig(g::Graph, vs)
+    t = _astuple(vs)
+    ids = Vector{ValueId}(undef, length(t))
+    for i in eachindex(ids)
+        ids[i] = canon_id(g, (t[i]::Value).id)
+    end
+    Tuple(ids)
+end
 _pass_key(pass) = Base.issingletontype(typeof(pass)) ? typeof(pass) : objectid(pass)
 
 """
@@ -140,7 +149,9 @@ end
 function _reuses_bound_preparation(@nospecialize(bound), @nospecialize(passes))
     bound === () && return false
     all(pass -> Base.issingletontype(typeof(pass)), passes) || return false
-    !isempty(first(_partial_bound_pairs(bound)))
+    # Whether there is any pair, without building the pairs `_prepare_bound!`
+    # builds (and checks) again.
+    bound isa Pair || !isempty(bound)
 end
 
 _graph_bound_preparation(g::Graph, @nospecialize(have), @nospecialize(want),
@@ -230,7 +241,14 @@ for (f, types) in ((_bound_entry, (Plan, Any)), (_bound_hoisted, (_BoundEntry, T
                    (_rebind_table, (Any, Vector{Any})),
                    (_rebind_table, (Any, Vector{Recipe})),
                    (_rebound_table, (_RebindTable, Vector{Any})),
-                   (_rebound_table, (_RebindTable, Vector{Recipe})))
+                   (_rebound_table, (_RebindTable, Vector{Recipe})),
+                   (_rebound_table, (Vector{Any}, Vector{Int}, Vector{Any})),
+                   (_rebound_table, (Vector{Any}, Vector{Int}, Vector{Recipe})),
+                   (_ExecutableTable, (_RebindTable,)),
+                   (_executable_entries, (_ExecutableTable, _RebindTable)),
+                   (_rebound_executable, (_ExecutableTable, _RebindTable, Vector{Any})),
+                   (_executed_prepared_kernel,
+                    (Any, Tuple, Tuple, Tuple, Plan, Expr, Tuple, Type, Any)))
     precompile(f, types) || error("no $f method for $types")
 end
 for value in (Any, Number, Tuple, AbstractArray)

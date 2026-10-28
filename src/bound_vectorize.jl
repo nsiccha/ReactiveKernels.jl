@@ -54,6 +54,7 @@ struct _RebindPrepared
     ast::Expr
     lowered::_RebindTable
     signature::Type
+    executable::_ExecutableTable # `ops` as this process executes it
 end
 
 # A scheduled batch: its serial driver, its prefix and one empty residual
@@ -72,10 +73,17 @@ struct _RebindConstants
     recipes::Vector{Any}
 end
 # `getfield`, not `getindex`: on an unspecialized kernel each `getindex` was a
-# dynamic dispatch on the type of a table of hundreds of entries.
-_RebindConstants(@nospecialize(kernel::PreparedKernel), slots::Vector{Int}) =
-    _RebindConstants(Any[getfield(kernel.ops, k) for k in slots],
-                     Any[getfield(kernel.lowered_recipes, k) for k in slots])
+# dynamic dispatch on the type of a table of hundreds of entries. Each table
+# is read from the kernel once: a tuple field of an unspecialized kernel is
+# boxed, a copy of the whole table, at every read, which inside the loop was
+# 1.8 MB per binding of a simulator graph with 56 constants among 365 entries
+# (snag per-binding-resi-990b18ab).
+function _RebindConstants(@nospecialize(kernel::PreparedKernel), slots::Vector{Int})
+    ops = getfield(kernel, :ops)
+    recipes = getfield(kernel, :lowered_recipes)
+    _RebindConstants(Any[getfield(ops, k) for k in slots],
+                     Any[getfield(recipes, k) for k in slots])
+end
 
 _holds_constant(@nospecialize(table), constants::Vector{Any}) =
     any(x -> any(c -> x === c, constants), table)
@@ -88,7 +96,7 @@ function _vectorize(vectorizations::_BoundVectorizations,
                     @nospecialize(kernel::PreparedKernel), @nospecialize(batched),
                     reuse::Bool, @nospecialize(schedule))
     key = (_replica_batch_indices(inputs(kernel), batched), reuse,
-           schedule === nothing, typeof(kernel.ops))
+           schedule === nothing, fieldtype(typeof(kernel), :ops))
     kept = lock(() -> get(vectorizations.products, key, nothing), vectorizations.lock)
     constants = _RebindConstants(kernel, vectorizations.slots)
     kept === nothing || return _rebound(kept, kernel, constants, schedule)
@@ -130,7 +138,7 @@ function _rebind_prefix(@nospecialize(prefix::PreparedKernel), constants::_Rebin
     (ops === nothing || recipes === nothing || lowered === nothing) && return nothing
     _RebindPrepared(prefix.f, ops, prefix.inputs, prefix.outputs, prefix.plan.have,
                     prefix.plan.want, recipes, prefix.ast, lowered,
-                    _exact_signature(prefix))
+                    _exact_signature(prefix), _ExecutableTable(ops))
 end
 
 function _rebind_template(@nospecialize(product::_ScheduledBatchedKernel),
@@ -168,10 +176,10 @@ function _rebound(kept::_RebindPrepared, @nospecialize(kernel::PreparedKernel),
                   constants::_RebindConstants, @nospecialize(schedule))
     recipes = convert(Vector{Recipe}, _rebound_table(kept.recipes, constants.recipes))
     plan = _partial_subplan(kernel.plan, kept.have, kept.want, recipes)
-    _prepared_kernel(kept.f, Tuple(_rebound_table(kept.ops, constants.ops)), kept.inputs,
-                     kept.outputs, plan, kept.ast,
-                     Tuple(_rebound_table(kept.lowered, constants.recipes));
-                     exact_signature = kept.signature)
+    _executed_prepared_kernel(kept.f, _rebound_executable(kept.executable, kept.ops, constants.ops),
+                              kept.inputs, kept.outputs, plan, kept.ast,
+                              Tuple(_rebound_table(kept.lowered, constants.recipes)),
+                              kept.signature, nothing)
 end
 
 function _rebound(kept::_RebindScheduled, @nospecialize(kernel::PreparedKernel),
