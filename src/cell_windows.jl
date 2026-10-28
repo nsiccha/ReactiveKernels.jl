@@ -1,26 +1,36 @@
 # Values a plate cell reads at its own position, computed at that position
-# only (`plate_cell`, cells.jl; snag `rkppl-per-subjec-a3d6e6d8`, increment 1b).
+# only (`plate_cell`, cells.jl; snag `rkppl-per-subjec-a3d6e6d8`, increment 1b),
+# or at the several rows the cell gathers (snag `compact-cell-sam-d85d96ae`).
 #
 # A cell that captures a whole array and reads it at its batched element,
 # `log_k[i]` in `plate(i, ...) do i ... exp(log_k[i]) end`, needs one row of
 # it. The same is true when `log_k` is itself a batched input to the cell's
-# plate. When that array's producer computes it row by row, the native lowering
-# runs the producer's own operation on the one row instead: the producer is
-# given views of its row-aligned operands at that row, and the cell is given a
-# `_CellWindow` holding the result, which answers reads of that row and throws
-# `BoundsError` for any other. The rewrite applies to these source shapes,
-# read off the closure's native body (`_kernel_native_body`):
+# plate. A cell whose batched element is an integer vector `r` reads the rows
+# `log_w[r]`, and a cell that reads its rows through a shared index array,
+# `log_w[rows[k]]` (`rows` read whole or through `vec`), reads `rows[k]`: one
+# row or several. When that array's producer computes it row by row, the
+# native lowering runs the producer's own operation on those rows instead: the
+# producer is given views of its row-aligned operands at those rows, and the
+# cell is given a `_CellWindow` holding the result, which answers reads of
+# those rows and throws `BoundsError` for any other. The rewrite applies to
+# these source shapes, read off the closure's native body
+# (`_kernel_native_body`):
 #
 # - a dotted expression (one fused broadcast) whose operands are recipe
-#   inputs, numeric literals, or gathers `A[I]` / `A[I, 1, ...]` of an input by
-#   an integer vector input `I` (integer literals after it);
-# - such a gather on its own;
+#   inputs, numeric literals, gathers `A[I]` / `A[I, 1, ...]` of an input by
+#   an integer vector input `I` (integer literals after it), column reads
+#   `A[:, 1, ...]`, products `A * w` of two inputs, and literal-position reads
+#   `a[1]` of an array of numbers (read whole);
+# - such a gather on its own, and such a column read on its own;
+# - `hcat(a, b, ...)` of inputs: row `r` is the `hcat` of each operand's row
+#   `r`;
 # - a product `A * W...` (a source expression, or a bare call that keeps
-#   Base's `*` as its operation) whose left factor `A` is an input array:
-#   row `r` of the product is `A[r:r, ...] * W...`. Its full axes, which a
-#   dotted reader and the cell's linear reads need, are known for a
-#   matrix-vector product `A * v` (`(axes(A, 1),)`); any other product is read
-#   only by gathers;
+#   Base's `*` as its operation) whose left factor `A` is an input array, a
+#   column read or an `hcat`: row `r` of the product is `A[r:r, ...] * W...`.
+#   Its full axes, which a dotted reader and the cell's linear reads need,
+#   follow from `A`'s for a product of two operands whose right operand is an
+#   array or a number (`_cell_product_shape`); any other product is read only
+#   by gathers;
 # - an authored plate: row `r` of its value is the plate over row `r` of each
 #   batched argument, lowered natively over those one-row views at the reading
 #   cell. A shared argument its body reads only as `v[q]`, `q` the element of
@@ -31,22 +41,23 @@
 #
 # Row `r` of the dotted expression is the same expression over row `r` of each
 # array operand (the operand itself when broadcasting extrudes it), and row
-# `r` of a gather by `I` reads row `I[r]` of its source. Those rows are again
-# computed at that row when their producers have one of these shapes, and are
-# otherwise computed whole and indexed. A value is computed only at rows when
-# every reader of it reads rows this way, so the program computes no value
-# twice in different ways. The cell's batched element must be provably an
-# integer (a linear position), and each gather index provably an integer
-# vector (`_cell_static_type`).
+# `r` of a gather by `I` reads row `I[r]` of its source; rows `R` read rows
+# `R`, and `I[R]`. Those rows are again computed at those rows when their
+# producers have one of these shapes, and are otherwise computed whole and
+# indexed. A value is computed only at rows when every reader of it reads rows
+# this way, so the program computes no value twice in different ways. The
+# cell's batched element must be provably an integer (a linear position) or an
+# integer vector, and each gather index provably an integer vector
+# (`_cell_static_type`).
 #
 # Shapes and bounds keep the whole program's checks for this cell: each
-# dotted expression's full broadcast shape is computed from its operands' axes
-# (so mismatched operands still throw `DimensionMismatch`), the row is checked
-# against it, factor rows are bounds-checked views, and window reads check
-# their row. Values at other rows are not computed, so an error that only
-# another row raises (an out-of-range gather index elsewhere, a domain error
-# in another subject's predictor) is not raised, as the cell itself does not
-# run other cells. Everything else, including the tensorized lowering, the
+# dotted expression's and `hcat`'s full shape is computed from its operands'
+# axes (so mismatched operands still throw `DimensionMismatch`), the rows are
+# checked against it, factor rows are bounds-checked views, and window reads
+# check their row. Values at other rows are not computed, so an error that
+# only another row raises (an out-of-range gather index elsewhere, a domain
+# error in another subject's predictor) is not raised, as the cell itself does
+# not run other cells. Everything else, including the tensorized lowering, the
 # operation table, and `on_error = :ignore` twins, is unchanged.
 
 """

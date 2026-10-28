@@ -524,3 +524,234 @@ end
         @test _CELL_GUARD_CALLS[] == (present[i] ? 1 : 0)
     end
 end
+
+# A cell reading a row-wise value at several rows: `log_w[r]`, `r` one integer
+# vector per cell, as a total over a group of rows reads them (snag
+# `compact-cell-sam-d85d96ae`). The predictor and the product rows it gathers
+# run at those rows only.
+@kernel _cell_ragged(rows::Vector{Vector{Int}}, totals, w, codes::Vector{Int},
+                     Z::Matrix{Float64}, F::Matrix{Float64}, a::Float64) = begin
+    R = Z * F'
+    log_w = a .+ 0.5 .* w .+ R[codes, 1]
+    dens = plate(rows, totals) do r, t
+        -(t - sum(exp.(log_w[r])))^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+
+# The same rows read through a shared index array, `log_w[rows[k]]`, the
+# shape RKPPL and BRM emit for `rows = groups(g => cells)`.
+@kernel _cell_ragged_shared(positions::Vector{Int}, rows::Vector{Vector{Int}}, totals,
+                            w, codes::Vector{Int}, z, a::Float64) = begin
+    log_w = a .+ 0.5 .* w .+ z[codes]
+    dens = plate(positions, totals) do k, t
+        -(t - sum(exp.(log_w[rows[k]])))^2 / 2
+    end
+    return dens
+end
+
+function _cell_ragged_data(n; size = 3, levels = max(1, n ÷ 4))
+    rows = [collect(j:min(j + size - 1, n)) for j in 1:size:n]
+    (; rows, totals = collect(range(1.0, 4.0; length = length(rows))),
+       w = collect(range(-1.0, 1.0; length = n)),
+       codes = [mod1(3j, levels) for j in 1:n],
+       Z = reshape(collect(range(-0.5, 0.7; length = 2levels)), levels, 2))
+end
+
+const _RAGGED_HAVE = (:rows, :totals, :w, :codes, :Z, :F, :a)
+
+@testset "plate_cell: a value read at several rows of a cell" begin
+    spec = plate_cell(_cell_ragged, :dens; index = :i)
+    k = prepare(spec; have = (_RAGGED_HAVE..., :i), want = :dens_cell)
+    full = prepare(_cell_ragged; have = _RAGGED_HAVE, want = :dens)
+    d = _cell_ragged_data(13)
+    # A short group, an empty one, a repeated row and unsorted rows.
+    d = (; d..., rows = [d.rows..., Int[], [2, 2, 9], [7, 1]],
+           totals = [d.totals..., 0.5, 1.5, 2.5])
+    reference = full(d..., _CELL_F, 0.3)
+    @test [k(d..., _CELL_F, 0.3, i) for i in eachindex(d.rows)] ≈ reference
+    # Neither the predictor nor the product is computed for the domain.
+    allocated(d) = (k(d..., _CELL_F, 0.3, 2); @allocated k(d..., _CELL_F, 0.3, 2))
+    @test allocated(_cell_ragged_data(12)) == allocated(_cell_ragged_data(120_000))
+    bound = prepare(spec; have = (_RAGGED_HAVE..., :i), want = :dens_cell,
+        bound = (; d.rows, d.totals, d.w, d.codes))
+    @test [bound(d.Z, _CELL_F, 0.3, i) for i in eachindex(d.rows)] ≈ reference
+    # An operand extruded by broadcasting repeats its row.
+    one_w = (; d..., w = [0.2])
+    @test [k(one_w..., _CELL_F, 0.3, i) for i in eachindex(d.rows)] ≈
+        full(one_w..., _CELL_F, 0.3)
+    # The cell's reads are checked, and operand shapes as a whole.
+    beyond = (; d..., rows = [d.rows[1], [1, length(d.w) + 1]], totals = d.totals[1:2])
+    @test_throws BoundsError full(beyond..., _CELL_F, 0.3)
+    @test_throws BoundsError k(beyond..., _CELL_F, 0.3, 2)
+    @test_throws DimensionMismatch k((; d..., w = [d.w; 0.0])..., _CELL_F, 0.3, 2)
+    # Native Enzyme Reverse: only the gathered rows of Z have a derivative, and
+    # a repeated row adds both reads.
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    original = deepcopy(d)
+    for i in (1, length(d.rows) - 1)
+        matrix = prepare_ad(k, backend, d..., _CELL_F, 0.3, i; active = :Z)
+        value, dZ = ad_value_and_gradient(matrix, d..., _CELL_F, 0.3, i)
+        @test value ≈ reference[i]
+        gathered = sort!(unique(d.codes[d.rows[i]]))
+        @test findall(vec(any(!iszero, dZ; dims = 2))) == gathered
+        for j in gathered
+            e = zero(d.Z); e[j, 1] = 1.0
+            @test dZ[j, 1] ≈ _cell_central(
+                h -> k((; d..., Z = d.Z .+ h .* e)..., _CELL_F, 0.3, i), 0.0) rtol = 1e-6
+        end
+        scalar = prepare_ad(k, backend, d..., _CELL_F, 0.3, i; active = :a)
+        _, da = ad_value_and_gradient(scalar, d..., _CELL_F, 0.3, i)
+        @test da ≈ _cell_central(a -> k(d..., _CELL_F, a, i), 0.3) rtol = 1e-6
+    end
+    @test d == original
+end
+
+@testset "plate_cell: several rows read through a shared index array" begin
+    have = (:positions, :rows, :totals, :w, :codes, :z, :a)
+    k = prepare(plate_cell(_cell_ragged_shared, :dens; index = :i);
+        have = (have..., :i), want = :dens_cell)
+    full = prepare(_cell_ragged_shared; have, want = :dens)
+    function data(n; levels = max(1, n ÷ 4))
+        base = _cell_ragged_data(n; levels)
+        (; positions = collect(eachindex(base.rows)), base.rows, base.totals, base.w,
+           base.codes, z = collect(range(-0.5, 0.7; length = levels)))
+    end
+    d = data(13)
+    reference = full(d..., 0.3)
+    @test [k(d..., 0.3, i) for i in d.positions] ≈ reference
+    allocated(d) = (k(d..., 0.3, 2); @allocated k(d..., 0.3, 2))
+    @test allocated(data(12)) == allocated(data(120_000))
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for i in (1, 3)
+        ad = prepare_ad(k, backend, d..., 0.3, i; active = :z)
+        value, dz = ad_value_and_gradient(ad, d..., 0.3, i)
+        @test value ≈ reference[i]
+        @test findall(!iszero, dz) == sort!(unique(d.codes[d.rows[i]]))
+        j = first(d.codes[d.rows[i]])
+        e = zero(d.z); e[j] = 1.0
+        @test dz[j] ≈ _cell_central(h -> k((; d..., z = d.z .+ h .* e)..., 0.3, i), 0.0) rtol = 1e-6
+    end
+end
+
+# Design matrices and group blocks as BRM and RKPPL emit them: an `hcat` design
+# with a computed column read by a product, a level block scaled by a
+# literal-position read (`z .* tau[1]`), a per-row plate written as one matrix
+# column (`hcat`) and read back as `B[:, 1]`, and the same reads inline in a
+# dotted predictor. Each runs at the cell's row only.
+@kernel _cell_designs(positions::Vector{Int}, y, one, x, year, g::Vector{Int},
+                      s::Vector{Int}, beta::Vector{Float64}, z::Matrix{Float64},
+                      tau::Vector{Float64}, c0::Float64) = begin
+    c = x .- c0
+    X = hcat(one, c, year)
+    pop = X * beta
+    b = z .* tau[1]
+    strat = plate(g, s) do gi, si
+        z[gi, 1] * tau[si]
+    end
+    B = hcat(strat)
+    col = B[:, 1]
+    eta = pop .+ b[g, 1] .+ col
+    eta2 = X * beta .+ B[:, 1]
+    loc = plate(positions) do i
+        exp(eta[i]) + eta2[i]
+    end
+    dens = plate(loc, y) do li, yi
+        -(yi - li)^2 / 2
+    end
+    return dens
+end
+
+@testset "plate_cell: designs, column reads and level blocks read at the cell's row" begin
+    have = (:positions, :y, :one, :x, :year, :g, :s, :beta, :z, :tau, :c0)
+    spec = plate_cell(_cell_designs, :dens; index = :i)
+    k = prepare(spec; have = (have..., :i), want = :dens_cell)
+    full = prepare(_cell_designs; have, want = :dens)
+    function data(n; levels = max(2, n ÷ 3))
+        (; positions = collect(1:n), y = cos.(1:n), one = ones(n),
+           x = collect(range(0.5, 1.5; length = n)), year = collect(range(-1.0, 1.0; length = n)),
+           g = [mod1(2j, levels) for j in 1:n], s = [1 + j % 2 for j in 1:n])
+    end
+    params(levels) = (; beta = [0.1, -0.3, 0.2],
+        z = reshape(collect(range(-0.4, 0.6; length = levels)), levels, 1),
+        tau = [0.7, 1.3], c0 = 0.9)
+    d, p = data(9), params(3)
+    reference = full(d..., p...)
+    @test [k(d..., p..., i) for i in d.positions] ≈ reference
+    pushed = let lp = ReactiveKernels._lowering_plan(k.plan),
+                 cells = ReactiveKernels._cell_pushdowns(lp)
+        Set(String(cells.producer[c].outputs[1].name) for c in cells.pushed)
+    end
+    @test issubset(Set(["c", "X", "pop", "b", "strat", "B", "col", "eta", "eta2"]), pushed)
+    allocated(d, p) = (k(d..., p..., 2); @allocated k(d..., p..., 2))
+    @test allocated(data(12), params(4)) == allocated(data(120_000), params(40_000))
+    # `hcat` operands of different heights fail as the whole program does.
+    short = (; d..., year = d.year[1:end-1])
+    @test_throws DimensionMismatch full(short..., p...)
+    @test_throws DimensionMismatch k(short..., p..., 2)
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for i in (1, 6), name in (:beta, :z, :tau)
+        ad = prepare_ad(k, backend, d..., p..., i; active = name)
+        value, dp = ad_value_and_gradient(ad, d..., p..., i)
+        @test value ≈ reference[i]
+        for j in eachindex(getfield(p, name))
+            e = zero(getfield(p, name)); e[j] = 1.0
+            @test dp[j] ≈ _cell_central(h -> k(d..., merge(p, NamedTuple{(name,)}(
+                (getfield(p, name) .+ h .* e,)))..., i), 0.0) atol = 1e-6
+        end
+    end
+    _, dc = ad_value_and_gradient(prepare_ad(k, backend, d..., p..., 3; active = :c0),
+        d..., p..., 3)
+    @test dc ≈ _cell_central(c -> k(d..., merge(p, (; c0 = c))..., 3), p.c0) rtol = 1e-6
+end
+
+# An `hcat` design read at several rows of a cell: values run at those rows.
+# Native Enzyme Reverse rejects Base `hcat` of views beside dense arrays
+# (`IllegalTypeAnalysisException` in `_typed_hcat`), which those rows are. That
+# is an Enzyme gap, fixed in Enzyme rather than worked around in RK (Enzyme
+# snag `native-reverse-t-6d51cae6`; user principle
+# `enzyme-fixed-in-enzyme-everywhere`), so the gradient is pinned broken: an
+# "Unexpected Pass" signals the repair.
+@kernel _cell_ragged_design(positions::Vector{Int}, rows::Vector{Vector{Int}}, totals,
+                            one, x, beta::Vector{Float64}, c0::Float64) = begin
+    c = x .- c0
+    X = hcat(one, c)
+    log_w = X * beta
+    dens = plate(positions, totals) do k, t
+        -(t - sum(exp.(log_w[rows[k]])))^2 / 2
+    end
+    return dens
+end
+
+@testset "plate_cell: an hcat design read at several rows of a cell" begin
+    have = (:positions, :rows, :totals, :one, :x, :beta, :c0)
+    k = prepare(plate_cell(_cell_ragged_design, :dens; index = :i);
+        have = (have..., :i), want = :dens_cell)
+    full = prepare(_cell_ragged_design; have, want = :dens)
+    function data(n)
+        base = _cell_ragged_data(n)
+        (; positions = collect(eachindex(base.rows)), base.rows, base.totals,
+           one = ones(n), x = collect(range(0.5, 1.5; length = n)))
+    end
+    d = data(13)
+    reference = full(d..., [0.2, -0.4], 0.3)
+    @test [k(d..., [0.2, -0.4], 0.3, i) for i in d.positions] ≈ reference
+    allocated(d) = (k(d..., [0.2, -0.4], 0.3, 2); @allocated k(d..., [0.2, -0.4], 0.3, 2))
+    @test allocated(data(12)) == allocated(data(120_000))
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    result = try
+        ad = prepare_ad(k, backend, d..., [0.2, -0.4], 0.3, 2; active = :beta)
+        ad_value_and_gradient(ad, d..., [0.2, -0.4], 0.3, 2)
+    catch err
+        err
+    end
+    @test_broken !(result isa Exception)
+    if result isa Exception
+        @test nameof(typeof(result)) === :IllegalTypeAnalysisException
+    else
+        value, dbeta = result
+        @test value ≈ reference[2]
+        @test dbeta[2] ≈ _cell_central(b -> k(d..., [0.2, b], 0.3, 2), -0.4) rtol = 1e-6
+    end
+end

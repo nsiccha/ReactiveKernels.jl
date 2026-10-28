@@ -443,3 +443,99 @@ end
     sbound = bind_data(plan, (; n = 5, k = 2))
     @test_throws ContractValidationError prepare_cell_query(build_kernel(sbound), sbound, :k)
 end
+
+# The cell groups of a regional panel (snag `compact-cell-sam-d85d96ae`): a
+# total reads its rows of a predictor whose design has a computed column, and
+# an observation reads a mean with a per-row stratified effect. Each cell costs
+# its own rows, however many rows the model has.
+const _CQ_TOTALS = quote
+    sigma_t ~ Exponential(1)
+    beta[1:3] .~ Normal.(0, 1)
+    tau ~ Exponential(1)
+    u[levels(g)] .~ Normal.(0, 1)
+    c0 ~ Normal(4, 1)
+    c = lx .- c0
+    X = hcat(one, c, year)
+    log_w = X * beta .+ tau .* u[g]
+    @plate for k in eachindex(total)
+        total[k] ~ Normal(sum(exp.(log_w[rows[k]])), sigma_t * total[k])
+    end
+end
+
+const _CQ_STRATA = quote
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    ts[levels(s), 1:1] .~ Exponential.(1)
+    zg[levels(g), 1:1] .~ Normal.(0, 1)
+    @plate for i in eachindex(g)
+        b[i, 1:1] = ts[s[i], :] .* zg[g[i], :]
+    end
+    mu = a .+ b[:, 1]
+    xo .~ Normal.(mu[obs], sigma)
+end
+
+function _cq_panel_data(n; size = 4)
+    rows = [collect(j:min(j + size - 1, n)) for j in 1:size:n]
+    (; lx = 4.0 .+ 0.1 .* sin.(1:n), one = ones(n),
+       year = collect(range(-1.0, 1.0; length = n)),
+       g = [string("g", 1 + (j - 1) ÷ 2) for j in 1:n], rows,
+       total = [10.0 + k for k in eachindex(rows)],
+       s = [isodd(j) ? "a" : "b" for j in 1:n], obs = collect(1:2:n),
+       xo = [0.1 * j for j in 1:2:n])
+end
+
+# The totals' design as a data matrix: the cell gradient, compact and dense.
+const _CQ_TOTALS_DATA = quote
+    sigma_t ~ Exponential(1)
+    beta[1:3] .~ Normal.(0, 1)
+    tau ~ Exponential(1)
+    u[levels(g)] .~ Normal.(0, 1)
+    log_w = X * beta .+ tau .* u[g]
+    @plate for k in eachindex(total)
+        total[k] ~ Normal(sum(exp.(log_w[rows[k]])), sigma_t * total[k])
+    end
+end
+
+_cq_panel_data_matrix(n) = let d = _cq_panel_data(n)
+    (; X = hcat(d.one, d.lx, d.year), d.g, d.rows, d.total)
+end
+
+@testset "cell query: totals over rows and stratified effects cost their own rows" begin
+    backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    function measure(ast, data, obs; gradients)
+        map((40, 4_000)) do n
+            bound, built = _cq_bound(ast, data(n), (obs,))
+            q = prepare_cell_query(built, bound, obs)
+            u = collect(range(-0.4, 0.5; length = built.layout.total))
+            pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+            q(u, 2)
+            measured = (; value = q(u, 2), reference = getproperty(pointwise, obs)[2],
+                bytes = (@allocated q(u, 2)))
+            gradients || return measured
+            dense = prepare_cell_sampler(built, bound, obs, u; backend)
+            dense_value, dense_gradient = cell_value_and_gradient!(dense, similar(u), u, 2)
+            indices = collect(1:6)
+            active = u[indices]
+            compact = prepare_compact_cell_sampler(built, bound, obs, u, indices; backend)
+            compact_gradient = similar(active)
+            compact_value, _ = cell_value_and_gradient!(
+                compact, compact_gradient, u, active, indices, 2)
+            (; measured..., dense_value, compact_value,
+               parity = compact_gradient ≈ dense_gradient[indices],
+               compact_bytes = (@allocated cell_value_and_gradient!(
+                   compact, compact_gradient, u, active, indices, 2)))
+        end
+    end
+    for (ast, data, obs, gradients) in (
+            (_CQ_TOTALS, _cq_panel_data, :total, false),
+            (_CQ_TOTALS_DATA, _cq_panel_data_matrix, :total, true),
+            (_CQ_STRATA, _cq_panel_data, :xo, true))
+        measured = measure(ast, data, obs; gradients)
+        @test all(m -> m.value ≈ m.reference, measured)
+        @test measured[1].bytes == measured[2].bytes
+        gradients || continue
+        @test all(m -> m.value ≈ m.dense_value ≈ m.compact_value, measured)
+        @test all(m -> m.parity, measured)
+        @test measured[1].compact_bytes == measured[2].compact_bytes
+    end
+end

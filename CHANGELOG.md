@@ -16,6 +16,24 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.6
+
+- A plate cell that reads a row-wise value at several rows computes it at
+  those rows only: `v[r]` with `r` one integer vector per cell, or
+  `v[rows[k]]` through a shared index array (a total over a group of rows,
+  RKPPL's `groups(g => cells)`). On 0.1.5 and earlier such a cell computed
+  `v` and everything it reads for the whole domain.
+- Values a cell reads at its rows are computed at those rows for more
+  producers: column reads `A[:, k]`, `hcat` of row-aligned operands (a design
+  matrix with a computed column), a product whose left factor is one of
+  these, and dotted expressions with column reads, products `A * w` and
+  literal-position reads `a[1]` among their operands. BRM's stratified group
+  effects, scaled group blocks and completed-covariate designs are therefore
+  computed at the queried row; on 0.1.5 and earlier each was computed whole in
+  every cell query, compact cell gradients included.
+- Native Enzyme Reverse through an `hcat` read at several rows of a cell
+  fails in Enzyme (snag `native-reverse-t-6d51cae6`); its values are exact.
+
 ## 0.1.5
 
 - A rebuild of one program reuses the code compiled for the first build: in
