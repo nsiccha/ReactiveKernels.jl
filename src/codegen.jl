@@ -6982,10 +6982,12 @@ Base.@nospecializeinfer function _borrowed_batch(@nospecialize(target), p::Plan,
 end
 
 # A new native execution instance shares the read-only computation, not the
-# buffers of an earlier call. No planning, lowering or compilation occurs.
-Base.copy(kernel::BorrowedBatchedKernel) =
-    BorrowedBatchedKernel(kernel.target, kernel.native, kernel.ops,
-                         _borrowed_batch_caches(length(kernel.caches)), kernel.ast)
+# buffers of an earlier call. No planning, lowering or compilation occurs, and
+# the copy itself compiles once rather than once per reader type.
+Base.@nospecializeinfer Base.copy(@nospecialize(kernel::BorrowedBatchedKernel)) =
+    _kernel_new_instance(typeof(kernel), (getfield(kernel, :target), getfield(kernel, :native),
+        getfield(kernel, :ops), _borrowed_batch_caches(length(getfield(kernel, :caches))),
+        getfield(kernel, :ast)))
 
 @inline function (kernel::BorrowedBatchedKernel)(args::Vararg{Any,N}) where {N}
     length(args) == length(inputs(kernel)) || throw(MethodError(kernel, args))
