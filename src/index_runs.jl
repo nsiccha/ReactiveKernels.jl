@@ -273,7 +273,7 @@ function _lower_index_runs_native(body::Expr,ops)
         for s in selected
             push!(grouped.args,:($(shared[s])=$(GlobalRef(Base.Broadcast,:_broadcast_getindex))($s,Base.CartesianIndex($lo))))
         end
-        push!(grouped.args,:($part=zero($accumulator)),simd(grouped_body),
+        push!(grouped.args,:($part=$(GlobalRef(@__MODULE__,:_plate_run_seed))($accumulator)),simd(grouped_body),
             :($accumulator=$(GlobalRef(@__MODULE__,:_plate_total_add))($accumulator,$part)))
         reads=_inbounds_expr(Expr(:block,
             :($lo=getfield($metadata,1)[$run]),:($hi=getfield($metadata,2)[$run])))

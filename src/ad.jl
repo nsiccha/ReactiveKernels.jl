@@ -1345,8 +1345,12 @@ _ad_retained_box(call, prepared) = throw(ArgumentError(
 # A gradient, Hessian-vector product or third-order derivative selects exactly
 # one scalar WANT; a pullback or pushforward (`scalar_output = false`) selects
 # one or several, differentiated together as the kernel's tuple result.
+# `audited = true` says the caller audits the code of the callable its backend
+# differentiates (`_prepare_ad_operator`), which runs this kernel, so this
+# preparation checks only its values rather than infer the same code twice.
 function _ad_spec_kernel(spec::KernelSpec, want, bound = NamedTuple();
-                         retain::Tuple = (), scalar_output::Bool = true)
+                         retain::Tuple = (), scalar_output::Bool = true,
+                         audited::Bool = false)
     _ad_validate_unique_haves(spec)
     selected_wants = _kernel_selection(spec, want, spec.want_names, :want)
     names = Tuple(output.name for output in selected_wants)
@@ -1362,9 +1366,11 @@ function _ad_spec_kernel(spec::KernelSpec, want, bound = NamedTuple();
     wants = (selected_wants...,
              _kernel_selection(spec, retain, spec.want_names, :retain)...)
     selected = length(wants) == 1 ? only(wants) : wants
-    isempty(bound) && return prepare(plan(spec; want = selected))
-    prepare(plan(spec; want = selected);
-            bound = _kernel_bound_pairs(spec, bound))
+    _with_type_stability(nothing, audited ? :values : nothing) do
+        isempty(bound) && return prepare(plan(spec; want = selected))
+        prepare(plan(spec; want = selected);
+                bound = _kernel_bound_pairs(spec, bound))
+    end
 end
 
 # A partially-evaluated kernel is positional over the remaining HAVE ports;
@@ -1587,11 +1593,18 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
     # The exemplars type the program exactly as the derivative will see it.
     # Traced exemplars run the tensorized product, which this check does not
     # type.
-    _kernel_source_style(resolved) === Val(:native) &&
-        _warn_uninferred_values(kernel, map(Core.Typeof, resolved))
+    native = _kernel_source_style(resolved) === Val(:native)
+    values = native ? _uninferred_values(kernel, map(Core.Typeof, resolved)) :
+        _UninferredValue[]
     call, point, contexts, active_selector, external_values = _ad_call(
         kernel, resolved, active; scalar_output = _ad_operator_scalar_output(op),
         retain, _ad_operator_seeding(op, seeds, backend)...)
+    # The backend differentiates `call`: its code is what the level audits.
+    native && _report_type_stability(
+        values,
+        _level_code_findings(_type_stability_level(), call,
+                             _ad_call_argument_types(point, contexts)),
+        _type_stability())
     preparation = _ad_operator_preparation(
         op, call, backend, point, seeds, contexts)
     prepared = PreparedADOperator{
@@ -1670,7 +1683,7 @@ function _prepare_ad_tangent_operator(op::Val, kernel::_ADKernel, resolver,
 end
 
 """
-    prepare_ad(spec, backend, args...; active, want, bound=(;), retain=(), warm=false, native_forward_batch=false, kwargs...)
+    prepare_ad(spec, backend, args...; active, want, bound=(;), retain=(), warm=false, native_forward_batch=false, type_stability=nothing, type_stability_level=nothing, kwargs...)
 
 Prepare a reusable DifferentiationInterface gradient of the explicit scalar
 `want` port in a [`KernelSpec`](@ref). `active` names one selected HAVE port or
@@ -1707,11 +1720,17 @@ the differentiated callable; this does not change the public HAVE boundary.
 Bound views cross as owning copies with identical contents, since a
 prebuilt view operand defeats reverse-mode static activity analysis.
 
-Like [`prepare`](@ref), preparation warns, once per process, about each value
-of the kernel whose type Julia does not infer concretely from the exemplar
-argument types, naming the value and the recipe that computes it, and then
-continues. Such a value makes every recipe and plate cell that reads it
-dispatch dynamically, and native reverse mode may refuse the derivative.
+Like [`prepare`](@ref), preparation checks that the kernel is type stable for
+the exemplar argument types: each value of the kernel at
+`type_stability_level = :values`, and at `:rk` and `:all` (the default) also
+the code of the callable the backend differentiates. It warns once per process
+about each finding and continues. A non-concrete value makes every recipe and
+plate cell that reads it dispatch dynamically, and native reverse mode may
+refuse the derivative. `type_stability = :error` refuses such a kernel instead,
+throwing a [`TypeInstabilityError`](@ref) that names every finding. Both
+keywords default to the enclosing preparation's setting or the project's
+preference, as for [`prepare`](@ref). Every `prepare_ad_*` preparation takes
+the same keywords.
 
 `warm = true` compiles the gradient during preparation for the exemplar's
 argument types, so evaluations with those types run compiled code. It infers
@@ -1734,13 +1753,16 @@ function prepare_ad(spec::KernelSpec,
                     backend::DifferentiationInterface.AbstractADType,
                     args...; active, want, bound = NamedTuple(),
                     retain::Tuple = (), warm::Bool = false,
-                    native_forward_batch::Bool = false, kwargs...)
-    kernel, resolver, keywords =
-        _ad_spec_boundary(spec, want, bound, kwargs; retain)
-    native_forward_batch ?
-        _prepare_native_forward_batch_ad(kernel, resolver, backend, args,
-            keywords, active; retain, warm) :
-        _prepare_ad(kernel, resolver, backend, args, keywords, active; retain, warm)
+                    native_forward_batch::Bool = false, type_stability = nothing,
+                    type_stability_level = nothing, kwargs...)
+    _with_type_stability(type_stability, type_stability_level) do
+        kernel, resolver, keywords =
+            _ad_spec_boundary(spec, want, bound, kwargs; retain)
+        native_forward_batch ?
+            _prepare_native_forward_batch_ad(kernel, resolver, backend, args,
+                keywords, active; retain, warm) :
+            _prepare_ad(kernel, resolver, backend, args, keywords, active; retain, warm)
+    end
 end
 
 """
@@ -1764,12 +1786,15 @@ fails loudly naming the missing `using`.
 function prepare_ad(kernel::PreparedKernel,
                     backend::DifferentiationInterface.AbstractADType,
                     args...; active, retain::Tuple = (), warm::Bool = false,
-                    native_forward_batch::Bool = false, kwargs...)
-    keywords = _ad_reject_low_level_keywords(kernel, kwargs)
-    native_forward_batch ?
-        _prepare_native_forward_batch_ad(kernel, tuple, backend, args,
-            keywords, active; retain, warm) :
-        _prepare_ad(kernel, tuple, backend, args, keywords, active; retain, warm)
+                    native_forward_batch::Bool = false, type_stability = nothing,
+                    type_stability_level = nothing, kwargs...)
+    _with_type_stability(type_stability, type_stability_level) do
+        keywords = _ad_reject_low_level_keywords(kernel, kwargs)
+        native_forward_batch ?
+            _prepare_native_forward_batch_ad(kernel, tuple, backend, args,
+                keywords, active; retain, warm) :
+            _prepare_ad(kernel, tuple, backend, args, keywords, active; retain, warm)
+    end
 end
 
 """
@@ -1817,9 +1842,12 @@ fails loudly naming the missing `using`.
 function prepare_ad(kernel::NonAllocatingKernel,
                     backend::DifferentiationInterface.AbstractADType,
                     args...; active, retain::Tuple = (), warm::Bool = false,
-                    kwargs...)
-    keywords = _ad_reject_low_level_keywords(kernel, kwargs)
-    _prepare_ad(kernel, tuple, backend, args, keywords, active; retain, warm)
+                    type_stability = nothing, type_stability_level = nothing,
+        kwargs...)
+    _with_type_stability(type_stability, type_stability_level) do
+        keywords = _ad_reject_low_level_keywords(kernel, kwargs)
+        _prepare_ad(kernel, tuple, backend, args, keywords, active; retain, warm)
+    end
 end
 
 # A batched gradient callable owns the scalar AD preparation plus the same
@@ -1955,19 +1983,27 @@ fails loudly naming the missing `using`.
 """
 function prepare_ad_pullback(
         spec::KernelSpec, backend::DifferentiationInterface.AbstractADType,
-        seed, args...; active, want, kwargs...)
-    kernel = _ad_spec_kernel(spec, want; scalar_output = false)
-    _prepare_ad_pullback(
-        kernel, _ad_resolver(spec), backend, seed, args,
-        NamedTuple(kwargs), active)
+        seed, args...; active, want, type_stability = nothing,
+        type_stability_level = nothing,
+        kwargs...)
+    _with_type_stability(type_stability, type_stability_level) do
+        kernel = _ad_spec_kernel(spec, want; scalar_output = false, audited = true)
+        _prepare_ad_pullback(
+            kernel, _ad_resolver(spec), backend, seed, args,
+            NamedTuple(kwargs), active)
+    end
 end
 
 function prepare_ad_pullback(
         kernel::_ADKernel,
         backend::DifferentiationInterface.AbstractADType,
-        seed, args...; active, kwargs...)
-    keywords = _ad_reject_low_level_keywords(kernel, kwargs)
-    _prepare_ad_pullback(kernel, tuple, backend, seed, args, keywords, active)
+        seed, args...; active, type_stability = nothing,
+        type_stability_level = nothing,
+        kwargs...)
+    _with_type_stability(type_stability, type_stability_level) do
+        keywords = _ad_reject_low_level_keywords(kernel, kwargs)
+        _prepare_ad_pullback(kernel, tuple, backend, seed, args, keywords, active)
+    end
 end
 
 """
@@ -2037,6 +2073,11 @@ function ad_gradient(kernel::NonAllocatingKernel,
         call, backend, point, contexts...)
     _ad_restore_cotangent(point, gradient)
 end
+
+# The argument types of the callable the backend differentiates.
+_ad_call_argument_types(point, contexts) =
+    (Core.Typeof(point),
+     map(c -> Core.Typeof(DifferentiationInterface.unwrap(c)), contexts)...)
 
 function _ad_prepared_arguments(
         prepared::PreparedADOperator{I}, args, kwargs::NamedTuple) where {I}
@@ -2234,7 +2275,7 @@ end
 # authored defaults and keywords resolve as `prepare(spec)` does.
 function _ad_spec_boundary(spec::KernelSpec, want, bound, kwargs;
                            retain::Tuple = (), scalar_output::Bool = true)
-    kernel = _ad_spec_kernel(spec, want, bound; retain, scalar_output)
+    kernel = _ad_spec_kernel(spec, want, bound; retain, scalar_output, audited = true)
     isempty(bound) && return kernel, _ad_resolver(spec), NamedTuple(kwargs)
     kernel, tuple, _ad_reject_bound_keywords(NamedTuple(kwargs))
 end
@@ -2283,19 +2324,27 @@ loudly naming the missing `using`.
 """
 function prepare_ad_pushforward(
         spec::KernelSpec, backend::DifferentiationInterface.AbstractADType,
-        tangents, args...; active, want, bound = NamedTuple(), kwargs...)
-    kernel, resolver, keywords = _ad_spec_boundary(
-        spec, want, bound, kwargs; scalar_output = false)
-    _prepare_ad_tangent_operator(Val(:pushforward), kernel, resolver, backend,
-                                 tangents, args, keywords, active)
+        tangents, args...; active, want, bound = NamedTuple(),
+        type_stability = nothing, type_stability_level = nothing,
+        kwargs...)
+    _with_type_stability(type_stability, type_stability_level) do
+        kernel, resolver, keywords = _ad_spec_boundary(
+            spec, want, bound, kwargs; scalar_output = false)
+        _prepare_ad_tangent_operator(Val(:pushforward), kernel, resolver, backend,
+                                     tangents, args, keywords, active)
+    end
 end
 
 function prepare_ad_pushforward(
         kernel::_ADKernel, backend::DifferentiationInterface.AbstractADType,
-        tangents, args...; active, kwargs...)
-    keywords = _ad_reject_low_level_keywords(kernel, kwargs)
-    _prepare_ad_tangent_operator(Val(:pushforward), kernel, tuple, backend,
-                                 tangents, args, keywords, active)
+        tangents, args...; active, type_stability = nothing,
+        type_stability_level = nothing,
+        kwargs...)
+    _with_type_stability(type_stability, type_stability_level) do
+        keywords = _ad_reject_low_level_keywords(kernel, kwargs)
+        _prepare_ad_tangent_operator(Val(:pushforward), kernel, tuple, backend,
+                                     tangents, args, keywords, active)
+    end
 end
 
 # Call-time tangents are checked against the current active point and take
@@ -2365,18 +2414,26 @@ for `AutoEnzyme`); preparation without them fails loudly naming the missing
 """
 function prepare_ad_hvp(
         spec::KernelSpec, backend::DifferentiationInterface.AbstractADType,
-        tangents, args...; active, want, bound = NamedTuple(), kwargs...)
-    kernel, resolver, keywords = _ad_spec_boundary(spec, want, bound, kwargs)
-    _prepare_ad_tangent_operator(Val(:hvp), kernel, resolver, backend,
-                                 tangents, args, keywords, active)
+        tangents, args...; active, want, bound = NamedTuple(),
+        type_stability = nothing, type_stability_level = nothing,
+        kwargs...)
+    _with_type_stability(type_stability, type_stability_level) do
+        kernel, resolver, keywords = _ad_spec_boundary(spec, want, bound, kwargs)
+        _prepare_ad_tangent_operator(Val(:hvp), kernel, resolver, backend,
+                                     tangents, args, keywords, active)
+    end
 end
 
 function prepare_ad_hvp(
         kernel::_ADKernel, backend::DifferentiationInterface.AbstractADType,
-        tangents, args...; active, kwargs...)
-    keywords = _ad_reject_low_level_keywords(kernel, kwargs)
-    _prepare_ad_tangent_operator(Val(:hvp), kernel, tuple, backend,
-                                 tangents, args, keywords, active)
+        tangents, args...; active, type_stability = nothing,
+        type_stability_level = nothing,
+        kwargs...)
+    _with_type_stability(type_stability, type_stability_level) do
+        keywords = _ad_reject_low_level_keywords(kernel, kwargs)
+        _prepare_ad_tangent_operator(Val(:hvp), kernel, tuple, backend,
+                                     tangents, args, keywords, active)
+    end
 end
 
 _ad_restore_tangents(point, results::Tuple) =
@@ -2482,7 +2539,10 @@ constant at the outer levels (the direction `v` among them) is uninitialized
 memory. On Julia 1.10, OpenBLAS zero-fills a matrix-vector product's tangent,
 so those are exact there; on Julia 1.12 and later they are not, and
 matrix-matrix products can be NaN on every Julia version. The reproducer is
-`benchmark/repro_enzyme_forward_over_forward_view_matvec.jl`.
+`benchmark/repro_enzyme_forward_over_forward_view_matvec.jl`. The local Enzyme
+`dogfood` line overwrites the tangent from libEnzyme build `4be29b19`, and its
+third-order derivatives are then exact; no registered `Enzyme_jll` release
+carries the fix yet.
 
 Directions with disjoint supports compress, as for Hessian-vector products:
 when active coordinates fall into groups that never interact (per-subject
@@ -2497,20 +2557,28 @@ for `AutoEnzyme`); preparation without them fails loudly naming the missing
 """
 function prepare_ad_third(
         spec::KernelSpec, backend::DifferentiationInterface.AbstractADType,
-        tangents, args...; active, want, bound = NamedTuple(), kwargs...)
-    _ad_check_third_backend(backend)
-    kernel, resolver, keywords = _ad_spec_boundary(spec, want, bound, kwargs)
-    _prepare_ad_tangent_operator(Val(:third), kernel, resolver, backend,
-                                 tangents, args, keywords, active)
+        tangents, args...; active, want, bound = NamedTuple(),
+        type_stability = nothing, type_stability_level = nothing,
+        kwargs...)
+    _with_type_stability(type_stability, type_stability_level) do
+        _ad_check_third_backend(backend)
+        kernel, resolver, keywords = _ad_spec_boundary(spec, want, bound, kwargs)
+        _prepare_ad_tangent_operator(Val(:third), kernel, resolver, backend,
+                                     tangents, args, keywords, active)
+    end
 end
 
 function prepare_ad_third(
         kernel::_ADKernel, backend::DifferentiationInterface.AbstractADType,
-        tangents, args...; active, kwargs...)
-    _ad_check_third_backend(backend)
-    keywords = _ad_reject_low_level_keywords(kernel, kwargs)
-    _prepare_ad_tangent_operator(Val(:third), kernel, tuple, backend,
-                                 tangents, args, keywords, active)
+        tangents, args...; active, type_stability = nothing,
+        type_stability_level = nothing,
+        kwargs...)
+    _with_type_stability(type_stability, type_stability_level) do
+        _ad_check_third_backend(backend)
+        keywords = _ad_reject_low_level_keywords(kernel, kwargs)
+        _prepare_ad_tangent_operator(Val(:third), kernel, tuple, backend,
+                                     tangents, args, keywords, active)
+    end
 end
 
 _ad_third_tangent(prepared::PreparedADThird, point, tangent, contexts) =

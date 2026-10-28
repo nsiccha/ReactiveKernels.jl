@@ -4776,6 +4776,10 @@ function _cell_reads_index(ex::Expr, ivar, perlocals)
     return any(a -> _cell_reads_index(a, ivar, perlocals), ex.args[start:end])
 end
 
+const _CELL_ARRAY_LITERAL_HEADS = (:vect, :vcat, :hcat, :hvcat, :ncat,
+    :typed_vcat, :typed_hcat, :typed_hvcat, :typed_ncat, :comprehension,
+    :typed_comprehension)
+
 _retained_cell_expr(ex, ivar, perlocals) = false
 function _retained_cell_expr(ex::Expr, ivar, perlocals)
     per(a) = _cell_reads_index(a, ivar, perlocals)
@@ -4788,6 +4792,11 @@ function _retained_cell_expr(ex::Expr, ivar, perlocals)
     elseif ex.head === :. && length(ex.args) == 2 && ex.args[2] isa Expr &&
             ex.args[2].head === :tuple
         any(per, ex.args[2].args) && return true
+    elseif ex.head in _CELL_ARRAY_LITERAL_HEADS
+        # An array literal of per-index values holds one array per index:
+        # over whole columns, `[b * a1[i], b * a2[i]]` would build
+        # `[b .* a1, b .* a2]`, one array per literal entry instead.
+        any(per, ex.args) && return true
     elseif ex.head === :call && !isempty(ex.args)
         f = ex.args[1]
         args = ex.args[2:end]
@@ -10873,6 +10882,19 @@ _indexes_module_value(ex, ctx) = ex isa Expr &&
 _def_reads_module(s, ctx) = _contains_module_call(ctx.detmap[s]) ||
     any(t -> haskey(ctx.detmap, t) && _def_reads_module(t, ctx),
         _value_symbols(ctx.detmap[s]))
+# A retained `@plate` cell computes any Julia value per index (an array
+# literal, a module call's result), so a read of its output by position
+# (`cells[1]`) or through a reduction (`sum(cells)`) has the cells' own
+# shape: like an indexed module value, never a proven scalar offset.
+_reads_retained_cells(ex, ctx) =
+    any(s -> _def_reads_retained_cells(s, ctx, Set{Symbol}()), _value_symbols(ex))
+function _def_reads_retained_cells(s, ctx, seen::Set{Symbol})
+    haskey(ctx.detmap, s) && s ∉ seen || return false
+    push!(seen, s)
+    rhs = ctx.detmap[s]
+    _is_plate_column_call(rhs) && return true
+    return any(t -> _def_reads_retained_cells(t, ctx, seen), _value_symbols(rhs))
+end
 
 # An alias or a signed alias computes nothing of its own and still reads
 # through; array and matrix definitions are never inlined. A data-only
@@ -11225,7 +11247,7 @@ function _extract_summand(pname, core, sign::Int, ctx)
     if core isa Number || shape in (:scalar, :array)
         e = sign < 0 ? Expr(:call, :-, core) : core
         nm = _composed_scalar_leaf!(pname, e, ctx, Symbol[])
-        if shape === :array ||
+        if shape === :array || _reads_retained_cells(core, ctx) ||
                 (_reads_module_value(core, ctx) && !_is_bound_value_call(core))
             return TermSpec(ComposedTerm, ColumnRef[],
                 (tree = nm, subs = Symbol[], scalars = [nm]), nm, nm), nothing

@@ -76,10 +76,11 @@ _sig(g::Graph, vs) = Tuple(canon_id(g, v.id) for v in _astuple(vs))
 _pass_key(pass) = Base.issingletontype(typeof(pass)) ? typeof(pass) : objectid(pass)
 
 """
-    prepare!(cache, g; have, want, passes=(), bound=()) -> PreparedKernel
+    prepare!(cache, g; have, want, passes=(), bound=(), type_stability=nothing, type_stability_level=nothing) -> PreparedKernel
 
 Like `prepare`, but reuses a cached kernel when the same graph version and
-effective have/want/pass signature has been prepared before.
+effective have/want/pass signature has been prepared before under the same
+`type_stability` and `type_stability_level` (see [`prepare`](@ref)).
 
 With a non-empty `bound` (one `Value => data` pair or an iterable of them, as
 for `prepare`), the returned kernel is the same residual kernel `prepare(g;
@@ -93,14 +94,18 @@ partitions by a data-bound branch, or replaces by a bind-time value, is still
 specialized and compiled per binding and reuses the plan and prefix only.
 """
 function prepare!(cache::PreparationCache, g::Graph; have = (), want = (),
-                  passes = (), bound = (), on_error = nothing)
-    bound === () || return _prepare_bound!(cache, g, have, want, passes, bound,
-                                           objectid(g); on_error)
-    key = (objectid(g), g.version, _sig(g, have), _sig(g, want),
-           Tuple(objectid(p) for p in passes), on_error)
-    lock(cache.lock) do
-        get!(cache.kernels, key) do
-            prepare(g; have = have, want = want, passes = passes, on_error = on_error)
+                  passes = (), bound = (), on_error = nothing, type_stability = nothing,
+                  type_stability_level = nothing)
+    _with_type_stability(type_stability, type_stability_level) do
+        bound === () || return _prepare_bound!(cache, g, have, want, passes, bound,
+                                               objectid(g); on_error)
+        key = (objectid(g), g.version, _sig(g, have), _sig(g, want),
+               Tuple(objectid(p) for p in passes), on_error, _type_stability(),
+               _type_stability_level())
+        lock(cache.lock) do
+            get!(cache.kernels, key) do
+                prepare(g; have = have, want = want, passes = passes, on_error = on_error)
+            end
         end
     end
 end
@@ -150,8 +155,11 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     ports, data = _partial_bound_pairs(bound)
     isempty(ports) && return prepare!(cache, g; have = have, want = want,
                                      passes = passes, on_error = on_error)
+    # A binding checked under one set of type-stability settings never serves
+    # another: its rebindings are not checked again.
     key = (:bound, graph_key, g.version, _sig(g, have), _sig(g, want),
-           _sig(g, ports), Tuple(_pass_key(p) for p in passes), on_error)
+           _sig(g, ports), Tuple(_pass_key(p) for p in passes), on_error,
+           _type_stability(), _type_stability_level())
     entry = lock(cache.lock) do
         get!(cache.bound, key) do
             _bound_entry(_kernel_error_policy(plan(g; have = have, want = want), on_error), ports)

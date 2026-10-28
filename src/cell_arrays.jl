@@ -3,10 +3,28 @@
 # their native representation changes, after nested regions have been spliced.
 abstract type _CellArray{T,N} <: AbstractArray{T,N} end
 
-# Index types can remain unknown until specialization. Slices and other
-# nonscalar readers keep the authored materialization; scalar readers below
-# select their entries directly.
-Base.getindex(a::_CellArray, I...) = getindex(_cell_array_materialize(a), I...)
+# Index types can remain unknown until specialization. Scalar readers below
+# select their entries directly. A nonscalar reader (an integer vector, a
+# range, a colon or a mask) selects its entries the same way, into a fresh
+# array of Julia's result shape, so a group cell's `x[rows[g]]` computes those
+# rows only instead of the whole recipe at every read. Like the scalar reads,
+# the selection stays inlined, keeping the recipe visible to scalar
+# replacement (below).
+@inline function Base.getindex(a::_CellArray, I...)
+    J = to_indices(a, I)
+    @boundscheck checkbounds(a, J...)
+    _cell_array_select(a, J)
+end
+Base.getindex(a::_CellArray) = getindex(_cell_array_materialize(a))
+@inline _cell_array_select(a::_CellArray, J::Tuple{Integer,Vararg{Integer}}) =
+    @inbounds a[Base._to_subscript_indices(a, map(Int, J)...)...]
+@inline function _cell_array_select(a::_CellArray{T}, J::Tuple) where {T}
+    selected = similar(Array{T}, Base.index_shape(J...))
+    @inbounds for (k, index) in zip(eachindex(selected), Iterators.product(J...))
+        selected[k] = a[index...]
+    end
+    selected
+end
 @inline Base.getindex(a::_CellArray, I::CartesianIndex) = getindex(a, Tuple(I)...)
 @inline _cell_array_materialize(a) = a
 @inline _cell_array_materialize(bc::Base.Broadcast.Broadcasted) =

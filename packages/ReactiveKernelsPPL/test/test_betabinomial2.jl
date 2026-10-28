@@ -288,7 +288,7 @@ end
 # (docs/src/constraints.md, snag generic-betabino-8a854de2): registered
 # 0.13.216 flags its own by-value copy of the callable (`innerparm`), and
 # dogfood 31d31ec, which accepts that copy, flags the hoisted rule call
-# (Enzyme snag readonly-proof-h-bcbe23d3).
+# (Enzyme snag readonly-proof-h-bcbe23d3). Dogfood 9d920e1f repairs both.
 @testset "betabinomial scalar location and precision" begin
     y = [3, 5, 7, 2, 6, 4]
     cols = Dict{Symbol,AbstractVector}(:c => copy(y))

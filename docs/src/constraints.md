@@ -127,7 +127,18 @@ following their 20:14 feedback on decision
 need to fail.... but we should at the very least strongly discourage and
 probably warn when this happens", recorded as principle review
 `2026-10-12T20-19-25-395-1dvac2l`): preparation names the value and its
-recipe and continues.
+recipe and continues. Refusal is opt-in, never the default: a project's
+`type_stability = "error"` preference or a call's `type_stability = :error`
+keyword makes preparation throw instead (snag `type-stability-c-7eeae56d`,
+user decision
+`ReactiveKernels:snag.type-stability-c-7eeae56d/decisions/2026-10-27T20-42-40-959-1jkb0is`).
+The check covers "everything" by default: the code of the prepared program and
+of every function it calls except Julia's own, with lower
+`type_stability_level`s for the code ReactiveKernels prepares (`:rk`) or the
+values alone (`:values`) (user decision
+`ReactiveKernels:snag.type-stability-c-7eeae56d/decisions/2026-10-27T21-12-20-388-04ks7hd`
+and its comment: "maybe have different levels, which may then include either
+everything rk, or everything everything?").
 
 ## Derivative rules come from one mathematical graph, never by hand
 
@@ -437,19 +448,26 @@ and lock the one Reactant 0.2.289 lifted:
   on Julia 1.12.7 and 1.13.1 with that Enzyme version; its pushforwards and
   the dataflow kernel's Hessian-vector products work. No activity configuration
   or derivative rule is involved.
-- On Julia 1.12.7 and 1.13.1, native Enzyme 0.13.216 forward mode over forward
-  mode returns NaN on some calls when the objective multiplies a constant
-  matrix by a view of the active vector; identical calls in one process
-  disagree. The single forward pass, the same nested call over a slice, and
-  every call on Julia 1.10.12 are exact:
+- Native Enzyme 0.13.216 forward mode over forward mode returns NaN on some
+  calls through a dense matrix product; identical calls in one process
+  disagree. Its forward-mode BLAS rules (`gemv`, `symv`, `gemm`, `symm`,
+  `syrk`) scale the product's output tangent by `beta` instead of overwriting
+  it when `beta == 0`, and a forward-mode shadow allocation is uninitialized
+  memory. When the factors are constant at the outer levels, as the inner
+  tangent product `X * w` of a constant direction `w` is, that tangent is
+  `0 * NaN` whenever the memory holds a NaN. On Julia 1.10.12 OpenBLAS
+  zero-fills a matrix-vector product's tangent, so those calls are exact
+  there; on Julia 1.12.7 and 1.13.1 they are not, and matrix-matrix products
+  can be NaN on every Julia version.
   `repro_enzyme_forward_over_forward_view_matvec.jl` reproduces it with Enzyme
   only (Enzyme snag `nested-forward-o-9434176c`). `prepare_ad_third` runs
-  reverse over forward over forward, and RKPPL reads its coefficients as views
-  of the unconstrained vector, so its third-order derivatives of design-matrix
-  programs inherit the NaN there; the RKPPL tests record a NaN result on Julia
-  1.12 and later as broken and require every finite result to be exact.
-  Hessian-vector products (reverse over forward) are unaffected. No activity
-  configuration or derivative rule is involved.
+  reverse over forward over forward, so third-order derivatives of
+  design-matrix programs, RKPPL's included, inherit the NaN. The local Enzyme
+  `dogfood` line fixes it from libEnzyme build `4be29b19`: on Julia 1.12.7
+  `test_ad_tangent_operators.jl` and RKPPL's `test_query_derivatives.jl` are
+  then exact, and both assert exact values. No registered `Enzyme_jll`
+  release carries the fix yet. Hessian-vector products (reverse over forward)
+  are unaffected. No activity configuration or derivative rule is involved.
 - On Julia 1.10, native Enzyme 0.13.210 reverse mode fails static activity
   analysis (`EnzymeRuntimeActivityError`) for an empty array when a function
   branches on the array's length and then allocates over it, for example
@@ -729,10 +747,13 @@ and lock the one Reactant 0.2.289 lifted:
   the response's rows takes no hoist and differentiates. Enzyme `dogfood`
   `31d31ec` accepts that store, and its proof then rejects the hoisted call
   itself, although LLVM marks the call's pointer into the callable `readonly`
-  and `nocapture`. Dogfood does not repair this second site; it is Enzyme
-  snag `readonly-proof-h-bcbe23d3`. `test_betabinomial2.jl` checks these
-  shapes against an independent density and central differences, and accepts
-  only the exact gradient or this exception.
+  and `nocapture`. Dogfood repairs this second site from `9d920e1f` (Enzyme
+  snag `readonly-proof-h-bcbe23d3`): the proof accepts a call that passes the
+  callable's memory only by reference to parameters whose declared Julia type
+  cannot hold derivative data. On Julia 1.10.12 these shapes then
+  differentiate exactly with the plain backend. `test_betabinomial2.jl`
+  checks these shapes against an independent density and central differences,
+  and accepts only the exact gradient or this exception.
 - On Julia 1.12.7 and 1.13.1, Enzyme 0.13.216 reverse mode allocates 16 bytes
   per element when a loop stores into an array that is either a reused buffer
   or a fresh `similar` one and the store keeps its bounds check. Julia 1.12's

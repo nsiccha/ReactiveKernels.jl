@@ -446,17 +446,48 @@ of Julia's iteration protocol, is accepted. A kernel calling a function whose
 result is uninferred is the test's negative control.
 
 An RK-introduced residue that cannot be removed would be exempted with its
-reason in `test/type_stability_audit.jl`; none is exempt.
+reason in `src/type_stability_audit.jl` (`_CODE_FINDINGS_JUSTIFIED`); none is
+exempt.
 
-Client code is checked when it is prepared. A recipe whose inputs are
-concretely typed but whose result Julia does not infer concretely (`Any`, an
-abstract type, a `Union`, or an array of such elements) is reported with a
-warning that names the value and its recipe. `prepare` checks from the
-declared types of the HAVE ports where they are concrete and from bound data;
-`prepare_ad`, and so `prepare_sampler`, checks from the exemplar arguments.
-Values computed from such a value, or from a HAVE port whose type is not
-known, are not reported again. Preparation still succeeds, so the primal of
-such a kernel keeps working.
+Client code is checked when it is prepared, with the same audit.
+`prepare` checks from the declared types of the HAVE ports where they are
+concrete and from bound data; `prepare_ad`, and so `prepare_sampler`, checks
+from the exemplar arguments and audits the callable its backend
+differentiates. How far the check reaches is `type_stability_level`:
+
+| level | checks |
+|---|---|
+| `:values` | every value of the program: a recipe whose inputs are concretely typed but whose result Julia does not infer concretely (`Any`, an abstract type, a `Union`, or an array of such elements) is reported, naming the value and its recipe. Values computed from such a value, or from a HAVE port whose type is not known, are not reported again. |
+| `:rk` | also the code of the prepared program: the body ReactiveKernels generates and the functions of ReactiveKernels' packages it calls. A used value Julia does not infer concretely, or a call dispatched at run time, is reported with its method. Every other function is a leaf: its call must dispatch statically and return a concrete type. |
+| `:all` (default) | also every function that code calls, a client helper's body included, except Julia's own Base, Core and standard libraries, which stay leaves. |
+
+So at `:all`, a helper that dispatches at run time but asserts its result
+(`f(x) = (g(x))::Float64` over an uninferred `g`) is reported, and so is a
+declared local (`mu::Vector{Float64} = f(x)`) over a helper whose result is
+not inferred; at `:values` neither is.
+
+`type_stability` is what preparation does with a finding. By default (`:warn`)
+it logs a warning once per process and succeeds, so the primal of such a
+kernel keeps working. `:error` refuses the program: every preparation throws a
+`TypeInstabilityError` listing each finding. Both settings are keywords of
+`prepare`, `prepare!` and the `prepare_ad*` functions, which take precedence
+for one call and the preparations nested in it, and ReactiveKernels
+preferences of the same name, which a project sets once:
+
+```julia
+using Preferences, ReactiveKernels
+Preferences.set_preferences!(ReactiveKernels, "type_stability" => "error")
+Preferences.set_preferences!(ReactiveKernels, "type_stability_level" => "rk")
+```
+
+This writes `[ReactiveKernels] type_stability = "error"` (and the level) to the
+project's `LocalPreferences.toml`. Every preparation in that project then
+follows it, including preparations that other packages make for it (RKPPL's
+`prepare_sampler`), its tests (`Pkg.test` copies the preferences), scripts and
+precompile workloads. The preferences are read at the first preparation of a
+Julia session; a new session picks up a change without recompiling anything.
+Cached preparations are kept per setting, so a kernel prepared under `:warn`
+or a lower level is never returned to a stricter call.
 
 When an abstract HAVE declaration hides a concrete input type needed to infer
 an authored plate's rank, `prepare(...; exemplars = (x, ...))` opts the native
@@ -910,15 +941,20 @@ cell reads those results whole; the rest of its graph, including inner loops,
 runs per outer coordinate.
 
 Work that varies per outer coordinate cannot move out of the loop. When such a
-cell computes an `hcat` or a broadcast whose only readers are scalar indexing
-and shape queries, including readers in an embedded kernel's nested plates,
-native lowering reads its entries through those readers instead of storing it
-per cell. For example, `present = p .* offsets[event]` followed by
+cell computes an `hcat` or a broadcast whose only readers index it or query
+its shape, including readers in an embedded kernel's nested plates, native
+lowering reads its entries through those readers instead of storing it per
+cell. A value computed before the loop and read only that way in its cells is
+composed the same way. For example, `present = p .* offsets[event]` followed by
 `components = hcat(present, absent)` builds neither array per event. The graph
 and its queries keep both authored values, and ordinary Enzyme Reverse
 differentiates the composed reads without a derivative rule. Shape checks and
 declarations still run at the authored statement, and scalar reads keep bounds
-checks. The composition covers dense `Float32`/`Float64` arrays and real
+checks. A reader that indexes the value with an integer vector, a range, a
+colon or a mask computes the entries it selects into a fresh array of Julia's
+result shape, so a group cell's `x[rows[g]]` computes that group's rows only.
+Before ReactiveKernels 0.1.4, such a read computed the whole value at every
+read, once per group. The composition covers dense `Float32`/`Float64` arrays and real
 scalars, `hcat` of vectors and matrices, and one-dimensional broadcasts of
 total arithmetic (`+ - * /`, `exp`, `abs`, `abs2`, `logistic`, `log1pexp`,
 `identity`). Other values,
