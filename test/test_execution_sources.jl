@@ -149,6 +149,25 @@ end
     @test_throws ArgumentError RK._declaration_order(p, [RK.canon_id(graph, value!(graph, :d, Float64).id)])
 end
 
+@testset "generated bodies name globals by their owners" begin
+    # A lowering module (a program generator's, or an image's scope module
+    # standing in for it) qualifies the globals a body reads; naming them by the
+    # bindings they resolve to gives one body in every lowering and process
+    # (snag `compiled-reader-be3cadbb`).
+    named = Module(:LoweringModule)
+    Core.eval(named, :(const data = [1.0]; helper(x) = x))
+    scope = RK._kernel_scope_module(Module(gensym(:Image)), named,
+        :(reshape(view(data, :), 1) .* Float64(helper(1))))
+    for (name, owner) in ((:reshape, Base), (:view, Base), (:(:), Base), (:Float64, Core))
+        @test RK._canonical_global(GlobalRef(named, name)) == GlobalRef(owner, name)
+        @test RK._canonical_global(GlobalRef(scope, name)) == GlobalRef(owner, name)
+    end
+    for name in (:data, :helper)
+        @test RK._canonical_global(GlobalRef(named, name)) == GlobalRef(named, name)
+        @test RK._canonical_global(GlobalRef(scope, name)) == GlobalRef(named, name)
+    end
+end
+
 @testset "execution branch metadata preserves host branch behavior" begin
     call(x, scale) = scale > 0 ? x * log(scale) : -x
     branch = RK._KernelBranch(Val((2,)), Val((1, 2)), Val((1,)), call,

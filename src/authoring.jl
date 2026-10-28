@@ -5534,13 +5534,23 @@ function _kernel_eval_module(mod::Module, construction::Expr)
 end
 
 # A fresh child module of `parent` in which `construction` resolves every name
-# it reads as in `mod`.
+# it reads as in `mod`. It records `mod` as its origin (`_kernel_scope_origin`).
 function _kernel_scope_module(parent::Module, mod::Module, construction::Expr)
     names = _kernel_mentioned_names!(Set{Symbol}(), construction)
     # The construction may read bindings `mod` gained just before it was built.
     aliases = Base.invokelatest(_kernel_scope_aliases, mod, names)
+    push!(aliases, Expr(:const, Expr(:(=), _KERNEL_SCOPE_ORIGIN, mod)))
     Core.eval(parent, Expr(:module, false, gensym(nameof(mod)), Expr(:block, aliases...)))
 end
+
+# The module a scope module stands in for, or `mod` itself. A generated body
+# names a scope module's alias by the binding it stands in for
+# (`_canonical_globals`), so a program built while an image is generated reads
+# the same references as one built at run time.
+const _KERNEL_SCOPE_ORIGIN = Symbol("#_ReactiveKernels_scope_origin")
+_kernel_scope_origin(mod::Module) =
+    Base.invokelatest(isdefined, mod, _KERNEL_SCOPE_ORIGIN) ?
+        Base.invokelatest(getglobal, mod, _KERNEL_SCOPE_ORIGIN)::Module : mod
 
 function _kernel_scope_aliases(mod::Module, names::Set{Symbol})
     aliases = Any[]

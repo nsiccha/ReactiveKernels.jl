@@ -5836,17 +5836,53 @@ function _canonical_locals(ast::Expr)
     walk(ast)
 end
 
-# A program generator evaluates each lowering in a fresh module (BRM's
-# `##RKEmittedModels#N`, an image's scope module), and hygiene qualifies every
+# A program generator evaluates each lowering in a module of its own (BRM's
+# `##RKEmittedModels#N`; RKPPL's `PPLGeneratedModels`, or while an image is
+# generated a scope module standing in for it), and hygiene qualifies every
 # global a body reads in that module: `ones`, `eltype` and an imported helper
-# become `##RKEmittedModels#231.ones`, and so on. The body then differs in
-# every lowering of one program, and so does the callable's type (snag
-# `compiled-reader-be3cadbb`). Name each such global by the module that owns
-# its binding instead, or, for a constant bound there to a module or a named
-# function or a named type, by that value's own binding: the same reference
-# in every lowering.
-# A binding the fresh module itself owns otherwise stays as qualified.
+# become `##RKEmittedModels#231.ones`, and so on. The body then differs between
+# lowerings of one program, and so does the callable's type (snag
+# `compiled-reader-be3cadbb`). Name each global by the module that owns its
+# binding instead; a scope module's alias by the binding it stands in for; and
+# a constant bound to a module, a named function or a named type by that
+# value's own binding: the same reference in every lowering and every process.
+# A binding a lowering module itself owns otherwise stays as qualified.
 _anonymous_module(m::Module) = (name = String(nameof(m)); !isempty(name) && name[1] == '#')
+
+Base.@nospecializeinfer function _canonical_global(ref::GlobalRef)
+    m, name = ref.mod, ref.name
+    (m === Base || m === Core) && return ref
+    owner = Base.invokelatest(Base.binding_module, m, name)::Module
+    owner === m || return _canonical_global(GlobalRef(owner, name))
+    (Base.invokelatest(isdefined, m, name) && Base.invokelatest(isconst, m, name)) ||
+        return ref
+    value = Base.invokelatest(getglobal, m, name)
+    origin = _kernel_scope_origin(m)
+    origin === m || !Base.invokelatest(isdefined, origin, name) ||
+        Base.invokelatest(getglobal, origin, name) !== value ||
+        return _canonical_global(GlobalRef(origin, name))
+    named = value isa Type ? Base.unwrap_unionall(value) : nothing
+    home = value isa Module ? value :
+        value isa Function && Base.issingletontype(typeof(value)) ?
+            parentmodule(typeof(value)) :
+        named isa DataType ? named.name.module : nothing
+    home === nothing && return ref
+    own = named isa DataType ? named.name.name : nameof(value)
+    (home !== m && !_anonymous_module(home) && Base.invokelatest(isdefined, home, own) &&
+     Base.invokelatest(getglobal, home, own) === value) || return ref
+    _canonical_global(GlobalRef(home, own))
+end
+
+function _canonical_globals(ast::Expr)
+    seen = Dict{GlobalRef,GlobalRef}()
+    function walk(node)
+        node isa GlobalRef && return get!(() -> _canonical_global(node), seen, node)
+        node isa Expr || return node
+        node.head === :quote && return node
+        Expr(node.head, Any[walk(arg) for arg in node.args]...)
+    end
+    walk(ast)
+end
 
 # The ids of `p`'s values in declaration order: its HAVE ports, then each
 # recipe's outputs. Generated code orders values this way, never by identity: a
@@ -5870,36 +5906,6 @@ function _declaration_order(p::Plan, ids)
     length(order) == length(wanted) || throw(ArgumentError(
         "values to order are not all values of the plan"))
     order
-end
-
-Base.@nospecializeinfer function _canonical_global(ref::GlobalRef)
-    m, name = ref.mod, ref.name
-    _anonymous_module(m) || return ref
-    owner = Base.invokelatest(Base.binding_module, m, name)::Module
-    owner === m || return _canonical_global(GlobalRef(owner, name))
-    (Base.invokelatest(isdefined, m, name) && Base.invokelatest(isconst, m, name)) ||
-        return ref
-    value = Base.invokelatest(getglobal, m, name)
-    named = value isa Type ? Base.unwrap_unionall(value) : nothing
-    home = value isa Module ? value :
-        value isa Function && Base.issingletontype(typeof(value)) ?
-            parentmodule(typeof(value)) :
-        named isa DataType ? named.name.module : nothing
-    home === nothing && return ref
-    own = named isa DataType ? named.name.name : nameof(value)
-    (!_anonymous_module(home) && Base.invokelatest(isdefined, home, own) &&
-     Base.invokelatest(getglobal, home, own) === value) || return ref
-    GlobalRef(home, own)
-end
-
-function _canonical_globals(ast::Expr)
-    function walk(node)
-        node isa GlobalRef && return _canonical_global(node)
-        node isa Expr || return node
-        node.head === :quote && return node
-        Expr(node.head, Any[walk(arg) for arg in node.args]...)
-    end
-    walk(ast)
 end
 
 # Preserve the lowered argument names used by operation-table inspection.
