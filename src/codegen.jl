@@ -6230,7 +6230,17 @@ Base.@nospecializeinfer function _prepared_kernel(
         @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
         @nospecialize(lowered_recipes::Tuple); exact_signature::Type = Nothing,
         @nospecialize(rebinding = nothing))
-    ops = _execution_source(ops)
+    _executed_prepared_kernel(f, _execution_source(ops), inputs, outputs, plan, ast,
+                              lowered_recipes, exact_signature, rebinding)
+end
+
+# The same, over an operation table that is already the execution copy
+# (`_execution_source`), as a rebinding keeps it (`_ExecutableTable`).
+Base.@nospecializeinfer function _executed_prepared_kernel(
+        @nospecialize(f), @nospecialize(ops::Tuple), @nospecialize(inputs::Tuple),
+        @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
+        @nospecialize(lowered_recipes::Tuple), exact_signature::Type,
+        @nospecialize(rebinding))
     T = PreparedKernel{typeof(f),typeof(ops),typeof(inputs),typeof(outputs),
                        typeof(lowered_recipes),exact_signature}
     _kernel_new_instance(T, (f, ops, inputs, outputs, plan, ast,

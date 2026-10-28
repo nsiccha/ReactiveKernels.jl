@@ -230,7 +230,14 @@ for (f, types) in ((_bound_entry, (Plan, Any)), (_bound_hoisted, (_BoundEntry, T
                    (_rebind_table, (Any, Vector{Any})),
                    (_rebind_table, (Any, Vector{Recipe})),
                    (_rebound_table, (_RebindTable, Vector{Any})),
-                   (_rebound_table, (_RebindTable, Vector{Recipe})))
+                   (_rebound_table, (_RebindTable, Vector{Recipe})),
+                   (_rebound_table, (Vector{Any}, Vector{Int}, Vector{Any})),
+                   (_rebound_table, (Vector{Any}, Vector{Int}, Vector{Recipe})),
+                   (_ExecutableTable, (_RebindTable,)),
+                   (_executable_entries, (_ExecutableTable, _RebindTable)),
+                   (_rebound_executable, (_ExecutableTable, _RebindTable, Vector{Any})),
+                   (_executed_prepared_kernel,
+                    (Any, Tuple, Tuple, Tuple, Plan, Expr, Tuple, Type, Any)))
     precompile(f, types) || error("no $f method for $types")
 end
 for value in (Any, Number, Tuple, AbstractArray)

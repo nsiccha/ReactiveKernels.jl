@@ -44,9 +44,12 @@ using ReactiveKernels, Test
                     end
                     return y
                 end
-                folds, scaled, prepare(scaled)
+                # A bound preparation kept in the image, whose rebindings
+                # after load reuse its compiled residual.
+                bound = prepare(folds; bound = (; w = collect(range(0.1, 1.4; length = 14))))
+                folds, scaled, prepare(scaled), bound
             end
-            const FOLDS, SCALED, SCALED_PREPARED = make_graphs()
+            const FOLDS, SCALED, SCALED_PREPARED, BOUND_FOLDS = make_graphs()
             end
             """)
         setup = """
@@ -115,6 +118,20 @@ using ReactiveKernels, Test
             # the warm wrapper, whose latest-world branch stays at each call
             # (one per call, not per cell): ReactiveKernels todo `1t6j4ei`.
             @test_broken isempty(findings(C.SCALED_PREPARED, argtypes; recurse))
+            # A rebinding after load assembles its kernel from the template
+            # the image kept, whose companions were warm-wrapped when it was
+            # built: it executes them as a binding made at run time does
+            # (snag per-binding-resi-990b18ab keeps that execution per process).
+            w2 = 2 .* w
+            rebound = prepare(C.FOLDS; bound = (; w = w2))
+            @test rebound.f === C.BOUND_FOLDS.f
+            @test rebound(x) == [sum(w2[j] * xi for j in eachindex(w2); init = 0.0) for xi in x]
+            native = rebound.f isa RK._ArrayFunctionPair ? rebound.f.native : rebound.f
+            @test report(findings(RK._native_generated_function(native),
+                                  (typeof(rebound.ops), Vector{Float64}); recurse))
+            again = prepare(C.FOLDS; bound = (; w))
+            @test again.f === C.BOUND_FOLDS.f && typeof(again) === typeof(rebound)
+            @test again(x) == prepare(C.FOLDS)(w, x)
             @test (w, x) == saved
             end
             println("PRECOMPILED_SOURCE_COMPANIONS_PASS")

@@ -841,6 +841,18 @@ Base.@nospecializeinfer function _partial_plate_analysis(
     end
 end
 
+# A cached cell value of every cell of a plate's bound domain, in cell order.
+# The loop is its own method, compiled for the batch's type: in the untyped
+# pass below each cell was a dynamic `getindex` and `setindex!` with a boxed
+# result, about a sixth of a simulator graph's rebinding and growing with its
+# design's rows (snag per-binding-resi-990b18ab).
+function _partial_cell_values!(result, batch)
+    for index in CartesianIndices(axes(batch))
+        result[index] = batch[index]
+    end
+    result
+end
+
 # Generated inner-kernel types are data to this structural pass. Specializing
 # on them recompiles the entire partial evaluator once per authored plate.
 Base.@nospecializeinfer function _partial_plate_recipe(
@@ -913,10 +925,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
                 # Bool results may use packed BitArrays; bound-array
                 # externalization also supports these at the tensor boundary.
                 result = similar(batch, analysis.cell_types[cid])
-                for index in CartesianIndices(axes(batch))
-                    result[index] = batch[index]
-                end
-                arguments[cid] = result
+                arguments[cid] = _partial_cell_values!(result, batch)
             end
         end
     catch err
@@ -1934,13 +1943,44 @@ function _rebind_table(@nospecialize(table), constants::Vector)
 end
 
 # The table with another binding's constants in their slots.
-function _rebound_table(t::_RebindTable, constants::Vector)
-    table = copy(t.fixed)
-    for (j, k) in enumerate(t.slots)
+_rebound_table(t::_RebindTable, constants::Vector) = _rebound_table(t.fixed, t.slots, constants)
+function _rebound_table(fixed::Vector{Any}, slots::Vector{Int}, constants::Vector)
+    table = copy(fixed)
+    for (j, k) in enumerate(slots)
         table[k] = constants[j]
     end
     table
 end
+
+# The fixed entries of a kept operation table as this process executes them
+# (`_execution_source`), so a rebinding assembles its kernel without executing
+# the whole table again: 0.26 ms per binding of a simulator graph's 365
+# entries (snag per-binding-resi-990b18ab). A table kept from a binding made in
+# this process is already the execution copy (`_prepared_kernel` made it). One
+# kept while a package image is generated can hold a source function whose
+# compiled companion is visible only once the image is loaded
+# (`_PrecompileWarmFunction`), so it is executed at the first rebinding of
+# each process that loads the image; no execution copy is kept while an image
+# is generated. A constant needs none: `_execution_source` keeps a
+# `_BoundConstant` as it is.
+struct _ExecutableTable
+    entries::Base.RefValue{Any}  # the executed `fixed`, or `nothing`
+end
+_generating_image() = ccall(:jl_generating_output, Cint, ()) != 0
+_ExecutableTable(t::_RebindTable) =
+    _ExecutableTable(Ref{Any}(_generating_image() ? nothing : t.fixed))
+
+function _executable_entries(e::_ExecutableTable, t::_RebindTable)
+    entries = e.entries[]
+    entries === nothing || return entries::Vector{Any}
+    entries = Any[_execution_source(x) for x in t.fixed]
+    _generating_image() || (e.entries[] = entries)
+    entries
+end
+
+# The execution copy of `t` with another binding's constants in their slots.
+_rebound_executable(e::_ExecutableTable, t::_RebindTable, constants::Vector) =
+    Tuple(_rebound_table(_executable_entries(e, t), t.slots, constants))
 
 # A plan's per-binding constant recipes, in plan order: the hoisted constants
 # and the values the inner-plate pass cached.
@@ -1970,6 +2010,7 @@ struct _BoundTemplate
     ast::Expr
     lowered::_RebindTable # the readable recipes without the constants
     vectorizations::_BoundVectorizations
+    executable::_ExecutableTable # `ops` as this process executes it
 end
 
 # A class's template before its first binding the inner-plate pass left alone.
@@ -2072,7 +2113,7 @@ function _bound_build(entry::_BoundEntry, @nospecialize(residual),
     kernel = _rebinding_kernel(kernel, vectorizations)
     isempty(constants) && return kernel, kernel
     _BoundTemplate(kernel.f, ops, kernel.inputs, kernel.outputs, kernel.ast, lowered,
-                   vectorizations), kernel
+                   vectorizations, _ExecutableTable(ops)), kernel
 end
 
 # `kernel`, linked to the vectorizations its template's bindings share.
@@ -2106,10 +2147,10 @@ function _bound_rebind(entry::_BoundEntry, template::_BoundTemplate,
     # it does not, and the ordinary preparation is the safe answer.
     length(constants) == length(template.lowered.slots) ||
         return prepare(plan; passes = passes)
-    ops = _rebound_table(template.ops, Any[c.op for c in constants])
+    ops = _rebound_executable(template.executable, template.ops, Any[c.op for c in constants])
     lowered = _rebound_table(template.lowered, constants)
-    _prepared_kernel(template.f, Tuple(ops), template.inputs, template.outputs, plan,
-                     template.ast, Tuple(lowered); rebinding = template.vectorizations)
+    _executed_prepared_kernel(template.f, ops, template.inputs, template.outputs, plan,
+                              template.ast, Tuple(lowered), Nothing, template.vectorizations)
 end
 
 # Normalize the public `bound` kwarg — one `Value => data` pair or an
