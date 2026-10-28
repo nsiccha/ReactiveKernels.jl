@@ -72,6 +72,86 @@ end
     @test occursin("PASS", md)
 end
 
+# The report binds what `bind_data` binds: a matrix column and a scalar data
+# value. The oracle is the same model over the matrix's columns as vectors
+# with the scalar written as a literal (inputs the reporter always took).
+const _REPORT_MATRIX_SURFACE = """
+@rkppl begin
+    w[axes(X, 2)] .~ Normal.(0.0, 1.0)
+    a ~ Normal(0.0, s0)
+    sigma ~ Exponential(1.0)
+    mu = a .+ X * w
+    y .~ Normal.(mu, sigma)
+end
+"""
+
+const _REPORT_MATRIX_TWIN = """
+@rkppl begin
+    w[1:2] .~ Normal.(0.0, 1.0)
+    a ~ Normal(0.0, 2.0)
+    sigma ~ Exponential(1.0)
+    mu = a .+ w[1] .* x1 .+ w[2] .* x2
+    y .~ Normal.(mu, sigma)
+end
+"""
+
+const _REPORT_MATRIX_X = [0.5 -1.0; 1.5 0.0; -0.5 1.0; 0.25 -0.75; 2.0 0.3; -1.0 0.6]
+_report_matrix_data() = Dict{Symbol,Any}(
+    :y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0], :X => _REPORT_MATRIX_X, :s0 => 2.0)
+_report_matrix_twin_data() = Dict{Symbol,AbstractVector}(
+    :y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],
+    :x1 => _REPORT_MATRIX_X[:, 1], :x2 => _REPORT_MATRIX_X[:, 2])
+
+const _REPORT_MATRIX_U = [0.3, -0.4, 0.2, 0.1]
+
+_report_posterior(md) =
+    parse(Float64, match(r"`posterior\(u\) = (\S+)`", md).captures[1])
+
+@testset "report data: matrix column and scalar value" begin
+    twin = transpile_report(_REPORT_MATRIX_TWIN, _report_matrix_twin_data();
+        u = _REPORT_MATRIX_U)
+    md = transpile_report(_REPORT_MATRIX_SURFACE, _report_matrix_data();
+        meta = (; model = "matrix-column"), u = _REPORT_MATRIX_U,
+        backend = _GEN_BACKEND)
+    @test occursin("mu = a .+ X * w", md)
+    @test occursin("n_obs = 6", md)
+    @test occursin("(finite)", md)
+    @test occursin("PASS", md)
+    @test _report_posterior(md) ≈ _report_posterior(twin)
+    # The AST mode and a v1 artifact carry the same data through.
+    ast = _surface_block(_REPORT_MATRIX_SURFACE)
+    mktempdir() do dir
+        art = joinpath(dir, "matrix.jls")
+        Serialization.serialize(art,
+            (; ast, data = _report_matrix_data(), meta = (; model = "matrix")))
+        loaded = load_artifact(art)
+        md2 = transpile_report(loaded.ast, loaded.data; u = _REPORT_MATRIX_U)
+        @test _report_posterior(md2) == _report_posterior(md)
+    end
+    # NamedTuple data and String keys normalize to the same binding.
+    md3 = transpile_report(_REPORT_MATRIX_SURFACE,
+        (; y = _report_matrix_data()[:y], X = _REPORT_MATRIX_X, s0 = 2.0);
+        u = _REPORT_MATRIX_U)
+    @test _report_posterior(md3) == _report_posterior(md)
+    md4 = transpile_report(_REPORT_MATRIX_SURFACE,
+        Dict(string(k) => v for (k, v) in _report_matrix_data());
+        u = _REPORT_MATRIX_U)
+    @test _report_posterior(md4) == _report_posterior(md)
+    # A value bind_data does not take fails closed in bind_data, which owns
+    # the data-value contract.
+    bad = _report_matrix_data()
+    bad[:X] = "not data"
+    err = try
+        transpile_report(_REPORT_MATRIX_SURFACE, bad; u = _REPORT_MATRIX_U)
+        nothing
+    catch e
+        e
+    end
+    # refused: a data value must be a number or an array (bind_data's ColumnData contract)
+    @test err isa ContractValidationError
+    @test occursin("data value X must be a number or an array", sprint(showerror, err))
+end
+
 @testset "report AST mode fidelity + artifact round-trip" begin
     ast = _surface_block(_REPORT_SURFACE)
     @test ast isa Expr && ast.head === :block
@@ -101,7 +181,7 @@ end
     # The multi-probe internals reproduce the single-probe numbers exactly.
     cols = _norm_cols(_report_demo_data())
     ast = _surface_block(_REPORT_SURFACE)
-    bound = bind_data(lower_rkppl(ast, keys(cols); conditioned = keys(cols)), cols)
+    bound = _bind_surface(ast, cols)
     prep = _prepare_bound_report(bound)
     @test prep.n == 3
     pr = _run_report_probe(prep, _REPORT_U; backend = _GEN_BACKEND)
