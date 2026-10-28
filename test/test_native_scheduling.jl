@@ -5,6 +5,19 @@ using Enzyme
 
 _scheduled_raw(k) = k isa ReactiveKernels._KernelSignatureCallable ? k.target : k
 
+# Whether `f()` throws `T`: directly with one thread (a one-job call runs
+# serially), or inside the CompositeException of a call with several jobs.
+function _scheduled_failure(::Type{T}, f) where {T}
+    try
+        f()
+    catch error
+        Threads.nthreads() == 1 && return error isa T
+        return error isa CompositeException && !isempty(error.exceptions) &&
+               all(e -> e isa TaskFailedException && e.task.exception isa T, error.exceptions)
+    end
+    false
+end
+
 @kernel scheduled_response(position, data) = begin
     forcing = log1p.(abs.(data))
     trajectory = scan(forcing; init=position.initial,
@@ -217,12 +230,11 @@ end
     good = collect(1:19)
     data = collect(1.0:19)
     @test lookup(good, data) == data
-    @test_throws BoundsError lookup(vcat(0, good[2:end]), data)
-    if Threads.nthreads() > 1
-        @test_throws CompositeException lookup(vcat(good[1:end-1], 0), data)
-    else
-        @test_throws BoundsError lookup(vcat(good[1:end-1], 0), data)
-    end
+    # A call with several jobs runs every chunk in a task, the first job's
+    # first chunk included, so any failing chunk reaches the caller after the
+    # join, inside a CompositeException.
+    @test _scheduled_failure(BoundsError, () -> lookup(vcat(0, good[2:end]), data))
+    @test _scheduled_failure(BoundsError, () -> lookup(vcat(good[1:end-1], 0), data))
     # All spawned workers have joined before a failing call returns, so the
     # same instance is safe for a later sequential call.
     @test lookup(good, data) == data
@@ -230,5 +242,39 @@ end
         result = fill(1.0, x)
     end
     ragged = vectorize(scheduled_ragged; batched=:x, schedule)
-    @test_throws DimensionMismatch ragged(collect(1:19))
+    @test _scheduled_failure(DimensionMismatch, () -> ragged(collect(1:19)))
+end
+
+const _SCHEDULED_ARRIVALS = Threads.Atomic{Int}(0)
+const _SCHEDULED_EXPECTED = Ref(0)
+# Waits, up to 5 s, until `_SCHEDULED_EXPECTED[]` calls have arrived, and says
+# whether they did.
+function _scheduled_rendezvous(x::Float64)
+    Threads.atomic_add!(_SCHEDULED_ARRIVALS, 1)
+    deadline = time() + 5.0
+    while _SCHEDULED_ARRIVALS[] < _SCHEDULED_EXPECTED[] && time() < deadline
+        yield()
+    end
+    _SCHEDULED_ARRIVALS[] >= _SCHEDULED_EXPECTED[]
+end
+
+@testset "every job's first chunk runs concurrently" begin
+    # The first job's first chunk ran on the calling thread before any worker
+    # task started, so four workers over four chunks took two chunks' time
+    # (snag scheduled-reader-e32e20f1). Here each position waits until one
+    # position of every job has started: run that way, the first chunk's
+    # positions wait in vain.
+    if Threads.nthreads() > 1
+        workers = min(4, Threads.nthreads())
+        @kernel scheduled_together(x::Float64) = begin
+            result::Bool = _scheduled_rendezvous(x)
+        end
+        for reuse in (false, true)
+            reader = vectorize(scheduled_together; batched=:x, reuse,
+                               schedule=NativeScheduling(; chunk_size=2, workers))
+            _SCHEDULED_ARRIVALS[] = 0
+            _SCHEDULED_EXPECTED[] = workers
+            @test reader(collect(1.0:2workers)) == fill(true, 2workers)
+        end
+    end
 end

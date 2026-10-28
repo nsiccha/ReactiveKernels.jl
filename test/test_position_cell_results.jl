@@ -207,8 +207,13 @@ end
         error
     end
     @test scalar_error isa MethodError
+    # A scheduled call with several jobs raises it from its tasks, inside a
+    # CompositeException.
+    raised(error) = error isa CompositeException ?
+        [e.task.exception for e in error.exceptions] : [error]
     for reader in readers(flat, :loc)
-        @test_throws typeof(scalar_error) reader(theta, empty_rows)
+        errors = raised(try reader(theta, empty_rows); nothing catch error; error end)
+        @test !isempty(errors) && all(e -> e isa typeof(scalar_error), errors)
     end
     # The typed empty arm, and number cells as they are.
     for spec in (flat_or_empty, flat_by_kind, flat_by_bound, numbers_by_kind),

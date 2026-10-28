@@ -193,6 +193,9 @@ function _scheduled_chunk(k::_ScheduledBatchedKernel{R,S,B,BT,PS,N}, index, args
     N == 1 ? (result,) : result
 end
 
+_scheduled_first_range(job::UnitRange{Int}, chunk_size) =
+    first(job):min(last(job), first(job) + chunk_size - 1)
+
 function (k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N})(args...) where {Reuse,S,B,BT,PS,N}
     length(args) == length(inputs(k)) || throw(MethodError(k, args))
     # Scheduling is a native hint. Traced owning calls retain the existing
@@ -202,16 +205,27 @@ function (k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N})(args...) where {Reuse,S
     jobs = min(length(k.workers), cld(count, k.schedule.chunk_size))
     jobs <= 1 && return k.serial(args...)
     shared = _scheduled_shared(k, args)
+    chunk_size = k.schedule.chunk_size
     ranges = [fld((i - 1) * count, jobs) + 1:fld(i * count, jobs) for i in 1:jobs]
-    first_range = 1:min(last(ranges[1]), k.schedule.chunk_size)
-    first_chunk = _scheduled_chunk(k, 1, args, shared, first_range)
-    result = ntuple(i -> _scheduled_output!(k.caches[i], first_chunk[i], count, args, Val(Reuse)), N)
-    _scheduled_store!(result, first_chunk, first_range)
+    # Every job's first chunk runs in its own task: computed on the calling
+    # thread before any task started, the first job's chunk left the other
+    # workers idle for one chunk's time, so four workers over four chunks
+    # took two chunks' time (snag scheduled-reader-e32e20f1). The first job's
+    # chunk then fixes the output types and shapes. A worker's chunk stays
+    # valid until its next call, which its own task makes after storing it.
+    firsts = Vector{Any}(undef, jobs)
+    @sync for index in 1:jobs
+        Threads.@spawn firsts[index] = _scheduled_chunk(k, index, args, shared,
+            _scheduled_first_range(ranges[index], chunk_size))
+    end
+    result = ntuple(i -> _scheduled_output!(k.caches[i], firsts[1][i], count, args, Val(Reuse)), N)
     @sync for index in 1:jobs
         Threads.@spawn begin
-            start = index == 1 ? last(first_range) + 1 : first(ranges[index])
-            for low in start:k.schedule.chunk_size:last(ranges[index])
-                range = low:min(last(ranges[index]), low + k.schedule.chunk_size - 1)
+            job = ranges[index]
+            first_range = _scheduled_first_range(job, chunk_size)
+            _scheduled_store!(result, firsts[index], first_range)
+            for low in last(first_range)+1:chunk_size:last(job)
+                range = low:min(last(job), low + chunk_size - 1)
                 chunk = _scheduled_chunk(k, index, args, shared, range)
                 _scheduled_store!(result, chunk, range)
             end
