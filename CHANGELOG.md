@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.7
+
+- A package can state that its own scalar function computes a function
+  OutputSignatures already describes, with a method of
+  `ReactiveKernels._metadata_function(f)` (as it adds a JAX translation with
+  `_jax_elementwise`): the call and broadcast metadata of `f` are then that
+  function's. ReactiveKernelsPPL 0.1.3 states it for `_ppl_logistic`, its
+  inverse logit, whose calls had no metadata on 0.1.6 and earlier.
+
 ## 0.1.6
 
 - A plate cell that reads a row-wise value at several rows computes it at

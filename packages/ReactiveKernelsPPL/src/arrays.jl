@@ -663,8 +663,23 @@ function _metadata_result(r::_OS.CallInfo, ex, throw_conflicts::Bool)
 end
 
 _source_call_metadata(ex::Expr, args; kwargs = Pair{Symbol,_OS.ValueInfo}[]) =
-    ReactiveKernels._call_metadata(ex, _OS.ValueInfo[args...], @__MODULE__, ();
-        kwargs)
+    ReactiveKernels._call_metadata(_vocabulary_call(ex), _OS.ValueInfo[args...],
+        @__MODULE__, (); kwargs)
+
+# The value vocabulary's `logistic` is `_ppl_logistic` (`_value_math_rewrite`,
+# `_eval_callee`), which the generated scope holds, not this module.
+_vocabulary_call(ex::Expr) =
+    ex.head in (:call, :.) && !isempty(ex.args) && ex.args[1] === :logistic ?
+        Expr(ex.head, GlobalRef(PPLGeneratedModels, :_ppl_logistic), ex.args[2:end]...) :
+        ex
+
+# `_ppl_logistic` is the inverse logit LogExpFunctions' `logistic` computes,
+# formulated for finite derivatives at any argument (`generator.jl`). That
+# function's rules describe its calls, so `logistic.(a)` over a scalar is a
+# proven scalar: a location summand `b .* logistic.(a)` is then a scalar
+# offset, as `b .* exp.(a)` is.
+ReactiveKernels._metadata_function(::typeof(PPLGeneratedModels._ppl_logistic)) =
+    LogExpFunctions.logistic
 
 _position_metadata(i) = i === :(:) ? _OS.known_info(Colon()) :
     i isa Int ? _OS.known_info(i) : _OS.scalar_info(Int)
