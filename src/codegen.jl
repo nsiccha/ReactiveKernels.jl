@@ -4225,15 +4225,16 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
             Expr(:call, GlobalRef(@__MODULE__, :_plate_cell_slice), raw[position], cell)))
         push!(slices, slice)
     end
-    # A shared array read only at the cell's own row whose producer computes
-    # it row by row is computed at that row (`_CellEmitter`, cell_windows.jl).
+    # A shared array read only at the cell's own rows whose producer computes
+    # it row by row is computed at those rows (`_CellEmitter`, cell_windows.jl).
     if windows !== nothing
         d = windows.pushdowns
-        for (position, batched) in sort!(collect(get(d.captures, recipe.id,
-                Dict{Int,Int}())))
+        for (position, (batched, via)) in sort!(collect(get(d.captures, recipe.id,
+                Dict{Int,Tuple{Int,Int}}())))
             value = canon_id(d.graph, plate_values[position].id)
             value in d.pushed || continue
-            slices[position] = _cell_capture!(windows, value, slices[batched])
+            slices[position] = _cell_capture!(windows, value, slices[batched],
+                via == 0 ? nothing : slices[via])
         end
     end
     pointwise = gensym(:cell_pointwise)
@@ -5859,17 +5860,91 @@ end
 # A binding a lowering module itself owns otherwise stays as qualified.
 _anonymous_module(m::Module) = (name = String(nameof(m)); !isempty(name) && name[1] == '#')
 
+# Lowering reads the bindings of the modules a program is lowered in: a caller's
+# module or a docs page's sandbox, BRM's and RKPPL's generated modules. Before
+# Julia 1.12 the first read of a name a module has only from a `using` binds
+# the name to that import for good (`isdefined`, `isconst` and `binding_module`
+# read it too), and the module can no longer define the name itself. A docs
+# page that prepared the uniform example after another module had lowered the
+# same kernel, whose branch closure has a parameter `lower`, then failed on
+# `lower = -1.0`: "cannot assign a value to imported variable
+# ReactiveKernels.lower" (snag `docs-distributio-30373f1f`). So lowering reads
+# what a name denotes without binding it: before 1.12 by Julia's own lookup of
+# a module's imports (`jl_resolve_owner` and `using_resolve_binding`,
+# `src/module.c`, the same in 1.10 and 1.11), recording nothing. From 1.12 a
+# read binds nothing for good, and the ordinary reflection applies.
+@static if VERSION < v"1.12.0-"
+    # The module owning the binding `name` denotes in `m`, or `m` when it
+    # denotes none, as `Base.binding_module` answers.
+    function _binding_owner(m::Module, name::Symbol)
+        Base.isbindingresolved(m, name) && return Base.binding_module(m, name)
+        something(_imported_binding_owner(m, name, ()), m)
+    end
+
+    # The owner of the binding `m`'s `using`s give `name`, or `nothing`: imports
+    # that export different bindings give none, and among equal ones the oldest
+    # import wins, a deprecated one only when no other exports the name.
+    function _imported_binding_owner(m::Module, name::Symbol, visiting::Tuple)
+        m in visiting && return nothing
+        found = nothing
+        # Newest import first, as Julia searches them.
+        for imported in ccall(:jl_module_usings, Any, (Any,), m)::Vector{Any}
+            imported = imported::Module
+            Base.isexported(imported, name) || continue
+            owner = Base.isbindingresolved(imported, name) ?
+                Base.binding_module(imported, name) :
+                _imported_binding_owner(imported, name, (visiting..., m))
+            owner === nothing && continue
+            deprecated = Base.isdeprecated(owner, name)
+            found === nothing || deprecated || Base.isdeprecated(found, name) ||
+                _same_binding(found, owner, name) || return nothing
+            (found === nothing || !deprecated) && (found = owner)
+        end
+        # Julia skips a deprecated binding whose value is `nothing`.
+        found === nothing || !Base.isdeprecated(found, name) || !isdefined(found, name) ||
+            getglobal(found, name) !== nothing || return nothing
+        found
+    end
+
+    # The bindings two owners own are the same, or constants of one value.
+    _same_binding(a::Module, b::Module, name::Symbol) = a === b ||
+        isconst(a, name) && isconst(b, name) && isdefined(a, name) && isdefined(b, name) &&
+        getglobal(a, name) === getglobal(b, name)
+
+    # The module whose own binding `name` reads in `m`, or `nothing`.
+    function _binding_holder(m::Module, name::Symbol)
+        owner = _binding_owner(m, name)
+        Base.isbindingresolved(owner, name) ? owner : nothing
+    end
+else
+    _binding_owner(m::Module, name::Symbol) =
+        Base.invokelatest(Base.binding_module, m, name)::Module
+    _binding_holder(m::Module, ::Symbol) = m
+end
+
+# `Some(value)` of the binding `name` denotes in `m`, or `nothing` when it
+# denotes no defined one. Binds nothing in `m`.
+function _global_value(m::Module, name::Symbol)
+    holder = _binding_holder(m, name)
+    (holder !== nothing && Base.invokelatest(isdefined, holder, name)) || return nothing
+    Some(Base.invokelatest(getglobal, holder, name))
+end
+
+function _global_isconst(m::Module, name::Symbol)
+    holder = _binding_holder(m, name)
+    holder !== nothing && Base.invokelatest(isconst, holder, name)
+end
+
 Base.@nospecializeinfer function _canonical_global(ref::GlobalRef)
     m, name = ref.mod, ref.name
     (m === Base || m === Core) && return ref
-    owner = Base.invokelatest(Base.binding_module, m, name)::Module
+    owner = _binding_owner(m, name)
     owner === m || return _canonical_global(GlobalRef(owner, name))
-    (Base.invokelatest(isdefined, m, name) && Base.invokelatest(isconst, m, name)) ||
-        return ref
-    value = Base.invokelatest(getglobal, m, name)
+    value = _global_value(m, name)
+    (value !== nothing && _global_isconst(m, name)) || return ref
+    value = something(value)
     origin = _kernel_scope_origin(m)
-    origin === m || !Base.invokelatest(isdefined, origin, name) ||
-        Base.invokelatest(getglobal, origin, name) !== value ||
+    origin === m || _global_value(origin, name) !== Some(value) ||
         return _canonical_global(GlobalRef(origin, name))
     named = value isa Type ? Base.unwrap_unionall(value) : nothing
     home = value isa Module ? value :
@@ -5878,8 +5953,8 @@ Base.@nospecializeinfer function _canonical_global(ref::GlobalRef)
         named isa DataType ? named.name.module : nothing
     home === nothing && return ref
     own = named isa DataType ? named.name.name : nameof(value)
-    (home !== m && !_anonymous_module(home) && Base.invokelatest(isdefined, home, own) &&
-     Base.invokelatest(getglobal, home, own) === value) || return ref
+    (home !== m && !_anonymous_module(home) && _global_value(home, own) === Some(value)) ||
+        return ref
     _canonical_global(GlobalRef(home, own))
 end
 

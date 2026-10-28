@@ -992,16 +992,23 @@ port by passing the same `index` to successive `plate_cell` calls.
 
 A whole array the cell captures and reads only at its own position, `v[i]`
 with `i` an integer element of a batched argument, is computed at that row
-only when its producer computes it row by row. The native lowering supports
-these producers:
+only when its producer computes it row by row. So is one the cell reads at
+several rows: `v[r]` with `r` an integer-vector element of a batched argument,
+or `v[rows[k]]` through a shared index array `rows` (one integer vector per
+cell, as a total over a group of rows reads them). The native lowering
+supports these producers:
 
-- a dotted expression of inputs, numeric literals and gathers `A[I]` or
-  `A[I, k]` (an integer vector input `I`, integer literals `k`);
-- such a gather alone;
-- a product `A * W` with an array input as its left factor (row `r` is
-  `A[r:r, :] * W`). A matrix-vector product `X * beta` (a matrix input and a
-  vector input) can be read like any other value; other products only by
-  gathers `R[g, k]`, since their full shape is not known before they run;
+- a dotted expression of inputs, numeric literals, gathers `A[I]` or
+  `A[I, k]` (an integer vector input `I`, integer literals `k`), column reads
+  `A[:, k]`, products `A * w` of two inputs, and literal-position reads `a[1]`
+  of an array of numbers (read whole, as in `z .* tau[1]`);
+- such a gather alone, and such a column read alone;
+- `hcat(a, b, ...)` of inputs, such as a design matrix with a computed column;
+- a product `A * W` whose left factor is an array input, a column read or an
+  `hcat` (row `r` is `A[r:r, :] * W`). A product of two operands whose right
+  operand is an array or a number, such as `X * beta`, can be read like any
+  other value; other products only by gathers `R[g, k]`, since their full
+  shape is not known before they run;
 - an authored plate. Row `r` of its value is the plate over row `r` of each
   batched argument, so the cell runs that plate's body at row `r` only. A
   shared array the plate reads only at its own position, `u[j]` with `j` an
@@ -1010,22 +1017,32 @@ these producers:
   `pred = plate(rows) do r; f(log_k[r]) end` computes `pred` and `log_k` at
   row `i` only.
 
-The producer's own operation runs on one-row views of its row-aligned
-operands; an operand that broadcasting extrudes is passed whole. A value it
-gathers from is computed at the gathered row by the same rule. So for
-`R = Z * F'` and `log_k = a .+ b .* w .+ R[g, 1]` read as `log_k[i]`, the cell
-computes `log_k` at `i` and `R` at row `g[i]`, at a cost that does not grow
-with the domain; a population term `pop = X * beta` in `log_k = pop .+ …` is
-computed at row `i` the same way. A value is computed at rows only when every reader reads it
-this way. A value read whole anywhere, wanted, or produced any other way
-(including through an opaque function call) is computed whole as before.
+The producer's own operation runs on views of its row-aligned operands at the
+rows read; an operand that broadcasting extrudes is passed whole, or repeated
+at several rows. A value it gathers from is computed at the gathered rows by
+the same rule. So for `R = Z * F'` and `log_k = a .+ b .* w .+ R[g, 1]` read
+as `log_k[i]`, the cell computes `log_k` at `i` and `R` at row `g[i]`, at a
+cost that does not grow with the domain; a population term `pop = X * beta`
+in `log_k = pop .+ …` is computed at row `i` the same way, also when
+`X = hcat(one, c, year)` has a computed column `c`. A stratified group effect
+written by a per-row plate as one matrix column and read back as `b[:, 1]`,
+and a group block `z .* tau[1]` gathered as `b[g, 1]`, are computed at the
+rows read. A value is computed at rows only when every reader reads it this
+way. A value read whole anywhere, wanted, or produced any other way (including
+through an opaque function call) is computed whole as before.
 
-The full broadcast shape of each such expression is still checked from its
-operands' axes (`DimensionMismatch`), and the cell's own reads and the factor
-rows are bounds-checked. An error that only another row would raise, such as
-an out-of-range gather index at another position, is not raised, just as the
-cell does not run other cells. The tensorized lowering computes these values
-whole.
+The full broadcast shape of each such expression, and the full shape of each
+`hcat`, is still checked from its operands' axes (`DimensionMismatch`), and the
+cell's own reads and the factor rows are bounds-checked. An error that only
+another row would raise, such as an out-of-range gather index at another
+position, is not raised, just as the cell does not run other cells. The
+tensorized lowering computes these values whole.
+
+Native Enzyme Reverse through an `hcat` read at several rows of a cell fails
+with `IllegalTypeAnalysisException` in Base's `_typed_hcat`: those rows are
+views, and Enzyme rejects Base `hcat` of views beside dense arrays (Enzyme snag
+`native-reverse-t-6d51cae6`). Values are exact; the gradient waits on that
+Enzyme fix (`test_plate_cell.jl` pins it broken).
 
 ### Inspecting structure
 
