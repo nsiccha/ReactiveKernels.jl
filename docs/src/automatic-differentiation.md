@@ -229,7 +229,14 @@ value, (jv,) = ad_value_and_pushforward(jvp, (v,), parameters, 0.7; data)
 ```
 
 A Hessian-vector product needs a scalar WANT and a second-order backend.
-Use reverse over forward, as above. Native Enzyme forward over reverse fails
+Use reverse over forward, as above. Its preparation holds memory linear in
+the number of active coordinates `n`: RK prepares the reverse gradient of the
+directional derivative `x -> Df(x)[v]` itself, without the forward-mode
+gradient that DifferentiationInterface's own reverse-over-forward preparation
+adds for `gradient_and_hvp`, whose Enzyme preparation holds `n` one-hot
+vectors of length `n` (8n² bytes, 187 GiB at 158,343 coordinates).
+`ad_gradient_and_hvp` takes its gradient from the reverse backend in one
+sweep. Native Enzyme forward over reverse fails
 static activity analysis when the objective multiplies a constant matrix by an
 active vector, as a design-matrix linear predictor does
 (`benchmark/repro_enzyme_forward_over_reverse_const_array.jl`); it works on
@@ -247,9 +254,10 @@ number of subjects. The focused authority is
 [`test_ad_tangent_operators.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/test/test_ad_tangent_operators.jl).
 
 A tuple `active` selector works for pushforwards (each direction is a tuple of
-component tangents). DifferentiationInterface 0.7.21 cannot yet take a
-Hessian-vector product at such a structured point, so tuple-selector HVPs are
-not supported. A `NonAllocatingKernel` supports pushforwards; its
+component tangents) and for reverse-over-forward Hessian-vector products (each
+direction and each result is a tuple of components). DifferentiationInterface
+0.7.21 cannot yet take a forward-over-reverse Hessian-vector product at such
+a structured point. A `NonAllocatingKernel` supports pushforwards; its
 Hessian-vector products fail Enzyme's static activity analysis, so take them
 from the dataflow kernel. Reactant-compiled pushforwards and Hessian-vector
 products are not provided; these operators run natively.
