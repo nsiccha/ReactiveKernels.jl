@@ -997,15 +997,16 @@ function _ad_validate_unique_haves(spec::KernelSpec)
     nothing
 end
 
-# A HAVE value reachable from the active value is not constant model data: it
-# is an active-derived boundary cut. Marking it Constant would sever a real
-# derivative. The caller must instead derive it inside the selected kernel or
-# use DifferentiationInterface directly with an explicit Cache contract.
-function _ad_validate_constant_boundary(kernel::_ADKernel, active_selector)
+# Every value of the kernel's graph that some recipe reachable from the active
+# HAVE ports produces, the active ports included. The closure runs over every
+# recipe of the graph, not only the planned ones, so it over-approximates what
+# the active ports reach: a value outside it depends on no active port in any
+# plan.
+function _ad_active_downstream(kernel::_ADKernel, active_selector)
     graph = kernel.plan.graph
     active_indices = _ad_selector_indices(active_selector)
-    active_inputs = map(index -> inputs(kernel)[index], active_indices)
-    downstream = Set(canon_id(graph, active.id) for active in active_inputs)
+    downstream = Set(canon_id(graph, inputs(kernel)[index].id)
+                     for index in active_indices)
     changed = true
     while changed
         changed = false
@@ -1021,6 +1022,29 @@ function _ad_validate_constant_boundary(kernel::_ADKernel, active_selector)
             end
         end
     end
+    downstream
+end
+
+# Positions, among `positions` of the kernel's WANT outputs, of the ports no
+# active HAVE port reaches: bound data alone, inactive HAVE values alone, or
+# an inactive HAVE port itself. Their derivative is identically zero.
+function _ad_constant_outputs(kernel::_ADKernel, active_selector, positions)
+    isempty(positions) && return ()
+    graph = kernel.plan.graph
+    downstream = _ad_active_downstream(kernel, active_selector)
+    Tuple(position for position in positions
+          if !(canon_id(graph, outputs(kernel)[position].id) in downstream))
+end
+
+# A HAVE value reachable from the active value is not constant model data: it
+# is an active-derived boundary cut. Marking it Constant would sever a real
+# derivative. The caller must instead derive it inside the selected kernel or
+# use DifferentiationInterface directly with an explicit Cache contract.
+function _ad_validate_constant_boundary(kernel::_ADKernel, active_selector)
+    graph = kernel.plan.graph
+    active_indices = _ad_selector_indices(active_selector)
+    active_inputs = map(index -> inputs(kernel)[index], active_indices)
+    downstream = _ad_active_downstream(kernel, active_selector)
 
     derived = Symbol[]
     for (index, input) in pairs(inputs(kernel))
@@ -1162,18 +1186,137 @@ function _ad_call(kernel::_ADKernel, resolved::Tuple, active;
                         scalar_output, retain)
     call, external_values =
         _ad_kernel_call(kernel, resolved, Val(active_selector))
+    constant = _ad_constant_outputs(
+        kernel, active_selector, _ad_value_positions(kernel, scalar_output, retain))
+    if !isempty(constant)
+        call, external_values = _ad_constant_outputs_call(
+            kernel, call, external_values, resolved, active_selector, constant)
+    end
     if !isempty(retain)
         call, external_values = _ad_retaining_call(
-            kernel, call, external_values, resolved, retain)
+            kernel, call, external_values, resolved, active_selector, retain)
     end
-    if seed !== nothing && length(outputs(kernel)) > 1
+    if call isa _ADConstantCall
+        seed === nothing || _ad_check_seed(kernel, seed, _ad_call_exemplar(
+            call, resolved, external_values, active_selector))
+    elseif seed !== nothing && length(outputs(kernel)) > 1
         call, external_values = _ad_seeded_call(
-            kernel, call, external_values, resolved, seed, keep_values)
+            kernel, call, external_values, resolved, active_selector, seed,
+            keep_values)
     end
     point, contexts = _ad_arguments(
         Val(active_selector), (resolved..., external_values...))
     call, point, contexts, active_selector, external_values
 end
+
+# Positions of the WANT outputs whose values leave the differentiated call: the
+# retained ones beside a scalar objective, which is always differentiated, or
+# every port of a pullback or pushforward.
+function _ad_value_positions(kernel::_ADKernel, scalar_output::Bool, retain::Tuple)
+    scalar_output || return Tuple(eachindex(outputs(kernel)))
+    isempty(retain) ? () : last(_ad_output_positions(kernel, retain))
+end
+
+# One evaluation of the call the backend differentiates, at the preparation
+# exemplars: the values it returns, of the types it returns them in (bound
+# views cross it as owning copies, `_ad_kernel_call`).
+function _ad_call_exemplar(call, resolved::Tuple, external_values::Tuple,
+                           active_selector)
+    point, contexts = _ad_arguments(
+        Val(active_selector), (resolved..., external_values...))
+    call(point, map(DifferentiationInterface.unwrap, contexts)...)
+end
+
+# WANT ports no active HAVE port reaches (`_ad_constant_outputs`). Bound partial
+# evaluation folds a port that reads bound data alone into a constant, which
+# reaches the differentiated call as one of its hidden `Constant` operands; a
+# port that reads inactive HAVE values alone is computed from `Constant`
+# contexts. Either way its derivative is identically zero. Returned from the
+# differentiated call, it would present constant memory as a differentiable
+# output: plain Enzyme Reverse refuses that statically
+# (`EnzymeRuntimeActivityError`), and under runtime activity the pullback adds
+# its seed into the constant, the prepared kernel's own bound data (snag
+# prepare-ad-pullb-8ca897b0). So the differentiated call returns `nothing` in
+# those positions, and stores their values, from the same sweep, in a box that
+# crosses as its last `Constant` context. The operators fill them back in, with
+# zero derivatives. `C` holds their positions among the call's `M` outputs.
+struct _ADConstantOutputsCall{C,M,F}
+    call::F
+end
+
+@generated function (split::_ADConstantOutputsCall{C,M})(
+        active, contexts::Vararg{Any,N}) where {C,M,N}
+    inner = [:(getfield(contexts, $index)) for index in 1:(N - 1)]
+    constant = Expr(:tuple, (:(getfield(values, $index)) for index in C)...)
+    varying = Expr(:tuple, (index in C ? :nothing : :(getfield(values, $index))
+                            for index in 1:M)...)
+    quote
+        values = Base.@inline split.call(active, $(inner...))
+        getfield(contexts, $N)[] = $constant
+        $varying
+    end
+end
+
+# Every selected WANT port is constant: the derivative is identically zero,
+# and no backend runs. Calling it evaluates the port values.
+struct _ADConstantCall{F}
+    call::F
+end
+
+(constant::_ADConstantCall)(active, contexts::Vararg{Any,N}) where {N} =
+    Base.@inline constant.call(active, contexts...)
+
+function _ad_constant_outputs_call(kernel::_ADKernel, call, external_values,
+                                   resolved::Tuple, active_selector,
+                                   constant::Tuple)
+    count = length(outputs(kernel))
+    length(constant) == count &&
+        return _ADConstantCall{typeof(call)}(call), external_values
+    values = _ad_call_exemplar(call, resolved, external_values, active_selector)
+    box = Ref(map(position -> values[position], constant))
+    _ADConstantOutputsCall{constant,count,typeof(call)}(call),
+        (external_values..., DifferentiationInterface.Constant(box))
+end
+
+# The box rides after the wrapped call's own hidden operands.
+_ad_hidden_operands(split::_ADConstantOutputsCall, values) =
+    _ad_hidden_operands(split.call, Base.front(values))
+_ad_hidden_operands(constant::_ADConstantCall, values) =
+    _ad_hidden_operands(constant.call, values)
+
+# The WANT values from a differentiated call's output, with the constant ports'
+# values filled back in from the box of that sweep. `external_values` ends
+# with the call's own operands.
+_ad_with_constants(call, external_values, values) = values
+_ad_with_constants(::_ADConstantOutputsCall{C}, external_values, values) where {C} =
+    _ad_fill_positions(values, Val(C),
+                       DifferentiationInterface.unwrap(last(external_values))[])
+
+# The output tangents of the differentiated call, with a zero tangent of each
+# constant port's value filled in.
+_ad_constant_tangents(call, external_values, tangents) = tangents
+_ad_constant_tangents(::_ADConstantOutputsCall{C}, external_values, tangents) where {C} =
+    _ad_fill_positions(tangents, Val(C), map(_ad_zero_tangent,
+        DifferentiationInterface.unwrap(last(external_values))[]))
+
+# `values` with its entries at positions `C` replaced, in order, by `fill`.
+@generated function _ad_fill_positions(values::Tuple, ::Val{C},
+                                       fill::Tuple) where {C}
+    entries = map(1:fieldcount(values)) do position
+        slot = findfirst(==(position), C)
+        slot === nothing ? :(getfield(values, $position)) : :(getfield(fill, $slot))
+    end
+    Expr(:tuple, entries...)
+end
+
+_ad_zero_tangent(value::Union{Tuple,NamedTuple}) = map(_ad_zero_tangent, value)
+_ad_zero_tangent(value) = zero(value)
+
+# The active cotangent of a constant WANT, in the point's representation (a
+# tuple selector's scalar components cross as `Ref`).
+_ad_zero_cotangent(point::Base.RefValue) = Ref(_ad_zero_cotangent(point[]))
+_ad_zero_cotangent(point::Union{Tuple,NamedTuple}) = map(_ad_zero_cotangent, point)
+_ad_zero_cotangent(point) = zero(point)
 
 # Retained WANT outputs. The kernel computes the objective and every retained
 # WANT in one primal sweep. The differentiated target returns the objective to
@@ -1203,18 +1346,42 @@ _ad_hidden_operands(retaining::_ADRetainingCall, values) =
     _ad_hidden_operands(retaining.call, Base.front(values))
 
 function _ad_retaining_call(kernel::PreparedKernel, call, external_values,
-                            resolved::Tuple, retain::Tuple)
+                            resolved::Tuple, active_selector, retain::Tuple)
     objective, retained = _ad_output_positions(kernel, retain)
-    # The exemplar sweep fixes the box's concrete type, so the stored values
-    # stay type-stable inside the differentiated call.
-    values = kernel(resolved...)
+    # The differentiated call's exemplar sweep fixes the box's concrete type,
+    # so the stored values stay type-stable inside that call.
+    values = _ad_call_exemplar(call, resolved, external_values, active_selector)
     box = Ref(NamedTuple{retain}(map(index -> values[index], retained)))
     _ADRetainingCall{objective,retained,retain,typeof(call)}(call),
         (external_values..., DifferentiationInterface.Cache(box))
 end
 
+# The retained values of the last sweep, a constant retained port's value
+# filled in from its own box.
+function _ad_retained_values(prepared)
+    retaining = prepared.call
+    retained = _ad_retained_box(retaining, prepared)[]
+    _ad_retained_with_constants(retaining, retaining.call,
+                                Base.front(prepared.external_values), retained)
+end
+
+_ad_retained_with_constants(retaining, call, external_values, retained) = retained
+
+@generated function _ad_retained_with_constants(
+        ::_ADRetainingCall{J,R,N}, ::_ADConstantOutputsCall{C},
+        external_values, retained) where {J,R,N,C}
+    fields = map(eachindex(R)) do index
+        slot = findfirst(==(R[index]), C)
+        slot === nothing ? :(getfield(retained, $index)) : :(getfield(constant, $slot))
+    end
+    quote
+        constant = DifferentiationInterface.unwrap(last(external_values))[]
+        NamedTuple{$N}(($(fields...),))
+    end
+end
+
 function _ad_retaining_call(kernel::NonAllocatingKernel, call, external_values,
-                            resolved::Tuple, retain::Tuple)
+                            resolved::Tuple, active_selector, retain::Tuple)
     # Its WANT values live in cache slots the next call overwrites, so a
     # retained value would need an owned copy inside the differentiated call.
     throw(ArgumentError(
@@ -1261,6 +1428,8 @@ end
 
 _ad_seed_dot(seed::Number, value::Number) = seed * value
 _ad_seed_dot(seed::AbstractArray, value::AbstractArray) = dot(seed, value)
+# A constant port's position (`_ADConstantOutputsCall`) adds nothing.
+_ad_seed_dot(seed, ::Nothing) = false
 _ad_seed_dot(seed::Tuple, value::Tuple) = sum(map(_ad_seed_dot, seed, value))
 _ad_seed_dot(seed::NamedTuple{N}, value::NamedTuple{N}) where {N} =
     _ad_seed_dot(values(seed), values(value))
@@ -1268,21 +1437,29 @@ _ad_seed_dot(seed, value) = throw(ArgumentError(
     "a WANT port's cotangent must have the port value's structure; got a " *
     "$(typeof(seed)) cotangent for a $(typeof(value)) value"))
 
-# The exemplar sweep checks the seed against the port values, so a missing or
-# misshapen cotangent names the boundary before differentiation, and fixes the
-# box's concrete type, as for retained values.
+# The exemplar sweep of the differentiated call checks the seed against the
+# port values, so a missing or misshapen cotangent names the boundary before
+# differentiation, and fixes the box's concrete type, as for retained values.
 function _ad_seeded_call(kernel::_ADKernel, call, external_values,
-                         resolved::Tuple, seed, keep_values::Bool)
-    values = kernel(resolved...)
-    _ad_tangent_matches(values, seed) || throw(ArgumentError(
-        "a pullback over WANT ports " *
-        string(Tuple(output.name for output in outputs(kernel))) *
-        " takes one cotangent per port, each with its port value's " *
-        "structure ($(_ad_tangent_shape(values))); got " *
-        _ad_tangent_shape(seed)))
+                         resolved::Tuple, active_selector, seed,
+                         keep_values::Bool)
+    values = _ad_call_exemplar(call, resolved, external_values, active_selector)
+    _ad_check_seed(kernel, seed, _ad_with_constants(call, external_values, values))
     keep_values || return _ADSeededCall{false,typeof(call)}(call), external_values
     _ADSeededCall{true,typeof(call)}(call),
         (external_values..., DifferentiationInterface.Cache(Ref(values)))
+end
+
+function _ad_check_seed(kernel::_ADKernel, seed, values)
+    _ad_tangent_matches(values, seed) && return nothing
+    names = Tuple(output.name for output in outputs(kernel))
+    throw(ArgumentError(length(names) == 1 ?
+        "a pullback of WANT port :$(only(names)) takes a cotangent with " *
+        "the port value's structure ($(_ad_tangent_shape(values))); got " *
+        _ad_tangent_shape(seed) :
+        "a pullback over WANT ports $names takes one cotangent per port, " *
+        "each with its port value's structure " *
+        "($(_ad_tangent_shape(values))); got " * _ad_tangent_shape(seed)))
 end
 
 # The seed leads the differentiated call's contexts, followed by the box, the
@@ -1295,10 +1472,12 @@ _ad_seeded_contexts(::_ADSeededCall{true}, contexts::Tuple, seed) =
 
 # The port values of the differentiated sweep: stored in the box when the
 # backend kept the sweep, otherwise one separate primal evaluation.
-_ad_seeded_values(prepared, ::_ADSeededCall{true}, point, contexts) =
-    DifferentiationInterface.unwrap(last(prepared.external_values))[]
+_ad_seeded_values(prepared, call::_ADSeededCall{true}, point, contexts) =
+    _ad_with_constants(call.call, Base.front(prepared.external_values),
+        DifferentiationInterface.unwrap(last(prepared.external_values))[])
 _ad_seeded_values(prepared, call::_ADSeededCall{false}, point, contexts) =
-    Base.@inline call.call(point, map(DifferentiationInterface.unwrap, contexts)...)
+    _ad_with_constants(call.call, prepared.external_values, Base.@inline call.call(
+        point, map(DifferentiationInterface.unwrap, contexts)...))
 
 """
     ad_retains_primal_sweep(backend) -> Bool
@@ -1459,6 +1638,11 @@ _ad_operator_preparation(::Val{:pullback}, call::_ADSeededCall, backend, point,
                          seeds, contexts) =
     DifferentiationInterface.prepare_gradient(
         call, backend, point, _ad_seeded_contexts(call, contexts, only(seeds))...)
+# Every selected WANT port is constant: nothing is differentiated.
+_ad_operator_preparation(::Val{:pullback}, ::_ADConstantCall, backend, point,
+                         seeds, contexts) = nothing
+_ad_operator_preparation(::Val{:pushforward}, ::_ADConstantCall, backend, point,
+                         seeds, contexts) = nothing
 
 # A pullback hands `_ad_call` its seed, which differentiates several WANT
 # ports as their seeded inner product (`_ADSeededCall`).
@@ -1976,6 +2160,12 @@ its primal sweep ([`ad_retains_primal_sweep`](@ref), reverse-mode `AutoEnzyme`)
 yields them from the same sweep, any other with one separate primal
 evaluation.
 
+A selected port that no active HAVE port reaches (bound data alone, inactive
+HAVE values alone, or an inactive HAVE port) has a zero derivative: it is left
+out of the differentiated call and adds nothing to the pullback, and its value
+comes from the same sweep. When no selected port depends on an active port,
+the pullback is zero and no backend runs.
+
 The backend's package must be loaded in the calling session (`using Enzyme`
 for `AutoEnzyme`); the backend value alone does not load
 DifferentiationInterface's backend extension, and preparation without it
@@ -2175,6 +2365,8 @@ _ad_unprepared_pullback_call(call::_ADSeededCall, backend, point, seed,
                              contexts) =
     DifferentiationInterface.gradient(
         call, backend, point, _ad_seeded_contexts(call, contexts, seed)...)
+_ad_unprepared_pullback_call(::_ADConstantCall, backend, point, seed, contexts) =
+    _ad_zero_cotangent(point)
 
 function ad_pullback(prepared::PreparedADPullback, seed, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
@@ -2191,6 +2383,8 @@ _ad_prepared_pullback(call::_ADSeededCall, prepared, point, seed, contexts) =
     DifferentiationInterface.gradient(
         call, prepared.preparation, prepared.backend,
         point, _ad_seeded_contexts(call, contexts, seed)...)
+_ad_prepared_pullback(::_ADConstantCall, prepared, point, seed, contexts) =
+    _ad_zero_cotangent(point)
 
 """
     ad_value_and_pullback(prepared, seed, args...; kwargs...)
@@ -2223,6 +2417,11 @@ function _ad_prepared_value_and_pullback(
     cotangent = _ad_prepared_pullback(call, prepared, point, seed, contexts)
     _ad_seeded_values(prepared, call, point, contexts), cotangent
 end
+
+_ad_prepared_value_and_pullback(
+        call::_ADConstantCall, prepared, point, seed, contexts) =
+    call(point, map(DifferentiationInterface.unwrap, contexts)...),
+    _ad_zero_cotangent(point)
 
 """
     ad_value_and_pullback!(prepared, cotangent, seed, args...; kwargs...)
@@ -2270,6 +2469,12 @@ function _ad_prepared_value_and_pullback_into!(
     _ad_seeded_values(prepared, call, point, contexts), cotangent
 end
 
+function _ad_prepared_value_and_pullback_into!(
+        call::_ADConstantCall, prepared, cotangent, seed, point, contexts)
+    value = call(point, map(DifferentiationInterface.unwrap, contexts)...)
+    value, _ad_copy_cotangent!(cotangent, _ad_zero_cotangent(point))
+end
+
 # The authored-boundary resolution shared by every `KernelSpec` preparation:
 # a bound preparation is positional over the remaining ports, otherwise the
 # authored defaults and keywords resolve as `prepare(spec)` does.
@@ -2311,7 +2516,9 @@ way `prepare(spec; want = (:a, :b, ...))` evaluates them in one sweep: one
 forward sweep carries every direction through the shared graph, and each
 output tangent is a tuple with one tangent per port, in WANT order. Whether a
 backend differentiates a tuple-valued function is the backend's own contract;
-forward-mode `AutoEnzyme` does.
+forward-mode `AutoEnzyme` does. A port that no active HAVE port reaches is
+left out of the differentiated call and gets a zero tangent; when no selected
+port depends on an active port, no backend runs.
 
 Several directions with disjoint supports give a compressed Jacobian: for a
 WANT whose entries each depend on one group of active coordinates, one
@@ -2365,9 +2572,41 @@ function ad_pushforward(prepared::PreparedADPushforward, tangents, args...;
                         kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
-    DifferentiationInterface.pushforward(
-        prepared.call, prepared.preparation, prepared.backend,
-        point, _ad_prepared_tangents(point, tangents), contexts...)
+    last(_ad_prepared_value_and_pushforward(
+        prepared.call, prepared, point,
+        _ad_prepared_tangents(point, tangents), contexts; values = false))
+end
+
+# `values = false` skips the port values a pushforward does not return.
+_ad_prepared_value_and_pushforward(call, prepared, point, tangents, contexts;
+                                   values::Bool = true) =
+    _ad_backend_pushforward(call, prepared, point, tangents, contexts, values)
+
+function _ad_backend_pushforward(call, prepared, point, tangents, contexts,
+                                 values::Bool)
+    values || return nothing, DifferentiationInterface.pushforward(
+        call, prepared.preparation, prepared.backend, point, tangents, contexts...)
+    DifferentiationInterface.value_and_pushforward(
+        call, prepared.preparation, prepared.backend, point, tangents, contexts...)
+end
+
+function _ad_prepared_value_and_pushforward(
+        split::_ADConstantOutputsCall, prepared, point, tangents, contexts;
+        values::Bool = true)
+    value, output_tangents = _ad_backend_pushforward(
+        split, prepared, point, tangents, contexts, values)
+    filled = map(output_tangents) do tangent
+        _ad_constant_tangents(split, prepared.external_values, tangent)
+    end
+    values || return nothing, filled
+    _ad_with_constants(split, prepared.external_values, value), filled
+end
+
+function _ad_prepared_value_and_pushforward(
+        constant::_ADConstantCall, prepared, point, tangents, contexts;
+        values::Bool = true)
+    value = constant(point, map(DifferentiationInterface.unwrap, contexts)...)
+    value, map(_ -> _ad_zero_tangent(value), tangents)
 end
 
 """
@@ -2380,9 +2619,9 @@ function ad_value_and_pushforward(
         prepared::PreparedADPushforward, tangents, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
-    DifferentiationInterface.value_and_pushforward(
-        prepared.call, prepared.preparation, prepared.backend,
-        point, _ad_prepared_tangents(point, tangents), contexts...)
+    _ad_prepared_value_and_pushforward(
+        prepared.call, prepared, point,
+        _ad_prepared_tangents(point, tangents), contexts)
 end
 
 """
@@ -2767,10 +3006,10 @@ retained values; a previously returned `retained` is not modified.
 """
 function ad_value_gradient_and_retained!(
         prepared::PreparedADKernel, gradient, args...; kwargs...)
-    box = _ad_retained_box(prepared)
+    _ad_retained_box(prepared)
     value, gradient = ad_value_and_gradient!(
         prepared, gradient, args...; kwargs...)
-    value, gradient, box[]
+    value, gradient, _ad_retained_values(prepared)
 end
 
 """
@@ -2782,9 +3021,9 @@ structured gradient as [`ad_value_and_gradient`](@ref) does.
 """
 function ad_value_gradient_and_retained(
         prepared::PreparedADKernel, args...; kwargs...)
-    box = _ad_retained_box(prepared)
+    _ad_retained_box(prepared)
     value, gradient = ad_value_and_gradient(prepared, args...; kwargs...)
-    value, gradient, box[]
+    value, gradient, _ad_retained_values(prepared)
 end
 
 function _ad_prepared_value_and_gradient!(
