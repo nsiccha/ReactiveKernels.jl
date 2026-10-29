@@ -1875,12 +1875,32 @@ _ad_tangent_point(point, tangent) = tangent
 _ad_tangents_point(point, tangents::Tuple) =
     map(tangent -> _ad_tangent_point(point, tangent), tangents)
 
+# The backend a prepared operator stores and evaluates with. A prepared
+# operator serves one caller at a time (its stored preparation is not
+# thread-safe), so every shadow its derivative accumulates into is private to
+# the running call: the caller's gradient buffer, the shadows of its own
+# preparation and caches, and fresh intermediates. A backend extension may
+# therefore drop the cross-thread safety a backend adds for shadows other
+# threads could share; the Enzyme extension turns off atomic shadow
+# accumulation where the loaded Enzyme offers that switch and the caller left
+# it unset (snag prepared-rk-grad-788e46db). `op` names the operator, because
+# a backend whose mode is left to DifferentiationInterface runs reverse mode
+# only for gradients and pullbacks. A second-order backend applies the same
+# choice to each of its parts.
+_ad_prepared_backend(::Val, backend::DifferentiationInterface.AbstractADType) =
+    backend
+_ad_prepared_backend(::Val, backend::DifferentiationInterface.SecondOrder) =
+    DifferentiationInterface.SecondOrder(
+        _ad_prepared_backend(Val(:part), DifferentiationInterface.outer(backend)),
+        _ad_prepared_backend(Val(:part), DifferentiationInterface.inner(backend)))
+
 function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
-                              backend::DifferentiationInterface.AbstractADType,
+                              requested::DifferentiationInterface.AbstractADType,
                               seeds::Tuple, args::Tuple, kwargs::NamedTuple,
                               active; retain::Tuple = (), warm::Bool = false) where {O}
-    _ad_require_backend_packages(backend)
-    _ad_require_retaining_backend(backend, retain)
+    _ad_require_backend_packages(requested)
+    _ad_require_retaining_backend(requested, retain)
+    backend = _ad_prepared_backend(op, requested)
     resolved = _ad_resolve(resolver, args, kwargs)
     # The exemplars type the program exactly as the derivative will see it.
     # Traced exemplars run the tensorized product, which this check does not
@@ -2001,6 +2021,16 @@ The backend's package must be loaded in the calling session (`using Enzyme`
 for `AutoEnzyme`); the backend value alone does not load
 DifferentiationInterface's backend extension, and preparation without it
 fails loudly naming the missing `using`.
+
+A prepared operator serves one caller at a time, so no other thread updates
+the shadows its derivative accumulates into. Where the loaded Enzyme has
+`Enzyme.set_atomic_add`, a reverse-mode `AutoEnzyme` that leaves that setting
+to Enzyme (`AutoEnzyme()`, `AutoEnzyme(; mode = Enzyme.Reverse)`, or the
+reverse part of a `SecondOrder`) is prepared with `set_atomic_add(mode,
+false)`: plain shadow updates, where Enzyme would otherwise compile atomic ones
+in any process with several default-pool threads. A mode that sets it either
+way is kept. Every `prepare_ad_*` preparation does the same, and the prepared
+operator stores the backend it was prepared with.
 
 A non-empty `bound` NamedTuple runs the [`partial_evaluation`](@ref) pre-pass
 first: the named ports are fixed to the supplied values, their data-only

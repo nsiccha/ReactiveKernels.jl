@@ -6,7 +6,7 @@
 # callable. No derivative mathematics is authored here, and nothing attaches
 # to a function ReactiveKernels does not own. This extension also declares
 # which Enzyme modes retain WANT values during a prepared gradient's primal
-# sweep.
+# sweep, and which shadow updates a prepared operator's reverse mode compiles.
 module ReactiveKernelsEnzymeExt
 
 using ReactiveKernels: ScalarDerivativeRule, derivative_cut, DerivativeRule, forward_cut,
@@ -284,6 +284,35 @@ end
 ReactiveKernels.ad_retains_primal_sweep(
     ::ReactiveKernels.DifferentiationInterface.AutoEnzyme{
         <:Union{Nothing,Enzyme.ReverseMode}}) = true
+
+# ------------------------------------------------- atomic shadow updates ----
+
+# Enzyme compiles every shadow accumulation as an atomic update whenever the
+# process has more than one default-pool thread, whether or not another thread
+# can reach the shadow. A prepared operator's shadows are private to its running
+# call (`_ad_prepared_backend`), so a reverse mode that leaves the choice to
+# Enzyme is prepared with plain updates. Enzyme still keeps atomic updates in
+# code that starts or waits for a task or runs a threaded loop, and a mode
+# whose caller chose either way is kept. Only an Enzyme that has the switch
+# (`set_atomic_add`, EnzymeCore 0.8.27 on the local dogfood line) defines these
+# methods; with any other Enzyme the backend is stored as given.
+@static if isdefined(Enzyme, :set_atomic_add)
+    _plain_shadow_updates(mode::Enzyme.ReverseMode) =
+        Enzyme.atomic_add(mode) === nothing ? Enzyme.set_atomic_add(mode, false) : mode
+
+    ReactiveKernels._ad_prepared_backend(::Val,
+            backend::ReactiveKernels.DifferentiationInterface.AutoEnzyme{
+                <:Enzyme.ReverseMode,A}) where {A} =
+        ReactiveKernels.DifferentiationInterface.AutoEnzyme(;
+            mode = _plain_shadow_updates(backend.mode), function_annotation = A)
+
+    # Without a mode, DifferentiationInterface takes gradients and pullbacks in
+    # `Enzyme.Reverse`; any other operator keeps the backend as given.
+    ReactiveKernels._ad_prepared_backend(::Union{Val{:gradient},Val{:pullback}},
+            ::ReactiveKernels.DifferentiationInterface.AutoEnzyme{Nothing,A}) where {A} =
+        ReactiveKernels.DifferentiationInterface.AutoEnzyme(;
+            mode = _plain_shadow_updates(Enzyme.Reverse), function_annotation = A)
+end
 
 # A small active vector can carry one forward tangent lane per coordinate.
 # Enzyme differentiates the *same* native RK callable, so every plate cell,
