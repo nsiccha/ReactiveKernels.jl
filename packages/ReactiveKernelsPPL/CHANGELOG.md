@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.4
+
+- A location summand computed from `ifelse.` over scalars is a scalar, as one
+  computed from `logistic` is: `x[rows] .+ b .* s` with
+  `s = ifelse.(a .> 0, a, b)`, or the same `ifelse.` inline. On 0.1.3 and
+  earlier `bind_data` failed with `ContractValidationError:
+  [_rkppl_leaf_1_off] term references missing column _rkppl_leaf_1`.
+  Requires ReactiveKernels 0.1.8.
+
 ## 0.1.3
 
 - A location summand computed from a `logistic` value is a scalar, as one

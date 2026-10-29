@@ -1,7 +1,7 @@
 name = "ReactiveKernels"
 uuid = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.7"
+version = "0.1.8"
 
 [deps]
 DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
@@ -38,7 +38,7 @@ ReactiveKernelsSciMLODEExt = ["SciMLBase", "SciMLSensitivity"]
 ReactiveKernelsSpecialFunctionsExt = "SpecialFunctions"
 
 [sources]
-OutputSignatures = {url = "https://github.com/nsiccha/OutputSignatures.jl.git", rev = "d16c4efb72b963f45de9d6f632c38d46706c23e1"}
+OutputSignatures = {url = "https://github.com/nsiccha/OutputSignatures.jl.git", rev = "f971381f760e91986b3a728a719341e7e7761f55"}
 
 [compat]
 ChainRulesCore = "1"
@@ -49,7 +49,7 @@ Enzyme_jll = "0.0.0 - 0.0.301, 0.0.303 - 0.0"
 InverseFunctions = "0.1"
 LambertW = "1"
 LogExpFunctions = "0.3, 1.0.2"
-OutputSignatures = "0.1.5"
+OutputSignatures = "0.1.6"
 MutatingFunctions = "0.1"
 OrdinaryDiffEqBDF = "2.4"
 OrdinaryDiffEqLowOrderRK = "2.2"

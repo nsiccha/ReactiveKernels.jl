@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.8
+
+- Requires OutputSignatures 0.1.6, whose rules describe the comparisons `<`,
+  `<=`, `>`, `>=`, `==`, `!=` and `ifelse` over machine-real scalars and
+  their broadcasts. Value metadata of a call or broadcast of these is
+  therefore known: `ifelse.(a .> 0, a, b)` over scalars is a scalar. On 0.1.7
+  and earlier such a call had no metadata.
+
 ## 0.1.7
 
 - A package can state that its own scalar function computes a function

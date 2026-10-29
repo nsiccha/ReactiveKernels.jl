@@ -99,6 +99,31 @@ end
     @test helper_calls[] == calls
 end
 
+@testset "comparisons and ifelse have metadata" begin
+    # OutputSignatures 0.1.6 describes the comparisons and `ifelse` over
+    # machine-real scalars, called or broadcast: RKPPL re-proves a location
+    # summand `b .* ifelse.(a .> 0, a, b)` scalar through these facts.
+    bindings = Dict(:a=>OS.scalar_info(Float64), :b=>OS.scalar_info(Float64),
+        :x=>OS.vector_info(Float64, 3))
+    for op in (:<, :<=, :>, :>=, :(==), :!=)
+        called = info(Expr(:call, op, :a, :b), bindings)
+        @test OS.value_rank(called) === 0
+        @test OS.type_bound(called) === Bool
+        dotted = info(Expr(:call, Symbol(".", op), :a, 0), bindings)
+        @test OS.value_rank(dotted) === 0
+        @test OS.type_bound(dotted) === Bool
+    end
+    for ex in (:(ifelse(a > 0, a, b)), :(ifelse.(a .> 0, a, b)),
+            :(b .* ifelse.(a .<= b, exp.(a), b)))
+        s = info(ex, bindings)
+        @test OS.value_rank(s) === 0
+        @test OS.type_bound(s) === Float64
+    end
+    masked = info(:(ifelse.(x .> a, x, b)), bindings)
+    @test OS.value_axes(masked) == (Base.OneTo(3),)
+    @test OS.type_bound(masked) === Vector{Float64}
+end
+
 @testset "kernel chain agrees with Julia and ordinary Reverse" begin
     f = prepare(metadata_total)
     for group in (Int[], [2], [1, 3, 2, 3, 1])
