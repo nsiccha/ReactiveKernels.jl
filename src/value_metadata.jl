@@ -12,6 +12,17 @@ function _metadata_callable(callee, mod::Module, shadowed)
     return _kernel_resolve_binding(mod, callee)
 end
 
+"""
+    _metadata_function(f)
+
+The function whose OutputSignatures rules describe the calls of `f`: `f`
+itself, unless `f` is a package's own formulation of a function those rules
+already describe. A package states that for its own scalar function with a
+method of this function, as it adds a JAX translation with
+`_jax_elementwise`; OutputSignatures still owns every rule.
+"""
+_metadata_function(f) = f
+
 # The OutputSignatures `CallInfo` for a source call whose operand descriptors
 # have already been computed: `.status` says whether a rule applied, and an
 # `:unknown` result may still carry sound partial facts (a broadcast's axes).
@@ -34,6 +45,7 @@ function _call_metadata(ex::Expr, args::Vector{OutputSignatures.ValueInfo},
         return unknown("no call syntax")
     end
     f === nothing && return unknown("callee is not a resolved binding")
+    f = _metadata_function(f)
     # Julia lowers a literal exponent in x^n / x.^n to literal_pow. In
     # particular integer bases with negative literal powers produce floats;
     # the ordinary ^ call can throw instead. Normalize syntax, not a guessed
