@@ -16,6 +16,16 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.8
+
+- A design rebound from a binding without a dotted-cell response that held
+  one array per index there (`bind_data(fit, (; t = tnew))`, `y` absent)
+  observes one array per index, also when its cells read only computed
+  values. `build_kernel(design)` then builds the fit's program, and a query
+  of it on the fit binding equals the fit's own build. On 0.1.7 and earlier
+  that build observed one value per index, and the fit binding was refused
+  as a different program.
+
 ## 0.1.7
 
 - A dotted `@plate` cell observing one array per index (`y[i] .~ D.(…)`)
