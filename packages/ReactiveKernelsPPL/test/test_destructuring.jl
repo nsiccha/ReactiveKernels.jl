@@ -24,6 +24,11 @@ function parts(x)
     CALLS[] += 1
     return (sum(x), 2 .* x)
 end
+const PIECES = Ref(0)
+function pieces(t)
+    PIECES[] += 1
+    return (t, 2t, 3t)
+end
 @rkppl moment_sum(x, g) = begin
     (path, total) = moments(x, g)
     path .+ total
@@ -219,6 +224,57 @@ end
     @test call_count(kernel_expr(bound, built.layout), :moments) == 1
     @test scan_count(built.spec) == 1
     check_sampler(bound, built, data)
+end
+
+
+# Inside a `@plate` cell, `(u, v) = f(…)` binds each element as Julia does,
+# with the call run once per cell, like the field-access spelling.
+@testset "a destructuring in a @plate cell binds each element, the call once per cell" begin
+    data = (; x = [0.3, -0.5, 1.2, 0.8], y = [0.4, -0.9, 3.1, 2.3])
+    plate(cell) = quote
+        a ~ Normal(0, 0.7)
+        @plate for i in eachindex(y)
+            $(cell.args...)
+        end
+    end
+    param = plate(quote
+        (u, v) = pieces(a * x[i])
+        y[i] ~ Normal(u + v, 0.5)
+    end)
+    param_fields = plate(quote
+        p = pieces(a * x[i])
+        y[i] ~ Normal(p[1] + p[2], 0.5)
+    end)
+    data_only = plate(quote
+        (u, v) = pieces(x[i])
+        y[i] ~ Normal(a * (u + v), 0.5)
+    end)
+    # An extra element is dropped (`pieces` returns three).
+    single = plate(quote
+        (u,) = pieces(a * x[i])
+        y[i] ~ Normal(3u, 0.5)
+    end)
+    oracle(a) = logpdf(Normal(0, 0.7), a) + sum(logpdf.(Normal.(3a .* data.x, 0.5), data.y))
+    grad(a) = -a / 0.7^2 + sum((data.y .- 3a .* data.x) .* (3 .* data.x)) / 0.5^2
+    for ast in (param, param_fields, data_only, single)
+        bound, built = build(ast, data)
+        sampler = prepare_sampler(built, bound, [0.2]; backend=BACKEND)
+        for a in (0.2, -0.4)
+            Models.PIECES[] = 0
+            value = Base.invokelatest(sampler.kernel, [a])
+            ast === data_only || @test Models.PIECES[] == length(data.y)
+            @test value ≈ oracle(a) rtol=1e-12
+            _, g = sampler_value_and_gradient!(sampler, [0.0], [a])
+            @test g ≈ [grad(a)] rtol=1e-10
+        end
+    end
+    # refused at evaluation: a missing element is Julia's BoundsError
+    missing_one = plate(quote
+        (u, v, w, z) = pieces(a * x[i])
+        y[i] ~ Normal(u + v + w + z, 0.5)
+    end)
+    bound, built = build(missing_one, data)
+    @test_throws BoundsError Base.invokelatest(prepare_query(built, bound, :sampler), [0.2])
 end
 
 end

@@ -270,6 +270,41 @@ end
     end
 end
 
+@testset "a constant two imports export as one value reads it" begin
+    # Two `using`s export distinct constant bindings of one value (one
+    # object: Julia compares the stored values by identity, and a small `Int`
+    # is one cached box). Julia 1.10 and 1.11 name the oldest import its
+    # owner; from 1.12 `Base.binding_module` throws "Constant binding was
+    # imported from multiple modules". A body reading the name reads its
+    # value either way.
+    parent = Module(gensym(:SharedConstants))
+    Core.eval(parent, Expr(:toplevel, (quote
+        module A
+            export shared
+            const shared = 2
+        end
+        module B
+            export shared
+            const shared = 2
+        end
+        module R
+            using ..A, ..B
+        end
+    end).args...))
+    R = Base.invokelatest(getglobal, parent, :R)
+    Core.eval(R, :(using ReactiveKernels))
+    @test RK._global_value(R, :shared) === Some(2)
+    @test RK._global_isconst(R, :shared)
+    ref = RK._canonical_global(GlobalRef(R, :shared))
+    @test Base.invokelatest(getglobal, ref.mod, ref.name) === 2
+    Core.eval(R, :(@kernel scaled(x) = begin
+        value = shared .* x
+        return value
+    end))
+    kernel = Core.eval(R, :(prepare(scaled; have = (:x,), want = :value)))
+    @test Base.invokelatest(kernel, [1.5, -0.5]) == [3.0, -1.0]
+end
+
 @testset "a kernel another module lowered leaves this module's names free" begin
     # A docs page prepared the uniform example after another module had lowered
     # the same kernel; comparing the two modules' bindings for its branch

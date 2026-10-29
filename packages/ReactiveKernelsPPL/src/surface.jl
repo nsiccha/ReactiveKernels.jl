@@ -1763,6 +1763,24 @@ function _desugar_destructuring(stmts)
     return out
 end
 
+# A cell's `(u, v) = f(…)` binds each element, as Julia does: the value once,
+# in a fresh cell local, then each name its element of it. The cell paths
+# then see ordinary local assignments.
+function _desugar_cell_destructuring(cells)
+    any(_is_destructuring, cells) || return cells
+    out = Any[]
+    for c in cells
+        _is_destructuring(c) || (push!(out, c); continue)
+        value = gensym(:_rkppl_destructured)
+        push!(out, Expr(:(=), value, c.args[2]))
+        for (i, nm) in enumerate(c.args[1].args)
+            push!(out, Expr(:(=), nm, Expr(:call,
+                GlobalRef(@__MODULE__, :_destructure_element), value, i)))
+        end
+    end
+    return out
+end
+
 # Element `i` of `(a, b, …) = value`, what Julia's lowering binds through
 # `Base.indexed_iterate`: the same read RK splits a destructuring into inside a
 # plate cell.
@@ -2798,8 +2816,48 @@ function _resolve_call_head(fn, mod::Module, names::Set{Symbol}, where;
         m = _resolve_module_path(fn.args[1], mod, where)
         return _module_binding(m, fn.args[2].value, where, repr(fn))
     end
+    # A parametric constructor `C{P...}` (`Law{LogNormal}(loc, s)`) is
+    # Julia's `C{P...}` of its module-visible parts.
+    if Meta.isexpr(fn, :curly) && length(fn.args) >= 2
+        base = _resolve_call_head(fn.args[1], mod, names, where)
+        base isa GlobalRef || _sfail("$where calls `$(repr(fn))`, whose " *
+            "`$(repr(fn.args[1]))` is not a module-visible constructor")
+        return Expr(:curly, base,
+            Any[_resolve_type_parameter(p, mod, names, where, fn) for p in fn.args[2:end]]...)
+    end
     return fn  # anonymous or exotic heads: the screen rejects them
 end
+
+# A type parameter of a parametric call head: a module-visible binding, a
+# parametric type of such parts, or a literal. A model value is a run-time
+# value, which a constructor's type parameters are not.
+function _resolve_type_parameter(p, mod::Module, names::Set{Symbol}, where, fn)
+    p isa GlobalRef && return p
+    if p isa Symbol
+        p in names && _sfail("$where calls `$(repr(fn))`, whose type parameter " *
+            "`$p` is a model value")
+        return _module_binding(mod, p, where, p)
+    end
+    Meta.isexpr(p, :., 2) && p.args[2] isa QuoteNode && return _module_binding(
+        _resolve_module_path(p.args[1], mod, where), p.args[2].value, where, repr(p))
+    Meta.isexpr(p, :curly) && return _resolve_call_head(p, mod, names, where)
+    Meta.isexpr(p, (:<:, :>:), 1) && return Expr(p.head,
+        _resolve_type_parameter(p.args[1], mod, names, where, fn))
+    p isa Union{Number,QuoteNode,String,Char} && return p
+    _sfail("$where calls `$(repr(fn))`, whose type parameter `$(repr(p))` is " *
+        "not a module-visible binding or a literal")
+end
+
+# A call head resolved to a binding or to a parametric constructor of
+# bindings and literals (`_resolve_call_head`).
+_is_constructor_head(h) = h isa GlobalRef ||
+    (Meta.isexpr(h, :curly) && h.args[1] isa GlobalRef)
+
+# The value such a head denotes, as a data definition evaluates it.
+_call_head_value(h::GlobalRef) = getglobal(h.mod, h.name)
+_call_head_value(h::QuoteNode) = h.value
+_call_head_value(h::Expr) = _eval_type_application(h, _call_head_value)
+_call_head_value(h) = h
 
 # A bare function name passed to a module function (`map(abs2, v)`) is the
 # function value, as in Julia; model names shadow it.
@@ -2925,7 +2983,7 @@ function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where;
             _julia_reduction_ref(ex.args[1]) :
             _resolve_call_head(ex.args[1], mod, names, where)
         args = Any[recur(a) for a in ex.args[2:end]]
-        if head isa GlobalRef || _constructed_endpoint_head(head)
+        if _is_constructor_head(head) || _constructed_endpoint_head(head)
             args = Any[_resolve_function_arg(a, mod, names, where)
                 for a in args]
         end
@@ -4339,7 +4397,7 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
     R = asg.args[2]
     rkind = _plate_range_kind(R)
     body = loop.args[2]
-    cells = Any[a for a in body.args if !(a isa LineNumberNode)]
+    cells = _desugar_cell_destructuring(Any[a for a in body.args if !(a isa LineNumberNode)])
     isempty(cells) && return Expr[], Tuple{Symbol,Int,Set{Symbol}}[],
         Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
     # Names bound by `=` anywhere in this plate (cell locals, excluded

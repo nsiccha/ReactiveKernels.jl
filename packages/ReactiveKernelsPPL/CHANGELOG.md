@@ -16,13 +16,41 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.9
+## 0.1.12
 
 - A `@plate` output holding one number per index (`c[i] = sum(lam)`) lowers
   as a location, a scale or a composition operand also when its cell reads a
   composed predictor (`f = 0.4 .* mu[main] .+ u[m]`, then
-  `lam = exp.(f[rows[i]])`). On 0.1.8 and earlier lowering refused it with
+  `lam = exp.(f[rows[i]])`). On 0.1.11 and earlier lowering refused it with
   "predictor c applies `_ppl_plate_column` inside a composition".
+
+## 0.1.11
+
+- Probit and cloglog cumulative-ordinal interior levels are accurate when
+  both their cutpoints lie far above `eta`: the mass comes from the
+  complementary tails. On 0.1.10 and earlier the log-CDFs rounded it away. A
+  probit level between 7 and 8 was off by `6.7e-6`, and a cloglog level
+  between 5 and 6 gave `-Inf` where the log mass is `-148.4`. Values,
+  gradients and pointwise values below the upper tail are unchanged.
+
+## 0.1.10
+
+- A `@plate` cell may destructure, as Julia does: `(u, v) = f(x[i])` binds
+  each element, with `f` run once per cell, whether it reads parameters or
+  only data. An extra element is dropped, and a missing one raises
+  `BoundsError` at evaluation. On 0.1.9 and earlier lowering refused it with
+  `selected plate assignments bind a local or an indexed scalar column`.
+
+## 0.1.9
+
+- A sampling right-hand side whose head is a parametric constructor,
+  `T[i] ~ Law{LogNormal}(loc, s)` or `b ~ Law{LogNormal}(…)`, lowers as
+  Julia's constructor call, in a joint `@plate` cell latent and at model
+  level: its `sampling_geometry` receives the constructor `Law{LogNormal}`.
+  On 0.1.8 and earlier lowering refused it with `external RHS … needs a
+  module-visible constructor`. The constructor's base and type parameters
+  resolve in the model module; one that names no binding there, or a model
+  value, is refused, naming it.
 
 ## 0.1.8
 

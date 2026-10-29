@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.11
+
+- On Julia 1.12 and later, a kernel body may read a name that two `using`s
+  export as distinct constant bindings of one stored value (Julia defines
+  the name, and plain code in the module reads it). On 0.1.10 and earlier
+  `compile`, and with it `prepare`, threw `Constant binding was imported from
+  multiple modules` from `Base.binding_module`. Julia 1.10 and 1.11 were
+  unaffected.
+
 ## 0.1.10
 
 - `prepare_ad_pullback`, `prepare_ad_pushforward`, the one-shot

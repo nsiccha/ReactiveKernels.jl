@@ -450,8 +450,8 @@ function _cell_joint_geometry(rhs::Expr, mod::Module, names::Set{Symbol})
         e isa SurfaceLoweringError || rethrow()
         return nothing
     end
-    Meta.isexpr(call, :call) && call.args[1] isa GlobalRef || return nothing
-    constructor = getglobal(call.args[1].mod, call.args[1].name)
+    Meta.isexpr(call, :call) && _is_constructor_head(call.args[1]) || return nothing
+    constructor = _call_head_value(call.args[1])
     geometry = try
         sampling_geometry(constructor, Tuple(deepcopy(call.args[2:end])), ())
     catch e
