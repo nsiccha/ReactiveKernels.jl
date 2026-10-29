@@ -16,6 +16,24 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.13
+
+- With an Enzyme that has `Enzyme.set_atomic_add` (EnzymeCore 0.8.27, the
+  local Enzyme `dogfood` line), every `prepare_ad_*` preparation, and so every
+  RKPPL sampler, query and cell sampler gradient, prepares a reverse-mode
+  `AutoEnzyme` that leaves that setting to Enzyme (`AutoEnzyme()`,
+  `AutoEnzyme(; mode = Enzyme.Reverse)`, the reverse part of a `SecondOrder`)
+  with `set_atomic_add(mode, false)`. Its derivative then compiles plain
+  shadow updates in a process with several default-pool threads, where Enzyme
+  otherwise compiles each one as an atomic update. A prepared operator serves
+  one caller at a time, so no other thread updates its shadows. A mode that
+  sets the switch either way is kept, and the operator's `backend` field holds
+  the backend it was prepared with. Measured on Julia 1.10.12 with 8 default
+  threads: an RK `prepare_ad` Gaussian likelihood gradient (434 × 4) took
+  1381 ns instead of 4394 ns, and an RKPPL `prepare_sampler` regression
+  gradient 659 ns instead of 2114 ns. With registered Enzyme, which lacks the
+  switch, nothing changes.
+
 ## 0.1.12
 
 - With a reverse-over-forward backend,
