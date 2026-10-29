@@ -1791,10 +1791,11 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
         _type_stability())
     preparation = _ad_operator_preparation(
         op, call, backend, point, seeds, contexts)
-    prepared = PreparedADOperator{
+    # Built without compiling the constructor for this program's types.
+    prepared = _kernel_new_instance(PreparedADOperator{
         active_selector,typeof(kernel),typeof(resolver),typeof(call),
         typeof(backend),typeof(preparation),typeof(external_values),O,
-    }(kernel, resolver, call, backend, preparation, external_values)
+    }, (kernel, resolver, call, backend, preparation, external_values))::PreparedADOperator
     warm && _ad_warm!(prepared, point, contexts)
     prepared
 end
