@@ -907,6 +907,34 @@ function _is_endpoint_position(i)
         any(_is_endpoint_position, args)
 end
 
+# An index written as integer arithmetic of literals (`cs[4 + 1]`, or the
+# `cs[S + 1]` a submodel call with a literal `S` gives) is the position it
+# evaluates to, as in Julia, and folds the same way inside endpoint
+# arithmetic (`z[end - (1 + 1)]` is `z[end - 2]`). Lowering folds every index
+# before reading it (`_fold_literal_positions`), so each reader sees the
+# literal.
+_is_literal_arithmetic(i) = i isa Int || Meta.isexpr(i, :call) &&
+    length(i.args) >= 2 && i.args[1] in _ENDPOINT_OPS &&
+    all(_is_literal_arithmetic, i.args[2:end])
+
+function _fold_index(i)
+    i isa Expr || return i
+    _is_literal_arithmetic(i) && return _endpoint_value(i, 0, 0)
+    return Expr(i.head, Any[_fold_index(a) for a in i.args]...)
+end
+
+function _fold_literal_positions(ex)
+    ex isa Expr || return ex
+    ex.head === :quote && return ex
+    args = Any[_fold_literal_positions(a) for a in ex.args]
+    if ex.head === :ref
+        for k in 2:length(args)
+            args[k] = _fold_index(args[k])
+        end
+    end
+    return Expr(ex.head, args...)
+end
+
 # The position an endpoint index denotes on an axis `first:last`.
 _endpoint_value(i::Int, first::Int, last::Int) = i
 _endpoint_value(i::Symbol, first::Int, last::Int) =

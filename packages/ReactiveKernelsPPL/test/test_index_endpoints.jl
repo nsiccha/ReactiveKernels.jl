@@ -170,8 +170,39 @@ end
     @test coordinate_names(built.layout) == [:b, Symbol("z.1"), Symbol("z.2")]
 end
 
+# A submodel whose position is its argument: `cs[S + 1]` with a literal `S`.
+@rkppl _span_total(phi, S) = begin
+    cs = cumsum(vcat(0.0, phi))
+    return cs[S + 1] - cs[1]
+end
+
+@testset "an index of literal integer arithmetic is the position it evaluates to" begin
+    ast = quote
+        phi[1:4] .~ Normal.(0, 1)
+        Z[1:3, 1:2] .~ Normal.(0, 1)
+        b ~ Normal(0, 1)
+        cs = cumsum(vcat(0.0, phi))
+        t = cs[4 + 1] - cs[1]
+        loc = b .* x .+ t .+ phi[1 + 1] .+ Z[2 * 1, 1] .- Z[end - (1 + 1), end]
+        y .~ Normal.(loc, 0.7)
+    end
+    data = (; x, y)
+    check(lowered(ast, data), data, (p, d) ->
+        sum(logpdf.(Normal(0, 1), p.phi)) + sum(logpdf.(Normal(0, 1), p.Z)) +
+        logpdf(Normal(0, 1), p.b) +
+        sum(logpdf.(Normal.(p.b .* d.x .+ sum(p.phi) .+ p.phi[2] .+ p.Z[2, 1] .-
+            p.Z[1, 2], 0.7), d.y)))
+    sub = quote
+        phi[1:4] .~ Normal.(0, 1)
+        t ~ _span_total(phi, 4)
+        y .~ Normal.(t .+ x, 0.7)
+    end
+    check(lowered(sub, data), data, (p, d) -> sum(logpdf.(Normal(0, 1), p.phi)) +
+        sum(logpdf.(Normal.(sum(p.phi) .+ d.x, 0.7), d.y)))
+end
+
 @testset "an endpoint past the array fails binding" begin
-    for read in (:(t = exp(z[end + 1])), :(t = exp(z[begin - 1])))
+    for read in (:(t = exp(z[end + 1])), :(t = exp(z[begin - 1])), :(t = exp(z[2 + 2])))
         ast = quote
             z[1:3] .~ Normal.(0, 1)
             $read
