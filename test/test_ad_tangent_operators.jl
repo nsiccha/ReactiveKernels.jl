@@ -103,6 +103,26 @@ _tangent_unit(n, i) = (e = zeros(n); e[i] = 1.0; e)
         @test only(results) ≈ 2 * _tangent_hessian(q, s, data) * v
     end
 
+    @testset "the gradient of ad_gradient_and_hvp takes the reverse backend" begin
+        # Reverse over forward takes the gradient from its outer reverse
+        # backend in one sweep: DifferentiationInterface's own
+        # `gradient_and_hvp` takes it from the inner forward backend, ⌈n/16⌉
+        # forward passes for n coordinates. Forward over reverse keeps
+        # DifferentiationInterface's own composition.
+        rof = prepare_ad_hvp(tangent_density, second_order, (v,), q, s;
+                             data, active = :q, want = :density)
+        @test rof.preparation isa NamedTuple{(:hvp, :gradient)}
+        for prepared in (rof, prepare_ad_hvp(tangent_density, forward_over_reverse,
+                (v,), q, s; data, active = :q, want = :density))
+            gradient, (hv,) = ad_gradient_and_hvp(prepared, (v,), q, s; data)
+            @test gradient ≈ data .* s .* exp.(s .* q) .- q
+            @test hv ≈ _tangent_hessian(q, s, data) * v
+        end
+        fwd = prepare_ad_hvp(tangent_density, forward_over_reverse, (v,), q, s;
+                             data, active = :q, want = :density)
+        @test !(fwd.preparation isa NamedTuple)
+    end
+
     @testset "batched directions and bound preparations" begin
         units = ntuple(i -> _tangent_unit(3, i), 3)
         batched = prepare_ad_hvp(tangent_density, second_order, units, q, s;

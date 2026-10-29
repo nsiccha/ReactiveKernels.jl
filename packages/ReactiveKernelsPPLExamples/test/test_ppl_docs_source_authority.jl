@@ -196,3 +196,16 @@ end
         @test occursin("\"$page\" => 1", rendered_contract_source)
     end
 end
+
+# The model-only evaluation `__init__` runs finds the `model` its source
+# defines in a fresh sandbox, a binding Julia 1.12 and later show only in a
+# later world than the evaluator's own (so on 1.12 the package failed to load).
+@testset "a model-only source evaluation finds the model its source defines" begin
+    for (_, _, owner, _, evaluator_name) in PPL_SOURCE_CASES
+        evaluator = getfield(owner, evaluator_name)
+        hasmethod(evaluator, Tuple{}, (:model_only,)) || continue
+        result = evaluator(; model_only = true)
+        @test result.model isa ReactiveKernels.KernelSpec
+        @test parentmodule(result.sandbox) === owner
+    end
+end
