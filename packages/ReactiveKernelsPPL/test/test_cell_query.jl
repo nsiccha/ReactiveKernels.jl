@@ -44,7 +44,8 @@ _cq_central(f, u, j; h = 1e-6) =
     (f(setindex!(copy(u), u[j] + h, j)) - f(setindex!(copy(u), u[j] - h, j))) / (2h)
 
 _cq_direct_compact_value(q, base, active, indices, cell) =
-    q(ReactiveKernelsPPL._CompactCellPoint(base, active, indices), cell)
+    q(ReactiveKernelsPPL._CompactCellPoint(base, active,
+        ReactiveKernelsPPL._compact_cell_slots(length(base), indices)), cell)
 
 @testset "cell query: one group of an @plate for loop" begin
     data = _cq_grouped_data()
@@ -112,6 +113,39 @@ _cq_direct_compact_value(q, base, active, indices, cell) =
     end
     @test_throws ReactiveKernelsPPL.ContractValidationError cell_value_and_gradient!(
         compact, zeros(2), u, zeros(2), [2, 2], 1)
+    # The sampler maps the previous call's selection; a caller that changes its
+    # `indices` in place between calls gets the new selection, and a refused
+    # selection leaves the previous one in force.
+    let indices = sort!([2; block(1)]), base = copy(u)
+        function expected(indices, cell = 1)
+            overlaid = copy(base)
+            overlaid[indices] .+= 0.1
+            g = similar(u)
+            value, _ = cell_value_and_gradient!(s, g, overlaid, cell)
+            value, g[indices]
+        end
+        compact_gradient = zeros(length(indices))
+        # The loop above last selected group 4's block; the refusal kept it.
+        previous = sort!([2; block(4)])
+        value, _ = cell_value_and_gradient!(compact, compact_gradient, base,
+            base[previous] .+ 0.1, previous, 4)
+        @test value ≈ expected(previous, 4)[1]
+        @test compact_gradient ≈ expected(previous, 4)[2]
+        value, _ = cell_value_and_gradient!(compact, compact_gradient, base,
+            base[indices] .+ 0.1, indices, 1)
+        @test value ≈ expected(indices)[1]
+        @test compact_gradient ≈ expected(indices)[2]
+        indices[1] = 1
+        value, _ = cell_value_and_gradient!(compact, compact_gradient, base,
+            base[indices] .+ 0.1, indices, 1)
+        @test value ≈ expected(indices)[1]
+        @test compact_gradient ≈ expected(indices)[2]
+        indices[1] = 2
+        value, _ = cell_value_and_gradient!(compact, compact_gradient, base,
+            base[indices] .+ 0.1, indices, 1)
+        @test value ≈ expected(indices)[1]
+        @test compact_gradient ≈ expected(indices)[2]
+    end
     # Gradients leave the bound per-group arrays and later values unchanged.
     @test data == _cq_grouped_data()
     @test [q(u, i) for i in eachindex(data.y)] ≈ cells
