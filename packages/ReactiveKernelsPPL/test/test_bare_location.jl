@@ -763,10 +763,11 @@ end
     end
 end
 
-# The same location beside a design matrix, a scan or a latent plate, where
-# every location gets its response's rows. The composition read by name got
-# none, so the fused count likelihood read `dot(w, la)` of a number and
-# raised a DimensionMismatch (snag scalar-alias-loc-6305553f).
+# The same location beside a design matrix, a scan or a latent plate. Every
+# location there used to get its response's rows; the composition read by
+# name got none, so the fused count likelihood read `dot(w, la)` of a number
+# and raised a DimensionMismatch (snag scalar-alias-loc-6305553f). A proven
+# scalar location now stays scalar there too (ReactiveKernels todo `1sja7je`).
 @testset "a scalar location read by another definition beside structured axes" begin
     D = Distributions
     w = [mod(2j, 5) for j in 1:15]
@@ -822,6 +823,10 @@ end
         plan = lower_rkppl(prog, cols; conditioned = (:y, observed))
         bound = bind_data(plan, cols)
         built = build_kernel(bound)
+        # The scalar location stays scalar beside these axes too: no row
+        # vector, and no fused row product of it.
+        src = string(kernel_expr(bound, built.layout))
+        @test !occursin("_ppl_rows", src) && !occursin("dot(", src)
         u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
         oracle(v) = begin
             p = constrain(built.layout, v)

@@ -314,6 +314,7 @@ const _PPL_TEST_FILES = (
     "test_cell_composed_gathers.jl",
     "test_plate_cell_arrays.jl",
     "test_vector_plate_outputs.jl",
+    "test_plate_column_compositions.jl",
     "test_plate_cell_once.jl",
     "test_plate_cell_once_reactant.jl",
     "test_index_endpoints.jl",

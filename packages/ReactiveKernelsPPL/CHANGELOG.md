@@ -16,6 +16,23 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.13
+
+- A proven scalar location stays a scalar beside a design matrix, a `@scan`
+  or a latent `@plate` too, as it already did in a plan with one ordinary
+  observation axis: the observation plate broadcasts it, with no row vector
+  and no fused row product (`dot`) of it per evaluation. Densities and
+  gradients are unchanged. A plan with a packed `mi(…)` response keeps the
+  rows, since it gathers every plate input by job.
+
+## 0.1.12
+
+- A `@plate` output holding one number per index (`c[i] = sum(lam)`) lowers
+  as a location, a scale or a composition operand also when its cell reads a
+  composed predictor (`f = 0.4 .* mu[main] .+ u[m]`, then
+  `lam = exp.(f[rows[i]])`). On 0.1.11 and earlier lowering refused it with
+  "predictor c applies `_ppl_plate_column` inside a composition".
+
 ## 0.1.11
 
 - Probit and cloglog cumulative-ordinal interior levels are accurate when

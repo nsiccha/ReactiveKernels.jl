@@ -1652,7 +1652,114 @@ _ad_operator_seeding(::Val, seeds, backend) = (;)
 _ad_operator_preparation(::Val{:pushforward}, call, backend, point, seeds, contexts) =
     DifferentiationInterface.prepare_pushforward(call, backend, point, seeds, contexts...)
 _ad_operator_preparation(::Val{:hvp}, call, backend, point, seeds, contexts) =
-    DifferentiationInterface.prepare_hvp(call, backend, point, seeds, contexts...)
+    _ad_prepare_hvp(call, backend, point, seeds, contexts, true)
+
+# The Hessian-vector preparation of `f`. Under reverse over forward the
+# Hessian-vector product along `v` is the outer backend's gradient of the
+# directional derivative `x -> Df(x)[v]` that the inner backend computes, the
+# gradient DifferentiationInterface's own `hvp` takes. RK prepares that
+# gradient itself instead of calling `prepare_hvp`, which also prepares a
+# gradient of `f` with the inner forward backend for its `gradient_and_hvp`
+# (DifferentiationInterface 0.7.21): Enzyme's forward-mode gradient
+# preparation holds `n` one-hot basis vectors of length `n`, 8n² bytes for `n`
+# active coordinates (187 GiB at n = 158,343; snag prepare-ad-hvp-r-e5eb074c).
+# `gradient = true` also prepares the gradient of `ad_gradient_and_hvp` with
+# the outer backend. Every other backend keeps DifferentiationInterface's
+# preparation.
+struct _ADReverseOverForwardHVP{D,G}
+    directional::D
+    gradient::G
+end
+
+_ad_prepare_hvp(f, backend, point, seeds, contexts, gradient::Bool) =
+    _ad_prepare_hvp(_ad_hvp_gradient_backend(backend), f, backend, point, seeds,
+                    contexts, gradient)
+_ad_prepare_hvp(::Nothing, f, backend, point, seeds, contexts, gradient::Bool) =
+    DifferentiationInterface.prepare_hvp(f, backend, point, seeds, contexts...)
+function _ad_prepare_hvp(outer, f, backend, point, seeds, contexts,
+                         gradient::Bool)
+    directional = DifferentiationInterface.prepare_gradient(
+        _ADDirectionalDerivative(contexts), outer, point,
+        _ad_directional_contexts(f, DifferentiationInterface.inner(backend),
+                                 first(seeds), contexts)...)
+    _ADReverseOverForwardHVP(directional, gradient ?
+        DifferentiationInterface.prepare_gradient(f, outer, point, contexts...) :
+        nothing)
+end
+
+# A reverse-over-forward Hessian-vector backend: its Hessian-vector products
+# take RK's preparation above, and the gradient of `ad_gradient_and_hvp` its
+# outer reverse backend, one sweep. DifferentiationInterface's own
+# `gradient_and_hvp` takes it from the inner forward backend, ⌈n/16⌉ forward
+# passes for n coordinates: 285 µs where the reverse gradient and the
+# Hessian-vector product take 3.7 + 2.8 µs (302 coordinates, todo `017zu8v`).
+_ad_hvp_gradient_backend(backend) = nothing
+function _ad_hvp_gradient_backend(backend::DifferentiationInterface.SecondOrder)
+    ADTypes = DifferentiationInterface.ADTypes
+    outer = DifferentiationInterface.outer(backend)
+    ADTypes.mode(outer) isa ADTypes.ReverseMode &&
+        ADTypes.mode(DifferentiationInterface.inner(backend)) isa ADTypes.ForwardMode ?
+        outer : nothing
+end
+
+# One Hessian-vector product of `f` per direction, from either preparation.
+_ad_hvps(f, preparation::_ADReverseOverForwardHVP, backend, point,
+         tangents::Tuple, contexts) =
+    map(tangents) do tangent
+        DifferentiationInterface.gradient(
+            _ADDirectionalDerivative(contexts), preparation.directional,
+            DifferentiationInterface.outer(backend), point,
+            _ad_directional_contexts(f, DifferentiationInterface.inner(backend),
+                                     tangent, contexts)...)
+    end
+_ad_hvps(f, preparation, backend, point, tangents, contexts) =
+    DifferentiationInterface.hvp(f, preparation, backend, point, tangents,
+                                 contexts...)
+
+function _ad_hvps!(f, results::Tuple, preparation::_ADReverseOverForwardHVP,
+                   backend, point, tangents::Tuple, contexts)
+    _ad_check_destinations(results, tangents)
+    foreach(results, tangents) do result, tangent
+        DifferentiationInterface.gradient!(
+            _ADDirectionalDerivative(contexts), result, preparation.directional,
+            DifferentiationInterface.outer(backend), point,
+            _ad_directional_contexts(f, DifferentiationInterface.inner(backend),
+                                     tangent, contexts)...)
+    end
+    results
+end
+_ad_hvps!(f, results, preparation, backend, point, tangents, contexts) =
+    DifferentiationInterface.hvp!(f, results, preparation, backend, point,
+                                  tangents, contexts...)
+
+function _ad_check_destinations(results::Tuple, tangents::Tuple)
+    length(results) == length(tangents) || throw(DimensionMismatch(
+        "$(length(results)) result destinations for $(length(tangents)) " *
+        "directions"))
+    results
+end
+
+_ad_gradient_and_hvp(call, preparation, backend, point, tangents, contexts) =
+    DifferentiationInterface.gradient_and_hvp(
+        call, preparation, backend, point, tangents, contexts...)
+_ad_gradient_and_hvp(call, preparation::_ADReverseOverForwardHVP, backend,
+                     point, tangents, contexts) =
+    (DifferentiationInterface.gradient(call, preparation.gradient,
+        DifferentiationInterface.outer(backend), point, contexts...),
+     _ad_hvps(call, preparation, backend, point, tangents, contexts))
+
+_ad_gradient_and_hvp!(call, gradient, results, preparation, backend, point,
+                      tangents, contexts) =
+    DifferentiationInterface.gradient_and_hvp!(
+        call, gradient, results, preparation, backend, point, tangents, contexts...)
+function _ad_gradient_and_hvp!(call, gradient, results,
+                               preparation::_ADReverseOverForwardHVP, backend,
+                               point, tangents, contexts)
+    DifferentiationInterface.gradient!(call, gradient, preparation.gradient,
+        DifferentiationInterface.outer(backend), point, contexts...)
+    _ad_hvps!(call, results, preparation, backend, point, tangents, contexts)
+    gradient, results
+end
 
 # A third-order operator is the Hessian-vector product of the directional
 # derivative `x -> Df(x)[v]` in the same direction `v`: its gradient is
@@ -1667,41 +1774,42 @@ _ad_operator_preparation(::Val{:hvp}, call, backend, point, seeds, contexts) =
 function _ad_operator_preparation(::Val{:third}, call, backend, point, seeds,
                                   contexts)
     hvp_backend = backend.outer
-    direction = _ADDirectionalDerivative(call, backend.inner, contexts)
     seed = first(seeds)
-    (; direction,
-     third = DifferentiationInterface.prepare_hvp(
-         direction, hvp_backend, point, (seed,),
-         DifferentiationInterface.Constant(seed), contexts...),
-     hvp = DifferentiationInterface.prepare_hvp(
-         call, hvp_backend, point, seeds, contexts...),
+    (; third = _ad_prepare_hvp(
+         _ADDirectionalDerivative(contexts), hvp_backend, point, (seed,),
+         _ad_directional_contexts(call, backend.inner, seed, contexts), false),
+     hvp = _ad_prepare_hvp(call, hvp_backend, point, seeds, contexts, false),
      gradient = DifferentiationInterface.prepare_gradient(
          call, hvp_backend.outer, point, contexts...))
 end
 
-# `x -> Df(x)[v]`, the scalar pushforward of the kernel call along `v`.
-# DifferentiationInterface hands a differentiated function its contexts
-# unwrapped, so the call wraps each again in its original context type
-# (`Constant`, or a non-allocating kernel's `Cache`) before the pushforward.
-# `C` is the type of the contexts it was built from.
-struct _ADDirectionalDerivative{C,F,B}
-    call::F
-    backend::B
-end
+# `x -> Df(x)[v]`, the scalar pushforward of `f` along `v` with `backend`.
+# `f`, the backend and `v` cross as `Constant` contexts ahead of `f`'s own, as
+# in DifferentiationInterface's reverse over forward, so the function a
+# backend differentiates is this singleton. DifferentiationInterface hands a
+# differentiated function its contexts unwrapped, so the derivative wraps
+# `f`'s contexts again in their original context types (`Constant`, or a
+# non-allocating kernel's `Cache`) before the pushforward. `C` is the type of
+# those contexts.
+struct _ADDirectionalDerivative{C} end
 
-_ADDirectionalDerivative(call, backend, contexts::Tuple) =
-    _ADDirectionalDerivative{typeof(contexts),typeof(call),typeof(backend)}(
-        call, backend)
+_ADDirectionalDerivative(contexts::Tuple) =
+    _ADDirectionalDerivative{typeof(contexts)}()
 
-@generated function (derivative::_ADDirectionalDerivative{C})(
-        point, direction, contexts::Vararg{Any,N}) where {C,N}
+_ad_directional_contexts(f, backend, direction, contexts) =
+    (DifferentiationInterface.Constant(f),
+     DifferentiationInterface.Constant(backend),
+     DifferentiationInterface.Constant(direction), contexts...)
+
+@generated function (::_ADDirectionalDerivative{C})(
+        point, f, backend, direction, contexts::Vararg{Any,N}) where {C,N}
     fieldcount(C) == N || return :(throw(ArgumentError(
         "the directional derivative was prepared with $(fieldcount(C)) " *
         "contexts; got $N")))
     wrapped = [:($(Base.typename(fieldtype(C, index)).wrapper)(
                    getfield(contexts, $index))) for index in 1:N]
     :(only(DifferentiationInterface.pushforward(
-        derivative.call, derivative.backend, point, (direction,), $(wrapped...))))
+        f, backend, point, (direction,), $(wrapped...))))
 end
 
 # The third-order backend's shape, checked before anything is prepared.
@@ -2642,7 +2750,12 @@ Pass a second-order backend. Reverse over forward,
 AutoEnzyme(; mode = Enzyme.Forward))`, also differentiates objectives that
 multiply a constant matrix by the active vector (a design-matrix linear
 predictor), which native Enzyme forward over reverse cannot analyse
-statically. Directions with disjoint supports give a
+statically. Its preparation holds memory linear in the number of active
+coordinates: RK prepares the reverse gradient of the directional derivative
+`x -> Df(x)[v]` itself, without the forward-mode gradient that
+DifferentiationInterface's own reverse-over-forward preparation adds, whose
+Enzyme preparation holds `n` one-hot vectors of length `n`. A tuple `active`
+selector works there too. Directions with disjoint supports give a
 compressed Hessian: when active coordinates fall into groups that never
 interact (per-subject effects of a population model, say), one direction per
 coordinate within a group, summed across groups, recovers every group's
@@ -2689,9 +2802,9 @@ tangent in `tangents`, returning a tuple of results in the same order.
 function ad_hvp(prepared::PreparedADHVP, tangents, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
-    _ad_restore_tangents(point, DifferentiationInterface.hvp(
+    _ad_restore_tangents(point, _ad_hvps(
         prepared.call, prepared.preparation, prepared.backend,
-        point, _ad_prepared_tangents(point, tangents), contexts...))
+        point, _ad_prepared_tangents(point, tangents), contexts))
 end
 
 """
@@ -2704,25 +2817,26 @@ function ad_hvp!(prepared::PreparedADHVP, results::Tuple, tangents, args...;
                  kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
-    DifferentiationInterface.hvp!(
-        prepared.call, results, prepared.preparation, prepared.backend,
-        point, _ad_prepared_tangents(point, tangents), contexts...)
+    _ad_hvps!(prepared.call, results, prepared.preparation, prepared.backend,
+              point, _ad_prepared_tangents(point, tangents), contexts)
 end
 
 """
     ad_gradient_and_hvp(prepared, tangents, args...; kwargs...)
 
 Evaluate the gradient of the prepared scalar WANT and one Hessian-vector
-product per input tangent from the same differentiation pass. Returns
-`(gradient, hvps)`.
+product per input tangent at one point. Returns `(gradient, hvps)`. With a
+reverse-over-forward backend (`SecondOrder(reverse, forward)`) the gradient
+takes one sweep of the reverse backend and each Hessian-vector product one
+sweep of the Hessian-vector backend.
 """
 function ad_gradient_and_hvp(prepared::PreparedADHVP, tangents, args...;
                              kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
-    gradient, results = DifferentiationInterface.gradient_and_hvp(
+    gradient, results = _ad_gradient_and_hvp(
         prepared.call, prepared.preparation, prepared.backend,
-        point, _ad_prepared_tangents(point, tangents), contexts...)
+        point, _ad_prepared_tangents(point, tangents), contexts)
     _ad_restore_cotangent(point, gradient), _ad_restore_tangents(point, results)
 end
 
@@ -2737,10 +2851,10 @@ function ad_gradient_and_hvp!(prepared::PreparedADHVP, gradient,
                               results::Tuple, tangents, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
-    DifferentiationInterface.gradient_and_hvp!(
+    _ad_gradient_and_hvp!(
         prepared.call, gradient, results, prepared.preparation,
         prepared.backend, point, _ad_prepared_tangents(point, tangents),
-        contexts...)
+        contexts)
 end
 
 """
@@ -2822,25 +2936,25 @@ function prepare_ad_third(
 end
 
 _ad_third_tangent(prepared::PreparedADThird, point, tangent, contexts) =
-    only(DifferentiationInterface.hvp(
-        prepared.preparation.direction, prepared.preparation.third,
+    only(_ad_hvps(
+        _ADDirectionalDerivative(contexts), prepared.preparation.third,
         prepared.backend.outer, point, (tangent,),
-        DifferentiationInterface.Constant(tangent), contexts...))
+        _ad_directional_contexts(prepared.call, prepared.backend.inner, tangent,
+                                 contexts)))
 
 function _ad_third_tangent!(prepared::PreparedADThird, result, point, tangent,
                             contexts)
-    DifferentiationInterface.hvp!(
-        prepared.preparation.direction, (result,), prepared.preparation.third,
+    _ad_hvps!(
+        _ADDirectionalDerivative(contexts), (result,), prepared.preparation.third,
         prepared.backend.outer, point, (tangent,),
-        DifferentiationInterface.Constant(tangent), contexts...)
+        _ad_directional_contexts(prepared.call, prepared.backend.inner, tangent,
+                                 contexts))
     result
 end
 
 function _ad_third_results!(prepared::PreparedADThird, results::Tuple, point,
                             tangents, contexts)
-    length(results) == length(tangents) || throw(DimensionMismatch(
-        "$(length(results)) result destinations for $(length(tangents)) " *
-        "directions"))
+    _ad_check_destinations(results, tangents)
     foreach(results, tangents) do result, tangent
         _ad_third_tangent!(prepared, result, point, tangent, contexts)
     end
@@ -2895,9 +3009,9 @@ function ad_gradient_hvp_and_third(prepared::PreparedADThird, tangents, args...;
     gradient = DifferentiationInterface.gradient(
         prepared.call, prepared.preparation.gradient,
         prepared.backend.outer.outer, point, contexts...)
-    hvps = DifferentiationInterface.hvp(
+    hvps = _ad_hvps(
         prepared.call, prepared.preparation.hvp, prepared.backend.outer,
-        point, directions, contexts...)
+        point, directions, contexts)
     thirds = map(
         tangent -> _ad_third_tangent(prepared, point, tangent, contexts),
         directions)
@@ -2923,9 +3037,9 @@ function ad_gradient_hvp_and_third!(prepared::PreparedADThird, gradient,
     DifferentiationInterface.gradient!(
         prepared.call, gradient, prepared.preparation.gradient,
         prepared.backend.outer.outer, point, contexts...)
-    DifferentiationInterface.hvp!(
+    _ad_hvps!(
         prepared.call, hvps, prepared.preparation.hvp, prepared.backend.outer,
-        point, directions, contexts...)
+        point, directions, contexts)
     _ad_third_results!(prepared, thirds, point, directions, contexts)
     gradient, hvps, thirds
 end
