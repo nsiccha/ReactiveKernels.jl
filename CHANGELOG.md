@@ -16,6 +16,24 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.10
+
+- `prepare_ad_pullback`, `prepare_ad_pushforward`, the one-shot
+  `ad_pullback` and `prepare_ad(...; retain)` accept WANT ports that no
+  active HAVE port reaches: a port computed from bound data alone (which
+  `bound` partial evaluation folds into a constant, such as a gather
+  `loc[rows]` or `view(loc, rows)`), from inactive HAVE values alone, or an
+  inactive HAVE port itself. Their derivative is zero: a pullback adds
+  nothing for them, a pushforward returns a zero tangent, and their values
+  come from the same sweep. When every selected port is such a port, the
+  pullback is zero and the pushforward tangents are zero without a backend
+  call, and a pullback's seed is still checked against the port values'
+  shapes at preparation. On 0.1.9 and earlier such a port raised
+  `EnzymeRuntimeActivityError` under plain Enzyme Reverse or Forward, alone
+  or beside ports that read the point, and a bound view beside them failed
+  with `MethodError: Cannot convert an object of type Vector{Float64} to an
+  object of type SubArray`.
+
 ## 0.1.9
 
 - A generated body that reads a name its module imported under another name

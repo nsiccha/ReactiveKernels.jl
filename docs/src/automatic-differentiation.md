@@ -131,6 +131,24 @@ one tangent per port; forward-mode `AutoEnzyme` differentiates the
 tuple-valued kernel directly. A single WANT keeps its untupled value,
 cotangent and tangents.
 
+### Ports that no active port reaches
+
+A selected WANT port may not depend on any active HAVE port. Examples are a
+gather of bound data that `bound` partial evaluation folds into a constant
+(`loc[rows]` or `view(loc, rows)`), a value computed from inactive HAVE values
+alone, or an inactive HAVE port itself. Its derivative is zero. RK finds such
+ports in the graph and leaves them out of the call the backend
+differentiates. The pullback adds nothing for them, each pushforward
+direction carries a zero tangent for them, and their values come from the
+same sweep. When every selected port is such a port, the pullback is zero and
+the tangents are zero without a backend call. The same holds for a port named
+in `retain` (below). Returning such a port from the differentiated call would
+hand the backend constant memory as a differentiable output. Plain Enzyme
+refuses that, and under runtime activity the pullback would add its seed into
+the constant, the prepared kernel's own bound data. `test_ad_constant_ports.jl`
+covers bound, folded, view and inactive-input ports, alone and beside ports
+that read the point.
+
 ## Retain other WANT values from the gradient sweep
 
 A caller that needs both a gradient and other values of the same point, such
