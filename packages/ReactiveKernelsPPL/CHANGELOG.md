@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.9
+
+- A `@plate` output holding one number per index (`c[i] = sum(lam)`) lowers
+  as a location, a scale or a composition operand also when its cell reads a
+  composed predictor (`f = 0.4 .* mu[main] .+ u[m]`, then
+  `lam = exp.(f[rows[i]])`). On 0.1.8 and earlier lowering refused it with
+  "predictor c applies `_ppl_plate_column` inside a composition".
+
 ## 0.1.8
 
 - A design rebound from a binding without a dotted-cell response that held
