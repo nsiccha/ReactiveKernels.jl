@@ -55,6 +55,57 @@ function _infer_on_small_stack(f, types; stack = 2^18)
     fetch(task)
 end
 
+# The signatures Julia compiles while `f()` runs.
+function _compiled_signatures(f)
+    path = tempname()
+    open(path, "w") do io
+        ccall(:jl_dump_compiles, Cvoid, (Ptr{Cvoid},), io.handle)
+        try
+            f()
+        finally
+            ccall(:jl_dump_compiles, Cvoid, (Ptr{Cvoid},), C_NULL)
+        end
+    end
+    signatures = [String(last(split(line, '\t'; limit = 2))) for line in readlines(path)]
+    rm(path)
+    signatures
+end
+
+# Whether `signature` is specialized on a selection of about `n` ports: a tuple
+# of that many `Value`s, or a signature key of that many `ValueId`s.
+function _port_width_specialized(signature, n)
+    count("ReactiveKernels.Value{", signature) >= n ÷ 2 && return true
+    any(m -> parse(Int, m.captures[1]) >= n ÷ 2,
+        eachmatch(r"NTuple\{(\d+), ReactiveKernels\.ValueId\}", signature))
+end
+
+@testset "preparation compiles once for every port count" begin
+    # Preparing a kernel compiles its own callables for its port types; nothing
+    # else may specialize on the selection of its ports. Before, the keyword
+    # body of `prepare`, the binding's pairs, the preparation cache's closures
+    # and its keys compiled again for every port count: 27 of the 30 s of
+    # preparing a kernel with 655 bound ports.
+    function bound_columns(n)
+        columns = [_wide_column(_wide_column_type(i), 3 + mod(i, 4)) for i in 1:n]
+        NamedTuple{Tuple(Symbol(:x, i) for i in 1:n)}(Tuple(columns))
+    end
+    prepare(_wide_spec(:wide_warmup, 5; typed = true); bound = bound_columns(5))
+    n = 120
+    spec = _wide_spec(:wide_compiles, n; typed = true)
+    bound = bound_columns(n)
+    signatures = _compiled_signatures(() -> prepare(spec; bound))
+    kernel_code(signature) = occursin("ReactiveKernels.PreparedKernel{", signature) ||
+                             occursin("RuntimeGeneratedFunctions", signature)
+    # Base's `all`/`any` over one recipe's input tuple compile per arity, a few
+    # milliseconds each; this kernel's embedded op reads every column.
+    recipe_inputs(signature) = any(f -> startswith(signature, "\"Tuple{typeof(Base.$f), "),
+                                   ("all", "_all", "any", "_any"))
+    @test isempty(filter(s -> !kernel_code(s) && !recipe_inputs(s) &&
+                              _port_width_specialized(s, n), signatures))
+    @test prepare(spec; bound)(0.7) ≈
+          0.7 * (sum(2.0 .* bound.x1) + sum(length, values(bound)[2:end]))
+end
+
 @testset "marker searches over a wide argument list infer in one frame" begin
     n = 600
     T = Tuple{(_wide_column_type(i) for i in 1:n)...}
