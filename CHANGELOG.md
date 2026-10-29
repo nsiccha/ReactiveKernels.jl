@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.9
+
+- A generated body that reads a name its module imported under another name
+  (`import LogExpFunctions: cexpexp as _ppl_cexpexp`) reads that binding. On
+  0.1.8 and earlier it read the owner's binding of the alias name instead:
+  `LogExpFunctions._ppl_cexpexp`, which is undefined, so the first evaluation
+  raised `UndefVarError`, or, where the owner defines a function under the
+  alias name too, that other function.
+
 ## 0.1.8
 
 - Requires OutputSignatures 0.1.6, whose rules describe the comparisons `<`,
