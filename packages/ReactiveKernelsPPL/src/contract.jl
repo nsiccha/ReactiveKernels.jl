@@ -2356,6 +2356,14 @@ function _size_absent_responses!(plan::StructuralPlan, columns::AbstractDict)
             dims = (max(first(dims), maximum(rows; init = 0)), Base.tail(dims)...)
         end
         cells = _absent_cell_shapes(plan, columns, r.response)
+        # With no per-index data to size its cells, a response that held one
+        # array per index in the binding being rebound still does: one cell
+        # per index, each of one entry (shapes are not part of the program,
+        # as for a built graph's in `_absent_typed_as`).
+        if cells === nothing
+            N = _rebound_cell_ndims(plan, r.response)
+            N === nothing || (cells = fill(ntuple(_ -> 1, N), first(dims)))
+        end
         for nm in names
             old = columns[nm]
             # A joint response's outcomes and a Multinomial's counts are
@@ -2374,6 +2382,16 @@ function _size_absent_responses!(plan::StructuralPlan, columns::AbstractDict)
         columns[nm] = _absent_cells(nm, Array{eltype(columns[nm]),length(first(cells))}, cells)
     end
     return columns
+end
+
+# The rank of the arrays a dotted cell's response held per index in the
+# binding being rebound, or `nothing` when it held none there.
+function _rebound_cell_ndims(plan::StructuralPlan, response::Symbol)
+    haskey(plan.cell_broadcasts, response) || return nothing
+    old = get(plan.columns, response, nothing)
+    old isa _AbsentCells && return ndims(eltype(old))
+    _holds_arrays(old) || return nothing
+    return eltype(old) <: AbstractArray ? ndims(eltype(old)) : ndims(first(old))
 end
 
 # A dotted `@plate` cell (`y[i] .~ D.(…)`) whose per-index data hold one

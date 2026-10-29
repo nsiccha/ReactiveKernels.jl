@@ -387,15 +387,15 @@ _ao_shift_cells(t, a) = [a .+ ti for ti in t]
     @test _ao_eval(prepare_query(built, d, :prior), u) ≈
         _ao_eval(prepare_query(built, fit, :prior), u) rtol = 1e-12
     @test _ao_refused(() -> prepare_query(built, d, :likelihood), :y)
-    # Not built yet: without per-index data or a built graph, a binding
-    # cannot tell that the absent response holds one array per index, so a
-    # graph built from it observes one value per index.
-    @test_broken try
-        _ao_eval(prepare_query(build_kernel(d), fit, :prior), u) ≈
-            _ao_eval(prepare_query(built, fit, :prior), u)
-    catch
-        false
-    end
+    # With no per-index data or built graph to say so, the binding it rebinds
+    # says that the absent response holds one array per index, so a graph
+    # built from the design is the fit's program.
+    design_built = build_kernel(d)
+    @test _ao_eval(prepare_query(design_built, fit, :prior), u) ≈
+        _ao_eval(prepare_query(built, fit, :prior), u) rtol = 1e-12
+    @test _ao_eval(prepare_query(design_built, fit, :sampler), u) ≈
+        _ao_eval(prepare_query(built, fit, :sampler), u) rtol = 1e-12
+    @test _ao_eval(_ao_prepare(design_built, d, (:loc,)), u) ≈ [a .+ ti for ti in T] rtol = 1e-12
 end
 
 @testset "absent observations: a conditioned declaration without its value" begin
