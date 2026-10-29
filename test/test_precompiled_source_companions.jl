@@ -127,9 +127,9 @@ using ReactiveKernels, Test
             end
             @test report(findings(prepare(C.FOLDS), argtypes; recurse))
             # A kernel prepared while the image was built holds its body behind
-            # the warm wrapper, whose latest-world branch stays at each call
-            # (one per call, not per cell): ReactiveKernels todo `1t6j4ei`.
-            @test_broken isempty(findings(C.SCALED_PREPARED, argtypes; recurse))
+            # the warm wrapper; once the image is loaded the wrapper's method
+            # query folds, so no latest-world branch stays at the call.
+            @test report(findings(C.SCALED_PREPARED, argtypes; recurse))
             # A rebinding assembles its kernel from the bound template's
             # execution copy of its table, kept once per process (snag
             # per-binding-resi-990b18ab). A template the image kept has none:
