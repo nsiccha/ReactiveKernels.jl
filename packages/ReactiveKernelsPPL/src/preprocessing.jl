@@ -211,6 +211,11 @@ end
 # A proven scalar location keeps its scalar shape too: the observation
 # plate broadcasts it as a shared argument, with no row vector.
 function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
+    # Beside structured axes (a design matrix, a `@scan`, a latent `@plate`)
+    # too, except where a packed `mi` response gathers every plate input by
+    # job index and so needs the rows.
+    _scalar_valued_predictor(plan, pred) &&
+        !any(r -> r.mi_jobs !== nothing, plan.responses) && return true
     _uses_structured_observation_axes(plan) && return false
     _scalar_valued_predictor(plan, pred) && return true
     # An intercept added to a vector expression remains a scalar broadcast.
