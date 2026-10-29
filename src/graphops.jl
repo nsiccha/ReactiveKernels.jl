@@ -73,14 +73,16 @@ PreparationCache() = PreparationCache(Dict{Any,PreparedKernel}(),
 Base.length(c::PreparationCache) = length(c.kernels) + length(c.bound)
 
 # A loop, not a generator over the (heterogeneous) value tuple, which
-# allocated at every element of a rebinding's three signatures.
-function _sig(g::Graph, vs)
-    t = _astuple(vs)
-    ids = Vector{ValueId}(undef, length(t))
-    for i in eachindex(ids)
-        ids[i] = canon_id(g, (t[i]::Value).id)
+# allocated at every element of a rebinding's three signatures; and over
+# `_value_iter`, which compiles once for every selection width. A vector, not a
+# tuple: a cache key holding an `NTuple{N,ValueId}` compiled the cache's `get`
+# and `setindex!` again for every width (8 s at 655 ports).
+Base.@nospecializeinfer function _sig(g::Graph, @nospecialize(vs))
+    ids = ValueId[]
+    for v in _value_iter(vs)
+        push!(ids, canon_id(g, (v::Value).id))
     end
-    Tuple(ids)
+    ids
 end
 _pass_key(pass) = Base.issingletontype(typeof(pass)) ? typeof(pass) : objectid(pass)
 
@@ -105,15 +107,17 @@ specialized and compiled per binding and reuses the plan and prefix only.
 function prepare!(cache::PreparationCache, g::Graph; have = (), want = (),
                   passes = (), bound = (), on_error = nothing, type_stability = nothing,
                   type_stability_level = nothing)
+    # One type for every selection's width before the closures capture them.
+    haves, wants, binding = _value_list(have), _value_list(want), _bound_list(bound)
     _with_type_stability(type_stability, type_stability_level) do
-        bound === () || return _prepare_bound!(cache, g, have, want, passes, bound,
-                                               objectid(g); on_error)
-        key = (objectid(g), g.version, _sig(g, have), _sig(g, want),
+        binding === () || return _prepare_bound!(cache, g, haves, wants, passes, binding,
+                                                 objectid(g); on_error)
+        key = (objectid(g), g.version, _sig(g, haves), _sig(g, wants),
                Tuple(objectid(p) for p in passes), on_error, _type_stability(),
                _type_stability_level())
         lock(cache.lock) do
             get!(cache.kernels, key) do
-                prepare(g; have = have, want = want, passes = passes, on_error = on_error)
+                prepare(g; have = haves, want = wants, passes = passes, on_error = on_error)
             end
         end
     end
@@ -171,10 +175,17 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     key = (:bound, graph_key, g.version, _sig(g, have), _sig(g, want),
            _sig(g, ports), Tuple(_pass_key(p) for p in passes), on_error,
            _type_stability(), _type_stability_level())
-    entry = lock(cache.lock) do
-        get!(cache.bound, key) do
-            _bound_entry(_kernel_error_policy(plan(g; have = have, want = want), on_error), ports)
+    # Locked blocks, not `lock(...) do` closures: a closure's type holds the
+    # types it captures (here the signatures in `key`, and below the hoisted
+    # values), so it compiled once per program and width.
+    entry = @lock cache.lock begin
+        existing = get(cache.bound, key, nothing)
+        if existing === nothing
+            existing = _bound_entry(
+                _kernel_error_policy(plan(g; have = have, want = want), on_error), ports)
+            cache.bound[key] = existing
         end
+        existing
     end
     # The per-binding mathematics runs outside the lock.
     hoisted = _bound_hoisted(entry, data)
@@ -190,13 +201,13 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     template_key = (classes, _bound_index_run_classes(entry.index_run_slots, hoisted),
                     signature)
     fresh = nothing
-    template = lock(cache.lock) do
+    template = @lock cache.lock begin
         current = get(entry.templates, template_key, _UnbuiltTemplate())
-        current isa _UnbuiltTemplate || return current
-        template, kernel = _bound_build(entry, specialized, hoisted, passes)
-        entry.templates[template_key] = template
-        fresh = kernel
-        template
+        if current isa _UnbuiltTemplate
+            current, fresh = _bound_build(entry, specialized, hoisted, passes)
+            entry.templates[template_key] = current
+        end
+        current
     end
     fresh === nothing ? _bound_rebind(entry, template, specialized, hoisted, passes) : fresh
 end
@@ -212,6 +223,17 @@ end
 for graph_key in (Nothing, UInt64)
     precompile(_prepare_bound!, (PreparationCache, Graph, Any, Any, Any, Any, graph_key)) ||
         error("no _prepare_bound! method for a $graph_key graph key")
+end
+# A cache hit compares its key with the stored one. Signatures are vectors, so
+# one key type serves every port count (here without passes).
+for on_error in (Nothing, Symbol)
+    S = Vector{ValueId}
+    for graph_key in (Nothing, UInt64)
+        K = Tuple{Symbol,graph_key,Int,S,S,S,Tuple{},on_error,Symbol,Symbol}
+        precompile(isequal, (K, K)) || error("no isequal method for bound key $K")
+    end
+    K = Tuple{UInt64,Int,S,S,Tuple{},on_error,Symbol,Symbol}
+    precompile(isequal, (K, K)) || error("no isequal method for cache key $K")
 end
 for template in (_BoundTemplate, PreparedKernel, Nothing)
     precompile(_bound_rebind, (_BoundEntry, template, Any, Any, Any)) ||

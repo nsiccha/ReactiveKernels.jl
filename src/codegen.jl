@@ -7645,11 +7645,13 @@ end
 function prepare(g::Graph; have = (), want = (), passes = (), bound = (),
                  on_error = nothing, exemplars = nothing, type_stability = nothing,
                  type_stability_level = nothing)
+    # One type for every selection's width before the closure captures them.
+    haves, wants, binding = _value_list(have), _value_list(want), _bound_list(bound)
     _with_type_stability(type_stability, type_stability_level) do
-        exemplars === nothing && _reuses_bound_preparation(bound, passes) &&
-            return _graph_bound_preparation(g, have, want, passes, bound, on_error)
-        p = plan(g; have = have, want = want)
-        prepare(p; passes = passes, bound = bound, on_error = on_error, exemplars)
+        exemplars === nothing && _reuses_bound_preparation(binding, passes) &&
+            return _graph_bound_preparation(g, haves, wants, passes, binding, on_error)
+        p = plan(g; have = haves, want = wants)
+        prepare(p; passes = passes, bound = binding, on_error = on_error, exemplars)
     end
 end
 

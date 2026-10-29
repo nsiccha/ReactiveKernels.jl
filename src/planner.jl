@@ -352,13 +352,13 @@ function plan(g::Graph; have = (), want = ())
     # collapsing repeated and structural-CSE-aliased identities to one input.
     haves = Value[]
     seen_have = Set{ValueId}()
-    for v in _astuple(have)
+    for v in _value_iter(have)
         cid = canon_id(g, v.id)
         cid in seen_have && continue
         push!(seen_have, cid)
         push!(haves, g.values[cid])
     end
-    wants = collect(Value, _astuple(want))
+    wants = _value_vector(want)
     have_ids = Set(canon_id(g, v.id) for v in haves)
     want_ids = [canon_id(g, v.id) for v in wants]
 
