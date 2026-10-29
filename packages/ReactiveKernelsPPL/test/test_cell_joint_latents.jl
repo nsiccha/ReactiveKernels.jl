@@ -116,6 +116,34 @@ ReactiveKernelsPPL.sampling_geometry(::Type{ShiftedBlock}, args, shape) =
         unconstrain = (x, shape, m, lower; rate = 1.0) -> vec(log.(rate .* (x .- lower))),
         logjac = (u, shape, m, lower; rate = 1.0) -> sum(u; init = 0.0) - length(u) * log(rate))
 
+# Laws constructed with their family as a type parameter, `Law{LogNormal}(…)`:
+# one vector of values per index (identity coordinates, the law reads their
+# exponentials), and a positive scalar.
+struct Law{F,L,S}
+    loc::L
+    scale::S
+end
+(::Type{Law{F}})(loc, scale) where {F} = Law{F,typeof(loc),typeof(scale)}(loc, scale)
+@inline ReactiveKernelsPPL.sampling_logdensity(d::Law{F}, c) where {F} =
+    sum(Distributions.logpdf.(F.(d.loc, d.scale), exp.(c)); init = 0.0)
+ReactiveKernelsPPL.sampling_geometry(::Type{<:Law}, args, shape) =
+    ParameterGeometry((:(length($(args[1]))),), :(length($(args[1]))); support = :real,
+        constrain = (u, shape, args...) -> collect(u),
+        unconstrain = (c, shape, args...) -> collect(c),
+        logjac = (u, shape, args...) -> 0.0)
+struct PosLaw{F,L,S}
+    loc::L
+    scale::S
+end
+(::Type{PosLaw{F}})(loc, scale) where {F} = PosLaw{F,typeof(loc),typeof(scale)}(loc, scale)
+ReactiveKernelsPPL.sampling_logdensity(d::PosLaw{F}, x) where {F} =
+    Distributions.logpdf(F(d.loc, d.scale), x)
+ReactiveKernelsPPL.sampling_geometry(::Type{<:PosLaw}, args, shape) =
+    ParameterGeometry(shape, 1; support = :positive,
+        constrain = (u, shape, args...) -> exp(u[1]),
+        unconstrain = (x, shape, args...) -> [log(x)],
+        logjac = (u, shape, args...) -> u[1])
+
 # A geometry whose shape reads a sampled value: not data, refused.
 struct LiveShape{N}
     n::N
@@ -431,4 +459,56 @@ end
         end
     end
     @test_broken (lower_rkppl(levels_ast, (; g = [1, 2], x = [0.1, 0.2])); true)
+end
+
+# A sampling RHS whose head is a parametric constructor, `C{P...}(…)`, is
+# Julia's constructor call: in a joint cell latent and at model level.
+@testset "a sampling RHS with a parametric constructor head" begin
+    d = (; mu = [[10.0, 20.0, 5.0], [7.0, 3.0]], obs = [[1, 2], [1]],
+        y = [[2.3, 3.0], [1.9]], total = [35.0, 10.0])
+    cells = quote
+        sigma ~ Exponential(1.0)
+        @plate for i in eachindex(total)
+            T[i] ~ _CJLFixtures.Law{LogNormal}(log.(mu[i]), 0.5)
+            y[i] .~ Normal.(T[i][obs[i]], sigma)
+        end
+    end
+    function cells_oracle(u)
+        sigma = exp(u[1])
+        T = _cjl_blocks(u[2:end], length.(d.mu))
+        logpdf(Exponential(1.0), sigma) + u[1] + sum(
+            sum(logpdf.(LogNormal.(log.(d.mu[i]), 0.5), exp.(T[i]))) +
+            sum(logpdf.(Normal.(T[i][d.obs[i]], sigma), d.y[i])) for i in eachindex(d.mu))
+    end
+    for source in (d, keys(d))
+        bound = bind_data(lower_rkppl(cells, source; conditioned = (:y,),
+            mod = @__MODULE__), d)
+        built = build_kernel(bound)
+        @test coordinate_names(built.layout) == [:sigma, Symbol("T.1.1"),
+            Symbol("T.1.2"), Symbol("T.1.3"), Symbol("T.2.1"), Symbol("T.2.2")]
+        for u in ([0.1, 2.2, 3.0, 1.6, 1.9, 1.1], [-0.3, 2.4, 2.9, 1.5, 2.0, 1.0])
+            @test constrain(built.layout, u).T == _cjl_blocks(u[2:end], length.(d.mu))
+            _cjl_check(built, bound, u, cells_oracle)
+        end
+    end
+    scalar = quote
+        b ~ _CJLFixtures.PosLaw{LogNormal}(log(m), 0.5)
+        z .~ Normal.(b, 1.0)
+    end
+    s = (; m = 2.0, z = [0.5, 1.2])
+    bound = bind_data(lower_rkppl(scalar, s; conditioned = (:z,), mod = @__MODULE__), s)
+    built = build_kernel(bound)
+    _cjl_check(built, bound, [0.3], u -> logpdf(LogNormal(log(2.0), 0.5), exp(u[1])) +
+        u[1] + sum(logpdf.(Normal.(exp(u[1]), 1.0), s.z)))
+    # refused: the constructor's base or a type parameter names no binding of
+    # the model module, or a type parameter is a model value
+    for (rhs, message) in ((:(_CJLFixtures.Nope{LogNormal}(log(m), 0.5)), "Nope"),
+            (:(_CJLFixtures.PosLaw{NoSuchFamily}(log(m), 0.5)), "NoSuchFamily"),
+            (:(_CJLFixtures.PosLaw{m}(log(m), 0.5)), "type parameter `m` is a model value"))
+        ast = quote
+            b ~ $rhs
+            z .~ Normal.(b, 1.0)
+        end
+        @test_throws message lower_rkppl(ast, s; conditioned = (:z,), mod = @__MODULE__)
+    end
 end

@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.9
+
+- A sampling right-hand side whose head is a parametric constructor,
+  `T[i] ~ Law{LogNormal}(loc, s)` or `b ~ Law{LogNormal}(…)`, lowers as
+  Julia's constructor call, in a joint `@plate` cell latent and at model
+  level: its `sampling_geometry` receives the constructor `Law{LogNormal}`.
+  On 0.1.8 and earlier lowering refused it with `external RHS … needs a
+  module-visible constructor`. The constructor's base and type parameters
+  resolve in the model module; one that names no binding there, or a model
+  value, is refused, naming it.
+
 ## 0.1.8
 
 - A design rebound from a binding without a dotted-cell response that held
