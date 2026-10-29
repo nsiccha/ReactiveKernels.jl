@@ -6034,11 +6034,21 @@ struct _PrecompileWarmFunction{F} <: Function
     f::F
 end
 
+# Whether the generated method of the generated function `f` is visible in the
+# caller's world: `Core._hasmethod` on the complete signature, a constant
+# inference folds (as for `_KernelSourceFunction`, `src/core.jl`). It is not
+# while the first compiling call of an image defines that method, and it is
+# once the image is loaded, so a loaded image's kernel calls carry no run-time
+# image check or latest-world branch.
+@generated function _warm_visible(f::F, args::Vararg{Any,N}) where {F,N}
+    signature = Expr(:curly, GlobalRef(Core, :Tuple),
+        :(typeof(RuntimeGeneratedFunctions.generated_callfunc)), F, args...)
+    Expr(:block, Expr(:meta, :inline), :(Core._hasmethod($signature)))
+end
+
 @inline function (f::_PrecompileWarmFunction)(args...)
-    # During ordinary execution the image's context method is already loaded.
-    # Keep latest-world dispatch confined to execution while building an image.
-    ccall(:jl_generating_output, Cint, ()) == 0 ? f.f(args...) :
-        _precompile_warm_call(f.f, args...)
+    # Latest-world dispatch only where the context method is not visible yet.
+    _warm_visible(f.f, args...) ? f.f(args...) : _precompile_warm_call(f.f, args...)
 end
 
 @inline function _precompile_warm_call(f, args...)
@@ -6462,11 +6472,12 @@ function _native_body_call_expr(::Type{F}, f, args) where {F}
         return :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
             $f, $(args...)))
     elseif F <: _PrecompileWarmFunction
-        # Preserve latest-world execution while building a consumer image;
-        # after loading it, enter the wrapped generated body directly.
+        # Enter the wrapped generated body directly wherever its context
+        # method is visible (`_warm_visible`, folded by inference), and
+        # cross to the latest world only where it is not yet.
         direct = :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
             getfield($f, :f), $(args...)))
-        return :(ccall(:jl_generating_output, Cint, ()) == 0 ?
+        return :($(GlobalRef(@__MODULE__, :_warm_visible))(getfield($f, :f), $(args...)) ?
                  $direct : $f($(args...)))
     end
     :($f($(args...)))
