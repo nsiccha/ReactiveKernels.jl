@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.14
+
+- A compact cell sampler (`prepare_compact_cell_sampler`) reads a selected
+  packed coordinate in constant time, through a map from packed position to
+  selection slot that the sampler keeps. It was a binary search over the
+  selection on every read. The selection is checked once when it changes,
+  where every call checked it, so a run of `cell_value_and_gradient!` calls
+  over one selection pays one comparison each. Values and gradients are
+  unchanged. On BRM's regional panel at 34,626 packed coordinates with a
+  2,892-coordinate selection, a 27-row cell's gradient takes ~38 µs instead
+  of ~78 µs, a one-row cell's ~2.9 µs instead of ~4.1 µs, and one subject's
+  2,795 cell gradients ~14 ms instead of ~21 ms. The sampler holds one
+  `Int32` per packed coordinate.
+
 ## 0.1.13
 
 - A proven scalar location stays a scalar beside a design matrix, a `@scan`

@@ -702,36 +702,55 @@ _cell_gradient!(s, g, args::Vararg{Any,N}) where {N} =
     first(ad_value_and_gradient!(s.ad, g, args...))
 
 # A packed point whose selected coordinates come from a compact active vector.
-# The packed base and coordinate selection cross the AD boundary as constants;
-# the graph still contains every model calculation after this selection.
-struct _CompactCellPoint{B<:AbstractVector{Float64},A<:AbstractVector{Float64},I<:AbstractVector{Int}} <: AbstractVector{Float64}
+# `slots[j]` is packed coordinate `j`'s position in `active`, or 0 when `j`
+# reads `base`. The packed base and the slot map cross the AD boundary as
+# constants; the graph still contains every model calculation after this
+# selection. A read is one slot load and a branch, where a binary search over
+# the selection cost O(log selection) per read (snag
+# `compact-cell-cal-58569833`). Native Reverse multiplied that search's cost
+# inside gathers far beyond its primal cost; that is Enzyme snag
+# `reverse-over-a-g-a9ee15bb`.
+struct _CompactCellPoint{B<:AbstractVector{Float64},A<:AbstractVector{Float64},S<:AbstractVector{Int32}} <: AbstractVector{Float64}
     base::B
     active::A
-    indices::I
+    slots::S
 end
 
 Base.size(point::_CompactCellPoint) = size(point.base)
 Base.IndexStyle(::Type{<:_CompactCellPoint}) = IndexLinear()
 @inline function Base.getindex(point::_CompactCellPoint, index::Int)
     @boundscheck checkbounds(point.base, index)
-    slot = searchsortedfirst(point.indices, index)
-    slot <= length(point.indices) && @inbounds(point.indices[slot] == index) ?
-        @inbounds(point.active[slot]) : @inbounds(point.base[index])
+    slot = @inbounds point.slots[index]
+    iszero(slot) ? @inbounds(point.base[index]) : @inbounds(point.active[slot])
 end
 
-@inline _compact_cell_point(base, active, indices) =
-    _CompactCellPoint(base, active, indices)
+@inline _compact_cell_point(base, active, slots) =
+    _CompactCellPoint(base, active, slots)
+
+# The slot map of a selection over `total` packed coordinates.
+function _compact_cell_slots(total::Int, indices)
+    slots = zeros(Int32, total)
+    for (slot, index) in enumerate(indices)
+        slots[index] = slot
+    end
+    slots
+end
 
 # A parameter block read from the overlay is not strided, so a product of it
 # would take LinearAlgebra's generic `mul!`; RK's native product computes it
 # with a typed loop instead (`_native_mul`).
 ReactiveKernels._native_mul_operand(::_CompactCellPoint) = true
 
-function _check_compact_cell_indices(base, active, indices, total)
+function _check_compact_cell_lengths(base, active, indices, total)
     length(base) == total || throw(ContractValidationError(
         "[query] packed base length $(length(base)) ≠ layout total $total"))
     length(active) == length(indices) || throw(ContractValidationError(
         "[query] active length $(length(active)) ≠ selection length $(length(indices))"))
+    nothing
+end
+
+function _check_compact_cell_indices(base, active, indices, total)
+    _check_compact_cell_lengths(base, active, indices, total)
     previous = 0
     for index in indices
         previous < index <= total || throw(ContractValidationError(
@@ -746,16 +765,51 @@ end
 
 A prepared cell gradient over selected packed coordinates. The packed base point
 is read-only, and the derivative is returned only in the order of `indices`.
-Prepare one sampler per concurrent caller.
+The sampler keeps the current selection as a map over every packed coordinate,
+rewritten when a call selects different positions. Prepare one sampler per
+concurrent caller.
 """
 mutable struct CompactCellSampler{P,L,O}
     const ad::P
     const layout::L
     const observations::O
+    # The selection `slots` maps (`_compact_cell_slots`), compared with each
+    # call's `indices`.
+    const selected::Vector{Int}
+    const slots::Vector{Int32}
     value::Float64
 end
-CompactCellSampler(ad, layout, observations) =
-    CompactCellSampler(ad, layout, observations, NaN)
+CompactCellSampler(ad, layout, observations, selected, slots) =
+    CompactCellSampler(ad, layout, observations, selected, slots, NaN)
+
+# Point the slot map at `indices`. Validating and rewriting cost O(selection),
+# so they run only when the selection differs from the previous call's; a run
+# of calls over one selection pays one comparison each.
+function _select_compact_cells!(sampler::CompactCellSampler, base, active, indices)
+    _check_compact_cell_lengths(base, active, indices, sampler.layout.total)
+    selected = sampler.selected
+    _same_selection(selected, indices) && return nothing
+    _check_compact_cell_indices(base, active, indices, sampler.layout.total)
+    slots = sampler.slots
+    for index in selected
+        slots[index] = 0
+    end
+    copyto!(resize!(selected, length(indices)), indices)
+    for (slot, index) in enumerate(selected)
+        slots[index] = slot
+    end
+    nothing
+end
+
+function _same_selection(selected::Vector{Int}, indices::Vector{Int})
+    length(selected) == length(indices) || return false
+    different = false
+    @inbounds @simd for k in eachindex(selected, indices)
+        different |= selected[k] != indices[k]
+    end
+    !different
+end
+_same_selection(selected::Vector{Int}, indices) = selected == indices
 
 """
     prepare_compact_cell_sampler(built, plan, observations, base0, indices0; backend)
@@ -767,7 +821,8 @@ base is passed read-only; selected coordinates are supplied separately. This
 keeps the active AD point and gradient proportional to the selected cell's
 coordinates rather than the full layout. With native `AutoEnzyme` Reverse, use
 `Enzyme.set_runtime_activity(Enzyme.Reverse)`: packed reads can select either an
-active coordinate or a constant base coordinate.
+active coordinate or a constant base coordinate. The sampler holds one `Int32`
+per packed coordinate, mapping each to its position in the selection.
 """
 function prepare_compact_cell_sampler(built, plan::StructuralPlan, observations,
         base0::AbstractVector{Float64}, indices0::AbstractVector{Int};
@@ -775,6 +830,8 @@ function prepare_compact_cell_sampler(built, plan::StructuralPlan, observations,
     layout = built.layout::LayoutTable
     _check_compact_cell_indices(base0, indices0, indices0, layout.total)
     active0 = base0[indices0]
+    selected = Vector{Int}(indices0)
+    slots = _compact_cell_slots(layout.total, selected)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_compact_cell_sampler requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
@@ -785,24 +842,24 @@ function prepare_compact_cell_sampler(built, plan::StructuralPlan, observations,
     spec, want = _cell_query_spec(built, plan, names)
     for (name, type) in ((:_ppl_cell_base, AbstractVector{Float64}),
             (:_ppl_cell_active, AbstractVector{Float64}),
-            (:_ppl_cell_indices, AbstractVector{Int}))
+            (:_ppl_cell_slots, AbstractVector{Int32}))
         haskey(spec.ports, name) && throw(ContractValidationError(
             "[query] compact cell port `$name` collides with a model port"))
         spec.ports[name] = value!(spec.graph, name, type)
         push!(spec.port_order, name)
     end
     add!(spec.graph, (spec[:_ppl_cell_base], spec[:_ppl_cell_active],
-        spec[:_ppl_cell_indices]) => spec[:unconstrained], _compact_cell_point)
+        spec[:_ppl_cell_slots]) => spec[:unconstrained], _compact_cell_point)
     filter!(!=(:unconstrained), spec.have_names)
-    prepend!(spec.have_names, [:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_indices])
+    prepend!(spec.have_names, [:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots])
     filter!(n -> n ∉ _absent_inputs(plan), spec.have_names)
     have = (spec.have_names..., _frozen_graph_names(plan)...)
     kernel = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
     end
-    ad = Base.invokelatest(prepare_ad, kernel, backend, base0, active0, indices0, 1;
+    ad = Base.invokelatest(prepare_ad, kernel, backend, base0, active0, slots, 1;
         active = :_ppl_cell_active)
-    CompactCellSampler(ad, layout, names)
+    CompactCellSampler(ad, layout, names, selected, slots)
 end
 
 """
@@ -810,16 +867,17 @@ end
 
 Return one cell's density and write only the selected-coordinate gradient.
 `base` and `indices` are not mutated. The active values overlay `base` at the
-sorted positions in `indices`.
+sorted positions in `indices`. Consecutive calls with equal `indices` check the
+selection once.
 """
 function cell_value_and_gradient!(sampler::CompactCellSampler, gradient::AbstractVector,
         base::AbstractVector{Float64}, active::AbstractVector{Float64},
         indices::AbstractVector{Int}, cell::Int)
-    _check_compact_cell_indices(base, active, indices, sampler.layout.total)
     length(gradient) == length(active) || throw(ContractValidationError(
         "[query] compact gradient length $(length(gradient)) ≠ active length $(length(active))"))
-    return _latest_value(_cell_gradient!, sampler, gradient, base, active, indices, cell),
-        gradient
+    _select_compact_cells!(sampler, base, active, indices)
+    return _latest_value(_cell_gradient!, sampler, gradient, base, active,
+        sampler.slots, cell), gradient
 end
 
 function _stack_restored_draws(values)
