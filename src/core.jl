@@ -804,20 +804,26 @@ end
 @inline _native_mul_strided(::LinearAlgebra.AdjOrTrans{<:Any,<:StridedVecOrMat}) = true
 @inline _native_mul_strided(_) = false
 
-@inline _native_mul(args...) = *(args...)
-@inline function _native_mul(A::AbstractMatrix{TA},
-                             B::AbstractVecOrMat{TB}) where {TA<:Real,TB<:Real}
-    isbitstype(TA) && isbitstype(TB) || return A * B
-    A isa LinearAlgebra.AdjOrTransAbsVec && return A * B
-    B isa LinearAlgebra.AdjOrTransAbsVec && return A * B
-    _native_mul_operand(A) && _native_mul_operand(B) || return A * B
-    _native_mul_strided(A) && _native_mul_strided(B) && return A * B
-    Base.has_offset_axes(A, B) && return A * B
-    size(A, 2) == size(B, 1) || return A * B
-    T = Base.promote_op(LinearAlgebra.matprod, TA, TB)
-    isbitstype(T) || return A * B
+# Whether `_native_mul` computes `A * B` with its own loop (the operands
+# above), rather than leaving it to Base. The non-allocating program's product
+# step (`_MatMulStep`) asks the same question for its cached destination.
+@inline _native_mul_loops(A, B) = false
+@inline function _native_mul_loops(A::AbstractMatrix{TA},
+                                   B::AbstractVecOrMat{TB}) where {TA<:Real,TB<:Real}
+    isbitstype(TA) && isbitstype(TB) || return false
+    A isa LinearAlgebra.AdjOrTransAbsVec && return false
+    B isa LinearAlgebra.AdjOrTransAbsVec && return false
+    _native_mul_operand(A) && _native_mul_operand(B) || return false
+    _native_mul_strided(A) && _native_mul_strided(B) && return false
+    Base.has_offset_axes(A, B) && return false
+    size(A, 2) == size(B, 1) || return false
+    isbitstype(Base.promote_op(LinearAlgebra.matprod, TA, TB))
+end
+
+# Adds `A * B` into `C` in the generic method's order over the shared
+# dimension, each product added in turn; `C` holds zeros on entry.
+@inline function _native_mul_accumulate!(C, A, B)
     m, n = size(A)
-    C = B isa AbstractVector ? zeros(T, m) : zeros(T, m, size(B, 2))
     @inbounds for j in 1:size(B, 2), k in 1:n
         b = B[k, j]
         for i in 1:m
@@ -825,6 +831,16 @@ end
         end
     end
     C
+end
+
+@inline _native_mul(args...) = *(args...)
+@inline function _native_mul(A::AbstractMatrix{TA},
+                             B::AbstractVecOrMat{TB}) where {TA<:Real,TB<:Real}
+    _native_mul_loops(A, B) || return A * B
+    T = Base.promote_op(LinearAlgebra.matprod, TA, TB)
+    m = size(A, 1)
+    C = B isa AbstractVector ? zeros(T, m) : zeros(T, m, size(B, 2))
+    _native_mul_accumulate!(C, A, B)
 end
 
 # Nested dotted calls stay lazy so Julia's broadcast fusion survives the

@@ -62,7 +62,9 @@ the result shape), so a batch-size change between calls would hand `mul!` a
 stale destination; this step owns the shape/eltype guard and reseeds instead.
 """
 struct _MatMulStep end
-@inline (::_MatMulStep)(A, B) = A * B
+# The product the native body computes (`_native_mul`): Base's, or its own loop
+# for an operand BLAS cannot take.
+@inline (::_MatMulStep)(A, B) = _native_mul(A, B)
 
 "Array constructor with a known fill value (`zeros`/`ones`)."
 struct _FillConstructorStep{F}

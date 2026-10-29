@@ -207,6 +207,31 @@ end
         end
     end
 
+    @testset "a product with a non-strided operand runs the native loop into its cache" begin
+        # A view through an index vector is not strided, so BLAS cannot take
+        # it: the native body sums it with its own loop (`_native_mul`). The
+        # product step did so too only on a shape mismatch; with its cache it
+        # ran the generic `mul!`, which allocates two tile buffers per call on
+        # Julia 1.10 (snag `compact-cell-gra-ebf0a114`).
+        spec = @kernel nonstrided_product(Z::Matrix{Float64}, rows::Vector{Int},
+                                          L::Matrix{Float64}) = begin
+            V = view(Z, rows, :)
+            P = V * transpose(L)
+            total::Float64 = sum(P)
+        end
+        ordinary = prepare(spec; have = (:Z, :rows, :L), want = :total)
+        k = prepare_nonallocating(spec; have = (:Z, :rows, :L), want = :total)
+        Z, rows, L = rand(40, 3), [2, 7, 7, 31], rand(3, 3)
+        @test any(op -> op isa ReactiveKernels._MatMulStep, called_ops(k))
+        @test k(Z, rows, L) === ordinary(Z, rows, L)
+        k(Z, rows, L)
+        bytes = @allocated k(Z, rows, L)
+        println("NONALLOCATING_ALLOC_BYTES\tnonstrided_product\t", bytes)
+        @test bytes <= 512
+        # A changed row count recomputes through the step itself.
+        @test k(Z, [5, 9], L) === ordinary(Z, [5, 9], L)
+    end
+
     @testset "dotted-call f.(x) spelling decomposes like operator-dot" begin
         # `f.(x)` parses as `Expr(:.)`, not a dotted-callee `:call`: without
         # dotcall coverage it silently kept the whole-recipe fallback and

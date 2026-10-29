@@ -188,15 +188,21 @@ const _LA = ReactiveKernels.LinearAlgebra
 
 # Guarded matrix product: `mul!` follows the pre-sized destination convention,
 # so reuse the cache only when it already has the exact result shape and
-# eltype; any mismatch (e.g. a batch-size change) recomputes and reseeds.
+# eltype; any mismatch (e.g. a batch-size change) recomputes and reseeds. An
+# operand BLAS cannot take (a view of RKPPL's compact-cell overlay) is summed
+# into the cache by the native body's own loop, with the same values: the
+# generic `mul!` allocates two tile buffers per call on Julia 1.10 and reaches
+# its kernel dynamically under native Reverse (snag `compact-cell-gra-ebf0a114`).
 @inline function MutatingFunctions.apply!!(
         cache::AbstractVecOrMat, op::ReactiveKernels._MatMulStep,
         A::AbstractVecOrMat, B::AbstractVecOrMat)
     T = Base.promote_op(_LA.matprod, eltype(A), eltype(B))
     if eltype(cache) === T && _matmul_destination_matches(cache, A, B)
+        ReactiveKernels._native_mul_loops(A, B) &&
+            return ReactiveKernels._native_mul_accumulate!(fill!(cache, zero(T)), A, B)
         return _LA.mul!(cache, A, B)
     end
-    A * B
+    op(A, B)
 end
 
 @inline function _vcat_destination_matches(cache::Array{T,N}, args) where {T,N}
