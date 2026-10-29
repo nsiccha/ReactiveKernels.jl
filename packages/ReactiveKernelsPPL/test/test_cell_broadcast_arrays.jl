@@ -449,3 +449,48 @@ end
         end
     end
 end
+
+# The loop's range indexes the cells. A response with fewer entries in all
+# than there are cells (some cells empty) binds when the loop iterates
+# another array's indices, and every entry a cell observes is validated,
+# however many there are.
+@testset "dotted plate cells over arrays: fewer entries than cells" begin
+    ast = quote
+        a ~ Normal(0, 1)
+        @plate for i in eachindex(total)
+            y[i] .~ Normal.(x[i] .+ a, 1)
+            total[i] ~ Normal(sum(x[i]) + a, 1)
+        end
+    end
+    oracle(u, d) = logpdf(Normal(), u[1]) +
+        sum(sum(logpdf.(Normal.(d.x[i] .+ u[1], 1), d.y[i]); init = 0.0) +
+            logpdf(Normal(sum(d.x[i]) + u[1], 1), d.total[i]) for i in eachindex(d.total))
+    for d in ((; x = [[1.0], Float64[], [2.0]], y = [[1.1], Float64[], [2.1]],
+                total = [1.0, 0.0, 2.0]),
+            (; x = [Float64[], Float64[], [0.5]], y = [Float64[], Float64[], [0.4]],
+                total = [0.1, -0.2, 0.6]),
+            (; x = [[1.0, 2.0], [3.0], [4.0]], y = [[1.1, 2.2], [3.1], [4.2]],
+                total = [3.0, 3.0, 4.0])), source in (d, keys(d))
+        bound = bind_data(lower_rkppl(ast, source; conditioned = (:y, :total)), d)
+        built = build_kernel(bound)
+        sampler = prepare_sampler(built, bound, [0.3];
+            backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        for u in ([0.3], [-0.6])
+            value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+            @test value ≈ oracle(u, d) rtol = 1e-12
+            @test gradient ≈ _cba_fd(v -> oracle(v, d), u) rtol = 1e-6 atol = 1e-8
+        end
+    end
+    counts = @rkppl begin
+        a ~ Normal(0, 1)
+        @plate for i in eachindex(total)
+            c[i] .~ Poisson.(exp.(a .+ x[i]))
+            total[i] ~ Normal(sum(x[i]) + a, 1)
+        end
+    end
+    # refused: a Poisson observation is a non-negative integer, including the
+    # last entry of the last cell
+    @test_throws "Poisson response must be non-negative integers" counts(;
+        x = [[0.1, 0.2], [0.3], [0.4, 0.5]]) | (; c = [[1, 2], [0], [3, -1]],
+        total = [0.3, 0.3, 0.9])
+end

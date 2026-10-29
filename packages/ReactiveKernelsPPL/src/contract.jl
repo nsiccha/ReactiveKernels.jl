@@ -6286,7 +6286,13 @@ function _validate_response_data(plan::StructuralPlan)
         grouped = _cell_broadcast_response(plan, r)
         checked = grouped && _group_thresholds(plan, r) ?
             _with(r; thresholds = ThresholdRows(r.thresholds)) : r
-        _validate_response_data(checked, grouped ? _cell_broadcast_entries(plan, r) : plan)
+        grouped || (_validate_response_data(checked, plan); continue)
+        # The loop range indexes the cells, which hold the arrays; it covers
+        # them all (a partial observation is refused), so every entry the
+        # cells observe is checked, however many entries a cell holds.
+        r.range isa Expr && _selected_response_column(plan, r)
+        _validate_response_data(_with(checked; range = nothing),
+            _cell_broadcast_entries(plan, r))
     end
     return nothing
 end

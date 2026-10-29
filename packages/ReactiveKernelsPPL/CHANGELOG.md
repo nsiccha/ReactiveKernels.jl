@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.7
+
+- A dotted `@plate` cell observing one array per index (`y[i] .~ D.(…)`)
+  binds when its loop iterates another array's indices
+  (`@plate for i in eachindex(total)`) and some cells are empty, so that the
+  response holds fewer entries in all than there are cells. On 0.1.6 and
+  earlier binding refused it with `response slice … indexes outside`: the
+  loop range was checked against the flattened entries, not the cells.
+  Binding now validates every entry the cells observe. Before, it read only
+  as many flattened entries as there are cells, so an invalid entry past them
+  (a negative Poisson count in the last cell) was not refused.
+
 ## 0.1.6
 
 - An index written as integer arithmetic of literals is the position it
