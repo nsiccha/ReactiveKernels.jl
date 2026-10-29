@@ -111,7 +111,7 @@ _tangent_unit(n, i) = (e = zeros(n); e[i] = 1.0; e)
         # DifferentiationInterface's own composition.
         rof = prepare_ad_hvp(tangent_density, second_order, (v,), q, s;
                              data, active = :q, want = :density)
-        @test rof.preparation isa NamedTuple{(:hvp, :gradient)}
+        @test rof.preparation isa ReactiveKernels._ADReverseOverForwardHVP
         for prepared in (rof, prepare_ad_hvp(tangent_density, forward_over_reverse,
                 (v,), q, s; data, active = :q, want = :density))
             gradient, (hv,) = ad_gradient_and_hvp(prepared, (v,), q, s; data)
@@ -120,7 +120,35 @@ _tangent_unit(n, i) = (e = zeros(n); e[i] = 1.0; e)
         end
         fwd = prepare_ad_hvp(tangent_density, forward_over_reverse, (v,), q, s;
                              data, active = :q, want = :density)
-        @test !(fwd.preparation isa NamedTuple)
+        @test !(fwd.preparation isa ReactiveKernels._ADReverseOverForwardHVP)
+    end
+
+    @testset "reverse-over-forward preparations hold memory linear in n" begin
+        # DifferentiationInterface's reverse-over-forward preparation also
+        # prepares a forward-mode gradient for `gradient_and_hvp`, whose
+        # Enzyme preparation holds n one-hot basis vectors of length n: 8n²
+        # bytes, 187 GiB at n = 158,343 (snag prepare-ad-hvp-r-e5eb074c). RK
+        # prepares reverse over forward without it, for third-order
+        # derivatives too, which prepare two Hessian-vector products.
+        third_backend = SecondOrder(second_order, forward)
+        for n in (64, 512)
+            qn = collect(range(-0.5, 0.5; length = n))
+            datan, vn = cos.(1:n), sin.(1:n)
+            hvp_prepared = prepare_ad_hvp(
+                tangent_density, second_order, (vn,), qn, s;
+                data = datan, active = :q, want = :density)
+            third_prepared = prepare_ad_third(
+                tangent_density, third_backend, (vn,), qn, s;
+                data = datan, active = :q, want = :density)
+            @test Base.summarysize(hvp_prepared.preparation) ≤ 64n
+            @test Base.summarysize(third_prepared.preparation) ≤ 64n
+            gradient, (hv,) = ad_gradient_and_hvp(hvp_prepared, (vn,), qn, s;
+                                                  data = datan)
+            @test gradient ≈ datan .* s .* exp.(s .* qn) .- qn
+            @test hv ≈ _tangent_hessian(qn, s, datan) * vn
+            @test only(ad_third(third_prepared, (vn,), qn, s; data = datan)) ≈
+                  _tangent_third(qn, s, datan, vn)
+        end
     end
 
     @testset "batched directions and bound preparations" begin
@@ -507,22 +535,39 @@ _tangent_unit(n, i) = (e = zeros(n); e[i] = 1.0; e)
             data, active = :q, want = :mean)
     end
 
-    # DifferentiationInterface 0.7.21 cannot take a Hessian-vector product at
-    # the structured (Vector, Ref) point a tuple selector differentiates:
-    # forward over reverse calls `similar(x)` and reverse over forward
-    # `pick_batchsize`, neither defined for a tuple. The shape is valid; it
-    # waits on DI accepting tuple points.
-    @testset "tuple-selector Hessian-vector products (DI tuple points)" begin
-        for backend in (second_order, forward_over_reverse)
-            @test_broken try
-                prepared = prepare_ad_hvp(
-                    tangent_density, backend, ((v, 1.0),), q, s;
-                    data, active = (:q, :s), want = :density)
-                ad_hvp(prepared, ((v, 1.0),), q, s; data) isa Tuple
-            catch error
-                error isa MethodError || rethrow()
-                false
-            end
+    # A tuple selector differentiates the structured (Vector, Ref) point.
+    # Reverse over forward takes RK's preparation, whose gradients accept it;
+    # DifferentiationInterface's own reverse over forward failed in
+    # `pick_batchsize` of the forward-mode gradient it also prepares.
+    @testset "tuple-selector Hessian-vector products" begin
+        prepared = prepare_ad_hvp(tangent_density, second_order, ((v, 1.0),),
+                                  q, s; data, active = (:q, :s),
+                                  want = :density)
+        e = exp.(s .* q)
+        cross = data .* e .* (1 .+ s .* q)
+        expected = ((data .* s^2 .* e .- 1) .* v .+ cross,
+                    dot(cross, v) + sum(data .* q .^ 2 .* e) - 2)
+        (hv,) = ad_hvp(prepared, ((v, 1.0),), q, s; data)
+        @test hv[1] ≈ expected[1]
+        @test hv[2] ≈ expected[2]
+        gradient, (hv,) = ad_gradient_and_hvp(prepared, ((v, 1.0),), q, s; data)
+        @test gradient[1] ≈ data .* s .* e .- q
+        @test gradient[2] ≈ sum(data .* q .* e) - 2s
+        @test hv[1] ≈ expected[1] && hv[2] ≈ expected[2]
+    end
+
+    # DifferentiationInterface 0.7.21's forward over reverse calls `similar(x)`
+    # on the tuple point, which is not defined for a tuple. The shape is
+    # valid; it waits on DI accepting tuple points.
+    @testset "tuple-selector Hessian-vector products (DI forward over reverse)" begin
+        @test_broken try
+            prepared = prepare_ad_hvp(
+                tangent_density, forward_over_reverse, ((v, 1.0),), q, s;
+                data, active = (:q, :s), want = :density)
+            ad_hvp(prepared, ((v, 1.0),), q, s; data) isa Tuple
+        catch error
+            error isa MethodError || rethrow()
+            false
         end
     end
 end
