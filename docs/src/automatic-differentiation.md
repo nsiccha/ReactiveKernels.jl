@@ -421,6 +421,14 @@ structure: `log(d)` is cached and the cell computes `theta *` that value (see
   real derivative path.
 - Stored backend preparation is reusable but not thread-safe; concurrent callers
   use separate prepared objects.
+- Because of that, no other thread updates the shadows a prepared derivative
+  accumulates into. Where the loaded Enzyme has `Enzyme.set_atomic_add` (the
+  local Enzyme `dogfood` line), a reverse-mode `AutoEnzyme` that leaves the
+  setting to Enzyme is prepared with `set_atomic_add(mode, false)`, so its
+  gradients compile plain shadow updates in a multi-threaded process; a mode
+  that sets it either way is kept. Registered Enzyme 0.13.216 lacks the
+  switch and compiles atomic updates whenever Julia runs more than one
+  default-pool thread.
 - Plain `AutoEnzyme(mode = Enzyme.Reverse)` is the supported example
   configuration. Runtime-activity mode and function annotations are outside the
   ReactiveKernels boundary.

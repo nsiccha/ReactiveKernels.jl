@@ -8,7 +8,8 @@
 # `atomicrmw fadd`. On x86-64 that is a compare-and-swap loop that also stops
 # the loop from vectorizing. The choice is made at compile time from the
 # process's thread count, not from whether the differentiated code runs in
-# parallel, and `autodiff` exposes no option to turn it off.
+# parallel. Registered Enzyme's `autodiff` exposes no option to turn it off;
+# the local Enzyme dogfood line adds `set_atomic_add(mode, false)`.
 #
 # Run the same file twice and compare:
 #     JULIA_NUM_THREADS=1 julia --project=<env with Enzyme> repro_enzyme_thread_atomic_add.jl
@@ -23,9 +24,11 @@
 #     8         3576-3608 ns, 0 B, 5 atomicrmw   4335-4476 ns, 14592 B, 14 atomicrmw
 # The loop allocates nothing at either thread count and still runs about 40x
 # slower; the likelihood allocates the same bytes at both. The cost therefore
-# comes from the atomic shadow updates, not from allocation. ReactiveKernels'
-# prepared gradients (`prepare_ad`, RKPPL `prepare_sampler`) inherit it, and
-# so does a non-allocating kernel.
+# comes from the atomic shadow updates, not from allocation. With registered
+# Enzyme, ReactiveKernels' prepared gradients (`prepare_ad`, RKPPL
+# `prepare_sampler`) inherit it, and so does a non-allocating kernel. With an
+# Enzyme that has `set_atomic_add`, they are prepared with plain shadow updates
+# (snag prepared-rk-grad-788e46db).
 using Enzyme
 
 sum_of_squares(x) = (s = 0.0; @inbounds for i in eachindex(x); s += x[i]^2; end; s)

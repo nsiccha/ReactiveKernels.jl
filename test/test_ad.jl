@@ -18,6 +18,7 @@ include("test_lazy_arm_child_ad.jl")
 include("test_ad_retained_outputs.jl")
 include("test_ad_constant_ports.jl")
 include("test_ad_warm.jl")
+include("test_ad_atomic_shadows.jl")
 
 const TEST_AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
