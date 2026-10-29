@@ -6239,7 +6239,25 @@ struct _DynamicEmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
     tensorized_ast::A
 end
 
-@inline _dynamic_embedded_marker(args, ::Val{()}) = nothing
+# The marker searches below visit every argument of a prepared call (or every
+# field of a record). Written as a recursion over `Base.tail`, they made Julia's
+# inference open one nested frame per argument, each typed by the tuple still
+# to come: about 8.5 KB of native stack per argument, and type sizes quadratic
+# in the argument count. The data-only prefix of a large model, which takes
+# every bound column as an argument (655 of them), then overflowed inference's
+# stack and ran uninferred (snag stack-overflow-i-549143aa). One chain of calls
+# infers in one frame whatever the width. Its calls still dispatch in the
+# caller's world, so backend methods (`_requires_tensorized_marker`) apply.
+_first_marker_chain(indices) = Expr(:block,
+    Any[:(marker = f(getfield(values, $index)); marker === nothing || return marker)
+        for index in indices]..., nothing)
+
+# The first result of `f` that is not `nothing`, over the fields of `values`
+# (those at positions `I`), or `nothing`.
+@inline @generated _first_marker(f::F, values::V) where {F,V<:Tuple} =
+    _first_marker_chain(1:fieldcount(V))
+@inline @generated _first_marker(f::F, values::Tuple, ::Val{I}) where {F,I} =
+    _first_marker_chain(I)
 
 # A graph-proven candidate can be an atomic model boundary rather than the
 # array consumed by a downstream plate.  Traverse only deliberately supported
@@ -6264,33 +6282,21 @@ end
     _embedded_axis_marker_values(_embedded_marker_values(value))
 end
 
-@inline _embedded_axis_marker_values(::Tuple{}) = nothing
+@inline _embedded_axis_marker_values(values::Tuple) =
+    _first_marker(_embedded_axis_marker, values)
 
-@inline function _embedded_axis_marker_values(values::Tuple)
-    marker = _embedded_axis_marker(first(values))
-    marker === nothing ?
-        _embedded_axis_marker_values(Base.tail(values)) : marker
-end
-
-@inline function _dynamic_embedded_marker(args, ::Val{I}) where {I}
-    index = first(I)
-    marker = _embedded_axis_marker(getfield(args, index))
-    marker === nothing || return marker
-    _dynamic_embedded_marker(args, Val(Base.tail(I)))
-end
+@inline _dynamic_embedded_marker(args, ::Val{I}) where {I} =
+    _first_marker(_embedded_axis_marker, args, Val(I))
 
 @inline _requires_tensorized_marker(marker) = false
-@inline _dynamic_tensorized_marker(::Tuple{}) = nothing
 
 @inline function _dynamic_tensorized_value_marker(value)
     _requires_tensorized_marker(value) && return value
     _dynamic_tensorized_marker(_embedded_marker_values(value))
 end
 
-@inline function _dynamic_tensorized_marker(args::Tuple)
-    marker = _dynamic_tensorized_value_marker(first(args))
-    marker === nothing ? _dynamic_tensorized_marker(Base.tail(args)) : marker
-end
+@inline _dynamic_tensorized_marker(args::Tuple) =
+    _first_marker(_dynamic_tensorized_value_marker, args)
 
 @inline function (f::_DynamicEmbeddedFunctionPair{I})(ops, args...) where {I}
     traced = _dynamic_tensorized_marker(args)
