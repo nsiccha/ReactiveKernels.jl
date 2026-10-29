@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.15
+
+- A `@plate` cell that computes an array per index (`b[i, 1:1] = …`) looks a
+  label index up on a `levels(…)` axis also when the index is a definition
+  computed from data (`g = glab[pos]`, then `z[g[i], :]` over
+  `z[levels(g), 1:1]`), as it does for a data column. This includes an index
+  passed to a submodel, such as BRM's stratified group effects over a
+  grouping computed from data. On 0.1.14 and earlier the cell indexed the
+  array with the label itself: a string label raised `ArgumentError: invalid
+  index`, and an integer label read the entry at that position, a
+  `BoundsError` past the axis and the wrong level otherwise, right only where
+  every label equals its position (labels `1:G`). The data-column spelling is
+  unchanged.
+
 ## 0.1.14
 
 - A compact cell sampler (`prepare_compact_cell_sampler`) reads a selected

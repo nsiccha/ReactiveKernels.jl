@@ -197,3 +197,112 @@ end
     @test prepare_query(built, bound, :sampler)(u) ≈ oracle(u)
     @test _check_gradient(built.spec, bound, u) ≈ _findiff_grad(oracle, u)
 end
+
+# A per-index cell's label index may be data or a data-only definition
+# (`g = glab[pos]`): along a `levels(g)` axis either one is looked up among
+# the axis labels (rkppl-use §3 "Labels or positions", §13). The labels are
+# strings and integers other than 1:G, where a positional read would not
+# reproduce the oracle (snag rkppl-submodel-l-00ff0f27: BRM's stratified
+# group effects over a grouping computed from data).
+@rkppl _pc_stratified(g, s) = begin
+    tau[levels(s), 1:1] .~ restricted.(Normal(0, 1), 0.0, Inf)
+    z[levels(g), 1:1] .~ Normal.(0, 1)
+    @plate for i = eachindex(g)
+        b[i, 1:1] = tau[s[i], :] .* z[g[i], :]
+    end
+    return b
+end
+
+@testset "per-index cells look labels up through data-only definitions" begin
+    pos = [1, 2, 3, 4, 1, 3, 2, 4, 2]
+    y = [0.4 * sin(1.3t) for t in 1:9]
+    code(v, pool) = indexin(v, sort(unique(pool)))
+    function check(definition, twin, cols, twin_cols, oracle)
+        bound = bind_data(lower_rkppl(definition, keys(cols);
+            mod = @__MODULE__, conditioned = (:y,)), cols)
+        built = build_kernel(bound)
+        u = [0.3 * sin(1.7k) - 0.1 for k in 1:built.layout.total]
+        _check_model_math(built, bound, u, w -> oracle(constrain(built.layout, w)) +
+            logjac(built.layout, w))
+        # Binding the definition's value as data is the same program.
+        tbound = bind_data(lower_rkppl(twin, keys(twin_cols);
+            mod = @__MODULE__, conditioned = (:y,)), twin_cols)
+        tbuilt = build_kernel(tbound)
+        @test coordinate_names(tbuilt.layout) == coordinate_names(built.layout)
+        @test isequal(prepare_query(tbuilt, tbound, :sampler)(u),
+            prepare_query(built, bound, :sampler)(u))
+    end
+    @testset "stratified submodel, $what labels" for (what, glab, slab) in (
+            ("string", ["b2", "a1", "b1", "a2"], ["b", "a", "b", "a"]),
+            ("integer", [104, 101, 103, 102], [9, 7, 9, 7]))
+        g, s = glab[pos], slab[pos]
+        cols = (; glab, slab, pos, y)
+        saved = deepcopy(cols)
+        oracle(p) = sum(logpdf.(Normal(0, 1), p.b.tau)) + sum(logpdf.(Normal(0, 1), p.b.z)) +
+            sum(logpdf.(Normal.(p.b.tau[code(s, s), 1] .* p.b.z[code(g, g), 1], 1.0), y))
+        twin = quote
+            b ~ _pc_stratified(g, s)
+            y .~ Normal.(b[:, 1], 1.0)
+        end
+        check(quote
+            g = glab[pos]
+            s = slab[pos]
+            b ~ _pc_stratified(g, s)
+            y .~ Normal.(b[:, 1], 1.0)
+        end, twin, cols, (; g, s, y), oracle)
+        # One definition beside a data column.
+        check(quote
+            g = glab[pos]
+            b ~ _pc_stratified(g, s)
+            y .~ Normal.(b[:, 1], 1.0)
+        end, twin, (; glab, pos, s, y), (; g, s, y), oracle)
+        @test cols == saved
+    end
+    @testset "per-level factors read at a definition's labels" begin
+        glab, slab = ["d", "a", "c", "b"], ["y", "x", "y", "x"]
+        g, s = glab[pos], slab[pos]
+        x = collect(range(-1.3, 1.7; length = 9))
+        cell = quote
+            a ~ Normal(0, 5); sigma ~ Exponential(1)
+            sd[levels(s), 1:2] .~ HalfNormal.(1)
+            @plate for k in levels(s)
+                L[k] ~ LKJCholesky(2, 1.0)
+            end
+            z[levels(g), 1:2] .~ Normal.(0, 1)
+            @plate for i in eachindex(g)
+                b[i, 1:2] = (sd[s[i], :] .* L[s[i]]) * z[g[i], :]
+            end
+            mu = a .+ b[:, 1] .+ x .* b[:, 2]
+            y .~ Normal.(mu, sigma)
+        end
+        function oracle(p)
+            mu = map(1:9) do i
+                si, gi = code(s, s)[i], code(g, g)[i]
+                row = (Diagonal(p.sd[si, :]) * p.L[:, :, si]) * p.z[gi, :]
+                p.a + row[1] + x[i] * row[2]
+            end
+            hn(v) = logpdf(truncated(Normal(0, 1), 0, Inf), v)
+            return logpdf(Normal(0, 5), p.a) + logpdf(Exponential(1), p.sigma) +
+                sum(hn, p.sd) + sum(logpdf(LKJCholesky(2, 1.0),
+                    Cholesky(LowerTriangular(p.L[:, :, k]))) for k in 1:2) +
+                sum(logpdf.(Normal(0, 1), p.z)) + sum(logpdf.(Normal.(mu, p.sigma), y))
+        end
+        check(Expr(:block, :(g = glab[pos]), :(s = slab[pos]), cell.args...), cell,
+            (; glab, slab, pos, x, y), (; g, s, x, y), oracle)
+    end
+    @testset "an index definition on another column's levels" begin
+        h = ["b2", "a1", "b1", "a2"]
+        gg = ["a1", "a2", "b1", "b2"][pos]
+        cell = quote
+            z[levels(h), 1:1] .~ Normal.(0, 1)
+            @plate for i = eachindex(gg)
+                b[i, 1:1] = 2.0 .* z[gg[i], :]
+            end
+            y .~ Normal.(b[:, 1], 1.0)
+        end
+        oracle(p) = sum(logpdf.(Normal(0, 1), p.z)) +
+            sum(logpdf.(Normal.(2.0 .* p.z[code(gg, h), 1], 1.0), y))
+        check(Expr(:block, :(gg = lab[pos]), cell.args...), cell,
+            (; lab = ["a1", "a2", "b1", "b2"], pos, h, y), (; gg, h, y), oracle)
+    end
+end

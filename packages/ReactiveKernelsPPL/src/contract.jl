@@ -7457,6 +7457,13 @@ function _uncached_module_data_names(plan::StructuralPlan, raw::AbstractSet{Symb
                 idx isa Symbol && push!(axes, idx)
             end
         end
+        # An array plate column's level codes gather by the labels of
+        # their first column (`_ppl_codes(g, h)`, `_ppl_axis_codes(g, z, j)`).
+        if ex.head === :call && length(ex.args) >= 3 &&
+                ex.args[1] in (:_ppl_codes, :_ppl_axis_codes) &&
+                ex.args[2] isa Symbol
+            push!(axes, ex.args[2])
+        end
         foreach(gather_indices, ex.args)
     end
     foreach(gather_indices, values(nodes))
