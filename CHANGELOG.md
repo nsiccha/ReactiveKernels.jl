@@ -16,6 +16,27 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.12
+
+- With a reverse-over-forward backend,
+  `SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
+  AutoEnzyme(; mode = Enzyme.Forward))`, `prepare_ad_hvp` and
+  `prepare_ad_third` hold memory linear in the number of active coordinates
+  `n`. RK prepares the reverse gradient of the directional derivative
+  `x -> Df(x)[v]` itself. On 0.1.11 and earlier they held
+  DifferentiationInterface's own preparation, which also prepares a
+  forward-mode gradient whose Enzyme preparation holds `n` one-hot vectors of
+  length `n`: 8n² bytes per Hessian-vector preparation and 16n² per
+  third-order one, 187 GiB at 158,343 coordinates.
+- `ad_gradient_and_hvp` and `ad_gradient_and_hvp!` take the gradient from the
+  outer reverse backend in one sweep. On 0.1.11 and earlier,
+  DifferentiationInterface's `gradient_and_hvp` took it from the inner
+  forward backend, ⌈n/16⌉ forward passes: 10.9 ms against 31 µs at 4,000
+  coordinates.
+- A tuple `active` selector works for reverse-over-forward Hessian-vector
+  products: each direction and each result is a tuple of components. On
+  0.1.11 and earlier it failed in DifferentiationInterface's `pick_batchsize`.
+
 ## 0.1.11
 
 - On Julia 1.12 and later, a kernel body may read a name that two `using`s
