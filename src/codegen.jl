@@ -5920,8 +5920,18 @@ _anonymous_module(m::Module) = (name = String(nameof(m)); !isempty(name) && name
         Base.isbindingresolved(owner, name) ? owner : nothing
     end
 else
-    _binding_owner(m::Module, name::Symbol) =
-        Base.invokelatest(Base.binding_module, m, name)::Module
+    # A name two imports export as distinct constants of one value has no one
+    # owner: `Base.binding_module` throws "Constant binding was imported from
+    # multiple modules", where 1.10 and 1.11 name the oldest import. The name
+    # still reads its value in `m`, so it answers `m`, as for no binding.
+    function _binding_owner(m::Module, name::Symbol)
+        try
+            return Base.invokelatest(Base.binding_module, m, name)::Module
+        catch e
+            e isa ErrorException && Base.invokelatest(isdefined, m, name) || rethrow()
+            return m
+        end
+    end
     _binding_holder(m::Module, ::Symbol) = m
 end
 

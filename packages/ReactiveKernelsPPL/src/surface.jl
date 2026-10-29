@@ -1763,6 +1763,24 @@ function _desugar_destructuring(stmts)
     return out
 end
 
+# A cell's `(u, v) = f(…)` binds each element, as Julia does: the value once,
+# in a fresh cell local, then each name its element of it. The cell paths
+# then see ordinary local assignments.
+function _desugar_cell_destructuring(cells)
+    any(_is_destructuring, cells) || return cells
+    out = Any[]
+    for c in cells
+        _is_destructuring(c) || (push!(out, c); continue)
+        value = gensym(:_rkppl_destructured)
+        push!(out, Expr(:(=), value, c.args[2]))
+        for (i, nm) in enumerate(c.args[1].args)
+            push!(out, Expr(:(=), nm, Expr(:call,
+                GlobalRef(@__MODULE__, :_destructure_element), value, i)))
+        end
+    end
+    return out
+end
+
 # Element `i` of `(a, b, …) = value`, what Julia's lowering binds through
 # `Base.indexed_iterate`: the same read RK splits a destructuring into inside a
 # plate cell.
@@ -4379,7 +4397,7 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
     R = asg.args[2]
     rkind = _plate_range_kind(R)
     body = loop.args[2]
-    cells = Any[a for a in body.args if !(a isa LineNumberNode)]
+    cells = _desugar_cell_destructuring(Any[a for a in body.args if !(a isa LineNumberNode)])
     isempty(cells) && return Expr[], Tuple{Symbol,Int,Set{Symbol}}[],
         Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
     # Names bound by `=` anywhere in this plate (cell locals, excluded

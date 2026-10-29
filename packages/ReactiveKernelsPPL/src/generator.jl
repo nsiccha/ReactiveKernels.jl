@@ -3856,7 +3856,7 @@ end
 
 # Log-difference of log-probs (a ≥ b): `a + log1p(-exp(b - a))`. It
 # cancels as b - a → 0⁻; only the probit and cloglog interior levels use it,
-# and their log-CDFs already round away the upper-tail mass it would need.
+# below the upper tail, whose mass their log-CDFs round away.
 _log_diff_exp(a, b) = :($a + log1p(-exp($b - $a)))
 
 # Interior cumulative level `F(hi) - F(lo)` (hi = d*(c[y] - eta) ≥
@@ -3866,11 +3866,18 @@ _log_diff_exp(a, b) = :($a + log1p(-exp($b - $a)))
 # tails, plus a term that reads only the scaled cutpoint gap — absolute
 # error ~eps for any gap, and no eta in it, so with data cutpoints the
 # reverse pass skips it. `log_diff_exp` of two log-CDFs instead cancels when
-# both cutpoints lie far above eta (both log-CDFs near 0).
+# both cutpoints lie far above eta (both log-CDFs near 0), so probit and
+# cloglog take the mass there from the complementary tails,
+# CC(lo) (1 - CC(hi) / CC(lo)), whose log-CCDFs keep it. The selection is a
+# lazy branch on the live `lo`: only its arm runs, so a log-CCDF that
+# underflows in the other arm gives no NaN partial.
 function _ordinal_interior_logmass(link::LinkFunction, hi, lo, gap)
     link === LogitLink && return :($(_ordinal_logF(link, hi)) +
         $(_ordinal_logCC(link, lo)) + log(-expm1($gap)))
-    return _log_diff_exp(_ordinal_logF(link, hi), _ordinal_logF(link, lo))
+    upper = :($(_ordinal_logCC(link, lo)) +
+        log(-expm1($(_ordinal_logCC(link, hi)) - $(_ordinal_logCC(link, lo)))))
+    lower = _log_diff_exp(_ordinal_logF(link, hi), _ordinal_logF(link, lo))
+    return :($lo > 0 ? $upper : $lower)
 end
 
 # Modeled-scale precompute name (response `label`).
