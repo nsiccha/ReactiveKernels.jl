@@ -1,4 +1,5 @@
 using DifferentiationInterface, Enzyme, ReactiveKernels, ReactiveKernelsPPL, Test
+import SpecialFunctions
 
 # Independent cumulative-logit mathematics, including the stated scalar
 # priors. No distribution adapter or derivative rule is used by this oracle.
@@ -242,6 +243,82 @@ function _dc_tail_oracle(u, data; discrimination)
         prior = sum(t -> -(log(2 * big(pi)) + t^2) / 2, v)
         (; value = Float64(prior + sum(cells)), gradient = Float64.(g),
             pointwise = Float64.(cells))
+    end
+end
+
+# The same 256-bit mathematics for any link, from its CDF `F`, its complement
+# `CC` and its density `f`. A level above eta takes its mass from `CC`: even in
+# 256 bits `1 - F` rounds a cloglog upper tail such as exp(-e^5.3) away.
+function _dc_link_tail_oracle(u, data, F, CC, f; discrimination)
+    setprecision(BigFloat, 256) do
+        v, c = big.(u), big.(data.cuts)
+        K = length(c) + 1
+        g = -v
+        cells = map(eachindex(data.y)) do i
+            x, k = big(data.x[i]), data.y[i]
+            eta = v[1] + v[2] * x
+            d = discrimination ? exp(v[3] * x) : big(1)
+            zhi = k == K ? nothing : d * (c[k] - eta)
+            zlo = k == 1 ? nothing : d * (c[k-1] - eta)
+            fhi = zhi === nothing ? big(0) : f(zhi)
+            flo = zlo === nothing ? big(0) : f(zlo)
+            mass = zlo !== nothing && zlo > 0 ?
+                CC(zlo) - (zhi === nothing ? big(0) : CC(zhi)) :
+                (zhi === nothing ? big(1) : F(zhi)) - (zlo === nothing ? big(0) : F(zlo))
+            geta = d * (flo - fhi) / mass
+            g[1] += geta
+            g[2] += geta * x
+            if discrimination
+                g[3] += ((zhi === nothing ? 0 : fhi * zhi) -
+                    (zlo === nothing ? 0 : flo * zlo)) * x / mass
+            end
+            log(mass)
+        end
+        prior = sum(t -> -(log(2 * big(pi)) + t^2) / 2, v)
+        (; value = Float64(prior + sum(cells)), gradient = Float64.(g),
+            pointwise = Float64.(cells))
+    end
+end
+
+# Probit and cloglog interior levels between two cutpoints far above eta: the
+# log-CDFs round that mass away (probit lost 6.7e-6 between 7 and 8, cloglog
+# gave -Inf between 4 and 5.5), the log-CCDFs keep it. Lower-tail and central
+# levels keep the log-CDF difference.
+@testset "cumulative probit and cloglog interior levels keep precision in both tails" begin
+    x = [-0.6, 0.2, 0.8, -0.1, 0.4, 0.7, -0.3, 0.5, 0.1, -0.8]
+    links = (
+        (:ProbitLink, [-9.0, -7.0, 0.0, 7.0, 8.0],
+            z -> SpecialFunctions.erfc(-z / sqrt(big(2))) / 2,
+            z -> SpecialFunctions.erfc(z / sqrt(big(2))) / 2,
+            z -> exp(-z^2 / 2) / sqrt(2 * big(pi))),
+        (:CloglogLink, [-30.0, -20.0, 0.0, 4.0, 5.5],
+            z -> -expm1(-exp(z)), z -> exp(-exp(z)), z -> exp(z - exp(z))))
+    for (link, cuts, F, CC, f) in links, discriminated in (false, true)
+        data = (; y = [1, 2, 3, 4, 5, 6, 5, 2, 5, 3], x, cuts)
+        response = discriminated ?
+            :(Ordinal.(Cumulative(), $link(), eta, Ref(cuts), exp.(gamma .* x))) :
+            :(Ordinal.(Cumulative(), $link(), eta, Ref(cuts)))
+        ast = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            eta = a .+ b .* x
+        end
+        discriminated && push!(ast.args, :(gamma ~ Normal(0, 1)))
+        push!(ast.args, :(y .~ $response))
+        bound = _dc_bound(ast, data)
+        u = discriminated ? [0.2, -0.3, 0.15] : [0.2, -0.3]
+        ref = _dc_link_tail_oracle(u, data, F, CC, f; discrimination = discriminated)
+        @test isfinite(ref.value) && all(isfinite, ref.gradient) &&
+            all(isfinite, ref.pointwise)
+        built = build_kernel(bound)
+        sampler = prepare_sampler(built, bound, u;
+            backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        value, grad = sampler_value_and_gradient!(sampler, similar(u), copy(u))
+        @test abs(value - ref.value) <= 1e-13 * abs(ref.value)
+        @test maximum(abs.(grad .- ref.gradient)) <=
+            1e-12 * maximum(abs.(ref.gradient))
+        pw = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+        @test maximum(abs.((pw.y .- ref.pointwise) ./ ref.pointwise)) <= 1e-13
     end
 end
 

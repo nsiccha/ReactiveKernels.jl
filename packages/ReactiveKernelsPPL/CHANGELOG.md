@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.11
+
+- Probit and cloglog cumulative-ordinal interior levels are accurate when
+  both their cutpoints lie far above `eta`: the mass comes from the
+  complementary tails. On 0.1.10 and earlier the log-CDFs rounded it away. A
+  probit level between 7 and 8 was off by `6.7e-6`, and a cloglog level
+  between 5 and 6 gave `-Inf` where the log mass is `-148.4`. Values,
+  gradients and pointwise values below the upper tail are unchanged.
+
 ## 0.1.10
 
 - A `@plate` cell may destructure, as Julia does: `(u, v) = f(x[i])` binds
