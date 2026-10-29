@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.3
+
+- A location summand computed from a `logistic` value is a scalar, as one
+  computed from `exp` is: `p .+ e .* logistic.(a)` and `p .+ e .* s` with
+  `s = logistic.(a)` beside a product definition `e = logistic.(b) .* exp.(a)`,
+  `x[rows] .+ b .* logistic.(a)`, `x .+ 2 .* logistic(a)`, `x .+ e`, and a
+  data-only `m = logistic(mean(x))` read as `x .+ b .* m`. On 0.1.2 and
+  earlier `bind_data` failed with `ContractValidationError:
+  [_rkppl_leaf_1_off] term references missing column _rkppl_leaf_1`.
+  Requires ReactiveKernels 0.1.7.
+
 ## 0.1.2
 
 - `logistic` is a scalar value function, as `exp` is. Undotted over a scalar,

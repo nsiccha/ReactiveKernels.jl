@@ -302,3 +302,51 @@ _lv_normals(u) = sum(logpdf.(Normal(), u))
         @test occursin("over a vector needs dots", sprint(showerror, err))
     end
 end
+
+# A location summand computed from a `logistic` value is a scalar, as one
+# computed from `exp` is: named, inline, undotted, beside a product
+# definition and from data. Binding failed with `term references missing
+# column _rkppl_leaf_1` (snag rkppl-leaf-colum-59c22941).
+@testset "a logistic value in a location summand" begin
+    xs = [-0.6, 0.1, 0.8, 1.4]
+    rows = [1, 3, 2, 4, 3]
+    y = [0.9, 1.6, 1.1, 1.8, 1.4]
+    data = (; x = xs, rows, y)
+    points = ([0.3, -0.4], [-1.1, 0.8])
+    located(loc) = u -> _lv_normals(u) + sum(logpdf.(Normal.(loc(u...), 0.7), y))
+    p(a) = logistic.(a .+ logistic.(xs)[rows])
+    e(a, b) = logistic(b) * exp(a)
+
+    # BRM's emission: a vector definition plus a product reading a product
+    # definition, the factor named, inline or a dotted `exp`.
+    for (factor, value) in ((:(exp.(a)), exp), (:s, logistic),
+            (:(logistic.(a)), logistic))
+        f = _lv_model(quote
+            q = logistic.(x)
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            p = logistic.(a .+ q[rows])
+            e = logistic.(b) .* exp.(a)
+            s = logistic.(a)
+            y .~ Normal.(p .+ e .* $factor, 0.7)
+        end, data; conditioned = (:y,))
+        _lv_check(f, located((a, b) -> p(a) .+ e(a, b) * value(a)), points)
+    end
+
+    xr = xs[rows]
+    for (loc, oracle) in (
+            (:(x[rows] .+ e), (a, b) -> xr .+ e(a, b)),
+            (:(x[rows] .+ logistic.(a)), (a, b) -> xr .+ logistic(a)),
+            (:(x[rows] .+ b .* logistic.(a)), (a, b) -> xr .+ b * logistic(a)),
+            (:(x[rows] .+ 2 .* logistic(a)), (a, b) -> xr .+ 2 * logistic(a)),
+            (:(x[rows] .+ b .* m), (a, b) -> xr .+ b * logistic(sum(xs) / 4)))
+        f = _lv_model(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            e = logistic.(b) .* exp.(a)
+            m = logistic(mean(x))
+            y .~ Normal.($loc, 0.7)
+        end, data; conditioned = (:y,))
+        _lv_check(f, located(oracle), points)
+    end
+end
