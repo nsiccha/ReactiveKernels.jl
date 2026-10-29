@@ -2,8 +2,9 @@
 # scalar, as `exp` is, and dotted over an array. A scalar definition, a scalar
 # times a dotted vector, a distribution argument, a prior argument, a
 # data-only definition, a plate cell and a recurrence all read it as a value,
-# and a count rate or mean is any value, inline as named. Densities and Enzyme
-# reverse gradients match Distributions oracles. Self-contained: runs
+# and a count rate or mean is any value, inline as named. A location summand
+# computed from `logistic`, or from `ifelse.`, is a scalar. Densities and
+# Enzyme reverse gradients match Distributions oracles. Self-contained: runs
 # standalone.
 using DifferentiationInterface
 using Distributions: Bernoulli, Binomial, NegativeBinomial, Normal, Poisson,
@@ -345,6 +346,38 @@ end
             b ~ Normal(0, 1)
             e = logistic.(b) .* exp.(a)
             m = logistic(mean(x))
+            y .~ Normal.($loc, 0.7)
+        end, data; conditioned = (:y,))
+        _lv_check(f, located(oracle), points)
+    end
+end
+
+# A location summand computed from `ifelse.` over scalars is a scalar too,
+# named or inline, with any comparison as its condition: OutputSignatures
+# 0.1.6 describes comparisons and `ifelse`, and binding re-proves the offset
+# through it. On OutputSignatures 0.1.5 binding failed the same way (todo
+# 2026-10-29T00-33-10-774-023xag3). The points sit on both sides of each
+# condition, away from its kink.
+@testset "an ifelse value in a location summand" begin
+    xs = [-0.6, 0.1, 0.8, 1.4]
+    rows = [1, 3, 2, 4, 3]
+    y = [0.9, 1.6, 1.1, 1.8, 1.4]
+    data = (; x = xs, rows, y)
+    points = ([0.3, -0.4], [-1.1, 0.8])
+    located(loc) = u -> _lv_normals(u) + sum(logpdf.(Normal.(loc(u...), 0.7), y))
+    xr = xs[rows]
+    s(a, b) = ifelse(a > 0, a, b)
+    t(a, b) = ifelse(a <= b, exp(a), logistic(b))
+    for (loc, oracle) in (
+            (:(x[rows] .+ b .* s), (a, b) -> xr .+ b * s(a, b)),
+            (:(x[rows] .+ s), (a, b) -> xr .+ s(a, b)),
+            (:(x[rows] .+ 2 .* ifelse.(a .> 0, a, b)), (a, b) -> xr .+ 2 * s(a, b)),
+            (:(x[rows] .+ b .* ifelse.(a .<= b, exp.(a), logistic.(b))),
+                (a, b) -> xr .+ b * t(a, b)))
+        f = _lv_model(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            s = ifelse.(a .> 0, a, b)
             y .~ Normal.($loc, 0.7)
         end, data; conditioned = (:y,))
         _lv_check(f, located(oracle), points)
