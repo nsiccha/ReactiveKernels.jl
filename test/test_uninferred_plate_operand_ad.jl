@@ -105,11 +105,12 @@ end
 # not the trigger. Behind an inference barrier the step's `next` infers
 # `Tuple{Any, Any, Any}` (preparation warns) and the carry dispatches
 # dynamically. Plain `AutoEnzyme(Reverse)` then raises
-# `EnzymeMutabilityException` ("cannot be proven readonly") at a store of a
-# pointer into `innerparm`, Enzyme's own by-value copy of the prepared
-# callable; Enzyme dogfood `23b72c9` still raises it. With
+# `EnzymeMutabilityException` ("cannot be proven readonly") on released
+# Enzyme, at a store of a pointer into the object Julia allocates to pass the
+# step's recipe to a run-time dispatched call; Enzyme dogfood repairs it from
+# `f53965b` (Enzyme snag `readonly-check-f-647688be`). With
 # `function_annotation = Enzyme.Const`, released Enzyme raises the
-# static-activity error of the plate shapes above, which dogfood repairs.
+# static-activity error of the plate shapes above, which dogfood repairs too.
 # Both are Enzyme gaps (principle `114x8kz`): each leg accepts the exact
 # gradient or its named exception, recorded as broken.
 function repeated_transition(A::Matrix{Float64}, x::Vector{Float64}, amount::Float64,
