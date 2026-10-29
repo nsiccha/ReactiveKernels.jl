@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.10
+
+- A `@plate` cell may destructure, as Julia does: `(u, v) = f(x[i])` binds
+  each element, with `f` run once per cell, whether it reads parameters or
+  only data. An extra element is dropped, and a missing one raises
+  `BoundsError` at evaluation. On 0.1.9 and earlier lowering refused it with
+  `selected plate assignments bind a local or an indexed scalar column`.
+
 ## 0.1.9
 
 - A sampling right-hand side whose head is a parametric constructor,
