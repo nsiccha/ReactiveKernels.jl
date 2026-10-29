@@ -1634,11 +1634,15 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         axis = _plate_column_axis(rhs)
         axis === nothing || (pc_dims[nm] = Any[:(levels($axis))])
     end
+    # A data-only definition holds labels as data does (`g = glab[pos]`).
+    labels = union(data, Set{Symbol}(nm for (nm, rhs) in det
+        if _data_only(rhs, data, canonmap)))
     for (i, p) in enumerate(predictors)
         terms = TermSpec[if t.kind === ComposedTerm &&
                 _is_plate_column_call(t.options.tree)
             TermSpec(t.kind, t.columns, merge(t.options,
-                (; tree = _plate_column_expr(p.name, t.options.tree, pc_dims, data))),
+                (; tree = _plate_column_expr(p.name, t.options.tree, pc_dims, data;
+                    labels))),
                 t.addressee, t.label)
         else
             t
@@ -1649,7 +1653,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         nm in skip && continue
         rhs = canonmap[nm]
         _is_plate_column_call(rhs) &&
-            (rhs = _plate_column_expr(nm, rhs, pc_dims, data))
+            (rhs = _plate_column_expr(nm, rhs, pc_dims, data; labels))
         if detshape[nm] === :vector
             push!(derived, _lower_vector_assignment(nm, rhs, coefuse))
         else
@@ -1661,7 +1665,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     end
     for d in ctx.synth_derived
         rhs = _is_plate_column_call(d.expr) ?
-            _plate_column_expr(d.name, d.expr, pc_dims, data) : d.expr
+            _plate_column_expr(d.name, d.expr, pc_dims, data; labels) : d.expr
         push!(derived, VectorAssignmentSpec(d.name, rhs, d.label))
     end
     append!(assigns, ctx.synth_assigns)
@@ -5450,8 +5454,12 @@ end
 # every other name (arrays, parameters, definitions) whole, by closing over
 # it. Inside the cell those reads are ordinary integer indexing
 # (`sd[c, :]`, `L[:, :, c]`); RK generates the loop.
+# `labels` are the names whose values are data at bind: the data and the
+# data-only definitions (`g = glab[pos]`). A read `z[g[i], :]` along a
+# levels axis looks `g[i]` up among the axis labels whichever `g` is.
 function _plate_column_expr(nm::Symbol, call::Expr,
-        dims::Dict{Symbol,Vector{Any}}, data::Set{Symbol})
+        dims::Dict{Symbol,Vector{Any}}, data::Set{Symbol};
+        labels::Set{Symbol} = data)
     spec = call.args[2]
     ivar = spec.args[1].value
     body = spec.args[2].value
@@ -5469,8 +5477,10 @@ function _plate_column_expr(nm::Symbol, call::Expr,
             Expr(:call, :_ppl_level_indices, axis), Symbol(:_ppl_pi_, axis))
     level() = lane(Expr(:call, :_ppl_level_values, axis),
         Symbol(:_ppl_pl_, axis))
-    iscodeidx(a) = a isa Expr && a.head === :ref && length(a.args) == 2 &&
-        a.args[1] isa Symbol && a.args[1] in data && a.args[2] === ivar
+    iscodeidx(a, names = data) = a isa Expr && a.head === :ref &&
+        length(a.args) == 2 && a.args[1] isa Symbol && a.args[1] in names &&
+        a.args[2] === ivar
+    islabelidx(a) = iscodeidx(a, labels)
     isidx(a) = indices === nothing && axis === nothing && iscodeidx(a)
     function code(a, d, X, j)
         _is_levels_dim(d) && d.args[2] isa Symbol || _sfail("$where reads " *
@@ -5534,13 +5544,13 @@ function _plate_column_expr(nm::Symbol, call::Expr,
                 return Expr(:ref, X, codevar, map(rw, idx[2:end])...)
             end
             isidx(ex) && return lane(X, Symbol(:_ppl_pv_, X))
-            if d !== nothing && !isempty(idx) && any(iscodeidx, idx)
+            if d !== nothing && !isempty(idx) && any(islabelidx, idx)
                 if length(d) == 3 && length(idx) == 1
                     return Expr(:ref, X, :(:), :(:), code(idx[1], d[3], X, 3))
                 end
-                base, gatherindices = X, Any[iscodeidx(a) ? a : rw(a) for a in idx]
+                base, gatherindices = X, Any[islabelidx(a) ? a : rw(a) for a in idx]
                 for j in eachindex(idx)
-                    iscodeidx(idx[j]) || continue
+                    islabelidx(idx[j]) || continue
                     if !_is_levels_dim(d[j])
                         gatherindices[j] = rw(idx[j])
                         continue
