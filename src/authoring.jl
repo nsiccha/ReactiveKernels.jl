@@ -5669,7 +5669,13 @@ const _KERNEL_DEFAULT_BOUNDARY = _KernelDefaultBoundary()
 # while 3 made construction slower again.
 const _KERNEL_EXPAND_CHUNK = 10
 
-Base.@nospecializeinfer function _kernel_selection(@nospecialize(spec::KernelSpec),
+Base.@nospecializeinfer _kernel_selection(@nospecialize(spec::KernelSpec),
+                           selection, defaults::Vector{Symbol}, label::Symbol) =
+    Tuple(_kernel_selected_values(spec, selection, defaults, label))
+
+# The selection as one `Vector{Value}`, for preparation code that would
+# otherwise specialize on a tuple type of the selection's width (`_value_list`).
+Base.@nospecializeinfer function _kernel_selected_values(@nospecialize(spec::KernelSpec),
                            selection, defaults::Vector{Symbol}, label::Symbol)
     chosen = selection === _KERNEL_DEFAULT_BOUNDARY ? Tuple(defaults) : selection
     items = chosen isa Tuple || chosen isa AbstractVector ? chosen : (chosen,)
@@ -5690,7 +5696,7 @@ Base.@nospecializeinfer function _kernel_selection(@nospecialize(spec::KernelSpe
                 "$label entries must be port names or Value objects, got $(repr(item))"))
         end
     end
-    Tuple(values)
+    values
 end
 
 """
@@ -5730,13 +5736,19 @@ function plan(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
 end
 
 # Resolve the spec-level `bound` NamedTuple (authored port name => data) into
-# the `Value => data` pairs the plan-level partial-evaluation pass consumes.
-function _kernel_bound_pairs(spec::KernelSpec, bound)
+# the `Value => data` pairs the plan-level partial-evaluation pass consumes,
+# as one vector whatever the number of bound ports (`_bound_list`).
+Base.@nospecializeinfer function _kernel_bound_pairs(@nospecialize(spec::KernelSpec),
+                                                     @nospecialize(bound))
     bound isa NamedTuple || throw(ArgumentError(
         "spec-level bound must be a NamedTuple of authored port name => data; " *
         "got $(typeof(bound))"))
-    ports = _kernel_selection(spec, keys(bound), spec.have_names, :have)
-    Tuple(port => data for (port, data) in zip(ports, Base.values(bound)))
+    ports = _kernel_selected_values(spec, keys(bound), spec.have_names, :have)
+    pairs = Pair{Value,Any}[]
+    for (index, port) in enumerate(ports)
+        push!(pairs, port => getfield(bound, index))
+    end
+    pairs
 end
 
 """
@@ -5777,8 +5789,8 @@ function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                  type_stability_level = nothing)
     _with_type_stability(type_stability, type_stability_level) do
         isempty(bound) || return prepare(spec.graph;
-            have = _kernel_selection(spec, have, spec.have_names, :have),
-            want = _kernel_selection(spec, want, spec.want_names, :want),
+            have = _kernel_selected_values(spec, have, spec.have_names, :have),
+            want = _kernel_selected_values(spec, want, spec.want_names, :want),
             passes = passes, bound = _kernel_bound_pairs(spec, bound),
             on_error = on_error, exemplars)
         prepared = prepare(plan(spec; have = have, want = want); passes = passes,
@@ -5806,8 +5818,8 @@ function prepare!(cache::PreparationCache, spec::KernelSpec;
                   bound = NamedTuple(), on_error = nothing, type_stability = nothing,
                   type_stability_level = nothing)
     isempty(bound) || return prepare!(cache, spec.graph;
-        have = _kernel_selection(spec, have, spec.have_names, :have),
-        want = _kernel_selection(spec, want, spec.want_names, :want),
+        have = _kernel_selected_values(spec, have, spec.have_names, :have),
+        want = _kernel_selected_values(spec, want, spec.want_names, :want),
         passes = passes, bound = _kernel_bound_pairs(spec, bound), on_error = on_error,
         type_stability, type_stability_level)
     prepared = prepare!(cache, spec.graph;

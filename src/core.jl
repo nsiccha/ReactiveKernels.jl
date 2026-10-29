@@ -2384,6 +2384,44 @@ _astuple(v::Value) = (v,)
 _astuple(t::Tuple) = t
 _astuple(v::AbstractVector) = Tuple(v)
 
+# A HAVE/WANT selection as one `Vector{Value}`, and a non-empty binding as one
+# vector of `Value => data` pairs. A tuple of `Value`s or of pairs has a type of
+# its own for every selection, so preparation code specialized on it (a keyword
+# method's body, a closure that captures it) compiled again for every program,
+# in time superlinear in the width: 27 of the 30 s of preparing a kernel with
+# 655 bound ports (snag stack-overflow-i-549143aa). Anything else (one value or
+# pair, an entry of another kind) is returned as it is, for the callee to take or
+# refuse as before.
+Base.@nospecializeinfer function _value_list(@nospecialize(vs))
+    vs isa Tuple || return vs
+    list = Value[]
+    for i in 1:nfields(vs)
+        v = getfield(vs, i)
+        v isa Value || return vs
+        push!(list, v)
+    end
+    list
+end
+
+# The values `_astuple(vs)` iterates, and `collect(Value, _astuple(vs))`,
+# without compiling for the type of a tuple `vs`.
+Base.@nospecializeinfer function _value_iter(@nospecialize(vs))
+    list = _value_list(vs)
+    list isa AbstractVector ? list : _astuple(list)
+end
+Base.@nospecializeinfer _value_vector(@nospecialize(vs)) = collect(Value, _value_iter(vs))
+
+Base.@nospecializeinfer function _bound_list(@nospecialize(bound))
+    bound isa Tuple && nfields(bound) > 0 || return bound
+    list = Pair{Value,Any}[]
+    for i in 1:nfields(bound)
+        entry = getfield(bound, i)
+        entry isa Pair{<:Value} || return bound
+        push!(list, entry)
+    end
+    list
+end
+
 function _cse_alias_plan(g::Graph, new_outputs::Tuple, old_outputs::Tuple, cse_key)
     targets = Dict{ValueId,ValueId}()
     edges = Pair{ValueId,ValueId}[]

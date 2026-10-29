@@ -1630,7 +1630,7 @@ copy. Rebinding new data means running the pass
 again from the same original plan.
 """
 function partial_evaluation(p::Plan, bound, values)
-    bound_values = collect(Value, _astuple(bound))
+    bound_values = _value_vector(bound)
     value_tuple = Tuple(_astuple(values))
     length(bound_values) == length(value_tuple) || throw(ArgumentError(
         "partial evaluation received $(length(bound_values)) bound ports " *
@@ -2050,7 +2050,7 @@ function _bound_entry(p::Plan, @nospecialize(ports))
     # Keep a cell's single-use argument producer inside the cell before bound
     # specialization can split a guarded producer into materialized arms.
     p = _fuse_authored_plate_chains(p; cells_only = true)
-    bound_values = collect(Value, _astuple(ports))
+    bound_values = _value_vector(ports)
     p = _partial_split_bound(p, bound_values)
     p = _partial_index_runs(p, bound_values)
     boundary = _partial_boundary(p, bound_values)
@@ -2165,9 +2165,10 @@ function _bound_rebind(entry::_BoundEntry, template::_BoundTemplate,
 end
 
 # Normalize the public `bound` kwarg — one `Value => data` pair or an
-# iterable of them — into parallel port/value tuples.
-_partial_bound_pairs(bound::Pair{<:Value}) = ((first(bound),), (last(bound),))
-function _partial_bound_pairs(bound)
+# iterable of them — into the ports, as one vector whatever their number
+# (`_value_list`), and a tuple of their values.
+_partial_bound_pairs(bound::Pair{<:Value}) = (Value[first(bound)], (last(bound),))
+Base.@nospecializeinfer function _partial_bound_pairs(@nospecialize(bound))
     ports = Value[]
     data = Any[]
     for entry in bound
@@ -2176,7 +2177,7 @@ function _partial_bound_pairs(bound)
         push!(ports, first(entry))
         push!(data, last(entry))
     end
-    Tuple(ports), Tuple(data)
+    ports, Tuple(data)
 end
 
 """
