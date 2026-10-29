@@ -44,7 +44,9 @@ function _evaluate_ppl_source(source::AbstractString, owner::Module;
     # project, forcing runners to repeat dependencies named by the source.
     sandbox_name = gensym(Symbol(nameof(owner), :Source))
     Core.eval(owner, Expr(:module, true, sandbox_name, Expr(:block)))
-    sandbox = getfield(owner, sandbox_name)
+    # From Julia 1.12 a binding `Core.eval` creates is visible only in a
+    # later world than this running function's: read it there.
+    sandbox = Base.invokelatest(getglobal, owner, sandbox_name)
     Core.eval(sandbox, :(using ReactiveKernels))
     owner_name = nameof(owner)
     Core.eval(sandbox, :(const $(owner_name) = $owner))
@@ -66,7 +68,7 @@ function _evaluate_ppl_source(source::AbstractString, owner::Module;
         # self-check tail — the observable the sentinel below records.
         model_defined && (tail_ran = true)
         Core.eval(sandbox, expression)
-        if !model_defined && isdefined(sandbox, :model)
+        if !model_defined && Base.invokelatest(isdefined, sandbox, :model)
             model_defined = true
             # Template build: the graph is complete once `model` is defined; stop
             # before the source's prepare/execute/@assert demo tail runs.
@@ -76,7 +78,7 @@ function _evaluate_ppl_source(source::AbstractString, owner::Module;
     tail_ran && (_DEMO_TAIL_EXECUTIONS[] += 1)
 
     if model_only
-        isdefined(sandbox, :model) || error(
+        Base.invokelatest(isdefined, sandbox, :model) || error(
             "$(nameof(owner)) model_only source did not define a `model`",
         )
         model = Core.eval(sandbox, :model)
