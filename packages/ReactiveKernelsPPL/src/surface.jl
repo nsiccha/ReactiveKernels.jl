@@ -10505,6 +10505,12 @@ function _composed_trigger(rhs, ctx)
     rhs isa Symbol && return haskey(ctx.detmap, rhs) &&
         ctx.detmap[rhs] !== rhs && _composed_trigger(ctx.detmap[rhs], ctx)
     rhs isa Expr || return false
+    # An array-cell plate column is one per-observation value its retained
+    # cell computes, whatever the cell reads (`c[i] = sum(exp.(f[rows[i]]))`
+    # with a composed `f`); its arguments are the cell's inputs, not
+    # operands, so it never composes (`_extract_composed_tree` reads it as a
+    # column).
+    _is_plate_column_call(rhs) && return false
     # An admitted elementwise map over a subtree reaching a sub-predictor
     # (`resp = logistic.((log_dose .- dl) .* exp.(dls))`) is a composition.
     _is_composed_map(rhs) && rhs.args[1] in _COMPOSED_UNARY &&
