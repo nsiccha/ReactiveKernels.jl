@@ -168,6 +168,37 @@ end
     end
 end
 
+@testset "a name imported under another name is named by its owner's binding" begin
+    # `import X: f as g` binds `g` to X's `f`; X's own `g`, if any, is another
+    # binding. RKPPL's generated module imports `cexpexp as _ppl_cexpexp`, and
+    # its bodies read `LogExpFunctions._ppl_cexpexp`, which is undefined.
+    parent = Module(gensym(:Aliases))
+    Core.eval(parent, Expr(:toplevel, (quote
+        module A
+            f(x) = x
+            g(x) = 2x
+            const c = 1
+            v = [1.0]
+        end
+        module M
+            import ..A: f as g, f as h, c as d, v as w
+            using ..A: f as u
+        end
+    end).args...))
+    A, M = (Base.invokelatest(getglobal, parent, n) for n in (:A, :M))
+    f = Base.invokelatest(getglobal, A, :f)
+    for name in (:g, :h, :u)
+        @test RK._canonical_global(GlobalRef(M, name)) == GlobalRef(A, :f)
+        @test RK._global_value(M, name) === Some(f)
+        @test RK._global_isconst(M, name)
+    end
+    for name in (:d, :w)
+        ref = RK._canonical_global(GlobalRef(M, name))
+        @test Base.invokelatest(getglobal, ref.mod, ref.name) ===
+            Base.invokelatest(getglobal, M, name)
+    end
+end
+
 @testset "lowering reads a module's names as Julia resolves them, binding none" begin
     # Before Julia 1.12 the first read of a name a module has only from a
     # `using` binds it to that import for good, and the module can then not

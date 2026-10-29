@@ -5911,8 +5911,11 @@ _anonymous_module(m::Module) = (name = String(nameof(m)); !isempty(name) && name
         isconst(a, name) && isconst(b, name) && isdefined(a, name) && isdefined(b, name) &&
         getglobal(a, name) === getglobal(b, name)
 
-    # The module whose own binding `name` reads in `m`, or `nothing`.
+    # The module whose own binding `name` reads in `m`, or `nothing`. A
+    # resolved binding reads through `m` itself: the owner of an
+    # `import X: f as g` binding holds it as `f`, not as `g`.
     function _binding_holder(m::Module, name::Symbol)
+        Base.isbindingresolved(m, name) && return m
         owner = _binding_owner(m, name)
         Base.isbindingresolved(owner, name) ? owner : nothing
     end
@@ -5939,7 +5942,10 @@ Base.@nospecializeinfer function _canonical_global(ref::GlobalRef)
     m, name = ref.mod, ref.name
     (m === Base || m === Core) && return ref
     owner = _binding_owner(m, name)
-    owner === m || return _canonical_global(GlobalRef(owner, name))
+    # The owner of an `import X: f as g` binding holds it as `f`, and its `g`
+    # is another binding or none: such a name is named by its value below.
+    owner === m || _global_value(owner, name) !== _global_value(m, name) ||
+        return _canonical_global(GlobalRef(owner, name))
     value = _global_value(m, name)
     (value !== nothing && _global_isconst(m, name)) || return ref
     value = something(value)

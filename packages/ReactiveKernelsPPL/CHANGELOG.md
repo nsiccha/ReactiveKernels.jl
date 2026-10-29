@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.5
+
+- A value computed with `cexpexp.` (the inverse cloglog link) evaluates where
+  a distribution argument reads it: a Gamma mean `Gamma.(k, cexpexp.(eta) ./ k)`,
+  an ordinal discrimination `Ordinal.(…, cexpexp.(eta))` and a transformed
+  mean. On 0.1.4 and earlier lowering and `build_kernel` succeeded, and the
+  first evaluation raised `UndefVarError: _ppl_cexpexp not defined`. Requires
+  ReactiveKernels 0.1.9.
+
 ## 0.1.4
 
 - A location summand computed from `ifelse.` over scalars is a scalar, as one
