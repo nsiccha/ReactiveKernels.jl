@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.6
+
+- An index written as integer arithmetic of literals is the position it
+  evaluates to, as in Julia: `cs[4 + 1]` reads `cs[5]`, `Z[2 * 1, 1]` reads
+  `Z[2, 1]`, and `z[end - (1 + 1)]` reads `z[end - 2]`. A submodel position
+  `cs[S + 1]` called with a literal `S` reads that position too. On 0.1.5
+  and earlier `lower_rkppl` refused these with `ContractValidationError`.
+
 ## 0.1.5
 
 - A value computed with `cexpexp.` (the inverse cloglog link) evaluates where
