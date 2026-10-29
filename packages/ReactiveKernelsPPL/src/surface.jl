@@ -1067,6 +1067,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         shared_defs::Set{Symbol} = Set{Symbol}(),
         array_entries::Set{Symbol} = Set{Symbol}())
     input_data = data
+    ast = _fold_literal_positions(ast)
     # A `@scan` carried array that is observed data observes its entries
     # (`observed_scan.jl`); the rewrite is an ordinary program.
     ast = Expr(:block, _expand_observed_scans(ast.args, data)...)
