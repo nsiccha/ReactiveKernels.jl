@@ -1983,7 +1983,7 @@ end
 # statements only unread entries need leave the cell. Effectful work stays.
 function _drop_unread_plate_entries(p::Plan)
     g = p.graph
-    boundary = Set(canon_id(g, v.id) for v in (p.have..., p.want...))
+    boundary = Set(canon_id(g, v.id) for v in vcat(p.have, p.want))
     recipes = collect(p.recipes)
     changed = false
     for (index, producer) in enumerate(recipes)
@@ -2090,7 +2090,7 @@ end
 function _fuse_authored_plate_chains(original::Plan; cells_only = false)
     p = _drop_unread_plate_entries(original)
     recipes = Union{Nothing,Recipe}[p.recipes...]
-    boundary = Set(canon_id(p.graph, v.id) for v in (p.have..., p.want...))
+    boundary = Set(canon_id(p.graph, v.id) for v in vcat(p.have, p.want))
     changed = p !== original
     # A plate's output, unless it is a boundary value, and the recipes that
     # read it.
@@ -6355,7 +6355,15 @@ _exact_signature(@nospecialize(kernel::PreparedKernel)) =
 # A caller that guarantees execution through a latest-world entry may use the
 # authored closure directly. Ordinary prepare retains its world-age fallback.
 _kernel_latest_source(x) = x
-_kernel_latest_source(xs::Tuple) = map(_kernel_latest_source, xs)
+# A `map` over the operation table compiles once per table type, so once per
+# program (snag `rkbrmi-start-up-c31e3789`); build it as `_execution_source` does.
+Base.@nospecializeinfer function _kernel_latest_source(@nospecialize(xs::Tuple))
+    values = Vector{Any}(undef, nfields(xs))
+    for i in eachindex(values)
+        values[i] = _kernel_latest_source(getfield(xs, i))
+    end
+    Tuple(values)
+end
 
 # A generated kernel whose public entry guarantees a latest-world barrier can
 # carry that guarantee into literal source calls within its native recipe
@@ -6385,14 +6393,22 @@ function _kernel_latest_literal_calls(ex)
     _kernel_is_branch_arm_graph(result) ?
         Expr(:call, GlobalRef(@__MODULE__, :_kernel_latest_arm_plan), result) : result
 end
-function _kernel_latest_source(f::_KernelSourceFunction{F,RF,C}) where {F,RF,C}
-    _KernelSourceFunction{F,RF,C,Val{:latest_world}}(
-        f.f, f.runtime_f, f.captures)
+# Every operation and source function has its own concrete type; these copies
+# are built from their parameters without compiling once per operation.
+Base.@nospecializeinfer function _kernel_latest_source(@nospecialize(f::_KernelSourceFunction))
+    F, RF, C = (typeof(f)::DataType).parameters
+    _kernel_new_instance(_KernelSourceFunction{F,RF,C,Val{:latest_world}},
+        (getfield(f, :f), getfield(f, :runtime_f), getfield(f, :captures)))
 end
-function _kernel_latest_source(op::_KernelSourceOp)
-    _KernelSourceOp(Val(kernel_sourceop_token(op)), Val(kernel_sourceop_form(op)),
-        _kernel_latest_source(op.f), _kernel_latest_source(op.tensor_f),
-        _kernel_latest_source(op.ignored_throws), op.call_identity)
+Base.@nospecializeinfer function _kernel_latest_source(@nospecialize(op::_KernelSourceOp))
+    token, form = (typeof(op)::DataType).parameters
+    f = _kernel_latest_source(getfield(op, :f))
+    tensor_f = _kernel_latest_source(getfield(op, :tensor_f))
+    ignored_throws = _kernel_latest_source(getfield(op, :ignored_throws))
+    call_identity = getfield(op, :call_identity)
+    T = _KernelSourceOp{token,form,typeof(f),typeof(tensor_f),typeof(ignored_throws),
+                        typeof(call_identity)}
+    _kernel_new_instance(T, (f, tensor_f, ignored_throws, call_identity))::_KernelSourceOp
 end
 function _kernel_latest_source(split::_KernelSplit)
     _KernelSplit(Val(_kernel_split_spec(split)),
@@ -6422,14 +6438,18 @@ function _kernel_latest_arm_plan(spec)
         r.cost, r.cse_key, r.effectful, r.source) for r in p.recipes]
     _partial_subplan(p, p.have, p.want, recipes)
 end
-function _kernel_latest_source(op::_AuthoredPlateOp{K,A}) where {K,A}
-    kernel = _kernel_latest_prepared(op.kernel)
-    _AuthoredPlateOp{typeof(kernel),A}(kernel, op.axis_checks)
+Base.@nospecializeinfer function _kernel_latest_source(@nospecialize(op::_AuthoredPlateOp))
+    kernel = _kernel_latest_prepared(getfield(op, :kernel))
+    A = (typeof(op)::DataType).parameters[2]
+    _kernel_new_instance(_AuthoredPlateOp{typeof(kernel),A},
+                         (kernel, getfield(op, :axis_checks)))::_AuthoredPlateOp
 end
-function _kernel_latest_prepared(kernel::PreparedKernel{F,O,IN,OUT,RR,S}) where {F,O,IN,OUT,RR,S}
-    _prepared_kernel(kernel.f, map(_kernel_latest_source, kernel.ops),
-                     kernel.inputs, kernel.outputs, kernel.plan, kernel.ast,
-                     kernel.lowered_recipes; exact_signature = S)
+Base.@nospecializeinfer function _kernel_latest_prepared(@nospecialize(kernel::PreparedKernel))
+    _prepared_kernel(getfield(kernel, :f), _kernel_latest_source(getfield(kernel, :ops)),
+                     getfield(kernel, :inputs), getfield(kernel, :outputs),
+                     getfield(kernel, :plan), getfield(kernel, :ast),
+                     getfield(kernel, :lowered_recipes);
+                     exact_signature = _exact_signature(kernel))
 end
 
 # A prepared kernel is statically untraced. `Recipe.cse_key` provenance tuples
@@ -6570,33 +6590,40 @@ in the callable can defeat native Enzyme's readonly analysis when it
 reconstructs that callable beside active values; moving the same fixed values
 out of those fields preserves the public kernel boundary.
 """
-function _externalize_bound_array_call(f, ops;
-                                       min_elements::Integer = 0,
-                                       materialize_view_copies::Bool = false,
-                                       externalize_scalars::Bool = false)
-    positions = Tuple(
-        index for (index, op) in pairs(ops)
-        if op isa _BoundConstant &&
-           (_has_external_bound_array(op.value, min_elements) ||
-            externalize_scalars && op.value isa Number))
-    isempty(positions) && return nothing, ()
-    values = Tuple(
-        _externalize_bound_value(ops[index].value, materialize_view_copies)
-        for index in positions)
-    stripped = ntuple(length(ops)) do index
-        slot = findfirst(==(index), positions)
-        slot === nothing ? ops[index] :
+Base.@nospecializeinfer function _externalize_bound_array_call(@nospecialize(f),
+        @nospecialize(ops::Tuple); min_elements::Integer = 0,
+        materialize_view_copies::Bool = false, externalize_scalars::Bool = false)
+    # Walk the table without a generator or `ntuple` over it: those compile
+    # once per table type, so once per program (snag `rkbrmi-start-up-c31e3789`).
+    found = Int[]
+    for index in 1:nfields(ops)
+        op = getfield(ops, index)
+        op isa _BoundConstant || continue
+        value = getfield(op, :value)
+        (_has_external_bound_array(value, min_elements) ||
+         externalize_scalars && value isa Number) && push!(found, index)
+    end
+    isempty(found) && return nothing, ()
+    positions = Tuple(found)
+    values = Tuple(Any[_externalize_bound_value(getfield(getfield(ops, index), :value),
+                                                materialize_view_copies)
+                       for index in found])
+    entries = Vector{Any}(undef, nfields(ops))
+    for index in 1:nfields(ops)
+        slot = findfirst(==(index), found)
+        entries[index] = slot === nothing ? getfield(ops, index) :
             _ExternalBoundArraySlot{slot}()
     end
+    stripped = Tuple(entries)
     structured = any(value -> value isa Union{Tuple,NamedTuple} ||
                               _bound_record(value), values)
     external_body = structured ?
         _externalize_bound_array_body(f, positions, values) : nothing
     callable = external_body === nothing ? f : external_body
     external_values = external_body === nothing ? values : _bound_array_leaves(values)
-    call = _ExternalizedBoundArrayCall{
+    call = _kernel_new_instance(_ExternalizedBoundArrayCall{
         typeof(callable),typeof(stripped),positions,
-        external_body !== nothing,length(external_values)}(callable, stripped)
+        external_body !== nothing,length(external_values)}, (callable, stripped))
     call, external_values
 end
 
@@ -7579,7 +7606,9 @@ function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing,
     embedded || return _prepare(p, native_ast, ops, recipes; exact_signature)
 
     tensorized_ast, tensorized_ops, tensorized_recipes = tensorized_lowering
-    tensorized_ops == ops || throw(ArgumentError(
+    # Both lowerings store the same operation objects, so `===` settles it
+    # without compiling `==` for every operation type (once per program).
+    tensorized_ops === ops || tensorized_ops == ops || throw(ArgumentError(
         "embedded native and tensorized kernels produced different operation tables"))
     _same_readable_recipes(tensorized_recipes, recipes) || throw(ArgumentError(
         "embedded native and tensorized kernels produced different readable recipes"))
