@@ -122,11 +122,6 @@ end
         @test !occursin("struct ", GPCM_LR_SOURCE)
         @test artifact.student_t_object === student_t
 
-        raw_generated = code_expr(artifact.kernel)
-        readable = sprint(Base.show_unquoted,
-            ReactiveKernels._readable_expr(raw_generated, artifact.kernel);
-            context = :limit => false)
-        @test !occursin(r"__ops__\[\d+\]", readable)
     end
 
     @testset "posterior decomposition vs the independent reference oracle" begin

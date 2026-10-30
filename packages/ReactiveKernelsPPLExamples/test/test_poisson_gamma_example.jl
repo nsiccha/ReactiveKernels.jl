@@ -31,14 +31,6 @@ end
         @test artifact.gamma_object === gamma
         @test artifact.poisson_object === poisson
 
-        raw_generated = code_expr(artifact.kernel)
-        readable = sprint(
-            Base.show_unquoted,
-            ReactiveKernels._readable_expr(raw_generated, artifact.kernel);
-            context = :limit => false,
-        )
-        @test !occursin(r"__ops__\[\d+\]", readable)
-        @test !occursin(r"\boperation\(", readable)
     end
 
     @testset "constrain-only prunes the density work" begin

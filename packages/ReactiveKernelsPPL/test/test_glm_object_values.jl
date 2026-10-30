@@ -124,9 +124,10 @@ end
     prepared = prepare_query(built, plan, :sampler)
     code = sprint(print, Base.remove_linenums!(deepcopy(code_expr(prepared))))
     @test !occursin("loggamma", code)
-    normalizer = match(r"\b_ppl_lnorm_\w+ = \(__ops__\[(\d+)\]\)\(\)", code)
+    normalizer = match(r"\b_ppl_lnorm_\w+ = __constants__\[(\d+)\]", code)
     @test normalizer !== nothing
-    @test prepared.ops[parse(Int, normalizer.captures[1])] isa ReactiveKernels._BoundConstant
+    @test prepared.lowered_recipes[parse(Int, normalizer.captures[1])].op isa
+          ReactiveKernels._BoundConstant
     u = _gv_u(built)
     cells = oracle(constrain(built.layout, u))
     @test Base.invokelatest(prepare_query(built, plan, :pointwise), u).counts ≈ cells

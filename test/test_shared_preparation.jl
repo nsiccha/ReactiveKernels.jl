@@ -364,8 +364,7 @@ end
     function first_binding_hoisted(cache)
         kernel = prepare!(cache, F.fresh; have = (:data, :q), want = :scaled,
                           bound = (; data = [4.0, 5.0]))
-        constant = only(op for op in kernel.ops if op isa ReactiveKernels._BoundConstant)
-        WeakRef(constant.value)
+        WeakRef(only(value for value in kernel.constants if value !== nothing))
     end
     hoisted = first_binding_hoisted(cache)
     @test prepare!(cache, F.fresh; have = (:data, :q), want = :scaled,
@@ -536,8 +535,7 @@ end
     function plain_first_binding_hoisted()
         kernel = prepare(FirstRebindingFixture.fresh; have = (:data, :q),
                          want = :scaled, bound = (; data = [6.0, 7.0]))
-        constant = only(op for op in kernel.ops if op isa ReactiveKernels._BoundConstant)
-        WeakRef(constant.value)
+        WeakRef(only(value for value in kernel.constants if value !== nothing))
     end
     hoisted = plain_first_binding_hoisted()
     @test prepare(FirstRebindingFixture.fresh; have = (:data, :q), want = :scaled,

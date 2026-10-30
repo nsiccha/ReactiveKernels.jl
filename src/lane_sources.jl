@@ -67,33 +67,23 @@ A callee's plan lowered as a position residual part (`_lane_kernel`): the
 compiled body `f(ops, recycled, slots, inputs...)` and the table it reads,
 with `N` slots for the callee's own lane and cell values.
 """
-struct _LaneKernel{N,F,O}
+struct _LaneKernel{N,F,C,O}
     f::F
-    ops::O
+    constants::C
+    callables::O
 end
-_LaneKernel{N}(f::F, ops::O) where {N,F,O} = _LaneKernel{N,F,O}(f, ops)
+_LaneKernel{N}(f::F, constants::C, callables::O) where {N,F,C,O} =
+    _LaneKernel{N,F,C,O}(f, constants, callables)
 
-# The operation table of a native body, with every slot the body does not read
-# set to `nothing`. A plate or scan keeps its operation in a slot the native
-# body does not read, and that operation holds its prepared body; the rest of
-# the table is singleton source operations, so the callable holding
+# The callables table of a native body, with every entry the body does not
+# read set to `nothing`. A plate or scan keeps its operation in an entry the
+# native body does not read, and that operation holds its prepared body; the
+# rest of the table is singleton source operations, so the callable holding
 # it stays isbits. A body that reads the table other than by literal index
 # keeps the whole table.
 function _native_table(ast::Expr, ops::Tuple)
-    reads = Set{Int}()
-    whole = Ref(false)
-    function walk(node)
-        if node === _OPS_ARG
-            whole[] = true
-        elseif node isa Expr && node.head === :ref && length(node.args) == 2 &&
-               node.args[1] === _OPS_ARG && node.args[2] isa Int
-            push!(reads, node.args[2])
-        elseif node isa Expr && node.head !== :quote
-            foreach(walk, node.args)
-        end
-    end
-    walk(ast.args[2])
-    whole[] ? ops : ntuple(i -> i in reads ? ops[i] : nothing, length(ops))
+    reads = _callable_reads(ast.args[2])
+    reads === nothing ? ops : ntuple(i -> i in reads ? ops[i] : nothing, length(ops))
 end
 
 # The lane kernel of a plan with one WANT that a destination form produces,
@@ -118,7 +108,7 @@ function _lane_kernel(p::Plan)
         push!(scratch, slot)
     end
     cell_slots = Symbol[]
-    ast, ops, _ = _replicated_part_ast(p; recycle, cell_slots)
+    ast, constants, callables, _ = _replicated_part_ast(p; recycle, cell_slots)
     slots = gensym(:lane_slots)
     inputs = Any[gensym(Symbol(v.name, :_lane_input)) for v in p.have]
     body = Expr(:block)
@@ -129,9 +119,10 @@ function _lane_kernel(p::Plan)
     append!(body.args, _embedded_statements(ast, Any[inputs..., output, scratch...],
                                             result, 0))
     push!(body.args, Expr(:return, result))
-    wrapper = Expr(:function, Expr(:tuple, _OPS_ARG, output, slots, inputs...), body)
+    wrapper = Expr(:function,
+        Expr(:tuple, _CONSTANTS_ARG, _CALLABLES_ARG, output, slots, inputs...), body)
     _LaneKernel{length(scratch) + length(cell_slots)}(
-        compile(wrapper), _native_table(wrapper, Tuple(ops)))
+        compile(wrapper), Tuple(constants), _native_table(wrapper, Tuple(callables)))
 end
 
 # The lane kernel of an RK-owned callee, or `nothing`: a rule's
@@ -161,7 +152,8 @@ _lane_callee(child::_KernelPreparedChild) = getfield(child, :lane)
     quote
         $(Expr(:meta, :inline))
         $(_native_body_call_expr(F, :(getfield(lane, :f)),
-            Any[:(getfield(lane, :ops)), :recycled, :slots, forwarded...]))
+            Any[:(getfield(lane, :constants)), :(getfield(lane, :callables)),
+                :recycled, :slots, forwarded...]))
     end
 end
 

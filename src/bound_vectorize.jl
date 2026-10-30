@@ -16,11 +16,11 @@
 # constants in their slots, exactly as `_bound_rebind` rebuilds the scalar
 # kernel.
 #
-# A product is kept only when each of its tables holds each constant exactly
-# once, in plan order, and nothing else of that binding; every other product
-# is lowered afresh per call, as before. The key includes the type of the
-# kernel's operation table, so the constants' types are those the kept
-# programs were lowered for. Nothing here is on a call path, and the products'
+# A product is kept only when each of its constants tables holds each
+# constant's value exactly once, in plan order, and nothing else of that
+# binding; every other product is lowered afresh per call, as before. The key
+# includes the types of the kernel's two tables, so the constants' types are
+# those the kept programs were lowered for. Nothing here is on a call path, and the products'
 # types are as varied as the graphs, so these functions take their arguments
 # unspecialized.
 
@@ -28,7 +28,8 @@
 struct _RebindReplicated
     type::DataType   # the exact `GraphReplicatedKernel` type
     native::Any
-    ops::_RebindTable
+    constants::_RebindTable
+    callables::Tuple
     ast::Expr
 end
 
@@ -36,7 +37,8 @@ end
 struct _RebindBorrowed
     target::_RebindReplicated
     native::Any
-    ops::_RebindTable
+    constants::_RebindTable
+    callables::Tuple
     slots::Int
     ast::Expr
 end
@@ -45,7 +47,8 @@ end
 # scheduled batch).
 struct _RebindPrepared
     f::Any
-    ops::_RebindTable
+    constants::_RebindTable
+    callables::Vector{Any}
     inputs::Tuple
     outputs::Tuple
     have::Vector{Value}
@@ -54,7 +57,7 @@ struct _RebindPrepared
     ast::Expr
     lowered::_RebindTable
     signature::Type
-    executable::_ExecutableTable # `ops` as this process executes it
+    executable::_ExecutableTable # `callables` as this process executes them
 end
 
 # A scheduled batch: its serial driver, its prefix and one empty residual
@@ -66,10 +69,10 @@ struct _RebindScheduled
     residual::BorrowedBatchedKernel
 end
 
-# A kernel's constants: its operation-table entries and readable recipes at
-# its template's constant slots, in plan order.
+# A kernel's constants: their values in its constants table and their
+# readable recipes, at its template's constant slots, in plan order.
 struct _RebindConstants
-    ops::Vector{Any}
+    values::Vector{Any}
     recipes::Vector{Any}
 end
 # `getfield`, not `getindex`: on an unspecialized kernel each `getindex` was a
@@ -79,9 +82,9 @@ end
 # 1.8 MB per binding of a simulator graph with 56 constants among 365 entries
 # (snag per-binding-resi-990b18ab).
 function _RebindConstants(@nospecialize(kernel::PreparedKernel), slots::Vector{Int})
-    ops = getfield(kernel, :ops)
+    constants = getfield(kernel, :constants)
     recipes = getfield(kernel, :lowered_recipes)
-    _RebindConstants(Any[getfield(ops, k) for k in slots],
+    _RebindConstants(Any[getfield(constants, k) for k in slots],
                      Any[getfield(recipes, k) for k in slots])
 end
 
@@ -96,7 +99,8 @@ function _vectorize(vectorizations::_BoundVectorizations,
                     @nospecialize(kernel::PreparedKernel), @nospecialize(batched),
                     reuse::Bool, @nospecialize(schedule))
     key = (_replica_batch_indices(inputs(kernel), batched), reuse,
-           schedule === nothing, fieldtype(typeof(kernel), :ops))
+           schedule === nothing, fieldtype(typeof(kernel), :constants),
+           fieldtype(typeof(kernel), :callables))
     kept = lock(() -> get(vectorizations.products, key, nothing), vectorizations.lock)
     constants = _RebindConstants(kernel, vectorizations.slots)
     kept === nothing || return _rebound(kept, kernel, constants, schedule)
@@ -116,9 +120,10 @@ function _rebind_template(@nospecialize(product::GraphReplicatedKernel),
                           @nospecialize(kernel::PreparedKernel),
                           constants::_RebindConstants)
     product.target === kernel || return nothing
-    ops = _rebind_table(product.ops, constants.ops)
-    ops === nothing ? nothing :
-        _RebindReplicated(typeof(product), product.native, ops, product.ast)
+    table = _rebind_table(product.constants, constants.values)
+    table === nothing ? nothing :
+        _RebindReplicated(typeof(product), product.native, table, product.callables,
+                          product.ast)
 end
 
 function _rebind_template(@nospecialize(product::BorrowedBatchedKernel),
@@ -126,19 +131,21 @@ function _rebind_template(@nospecialize(product::BorrowedBatchedKernel),
                           constants::_RebindConstants)
     target = _rebind_template(product.target, kernel, constants)
     target === nothing && return nothing
-    ops = _rebind_table(product.ops, constants.ops)
-    ops === nothing ? nothing :
-        _RebindBorrowed(target, product.native, ops, length(product.caches), product.ast)
+    table = _rebind_table(product.constants, constants.values)
+    table === nothing ? nothing :
+        _RebindBorrowed(target, product.native, table, product.callables,
+                        length(product.caches), product.ast)
 end
 
 function _rebind_prefix(@nospecialize(prefix::PreparedKernel), constants::_RebindConstants)
-    ops = _rebind_table(prefix.ops, constants.ops)
+    table = _rebind_table(prefix.constants, constants.values)
     recipes = _rebind_table(prefix.plan.recipes, constants.recipes)
     lowered = _rebind_table(prefix.lowered_recipes, constants.recipes)
-    (ops === nothing || recipes === nothing || lowered === nothing) && return nothing
-    _RebindPrepared(prefix.f, ops, prefix.inputs, prefix.outputs, prefix.plan.have,
-                    prefix.plan.want, recipes, prefix.ast, lowered,
-                    _exact_signature(prefix), _ExecutableTable(ops))
+    (table === nothing || recipes === nothing || lowered === nothing) && return nothing
+    callables = Any[prefix.callables...]
+    _RebindPrepared(prefix.f, table, callables, prefix.inputs, prefix.outputs,
+                    prefix.plan.have, prefix.plan.want, recipes, prefix.ast, lowered,
+                    _exact_signature(prefix), _ExecutableTable(callables))
 end
 
 function _rebind_template(@nospecialize(product::_ScheduledBatchedKernel),
@@ -150,7 +157,7 @@ function _rebind_template(@nospecialize(product::_ScheduledBatchedKernel),
              _rebind_prefix(product.prefix, constants)
     product.prefix === nothing || prefix !== nothing || return nothing
     residual = first(product.workers)
-    _holds_constant(residual.ops, constants.ops) && return nothing
+    _holds_constant(residual.constants, constants.values) && return nothing
     _holds_constant(plan(residual).recipes, constants.recipes) && return nothing
     _RebindScheduled(typeof(product), serial, prefix, copy(residual))
 end
@@ -159,24 +166,25 @@ end
 
 function _rebound(kept::_RebindReplicated, @nospecialize(kernel::PreparedKernel),
                   constants::_RebindConstants, @nospecialize(schedule))
-    ops = Tuple(_rebound_table(kept.ops, constants.ops))
-    _kernel_new_instance(kept.type, (kernel, kept.native, ops, kernel.plan, kept.ast,
-                                     kernel.inputs, kernel.outputs))
+    table = Tuple(_rebound_table(kept.constants, constants.values))
+    _kernel_new_instance(kept.type, (kernel, kept.native, table, kept.callables,
+                                     kernel.plan, kept.ast, kernel.inputs, kernel.outputs))
 end
 
 function _rebound(kept::_RebindBorrowed, @nospecialize(kernel::PreparedKernel),
                   constants::_RebindConstants, @nospecialize(schedule))
     target = _rebound(kept.target, kernel, constants, schedule)
-    ops = Tuple(_rebound_table(kept.ops, constants.ops))
-    BorrowedBatchedKernel(target, kept.native, ops, _borrowed_batch_caches(kept.slots),
-                          kept.ast)
+    table = Tuple(_rebound_table(kept.constants, constants.values))
+    BorrowedBatchedKernel(target, kept.native, table, kept.callables,
+                          _borrowed_batch_caches(kept.slots), kept.ast)
 end
 
 function _rebound(kept::_RebindPrepared, @nospecialize(kernel::PreparedKernel),
                   constants::_RebindConstants, @nospecialize(schedule))
     recipes = convert(Vector{Recipe}, _rebound_table(kept.recipes, constants.recipes))
     plan = _partial_subplan(kernel.plan, kept.have, kept.want, recipes)
-    _executed_prepared_kernel(kept.f, _rebound_executable(kept.executable, kept.ops, constants.ops),
+    _executed_prepared_kernel(kept.f, Tuple(_rebound_table(kept.constants, constants.values)),
+                              _executable_callables(kept.executable, kept.callables),
                               kept.inputs, kept.outputs, plan, kept.ast,
                               Tuple(_rebound_table(kept.lowered, constants.recipes)),
                               kept.signature, nothing)

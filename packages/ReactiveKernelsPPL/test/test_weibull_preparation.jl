@@ -73,7 +73,7 @@ end
             # lowering and compilation.
             kernel = Base.invokelatest(prepare, state.kernel.plan;
                                       passes = (_collect_pass,))
-            push!(shapes, (_emission_shape(code_expr(kernel)), length(kernel.ops)))
+            push!(shapes, (_emission_shape(code_expr(kernel)), length(kernel.callables)))
             u = unconstrain(state.built.layout, q)
             pointwise = [logpdf(Weibull(k, exp(a + b * xi)), yi)
                          for (xi, yi) in zip(x, y)]

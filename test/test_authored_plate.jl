@@ -19,9 +19,8 @@ isdefined(@__MODULE__, :AuthoredPlateChains) ||
     @test p.recipes == recipes
     @test count(r -> r.op isa ReactiveKernels._AuthoredPlateOp, p.recipes) == 2
     @test !occursin("similar", string(code_expr(kernel)))
-    shown_cell = ReactiveKernels._readable_recipe_call(
-        last(kernel.lowered_recipes), Any[0.2, 0.7])
-    @test Core.eval(@__MODULE__, shown_cell) == -0.5 * (0.2 - 0.7)^2
+    # The cell recipe's operation is the fused source over its two formals.
+    @test last(kernel.lowered_recipes).op(0.2, 0.7) == -0.5 * (0.2 - 0.7)^2
     C.allocated(kernel, q, x, y)
     @test C.allocated(kernel, q, x, y) == 0
     @test kernel(q, Float64[], Float64[]) == 0.0
@@ -528,8 +527,9 @@ end
                                        total(xs, location, scale))
 
     raw_ast = lower(total_plan)
-    raw_ops = Tuple(recipe.op for recipe in total_plan.recipes)
-    @test ReactiveKernels.compile(raw_ast)(raw_ops, xs, location, scale) ≈
+    raw_callables = Tuple(recipe.op for recipe in total_plan.recipes)
+    raw_constants = map(_ -> nothing, raw_callables)
+    @test ReactiveKernels.compile(raw_ast)(raw_constants, raw_callables, xs, location, scale) ≈
         sum(reference)
 
     total_ast = code_expr(total)
@@ -541,20 +541,22 @@ end
     @test !occursin("similar", string(total_ast))
     @test occursin("similar", string(pointwise_ast))
     @test occursin("similar", string(both_ast))
+    # The first recipe statement: its source inlined (locals named from the
+    # recipe position, `#op`) or its call through the callables table.
+    first_recipe_mention(text) = minimum(first(r) for r in
+        (findfirst("#op", text), findfirst("__callables__[", text)) if r !== nothing)
     native_text = string(total_ast)
-    @test findfirst("Base.broadcastable", native_text) <
-          findfirst("__ops__[", native_text)
+    @test first(findfirst("Base.broadcastable", native_text)) <
+          first_recipe_mention(native_text)
     for materializing_ast in (pointwise_ast, both_ast)
         materializing_text = string(materializing_ast)
         @test findfirst("Base.broadcastable", materializing_text) <
               findfirst("similar", materializing_text)
-        @test findfirst("Base.broadcastable", materializing_text) <
-              findfirst("__ops__[", materializing_text)
+        @test first(findfirst("Base.broadcastable", materializing_text)) <
+              first_recipe_mention(materializing_text)
     end
 
-    readable = string(ReactiveKernels._readable_expr(total_ast, total))
-    @test occursin("standard.logpdf", readable)
-    @test !occursin(r"__ops__\[\d+\]", readable)
+    @test occursin("standard.logpdf", string(total_ast))
 
     locations = [0.1, 0.2, 0.4, 0.5]
     scales = [0.8, 1.0, 1.3, 1.5]
@@ -1346,7 +1348,7 @@ end
     # closure arguments are the do-block formals in recipe-input order.
     cell_index = only(i for (i, recipe) in enumerate(kernel.lowered_recipes)
                       if [v.name for v in recipe.outputs] == [:__plate_value__])
-    op = kernel.ops[cell_index]
+    op = kernel.callables[cell_index]
     @test op isa ReactiveKernels._KernelSourceOp
     formal_types = Dict(:plan => typeof(plan), :observation => Int,
                         :units => typeof(units), :weights => typeof(weights))
@@ -1422,7 +1424,8 @@ function _plate_entry_llvm(kernel, args...)
     kernel(args...)
     sprint(io -> InteractiveUtils.code_llvm(io,
         ReactiveKernels.RuntimeGeneratedFunctions.generated_callfunc,
-        Tuple{typeof(kernel.f.native), typeof(kernel.ops), map(typeof, args)...};
+        Tuple{typeof(kernel.f.native), typeof(kernel.constants), typeof(kernel.callables),
+              map(typeof, args)...};
         debuginfo = :none))
 end
 
@@ -1566,8 +1569,14 @@ end
     return sum(path)
 end
 _emitted_count(kernel, literal) =
-    count(_ -> true, eachmatch(literal,
-        string(ReactiveKernels._readable_expr(code_expr(kernel), kernel))))
+    count(_ -> true, eachmatch(literal, string(code_expr(kernel))))
+# How often the body calls the callable `f` through its table position (a
+# plate's type seed reads the position too, without calling it).
+function _callable_mentions(kernel, f)
+    i = findfirst(op -> op === f, kernel.callables)
+    i === nothing && return 0
+    count(_ -> true, eachmatch(Regex("\\(__callables__\\[$i\\]\\)\\("), string(code_expr(kernel))))
+end
 
 @testset "authored plate native: each cell recipe is emitted once" begin
     xs = collect(range(-1.0, 2.0; length = 7))
@@ -1591,7 +1600,7 @@ _emitted_count(kernel, literal) =
     # invariant: it runs once per call. A value that holds no axis reaches it
     # as its broadcast element, as it reaches every other cell recipe.
     invariant = prepare(_emitted_once_invariant)
-    @test _emitted_count(invariant, r"_emitted_once_log\(") == 1
+    @test _callable_mentions(invariant, _emitted_once_log) == 1
     expected = sum(xs .* log(1.7))
     for s in (1.7, fill(1.7), Ref(1.7))
         _EMITTED_ONCE_CALLS[] = 0
@@ -1639,7 +1648,8 @@ end
 end
 function _generated_code_text(kernel)
     parts = String[string(code_expr(kernel))]
-    for op in kernel.ops
+    for recipe in kernel.lowered_recipes
+        op = recipe.op
         (op isa ReactiveKernels._AuthoredPlateOp ||
          op isa ReactiveKernels._AuthoredScanOp) || continue
         push!(parts, _generated_code_text(op.kernel))
@@ -1651,9 +1661,12 @@ _unguarded(kernel) = (code = _generated_code_text(kernel);
     !occursin("plate_previous", code))
 # The generated body with gensym counters and the argument line removed: a
 # bound port is a constant line instead of an argument.
-_lowered_body(kernel) = [replace(line, r"#\d+" => "#")
-    for line in split(string(ReactiveKernels._readable_expr(
-        code_expr(kernel), kernel)), '\n')
+# The generated body with gensym counters, recipe positions and the argument
+# line removed: a bound port is a constants read instead of an argument.
+_lowered_body(kernel) = [replace(line, r"#\d+" => "#", r"#op\d+" => "#op",
+                                 r"__callables__\[\d+\]" => "__callables__[#]",
+                                 r"__constants__\[\d+\]" => "xs")
+    for line in split(string(code_expr(kernel)), '\n')
     if !startswith(line, "function") && !occursin(r"^\s*xs = ", line)]
 
 @testset "authored plate native: bound plate arguments lower as their class" begin
@@ -1674,7 +1687,7 @@ _lowered_body(kernel) = [replace(line, r"#\d+" => "#")
     xs = collect(range(-1.0, 2.0; length = 7))
     scalar = prepare(_emitted_once_invariant; bound = (; s = 1.7))
     @test _unguarded(scalar)
-    @test _emitted_count(scalar, r"_emitted_once_log\(") == 1
+    @test _callable_mentions(scalar, _emitted_once_log) == 1
     _EMITTED_ONCE_CALLS[] = 0
     @test scalar(xs) ≈ sum(xs .* log(1.7))
     @test _EMITTED_ONCE_CALLS[] == 1
@@ -1954,7 +1967,7 @@ end
     return concentration
 end
 _dose_outer_reductions(kernel) = count(op -> op isa ReactiveKernels._KernelSourceOp &&
-                                             op.f isa ReactiveKernels._KernelReduction, kernel.ops)
+                                             op.f isa ReactiveKernels._KernelReduction, kernel.callables)
 _dose_outer_same(a, b) = length(a) == length(b) && all(map(===, a, b))
 
 @testset "authored plate block: a gathered generator sum runs dose-outer, bitwise" begin

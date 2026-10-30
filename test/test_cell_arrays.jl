@@ -14,7 +14,7 @@ end
 
 # Embedding must keep Julia's call boundary even when an argument is a
 # projection or another expression used repeatedly by the nested body.
-argument_once = ReactiveKernels._embedded_statements(:(function (__ops__, x)
+argument_once = ReactiveKernels._embedded_statements(:(function (__constants__, __callables__, x)
     return x + x
 end), [:(popfirst!(xs))], :result, 0)
 @eval function embedded_argument_once(xs)

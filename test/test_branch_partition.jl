@@ -193,7 +193,7 @@ end
                       for (m, xi, yi, o) in zip(mu, xc, yc, obs))
         bound = prepare(C.chained_arms; bound = (; x = xc, y = yc, obs))
         @test length(plates(bound.plan)) == 4
-        @test any(op -> op isa RK._LaneAssemble, bound.ops)
+        @test any(op -> op isa RK._LaneAssemble, bound.callables)
         @test bound(mu) ≈ ref(mu)
         pb = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), mu; active = :mu)
         value, grad = RK.ad_value_and_gradient!(pb, similar(mu), mu)
@@ -213,7 +213,7 @@ end
                      for (xi, yi, o) in zip(xc, yc, obs))
         bound = prepare(C.guarded_location;
                         bound = (; x = xc, y = yc, idx = collect(1:3), obs))
-        @test any(op -> op isa RK._LaneAssemble, bound.ops)
+        @test any(op -> op isa RK._LaneAssemble, bound.callables)
         u = [0.2, -0.3]
         @test bound(u) ≈ ref(u)
         pb = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), u; active = :u)
@@ -236,7 +236,7 @@ end
         bound = prepare(C.guarded_shared; have = (:x, :y, :s), want = :total,
                         bound = (; y))
         @test length(plates(bound.plan)) == 2
-        @test count(op -> op isa RK._LaneGather, bound.ops) == 4
+        @test count(op -> op isa RK._LaneGather, bound.callables) == 4
         @test bound(x, s) ≈ ref(x, s)
         # No arm copies its lanes of `x`: the evaluation allocates the same
         # at twenty times the lane count.
@@ -301,7 +301,7 @@ end
             bound = prepare(C.guarded; have = (:x, :y), want, bound = (; y))
             code = code_expr(bound)
             @test code === bound.ast
-            @test occursin("__ops__", string(code))
+            @test occursin("__callables__", string(code))
             @test !occursin("yi > 0", string(code))
             for recipe in plates(bound.plan)
                 inner = recipe.op.kernel

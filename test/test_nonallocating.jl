@@ -75,7 +75,7 @@ function nonallocating_op_call_indices(ast)
     function visit(node)
         node isa Expr || return
         if node.head === :ref && length(node.args) == 2 &&
-           node.args[1] === :__ops__ && node.args[2] isa Int
+           node.args[1] === :__callables__ && node.args[2] isa Int
             push!(indices, node.args[2])
         end
         foreach(visit, node.args)

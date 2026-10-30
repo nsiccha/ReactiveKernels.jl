@@ -332,7 +332,7 @@ end
         @testset "$name" begin
             kernel = @test_logs min_level = Base.CoreLogging.Warn prepared_kernel(spec, bound)
             spec === C.branch_pointwise &&
-                @test any(op -> op isa ReactiveKernels._LaneAssemble, kernel.ops)
+                @test any(op -> op isa ReactiveKernels._LaneAssemble, kernel.callables)
             @test report("$name (native body)",
                          findings(kernel, map(Core.Typeof, args); recurse))
             prepared = @test_logs min_level = Base.CoreLogging.Warn prepare_ad(

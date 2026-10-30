@@ -126,7 +126,7 @@ _sum_to_zero_reference_cauchy(x, location, scale) =
                     split(posterior_code, '\n')) == 2
         @test !occursin("similar", posterior_code)
         @test !any(op -> op isa ReactiveKernels.PreparedKernel,
-                   posterior_kernel.ops)
+                   posterior_kernel.callables)
         posterior_produced = Set(
             canon_id(model.graph, output.id)
             for recipe in posterior_kernel.plan.recipes
@@ -179,18 +179,16 @@ _sum_to_zero_reference_cauchy(x, location, scale) =
             parameters, 5.0, innovation,
         )) == recovered
         recovery_code = sprint(
-            Base.show_unquoted,
-            ReactiveKernels._readable_expr(
-                code_expr(recovery_kernel), recovery_kernel,
-            );
-            context = :limit => false,
+            Base.show_unquoted, code_expr(recovery_kernel); context = :limit => false,
         )
         for pruned_source in ("observations", "normal(", "cauchy(",
                               "log_jacobian", "effects_free")
             @test !occursin(pruned_source, recovery_code)
         end
         @test !occursin("for ", recovery_code)
-        @test count("effects_s2z .+ mean_effect_bayes", recovery_code) == 1
+        # The recovery's source runs in the body over its two arguments.
+        @test count(r"var\"#effects_s2z#op\d+\" \.\+ var\"#mean_effect_bayes#op\d+\"",
+                    recovery_code) == 1
 
         produced = Set(
             canon_id(model.graph, output.id)

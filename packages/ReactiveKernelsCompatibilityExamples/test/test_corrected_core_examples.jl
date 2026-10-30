@@ -99,7 +99,7 @@
 
     @testset "query inputs and lowering names are validated" begin
         graph = Graph()
-        user_ops = value!(graph, :__ops__, Float64)
+        user_ops = value!(graph, :__callables__, Float64)
         hamiltonian = value!(graph, :hamiltonian, Float64)
         add!(graph, user_ops => hamiltonian, x -> abs2(x))
         @test prepare(graph; have = (user_ops,), want = (hamiltonian,))(3.0) == 9.0

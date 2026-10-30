@@ -209,7 +209,7 @@ _pointwise_reverse_bytes(q, g, u) = @allocated sampler_value_and_gradient!(q, g,
         end
         @test (idx, x, y) == saved
         emitted = sprint(show, Base.remove_linenums!(deepcopy(code_expr(query.kernel))))
-        @test !occursin(r"\bmu = \(__ops__\[", emitted)
+        @test !occursin(r"\bmu = \(__callables__\[", emitted)
         push!(bytes, _pointwise_primal_bytes(query.kernel, u))
     end
     @test bytes[2] - bytes[1] <= 64

@@ -16,6 +16,41 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.26
+
+- **Breaking:** the generated function takes two tables instead of the
+  operation table `__ops__`: `function (__constants__, __callables__, ports...)`.
+  Both have one entry per lowered recipe: `__constants__[k]` is the value of a
+  bound constant (`prepare(…; bound)`), read as `x = __constants__[k]`, and
+  `__callables__[k]` an operation the body still calls,
+  `y = (__callables__[k])(x)`; every other entry is `nothing`. A recipe whose
+  source runs in the body references neither: its statement is
+  `lhs = let var"#x#opk" = x, …; <source> end` with locals named from the
+  recipe's position, a literal statement its literal, an alias its argument,
+  and a source with captures reads them from its authored closure in the
+  callables table. `lower_with_ops` returns `(ast, constants, callables, recipes)`
+  and the compiled function is called as `f(constants, callables, ports...)`;
+  `lower` is unchanged. A prepared kernel holds `constants` and `callables`
+  instead of `ops`, keeps only the callables its body references (a plate's
+  or scan's operation whose loop is inlined is not among them), and a
+  rebinding (`bound=` with the same graph and types) replaces the constants
+  table alone. The nonallocating program's signature is
+  `(__constants__, __callables__, __caches__, __cache_apply__, ports...)`,
+  caches indexed like the callables. Values, gradients, plans, recipes,
+  `recipe_inventory` and `explain` are unchanged; `code_expr` prints the code
+  that runs. Measured on the ArbeitsplatzAtlas model: the log-density
+  kernel's type text 2.58 MB with the table, 536 KB in 0.1.23, 494 KB now
+  (1130 of its 3660 table positions are empty; the 1747 closures kept are
+  the plate cells' operations, which the plate loops still type through
+  them), the bound-data prefix's 312 KB → 92 KB → 79 KB; the log density
+  and the first native gradient are bitwise the table's. On the K=64
+  synthetic program the prepared kernel's type text is 1.03 MB → 255 KB →
+  228 KB with 648 of 1617 positions empty, and its density, gradient sum and
+  gradient hash are identical.
+- The display-only readable rewrite (`_readable_expr`, test-only) is gone:
+  the generated code is the readable code (decision `06631v9`'s direction),
+  and the tests read `code_expr` directly.
+
 ## 0.1.25
 
 - A cell (`plate_cell`, `plate_partition`) of one value of a shared cell no

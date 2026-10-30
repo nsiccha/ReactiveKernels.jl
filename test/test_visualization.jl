@@ -151,11 +151,11 @@ end
     # Reserved-looking value names remain ordinary data in all renderers and
     # cannot collide with the generated kernel's internal argument names.
     g3 = Graph()
-    reserved = value!(g3, :__ops__, Int)
+    reserved = value!(g3, :__callables__, Int)
     reserved_out = value!(g3, :__rk_values__, Int)
     add!(g3, reserved => reserved_out, identity)
     p3 = plan(g3; have = (reserved,), want = (reserved_out,))
     @test prepare(p3)(7) == 7
-    @test occursin("__ops__", dot_source(p3))
+    @test occursin("__callables__", dot_source(p3))
     @test occursin("__rk_values__", sprint(show, MIME"text/html"(), p3))
 end

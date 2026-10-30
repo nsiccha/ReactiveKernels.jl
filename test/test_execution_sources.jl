@@ -8,7 +8,7 @@ const RK = ReactiveKernels
         for i in 1:padding
             value!(graph, Symbol(:unused, i), Float64)
         end
-        ports = map(name -> value!(graph, name, Float64), (:a, :a, :a_2, :__ops__))
+        ports = map(name -> value!(graph, name, Float64), (:a, :a, :a_2, :__callables__))
         output = value!(graph, :a, Float64)
         add!(graph, ports => output, (x, y, z, w) -> 1000x + 100y + 10z + w)
         prepare(graph; have=ports, want=output)
@@ -33,15 +33,17 @@ end
     specs = [RK._kernel_eval_definition(mod, deepcopy(definition)) for _ in 1:2]
     kernels = [prepare(spec) for spec in specs]
     @test typeof(kernels[1].f) === typeof(kernels[2].f)
-    @test typeof(kernels[1].ops) === typeof(kernels[2].ops)
+    @test typeof(kernels[1].callables) === typeof(kernels[2].callables)
+    @test typeof(kernels[1].constants) === typeof(kernels[2].constants)
     @test Base.invokelatest(kernels[1], 2.0) == Base.invokelatest(kernels[2], 2.0) == 5.0
     source = [only(filter(r -> r.op isa RK._KernelSourceOp, spec.graph.recipes)) for spec in specs]
     @test RK._kernel_source_token(source[1].op) !== RK._kernel_source_token(source[2].op)
     # The differentiated callable holds only executable state: no token,
     # parameter names or module value that Enzyme must prove read-only.
-    @test isbitstype(typeof(kernels[1].ops))
+    @test isbitstype(typeof(kernels[1].callables))
+    @test isbitstype(typeof(kernels[1].constants))
     for (kernel, original) in zip(kernels, source),
-            (op, recipe) in zip(kernel.ops, kernel.lowered_recipes)
+            (op, recipe) in zip(kernel.callables, kernel.lowered_recipes)
         op isa RK._KernelSourceOp || continue
         @test RK.kernel_sourceop_token(op) === nothing
         @test RK.kernel_sourceop_token(recipe.op) === RK._kernel_source_token(original.op)
@@ -321,7 +323,7 @@ end
         Core.eval(mod, deepcopy(source))
         Core.eval(mod, :(prepare(bounded.ccdf; have = (:x, :lower, :upper), want = :ccdf)))
     end
-    @test typeof(kernels[1].ops) === typeof(kernels[2].ops)
+    @test typeof(kernels[1].callables) === typeof(kernels[2].callables)
     for mod in modules
         Core.eval(mod, :(lower = -1.0))
         @test Base.invokelatest(getglobal, mod, :lower) === -1.0
@@ -353,7 +355,7 @@ end
         end
     end
     a, b = prepare(make(1.0)), prepare(make(4.0))
-    @test typeof(a.ops) === typeof(b.ops)
+    @test typeof(a.callables) === typeof(b.callables)
     @test a(2.0) == 3.0
     @test b(2.0) == 6.0
     function make_ref(offset)
@@ -370,4 +372,13 @@ end
     @test only(only(Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(live),
         Enzyme.Active, Enzyme.Active(2.0)))) == 1.0
 end
+end
+
+@testset "legacy source wrappers retain their constructor contract" begin
+    legacy = ReactiveKernels._KernelSourceOp(Val(:legacy), Val(:fused), identity)
+    @test legacy(2) == 2
+    @test ReactiveKernels._kernel_source_call(legacy, 2) == 2
+    # The legacy constructor has no throw-stripped alternate body.
+    @test legacy.ignored_throws === nothing
+    @test ReactiveKernels._kernel_ignore_throw_op(legacy) === legacy
 end

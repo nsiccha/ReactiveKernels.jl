@@ -239,7 +239,7 @@ end
 
 _retains_body_op(k) = any(op -> op isa Union{ReactiveKernels._AuthoredScanOp,
                                                ReactiveKernels._AuthoredPlateOp},
-                          ReactiveKernels._ad_native_ops(k))
+                          ReactiveKernels._ad_native_callables(k))
 _loops(ex) = ex isa Expr ? Int(ex.head === :for) + sum(_loops, ex.args; init=0) : 0
 
 @testset "scans whose step owns a child plate or scan keep ordinary reverse AD" begin

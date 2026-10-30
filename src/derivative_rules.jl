@@ -13,8 +13,8 @@
 # partials with the backend's directions or covectors.
 #
 # Representation. Each cut is lowered by the ordinary planner
-# (`_lower_with_ops`) to a straight-line body of `name = __ops__[i](names...)`
-# statements over the cut's operation table. That body is encoded in the rule's
+# (`_lower_with_ops`) to a straight-line body of `name = (__callables__[i])(names...)`
+# statements over the cut's callables table. That body is encoded in the rule's
 # TYPE (tuples of symbols and integers) and emitted by a generated function,
 # while the operation tables are the only fields. The callable therefore holds
 # no runtime-generated code object: with singleton source operations it is an
@@ -54,7 +54,7 @@ end
 # intermediates are user-chosen identifiers, so they bind to gensym'd locals:
 # a plain local named `K`, `M`, `N` (or any other static parameter of the
 # calling generated function) refuses to compile, and one named `rule`,
-# `args`, or `__ops__` would shadow the call's own bindings. `stage_primal`
+# `args`, or `__callables__` would shadow the call's own bindings. `stage_primal`
 # needs the map to address the primal output and residuals in its own return.
 function _rule_body_expr_mapped(spec, ops_expr; tuple_return::Bool = false)
     signature, body, ret = spec[1], spec[2], spec[3]
@@ -62,7 +62,7 @@ function _rule_body_expr_mapped(spec, ops_expr; tuple_return::Bool = false)
     localname(name::Symbol) = get!(localof, name) do
         gensym(name)
     end
-    ops_local = gensym(:__ops__)
+    ops_local = gensym(:__callables__)
     statements = Any[Expr(:(=), ops_local, ops_expr)]
     for (index, name) in enumerate(signature)
         push!(statements,
@@ -210,10 +210,11 @@ function _derivative_cut_lowering(spec::KernelSpec, name::Symbol, have, want;
     p = _fuse_authored_plate_chains(_partial_apply(p, ()))
     _owns_array_regions(p) && return _rule_region_cut(p, name)
     # The cut is encoded from the operation calls (`_encode_cut_body`), so
-    # this lowering keeps every recipe's call in the table.
-    ast, ops, _ = _lower_with_ops(p; inline_sources = false)
+    # this lowering keeps every recipe's call in the table; a cut holds no
+    # constants (`_partial_apply(p, ())`).
+    ast, _, callables, _ = _lower_with_ops(p; inline_sources = false)
     cut_spec = _encode_cut_body(ast, name, generator)
-    (cut_spec, ops, cut_spec)
+    (cut_spec, callables, cut_spec)
 end
 
 # A cut that runs a plate, a scan or an embedded kernel lowers to loops, which
@@ -230,8 +231,8 @@ function _rule_region_cut(p::Plan, name::Symbol)
     union!(read, (canon_id(g, v.id) for v in p.want))
     have = Value[v for v in p.have if canon_id(g, v.id) in read]
     region_plan = _partial_subplan(p, have, p.want, p.recipes)
-    ast, ops, _ = _lower_with_ops(region_plan)
-    region = _RuleRegion{name}(compile(ast), _native_table(ast, Tuple(ops)))
+    ast, constants, callables, _ = _lower_with_ops(region_plan)
+    region = _RuleRegion{name}(compile(ast), constants, _native_table(ast, callables))
     names = _varnames(p)
     nm(v) = names[canon_id(g, v.id)]
     signature = Tuple(nm(v) for v in p.have)
@@ -253,34 +254,38 @@ The operation of a rule cut whose graph runs a plate, a scan or an embedded
 kernel (`_rule_region_cut`): the cut's compiled native body and the table it
 reads.
 """
-struct _RuleRegion{Name,F,O}
+struct _RuleRegion{Name,F,C,O}
     f::F
-    ops::O
+    constants::C
+    callables::O
 end
-_RuleRegion{Name}(f::F, ops::O) where {Name,F,O} = _RuleRegion{Name,F,O}(f, ops)
+_RuleRegion{Name}(f::F, constants::C, callables::O) where {Name,F,C,O} =
+    _RuleRegion{Name,F,C,O}(f, constants, callables)
 
 @generated function (region::_RuleRegion{Name,F})(args::Vararg{Any,N}) where {Name,F,N}
     forwarded = Any[:(getfield(args, $index)) for index in 1:N]
     _native_body_call_expr(F, :(getfield(region, :f)),
-                           Any[:(getfield(region, :ops)), forwarded...])
+                           Any[:(getfield(region, :constants)),
+                               :(getfield(region, :callables)), forwarded...])
 end
 
 _kernel_latest_source(region::_RuleRegion{Name}) where {Name} =
-    _RuleRegion{Name}(region.f, _kernel_latest_source(region.ops))
+    _RuleRegion{Name}(region.f, region.constants, _kernel_latest_source(region.callables))
 
-# Encode a lowered `function (__ops__, x::T...) name = __ops__[i](names...);
-# ...; return ... end` as type-level data. Anything outside that grammar is a
-# lowering this slice does not cover and is refused explicitly.
+# Encode a lowered `function (__constants__, __callables__, x::T...)
+# name = (__callables__[i])(names...); ...; return ... end` as type-level
+# data. Anything outside that grammar is a lowering this slice does not cover
+# and is refused explicitly.
 function _encode_cut_body(ast::Expr, name::Symbol, generator::Symbol)
     unsupported(what) = throw(ArgumentError(
         "$(generator)($(name)): the lowered cut contains $(what), " *
         "which the rule generator does not encode: $(ast)"))
     ast.head === :function || unsupported("a non-function expression")
     signature = ast.args[1]
-    (signature isa Expr && signature.head === :tuple &&
-     !isempty(signature.args) && signature.args[1] === _OPS_ARG) ||
+    (signature isa Expr && signature.head === :tuple && length(signature.args) >= 2 &&
+     signature.args[1] === _CONSTANTS_ARG && signature.args[2] === _CALLABLES_ARG) ||
         unsupported("an unexpected signature")
-    names = map(signature.args[2:end]) do arg
+    names = map(signature.args[3:end]) do arg
         arg isa Expr && arg.head === :(::) && arg.args[1] isa Symbol && return arg.args[1]
         arg isa Symbol && return arg
         unsupported("the argument $(arg)")
@@ -319,9 +324,8 @@ function _encode_cut_body(ast::Expr, name::Symbol, generator::Symbol)
             unsupported("the assignment target $(lhs)")
         end
         call = statement.args[2]
-        (call isa Expr && call.head === :call && call.args[1] isa Expr &&
-         call.args[1].head === :ref && call.args[1].args[1] === _OPS_ARG &&
-         call.args[1].args[2] isa Int) || unsupported("the statement $(statement)")
+        (call isa Expr && call.head === :call &&
+         _callable_slot(call.args[1]) !== nothing) || unsupported("the statement $(statement)")
         arguments = map(call.args[2:end]) do arg
             (arg isa Symbol || arg isa Number) && return arg
             unsupported("the call argument $(arg)")

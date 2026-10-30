@@ -85,7 +85,7 @@ _has_linenumber(x) = x isa LineNumberNode ||
         display_plan = plan(display_model)
         @test code_expr(display_model) isa Expr
         @test code_expr(display_plan) isa Expr
-        @test occursin("__ops__", string(code_expr(display_plan)))
+        @test occursin("__callables__", string(code_expr(display_plan)))
 
         kernel = prepare(display_model)
         xs = [-1.0, 0.5, 2.0]
@@ -93,7 +93,7 @@ _has_linenumber(x) = x isa LineNumberNode ||
         @test code_expr(kernel) === kernel.ast
         visible = Base.remove_linenums!(deepcopy(code_expr(kernel)))
         @test !_has_linenumber(visible)
-        @test occursin("__ops__", string(visible))
+        @test occursin("__callables__", string(visible))
         @test code_expr(kernel) === kernel.ast
     end
 
@@ -114,7 +114,7 @@ _has_linenumber(x) = x isa LineNumberNode ||
         rendered_rebind = Core.eval(@__MODULE__, code_expr(rebind))
         rows = [[1, 2], [3]]
         ys = [1.0, 2.0, 4.0]
-        @test Base.invokelatest(rendered_rebind, rebind.ops, rows, ys) ==
+        @test Base.invokelatest(rendered_rebind, rebind.constants, rebind.callables, rows, ys) ==
               rebind(rows, ys) == [10.0, 11.0]
 
         @kernel display_arm_child(x::Float64, s::Float64) = begin
@@ -127,9 +127,9 @@ _has_linenumber(x) = x isa LineNumberNode ||
         end
         arm = prepare(display_arm_parent)
         rendered_arm = Core.eval(@__MODULE__, code_expr(arm))
-        @test Base.invokelatest(rendered_arm, arm.ops, [2.0], -1.0) ==
+        @test Base.invokelatest(rendered_arm, arm.constants, arm.callables, [2.0], -1.0) ==
               arm([2.0], -1.0) == -Inf
-        @test_throws BoundsError Base.invokelatest(rendered_arm, arm.ops,
+        @test_throws BoundsError Base.invokelatest(rendered_arm, arm.constants, arm.callables,
                                                   Float64[], -1.0)
         @test_throws BoundsError arm(Float64[], -1.0)
     end

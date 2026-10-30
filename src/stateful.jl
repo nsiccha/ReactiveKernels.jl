@@ -32,28 +32,28 @@ Base.show(io::IO, value::ReactiveValue) = print(io, "state(", value.value, ")")
 
 struct _ReactiveGetter{F,O}
     f::F
-    ops::O
+    callables::O
     ast::Expr
 end
 
 @inline (getter::_ReactiveGetter)(slots, valid) =
-    getter.f(getter.ops, slots, valid)
+    getter.f(getter.callables, slots, valid)
 
 # In-place variant produced by `prepare_reactive_nonallocating`. It carries an
 # extra injected `cache_apply` callable, passed positionally to the generated
-# getter alongside the pure `ops` tuple. The generated body routes selected
+# getter alongside the pure callables tuple. The generated body routes selected
 # single-output recipes through `cache_apply` so a stale slot buffer is reused
 # in place instead of allocating a fresh recipe return. `get!` calls both getter
 # variants through the same `(slots, valid)` interface.
 struct _ReactiveGetterInPlace{F,O,A}
     f::F
-    ops::O
+    callables::O
     cache_apply::A
     ast::Expr
 end
 
 @inline (getter::_ReactiveGetterInPlace)(slots, valid) =
-    getter.f(getter.ops, getter.cache_apply, slots, valid)
+    getter.f(getter.callables, getter.cache_apply, slots, valid)
 
 """
     ReactiveProgram
@@ -181,8 +181,8 @@ function _ensure_expr(plan::Plan, index, recipe_index, id::ValueId,
         push!(body.args, quote
             if !__valid__[$slot_index]
                 __slots__[$slot_index][] = isassigned(__slots__[$slot_index]) ?
-                    __cache_apply__(__slots__[$slot_index][], __ops__[$k], $(args...)) :
-                    __ops__[$k]($(args...))
+                    __cache_apply__(__slots__[$slot_index][], __callables__[$k], $(args...)) :
+                    __callables__[$k]($(args...))
                 __valid__[$slot_index] = true
             end
         end)
@@ -201,7 +201,7 @@ function _ensure_expr(plan::Plan, index, recipe_index, id::ValueId,
         # and each recipe is emitted under its own `if !__valid__[slot]` guard, so
         # reusing the name across a diamond re-emission is a guarded reassignment of
         # the same value — semantically identical to the old distinct gensyms.
-        call = :(__ops__[$k]($(args...)))
+        call = :(__callables__[$k]($(args...)))
         multiple = length(recipe.outputs) != 1
         results = if multiple
             names = [Symbol("__recipe_result_", k, "_", position)
@@ -242,8 +242,8 @@ function _getter_ast(plan::Plan, index, recipe_index, id::ValueId;
     push!(body.args, _ensure_expr(plan, index, recipe_index, id, mutating_slots))
     push!(body.args, :(return __slots__[$slot_index][]))
     signature = in_place ?
-        Expr(:tuple, :__ops__, :__cache_apply__, :__slots__, :__valid__) :
-        Expr(:tuple, :__ops__, :__slots__, :__valid__)
+        Expr(:tuple, :__callables__, :__cache_apply__, :__slots__, :__valid__) :
+        Expr(:tuple, :__callables__, :__slots__, :__valid__)
     Expr(:function, signature, body)
 end
 

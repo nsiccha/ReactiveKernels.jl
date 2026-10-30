@@ -77,9 +77,9 @@ end
     @test ReactiveKernels.kernel_endpoint_names(let_scopes) ==
           (:sequential, :shadowed, :statement, :sibling, :shadowed_endpoint)
     endpoint_let = prepare(inflated_let.logkernel)
-    @test occursin("let nl1pe",
-                   string(ReactiveKernels._readable_expr(
-                       code_expr(endpoint_let), endpoint_let)))
+    # The endpoint's source keeps its `let`; its recipe carries that source.
+    @test occursin("let nl1pe", string(only(r for r in endpoint_let.lowered_recipes
+                                              if only(r.outputs).name === :logkernel).source))
     endpoint_block = prepare(inflated_block.logkernel)
     for (n, logit, zi, observed) in ((8, -0.4, 0.3, 0), (8, 100.0, 0.3, 0),
                                      (8, 0.7, 0.2, 3), (8, -1.3, 0.6, 8))

@@ -40,8 +40,7 @@ function _plan_value_types(recipe_types, p::Plan, argument_types)
     types = Dict{ValueId,Any}(canon_id(p.graph, v.id) => T
                           for (v, T) in zip(p.have, argument_types))
     for recipe in p.recipes
-        input_types = Any[get(types, canon_id(p.graph, v.id), Any)
-                          for v in recipe.inputs]
+        input_types = _input_list(v -> get(types, canon_id(p.graph, v.id), Any), recipe.inputs)
         for (output, T) in zip(recipe.outputs, recipe_types(recipe, input_types))
             types[canon_id(p.graph, output.id)] = T
         end

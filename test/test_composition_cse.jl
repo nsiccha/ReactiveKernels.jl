@@ -19,7 +19,7 @@ using Test
         # only ONE `f` application survives + the sum
         @test count(r -> r.cse_key === :f, p.recipes) == 1
         ast = string(code_expr(p))
-        @test count(m -> true, collect(eachmatch(r"__ops__\[", ast))) == 2  # f once, sum once
+        @test count(m -> true, collect(eachmatch(r"__callables__\[", ast))) == 2  # f once, sum once
         k = prepare(p)
         @test k(2.0, 3.0) == 10.0        # a1=a2=5, s=10
     end

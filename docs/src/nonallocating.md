@@ -57,8 +57,8 @@ The ordinary generated function calls each of these operations directly, since
 `copy` and `reverse` are bare calls of Base functions:
 
 ```julia
-copied = __ops__[1](x)
-reversed = __ops__[2](copied)
+copied = (__callables__[1])(x)
+reversed = (__callables__[2])(copied)
 ```
 
 A recipe whose operation is its authored source (an expression such as
@@ -68,8 +68,8 @@ non-allocating version lowers every recipe as a call and routes each call that
 has an in-place form through a small helper that fills a reusable cache:
 
 ```julia
-copied = __cache_apply__(__caches__[1], __ops__[1], x)
-reversed = __cache_apply__(__caches__[2], __ops__[2], copied)
+copied = __cache_apply__(__caches__[1], __callables__[1], x)
+reversed = __cache_apply__(__caches__[2], __callables__[2], copied)
 ```
 
 `code_expr(k)` shows the resulting function. The recipes chosen and the order of
