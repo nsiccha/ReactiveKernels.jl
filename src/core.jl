@@ -403,6 +403,18 @@ end
     forwarded = [:(getfield(args, $index)) for index in 1:N]
     :(_kernel_source_call(op, $(forwarded...)))
 end
+# A deep copy of a plan copies its operations; the authoring module is a
+# global object the copy shares (`deepcopy` refuses a `Module`).
+function Base.deepcopy_internal(op::_KernelSourceOp, stackdict::IdDict)
+    haskey(stackdict, op) && return stackdict[op]
+    copy = _KernelSourceOp(Val(getfield(op, :token)), Val(getfield(op, :form)),
+                           Base.deepcopy_internal(getfield(op, :f), stackdict),
+                           Base.deepcopy_internal(getfield(op, :ignored_throws), stackdict),
+                           Base.deepcopy_internal(getfield(op, :call_identity), stackdict),
+                           getfield(op, :mod))
+    stackdict[op] = copy
+end
+
 # One instance for every operation type: the readers below run for every
 # recipe of a program.
 Base.@nospecializeinfer kernel_sourceop_token(@nospecialize(op::_KernelSourceOp)) =

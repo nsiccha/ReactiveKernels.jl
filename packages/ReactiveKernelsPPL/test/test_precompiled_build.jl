@@ -122,8 +122,14 @@ using ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels, T
                 [-a / 25 + sum(r) / s^2, -b / 4 + sum(x .* r) / s^2,
                  1 - s + sum(r .^ 2 ./ s^2 .- 1)]
             end
-            closure_roots(spec) = Set(Base.moduleroot(RK._kernel_endpoint_source_module(r.op))
-                                      for r in spec.graph.recipes)
+            # The module whose image owns each source companion (the cache of
+            # its generated function), and each source's authoring module.
+            companion_roots(spec) = Set(Base.moduleroot(parentmodule(
+                    typeof(RK._native_generated_function(f.companion)).parameters[2]))
+                for r in spec.graph.recipes if r.op isa RK._KernelSourceOp
+                for f in (RK._source_record(r.op.f),) if f !== nothing && f.companion !== nothing)
+            source_modules(spec) = Set(RK._kernel_endpoint_source_module(r.op)
+                for r in spec.graph.recipes if r.op isa RK._KernelSourceOp)
             @testset "loaded images" begin
             @test B.WAS_PRECOMPILED && P.WAS_PRECOMPILED
             x, y = [0.0, 1.0, 2.0], [0.1, 0.9, 2.2]
@@ -136,13 +142,17 @@ using ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels, T
                 # One build serves another binding of the same program.
                 @test prepare_query(B.BUILT, P.PLAN, :sampler)(u) ≈ density(u, x2, y2)
             end
-            # Each image owns its builds' closures; a build at run time is
-            # evaluated in `PPLGeneratedModels`, as before.
-            @test B in closure_roots(B.BUILT.spec)
-            @test P in closure_roots(P.BUILT.spec)
+            # Each image owns the source companions of its builds, and a build
+            # of the same program at run time reuses them (`compile` returns a
+            # loaded image's generated function). Every build resolves its
+            # sources' names in `PPLGeneratedModels`.
+            @test B in companion_roots(B.BUILT.spec)
+            @test P in companion_roots(P.BUILT.spec)
             runtime = build_kernel(B.PLAN)
-            @test ReactiveKernelsPPL in closure_roots(runtime.spec)
-            @test isdisjoint(closure_roots(runtime.spec), (B, P))
+            @test !isempty(companion_roots(runtime.spec))
+            @test companion_roots(runtime.spec) ⊆
+                  union(companion_roots(B.BUILT.spec), companion_roots(P.BUILT.spec))
+            @test all(m -> Base.moduleroot(m) === ReactiveKernelsPPL, source_modules(runtime.spec))
             @test prepare_query(runtime, B.PLAN, :sampler)([0.3, -0.2, 0.1]) ≈
                   density([0.3, -0.2, 0.1], x, y)
             end
