@@ -776,6 +776,23 @@ end
     return dens
 end
 
+# Group totals a plate computes through a shared index array (`log_w[rows[k]]`),
+# gathered by group in the predictor the cell reads, as a mixture intensity
+# sums a component's rows over each group: the plate runs at the groups read,
+# and `log_w` at those groups' rows.
+@kernel _cell_group_totals(y, positions::Vector{Int}, rows::Vector{Vector{Int}},
+                           g::Vector{Int}, x, beta::Vector{Float64}) = begin
+    log_w = x .* beta[1] .+ beta[2]
+    totals = plate(positions) do k
+        sum(exp.(log_w[rows[k]]))
+    end
+    mu = log.(totals[g])
+    dens = plate(mu, y) do mi, yi
+        -(yi - mi)^2 / 2
+    end
+    return dens
+end
+
 # Matrices stacked by `vcat` and read by a row gather.
 @kernel _cell_stacked(y, A::Matrix{Float64}, B::Matrix{Float64}, g::Vector{Int}) = begin
     M = vcat(A, B)
@@ -798,7 +815,7 @@ end
     return dens
 end
 
-@testset "plate_cell: vcat operands, typed aliases and several gather indices at the cell's rows" begin
+@testset "plate_cell: vcat operands, typed aliases, several gather indices and index-array plates at the cell's rows" begin
     have = (:y, :observed, :mask, :lookup, :free, :scale, :z, :r1, :r2)
     k = prepare(plate_cell(_cell_completion, :dens; index = :i);
         have = (have..., :i), want = :dens_cell)
@@ -859,6 +876,34 @@ end
     narrow = (; s..., B = s.B[:, 1:2])
     @test_throws DimensionMismatch sfull(narrow...)
     @test_throws DimensionMismatch sk(narrow..., 2)
+    # Group totals read through a shared index array, gathered by group.
+    tk = prepare(plate_cell(_cell_group_totals, :dens; index = :i);
+        have = (:y, :positions, :rows, :g, :x, :beta, :i), want = :dens_cell)
+    tfull = prepare(_cell_group_totals; have = (:y, :positions, :rows, :g, :x, :beta),
+        want = :dens)
+    function totals_data(n)
+        groups = max(2, n ÷ 4)
+        rows = [Int[j for j in 1:n if mod1(j, groups) == k] for k in 1:groups]
+        (; y = cos.(1:n), positions = collect(1:groups), rows,
+           g = [mod1(3j, groups) for j in 1:n], x = collect(range(-1, 1; length = n)))
+    end
+    t, beta = totals_data(12), [0.4, -0.2]
+    treference = tfull(t..., beta)
+    @test [tk(t..., beta, i) for i in eachindex(t.y)] ≈ treference
+    tpushed = let lp = ReactiveKernels._lowering_plan(tk.plan),
+                  cells = ReactiveKernels._cell_pushdowns(lp)
+        Set(String(cells.producer[c].outputs[1].name) for c in cells.pushed)
+    end
+    @test issubset(Set(["log_w", "totals", "mu"]), tpushed)
+    talloc(n) = let t = totals_data(n); tk(t..., beta, 2); @allocated tk(t..., beta, 2) end
+    @test talloc(16) == talloc(16_000)
+    tad = prepare_ad(tk, backend, t..., beta, 5; active = :beta)
+    tvalue, dbeta = ad_value_and_gradient(tad, t..., beta, 5)
+    @test tvalue ≈ treference[5]
+    for j in 1:2
+        e = setindex!(zeros(2), 1.0, j)
+        @test dbeta[j] ≈ _cell_central(h -> tk(t..., beta .+ h .* e, 5), 0.0) rtol = 1e-6
+    end
     # A converting declaration is computed whole, and still converts.
     ck = prepare(plate_cell(_cell_converted, :dens; index = :i);
         have = (:y, :x, :r, :i), want = :dens_cell)

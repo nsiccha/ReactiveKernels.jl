@@ -248,6 +248,11 @@ end
     out
 end
 
+# The rows a plate reads through its index array `w` at the positions `qs`
+# its index argument holds there (`v[w[q]]`): each `w[q]` is one row or several.
+@inline _cell_via_rows(w, qs) =
+    Int[row for q in qs for row in (vec(w)[q] isa Integer ? (vec(w)[q],) : vec(w)[q])]
+
 # The rows several gather indices read, joined in order.
 @inline _cell_gather_rows(ats...) =
     Int[row for at in ats for row in (at isa Integer ? (at,) : at)]
@@ -317,7 +322,9 @@ end
 # input a gather source `j` is read by (`A[I]` and `A[J]` in one expression
 # read `A` at the rows of both). `parts` are a `vcat`'s operands in order: an
 # input position, or a number literal; an input read as a `vcat` operand has
-# role `:part`.
+# role `:part`. `vias[j]` is the shared index array an authored plate reads
+# source `j` through (`v[w[q]]`, `q` the element of index input
+# `gather_index[j]`), 0 for a direct read; that index array has role `:via`.
 struct _CellForm
     kind::Symbol
     roles::Vector{Symbol}
@@ -326,11 +333,13 @@ struct _CellForm
     operand::Int
     indices::Vector{Vector{Int}}
     parts::Vector{Any}
+    vias::Vector{Int}
 end
-_CellForm(kind, roles, gather_index, leaves, operand) =
-    _CellForm(kind, roles, gather_index, leaves, operand,
-        Vector{Int}[role in (:gather, :linear_gather) ? [gather_index[j]] : Int[]
-                    for (j, role) in enumerate(roles)], Any[])
+_CellForm(kind, roles, gather_index, leaves, operand, indices = Vector{Int}[
+        role in (:gather, :linear_gather) ? [gather_index[j]] : Int[]
+        for (j, role) in enumerate(roles)], parts = Any[]) =
+    _CellForm(kind, roles, gather_index, leaves, operand, indices, parts,
+        zeros(Int, length(roles)))
 
 # Expression heads that bind no names; any other head declines the rewrite.
 const _CELL_PLAIN_HEADS = (:call, :ref, :tuple, :., Symbol("'"), :vect, :hcat,
@@ -515,7 +524,7 @@ function _cell_form(r::Recipe)
     gather_index = Int[isempty(indices[j]) ? get(products, j, 0) : first(indices[j])
                        for j in eachindex(params)]
     _CellForm(kind, roles, gather_index, kind in (:hcat, :vcat) ? leaves : unique!(leaves),
-        operand, indices, parts)
+        operand, indices, parts, zeros(Int, length(roles)))
 end
 
 # An identity `b::T = a` (a typed alias RK keeps as a recipe): its rows are
@@ -541,7 +550,9 @@ end
 
 # An authored plate's value, row by row: its batched arguments are broadcast
 # operands, a shared argument read only at one batched integer argument's
-# element is gathered by it, and any other shared argument is read whole.
+# element, or through a shared index array at it (`v[w[q]]`, as a total over a
+# group of rows reads them), is gathered by it, and any other shared argument
+# is read whole.
 function _cell_plate_form(r::Recipe)
     op = r.op::_AuthoredPlateOp
     atomic = typeof(op).parameters[2]
@@ -554,18 +565,25 @@ function _cell_plate_form(r::Recipe)
     isempty(leaves) && return nothing
     roles = Symbol[k in atomic ? :whole : :leaf for k in 1:n]
     gather_index = zeros(Int, n)
+    vias = zeros(Int, n)
     wants = Set(canon_id(ig, w.id) for w in inner.want)
     for k in atomic
         roots[k] in wants && continue
         read = _cell_capture_reader(inner, roots, atomic, roots[k])
         read === nothing && continue
         b, via = read
-        via == 0 || continue
+        # An index array is read whole; it cannot also be gathered.
+        via == 0 || roles[via] in (:whole, :via) || continue
         roles[k] = :linear_gather
         gather_index[k] = b
         roles[b] = :index
+        via == 0 || (vias[k] = via; roles[via] = :via)
     end
-    _CellForm(:pointwise, roles, gather_index, leaves, 0)
+    any(k -> roles[k] === :via && (gather_index[k] != 0 || vias[k] != 0), 1:n) &&
+        return nothing
+    f = _CellForm(:pointwise, roles, gather_index, leaves, 0)
+    _CellForm(f.kind, f.roles, f.gather_index, f.leaves, f.operand, f.indices, f.parts,
+        vias)
 end
 
 # `*` as the closure resolves it is Base's, or the native body's companion
@@ -766,6 +784,7 @@ function _cell_pushdowns(p::Plan)
             role === :factor_leaf ? (static_type(input) <: AbstractArray || array_form(input)) &&
                 static_type(r.inputs[paired]) <: Union{AbstractVecOrMat,Number} :
             role === :scalar ? static_type(input) <: AbstractArray{<:Number} :
+            role === :via ? _cell_positions_type(static_type(input)) :
             true
         end
     end
@@ -943,8 +962,10 @@ function _cell_window!(e::_CellEmitter, cid::ValueId, row::Symbol)
             # those of several indices).
             ats = map(f.indices[j]) do k
                 index = canon_id(d.graph, r.inputs[k].id)
-                Expr(:call, _cell_ref(:_cell_gather_row), _cell_operand_row!(e, index, row),
-                    row)
+                at = _cell_operand_row!(e, index, row)
+                f.vias[j] == 0 ? Expr(:call, _cell_ref(:_cell_gather_row), at, row) :
+                    Expr(:call, _cell_ref(:_cell_via_rows),
+                        e.names[canon_id(d.graph, r.inputs[f.vias[j]].id)], at)
             end
             at = length(ats) == 1 ? only(ats) :
                 Expr(:call, _cell_ref(:_cell_gather_rows), ats...)
