@@ -1034,3 +1034,80 @@ end
     @test "s" in pushed(zero_rank)
     @test [zero_rank(d..., fill(0.7), i) for i in 1:8] ≈ [scalar(d..., 0.3, 0.4, i) for i in 1:8]
 end
+
+# A gather straight from an inline `vcat`, alone and inside a dotted
+# completion, as one expression (snag `inline-vcat-gath-bb73ae09`): the cell
+# lowering outlines the `vcat` into a value of its own, so the cell computes
+# both at its rows, as their two-statement spelling (`stacked = vcat(...)`,
+# `stacked[order]`) does. A completion also read whole stays as written.
+@kernel _cell_inline_gather(y, observed, z, order::Vector{Int}, s::Float64) = begin
+    drawn = exp.(z .* s)
+    completed = (vcat(observed, drawn))[order]
+    dens = plate(completed, y) do ci, yi
+        -(yi - ci)^2 / 2
+    end
+    return dens
+end
+
+@kernel _cell_inline_masked(y, observed, mask, z, lookup::Vector{Int}, s::Float64) = begin
+    drawn = exp.(z .* s)
+    completed = observed .+ mask .* vcat(drawn, z)[lookup]
+    dens = plate(completed, y) do ci, yi
+        -(yi - ci)^2 / 2
+    end
+    return dens
+end
+
+@kernel _cell_inline_whole(y, observed, z, order::Vector{Int}, s::Float64) = begin
+    drawn = exp.(z .* s)
+    completed = (vcat(observed, drawn))[order]
+    total = sum(completed)
+    dens = plate(completed, y) do ci, yi
+        -(yi - ci)^2 / 2 + total
+    end
+    return dens
+end
+
+@testset "plate_cell: a gather from an inline vcat runs at the cell's rows" begin
+    gathered(n) = let nobs = n ÷ 2
+        (; y = cos.(1:n), observed = collect(range(0.1, 0.9; length = nobs)),
+           z = collect(range(-0.5, 0.4; length = n - nobs)), order = collect(n:-1:1))
+    end
+    masked(n) = (; y = cos.(1:n), observed = collect(range(0.1, 0.9; length = n)),
+        mask = Float64[isodd(j) for j in 1:n], z = collect(range(-0.5, 0.4; length = n)),
+        lookup = [mod1(3j, 2n) for j in 1:n])
+    outlined(k) = ReactiveKernels._cell_outlined_pushdowns(
+        ReactiveKernels._lowering_plan(k.plan))
+    pushed(k) = let (_, cells) = outlined(k)
+        cells === nothing ? Set{String}() :
+            Set(String(cells.producer[v].outputs[1].name) for v in cells.pushed)
+    end
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for (spec, have, data) in ((_cell_inline_gather, (:y, :observed, :z, :order), gathered),
+                               (_cell_inline_masked, (:y, :observed, :mask, :z, :lookup), masked))
+        k = prepare(plate_cell(spec, :dens; index = :i); have = (have..., :s, :i),
+            want = :dens_cell)
+        full = prepare(spec; have = (have..., :s), want = :dens)
+        d = data(10)
+        reference = full(d..., 0.7)
+        @test [k(d..., 0.7, i) for i in eachindex(reference)] ≈ reference
+        @test issubset(Set(["drawn", "completed_part1", "completed"]), pushed(k))
+        allocated(n) = let d = data(n); k(d..., 0.7, 2); @allocated k(d..., 0.7, 2) end
+        @test allocated(20) == allocated(20_000)
+        @test_throws BoundsError k(d..., 0.7, 11)
+        for i in (1, 7)
+            ad = prepare_ad(k, backend, d..., 0.7, i; active = :s)
+            value, ds = ad_value_and_gradient(ad, d..., 0.7, i)
+            @test value ≈ reference[i]
+            @test ds ≈ _cell_central(s -> k(d..., s, i), 0.7) atol = 1e-8
+        end
+    end
+    # Read whole by `sum`, the completion is computed whole: nothing is outlined.
+    k = prepare(plate_cell(_cell_inline_whole, :dens; index = :i);
+        have = (:y, :observed, :z, :order, :s, :i), want = :dens_cell)
+    full = prepare(_cell_inline_whole; have = (:y, :observed, :z, :order, :s), want = :dens)
+    d = gathered(10)
+    @test [k(d..., 0.7, i) for i in 1:10] ≈ full(d..., 0.7)
+    lp = ReactiveKernels._lowering_plan(k.plan)
+    @test first(ReactiveKernels._cell_outlined_pushdowns(lp)) === lp
+end

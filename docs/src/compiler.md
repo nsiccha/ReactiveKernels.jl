@@ -1001,7 +1001,9 @@ supports these producers:
   of an array of numbers (read whole, as in `z .* tau[1]`). One source may be
   gathered by several index vectors, as in `exp.(t[r1]) .+ exp.(t[r2])`; it
   is then computed at the rows of every index;
-- such a gather alone, and such a column read alone;
+- such a gather alone, also written as the read-only view
+  `_readonly_gather(A, I)` that RKPPL reads a bare gathered definition
+  through, and such a column read alone;
 - `hcat(a, b, ...)` of inputs, such as a design matrix with a computed column;
 - `vcat(a, b, ...)` of inputs and number literals, such as a completed
   covariate `vcat(free, grouped)[lookup]` or a padded field `vcat(phi, 0.0)`.
@@ -1025,6 +1027,22 @@ supports these producers:
   row by these rules. So a later plate reading `pred[i]` from
   `pred = plate(rows) do r; f(log_k[r]) end` computes `pred` and `log_k` at
   row `i` only.
+
+These producers can also be written inside one expression, such as a gather
+straight from an inline `vcat`, `completed = vcat(observed, drawn)[order]`, or
+`observed .+ mask .* vcat(free, grouped)[lookup]`. The cell lowering outlines
+the inner call into a value of its own, so both are computed at the rows read,
+as with the two-statement spelling `stacked = vcat(observed, drawn)` and
+`completed = stacked[order]`. A call is outlined where the producers above read
+a value by name: a gather's source or index, an operand of `vcat`, `hcat` or
+`*`, or an operand of a dotted expression that is not itself dotted (a nested
+dotted call stays fused). Only strict subexpressions are outlined, never a
+branch arm, a generator or a closure body, and the parts apply the authored
+operations to the same operands in the same order, so values are unchanged. A
+recipe is outlined only when the cell then computes it at its rows; otherwise
+it is lowered as written. Cheap expressions are not outlined: a gather `x[pos]`
+written as a `vcat` operand (`vcat(x[pos], u)`) still makes that `vcat` read
+whole.
 
 The producer's own operation runs on views of its row-aligned operands at the
 rows read; an operand that broadcasting extrudes is passed whole, or repeated

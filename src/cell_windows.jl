@@ -21,7 +21,9 @@
 #   an integer vector input `I` (integer literals after it), column reads
 #   `A[:, 1, ...]`, products `A * w` of two inputs, and literal-position reads
 #   `a[1]` of an array of numbers (read whole);
-# - such a gather on its own, and such a column read on its own;
+# - such a gather on its own (also as `_readonly_gather(A, I)`, the view RKPPL
+#   reads a bare gathered definition through), and such a column read on its
+#   own;
 # - `hcat(a, b, ...)` of inputs: row `r` is the `hcat` of each operand's row
 #   `r`;
 # - a product `A * W...` (a source expression, or a bare call that keeps
@@ -48,7 +50,10 @@
 # this way, so the program computes no value twice in different ways. The
 # cell's batched element must be provably an integer (a linear position) or an
 # integer vector, and each gather index provably an integer vector
-# (`_cell_static_type`).
+# (`_cell_static_type`). A recipe that holds one of these shapes inside one
+# expression, such as a gather from an inline `vcat`, is first split into
+# recipes of its own along its authored structure (`_cell_outlined_pushdowns`,
+# below).
 #
 # Shapes and bounds keep the whole program's checks for this cell: each
 # dotted expression's and `hcat`'s full shape is computed from its operands'
@@ -120,6 +125,13 @@ end
     _cell_reads_rows(w, I) && return w.data[:, j, rest...]
     [w[i, j, rest...] for i in I]
 end
+
+# A read-only gather of a vector (`_readonly_gather`, core.jl, the view RKPPL
+# reads a bare gathered definition through) reads the window's rows as the
+# linear gather `w[I]` does; any other shape keeps `_readonly_gather`'s
+# `MethodError`.
+@inline _readonly_gather(w::_CellWindow{<:Any,<:Any,<:Tuple{Any}},
+                         indices::AbstractVector{<:Integer}) = w[indices]
 
 Base.show(io::IO, w::_CellWindow{<:Any,Int}) =
     print(io, "cell window at row ", w.rows, " of ", summary(w.data))
@@ -366,8 +378,8 @@ const _CELL_PLAIN_HEADS = (:call, :ref, :tuple, :., Symbol("'"), :vect, :hcat,
     :vcat, :row, :nrow, :ncat, :parameters, :kw, :comparison, :&&, :||, :if,
     :curly, :..., :string, :(::))
 
-function _cell_native(r::Recipe)
-    closure = _lane_source_closure(r)
+function _cell_native(r::Recipe; outlined::Bool = false)
+    closure = _lane_source_closure(r; outlined)
     closure === nothing && return nothing
     _, params, mod = closure
     source = _lane_expand_dot(_lane_strip_lines(r.source), mod)
@@ -400,7 +412,7 @@ function _cell_whole_uses!(uses, ex, position, role)
     all(arg -> _cell_whole_uses!(uses, arg, position, role), ex.args)
 end
 
-function _cell_form(r::Recipe)
+function _cell_form(r::Recipe; outlined::Bool = false)
     length(r.outputs) == 1 && !r.effectful || return nothing
     r.op isa _AuthoredPlateOp && return _cell_plate_form(r)
     r.source isa Symbol && return _cell_identity_form(r)
@@ -413,7 +425,7 @@ function _cell_form(r::Recipe)
         return _CellForm(:product, roles, zeros(Int, n), Int[], n == 2 ? 2 : 0)
     end
     r.op isa _KernelSourceOp || return nothing
-    analyzed = _cell_native(r)
+    analyzed = _cell_native(r; outlined)
     analyzed === nothing && return nothing
     native, params, mod = analyzed
     position = Dict{Symbol,Int}(name => j for (j, name) in enumerate(params))
@@ -424,6 +436,10 @@ function _cell_form(r::Recipe)
     products = Dict{Int,Int}()
     leaves = Int[]
     param(x) = x isa Symbol && haskey(position, x)
+    # `_readonly_gather(A, I)`, RKPPL's view of a bare gathered definition: the
+    # linear gather `A[I]`.
+    readonly(ex) = ex isa Expr && ex.head === :call && length(ex.args) == 3 &&
+        !(ex.args[1] in params) && _kernel_resolve_binding(mod, ex.args[1]) === _readonly_gather
     function gather!(ex)
         length(ex.args) >= 2 || return false
         source, index = ex.args[1], ex.args[2]
@@ -448,6 +464,7 @@ function _cell_form(r::Recipe)
         end
         ex isa Union{Int,Float64,Bool} && return true
         ex isa Expr && ex.head === :ref && return gather!(ex) || column!(ex) || scalar!(ex)
+        readonly(ex) && return gather!(Expr(:ref, ex.args[2], ex.args[3]))
         ex isa Expr && ex.head === :call && return product!(ex)
         false
     end
@@ -493,6 +510,8 @@ function _cell_form(r::Recipe)
         push!(leaves, position[native.args[1]])
     elseif native isa Expr && native.head === :ref
         gather!(native) || return nothing
+    elseif readonly(native)
+        gather!(Expr(:ref, native.args[2], native.args[3])) || return nothing
     elseif native isa Expr && native.head === :call && length(native.args) >= 2 &&
            native.args[1] == GlobalRef(@__MODULE__, :_native_hcat) &&
            all(arg -> arg isa Symbol && haskey(position, arg), native.args[2:end])
@@ -748,7 +767,13 @@ end
 _cell_row_role(role) =
     role in (:leaf, :gather, :linear_gather, :column, :factor_leaf, :factor, :part)
 
-function _cell_pushdowns(p::Plan)
+# `outlined` are the ids of the recipes a cell lowering outlined (`_cell_outline`);
+# `blocked`, when given, collects the ids of the producers whose values a reader
+# asks for at rows but that have no row form; `known` keeps the forms of recipes
+# already analyzed, by recipe.
+function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
+                         blocked::Union{Nothing,Set{Int}} = nothing,
+                         known::IdDict{Recipe,Any} = IdDict{Recipe,Any}())
     any(r -> r.op isa _AuthoredPlateCellOp, p.recipes) || return nothing
     g = p.graph
     cidof(v) = canon_id(g, v.id)
@@ -769,7 +794,7 @@ function _cell_pushdowns(p::Plan)
         (cid in fixed || length(candidates) != 1) && return nothing
         r = only(candidates)
         haskey(forms, r.id) && return forms[r.id]
-        f = _cell_form(r)
+        f = get!(() -> _cell_form(r; outlined = r.id in outlined), known, r)
         f === nothing || (forms[r.id] = f)
         f
     end
@@ -816,6 +841,11 @@ function _cell_pushdowns(p::Plan)
     work = ValueId[]
     function reach!(cid, role)
         cid in pushed && return
+        if blocked !== nothing && form(cid) === nothing
+            candidates = get(producers, cid, Recipe[])
+            cid in fixed || length(candidates) != 1 || push!(blocked, only(candidates).id)
+            return
+        end
         fits(cid, role) && operands_fit(cid) || return
         push!(pushed, cid)
         push!(work, cid)
@@ -869,6 +899,134 @@ function _cell_pushdowns(p::Plan)
     _CellPushdowns(g, pushed, recipes,
         Dict(cid => only(producers[cid]) for cid in pushed), forms, captures, batched,
         Dict{Int,Int}(), Dict{Int,Any}(), Dict(r.id => k for (k, r) in enumerate(p.recipes)))
+end
+
+# ---------------------------------------------------------------- outlining
+
+# A recipe without a row form can hold a subexpression with one where a form
+# reads a named value: `vcat(observed, drawn)[order]` gathers from an inline
+# `vcat`, so a cell computed the whole `vcat` and gathered from it, while
+# `stacked = vcat(observed, drawn); stacked[order]` computes both at the
+# gathered rows (snag `inline-vcat-gath-bb73ae09`). A cell lowering outlines
+# such subexpressions along the recipe's split nodes (`_KernelSplit`, the
+# decomposition `bound=` partial evaluation splits data-only parts along,
+# `_partial_emit_split!`): each becomes a recipe of its own, read by name.
+# Split nodes are strict subexpressions only, so no part runs where the
+# authored expression would not, and the parts apply the authored operations
+# to the same operands in the same order: values are unchanged. An outline is
+# kept only while its recipe is then computed at the cell's rows; any other
+# recipe stays as authored.
+
+# Whether `ex` is a dotted call `f.(x...)`, or one of a dotted operator `x .+ y`.
+_cell_dotted_call(ex) = ex isa Expr && ex.head === :. && length(ex.args) == 2 &&
+    Meta.isexpr(ex.args[2], :tuple)
+function _cell_dotted(ex)
+    _cell_dotted_call(ex) && return true
+    ex isa Expr && ex.head === :call && !isempty(ex.args) || return false
+    name = _kernel_split_callee_name(ex.args[1])
+    name isa Symbol && length(String(name)) > 1 && startswith(String(name), ".")
+end
+
+# Whether a row form reads operand `child` of `parent` as a named value: a
+# gather's source or index, an operand of `vcat`, `hcat` or `*`, or a
+# broadcast operand that is not itself fused into the broadcast.
+function _cell_named_operand(parent::Expr, child)
+    parent.head === :ref && return true
+    _cell_dotted(parent) && return !_cell_dotted(child)
+    parent.head === :call && !isempty(parent.args) || return false
+    _kernel_split_callee_name(parent.args[1]) in (:vcat, :hcat, :*)
+end
+
+# The split parts of recipe `r` (`_partial_split_parts`) with the nodes to
+# outline whole marked, or `nothing`: each node in a named-operand position
+# that holds no such node itself. A node holding a marked one is split around
+# it (`_partial_emit_split!`).
+function _cell_outline_nodes(r::Recipe)
+    length(r.outputs) == 1 && !r.effectful || return nothing
+    parts = _partial_split_parts(r)
+    parts === nothing && return nothing
+    nodes = parts.split.nodes
+    index = IdDict{Any,Int}(node.expr => i for (i, node) in enumerate(nodes))
+    named = falses(length(nodes))
+    function walk(ex)
+        ex isa Expr && !(ex.head in (:quote, :inert)) || return
+        for child in (_cell_dotted_call(ex) ? ex.args[2].args : ex.args)
+            i = get(index, child, 0)
+            i == 0 || (named[i] = _cell_named_operand(ex, child))
+            walk(child)
+        end
+    end
+    walk(_kernel_branch_unwrap(r.source))
+    marked = falses(length(nodes))
+    below = falses(length(nodes))
+    for (i, node) in enumerate(nodes)          # post-order: kids come first
+        below[i] = any(k -> named[k] || below[k], node.kids)
+        marked[i] = named[i] && !below[i]
+    end
+    any(marked) ? (; parts, marked = collect(marked)) : nothing
+end
+
+# `p` with each recipe in `outlines` (id => `_cell_outline_nodes`) outlined,
+# and the ids of the recipes the outlines made. New values live in a copy of
+# the graph; `p.graph` is unchanged.
+function _cell_outline(p::Plan, outlines::Dict{Int,Any})
+    isempty(outlines) && return p, Set{Int}()
+    g = p.graph
+    copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers), copy(g.aliases),
+                   g.version)
+    next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
+    fresh() = (id = next_id[]; next_id[] -= 1; id)
+    recipes = Recipe[]
+    outlined = Set{Int}()
+    readable = Dict{Int,Any}()
+    for r in p.recipes
+        outline = get(outlines, r.id, nothing)
+        if outline === nothing
+            push!(recipes, r)
+            continue
+        end
+        start = length(recipes)
+        _partial_emit_split!(recipes, readable, copied, r, outline.parts, outline.marked,
+                             fresh)
+        foreach(q -> push!(outlined, q.id), @view recipes[start+1:end])
+    end
+    template = Plan(copied, p.have, p.want, p.recipes, p.producer, p.cost, p.candidates)
+    _partial_subplan(template, p.have, p.want, recipes), outlined
+end
+
+"""
+    _cell_outlined_pushdowns(p::Plan) -> (plan, pushdowns)
+
+`p` with the recipes outlined that the cells then compute at their rows (see
+above), and that plan's pushdowns (`_cell_pushdowns`, `nothing` when no value
+is computed at rows). A recipe is outlined when a reader asks for its value at
+rows and it has no row form; the outline stays while the recipe is pushed, and
+is dropped for good otherwise. `p` itself when nothing is outlined.
+"""
+function _cell_outlined_pushdowns(p::Plan)
+    any(r -> r.op isa _AuthoredPlateCellOp, p.recipes) || return p, nothing
+    known = IdDict{Recipe,Any}()
+    byid = Dict(r.id => r for r in p.recipes)
+    candidates = Dict{Int,Any}()
+    candidate(id) = haskey(byid, id) ?
+        get!(() -> _cell_outline_nodes(byid[id]), candidates, id) : nothing
+    kept = Dict{Int,Any}()
+    refused = Set{Int}()
+    while true
+        q, outlined = _cell_outline(p, kept)
+        blocked = Set{Int}()
+        cells = _cell_pushdowns(q; outlined, blocked, known)
+        lost = Int[id for id in keys(kept) if cells === nothing || !(id in cells.recipes)]
+        if !isempty(lost)
+            union!(refused, lost)
+            foreach(id -> delete!(kept, id), lost)
+            continue
+        end
+        new = Int[id for id in blocked if !haskey(kept, id) && !(id in refused) &&
+                  candidate(id) !== nothing]
+        isempty(new) && return q, cells
+        foreach(id -> kept[id] = candidates[id], new)
+    end
 end
 
 # ---------------------------------------------------------------- emission
