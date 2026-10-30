@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.23
+
+- `prepare_partition` and `prepare_partition_sampler` (dense and compact)
+  prepare the partition with a plan port: each label's plan (ReactiveKernels
+  `partition_plan`) is computed once at preparation (`PartitionQuery.plans`,
+  `PartitionSampler.plans`) and passed to every evaluation and gradient, so a
+  call recomputes no row bookkeeping. On registered Enzyme (0.13.216) the
+  gradient of a planned partition needs runtime activity
+  (`AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`): the
+  plan's row vectors meet the active vector in the body's views, which
+  Enzyme's static activity analysis refuses (Enzyme snag
+  `plan-const-int-r-4671f4a7`). Requires ReactiveKernels 0.1.28.
 ## 0.1.22
 
 - `prepare_compact_cell_ad(prepare_operator, built, plan, observations, base0,

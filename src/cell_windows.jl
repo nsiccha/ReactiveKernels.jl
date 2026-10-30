@@ -81,12 +81,18 @@ along its first axis, every later dimension whole; `shape` is the value's
 full axes, or `nothing` when only row reads `v[I, j...]` are made of it.
 Reading any other row throws `BoundsError`.
 """
-struct _CellWindow{D,R<:Union{Int,Vector{Int}},S}
+struct _CellWindow{D,R<:Union{Int,Vector{Int}},S,X}
     data::D
     rows::R
     shape::S
     sorted::Bool
+    # The gather index this window was prepared for and its entries' positions
+    # in `rows` (`_cell_window_positions`; a partition's plan computes them
+    # once per label); `nothing` and empty when none is prepared.
+    index::X
+    positions::Vector{Int}
 end
+_CellWindow(data, rows, shape, sorted::Bool) = _CellWindow(data, rows, shape, sorted, nothing, Int[])
 
 # The position along `data`'s first axis of row `row`; `at` is the read. The
 # lookup reads the window's rows only, so native reverse differentiation sees
@@ -117,13 +123,29 @@ end
 # row inside the position lookup instead (`[w[i, j] for i in I]`) made native
 # Enzyme Reverse refuse the read with `EnzymeRuntimeActivityError`, the
 # constant positions and the active data meeting in one loop.
-@inline function _cell_local_rows(w::_CellWindow, I::AbstractVector{<:Integer}, at)
+@inline function _cell_local_rows(w::_CellWindow{<:Any,<:Any,<:Any,Nothing},
+                                  I::AbstractVector{<:Integer}, at)
     positions = Vector{Int}(undef, length(I))
     for (k, i) in enumerate(I)
         positions[k] = _cell_local_row(w, i, at)
     end
     positions
 end
+# A window prepared for its gather index (`_cell_window!`: one direct index
+# lane) holds the entries' positions, computed apart from the gather and once
+# per label with a plan, and the read is by that index. The two cases are two
+# methods: a fallback computing fresh positions here would merge a constant
+# vector (the plan's) with a fresh one in one value, which native Reverse
+# refuses (`EnzymeRuntimeActivityError`); a read by another index is an
+# internal error instead.
+@inline function _cell_local_rows(w::_CellWindow{<:Any,<:Any,<:Any,<:AbstractVector},
+                                  I::AbstractVector{<:Integer}, at)
+    I === w.index && length(w.positions) == length(I) || _cell_window_unprepared(at)
+    w.positions
+end
+@noinline _cell_window_unprepared(at) = throw(ArgumentError(
+    "internal: a cell window prepared for one gather index was read with another " *
+    "($(summary(at)))"))
 
 # Whether gather index `I` reads exactly a vector value's window rows, in
 # order: then the gather is the window's data.
@@ -202,6 +224,33 @@ end
     positions = length(axis) == 1 ? fill(Int(first(axis)), length(rows)) : rows
     view(arg, positions, ntuple(_ -> Colon(), Val(N - 1))...)
 end
+# The same read in two steps, as the emitter makes it (`_cell_operand_row!`):
+# the positions read of an operand of shape `shape` at `rows` (its own rows,
+# or its one row repeated when broadcasting extrudes its first axis; `nothing`
+# for a number), integer work on the shape alone, which a partition's plan
+# computes once per label; then the view of the operand at those positions.
+@inline _cell_slice_positions(::Tuple{}, ::Integer) = nothing
+@inline _cell_slice_positions(::Tuple{}, ::Vector{Int}) = nothing
+@inline _cell_slice_positions(shape::Tuple, row::Integer) =
+    length(first(shape)) == 1 ? Int(first(first(shape))) : Int(row)
+@inline _cell_slice_positions(shape::Tuple, rows::Vector{Int}) =
+    length(first(shape)) == 1 ? fill(Int(first(first(shape))), length(rows)) : rows
+# A view of `arg` at `positions` along its first axis, every later dimension
+# whole. Not Base's `view`: that copies an index vector that may share memory
+# with the array (`Base.unalias`), so a plan's constant row vector and a fresh
+# copy would meet in one value, which native Reverse refuses
+# (`EnzymeRuntimeActivityError`); a row vector of the lowering never aliases a
+# value. Bounds are checked as `view` checks them.
+@inline _cell_rows_view(arg, ::Nothing) = arg
+@inline _cell_rows_view(arg::Tuple, positions::Vector{Int}) = [arg[p] for p in positions]
+@inline _cell_rows_view(arg::Tuple, position::Integer) = (arg[position],)
+@inline function _cell_rows_view(arg::AbstractArray{<:Any,N}, positions::Vector{Int}) where {N}
+    rest = ntuple(_ -> Colon(), Val(N - 1))
+    @boundscheck checkbounds(arg, positions, rest...)
+    Base.unsafe_view(arg, Base.to_indices(arg, (positions, rest...))...)
+end
+@inline _cell_rows_view(arg::AbstractArray{<:Any,N}, position::Integer) where {N} =
+    view(arg, position:position, ntuple(_ -> Colon(), Val(N - 1))...)
 
 # The full axes of a matrix-vector product `A * v`.
 @inline _cell_factor_shape(A::AbstractMatrix) = (axes(A, 1),)
@@ -361,14 +410,27 @@ end
 # Rows `rows` of a value's window `data` computed at rows `union` (which hold
 # them), in the order asked, every later dimension whole. A value without rows
 # (a dotted expression of numbers is a number) reads the same at every row.
-@inline _cell_take_rows(data::Number, ::Vector{Int}, rows, sorted::Bool) = data
-@inline _cell_take_rows(data::AbstractArray{<:Any,0}, ::Vector{Int}, rows, sorted::Bool) = data
-@inline function _cell_take_rows(data::AbstractArray{<:Any,N}, union::Vector{Int},
-                                 rows, sorted::Bool) where {N}
-    positions = Int[_cell_row_position(union, row, row, sorted)
-                    for row in (rows isa Integer ? (rows,) : rows)]
-    view(data, positions, ntuple(_ -> Colon(), Val(N - 1))...)
-end
+# The positions in `union` of rows `rows` (one or several), and of a gather
+# index `I` of a window over a vector (its linear positions are its rows; a
+# shaped source's are not, and get none). Integer work apart from the data,
+# which a partition's plan computes once per label.
+@inline _cell_take_positions(union::Vector{Int}, rows, sorted::Bool) =
+    Int[_cell_row_position(union, row, row, sorted)
+        for row in (rows isa Integer ? (rows,) : rows)]
+@inline _cell_window_positions(union::Vector{Int}, I::AbstractVector{<:Integer}, sorted::Bool,
+                               ::Union{Nothing,Tuple{Base.OneTo}}) =
+    Int[_cell_row_position(union, i, i, sorted) for i in I]
+@inline _cell_window_positions(::Vector{Int}, ::AbstractVector{<:Integer}, ::Bool, ::Tuple) = Int[]
+# A single cell's window holds one row: every entry of the index is that row,
+# at the window's first position.
+@inline _cell_window_positions(union::Integer, I::AbstractVector{<:Integer}, ::Bool,
+                               ::Union{Nothing,Tuple{Base.OneTo}}) =
+    Int[(i == union || throw(BoundsError(union, i)); 1) for i in I]
+@inline _cell_window_positions(::Integer, ::AbstractVector{<:Integer}, ::Bool, ::Tuple) = Int[]
+@inline _cell_take_rows(data::Number, ::Vector{Int}) = data
+@inline _cell_take_rows(data::AbstractArray{<:Any,0}, ::Vector{Int}) = data
+@inline _cell_take_rows(data::AbstractArray{<:Any,N}, positions::Vector{Int}) where {N} =
+    _cell_rows_view(data, positions)
 
 # The source of a range view or a reshape at rows: a vector, its positions.
 @inline _cell_source_rows(source::AbstractVector, rows) = _cell_factor_rows(source, rows)
@@ -384,7 +446,7 @@ end
 @inline _cell_factor_rows(arg::AbstractArray{<:Any,N}, row::Integer) where {N} =
     view(arg, row:row, ntuple(_ -> Colon(), Val(N - 1))...)
 @inline _cell_factor_rows(arg::AbstractArray{<:Any,N}, rows::Vector{Int}) where {N} =
-    view(arg, rows, ntuple(_ -> Colon(), Val(N - 1))...)
+    _cell_rows_view(arg, rows)
 
 # A dotted expression's rows must lie in its full first axis.
 @inline function _cell_check_row(shape::Tuple, row::Integer)
@@ -975,7 +1037,7 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid)
         nothing
     end
     for recipe in inner.recipes
-        slots = findall(v -> canon_id(ig, v.id) == cid, collect(recipe.inputs))
+        slots = findall(_input_list(v -> canon_id(ig, v.id) == cid, recipe.inputs))
         isempty(slots) && continue
         recipe.op isa _KernelSourceOp || return nothing
         analyzed = _cell_native(recipe)
@@ -1105,7 +1167,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
             r = only(candidates)
             k = findfirst(o -> cidof(o) == cid, r.outputs)
             declared = valtype(r.outputs[k])
-            inputs = Any[static_type(v) for v in r.inputs]
+            inputs = _input_list(static_type, r.inputs)
             inferred = declared !== Any ? declared :
                 r.op isa _AuthoredPlateOp ?
                     (length(r.outputs) == 1 ? _cell_plate_output_type(r.op, inputs) : Any) :
@@ -1446,13 +1508,22 @@ function _cell_bind!(e::_CellEmitter, prefix::Symbol, value)
     name
 end
 
+# The full axes of an operand read whole: `()` for a value declared a number,
+# so a partition's plan holds the shape without reading the value (a scalar
+# computed from the active vector would otherwise tie every row derived from
+# it to the data), else the axes of its broadcastable form.
+function _cell_leaf_shape_expr(e::_CellEmitter, input::ValueId)
+    valtype(e.pushdowns.graph.values[input]) <: Number && return Expr(:tuple)
+    Expr(:call, _cell_ref(:_cell_leaf_shape), e.names[input])
+end
+
 function _cell_shape!(e::_CellEmitter, cid::ValueId)
     haskey(e.shapes, cid) && return e.shapes[cid]
     d = e.pushdowns
     r = d.producer[cid]
     f = d.forms[r.id]
     input_shape(input) = input in d.pushed ? _cell_shape!(e, input) :
-        Expr(:call, _cell_ref(:_cell_leaf_shape), e.names[input])
+        _cell_leaf_shape_expr(e, input)
     if f.kind === :product
         factor = canon_id(d.graph, r.inputs[findfirst(==(:factor), f.roles)].id)
         operand = canon_id(d.graph, r.inputs[f.operand].id)
@@ -1481,7 +1552,7 @@ function _cell_vcat_part_shapes!(e::_CellEmitter, r::Recipe, f::_CellForm)
         part isa Int || return Expr(:tuple)
         input = canon_id(d.graph, r.inputs[part].id)
         input in d.pushed ? _cell_shape!(e, input) :
-            Expr(:call, _cell_ref(:_cell_leaf_shape), e.names[input])
+            _cell_leaf_shape_expr(e, input)
     end
     Expr(:tuple, shapes...)
 end
@@ -1492,7 +1563,7 @@ function _cell_part_shape!(e::_CellEmitter, r::Recipe, f::_CellForm, j::Int)
     d = e.pushdowns
     input = canon_id(d.graph, r.inputs[j].id)
     shape = input in d.pushed ? _cell_shape!(e, input) :
-        Expr(:call, _cell_ref(:_cell_leaf_shape), e.names[input])
+        _cell_leaf_shape_expr(e, input)
     f.roles[j] === :column && return Expr(:call, _cell_ref(:_cell_column_shape), shape)
     f.roles[j] === :factor_leaf || return shape
     w = e.names[canon_id(d.graph, r.inputs[f.gather_index[j]].id)]
@@ -1511,8 +1582,15 @@ end
 function _cell_operand_row!(e::_CellEmitter, cid::ValueId, row::Symbol)
     _footprint_record!(cid, :rows, row)
     get!(e.rows, (cid, row)) do
-        _cell_bind!(e, :cell_operand, Expr(:call, _cell_ref(:_cell_row_slice),
-            Expr(:call, GlobalRef(Base, :broadcastable), e.names[cid]), row))
+        # The positions read, decided on the operand's shape apart from the
+        # view (`_cell_slice_positions`): a partition's plan decides them once
+        # per label, and the view's index is never a value merging the plan's
+        # rows with a fresh vector.
+        shape = _cell_bind!(e, :cell_shape, _cell_leaf_shape_expr(e, cid))
+        positions = _cell_bind!(e, :cell_positions,
+            Expr(:call, _cell_ref(:_cell_slice_positions), shape, row))
+        _cell_bind!(e, :cell_operand, Expr(:call, _cell_ref(:_cell_rows_view),
+            Expr(:call, GlobalRef(Base, :broadcastable), e.names[cid]), positions))
     end
 end
 
@@ -1535,8 +1613,9 @@ end
 # window when that request is the window's rows, else those rows of it.
 function _cell_take!(e::_CellEmitter, cid::ValueId, row::Symbol)
     e.unions[cid] === row && return e.data[cid]
-    _cell_bind!(e, :cell_taken,
-        Expr(:call, _cell_ref(:_cell_take_rows), e.data[cid], e.unions[cid], row, e.sorted))
+    positions = _cell_bind!(e, :cell_positions,
+        Expr(:call, _cell_ref(:_cell_take_positions), e.unions[cid], row, e.sorted))
+    _cell_bind!(e, :cell_taken, Expr(:call, _cell_ref(:_cell_take_rows), e.data[cid], positions))
 end
 
 # Computes every requested pushed value's window, once each: requests from the
@@ -1581,7 +1660,7 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
         end]
         return
     end
-    reads = Any[nothing for _ in r.inputs]
+    reads = Vector{Any}(nothing, length(r.inputs))
     for (j, input) in enumerate(r.inputs)
         icid = canon_id(d.graph, input.id)
         role = f.roles[j]
@@ -1658,8 +1737,21 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
                 _cell_operand_row!(e, icid, U))
         elseif role in (:gather, :linear_gather) && icid in d.pushed
             shape = role === :gather ? nothing : _cell_shape!(e, icid)
-            push!(args, _cell_bind!(e, :cell_window, Expr(:call,
-                _cell_ref(:_CellWindow), e.data[icid], e.unions[icid], shape, e.sorted)))
+            window = Any[e.data[icid], e.unions[icid], shape, e.sorted]
+            # One index lane read directly: its entries' positions in the
+            # window's rows are computed apart from the gather (once per label
+            # with a plan), and the gather `v[I]` of that slice reads them.
+            if length(f.indices[j]) == 1 && only(f.vias[j]) == 0
+                index = canon_id(d.graph, r.inputs[only(f.indices[j])].id)
+                if !(index in d.pushed) && haskey(e.rows, (index, U))
+                    slice = e.rows[(index, U)]
+                    push!(window, slice, _cell_bind!(e, :cell_positions, Expr(:call,
+                        _cell_ref(:_cell_window_positions), e.unions[icid], slice, e.sorted,
+                        shape === nothing ? nothing : shape)))
+                end
+            end
+            push!(args, _cell_bind!(e, :cell_window, Expr(:call, _cell_ref(:_CellWindow),
+                                                          window...)))
         elseif role in (:gather, :linear_gather)
             # The whole source, read by the gather at its index's rows.
             for (k, via) in zip(f.indices[j], f.vias[j])

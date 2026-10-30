@@ -104,6 +104,34 @@ too, across bindings whose caching decisions agree; one whose plates the pass
 partitions by a data-bound branch, or replaces by a bind-time value, is still
 specialized and compiled per binding and reuses the plan and prefix only.
 """
+# Set while `partition_plan_kernel(spec; …)` prepares: the lowering emits the
+# plan's body instead of the kernel's.
+const _PLAN_MODE = :ReactiveKernels_partition_plan_mode
+_plan_mode() = get(task_local_storage(), _PLAN_MODE, false)
+# The exemplars `prepare` received, one value per HAVE port in order, while it
+# lowers: the plan typing evaluates the plan on them (`_partition_plan_type`).
+const _PLAN_EXEMPLARS = :ReactiveKernels_partition_plan_exemplars
+# The record: the exemplars, and the plan port's position and type once the
+# lowering has typed it (`typed`), which replaces the port's exemplar type
+# (`Nothing`) in the kernel's exact signature.
+struct _PlanExemplars
+    exemplars::Tuple
+    typed::Base.RefValue{Any}
+end
+_plan_exemplar_record(::Nothing) = nothing
+_plan_exemplar_record(exemplars::Tuple) = _PlanExemplars(exemplars, Ref{Any}(nothing))
+_plan_exemplars() = get(task_local_storage(), _PLAN_EXEMPLARS, nothing)
+_with_plan_exemplars(f, ::Nothing) = f()
+_with_plan_exemplars(f, record::_PlanExemplars) =
+    task_local_storage(f, _PLAN_EXEMPLARS, record)
+_plan_typed_exemplars(types, ::Nothing) = types
+function _plan_typed_exemplars(types, record::_PlanExemplars)
+    typed = record.typed[]
+    typed === nothing && return types
+    position, T = typed
+    Tuple(i == position ? T : t for (i, t) in enumerate(types))
+end
+
 function prepare!(cache::PreparationCache, g::Graph; have = (), want = (),
                   passes = (), bound = (), on_error = nothing, type_stability = nothing,
                   type_stability_level = nothing)
@@ -114,7 +142,7 @@ function prepare!(cache::PreparationCache, g::Graph; have = (), want = (),
                                                  objectid(g); on_error)
         key = (objectid(g), g.version, _sig(g, haves), _sig(g, wants),
                Tuple(objectid(p) for p in passes), on_error, _type_stability(),
-               _type_stability_level())
+               _type_stability_level(), _plan_mode())
         lock(cache.lock) do
             get!(cache.kernels, key) do
                 prepare(g; have = haves, want = wants, passes = passes, on_error = on_error)
@@ -171,10 +199,12 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     isempty(ports) && return prepare!(cache, g; have = have, want = want,
                                      passes = passes, on_error = on_error)
     # A binding checked under one set of type-stability settings never serves
-    # another: its rebindings are not checked again.
+    # another: its rebindings are not checked again. A partition's plan kernel
+    # (`partition_plan_kernel`, lowered in plan mode) is another program of
+    # the same graph and binding.
     key = (:bound, graph_key, g.version, _sig(g, have), _sig(g, want),
            _sig(g, ports), Tuple(_pass_key(p) for p in passes), on_error,
-           _type_stability(), _type_stability_level())
+           _type_stability(), _type_stability_level(), _plan_mode())
     # Locked blocks, not `lock(...) do` closures: a closure's type holds the
     # types it captures (here the signatures in `key`, and below the hoisted
     # values), so it compiled once per program and width.
@@ -229,10 +259,10 @@ end
 for on_error in (Nothing, Symbol)
     S = Vector{ValueId}
     for graph_key in (Nothing, UInt64)
-        K = Tuple{Symbol,graph_key,Int,S,S,S,Tuple{},on_error,Symbol,Symbol}
+        K = Tuple{Symbol,graph_key,Int,S,S,S,Tuple{},on_error,Symbol,Symbol,Bool}
         precompile(isequal, (K, K)) || error("no isequal method for bound key $K")
     end
-    K = Tuple{UInt64,Int,S,S,Tuple{},on_error,Symbol,Symbol}
+    K = Tuple{UInt64,Int,S,S,Tuple{},on_error,Symbol,Symbol,Bool}
     precompile(isequal, (K, K)) || error("no isequal method for cache key $K")
 end
 for template in (_BoundTemplate, PreparedKernel, Nothing)

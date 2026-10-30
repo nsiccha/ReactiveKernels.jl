@@ -107,12 +107,15 @@ cell value's name). Entries are in plan order per cell, cells in plan order.
 function _cell_locality(p::Plan, d::_CellPushdowns)
     g = p.graph
     cidof(v) = canon_id(g, v.id)
+    # A plan without a cell has no locality to report; nothing below may
+    # compile per port count for an ordinary kernel.
+    any(r -> r.op isa _AuthoredPlateCellOp, p.recipes) || return NamedTuple[]
     producers = Dict{ValueId,Vector{Recipe}}()
     readers = Dict{ValueId,Vector{Tuple{Recipe,Vector{Int}}}}()
     for r in p.recipes
         foreach(o -> push!(get!(producers, cidof(o), Recipe[]), r), r.outputs)
-        for cid in unique(map(cidof, r.inputs))
-            slots = findall(v -> cidof(v) == cid, collect(r.inputs))
+        for cid in unique!(ValueId[_input_list(cidof, r.inputs)...])
+            slots = findall(_input_list(v -> cidof(v) == cid, r.inputs))
             push!(get!(readers, cid, Tuple{Recipe,Vector{Int}}[]), (r, slots))
         end
     end
@@ -236,7 +239,7 @@ end
 # whether a value is a number or an array matters here, so abstract types
 # such as `AbstractVector{Float64}` are kept.
 function _locality_value_types(p::Plan)
-    _plan_value_types(p, map(valtype, p.have)) do recipe, input_types
+    _plan_value_types(p, Any[valtype(v) for v in p.have]) do recipe, input_types
         recipe.op isa _BoundConstant && return (typeof(recipe.op.value),)
         map(recipe.outputs) do value
             valtype(value) === Any || return valtype(value)
@@ -439,9 +442,13 @@ port of `spec` to partition several specs at the same label.
 """
 function plate_partition(spec::KernelSpec, plates; by,
                          index::Symbol = :partition, name::Symbol = :partition_total,
-                         locality::Union{Nothing,Symbol} = :error, partitioned = ())
+                         locality::Union{Nothing,Symbol} = :error, partitioned = (),
+                         plan::Union{Nothing,Symbol,Pair{Symbol,<:Type}} = nothing)
     locality in (nothing, :error, :warn, :ignore) || throw(ArgumentError(
         "plate_partition: locality must be :error, :warn, :ignore or nothing; got $(repr(locality))"))
+    plan_port, plan_type = plan isa Pair ? (first(plan), last(plan)) : (plan, Any)
+    plan_port === nothing || plan_port !== index || throw(ArgumentError(
+        "plate_partition: the plan port must differ from the index port :$index"))
     names = plates isa Symbol ? (plates,) : Tuple(Symbol.(collect(plates)))
     isempty(names) && throw(ArgumentError("plate_partition: name at least one plate"))
     keys_by_plate = by isa Symbol ? Dict{Symbol,Symbol}(plate => by for plate in names) :
@@ -476,6 +483,12 @@ function plate_partition(spec::KernelSpec, plates; by,
         _kernel_declare!(copied, ports, order, index, Any)
     end
     _kernel_push_unique!(have_names, index)
+    if plan_port !== nothing
+        haskey(ports, plan_port) && throw(ArgumentError(
+            "plate_partition: the kernel already has a port :$plan_port"))
+        _kernel_declare!(copied, ports, order, plan_port, plan_type)
+        _kernel_push_unique!(have_names, plan_port)
+    end
     recipes = Recipe[]
     tables = Value[]
     for plate in names
@@ -504,7 +517,7 @@ function plate_partition(spec::KernelSpec, plates; by,
         total = length(names) == 1 ? _kernel_declare!(copied, ports, order, name, T) :
             value!(copied, Symbol(:_partition_, plate), T)
         _add_recipe!(copied, (lanes, recipe.inputs...), (total,),
-                     _AuthoredPlateCellOp(recipe.op, locality, true, rule), recipe.cost,
+                     _AuthoredPlateCellOp(recipe.op, locality, true, rule, plan_port), recipe.cost,
                      nothing, false, recipe.source)
         push!(totals, total)
     end
@@ -568,7 +581,7 @@ function _footprint_return(p::Plan, cells, names)
         for r in p.recipes
             r.op isa _AuthoredPlateCellOp && continue
             any(o -> cidof(o) in pushed, r.outputs) && continue
-            slots = findall(v -> cidof(v) == cid, collect(r.inputs))
+            slots = findall(_input_list(v -> cidof(v) == cid, r.inputs))
             isempty(slots) && continue
             f = _cell_form(r)
             literal = f === nothing ? _footprint_literal_read(r) : nothing
@@ -800,4 +813,370 @@ function _partition_label_of(p::Plan, partition::Recipe, args)
     port = canon_id(g, first(checked.inputs).id)
     index = findfirst(v -> canon_id(g, v.id) == port, p.have)
     index === nothing ? nothing : args[index]
+end
+
+# ------------------------------------------------------------------ plans
+
+# The integer bookkeeping of a partition (its rows from the table, every pushed
+# value's rows and unions, the positions a read bisects, the bounds checks,
+# the slices of bound lanes) depends on the label and the bound data only.
+# With a plan port (`plate_partition(…; plan)`), the generated body reads that
+# bookkeeping from the port's value, a named tuple `partition_plan` computes
+# once per label, and the differentiated body carries none of it. The split
+# is by dependency over the emitted statements: a statement reads only the
+# label, bound constants (`_BoundConstant` getters, the partition table ops)
+# and other such statements, or it stays in the body.
+const _PLAN_ARG = :__plan__
+# `_PLAN_MODE` / `_plan_mode()` (graphops.jl): set while `partition_plan_kernel(spec; …)`
+# prepares; the lowering then emits the plan body instead of the partition's.
+
+_plan_eligible_op(op) = op isa Union{_PartitionTable,_PartitionLabel,_PartitionLanes}
+# A bound value the plan may hold is index bookkeeping (a partition table, an
+# index column, a mask, a count), never data: the data columns stay the body's
+# hidden operands, and a derivative never meets them through the plan.
+_plan_eligible_op(op::_BoundConstant) = _plan_bookkeeping(op.value)
+_plan_bookkeeping(::Integer) = true
+_plan_bookkeeping(v::AbstractArray) = _plan_bookkeeping_type(eltype(v))
+_plan_bookkeeping(v::AbstractDict) = _plan_bookkeeping_type(Base.valtype(v))
+_plan_bookkeeping(v::Tuple) = all(_plan_bookkeeping, v)
+_plan_bookkeeping(@nospecialize(_)) = false
+# An element type of index bookkeeping: integers, or arrays, ranges and
+# tuples of them, nested (a ragged row structure is a vector of row vectors).
+function _plan_bookkeeping_type(@nospecialize(T))
+    T <: Integer && return true
+    T <: AbstractArray && return _plan_bookkeeping_type(eltype(T))
+    T <: Tuple && T isa DataType && return all(_plan_bookkeeping_type, T.parameters)
+    false
+end
+
+# Whether `ex` reads nothing that varies per call: no data symbol (an unbound
+# HAVE port other than the label, or a value computed from one) and no
+# operation call other than a partition table op, and no bound value other
+# than index bookkeeping (`__constants__[k]`, `_plan_bookkeeping`).
+function _plan_eligible(ex, data::Set{Symbol}, ops)
+    ex isa Symbol && return !(ex in data)
+    ex isa Expr || return true
+    if ex.head === :call
+        # A type the body computes (`typeof`, `eltype`, `_promote_op`, a
+        # plate's element type) is a constant inference folds; read from the
+        # port it would be a run-time `DataType`, every use of it a dynamic
+        # dispatch, and native Reverse would meet the operation table's untyped
+        # metadata in a run-time `return_type` call.
+        _plan_call_name(ex.args[1]) in _PLAN_TYPE_CALLS && return false
+        slot = _callable_slot(ex.args[1])
+        if slot !== nothing
+            _plan_eligible_op(ops[slot]) || return false
+            return all(a -> _plan_eligible(a, data, ops), ex.args[2:end])
+        end
+        return all(a -> _plan_eligible(a, data, ops), ex.args)
+    end
+    slot = _constant_slot(ex)
+    slot === nothing || return _plan_eligible_op(ops[slot])
+    ex.head in (:tuple, :ref, :., :kw, :parameters, :vect, :quote, :&&, :||, :comparison,
+                :(::), :curly, :if) || return false
+    all(a -> _plan_eligible(a, data, ops), ex.args)
+end
+
+const _PLAN_TYPE_CALLS = Set{Symbol}([:typeof, :eltype, :promote_type, :_promote_op,
+                                      :_plate_result_eltype])
+# The locals the lowering binds to types (`_bind_native_type_exprs!`, a
+# plate's element type): never planned, for the reason above.
+_plan_type_local(name::Symbol) = (text = String(name);
+    startswith(text, "##native_type") || startswith(text, "##plate_eltype"))
+
+# The helpers that read only the shapes of their arguments: a shape of a value
+# computed from the data is constant for arguments of one shape, so the plan
+# holds it, and the body checks the plan's shape against the value's on every
+# call (`_cell_plan_check`).
+const _PLAN_SHAPE_HELPERS = Set{Symbol}([:_cell_leaf_shape, :_cell_product_shape,
+    :_cell_factor_shape, :_cell_column_shape, :_cell_hcat_shape, :_cell_vcat_shape,
+    :_cell_vcat_starts, :_plate_broadcast_shape, :_plate_require_axes, :_cell_dims_shape,
+    :_cell_range_shape, :axes])
+_plan_call_name(f) = f isa GlobalRef ? f.name :
+    Meta.isexpr(f, :., 2) && f.args[2] isa QuoteNode ? f.args[2].value :
+    f isa Symbol ? f : nothing
+
+# Whether `ex` is a shape statement's value: a shape helper's call whose
+# arguments are shape expressions or data symbols read for their shape, or a
+# tuple of such calls and plan expressions. A bare data symbol is a value, not
+# a shape: an alias of one stays in the body.
+function _plan_shape_statement(ex, data::Set{Symbol}, ops)
+    ex isa Expr || return false
+    ex.head === :call && return _plan_shape_eligible(ex, data, ops)
+    ex.head === :tuple && return all(ex.args) do a
+        _plan_eligible(a, data, ops) || _plan_shape_statement(a, data, ops)
+    end
+    false
+end
+# Whether `ex` reads only shapes: plan-eligible, a data symbol an enclosing
+# shape helper reads for its shape, or a shape helper's call over such.
+function _plan_shape_eligible(ex, data::Set{Symbol}, ops)
+    _plan_eligible(ex, data, ops) && return true
+    ex isa Symbol && return true                 # a data value, read for its shape
+    ex isa Expr || return false
+    if ex.head === :call
+        name = _plan_call_name(ex.args[1])
+        name in _PLAN_SHAPE_HELPERS || return false
+        return all(a -> _plan_shape_eligible(a, data, ops), ex.args[2:end])
+    end
+    ex.head === :tuple && return all(a -> _plan_shape_eligible(a, data, ops), ex.args)
+    false
+end
+
+# The plan's shape against the value's: arguments of another shape need a plan
+# of their own.
+@inline function _cell_plan_check(planned, current)
+    planned == current || _plan_mismatch(planned, current)
+    current
+end
+@noinline _plan_mismatch(planned, current) = throw(ArgumentError(
+    "partition plan: the arguments' shapes differ from the plan's ($(current) against " *
+    "$(planned)); compute the plan for arguments of these shapes (`partition_plan`)"))
+
+# The names a statement assigns anywhere inside it (plain and tuple
+# assignments, loop variables, locals).
+function _assigned_names!(names::Set{Symbol}, ex)
+    ex isa Expr || return names
+    if ex.head === :(=) || ex.head === :local
+        lhs = ex.args[1]
+        lhs isa Symbol && push!(names, lhs)
+        Meta.isexpr(lhs, :tuple) && foreach(x -> x isa Symbol && push!(names, x), lhs.args)
+        Meta.isexpr(lhs, :(::), 2) && lhs.args[1] isa Symbol && push!(names, lhs.args[1])
+    end
+    foreach(a -> _assigned_names!(names, a), ex.args)
+    names
+end
+function _symbol_refs!(refs::Set{Symbol}, ex)
+    ex isa Symbol && (push!(refs, ex); return refs)
+    ex isa Expr && foreach(a -> _symbol_refs!(refs, a), ex.args)
+    refs
+end
+
+# The emitted body split into the plan's statements (each assigning or
+# checking something that varies with the label only) and the body's rest, with
+# the plan symbols the rest reads and their field names (`plan_k`, positional:
+# the plan-mode lowering of the same plan names them the same way).
+function _partition_plan_split(body::Expr, data_names, ops)
+    # Every symbol the body assigns anywhere is data until a plan statement
+    # assigns it, so a reference ahead of a later or nested assignment can
+    # never leave the body.
+    data = union!(_assigned_names!(Set{Symbol}(), body), data_names)
+    kinds = Symbol[]
+    for st in body.args
+        kind = if st isa Expr && st.head === :(=) && st.args[1] isa Symbol &&
+                  _plan_type_local(st.args[1])
+            :main
+        elseif st isa Expr && st.head === :(=) && st.args[1] isa Symbol &&
+                  _plan_eligible(st.args[2], data, ops)
+            delete!(data, st.args[1])
+            :plan
+        elseif st isa Expr && st.head === :(=) && st.args[1] isa Symbol &&
+               _plan_shape_statement(st.args[2], data, ops)
+            delete!(data, st.args[1])
+            :shape
+        elseif st isa Expr && st.head === :call && _plan_eligible(st, data, ops)
+            :plan
+        else
+            :main
+        end
+        push!(kinds, kind)
+    end
+    any(k -> k !== :main, kinds) || return nothing
+    # The plan's body: its statements with every statement they depend on (a
+    # shape of a value computed from the data needs that value, computed from
+    # the exemplar), in the body's order.
+    wanted = Set{Symbol}()
+    for (k, st) in enumerate(body.args)
+        kinds[k] === :main || _symbol_refs!(wanted, st)
+    end
+    keep = falses(length(body.args))
+    for k in reverse(eachindex(body.args))
+        st = body.args[k]
+        if kinds[k] !== :main
+            keep[k] = true
+        elseif any(n -> n in wanted, _assigned_names!(Set{Symbol}(), st))
+            keep[k] = true
+            _symbol_refs!(wanted, st)
+        end
+    end
+    plan = Any[st for (k, st) in enumerate(body.args) if keep[k] && !(st isa LineNumberNode)]
+    # The kernel's body: everything else, a shape statement checked against the
+    # plan's value where it stood.
+    main = Any[]
+    assigned = Symbol[]
+    for (k, st) in enumerate(body.args)
+        if kinds[k] === :plan
+            st isa Expr && st.head === :(=) && push!(assigned, st.args[1])
+        elseif kinds[k] === :shape
+            push!(assigned, st.args[1])
+            push!(main, Expr(:call, GlobalRef(@__MODULE__, :_cell_plan_check), st.args[1],
+                             st.args[2]))
+        else
+            push!(main, st)
+        end
+    end
+    refs = Set{Symbol}()
+    foreach(st -> _symbol_refs!(refs, st), main)
+    needed = Symbol[name for name in assigned if name in refs]
+    isempty(needed) && return nothing
+    fields = Symbol[Symbol(:plan_, k) for k in eachindex(needed)]
+    # A typed declaration of a plan symbol (`local x::T`) precedes its read
+    # from the port, where the body's own assignment stood after it.
+    declared = Set{Symbol}(needed)
+    declarations = Any[st for st in main if _declares_any(st, declared)]
+    filter!(st -> !_declares_any(st, declared), main)
+    (plan, Any[declarations..., main...], needed, fields)
+end
+_declares_any(st, names::Set{Symbol}) =
+    st isa Expr && st.head === :local && !isempty(intersect(_assigned_names!(Set{Symbol}(), st), names))
+
+# The body of a kernel whose partition has a plan port: in plan mode the plan's
+# statements returning the named tuple of plan fields; otherwise the rest of
+# the body reading those fields from the port, typed by the plan function's
+# inferred return type. `nothing` leaves the body as emitted (no plan port,
+# nothing to plan, or a plan whose type inference cannot name concretely).
+function _partition_plan_lowering(p::Plan, body::Expr, argexprs, runtime_ops, nm,
+                                  plan_mode::Bool)
+    cell = findfirst(r -> r.op isa _AuthoredPlateCellOp && r.op.plan !== nothing, p.recipes)
+    cell === nothing && return nothing
+    port = p.recipes[cell].op.plan
+    position = findfirst(v -> v.name === port, p.have)
+    position === nothing && return nothing
+    # The label port is the input of the label check (`_PartitionLabel`); it
+    # varies per call but names the plan, so it is not data.
+    labels = Set{Symbol}(nm(r.inputs[1]) for r in p.recipes if r.op isa _PartitionLabel)
+    data = Symbol[nm(v) for v in p.have if !(nm(v) in labels) && v.name !== port]
+    split = _partition_plan_split(body, data, runtime_ops)
+    split === nothing && return nothing
+    plan, main, needed, fields = split
+    plan_body = Expr(:block, plan..., Expr(:return, Expr(:call,
+        Expr(:curly, GlobalRef(Core, :NamedTuple), Expr(:tuple, (QuoteNode(f) for f in fields)...)),
+        Expr(:tuple, needed...))))
+    plan_mode && return plan_body
+    # The port's declared type names the plan's type (`plate_partition(…;
+    # plan = port => T)`, T the type of a plan the plan kernel computed); an
+    # untyped port is typed by one evaluation on empty data, which serves a
+    # plan that reads no data.
+    T = valtype(p.have[position])
+    if T === Any
+        T = _partition_plan_type(Expr(:function, Expr(:tuple, argexprs...), plan_body), p,
+                                 runtime_ops, length(argexprs) - 2 - length(p.have),
+                                 port, position, labels, nm)
+    elseif !(T <: NamedTuple && isconcretetype(T))
+        throw(ArgumentError("partition plan: the plan port :$port is declared $T, not the " *
+            "concrete named-tuple type of its plan; `partition_plan_kernel(spec; …)` " *
+            "computes a plan of that type, declare it with `plan = :$port => typeof(plan)`"))
+    end
+    reads = Any[Expr(:(=), _PLAN_ARG, Expr(:(::), nm(p.have[position]), T))]
+    for (name, field) in zip(needed, fields)
+        push!(reads, Expr(:(=), name, Expr(:call, GlobalRef(Core, :getfield), _PLAN_ARG,
+                                             QuoteNode(field))))
+    end
+    Expr(:block, reads..., main...)
+end
+
+# The concrete named-tuple type the plan function returns, found by one
+# evaluation at preparation: on the exemplars when `prepare` received them
+# (`exemplars`, one value per HAVE port, `nothing` for the plan port), else on
+# the first bound label with empty stand-ins for the data ports, which serves
+# a plan that reads no unbound data. Inference cannot name the type: a
+# generated function's call crosses a world-age lookup it does not see
+# through. A plan port the caller asked for is never silently ignored: a plan
+# the evaluation cannot type is an error naming the remedy.
+function _partition_plan_type(plan_ast::Expr, p::Plan, runtime_ops, extra::Int, port::Symbol,
+                              position::Int, labels, nm)
+    f = compile(plan_ast)
+    record = _plan_exemplars()
+    exemplars = record === nothing ? nothing : record.exemplars
+    remedy = "prepare with `exemplars` (one value per HAVE port, `nothing` for the plan " *
+             "port) or declare the port's type (`partition_plan_kernel(spec; …)`, " *
+             "`plate_partition(…; plan = :$port => T)`)"
+    arguments = if exemplars === nothing
+        table = findfirst(op -> op isa _BoundConstant && op.value isa AbstractDict &&
+                                Base.valtype(op.value) <: Vector{Int}, runtime_ops)
+        keys_ = table === nothing ? () : keys(runtime_ops[table].value)
+        isempty(keys_) && throw(ArgumentError(
+            "partition plan: the plan port :$port is untyped and no bound label names a " *
+            "plan to type it from; $remedy"))
+        label = first(keys_)
+        Any[nm(v) in labels ? label : _plan_dummy(valtype(v)) for v in p.have]
+    else
+        length(exemplars) == length(p.have) || throw(ArgumentError(
+            "internal: $(length(exemplars)) exemplars for $(length(p.have)) HAVE ports"))
+        _input_list(identity, exemplars)
+    end
+    arguments[position] = nothing
+    append!(arguments, fill(nothing, extra))
+    constants, callables = _lowering_tables(runtime_ops)
+    plan = try
+        Base.invokelatest(f, constants, _native_table(plan_ast, callables), arguments...)
+    catch err
+        throw(ArgumentError(
+            "partition plan: the plan port :$port is untyped and evaluating its plan on " *
+            (exemplars === nothing ? "empty stand-ins for the data ports" : "the exemplars") *
+            " failed: $(sprint(showerror, err)); $remedy"))
+    end
+    T = typeof(plan)
+    T <: NamedTuple && isconcretetype(T) || throw(ArgumentError(
+        "partition plan: the plan of :$port has type $T, which is not a concrete named tuple"))
+    record === nothing || (record.typed[] = (position, T))
+    T
+end
+# A stand-in of the declared type of a data port the plan never reads.
+function _plan_dummy(::Type{T}) where {T}
+    T <: AbstractArray || return nothing
+    E = eltype(T)
+    E = E === Any || !isconcretetype(E) ? Float64 : E
+    N = try ndims(T) catch; 1 end
+    Array{E,N}(undef, ntuple(_ -> 0, N))
+end
+
+const _PLAN_KERNELS = IdDict{Any,Any}()
+const _PLAN_LOCK = ReentrantLock()
+
+"""
+    partition_plan_kernel(kernel::PreparedKernel) -> PreparedKernel
+
+The kernel [`partition_plan`](@ref) evaluates: called with `kernel`'s HAVE
+arguments (the plan port's own value is ignored; pass `nothing`), it returns
+the plan: the named tuple of integer bookkeeping the partition's body reads
+from its plan port. `partition_plan` prepares and keeps one per kernel for the
+process; a caller evaluating many labels prepares it once here and holds it.
+"""
+function partition_plan_kernel(kernel::PreparedKernel)
+    p = _lowering_plan(kernel.plan)
+    ast, constants, callables, recipes = _sharing_cell_plans() do
+        _lower_with_ops(p; partition_plan = true)
+    end
+    _prepare(p, ast, constants, _native_table(ast, callables), recipes)
+end
+"""
+    partition_plan_kernel(spec::KernelSpec; have, want, bound, on_error) -> PreparedKernel
+
+The plan kernel of a partition prepared from `spec` with these arguments
+(`prepare`'s), without preparing the partition itself: it computes a label's
+plan from the exemplar's data, and the type of that plan declares the plan
+port of the partition to prepare (`plate_partition(…; plan = port => T)`),
+which then reads every plan field with that type.
+"""
+partition_plan_kernel(spec::KernelSpec; kwargs...) =
+    task_local_storage(() -> prepare(spec; kwargs...), _PLAN_MODE, true)
+
+"""
+    partition_plan(kernel::PreparedKernel, args...) -> NamedTuple
+
+The plan of a partition kernel prepared with a plan port
+(`plate_partition(…; plan)`): the integer bookkeeping of the label among
+`args` (the kernel's HAVE arguments in order; pass `nothing` for the plan
+port), computed from the bound data. The kernel's body reads it from the port
+instead of recomputing it per call, and a derivative carries none of it:
+`kernel(args..., label, partition_plan(kernel, args..., label, nothing))`.
+Compute it once per label and keep it; a label no plate has throws
+`ArgumentError` naming the keys.
+"""
+function partition_plan(kernel::PreparedKernel, args...)
+    planner = lock(_PLAN_LOCK) do
+        get!(() -> partition_plan_kernel(kernel), _PLAN_KERNELS, kernel)
+    end
+    Base.invokelatest(planner, args...)
 end

@@ -514,12 +514,18 @@ struct _AuthoredPlateCellOp{K,A}
     # per-partition HAVE port with the label of each of its positions
     # (`missing` for a shared position).
     partitioned::Tuple{Vararg{Pair{Symbol,<:AbstractVector}}}
+    # The HAVE port holding a partition's plan (`plate_partition(…; plan)`,
+    # `partition_plan`): the integer bookkeeping of a label, computed once and
+    # read by the body instead of recomputed per call; `nothing` for none.
+    plan::Union{Nothing,Symbol}
 end
 _AuthoredPlateCellOp(plate::_AuthoredPlateOp) = _AuthoredPlateCellOp(plate, nothing, false, ())
 _AuthoredPlateCellOp(plate::_AuthoredPlateOp, locality) =
     _AuthoredPlateCellOp(plate, locality, false, ())
 _AuthoredPlateCellOp(plate::_AuthoredPlateOp, locality, rows::Bool) =
     _AuthoredPlateCellOp(plate, locality, rows, ())
+_AuthoredPlateCellOp(plate::_AuthoredPlateOp, locality, rows::Bool, partitioned) =
+    _AuthoredPlateCellOp(plate, locality, rows, partitioned, nothing)
 
 function (op::_AuthoredPlateCellOp{K,A})(index, args...) where {K,A}
     op.rows && return sum(op.plate(_plate_partition_slices(Val(A), index, args...)...))
@@ -1974,6 +1980,7 @@ struct _AuthoredPlateCellDraft{A}
     locality::Union{Nothing,Symbol}
     rows::Bool
     partitioned::Tuple{Vararg{Pair{Symbol,<:AbstractVector}}}
+    plan::Union{Nothing,Symbol}
 end
 const _AuthoredPlateLike = Union{_AuthoredPlateOp,_AuthoredPlateDraft}
 const _AuthoredPlateCellLike = Union{_AuthoredPlateCellOp,_AuthoredPlateCellDraft}
@@ -1993,7 +2000,7 @@ function _built_plate_op(draft::_AuthoredPlateDraft{A}) where {A}
 end
 _built_plate_op(draft::_AuthoredPlateCellDraft) =
     _AuthoredPlateCellOp(_built_plate_op(draft.plate), draft.locality, draft.rows,
-                         draft.partitioned)
+                         draft.partitioned, draft.plan)
 _built_plate_recipe(r::Recipe) =
     r.op isa Union{_AuthoredPlateDraft,_AuthoredPlateCellDraft} ?
     Recipe(r.id, r.inputs, r.outputs, _built_plate_op(r.op), r.cost, r.cse_key,
@@ -2371,7 +2378,7 @@ function _compose_plate_into(g::Graph, producer::Recipe, consumer::Recipe, cid)
     cell || return composed
     Recipe(composed.id, (first(consumer.inputs), composed.inputs...), composed.outputs,
         _AuthoredPlateCellDraft(composed.op, consumer.op.locality, consumer.op.rows,
-                                consumer.op.partitioned),
+                                consumer.op.partitioned, consumer.op.plan),
         composed.cost, nothing, false, composed.source)
 end
 
@@ -4646,6 +4653,7 @@ function _lower_with_ops_collecting(p::Plan;
                          plate_element_types::Bool = false,
                          type_hints = nothing, exemplar_types = nothing,
                          footprint::Bool = false,
+                         partition_plan::Bool = false,
                          inline_sources::Bool = _inline_sources_enabled())
     # The footprint variant (`partition_footprint`, plate_partition.jl): the
     # body records every read of a HAVE port and returns them instead of the
@@ -5037,6 +5045,15 @@ function _lower_with_ops_collecting(p::Plan;
     # otherwise those mutually exclusive definitions appear to escape here.
     inline_embedded && (body = _lower_cell_arrays_native(body, runtime_recipes))
     inline_embedded && (body = _lower_index_runs_native(body, runtime_ops))
+    # A partition with a plan port reads its integer bookkeeping from the
+    # port's value, computed once per label; in plan mode the body computes
+    # and returns that bookkeeping instead (`_partition_plan_lowering`,
+    # plate_partition.jl).
+    if !_footprint_recording()
+        planned = _partition_plan_lowering(p, body, argexprs, runtime_ops, nm,
+                                           partition_plan || _plan_mode())
+        planned === nothing || (body = planned)
+    end
     ast = Expr(:function, Expr(:tuple, argexprs...), body)
     constants, callables = _lowering_tables(runtime_ops)
     ast, constants, callables, Tuple(runtime_recipes)
@@ -7474,10 +7491,15 @@ function _prepare_plan_body(p::Plan; passes = (), bound = (), on_error = nothing
         end
     end
     lowered_plan = _lowering_plan(p)
-    exact_signature = exemplar_types === nothing ? Nothing : Tuple{exemplar_types...}
+    record = _plan_exemplar_record(exemplars)
     native_ast, constants, callables, recipes = _sharing_cell_plans() do
-        _lower_with_ops(lowered_plan; exemplar_types)
+        _with_plan_exemplars(record) do
+            _lower_with_ops(lowered_plan; exemplar_types)
+        end
     end
+    # A plan port typed on the exemplars is called with plans of that type.
+    exemplar_types = _plan_typed_exemplars(exemplar_types, record)
+    exact_signature = exemplar_types === nothing ? Nothing : Tuple{exemplar_types...}
     isempty(passes) || (native_ast = transform(native_ast, passes...))
     # The callables the final body reads; a pass may read one the lowering's
     # body did not (`test_ad.jl`, a source transform over the scan metadata).
