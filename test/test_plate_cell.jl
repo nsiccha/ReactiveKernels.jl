@@ -1319,6 +1319,7 @@ end
         end
         @test_broken exact
     end
+end
 
 # ReactiveKernelsPPL unpacks a packed parameter vector into blocks as
 # `view(u, lo:hi)` and `reshape(flat, n, k)`. A block read at a cell's rows is
