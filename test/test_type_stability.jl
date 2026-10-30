@@ -207,6 +207,37 @@ hidden_scale(x) = (SCALE[] * x)::Float64
     return total
 end
 
+# A helper that logs on cold branches, as SpecialFunctions' `beta_inc` does on
+# underflow (snag `type-stability-a-a6941de1`). The expansion of Julia's
+# logging macros dispatches at run time by design, the record's fields
+# included: it is Julia's code, not the helper's.
+function logged_scale(x)
+    if x == 0.0
+        @debug "zero scale" x
+        return 1.0
+    end
+    x < -10.0 && @warn "large negative scale" shown = string(Base.inferencebarrier(x))
+    return 2.0 * x
+end
+
+@kernel logged(a::Float64, y::Vector{Float64}) = begin
+    mu = logged_scale(a)
+    total::Float64 = sum((y .- mu) .^ 2)
+    return total
+end
+
+# The same logging beside a run-time dispatch of the helper's own.
+function logged_hidden_scale(x)
+    x == 0.0 && @debug "zero scale" x
+    return (SCALE[] * x)::Float64
+end
+
+@kernel logged_hidden(a::Float64, y::Vector{Float64}) = begin
+    mu = logged_hidden_scale(a)
+    total::Float64 = sum((y .- mu) .^ 2)
+    return total
+end
+
 # Two independent uninferred values: the location and the scale.
 uninferred_scale(s) = Base.inferencebarrier(abs(s))
 
@@ -549,6 +580,35 @@ code_warning(pattern) = (:warn, Regex("ReactiveKernels: .*" * pattern, "s"))
         @test_throws ArgumentError prepare(Corpus.plate_location)
     end
     @test_throws ArgumentError prepare(Corpus.plate_location; type_stability_level = :deep)
+end
+
+@testset "type-stability levels: Julia's logging macros are Julia's own code" begin
+    U = Uninferred
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    # Control: the helper's own typed code holds the logging dispatch the
+    # audit exempts, so the refusals below would fire without the exemption.
+    code = first(only(code_typed(U.logged_scale, (Float64,); optimize = true))).code
+    @test any(s -> occursin("current_logger_for_env", sprint(show, s)), code)
+    @test any(s -> occursin("shouldlog", sprint(show, s)), code)
+
+    for level in (:values, :rk, :all)
+        @test_logs min_level = Base.CoreLogging.Warn prepare(
+            U.logged; type_stability = :error, type_stability_level = level)
+    end
+    kernel = prepare(U.logged; type_stability = :error)
+    @test kernel(0.1, y) ≈ sum((y .- 0.2) .^ 2)
+    @test_logs min_level = Base.CoreLogging.Warn prepare_ad(
+        kernel, backend, 0.1, y; active = :a, type_stability = :error)
+
+    # The audit still reports the helper's own run-time dispatch beside its
+    # logging, and names none of the logging.
+    e = refusal(() -> prepare(U.logged_hidden; type_stability = :error))
+    @test e isa TypeInstabilityError
+    message = only(e.messages)
+    @test occursin("logged_hidden_scale", message)
+    @test occursin("is a call dispatched at run time", message)
+    @test !occursin("CoreLogging", message)
+    @test !occursin("shouldlog", message)
 end
 
 end # module
