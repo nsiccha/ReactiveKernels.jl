@@ -2155,6 +2155,67 @@ function _plate_keeping_entries(producer::Recipe, read::Set{Int})
            nothing, producer.effectful, producer.source)
 end
 
+# A plate this pass drafts (sliced to the tuple entries its readers read, or
+# composed with its producer) whose planned cell no longer reads a shared
+# operand (a capture or `Ref`) stops taking it, and the work only such operands
+# needed leaves the plan: a cell of one value of a shared cell computes nothing
+# only the other values read (snag `sibling-only-pla-2b3df69e`). A zipped
+# operand stays, as it shapes the domain; an undrafted plate keeps its operands.
+function _drop_unread_plate_operands!(g::Graph, recipes, want)
+    changed = false
+    for (index, r) in enumerate(recipes)
+        r === nothing && continue
+        trimmed = _plate_without_unread_operands(r)
+        trimmed === nothing && continue
+        recipes[index] = trimmed
+        changed = true
+    end
+    changed || return false
+    read = Set(canon_id(g, v.id) for v in want)
+    for index in reverse(eachindex(recipes))
+        r = recipes[index]
+        r === nothing && continue
+        if r.effectful || any(v -> canon_id(g, v.id) in read, r.outputs)
+            foreach(v -> push!(read, canon_id(g, v.id)), r.inputs)
+        else
+            recipes[index] = nothing
+        end
+    end
+    true
+end
+
+# Drafted plate (or cell) recipe `r` without the shared operands its cell does
+# not read, or `nothing` when it reads them all.
+function _plate_without_unread_operands(r::Recipe)
+    cell = r.op isa _AuthoredPlateCellDraft
+    op = cell ? r.op.plate : r.op
+    op isa _AuthoredPlateDraft || return nothing
+    inner = op.plan
+    ig = inner.graph
+    read = Set(canon_id(ig, v.id) for v in inner.want)
+    for q in inner.recipes, v in q.inputs
+        push!(read, canon_id(ig, v.id))
+    end
+    atomic = _plate_atomic(op)
+    unread = Set(position for position in atomic
+                 if !(canon_id(ig, inner.have[position].id) in read))
+    isempty(unread) && return nothing
+    inputs = cell ? r.inputs[2:end] : r.inputs
+    kept = [position for position in eachindex(inputs) if !(position in unread)]
+    moved = Dict(old => new for (new, old) in enumerate(kept))
+    checks = Tuple(Tuple(moved[position] for position in group if haskey(moved, position))
+                   for group in op.axis_checks)
+    draft = _AuthoredPlateDraft{Tuple(moved[position] for position in atomic
+                                      if haskey(moved, position))}(
+        _partial_subplan(inner, inner.have[kept], inner.want, collect(inner.recipes)),
+        op.lowered_recipes, checks)
+    cell || return Recipe(r.id, inputs[kept], r.outputs, draft, r.cost, nothing,
+                          r.effectful, r.source)
+    Recipe(r.id, (first(r.inputs), inputs[kept]...), r.outputs,
+           _AuthoredPlateCellDraft(draft, r.op.locality, r.op.rows, r.op.partitioned),
+           r.cost, nothing, r.effectful, r.source)
+end
+
 function _fuse_authored_plate_chains(original::Plan; cells_only = false)
     p = _drop_unread_plate_entries(original)
     recipes = Union{Nothing,Recipe}[p.recipes...]
@@ -2217,6 +2278,7 @@ function _fuse_authored_plate_chains(original::Plan; cells_only = false)
         end
         changed |= progressed
     end
+    changed |= _drop_unread_plate_operands!(p.graph, recipes, p.want)
     changed || return p
     selected = Recipe[_built_plate_recipe(r) for r in recipes if r !== nothing]
     producer = Dict(canon_id(p.graph, v.id) => r for r in selected for v in r.outputs)

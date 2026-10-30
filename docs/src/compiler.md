@@ -948,6 +948,13 @@ index port): each of those cells runs it at that position. A position
 outside the domain throws `BoundsError`. Several plates can share one index
 port by passing the same `index` to successive `plate_cell` calls.
 
+A cell takes only the values its body reads. When several values come from
+one shared cell returning a tuple (`t = (a, b, c)`, read as `t[k]`, the cell
+RKPPL emits for an `@plate for` loop whose values share work), a cell of one
+value's reader runs the shared cell's work for that value alone, and the
+values only the other entries read (with everything upstream of them) are
+not computed.
+
 A whole array the cell captures and reads only at its own position, `v[i]`
 with `i` an integer element of a batched argument, is computed at that row
 only when its producer computes it row by row. So is one the cell reads at
