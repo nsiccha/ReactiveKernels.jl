@@ -540,8 +540,14 @@ function _affine_coefficient_statements(plan::StructuralPlan, layout::LayoutTabl
             value = t.options.parameter
             rhs = t.options.sign == 1 ? value : :(-$value)
         else
+            # A coefficient vector of Float64s, declared as the layout's own
+            # coordinate views are (`_plate_transform_statements`): a cell
+            # that reads the predictor at its rows needs the vector's type to
+            # compute `design * coefficients` there (`_cell_pushdowns`).
             rhs = _affine_coordinate_view(p, shape, layout)
             rhs === nothing && (rhs = :(vcat($(chunks...))))
+            push!(stmts, :($(_affine_block_name(p))::AbstractVector{Float64} = $rhs))
+            continue
         end
         push!(stmts, :($(_affine_block_name(p)) = $rhs))
     end
