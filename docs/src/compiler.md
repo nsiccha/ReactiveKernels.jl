@@ -1001,7 +1001,9 @@ supports these producers:
   of an array of numbers (read whole, as in `z .* tau[1]`). One source may be
   gathered by several index vectors, as in `exp.(t[r1]) .+ exp.(t[r2])`; it
   is then computed at the rows of every index;
-- such a gather alone, and such a column read alone;
+- such a gather alone, also written as the read-only view
+  `_readonly_gather(A, I)` that RKPPL reads a bare gathered definition
+  through, and such a column read alone;
 - `hcat(a, b, ...)` of inputs, such as a design matrix with a computed column;
 - `vcat(a, b, ...)` of inputs and number literals, such as a completed
   covariate `vcat(free, grouped)[lookup]` or a padded field `vcat(phi, 0.0)`.

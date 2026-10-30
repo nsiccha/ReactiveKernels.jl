@@ -21,7 +21,9 @@
 #   an integer vector input `I` (integer literals after it), column reads
 #   `A[:, 1, ...]`, products `A * w` of two inputs, and literal-position reads
 #   `a[1]` of an array of numbers (read whole);
-# - such a gather on its own, and such a column read on its own;
+# - such a gather on its own (also as `_readonly_gather(A, I)`, the view RKPPL
+#   reads a bare gathered definition through), and such a column read on its
+#   own;
 # - `hcat(a, b, ...)` of inputs: row `r` is the `hcat` of each operand's row
 #   `r`;
 # - a product `A * W...` (a source expression, or a bare call that keeps
@@ -123,6 +125,13 @@ end
     _cell_reads_rows(w, I) && return w.data[:, j, rest...]
     [w[i, j, rest...] for i in I]
 end
+
+# A read-only gather of a vector (`_readonly_gather`, core.jl, the view RKPPL
+# reads a bare gathered definition through) reads the window's rows as the
+# linear gather `w[I]` does; any other shape keeps `_readonly_gather`'s
+# `MethodError`.
+@inline _readonly_gather(w::_CellWindow{<:Any,<:Any,<:Tuple{Any}},
+                         indices::AbstractVector{<:Integer}) = w[indices]
 
 Base.show(io::IO, w::_CellWindow{<:Any,Int}) =
     print(io, "cell window at row ", w.rows, " of ", summary(w.data))
@@ -427,6 +436,10 @@ function _cell_form(r::Recipe; outlined::Bool = false)
     products = Dict{Int,Int}()
     leaves = Int[]
     param(x) = x isa Symbol && haskey(position, x)
+    # `_readonly_gather(A, I)`, RKPPL's view of a bare gathered definition: the
+    # linear gather `A[I]`.
+    readonly(ex) = ex isa Expr && ex.head === :call && length(ex.args) == 3 &&
+        !(ex.args[1] in params) && _kernel_resolve_binding(mod, ex.args[1]) === _readonly_gather
     function gather!(ex)
         length(ex.args) >= 2 || return false
         source, index = ex.args[1], ex.args[2]
@@ -451,6 +464,7 @@ function _cell_form(r::Recipe; outlined::Bool = false)
         end
         ex isa Union{Int,Float64,Bool} && return true
         ex isa Expr && ex.head === :ref && return gather!(ex) || column!(ex) || scalar!(ex)
+        readonly(ex) && return gather!(Expr(:ref, ex.args[2], ex.args[3]))
         ex isa Expr && ex.head === :call && return product!(ex)
         false
     end
@@ -496,6 +510,8 @@ function _cell_form(r::Recipe; outlined::Bool = false)
         push!(leaves, position[native.args[1]])
     elseif native isa Expr && native.head === :ref
         gather!(native) || return nothing
+    elseif readonly(native)
+        gather!(Expr(:ref, native.args[2], native.args[3])) || return nothing
     elseif native isa Expr && native.head === :call && length(native.args) >= 2 &&
            native.args[1] == GlobalRef(@__MODULE__, :_native_hcat) &&
            all(arg -> arg isa Symbol && haskey(position, arg), native.args[2:end])

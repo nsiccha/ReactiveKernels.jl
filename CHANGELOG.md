@@ -31,6 +31,11 @@ are recorded in the git history only.
   along the recipe's strict subexpressions, and keeps it when the recipe is
   then computed at rows. Values are unchanged. `prepare_nonallocating` keeps
   such a recipe as written.
+- A cell also computes at its rows a read-only gather
+  (`ReactiveKernels._readonly_gather(A, I)`, the view RKPPL reads a bare
+  gathered `@rkppl` definition through, such as
+  `w = vcat(w_observed, y_mis)[w_order]` or `w = s[idx]`), as it computes
+  `A[I]`. Earlier versions computed such a definition whole in every cell.
 
 ## 0.1.18
 
