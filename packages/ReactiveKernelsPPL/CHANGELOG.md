@@ -27,6 +27,17 @@ are recorded in the git history only.
   supplied data column with one entry per cell of each observation's plate
   (one name, or `observation => column` pairs). Requires ReactiveKernels
   0.1.23.
+- `prepare_partition_sampler(…; compact = true, partitioned = ())`: with
+  `compact` (the default) the gradient is over each partition's footprint,
+  the packed coordinates it reads, computed at preparation for every label
+  (`ReactiveKernels.partition_footprint(s, label)` lists them; `g` has the
+  footprint's length), the active coordinates overlaying a read-only packed
+  base as in `prepare_compact_cell_sampler` (native Enzyme Reverse needs
+  `Enzyme.set_runtime_activity`). `partitioned` names the parameters whose
+  rows belong to one partition each, bare when indexed by the key column
+  (`z[levels(subject)]`) or as `parameter => labels`; a partition that reads
+  another label's rows of them is refused at preparation with a
+  `ReactiveKernels.PartitionSeparabilityError`.
 - `prepare_cell_query`, `prepare_cell_sampler` and
   `prepare_compact_cell_sampler` take `locality = :error | :warn | :ignore`
   (`nothing`, the default, reads ReactiveKernels' `cell_locality`
