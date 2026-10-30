@@ -16,6 +16,41 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.16
+
+- One cell of a plate (`plate_cell`; RKPPL's `prepare_cell_query` and compact
+  cell samplers) computes more of the values it reads at its own rows instead
+  of whole:
+  - `vcat(a, b, ...)` of inputs and number literals, such as a completed
+    covariate `observed .+ mask .* vcat(free, grouped)[lookup]` or a padded
+    field `vcat(phi, 0.0)`: each operand is computed at the rows of it the
+    cell reads, none for an operand it does not read. Matrices stack along
+    their first axis, with their other dimensions checked as `vcat` checks
+    them.
+  - a typed alias `b::T = a` whose declaration converts no elements
+    (`AbstractVector`, no declaration). A declaration that converts
+    elements (`b::Vector{Float64} = a`) keeps `b` whole.
+  - one source gathered by several index vectors in one expression
+    (`exp.(t[r1]) .+ exp.(t[r2])`).
+  - a shared value that a plate computed at rows reads through an index
+    array (`sum(exp.(log_w[rows[k]]))`), as cells already read it.
+- Each value computed at rows is computed once per cell, at all the rows its
+  readers read. Earlier versions computed it, with everything upstream of it,
+  once per set of rows read (a predictor gathered by two index vectors in two
+  definitions ran twice).
+- Measured on ArbeitsplatzAtlas's BRM program (223,941 coordinates, BRM
+  0.2.63; gordito, Julia 1.10.12, one thread, at the zero point): one cell's
+  value reads 26,145 packed coordinates instead of 252,447 (`osm_pub`),
+  49,215 instead of 724,502 (`ba_n`) and about 50,000 instead of 713,760
+  (`gr_n`, `hh_n`); a warm value takes 0.36 ms instead of 4.1 ms (`osm_pub`)
+  and 0.50 ms instead of 17.1 ms (`ba_n`), a warm compact cell gradient 9.9 ms
+  instead of 30.2 ms and 23.0 ms instead of 74.1 ms. Preparing a cell costs
+  more: its first compact gradient compiles in 133–140 s instead of 54–72 s
+  (`ba_n`, `gr_n`), its first value in about 21 s instead of 8 s. A value an
+  ordinary function computes (BRM's grouped-shares values and CAR fields
+  there) is still computed whole in every cell, also as a `vcat` operand the
+  cell reads no row of, since the `vcat` needs its length.
+
 ## 0.1.15
 
 - **Breaking:** ReactiveKernels has no Reactant path. The Reactant extension
