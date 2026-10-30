@@ -16,7 +16,8 @@
 # non-concrete value whose arguments are all concrete is the source of the
 # instability and is reported as `:root`. Statements inlined from a call chain
 # in `_CODE_FINDINGS_JUSTIFIED` are exempt; each entry carries its
-# justification.
+# justification. So are the statements of an expansion of Julia's logging
+# macros (`_code_logging`).
 
 struct _CodeFinding
     kind::Symbol
@@ -204,6 +205,44 @@ _code_justified(ci, i) = let chain = _code_inlining_chain(ci, i)
     any(entry -> all(in(chain), entry), _CODE_FINDINGS_JUSTIFIED)
 end
 
+# The source files of the macro expansions statement `i` lies in, at any
+# inlining depth. From Julia 1.12 a macro expansion is a frame of the
+# `DebugInfo` line tables, which the compiler's own walk (`append_scopes!`)
+# names `macro expansion`; before, a `LineInfoNode` of that name.
+function _code_expansion_files(ci::Core.CodeInfo, i)
+    if isdefined(ci, :debuginfo)
+        scopes = Base.IRShow.LineInfoNode[]
+        Base.IRShow.append_scopes!(scopes, i, ci.debuginfo, nothing)
+        return Symbol[s.file for s in scopes if s.method === Symbol("macro expansion")]
+    end
+    files = Symbol[]
+    location = ci.codelocs[i]
+    while location != 0
+        node = ci.linetable[location]
+        node.method === Symbol("macro expansion") && push!(files, node.file)
+        location = node.inlined_at
+    end
+    files
+end
+
+# Base's logging source, where the code its logging macros (`@debug`, `@info`,
+# `@warn`, `@error`, `@logmsg`) expand to is written.
+const _LOGGING_SOURCES = Set{Symbol}(m.file for m in methods(Base.CoreLogging.logmsg_code))
+
+# Whether statement `i` belongs to an expansion of Julia's logging macros. That
+# code is Julia's own, written into the caller's body by the macro, and it
+# dispatches at run time by design: the logger is a dynamically scoped
+# `AbstractLogger`, and `shouldlog` and `handle_message` are called in the
+# latest world. It runs only when its log statement is reached, and dispatches
+# only when a logger accepts the record, so no client can make it concrete.
+# The audit therefore treats it as it treats the bodies of Julia's own
+# functions, which it never enters. This covers the record's message and
+# fields, which run only for an accepted record. Measured on Julia 1.10.12,
+# 1.12.7 and 1.13.1 (snag `type-stability-a-a6941de1`: the `@debug` calls on
+# the underflow branches of SpecialFunctions' `beta_inc` refused a
+# negative-binomial likelihood at `type_stability_level = :all`).
+_code_logging(ci, i) = any(in(_LOGGING_SOURCES), _code_expansion_files(ci, i))
+
 function _within_module(m::Module, root::Module)
     while true
         m === root && return true
@@ -244,25 +283,27 @@ function _code_audit!(found, seen, @nospecialize(tt), where, recurse)
         live, reads = _code_returning(ci), _code_used(ci)
         for (i, statement) in enumerate(ci.code)
             live[i] || continue
-            _code_justified(ci, i) && continue
             T = _code_widen(ci.ssavaluetypes[i])
-            if reads[i] && _code_valued(statement) && !_code_stable(T)
+            unstable = reads[i] && _code_valued(statement) && !_code_stable(T)
+            dynamic = statement isa Expr && _code_dynamic(ci, statement)
+            mi = statement isa Expr && statement.head === :invoke ?
+                _code_method_instance(statement) : nothing
+            callee = mi === nothing ? nothing : mi.def
+            recursing = callee isa Method && recurse(callee)
+            # The exemptions read the statement's debug info, so only for a
+            # statement the audit would report or enter.
+            unstable || dynamic || recursing || continue
+            (_code_justified(ci, i) || _code_logging(ci, i)) && continue
+            if unstable
                 root = statement isa Expr && statement.head in (:call, :invoke) &&
                     all(x -> _code_stable(_code_argument_type(ci, x)),
                         _code_call_arguments(statement))
                 push!(found, _CodeFinding(root ? :root : :nonconcrete, where, i, T,
                                           _code_statement_text(statement)))
             end
-            statement isa Expr && _code_dynamic(ci, statement) &&
-                push!(found, _CodeFinding(:dynamic, where, i, T,
-                                          _code_statement_text(statement)))
-            if statement isa Expr && statement.head === :invoke
-                mi = _code_method_instance(statement)
-                mi === nothing && continue
-                m = mi.def
-                m isa Method && recurse(m) || continue
-                _code_audit!(found, seen, mi.specTypes, _code_label(m), recurse)
-            end
+            dynamic && push!(found, _CodeFinding(:dynamic, where, i, T,
+                                                 _code_statement_text(statement)))
+            recursing && _code_audit!(found, seen, mi.specTypes, _code_label(callee), recurse)
         end
     end
     found

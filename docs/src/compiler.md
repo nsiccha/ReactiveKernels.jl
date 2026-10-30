@@ -466,6 +466,16 @@ So at `:all`, a helper that dispatches at run time but asserts its result
 declared local (`mu::Vector{Float64} = f(x)`) over a helper whose result is
 not inferred; at `:values` neither is.
 
+The code that Julia's logging macros (`@debug`, `@info`, `@warn`, `@error`,
+`@logmsg`) write into a function's body is Julia's own and is not reported at
+any level, the record's message and fields included. It dispatches at run
+time by design: the logger is a dynamically scoped `AbstractLogger`, and
+`shouldlog` and `handle_message` are called in the latest world. It runs only
+when its log statement is reached, and dispatches only when a logger accepts
+the record. So a dependency that logs on a cold branch, as SpecialFunctions'
+`beta_inc` does with `@debug` on underflow, passes `:all`, while a run-time
+dispatch of that dependency's own code is still reported.
+
 `type_stability` is what preparation does with a finding. By default (`:warn`)
 it logs a warning once per process and succeeds, so the primal of such a
 kernel keeps working. `:error` refuses the program: every preparation throws a
