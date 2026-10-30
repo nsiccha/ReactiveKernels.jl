@@ -1089,13 +1089,19 @@ end
         active = :unconstrained)
     _, gfull = Base.invokelatest(ad_value_and_gradient, full, u)
     names = coordinate_names(built.layout)
+    levels = sort(unique(data.group))
+    # The coordinates a subject may read: every shared one, and its own
+    # groups' rows of `z` (named by level index).
+    own_of(label) = findall(names) do n
+        !startswith(String(n), "z.") || any(unique(data.group[data.subject .== label])) do gi
+            String(n) == "z.$(findfirst(==(gi), levels))"
+        end
+    end
     g = similar(u)
     for label in 1:3
         value, _ = partition_value_and_gradient!(s, g, u, label)
         @test value ≈ q(u, label)
-        own = findall(n -> any(gi -> startswith(String(n), "z.$gi"),
-            unique(data.group[data.subject .== label])) || !startswith(String(n), "z."), names)
-        @test findall(!iszero, g) ⊆ own
+        @test findall(!iszero, g) ⊆ own_of(label)
     end
     gsum = zero(u)
     for label in 1:3
@@ -1124,7 +1130,6 @@ end
     # packed coordinates it reads, equal to the dense one there; the
     # footprints' union over the labels is the full likelihood gradient.
     rt = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
-    levels = sort(unique(data.group))
     level_subject = [data.subject[findfirst(==(l), data.group)] for l in levels]
     compact = prepare_partition_sampler(built, bound, :y, u; by = :subject, backend = rt,
                                         partitioned = (:z => level_subject,))
@@ -1133,8 +1138,9 @@ end
     for label in 1:3
         footprint = partition_footprint(compact, label)
         @test issorted(footprint) && allunique(footprint)
+        # `sd` is read by the prior only, never by the likelihood's cells.
         own = unique(data.group[data.subject .== label])
-        @test Set(String.(names[footprint])) == Set(["sigma", "a", "sd", ("z.$(findfirst(==(gi), levels))" for gi in own)...])
+        @test Set(String.(names[footprint])) == Set(["sigma", "a", ("z.$(findfirst(==(gi), levels))" for gi in own)...])
         gc = zeros(length(footprint))
         value, _ = partition_value_and_gradient!(compact, gc, u, label)
         @test value ≈ q(u, label)

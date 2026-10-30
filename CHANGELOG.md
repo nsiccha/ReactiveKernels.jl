@@ -35,7 +35,7 @@ are recorded in the git history only.
   process); `plate_cell` defaults to the project preference `cell_locality`
   (`"warn"` unless set), `plate_partition` to `:error`.
   `partition_locality(kernel)` reports the classification of every value a
-  cell reads (`:rows`, `:input`, `:data`, `:scalar`, `:shared`, `:unknown`,
+  cell reads (`:rows`, `:input`, `:data`, `:scalar`, `:shared`,
   `:whole`).
 - Two more producers are computed at a cell's rows: `view(A, lo:hi)` /
   `A[lo:hi]` and `reshape(v, n, k...)` with literal or scalar-input bounds and

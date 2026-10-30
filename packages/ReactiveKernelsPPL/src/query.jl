@@ -780,6 +780,10 @@ end
 
 @inline _compact_cell_point(base, active, slots) =
     _CompactCellPoint(base, active, slots)
+# The overlay is a lazy view of its base and active vectors: a cell or
+# partition reads it at rows as it reads a packed HAVE vector (RK's locality
+# analysis, `reactivekernels-use` §4i).
+ReactiveKernels._cell_lazy_view(::typeof(_compact_cell_point)) = true
 
 # The slot map of a selection over `total` packed coordinates.
 function _compact_cell_slots(total::Int, indices)

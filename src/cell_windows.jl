@@ -969,6 +969,13 @@ struct _CellPushdowns
     dropped::Dict{ValueId,Int}
 end
 
+# Whether an operation's output is a lazy view of its inputs, built at no cost
+# per element and read at rows as a view of them (ReactiveKernelsPPL's compact
+# overlay of active coordinates on a packed base). Such a value is never
+# computed at rows or refused for being computed whole: reading it at rows
+# reads its inputs at those rows. Extend for an operation of that kind.
+_cell_lazy_view(@nospecialize(op)) = false
+
 # Whether a producer reads an input in `role` at its own rows.
 _cell_row_role(role) =
     role in (:leaf, :gather, :linear_gather, :column, :factor_leaf, :factor, :part,
@@ -1032,7 +1039,11 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
             typeof(only(candidates).op.value) :
             valtype(v) === Any ? value_type(cidof(v)) : valtype(v)
     end
+    # A lazy view's output is read like a HAVE port: at rows as a view.
     fixed = Set(cidof(v) for v in Iterators.flatten((p.have, p.want)))
+    for r in p.recipes
+        _cell_lazy_view(r.op) && union!(fixed, (cidof(o) for o in r.outputs))
+    end
     forms = Dict{Int,_CellForm}()
     function form(cid)
         candidates = get(producers, cid, Recipe[])

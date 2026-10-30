@@ -34,7 +34,9 @@ function _pp_subject_data(per_subject)
     subject = Int[s for (s, n) in enumerate(per_subject) for _ in 1:n]
     g = Int[2(s - 1) + 1 + i % 2 for (s, n) in enumerate(per_subject) for i in 1:n]
     w = [sin(i / 3) for i in eachindex(subject)]
-    u = [0.3; [0.1 * ((k * 7) % 5 - 2) for k in 1:20]; 0.7]
+    # No exact zero among the effects: a zero effect makes a derivative vanish
+    # where the coordinate is still read.
+    u = [0.3; [0.1 * ((k * 7) % 5 - 1.5) for k in 1:20]; 0.7]
     (; u, g, w, subject)
 end
 const _PP_HAVE = (:u, :g, :w, :subject)

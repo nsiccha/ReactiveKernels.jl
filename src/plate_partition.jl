@@ -15,7 +15,8 @@
 # Classification of each value in a cell's cone (`_cell_locality`):
 #
 # - `:rows` — computed at the rows the cell reads (pushed);
-# - `:input` — a HAVE port: read at rows as a view, or whole, never computed;
+# - `:input` — a HAVE port, or a lazy view of inputs (`_cell_lazy_view`):
+#   read at rows as a view, or whole, never computed;
 # - `:data` — a bound constant (data): the same;
 # - `:scalar` — a number; it has no rows;
 # - `:shared` — computed whole because the evaluation genuinely needs it
@@ -187,7 +188,8 @@ function _cell_locality(p::Plan, d::_CellPushdowns)
                 found === nothing ? (isempty(requested) ? nothing : asker(first(requested)[1])) :
                     only(readers[cid][found][1].outputs).name
             end
-            status, reason, reader = if cid in have
+            status, reason, reader = if cid in have ||
+                                        (r !== nothing && _cell_lazy_view(r.op))
                 (:input, isempty(requested) ? :read_whole : :read_at_rows, nothing)
             elseif r !== nothing && r.op isa _BoundConstant
                 (:data, isempty(requested) ? :read_whole : :read_at_rows, nothing)
@@ -229,6 +231,21 @@ function _locality_value_types(p::Plan)
             recipe.op isa Union{_AuthoredPlateOp,_AuthoredScanOp,_AuthoredPlateCellOp} &&
                 return Any
             length(recipe.outputs) == 1 || return Any
+            # A literal read `a[k...]` of an array of numbers is one of them;
+            # a value with a row form over arrays of numbers is an array of
+            # numbers (Base computes its elements from its operands').
+            literal = _footprint_literal_read(recipe)
+            if literal !== nothing
+                S = input_types[first(literal)]
+                S isa Type && S <: AbstractArray && eltype(S) <: Number && return eltype(S)
+            end
+            f = _cell_form(recipe)
+            if f !== nothing && f.kind in (:pointwise, :identity, :columns, :hcat, :vcat,
+                                           :range_view, :reshape, :product)
+                elements = [eltype(S) for S in input_types
+                            if S isa Type && S <: AbstractArray && eltype(S) <: Number]
+                isempty(elements) || return AbstractArray{promote_type(elements...)}
+            end
             T = try
                 _promote_op(recipe.op, input_types...)
             catch
