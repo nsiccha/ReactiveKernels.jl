@@ -75,10 +75,11 @@ function _inline_source_form(r::Recipe, callargs, slot::Int)
     f isa _KernelSplit && (f = getfield(f, :call))
     f isa _KernelSourceFunction || return nothing
     # The throw-stripped twin (`on_error = :ignore`) carries the authored
-    # source, which is not its code: it keeps its call until it inlines its
-    # own stripped source (`_kernel_ignore_throw_source`). An authored
-    # operation is the one that holds a twin.
-    getfield(op, :ignored_throws) === nothing && return nothing
+    # source, which is not its code; `prepare(…; on_error = :ignore)` turns
+    # this emitter off for that preparation (`_INLINE_SOURCES_OFF`), so an
+    # operation without a twin here is one built without one: a split part,
+    # an outlined cell subexpression (`_cell_outline`), a hand-built
+    # operation. Its source is its code.
     source = r.source
     if _inline_literal(source)
         # A literal statement (`a::Float64 = -1.5`): the literal is its code.
