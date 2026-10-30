@@ -1524,6 +1524,11 @@ value, g = cell_value_and_gradient!(s, similar(u), u, i)
   on the coordinates cell `i` reads.
 - Observations without a pointwise plate (a scalar `~` observation, a joint
   multivariate response) are refused, naming the observation.
+- Preparing another cell's query costs that cell's preparation, not the
+  program's. The first preparation of a binding (a query, a sampler or a cell
+  query) generates the program once to check that the binding generates the
+  build's program; later preparations of that binding and build skip it, and a
+  cell query finds its plate in the program the build recorded.
 - Queries are not thread-safe: prepare one per thread.
 
 ## Programs emitted by BRM
