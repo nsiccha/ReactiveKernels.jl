@@ -8,19 +8,22 @@
 # plate. A cell whose batched element is an integer vector `r` reads the rows
 # `log_w[r]`, and a cell that reads its rows through a shared index array,
 # `log_w[rows[k]]` (`rows` read whole or through `vec`), reads `rows[k]`: one
-# row or several. When that array's producer computes it row by row, the
-# native lowering runs the producer's own operation on those rows instead: the
-# producer is given views of its row-aligned operands at those rows, and the
-# cell is given a `_CellWindow` holding the result, which answers reads of
-# those rows and throws `BoundsError` for any other. The rewrite applies to
-# these source shapes, read off the closure's native body
+# row or several. A cell may read it through several batched elements (the
+# outputs of one `@plate for` loop compose into the cell, each over a domain of
+# its own): it reads the rows of each. When that array's producer computes it
+# row by row, the native lowering runs the producer's own operation on those
+# rows instead: the producer is given views of its row-aligned operands at
+# those rows, and the cell is given a `_CellWindow` holding the result, which
+# answers reads of those rows and throws `BoundsError` for any other. The
+# rewrite applies to these source shapes, read off the closure's native body
 # (`_kernel_native_body`):
 #
 # - a dotted expression (one fused broadcast) whose operands are recipe
 #   inputs, numeric literals, gathers `A[I]` / `A[I, 1, ...]` of an input by
 #   an integer vector input `I` (integer literals after it), column reads
-#   `A[:, 1, ...]`, products `A * w` of two inputs, and literal-position reads
-#   `a[1]` of an array of numbers (read whole);
+#   `A[:, 1, ...]` (also as `view(A, :, 1, ...)`, the view RKPPL reads a
+#   per-observation value's column through), products `A * w` of two inputs,
+#   and literal-position reads `a[1]` of an array of numbers (read whole);
 # - such a gather on its own (also as `_readonly_gather(A, I)`, the view RKPPL
 #   reads a bare gathered definition through), and such a column read on its
 #   own;
@@ -36,8 +39,9 @@
 # - an authored plate: row `r` of its value is the plate over row `r` of each
 #   batched argument, lowered natively over those one-row views at the reading
 #   cell. A shared argument its body reads only as `v[q]`, `q` the element of
-#   one batched integer argument, is a linear gather by that argument, as in a
-#   cell (`_cell_capture_reader`); its other shared arguments are read whole.
+#   a batched integer argument (one or several), is a linear gather by those
+#   arguments, as in a cell (`_cell_capture_reader`); its other shared
+#   arguments are read whole.
 #   Its full axes are its batched arguments' broadcast axes, as its loop
 #   combines them.
 #
@@ -49,11 +53,12 @@
 # indexed. A value is computed only at rows when every reader of it reads rows
 # this way, so the program computes no value twice in different ways. The
 # cell's batched element must be provably an integer (a linear position) or an
-# integer vector, and each gather index provably an integer vector
-# (`_cell_static_type`). A recipe that holds one of these shapes inside one
-# expression, such as a gather from an inline `vcat`, is first split into
-# recipes of its own along its authored structure (`_cell_outlined_pushdowns`,
-# below).
+# integer vector, each gather index provably an integer vector, and each array
+# read at literal positions provably an array of numbers: by its declared type,
+# or by its producer's operands' types (`static_type` in `_cell_pushdowns`). A
+# recipe that holds one of these shapes inside one expression, such as a
+# gather from an inline `vcat`, is first split into recipes of its own along
+# its authored structure (`_cell_outlined_pushdowns`, below).
 #
 # Shapes and bounds keep the whole program's checks for this cell: each
 # dotted expression's and `hcat`'s full shape is computed from its operands'
@@ -400,9 +405,9 @@ end
 # input a gather source `j` is read by (`A[I]` and `A[J]` in one expression
 # read `A` at the rows of both). `parts` are a `vcat`'s operands in order: an
 # input position, or a number literal; an input read as a `vcat` operand has
-# role `:part`. `vias[j]` is the shared index array an authored plate reads
-# source `j` through (`v[w[q]]`, `q` the element of index input
-# `gather_index[j]`), 0 for a direct read; that index array has role `:via`.
+# role `:part`. `vias[j][m]` is the shared index array an authored plate reads
+# source `j` through at its `m`th index (`v[w[q]]`, `q` the element of index
+# input `indices[j][m]`), 0 for a direct read; that index array has role `:via`.
 struct _CellForm
     kind::Symbol
     roles::Vector{Symbol}
@@ -411,7 +416,7 @@ struct _CellForm
     operand::Int
     indices::Vector{Vector{Int}}
     parts::Vector{Any}
-    vias::Vector{Int}
+    vias::Vector{Vector{Int}}
     # A `:range_view`'s literal range, or a `:reshape`'s literal dimensions.
     literal::Any
 end
@@ -419,9 +424,12 @@ _CellForm(kind, roles, gather_index, leaves, operand, indices = Vector{Int}[
         role in (:gather, :linear_gather) ? [gather_index[j]] : Int[]
         for (j, role) in enumerate(roles)], parts = Any[]) =
     _CellForm(kind, roles, gather_index, leaves, operand, indices, parts,
-        zeros(Int, length(roles)), nothing)
+        _cell_direct_reads(indices), nothing)
 _CellForm(kind, roles, gather_index, leaves, operand, indices, parts, vias) =
     _CellForm(kind, roles, gather_index, leaves, operand, indices, parts, vias, nothing)
+
+# Every index of every source read directly (no shared index array).
+_cell_direct_reads(indices) = Vector{Int}[zeros(Int, length(ix)) for ix in indices]
 
 # Expression heads that bind no names; any other head declines the rewrite.
 const _CELL_PLAIN_HEADS = (:call, :ref, :tuple, :., Symbol("'"), :vect, :hcat,
@@ -490,6 +498,13 @@ function _cell_form(r::Recipe; outlined::Bool = false)
     # linear gather `A[I]`.
     readonly(ex) = ex isa Expr && ex.head === :call && length(ex.args) == 3 &&
         !(ex.args[1] in params) && _kernel_resolve_binding(mod, ex.args[1]) === _readonly_gather
+    # `view(A, :, k...)`, RKPPL's in-place column read of a per-observation
+    # value (`_observation_slice_views`): the column read `A[:, k...]`, as an
+    # `Expr(:ref)`, or `nothing`.
+    column_view(ex) = ex isa Expr && ex.head === :call && length(ex.args) >= 4 &&
+        !_native_callee_shadowed(ex.args[1], params) &&
+        _cell_binding(ex.args[1], mod) === Base.view && _cell_colon(ex.args[3], mod) ?
+        Expr(:ref, ex.args[2], :(:), ex.args[4:end]...) : nothing
     function gather!(ex)
         length(ex.args) >= 2 || return false
         source, index = ex.args[1], ex.args[2]
@@ -515,6 +530,8 @@ function _cell_form(r::Recipe; outlined::Bool = false)
         ex isa Union{Int,Float64,Bool} && return true
         ex isa Expr && ex.head === :ref && return gather!(ex) || column!(ex) || scalar!(ex)
         readonly(ex) && return gather!(Expr(:ref, ex.args[2], ex.args[3]))
+        column = column_view(ex)
+        column === nothing || return column!(column)
         ex isa Expr && ex.head === :call && return product!(ex)
         false
     end
@@ -549,6 +566,7 @@ function _cell_form(r::Recipe; outlined::Bool = false)
     operand = 0
     parts = Any[]
     literal = nothing
+    native = something(column_view(native), native)
     if _cell_materialize(native)
         lazy = native.args[2]
         _cell_broadcasted(lazy) && lazy!(lazy) || return nothing
@@ -640,7 +658,7 @@ function _cell_form(r::Recipe; outlined::Bool = false)
     gather_index = Int[isempty(indices[j]) ? get(products, j, 0) : first(indices[j])
                        for j in eachindex(params)]
     _CellForm(kind, roles, gather_index, kind in (:hcat, :vcat) ? leaves : unique!(leaves),
-        operand, indices, parts, zeros(Int, length(roles)), literal)
+        operand, indices, parts, _cell_direct_reads(indices), literal)
 end
 
 # A literal of a range bound or a reshape dimension: an integer, or a scalar
@@ -728,10 +746,10 @@ function _cell_identity_form(r::Recipe)
 end
 
 # An authored plate's value, row by row: its batched arguments are broadcast
-# operands, a shared argument read only at one batched integer argument's
-# element, or through a shared index array at it (`v[w[q]]`, as a total over a
-# group of rows reads them), is gathered by it, and any other shared argument
-# is read whole.
+# operands, a shared argument read only at batched integer arguments'
+# elements, or through a shared index array at them (`v[w[q]]`, as a total
+# over a group of rows reads them), is gathered by them, and any other shared
+# argument is read whole.
 function _cell_plate_form(r::Recipe)
     op = r.op::_AuthoredPlateOp
     atomic = typeof(op).parameters[2]
@@ -744,26 +762,53 @@ function _cell_plate_form(r::Recipe)
     isempty(leaves) && return nothing
     roles = Symbol[k in atomic ? :whole : :leaf for k in 1:n]
     gather_index = zeros(Int, n)
-    vias = zeros(Int, n)
+    indices = Vector{Int}[Int[] for _ in 1:n]
+    vias = Vector{Int}[Int[] for _ in 1:n]
     wants = Set(canon_id(ig, w.id) for w in inner.want)
+    reads = Dict{Int,Vector{Tuple{Int,Int}}}()
     for k in atomic
         roots[k] in wants && continue
-        read = _cell_capture_reader(inner, roots, atomic, roots[k])
-        read === nothing && continue
-        b, via = read
-        # An index array is read whole; it cannot also be gathered.
-        via == 0 || roles[via] in (:whole, :via) || continue
-        roles[k] = :linear_gather
-        gather_index[k] = b
-        roles[b] = :index
-        via == 0 || (vias[k] = via; roles[via] = :via)
+        found = _cell_capture_reader(inner, roots, atomic, roots[k])
+        found === nothing || (reads[k] = found)
     end
-    any(k -> roles[k] === :via && (gather_index[k] != 0 || vias[k] != 0), 1:n) &&
-        return nothing
-    f = _CellForm(:pointwise, roles, gather_index, leaves, 0)
-    _CellForm(f.kind, f.roles, f.gather_index, f.leaves, f.operand, f.indices, f.parts,
-        vias)
+    # An index array is read whole; it is not also gathered.
+    through = Set(w for found in values(reads) for (_, w) in found if w != 0)
+    for (k, found) in reads
+        k in through && continue
+        roles[k] = :linear_gather
+        gather_index[k] = first(first(found))
+        for (b, w) in found
+            roles[b] = :index
+            push!(indices[k], b)
+            push!(vias[k], w)
+        end
+    end
+    foreach(w -> roles[w] = :via, through)
+    _CellForm(:pointwise, roles, gather_index, leaves, 0, indices, Any[], vias)
 end
+
+# The type of an authored plate's value from its input types: an array of its
+# cell's result type, typed from a walk of its body as the generated body
+# types the buffer it allocates (`_checked_plate_element!`, `_plate_similar_output`),
+# or `Any` when that type is unknown.
+function _cell_plate_output_type(op::_AuthoredPlateOp, input_types)
+    all(T -> T isa Type, input_types) || return Any
+    element = _checked_plate_element!(_UninferredValue[], op, input_types, Symbol[])
+    element isa Type && element !== Any && element !== Union{} || return Any
+    isconcretetype(element) ? AbstractArray{element} : AbstractArray{<:element}
+end
+
+# A concrete array of an abstract array type's element type and rank, which
+# Base computes the same elements from; any other type unchanged.
+_cell_standin_type(T) = T isa DataType && T <: AbstractArray && !isconcretetype(T) &&
+    isconcretetype(eltype(T)) ? Array{eltype(T),ndims(T)} : T
+
+# What a value computed from such stand-ins is known to be: its element type
+# and rank (its container follows from its operands'), a number, or `Any`.
+_cell_element_type(S) =
+    S isa DataType && S <: AbstractArray && isconcretetype(eltype(S)) ?
+        AbstractArray{eltype(S),ndims(S)} :
+    S isa Type && S !== Union{} && S <: Number ? S : Any
 
 # `*` as the closure resolves it is Base's, or the native body's companion
 # for it (`_native_mul`, core.jl).
@@ -774,32 +819,43 @@ function _cell_base_product(callee, mod, params)
     isdefined(mod, :*) && getglobal(mod, :*) === Base.:*
 end
 
+# The value a callee or argument names in the closure's module: a `GlobalRef`,
+# or a bare or qualified name (`_kernel_resolve_binding`); `nothing` when it
+# names no binding.
+_cell_binding(ex::GlobalRef, mod) =
+    isdefined(ex.mod, ex.name) ? getglobal(ex.mod, ex.name) : nothing
+_cell_binding(ex, mod) = mod isa Module ? _kernel_resolve_binding(mod, ex) : nothing
+
+# Whether a call argument is the whole-axis index `:` (`Colon()`): the bare or
+# resolved `:`, or `Colon()` called with no arguments.
+_cell_colon(ex, mod) = _cell_binding(ex, mod) === Colon() ||
+    Meta.isexpr(ex, :call, 1) && _cell_binding(ex.args[1], mod) === Colon
+
 # The positions `k` of the cell's shared arguments that its body reads only as
-# `v[q]` or `v[w[q]]`, `q` the element of one batched argument `b` and `w`
-# another shared argument, as `k => (b, w)` (`w = 0` for `v[q]`). The element
-# `q`, or `w[q]`, is a linear position or an integer vector of them.
+# `v[q]` or `v[w[q]]`, each `q` the element of a batched argument `b` and `w`
+# another shared argument, as `k => [(b, w), ...]` (`w = 0` for `v[q]`), one
+# pair per distinct read (`_cell_capture_reader`). Each element `q`, or
+# `w[q]`, is a linear position or an integer vector of them.
 function _cell_capture_positions(r::Recipe, static_type)
     plate = (r.op::_AuthoredPlateCellOp).plate
     atomic = typeof(plate).parameters[2]
     inner = plate.kernel.plan
     ig = inner.graph
     roots = ValueId[canon_id(ig, v.id) for v in inner.have]
-    captures = Dict{Int,Tuple{Int,Int}}()
+    captures = Dict{Int,Vector{Tuple{Int,Int}}}()
     length(roots) == length(r.inputs) - 1 && allunique(roots) || return captures
     wants = Set(canon_id(ig, w.id) for w in inner.want)
     for k in atomic
         roots[k] in wants && continue
-        read = _cell_capture_reader(inner, roots, atomic, roots[k])
-        read === nothing && continue
-        b, via = read
-        lane = static_type(r.inputs[1 + b])
-        if via == 0
-            _cell_positions_type(lane) || continue
-        else
-            lane <: AbstractArray{<:Integer} &&
-                _cell_positions_type(static_type(r.inputs[1 + via])) || continue
-        end
-        captures[k] = read
+        reads = _cell_capture_reader(inner, roots, atomic, roots[k])
+        reads === nothing && continue
+        all(reads) do (b, via)
+            lane = static_type(r.inputs[1 + b])
+            via == 0 ? _cell_positions_type(lane) :
+                lane <: AbstractArray{<:Integer} &&
+                    _cell_positions_type(static_type(r.inputs[1 + via]))
+        end || continue
+        captures[k] = reads
     end
     captures
 end
@@ -809,11 +865,14 @@ _cell_positions_type(T) =
     T <: AbstractArray{<:Integer} || T <: AbstractArray{<:AbstractVector{<:Integer}}
 
 # How the plate body reads shared argument `cid`: only as `v[q]` or `v[w[q]]`,
-# `q` the element of one batched argument `b`, `w` one other shared argument,
-# the same way at every read. `(b, w)`, `w = 0` for `v[q]`, or `nothing`.
+# `q` the element of a batched argument `b`, `w` one other shared argument.
+# Each distinct read `(b, w)`, `w = 0` for `v[q]`, in first-read order, or
+# `nothing`. A value read through several batched arguments is read at the
+# rows of each: the plates of one `@plate for` loop's outputs, each over a
+# domain of its own, compose into one cell that reads it through each domain.
 function _cell_capture_reader(inner::Plan, roots, atomic, cid)
     ig = inner.graph
-    found = nothing
+    found = Tuple{Int,Int}[]
     root(params, recipe, name) = let j = findfirst(==(name), params)
         j === nothing ? nothing : findfirst(==(canon_id(ig, recipe.inputs[j].id)), roots)
     end
@@ -851,11 +910,10 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid)
             (b === nothing || b in atomic) && return nothing
             w = via === nothing ? 0 : via_root(params, recipe, via)
             (w === nothing || (w != 0 && !(w in atomic)) || w == b) && return nothing
-            found === nothing && (found = (b, w))
-            found == (b, w) || return nothing
+            (b, w) in found || push!(found, (b, w))
         end
     end
-    found
+    isempty(found) ? nothing : found
 end
 
 # Whether `ex` reads the names `captured` only as `v[q]` or `v[w[q]]`, with `q`
@@ -884,9 +942,9 @@ producers computed only at their readers' rows (their table slots are kept and
 recorded in `slots` as lowering reaches them: an operation's slot, or, for an
 authored plate, the table length before its reserved slots, with the
 argument values it is lowered with in `plates`). `captures[cell recipe id]`
-maps each shared argument position read at the cell's own rows to the batched
-argument holding those rows and the shared argument they are read through
-(`_cell_capture_positions`); `batched[cell recipe id]` names the cell's
+maps each shared argument position read at the cell's own rows to each pair of
+a batched argument holding rows it reads and the shared argument they are read
+through (`_cell_capture_positions`); `batched[cell recipe id]` names the cell's
 ordinary batched argument positions; `order[recipe id]` is its position in the
 plan, producers first.
 """
@@ -896,7 +954,7 @@ struct _CellPushdowns
     recipes::Set{Int}
     producer::Dict{ValueId,Recipe}
     forms::Dict{Int,_CellForm}
-    captures::Dict{Int,Dict{Int,Tuple{Int,Int}}}
+    captures::Dict{Int,Dict{Int,Vector{Tuple{Int,Int}}}}
     batched::Dict{Int,Set{Int}}
     slots::Dict{Int,Int}
     plates::Dict{Int,Any}
@@ -932,9 +990,47 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
         foreach(o -> push!(get!(producers, cidof(o), Recipe[]), r), r.outputs)
         foreach(c -> push!(get!(readers, c, Recipe[]), r), unique(map(cidof, r.inputs)))
     end
+    have_types = Dict{ValueId,Any}(cidof(v) => valtype(v) for v in p.have)
+    types = Dict{ValueId,Any}()
+    # A value's type: bound data's own type, else the type the reading value
+    # declares, else the one its producer's output declares (an alias such as
+    # `e = lr` reads `lr` under a name of its own that declares nothing), else
+    # what Julia infers the producer returns from its inputs' types, as the
+    # plan types plate inputs (`_recipe_inferred_output_types`; no recipe is
+    # run), or for an authored plate an array of its cell's result type
+    # (`_cell_plate_output_type`). Julia infers nothing for a broadcast over an
+    # abstract array type (`exp.(lr)` with `lr::AbstractVector{Float64}`), so a
+    # value with a row form, whose elements Base computes from its operands'
+    # elements, is typed by its element type and rank from concrete arrays of
+    # its operands' element types (`_cell_element_type`). A dotted value
+    # `e = exp.(lr)` read at literal positions, `e[1]`, is so known to hold
+    # numbers.
+    function value_type(cid)
+        haskey(types, cid) && return types[cid]
+        candidates = get(producers, cid, Recipe[])
+        T = if length(candidates) != 1
+            get(have_types, cid, Any)
+        else
+            r = only(candidates)
+            k = findfirst(o -> cidof(o) == cid, r.outputs)
+            declared = valtype(r.outputs[k])
+            inputs = Any[static_type(v) for v in r.inputs]
+            inferred = declared !== Any ? declared :
+                r.op isa _AuthoredPlateOp ?
+                    (length(r.outputs) == 1 ? _cell_plate_output_type(r.op, inputs) : Any) :
+                    _recipe_inferred_output_types(r, inputs)[k]
+            if inferred === Any && !(r.op isa _AuthoredPlateOp) && form(cid) !== nothing
+                inferred = _cell_element_type(_recipe_inferred_output_types(r,
+                    Any[_cell_standin_type(T) for T in inputs])[k])
+            end
+            inferred === Union{} ? Any : inferred
+        end
+        types[cid] = T
+    end
     static_type(v) = let candidates = get(producers, cidof(v), Recipe[])
         length(candidates) == 1 && only(candidates).op isa _BoundConstant ?
-            typeof(only(candidates).op.value) : valtype(v)
+            typeof(only(candidates).op.value) :
+            valtype(v) === Any ? value_type(cidof(v)) : valtype(v)
     end
     fixed = Set(cidof(v) for v in Iterators.flatten((p.have, p.want)))
     forms = Dict{Int,_CellForm}()
@@ -990,7 +1086,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
             part isa Int || static_type(r.inputs[part.input]) <: Integer
         end
     end
-    captures = Dict{Int,Dict{Int,Tuple{Int,Int}}}()
+    captures = Dict{Int,Dict{Int,Vector{Tuple{Int,Int}}}}()
     batched = Dict{Int,Set{Int}}()
     pushed = Set{ValueId}()
     requests = Dict{ValueId,Vector{Tuple{Int,Symbol}}}()
@@ -1044,7 +1140,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
             for reader in get(readers, cid, Recipe[])
                 slots = findall(v -> cidof(v) == cid, collect(reader.inputs))
                 ok = if reader.op isa _AuthoredPlateCellOp
-                    positions = get(captures, reader.id, Dict{Int,Tuple{Int,Int}}())
+                    positions = get(captures, reader.id, Dict{Int,Vector{Tuple{Int,Int}}}())
                     lanes = get(batched, reader.id, Set{Int}())
                     all(slots) do s
                         s > 1 && ((haskey(positions, s - 1) &&
@@ -1387,12 +1483,12 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
         elseif role in (:gather, :linear_gather) && icid in d.pushed
             # The rows every gather index reads (`_cell_gather_rows` joins
             # those of several indices).
-            ats = map(f.indices[j]) do k
+            ats = map(f.indices[j], f.vias[j]) do k, via
                 index = canon_id(d.graph, r.inputs[k].id)
                 at = _cell_operand_row!(e, index, U)
-                f.vias[j] == 0 ? Expr(:call, _cell_ref(:_cell_gather_row), at, U) :
+                via == 0 ? Expr(:call, _cell_ref(:_cell_gather_row), at, U) :
                     Expr(:call, _cell_ref(:_cell_via_rows),
-                        e.names[canon_id(d.graph, r.inputs[f.vias[j]].id)], at)
+                        e.names[canon_id(d.graph, r.inputs[via].id)], at)
             end
             at = length(ats) == 1 ? only(ats) :
                 Expr(:call, _cell_ref(:_cell_gather_rows), ats...)
@@ -1457,10 +1553,10 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
                 _cell_ref(:_CellWindow), e.data[icid], e.unions[icid], shape)))
         elseif role in (:gather, :linear_gather)
             # The whole source, read by the gather at its index's rows.
-            for k in f.indices[j]
+            for (k, via) in zip(f.indices[j], f.vias[j])
                 at = _cell_operand_row!(e, canon_id(d.graph, r.inputs[k].id), U)
-                f.vias[j] == 0 || (at = Expr(:call, _cell_ref(:_cell_via_rows),
-                    e.names[canon_id(d.graph, r.inputs[f.vias[j]].id)], at))
+                via == 0 || (at = Expr(:call, _cell_ref(:_cell_via_rows),
+                    e.names[canon_id(d.graph, r.inputs[via].id)], at))
                 _footprint_record!(icid, role === :gather ? :gathered_rows : :gathered, at)
             end
             push!(args, e.names[icid])

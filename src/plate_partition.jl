@@ -132,7 +132,7 @@ function _cell_locality(p::Plan, d::_CellPushdowns)
         ok = cid in wants || any(get(readers, cid, Tuple{Recipe,Vector{Int}}[])) do (r, slots)
             if r.op isa _AuthoredPlateCellOp
                 atomic = typeof(r.op.plate).parameters[2]
-                positions = get(d.captures, r.id, Dict{Int,Tuple{Int,Int}}())
+                positions = get(d.captures, r.id, Dict{Int,Vector{Tuple{Int,Int}}}())
                 # Read whole by the cell body: an atomic argument that is not
                 # a capture read at the cell's own rows.
                 return any(s -> s > 1 && (s - 1) in atomic && !haskey(positions, s - 1), slots)
@@ -564,13 +564,13 @@ function _footprint_constant(r::Recipe, f::_CellForm, s::Int, producers, cidof)
     role = f.roles[s]
     if role in (:gather, :linear_gather)
         positions = Int[]
-        for k in f.indices[s]
+        for (k, via) in zip(f.indices[s], f.vias[s])
             producer = get(producers, cidof(r.inputs[k]), nothing)
             producer !== nothing && producer.op isa _BoundConstant || return nothing
             index = producer.op.value
             index isa AbstractArray{<:Integer} || return nothing
             role === :linear_gather || return nothing
-            f.vias[s] == 0 || return nothing
+            via == 0 || return nothing
             append!(positions, vec(index))
         end
         return positions

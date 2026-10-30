@@ -942,8 +942,10 @@ supports these producers:
 
 - a dotted expression of inputs, numeric literals, gathers `A[I]` or
   `A[I, k]` (an integer vector input `I`, integer literals `k`), column reads
-  `A[:, k]`, products `A * w` of two inputs, and literal-position reads `a[1]`
-  of an array of numbers (read whole, as in `z .* tau[1]`). One source may be
+  `A[:, k]` (also written as the view `view(A, :, k)`, which RKPPL reads a
+  per-observation value's column through), products `A * w` of two inputs,
+  and literal-position reads `a[1]` of an array of numbers (read whole, as in
+  `z .* tau[1]`). One source may be
   gathered by several index vectors, as in `exp.(t[r1]) .+ exp.(t[r2])`; it
   is then computed at the rows of every index;
 - such a gather alone, also written as the read-only view

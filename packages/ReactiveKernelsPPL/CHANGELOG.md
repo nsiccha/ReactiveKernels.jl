@@ -26,7 +26,7 @@ are recorded in the git history only.
   as one compiled pass, with its value and dense gradient. `by` names a
   supplied data column with one entry per cell of each observation's plate
   (one name, or `observation => column` pairs). Requires ReactiveKernels
-  0.1.21.
+  0.1.23.
 - `prepare_cell_query`, `prepare_cell_sampler` and
   `prepare_compact_cell_sampler` take `locality = :error | :warn | :ignore`
   (`nothing`, the default, reads ReactiveKernels' `cell_locality`

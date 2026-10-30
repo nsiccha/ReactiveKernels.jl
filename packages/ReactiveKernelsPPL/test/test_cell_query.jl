@@ -836,6 +836,137 @@ end
     end
 end
 
+# A joint population effect for several responses, as BRM emits it (snag
+# `column-read-lowe-24508269`): a design with a gathered computed column, a
+# submodel returning `X * beta` and one definition per response column. RKPPL
+# reads each column `P[:, j]` of the per-observation product in place, through
+# `view(P, :, j)`; a cell of one response computes the product, the design and
+# the gathered column at its own row, so its cost does not grow with the
+# observations.
+@rkppl _cq_joint(X, K, T) = begin
+    beta[1:K, 1:T] .~ Normal.(0.0, 1.0)
+    return X * beta
+end
+
+const _CQ_JOINT_COLUMNS = quote
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    z[levels(g)] .~ Normal.(0, 1)
+    c = z[g]
+    X = hcat(ones(length(x)), x, c)
+    P ~ _cq_joint(X, 3, 3)
+    m1 = P[:, 1]
+    eta1 = m1 .+ a
+    y1 .~ Normal.(eta1, sigma)
+    y2 .~ Normal.(P[:, 2] .+ P[:, 3], sigma)
+end
+
+_cq_joint_columns_data(n) = (; x = collect(range(0.5, 1.5; length = n)),
+    g = [mod1(3j, 5) for j in 1:n],
+    y1 = [0.3 * sin(j) for j in 1:n], y2 = [0.2 * cos(j) for j in 1:n])
+
+@testset "cell query: column views of a joint product cost the cell's own row" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    measured = map((20, 2_000)) do n
+        data = _cq_joint_columns_data(n)
+        bound, built = _cq_bound(_CQ_JOINT_COLUMNS, data, (:y1, :y2))
+        @test occursin("Base.view(P", string(kernel_expr(bound, built.layout)))
+        q = prepare_cell_query(built, bound, :y1)
+        u = collect(range(-0.4, 0.5; length = built.layout.total))
+        pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u).y1
+        values = [q(u, i) for i in (1, 2, n)]
+        q(u, 3)
+        s = prepare_cell_sampler(built, bound, :y1, u; backend)
+        cells = map((2, 3)) do i
+            g = similar(u)
+            value, _ = cell_value_and_gradient!(s, g, u, i)
+            (; value, central = all(j -> isapprox(g[j], _cq_central(v -> q(v, i), u, j);
+                rtol = 1e-5, atol = 1e-8), eachindex(u)))
+        end
+        (; values, reference = pointwise[[1, 2, n]], bytes = (@allocated q(u, 3)), cells,
+           cell_values = [q(u, i) for i in (2, 3)])
+    end
+    @test all(m -> m.values ≈ m.reference, measured)
+    @test measured[1].bytes == measured[2].bytes
+    for m in measured
+        @test [c.value for c in m.cells] ≈ m.cell_values
+        @test all(c -> c.central, m.cells)
+    end
+end
+
+# Values whose producers compute them row by row but that the cell computed
+# whole (snag `form-value-compu-c1e0965c`, the shapes of a BRM NLME program):
+# `c`, read at the loop index by two statements of one `@plate for` loop (each
+# output a plate over a domain of its own, so the cell reads `c` through two
+# domains); dotted sums of gathers that read a computed vector `e` and an
+# alias `f` of a drawn vector at literal positions (`e[1]`, `f[2]`); and a
+# mixture `mix` with literal reads of a computed vector, read through a gather.
+ReactiveKernels.@kernel _cq_form_law(value, a1, a2, a3) = begin
+    density = -0.5 * (value - a1 - a2 - a3)^2
+    return density
+end
+
+const _CQ_FORM_VALUES = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
+    lz ~ Normal(0, 1)
+    sigma ~ Exponential(1)
+    lr[1:3] .~ Normal.(0, 1)
+    z[levels(g)] .~ Normal.(0, 1)
+    c = logistic.(a .+ z[g])
+    xi = exp.(b .+ z[g])
+    lp = b .+ x
+    @plate for i in eachindex(y1)
+        arg1[i] = x[i]
+        arg2[i] = log(c[i]) - log(xi[i])
+        arg3[i] = (1 - c[i]) * sum(exp.(lp[rows[i]]))
+    end
+    y1 .~ LogDensity.(_cq_form_law, arg1, arg2, arg3)
+    e = logistic.(lz) .* exp.(lr)
+    f = lr
+    w = c[rep] .* e[1] .+ c[rep2] .* f[2]
+    y2 .~ Normal.(w, sigma)
+    cover = b .+ lr
+    mix = c .* exp.(cover[1]) .+ (1 .- c) .* exp.(cover[2])
+    y3 .~ Normal.(mix[k], sigma)
+end
+
+_cq_form_data(n) = (; y1 = sin.(1:n), y2 = cos.(1:n), y3 = sin.(2 .* (1:n)),
+    x = collect(range(-1, 1; length = n)), g = ["g$(mod1(3j, max(2, n ÷ 10)))" for j in 1:n],
+    rows = [[mod1(j, n), mod1(j + 3, n)] for j in 1:n], rep = [mod1(j + 1, n) for j in 1:n],
+    rep2 = [mod1(j + 5, n) for j in 1:n], k = [mod1(7j, n) for j in 1:n])
+
+@testset "cell query: values read by two loop statements, and literal reads of computed vectors" begin
+    backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    for obs in (:y1, :y2, :y3)
+        measured = map((40, 4_000)) do n
+            data = _cq_form_data(n)
+            bound, built = _cq_bound(_CQ_FORM_VALUES, data, (:y1, :y2, :y3))
+            q = prepare_cell_query(built, bound, obs)
+            u = collect(range(-0.4, 0.5; length = built.layout.total))
+            pointwise = getproperty(
+                Base.invokelatest(prepare_query(built, bound, :pointwise), u), obs)
+            values = [q(u, i) for i in (1, 2, n)]
+            q(u, 2)
+            dense = prepare_cell_sampler(built, bound, obs, u; backend)
+            dense_value, dense_gradient = cell_value_and_gradient!(dense, similar(u), u, 2)
+            support = findall(!iszero, dense_gradient)
+            compact = prepare_compact_cell_sampler(built, bound, obs, u, support; backend)
+            compact_gradient = similar(u[support])
+            compact_value, _ = cell_value_and_gradient!(
+                compact, compact_gradient, u, u[support], support, 2)
+            (; values, reference = [sum(x; init = 0.0) for x in pointwise[[1, 2, n]]],
+               bytes = (@allocated q(u, 2)), dense_value, compact_value,
+               parity = compact_gradient ≈ dense_gradient[support],
+               central = all(j -> isapprox(dense_gradient[j],
+                   _cq_central(v -> q(v, 2), u, j); rtol = 1e-5), support))
+        end
+        @test all(m -> m.values ≈ m.reference, measured)
+        @test measured[1].bytes == measured[2].bytes
+        @test all(m -> m.values[2] ≈ m.dense_value ≈ m.compact_value, measured)
+        @test all(m -> m.parity && m.central, measured)
+    end
+
 # A model value an ordinary function computes, read at a cell's rows, is
 # computed whole in every cell. `locality = :error` refuses the query naming
 # the statement (RK `plate_cell`, decision

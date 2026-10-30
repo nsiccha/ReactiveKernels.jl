@@ -4233,15 +4233,16 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
     if _footprint_recording() && windows !== nothing
         d = windows.pushdowns
         _footprint_record!(canon_id(d.graph, first(recipe.inputs).id), :whole, nothing)
-        positions = get(d.captures, recipe.id, Dict{Int,Tuple{Int,Int}}())
+        positions = get(d.captures, recipe.id, Dict{Int,Vector{Tuple{Int,Int}}}())
         for (position, value) in enumerate(plate_values)
             position in atomic || continue
             cid = canon_id(d.graph, value.id)
             cid in d.pushed && continue
             if haskey(positions, position)
-                batched, via = positions[position]
-                _footprint_record!(cid, :gathered, _cell_capture_element(slices[batched],
-                    via == 0 ? nothing : slices[via]; rows = partition))
+                for (batched, via) in positions[position]
+                    _footprint_record!(cid, :gathered, _cell_capture_element(slices[batched],
+                        via == 0 ? nothing : slices[via]; rows = partition))
+                end
             else
                 _footprint_record!(cid, :whole, nothing)
             end
@@ -4251,21 +4252,23 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
     # it row by row is computed at those rows (`_CellEmitter`, cell_windows.jl).
     # Every pushed value is computed once, at all the rows the cell's lanes and
     # captures read of it; a capture read at a pushed lane's element waits for
-    # that lane, so it is computed in a second round.
+    # that lane, so it is computed in a second round. A capture read through
+    # several lanes is requested at each lane's rows, in one round.
     if windows !== nothing
         d = windows.pushdowns
-        captures = Tuple{Int,ValueId,Int,Int}[]
-        for (position, (batched, via)) in sort!(collect(get(d.captures, recipe.id,
-                Dict{Int,Tuple{Int,Int}}())))
+        captures = Tuple{Int,ValueId,Vector{Tuple{Int,Int}}}[]
+        for (position, reads) in sort!(collect(get(d.captures, recipe.id,
+                Dict{Int,Vector{Tuple{Int,Int}}}())); by = first)
             value = canon_id(d.graph, plate_values[position].id)
-            value in d.pushed && push!(captures, (position, value, batched, via))
+            value in d.pushed && push!(captures, (position, value, reads))
         end
-        waits(c) = haskey(pushed_lanes, c[3]) || (c[4] != 0 && haskey(pushed_lanes, c[4]))
-        for (position, value, batched, via) in captures
-            waits((position, value, batched, via)) && continue
-            _cell_capture_request!(windows, value, slices[batched],
+        waits(c) = any(((batched, via),) -> haskey(pushed_lanes, batched) ||
+            (via != 0 && haskey(pushed_lanes, via)), c[3])
+        request!(emitter, (_, value, reads)) = foreach(reads) do (batched, via)
+            _cell_capture_request!(emitter, value, slices[batched],
                 via == 0 ? nothing : slices[via]; rows = partition)
         end
+        foreach(c -> waits(c) || request!(windows, c), captures)
         _cell_emit_windows!(windows)
         for (position, lane_row) in lane_rows
             taken = _cell_take!(windows, pushed_lanes[position], lane_row)
@@ -4274,11 +4277,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
         end
         later = _CellEmitter(body, d, windows.names, windows.runtime_ops,
             windows.runtime_recipes)
-        for (position, value, batched, via) in captures
-            waits((position, value, batched, via)) || continue
-            _cell_capture_request!(later, value, slices[batched],
-                via == 0 ? nothing : slices[via]; rows = partition)
-        end
+        foreach(c -> waits(c) && request!(later, c), captures)
         any(waits, captures) && _cell_emit_windows!(later)
         for c in captures
             position, value = c[1], c[2]
@@ -4359,16 +4358,8 @@ function _plate_inferred_input_types(p::Plan; exemplar_types = nothing)
     for recipe in p.recipes
         recipe.id in needed || continue
         inputs = Any[get(types, canon_id(g, v.id), Any) for v in recipe.inputs]
-        T = if recipe.op isa _BoundConstant
-            typeof(recipe.op.value)
-        elseif recipe.op isa Union{_AuthoredPlateOp,_AuthoredScanOp}
-            Any
-        elseif all(t -> t isa Type, inputs)
-            _promote_op(recipe.op, inputs...)
-        else
-            Any
-        end
-        for (v, output_type) in zip(recipe.outputs, _recipe_output_types(recipe, T))
+        for (v, output_type) in zip(recipe.outputs,
+                                    _recipe_inferred_output_types(recipe, inputs))
             declared = valtype(v)
             # The parent lowering enforces concretely declared locals. Keep
             # that fact when inference of an earlier source closure is weaker;
@@ -4384,6 +4375,24 @@ function _plate_inferred_input_types(p::Plan; exemplar_types = nothing)
         end
     end
     types
+end
+
+# The types of a recipe's outputs that inference proves from its input types
+# `inputs` (`Any` where an input type is unknown): bound data's own type, or
+# the type Julia infers its operation returns. A plate's, a plate cell's or a
+# scan's call is not inferred: it is a fallback the lowering does not run
+# (`_checked_recipe_type!`).
+function _recipe_inferred_output_types(recipe::Recipe, inputs)
+    T = if recipe.op isa _BoundConstant
+        typeof(recipe.op.value)
+    elseif recipe.op isa Union{_AuthoredPlateOp,_AuthoredPlateCellOp,_AuthoredScanOp}
+        Any
+    elseif all(t -> t isa Type, inputs)
+        _promote_op(recipe.op, inputs...)
+    else
+        Any
+    end
+    _recipe_output_types(recipe, T)
 end
 
 function _plate_inferred_values(g::Graph, values, scalar_types; rank_types = nothing)

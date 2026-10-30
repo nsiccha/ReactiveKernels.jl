@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.21
+## 0.1.23
 
 - `plate_partition(spec, plates; by, index, name, locality)`: the cells of
   one or more authored plates whose key equals the label held by the HAVE
@@ -46,6 +46,38 @@ are recorded in the git history only.
   the rows' positions (the positions computed first); the previous
   row-by-row read made native Enzyme Reverse refuse a partition's gather of
   a product's rows (`EnzymeRuntimeActivityError`).
+## 0.1.22
+
+- One cell of a plate (`plate_cell`; RKPPL's `prepare_cell_query` and cell
+  samplers) computes at the rows it reads a value it reads at its own position
+  through several batched arguments. The outputs of one `@plate for` loop are
+  one plate each, over a domain of its own, and compose into the cell that
+  reads them, so a value two statements of the loop read at the loop index,
+  `log(c[i]) - log(xi[i])` and `(1 - c[i]) * scale`, is read through two
+  domains. A plate gathered by a reader likewise reads a value through each
+  of its batched arguments (`plate(d1, d2) do i, j; c[i] - c[j] end`).
+  Earlier versions computed such a value whole in every cell, with everything
+  upstream of it.
+- A cell also computes at its rows a dotted value that reads an array at
+  literal positions (`p .* e[1] .+ (1 .- p) .* e[2]`) when that array declares
+  no type but holds numbers: an alias of a typed value (`e = lr`), a dotted
+  value of typed arrays (`e = logistic.(lz) .* exp.(lr)` with
+  `lr::AbstractVector{Float64}`, typed by its elements, which Base computes
+  from its operands' elements), or an authored plate's value (typed from its
+  cell). Earlier versions required the array's own declared type and computed
+  such a value whole in every cell. Values are unchanged.
+
+## 0.1.21
+
+- One cell of a plate (`plate_cell`; RKPPL's `prepare_cell_query` and cell
+  samplers) computes a column view `view(A, :, k)` at the rows it reads, as it
+  computes the column read `A[:, k]`: alone and as an operand of a dotted
+  expression, so a product `A = X * W` and its `hcat` design are computed at
+  those rows too. RKPPL reads every column `P[:, j]` of a per-observation
+  value through such a view, as in the columns of a BRM joint population
+  effect for several responses. Earlier versions computed the view whole in
+  every cell, and with it the product, the design and everything upstream.
+  Values are unchanged.
 
 ## 0.1.20
 
