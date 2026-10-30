@@ -1715,7 +1715,8 @@ end
 # gathered generator sum (the dose-outer passes).
 _scan_step_fold(op) = false
 _scan_step_fold(::typeof(evalpoly)) = true
-_scan_step_fold(op::_KernelSourceOp) = op.f isa _KernelReduction
+Base.@nospecializeinfer _scan_step_fold(@nospecialize(op::_KernelSourceOp)) =
+    getfield(op, :f) isa _KernelReduction
 
 # Step recipe `index` as a one-cell plate: lanes are scan sequences
 # (`lane_of`) or earlier hoisted strip buffers (`hoisted_of`), `Ref` operands
@@ -2445,14 +2446,15 @@ end
 # varies with; the fold's iterator and coefficients must vary with none.
 _plate_reduction_kind(op, recipe, recipe_index, roots, dynamic) = nothing
 # A generator sum: gathered (`get(A, K, D)`, dose-outer) or gather-free.
-function _plate_reduction_kind(op::_KernelSourceOp, recipe, recipe_index, roots,
-                               dynamic)
-    op.f isa _KernelReduction || return nothing
-    II, XI, KI, AI = typeof(op.f).parameters
+Base.@nospecializeinfer function _plate_reduction_kind(
+        @nospecialize(op::_KernelSourceOp), recipe, recipe_index, roots, dynamic)
+    f = getfield(op, :f)
+    f isa _KernelReduction || return nothing
+    II, XI, KI, AI = (typeof(f)::DataType).parameters
     for position in (II..., AI...)
         isempty(dynamic(recipe.inputs[position])) || return nothing
     end
-    (; kind = Val(op.f.index === nothing ? :sum : :gather), recipe_index, recipe,
+    (; kind = Val(getfield(f, :index) === nothing ? :sum : :gather), recipe_index, recipe,
        roots, iterator = II, init = XI, index = KI, source = AI)
 end
 # A cell that is exactly Base's `evalpoly(x, c)` (an authored `evalpoly(x, c)`
@@ -3319,9 +3321,9 @@ function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots;
     if destination !== nothing
         append!(body.args, (Expr(:(=), name, arg) for (name, arg) in zip(names, args)))
         push!(body.args, Expr(:(=), out, destination))
-    elseif recipe.op isa _KernelSourceOp && recipe.op.f isa _KernelBranch
+    elseif recipe.op isa _KernelSourceOp && getfield(recipe.op, :f) isa _KernelBranch
         push!(body.args, Expr(:(=), out,
-            _native_plate_branch_expr(recipe.op.f, :(getfield($operation, :f)), args)))
+            _native_plate_branch_expr(getfield(recipe.op, :f), :(getfield($operation, :f)), args)))
     else
         # Where the cell kernel's own lowering emitted this recipe's source and
         # left its authored closure in the slot (`inline_sources.jl`), the cell
@@ -7538,24 +7540,35 @@ function _unscoped_source_name(name::Symbol, spelled)
     end
     name
 end
-function _source_parameter_names(op::_KernelSourceOp, source, n)
+# One instance for every operation type, reading fields with the `getfield`
+# builtin: a program lowers thousands of distinct operation types through
+# these readers, and the atlas `problem` stage compiled 1150 instances of
+# `_source_parameter_names` and 1045 of `_kernel_endpoint_source_module`.
+Base.@nospecializeinfer function _source_parameter_names(
+        @nospecialize(op::_KernelSourceOp), @nospecialize(source), n)
     # A branch preparation rebuilt names its arguments itself.
-    names = _branch_call_names(op.f)
+    f = getfield(op, :f)
+    names = _branch_call_names(f)
     names === nothing || return length(names) == n ? names : nothing
-    _closure_parameter_names(_source_closure(op.f), n)
+    _closure_parameter_names(_source_closure(f), n)
 end
-_source_closure(f) = f
-_source_closure(f::_KernelSourceFunction) = _source_closure(f.f)
-_source_closure(branch::_KernelBranch) = _source_closure(branch.call)
-_source_closure(split::_KernelSplit) = _source_closure(split.call)
-_source_closure(apply::_KernelSplitApply) = _source_closure(apply.split)
-_source_closure(reduction::_KernelReduction) = _source_closure(reduction.call)
-_source_parameter_names(op::Function, source::Expr, n) =
+Base.@nospecializeinfer _source_closure(@nospecialize(f)) = f
+Base.@nospecializeinfer _source_closure(@nospecialize(f::_KernelSourceFunction)) =
+    _source_closure(getfield(f, :f))
+Base.@nospecializeinfer _source_closure(@nospecialize(branch::_KernelBranch)) =
+    _source_closure(getfield(branch, :call))
+Base.@nospecializeinfer _source_closure(@nospecialize(split::_KernelSplit)) =
+    _source_closure(getfield(split, :call))
+Base.@nospecializeinfer _source_closure(@nospecialize(apply::_KernelSplitApply)) =
+    _source_closure(getfield(apply, :split))
+Base.@nospecializeinfer _source_closure(@nospecialize(reduction::_KernelReduction)) =
+    _source_closure(getfield(reduction, :call))
+Base.@nospecializeinfer _source_parameter_names(@nospecialize(op::Function), source::Expr, n) =
     source.head === :call && length(source.args) == n + 1 &&
         all(arg -> arg isa Symbol, source.args[2:end]) ?
         Symbol[source.args[2:end]...] : nothing
-_source_parameter_names(op, source, n) = nothing
-function _closure_parameter_names(f, n)
+Base.@nospecializeinfer _source_parameter_names(@nospecialize(op), @nospecialize(source), n) = nothing
+Base.@nospecializeinfer function _closure_parameter_names(@nospecialize(f), n)
     f isa Function || return nothing
     candidates = methods(f)
     length(candidates) == 1 || return nothing

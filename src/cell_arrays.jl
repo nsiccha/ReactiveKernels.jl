@@ -140,9 +140,10 @@ function _cell_array_source(r::Recipe, args)
     r.effectful && return nothing
     op = r.op
     op isa _KernelSourceOp || return nothing
-    kernel_sourceop_form(op) === :fused && op.ignored_throws !== nothing || return nothing
-    f = op.f
-    f isa _KernelBranch && (f = f.call)
+    kernel_sourceop_form(op) === :fused && getfield(op, :ignored_throws) !== nothing ||
+        return nothing
+    f = getfield(op, :f)
+    f isa _KernelBranch && (f = getfield(f, :call))
     f = _kernel_native_source(f)
     f isa Function && fieldcount(typeof(f)) == 0 || return nothing
     params = _closure_parameter_names(f, length(args))

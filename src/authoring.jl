@@ -1510,19 +1510,21 @@ end
 # Resolve its source globals in that defining module, even when the branch
 # belongs to a different caller module. The wrapper's module is core RK;
 # its captured body carries the authored scope.
-_kernel_endpoint_source_module(op) = parentmodule(typeof(op))
-_kernel_endpoint_source_module(op::_KernelSourceFunction) =
-    _kernel_endpoint_source_module(op.f)
-_kernel_endpoint_source_module(op::_KernelSourceOp) =
-    _kernel_endpoint_source_module(op.f)
-_kernel_endpoint_source_module(op::_KernelBranch) =
-    _kernel_endpoint_source_module(op.call)
+# One instance for every operation type (`@nospecialize`, `getfield`): see
+# `_source_parameter_names`.
+Base.@nospecializeinfer _kernel_endpoint_source_module(@nospecialize(op)) = parentmodule(typeof(op))
+Base.@nospecializeinfer _kernel_endpoint_source_module(@nospecialize(op::_KernelSourceFunction)) =
+    _kernel_endpoint_source_module(getfield(op, :f))
+Base.@nospecializeinfer _kernel_endpoint_source_module(@nospecialize(op::_KernelSourceOp)) =
+    _kernel_endpoint_source_module(getfield(op, :f))
+Base.@nospecializeinfer _kernel_endpoint_source_module(@nospecialize(op::_KernelBranch)) =
+    _kernel_endpoint_source_module(getfield(op, :call))
 # A rebuilt branch's call is RK's own `_KernelBranchCall`; its authored parts
 # (the condition, like each arm, a closure of the source) name the module.
-_kernel_endpoint_source_module(op::_KernelBranchCall) =
-    _kernel_endpoint_source_module(op.condition)
-_kernel_endpoint_source_module(op::_KernelSplit) =
-    _kernel_endpoint_source_module(op.call)
+Base.@nospecializeinfer _kernel_endpoint_source_module(@nospecialize(op::_KernelBranchCall)) =
+    _kernel_endpoint_source_module(getfield(op, :condition))
+Base.@nospecializeinfer _kernel_endpoint_source_module(@nospecialize(op::_KernelSplit)) =
+    _kernel_endpoint_source_module(getfield(op, :call))
 
 # Render a constructed-endpoint call as source for a branch-arm position.
 # `actuals` are the call-site binding sources in the endpoint HAVE order

@@ -90,8 +90,13 @@ end
 # The type of a recipe's result inferred from concrete input types, or
 # `nothing` when inference proves no result (the call always throws, or no
 # method is visible in this world): such a value is not reported.
-function _inferred_recipe_type(op, input_types)
-    T = _promote_op(op, input_types...)
+# One instance for every operation type: a program's audit types thousands of
+# distinct operation types, and a per-type instance of this query was 8 s of
+# the atlas `problem` stage (2001 instances). `Base._return_type` is the
+# inference `_promote_op` performs, without a generated wrapper per type.
+Base.@nospecializeinfer function _inferred_recipe_type(@nospecialize(op), input_types)
+    any(T -> T === Union{}, input_types) && return nothing
+    T = Base._return_type(op, Core.apply_type(Tuple, input_types...))
     T === Union{} ? nothing : T
 end
 
@@ -137,7 +142,7 @@ end
 # that call is a semantic fallback the lowering does not run, and inferring it
 # for a wide plate (34 operands) took minutes and tens of gigabytes. `nothing`
 # leaves the result unknown.
-_checked_recipe_type!(found, op, input_types, path) =
+Base.@nospecializeinfer _checked_recipe_type!(found, @nospecialize(op), input_types, path) =
     _inferred_recipe_type(op, input_types)
 
 # The element type of a plate's result: the cell's inferred result, or its

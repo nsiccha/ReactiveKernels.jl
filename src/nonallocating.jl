@@ -537,7 +537,7 @@ function _decompose_fused_recipe!(prog::_StepProgram, r::Recipe, callargs,
                                   input_types, lhs)
     op = r.op
     kernel_sourceop_form(op) === :fused || return nothing
-    source_f = _kernel_native_source(op.f)
+    source_f = _kernel_native_source(getfield(op, :f))
     fieldcount(typeof(source_f)) == 0 || return nothing # capturing closure
     # The source reads its inputs by the closure's parameter names, not by the
     # input values' names (`_lane_source_params`).
