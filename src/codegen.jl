@@ -4396,7 +4396,8 @@ function _lower_with_ops_collecting(p::Plan;
                          recycle::Vector{Pair{ValueId,Symbol}} = Pair{ValueId,Symbol}[],
                          pushdowns::Bool = isempty(recycle),
                          plate_element_types::Bool = false,
-                         type_hints = nothing, exemplar_types = nothing)
+                         type_hints = nothing, exemplar_types = nothing,
+                         inline_sources::Bool = inline_embedded && _inline_sources_enabled())
     g = p.graph
     names = _varnames(p)
     nm(v) = names[canon_id(g, v.id)]
@@ -4725,6 +4726,15 @@ function _lower_with_ops_collecting(p::Plan;
                 recycled(canon_id(g, only(r.outputs).id)) : nothing
             destination === nothing ||
                 (destination = _lane_source_expr(r, callargs, destination))
+            if destination === nothing && inline_sources
+                # Prototype (todo `0pro4di`): the recipe's source in the body,
+                # its captures as data in the slot (`inline_sources.jl`).
+                inlined = _inline_source_form(r, callargs, length(runtime_ops))
+                if inlined !== nothing
+                    runtime_ops[end] = _InlinedSource(inlined[2])
+                    destination = inlined[1]
+                end
+            end
             call = destination === nothing ?
                 Expr(:call, Expr(:ref, _OPS_ARG, length(runtime_ops)), callargs...) :
                 destination
@@ -7066,6 +7076,14 @@ end
 # feed the checked program as bound data of their runtime types.
 function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing,
                        exemplars = nothing)
+    on_error === nothing || return task_local_storage(_INLINE_SOURCES_OFF, true) do
+        _prepare_plan_body(p; passes, bound, on_error, exemplars)
+    end
+    _prepare_plan_body(p; passes, bound, on_error, exemplars)
+end
+
+function _prepare_plan_body(p::Plan; passes = (), bound = (), on_error = nothing,
+                            exemplars = nothing)
     p = _kernel_error_policy(p, on_error)
     # Compose cell-only producers before the top-level bound split. Other
     # eligible chains compose after that split but before guarded cells are
