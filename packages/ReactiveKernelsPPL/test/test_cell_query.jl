@@ -893,3 +893,77 @@ _cq_joint_columns_data(n) = (; x = collect(range(0.5, 1.5; length = n)),
         @test all(c -> c.central, m.cells)
     end
 end
+
+# Values whose producers compute them row by row but that the cell computed
+# whole (snag `form-value-compu-c1e0965c`, the shapes of a BRM NLME program):
+# `c`, read at the loop index by two statements of one `@plate for` loop (each
+# output a plate over a domain of its own, so the cell reads `c` through two
+# domains); dotted sums of gathers that read a computed vector `e` and an
+# alias `f` of a drawn vector at literal positions (`e[1]`, `f[2]`); and a
+# mixture `mix` with literal reads of a computed vector, read through a gather.
+ReactiveKernels.@kernel _cq_form_law(value, a1, a2, a3) = begin
+    density = -0.5 * (value - a1 - a2 - a3)^2
+    return density
+end
+
+const _CQ_FORM_VALUES = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
+    lz ~ Normal(0, 1)
+    sigma ~ Exponential(1)
+    lr[1:3] .~ Normal.(0, 1)
+    z[levels(g)] .~ Normal.(0, 1)
+    c = logistic.(a .+ z[g])
+    xi = exp.(b .+ z[g])
+    lp = b .+ x
+    @plate for i in eachindex(y1)
+        arg1[i] = x[i]
+        arg2[i] = log(c[i]) - log(xi[i])
+        arg3[i] = (1 - c[i]) * sum(exp.(lp[rows[i]]))
+    end
+    y1 .~ LogDensity.(_cq_form_law, arg1, arg2, arg3)
+    e = logistic.(lz) .* exp.(lr)
+    f = lr
+    w = c[rep] .* e[1] .+ c[rep2] .* f[2]
+    y2 .~ Normal.(w, sigma)
+    cover = b .+ lr
+    mix = c .* exp.(cover[1]) .+ (1 .- c) .* exp.(cover[2])
+    y3 .~ Normal.(mix[k], sigma)
+end
+
+_cq_form_data(n) = (; y1 = sin.(1:n), y2 = cos.(1:n), y3 = sin.(2 .* (1:n)),
+    x = collect(range(-1, 1; length = n)), g = ["g$(mod1(3j, max(2, n ÷ 10)))" for j in 1:n],
+    rows = [[mod1(j, n), mod1(j + 3, n)] for j in 1:n], rep = [mod1(j + 1, n) for j in 1:n],
+    rep2 = [mod1(j + 5, n) for j in 1:n], k = [mod1(7j, n) for j in 1:n])
+
+@testset "cell query: values read by two loop statements, and literal reads of computed vectors" begin
+    backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    for obs in (:y1, :y2, :y3)
+        measured = map((40, 4_000)) do n
+            data = _cq_form_data(n)
+            bound, built = _cq_bound(_CQ_FORM_VALUES, data, (:y1, :y2, :y3))
+            q = prepare_cell_query(built, bound, obs)
+            u = collect(range(-0.4, 0.5; length = built.layout.total))
+            pointwise = getproperty(
+                Base.invokelatest(prepare_query(built, bound, :pointwise), u), obs)
+            values = [q(u, i) for i in (1, 2, n)]
+            q(u, 2)
+            dense = prepare_cell_sampler(built, bound, obs, u; backend)
+            dense_value, dense_gradient = cell_value_and_gradient!(dense, similar(u), u, 2)
+            support = findall(!iszero, dense_gradient)
+            compact = prepare_compact_cell_sampler(built, bound, obs, u, support; backend)
+            compact_gradient = similar(u[support])
+            compact_value, _ = cell_value_and_gradient!(
+                compact, compact_gradient, u, u[support], support, 2)
+            (; values, reference = [sum(x; init = 0.0) for x in pointwise[[1, 2, n]]],
+               bytes = (@allocated q(u, 2)), dense_value, compact_value,
+               parity = compact_gradient ≈ dense_gradient[support],
+               central = all(j -> isapprox(dense_gradient[j],
+                   _cq_central(v -> q(v, 2), u, j); rtol = 1e-5), support))
+        end
+        @test all(m -> m.values ≈ m.reference, measured)
+        @test measured[1].bytes == measured[2].bytes
+        @test all(m -> m.values[2] ≈ m.dense_value ≈ m.compact_value, measured)
+        @test all(m -> m.parity && m.central, measured)
+    end
+end
