@@ -61,6 +61,52 @@ end
     return (a, b)
 end
 
+# Outputs that read different cell statements (snag `sibling-only-pla-2b3df69e`):
+# each output is the call form written for it alone, so it captures, zips and
+# checks only what its own statements read.
+@kernel _loop_siblings(a, b, ra, rb, s) = begin
+    @plate for i in eachindex(ra, rb)
+        x = sum(a[ra[i]])
+        y = sum(b[rb[i]])
+        out_x[i] = x * s
+        out_y[i] = y * s
+        out_xy[i] = x + y
+    end
+    return (out_x, out_y, out_xy)
+end
+@kernel _call_siblings(a, b, ra, rb, s) = begin
+    out_x = plate(eachindex(ra, rb), ra) do i, ra_i
+        x = sum(a[ra_i])
+        out_x_i = x * s
+        out_x_i
+    end
+    out_y = plate(eachindex(ra, rb), rb) do i, rb_i
+        y = sum(b[rb_i])
+        out_y_i = y * s
+        out_y_i
+    end
+    out_xy = plate(eachindex(ra, rb), ra, rb) do i, ra_i, rb_i
+        x = sum(a[ra_i])
+        y = sum(b[rb_i])
+        out_xy_i = x + y
+        out_xy_i
+    end
+    return (out_x, out_y, out_xy)
+end
+
+# A nested loop that only one output reads.
+@kernel _loop_nested_siblings(groups, w) = begin
+    @plate for g in eachindex(groups)
+        obs = groups[g]
+        @plate for j in eachindex(obs)
+            s[j] = obs[j] * w[g]
+        end
+        tot[g] = sum(s; init = 0.0)
+        len[g] = length(obs)
+    end
+    return (tot, len)
+end
+
 # A nested loop over each group's observations, including an empty group.
 @kernel _loop_nested(groups, w) = begin
     @plate for g in eachindex(groups)
@@ -160,6 +206,22 @@ end
     @test prepare(_loop_outputs)(x, idx, [2.0]) == ([61.0, 22.0], [62.0, 23.0])
     @test prepare(_loop_nested)([[1.0, 2.0], Float64[], [3.0]], [1.0, 2.0, 3.0]) ==
           [3.0, 0.0, 9.0]
+
+    a, b, ra, rb = [1.0, 2.0, 4.0], [10.0, 20.0], [[1, 2], [3]], [[2], [1, 2]]
+    @test prepare(_loop_siblings)(a, b, ra, rb, 0.5) ==
+          ([1.5, 2.0], [10.0, 15.0], [23.0, 34.0])
+    @test _loop_program(prepare(_loop_siblings)) ==
+          _loop_program(prepare(_call_siblings))
+    # A query of one output needs none of its siblings' inputs.
+    @test prepare(_loop_siblings; have = (:a, :ra, :rb, :s), want = :out_x)(
+              a, ra, rb, 0.5) == [1.5, 2.0]
+    @test prepare(_loop_siblings; have = (:b, :ra, :rb, :s), want = :out_y)(
+              b, ra, rb, 0.5) == [10.0, 15.0]
+    groups = [[1.0, 2.0], Float64[], [3.0]]
+    @test prepare(_loop_nested_siblings)(groups, [1.0, 2.0, 3.0]) ==
+          ([3.0, 0.0, 9.0], [2, 0, 1])
+    @test prepare(_loop_nested_siblings; have = (:groups,), want = :len)(groups) ==
+          [2, 0, 1]
 
     @test prepare(_loop_range)([1.0, 2.0], [0.5, 1.0], 2) == [0.5, 1.0]
     # Rejected data: an array read at the loop index has the loop's indices; a

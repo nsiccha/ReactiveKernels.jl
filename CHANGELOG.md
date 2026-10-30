@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.25
+
+- A cell (`plate_cell`, `plate_partition`) of one value of a shared cell no
+  longer computes what only the other values read. Values that share cell
+  work come from one plate returning a tuple, read as `t[k]` (the cell RKPPL
+  emits for an `@plate for` loop computing several observations' arguments);
+  a query reading some entries already sliced the shared cell to them, but
+  every value the cell captured was still computed, whole, with everything
+  upstream of it. A drafted plate now takes only the shared operands its
+  planned cell reads, and work nothing else reads leaves the plan. Before,
+  `partition_locality` listed such a value as `:shared` (`:never_at_rows`),
+  so `locality = :error` did not name it (snag `sibling-only-pla-2b3df69e`).
+- `@plate for` with several outputs gives each output a plate over the loop
+  statements it reads, exactly the call form written for that output alone:
+  it captures, zips and checks only what those statements read. Before, each
+  output's plate took every value the whole loop read, so a HAVE/WANT query
+  of one output needed its sibling outputs' inputs, and a cell of one output
+  computed the values only its siblings read.
+
 ## 0.1.24
 
 - `plate_partition(spec, plates; by, index, name, locality)`: the cells of
