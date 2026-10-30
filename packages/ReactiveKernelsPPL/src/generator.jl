@@ -50,7 +50,7 @@ function _build_kernel_latest(plan::StructuralPlan)
     layout = assign_layout(plan)
     def = kernel_expr(plan, layout)
     spec = _eval_kernel_def(def)
-    return (; spec, layout, program = _program_identity(def))
+    return (; spec, layout, program = _program_identity(def, plan))
 end
 
 """
@@ -146,6 +146,30 @@ end
 # data are data and keep their spelling. Stable named modules remain part of
 # the identity. Compare the results with `_same_program`: Julia's Expr
 # equality need not compare embedded array literals by value.
+#
+# With the binding, each level axis's labels call (`_ppl_levels(h)`,
+# `_ppl_unique(h)`, `_ppl_values(h)`; `_axis_labels_expr`) is replaced by its
+# value over the binding's column as quoted data: the labels are the
+# program's, as the layout and the level codes are sized by them, while the
+# compiled code holds none of them (a binding with other labels is refused
+# by `prepare_query`, `rkppl-use` §14).
+function _program_identity(def, plan::StructuralPlan)
+    labels(x) = x
+    labels(x::Expr) = _is_level_labels_call(x) ?
+        QuoteNode(_level_axis_labels(plan, x.args[1], x.args[2])) :
+        Expr(x.head, Any[labels(a) for a in x.args]...)
+    return _program_identity(labels(def))
+end
+
+_is_level_labels_call(x::Expr) = x.head === :call && length(x.args) == 2 &&
+    x.args[1] in _LEVEL_LABEL_FUNCTIONS && x.args[2] isa Symbol
+
+# The value `_ppl_levels(h)` / `_ppl_unique(h)` / `_ppl_values(h)` takes on the
+# binding: the same function over the bound column (each returns a fresh
+# vector, so the identity aliases no binder-owned metadata).
+_level_axis_labels(plan::StructuralPlan, fn::Symbol, h::Symbol) =
+    getfield(@__MODULE__, fn)(_vector_column(plan.columns, h, :plan, "level axis column"))
+
 function _program_identity(def)
     names = Dict{Symbol,Symbol}()
     modules = IdDict{Module,Symbol}()
@@ -657,9 +681,10 @@ _ppl_normcdf(x) = 0.5 * erfc(-x / sqrt(2))
 # transforms); imported from the enclosing module so the emitted
 # `positive_bijector()` / `unit_bijector()` calls resolve.
 import ..positive_bijector, ..unit_bijector
-# In-model grouping encoder (`_ppl_gidx_<group>` nodes call it with the
-# raw column + literal declared levels).
-import .._declared_codes
+# In-model grouping encoder (`_ppl_lvx_<…>` nodes call it with the raw
+# column and the axis's labels) and the label values of a level axis
+# (`preprocessing.jl`).
+import .._declared_codes, .._ppl_levels, .._ppl_unique, .._ppl_values
 # Stopping-ratio stage-lane tables (data-only recipes over the bound
 # response; `preprocessing.jl`).
 import .._ordinal_stage_obs, .._ordinal_stage_idx, .._ordinal_effects_matrix

@@ -1670,20 +1670,21 @@ function _array_gather_rewrite(ex, plan::StructuralPlan,
         name, g, ld = ex.args[2:end]
         axs = _gather_axes(plan, name)
         d = axs[ld]
-        lv = _array_axis_levels(plan, name, :plan, d)
-        lv = _apply_subset(lv, LevelMap(name, d.args[2], [], :levels,
-            _levels_subset(d)))
-        # These codes depend only on bound labels, not the number of cells
-        # in the graph. Omitted selected levels use the usual zero row.
-        codes = _declared_codes(_array_axis_levels(plan, name, :plan, g), lv)
+        # The codes of the cell axis's levels on the array's axis: a
+        # data-only value over the two label vectors, which depends on the
+        # bound labels alone, not on the number of cells in the graph (and
+        # is no literal, however many levels). Omitted selected levels use
+        # the usual zero row.
+        codes = Expr(:call, :_declared_codes, _axis_labels_expr(:levels, g, Colon()),
+            _axis_labels_expr(d))
         source = name
         if _levels_subset(d) !== Colon()
             source = length(axs) == 1 ? :(vcat(0.0, $name)) :
                 ld == 1 ? :(vcat(zeros(1, size($name, 2)), $name)) :
                 :(cat(zeros(size($name, 1), size($name, 2), 1), $name; dims = 3))
-            codes = codes .+ 1
+            codes = Expr(:call, :.+, codes, 1)
         end
-        ix = Expr(:vect, codes...)
+        ix = codes
         length(axs) == 1 && return Expr(:ref, source, ix)
         if ld == 1
             aligned = Expr(:ref, source, ix, :(:))
@@ -1695,11 +1696,11 @@ function _array_gather_rewrite(ex, plan::StructuralPlan,
     if ex.head === :call && !isempty(ex.args) &&
             ex.args[1] in (:_ppl_level_indices, :_ppl_level_values)
         g = ex.args[2]
-        lv = _array_axis_levels(plan, g, :plan, g)
         if ex.args[1] === :_ppl_level_indices
+            lv = _array_axis_levels(plan, g, :plan, g)
             return :(collect(1:$(length(lv))))
         elseif ex.args[1] === :_ppl_level_values
-            return Expr(:vect, map(_level_literal, lv)...)
+            return _axis_labels_expr(:levels, g, Colon())
         end
     end
     if ex.head === :call && length(ex.args) == 3 && ex.args[1] === :_ppl_codes
@@ -1738,20 +1739,16 @@ function _array_gather_rewrite(ex, plan::StructuralPlan,
 end
 
 # The level-code vectors a plan's gathers read (data-only: `bound=` folds
-# them), keyed by an array value or a plate cell's levels column.
+# them), keyed by an array value or a plate cell's levels column. The axis's
+# labels are a data-only value too (`_axis_labels_expr`), never a literal.
 function _array_level_index_statements(plan::StructuralPlan,
         needed::Set{Tuple{Symbol,Symbol,Int}})
     stmts = Expr[]
     for (g, name, axis) in sort!(collect(needed))
         axes = _gather_axes(plan, name)
         d = axis == 0 ? Expr(:call, :levels, name) : axes[axis]
-        h = d.args[2]
-        lv = _array_axis_levels(plan, name, :plan, d)
-        lv = _apply_subset(lv, LevelMap(name, h, [], :levels,
-            _levels_subset(d)))
-        lvlvec = Expr(:vect, (_level_literal(l) for l in lv)...)
         push!(stmts, :($(_array_level_index_name(g, name, axis)) =
-            _declared_codes($g, $lvlvec)))
+            _declared_codes($g, $(_axis_labels_expr(d)))))
     end
     return stmts
 end

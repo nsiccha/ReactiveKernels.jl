@@ -109,6 +109,38 @@ ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
     ReactiveKernels._jax_is_array(args[1].T) ?
     ReactiveKernels._jax_index_values(ctx, args[1], args[2:end]) : args[1]
 
+# The labels of a level axis (`_ppl_levels`, `_ppl_unique`, `_ppl_values`;
+# `preprocessing.jl`), as host NumPy over a plain column: a `jax_source`
+# module's `prepare_data` computes them from the column it is given, and a
+# categorical pool's own order does not reach a JAX module. `_rk_levels` is
+# `DataAPI.levels` of a plain vector: the distinct values in sorted order,
+# missing (`None`) left out.
+const _JAX_LEVELS = """
+def _rk_levels(x):
+    arr = np.asarray(x)
+    values = sorted(set(v for v in arr.tolist() if v is not None))
+    return np.array(values, dtype=object if arr.dtype == object else arr.dtype)
+"""
+const _JAX_UNIQUE = """
+def _rk_unique(x):
+    arr = np.asarray(x)
+    return np.array(list(dict.fromkeys(arr.tolist())),
+                    dtype=object if arr.dtype == object else arr.dtype)
+"""
+for (f, helper, code) in ((_ppl_levels, "_rk_levels", _JAX_LEVELS),
+                          (_ppl_unique, "_rk_unique", _JAX_UNIQUE))
+    @eval function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+            ::typeof($f), args::Vector{ReactiveKernels._PyVal})
+        name = ReactiveKernels._jax_helper!(ctx, $helper, $code)
+        ReactiveKernels._PyVal(name * "(" * ReactiveKernels._jax_args(args) * ")",
+                               only(args).T, only(args).static)
+    end
+end
+ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_values), args::Vector{ReactiveKernels._PyVal}) =
+    ReactiveKernels._PyVal("np.array(" * only(args).code * ")", only(args).T,
+                           only(args).static)
+
 # The broadcast row count of bound columns: their first-axis lengths are
 # shapes, known while JAX traces, and compatible (one, or a common length).
 function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
