@@ -281,6 +281,13 @@ function _inline_qualify(ex, mod::Module, renamed::Dict{Symbol,Symbol})
         haskey(renamed, ex) && return renamed[ex]
         ex in (:end, :begin) && return ex
         _global_value(mod, ex) === nothing && return nothing
+        # A source reading a binding the module can reassign keeps its call:
+        # its generated source function was compiled when the kernel was
+        # defined and names the value the binding held then (`compile`,
+        # `_canonical_globals`), where the body compiles at preparation and
+        # would read the binding as it is by then (`test_authoring.jl`,
+        # "lowered exact calls retain composition identity").
+        _global_isconst(mod, ex) || return nothing
         return GlobalRef(mod, ex)
     end
     ex isa Expr || return ex
