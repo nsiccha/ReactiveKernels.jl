@@ -4,8 +4,8 @@
 #
 # The DynamicPPL posteriordb benchmark reports Turing/Stan ratios against the
 # NAIVE posteriordb reference Stan. This runs the same model families with EVERY
-# side optimized and adds ReactiveKernels: RK @kernel (one authored graph that
-# lowers to native + Reactant; pure-function poisson/binomial densities) vs Stan
+# side optimized and adds ReactiveKernels: RK @kernel (one authored graph;
+# pure-function poisson/binomial densities) vs Stan
 # (naive loop / vectorized / fused-GLM where it exists) vs the posteriordb-style
 # optimized Turing translation. Native primal + gradient at the fair boundary;
 # parity gated against an independent finite-difference oracle.

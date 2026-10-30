@@ -8,22 +8,15 @@
 # diagnostic evidence only — they are NOT rerun for this delivery, are not
 # accepted support, and no HMM delivery may require them or any priming through
 # this mode. The native plain-Reverse failure remains an unresolved RK defect
-# under snag scan-prior-enzym-d67d4ac1. The script is retained as the exact
-# provenance of the already-recorded evidence. It records THREE SEPARATE
-# facts: (a) the ordinary vs Const-annotated native gradient
-# configuration comparison; (b) the runtime-activity gradient against Stan
-# (proof the translation's gradient math is correct); and (c) a same-process
-# compile observation (the compiled gradient compiled and matched Stan when
-# exercised after the runtime-activity native axis in one process). Fact (c)
-# is an UNISOLATED success: no first-trace failure, cache, or order-dependence
-# is claimed here — the independently reached compiled outcome is measured by
-# structured_gate.jl's isolated Reactant phase. See snag
-# scan-prior-enzym-d67d4ac1.
+# under snag scan-prior-enzym-d67d4ac1. It records TWO SEPARATE facts: (a) the
+# ordinary vs Const-annotated native gradient configuration comparison; and
+# (b) the runtime-activity gradient against Stan (proof the translation's
+# gradient math is correct). See snag scan-prior-enzym-d67d4ac1.
 #
 # Run: julia --project=benchmark/all80-env benchmark/structured_gate_diagnostics.jl
 
 using Random, LinearAlgebra
-import BridgeStan, PosteriorDB, Enzyme, Reactant
+import BridgeStan, PosteriorDB, Enzyme
 using ReactiveKernels, ReactiveKernelsDistributionKernels
 using ReactiveKernelsPPLExamples
 using DifferentiationInterface
@@ -74,16 +67,5 @@ for (name, build, have, bind) in (
     rg = relerr(g, sgrad(sm, q))
     @assert all(isfinite, g) && rg < 1e-3 "$name: runtime-activity gradient rel=$rg"
     println("  runtime-activity grad vs Stan rel=$(round(rg; sigdigits=4)) PASS (math diagnostic)"); flush(stdout)
-
-    # Same-process compile observation (UNISOLATED success; no dependence
-    # claimed): the compiled gradient is exercised AFTER the runtime-activity
-    # native axis has run in this same process.
-    prep = prepare_ad(kb, AE_ORD, q; active = :unconstrained)
-    rq = Reactant.to_rarray(q); gb = Reactant.to_rarray(similar(q))
-    gc = Reactant.compile(ReactiveKernels.ad_value_and_gradient!, (prep, gb, rq); sync = true)
-    _, rgrad = gc(prep, gb, rq)
-    gh = Array{Float64}(rgrad)
-    rr = relerr(gh, sgrad(sm, q))
-    println("  same-process Reactant grad vs Stan rel=$(round(rr; sigdigits=4)) (UNISOLATED observation; not acceptance)"); flush(stdout)
 end
 println("\ndiagnostics done"); flush(stdout)

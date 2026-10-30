@@ -79,25 +79,3 @@ slot_chain(borrowed,0,1)
 read_slot(borrowed.contexts[1],:value)==[2.0,4.0] || error("hidden cache transfer changed a borrowed array")
 !current(borrowed.contexts[3],:y) || error("borrowed destination cache was overwritten")
 println("native_partial_cache_validity=true uncopied_input_invalidates=true borrowed_cache_preserved=true")
-
-using Reactant
-const TSC=Base.get_extension(RK,:ReactiveKernelsReactantExt).TracedSlotCompiler
-function check_traced(program,index)
-    f,metadata=program.f,program.metadata
-    driver=(state,invalid,counts)->f(deepcopy(state),invalid,counts,metadata)
-    state=Reactant.to_rarray(deepcopy(program.state);track_numbers=true)
-    invalid=Reactant.to_rarray(false;track_numbers=true)
-    counts=Reactant.to_rarray((0,0);track_numbers=true)
-    compiled=Reactant.compile(driver,(state,invalid,counts);sync=true,donated_args=:none)
-    for flag in (false,true)
-        output=compiled(state,Reactant.to_rarray(flag;track_numbers=true),counts)
-        Float64(output.state.values[index])==(flag ? 110.0 : 46.0) || error("traced partial-copy result")
-        Float64(state.values[index])==0.0 || error("traced caller changed")
-    end
-    println("traced_partial_cache_result=true caller_preserved=true")
-end
-native=prepare(make_parent(),:check!)
-traced=TSC.compile_traced_slots(native)
-key=(Symbol(native.contexts[1].prefix,:_owned),slot_index(native.contexts[1],:value))
-index=only(findall(pair->first(pair)==key,traced.ordered))
-Base.invokelatest(check_traced,traced,index)

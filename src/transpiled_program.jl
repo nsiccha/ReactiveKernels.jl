@@ -109,8 +109,7 @@ _copy_construction(value, seen) = Base.deepcopy_internal(value, seen)
 
 """
     prepare_transpiled(source, args...; method, argument, outputs,
-        iterations=1, backend=:native, kernel_kwargs=(;),
-        compiler_options=(;), backend_options=(;))
+        iterations=1, kernel_kwargs=(;), compiler_options=(;))
 
 Compile a captured `@kernel` method for fixed types, shapes, call graph and
 compiler-known mutation. `argument` provides the runtime argument's type/shape;
@@ -123,18 +122,14 @@ Call `prepared(state, argument)` to execute `iterations` method calls and return
 or reuse an earlier state. Inputs are preserved and named outputs are independent
 snapshots. State belongs to one preparation; its storage is private.
 
-The optional `:reactant` backend requires loading Reactant and using
-`Reactant.ReactantRNG` for random operations. It returns device values, compiles
-the whole batch and synchronizes by default. Native Julia accepts its ordinary
-RNGs. Runtime arguments currently support numeric scalars, arrays and RNGs.
+Runtime arguments currently support numeric scalars, arrays and RNGs.
 Reprepare when types, shapes, construction controls or fixed authorities change.
 The interface is experimental; unsupported source forms reject at preparation.
 """
 function prepare_transpiled(source, args...; method::Symbol, argument,
-        outputs::NamedTuple, iterations::Integer=1, backend::Symbol=:native,
+        outputs::NamedTuple, iterations::Integer=1,
         kernel_kwargs::NamedTuple=NamedTuple(),
-        compiler_options::NamedTuple=NamedTuple(),
-        backend_options::NamedTuple=NamedTuple())
+        compiler_options::NamedTuple=NamedTuple())
     0 <= iterations <= typemax(Int) ||
         throw(ArgumentError("iterations must be a nonnegative machine integer"))
     _runtime_contract(argument, argument)
@@ -142,25 +137,15 @@ function prepare_transpiled(source, args...; method::Symbol, argument,
     # NativePoint's copy isolates its owned fields and retains fixed authorities.
     owned_args, owned_kwargs = _copy_construction((args, kernel_kwargs), IdDict())
     parent = fast_native_factory(source, owned_args...; owned_kwargs...)
-    options = merge((; count_steps=false, peel_loops=backend === :reactant), compiler_options)
+    options = merge((; count_steps=false, peel_loops=false), compiler_options)
     program = compile_native_slots(parent.kernel, parent.state, method;
         endpoints=parent.endpoints, effects=parent.effects, options...)
     locations = _output_locations(program, parent.endpoints, outputs)
     projection = _projection_expression(program, locations, keys(outputs))
     initial = deepcopy(map(first, program.stores))
-    prepared = NativeTranspiledProgram(program, RK.compile(projection),
+    NativeTranspiledProgram(program, RK.compile(projection),
         deepcopy(argument), outputs, Ref(nothing), initial, Int(iterations))
-    _prepare_transpiled_backend(Val(backend), prepared, projection, backend_options)
 end
-
-function _prepare_transpiled_backend(::Val{:native}, prepared, projection, options)
-    isempty(options) || throw(ArgumentError("native backend accepts no backend_options"))
-    prepared
-end
-_prepare_transpiled_backend(::Val{:reactant}, prepared, projection, options) =
-    throw(ArgumentError("load Reactant before preparing the Reactant backend"))
-_prepare_transpiled_backend(::Val{B}, prepared, projection, options) where {B} =
-    throw(ArgumentError("unknown transpiler backend $B"))
 
 """
     initial_transpiled_state(prepared)

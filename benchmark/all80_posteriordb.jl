@@ -24,7 +24,6 @@ using Random: RandomDevice
 
 const _INNER = "RK_ALL80_INNER"
 const _BODY = joinpath(@__DIR__, "all80_posteriordb_body.jl")
-const _REACTANT_BODY = joinpath(@__DIR__, "all80_reactant_body.jl")
 const DPPL_SHA = "6378673b0029518c8a698096eb4f8ab662333083"
 const UPSTREAM_DIGESTS = Dict(
     "posteriordb_models.jl" => "a7ef985b93df973dd0598f0c772f3f002afa25be80829fc38a9e8cb7232413ad",
@@ -44,9 +43,8 @@ function _ensure_env()
             "DifferentiationInterface","LogExpFunctions","SpecialFunctions","PosteriorDB",
             "OrdinaryDiffEqBDF","OrdinaryDiffEqLowOrderRK","OrdinaryDiffEqTsit5",
             "SciMLBase","SciMLSensitivity",
-            # coexistence superset for the RK+Reactant single-eval + HMC transpiler
-            # (Reactant) and the AHMC-Turing HMC throughput axis (AdvancedHMC).
-            "Reactant","AdvancedHMC")])
+            # the AHMC-Turing HMC throughput axis
+            "AdvancedHMC")])
         Pkg.develop([
             Pkg.PackageSpec(path = root),
             Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsDistributionKernels")),
@@ -73,33 +71,24 @@ end
 
 const RECEIPT_DIR = joinpath(@__DIR__, "receipts")
 
-# One isolated Julia subprocess per PHASE over the SAME pinned coexistence env. Native and
-# Reactant timings must never share a process (loading Reactant perturbs native compiler
-# state), so each phase re-execs this body with RK_ALL80_PHASE set and writes its own phase
-# receipt; the reactant phase additionally pins JULIA_NUM_PRECOMPILE_TASKS=1 (the primer's
-# ReactiveKernelsReactantExt precompile-wedge mitigation).
+# The measurement runs in an isolated Julia subprocess over the pinned env: it re-execs the
+# body with RK_ALL80_PHASE set and writes its own phase receipt, which the parent aggregates.
+# Historical receipts also carry a "reactant" phase, measured with ReactiveKernels' removed
+# Reactant path.
 function _phase_cmd(phase, up, receipt)
-    body = phase == "reactant" ? _REACTANT_BODY : _BODY
-    cmd = addenv(
-        `$(Base.julia_cmd()) --startup-file=no --project=$ENV_DIR $(body) $ARGS`,
+    addenv(
+        `$(Base.julia_cmd()) --startup-file=no --project=$ENV_DIR $(_BODY) $ARGS`,
         _INNER => "1", "RK_ALL80_UPSTREAM" => up, "RK_ALL80_DPPL_SHA" => DPPL_SHA,
         "RK_ALL80_PHASE" => phase, "RK_ALL80_RECEIPT" => receipt,
         "RK_ALL80_BATCH" => get(ENV, "RK_ALL80_BATCH", ""),
         "RK_ALL80_RUN_ID" => get(ENV, "RK_ALL80_RUN_ID", ""),
         "RK_ALL80_SOURCE_LOCK" => get(ENV, "RK_ALL80_SOURCE_LOCK", ""),
     )
-    phase == "reactant" ? addenv(cmd, "JULIA_NUM_PRECOMPILE_TASKS" => "1") : cmd
 end
 
-function _phase_harness_files(phase)
-    common = ("all80_posteriordb.jl", "all80_registry.jl", "all80_receipt.jl",
-              "all80_axes.jl")
-    phase == "native" ? (common..., "all80_posteriordb_body.jl",
-        "all80_metadata.jl", "all80_parity.jl",
-        All80Receipt._HMC_HARNESS_FILES...) :
-        (common..., "all80_reactant_body.jl", "all80_reactant_evals.jl",
-         All80Receipt._HMC_HARNESS_FILES...)
-end
+_phase_harness_files(phase) = ("all80_posteriordb.jl", "all80_registry.jl",
+    "all80_receipt.jl", "all80_axes.jl", "all80_posteriordb_body.jl",
+    "all80_metadata.jl", "all80_parity.jl", All80Receipt._HMC_HARNESS_FILES...)
 
 function _write_phase_source_lock(phase, up, requested_keys, run_id)
     upstream_files = Dict(
@@ -144,7 +133,7 @@ function _run()
         error("RK_ALL80 duplicate model key(s) requested: $(join(duplicated, ", "))")
     isempty(batch) || get(ENV, "RK_ALL80_RESUME", "") != "1" ||
         error("RK_ALL80_BATCH resume is disabled: no durable same-run lock handle exists. Preserve the old phase receipt and start a fresh exact-key run")
-    phases = String.(split(get(ENV, "RK_ALL80_PHASES", "native,reactant"), ','))
+    phases = ["native"]
     phase_receipts = String[]
     locks = String[]
     run_id = bytes2hex(rand(RandomDevice(), UInt8, 16))
@@ -169,7 +158,7 @@ function _run()
         expected_keys = isempty(batch) ? String[] : non_flag,
         batch = batch)
     @info "RK_ALL80: aggregated final receipt -> $out"
-    complete = isempty(batch) && isempty(non_flag) && Set(phases) == Set(["native", "reactant"])
+    complete = isempty(batch) && isempty(non_flag)
     issues = if isempty(batch)
         # A complete default run also gates the ROW COUNT (all 82 present), not just cell fill.
         Base.invokelatest(All80Receipt.validate, staged;
@@ -184,7 +173,7 @@ function _run()
             foreach(i -> println("  ", i), first(issues, 30))
             exit(1)
         else
-            @warn "RK_ALL80: PARTIAL run — $(length(issues)) mandatory cell(s) unpopulated (expected for a key-subset or single-phase run)"
+            @warn "RK_ALL80: PARTIAL run — $(length(issues)) mandatory cell(s) unpopulated (expected for a key-subset run)"
             foreach(i -> println("  ", i), first(issues, 20))
         end
     end

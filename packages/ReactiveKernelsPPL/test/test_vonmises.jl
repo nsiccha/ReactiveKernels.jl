@@ -1,8 +1,7 @@
 # Von-Mises response (SB `brm_von_mises_lpdf` mirror): surface
 # admission, value parity vs Distributions.jl oracles (exact +
 # circular; literal / Gamma-sampled / per-observation / predictor-fed
-# kappa), Enzyme-vs-findiff gradients, Reactant/XLA value+grad (in
-# test_vonmises_reactant.jl), O(1) emission, and VM1/VM2/VM3 SB parity vs the peer lane's BridgeStan
+# kappa), Enzyme-vs-findiff gradients, O(1) emission, and VM1/VM2/VM3 SB parity vs the peer lane's BridgeStan
 # numbers (brief 2026-09-26T16-05-40-553-6m5ln2 on
 # BayesianRegressionModels:rk:parity-fam-vonmises). (`_findiff_grad` /
 # `_GEN_BACKEND` come from test_generator.jl, included first.)

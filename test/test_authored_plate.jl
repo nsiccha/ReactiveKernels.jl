@@ -91,7 +91,7 @@ end
     bound = prepare(C.ref_atomic_chain; bound = (; x, y))
     @test bound(q) ≈ ref
     @test bound(q) == unbound(q, x, y)
-    @test bound.f isa ReactiveKernels._ArrayFunctionPair
+    @test bound.f isa ReactiveKernels._ArrayFunction
 
     # A demanded intermediate keeps its materialization boundary and stays
     # bound/unbound consistent.
@@ -116,7 +116,7 @@ end
     @test unbound(schedule, dose) ≈ ref
     bound = prepare(outer.graph; have = (outer.schedule, outer.dose),
                     want = outer.result, bound = [outer.schedule => schedule])
-    @test bound.f isa ReactiveKernels._DynamicEmbeddedFunctionPair
+    @test bound.f isa ReactiveKernels._ArrayFunction
     got = bound(dose)
     @test got ≈ ref
     # The plate axis is the bound nobs plan, never the ndoses live dose extent.
@@ -125,16 +125,15 @@ end
     @test bound(dose .+ 1.0) ≈ 2 .* plan_axis .+ (dose[1] + 1.0)
     @test !(bound(dose .+ 1.0) ≈ got)
 
-    # A typed dose port keeps the static backend marker.
+    # A typed dose port prepares the same way.
     touter = C.embedded_dose_outer_graph(; dose_type = Vector{Float64})
     tbound = prepare(touter.graph; have = (touter.schedule, touter.dose),
                      want = touter.result,
                      bound = [touter.schedule => schedule])
-    @test tbound.f isa ReactiveKernels._EmbeddedFunctionPair
+    @test tbound.f isa ReactiveKernels._ArrayFunction
     @test tbound(dose) ≈ ref
 
-    # The axis is already bound. A scalar live port needs no runtime array
-    # marker; it selects the native body while retaining the bound axis.
+    # The axis is already bound. A scalar live port keeps the bound axis.
     souter = C.embedded_dose_outer_graph(; dose_type = Float64)
     sbound = prepare(
         souter.graph; have = (souter.schedule, souter.dose),
@@ -390,18 +389,6 @@ end
 _authored_plate_steady_allocated(kernel, a, b, c) =
     @allocated kernel(a, b, c)
 
-struct _AuthoredPlateBackendArray <: AbstractVector{Float64}
-    values::Vector{Float64}
-end
-Base.size(marker::_AuthoredPlateBackendArray) = size(marker.values)
-Base.getindex(marker::_AuthoredPlateBackendArray, index::Int) =
-    marker.values[index]
-ReactiveKernels._requires_tensorized_marker(
-    ::_AuthoredPlateBackendArray) = true
-ReactiveKernels._batched_call(
-        pair::ReactiveKernels._ArrayFunctionPair, ops, args,
-        ::_AuthoredPlateBackendArray) = pair.tensorized(ops, args...)
-
 function _authored_plate_head_count(node, head)
     node isa Expr || return 0
     (node.head === head ? 1 : 0) +
@@ -427,8 +414,7 @@ end
         @test pointwise(values) == expected
         # A materialized cell must produce a concrete container, never a boxed
         # `Vector{Any}` — an untyped cell (metadata result type `Any`) is
-        # narrowed to its element type so the node stays promotable at the
-        # Reactant host-operand boundary (snag untyped-plate-ce).
+        # narrowed to its element type (snag untyped-plate-ce).
         @test pointwise(values) isa Vector{Float64}
     end
 end
@@ -503,12 +489,10 @@ end
     reference = [_authored_plate_normal(x, location, scale) for x in xs]
 
     untyped_total = prepare(untyped_authored_normal_loglik)
-    @test untyped_total.f isa ReactiveKernels._DynamicEmbeddedFunctionPair
-    @test typeof(untyped_total.f).parameters[1] == (1, 2, 3)
+    @test untyped_total.f isa ReactiveKernels._ArrayFunction
     @test untyped_total(xs, location, scale) ≈ sum(reference)
     @test _authored_plate_allocated(
         untyped_total, xs, location, scale) == 0
-    @test !occursin("for ", string(untyped_total.f.tensorized_ast))
 
     parameters = (; μ = location, τ = scale, θ = xs)
     constrained_prior = prepare(
@@ -518,9 +502,7 @@ end
         _authored_plate_normal(location, 0.0, 5.0) +
         log(2.0) + _authored_plate_cauchy(scale, 0.0, 5.0) +
         sum(_authored_plate_normal(value, location, scale) for value in xs)
-    @test constrained_prior.f isa
-          ReactiveKernels._DynamicEmbeddedFunctionPair
-    @test typeof(constrained_prior.f).parameters[1] == (1,)
+    @test constrained_prior.f isa ReactiveKernels._ArrayFunction
     @test constrained_prior(parameters) ≈ constrained_reference
 
     scalar_parameters = (; μ = location)
@@ -528,7 +510,7 @@ end
     observed_total = prepare(authored_namedtuple_observed_loglik)
     observed_pointwise = prepare(extract(
         authored_namedtuple_observed_loglik; want = :pointwise))
-    @test typeof(observed_total.f).parameters[1] == (1, 2, 3)
+    @test observed_total.f isa ReactiveKernels._ArrayFunction
     @test observed_total(scalar_parameters, xs, observed_scales) ≈ sum(
         _authored_plate_normal(xs[i], location, observed_scales[i])
         for i in eachindex(xs))
@@ -559,8 +541,6 @@ end
     @test !occursin("similar", string(total_ast))
     @test occursin("similar", string(pointwise_ast))
     @test occursin("similar", string(both_ast))
-    @test !occursin("for ", string(total.f.tensorized_ast))
-    @test occursin("_tensorized_plate_call", string(total.f.tensorized_ast))
     native_text = string(total_ast)
     @test findfirst("Base.broadcastable", native_text) <
           findfirst("__ops__[", native_text)
@@ -581,34 +561,6 @@ end
     @test untyped_total(0.25, locations, scale) ≈ sum(
         _authored_plate_normal(0.25, item, scale) for item in locations)
 
-    # A native array in an earlier candidate position must not mask a later
-    # backend-traced array (or traced scalar) that requires tensorized lowering.
-    native_call = (ops, args...) -> :native
-    tensorized_call = (ops, args...) -> :tensorized
-    pair = ReactiveKernels._DynamicEmbeddedFunctionPair{
-        (1, 2),typeof(native_call),typeof(tensorized_call),Expr}(
-            native_call, tensorized_call, Expr(:block))
-    single_candidate_pair = ReactiveKernels._DynamicEmbeddedFunctionPair{
-        (1,),typeof(native_call),typeof(tensorized_call),Expr}(
-            native_call, tensorized_call, Expr(:block))
-    typed_pair = ReactiveKernels._EmbeddedFunctionPair{
-        1,typeof(native_call),typeof(tensorized_call),Expr}(
-            native_call, tensorized_call, Expr(:block))
-    backend_locations = _AuthoredPlateBackendArray(locations)
-    @test pair((), xs, backend_locations) === :tensorized
-    @test pair((), xs, locations) === :native
-    @test pair((), (; μ = location, τ = scale), locations) === :native
-    @test pair((), Dict(:μ => location, :τ => scale), locations) === :native
-    @test pair((), (; μ = location, τ = scale), backend_locations) ===
-          :tensorized
-    @test pair((), (; θ = xs), locations) === :native
-    @test pair((), (; θ = backend_locations), locations) === :tensorized
-    @test single_candidate_pair((), (; μ = location, τ = scale)) === :native
-    @test single_candidate_pair(
-        (), (; μ = location, τ = scale, θ = backend_locations)) ===
-          :tensorized
-    @test typed_pair((), xs, backend_locations) === :tensorized
-    @test typed_pair((), xs, locations) === :native
     zipped_reference = [
         _authored_plate_normal(xs[i], locations[i], scales[i])
         for i in eachindex(xs)
@@ -722,7 +674,6 @@ end
     @test occursin("_plate_dependency_changed", generated)
     @test _authored_plate_head_count(code_expr(total), :for) == 1
     @test !occursin("similar", generated)
-    @test !occursin("for ", string(total.f.tensorized_ast))
 
     total(observations, locations, scales)
     _AUTHORED_PLATE_SCALE_CALLS[] = 0
@@ -771,7 +722,7 @@ end
     @test pointwise(observations, location) ≈ reference
     @test total(observations, location) ≈ sum(reference)
     @test untyped_total(observations, location) ≈ sum(reference)
-    @test typeof(untyped_total.f).parameters[1] == (1,)
+    @test untyped_total.f isa ReactiveKernels._ArrayFunction
     @test _authored_plate_head_count(code_expr(total), :for) == 1
     @test !occursin("similar", string(code_expr(total)))
 end
@@ -793,7 +744,6 @@ end
     @test length(plan(authored_eachcol_sum).recipes) == 3
     @test _authored_plate_head_count(code_expr(column_total), :for) == 1
     @test !occursin("similar", string(code_expr(column_total)))
-    @test !occursin("for ", string(column_total.f.tensorized_ast))
 
     row_offsets = [0.5, 1.5]
     row_reference = [
@@ -809,7 +759,6 @@ end
     @test count(recipe -> recipe.source == :(offsets .+ 1.0),
                 authored_eachrow_derived_sum.graph.recipes) == 1
     @test _authored_plate_head_count(code_expr(row_total), :for) == 1
-    @test !occursin("for ", string(row_total.f.tensorized_ast))
 
     values = [-1.0, 0.5, 2.0]
     atomic_offsets = [0.25, 0.75]
@@ -824,7 +773,6 @@ end
                 authored_ref_derived_sum.graph.recipes) == 1
     @test _authored_plate_head_count(code_expr(atomic_total), :for) == 1
     @test !occursin("similar", string(code_expr(atomic_total)))
-    @test !occursin("for ", string(atomic_total.f.tensorized_ast))
 
     logits = [1.0 -0.5 0.25; 0.0 1.25 -0.75; -1.0 0.5 1.5]
     observed = [1, 2, 3]
@@ -841,7 +789,6 @@ end
                 authored_eachcol_categorical.graph.recipes) == 1
     @test _authored_plate_head_count(code_expr(categorical_total), :for) == 1
     @test !occursin("similar", string(code_expr(categorical_total)))
-    @test !occursin("for ", string(categorical_total.f.tensorized_ast))
 
     W = [0.25 -0.5; 0.75 1.0]
     b = [-0.25, 0.5]
@@ -854,7 +801,6 @@ end
                 authored_vcat_normal.graph.recipes) == 1
     @test _authored_plate_head_count(code_expr(normal_total), :for) == 1
     @test !occursin("similar", string(code_expr(normal_total)))
-    @test !occursin("for ", string(normal_total.f.tensorized_ast))
 end
 
 # A nested object-endpoint call after a cell-local in a plate cell. The inline
@@ -1016,9 +962,7 @@ end
     # ::Type{<:Tuple}) === :axis` and `_authored_plate_is_axis(::Tuple)` accept it —
     # so the static marker binds to a tuple argument. The pointwise buffer was then
     # allocated with a bare `similar(marker, T, axes)`, which has NO method for a
-    # `Tuple` marker: the Reactant path materialized the tuple case
-    # (test_ref_array_plate_reactant.jl "broadcast axes and shared rank …") but the
-    # NATIVE `k(q)` crashed with
+    # `Tuple` marker: the native `k(q)` crashed with
     # `similar(::Tuple{Float64}, ::Type{Float64}, ::Tuple{Base.OneTo{Int}})`.
     # `_plate_similar_output` allocates a plain `Array` for a tuple marker, matching
     # Julia's broadcast container rule (`x .+ sum(q) .* y` is a `Vector`).
@@ -1418,7 +1362,7 @@ end
             (typeof(op.f), typeof(ReactiveKernels._kernel_native_source(op.f)))
     end
     @test !invokes_closure(ReactiveKernels._kernel_source_call,
-                           (Val{:native}, typeof(op), argtypes...))
+                           (typeof(op), argtypes...))
     # Negative control: explicitly keep the same source callable as an invoke,
     # independently of the Julia version's ordinary inlining heuristic.
     # Fixed arity on purpose: a forwarded `args...` splat is left unspecialized
@@ -1785,12 +1729,9 @@ end
 # `max.(row, 1)`, a gather, a mask, a fused product, `sum`): every temporary is
 # an ordinary per-cell Julia allocation, so the prepared plate allocated ~336 B
 # per cell and ran ~50× slower than a hand loop. A scalar generator over the
-# per-dose index is allocation-free natively AND lowers per lane under Reactant
-# (`test_ref_array_plate_reactant.jl`), with either plan representation behind a
+# per-dose index is allocation-free natively, with either plan representation behind a
 # per-dose accessor: index arithmetic on host data for the lattice plan, and the
-# one-element reduction `sum(view(row, i:i))` for a stored row (the same
-# normalization the tensorized `row[i]` lowering uses, so it never trips
-# Reactant's scalar-indexing guard inside an opaque helper).
+# one-element reduction `sum(view(row, i:i))` for a stored row.
 struct _PlateGatherLattice
     shifts::Vector{Int}
     nobs::Int
@@ -1873,8 +1814,7 @@ end
 # of the dose weight times the unit response at the lag since that dose. Two
 # natural spellings state exactly that: the unit response extended by zero
 # before its dose (`get(units, lag, 0.0)`, Base's total gather), and the sum
-# over the doses given (a filtered generator). Both are ordinary Julia natively;
-# the tensorized companion keeps each branch lazy (`test_ref_array_plate_reactant.jl`).
+# over the doses given (a filtered generator). Both are ordinary Julia.
 # One graph serves both plan types through dispatching helpers: its domain port
 # carries no declared type, and the native lowering schedules it from the
 # concrete value it receives.
@@ -2508,46 +2448,6 @@ end
     end
 end
 
-@testset "tensorized companion: filtered sums and get keep their branches lazy" begin
-    # The tensorized rewrite, evaluated on host values, is Base's own fold: the
-    # filter is a branch on the accumulator and `get` stays `Base.get`. Over a
-    # data-length iterator the fold is one authored loop (retained under a
-    # tracing backend); over a helper-produced iterator it is `foldl`.
-    native(t, s, u, w, z) = sum(w[j] * u[t - s[j]] for j in eachindex(s) if t > s[j]; init = z)
-    looped = ReactiveKernels._kernel_tensorized_rhs(
-        :(sum(w[j] * u[t - s[j]] for j in eachindex(s) if t > s[j]; init = z)),
-        Set{Symbol}(), nothing, Set([:t, :s, :u, :w, :z]))
-    @test looped.head === :let && occursin("@trace", string(looped))
-    folded = ReactiveKernels._kernel_tensorized_rhs(
-        :(sum(w[j] * u[t - s[j]] for j in _natural_sup_slots(s) if t > s[j]; init = z)))
-    @test folded.head === :call && folded.args[1] == GlobalRef(Base, :foldl)
-    @test occursin("_recurrence_branch", string(folded))
-    u = [1.5, -2.25, 0.125, 7.0, 3.5]
-    cases = ((5, [0, 2, 4], [1.0, 0.5, 2.0], 0.0),
-             (1, [0, 2, 4], [1.0, 0.5, 2.0], 0.0),     # one dose given
-             (1, [1, 2, 4], [1.0, 0.5, 2.0], 0.0),     # none given: init
-             (3, Int[], Float64[], 0.0),               # no doses
-             (5, [0, 2, 4], [1.0, 0.5, 2.0], 0),       # Int init, Float64 terms
-             (5, [0, 2, 4], [1.0, 0.5, 2.0], -0.0))
-    for lowered in (looped, folded)
-        companion = Core.eval(@__MODULE__, :((t, s, u, w, z) -> $lowered))
-        # The closure is defined in a newer world than this running testset;
-        # Julia 1.12 and later refuse the direct call (`MethodError`).
-        for (t, s, w, z) in cases
-            @test Base.invokelatest(companion, t, s, u, w, z) === native(t, s, u, w, z)
-        end
-    end
-    # Only the `init` form is rewritten: without it Base seeds the sum with the
-    # first ACCEPTED element, which a traced condition cannot select.
-    plain = ReactiveKernels._kernel_tensorized_rhs(:(sum(u[j] for j in r if c[j])))
-    @test !occursin("foldl", string(plain))
-    # `get` routes through the tensorized hook, whose fallback is `Base.get`.
-    @test occursin("_tensorized_get", string(ReactiveKernels._kernel_tensorized_rhs(:(get(u, i, 0.0)))))
-    @test ReactiveKernels._tensorized_get(u, 9, 0.0) === 0.0
-    @test ReactiveKernels._tensorized_get(u, 2, 0.0) === -2.25
-    @test ReactiveKernels._tensorized_get(Dict(:a => 1), :b, 0) === 0
-end
-
 module TraceableHelperFixtures
 using ReactiveKernels
 struct Lattice
@@ -2568,8 +2468,7 @@ struct Exact end
 end
 "The value scaled by the factor."
 @traceable scaled(x::T, s) where {T<:Real} = s * x
-# A hand-written tracing method: the native method is an opaque in-place loop,
-# the traced one a different implementation of the same mathematics.
+# An opaque in-place helper.
 function superpose(plan::Lattice, units, weights, nobs)
     out = zeros(nobs)
     for (s, w) in zip(plan.shifts, weights), t in (s + 1):nobs
@@ -2578,12 +2477,9 @@ function superpose(plan::Lattice, units, weights, nobs)
     out
 end
 plain_helper(plan, units, weights, nobs) = superpose(plan, units, weights, nobs)
-ReactiveKernels.traced(::typeof(superpose), plan::Lattice, units, weights, nobs) =
-    [sum(weights[j] * get(units, t - plan.shifts[j], 0.0) for j in eachindex(weights); init = 0.0)
-     for t in 1:nobs]
 end
 
-@testset "@traceable: the method as written, plus the rewritten one for tracing" begin
+@testset "@traceable: the method as written" begin
     H = TraceableHelperFixtures
     lattice = H.Lattice([0, 2, 5])
     # The native method is the authored one.
@@ -2595,41 +2491,12 @@ end
     @test occursin("plan's shifts", string(@doc H.row_index))
     @test occursin("above the lower bound", string(@doc H.clipped))
     @test occursin("scaled by the factor", string(@doc H.scaled))
-    # The tensorized hook dispatches to the rewritten body by the authored
-    # signature; on host values it computes what the method computes.
-    call = ReactiveKernels.traced
-    @test call(H.row_index, 7, lattice, 2) == 5
-    @test call(H.row_index, [4, 9, 1], H.Exact(), 2) == 9
-    @test call(H.clipped, 2.5, 1.0) === 1.5 && call(H.clipped, 0.5, 1.0) === 0.0
-    @test call(H.clipped, 2.0) === 2.0
-    @test call(H.scaled, 2, 1.5) == 3.0
-    @test call(+, 1, 2) == 3
-    # A hand-written method is reached the same way and agrees with the native one.
-    units = [1.0, 0.5, 0.25, 0.125, 2.0, 4.0]
-    @test call(H.superpose, lattice, units, [1.0, 2.0, 3.0], 6) ==
-          H.superpose(lattice, units, [1.0, 2.0, 3.0], 6)
-    # The rewritten body carries the recipe rewrites (a traced index reads
-    # through `_tensorized_getindex`; a branch is lazy).
-    rewritten = string(ReactiveKernels._traceable_definition(
-        :(row_index(t, p::Lattice, i) = t - p.shifts[i]), H))
-    @test occursin("_tensorized_getindex", rewritten)
-    @test occursin("_recurrence_branch", string(ReactiveKernels._traceable_definition(
-        :(f(x) = x > 0 ? x : zero(x)), H)))
-    # A recipe routes calls to helpers through the hook; Base and package
-    # calls, and calls with keyword arguments, keep their form.
-    lower(ex) = string(ReactiveKernels._kernel_tensorized_rhs(ex, Set{Symbol}(), H,
-                                                              Set([:t, :p, :i, :x])))
-    @test occursin("ReactiveKernels.traced", lower(:(row_index(t, p, i))))
-    @test occursin("ReactiveKernels.traced", lower(:(not_yet_defined(t))))
-    @test !occursin("ReactiveKernels.traced", lower(:(exp(x) + sum(x))))
-    @test !occursin("ReactiveKernels.traced", lower(:(plate(x))))
-    @test !occursin("ReactiveKernels.traced", lower(:(row_index(t, p; i = i))))
-    # A whole recipe `x = f(ports...)` keeps `f` as its raw operation unless
-    # `f` has a `traced` method, which sends it through the tracing companion.
+    # A whole recipe `x = f(ports...)` keeps a helper `f` as its raw operation,
+    # `@traceable` or not.
     operation(ex) = ReactiveKernels._kernel_operation(
         ex, Symbol[ex.args[2:end]...], Set{Symbol}(ex.args[2:end]); mod = H)
-    @test operation(:(superpose(plan, u, w, n))) isa Expr
-    @test operation(:(row_index(t, p, i))) isa Expr          # @traceable defines one
+    @test operation(:(superpose(plan, u, w, n))) === :superpose
+    @test operation(:(row_index(t, p, i))) === :row_index
     @test operation(:(plain_helper(plan, u, w, n))) === :plain_helper
     # Loud refusals.
     define(ex) = ReactiveKernels._traceable_definition(ex, H)

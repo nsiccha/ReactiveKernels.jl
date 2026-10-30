@@ -86,7 +86,7 @@ _embedded_kernel(op) = nothing
 # A first-class authored plate keeps its scalar pointwise kernel as compiler
 # metadata.  The ordinary call method is a semantic fallback (and is useful to
 # low-level consumers); `_lower_with_ops` recognizes the operation and emits
-# the fused native/tensorized loop products directly.
+# the fused native loop directly.
 struct _AuthoredPlateOp{K,A}
     kernel::K
     # Cold lowering metadata: each tuple names the non-atomic arguments of an
@@ -281,19 +281,15 @@ end
 _plate_fold_ref(::typeof(LogExpFunctions.logsumexp)) =
     GlobalRef(LogExpFunctions, :logsumexp)
 
-# The materialized tensor lanes of a plate reduced by its streamed fold.
-@inline _tensorized_plate_total(::typeof(LogExpFunctions.logsumexp), value) =
-    LogExpFunctions.logsumexp(_tensorized_plate_materialize(value))
-
 # The pointwise buffer's container type and shape come from the axis marker. For
 # an array marker `similar(marker, T, output_axes)` is the single-allocation fast
 # path (unchanged). A `Tuple` axis marker — a tuple-valued batched argument, or a
 # plate whose sole axis is a tuple — has no `similar(::Tuple, T, axes)` method, so
-# the native/nonallocating pointwise allocation used to crash on it even though
-# the Reactant path materialized it. Julia's broadcast rule collapses a `Tuple`
-# against arrays (or a lone `Tuple`) to a plain `Array`, so allocate the `Array`
-# of the combined output shape directly, matching the container both `_plate_similar`
-# (style-combining) and the Reactant oracle already produce for a tuple axis.
+# the native/nonallocating pointwise allocation used to crash on it. Julia's
+# broadcast rule collapses a `Tuple` against arrays (or a lone `Tuple`) to a
+# plain `Array`, so allocate the `Array` of the combined output shape directly,
+# matching the container `_plate_similar` (style-combining) produces for a
+# tuple axis.
 # (`_plate_similar` alone does not cover a plate whose SOLE axis is a tuple — a
 # lone `Style{Tuple}` would materialize a tuple, not an array — so this marker
 # dispatch is the general fix. The name retains `similar` so the lowering's
@@ -311,12 +307,9 @@ _plate_fold_ref(::typeof(LogExpFunctions.logsumexp)) =
 # An untyped plate cell exposes its result through a metadata-`Any` boundary
 # port (type annotations are optional metadata in an authored kernel), so the
 # native lowering allocates its pointwise container as a boxed `Vector{Any}` —
-# even when every cell yields the same concrete type. That boxed container is
-# not promotable at the Reactant host-operand boundary
-# (`unwrapped_eltype(::Type{Any})` has no method), so a transformed-data plate
-# over BOUND data (evaluated natively, then handed to a traced likelihood)
-# breaks an otherwise-tracing posterior. Narrow the filled container once to its
-# concrete element type, mirroring `map(identity, ·)`: a homogeneous cell
+# even when every cell yields the same concrete type. Narrow the filled
+# container once to its concrete element type, mirroring `map(identity, ·)`:
+# a homogeneous cell
 # collapses to `Vector{Float64}`, while a genuinely heterogeneous cell keeps its
 # wide container. Reached only when the boundary type is `Any`; a typed cell
 # keeps the original single-allocation fast path untouched.
@@ -479,7 +472,7 @@ function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
     # Fallback runtime narrowing when the element type was genuinely
     # uninferrable (`valtype(output) === Any` and `promote_op` could not narrow):
     # a no-op for the typed buffer above, recovering a homogeneous element type
-    # otherwise so the result stays promotable at the Reactant host boundary.
+    # otherwise.
     _narrow_plate_output(result)
 end
 
@@ -541,8 +534,8 @@ end
 # A first-class authored SEQUENTIAL scan.  Unlike `plate` (a pure broadcast map),
 # it threads a carry through an ordered loop; its scalar step is a 2-`want` kernel
 # `(carry, x, shared...) -> (new_carry, output)`. Native lowering inlines that
-# step and can stream its output into a reducing plate. The tensorized product
-# calls `_tensorized_scan`, specialized by a backend to a `stablehlo.while`.
+# step and can stream its output into a reducing plate; calling the operation
+# runs `_scan_loop`.
 # The op's argument order is fixed by authoring: index 1 = carry seed, index 2 =
 # the sequence `xs`, index 3+ = Ref-shared operands; `A` records the atomic
 # (broadcast-invariant) indices {1, 3, 4, …}. `I` is the authored
@@ -568,7 +561,7 @@ end
 # `A` is the atomic (broadcast-invariant) index set over the op's argument tuple
 # `(init, operand...)`: index 1 (the carry seed) plus every `Ref`-shared operand.
 # The iterated sequences are the remaining operand indices (>= 2, not in `A`).
-# Split them at compile time so `_tensorized_scan` receives the sequence tuple and
+# Split them at compile time so `_scan_loop` receives the sequence tuple and
 # the shared tuple explicitly.
 @generated function (op::_AuthoredScanOp{K,A,I,H})(args...) where {K,A,I,H}
     n = length(args)
@@ -577,9 +570,9 @@ end
     last_shared = H ? n - 1 : n
     iterated = Expr(:tuple, (:(args[$i]) for i in 2:last_shared if !(i in A))...)
     shared = Expr(:tuple, (:(args[$i]) for i in 2:last_shared if i in A)...)
-    H && return :(_tensorized_scan_history(op.kernel, args[1], args[$n],
-                                           $iterated, $shared))
-    :(_tensorized_scan(op.kernel, args[1], $iterated, $shared, Val($I)))
+    H && return :(_scan_history_loop(op.kernel, args[1], args[$n],
+                                     $iterated, $shared))
+    :(_scan_loop(op.kernel, args[1], $iterated, $shared, Val($I)))
 end
 
 function _lhs_symbols!(symbols::Set{Symbol}, lhs)
@@ -757,7 +750,7 @@ function _scan_step_output_type!(runtime_ops, runtime_recipes, step, input_types
     p = step.plan
     types = _body_types!(runtime_ops, runtime_recipes, p,
         Any[recipe.op for recipe in p.recipes], p.recipes, input_types, base;
-        declared = _needs_embedded_tensorization(p))
+        declared = _owns_array_regions(p))
     types[canon_id(p.graph, p.want[2].id)]
 end
 
@@ -2218,23 +2211,6 @@ function _compose_plate_into(g::Graph, producer::Recipe, consumer::Recipe, cid)
         _AuthoredPlateCellDraft(composed.op), composed.cost, nothing, false, composed.source)
 end
 
-# Is a plate's pointwise value read only by other plates, each zipping it, and
-# returned by no WANT? Its tensorized lanes then pass to them as they are
-# (`_tensorized_plate_lanes`).
-function _plate_read_by_plates(p::Plan, pointwise_id, sum_recipe)
-    g = p.graph
-    any(w -> canon_id(g, w.id) == pointwise_id, p.want) && return false
-    readers = [r for r in p.recipes if r !== sum_recipe &&
-        any(input -> canon_id(g, input.id) == pointwise_id, r.inputs)]
-    isempty(readers) && return false
-    all(readers) do r
-        r.op isa _AuthoredPlateOp || return false
-        atomic = typeof(r.op).parameters[2]
-        all(k -> !(k in atomic) || canon_id(g, r.inputs[k].id) != pointwise_id,
-            eachindex(r.inputs))
-    end
-end
-
 function _plate_dependencies(plan::Plan, root_ids::Set{ValueId})
     graph = plan.graph
     dependencies = Dict{ValueId,Set{ValueId}}()
@@ -2786,8 +2762,8 @@ end
 # Keep an authored branch in the containing native plate loop. Calling its
 # all-in-one source closure can make Enzyme Reverse enter a composed endpoint's
 # inactive logarithm when the condition reads a shared scalar. The condition
-# and arm callables are the same branch parts used by plate partitioning and
-# tensorized execution; emitting them here retains the authored lazy choice.
+# and arm callables are the same branch parts used by plate partitioning;
+# emitting them here retains the authored lazy choice.
 function _native_plate_branch_expr(
         branch::_KernelBranch{CI,TI,EI}, reference, args) where {CI,TI,EI}
     condition = Expr(:call, :(getfield($reference, :condition)),
@@ -2811,10 +2787,8 @@ end
 # shared work (the `log(scale)` of a density, say) is hoisted above the loop
 # like any other cell invariant, and evaluated only when that arm is taken.
 # Each lane still evaluates only its own arm, and an empty domain evaluates no
-# condition and no arm, so the authored lazy semantics are unchanged. This is
-# the native counterpart of the tensorized shared-condition dispatch
-# (`_tensorized_plate_dispatch`, docs/src/constraints.md "Preserve lazy
-# branches").
+# condition and no arm, so the authored lazy semantics are unchanged
+# (docs/src/constraints.md "Preserve lazy branches").
 #
 # The condition must read plate arguments that are statically shared: an
 # atomic operand or a `Number`. A cell holding a nested plate or scan, an
@@ -2874,11 +2848,11 @@ Base.@nospecializeinfer function _plate_branch_source_graphs(
      _kernel_branch_parts(r.source) === nothing) && return branch
     mod = _kernel_endpoint_source_module(r.op)
     key = (Tuple(names), Tuple(sort!(collect(shared))), mod)
-    # Native and tensorized lowerings must append the SAME arm operation
-    # objects to their tables. Key by source identity: equal expressions in
-    # different plans have independent lifetimes. WeakKeyDict compares Exprs
-    # structurally, so its entry could belong to a dead earlier plan and be
-    # collected between the two lowerings of the live plan.
+    # Every lowering of one plan must append the SAME arm operation objects to
+    # its table. Key by source identity: equal expressions in different plans
+    # have independent lifetimes. WeakKeyDict compares Exprs structurally, so
+    # its entry could belong to a dead earlier plan and be collected between
+    # two lowerings of the live plan.
     lock(_PLATE_BRANCH_SOURCE_GRAPHS_LOCK) do
         if Threads.atomic_xchg!(_PLATE_BRANCH_SOURCE_GRAPHS_DIRTY, false)
             filter!(entry -> entry.first.source.value !== nothing,
@@ -3125,8 +3099,7 @@ end
 # not compile per model (the construction rule of the primer's cold-construction
 # section).
 Base.@nospecializeinfer _plate_branch_operation(@nospecialize(op)) =
-    op isa _KernelSourceOp && getfield(op, :f) isa _KernelBranch &&
-    getfield(op, :tensor_f) isa _KernelBranch
+    op isa _KernelSourceOp && getfield(op, :f) isa _KernelBranch
 Base.@nospecializeinfer function _plate_branch_has_graph(@nospecialize(arm))
     arm isa _KernelBranch || return false
     getfield(arm, :then_spec) !== nothing || getfield(arm, :else_spec) !== nothing ||
@@ -3142,7 +3115,6 @@ end
 Base.@nospecializeinfer function _plate_branch_arm_kernel(
         inner::Plan, index::Int, side::Symbol, @nospecialize(native), names)
     r = inner.recipes[index]
-    tensor = getfield(r.op, :tensor_f)
     then = side === :then
     positions = (typeof(native)::DataType).parameters[then ? 2 : 3]
     spec = getfield(native, then ? :then_spec : :else_spec)
@@ -3156,8 +3128,7 @@ Base.@nospecializeinfer function _plate_branch_arm_kernel(
     replacement = if spec === nothing
         token, form = (typeof(r.op)::DataType).parameters
         arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form),
-            getfield(native, then ? :then_arm : :else_arm),
-            getfield(tensor, then ? :then_arm : :else_arm))
+            getfield(native, then ? :then_arm : :else_arm))
         Recipe[Recipe(r.id, Tuple(r.inputs[i] for i in positions), r.outputs,
                       arm_op, r.cost, nothing, false, r.source)]
     else
@@ -3223,9 +3194,8 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_native!(
         @nospecialize(callvalues), raw_arguments, prepared_arguments, marker,
         output_axes, pointwise_lhs, total_lhs; recycled, input_type_hints,
         element_type, into, nonempty::Bool, total_fold = sum)
-    # The cell's own operations come first, where the tensorized lowering
-    # places them (`_lower_authored_plate_tensorized!`); the condition and the
-    # empty-domain cells read them there. Every arm stores into one container
+    # The cell's own operations come first; the condition and the empty-domain
+    # cells read them there. Every arm stores into one container
     # type and seeds one total: the element type the cell's branch gives.
     types = _plate_cell_types!(runtime_ops, runtime_recipes, inner_kernel, atomic,
         callargs, callvalues, raw_arguments, input_type_hints)
@@ -3257,30 +3227,6 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_native!(
     allocate && push!(body.args, :($pointwise_lhs =
         $(GlobalRef(@__MODULE__, :_narrow_plate_output))($pointwise_lhs)))
     body
-end
-
-# The tensorized lowering keeps the shared condition in its batch dispatch,
-# but both lowerings share one operation table: reserve the slots the native
-# arms take, in the same order.
-Base.@nospecializeinfer function _plate_shared_branch_reserve!(
-        runtime_ops, runtime_recipes, @nospecialize(inner_kernel),
-        @nospecialize(atomic), @nospecialize(callargs), @nospecialize(callvalues),
-        pointwise_lhs, total_lhs)
-    branch = _plate_shared_branch(inner_kernel, atomic, callargs, callvalues)
-    branch === nothing && return nothing
-    # The tensorized lowering has just appended the cell's own operations, as
-    # the native shared path does first; only the arms' slots remain.
-    placeholders = Any[gensym(:plate_argument) for _ in callargs]
-    types = (; op_offset = 0, scan_offsets = Dict{Int,Any}(),
-             plate_type_exprs = Dict{ValueId,Any}(), nested = nothing,
-             lane_arms = Dict{Int,Any}())
-    _lower_plate_shared_branch_arms!(Expr(:block), runtime_ops, runtime_recipes,
-        inner_kernel, branch, atomic, callargs, callvalues, placeholders,
-        placeholders, gensym(:plate_axis), gensym(:plate_axes), pointwise_lhs,
-        total_lhs; recycled = nothing, input_type_hints = nothing,
-        element_type = gensym(:plate_eltype), into = false, nonempty = false,
-        types)
-    nothing
 end
 
 Base.@nospecializeinfer function _lower_plate_shared_branch_arms!(
@@ -3455,9 +3401,8 @@ end
 
 # The scalar plan of a cell containing another plate: its shared work hoisted
 # (`_nested_plate_invariants`) and its plate chains composed. Composing gives the
-# composed values fresh identities (`_compose_authored_plates`). Both backend
-# products of one preparation lower the same cells, and one product can lower a
-# cell more than once, so within a preparation (`_sharing_cell_plans`) every
+# composed values fresh identities (`_compose_authored_plates`). One preparation
+# can lower a cell more than once, so within a preparation (`_sharing_cell_plans`) every
 # lowering of a cell reuses one plan: they name the same values and compose once.
 # The plan depends only on the cell kernel, the atomic positions and which call
 # values are scalars.
@@ -4150,9 +4095,8 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     # already types the buffer up front, so for an inferable body this is a
     # compile-time no-op (`_narrow_plate_output` dispatches on `eltype`); it only
     # does work in the residual case where inference yielded `Any` and the buffer
-    # is a boxed `Vector{Any}`, recovering a homogeneous element type so a
-    # transformed-data plate over bound data stays promotable at the Reactant
-    # host-operand boundary. The total is seeded by `_plate_total_seed`, so this
+    # is a boxed `Vector{Any}`, recovering a homogeneous element type. The
+    # total is seeded by `_plate_total_seed`, so this
     # touches only the pointwise materialization.
     if pointwise_lhs !== nothing && !into
         push!(body.args, :($pointwise_lhs =
@@ -4163,13 +4107,12 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     body
 end
 
-# Keep tensorized lowering on the same non-specializing boundary as native.
 # A plate cell lowers as its plate over the one-cell slices of the plate's
-# arguments (`_plate_cell_slices`), with the same native or tensorized plate
-# lowering and the same operation-table entries as the plate itself.
+# arguments (`_plate_cell_slices`), with the same native plate lowering and the
+# same operation-table entries as the plate itself.
 Base.@nospecializeinfer function _lower_authored_plate_cell!(
         body, runtime_ops, runtime_recipes, @nospecialize(recipe::Recipe),
-        callargs, lhs, tensorized::Bool; windows = nothing)
+        callargs, lhs; windows = nothing)
     op = recipe.op::_AuthoredPlateCellOp
     plate = op.plate
     atomic = typeof(plate).parameters[2]
@@ -4238,123 +4181,9 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
         end
     end
     pointwise = gensym(:cell_pointwise)
-    if tensorized
-        _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
-            plate, slices, plate_values, pointwise, nothing)
-    else
-        _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
-            plate, slices, plate_values, pointwise, nothing)
-    end
+    _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
+        plate, slices, plate_values, pointwise, nothing)
     push!(body.args, Expr(:(=), lhs, Expr(:call, GlobalRef(Base, :only), pointwise)))
-    body
-end
-
-Base.@nospecializeinfer function _lower_authored_plate_tensorized!(
-        body, runtime_ops, runtime_recipes,
-        @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
-        pointwise_lhs, total_lhs; lanes::Bool = false, total_fold = sum)
-    inner_kernel = op.kernel
-    inner = inner_kernel.plan
-    length(inner.want) == 1 || throw(ArgumentError(
-        "an authored plate body must have exactly one distinguished result"))
-    length(inner_kernel.ops) == length(inner.recipes) || throw(ArgumentError(
-        "an authored plate body must lower to one operation per transparent scalar recipe"))
-
-    atomic = typeof(op).parameters[2]
-    # A cell recipe whose transitive roots are all atomic (`Ref`) arguments or
-    # statically scalar ports is loop-invariant: the native lowering evaluates
-    # it ONCE above the cell loop (an empty-`dynamic` group in
-    # `_lower_authored_plate_native!`). The tensorized body must give its value
-    # the same standing. A cell-local ARRAY built from atomic operands only
-    # (`shifts = schedule_plan.shifts` read from a `Ref`-wrapped host plan) is
-    # one shared value, not a lane axis, so it is evaluated once with the
-    # unwrapped atomic operands and re-enters every downstream tensorized plate
-    # call wrapped in `Ref`, exactly like an atomic argument. Before this, the
-    # bare invariant array met the lane axis in `combine_axes` and the whole
-    # plate failed with `DimensionMismatch` under Reactant while the native
-    # kernel was correct (snag `plate-cell-gathe-94d4a929`). The distinguished
-    # result retains the whole plate domain, even when it reads no lane input.
-    root_positions = Dict(
-        canon_id(inner.graph, input.id) => position
-        for (position, input) in enumerate(inner.have))
-    dependencies = _plate_dependencies(inner, Set(keys(root_positions)))
-    # Statically scalar means the OUTER argument's value type (`callvalues`),
-    # exactly as the native lowering decides — never the cell formal's inferred
-    # element type, which is scalar for the batched axis itself.
-    invariant_root(root) = root_positions[root] in atomic ||
-        valtype(callvalues[root_positions[root]]) <: Number
-    result_cid = canon_id(inner.graph, only(inner.want).id)
-    locals = Dict{ValueId,Any}()
-    shared = Dict{ValueId,Any}()
-    for (index, input) in enumerate(inner.have)
-        arg = callargs[index]
-        cid = canon_id(inner.graph, input.id)
-        locals[cid] = index in atomic ?
-            Expr(:call, GlobalRef(Base, :Ref), arg) : arg
-        shared[cid] = arg
-    end
-    op_offset = length(runtime_ops)
-    append!(runtime_ops, inner_kernel.ops)
-    append!(runtime_recipes, inner_kernel.lowered_recipes)
-    _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
-    _plate_lane_arm_slots!(runtime_ops, runtime_recipes, inner, atomic, callvalues)
-    _plate_shared_branch_reserve!(runtime_ops, runtime_recipes, inner_kernel,
-        atomic, callargs, callvalues, pointwise_lhs, total_lhs)
-    if any(r -> r.op isa _AuthoredPlateOp, inner.recipes)
-        _plate_nested_native!(runtime_ops, runtime_recipes, inner_kernel,
-            Any[GlobalRef(Core, :Any) for _ in inner.have], atomic, callvalues)
-        # The current tensor product batches individual scalar recipes. Calling
-        # a nested plate's host fallback there would trace a data-sized loop.
-        # Keep this capability gap explicit until nested backend regions exist.
-        push!(body.args, :(throw(ArgumentError(
-            "nested authored plates currently support native execution and native reverse AD; " *
-            "compiled nested plate regions are not implemented"))))
-        return body
-    end
-    for (recipe_index, recipe) in enumerate(inner.recipes)
-        length(recipe.outputs) == 1 || throw(ArgumentError(
-            "an authored plate currently requires single-output scalar recipes"))
-        output = only(recipe.outputs)
-        output_cid = canon_id(inner.graph, output.id)
-        out = gensym(Symbol(:plate_, output.name))
-        operation = Expr(:ref, _OPS_ARG, op_offset + recipe_index)
-        if output_cid != result_cid &&
-           all(invariant_root, dependencies.recipes[recipe_index])
-            args = Any[shared[canon_id(inner.graph, input.id)]
-                       for input in recipe.inputs]
-            push!(body.args, Expr(:(=), out, Expr(:call, operation, args...)))
-            locals[output_cid] = Expr(:call, GlobalRef(Base, :Ref), out)
-            shared[output_cid] = out
-            continue
-        end
-        args = Any[locals[canon_id(inner.graph, input.id)] for input in recipe.inputs]
-        if output_cid == result_cid &&
-           all(invariant_root, dependencies.recipes[recipe_index])
-            # The terminal recipe can read only shared values while unused
-            # lane arguments still determine its broadcast domain. Retain
-            # every lane axis through ignored arguments; no cell is unrolled.
-            for index in eachindex(inner.have)
-                index in atomic && continue
-                valtype(callvalues[index]) <: Number && continue
-                operation = Expr(:call, GlobalRef(@__MODULE__, :_LaneAnchored), operation)
-                pushfirst!(args, callargs[index])
-            end
-        end
-        call = Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_call),
-                    operation, args...)
-        push!(body.args, Expr(:(=), out, call))
-        locals[output_cid] = out
-    end
-    scalar_result = locals[result_cid]
-    pointwise = Expr(:call, GlobalRef(@__MODULE__,
-        lanes ? :_tensorized_plate_lanes : :_tensorized_plate_pointwise), scalar_result)
-    pointwise_lhs === nothing ||
-        push!(body.args, :($pointwise_lhs = $pointwise))
-    total = total_fold === sum ?
-        Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_sum), scalar_result) :
-        Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_total),
-             _plate_fold_ref(total_fold), scalar_result)
-    total_lhs === nothing || push!(body.args, :($total_lhs = $total))
     body
 end
 
@@ -4373,14 +4202,12 @@ end
 # loop once per cell, boxing the coordinate and the result (measured on the
 # ShinyRK simulation graph: 2.4x the read time and 3x the bytes of the children's
 # sum; snag `embedded-prepare-612e5944`). The declaration restores the authored
-# contract at the assignment. Only a product that is host-only by construction
-# may declare: the tensorized product binds traced arrays to the same names, and
-# a PLAIN prepared kernel (no plate, scan or embedded pair, hence no tensorized
-# product) has its native body traced by Reactant directly, where a host-typed
-# local would `convert` a traced array. So `_lower_with_ops` declares only in
-# the native body of a kernel that `prepare` builds as a native/tensorized pair
-# (`_needs_embedded_tensorization`), `lower_batched` in its native loop, and
-# the position driver (`_lower_replicated_with_ops`) in both of its parts.
+# contract at the assignment. `_lower_with_ops` declares in the body of a
+# kernel that owns a plate, scan or embedded array kernel
+# (`_owns_array_regions`), `lower_batched` in its native loop, and the position
+# driver (`_lower_replicated_with_ops`) in both of its parts. A plain kernel
+# keeps its undeclared body; that boundary dates from the removed traced
+# lowering, and widening it would change those kernels' generated code.
 # A bound constant (`_BoundConstant`) is exempt: inference already knows its
 # exact value type, and a declaration would only convert a deliberately bound
 # view or range into an owning copy. `Any` declares nothing.
@@ -4538,10 +4365,9 @@ end
 _lane_slot_values(p::Plan, excluded) =
     Value[only(p.recipes[position].outputs) for position in _lane_slot_recipes(p, excluded)]
 
-function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
+function _lower_with_ops_collecting(p::Plan;
                          inline_embedded::Bool = true,
-                         declare::Bool = !tensorized && inline_embedded &&
-                                         _needs_embedded_tensorization(p),
+                         declare::Bool = inline_embedded && _owns_array_regions(p),
                          recycle::Vector{Pair{ValueId,Symbol}} = Pair{ValueId,Symbol}[],
                          pushdowns::Bool = isempty(recycle),
                          plate_element_types::Bool = false,
@@ -4564,7 +4390,7 @@ function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
     skipped_recipes = Set{Int}()
     terminal_skips = Set{Int}()
     pending_scans = Dict{Int,Any}()
-    # Scans read only through one slice, emitted at that reader (native only).
+    # Scans read only through one slice, emitted at that reader.
     pending_slices = Dict{Int,Any}()
     inferred_plate_types = nothing
     inferred_exemplar_types = nothing
@@ -4575,11 +4401,11 @@ function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
     # collateral multi-output; execute the recipe but discard the duplicate so
     # neither authoritative inputs nor earlier logical values are overwritten.
     assigned = Set(canon_id(g, v.id) for v in p.have)
-    # Plates strip-fused with the scan they feed (native only): each keeps its
+    # Plates strip-fused with the scan they feed: each keeps its
     # operation-table slots at its own position and is emitted at the scan.
     strip_regions = Dict{Int,Vector{Recipe}}()
     strip_plates = Dict{Int,Any}()
-    if !tensorized && inline_embedded
+    if inline_embedded
         for r in p.recipes
             r.op isa _AuthoredScanOp && _authored_scan_sum_consumer(p, r) === nothing ||
                 continue
@@ -4592,15 +4418,14 @@ function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
     # (`_authored_scan_column_projections`); each keeps its table slots.
     scan_columns = Set{Int}()
     # Values plate cells read only at their own row, computed there
-    # (`_cell_pushdowns`, cell_windows.jl). Native only: the tensorized product
-    # computes them whole, and both keep the same operation table.
-    cells = !tensorized && inline_embedded && pushdowns &&
+    # (`_cell_pushdowns`, cell_windows.jl).
+    cells = inline_embedded && pushdowns &&
         type_hints === nothing ? _cell_pushdowns(p) : nothing
     for r in p.recipes
         r.id in skipped_recipes && continue
         if r.id in terminal_skips
-            # The native scan computed this value. Keep the original slots in
-            # both products so their operation tables remain identical.
+            # The native scan computed this value. Keep its original slots in
+            # the operation table.
             push!(runtime_ops, r.op)
             push!(runtime_recipes, r)
             continue
@@ -4617,17 +4442,14 @@ function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
 
         if inline_embedded && r.op isa _AuthoredPlateOp
             callvalues = r.inputs
-            # Shared-branch arm slots belong to the common operation table,
-            # so both lowerings use source-inferred scalar inputs. Exemplar
-            # rank evidence is native-only; exemplar-only scalar evidence
-            # cannot change a branch table shared with the tensorized kernel.
+            # Shared-branch arm slots use source-inferred scalar inputs;
+            # exemplars add rank evidence only.
             branch = any(q -> _plate_branch_operation(q.op),
                          r.op.kernel.plan.recipes)
-            if type_hints === nothing &&
-                    ((!tensorized && exemplar_types !== nothing) || branch)
+            if type_hints === nothing && (exemplar_types !== nothing || branch)
                 inferred_plate_types === nothing &&
                     (inferred_plate_types = _plate_inferred_input_types(p))
-                if !tensorized && exemplar_types !== nothing
+                if exemplar_types !== nothing
                     inferred_exemplar_types === nothing &&
                         (inferred_exemplar_types =
                             _plate_inferred_input_types(p; exemplar_types))
@@ -4678,7 +4500,7 @@ function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
                 total_lhs === nothing || _declare_typed_output!(
                     body, only(total_recipe.outputs), total_lhs, declared)
             end
-            if !tensorized && r.id in scan_columns
+            if r.id in scan_columns
                 # The scan wrote this column; reserve the projection's table
                 # slots here, as for a strip member.
                 _lower_authored_plate_native!(
@@ -4687,7 +4509,7 @@ function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
                     total_fold,
                     input_type_hints = type_hints === nothing ? nothing :
                         Any[type_hints[canon_id(g, v.id)] for v in r.inputs])
-            elseif !tensorized && haskey(pending_scans, r.id)
+            elseif haskey(pending_scans, r.id)
                 scan_recipe, scan_args, scan_offset, scan_type_offset =
                     pending_scans[r.id]
                 output_id = canon_id(g, only(scan_recipe.outputs).id)
@@ -4702,12 +4524,6 @@ function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
                     body, scan_recipe.op, scan_args, nothing, scan_offset; consumer,
                     pointwise_recycled = recycled(pointwise_id),
                     type_offset = scan_type_offset)
-            elseif tensorized
-                _lower_authored_plate_tensorized!(
-                    body, runtime_ops, runtime_recipes, r.op, callargs, callvalues,
-                    pointwise_lhs, total_lhs; total_fold,
-                    lanes = pointwise_lhs !== nothing &&
-                        _plate_read_by_plates(p, pointwise_id, total_recipe))
             elseif r.id in strip_members
                 hints = type_hints === nothing ? nothing :
                     Any[type_hints[canon_id(g, v.id)] for v in r.inputs]
@@ -4748,14 +4564,14 @@ function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
         lhs = length(lhsnames) == 1 ? only(lhsnames) : Expr(:tuple, lhsnames...)
         if inline_embedded && r.op isa _AuthoredPlateCellOp
             _lower_authored_plate_cell!(body, runtime_ops, runtime_recipes, r,
-                callargs, lhs, tensorized;
+                callargs, lhs;
                 windows = cells === nothing ? nothing :
                     _CellEmitter(body, cells, names, runtime_ops, runtime_recipes))
             continue
         end
         if inline_embedded && r.op isa _AuthoredScanOp
-            # Both products keep the same table: the traced path calls the scan
-            # op, while the native path calls its inlined scalar operations.
+            # The table keeps the scan op; the native body calls its inlined
+            # scalar operations.
             push!(runtime_ops, r.op)
             push!(runtime_recipes, r)
             scan_index = length(runtime_ops)
@@ -4792,84 +4608,75 @@ function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
                         mod = transform === nothing ? nothing : _kernel_endpoint_source_module(transform.op),
                         recycled = transform === nothing ? nothing :
                             recycled(canon_id(g, only(transform.outputs).id))))
-                    if !tensorized
-                        transform === nothing || push!(terminal_skips, transform.id)
-                        push!(terminal_skips, reduction.id)
-                        push!(assigned, reduction_id)
-                        declare_types && _declare_typed_output!(body,
-                            reduction_value, nm(reduction_value), declared)
-                    end
+                    transform === nothing || push!(terminal_skips, transform.id)
+                    push!(terminal_skips, reduction.id)
+                    push!(assigned, reduction_id)
+                    declare_types && _declare_typed_output!(body,
+                        reduction_value, nm(reduction_value), declared)
                 end
             end
-            if tensorized
-                call = Expr(:call, Expr(:ref, _OPS_ARG, scan_index),
-                            callargs...)
-                push!(body.args, Expr(:(=), lhs, call))
+            consumer = _authored_scan_sum_consumer(p, r)
+            hoisted = consumer === nothing ? _authored_scan_hoistable(r.op) : Int[]
+            slice = consumer === nothing && terminal === nothing &&
+                !haskey(strip_regions, r.id) &&
+                recycled(canon_id(g, only(r.outputs).id)) === nothing ?
+                _authored_scan_slice_demand(p, r) : nothing
+            if slice !== nothing &&
+                    (recycled(canon_id(g, only(slice.reader.outputs).id)) !== nothing ||
+                     cells !== nothing && slice.reader.id in cells.recipes)
+                slice = nothing
+            end
+            projections = slice === nothing && terminal === nothing &&
+                consumer === nothing ?
+                _authored_scan_column_projections(p, r) : nothing
+            if projections !== nothing && any(c -> c.recipe.id in strip_members ||
+                    (cells !== nothing && c.recipe.id in cells.recipes), projections)
+                projections = nothing
+            end
+            columns = nothing
+            if projections !== nothing
+                columns = Any[]
+                for projection in projections
+                    column = only(projection.recipe.outputs)
+                    column_id = canon_id(g, column.id)
+                    push!(scan_columns, projection.recipe.id)
+                    push!(assigned, column_id)
+                    declare_types &&
+                        _declare_typed_output!(body, column, nm(column), declared)
+                    push!(columns, (; projection.field, lhs = nm(column),
+                                    recycled = recycled(column_id)))
+                end
+                # Nothing reads the rows themselves.
+                lhs = nothing
+            end
+            if slice !== nothing
+                # Its reader's arguments are ready only there.
+                pending_slices[slice.reader.id] =
+                    (r, callargs, scan_index, type_offset, slice)
+            elseif terminal !== nothing
+                _lower_authored_scan_native!(body, r.op, callargs, nothing,
+                    scan_index; type_offset,
+                    recycled = recycled(canon_id(g, only(r.outputs).id)),
+                    terminals = (; items = terminal_records, scan_lhs = lhs,
+                        eltype = declare_types ? _scan_terminal_eltype(valtype(only(r.outputs))) : nothing))
+            elseif haskey(strip_regions, r.id) || !isempty(hoisted)
+                output = only(r.outputs)
+                records = Any[strip_plates[x.id]
+                              for x in get(strip_regions, r.id, Recipe[])]
+                hoisting = _scan_hoisted_records!(records, r, callargs,
+                    hoisted, scan_index)
+                _lower_authored_scan_strips!(body, r, records, hoisting,
+                    callargs, lhs, scan_index, runtime_ops,
+                    runtime_recipes; type_offset, recycled = lhs === nm(output) ?
+                        recycled(canon_id(g, output.id)) : nothing, columns)
+            elseif consumer === nothing
+                output = only(r.outputs)
+                _lower_authored_scan_native!(body, r.op, callargs, lhs, scan_index;
+                    type_offset, recycled = lhs === nm(output) ?
+                        recycled(canon_id(g, output.id)) : nothing, columns)
             else
-                consumer = _authored_scan_sum_consumer(p, r)
-                hoisted = consumer === nothing ? _authored_scan_hoistable(r.op) : Int[]
-                slice = consumer === nothing && terminal === nothing &&
-                    !haskey(strip_regions, r.id) &&
-                    recycled(canon_id(g, only(r.outputs).id)) === nothing ?
-                    _authored_scan_slice_demand(p, r) : nothing
-                if slice !== nothing &&
-                        (recycled(canon_id(g, only(slice.reader.outputs).id)) !== nothing ||
-                         cells !== nothing && slice.reader.id in cells.recipes)
-                    slice = nothing
-                end
-                projections = slice === nothing && terminal === nothing &&
-                    consumer === nothing ?
-                    _authored_scan_column_projections(p, r) : nothing
-                if projections !== nothing && any(c -> c.recipe.id in strip_members ||
-                        (cells !== nothing && c.recipe.id in cells.recipes), projections)
-                    projections = nothing
-                end
-                columns = nothing
-                if projections !== nothing
-                    columns = Any[]
-                    for projection in projections
-                        column = only(projection.recipe.outputs)
-                        column_id = canon_id(g, column.id)
-                        push!(scan_columns, projection.recipe.id)
-                        push!(assigned, column_id)
-                        declare_types &&
-                            _declare_typed_output!(body, column, nm(column), declared)
-                        push!(columns, (; projection.field, lhs = nm(column),
-                                        recycled = recycled(column_id)))
-                    end
-                    # Nothing reads the rows themselves.
-                    lhs = nothing
-                end
-                if slice !== nothing
-                    # Its reader's arguments are ready only there.
-                    pending_slices[slice.reader.id] =
-                        (r, callargs, scan_index, type_offset, slice)
-                elseif terminal !== nothing
-                    _lower_authored_scan_native!(body, r.op, callargs, nothing,
-                        scan_index; type_offset,
-                        recycled = recycled(canon_id(g, only(r.outputs).id)),
-                        terminals = (; items = terminal_records, scan_lhs = lhs,
-                            eltype = declare_types ? _scan_terminal_eltype(valtype(only(r.outputs))) : nothing))
-                elseif haskey(strip_regions, r.id) || !isempty(hoisted)
-                    output = only(r.outputs)
-                    records = Any[strip_plates[x.id]
-                                  for x in get(strip_regions, r.id, Recipe[])]
-                    hoisting = _scan_hoisted_records!(records, r, callargs,
-                        hoisted, scan_index)
-                    _lower_authored_scan_strips!(body, r, records, hoisting,
-                        callargs, lhs, scan_index, runtime_ops,
-                        runtime_recipes; type_offset, recycled = lhs === nm(output) ?
-                            recycled(canon_id(g, output.id)) : nothing, columns)
-                elseif consumer === nothing
-                    output = only(r.outputs)
-                    _lower_authored_scan_native!(body, r.op, callargs, lhs, scan_index;
-                        type_offset, recycled = lhs === nm(output) ?
-                            recycled(canon_id(g, output.id)) : nothing, columns)
-                else
-                    # Emit at the plate, where all its scalar inputs are ready.
-                    # The reserved table slots keep both backend products equal.
-                    pending_scans[consumer.id] = (r, callargs, scan_index, type_offset)
-                end
+                # Emit at the plate, where all its scalar inputs are ready.
+                pending_scans[consumer.id] = (r, callargs, scan_index, type_offset)
             end
             continue
         end
@@ -4877,7 +4684,7 @@ function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
         if embedded === nothing
             push!(runtime_ops, r.op)
             push!(runtime_recipes, r)
-            if !tensorized && haskey(pending_slices, r.id)
+            if haskey(pending_slices, r.id)
                 scan_recipe, scan_args, scan_offset, scan_type_offset, slice =
                     pending_slices[r.id]
                 _lower_authored_scan_slice_native!(body, scan_recipe.op, scan_args,
@@ -4888,7 +4695,7 @@ function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
             end
             # A recycled dotted-call or slice result fills its lane buffer
             # (`_lane_source_expr`); the table keeps the operation either way.
-            destination = !tensorized && length(r.outputs) == 1 &&
+            destination = length(r.outputs) == 1 &&
                 lhs === nm(only(r.outputs)) ?
                 recycled(canon_id(g, only(r.outputs).id)) : nothing
             destination === nothing ||
@@ -4898,7 +4705,7 @@ function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
                 destination
             push!(body.args, Expr(:(=), lhs, call))
         else
-            inner_ast = _embedded_ast(embedded, tensorized)
+            inner_ast = embedded.ast
             op_offset = length(runtime_ops)
             append!(runtime_ops, embedded.ops)
             append!(runtime_recipes, embedded.lowered_recipes)
@@ -4906,16 +4713,13 @@ function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
                     _embedded_statements(inner_ast, callargs, lhs, op_offset))
         end
     end
-    output(w) = tensorized ? Expr(:call,
-        GlobalRef(@__MODULE__, :_tensorized_plate_materialize), nm(w)) : nm(w)
-    retval = length(p.want) == 1 ? output(p.want[1]) :
-             Expr(:tuple, (output(w) for w in p.want)...)
+    retval = length(p.want) == 1 ? nm(p.want[1]) :
+             Expr(:tuple, (nm(w) for w in p.want)...)
     push!(body.args, Expr(:return, retval))
     # Compose before index runs duplicate a cell body into grouped/flat arms;
     # otherwise those mutually exclusive definitions appear to escape here.
-    !tensorized && inline_embedded &&
-        (body = _lower_cell_arrays_native(body, runtime_recipes))
-    !tensorized && inline_embedded && (body = _lower_index_runs_native(body, runtime_ops))
+    inline_embedded && (body = _lower_cell_arrays_native(body, runtime_recipes))
+    inline_embedded && (body = _lower_index_runs_native(body, runtime_ops))
     Expr(:function, Expr(:tuple, argexprs...), body),
     Tuple(runtime_ops), Tuple(runtime_recipes)
 end
@@ -4939,7 +4743,7 @@ lower(p::Plan) = first(_lower_with_ops(p; inline_embedded = false))
 _lower_unembedded(p::Plan) = lower(p)
 
 """
-    lower_with_ops(p::Plan; tensorized=false, inline_embedded=false) -> (ast, ops, recipes)
+    lower_with_ops(p::Plan; inline_embedded=false) -> (ast, ops, recipes)
 
 Lower a plan to an executable straight-line function `Expr` plus the operation
 table it closes over. `ast` is `function (__ops__, ports...) ... end` over the
@@ -4954,15 +4758,12 @@ tuple first:
     f = compile(ast)
     f(ops, port_values...)
 
-`lower(p)` is `first(lower_with_ops(p))`. With `tensorized = true` the body
-takes the backend tensorized form over the same operation table; with
-`inline_embedded = true` embedded prepared kernels are spliced as statements
+`lower(p)` is `first(lower_with_ops(p))`. With `inline_embedded = true`
+embedded prepared kernels are spliced as statements
 (the form [`prepare`](@ref) compiles) instead of opaque `__ops__` calls.
 """
-function lower_with_ops(p::Plan; tensorized::Bool = false,
-                        inline_embedded::Bool = false)
-    _lower_with_ops(
-        p; tensorized = tensorized, inline_embedded = inline_embedded)
+function lower_with_ops(p::Plan; inline_embedded::Bool = false)
+    _lower_with_ops(p; inline_embedded = inline_embedded)
 end
 
 function _batched_dependency_analysis(p::Plan, batched)
@@ -5276,8 +5077,7 @@ function _replicated_parts(p::Plan, analysis)
 end
 
 # Lower one part as `prepare` lowers a scalar kernel. Every output is declared,
-# as the position driver always did: its body is host-only by construction
-# (a traced batch calls the scalar target through `_replica`).
+# as the position driver always did.
 _replicated_part_ast(part::Plan; recycle = Pair{ValueId,Symbol}[],
                      cell_slots = nothing, cell_tables = nothing) =
     _lower_with_ops(_lowering_plan(part); declare = true, recycle, cell_slots,
@@ -5663,97 +5463,6 @@ function lower_batched(p::Plan; batched, reduce = :+)
     Expr(:function, Expr(:tuple, argexprs...), body)
 end
 
-# Reactant deliberately rejects scalar indexing of traced arrays.  Keep the
-# ordinary loop lowering above as the native hot path, and compile this eager
-# tensor lowering alongside it for array-tracing backends.  Each dependent
-# recipe is materialized before the next one consumes it; Reactant sees those
-# broadcasts and the final reduction as tensor operations and can fuse them in
-# the compiled program.  This body is never selected for ordinary Julia arrays,
-# so the native exact-zero-allocation reducing contract is unchanged.
-function _lower_batched_tensorized(p::Plan; batched, reduce = :+)
-    g = p.graph
-    length(p.want) == 1 || throw(ArgumentError(
-        "lower_batched requires a single scalar want; got $(length(p.want))"))
-    for r in p.recipes
-        length(r.outputs) == 1 || throw(ArgumentError(
-            "lower_batched requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
-    end
-    batched_names = Set{Symbol}(batched isa Symbol ? (batched,) : batched)
-    names = _varnames(p)
-    nm(v) = names[canon_id(g, v.id)]
-
-    batched_input_ids = Set{ValueId}()
-    for v in p.have
-        v.name in batched_names && push!(batched_input_ids, canon_id(g, v.id))
-    end
-    isempty(batched_input_ids) && throw(ArgumentError(
-        "lower_batched: none of the have ports are batched (batched = $(sort(collect(batched_names))))"))
-
-    batched_vals = Set{ValueId}(batched_input_ids)
-    recipe_is_batched = falses(length(p.recipes))
-    for (k, r) in enumerate(p.recipes)
-        dependent = any(canon_id(g, inp.id) in batched_vals for inp in r.inputs)
-        recipe_is_batched[k] = dependent
-        dependent && for output in r.outputs
-            push!(batched_vals, canon_id(g, output.id))
-        end
-    end
-
-    want = only(p.want)
-    canon_id(g, want.id) in batched_vals || throw(ArgumentError(
-        "lower_batched: want :$(want.name) is loop-invariant (does not depend on a batched port); nothing to vectorize"))
-
-    argexprs = Any[_OPS_ARG]
-    for v in p.have
-        push!(argexprs, canon_id(g, v.id) in batched_input_ids ?
-              nm(v) : :($(nm(v))::$(valtype(v))))
-    end
-
-    body = Expr(:block)
-    assigned = Set(canon_id(g, v.id) for v in p.have)
-    for (k, r) in enumerate(p.recipes)
-        out = only(r.outputs)
-        cid = canon_id(g, out.id)
-        cid in assigned && continue
-        push!(assigned, cid)
-        op = Expr(:ref, _OPS_ARG, k)
-        args = Any[nm(inp) for inp in r.inputs]
-        if recipe_is_batched[k]
-            # A batched recipe maps over the lane axis; every operand that is
-            # NOT batched — a shared scalar, or a shared ARRAY port such as the
-            # whole unit-response vector a per-dose cell gathers from — is one
-            # atomic value per lane. It enters the call wrapped in `Ref`, and
-            # the call routes through `_tensorized_plate_call`, whose backend
-            # extension batches a shared array payload (`Ops.batch`) instead
-            # of expanding it as a broadcast axis. Before this, a shared array
-            # HAVE was broadcast as an axis (`DimensionMismatch`, snag
-            # `plate-cell-gathe-94d4a929`) while `lower_batched` hoisted it
-            # correctly natively.
-            shared = Any[
-                canon_id(g, inp.id) in batched_vals ? nm(inp) :
-                    Expr(:call, GlobalRef(Base, :Ref), nm(inp))
-                for inp in r.inputs]
-            call = Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_call),
-                        op, shared...)
-        else
-            call = Expr(:call, op, args...)
-        end
-        push!(body.args, Expr(:(=), nm(out), call))
-    end
-
-    materialized = Expr(:call,
-        GlobalRef(@__MODULE__, :_tensorized_plate_materialize), nm(want))
-    retval = if reduce === nothing
-        materialized
-    elseif reduce === :+
-        Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_sum), nm(want))
-    else
-        Expr(:call, GlobalRef(Base, :reduce), reduce, materialized)
-    end
-    push!(body.args, Expr(:return, retval))
-    Expr(:function, Expr(:tuple, argexprs...), body)
-end
-
 """
     transform(ast, passes...) -> Expr
 
@@ -5815,7 +5524,7 @@ end
 # exactly those names. `RuntimeGeneratedFunctions` keys its body cache on a
 # content hash of the expression and carries that hash in the callable's TYPE,
 # so every fresh lowering would otherwise mint a new `RuntimeGeneratedFunction`
-# type — and with it a new `PreparedKernel`/`_EmbeddedFunctionPair` constructor
+# type — and with it a new `PreparedKernel`/`_ArrayFunction` constructor
 # specialization at `prepare` time plus a new `generated_callfunc` expansion at
 # the first call — on EVERY `prepare` of an unchanged graph (snag
 # `prepare-with-bou-2b4faf57`: ~15–60 ms of compilation per request-time
@@ -6191,122 +5900,16 @@ function _register_image_programs(package::Base.PkgId)
     nothing
 end
 
-# A plated kernel owns two compiled bodies but presents exactly the same
-# PreparedKernel API as every scalar kernel.  The batched input position is a
-# type parameter so choosing the native body remains inferred and allocation
-# free.  Optional backend extensions specialize `_batched_call` on their traced
-# array marker; ordinary arrays always take `native`.
-abstract type _ArrayFunctionPair end
-
-struct _BatchedFunctionPair{I,B,R,N,T} <: _ArrayFunctionPair
+# A plated or embedding kernel keeps its compiled native body in this wrapper
+# and presents exactly the same PreparedKernel API as every scalar kernel. The
+# call enters the generated body with positional operands
+# (`_native_array_body_call`), and AD differentiates `native` directly
+# (`_ad_kernel_call`).
+struct _ArrayFunction{N}
     native::N
-    tensorized::T
 end
 
-@inline function (f::_BatchedFunctionPair{I})(ops, args...) where {I}
-    traced = _dynamic_tensorized_marker(args)
-    marker = traced === nothing ? getfield(args, I) : traced
-    _batched_call(f, ops, args, marker)
-end
-
-struct _EmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
-    native::N
-    tensorized::T
-    tensorized_ast::A
-end
-
-@inline function (f::_EmbeddedFunctionPair{I})(ops, args...) where {I}
-    traced = _dynamic_tensorized_marker(args)
-    marker = traced === nothing ? getfield(args, I) : traced
-    _batched_call(f, ops, args, marker)
-end
-
-# An untyped authored signature still specializes on its concrete call-site
-# argument types.  Keep every graph-proven candidate axis as type metadata and
-# prefer the first runtime broadcast axis when choosing native vs. tensorized
-# execution.  The native call ignores the marker and may derive its plate axis
-# only after projecting an atomic boundary, so exhausting the candidates falls
-# back to a non-axis sentinel.  Atomic `Ref(port)` inputs are excluded from the
-# axis candidates, so an array-valued atom cannot be mistaken for the plate
-# axis; but when every axis operand is bound and no axis candidate remains,
-# `_embedded_marker_candidates` admits every HAVE port not provably scalar
-# (array-valued and ambiguous/`Any` ones, atomic ones included) as backend
-# markers, since only the marker TYPE — never its axis — selects native vs.
-# tensorized execution there.
-struct _DynamicEmbeddedFunctionPair{I,N,T,A} <: _ArrayFunctionPair
-    native::N
-    tensorized::T
-    tensorized_ast::A
-end
-
-# The marker searches below visit every argument of a prepared call (or every
-# field of a record). Written as a recursion over `Base.tail`, they made Julia's
-# inference open one nested frame per argument, each typed by the tuple still
-# to come: about 8.5 KB of native stack per argument, and type sizes quadratic
-# in the argument count. The data-only prefix of a large model, which takes
-# every bound column as an argument (655 of them), then overflowed inference's
-# stack and ran uninferred (snag stack-overflow-i-549143aa). One chain of calls
-# infers in one frame whatever the width. Its calls still dispatch in the
-# caller's world, so backend methods (`_requires_tensorized_marker`) apply.
-_first_marker_chain(indices) = Expr(:block,
-    Any[:(marker = f(getfield(values, $index)); marker === nothing || return marker)
-        for index in indices]..., nothing)
-
-# The first result of `f` that is not `nothing`, over the fields of `values`
-# (those at positions `I`), or `nothing`.
-@inline @generated _first_marker(f::F, values::V) where {F,V<:Tuple} =
-    _first_marker_chain(1:fieldcount(V))
-@inline @generated _first_marker(f::F, values::Tuple, ::Val{I}) where {F,I} =
-    _first_marker_chain(I)
-
-# A graph-proven candidate can be an atomic model boundary rather than the
-# array consumed by a downstream plate.  Traverse only deliberately supported
-# structures; generic structs remain atomic instead of being reflected over or
-# passed to `broadcastable`.  Backend extensions may specialize this trait for
-# their own transparent runtime carrier.
-@inline _embedded_marker_values(x) = ()
-@inline _embedded_marker_values(x::NamedTuple) = values(x)
-# A view or other array wrapper must not hide its traced storage from dispatch.
-# An array whose parent has its own type is unwrapped storage. Deciding that by
-# type keeps the marker search inferable: a runtime `parent(x) === x` left the
-# array's own type in the result, so the search re-entered itself with the
-# same signature, and from Julia 1.12 inference gave up and dispatched every
-# kernel call's marker search at run time. Traced-ness is a property of the
-# type (`_requires_tensorized_marker`), so a same-typed parent adds nothing.
-@inline _embedded_marker_values(x::AbstractArray) = _embedded_parent_values(x, parent(x))
-@inline _embedded_parent_values(::A, ::A) where {A<:AbstractArray} = ()
-@inline _embedded_parent_values(x, parent) = (parent,)
-
-@inline function _embedded_axis_marker(value)
-    _authored_plate_is_axis(value) && return value
-    _embedded_axis_marker_values(_embedded_marker_values(value))
-end
-
-@inline _embedded_axis_marker_values(values::Tuple) =
-    _first_marker(_embedded_axis_marker, values)
-
-@inline _dynamic_embedded_marker(args, ::Val{I}) where {I} =
-    _first_marker(_embedded_axis_marker, args, Val(I))
-
-@inline _requires_tensorized_marker(marker) = false
-
-@inline function _dynamic_tensorized_value_marker(value)
-    _requires_tensorized_marker(value) && return value
-    _dynamic_tensorized_marker(_embedded_marker_values(value))
-end
-
-@inline _dynamic_tensorized_marker(args::Tuple) =
-    _first_marker(_dynamic_tensorized_value_marker, args)
-
-@inline function (f::_DynamicEmbeddedFunctionPair{I})(ops, args...) where {I}
-    traced = _dynamic_tensorized_marker(args)
-    marker = traced === nothing ?
-             _dynamic_embedded_marker(args, Val(I)) : traced
-    _batched_call(f, ops, args, marker)
-end
-
-@inline _batched_call(f::_ArrayFunctionPair, ops, args, marker) =
-    _native_array_body_call(f.native, ops, args)
+@inline (f::_ArrayFunction)(ops, args...) = _native_array_body_call(f.native, ops, args)
 
 """
     PreparedKernel
@@ -6373,9 +5976,9 @@ end
 
 # A generated kernel whose public entry guarantees a latest-world barrier can
 # carry that guarantee into literal source calls within its native recipe
-# bodies and retained arm plans. Only the native argument of a source-op
-# construction is visited; the tensorized body and quoted source/provenance
-# expressions remain unchanged.
+# bodies and retained arm plans. Only the body argument of a source-op
+# construction is visited; quoted source/provenance expressions remain
+# unchanged.
 function _kernel_latest_native_source_literals(ex)
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
@@ -6409,12 +6012,10 @@ end
 Base.@nospecializeinfer function _kernel_latest_source(@nospecialize(op::_KernelSourceOp))
     token, form = (typeof(op)::DataType).parameters
     f = _kernel_latest_source(getfield(op, :f))
-    tensor_f = _kernel_latest_source(getfield(op, :tensor_f))
     ignored_throws = _kernel_latest_source(getfield(op, :ignored_throws))
     call_identity = getfield(op, :call_identity)
-    T = _KernelSourceOp{token,form,typeof(f),typeof(tensor_f),typeof(ignored_throws),
-                        typeof(call_identity)}
-    _kernel_new_instance(T, (f, tensor_f, ignored_throws, call_identity))::_KernelSourceOp
+    T = _KernelSourceOp{token,form,typeof(f),typeof(ignored_throws),typeof(call_identity)}
+    _kernel_new_instance(T, (f, ignored_throws, call_identity))::_KernelSourceOp
 end
 function _kernel_latest_source(split::_KernelSplit)
     _KernelSplit(Val(_kernel_split_spec(split)),
@@ -6457,17 +6058,6 @@ Base.@nospecializeinfer function _kernel_latest_prepared(@nospecialize(kernel::P
                      getfield(kernel, :lowered_recipes);
                      exact_signature = _exact_signature(kernel))
 end
-
-# A prepared kernel is statically untraced. `Recipe.cse_key` provenance tuples
-# carry output `Type`s as data (authoring.jl `_kernel_provenance_key`), and
-# ReactantCore's `::Type` `is_traced` early-out covers only the 1-arg call
-# while the structural recursion is 2-arg, so walking a kernel reaches type
-# internals and throws `type DataType has no field var` (upstream ReactantCore
-# gap). Kernels are immutable compile-time metadata built before tracing and
-# never contain tracers; `@trace` still takes the traced path when a loop's
-# DATA operands are traced.
-ReactantCore.is_traced(::PreparedKernel) = false
-ReactantCore.is_traced(::PreparedKernel, ::Base.IdSet) = false
 
 # Partial evaluation deliberately stores hoisted values in the prepared
 # operation tuple so the public residual kernel has only its unbound HAVE
@@ -6763,91 +6353,16 @@ _externalize_bound_value(value::Union{Tuple,NamedTuple},
 # an opaque nested callback.
 _embedded_kernel(kernel::PreparedKernel) = kernel
 
-_batched_options(::_BatchedFunctionPair{I,B,R}) where {I,B,R} = (B, R)
-function _embedded_ast(kernel::PreparedKernel, tensorized::Bool)
-    tensorized || return kernel.ast
-    if kernel.f isa _BatchedFunctionPair
-        batched, reduce = _batched_options(kernel.f)
-        return _lower_batched_tensorized(
-            kernel.plan; batched = batched, reduce = reduce)
-    elseif kernel.f isa Union{_EmbeddedFunctionPair,
-                              _DynamicEmbeddedFunctionPair}
-        # The tensorized product may already contain arbitrarily nested plates
-        # and user AST passes. Preserve that exact prepared artifact instead of
-        # rebuilding from the native `kernel.ast`, which would silently restore
-        # scalar-indexing loops at the next composition level.
-        return kernel.f.tensorized_ast
-    end
-    kernel.ast
-end
-
-function _needs_embedded_tensorization(p::Plan)
+# Whether a plan owns a plate, a scan over live inputs, or an embedded kernel
+# that does. `prepare` then keeps its body in an `_ArrayFunction`, and its
+# lowering declares typed locals (`_declare_typed_output!`).
+function _owns_array_regions(p::Plan)
     any(p.recipes) do recipe
         recipe.op isa _AuthoredPlateOp && return true
         recipe.op isa _AuthoredScanOp && !isempty(p.have) && return true
         kernel = _embedded_kernel(recipe.op)
-        kernel !== nothing && kernel.f isa _ArrayFunctionPair
+        kernel !== nothing && kernel.f isa _ArrayFunction
     end
-end
-
-_array_marker_positions(::_ArrayFunctionPair) = ()
-_array_marker_positions(::_BatchedFunctionPair{I}) where {I} = (I,)
-_array_marker_positions(::_EmbeddedFunctionPair{I}) where {I} = (I,)
-_array_marker_positions(::_DynamicEmbeddedFunctionPair{I}) where {I} = I
-
-function _embedded_marker_candidates(p::Plan)
-    root_positions = Dict(
-        canon_id(p.graph, input.id) => position
-        for (position, input) in enumerate(p.have)
-    )
-    dependencies = _plate_dependencies(
-        p, Set(keys(root_positions))).values
-    candidates = Int[]
-    for recipe in p.recipes
-        positions = if recipe.op isa _AuthoredScanOp
-            # With the sequence bound, a traced carry/shared operand still
-            # selects the tensorized product through its runtime HAVE roots.
-            (2, 1, (3:length(recipe.inputs))...)
-        elseif recipe.op isa _AuthoredPlateOp
-            atomic = typeof(recipe.op).parameters[2]
-            Tuple(index for index in eachindex(recipe.inputs)
-                  if !(index in atomic))
-        else
-            kernel = _embedded_kernel(recipe.op)
-            kernel === nothing ? () : _array_marker_positions(kernel.f)
-        end
-        for position in positions
-            input = recipe.inputs[position]
-            roots = sort!(collect(get(
-                dependencies, canon_id(p.graph, input.id), Set{ValueId}()));
-                by = root -> root_positions[root])
-            for root in roots
-                position = root_positions[root]
-                position in candidates || push!(candidates, position)
-            end
-        end
-    end
-    if isempty(candidates)
-        # No non-atomic (axis-defining) plate operand traces back to an active
-        # HAVE port: every axis operand is bound (`bound=`), so the plate axis is
-        # a compile-time constant baked into both bodies (the native body derives
-        # its own axis; the tensorized body takes the marker-less axis fallback).
-        # Backend selection still needs a runtime marker, so admit every active
-        # HAVE port the static axis class does not PROVE scalar (`:not_axis`) —
-        # including a whole-vector `Ref`-captured parameter that is atomic for
-        # broadcasting yet remains a live array HAVE, and an untyped (`Any`)
-        # port whose live values are arrays. Only the marker TYPE is consulted
-        # (`_batched_call` dispatches native vs. tensorized on it), never its
-        # axis, so an admitted port can never be mistaken for the plate axis;
-        # the dynamic runtime selection skips scalar values. Only provably
-        # scalar live ports (e.g. `::Float64`) use the non-axis native sentinel;
-        # a traced scalar is detected separately at the call boundary.
-        for (position, input) in enumerate(p.have)
-            _static_plate_axis_class(valtype(input)) === :not_axis ||
-                push!(candidates, position)
-        end
-    end
-    Tuple(candidates)
 end
 
 """
@@ -6865,18 +6380,12 @@ end
 
 @inline function (k::ReplicatedKernel{B})(args...) where {B}
     length(args) == length(k.inputs) || throw(MethodError(k, args))
-    marker = _dynamic_tensorized_marker(args)
-    _replica_call(k, args, marker === nothing ? getfield(args, first(B)) : marker)
+    _replica_call(k, args)
 end
 
 inputs(k::ReplicatedKernel) = k.inputs
 outputs(k::ReplicatedKernel) = k.outputs
 code_expr(k::ReplicatedKernel) = code_expr(k.target)
-
-# Same statically-untraced contract as `PreparedKernel` above: the whole
-# object is captured by the `@trace` loop in `_replica_call`.
-ReactantCore.is_traced(::ReplicatedKernel) = false
-ReactantCore.is_traced(::ReplicatedKernel, ::Base.IdSet) = false
 
 function Base.show(io::IO, k::ReplicatedKernel{B}) where {B}
     names = Tuple(k.inputs[i].name for i in B)
@@ -6984,9 +6493,7 @@ replica axis.
 The scalar kernel remains the only mathematical definition. In particular,
 reductions inside it still reduce only their original dimensions, so a scalar
 `dot(q, q)` becomes one dot product per replica rather than a reduction across
-replicas. Native Julia evaluates scalar replicas and stacks their results;
-optional array-compiler extensions may lower the same map to a backend batch
-primitive.
+replicas. Native Julia evaluates scalar replicas and stacks their results.
 """
 replica(kernel::PreparedKernel; batched) = _replica(kernel, batched)
 
@@ -6996,8 +6503,7 @@ replica(kernel::PreparedKernel; batched) = _replica(kernel, batched)
 Native position-batched lowering for a straight-line scalar plan. Shared-only
 recipes are evaluated once above the position loop; recipes depending on a
 batched HAVE port execute once per position. The scalar `PreparedKernel` is
-retained as the mathematical authority and as the fallback for array-compiler
-batching.
+retained as the mathematical authority.
 """
 struct GraphReplicatedKernel{B,BT,OT,F,O,P,K,IN,OUT}
     target::K
@@ -7009,13 +6515,8 @@ struct GraphReplicatedKernel{B,BT,OT,F,O,P,K,IN,OUT}
     outputs::OUT
 end
 
-function _replicated_backend_call end
-
 @inline function (k::GraphReplicatedKernel{B})(args...) where {B}
     length(args) == length(k.inputs) || throw(MethodError(k, args))
-    if _dynamic_tensorized_marker(args) !== nothing
-        return _replicated_backend_call(k, args)
-    end
     k.native(k.ops, args...)
 end
 
@@ -7193,8 +6694,6 @@ Base.@nospecializeinfer Base.copy(@nospecialize(kernel::BorrowedBatchedKernel)) 
 
 @inline function (kernel::BorrowedBatchedKernel)(args::Vararg{Any,N}) where {N}
     length(args) == length(inputs(kernel)) || throw(MethodError(kernel, args))
-    _dynamic_tensorized_marker(args) === nothing || throw(ArgumentError(
-        "reuse=true borrows native output buffers; compile the owning batch instead"))
     for index in 1:length(outputs(kernel))
         # A caller may feed an earlier borrowed output into the next call.
         # Detach in that case so no input is modified through an output alias.
@@ -7254,7 +6753,7 @@ function _replica_native_outputs(results, ::Type{OT}) where {OT<:Tuple}
     end
 end
 
-function _replica_call(k::ReplicatedKernel{B,BT,OT}, args, marker) where {B,BT,OT}
+function _replica_call(k::ReplicatedKernel{B,BT,OT}, args) where {B,BT,OT}
     replica_count = _replicated_validate_axes(args, Val(B), BT)
     results = map(1:replica_count) do replica_index
         scalar_args = _replica_native_inputs(
@@ -7276,9 +6775,7 @@ end
 @inline function (k::PreparedKernel{F,O,IN,OUT,RR,S})(
         args::Vararg{Any,N}) where {F,O,IN,OUT,RR,S,N}
     N == fieldcount(IN) || throw(MethodError(k, args))
-    S === Nothing || args isa S ||
-        _dynamic_tensorized_marker(args) !== nothing ||
-        _prepared_argument_types_error(k, S, args)
+    S === Nothing || args isa S || _prepared_argument_types_error(k, S, args)
     _prepared_call(k, args, Val(N))
 end
 
@@ -7300,9 +6797,8 @@ end
 """
     _prepare_batched(p::Plan; batched, reduce = :+) -> PreparedKernel
 
-Internal constructor shared by public plate authoring and optional array
-compiler extensions.  It compiles both the allocation-free native loop and an
-eager tensorized body, then selects between them by the runtime array type.
+Internal constructor for public plate authoring. It compiles the
+allocation-free native loop.
 """
 function _prepare_batched(p::Plan; batched, reduce = :+)
     batched_names = Set{Symbol}(batched isa Symbol ? (batched,) : batched)
@@ -7311,17 +6807,10 @@ function _prepare_batched(p::Plan; batched, reduce = :+)
         "lower_batched: none of the have ports are batched (batched = $(sort(collect(batched_names))))"))
 
     native_ast = lower_batched(p; batched = batched, reduce = reduce)
-    tensorized_ast = _lower_batched_tensorized(p; batched = batched, reduce = reduce)
     native = compile(native_ast)
-    tensorized = compile(tensorized_ast)
-    batched_ports = Tuple(value.name for value in p.have
-                          if value.name in batched_names)
-    f = _BatchedFunctionPair{
-        input_index,batched_ports,reduce,typeof(native),typeof(tensorized)}(
-            native, tensorized)
     ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
-    _prepared_kernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast,
-                     Tuple(p.recipes))
+    _prepared_kernel(_ArrayFunction(native), ops, Tuple(p.have), Tuple(p.want), p,
+                     native_ast, Tuple(p.recipes))
 end
 
 # The optional MutatingFunctions extension uses one typed cache cell per
@@ -7489,9 +6978,9 @@ prepared afresh. A `Plan` is always prepared afresh.
 
 `exemplars = (x, ...)` opts into native type evidence from one value per
 remaining positional HAVE port. Native calls then require those exact input
-types; prepare another kernel for different types. The tensorized body keeps
-the declared port types, as does the native signature; only native plate
-lowering reads the exemplar evidence. Lengths and values are not baked into
+types; prepare another kernel for different types. The native signature keeps
+the declared port types; only plate lowering reads the exemplar evidence.
+Lengths and values are not baked into
 the program. A graph prepared with exemplars is compiled afresh.
 
 Selected authored plates with a single plate consumer are composed during
@@ -7547,33 +7036,6 @@ function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
     end
 end
 
-# The two backend products of one preparation reuse each nested cell's composed
-# plan (`_nested_cell_plan`); other intermediates they create independently can
-# carry fresh Value identities. Accept only a consistent renaming: source,
-# operations, order and all graph edges must still agree.
-function _same_readable_recipes(a, b)
-    length(a) == length(b) || return false
-    forward = Dict{ValueId,ValueId}()
-    backward = Dict{ValueId,ValueId}()
-    for (left, right) in zip(a, b)
-        for field in (:id, :op, :cost, :cse_key, :effectful, :source)
-            isequal(getfield(left, field), getfield(right, field)) || return false
-        end
-        for field in (:inputs, :outputs)
-            x, y = getfield(left, field), getfield(right, field)
-            length(x) == length(y) || return false
-            for (lv, rv) in zip(x, y)
-                lv.name == rv.name && valtype(lv) == valtype(rv) || return false
-                get(forward, lv.id, rv.id) == rv.id || return false
-                get(backward, rv.id, lv.id) == lv.id || return false
-                forward[lv.id] = rv.id
-                backward[rv.id] = lv.id
-            end
-        end
-    end
-    true
-end
-
 # `prepare` without the type-stability check, for a program RK runs once while
 # it prepares another (the data-only prefix of a bound preparation): its values
 # feed the checked program as bound data of their runtime types.
@@ -7602,44 +7064,15 @@ function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing,
     end
     lowered_plan = _lowering_plan(p)
     exact_signature = exemplar_types === nothing ? Nothing : Tuple{exemplar_types...}
-    embedded = _needs_embedded_tensorization(p)
-    (native_ast, ops, recipes), tensorized_lowering = _sharing_cell_plans() do
-        native_lowering = _lower_with_ops(lowered_plan; exemplar_types)
-        embedded || return (native_lowering, nothing)
-        (native_lowering, _lower_with_ops(lowered_plan; tensorized = true))
+    native_ast, ops, recipes = _sharing_cell_plans() do
+        _lower_with_ops(lowered_plan; exemplar_types)
     end
     isempty(passes) || (native_ast = transform(native_ast, passes...))
-    embedded || return _prepare(p, native_ast, ops, recipes; exact_signature)
+    _owns_array_regions(p) || return _prepare(p, native_ast, ops, recipes; exact_signature)
 
-    tensorized_ast, tensorized_ops, tensorized_recipes = tensorized_lowering
-    # Both lowerings store the same operation objects, so `===` settles it
-    # without compiling `==` for every operation type (once per program).
-    tensorized_ops === ops || tensorized_ops == ops || throw(ArgumentError(
-        "embedded native and tensorized kernels produced different operation tables"))
-    _same_readable_recipes(tensorized_recipes, recipes) || throw(ArgumentError(
-        "embedded native and tensorized kernels produced different readable recipes"))
-    isempty(passes) ||
-        (tensorized_ast = transform(tensorized_ast, passes...))
     native = compile(native_ast)
-    tensorized = compile(tensorized_ast)
-    candidates = _embedded_marker_candidates(p)
-    # Every axis may be bound while the remaining HAVE ports are scalars.
-    # The dynamic pair selects native execution with its non-axis sentinel,
-    # and a traced scalar still selects the tensor product at call time.
-    typed_candidate = findfirst(
-        index -> valtype(p.have[index]) <: AbstractArray, candidates)
-    f = if typed_candidate === nothing
-        _DynamicEmbeddedFunctionPair{
-            candidates,typeof(native),typeof(tensorized),typeof(tensorized_ast)}(
-                native, tensorized, tensorized_ast)
-    else
-        input_index = candidates[typed_candidate]
-        _EmbeddedFunctionPair{
-            input_index,typeof(native),typeof(tensorized),typeof(tensorized_ast)}(
-                native, tensorized, tensorized_ast)
-    end
-    _prepared_kernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast,
-        recipes; exact_signature)
+    _prepared_kernel(_ArrayFunction(native), ops, Tuple(p.have), Tuple(p.want), p,
+        native_ast, recipes; exact_signature)
 end
 
 function prepare(g::Graph; have = (), want = (), passes = (), bound = (),

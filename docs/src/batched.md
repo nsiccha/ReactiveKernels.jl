@@ -46,10 +46,9 @@ or passed as a `Ref` operand (see [Plate-cell scope](#Plate-cell-scope)).
 
 Whole parameter arrays can remain atomic when observation data is bound. A
 kernel prepared with `bound = (; x, y)` may keep `q` as its only input and read
-`q` in each plate cell as a closure. The same prepared kernel accepts
-Reactant-traced `q`:
-every cell receives the complete parameter array, while the observation
-operands determine the broadcast axes and singleton expansion.
+`q` in each plate cell as a closure: every cell receives the complete
+parameter array, while the observation operands determine the broadcast axes
+and singleton expansion.
 
 Arguments may be transparent derived expressions, not only named ports. For
 example, `plate(eachcol(logits), y) do column, observed ... end` materializes
@@ -203,23 +202,8 @@ iterated over `eachindex` of the doses:
 sum(w[j] * get(u, lag(t, p, j), 0.0) for j in eachindex(w); init = 0.0)
 ```
 
-Natively `lag` is the method as written. Under a tracing backend the sum is
-one retained loop whose index is traced, and `@traceable` gives the helper the
-same lowering of `p.shifts[j]` and `row[j]` that the term gets, so the program
-is the one the inline spelling emits for either plan. An ordinary helper
-cannot read at a traced index (`Scalar indexing is disallowed`).
-
-`@traceable` is shorthand for a `ReactiveKernels.traced` method, the
-implementation a kernel calls in place of the helper when a tracing backend
-compiles it. Write that method by hand when the two should differ: a
-hand-tuned in-place superposition loop stays the native method, and its traced
-method calls a prepared plate kernel with the cell above.
-
-```julia
-superpose(plan, units, weights) = ...        # in-place loop, native only
-ReactiveKernels.traced(::typeof(superpose), plan, units, weights) =
-    SUPERPOSITION_CELL(plan, units, weights) # a prepared kernel
-```
+`lag` is the method as written; `@traceable` also records its source, so
+[`jax_source`](jax.md) translates the helper with the cell.
 
 Purity is the plate contract, just as it is for ordinary stateless RK recipes.
 RK does not inspect an opaque Julia callable to prove its implementation pure;
@@ -231,17 +215,16 @@ plate. Work with observable effects belongs outside `plate`.
 
 The checked-in Normal receipt compares the authored return-only kernel with the
 established `plate(normal.logpdf; ...)` reduction in the same process, rounds,
-and data. Its native and Reactant panels now live under
-[Distribution kernels through Reactant](distributions-reactant.md#batched-authored-graph-parity),
+and data. That receipt was measured while RK still had a Reactant path; its
+native and Reactant panels are kept as recorded under
+[Distribution kernels through Reactant (historical receipt)](distributions-reactant.md#batched-authored-graph-parity),
 keeping this page as the one executable source authority for the authored graph.
 
 The native hard gate requires the authored path to stay within 10% of the
 established plate path for every `N ≥ 1,000`; `N = 1` is reported but excluded
 from that ratio gate because timer quantization dominates such a short call.
 Return-only authored execution must remain zero-byte and zero-allocation at all
-six sizes. Before timing, the harness also rejects a native `similar` output or
-a Reactant lowering that is not a tensorized broadcast chain consumed by
-`sum`.
+six sizes. Before timing, the harness also rejects a native `similar` output.
 
 ## Reproduce the receipt
 
@@ -251,11 +234,13 @@ From the repository root:
 julia --startup-file=no --project=benchmark/distributions \
   benchmark/distributions/setup.jl
 julia --startup-file=no --project=benchmark/distributions \
-  benchmark/distributions_comparison.jl \
-  --output=benchmark/receipts/distribution-logdensity-v1.toml
-julia --startup-file=no benchmark/receipts/validate_distributions.jl \
-  benchmark/receipts/distribution-logdensity-v1.toml
+  benchmark/distributions_comparison.jl --output=distribution-logdensity-v2.toml
 ```
+
+The script now writes a `distribution-logdensity-v2` receipt with native cells
+only. The checked-in v1 receipt behind the historical page also carries Reactant
+cells measured with the removed Reactant path;
+`benchmark/receipts/validate_distributions.jl` validates it.
 
 For a reusable pointwise output buffer, the optional MutatingFunctions
 integration prepares the pointwise extraction non-allocatingly. The focused

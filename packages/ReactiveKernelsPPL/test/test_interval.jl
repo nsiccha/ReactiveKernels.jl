@@ -1,9 +1,7 @@
 # Interval-censored response (`interval_censored.(dist, hi)` evidence kind;
 # the response IS the lower endpoint): surface admission (Gaussian/Poisson
 # × literal/column upper, fused head, weighted composition), value parity
-# vs Distributions.jl hand oracles, Enzyme-vs-findiff gradients,
-# Reactant/XLA value+grad on the Gaussian cell and the pinned upstream
-# Poisson-XLA gap (both in test_interval_reactant.jl), and the I1/I2
+# vs Distributions.jl hand oracles, Enzyme-vs-findiff gradients, and the I1/I2
 # SB-parity probes
 # (N=80, Xoshiro recipes, vectors inlined so the test is immune to
 # RNG/Distributions drift; SB literals from the peer lane's BridgeStan

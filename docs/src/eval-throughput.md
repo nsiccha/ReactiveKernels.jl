@@ -1,4 +1,9 @@
-# Evaluation latency and batched throughput vs Turing.jl
+# Evaluation latency and batched throughput vs Turing.jl (historical receipt)
+
+> **Historical receipt.** ReactiveKernels no longer has a Reactant path: its
+> Reactant extension, tensorized lowering and Reactant tests were removed. This
+> page keeps the measurements as recorded. Nothing on it runs Reactant, and the
+> RK functions and test files it names no longer exist.
 
 This page compares **evaluation** throughput — how fast a log density is
 evaluated, differentiated, and turned into a generated quantity — between a
@@ -26,14 +31,6 @@ DifferentiationInterface on both sides; the benchmark asserts that the Enzyme
 backend is actually the one exercised (a correct gradient alone does not prove
 which backend produced it). Reactant device transfers and compilation happen
 outside the timed region; only the compiled call is timed, synchronously.
-
-## Reactant support
-
-ReactiveKernels lowers a log density to a straight-line array program, so
-Reactant can `@compile` the primal and the generated quantities and Enzyme can
-differentiate it under Reactant. Turing's DynamicPPL evaluation re-runs the model
-rather than being a straight-line array program, so it is **not
-Reactant-traceable**; those cells are reported unsupported rather than faked.
 
 ## Results
 
@@ -113,14 +110,19 @@ the transition or sampler loop that contains the repeated evaluations, as in
 
 ## Reproduce
 
+The receipt above is v1 and records the removed Reactant path's cells. It was
+generated in a fresh, pinned environment (Reactant 0.2.289, Turing 0.47.1,
+DynamicPPL 0.42.6, Enzyme 0.13.199, DifferentiationInterface 0.7.21) that never
+entered ReactiveKernels' root dependencies, and
+`benchmark/receipts/validate_eval_throughput.jl` still validates it.
+
+The current script measures the native and Turing cells only and writes an
+`eval-throughput-v2` receipt:
+
 ```julia
 julia --startup-file=no benchmark/eval_throughput_comparison.jl \
-  --output=benchmark/receipts/eval-throughput-v1.toml
-julia --startup-file=no benchmark/receipts/validate_eval_throughput.jl \
-  benchmark/receipts/eval-throughput-v1.toml
+  --output=eval-throughput-v2.toml
 ```
 
-The script provisions a fresh, pinned environment (Reactant 0.2.289, Turing
-0.47.1, DynamicPPL 0.42.6, Enzyme 0.13.199, DifferentiationInterface 0.7.21) that
-never enters ReactiveKernels' root dependencies. A quick smoke run:
-`RK_EVAL_SIZES=16,64 RK_EVAL_ROUNDS=20 RK_EVAL_REPLICAS=8 julia --startup-file=no benchmark/eval_throughput_comparison.jl`.
+A quick smoke run:
+`RK_EVAL_SIZES=16,64 RK_EVAL_ROUNDS=20 julia --startup-file=no benchmark/eval_throughput_comparison.jl`.

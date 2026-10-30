@@ -97,8 +97,7 @@ end
             Base.invokelatest(_adg_native, fx, u)
             @test fx.cols == before
             # The graph has a fixed number of statements as bound level
-            # and observation counts grow; compiled regions are checked
-            # separately by test_array_definition_gathers_reactant.jl.
+            # and observation counts grow.
             push!(structures, length(fx.built.spec.graph.recipes))
         end
         @test structures[1] == structures[2]

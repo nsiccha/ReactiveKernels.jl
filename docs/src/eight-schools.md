@@ -143,7 +143,8 @@ The fixed-data form is the public partial-evaluation path (`bound =
 unconstrained vector to the full joint, and all ten headline cells must work.
 Nonallocating AD and nonallocating Reactant are deliberately absent because
 those public kernel types do not compose yet; the suite validators reject any
-receipt that silently invents such a surface.
+receipt that silently invents such a surface. ReactiveKernels has since removed
+its Reactant path; the Reactant configurations' receipts stay as recorded.
 
 The receipt prepares the exact authored graph above from three useful
 starting boundaries and asks for four model outcomes. `Packed unconstrained`

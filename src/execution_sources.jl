@@ -63,12 +63,11 @@ _execution_runtime(f::_PrecompileWarmFunction) =
 _execution_source(op::_KernelSourceOp{nothing}) = op
 Base.@nospecializeinfer function _execution_source(@nospecialize(op::_KernelSourceOp))
     f = _execution_source(getfield(op, :f))
-    tensor = _execution_source(getfield(op, :tensor_f))
     ignored = _execution_source(getfield(op, :ignored_throws))
     identity = getfield(op, :call_identity)
     form = (typeof(op)::DataType).parameters[2]
-    T = _KernelSourceOp{nothing,form,typeof(f),typeof(tensor),typeof(ignored),typeof(identity)}
-    _kernel_new_instance(T, (f, tensor, ignored, identity))
+    T = _KernelSourceOp{nothing,form,typeof(f),typeof(ignored),typeof(identity)}
+    _kernel_new_instance(T, (f, ignored, identity))
 end
 
 Base.@nospecializeinfer function _execution_source(@nospecialize(split::_KernelSplit))

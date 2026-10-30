@@ -26,7 +26,7 @@ _pathfinder_matrix(rows) = reduce(vcat, permutedims(Float64.(row)) for row in ro
               Set((:single_path_pathfinder, :pathfinder_jl_compact_lbfgs))
         for candidate_entry in values(entries)
             @test propertynames(candidate_entry) == PathfinderExternalCorpus.ENTRY_FIELDS
-            @test candidate_entry.minimum_acceptance === :native_and_reactant
+            @test candidate_entry.minimum_acceptance === :native
             @test all(path -> isfile(joinpath(@__DIR__, "..", path)),
                       candidate_entry.current_reactive_sources)
             @test candidate_entry.oracle.execution === :separate_python_process

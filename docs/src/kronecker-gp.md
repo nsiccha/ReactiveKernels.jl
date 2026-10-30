@@ -51,10 +51,10 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
 )
 ```
 
-## Automatic differentiation and Reactant boundaries
+## Automatic differentiation boundary
 
-This page owns the model's native-Enzyme and Reactant support boundary
-explicitly (the same per-model disclosure policy as the GP pages):
+This page owns the model's native-Enzyme support boundary explicitly (the same
+per-model disclosure policy as the GP pages):
 
 - **Native value** — hard-asserted against the reference `.stan` via BridgeStan
   (`propto = false`, `jacobian = true`) on multiple reference-valid probes.
@@ -62,13 +62,6 @@ explicitly (the same per-model disclosure policy as the GP pages):
   the graph containing two dense symmetric eigendecompositions; per-axis
   support is recorded by the structured gate with the complete diagnostic
   retained for any unsupported axis.
-- **Reactant axes** — the all-bound and traced-stream compiled queries, and
-  the Reactant-compiled gradient, are measured per axis in the isolated
-  Reactant phase of `benchmark/structured_gate.jl`. Because dense symmetric
-  eigendecomposition lowering through Reactant/EnzymeMLIR is not established
-  at this pin, this model's Reactant axes run in measured mode: each axis is
-  recorded as PASS or UNSUPPORTED with its complete retained diagnostic —
-  never asserted in advance and never silently skipped.
 
 Run the walkthrough from the repository root:
 

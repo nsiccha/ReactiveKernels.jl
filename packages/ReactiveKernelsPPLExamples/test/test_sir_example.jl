@@ -58,9 +58,6 @@ function _sir_reference(q)
 end
 
 @testset "PPL graph — sir (posteriordb adaptive RK45)" begin
-    modules_before = Set(String(id.name) for id in keys(Base.loaded_modules))
-    @test !("Reactant" in modules_before)
-
     artifact = evaluate_sir_source()
     @test artifact.source == strip(SIR_SOURCE, '\n')
     @test artifact.output == Base.invokelatest(artifact.kernel, artifact.inputs.q)
@@ -115,8 +112,4 @@ end
         bound = (; t = SIR_T, y0 = SIR_Y0, stoi_hat = SIR_STOI_HAT,
                  B_hat = SIR_B_HAT))(q)
     @test template_value == full_value
-
-    modules_after = Set(String(id.name) for id in keys(Base.loaded_modules))
-    @test issubset(modules_before, modules_after)
-    @test !("Reactant" in modules_after)
 end

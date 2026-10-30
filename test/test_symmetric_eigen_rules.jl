@@ -6,8 +6,7 @@
 # reverse Enzyme through `eigen(::Symmetric)` fails
 # (`EnzymeNoDerivativeError` on the LAPACK `syevr!` `ccall`), so these rules
 # are the native-execution replacement path for general eigendecomposition
-# calls; no Reactant custom rule is emitted (no release
-# carries the upstream mechanism), so no XLA assertions here by design.
+# calls.
 using DifferentiationInterface: AutoEnzyme, gradient
 import Enzyme
 using Enzyme: Const, Duplicated, Forward

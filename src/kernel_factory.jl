@@ -996,7 +996,7 @@ function _plan_superset_from_key(Key)
 end
 # The HAVE canons (caller-supplied sources) = entry_current minus the producer-map keys, in entry_current order.
 _plan_have_from_key(Key) = (prodk = Set{Int}(c for (c, _) in Key[4]); Int[c for c in Key[8] if !(c in prodk)])
-# The Form param of a `_KernelSourceOp{DefToken,Form,F,TF}` op type (`:portcall` / `:fused`).
+# The Form param of a `_KernelSourceOp{DefToken,Form,F}` op type (`:portcall` / `:fused`).
 _sourceop_form_type(::Type{<:_KernelSourceOp{DefToken,Form}}) where {DefToken,Form} = Form
 # The identity-kept EXTERNAL canonical ids. Real plans capture these selection-independently from ALL
 # backward-reachable `:portcall` candidates in Key[9], so an unselected alternative callable (pot_f)

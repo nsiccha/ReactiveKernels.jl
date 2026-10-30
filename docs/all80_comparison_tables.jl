@@ -9,7 +9,8 @@ import TOML
 
 # The aggregated all80-benchmark-v1 receipt (native phase ∪ Reactant phase). The
 # native-only frozen checkpoint (all80-native-checkpoint-v1.toml) remains committed as
-# historical provenance; this page renders the aggregate so the Reactant cells appear.
+# historical provenance; this page renders the aggregate so the Reactant cells appear,
+# labelled as measured with RK's since-removed Reactant path.
 const _ALL80_BENCHMARK_PATH = joinpath(
     dirname(@__DIR__), "benchmark", "receipts", "all80-benchmark-v1.toml")
 
@@ -59,13 +60,14 @@ function all80_primal_table(models; id = "all80-primal",
              "primal_opt_stan", "primal_further_turing"]
     cols = (_column(:model, "Model"),
             _all80_num(:primal_rk, "idiomatic RK"),
-            _all80_num(:primal_rk_reactant, "RK + Reactant"),
+            _all80_num(:primal_rk_reactant, "RK + Reactant ($_REMOVED_REACTANT_LABEL)"),
             _all80_num(:primal_turing, "upstream Turing"),
             _all80_num(:primal_stan, "reference Stan"),
             _all80_num(:primal_opt_stan, "optimized Stan"),
             _all80_num(:primal_further_turing, "further Turing"),
             _column(:note, "Structural difference"))
-    _result_table(_all80_rows(models, cells), cols; id, title, note)
+    _result_table(_all80_rows(models, cells), cols; id, title,
+        note = note * " " * _REMOVED_REACTANT_NOTE)
 end
 
 function all80_gradient_table(models; id = "all80-gradient",
@@ -75,13 +77,14 @@ function all80_gradient_table(models; id = "all80-gradient",
              "gradient_opt_stan", "gradient_further_turing"]
     cols = (_column(:model, "Model"),
             _all80_num(:gradient_rk, "idiomatic RK"),
-            _all80_num(:gradient_rk_reactant, "RK + Reactant"),
+            _all80_num(:gradient_rk_reactant, "RK + Reactant ($_REMOVED_REACTANT_LABEL)"),
             _all80_num(:gradient_turing, "upstream Turing"),
             _all80_num(:gradient_stan, "reference Stan"),
             _all80_num(:gradient_opt_stan, "optimized Stan"),
             _all80_num(:gradient_further_turing, "further Turing"),
             _column(:note, "Structural difference"))
-    _result_table(_all80_rows(models, cells), cols; id, title, note)
+    _result_table(_all80_rows(models, cells), cols; id, title,
+        note = note * " " * _REMOVED_REACTANT_NOTE)
 end
 
 function all80_hmc_table(models; id = "all80-hmc",
@@ -90,10 +93,11 @@ function all80_hmc_table(models; id = "all80-hmc",
     cells = ["hmc_rk_native", "hmc_rk_reactant", "hmc_ahmc_turing"]
     cols = (_column(:model, "Model"),
             _all80_hmc(:hmc_rk_native, "RK native"),
-            _all80_hmc(:hmc_rk_reactant, "RK + Reactant"),
+            _all80_hmc(:hmc_rk_reactant, "RK + Reactant ($_REMOVED_REACTANT_LABEL)"),
             _all80_hmc(:hmc_ahmc_turing, "AHMC + Turing"),
             _column(:note, "Structural difference"))
-    _result_table(_all80_rows(models, cells), cols; id, title, note)
+    _result_table(_all80_rows(models, cells), cols; id, title,
+        note = note * " " * _REMOVED_REACTANT_NOTE)
 end
 
 """Render all three all-82 comparison tables from a receipt file (or a parsed

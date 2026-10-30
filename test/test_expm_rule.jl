@@ -3,8 +3,7 @@
 # pure-math graph `rk_expm_rule`, and the Enzyme adapter in ReactiveKernels'
 # own extension reads them from that graph's cuts. Ordinary reverse Enzyme
 # through `LinearAlgebra.exp` fails (`EnzymeNoDerivativeError` on the LAPACK
-# `ccall`); no Reactant custom rule is emitted (no release
-# carries the upstream mechanism), so no XLA assertions here by design.
+# `ccall`).
 using DifferentiationInterface: AutoEnzyme, gradient
 import Enzyme
 using Enzyme: Const, Duplicated, Forward

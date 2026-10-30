@@ -71,10 +71,8 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     # This is the NATURAL authoring, expressed with the `scan` primitive: the
     # carry threads (y_{t-1}, err_{t-1}), seeded (μ, 0) so the unified step
     #   νₜ = μ + φ·carry.y_prev + θ·carry.err_prev
-    # reproduces ν₁ = μ + φ·μ at t = 1 (y₀ ≡ μ, err₀ ≡ 0). `scan` lowers this
-    # sequential recurrence to a `stablehlo.while` carry loop — so unlike the raw
-    # `for`/`err[t-1]` authoring (forbidden scalar indexing of a traced array),
-    # this natural form DOES lower through Reactant. The likelihood/density reduce
+    # reproduces ν₁ = μ + φ·μ at t = 1 (y₀ ≡ μ, err₀ ≡ 0). `scan` keeps this
+    # sequential recurrence one retained carry loop. The likelihood/density reduce
     # it directly; `errors_closed` below is an independent vectorized cross-check.
     errors::Vector{Float64} =
         scan(series; init = (; y_prev = μ, err_prev = 0.0)) do carry, y
@@ -88,7 +86,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     # The recurrence errₜ = aₜ − θ·err_{t-1} (with aₜ = yₜ − μ − φ·y_{t-1}) is
     # linear, so errₜ = Σ_{k≤t} (−θ)^{t−k} aₖ — a lower-triangular Toeplitz matvec
     # err = L·a. It uses only vectorized ops (slice, vcat, broadcast, a `.>=`
-    # comparison mask, matmul), and also lowers through Reactant.
+    # comparison mask, matmul).
     errors_closed::Vector{Float64} = let
         T = length(series)
         y_lag = vcat(μ, series[1:(T - 1)])                  # y_{t-1}, with y₀ ≡ μ
@@ -109,8 +107,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, cauc
     prior::Float64 = μ_prior + φ_prior + θ_prior + σ_prior
 
     # One authored likelihood plate over the latent errors: errₜ ~ Normal(0, σ).
-    # It reduces the NATURAL sequential `errors` (the `scan` form), so the whole
-    # density compiles through Reactant off the natural recursion; the scalar σ
+    # It reduces the NATURAL sequential `errors` (the `scan` form); the scalar σ
     # broadcasts across the error vector.
     pointwise = plate(errors, σ) do e, s
         normal(0.0, s).logpdf(e)
@@ -182,10 +179,9 @@ Build the posteriordb ARMA(1, 1) model as a declarative
 `ReactiveKernels.KernelSpec`. The latent one-step errors are computed by a
 sequential recursion authored inline with the `scan` primitive and exposed as
 their own port, so a query can ask for just the errors, the full density, or the
-one-step forecast. `scan` lowers the recurrence to a `stablehlo.while` carry
-loop, so the likelihood/density reduce the natural sequential `errors` directly
-and the whole density lowers through Reactant; a vectorized closed-form
-equivalent (`errors_closed`) is kept as an independent numerical cross-check. The Normal and Cauchy endpoints are reused from
+one-step forecast. `scan` keeps the recurrence one retained carry loop, and
+the likelihood/density reduce the natural sequential `errors` directly; a
+vectorized closed-form equivalent (`errors_closed`) is kept as an independent numerical cross-check. The Normal and Cauchy endpoints are reused from
 `ReactiveKernelsDistributionKernels`; the half-Cauchy prior on `σ` folds the
 Cauchy endpoint with the `log(2)` truncation constant. The support transform +
 Jacobian, prior, pointwise log-likelihood, likelihood reduction, and total

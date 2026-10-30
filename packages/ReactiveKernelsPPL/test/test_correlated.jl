@@ -1,9 +1,5 @@
 # Correlated outcomes: joint MvNormalCholesky responses over an LKJ
 # covariance factor with explicitly declared scale and LKJCholesky priors.
-# Native axes only (the exact-GP precedent): Reactant primal of this emission
-# shape is verified in scratch, and the Reactant-compiled gradient axis is
-# upstream-blocked (no `stablehlo.triangular_solve` adjoint — recorded in
-# the generator, not pinned here).
 
 using LinearAlgebra: Diagonal
 using Distributions: MvNormal, Normal, Exponential, logpdf

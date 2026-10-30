@@ -77,10 +77,7 @@ end
                    isequal(got[2][i], expected[i][2]), eachindex(seeds))
     @test (xs, seeds) == saved
     native = ReactiveKernels._lower_with_ops(fused.plan)
-    tensorized = ReactiveKernels._lower_with_ops(fused.plan; tensorized=true)
-    @test native[2] == tensorized[2]
-    @test native[3] == tensorized[3]
-    @test compile(tensorized[1])(tensorized[2], xs, 2.0) == fused(xs, 2.0)
+    @test compile(native[1])(native[2], xs, 2.0) == fused(xs, 2.0)
     for n in (0, 17, 1024)
         xs = fill(-0.001, n)
         fused(xs, 2.0)

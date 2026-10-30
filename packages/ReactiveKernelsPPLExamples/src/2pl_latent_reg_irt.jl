@@ -85,7 +85,7 @@ end
 # Constant I×(I-1) design that maps the free difficulties to the sum-to-zero
 # vector: beta = S · beta_free = [beta_free; −Σ beta_free]. Built from the bound
 # item count I (folded by partial eval), so the sum-to-zero constraint is a plain
-# constant-matrix multiply — no scalar array writes, so it lowers under Reactant.
+# constant-matrix multiply with no scalar array writes.
 function _sum_to_zero_design(I)
     S = zeros(I, I - 1)
     for k in 1:(I - 1)
@@ -115,7 +115,7 @@ end
     log_jacobian::Float64 = sum(u_alpha)
 
     # Transformed parameter: sum-to-zero difficulties beta = S · beta_free =
-    # [beta_free; −Σβ_free], via a folded constant design (Reactant-lowerable).
+    # [beta_free; −Σβ_free], via a folded constant design.
     S::Matrix{Float64} = _sum_to_zero_design(I)
     beta::Vector{Float64} = S * beta_free
 

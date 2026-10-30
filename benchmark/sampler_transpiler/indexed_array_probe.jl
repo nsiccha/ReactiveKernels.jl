@@ -51,19 +51,3 @@ let rejected=false
     rejected || error("custom range was trusted for bounds elimination")
 end
 println("native_fixed_index_reads=true invalid_bounds_rejected=true")
-
-using Reactant
-const TSC=Base.get_extension(RK,:ReactiveKernelsReactantExt).TracedSlotCompiler
-function check_traced_index(program)
-    call=TSC.TracedSlotCall(program.f,program.metadata)
-    driver=(state,seed,counts)->call(deepcopy(state),copy(seed),deepcopy(counts))
-    inputs=(Reactant.to_rarray(deepcopy(program.state);track_numbers=true),
-        Reactant.to_rarray(UInt64[91,77]),Reactant.to_rarray((0,0);track_numbers=true))
-    compiled=Reactant.compile(driver,inputs;sync=true,donated_args=:none)
-    result=compiled(inputs...)
-    Float64(only(result.state.values))==10.0 || error("traced indexed source result")
-    Float64(only(inputs[1].values))==0.0 || error("caller state changed")
-    println("traced_fixed_index_reads=true caller_state_preserved=true")
-end
-const PROGRAM=TSC.compile_traced_slots(prepare_array_sum(4:-1:1))
-Base.invokelatest(check_traced_index,PROGRAM)

@@ -83,10 +83,9 @@ using LogExpFunctions: logistic, log1pexp
 
     # Hierarchical integer-array GATHER, done OUTSIDE any plate: the per-county
     # intercept is gathered by the concrete data index into a length-N mean
-    # vector (`mu_n = alpha[county_idx[n]]`). A traced integer index does not
-    # lower, so the docs_example binds `county_idx` at preparation; then the
-    # gather traces as a concrete gather and the Reactant path sees only the
-    # float inputs + the parameter vector. This is the named transformed
+    # vector (`mu_n = alpha[county_idx[n]]`). The docs_example binds
+    # `county_idx` at preparation; then the gather reads a concrete index and
+    # the prepared kernel takes only the float inputs + the parameter vector. This is the named transformed
     # parameter / generated-quantity node.
     mu = alpha[county_idx]
 
@@ -110,8 +109,8 @@ county_idx = RADON_PP_COUNTY
 log_radon = RADON_PP_LOG
 
 requested_nodes = (:parameters, :log_jacobian, :prior, :likelihood, :posterior)
-# Bind the integer gather index so `a.inputs` excludes it and the Reactant path
-# traces only the float inputs + the parameter vector (spec addendum).
+# Bind the integer gather index so `a.inputs` excludes it and the prepared kernel
+# takes only the float inputs + the parameter vector (spec addendum).
 density_kernel = prepare(model;
     have = (:unconstrained, :county_idx, :log_radon),
     want = requested_nodes,

@@ -2,8 +2,7 @@
 #
 # Motivation: the DynamicPPL posteriordb benchmark reports Turing/Stan ratios
 # against the NAIVE posteriordb reference Stan. Here every side is optimized and
-# ReactiveKernels is added: RK @kernel (one authored graph, lowers to native +
-# Reactant) vs Stan (naive loop / vectorized / fused-GLM where it exists) vs
+# ReactiveKernels is added: RK @kernel (one authored graph) vs Stan (naive loop / vectorized / fused-GLM where it exists) vs
 # optimized Turing (the posteriordb-style translation). Weak-normal unbounded
 # priors replace posteriordb's bounded uniforms so the likelihood dominates the
 # timing; parity is gated against an independent finite-difference oracle.

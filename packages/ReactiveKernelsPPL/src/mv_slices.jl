@@ -81,9 +81,8 @@ end
 
 # ── multivariate normal slices ───────────────────────────────────────
 
-# Forward substitution across every slice at once. Keep the margin axis
-# leading so a traced row read/write uses the retained loop's storage layout.
-# Unsolved rows of Z are zero; the full row product therefore sums exactly
+# Forward substitution across every slice at once, with the margin axis
+# leading. Unsolved rows of Z are zero; the full row product therefore sums exactly
 # the already solved margins. No body is duplicated for either data axis.
 # X and F remain read-only; Z is fresh and local until construction finishes.
 @traceable function _lower_solve_rows_logpdf(X, F, logdet)
@@ -101,12 +100,10 @@ end
     end
 end
 
-# Native forward substitution over `Float64` storage. The row form above
-# is what tracing retains as one loop body; natively it allocates five
-# temporaries per margin. Here every slice solves into one fresh buffer,
-# `Z[i, g] = (X[g, i] - Σ_{j<i} F[i, j] Z[j, g]) / F[i, i]`, each entry
-# written once, so native reverse records no overwritten storage. Tracing
-# never selects this method: `traced` keeps the authored generic body.
+# Forward substitution over `Float64` storage. The generic row form above
+# allocates five temporaries per margin. Here every slice solves into one
+# fresh buffer, `Z[i, g] = (X[g, i] - Σ_{j<i} F[i, j] Z[j, g]) / F[i, i]`,
+# each entry written once, so native reverse records no overwritten storage.
 function _lower_solve_rows_logpdf(X::AbstractMatrix{Float64},
         F::AbstractMatrix{Float64}, logdet::Float64)
     groups, k = size(X)
@@ -192,11 +189,10 @@ end
     return F
 end
 
-# The same factor over native `Float64` storage, column by column
-# (Cholesky–Crout), with the triangular bounds the traced form above
-# replaces by guarded full-length loops: `k³/3` multiply-adds instead of
-# `k³` branches, each entry written once. Checks and messages are the
-# traced form's; tracing never selects this method.
+# The same factor over `Float64` storage, column by column (Cholesky–Crout),
+# with the triangular bounds the generic form above replaces by guarded
+# full-length loops: `k³/3` multiply-adds instead of `k³` branches, each
+# entry written once. Checks and messages are the generic form's.
 function _covariance_cholesky(Sigma::AbstractMatrix{Float64}, k)
     size(Sigma) == (k, k) || throw(DimensionMismatch("MvNormal slices " *
         "have length $k, but the covariance has size $(size(Sigma))"))
@@ -345,11 +341,8 @@ function _ordered_normal_slices_logpdf(o, B, m, s)
 end
 
 # Querying a broadcast of joint slice draws keeps one log density per
-# slice. Whole-vector draws remain scalar in the query emitter. These
-# native multivariate-normal helpers retain the existing compiled refusal.
+# slice. Whole-vector draws remain scalar in the query emitter.
 function _mvnormal_cholesky_slices_pointwise(o, B, mu, F)
-    ReactiveKernels._dynamic_tensorized_marker((B, mu, F)) === nothing ||
-        throw(ArgumentError("MvNormalCholesky slice priors support native execution only"))
     groups, k = _slice_count(o, B), _slice_length(o, B)
     _check_slice_vector_arg("the MvNormalCholesky mean", mu, groups, k)
     logdet = _cholesky_factor_logdet(F, k)
@@ -363,8 +356,6 @@ function _mvnormal_cholesky_slices_pointwise(o, B, mu, F)
 end
 
 function _mvnormal_slices_pointwise(o, B, mu, Sigma)
-    ReactiveKernels._dynamic_tensorized_marker((B, mu, Sigma)) === nothing ||
-        throw(ArgumentError("MvNormal slice priors support native execution only"))
     return _mvnormal_cholesky_slices_pointwise(o, B, mu,
         _covariance_cholesky(Sigma, _slice_length(o, B)))
 end
@@ -408,9 +399,7 @@ _ordered_slices_unconstrain(::_SliceCols, X) =
 # value and the log-Jacobian. The constant leading column of `lr` and
 # trailing column of the value are built from `U` (`0.0 .* U[:, 1:1]`),
 # never as a host array, so the transform is broadcasts and reductions
-# over `U` alone and traces under Reactant (a host column concatenated
-# with a traced one falls back to scalar indexing). `U` is finite, so the
-# column is exactly zero. A one-entry simplex (K = 1, no coordinates) is
+# over `U` alone. `U` is finite, so the column is exactly zero. A one-entry simplex (K = 1, no coordinates) is
 # the constant 1.
 _slice_zero(::_SliceRows, U) = 0.0 .* U[:, 1:1]
 _slice_zero(::_SliceCols, U) = 0.0 .* U[1:1, :]

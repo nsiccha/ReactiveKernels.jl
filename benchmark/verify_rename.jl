@@ -1,6 +1,6 @@
 # Focused verification receipt for the arma11 + dugongs `density`->`posterior`
 # node rename (canonical model sources + tests). Runs ONLY those two package
-# testsets (native, no Reactant) against the pinned env. NOT a by-construction
+# testsets (native) against the pinned env. NOT a by-construction
 # claim — this actually executes the sibling's 4-part parity/structure gates.
 import Pkg
 const ENV_DIR = joinpath(@__DIR__, "all80-env")

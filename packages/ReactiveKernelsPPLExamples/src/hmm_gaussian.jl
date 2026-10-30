@@ -52,7 +52,7 @@ using LogExpFunctions: logsumexp
     u_sigma::Vector{Float64}  = unconstrained[(K * K + K):(K * K + 2 * K - 1)]
 
     # Constant sum-to-zero basis B (K×(K-1)); sum_to_zero_constrain is linear, so
-    # each simplex is x = B·free (matmul-only → lowers through Reactant):
+    # each simplex is x = B·free (matmul-only):
     #   A[k,j] = (j ≥ k) − (j == k−1)·j ;  B[k,j] = A[k,j]/sqrt(j(j+1)).
     Nf::Int = K - 1
     jcol::Vector{Float64} = collect(1.0:Nf)
@@ -118,11 +118,9 @@ y = HMM_GAUSSIAN_Y
 K = HMM_GAUSSIAN_K
 
 requested_nodes = (:parameters, :log_jacobian, :likelihood, :posterior)
-# The raw observation series `y` enters as a TRACED argument (only the scalar
-# state count `K` is bound), so the `scan` forward recursion lowers to a
-# `stablehlo.while` carry loop under Reactant instead of unrolling over the
-# fixed-length series. Indices use the explicit `T`, not `end`, which does not
-# resolve on traced results.
+# The raw observation series `y` stays a live argument (only the scalar state
+# count `K` is bound), so the `scan` forward recursion is one retained loop over
+# the series.
 density_kernel = prepare(model;
     have = (:unconstrained, :y, :K),
     want = requested_nodes,
@@ -170,7 +168,7 @@ Build the posteriordb `hmm_gaussian` model as a declarative
 `ReactiveKernels.KernelSpec`: a K-state Gaussian HMM (initial distribution
 `pi1`, K×K transition `A`, `ordered` means, per-state `sigma`) whose marginal
 likelihood is the sequential forward algorithm, authored with a `scan` over a
-K-vector belief-state carry (lowers to a stablehlo.while carry loop). The
+K-vector belief-state carry (one retained carry loop). The
 K transition simplexes are constrained at once through the shared inverse-ILR
 basis. The Stan `logalpha[1] = log(pi1) + normal_lpdf(y[1] | mu, sigma)` quirk
 (the full emission SUM added to every initial state) is reproduced exactly.

@@ -172,7 +172,7 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         op = only(
             o for o in kernel.ops if o isa ReactiveKernels._KernelSourceOp)
         llvm = sprint(code_llvm, ReactiveKernels._kernel_source_call,
-            Tuple{Val{:native},typeof(op),ntuple(_ -> Float64, 40)...})
+            Tuple{typeof(op),ntuple(_ -> Float64, 40)...})
         @test !occursin("jl_apply_generic", llvm)
     end
 
@@ -966,7 +966,7 @@ end
 # was routed through `logit = log(p) - log1p(-p)` whose derivative is ±Inf there,
 # so `0 · ±Inf = NaN` even though the primal is finite. The boundary-safe route
 # computes the log-probability directly from `p`; the logit HAVE keeps its stable
-# log-sum-exp gradient. (The Reactant analog lives in `test/test_ad_reactant.jl`.)
+# log-sum-exp gradient.
 @testset "bernoulli direct-p boundary gradients are finite" begin
     p_kernel = prepare(bernoulli.logpdf; have = (:observed, :p), want = :logpdf)
     logit_kernel = prepare(bernoulli.logpdf; have = (:observed, :logit), want = :logpdf)

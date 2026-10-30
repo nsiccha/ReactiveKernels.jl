@@ -1,8 +1,6 @@
 # Zero-inflated Poisson response (SB `ZeroInflatedPoisson` mirror):
 # surface admission, value parity vs a BRM-math hand oracle (literal /
-# Beta-sampled / predictor-fed zi), Enzyme-vs-findiff gradients;
-# test_zip_reactant.jl adds Reactant/XLA value+grad parity at
-# unconstrained probes (native vs compiled), plus the traced program size. (`_findiff_grad` /
+# Beta-sampled / predictor-fed zi), Enzyme-vs-findiff gradients. (`_findiff_grad` /
 # `_GEN_BACKEND` come from test_generator.jl, included first.)
 using DifferentiationInterface
 using Distributions: Beta, Normal, Poisson, logpdf

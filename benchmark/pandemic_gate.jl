@@ -13,10 +13,6 @@
 #                          function_annotation, runtime_activity, or priming
 #                          substitution — vs BridgeStan log_density_gradient
 #                          (relative error < 1e-3), finite at every probe.
-#   3. REACTANT PRIMAL   — the Reactant-compiled primal vs the native primal
-#                          (relative error < 1e-6).
-#   4. REACTANT GRADIENT — the Reactant-compiled gradient vs BridgeStan
-#                          (relative error < 2e-3), finite.
 #
 # plus BOUNDARY CONTROLS on small synthetic datasets against actual Stan:
 # early observations inside the imputation window (including day 1's
@@ -32,47 +28,22 @@
 # The four posteriors of the pandemic family are covered: the bundled
 # covid19imperial_v2.stan and covid19imperial_v3.stan are byte-identical, so
 # the same graph serves both model names; the sibling datasets ecdc0401 and
-# ecdc0501 are separately bound through the same raw ports. Native axes (1-2)
-# run for every selected posterior. Reactant axes (3-4) are compiled ONCE per
-# DISTINCT dataset (its first selected posterior, whichever model name that
-# is); later selected posteriors of the same dataset assert .stan byte equality
-# and identical dataset with the covering entry and are explicitly labelled as
-# NOT independently compiled — they never silently claim axis 3-4 execution.
+# ecdc0501 are separately bound through the same raw ports. Both axes run for
+# every selected posterior.
 #
-# Run (needs BridgeStan 2.9 / Stan 2.39, PosteriorDB, Reactant, Enzyme — all in
-# the all80 environment):
+# Run (needs BridgeStan 2.9 / Stan 2.39, PosteriorDB, Enzyme — all in the all80
+# environment):
 #
 #   julia --project=benchmark/all80-env benchmark/pandemic_gate.jl
 #
 # Optional: PANDEMIC_MODELS=ecdc0401_v2 restricts the set. Probe scope: 5
-# reference-valid (Stan-finite) probes per posterior for native axes, 1 probe
-# per compiled dataset for the Reactant axes.
-#
-# The Reactant axes (3, 4) and the two native axes (1, 2) MUST be certified in
-# SEPARATE processes: `PANDEMIC_REACTANT=0` asserts Reactant is UNLOADED both
-# BEFORE any package import and AFTER the native phase, so axes 1-2 certify
-# plain-native execution with the Reactant extension genuinely absent;
-# `PANDEMIC_REACTANT=1` imports Reactant and runs all four. Authoritative
-# acceptance = one run of each.
-
-const DO_REACTANT = get(ENV, "PANDEMIC_REACTANT", "1") == "1"
-
-_reactant_loaded() = any(id -> id.name == "Reactant", keys(Base.loaded_modules))
-if !DO_REACTANT
-    @assert !_reactant_loaded() "PANDEMIC_REACTANT=0 native phase must START with Reactant UNLOADED (before any package import), but it is loaded"
-end
+# reference-valid (Stan-finite) probes per posterior.
 
 using Random, LinearAlgebra
 import BridgeStan, PosteriorDB, Enzyme
 using ReactiveKernels, ReactiveKernelsDistributionKernels
 using ReactiveKernelsPPLExamples
 using DifferentiationInterface
-
-if DO_REACTANT
-    import Reactant
-else
-    @assert !_reactant_loaded() "PANDEMIC_REACTANT=0 native phase must keep Reactant UNLOADED after package imports"
-end
 
 const PE = ReactiveKernelsPPLExamples
 # ORDINARY reverse-mode Enzyme: no function_annotation=Const, no
@@ -83,8 +54,6 @@ const AE = AutoEnzyme(mode = Enzyme.Reverse)
 
 const VALUE_TOL   = 1e-6      # native value vs Stan
 const GRAD_TOL    = 1e-3      # native plain-Enzyme gradient vs Stan
-const RPRIMAL_TOL = 1e-6      # Reactant primal vs native
-const RGRAD_TOL   = 2e-3      # Reactant gradient vs Stan
 
 sval(sm, q) = BridgeStan.log_density(sm, q; propto = false, jacobian = true)
 sgrad(sm, q) = BridgeStan.log_density_gradient(sm, q; propto = false, jacobian = true)[2]
@@ -97,11 +66,8 @@ println("  julia = ", VERSION, "  BridgeStan = ", Base.pkgversion(BridgeStan),
         "  PosteriorDB = ", Base.pkgversion(PosteriorDB))
 println("  Enzyme = ", Base.pkgversion(Enzyme),
         "  DifferentiationInterface = ", Base.pkgversion(DifferentiationInterface))
-if DO_REACTANT
-    println("  Reactant = ", Base.pkgversion(Reactant))
-end
 println("  AD configuration: ordinary AutoEnzyme(mode = Enzyme.Reverse); no annotation/runtime_activity/priming")
-println("  probe scope: 5 reference-valid probes per posterior (native axes); 1 probe per compiled dataset (Reactant axes)")
+println("  probe scope: 5 reference-valid probes per posterior")
 flush(stdout)
 
 function bridge(name, seed)
@@ -138,10 +104,8 @@ _bind(d) = (X = Float64.(d["X"]), EpidemicStart = Int.(d["EpidemicStart"]),
             P = Int(d["P"]), N0 = Int(d["N0"]), N2 = Int(d["N2"]))
 
 const _NATIVE_RAN = Ref(0)
-const _REACTANT_DATASETS_RUN = Set{String}()
-const _REACTANT_COVERED_BY = Dict{String,String}()
 
-function gate(name; do_reactant, reactant_note)
+function gate(name)
     println("\n########## $name ##########"); flush(stdout)
     sm, post = bridge(name, 468)
     data = PosteriorDB.load(PosteriorDB.dataset(post))
@@ -169,27 +133,8 @@ function gate(name; do_reactant, reactant_note)
     println("  [1] native value   max_rel=$(round(max_v; sigdigits = 4))  (< $VALUE_TOL) PASS")
     println("  [2] native grad    max_rel=$(round(max_g; sigdigits = 4))  (< $GRAD_TOL) PASS  [ordinary AutoEnzyme(Reverse)]"); flush(stdout)
 
-    if do_reactant
-        _reactant_axes(name, kb, prep, sm, pts)
-    else
-        println("  [3,4] Reactant axes NOT executed here — $reactant_note"); flush(stdout)
-    end
     _NATIVE_RAN[] += 1
     return
-end
-
-# The Reactant axes use `Reactant.@compile`, a macro expanded when the code
-# containing it is LOWERED. A plain `if DO_REACTANT … end` guard does NOT help:
-# a top-level `if` is macro-expanded (both branches) before it is evaluated, so
-# the macro would still expand — and abort — in the Reactant-UNLOADED process.
-# The only sound guard is a separate file INCLUDED ONLY after `import Reactant`,
-# whose body is lowered solely at include time (which happens only when Reactant
-# is loaded). Under PANDEMIC_REACTANT=0 the no-op method below stands in and no
-# Reactant macro or binding is ever referenced.
-if DO_REACTANT
-    include(joinpath(@__DIR__, "pandemic_gate_reactant.jl"))
-else
-    _reactant_axes(args...) = nothing
 end
 
 # ---- small-shape boundary controls against ACTUAL Stan (synthetic data) ----
@@ -250,41 +195,9 @@ const SELECTION = [p for p in _POSTERIORS if p.key in SEL]
 length(SELECTION) == length(SEL) ||
     error("selection bookkeeping mismatch: $(length(SELECTION)) resolved for $(length(SEL)) requested")
 
-# Reactant compiles once per DISTINCT dataset, on that dataset's FIRST selected
-# posterior (whichever model name that is). Every later selected posterior of
-# the same dataset must prove source+data equivalence with the covering entry
-# and is labelled as not independently compiled.
-const _REACTANT_OWNER = Dict{String,String}()
 for p in SELECTION
-    get!(_REACTANT_OWNER, p.dataset) do; p.name; end
-end
-function _stan_bytes(name)
-    post = PosteriorDB.posterior(PosteriorDB.database(), name)
-    read(PosteriorDB.path(PosteriorDB.implementation(PosteriorDB.model(post), "stan")))
-end
-
-for p in SELECTION
-    owner = _REACTANT_OWNER[p.dataset]
-    do_reactant = DO_REACTANT && p.name == owner
-    if do_reactant
-        note = "compiled for this dataset"
-    else
-        # Same dataset is guaranteed by the grouping key; the load-bearing
-        # equivalence for sharing a compiled graph is the model source bytes.
-        @assert _stan_bytes(owner) == _stan_bytes(p.name) "$(p.name): .stan bytes differ from covering entry $(owner)"
-        note = "identical .stan bytes and dataset ($(p.dataset)), compiled as $(owner)"
-    end
-    gate(p.name; do_reactant, reactant_note = note)
+    gate(p.name)
 end
 
 @assert _NATIVE_RAN[] == length(SELECTION) "$(_NATIVE_RAN[]) native gate(s) ran but $(length(SELECTION)) were selected"
-const _EXPECTED_REACTANT = DO_REACTANT ? length(_REACTANT_OWNER) : 0
-@assert length(_REACTANT_DATASETS_RUN) == _EXPECTED_REACTANT "Reactant accounting mismatch: $(length(_REACTANT_DATASETS_RUN)) dataset compile(s) ran, expected $(_EXPECTED_REACTANT)"
-const _PHASE = DO_REACTANT ?
-    "all FOUR parts (native value+grad on every selected posterior; Reactant primal+grad compiled once per distinct dataset: $(join(sort(collect(_REACTANT_DATASETS_RUN)), ", ")))" :
-    "the TWO native parts + boundary controls (Reactant UNLOADED before imports and after the phase; parts 3-4 deferred to a PANDEMIC_REACTANT=1 run)"
-println("\n== pandemic_gate: $(length(SELECTION)) posterior(s) [$(join((p.key for p in SELECTION), ", "))] PASSED $_PHASE =="); flush(stdout)
-
-if !DO_REACTANT
-    @assert !_reactant_loaded() "PANDEMIC_REACTANT=0 native phase must END with Reactant still UNLOADED"
-end
+println("\n== pandemic_gate: $(length(SELECTION)) posterior(s) [$(join((p.key for p in SELECTION), ", "))] PASSED the native value + gradient parts and boundary controls =="); flush(stdout)

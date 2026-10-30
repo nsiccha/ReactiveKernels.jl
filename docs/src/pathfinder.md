@@ -96,8 +96,7 @@ The optimizer, circular-history policy, and RNG policy stay outside the
 kernels. The `run_single_path` driver walks supplied positions and gradients,
 feeds one retained pair into the prepared kernel at a time, threads
 `alpha_next`, and selects the largest ELBO. Standard-normal tensors are HAVE
-values rather than a hidden RNG effect, so native Julia and Reactant execute
-the same deterministic mathematics.
+values rather than a hidden RNG effect, so the mathematics is deterministic.
 
 For the compact candidate, the caller snapshots the currently active circular
 history in chronological columns and supplies its matching ``H_0`` diagonal.
@@ -106,8 +105,7 @@ to the original BFGS covariance, while the rendered two-column fixture proves
 the multi-history correction is active.
 
 The acceptance tests compare every native observable with the independent
-physical oracle and compile the full candidate through Reactant. The external
-corpus records the paper digest, the pinned Pathfinder.jl revision and
-source-file digests, both oracle sections, supported backend boundaries, and
-minimum native-plus-Reactant acceptance without adding Pathfinder to the
-exhaustive ReactiveHMC corpus.
+physical oracle. The external corpus records the paper digest, the pinned
+Pathfinder.jl revision and source-file digests, both oracle sections,
+supported backend boundaries, and minimum native acceptance without adding
+Pathfinder to the exhaustive ReactiveHMC corpus.

@@ -15,20 +15,11 @@ a prepared kernel.
 > [this gist](https://gist.github.com/nsiccha/7f8c6802e1522be05f2d3240dba8aa68).
 > It contains no probabilistic-programming or domain-specific semantics — it is a
 > general dataflow abstraction. Scope covers the design's Phases 1–4 and the
-> first Phase 5 physical-lowering integrations: an optional
-> MutatingFunctions-backed non-allocating preparation path and an optional
-> Reactant extension for traceable mathematical kernels and whole-kernel
-> replicas. The optional external
-> [adaptive-NUTS exemplar](packages/ReactiveKernelsNUTSExamples/src/nuts_runtime/kernel_nuts_reactant.jl) compiles
-> one full-depth transition to one data-dependent traced `while`, with
-> pre-generated momentum, direction, and exponential tensors plus explicit
-> counters, so there is no host RNG inside the trace. That acceptance path is
-> scoped to `Float64`, a positive diagonal Euclidean metric, the locked authored
-> control-flow graph, and the current diagnostics callback. Overflow and
-> unsupported cases reject; the native adaptive API remains CPU execution. See
-> the [executable acceptance test](test/test_kernel_nuts_reactant.jl). This is
-> not blanket accelerator support for mutable state machines. E-graph
-> optimization remains future work.
+> first Phase 5 physical-lowering integration: an optional
+> MutatingFunctions-backed non-allocating preparation path. ReactiveKernels
+> no longer has a Reactant path; its former Reactant extension and the
+> measurements taken with it are kept only as historical receipts in the
+> documentation. E-graph optimization remains future work.
 
 The runnable [`ReactiveKernelsPPLExamples` eight-schools source](packages/ReactiveKernelsPPLExamples/src/eight_schools.jl) shows how
 to build PPL semantics manually from ordinary recipes: unconstrained-to-

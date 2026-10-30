@@ -1,11 +1,7 @@
-# Exact motorcycle kernel through the shared authored HMC benchmark. Run each
-# backend in a fresh process with identical batch sizes and CPU affinity.
+# Exact motorcycle kernel through the shared authored HMC benchmark.
 using ReactiveKernels, Enzyme, DifferentiationInterface
 using LinearAlgebra, Random, Serialization, Statistics, SHA, TOML, Dates
 import Pkg
-const BACKEND_NAME = Symbol(get(ENV, "HMC_BACKEND", "native"))
-BACKEND_NAME in (:native, :reactant) || error("HMC_BACKEND must be native or reactant")
-BACKEND_NAME === :reactant && (@eval import Reactant)
 include(joinpath(@__DIR__, "..", "..", "examples", "brm_hsgp.jl"))
 include(joinpath(@__DIR__, "..", "sampler_transpiler", "hmc_benchmark.jl"))
 const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
@@ -31,11 +27,10 @@ function main()
     data = BRMHSGPExample.motorcycle_data()
     model_prepare_seconds = @elapsed density = BRMHSGPExample.prepare_model(data)
     backend = AutoEnzyme(; mode=Enzyme.Reverse, function_annotation=Enzyme.Const)
-    make_rng(i) = BACKEND_NAME === :native ? Xoshiro(91+i) :
-        Reactant.ReactantRNG(Reactant.to_rarray(UInt64[91+i, 77]))
+    make_rng(i) = Xoshiro(91+i)
     packages = Dict{String,Any}()
     for (_, info) in Pkg.dependencies()
-        info.name in ("ReactiveKernels", "ReactiveKernelsPPL", "BayesianRegressionModels", "Reactant", "Enzyme", "DifferentiationInterface",
+        info.name in ("ReactiveKernels", "ReactiveKernelsPPL", "BayesianRegressionModels", "Enzyme", "DifferentiationInterface",
             "MutatingFunctions", "OutputSignatures", "LogExpFunctions") || continue
         entry = Dict{String,Any}("version"=>string(info.version), "source"=>something(info.source, ""))
         if info.source !== nothing && isdir(joinpath(info.source, ".git")) ||
@@ -50,7 +45,7 @@ function main()
         "benchmark/sampler_transpiler/position_multinomial_hmc_kernel.jl",
         "benchmark/nuts_kernel_authoring_fixture_b.jl"]
     receipt = Dict{String,Any}("schema"=>"brm-hsgp-hmc-v1",
-        "generated_at_utc"=>string(now(UTC)), "backend"=>string(BACKEND_NAME),
+        "generated_at_utc"=>string(now(UTC)), "backend"=>"native",
         "rk_head"=>strip(read(`git -C $ROOT rev-parse HEAD`, String)),
         "rk_worktree_status"=>read(`git -C $ROOT status --short`, String),
         "rk_statistical_model_owner"=>"BayesianRegressionModels.rk_model(:dual_hsgp)",
@@ -62,7 +57,7 @@ function main()
         "cpu_affinity"=>match(r"Cpus_allowed_list:\s*([^\n]+)", read("/proc/self/status", String)).captures[1],
         "loadavg_start"=>strip(read("/proc/loadavg", String)),
         "model_prepare_seconds"=>model_prepare_seconds,
-        "methodology"=>"Same authored multinomial HMC, fixed L and step size, matched batch sizes. Fixed diagonal mass = inverse coordinate variance of the supplied 10000-draw frame. Start at supplied column 5000. Data-only basis prepared once; q active, centeredness held by sampler context. Native uses prepared Enzyme; Reactant compiles the HMC batch including AD and RNG, synchronizes once. No adaptation or history; throughput is not ESS. Julia bytes exclude native runtime/device allocations. RNG construction and result validation outside timing; state-copy/output wrapper inside.",
+        "methodology"=>"Same authored multinomial HMC, fixed L and step size, matched batch sizes. Fixed diagonal mass = inverse coordinate variance of the supplied 10000-draw frame. Start at supplied column 5000. Data-only basis prepared once; q active, centeredness held by sampler context. Native uses prepared Enzyme. No adaptation or history; throughput is not ESS. RNG construction and result validation outside timing; state-copy/output wrapper inside.",
         "frames"=>Dict{String,Any}())
     save() = open(output, "w") do io
         receipt["loadavg_latest"] = strip(read("/proc/loadavg", String))
@@ -86,12 +81,12 @@ function main()
             "results"=>Dict{String,Any}())
         receipt["frames"][frame] = frame_receipt
         for transitions in batch_sizes
-            println("HMC begin backend=$BACKEND_NAME frame=$frame T=$transitions L=$steps"); flush(stdout)
+            println("HMC begin frame=$frame T=$transitions L=$steps"); flush(stdout)
             result = HMCBenchmark.benchmark_hmc(density, ad, q, make_rng;
-                backend=BACKEND_NAME, transitions, steps, stepsize, rounds, metric, context=(c,))
+                transitions, steps, stepsize, rounds, metric, context=(c,))
             frame_receipt["results"][string(transitions)] = result
             save()
-            println("HMC result backend=$BACKEND_NAME frame=$frame T=$transitions ",
+            println("HMC result frame=$frame T=$transitions ",
                 "us_per_transition=", result["median_us_per_transition"],
                 " prepare_s=", result["prepare_seconds"],
                 " first_s=", result["first_execution_seconds"]); flush(stdout)

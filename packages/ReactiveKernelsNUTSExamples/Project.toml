@@ -9,15 +9,9 @@ LogExpFunctions = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 
-[weakdeps]
-Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
-
-[extensions]
-ReactiveKernelsNUTSExamplesReactantExt = "Reactant"
 
 [compat]
 LogExpFunctions = "0.3, 1.0.2"
-Reactant = "0.2.284"
 ReactiveKernels = "0.1"
 julia = "1.10"
 

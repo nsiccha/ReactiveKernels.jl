@@ -50,19 +50,3 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
     setup = Main.ReactiveKernelsDocs.setup_gpcm_latent_reg_irt!,
 )
 ```
-
-## Reactant
-
-On the focused gate's finite BridgeStan-valid probes, the exact authored graph
-compiles and executes through the public Reactant boundary with value and
-gradient parity — primal and gradient both `@compile` and match native/the
-reference `.stan` (via BridgeStan, `propto = false`, `jacobian = true`) to
-machine precision. The concrete-index
-matrix gather, the cumulative-sum matmul, the masked row-wise `logsumexp`, and
-the reused `LogNormal`/`Normal`/`Student-t` endpoints all lower cleanly.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.GpcmLatentRegIrtExample.demo()'
-```

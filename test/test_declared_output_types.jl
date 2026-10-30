@@ -54,8 +54,7 @@ end
     return (y, z, scaled)
 end
 
-# A plain kernel has no tensorized product: Reactant traces its native body, so
-# that body must not bind host types.
+# A plain kernel's native body must not bind host types.
 @kernel _dot_plain(n::Int, xs::Vector{Float64}) = begin
     y::Vector{Float64} = xs .* n
     return y
@@ -72,7 +71,7 @@ end
 end
 
 function _dot_native(k)
-    f = k.f isa ReactiveKernels._ArrayFunctionPair ? k.f.native : k.f
+    f = k.f isa ReactiveKernels._ArrayFunction ? k.f.native : k.f
     f isa ReactiveKernels._PrecompileWarmFunction ? f.f : f
 end
 # `code_typed` (not `return_types`) reaches through the generated RGF entry.
@@ -117,7 +116,7 @@ _dot_decl(name::Symbol, T) = Expr(:(::), name, T)
     @test nested <= control + 4096
 end
 
-@testset "declared types convert at the assignment; only host-only products declare" begin
+@testset "declared types convert at the assignment in kernels that own array regions" begin
     k = prepare(_dot_convert)
     y, z, scaled = k(2, [1.0, 2.0], [0.5])
     @test y isa Vector{Float64} && y == [2.0, 2.0, 2.0]
@@ -126,13 +125,11 @@ end
     p = plan(_dot_convert; have = (:n, :xs, :w), want = (:y, :z, :scaled))
     # `inline_embedded = true` is the product `prepare` compiles.
     native, _, _ = lower_with_ops(p; inline_embedded = true)
-    tensorized, _, _ = lower_with_ops(p; tensorized = true, inline_embedded = true)
     @test Set(_dot_declarations(native)) == Set([
         _dot_decl(:y, Vector{Float64}), _dot_decl(:z, Float64),
         _dot_decl(:scaled, Vector{Float64})])
-    @test isempty(_dot_declarations(tensorized))
     @test Set(_dot_declarations(code_expr(k))) == Set(_dot_declarations(native))
-    # The plain kernel's single product is traced under Reactant: no declarations.
+    # A plain kernel (no plate, scan or embedded array kernel) declares nothing.
     plain = prepare(_dot_plain)
     @test isempty(_dot_declarations(code_expr(plain)))
     @test plain(2, [1.0, 2.0]) == [2.0, 4.0]

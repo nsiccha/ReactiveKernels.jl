@@ -82,8 +82,8 @@ using LogExpFunctions: logistic, log1pexp
     prior::Float64 = mu_a_prior + mu_b_prior + a_prior + b_prior
 
     # Transformed parameter: y_hat[i] = a[group_id[i]] + b[scenario_id[i]]. The
-    # two integer-array gathers are done OUTSIDE any plate (a traced integer
-    # index does not lower; docs_example binds both indices). This is the named
+    # two integer-array gathers are done OUTSIDE any plate (docs_example binds
+    # both indices). This is the named
     # transformed-parameter / generated-quantity node.
     a_gathered = a[group_id]
     b_gathered = b[scenario_id]
@@ -111,8 +111,8 @@ scenario_id = PILOTS_SCENARIO_ID
 y = PILOTS_Y
 
 requested_nodes = (:parameters, :log_jacobian, :prior, :likelihood, :posterior)
-# Bind the integer gather indices so `a.inputs` excludes them and the Reactant
-# path traces only the float inputs + the parameter vector (spec addendum).
+# Bind the integer gather indices so `a.inputs` excludes them and the prepared
+# kernel takes only the float inputs + the parameter vector (spec addendum).
 density_kernel = prepare(model;
     have = (:unconstrained, :group_id, :scenario_id, :y),
     want = requested_nodes,

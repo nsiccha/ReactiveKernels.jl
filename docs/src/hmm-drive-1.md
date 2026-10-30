@@ -12,9 +12,7 @@ sequential K-vector recursion, authored inline with the
 [`scan` primitive](scan.md): the carry is the per-state log-belief vector, the
 iterated sequence is the bound two-stream observation matrix widened with a
 0/1 first-step mask column (`scan(eachrow(scan_rows), …)`), and the step updates
-`gamma[k] = logsumexp_j(gamma[j] + mask_t·logtheta[j,k]) + emit_k(u_t, v_t)`
-(the compiled module's `stablehlo.while` count is measured per query shape —
-see the Reactant section — not asserted from other models).
+`gamma[k] = logsumexp_j(gamma[j] + mask_t·logtheta[j,k]) + emit_k(u_t, v_t)`.
 The masked first step is the identity in log space (the carry is seeded with
 the uniform initial log mass, so `logsumexp(seed) = 0`), which reproduces
 Stan's bare first-emission vector exactly and keeps the graph valid for every
@@ -58,46 +56,4 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
     @__MODULE__, :HmmDrive1Example, :HMM_DRIVE_1_SOURCE;
     setup = Main.ReactiveKernelsDocs.setup_hmm_drive_1!,
 )
-```
-
-## Reactant
-
-The natural forward recursion **lowers through Reactant**, and the two query
-boundaries are measured separately (`benchmark/structured_gate.jl`, axes 3a/3b):
-the public **all-bound** query (raw `u`/`v`/`alpha`/`tau`/`rho` bound) compiles
-and matches the native density exactly, with the compiler specializing the
-recurrence for the query shape (its emitted HLO contains no `stablehlo.while`
-region; the specialization is recorded with a byte-size control, and no
-carry-loop claim is made for it). The **traced-stream** query (the same graph
-with the data ports free and traced) also matches native exactly and, on the
-current pin carrying ReactiveKernels `90acd41c`, lowers as a **single
-`stablehlo.while` carry loop** (~99 KB of HLO, asserted by the gate — the
-earlier pin unrolled it into a ~9.6 MB module). The counts are read from
-`repr(Reactant.@code_hlo ...)` — the same surface the repository's
-authored-scan tests assert on — because `module_string` is empty on the pinned
-Reactant and a count against it would be vacuous.
-
-The **native plain-Enzyme reverse gradient** works under both the ordinary and
-Const-annotated configurations, because the scan step reduces with the
-type-stable `logsumexp(M; dims = 1)`; the example test checks the ordinary
-configuration against finite differences. While the step used
-`mapslices(logsumexp, M; dims = 1)`, which infers `Any`, the gradient failed
-Enzyme's *static* activity analysis (`EnzymeRuntimeActivityError`, snag
-`scan-prior-enzym-d67d4ac1`) and needed `Enzyme.set_runtime_activity`. The
-Reactant-compiled gradient is an explicit UNSUPPORTED axis at this pin on both
-query shapes, each measured in its own isolated process (no native gradient
-work of any mode beforehand): the all-bound shape's unrolled module is
-intractable for the EnzymeMLIR reverse pass, and the single-while traced-stream
-shape currently fails the reverse pass itself (`operand #0 does not dominate
-this use`); complete diagnostics are retained by the gate.
-The runtime-activity result and the same-process compile observations are kept
-as separate, explicitly labeled facts in
-`benchmark/structured_gate_diagnostics.jl` — no order-dependence or cache
-explanation is claimed. The gate pins the documented failure signatures on the
-standard axes so neither a regression nor a quiet fix can hide.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.HmmDrive1Example.demo()'
 ```

@@ -47,7 +47,7 @@ function render_results()
             error("HMC integration-work axis mismatch")
     end
     io = IOBuffer()
-    println(io, "| Steps | Native median | Reactant median | AdvancedHMC fastest sample |")
+    println(io, "| Steps | Native median | Reactant median (removed path) | AdvancedHMC fastest sample |")
     println(io, "| --- | ---: | ---: | ---: |")
     for steps in (4, 16)
         selected = filter(row -> row["steps_per_transition"] == string(steps) &&
@@ -72,7 +72,7 @@ function render_endpoint_results()
     headers = split(first(lines),',')
     rows = [Dict(zip(headers,split(line,','))) for line in lines[2:end]]
     io = IOBuffer()
-    println(io,"| Steps | RK native | AdvancedHMC endpoint | RK Reactant | ProbProg endpoint |")
+    println(io,"| Steps | RK native | AdvancedHMC endpoint | RK Reactant (removed path) | ProbProg endpoint |")
     println(io,"| --- | ---: | ---: | ---: | ---: |")
     for steps in (4,16)
         values = map(("rk_native_endpoint","ahmc_endpoint","rk_reactant_endpoint","probprog_endpoint")) do kernel
@@ -106,7 +106,8 @@ function render_interface_results()
             length(samples) == receipt["replicates"] || error("interface samples missing")
             median(samples)
         end
-        @printf(io, "| %s | %d | %.2f μs | %.2f μs |\n", backend, steps, times...)
+        label = backend == "reactant" ? "reactant (removed path)" : backend
+        @printf(io, "| %s | %d | %.2f μs | %.2f μs |\n", label, steps, times...)
     end
     Markdown.parse(String(take!(io)))
 end

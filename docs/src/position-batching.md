@@ -53,15 +53,12 @@ untyped port, or one that leaves the rank open such as
 untyped numeric port, a vector supplies scalar positions and a matrix supplies
 vector positions. Tuple and named-tuple inputs use trees of such arrays, with
 one common trailing length across all leaves. Native execution also accepts a
-vector of scalar records. Compiled record inputs use the tree-of-arrays form.
+vector of scalar records.
 
 Outputs may be numbers, numeric arrays, or tuple/named-tuple trees of these.
 Their fields, leaf element types, and shapes must agree across positions. Empty
 batches need declared output types because no first position exists from which
 to infer a layout; array outputs then have zero-sized original dimensions.
-This empty-batch contract is native. Reactant's existing zero-sized result
-export limitation also applies to a compiled empty batch; see
-[issue #12](https://github.com/nsiccha/ReactiveKernels.jl/issues/12).
 
 For example, this untyped scalar record graph is also the batched source:
 
@@ -89,8 +86,7 @@ the contract without runtime Symbol lookup.
 
 `want` selects outputs before lifting, exactly as ordinary preparation does. A
 scalar `PreparedADKernel` can be lifted with `replica(ad; batched = ...)`;
-native and Reactant paths then return one objective and one active-port gradient
-per position.
+it returns one objective and one active-port gradient per position.
 
 ## Fix positions once and keep another HAVE active
 
@@ -430,9 +426,8 @@ the final result. Each worker keeps its own intermediate lane slots; scheduling
 does not remove the allocations of other recipes. Small or allocation-heavy work
 can run slower with extra workers.
 
-The schedule applies to native primal calls. An owning scheduled kernel compiled
-with Reactant keeps the existing retained position loop; `reuse=true` keeps its
-native-only boundary. Per-position derivatives use the existing scalar AD path:
+The schedule applies to native primal calls. Per-position derivatives use the
+existing scalar AD path:
 
 ```julia
 using DifferentiationInterface: AutoEnzyme
@@ -444,20 +439,3 @@ values, gradients = replica(ad; batched=:x)(positions, 0.5)
 
 This derivative callable uses ordinary replicated scalar AD. Differentiating
 the native task scheduler itself is outside this execution surface.
-
-With Reactant, `@compile batched(positions, shared...)` lowers the same map to a
-retained loop with dynamic slices and output buffers. A scalar kernel that compiles under Reactant therefore
-has the same compiler requirement in vectorized form; reverse gradients have the
-same requirement as the scalar prepared AD kernel. The position axis remains a
-backend loop rather than one copied body per position. The loop keeps each
-position's authored guards. Backend optimization must preserve selected values,
-ordinary derivatives, effects and invalid-access safety, as described in the
-[core constraints](constraints.md). Compile the
-ordinary owning batch; `reuse=true` is a native-only borrowed-buffer surface.
-
-The loop reads and writes each position in storage layout, with the position
-axis leading, so the optimized program slices the compiled arguments directly.
-With the position axis trailing, two backend rewrite patterns never finish;
-see the [constraints](constraints.md) and the backend-only
-`benchmark/repro_reactant_reshape_slice_rewrite.jl` reproducer. The array
-layout at the call boundary is unchanged.

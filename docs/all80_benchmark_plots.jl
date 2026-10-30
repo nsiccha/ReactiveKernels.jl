@@ -4,7 +4,7 @@
 # `data`, `mapping`, `visual`, `config`, `scales`, `_plot_block`, `_interactive_block`,
 # and `h` are already in scope. The extra AoV marks this file needs are imported here.
 #
-# The receipt cells are honest by construction (benchmark/all80_reactant_body.jl,
+# The receipt cells are honest by construction (the producer bodies,
 # all80_axes.jl): a numeric timing where the operation ran, or an exact diagnostic
 # STRING where it failed. These plots therefore only ever plot the NUMERIC cells, and
 # the coverage plot COUNTS the string cells so the failures stay visible — never hidden,
@@ -156,18 +156,18 @@ function render_all80_reactant_hmc_plot(path = _ALL80_BENCHMARK_PATH)
             title = "Reactant HMC-loop CAPABILITY PROBE (T=4) vs native throughput (calibrated T)",
             scales = scales(X = (; scale = log10)));
         id = "all80-reactant-hmc",
-        title = "Reactant compiled-HMC-loop capability probe — NOT a matched long-chain ranking",
-        description = "One point per model whose Reactant HMC loop lowered. **Batch sizes DIFFER**: " *
+        title = "Reactant compiled-HMC-loop capability probe ($_REMOVED_REACTANT_LABEL) — NOT a matched long-chain ranking",
+        description = _REMOVED_REACTANT_NOTE * " " *
+            "One point per model whose Reactant HMC loop lowered. **Batch sizes DIFFER**: " *
             "Reactant runs a FIXED 4 transitions per compiled call (with per-round RNG marshalling " *
             "inside the timer), while native runs its calibrated batch T (30–1000; ~39/59 at 1000, " *
             "shown by colour). The per-call XLA-launch overhead is amortized over T, so at T=4 " *
             "Reactant's per-transition figure is inflated and this ratio is NOT a matched long-chain " *
             "backend verdict — it is a lowering CAPABILITY probe (does the whole loop compile+run). " *
-            "The fair same-T comparison (T∈{4,100,1000}, same q/metric/L/ε both backends) is a tracked " *
-            "investigation. Models whose loop does not lower are absent here and counted in the coverage plot.")
+            "Models whose loop did not lower are absent here and counted in the coverage plot.")
 end
 
-# ---- Plot 3: Reactant coverage — how many models lower, how many fail (visibly) ----
+# ---- Plot 3: Reactant coverage — how many models lowered, how many failed (visibly) ----
 # For each Reactant cell (primal / gradient / HMC), stack {lowered, failed} across all 82
 # models so the honest coverage — and the size of the still-failing set — is one glance.
 const _ALL80_REACTANT_CELLS = (
@@ -199,12 +199,11 @@ function render_all80_reactant_coverage_plot(path = _ALL80_BENCHMARK_PATH)
             title = "Reactant lowering coverage across the 82 faithful graphs",
             scales = scales(Y = (; zero = true)));
         id = "all80-reactant-coverage",
-        title = "Reactant coverage — what lowered, what still fails",
-        description = "For each operation, how many of the 82 faithful graphs lowered through " *
+        title = "Reactant coverage ($_REMOVED_REACTANT_LABEL) — what lowered, what failed",
+        description = _REMOVED_REACTANT_NOTE * " " *
+            "For each operation, how many of the 82 faithful graphs lowered through " *
             "Reactant versus recorded an exact lowering diagnostic. On the natural-source base all " *
-            "82 lower for all three operations (primal, gradient, and the compiled HMC loop). The " *
-            "diagnostic-recording mechanism stays in place — never a workaround in the sources — so " *
-            "any future model or backend change that fails is surfaced here rather than hidden.")
+            "82 lowered for all three operations (primal, gradient, and the compiled HMC loop).")
 end
 
 # ---- Batch-1 incremental additions (todo 1x4pytu) — SEPARATE receipt, rendered ALONGSIDE ----------
@@ -226,8 +225,9 @@ function render_all80_batch1_coverage_plot(path = _ALL80_BATCH1_PATH)
             title = "Historical batch-1 Reactant lowering coverage (uncertified)",
             scales = scales(Y = (; zero = true)));
         id = "all80-batch1-coverage",
-        title = "Batch-1 coverage — what lowered",
-        description = "The historical batch-1 additions, rendered from the SEPARATE " *
+        title = "Batch-1 Reactant coverage ($_REMOVED_REACTANT_LABEL) — what lowered",
+        description = _REMOVED_REACTANT_NOTE * " " *
+            "The historical batch-1 additions, rendered from the SEPARATE " *
             "all80-batch1-v1.toml — a UNION alongside the frozen 82, never merged into it. This saved run is uncertified: Reactant producer provenance and ordinary-AE certification are absent. Registered against the " *
             "existing upstream Turing + posteriordb Stan comparators (no new Turing translation).")
 end
@@ -272,8 +272,9 @@ function render_all80_irt_coverage_plot(path = _ALL80_IRT_PATH)
             title = "IRT batch Reactant lowering coverage (certified)",
             scales = scales(Y = (; zero = true)));
         id = "all80-irt-coverage",
-        title = "IRT coverage — what lowered",
-        description = "The IRT additions, rendered from the SEPARATE " *
+        title = "IRT Reactant coverage ($_REMOVED_REACTANT_LABEL) — what lowered",
+        description = _REMOVED_REACTANT_NOTE * " " *
+            "The IRT additions, rendered from the SEPARATE " *
             "all80-irt-v1.toml — a UNION alongside the frozen 82, never merged into it. Certified " *
             "ordinary-AE run (both phases backend-recorded + loaded-module certified, one run id). " *
             "Registered against the existing upstream Turing + posteriordb Stan comparators (no new " *

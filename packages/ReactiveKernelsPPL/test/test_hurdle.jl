@@ -1,7 +1,6 @@
 # Hurdle-Poisson response (SB `hurdle_poisson` mirror): surface admission,
 # value parity vs a BRM-math hand oracle (literal / Beta-sampled /
-# predictor-fed / per-observation p_zero), Enzyme-vs-findiff gradients,
-# Reactant/XLA value+grad (in test_hurdle_reactant.jl), and SB-parity
+# predictor-fed / per-observation p_zero), Enzyme-vs-findiff gradients, and SB-parity
 # constants (filled with the peer
 # lane's BridgeStan numbers before landing). (`_findiff_grad` /
 # `_GEN_BACKEND` come from test_generator.jl, included first.)

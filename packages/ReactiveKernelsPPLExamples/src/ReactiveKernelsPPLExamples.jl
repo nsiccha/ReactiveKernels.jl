@@ -126,8 +126,7 @@ include("bones_model.jl")
 include("multi_occupancy.jl")
 
 # posteriordb dynamics batch: lotka_volterra, sir,
-# soil_incubation (native + ordinary-Reverse path under 008vhy5; compiled
-# Reactant unsupported — see each module docstring).
+# soil_incubation (native + ordinary-Reverse path under 008vhy5).
 include("lotka_volterra.jl")
 include("sir.jl")
 include("soil_incubation.jl")

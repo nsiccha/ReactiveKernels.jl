@@ -131,29 +131,30 @@ both Jacobian terms are absent from that prepared function.
 
 The comparison below measures only the packed unconstrained posterior used by
 a sampler. Observations, observation scales, and `α_prior_sd` are bound before
-timing. Planning, AD preparation, Reactant transfers and compilation, first
-execution, and result readback are all outside the steady-state region.
+timing. Planning, AD preparation, compilation (including the historical
+Reactant transfers), first execution, and result readback are all outside the
+steady-state region.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_sum_to_zero_benchmarks()
 ```
 
 Native RK is competitive with the optimized handwritten control and materially
-faster than Turing for both primal evaluation and reverse AD. Reactant executes
-the exact authored RK graph and lands within a few percent of the
-scalar-unrolled `K = 8` manual control for both primal evaluation and
-value-plus-gradient. That receipt was measured under a former lowering that
-expanded a plate with at most 16 lanes into per-lane scalar recipes with a
-scalar reduction, so XLA fused the whole posterior into one CPU kernel exactly
-as it does for the hand-unrolled loop. A plate's lane count is a data length,
-so that expansion is the data-derived unrolling the [core
-constraints](constraints.md) forbid, and it has been removed: every plate now
-keeps the batched lowering, which compiled this graph into several kernels (a
-materialized effect vector reused by two plates, scalars broadcast across
-lanes, and two reductions) and measured between 1.4× and 2× slower than the
-fused kernel in the earlier comparison. The automatic AD compile still keeps
-small bound arrays embedded as compiler literals. Turing is absent from the
-Reactant panels because DynamicPPL does not expose a public Reactant-traceable
+faster than Turing for both primal evaluation and reverse AD.
+
+The two Reactant panels are historical: ReactiveKernels has since removed its
+Reactant path, and they are kept as recorded. Through that path RK executed the
+exact authored graph within a few percent of the scalar-unrolled `K = 8`
+manual control for both primal evaluation and value-plus-gradient. That
+receipt was measured under a former lowering that expanded a plate with at
+most 16 lanes into per-lane scalar recipes with a scalar reduction, so XLA
+fused the whole posterior into one CPU kernel exactly as it does for the
+hand-unrolled loop. A plate's lane count is a data length, so that expansion
+is the data-derived unrolling the [core constraints](constraints.md) forbid,
+and it was removed before the Reactant path itself; the batched lowering that
+replaced it compiled this graph into several kernels and measured between
+1.4× and 2× slower than the fused kernel. Turing is absent from the Reactant
+panels because DynamicPPL did not expose a public Reactant-traceable
 model-evaluation interface.
 
 Recovery is not benchmarked as part of the density. The receipt and generated

@@ -74,9 +74,7 @@ authored. An elementwise declaration such as `z[1:0] .~ Normal.(0, 1)` is an
 empty vector with no coordinates and zero prior and log-Jacobian. The same
 identity applies to empty matrix axes and empty data-sized elementwise arrays;
 negative declared sizes and out-of-bounds gathers remain errors.
-Native gradients also support a completely empty coordinate pack. Compiled
-values support it; compiled gradients currently fail at the backend's empty
-tensor export boundary (see [Core constraints](constraints.md)).
+Native gradients also support a completely empty coordinate pack.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("01_gaussian.jl", :rkppl_first_model; preamble = "using ReactiveKernelsPPL")
@@ -206,11 +204,9 @@ a vector literal containing live values, or an array-valued definition.
 The concentration shape determines the simplex size at binding; it does not
 replicate the density body. Concentrations must be positive.
 
-Dynamic Normal, Cauchy and Weibull truncation supports native and Reactant
-primal and reverse execution. Gamma, Beta and InverseGamma truncation calls
-incomplete gamma or beta functions whose traced methods are still unavailable;
-those normalizers support native execution. Hierarchical Dirichlet supports
-native and compiled primal and reverse execution.
+Dynamic Normal, Cauchy and Weibull truncation and hierarchical Dirichlet
+support native primal and reverse execution. Gamma, Beta and InverseGamma
+truncation normalizers support native execution.
 
 ## Distribution arguments are values
 
@@ -390,8 +386,7 @@ backend AD. Statistical bodies remain caller-owned. Model-sized iteration
 belongs in visible submodel statements or retained plates/scans, following
 [Core constraints](constraints.md). The initial custom RHS acceptance tests
 cover native values, ordinary Enzyme Reverse, host/kernel transforms and
-printed-source replay; compiled backend support depends on the caller's Julia
-operations and requires its own retained-loop acceptance. Custom scan-state
+printed-source replay. Custom scan-state
 geometry is not yet implemented. Ordinary RHS keyword arguments are preserved;
 geometry endpoints receive those same keyword values. Structural argument
 expressions retain Julia's `Expr(:parameters, ...)` keyword representation.
@@ -411,8 +406,7 @@ generated values to sampler coordinates.
   probability `0.5`, `InverseGaussian.(exp.(eta))` uses unit shape,
   `Weibull.(k)` uses unit scale, and `VonMises.(exp.(eta))` has zero mean
   and concentration `exp.(eta)`. Plate observations accept `Normal.(mu)` too.
-  Live VonMises concentration supports native values and derivatives;
-  Reactant compilation still encounters its existing traced `besseli` gap.
+  Live VonMises concentration supports native values and derivatives.
 - `Bool` response values retain their numeric meaning, zero or one.
   Responses with a strictly positive data domain require `true`.
 - `MixtureModel.(vcat.(C1, C2))` gives the components equal weights.
@@ -448,16 +442,10 @@ generated values to sampler coordinates.
   density branch. Mixture components may use independent links.
   A computed coefficient such as `b = z * lambda * tau` reads its
   declared parameters, so using it as a scale retains the same priors.
-  Native value and reverse checks cover this form. With Reactant 0.2.290,
-  some shared scalar density guards fail during tracing with
-  `isless(::Int64, ::Reactant.EnsureReturnType{Any})`, before the compiled
-  primal runs. The generic RK reproducer is
-  `benchmark/repro_reactant_shared_scale_guard.jl`; this also reproduces
-  outside the PPL and predates the construct removal.
+  Native value and reverse checks cover this form.
 - Plate cells accept `BernoulliLogit.(eta)` and `PoissonLog.(eta)` directly
   on the logit and log-rate scales. A bare modeled `VonMises.(kappa)` uses
-  zero mean. Live concentration supports native density and AD; compiled
-  execution remains gated by the missing traced `besseli` method.
+  zero mean. Live concentration supports native density and AD.
 - A vector response uses the dotted tilde, `y .~ Normal.(mu, sigma)`. A plain
   `y ~ Normal(...)` on a data vector is rejected.
 - A `~` whose left-hand side is a bound data column is an observation. On an
@@ -525,10 +513,7 @@ computed even when one element is read.
 
 Composition exposes the child's execution capabilities. Ordinary native
 Enzyme reverse covers empty and nonempty child scans, including inside a bound
-`eachcol` subject plate. The default compiled backend expands small subject
-plates into copies of the child scan, so those shapes still lack retained-loop
-structural acceptance. The composition tests keep that gap visible; larger
-compiled subject plates are covered separately.
+`eachcol` subject plate.
 
 A data-only call used only by a parameter-dependent function runs once when
 `prepare_query` or `prepare_sampler` prepares the graph. It may return a tuple or
@@ -597,11 +582,8 @@ Julia's `UniformScaling`, added to the diagonal. The factor spellings
 `MvNormalCholesky(zeros(N), cholesky(Symmetric(K)).L)` and
 `MvNormalCholesky(zeros(N), rk_cholesky_lower(K))` state the same density.
 
-Valid multivariate priors compile with Reactant when prepared with
-`on_error = :ignore`. This explicit preparation policy strips visible
-throws and assertions; native preparation checks the factor or covariance.
-The shared solve retains its loops and ordinary reverse AD. Compiled empty
-gradients remain subject to the [Reactant export limitation](constraints.md#acceptance-and-existing-limitations).
+Native preparation checks the factor or covariance. The shared solve retains
+its loops and ordinary reverse AD.
 
 ## Declared arrays as values
 
@@ -616,12 +598,6 @@ packed coordinates.
 The LKJ shape `eta` is a scalar value: it can be a positive literal, bound
 data, a sampled parameter, or a definition using those values. A per-level
 LKJ prior can share that same value across all its factors.
-
-Compiled reverse mode currently fails for a data-sized whole factor with a
-live shape when its retained diagonal prior and shared response expressions
-both read the factor. Native density and gradients and compiled primal pass.
-The literal two-dimensional and per-level forms have compiled reverse coverage;
-see the [backend limitation](constraints.md#acceptance-and-existing-limitations).
 
 Joint correlated responses can also use explicit factor priors:
 declare `sd[1:2] .~ Gamma.(2, 1)` and `C ~ LKJCholesky(2, eta)`,
@@ -680,8 +656,7 @@ distances during preparation; locations derived from parameters retain live
 distance calculations. The covariance matrix remains dense and diagonal jitter
 depends on position, including when two locations are equal. Dense Cholesky in
 `gp_chol_latent` delegates its factorization to the general RK-proper
-`rk_cholesky_lower` callable, preserving native gradient support;
-compiled covariance support does not imply compiled Cholesky gradients.
+`rk_cholesky_lower` callable, preserving native gradient support.
 Import these helpers into the model module as ordinary Julia functions. For
 explicit graph composition, load RK and RKPPL and use
 `BayesianRegressionModels.rk_model(:gp_exp_quad_cov)` or
@@ -701,10 +676,8 @@ A module function's result has no tracked level axes: `b = identity(z)`
 followed by `b[g, 1]` uses integer positions too. Binding checks that positional
 indices are positive integers and within known sizes. If the result's size
 depends on a function call, Julia checks its bounds when the result is read.
-Linear indexing of an adjoint row currently supports native execution and
-Enzyme gradients; Reactant tracing fails on that wrapper. Linear indexing of
-a plain matrix and positional gathers from module-produced arrays compile.
-See [backend limitations](constraints.md#acceptance-and-existing-limitations).
+Linear indexing of an adjoint row supports native execution and Enzyme
+gradients.
 
 Gathering by a derived column is not supported yet. Pass a declared array
 whole to a model-level Julia function when it needs the full value; a bare
@@ -715,8 +688,7 @@ A declared array with a real-support prior, such as `Normal`, `StudentT` or
 `Flat`, and a real-support plate latent read the sampler's packed
 coordinates in place, so no native evaluation copies them. Such a value is a
 read-only `AbstractVector{Float64}` view; a two-axis array is a reshaped view
-(`AbstractMatrix{Float64}`). Compiled execution traces the same block as a
-slice. An array with a constrained prior is its transform's fresh output. A
+(`AbstractMatrix{Float64}`). An array with a constrained prior is its transform's fresh output. A
 function that receives one whole should accept `AbstractVector` or
 `AbstractMatrix`, and must not write into it.
 
@@ -864,13 +836,6 @@ is introduced. Missing responses read elsewhere as model values and missing
 components of joint outcomes still need richer handling; those uses fail rather
 than silently inventing values or discarding supplied joint components.
 
-The current default Reactant runtime can fail compilation when a matrix-vector
-predictor feeds a strided presence gather. The backend-only reproducer is
-`benchmark/repro_reactant_strided_dot_gather.jl`; native execution remains
-available. This compiler repair is tracked separately from missing-response
-binding. Successful compiled checks for other shapes do not establish support
-for this affected shape.
-
 Some short guarded likelihood batches expand into repeated scalar work during
 backend optimization. RK must emit retained loops or batched array structure;
 subsequent semantics-preserving backend unrolling is diagnostic, following the
@@ -907,7 +872,7 @@ one factor per stratum. An observation cell can then read `sd[s[i], :]`,
 `L[s[i]]` and `z[g[i], :]`, compute a matrix-vector product, and name a
 scalar output with `r[i] = ...` or a row with `b[i, 1:K] = ...`. Shared arrays
 enter the generated RK plates through `Ref`; increasing observations or
-strata does not multiply their compiled cell regions.
+strata does not multiply their cell regions.
 
 A per-level row statement, `b[j, :] ~ MvNormalCholesky(zeros(2), F)` inside a
 plate over `levels(g)`, is equivalent to
@@ -932,8 +897,6 @@ on `levels(h)` also works when every loop label occurs on that full axis;
 the order and number of its coordinates can differ from `levels(g)`.
 Matrix row reads follow the same rule. Raw bound-array reads and lazy
 branches keep their authored Julia semantics.
-Reactant's remaining limitation for an invalid host-constant index inside
-an inactive live branch is recorded in the [core constraints](constraints.md).
 
 In an array cell, an observation must read a named per-index output
 (`y[i] ~ Normal(r[i], sigma)`), rather than a cell local directly.
@@ -1028,7 +991,7 @@ index's value. The observation lowers to RK's nested group and observation plate
 observation plate runs inside the group plate, with no copy per group. The
 `:pointwise` query returns one array of densities per index, and empty arrays
 contribute zero. Native values and ordinary Enzyme reverse gradients are
-supported; RK does not implement compiled nested plate regions.
+supported.
 
 Every observation a flat response admits runs on each index's entries the
 same way. This includes link families such as `BernoulliLogit.(eta[i])` and
@@ -1151,8 +1114,8 @@ per index, and `unconstrain` and `restore_draws` take and give that shape. A
 dotted latent of the same cell may read `c[i]`, which has the geometry's shape
 there. A geometry whose shape reads a sampled value is refused at binding.
 Native values and ordinary Enzyme Reverse gradients are supported. Not built
-yet: such latents over `levels(…)`, and predictive draws, `jax_source` and
-compiled execution of them.
+yet: such latents over `levels(…)`, and predictive draws and `jax_source`
+of them.
 
 Two properties of the law keep its density differentiable by native Enzyme
 Reverse. Pass a distribution family as a type parameter, not a field: with

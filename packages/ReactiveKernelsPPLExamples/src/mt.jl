@@ -16,7 +16,7 @@ export MT_SOURCE, evaluate_mt_source
 #                          = (Y · logit(p))[i] + Σⱼ log(1-p[j]),
 # and logit(p[j]) = u_p[j] (the unconstrained value), so the per-individual
 # detection log-likelihood is the matrix-vector product `Y * u_p` plus a shared
-# constant — this lowers through Reactant when the capture matrix Y is bound. The
+# constant. The
 # observed/unobserved split (s>0 vs s==0) is a DATA mask; never-detected
 # individuals have an all-zero history, so their term reduces to Σⱼ log(1-p[j]).
 # Real data is M=237/T=3 (C=87 observed, 150 augmented zeros); a representative
@@ -155,8 +155,8 @@ transforms with their Jacobians (implicit uniform priors, contributing 0). The
 per-individual detection log-likelihood is the matrix-vector product `Y * u_p`
 (the capture matrix times the detection log-odds) plus a shared constant; the
 likelihood marginalizes the latent inclusion indicator with a `log_sum_exp` over
-never-detected individuals — the observed/unobserved split is a data mask, so it
-lowers through Reactant when the capture matrix is bound. Named nodes for the
+never-detected individuals — the observed/unobserved split is a data mask.
+Named nodes for the
 transform Jacobian, the `parameters` NamedTuple, pointwise/summed likelihood,
 densities, the posterior, and the `omega_nd` generated quantity.
 """

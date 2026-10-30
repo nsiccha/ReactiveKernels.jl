@@ -153,10 +153,6 @@ end
     # Original invalid-index behavior is retained (todo0arze4h).
     invalid=prepare(subject;bound=(idx=fill(4,32),x=fill(.25,32)))
     @test_throws BoundsError invalid(q)
-    # Native/tensor bodies keep the same operation table without tracing.
-    _,nativeops,_=RK._lower_with_ops(k.plan;inline_embedded=true)
-    _,tensorops,_=RK._lower_with_ops(k.plan;inline_embedded=true,tensorized=true)
-    @test nativeops==tensorops
 end
 
 @testset "index runs: retained loops across fresh data sizes" begin

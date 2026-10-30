@@ -1,6 +1,6 @@
 # Focused acceptance/measurement driver. Run in a consumer environment containing
-# RK, its distribution package, PosteriorDB, BenchmarkTools, SpecialFunctions, and Enzyme;
-# add Reactant for RK_INNER_PE_BACKEND=reactant. Output belongs in task scratch.
+# RK, its distribution package, PosteriorDB, BenchmarkTools, SpecialFunctions, and Enzyme.
+# Output belongs in task scratch.
 # Use this SAME detached driver checkout for both compiler revisions. Select
 # the loaded compiler with RK_INNER_PE_COMPILER_ROOT/SHA and ROLE=baseline or
 # candidate (all variables have the RK_INNER_PE_ prefix). Baseline measures ON;
@@ -16,15 +16,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: binomial
 using DifferentiationInterface: AutoEnzyme
 import Enzyme
 
-const backend_name = get(ENV, "RK_INNER_PE_BACKEND", "native")
-backend_name in ("native", "reactant") || error("unknown backend: $backend_name")
-reactant_loaded() = any(id -> id.name == "Reactant", keys(Base.loaded_modules))
-if backend_name == "reactant"
-    @eval using Reactant
-    @assert Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt) !== nothing
-end
-backend_name == "native" && reactant_loaded() && error(
-    "native-only measurements require a fresh Julia process without Reactant loaded")
 const package_load_s = time() - load_started
 const ad_backend = AutoEnzyme(; mode = Enzyme.Reverse)
 const root = dirname(@__DIR__)
@@ -225,8 +216,6 @@ function used_inputs(p)
 end
 
 function run_case(label, spec, q, data; active = :q, want = :total)
-    backend_name == "native" && reactant_loaded() && error(
-        "Reactant was loaded into the native-only measurement process")
     reference_value = nothing
     reference_gradient = nothing
     results = Dict[]
@@ -262,9 +251,9 @@ function run_case(label, spec, q, data; active = :q, want = :total)
             if value isa AbstractArray && canon_id(original.graph, port(spec, name).id) in original_used &&
                !(canon_id(original.graph, port(spec, name).id) in residual_used); init=0)
         row = Dict{String,Any}(
-            "case" => label, "bound" => bound, "backend" => backend_name,
+            "case" => label, "bound" => bound, "backend" => "native",
             "role" => run_role, "input_sha256" => input_receipt(q, data, active, want),
-            "host_context" => reactant_loaded() ? "reactant_loaded" : "native_only",
+            "host_context" => "native_only",
             "prepare_s" => prep.time, "prepare_bytes" => prep.bytes,
             "native_first_call_s" => first_call.time,
             "ad_prepare_s" => ad_prep.time, "ad_first_call_s" => first_ad.time,
@@ -273,23 +262,8 @@ function run_case(label, spec, q, data; active = :q, want = :total)
             "net_array_operand_bytes" => cache_bytes - eliminated,
             "retained_constant_bytes" => Base.summarysize(Tuple(r.op.value for r in constants)),
             "repeats" => Dict[])
-        if backend_name == "native"
-            primal = (invoke_kernel, kernel, args)
-            derivative = (invoke_gradient, prepared, gradient, args)
-        else
-            traced = map(Reactant.to_rarray, args)
-            compilation = @timed Reactant.compile(kernel, traced; sync=true)
-            ad_compilation = @timed compile_ad_value_and_gradient(prepared, traced...; sync=true)
-            compiled, compiled_ad = compilation.value, ad_compilation.value
-            @test Float64(compiled(traced...)) ≈ value rtol=2e-11 atol=1e-9
-            rv, rg = compiled_ad(traced...)
-            @test Float64(rv) ≈ value rtol=2e-11 atol=1e-9
-            @test Array(rg) ≈ gradient rtol=2e-10 atol=1e-9
-            row["reactant_compile_s"] = compilation.time
-            row["reactant_ad_compile_s"] = ad_compilation.time
-            primal = (invoke_kernel, compiled, traced)
-            derivative = (invoke_kernel, compiled_ad, traced)
-        end
+        primal = (invoke_kernel, kernel, args)
+        derivative = (invoke_gradient, prepared, gradient, args)
         push!(states, (; row, primal, derivative))
         push!(results, row)
     end
@@ -346,7 +320,7 @@ function main()
     _require_clean_detached_candidate(compiler_root) == compiler_sha || error("compiler HEAD changed during measurement")
     output = Dict("julia" => string(VERSION), "package_load_s" => package_load_s,
         "driver_sha" => driver_sha, "compiler_sha" => compiler_sha, "role" => run_role,
-        "dependencies" => dependencies, "backend" => backend_name,
+        "dependencies" => dependencies, "backend" => "native",
         "process_pair_id" => process_pair_id, "process_order" => process_order,
         "paired_repeats" => paired_repeats, "sources" => source_hashes,
         "threads" => Threads.nthreads(), "cpu" => Sys.CPU_NAME,

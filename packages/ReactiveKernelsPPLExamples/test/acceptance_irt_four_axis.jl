@@ -1,24 +1,13 @@
 # Focused, real-package four-axis acceptance for the posteriordb IRT batch.
 #
-# Run from the repository root with the shared BridgeStan/Reactant environment:
+# Run from the repository root with the shared BridgeStan environment:
 #
-#   IRT_REACTANT=0 julia --project=benchmark/all80-env \
-#     packages/ReactiveKernelsPPLExamples/test/acceptance_irt_four_axis.jl
-#   IRT_REACTANT=1 julia --project=benchmark/all80-env \
+#   julia --project=benchmark/all80-env \
 #     packages/ReactiveKernelsPPLExamples/test/acceptance_irt_four_axis.jl
 #
-# The native phase proves Reactant is absent both before package import and after
-# every assertion. The Reactant phase is a separate process and lowers its
-# `@compile` expressions only through acceptance_irt_reactant.jl. Each selected
-# model gets six BridgeStan-valid native value/Reverse-gradient probes and one
-# ordinary Reactant probe; irt_2pl additionally forwards one oracle-checked
-# probability-saturation stress probe through both backends.
-
-const DO_REACTANT = get(ENV, "IRT_REACTANT", "0") == "1"
-_pkg_loaded(name) = any(id -> id.name == name, keys(Base.loaded_modules))
-if !DO_REACTANT
-    @assert !_pkg_loaded("Reactant") "native phase started with Reactant loaded"
-end
+# Each selected model gets six BridgeStan-valid native value/Reverse-gradient
+# probes; irt_2pl additionally checks one oracle-checked probability-saturation
+# stress probe.
 
 using Random
 using LinearAlgebra
@@ -31,17 +20,6 @@ using ReactiveKernelsPPLExamples
 using ReactiveKernelsPPLExamples:
     Irt2plExample, TwoplLatentRegIrtExample, Hier2plExample, GpcmLatentRegIrtExample
 
-if !DO_REACTANT
-    @assert !_pkg_loaded("Reactant") "real-package native import loaded Reactant"
-end
-if DO_REACTANT
-    import Reactant
-    @assert _pkg_loaded("Reactant") "Reactant phase failed to load Reactant"
-    include(joinpath(@__DIR__, "acceptance_irt_reactant.jl"))
-else
-    _reactant_axes(args...) = nothing
-end
-
 # Ordinary reverse-mode AD only: no function annotation, runtime activity
 # annotation, custom rule, or finite-difference substitution.
 const AD_BACKEND = AutoEnzyme(mode = Enzyme.Reverse)
@@ -52,8 +30,6 @@ const IRT_SATURATION_ETA = 40.0
 
 const VALUE_TOL = 1e-6
 const GRAD_TOL = 1e-3
-const REACTANT_VALUE_TOL = 1e-6
-const REACTANT_GRAD_TOL = 2e-3
 
 _relative_scalar(a, b) = abs(a - b) / max(abs(b), 1.0)
 _relative_vector(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), 1.0))
@@ -234,20 +210,18 @@ const REQUESTED = _parse_requested(
 )
 const RAN = String[]
 
-println("IRT four-axis acceptance phase=", DO_REACTANT ? "reactant-loaded" : "native-unloaded")
+println("IRT four-axis acceptance")
 println("source_head=", _repository_head())
 println("julia=", VERSION, " ReactiveKernels=", _version_label(ReactiveKernels),
         " ReactiveKernelsPPLExamples=", _version_label(ReactiveKernelsPPLExamples))
 println("BridgeStan=", _version_label(BridgeStan),
         " PosteriorDB=", _version_label(PosteriorDB),
         " Enzyme=", _version_label(Enzyme),
-        " DifferentiationInterface=", _version_label(DifferentiationInterface),
-        DO_REACTANT ? string(" Reactant=", _version_label(Reactant)) : "")
+        " DifferentiationInterface=", _version_label(DifferentiationInterface))
 println("native_AD=ordinary AutoEnzyme(mode=Enzyme.Reverse)",
         " stan_query=propto=false,jacobian=true")
 println("probe_seed=", PROBE_SEED, " native_probe_scale=", NATIVE_PROBE_SCALE,
         " native_probes_per_model=", NATIVE_PROBE_COUNT,
-        " reactant_ordinary_probes_per_model=1",
         " irt_probability_saturation_stress_probes=",
         "irt_2pl" in REQUESTED ? 1 : 0,
         " eta>=", IRT_SATURATION_ETA)
@@ -316,15 +290,10 @@ for key in REQUESTED
                 " native ordinary-Reverse value+gradient finite and matched")
     end
 
-    _reactant_axes(case, kernel, prepared, stan_model, points[1], stress_q)
     push!(RAN, key)
     flush(stdout)
 end
 
 @assert length(RAN) == length(REQUESTED)
 @assert Set(RAN) == Set(REQUESTED)
-if !DO_REACTANT
-    @assert !_pkg_loaded("Reactant") "native phase loaded Reactant during acceptance"
-end
-println("\nIRT four-axis acceptance complete: models_ran=", length(RAN),
-        " phase=", DO_REACTANT ? "reactant-loaded" : "native-unloaded")
+println("\nIRT four-axis acceptance complete: models_ran=", length(RAN))

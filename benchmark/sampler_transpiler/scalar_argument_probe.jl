@@ -1,5 +1,5 @@
-# A nonsampler consumer of the same finite MethodIR compiler. Each backend
-# checks the source's closed-form result; no cross-backend comparison is used.
+# A nonsampler consumer of the same finite MethodIR compiler. The native
+# lowering checks the source's closed-form result.
 using ReactiveKernels
 using ReactiveKernels.NativeSlotCompiler:
     fast_native_factory,compile_native_slots,slot_chain,slotplan,slotfields
@@ -29,29 +29,4 @@ function check_native_scalar()
     println("native_scalar_value=",value)
 end
 
-# Execute native lowering before loading the optional backend.
 check_native_scalar()
-using Reactant
-const TSC=Base.get_extension(RK,:ReactiveKernelsReactantExt).TracedSlotCompiler
-
-function check_traced_scalar(program)
-    f,metadata=program.f,program.metadata
-    driver=(state,increment,counts)->f(deepcopy(state),increment,counts,metadata)
-    initial=Reactant.to_rarray(deepcopy(program.state);track_numbers=true)
-    increment=Reactant.to_rarray(2.0;track_numbers=true)
-    counts=Reactant.to_rarray((0,0);track_numbers=true)
-    compiled=Reactant.compile(driver,(initial,increment,counts);
-        sync=true,donated_args=:none)
-    # Reuse one executable with different runtime scalar values.
-    for (amount,expected) in ((2.0,9.0),(3.0,13.0))
-        input=Reactant.to_rarray(amount;track_numbers=true)
-        result=compiled(initial,input,counts)
-        value=Float64(only(result.state.values))
-        value==expected || error("traced source accumulation failed")
-        Float64(result.argument)==amount || error("traced argument changed")
-        Float64(only(initial.values))==1.0 || error("traced caller state changed")
-        println("traced_scalar_value=",value," preserved_increment=",Float64(result.argument))
-    end
-end
-
-Base.invokelatest(check_traced_scalar,TSC.compile_traced_slots(build_scalar_program()))

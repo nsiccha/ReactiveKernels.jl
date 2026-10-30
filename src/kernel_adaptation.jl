@@ -649,8 +649,7 @@ struct OrderedRNGReplay{N,U,E,T,NI,UI,EI,TI,O}
 end
 
 # The unchecked constructor is deliberately private and token-gated.  It is
-# used only to rebuild an already validated replay while tracing tensorized
-# cursors.  Public callers get the validating value-plus-event-tape
+# used only to rebuild an already validated replay.  Public callers get the validating value-plus-event-tape
 # constructor below; there is no public full-field cursor escape hatch.
 @inline _sm_ordered_rng_reconstruct(
         normals, uniforms, exponentials, event_tokens, normal_index,
@@ -5036,10 +5035,8 @@ _sm_machine_state_type(
 
 # A Cholesky wrapper travels as its `(factors, uplo, info)` parts: the factors
 # recurse structurally, `uplo` is a static identity, and `info` is one numeric
-# column (a factorization computed inside a compiled call may carry a traced
-# success flag).  A backend's representation-only wrapper (the Reactant
-# extension's traced Cholesky) registers its own accessor; anything else is
-# not a Cholesky.
+# column.  A backend's representation-only wrapper registers its own
+# accessor; anything else is not a Cholesky.
 _sm_observation_cholesky_parts(value::LinearAlgebra.Cholesky) =
     (factors=value.factors, uplo=value.uplo, info=value.info)
 _sm_observation_cholesky_parts(value) = nothing
@@ -5092,9 +5089,8 @@ end
 # Anything else is a static identity: carried by reference, never stored.
 _sm_observation_storage(value, ::Type{T}, ::Val, marker) where {T} = value
 
-# One column of zeros shaped like `value` with a trailing slot axis.  A backend
-# fills the column in its own value domain (the Reactant extension emits one
-# `fill`), so the program never spells out the capacity.
+# One column of zeros shaped like `value` with a trailing slot axis, filled
+# once, so the program never spells out the capacity.
 _sm_observation_array_column(value::AbstractArray, ::Val{Capacity}) where {Capacity} =
     fill(zero(eltype(value)), size(value)..., Capacity)
 
@@ -5549,17 +5545,6 @@ function _sm_validate_observation_result(
     result
 end
 
-# A recipe whose operation is a bare factorization identity (`F = cholesky(A)`)
-# keeps that identity in the graph, so under a tracing backend it returns the
-# backend's own factorization type.  Before such a value is stored as state it
-# passes through `_tensorized_factorization` (core.jl), which the backend
-# extension specializes to its wrapper; container structure is walked and
-# every other leaf is returned unchanged.
-@inline _sm_backend_logical_value(value) = _tensorized_factorization(value)
-@inline _sm_backend_logical_value(value::NamedTuple) =
-    map(_sm_backend_logical_value, value)
-@inline _sm_backend_logical_value(value::Tuple) =
-    map(_sm_backend_logical_value, value)
 
 @inline _sm_backend_storage_value(value) = value
 @inline _sm_backend_storage_value(value::NamedTuple) =
@@ -6011,15 +5996,8 @@ end
 # Retained loop of a functional state transition: `body` is one compiled
 # program `(ensures, controls, carry, index) -> carry` over a tuple carry of
 # canonical field values and lexical locals, run once per iteration of
-# `range`.  A backend extension specializes the backend method on its traced
-# marker to run the same body inside one retained loop region; the native
-# loop below is the default.
-@inline function _sm_transition_loop(body, ensures, controls, range, carry::Tuple)
-    _sm_transition_loop_backend(
-        _dynamic_tensorized_marker(carry), body, ensures, controls, range, carry)
-end
-function _sm_transition_loop_backend(marker, body, ensures, controls, range,
-                                     carry::Tuple)
+# `range`, as a native loop.
+function _sm_transition_loop(body, ensures, controls, range, carry::Tuple)
     for index in range
         carry = body(ensures, controls, carry, index)
     end
@@ -10580,7 +10558,7 @@ end
 function _sm_normalize_compiled_state(
         transition::CompiledStateTransition, value)
     canonical = _sm_canonicalize_topology(
-        _sm_backend_logical_value(value), _sm_compiled_topology(transition))
+        value, _sm_compiled_topology(transition))
     _sm_restore_compiled_external_groups(transition, canonical)
 end
 

@@ -21,7 +21,7 @@ recurring vocabulary across the examples is:
 - **packed-unconstrained** — a single `unconstrained::Vector` split into the
   latent components; the native-HMC boundary.
 - **named-latent** — the components (`μ`, `τ`, `θ`, …) or the constrained
-  `parameters` object supplied directly; the Reactant-friendly boundary.
+  `parameters` object supplied directly.
 Both feed the *same* prior/likelihood graph; HAVE authority prunes whichever
 edges the query does not need (e.g. supplying both `τ` and `log_τ` makes both
 authoritative, so neither is recomputed — no `log(exp(x))` round trip).

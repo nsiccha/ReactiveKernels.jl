@@ -82,19 +82,3 @@ types. Prediction takes a standard-normal innovation as an input rather than
 drawing a random number inside a recipe. That preserves the graph's purity: a
 caller can draw a fresh innovation, replay a fixed one, or batch them using the
 same prepared kernel without hiding an effect from the planner.
-
-## Reactant
-
-The exact authored graph compiles and executes through the public Reactant
-boundary with no model-specific lowering path. `test/test_ppl_examples_reactant.jl`
-converts the packed unconstrained boundary to Reactant arrays, `@compile`s the
-prepared density kernel, and asserts the compiled result matches the native
-evaluation. The small static likelihood plate lowers as per-lane scalar recipes
-with a scalar reduction — there is no opaque or externalized operation in the
-compiled module.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.LinearRegressionExample.demo()'
-```

@@ -262,7 +262,7 @@ using ReactiveKernels, Test
                 end
                 return sum(scores)
             end
-            @test RK._needs_embedded_tensorization(plan(event_mixtures))
+            @test RK._owns_array_regions(plan(event_mixtures))
             function plate_value_ids!(ids, graph)
                 for r in graph.recipes
                     r.op isa RK._AuthoredPlateOp || continue

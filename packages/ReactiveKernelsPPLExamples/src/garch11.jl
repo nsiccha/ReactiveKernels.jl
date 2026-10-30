@@ -69,9 +69,7 @@ using LogExpFunctions: logistic, log1pexp
     #   σ₁ = sigma1 (data);  σₜ = sqrt(α0 + α1·(y_{t−1} − μ)² + β1·σ_{t−1}²)  (t ≥ 2).
     # Authored with `scan`: the carry is σ_{t−1} (seeded σ₁ = sigma1) and the
     # per-step input is y_{t−1} (the lagged series, derived in-graph). `scan`
-    # lowers this recurrence to a stablehlo.while carry loop, so the whole density
-    # compiles through Reactant off the natural recursion — a raw scalar-indexed
-    # `for`/`σ[t-1]` loop over a traced array would not.
+    # keeps this recurrence one retained carry loop.
     T::Int = length(y)
     y_lag::Vector{Float64} = y[1:(T - 1)]                 # y_{t−1}, in-graph shape prep
     sigma_tail::Vector{Float64} =
@@ -92,8 +90,6 @@ using LogExpFunctions: logistic, log1pexp
     posterior::Float64 = likelihood + log_jacobian
 
     # Deterministic one-step-ahead conditional sd σ_{T+1}, read off the last state.
-    # Explicit `T` index (not `end`) so `forecast_sigma` also lowers through
-    # Reactant — `end` on a traced result does not resolve in the traced program.
     forecast_sigma::Float64 =
         sqrt(alpha0 + alpha1 * (y[T] - mu)^2 + beta1 * sigma[T]^2)
 
@@ -106,9 +102,8 @@ sigma1 = GARCH11_SIGMA1
 
 requested_nodes = (:parameters, :log_jacobian, :sigma, :pointwise, :likelihood,
                    :posterior, :forecast_sigma)
-# The iterated series `y` enters as a TRACED argument (only the scalar `sigma1`
-# is bound), so the `scan` recursion lowers to a `stablehlo.while` carry loop
-# under Reactant instead of unrolling over the fixed-length series.
+# The iterated series `y` stays a live argument (only the scalar `sigma1` is
+# bound), so the `scan` recursion is one retained loop over the series.
 density_kernel = prepare(model;
     have = (:unconstrained, :y, :sigma1),
     want = requested_nodes,
@@ -165,7 +160,7 @@ Build the posteriordb `garch11` model as a declarative
 `ReactiveKernels.KernelSpec`: a Gaussian GARCH(1,1) with mean `mu`. The
 conditional standard deviations are computed by a sequential recursion authored
 inline with the `scan` primitive (carry σ_{t−1}, per-step input the lagged
-series), so the density lowers through Reactant off the natural recursion. The
+series). The
 support transforms + Jacobian (exp for `alpha0`, the (0,1) logistic for
 `alpha1`, and the (0, 1−alpha1) scaled logistic for `beta1` — whose upper bound
 depends on `alpha1`, matching Stan's declaration-order constraining), the

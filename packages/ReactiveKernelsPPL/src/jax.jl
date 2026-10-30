@@ -73,8 +73,8 @@ end
 ReactiveKernels._jax_elementwise(::typeof(PPLGeneratedModels._ppl_logistic)) = "jax.nn.sigmoid"
 ReactiveKernels._jax_elementwise(::typeof(PPLGeneratedModels._ppl_normcdf)) = "jsp.ndtr"
 
-# The packed-coordinate transforms, as the vector expressions of their traced
-# twins (`layout.jl`). `lo` and `hi` are 1-based literal bounds of the block.
+# The packed-coordinate transforms, as vector expressions (`layout.jl`). `lo`
+# and `hi` are 1-based literal bounds of the block.
 const _JAX_ORDERED = """
 def _rk_ordered_constrain(u, lo, hi):
     # RKPPL ordered transform: y[1] = u[lo], y[i] = y[i - 1] + exp(u[lo + i - 1]).

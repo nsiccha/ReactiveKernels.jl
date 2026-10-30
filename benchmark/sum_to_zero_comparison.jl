@@ -1,8 +1,7 @@
 #!/usr/bin/env julia
 
 # Reproducible native primal/AD comparison for the sum-to-zero sampler hot
-# loop. Reactant compilation has a separate receipt because it requires a much
-# heavier pinned environment and has different timing rules.
+# loop.
 
 import Pkg
 

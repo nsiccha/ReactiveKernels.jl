@@ -386,20 +386,15 @@ function sum_to_zero_model_source_preserves_published_authority(current, publish
             "    K::Int = length(effects_s2z)\n",
         ),
         # The pivot-coordinate transform is vectorized (`w`, suffix sum via
-        # `cumsum`, tail rule) so that no loop over the data-derived number
-        # of free coordinates reaches a tensorizing backend
-        # (`docs/src/constraints.md`); the values are identical.  The prepared
-        # graph differs from the one the published v1 measurements ran, so
-        # those measurements stay attributed to the pinned blob and this
-        # delta stays explicit here.
+        # `cumsum`, tail rule); the values are identical.  The prepared graph
+        # differs from the one the published v1 measurements ran, so those
+        # measurements stay attributed to the pinned blob and this delta stays
+        # explicit here.
         (
             "    # Vectorized: `w[i] = y[i] / sqrt(i (i + 1))`, the running sum from the\n" *
-            "    # top is the suffix sum `sum(w) - cumsum(w) + w` (spelled without\n" *
-            "    # `reverse`, whose traced lowering reverses its input buffer in place),\n" *
-            "    # and each `constrained[i + 1]` is the running sum at `i` minus\n" *
-            "    # `(i + 1) w[i]`; the last entry is the tail of that rule and the first\n" *
-            "    # is the full sum.  No loop over the (data-derived) number of free\n" *
-            "    # coordinates reaches a tensorizing backend.\n" *
+            "    # top is the suffix sum `sum(w) - cumsum(w) + w`, and each\n" *
+            "    # `constrained[i + 1]` is the running sum at `i` minus `(i + 1) w[i]`;\n" *
+            "    # the last entry is the tail of that rule and the first is the full sum.\n" *
             "    effects_s2z::AbstractVector{Float64} = let\n" *
             "        nfree = length(effects_free)\n" *
             "        index = 1:nfree\n" *

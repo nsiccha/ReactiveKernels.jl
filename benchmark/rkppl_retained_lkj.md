@@ -1,5 +1,8 @@
 # Retained LKJ measurements
 
+> **Historical note.** The Reactant statements here describe ReactiveKernels'
+> removed Reactant path.
+
 Declared LKJ factors now retain one transform/Jacobian/prior program as K
 changes. At K=16 the measured native gradient was about 24 times faster and
 allocated about 25 times fewer bytes than the opening implementation.

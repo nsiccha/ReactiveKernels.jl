@@ -1084,8 +1084,8 @@ _hmc_receipt_numeric_matches(actual, expected) = actual == expected
 
 function _assert_hmc_receipt(actual, expected)
     # The physical receipt was captured on Julia 1.10.11. Preserve exact
-    # mixed-precision bits below, but admit the same narrow Float64 reduction
-    # tolerance as the Reactant HMC corpus across Julia/BLAS platforms.
+    # mixed-precision bits below, but admit a narrow Float64 reduction
+    # tolerance across Julia/BLAS platforms.
     @test _hmc_receipt_numeric_matches(
         collect(actual.init_pos), expected["init_pos"])
     @test _hmc_receipt_numeric_matches(

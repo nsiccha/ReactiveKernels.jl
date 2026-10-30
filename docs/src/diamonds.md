@@ -72,18 +72,3 @@ gq_kernel = prepare(model;
     bound = (; X = DIAMONDS_X))
 b_Intercept = gq_kernel(q)
 ```
-
-## Reactant
-
-The exact authored graph compiles and executes through the public Reactant
-boundary with value and gradient parity — `benchmark/batch1_gate.jl` `@compile`s
-both the primal and the gradient and asserts they match the native evaluation
-and the reference `.stan` (via BridgeStan). The centering prefix, the fused
-`normal_id_glm` mean, and the reused `normal`/`student_t` endpoints all lower
-cleanly.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.DiamondsExample.demo()'
-```

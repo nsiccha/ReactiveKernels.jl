@@ -20,8 +20,8 @@ export MTBH_SOURCE, evaluate_mtbh_model_source
 # zero first column. Precomputing that shifted matrix `Yprev` as data turns
 # logit_p into a single broadcast `eps .+ transpose(alpha) .+ gamma .* Yprev`,
 # and the per-individual `bernoulli_logit_lpmf(y[i] | logit_p[i])` is the same
-# genuine M×T broadcast + row-reduce as Mth (`vec(sum(...; dims = 2))`), which
-# lowers through Reactant. The observed/unobserved split (s>0 vs s==0) is a DATA
+# genuine M×T broadcast + row-reduce as Mth (`vec(sum(...; dims = 2))`). The
+# observed/unobserved split (s>0 vs s==0) is a DATA
 # mask. Real data is M=146/T=5 (C=31 observed, 115 augmented zeros); a
 # representative mixed subset (20 observed spanning s∈1..4 + 20 augmented
 # all-zero rows, T=5) is embedded as the real capture matrix, and the graph
@@ -193,7 +193,7 @@ detection log-odds is the full M×T matrix
 `eps .+ transpose(alpha) .+ gamma .* Yprev` (`Yprev` = previous-occasion
 captures), and the per-individual `bernoulli_logit_lpmf` is
 `Σⱼ [y·logit_p − log1pexp(logit_p)]` — a genuine broadcast + row-reduce
-(`vec(sum(...; dims = 2))`) that lowers through Reactant. The likelihood
+(`vec(sum(...; dims = 2))`). The likelihood
 marginalizes the latent inclusion indicator with a `log_sum_exp` over
 never-detected individuals (a data mask). Named nodes for the prior, transform
 Jacobian, `eps`, `logit_p`, pointwise/summed likelihood, densities, the

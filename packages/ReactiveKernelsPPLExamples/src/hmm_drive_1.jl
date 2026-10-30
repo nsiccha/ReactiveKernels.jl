@@ -105,8 +105,7 @@ using LogExpFunctions: logsumexp, logaddexp
     # logsumexp(seed) = 0, so gamma[1] is exactly Stan's bare emission vector;
     # every later row applies the real transition. The two normal emission
     # log-densities are inlined (matching Stan's `normal_lpdf`) as whole-vector
-    # expressions over the K states, so nothing scalar-indexes a traced array
-    # inside the loop.
+    # expressions over the K states.
     obs::Matrix{Float64} = hcat(u, v)
     n::Int = size(obs, 1)
     first_mask::Vector{Float64} = vcat([0.0], ones(n - 1))
@@ -124,8 +123,7 @@ using LogExpFunctions: logsumexp, logaddexp
             (newg, logsumexp(newg))
         end
     # The final marginal is the scan's last per-step output; a 0/1 mask-weighted
-    # sum selects it without scalar-indexing the traced scan output (an `end`
-    # index does not resolve inside the traced scan closure).
+    # sum selects it.
     last_weight::Vector{Float64} = vcat(zeros(n - 1), [1.0])
     likelihood::Float64 = sum(forward .* last_weight)
 

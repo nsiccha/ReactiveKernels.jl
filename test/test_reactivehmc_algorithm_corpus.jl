@@ -39,7 +39,7 @@ using Test
     source_files = Set(first.(RHMC_CORPUS.UPSTREAM.source_sha256))
     @test all(e -> e.upstream.file in source_files, RHMC_CORPUS.CORPUS)
     @test all(e -> !isempty(e.upstream.lines) && !isempty(e.capabilities), RHMC_CORPUS.CORPUS)
-    @test all(e -> e.minimum_acceptance == :native_and_reactant, RHMC_CORPUS.CORPUS)
+    @test all(e -> e.minimum_acceptance == :native, RHMC_CORPUS.CORPUS)
 
     repo_root = normpath(joinpath(@__DIR__, ".."))
     @test all(e -> all(p -> isfile(joinpath(repo_root, p)), e.current_reactive_sources),
@@ -79,7 +79,6 @@ using Test
         :source_lock,
         :oracle_capture,
         :native_reactive_parity,
-        :generic_reactant_lowering,
         :independent_acceptance,
     )
 

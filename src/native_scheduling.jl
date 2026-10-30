@@ -198,9 +198,6 @@ _scheduled_first_range(job::UnitRange{Int}, chunk_size) =
 
 function (k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N})(args...) where {Reuse,S,B,BT,PS,N}
     length(args) == length(inputs(k)) || throw(MethodError(k, args))
-    # Scheduling is a native hint. Traced owning calls retain the existing
-    # compiler's runtime position loop; borrowed calls keep its native boundary.
-    _dynamic_tensorized_marker(args) === nothing || return k.serial(args...)
     count = _replicated_validate_axes(args, Val(B), BT)
     jobs = min(length(k.workers), cld(count, k.schedule.chunk_size))
     jobs <= 1 && return k.serial(args...)

@@ -8,14 +8,12 @@ function _ci_workflow_sections(workflow)
         match(
             r"(?ms)^  compiled-module-smoke:\n.*?(?=^  nonallocating-integration:)",
             workflow),
-        match(r"(?ms)^  reactant-integration:\n.*\z", workflow),
     )
     any(isnothing, matches) && return nothing
     return (
         workflow = workflow,
         package_matrix = something(matches[1]).match,
         smoke = something(matches[2]).match,
-        reactant = something(matches[3]).match,
     )
 end
 
@@ -28,7 +26,6 @@ end
     workflow = sections.workflow
     package_matrix = sections.package_matrix
     smoke = sections.smoke
-    reactant = sections.reactant
 
     crlf_sections = _ci_workflow_sections(replace(workflow, "\n" => "\r\n"))
     @test crlf_sections == sections
@@ -89,7 +86,5 @@ end
         last(sources) < first(instantiate)
     @test occursin("Pkg.precompile(; strict=true)", smoke)
     @test occursin("using ReactiveKernels", smoke)
-    @test occursin("timeout-minutes: 90", reactant)
-    @test occursin("uses: julia-actions/cache", reactant)
 
 end

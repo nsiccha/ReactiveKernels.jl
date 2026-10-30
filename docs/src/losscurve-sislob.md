@@ -49,23 +49,3 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
     setup = Main.ReactiveKernelsDocs.setup_losscurve_sislob!,
 )
 ```
-
-## Reactant
-
-The exact authored graph compiles and executes through the public Reactant
-boundary with value and gradient parity — `benchmark/forecast_batch_gate.jl`
-`@compile`s both the primal and the gradient and asserts they match the native
-evaluation and the reference `.stan` (via BridgeStan). The reused `normal` and
-`lognormal` endpoints and the integer-array gathers all lower cleanly. Parity is
-asserted at the gate's tested reference-valid probe points — six native probes
-per case plus the `ω = 1000` inactive-branch stress probe, with the Reactant
-axes at the first probe and the stress probe — on the gate's pinned
-`benchmark/all80-env` toolchain (BridgeStan 2.9 / Stan 2.39, Reactant, Enzyme
-and DifferentiationInterface as resolved there); it is a tested-point result,
-not a claim over every finite input.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.LosscurveSislobExample.demo()'
-```

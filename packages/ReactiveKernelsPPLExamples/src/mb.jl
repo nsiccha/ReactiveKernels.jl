@@ -17,8 +17,7 @@ export MB_SOURCE, evaluate_mb_source
 #   a = #(p-state, captured), b = #(p-state, missed),
 #   e = #(c-state, captured), f = #(c-state, missed),   with a+b+e+f = T,
 #   bern[i] = a·log(p) + b·log(1-p) + e·log(c) + f·log(1-c).
-# This is pure scalar-per-cell plate arithmetic (no matrix ops) and lowers
-# through Reactant when the counts are bound. Never-detected individuals stay in
+# This is pure scalar-per-cell plate arithmetic (no matrix ops). Never-detected individuals stay in
 # the p-state throughout (a=e=f=0, b=T), so bern = T·log(1-p). The
 # observed/unobserved split (s>0 vs s==0) is a DATA mask. Real data is
 # M=318/T=5 (C=168 observed, 150 augmented zeros); a representative mixed subset
@@ -173,8 +172,7 @@ detection probability collapses to four per-individual data counts, so the
 per-individual detection log-likelihood is
 `a·log(p) + b·log(1-p) + e·log(c) + f·log(1-c)`; the likelihood marginalizes the
 latent inclusion indicator with a `log_sum_exp` over never-detected individuals
-— the observed/unobserved split is a data mask, so it lowers through Reactant
-when the counts are bound. Named nodes for the transform Jacobian, the
+— the observed/unobserved split is a data mask. Named nodes for the transform Jacobian, the
 `parameters` NamedTuple, pointwise/summed likelihood, densities, the posterior,
 and the `omega_nd`/`trap_response` generated quantities.
 """

@@ -1,20 +1,16 @@
 #!/usr/bin/env julia
 
-# forecast_batch_gate.jl — the four-part correctness gate for the posteriordb
+# forecast_batch_gate.jl — the two-part correctness gate for the posteriordb
 # FORECASTING batch `@kernel` PPL translations (losscurve_sislob, accel_splines,
 # state_space_stochastic_level_stochastic_seasonal, prophet). Each model is
 # checked, on its FULL real posteriordb data, against the ACTUAL reference `.stan`
-# via BridgeStan (propto = false, jacobian = true) along four independent axes:
+# via BridgeStan (propto = false, jacobian = true) along two independent axes:
 #
 #   1. NATIVE VALUE      — RK primal log-density vs BridgeStan log_density
 #                          (relative error < 1e-6).
 #   2. NATIVE GRADIENT   — RK gradient via plain DifferentiationInterface + Enzyme
-#                          reverse (no Reactant) vs BridgeStan log_density_gradient
+#                          reverse vs BridgeStan log_density_gradient
 #                          (relative error < 1e-3), finite at every probe.
-#   3. REACTANT PRIMAL   — the Reactant-compiled primal vs the native primal
-#                          (relative error < 1e-6).
-#   4. REACTANT GRADIENT — the Reactant-compiled gradient vs BridgeStan
-#                          (relative error < 2e-3), finite.
 #
 # Every axis is a hard `@assert`, so a regression exits nonzero. Each case builds
 # its graph from the REAL installed package's `build_*_graph`, prepares it, and
@@ -28,36 +24,18 @@
 # (`test/runtests.jl`) and from the model-only import sentinel
 # (`test/test_startup_initialization.jl`).
 #
-# Run (needs BridgeStan 2.9 / Stan 2.39, PosteriorDB, Reactant, Enzyme, DI — all
+# Run (needs BridgeStan 2.9 / Stan 2.39, PosteriorDB, Enzyme, DI — all
 # in the all80 environment):
 #
 #   julia --project=benchmark/all80-env benchmark/forecast_batch_gate.jl
 #
 # Optional: FORECAST_MODELS=losscurve,prophet restricts the set.
-#
-# The Reactant axes (3, 4) and the two native axes (1, 2) MUST be certified in
-# SEPARATE processes: `FORECAST_REACTANT=0` never imports Reactant and asserts it
-# is not loaded, so axes 1 & 2 certify plain-native execution with the Reactant
-# extension genuinely absent; `FORECAST_REACTANT=1` imports Reactant and runs all
-# four. Authoritative acceptance = one run of each. Because Reactant cannot be
-# unloaded once imported, the split is a real load boundary, not a runtime flag.
-
-const DO_REACTANT = get(ENV, "FORECAST_REACTANT", "1") == "1"
 
 using Random, LinearAlgebra
 import BridgeStan, PosteriorDB, Enzyme
 using ReactiveKernels, ReactiveKernelsDistributionKernels
 using ReactiveKernelsPPLExamples
 using DifferentiationInterface
-
-if DO_REACTANT
-    import Reactant
-end
-
-_reactant_loaded() = any(id -> id.name == "Reactant", keys(Base.loaded_modules))
-if !DO_REACTANT
-    @assert !_reactant_loaded() "FORECAST_REACTANT=0 native phase must run with Reactant UNLOADED, but it is loaded"
-end
 
 const PE = ReactiveKernelsPPLExamples
 # Ordinary reverse-mode Enzyme (no function_annotation), matching the package's
@@ -66,8 +44,6 @@ const AE = AutoEnzyme(mode = Enzyme.Reverse)
 
 const VALUE_TOL   = 1e-6     # native value vs Stan
 const GRAD_TOL    = 1e-3     # native plain-Enzyme gradient vs Stan
-const RPRIMAL_TOL = 1e-6     # Reactant primal vs native
-const RGRAD_TOL   = 2e-3     # Reactant gradient vs Stan
 
 sval(sm, q) = BridgeStan.log_density(sm, q; propto = false, jacobian = true)
 sgrad(sm, q) = BridgeStan.log_density_gradient(sm, q; propto = false, jacobian = true)[2]
@@ -117,7 +93,7 @@ function reference_points(sm, dim, seed, name, npts, scale)
 end
 
 function gate(name; build, have, bind, want = :posterior, scale = 0.3, npts = 6, seed = 468,
-              do_reactant = true, boundary_point = nothing, altflag = nothing)
+              boundary_point = nothing, altflag = nothing)
     println("\n########## $name ##########"); flush(stdout)
     if altflag === nothing
         sm, post = bridge(name, seed)
@@ -179,23 +155,8 @@ function gate(name; build, have, bind, want = :posterior, scale = 0.3, npts = 6,
         println("  [b] stress-point (reference-valid) value+grad finite and match Stan PASS"); flush(stdout)
     end
 
-    do_reactant && _reactant_axes(name, kb, prep, sm, pts, stress_q)
     _RAN[] += 1
     return
-end
-
-# The Reactant axes use `Reactant.@compile`, a macro expanded when the code
-# containing it is LOWERED. A plain `if DO_REACTANT … end` guard does NOT help:
-# a top-level `if` is macro-expanded (both branches) before it is evaluated, so
-# the macro would still expand — and abort — in the Reactant-UNLOADED process.
-# The only sound guard is a separate file INCLUDED ONLY after `import Reactant`,
-# whose body is lowered solely at include time (which happens only when Reactant
-# is loaded). Under FORECAST_REACTANT=0 the no-op method below stands in and no
-# Reactant macro or binding is ever referenced.
-if DO_REACTANT
-    include(joinpath(@__DIR__, "forecast_batch_gate_reactant.jl"))
-else
-    _reactant_axes(args...) = nothing
 end
 
 # Two INACTIVE-BRANCH STRESS probes are supplied (deliberately extreme points,
@@ -203,8 +164,7 @@ end
 # arms, so a naive transcription's unselected arm can overflow/underflow and
 # poison the reverse gradient while Stan — whose ternary selects lazily — stays
 # finite. Each stress probe establishes the Stan oracle's value+gradient
-# finiteness FIRST, then asserts ordinary-native and (in the Reactant process)
-# compiled-Reactant value+gradient parity:
+# finiteness FIRST, then asserts ordinary-native value+gradient parity:
 #   * losscurve (data growthmodel_id=1, Weibull selected): q₁=log(1000),
 #     q₂=log(max t_value) — at ω=1000 the unused log-logistic arm's
 #     t^ω/θ^ω overflows; the authored overflow-safe forms must stay finite.
@@ -253,7 +213,7 @@ _want("losscurve") && gate("loss_curves-losscurve_sislob";
         q[2] = log(maximum(PE.LosscurveSislobExample.LOSSCURVE_T_VALUE))
         q
     end,
-    scale = 0.3, do_reactant = DO_REACTANT)
+    scale = 0.3)
 
 # accel_splines — brms penalized-spline regression; bind the response + the four
 # design/basis matrices (in-graph matrix-vector products).
@@ -262,7 +222,7 @@ _want("accel") && gate("mcycle_splines-accel_splines";
     have = (:unconstrained, :Y, :Xs, :Zs_1_1, :Xs_sigma, :Zs_sigma_1_1),
     bind = d -> (Y = Float64.(d["Y"]), Xs = _mat(d["Xs"]), Zs_1_1 = _mat(d["Zs_1_1"]),
                  Xs_sigma = _mat(d["Xs_sigma"]), Zs_sigma_1_1 = _mat(d["Zs_sigma_1_1"])),
-    scale = 0.3, do_reactant = DO_REACTANT)
+    scale = 0.3)
 
 # state_space — structural DLM; bind only the raw series y, x, w (the bounded
 # level transform, positive_ordered scales, random-walk level and trailing-window
@@ -271,7 +231,7 @@ _want("state_space") && gate("uk_drivers-state_space_stochastic_level_stochastic
     build = () -> PE.StateSpaceStochasticExample.build_state_space_stochastic_graph(),
     have = (:unconstrained, :y, :x, :w),
     bind = d -> (y = Float64.(d["y"]), x = Float64.(d["x"]), w = Float64.(d["w"])),
-    scale = 0.2, do_reactant = DO_REACTANT)
+    scale = 0.2)
 
 # prophet — Facebook Prophet linear-trend forecasting; bind the raw time/
 # changepoint/design data (the changepoint incidence matrix + trend + seasonality
@@ -283,11 +243,11 @@ _want("prophet") && gate("rstan_downloads-prophet";
     bind = d -> (t = Float64.(d["t"]), t_change = Float64.(d["t_change"]), X = _mat(d["X"]),
                  sigmas = Float64.(d["sigmas"]), tau = Float64(d["tau"]),
                  s_a = Float64.(d["s_a"]), s_m = Float64.(d["s_m"]), y = Float64.(d["y"])),
-    scale = 0.2, do_reactant = DO_REACTANT)
+    scale = 0.2)
 
 # ALTERNATE-FLAG Stan-oracle axes. The real posterior selects one mode
 # (losscurve growthmodel_id=1 Weibull; accel prior_only=0 likelihood-included).
-# These entries flip the flag in the BridgeStan data, so the four-axis gate
+# These entries flip the flag in the BridgeStan data, so the gate
 # certifies the OTHER mode against an actual Stan oracle. Losscurve's eager
 # per-cell `ifelse` needs the flipped flag bound in RK too; accel's prior_only
 # is a WANT-selected node (`accel_splines_posterior_want(true)`), mirroring
@@ -301,7 +261,7 @@ _want("losscurve_altflag") && gate("loss_curves-losscurve_sislob";
                  premium = Float64.(d["premium"]), loss = Float64.(d["loss"])),
     altflag = (regex = r"\"growthmodel_id\"\s*:\s*\d+", replacement = "\"growthmodel_id\": 0",
                bind = (; growthmodel_id = 0)),
-    scale = 0.3, do_reactant = DO_REACTANT)
+    scale = 0.3)
 
 _want("accel_altflag") && gate("mcycle_splines-accel_splines";
     build = () -> PE.AccelSplinesExample.build_accel_splines_graph(),
@@ -321,22 +281,10 @@ _want("accel_altflag") && gate("mcycle_splines-accel_splines";
               size(PE.AccelSplinesExample.ACCEL_ZS_1_1, 2)] = -800.0
         q
     end,
-    scale = 0.3, do_reactant = DO_REACTANT)
+    scale = 0.3)
 
 @assert _RAN[] == length(SEL) "$(_RAN[]) gate(s) ran but $(length(SEL)) were selected"
 @assert _RAN[] > 0 "no gates ran"
 
-# Native phase: assert Reactant is STILL unloaded AFTER every model ran, not only
-# before — nothing in the native value/gradient path may have pulled the Reactant
-# extension in. (Before + after bracket the whole native certification.)
-if !DO_REACTANT
-    @assert !_reactant_loaded() "FORECAST_REACTANT=0 native phase loaded Reactant during execution (was unloaded at start)"
-    println("  [native] Reactant asserted UNLOADED before AND after all models"); flush(stdout)
-end
-
-const _PHASE = DO_REACTANT ?
-    "all FOUR parts (native value+grad, Reactant primal+grad)" :
-    "the TWO native parts (Reactant UNLOADED; parts 3-4 deferred to a FORECAST_REACTANT=1 run)"
-println("\n== forecast_batch_gate: $(_RAN[]) case(s) [$(join(SEL, ", "))] PASSED $_PHASE ==")
-println("   (native = 6 reference-valid probes/case, plus the reference-valid stress probe where supplied;")
-println("    Reactant axes = first probe, plus the stress probe where supplied)"); flush(stdout)
+println("\n== forecast_batch_gate: $(_RAN[]) case(s) [$(join(SEL, ", "))] PASSED the two native parts ==")
+println("   (6 reference-valid probes/case, plus the reference-valid stress probe where supplied)"); flush(stdout)

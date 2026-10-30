@@ -80,8 +80,7 @@ reverse-mode rules generated from the one pure-math graph
 `rk_symmetric_eigvals_rule`. Differentiating through it with Enzyme —
 directly or via `DifferentiationInterface` with `AutoEnzyme` — uses those
 generated cuts, so the LAPACK `syevr!` `ccall` inside is never
-differentiated. No Reactant custom rule is emitted (see
-`docs/src/manual-derivative-rules.md`).
+differentiated (see `docs/src/manual-derivative-rules.md`).
 
 `A` must be symmetric (only the upper triangle is read) with distinct
 eigenvalues.
@@ -99,8 +98,7 @@ forward- and reverse-mode rules generated from the one pure-math graph
 `rk_symmetric_eigvecs_rule`. Differentiating through it with Enzyme —
 directly or via `DifferentiationInterface` with `AutoEnzyme` — uses those
 generated cuts, so the LAPACK `syevr!` `ccall` inside is never
-differentiated. No Reactant custom rule is emitted (see
-`docs/src/manual-derivative-rules.md`).
+differentiated (see `docs/src/manual-derivative-rules.md`).
 
 `A` must be symmetric (only the upper triangle is read) with distinct
 eigenvalues. Columns are defined up to sign; align a covector's signs with

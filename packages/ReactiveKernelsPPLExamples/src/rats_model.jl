@@ -97,7 +97,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 
     # Hierarchical integer-array GATHERS, done OUTSIDE any plate: the per-rat
     # intercept and slope gathered by the concrete data index `rat`. The
-    # docs_example binds `rat` at preparation so the Reactant path traces only
+    # docs_example binds `rat` at preparation so the prepared kernel takes only
     # floats + the parameter vector.
     alpha_rat = alpha[rat]
     beta_rat = beta[rat]
@@ -134,7 +134,7 @@ y = RATS_Y
 xbar = RATS_XBAR
 
 requested_nodes = (:parameters, :log_jacobian, :prior, :likelihood, :posterior)
-# Bind the integer gather index (spec addendum): the Reactant path then traces
+# Bind the integer gather index (spec addendum): the prepared kernel then takes
 # only the float inputs + the parameter vector.
 density_kernel = prepare(model;
     have = (:unconstrained, :rat, :x, :y, :xbar),

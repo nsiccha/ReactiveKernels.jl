@@ -59,9 +59,6 @@ function _soil_reference(q)
 end
 
 @testset "PPL graph — soil_incubation (posteriordb adaptive RK45)" begin
-    modules_before = Set(String(id.name) for id in keys(Base.loaded_modules))
-    @test !("Reactant" in modules_before)
-
     artifact = evaluate_soil_incubation_source()
     @test artifact.source == strip(SOIL_INCUBATION_SOURCE, '\n')
     @test artifact.output == Base.invokelatest(artifact.kernel, artifact.inputs.q)
@@ -120,8 +117,4 @@ end
         bound = (; ts = SOIL_TS, total_c_t0 = SOIL_TOTAL_C_T0,
                  eco2_mean = SOIL_ECO2MEAN))(q)
     @test template_value == full_value
-
-    modules_after = Set(String(id.name) for id in keys(Base.loaded_modules))
-    @test issubset(modules_before, modules_after)
-    @test !("Reactant" in modules_after)
 end

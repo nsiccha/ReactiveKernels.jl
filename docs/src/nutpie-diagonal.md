@@ -8,8 +8,8 @@ This page is an external compiler corpus derived from Adrian Seyboldt's
 [`nuts-rs`](https://github.com/pymc-devs/nuts-rs/tree/97be9ab88cfaadfafd9e5f4409a3b1d5af62805a)
 diagonal adaptation at revision
 `97be9ab88cfaadfafd9e5f4409a3b1d5af62805a`. It demonstrates mathematical
-kernels that ReactiveKernels compiles through both its native and optional
-Reactant paths; it does not add a nutpie sampler API to the package.
+kernels that ReactiveKernels compiles natively; it does not add a nutpie
+sampler API to the package.
 
 The executable source authority is
 [`examples/nutpie_diagonal_adaptation.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/nutpie_diagonal_adaptation.jl).
@@ -104,5 +104,4 @@ standalone Rust oracle
 consumes explicit raw positions and gradients with no RNG, and its byte-exact
 output is committed in
 [`benchmark/nutpie_diag_oracle.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/nutpie_diag_oracle.toml).
-Native execution matches that oracle, while the isolated Reactant acceptance
-test compiles the same two `PreparedKernel`s without a nutpie-specific adapter.
+Native execution matches that oracle.

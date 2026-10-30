@@ -16,7 +16,6 @@ _mnist_logsumexp(v) = (m = maximum(v); m + log(sum(x -> exp(x - m), v)))
     @test occursin("plate(eachcol(logits), y)", MNIST_LOGISTIC_SOURCE)
     @test occursin("categorical_logit(observation_logits).logpdf",
                    MNIST_LOGISTIC_SOURCE)
-    @test !occursin("_kernel_tensorized_pair", MNIST_LOGISTIC_SOURCE)
     @test !occursin("log(2π)", MNIST_LOGISTIC_SOURCE)     # no hand-written Normal
     @test artifact.normal_object === normal
     @test artifact.categorical_logit_object === categorical_logit
@@ -77,7 +76,6 @@ end
                    MNIST_LOGISTIC_OPTIMIZED_SOURCE)
     @test occursin("categorical_logit_ref(observation_logits).logpdf",
                    MNIST_LOGISTIC_OPTIMIZED_SOURCE)
-    @test !occursin("_kernel_tensorized_pair", MNIST_LOGISTIC_OPTIMIZED_SOURCE)
     @test !occursin("log(2π)", MNIST_LOGISTIC_OPTIMIZED_SOURCE)
     @test !occursin("zeros(", MNIST_LOGISTIC_OPTIMIZED_SOURCE)
     authored_optimized = "@kernel model" * first(split(

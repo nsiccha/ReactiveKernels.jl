@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.17
+
+- **Breaking:** ReactiveKernelsPPL has no Reactant path, following
+  ReactiveKernels 0.1.15. Generated kernels read packed blocks through
+  `Base.view` (they called `ReactiveKernels._tensorized_view`) and carry no
+  `within_compile` branches. The fields of a `SamplerQuery` can no longer be
+  compiled with Reactant; call the query natively. Requires ReactiveKernels
+  0.1.15.
+
 ## 0.1.16
 
 - A query preparation (`prepare_query`, `prepare_sampler`, `prepare_query_ad`,

@@ -1,7 +1,6 @@
 # Finite-mixture response (SB `MixtureModel` mirror): surface admission,
 # fail-closed battery, value parity vs Distributions.jl oracles (all 7 v1
-# families), Enzyme-vs-findiff gradients, Reactant/XLA value+grad (in
-# test_mixture_reactant.jl), and SB-parity constants. (`_findiff_grad` / `_GEN_BACKEND` come from
+# families), Enzyme-vs-findiff gradients, and SB-parity constants. (`_findiff_grad` / `_GEN_BACKEND` come from
 # test_generator.jl, included first.)
 using DifferentiationInterface
 using Distributions: MixtureModel, Normal, Bernoulli, Poisson, Binomial,

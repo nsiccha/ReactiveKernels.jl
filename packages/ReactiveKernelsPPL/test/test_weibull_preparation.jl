@@ -67,12 +67,10 @@ end
                 GC.enable(enabled)
             end
             GC.gc()
-            tensorized = RK._lower_with_ops(lowered; tensorized = true)
-            aligned = native[2] == tensorized[2]
-            @test aligned
-            @test RK._same_readable_recipes(native[3], tensorized[3])
-            # Exercise the public preparation boundary with collection exactly
-            # between its two emissions, including its strict alignment checks.
+            again = RK._lower_with_ops(lowered)
+            @test native[2] == again[2]
+            # Exercise the public preparation boundary with collection between
+            # lowering and compilation.
             kernel = Base.invokelatest(prepare, state.kernel.plan;
                                       passes = (_collect_pass,))
             push!(shapes, (_emission_shape(code_expr(kernel)), length(kernel.ops)))

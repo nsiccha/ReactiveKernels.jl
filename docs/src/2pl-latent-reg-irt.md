@@ -32,8 +32,7 @@ evaluation folds them:
   values" test, so the range branch is dead and the scale is always `2·sd` for
   `k ≥ 2`; this is transcribed verbatim for exact BridgeStan parity.
 - The sum-to-zero difficulties `beta = [beta_free; −Σ beta_free]` are written as
-  a folded constant design-matrix multiply `beta = S·beta_free` (a form that
-  lowers cleanly under Reactant).
+  a folded constant design-matrix multiply `beta = S·beta_free`.
 
 The unconstrained vector is `(u_alpha[1..I], beta_free[1..I−1], theta[1..J],
 lambda_adj[1..K])`; `alpha = exp.(u_alpha)` is the only positive-constrained
@@ -49,20 +48,4 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
     @__MODULE__, :TwoplLatentRegIrtExample, :TWOPL_LR_SOURCE;
     setup = Main.ReactiveKernelsDocs.setup_2pl_latent_reg_irt!,
 )
-```
-
-## Reactant
-
-On the focused gate's finite BridgeStan-valid probes, the exact authored graph
-compiles and executes through the public Reactant boundary with value and
-gradient parity — primal and gradient both `@compile` and match native/the
-reference `.stan` (via BridgeStan, `propto = false`, `jacobian = true`) to
-machine precision. The folded covariate
-design, the constant-matrix sum-to-zero map, the `W_adj·lambda` regression mean,
-and the reused endpoints all lower cleanly.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.TwoplLatentRegIrtExample.demo()'
 ```

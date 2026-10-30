@@ -7,9 +7,8 @@ string, the Normal endpoint is reused from the shared distribution objects, and
 the constrained parameters are a plain NamedTuple. Like
 [ARMA(1,1)](arma11.md) its distinctive structure is a **sequential recursion** —
 here the conditional standard deviations `σₜ` — authored with the
-[`scan` primitive](scan.md), which threads a carry through the series and lowers
-the recurrence to a `stablehlo.while` loop, so the natural sequential form
-**lowers through Reactant directly**.
+[`scan` primitive](scan.md), which threads a carry through the series as a
+retained loop.
 
 The complete runnable source is
 [`packages/ReactiveKernelsPPLExamples/src/garch11.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/garch11.jl).
@@ -39,7 +38,7 @@ transforms match Stan exactly and are constrained in declaration order, so
 unconstrained ─► μ, u_α0, u_α1, u_β1 ─► α0, α1, β1 (support transforms + Jacobian)
    │                                        │
 sigma1 ─┬─► sigma (scan recursion) ─────────┼─► forecast_sigma (σ_{T+1})
-        │   (lowers via stablehlo.while)    └─► pointwise ─► likelihood
+        │   (a retained loop)               └─► pointwise ─► likelihood
 y ──────┘
 likelihood + log Jacobian ──► unconstrained log density
 ```
@@ -55,25 +54,4 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
     @__MODULE__, :GARCH11Example, :GARCH11_SOURCE;
     setup = Main.ReactiveKernelsDocs.setup_garch11!,
 )
-```
-
-## Reactant
-
-The natural sequential recursion **lowers through Reactant directly on the
-traced raw-series query**: the walkthrough entry passes `y` as a traced argument
-and binds only the scalar `sigma1`, so `sigma` (authored with the
-[`scan` primitive](scan.md): carry `σ_{t-1}` seeded `σ₁ = sigma1`, per-step
-input the lagged observation `y_{t-1}`) lowers to a `stablehlo.while` carry
-loop — one traced loop, no unrolling and no per-step scalar indexing of a traced
-array. Indices use the explicit `T`, never `end`, which does not resolve on
-traced results. The all-bound query (host `y` partial-evaluated) is a separate,
-also-supported native boundary; it unrolls the fixed-length recursion instead of
-emitting the loop. The translation was verified against the reference `.stan`
-via BridgeStan (`propto=false, jacobian=true`): native value and gradient, and the Reactant-compiled primal and gradient, all match to machine
-precision.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.GARCH11Example.demo()'
 ```

@@ -5,7 +5,7 @@ using LogExpFunctions
 using Random
 
 # An eager, ordinary-Julia execution model of the locked authoring fixture.  It deliberately does not
-# inspect MethodIR, a prepared plan, either native emitter, the Reactant control machine, canonical masks,
+# inspect MethodIR, a prepared plan, either native emitter, canonical masks,
 # or compiler storage.  Pure derived fields are recomputed eagerly after each authored HAVE mutation;
 # this is observationally equivalent to the fixture's demand-driven currentness rules.
 

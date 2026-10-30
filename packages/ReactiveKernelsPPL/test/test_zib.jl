@@ -3,8 +3,7 @@
 # probability p (the BinomialProb precedent) plus the ZIP-convention zi
 # slot (structural-zero probability, parameter or literal). Surface
 # admission, value parity vs a Distributions.jl hand oracle,
-# Enzyme-vs-findiff gradients, O(1) emission, Reactant/XLA value+grad
-# (in test_zib_reactant.jl).
+# Enzyme-vs-findiff gradients, and O(1) emission.
 # (`_findiff_grad` / `_GEN_BACKEND` come from test_generator.jl, included
 # first.)
 #

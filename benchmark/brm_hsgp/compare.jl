@@ -1,4 +1,4 @@
-using ReactiveKernels, Reactant, BenchmarkTools, BridgeStan
+using ReactiveKernels, BenchmarkTools, BridgeStan
 using BayesianRegressionModels, Turing, StanBlocks, WarmupHMC
 using DifferentiationInterface: AutoEnzyme
 using Distributions, LinearAlgebra, Serialization, SHA, TOML, Statistics, Test
@@ -125,8 +125,8 @@ function adversarial_points(c)
     reduce(hcat, points)
 end
 
-function check_points(compiled, primal, refs, points, c; label)
-    rc = Reactant.to_rarray(c)
+function check_points(prepared, kernel, refs, points, c; label)
+    gradient_buffer = zeros(44)
     max_value_sb = max_gradient_sb = max_value_native = max_gradient_native = 0.0
     max_value_generated = 0.0
     max_scaled_gradient_sb = max_scaled_gradient_native = 0.0
@@ -135,11 +135,10 @@ function check_points(compiled, primal, refs, points, c; label)
         qsb[refs.ps] .= q
         sv, sg = BridgeStan.log_density_gradient(refs.stan.model, qsb;
             propto=false, jacobian=true)
-        rq = Reactant.to_rarray(collect(q))
-        rv, rg = compiled(rq, rc)
-        v, g = Float64(rv), Array(rg)
-        pv = Float64(primal(rq, rc))
-        @assert isapprox(pv, sv; atol=2e-8, rtol=2e-10) "$label point $i compiled primal mismatch"
+        qi = collect(q)
+        v, g = ad_value_and_gradient!(prepared, gradient_buffer, qi, c)
+        pv = kernel(qi, c)
+        @assert isapprox(pv, sv; atol=2e-8, rtol=2e-10) "$label point $i primal mismatch"
         @assert all(isfinite, (sv, v)) && all(isfinite, g) &&
             all(isfinite, sg) "$label point $i non-finite"
         @assert isapprox(v, sv; atol=2e-8, rtol=2e-10) "$label point $i Stan value: $v != $sv"
@@ -186,25 +185,16 @@ function measurement(f)
         "bytes"=>trial.memory, "allocations"=>trial.allocs, "samples"=>length(trial))
 end
 
-function runtimes(compiled, primal, kernel, prepared, refs, q, c)
-    rq, rc = Reactant.to_rarray(q), Reactant.to_rarray(c)
+function runtimes(kernel, prepared, refs, q, c)
     qs = q[invperm(refs.ps)]
-    resident = measurement(() -> compiled(rq, rc)) # sync=true is the public default
-    host = measurement() do
-        v, g = compiled(Reactant.to_rarray(q), rc)
-        Float64(v), Array(g)
-    end
     sb = measurement(() -> BridgeStan.log_density_gradient(refs.stan.model, qs;
         propto=false, jacobian=true))
     grad_buffer = similar(q)
     native_ad = measurement(() -> ad_value_and_gradient!(prepared, grad_buffer, q, c))
     native_primal = measurement(() -> kernel(q, c))
-    reactant_primal = measurement(() -> primal(rq, rc))
-    result = Dict{String,Any}("reactant_resident"=>resident, "reactant_host"=>host, "stanblocks"=>sb,
+    result = Dict{String,Any}("stanblocks"=>sb,
         "rk_native_value_gradient"=>native_ad, "rk_native_primal"=>native_primal,
-        "reactant_primal"=>reactant_primal,
-        "resident_over_stan"=>resident["median_ns"]/sb["median_ns"],
-        "host_over_stan"=>host["median_ns"]/sb["median_ns"])
+        "rk_native_over_stan"=>native_ad["median_ns"]/sb["median_ns"])
     if refs.native !== nothing
         qn = q[invperm(refs.pn)]
         native = measurement(() -> LDP.logdensity_and_gradient(refs.native, qn))
@@ -227,15 +217,9 @@ function main(bundle, output; limit=typemax(Int), native_enabled=true)
     c = zeros(40)
     ad_seconds = @elapsed prepared = prepare_ad(kernel, BACKEND, q, c; active=:q)
     native_first_seconds = @elapsed ad_value_and_gradient!(prepared, similar(q), q, c)
-    rq, rc = Reactant.to_rarray(q), Reactant.to_rarray(c)
-    primal_compile_seconds = @elapsed primal = Reactant.@compile sync=true kernel(rq, rc)
-    compile_seconds = @elapsed compiled = compile_ad_value_and_gradient(prepared, rq, rc)
-    first_seconds = @elapsed compiled(rq, rc)
     result = Dict{String,Any}("kernel_preparation_seconds"=>prep_seconds,
-        "ad_preparation_seconds"=>ad_seconds, "reactant_compilation_seconds"=>compile_seconds,
-        "reactant_primal_compilation_seconds"=>primal_compile_seconds,
+        "ad_preparation_seconds"=>ad_seconds,
         "native_ad_first_execution_seconds"=>native_first_seconds,
-        "reactant_first_execution_seconds"=>first_seconds,
         "julia_version"=>string(VERSION), "data_sha256"=>BRMHSGPExample.MCYCLE_SHA256,
         "brm_model_source_sha256"=>bytes2hex(sha256(BRMSource.model_source)),
         "coordinate_names"=>coordinate_names(), "blas_threads"=>BLAS.get_num_threads(),
@@ -246,7 +230,7 @@ function main(bundle, output; limit=typemax(Int), native_enabled=true)
         "rk_statistical_model_source_sha256"=>bytes2hex(sha256(read(BRMHSGPExample.MODEL_SOURCE))),
         "kernel_source_sha256"=>bytes2hex(sha256(read(joinpath(@__DIR__,"..","..","examples","brm_hsgp.jl")))))
     relevant = Set(("ReactiveKernels", "ReactiveKernelsPPL", "BayesianRegressionModels", "StanBlocks", "WarmupHMC",
-        "Reactant", "Reactant_jll", "Enzyme", "Enzyme_jll", "DifferentiationInterface",
+        "Enzyme", "Enzyme_jll", "DifferentiationInterface",
         "DynamicPPL", "Turing", "Distributions", "BridgeStan", "MutatingFunctions",
         "OutputSignatures", "LogDensityProblems", "BenchmarkTools"))
     result["packages"] = [Dict("name"=>p.name, "version"=>string(p.version),
@@ -269,8 +253,8 @@ function main(bundle, output; limit=typemax(Int), native_enabled=true)
         n = min(size(source,2), limit)
         points = reduce(hcat, (transport(source[refs.ps,i], source_c, controls) for i in 1:n))
         println("compare\t", label, "\t", n); flush(stdout)
-        row = check_points(compiled, primal, refs, points, controls; label)
-        row["adversarial"] = check_points(compiled, primal, refs,
+        row = check_points(prepared, kernel, refs, points, controls; label)
+        row["adversarial"] = check_points(prepared, kernel, refs,
             adversarial_points(controls), controls; label=label * " adversarial")
         row["stan_preparation_seconds"] = refs.sb_seconds
         row["stan_permutation"] = refs.ps
@@ -284,7 +268,7 @@ function main(bundle, output; limit=typemax(Int), native_enabled=true)
             row["native_generated_permutation"] = refs.pd
         end
         row["centeredness"] = controls
-        row["runtime"] = runtimes(compiled, primal, kernel, prepared, refs, points[:,cld(n,2)], controls)
+        row["runtime"] = runtimes(kernel, prepared, refs, points[:,cld(n,2)], controls)
         result[label] = row
         open(joinpath(output,"receipt.toml"), "w") do io
             TOML.print(io, result; sorted=true)

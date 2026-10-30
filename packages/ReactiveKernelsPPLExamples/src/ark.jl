@@ -9,8 +9,7 @@ export ARK_SOURCE, evaluate_ark_source
 
 # posteriordb `arK-arK` — an autoregressive AR(K) model. Because `y` is DATA, the
 # per-step "recurrence" is just data lags, so the likelihood is a Gaussian
-# regression on a lag design matrix (it vectorizes and lowers through Reactant;
-# no sequential scan). Real data is T=200; a representative T=60 subset is
+# regression on a lag design matrix (it vectorizes; no sequential scan). Real data is T=200; a representative T=60 subset is
 # embedded (the graph rebinds full data via the ylag/yt ports).
 const ARK_K = 5
 const ARK_Y = [
@@ -120,8 +119,8 @@ end
 
 Build the posteriordb `arK` model (an AR(K) autoregression) as a declarative
 `ReactiveKernels.KernelSpec`. Because `y` is data, the AR structure is a Gaussian
-regression on the lag design matrix `ylag` (it vectorizes and lowers through
-Reactant — no sequential scan). Priors: `alpha, beta ~ Normal(0,10)`,
+regression on the lag design matrix `ylag` (it vectorizes — no sequential
+scan). Priors: `alpha, beta ~ Normal(0,10)`,
 `sigma ~ HalfCauchy(0,2.5)` (exp transform + Jacobian). The prior, lag mean,
 pointwise/summed likelihood, densities and posterior are named nodes.
 """

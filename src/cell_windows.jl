@@ -57,8 +57,8 @@
 # check their row. Values at other rows are not computed, so an error that
 # only another row raises (an out-of-range gather index elsewhere, a domain
 # error in another subject's predictor) is not raised, as the cell itself does
-# not run other cells. Everything else, including the tensorized lowering, the
-# operation table, and `on_error = :ignore` twins, is unchanged.
+# not run other cells. Everything else, including the operation table and
+# `on_error = :ignore` twins, is unchanged.
 
 """
     _CellWindow(data, rows, shape)

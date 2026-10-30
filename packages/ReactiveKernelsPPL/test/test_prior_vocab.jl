@@ -3,7 +3,7 @@
 # resolved maximal population + recommended sampled + per-addressee mixing;
 # scope confirmed by reconciliation `1ljidem`): surface admission for the new
 # population/sampled families, Distributions.jl hand-oracle value parity,
-# Enzyme-vs-findiff gradients (Reactant/XLA legs: test_prior_vocab_reactant.jl).
+# Enzyme-vs-findiff gradients.
 # Ordinary declarations
 # retain their priors through affine and GLM optimizations.
 # SB-parity probes follow the BRM peer's BridgeStan brief

@@ -8,7 +8,6 @@ using ReactiveKernelsNUTSExamples
 using ReactiveKernelsPPLExamples
 using ReactiveKernelsPPL
 using ReactiveKernelsStreamingStats
-using ReactiveKernelsReactantODESolvers
 
 # Opt into the standalone nutpie/nuts-rs diagonal-adaptation compiler corpus.
 # It remains an external mathematical example rather than a package API.
@@ -115,15 +114,13 @@ site_pages = [
         "Distributions: scalar and batched" => "distributions-ad.md",
         "PPL: Eight Schools and MNIST" => "ppl-ad.md",
     ],
-    "Reactant" => [
-        "Overview" => "reactant.md",
+    "Historical Reactant receipts" => [
         "Distributions: scalar and batched" => "distributions-reactant.md",
         "Probabilistic programming" => [
             "Eight Schools" => "eight-schools-reactant.md",
             "MNIST multinomial logistic" => "mnist-reactant.md",
             "ProbProg MCMC (NUTS sampling)" => "probprog-mcmc.md",
         ],
-        "AD + Reactant" => "reactant-ad.md",
         "Evaluation throughput vs Turing.jl" => "eval-throughput.md",
         "Adaptive NUTS receipt (static)" => "nuts-reactant.md",
     ],
@@ -160,7 +157,6 @@ makedocs(
         ReactiveKernelsNUTSExamples,
         ReactiveKernelsStreamingStats,
         ReactiveKernelsHMCDiagnostics,
-        ReactiveKernelsReactantODESolvers,
     ],
     format   = DocumenterVitepress.MarkdownVitepress(
         repo = "github.com/nsiccha/ReactiveKernels.jl",

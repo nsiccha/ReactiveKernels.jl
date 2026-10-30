@@ -44,8 +44,8 @@ function _index_run_metadata(indices::Vector{Int})
     (starts, stops, n, true)
 end
 
-# The extra dependency is compiler metadata only. The ordinary and tensorized
-# semantic fallback return exactly the original borrowed gather representation.
+# The extra dependency is compiler metadata only. The semantic fallback returns
+# exactly the original borrowed gather representation.
 @inline _readonly_gather_runs(parent,indices,runs) = _readonly_gather(parent,indices)
 
 # Record these constant slots once per bound plan. Rebinding keys the compiled
@@ -189,8 +189,7 @@ function _index_run_simd_plate(ex)
 end
 
 # This local emitter transformation reads only compiler-owned operation identity
-# and generated data flow. It adds no operation slots, so native and tensorized
-# products retain identical tables. Tensorized execution keeps the original loop.
+# and generated data flow. It adds no operation slots.
 function _lower_index_runs_native(body::Expr,ops)
     any(op->op===_readonly_gather_runs,ops) || return body
     gathers=Dict{Symbol,Symbol}();raw=Dict{Symbol,Symbol}();projections=Dict{Symbol,Symbol}()

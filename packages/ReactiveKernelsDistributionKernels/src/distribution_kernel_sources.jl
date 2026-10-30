@@ -3,7 +3,6 @@ module DistributionKernelSources
 using ReactiveKernels
 using LinearAlgebra
 import LogExpFunctions
-import ReactantCore
 import SpecialFunctions
 
 # The two special functions whose derivatives this repository owns, each
@@ -41,18 +40,11 @@ using ReactiveKernels: rk_symmetric_eigvals_rule, rk_symmetric_eigvecs_rule
 
 # Owned regularized incomplete beta, I_x(a, b), over the Student-t cdf
 # slice (one shape is 1/2, the other is nu/2 with nu > 0, x in [0, 1]).
-# `SpecialFunctions.beta_inc` has no method for a Reactant-traced scalar
-# (its entry points require `Real`, and Reactant's SpecialFunctions
-# extension leaves `beta...` as an unwired placeholder with no backing
-# MLIR op), so every evidence arm through the Student-t cdf fails at
-# trace time. This spelling is plain transparent math — endpoint guards,
-# reflection to x <= (a+1)/(a+b+2), a logbeta front factor, and Lentz's
-# continued fraction over a FIXED count, kept as one retained
-# `@trace while` (a `for` unrolls into ~300 body copies, whose reverse
-# explodes past 8 GB) — so it traces under Reactant as one small loop
-# and differentiates under Enzyme without any rule (no backend-specific
-# derivative code, no method on a function this repository does not
-# own). Endpoint guards and reflection use lazy branches, including their
+# This spelling is plain transparent math — endpoint guards, reflection to
+# x <= (a+1)/(a+b+2), a logbeta front factor, and Lentz's continued fraction
+# over a FIXED count in one retained `while` loop — so it differentiates under
+# Enzyme without any rule (no backend-specific derivative code, no method on
+# a function this repository does not own). Endpoint guards and reflection use lazy branches, including their
 # derivative work. Tail selection only selects between already valid values.
 #
 # `@_record_source` keeps the source of these helpers for `jax_source`, whose
@@ -74,19 +66,10 @@ ReactiveKernels.@_record_source function _rk_beta_inc_cf(a, b, x)
     d = 1 - qab * x / qap
     d = ifelse(abs(d) < RK_BETA_INC_FPMIN, RK_BETA_INC_FPMIN, d)
     d = one(d) / d
-    # `* one(d)`, not a bare alias: `@trace` rejects loop-carried
-    # variables whose aliasing pattern changes across the body.
     h = d * one(d)
-    # Retained `@trace while` (never a `for`): Reactant unrolls a `for`
-    # into ~300 body copies, and reverse through that explodes past 8 GB
-    # on a 3-row program. The retained loop is exactly the
-    # `reactivekernels-use` §7i working shape — `<` (not `<=`) over a
-    # pure +1 counter with a constant bound, `Binomial` checkpointing —
-    # so it reverses exactly at ~1 GB. Natively (nothing traced) `@trace`
-    # runs this as the plain `while` below, so Enzyme still sees
-    # ordinary control flow.
+    # A retained loop over the fixed count, never unrolled.
     i = 0
-    ReactantCore.@trace checkpointing = ReactantCore.Binomial(4) while i < RK_BETA_INC_ITERS
+    while i < RK_BETA_INC_ITERS
         m = i + 1
         m2 = 2 * m
         aa = m * (b - m) * x / ((qam + m2) * (a + m2))
@@ -115,7 +98,7 @@ end
 
 ReactiveKernels.@_record_source function _rk_beta_inc_interior(a, b, x, upper::Bool)
     result = zero(a + b)
-    ReactantCore.@trace if x < (a + 1) / (a + b + 2)
+    if x < (a + 1) / (a + b + 2)
         small = _rk_beta_inc_core(a, b, x)
         result = ifelse(upper, 1 - small, small)
     else
@@ -126,7 +109,7 @@ ReactiveKernels.@_record_source function _rk_beta_inc_interior(a, b, x, upper::B
 end
 ReactiveKernels.@_record_source function _rk_beta_inc_upper_guard(a, b, x, upper::Bool)
     result = zero(a + b)
-    ReactantCore.@trace if x >= 1
+    if x >= 1
         result = ifelse(upper, zero(a + b), one(a + b))
     else
         result = _rk_beta_inc_interior(a, b, x, upper)
@@ -135,7 +118,7 @@ ReactiveKernels.@_record_source function _rk_beta_inc_upper_guard(a, b, x, upper
 end
 ReactiveKernels.@_record_source function rk_beta_inc_tail(a, b, x, upper::Bool)
     result = zero(a + b)
-    ReactantCore.@trace if x <= 0
+    if x <= 0
         result = ifelse(upper, one(a + b), zero(a + b))
     else
         result = _rk_beta_inc_upper_guard(a, b, x, upper)
@@ -149,7 +132,7 @@ rk_beta_inc(a, b, x) = rk_beta_inc_tail(a, b, x, false)
 # singular coordinate while retaining ordinary differentiation of the primal.
 ReactiveKernels.@_record_source function rk_student_tail(nu, z, upper::Bool)
     result = zero(nu + z)
-    ReactantCore.@trace if abs(z) <= 1e-4 * sqrt(nu / (nu + 1))
+    if abs(z) <= 1e-4 * sqrt(nu / (nu + 1))
         t = z^2 / nu
         c = exp(loggamma((nu + 1) / 2) - loggamma(nu / 2) - 0.5log(nu*3.141592653589793))
         delta = c*z*(1 - (nu+1)*t/6 + (nu+1)*(nu+3)*t^2/40 -
@@ -251,8 +234,8 @@ end
 # `cdf`/`quantile` use the regularized incomplete beta with x = nu/(nu+z^2):
 # for z<=0, F(z) = I_x(nu/2, 1/2)/2; symmetry gives the upper tail and the
 # inverse. Only positive df is a valid parameter, so there is no domain guard.
-# `cdf` calls the owned `rk_beta_inc` (transparent math that traces under
-# Reactant); `SpecialFunctions.beta_inc` has no traced-scalar method.
+# `cdf` calls the owned `rk_beta_inc` (transparent math that Enzyme
+# differentiates without a rule).
 @kernel standard_student_t(nu::Float64) = begin
     logpdf(z::Float64)::Float64 =
         loggamma((nu + 1) / 2) - loggamma(nu / 2) - 0.5 * log(nu * π) -

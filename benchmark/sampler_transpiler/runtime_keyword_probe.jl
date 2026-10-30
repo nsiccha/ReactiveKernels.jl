@@ -59,19 +59,3 @@ for (source,update,reason) in (
     rejected || error("invalid per-callsite keyword contract admitted")
 end
 println("native_runtime_keyword_evaluated_once=true per_callsite_rejections=true")
-
-using Reactant
-const TSC=Base.get_extension(RK,:ReactiveKernelsReactantExt).TracedSlotCompiler
-function traced_keyword_check(program)
-    call=TSC.TracedSlotCall(program.f,program.metadata)
-    driver=(state,seed,counts)->call(deepcopy(state),copy(seed),deepcopy(counts))
-    inputs=(Reactant.to_rarray(deepcopy(program.state);track_numbers=true),
-        Reactant.to_rarray(UInt64[91,77]),Reactant.to_rarray((0,0);track_numbers=true))
-    compiled=Reactant.compile(driver,inputs;sync=true,donated_args=:none)
-    result=compiled(inputs...)
-    Float64(only(result.state.values))==3.0 || error("traced keyword evaluation order")
-    Float64(only(inputs[1].values))==1.0 || error("caller changed")
-    println("traced_runtime_keyword_evaluated_once=true caller_preserved=true")
-end
-const TRACED=TSC.compile_traced_slots(keyword_program())
-Base.invokelatest(traced_keyword_check,TRACED)

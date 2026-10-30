@@ -1,9 +1,10 @@
 # Versioned receipt schema + deterministic aggregator for the all-82 posteriordb
-# benchmark. Process-isolation contract (parent-mandated): native and Reactant timings
-# are produced in SEPARATE Julia subprocesses (loading Reactant must not perturb native
-# compiler state), each writing a PHASE receipt; the single entrypoint aggregates them
-# by model key into ONE final receipt. Pure Julia + stdlib TOML (no heavy deps), so it
-# is usable from the measurement body, the orchestrator, and a standalone check.
+# benchmark. The measurement runs in a separate Julia subprocess that writes a PHASE
+# receipt; the single entrypoint aggregates phase receipts by model key into ONE final
+# receipt. The producer has one phase, "native"; historical receipts also carry a
+# "reactant" phase, measured with ReactiveKernels' removed Reactant path, and still
+# validate here. Pure Julia + stdlib TOML (no heavy deps), so it is usable from the
+# measurement body, the orchestrator, and a standalone check.
 module All80Receipt
 
 import TOML, Dates, SHA
@@ -11,9 +12,8 @@ import TOML, Dates, SHA
 const SCHEMA = "all80-benchmark-v1"
 
 const _HARNESS_FILES = (
-    "all80_posteriordb.jl", "all80_posteriordb_body.jl", "all80_reactant_body.jl",
-    "all80_reactant_evals.jl", "all80_registry.jl", "all80_receipt.jl",
-    "all80_axes.jl", "all80_metadata.jl", "all80_parity.jl")
+    "all80_posteriordb.jl", "all80_posteriordb_body.jl", "all80_registry.jl",
+    "all80_receipt.jl", "all80_axes.jl", "all80_metadata.jl", "all80_parity.jl")
 const _HMC_HARNESS_FILES = (
     "sampler_transpiler/eight_schools_density.jl",
     "nuts_kernel_authoring_fixture_b.jl",
@@ -304,16 +304,9 @@ end
 
 # The MANDATORY numeric cells — real numbers required for ALL 82 rows (publication gate).
 # primal_*/gradient_* are MEDIAN NANOSECONDS; hmc_* are MEDIAN MICROSECONDS/transition
-# (lower = faster). Which PHASE (isolated subprocess) produces which cell (LOCKED split —
-# the native phase must NOT `using Reactant`, so loading Reactant cannot perturb native
-# timings; cross-process fairness comes from identical q/integrator/steps/warmup/procedure):
-#   native (NO Reactant loaded): primal_{rk,turing,stan}, gradient_{rk,turing,stan},
-#       hmc_rk_native (RK-native multinomial-HMC loop), hmc_ahmc_turing (AdvancedHMC)
-#   reactant (Reactant + transpiler loaded): primal_rk_reactant, gradient_rk_reactant,
-#       hmc_rk_reactant (SAME multinomial HMC, Reactant-compiled)
-# MANDATORY (a finite number for ALL 82): the 8 NATIVE cells. RK+Reactant is NOT mandatory
-# for all 82 — the user (2026-09-07) explicitly does not expect every faithful graph to lower
-# through Reactant; the honest deliverable is a per-model transpile/no-transpile breakdown.
+# (lower = faster). The native phase produces primal_{rk,turing,stan},
+# gradient_{rk,turing,stan}, hmc_rk_native (RK-native multinomial-HMC loop) and
+# hmc_ahmc_turing (AdvancedHMC).
 const NATIVE_CELLS = ("primal_rk", "primal_turing", "primal_stan",
     "gradient_rk", "gradient_turing", "gradient_stan",
     "hmc_rk_native", "hmc_ahmc_turing")
@@ -333,13 +326,13 @@ const MANDATORY_CELLS = ("primal_turing", "primal_stan",
 # finite numbers once the per-model fix lands (canonicals bound per follow-on).
 const RK_CELLS = ("primal_rk", "gradient_rk", "hmc_rk_native")
 # CONDITIONAL cells: a finite NUMBER where it applies, else a NONEMPTY string carrying the
-# exact reason. REACTANT cells = numeric where the model lowers through Reactant, else the
-# exact Reactant-lowering error. OPTIONAL optimized-Stan/further-Turing = number if a distinct
-# verified-faster impl exists, else the user-directive deferral provenance. Never merely absent.
+# exact reason. OPTIONAL optimized-Stan/further-Turing = number if a distinct verified-faster
+# impl exists, else the user-directive deferral provenance. Never merely absent. HISTORICAL
+# REACTANT cells (removed Reactant path) = numeric where the model lowered, else the exact
+# lowering error; checked only on rows that carry them.
 const REACTANT_CELLS = ("primal_rk_reactant", "gradient_rk_reactant", "hmc_rk_reactant")
 const OPTIONAL_CELLS = ("primal_opt_stan", "primal_further_turing",
     "gradient_opt_stan", "gradient_further_turing")
-const CONDITIONAL_CELLS = (REACTANT_CELLS..., OPTIONAL_CELLS...)
 # Descriptive per-model fields carried alongside the cells (native phase authors them).
 const DESCRIPTIVE = ("dim", "family", "note", "parity_pass", "rk_off", "tu_off",
     "off_reason", "rk_grad_relerr", "tu_grad_relerr",
@@ -365,7 +358,7 @@ function write_phase(path::AbstractString, phase, rows::AbstractDict; provenance
     path
 end
 
-"""Merge phase receipts (native ∪ reactant, per model key) into the final receipt.
+"""Merge phase receipts (per model key) into the final receipt.
 Phases carry disjoint cell sets by construction; a cell that appears in two phases must
 AGREE — a conflicting duplicate is a HARD ERROR, never a silent overwrite. Model ordering
 and cell content are deterministic (TOML-sorted); the only non-reproducible field is the
@@ -374,12 +367,12 @@ function aggregate(phase_paths, out_path::AbstractString; meta = Dict{String,Any
                    preserve_provenance = false, require_phases = String[],
                    expected_keys = String[], batch = "")
     merged = Dict{String,Dict{String,Any}}()
-    prov = Dict{String,Any}()   # per-phase process-start provenance (batch-1); native + reactant kept BOTH
+    prov = Dict{String,Any}()   # per-phase process-start provenance (batch-1), keyed by phase
     seen_phases = String[]
     run_ids = String[]
     strict = !isempty(require_phases)
-    strict && Set(String.(require_phases)) == Set(["native", "reactant"]) ||
-        isempty(require_phases) || error("All80Receipt.aggregate: required phases must be exactly native+reactant")
+    strict && Set(String.(require_phases)) == Set(["native"]) ||
+        isempty(require_phases) || error("All80Receipt.aggregate: required phases must be exactly native")
     strict && length(phase_paths) == length(require_phases) ||
         isempty(require_phases) ||
         error("All80Receipt.aggregate: expected $(length(require_phases)) phase receipts, got $(length(phase_paths))")
@@ -467,7 +460,9 @@ function validate(path::AbstractString; expected_models = nothing)
             ok = (v isa Real && isfinite(v)) || (v isa AbstractString && !isempty(v))
             ok || push!(issues, "$k: RK cell $c must be a finite number or a nonempty defect diagnostic string ($(repr(v)))")
         end
-        for c in CONDITIONAL_CELLS
+        conditional = any(c -> haskey(cells, c), REACTANT_CELLS) ?
+            (REACTANT_CELLS..., OPTIONAL_CELLS...) : OPTIONAL_CELLS
+        for c in conditional
             v = get(cells, c, nothing)
             ok = (v isa Real && isfinite(v)) || (v isa AbstractString && !isempty(v))
             ok || push!(issues, "$k: conditional cell $c must be a finite number or a nonempty reason/provenance string ($(repr(v)))")
@@ -478,9 +473,10 @@ end
 
 """Strict incremental-batch publication contract: exact phases/keys/multiplicity, matching
 per-phase provenance and run id, certified loaded roots, recorded configuration, per-model input
-identities, plus the ordinary report-completeness gate. Missing Reactant provenance in the saved
-batch is therefore an explicit certification failure, not a silently accepted aggregate."""
-function validate_batch(path::AbstractString; expected_keys, phases = ("native", "reactant"),
+identities, plus the ordinary report-completeness gate. A historical batch validated with
+`phases = ("native", "reactant")` must carry that provenance and the Reactant input identities;
+missing ones are an explicit certification failure, not a silently accepted aggregate."""
+function validate_batch(path::AbstractString; expected_keys, phases = ("native",),
         batch = "")
     d = TOML.parsefile(path)
     issues = String[]
@@ -525,8 +521,9 @@ function validate_batch(path::AbstractString; expected_keys, phases = ("native",
         _input_query_identity_ok(get(models[key], "input_identity_native", nothing),
             models[key], "native", key) ||
             push!(issues, "$key lacks a complete native input/query identity")
-        _input_query_identity_ok(get(models[key], "input_identity_reactant", nothing),
-            models[key], "reactant", key) ||
+        "reactant" in phases &&
+            !_input_query_identity_ok(get(models[key], "input_identity_reactant", nothing),
+                models[key], "reactant", key) &&
             push!(issues, "$key lacks a complete Reactant input/query identity")
     end
     issues

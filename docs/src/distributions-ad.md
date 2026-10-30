@@ -43,10 +43,7 @@ A scalar active port becomes a length-`N` value vector. An active vector port
 whose scalar shape is `D` receives a trailing replica axis in the batched call
 and its gradient is stacked as `D × N`. The scalar preparation stays the source
 of truth. Native Enzyme reverse mode calls the same prepared AD kernel once per
-position (`test/test_replica.jl`). With Reactant, `@compile batched_ad(...)`
-lowers the replica map in one executable: static replica slices feed the same
-prepared DI/AutoEnzyme program, and the objective/gradient outputs are stacked
-(`test/test_reactant.jl`).
+position (`test/test_replica.jl`).
 
 ## Distribution gradient latency and allocation
 

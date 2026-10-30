@@ -1,4 +1,9 @@
-# Eight Schools kernels through Reactant
+# Eight Schools kernels through Reactant (historical receipt)
+
+> **Historical receipt.** ReactiveKernels no longer has a Reactant path: its
+> Reactant extension, tensorized lowering and Reactant tests were removed. This
+> page keeps the measurements as recorded. Nothing on it runs Reactant, and the
+> RK functions and test files it names no longer exist.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_result_assets()
@@ -79,37 +84,13 @@ For the exact model graph see the [Eight Schools kernel page](eight-schools.md);
 for native-AD (non-Reactant) timing see the
 [automatic-differentiation page](automatic-differentiation.md).
 
-## Reproduce
+## Provenance
 
-The receipt generator requires a clean detached candidate so its full commit
-pin and source blob are immutable. From a sibling directory:
-
-```sh
-git -C ReactiveKernels.jl worktree add --detach ReactiveKernels-eight-schools-receipt HEAD
-cd ReactiveKernels-eight-schools-receipt
-julia --startup-file=no benchmark/eight_schools_reactant_comparison.jl \
-  --output=benchmark/receipts/eight-schools-reactant-v2.toml
-julia --startup-file=no benchmark/receipts/validate_eight_schools_reactant.jl \
-  benchmark/receipts/eight-schools-reactant-v2.toml
-```
-
-The script provisions a fresh environment with Reactant 0.2.289, develops the
-exact candidate plus its two example packages, and records environment setup
-and package precompilation separately. For a quick non-publication smoke run,
-set `RK_EIGHT_SCHOOLS_REACTANT_ROUNDS=2` and
-`RK_EIGHT_SCHOOLS_REACTANT_TARGET_SECONDS=0.002`; the checked-in receipt keeps
-the publication protocol of at least 20 rounds.
-
-The Reactant-compiled-AD receipt is generated the same way from the same clean
-detached candidate, and additionally resolves Enzyme and DifferentiationInterface
-into the pinned environment:
-
-```sh
-julia --startup-file=no benchmark/eight_schools_reactant_ad_comparison.jl \
-  --output=benchmark/receipts/eight-schools-reactant-ad-v2.toml
-julia --startup-file=no benchmark/receipts/validate_eight_schools_reactant_ad.jl \
-  benchmark/receipts/eight-schools-reactant-ad-v2.toml
-```
-
-Its quick-smoke knobs are `RK_EIGHT_SCHOOLS_REACTANT_AD_ROUNDS` and
-`RK_EIGHT_SCHOOLS_REACTANT_AD_TARGET_SECONDS`.
+Each receipt was generated from a clean detached checkout of the
+ReactiveKernels commit it pins, in a fresh environment with Reactant 0.2.289,
+by `benchmark/eight_schools_reactant_comparison.jl` and
+`benchmark/eight_schools_reactant_ad_comparison.jl` at that commit. Both
+scripts were removed together with ReactiveKernels' Reactant path. The
+checked-in receipts keep the publication protocol of at least 20 rounds, and
+`benchmark/receipts/validate_eight_schools_reactant.jl` and
+`validate_eight_schools_reactant_ad.jl` still validate them.

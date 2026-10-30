@@ -59,13 +59,8 @@ end
 @testset "PPL graph — lotka_volterra (posteriordb adaptive RK45)" begin
     # Boundary: native primal/value plus ordinary-Reverse gradient is
     # accepted, supported via landed core fix 55da875/f8acaa1 for snag
-    # plain-enzyme-rev-3dc5d563; compiled Reactant primal/gradient is
-    # unsupported pending the separate Reactant survey — so this file
-    # asserts Reactant stays absent throughout (values here, gradients in
-    # the default four-model gate).
-    modules_before = Set(String(id.name) for id in keys(Base.loaded_modules))
-    @test !("Reactant" in modules_before)
-
+    # plain-enzyme-rev-3dc5d563 (values here, gradients in the default
+    # four-model gate).
     artifact = evaluate_lotka_volterra_source()
     @test artifact.source == strip(LOTKA_VOLTERRA_SOURCE, '\n')
     @test artifact.output == Base.invokelatest(artifact.kernel, artifact.inputs.q)
@@ -115,8 +110,4 @@ end
         have = (:unconstrained, :ts, :y_init, :y), want = :posterior,
         bound = (; ts = LOTKA_TS, y_init = LOTKA_Y_INIT, y = LOTKA_Y))(q)
     @test template_value == full_value
-
-    modules_after = Set(String(id.name) for id in keys(Base.loaded_modules))
-    @test issubset(modules_before, modules_after)
-    @test !("Reactant" in modules_after)
 end

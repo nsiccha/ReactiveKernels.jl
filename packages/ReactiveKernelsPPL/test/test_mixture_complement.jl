@@ -1,8 +1,7 @@
 # Complement-pair mixture weights (`[s, 1.0 - s]` / `[1.0 - s, s]` over
 # one `:unit`-support sampled parameter — the collapsed Beta-weight
 # shape): surface admission, fail-closed battery, value parity vs
-# Distributions.jl oracles, Enzyme-vs-findiff gradients, and
-# Reactant/XLA value+grad (in test_mixture_complement_reactant.jl).
+# Distributions.jl oracles and Enzyme-vs-findiff gradients.
 # (`_check_gradient` / `_findiff_grad` /
 # `_GEN_BACKEND` come from test_generator.jl, included first.)
 using Distributions: Beta, Exponential, Normal, Uniform, logpdf

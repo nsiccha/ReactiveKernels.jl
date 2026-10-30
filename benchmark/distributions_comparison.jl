@@ -1,5 +1,9 @@
 #!/usr/bin/env julia
 
+# Native Normal log-density reduction benchmark. Writes a
+# `distribution-logdensity-v2` receipt; the checked-in v1 receipts also carry
+# historical Reactant cells, measured with ReactiveKernels' removed Reactant path.
+
 module DistributionComparison
 
 include("distribution_benchmark_cases.jl")
@@ -7,11 +11,9 @@ include("distribution_benchmark_cases.jl")
 using BenchmarkTools
 using Dates
 using Distributions
-using Pkg
 using Printf
 using ProbabilityMeasures
 using Random
-using Reactant
 using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 using Statistics
@@ -19,8 +21,6 @@ using TOML
 
 using .DistributionBenchmarkCases:
     NORMAL_SIZES, normal_observations, normal_parameters
-
-using Reactant: @compile
 
 const PROBABILITY_MEASURES_SHA = "7cf3a6e112aaae2097b8d401b256d1bce635e03e"
 const DEFAULT_SIZES = NORMAL_SIZES
@@ -51,10 +51,6 @@ const RK_REDUCE = plate(
 end
 
 const RK_AUTHORED_RETURN = prepare(benchmark_authored_normal_loglik)
-const RK_SCALAR = prepare(extract(
-    normal; have = (:x, :location, :scale), want = :logpdf,
-))
-const RK_REPLICATED = replica(RK_SCALAR; batched = :x)
 
 distributions_reduce(μ, σ, xs) =
     sum(Distributions.logpdf.(Distributions.Normal(μ, σ), xs))
@@ -82,15 +78,6 @@ function hand_hoisted_reduce(μ, σ, xs)
     acc
 end
 
-compile_rk(xs, μ, σ) = @compile sync = true RK_REDUCE(xs, μ, σ)
-compile_rk_authored(xs, μ, σ) =
-    @compile sync = true RK_AUTHORED_RETURN(xs, μ, σ)
-compile_rk_replicated(xs, μ, σ) =
-    @compile sync = true RK_REPLICATED(xs, μ, σ)
-compile_pm(μ, σ, xs) = @compile sync = true probability_measures_reduce(μ, σ, xs)
-compile_distributions(μ, σ, xs) =
-    @compile sync = true distributions_reduce(μ, σ, xs)
-
 function _measurement(f, a, b, c; rounds::Int)
     benchmark = @benchmarkable $f($a, $b, $c)
     times_ns = Float64[]
@@ -114,22 +101,9 @@ end
 
 _git(repo, args...) = readchomp(Cmd(["git", "-C", repo, string.(args)...]))
 
-function _package_version(name)
-    for info in values(Pkg.dependencies())
-        info.name == name && return string(info.version)
-    end
-    error("package $name is absent from the benchmark environment")
-end
-
 function _sizes()
     raw = get(ENV, "RK_DENSITY_BENCH_SIZES", "")
     isempty(raw) && return DEFAULT_SIZES
-    Tuple(parse(Int, strip(item)) for item in split(raw, ','))
-end
-
-function _replica_counts()
-    raw = get(ENV, "RK_DENSITY_REPLICAS", "")
-    isempty(raw) && return (1, 16, 256)
     Tuple(parse(Int, strip(item)) for item in split(raw, ','))
 end
 
@@ -138,34 +112,6 @@ function _output_path()
         startswith(arg, "--output=") && return split(arg, '='; limit = 2)[2]
     end
     nothing
-end
-
-function _reactant_amortization(μ, σ, rμ, rσ, rounds)
-    rows = Dict{String,Any}[]
-    for replicas in _replica_counts()
-        replicas > 0 || throw(ArgumentError("RK_DENSITY_REPLICAS must be positive"))
-        xs = [0.17 + 0.001 * (j - 1) for j in 1:replicas]
-        references = [RK_SCALAR(x, μ, σ) for x in xs]
-        native = RK_REPLICATED(xs, μ, σ)
-        isapprox(native, references; rtol = 1e-11) ||
-            error("native replicated value mismatch at replicas=$replicas")
-
-        rxs = Reactant.to_rarray(xs)
-        compile_s = @elapsed compiled = compile_rk_replicated(rxs, rμ, rσ)
-        observed = Array(compiled(rxs, rμ, rσ))
-        isapprox(observed, references; rtol = 1e-11) ||
-            error("Reactant replicated value mismatch at replicas=$replicas")
-        measurement = _measurement(compiled, rxs, rμ, rσ; rounds)
-        push!(rows, Dict{String,Any}(
-            "n" => 1,
-            "replicas" => replicas,
-            "max_abs_error" => maximum(abs.(observed .- references)),
-            "rk_reactant_replicated" => measurement,
-            "median_ns_per_evaluation" => measurement["median_ns"] / replicas,
-            "compile_seconds" => compile_s,
-        ))
-    end
-    rows
 end
 
 function run_benchmark()
@@ -177,30 +123,18 @@ function run_benchmark()
     )
 
     authored_native_ast = string(code_expr(RK_AUTHORED_RETURN))
-    authored_tensorized_ast = string(RK_AUTHORED_RETURN.f.tensorized_ast)
     occursin("similar", authored_native_ast) &&
         error("authored return-only lowering materializes a pointwise output")
-    occursin("for ", authored_tensorized_ast) &&
-        error("authored Reactant lowering retained a host loop")
-    occursin("Base.broadcast", authored_tensorized_ast) ||
-        error("authored Reactant lowering is not tensorized as broadcasts")
-    occursin("Base.sum", authored_tensorized_ast) ||
-        error("authored Reactant lowering is not a fused reduction")
 
     Random.seed!(0x5eed)
     parameters = normal_parameters()
     μ, σ = parameters.location, parameters.scale
-    rμ = Reactant.ConcreteRNumber(μ)
-    rσ = Reactant.ConcreteRNumber(σ)
     rounds = parse(Int, get(ENV, "RK_DENSITY_BENCH_ROUNDS", string(DEFAULT_ROUNDS)))
 
     rows = Dict{String,Any}[]
-    distributions_reactant_supported = true
-    distributions_reactant_error = ""
 
     for n in _sizes()
         xs = normal_observations(n)
-        rxs = Reactant.to_rarray(xs)
         reference = hand_hoisted_reduce(μ, σ, xs)
 
         native_values = (
@@ -215,47 +149,12 @@ function run_benchmark()
         all(value -> isapprox(value, reference; rtol = 1e-11), native_values) ||
             error("native value mismatch at N=$n")
 
-        rk_compile_s = @elapsed rk_compiled = compile_rk(rxs, rμ, rσ)
-        rk_authored_compile_s = @elapsed rk_authored_compiled =
-            compile_rk_authored(rxs, rμ, rσ)
-        pm_compile_s = @elapsed pm_compiled = compile_pm(rμ, rσ, rxs)
-        rk_value = Float64(rk_compiled(rxs, rμ, rσ))
-        rk_authored_value = Float64(rk_authored_compiled(rxs, rμ, rσ))
-        pm_value = Float64(pm_compiled(rμ, rσ, rxs))
-        isapprox(rk_value, reference; rtol = 1e-11) ||
-            error("Reactant RK value mismatch at N=$n")
-        isapprox(rk_authored_value, reference; rtol = 1e-11) ||
-            error("Reactant authored RK value mismatch at N=$n")
-        isapprox(pm_value, reference; rtol = 1e-11) ||
-            error("Reactant ProbabilityMeasures value mismatch at N=$n")
-
-        dist_compiled = nothing
-        dist_compile_s = nothing
-        dist_value = nothing
-        if distributions_reactant_supported
-            try
-                dist_compile_s = @elapsed dist_compiled =
-                    compile_distributions(rμ, rσ, rxs)
-                dist_value = Float64(dist_compiled(rμ, rσ, rxs))
-                isapprox(dist_value, reference; rtol = 1e-11) ||
-                    error("Reactant Distributions value mismatch at N=$n")
-            catch err
-                distributions_reactant_supported = false
-                distributions_reactant_error = first(split(sprint(showerror, err), '\n'))
-            end
-        end
-
-        observed_values = Any[
-            native_values..., rk_value, rk_authored_value, pm_value,
-        ]
-        dist_value === nothing || push!(observed_values, dist_value)
-
         row = Dict{String,Any}(
             "n" => n,
             "max_abs_error" =>
-                maximum(abs(value - reference) for value in observed_values),
+                maximum(abs(value - reference) for value in native_values),
             "max_relative_error" => maximum(
-                abs(value - reference) / abs(reference) for value in observed_values
+                abs(value - reference) / abs(reference) for value in native_values
             ),
             "rk_native" => _measurement(RK_REDUCE, xs, μ, σ; rounds),
             "rk_authored_native" =>
@@ -272,28 +171,13 @@ function run_benchmark()
                 _measurement(probability_measures_loop, μ, σ, xs; rounds),
             "hand_hoisted" =>
                 _measurement(hand_hoisted_reduce, μ, σ, xs; rounds),
-            "rk_reactant" => _measurement(rk_compiled, rxs, rμ, rσ; rounds),
-            "rk_authored_reactant" =>
-                _measurement(rk_authored_compiled, rxs, rμ, rσ; rounds),
-            "probability_measures_reactant" =>
-                _measurement(pm_compiled, rμ, rσ, rxs; rounds),
-            "rk_reactant_compile_seconds" => rk_compile_s,
-            "rk_authored_reactant_compile_seconds" => rk_authored_compile_s,
-            "probability_measures_reactant_compile_seconds" => pm_compile_s,
         )
-        if dist_compiled !== nothing
-            row["distributions_reactant"] =
-                _measurement(dist_compiled, rμ, rσ, rxs; rounds)
-            row["distributions_reactant_compile_seconds"] = dist_compile_s
-        end
         push!(rows, row)
         @printf("N=%d complete\n", n)
     end
 
-    amortization = _reactant_amortization(μ, σ, rμ, rσ, rounds)
-
     receipt = Dict{String,Any}(
-        "schema" => "distribution-logdensity-v1",
+        "schema" => "distribution-logdensity-v2",
         "generated_at" => string(now(UTC), "Z"),
         "pins" => Dict(
             "reactivekernels_sha" => _git(repo, "rev-parse", "HEAD"),
@@ -301,8 +185,6 @@ function run_benchmark()
             "probability_measures_sha" => PROBABILITY_MEASURES_SHA,
             "probability_measures_version" => string(Base.pkgversion(ProbabilityMeasures)),
             "distributions_version" => string(Base.pkgversion(Distributions)),
-            "reactant_version" => string(Base.pkgversion(Reactant)),
-            "reactant_jll_version" => _package_version("Reactant_jll"),
             "julia_version" => string(VERSION),
         ),
         "environment" => Dict(
@@ -310,7 +192,6 @@ function run_benchmark()
             "arch" => string(Sys.ARCH),
             "cpu" => first(Sys.cpu_info()).model,
             "julia_threads" => Threads.nthreads(),
-            "reactant_backend" => "default CPU",
         ),
         "protocol" => Dict(
             "formula" => "Normal log density with shared μ and σ",
@@ -319,22 +200,6 @@ function run_benchmark()
             "estimator" => "median of per-round BenchmarkTools minimum times",
             "samples_per_round" => 200,
             "seconds_per_round" => 0.25,
-            "reactant_sync" => true,
-            "reactant_transfers_included" => false,
-            "reactant_parameters_traced" => true,
-            "reactant_compile_time_in_timed_region" => false,
-            "reactant_compile_order" => [
-                "ReactiveKernels legacy plate",
-                "ReactiveKernels authored plate return",
-                "ProbabilityMeasures",
-                "Distributions",
-            ],
-            "reactant_compile_times_include_first_service_startup" => true,
-            "reactant_replica_counts" => collect(_replica_counts()),
-            "reactant_replica_axis" =>
-                "independent one-observation data sets on the trailing x axis",
-            "reactant_replica_normalization" =>
-                "whole-batch median divided by replica count",
             "native_distributions_spelling" =>
                 "sum(Distributions.logpdf.(Distributions.Normal(μ, σ), xs))",
             "native_probability_measures_spelling" =>
@@ -345,20 +210,10 @@ function run_benchmark()
                 "@kernel normal_loglik(x, location, scale) = begin; pointwise = plate(x, location, scale) do xi, li, si; normal(li, si).logpdf(xi); end; return sum(pointwise); end",
             "rk_authored_native_lowering" =>
                 "one reduction traversal with no similar/pointwise output",
-            "rk_authored_reactant_lowering" =>
-                "tensorized broadcast chain consumed by Base.sum; no host loop or similar",
             "rk_direct_control_spelling" =>
                 "one-off benchmark_normal_logpdf lifted with plate",
         ),
-        "support" => Dict(
-            "rk_reactant" => true,
-            "rk_authored_reactant" => true,
-            "probability_measures_reactant" => true,
-            "distributions_reactant" => distributions_reactant_supported,
-            "distributions_reactant_error" => distributions_reactant_error,
-        ),
         "measurements" => rows,
-        "reactant_amortization" => amortization,
     )
 
     output = _output_path()

@@ -456,7 +456,7 @@ function _lower(name, dataargs, params, obs, passthrough)
 
     # 1. Packed-unconstrained split + per-parameter constrained transform.
     #    Each parameter takes ONE packed coordinate: its UNCONSTRAINED value.
-    #    `sum(view(…))` keeps the evaluator allocation-free / Reactant-friendly.
+    #    `sum(view(…))` keeps the evaluator allocation-free.
     #    Real → identity; positive → log/exp; unit → logit/logistic. BOTH
     #    transform directions are authored (forward from the unconstrained
     #    coordinate, inverse from the constrained value) so HAVE authority routes

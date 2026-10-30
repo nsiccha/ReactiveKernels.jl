@@ -337,13 +337,12 @@ end
     call(x, scale) = scale > 0 ? x * log(scale) : -x
     branch = RK._KernelBranch(Val((2,)), Val((1, 2)), Val((1,)), call,
         scale -> scale > 0, (x, scale) -> x * log(scale), x -> -x)
-    source = RK._KernelSourceOp(Val(gensym(:branch)), Val(:fused), branch, branch)
+    source = RK._KernelSourceOp(Val(gensym(:branch)), Val(:fused), branch)
     op = RK._execution_source(source)
     @test RK.kernel_sourceop_token(op) === nothing
-    @test RK._tensorized_plate_dispatch(op, ([2.0, 3.0], 2.0)) ≈
-        [2.0, 3.0] .* log(2.0)
-    @test RK._tensorized_plate_dispatch(op, ([2.0, 3.0], -2.0)) ==
-        [-2.0, -3.0]
+    @test op.f isa RK._KernelBranch
+    @test [op(x, 2.0) for x in (2.0, 3.0)] ≈ [2.0, 3.0] .* log(2.0)
+    @test [op(x, -2.0) for x in (2.0, 3.0)] == [-2.0, -3.0]
 end
 
 @testset "runtime source conversion preserves lexical captures" begin

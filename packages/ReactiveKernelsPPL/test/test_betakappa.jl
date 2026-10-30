@@ -1,8 +1,7 @@
 # Beta modeled-kappa (SB `beta(mu .* kappa, ...)` mirror): surface
 # admission of a log-link kappa predictor, value parity vs
 # Distributions.jl oracles (predictor-fed / literal kappa), a shared
-# mixture-component kappa predictor, Enzyme-vs-findiff gradients,
-# Reactant/XLA value+grad (in test_betakappa_reactant.jl), O(1)
+# mixture-component kappa predictor, Enzyme-vs-findiff gradients, O(1)
 # emission, and the P2 SB parity probe vs
 # the peer lane's BridgeStan numbers (spec brief
 # 2026-09-27T14-14-33-651-1mcop44 on

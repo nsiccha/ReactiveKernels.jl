@@ -60,18 +60,3 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
     setup = Main.ReactiveKernelsDocs.setup_dogs_nonhierarchical!,
 )
 ```
-
-## Reactant
-
-The exact authored graph compiles and executes through the public Reactant
-boundary with value and gradient parity — `benchmark/batch1_gate.jl` `@compile`s
-both the primal and the gradient and asserts they match the native evaluation and
-the reference `.stan`. The in-graph triangular operator, the `y·C` running-count
-matrices, the per-dog broadcast, and the multiplicative Bernoulli likelihood all
-lower cleanly.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.DogsNonhierarchicalExample.demo()'
-```

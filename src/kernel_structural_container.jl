@@ -400,10 +400,9 @@ end
 end
 
 
-# One element of a column at a runtime (possibly traced) slot index: a scalar
-# column is one scalar gather, an array column one slice along its trailing
-# slot axis.  `_sm_functional_index` is the backend-neutral indexed read (the
-# Reactant extension gathers under `@allowscalar`).
+# One element of a column at a runtime slot index: a scalar column is one
+# scalar gather, an array column one slice along its trailing slot axis.
+# `_sm_functional_index` is the backend-neutral indexed read.
 @inline _sm_finite_read_slot(column, ::_SMFiniteScalarColumnSpec, index) =
     _sm_functional_index(column, index)
 @inline _sm_finite_read_slot(
@@ -452,9 +451,8 @@ end
         Uplo, Info)
 end
 
-# Optional backends may need representation-only wrappers while tracing (for
-# example the Reactant extension's traced Cholesky).  Reusable results cross back to the
-# source-logical ABI before their next invocation: retain the backend arrays,
+# Optional backends may need representation-only wrappers.  Reusable results
+# cross back to the source-logical ABI before their next invocation: retain the backend arrays,
 # but rebuild every structural wrapper from the frozen source schema.  This is
 # intentionally separate from `_sm_finite_reconstruct`, whose backend-aware
 # wrapper choice is required inside the compiled program.

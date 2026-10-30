@@ -57,23 +57,19 @@ c = zeros(40)
 kernel(q, c)
 ```
 
-## Compile the value and gradient
+## Value and gradient
 
 The following uses the same graph and the public prepared AD boundary. The
-historical benchmark receipts below exercised this path before ownership
-transfer; the documentation build executes the native interaction above.
+historical benchmark receipts below exercised this path, and RK's since-removed
+Reactant path, before ownership transfer; the documentation build executes the
+native interaction above.
 
 ```julia
-using Reactant, Enzyme
+using Enzyme
 using DifferentiationInterface: AutoEnzyme
 backend = AutoEnzyme(; mode=Enzyme.Reverse, function_annotation=Enzyme.Const)
 prepared = prepare_ad(kernel, backend, q, c; active=:q)
-native_value, native_gradient = ad_value_and_gradient!(prepared, similar(q), q, c)
-rq, rc = Reactant.to_rarray(q), Reactant.to_rarray(c)
-compiled_primal = Reactant.@compile sync=true kernel(rq, rc)
-value = compiled_primal(rq, rc)
-compiled = compile_ad_value_and_gradient(prepared, rq, rc)
-value, gradient = compiled(rq, rc)
+value, gradient = ad_value_and_gradient!(prepared, similar(q), q, c)
 ```
 
 Centeredness is held fixed when differentiating with respect to `q`. Changing
@@ -90,16 +86,17 @@ the owned body source as well as this repository's consumer wrapper.
 
 On the CPU benchmark, native Julia is faster for the primal. Native Enzyme
 value-and-gradient evaluation is 1.02–1.20× StanBlocks in the longer measurement,
-meeting the case study's `≤1.25×` target. The resident Reactant path is
-1.50–1.98× StanBlocks and does not meet that target. The first, shorter receipt
+meeting the case study's `≤1.25×` target. The resident Reactant path, since
+removed from RK, was 1.50–1.98× StanBlocks and did not meet that target; its
+rows below are historical. The first, shorter receipt
 overstated the native Enzyme gap; both receipts are retained for comparison.
 
 The table reads the committed receipt. Times are warmed median microseconds
 at one posterior position per frame, with up to 100,000 single-evaluation samples
 and a two-second budget per measurement,
 CPU affinity 6 on `strato2`, Julia 1.10.11, and one BLAS thread. The shared host
-was not reserved. Resident Reactant calls synchronize before returning; the
-host row also transfers the position and materializes both results. Julia
+was not reserved. Resident Reactant calls synchronized before returning; the
+host row also transferred the position and materialized both results. Julia
 allocation counts exclude backend-managed memory. These are CPU measurements.
 
 ```@eval
@@ -108,10 +105,10 @@ receipt = TOML.parsefile(joinpath(@__DIR__, "..", "..", "benchmark", "receipts",
     "brm-hsgp-reactant-v2.toml"))
 frames = ("noncentered", "selected_partial", "mixed", "centered")
 paths = (("Julia primal", "rk_native_primal"),
-    ("Reactant primal (resident)", "reactant_primal"),
+    ("Reactant primal (resident; removed path)", "reactant_primal"),
     ("Enzyme value + gradient", "rk_native_value_gradient"),
-    ("Enzyme + Reactant value + gradient (resident)", "reactant_resident"),
-    ("Enzyme + Reactant value + gradient (host)", "reactant_host"),
+    ("Enzyme + Reactant value + gradient (resident; removed path)", "reactant_resident"),
+    ("Enzyme + Reactant value + gradient (host; removed path)", "reactant_host"),
     ("StanBlocks value + gradient", "stanblocks"),
     ("Native Turing + adaptive gradient wrapper", "native_turing"))
 rows = ["| Evaluation | NCP (μs) | Selected partial (μs) | Mixed (μs) | Centered (μs) | NCP Julia bytes / allocations |",
@@ -132,7 +129,7 @@ a 0.30 s first execution. These stages ran in that order in one process, so
 the second compiler measurement benefits from the first one's initialization.
 None of those costs is included in the warmed table.
 
-The compiled primal and value-and-gradient paths passed 40,072 comparisons
+The historical Reactant primal and value-and-gradient paths passed 40,072 comparisons
 against both normalized StanBlocks and native Turing: both supplied 10,000-draw posterior bundles,
 10,000 NCP positions transported to each of mixed and centered coordinates,
 and 18 adversarial points in every frame. Maximum absolute density error was
@@ -154,7 +151,7 @@ DynamicPPL. Those reference checks evaluate fixed posterior positions.
 The targets compute the same normalized density and derivatives, but the
 executed operations differ. BRM specializes its generated NCP model to
 standardized weights, while the RK example keeps centeredness live. The RK
-lowering folds the basis once: its optimized StableHLO has a constant
+lowering folds the basis once; the historical Reactant program held a constant
 `133×20` basis and no sine operation. It still performs the parameter-dependent
 rescaling and projections on every call.
 
@@ -162,14 +159,14 @@ The native Enzyme allocation profile records 40 arrays per call: eight slices,
 28 broadcast results, and four matrix-product results. AD preparation reuses
 differentiation setup, not all those intermediates. Binding NCP centeredness
 in a diagnostic reduces allocations from 40 to 32 and the native gradient
-median from 8.42 to 6.95 μs. The corresponding Reactant median changes from
-16.26 to 14.76 μs. These controls ran on CPU7 and should be compared within
+median from 8.42 to 6.95 μs. The corresponding historical Reactant median
+changed from 16.26 to 14.76 μs. These controls ran on CPU7 and should be compared within
 their own run.
 
-A cheap Reactant control returning the same scalar-plus-44-vector shape takes
+A cheap Reactant control returning the same scalar-plus-44-vector shape took
 5.76 μs. A quadratic control containing just the two basis projections and their
-reverse projections already takes 15.98 μs through Reactant, versus 1.37 μs
-for its native analytic evaluation. Grouping the right-hand sides changes
+reverse projections already took 15.98 μs through Reactant, versus 1.37 μs
+for its native analytic evaluation. Grouping the right-hand sides changed
 the Reactant control to 15.67 μs. Thus call overhead is material, and this
 small dense linear-algebra workload reproduces most of the compiled model's
 latency. This is a controlled comparison, not an additive timing breakdown or
@@ -186,9 +183,10 @@ warmed runtime measurements.
 
 The same motorcycle kernel also runs through the
 [authored HMC transpiler](hmc-transpiler.md). Native uses prepared Enzyme
-gradients; Reactant compiles differentiation together with momentum refreshes,
-leapfrog integration, and multinomial proposal selection. This removes the
-standalone gradient-call boundary from every leapfrog step.
+gradients. The historical Reactant column was measured with the transpiler's
+since-removed Reactant backend, which compiled differentiation together with
+momentum refreshes, leapfrog integration, and multinomial proposal selection,
+removing the standalone gradient-call boundary from every leapfrog step.
 
 The shared benchmark helper is
 [`HMCBenchmark.prepare_hmc` / `benchmark_hmc`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/sampler_transpiler/hmc_benchmark.jl),
@@ -201,14 +199,14 @@ batches on CPU6 of the shared host. The bracketed values are observed minimum
 and maximum, not confidence intervals. Compilation garbage is collected once;
 at least one second and three batches of additional warmup precede timing.
 Each prepared-program call preserves its input state and returns final output
-snapshots. Those wrapper costs are timed; Reactant synchronizes once per batch.
+snapshots. Those wrapper costs are timed; Reactant synchronized once per batch.
 
 ```@eval
 using Markdown, TOML
 receipts = Dict(backend => TOML.parsefile(joinpath(@__DIR__, "..", "..",
     "benchmark", "receipts", "brm-hsgp-hmc-$backend-v1.toml"))
     for backend in ("native", "reactant"))
-rows = ["| Frame | Transitions/batch | Native + Enzyme (μs) | Reactant + Enzyme (μs) | Native / Reactant |",
+rows = ["| Frame | Transitions/batch | Native + Enzyme (μs) | Reactant + Enzyme, removed path (μs) | Native / Reactant |",
         "|---|---:|---:|---:|---:|"]
 for (frame, label) in (("noncentered", "NCP"), ("partial", "Selected partial")), t in (4, 100, 1000)
     measured = [receipts[b]["frames"][frame]["results"][string(t)] for b in ("native", "reactant")]
@@ -221,7 +219,7 @@ end
 Markdown.parse(join(rows, "\n"))
 ```
 
-At 1,000 transitions, Reactant is about 2.3× faster in both frames. The shared
+At 1,000 transitions, Reactant was about 2.3× faster in both frames. The shared
 host produced substantial variation, so these results support the throughput
 advantage more strongly than a precise scaling curve. First HMC preparation
 took 14.75 s native and 66.74 s Reactant, in addition to density/AD preparation

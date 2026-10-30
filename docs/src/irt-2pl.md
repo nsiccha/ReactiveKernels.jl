@@ -44,19 +44,3 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
     setup = Main.ReactiveKernelsDocs.setup_irt_2pl!,
 )
 ```
-
-## Reactant
-
-On the focused gate's finite BridgeStan-valid probes (plus the explicit irt
-probability-saturation stress probe), the exact authored graph compiles and
-executes through the public Reactant boundary with value and gradient parity:
-the primal and gradient both `@compile` and match native/the reference `.stan`
-(via BridgeStan, `propto = false`, `jacobian = true`) to machine precision. The
-`transpose`-broadcast linear predictor and the reused `Cauchy`/`Normal`/
-`LogNormal`/`Bernoulli` endpoints all lower cleanly.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.Irt2plExample.demo()'
-```

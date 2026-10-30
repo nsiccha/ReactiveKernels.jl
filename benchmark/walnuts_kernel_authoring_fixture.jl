@@ -284,7 +284,7 @@ example_walnuts_binding(init, macro_time; max_step_halvings = 10,
 end
 
 # All stochastic inputs are explicit values.  This makes random consumption a
-# source-path observable shared by native and Reactant execution.
+# source-path observable.
 @kernel walnuts!!(state; momentum, directions, exponentials) = begin
     @. state.init.mom = momentum
     step!(state, directions, exponentials)

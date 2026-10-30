@@ -17,8 +17,8 @@ export MTH_SOURCE, evaluate_mth_model_source
 # so the per-individual `bernoulli_logit_lpmf(y[i] | logit_p[i])` is a genuine
 # 2D computation: an OUTER SUM of the T-vector `mean_lp` and the M-vector `eps`
 # (`eps .+ transpose(mean_lp)`), an elementwise `y*logit_p - log1pexp(logit_p)`,
-# then a ROW-REDUCE over occasions (`vec(sum(...; dims = 2))`). This broadcast +
-# `dims`-reduce lowers through Reactant. The observed/unobserved split
+# then a ROW-REDUCE over occasions (`vec(sum(...; dims = 2))`). The
+# observed/unobserved split
 # (s>0 vs s==0) is a DATA mask; a never-detected individual has an all-zero
 # history, so its term reduces to `-Σⱼ log1pexp(logit_p[i,j])`. Real data is
 # M=387/T=5 (C=87 observed, 300 augmented zeros); a representative mixed subset
@@ -99,7 +99,7 @@ using LogExpFunctions: logistic, log1pexp, logaddexp
     # Per-individual detection log-likelihood bernoulli_logit_lpmf(y[i]|logit_p[i])
     #   = Σⱼ [ y[i,j]·logit_p[i,j] − log1pexp(logit_p[i,j]) ].
     # This is the genuine M×T computation: an elementwise combination of the
-    # bound capture matrix Y with the traced logit_p matrix, then a per-row
+    # bound capture matrix Y with the live logit_p matrix, then a per-row
     # reduction over occasions. Never-detected rows (all-zero) reduce to
     # −Σⱼ log1pexp(logit_p[i,j]).
     bern_terms = Y .* logit_p .- log1pexp.(logit_p)
@@ -181,8 +181,7 @@ their Jacobians (implicit uniform priors); `eps_raw ~ Normal(0,1)`; the random
 effect `eps = sigma*eps_raw`. The detection log-odds is the full M×T outer sum
 `logit_p[i,j] = mean_lp[j] + eps[i]`, and the per-individual
 `bernoulli_logit_lpmf` is `Σⱼ [y·logit_p − log1pexp(logit_p)]` — a genuine
-broadcast + row-reduce (`vec(sum(...; dims = 2))`) that lowers through Reactant.
-The likelihood marginalizes the latent inclusion indicator with a `log_sum_exp`
+broadcast + row-reduce (`vec(sum(...; dims = 2))`). The likelihood marginalizes the latent inclusion indicator with a `log_sum_exp`
 over never-detected individuals (a data mask). Named nodes for the prior,
 transform Jacobian, `eps`, `logit_p`, pointwise/summed likelihood, densities,
 the posterior, and the `p = inv_logit(logit_p)` generated quantity.

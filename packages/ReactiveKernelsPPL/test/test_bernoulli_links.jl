@@ -1,7 +1,6 @@
 # Bernoulli links end to end (SB-parity pair `fam-bernoulli-links`, RK side):
 # sampler-query values vs Distributions oracles and native Enzyme gradients
-# vs central differences; test_bernoulli_links_reactant.jl adds Reactant/XLA
-# primal + compiled-gradient parity and the traced program size. Binomial
+# vs central differences. Binomial
 # probit/cloglog twins ride the same generator path and are locked at n=8.
 # (`_GEN_BACKEND` comes from test_generator.jl, included first.)
 using DifferentiationInterface

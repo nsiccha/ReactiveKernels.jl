@@ -60,7 +60,7 @@ const EXTERNAL_CORPUS = (
         ),
         oracle = :separate_process_pinned_cpp_replay,
         comparison = :rng_control_grid_and_state,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
 )
 

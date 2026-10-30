@@ -39,23 +39,3 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
     setup = Main.ReactiveKernelsDocs.setup_state_space_stochastic!,
 )
 ```
-
-## Reactant
-
-The exact authored graph compiles and executes through the public Reactant
-boundary with value and gradient parity — `benchmark/forecast_batch_gate.jl`
-`@compile`s both the primal and the gradient and asserts they match the native
-evaluation and the reference `.stan` (via BridgeStan). The data-bounded logit
-level transform, the `positive_ordered` cumulative-exp scales, and the
-trailing-window seasonal matvec all lower cleanly. Parity is asserted at the
-gate's tested reference-valid probe points — six native probes per case, Reactant
-axes at the first probe — on the gate's pinned `benchmark/all80-env` toolchain
-(BridgeStan 2.9 / Stan 2.39, Reactant, Enzyme and DifferentiationInterface as
-resolved there); it is a tested-point result, not a claim over every finite
-input.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.StateSpaceStochasticExample.demo()'
-```

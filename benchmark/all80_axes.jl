@@ -1,26 +1,21 @@
-# Phase-compute CONTRACT for the all-82 benchmark. The measurement body calls exactly one
-# phase per subprocess (RK_ALL80_PHASE), so native and Reactant never share compiler state.
+# Measurement CONTRACT for the all-82 benchmark. The measurement body calls
+# `measure_native` once per model.
 #
 #   measure_native(ctx)   -> Dict of NATIVE_CELLS + descriptive/parity fields
 #       primal_rk, primal_turing, primal_stan            (median ns, via Chairmarks)
 #       gradient_rk, gradient_turing, gradient_stan       (median ns)
-#       hmc_rk_native                                     (µs/transition, transpiler :native)
+#       hmc_rk_native                                     (µs/transition, transpiled HMC program)
 #       hmc_ahmc_turing                                   (µs/transition, AdvancedHMC on the Turing LDF)
 #       dim, family, note, parity_pass, rk_off, tu_off, off_reason, rk_grad_relerr, tu_grad_relerr
-#   measure_reactant(ctx) -> Dict of REACTANT_CELLS
-#       primal_rk_reactant, gradient_rk_reactant          (median ns, Reactant-compiled RK kernel)
-#       hmc_rk_reactant                                   (µs/transition, transpiler :reactant)
 #
 # `ctx` is the shared per-model bundle the body builds once (name, model, data, sm, cmap,
 # groups, points, kb, prep, tldf, off_rk, off_tu, ...). Timing helpers return MEDIAN
 # NANOSECONDS (Chairmarks `median(b).time` is SECONDS — convert with *1e9; the original
 # body's missing conversion is why the first smoke printed "0.0 ns").
 #
-# HMC uses the SAME transpiler path as benchmark/reactant_hmc_loop_table.jl
-# (transpiled_endpoint / prepare_transpiled / time_loop, backend :native|:reactant), but
-# fed the FAITHFUL registry graphs (ctx.kb / ctx.prep) rather than the historical hand-rolled
-# flat densities. That machinery lives under benchmark/sampler_transpiler/ and is included by
-# the body only in the phase that needs it.
+# HMC uses the transpiled multinomial-HMC program (transpiled_endpoint / prepare_transpiled)
+# fed the FAITHFUL registry graphs (ctx.kb / ctx.prep). That machinery lives under
+# benchmark/sampler_transpiler/ and is included by the body.
 module All80Axes
 
 using Statistics: median
@@ -58,20 +53,17 @@ function native_single_eval!(row, c)
 end
 
 # ---- HMC throughput (µs/transition) --------------------------------------------------
-# transpiler backend :native / :reactant — the body includes the sampler_transpiler
-# machinery and passes `hmc_time_loop` (a closure capturing transpiled_endpoint /
-# prepare_transpiled / F.leapfrog! bound to ctx.kb + ctx.prep), so this module stays free of
-# the Reactant/transpiler imports until the phase that needs them.
-"""native HMC: RK density+grad driven through the transpiler :native backend. The RK-native
+# The body includes the sampler_transpiler machinery and passes `hmc_time_loop` (a closure
+# capturing transpiled_endpoint / prepare_transpiled / F.leapfrog! bound to ctx.kb +
+# ctx.prep), so this module stays free of the transpiler imports.
+"""native HMC: RK density+grad driven through the transpiled HMC program. The RK-native
 HMC loop needs the RK reverse gradient, so a model whose gradient hits the known core defect
 (`c.rk_grad_diag` set) records the SAME diagnostic here (HMC is blocked BY the gradient), never
 a fabricated number. hmc_ahmc_turing is unaffected (Turing side)."""
 hmc_rk_native!(row, c) = (row["hmc_rk_native"] =
     c.rk_grad_diag !== nothing ? "hmc_rk_native blocked by RK gradient: " * c.rk_grad_diag :
     c.rk_primal_diag !== nothing ? "hmc_rk_native blocked by RK primal: " * c.rk_primal_diag :
-    c.hmc_time_loop(:native, row["hmc_transitions"]); row)
-"""reactant HMC: SAME transpiled program lowered through Reactant."""
-hmc_rk_reactant!(row, c) = (row["hmc_rk_reactant"] = c.hmc_time_loop(:reactant); row)
+    c.hmc_time_loop(row["hmc_transitions"]); row)
 """AHMC+Turing HMC: AdvancedHMC over the Turing LDF (value+gradient); µs/transition.
 Body supplies `c.ahmc_time_loop` (AdvancedHMC.HMC, fixed L, warmup excluded)."""
 hmc_ahmc_turing!(row, c) =
@@ -110,18 +102,8 @@ function hmc_protocol!(row, c)
     row
 end
 
-# ---- Reactant single-eval (primal+gradient of the compiled RK kernel) ----------------
-# Body supplies `c.rk_reactant_primal` / `c.rk_reactant_grad` closures (Reactant-compiled
-# kb / prep via `@compile sync=true`), value-checked == native before timing.
-function reactant_single_eval!(row, c)
-    row["primal_rk_reactant"]   = med_ns(Chairmarks.@be c.rk_reactant_primal())
-    row["gradient_rk_reactant"] = med_ns(Chairmarks.@be c.rk_reactant_grad())
-    row
-end
-
-# ---- phase entrypoints ---------------------------------------------------------------
-# native phase (NO `using Reactant`): single-eval rk/turing/stan + RK-native HMC +
-# AHMC-Turing HMC + descriptive/parity. Loading Reactant must not perturb these timings.
+# ---- entrypoint -----------------------------------------------------------------------
+# single-eval rk/turing/stan + RK-native HMC + AHMC-Turing HMC + descriptive/parity.
 function measure_native(c)
     row = Dict{String,Any}("dim" => c.dim, "family" => c.family, "note" => c.note,
         "parity_pass" => c.parity_pass, "rk_off" => c.rk_off, "tu_off" => c.tu_off,
@@ -134,15 +116,6 @@ function measure_native(c)
         "protocol" => c.protocol)
     native_single_eval!(row, c)
     hmc_protocol!(row, c)
-    row
-end
-
-# reactant phase (Reactant + transpiler loaded): RK+Reactant single-eval + RK+Reactant HMC.
-# Same multinomial HMC + identical q/integrator/steps/warmup as the native RK HMC.
-function measure_reactant(c)
-    row = Dict{String,Any}()
-    reactant_single_eval!(row, c)
-    hmc_rk_reactant!(row, c)
     row
 end
 

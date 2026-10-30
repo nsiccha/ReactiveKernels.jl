@@ -22,8 +22,8 @@ The corpus separates three kinds of evidence:
 - The RK source file is the authored compiler input; it is never copied into
   this Markdown page.
 - Independent receipts establish expected values and control behavior outside
-  the candidate compiler. A terminal `native_and_reactant` field is the corpus
-  acceptance contract, not permission to infer an unrecorded backend result.
+  the candidate compiler. A terminal `native` field is the corpus acceptance
+  contract, not permission to infer an unrecorded result.
 
 ## Complete algorithm inventory
 
@@ -127,7 +127,7 @@ independent evidence remain readable:
 - [WALNUTS-D](walnuts.md) shows fixed-macro-time dyadic refinement, reverse-grid
   rejection, the depth-10 NUTS leaf, explicit replay streams, and the complete
   authored source. Its current interaction is honest fixture/MethodIR/receipt
-  inspection only, with no native or Reactant compiler-success claim.
+  inspection only, with no compiler-success claim.
 - [Nutpie diagonal adaptation](nutpie-diagonal.md) executes its initialization
   and adaptation kernels against an independent Rust oracle.
 - [Pathfinder approximation](pathfinder.md) executes two WANT cuts of one

@@ -69,8 +69,8 @@ end
         @test log10_earn ≈ reference.log10_earn
         # The untyped `log10(e)` cell must materialize a concrete `Vector{Float64}`
         # (not a boxed `Vector{Any}`), both as a live node and as a bound
-        # transformed-data node, so the all-data-bound posterior stays promotable
-        # at the Reactant host-operand boundary (snag untyped-plate-ce).
+        # transformed-data node, so the all-data-bound posterior stays
+        # concretely typed (snag untyped-plate-ce).
         @test log10_earn isa Vector{Float64}
         bound_log10_earn = prepare(model;
             have = (:unconstrained, :height, :earn), want = :log10_earn,

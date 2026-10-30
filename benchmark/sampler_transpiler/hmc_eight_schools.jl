@@ -1,6 +1,6 @@
 # Executable prototype, not a public sampler API or performance claim.
 # The sampler and integrator are the existing authored mathematical kernels.
-using ReactiveKernels, ReactiveKernelsPPLExamples, Reactant, Enzyme
+using ReactiveKernels, ReactiveKernelsPPLExamples, Enzyme
 using DifferentiationInterface, LinearAlgebra, Random
 import AdvancedHMC
 const RK = ReactiveKernels
@@ -83,31 +83,16 @@ function build_prototype(backend; L=4, callback_handles=true)
         n_steps=L, step_f=step_source, stats_f=stats_source))
     backend === :native_slots && return (; kernel, snapshot, endpoint, endpoint_inputs, L,
                                           density, ad, q)
-    provider = backend === :reactant ? RK.rng_provider(Val(:reactant)) :
-        RK.rng_provider(Vector{UInt64};
-            normal_fill=RK.total_functional_lowering(native_normal),
-            bool_draw=RK.total_functional_lowering(native_bool),
-            exp_draw=RK.total_functional_lowering(native_exp))
+    provider = RK.rng_provider(Vector{UInt64};
+        normal_fill=RK.total_functional_lowering(native_normal),
+        bool_draw=RK.total_functional_lowering(native_bool),
+        exp_draw=RK.total_functional_lowering(native_exp))
     transition = measured("lower_hmc") do
         RK._functionalize_stateful(kernel, Val(:step!); max_iterations=L,
             argument_types=Tuple{Vector{UInt64}}, rng_providers=(rng=provider,),
-            native_state_types=backend === :native)
+            native_state_types=true)
     end
     (; transition, snapshot, L)
-end
-
-# Backend-boundary adapter using the compiler's existing structural contract.
-# Only numerical leaves are runtime inputs; callable identities are preparation metadata.
-struct NumericStateTransition{T,C}
-    transition::T
-    contract::C
-end
-function (program::NumericStateTransition)(raw, seed)
-    state = RK._sm_finite_structural_read(program.contract, raw, 1).value
-    result = program.transition(state, seed)
-    packed = RK._sm_finite_structural_write(
-        program.contract, raw, 1, result.state).storage
-    merge(result, (state=packed,))
 end
 
 function native_chain(transition, state, seed, n)
@@ -117,18 +102,6 @@ function native_chain(transition, state, seed, n)
         state, seed = result.state, result.arguments[1]
     end
     state, seed
-end
-
-# This is a driver loop around the generated transition, not another HMC implementation.
-function traced_chain(program, state, seed, overflow, steps, n)
-    Reactant.@trace for _ in 1:n
-        result = program(state, seed)
-        state = result.state
-        seed = result.arguments[1]
-        overflow = overflow | result.control_overflow
-        steps = steps + result.effects.stats_f.steps
-    end
-    (; state, seed, overflow, steps)
 end
 
 function run_native(prototype; n=100)
@@ -145,42 +118,6 @@ function run_native(prototype; n=100)
             native_chain(transition, snapshot, seed, n)
         end
     end
-end
-
-function run_reactant(prototype; n=100)
-    transition, snapshot = prototype.transition, prototype.snapshot
-    contract = RK._sm_finite_structural_contract([snapshot];
-        static_values=(snapshot.init.pot_f, snapshot.init.grad_f,
-                       snapshot.step_f, snapshot.stats_f))
-    state = Reactant.to_rarray(RK._sm_finite_structural_pack(contract, [snapshot]))
-    seed = Reactant.to_rarray(UInt64[91, 77])
-    overflow = Reactant.to_rarray(false; track_numbers=true)
-    steps = Reactant.to_rarray(0; track_numbers=true)
-    program = NumericStateTransition(transition, contract)
-    driver = (state, seed, overflow, steps) ->
-        traced_chain(program, state, seed, overflow, steps, n)
-    inputs = (state, seed, overflow, steps)
-    compiled = measured("compile_reactant_$(n)_transitions") do
-        Reactant.compile(driver, inputs; sync=true,
-            donated_args=:none, serializable=true)
-    end
-    println("mlir_bytes=", sizeof(compiled.module_string),
-            " while_regions=", count("stablehlo.while", compiled.module_string),
-            " triangular_solves=", count("stablehlo.triangular_solve", compiled.module_string))
-    result = measured("reactant_first_chain") do
-        compiled(inputs...)
-    end
-    Bool(result.overflow) && error("compiled control bound exhausted")
-    println("integration_steps=", Int(result.steps))
-    Int(result.steps) == n * prototype.L || error("unexpected integration-step count")
-    decoded = RK._sm_finite_structural_read(contract, result.state, 1).value
-    all(isfinite, Array(decoded.init.pos)) || error("nonfinite position")
-    for _ in 1:5
-        measured("reactant_$(n)_transitions") do
-            compiled(inputs...)
-        end
-    end
-    compiled
 end
 
 function ahmc_chain(rng, hamiltonian, kernel, phasepoint, n)
@@ -218,28 +155,23 @@ end
 include("native_slots.jl")
 include("native_slots_factory.jl")
 include("native_comparison.jl")
-include("traced_slots.jl")
-include("traced_comparison.jl")
 
 function main(args=ARGS)
-    length(args) <= 3 || error("usage: hmc_eight_schools.jl [native|native-slots|compare|reactant|reactant-slots|ahmc] [batch_length] [leapfrog_steps]")
+    length(args) <= 3 || error("usage: hmc_eight_schools.jl [native|native-slots|compare|ahmc] [batch_length] [leapfrog_steps]")
     backend = isempty(args) ? :native_slots : Symbol(replace(first(args), '-' => '_'))
     n = length(args) >= 2 ? parse(Int, args[2]) : 100
     L = length(args) == 3 ? parse(Int,args[3]) : 4
     n > 0 || error("batch length must be positive")
     L > 0 || error("leapfrog count must be positive")
-    backend in (:native, :native_slots, :compare, :reactant, :reactant_slots, :ahmc) || error("unknown backend")
-    length(args)==3 && !(backend in (:native_slots,:compare,:reactant_slots)) &&
+    backend in (:native, :native_slots, :compare, :ahmc) || error("unknown backend")
+    length(args)==3 && !(backend in (:native_slots,:compare)) &&
         error("leapfrog count is configurable in the slot-based modes")
     backend === :ahmc && return run_ahmc(; n)
-    backend === :reactant_slots && return run_traced_comparison(
-        build_fast_prototype(;L,compiler_options=(peel_loops=true,));n)
     if backend in (:native_slots,:compare)
         prototype=build_fast_prototype(;L)
         return run_prepared_comparison(prototype.prepared,
             backend===:compare ? prototype.comparator : nothing,L,n)
     end
-    prototype = build_prototype(backend)
-    backend === :native ? run_native(prototype; n) : run_reactant(prototype; n)
+    run_native(build_prototype(backend); n)
 end
 abspath(PROGRAM_FILE) == (@__FILE__) && main()

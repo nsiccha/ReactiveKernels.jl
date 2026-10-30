@@ -1,5 +1,8 @@
 # Mutation profile B corpus translation
 
+> **Historical note.** The Reactant statements here describe ReactiveKernels'
+> removed Reactant path.
+
 This report accompanies parallel fixtures; it does not modify the locked
 ReactiveHMC/NUTS/WALNUTS source authorities.
 

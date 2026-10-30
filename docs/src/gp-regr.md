@@ -49,27 +49,3 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
 The native primal log-density and the plain-Enzyme reverse gradient match
 BridgeStan's reference `.stan` (`propto = false`, `jacobian = true`) to machine
 precision on the full data.
-
-## Reactant
-
-The exact authored graph compiles and executes its **primal** log-density
-through the public Reactant boundary with value parity — the covariance,
-Cholesky, and the `multi_normal_cholesky` whitening lower through XLA. The
-*response* is passed traced (as with the `mvnormal` object), which lets the
-triangular solve lower; the design input `x` stays bound so the squared-distance
-node folds.
-
-The **compiled Reactant reverse gradient does not lower for this shape**: XLA /
-EnzymeMLIR has no adjoint for the dense Cholesky primitive
-`stablehlo.triangular_solve` (the marginal-GP solve). This is an upstream
-limitation, documented in the `reactivekernels-use` skill §7f — the supported AD
-path here is the native primal plus the native plain-Enzyme reverse gradient
-(both machine-precision accurate against Stan), together with the Reactant
-primal. The approximate/basis GP (see [Approximate GP (HSGP)](accel-gp.md)) has
-no Cholesky and lowers all of primal, Reactant primal, and Reactant gradient.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.GPRegrExample.demo()'
-```

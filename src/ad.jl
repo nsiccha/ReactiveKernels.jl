@@ -100,12 +100,6 @@ mutable and not thread-safe. Prepare one object per concurrent caller.
 """
 const PreparedADThird{I,K,R,F,B,P,E} = PreparedADOperator{I,K,R,F,B,P,E,:third}
 
-# Same statically-untraced contract as `PreparedKernel` (codegen.jl): this
-# object is captured by the `@trace` loop in `_replica_ad_call`, and its
-# kernel reaches the same `Type`-carrying recipe metadata.
-ReactantCore.is_traced(::PreparedADOperator) = false
-ReactantCore.is_traced(::PreparedADOperator, ::Base.IdSet) = false
-
 # Low-level prepared kernels AD accepts: the allocating dataflow kernel and
 # the non-allocating step-program kernel. Both expose the same positional
 # HAVE boundary, single-WANT outputs, and plan graph; only the differentiated
@@ -121,11 +115,9 @@ struct _ADKernelCall{I,K}
     kernel::K
 end
 
-# Plated PreparedKernels carry their already-generated native and tensorized
-# bodies behind a runtime function-pair selector. Native AD preparation has
-# concrete exemplars, so it can bypass only that selector and differentiate the
-# exact native callable and its live operations. No AD-specific kernel or AST
-# is generated.
+# Plated and embedding PreparedKernels carry their generated native body in an
+# `_ArrayFunction`. AD differentiates that exact native callable and its live
+# operations. No AD-specific kernel or AST is generated.
 struct _ADNativeKernelCall{I,F,O}
     native::F
     ops::O
@@ -154,8 +146,7 @@ _ad_selector_indices(indices::Tuple) = indices
 # point that mixes duplicated storage (arrays) and active scalars. Represent a
 # scalar component as mutable scalar storage so the whole tuple is duplicated,
 # then unwrap it at the RK callable boundary and restore its cotangent before
-# returning to the caller. Optional compiler extensions may keep their traced
-# scalar wrappers unchanged by specializing `_ad_active_point_component`.
+# returning to the caller.
 _ad_active_point_component(value::Number) = Ref(value)
 _ad_active_point_component(value) = value
 _ad_active_value(value::Base.RefValue) = value[]
@@ -214,8 +205,8 @@ function _ad_native_ops(kernel::PreparedKernel)
     ast = RuntimeGeneratedFunctions.get_expression(native)
     used = Set{Int}()
     _ad_operation_slots!(used, ast.args[2]) || return ops
-    # Native plate/scan bodies are inlined, but the shared operation table also
-    # holds their complete prepared kernels for tensorized execution. Rebuilding
+    # Native plate/scan bodies are inlined, but the operation table also holds
+    # their complete prepared kernels. Rebuilding
     # a bound-array table with unused graph metadata defeats Enzyme's readonly
     # analysis. Keep every live slot and the original positional ABI; remove
     # only unused plate/scan metadata from this internal native call. A transform
@@ -227,10 +218,7 @@ function _ad_native_ops(kernel::PreparedKernel)
 end
 
 function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I}
-    native_exemplars = _dynamic_tensorized_marker(args) === nothing
-    if kernel.f isa Union{
-            _ArrayFunctionPair,_EmbeddedFunctionPair,
-            _DynamicEmbeddedFunctionPair} && native_exemplars
+    if kernel.f isa _ArrayFunction
         ops = _ad_native_ops(kernel)
         # Bound views cross this Enzyme boundary as owning copies: a
         # `SubArray`-typed `Constant` operand defeats static activity
@@ -251,7 +239,7 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
     end
     externalized, values = _externalize_bound_arrays(
         kernel; materialize_view_copies = true, externalize_scalars = true)
-    if externalized === kernel && native_exemplars
+    if externalized === kernel
         # As for plated bodies above, differentiation needs only the executable
         # and its operands. Repacking the whole PreparedKernel also stores its
         # mutable graph/Expr metadata beside active arguments, which defeats
@@ -382,19 +370,6 @@ _ad_hidden_operands(prepared) =
 _ad_hidden_operands(call, values) = values
 _ad_hidden_operands(::_ADKernelCall{I,<:_PackedOperandCall}, pack) where {I} =
     Tuple(only(pack))
-
-# A caller that rebuilds the unpacked call itself (the in-trace Reactant path)
-# passes the prepared contexts with the pack replaced by those operands.
-_ad_unpack_hidden_contexts(prepared, contexts::Tuple) =
-    _ad_unpack_hidden_contexts(prepared.call, prepared, contexts)
-_ad_unpack_hidden_contexts(call, prepared, contexts::Tuple) = contexts
-function _ad_unpack_hidden_contexts(
-        ::_ADKernelCall{I,<:_PackedOperandCall}, prepared,
-        contexts::Tuple) where {I}
-    public = length(contexts) - 1
-    (contexts[1:public]...,
-     map(DifferentiationInterface.Constant, _ad_hidden_operands(prepared))...)
-end
 
 # Match one non-allocating cache step,
 # `__cache_apply__(__caches__[j], __ops__[j], callargs...)`, returning the
@@ -1163,14 +1138,6 @@ end
     :($point, ($(contexts...),))
 end
 
-# A native (non-traced) prepared-AD call inside a Reactant trace never reaches
-# native Enzyme: Reactant's autodiff overlay intercepts the call with all-native
-# arguments and the staged derivative comes back a silent zero gradient, while
-# the value stays correct. Every native call boundary checks its already-split
-# point here; the Reactant extension implements the in-trace refusal, and this
-# fallback keeps the core independent of the weak dependency.
-_ad_trace_sanity(point, contexts) = nothing
-
 function _ad_resolve(resolver, args::Tuple, kwargs::NamedTuple)
     resolver(args...; kwargs...)
 end
@@ -1501,16 +1468,6 @@ function _ad_require_retaining_backend(
         "(reverse-mode `AutoEnzyme`, its backend package loaded); " *
         "`$backend` is not declared to. Evaluate the retained WANT with a " *
         "separate primal call for this backend"))
-    nothing
-end
-
-# Compiled staging rebuilds the differentiated call from the kernel alone, so
-# a retaining preparation would lose its box there; refuse it by name.
-function _ad_refuse_staged_retention(prepared)
-    prepared.call isa _ADRetainingCall && throw(ArgumentError(
-        "retained WANT outputs are not built yet for compiled (Reactant) " *
-        "staging; use the native prepared gradient, or prepare the compiled " *
-        "gradient without `retain`"))
     nothing
 end
 
@@ -1903,16 +1860,12 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
     backend = _ad_prepared_backend(op, requested)
     resolved = _ad_resolve(resolver, args, kwargs)
     # The exemplars type the program exactly as the derivative will see it.
-    # Traced exemplars run the tensorized product, which this check does not
-    # type.
-    native = _kernel_source_style(resolved) === Val(:native)
-    values = native ? _uninferred_values(kernel, map(Core.Typeof, resolved)) :
-        _UninferredValue[]
+    values = _uninferred_values(kernel, map(Core.Typeof, resolved))
     call, point, contexts, active_selector, external_values = _ad_call(
         kernel, resolved, active; scalar_output = _ad_operator_scalar_output(op),
         retain, _ad_operator_seeding(op, seeds, backend)...)
     # The backend differentiates `call`: its code is what the level audits.
-    native && _report_type_stability(
+    _report_type_stability(
         values,
         _level_code_findings(_type_stability_level(), call,
                              _ad_call_argument_types(point, contexts)),
@@ -2360,7 +2313,6 @@ function ad_gradient(spec::KernelSpec,
     if !isempty(bound)
         _ad_reject_bound_keywords(NamedTuple(kwargs))
         call, point, contexts, _, _ = _ad_call(kernel, args, active)
-        _ad_trace_sanity(point, contexts)
         gradient = DifferentiationInterface.gradient(
             call, backend, point, contexts...)
         return _ad_restore_cotangent(point, gradient)
@@ -2368,7 +2320,6 @@ function ad_gradient(spec::KernelSpec,
     resolver = _ad_resolver(spec)
     resolved = _ad_resolve(resolver, args, NamedTuple(kwargs))
     call, point, contexts, _, _ = _ad_call(kernel, resolved, active)
-    _ad_trace_sanity(point, contexts)
     gradient = DifferentiationInterface.gradient(
         call, backend, point, contexts...)
     _ad_restore_cotangent(point, gradient)
@@ -2382,7 +2333,6 @@ function ad_gradient(kernel::PreparedKernel,
         "a low-level PreparedKernel has a positional HAVE boundary and does " *
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
     call, point, contexts, _, _ = _ad_call(kernel, args, active)
-    _ad_trace_sanity(point, contexts)
     gradient = DifferentiationInterface.gradient(
         call, backend, point, contexts...)
     _ad_restore_cotangent(point, gradient)
@@ -2397,7 +2347,6 @@ function ad_gradient(kernel::NonAllocatingKernel,
         "does not accept keywords; use a KernelSpec to preserve authored " *
         "keywords"))
     call, point, contexts, _, _ = _ad_call(kernel, args, active)
-    _ad_trace_sanity(point, contexts)
     gradient = DifferentiationInterface.gradient(
         call, backend, point, contexts...)
     _ad_restore_cotangent(point, gradient)
@@ -2416,7 +2365,6 @@ function _ad_prepared_arguments(
         "values; got $(length(resolved))"))
     point, contexts =
         _ad_arguments(Val(I), (resolved..., prepared.external_values...))
-    _ad_trace_sanity(point, contexts)
     point, contexts
 end
 
@@ -2436,10 +2384,6 @@ Compute a scalar value and gradient without requiring caller-owned gradient
 storage. This is the structured counterpart to [`ad_value_and_gradient!`](@ref):
 it preserves DifferentiationInterface's returned cotangent structure, including
 `NamedTuple` active inputs supported by the backend.
-
-With Reactant loaded, a traced scalar or array active input stages this
-operation inside the enclosing compiled program, using the same primal kernel
-and DI backend. It does not reuse the native-input DI preparation in that trace.
 """
 function ad_value_and_gradient(
         prepared::PreparedADKernel, args...; kwargs...)
@@ -2492,7 +2436,6 @@ function _ad_unprepared_pullback(kernel::_ADKernel, backend, seed,
                                  resolved::Tuple, active)
     call, point, contexts, _, _ =
         _ad_call(kernel, resolved, active; scalar_output = false, seed)
-    _ad_trace_sanity(point, contexts)
     _ad_restore_cotangent(point,
         _ad_unprepared_pullback_call(call, backend, point, seed, contexts))
 end
@@ -3091,10 +3034,6 @@ Returns the `(value, gradient)` pair from
 for the active argument's gradient and is mutated in place. Like
 [`ad_gradient`](@ref), this prepared object and its DI preparation are not
 thread-safe; use one per concurrent caller.
-
-A Reactant-traced active input stages the derivative in the enclosing compiled
-program and writes it into the traced destination, without using the native DI
-preparation there.
 """
 @generated function ad_value_and_gradient!(
         prepared::PreparedADKernel{I,K,typeof(tuple),F,B,P,E}, gradient,
@@ -3247,108 +3186,4 @@ function Base.show(io::IO, prepared::PreparedADOperator{I}) where {I}
     print(io, ", kernel=")
     show(io, prepared.kernel)
     print(io, ")")
-end
-
-# --- Reactant-compiled automatic differentiation -----------------------------
-# The AD analog of the primal Reactant path (`@compile sync=true kernel(args...)`).
-# These take a native `PreparedADKernel` — which already owns the scalar-WANT /
-# active-port validation and the authored-HAVE-order reorder — and compile a
-# DifferentiationInterface gradient (or value-and-gradient) through Reactant.
-#
-# The differentiation engine stays the caller's DifferentiationInterface backend
-# (the one passed to `prepare_ad`), so ReactiveKernels imports no concrete AD
-# engine here: a caller-configured reverse-mode backend stages differentiation
-# inside the Reactant program. The real methods live in
-# `ext/ReactiveKernelsReactantExt.jl` and are selected when the active argument is
-# a Reactant-traced value; without the Reactant weak dependency loaded (or with a
-# host-array active argument) these raise a clear, actionable error instead of a
-# bare `MethodError`.
-
-function _reactant_ad_marker(prepared::PreparedADKernel{I}, args::Tuple) where {I}
-    length(args) == length(inputs(prepared.kernel)) || throw(ArgumentError(
-        "Reactant AD compilation expects the $(length(inputs(prepared.kernel)))-value " *
-        "HAVE boundary $(Tuple(input.name for input in inputs(prepared.kernel))); " *
-        "got $(length(args)) argument(s)"))
-    I isa Int ? getfield(args, I) :
-        ntuple(position -> getfield(args, I[position]), length(I))
-end
-
-# Selected by the Reactant extension on `marker::Reactant.RArray` /
-# `Reactant.RNumber`. This fallback fires when Reactant is not loaded or the
-# active argument was not traced.
-_reactant_compile_ad(::Val, ::PreparedADKernel, marker, args...; kwargs...) =
-    throw(ArgumentError(
-        "Reactant-compiled AD requires the Reactant weak dependency (`using Reactant`) " *
-        "and a Reactant-traced active argument (e.g. `Reactant.to_rarray(active)`); " *
-        "the active argument is a $(typeof(marker))"))
-
-# Internal extension point used when a partially-evaluated kernel owns large
-# bound arrays. The Reactant extension compiles the same DI operation after
-# those arrays have been transferred explicitly as hidden compiler operands.
-function _reactant_compile_ad_externalized end
-
-"""
-    compile_ad_gradient(prepared::PreparedADKernel, traced_args...; sync = true)
-
-Reactant/XLA-compile the gradient of a [`PreparedADKernel`](@ref) with respect to
-its active HAVE port or ordered tuple of active ports. `traced_args` are the
-selected HAVE values in authored order, already traced with
-`Reactant.to_rarray` (matching the primal Reactant path). Returns a compiled
-callable that accepts the same traced boundary and returns the gradient with
-respect to the active point; every inactive HAVE is held constant, exactly as
-on the native [`ad_gradient`](@ref) path.
-
-This is the AD analog of compiling the primal kernel with
-`@compile sync = true kernel(traced_args...)`. It is only possible where the
-primal kernel itself compiles through Reactant; where it does not, the underlying
-`@compile` error propagates unchanged.
-
-Requires the Reactant weak dependency to be loaded. The differentiation engine is
-the DifferentiationInterface backend passed to [`prepare_ad`](@ref).
-
-`optimize` selects the Reactant optimization pipeline: `nothing` (default)
-runs Reactant's default pipeline; `:no_slice_slice` runs the default pipeline
-minus the `slice_slice` transform, which miscompiles chained consumers of a
-strided slice, and `enzyme_hlo_unroll`, which expands small bound count loops
-(see reactivekernels-use §§7i–7j); any other
-value forwards verbatim to `Reactant.compile`'s `optimize` keyword.
-"""
-function compile_ad_gradient(prepared::PreparedADKernel, args...; sync::Bool = true,
-                             optimize = nothing)
-    prepared.kernel isa NonAllocatingKernel && throw(ArgumentError(
-        "Reactant-compiled AD is not supported over a NonAllocatingKernel " *
-        "(the mutating cache program does not stage); prepare the gradient " *
-        "from the dataflow kernel instead"))
-    _reactant_compile_ad(Val(:gradient), prepared,
-                         _reactant_ad_marker(prepared, args), args...; sync,
-                         optimize)
-end
-
-"""
-    compile_ad_value_and_gradient(prepared::PreparedADKernel, traced_args...; sync = true)
-
-Reactant/XLA-compile the scalar value and gradient of a [`PreparedADKernel`](@ref)
-together, mirroring the native [`ad_value_and_gradient!`](@ref) boundary. Returns
-a compiled callable that accepts the traced HAVE boundary in authored order and
-returns the `(value, gradient)` pair (a traced scalar and a traced gradient with
-respect to the active port or ordered active tuple). This is the sampler-facing
-surface: one compiled call yields both the potential and its gradient.
-
-Like [`compile_ad_gradient`](@ref), this requires the Reactant weak dependency,
-reuses the DifferentiationInterface backend from [`prepare_ad`](@ref), and only
-compiles where the primal kernel itself compiles through Reactant. The
-`optimize` keyword is identical: `nothing` (default) runs Reactant's default
-pipeline, `:no_slice_slice` removes the miscompiling `slice_slice` transform
-and the `enzyme_hlo_unroll` pass to retain count loops (reactivekernels-use
-§§7i–7j), and any other value forwards to `Reactant.compile`.
-"""
-function compile_ad_value_and_gradient(prepared::PreparedADKernel, args...; sync::Bool = true,
-                                        optimize = nothing)
-    prepared.kernel isa NonAllocatingKernel && throw(ArgumentError(
-        "Reactant-compiled AD is not supported over a NonAllocatingKernel " *
-        "(the mutating cache program does not stage); prepare the gradient " *
-        "from the dataflow kernel instead"))
-    _reactant_compile_ad(Val(:value_and_gradient), prepared,
-                         _reactant_ad_marker(prepared, args), args...; sync,
-                         optimize)
 end

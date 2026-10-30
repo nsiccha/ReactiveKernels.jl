@@ -4,9 +4,12 @@ export RK_BENCHMARK_CONFIGURATIONS, RK_UNAVAILABLE_CONFIGURATION_COMBINATIONS
 
 # The public execution modifiers shared by the PPL model benchmarks. This is
 # deliberately not a Cartesian product: nonallocating execution currently
-# returns a NonAllocatingKernel, while the public AD and Reactant surfaces
-# consume PreparedKernel/PreparedADKernel. Until those APIs compose, inventing
-# nonallocating-AD or nonallocating-Reactant columns would overstate support.
+# returns a NonAllocatingKernel, while the public AD surface consumes
+# PreparedKernel/PreparedADKernel. Until those APIs compose, inventing
+# nonallocating-AD columns would overstate support. The `reactant`
+# configurations describe the historical receipts measured with ReactiveKernels'
+# removed Reactant path; the suite validators still map them onto those
+# receipts, and the native producers record them as unsupported.
 const RK_BENCHMARK_CONFIGURATIONS = (
     (id = "primal_native", differentiation = "primal",
      compiler = "native", allocation = "ordinary", data = "unbound"),

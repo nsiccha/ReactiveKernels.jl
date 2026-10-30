@@ -88,29 +88,13 @@ end
                  "mnist_logistic_matrix_spec.jl",
                  "mnist_logistic_ad_comparison.jl",
                  "mnist_logistic_ad_comparison_body.jl",
-                 "eight_schools_reactant_comparison.jl",
-                 "eight_schools_reactant_comparison_body.jl",
-                 "eight_schools_reactant_ad_comparison.jl",
-                 "eight_schools_reactant_ad_comparison_body.jl",
                  "sum_to_zero_comparison.jl",
                  "sum_to_zero_comparison_body.jl",
-                 "sum_to_zero_reactant_comparison.jl",
-                 "sum_to_zero_reactant_comparison_body.jl",
-                 "mnist_reactant_comparison.jl",
-                 "mnist_reactant_comparison_body.jl",
-                 "mnist_reactant_wren_pca40_comparison_body.jl",
-                 "mnist_reactant_ad_comparison.jl",
-                 "mnist_reactant_ad_comparison_body.jl",
-                 "mnist_reactant_ad_wren_pca40_comparison_body.jl",
                  "_mnist_dataset_profiles.jl",
-                 "probprog_mcmc_comparison.jl",
-                 "probprog_mcmc_comparison_body.jl",
                  joinpath("receipts", "validate_probprog_mcmc.jl"),
                  "practicalbayes_comparison.jl",
                  "practicalbayes_comparison_body.jl",
                  joinpath("receipts", "validate_practicalbayes.jl"),
-                 "nuts_reactant_comparison.jl",
-                 "nuts_reactant_comparison_body.jl",
                  "eval_throughput_comparison.jl",
                  "eval_throughput_comparison_body.jl",
                  "partial_evaluation_comparison.jl",
@@ -172,102 +156,13 @@ end
     end
 end
 
-const _PIN_CONST_PATTERN =
-    r"""^const\s+(\w*REACTANT\w*VERSION\w*)\s*=\s*v"([^"]+)"""
-
-function _reactant_pin_consts(path)
-    pins = Tuple{String,VersionNumber}[]
-    for line in eachline(path)
-        matched = match(_PIN_CONST_PATTERN, strip(line))
-        matched === nothing && continue
-        push!(pins, (String(matched.captures[1]),
-                      VersionNumber(matched.captures[2])))
-    end
-    pins
-end
-
-function _reactant_bound_projects()
-    projects = String[]
-    for name in readdir(_BENCH_DIR)
-        project = joinpath(_BENCH_DIR, name, "Project.toml")
-        isfile(project) && push!(projects, project)
-    end
-    packages = joinpath(_REPOSITORY_ROOT, "packages")
-    for name in readdir(packages)
-        project = joinpath(packages, name, "Project.toml")
-        isfile(project) && push!(projects, project)
-    end
-    projects
-end
-
-function _reactant_compat_bound(project)
-    parsed = TOML.parsefile(project)
-    compat = get(parsed, "compat", Dict{String,Any}())
-    get(compat, "Reactant", nothing)
-end
-
-function _manifest_reactant_version(manifest)
-    parsed = TOML.parsefile(manifest)
-    recorded = get(get(parsed, "deps", Dict{String,Any}()), "Reactant", nothing)
-    recorded === nothing && return nothing
-    VersionNumber(only(recorded)["version"])
-end
-
-@testset "benchmark Reactant pins satisfy root [compat]" begin
-    root_project = TOML.parsefile(joinpath(_REPOSITORY_ROOT, "Project.toml"))
-    root_spec = Pkg.Types.semver_spec(root_project["compat"]["Reactant"])
-    pin_files = vcat(
-        [joinpath(_BENCH_DIR, name)
-         for name in readdir(_BENCH_DIR) if endswith(name, ".jl")],
-        [joinpath(_REPOSITORY_ROOT, "test", "run_reactant_integration.jl")],
-    )
-    found = 0
-    for path in pin_files
-        for (_, version) in _reactant_pin_consts(path)
-            found += 1
-            @test version in root_spec
-        end
-    end
-    # 8 comparison entrypoints + the CI integration runner: a smaller count
-    # means the pin pattern above no longer matches the entrypoint shape.
-    @test found >= 9
-    for project in _reactant_bound_projects()
-        bound = _reactant_compat_bound(project)
-        bound === nothing && continue
-        @test !isempty(intersect(
-            root_spec, Pkg.Types.semver_spec(bound)))
-    end
-    for project in _reactant_bound_projects()
-        manifest = joinpath(dirname(project), "Manifest.toml")
-        isfile(manifest) || continue
-        recorded = _manifest_reactant_version(manifest)
-        recorded === nothing && continue
-        @test recorded in root_spec
-    end
-end
-
 @testset "sum-to-zero benchmark receipts validate" begin
     for name in (
         "validate_sum_to_zero_native.jl",
-        "validate_sum_to_zero_reactant.jl",
     )
         _load_benchmark_validator(joinpath(_BENCH_DIR, "receipts", name))
     end
     @test true
-end
-
-@testset "MNIST Reactant dataset routes stay reproducible" begin
-    for (wrapper, frozen_body) in (
-            "mnist_reactant_comparison.jl" =>
-                "mnist_reactant_wren_pca40_comparison_body.jl",
-            "mnist_reactant_ad_comparison.jl" =>
-                "mnist_reactant_ad_wren_pca40_comparison_body.jl",
-        )
-        source = read(joinpath(_BENCH_DIR, wrapper), String)
-        @test occursin("--dataset=wren-pca40", source)
-        @test occursin(frozen_body, source)
-        @test isfile(joinpath(_BENCH_DIR, frozen_body))
-    end
 end
 
 @testset "Eight Schools benchmark capability matrix is explicit" begin
@@ -472,9 +367,8 @@ end
 
 @testset "incremental producer selection and resume isolation" begin
     native = read(joinpath(_BENCH_DIR, "all80_posteriordb_body.jl"), String)
-    reactant = read(joinpath(_BENCH_DIR, "all80_reactant_body.jl"), String)
     selector = "setdiff(keys(RK), All80Registry.BATCH_KEYS)"
-    @test occursin(selector, native) && occursin(selector, reactant)
+    @test occursin(selector, native)
     registry = read(joinpath(_BENCH_DIR, "all80_registry.jl"), String)
     @test occursin("const BATCH1_KEYS = Set([", registry)
     @test occursin("const IRT_KEYS = Set([", registry)
@@ -486,11 +380,7 @@ end
         "irt_2pl-irt_2pl", "fims_Aus_Jpn_irt-2pl_latent_reg_irt",
         "sat-hier_2pl", "timssAusTwn_irt-gpcm_latent_reg_irt")) == 4
     @test occursin("count(==(name), _req) > 1", native)
-    @test occursin("count(==(name), requested) > 1", reactant)
     @test occursin("All80Receipt.assert_batch_resume!", native)
-    @test occursin("All80Receipt.assert_batch_resume!", reactant)
-    @test occursin("reference_valid_probe", reactant)
-    @test !occursin("valid_rk_point(", reactant)
 end
 
 @testset "MNIST logistic primal benchmark receipt validates" begin

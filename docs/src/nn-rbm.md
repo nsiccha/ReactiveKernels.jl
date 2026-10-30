@@ -71,22 +71,3 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
 Named nodes make alternate boundaries cheap: `want = :pointwise` cuts the same
 plate to the per-observation log-likelihoods; `want = :prior` or `:log_jacobian`
 prunes the likelihood entirely.
-
-## Reactant
-
-The exact authored graph compiles and executes through the public Reactant
-boundary with value and gradient parity — `benchmark/batch_textnn_gate.jl`
-`@compile`s both the primal and the gradient and asserts they match the native
-evaluation and the reference `.stan` (via BridgeStan). For
-`mnist_100-nn_rbm1bJ10` the data matrix is **bound** for the Reactant compile as
-for the native axes. For `mnist-nn_rbm1bJ100` the 376,320,000-byte design matrix
-`x` exceeds the observed Reactant-0.2.285 constant-embedding threshold
-(104857600 bytes), so it is passed as a **traced runtime input** (still inactive
-in the gradient) — a different data-entry boundary with an identical graph,
-value, and parameter gradient (reactivekernels-use §7e).
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.NNRBMExample.demo()'
-```

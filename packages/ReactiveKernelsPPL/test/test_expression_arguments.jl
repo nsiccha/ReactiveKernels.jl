@@ -44,8 +44,7 @@ end
 _expression_sigmoid(x) = 1 / (1 + exp(-x))
 
 # Live zero-inflation values exercise the per-cell support branch, including
-# nested branch arms whose data-only parts preparation caches. Keep this native
-# regression separate from `_expression_cases`, which also drives Reactant.
+# nested branch arms whose data-only parts preparation caches.
 function _expression_live_zi_case(n, source, named; varying_rate=false)
     x = collect(range(-0.6, 0.7; length=n))
     y = [mod(i - 1, 4) for i in 1:n]
