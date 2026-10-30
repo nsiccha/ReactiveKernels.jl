@@ -276,8 +276,13 @@ a = let var"#x#op1" = x
     <the recipe's source over x>
 end
 b = __constants__[2]
-c = (__callables__[3])(a, b)
+c = cholesky(a)
+d = (__callables__[4])(c, b)
 ```
+
+An exact call of a function or type bound `const` in its module is written by
+name (`c = cholesky(a)`), so the statement names exactly what runs and the
+table need not hold it.
 
 A source with lexical captures reads them from its source record, which the
 callables tuple keeps for it
@@ -285,10 +290,12 @@ callables tuple keeps for it
 a literal statement is its literal (`shift::Float64 = -1.5`) and an alias its
 argument. The source's own names are resolved in the module that defined it,
 as the rest of the body resolves globals. An operation whose code is not its
-source is called through its literal position in the callables tuple: a raw
-function, a plate, a scan, a branch, a source that reads a module binding the
-module can reassign (its generated source function names the value the binding
-held when the kernel was defined), or a source outside the emitter's grammar. A
+source is called through its literal position in the callables tuple: a
+function that is a runtime value rather than a `const` binding (a closure), a
+plate, a scan, a branch, a generator sum, a source Julia must own, a source
+that reads a module binding the module can reassign (its generated source
+function names the value the binding held when the kernel was defined), or a
+source outside the emitter's grammar. A
 prepared kernel keeps only the callables its body references; a rebinding
 replaces the constants tuple alone. HAVE values appear in their preserved
 boundary order; WANT values appear in their requested return order. A single

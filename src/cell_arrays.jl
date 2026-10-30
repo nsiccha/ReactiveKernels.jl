@@ -168,7 +168,12 @@ function _cell_array_expand_call(rhs, recipes)
     # (`inline_sources.jl`): both name the recipe whose source is read.
     if rhs.head === :call
         slot = _callable_slot(rhs.args[1])
-        slot === nothing && return rhs
+        if slot === nothing
+            # A call by name (`_const_call_ref`): an identity alias is its argument.
+            rhs.args[1] == GlobalRef(Base, :identity) && length(rhs.args) == 2 &&
+                return rhs.args[2]
+            return rhs
+        end
         args = rhs.args[2:end]
     else
         inlined = _inline_statement_call(rhs)

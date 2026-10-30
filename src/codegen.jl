@@ -961,13 +961,13 @@ function _authored_scan_step(op::_AuthoredScanOp, callargs, offset, index, carry
     for i in shared_positions
         push!(arguments, callargs[i])
     end
+    # A hoisted statement's value is already in its strip buffer: it is
+    # found by its output local before the embedding renames the step's
+    # locals.
+    step_ast = strips !== nothing && !isempty(strips.hoisted) ?
+        _scan_hoisted_rewrite(step.ast, strips, index) : step.ast
     step_statements = _embedded_statements(
-        step.ast, arguments, Expr(:tuple, carry, output), offset)
-    if strips !== nothing && !isempty(strips.hoisted)
-        # A hoisted statement's value is already in its strip buffer.
-        step_statements = Any[_scan_hoisted_read(statement, strips, index)
-                              for statement in step_statements]
-    end
+        step_ast, arguments, Expr(:tuple, carry, output), offset)
     step_body = Expr(:block, elements..., step_statements...)
     # The step's static output type for an empty sequence: the step's argument
     # types are the carry seed, one element of each sequence and the shared
@@ -1304,19 +1304,20 @@ function _lower_authored_scan_slice_native!(body, op::_AuthoredScanOp, callargs,
     body
 end
 
-# `local = (__callables__[slot])(...)` (or the source inlined in its place) for a
-# hoisted step statement becomes a read of
-# its strip buffer at the step (`_lower_authored_scan_strips!`).
+# The step body with each hoisted statement, named by its output local
+# (`strips.hoisted`, from the step plan's `_varnames`), reading its strip
+# buffer at the step (`_lower_authored_scan_strips!`). The statement's shape
+# (a table call, an inlined source, a call by name) does not matter.
+function _scan_hoisted_rewrite(ast::Expr, strips, index)
+    signature, body = ast.args
+    Expr(:function, signature,
+         Expr(:block, Any[_scan_hoisted_read(statement, strips, index)
+                          for statement in body.args]...))
+end
 function _scan_hoisted_read(statement, strips, index)
-    statement isa Expr && statement.head === :(=) || return statement
-    call = statement.args[2]
-    call isa Expr || return statement
-    # The step statement is the operation's call, or its source inlined in
-    # its place (`inline_sources.jl`); either names the slot.
-    slot = call.head === :call ? _callable_slot(call.args[1]) :
-        (inlined = _inline_statement_call(call); inlined === nothing ? nothing : first(inlined))
-    slot === nothing && return statement
-    buffer = get(strips.hoisted, slot, nothing)
+    statement isa Expr && statement.head === :(=) && statement.args[1] isa Symbol ||
+        return statement
+    buffer = get(strips.hoisted, statement.args[1], nothing)
     buffer === nothing && return statement
     Expr(:(=), statement.args[1],
          _inbounds_value(:($buffer[$index - $(strips.lo) + 1])))
@@ -1827,11 +1828,16 @@ end
 function _scan_hoisted_records!(records, scan_recipe::Recipe, callargs, hoisted,
                                 offset)
     slots = Dict{Int,Symbol}()
-    isempty(hoisted) && return (; slots, types = Any[])
+    lhs = Dict{Symbol,Symbol}()
+    isempty(hoisted) && return (; slots, lhs, types = Any[])
     op = scan_recipe.op
     step = op.kernel
     sp = step.plan
     cid(v) = canon_id(sp.graph, v.id)
+    # The step body names each value by the step plan's local (`_varnames`);
+    # a hoisted statement is found by that name, whatever its shape (a table
+    # call, an inlined source, a call by name).
+    step_names = _varnames(sp)
     atomic = typeof(op).parameters[2]
     count = length(sp.have)
     iterated = [i for i in 2:count if !(i in atomic)]
@@ -1862,11 +1868,12 @@ function _scan_hoisted_records!(records, scan_recipe::Recipe, callargs, hoisted,
                           offset = offset + index - 1, hoisted = true))
         hoisted_of[cid(output)] = buffer
         slots[offset + index] = buffer
+        lhs[step_names[cid(output)]] = buffer
         types[cid(output)] = _slot_type_expr(sp.recipes[index], offset + index,
             (types[cid(v)] for v in sp.recipes[index].inputs))
         push!(hoisted_types, types[cid(output)])
     end
-    (; slots, types = hoisted_types)
+    (; slots, lhs, types = hoisted_types)
 end
 
 # Whether every hoisted step value is a concrete number, so its strip buffer
@@ -1948,7 +1955,7 @@ function _lower_authored_scan_strips!(body, scan_recipe::Recipe, records,
     emit_plates!(bind_views(fused), true, false)
     _lower_authored_scan_native!(fused, op, callargs, lhs, offset; type_offset,
         recycled, columns, strips = (; positions, lo, hi, axis, refill,
-                                       hoisted = hoisting.slots))
+                                       hoisted = hoisting.lhs))
     ordinary = emit_plates!(Expr(:block), false, false; ordinary = true)
     _lower_authored_scan_native!(ordinary, op, callargs, lhs, offset; type_offset,
                                  recycled, columns)
@@ -5007,14 +5014,19 @@ function _lower_with_ops_collecting(p::Plan;
             destination === nothing ||
                 (destination = _lane_source_expr(r, callargs, destination))
             if destination === nothing && inline_sources
-                # The recipe's source in the body; its authored closure, whose
-                # fields the body reads as the captures, in the slot
-                # (`inline_sources.jl`).
+                # The recipe's source in the body; its record, whose captures
+                # the body reads, in the slot (`inline_sources.jl`).
                 inlined = _inline_source_form(r, callargs, length(runtime_ops))
                 if inlined !== nothing
                     runtime_ops[end] = inlined[2]
                     destination = inlined[1]
                 end
+            end
+            if destination === nothing && inline_sources
+                # An exact call of a constant module binding names it
+                # (`_const_call_ref`); the table entry then goes unreferenced.
+                ref = _const_call_ref(r.op)
+                ref === nothing || (destination = Expr(:call, ref, callargs...))
             end
             call = destination === nothing ?
                 Expr(:call, Expr(:ref, _CALLABLES_ARG, length(runtime_ops)), callargs...) :
@@ -7532,6 +7544,31 @@ end
 # value read from the constants table, else the operation's call.
 _slot_call_expr(r::Recipe, k::Int, args) = r.op isa _BoundConstant ?
     Expr(:ref, _CONSTANTS_ARG, k) : Expr(:call, Expr(:ref, _CALLABLES_ARG, k), args...)
+# The constant global binding of a raw operation, as the `GlobalRef` the body
+# calls by name (`w = sin(z)`), or `nothing`: a singleton function, or the
+# type behind `_TypeOperation`, bound `const` under its own name in its home
+# module, so the call names exactly what runs and the callables table need not
+# hold it. One instance for every operation type.
+Base.@nospecializeinfer function _const_call_ref(@nospecialize(op))
+    op isa _TypeOperation && return _const_type_ref(_type_operation_type(op))
+    op isa Function || return nothing
+    T = typeof(op)
+    T isa DataType && Base.issingletontype(T) || return nothing
+    # `nameof` of the function value is its name (`:sin`); of its type, the
+    # type's (`Symbol("#sin")`).
+    home, name = parentmodule(T), nameof(op)
+    (isdefined(home, name) && isconst(home, name) && getglobal(home, name) === op) ||
+        return nothing
+    _canonical_global(GlobalRef(home, name))
+end
+Base.@nospecializeinfer function _const_type_ref(@nospecialize(T))
+    base = T isa UnionAll ? Base.unwrap_unionall(T) : T
+    base isa DataType || return nothing
+    home, name = base.name.module, base.name.name
+    (isdefined(home, name) && isconst(home, name) && getglobal(home, name) === T) ||
+        return nothing
+    _canonical_global(GlobalRef(home, name))
+end
 # The type expression of recipe `r`'s value at position `k` over its inputs'
 # type expressions: the constant's type, else `_promote_op` of the operation.
 _slot_type_expr(r::Recipe, k::Int, input_types) = r.op isa _BoundConstant ?

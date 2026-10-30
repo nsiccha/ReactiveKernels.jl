@@ -164,7 +164,8 @@ _names_identity_recipes(spec) =
         conversions = [recipe for recipe in kernel_graph(names_pair_caller).recipes
                        if recipe.op === identity]
         @test sort!([only(recipe.outputs).name for recipe in conversions]) == [:a, :m]
-        @test occursin(r"a = \(__callables__\[\d+\]\)\(m\)", _names_text(names_pair_caller))
+        # An exact `identity` call is written by name (`_const_call_ref`).
+        @test occursin(r"a = Base\.identity\(m\)", _names_text(names_pair_caller))
         @test prepare(names_pair_caller)(3) == 4 + 8
     end
 
@@ -181,8 +182,8 @@ _names_identity_recipes(spec) =
         # program reads it by that name rather than a substituted value.
         @test occursin("var\"lp_s.scale\" = 4.0", text)
         # `log(scale)` is a bare call, so it is called through the table.
-        @test occursin(r"var\"lp_s\.log_scale\" = \(__callables__\[\d+\]\)\(var\"lp_s\.scale\"\)", text)
-        @test occursin(r"var\"lp_t\.log_scale\" = \(__callables__\[\d+\]\)\(var\"lp_t\.scale\"\)", text)
+        @test occursin(r"var\"lp_s\.log_scale\" = [A-Za-z_][\w.]*\(var\"lp_s\.scale\"\)", text)
+        @test occursin(r"var\"lp_t\.log_scale\" = [A-Za-z_][\w.]*\(var\"lp_t\.scale\"\)", text)
         @test occursin(r"lp_s = let var\"#[^\"]+#op\d+\" = s, var\"#[^\"]+#op\d+\" = var\"lp_s\.log_scale\", var\"#[^\"]+#op\d+\" = var\"lp_s\.scale\"", text)
         @test occursin("var\"lp_t.x\" = ", text)
         # A bound child endpoint's scoped port reads its own value, not
@@ -261,7 +262,7 @@ _names_identity_recipes(spec) =
         # A HAVE port is the kernel's public boundary: its declared type
         # (here none) is unchanged, so the formal keeps its conversion.
         @test only(inputs(names_typed_have)) isa ReactiveKernels.Value{Any}
-        @test occursin(r"var\"r\.v\" = \(__callables__\[\d+\]\)\(a\)", _names_text(names_typed_have))
+        @test occursin(r"var\"r\.v\" = Base\.identity\(a\)", _names_text(names_typed_have))
         @test prepare(names_typed_have)([1.0, 2.0]) == 6.0
     end
 

@@ -208,8 +208,9 @@ function _lower_index_runs_native(body::Expr,ops)
         end
         rhs.head===:call || return
         slot=_callable_slot(rhs.args[1])
-        if slot!==nothing
-            op=ops[slot]
+        # The gather is called through the table or by name (`_const_call_ref`).
+        if slot!==nothing || rhs.args[1]==GlobalRef(@__MODULE__,:_readonly_gather_runs)
+            op=slot===nothing ? _readonly_gather_runs : ops[slot]
             op===_readonly_gather_runs && length(rhs.args)==4 &&
                 rhs.args[4] isa Symbol && (gathers[lhs]=rhs.args[4])
         elseif _index_run_call(rhs,GlobalRef(Base,:broadcastable),1)

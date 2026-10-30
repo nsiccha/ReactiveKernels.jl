@@ -34,8 +34,14 @@ are recorded in the git history only.
   `getfield(getfield(__callables__[k], :captures), :c)`. `prepare_sampler`'s
   latest-world preparation and `_kernel_eval_definition`'s
   `latest_world_native_sources` are accepted and do nothing: a record is
-  callable from any world. Values, gradients, plans, recipes and `code_expr`'s
-  statements are unchanged.
+  callable from any world. Values, gradients, plans and recipes are unchanged.
+- An exact call of a function or type bound `const` in its module is written
+  by name in the generated body (`w = Base.sin(z)`, `n = Base.length(v)`), so
+  the statement names exactly what runs and such an operation leaves the
+  callables table; a kernel of inline sources and exact calls has an empty
+  table. The nonallocating and derivative-rule lowerings, which key on the
+  table, keep every call in it as before. A scan's hoisted step statements
+  are found by their output locals, whatever their shape.
 
 ## 0.1.26
 
