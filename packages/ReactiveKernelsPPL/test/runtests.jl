@@ -233,6 +233,7 @@ const _PPL_TEST_FILES = (
     "test_inline_scalar_reads.jl",
     "test_authored_names.jl",
     "test_cell_query.jl",
+    "test_compact_cell_derivatives.jl",
     "test_logistic_values.jl",
 )
 
