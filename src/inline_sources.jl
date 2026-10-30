@@ -1,20 +1,26 @@
-# Prototype for the operation-table study (todo `0pro4di`): a recipe's authored
-# source emitted directly into the generated body.
+# A recipe's authored source emitted directly into the generated body
+# (operation-table migration, stage 1; decision `0dgfkf5`).
 #
-# Today every authored recipe is one entry of the operation table `__ops__`, a
+# An authored recipe used to be one entry of the operation table `__ops__`, a
 # `_KernelSourceOp` around a separately generated function of the recipe's
-# source, and the body calls `lhs = __ops__[k](x, y)`. With
-# `RK_INLINE_SOURCES=1` the body carries the source itself,
+# source, called as `lhs = __ops__[k](x, y)`. The body now carries the source
+# itself,
 #
-#     lhs = let x#1 = x, y#2 = y
+#     lhs = let var"#opk" = __ops__[k], var"#x#opk" = x, var"#y#opk" = y,
+#               var"#c#opk" = getfield(__ops__[k], :c)
 #         <the recipe's native source, its names bound hygienically>
 #     end
 #
-# and the slot keeps `_InlinedSource(captures)`: the recipe's lexical captures
-# as data, read by the body where the source reads them. The table's type then
-# names no source function. The plan, its recipes and `Recipe.source` are
-# untouched, so `explain`, `recipe_inventory` and the structural graph read as
-# before, and `code_expr` shows the code that executes.
+# and the slot keeps the recipe's authored closure (`_kernel_shared_closure`
+# gives fresh builds of one program one closure type), whose fields are the
+# source's lexical captures: the body reads them through the literal slot,
+# which every slot analysis (`_operation_slot`, `_native_table`, the AD
+# externalization) recognizes, and the slot stays an ordinary callable, so the
+# type expressions `_promote_op(__ops__[k], …)` of cells and scan steps keep
+# working. The table's type then names no generated source function. The plan,
+# its recipes and `Recipe.source` are untouched, so `explain`,
+# `recipe_inventory` and the structural graph read as before, and `code_expr`
+# shows the code that executes (`docs/src/constraints.md`).
 #
 # A recipe keeps its table call when its source is outside this emitter's
 # reach: an exact bare call (`cholesky(x)`, a raw function in the table), a
@@ -24,15 +30,21 @@
 
 # Off under `on_error = :ignore`: the throw-stripped twin that policy selects
 # keeps the authored source on its recipe, so the source is not its code.
+# `RK_INLINE_SOURCES=0` keeps every call in the table (the comparison baseline
+# of the migration's measurements).
 const _INLINE_SOURCES_OFF = :ReactiveKernels_inline_sources_off
-_inline_sources_enabled() = get(ENV, "RK_INLINE_SOURCES", "0") == "1" &&
+_inline_sources_enabled() = get(ENV, "RK_INLINE_SOURCES", "1") != "0" &&
     !get(task_local_storage(), _INLINE_SOURCES_OFF, false)
 
-struct _InlinedSource{C}
-    captures::C
-end
-(::_InlinedSource)(args...) = throw(ArgumentError(
-    "an inlined source's operation slot is a data placeholder; its code is in the generated body"))
+# The statement's locals are named from the recipe's slot, never minted with
+# `gensym`: two lowerings of one plan then emit one expression (`lower(p)`
+# equals `lower_with_ops(p)`'s, and a prepared kernel's `code_expr` is a
+# function of its plan). A leading `#` keeps them apart from every authored
+# identifier, and the `#op` infix from the `#name#N` locals that
+# `_value_local_name` derives from gensyms and from `gensym`'s own `##name#N`.
+# `_canonical_locals` treats them as the lowering's locals, as it does gensyms.
+_inline_slot_name(slot::Int) = Symbol("#op", slot)
+_inline_local_name(name::Symbol, slot::Int) = Symbol('#', name, "#op", slot)
 
 # Heads whose symbol arguments are syntax, not names.
 const _INLINE_OPAQUE_HEADS = (:quote, :inert, :meta, :inbounds, :boundscheck,
@@ -43,24 +55,33 @@ const _INLINE_SCOPE_HEADS = (:->, :function, :let, :for, :generator, :comprehens
                              :typed_comprehension, :do, :try, :while)
 
 # The inline form of recipe `r` over `callargs` (its operation at table slot
-# `slot`), with the recipe's captures, or `nothing` where it keeps its call.
+# `slot`) and the authored closure the slot keeps, or `nothing` where the
+# recipe keeps its call.
 function _inline_source_form(r::Recipe, callargs, slot::Int)
     op = r.op
     op isa _KernelSourceOp || return nothing
     kernel_sourceop_form(op) === :fused || return nothing
+    # Only a plain source function inlines. A branch, a reduction or a split
+    # keeps its operation: the plate lowerings read its parts through the
+    # slot (`getfield(__ops__[k], :f)`), and its source is not its code.
+    f = getfield(op, :f)
+    f isa _KernelSourceFunction || return nothing
+    # The throw-stripped twin (`on_error = :ignore`) carries the authored
+    # source, which is not its code: it keeps its call until it inlines its
+    # own stripped source (`_kernel_ignore_throw_source`). An authored
+    # operation is the one that holds a twin.
+    getfield(op, :ignored_throws) === nothing && return nothing
     source = r.source
     source isa Expr || return nothing
     params = _recipe_source_names(r)
     length(params) == length(callargs) && allunique(params) || return nothing
     mod = _kernel_endpoint_source_module(op)
     mod isa Module || return nothing
-    closure = _kernel_native_source(_source_closure(op.f))
+    closure = _kernel_native_source(f)
     T = typeof(closure)
     T isa DataType && closure isa Function || return nothing
     names = fieldnames(T)
-    values = Any[getfield(closure, i) for i in 1:length(names)]
-    any(v -> v isa Core.Box, values) && return nothing
-    captures = NamedTuple{names}(Tuple(values))
+    any(i -> getfield(closure, i) isa Core.Box, 1:length(names)) && return nothing
     native = _kernel_native_body(source, mod, Set{Symbol}(params))
     # A source whose closures Julia must own (a local function, a generator or
     # comprehension, an exception scope) keeps its native closure today, with
@@ -84,33 +105,57 @@ function _inline_source_form(r::Recipe, callargs, slot::Int)
         _global_value(mod, name) === nothing || return nothing
     end
     renamed = Dict{Symbol,Symbol}()
-    for name in params
-        renamed[name] = gensym(name)
-    end
-    for name in names
-        haskey(renamed, name) || (renamed[name] = gensym(name))
-    end
-    for name in bound
-        haskey(renamed, name) || (renamed[name] = gensym(name))
+    for name in Iterators.flatten((params, names, bound))
+        haskey(renamed, name) || (renamed[name] = _inline_local_name(name, slot))
     end
     rewritten = _inline_qualify(body, mod, renamed)
     rewritten === nothing && return nothing
-    bindings = Any[]
+    # The first binding names the recipe's slot: the passes that key on a
+    # statement's recipe (`_inline_statement_call`) read it there, and the
+    # slot analyses see the slot as read.
+    bindings = Any[Expr(:(=), _inline_slot_name(slot), Expr(:ref, _OPS_ARG, slot))]
     for (name, arg) in zip(params, callargs)
         push!(bindings, Expr(:(=), renamed[name], arg))
     end
-    if !isempty(names)
-        captured = Expr(:call, GlobalRef(Core, :getfield),
-                        Expr(:call, GlobalRef(Core, :getfield), _OPS_ARG, slot),
-                        QuoteNode(:captures))
-        for name in names
-            push!(bindings, Expr(:(=), renamed[name],
-                                 Expr(:call, GlobalRef(Core, :getfield), captured,
-                                      QuoteNode(name))))
-        end
+    # A capture is a field of the closure in the slot, read through the
+    # literal slot (never the bare table, which the slot analyses read as
+    # "the whole table" and `_rewrite_embedded` cannot shift).
+    for name in names
+        push!(bindings, Expr(:(=), renamed[name],
+                             Expr(:call, GlobalRef(Core, :getfield),
+                                  Expr(:ref, _OPS_ARG, slot), QuoteNode(name))))
     end
-    Expr(:let, Expr(:block, bindings...), rewritten), captures
+    # The slot keeps the closure under the type every build of this source
+    # shares (`_kernel_shared_closure`), so one program's fresh builds have
+    # one table type and one compiled body.
+    shared = _kernel_shared_closure(closure, Expr(:->, Expr(:tuple, params...), source))
+    Expr(:let, Expr(:block, bindings...), rewritten), shared
 end
+
+# An inlined statement's right-hand side read back as the call it replaced:
+# `(slot, callargs)` for `let var"#opk" = __ops__[k], var"#x#opk" = x, …; body
+# end`, or `nothing` for any other expression. A capture binding
+# (`var"#c#opk" = getfield(__ops__[k], :c)`) is not an argument.
+function _inline_statement_call(rhs)
+    rhs isa Expr && rhs.head === :let && length(rhs.args) == 2 || return nothing
+    header = rhs.args[1]
+    header isa Expr && header.head === :block && !isempty(header.args) || return nothing
+    first_binding = header.args[1]
+    first_binding isa Expr && first_binding.head === :(=) || return nothing
+    slot = _operation_slot(first_binding.args[2])
+    slot === nothing && return nothing
+    callargs = Any[]
+    for binding in header.args[2:end]
+        binding isa Expr && binding.head === :(=) || return nothing
+        value = binding.args[2]
+        _inline_capture_read(value, slot) && continue
+        push!(callargs, value)
+    end
+    slot, callargs
+end
+_inline_capture_read(value, slot) = value isa Expr && value.head === :call &&
+    length(value.args) == 3 && value.args[1] == GlobalRef(Core, :getfield) &&
+    _operation_slot(value.args[2]) == slot && value.args[3] isa QuoteNode
 
 function _inline_contains_return(ex)
     ex isa Expr || return false

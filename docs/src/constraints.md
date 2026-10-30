@@ -307,8 +307,11 @@ only, no ReactiveKernels code) isolate the remaining backend limitations:
   empty and nonempty sequences. A step that contains a plate, a scan or an
   embedded kernel is typed from that nested body's leaf operations, as a
   nested plate body is; a step without a concrete inferred output type keeps
-  per-arm allocation. No activity configuration or derivative rule is
-  involved.
+  per-arm allocation. A plate chain that reconverges into two summed readers
+  (`test_plate_fusion_reconvergence_ad.jl`, the `independent` diamond) meets
+  the same phi over an empty sequence with registered Enzyme 0.13.216 on
+  Julia 1.10.12; that gradient is pinned as broken there. No activity
+  configuration or derivative rule is involved.
 - Native Enzyme 0.13.210 forward mode over a reverse-mode gradient (a
   forward-over-reverse Hessian-vector product) fails static activity analysis
   (`EnzymeRuntimeActivityError`) when the objective multiplies a constant

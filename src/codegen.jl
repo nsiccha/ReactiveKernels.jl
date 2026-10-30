@@ -586,15 +586,29 @@ function _lhs_symbols!(symbols::Set{Symbol}, lhs)
     symbols
 end
 
+# The field labels of a named tuple (`(a = x,)`, `(; a = x)`) and the labels
+# of keyword arguments (`f(x; a = y)`) are syntax, not names: a recipe's source
+# emitted into the body (`inline_sources.jl`) spells them where its generated
+# source function used to hide them. The labeled item's value, or the item
+# itself when it carries no label.
+_labeled_value(item) =
+    item isa Expr && item.head in (:(=), :kw) && length(item.args) == 2 &&
+        item.args[1] isa Symbol ? item.args[2] : item
+
 function _local_symbols!(symbols::Set{Symbol}, node)
     node isa Expr || return symbols
-    node.head === :quote && return symbols
+    node.head in _INLINE_OPAQUE_HEADS && return symbols
     if node.head === :(=)
         _lhs_symbols!(symbols, node.args[1])
     elseif node.head === :for
         iteration = node.args[1]
         iteration isa Expr && iteration.head === :(=) &&
             _lhs_symbols!(symbols, iteration.args[1])
+    elseif node.head in (:tuple, :parameters)
+        foreach(item -> _local_symbols!(symbols, _labeled_value(item)), node.args)
+        return symbols
+    elseif node.head === :kw
+        return _local_symbols!(symbols, node.args[end])
     end
     foreach(child -> _local_symbols!(symbols, child), node.args)
     symbols
@@ -608,14 +622,25 @@ _signature_name(annotation::Expr) = annotation.head === :(::) ?
 function _rewrite_embedded(node, names::Dict{Symbol,Any}, op_offset::Int)
     node isa Symbol && return get(names, node, node)
     node isa Expr || return node
-    node.head === :quote && return node
+    node.head in _INLINE_OPAQUE_HEADS && return node
     if node.head === :ref && length(node.args) == 2 &&
        node.args[1] === _OPS_ARG && node.args[2] isa Int
         return Expr(:ref, _OPS_ARG, op_offset + node.args[2])
     end
+    # A named tuple's field labels and keyword labels are syntax
+    # (`_labeled_value`): their values are rewritten, the labels stay.
+    if node.head in (:tuple, :parameters)
+        return Expr(node.head,
+                    (_rewrite_labeled(item, names, op_offset) for item in node.args)...)
+    elseif node.head === :kw && _labeled_value(node) !== node
+        return Expr(:kw, node.args[1], _rewrite_embedded(node.args[2], names, op_offset))
+    end
     Expr(node.head,
          (_rewrite_embedded(child, names, op_offset) for child in node.args)...)
 end
+_rewrite_labeled(item, names::Dict{Symbol,Any}, op_offset::Int) =
+    _labeled_value(item) === item ? _rewrite_embedded(item, names, op_offset) :
+    Expr(item.head, item.args[1], _rewrite_embedded(item.args[2], names, op_offset))
 
 function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int)
     ast.head === :function || throw(ArgumentError(
@@ -1216,11 +1241,13 @@ end
 function _scan_hoisted_read(statement, strips, index)
     statement isa Expr && statement.head === :(=) || return statement
     call = statement.args[2]
-    call isa Expr && call.head === :call || return statement
-    callee = call.args[1]
-    callee isa Expr && callee.head === :ref && length(callee.args) == 2 &&
-        callee.args[1] === _OPS_ARG || return statement
-    buffer = get(strips.hoisted, callee.args[2], nothing)
+    call isa Expr || return statement
+    # The step statement is the operation's call, or its source inlined in
+    # its place (`inline_sources.jl`); either names the slot.
+    slot = call.head === :call ? _operation_slot(call.args[1]) :
+        (inlined = _inline_statement_call(call); inlined === nothing ? nothing : first(inlined))
+    slot === nothing && return statement
+    buffer = get(strips.hoisted, slot, nothing)
     buffer === nothing && return statement
     Expr(:(=), statement.args[1],
          _inbounds_value(:($buffer[$index - $(strips.lo) + 1])))
@@ -4397,7 +4424,7 @@ function _lower_with_ops_collecting(p::Plan;
                          pushdowns::Bool = isempty(recycle),
                          plate_element_types::Bool = false,
                          type_hints = nothing, exemplar_types = nothing,
-                         inline_sources::Bool = inline_embedded && _inline_sources_enabled())
+                         inline_sources::Bool = _inline_sources_enabled())
     g = p.graph
     names = _varnames(p)
     nm(v) = names[canon_id(g, v.id)]
@@ -4727,11 +4754,12 @@ function _lower_with_ops_collecting(p::Plan;
             destination === nothing ||
                 (destination = _lane_source_expr(r, callargs, destination))
             if destination === nothing && inline_sources
-                # Prototype (todo `0pro4di`): the recipe's source in the body,
-                # its captures as data in the slot (`inline_sources.jl`).
+                # The recipe's source in the body; its authored closure, whose
+                # fields the body reads as the captures, in the slot
+                # (`inline_sources.jl`).
                 inlined = _inline_source_form(r, callargs, length(runtime_ops))
                 if inlined !== nothing
-                    runtime_ops[end] = _InlinedSource(inlined[2])
+                    runtime_ops[end] = inlined[2]
                     destination = inlined[1]
                 end
             end
@@ -4765,10 +4793,18 @@ end
 Lower a plan to an ordinary anonymous-function `Expr` of the form
 
     function (__ops__, x::T1, y::T2)
-        a = __ops__[1](x, y)
+        a = let var"#op1" = __ops__[1], var"#x#op1" = x, var"#y#op1" = y
+            <the first recipe's source over x and y>
+        end
+        b = __ops__[2](a)
         ...
         return out
     end
+
+A recipe's authored source runs in the body over its arguments, its captures
+read from the authored closure its slot keeps (`inline_sources.jl`); an
+operation whose code is not its source (a plate, a scan, a raw function, a
+branch) is called through its slot.
 
 This `Expr` is a first-class artifact: it may be inspected (`code_expr`) and
 rewritten (`transform`) before compilation (gist §9). Pair it with its
@@ -7531,6 +7567,17 @@ function _readable_expr(node, recipes)
     let slot = _operation_slot(node)
         slot !== nothing && 1 <= slot <= length(recipes) &&
             return _readable_callee(recipes[slot].op)
+    end
+
+    # A recipe's source inlined in the body (`inline_sources.jl`) renders as
+    # the call it replaced: the source over its arguments, as this view shows
+    # every operation.
+    if node.head === :let
+        inlined = _inline_statement_call(node)
+        if inlined !== nothing && 1 <= inlined[1] <= length(recipes)
+            args = map(arg -> _readable_expr(arg, recipes), inlined[2])
+            return _readable_recipe_call(recipes[inlined[1]], args)
+        end
     end
 
     # Ordinary lowered kernels and pure reactive getters invoke an operation
