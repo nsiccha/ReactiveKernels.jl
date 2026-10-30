@@ -627,3 +627,88 @@ end
     @test all(ref -> ref isa WeakRef, record.programs)
     @test any(ref -> ref.value === built.program, record.programs)
 end
+
+# Values a cell reads through gathers of model-level vectors (snag
+# `on-arbeitsplatza-6065a1ef`): a group-effect predictor `a .+ b .* x .+ z[g]`
+# (its coefficients as a typed coordinate view), a covariate completed from
+# drawn entries `vcat(free, grouped)` and gathered onto the rows that read it,
+# and a NegativeBinomial2 location gathered from a sum of that predictor at
+# two row indices (one gathered value, two index vectors; RKPPL reads the
+# location through a typed alias), as BRM emits mixture intensities. Each cell
+# computes them at its own rows.
+const _CQ_GATHERED = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
+    s ~ Exponential(1)
+    phi ~ Exponential(1)
+    z[levels(g)] .~ Normal.(0, 1)
+    zf[axes(free_rows, 1)] .~ Normal.(0, 1)
+    zs[axes(share_rows, 1)] .~ Normal.(0, 1)
+    yf = exp.(mf .+ s .* zf)
+    ys = exp.(0.5 .* zs)
+    completed = observed .+ mask .* vcat(yf, ys)[lookup]
+    c = log.(completed) .- 0.5
+    eta = a .+ b .* x .+ z[g] .+ c[pos]
+    y .~ Poisson.(exp.(eta))
+    lam = exp.(eta[r1]) .+ exp.(eta[r2])
+    log_m = log.(lam) .+ a
+    m2 = exp.(log_m[r3])
+    w .~ NegativeBinomial2.(m2, phi)
+end
+
+function _cq_gathered_data(n)
+    # A covariate of `rows` entries, some missing: the first `nfree` missing
+    # entries are free draws, the others grouped ones. An observed entry looks
+    # up drawn entry 1 and masks it out, as BRM's completions do.
+    rows = max(4, n ÷ 2)
+    nfree = nshare = max(1, rows ÷ 8)
+    missing_rows = collect(range(1; step = 3, length = nfree + nshare))
+    lookup, mask = ones(Int, rows), zeros(rows)
+    for (k, row) in enumerate(missing_rows)
+        lookup[row], mask[row] = k, 1.0
+    end
+    observed = (1 .- mask) .* collect(range(0.5, 3.0; length = rows))
+    (; x = collect(range(-1, 1; length = n)), g = ["g$(mod1(7j, max(2, n ÷ 10)))" for j in 1:n],
+       free_rows = collect(1:nfree), share_rows = collect(1:nshare),
+       mf = collect(range(-0.2, 0.2; length = nfree)), observed, mask, lookup,
+       pos = [mod1(5j, rows) for j in 1:n], y = [j % 4 for j in 1:n],
+       r1 = [mod1(3j, n) for j in 1:n], r2 = [mod1(11j + 1, n) for j in 1:n],
+       r3 = [mod1(j + 2, n) for j in 1:n], w = [j % 3 for j in 1:n])
+end
+
+@testset "cell query: gathered model-level values and their completions cost their own rows" begin
+    backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    for obs in (:y, :w)
+        measured = map((40, 4_000)) do n
+            data = _cq_gathered_data(n)
+            bound, built = _cq_bound(_CQ_GATHERED, data, (:y, :w))
+            q = prepare_cell_query(built, bound, obs)
+            u = collect(range(-0.4, 0.5; length = built.layout.total))
+            pointwise = getproperty(
+                Base.invokelatest(prepare_query(built, bound, :pointwise), u), obs)
+            values = [q(u, i) for i in (1, 2, n)]
+            q(u, 2)
+            dense = prepare_cell_sampler(built, bound, obs, u; backend)
+            dense_value, dense_gradient = cell_value_and_gradient!(dense, similar(u), u, 2)
+            support = findall(!iszero, dense_gradient)
+            indices = sort!(union(support, 1:4))
+            compact = prepare_compact_cell_sampler(built, bound, obs, u, indices; backend)
+            compact_gradient = similar(u[indices])
+            compact_value, _ = cell_value_and_gradient!(
+                compact, compact_gradient, u, u[indices], indices, 2)
+            j = last(support)
+            (; values, reference = pointwise[[1, 2, n]], bytes = (@allocated q(u, 2)),
+               dense_value, compact_value, support = length(support),
+               parity = compact_gradient ≈ dense_gradient[indices],
+               central = isapprox(dense_gradient[j], _cq_central(v -> q(v, 2), u, j);
+                   rtol = 1e-5))
+        end
+        @test all(m -> m.values ≈ m.reference, measured)
+        @test measured[1].bytes == measured[2].bytes
+        @test all(m -> m.values[2] ≈ m.dense_value ≈ m.compact_value, measured)
+        @test all(m -> m.parity && m.central, measured)
+        # The gradient's support is the cell's own rows: the coefficients,
+        # one group effect and one drawn entry per row read (and its scale).
+        @test all(m -> m.support <= 11, measured)
+    end
+end

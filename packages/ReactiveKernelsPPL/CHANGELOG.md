@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.18
+
+- A cell query (`prepare_cell_query`, compact cell samplers) computes an
+  affine predictor with an offset at the cell's rows: RKPPL declares the
+  predictor's coefficient vector `::AbstractVector{Float64}`, as its other
+  coordinate views are declared. For `mu = a .+ b .* x .+ z[g]` with
+  `y .~ Normal.(mu, s)`, one cell allocates 592 B at 100 and at 100,000 rows;
+  0.1.17 computed `mu` whole in every cell (1,424 B and 800,576 B).
+- With ReactiveKernels 0.1.16, a cell also computes at its rows a covariate
+  completed from drawn entries (`observed .+ mask .* vcat(free, grouped)[lookup]`,
+  as BRM completes `mi()` covariates) and read through a gather, a location
+  RKPPL reads through a typed alias, and a location gathered from a sum of a
+  predictor at two row indices. Requires ReactiveKernels 0.1.16.
+
 ## 0.1.17
 
 - **Breaking:** ReactiveKernelsPPL has no Reactant path, following

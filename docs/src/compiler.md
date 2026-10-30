@@ -998,9 +998,21 @@ supports these producers:
 - a dotted expression of inputs, numeric literals, gathers `A[I]` or
   `A[I, k]` (an integer vector input `I`, integer literals `k`), column reads
   `A[:, k]`, products `A * w` of two inputs, and literal-position reads `a[1]`
-  of an array of numbers (read whole, as in `z .* tau[1]`);
+  of an array of numbers (read whole, as in `z .* tau[1]`). One source may be
+  gathered by several index vectors, as in `exp.(t[r1]) .+ exp.(t[r2])`; it
+  is then computed at the rows of every index;
 - such a gather alone, and such a column read alone;
 - `hcat(a, b, ...)` of inputs, such as a design matrix with a computed column;
+- `vcat(a, b, ...)` of inputs and number literals, such as a completed
+  covariate `vcat(free, grouped)[lookup]` or a padded field `vcat(phi, 0.0)`.
+  A row of it is a row of exactly one operand, so each operand is computed at
+  the rows that fall in it, and an operand none falls in is computed at no
+  rows. Matrices stack along their first axis; their other dimensions must
+  agree, as `vcat` requires (`DimensionMismatch`);
+- a typed alias `b::T = a` whose declaration converts no elements (`T` an
+  array type without an element type such as `AbstractVector`, or no
+  declaration): its rows are `a`'s rows. A declaration such as
+  `b::Vector{Float64} = a` converts the whole value and keeps it whole;
 - a product `A * W` whose left factor is an array input, a column read or an
   `hcat` (row `r` is `A[r:r, :] * W`). A product of two operands whose right
   operand is an array or a number, such as `X * beta`, can be read like any
@@ -1025,8 +1037,12 @@ in `log_k = pop .+ …` is computed at row `i` the same way, also when
 written by a per-row plate as one matrix column and read back as `b[:, 1]`,
 and a group block `z .* tau[1]` gathered as `b[g, 1]`, are computed at the
 rows read. A value is computed at rows only when every reader reads it this
-way. A value read whole anywhere, wanted, or produced any other way (including
-through an opaque function call) is computed whole as before.
+way, and it is computed once per cell, at all the rows its readers read: a
+predictor gathered by two index vectors in two definitions, or by a
+definition and a plate, runs once at both sets of rows, with everything
+upstream of it. A value read whole anywhere, wanted, or produced any other way (including
+through an opaque function call) is computed whole as before, also when it is
+an operand of a `vcat` whose read rows all fall in other operands.
 
 The full broadcast shape of each such expression, and the full shape of each
 `hcat`, is still checked from its operands' axes (`DimensionMismatch`), and the

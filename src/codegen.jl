@@ -4148,6 +4148,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
     row = isempty(pushed_lanes) ? nothing : _cell_bind!(windows, :cell_row,
         Expr(:call, GlobalRef(Base, :getindex), cell, 1))
     slices = Any[]
+    lane_rows = Dict{Int,Symbol}()
     for (position, arg) in enumerate(plate_args)
         if position in atomic
             push!(slices, arg)
@@ -4155,12 +4156,11 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
         end
         if haskey(pushed_lanes, position)
             value = pushed_lanes[position]
-            lane_row = _cell_bind!(windows, :cell_row,
-                Expr(:call, GlobalRef(@__MODULE__, :_cell_leaf_row),
-                    _cell_shape!(windows, value), row))
-            window = _cell_window!(windows, value, lane_row)
-            push!(slices, Expr(:call, GlobalRef(@__MODULE__, :_cell_batched_slice),
-                window, cell))
+            lane_rows[position] = _cell_request!(windows, value,
+                _cell_bind!(windows, :cell_row,
+                    Expr(:call, GlobalRef(@__MODULE__, :_cell_leaf_row),
+                        _cell_shape!(windows, value), row)))
+            push!(slices, nothing)
             continue
         end
         slice = gensym(:cell_argument)
@@ -4170,14 +4170,39 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
     end
     # A shared array read only at the cell's own rows whose producer computes
     # it row by row is computed at those rows (`_CellEmitter`, cell_windows.jl).
+    # Every pushed value is computed once, at all the rows the cell's lanes and
+    # captures read of it; a capture read at a pushed lane's element waits for
+    # that lane, so it is computed in a second round.
     if windows !== nothing
         d = windows.pushdowns
+        captures = Tuple{Int,ValueId,Int,Int}[]
         for (position, (batched, via)) in sort!(collect(get(d.captures, recipe.id,
                 Dict{Int,Tuple{Int,Int}}())))
             value = canon_id(d.graph, plate_values[position].id)
-            value in d.pushed || continue
-            slices[position] = _cell_capture!(windows, value, slices[batched],
+            value in d.pushed && push!(captures, (position, value, batched, via))
+        end
+        waits(c) = haskey(pushed_lanes, c[3]) || (c[4] != 0 && haskey(pushed_lanes, c[4]))
+        for (position, value, batched, via) in captures
+            waits((position, value, batched, via)) && continue
+            _cell_capture_request!(windows, value, slices[batched],
                 via == 0 ? nothing : slices[via])
+        end
+        _cell_emit_windows!(windows)
+        for (position, lane_row) in lane_rows
+            slices[position] = Expr(:call, GlobalRef(@__MODULE__, :_cell_batched_slice),
+                _cell_take!(windows, pushed_lanes[position], lane_row), cell)
+        end
+        later = _CellEmitter(body, d, windows.names, windows.runtime_ops,
+            windows.runtime_recipes)
+        for (position, value, batched, via) in captures
+            waits((position, value, batched, via)) || continue
+            _cell_capture_request!(later, value, slices[batched],
+                via == 0 ? nothing : slices[via])
+        end
+        any(waits, captures) && _cell_emit_windows!(later)
+        for c in captures
+            position, value = c[1], c[2]
+            slices[position] = _cell_capture!(waits(c) ? later : windows, value)
         end
     end
     pointwise = gensym(:cell_pointwise)

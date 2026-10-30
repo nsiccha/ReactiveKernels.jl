@@ -1463,8 +1463,15 @@ computed at that index only: for `log_k = a .+ b .* w .+ R[group, 1]` with
 `R = Z * F'`, read as `log_k[i]`, the cell computes `log_k[i]` from row
 `group[i]` of `R` (see "One cell of a plate" in the compiler guide for the
 supported forms). Its cost is then what one iteration costs, independent of the
-number of groups. A predictor computed through a module function call, or read
-whole elsewhere in the program, is still computed for every index.
+number of groups. The same holds for an elementwise observation of a
+group-effect predictor `mu = a .+ b .* x .+ z[g]`, for a covariate completed
+from drawn entries (`c = log.(observed .+ mask .* vcat(free, grouped)[lookup])`)
+and read through a gather (`eta = … .+ c[pos]`), and for a location gathered
+from a sum of a predictor at two row indices
+(`lam = exp.(eta[r1]) .+ exp.(eta[r2])`). A predictor computed through a module
+function call, or read whole elsewhere in the program, is still computed for
+every index; so is such a value when it is one operand of a `vcat`, even when
+the cell reads only another operand's rows.
 When the queried observations read one shared cell (two outputs of one loop),
 each observation's cell runs that shared cell at the same index. An output of
 an earlier `@plate for` loop that the observation reads at its own index
