@@ -338,6 +338,31 @@ end
 @inline _cell_gather_row(index, row::Integer) = Int(only(index))
 @inline _cell_gather_row(index, rows::Vector{Int}) = Int[i for i in index]
 
+# A range view's range from its parts `(lo, hi)` or `(lo, step, hi)`, and its
+# full axes; the positions of its source that rows `rows` of the view read.
+@inline _cell_range(parts::Tuple) = (:)(parts...)
+@inline _cell_range_shape(parts::Tuple) = (Base.OneTo(length(_cell_range(parts))),)
+@inline _cell_range_rows(parts::Tuple, row::Integer) = Int(_cell_range(parts)[row])
+@inline _cell_range_rows(parts::Tuple, rows::Vector{Int}) =
+    let range = _cell_range(parts)
+        Int[range[row] for row in rows]
+    end
+
+# A reshape's full axes from its dimensions; the positions of its source
+# vector that rows `rows` of the reshaped array read: row `r` holds positions
+# `r + n * (j - 1)` for each trailing coordinate `j` (column-major), trailing
+# coordinate outer and row inner, so the rows reshape back in that order
+# (`_cell_reshape_window`).
+@inline _cell_dims_shape(dims::Tuple) = map(Base.OneTo, dims)
+@inline _cell_reshape_rows(dims::Tuple, row::Integer) =
+    Int[row + first(dims) * (j - 1) for j in 1:prod(Base.tail(dims); init = 1)]
+@inline _cell_reshape_rows(dims::Tuple, rows::Vector{Int}) =
+    Int[row + first(dims) * (j - 1) for j in 1:prod(Base.tail(dims); init = 1) for row in rows]
+@inline _cell_reshape_window(data, row::Integer, dims::Tuple) =
+    reshape(data, 1, Base.tail(dims)...)
+@inline _cell_reshape_window(data, rows::Vector{Int}, dims::Tuple) =
+    reshape(data, length(rows), Base.tail(dims)...)
+
 # ---------------------------------------------------------------- analysis
 
 # How a source recipe computes its value row by row. `roles[j]` is how input
@@ -347,7 +372,9 @@ end
 # operand read as a column `A[:, k...]`), `:factor_leaf` (the left factor of a
 # broadcast operand `A * w`, `w` input `gather_index[j]`), `:factor` (a
 # product's left factor), `:scalar` (an array of numbers read at literal
-# positions, `a[1]`, so whole), or `:whole`. `leaves` are the inputs whose
+# positions, `a[1]`, so whole), `:range_source` (the array a `view(A, lo:hi)`
+# or `A[lo:hi]` with literal bounds reads), `:reshape_source` (the vector a
+# `reshape(v, n, k...)` with literal dimensions reads), or `:whole`. `leaves` are the inputs whose
 # axes make up a pointwise value's full shape. `operand` is the input `v` of a
 # product `A * v` of exactly two inputs (0 otherwise): with a matrix `A` and a
 # vector `v`, its full axes are `(axes(A, 1),)`. `indices[j]` are every index
@@ -366,12 +393,16 @@ struct _CellForm
     indices::Vector{Vector{Int}}
     parts::Vector{Any}
     vias::Vector{Int}
+    # A `:range_view`'s literal range, or a `:reshape`'s literal dimensions.
+    literal::Any
 end
 _CellForm(kind, roles, gather_index, leaves, operand, indices = Vector{Int}[
         role in (:gather, :linear_gather) ? [gather_index[j]] : Int[]
         for (j, role) in enumerate(roles)], parts = Any[]) =
     _CellForm(kind, roles, gather_index, leaves, operand, indices, parts,
-        zeros(Int, length(roles)))
+        zeros(Int, length(roles)), nothing)
+_CellForm(kind, roles, gather_index, leaves, operand, indices, parts, vias) =
+    _CellForm(kind, roles, gather_index, leaves, operand, indices, parts, vias, nothing)
 
 # Expression heads that bind no names; any other head declines the rewrite.
 const _CELL_PLAIN_HEADS = (:call, :ref, :tuple, :., Symbol("'"), :vect, :hcat,
@@ -498,6 +529,7 @@ function _cell_form(r::Recipe; outlined::Bool = false)
     kind = :pointwise
     operand = 0
     parts = Any[]
+    literal = nothing
     if _cell_materialize(native)
         lazy = native.args[2]
         _cell_broadcasted(lazy) && lazy!(lazy) || return nothing
@@ -545,6 +577,24 @@ function _cell_form(r::Recipe; outlined::Bool = false)
             haskey(position, native.args[3]) && (operand = position[native.args[3]])
         all(arg -> _cell_whole_uses!(uses, arg, position, :whole), native.args[3:end]) ||
             return nothing
+    elseif (range_view = _cell_range_view(native, position, mod)) !== nothing
+        # `view(A, lo:hi)` or `A[lo:hi]`, the bounds integer literals or
+        # scalar inputs (RKPPL's packed parameter blocks): row `r` of it is
+        # row `(lo:hi)[r]` of `A`.
+        kind = :range_view
+        source, literal = range_view
+        push!(uses[source], :range_source)
+        push!(leaves, source)
+        foreach(part -> part isa Int || push!(uses[part.input], :whole), literal)
+    elseif (reshaped = _cell_reshape(native, position, mod)) !== nothing
+        # `reshape(v, n, k...)`, the dimensions integer literals or scalar
+        # inputs (RKPPL's matrix blocks): row `r` of it holds positions
+        # `r + n * (j - 1)` of `v`.
+        kind = :reshape
+        source, literal = reshaped
+        push!(uses[source], :reshape_source)
+        push!(leaves, source)
+        foreach(part -> part isa Int || push!(uses[part.input], :whole), literal)
     else
         return nothing
     end
@@ -563,7 +613,70 @@ function _cell_form(r::Recipe; outlined::Bool = false)
     gather_index = Int[isempty(indices[j]) ? get(products, j, 0) : first(indices[j])
                        for j in eachindex(params)]
     _CellForm(kind, roles, gather_index, kind in (:hcat, :vcat) ? leaves : unique!(leaves),
-        operand, indices, parts, zeros(Int, length(roles)))
+        operand, indices, parts, zeros(Int, length(roles)), literal)
+end
+
+# A literal of a range bound or a reshape dimension: an integer, or a scalar
+# input read whole, by its position (`_cell_literal_parts`).
+struct _CellInputLiteral
+    input::Int
+end
+
+# `view(A, lo:hi)` / `Base.view(A, lo:hi)` / `A[lo:hi]` with `A` a parameter
+# and the bounds (a step allowed) integer literals or inputs:
+# `(A's position, the range's parts)`.
+function _cell_range_view(native, position, mod)
+    native isa Expr || return nothing
+    if native.head === :ref && length(native.args) == 2
+        source, range = native.args
+    elseif native.head === :call && length(native.args) == 3 &&
+           _cell_resolves_to(native.args[1], mod, position, Base.view)
+        source, range = native.args[2], native.args[3]
+    else
+        return nothing
+    end
+    source isa Symbol && haskey(position, source) || return nothing
+    range isa Expr && range.head === :call && range.args[1] === :(:) &&
+        length(range.args) in (3, 4) || return nothing
+    parts = _cell_literal_parts(range.args[2:end], position, source)
+    parts === nothing && return nothing
+    (position[source], parts)
+end
+
+# `reshape(v, n, k...)` with `v` a parameter and the dimensions integer
+# literals or inputs: `(v's position, the dimensions' parts)`.
+function _cell_reshape(native, position, mod)
+    native isa Expr && native.head === :call && length(native.args) >= 4 &&
+        _cell_resolves_to(native.args[1], mod, position, Base.reshape) || return nothing
+    source = native.args[2]
+    source isa Symbol && haskey(position, source) || return nothing
+    parts = _cell_literal_parts(native.args[3:end], position, source)
+    parts === nothing && return nothing
+    (position[source], parts)
+end
+
+# Each of `exs` as an `Int` literal or the input it names (not `source`).
+function _cell_literal_parts(exs, position, source)
+    parts = Any[]
+    for ex in exs
+        if ex isa Int
+            push!(parts, ex)
+        elseif ex isa Symbol && haskey(position, ex) && ex !== source
+            push!(parts, _CellInputLiteral(position[ex]))
+        else
+            return nothing
+        end
+    end
+    Tuple(parts)
+end
+
+# Whether a callee, as the closure resolves it, is the function `f`.
+function _cell_resolves_to(callee, mod, position, f)
+    callee isa Symbol && haskey(position, callee) && return false
+    callee isa GlobalRef && return isdefined(callee.mod, callee.name) &&
+        getglobal(callee.mod, callee.name) === f
+    mod isa Module || return false
+    _kernel_resolve_binding(mod, callee) === f
 end
 
 # An identity `b::T = a` (a typed alias RK keeps as a recipe): its rows are
@@ -765,7 +878,8 @@ end
 
 # Whether a producer reads an input in `role` at its own rows.
 _cell_row_role(role) =
-    role in (:leaf, :gather, :linear_gather, :column, :factor_leaf, :factor, :part)
+    role in (:leaf, :gather, :linear_gather, :column, :factor_leaf, :factor, :part,
+             :range_source, :reshape_source)
 
 # `outlined` are the ids of the recipes a cell lowering outlined (`_cell_outline`);
 # `blocked`, when given, collects the ids of the producers whose values a reader
@@ -798,16 +912,18 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
         f === nothing || (forms[r.id] = f)
         f
     end
-    # A read needs the value's full shape unless it reads rows `v[I, j...]`
-    # or takes rows of a product's left factor.
-    needs_shape(role) = !(role in (:gather, :factor))
+    # A read needs the value's full shape unless it reads rows `v[I, j...]`,
+    # takes rows of a product's left factor, or reads positions of a range
+    # view's or a reshape's source.
+    needs_shape(role) = !(role in (:gather, :factor, :range_source, :reshape_source))
     # Full axes are known for pointwise values, identities, column reads,
-    # `hcat`s and `vcat`s, and for a product of two operands whose right
-    # operand is an array or a number (`_cell_product_shape`) and whose left
-    # factor's axes are known.
+    # `hcat`s, `vcat`s, range views and reshapes, and for a product of two
+    # operands whose right operand is an array or a number
+    # (`_cell_product_shape`) and whose left factor's axes are known.
     function shaped(cid)
         f = forms[only(producers[cid]).id]
-        f.kind in (:pointwise, :identity, :columns, :hcat, :vcat) && return true
+        f.kind in (:pointwise, :identity, :columns, :hcat, :vcat, :range_view, :reshape) &&
+            return true
         f.operand == 0 && return false
         inputs = only(producers[cid]).inputs
         factor = cidof(inputs[findfirst(==(:factor), f.roles)])
@@ -832,7 +948,11 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
                 static_type(r.inputs[paired]) <: Union{AbstractVecOrMat,Number} :
             role === :scalar ? static_type(input) <: AbstractArray{<:Number} :
             role === :via ? _cell_positions_type(static_type(input)) :
+            role in (:range_source, :reshape_source) ?
+                static_type(input) <: AbstractArray || form(cidof(input)) !== nothing :
             true
+        end && all(f.literal === nothing ? () : f.literal) do part
+            part isa Int || static_type(r.inputs[part.input]) <: Integer
         end
     end
     captures = Dict{Int,Dict{Int,Tuple{Int,Int}}}()
@@ -1088,6 +1208,10 @@ function _cell_shape!(e::_CellEmitter, cid::ValueId)
     end
     f.kind === :vcat && return e.shapes[cid] = _cell_bind!(e, :cell_shape,
         Expr(:call, _cell_ref(:_cell_vcat_shape), _cell_vcat_part_shapes!(e, r, f)))
+    f.kind === :range_view && return e.shapes[cid] = _cell_bind!(e, :cell_shape,
+        Expr(:call, _cell_ref(:_cell_range_shape), _cell_literal!(e, r, f)))
+    f.kind === :reshape && return e.shapes[cid] = _cell_bind!(e, :cell_shape,
+        Expr(:call, _cell_ref(:_cell_dims_shape), _cell_literal!(e, r, f)))
     parts = Any[_cell_part_shape!(e, r, f, j) for j in f.leaves]
     shape = f.kind === :columns ?
         Expr(:call, _cell_ref(:_cell_column_shape), only(parts)) :
@@ -1119,6 +1243,15 @@ function _cell_part_shape!(e::_CellEmitter, r::Recipe, f::_CellForm, j::Int)
     f.roles[j] === :factor_leaf || return shape
     w = e.names[canon_id(d.graph, r.inputs[f.gather_index[j]].id)]
     _cell_bind!(e, :cell_shape, Expr(:call, _cell_ref(:_cell_product_shape), shape, w))
+end
+
+# A form's literal (a range view's bounds, a reshape's dimensions) as a tuple
+# expression: each part its integer, or the name of the input it reads.
+function _cell_literal!(e::_CellEmitter, r::Recipe, f::_CellForm)
+    parts = map(f.literal) do part
+        part isa Int ? part : e.names[canon_id(e.pushdowns.graph, r.inputs[part.input].id)]
+    end
+    Expr(:tuple, parts...)
 end
 
 function _cell_operand_row!(e::_CellEmitter, cid::ValueId, row::Symbol)
@@ -1222,6 +1355,14 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
         elseif role === :factor
             reads[j] = U
             icid in d.pushed && _cell_request!(e, icid, U)
+        elseif role === :range_source
+            reads[j] = _cell_bind!(e, :cell_row,
+                Expr(:call, _cell_ref(:_cell_range_rows), _cell_literal!(e, r, f), U))
+            icid in d.pushed && _cell_request!(e, icid, reads[j])
+        elseif role === :reshape_source
+            reads[j] = _cell_bind!(e, :cell_row,
+                Expr(:call, _cell_ref(:_cell_reshape_rows), _cell_literal!(e, r, f), U))
+            icid in d.pushed && _cell_request!(e, icid, reads[j])
         end
     end
     e.reads[cid] = reads
@@ -1234,11 +1375,22 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
     f = d.forms[r.id]
     U = e.unions[cid]
     f.kind === :vcat && return _cell_vcat_window!(e, cid, r, f, U)
-    if f.kind in (:pointwise, :identity, :columns, :hcat)
+    if f.kind in (:pointwise, :identity, :columns, :hcat, :range_view, :reshape)
         push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row),
             _cell_shape!(e, cid), U))
     end
     reads = e.reads[cid]
+    if f.kind in (:range_view, :reshape)
+        # The source's positions, by the source's own window when it is pushed
+        # and as a bounds-checked view of its whole value otherwise.
+        j = only(f.leaves)
+        icid = canon_id(d.graph, r.inputs[j].id)
+        positions = icid in d.pushed ? _cell_take!(e, icid, reads[j]) :
+            Expr(:call, _cell_ref(:_cell_factor_rows), e.names[icid], reads[j])
+        f.kind === :range_view && return _cell_bind!(e, :cell_rows, positions)
+        return _cell_bind!(e, :cell_rows, Expr(:call, _cell_ref(:_cell_reshape_window),
+            positions, U, _cell_literal!(e, r, f)))
+    end
     args = Any[]
     for (j, input) in enumerate(r.inputs)
         icid = canon_id(d.graph, input.id)
