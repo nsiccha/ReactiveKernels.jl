@@ -840,10 +840,11 @@ end
 CompactCellSampler(ad, layout, observations, selected, slots) =
     CompactCellSampler(ad, layout, observations, selected, slots, NaN)
 
-# Point the slot map at `indices`. Validating and rewriting cost O(selection),
-# so they run only when the selection differs from the previous call's; a run
-# of calls over one selection pays one comparison each.
-function _select_compact_cells!(sampler::CompactCellSampler, base, active, indices)
+# Point the slot map of a `CompactCellSampler` or `CompactCellAD` at `indices`.
+# Validating and rewriting cost O(selection), so they run only when the
+# selection differs from the previous call's; a run of calls over one selection
+# pays one comparison each.
+function _select_compact_cells!(sampler, base, active, indices)
     _check_compact_cell_lengths(base, active, indices, sampler.layout.total)
     selected = sampler.selected
     _same_selection(selected, indices) && return nothing
@@ -885,26 +886,37 @@ per packed coordinate, mapping each to its position in the selection.
 function prepare_compact_cell_sampler(built, plan::StructuralPlan, observations,
         base0::AbstractVector{Float64}, indices0::AbstractVector{Int};
         backend, on_error = nothing, locality = nothing)
+    c = _prepare_compact_cell(:prepare_compact_cell_sampler, built, plan, observations,
+        base0, indices0; on_error, locality)
+    ad = Base.invokelatest(prepare_ad, c.kernel, backend, base0, c.active0, c.slots, 1;
+        active = :_ppl_cell_active)
+    CompactCellSampler(ad, built.layout, c.names, c.selected, c.slots)
+end
+
+# The cell kernel over the compact overlay that the compact cell sampler and
+# the compact cell derivative operators differentiate: its HAVE boundary is
+# `(base, active, slots, cell)`, with `active` the selected coordinates.
+function _prepare_compact_cell(caller::Symbol, built, plan::StructuralPlan, observations,
+        base0::AbstractVector{Float64}, indices0::AbstractVector{Int};
+        on_error = nothing, locality = nothing)
     layout = built.layout::LayoutTable
     _check_compact_cell_indices(base0, indices0, indices0, layout.total)
     active0 = base0[indices0]
     selected = Vector{Int}(indices0)
     slots = _compact_cell_slots(layout.total, selected)
     isbound(plan) || throw(ContractValidationError(
-        "[query] prepare_compact_cell_sampler requires a bound plan (bind_data first)"))
+        "[query] $caller requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
     names = observations isa Symbol ? (observations,) : Tuple(Symbol.(observations))
     isempty(names) && throw(ContractValidationError(
-        "[query] prepare_compact_cell_sampler needs at least one observation name"))
+        "[query] $caller needs at least one observation name"))
     _refuse_absent_cells(plan, names)
     spec, want = _cell_query_spec(built, plan, names; locality)
     have = _compact_overlay!(spec, plan)
     kernel = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
     end
-    ad = Base.invokelatest(prepare_ad, kernel, backend, base0, active0, slots, 1;
-        active = :_ppl_cell_active)
-    CompactCellSampler(ad, layout, names, selected, slots)
+    (; kernel, names, active0, selected, slots)
 end
 
 # Overlay a compact active vector on a read-only packed base in `spec`: the
@@ -943,6 +955,100 @@ function cell_value_and_gradient!(sampler::CompactCellSampler, gradient::Abstrac
     _select_compact_cells!(sampler, base, active, indices)
     return _latest_value(_cell_gradient!, sampler, gradient, base, active,
         sampler.slots, cell), gradient
+end
+
+"""
+    CompactCellAD
+
+A prepared ReactiveKernels derivative operator over one cell's log density,
+active over selected packed coordinates: the boundary of
+[`prepare_compact_cell_sampler`](@ref). Construct one with
+[`prepare_compact_cell_ad`](@ref). The ReactiveKernels derivative calls accept
+it in place of the prepared operator, with `base, active, indices, cell` (as
+[`cell_value_and_gradient!`](@ref) takes them) in place of the operator's
+point: `ad_gradient_and_hvp(q, tangents, base, active, indices, cell)`,
+`ad_gradient_hvp_and_third(q, tangents, base, active, indices, cell)` and the
+other verbs [`QueryAD`](@ref) takes. Directions, gradients and results are over
+the selection, in `indices` order. `base` and `indices` are read only. Each
+call carries the `Base.invokelatest` barrier. Not thread-safe (one per caller).
+"""
+mutable struct CompactCellAD{P,L,O}
+    const prepared::P
+    const layout::L
+    const observations::O
+    # The selection `slots` maps, as for `CompactCellSampler`.
+    const selected::Vector{Int}
+    const slots::Vector{Int32}
+end
+
+"""
+    prepare_compact_cell_ad(prepare_operator, built, plan, observations, base0, indices0,
+                            backend, exemplars...; on_error = nothing, locality = nothing)
+        -> CompactCellAD
+
+Prepare a ReactiveKernels derivative operator over one cell of the
+observations named in `observations`, differentiating with respect to the
+packed coordinates at the sorted, unique positions `indices0` over the
+read-only packed base `base0`, as [`prepare_compact_cell_sampler`](@ref) does
+for the gradient. `prepare_operator` is the ReactiveKernels preparation to
+apply (`prepare_ad`, `prepare_ad_pullback`, `prepare_ad_pushforward`,
+`prepare_ad_hvp` or `prepare_ad_third`), and `exemplars` are its arguments
+between the backend and the point: the directions for an HVP or a third-order
+derivative, each of the selection's length.
+
+```julia
+so = SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),   # reverse over forward
+                 AutoEnzyme(; mode = Enzyme.Forward))
+directions = ntuple(k -> onehot(k, m), m)                # m = length(indices0)
+h = prepare_compact_cell_ad(prepare_ad_hvp, built, plan, :y, u, indices0, so, directions)
+gradient, columns = ad_gradient_and_hvp(h, directions, u, active, indices, i)
+
+t = prepare_compact_cell_ad(prepare_ad_third, built, plan, :y, u, indices0,
+                            SecondOrder(so, AutoEnzyme(; mode = Enzyme.Forward)), (v,))
+gradient, (hv,), (tv,) = ad_gradient_hvp_and_third(t, (v,), u, active, indices, i)
+```
+
+With the `m` unit directions, the HVP columns are the cell's `m × m` Hessian
+block over its selection, from one call. `tv = ∇(vᵀ H v)` is the third-order
+contraction `D³ℓ[v, v, ·]` over the selection. At evaluation the selection may
+change, as for the compact sampler: the active vector and the selection keep
+the exemplar's type and length, and so do the directions. `locality` is as for
+[`prepare_cell_query`](@ref).
+"""
+function prepare_compact_cell_ad(prepare_operator, built, plan::StructuralPlan, observations,
+        base0::AbstractVector{Float64}, indices0::AbstractVector{Int}, backend, exemplars...;
+        on_error = nothing, locality = nothing)
+    c = _prepare_compact_cell(:prepare_compact_cell_ad, built, plan, observations,
+        base0, indices0; on_error, locality)
+    prepared = Base.invokelatest(prepare_operator, c.kernel, backend, exemplars...,
+        base0, c.active0, c.slots, 1; active = :_ppl_cell_active)
+    CompactCellAD(prepared, built.layout, c.names, c.selected, c.slots)
+end
+
+for verb in (:ad_gradient, :ad_value_and_gradient, :ad_value_and_gradient!,
+        :ad_pullback, :ad_value_and_pullback, :ad_value_and_pullback!,
+        :ad_pushforward, :ad_value_and_pushforward,
+        :ad_hvp, :ad_hvp!, :ad_gradient_and_hvp, :ad_gradient_and_hvp!,
+        :ad_third, :ad_third!, :ad_gradient_hvp_and_third,
+        :ad_gradient_hvp_and_third!)
+    @eval ReactiveKernels.$verb(q::CompactCellAD, args...) =
+        Base.invokelatest(_compact_cell_ad_call, ReactiveKernels.$verb, q, args...)
+end
+# The verb's trailing `base, active, indices, cell` become the operator's
+# point `base, active, slots, cell`; its leading arguments (outputs, tangents,
+# seeds) pass through.
+function _compact_cell_ad_call(verb::F, q::CompactCellAD, args::Vararg{Any,N}) where {F,N}
+    N >= 4 || throw(ContractValidationError(
+        "[query] a compact cell derivative takes `base, active, indices, cell` last"))
+    base, active, indices, cell = args[N - 3], args[N - 2], args[N - 1], args[N]
+    base isa AbstractVector{Float64} && active isa AbstractVector{Float64} &&
+        indices isa AbstractVector{Int} && cell isa Int || throw(ContractValidationError(
+        "[query] a compact cell derivative takes `base::AbstractVector{Float64}, " *
+        "active::AbstractVector{Float64}, indices::AbstractVector{Int}, cell::Int` last; got " *
+        join(summary.((base, active, indices, cell)), ", ")))
+    _select_compact_cells!(q, base, active, indices)
+    leading = ntuple(k -> args[k], Val(N - 4))
+    return verb(q.prepared, leading..., base, active, q.slots, cell)
 end
 
 function _stack_restored_draws(values)
