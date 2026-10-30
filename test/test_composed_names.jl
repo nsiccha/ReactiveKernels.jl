@@ -303,7 +303,8 @@ _names_identity_recipes(spec) =
         text = _names_text(names_arm)
         # The arm binds the endpoint's own values by name; their operations
         # are the callables the generated code embeds.
-        @test occursin(r"lp = \(__callables__\[\d+\]\)\(s, x\)", text)
+        # The lazy branch runs inline as an `if` over its own names.
+        @test occursin(r"lp = let var\"#s#op\d+\" = s, var\"#x#op\d+\" = x", text)
         # No generated binding name (an embedded operation's type may carry
         # its definition token).
         @test !occursin("var\"##", text)

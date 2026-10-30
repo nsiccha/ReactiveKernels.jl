@@ -71,20 +71,27 @@ const _INLINE_SCOPE_HEADS = (:->, :function, :let, :for, :generator, :comprehens
                              :typed_comprehension, :do, :try, :while)
 
 # The inline form of recipe `r` over `callargs` (the recipe at position `slot`
-# of the lowered recipes) and the source record the callables table keeps for
-# it (read only for its captures), or `nothing` where the recipe keeps its
-# call.
+# of the lowered recipes) and the entry the callables table keeps for it (its
+# record, or the metadata around one; a prepared kernel drops it unless a
+# plate lowering reads it), or `nothing` where the recipe keeps its call.
 function _inline_source_form(r::Recipe, callargs, slot::Int)
     op = r.op
     op isa _KernelSourceOp || return nothing
     kernel_sourceop_form(op) === :fused || return nothing
-    # A plain source inlines, and so does a fused source with data-only split
-    # nodes (`_KernelSplit`): a residual plan calls it whole, partial
-    # evaluation reads its parts from the plan's recipe, never from the slot,
-    # so the whole source is its code. A branch or a reduction keeps its
-    # operation: the plate lowerings read its parts through the slot
-    # (`getfield(__callables__[k], :f)`), and its source is not its code.
-    f = getfield(op, :f)
+    # A plain source inlines, and so do a fused source with data-only split
+    # nodes (`_KernelSplit`) and a lazy branch (`_KernelBranch`): a residual
+    # plan calls the whole source, and partial evaluation and the plate
+    # lowerings read the parts from the plan's recipe or from the metadata at
+    # the table position (`_recipe_table_entry`), never from this statement,
+    # so the whole source (`c ? a : b` as an `if`, as lazy) is its code. A
+    # generator sum (`_KernelReduction`) keeps its call: its source is one
+    # Julia owns.
+    # The table keeps the operation's whole entry at the position (the
+    # branch or split metadata, whose parts a plate lowering reads there);
+    # the source inlined is that of the whole call's record.
+    entry = getfield(op, :f)
+    f = entry
+    f isa _KernelBranch && (f = getfield(f, :call))
     f isa _KernelSplit && (f = getfield(f, :call))
     f isa _KernelSource || return nothing
     # A source whose closure Julia must own (a local function, a generator or
@@ -104,14 +111,14 @@ function _inline_source_form(r::Recipe, callargs, slot::Int)
     if _inline_literal(source)
         # A literal statement (`a::Float64 = -1.5`): the literal is its code.
         isempty(callargs) && isempty(captures) || return nothing
-        return source, f
+        return source, entry
     end
     if source isa Symbol
         # An alias (`y::Float64 = x`): the statement is its one argument.
         params = _recipe_source_names(r)
         length(params) == length(callargs) == 1 && only(params) === source || return nothing
         isempty(captures) || return nothing
-        return only(callargs), f
+        return only(callargs), entry
     end
     source isa Expr || return nothing
     params = _recipe_source_names(r)
@@ -151,8 +158,8 @@ function _inline_source_form(r::Recipe, callargs, slot::Int)
     for name in names
         push!(bindings, Expr(:(=), renamed[name], _inline_capture_expr(slot, name)))
     end
-    isempty(bindings) && return rewritten, f
-    Expr(:let, Expr(:block, bindings...), rewritten), f
+    isempty(bindings) && return rewritten, entry
+    Expr(:let, Expr(:block, bindings...), rewritten), entry
 end
 
 # `getfield(__constants__[k], :name)`: the captured value `name` of the source

@@ -293,7 +293,7 @@ argument. The source's own names are resolved in the module that defined it,
 as the rest of the body resolves globals. An operation whose code is not its
 source is called through its literal position in the callables tuple: a
 function that is a runtime value rather than a `const` binding (a closure), a
-plate, a scan, a branch, a generator sum, a source Julia must own, a source
+plate, a scan, a generator sum, a source Julia must own, a source
 that reads a module binding the module can reassign (its generated source
 function names the value the binding held when the kernel was defined), or a
 source outside the emitter's grammar. A

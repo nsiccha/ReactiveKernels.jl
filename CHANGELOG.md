@@ -44,7 +44,10 @@ are recorded in the git history only.
   callables table; a kernel of inline sources and exact calls has an empty
   table. The nonallocating and derivative-rule lowerings, which key on the
   table, keep every call in it as before. A scan's hoisted step statements
-  are found by their output locals, whatever their shape.
+  are found by their output locals, whatever their shape. A lazy branch at
+  the top level runs its whole source in the body too (`c ? a : b` as an
+  `if`); a plate cell's branch keeps its metadata at its position for the
+  lane lowerings.
 
 ## 0.1.26
 
