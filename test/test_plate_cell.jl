@@ -706,6 +706,114 @@ end
     @test dc ≈ _cell_central(c -> k(d..., merge(p, (; c0 = c))..., 3), p.c0) rtol = 1e-6
 end
 
+# A joint product's columns read through views, as RKPPL reads a
+# per-observation value's columns (`view(P, :, j)`, `_observation_slice_views`;
+# snag `column-read-lowe-24508269`): the view is the column read `P[:, j]`,
+# alone in RKPPL's `Base.Colon()` spelling and as a dotted operand, so the cell
+# computes the product and its `hcat` design at its row only. Read by two
+# views, `P` is computed at the union of their rows, so its `hcat` design's
+# data operands are row views beside a computed column, which native Enzyme
+# Reverse rejects in Base's `_typed_hcat`, as for any `hcat` read at several
+# rows (Enzyme snag `native-reverse-t-6d51cae6`; user principle
+# `enzyme-fixed-in-enzyme-everywhere`): that gradient is pinned broken.
+@kernel _cell_column_view(positions::Vector{Int}, y, one, x, W::Matrix{Float64},
+                          c0::Float64) = begin
+    c = x .- c0
+    X = hcat(one, c)
+    P = X * W
+    p2 = Base.view(P, Base.Colon(), 2)
+    eta = p2 .+ 0.5
+    loc = plate(positions) do i
+        exp(eta[i])
+    end
+    dens = plate(loc, y) do li, yi
+        -(yi - li)^2 / 2
+    end
+    return dens
+end
+
+@kernel _cell_column_view_inline(positions::Vector{Int}, y, one, x, W::Matrix{Float64},
+                                 c0::Float64) = begin
+    c = x .- c0
+    X = hcat(one, c)
+    P = X * W
+    eta = 0.5 .+ 2.0 .* view(P, :, 2)
+    loc = plate(positions) do i
+        exp(eta[i])
+    end
+    dens = plate(loc, y) do li, yi
+        -(yi - li)^2 / 2
+    end
+    return dens
+end
+
+@kernel _cell_column_views_two(positions::Vector{Int}, y, one, x, W::Matrix{Float64},
+                               c0::Float64) = begin
+    c = x .- c0
+    X = hcat(one, c)
+    P = X * W
+    p1 = Base.view(P, Base.Colon(), 1)
+    eta = p1 .+ 2.0 .* view(P, :, 2)
+    loc = plate(positions) do i
+        exp(eta[i])
+    end
+    dens = plate(loc, y) do li, yi
+        -(yi - li)^2 / 2
+    end
+    return dens
+end
+
+@testset "plate_cell: column views of a product read at the cell's row" begin
+    have = (:positions, :y, :one, :x, :W, :c0)
+    data(n) = (; positions = collect(1:n), y = cos.(1:n), one = ones(n),
+        x = collect(range(0.5, 1.5; length = n)))
+    W, c0 = [0.1 -0.2; -0.3 0.4], 0.9
+    d = data(9)
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    @testset "$label" for (label, spec, names, broken) in (
+            ("one view", _cell_column_view, ["c", "X", "P", "p2", "eta"], false),
+            ("an inline view", _cell_column_view_inline, ["c", "X", "P", "eta"], false),
+            ("two views", _cell_column_views_two, ["c", "X", "P", "p1", "eta"], true))
+        k = prepare(plate_cell(spec, :dens; index = :i); have = (have..., :i),
+            want = :dens_cell)
+        reference = prepare(spec; have, want = :dens)(d..., W, c0)
+        @test [k(d..., W, c0, i) for i in d.positions] ≈ reference
+        pushed = let lp = ReactiveKernels._lowering_plan(k.plan),
+                     cells = ReactiveKernels._cell_pushdowns(lp)
+            cells === nothing ? Set{String}() :
+                Set(String(cells.producer[c].outputs[1].name) for c in cells.pushed)
+        end
+        @test issubset(Set(names), pushed)
+        allocated(d) = (k(d..., W, c0, 2); @allocated k(d..., W, c0, 2))
+        @test allocated(data(12)) == allocated(data(120_000))
+        for i in (1, 6)
+            result = try
+                ad_value_and_gradient(prepare_ad(k, backend, d..., W, c0, i; active = :W),
+                    d..., W, c0, i)
+            catch err
+                broken || rethrow()
+                err
+            end
+            if result isa Exception
+                @test_broken !(result isa Exception)
+                @test nameof(typeof(result)) === :IllegalTypeAnalysisException
+                continue
+            end
+            broken && @test_broken !(result isa Exception)
+            value, dW = result
+            @test value ≈ reference[i]
+            for j in eachindex(W)
+                e = zero(W); e[j] = 1.0
+                @test dW[j] ≈ _cell_central(h -> k(d..., W .+ h .* e, c0, i), 0.0) rtol = 1e-6
+            end
+            broken && continue
+            _, dc = ad_value_and_gradient(
+                prepare_ad(k, backend, d..., W, c0, i; active = :c0), d..., W, c0, i)
+            @test dc ≈ _cell_central(c -> k(d..., W, c, i), c0) rtol = 1e-6
+        end
+    end
+end
+
 # An `hcat` design read at several rows of a cell: values run at those rows.
 # Native Enzyme Reverse rejects Base `hcat` of views beside dense arrays
 # (`IllegalTypeAnalysisException` in `_typed_hcat`), which those rows are. That

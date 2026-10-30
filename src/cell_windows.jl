@@ -19,8 +19,9 @@
 # - a dotted expression (one fused broadcast) whose operands are recipe
 #   inputs, numeric literals, gathers `A[I]` / `A[I, 1, ...]` of an input by
 #   an integer vector input `I` (integer literals after it), column reads
-#   `A[:, 1, ...]`, products `A * w` of two inputs, and literal-position reads
-#   `a[1]` of an array of numbers (read whole);
+#   `A[:, 1, ...]` (also as `view(A, :, 1, ...)`, the view RKPPL reads a
+#   per-observation value's column through), products `A * w` of two inputs,
+#   and literal-position reads `a[1]` of an array of numbers (read whole);
 # - such a gather on its own (also as `_readonly_gather(A, I)`, the view RKPPL
 #   reads a bare gathered definition through), and such a column read on its
 #   own;
@@ -440,6 +441,13 @@ function _cell_form(r::Recipe; outlined::Bool = false)
     # linear gather `A[I]`.
     readonly(ex) = ex isa Expr && ex.head === :call && length(ex.args) == 3 &&
         !(ex.args[1] in params) && _kernel_resolve_binding(mod, ex.args[1]) === _readonly_gather
+    # `view(A, :, k...)`, RKPPL's in-place column read of a per-observation
+    # value (`_observation_slice_views`): the column read `A[:, k...]`, as an
+    # `Expr(:ref)`, or `nothing`.
+    column_view(ex) = ex isa Expr && ex.head === :call && length(ex.args) >= 4 &&
+        !_native_callee_shadowed(ex.args[1], params) &&
+        _cell_binding(ex.args[1], mod) === Base.view && _cell_colon(ex.args[3], mod) ?
+        Expr(:ref, ex.args[2], :(:), ex.args[4:end]...) : nothing
     function gather!(ex)
         length(ex.args) >= 2 || return false
         source, index = ex.args[1], ex.args[2]
@@ -465,6 +473,8 @@ function _cell_form(r::Recipe; outlined::Bool = false)
         ex isa Union{Int,Float64,Bool} && return true
         ex isa Expr && ex.head === :ref && return gather!(ex) || column!(ex) || scalar!(ex)
         readonly(ex) && return gather!(Expr(:ref, ex.args[2], ex.args[3]))
+        column = column_view(ex)
+        column === nothing || return column!(column)
         ex isa Expr && ex.head === :call && return product!(ex)
         false
     end
@@ -498,6 +508,7 @@ function _cell_form(r::Recipe; outlined::Bool = false)
     kind = :pointwise
     operand = 0
     parts = Any[]
+    native = something(column_view(native), native)
     if _cell_materialize(native)
         lazy = native.args[2]
         _cell_broadcasted(lazy) && lazy!(lazy) || return nothing
@@ -633,6 +644,18 @@ function _cell_base_product(callee, mod, params)
     callee === :* && !(callee in params) && mod isa Module || return false
     isdefined(mod, :*) && getglobal(mod, :*) === Base.:*
 end
+
+# The value a callee or argument names in the closure's module: a `GlobalRef`,
+# or a bare or qualified name (`_kernel_resolve_binding`); `nothing` when it
+# names no binding.
+_cell_binding(ex::GlobalRef, mod) =
+    isdefined(ex.mod, ex.name) ? getglobal(ex.mod, ex.name) : nothing
+_cell_binding(ex, mod) = mod isa Module ? _kernel_resolve_binding(mod, ex) : nothing
+
+# Whether a call argument is the whole-axis index `:` (`Colon()`): the bare or
+# resolved `:`, or `Colon()` called with no arguments.
+_cell_colon(ex, mod) = _cell_binding(ex, mod) === Colon() ||
+    Meta.isexpr(ex, :call, 1) && _cell_binding(ex.args[1], mod) === Colon
 
 # The positions `k` of the cell's shared arguments that its body reads only as
 # `v[q]` or `v[w[q]]`, `q` the element of one batched argument `b` and `w`
