@@ -90,16 +90,17 @@ function _latest_source_fresh_model()
 
     # The public sampler promises a latest-world entry, including operations
     # inlined into a source body under the Normal observation plate. A bare
-    # raw query still uses its documented invokelatest call boundary.
+    # raw query still uses its documented invokelatest call boundary. Those
+    # operations' sources run in the generated body itself (ReactiveKernels'
+    # inline statement), so no separately generated source function is left
+    # in the table to carry a world mode; the sampler's entry is the
+    # latest-world boundary, checked below.
     nested = Core.eval(mod, :nested_endpoint)
     nested_plan = nested(; sigma = [1.0, 1.3, 0.7]) | (; y = [0.2, -0.3, 0.4])
     nested_built = build_kernel(nested_plan)
     nested_u = zeros(nested_built.layout.total)
     nested_raw = prepare_query(nested_built, nested_plan, :sampler)
-    embedded = _embedded_native_source_ops(nested_raw)
-    @test !isempty(embedded)
-    @test all(op -> op.f isa ReactiveKernels._KernelSourceFunction &&
-                    typeof(op.f).parameters[4] === Val{:latest_world}, embedded)
+    @test isempty(_embedded_native_source_ops(nested_raw))
     nested_q = prepare_sampler(nested_built, nested_plan, nested_u;
         backend = AutoEnzyme(; mode = Enzyme.Reverse))
     @test Base.invokelatest(nested_raw, nested_u) ≈ nested_q(nested_u)
