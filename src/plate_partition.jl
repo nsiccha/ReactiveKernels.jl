@@ -329,8 +329,8 @@ end
 
 # The linear positions a partition runs: a `Vector{Int}`, as given, or any
 # integer vector converted.
-@inline _partition_rows(rows::Vector{Int}) = rows
-@inline _partition_rows(rows::AbstractVector{<:Integer}) = Vector{Int}(rows)
+@inline _partition_rows(rows::Vector{Int}) = _cell_canonical_rows(rows)
+@inline _partition_rows(rows::AbstractVector{<:Integer}) = _cell_canonical_rows(Vector{Int}(rows))
 _partition_rows(rows) = throw(ArgumentError(
     "plate_partition: the partition's rows must be an integer vector of linear " *
     "positions in the plate's domain; got $(typeof(rows))"))

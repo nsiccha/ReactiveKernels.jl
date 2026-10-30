@@ -294,8 +294,8 @@ end
 
 # The rows a plate reads through its index array `w` at the positions `qs`
 # its index argument holds there (`v[w[q]]`): each `w[q]` is one row or several.
-@inline _cell_via_rows(w, qs) =
-    Int[row for q in qs for row in (vec(w)[q] isa Integer ? (vec(w)[q],) : vec(w)[q])]
+@inline _cell_via_rows(w, qs) = _cell_canonical_rows(
+    Int[row for q in qs for row in (vec(w)[q] isa Integer ? (vec(w)[q],) : vec(w)[q])])
 
 # The rows several gather indices read, joined in order.
 @inline _cell_gather_rows(ats...) =
@@ -304,8 +304,12 @@ end
 # The rows several readers ask a value for, each once, sorted: the value is
 # computed at them in this order and read back by bisection (`_cell_local_row`).
 @inline _cell_union_rows(ats...) = unique!(sort!(_cell_gather_rows(ats...)))
-# One reader's rows as the value's window holds them: the rows themselves when
-# sorted and unique, else sorted and deduplicated. One row is itself.
+# Rows as every request holds them: sorted and unique (the rows themselves when
+# they already are), so one reader's request is its value's window as is, and
+# a value asked for at the same row by many readers is computed once. Every
+# helper that derives rows from rows (leaf, gather, linear, via) returns them
+# this way; the partition's own rows come sorted from its table. One row is
+# itself.
 @inline _cell_canonical_rows(row::Integer) = row
 @inline function _cell_canonical_rows(rows::Vector{Int})
     for k in 2:length(rows)
@@ -319,10 +323,6 @@ end
 # (a dotted expression of numbers is a number) reads the same at every row.
 @inline _cell_take_rows(data::Number, ::Vector{Int}, rows) = data
 @inline _cell_take_rows(data::AbstractArray{<:Any,0}, ::Vector{Int}, rows) = data
-@inline function _cell_take_rows(data, union::Integer, row::Integer)
-    row == union || throw(BoundsError(union, row))
-    data
-end
 @inline function _cell_take_rows(data::AbstractArray{<:Any,N}, union::Vector{Int},
                                  rows) where {N}
     positions = Int[_cell_union_position(union, row)
@@ -363,7 +363,7 @@ end
 @inline _cell_leaf_row(shape::Tuple, row::Integer) =
     length(first(shape)) == 1 ? Int(first(first(shape))) : row
 @inline _cell_leaf_row(shape::Tuple, rows::Vector{Int}) =
-    Int[_cell_leaf_row(shape, row) for row in rows]
+    _cell_canonical_rows(Int[_cell_leaf_row(shape, row) for row in rows])
 
 # A row window still spans a plate's trailing axes. A multidimensional cell
 # selects its remaining coordinates from that window; a vector row is already
@@ -384,11 +384,11 @@ end
 @inline _cell_linear_row(shape::Tuple, q::Integer) =
     Int(first(Tuple(CartesianIndices(shape)[q])))
 @inline _cell_linear_row(shape::Tuple, q::AbstractVector{<:Integer}) =
-    Int[_cell_linear_row(shape, p) for p in q]
+    _cell_canonical_rows(Int[_cell_linear_row(shape, p) for p in q])
 
 # The index a row of a gather index holds, or the indices its rows hold.
 @inline _cell_gather_row(index, row::Integer) = Int(only(index))
-@inline _cell_gather_row(index, rows::Vector{Int}) = Int[i for i in index]
+@inline _cell_gather_row(index, rows::Vector{Int}) = _cell_canonical_rows(Int[i for i in index])
 
 # A range view's range from its parts `(lo, hi)` or `(lo, step, hi)`, and its
 # full axes; the positions of its source that rows `rows` of the view read.
@@ -1471,9 +1471,8 @@ end
 # The rows every request of `cid` reads: the one request, or their union.
 function _cell_union!(e::_CellEmitter, cid::ValueId)
     rows = e.requests[cid]
-    e.unions[cid] = _cell_bind!(e, :cell_rows_union, length(rows) == 1 ?
-        Expr(:call, _cell_ref(:_cell_canonical_rows), only(rows)) :
-        Expr(:call, _cell_ref(:_cell_union_rows), rows...))
+    e.unions[cid] = length(rows) == 1 ? only(rows) :
+        _cell_bind!(e, :cell_rows_union, Expr(:call, _cell_ref(:_cell_union_rows), rows...))
 end
 
 # The data of pushed value `cid` at rows `row`, one of its requests: its
