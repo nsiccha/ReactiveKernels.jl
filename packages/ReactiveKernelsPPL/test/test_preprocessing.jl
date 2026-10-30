@@ -6,6 +6,9 @@ using Test
 
 function _eval_recipe(expr, columns)
     mod = Module()
+    # A factor contrast reads its axis's labels as a data-only value, as the
+    # generated program's module does.
+    Core.eval(mod, :(using ReactiveKernelsPPL: _ppl_levels, _ppl_unique, _ppl_values))
     for (k, v) in columns
         Core.eval(mod, :($k = $v))
     end

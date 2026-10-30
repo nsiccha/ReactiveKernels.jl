@@ -18,7 +18,9 @@ spline/hsgp summands (the basis id), monotonic blocks (the increments
 key naming the contrast recipe), and matrix blocks (the matrix name).
 `elements` is meaningful for matrix blocks only (the matrix columns in
 order, `nothing` at intercept positions — per-element prior addresses
-and intercept flags for consumers that fan out).
+and intercept flags for consumers that fan out). `axis` is meaningful
+for factors only: the data-only graph expression of the map's labels
+(`_axis_labels_expr`), which the contrast reads instead of a literal.
 """
 struct DesignBlock
     kind::TermKind
@@ -28,9 +30,14 @@ struct DesignBlock
     labels::Vector{Symbol}
     levels::Vector
     elements::Vector{Union{Nothing,Symbol}}
+    axis::Any
 end
 
-# Non-matrix blocks carry no elements.
+# Non-factor blocks carry no axis; non-matrix blocks carry no elements.
+DesignBlock(kind::TermKind, column::Union{Nothing,Symbol}, addressee::Symbol,
+    width::Int, labels::Vector{Symbol}, levels::Vector,
+    elements::Vector{Union{Nothing,Symbol}}) =
+    DesignBlock(kind, column, addressee, width, labels, levels, elements, nothing)
 DesignBlock(kind::TermKind, column::Union{Nothing,Symbol}, addressee::Symbol,
     width::Int, labels::Vector{Symbol}, levels::Vector) =
     DesignBlock(kind, column, addressee, width, labels, levels,
@@ -104,7 +111,8 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps, matrices)
             "(bind_data fills these)"))
         labels = Symbol[Symbol(string(col) * "_" * string(level)) for level in m.values]
         return DesignBlock(FactorTerm, col, t.addressee, length(labels), labels,
-            collect(m.values))
+            collect(m.values), Union{Nothing,Symbol}[],
+            _axis_labels_expr(m.source, col, m.subset))
     elseif t.kind === MatrixTerm
         # A matrix term splices `X * view(coef, ...)` over its design
         # matrix: width K with per-element labels matching the affine
