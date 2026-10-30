@@ -52,7 +52,7 @@ const _RGF = ReactiveKernels.RuntimeGeneratedFunctions
     a1, b1 = gensym(:x), gensym(:x)
     a2, b2 = gensym(:x), gensym(:x)
     lowered(a, b) = Base.remove_linenums!(
-        :(function (__ops__, v); $a = v + 1; $b = $a * 2; return $b; end))
+        :(function (__constants__, __callables__, v); $a = v + 1; $b = $a * 2; return $b; end))
     e1, e2 = lowered(a1, b1), lowered(a2, b2)
     @test e1 != e2
     c1, c2 = ReactiveKernels._canonical_locals(e1), ReactiveKernels._canonical_locals(e2)

@@ -42,14 +42,6 @@ end
         @test !occursin("struct ", LOGEARN_HEIGHT_SOURCE)
         @test artifact.normal_object === normal
 
-        raw_generated = code_expr(artifact.kernel)
-        readable = sprint(
-            Base.show_unquoted,
-            ReactiveKernels._readable_expr(raw_generated, artifact.kernel);
-            context = :limit => false,
-        )
-        @test !occursin(r"__ops__\[\d+\]", readable)
-        @test !occursin(r"\boperation\(", readable)
     end
 
     @testset "constrain-only prunes the likelihood work" begin

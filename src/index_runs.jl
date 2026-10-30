@@ -197,13 +197,19 @@ function _lower_index_runs_native(body::Expr,ops)
     _index_run_visit(body) do ex
         ex.head===:(=) && length(ex.args)==2 && ex.args[1] isa Symbol || return
         lhs,rhs=ex.args
-        rhs isa Expr && rhs.head===:call || return
-        fn=rhs.args[1]
-        if fn isa Expr && fn.head===:ref && length(fn.args)==2 &&
-                fn.args[1]===_OPS_ARG && fn.args[2] isa Int
-            op=ops[fn.args[2]]
+        rhs isa Expr || return
+        constant=_constant_slot(rhs)
+        if constant!==nothing
+            # A bound constant's value, read from the constants table.
+            op=ops[constant]
             op isa _BoundConstant && op.value isa _IndexRunData &&
                 (policies[lhs]=op.value[4])
+            return
+        end
+        rhs.head===:call || return
+        slot=_callable_slot(rhs.args[1])
+        if slot!==nothing
+            op=ops[slot]
             op===_readonly_gather_runs && length(rhs.args)==4 &&
                 rhs.args[4] isa Symbol && (gathers[lhs]=rhs.args[4])
         elseif _index_run_call(rhs,GlobalRef(Base,:broadcastable),1)

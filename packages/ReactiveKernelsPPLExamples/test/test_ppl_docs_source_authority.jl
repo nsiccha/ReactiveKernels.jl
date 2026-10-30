@@ -123,15 +123,7 @@ end
             artifact.kernel, Tuple(artifact.inputs)...,
         )
         @test artifact.output == observed
-        raw_generated = code_expr(artifact.kernel)
-        readable_generated = sprint(
-            Base.show_unquoted,
-            ReactiveKernels._readable_expr(raw_generated, artifact.kernel);
-            context = :limit => false,
-        )
-        @test raw_generated === code_expr(artifact.kernel)
-        @test !occursin(r"__ops__\[\d+\]", readable_generated)
-        @test !occursin(r"\boperation\(", readable_generated)
+        @test code_expr(artifact.kernel) === code_expr(artifact.kernel)
     end
 
     make_source = read(joinpath(REPOSITORY_ROOT, "docs", "make.jl"), String)
@@ -144,9 +136,9 @@ end
     @test occursin("warnonly = false", make_source)
     @test !occursin("warnonly = Documenter.except(:eval_block)", make_source)
     @test occursin("assert_ppl_examples_executed!()", make_source)
-    @test occursin("ReactiveKernels._readable_expr", helper_source)
-    @test occursin("readable generated view retained an opaque operation slot",
-                   helper_source)
+    # The generated pane prints the compiled expression itself.
+    @test occursin("code_expr(artifact.kernel)", helper_source)
+    @test !occursin("_readable_expr", helper_source)
     for name in (
         :eight_schools_extraction,
         :sum_to_zero_logdensity,

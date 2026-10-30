@@ -725,8 +725,8 @@ _html_escape(value) = replace(
 
 # The ONE shared three-view UI (Raw input / Generated kernel / Compute DAG). Both
 # the stateless PreparedKernel path and the ReactiveProgram path emit through this;
-# there is no second renderer. `generated` is a display-only readable copy of the
-# compiled AST; `dag` is the exact `Plan` consumed by `visualize`.
+# there is no second renderer. `generated` is the compiled AST itself, the code
+# that runs (`code_expr`); `dag` is the exact `Plan` consumed by `visualize`.
 function _three_pane_blocks!(blocks, artifact_id, title, source, generated, dag::Plan)
     stable_id = _html_escape("example:" * string(artifact_id))
     push!(blocks, RawHTML("""
@@ -757,8 +757,8 @@ end
 Render executable documentation artifacts in the standard three-view UI. Each
 artifact supplies its exact raw source/call, the raw `code_expr` captured from
 the executed `PreparedKernel`, and the selected `Plan` consumed by `visualize`.
-The Generated kernel pane derives a readable, display-only expression from the
-raw AST and that plan without changing either artifact.
+The Generated kernel pane prints that expression as it is, with only its
+line-number nodes removed: the generated code is the readable code.
 """
 function render_examples(artifacts)
     blocks = Any[]

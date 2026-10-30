@@ -51,14 +51,6 @@ end
         @test occursin("k_s[i] / k_s[i+1]", PROPHET_LOGISTIC_TREND_REFERENCE_SOURCE)
         @test artifact.normal_object === normal
         @test artifact.laplace_object === laplace
-        raw_generated = code_expr(artifact.kernel)
-        readable = sprint(
-            Base.show_unquoted,
-            ReactiveKernels._readable_expr(raw_generated, artifact.kernel);
-            context = :limit => false,
-        )
-        @test !occursin(r"__ops__\[\d+\]", readable)
-        @test !occursin(r"\boperation\(", readable)
     end
 
     @testset "density decomposition vs the independent reference oracle" begin

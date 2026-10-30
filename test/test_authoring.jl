@@ -881,9 +881,9 @@ end
         @test prepare(scoped)(2.0, 10.0, 20.0, 30.0) == (17.0, 17.0)
 
         reserved = @kernel begin
-            __ops__::Int
+            __callables__::Int
             x::Int
-            __caches__::Int = __ops__ + x
+            __caches__::Int = __callables__ + x
             return __caches__
         end
         @test prepare(reserved)(2, 3) == 5
@@ -1984,7 +1984,7 @@ end
                 rhs = statement.args[2]
                 inlined = ReactiveKernels._inline_statement_call(rhs)
                 inlined === nothing || return (statement.args[1], inlined...)
-                (statement.args[1], ReactiveKernels._operation_slot(rhs.args[1]), rhs.args[2:end])
+                (statement.args[1], ReactiveKernels._callable_slot(rhs.args[1]), rhs.args[2:end])
             end
         end
         @test applications(code_expr(authored_plan)) == applications(code_expr(low_plan)) ==

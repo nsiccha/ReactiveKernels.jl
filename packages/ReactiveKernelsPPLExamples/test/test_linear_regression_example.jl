@@ -37,15 +37,6 @@ end
         @test !occursin("struct ", LINEAR_REGRESSION_SOURCE)
         @test artifact.normal_object === normal
 
-        # No opaque/fallback operation survives in the generated kernel.
-        raw_generated = code_expr(artifact.kernel)
-        readable = sprint(
-            Base.show_unquoted,
-            ReactiveKernels._readable_expr(raw_generated, artifact.kernel);
-            context = :limit => false,
-        )
-        @test !occursin(r"__ops__\[\d+\]", readable)
-        @test !occursin(r"\boperation\(", readable)
     end
 
     @testset "unconstrained -> constrained; Jacobian is optional" begin

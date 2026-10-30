@@ -136,8 +136,8 @@ function _step!(prog::_StepProgram, op, cache)
 end
 
 _step_call(j::Int, args...) = Expr(:call, _CACHE_APPLY_ARG,
-    Expr(:ref, _CACHES_ARG, j), Expr(:ref, _OPS_ARG, j), args...)
-_plain_call(j::Int, args...) = Expr(:call, Expr(:ref, _OPS_ARG, j), args...)
+    Expr(:ref, _CACHES_ARG, j), Expr(:ref, _CALLABLES_ARG, j), args...)
+_plain_call(j::Int, args...) = Expr(:call, Expr(:ref, _CALLABLES_ARG, j), args...)
 
 # --- static typing helpers --------------------------------------------------
 
@@ -717,14 +717,15 @@ function _nonalloc_argument_types(types::Dict{Symbol,Any}, callargs)
 end
 
 # One top-level statement of the native program. An operation call
-# `lhs = __ops__[i](callargs...)` takes the step rule; everything else (the
-# inlined plates, scans and cells, lane-filling sources, control flow) is kept.
+# `lhs = (__callables__[i])(callargs...)` takes the step rule; everything else
+# (a constant's read, the inlined plates, scans and cells, lane-filling
+# sources, control flow) is kept.
 function _nonalloc_statement!(prog::_StepProgram, recipes::Tuple,
                               types::Dict{Symbol,Any}, stmt)
     stmt isa Expr && stmt.head === :(=) && stmt.args[1] isa Symbol &&
         stmt.args[2] isa Expr && stmt.args[2].head === :call || return Any[stmt]
     call = stmt.args[2]
-    i = _operation_slot(call.args[1])
+    i = _callable_slot(call.args[1])
     i !== nothing && 1 <= i <= length(recipes) &&
         length(recipes[i].outputs) == 1 || return Any[stmt]
     _nonalloc_step!(prog, recipes[i], i, types, stmt.args[1],
@@ -799,7 +800,7 @@ end
 # its cache slots are typed for them, so annotate the HAVE signature with them.
 function _nonalloc_exact_signature(ast::Expr, have_types::Tuple)
     signature = ast.args[1]
-    ports = signature.args[4:end]
+    ports = signature.args[5:end]
     length(ports) == length(have_types) || throw(ArgumentError(
         "non-allocating preparation produced $(length(ports)) HAVE arguments " *
         "for $(length(have_types)) exemplar types"))
@@ -807,11 +808,11 @@ function _nonalloc_exact_signature(ast::Expr, have_types::Tuple)
         name = port isa Expr && port.head === :(::) ? port.args[1] : port
         Expr(:(::), name, T)
     end
-    Expr(:function, Expr(:tuple, signature.args[1:3]..., typed...), ast.args[2])
+    Expr(:function, Expr(:tuple, signature.args[1:4]..., typed...), ast.args[2])
 end
 
 """
-    _nonallocating_program(p::Plan; have_types, cache_apply, passes) -> (ast, ops, caches)
+    _nonallocating_program(p::Plan; have_types, cache_apply, passes) -> (ast, constants, callables, caches)
 
 The non-allocating step program of `p`. It is the native program ordinary
 `prepare` compiles (`_lower_with_ops` over `_lowering_plan(p)`): plate chains
@@ -827,8 +828,9 @@ sites are routed to kernel-owned storage:
 - a plate whose cells return arrays stays one cache step
   (`_nonalloc_nested_plates`).
 
-The operation table is the native one, so every inlined `__ops__[i]`
-reference keeps its meaning; decomposition steps and lane slots are appended.
+The tables are the native lowering's, so every inlined `__constants__[i]` and
+`__callables__[i]` reference keeps its meaning; decomposition steps and lane
+slots are appended to the callables and caches, which share one index.
 """
 function _nonallocating_program(p::Plan; have_types = nothing,
                                 cache_apply = nothing, passes = ())
@@ -846,7 +848,8 @@ function _nonallocating_program(p::Plan; have_types = nothing,
     # the step program keys its caches on the operation calls
     # (`_nonalloc_statement!`), so this emitter keeps every recipe's call in
     # the table rather than its inlined source.
-    ast, ops, recipes = _lower_with_ops(lowered; exemplar_types = have_types,
+    ast, constants, callables, recipes = _lower_with_ops(lowered;
+                                        exemplar_types = have_types,
                                         declare = false, recycle,
                                         pushdowns = true, outline = false,
                                         plate_element_types = true,
@@ -855,7 +858,7 @@ function _nonallocating_program(p::Plan; have_types = nothing,
     names = _varnames(lowered)
     types = Dict{Symbol,Any}(names[cid] => T for (cid, T) in values
                              if haskey(names, cid))
-    prog = _StepProgram(Any[ops...], Any[nothing for _ in ops], cache_apply)
+    prog = _StepProgram(Any[callables...], Any[nothing for _ in callables], cache_apply)
     body = Expr(:block)
     for stmt in ast.args[2].args
         append!(body.args, _nonalloc_statement!(prog, recipes, types, stmt))
@@ -870,8 +873,8 @@ function _nonallocating_program(p::Plan; have_types = nothing,
         push!(lanes, Expr(:(=), lane, Expr(:ref, _CACHES_ARG, j)))
     end
     prepend!(body.args, lanes)
-    ports = ast.args[1].args[2:1 + length(lowered.have)]
-    (Expr(:function, Expr(:tuple, _OPS_ARG, _CACHES_ARG, _CACHE_APPLY_ARG,
-                          ports...), body),
-     Tuple(prog.ops), Tuple(prog.caches))
+    ports = ast.args[1].args[3:2 + length(lowered.have)]
+    (Expr(:function, Expr(:tuple, _CONSTANTS_ARG, _CALLABLES_ARG, _CACHES_ARG,
+                          _CACHE_APPLY_ARG, ports...), body),
+     constants, Tuple(prog.ops), Tuple(prog.caches))
 end

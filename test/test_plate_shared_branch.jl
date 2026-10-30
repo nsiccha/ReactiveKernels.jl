@@ -155,7 +155,7 @@ _reference_normal(y, mu, sigma) =
 
 function _program(k)
     names = Dict{String,String}()
-    replace(string(ReactiveKernels._readable_expr(code_expr(k), k)),
+    replace(string(code_expr(k)),
             r"var\"[^\"]*\"" => m -> get!(names, m, "v$(length(names) + 1)"))
 end
 
@@ -184,8 +184,9 @@ end
 
     # The taken arm's scale logarithm runs once, above the cell loop.
     program = _program(k)
-    @test occursin("log(sigma)", program)
-    @test findfirst("log(sigma)", program).start < findfirst("for ", program).start
+    logcall = "(__callables__[$(findfirst(op -> op === log, k.callables))])("
+    @test occursin(logcall, program)
+    @test findfirst(logcall, program).start < findfirst("for ", program).start
     @test count("condition", program) == 1
     # The graph keeps the authored lazy branch; only the native loop changes.
     @test [(e.kind, e.depth) for e in recipe_inventory(k)

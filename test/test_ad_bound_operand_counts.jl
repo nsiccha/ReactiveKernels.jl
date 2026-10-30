@@ -59,13 +59,13 @@ end
     # An opaque body cannot rewrite literal slot loads. Its fallback boundary
     # still carries one operand per replaced slot, including numeric slots.
     data = (; weights = [2.0, 3.0])
-    ops = (ReactiveKernels._BoundConstant(data),
-           ReactiveKernels._BoundConstant(0.5))
-    body = (ops, q) -> sum(q .* ops[1]().weights) + ops[2]()
+    constants = (data, 0.5)
+    callables = (nothing, nothing)
+    body = (constants, callables, q) -> sum(q .* constants[1].weights) + constants[2]
     external, values = ReactiveKernels._externalize_bound_array_call(
-        body, ops; externalize_scalars = true)
+        body, constants, callables; externalize_scalars = true)
     @test values == (data, 0.5)
-    @test external([0.1, 0.2], values...) == body(ops, [0.1, 0.2])
+    @test external([0.1, 0.2], values...) == body(constants, callables, [0.1, 0.2])
 end
 
 # Kernels whose bound data leave many hidden operands, evaluated once at file

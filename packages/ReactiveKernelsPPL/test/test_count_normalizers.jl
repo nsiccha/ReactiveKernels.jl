@@ -24,9 +24,9 @@ const _CN_W = [1.0, 0.5, 2.0, 1.0, 1.5, 1.0, 0.25, 3.0]
 _cn_source(f) = string(kernel_expr(f.plan, f.built.layout))
 _cn_prepared(f) = sprint(print, Base.remove_linenums!(deepcopy(code_expr(f.kernel))))
 function _cn_folded(f, name)
-    slot = match(Regex("\\b$(name) = \\(__ops__\\[(\\d+)\\]\\)\\(\\)"), _cn_prepared(f))
+    slot = match(Regex("\\b$(name) = __constants__\\[(\\d+)\\]"), _cn_prepared(f))
     slot !== nothing &&
-        f.kernel.ops[parse(Int, slot.captures[1])] isa ReactiveKernels._BoundConstant
+        f.kernel.lowered_recipes[parse(Int, slot.captures[1])].op isa ReactiveKernels._BoundConstant
 end
 _cn_eta(u) = u[1] .+ u[2] .* _CN_X
 _cn_normal_prior(u) = sum(logpdf.(Normal(), u))

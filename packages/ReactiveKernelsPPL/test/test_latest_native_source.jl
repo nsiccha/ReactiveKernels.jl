@@ -15,7 +15,7 @@ function _embedded_native_source_ops(kernel)
             foreach(visit, ex.args)
         end
     end
-    for op in kernel.ops
+    for op in kernel.callables
         op isa ReactiveKernels._KernelSourceOp || continue
         op.f isa ReactiveKernels._KernelSourceFunction || continue
         for method in methods(op.f.f), statement in Base.uncompressed_ast(method).code

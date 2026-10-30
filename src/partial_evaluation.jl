@@ -15,8 +15,8 @@
 # `prepare_nonallocating`, AD preparation, plates, embedded composition,
 # compile backends — consumes it unchanged: the pass only transforms the
 # graph/AST layer and adds no new runtime object or calling convention. The
-# constants ride the existing `__ops__` tuple as nullary operations, so the
-# generated body keeps the established `(__ops__, args...)` ABI.
+# constants' values ride the generated function's constants tuple
+# (`__constants__[k]`, codegen.jl), which a rebinding replaces alone.
 #
 # Purity of the prefix is the ordinary recipe contract: effectful recipes
 # never enter a plan (planner.jl), so running the prefix at bind time cannot
@@ -658,9 +658,11 @@ end
 # declarations. This keeps nested calls concrete under Julia's recursive
 # inference heuristic.
 function _partial_arm_function(p::Plan)
-    ast, ops, _ = _lower_with_ops(p; inline_embedded = false, declare = true)
-    popfirst!(ast.args[1].args) # the operation tuple becomes a literal
-    bind(ex) = ex === :__ops__ ? QuoteNode(ops) :
+    ast, constants, callables, _ = _lower_with_ops(p; inline_embedded = false, declare = true)
+    popfirst!(ast.args[1].args) # the two tables become literals
+    popfirst!(ast.args[1].args)
+    bind(ex) = ex === _CONSTANTS_ARG ? QuoteNode(constants) :
+        ex === _CALLABLES_ARG ? QuoteNode(callables) :
         ex isa Expr && !(ex.head in (:quote, :inert)) ?
             Expr(ex.head, map(bind, ex.args)...) : ex
     ast.args[2] = bind(ast.args[2])
@@ -844,13 +846,13 @@ function _partial_cell_values!(result, batch)
     result
 end
 
-# A plate's cell kernel, and the length of its operation table from its
+# A plate's cell kernel, and the length of its callables table from its
 # type. Each read of a field of an unspecialized plate operation boxes a copy
-# of what it holds inline, so reading `op.kernel.ops` twice per plate copied
-# the cell kernel twice and its table once on every binding.
+# of what it holds inline, so reading `op.kernel.callables` twice per plate
+# copied the cell kernel twice and its table once on every binding.
 _plate_cell_kernel(@nospecialize(op::_AuthoredPlateOp)) = getfield(op, :kernel)
 _plate_cell_ops_length(@nospecialize(op::_AuthoredPlateOp)) =
-    fieldcount(fieldtype(fieldtype(typeof(op), :kernel), :ops))
+    fieldcount(fieldtype(fieldtype(typeof(op), :kernel), :callables))
 
 # Generated inner-kernel types are data to this structural pass. Specializing
 # on them recompiles the entire partial evaluator once per authored plate.
@@ -1025,8 +1027,9 @@ Base.@nospecializeinfer function _partial_plate_recipe(
                                       inner.want, cell_recipes)
         kernel = _prepare(scalar_plan,
             _lower_with_ops(scalar_plan; inline_embedded = false)...)
-        kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
-            kernel.plan, kernel.ast, Tuple(readable[r.id] for r in cell_recipes))
+        kernel = _prepared_kernel(kernel.f, kernel.constants, kernel.callables,
+            kernel.inputs, kernel.outputs, kernel.plan, kernel.ast,
+            Tuple(readable[r.id] for r in cell_recipes))
         axis_checks = Tuple(Tuple(position[index] for index in group)
                             for group in op.axis_checks)
         replacement = _AuthoredPlateOp{typeof(kernel),Tuple(atomic)}(
@@ -1324,14 +1327,14 @@ Base.@nospecializeinfer function _partition_plate_recipe(
             arm_plan = _partial_subplan(inner, inner.have, inner.want, arm_recipes)
             prepared = _prepare(arm_plan,
                 _lower_with_ops(arm_plan; inline_embedded = false)...)
-            _prepared_kernel(prepared.f, prepared.ops, prepared.inputs,
-                prepared.outputs, prepared.plan, prepared.ast,
+            _prepared_kernel(prepared.f, prepared.constants, prepared.callables,
+                prepared.inputs, prepared.outputs, prepared.plan, prepared.ast,
                 Tuple(readable[r.id] for r in arm_recipes))
         else
             prepared = _prepare(spliced.plan,
                 _lower_with_ops(spliced.plan; inline_embedded = false)...)
-            _prepared_kernel(prepared.f, prepared.ops, prepared.inputs,
-                prepared.outputs, prepared.plan, prepared.ast,
+            _prepared_kernel(prepared.f, prepared.constants, prepared.callables,
+                prepared.inputs, prepared.outputs, prepared.plan, prepared.ast,
                 Tuple(get(readable, r.id, source) for (r, source) in
                       zip(prepared.plan.recipes, prepared.lowered_recipes)))
         end
@@ -1889,13 +1892,28 @@ function _plate_analysis(r::_PlateRewrites, key::_PlateAnalysisKey, recipe::Reci
                  _partial_plate_analysis(key, recipe, op, excluded, bound, bound_types))
 end
 
-# A table (an operation table, a recipe list) without one binding's
+# A table (a constants table, a recipe list) without one binding's
 # constants: `fixed` holds every other entry and `slots[j]` the position of
 # constant `j`. Each constant must occur exactly once, in order, and no other
 # entry may be one of them, so the table holds nothing of that binding.
 struct _RebindTable
     fixed::Vector{Any}
     slots::Vector{Int}
+end
+
+# A prepared kernel's constants table without its binding's values: the
+# constant recipes' positions are `slots` (those of the recipes in the lowered
+# recipes, `_lowering_tables`), each holding that recipe's value. `nothing`
+# where a position holds another value.
+function _constants_rebind_table(@nospecialize(kernel::PreparedKernel), slots::Vector{Int},
+                                 constants::Vector{Recipe})
+    table = getfield(kernel, :constants)
+    fixed = Any[table...]
+    for (j, k) in enumerate(slots)
+        fixed[k] === constants[j].op.value || return nothing
+        fixed[k] = nothing
+    end
+    _RebindTable(fixed, slots)
 end
 
 function _rebind_table(@nospecialize(table), constants::Vector)
@@ -1921,35 +1939,34 @@ function _rebound_table(fixed::Vector{Any}, slots::Vector{Int}, constants::Vecto
     table
 end
 
-# The fixed entries of a kept operation table as this process executes them
-# (`_execution_source`), so a rebinding assembles its kernel without executing
-# the whole table again: 0.26 ms per binding of a simulator graph's 365
-# entries (snag per-binding-resi-990b18ab). A table kept from a binding made in
-# this process is already the execution copy (`_prepared_kernel` made it). One
-# kept while a package image is generated can hold a source function whose
-# compiled companion is visible only once the image is loaded
+# A kept callables table as this process executes it (`_execution_source`),
+# so a rebinding assembles its kernel without executing the whole table
+# again: 0.26 ms per binding of a simulator graph's 365 entries (snag
+# per-binding-resi-990b18ab). A table kept from a binding made in this process
+# is already the execution copy (`_prepared_kernel` made it). One kept while a
+# package image is generated can hold a source function whose compiled
+# companion is visible only once the image is loaded
 # (`_PrecompileWarmFunction`), so it is executed at the first rebinding of
 # each process that loads the image; no execution copy is kept while an image
-# is generated. A constant needs none: `_execution_source` keeps a
-# `_BoundConstant` as it is.
+# is generated. The constants table needs none: a rebinding replaces it.
 struct _ExecutableTable
-    entries::Base.RefValue{Any}  # the executed `fixed`, or `nothing`
+    entries::Base.RefValue{Any}  # the executed callables, or `nothing`
 end
 _generating_image() = ccall(:jl_generating_output, Cint, ()) != 0
-_ExecutableTable(t::_RebindTable) =
-    _ExecutableTable(Ref{Any}(_generating_image() ? nothing : t.fixed))
+_ExecutableTable(callables::Vector{Any}) =
+    _ExecutableTable(Ref{Any}(_generating_image() ? nothing : callables))
 
-function _executable_entries(e::_ExecutableTable, t::_RebindTable)
+function _executable_entries(e::_ExecutableTable, callables::Vector{Any})
     entries = e.entries[]
     entries === nothing || return entries::Vector{Any}
-    entries = Any[_execution_source(x) for x in t.fixed]
+    entries = Any[_execution_source(x) for x in callables]
     _generating_image() || (e.entries[] = entries)
     entries
 end
 
-# The execution copy of `t` with another binding's constants in their slots.
-_rebound_executable(e::_ExecutableTable, t::_RebindTable, constants::Vector) =
-    Tuple(_rebound_table(_executable_entries(e, t), t.slots, constants))
+# The kept callables as this process executes them, as a kernel's table.
+_executable_callables(e::_ExecutableTable, callables::Vector{Any}) =
+    Tuple(_executable_entries(e, callables))
 
 # A plan's per-binding constant recipes, in plan order: the hoisted constants
 # and the values the inner-plate pass cached.
@@ -1959,10 +1976,10 @@ _bound_constants(p::Plan) = Recipe[r for r in p.recipes if r.op isa _BoundConsta
 # of a template's kernel keeps, per vectorize key, the position-batched
 # programs of the first binding it lowered, without that binding's constants
 # (`_RebindReplicated` and friends, bound_vectorize.jl); a later binding's
-# `vectorize` places its own constants in the leading `constants` slots of
-# their operation tables instead of lowering and compiling them again.
-# `slots` are the positions of the kernel's constants in its operation table
-# and readable recipes.
+# `vectorize` places its own constants in their positions of the products'
+# constants tables instead of lowering and compiling them again. `slots` are
+# the positions of the kernel's constants in its constants table and lowered
+# recipes.
 struct _BoundVectorizations
     slots::Vector{Int}
     products::Dict{Any,Any}
@@ -1973,13 +1990,14 @@ _BoundVectorizations(slots::Vector{Int}) =
 
 struct _BoundTemplate
     f::Any                # the compiled residual callable, shared by every binding
-    ops::_RebindTable     # the operation table without the constants
+    constants::_RebindTable # the constants table without the binding's values
+    callables::Vector{Any}  # the callables table, the same for every binding
     inputs::Tuple
     outputs::Tuple
     ast::Expr
     lowered::_RebindTable # the readable recipes without the constants
     vectorizations::_BoundVectorizations
-    executable::_ExecutableTable # `ops` as this process executes it
+    executable::_ExecutableTable # `callables` as this process executes them
 end
 
 # A class's template before its first binding the inner-plate pass left alone.
@@ -2071,25 +2089,27 @@ function _bound_build(entry::_BoundEntry, @nospecialize(residual),
     plan = _bound_residual_plan(entry, residual, hoisted)
     kernel = prepare(plan; passes = passes)
     constants = _bound_constants(plan)
-    # Rebinding replaces the constants' operation-table entries and readable
-    # recipes, so each must fill one slot of both, the same one, and no other
-    # entry may hold it.
+    # Rebinding replaces the constants' values in the constants table and
+    # their readable recipes, so each must fill one position of the recipes,
+    # and no other entry may hold it; the constants table holds the value at
+    # that same position (`_lowering_tables`).
     lowered = _rebind_table(kernel.lowered_recipes, constants)
     lowered === nothing && return nothing, kernel
-    ops = _rebind_table(kernel.ops, Any[c.op for c in constants])
-    ops !== nothing && ops.slots == lowered.slots || return nothing, kernel
+    table = _constants_rebind_table(kernel, lowered.slots, constants)
+    table === nothing && return nothing, kernel
     vectorizations = _BoundVectorizations(lowered.slots)
     kernel = _rebinding_kernel(kernel, vectorizations)
     isempty(constants) && return kernel, kernel
-    _BoundTemplate(kernel.f, ops, kernel.inputs, kernel.outputs, kernel.ast, lowered,
-                   vectorizations, _ExecutableTable(ops)), kernel
+    callables = Any[kernel.callables...]
+    _BoundTemplate(kernel.f, table, callables, kernel.inputs, kernel.outputs, kernel.ast,
+                   lowered, vectorizations, _ExecutableTable(callables)), kernel
 end
 
 # `kernel`, linked to the vectorizations its template's bindings share.
 function _rebinding_kernel(@nospecialize(kernel::PreparedKernel),
                            vectorizations::_BoundVectorizations)
-    _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs, kernel.plan,
-                     kernel.ast, kernel.lowered_recipes;
+    _prepared_kernel(kernel.f, kernel.constants, kernel.callables, kernel.inputs,
+                     kernel.outputs, kernel.plan, kernel.ast, kernel.lowered_recipes;
                      exact_signature = _exact_signature(kernel),
                      rebinding = vectorizations)
 end
@@ -2116,10 +2136,12 @@ function _bound_rebind(entry::_BoundEntry, template::_BoundTemplate,
     # it does not, and the ordinary preparation is the safe answer.
     length(constants) == length(template.lowered.slots) ||
         return prepare(plan; passes = passes)
-    ops = _rebound_executable(template.executable, template.ops, Any[c.op for c in constants])
+    table = Tuple(_rebound_table(template.constants, Any[c.op.value for c in constants]))
+    callables = _executable_callables(template.executable, template.callables)
     lowered = _rebound_table(template.lowered, constants)
-    _executed_prepared_kernel(template.f, ops, template.inputs, template.outputs, plan,
-                              template.ast, Tuple(lowered), Nothing, template.vectorizations)
+    _executed_prepared_kernel(template.f, table, callables, template.inputs,
+                              template.outputs, plan, template.ast, Tuple(lowered),
+                              Nothing, template.vectorizations)
 end
 
 # Normalize the public `bound` kwarg — one `Value => data` pair or an

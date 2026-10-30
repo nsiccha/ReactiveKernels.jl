@@ -1687,7 +1687,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
             e.runtime_recipes[1:offset], r.op, args, d.plates[r.id], window, nothing)
         return window
     end
-    call = Expr(:call, Expr(:ref, _OPS_ARG, d.slots[r.id]), args...)
+    call = _slot_call_expr(r, d.slots[r.id], args)
     f.kind === :identity &&
         (call = Expr(:call, GlobalRef(Base, :convert), valtype(only(r.outputs)), call))
     _cell_bind!(e, :cell_rows, call)

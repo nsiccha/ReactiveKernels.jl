@@ -63,14 +63,6 @@ end
         @test !occursin("struct ", ACCEL_SPLINES_SOURCE)
         @test artifact.normal_object === normal
         @test artifact.student_t_object === student_t
-        raw_generated = code_expr(artifact.kernel)
-        readable = sprint(
-            Base.show_unquoted,
-            ReactiveKernels._readable_expr(raw_generated, artifact.kernel);
-            context = :limit => false,
-        )
-        @test !occursin(r"__ops__\[\d+\]", readable)
-        @test !occursin(r"\boperation\(", readable)
     end
 
     @testset "density decomposition vs the independent reference oracle" begin

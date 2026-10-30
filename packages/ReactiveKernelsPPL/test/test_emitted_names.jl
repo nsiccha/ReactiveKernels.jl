@@ -25,11 +25,12 @@ const g = [1, 2, 1, 2]
 _text(bound) = sprint(print,
     Base.remove_linenums!(deepcopy(kernel_expr(bound, assign_layout(bound)))))
 # A planned statement runs its operation's source in the body, binding the
-# slot and the source's parameters first (`lhs = let var"#opN" = __ops__[N],
-# var"#p#opN" = arg, …`); an operation without a source stays a call
-# (`lhs = (__ops__[N])(arg, …)`). `lhs` is a regular-expression pattern.
+# source's parameters first (`lhs = let var"#p#opN" = arg, …`); an operation
+# without a source stays a call (`lhs = (__callables__[N])(arg, …)`), a bound
+# constant a read (`lhs = __constants__[N]`). `lhs` is a regular-expression
+# pattern.
 _slot_statement(lhs::AbstractString) = Regex("\\n\\s*" * lhs *
-    " = (let var\"#op\\d+\" = __ops__\\[\\d+\\]|\\(__ops__\\[\\d+\\]\\))")
+    " = (let var\"#[^\"]+#op\\d+\" = |\\(__callables__\\[\\d+\\]\\)|__constants__\\[\\d+\\])")
 _bound(ast, data; mod = Fns) =
     bind_data(lower_rkppl(ast, data; conditioned = (:y,), mod), data)
 
@@ -74,7 +75,7 @@ end
         @test occursin("(normal(loc, y_scale)).logpdf(y)", text)
         @test !occursin("y_eta = loc", text)
         @test !occursin("_ppl_lp_y_eta", text)
-        @test occursin("_ppl_pw_y_resp = (__ops__[",
+        @test occursin("_ppl_pw_y_resp = (__callables__[",
             string(code_expr(build_kernel(bound).spec)))
         @test !occursin(r"_ppl_c\d", text)
     end
@@ -371,7 +372,7 @@ end
     # The planned expression keeps the generated operation slots, each bound
     # to its actual arguments, and runs their sources in place.
     @test occursin(_slot_statement("var\"[^\"]+\\.fall\\.xi_max\""), code)
-    @test occursin(r"shift = let var\"#op\d+\" = __ops__\[\d+\], var\"#\w+#op\d+\" = base, var\"#\w+#op\d+\" = var\"shift\.s\"", code)
+    @test occursin(r"shift = let var\"#\w+#op\d+\" = base, var\"#\w+#op\d+\" = var\"shift\.s\"", code)
     @test !occursin("identity(", code)
     @test occursin("var\"##plate_argument#", code)
 
@@ -463,7 +464,7 @@ end
         for want in wants
             @test occursin(want, code)
         end
-        @test occursin("__ops__", code)
+        @test occursin("__callables__", code)
         layout = built.layout
         u = collect(range(-0.3, 0.4; length = layout.total))
         sq = prepare_sampler(built, bound, u; backend = BACKEND)

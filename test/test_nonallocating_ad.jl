@@ -51,10 +51,10 @@ naad_spec = @kernel naad_model(unconstrained, X, Cf, cterm) = begin
     return posterior
 end
 
-# The differentiated program's operation table and hidden operands. Bound and
+# The differentiated program's constants table and hidden operands. Bound and
 # folded values leave the table as placeholders and cross as the pack.
-naad_ad_ops(prepared) = prepared.call.ops === nothing ?
-    prepared.call.f.call.ops : prepared.call.ops
+naad_ad_constants(prepared) = prepared.call.constants === nothing ?
+    prepared.call.f.call.constants : prepared.call.constants
 naad_hidden(prepared) =
     ReactiveKernels._ad_hidden_operands(prepared.call, prepared.external_values)
 
@@ -158,7 +158,7 @@ end
         # cannot prove readonly when `X` is a field of the differentiated
         # callable (EnzymeMutabilityException). The bound values instead form
         # one named `Constant` pack before the owned caches.
-        @test prepna.call.ops === nothing
+        @test prepna.call.constants === nothing
         @test keys(first(prepna.external_values)) == (:X, :Cf, :cterm)
         @test naad_hidden(prepna) == (X, Cf, cterm)
         annotated = prepare_ad(kbna, AutoEnzyme(mode = Enzyme.Reverse,
@@ -318,7 +318,7 @@ end
                                      bound = (; y))
         # Vacuity guard: without partitioning there are no lane gathers and
         # this test would pass while exercising nothing.
-        @test any(op -> op isa ReactiveKernels._LaneGather, kbna.ops)
+        @test any(op -> op isa ReactiveKernels._LaneGather, kbna.callables)
         kb = prepare(arith_partition_naad; have = (:x, :y), want = :total,
                      bound = (; y))
         prepna = prepare_ad(kbna, NA_AD_BACKEND, x; active = :x)
@@ -387,7 +387,7 @@ end
     kbna = prepare_nonallocating(spec; have = (:m, :v, :a), want = :s,
                                  bound = (; m, v))
     matmul_step = findfirst(
-        op -> op isa ReactiveKernels._MatMulStep, kbna.ops)
+        op -> op isa ReactiveKernels._MatMulStep, kbna.callables)
     @test matmul_step !== nothing
     prep = prepare_ad(kb, NA_AD_BACKEND, a0; active = :a)
     prepna = prepare_ad(kbna, NA_AD_BACKEND, a0; active = :a)
@@ -456,8 +456,8 @@ end
         @test m.products[] == 1
         folded = only(value for value in naad_hidden(prepared)
             if value isa AbstractVector && value == product)
-        matmul = only(i for i in eachindex(kernel.ops)
-            if kernel.ops[i] isa ReactiveKernels._MatMulStep)
+        matmul = only(i for i in eachindex(kernel.callables)
+            if kernel.callables[i] isa ReactiveKernels._MatMulStep)
         @test folded == product
         @test folded !== kernel.caches[matmul][]
         preparation = prepared.preparation
@@ -519,7 +519,7 @@ end
     prepna = prepare_ad(kbna, NA_AD_BACKEND, v, a0; active = :a)
     # The product sees the unbound port, so nothing folds: the bound matrix
     # is the only hidden operand.
-    @test length(naad_ad_ops(prepna)) == length(kbna.ops)
+    @test length(naad_ad_constants(prepna)) == length(kbna.constants)
     @test naad_hidden(prepna) == (m,)
     gna = similar(a0)
     va, _ = ad_value_and_gradient!(prepna, gna, v, a0)
@@ -553,8 +553,8 @@ end
                                  bound = (; b = b0))
     # Vacuity: the arithmetic must decompose to bare `+`/`-` steps (not the
     # fused fallback), or this test exercises nothing.
-    @test any(op -> op === +, kbna.ops)
-    @test any(op -> op === -, kbna.ops)
+    @test any(op -> op === +, kbna.callables)
+    @test any(op -> op === -, kbna.callables)
     prep = prepare_ad(kb, NA_AD_BACKEND, a0; active = :a)
     prepna = prepare_ad(kbna, NA_AD_BACKEND, a0; active = :a)
     @test any(op -> op === +, naad_ad_ops(prepna))
@@ -577,7 +577,7 @@ end
     kb = prepare(spec; have = (:a, :d), want = :s, bound = (; d = d0))
     kbna = prepare_nonallocating(spec; have = (:a, :d), want = :s,
                                  bound = (; d = d0))
-    @test any(op -> op isa ReactiveKernels._MaterializeStep, kbna.ops)
+    @test any(op -> op isa ReactiveKernels._MaterializeStep, kbna.callables)
     prep = prepare_ad(kb, NA_AD_BACKEND, a0; active = :a)
     prepna = prepare_ad(kbna, NA_AD_BACKEND, a0; active = :a)
     @test any(op -> op isa ReactiveKernels._MaterializeStep, naad_ad_ops(prepna))
@@ -598,7 +598,7 @@ end
     matkb = prepare(matspec; have = (:A, :B), want = :S, bound = (; B = B0))
     matkbna = prepare_nonallocating(matspec; have = (:A, :B), want = :S,
                                     bound = (; B = B0))
-    @test any(op -> op === +, matkbna.ops)
+    @test any(op -> op === +, matkbna.callables)
     matprep = prepare_ad(matkb, NA_AD_BACKEND, A0; active = :A)
     matprepna = prepare_ad(matkbna, NA_AD_BACKEND, A0; active = :A)
     gmat, gmatna = similar(A0), similar(A0)
@@ -617,7 +617,7 @@ end
                        bound = (; D = B0))
     dotmatkbna = prepare_nonallocating(dotmatspec; have = (:A, :D),
                                        want = :S, bound = (; D = B0))
-    @test any(op -> op isa ReactiveKernels._MaterializeStep, dotmatkbna.ops)
+    @test any(op -> op isa ReactiveKernels._MaterializeStep, dotmatkbna.callables)
     dotmatprep = prepare_ad(dotmatkb, NA_AD_BACKEND, A0; active = :A)
     dotmatprepna = prepare_ad(dotmatkbna, NA_AD_BACKEND, A0; active = :A)
     gdot, gdotna = similar(A0), similar(A0)

@@ -693,10 +693,10 @@ once here and holds it itself.
 """
 function partition_footprint_kernel(kernel::PreparedKernel)
     p = _lowering_plan(kernel.plan)
-    ast, ops, recipes = _sharing_cell_plans() do
+    ast, constants, callables, recipes = _sharing_cell_plans() do
         _lower_with_ops(p; footprint = true)
     end
-    _prepare(p, ast, ops, recipes)
+    _prepare(p, ast, constants, _native_table(ast, callables), recipes)
 end
 
 # ----------------------------------------------------------- separability

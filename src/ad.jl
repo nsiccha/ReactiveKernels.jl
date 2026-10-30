@@ -118,24 +118,27 @@ end
 # Plated and embedding PreparedKernels carry their generated native body in an
 # `_ArrayFunction`. AD differentiates that exact native callable and its live
 # operations. No AD-specific kernel or AST is generated.
-struct _ADNativeKernelCall{I,F,O}
+struct _ADNativeKernelCall{I,F,C,O}
     native::F
-    ops::O
+    constants::C
+    callables::O
 end
 
 # The differentiated call for a `NonAllocatingKernel`: the elided unbound step
 # program (`_ad_na_program`) with the operation table and cache driver held
-# constant. HAVE-free elided steps are folded to appended `_BoundConstant`
-# loads, so the gradient never recomputes bound-data-only work. The owned AD
+# constant. HAVE-free elided steps are folded to appended constants, so the
+# gradient never recomputes bound-data-only work. The owned AD
 # caches arrive as the trailing `Cache` context, so the backend shadows them
 # itself; the kernel's borrowed primal caches are never exposed to
-# differentiation. When the table holds bound or folded values (`H`), `f` is
-# the packed externalized program (`_externalize_bound_array_call`), `ops` is
-# `nothing`, and those values arrive as one hidden `Constant` pack just before
-# the caches, exactly as the dataflow call receives its bound operands.
-struct _ADNonAllocatingKernelCall{I,H,F,O,A}
+# differentiation. When the constants table holds bound or folded values
+# (`H`), `f` is the packed externalized program
+# (`_externalize_bound_array_call`), the tables are `nothing`, and those
+# values arrive as one hidden `Constant` pack just before the caches, exactly
+# as the dataflow call receives its bound operands.
+struct _ADNonAllocatingKernelCall{I,H,F,C,O,A}
     f::F
-    ops::O
+    constants::C
+    callables::O
     cache_apply::A
 end
 
@@ -180,13 +183,14 @@ _ad_restore_cotangent(point, cotangent) = cotangent
     # Pass the original operands directly to the existing generated model body,
     # as externalized bound arrays do, without a warm wrapper's image-build
     # dispatch (`_differentiated_body_call_expr`).
-    _differentiated_body_call_expr(F, :(call.native), Any[:(call.ops), positional...])
+    _differentiated_body_call_expr(F, :(call.native),
+                                   Any[:(call.constants), :(call.callables), positional...])
 end
 
 function _ad_operation_slots!(used, node)
-    node === _OPS_ARG && return false
+    node === _CALLABLES_ARG && return false
     node isa Expr || return true
-    slot = _operation_slot(node)
+    slot = _callable_slot(node)
     if slot !== nothing
         push!(used, slot)
         return true
@@ -194,8 +198,8 @@ function _ad_operation_slots!(used, node)
     all(child -> _ad_operation_slots!(used, child), node.args)
 end
 
-function _ad_native_ops(kernel::PreparedKernel)
-    ops = kernel.ops
+function _ad_native_callables(kernel::PreparedKernel)
+    ops = kernel.callables
     any(op -> op isa Union{_AuthoredScanOp,_AuthoredPlateOp}, ops) || return ops
     native = kernel.f.native
     _native_generated_function(native) isa
@@ -205,12 +209,12 @@ function _ad_native_ops(kernel::PreparedKernel)
     ast = RuntimeGeneratedFunctions.get_expression(native)
     used = Set{Int}()
     _ad_operation_slots!(used, ast.args[2]) || return ops
-    # Native plate/scan bodies are inlined, but the operation table also holds
-    # their complete prepared kernels. Rebuilding
-    # a bound-array table with unused graph metadata defeats Enzyme's readonly
-    # analysis. Keep every live slot and the original positional ABI; remove
-    # only unused plate/scan metadata from this internal native call. A transform
-    # that accesses the table dynamically conservatively retains the whole table.
+    # Native plate/scan bodies are inlined, but the callables table also holds
+    # their complete prepared kernels. Keeping unused graph metadata beside the
+    # bound arrays defeats Enzyme's readonly analysis. Keep every live entry
+    # and the original positional ABI; remove only unused plate/scan metadata
+    # from this internal native call. A transform that accesses the table
+    # dynamically conservatively retains the whole table.
     ntuple(length(ops)) do index
         op = ops[index]
         op isa Union{_AuthoredScanOp,_AuthoredPlateOp} && !(index in used) ? nothing : op
@@ -219,22 +223,23 @@ end
 
 function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I}
     if kernel.f isa _ArrayFunction
-        ops = _ad_native_ops(kernel)
+        callables = _ad_native_callables(kernel)
+        constants = kernel.constants
         # Bound views cross this Enzyme boundary as owning copies: a
         # `SubArray`-typed `Constant` operand defeats static activity
         # analysis, while identical owning contents differentiate cleanly.
         # Bound numeric fields likewise cross as inactive operands, so
         # reconstructing their table does not appear to mutate the callable.
         externalized, values = _externalize_bound_array_call(
-            kernel.f.native, ops; materialize_view_copies = true,
+            kernel.f.native, constants, callables; materialize_view_copies = true,
             externalize_scalars = true)
         isempty(values) && return (
-            _ADNativeKernelCall{I,typeof(kernel.f.native),typeof(ops)}(
-                kernel.f.native, ops),
+            _ADNativeKernelCall{I,typeof(kernel.f.native),typeof(constants),typeof(callables)}(
+                kernel.f.native, constants, callables),
             (),
         )
         packed, pack = _pack_hidden_operands(
-            externalized, values, kernel.lowered_recipes, ops)
+            externalized, values, kernel.lowered_recipes, constants)
         return _ADKernelCall{I,typeof(packed)}(packed), pack
     end
     externalized, values = _externalize_bound_arrays(
@@ -244,13 +249,14 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
         # and its operands. Repacking the whole PreparedKernel also stores its
         # mutable graph/Expr metadata beside active arguments, which defeats
         # ordinary Enzyme activity analysis through a nested prepared callback.
-        return _ADNativeKernelCall{I,typeof(kernel.f),typeof(kernel.ops)}(
-            kernel.f, kernel.ops), values
+        return _ADNativeKernelCall{I,typeof(kernel.f),typeof(kernel.constants),
+                                   typeof(kernel.callables)}(
+            kernel.f, kernel.constants, kernel.callables), values
     end
     isempty(values) &&
         return _ADKernelCall{I,typeof(externalized)}(externalized), values
     packed, pack = _pack_hidden_operands(
-        externalized, values, kernel.lowered_recipes, kernel.ops)
+        externalized, values, kernel.lowered_recipes, kernel.constants)
     _ADKernelCall{I,typeof(packed)}(packed), pack
 end
 
@@ -275,13 +281,13 @@ struct _PackedOperandCall{K}
     call::K
 end
 
-function _pack_hidden_operands(call, values::Tuple, recipes, ops)
+function _pack_hidden_operands(call, values::Tuple, recipes, constants)
     _pack_named_hidden_operands(call, values,
-                                _hidden_operand_names(recipes, ops, call), ops)
+                                _hidden_operand_names(recipes, constants, call), constants)
 end
 
-function _pack_named_hidden_operands(call, values::Tuple, slot_names::Tuple, ops)
-    names = _hidden_operand_leaf_names(call, slot_names, ops)
+function _pack_named_hidden_operands(call, values::Tuple, slot_names::Tuple, constants)
+    names = _hidden_operand_leaf_names(call, slot_names, constants)
     length(names) == length(values) || throw(ArgumentError(
         "internal: $(length(values)) hidden operand(s) but $(length(names)) " *
         "name(s) derived from the bound slots"))
@@ -293,34 +299,34 @@ end
 # folded intermediate), with the field path appended for an array leaf of a
 # structured bound value. The leaf order mirrors `_bound_array_leaves`.
 # `recipes` is the kernel's flattened `lowered_recipes`, which matches its
-# operation slots one to one, nested plate and scan bodies included (the plan's
-# own recipes cover only the top level).
+# constants table one to one, nested plate and scan bodies included (the
+# plan's own recipes cover only the top level).
 function _hidden_operand_names(
-        recipes, ops, ::_ExternalizedBoundArrayCall{F,O,P}) where {F,O,P}
-    length(recipes) == length(ops) || throw(ArgumentError(
-        "internal: $(length(ops)) operation slots but $(length(recipes)) " *
-        "lowered recipes"))
+        recipes, constants, ::_ExternalizedBoundArrayCall{F,C,O,P}) where {F,C,O,P}
+    length(recipes) == length(constants) || throw(ArgumentError(
+        "internal: $(length(constants)) constants table entries but " *
+        "$(length(recipes)) lowered recipes"))
     map(P) do slot
         recipe = recipes[slot]
-        recipe.op isa _BoundConstant && ops[slot] isa _BoundConstant ||
-            throw(ArgumentError("internal: operation slot $slot is not the " *
-                                "bound constant of lowered recipe $slot"))
+        recipe.op isa _BoundConstant ||
+            throw(ArgumentError("internal: constants table entry $slot is not " *
+                                "the bound constant of lowered recipe $slot"))
         only(recipe.outputs).name
     end
 end
 
-_externalized_slots(::_ExternalizedBoundArrayCall{F,O,P}) where {F,O,P} = P
+_externalized_slots(::_ExternalizedBoundArrayCall{F,C,O,P}) where {F,C,O,P} = P
 
-# One name per hidden operand from one name per externalized slot.
+# One name per hidden operand from one name per externalized position.
 function _hidden_operand_leaf_names(
-        ::_ExternalizedBoundArrayCall{F,O,P,H}, slot_names::Tuple,
-        ops) where {F,O,P,H}
+        ::_ExternalizedBoundArrayCall{F,C,O,P,H}, slot_names::Tuple,
+        constants) where {F,C,O,P,H}
     length(slot_names) == length(P) || throw(ArgumentError(
         "internal: $(length(P)) externalized slot(s) but " *
         "$(length(slot_names)) slot name(s)"))
     names = Symbol[]
     for (slot, name) in zip(P, slot_names)
-        for path in (H ? _bound_leaf_paths(ops[slot].value) : ((),))
+        for path in (H ? _bound_leaf_paths(constants[slot]) : ((),))
             push!(names, isempty(path) ? name : Symbol(join((name, path...), "_")))
         end
     end
@@ -372,8 +378,8 @@ _ad_hidden_operands(::_ADKernelCall{I,<:_PackedOperandCall}, pack) where {I} =
     Tuple(only(pack))
 
 # Match one non-allocating cache step,
-# `__cache_apply__(__caches__[j], __ops__[j], callargs...)`, returning the
-# slot index and call arguments. Anything else is not a step.
+# `__cache_apply__(__caches__[j], __callables__[j], callargs...)`, returning
+# the slot index and call arguments. Anything else is not a step.
 function _ad_na_step_parts(node, ops_length::Int)
     node isa Expr && node.head === :call && length(node.args) >= 3 ||
         return nothing
@@ -385,7 +391,7 @@ function _ad_na_step_parts(node, ops_length::Int)
         caches_ref.args[1] === _CACHES_ARG &&
         caches_ref.args[2] isa Int || return nothing
     ops_ref isa Expr && ops_ref.head === :ref &&
-        length(ops_ref.args) == 2 && ops_ref.args[1] === _OPS_ARG &&
+        length(ops_ref.args) == 2 && ops_ref.args[1] === _CALLABLES_ARG &&
         ops_ref.args[2] isa Int || return nothing
     step = caches_ref.args[2]
     ops_ref.args[2] == step && 1 <= step <= ops_length || return nothing
@@ -591,7 +597,7 @@ end
 # proven HAVE-free steps fold, and zero-argument steps (already constant loads)
 # keep their plain call.
 function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
-                     ops::Tuple, caches::Tuple, elided::Set{Int},
+                     constants::Tuple, ops::Tuple, caches::Tuple, elided::Set{Int},
                      fold_values::Vector{Any})
     parts = _ad_na_step_parts(node, length(ops))
     if parts !== nothing
@@ -601,7 +607,7 @@ function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
         step_free = true
         for arg in callargs
             new_arg, arg_tainted, arg_free =
-                _ad_na_walk(arg, tainted, have_free, ops, caches, elided,
+                _ad_na_walk(arg, tainted, have_free, constants, ops, caches, elided,
                             fold_values)
             push!(rewritten, new_arg)
             step_tainted = step_tainted || arg_tainted
@@ -609,14 +615,15 @@ function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
         end
         if !step_tainted && caches[step] isa Base.RefValue
             if step_free && !isempty(callargs)
+                # The step's seeded value, appended to the constants table.
                 push!(elided, step)
                 push!(fold_values,
                       _ad_na_seed_value(caches[step], step, ops[step]))
-                slot = length(ops) + length(fold_values)
-                return Expr(:call, Expr(:ref, _OPS_ARG, slot)), false, true
+                slot = length(constants) + length(fold_values)
+                return Expr(:ref, _CONSTANTS_ARG, slot), false, true
             end
             push!(elided, step)
-            return Expr(:call, Expr(:ref, _OPS_ARG, step), rewritten...),
+            return Expr(:call, Expr(:ref, _CALLABLES_ARG, step), rewritten...),
                 false, step_free
         end
         if step_tainted && ops[step] isa _AuthoredPlateOp &&
@@ -654,18 +661,21 @@ function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
             return Expr(:call,
                         GlobalRef(@__MODULE__, :_ad_na_arith_loop!),
                         Expr(:ref, _CACHES_ARG, step),
-                        Expr(:ref, _OPS_ARG, step), rewritten...),
+                        Expr(:ref, _CALLABLES_ARG, step), rewritten...),
                 true, false
         end
         return Expr(:call, _CACHE_APPLY_ARG, Expr(:ref, _CACHES_ARG, step),
-                    Expr(:ref, _OPS_ARG, step), rewritten...),
+                    Expr(:ref, _CALLABLES_ARG, step), rewritten...),
             step_tainted, !step_tainted && step_free
     end
-    # The operation table is preparation-owned, not a HAVE input. Plain
-    # constant loads and cacheless steps must propagate HAVE-freedom through
-    # their callee just as cached steps do through their arguments.
-    slot = _operation_slot(node)
+    # The tables are preparation-owned, not a HAVE input. Plain constant reads
+    # and cacheless steps must propagate HAVE-freedom through their callee
+    # just as cached steps do through their arguments.
+    slot = _callable_slot(node)
     slot !== nothing && 1 <= slot <= length(ops) &&
+        return node, false, true
+    slot = _constant_slot(node)
+    slot !== nothing && 1 <= slot <= length(constants) + length(fold_values) &&
         return node, false, true
     node isa Symbol && return node, node in tainted, node in have_free
     node isa GlobalRef && return node, false, true
@@ -674,8 +684,8 @@ function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
     if node.head === :(=) && length(node.args) == 2 &&
             node.args[1] isa Symbol
         new_rhs, rhs_tainted, rhs_free =
-            _ad_na_walk(node.args[2], tainted, have_free, ops, caches, elided,
-                        fold_values)
+            _ad_na_walk(node.args[2], tainted, have_free, constants, ops, caches,
+                        elided, fold_values)
         if rhs_tainted
             push!(tainted, node.args[1])
         else
@@ -693,7 +703,7 @@ function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
     new_args = Any[]
     for arg in node.args
         new_arg, arg_tainted, arg_free =
-            _ad_na_walk(arg, tainted, have_free, ops, caches, elided,
+            _ad_na_walk(arg, tainted, have_free, constants, ops, caches, elided,
                         fold_values)
         push!(new_args, new_arg)
         node_tainted = node_tainted || arg_tainted
@@ -736,16 +746,14 @@ function _ad_na_concretize_cache(slot::Base.RefValue, step::Int, ::_NonallocLane
     Base.RefValue{typeof(seeded)}(copy(seeded))
 end
 
-# Name each externalized slot after the variable its program loads it into
-# (`X = __ops__[1]()`: a bound port or a folded step's result), falling back
-# to the slot number for a load that is not a whole statement.
+# Name each externalized position after the variable its program reads it
+# into (`X = __constants__[1]`: a bound port or a folded step's result),
+# falling back to the position for a read that is not a whole statement.
 function _ad_na_slot_names(stmts, positions::Tuple)
     loaded = Dict{Int,Symbol}()
     for stmt in stmts
-        stmt isa Expr && stmt.head === :(=) && stmt.args[1] isa Symbol &&
-            stmt.args[2] isa Expr && stmt.args[2].head === :call &&
-            length(stmt.args[2].args) == 1 || continue
-        slot = _operation_slot(stmt.args[2].args[1])
+        stmt isa Expr && stmt.head === :(=) && stmt.args[1] isa Symbol || continue
+        slot = _constant_slot(stmt.args[2])
         slot === nothing || get!(loaded, slot, stmt.args[1])
     end
     map(slot -> get(loaded, slot, Symbol(:op, slot)), positions)
@@ -756,22 +764,22 @@ end
 # cannot see the active input (storing caller-owned constant data into a
 # backend-shadowed slot would be a static-activity error), fold the elided
 # steps that cannot see any HAVE input (their seeded value is call-
-# independent, so it is captured once as an appended `_BoundConstant`), and
-# compile the resulting unbound program alongside its owned AD caches and
-# operation table. Returns the rewritten statements too, which name the
-# hidden operands.
+# independent, so it is captured once as an appended constant), and compile
+# the resulting unbound program alongside its owned AD caches and tables.
+# Returns the rewritten statements too, which name the hidden operands.
 function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
                         exemplars::Tuple)
     ast = kernel.ast
     ast.head === :function && ast.args[1] isa Expr &&
         ast.args[1].head === :tuple &&
-        length(ast.args[1].args) >= 3 &&
-        ast.args[1].args[1] === _OPS_ARG &&
-        ast.args[1].args[2] === _CACHES_ARG &&
-        ast.args[1].args[3] === _CACHE_APPLY_ARG || throw(ArgumentError(
+        length(ast.args[1].args) >= 4 &&
+        ast.args[1].args[1] === _CONSTANTS_ARG &&
+        ast.args[1].args[2] === _CALLABLES_ARG &&
+        ast.args[1].args[3] === _CACHES_ARG &&
+        ast.args[1].args[4] === _CACHE_APPLY_ARG || throw(ArgumentError(
             "AD preparation over a non-allocating kernel requires the " *
             "unbound step-program form; the kernel AST has an unexpected shape"))
-    have_syms = map(ast.args[1].args[4:end]) do arg
+    have_syms = map(ast.args[1].args[5:end]) do arg
         arg isa Expr && arg.head === :(::) ? arg.args[1] : arg
     end
     length(have_syms) == length(inputs(kernel)) &&
@@ -787,14 +795,14 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
     have_free = Set{Symbol}()
     elided = Set{Int}()
     fold_values = Any[]
-    ops, caches = kernel.ops, kernel.caches
+    constants, ops, caches = kernel.constants, kernel.callables, kernel.caches
     length(ops) == length(caches) || throw(ArgumentError(
         "AD preparation over a non-allocating kernel requires aligned " *
-        "operation and cache tables; got $(length(ops)) operations and " *
+        "callables and cache tables; got $(length(ops)) callables and " *
         "$(length(caches)) caches"))
     new_stmts = Any[]
     for stmt in ast.args[2].args
-        new_stmt, _, _ = _ad_na_walk(stmt, tainted, have_free, ops, caches,
+        new_stmt, _, _ = _ad_na_walk(stmt, tainted, have_free, constants, ops, caches,
                                      elided, fold_values)
         push!(new_stmts, new_stmt)
     end
@@ -804,14 +812,13 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
     end
     f = compile(Expr(:function, deepcopy(ast.args[1]),
                      Expr(:block, new_stmts...)))
-    ad_ops = isempty(fold_values) ? ops :
-        (ops..., map(_BoundConstant, fold_values)...)
-    f, ad_caches, ad_ops, new_stmts
+    ad_constants = isempty(fold_values) ? constants : (constants..., fold_values...)
+    f, ad_caches, ad_constants, ops, new_stmts
 end
 
 function _ad_kernel_call(kernel::NonAllocatingKernel, args::Tuple,
                          ::Val{I}) where {I}
-    f, ad_caches, ad_ops, stmts = _ad_na_program(kernel, I, args)
+    f, ad_caches, ad_constants, ad_callables, stmts = _ad_na_program(kernel, I, args)
     # A cacheless step program still carries the positional cache-table ABI,
     # but asking the backend to shadow `Tuple{Nothing,...}` marks a ghost-only
     # type differentiable. Keep that inert table Constant; any retained slot
@@ -825,18 +832,19 @@ function _ad_kernel_call(kernel::NonAllocatingKernel, args::Tuple,
     # such as BLAS `gemv`. Views cross as owning copies and numbers leave the
     # table too, exactly as for the dataflow call.
     externalized, values = _externalize_bound_array_call(
-        f, ad_ops; materialize_view_copies = true, externalize_scalars = true)
+        f, ad_constants, ad_callables; materialize_view_copies = true,
+        externalize_scalars = true)
     if externalized === nothing
-        return _ADNonAllocatingKernelCall{I,false,typeof(f),typeof(ad_ops),
-                                          typeof(kernel.cache_apply)}(
-            f, ad_ops, kernel.cache_apply), (cache_context,)
+        return _ADNonAllocatingKernelCall{I,false,typeof(f),typeof(ad_constants),
+                                          typeof(ad_callables),typeof(kernel.cache_apply)}(
+            f, ad_constants, ad_callables, kernel.cache_apply), (cache_context,)
     end
     packed, pack = _pack_named_hidden_operands(
         externalized, values,
-        _ad_na_slot_names(stmts, _externalized_slots(externalized)), ad_ops)
-    _ADNonAllocatingKernelCall{I,true,typeof(packed),Nothing,
+        _ad_na_slot_names(stmts, _externalized_slots(externalized)), ad_constants)
+    _ADNonAllocatingKernelCall{I,true,typeof(packed),Nothing,Nothing,
                                typeof(kernel.cache_apply)}(
-        packed, nothing, kernel.cache_apply), (pack..., cache_context)
+        packed, nothing, nothing, kernel.cache_apply), (pack..., cache_context)
 end
 
 @generated function (call::_ADKernelCall{I})(
@@ -892,13 +900,13 @@ end
         getfield(contexts, $N), call.cache_apply, $(arguments...),
         getfield(contexts, $(N - 1))))
     # Enter the program without the RGF vararg wrapper: once its operands (the
-    # operation table, caches and driver plus every HAVE port) pass 32, the
+    # two tables, caches and driver plus every HAVE port) pass 32, the
     # wrapper's one-tuple splat stays a dynamic `Core._apply_iterate`, and
     # native Reverse rejects the constant HAVE arrays stored there beside the
     # shadowed caches (`_native_body_call_expr`).
     _differentiated_body_call_expr(F, :(call.f),
-        Any[:(call.ops), :(getfield(contexts, $N)), :(call.cache_apply),
-            arguments...])
+        Any[:(call.constants), :(call.callables), :(getfield(contexts, $N)),
+            :(call.cache_apply), arguments...])
 end
 
 # The hidden operands in their original order; the cache context follows them.

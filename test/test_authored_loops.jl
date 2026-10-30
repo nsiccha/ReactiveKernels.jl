@@ -6,7 +6,7 @@ using ReactiveKernels, DifferentiationInterface, Enzyme, Test
 
 function _loop_program(k)
     names = Dict{String,String}()
-    replace(string(ReactiveKernels._readable_expr(code_expr(k), k)),
+    replace(string(code_expr(k)),
             r"var\"[^\"]*\"" => m -> get!(names, m, "v$(length(names) + 1)"))
 end
 

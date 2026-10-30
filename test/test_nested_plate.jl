@@ -24,10 +24,8 @@ isdefined(@__MODULE__, :NestedPlates) || include("fixtures/nested_plates.jl")
     printed = sprint(Base.show_unquoted, Meta.parse(N.NORMAL_SOURCE))
     Core.eval(replay, Meta.parse(printed))
     replay_k = prepare(getfield(replay, :visible_observations))
-    generated = sprint(Base.show_unquoted,
-        ReactiveKernels._readable_expr(code_expr(k), k); context=:limit => false)
-    @test !occursin("__ops__[", generated)
-    @test occursin("log(scale)", generated)
+    generated = sprint(Base.show_unquoted, code_expr(k); context=:limit => false)
+    @test occursin(r"log\(var\"#scale#op\d+\"\)", generated)
 
     for data in (groups, [Float64[]], Vector{Float64}[], [[1.1], [0.3, -0.4, 0.8]],
                  [(0.25, 0.9), (), (0.7,)], [(), (0.25, 0.9), (0.7,)],

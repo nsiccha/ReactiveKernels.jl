@@ -43,15 +43,6 @@ _plain_alloc(kernel, q, x, y) = (kernel(q, x, y); @allocated kernel(q, x, y))
         @test !occursin("struct ", BOUND_REGRESSION_SOURCE)
         @test artifact.normal_object === normal
 
-        # The displayed (unbound) kernel keeps every op named.
-        raw_generated = code_expr(artifact.kernel)
-        readable = sprint(
-            Base.show_unquoted,
-            ReactiveKernels._readable_expr(raw_generated, artifact.kernel);
-            context = :limit => false,
-        )
-        @test !occursin(r"__ops__\[\d+\]", readable)
-        @test !occursin(r"\boperation\(", readable)
     end
 
     @testset "density vs the independent reference oracle" begin
@@ -77,8 +68,8 @@ _plain_alloc(kernel, q, x, y) = (kernel(q, x, y); @allocated kernel(q, x, y))
         # The bound port leaves the runtime signature; the standardized matrix
         # re-enters as a hoisted constant op.
         @test Tuple(v.name for v in inputs(bound)) == (:unconstrained, :responses)
-        @test any(op -> op isa ReactiveKernels._BoundConstant, bound.ops)
-        @test !any(op -> op isa ReactiveKernels._BoundConstant, plain.ops)
+        @test any(!isnothing, bound.constants)
+        @test all(isnothing, plain.constants)
 
         # Same modeled density, and the bound arg is no longer accepted.
         @test bound(q, BOUND_Y) == plain(q, BOUND_RAW_X, BOUND_Y)

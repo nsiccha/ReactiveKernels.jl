@@ -163,14 +163,14 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         kernel = prepare(graph; have = (q,), want = total)
         # 40 lanes plus the wide op, all surviving preparation: a future
         # pass must not silently shrink the fused call below the cliff.
-        @test length(kernel.ops) == 41
+        @test length(kernel.callables) == 41
         point = fill(0.25, 40)
         @test kernel(point) ≈ 0.25 * 40^2 + 40 * 41 / 2
         # Static-dispatch pin (fast; the memo e2e covers Enzyme end to
         # end): pre-fix, 1.12 emitted `jl_apply_generic` for this call and
         # Enzyme aborted the gradient.
         op = only(
-            o for o in kernel.ops if o isa ReactiveKernels._KernelSourceOp)
+            o for o in kernel.callables if o isa ReactiveKernels._KernelSourceOp)
         llvm = sprint(code_llvm, ReactiveKernels._kernel_source_call,
             Tuple{typeof(op),ntuple(_ -> Float64, 40)...})
         @test !occursin("jl_apply_generic", llvm)
@@ -211,7 +211,7 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         @test destination ≈ fill(32.0, 3)
         # The op's entry call itself forwards statically.
         op = only(
-            o for o in kernel.ops if o isa ReactiveKernels._KernelSourceOp)
+            o for o in kernel.callables if o isa ReactiveKernels._KernelSourceOp)
         llvm = sprint(code_llvm, op,
             Tuple{Vector{Float64},ntuple(_ -> Float64, 32)...})
         @test !occursin("jl_f__apply_iterate", llvm)
@@ -551,7 +551,8 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         ad_text = string(code_expr(prepared))
         @test prepared.call isa ReactiveKernels._ADNativeKernelCall
         @test prepared.call.native === kernel.f.native
-        @test prepared.call.ops === kernel.ops
+        @test prepared.call.constants === kernel.constants
+        @test prepared.call.callables === kernel.callables
         @test code_expr(prepared) === primal_ast
         @test occursin("Base.Broadcast.preprocess", ad_text)
         @test !occursin("_plate_dependency_changed", ad_text)
@@ -942,10 +943,10 @@ end
     spec = AuthoredScanFixtures.authored_scan_arma
     q, series = [0.2, 0.7, -0.3], [0.5]
     original = prepare(spec; bound = (; series), want = :total)
-    slot = findfirst(op -> op isa ReactiveKernels._AuthoredScanOp, original.ops)
-    # A literal slot and an arbitrary table use must both retain the scan
+    slot = findfirst(r -> r.op isa ReactiveKernels._AuthoredScanOp, original.lowered_recipes)
+    # A literal entry and an arbitrary table use must both retain the scan
     # metadata when a caller's source transform actually consumes it.
-    for table in (:__ops__, :(identity(__ops__)))
+    for table in (:__callables__, :(identity(__callables__)))
         function require_scan_metadata(ast)
             insert!(ast.args[2].args, 1,
                 :(@assert $table[$slot] isa ReactiveKernels._AuthoredScanOp))
