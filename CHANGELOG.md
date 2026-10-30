@@ -16,6 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.17
+
+- A prepared kernel's call enters its generated body directly, with the
+  operation table and one argument per HAVE port written out. It went through
+  the `RuntimeGeneratedFunction` call method, which splats its arguments; past
+  Julia's 32-element splat limit that splat is a call dispatched at run time.
+  A program with 32 or more HAVE ports whose prepared callable is that
+  generated function (one with no plate, no scan over its inputs and no
+  embedded kernel holding either) therefore dispatched every call at run
+  time, and `type_stability = :error` refused it, naming
+  `Core._apply_iterate(Base.iterate, RuntimeGeneratedFunctions.generated_callfunc, …)`
+  in "The prepared program's entry call". BRM-emitted simulator programs over
+  37 and 39 data columns were refused that way. Values are unchanged.
+
 ## 0.1.16
 
 - One cell of a plate (`plate_cell`; RKPPL's `prepare_cell_query` and compact
