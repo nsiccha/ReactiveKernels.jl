@@ -537,7 +537,7 @@ function _decompose_fused_recipe!(prog::_StepProgram, r::Recipe, callargs,
                                   input_types, lhs)
     op = r.op
     kernel_sourceop_form(op) === :fused || return nothing
-    source_f = _kernel_native_source(op.f)
+    source_f = _kernel_native_source(getfield(op, :f))
     fieldcount(typeof(source_f)) == 0 || return nothing # capturing closure
     # The source reads its inputs by the closure's parameter names, not by the
     # input values' names (`_lane_source_params`).
@@ -842,11 +842,15 @@ function _nonallocating_program(p::Plan; have_types = nothing,
     # `W::Matrix{Float64} = reshape(view(u, r), a, b)` would copy the lazy
     # value into a fresh matrix on every call. Declared plate outputs still
     # fix their buffers' element types. The steps below read the names and
-    # value types of `lowered`, so its cells outline nothing (`outline`).
+    # value types of `lowered`, so its cells outline nothing (`outline`), and
+    # the step program keys its caches on the operation calls
+    # (`_nonalloc_statement!`), so this emitter keeps every recipe's call in
+    # the table rather than its inlined source.
     ast, ops, recipes = _lower_with_ops(lowered; exemplar_types = have_types,
                                         declare = false, recycle,
                                         pushdowns = true, outline = false,
-                                        plate_element_types = true)
+                                        plate_element_types = true,
+                                        inline_sources = false)
     isempty(passes) || (ast = transform(ast, passes...))
     names = _varnames(lowered)
     types = Dict{Symbol,Any}(names[cid] => T for (cid, T) in values

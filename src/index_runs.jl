@@ -68,9 +68,9 @@ function _bound_index_run_classes(slots::Vector{Int}, @nospecialize(hoisted))
     Tuple(classes)
 end
 
-_index_run_gather(op) = op === _readonly_gather ||
-    (op isa _KernelSourceOp && op.call_identity !== nothing &&
-     first(op.call_identity) === _readonly_gather)
+Base.@nospecializeinfer _index_run_gather(@nospecialize(op)) = op === _readonly_gather ||
+    (op isa _KernelSourceOp && getfield(op, :call_identity) !== nothing &&
+     first(getfield(op, :call_identity)) === _readonly_gather)
 
 function _partial_index_runs(p::Plan,bound_values::Vector{Value})
     isempty(bound_values) && return p

@@ -90,8 +90,13 @@ end
 # The type of a recipe's result inferred from concrete input types, or
 # `nothing` when inference proves no result (the call always throws, or no
 # method is visible in this world): such a value is not reported.
-function _inferred_recipe_type(op, input_types)
-    T = _promote_op(op, input_types...)
+# One instance for every operation type: a program's audit types thousands of
+# distinct operation types, and a per-type instance of this query was 8 s of
+# the atlas `problem` stage (2001 instances). `Base._return_type` is the
+# inference `_promote_op` performs, without a generated wrapper per type.
+Base.@nospecializeinfer function _inferred_recipe_type(@nospecialize(op), input_types)
+    any(T -> T === Union{}, input_types) && return nothing
+    T = Base._return_type(op, Core.apply_type(Tuple, input_types...))
     T === Union{} ? nothing : T
 end
 
@@ -137,17 +142,21 @@ end
 # that call is a semantic fallback the lowering does not run, and inferring it
 # for a wide plate (34 operands) took minutes and tens of gigabytes. `nothing`
 # leaves the result unknown.
-_checked_recipe_type!(found, op, input_types, path) =
+Base.@nospecializeinfer _checked_recipe_type!(found, @nospecialize(op), input_types, path) =
     _inferred_recipe_type(op, input_types)
 
 # The element type of a plate's result: the cell's inferred result, or its
 # declared type (`_plate_result_eltype`), as the generated body types the
 # buffer (`_plate_body_types!`).
-function _checked_plate_element!(found, op::_AuthoredPlateOp{K,A}, input_types,
-                                 path) where {K,A}
+# One instance for every plate and scan type (`@nospecialize`, `getfield`),
+# as for ordinary operations above (276 instances of the typed methods on
+# the atlas).
+Base.@nospecializeinfer function _checked_plate_element!(
+        found, @nospecialize(op::_AuthoredPlateOp), input_types, path)
+    A = (typeof(op)::DataType).parameters[2]
     cell_types = Any[_plate_argument_type(T, position in A)
                      for (position, T) in enumerate(input_types)]
-    body = op.kernel.plan
+    body = getfield(getfield(op, :kernel), :plan)
     types = _uninferred_values!(found, body, cell_types, path, false)
     want = only(body.want)
     _plate_result_eltype(get(types, canon_id(body.graph, want.id), Any), valtype(want))
@@ -160,8 +169,9 @@ end
 # an axis leaves the marker to run time, and the result unknown. The shape is
 # inferred through RK's fold rather than Base's `combine_axes`, whose splat
 # recursion took minutes to infer over a 34-operand plate.
-function _checked_recipe_type!(found, op::_AuthoredPlateOp{K,A}, input_types,
-                               path) where {K,A}
+Base.@nospecializeinfer function _checked_recipe_type!(
+        found, @nospecialize(op::_AuthoredPlateOp), input_types, path)
+    A = (typeof(op)::DataType).parameters[2]
     element = _checked_plate_element!(found, op, input_types, path)
     _concrete_value_type(element) || return nothing
     batched = Any[T for (position, T) in enumerate(input_types) if !(position in A)]
@@ -178,16 +188,18 @@ function _checked_recipe_type!(found, op::_AuthoredPlateOp{K,A}, input_types,
     _concrete_value_type(T) ? T : nothing
 end
 
-function _checked_recipe_type!(found, op::_AuthoredPlateCellOp, input_types, path)
-    element = _checked_plate_element!(found, op.plate, input_types[2:end], path)
+Base.@nospecializeinfer function _checked_recipe_type!(
+        found, @nospecialize(op::_AuthoredPlateCellOp), input_types, path)
+    element = _checked_plate_element!(found, getfield(op, :plate), input_types[2:end], path)
     _concrete_value_type(element) ? element : nothing
 end
 
-function _checked_recipe_type!(found, op::_AuthoredScanOp, input_types, path)
+Base.@nospecializeinfer function _checked_recipe_type!(
+        found, @nospecialize(op::_AuthoredScanOp), input_types, path)
     # A history scan's result holds values of the fill's type, or the
     # leading entries' element type.
     _scan_has_history(op) && return _scan_history_result_type(input_types[end])
-    step = op.kernel.plan
+    step = getfield(getfield(op, :kernel), :plan)
     types = _uninferred_values!(found, step,
         _scan_step_argument_types(op, input_types), path,
         _owns_array_regions(step))
@@ -196,8 +208,9 @@ function _checked_recipe_type!(found, op::_AuthoredScanOp, input_types, path)
 end
 
 # An embedded kernel returns its single WANT, or a tuple of its WANTs.
-function _checked_recipe_type!(found, op::PreparedKernel, input_types, path)
-    p = op.plan
+Base.@nospecializeinfer function _checked_recipe_type!(
+        found, @nospecialize(op::PreparedKernel), input_types, path)
+    p = getfield(op, :plan)
     types = _uninferred_values!(found, p, input_types, path,
                                 _owns_array_regions(p))
     wants = Any[get(types, canon_id(p.graph, v.id), Any) for v in p.want]

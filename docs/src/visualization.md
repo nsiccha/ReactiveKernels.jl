@@ -87,8 +87,10 @@ structure](compiler.md#Inspecting-structure)).
 
 `code_expr(spec_or_plan)` and `code_expr(prepared)` return the generated
 Julia expression itself. Print that expression with Julia's ordinary printer;
-for a cleaner listing, remove only line-number nodes from a copy. Calls retain
-their actual `__ops__[k]` slots. The operation tuple is available separately
+for a cleaner listing, remove only line-number nodes from a copy. Each
+statement names its actual `__ops__[k]` slot: a recipe's authored source runs
+in the body as a `let` that binds the slot first, an operation without such a
+source is called through it. The operation tuple is available separately
 as `prepared.ops`; a printed expression that embeds an operation object may
 not parse on its own. The structural graph view explains names and recipes
 without altering this executable expression.

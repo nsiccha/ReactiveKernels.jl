@@ -1974,7 +1974,26 @@ end
             r.effectful,
         )
         @test recipe_shape.(authored_plan.recipes) == recipe_shape.(low_plan.recipes)
-        @test code_expr(authored_plan) == code_expr(low_plan)
+        # Both bodies apply the same operation slots to the same values in the
+        # same order. The declarative recipes carry their sources, which run
+        # in the body (`inline_sources.jl`); the low-level graph's closures
+        # have none, so they are called through their slots.
+        function applications(ast)
+            statements = filter(s -> s isa Expr && s.head === :(=), ast.args[2].args)
+            map(statements) do statement
+                rhs = statement.args[2]
+                inlined = ReactiveKernels._inline_statement_call(rhs)
+                inlined === nothing || return (statement.args[1], inlined...)
+                (statement.args[1], ReactiveKernels._operation_slot(rhs.args[1]), rhs.args[2:end])
+            end
+        end
+        @test applications(code_expr(authored_plan)) == applications(code_expr(low_plan)) ==
+              [(:a, 1, Any[:x]), (:b, 2, Any[:a])]
+        @test all(s -> !(s isa Expr && s.head === :(=)) ||
+                       ReactiveKernels._inline_statement_call(s.args[2]) !== nothing,
+                  code_expr(authored_plan).args[2].args)
+        @test all(s -> !(s isa Expr && s.head === :(=)) || s.args[2].head === :call,
+                  code_expr(low_plan).args[2].args)
 
         authored = prepare(authored_plan)
         low = prepare(low_plan)

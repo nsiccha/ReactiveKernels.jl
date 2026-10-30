@@ -267,7 +267,7 @@ end
 # split.
 function _partial_split_parts(r::Recipe)
     r.op isa _KernelSourceOp || return nothing
-    native = r.op.f
+    native = getfield(r.op, :f)
     native isa _KernelSplit || return nothing
     shape = _kernel_split_spec(native)
     ports = collect(Symbol, first(shape))
@@ -405,10 +405,11 @@ function _partial_branch_leaves!(leaves, native::_KernelBranch, source, path, co
 end
 
 # The names of a rebuilt branch's arguments in its recipe's readable source.
-_branch_call_names(f) = nothing
-_branch_call_names(branch::_KernelBranch) = _branch_call_names(branch.call)
-_branch_call_names(::_KernelBranchCall{CI,TI,EI,Names}) where {CI,TI,EI,Names} =
-    collect(Symbol, Names)
+Base.@nospecializeinfer _branch_call_names(@nospecialize(f)) = nothing
+Base.@nospecializeinfer _branch_call_names(@nospecialize(branch::_KernelBranch)) =
+    _branch_call_names(getfield(branch, :call))
+Base.@nospecializeinfer _branch_call_names(@nospecialize(call::_KernelBranchCall)) =
+    collect(Symbol, (typeof(call)::DataType).parameters[4])
 
 # The branch `native` with each leaf in `plans` reading its cached nodes, appended as arguments `count + 1:count + added`. A leaf arm that is
 # not rebuilt keeps its graph (`then_spec`/`else_spec`), which the shared
@@ -509,7 +510,7 @@ end
 function _partial_speculate_recipe(r::Recipe, reads::Vector{Bool}, refused;
                                    bound_guards::Bool = false)
     r.op isa _KernelSourceOp || return nothing
-    native = r.op.f
+    native = getfield(r.op, :f)
     native isa _KernelBranch || return nothing
     count = length(r.inputs)
     # The outer cell's bound branch belongs to the lane partition. Inside
@@ -583,10 +584,13 @@ end
 # enclosing cell and keep a cut of the selected plan as the lazy residual arm.
 # Nested speculative nodes retain their refusal keys, so a throwing operation
 # is restored beneath every guard it originally had on the next attempt.
-function _partial_speculate_graph_arm!(nodes, plans, names, mapping,
-                                       r::Recipe, leaf, reads, refused)
-    leaf.spec === nothing && return
-    arm = _plate_arm_plan(leaf.spec)
+# One instance for every arm (`@nospecialize(leaf)`): the leaf names its
+# arm's source function, a type of its own per arm (55 instances, 3.3 s of
+# the atlas `problem` stage).
+Base.@nospecializeinfer function _partial_speculate_graph_arm!(nodes, plans, names, mapping,
+                                       r::Recipe, @nospecialize(leaf), reads, refused)
+    getfield(leaf, :spec) === nothing && return
+    arm = _plate_arm_plan(getfield(leaf, :spec))
     length(arm.want) == 1 || return
     any(q -> q.effectful || length(q.outputs) != 1 ||
              q.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
@@ -600,8 +604,8 @@ function _partial_speculate_graph_arm!(nodes, plans, names, mapping,
     # As for expression arms, split mixed computations only. Returning a
     # cached array as the whole arm would publish shared bind-time storage.
     all(v -> canon_id(g, v.id) in bound, arm.have) && return
-    prefix_key = (:arm_recipe, r.id, leaf.path)
-    node_key = (:arm_node, r.id, leaf.path)
+    prefix_key = (:arm_recipe, r.id, getfield(leaf, :path))
+    node_key = (:arm_node, r.id, getfield(leaf, :path))
     excluded = Set(q.id for q in arm.recipes if (prefix_key..., q.id) in refused)
     nested_refused = Set(key[4] for key in refused
                          if length(key) == 4 && key[1:3] == node_key)
@@ -643,8 +647,8 @@ function _partial_speculate_graph_arm!(nodes, plans, names, mapping,
     native = _partial_arm_function(cut)
     indices = Tuple(vcat([positions[v.name] for v in arm.have],
                          [available[canon_id(ag, v.id)] for v in frontier]))
-    plans[leaf.path] = (; native, positions = indices, spec = cut)
-    mapping[leaf.source] = Expr(:call, QuoteNode(native), (names[i] for i in indices)...)
+    plans[getfield(leaf, :path)] = (; native, positions = indices, spec = cut)
+    mapping[getfield(leaf, :source)] = Expr(:call, QuoteNode(native), (names[i] for i in indices)...)
     nothing
 end
 
@@ -1218,8 +1222,8 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     # The first branch recipe whose condition reads bound data only.
     target = nothing
     for r in inner.recipes
-        r.op isa _KernelSourceOp && r.op.f isa _KernelBranch || continue
-        CI = typeof(r.op.f).parameters[1]
+        r.op isa _KernelSourceOp && getfield(r.op, :f) isa _KernelBranch || continue
+        CI = (typeof(getfield(r.op, :f))::DataType).parameters[1]
         ports = [canon_id(inner.graph, r.inputs[i].id) for i in CI]
         all(cid -> haskey(bound, cid), ports) || continue
         target = (r, ports)
@@ -1227,7 +1231,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     end
     target === nothing && return nothing
     branch_recipe, cond_ports = target
-    native = branch_recipe.op.f
+    native = getfield(branch_recipe.op, :f)
     pred = broadcast(native.condition, (bound[cid] for cid in cond_ports)...)
     arms = if pred isa Bool
         # A lane-invariant condition selects its arm statically.

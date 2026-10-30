@@ -24,6 +24,12 @@ const g = [1, 2, 1, 2]
 
 _text(bound) = sprint(print,
     Base.remove_linenums!(deepcopy(kernel_expr(bound, assign_layout(bound)))))
+# A planned statement runs its operation's source in the body, binding the
+# slot and the source's parameters first (`lhs = let var"#opN" = __ops__[N],
+# var"#p#opN" = arg, …`); an operation without a source stays a call
+# (`lhs = (__ops__[N])(arg, …)`). `lhs` is a regular-expression pattern.
+_slot_statement(lhs::AbstractString) = Regex("\\n\\s*" * lhs *
+    " = (let var\"#op\\d+\" = __ops__\\[\\d+\\]|\\(__ops__\\[\\d+\\]\\))")
 _bound(ast, data; mod = Fns) =
     bind_data(lower_rkppl(ast, data; conditioned = (:y,), mod), data)
 
@@ -362,10 +368,10 @@ end
     bound = _bound(model, data; mod = @__MODULE__)
     built = build_kernel(bound)
     code = string(code_expr(built.spec))
-    # The planned expression retains the call slots and their actual bindings.
-    # Source bodies of those callables are separate from this expression.
-    @test occursin(r"var\"[^\"]+\.fall\.xi_max\" = \(__ops__\[", code)
-    @test occursin(r"shift = \(__ops__\[\d+\]\)\(base, var\"shift\.s\"\)", code)
+    # The planned expression keeps the generated operation slots, each bound
+    # to its actual arguments, and runs their sources in place.
+    @test occursin(_slot_statement("var\"[^\"]+\\.fall\\.xi_max\""), code)
+    @test occursin(r"shift = let var\"#op\d+\" = __ops__\[\d+\], var\"#\w+#op\d+\" = base, var\"#\w+#op\d+\" = var\"shift\.s\"", code)
     @test !occursin("identity(", code)
     @test occursin("var\"##plate_argument#", code)
 
@@ -413,7 +419,7 @@ end
             (quote
                 mu = base .* ComposedFns.rise(base) .* exp.(ComposedFns.fall(base, 0.5))
                 y .~ Normal.(mu, sa)
-            end, ["var\"mu.rise.xi\" = (__ops__[", "mu = (__ops__["],
+            end, [_slot_statement("var\"mu\\.rise\\.xi\""), _slot_statement("mu")],
                 nt -> sum(logpdf.(Normal.(base(nt) .* rise(base(nt)) .*
                     exp.(fall(base(nt))), nt.sa), y))),
             # Its named twin.
@@ -422,7 +428,7 @@ end
                 f = ComposedFns.fall(base, 0.5)
                 mu = base .* r .* exp.(f)
                 y .~ Normal.(mu, sa)
-            end, ["r = (__ops__[", "f = (__ops__[", "mu = (__ops__["],
+            end, [_slot_statement("r"), _slot_statement("f"), _slot_statement("mu")],
                 nt -> sum(logpdf.(Normal.(base(nt) .* rise(base(nt)) .*
                     exp.(fall(base(nt))), nt.sa), y))),
             # A scale, a log-link location and a location two responses read.
@@ -430,14 +436,14 @@ end
                 r = ComposedFns.rise(base)
                 sd = exp.(0.1 .* base .* r)
                 y .~ Normal.(a, sd)
-            end, ["sd = (__ops__["],
+            end, [_slot_statement("sd")],
                 nt -> sum(logpdf.(Normal.(nt.a,
                     exp.(0.1 .* base(nt) .* rise(base(nt)))), y))),
             (quote
                 r = ComposedFns.rise(base)
                 eta = 0.1 .* base .* r
                 yc .~ Poisson.(exp.(eta))
-            end, ["eta = (__ops__["],
+            end, [_slot_statement("eta")],
                 nt -> sum(logpdf.(Poisson.(exp.(0.1 .* base(nt) .*
                     rise(base(nt)))), yc))),
             (quote
@@ -445,7 +451,7 @@ end
                 mu = base .* r
                 y .~ Normal.(mu, sa)
                 yc .~ Normal.(mu, 1.0)
-            end, ["mu = (__ops__["],
+            end, [_slot_statement("mu")],
                 nt -> sum(logpdf.(Normal.(base(nt) .* rise(base(nt)), nt.sa), y)) +
                     sum(logpdf.(Normal.(base(nt) .* rise(base(nt)), 1.0), yc))))
         model = Expr(:block, head.args..., body.args...)
@@ -485,8 +491,8 @@ end
     bound = _bound(model, (; y); mod = @__MODULE__)
     built = build_kernel(bound)
     code = string(code_expr(built.spec))
-    @test occursin("var\"p.logjac\" = (__ops__[", code)
-    @test occursin("log_jacobian = (__ops__[", code)
+    @test occursin(_slot_statement("var\"p\\.logjac\""), code)
+    @test occursin(_slot_statement("log_jacobian"), code)
     layout = built.layout
     u = [0.3, -0.2, 0.1]
     query = prepare_query(built, bound, :log_jacobian)
