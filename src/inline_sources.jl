@@ -314,6 +314,12 @@ function _inline_qualify(ex, mod::Module, renamed::Dict{Symbol,Symbol})
                 value = _inline_qualify(item.args[2], mod, renamed)
                 value === nothing && return nothing
                 push!(args, Expr(:(=), item.args[1], value))
+            elseif head === :parameters && item isa Symbol
+                # `(; x)` and `f(; x)` name the field or keyword `x` by the
+                # value `x` reads: the label stays, the value is renamed.
+                value = _inline_qualify(item, mod, renamed)
+                value === nothing && return nothing
+                push!(args, Expr(:kw, item, value))
             else
                 rewritten = _inline_qualify(item, mod, renamed)
                 rewritten === nothing && return nothing

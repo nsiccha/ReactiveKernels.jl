@@ -629,9 +629,12 @@ function _rewrite_embedded(node, names::Dict{Symbol,Any}, op_offset::Int)
     end
     # A named tuple's field labels and keyword labels are syntax
     # (`_labeled_value`): their values are rewritten, the labels stay.
-    if node.head in (:tuple, :parameters)
-        return Expr(node.head,
+    if node.head === :tuple
+        return Expr(:tuple,
                     (_rewrite_labeled(item, names, op_offset) for item in node.args)...)
+    elseif node.head === :parameters
+        return Expr(:parameters,
+                    (_rewrite_parameter(item, names, op_offset) for item in node.args)...)
     elseif node.head === :kw && _labeled_value(node) !== node
         return Expr(:kw, node.args[1], _rewrite_embedded(node.args[2], names, op_offset))
     end
@@ -641,6 +644,11 @@ end
 _rewrite_labeled(item, names::Dict{Symbol,Any}, op_offset::Int) =
     _labeled_value(item) === item ? _rewrite_embedded(item, names, op_offset) :
     Expr(item.head, item.args[1], _rewrite_embedded(item.args[2], names, op_offset))
+# `(; x)` and `f(; x)` name the field or keyword `x` by the value `x` reads:
+# the label stays, the value is rewritten.
+_rewrite_parameter(item, names::Dict{Symbol,Any}, op_offset::Int) =
+    item isa Symbol ? Expr(:kw, item, _rewrite_embedded(item, names, op_offset)) :
+    _rewrite_labeled(item, names, op_offset)
 
 function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int)
     ast.head === :function || throw(ArgumentError(
@@ -3291,9 +3299,11 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_arms!(
 end
 
 # `recycled`: the lane slot of the recipe's value (`_lower_authored_plate_loop_native!`),
-# which a scan, dotted call or slice fills instead of allocating.
+# which a scan, dotted call or slice fills instead of allocating. `op`: what
+# the table holds at `operation` (the cell kernel's own operation for this
+# recipe), or `nothing` when the caller does not know.
 function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots;
-                                     recycled = nothing)
+                                     recycled = nothing, op = nothing)
     if recipe.op isa _AuthoredScanOp
         _lower_authored_scan_native!(body, recipe.op, args, out, slots.offset;
                                      slots.type_offset, recycled)
@@ -3313,7 +3323,15 @@ function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots;
         push!(body.args, Expr(:(=), out,
             _native_plate_branch_expr(recipe.op.f, :(getfield($operation, :f)), args)))
     else
-        push!(body.args, Expr(:(=), out, Expr(:call, operation, args...)))
+        # Where the cell kernel's own lowering emitted this recipe's source and
+        # left its authored closure in the slot (`inline_sources.jl`), the cell
+        # runs that source over its arguments here too; a slot that keeps the
+        # operation is called.
+        slot = _operation_slot(operation)
+        inlined = op === nothing || op isa _KernelSourceOp || slot === nothing ?
+            nothing : _inline_source_form(recipe, args, slot)
+        push!(body.args, Expr(:(=), out,
+            inlined === nothing ? Expr(:call, operation, args...) : inlined[1]))
     end
     body
 end
@@ -3860,7 +3878,8 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         recipe_index in sliced_scans && return block
         haskey(slices, recipe_index) || return _lower_plate_recipe_native!(
             block, inner.recipes[recipe_index], args, out, operation,
-            get(scan_offsets, recipe_index, nothing); recycled = slot_of(recipe_index))
+            get(scan_offsets, recipe_index, nothing); recycled = slot_of(recipe_index),
+            op = inner_kernel.ops[recipe_index])
         scan_index, demand = slices[recipe_index]
         scan_recipe = inner.recipes[scan_index]
         scan_args = Any[_authored_plate_scalar_ref(
