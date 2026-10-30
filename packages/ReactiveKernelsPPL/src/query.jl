@@ -216,13 +216,56 @@ end
 # program: the binding supplies no value to say otherwise.
 function _check_built_program(built, plan::StructuralPlan)
     hasproperty(built, :program) || return nothing
-    plan = _absent_typed_as(plan, built.program)
-    program = _program_identity(kernel_expr(plan, assign_layout(plan)))
-    _same_program(program, built.program) && return nothing
-    throw(ContractValidationError("[query] this binding generates a " *
+    _checked_program(plan, built.program) && return nothing
+    typed = _absent_typed_as(plan, built.program)
+    program = _program_identity(kernel_expr(typed, assign_layout(typed)))
+    _same_program(program, built.program) || throw(ContractValidationError(
+        "[query] this binding generates a " *
         "different program than the one this graph was built from, so it " *
         "needs its own `build_kernel(plan)`. First difference, " *
         _program_difference(built.program, program)))
+    _record_checked_program!(plan, built.program)
+    return nothing
+end
+
+# A binding generates its program from its own fields and bound values, which
+# no step mutates (plans are immutable by contract), so a binding that
+# generated a build's program once does again. Generating it costs the whole
+# program, however small the query: about 45 s on a 224k-coordinate BRM
+# program, paid by every preparation of one cell (snag
+# `brm-s-nlme-cell-d70abd20`). So each binding is checked against each build
+# once. The record sits in the binding's lowering cache (`_structural_cache`)
+# and holds the binding's column table and the build's program weakly.
+mutable struct _CheckedPrograms
+    const columns::WeakRef
+    programs::Vector{WeakRef}
+end
+
+_checked_program_key(plan::StructuralPlan) =
+    (:checked_program, _structure_fields(plan), objectid(plan.columns), plan.n_obs)
+
+function _checked_program(plan::StructuralPlan, program::Expr)
+    cache = _structural_cache(plan)
+    lock(cache.lock) do
+        checked = get(cache.entries, _checked_program_key(plan), nothing)
+        checked isa _CheckedPrograms && checked.columns.value === plan.columns &&
+            any(ref -> ref.value === program, checked.programs)
+    end
+end
+
+function _record_checked_program!(plan::StructuralPlan, program::Expr)
+    cache = _structural_cache(plan)
+    key = _checked_program_key(plan)
+    lock(cache.lock) do
+        checked = get(cache.entries, key, nothing)
+        if !(checked isa _CheckedPrograms && checked.columns.value === plan.columns)
+            length(cache.entries) >= _STRUCTURAL_CACHE_LIMIT && empty!(cache.entries)
+            checked = cache.entries[key] = _CheckedPrograms(WeakRef(plan.columns), WeakRef[])
+        end
+        filter!(ref -> ref.value !== nothing, checked.programs)
+        push!(checked.programs, WeakRef(program))
+    end
+    return nothing
 end
 
 function _absent_typed_as(plan::StructuralPlan, program::Expr)
@@ -607,9 +650,13 @@ const _CELL_PORT = :_ppl_cell
 
 # Each observation's cell plate (its per-index totals when the loop observes
 # one array per index), one `plate_cell` value per plate at the shared position
-# port, and their sum when there are several.
+# port, and their sum when there are several. The plates are named in the
+# program the build recorded, which `_check_built_program` proved `plan`
+# generates; only a graph made outside `build_kernel` has the program
+# generated again.
 function _cell_query_spec(built, plan::StructuralPlan, names)
-    body = kernel_expr(plan, built.layout).args[2].args
+    def = hasproperty(built, :program) ? built.program : kernel_expr(plan, built.layout)
+    body = def.args[2].args
     statement = findfirst(st -> Meta.isexpr(st, :(=), 2) && st.args[1] === :pointwise, body)
     pointwise = Dict{Symbol,Any}()
     if statement !== nothing && Meta.isexpr(body[statement].args[2], :tuple)
