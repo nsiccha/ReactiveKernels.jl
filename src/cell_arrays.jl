@@ -142,16 +142,15 @@ function _cell_array_source(r::Recipe, args)
     op isa _KernelSourceOp || return nothing
     kernel_sourceop_form(op) === :fused && getfield(op, :ignored_throws) !== nothing ||
         return nothing
-    f = getfield(op, :f)
-    f isa _KernelBranch && (f = getfield(f, :call))
-    f = _kernel_native_source(f)
-    f isa Function && fieldcount(typeof(f)) == 0 || return nothing
-    params = _closure_parameter_names(f, length(args))
+    record = _source_record(getfield(op, :f))
+    record === nothing && return nothing
+    params = _lane_source_params(record, length(args))
     params === nothing && return nothing
-    source = _lane_expand_dot(_lane_strip_lines(r.source), parentmodule(typeof(f)))
+    mod = _kernel_endpoint_source_module(op)
+    source = _lane_expand_dot(_lane_strip_lines(r.source), mod)
     source === nothing && return nothing
-    native = _kernel_native_body(source, parentmodule(typeof(f)), Set{Symbol}(params))
-    ctx = _LaneSourceContext(parentmodule(typeof(f)), Dict{Symbol,Any}(zip(params, args)))
+    native = _kernel_native_body(source, mod, Set{Symbol}(params))
+    ctx = _LaneSourceContext(mod, Dict{Symbol,Any}(zip(params, args)))
     _cell_array_source_node(ctx, native)
 end
 function _cell_array_source_node(ctx, x)

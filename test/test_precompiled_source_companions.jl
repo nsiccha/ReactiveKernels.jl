@@ -55,12 +55,6 @@ using ReactiveKernels, Test
                 folds, scaled, prepare(scaled), dot, bound
             end
             const FOLDS, SCALED, SCALED_PREPARED, DOT, BOUND_DOT = make_graphs()
-            # Whether the bound template kept an execution copy of its table
-            # while the image was generated.
-            const KEPT_EXECUTABLE = any(values(only(values(
-                    ReactiveKernels._graph_preparations(DOT.graph).bound)).templates)) do t
-                t isa ReactiveKernels._BoundTemplate && t.executable.entries[] !== nothing
-            end
             end
             """)
         setup = """
@@ -90,7 +84,7 @@ using ReactiveKernels, Test
                     return found
                 haskey(seen, x) && return found
                 seen[x] = nothing
-                x isa RK._KernelSourceFunction && push!(found, x)
+                x isa RK._KernelSource && push!(found, x)
                 if x isa Union{Tuple,NamedTuple}
                     foreach(v -> sources!(found, v, seen), x)
                 elseif x isa AbstractArray
@@ -101,7 +95,7 @@ using ReactiveKernels, Test
                 end
                 found
             end
-            warm(x) = any(f -> f.runtime_f isa RK._PrecompileWarmFunction,
+            warm(x) = any(f -> f.companion isa RK._PrecompileWarmFunction,
                           sources!(Any[], x))
             warm(spec::RK.KernelSpec) = warm(spec.graph)
             @testset "loaded image" begin
@@ -130,22 +124,14 @@ using ReactiveKernels, Test
             # the warm wrapper; once the image is loaded the wrapper's method
             # query folds, so no latest-world branch stays at the call.
             @test report(findings(C.SCALED_PREPARED, argtypes; recurse))
-            # A rebinding assembles its kernel from the bound template's
-            # execution copy of its table, kept once per process (snag
-            # per-binding-resi-990b18ab). A template the image kept has none:
-            # its companions were warm-wrapped while it was generated, so
-            # the first rebinding after load executes the table, as every
-            # rebinding did before.
-            @test !C.KEPT_EXECUTABLE
+            # A rebinding assembles its kernel from the bound template's kept
+            # callables; the records are their own execution in every process,
+            # so a template the image kept needs no per-process copy.
             w2 = 2 .* w
             xs = x[eachindex(w)]
             rebound = prepare(C.DOT; bound = (; w = w2))
             @test rebound.f === C.BOUND_DOT.f
-            @test rebound.callables === RK._execution_source(rebound.callables)
-            template = only(t for t in values(only(values(
-                RK._graph_preparations(C.DOT.graph).bound)).templates)
-                if t isa RK._BoundTemplate)
-            @test template.executable.entries[] isa Vector{Any}
+            @test rebound.callables === C.BOUND_DOT.callables
             @test rebound(xs) == sum(w2[j] * xs[j] for j in eachindex(w2); init = 0.0)
             again = prepare(C.DOT; bound = (; w))
             @test again.f === C.BOUND_DOT.f && typeof(again) === typeof(rebound)

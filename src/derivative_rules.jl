@@ -269,9 +269,6 @@ _RuleRegion{Name}(f::F, constants::C, callables::O) where {Name,F,C,O} =
                                :(getfield(region, :callables)), forwarded...])
 end
 
-_kernel_latest_source(region::_RuleRegion{Name}) where {Name} =
-    _RuleRegion{Name}(region.f, region.constants, _kernel_latest_source(region.callables))
-
 # Encode a lowered `function (__constants__, __callables__, x::T...)
 # name = (__callables__[i])(names...); ...; return ... end` as type-level
 # data. Anything outside that grammar is a lowering this slice does not cover
@@ -383,16 +380,10 @@ struct DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged,PO,FO,RO,SO,LO
     lane::LO
 end
 
-function _kernel_latest_rule(rule::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged}) where
-        {Name,N,Inputs,Primal,Forward,Reverse,Staged}
-    po = _kernel_latest_source(rule.primal_ops)
-    fo = _kernel_latest_source(rule.forward_ops)
-    ro = _kernel_latest_source(rule.reverse_ops)
-    so = _kernel_latest_source(rule.staged_ops)
-    DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged,
-        typeof(po),typeof(fo),typeof(ro),typeof(so),typeof(rule.lane),
-        _rule_result(rule)}(po,fo,ro,so,rule.lane)
-end
+# A rule's operations are source records and prepared regions, callable from
+# any world: the rule a latest-world caller uses is the rule itself (the name
+# remains for ReactiveKernelsPPL's GLM rule).
+_kernel_latest_rule(rule::DerivativeRule) = rule
 
 _rule_result(::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged,PO,FO,RO,SO,LO,
                               Result}) where {Name,N,Inputs,Primal,Forward,Reverse,

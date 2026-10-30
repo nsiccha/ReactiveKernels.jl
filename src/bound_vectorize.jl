@@ -57,7 +57,6 @@ struct _RebindPrepared
     ast::Expr
     lowered::_RebindTable
     signature::Type
-    executable::_ExecutableTable # `callables` as this process executes them
 end
 
 # A scheduled batch: its serial driver, its prefix and one empty residual
@@ -145,7 +144,7 @@ function _rebind_prefix(@nospecialize(prefix::PreparedKernel), constants::_Rebin
     callables = Any[prefix.callables...]
     _RebindPrepared(prefix.f, table, callables, prefix.inputs, prefix.outputs,
                     prefix.plan.have, prefix.plan.want, recipes, prefix.ast, lowered,
-                    _exact_signature(prefix), _ExecutableTable(callables))
+                    _exact_signature(prefix))
 end
 
 function _rebind_template(@nospecialize(product::_ScheduledBatchedKernel),
@@ -184,7 +183,7 @@ function _rebound(kept::_RebindPrepared, @nospecialize(kernel::PreparedKernel),
     recipes = convert(Vector{Recipe}, _rebound_table(kept.recipes, constants.recipes))
     plan = _partial_subplan(kernel.plan, kept.have, kept.want, recipes)
     _executed_prepared_kernel(kept.f, Tuple(_rebound_table(kept.constants, constants.values)),
-                              _executable_callables(kept.executable, kept.callables),
+                              _executable_callables(kept.callables),
                               kept.inputs, kept.outputs, plan, kept.ast,
                               Tuple(_rebound_table(kept.lowered, constants.recipes)),
                               kept.signature, nothing)

@@ -2043,35 +2043,43 @@ eltype_or_self(@nospecialize(T)) = T isa Type && T <: AbstractArray ? eltype(T) 
 
 # A source operation called directly (an embedded kernel's operation spliced
 # into another recipe's source, or one step of a derivative rule): its
-# runtime-generated body, whose globals are qualified, over the arguments.
+# runtime-generated body, whose globals are qualified, over the arguments,
+# with the operation's module for the names the body leaves to it.
 _jax_call_positional(ctx::_JaxContext, op::_KernelSourceOp, args::Vector{_PyVal}) =
-    _jax_call(ctx, op.f, args)
-function _jax_call_positional(ctx::_JaxContext,
-        f::Union{_KernelSourceFunction,_KernelSplit,_KernelReduction}, args::Vector{_PyVal})
+    _jax_source_call(ctx, op.f, args, _kernel_endpoint_source_module(op))
+_jax_call_positional(ctx::_JaxContext,
+                     f::Union{_KernelSource,_KernelSplit,_KernelReduction,_KernelBranch},
+                     args::Vector{_PyVal}) =
+    _jax_error("a source part `", typeof(f), "` called without its operation", _jax_where(ctx))
+function _jax_source_call(ctx::_JaxContext,
+        f::Union{_KernelSource,_KernelSplit,_KernelReduction}, args::Vector{_PyVal}, mod)
     params, body = _jax_op_body(f)
     length(params) == length(args) ||
         _jax_error("an embedded operation takes ", length(params), " arguments, not ",
                    length(args), _jax_where(ctx))
-    v = _jax_source_expr(ctx, body, params, args, _jax_closure_module(_source_closure(f)),
-                         _jax_captures(f))
+    v = _jax_source_expr(ctx, body, params, args, mod, _jax_captures(f))
     _jax_bind!(ctx, :value, v)
 end
 # A lazy branch called as a value (a cell's branch spliced into its plate's
 # body): its condition over the arguments at `CI`, and an arm over those at
 # `TI` or `EI`, as a conditional that keeps the arms lazy.
-function _jax_call_positional(ctx::_JaxContext, b::_KernelBranch{CI,TI,EI},
-                              args::Vector{_PyVal}) where {CI,TI,EI}
-    condition = _jax_call(ctx, b.condition, args[collect(Int, CI)])
-    v = _jax_conditional(ctx, condition, () -> _jax_call(ctx, b.then_arm, args[collect(Int, TI)]),
-                         () -> _jax_call(ctx, b.else_arm, args[collect(Int, EI)]))
+function _jax_source_call(ctx::_JaxContext, b::_KernelBranch{CI,TI,EI},
+                          args::Vector{_PyVal}, mod) where {CI,TI,EI}
+    condition = _jax_source_call(ctx, b.condition, args[collect(Int, CI)], mod)
+    v = _jax_conditional(ctx, condition,
+                         () -> _jax_source_call(ctx, b.then_arm, args[collect(Int, TI)], mod),
+                         () -> _jax_source_call(ctx, b.else_arm, args[collect(Int, EI)], mod))
     _jax_bind!(ctx, :value, v)
 end
+_jax_source_call(ctx::_JaxContext, f, args::Vector{_PyVal}, mod) = _jax_call(ctx, f, args)
 
 const _JAX_RGF = RuntimeGeneratedFunctions
 # The parameters and body of a source function: its runtime-generated body
 # when it has one (its first parameter is the captures), else its source.
-function _jax_op_body(f::_KernelSourceFunction)
-    ex = _JAX_RGF.get_expression(f.runtime_f)
+function _jax_op_body(f::_KernelSource)
+    f.companion === nothing &&
+        _jax_error("an embedded operation whose source Julia owns has no generated body")
+    ex = _JAX_RGF.get_expression(f.companion)
     ex isa Expr && ex.head === :-> || _jax_error("an unexpected generated body `", ex, "`")
     params = ex.args[1] isa Expr ? Symbol[a for a in ex.args[1].args] : Symbol[ex.args[1]]
     params[2:end], ex.args[2]
@@ -2402,14 +2410,14 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_KernelSourc
     _jax_split_outputs(ctx, recipe, v)
 end
 
-_jax_source_module(op::_KernelSourceOp) = _jax_closure_module(_source_closure(op.f))
+_jax_source_module(op::_KernelSourceOp) = _kernel_endpoint_source_module(op)
 function _jax_closure_module(f)
     f isa Function || return Main
     ms = methods(f)
     isempty(ms) ? parentmodule(typeof(f)) : first(ms).module
 end
 _jax_source_captures(op::_KernelSourceOp) = _jax_captures(op.f)
-_jax_captures(f::_KernelSourceFunction) = f.captures
+_jax_captures(f::_KernelSource) = f.captures
 _jax_captures(f) = nothing
 
 # Translate `source` with `names[i]` bound to `inputs[i]`.

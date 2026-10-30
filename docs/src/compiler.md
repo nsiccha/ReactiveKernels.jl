@@ -279,8 +279,9 @@ b = __constants__[2]
 c = (__callables__[3])(a, b)
 ```
 
-A source with lexical captures reads them from its authored closure, which the
-callables tuple keeps for it (`var"#c#op1" = getfield(__callables__[1], :c)`);
+A source with lexical captures reads them from its source record, which the
+callables tuple keeps for it
+(`var"#c#op1" = getfield(getfield(__callables__[1], :captures), :c)`);
 a literal statement is its literal (`shift::Float64 = -1.5`) and an alias its
 argument. The source's own names are resolved in the module that defined it,
 as the rest of the body resolves globals. An operation whose code is not its
@@ -323,22 +324,23 @@ specializes and executes the recipe callables normally; their own dispatch,
 allocations, exceptions, and side effects are not erased by the graph compiler.
 
 Fresh authored definitions retain distinct provenance even when their source is
-identical. At prepared-kernel assembly, execution uses the existing generated
-source companion and its concrete lexical captures. The execution copy carries
-no definition token: the original operations, with their tokens, remain in the
-plan, source recipes and `lowered_recipes`. This lets identical fresh builds
-reuse operation and derivative types without merging their graph identities or
-caching bound data. The execution copy holds no provenance value either, so a
-capture-free operation table stays free of heap references that Enzyme would
-otherwise have to prove read-only in the differentiated callable. Bodies with
-local functions, generators, exception scopes, or boxed lexical cells retain
-Julia's native closure path. A companion compiled while a package image is
-built, before the image's generated method is visible, is wrapped for a
-latest-world call. Once that method is visible, as in every process that loads
-the image, the execution copy holds the generated function itself, so a graph
-defined in a package image runs its cells as one built at run time does.
-Before then, preparation keeps the guarded closure, whose method query selects
-the native closure after loading. Private generated
+identical: each authored operation carries a definition token, a value the plan,
+the source recipes and `lowered_recipes` keep. An operation's type is its
+source's (`_KernelSource`: the source compiled once as a runtime-generated
+function over its captured values, its parameter names in the record's type;
+the token and the module stay on the recipe's operation), so identical
+fresh builds reuse operation and derivative types without merging their graph
+identities or caching bound data, and a prepared kernel's callables table
+holds the records themselves. A capture-free operation table stays
+free of heap references that Enzyme would otherwise have to prove read-only in
+the differentiated callable. Bodies with local functions, generators, exception
+scopes, or boxed lexical cells retain Julia's native closure, called with a
+latest-world fallback where its method is not yet visible. A companion compiled
+while a package image is built, before the image's generated method is visible,
+is wrapped for a latest-world call; once that method is visible, as in every
+process that loads the image, the call enters the generated function directly,
+so a graph defined in a package image runs its cells as one built at run time
+does. Private generated
 names in the derivative operand pack are canonicalized in that actual pack;
 the operands and their positional reads are unchanged. Construction, planning,
 and preparation still perform work, so reusing a build remains useful.

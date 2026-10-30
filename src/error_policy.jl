@@ -118,9 +118,8 @@ end
 # Read the fields with the `getfield` builtin so nothing is compiled per type.
 Base.@nospecializeinfer function _kernel_with_ignored_throws(
         @nospecialize(op::_KernelSourceOp), @nospecialize(ignored))
-    T = typeof(op)::DataType
-    _KernelSourceOp(Val(T.parameters[1]), Val(T.parameters[2]), getfield(op, :f),
-                    ignored, getfield(op, :call_identity))
+    _KernelSourceOp(Val(getfield(op, :token)), Val(getfield(op, :form)), getfield(op, :f),
+                    ignored, getfield(op, :call_identity), getfield(op, :mod))
 end
 
 _kernel_ignore_throw_op(op) = _IgnoredThrowFunction(op)

@@ -137,7 +137,7 @@ end
     a = RK._KernelSourceOp(Val(:nested_a), Val(:fused), sin)
     b = RK._KernelSourceOp(Val(:nested_b), Val(:fused), cos)
     wrapped = RK._KernelSourceOp(Val(:nested_c), Val(:fused),
-                                 RK._KernelSourceFunction(a, nothing, nothing))
+                                 RK._KernelSource((;), nothing, a))
     A, B, W = typeof(a), typeof(b), typeof(wrapped)
     call = typeof(RK._kernel_source_call)
     # Distinct operations, called directly or forwarded, are well founded.
@@ -151,7 +151,7 @@ end
     @test !relation(nothing, nothing, Tuple{typeof(sin),Float64}, Tuple{A,Float64})
     if hasfield(Method, :recursion_relation)
         for sig in (Tuple{RK._KernelSourceOp,Vararg{Any}},
-                    Tuple{RK._KernelSourceFunction,Vararg{Any}},
+                    Tuple{RK._KernelSource,Vararg{Any}},
                     Tuple{RK._KernelBranch,Vararg{Any}},
                     Tuple{RK._KernelReduction,Vararg{Any}},
                     Tuple{RK._IgnoredThrowFunction,Vararg{Any}})

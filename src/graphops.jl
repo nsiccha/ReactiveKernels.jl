@@ -266,9 +266,7 @@ for (f, types) in ((_bound_entry, (Plan, Any)), (_bound_hoisted, (_BoundEntry, T
                    (_rebound_table, (_RebindTable, Vector{Recipe})),
                    (_rebound_table, (Vector{Any}, Vector{Int}, Vector{Any})),
                    (_rebound_table, (Vector{Any}, Vector{Int}, Vector{Recipe})),
-                   (_ExecutableTable, (Vector{Any},)),
-                   (_executable_entries, (_ExecutableTable, Vector{Any})),
-                   (_executable_callables, (_ExecutableTable, Vector{Any})),
+                   (_executable_callables, (Vector{Any},)),
                    (_executed_prepared_kernel,
                     (Any, Tuple, Tuple, Tuple, Tuple, Plan, Expr, Tuple, Type, Any)))
     precompile(f, types) || error("no $f method for $types")

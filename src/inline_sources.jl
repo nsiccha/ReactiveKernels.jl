@@ -13,9 +13,9 @@
 # with its locals named from the recipe's position `k` in the lowered recipes
 # (`_inline_local_name`), so the statement names its recipe for the passes
 # that read one (`_inline_statement_call`) and references no table. A source
-# with lexical captures reads them from its authored closure, which the
-# callables table keeps for it under the type every build of the program
-# shares (`_kernel_shared_closure`): `var"#c#opk" = getfield(__callables__[k], :c)`.
+# with lexical captures reads them from its source record (`_KernelSource`),
+# which the callables table keeps for it under the type every build of the
+# program shares: `var"#c#opk" = getfield(getfield(__callables__[k], :captures), :c)`.
 # A literal statement is its literal (`shift::Float64 = -1.5`), an alias its
 # argument (`y = x`). The plan, its recipes and `Recipe.source` are untouched,
 # so `explain`, `recipe_inventory` and the structural graph read as before,
@@ -71,22 +71,28 @@ const _INLINE_SCOPE_HEADS = (:->, :function, :let, :for, :generator, :comprehens
                              :typed_comprehension, :do, :try, :while)
 
 # The inline form of recipe `r` over `callargs` (the recipe at position `slot`
-# of the lowered recipes) and the authored closure the callables table keeps
-# for it (read only for its captures), or `nothing` where the recipe keeps
-# its call.
+# of the lowered recipes) and the source record the callables table keeps for
+# it (read only for its captures), or `nothing` where the recipe keeps its
+# call.
 function _inline_source_form(r::Recipe, callargs, slot::Int)
     op = r.op
     op isa _KernelSourceOp || return nothing
     kernel_sourceop_form(op) === :fused || return nothing
-    # A plain source function inlines, and so does a fused source with
-    # data-only split nodes (`_KernelSplit`): a residual plan calls it whole,
-    # partial evaluation reads its parts from the plan's recipe, never from the
-    # slot, so the whole source is its code. A branch or a reduction keeps its
+    # A plain source inlines, and so does a fused source with data-only split
+    # nodes (`_KernelSplit`): a residual plan calls it whole, partial
+    # evaluation reads its parts from the plan's recipe, never from the slot,
+    # so the whole source is its code. A branch or a reduction keeps its
     # operation: the plate lowerings read its parts through the slot
     # (`getfield(__callables__[k], :f)`), and its source is not its code.
     f = getfield(op, :f)
     f isa _KernelSplit && (f = getfield(f, :call))
-    f isa _KernelSourceFunction || return nothing
+    f isa _KernelSource || return nothing
+    # A source whose closure Julia must own (a local function, a generator or
+    # comprehension, an exception scope, a boxed capture) keeps its native
+    # closure and its call: inside a generated body Julia creates such a
+    # closure at run time and every value derived from it dispatches
+    # dynamically.
+    _source_native(f) === nothing || return nothing
     # The throw-stripped twin (`on_error = :ignore`) carries the authored
     # source, which is not its code; `prepare(…; on_error = :ignore)` turns
     # this emitter off for that preparation (`_INLINE_SOURCES_OFF`), so an
@@ -94,41 +100,26 @@ function _inline_source_form(r::Recipe, callargs, slot::Int)
     # an outlined cell subexpression (`_cell_outline`), a hand-built
     # operation. Its source is its code.
     source = r.source
+    captures = _source_captures(f)
     if _inline_literal(source)
         # A literal statement (`a::Float64 = -1.5`): the literal is its code.
-        isempty(callargs) || return nothing
-        closure = _kernel_native_source(f)
-        T = typeof(closure)
-        T isa DataType && closure isa Function && fieldcount(T) == 0 || return nothing
-        shared = _kernel_shared_closure(closure, Expr(:->, Expr(:tuple), source))
-        return source, shared
+        isempty(callargs) && isempty(captures) || return nothing
+        return source, f
     end
     if source isa Symbol
         # An alias (`y::Float64 = x`): the statement is its one argument.
         params = _recipe_source_names(r)
         length(params) == length(callargs) == 1 && only(params) === source || return nothing
-        closure = _kernel_native_source(f)
-        T = typeof(closure)
-        T isa DataType && closure isa Function && fieldcount(T) == 0 || return nothing
-        shared = _kernel_shared_closure(closure, Expr(:->, Expr(:tuple, source), source))
-        return only(callargs), shared
+        isempty(captures) || return nothing
+        return only(callargs), f
     end
     source isa Expr || return nothing
     params = _recipe_source_names(r)
     length(params) == length(callargs) && allunique(params) || return nothing
     mod = _kernel_endpoint_source_module(op)
     mod isa Module || return nothing
-    closure = _kernel_native_source(f)
-    T = typeof(closure)
-    T isa DataType && closure isa Function || return nothing
-    names = fieldnames(T)
-    any(i -> getfield(closure, i) isa Core.Box, 1:length(names)) && return nothing
+    names = keys(captures)
     native = _kernel_native_body(source, mod, Set{Symbol}(params))
-    # A source whose closures Julia must own (a local function, a generator or
-    # comprehension, an exception scope) keeps its native closure today, with
-    # no generated companion (`_kernel_source_function`): inside a generated
-    # body Julia creates such a closure at run time and every value derived
-    # from it dispatches dynamically. It keeps its table call here too.
     _kernel_source_native_scope(native) && return nothing
     body = try
         macroexpand(mod, native)
@@ -152,29 +143,30 @@ function _inline_source_form(r::Recipe, callargs, slot::Int)
     rewritten = _inline_qualify(body, mod, renamed)
     rewritten === nothing && return nothing
     # The parameters bound to the call's arguments, then the captures: each
-    # a field of the authored closure the callables table keeps at the
+    # a field of the record's `captures` the callables table keeps at the
     # recipe's position, read through that literal entry (never the bare
     # table, which the table analyses read as "the whole table" and
     # `_rewrite_embedded` cannot shift).
     bindings = Any[Expr(:(=), renamed[name], arg) for (name, arg) in zip(params, callargs)]
     for name in names
-        push!(bindings, Expr(:(=), renamed[name],
-                             Expr(:call, GlobalRef(Core, :getfield),
-                                  Expr(:ref, _CALLABLES_ARG, slot), QuoteNode(name))))
+        push!(bindings, Expr(:(=), renamed[name], _inline_capture_expr(slot, name)))
     end
-    # The closure under the type every build of this source shares
-    # (`_kernel_shared_closure`), so one program's fresh builds have one table
-    # type and one compiled body; the lowering keeps it only where the body
-    # reads a capture from it.
-    shared = _kernel_shared_closure(closure, Expr(:->, Expr(:tuple, params...), source))
-    isempty(bindings) && return rewritten, shared
-    Expr(:let, Expr(:block, bindings...), rewritten), shared
+    isempty(bindings) && return rewritten, f
+    Expr(:let, Expr(:block, bindings...), rewritten), f
 end
+
+# `getfield(getfield(__callables__[k], :captures), :name)`: the captured value
+# `name` of the source record at position `k`.
+_inline_capture_expr(slot::Int, name::Symbol) =
+    Expr(:call, GlobalRef(Core, :getfield),
+         Expr(:call, GlobalRef(Core, :getfield), Expr(:ref, _CALLABLES_ARG, slot),
+              QuoteNode(:captures)),
+         QuoteNode(name))
 
 # An inlined statement's right-hand side read back as the call it replaced:
 # `(slot, callargs)` for `let var"#x#opk" = x, …; body end`, the position `k`
 # its locals were named from and the bound arguments, or `nothing` for any
-# other expression. A capture binding (`var"#c#opk" = getfield(__callables__[k], :c)`)
+# other expression. A capture binding (`var"#c#opk" = getfield(getfield(__callables__[k], :captures), :c)`)
 # is not an argument. A statement with no binding (a literal, an alias, a
 # source over no argument) names no recipe.
 function _inline_statement_call(rhs)
@@ -195,9 +187,15 @@ function _inline_statement_call(rhs)
     end
     slot, callargs
 end
-_inline_capture_read(value, slot) = value isa Expr && value.head === :call &&
-    length(value.args) == 3 && value.args[1] == GlobalRef(Core, :getfield) &&
-    _callable_slot(value.args[2]) == slot && value.args[3] isa QuoteNode
+function _inline_capture_read(value, slot)
+    value isa Expr && value.head === :call && length(value.args) == 3 &&
+        value.args[1] == GlobalRef(Core, :getfield) && value.args[3] isa QuoteNode ||
+        return false
+    captures = value.args[2]
+    captures isa Expr && captures.head === :call && length(captures.args) == 3 &&
+        captures.args[1] == GlobalRef(Core, :getfield) &&
+        captures.args[3] == QuoteNode(:captures) && _callable_slot(captures.args[2]) == slot
+end
 
 function _inline_contains_return(ex)
     ex isa Expr || return false

@@ -15,12 +15,10 @@ function _embedded_native_source_ops(kernel)
             foreach(visit, ex.args)
         end
     end
-    for op in kernel.callables
-        op isa ReactiveKernels._KernelSourceOp || continue
-        op.f isa ReactiveKernels._KernelSourceFunction || continue
-        for method in methods(op.f.f), statement in Base.uncompressed_ast(method).code
-            visit(statement)
-        end
+    for f in kernel.callables
+        f isa ReactiveKernels._KernelSource || continue
+        f.companion === nothing && continue
+        visit(ReactiveKernels.RuntimeGeneratedFunctions.get_expression(f.companion))
     end
     found
 end
@@ -142,9 +140,7 @@ function _latest_source_fresh_model()
 end
 
 @testset "scoped native source calls across a fresh-model world age" begin
-    captured = ReactiveKernels._KernelSourceFunction(identity, nothing, (; kept = 2.0))
-    latest = ReactiveKernels._kernel_latest_source(captured)
-    @test latest.captures === captured.captures
-    @test latest(2.0) == captured(2.0)
+    captured = ReactiveKernels._KernelSource((; kept = 2.0), nothing, identity)
+    @test captured(2.0) == 2.0
     _latest_source_fresh_model()
 end

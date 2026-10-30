@@ -16,6 +16,27 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.27
+
+- An authored recipe's operation carries its source as a record instead of a
+  closure (stage 3 of the operation-table migration, decision `0dgfkf5`).
+  `_KernelSource` holds what runs: the captured values, the source compiled
+  once as a runtime-generated function over them (its type carries the
+  canonical source's id; the record's type the authored parameter names), or the native
+  closure for a source Julia must own (a local function, a generator, an
+  exception scope, a boxed capture). The recipe's operation (`_KernelSourceOp`)
+  keeps the definition token, the form and the authoring module as values, not
+  type parameters, and a prepared kernel's callables table holds the record,
+  never the operation, so one program's fresh builds share one kernel type
+  without execution copies: `_KernelSourceFunction`, `_ExecutableSourceFunction`,
+  `src/execution_sources.jl`, the guarded and latest-world call modes and the
+  per-process executable table are gone. A capture reads as
+  `getfield(getfield(__callables__[k], :captures), :c)`. `prepare_sampler`'s
+  latest-world preparation and `_kernel_eval_definition`'s
+  `latest_world_native_sources` are accepted and do nothing: a record is
+  callable from any world. Values, gradients, plans, recipes and `code_expr`'s
+  statements are unchanged.
+
 ## 0.1.26
 
 - **Breaking:** the generated function takes two tables instead of the
