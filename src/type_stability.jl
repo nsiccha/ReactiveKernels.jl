@@ -302,6 +302,7 @@ end
 #   the standard libraries), which stay leaves.
 _type_stability_choices(::Val{:type_stability}) = (:warn, :error)
 _type_stability_choices(::Val{:type_stability_level}) = (:all, :rk, :values)
+_type_stability_choices(::Val{:cell_locality}) = (:warn, :error, :ignore)
 
 function _type_stability_choice(setting::Val{S}, value) where {S}
     choices = _type_stability_choices(setting)
@@ -316,10 +317,15 @@ end
 # are not compiled in, so a new session picks up a change without recompiling.
 # `__init__` forgets values read while an image was generated.
 const _TYPE_STABILITY_PREFERENCES =
-    (Ref{Union{Nothing,Symbol}}(nothing), Ref{Union{Nothing,Symbol}}(nothing))
+    (Ref{Union{Nothing,Symbol}}(nothing), Ref{Union{Nothing,Symbol}}(nothing),
+     Ref{Union{Nothing,Symbol}}(nothing))
 _type_stability_preference_cache(::Val{:type_stability}) = _TYPE_STABILITY_PREFERENCES[1]
 _type_stability_preference_cache(::Val{:type_stability_level}) =
     _TYPE_STABILITY_PREFERENCES[2]
+# The cell-locality preference (`cell_locality`, plate_partition.jl) is read
+# and cached the same way.
+_type_stability_preference_cache(::Val{:cell_locality}) = _TYPE_STABILITY_PREFERENCES[3]
+_cell_locality_preference() = _type_stability_preference(Val(:cell_locality))
 
 function _type_stability_preference(setting::Val{S}) where {S}
     cache = _type_stability_preference_cache(setting)

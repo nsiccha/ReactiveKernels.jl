@@ -47,6 +47,7 @@ include("execution_sources.jl")
 include("value_metadata.jl")
 include("cells.jl")
 include("cell_windows.jl")
+include("plate_partition.jl")
 include("lane_sources.jl")
 include("inline_sources.jl")
 include("cell_arrays.jl")
@@ -68,6 +69,8 @@ include("jax_host.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, PreparedADPullback, ReplicatedKernel, NonAllocatingKernel, PlanningError
 export TypeInstabilityError
+export PartitionLocalityError, PartitionSeparabilityError, partition_locality, plate_partition,
+    partition_footprint, partition_footprint_kernel, partition_separability
 export PreparedADOperator, PreparedADPushforward, PreparedADHVP, PreparedADThird
 export value, value!, add!, plan, prepare, prepare_nonallocating, plate, scan, @plate, @scan
 export partial_evaluation

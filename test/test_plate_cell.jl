@@ -1309,14 +1309,228 @@ end
             @test ds ≈ _cell_central(s -> k(d..., s, i), 0.7) atol = 1e-8
         end
         backend === runtime || continue
-        exact = try
-            ad = prepare_ad(k, plain, d..., 0.7, 1; active = :s)
-            last(ad_value_and_gradient(ad, d..., 0.7, 1)) ≈
-                _cell_central(s -> k(d..., s, 1), 0.7)
-        catch err
-            nameof(typeof(err)) === :EnzymeRuntimeActivityError || rethrow()
-            false
-        end
-        @test_broken exact
+        # Plain Reverse too: a window's rows are read positions-first, then
+        # gathered once (RK 0.1.24), which static activity analysis accepts.
+        ad = prepare_ad(k, plain, d..., 0.7, 1; active = :s)
+        @test last(ad_value_and_gradient(ad, d..., 0.7, 1)) ≈
+            _cell_central(s -> k(d..., s, 1), 0.7)
     end
+end
+
+# ReactiveKernelsPPL unpacks a packed parameter vector into blocks as
+# `view(u, lo:hi)` and `reshape(flat, n, k)`. A block read at a cell's rows is
+# computed, as those rows, from the packed positions the rows hold, so a
+# subject's cell reads its own coordinates only (decision
+# `ReactiveKernels:snag.partition-graph-6306f756/decisions/2026-10-30T11-52-01-648-08uci2h`,
+# option 1, increment 1).
+@kernel _cell_packed(u::AbstractVector{Float64}, g::AbstractVector{Int},
+                     w::AbstractVector{Float64}) = begin
+    a::Float64 = u[1]
+    zflat::AbstractVector{Float64} = view(u, 2:11)
+    Z::AbstractMatrix{Float64} = reshape(zflat, 5, 2)
+    tau::Float64 = u[12]
+    R = Z * [1.0 0.5; 0.0 1.0]
+    log_k = a .+ w .* tau .+ R[g, 1]
+    log_v = R[g, 2]
+    dens = plate(log_k, log_v, w) do lk, lv, wi
+        -(wi - exp(lk))^2 / 2 - lv^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+# The same with the bounds and dimensions as scalar inputs.
+@kernel _cell_packed_inputs(u::AbstractVector{Float64}, g::AbstractVector{Int},
+                            w::AbstractVector{Float64}, lo::Int, hi::Int, n::Int) = begin
+    a::Float64 = u[1]
+    zflat::AbstractVector{Float64} = u[lo:hi]
+    Z::AbstractMatrix{Float64} = reshape(zflat, n, 2)
+    log_k = a .+ w .+ Z[g, 1]
+    dens = plate(log_k, w) do lk, wi
+        -(wi - exp(lk))^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+_cell_packed_data(m) = (; u = [0.3; [0.1 * ((k * 7) % 5 - 2) for k in 1:10]; 0.7],
+    g = [1 + (i - 1) % 5 for i in 1:m], w = [sin(i / 3) for i in 1:m])
+
+@testset "plate_cell: packed blocks (a literal range view and a reshape) read at the cell's rows" begin
+    spec = plate_cell(_cell_packed, :dens; index = :i, locality = :error)
+    k = prepare(spec; have = (:u, :g, :w, :i), want = :dens_cell)
+    full = prepare(_cell_packed; have = (:u, :g, :w), want = :dens)
+    for m in (12, 400)
+        d = _cell_packed_data(m)
+        @test [k(d.u, d.g, d.w, i) for i in 1:m] ≈ full(d.u, d.g, d.w)
+    end
+    allocated(m) = (d = _cell_packed_data(m); k(d.u, d.g, d.w, 2); @allocated k(d.u, d.g, d.w, 2))
+    @test allocated(10) == allocated(10_000)
+    report = partition_locality(k)
+    status(name) = only(e.status for e in report if e.value === name)
+    @test status(:zflat) === :rows && status(:Z) === :rows && status(:R) === :rows
+    @test status(:log_k) === :rows && status(:log_v) === :rows
+    @test status(:a) === :scalar && status(:tau) === :scalar && status(:u) === :input
+    @test all(e.status !== :whole for e in report)
+    d = _cell_packed_data(15)
+    ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), d.u, d.g, d.w, 2; active = :u)
+    gradient = similar(d.u)
+    value, _ = ad_value_and_gradient!(ad, gradient, d.u, d.g, d.w, 2)
+    @test value ≈ full(d.u, d.g, d.w)[2]
+    for j in eachindex(d.u)
+        @test gradient[j] ≈ _cell_central(h -> k(d.u .+ h .* (eachindex(d.u) .== j),
+            d.g, d.w, 2), 0.0) atol = 1e-6
+    end
+    # `a`, row `g[2]` of both columns of `Z` (packed after `a`), and `tau`.
+    @test findall(!iszero, gradient) == [1, 1 + d.g[2], 6 + d.g[2], 12]
+    bound = prepare(spec; have = (:u, :g, :w, :i), want = :dens_cell, bound = (; d.g, d.w))
+    @test [bound(d.u, i) for i in 1:15] ≈ full(d.u, d.g, d.w)
+    # The cell's own reads and the positions a row holds are bounds-checked.
+    @test_throws BoundsError k(d.u, d.g, d.w, 16)
+    @test_throws BoundsError k(d.u, [6; d.g[2:end]], d.w, 1)
+
+    spec = plate_cell(_cell_packed_inputs, :dens; index = :i, locality = :error)
+    k = prepare(spec; have = (:u, :g, :w, :lo, :hi, :n, :i), want = :dens_cell)
+    full = prepare(_cell_packed_inputs; have = (:u, :g, :w, :lo, :hi, :n), want = :dens)
+    d = _cell_packed_data(9)
+    @test [k(d.u, d.g, d.w, 2, 11, 5, i) for i in 1:9] ≈ full(d.u, d.g, d.w, 2, 11, 5)
+    allocated(m) = (d = _cell_packed_data(m); k(d.u, d.g, d.w, 2, 11, 5, 2);
+                    @allocated k(d.u, d.g, d.w, 2, 11, 5, 2))
+    @test allocated(10) == allocated(10_000)
+    @test all(e.status !== :whole for e in partition_locality(k))
+end
+
+# A value with no row form that a cell reads at its rows is computed whole in
+# every cell. Preparation names it instead of staying silent: `locality =
+# :error` refuses, `:warn` warns once per process, `:ignore` evaluates as
+# before. The rule (decision `08uci2h` above): a value that every reader of the
+# evaluation needs only at some rows is computed only at those rows, or it is a
+# violation, named with its producer's source and the reader that asked.
+_cell_opaque_field(x, s) = s .* cumsum(x)
+_cell_opaque_walk(y) = cumsum(y)
+@kernel _cell_opaque(x::AbstractVector{Float64}, s::Float64, w::AbstractVector{Float64}) = begin
+    field::Vector{Float64} = _cell_opaque_field(x, s)
+    eta = field .+ w
+    dens = plate(eta, w) do ei, wi
+        -(wi - ei)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+@kernel _cell_cascade(x::AbstractVector{Float64}, s::Float64, w::AbstractVector{Float64}) = begin
+    field::Vector{Float64} = _cell_opaque_field(x, s)
+    walk::Vector{Float64} = _cell_opaque_walk(field)
+    eta = walk .+ w
+    dens = plate(eta, w) do ei, wi
+        -(wi - ei)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+# Values the evaluation genuinely needs whole are shared, never refused: a
+# total (`sum(x)`), the right operand of a product (`A * x`), a scalar. A
+# scalar's type must be known (declared, or inferred from concrete inputs):
+# an untyped value with no row form may be an array computed whole, and is
+# refused as such, naming the declaration that settles it.
+@kernel _cell_shared(x::AbstractVector{Float64}, w::AbstractVector{Float64},
+                     A::Matrix{Float64}) = begin
+    s::Float64 = sum(x)
+    scaled = x .* s
+    v = A * x
+    eta = scaled .+ v .+ w
+    dens = plate(eta, w) do ei, wi
+        -(wi - ei)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+
+@testset "plate_cell: locality — a value computed whole though read at rows is refused by name" begin
+    have = (:x, :s, :w, :i)
+    # refused: the cell would read every row of `field` (decision `08uci2h`, option 1)
+    err = try
+        prepare(plate_cell(_cell_opaque, :dens; index = :i, locality = :error);
+                have, want = :dens_cell)
+        nothing
+    catch e
+        e
+    end
+    @test err isa PartitionLocalityError
+    @test err.cell === :dens_cell
+    @test [v.value for v in err.violations] == [:field]
+    @test only(err.violations).reason === :no_form
+    @test only(err.violations).reader === :eta
+    message = sprint(showerror, err)
+    @test occursin("`field` is computed whole", message)
+    @test occursin("_cell_opaque_field(x, s)", message)
+    @test occursin("by `eta`", message)
+    # `:warn` names it once per process; the cell still evaluates.
+    warned = @test_logs (:warn, r"computes a value whole") prepare(
+        plate_cell(_cell_opaque, :dens; index = :i, locality = :warn); have, want = :dens_cell)
+    @test_logs prepare(plate_cell(_cell_opaque, :dens; index = :i, locality = :warn);
+                       have, want = :dens_cell)
+    silent = @test_logs prepare(plate_cell(_cell_opaque, :dens; index = :i, locality = :ignore);
+                                have, want = :dens_cell)
+    x, w = [1.0, 2.0, 3.0], [0.1, 0.2, 0.3]
+    full = prepare(_cell_opaque; have = (:x, :s, :w), want = :dens)(x, 0.5, w)
+    @test [warned(x, 0.5, w, i) for i in 1:3] ≈ full
+    @test [silent(x, 0.5, w, i) for i in 1:3] ≈ full
+    report = partition_locality(warned)
+    entry(name) = only(e for e in report if e.value === name)
+    @test entry(:field).status === :whole && entry(:field).reason === :no_form
+    @test entry(:eta).status === :rows
+    @test entry(:x).status === :input && entry(:s).status === :input
+    # The default reads the project preference, `:warn` unless set.
+    @test ReactiveKernels._cell_locality_preference() === :warn
+    @test_throws ArgumentError plate_cell(_cell_opaque, :dens; index = :i, locality = :loud)
+
+    # Only the root of a cascade is refused; the report marks the rest.
+    err = try
+        prepare(plate_cell(_cell_cascade, :dens; index = :i, locality = :error);
+                have, want = :dens_cell)
+        nothing
+    catch e
+        e
+    end
+    @test err isa PartitionLocalityError
+    @test [v.value for v in err.violations] == [:walk]
+    k = prepare(plate_cell(_cell_cascade, :dens; index = :i, locality = :ignore);
+                have, want = :dens_cell)
+    report = partition_locality(k)
+    @test entry(:walk).status === :whole && entry(:walk).reason === :no_form
+    @test entry(:field).status === :whole && entry(:field).reason === :cascade
+    @test entry(:field).reader === :walk
+
+    # Shared values are not violations.
+    k = prepare(plate_cell(_cell_shared, :dens; index = :i, locality = :error);
+                have = (:x, :w, :A, :i), want = :dens_cell)
+    report = partition_locality(k)
+    @test entry(:x).status === :input && entry(:s).status === :scalar
+    @test entry(:v).status === :rows && entry(:scaled).status === :rows
+    @test entry(:eta).status === :rows
+    @test all(e.status !== :whole for e in report)
+    A = [1.0 0.0 0.5; 0.0 1.0 0.0; 0.2 0.0 1.0]
+    @test [k(x, w, A, i) for i in 1:3] ≈
+        prepare(_cell_shared; have = (:x, :w, :A), want = :dens)(x, w, A)
+    # A kernel without cells reports nothing.
+    @test isempty(partition_locality(prepare(_cell_shared; have = (:x, :w, :A), want = :dens)))
+
+    # An undeclared scalar is refused, naming the declaration.
+    @kernel _cell_untyped(x::AbstractVector{Float64}, w::AbstractVector{Float64}) = begin
+        s = sum(x)
+        eta = w .* s
+        dens = plate(eta, w) do ei, wi
+            -(wi - ei)^2 / 2
+        end
+        total = sum(dens)
+        return total
+    end
+    err = try
+        prepare(plate_cell(_cell_untyped, :dens; index = :i, locality = :error);
+                have = (:x, :w, :i), want = :dens_cell)
+        nothing
+    catch e
+        e
+    end
+    @test err isa PartitionLocalityError
+    @test only(err.violations).value === :s && only(err.violations).reason === :untyped
+    @test occursin("s::Float64 = …", sprint(showerror, err))
 end

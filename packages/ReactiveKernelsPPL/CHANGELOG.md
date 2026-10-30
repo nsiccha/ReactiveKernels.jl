@@ -16,6 +16,44 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.21
+
+- `prepare_partition(built, plan, observations; by, locality = :error)`,
+  `PartitionQuery`, `partition_labels`, `prepare_partition_sampler(built, plan,
+  observations, u0; by, backend, locality)`, `PartitionSampler` and
+  `partition_value_and_gradient!(s, g, u, label)`: one partition of the named
+  observations (all cells whose key equals a label, such as one subject's)
+  as one compiled pass, with its value and dense gradient. `by` names a
+  supplied data column with one entry per cell of each observation's plate
+  (one name, or `observation => column` pairs). Requires ReactiveKernels
+  0.1.24.
+- `prepare_partition_sampler(…; compact = true, partitioned = ())`: with
+  `compact` (the default) the gradient is over each partition's footprint,
+  the packed coordinates it reads, computed at preparation for every label
+  (`ReactiveKernels.partition_footprint(s, label)` lists them; `g` has the
+  footprint's length), the active coordinates overlaying a read-only packed
+  base as in `prepare_compact_cell_sampler` (native Enzyme Reverse needs
+  `Enzyme.set_runtime_activity`); `compact = false` gives a dense gradient
+  over the whole packed vector, nonzero only on the footprint (atlas-17, one
+  unit: compact 2.6 ms, dense 3.1 ms). `partitioned` names the parameters whose
+  rows belong to one partition each, bare when indexed by the key column
+  (`z[levels(subject)]`) or as `parameter => labels`; a partition that reads
+  another label's rows of them is refused at preparation with a
+  `ReactiveKernels.PartitionSeparabilityError`. The sampler prepares the
+  footprint kernel once (`ReactiveKernels.partition_footprint_kernel`).
+- An LKJ factor's unconstrained block is read as a statement of its own
+  (`_ppl_lkj_raw_<name>`), as every other block is: read inside the `tanh.`
+  expression, a cell or partition counted the whole packed vector as read, so
+  a model with correlated group effects had every coordinate in every
+  partition's footprint.
+- `prepare_cell_query`, `prepare_cell_sampler` and
+  `prepare_compact_cell_sampler` take `locality = :error | :warn | :ignore`
+  (`nothing`, the default, reads ReactiveKernels' `cell_locality`
+  preference): with `:error` a query is refused with a
+  `ReactiveKernels.PartitionLocalityError` naming each model value the cell
+  reads at its rows but would compute whole, and the statement that computes
+  it.
+
 ## 0.1.20
 
 - A constructed endpoint (`object(; …).endpoint(x)`) accepts any method-bearing

@@ -16,6 +16,56 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.24
+
+- `plate_partition(spec, plates; by, index, name, locality)`: the cells of
+  one or more authored plates whose key equals the label held by the HAVE
+  port `index` (one subject's observations), summed, as ONE compiled pass:
+  each plate loops once over the positions holding the label, and every
+  value the partition's cells read at their rows is computed once per
+  partition at the union of those rows. `by` gives each plate's key (one
+  entry per cell, usually bound data); under `bound=` each label's positions
+  are computed once per binding. A label no named plate has is refused by
+  name; a plate without a cell of the label contributes nothing.
+- Locality guarantee: a value a cell or partition reads at its rows but would
+  compute whole is now named instead of computed silently. `plate_cell` and
+  `plate_partition` take `locality = :error | :warn | :ignore`
+  (`PartitionLocalityError` lists each such value with its producer's source,
+  the reason and the reader that asked for rows; `:warn` names each once per
+  process); `plate_cell` defaults to the project preference `cell_locality`
+  (`"warn"` unless set), `plate_partition` to `:error`.
+  `partition_locality(kernel)` reports the classification of every value a
+  cell reads (`:rows`, `:input`, `:data`, `:scalar`, `:shared`,
+  `:whole`).
+- Two more producers are computed at a cell's rows: `view(A, lo:hi)` /
+  `A[lo:hi]` and `reshape(v, n, k...)` with literal or scalar-input bounds and
+  dimensions, the shapes ReactiveKernelsPPL unpacks packed parameter blocks
+  with, so a block read at a cell's rows reads its own packed coordinates
+  only.
+- A cell's row window reads a vector of rows as one gather of its data at
+  the rows' positions (the positions computed first); the previous
+  row-by-row read made native Enzyme Reverse refuse a partition's gather of
+  a product's rows (`EnzymeRuntimeActivityError`). A partition's windows
+  hold their rows sorted and unique and a read finds its row by bisection,
+  so a partition of r cells reading a value row by row costs O(r log r), not
+  O(r²), and a value gathered at the rows of many cells is computed once per
+  distinct row; a single cell's windows are unchanged.
+- A plate body reading a row of a shared matrix, `M[q, :]` with `q` the
+  element of a batched integer argument, captures that row as `v[q]` captures
+  an element: a cell or partition reads only its own rows of the matrix.
+- Locality names two more cases that were computed whole silently: a
+  captured value whose index lane has no known type (`:untyped_index`), and a
+  value pushed for one reader and dropped because another reader at rows
+  cannot take it in its role (`:unshaped`, naming that reader). A literal
+  range or reshape of a matrix (linear positions, not rows) is refused as
+  `:operands`.
+- `partition_footprint` reads a lane of one row as that row (extruded over
+  the partition) instead of throwing, and a lowering nested in the footprint
+  lowering (a plate body, an embedded kernel) no longer records or returns
+  footprints of its own. `partition_footprint_kernel(kernel)` prepares the
+  footprint kernel for a caller to hold; `partition_separability` takes a
+  computed `footprint`.
+
 ## 0.1.23
 
 - Each authored recipe's source runs in the generated body. A fused recipe

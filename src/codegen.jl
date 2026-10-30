@@ -484,10 +484,45 @@ end
 # and so runs at that cell only as well.
 struct _AuthoredPlateCellOp{K,A}
     plate::_AuthoredPlateOp{K,A}
+    # What preparation does with a value the cell reads at rows but would
+    # compute whole (`_cell_locality_check!`, plate_partition.jl): `:error`,
+    # `:warn` or `:ignore`; `nothing` reads the `cell_locality` preference.
+    locality::Union{Nothing,Symbol}
+    # A partition (`plate_partition`, plate_partition.jl): the first input
+    # holds the linear positions of the cells to run (a `Vector{Int}`), not
+    # one position, and the value is the sum of those cells.
+    rows::Bool
+    # The separability rule of a partition (`partition_separability`): each
+    # per-partition HAVE port with the label of each of its positions
+    # (`missing` for a shared position).
+    partitioned::Tuple{Vararg{Pair{Symbol,<:AbstractVector}}}
 end
+_AuthoredPlateCellOp(plate::_AuthoredPlateOp) = _AuthoredPlateCellOp(plate, nothing, false, ())
+_AuthoredPlateCellOp(plate::_AuthoredPlateOp, locality) =
+    _AuthoredPlateCellOp(plate, locality, false, ())
+_AuthoredPlateCellOp(plate::_AuthoredPlateOp, locality, rows::Bool) =
+    _AuthoredPlateCellOp(plate, locality, rows, ())
 
 function (op::_AuthoredPlateCellOp{K,A})(index, args...) where {K,A}
+    op.rows && return sum(op.plate(_plate_partition_slices(Val(A), index, args...)...))
     only(op.plate(_plate_cell_slices(Val(A), index, args...)...))
+end
+
+# The plate's batched arguments restricted to the cells at the linear
+# positions `rows` of its (one-dimensional) domain, shared arguments
+# unchanged: views along the first axis (`_cell_row_slice`), bounds-checked
+# against the domain. The lowered partition emits the same steps.
+@generated function _plate_partition_slices(::Val{A}, rows, args::Vararg{Any,N}) where {A,N}
+    batched = [position for position in 1:N if !(position in A)]
+    raw(position) = :($(GlobalRef(Base, :broadcastable))(getfield(args, $position)))
+    shape = _plate_combined_axes_expr(Any[raw(position) for position in batched])
+    slices = Any[position in A ? :(getfield(args, $position)) :
+                 :(_cell_row_slice($(raw(position)), positions)) for position in 1:N]
+    quote
+        positions = _partition_rows(rows)
+        _partition_check_rows(_plate_require_axes($shape), positions)
+        ($(slices...),)
+    end
 end
 
 # The plate's batched arguments restricted to the cell at `index` (a linear or
@@ -1911,6 +1946,9 @@ struct _AuthoredPlateDraft{A}
 end
 struct _AuthoredPlateCellDraft{A}
     plate::_AuthoredPlateDraft{A}
+    locality::Union{Nothing,Symbol}
+    rows::Bool
+    partitioned::Tuple{Vararg{Pair{Symbol,<:AbstractVector}}}
 end
 const _AuthoredPlateLike = Union{_AuthoredPlateOp,_AuthoredPlateDraft}
 const _AuthoredPlateCellLike = Union{_AuthoredPlateCellOp,_AuthoredPlateCellDraft}
@@ -1929,7 +1967,8 @@ function _built_plate_op(draft::_AuthoredPlateDraft{A}) where {A}
     _AuthoredPlateOp{typeof(kernel),A}(kernel, draft.axis_checks)
 end
 _built_plate_op(draft::_AuthoredPlateCellDraft) =
-    _AuthoredPlateCellOp(_built_plate_op(draft.plate))
+    _AuthoredPlateCellOp(_built_plate_op(draft.plate), draft.locality, draft.rows,
+                         draft.partitioned)
 _built_plate_recipe(r::Recipe) =
     r.op isa Union{_AuthoredPlateDraft,_AuthoredPlateCellDraft} ?
     Recipe(r.id, r.inputs, r.outputs, _built_plate_op(r.op), r.cost, r.cse_key,
@@ -2244,7 +2283,9 @@ function _compose_plate_into(g::Graph, producer::Recipe, consumer::Recipe, cid)
     composed = _compose_authored_plates(g, producer, plate)
     cell || return composed
     Recipe(composed.id, (first(consumer.inputs), composed.inputs...), composed.outputs,
-        _AuthoredPlateCellDraft(composed.op), composed.cost, nothing, false, composed.source)
+        _AuthoredPlateCellDraft(composed.op, consumer.op.locality, consumer.op.rows,
+                                consumer.op.partitioned),
+        composed.cost, nothing, false, composed.source)
 end
 
 function _plate_dependencies(plan::Plan, root_ids::Set{ValueId})
@@ -4169,7 +4210,11 @@ end
 
 # A plate cell lowers as its plate over the one-cell slices of the plate's
 # arguments (`_plate_cell_slices`), with the same native plate lowering and the
-# same operation-table entries as the plate itself.
+# same operation-table entries as the plate itself. A partition (`op.rows`)
+# lowers as the plate over the rows slices of its arguments
+# (`_plate_partition_slices`): one native loop over the partition's cells,
+# summed, with every pushed value computed once at the union of the rows the
+# partition reads (`_CellEmitter`, cell_windows.jl).
 Base.@nospecializeinfer function _lower_authored_plate_cell!(
         body, runtime_ops, runtime_recipes, @nospecialize(recipe::Recipe),
         callargs, lhs; windows = nothing)
@@ -4179,6 +4224,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
     index_arg = first(callargs)
     plate_args = callargs[2:end]
     plate_values = recipe.inputs[2:end]
+    partition = op.rows
     pushed_lanes = Dict{Int,ValueId}()
     if windows !== nothing
         d = windows.pushdowns
@@ -4187,7 +4233,8 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
             value in d.pushed && (pushed_lanes[position] = value)
         end
     end
-    # The steps of `_plate_cell_slices`, one argument at a time.
+    # The steps of `_plate_cell_slices` / `_plate_partition_slices`, one
+    # argument at a time.
     raw = Dict{Int,Symbol}()
     for (position, arg) in enumerate(plate_args)
         (position in atomic || haskey(pushed_lanes, position)) && continue
@@ -4195,18 +4242,26 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
         push!(body.args, Expr(:(=), raw[position],
             Expr(:call, GlobalRef(Base, :broadcastable), arg)))
     end
-    cell = gensym(:cell_position)
+    cell = gensym(partition ? :partition_rows : :cell_position)
     axes = Any[haskey(pushed_lanes, position) ?
         _cell_shape!(windows, pushed_lanes[position]) :
         Expr(:call, GlobalRef(Base, :axes), raw[position])
         for position in eachindex(plate_args) if !(position in atomic)]
     shape = Expr(:call, GlobalRef(@__MODULE__, :_plate_broadcast_shape),
         Expr(:tuple, axes...))
-    push!(body.args, Expr(:(=), cell,
-        Expr(:call, GlobalRef(@__MODULE__, :_plate_cell_position),
-             Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes), shape), index_arg)))
-    row = isempty(pushed_lanes) ? nothing : _cell_bind!(windows, :cell_row,
-        Expr(:call, GlobalRef(Base, :getindex), cell, 1))
+    domain = Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes), shape)
+    if partition
+        push!(body.args, Expr(:(=), cell,
+            Expr(:call, GlobalRef(@__MODULE__, :_partition_rows), index_arg)))
+        push!(body.args, Expr(:call, GlobalRef(@__MODULE__, :_partition_check_rows),
+            domain, cell))
+        row = cell
+    else
+        push!(body.args, Expr(:(=), cell,
+            Expr(:call, GlobalRef(@__MODULE__, :_plate_cell_position), domain, index_arg)))
+        row = isempty(pushed_lanes) ? nothing : _cell_bind!(windows, :cell_row,
+            Expr(:call, GlobalRef(Base, :getindex), cell, 1))
+    end
     slices = Any[]
     lane_rows = Dict{Int,Symbol}()
     for (position, arg) in enumerate(plate_args)
@@ -4224,9 +4279,34 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
             continue
         end
         slice = gensym(:cell_argument)
-        push!(body.args, Expr(:(=), slice,
+        push!(body.args, Expr(:(=), slice, partition ?
+            Expr(:call, GlobalRef(@__MODULE__, :_cell_row_slice), raw[position], cell) :
             Expr(:call, GlobalRef(@__MODULE__, :_plate_cell_slice), raw[position], cell)))
         push!(slices, slice)
+        windows === nothing || _footprint_record!(
+            canon_id(windows.pushdowns.graph, plate_values[position].id),
+            partition ? :rows : :cell, cell)
+    end
+    # The footprint of the shared arguments: a capture of a value not computed
+    # at rows is read at its positions, any other shared argument whole; the
+    # index (or rows) argument is read whole.
+    if _footprint_recording() && windows !== nothing
+        d = windows.pushdowns
+        _footprint_record!(canon_id(d.graph, first(recipe.inputs).id), :whole, nothing)
+        positions = get(d.captures, recipe.id, Dict{Int,Vector{Tuple{Int,Int}}}())
+        for (position, value) in enumerate(plate_values)
+            position in atomic || continue
+            cid = canon_id(d.graph, value.id)
+            cid in d.pushed && continue
+            if haskey(positions, position)
+                for (batched, via) in positions[position]
+                    _footprint_record!(cid, :gathered, _cell_capture_element(slices[batched],
+                        via == 0 ? nothing : slices[via]; rows = partition))
+                end
+            else
+                _footprint_record!(cid, :whole, nothing)
+            end
+        end
     end
     # A shared array read only at the cell's own rows whose producer computes
     # it row by row is computed at those rows (`_CellEmitter`, cell_windows.jl).
@@ -4246,22 +4326,28 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
             (via != 0 && haskey(pushed_lanes, via)), c[3])
         request!(emitter, (_, value, reads)) = foreach(reads) do (batched, via)
             _cell_capture_request!(emitter, value, slices[batched],
-                via == 0 ? nothing : slices[via])
+                via == 0 ? nothing : slices[via]; rows = partition)
         end
         foreach(c -> waits(c) || request!(windows, c), captures)
         _cell_emit_windows!(windows)
         for (position, lane_row) in lane_rows
-            slices[position] = Expr(:call, GlobalRef(@__MODULE__, :_cell_batched_slice),
-                _cell_take!(windows, pushed_lanes[position], lane_row), cell)
+            taken = _cell_take!(windows, pushed_lanes[position], lane_row)
+            slices[position] = partition ? taken :
+                Expr(:call, GlobalRef(@__MODULE__, :_cell_batched_slice), taken, cell)
         end
         later = _CellEmitter(body, d, windows.names, windows.runtime_ops,
-            windows.runtime_recipes)
+            windows.runtime_recipes; sorted = partition)
         foreach(c -> waits(c) && request!(later, c), captures)
         any(waits, captures) && _cell_emit_windows!(later)
         for c in captures
             position, value = c[1], c[2]
             slices[position] = _cell_capture!(waits(c) ? later : windows, value)
         end
+    end
+    if partition
+        _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
+            plate, slices, plate_values, nothing, lhs)
+        return body
     end
     pointwise = gensym(:cell_pointwise)
     _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
@@ -4466,7 +4552,26 @@ function _lower_with_ops_collecting(p::Plan;
                          outline::Bool = pushdowns,
                          plate_element_types::Bool = false,
                          type_hints = nothing, exemplar_types = nothing,
+                         footprint::Bool = false,
                          inline_sources::Bool = _inline_sources_enabled())
+    # The footprint variant (`partition_footprint`, plate_partition.jl): the
+    # body records every read of a HAVE port and returns them instead of the
+    # wanted values.
+    footprint && return task_local_storage(_FOOTPRINT, _FootprintRecords()) do
+        _lower_with_ops_collecting(p; inline_embedded, declare, recycle, pushdowns, outline,
+                                   plate_element_types, type_hints, exemplar_types, inline_sources)
+    end
+    # Only the lowering the footprint was asked for records reads and returns
+    # them: a lowering nested in it (a plate body, an embedded kernel) runs
+    # blind to the recording, its reads and its own return untouched.
+    recording = get(task_local_storage(), _FOOTPRINT, nothing)
+    if recording !== nothing
+        recording.active && return task_local_storage(_FOOTPRINT, nothing) do
+            _lower_with_ops_collecting(p; inline_embedded, declare, recycle, pushdowns, outline,
+                                       plate_element_types, type_hints, exemplar_types, inline_sources)
+        end
+        recording.active = true
+    end
     # Values plate cells read only at their own row, computed there
     # (`_cell_pushdowns`, cell_windows.jl). With `outline`, inline
     # subexpressions that block that become recipes of their own first
@@ -4474,6 +4579,9 @@ function _lower_with_ops_collecting(p::Plan;
     cells = nothing
     if inline_embedded && pushdowns && type_hints === nothing
         p, cells = outline ? _cell_outlined_pushdowns(p) : (p, _cell_pushdowns(p))
+        # A value a cell reads at rows but would compute whole is refused or
+        # reported by name (`locality`, plate_partition.jl).
+        cells === nothing || _cell_locality_check!(p, cells)
     end
     g = p.graph
     names = _varnames(p)
@@ -4665,7 +4773,8 @@ function _lower_with_ops_collecting(p::Plan;
             _lower_authored_plate_cell!(body, runtime_ops, runtime_recipes, r,
                 callargs, lhs;
                 windows = cells === nothing ? nothing :
-                    _CellEmitter(body, cells, names, runtime_ops, runtime_recipes))
+                    _CellEmitter(body, cells, names, runtime_ops, runtime_recipes;
+                                 sorted = r.op.rows))
             continue
         end
         if inline_embedded && r.op isa _AuthoredScanOp
@@ -4824,6 +4933,7 @@ function _lower_with_ops_collecting(p::Plan;
     end
     retval = length(p.want) == 1 ? nm(p.want[1]) :
              Expr(:tuple, (nm(w) for w in p.want)...)
+    _footprint_recording() && (retval = _footprint_return(p, cells, names))
     push!(body.args, Expr(:return, retval))
     # Compose before index runs duplicate a cell body into grouped/flat arms;
     # otherwise those mutually exclusive definitions appear to escape here.
