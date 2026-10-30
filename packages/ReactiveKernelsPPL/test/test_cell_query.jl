@@ -1083,7 +1083,10 @@ end
     @test only(e.status for e in report if e.value === :mu) === :rows
     # The gradient of one subject's density is the full likelihood gradient
     # on the coordinates it reads and zero elsewhere.
-    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    # A planned partition reads its rows from the plan port; on registered
+    # Enzyme that needs runtime activity, as the compact samplers' window
+    # reads do (RK `test_plate_partition.jl`, "a plan per label").
+    backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
     s = prepare_partition_sampler(built, bound, :y, u; by = :subject, backend, compact = false)
     @test s isa PartitionSampler
     full = prepare_ad(prepare_query(built, bound, :likelihood), backend, u;

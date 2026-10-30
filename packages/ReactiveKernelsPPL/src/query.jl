@@ -1014,12 +1014,18 @@ mutable struct PartitionQuery{K,L}
     const observations::Tuple{Vararg{Symbol}}
     const by::Dict{Symbol,Symbol}
     const labels::Vector{Any}
+    # Each label's plan (`ReactiveKernels.partition_plan`), computed at
+    # preparation; a label without one is planned on the spot, which refuses
+    # a label no observation has.
+    const plans::Dict{Any,Any}
 end
 
 (q::PartitionQuery)(u::AbstractVector{Float64}, label) =
     Base.invokelatest(_partition_density, q, u, label)::Float64
 (q::PartitionQuery)(u::AbstractVector{<:Real}, label) = q(Vector{Float64}(u), label)
-_partition_density(q::PartitionQuery, u, label) = q.kernel(u, label)
+_partition_density(q::PartitionQuery, u, label) =
+    q.kernel(u, label, get(() -> ReactiveKernels.partition_plan(q.kernel, u, label, nothing),
+                           q.plans, label))
 
 """
     partition_labels(q) -> Vector
@@ -1030,6 +1036,21 @@ the observations named at preparation: every label the query accepts.
 partition_labels(q::PartitionQuery) = copy(q.labels)
 
 const _PARTITION_PORT = :_ppl_partition
+# The plan port: the integer bookkeeping of a label (its rows, every pushed
+# value's rows and positions), computed once per label by RK's
+# `partition_plan` and read by the body instead of recomputed per call.
+const _PLAN_PORT = :_ppl_partition_plan
+# Every label's plan by the plan kernel prepared from the spec (RK
+# `partition_plan_kernel`), and the type of those plans, which declares the
+# plan port of the partition kernel to prepare.
+function _partition_plans(planner, labels, args...)
+    plans = Dict{Any,Any}(label => Base.invokelatest(planner, args..., label, nothing)
+                          for label in labels)
+    types = unique!(Any[typeof(plan) for plan in values(plans)])
+    length(types) == 1 || throw(ContractValidationError(
+        "[query] the partition plans have several types: $(join(types, ", "))"))
+    plans, only(types)
+end
 const _PARTITION_TOTAL = :_ppl_partition_total
 
 # The key column of each observation: one column name for all of them, or
@@ -1053,7 +1074,7 @@ end
 # Each observation's cell plate partitioned by its key, and their sum: the
 # plates of `_cell_query_spec`, through RK's `plate_partition`.
 function _partition_query_spec(built, plan::StructuralPlan, names, keys_by_name;
-                               locality, partitioned = ())
+                               locality, partitioned = (), plan_type = Any)
     locality in (nothing, :error, :warn, :ignore) || throw(ContractValidationError(
         "[query] locality must be :error, :warn, :ignore or nothing; got $(repr(locality))"))
     def = hasproperty(built, :program) ? built.program : kernel_expr(plan, built.layout)
@@ -1088,7 +1109,8 @@ function _partition_query_spec(built, plan::StructuralPlan, names, keys_by_name;
     end
     spec = try
         plate_partition(built.spec, plates; by = keys_by_plate, index = _PARTITION_PORT,
-                        name = _PARTITION_TOTAL, locality, partitioned)
+                        name = _PARTITION_TOTAL, locality, partitioned,
+                        plan = plan_type === Any ? _PLAN_PORT : _PLAN_PORT => plan_type)
     catch err
         err isa ArgumentError || rethrow()
         throw(ContractValidationError("[query] the observations have no partitionable " *
@@ -1146,13 +1168,20 @@ function prepare_partition(built, plan::StructuralPlan, observations; by,
         "[query] prepare_partition needs at least one observation name"))
     _refuse_absent_cells(plan, names)
     keys_by_name = _partition_keys(plan, names, by)
+    labels = _partition_labels(plan, names, keys_by_name)
+    have = (_query_have(plan)..., _PARTITION_PORT, _PLAN_PORT)
+    exemplar = zeros(built.layout.total)
     spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality)
-    have = (_query_have(plan)..., _PARTITION_PORT)
+    planner = _absent_refusal(plan, spec, have, want) do
+        Base.invokelatest(ReactiveKernels.partition_plan_kernel, spec; have, want,
+                          bound = _query_bound(plan), on_error)
+    end
+    plans, plan_type = _partition_plans(planner, labels, exemplar)
+    spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality, plan_type)
     kernel = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
     end
-    return PartitionQuery(kernel, built.layout, names, keys_by_name,
-                          _partition_labels(plan, names, keys_by_name))
+    return PartitionQuery(kernel, built.layout, names, keys_by_name, labels, plans)
 end
 
 """
@@ -1181,6 +1210,8 @@ mutable struct PartitionSampler{K,P,L}
     const slots::Vector{Int32}
     const active::Vector{Float64}
     const gradient::Vector{Float64}
+    # Each label's plan of the differentiated kernel (`partition_plan`).
+    const plans::Dict{Any,Any}
     value::Float64
 end
 _compact(s::PartitionSampler) = !isempty(s.slots)
@@ -1303,24 +1334,32 @@ function prepare_partition_sampler(built, plan::StructuralPlan, observations,
     # The dense query: the values, the footprints and the separability check.
     spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality,
                                        partitioned = rule)
-    have = (_query_have(plan)..., _PARTITION_PORT)
+    have = (_query_have(plan)..., _PARTITION_PORT, _PLAN_PORT)
+    planner = _absent_refusal(plan, spec, have, want) do
+        Base.invokelatest(ReactiveKernels.partition_plan_kernel, spec; have, want,
+                          bound = _query_bound(plan), on_error)
+    end
+    plans, plan_type = _partition_plans(planner, labels, exemplar)
+    spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality,
+                                       partitioned = rule, plan_type)
     kernel = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
     end
     footprints = Dict{Any,Vector{Int}}()
     footprint = Base.invokelatest(ReactiveKernels.partition_footprint_kernel, kernel)
     for label in labels
-        read = Base.invokelatest(footprint, exemplar, label)
+        read = Base.invokelatest(footprint, exemplar, label, nothing)
         isempty(rule) || Base.invokelatest(ReactiveKernels.partition_separability, kernel,
-                                           exemplar, label; footprint = read)
+                                           exemplar, label, nothing; footprint = read)
         positions = read.unconstrained
         footprints[label] = positions === :whole ? collect(1:layout.total) : positions
     end
     if !compact
-        ad = Base.invokelatest(prepare_ad, kernel, backend, exemplar, first(labels);
-            active = :unconstrained)
+        ad = Base.invokelatest(prepare_ad, kernel, backend, exemplar, first(labels),
+            plans[first(labels)]; active = :unconstrained)
         return PartitionSampler(kernel, ad, layout, names, keys_by_name, labels, exemplar,
-            footprints, Dict{Any,Vector{Int}}(), Int[], Int32[], Float64[], Float64[], NaN)
+            footprints, Dict{Any,Vector{Int}}(), Int[], Int32[], Float64[], Float64[], plans,
+            NaN)
     end
     # One selection width for every label: each footprint padded with the
     # smallest positions outside it (their derivative is zero).
@@ -1336,19 +1375,27 @@ function prepare_partition_sampler(built, plan::StructuralPlan, observations,
         end
         selections[label] = sort!(selection)
     end
-    spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality,
-                                       partitioned = rule)
-    have = (_compact_overlay!(spec, plan)..., _PARTITION_PORT)
-    compact_kernel = _absent_refusal(plan, spec, have, want) do
-        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
-    end
     selected = copy(selections[first(labels)])
     slots = _compact_cell_slots(layout.total, selected)
     active = exemplar[selected]
+    spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality,
+                                       partitioned = rule)
+    have = (_compact_overlay!(spec, plan)..., _PARTITION_PORT, _PLAN_PORT)
+    planner = _absent_refusal(plan, spec, have, want) do
+        Base.invokelatest(ReactiveKernels.partition_plan_kernel, spec; have, want,
+                          bound = _query_bound(plan), on_error)
+    end
+    plans, plan_type = _partition_plans(planner, labels, exemplar, active, slots)
+    spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality,
+                                       partitioned = rule, plan_type)
+    _compact_overlay!(spec, plan)
+    compact_kernel = _absent_refusal(plan, spec, have, want) do
+        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
+    end
     ad = Base.invokelatest(prepare_ad, compact_kernel, backend, exemplar, active, slots,
-        first(labels); active = :_ppl_cell_active)
+        first(labels), plans[first(labels)]; active = :_ppl_cell_active)
     PartitionSampler(kernel, ad, layout, names, keys_by_name, labels, exemplar, footprints,
-        selections, selected, slots, active, zeros(width), NaN)
+        selections, selected, slots, active, zeros(width), plans, NaN)
 end
 
 """
@@ -1361,7 +1408,8 @@ packed vector otherwise. Returns `(value, g)`. `u` is read only.
 """
 function partition_value_and_gradient!(s::PartitionSampler, g::AbstractVector,
                                        u::Vector{Float64}, label)
-    _compact(s) || return (_latest_value(_cell_gradient!, s, g, u, label), g)
+    _compact(s) || return (_latest_value(_cell_gradient!, s, g, u, label,
+                                         _partition_plan_of(s, label)), g)
     length(u) == s.layout.total || throw(ContractValidationError(
         "[query] packed length $(length(u)) ≠ layout total $(s.layout.total)"))
     footprint = get(s.footprints, label) do
@@ -1376,7 +1424,8 @@ function partition_value_and_gradient!(s::PartitionSampler, g::AbstractVector,
     for (k, position) in enumerate(selection)
         s.active[k] = u[position]
     end
-    value = _latest_value(_cell_gradient!, s, s.gradient, u, s.active, s.slots, label)
+    value = _latest_value(_cell_gradient!, s, s.gradient, u, s.active, s.slots, label,
+                          _partition_plan_of(s, label))
     for (k, position) in enumerate(footprint)
         g[k] = s.gradient[s.slots[position]]
     end
@@ -1385,6 +1434,12 @@ end
 partition_value_and_gradient!(s::PartitionSampler, g::AbstractVector, u::AbstractVector,
                               label) =
     partition_value_and_gradient!(s, g, Vector{Float64}(u), label)
+
+# The plan of `label` for the sampler's differentiated kernel.
+_partition_plan_of(s::PartitionSampler, label) = get(s.plans, label) do
+    throw(ContractValidationError("[query] no partition has the label $(repr(label)); " *
+        "the labels are $(join(repr.(s.labels), ", "))"))
+end
 
 # Point the slot map at `selection` when it differs from the one in force.
 function _select_partition!(s::PartitionSampler, selection::Vector{Int})

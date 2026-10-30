@@ -41,7 +41,7 @@ function _plan_value_types(recipe_types, p::Plan, argument_types)
                           for (v, T) in zip(p.have, argument_types))
     for recipe in p.recipes
         input_types = Any[get(types, canon_id(p.graph, v.id), Any)
-                          for v in recipe.inputs]
+                          for v in _tuple_vector(recipe.inputs)]
         for (output, T) in zip(recipe.outputs, recipe_types(recipe, input_types))
             types[canon_id(p.graph, output.id)] = T
         end

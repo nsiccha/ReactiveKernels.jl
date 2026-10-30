@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.27
+
+- `plate_partition(…; plan = port)` / `plan = port => T`: a plan port holding
+  the partition's integer bookkeeping (a label's positions, every pushed
+  value's rows, gather and capture positions, the shapes it checks), computed
+  once per label by `partition_plan(kernel, args...)` from the bound data and
+  read by the body instead of recomputed on every call; a derivative carries
+  none of it. `partition_plan_kernel(spec; have, want, bound)` prepares the
+  kernel that computes a label's plan (its result's type declares the port);
+  `partition_plan_kernel(kernel)` returns the plan kernel of a prepared
+  partition. An untyped plan port is typed by evaluating the plan on
+  `prepare`'s `exemplars`; a plan port that cannot be typed is refused naming
+  the remedy. A plan holds index bookkeeping only, never a data column.
+- A partition's windows carry the positions of a gather index's entries,
+  computed apart from the gather (once per label with a plan); row takes are
+  a positions step and a view.
+
 ## 0.1.24
 
 - `plate_partition(spec, plates; by, index, name, locality)`: the cells of
