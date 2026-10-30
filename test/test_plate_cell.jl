@@ -1219,3 +1219,104 @@ end
     lp = ReactiveKernels._lowering_plan(k.plan)
     @test first(ReactiveKernels._cell_outlined_pushdowns(lp)) === lp
 end
+
+# A value read at its own position through several batched arguments (snag
+# `form-value-compu-c1e0965c`): the outputs of one `@plate for` loop are one
+# plate each, over a domain of its own, and compose into the cell that reads
+# them, so the cell reads `c` through both domains; a plate gathered by a
+# reader reads it through its two arguments. Either way `c` is computed at the
+# rows read, as `xi`, read through one domain, always was.
+@kernel _cell_two_lanes(y, d1::UnitRange{Int}, d2::UnitRange{Int}, z::Vector{Float64},
+                        s::Float64) = begin
+    c = exp.(z .* s)
+    xi = z .+ s
+    a2 = plate(d1) do i
+        log(c[i]) - xi[i]
+    end
+    a3 = plate(d2) do i
+        (1 - c[i]) * s
+    end
+    dens = plate(y, a2, a3) do yi, u, v
+        -(yi - u - v)^2 / 2
+    end
+    return dens
+end
+
+@kernel _cell_two_lane_plate(y, d1::UnitRange{Int}, d2::UnitRange{Int}, z::Vector{Float64},
+                             k::Vector{Int}, s::Float64) = begin
+    c = exp.(z .* s)
+    a = plate(d1, d2) do i, j
+        c[i] - c[j] * s
+    end
+    m = a[k]
+    dens = plate(m, y) do mi, yi
+        -(yi - mi)^2 / 2
+    end
+    return dens
+end
+
+# Literal-position reads `e[1]` of a value that declares no type, its type
+# inferred from its producer (`e = exp.(w .* s)` holds numbers).
+@kernel _cell_literal_reads(y, x::Vector{Float64}, w::Vector{Float64}, k::Vector{Int},
+                            s::Float64) = begin
+    e = exp.(w .* s)
+    p = 1.0 ./ (1.0 .+ exp.(x .* s))
+    mix = p .* e[1] .+ (1.0 .- p) .* e[2]
+    m = mix[k]
+    dens = plate(m, y) do mi, yi
+        -(yi - mi)^2 / 2
+    end
+    return dens
+end
+
+@testset "plate_cell: values read through several domains, and literal reads of an untyped value" begin
+    pushed(k) = let (_, cells) = ReactiveKernels._cell_outlined_pushdowns(
+                        ReactiveKernels._lowering_plan(k.plan))
+        cells === nothing ? Set{String}() :
+            Set(String(cells.producer[v].outputs[1].name) for v in cells.pushed)
+    end
+    lanes(n) = (; y = cos.(1:n), d1 = 1:n, d2 = 2:(n + 1),
+        z = collect(range(-0.5, 0.4; length = n + 1)))
+    plated(n) = (; lanes(n)..., k = [mod1(3j, n) for j in 1:n])
+    literal(n) = (; y = cos.(1:n), x = sin.(1:n), w = [0.2, -0.3, 0.1],
+        k = [mod1(5j, n) for j in 1:n])
+    plain = AutoEnzyme(; mode = Enzyme.Reverse)
+    runtime = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    # Plain native Reverse through a gather of a plate whose cell reads a
+    # window (`m = a[k]`) raises `EnzymeRuntimeActivityError` on registered
+    # Enzyme, through one domain as through two and on canonical before this
+    # change (todo `ReactiveKernels/todos/2026-10-30T12-25-05-259-15v6ws6`);
+    # runtime activity differentiates it exactly.
+    for (spec, data, rows, backend) in (
+            (_cell_two_lanes, lanes, ["c", "xi"], plain),
+            (_cell_two_lane_plate, plated, ["c", "a", "m"], runtime),
+            (_cell_literal_reads, literal, ["mix", "p", "m"], plain))
+        have = keys(data(4))
+        k = prepare(plate_cell(spec, :dens; index = :i); have = (have..., :s, :i),
+            want = :dens_cell)
+        full = prepare(spec; have = (have..., :s), want = :dens)
+        d = data(10)
+        reference = full(d..., 0.7)
+        @test [k(d..., 0.7, i) for i in eachindex(reference)] ≈ reference
+        @test issubset(Set(rows), pushed(k))
+        allocated(n) = let d = data(n); k(d..., 0.7, 2); @allocated k(d..., 0.7, 2) end
+        @test allocated(20) == allocated(20_000)
+        @test_throws BoundsError k(d..., 0.7, 11)
+        for i in (1, 7)
+            ad = prepare_ad(k, backend, d..., 0.7, i; active = :s)
+            value, ds = ad_value_and_gradient(ad, d..., 0.7, i)
+            @test value ≈ reference[i]
+            @test ds ≈ _cell_central(s -> k(d..., s, i), 0.7) atol = 1e-8
+        end
+        backend === runtime || continue
+        exact = try
+            ad = prepare_ad(k, plain, d..., 0.7, 1; active = :s)
+            last(ad_value_and_gradient(ad, d..., 0.7, 1)) ≈
+                _cell_central(s -> k(d..., s, 1), 0.7)
+        catch err
+            nameof(typeof(err)) === :EnzymeRuntimeActivityError || rethrow()
+            false
+        end
+        @test_broken exact
+    end
+end
