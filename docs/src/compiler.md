@@ -1019,6 +1019,74 @@ views, and Enzyme rejects Base `hcat` of views beside dense arrays (Enzyme snag
 `native-reverse-t-6d51cae6`). Values are exact; the gradient waits on that
 Enzyme fix (`test_plate_cell.jl` pins it broken).
 
+Two more producers run at a cell's rows: `view(A, lo:hi)` or `A[lo:hi]` and
+`reshape(v, n, k...)`, with the bounds and dimensions integer literals or
+scalar inputs. These are the shapes ReactiveKernelsPPL unpacks a packed
+parameter vector's blocks with, so a block read at a cell's rows reads only
+its own packed coordinates.
+
+### Locality: named, not silent
+
+A value a cell reads at its rows but whose producer has no row form was
+computed whole in every cell, silently. The rule is now checked at
+preparation: a value that every reader of the evaluation needs only at some
+rows is computed only at those rows, or it is a violation, named. A value the
+evaluation genuinely needs whole, such as a wanted value, `sum(x)`, the right
+operand of `A * w`, an index array or a scalar, is shared and never refused.
+`plate_cell(spec, …; locality)` says what preparation does with a violation:
+`:error` throws a `PartitionLocalityError` listing each value with its
+producer's authored source, the reason and the reader that asked for rows;
+`:warn` names each once per process; `:ignore` says nothing; the default
+`nothing` reads the project preference `cell_locality` (`"warn"` unless set,
+as `type_stability` is). Only the root of a cascade is refused: a value read
+whole by another refused value is marked as such in the report.
+`partition_locality(kernel)` lists every value a cell reads with its status
+(`:rows`, `:input`, `:data`, `:scalar`, `:shared`, `:whole`) and reason. A
+scalar's type must be known, by declaration, bound data or inference from its
+inputs: an undeclared value with no row form may be an array computed whole,
+and is refused as `:untyped`, naming the declaration (`s::Float64 = …`) that
+settles it.
+
+### A partition of plates by a key
+
+`plate_partition(spec, plates; by, index = :partition, name = :partition_total,
+locality = :error, partitioned = ())` returns a kernel whose value `name` is
+the sum of the cells of the named authored plates (one or several) whose key
+equals the label held by the new HAVE port `index`: a partition, such as one
+subject's observations. `by` gives each plate's key, a value of `spec` with
+one entry per cell in the plate's linear order (usually bound data), as one
+name for every plate or `(plate = :key, …)`.
+
+A partition runs as one compiled pass over its cells: each named plate loops
+once over the positions holding the label, through its own scalar body and
+the native total loop, and every value the partition's cells read at their
+rows is computed once per partition at the union of those rows, by the row
+forms above, with the plate's batched arguments sliced as views. Values the
+partition reads whole are computed once per call. Under `bound=` each label's
+positions are computed from the key once per binding, and a label's lookup
+is one dictionary read per call. A label no named plate has throws
+`ArgumentError` naming the keys; a plate without a cell of the label
+contributes nothing. The partition's default `locality` is `:error`: it is
+prepared only when every value its cells read at rows is computed at those
+rows. Native Enzyme Reverse differentiates it with the label a constant, and
+a vector input's gradient is nonzero only on the positions the partition
+reads. A plate whose domain is not one-dimensional is refused at evaluation.
+
+`partition_footprint(kernel, args...)` returns, for each HAVE port, the
+sorted linear positions the evaluation with those arguments reads, or
+`:whole` for a port read whole: the body is lowered once more in a mode that
+records every read of a port (the rows a value is sliced to, the positions
+gathers and captures read, the constant positions of a bound-indexed read)
+and returns them instead of the value. For a packed parameter vector this is
+the exact support of a partition's gradient; a lazy branch contributes both
+arms. `partitioned` adds the separability rule, pairs `port => labels` giving
+the label of each position of a per-partition port (`missing` for a shared
+position): `partition_separability(kernel, args...)` checks that the
+partition reads no other label's positions of those ports, throwing
+`PartitionSeparabilityError` otherwise. ReactiveKernelsPPL builds its
+partition queries and compact gradients on these (`prepare_partition`,
+`prepare_partition_sampler`).
+
 ### Inspecting structure
 
 `recipe_kind(recipe)` classifies a recipe as `:plate`, `:scan` or `:ordinary`

@@ -835,3 +835,208 @@ end
         end
     end
 end
+
+# A model value an ordinary function computes, read at a cell's rows, is
+# computed whole in every cell. `locality = :error` refuses the query naming
+# the statement (RK `plate_cell`, decision
+# `ReactiveKernels:snag.partition-graph-6306f756/decisions/2026-10-30T11-52-01-648-08uci2h`,
+# option 1); the packed blocks of an ordinary model are read at the cell's
+# rows and pass.
+_cq_opaque_shares(v) = v ./ sum(v)
+const _CQ_OPAQUE = quote
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    v[1:3] .~ Exponential.(1)
+    shares = _cq_opaque_shares(v)
+    mu = a .+ shares[g]
+    y .~ Normal.(mu, sigma)
+end
+
+@testset "cell query: locality" begin
+    data = _cq_grouped_data()
+    bound, built = _cq_bound(_CQ_GROUPED, data, (:y,))
+    q = prepare_cell_query(built, bound, :y; locality = :error)
+    report = ReactiveKernels.partition_locality(q.kernel)
+    @test all(e.status !== :whole for e in report)
+    status(name) = only(e.status for e in report if e.value === name)
+    @test status(:Z) === :rows && status(:R) === :rows && status(:log_k) === :rows
+    u = collect(range(-0.4, 0.5; length = built.layout.total))
+    @test q(u, 1) ≈ prepare_cell_query(built, bound, :y)(u, 1)
+
+    odata = (; g = [1, 2, 3, 1, 2], y = [0.1, 0.4, 0.2, 0.3, 0.5])
+    obound, obuilt = _cq_bound(_CQ_OPAQUE, odata, (:y,))
+    # refused: every cell would read every entry of `shares` (decision `08uci2h`, option 1)
+    err = try
+        prepare_cell_query(obuilt, obound, :y; locality = :error)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ReactiveKernels.PartitionLocalityError
+    @test [v.value for v in err.violations] == [:shares]
+    @test occursin("_cq_opaque_shares(v)", sprint(showerror, err))
+    u0 = zeros(obuilt.layout.total)
+    @test_throws ReactiveKernels.PartitionLocalityError prepare_cell_sampler(
+        obuilt, obound, :y, u0; backend = AutoEnzyme(; mode = Enzyme.Reverse), locality = :error)
+    @test_throws ReactiveKernels.PartitionLocalityError prepare_compact_cell_sampler(
+        obuilt, obound, :y, u0, [1, 2];
+        backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)),
+        locality = :error)
+    @test_throws ContractValidationError prepare_cell_query(obuilt, obound, :y; locality = :loud)
+    qo = prepare_cell_query(obuilt, obound, :y; locality = :ignore)
+    @test sum(qo(u0, i) for i in 1:5) ≈
+        Base.invokelatest(prepare_query(obuilt, obound, :likelihood), u0)
+end
+
+# One partition of the observations: all cells whose key equals a label, as
+# one compiled pass (RK `plate_partition`, decision `08uci2h` option 1).
+const _CQ_ROWS = quote
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    sd ~ Exponential(1)
+    z[levels(group)] .~ Normal.(0, sd)
+    mu = a .+ 0.5 .* x .+ z[group]
+    y .~ Normal.(mu, sigma)
+end
+function _cq_rows_data(per_subject)
+    subject = Int[s for (s, n) in enumerate(per_subject) for _ in 1:n]
+    n = length(subject)
+    group = String["g$(2(s - 1) + 1 + i % 2)" for (s, n) in enumerate(per_subject) for i in 1:n]
+    (; subject, group, x = [sin(i / 3) for i in 1:n], y = [0.5 + cos(i / 4) for i in 1:n])
+end
+
+const _CQ_SUBJECT = quote
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    z[levels(subject)] .~ Normal.(0, 1)
+    mu = a .+ z[subject]
+    y .~ Normal.(mu, sigma)
+end
+
+@testset "partition query: one subject's cells as one pass" begin
+    # An elementwise observation partitioned by a per-row subject column.
+    data = _cq_rows_data((3, 5, 4))
+    bound, built = _cq_bound(_CQ_ROWS, data, (:y,))
+    q = prepare_partition(built, bound, :y; by = :subject)
+    @test q isa PartitionQuery
+    @test partition_labels(q) == [1, 2, 3]
+    u = collect(range(-0.3, 0.4; length = built.layout.total))
+    pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+    likelihood = Base.invokelatest(prepare_query(built, bound, :likelihood), u)
+    cell = prepare_cell_query(built, bound, :y)
+    for s in 1:3
+        rows = findall(==(s), data.subject)
+        @test q(u, s) ≈ sum(pointwise.y[rows])
+        @test q(u, s) ≈ sum(cell(u, i) for i in rows)
+    end
+    @test sum(q(u, s) for s in 1:3) ≈ likelihood
+    @test_throws ArgumentError q(u, 4)
+    # The partition's cost does not grow with the other subjects' rows.
+    allocated(sizes) = let d = _cq_rows_data(sizes), (b, k) = _cq_bound(_CQ_ROWS, d, (:y,)),
+            p = prepare_partition(k, b, :y; by = :subject), v = zeros(k.layout.total)
+        p(v, 1)
+        @allocated p(v, 1)
+    end
+    @test allocated((6, 6, 6)) == allocated((6, 600, 600))
+    # Every value is at the partition's rows, shared, or an input.
+    report = ReactiveKernels.partition_locality(q.kernel)
+    @test all(e.status !== :whole for e in report)
+    @test only(e.status for e in report if e.value === :mu) === :rows
+    # The gradient of one subject's density is the full likelihood gradient
+    # on the coordinates it reads and zero elsewhere.
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    s = prepare_partition_sampler(built, bound, :y, u; by = :subject, backend)
+    @test s isa PartitionSampler
+    full = prepare_ad(prepare_query(built, bound, :likelihood), backend, u;
+        active = :unconstrained)
+    _, gfull = Base.invokelatest(ad_value_and_gradient, full, u)
+    names = coordinate_names(built.layout)
+    g = similar(u)
+    for label in 1:3
+        value, _ = partition_value_and_gradient!(s, g, u, label)
+        @test value ≈ q(u, label)
+        own = findall(n -> any(gi -> startswith(String(n), "z.$gi"),
+            unique(data.group[data.subject .== label])) || !startswith(String(n), "z."), names)
+        @test findall(!iszero, g) ⊆ own
+    end
+    gsum = zero(u)
+    for label in 1:3
+        partition_value_and_gradient!(s, g, u, label)
+        gsum .+= g
+    end
+    @test gsum ≈ gfull
+    # Keys must be supplied data columns, one per observation.
+    @test_throws ContractValidationError prepare_partition(built, bound, :y; by = :nope)
+    @test_throws ContractValidationError prepare_partition(built, bound, :y; by = (; z = :subject))
+
+    # A grouped loop partitioned by a per-iteration key: several groups per site.
+    gdata = (; _cq_grouped_data()..., site = ["s1", "s1", "s2", "s2", "s2"])
+    gbound, gbuilt = _cq_bound(_CQ_GROUPED, gdata, (:y,))
+    gq = prepare_partition(gbuilt, gbound, :y; by = :site)
+    @test partition_labels(gq) == ["s1", "s2"]
+    gu = collect(range(-0.4, 0.5; length = gbuilt.layout.total))
+    gcell = prepare_cell_query(gbuilt, gbound, :y)
+    @test gq(gu, "s1") ≈ gcell(gu, 1) + gcell(gu, 2)
+    @test gq(gu, "s2") ≈ sum(gcell(gu, i) for i in 3:5)
+    @test gq(gu, "s1") + gq(gu, "s2") ≈
+        Base.invokelatest(prepare_query(gbuilt, gbound, :likelihood), gu)
+    @test all(e.status !== :whole for e in ReactiveKernels.partition_locality(gq.kernel))
+
+    # The compact sampler: the gradient over each partition's footprint, the
+    # packed coordinates it reads, equal to the dense one there; the
+    # footprints' union over the labels is the full likelihood gradient.
+    rt = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    levels = sort(unique(data.group))
+    level_subject = [data.subject[findfirst(==(l), data.group)] for l in levels]
+    compact = prepare_partition_sampler(built, bound, :y, u; by = :subject, backend = rt,
+                                        partitioned = (:z => level_subject,))
+    @test partition_labels(compact) == [1, 2, 3]
+    gsum = zero(u)
+    for label in 1:3
+        footprint = partition_footprint(compact, label)
+        @test issorted(footprint) && allunique(footprint)
+        own = unique(data.group[data.subject .== label])
+        @test Set(String.(names[footprint])) == Set(["sigma", "a", "sd", ("z.$(findfirst(==(gi), levels))" for gi in own)...])
+        gc = zeros(length(footprint))
+        value, _ = partition_value_and_gradient!(compact, gc, u, label)
+        @test value ≈ q(u, label)
+        partition_value_and_gradient!(s, g, u, label)
+        @test gc ≈ g[footprint]
+        @test all(iszero, g[setdiff(eachindex(u), footprint)])
+        gsum[footprint] .+= gc
+    end
+    @test gsum ≈ gfull
+    @test_throws ContractValidationError partition_value_and_gradient!(compact, zeros(2), u, 1)
+    @test_throws ContractValidationError partition_footprint(compact, 4)
+    # The separability rule refuses a group shared between subjects by name.
+    shared = (; data..., group = [i == 4 ? "g1" : gi for (i, gi) in enumerate(data.group)])
+    sbound, sbuilt = _cq_bound(_CQ_ROWS, shared, (:y,))
+    slevels = sort(unique(shared.group))
+    slevel_subject = [shared.subject[findfirst(==(l), shared.group)] for l in slevels]
+    @test_throws ReactiveKernels.PartitionSeparabilityError prepare_partition_sampler(
+        sbuilt, sbound, :y, u; by = :subject, backend = rt,
+        partitioned = (:z => slevel_subject,))
+    @test_throws ContractValidationError prepare_partition_sampler(built, bound, :y, u;
+        by = :subject, backend = rt, partitioned = (:z,))        # z's axis is group, not subject
+    @test_throws ContractValidationError prepare_partition_sampler(built, bound, :y, u;
+        by = :subject, backend = rt, partitioned = (:nope,))
+    # A parameter indexed by the key column itself is named bare.
+    sdata = (; data..., subject = data.subject)
+    kbound, kbuilt = _cq_bound(_CQ_SUBJECT, sdata, (:y,))
+    ku = collect(range(-0.3, 0.4; length = kbuilt.layout.total))
+    ks = prepare_partition_sampler(kbuilt, kbound, :y, ku; by = :subject, backend = rt,
+                                   partitioned = (:z,))
+    knames = coordinate_names(kbuilt.layout)
+    for label in 1:3
+        @test Set(String.(knames[partition_footprint(ks, label)])) == Set(["sigma", "a", "z.$label"])
+    end
+
+    # The strict locality default refuses an ordinary function's value by name.
+    odata = (; g = [1, 2, 3, 1, 2], y = [0.1, 0.4, 0.2, 0.3, 0.5], subject = [1, 1, 2, 2, 2])
+    obound, obuilt = _cq_bound(_CQ_OPAQUE, odata, (:y,))
+    @test_throws ReactiveKernels.PartitionLocalityError prepare_partition(
+        obuilt, obound, :y; by = :subject)
+    oq = prepare_partition(obuilt, obound, :y; by = :subject, locality = :ignore)
+    ou = zeros(obuilt.layout.total)
+    @test oq(ou, 1) + oq(ou, 2) ≈ Base.invokelatest(prepare_query(obuilt, obound, :likelihood), ou)
+end

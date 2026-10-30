@@ -16,6 +16,37 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.21
+
+- `plate_partition(spec, plates; by, index, name, locality)`: the cells of
+  one or more authored plates whose key equals the label held by the HAVE
+  port `index` (one subject's observations), summed, as ONE compiled pass:
+  each plate loops once over the positions holding the label, and every
+  value the partition's cells read at their rows is computed once per
+  partition at the union of those rows. `by` gives each plate's key (one
+  entry per cell, usually bound data); under `bound=` each label's positions
+  are computed once per binding. A label no named plate has is refused by
+  name; a plate without a cell of the label contributes nothing.
+- Locality guarantee: a value a cell or partition reads at its rows but would
+  compute whole is now named instead of computed silently. `plate_cell` and
+  `plate_partition` take `locality = :error | :warn | :ignore`
+  (`PartitionLocalityError` lists each such value with its producer's source,
+  the reason and the reader that asked for rows; `:warn` names each once per
+  process); `plate_cell` defaults to the project preference `cell_locality`
+  (`"warn"` unless set), `plate_partition` to `:error`.
+  `partition_locality(kernel)` reports the classification of every value a
+  cell reads (`:rows`, `:input`, `:data`, `:scalar`, `:shared`, `:unknown`,
+  `:whole`).
+- Two more producers are computed at a cell's rows: `view(A, lo:hi)` /
+  `A[lo:hi]` and `reshape(v, n, k...)` with literal or scalar-input bounds and
+  dimensions, the shapes ReactiveKernelsPPL unpacks packed parameter blocks
+  with, so a block read at a cell's rows reads its own packed coordinates
+  only.
+- A cell's row window reads a vector of rows as one gather of its data at
+  the rows' positions (the positions computed first); the previous
+  row-by-row read made native Enzyme Reverse refuse a partition's gather of
+  a product's rows (`EnzymeRuntimeActivityError`).
+
 ## 0.1.20
 
 - **Breaking:** the iterative-method compiler, the NUTS/HMC sampler

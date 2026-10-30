@@ -16,6 +16,25 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.21
+
+- `prepare_partition(built, plan, observations; by, locality = :error)`,
+  `PartitionQuery`, `partition_labels`, `prepare_partition_sampler(built, plan,
+  observations, u0; by, backend, locality)`, `PartitionSampler` and
+  `partition_value_and_gradient!(s, g, u, label)`: one partition of the named
+  observations (all cells whose key equals a label, such as one subject's)
+  as one compiled pass, with its value and dense gradient. `by` names a
+  supplied data column with one entry per cell of each observation's plate
+  (one name, or `observation => column` pairs). Requires ReactiveKernels
+  0.1.21.
+- `prepare_cell_query`, `prepare_cell_sampler` and
+  `prepare_compact_cell_sampler` take `locality = :error | :warn | :ignore`
+  (`nothing`, the default, reads ReactiveKernels' `cell_locality`
+  preference): with `:error` a query is refused with a
+  `ReactiveKernels.PartitionLocalityError` naming each model value the cell
+  reads at its rows but would compute whole, and the statement that computes
+  it.
+
 ## 0.1.20
 
 - A constructed endpoint (`object(; …).endpoint(x)`) accepts any method-bearing

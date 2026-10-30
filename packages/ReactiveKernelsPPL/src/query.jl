@@ -603,7 +603,7 @@ end
 _cell_density(q::CellQuery, u, cell) = q.kernel(u, cell)
 
 """
-    prepare_cell_query(built, plan, observations; on_error = nothing) -> CellQuery
+    prepare_cell_query(built, plan, observations; on_error = nothing, locality = nothing) -> CellQuery
 
 Prepare the summed log density of ONE cell of the observations named in
 `observations` (a name or a collection of names), evaluated at an
@@ -612,6 +612,13 @@ pointwise values come from a plate (`:pointwise`'s array for that name); cell
 `i` is that plate's entry `i`, so
 
     sum(q(u, i) for i in eachindex(pointwise.y)) == pointwise likelihood of y
+
+`locality` says what preparation does with a model value the cell reads at its
+rows but would compute whole (RK `plate_cell`): `:error` refuses the query
+with a `ReactiveKernels.PartitionLocalityError` naming each such value and its
+statement, `:warn` names each once per process, `:ignore` says nothing;
+`nothing` reads the ReactiveKernels preference `cell_locality` (`"warn"`
+unless set). `ReactiveKernels.partition_locality(q.kernel)` lists every value.
 
 For an `@plate for i in eachindex(y)` loop holding one array per index
 (`y[i] .~ …`), entry `i` is the sum of iteration `i`'s densities. Several
@@ -627,7 +634,7 @@ observation. `plan` must generate the program `built` was built from, as for
 [`prepare_query`](@ref).
 """
 function prepare_cell_query(built, plan::StructuralPlan, observations;
-        on_error = nothing)
+        on_error = nothing, locality = nothing)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_cell_query requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
@@ -635,7 +642,7 @@ function prepare_cell_query(built, plan::StructuralPlan, observations;
     isempty(names) && throw(ContractValidationError(
         "[query] prepare_cell_query needs at least one observation name"))
     _refuse_absent_cells(plan, names)
-    spec, want = _cell_query_spec(built, plan, names)
+    spec, want = _cell_query_spec(built, plan, names; locality)
     have = (_query_have(plan)..., _CELL_PORT)
     kernel = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
@@ -651,7 +658,9 @@ const _CELL_PORT = :_ppl_cell
 # program the build recorded, which `_check_built_program` proved `plan`
 # generates; only a graph made outside `build_kernel` has the program
 # generated again.
-function _cell_query_spec(built, plan::StructuralPlan, names)
+function _cell_query_spec(built, plan::StructuralPlan, names; locality = nothing)
+    locality in (nothing, :error, :warn, :ignore) || throw(ContractValidationError(
+        "[query] locality must be :error, :warn, :ignore or nothing; got $(repr(locality))"))
     def = hasproperty(built, :program) ? built.program : kernel_expr(plan, built.layout)
     body = def.args[2].args
     statement = findfirst(st -> Meta.isexpr(st, :(=), 2) && st.args[1] === :pointwise, body)
@@ -681,7 +690,7 @@ function _cell_query_spec(built, plan::StructuralPlan, names)
         node = totals in assigned ? totals : node
         cell = Symbol(:_ppl_cell_, node)
         spec = try
-            plate_cell(spec, node; index = _CELL_PORT, name = cell)
+            plate_cell(spec, node; index = _CELL_PORT, name = cell, locality)
         catch err
             err isa ArgumentError || rethrow()
             throw(ContractValidationError("[query] observation `$name` has no " *
@@ -714,19 +723,20 @@ CellSampler(kernel, ad, layout, observations) =
     CellSampler(kernel, ad, layout, observations, NaN)
 
 """
-    prepare_cell_sampler(built, plan, observations, u0; backend, on_error = nothing) -> CellSampler
+    prepare_cell_sampler(built, plan, observations, u0; backend, on_error = nothing, locality = nothing) -> CellSampler
 
 [`prepare_cell_query`](@ref) plus a `prepare_ad` gradient with
 `active = :unconstrained`; the position stays a constant (an `Int`). `u0` is a
 length-consistent exemplar and `backend` a DifferentiationInterface backend,
-as for [`prepare_sampler`](@ref).
+as for [`prepare_sampler`](@ref). `locality` is passed to
+[`prepare_cell_query`](@ref).
 """
 function prepare_cell_sampler(built, plan::StructuralPlan, observations,
-        u0::AbstractVector{<:Real}; backend, on_error = nothing)
+        u0::AbstractVector{<:Real}; backend, on_error = nothing, locality = nothing)
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
-    q = prepare_cell_query(built, plan, observations; on_error)
+    q = prepare_cell_query(built, plan, observations; on_error, locality)
     ad = Base.invokelatest(prepare_ad, q.kernel, backend, Vector{Float64}(u0), 1;
         active = :unconstrained)
     return CellSampler(q.kernel, ad, layout, q.observations)
@@ -856,10 +866,10 @@ end
 _same_selection(selected::Vector{Int}, indices) = selected == indices
 
 """
-    prepare_compact_cell_sampler(built, plan, observations, base0, indices0; backend)
+    prepare_compact_cell_sampler(built, plan, observations, base0, indices0; backend, on_error = nothing, locality = nothing)
 
 Prepare a cell value and gradient over the sorted, unique packed positions
-`indices0`. At evaluation, the selected positions may change, provided the
+`indices0`. `locality` is as for [`prepare_cell_query`](@ref). At evaluation, the selected positions may change, provided the
 active vector and selection retain the exemplar's type and length. The packed
 base is passed read-only; selected coordinates are supplied separately. This
 keeps the active AD point and gradient proportional to the selected cell's
@@ -870,7 +880,7 @@ per packed coordinate, mapping each to its position in the selection.
 """
 function prepare_compact_cell_sampler(built, plan::StructuralPlan, observations,
         base0::AbstractVector{Float64}, indices0::AbstractVector{Int};
-        backend, on_error = nothing)
+        backend, on_error = nothing, locality = nothing)
     layout = built.layout::LayoutTable
     _check_compact_cell_indices(base0, indices0, indices0, layout.total)
     active0 = base0[indices0]
@@ -883,7 +893,20 @@ function prepare_compact_cell_sampler(built, plan::StructuralPlan, observations,
     isempty(names) && throw(ContractValidationError(
         "[query] prepare_compact_cell_sampler needs at least one observation name"))
     _refuse_absent_cells(plan, names)
-    spec, want = _cell_query_spec(built, plan, names)
+    spec, want = _cell_query_spec(built, plan, names; locality)
+    have = _compact_overlay!(spec, plan)
+    kernel = _absent_refusal(plan, spec, have, want) do
+        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
+    end
+    ad = Base.invokelatest(prepare_ad, kernel, backend, base0, active0, slots, 1;
+        active = :_ppl_cell_active)
+    CompactCellSampler(ad, layout, names, selected, slots)
+end
+
+# Overlay a compact active vector on a read-only packed base in `spec`: the
+# packed point becomes `_compact_cell_point(base, active, slots)`, and the
+# HAVE boundary starts with the three overlay ports. Returns that boundary.
+function _compact_overlay!(spec, plan::StructuralPlan)
     for (name, type) in ((:_ppl_cell_base, AbstractVector{Float64}),
             (:_ppl_cell_active, AbstractVector{Float64}),
             (:_ppl_cell_slots, AbstractVector{Int32}))
@@ -897,13 +920,7 @@ function prepare_compact_cell_sampler(built, plan::StructuralPlan, observations,
     filter!(!=(:unconstrained), spec.have_names)
     prepend!(spec.have_names, [:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots])
     filter!(n -> n ∉ _absent_inputs(plan), spec.have_names)
-    have = (spec.have_names..., _frozen_graph_names(plan)...)
-    kernel = _absent_refusal(plan, spec, have, want) do
-        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
-    end
-    ad = Base.invokelatest(prepare_ad, kernel, backend, base0, active0, slots, 1;
-        active = :_ppl_cell_active)
-    CompactCellSampler(ad, layout, names, selected, slots)
+    (spec.have_names..., _frozen_graph_names(plan)...)
 end
 
 """
@@ -975,4 +992,407 @@ function restore_draws(layout::LayoutTable, U::AbstractMatrix{<:Real})
         constrain(layout, view(U, :, j))
     end
     return _stack_restored_draws(nts)
+end
+
+# ------------------------------------------------------------- partitions
+
+"""
+    PartitionQuery
+
+The summed log density of one partition of the observations named at
+preparation: all cells whose key equals a label, as one compiled pass
+(RK `plate_partition`). Construct with [`prepare_partition`](@ref); call as
+`q(u, label)`. Not thread-safe: prepare one per thread.
+"""
+mutable struct PartitionQuery{K,L}
+    const kernel::K
+    const layout::L
+    const observations::Tuple{Vararg{Symbol}}
+    const by::Dict{Symbol,Symbol}
+    const labels::Vector{Any}
+end
+
+(q::PartitionQuery)(u::AbstractVector{Float64}, label) =
+    Base.invokelatest(_partition_density, q, u, label)::Float64
+(q::PartitionQuery)(u::AbstractVector{<:Real}, label) = q(Vector{Float64}(u), label)
+_partition_density(q::PartitionQuery, u, label) = q.kernel(u, label)
+
+"""
+    partition_labels(q) -> Vector
+
+The distinct keys of the partitioned observations, in first-seen order over
+the observations named at preparation: every label the query accepts.
+"""
+partition_labels(q::PartitionQuery) = copy(q.labels)
+
+const _PARTITION_PORT = :_ppl_partition
+const _PARTITION_TOTAL = :_ppl_partition_total
+
+# The key column of each observation: one column name for all of them, or
+# a named tuple / pairs `observation => column`. Every column must be a
+# supplied data column of the binding.
+function _partition_keys(plan::StructuralPlan, names, by)
+    keys_by_name = by isa Symbol ? Dict{Symbol,Symbol}(name => by for name in names) :
+        Dict{Symbol,Symbol}(Symbol(k) => Symbol(v) for (k, v) in pairs(by))
+    columns = _query_columns(plan)
+    for name in names
+        haskey(keys_by_name, name) || throw(ContractValidationError(
+            "[query] `by` gives no key column for observation `$name`"))
+        key = keys_by_name[name]
+        key in columns || throw(ContractValidationError(
+            "[query] the partition key `$key` of `$name` is not a supplied data column; " *
+            "the columns are $(join(columns, ", "))"))
+    end
+    keys_by_name
+end
+
+# Each observation's cell plate partitioned by its key, and their sum: the
+# plates of `_cell_query_spec`, through RK's `plate_partition`.
+function _partition_query_spec(built, plan::StructuralPlan, names, keys_by_name;
+                               locality, partitioned = ())
+    locality in (nothing, :error, :warn, :ignore) || throw(ContractValidationError(
+        "[query] locality must be :error, :warn, :ignore or nothing; got $(repr(locality))"))
+    def = hasproperty(built, :program) ? built.program : kernel_expr(plan, built.layout)
+    body = def.args[2].args
+    statement = findfirst(st -> Meta.isexpr(st, :(=), 2) && st.args[1] === :pointwise, body)
+    pointwise = Dict{Symbol,Any}()
+    if statement !== nothing && Meta.isexpr(body[statement].args[2], :tuple)
+        for field in body[statement].args[2].args
+            pointwise[field.args[1]] = field.args[2]
+        end
+    end
+    assigned = Set{Symbol}()
+    for st in body
+        Meta.isexpr(st, :(=), 2) || continue
+        lhs = st.args[1]
+        Meta.isexpr(lhs, :(::), 2) && (lhs = lhs.args[1])
+        lhs isa Symbol && push!(assigned, lhs)
+    end
+    plates = Symbol[]
+    keys_by_plate = Dict{Symbol,Symbol}()
+    for name in names
+        haskey(pointwise, name) || throw(ContractValidationError(
+            "[query] `$name` is not an observation of this model; its " *
+            "observations are $(join(sort!(collect(keys(pointwise))), ", "))"))
+        node = pointwise[name]
+        node isa Symbol || throw(ContractValidationError(
+            "[query] observation `$name` has no pointwise plate, so it has no cells"))
+        totals = Symbol(node, :_totals)
+        node = totals in assigned ? totals : node
+        push!(plates, node)
+        keys_by_plate[node] = keys_by_name[name]
+    end
+    spec = try
+        plate_partition(built.spec, plates; by = keys_by_plate, index = _PARTITION_PORT,
+                        name = _PARTITION_TOTAL, locality, partitioned)
+    catch err
+        err isa ArgumentError || rethrow()
+        throw(ContractValidationError("[query] the observations have no partitionable " *
+            "pointwise plate ($(err.msg))"))
+    end
+    return spec, _PARTITION_TOTAL
+end
+
+# The distinct labels of the named observations' key columns, in first-seen
+# order; each key column must hold one entry per cell of its plate, which the
+# prepared kernel checks at evaluation.
+function _partition_labels(plan::StructuralPlan, names, keys_by_name)
+    labels = Any[]
+    seen = Set{Any}()
+    for name in names
+        for label in vec(plan.columns[keys_by_name[name]])
+            label in seen || (push!(seen, label); push!(labels, label))
+        end
+    end
+    labels
+end
+
+"""
+    prepare_partition(built, plan, observations; by, locality = :error, on_error = nothing) -> PartitionQuery
+
+Prepare the summed log density of ONE partition of the observations named in
+`observations` (a name or a collection of names): all cells whose key equals
+a label, such as one subject's observations, evaluated at an unconstrained
+point `u`: `q(u, label)`. `by` names the key: a supplied data column with one
+entry per cell of each observation's plate (one row per entry of an
+elementwise observation, one per iteration of an `@plate for` loop), either
+one column name for every observation or a named tuple or pairs
+`observation => column`. [`partition_labels`](@ref) lists the labels.
+
+A partition runs as one compiled pass over its cells (RK `plate_partition`):
+each plate loops once over the positions holding the label, and every value
+the partition's cells read at their rows is computed once per partition at
+the union of those rows, so
+
+    sum(q(u, label) for label in partition_labels(q)) == likelihood of the observations
+
+and one partition costs its share of the whole likelihood. `locality` is as
+for [`prepare_cell_query`](@ref), with the default `:error`: the query is
+prepared only when every value its cells read at rows is computed at those
+rows; otherwise preparation throws a `ReactiveKernels.PartitionLocalityError`
+naming each such value and its statement.
+"""
+function prepare_partition(built, plan::StructuralPlan, observations; by,
+        locality = :error, on_error = nothing)
+    isbound(plan) || throw(ContractValidationError(
+        "[query] prepare_partition requires a bound plan (bind_data first)"))
+    _check_built_program(built, plan)
+    names = observations isa Symbol ? (observations,) : Tuple(Symbol.(observations))
+    isempty(names) && throw(ContractValidationError(
+        "[query] prepare_partition needs at least one observation name"))
+    _refuse_absent_cells(plan, names)
+    keys_by_name = _partition_keys(plan, names, by)
+    spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality)
+    have = (_query_have(plan)..., _PARTITION_PORT)
+    kernel = _absent_refusal(plan, spec, have, want) do
+        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
+    end
+    return PartitionQuery(kernel, built.layout, names, keys_by_name,
+                          _partition_labels(plan, names, keys_by_name))
+end
+
+"""
+    PartitionSampler
+
+A [`PartitionQuery`](@ref) with its `prepare_ad` gradient: compact, over each
+partition's footprint (the packed coordinates it reads), or dense over the
+whole packed vector. Construct with [`prepare_partition_sampler`](@ref); use
+[`partition_value_and_gradient!`](@ref) and [`partition_footprint`](@ref).
+Not thread-safe: prepare one per thread.
+"""
+mutable struct PartitionSampler{K,P,L}
+    const kernel::K
+    const ad::P
+    const layout::L
+    const observations::Tuple{Vararg{Symbol}}
+    const by::Dict{Symbol,Symbol}
+    const labels::Vector{Any}
+    const exemplar::Vector{Float64}
+    # Each label's exact footprint (sorted packed positions). Compact only:
+    # its padded selection of one width, the selection in force, its slot
+    # map, and the active and gradient buffers of that width.
+    const footprints::Dict{Any,Vector{Int}}
+    const selections::Dict{Any,Vector{Int}}
+    const selected::Vector{Int}
+    const slots::Vector{Int32}
+    const active::Vector{Float64}
+    const gradient::Vector{Float64}
+    value::Float64
+end
+_compact(s::PartitionSampler) = !isempty(s.slots)
+partition_labels(s::PartitionSampler) = copy(s.labels)
+
+"""
+    partition_footprint(s::PartitionSampler, label) -> Vector{Int}
+
+The packed positions partition `label` reads (sorted, unique): the support of
+its gradient, computed at preparation from the bound index data by the row
+analysis that evaluates the partition (a method of ReactiveKernels'
+`partition_footprint`). A compact sampler's gradient is over exactly these,
+in this order.
+"""
+ReactiveKernels.partition_footprint(s::PartitionSampler, label) = copy(get(s.footprints, label) do
+    throw(ContractValidationError("[query] no partition has the label $(repr(label)); " *
+        "the labels are $(join(repr.(s.labels), ", "))"))
+end)
+
+# The packed positions a partition reads, by RK's footprint: `:whole` is every
+# position.
+function _partition_footprint_positions(kernel, u0, label, total)
+    read = Base.invokelatest(ReactiveKernels.partition_footprint, kernel, u0, label)
+    positions = read.unconstrained
+    positions === :whole ? collect(1:total) : positions
+end
+
+# The separability rule as RK takes it: the label of each packed coordinate
+# of the named parameters, `missing` for every other coordinate. A parameter
+# named bare is indexed by the key column itself (`z[levels(subject)]`), so
+# its row `r` carries the `r`-th level; `parameter => labels` gives each
+# level's label when the parameter's axis is finer than the key (a group
+# within a subject).
+function _partition_coordinate_labels(plan::StructuralPlan, layout::LayoutTable,
+                                      partitioned, keys_by_name)
+    labels = Vector{Any}(missing, layout.total)
+    entries = partitioned isa Union{Symbol,Pair} ? (partitioned,) : partitioned
+    for entry in entries
+        name, level_labels = entry isa Pair ? (Symbol(first(entry)), last(entry)) :
+            (Symbol(entry), nothing)
+        position = findfirst(e -> e.name === name, layout.entries)
+        position === nothing && throw(ContractValidationError(
+            "[query] `partitioned` names `$name`, which is not a sampled parameter; the " *
+            "parameters are $(join((e.name for e in layout.entries), ", "))"))
+        e = layout.entries[position]
+        if level_labels === nothing
+            axis = _partition_parameter_axis(plan, name)
+            axis === nothing && throw(ContractValidationError(
+                "[query] `partitioned` names `$name`, whose first axis is not " *
+                "`levels(<column>)`; give its levels' labels as `$name => labels`"))
+            axis in values(keys_by_name) || throw(ContractValidationError(
+                "[query] `$name` is indexed by `levels($axis)`, not by the partition key " *
+                "$(join(unique(values(keys_by_name)), ", ")); give its levels' labels as " *
+                "`$name => labels`"))
+            level_labels = _ppl_levels(plan.columns[axis])
+        end
+        n = isempty(e.dims) ? e.size : first(e.dims)
+        length(level_labels) == n || throw(ContractValidationError(
+            "[query] `$name` has $n levels, but `partitioned` gives $(length(level_labels)) " *
+            "labels"))
+        for c in 1:e.size
+            labels[e.offset + c - 1] = level_labels[mod1(c, n)]
+        end
+    end
+    labels
+end
+
+# The column a parameter's first axis takes its levels from, `nothing` when
+# that axis is not `levels(<column>)`.
+function _partition_parameter_axis(plan::StructuralPlan, name::Symbol)
+    axis(ex) = Meta.isexpr(ex, :call, 2) && ex.args[1] === :levels && ex.args[2] isa Symbol ?
+        ex.args[2] : nothing
+    for p in plan.plate_parameters
+        p.name === name && return axis(p.range)
+    end
+    for p in plan.array_parameters
+        p.name === name && return axis(first(p.dims))
+    end
+    nothing
+end
+
+"""
+    prepare_partition_sampler(built, plan, observations, u0; by, backend, compact = true,
+                              partitioned = (), locality = :error, on_error = nothing) -> PartitionSampler
+
+[`prepare_partition`](@ref) plus a `prepare_ad` gradient; the label stays a
+constant. `u0` is a length-consistent exemplar and `backend` a
+DifferentiationInterface backend, as for [`prepare_sampler`](@ref).
+
+With `compact = true` (the default) the gradient is over each partition's
+footprint, the packed coordinates it reads, computed at preparation for every
+label from the bound index data ([`partition_footprint`](@ref)); the active
+coordinates overlay a read-only packed base as in
+[`prepare_compact_cell_sampler`](@ref), so with native `AutoEnzyme` Reverse
+use `Enzyme.set_runtime_activity(Enzyme.Reverse)`. With `compact = false` the
+gradient is over the whole packed vector, nonzero only on the footprint.
+
+`partitioned` is the separability rule: the parameters whose rows belong to
+one partition each (an NLME unit's effects), named bare when indexed by the
+key column itself (`z[levels(subject)]`) or as `parameter => labels` giving
+each level's label. Preparation then checks every label: a partition that
+reads another label's coordinates of those parameters, even genuinely, is
+refused with a `ReactiveKernels.PartitionSeparabilityError` naming them.
+"""
+function prepare_partition_sampler(built, plan::StructuralPlan, observations,
+        u0::AbstractVector{<:Real}; by, backend, compact::Bool = true, partitioned = (),
+        locality = :error, on_error = nothing)
+    layout = built.layout::LayoutTable
+    length(u0) == layout.total || throw(ContractValidationError(
+        "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
+    exemplar = Vector{Float64}(u0)
+    isbound(plan) || throw(ContractValidationError(
+        "[query] prepare_partition_sampler requires a bound plan (bind_data first)"))
+    _check_built_program(built, plan)
+    names = observations isa Symbol ? (observations,) : Tuple(Symbol.(observations))
+    isempty(names) && throw(ContractValidationError(
+        "[query] prepare_partition_sampler needs at least one observation name"))
+    _refuse_absent_cells(plan, names)
+    keys_by_name = _partition_keys(plan, names, by)
+    labels = _partition_labels(plan, names, keys_by_name)
+    isempty(labels) && throw(ContractValidationError(
+        "[query] the partition key columns of $(join(names, ", ")) hold no label"))
+    rule = isempty(partitioned) ? () :
+        (:unconstrained => _partition_coordinate_labels(plan, layout, partitioned, keys_by_name),)
+    # The dense query: the values, the footprints and the separability check.
+    spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality,
+                                       partitioned = rule)
+    have = (_query_have(plan)..., _PARTITION_PORT)
+    kernel = _absent_refusal(plan, spec, have, want) do
+        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
+    end
+    footprints = Dict{Any,Vector{Int}}()
+    for label in labels
+        isempty(rule) || Base.invokelatest(ReactiveKernels.partition_separability, kernel,
+                                           exemplar, label)
+        footprints[label] = _partition_footprint_positions(kernel, exemplar, label, layout.total)
+    end
+    if !compact
+        ad = Base.invokelatest(prepare_ad, kernel, backend, exemplar, first(labels);
+            active = :unconstrained)
+        return PartitionSampler(kernel, ad, layout, names, keys_by_name, labels, exemplar,
+            footprints, Dict{Any,Vector{Int}}(), Int[], Int32[], Float64[], Float64[], NaN)
+    end
+    # One selection width for every label: each footprint padded with the
+    # smallest positions outside it (their derivative is zero).
+    width = maximum(length, values(footprints))
+    selections = Dict{Any,Vector{Int}}()
+    for (label, footprint) in footprints
+        selection = copy(footprint)
+        inside = Set(footprint)
+        position = 1
+        while length(selection) < width
+            position in inside || push!(selection, position)
+            position += 1
+        end
+        selections[label] = sort!(selection)
+    end
+    spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality,
+                                       partitioned = rule)
+    have = (_compact_overlay!(spec, plan)..., _PARTITION_PORT)
+    compact_kernel = _absent_refusal(plan, spec, have, want) do
+        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
+    end
+    selected = copy(selections[first(labels)])
+    slots = _compact_cell_slots(layout.total, selected)
+    active = exemplar[selected]
+    ad = Base.invokelatest(prepare_ad, compact_kernel, backend, exemplar, active, slots,
+        first(labels); active = :_ppl_cell_active)
+    PartitionSampler(kernel, ad, layout, names, keys_by_name, labels, exemplar, footprints,
+        selections, selected, slots, active, zeros(width), NaN)
+end
+
+"""
+    partition_value_and_gradient!(s::PartitionSampler, g, u, label)
+
+The partition `label`'s log density and its gradient, written into `g`:
+over [`partition_footprint`](@ref)`(s, label)`, in that order, for a compact
+sampler (`length(g)` must be the footprint's length), or over the whole
+packed vector otherwise. Returns `(value, g)`. `u` is read only.
+"""
+function partition_value_and_gradient!(s::PartitionSampler, g::AbstractVector,
+                                       u::Vector{Float64}, label)
+    _compact(s) || return (_latest_value(_cell_gradient!, s, g, u, label), g)
+    length(u) == s.layout.total || throw(ContractValidationError(
+        "[query] packed length $(length(u)) ≠ layout total $(s.layout.total)"))
+    footprint = get(s.footprints, label) do
+        throw(ContractValidationError("[query] no partition has the label $(repr(label)); " *
+            "the labels are $(join(repr.(s.labels), ", "))"))
+    end
+    length(g) == length(footprint) || throw(ContractValidationError(
+        "[query] compact gradient length $(length(g)) ≠ footprint length " *
+        "$(length(footprint)) of partition $(repr(label))"))
+    selection = s.selections[label]
+    _select_partition!(s, selection)
+    for (k, position) in enumerate(selection)
+        s.active[k] = u[position]
+    end
+    value = _latest_value(_cell_gradient!, s, s.gradient, u, s.active, s.slots, label)
+    for (k, position) in enumerate(footprint)
+        g[k] = s.gradient[s.slots[position]]
+    end
+    return value, g
+end
+partition_value_and_gradient!(s::PartitionSampler, g::AbstractVector, u::AbstractVector,
+                              label) =
+    partition_value_and_gradient!(s, g, Vector{Float64}(u), label)
+
+# Point the slot map at `selection` when it differs from the one in force.
+function _select_partition!(s::PartitionSampler, selection::Vector{Int})
+    _same_selection(s.selected, selection) && return nothing
+    for position in s.selected
+        s.slots[position] = 0
+    end
+    copyto!(resize!(s.selected, length(selection)), selection)
+    for (slot, position) in enumerate(s.selected)
+        s.slots[position] = slot
+    end
+    nothing
 end

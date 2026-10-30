@@ -78,6 +78,10 @@ export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
     sampler_value_gradient_and_retained!
 export QueryAD, prepare_query_ad
 export prepare_cell_query, CellQuery, prepare_cell_sampler, CellSampler, cell_value_and_gradient!
+export prepare_partition, PartitionQuery, prepare_partition_sampler, PartitionSampler,
+    partition_value_and_gradient!, partition_labels
+# `partition_footprint(s::PartitionSampler, label)` extends ReactiveKernels'
+# function; its name is ReactiveKernels' export.
 export prepare_compact_cell_sampler, CompactCellSampler
 export prepare_predictive, PredictiveQuery, PredictiveLaws, predictive_laws, predictive_draws!,
     predictive_draws, predictive_node, predictive_targets

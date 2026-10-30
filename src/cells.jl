@@ -3,7 +3,7 @@
 # codegen.jl); this file is the public graph transform.
 
 """
-    plate_cell(spec::KernelSpec, plate::Symbol; index = :cell, name = Symbol(plate, :_cell)) -> KernelSpec
+    plate_cell(spec::KernelSpec, plate::Symbol; index = :cell, name = Symbol(plate, :_cell), locality = nothing) -> KernelSpec
 
 A new kernel in which the value `name` is ONE cell of the authored plate that
 produces `plate`, at the position held by the HAVE port `index`: a linear
@@ -26,9 +26,20 @@ and the WANT `name`. `spec` is unchanged: the result has its own graph, sharing
 the original values and recipes. `index` may name an existing HAVE port of
 `spec` (or of an earlier `plate_cell` result) to evaluate several plates at the
 same cell.
+
+A value the cell reads only at its own rows is computed at those rows when its
+producer has a row form (see the package guide). `locality` says what
+preparation does with a value the cell reads at rows but would compute whole:
+`:error` throws a [`PartitionLocalityError`](@ref) naming every such value,
+`:warn` names each once per process, `:ignore` says nothing. `nothing` (the
+default) reads the project preference `cell_locality` (`"warn"` unless set).
+[`partition_locality`](@ref) reports the classification of every value.
 """
 function plate_cell(spec::KernelSpec, plate::Symbol; index::Symbol = :cell,
-                    name::Symbol = Symbol(plate, :_cell))
+                    name::Symbol = Symbol(plate, :_cell),
+                    locality::Union{Nothing,Symbol} = nothing)
+    locality in (nothing, :error, :warn, :ignore) || throw(ArgumentError(
+        "plate_cell: locality must be :error, :warn, :ignore or nothing; got $(repr(locality))"))
     graph = spec.graph
     target = spec[plate]
     producers = Recipe[graph.recipes[id] for id in producers_of(graph, target.id)
@@ -58,7 +69,7 @@ function plate_cell(spec::KernelSpec, plate::Symbol; index::Symbol = :cell,
     T = valtype(only(recipe.op.kernel.plan.want))
     cell = _kernel_declare!(copied, ports, order, name, T)
     _add_recipe!(copied, (position, recipe.inputs...), (cell,),
-                 _AuthoredPlateCellOp(recipe.op), recipe.cost, nothing, false,
+                 _AuthoredPlateCellOp(recipe.op, locality), recipe.cost, nothing, false,
                  recipe.source)
     KernelSpec(copied, ports, order, have_names, Symbol[name], nothing)
 end

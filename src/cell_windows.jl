@@ -81,15 +81,29 @@ struct _CellWindow{D,R<:Union{Int,Vector{Int}},S}
     shape::S
 end
 
-# The position along `data`'s first axis of row `row`; `at` is the read.
+# The position along `data`'s first axis of row `row`; `at` is the read. The
+# lookup reads the window's rows only, so native reverse differentiation sees
+# index arithmetic apart from the data (below).
 @inline function _cell_local_row(w::_CellWindow{<:Any,Int}, row, at)
-    row == w.rows || throw(BoundsError(w, at))
+    row == w.rows || throw(BoundsError(w.rows, at))
     firstindex(w.data, 1)
 end
 @inline function _cell_local_row(w::_CellWindow{<:Any,Vector{Int}}, row, at)
     k = findfirst(==(row), w.rows)
-    k === nothing && throw(BoundsError(w, at))
+    k === nothing && throw(BoundsError(w.rows, at))
     firstindex(w.data, 1) + k - 1
+end
+# The positions of rows `I`, computed before the data is read: a vector read
+# is then one gather of the data at those positions. Reading the data row by
+# row inside the position lookup instead (`[w[i, j] for i in I]`) made native
+# Enzyme Reverse refuse the read with `EnzymeRuntimeActivityError`, the
+# constant positions and the active data meeting in one loop.
+@inline function _cell_local_rows(w::_CellWindow, I::AbstractVector{<:Integer}, at)
+    positions = Vector{Int}(undef, length(I))
+    for (k, i) in enumerate(I)
+        positions[k] = _cell_local_row(w, i, at)
+    end
+    positions
 end
 
 # Whether gather index `I` reads exactly a vector value's window rows, in
@@ -100,7 +114,7 @@ end
 
 # Linear reads `v[q]`, as the cell and single-index gathers make them.
 @inline function Base.getindex(w::_CellWindow{<:Any,<:Any,Tuple{}}, q::Integer)
-    q == 1 || throw(BoundsError(w, q))
+    q == 1 || throw(BoundsError(w.rows, q))
     w.data[]
 end
 @inline function Base.getindex(w::_CellWindow{<:Any,<:Any,<:Tuple{Any,Vararg{Any}}},
@@ -108,13 +122,18 @@ end
     position = Tuple(CartesianIndices(w.shape)[q])
     w.data[_cell_local_row(w, first(position), q), Base.tail(position)...]
 end
-@inline Base.getindex(w::_CellWindow{<:Any,<:Any,<:Tuple}, I::AbstractVector{<:Integer}) =
-    [w[q] for q in I]
+@inline function Base.getindex(w::_CellWindow{<:Any,<:Any,<:Tuple},
+                               I::AbstractVector{<:Integer})
+    cells = CartesianIndices(w.shape)
+    positions = [CartesianIndex(_cell_local_row(w, first(Tuple(cells[q])), q),
+                                Base.tail(Tuple(cells[q]))...) for q in I]
+    w.data[positions]
+end
 # A vector value with one-based axes: linear position `q` is row `q`.
 @inline function Base.getindex(w::_CellWindow{<:Any,<:Any,<:Tuple{Base.OneTo}},
                                I::AbstractVector{<:Integer})
     _cell_reads_rows(w, I) && return w.data[:]
-    [w[q] for q in I]
+    w.data[_cell_local_rows(w, I, I)]
 end
 
 # Row reads `v[i, j...]` and gathers `v[I, j...]`.
@@ -123,7 +142,7 @@ end
 @inline function Base.getindex(w::_CellWindow, I::AbstractVector{<:Integer}, j::Integer,
                                rest::Integer...)
     _cell_reads_rows(w, I) && return w.data[:, j, rest...]
-    [w[i, j, rest...] for i in I]
+    w.data[_cell_local_rows(w, I, (I, j, rest...)), j, rest...]
 end
 
 # A read-only gather of a vector (`_readonly_gather`, core.jl, the view RKPPL
@@ -540,6 +559,14 @@ function _cell_form(r::Recipe; outlined::Bool = false)
         kind = :columns
         push!(uses[position[native.args[1]]], :leaf)
         push!(leaves, position[native.args[1]])
+    elseif native isa Expr && native.head === :ref &&
+           (range_view = _cell_range_view(native, position, mod)) !== nothing
+        # `A[lo:hi]` with literal or scalar-input bounds: a range view.
+        kind = :range_view
+        source, literal = range_view
+        push!(uses[source], :range_source)
+        push!(leaves, source)
+        foreach(part -> part isa Int || push!(uses[part.input], :whole), literal)
     elseif native isa Expr && native.head === :ref
         gather!(native) || return nothing
     elseif readonly(native)
@@ -874,6 +901,14 @@ struct _CellPushdowns
     slots::Dict{Int,Int}
     plates::Dict{Int,Any}
     order::Dict{Int,Int}
+    # The locality record (`_cell_locality`, plate_partition.jl): every value
+    # a reader asked for at rows, with `(reader recipe id, role)` per ask;
+    # why a value asked for has no row form (`:no_form`, `:unshaped`,
+    # `:operands`); and, for a value with a form that is still computed
+    # whole, the reader that reads it whole or is itself computed whole.
+    requests::Dict{ValueId,Vector{Tuple{Int,Symbol}}}
+    refused::Dict{ValueId,Symbol}
+    dropped::Dict{ValueId,Int}
 end
 
 # Whether a producer reads an input in `role` at its own rows.
@@ -958,15 +993,27 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
     captures = Dict{Int,Dict{Int,Tuple{Int,Int}}}()
     batched = Dict{Int,Set{Int}}()
     pushed = Set{ValueId}()
+    requests = Dict{ValueId,Vector{Tuple{Int,Symbol}}}()
+    refused = Dict{ValueId,Symbol}()
+    dropped = Dict{ValueId,Int}()
     work = ValueId[]
-    function reach!(cid, role)
+    function reach!(cid, role, reader)
+        push!(get!(() -> Tuple{Int,Symbol}[], requests, cid), (reader, role))
         cid in pushed && return
-        if blocked !== nothing && form(cid) === nothing
+        if form(cid) === nothing
             candidates = get(producers, cid, Recipe[])
-            cid in fixed || length(candidates) != 1 || push!(blocked, only(candidates).id)
+            (cid in fixed || length(candidates) != 1) && return
+            blocked === nothing || push!(blocked, only(candidates).id)
+            refused[cid] = :no_form
             return
         end
-        fits(cid, role) && operands_fit(cid) || return
+        if !fits(cid, role)
+            refused[cid] = :unshaped
+            return
+        elseif !operands_fit(cid)
+            refused[cid] = :operands
+            return
+        end
         push!(pushed, cid)
         push!(work, cid)
     end
@@ -974,18 +1021,18 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
         r.op isa _AuthoredPlateCellOp || continue
         positions = _cell_capture_positions(r, static_type)
         isempty(positions) || (captures[r.id] = positions)
-        foreach(k -> reach!(cidof(r.inputs[1 + k]), :linear_gather), keys(positions))
+        foreach(k -> reach!(cidof(r.inputs[1 + k]), :linear_gather, r.id), keys(positions))
         atomic = typeof(r.op.plate).parameters[2]
         lanes = Set(k for k in 1:length(r.inputs)-1 if !(k in atomic))
         batched[r.id] = lanes
-        foreach(k -> reach!(cidof(r.inputs[1 + k]), :leaf), lanes)
+        foreach(k -> reach!(cidof(r.inputs[1 + k]), :leaf, r.id), lanes)
     end
     while !isempty(work)
         cid = pop!(work)
         r = only(producers[cid])
         f = forms[r.id]
         for (j, input) in enumerate(r.inputs)
-            _cell_row_role(f.roles[j]) && reach!(cidof(input), f.roles[j])
+            _cell_row_role(f.roles[j]) && reach!(cidof(input), f.roles[j], r.id)
         end
     end
     # Keep a value at rows only while every reader reads it at rows.
@@ -993,32 +1040,36 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
     while changed
         changed = false
         for cid in collect(pushed)
-            ok = all(get(readers, cid, Recipe[])) do reader
+            failing = nothing
+            for reader in get(readers, cid, Recipe[])
                 slots = findall(v -> cidof(v) == cid, collect(reader.inputs))
-                if reader.op isa _AuthoredPlateCellOp
+                ok = if reader.op isa _AuthoredPlateCellOp
                     positions = get(captures, reader.id, Dict{Int,Tuple{Int,Int}}())
                     lanes = get(batched, reader.id, Set{Int}())
-                    return all(slots) do s
+                    all(slots) do s
                         s > 1 && ((haskey(positions, s - 1) &&
                             fits(cid, :linear_gather)) ||
                             (s - 1 in lanes && fits(cid, :leaf)))
                     end
+                elseif length(reader.outputs) == 1 && cidof(only(reader.outputs)) in pushed
+                    f = forms[reader.id]
+                    all(s -> _cell_row_role(f.roles[s]) && fits(cid, f.roles[s]), slots)
+                else
+                    false
                 end
-                length(reader.outputs) == 1 && cidof(only(reader.outputs)) in pushed ||
-                    return false
-                f = forms[reader.id]
-                all(s -> _cell_row_role(f.roles[s]) && fits(cid, f.roles[s]), slots)
+                ok || (failing = reader.id; break)
             end
-            ok && continue
+            failing === nothing && continue
             delete!(pushed, cid)
+            dropped[cid] = failing
             changed = true
         end
     end
-    isempty(pushed) && return nothing
     recipes = Set(only(producers[cid]).id for cid in pushed)
     _CellPushdowns(g, pushed, recipes,
         Dict(cid => only(producers[cid]) for cid in pushed), forms, captures, batched,
-        Dict{Int,Int}(), Dict{Int,Any}(), Dict(r.id => k for (k, r) in enumerate(p.recipes)))
+        Dict{Int,Int}(), Dict{Int,Any}(), Dict(r.id => k for (k, r) in enumerate(p.recipes)),
+        requests, refused, dropped)
 end
 
 # ---------------------------------------------------------------- outlining
@@ -1118,8 +1169,8 @@ end
     _cell_outlined_pushdowns(p::Plan) -> (plan, pushdowns)
 
 `p` with the recipes outlined that the cells then compute at their rows (see
-above), and that plan's pushdowns (`_cell_pushdowns`, `nothing` when no value
-is computed at rows). A recipe is outlined when a reader asks for its value at
+above), and that plan's pushdowns (`_cell_pushdowns`; `nothing` when the plan
+has no cell). A recipe is outlined when a reader asks for its value at
 rows and it has no row form; the outline stays while the recipe is pushed, and
 is dropped for good otherwise. `p` itself when nothing is outlined.
 """
@@ -1255,6 +1306,7 @@ function _cell_literal!(e::_CellEmitter, r::Recipe, f::_CellForm)
 end
 
 function _cell_operand_row!(e::_CellEmitter, cid::ValueId, row::Symbol)
+    _footprint_record!(cid, :rows, row)
     get!(e.rows, (cid, row)) do
         _cell_bind!(e, :cell_operand, Expr(:call, _cell_ref(:_cell_row_slice),
             Expr(:call, GlobalRef(Base, :broadcastable), e.names[cid]), row))
@@ -1385,6 +1437,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
         # and as a bounds-checked view of its whole value otherwise.
         j = only(f.leaves)
         icid = canon_id(d.graph, r.inputs[j].id)
+        icid in d.pushed || _footprint_record!(icid, :rows, reads[j])
         positions = icid in d.pushed ? _cell_take!(e, icid, reads[j]) :
             Expr(:call, _cell_ref(:_cell_factor_rows), e.names[icid], reads[j])
         f.kind === :range_view && return _cell_bind!(e, :cell_rows, positions)
@@ -1402,10 +1455,21 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
             shape = role === :gather ? nothing : _cell_shape!(e, icid)
             push!(args, _cell_bind!(e, :cell_window, Expr(:call,
                 _cell_ref(:_CellWindow), e.data[icid], e.unions[icid], shape)))
+        elseif role in (:gather, :linear_gather)
+            # The whole source, read by the gather at its index's rows.
+            for k in f.indices[j]
+                at = _cell_operand_row!(e, canon_id(d.graph, r.inputs[k].id), U)
+                f.vias[j] == 0 || (at = Expr(:call, _cell_ref(:_cell_via_rows),
+                    e.names[canon_id(d.graph, r.inputs[f.vias[j]].id)], at))
+                _footprint_record!(icid, role === :gather ? :gathered_rows : :gathered, at)
+            end
+            push!(args, e.names[icid])
         elseif role in (:factor_leaf, :factor)
+            icid in d.pushed || _footprint_record!(icid, :rows, reads[j])
             push!(args, icid in d.pushed ? _cell_take!(e, icid, reads[j]) :
                 Expr(:call, _cell_ref(:_cell_factor_rows), e.names[icid], reads[j]))
         else
+            _footprint_record!(icid, :whole, nothing)
             push!(args, e.names[icid])
         end
     end
@@ -1446,14 +1510,31 @@ end
 # The row a cell reads of pushed capture `cid`, at linear position
 # `only(slice)` (the cell's batched element), or at `via[only(slice)]`; either
 # is one position or an integer vector of them. Requested; read with
-# `_cell_capture!` once the windows are emitted.
-function _cell_capture_request!(e::_CellEmitter, cid::ValueId, slice, via = nothing)
-    element = Expr(:call, GlobalRef(Base, :only), slice)
-    via === nothing || (element = Expr(:call, GlobalRef(Base, :getindex), via, element))
-    position = _cell_bind!(e, :cell_read, element)
+# `_cell_capture!` once the windows are emitted. A partition (`rows`) reads
+# the positions every element of its slice holds, joined
+# (`_cell_partition_positions`), or those `via` holds at them.
+function _cell_capture_request!(e::_CellEmitter, cid::ValueId, slice, via = nothing;
+                                rows::Bool = false)
+    position = _cell_bind!(e, :cell_read, _cell_capture_element(slice, via; rows))
     _cell_request!(e, cid, _cell_bind!(e, :cell_row,
         Expr(:call, _cell_ref(:_cell_linear_row), _cell_shape!(e, cid), position)))
 end
+
+# The positions a cell reads of a captured value: its batched element (one
+# position or an integer vector of them), or `via` at it; a partition's are
+# those of every element of its slice, joined.
+function _cell_capture_element(slice, via; rows::Bool)
+    rows && return via === nothing ?
+        Expr(:call, _cell_ref(:_cell_partition_positions), slice) :
+        Expr(:call, _cell_ref(:_cell_via_rows), via, slice)
+    only = Expr(:call, GlobalRef(Base, :only), slice)
+    via === nothing ? only : Expr(:call, GlobalRef(Base, :getindex), via, only)
+end
+
+# The positions a partition's slice of a batched index argument holds: each
+# element one position or an integer vector of them, joined in order.
+@inline _cell_partition_positions(slice) =
+    Int[row for q in slice for row in (q isa Integer ? (q,) : q)]
 
 # The window a cell reads in place of pushed capture `cid`.
 _cell_capture!(e::_CellEmitter, cid::ValueId) = _cell_bind!(e, :cell_capture,
