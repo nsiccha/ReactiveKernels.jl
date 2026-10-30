@@ -27,7 +27,7 @@ are recorded in the git history only.
   (`AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`): the
   plan's row vectors meet the active vector in the body's views, which
   Enzyme's static activity analysis refuses (Enzyme snag
-  `plan-const-int-r-4671f4a7`). Requires ReactiveKernels 0.1.27.
+  `plan-const-int-r-4671f4a7`). Requires ReactiveKernels 0.1.28.
 ## 0.1.22
 
 - `prepare_compact_cell_ad(prepare_operator, built, plan, observations, base0,
