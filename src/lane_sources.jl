@@ -176,10 +176,10 @@ function _lane_source_closure(r::Recipe; branches::Bool = false, outlined::Bool 
     kernel_sourceop_form(op) === :fused || return nothing
     # Ordinary authored operations carry their ignore-mode twin; the twin
     # itself (selected by `on_error = :ignore`) does not, and its body differs.
-    outlined || op.ignored_throws !== nothing || return nothing
+    outlined || getfield(op, :ignored_throws) !== nothing || return nothing
     r.source isa Expr || return nothing
-    branches || !(op.f isa _KernelBranch) || return nothing
-    f = _kernel_native_source(_lane_source_callable(op.f))
+    branches || !(getfield(op, :f) isa _KernelBranch) || return nothing
+    f = _kernel_native_source(_lane_source_callable(getfield(op, :f)))
     fieldcount(typeof(f)) == 0 || return nothing
     params = _lane_source_params(f, length(r.inputs))
     params === nothing && return nothing
@@ -191,7 +191,7 @@ end
 # names, which need not be the input values' names: a composed child's recipe
 # reads its formals (`A * w`) over the caller's values (`X`, `b`), or over
 # values scoped under the caller's name (`pointwise.X`).
-function _lane_source_params(f, n)
+Base.@nospecializeinfer function _lane_source_params(@nospecialize(f), n)
     candidates = methods(f)
     length(candidates) == 1 || return nothing
     params = Base.method_argnames(only(candidates))[2:end]
@@ -217,8 +217,9 @@ end
 
 # A lazy branch runs its authored all-in-one closure (`_KernelBranch`); a branch
 # that preparation rebuilt from its parts (`_KernelBranchCall`) is no closure.
-_lane_source_callable(f) = f
-_lane_source_callable(branch::_KernelBranch) = branch.call
+Base.@nospecializeinfer _lane_source_callable(@nospecialize(f)) = f
+Base.@nospecializeinfer _lane_source_callable(@nospecialize(branch::_KernelBranch)) =
+    getfield(branch, :call)
 
 function _lane_strip_lines(ex)
     ex isa Expr || return ex

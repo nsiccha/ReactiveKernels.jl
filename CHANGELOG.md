@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.23
+## 0.1.24
 
 - `plate_partition(spec, plates; by, index, name, locality)`: the cells of
   one or more authored plates whose key equals the label held by the HAVE
@@ -65,6 +65,49 @@ are recorded in the git history only.
   footprints of its own. `partition_footprint_kernel(kernel)` prepares the
   footprint kernel for a caller to hold; `partition_separability` takes a
   computed `footprint`.
+
+## 0.1.23
+
+- Each authored recipe's source runs in the generated body. A fused recipe
+  used to be one entry of the operation table, a separately generated
+  function of its source called as `lhs = __ops__[k](x, y)`; the body now
+  carries the source itself,
+  `lhs = let var"#opk" = __ops__[k], var"#x#opk" = x, …; <source> end`,
+  with the recipe's authored closure in the slot for its captures
+  (`getfield(__ops__[k], :c)`) and locals named from the slot, so one plan
+  lowers to one expression. Literal statements (`shift::Float64 = -1.5`),
+  aliases, fused sources with data-only split nodes and operations built
+  without a throw-stripped twin inline too, as do a plate's cell recipes
+  inside the plate loop and a scan's step statements. A branch, a
+  reduction, a raw function, a bound constant, a plate, a scan, an embedded
+  kernel, a source reading a module binding the module can reassign (its
+  definition-time callee stays pinned), and a source outside the emitter's
+  grammar keep their call through the slot. `RK_INLINE_SOURCES=0` keeps
+  every call in the table for comparison. The plan, its recipes,
+  `recipe_inventory` and `explain` are unchanged; `code_expr` prints the
+  code that runs. On the ArbeitsplatzAtlas model the log-density kernel's
+  table type shrinks from 2.58 MB to 548 KB of type text and the bound-data
+  prefix's from 312 KB to 94 KB; the log density and the K=64 synthetic
+  program's density and gradient are bitwise equal to the table's.
+- Lowering reads an operation's fields with one method instance for every
+  operation type (`_source_parameter_names`, the source module, the
+  type-stability audit's recipe type query through `Base._return_type`, the
+  plate and scan predicates, partial evaluation's branch reads, the gather
+  predicate), and the plate loop's recipe emitter has one closure type for
+  every plate (its captures travel through a `Ref{Any}` cell). Measured side by
+  side on the ArbeitsplatzAtlas model, its `problem` stage (prepare, the
+  audit, `prepare_ad`) compiles 6,691 method instances in 103.5 s instead
+  of 7,677 in 111.3 s, and a K=64 synthetic program's prepare takes 34.7 s
+  instead of 38.2 s (1,638 instead of 2,219 methods).
+- The embedded-kernel splice keeps named-tuple field labels (`(g = …, a = a)`,
+  `(; x)`) and keyword labels as syntax; it renamed them with the locals,
+  which the generated source function used to hide.
+- The `independent` reconvergent plate diamond's empty-sequence native
+  Reverse gradient is pinned as an Enzyme boundary on Julia 1.10
+  (`test_plate_fusion_reconvergence_ad.jl`, the
+  `repro_enzyme_branch_allocation_phi.jl` class, decision `0ajp3qj`'s
+  policy); it failed identically before this change.
+
 ## 0.1.22
 
 - One cell of a plate (`plate_cell`; RKPPL's `prepare_cell_query` and cell

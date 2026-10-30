@@ -43,7 +43,18 @@ _diamond_reverse_bytes(ad::A, gradient, args::Vararg{Any,N}) where {A,N} =
         ad = prepare_ad(k, backend, q, x; active = :q)
         base = sum(q) .* x
         expected = sum(x .* (cos.(base) .- sin.(base)); init = 0.0)
-        @test ad_gradient(ad, q, x) ≈ fill(expected, 2)
+        if VERSION < v"1.11-" && n == 0
+            # Enzyme boundary (`docs/src/constraints.md`,
+            # `benchmark/repro_enzyme_branch_allocation_phi.jl`): over the empty
+            # sequence the two summed readers meet an empty, never written
+            # allocation in one value, and registered Enzyme 0.13.216 fails
+            # static activity analysis on Julia 1.10.12. The Enzyme dogfood
+            # line repairs the class (decision `0ajp3qj`); an "Unexpected Pass"
+            # here is the signal to drop this pin.
+            @test_broken ad_gradient(ad, q, x) ≈ fill(expected, 2)
+        else
+            @test ad_gradient(ad, q, x) ≈ fill(expected, 2)
+        end
     end
     for depth in (1, 6)
         name = Symbol(:joined_, depth)

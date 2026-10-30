@@ -99,15 +99,22 @@ end
     @test totals ≈ [2sum(transformed), 3sum(transformed)]
     @test pointwise ≈ [2 .* transformed 3 .* transformed]
     # The shared recipe runs once on the shared data above the position loop,
-    # never on a projected position inside it.
+    # never on a projected position inside it. Its statement is the recipe's
+    # source inlined over its arguments (`inline_sources.jl`), so the slot it
+    # names and the arguments it binds are read back structurally.
     expression = code_expr(kernel)
     loop_index = findlast(node -> node isa Expr && node.head === :for,
                           expression.args[2].args)
-    before_loop = string(Expr(:block, expression.args[2].args[1:loop_index-1]...))
-    loop = string(expression.args[2].args[loop_index])
-    @test occursin("(__ops__[1])(data)", before_loop)
-    @test !occursin("(__ops__[1])", loop)
-    @test !occursin("(__ops__[1])(var\"##theta_position", before_loop)
+    recipe_applications(statements) = [
+        ReactiveKernels._inline_statement_call(statement.args[2])
+        for statement in statements
+        if statement isa Expr && statement.head === :(=) &&
+           ReactiveKernels._inline_statement_call(statement.args[2]) !== nothing]
+    before_loop = recipe_applications(expression.args[2].args[1:loop_index-1])
+    loop_body = expression.args[2].args[loop_index].args[2].args
+    @test any(((slot, callargs),) -> slot == 1 && callargs == Any[:data], before_loop)
+    @test !any(((slot, _),) -> slot == 1, recipe_applications(loop_body))
+    @test !occursin("__ops__[1]", string(expression.args[2].args[loop_index]))
 end
 
 @kernel replica_defaulted(x::Float64, offset::Float64 = 1.0) = begin

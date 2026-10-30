@@ -274,8 +274,10 @@ end
 _KernelSourceFunction(f::F, runtime_f::RF, captures::C) where {F,RF,C} =
     _KernelSourceFunction{F,RF,C,Val{:guarded}}(f, runtime_f, captures)
 
-_kernel_native_source(f) = f
-_kernel_native_source(f::_KernelSourceFunction) = f.f
+# One instance for every source type (`@nospecialize`, `getfield`): lowering
+# reads these for every recipe of a program (`_source_parameter_names`).
+Base.@nospecializeinfer _kernel_native_source(@nospecialize(f)) = f
+Base.@nospecializeinfer _kernel_native_source(@nospecialize(f::_KernelSourceFunction)) = getfield(f, :f)
 
 # The call is a forwarding shim and is never a call boundary: both generated
 # bodies declare themselves inline. `@inline` on a `@generated` definition does
@@ -381,8 +383,9 @@ kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = F
 # no cell evaluated. `nothing` for any other callable, or when inference gives
 # no concrete type.
 _kernel_native_result_type(f, ::Type{<:Tuple}) = nothing
-function _kernel_native_result_type(op::_KernelSourceOp, argtypes::Type{<:Tuple})
-    T = Core.Compiler.return_type(op.f, argtypes)
+Base.@nospecializeinfer function _kernel_native_result_type(
+        @nospecialize(op::_KernelSourceOp), @nospecialize(argtypes::Type{<:Tuple}))
+    T = Core.Compiler.return_type(getfield(op, :f), argtypes)
     isconcretetype(T) ? T : nothing
 end
 # Read-only graph gathers may share their parent's storage, including in queries.
@@ -1343,7 +1346,8 @@ end
 _kernel_split_spec(::_KernelSplit{S}) where {S} = S
 # Source readers of the whole expression (destination forms, nonallocating
 # decomposition) read the authored closure the split metadata wraps.
-_kernel_native_source(split::_KernelSplit) = _kernel_native_source(split.call)
+Base.@nospecializeinfer _kernel_native_source(@nospecialize(split::_KernelSplit)) =
+    _kernel_native_source(getfield(split, :call))
 # Forwarded positionally and inlined, as `_KernelSourceFunction` forwards.
 @inline @generated function (split::_KernelSplit)(args::Vararg{Any,N}) where {N}
     forwarded = [:(getfield(args, $index)) for index in 1:N]
@@ -1381,7 +1385,8 @@ _KernelSplitApply(::Val{P}, split::S) where {P,S} = _KernelSplitApply{P,S}(split
     end
     :(Base.@inline getfield($split, :root)($(map(arg, root[1])...), $(map(node, P)...)))
 end
-_kernel_native_source(apply::_KernelSplitApply) = _kernel_native_source(apply.split)
+Base.@nospecializeinfer _kernel_native_source(@nospecialize(apply::_KernelSplitApply)) =
+    _kernel_native_source(getfield(apply, :split))
 
 # One arm of a `_KernelBranchCall`: its operation over the arguments at `I`.
 struct _KernelArm{I,F}

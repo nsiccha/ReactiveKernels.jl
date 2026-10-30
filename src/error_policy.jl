@@ -124,8 +124,8 @@ Base.@nospecializeinfer function _kernel_with_ignored_throws(
 end
 
 _kernel_ignore_throw_op(op) = _IgnoredThrowFunction(op)
-_kernel_ignore_throw_op(op::_KernelSourceOp) =
-    op.ignored_throws === nothing ? op : op.ignored_throws
+Base.@nospecializeinfer _kernel_ignore_throw_op(@nospecialize(op::_KernelSourceOp)) =
+    getfield(op, :ignored_throws) === nothing ? op : getfield(op, :ignored_throws)
 function _kernel_ignore_throw_op(op::_AuthoredPlateOp{K,A}) where {K,A}
     kernel = prepare(op.kernel.plan; on_error = :ignore)
     _AuthoredPlateOp{typeof(kernel),A}(kernel, op.axis_checks)

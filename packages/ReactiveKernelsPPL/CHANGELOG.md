@@ -26,7 +26,7 @@ are recorded in the git history only.
   as one compiled pass, with its value and dense gradient. `by` names a
   supplied data column with one entry per cell of each observation's plate
   (one name, or `observation => column` pairs). Requires ReactiveKernels
-  0.1.23.
+  0.1.24.
 - `prepare_partition_sampler(…; compact = true, partitioned = ())`: with
   `compact` (the default) the gradient is over each partition's footprint,
   the packed coordinates it reads, computed at preparation for every label

@@ -262,11 +262,27 @@ assumed.
 ### 4. Lowering and emitted ABI
 
 Lowering turns the selected plan into a straight-line anonymous Julia function.
-It creates collision-free locals from canonical value identities, takes the
-selected operations in a positional tuple, and calls each operation through a
-literal tuple index. HAVE values appear in their preserved boundary order;
-WANT values appear in their requested return order. A single WANT returns one
-value and multiple WANTS return a tuple.
+It creates collision-free locals from canonical value identities and takes the
+selected operations in a positional tuple, one slot per recipe. A recipe whose
+operation is its authored source runs that source in the body, as a `let` that
+binds the slot first, then the source's parameters to the recipe's arguments
+and its captures to the fields of the authored closure the slot keeps:
+
+```julia
+a = let var"#op1" = __ops__[1], var"#x#op1" = x, var"#c#op1" = getfield(__ops__[1], :c)
+    <the recipe's source over x and c>
+end
+```
+
+The source's own names are resolved in the module that defined it, as the
+rest of the body resolves globals. An operation whose code is not its source
+is called through its literal tuple index: a raw function, a plate, a scan, a
+branch, a bound constant, a source that reads a module binding the module can
+reassign (its generated source function names the value the binding held when
+the kernel was defined), or a source outside the emitter's grammar. HAVE
+values appear in their preserved boundary order; WANT values appear in their
+requested return order. A single WANT returns one value and multiple WANTS
+return a tuple.
 
 Multi-output recipes use one tuple destructure. If a later recipe emits a value
 already owned by HAVE or an earlier selected producer, lowering binds that

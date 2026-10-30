@@ -621,15 +621,29 @@ function _lhs_symbols!(symbols::Set{Symbol}, lhs)
     symbols
 end
 
+# The field labels of a named tuple (`(a = x,)`, `(; a = x)`) and the labels
+# of keyword arguments (`f(x; a = y)`) are syntax, not names: a recipe's source
+# emitted into the body (`inline_sources.jl`) spells them where its generated
+# source function used to hide them. The labeled item's value, or the item
+# itself when it carries no label.
+_labeled_value(item) =
+    item isa Expr && item.head in (:(=), :kw) && length(item.args) == 2 &&
+        item.args[1] isa Symbol ? item.args[2] : item
+
 function _local_symbols!(symbols::Set{Symbol}, node)
     node isa Expr || return symbols
-    node.head === :quote && return symbols
+    node.head in _INLINE_OPAQUE_HEADS && return symbols
     if node.head === :(=)
         _lhs_symbols!(symbols, node.args[1])
     elseif node.head === :for
         iteration = node.args[1]
         iteration isa Expr && iteration.head === :(=) &&
             _lhs_symbols!(symbols, iteration.args[1])
+    elseif node.head in (:tuple, :parameters)
+        foreach(item -> _local_symbols!(symbols, _labeled_value(item)), node.args)
+        return symbols
+    elseif node.head === :kw
+        return _local_symbols!(symbols, node.args[end])
     end
     foreach(child -> _local_symbols!(symbols, child), node.args)
     symbols
@@ -643,14 +657,33 @@ _signature_name(annotation::Expr) = annotation.head === :(::) ?
 function _rewrite_embedded(node, names::Dict{Symbol,Any}, op_offset::Int)
     node isa Symbol && return get(names, node, node)
     node isa Expr || return node
-    node.head === :quote && return node
+    node.head in _INLINE_OPAQUE_HEADS && return node
     if node.head === :ref && length(node.args) == 2 &&
        node.args[1] === _OPS_ARG && node.args[2] isa Int
         return Expr(:ref, _OPS_ARG, op_offset + node.args[2])
     end
+    # A named tuple's field labels and keyword labels are syntax
+    # (`_labeled_value`): their values are rewritten, the labels stay.
+    if node.head === :tuple
+        return Expr(:tuple,
+                    (_rewrite_labeled(item, names, op_offset) for item in node.args)...)
+    elseif node.head === :parameters
+        return Expr(:parameters,
+                    (_rewrite_parameter(item, names, op_offset) for item in node.args)...)
+    elseif node.head === :kw && _labeled_value(node) !== node
+        return Expr(:kw, node.args[1], _rewrite_embedded(node.args[2], names, op_offset))
+    end
     Expr(node.head,
          (_rewrite_embedded(child, names, op_offset) for child in node.args)...)
 end
+_rewrite_labeled(item, names::Dict{Symbol,Any}, op_offset::Int) =
+    _labeled_value(item) === item ? _rewrite_embedded(item, names, op_offset) :
+    Expr(item.head, item.args[1], _rewrite_embedded(item.args[2], names, op_offset))
+# `(; x)` and `f(; x)` name the field or keyword `x` by the value `x` reads:
+# the label stays, the value is rewritten.
+_rewrite_parameter(item, names::Dict{Symbol,Any}, op_offset::Int) =
+    item isa Symbol ? Expr(:kw, item, _rewrite_embedded(item, names, op_offset)) :
+    _rewrite_labeled(item, names, op_offset)
 
 function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int)
     ast.head === :function || throw(ArgumentError(
@@ -1251,11 +1284,13 @@ end
 function _scan_hoisted_read(statement, strips, index)
     statement isa Expr && statement.head === :(=) || return statement
     call = statement.args[2]
-    call isa Expr && call.head === :call || return statement
-    callee = call.args[1]
-    callee isa Expr && callee.head === :ref && length(callee.args) == 2 &&
-        callee.args[1] === _OPS_ARG || return statement
-    buffer = get(strips.hoisted, callee.args[2], nothing)
+    call isa Expr || return statement
+    # The step statement is the operation's call, or its source inlined in
+    # its place (`inline_sources.jl`); either names the slot.
+    slot = call.head === :call ? _operation_slot(call.args[1]) :
+        (inlined = _inline_statement_call(call); inlined === nothing ? nothing : first(inlined))
+    slot === nothing && return statement
+    buffer = get(strips.hoisted, slot, nothing)
     buffer === nothing && return statement
     Expr(:(=), statement.args[1],
          _inbounds_value(:($buffer[$index - $(strips.lo) + 1])))
@@ -1715,7 +1750,8 @@ end
 # gathered generator sum (the dose-outer passes).
 _scan_step_fold(op) = false
 _scan_step_fold(::typeof(evalpoly)) = true
-_scan_step_fold(op::_KernelSourceOp) = op.f isa _KernelReduction
+Base.@nospecializeinfer _scan_step_fold(@nospecialize(op::_KernelSourceOp)) =
+    getfield(op, :f) isa _KernelReduction
 
 # Step recipe `index` as a one-cell plate: lanes are scan sequences
 # (`lane_of`) or earlier hoisted strip buffers (`hoisted_of`), `Ref` operands
@@ -2442,7 +2478,7 @@ function _plate_reduction_plan(inner::Plan, inner_kernel, dependencies,
     recipe = inner.recipes[recipe_index]
     roots = dynamic(want)
     isempty(roots) && return nothing
-    _plate_reduction_kind(inner_kernel.ops[recipe_index], recipe, recipe_index,
+    _plate_reduction_kind(getfield(inner_kernel, :ops)[recipe_index], recipe, recipe_index,
                           roots, input -> dynamic(canon_id(graph, input.id)))
 end
 
@@ -2451,14 +2487,15 @@ end
 # varies with; the fold's iterator and coefficients must vary with none.
 _plate_reduction_kind(op, recipe, recipe_index, roots, dynamic) = nothing
 # A generator sum: gathered (`get(A, K, D)`, dose-outer) or gather-free.
-function _plate_reduction_kind(op::_KernelSourceOp, recipe, recipe_index, roots,
-                               dynamic)
-    op.f isa _KernelReduction || return nothing
-    II, XI, KI, AI = typeof(op.f).parameters
+Base.@nospecializeinfer function _plate_reduction_kind(
+        @nospecialize(op::_KernelSourceOp), recipe, recipe_index, roots, dynamic)
+    f = getfield(op, :f)
+    f isa _KernelReduction || return nothing
+    II, XI, KI, AI = (typeof(f)::DataType).parameters
     for position in (II..., AI...)
         isempty(dynamic(recipe.inputs[position])) || return nothing
     end
-    (; kind = Val(op.f.index === nothing ? :sum : :gather), recipe_index, recipe,
+    (; kind = Val(getfield(f, :index) === nothing ? :sum : :gather), recipe_index, recipe,
        roots, iterator = II, init = XI, index = KI, source = AI)
 end
 # A cell that is exactly Base's `evalpoly(x, c)` (an authored `evalpoly(x, c)`
@@ -2838,7 +2875,7 @@ end
 Base.@nospecializeinfer function _plate_shared_branch(
         @nospecialize(inner_kernel), @nospecialize(atomic), @nospecialize(callargs),
         @nospecialize(callvalues))
-    inner = inner_kernel.plan
+    inner = getfield(inner_kernel, :plan)
     for r in inner.recipes
         (r.effectful || length(r.outputs) != 1 ||
          r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
@@ -3241,7 +3278,7 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_native!(
     types = _plate_cell_types!(runtime_ops, runtime_recipes, inner_kernel, atomic,
         callargs, callvalues, raw_arguments, input_type_hints)
     if element_type === nothing
-        inner = inner_kernel.plan
+        inner = getfield(inner_kernel, :plan)
         inferred = only(_bind_native_type_exprs!(body, Any[get(types.plate_type_exprs,
             canon_id(inner.graph, only(inner.want).id), GlobalRef(Core, :Any))]))
         element_type = gensym(:plate_eltype)
@@ -3306,8 +3343,11 @@ end
 
 # `recycled`: the lane slot of the recipe's value (`_lower_authored_plate_loop_native!`),
 # which a scan, dotted call or slice fills instead of allocating.
+# `slot_inlines`: whether the table holds the recipe's authored closure at
+# `operation` (the cell kernel's own lowering inlined it) rather than its
+# operation; a `Bool`, so the keyword call has one instance for every plate.
 function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots;
-                                     recycled = nothing)
+                                     recycled = nothing, slot_inlines::Bool = false)
     if recipe.op isa _AuthoredScanOp
         _lower_authored_scan_native!(body, recipe.op, args, out, slots.offset;
                                      slots.type_offset, recycled)
@@ -3323,11 +3363,19 @@ function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots;
     if destination !== nothing
         append!(body.args, (Expr(:(=), name, arg) for (name, arg) in zip(names, args)))
         push!(body.args, Expr(:(=), out, destination))
-    elseif recipe.op isa _KernelSourceOp && recipe.op.f isa _KernelBranch
+    elseif recipe.op isa _KernelSourceOp && getfield(recipe.op, :f) isa _KernelBranch
         push!(body.args, Expr(:(=), out,
-            _native_plate_branch_expr(recipe.op.f, :(getfield($operation, :f)), args)))
+            _native_plate_branch_expr(getfield(recipe.op, :f), :(getfield($operation, :f)), args)))
     else
-        push!(body.args, Expr(:(=), out, Expr(:call, operation, args...)))
+        # Where the cell kernel's own lowering emitted this recipe's source and
+        # left its authored closure in the slot (`inline_sources.jl`), the cell
+        # runs that source over its arguments here too; a slot that keeps the
+        # operation is called.
+        slot = _operation_slot(operation)
+        inlined = slot_inlines && slot !== nothing ?
+            _inline_source_form(recipe, args, slot) : nothing
+        push!(body.args, Expr(:(=), out,
+            inlined === nothing ? Expr(:call, operation, args...) : inlined[1]))
     end
     body
 end
@@ -3524,10 +3572,10 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     # plate, of its element type; the cells are written into it in place and
     # the binding is left alone (a strip refill, `_lower_authored_scan_strips!`).
     inner_kernel = op.kernel
-    inner = inner_kernel.plan
+    inner = getfield(inner_kernel, :plan)
     length(inner.want) == 1 || throw(ArgumentError(
         "an authored plate body must have exactly one distinguished result"))
-    length(inner_kernel.ops) == length(inner.recipes) || throw(ArgumentError(
+    length(getfield(inner_kernel, :ops)) == length(inner.recipes) || throw(ArgumentError(
         "an authored plate body must lower to one operation per transparent scalar recipe"))
 
     atomic = typeof(op).parameters[2]
@@ -3687,7 +3735,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         input_type_hints = nothing, element_type = nothing, into::Bool = false,
         unswitch::Bool = true, cells::Bool = true, nonempty::Bool = false,
         types = nothing, total_fold = sum)
-    inner = inner_kernel.plan
+    inner = getfield(inner_kernel, :plan)
     if unswitch
         branch = _plate_shared_branch(inner_kernel, atomic, callargs, callvalues)
         branch === nothing || return _lower_plate_shared_branch_native!(
@@ -3744,10 +3792,10 @@ Base.@nospecializeinfer function _plate_cell_types!(
         runtime_ops, runtime_recipes, @nospecialize(inner_kernel),
         @nospecialize(atomic), @nospecialize(callargs), @nospecialize(callvalues),
         raw_arguments, input_type_hints; result_slot::Bool = false)
-    inner = inner_kernel.plan
+    inner = getfield(inner_kernel, :plan)
     op_offset = length(runtime_ops)
-    append!(runtime_ops, inner_kernel.ops)
-    append!(runtime_recipes, inner_kernel.lowered_recipes)
+    append!(runtime_ops, getfield(inner_kernel, :ops))
+    append!(runtime_recipes, getfield(inner_kernel, :lowered_recipes))
     scan_offsets = _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
     lane_arms = _plate_lane_arm_slots!(runtime_ops, runtime_recipes, inner,
                                        atomic, callvalues)
@@ -3870,17 +3918,29 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
                   k === nothing ? nothing : last(slotted[k]))
     # A scan read only through one slice is emitted where that slice is read
     # (`_lower_authored_scan_slice_native!`).
+    # Julia parametrizes a closure's type by its captured values' types: with
+    # the plate's own kernel, argument and schedule types captured directly,
+    # every plate had its own `lower_recipe!` type and compiled body (256
+    # instances, 5.5 s of the atlas `problem` stage). Captured through
+    # `Ref{Any}` cells, one closure type serves every plate.
+    captured = Ref{Any}((; inner_kernel, atomic, callargs, callvalues,
+                           prepared_arguments, slices, sliced_scans, scan_offsets))
     function lower_recipe!(block, recipe_index, args, out, operation, looped)
-        recipe_index in sliced_scans && return block
-        haskey(slices, recipe_index) || return _lower_plate_recipe_native!(
+        # `getfield`, not `.`: the cell is `Any`, and a property read would
+        # compile once per plate's record type.
+        c = captured[]
+        recipe_index in getfield(c, :sliced_scans) && return block
+        haskey(getfield(c, :slices), recipe_index) || return _lower_plate_recipe_native!(
             block, inner.recipes[recipe_index], args, out, operation,
-            get(scan_offsets, recipe_index, nothing); recycled = slot_of(recipe_index))
-        scan_index, demand = slices[recipe_index]
+            get(getfield(c, :scan_offsets), recipe_index, nothing); recycled = slot_of(recipe_index),
+            slot_inlines = !(getfield(getfield(c, :inner_kernel), :ops)[recipe_index] isa _KernelSourceOp))
+        scan_index, demand = getfield(c, :slices)[recipe_index]
         scan_recipe = inner.recipes[scan_index]
         scan_args = Any[_authored_plate_scalar_ref(
-            inner, locals, callargs, callvalues, prepared_arguments, atomic,
+            inner, locals, getfield(c, :callargs), getfield(c, :callvalues),
+            getfield(c, :prepared_arguments), getfield(c, :atomic),
             input, index, looped) for input in scan_recipe.inputs]
-        slots = scan_offsets[scan_index]
+        slots = getfield(c, :scan_offsets)[scan_index]
         _lower_authored_scan_slice_native!(block, scan_recipe.op, scan_args,
             slots.offset, demand, args, out, operation; slots.type_offset)
     end
@@ -4492,13 +4552,14 @@ function _lower_with_ops_collecting(p::Plan;
                          outline::Bool = pushdowns,
                          plate_element_types::Bool = false,
                          type_hints = nothing, exemplar_types = nothing,
-                         footprint::Bool = false)
+                         footprint::Bool = false,
+                         inline_sources::Bool = _inline_sources_enabled())
     # The footprint variant (`partition_footprint`, plate_partition.jl): the
     # body records every read of a HAVE port and returns them instead of the
     # wanted values.
     footprint && return task_local_storage(_FOOTPRINT, _FootprintRecords()) do
         _lower_with_ops_collecting(p; inline_embedded, declare, recycle, pushdowns, outline,
-                                   plate_element_types, type_hints, exemplar_types)
+                                   plate_element_types, type_hints, exemplar_types, inline_sources)
     end
     # Only the lowering the footprint was asked for records reads and returns
     # them: a lowering nested in it (a plate body, an embedded kernel) runs
@@ -4507,7 +4568,7 @@ function _lower_with_ops_collecting(p::Plan;
     if recording !== nothing
         recording.active && return task_local_storage(_FOOTPRINT, nothing) do
             _lower_with_ops_collecting(p; inline_embedded, declare, recycle, pushdowns, outline,
-                                       plate_element_types, type_hints, exemplar_types)
+                                       plate_element_types, type_hints, exemplar_types, inline_sources)
         end
         recording.active = true
     end
@@ -4847,6 +4908,16 @@ function _lower_with_ops_collecting(p::Plan;
                 recycled(canon_id(g, only(r.outputs).id)) : nothing
             destination === nothing ||
                 (destination = _lane_source_expr(r, callargs, destination))
+            if destination === nothing && inline_sources
+                # The recipe's source in the body; its authored closure, whose
+                # fields the body reads as the captures, in the slot
+                # (`inline_sources.jl`).
+                inlined = _inline_source_form(r, callargs, length(runtime_ops))
+                if inlined !== nothing
+                    runtime_ops[end] = inlined[2]
+                    destination = inlined[1]
+                end
+            end
             call = destination === nothing ?
                 Expr(:call, Expr(:ref, _OPS_ARG, length(runtime_ops)), callargs...) :
                 destination
@@ -4878,10 +4949,18 @@ end
 Lower a plan to an ordinary anonymous-function `Expr` of the form
 
     function (__ops__, x::T1, y::T2)
-        a = __ops__[1](x, y)
+        a = let var"#op1" = __ops__[1], var"#x#op1" = x, var"#y#op1" = y
+            <the first recipe's source over x and y>
+        end
+        b = __ops__[2](a)
         ...
         return out
     end
+
+A recipe's authored source runs in the body over its arguments, its captures
+read from the authored closure its slot keeps (`inline_sources.jl`); an
+operation whose code is not its source (a plate, a scan, a raw function, a
+branch) is called through its slot.
 
 This `Expr` is a first-class artifact: it may be inspected (`code_expr`) and
 rewritten (`transform`) before compilation (gist §9). Pair it with its
@@ -7201,6 +7280,14 @@ end
 # feed the checked program as bound data of their runtime types.
 function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing,
                        exemplars = nothing)
+    on_error === nothing || return task_local_storage(_INLINE_SOURCES_OFF, true) do
+        _prepare_plan_body(p; passes, bound, on_error, exemplars)
+    end
+    _prepare_plan_body(p; passes, bound, on_error, exemplars)
+end
+
+function _prepare_plan_body(p::Plan; passes = (), bound = (), on_error = nothing,
+                            exemplars = nothing)
     p = _kernel_error_policy(p, on_error)
     # Compose cell-only producers before the top-level bound split. Other
     # eligible chains compose after that split but before guarded cells are
@@ -7594,24 +7681,35 @@ function _unscoped_source_name(name::Symbol, spelled)
     end
     name
 end
-function _source_parameter_names(op::_KernelSourceOp, source, n)
+# One instance for every operation type, reading fields with the `getfield`
+# builtin: a program lowers thousands of distinct operation types through
+# these readers, and the atlas `problem` stage compiled 1150 instances of
+# `_source_parameter_names` and 1045 of `_kernel_endpoint_source_module`.
+Base.@nospecializeinfer function _source_parameter_names(
+        @nospecialize(op::_KernelSourceOp), @nospecialize(source), n)
     # A branch preparation rebuilt names its arguments itself.
-    names = _branch_call_names(op.f)
+    f = getfield(op, :f)
+    names = _branch_call_names(f)
     names === nothing || return length(names) == n ? names : nothing
-    _closure_parameter_names(_source_closure(op.f), n)
+    _closure_parameter_names(_source_closure(f), n)
 end
-_source_closure(f) = f
-_source_closure(f::_KernelSourceFunction) = _source_closure(f.f)
-_source_closure(branch::_KernelBranch) = _source_closure(branch.call)
-_source_closure(split::_KernelSplit) = _source_closure(split.call)
-_source_closure(apply::_KernelSplitApply) = _source_closure(apply.split)
-_source_closure(reduction::_KernelReduction) = _source_closure(reduction.call)
-_source_parameter_names(op::Function, source::Expr, n) =
+Base.@nospecializeinfer _source_closure(@nospecialize(f)) = f
+Base.@nospecializeinfer _source_closure(@nospecialize(f::_KernelSourceFunction)) =
+    _source_closure(getfield(f, :f))
+Base.@nospecializeinfer _source_closure(@nospecialize(branch::_KernelBranch)) =
+    _source_closure(getfield(branch, :call))
+Base.@nospecializeinfer _source_closure(@nospecialize(split::_KernelSplit)) =
+    _source_closure(getfield(split, :call))
+Base.@nospecializeinfer _source_closure(@nospecialize(apply::_KernelSplitApply)) =
+    _source_closure(getfield(apply, :split))
+Base.@nospecializeinfer _source_closure(@nospecialize(reduction::_KernelReduction)) =
+    _source_closure(getfield(reduction, :call))
+Base.@nospecializeinfer _source_parameter_names(@nospecialize(op::Function), source::Expr, n) =
     source.head === :call && length(source.args) == n + 1 &&
         all(arg -> arg isa Symbol, source.args[2:end]) ?
         Symbol[source.args[2:end]...] : nothing
-_source_parameter_names(op, source, n) = nothing
-function _closure_parameter_names(f, n)
+Base.@nospecializeinfer _source_parameter_names(@nospecialize(op), @nospecialize(source), n) = nothing
+Base.@nospecializeinfer function _closure_parameter_names(@nospecialize(f), n)
     f isa Function || return nothing
     candidates = methods(f)
     length(candidates) == 1 || return nothing
@@ -7648,6 +7746,17 @@ function _readable_expr(node, recipes)
     let slot = _operation_slot(node)
         slot !== nothing && 1 <= slot <= length(recipes) &&
             return _readable_callee(recipes[slot].op)
+    end
+
+    # A recipe's source inlined in the body (`inline_sources.jl`) renders as
+    # the call it replaced: the source over its arguments, as this view shows
+    # every operation.
+    if node.head === :let
+        inlined = _inline_statement_call(node)
+        if inlined !== nothing && 1 <= inlined[1] <= length(recipes)
+            args = map(arg -> _readable_expr(arg, recipes), inlined[2])
+            return _readable_recipe_call(recipes[inlined[1]], args)
+        end
     end
 
     # Ordinary lowered kernels and pure reactive getters invoke an operation

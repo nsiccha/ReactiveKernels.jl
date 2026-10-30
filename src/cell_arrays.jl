@@ -140,9 +140,10 @@ function _cell_array_source(r::Recipe, args)
     r.effectful && return nothing
     op = r.op
     op isa _KernelSourceOp || return nothing
-    kernel_sourceop_form(op) === :fused && op.ignored_throws !== nothing || return nothing
-    f = op.f
-    f isa _KernelBranch && (f = f.call)
+    kernel_sourceop_form(op) === :fused && getfield(op, :ignored_throws) !== nothing ||
+        return nothing
+    f = getfield(op, :f)
+    f isa _KernelBranch && (f = getfield(f, :call))
     f = _kernel_native_source(f)
     f isa Function && fieldcount(typeof(f)) == 0 || return nothing
     params = _closure_parameter_names(f, length(args))
@@ -163,13 +164,21 @@ function _cell_array_source_node(ctx, x)
 end
 
 function _cell_array_expand_call(rhs, recipes)
-    rhs isa Expr && rhs.head === :call || return rhs
-    fn = rhs.args[1]
-    fn isa Expr && fn.head === :ref && length(fn.args) == 2 &&
-        fn.args[1] === _OPS_ARG && fn.args[2] isa Int || return rhs
-    recipe = recipes[fn.args[2]]
-    recipe.op === identity && length(rhs.args) == 2 && return rhs.args[2]
-    source = _cell_array_source(recipe, rhs.args[2:end])
+    rhs isa Expr || return rhs
+    # An operation call, or the recipe's source inlined in its place
+    # (`inline_sources.jl`): both name the recipe whose source is read.
+    if rhs.head === :call
+        slot = _operation_slot(rhs.args[1])
+        slot === nothing && return rhs
+        args = rhs.args[2:end]
+    else
+        inlined = _inline_statement_call(rhs)
+        inlined === nothing && return rhs
+        slot, args = inlined
+    end
+    recipe = recipes[slot]
+    recipe.op === identity && length(args) == 1 && return only(args)
+    source = _cell_array_source(recipe, args)
     source === nothing ? rhs : source
 end
 

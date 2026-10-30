@@ -209,7 +209,9 @@ function _derivative_cut_lowering(spec::KernelSpec, name::Symbol, have, want;
         "$(Tuple(v.name for v in p.have)) differs from the signature order $(have)"))
     p = _fuse_authored_plate_chains(_partial_apply(p, ()))
     _owns_array_regions(p) && return _rule_region_cut(p, name)
-    ast, ops, _ = _lower_with_ops(p)
+    # The cut is encoded from the operation calls (`_encode_cut_body`), so
+    # this lowering keeps every recipe's call in the table.
+    ast, ops, _ = _lower_with_ops(p; inline_sources = false)
     cut_spec = _encode_cut_body(ast, name, generator)
     (cut_spec, ops, cut_spec)
 end
