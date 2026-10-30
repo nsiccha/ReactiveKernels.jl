@@ -16,19 +16,32 @@ using DifferentiationInterface: AutoEnzyme, SecondOrder
 # `21a909f7` (Enzyme snag `static-reverse-s-f9483e9c`). On registered Enzyme
 # each testset records that gap as broken; drop the branch once a registered
 # Enzyme carries the repair.
+#
+# On dogfood, static reverse over forward still builds a zero shadow copy of
+# the constant packed base inside the forward call. Under `--check-bounds=yes`
+# the nonlinear grouped cell's outer Reverse fails to differentiate that copy
+# (`EnzymeInternalError` at `make_zero`); default bounds are exact. Both are
+# Enzyme snag `static-reverse-o-3d3debe4`; drop that branch when it lands.
 
 const _CCD_SECOND = SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
                                 AutoEnzyme(; mode = Enzyme.Forward))
 const _CCD_THIRD = SecondOrder(_CCD_SECOND, AutoEnzyme(; mode = Enzyme.Forward))
 
-# Runs `f()`; returns `nothing` when static Enzyme refuses the compact
-# overlay's read (the registered-Enzyme gap above), and rethrows anything else.
+# Runs `f()`; returns `nothing` when static Enzyme meets one of the gaps
+# above, and rethrows anything else.
 function _ccd_static(f)
     try
         f()
     catch err
-        err isa Enzyme.Compiler.EnzymeRuntimeActivityError || rethrow()
-        @test occursin("Mismatched activity", sprint(showerror, err))
+        message = sprint(showerror, err)
+        if err isa Enzyme.Compiler.EnzymeRuntimeActivityError
+            @test occursin("Mismatched activity", message)
+        elseif err isa Enzyme.Compiler.EnzymeInternalError &&
+               Base.JLOptions().check_bounds == 1
+            @test occursin("make_zero", message)
+        else
+            rethrow()
+        end
         @test_broken false
         nothing
     end
