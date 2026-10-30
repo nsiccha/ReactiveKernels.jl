@@ -51,6 +51,52 @@ using DifferentiationInterface, Enzyme, ReactiveKernels, ReactiveKernelsPPL, Tes
     @test startswith(ReactiveKernelsPPL._program_difference(built, other), "statement 2:")
 end
 
+@testset "level labels are the identity's quoted data, not compiled code" begin
+    m = @rkppl begin
+        a ~ Normal(0, 1)
+        c[levels(g)] .~ Normal.(0, 1)
+        y .~ Normal.(a .+ c[g], 1)
+    end
+    g = ["b", "a", "c", "a"]
+    y = [0.1, -0.2, 0.3, 0.0]
+    plan = m(; g) | (; y)
+    # The program reads the axis's labels as a data-only value: no label is
+    # a literal of the generated code (decision 1id2a4o: two 10,950-label
+    # literals were 60 s and 45 s of the ArbeitsplatzAtlas prefix compile).
+    program = string(kernel_expr(plan, assign_layout(plan)))
+    # This location is an affine design: the factor contrast reads the labels.
+    @test occursin("permutedims(_ppl_levels(g))", program)
+    @test !occursin("\"a\"", program)
+    # A gather outside a design reads them through its level codes.
+    gathered = (@rkppl begin
+        a ~ Normal(0, 1)
+        c[levels(g)] .~ Normal.(0, 1)
+        y .~ Normal.(a, exp.(c[g]))
+    end)(; g) | (; y)
+    program = string(kernel_expr(gathered, assign_layout(gathered)))
+    @test occursin("_ppl_lvx_c_g_axis_1 = _declared_codes(g, _ppl_levels(g))", program)
+    @test !occursin("\"a\"", program)
+    built = build_kernel(plan)
+    quoted = Any[]
+    walk(x) = x isa QuoteNode ? push!(quoted, x.value) :
+        x isa Expr ? foreach(walk, x.args) : nothing
+    walk(built.program)
+    @test ["a", "b", "c"] in quoted
+    @test !occursin("_ppl_levels", string(built.program))
+    # The same labels bound in another order are the same program; other
+    # labels another (`test_rebinding_rows.jl` pins the refusal).
+    same = ReactiveKernelsPPL._same_program
+    @test same(built.program, build_kernel(m(; g = ["c", "b", "a", "b"]) | (; y)).program)
+    @test !same(built.program, build_kernel(m(; g = ["b", "a", "d", "a"]) | (; y)).program)
+    # A long label vector prints as its summary and ends in the difference.
+    wide = build_kernel(m(; g = string.("g", 1:40)) | (; y = zeros(40))).program
+    other = build_kernel(m(; g = string.("h", 1:40)) | (; y = zeros(40))).program
+    difference = ReactiveKernelsPPL._program_difference(wide, other)
+    @test occursin("<40-element Vector{String}: g1, g10, g11", difference)
+    @test occursin("(32 more), g8, g9>", difference)
+    @test !occursin("g20", difference)
+end
+
 @testset "missing-observation programs prepare across repeated lowerings" begin
     model = @rkppl begin
         a ~ Normal(0, 1)

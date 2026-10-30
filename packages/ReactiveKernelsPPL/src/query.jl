@@ -207,7 +207,7 @@ function _check_built_program(built, plan::StructuralPlan)
     hasproperty(built, :program) || return nothing
     _checked_program(plan, built.program) && return nothing
     typed = _absent_typed_as(plan, built.program)
-    program = _program_identity(kernel_expr(typed, assign_layout(typed)))
+    program = _program_identity(kernel_expr(typed, assign_layout(typed)), typed)
     _same_program(program, built.program) || throw(ContractValidationError(
         "[query] this binding generates a " *
         "different program than the one this graph was built from, so it " *
@@ -286,9 +286,11 @@ end
 
 function _program_difference(built::Expr, other::Expr)
     # Fresh `Expr` nodes for `remove_linenums!` to edit; the values they hold
-    # (modules among them, which `deepcopy` refuses) are only printed.
+    # (modules among them, which `deepcopy` refuses) are only printed. A long
+    # quoted array (a level axis's labels) prints as its summary and ends.
     text(x) = x === nothing ? "(absent)" :
-        sprint(print, x isa Expr ? Base.remove_linenums!(copy(x)) : x)
+        sprint(print, x isa Expr ? Base.remove_linenums!(_elide_long_arrays(x)) :
+            _elide_long_arrays(x))
     sig(def) = def.args[1]
     _same_program(sig(built), sig(other)) || return "in the data arguments:\n  built: " *
         text(sig(built)) * "\n  this:  " * text(sig(other))
@@ -300,6 +302,17 @@ function _program_difference(built::Expr, other::Expr)
         return "statement $i:\n  built: " * text(x) * "\n  this:  " * text(y)
     end
     return "in the program's layout"
+end
+
+# A copy of `x` whose quoted arrays of more than `limit` elements are
+# replaced by a one-line summary with their first and last elements.
+function _elide_long_arrays(x; limit = 20)
+    x isa Expr && return Expr(x.head, Any[_elide_long_arrays(a; limit) for a in x.args]...)
+    x isa QuoteNode && x.value isa AbstractArray && length(x.value) > limit || return x
+    v = vec(x.value)
+    shown(r) = join((string(e) for e in v[r]), ", ")
+    return "<" * summary(x.value) * ": " * shown(1:6) * ", … (" *
+        string(length(v) - 8) * " more), " * shown(length(v) - 1:length(v)) * ">"
 end
 
 """

@@ -16,6 +16,23 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.19
+
+- A categorical's level labels no longer reach the generated program as a
+  literal array. The level codes of a gather over a `levels(g)` axis, a
+  factor contrast and a level plate's values read the axis's labels as a
+  data-only graph value (`_ppl_levels(g)`, `_ppl_unique(g)` or
+  `_ppl_values(g)`, indexed by the axis's selection), which preparation
+  folds under `bound=`, and `_declared_codes` matches labels through a
+  dictionary instead of a nested loop. The labels are still the program's:
+  a build's recorded program carries them as quoted data, so `prepare_query`
+  refuses a binding with other labels as before (`rkppl-use` §14). On the
+  ArbeitsplatzAtlas program, whose two Gemeinde columns hold 43,796 rows over
+  10,950 labels each, the two level-code statements compiled for 60 s and
+  45 s of the bound-data prefix's first call and matched for 1.2 s of its
+  warm run. A `jax_source` module computes the labels in `prepare_data`
+  (`_rk_levels`: the sorted distinct values of a plain column).
+
 ## 0.1.18
 
 - A cell query (`prepare_cell_query`, compact cell samplers) computes an

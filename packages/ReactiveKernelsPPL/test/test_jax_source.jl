@@ -25,6 +25,7 @@ const _JAX_N = 30
 const _JAX_X = randn(_JAX_RNG, _JAX_N)
 const _JAX_XM = randn(_JAX_RNG, _JAX_N, 3)
 const _JAX_G = rand(_JAX_RNG, 1:4, _JAX_N)
+const _JAX_LABELS = ["west", "north", "east", "south"][_JAX_G]
 const _JAX_Y = 1 .+ 2 .* _JAX_X .+ 0.5 .* randn(_JAX_RNG, _JAX_N)
 const _JAX_LENGTHS = [9, 4, 13, 6]
 const _JAX_R = [abs.(randn(_JAX_RNG, n)) for n in _JAX_LENGTHS]
@@ -53,6 +54,13 @@ const _JAX_CASES = (
         alpha[1:4] .~ Normal(0, tau)
         y .~ Normal.(X * beta .+ alpha[g], s)
     end))(; X = _JAX_XM, g = _JAX_G) | (; y = _JAX_Y),
+    # A `levels(g)` axis over string labels: `prepare_data` computes the
+    # labels and the level codes (no label is a literal of the program).
+    string_levels = () -> (@rkppl(begin
+        a ~ Normal(0, 1); tau ~ Exponential(1.0); s ~ Exponential(1.0)
+        c[levels(g)] .~ Normal.(0, tau)
+        y .~ Normal.(a .+ c[g], s)
+    end))(; g = _JAX_LABELS) | (; y = _JAX_Y),
     simplex = () -> (@rkppl(begin
         theta ~ Dirichlet(ones(3))
         y .~ Categorical(theta)

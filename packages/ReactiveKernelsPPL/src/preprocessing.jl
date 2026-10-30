@@ -291,11 +291,10 @@ _predictor_rows(plan::StructuralPlan, pname::Symbol) = _value_rows(plan, pname)
 
 function _contrast_expr(b::DesignBlock)
     @assert b.kind === FactorTerm
-    lvlvec = Expr(:vect, (_level_literal(lvl) for lvl in b.levels)...)
     # Compare labels with Julia's identity relation, including missing/NaN.
-    g = b.column
-    perms = :(permutedims($lvlvec))
-    return :(Float64.(isequal.($g, $perms)))
+    # The labels are a data-only value of the graph (`b.axis`), not a
+    # literal: a program holds no label in its compiled code.
+    return :(Float64.(isequal.($(b.column), permutedims($(b.axis)))))
 end
 
 # One matrix block as an in-graph data expression:
@@ -308,11 +307,47 @@ function _matrix_block_expr(b::DesignBlock, n_obs)
     return :(Float64.($(Expr(:call, :hcat, parts...))))
 end
 
-# Nonliteral level values stay quoted data; a Symbol must also be quoted
-# so the emitted expression never interprets a label as a variable.
-_level_literal(lvl::Union{Number,String,Bool,Char}) = lvl
-_level_literal(lvl::Symbol) = QuoteNode(lvl)
-_level_literal(lvl) = QuoteNode(lvl)
+"""
+    _ppl_levels(col) -> Vector
+    _ppl_unique(col) -> Vector
+    _ppl_values(col) -> Vector
+
+The labels of a declared level axis over the bound column `col`, as binding
+enumerates them: `levels(col)` is `DataAPI.levels` (a categorical pool's
+order, unobserved levels included), `unique(col)` first-occurrence order,
+a data-vector axis the vector itself. The generator emits one such call
+wherever a program reads an axis's labels, indexed by the axis's selection
+(`_axis_labels_expr`): the level codes of a gather
+(`_declared_codes(g, _ppl_levels(h))`), a factor contrast's
+`permutedims(…)`, a level plate's values. Its input is bound data, so the
+call folds under `bound=`, and no label reaches compiled code: before, every
+label was spliced into the program as a literal, which LLVM compiled as one
+store per label (two 10,950-label statements took 60 s and 45 s on the
+ArbeitsplatzAtlas program). The labels are still the program's:
+`_program_identity` replaces each call by its value as quoted data, so a
+binding with other labels is another program (`rkppl-use` §14).
+"""
+ReactiveKernels.@_record_source _ppl_levels(col::AbstractVector) = Vector(DataAPI.levels(col))
+ReactiveKernels.@_record_source _ppl_unique(col::AbstractVector) = unique(col)
+ReactiveKernels.@_record_source _ppl_values(col::AbstractVector) = collect(col)
+
+# The labels of the level axis `d` (`levels(h)`, `unique(h)`, a data vector
+# `_ppl_axis_values(h)`, each with an optional selection) as a data-only
+# graph expression: the kind's call over the column, indexed by the
+# selection as `_apply_subset` applies it.
+const _LEVEL_LABEL_FUNCTIONS = (levels = :_ppl_levels, unique = :_ppl_unique,
+    values = :_ppl_values)
+_axis_labels_expr(d::Expr) = _axis_labels_expr(
+    d.args[1] === :_ppl_axis_values ? :values : d.args[1], d.args[2], _levels_subset(d))
+function _axis_labels_expr(kind::Symbol, h::Symbol, subset)
+    labels = Expr(:call, _LEVEL_LABEL_FUNCTIONS[kind], h)
+    subset === Colon() && return labels
+    return Expr(:ref, labels, _subset_index_expr(subset))
+end
+_subset_index_expr(s::UnitRange{Int}) = :($(first(s)):$(last(s)))
+_subset_index_expr(s::Vector{Int}) = Expr(:vect, s...)
+_subset_index_expr(s::Tuple{Int,Symbol}) = Expr(:call, :(:), s[1], :end)
+_subset_index_expr(s::Tuple{Int,Int,Symbol}) = Expr(:call, :(:), s[1], s[2], :end)
 
 """
     _declared_codes(x, levels) -> Vector{Int}
@@ -321,24 +356,27 @@ In-model grouping encoder: the 1-based position of each element of raw
 grouping column `x` in DECLARED `levels` order — no sorting (SB
 numbering parity: SB numbers `CA.levels` order for categorical
 groupings, sort order otherwise). The generator splices one call per
-grouped column (`_ppl_gidx_<group> = _declared_codes(<group>,
-[<levels...>])`); both inputs are bound data, so the call folds under
-`bound=` and the Enzyme reverse pass sees no new surface. Validated
-plans only: bind-time coverage validation proves every value occurs in
-`levels`, so the 0 fallback for uncovered values is unreachable
-in-graph (a loud bind error beats a silent wrong gather).
+grouped column (`_ppl_lvx_<…> = _declared_codes(<group>,
+_ppl_levels(<group>))`); both inputs are bound data, so the call folds
+under `bound=` and the Enzyme reverse pass sees no new surface. Labels
+match through a dictionary (`isequal` and `hash`, as `Dict` compares:
+`missing`, `NaN`, `-0.0` and array labels keep their Julia meaning, and
+a categorical value finds its unwrapped label), so a column of n rows over
+K labels costs n lookups, not n × K comparisons: the 43,796-row Gemeinde
+columns of the ArbeitsplatzAtlas program took 1.2 s per preparation with
+the nested loop. Validated plans only: bind-time coverage validation
+proves every value occurs in `levels`, so the 0 fallback for uncovered
+values is unreachable in-graph (a loud bind error beats a silent wrong
+gather).
 """
 ReactiveKernels.@_record_source function _declared_codes(x::AbstractVector, levels::AbstractVector)
-    codes = Vector{Int}(undef, length(x))
+    positions = Dict{eltype(levels),Int}()
+    for (j, lv) in enumerate(levels)
+        get!(positions, lv, j)
+    end
+    codes = zeros(Int, length(x))
     for (i, v) in enumerate(x)
-        c = 0
-        for (j, lv) in enumerate(levels)
-            if isequal(v, lv)
-                c = j
-                break
-            end
-        end
-        codes[i] = c
+        codes[i] = get(positions, v, 0)
     end
     return codes
 end
