@@ -53,15 +53,19 @@ it has to outlive that next call. The kernel never writes into a caller's array.
 
 ## What changes in the generated code
 
-The ordinary generated function calls each operation directly:
+The ordinary generated function calls each of these operations directly, since
+`copy` and `reverse` are bare calls of Base functions:
 
 ```julia
 copied = __ops__[1](x)
 reversed = __ops__[2](copied)
 ```
 
-The non-allocating version routes each call that has an in-place form through a
-small helper that fills a reusable cache:
+A recipe whose operation is its authored source (an expression such as
+`W * transpose(X) .+ b`) runs that source in the ordinary function as a `let`
+over its arguments (see [Lowering and emitted ABI](compiler.md)); the
+non-allocating version lowers every recipe as a call and routes each call that
+has an in-place form through a small helper that fills a reusable cache:
 
 ```julia
 copied = __cache_apply__(__caches__[1], __ops__[1], x)
