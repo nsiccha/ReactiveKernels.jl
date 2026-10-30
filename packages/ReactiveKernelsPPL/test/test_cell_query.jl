@@ -712,3 +712,46 @@ end
         @test all(m -> m.support <= 11, measured)
     end
 end
+
+const _CQ_NUMBER_READERS = quote
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
+    z[levels(g)] .~ Normal.(0, 1)
+    # A number the cell computes, read by two predictors the cell computes at
+    # its rows (snag `cell-take-rows-s-e48675d0`).
+    s = exp.(b)
+    l1 = s .* x
+    l2 = s .+ w
+    mu = a .+ l1 .+ l2 .+ z[g]
+    y .~ Normal.(mu, sigma)
+end
+
+@testset "cell query: a number read by two predictors of a cell" begin
+    backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    measured = map((30, 3_000)) do n
+        data = (; y = cos.(1:n), x = sin.(1:n), w = collect(range(0.1, 1.0; length = n)),
+            g = [mod1(j, 5) for j in 1:n])
+        bound, built = _cq_bound(_CQ_NUMBER_READERS, data, (:y,))
+        q = prepare_cell_query(built, bound, :y)
+        u = collect(range(-0.4, 0.5; length = built.layout.total))
+        pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u).y
+        values = [q(u, i) for i in (1, 2, n)]
+        q(u, 2)
+        dense = prepare_cell_sampler(built, bound, :y, u; backend)
+        value, gradient = cell_value_and_gradient!(dense, similar(u), u, 2)
+        support = findall(!iszero, gradient)
+        compact = prepare_compact_cell_sampler(built, bound, :y, u, support; backend)
+        compact_gradient = similar(u[support])
+        compact_value, _ = cell_value_and_gradient!(
+            compact, compact_gradient, u, u[support], support, 2)
+        (; values, reference = pointwise[[1, 2, n]], bytes = (@allocated q(u, 2)), value,
+           compact_value, parity = compact_gradient ≈ gradient[support],
+           central = all(j -> isapprox(gradient[j], _cq_central(v -> q(v, 2), u, j);
+               rtol = 1e-5), support))
+    end
+    @test all(m -> m.values ≈ m.reference, measured)
+    @test measured[1].bytes == measured[2].bytes
+    @test all(m -> m.values[2] ≈ m.value ≈ m.compact_value, measured)
+    @test all(m -> m.parity && m.central, measured)
+end

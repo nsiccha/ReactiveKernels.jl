@@ -261,7 +261,10 @@ end
 @inline _cell_union_rows(ats...) = unique!(_cell_gather_rows(ats...))
 
 # Rows `rows` of a value's window `data` computed at rows `union` (which hold
-# them), in the order asked, every later dimension whole.
+# them), in the order asked, every later dimension whole. A value without rows
+# (a dotted expression of numbers is a number) reads the same at every row.
+@inline _cell_take_rows(data::Number, ::Vector{Int}, rows) = data
+@inline _cell_take_rows(data::AbstractArray{<:Any,0}, ::Vector{Int}, rows) = data
 @inline function _cell_take_rows(data::AbstractArray{<:Any,N}, union::Vector{Int},
                                  rows) where {N}
     positions = Int[_cell_union_position(union, row)

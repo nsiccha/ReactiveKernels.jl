@@ -828,6 +828,53 @@ end
     return dens
 end
 
+# A number computed at a cell's rows and read by several readers has no rows to
+# take: a dotted expression of numbers is a number, whichever reader reads it.
+@kernel _cell_number_readers(y, x, z, a::Float64, b::Float64) = begin
+    s = a .+ b
+    l = x .* s
+    m = z .+ s
+    mu = l .+ m
+    dens = plate(mu, y) do mi, yi
+        -(yi - mi)^2 / 2
+    end
+    return dens
+end
+
+# The same number read by a dotted operand and by the cell itself.
+@kernel _cell_number_lane(y, x, a::Float64) = begin
+    s = exp.(a)
+    l = x .* s
+    dens = plate(l, s, y) do li, si, yi
+        -(yi - li)^2 / 2 - si
+    end
+    return dens
+end
+
+# ... by a `vcat` and by a dotted operand; the `vcat` reads no row of it in
+# most cells.
+@kernel _cell_number_part(y, x, lookup::Vector{Int}, u::Vector{Float64}, a::Float64) = begin
+    s = exp.(a)
+    padded = vcat(s, u)
+    mu = padded[lookup] .+ x .* s
+    dens = plate(mu, y) do mi, yi
+        -(yi - mi)^2 / 2
+    end
+    return dens
+end
+
+# A rank-0 array read through an alias has no rows either.
+@kernel _cell_rank_zero(y, x, z, a) = begin
+    s::AbstractArray = a
+    l = x .* s
+    m = z .+ s
+    mu = l .+ m
+    dens = plate(mu, y) do mi, yi
+        -(yi - mi)^2 / 2
+    end
+    return dens
+end
+
 @testset "plate_cell: vcat operands, typed aliases, several gather indices and index-array plates at the cell's rows, each value once" begin
     have = (:y, :observed, :mask, :lookup, :free, :scale, :z, :r1, :r2)
     k = prepare(plate_cell(_cell_completion, :dens; index = :i);
@@ -946,4 +993,44 @@ end
             Set(String(cells.producer[v].outputs[1].name) for v in cells.pushed)
     end
     @test !("t" in converted)
+end
+
+@testset "plate_cell: a number read by several readers of a cell" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    pushed(k) = let lp = ReactiveKernels._lowering_plan(k.plan),
+                    cells = ReactiveKernels._cell_pushdowns(lp)
+        Set(String(cells.producer[v].outputs[1].name) for v in cells.pushed)
+    end
+    function check(spec, have, data, p, names)
+        k = prepare(plate_cell(spec, :dens; index = :i); have = (have..., :i), want = :dens_cell)
+        full = prepare(spec; have, want = :dens)
+        reference = full(data..., p...)
+        @test [k(data..., p..., i) for i in eachindex(reference)] ≈ reference
+        @test "s" in pushed(k)
+        for i in (1, lastindex(reference)), name in names
+            ad = prepare_ad(k, backend, data..., p..., i; active = name)
+            value, dp = ad_value_and_gradient(ad, data..., p..., i)
+            @test value ≈ reference[i]
+            @test dp ≈ _cell_central(h -> k(data..., merge(p, NamedTuple{(name,)}(
+                (getfield(p, name) + h,)))..., i), 0.0) rtol = 1e-6
+        end
+        k
+    end
+    grid(n) = (; y = cos.(1:n), x = sin.(1:n), z = collect(range(0.1, 1.0; length = n)))
+    k = check(_cell_number_readers, (:y, :x, :z, :a, :b), grid(8), (; a = 0.3, b = 0.4), (:a, :b))
+    allocated(n) = let d = grid(n)
+        k(d..., 0.3, 0.4, 2); @allocated k(d..., 0.3, 0.4, 2)
+    end
+    @test allocated(30) == allocated(30_000)
+    check(_cell_number_lane, (:y, :x, :a), (; y = cos.(1:8), x = sin.(1:8)), (; a = 0.3), (:a,))
+    check(_cell_number_part, (:y, :x, :lookup, :u, :a),
+        (; y = cos.(1:8), x = sin.(1:8), lookup = [1, 2, 3, 2, 1, 3, 3, 1], u = [0.5, -0.2]),
+        (; a = 0.3), (:a,))
+    d = grid(8)
+    scalar = prepare(plate_cell(_cell_number_readers, :dens; index = :i);
+        have = (:y, :x, :z, :a, :b, :i), want = :dens_cell)
+    zero_rank = prepare(plate_cell(_cell_rank_zero, :dens; index = :i);
+        have = (:y, :x, :z, :a, :i), want = :dens_cell)
+    @test "s" in pushed(zero_rank)
+    @test [zero_rank(d..., fill(0.7), i) for i in 1:8] ≈ [scalar(d..., 0.3, 0.4, i) for i in 1:8]
 end

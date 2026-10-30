@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.18
+
+- A cell (`plate_cell`; RKPPL's `prepare_cell_query` and cell samplers)
+  evaluates when a number it computes is read by two or more of its values
+  computed at rows, such as `s = exp.(b)` read by `l1 = s .* x` and
+  `l2 = s .+ w`. Since 0.1.16 a value with several readers is computed once,
+  at all the rows they read, and each reader takes its own rows from that
+  result. A number has no rows to take, so the cell raised
+  `MethodError: no method matching _cell_take_rows(::Float64, ::Vector{Int64}, ::Int64)`
+  (a rank-0 array failed the same way). Each reader now reads the number
+  whole. BRM-emitted NLME programs raised it on ArbeitsplatzAtlas's whole
+  model. Values of other cells are unchanged.
+
 ## 0.1.17
 
 - A prepared kernel's call enters its generated body directly, with the
