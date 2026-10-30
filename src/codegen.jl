@@ -4455,9 +4455,18 @@ function _lower_with_ops_collecting(p::Plan;
                          declare::Bool = inline_embedded && _owns_array_regions(p),
                          recycle::Vector{Pair{ValueId,Symbol}} = Pair{ValueId,Symbol}[],
                          pushdowns::Bool = isempty(recycle),
+                         outline::Bool = pushdowns,
                          plate_element_types::Bool = false,
                          type_hints = nothing, exemplar_types = nothing,
                          inline_sources::Bool = _inline_sources_enabled())
+    # Values plate cells read only at their own row, computed there
+    # (`_cell_pushdowns`, cell_windows.jl). With `outline`, inline
+    # subexpressions that block that become recipes of their own first
+    # (`_cell_outlined_pushdowns`), so `p` is the plan lowered from here on.
+    cells = nothing
+    if inline_embedded && pushdowns && type_hints === nothing
+        p, cells = outline ? _cell_outlined_pushdowns(p) : (p, _cell_pushdowns(p))
+    end
     g = p.graph
     names = _varnames(p)
     nm(v) = names[canon_id(g, v.id)]
@@ -4503,10 +4512,6 @@ function _lower_with_ops_collecting(p::Plan;
     # Column projections a native scan writes directly
     # (`_authored_scan_column_projections`); each keeps its table slots.
     scan_columns = Set{Int}()
-    # Values plate cells read only at their own row, computed there
-    # (`_cell_pushdowns`, cell_windows.jl).
-    cells = inline_embedded && pushdowns &&
-        type_hints === nothing ? _cell_pushdowns(p) : nothing
     for r in p.recipes
         r.id in skipped_recipes && continue
         if r.id in terminal_skips
@@ -5589,20 +5594,27 @@ callable does not hold the expression; the cache retains it for
 image compiled returns that image's generated function, with the code the
 image compiled for it.
 """
-function compile(ast::Expr)
+compile(ast::Expr) =
+    _compile(ast, @__MODULE__, GlobalRef(@__MODULE__, Symbol("@_native_context")))
+
+# `compile` with the body's global names resolved in `context` instead of RK.
+# `native_context` names a macro defined in `context` that returns its argument
+# unchanged, as `@_native_context` below does: its hygiene qualifies the globals.
+# A package whose lowered bodies name its own functions compiles them this way.
+function _compile(ast::Expr, context::Module, native_context::GlobalRef)
     ast = _canonical_locals(_canonical_globals(ast))
-    f = RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, ast)
+    f = RuntimeGeneratedFunction(context, context, ast)
     image = _image_program(f)
     image === nothing || return image
-    cache_module = _generated_function_cache_module()
-    cache_module === (@__MODULE__) && return RuntimeGeneratedFunctions.drop_expr(f)
+    cache_module = something(_image_target_module(), context)
+    cache_module === context && return RuntimeGeneratedFunctions.drop_expr(f)
     Base.invokelatest(RuntimeGeneratedFunctions.init, cache_module)
     # The cache and generated method must share an owner on Julia 1.12: a
     # generator defined in an older dependency cannot read new global bindings.
-    # Julia's macro hygiene resolves globals in RK while preserving lexical
-    # scopes, rather than guessing which symbols in the body are free names.
-    qualified = macroexpand(@__MODULE__, Expr(:macrocall,
-        GlobalRef(@__MODULE__, Symbol("@_native_context")), LineNumberNode(0), ast))
+    # Julia's macro hygiene resolves globals in `context` while preserving
+    # lexical scopes, rather than guessing which symbols in the body are free names.
+    qualified = macroexpand(context, Expr(:macrocall,
+        native_context, LineNumberNode(0), ast))
     # Hygiene renames every local through the global `gensym` counter again.
     qualified = _canonical_locals(_native_parameter_names(ast, qualified))
     native = Base.invokelatest(RuntimeGeneratedFunction, cache_module, cache_module, qualified)
@@ -5884,8 +5896,7 @@ RuntimeGeneratedFunctions.drop_expr(f::_PrecompileWarmFunction) =
 # consumer's package image. Use Julia's actual precompilation target rather
 # than the graph's author module: consumers can prepare imported graphs, and
 # preparation can run inside helpers or submodules. This is cold-path loader
-# state only. Ordinary runtime preparation still uses RK's existing context.
-_generated_function_cache_module() = something(_image_target_module(), @__MODULE__)
+# state only. Ordinary runtime preparation uses `_compile`'s context module.
 
 # The root module of the package whose image Julia is generating, or `nothing`
 # outside incremental package precompilation.

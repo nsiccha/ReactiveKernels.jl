@@ -1,7 +1,7 @@
 name = "ReactiveKernelsPPL"
 uuid = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.19"
+version = "0.1.20"
 
 [deps]
 DataAPI = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
@@ -28,7 +28,7 @@ Enzyme = "0.13"
 LinearAlgebra = "1"
 LogExpFunctions = "0.3, 1.0.2"
 PrecompileTools = "1.2"
-ReactiveKernels = "0.1.16"
+ReactiveKernels = "0.1.20"
 ReactiveKernelsDistributionKernels = "0.1"
 SpecialFunctions = "2"
 StatsFuns = "1, 2"

@@ -53,9 +53,8 @@ Each run writes the following files:
   `Manifest.toml`. It defaults to
   `~/.local/state/reactivekernels-benchmarks/enzyme-variants/<suite>/<UTC time>Z-<RK SHA>/`.
 
-A suite that only prints its results (`nuts_comparison.jl`,
-`gradient_probe.jl`) keeps them in each variant's `body.log`. Its matrix has
-no paired measurements.
+A suite that only prints its results keeps them in each variant's `body.log`.
+Its matrix has no paired measurements.
 
 Variant outputs are first written to the run directory and copied to the
 requested destination after both runs. A file written by the first run
@@ -128,9 +127,7 @@ run in one:
 | `eight_schools_ad_comparison.jl` | RK, DI and Turing value-and-gradient and pullback | `0.13.199` |
 | `sum_to_zero_comparison.jl` | RK, DI and Turing value-and-gradient | `0.13.199` |
 | `mnist_logistic_ad_comparison.jl` (both datasets) | RK, DI and Turing value-and-gradient | `0.13.199` |
-| `nuts_comparison.jl` | NUTS sampling, every sampler using DI+Enzyme gradients | `0.13.199` |
 | `practicalbayes_comparison.jl` | PracticalBayes and RK gradients | `0.13.199` |
-| `gradient_probe.jl` | RK DI+Enzyme gradient invocation paths | `0.13.199` |
 | `distribution_gradients.jl` (via `enzyme_variants.jl`, `--project=benchmark/distributions`) | prepared RK reverse gradients for the distribution corpus | `=0.13.199` in the committed project |
 
 The last column is the suite's historical pin, which the `registered` variant
@@ -150,12 +147,12 @@ with `--project=<dir>`.
 | Entry points | Reason |
 |---|---|
 | `eight_schools_primal_comparison.jl`, `mnist_logistic_comparison.jl`, `partial_evaluation_comparison.jl`, `distributions_comparison.jl`, `scalar_distribution_gallery_comparison.jl`, `structured_distributions_comparison.jl` | Primal only; Enzyme is not in the timed region. |
-| `nuts_microbench.jl`, `nuts_microbench_ca9.jl`, `cggibbs/`, `gibbs_poc/` | Analytic gradients; no Enzyme. |
+| `cggibbs/`, `gibbs_poc/` | Analytic gradients; no Enzyme. |
 | `fair_posteriordb_{b3,glm,gp,linear,mh,more}.jl`, `faithful_posteriordb.jl`, `faithful_staging.jl`, `all_sides_gaussian_regression.jl`, `all80_posteriordb.jl` and the `all80-env` scripts | They install and time a Mooncake comparator side, so running either variant would also run Mooncake. They become eligible once that side is removed. |
-| `eval_throughput_comparison.jl`, `sampler_transpiler/`, `brm_hsgp/` | Excluded while they depended on Reactant; not yet checked under the variants. |
+| `eval_throughput_comparison.jl`, `brm_hsgp/` | Excluded while they depended on Reactant; not yet checked under the variants. |
 | `repro_*`, `probe_*`, `*_mwe.jl`, `joint_stan_tiled/`, `native_bdf/` | Reproducers and feasibility checks, not timing suites. |
 | `*_gate*.jl`, `*_fixture*.jl`, `*_corpus.jl`, `test_*_fixture.jl`, `verify_rename.jl` | Acceptance gates and fixtures; no timed comparison. |
-| `native_position_*`, `benchmark_nested_construction.jl`, `borrowed_batch_instances.jl`, `dose_outer_superposition/`, `pathfinder_oracle/`, `walnuts_oracle/` | No Enzyme. |
+| `native_position_*`, `benchmark_nested_construction.jl`, `borrowed_batch_instances.jl`, `dose_outer_superposition/` | No Enzyme. |
 
 Historical receipts in `receipts/` stay unchanged as records of their
 single-environment runs.

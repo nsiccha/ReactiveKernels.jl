@@ -8,54 +8,12 @@ published BRM `1f296dac2c086347525194887500948edb213228` or a compatible descend
 [`examples/brm_hsgp.jl`](../../examples/brm_hsgp.jl) is a thin consumer and fixture
 loader. Owned preparation folds the data-only basis and squared frequencies; the 44-vector
 `q` and 40-vector of centeredness controls remain live. The benchmark prepares
-native Enzyme AD. `compare.jl` measures isolated evaluations; `hmc.jl` measures
-the authored HMC loop below.
+native Enzyme AD. `compare.jl` measures isolated evaluations.
 
 The checked-in receipts and the run history below were measured while RK still
 had a Reactant path: their Reactant fields come from ReactiveKernels' removed
-Reactant path, and [HMC.md](HMC.md) and [DIAGNOSTICS.md](DIAGNOSTICS.md) are
-historical analyses of them. The current scripts measure the native path only.
-
-## Native HMC
-
-`hmc.jl` uses the shared `sampler_transpiler/hmc_benchmark.jl` helper, also used
-by the Eight Schools HMC timing driver. It prepares the existing multinomial
-HMC `@kernel` through `prepare_transpiled` and calls prepared Enzyme gradients.
-
-After preparing the environment and downloading the bundle as described below:
-
-```sh
-BRM_BUNDLE=BUNDLE_DIR HMC_OUTPUT=native-hmc.toml \
-  JULIA_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 taskset -c 6 \
-  julia --startup-file=no --project=benchmark/brm_hsgp benchmark/brm_hsgp/hmc.jl
-```
-
-Defaults are matched batches of 4, 100, and 1,000 transitions, 16 leapfrog
-steps per transition, step size 0.03, and nine timed rounds. `HMC_BATCHES`,
-`HMC_STEPS`, `HMC_STEPSIZE`, `HMC_ROUNDS`, and `HMC_FRAMES` override these.
-Both noncentered and selected-partial frames start at column 5,000 of their
-supplied posterior bundle. Each frame uses a fixed diagonal mass: inverse
-coordinate variance over its 10,000 supplied draws. This is
-posterior-informed benchmark setup, not timed adaptation.
-
-Data-only design work is partially evaluated once. The density retains `(q,c)`
-inputs and prepares AD with only `q` active; the sampler holds `c` fixed in its
-callback context for the entire run. Changing this context requires preparing
-a new sampler. Thus HMC measures fixed-frame sampling, whereas the isolated
-evaluation comparison exposes centeredness at every executable call.
-
-Receipts separate model/AD preparation, first native gradient, HMC preparation,
-first batch execution, and raw warmed batch times. Compilation garbage is collected once, then additional untimed warmup
-runs for at least one second and three batches; timed rounds include normal
-GC costs. RNG construction and
-finite-density checks are outside timing. The
-prepared interface's state copies and output snapshots remain inside timing.
-Timed rounds start from the same initial position with distinct seeds. Four
-continued batches additionally check finite, moving execution.
-
-These runs retain only final positions and do not measure adaptation, history
-storage, ESS, or effective samples per second. Equal transition/leapfrog work
-supports a throughput comparison; it does not establish equal mixing.
+Reactant path, and [DIAGNOSTICS.md](DIAGNOSTICS.md) is a historical analysis
+of them. The current scripts measure the native path only.
 
 ## Exact target and coordinates
 

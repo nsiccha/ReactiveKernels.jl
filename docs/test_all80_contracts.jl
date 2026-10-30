@@ -7,7 +7,8 @@ using .All80Receipt
 # make.jl includes this file at Main top level while the table builders live in
 # ReactiveKernelsDocs (via Base.include); import them explicitly so the contract
 # holds under make.jl's own load order, not just inside the module.
-using .ReactiveKernelsDocs: all80_gradient_table, all80_hmc_table, all80_primal_table
+using .ReactiveKernelsDocs: all80_gradient_table, all80_primal_table,
+    render_all80_native_checkpoint
 
 const _ALL80_RECEIPT = get(ENV, "RK_ALL80_RECEIPT",
     normpath(joinpath(@__DIR__, "..", "benchmark", "receipts",
@@ -45,14 +46,14 @@ _number_or_reason(v) = _finite_number(v) || (v isa AbstractString && !isempty(v)
         end
         # MANDATORY reference cells (Turing/Stan) — always finite numbers; no RK-defect can touch them.
         for cell in ("primal_turing", "primal_stan",
-                     "gradient_turing", "gradient_stan", "hmc_ahmc_turing")
+                     "gradient_turing", "gradient_stan")
             @test _finite_number(get(row, cell, nothing))
         end
         # RK cells (Fix D per-cell preservation) + conditionals — a finite number OR a nonempty
         # defect/reason diagnostic. `primal_rk` moved here (was MANDATORY): a genuine RK primal
         # defect (e.g. wells saturation) is a diagnostic + parity_pass=false, never a missing cell.
-        for cell in ("primal_rk", "gradient_rk", "hmc_rk_native",
-                     "primal_rk_reactant", "gradient_rk_reactant", "hmc_rk_reactant",
+        for cell in ("primal_rk", "gradient_rk",
+                     "primal_rk_reactant", "gradient_rk_reactant",
                      "primal_opt_stan", "primal_further_turing",
                      "gradient_opt_stan", "gradient_further_turing")
             @test _number_or_reason(get(row, cell, nothing))
@@ -65,21 +66,21 @@ _number_or_reason(v) = _finite_number(v) || (v isa AbstractString && !isempty(v)
         ("idiomatic RK", "RK + Reactant", "upstream Turing", "reference Stan"))
     _all80_assert_table(all80_gradient_table(models), "all80-gradient", n,
         ("idiomatic RK", "RK + Reactant", "upstream Turing", "reference Stan"))
-    _all80_assert_table(all80_hmc_table(models), "all80-hmc", n,
-        ("RK native", "RK + Reactant", "AHMC + Turing"))
+    # The receipt's historical HMC-throughput cells are not rendered.
+    page_tables = sprint(show, render_all80_native_checkpoint(_ALL80_RECEIPT))
+    @test occursin("table:all80-primal", page_tables)
+    @test !occursin("HMC", page_tables)
 end
 
 # Render-path filtering PROVEN (not merely described): the REAL row-builders
-# `ReactiveKernelsDocs._all80_speedup_rows` / `_all80_reactant_hmc_rows` (docs/all80_benchmark_plots.jl)
+# `ReactiveKernelsDocs._all80_speedup_rows` (docs/all80_benchmark_plots.jl)
 # must (a) drop the RK/Turing ratio on a NON-EQUIVALENT Turing support, and (b) OMIT known-contended
 # (timing-quarantined) rows ENTIRELY even when their cells are numeric.
 @testset "render-path filtering — Turing-support guard AND timing quarantine (enforced, not described)" begin
     speedup_rows = ReactiveKernelsDocs._all80_speedup_rows
-    hmc_rows = ReactiveKernelsDocs._all80_reactant_hmc_rows
     base = Dict("dim" => 3.0, "family" => "x",
         "primal_rk" => 1.0, "primal_stan" => 2.0, "primal_turing" => 2.0,
-        "gradient_rk" => 1.0, "gradient_stan" => 2.0, "gradient_turing" => 2.0,
-        "hmc_rk_native" => 5.0, "hmc_rk_reactant" => 2.0)
+        "gradient_rk" => 1.0, "gradient_stan" => 2.0, "gradient_turing" => 2.0)
     models = Dict(
         "ok_model"             => merge(base, Dict("turing_support_ok" => true)),
         "bad_turing"           => merge(base, Dict("turing_support_ok" => false)),
@@ -93,8 +94,6 @@ end
     # (b) Timing quarantine — earn_height is in _ALL80_TIMING_QUARANTINED ⇒ OMITTED despite numeric cells.
     @test "earnings-earn_height" in ReactiveKernelsDocs._ALL80_TIMING_QUARANTINED
     @test isempty([r for r in rows if r.model == "earnings-earn_height"])            # omitted from speedup ranking
-    @test isempty([r for r in hmc_rows(models) if r.model == "earnings-earn_height"]) # omitted from reactant-HMC ranking
-    @test !isempty([r for r in hmc_rows(models) if r.model == "ok_model"])            # non-quarantined kept
 end
 
 # Batch-1 incremental render (todo 1x4pytu): the batch-1 plot fns satisfy the Documenter @eval
@@ -105,11 +104,11 @@ end
     RKD = ReactiveKernelsDocs
     bm(dim; failed = false) = begin
         m = Dict{String,Any}("dim" => dim, "family" => "batch1",
-            "primal_rk" => 100.0, "gradient_rk" => 200.0, "hmc_rk_native" => 10.0,
+            "primal_rk" => 100.0, "gradient_rk" => 200.0,
             "primal_stan" => 150.0, "gradient_stan" => 400.0,
             "primal_turing" => 160.0, "gradient_turing" => 420.0,
-            "primal_rk_reactant" => 90.0, "gradient_rk_reactant" => 180.0, "hmc_rk_reactant" => 8.0,
-            "parity_pass" => true, "turing_support_ok" => true, "hmc_transitions" => 1000)
+            "primal_rk_reactant" => 90.0, "gradient_rk_reactant" => 180.0,
+            "parity_pass" => true, "turing_support_ok" => true)
         failed && (m["gradient_rk_reactant"] = "gradient @compile: MethodError …")
         m
     end
@@ -146,9 +145,8 @@ end
     models = RKD._all80_models(path)
     @test all(m -> !haskey(m, "error"), values(models))
     @test all(m -> get(m, "parity_pass", false) === true, values(models))
-    for cell in ("primal_rk", "gradient_rk", "hmc_rk_native",
-                 "primal_rk_reactant", "gradient_rk_reactant",
-                 "hmc_rk_reactant")
+    for cell in ("primal_rk", "gradient_rk",
+                 "primal_rk_reactant", "gradient_rk_reactant")
         @test all(m -> _number_or_reason(get(m, cell, nothing)), values(models))
     end
     # The saved historical run is deliberately NOT publication-certified under the new gate:
@@ -165,10 +163,8 @@ end
     @test occursin("Reactant phase provenance absent", summary_text)
     tables_text = sprint(show, RKD.render_all80_batch1_tables(path))
     @test occursin("Historical batch-1 primal", tables_text)
-    @test occursin("Historical batch-1 HMC", tables_text)
-    @test occursin("Recorded transitions", tables_text)
-    @test occursin("Reactant: 4", tables_text)
-    @test occursin("not a matched-T claim", tables_text)
+    @test occursin("Historical batch-1 value+gradient", tables_text)
+    @test !occursin("HMC", tables_text)
     function plot_text(node)
         html = node.content isa AbstractString ? node.content : node.content[1].content
         payload = only(match(
@@ -193,11 +189,11 @@ end
     RKD = ReactiveKernelsDocs
     bm(dim; failed = false) = begin
         m = Dict{String,Any}("dim" => dim, "family" => "irt",
-            "primal_rk" => 100.0, "gradient_rk" => 200.0, "hmc_rk_native" => 10.0,
+            "primal_rk" => 100.0, "gradient_rk" => 200.0,
             "primal_stan" => 150.0, "gradient_stan" => 400.0,
             "primal_turing" => 160.0, "gradient_turing" => 420.0,
-            "primal_rk_reactant" => 90.0, "gradient_rk_reactant" => 180.0, "hmc_rk_reactant" => 8.0,
-            "parity_pass" => true, "turing_support_ok" => true, "hmc_transitions" => 1000)
+            "primal_rk_reactant" => 90.0, "gradient_rk_reactant" => 180.0,
+            "parity_pass" => true, "turing_support_ok" => true)
         failed && (m["gradient_rk_reactant"] = "gradient @compile: MethodError …")
         m
     end
@@ -231,9 +227,8 @@ end
     models = RKD._all80_models(path)
     @test all(m -> !haskey(m, "error"), values(models))
     @test all(m -> get(m, "parity_pass", false) === true, values(models))
-    for cell in ("primal_rk", "gradient_rk", "hmc_rk_native",
-                 "primal_rk_reactant", "gradient_rk_reactant",
-                 "hmc_rk_reactant")
+    for cell in ("primal_rk", "gradient_rk",
+                 "primal_rk_reactant", "gradient_rk_reactant")
         @test all(m -> _number_or_reason(get(m, cell, nothing)), values(models))
     end
     # Unlike the historical batch-1 run, this receipt IS ordinary-AE certified: the strict
@@ -250,10 +245,8 @@ end
     @test !occursin("MISSING", summary_text)
     tables_text = sprint(show, RKD.render_all80_irt_tables(path))
     @test occursin("IRT batch primal", tables_text)
-    @test occursin("IRT batch HMC", tables_text)
-    @test occursin("Recorded transitions", tables_text)
-    @test occursin("Reactant: 4", tables_text)
-    @test occursin("not a matched-T claim", tables_text)
+    @test occursin("IRT batch value+gradient", tables_text)
+    @test !occursin("HMC", tables_text)
     function plot_text(node)
         html = node.content isa AbstractString ? node.content : node.content[1].content
         payload = only(match(

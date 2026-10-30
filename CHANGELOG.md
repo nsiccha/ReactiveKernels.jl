@@ -16,6 +16,97 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.21
+
+- One cell of a plate (`plate_cell`; RKPPL's `prepare_cell_query` and cell
+  samplers) computes a column view `view(A, :, k)` at the rows it reads, as it
+  computes the column read `A[:, k]`: alone and as an operand of a dotted
+  expression, so a product `A = X * W` and its `hcat` design are computed at
+  those rows too. RKPPL reads every column `P[:, j]` of a per-observation
+  value through such a view, as in the columns of a BRM joint population
+  effect for several responses. Earlier versions computed the view whole in
+  every cell, and with it the product, the design and everything upstream.
+  Values are unchanged.
+
+## 0.1.20
+
+- **Breaking:** the iterative-method compiler, the NUTS/HMC sampler
+  examples and their tests, benchmarks and documentation pages are removed.
+  They moved to a separate private package that depends on ReactiveKernels.
+  Pure kernels, plates, scans, prepared AD, partial evaluation,
+  `ReactiveState`, `prepare_reactive` and RKPPL are unchanged. What to
+  change:
+  - `compile_stateful`, `stateful_compiler_bindings`, `functionalize_stateful`,
+    `stateful_snapshot`, `compile_state_transition`, `initial_transition_state`,
+    `validated_compiled_transition`, `stateful_control_bounds`, the effect and
+    observation ports (`pure_callable_port`, `effect_callable_port`,
+    `effect_lowering_port`, `structured_state_port`,
+    `total_functional_lowering`, `initial_transition_effects`,
+    `transition_with_effects`, `drain_observations!`), `rng_provider`,
+    `OrderedRNGReplay`, `prepare_transpiled`, `initial_transpiled_state`,
+    `transpiled_endpoint`, `partial` and `PartialFunction` are no longer
+    defined here.
+  - The nested packages `ReactiveKernelsNUTSExamples`,
+    `ReactiveKernelsStreamingStats` and `ReactiveKernelsHMCDiagnostics` are no
+    longer part of this repository.
+  - `ReactiveKernelsCompatibilityExamples` no longer has `ReactiveHMCExamples`
+    or the ReactiveHMC artifacts: `CompatibilityArtifacts.all_artifacts()`
+    returns the three ReactiveObjects graphs, and `reactivehmc_artifacts` is
+    gone. `ReactiveKernelsKernelExamples` no longer has `HMCExample`.
+  - The all-82 posteriordb benchmark measures primal and gradient only; its
+    receipts keep their recorded HMC-throughput cells, which the validator
+    checks where present and the docs no longer render. The motorcycle HSGP
+    HMC driver and its receipts are removed.
+  - `@kernel` no longer builds stateful free methods: a methodless body that
+    updates a field of its first argument in place, or a `!!` name, raises an
+    `ArgumentError`. A method-bearing object keeps its owner snapshot and pure
+    endpoint templates only; `copy!!`, `KernelObject`, `KernelView`,
+    `kernel_methods`, `kernel_recipe_ast`, `kernel_module`, `kernel_token`, the
+    callee and type snapshots and the primitive effect registry are gone.
+    Pure objects and their endpoints build and behave as before.
+- `ReactiveKernels._compile(ast, context, native_context)` compiles a lowered
+  body with its global names resolved in `context`; `compile(ast)` is that
+  core with ReactiveKernels as the context, unchanged.
+- A front end can build on method-bearing objects: `_KernelObjectSkeleton` is
+  the supertype of the object `@kernel` binds, the pure object machinery reads
+  an object only through `_kernel_pure_skeleton`, and
+  `_kernel_object_definition` returns the parts and the pure-skeleton
+  constructor of an object definition.
+
+## 0.1.19
+
+- One cell of a plate (`plate_cell`; RKPPL's `prepare_cell_query` and cell
+  samplers) computes a gather straight from an inline `vcat`,
+  `completed = vcat(observed, drawn)[order]`, at the rows it reads, as it
+  computes the two-statement spelling `stacked = vcat(observed, drawn)` and
+  `completed = stacked[order]`. Earlier versions computed that recipe whole in
+  every cell, `vcat` included, so every cell read every drawn entry. The cell
+  lowering now outlines a call written where a row form reads a named value
+  (a gather's source or index, an operand of `vcat`, `hcat` or `*`, or a
+  non-dotted operand of a dotted expression, as in
+  `observed .+ mask .* vcat(free, grouped)[lookup]`) into a value of its own,
+  along the recipe's strict subexpressions, and keeps it when the recipe is
+  then computed at rows. Values are unchanged. `prepare_nonallocating` keeps
+  such a recipe as written.
+- A cell also computes at its rows a read-only gather
+  (`ReactiveKernels._readonly_gather(A, I)`, the view RKPPL reads a bare
+  gathered `@rkppl` definition through, such as
+  `w = vcat(w_observed, y_mis)[w_order]` or `w = s[idx]`), as it computes
+  `A[I]`. Earlier versions computed such a definition whole in every cell.
+
+## 0.1.18
+
+- A cell (`plate_cell`; RKPPL's `prepare_cell_query` and cell samplers)
+  evaluates when a number it computes is read by two or more of its values
+  computed at rows, such as `s = exp.(b)` read by `l1 = s .* x` and
+  `l2 = s .+ w`. Since 0.1.16 a value with several readers is computed once,
+  at all the rows they read, and each reader takes its own rows from that
+  result. A number has no rows to take, so the cell raised
+  `MethodError: no method matching _cell_take_rows(::Float64, ::Vector{Int64}, ::Int64)`
+  (a rank-0 array failed the same way). Each reader now reads the number
+  whole. BRM-emitted NLME programs raised it on ArbeitsplatzAtlas's whole
+  model. Values of other cells are unchanged.
+
 ## 0.1.17
 
 - A prepared kernel's call enters its generated body directly, with the

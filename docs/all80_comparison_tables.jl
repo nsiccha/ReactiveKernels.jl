@@ -1,10 +1,11 @@
-# 82-row sortable comparison tables (primal / gradient / HMC-throughput) for the
+# 82-row sortable comparison tables (primal / gradient) for the
 # all-82 posteriordb benchmark, rendered from an all80-benchmark-v1 receipt
 # (benchmark/all80_receipt.jl). Included INTO the ReactiveKernelsDocs module (like
 # result_views.jl), so `_column`, `_result_table`, and `h` are in scope. Each table is a
 # `data-rk-artifact-kind="sortable-table"` section: rows = the 82 models, columns = the
 # implementations. Values are shown to ~2 significant figures; N/A cells carry a
-# provenance string and sort to the bottom.
+# provenance string and sort to the bottom. The receipts' historical HMC-throughput
+# cells are not rendered: ReactiveKernels no longer has sampler code.
 import TOML
 
 # The aggregated all80-benchmark-v1 receipt (native phase ∪ Reactant phase). The
@@ -28,8 +29,6 @@ function _all80_ns(value, _)
     value < 1e6  ? string(round(value / 1e3; sigdigits = 2), " µs") :
                    string(round(value / 1e6; sigdigits = 2), " ms")
 end
-# HMC throughput formatter: receipt stores µs/transition (lower = faster).
-_all80_us(value, _) = value isa Real ? string(round(value; sigdigits = 2), " µs/it") : string(value)
 # Numbers sort numerically; N/A provenance strings sort to the bottom.
 _all80_sort(value, _) = value isa Real ? value : nothing
 
@@ -50,9 +49,8 @@ function _all80_rows(models, cellkeys)
 end
 
 _all80_num(key, label) = _column(key, label; format = _all80_ns, sort = _all80_sort)
-_all80_hmc(key, label) = _column(key, label; format = _all80_us, sort = _all80_sort)
 
-# --- the three tables ------------------------------------------------------------
+# --- the two tables ------------------------------------------------------------
 function all80_primal_table(models; id = "all80-primal",
         title = "Primal log-density evaluation — median, lower is faster",
         note = "Select a column heading to sort.")
@@ -87,24 +85,11 @@ function all80_gradient_table(models; id = "all80-gradient",
         note = note * " " * _REMOVED_REACTANT_NOTE)
 end
 
-function all80_hmc_table(models; id = "all80-hmc",
-        title = "HMC throughput — median µs per transition (multinomial HMC, fixed L), lower is faster",
-        note = "Select a column heading to sort.")
-    cells = ["hmc_rk_native", "hmc_rk_reactant", "hmc_ahmc_turing"]
-    cols = (_column(:model, "Model"),
-            _all80_hmc(:hmc_rk_native, "RK native"),
-            _all80_hmc(:hmc_rk_reactant, "RK + Reactant ($_REMOVED_REACTANT_LABEL)"),
-            _all80_hmc(:hmc_ahmc_turing, "AHMC + Turing"),
-            _column(:note, "Structural difference"))
-    _result_table(_all80_rows(models, cells), cols; id, title,
-        note = note * " " * _REMOVED_REACTANT_NOTE)
-end
-
-"""Render all three all-82 comparison tables from a receipt file (or a parsed
+"""Render both all-82 comparison tables from a receipt file (or a parsed
 `models` dict). Returns the concatenated static blocks for embedding in the docs page."""
 function all80_comparison_sections(receipt)
     models = receipt isa AbstractDict ? receipt : get(TOML.parsefile(receipt), "models", Dict())
-    (all80_primal_table(models), all80_gradient_table(models), all80_hmc_table(models))
+    (all80_primal_table(models), all80_gradient_table(models))
 end
 
 """Render the published native checkpoint summary. This deliberately accepts gate-error
@@ -123,14 +108,13 @@ function render_all80_native_checkpoint_summary(path = _ALL80_BENCHMARK_PATH)
     """)
 end
 
-"""Render the three sortable tables from the committed native-checkpoint receipt."""
+"""Render the two sortable tables from the committed native-checkpoint receipt."""
 function render_all80_native_checkpoint(path = _ALL80_BENCHMARK_PATH)
     receipt = TOML.parsefile(path)
     models = get(receipt, "models", Dict())
     Markdown.MD(Any[
         all80_primal_table(models),
         all80_gradient_table(models),
-        all80_hmc_table(models),
     ])
 end
 
@@ -179,7 +163,7 @@ function render_all80_batch1_summary(path = _ALL80_BATCH1_PATH)
     """)
 end
 
-"""Render the three batch-1 comparison tables from the SEPARATE batch-1 receipt (or an honest note)."""
+"""Render the two batch-1 comparison tables from the SEPARATE batch-1 receipt (or an honest note)."""
 function render_all80_batch1_tables(path = _ALL80_BATCH1_PATH)
     isfile(path) || return Markdown.parse(
         "!!! note \"Batch-1 tables pending\"\n\n" *
@@ -187,16 +171,11 @@ function render_all80_batch1_tables(path = _ALL80_BATCH1_PATH)
         "(`RK_ALL80_BATCH=batch1 … <keys>`) to populate these tables.")
     models = get(TOML.parsefile(path), "models", Dict())
     historical = "Historical/uncertified batch-1 measurement; do not interpret as ordinary-AE publication evidence."
-    native_t = sort(unique(Int[m["hmc_transitions"] for m in values(models)]))
-    reactant_t = sort(unique(Int[m["hmc_reactant_transitions"] for m in values(models)]))
-    hmc_note = "Observed-load results. Recorded transitions — native: $(join(native_t, ", ")); Reactant: $(join(reactant_t, ", ")). Different T counts make this capability/end-to-end evidence, not a matched-T claim."
     Markdown.MD(Any[
         all80_primal_table(models; id = "batch1-primal",
             title = "Historical batch-1 primal — median, lower is faster", note = historical),
         all80_gradient_table(models; id = "batch1-gradient",
             title = "Historical batch-1 value+gradient — median, lower is faster", note = historical),
-        all80_hmc_table(models; id = "batch1-hmc",
-            title = "Historical batch-1 HMC — observed-load µs/transition", note = hmc_note),
     ])
 end
 
@@ -242,7 +221,7 @@ function render_all80_irt_summary(path = _ALL80_IRT_PATH)
     """)
 end
 
-"""Render the three IRT comparison tables from the SEPARATE IRT receipt (or an honest note)."""
+"""Render the two IRT comparison tables from the SEPARATE IRT receipt (or an honest note)."""
 function render_all80_irt_tables(path = _ALL80_IRT_PATH)
     isfile(path) || return Markdown.parse(
         "!!! note \"IRT tables pending\"\n\n" *
@@ -250,15 +229,10 @@ function render_all80_irt_tables(path = _ALL80_IRT_PATH)
         "(`RK_ALL80_BATCH=irt … <keys>`) to populate these tables.")
     models = get(TOML.parsefile(path), "models", Dict())
     certified = "Certified ordinary-AE IRT measurement (both phases backend-recorded + loaded-module certified, one run id)."
-    native_t = sort(unique(Int[m["hmc_transitions"] for m in values(models)]))
-    reactant_t = sort(unique(Int[m["hmc_reactant_transitions"] for m in values(models)]))
-    hmc_note = "Observed-load results. Recorded transitions — native: $(join(native_t, ", ")); Reactant: $(join(reactant_t, ", ")). Different T counts make this capability/end-to-end evidence, not a matched-T claim."
     Markdown.MD(Any[
         all80_primal_table(models; id = "irt-primal",
             title = "IRT batch primal — median, lower is faster", note = certified),
         all80_gradient_table(models; id = "irt-gradient",
             title = "IRT batch value+gradient — median, lower is faster", note = certified),
-        all80_hmc_table(models; id = "irt-hmc",
-            title = "IRT batch HMC — observed-load µs/transition", note = hmc_note),
     ])
 end

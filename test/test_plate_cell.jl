@@ -706,6 +706,114 @@ end
     @test dc ≈ _cell_central(c -> k(d..., merge(p, (; c0 = c))..., 3), p.c0) rtol = 1e-6
 end
 
+# A joint product's columns read through views, as RKPPL reads a
+# per-observation value's columns (`view(P, :, j)`, `_observation_slice_views`;
+# snag `column-read-lowe-24508269`): the view is the column read `P[:, j]`,
+# alone in RKPPL's `Base.Colon()` spelling and as a dotted operand, so the cell
+# computes the product and its `hcat` design at its row only. Read by two
+# views, `P` is computed at the union of their rows, so its `hcat` design's
+# data operands are row views beside a computed column, which native Enzyme
+# Reverse rejects in Base's `_typed_hcat`, as for any `hcat` read at several
+# rows (Enzyme snag `native-reverse-t-6d51cae6`; user principle
+# `enzyme-fixed-in-enzyme-everywhere`): that gradient is pinned broken.
+@kernel _cell_column_view(positions::Vector{Int}, y, one, x, W::Matrix{Float64},
+                          c0::Float64) = begin
+    c = x .- c0
+    X = hcat(one, c)
+    P = X * W
+    p2 = Base.view(P, Base.Colon(), 2)
+    eta = p2 .+ 0.5
+    loc = plate(positions) do i
+        exp(eta[i])
+    end
+    dens = plate(loc, y) do li, yi
+        -(yi - li)^2 / 2
+    end
+    return dens
+end
+
+@kernel _cell_column_view_inline(positions::Vector{Int}, y, one, x, W::Matrix{Float64},
+                                 c0::Float64) = begin
+    c = x .- c0
+    X = hcat(one, c)
+    P = X * W
+    eta = 0.5 .+ 2.0 .* view(P, :, 2)
+    loc = plate(positions) do i
+        exp(eta[i])
+    end
+    dens = plate(loc, y) do li, yi
+        -(yi - li)^2 / 2
+    end
+    return dens
+end
+
+@kernel _cell_column_views_two(positions::Vector{Int}, y, one, x, W::Matrix{Float64},
+                               c0::Float64) = begin
+    c = x .- c0
+    X = hcat(one, c)
+    P = X * W
+    p1 = Base.view(P, Base.Colon(), 1)
+    eta = p1 .+ 2.0 .* view(P, :, 2)
+    loc = plate(positions) do i
+        exp(eta[i])
+    end
+    dens = plate(loc, y) do li, yi
+        -(yi - li)^2 / 2
+    end
+    return dens
+end
+
+@testset "plate_cell: column views of a product read at the cell's row" begin
+    have = (:positions, :y, :one, :x, :W, :c0)
+    data(n) = (; positions = collect(1:n), y = cos.(1:n), one = ones(n),
+        x = collect(range(0.5, 1.5; length = n)))
+    W, c0 = [0.1 -0.2; -0.3 0.4], 0.9
+    d = data(9)
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    @testset "$label" for (label, spec, names, broken) in (
+            ("one view", _cell_column_view, ["c", "X", "P", "p2", "eta"], false),
+            ("an inline view", _cell_column_view_inline, ["c", "X", "P", "eta"], false),
+            ("two views", _cell_column_views_two, ["c", "X", "P", "p1", "eta"], true))
+        k = prepare(plate_cell(spec, :dens; index = :i); have = (have..., :i),
+            want = :dens_cell)
+        reference = prepare(spec; have, want = :dens)(d..., W, c0)
+        @test [k(d..., W, c0, i) for i in d.positions] ≈ reference
+        pushed = let lp = ReactiveKernels._lowering_plan(k.plan),
+                     cells = ReactiveKernels._cell_pushdowns(lp)
+            cells === nothing ? Set{String}() :
+                Set(String(cells.producer[c].outputs[1].name) for c in cells.pushed)
+        end
+        @test issubset(Set(names), pushed)
+        allocated(d) = (k(d..., W, c0, 2); @allocated k(d..., W, c0, 2))
+        @test allocated(data(12)) == allocated(data(120_000))
+        for i in (1, 6)
+            result = try
+                ad_value_and_gradient(prepare_ad(k, backend, d..., W, c0, i; active = :W),
+                    d..., W, c0, i)
+            catch err
+                broken || rethrow()
+                err
+            end
+            if result isa Exception
+                @test_broken !(result isa Exception)
+                @test nameof(typeof(result)) === :IllegalTypeAnalysisException
+                continue
+            end
+            broken && @test_broken !(result isa Exception)
+            value, dW = result
+            @test value ≈ reference[i]
+            for j in eachindex(W)
+                e = zero(W); e[j] = 1.0
+                @test dW[j] ≈ _cell_central(h -> k(d..., W .+ h .* e, c0, i), 0.0) rtol = 1e-6
+            end
+            broken && continue
+            _, dc = ad_value_and_gradient(
+                prepare_ad(k, backend, d..., W, c0, i; active = :c0), d..., W, c0, i)
+            @test dc ≈ _cell_central(c -> k(d..., W, c, i), c0) rtol = 1e-6
+        end
+    end
+end
+
 # An `hcat` design read at several rows of a cell: values run at those rows.
 # Native Enzyme Reverse rejects Base `hcat` of views beside dense arrays
 # (`IllegalTypeAnalysisException` in `_typed_hcat`), which those rows are. That
@@ -828,6 +936,53 @@ end
     return dens
 end
 
+# A number computed at a cell's rows and read by several readers has no rows to
+# take: a dotted expression of numbers is a number, whichever reader reads it.
+@kernel _cell_number_readers(y, x, z, a::Float64, b::Float64) = begin
+    s = a .+ b
+    l = x .* s
+    m = z .+ s
+    mu = l .+ m
+    dens = plate(mu, y) do mi, yi
+        -(yi - mi)^2 / 2
+    end
+    return dens
+end
+
+# The same number read by a dotted operand and by the cell itself.
+@kernel _cell_number_lane(y, x, a::Float64) = begin
+    s = exp.(a)
+    l = x .* s
+    dens = plate(l, s, y) do li, si, yi
+        -(yi - li)^2 / 2 - si
+    end
+    return dens
+end
+
+# ... by a `vcat` and by a dotted operand; the `vcat` reads no row of it in
+# most cells.
+@kernel _cell_number_part(y, x, lookup::Vector{Int}, u::Vector{Float64}, a::Float64) = begin
+    s = exp.(a)
+    padded = vcat(s, u)
+    mu = padded[lookup] .+ x .* s
+    dens = plate(mu, y) do mi, yi
+        -(yi - mi)^2 / 2
+    end
+    return dens
+end
+
+# A rank-0 array read through an alias has no rows either.
+@kernel _cell_rank_zero(y, x, z, a) = begin
+    s::AbstractArray = a
+    l = x .* s
+    m = z .+ s
+    mu = l .+ m
+    dens = plate(mu, y) do mi, yi
+        -(yi - mi)^2 / 2
+    end
+    return dens
+end
+
 @testset "plate_cell: vcat operands, typed aliases, several gather indices and index-array plates at the cell's rows, each value once" begin
     have = (:y, :observed, :mask, :lookup, :free, :scale, :z, :r1, :r2)
     k = prepare(plate_cell(_cell_completion, :dens; index = :i);
@@ -946,4 +1101,121 @@ end
             Set(String(cells.producer[v].outputs[1].name) for v in cells.pushed)
     end
     @test !("t" in converted)
+end
+
+@testset "plate_cell: a number read by several readers of a cell" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    pushed(k) = let lp = ReactiveKernels._lowering_plan(k.plan),
+                    cells = ReactiveKernels._cell_pushdowns(lp)
+        Set(String(cells.producer[v].outputs[1].name) for v in cells.pushed)
+    end
+    function check(spec, have, data, p, names)
+        k = prepare(plate_cell(spec, :dens; index = :i); have = (have..., :i), want = :dens_cell)
+        full = prepare(spec; have, want = :dens)
+        reference = full(data..., p...)
+        @test [k(data..., p..., i) for i in eachindex(reference)] ≈ reference
+        @test "s" in pushed(k)
+        for i in (1, lastindex(reference)), name in names
+            ad = prepare_ad(k, backend, data..., p..., i; active = name)
+            value, dp = ad_value_and_gradient(ad, data..., p..., i)
+            @test value ≈ reference[i]
+            @test dp ≈ _cell_central(h -> k(data..., merge(p, NamedTuple{(name,)}(
+                (getfield(p, name) + h,)))..., i), 0.0) rtol = 1e-6
+        end
+        k
+    end
+    grid(n) = (; y = cos.(1:n), x = sin.(1:n), z = collect(range(0.1, 1.0; length = n)))
+    k = check(_cell_number_readers, (:y, :x, :z, :a, :b), grid(8), (; a = 0.3, b = 0.4), (:a, :b))
+    allocated(n) = let d = grid(n)
+        k(d..., 0.3, 0.4, 2); @allocated k(d..., 0.3, 0.4, 2)
+    end
+    @test allocated(30) == allocated(30_000)
+    check(_cell_number_lane, (:y, :x, :a), (; y = cos.(1:8), x = sin.(1:8)), (; a = 0.3), (:a,))
+    check(_cell_number_part, (:y, :x, :lookup, :u, :a),
+        (; y = cos.(1:8), x = sin.(1:8), lookup = [1, 2, 3, 2, 1, 3, 3, 1], u = [0.5, -0.2]),
+        (; a = 0.3), (:a,))
+    d = grid(8)
+    scalar = prepare(plate_cell(_cell_number_readers, :dens; index = :i);
+        have = (:y, :x, :z, :a, :b, :i), want = :dens_cell)
+    zero_rank = prepare(plate_cell(_cell_rank_zero, :dens; index = :i);
+        have = (:y, :x, :z, :a, :i), want = :dens_cell)
+    @test "s" in pushed(zero_rank)
+    @test [zero_rank(d..., fill(0.7), i) for i in 1:8] ≈ [scalar(d..., 0.3, 0.4, i) for i in 1:8]
+end
+
+# A gather straight from an inline `vcat`, alone and inside a dotted
+# completion, as one expression (snag `inline-vcat-gath-bb73ae09`): the cell
+# lowering outlines the `vcat` into a value of its own, so the cell computes
+# both at its rows, as their two-statement spelling (`stacked = vcat(...)`,
+# `stacked[order]`) does. A completion also read whole stays as written.
+@kernel _cell_inline_gather(y, observed, z, order::Vector{Int}, s::Float64) = begin
+    drawn = exp.(z .* s)
+    completed = (vcat(observed, drawn))[order]
+    dens = plate(completed, y) do ci, yi
+        -(yi - ci)^2 / 2
+    end
+    return dens
+end
+
+@kernel _cell_inline_masked(y, observed, mask, z, lookup::Vector{Int}, s::Float64) = begin
+    drawn = exp.(z .* s)
+    completed = observed .+ mask .* vcat(drawn, z)[lookup]
+    dens = plate(completed, y) do ci, yi
+        -(yi - ci)^2 / 2
+    end
+    return dens
+end
+
+@kernel _cell_inline_whole(y, observed, z, order::Vector{Int}, s::Float64) = begin
+    drawn = exp.(z .* s)
+    completed = (vcat(observed, drawn))[order]
+    total = sum(completed)
+    dens = plate(completed, y) do ci, yi
+        -(yi - ci)^2 / 2 + total
+    end
+    return dens
+end
+
+@testset "plate_cell: a gather from an inline vcat runs at the cell's rows" begin
+    gathered(n) = let nobs = n ÷ 2
+        (; y = cos.(1:n), observed = collect(range(0.1, 0.9; length = nobs)),
+           z = collect(range(-0.5, 0.4; length = n - nobs)), order = collect(n:-1:1))
+    end
+    masked(n) = (; y = cos.(1:n), observed = collect(range(0.1, 0.9; length = n)),
+        mask = Float64[isodd(j) for j in 1:n], z = collect(range(-0.5, 0.4; length = n)),
+        lookup = [mod1(3j, 2n) for j in 1:n])
+    outlined(k) = ReactiveKernels._cell_outlined_pushdowns(
+        ReactiveKernels._lowering_plan(k.plan))
+    pushed(k) = let (_, cells) = outlined(k)
+        cells === nothing ? Set{String}() :
+            Set(String(cells.producer[v].outputs[1].name) for v in cells.pushed)
+    end
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for (spec, have, data) in ((_cell_inline_gather, (:y, :observed, :z, :order), gathered),
+                               (_cell_inline_masked, (:y, :observed, :mask, :z, :lookup), masked))
+        k = prepare(plate_cell(spec, :dens; index = :i); have = (have..., :s, :i),
+            want = :dens_cell)
+        full = prepare(spec; have = (have..., :s), want = :dens)
+        d = data(10)
+        reference = full(d..., 0.7)
+        @test [k(d..., 0.7, i) for i in eachindex(reference)] ≈ reference
+        @test issubset(Set(["drawn", "completed_part1", "completed"]), pushed(k))
+        allocated(n) = let d = data(n); k(d..., 0.7, 2); @allocated k(d..., 0.7, 2) end
+        @test allocated(20) == allocated(20_000)
+        @test_throws BoundsError k(d..., 0.7, 11)
+        for i in (1, 7)
+            ad = prepare_ad(k, backend, d..., 0.7, i; active = :s)
+            value, ds = ad_value_and_gradient(ad, d..., 0.7, i)
+            @test value ≈ reference[i]
+            @test ds ≈ _cell_central(s -> k(d..., s, i), 0.7) atol = 1e-8
+        end
+    end
+    # Read whole by `sum`, the completion is computed whole: nothing is outlined.
+    k = prepare(plate_cell(_cell_inline_whole, :dens; index = :i);
+        have = (:y, :observed, :z, :order, :s, :i), want = :dens_cell)
+    full = prepare(_cell_inline_whole; have = (:y, :observed, :z, :order, :s), want = :dens)
+    d = gathered(10)
+    @test [k(d..., 0.7, i) for i in 1:10] ≈ full(d..., 0.7)
+    lp = ReactiveKernels._lowering_plan(k.plan)
+    @test first(ReactiveKernels._cell_outlined_pushdowns(lp)) === lp
 end

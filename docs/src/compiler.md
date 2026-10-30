@@ -9,28 +9,21 @@ around it. This page is the capability contract: it says which decisions the
 compiler makes, which facts an author must supply, which work disappears from a
 prepared hot path, and which source shapes are deliberately rejected.
 
-The word *compiler* is used here for three related but different pipelines:
+The word *compiler* is used here for two related pipelines:
 
 - the public stateless have→want compiler, which selects recipes and emits a
-   straight-line Julia callable;
+   straight-line Julia callable; and
 - the public reactive compiler, which fixes the same selected graph into typed
-   slots, validity bits, dependency closures, and generated lazy getters; and
-- the source-captured state-machine compiler, which analyzes method-bearing
-   `@kernel` definitions using captured and validated effect metadata. Its most
-   complete consumer is the external sealed native NUTS acceptance artifact.
+   slots, validity bits, dependency closures, and generated lazy getters.
 
 Those surfaces share graph identities, producer selection, and currentness
-rules. They do **not** share the same public stability or source-language
-boundary. In particular, a stateless recipe may contain arbitrary ordinary
-Julia behind an opaque recipe call, while a source-captured state-machine method
-must stay inside the compiler's inspectable and registered subset.
+rules. A stateless recipe may contain arbitrary ordinary Julia behind an opaque
+recipe call.
 
-## Pure kernels and the iterative-method compiler
+## Pure kernels
 
-ReactiveKernels has two halves, and they have different status.
-
-**Pure kernels** are where development is focused. This half is everything a
-stateless graph needs, from authoring to execution:
+ReactiveKernels compiles pure kernels: everything a stateless graph needs, from
+authoring to execution:
 
 - function-shaped `@kernel` specifications (`KernelSpec`) and pure
    method-bearing kernel objects (`KernelObjectSpec`), including every
@@ -45,45 +38,9 @@ stateless graph needs, from authoring to execution:
 - `prepare_nonallocating`, and the owned primitives such as `rk_expm`,
    `rk_cholesky_lower` and `rk_ode_bdf_tol`.
 
-ReactiveKernelsPPL is built entirely on this half. So are the reactive
-execution layers, `ReactiveState` and `prepare_reactive` with
-`CompiledReactiveState`: they run prepared pure kernels with
-provenance-aware invalidation and do not use the iterative-method compiler.
-
-**The iterative-method compiler** is the third pipeline listed above. It
-compiles stateful object kernels and free update methods (see [Two stateful
-authoring modes](#Two-stateful-authoring-modes)) into state machines. It is
-**frozen**: its tests stay green, but it takes no new features until it is
-revisited. Its public entry points are:
-
-- `compile_stateful`, `stateful_compiler_bindings`, `functionalize_stateful`,
-   `stateful_snapshot`, `compile_state_transition`, `initial_transition_state`,
-   `validated_compiled_transition` and `stateful_control_bounds`, with their
-   result types;
-- effect ports and host-drained observations: `pure_callable_port`,
-   `effect_callable_port`, `effect_lowering_port`, `structured_state_port`,
-   `total_functional_lowering`, `initial_transition_effects`,
-   `transition_with_effects` and `drain_observations!`;
-- functionalized randomness: `rng_provider` and `OrderedRNGReplay`;
-- the experimental captured-program interface: `prepare_transpiled`,
-   `initial_transpiled_state` and `transpiled_endpoint`;
-- the token-preserving binder `partial` (`PartialFunction`).
-
-Its consumers are the NUTS and HMC compiler examples
-(`ReactiveKernelsNUTSExamples` and the [HMC transpiler](hmc-transpiler.md)
-page) and the compiled accumulators of `ReactiveKernelsStreamingStats`.
-
-The two halves share one front end. The `@kernel` mode discrimination, method
-extraction and endpoint templates in `src/kernel_stateful.jl` build pure kernel
-objects as well as stateful ones. No other pure source file, and nothing in
-ReactiveKernelsPPL or DistributionKernels, calls into the compiler's source
-files. A test keeps it that way:
-`packages/ReactiveKernelsPPL/test/test_pure_surface_boundary.jl` runs a pure
-workload in a fresh process: an `@rkppl` model with a native Reverse sampler,
-a DistributionKernels family object, a pure kernel object, `prepare`,
-`prepare_ad` and `vectorize`. It fails, naming the method, when the workload
-compiles any method of the compiler's source files. Its fixture,
-`pure_surface_census.jl`, lists those files.
+ReactiveKernelsPPL is built on this. So are the reactive execution layers,
+`ReactiveState` and `prepare_reactive` with `CompiledReactiveState`: they run
+prepared pure kernels with provenance-aware invalidation.
 
 ## Numerical metadata and its consumers
 
@@ -162,18 +119,6 @@ compiler-cost checks, not evidence of a speedup.
 ```@eval
 Main.ReactiveKernelsDocs.render_compiler_api_map()
 ```
-
-Method-bearing compilation has a finite exported contract rather than a
-general Julia `prepare` API. `compile_state_transition` combines a stateless
-endpoint `KernelSpec` with a bound free update method. `compile_stateful`,
-`stateful_compiler_bindings`, and `functionalize_stateful` compile a captured
-stateful object and one selected method through explicit typed callable,
-nested-state, loop-bound, and argument-domain contracts. NUTS, log-density, and
-PPL artifacts are external compilation examples and acceptance evidence, not
-domain APIs owned by ReactiveKernels. The NUTS runtime and domain surface live
-in the `ReactiveKernelsNUTSExamples` nested package; a bare `using ReactiveKernels` does not load or
-export them. See [What the NUTS proof does and does not
-establish](#What-the-NUTS-proof-does-and-does-not-establish).
 
 ## The stateless compiler
 
@@ -1013,11 +958,15 @@ supports these producers:
 
 - a dotted expression of inputs, numeric literals, gathers `A[I]` or
   `A[I, k]` (an integer vector input `I`, integer literals `k`), column reads
-  `A[:, k]`, products `A * w` of two inputs, and literal-position reads `a[1]`
-  of an array of numbers (read whole, as in `z .* tau[1]`). One source may be
+  `A[:, k]` (also written as the view `view(A, :, k)`, which RKPPL reads a
+  per-observation value's column through), products `A * w` of two inputs,
+  and literal-position reads `a[1]` of an array of numbers (read whole, as in
+  `z .* tau[1]`). One source may be
   gathered by several index vectors, as in `exp.(t[r1]) .+ exp.(t[r2])`; it
   is then computed at the rows of every index;
-- such a gather alone, and such a column read alone;
+- such a gather alone, also written as the read-only view
+  `_readonly_gather(A, I)` that RKPPL reads a bare gathered definition
+  through, and such a column read alone;
 - `hcat(a, b, ...)` of inputs, such as a design matrix with a computed column;
 - `vcat(a, b, ...)` of inputs and number literals, such as a completed
   covariate `vcat(free, grouped)[lookup]` or a padded field `vcat(phi, 0.0)`.
@@ -1041,6 +990,22 @@ supports these producers:
   row by these rules. So a later plate reading `pred[i]` from
   `pred = plate(rows) do r; f(log_k[r]) end` computes `pred` and `log_k` at
   row `i` only.
+
+These producers can also be written inside one expression, such as a gather
+straight from an inline `vcat`, `completed = vcat(observed, drawn)[order]`, or
+`observed .+ mask .* vcat(free, grouped)[lookup]`. The cell lowering outlines
+the inner call into a value of its own, so both are computed at the rows read,
+as with the two-statement spelling `stacked = vcat(observed, drawn)` and
+`completed = stacked[order]`. A call is outlined where the producers above read
+a value by name: a gather's source or index, an operand of `vcat`, `hcat` or
+`*`, or an operand of a dotted expression that is not itself dotted (a nested
+dotted call stays fused). Only strict subexpressions are outlined, never a
+branch arm, a generator or a closure body, and the parts apply the authored
+operations to the same operands in the same order, so values are unchanged. A
+recipe is outlined only when the cell then computes it at its rows; otherwise
+it is lowered as written. Cheap expressions are not outlined: a gather `x[pos]`
+written as a `vcat` operand (`vcat(x[pos], u)`) still makes that `vcat` read
+whole.
 
 The producer's own operation runs on views of its row-aligned operands at the
 rows read; an operand that broadcasting extrudes is passed whole, or repeated
@@ -1220,430 +1185,6 @@ buffer. Multi-output, immutable-output and other recipes remain on the pure
 path. Independent state instances own independent buffers, but a returned
 mutable value is still borrowed from its state.
 
-## Source-captured method compiler
-
-This is the frozen iterative-method compiler (see [Pure kernels and the
-iterative-method compiler](#Pure-kernels-and-the-iterative-method-compiler)).
-Compiled as state machines, method-bearing `@kernel` definitions enter a
-stricter compiler. Their pure, straight-line methods are also endpoint graphs
-of the pure half, which need nothing from this section. They are not
-opaque recipe closures and are not analyzed through Julia's compiled IR.
-
-### Authoritative input is captured source
-
-At definition time, the macro stores detached, structurally frozen source ASTs,
-definition-module identity, port metadata, and exact callee-registration
-snapshots. Later analysis walks that stored source. It does not call
-`code_lowered`, `code_typed`, `CodeInfo`, `Core.Compiler`, method inference, or
-arbitrary function-body inspection. Rebinding an authored callee slot to a
-different identity is detected and rejected.
-
-This boundary makes the compiler's claim finite: it compiles the language it
-captured and the effects explicitly registered for it. It makes no claim to
-understand arbitrary Julia hidden behind an unregistered call.
-
-### Two stateful authoring modes
-
-A body containing nested methods is an object kernel. Its receiver is
-implicit: bare unshadowed port names are owner fields, while formals and locals
-shadow fields lexically. Nested methods declare no `self` or `__self__` formal.
-The token `__self__` is legal only as the first positional actual of a sibling
-method call; using it as a field qualifier or ordinary value is rejected.
-
-A methodless definition that mutates a field of its first positional argument,
-or whose name ends in `!!`, is a free update method. Its first positional
-argument is the explicit subject. The `!!` spelling is an explicit strong
-same-object update contract, not a heuristic about a hidden implementation.
-
-Everything else remains the stateless `KernelSpec` path. These modes are
-selected from syntax before any recipe runs.
-
-### Normalized `MethodIR`
-
-Captured methods normalize into immutable `MethodIR` values. The IR represents:
-
-- literals, locals, formals, owner-field paths, indexes, property access,
-  tuples, named tuples, short-circuit values, and conditional values;
-- local assignment, direct/indexed/nested place writes, place swaps, and
-  write-then-return;
-- branches, guards, `for` and `while` loops, `break`, `continue`, and returns;
-- sibling calls, subject-method calls, registered callable-field calls,
-  registered primitive/intrinsic calls, and unresolved external calls; and
-- positional/keyword formals, defaults, overload candidates, source-order
-  reads, branch groups, and loop-carried access events.
-
-Each method records three independent facts: control shape (straight, branch,
-loop, or recursive), local effects, and unresolved dependencies. Structured
-access events keep branch alternatives separate and mark loops that may execute
-zero times. Every call records its actual-value reads. This prevents a flat
-source scan from inventing definite assignment or hiding a read behind a
-branch.
-
-Normalization rejects malformed or unsoundly ambiguous source, including a
-computed/dynamic callee, a positional splat at a call site, an unresolved
-qualified callee, a maybe-bound local read, unsupported tuple-place mutation,
-and a mutation whose owner root cannot be represented. An unregistered external
-may be represented as opaque for diagnostics, but executable ownership/effect
-lowering must resolve it or reject it.
-
-### Effects, ownership, and physical storage
-
-Calls are authorized by exact identity, not by spelling. Built-in compiler
-descriptors describe arity, reads, writes, result aliasing/borrowing, and RNG
-position. The former `@rk_pure`, `@rk_borrows`, and `@rk_rng` declarations have
-been removed. External fixtures use ordinary visible arithmetic/control or a
-captured sibling `@kernel` method. Undeclared ordinary helpers remain unsupported and are
-not made pure because they have an operator-like name or receive an argument
-named `rng`. `@node` is unrelated to this removal boundary and remains part of
-graph authoring.
-
-For compiler-known primitives, the implementation also checks the concrete
-specialization domain. Sanctioned Base numeric scalars, dense arrays, and the
-specific linear-algebra wrappers required by the compiled kernels are
-accepted. A user subtype that dispatches a custom overload through the same
-generic function is rejected unless it is admitted by an exact, validated
-compiler rule. This prevents generic-function identity from smuggling unknown
-effects into compiled code.
-
-The factory computes an interprocedural ownership fixed point over direct
-writes, sibling calls, callable fields, borrowed aliases, and strong-copy
-operations. It separates producer-owned endpoint storage from shared
-read-authority. Its immutable plan records canonical slots, role and physical
-index, authoritative HAVE, selected producer recipes, dependents, entry-current
-bits, captured operation handles, and recipe input/output ownership.
-
-Storage is concrete tuples/structs and validity masks; author symbols are only
-labels. Copied child endpoints get distinct owned storage but may share one
-read-only authority object. Two paths using the same graph value identity remain
-distinct because schedule state is keyed by physical owner/view path plus
-canonical value identity.
-
-### Currentness and exception semantics
-
-A direct write makes its target current and kills the transitive dependents of
-that target in the selected producer graph. Before a derived read, lowering
-recursively ensures the selected producer's inputs and executes that producer
-once if needed. One recipe execution produces its selected owned output set
-atomically; collateral outputs owned by another recipe are not blessed.
-
-A method may directly write only an authoritative source slot. Treating one
-value as both directly written and plan-produced is rejected. A stale derived
-read with no selected producer is also rejected. Entry currentness is an
-explicit factory contract, never inferred by assuming that all derived values
-are valid.
-
-Validity changes are exception-safe but values are not transactionally rolled
-back. Dependents are invalidated before or with a mutation. A throwing recipe
-does not bless its outputs. If several writes have already executed before a
-later throw, their invalidations remain, so a retry recomputes from the actual
-partially mutated state rather than reading stale cached values.
-
-### Control lowering
-
-The general control compiler distinguishes acyclic work from recursive or
-suspending work. Acyclic sibling methods and their early returns are inlined
-into the caller's continuation. Non-suspending loops remain native Julia loops.
-Recursive strongly connected components and callers that suspend across them
-are defunctionalized into finite method/PC dispatch, concrete frame stores, and
-an isbits control stack. Values live across a suspension are stored explicitly;
-the generated dispatcher contains no boxed closure or runtime method table.
-
-The implemented generic control surface is narrower than Julia. In the PC
-machine, a suspending `for` loop currently requires a two-bound unit range;
-non-suspending loops can retain an arbitrary native iterable. Exact overload
-narrowing is required before emission. Unsupported statements or unresolved
-effects reject instead of falling back to interpretation.
-
-### Functional free state transitions
-
-`compile_state_transition(spec, transition, endpoint_args;
-endpoint_kwargs=(;))` is the public, backend-neutral subset of the
-method-bearing compiler. `spec` supplies the endpoint's authoritative sources
-and have→want recipes. `transition` is a registered free mutating `@kernel`, or
-a `partial` of one that binds all of its required keyword controls. Construction
-uses the original endpoint and transition signature binders; it does not match
-the kernel's name, field names, or a program-counter census.
-
-The result is a `CompiledStateTransition`. `initial_transition_state(result)` returns an
-isolated, fully materialized named state while preserving external callable
-authorities by identity. Calling the result with that state is functional: an
-authored array write produces a new array value, invalidates the written
-source's transitive derived closure, and recomputes a stale derived field only
-at its next source-ordered read. The generated program is ordinary Julia.
-Every call validates the exact recursive state layout, owned-array axes,
-canonical aliases, and external authority identities captured at construction.
-Group-aware structural copies isolate owned arrays without invoking user
-`deepcopy` methods or duplicating callable authorities. Authored broadcast
-assignment between builtin floating types retains Julia's destination-element
-conversion, including Float64 intermediates written into Float32 storage.
-
-The initial public source subset is intentionally finite. It admits direct
-owned-field writes, exact captured `map(copy, tuple)`, tuple and named
-destructuring, bound non-Boolean numeric controls, and integer `Base.Colon`
-loops whose bounds are entirely static. Such a loop is retained: its body is
-compiled once as its own program over a carry of every canonical field value
-and lexical local, and runs natively as an ordinary loop or as one retained
-loop region on a tracing backend, whatever the bound — a bound may be bound
-numeric data, so the body is never replicated per iteration
-([core constraints](constraints.md)). Derived-field currentness is a loop
-invariant: every slot the body reads is repaired before the loop and at the
-end of each iteration. Indexed destinations,
-data-dependent branches/loops, arbitrary higher-order calls, and opaque
-callbacks reject. Callback computations used by endpoint recipes must be
-explicit endpoint ports so their authority is auditable and their identity is
-preserved.
-
-The six ReactiveHMC phase-point examples exercise this one compiler path for
-Gaussian and relativistic Euclidean, Riemannian, and diagonal-SoftAbs geometry.
-Both generalized leapfrog and implicit midpoint remain their ordinary authored
-mathematical kernels. Those examples validate a reusable compiler capability;
-they do not add geometry or integrator cases to compiler code.
-
-### Functional stateful methods and nested state contracts
-
-`compile_stateful` prepares a method-bearing `@kernel` after every callable
-field has an explicit entry in `stateful_compiler_bindings`. A
-`pure_callable_port` declares one exact argument/result contract and no
-mutation. An `effect_callable_port` additionally declares which positional
-values may be replaced, a functional lowering, and an auxiliary effect value.
-Both validate their replacement arguments, logical result, and effect-state
-type after lowering. A control-dependent lowering must be wrapped in
-`total_functional_lowering`, explicitly asserting that it is pure and total
-over inactive predicated values; an arbitrary partial callback rejects.
-`effect_lowering_port` is the distinct contract for a non-executable authority
-token whose compiler lowering has independent source-oracle evidence. It does
-not mislabel that token as an ordinary source callback.
-`StatefulStateValue` is the contract marker for a callback whose authored
-argument is `__self__`; the compiler substitutes and validates the concrete
-whole-state NamedTuple type rather than asking an application to reconstruct
-private storage types.
-
-Effect classification is currently an internal conservative compiler rule,
-not new public authoring syntax. A port that can replace any argument or return
-a meaningful value is causal: its state stays in the fixed compiled ABI, and
-host feedback can affect a later transition only after an explicit barrier and
-re-entry as a separately typed input. A source-backed port with no written
-arguments and `Nothing` result has no causal channel, so the compiler generates
-a split kernel automatically. The compiled region writes source-order records
-into structure-of-arrays storage of fixed capacity: one column per numeric
-leaf of the declared record type with a trailing slot axis, a fill count, and
-a sticky overflow flag, written by one dynamic slot write per call site (the
-program never enumerates the capacity); ordinary Julia then calls
-`drain_observations!(transition, result)` after the compiled call returns. No
-`push!`, callback invocation, allocation-driven shape growth, or implicit host
-round trip occurs inside the compiled invocation, and callers may schedule the
-drain on their own Julia task after that synchronization point.
-
-A compiler-only observational authority still runs its reviewed total lowering
-to form one fixed-shape summary. That summary is returned in the same outbox;
-the existing `effects` result also mirrors it for fixed-shape compatibility,
-but every invocation starts from the declared initial value rather than reading
-the prior summary. Consequently observation history cannot become an implicit
-future compiled input. Outbox overflow rejects before partial host replay, and
-a record whose type or axes would change is diagnosed as forbidden outbox
-growth. Runtime reusable-call mismatches report both expected and observed
-type/axes signatures and instruct the caller to explicitly recompile; the host
-guard performs that rejection before entering the backend executable.
-
-`structured_state_port(compiled_transition)` binds a nested state field to the
-canonical alias groups, external authority identities, writable source fields,
-and derived-recipe closure of an ordinary `CompiledStateTransition`. A nested
-write is admitted only when that transition declares its first path field
-writable. The compiler updates every alias in the written canonical group and
-eagerly repairs the active transitive derived closure before the outer method
-continues. Structural copies and predicated rollback select or copy once per
-canonical group, so internal aliases remain aliases and external callbacks
-remain identical. None of this lowering dispatches on sampler, geometry,
-method, or field names.
-
-### Prototype-derived finite structural containers
-
-The functional state-machine compiler has a closed ABI for fixed-capacity
-structural vectors. Construction starts from the actual prototype values; it
-does not infer a generic container promise from `Vector{T}` alone. The contract
-freezes the element type and capacity, recursive named-tuple and tuple layout,
-`Diagonal` and `Cholesky` wrappers, array element types and axes, static
-authority identities, within-element owned-array aliases, and the requirement
-that owned storage from different elements remain disjoint.
-
-Dynamic leaves are exactly `Bool`, the signed and unsigned 8-, 16-, 32-, and
-64-bit integers, `Float16`, `Float32`, `Float64`, and dense arrays of those
-types. The backend representation is a structure of arrays: one typed numeric
-column per logical owned leaf group, with capacity as the last array dimension.
-Static authorities never enter that numeric ABI. Unsupported leaves, wrapper
-types, shape changes, merged aliases, separated required aliases, or shared
-owned storage across elements reject during contract validation.
-
-The lowering has topology-aware read, write, copy, swap, and whole-container
-select operations. An active out-of-bounds index sets overflow and commits no
-partial write, copy, or swap. Raw input and output are both validated for exact
-column names and order, numeric types, axes, and capacity. Output validation
-happens before reconstruction, so restoring static identities or canonical
-aliases cannot hide a counterfeit backend result. This is a compiler-internal
-finite ABI, not a general exported container API and not permission for dynamic
-`push!`, `pop!`, resizing, or arbitrary element types.
-
-Primitive emission is closed over exact captured builtins and concrete
-specializations. `Base.abs` is admitted here only for one builtin
-`AbstractFloat` scalar. `Base.div` requires two operands of the identical
-builtin non-`Bool` integer type. Integer `abs`, mixed-integer `div`, `Bool`,
-128-bit integers, numeric wrappers, and user overloads do not widen those rules;
-they reject before executable lowering.
-
-`functionalize_stateful(kernel, Val(:method); max_iterations,
-argument_types, rng_providers)` produces the backend-neutral functional program;
-`stateful_snapshot` supplies its initial value surface. Dynamic structured
-control requires a positive finite loop bound. A bound violation, an active
-out-of-bounds indexed access, or exhausted effect storage sets a control
-overflow and rolls state plus auxiliary effects back atomically. The typed
-functional entry validates the outer plan's canonical aliases as well as any
-nested structured aliases. For repeated calls, a compiled executable must be
-wrapped with `validated_compiled_transition(compiled, transition)`. That generic host guard
-revalidates layout, shapes, canonical aliases, structured ports, and external
-authorities before dispatch. It restores frozen callable and nested structured
-external authorities (which are compiler metadata rather than backend data),
-then validates the returned owned-data alias topology. The
-effects-positional form also checks the dynamic effects carrier and method
-arguments. The raw executable alone is outside the safe repeated-call
-contract because a flattened buffer ABI cannot represent Julia object
-identity. Straight-line and
-state-machine gates both prove valid repeated execution, identity-preserving
-outputs, and rejection of an independently converted counterfeit alias.
-
-Every structured state-machine method with authored control flow — branches,
-guards, short circuits, `for` and `while` loops — lowers through the control
-program: the method's CFG becomes a set of blocks, and one retained `while`
-loop dispatches exactly one block per step by its (method, pc) address. A branch therefore evaluates only its taken side and a loop body is
-emitted once, whatever the admitted iteration count; each loop carries a
-counter checked against `max_iterations`, and exceeding it sets control
-overflow and rolls the transition back, exactly as before. Returned values
-travel in the root frame, so value-returning methods take the same path.
-Lexical locals, early returns, structured aliases, and effect state travel
-through the loop carry. Validated external callable identities are recovered
-from compiler bindings rather than copied through those operands; numeric and
-array external values remain operands. This is the lowering the
-[core constraints](constraints.md) require; the earlier per-iteration
-replication and predicated both-branch emission are no longer used for these
-methods.
-
-Host-drained observational records (`drain_observations!`) travel in that
-loop carry as the structured outbox described above: the storage is seeded
-once before the loop from the record's declared type (a `__self__` argument
-records the whole state; static callable fields are carried by reference and
-restored from the compiler bindings at the drain), each call site writes the
-next slot lazily inside its block, and the fill count and overflow flag are
-scalar carry slots. Slots fill sequentially, so the drain replays `1:count` in
-emission order without an activity mask.
-
-The control program's loop counters preserve the explicit overflow/rollback
-result at extreme bounds and with small integers; the earlier bounded
-predicated path (per-iteration replication with an unsigned finite allowance)
-is gone.
-
-Ordered RNG is one typed internal effect authority. Authored kernels keep the
-ordinary Julia expressions `Random.randn!(rng, destination)`,
-`Random.rand(rng, Bool)`, and `Random.randexp(rng)`, including draws nested in
-guards, short-circuit expressions, and conditional values. Native execution
-therefore uses a standard Julia `AbstractRNG` directly. Functional compilation
-instead binds the same unannotated logical `rng` formal through
-`rng_provider(State; normal_fill, bool_draw, exp_draw)`. The provider is frozen
-compiler metadata; only its finite `State` crosses the dynamic ABI, and the
-updated state is returned at the same position in `result.arguments`. A source
-annotation such as `rng::AbstractRNG` intentionally rejects a tensor-state
-provider rather than capturing a host RNG in a compiled executable. Changing
-provider type or backend state shape requires explicit recompilation.
-
-`OrderedRNGReplay` supplies deterministic draws for behavior and failure tests and infers its
-provider automatically. It carries independent floating normal, Boolean
-uniform, and exact Float64 exponential tapes, per-kind cursors, one global
-ordered event tape/cursor, and sticky overflow. `randn!` is admitted only for
-an immediate whole-vector state replacement with the declared
-destination/result alias; `rand(rng, Bool)` retains the exact captured type
-descriptor. Conditional source paths consume only the effects they enter, and
-an event-kind mismatch or exhausted tape fails closed while preserving the
-attempted replay receipt. Every consumed normal column is rechecked for
-finiteness and every consumed exponential for finiteness and nonnegativity,
-including dynamic tapes; invalid consumed data sets sticky overflow and
-atomically rolls state back, while unconsumed padding remains irrelevant.
-
-Causal auxiliary effects are explicit continuation state, not hidden compiler
-state. `initial_transition_effects(transition)` constructs the first value.
-Ordinary Julia may pass it as the `effects` keyword;
-`transition_with_effects(transition)` provides a positional callable for
-optional compilers, so callers can feed returned causal effects into the next
-compiled invocation. Compiler-only observational summaries may remain in that
-result carrier for compatibility, but are reset rather than consumed on the
-next invocation and are authoritatively exposed by `drain_observations!`.
-Compiler program metadata is recursively snapshotted from a finite
-immutable/builtin domain; later mutation of authoring configuration cannot
-change compiled semantics.
-
-The fixed-step ReactiveHMC fixture is the first combined acceptance case. Its
-unchanged mathematical source refreshes momentum, executes generalized
-leapfrog, records statistics before divergence exit, conditionally consumes an
-exponential draw, and copies an accepted endpoint. The generic compiler infers
-that the statistics callback is observational, returns its bounded records,
-and the Julia drain replays the collector after the barrier. The same generic
-compiler path matches the independent accept, reject, and divergence receipt.
-A separate
-pinned physical case locks Float32
-position/momentum/normal draws together with the authored Float64 `randexp`
-result, destination alias, and global RNG event order. That evidence
-admits reusable nested-state currentness, typed effects, ordered RNG, and mixed
-floating assignment capabilities; it is not an HMC case in compiler code.
-
-Floating-point results may differ between native and compiled execution.
-Sampler acceptance does not require bit matching or a fixed numerical distance
-between backends, and does not restrict compiler optimization to reproduce a
-reference rounding pattern. Tests check useful sampler behavior, including
-valid trajectories, termination, divergence handling, RNG consumption, and
-repeated execution. The mixed-precision case also checks Float32/Float64 field
-types, the `randn!` result alias, tape and destination shapes, and rollback.
-A widened Float64 normal tape is rejected by the entry contract.
-
-## What the NUTS proof does and does not establish
-
-The source-captured compiler's strongest end-to-end external exemplar is the
-reviewed eight-spec NUTS fixture shown on the [NUTS sampling](nuts.md) page. It exercises
-alternative recipe planning, destination-bound potential/gradient production,
-owned and shared storage, endpoint copies, mutation kills, recomputation,
-recursive tree control, loops, early returns, RNG effects, optional statistics,
-dual averaging, and Welford accumulation.
-
-The sealed native path cold-compiles detached `MethodIR` into a registry-free
-type tree. Callable values live in one concrete tuple indexed from type
-metadata. The native encoder admits exactly the source forms needed by that
-fixture and rejects anything else, including opaque calls, unresolved overload
-sets, call-site keyword splats, formal splats, typed native-NUTS formals,
-chained comparisons, raw `@node` payloads in control metadata, unsupported
-structural literals, and subject-method calls inside the NUTS object methods.
-
-Construction produces fixed-depth concrete endpoint/tree/proposal storage and a
-certificate binding owner token, root token, immutable plan type/key, native
-program type, control fingerprint, physical roles, selected recipes, emitted
-operations, and frame/root/scratch types. The acceptance evidence for that
-artifact verifies same-object mutation, inferred concrete return, exact
-zero allocation after construction, Float32/Float64 paths, two RNG types,
-exception/currentness behavior, and an instrumented emitted-operation census.
-The sealed acceptance root consults no graph, planner, mutable registry, or later-world
-method lookup.
-
-That proof is deliberately **not** a general Julia-recursion compiler proof. It
-establishes the captured fixture and the encoder's rejection boundary. It does
-not establish arbitrary recursion, arbitrary containers or numeric subtypes,
-arbitrary integrators, PPL semantics, or a stable exported constructor for
-every method-bearing `@kernel`.
-
-There is also a package-boundary distinction. The sealed `_build_nuts_sampler`
-compiler, fixture entry, certificate accessors, and the compiled-reactive
-`nuts_state` / `CompiledNUTSState` comparison path all live in the explicitly
-loaded external exemplar. None is loaded or exported by `ReactiveKernels`.
-
-Therefore “the sealed native compiler runs the NUTS fixture” must not be read as
-“ReactiveKernels exports or promises a NUTS API.” The two external paths are
-implemented and tested as compiler evidence, but neither
-turns NUTS, log-density, or PPL models into the package's domain contract.
-
 ## Definitive support matrix
 
 ```@eval
@@ -1655,17 +1196,11 @@ Main.ReactiveKernelsDocs.render_compiler_capabilities()
 Rejection is part of the compiler contract, not a request to guess at hidden
 semantics. A `PlanningError` says the dataflow query is impossible or cyclic.
 An authoring error says the declared graph/signature is malformed. A
-source-compiler rejection says captured syntax, callee identity, effect,
-ownership, concrete specialization domain, or currentness could not be proved.
-A compiled-state error says the fixed graph/program/handle boundary was
+compiled-state error says the fixed graph/program/handle boundary was
 violated.
 
 None of those paths silently switches to dynamic interpretation. If a
 computation belongs behind an opaque stateless recipe, put it there explicitly.
-If its mutations must participate in the source compiler, register the exact
-effect contract and remain within the corresponding concrete domain. If a
-reactive method needs unsupported lexical or exceptional control flow, keep
-that logic in ordinary Julia and pass its result through a declared port.
 
 The [API reference](api.md) lists exported names; this page defines the
 algorithmic meaning and limits behind them.

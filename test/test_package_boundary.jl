@@ -1,8 +1,7 @@
 import Pkg
 using TOML
-import ReactiveKernelsNUTSExamples
 
-@testset "package boundary — generic RK core, external NUTS exemplar" begin
+@testset "package boundary — generic RK core, no iterative-method compiler" begin
     srcdir = joinpath(pkgdir(ReactiveKernels), "src")
     module_source = read(joinpath(srcdir, "ReactiveKernels.jl"), String)
     project = TOML.parsefile(joinpath(pkgdir(ReactiveKernels), "Project.toml"))
@@ -56,12 +55,25 @@ import ReactiveKernelsNUTSExamples
     end
     @test isempty(dependency_paths)
 
-    for file in ("kernel_nuts.jl", "kernel_nuts_native.jl", "hmc.jl", "reactive_nuts.jl")
+    # The iterative-method compiler and the sampler examples live in a
+    # separate package that depends on ReactiveKernels; ReactiveKernels
+    # defines none of its source files or names.
+    for file in ("binders.jl", "kernel_adaptation.jl", "kernel_codegen.jl",
+                 "kernel_control.jl", "kernel_execution.jl", "kernel_factory.jl",
+                 "kernel_lowering.jl", "kernel_methodir.jl",
+                 "kernel_structural_container.jl", "native_slot_compiler.jl",
+                 "native_slots.jl", "native_slots_factory.jl", "transpiled_program.jl",
+                 "kernel_nuts.jl", "kernel_nuts_native.jl", "hmc.jl", "reactive_nuts.jl")
         @test !isfile(joinpath(srcdir, file))
         @test !occursin("include(\"$file\")", module_source)
     end
 
     for name in (
+        :compile_stateful, :stateful_compiler_bindings, :functionalize_stateful,
+        :stateful_snapshot, :compile_state_transition, :initial_transition_state,
+        :drain_observations!, :rng_provider, :OrderedRNGReplay,
+        :prepare_transpiled, :transpiled_endpoint, :partial, :PartialFunction,
+        :NativeSlotCompiler, :MethodIR,
         :ReactivePhasePoint, :reactive_nuts_group, :CompiledNUTSState,
         :NUTSDiagnostics, :nuts_state, :step!, :warmup!, :welford_var,
         :compile_leapfrog, :compile_nuts, :compile_nuts_native, :_NutsFrame,
@@ -69,6 +81,25 @@ import ReactiveKernelsNUTSExamples
         @test !isdefined(ReactiveKernels, name)
         @test name ∉ names(ReactiveKernels)
     end
+
+    # Its front end too: stateful free methods, the object/view skeletons, the frozen
+    # method and recipe source, the definition-time callee and type snapshots, the
+    # primitive effect registry and `copy!!`. Method-bearing objects keep only what
+    # their pure endpoints read.
+    for name in (
+        Symbol("copy!!"), :KernelObject, :KernelView, :_Mode2KernelSkeleton,
+        :_kernel_mode2_expand, :_PrimitiveEffect, :_KernelIntrinsic,
+        :_KernelRegistration, :kernel_registration, :kernel_rebound,
+        :kernel_callee_registration, :kernel_callee_registrations,
+        :_CapturedCalleeRef, :_CapturedTypeAuthority, :kernel_type_authorities,
+        :kernel_methods, :kernel_recipe_ast, :kernel_module, :kernel_token,
+        :_kernel_freeze_ast, :_kernel_thaw_ast,
+    )
+        @test !isdefined(ReactiveKernels, name)
+        @test name ∉ names(ReactiveKernels)
+    end
+    @test fieldnames(ReactiveKernels._StatefulKernelSkeleton) ==
+          (:name, :spec_snapshot, :endpoint_templates)
 
     for name in (Symbol("@rk_pure"), Symbol("@rk_borrows"), Symbol("@rk_rng"))
         @test !isdefined(ReactiveKernels, name)
@@ -83,13 +114,5 @@ import ReactiveKernelsNUTSExamples
     retired_object_type = Symbol("Reactive", "Object")
     @test !isdefined(ReactiveKernels, retired_object_type)
     @test retired_object_type ∉ names(ReactiveKernels, all = true)
-    @test :partial in names(ReactiveKernels)
     @test :reactive_program in names(ReactiveKernels)
-
-    @test isfile(joinpath(pkgdir(ReactiveKernels), "examples", "nuts_runtime.jl"))
-    for file in ("kernel_factory.jl", "kernel_codegen.jl", "kernel_nuts.jl",
-                 "kernel_nuts_native.jl", "hmc.jl", "reactive_nuts.jl")
-        @test isfile(joinpath(pkgdir(ReactiveKernelsNUTSExamples), "src",
-                              "nuts_runtime", file))
-    end
 end

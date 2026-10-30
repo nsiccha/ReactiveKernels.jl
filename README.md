@@ -197,8 +197,8 @@ The base boundary is preserved by default, so adding diagnostics does not alter
 the ordinary call or return shape and unused observables generate no work. Use
 `merge(base, fragment; boundary = :fragment)` only when replacing both default
 inputs and outputs is intentional. This is the extension path for augmenting a
-NUTS graph with downstream-specific observables while retaining a drop-in
-regular-NUTS kernel.
+graph with downstream-specific observables while keeping a drop-in replacement
+for the original kernel.
 
 ## Reactive / incremental use
 
@@ -256,19 +256,9 @@ source identity and presentation acceptance.
 ## Preexisting ecosystem examples
 
 [`ReactiveKernelsCompatibilityExamples`](packages/ReactiveKernelsCompatibilityExamples/examples/preexisting.jl) ports the examples that
-predate this package and exercises them against the public API:
-
-- ReactiveObjects.jl's chain, diamond, and shared-intermediate gallery graphs;
-- ReactiveHMC.jl's Euclidean, Riemannian, and SoftAbs phase points, including
-  all three relativistic variants;
-- leapfrog, generalized leapfrog, implicit midpoint, and multistep integration.
-
-The scalar gallery kernels assert zero allocations after preparation. The HMC
-ports prepare their geometry and dynamics kernels once, then count the original
-potential/gradient/metric oracles. For example, four generalized-leapfrog
-fixed-point iterations call the combined metric-gradient oracle exactly five
-times—once for the starting position and once per changed position—and never
-call the three dominated partial oracles.
+predate this package and exercises them against the public API: ReactiveObjects.jl's
+chain, diamond, and shared-intermediate gallery graphs. The gallery kernels
+assert zero allocations after preparation.
 
 `test/test_handwritten_benchmarks.jl` uses BenchmarkTools to compare the
 prepared chain and shared-intermediate kernels with equivalent hand-written
@@ -387,7 +377,7 @@ graph objects on the hot path). See `test/test_stateless.jl` and
 julia --project=. -e 'using Pkg; Pkg.test()'   # full package suite
 julia --project=. -e 'using Pkg; Pkg.test(test_args=["benchmark"])'
 julia --project=. -e 'using Pkg; Pkg.test(test_args=["test_ad"])'
-julia --project=. -e 'using Pkg; Pkg.test(test_args=["test_stateful", "test_hmc.jl"])'
+julia --project=. -e 'using Pkg; Pkg.test(test_args=["test_stateful"])'
 julia --project=packages packages/setup.jl     # resolve nested local packages
 julia --project=packages packages/test.jl      # all nested package suites
 julia --project=packages packages/ReactiveKernelsKernelExamples/examples/demo.jl
@@ -397,9 +387,9 @@ julia --project=packages packages/ReactiveKernelsCompatibilityExamples/examples/
 
 Test arguments accept one or more known test basenames (with or without `.jl`)
 and run them once in the suite's canonical order after shared setup. The named
-groups are `core`, `acceptance`, `acceptance-compiler`, `acceptance-runtime`,
-`acceptance-samplers`, `acceptance-benchmarks`, `ad`, and `benchmark`;
-`acceptance` is the aggregate of the four finer acceptance groups. GitHub Actions
+groups are `core`, `acceptance`, `acceptance-runtime`, `acceptance-benchmarks`,
+`ad`, and `benchmark`; `acceptance` is the aggregate of the two finer acceptance
+groups. GitHub Actions
 runs `core` on every supported Julia/OS cell, while each platform-independent
 acceptance group runs once on the LTS Ubuntu lane. Test-file begin/finish markers
 keep long compiler work attributable without multiplying identical acceptance

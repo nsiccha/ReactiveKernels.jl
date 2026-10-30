@@ -212,7 +212,7 @@ instead.
 `prepare_nonallocating` is meant for calling one kernel directly, over and over:
 each cache is *borrowed* — it may share memory with an input and is overwritten
 on the next call. The reactive layers deliberately do **not** use it.
-[`ReactiveState`](online-stats.md) keeps computed, frozen, and checkpointed
+`ReactiveState` keeps computed, frozen, and checkpointed
 values around and reuses them later, so a borrowed cache overwritten by a
 subsequent call would silently corrupt one of those saved values; `get!`
 therefore uses ordinary [`prepare`](api.md)-style kernels, whose results the
@@ -221,9 +221,7 @@ state owns outright.
 If you want in-place updates *and* the reactive machinery, use `prepare_reactive`
 → `CompiledReactiveState`: `mutate!`/`touch!` edit the declared mutable inputs in
 place, and derived values live in buffers the state owns. Ownership,
-invalidation, and freeze/checkpoint all still work; for the public object/method
-form over the same state machinery, see [Stateful Welford
-moments](online-stats.md#stateful-welford-moments). Reach
+invalidation, and freeze/checkpoint all still work. Reach
 for a `prepare_nonallocating` kernel only for direct, single-caller use, and copy
 any mutable result you need to keep before the next call.
 

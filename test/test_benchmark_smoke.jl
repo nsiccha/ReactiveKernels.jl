@@ -7,8 +7,8 @@ import TOML
 using Test
 
 # Keeps the checked-in benchmark scripts from rotting outside the (external-dep)
-# benchmark runs: every script must PARSE, and the in-repo microbenchmark's parity
-# gates + 0-B receipts + typed/LLVM hard gate must still hold on a tiny build.
+# benchmark runs: every script must PARSE, and every checked-in receipt must
+# validate.
 
 const _BENCH_DIR = joinpath(@__DIR__, "..", "benchmark")
 const _REPOSITORY_ROOT = normpath(joinpath(_BENCH_DIR, ".."))
@@ -68,11 +68,8 @@ function _parses(path)
 end
 
 @testset "benchmark scripts parse (anti-rot)" begin
-    for name in ("nuts_comparison.jl", "nuts_comparison_body.jl",
-                 "nuts_microbench.jl", "nuts_microbench_ca9.jl",
-                 "_ca9_microbench_body.jl", "_repro_guard.jl",
+    for name in ("_repro_guard.jl",
                  "_enzyme_variants.jl", "enzyme_variants.jl",
-                 "gradient_probe.jl",
                  "distributions_comparison.jl",
                  "scalar_distribution_gallery_comparison.jl",
                  "structured_distributions_comparison.jl",
@@ -91,7 +88,6 @@ end
                  "sum_to_zero_comparison.jl",
                  "sum_to_zero_comparison_body.jl",
                  "_mnist_dataset_profiles.jl",
-                 joinpath("receipts", "validate_probprog_mcmc.jl"),
                  "practicalbayes_comparison.jl",
                  "practicalbayes_comparison_body.jl",
                  joinpath("receipts", "validate_practicalbayes.jl"),
@@ -100,7 +96,6 @@ end
                  "partial_evaluation_comparison.jl",
                  "partial_evaluation_comparison_body.jl",
                  joinpath("receipts", "validate_partial_evaluation.jl"),
-                 joinpath("receipts", "validate_nuts_reactant.jl"),
                  joinpath("receipts", "validate_eval_throughput.jl"),
                  joinpath("receipts", "validate_distributions.jl"),
                  joinpath("receipts", "validate_scalar_gallery_distributions.jl"),
@@ -150,8 +145,7 @@ end
 @testset "Enzyme variant benchmark entry points lower" begin
     for name in ("_enzyme_variants.jl", "enzyme_variants.jl",
                  "eight_schools_ad_comparison.jl", "sum_to_zero_comparison.jl",
-                 "mnist_logistic_ad_comparison.jl", "nuts_comparison.jl",
-                 "practicalbayes_comparison.jl", "gradient_probe.jl")
+                 "mnist_logistic_ad_comparison.jl", "practicalbayes_comparison.jl")
         @test isempty(_lowering_errors(joinpath(_BENCH_DIR, name)))
     end
 end
@@ -656,15 +650,6 @@ end
     end
 end
 
-@testset "ProbProg MCMC sampling receipt validates" begin
-    validator = joinpath(_BENCH_DIR, "receipts", "validate_probprog_mcmc.jl")
-    receipt = joinpath(_BENCH_DIR, "receipts", "probprog-mcmc-v1.toml")
-    @test isfile(receipt)
-    validation = _load_benchmark_validator(validator)
-    @test isempty(Base.invokelatest(
-        validation.validate_probprog_mcmc_receipt, receipt))
-end
-
 @testset "PracticalBayes PPL comparator receipt validates" begin
     validator = joinpath(
         _BENCH_DIR, "receipts", "validate_practicalbayes.jl")
@@ -674,16 +659,6 @@ end
     validation = _load_benchmark_validator(validator)
     @test isempty(Base.invokelatest(
         validation.validate_practicalbayes_receipt, receipt))
-end
-
-@testset "adaptive Reactant NUTS benchmark receipt validates" begin
-    validator = joinpath(
-        _BENCH_DIR, "receipts", "validate_nuts_reactant.jl")
-    receipt = joinpath(
-        _BENCH_DIR, "receipts", "nuts-reactant-v1.toml")
-    @test isfile(receipt)
-    include(validator)
-    @test isempty(validate_nuts_reactant_receipt(receipt))
 end
 
 @testset "evaluation throughput benchmark receipt validates" begin
@@ -755,14 +730,4 @@ end
         write(joinpath(det, "f.txt"), "y")
         @test_throws ErrorException _require_clean_detached_candidate(det)
     end
-end
-
-@testset "in-repo microbench smoke (parity + 0-B + typed/LLVM)" begin
-    # Define the microbench functions without running the full (slow) benchmark.
-    include(joinpath(_BENCH_DIR, "nuts_microbench.jl"))
-    evidence = microbench_smoke(3)          # runs the parity gates + hard gates
-    @test evidence.return_concrete
-    @test evidence.any_typed_slots == 0
-    @test evidence.dynamic_calls == 0
-    @test isempty(evidence.llvm_forbidden_symbols)
 end

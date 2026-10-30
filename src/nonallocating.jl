@@ -841,13 +841,14 @@ function _nonallocating_program(p::Plan; have_types = nothing,
     # No typed local declarations: the program is host-only, and declaring
     # `W::Matrix{Float64} = reshape(view(u, r), a, b)` would copy the lazy
     # value into a fresh matrix on every call. Declared plate outputs still
-    # fix their buffers' element types.
-    # The step program keys its caches on the operation calls
+    # fix their buffers' element types. The steps below read the names and
+    # value types of `lowered`, so its cells outline nothing (`outline`), and
+    # the step program keys its caches on the operation calls
     # (`_nonalloc_statement!`), so this emitter keeps every recipe's call in
     # the table rather than its inlined source.
     ast, ops, recipes = _lower_with_ops(lowered; exemplar_types = have_types,
                                         declare = false, recycle,
-                                        pushdowns = true,
+                                        pushdowns = true, outline = false,
                                         plate_element_types = true,
                                         inline_sources = false)
     isempty(passes) || (ast = transform(ast, passes...))
