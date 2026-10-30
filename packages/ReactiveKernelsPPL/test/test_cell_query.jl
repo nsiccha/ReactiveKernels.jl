@@ -573,3 +573,57 @@ end
         @test measured[1].compact_bytes == measured[2].compact_bytes
     end
 end
+
+# Each preparation used to generate the whole program twice: once to check that
+# the binding generates the program the graph was built from, once to find the
+# observation's plate. On a 224k-coordinate BRM program that was about 45 s per
+# preparation of any one cell (snag `brm-s-nlme-cell-d70abd20`). A binding is
+# now checked against a build once, and the plates are read from the program
+# the build recorded.
+@testset "cell query: another preparation does not generate the program again" begin
+    data = _cq_grouped_data()
+    plan = lower_rkppl(_CQ_GROUPED, data; conditioned = (:y,), mod = @__MODULE__)
+    bound = bind_data(plan, data)
+    built = build_kernel(bound)
+    u = collect(range(-0.4, 0.5; length = built.layout.total))
+    pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+    check() = @allocated ReactiveKernelsPPL._check_built_program(built, bound)
+    # `prepare_query` above checked this binding: no check generates it again.
+    q = prepare_cell_query(built, bound, :y)
+    hit, again = check(), check()
+    @test hit < 10_000
+    @test again < 10_000
+    @test [q(u, i) for i in eachindex(data.y)] ≈ [sum(x; init = 0.0) for x in pointwise.y]
+
+    # Another binding of the same program (its own column table) is checked
+    # once, on its first preparation.
+    rebound = bind_data(plan, data)
+    generate = @allocated ReactiveKernelsPPL._check_built_program(built, rebound)
+    @test generate > 100 * hit
+    @test (@allocated ReactiveKernelsPPL._check_built_program(built, rebound)) < 10_000
+
+    # A binding of another program (one group fewer, so `Z` has other sizes) is
+    # refused on every preparation, before and after the first one.
+    fewer = map(x -> x isa AbstractVector ? x[1:4] : x, data)
+    other = bind_data(plan, fewer)
+    for _ in 1:2
+        @test_throws ContractValidationError prepare_cell_query(built, other, :y)
+        @test_throws ContractValidationError prepare_query(built, other, :pointwise)
+    end
+    # A binding checked against one build is checked against another.
+    own = build_kernel(other)
+    @test prepare_cell_query(own, other, :y) isa CellQuery
+    @test_throws ContractValidationError prepare_cell_query(own, bound, :y)
+
+    # A graph made outside `build_kernel` records no program: the plates are
+    # found in the program the binding generates, as before.
+    unrecorded = prepare_cell_query((; built.spec, built.layout), bound, :y)
+    @test [unrecorded(u, i) for i in eachindex(data.y)] == [q(u, i) for i in eachindex(data.y)]
+
+    # The record holds neither the binding's column table nor the program.
+    record = ReactiveKernelsPPL._structural_cache(bound).entries[
+        ReactiveKernelsPPL._checked_program_key(bound)]
+    @test record.columns isa WeakRef && record.columns.value === bound.columns
+    @test all(ref -> ref isa WeakRef, record.programs)
+    @test any(ref -> ref.value === built.program, record.programs)
+end

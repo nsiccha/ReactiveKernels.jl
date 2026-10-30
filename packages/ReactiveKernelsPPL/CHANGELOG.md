@@ -16,6 +16,21 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.16
+
+- A query preparation (`prepare_query`, `prepare_sampler`, `prepare_query_ad`,
+  `prepare_cell_query`, `prepare_cell_sampler`,
+  `prepare_compact_cell_sampler`, `prepare_predictive`, `jax_source`) checks
+  that its binding generates the build's program once per binding and build,
+  and a cell query reads its observation's plate from the program the build
+  recorded. On 0.1.15 and earlier every preparation generated the whole
+  program again for the check, and a cell query generated it a second time,
+  however small its query: on a 223,941-coordinate BRM program (1,984
+  statements) each cell query and each compact cell sampler took about 50 s,
+  against 0.02 s and 0.10 s now once the cell has compiled. The first
+  preparation of a binding still generates the program once. A binding of
+  another program is refused on every preparation, as before.
+
 ## 0.1.15
 
 - A `@plate` cell that computes an array per index (`b[i, 1:1] = …`) looks a
