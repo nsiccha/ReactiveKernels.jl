@@ -755,3 +755,69 @@ end
     @test all(m -> m.values[2] ≈ m.value ≈ m.compact_value, measured)
     @test all(m -> m.parity && m.central, measured)
 end
+
+# A covariate completed by a kernel that gathers straight from an inline
+# `vcat` of its observed and drawn entries, as BRM emits it (snag
+# `inline-vcat-gath-bb73ae09`): each subject's cell computes the completion at
+# its own row, so an observed subject reads no drawn entry and a missing one
+# reads only its own, as with `stacked = vcat(...)` and `stacked[order]`.
+ReactiveKernels.@kernel _cq_completed_covariate(observed, drawn, order) = begin
+    completed = (vcat(observed, drawn))[order]
+    return completed
+end
+
+const _CQ_INLINE_COMPLETION = quote
+    a ~ Normal(0, 1)
+    sigma ~ Exponential(1)
+    z_mis[axes(missing_rows, 1)] .~ Normal.(0, 1)
+    y_mis = 0 .+ 1 .* z_mis
+    w = _cq_completed_covariate(w_observed, y_mis, w_order)
+    y .~ Normal.(a .+ w, sigma)
+end
+
+# Even subjects observe the covariate; `w_order` is each subject's position in
+# `vcat(w_observed, y_mis)`.
+function _cq_inline_completion_data(n)
+    seen = [iseven(j) for j in 1:n]
+    nobs = count(seen)
+    order, o, m = zeros(Int, n), 0, 0
+    for j in 1:n
+        order[j] = seen[j] ? (o += 1) : nobs + (m += 1)
+    end
+    (; w_observed = collect(range(0.2, 1.4; length = nobs)),
+       missing_rows = collect(1:(n - nobs)), w_order = order,
+       y = [0.3 * sin(j) for j in 1:n])
+end
+
+@testset "cell query: a kernel's gather from an inline vcat costs the cell's own rows" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    measured = map((20, 2_000)) do n
+        data = _cq_inline_completion_data(n)
+        bound, built = _cq_bound(_CQ_INLINE_COMPLETION, data, (:y,))
+        q = prepare_cell_query(built, bound, :y)
+        u = collect(range(-0.4, 0.5; length = built.layout.total))
+        pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u).y
+        values = [q(u, i) for i in (1, 2, n)]
+        q(u, 3)
+        s = prepare_cell_sampler(built, bound, :y, u; backend)
+        names = coordinate_names(built.layout)
+        cells = map((2, 3)) do i
+            g = similar(u)
+            value, _ = cell_value_and_gradient!(s, g, u, i)
+            j = last(findall(!iszero, g))
+            (; value, drawn = filter(x -> startswith(String(x), "z_mis"), names[findall(!iszero, g)]),
+               central = isapprox(g[j], _cq_central(v -> q(v, i), u, j); rtol = 1e-5))
+        end
+        (; values, reference = pointwise[[1, 2, n]], bytes = (@allocated q(u, 3)), cells,
+           cell_values = [q(u, i) for i in (2, 3)])
+    end
+    @test all(m -> m.values ≈ m.reference, measured)
+    @test measured[1].bytes == measured[2].bytes
+    for m in measured
+        @test [c.value for c in m.cells] ≈ m.cell_values
+        @test all(c -> c.central, m.cells)
+        # Subject 2 observes its covariate; subject 3 is the second missing one.
+        @test isempty(m.cells[1].drawn)
+        @test m.cells[2].drawn == [Symbol("z_mis.2")]
+    end
+end

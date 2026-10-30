@@ -168,13 +168,15 @@ end
 # `(native closure, parameter names, module)` of an eligible source operation,
 # or `nothing`. `branches`: whether a lazy branch's all-in-one closure counts
 # (`_lane_source_expr` only; the slice and window analyses read other shapes).
-function _lane_source_closure(r::Recipe; branches::Bool = false)
+# `outlined`: `r` is a part a cell lowering outlined from an authored
+# operation (`_cell_outline`), which carries no twin of its own.
+function _lane_source_closure(r::Recipe; branches::Bool = false, outlined::Bool = false)
     op = r.op
     op isa _KernelSourceOp || return nothing
     kernel_sourceop_form(op) === :fused || return nothing
     # Ordinary authored operations carry their ignore-mode twin; the twin
     # itself (selected by `on_error = :ignore`) does not, and its body differs.
-    op.ignored_throws === nothing && return nothing
+    outlined || op.ignored_throws !== nothing || return nothing
     r.source isa Expr || return nothing
     branches || !(op.f isa _KernelBranch) || return nothing
     f = _kernel_native_source(_lane_source_callable(op.f))

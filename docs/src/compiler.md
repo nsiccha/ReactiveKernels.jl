@@ -1026,6 +1026,22 @@ supports these producers:
   `pred = plate(rows) do r; f(log_k[r]) end` computes `pred` and `log_k` at
   row `i` only.
 
+These producers can also be written inside one expression, such as a gather
+straight from an inline `vcat`, `completed = vcat(observed, drawn)[order]`, or
+`observed .+ mask .* vcat(free, grouped)[lookup]`. The cell lowering outlines
+the inner call into a value of its own, so both are computed at the rows read,
+as with the two-statement spelling `stacked = vcat(observed, drawn)` and
+`completed = stacked[order]`. A call is outlined where the producers above read
+a value by name: a gather's source or index, an operand of `vcat`, `hcat` or
+`*`, or an operand of a dotted expression that is not itself dotted (a nested
+dotted call stays fused). Only strict subexpressions are outlined, never a
+branch arm, a generator or a closure body, and the parts apply the authored
+operations to the same operands in the same order, so values are unchanged. A
+recipe is outlined only when the cell then computes it at its rows; otherwise
+it is lowered as written. Cheap expressions are not outlined: a gather `x[pos]`
+written as a `vcat` operand (`vcat(x[pos], u)`) still makes that `vcat` read
+whole.
+
 The producer's own operation runs on views of its row-aligned operands at the
 rows read; an operand that broadcasting extrudes is passed whole, or repeated
 at several rows. A value it gathers from is computed at the gathered rows by

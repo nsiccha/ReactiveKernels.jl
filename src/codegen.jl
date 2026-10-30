@@ -4395,8 +4395,17 @@ function _lower_with_ops_collecting(p::Plan;
                          declare::Bool = inline_embedded && _owns_array_regions(p),
                          recycle::Vector{Pair{ValueId,Symbol}} = Pair{ValueId,Symbol}[],
                          pushdowns::Bool = isempty(recycle),
+                         outline::Bool = pushdowns,
                          plate_element_types::Bool = false,
                          type_hints = nothing, exemplar_types = nothing)
+    # Values plate cells read only at their own row, computed there
+    # (`_cell_pushdowns`, cell_windows.jl). With `outline`, inline
+    # subexpressions that block that become recipes of their own first
+    # (`_cell_outlined_pushdowns`), so `p` is the plan lowered from here on.
+    cells = nothing
+    if inline_embedded && pushdowns && type_hints === nothing
+        p, cells = outline ? _cell_outlined_pushdowns(p) : (p, _cell_pushdowns(p))
+    end
     g = p.graph
     names = _varnames(p)
     nm(v) = names[canon_id(g, v.id)]
@@ -4442,10 +4451,6 @@ function _lower_with_ops_collecting(p::Plan;
     # Column projections a native scan writes directly
     # (`_authored_scan_column_projections`); each keeps its table slots.
     scan_columns = Set{Int}()
-    # Values plate cells read only at their own row, computed there
-    # (`_cell_pushdowns`, cell_windows.jl).
-    cells = inline_embedded && pushdowns &&
-        type_hints === nothing ? _cell_pushdowns(p) : nothing
     for r in p.recipes
         r.id in skipped_recipes && continue
         if r.id in terminal_skips

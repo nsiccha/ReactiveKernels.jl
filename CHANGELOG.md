@@ -16,6 +16,22 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.19
+
+- One cell of a plate (`plate_cell`; RKPPL's `prepare_cell_query` and cell
+  samplers) computes a gather straight from an inline `vcat`,
+  `completed = vcat(observed, drawn)[order]`, at the rows it reads, as it
+  computes the two-statement spelling `stacked = vcat(observed, drawn)` and
+  `completed = stacked[order]`. Earlier versions computed that recipe whole in
+  every cell, `vcat` included, so every cell read every drawn entry. The cell
+  lowering now outlines a call written where a row form reads a named value
+  (a gather's source or index, an operand of `vcat`, `hcat` or `*`, or a
+  non-dotted operand of a dotted expression, as in
+  `observed .+ mask .* vcat(free, grouped)[lookup]`) into a value of its own,
+  along the recipe's strict subexpressions, and keeps it when the recipe is
+  then computed at rows. Values are unchanged. `prepare_nonallocating` keeps
+  such a recipe as written.
+
 ## 0.1.18
 
 - A cell (`plate_cell`; RKPPL's `prepare_cell_query` and cell samplers)
