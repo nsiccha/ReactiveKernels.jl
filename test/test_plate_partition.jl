@@ -543,6 +543,13 @@ end
     @test gradient ≈ reference
     @test_throws ArgumentError plate_partition(_pp_subjects, :dens; by = :subject, index = :label,
                                                plan = :label)
+    # Bound values a plan may hold: index bookkeeping, nested (a ragged row
+    # structure), never data.
+    @test ReactiveKernels._plan_bookkeeping([[1, 2], [3]])
+    @test ReactiveKernels._plan_bookkeeping(Dict(1 => 2:3))
+    @test ReactiveKernels._plan_bookkeeping((1, [2, 3]))
+    @test !ReactiveKernels._plan_bookkeeping([1.0, 2.0])
+    @test !ReactiveKernels._plan_bookkeeping([[1.0]])
     # Without exemplars the plan reads `u` through the empty stand-ins and
     # cannot be typed: the requested plan port is refused, never dropped.
     @test_throws ArgumentError prepare(spec; have = (_PP_HAVE..., :label, :plan),

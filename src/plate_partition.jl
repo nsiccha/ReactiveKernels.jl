@@ -836,11 +836,18 @@ _plan_eligible_op(op) = op isa Union{_PartitionTable,_PartitionLabel,_PartitionL
 # hidden operands, and a derivative never meets them through the plan.
 _plan_eligible_op(op::_BoundConstant) = _plan_bookkeeping(op.value)
 _plan_bookkeeping(::Integer) = true
-_plan_bookkeeping(v::AbstractArray) = eltype(v) <: Integer
-_plan_bookkeeping(v::AbstractDict) =
-    Base.valtype(v) <: Integer || Base.valtype(v) <: AbstractArray{<:Integer}
+_plan_bookkeeping(v::AbstractArray) = _plan_bookkeeping_type(eltype(v))
+_plan_bookkeeping(v::AbstractDict) = _plan_bookkeeping_type(Base.valtype(v))
 _plan_bookkeeping(v::Tuple) = all(_plan_bookkeeping, v)
 _plan_bookkeeping(@nospecialize(_)) = false
+# An element type of index bookkeeping: integers, or arrays, ranges and
+# tuples of them, nested (a ragged row structure is a vector of row vectors).
+function _plan_bookkeeping_type(@nospecialize(T))
+    T <: Integer && return true
+    T <: AbstractArray && return _plan_bookkeeping_type(eltype(T))
+    T <: Tuple && T isa DataType && return all(_plan_bookkeeping_type, T.parameters)
+    false
+end
 
 # Whether `ex` reads nothing that varies per call: no data symbol (an unbound
 # HAVE port other than the label, or a value computed from one) and no
