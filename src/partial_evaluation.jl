@@ -584,10 +584,13 @@ end
 # enclosing cell and keep a cut of the selected plan as the lazy residual arm.
 # Nested speculative nodes retain their refusal keys, so a throwing operation
 # is restored beneath every guard it originally had on the next attempt.
-function _partial_speculate_graph_arm!(nodes, plans, names, mapping,
-                                       r::Recipe, leaf, reads, refused)
-    leaf.spec === nothing && return
-    arm = _plate_arm_plan(leaf.spec)
+# One instance for every arm (`@nospecialize(leaf)`): the leaf names its
+# arm's source function, a type of its own per arm (55 instances, 3.3 s of
+# the atlas `problem` stage).
+Base.@nospecializeinfer function _partial_speculate_graph_arm!(nodes, plans, names, mapping,
+                                       r::Recipe, @nospecialize(leaf), reads, refused)
+    getfield(leaf, :spec) === nothing && return
+    arm = _plate_arm_plan(getfield(leaf, :spec))
     length(arm.want) == 1 || return
     any(q -> q.effectful || length(q.outputs) != 1 ||
              q.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
@@ -601,8 +604,8 @@ function _partial_speculate_graph_arm!(nodes, plans, names, mapping,
     # As for expression arms, split mixed computations only. Returning a
     # cached array as the whole arm would publish shared bind-time storage.
     all(v -> canon_id(g, v.id) in bound, arm.have) && return
-    prefix_key = (:arm_recipe, r.id, leaf.path)
-    node_key = (:arm_node, r.id, leaf.path)
+    prefix_key = (:arm_recipe, r.id, getfield(leaf, :path))
+    node_key = (:arm_node, r.id, getfield(leaf, :path))
     excluded = Set(q.id for q in arm.recipes if (prefix_key..., q.id) in refused)
     nested_refused = Set(key[4] for key in refused
                          if length(key) == 4 && key[1:3] == node_key)
@@ -644,8 +647,8 @@ function _partial_speculate_graph_arm!(nodes, plans, names, mapping,
     native = _partial_arm_function(cut)
     indices = Tuple(vcat([positions[v.name] for v in arm.have],
                          [available[canon_id(ag, v.id)] for v in frontier]))
-    plans[leaf.path] = (; native, positions = indices, spec = cut)
-    mapping[leaf.source] = Expr(:call, QuoteNode(native), (names[i] for i in indices)...)
+    plans[getfield(leaf, :path)] = (; native, positions = indices, spec = cut)
+    mapping[getfield(leaf, :source)] = Expr(:call, QuoteNode(native), (names[i] for i in indices)...)
     nothing
 end
 

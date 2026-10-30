@@ -2437,7 +2437,7 @@ function _plate_reduction_plan(inner::Plan, inner_kernel, dependencies,
     recipe = inner.recipes[recipe_index]
     roots = dynamic(want)
     isempty(roots) && return nothing
-    _plate_reduction_kind(inner_kernel.ops[recipe_index], recipe, recipe_index,
+    _plate_reduction_kind(getfield(inner_kernel, :ops)[recipe_index], recipe, recipe_index,
                           roots, input -> dynamic(canon_id(graph, input.id)))
 end
 
@@ -2834,7 +2834,7 @@ end
 Base.@nospecializeinfer function _plate_shared_branch(
         @nospecialize(inner_kernel), @nospecialize(atomic), @nospecialize(callargs),
         @nospecialize(callvalues))
-    inner = inner_kernel.plan
+    inner = getfield(inner_kernel, :plan)
     for r in inner.recipes
         (r.effectful || length(r.outputs) != 1 ||
          r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
@@ -3237,7 +3237,7 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_native!(
     types = _plate_cell_types!(runtime_ops, runtime_recipes, inner_kernel, atomic,
         callargs, callvalues, raw_arguments, input_type_hints)
     if element_type === nothing
-        inner = inner_kernel.plan
+        inner = getfield(inner_kernel, :plan)
         inferred = only(_bind_native_type_exprs!(body, Any[get(types.plate_type_exprs,
             canon_id(inner.graph, only(inner.want).id), GlobalRef(Core, :Any))]))
         element_type = gensym(:plate_eltype)
@@ -3301,11 +3301,12 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_arms!(
 end
 
 # `recycled`: the lane slot of the recipe's value (`_lower_authored_plate_loop_native!`),
-# which a scan, dotted call or slice fills instead of allocating. `op`: what
-# the table holds at `operation` (the cell kernel's own operation for this
-# recipe), or `nothing` when the caller does not know.
+# which a scan, dotted call or slice fills instead of allocating.
+# `slot_inlines`: whether the table holds the recipe's authored closure at
+# `operation` (the cell kernel's own lowering inlined it) rather than its
+# operation; a `Bool`, so the keyword call has one instance for every plate.
 function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots;
-                                     recycled = nothing, op = nothing)
+                                     recycled = nothing, slot_inlines::Bool = false)
     if recipe.op isa _AuthoredScanOp
         _lower_authored_scan_native!(body, recipe.op, args, out, slots.offset;
                                      slots.type_offset, recycled)
@@ -3330,8 +3331,8 @@ function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots;
         # runs that source over its arguments here too; a slot that keeps the
         # operation is called.
         slot = _operation_slot(operation)
-        inlined = op === nothing || op isa _KernelSourceOp || slot === nothing ?
-            nothing : _inline_source_form(recipe, args, slot)
+        inlined = slot_inlines && slot !== nothing ?
+            _inline_source_form(recipe, args, slot) : nothing
         push!(body.args, Expr(:(=), out,
             inlined === nothing ? Expr(:call, operation, args...) : inlined[1]))
     end
@@ -3530,10 +3531,10 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     # plate, of its element type; the cells are written into it in place and
     # the binding is left alone (a strip refill, `_lower_authored_scan_strips!`).
     inner_kernel = op.kernel
-    inner = inner_kernel.plan
+    inner = getfield(inner_kernel, :plan)
     length(inner.want) == 1 || throw(ArgumentError(
         "an authored plate body must have exactly one distinguished result"))
-    length(inner_kernel.ops) == length(inner.recipes) || throw(ArgumentError(
+    length(getfield(inner_kernel, :ops)) == length(inner.recipes) || throw(ArgumentError(
         "an authored plate body must lower to one operation per transparent scalar recipe"))
 
     atomic = typeof(op).parameters[2]
@@ -3693,7 +3694,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         input_type_hints = nothing, element_type = nothing, into::Bool = false,
         unswitch::Bool = true, cells::Bool = true, nonempty::Bool = false,
         types = nothing, total_fold = sum)
-    inner = inner_kernel.plan
+    inner = getfield(inner_kernel, :plan)
     if unswitch
         branch = _plate_shared_branch(inner_kernel, atomic, callargs, callvalues)
         branch === nothing || return _lower_plate_shared_branch_native!(
@@ -3750,10 +3751,10 @@ Base.@nospecializeinfer function _plate_cell_types!(
         runtime_ops, runtime_recipes, @nospecialize(inner_kernel),
         @nospecialize(atomic), @nospecialize(callargs), @nospecialize(callvalues),
         raw_arguments, input_type_hints; result_slot::Bool = false)
-    inner = inner_kernel.plan
+    inner = getfield(inner_kernel, :plan)
     op_offset = length(runtime_ops)
-    append!(runtime_ops, inner_kernel.ops)
-    append!(runtime_recipes, inner_kernel.lowered_recipes)
+    append!(runtime_ops, getfield(inner_kernel, :ops))
+    append!(runtime_recipes, getfield(inner_kernel, :lowered_recipes))
     scan_offsets = _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
     lane_arms = _plate_lane_arm_slots!(runtime_ops, runtime_recipes, inner,
                                        atomic, callvalues)
@@ -3876,16 +3877,25 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
                   k === nothing ? nothing : last(slotted[k]))
     # A scan read only through one slice is emitted where that slice is read
     # (`_lower_authored_scan_slice_native!`).
+    # The closure's fields take its captured variables' declared types: with
+    # the plate's own argument and kernel types, every plate had its own
+    # closure type and compiled body (256 instances, 5.4 s of the atlas
+    # `problem` stage). Declared `Any`, one closure type serves every plate.
+    local kernel_any::Any = inner_kernel
+    local atomic_any::Any = atomic
+    local callargs_any::Any = callargs
+    local callvalues_any::Any = callvalues
+    local prepared_any::Any = prepared_arguments
     function lower_recipe!(block, recipe_index, args, out, operation, looped)
         recipe_index in sliced_scans && return block
         haskey(slices, recipe_index) || return _lower_plate_recipe_native!(
             block, inner.recipes[recipe_index], args, out, operation,
             get(scan_offsets, recipe_index, nothing); recycled = slot_of(recipe_index),
-            op = inner_kernel.ops[recipe_index])
+            slot_inlines = !(getfield(kernel_any, :ops)[recipe_index] isa _KernelSourceOp))
         scan_index, demand = slices[recipe_index]
         scan_recipe = inner.recipes[scan_index]
         scan_args = Any[_authored_plate_scalar_ref(
-            inner, locals, callargs, callvalues, prepared_arguments, atomic,
+            inner, locals, callargs_any, callvalues_any, prepared_any, atomic_any,
             input, index, looped) for input in scan_recipe.inputs]
         slots = scan_offsets[scan_index]
         _lower_authored_scan_slice_native!(block, scan_recipe.op, scan_args,
