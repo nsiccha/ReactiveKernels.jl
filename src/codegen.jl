@@ -3877,27 +3877,29 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
                   k === nothing ? nothing : last(slotted[k]))
     # A scan read only through one slice is emitted where that slice is read
     # (`_lower_authored_scan_slice_native!`).
-    # The closure's fields take its captured variables' declared types: with
-    # the plate's own argument and kernel types, every plate had its own
-    # closure type and compiled body (256 instances, 5.4 s of the atlas
-    # `problem` stage). Declared `Any`, one closure type serves every plate.
-    local kernel_any::Any = inner_kernel
-    local atomic_any::Any = atomic
-    local callargs_any::Any = callargs
-    local callvalues_any::Any = callvalues
-    local prepared_any::Any = prepared_arguments
+    # Julia parametrizes a closure's type by its captured values' types: with
+    # the plate's own kernel, argument and schedule types captured directly,
+    # every plate had its own `lower_recipe!` type and compiled body (256
+    # instances, 5.5 s of the atlas `problem` stage). Captured through
+    # `Ref{Any}` cells, one closure type serves every plate.
+    captured = Ref{Any}((; inner_kernel, atomic, callargs, callvalues,
+                           prepared_arguments, slices, sliced_scans, scan_offsets))
     function lower_recipe!(block, recipe_index, args, out, operation, looped)
-        recipe_index in sliced_scans && return block
-        haskey(slices, recipe_index) || return _lower_plate_recipe_native!(
+        # `getfield`, not `.`: the cell is `Any`, and a property read would
+        # compile once per plate's record type.
+        c = captured[]
+        recipe_index in getfield(c, :sliced_scans) && return block
+        haskey(getfield(c, :slices), recipe_index) || return _lower_plate_recipe_native!(
             block, inner.recipes[recipe_index], args, out, operation,
-            get(scan_offsets, recipe_index, nothing); recycled = slot_of(recipe_index),
-            slot_inlines = !(getfield(kernel_any, :ops)[recipe_index] isa _KernelSourceOp))
-        scan_index, demand = slices[recipe_index]
+            get(getfield(c, :scan_offsets), recipe_index, nothing); recycled = slot_of(recipe_index),
+            slot_inlines = !(getfield(getfield(c, :inner_kernel), :ops)[recipe_index] isa _KernelSourceOp))
+        scan_index, demand = getfield(c, :slices)[recipe_index]
         scan_recipe = inner.recipes[scan_index]
         scan_args = Any[_authored_plate_scalar_ref(
-            inner, locals, callargs_any, callvalues_any, prepared_any, atomic_any,
+            inner, locals, getfield(c, :callargs), getfield(c, :callvalues),
+            getfield(c, :prepared_arguments), getfield(c, :atomic),
             input, index, looped) for input in scan_recipe.inputs]
-        slots = scan_offsets[scan_index]
+        slots = getfield(c, :scan_offsets)[scan_index]
         _lower_authored_scan_slice_native!(block, scan_recipe.op, scan_args,
             slots.offset, demand, args, out, operation; slots.type_offset)
     end
