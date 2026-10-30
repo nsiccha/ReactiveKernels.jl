@@ -223,11 +223,7 @@ speculation with preserved semantics is not a failing branch check merely
 because the executable uses a selection.
 
 These are required constraints, not a claim that every existing path already
-conforms. Every functional stateful method with authored control flow lowers
-through the retained control program, and host-drained observational records
-travel in its loop carry as structure-of-arrays storage written by one dynamic
-slot write per call site (the [compiler](compiler.md) page describes it), so
-no stateful path replicates a body per admitted iteration.
+conforms.
 
 Standalone reproducers under `benchmark/` (the backend and its AD engine
 only, no ReactiveKernels code) isolate the remaining backend limitations:

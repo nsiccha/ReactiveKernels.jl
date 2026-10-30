@@ -41,8 +41,7 @@ function _complete_row()
         "dim" => 2,
         "primal_turing" => 1.0, "primal_stan" => 1.0,
         "gradient_turing" => 1.0, "gradient_stan" => 1.0,
-        "hmc_ahmc_turing" => 1.0, "primal_rk" => 1.0,
-        "gradient_rk" => 1.0, "hmc_rk_native" => 1.0,
+        "primal_rk" => 1.0, "gradient_rk" => 1.0,
         "primal_opt_stan" => "deferred",
         "primal_further_turing" => "deferred", "gradient_opt_stan" => "deferred",
         "gradient_further_turing" => "deferred", "parity_pass" => true,
@@ -63,7 +62,7 @@ end
     @test "all80_receipt.jl" in files
     @test all(f -> endswith(f, ".jl"), files)
     @test all(f -> isfile(joinpath(@__DIR__, f)), files)
-    @test count(f -> occursin("eight_schools_density", f), files) == 1
+    @test !any(f -> occursin("sampler_transpiler", f), files)
     @test length(rand(RandomDevice(), UInt8, 16)) == 16
 end
 
@@ -247,5 +246,19 @@ end
     aggregate([frozen_native], frozen_out;
         meta = Dict{String,Any}("args" => ["m1"]))
     @test !haskey(TOML.parsefile(frozen_out)["meta"], "provenance")
+end
+@testset "historical HMC cells validate only where a row carries them" begin
+    tmp = mktempdir()
+    current = joinpath(tmp, "current.toml")
+    write_phase(current, "native", Dict("m1" => _complete_row()))
+    @test isempty(All80Receipt.validate(current))
+    historical = joinpath(tmp, "historical.toml")
+    write_phase(historical, "native", Dict("m1" => merge(_complete_row(),
+        Dict{String,Any}("hmc_rk_native" => 5.0, "hmc_ahmc_turing" => 7.0))))
+    @test isempty(All80Receipt.validate(historical))
+    blank = joinpath(tmp, "blank.toml")
+    write_phase(blank, "native", Dict("m1" => merge(_complete_row(),
+        Dict{String,Any}("hmc_rk_native" => ""))))
+    @test any(issue -> occursin("hmc_rk_native", issue), All80Receipt.validate(blank))
 end
 println("BATCH1_PROVENANCE_FIXTURE_OK")

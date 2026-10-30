@@ -2799,7 +2799,7 @@ function _resolve_call_head(fn, mod::Module, names::Set{Symbol}, where;
         binding isa GlobalRef || _sfail("$where constructs an endpoint from " *
             "`$(repr(fn.args[1]))`, which is not a module-visible kernel object")
         object = getglobal(binding.mod, binding.name)
-        object isa Union{KernelObjectSpec,ReactiveKernels._StatefulKernelSkeleton} ||
+        object isa Union{KernelObjectSpec,ReactiveKernels._KernelObjectSkeleton} ||
             _sfail("$where constructs an endpoint from `$(repr(fn.args[1]))`, " *
                    "which is not a method-bearing kernel object")
         endpoint = fn.args[2].value

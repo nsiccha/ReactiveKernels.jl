@@ -42,7 +42,7 @@ using Test
 
     for page in (
         "distributions-reactant.md", "eight-schools-reactant.md",
-        "mnist-reactant.md", "eval-throughput.md", "nuts-reactant.md",
+        "mnist-reactant.md", "eval-throughput.md",
     )
         @test occursin("\"$page\"", make)
     end
@@ -82,13 +82,6 @@ using Test
     @test !occursin("execute_ppl_example", eight_schools_reactant)
     @test !occursin("execute_ppl_example", mnist_reactant)
 
-    nuts = read(joinpath(root, "docs", "src", "nuts.md"), String)
-    walnuts = read(joinpath(root, "docs", "src", "walnuts.md"), String)
-    @test occursin("Compiler/runtime execution is disabled in docs", nuts)
-    @test occursin("Compiler status: not executed during the docs build", walnuts)
-    @test occursin("NUTS source and receipts (not executed)", make)
-    @test occursin("WALNUTS-D source (not executed)", make)
-
     @test !occursin("Building blocks", make)
     @test !occursin("Kernel execution and tools", make)
 
@@ -98,11 +91,6 @@ using Test
         # `render_review_status(:frozen_ppl)` banners removed), and
         # gaussian-mixture.md was deleted, so :frozen_ppl no longer applies to any
         # page. Kept in lockstep with check_rendered.jl's expected_review_states.
-        :frozen_sampling => (
-            "pathfinder.md", "reactivehmc-corpus.md", "nuts.md",
-            "nutpie-diagonal.md", "walnuts.md", "online-stats.md",
-            "nuts-reactant.md",
-        ),
         :frozen_bijectors => ("bijectors.md",),
         :review_pending_nonallocating => ("nonallocating.md",),
     )

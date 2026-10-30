@@ -9,13 +9,6 @@ using LinearAlgebra
 
 _split(x) = (sum(x), x .* 2)                       # (scalar, vector) multi-output
 
-@testset "deterministic getter AST — same-signature repeated dual/welford share type" begin
-    @test typeof(dual_averaging_state(0.1)) === typeof(dual_averaging_state(0.2))
-    @test typeof(welford_var(3)) === typeof(welford_var(3))
-    @test typeof(dual_averaging_state(0.1f0)) !== typeof(dual_averaging_state(0.1))
-    @test typeof(welford_var(3, Float32)) !== typeof(welford_var(3, Float64))
-end
-
 # Direct prepare_reactive multi-output on the pure default path: a
 # multi-output recipe prepared twice from the same spec yields the SAME program type
 # and computes correctly.
@@ -44,17 +37,6 @@ end
     code_lines = filter(l -> !occursin(r"^\s*#", l), split(fn, "\n"))
     @test !any(l -> occursin("gensym(", l), code_lines)   # only comments mention it
 end
-
-@testset "mixed pure+in-place NUTS group — same signature shares one type" begin
-    _mg_grad!(g, q) = (copyto!(g, q); 0.5 * sum(abs2, q))
-    metric = Matrix{Float64}(I, 4, 4)
-    a = reactive_nuts_group(_mg_grad!, metric, [1.0, 2, 3, 4], [0.1, 0.2, 0.3, 0.4])
-    b = reactive_nuts_group(_mg_grad!, metric, [5.0, 6, 7, 8], [0.5, 0.6, 0.7, 0.8])
-    @test typeof(a) === typeof(b)                          # in-place bundle AST stable too
-    @test typeof(reactive_program(a)) === typeof(reactive_program(b))
-    @test a.dham ≈ b.dham                                 # both compute (behavior intact)
-end
-
 
 # --- prepared-kernel codegen: gensym-free RGF bodies ----------------------------
 # Lowering mints scratch locals with `gensym` (plate axes/indices, scan carries,

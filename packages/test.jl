@@ -6,9 +6,6 @@ const EXAMPLE_PACKAGES = (
     "ReactiveKernelsBatchingExamples",
     "ReactiveKernelsPPLExamples",
     "ReactiveKernelsCompatibilityExamples",
-    "ReactiveKernelsNUTSExamples",
-    "ReactiveKernelsStreamingStats",
-    "ReactiveKernelsHMCDiagnostics",
     "ReactiveKernelsPPL",
 )
 

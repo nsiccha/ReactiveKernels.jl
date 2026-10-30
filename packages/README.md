@@ -11,12 +11,7 @@ ReactiveKernels
 │   └── ReactiveKernelsPPLExamples
 ├── ReactiveKernelsPPL
 ├── ReactiveKernelsBatchingExamples
-├── ReactiveKernelsCompatibilityExamples
-├── ReactiveKernelsNUTSExamples
-├── ReactiveKernelsStreamingStats
-└── ReactiveKernelsHMCDiagnostics
-    ├── ReactiveKernelsNUTSExamples
-    └── ReactiveKernelsStreamingStats
+└── ReactiveKernelsCompatibilityExamples
 
 docs → every package above
 ```
@@ -28,7 +23,7 @@ modules; it does not copy their formulas or flatten their colliding exports.
 plan and generates fittable `@kernel` programs (layout, transforms,
 preprocessing, sampler queries).
 The general kernel-example package owns the distribution gallery, bijectors,
-fixed-step HMC, and runnable core walkthrough. Batching remains a separate
+and runnable core walkthrough. Batching remains a separate
 package because its public boundary includes DifferentiationInterface cache
 semantics. Compatibility examples are isolated from current authoring examples.
 
@@ -84,21 +79,3 @@ This prevents a nested-package setup from resolving an older metadata interface.
 unregistered test-only dependencies (MutatingFunctions) by URL and revision:
 `Pkg.test` builds its sandbox from the pruned parent manifest, so a test
 extra that is neither registered nor pinned there fails to resolve.
-
-The NUTS compiler exemplar and online-statistics consumers are separate nested
-packages with an acyclic dependency graph:
-
-```text
-ReactiveKernelsNUTSExamples → ReactiveKernels
-ReactiveKernelsStreamingStats → ReactiveKernels
-ReactiveKernelsHMCDiagnostics → {
-    ReactiveKernelsStreamingStats,
-    ReactiveKernelsNUTSExamples,
-}
-docs → all three
-```
-
-The legacy `examples/nuts_runtime.jl` and `examples/online_stats.jl` files are
-thin launchers only. Package-owned source preserves the byte-locked NUTS fixture,
-independent eager oracle, and the rule that bare
-`using ReactiveKernels` loads no sampler API.

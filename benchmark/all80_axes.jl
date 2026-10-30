@@ -4,8 +4,6 @@
 #   measure_native(ctx)   -> Dict of NATIVE_CELLS + descriptive/parity fields
 #       primal_rk, primal_turing, primal_stan            (median ns, via Chairmarks)
 #       gradient_rk, gradient_turing, gradient_stan       (median ns)
-#       hmc_rk_native                                     (µs/transition, transpiled HMC program)
-#       hmc_ahmc_turing                                   (µs/transition, AdvancedHMC on the Turing LDF)
 #       dim, family, note, parity_pass, rk_off, tu_off, off_reason, rk_grad_relerr, tu_grad_relerr
 #
 # `ctx` is the shared per-model bundle the body builds once (name, model, data, sm, cmap,
@@ -13,9 +11,8 @@
 # NANOSECONDS (Chairmarks `median(b).time` is SECONDS — convert with *1e9; the original
 # body's missing conversion is why the first smoke printed "0.0 ns").
 #
-# HMC uses the transpiled multinomial-HMC program (transpiled_endpoint / prepare_transpiled)
-# fed the FAITHFUL registry graphs (ctx.kb / ctx.prep). That machinery lives under
-# benchmark/sampler_transpiler/ and is included by the body.
+# Historical receipts also carry hmc_rk_native and hmc_ahmc_turing (µs/transition): the producer
+# measured HMC throughput until ReactiveKernels' sampler code was removed.
 module All80Axes
 
 using Statistics: median
@@ -37,8 +34,8 @@ function native_single_eval!(row, c)
     # a failed RK operation carries its exact diagnostic STRING — never a timing a ratio plot would
     # render as a passing verdict. Reference cells (turing/stan) are ALWAYS numeric.
     # PROPAGATION: a defective RK PRIMAL makes the whole RK graph unreliable, so it BLOCKS gradient_rk
-    # (and hmc_rk_native, below) even if the reverse happened to be finite/accurate — no RK cell may
-    # report a number off a broken graph (performance contract 2026-09-08).
+    # even if the reverse happened to be finite/accurate — no RK cell may report a number off a
+    # broken graph (performance contract 2026-09-08).
     row["primal_rk"]       = c.rk_primal_diag === nothing ?
         med_ns(Chairmarks.@be c.rk_primal()) : c.rk_primal_diag
     row["primal_turing"]   = med_ns(Chairmarks.@be c.tu_primal())
@@ -52,58 +49,8 @@ function native_single_eval!(row, c)
     row
 end
 
-# ---- HMC throughput (µs/transition) --------------------------------------------------
-# The body includes the sampler_transpiler machinery and passes `hmc_time_loop` (a closure
-# capturing transpiled_endpoint / prepare_transpiled / F.leapfrog! bound to ctx.kb +
-# ctx.prep), so this module stays free of the transpiler imports.
-"""native HMC: RK density+grad driven through the transpiled HMC program. The RK-native
-HMC loop needs the RK reverse gradient, so a model whose gradient hits the known core defect
-(`c.rk_grad_diag` set) records the SAME diagnostic here (HMC is blocked BY the gradient), never
-a fabricated number. hmc_ahmc_turing is unaffected (Turing side)."""
-hmc_rk_native!(row, c) = (row["hmc_rk_native"] =
-    c.rk_grad_diag !== nothing ? "hmc_rk_native blocked by RK gradient: " * c.rk_grad_diag :
-    c.rk_primal_diag !== nothing ? "hmc_rk_native blocked by RK primal: " * c.rk_primal_diag :
-    c.hmc_time_loop(row["hmc_transitions"]); row)
-"""AHMC+Turing HMC: AdvancedHMC over the Turing LDF (value+gradient); µs/transition.
-Body supplies `c.ahmc_time_loop` (AdvancedHMC.HMC, fixed L, warmup excluded)."""
-hmc_ahmc_turing!(row, c) =
-    (row["hmc_ahmc_turing"] = c.ahmc_time_loop(row["hmc_transitions"]); row)
-
-# Keep leapfrog work fixed while adapting repetitions to a bounded timing budget. The
-# slower available gradient determines ONE transition count shared by RK and AHMC, so a
-# row never compares different HMC workloads. Six median rounds remain fixed; only the
-# number of transitions in each round changes. The 1.25 factor leaves headroom for the
-# integrator and sampler bookkeeping beyond the 16 gradient evaluations.
-const HMC_STEPS = 16
-const HMC_ROUNDS = 6
-const HMC_MIN_TRANSITIONS = 4
-const HMC_MAX_TRANSITIONS = 1000
-const HMC_TARGET_ROUND_SECONDS = 0.5
-
-function hmc_transitions(row)
-    gradients = Float64[]
-    for cell in ("gradient_rk", "gradient_turing")
-        v = get(row, cell, nothing)
-        v isa Real && isfinite(v) && push!(gradients, Float64(v))
-    end
-    isempty(gradients) && error("adaptive HMC needs at least one finite gradient timing")
-    estimated_transition_ns = 1.25 * HMC_STEPS * maximum(gradients)
-    clamp(floor(Int, HMC_TARGET_ROUND_SECONDS * 1e9 / estimated_transition_ns),
-        HMC_MIN_TRANSITIONS, HMC_MAX_TRANSITIONS)
-end
-
-function hmc_protocol!(row, c)
-    row["hmc_steps"] = HMC_STEPS
-    row["hmc_rounds"] = HMC_ROUNDS
-    row["hmc_target_round_seconds"] = HMC_TARGET_ROUND_SECONDS
-    row["hmc_transitions"] = hmc_transitions(row)
-    hmc_rk_native!(row, c)
-    hmc_ahmc_turing!(row, c)
-    row
-end
-
 # ---- entrypoint -----------------------------------------------------------------------
-# single-eval rk/turing/stan + RK-native HMC + AHMC-Turing HMC + descriptive/parity.
+# single-eval rk/turing/stan + descriptive/parity.
 function measure_native(c)
     row = Dict{String,Any}("dim" => c.dim, "family" => c.family, "note" => c.note,
         "parity_pass" => c.parity_pass, "rk_off" => c.rk_off, "tu_off" => c.tu_off,
@@ -115,7 +62,6 @@ function measure_native(c)
         "turing_support_diag" => (c.turing_support_diag === nothing ? "" : c.turing_support_diag),
         "protocol" => c.protocol)
     native_single_eval!(row, c)
-    hmc_protocol!(row, c)
     row
 end
 

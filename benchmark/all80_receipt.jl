@@ -14,10 +14,6 @@ const SCHEMA = "all80-benchmark-v1"
 const _HARNESS_FILES = (
     "all80_posteriordb.jl", "all80_posteriordb_body.jl", "all80_registry.jl",
     "all80_receipt.jl", "all80_axes.jl", "all80_metadata.jl", "all80_parity.jl")
-const _HMC_HARNESS_FILES = (
-    "sampler_transpiler/eight_schools_density.jl",
-    "nuts_kernel_authoring_fixture_b.jl",
-    "sampler_transpiler/position_multinomial_hmc_kernel.jl")
 const _ENV_FILES = ("Project.toml", "Manifest.toml")
 const ORDINARY_AD_BACKEND = "AutoEnzyme(mode=Enzyme.Reverse; no function_annotation)"
 
@@ -303,34 +299,35 @@ function selected_point_stan_parity_ok(value, stan_value, declared_offset;
 end
 
 # The MANDATORY numeric cells — real numbers required for ALL 82 rows (publication gate).
-# primal_*/gradient_* are MEDIAN NANOSECONDS; hmc_* are MEDIAN MICROSECONDS/transition
-# (lower = faster). The native phase produces primal_{rk,turing,stan},
-# gradient_{rk,turing,stan}, hmc_rk_native (RK-native multinomial-HMC loop) and
-# hmc_ahmc_turing (AdvancedHMC).
+# primal_*/gradient_* are MEDIAN NANOSECONDS (lower = faster). The native phase produces
+# primal_{rk,turing,stan} and gradient_{rk,turing,stan}.
 const NATIVE_CELLS = ("primal_rk", "primal_turing", "primal_stan",
-    "gradient_rk", "gradient_turing", "gradient_stan",
-    "hmc_rk_native", "hmc_ahmc_turing")
+    "gradient_rk", "gradient_turing", "gradient_stan")
 # STRICTLY-MANDATORY (report-completeness): a finite real number for ALL 82 — the REFERENCE-side
-# cells only (Turing/Stan primal, Turing/Stan reverse gradient, AdvancedHMC-Turing throughput).
+# cells only (Turing/Stan primal, Turing/Stan reverse gradient).
 # NONE depend on the RK graph, so no RK-side defect can make them absent. `primal_rk` moved to
 # RK_CELLS (Fix D): a genuine RK primal defect (e.g. wells logistic saturation → -Inf where Stan
 # is finite) yields a primal_rk DIAGNOSTIC + parity_pass=false, not a missing cell — the row stays
 # report-complete, never a passing correctness verdict.
 const MANDATORY_CELLS = ("primal_turing", "primal_stan",
-    "gradient_turing", "gradient_stan", "hmc_ahmc_turing")
+    "gradient_turing", "gradient_stan")
 # RK CELLS (Fix D independent per-cell preservation): numeric where THAT RK operation is verified
 # vs reference Stan (the unaffected models), else a NONEMPTY diagnostic string carrying the exact
 # defect — RK primal (wells logistic saturation), RK reverse (authored-plate/scan Enzyme failure;
-# dogs_hier direct-p boundary NaN), or RK-native HMC blocked by either. Present-and-typed, NEVER
+# dogs_hier direct-p boundary NaN). Present-and-typed, NEVER
 # absent; a diagnostic cell forces parity_pass=false and prints NO benchmark ratio; republished as
 # finite numbers once the per-model fix lands (canonicals bound per follow-on).
-const RK_CELLS = ("primal_rk", "gradient_rk", "hmc_rk_native")
+const RK_CELLS = ("primal_rk", "gradient_rk")
 # CONDITIONAL cells: a finite NUMBER where it applies, else a NONEMPTY string carrying the
 # exact reason. OPTIONAL optimized-Stan/further-Turing = number if a distinct verified-faster
 # impl exists, else the user-directive deferral provenance. Never merely absent. HISTORICAL
 # REACTANT cells (removed Reactant path) = numeric where the model lowered, else the exact
 # lowering error; checked only on rows that carry them.
 const REACTANT_CELLS = ("primal_rk_reactant", "gradient_rk_reactant", "hmc_rk_reactant")
+# HISTORICAL HMC cells: MEDIAN MICROSECONDS/transition of the RK-native multinomial-HMC loop and
+# of AdvancedHMC on the Turing LDF, measured until ReactiveKernels' sampler code was removed; a
+# number or a nonempty diagnostic, checked only on rows that carry them.
+const HMC_CELLS = ("hmc_rk_native", "hmc_ahmc_turing")
 const OPTIONAL_CELLS = ("primal_opt_stan", "primal_further_turing",
     "gradient_opt_stan", "gradient_further_turing")
 # Descriptive per-model fields carried alongside the cells (native phase authors them).
@@ -462,6 +459,7 @@ function validate(path::AbstractString; expected_models = nothing)
         end
         conditional = any(c -> haskey(cells, c), REACTANT_CELLS) ?
             (REACTANT_CELLS..., OPTIONAL_CELLS...) : OPTIONAL_CELLS
+        conditional = (conditional..., filter(c -> haskey(cells, c), HMC_CELLS)...)
         for c in conditional
             v = get(cells, c, nothing)
             ok = (v isa Real && isfinite(v)) || (v isa AbstractString && !isempty(v))

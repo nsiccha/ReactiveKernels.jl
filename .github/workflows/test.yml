@@ -38,20 +38,18 @@ jobs:
           - { julia-version: 'pre', julia-arch: x64, os: macOS-latest, test-shard: core }
 
           # Acceptance asserts platform-independent semantics once. Repeating
-          # these compiler/runtime/sampler/benchmark suites on every supported
-          # Julia/OS cell spent 36 runners proving the same contract.
-          - { julia-version: 'lts', julia-arch: x64, os: ubuntu-latest, test-shard: acceptance-compiler }
+          # these runtime/benchmark suites on every supported Julia/OS cell
+          # spent runners proving the same contract.
           - { julia-version: 'lts', julia-arch: x64, os: ubuntu-latest, test-shard: acceptance-runtime }
-          - { julia-version: 'lts', julia-arch: x64, os: ubuntu-latest, test-shard: acceptance-samplers }
           - { julia-version: 'lts', julia-arch: x64, os: ubuntu-latest, test-shard: acceptance-benchmarks }
     steps:
       - uses: actions/checkout@v4
-        if: matrix.test-shard != 'acceptance-samplers'
+        if: matrix.test-shard != 'acceptance-runtime'
       # Benchmark source-attestation tests compare current source with exact
       # historical receipt pins.  Give only that shard the required history;
-      # the other twelve matrix cells retain the ordinary shallow checkout.
+      # the other matrix cells retain the ordinary shallow checkout.
       - uses: actions/checkout@v4
-        if: matrix.test-shard == 'acceptance-samplers'
+        if: matrix.test-shard == 'acceptance-runtime'
         with:
           fetch-depth: 0
       - name: Configure git for source dependencies

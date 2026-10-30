@@ -14,13 +14,11 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     )
     distributions_ad_path = joinpath(root, "docs", "src", "distributions-ad.md")
     batched_path = joinpath(root, "docs", "src", "batched.md")
-    nuts_reactant_path = joinpath(root, "docs", "src", "nuts-reactant.md")
 
     @test isfile(page_path)
     @test isfile(ad_path)
     @test isfile(manual_rules_path)
     @test isfile(distributions_ad_path)
-    @test isfile(nuts_reactant_path)
     page = _compiler_docs_lf(read(page_path, String))
     make = _compiler_docs_lf(read(make_path, String))
     index = _compiler_docs_lf(read(index_path, String))
@@ -29,7 +27,6 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     manual_rules_docs = _compiler_docs_lf(read(manual_rules_path, String))
     distributions_ad_docs = _compiler_docs_lf(read(distributions_ad_path, String))
     batched_docs = _compiler_docs_lf(read(batched_path, String))
-    nuts_reactant = _compiler_docs_lf(read(nuts_reactant_path, String))
 
     # Preparation-time partial evaluation is a public compiler capability,
     # with one prose authority that covers its API shape and frozen-data
@@ -109,48 +106,14 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     @test occursin("compiler.md", index)
     @test occursin("warnonly = false", make)
 
-    nuts = _compiler_docs_lf(read(joinpath(root, "docs", "src", "nuts.md"), String))
-    @test occursin("not an RK package API", nuts)
-    @test occursin("external NUTS compiler-acceptance exemplar", nuts)
-    @test occursin("The former `@rk_pure`,", nuts)
-    @test occursin("declarations have been removed", nuts)
-    @test occursin("The source below is the macro-free executable fixture", nuts)
-
-    # RK's Reactant path is removed; its NUTS result stays on a static,
-    # historical receipt page rather than on README, index, or the
-    # source-oriented NUTS page.
-    for marker in (
-            "**Historical receipt.**",
-            "packages/ReactiveKernelsNUTSExamples/src/nuts_runtime/kernel_nuts_reactant.jl",
-            "test/test_kernel_nuts_reactant.jl",
-            "render_nuts_reactant_benchmark()",
-            "benchmark/receipts/nuts-reactant-v1.toml",
-            "one synchronous CPU call per full-depth\ntransition",
-            "pre-generated momentum, direction, and exponential\nbundles",
-            "It is not adaptation",
-            "Neither is loaded or run by this page",
-        )
-        @test occursin(marker, nuts_reactant)
-    end
     @test !occursin("adaptive NUTS remains CPU-only", readme)
-    @test !occursin("Adaptive NUTS is currently a CPU sampler", nuts)
     @test !occursin("stays on the CPU because", index)
 
-    # The pure/iterative boundary names the test that guards it.
-    guard = joinpath("packages", "ReactiveKernelsPPL", "test",
-        "test_pure_surface_boundary.jl")
-    @test occursin("`" * join(splitpath(guard), "/") * "`", page)
-    @test isfile(joinpath(root, guard))
-
     for heading in (
-        "## Pure kernels and the iterative-method compiler",
+        "## Pure kernels",
         "## The stateless compiler",
         "## Batch and replica lowering",
         "## Incremental and compiled reactive execution",
-        "## Source-captured method compiler",
-        "### Functional stateful methods and nested state contracts",
-        "### Prototype-derived finite structural containers",
-        "## What the NUTS proof does and does not establish",
         "## Definitive support matrix",
     )
         @test occursin(heading, page)
@@ -162,47 +125,6 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "Structural CSE is explicit and conservative",
         "narrowest valid nested-loop boundary",
         "Effectful\nrecipes are excluded by the planner and cannot form a plate plan",
-        "does not call\n`code_lowered`",
-        "Validity changes are exception-safe but values are not transactionally rolled\nback",
-        "external compilation examples and acceptance evidence",
-        "`structured_state_port(compiled_transition)`",
-        "`StatefulStateValue`",
-        "`rng_provider(State; normal_fill, bool_draw, exp_draw)`",
-        "`OrderedRNGReplay`",
-        "`effect_lowering_port`",
-        "`total_functional_lowering`",
-        "`initial_transition_effects(transition)`",
-        "`transition_with_effects(transition)`",
-        "`drain_observations!(transition, result)`",
-        "internal conservative compiler rule",
-        "a fill count, and\na sticky overflow flag",
-        "explicitly recompile",
-        "one global\nordered event tape/cursor",
-        "Native execution\ntherefore uses a standard Julia `AbstractRNG` directly",
-        "exact recursive state layout, owned-array axes,\ncanonical aliases",
-        "It does\nnot mislabel that token as an ordinary source callback",
-        "authored Float64 `randexp`\nresult",
-        "Sampler acceptance does not require bit matching or a fixed numerical distance",
-        "does not restrict compiler optimization to reproduce a\nreference rounding pattern",
-        "valid trajectories, termination, divergence handling, RNG consumption",
-        "widened Float64 normal tape is rejected",
-        "None of this lowering dispatches on sampler, geometry,\nmethod, or field names",
-        "a bare `using ReactiveKernels` does not load or\nexport them",
-        "former `@rk_pure`, `@rk_borrows`, and `@rk_rng` declarations have\nbeen removed",
-        "`@node` is unrelated to this removal boundary",
-        "NUTS, log-density, and\nPPL artifacts are external compilation examples and acceptance evidence",
-        "not** a general Julia-recursion compiler proof",
-        "`compile_state_transition(spec, transition, endpoint_args;",
-        "Such a loop is retained: its body is\ncompiled once",
-        "do not add geometry or integrator cases to compiler code",
-        "fixed-capacity\nstructural vectors",
-        "`Diagonal` and `Cholesky` wrappers",
-        "one typed numeric\ncolumn per logical owned leaf group",
-        "topology-aware read, write, copy, swap, and whole-container\nselect",
-        "Output validation\nhappens before reconstruction",
-        "`Base.abs` is admitted here only for one builtin\n`AbstractFloat` scalar",
-        "`Base.div` requires two operands of the identical\nbuiltin non-`Bool` integer type",
-        "not a general exported container API",
     )
         @test occursin(contract, page)
     end

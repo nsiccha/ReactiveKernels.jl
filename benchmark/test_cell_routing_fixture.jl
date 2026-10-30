@@ -1,5 +1,5 @@
 # Stub-counter routing fixture for the Fix C/D/E per-cell semantics (performance contract 2026-09-08).
-# Exercises the ACTUAL production routing — All80Axes.native_single_eval! / hmc_rk_native! and the
+# Exercises the ACTUAL production routing — All80Axes.native_single_eval! and the
 # shared classify_boundary — with STUB inputs carrying CALL COUNTERS, so a BLOCKED RK cell is proven
 # to leave its closure UNINVOKED (count 0), not merely to hold a string. Establishes directly the
 # per-cell number-vs-diagnostic behavior + the primal→gradient PROPAGATION + the per-side boundary
@@ -8,12 +8,12 @@
 include(joinpath(@__DIR__, "all80_parity.jl"))
 include(joinpath(@__DIR__, "all80_axes.jl"))
 using Test
-using .All80Axes: native_single_eval!, hmc_rk_native!
+using .All80Axes: native_single_eval!
 
 isnum(x) = x isa Real && isfinite(x)
 isdiag(x) = x isa AbstractString && !isempty(x)
 
-mutable struct Calls; rk_primal::Int; rk_grad::Int; hmc::Int; end
+mutable struct Calls; rk_primal::Int; rk_grad::Int; end
 
 # Stub `c` whose RK closures INCREMENT `calls` when actually invoked (so a blocked cell ⇒ count 0).
 stubc(calls; rk_primal_diag = nothing, rk_grad_diag = nothing) = (;
@@ -21,35 +21,32 @@ stubc(calls; rk_primal_diag = nothing, rk_grad_diag = nothing) = (;
     rk_primal = () -> (calls.rk_primal += 1; 1.0),
     tu_primal = () -> 1.0, stan_primal = () -> 1.0,
     rk_grad = () -> (calls.rk_grad += 1; (1.0, [1.0])),
-    tu_grad = () -> (1.0, [1.0]), stan_grad = () -> (1.0, [1.0]),
-    hmc_time_loop = (backend, T) -> (calls.hmc += 1; 5.0))
+    tu_grad = () -> (1.0, [1.0]), stan_grad = () -> (1.0, [1.0]))
 
 function route(c)
-    r = Dict{String,Any}(); native_single_eval!(r, c)
-    r["hmc_transitions"] = 4; hmc_rk_native!(r, c); r
+    r = Dict{String,Any}(); native_single_eval!(r, c); r
 end
 
 @testset "Fix C/D per-cell routing + call counters (blocked closures NOT invoked)" begin
     # (iii) all verified ⇒ all RK cells NUMERIC; each RK closure called exactly once.
-    calls = Calls(0, 0, 0); r = route(stubc(calls))
-    @test isnum(r["primal_rk"]) && isnum(r["gradient_rk"]) && isnum(r["hmc_rk_native"])
-    # CALLED ⇒ count > 0 (Chairmarks.@be invokes the timed closures many times; hmc once).
-    @test calls.rk_primal > 0 && calls.rk_grad > 0 && calls.hmc > 0
+    calls = Calls(0, 0); r = route(stubc(calls))
+    @test isnum(r["primal_rk"]) && isnum(r["gradient_rk"])
+    # CALLED ⇒ count > 0 (Chairmarks.@be invokes the timed closures many times).
+    @test calls.rk_primal > 0 && calls.rk_grad > 0
     @test isnum(r["primal_turing"]) && isnum(r["primal_stan"]) &&
           isnum(r["gradient_turing"]) && isnum(r["gradient_stan"])
 
-    # (ii) good primal + FAILED gradient ⇒ primal_rk NUMERIC (called once); gradient_rk + hmc DIAG (NOT called).
-    calls = Calls(0, 0, 0); r = route(stubc(calls; rk_grad_diag = "gradient_rk: non-finite gradient"))
+    # (ii) good primal + FAILED gradient ⇒ primal_rk NUMERIC (called once); gradient_rk DIAG (NOT called).
+    calls = Calls(0, 0); r = route(stubc(calls; rk_grad_diag = "gradient_rk: non-finite gradient"))
     @test isnum(r["primal_rk"]) && calls.rk_primal > 0             # primal CALLED
     @test isdiag(r["gradient_rk"]) && calls.rk_grad == 0           # gradient BLOCKED ⇒ NOT invoked
-    @test isdiag(r["hmc_rk_native"]) && calls.hmc == 0
     @test isnum(r["primal_turing"]) && isnum(r["gradient_stan"])   # reference cells still numeric
 
     # (i) BAD primal ⇒ ALL RK cells DIAG; NO RK closure invoked (broken graph ⇒ nothing measured).
-    calls = Calls(0, 0, 0); r = route(stubc(calls; rk_primal_diag = "primal_rk: not a constant offset"))
-    @test isdiag(r["primal_rk"]) && isdiag(r["gradient_rk"]) && isdiag(r["hmc_rk_native"])
-    @test (calls.rk_primal, calls.rk_grad, calls.hmc) == (0, 0, 0)
-    @test occursin("primal", r["gradient_rk"]) && occursin("primal", r["hmc_rk_native"])
+    calls = Calls(0, 0); r = route(stubc(calls; rk_primal_diag = "primal_rk: not a constant offset"))
+    @test isdiag(r["primal_rk"]) && isdiag(r["gradient_rk"])
+    @test (calls.rk_primal, calls.rk_grad) == (0, 0)
+    @test occursin("primal", r["gradient_rk"])
     @test isnum(r["primal_turing"]) && isnum(r["gradient_stan"])
 end
 

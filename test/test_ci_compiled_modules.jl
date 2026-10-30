@@ -52,20 +52,18 @@ end
                 "os: $os, test-shard: core }")
         end
     end
-    for shard in (
-            "acceptance-compiler", "acceptance-runtime",
-            "acceptance-samplers", "acceptance-benchmarks")
+    for shard in ("acceptance-runtime", "acceptance-benchmarks")
         push!(expected_rows,
             "{ julia-version: 'lts', julia-arch: x64, " *
             "os: ubuntu-latest, test-shard: $shard }")
     end
     @test matrix_rows == expected_rows
-    @test length(matrix_rows) == 13
+    @test length(matrix_rows) == 11
     @test occursin("uses: julia-actions/cache", package_matrix)
     @test occursin(
-        "if: matrix.test-shard != 'acceptance-samplers'", package_matrix)
+        "if: matrix.test-shard != 'acceptance-runtime'", package_matrix)
     @test occursin(
-        "if: matrix.test-shard == 'acceptance-samplers'", package_matrix)
+        "if: matrix.test-shard == 'acceptance-runtime'", package_matrix)
     @test occursin("fetch-depth: 0", package_matrix)
     @test length(collect(eachmatch(
         r"uses: actions/checkout@v4", package_matrix))) == 2

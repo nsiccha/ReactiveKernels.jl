@@ -3,37 +3,14 @@ using ReactiveKernelsBatchingExamples
 using ReactiveKernelsCompatibilityExamples
 using ReactiveKernelsDistributionKernels
 using ReactiveKernelsKernelExamples
-using ReactiveKernelsHMCDiagnostics
-using ReactiveKernelsNUTSExamples
 using ReactiveKernelsPPLExamples
 using ReactiveKernelsPPL
-using ReactiveKernelsStreamingStats
-
-# Opt into the standalone nutpie/nuts-rs diagonal-adaptation compiler corpus.
-# It remains an external mathematical example rather than a package API.
-include(joinpath(@__DIR__, "..", "examples", "nutpie_diagonal_adaptation.jl"))
-import .NutpieDiagonalAdaptationExample
 
 # Load the executable derivative-rule example: one pure-math graph, the
 # `derivative_rule` it generates, and the same cuts prepared explicitly so the
 # page can render each one.
 include(joinpath(@__DIR__, "..", "examples", "manual_derivative_rule.jl"))
 import .ManualDerivativeRuleExample
-
-# NUTS and WALNUTS authoring fixtures are deliberately not included here.
-# Their pages read the source files as inert text; docs builds must not parse,
-# lower, compile, or execute either moving compiler/runtime surface.
-
-# Load the accepted ReactiveHMC compiler-corpus authorities themselves. The
-# corpus page extracts source from these exact files and inspects their captured
-# MethodIR; malformed or rejected source therefore fails the docs build.
-include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_algorithm_corpus.jl"))
-include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_rke_kernel_fixture.jl"))
-include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_rke_functional_lowering.jl"))
-include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_integrator_kernel_fixture.jl"))
-include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_statistics_kernel_fixture.jl"))
-include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_hmc_kernel_fixture.jl"))
-include(joinpath(@__DIR__, "..", "benchmark", "reactivehmc_docs_interactions.jl"))
 
 include("kernel_examples.jl")
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "result_views.jl"))
@@ -42,7 +19,6 @@ Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "all80_comparison_tables.jl
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "all80_benchmark_plots.jl"))
 include("check_rendered.jl")
 include("test_all80_contracts.jl")
-include("hmc_transpiler.jl")
 include("gibbs_page.jl")
 
 site_pages = [
@@ -119,10 +95,8 @@ site_pages = [
         "Probabilistic programming" => [
             "Eight Schools" => "eight-schools-reactant.md",
             "MNIST multinomial logistic" => "mnist-reactant.md",
-            "ProbProg MCMC (NUTS sampling)" => "probprog-mcmc.md",
         ],
         "Evaluation throughput vs Turing.jl" => "eval-throughput.md",
-        "Adaptive NUTS receipt (static)" => "nuts-reactant.md",
     ],
     "Non-allocating kernels" => "nonallocating.md",
     "posteriordb benchmark (RK vs Stan vs Turing)" => "posteriordb-comparison.md",
@@ -133,14 +107,7 @@ site_pages = [
     ],
     "Bijectors" => "bijectors.md",
     "Sampling (experimental)" => [
-        "Multinomial HMC transpiler" => "hmc-transpiler.md",
         "Gibbs on reactive kernels" => "gibbs.md",
-        "Pathfinder approximation" => "pathfinder.md",
-        "ReactiveHMC kernel corpus" => "reactivehmc-corpus.md",
-        "NUTS source and receipts (not executed)" => "nuts.md",
-        "Nutpie diagonal adaptation" => "nutpie-diagonal.md",
-        "WALNUTS-D source (not executed)" => "walnuts.md",
-        "Online statistics" => "online-stats.md",
     ],
 ]
 
@@ -154,9 +121,6 @@ makedocs(
         ReactiveKernelsBatchingExamples,
         ReactiveKernelsPPLExamples,
         ReactiveKernelsCompatibilityExamples,
-        ReactiveKernelsNUTSExamples,
-        ReactiveKernelsStreamingStats,
-        ReactiveKernelsHMCDiagnostics,
     ],
     format   = DocumenterVitepress.MarkdownVitepress(
         repo = "github.com/nsiccha/ReactiveKernels.jl",
@@ -172,7 +136,6 @@ makedocs(
 # A successful build must have executed and rendered every PPL walkthrough
 # exactly once. This catches an omitted page/block even when no eval error fires.
 ReactiveKernelsDocs.assert_ppl_examples_executed!()
-ReactiveKernelsDocs.assert_reactivehmc_docs_interacted!()
 
 # Ensure a root index.html redirect exists
 let redirect = joinpath(@__DIR__, "build", "index.html")

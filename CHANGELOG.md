@@ -16,6 +16,51 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.20
+
+- **Breaking:** the iterative-method compiler, the NUTS/HMC sampler
+  examples and their tests, benchmarks and documentation pages are removed.
+  They moved to a separate private package that depends on ReactiveKernels.
+  Pure kernels, plates, scans, prepared AD, partial evaluation,
+  `ReactiveState`, `prepare_reactive` and RKPPL are unchanged. What to
+  change:
+  - `compile_stateful`, `stateful_compiler_bindings`, `functionalize_stateful`,
+    `stateful_snapshot`, `compile_state_transition`, `initial_transition_state`,
+    `validated_compiled_transition`, `stateful_control_bounds`, the effect and
+    observation ports (`pure_callable_port`, `effect_callable_port`,
+    `effect_lowering_port`, `structured_state_port`,
+    `total_functional_lowering`, `initial_transition_effects`,
+    `transition_with_effects`, `drain_observations!`), `rng_provider`,
+    `OrderedRNGReplay`, `prepare_transpiled`, `initial_transpiled_state`,
+    `transpiled_endpoint`, `partial` and `PartialFunction` are no longer
+    defined here.
+  - The nested packages `ReactiveKernelsNUTSExamples`,
+    `ReactiveKernelsStreamingStats` and `ReactiveKernelsHMCDiagnostics` are no
+    longer part of this repository.
+  - `ReactiveKernelsCompatibilityExamples` no longer has `ReactiveHMCExamples`
+    or the ReactiveHMC artifacts: `CompatibilityArtifacts.all_artifacts()`
+    returns the three ReactiveObjects graphs, and `reactivehmc_artifacts` is
+    gone. `ReactiveKernelsKernelExamples` no longer has `HMCExample`.
+  - The all-82 posteriordb benchmark measures primal and gradient only; its
+    receipts keep their recorded HMC-throughput cells, which the validator
+    checks where present and the docs no longer render. The motorcycle HSGP
+    HMC driver and its receipts are removed.
+  - `@kernel` no longer builds stateful free methods: a methodless body that
+    updates a field of its first argument in place, or a `!!` name, raises an
+    `ArgumentError`. A method-bearing object keeps its owner snapshot and pure
+    endpoint templates only; `copy!!`, `KernelObject`, `KernelView`,
+    `kernel_methods`, `kernel_recipe_ast`, `kernel_module`, `kernel_token`, the
+    callee and type snapshots and the primitive effect registry are gone.
+    Pure objects and their endpoints build and behave as before.
+- `ReactiveKernels._compile(ast, context, native_context)` compiles a lowered
+  body with its global names resolved in `context`; `compile(ast)` is that
+  core with ReactiveKernels as the context, unchanged.
+- A front end can build on method-bearing objects: `_KernelObjectSkeleton` is
+  the supertype of the object `@kernel` binds, the pure object machinery reads
+  an object only through `_kernel_pure_skeleton`, and
+  `_kernel_object_definition` returns the parts and the pure-skeleton
+  constructor of an object definition.
+
 ## 0.1.19
 
 - One cell of a plate (`plate_cell`; RKPPL's `prepare_cell_query` and cell

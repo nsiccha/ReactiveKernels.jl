@@ -1,7 +1,4 @@
 using ReactiveKernelsCompatibilityExamples
-using ReactiveKernelsCompatibilityExamples: ReactiveObjectsExamples,
-    ReactiveHMCExamples
+using ReactiveKernelsCompatibilityExamples: ReactiveObjectsExamples
 
 ReactiveObjectsExamples.run()
-println()
-ReactiveHMCExamples.run()

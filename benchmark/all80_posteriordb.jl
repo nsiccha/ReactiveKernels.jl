@@ -42,9 +42,7 @@ function _ensure_env()
             "DynamicPPL","Distributions","Bijectors","FillArrays","StatsFuns",
             "DifferentiationInterface","LogExpFunctions","SpecialFunctions","PosteriorDB",
             "OrdinaryDiffEqBDF","OrdinaryDiffEqLowOrderRK","OrdinaryDiffEqTsit5",
-            "SciMLBase","SciMLSensitivity",
-            # the AHMC-Turing HMC throughput axis
-            "AdvancedHMC")])
+            "SciMLBase","SciMLSensitivity")])
         Pkg.develop([
             Pkg.PackageSpec(path = root),
             Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsDistributionKernels")),
@@ -88,7 +86,7 @@ end
 
 _phase_harness_files(phase) = ("all80_posteriordb.jl", "all80_registry.jl",
     "all80_receipt.jl", "all80_axes.jl", "all80_posteriordb_body.jl",
-    "all80_metadata.jl", "all80_parity.jl", All80Receipt._HMC_HARNESS_FILES...)
+    "all80_metadata.jl", "all80_parity.jl")
 
 function _write_phase_source_lock(phase, up, requested_keys, run_id)
     upstream_files = Dict(

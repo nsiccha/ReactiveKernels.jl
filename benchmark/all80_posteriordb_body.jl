@@ -1,9 +1,7 @@
 # All-82 measurement body — runs in its own subprocess (the native phase). Reuses the pinned upstream driver's helpers
 # (bridge_model / make_model / CoordinateMap / stable_ldf / random_valid_points / draw_center)
 # for reference-Stan + upstream-Turing at a shared q, and the faithful registry graphs for RK.
-# HMC uses the transpiled multinomial-HMC program (transpiled_endpoint / prepare_transpiled /
-# multinomial_hmc_state) fed the faithful kb/prep. AHMC-Turing uses AdvancedHMC on the Turing LDF. All timings via Chairmarks/@elapsed;
-# every side parity-gated against reference Stan (propto=false, jacobian=true) before timing.
+# All timings via Chairmarks; every side parity-gated against reference Stan (propto=false, jacobian=true) before timing.
 using Random, LinearAlgebra, Statistics
 import TOML, SHA
 
@@ -34,16 +32,6 @@ include(joinpath(@__DIR__, "all80_registry.jl"))   # All80Registry.REGISTRY (82 
 include(joinpath(@__DIR__, "all80_axes.jl"))       # All80Axes.measure_native (native phase)
 include(joinpath(@__DIR__, "all80_metadata.jl"))   # All80Metadata.meta(key): family/note + optional provenance
 const RK = All80Registry.REGISTRY
-
-# HMC transpiler machinery.
-const STD = joinpath(@__DIR__, "sampler_transpiler")
-include(joinpath(STD, "eight_schools_density.jl"))            # Potential, Gradient, CallbackHandle
-include(joinpath(@__DIR__, "nuts_kernel_authoring_fixture_b.jl"))  # F.euclidean_phasepoint, F.leapfrog!
-include(joinpath(STD, "position_multinomial_hmc_kernel.jl"))  # PositionMultinomialHMCAuthoring.multinomial_hmc_state
-using .EightSchoolsDensity: Potential, Gradient, CallbackHandle
-const F = NUTSBMutationAuthoringFixture
-
-import AdvancedHMC
 
 # BATCH provenance: the parent froze source/environment bytes before spawn; this child loaded and
 # verified that lock BEFORE measured imports. Now certify the actual loaded module roots and all
@@ -119,62 +107,6 @@ function _rk_full_diag(cell, name, err, bt)
     string(cell, ": ", first(replace(full, "\n" => " "), 200), ref)
 end
 
-# ---- HMC loop (µs/transition) via the shared transpiled program ----
-# rng_factory yields a fresh sampler RNG for each round.
-function hmc_loop(kb, prep, q, rng_factory; T = 1000, steps = 16, rounds = 6)
-    D = length(q)
-    point = transpiled_endpoint(F.euclidean_phasepoint, F.leapfrog!,
-        CallbackHandle(Potential(kb)), CallbackHandle(Gradient(prep)),
-        Diagonal(ones(D)), copy(q), zeros(D))
-    prog = prepare_transpiled(PositionMultinomialHMCAuthoring.multinomial_hmc_state, point;
-        method = :step!, argument = rng_factory(), iterations = T,
-        kernel_kwargs = (n_steps = steps, step_f = F.leapfrog!, stepsize = 0.03),
-        outputs = (position = (:init, :pos),))
-    st = initial_transpiled_state(prog)
-    warm = prog(st, rng_factory())                    # warmup
-    all(isfinite, Array(warm.outputs.position)) ||
-        error("RK HMC produced a non-finite warmup position (chain exploded)")
-    # FAIL-CLOSED per TIMED round: validate the final position of every measured result
-    # before accepting its duration (timing NaN/Inf is not a valid HMC cell). Fresh seed
-    # each round (deterministic, symmetric with AHMC).
-    times = Float64[]
-    for _ in 1:rounds
-        local r
-        t = @elapsed (r = prog(st, rng_factory()))
-        all(isfinite, Array(r.outputs.position)) ||
-            error("RK HMC produced a non-finite position on a timed round (chain exploded)")
-        push!(times, t)
-    end
-    median(times) / T * 1e6
-end
-_native_rng() = Xoshiro(91)
-
-# ---- AHMC-Turing HMC (µs/transition): fixed-L multinomial HMC over the Turing LDF, MATCHING
-# the RK program (L=steps, stepsize=0.03, no adaptation, warmup excluded). ----
-function ahmc_loop(tldf, q0; T = 1000, steps = 16, stepsize = 0.03, rounds = 6)
-    D = length(q0)
-    val(q) = DynamicPPL.LogDensityProblems.logdensity(tldf, q)
-    valgrad(q) = DynamicPPL.LogDensityProblems.logdensity_and_gradient(tldf, q)
-    metric = AdvancedHMC.DiagEuclideanMetric(D)
-    ham = AdvancedHMC.Hamiltonian(metric, val, valgrad)
-    integ = AdvancedHMC.Leapfrog(stepsize)
-    kern = AdvancedHMC.HMCKernel(AdvancedHMC.Trajectory{AdvancedHMC.MultinomialTS}(integ, AdvancedHMC.FixedNSteps(steps)))
-    loop() = AdvancedHMC.sample(Xoshiro(91), ham, kern, collect(q0), T;
-        progress = false, verbose = false)
-    _finalpos(r) = r isa Tuple ? r[1][end] : r[end]
-    all(isfinite, _finalpos(loop())) ||               # warmup + finite check
-        error("AHMC-Turing HMC produced a non-finite warmup sample (chain exploded)")
-    times = Float64[]
-    for _ in 1:rounds                                 # per-round finite check (symmetry with RK HMC)
-        local r
-        t = @elapsed (r = loop())
-        all(isfinite, _finalpos(r)) ||
-            error("AHMC-Turing HMC produced a non-finite sample on a timed round (chain exploded)")
-        push!(times, t)
-    end
-    median(times) / T * 1e6
-end
-
 function run_one(name; seed = 468, scale = 0.2, draws = 3)
     println("\n===== [$PHASE] $name =====")
     post = PosteriorDB.posterior(PDB, name)
@@ -219,7 +151,7 @@ function run_one(name; seed = 468, scale = 0.2, draws = 3)
     # RK reverse gradient parity — resilient to the KNOWN authored-plate core defect
     # (snag authored-plate-i-4556ee01: Int-axis accumulator / Any-materialization Enzyme
     # failure). On THAT failure record the exact diagnostic; under DISCOVER the row keeps
-    # every unaffected cell and only gradient_rk + hmc_rk_native carry the string (to be
+    # every unaffected cell and only gradient_rk carries the string (to be
     # republished as numbers once the core fix lands). Any OTHER error still throws.
     rk_grad_diag = nothing
     rk_grad_err = try
@@ -266,7 +198,7 @@ function run_one(name; seed = 468, scale = 0.2, draws = 3)
     # SUPPORT-boundary probe (per-side; Fix E / option 1). Stan is the REFERENCE and stays HARD; a
     # per-side RK or Turing failure is owned by THAT side (kept under DISCOVER as a diagnostic +
     # correctness=false; hard error under strict). A finite Turing where RK+Stan are -Inf is
-    # NON-EQUIVALENT support — not a valid reference success (no RK/Turing ratio, no HMC claim).
+    # NON-EQUIVALENT support — not a valid reference success (no RK/Turing ratio).
     turing_support_ok = true; turing_support_diag = nothing
     if e.boundary !== nothing
         qb = e.boundary(points[1])
@@ -310,20 +242,13 @@ function run_one(name; seed = 468, scale = 0.2, draws = 3)
         # Rows WITHOUT this field predate it — their absent scale-aware fields are "not recorded under
         # the old protocol", not a defect (performance directive: no full-82 rerun just to backfill).
         protocol = PARITY_PROTOCOL,
-        # native single-eval closures (timed by All80Axes); HMC returns µs/transition directly
+        # native single-eval closures (timed by All80Axes)
         rk_primal = () -> kb(q),
         tu_primal = () -> DynamicPPL.LogDensityProblems.logdensity(tldf, qt),
         stan_primal = () -> stan_val(sm, sq(q)),
         rk_grad = () -> ReactiveKernels.ad_value_and_gradient!(prep, gbuf, q),
         tu_grad = () -> DynamicPPL.LogDensityProblems.logdensity_and_gradient(tldf, qt),
-        stan_grad = () -> BridgeStan.log_density_gradient(sm, sq(q); propto = false, jacobian = true),
-        hmc_time_loop = transitions ->
-            hmc_loop(kb, prep, q, _native_rng;
-                T = transitions, steps = All80Axes.HMC_STEPS,
-                rounds = All80Axes.HMC_ROUNDS),
-        ahmc_time_loop = transitions ->
-            ahmc_loop(tldf, qt; T = transitions, steps = All80Axes.HMC_STEPS,
-                rounds = All80Axes.HMC_ROUNDS))
+        stan_grad = () -> BridgeStan.log_density_gradient(sm, sq(q); propto = false, jacobian = true))
 
     row = All80Axes.measure_native(ctx)
     # optional optimized-Stan / further-Turing cells: user-directive deferral provenance
@@ -333,9 +258,7 @@ function run_one(name; seed = 468, scale = 0.2, draws = 3)
     row["input_identity_native"] = input_identity
     for (k, v) in sort(collect(row); by = first)
         v isa Real && occursin(r"^(primal|gradient)_", k) && println("  $(rpad(k,24)) $(fmt(v))")
-        v isa Real && startswith(k, "hmc_") && println("  $(rpad(k,24)) $(round(v;sigdigits=3)) µs/it")
     end
-    println("  HMC protocol: $(row["hmc_transitions"]) transitions × $(row["hmc_steps"]) steps × $(row["hmc_rounds"]) rounds")
     println("MODEL_OK [$PHASE] $name")
     row
 end

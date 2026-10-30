@@ -28,8 +28,6 @@ const FOCUSED_BENCHMARK_VIEWS = (
     :render_eight_schools_primal_benchmarks => (4, 4),
     :render_eight_schools_ad_benchmarks => (4, 4),
     :render_sum_to_zero_benchmarks => (4, 4),
-    :render_nuts_g7_benchmark => (1, 1),
-    :render_nuts_reactant_benchmark => (1, 2),
     :render_eight_schools_reactant_benchmark => (4, 4),
     :render_eight_schools_reactant_ad_benchmark => (3, 3),
     :render_mnist_logistic_benchmarks => (4, 4),
@@ -40,7 +38,6 @@ const FOCUSED_BENCHMARK_VIEWS = (
     :render_mnist_reactant_wren_benchmark => (4, 4),
     :render_mnist_reactant_ad_benchmark => (3, 3),
     :render_mnist_reactant_ad_wren_benchmark => (3, 3),
-    :render_probprog_mcmc_benchmark => (1, 3),
 )
 
 @testset "focused benchmark renderer inventory" begin
