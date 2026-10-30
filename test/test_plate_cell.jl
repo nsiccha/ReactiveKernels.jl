@@ -755,3 +755,120 @@ end
         @test dbeta[2] ≈ _cell_central(b -> k(d..., [0.2, b], 0.3, 2), -0.4) rtol = 1e-6
     end
 end
+
+# A completed covariate read through gathers, the shape of a missing-value
+# completion: drawn entries `vcat(drawn_free, z)` and a literal-padded
+# `vcat(z, 0.0)` gathered onto the covariate's rows, a typed alias of the
+# completion, and that alias gathered by two index vectors in one expression.
+# Each runs at the rows the cell reads (snag `on-arbeitsplatza-6065a1ef`).
+@kernel _cell_completion(y, observed, mask, lookup::Vector{Int}, free::Vector{Float64},
+                         scale::Float64, z::Vector{Float64}, r1::Vector{Int},
+                         r2::Vector{Int}) = begin
+    drawn_free = exp.(free .* scale)
+    missing_values = vcat(drawn_free, z)
+    padded = vcat(z, 0.0)
+    completed = observed .+ mask .* missing_values[lookup] .+ padded[lookup]
+    typed::AbstractVector = completed
+    eta = log.(typed[r1]) .+ log.(typed[r2])
+    dens = plate(eta, y) do ei, yi
+        -(yi - ei)^2 / 2
+    end
+    return dens
+end
+
+# Matrices stacked by `vcat` and read by a row gather.
+@kernel _cell_stacked(y, A::Matrix{Float64}, B::Matrix{Float64}, g::Vector{Int}) = begin
+    M = vcat(A, B)
+    v = M[g, 2]
+    dens = plate(v, y) do vi, yi
+        -(yi - vi)^2 / 2
+    end
+    return dens
+end
+
+# A declaration that converts elements (`Vector{Float64}` of integer rows)
+# keeps the whole value: its rows alone could not show the conversion.
+@kernel _cell_converted(y, x::Vector{Int}, r::Vector{Int}) = begin
+    d = x .* 2
+    t::Vector{Float64} = d
+    e = t[r] ./ 3
+    dens = plate(e, y) do ei, yi
+        -(yi - ei)^2 / 2
+    end
+    return dens
+end
+
+@testset "plate_cell: vcat operands, typed aliases and several gather indices at the cell's rows" begin
+    have = (:y, :observed, :mask, :lookup, :free, :scale, :z, :r1, :r2)
+    k = prepare(plate_cell(_cell_completion, :dens; index = :i);
+        have = (have..., :i), want = :dens_cell)
+    full = prepare(_cell_completion; have, want = :dens)
+    # The rows the tested cells read fall in the same operands at every size:
+    # a cell reads `completed` at rows 10 and 16 (`r1`, `r2`), which look up a
+    # free draw and the padding literal.
+    function data(n)
+        nz = max(2, n ÷ 2)
+        lookup = [j == 16 ? nz + 1 : mod1(3j, 7) for j in 1:n]
+        mask = Float64[isodd(j) for j in 1:n]
+        (; y = cos.(1:2n), observed = 1.0 .+ (1 .- mask) .* collect(range(0.1, 0.9; length = n)),
+           mask, lookup)
+    end
+    params(n) = (; free = collect(range(-0.5, 0.4; length = max(1, n ÷ 3))), scale = 0.7,
+        z = collect(range(0.1, 0.6; length = max(2, n ÷ 2))))
+    rows(n) = (; r1 = [mod1(5j, n) for j in 1:2n], r2 = [mod1(7j + 2, n) for j in 1:2n])
+    d, p, r = data(15), params(15), rows(15)
+    reference = full(d..., p..., r...)
+    @test [k(d..., p..., r..., i) for i in eachindex(reference)] ≈ reference
+    pushed = let lp = ReactiveKernels._lowering_plan(k.plan),
+                 cells = ReactiveKernels._cell_pushdowns(lp)
+        Set(String(cells.producer[c].outputs[1].name) for c in cells.pushed)
+    end
+    @test issubset(Set(["drawn_free", "missing_values", "padded", "completed", "typed",
+        "eta"]), pushed)
+    allocated(n) = let d = data(n), p = params(n), r = rows(n)
+        k(d..., p..., r..., 2); @allocated k(d..., p..., r..., 2)
+    end
+    @test allocated(30) == allocated(30_000)
+    # A cell's own reads are checked, as the whole program checks them.
+    @test_throws BoundsError k(d..., p..., r..., 2 * 15 + 1)
+    beyond = (; d..., lookup = [d.lookup[1:end-1]; length(p.z) + 2])
+    @test_throws BoundsError full(beyond..., p..., r...)
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for i in (1, 8), name in (:free, :scale, :z)
+        ad = prepare_ad(k, backend, d..., p..., r..., i; active = name)
+        value, dp = ad_value_and_gradient(ad, d..., p..., r..., i)
+        @test value ≈ reference[i]
+        for j in eachindex(getfield(p, name))
+            e = getfield(p, name) isa Number ? 1.0 :
+                setindex!(zero(getfield(p, name)), 1.0, j)
+            @test dp[j] ≈ _cell_central(h -> k(d..., merge(p, NamedTuple{(name,)}(
+                (getfield(p, name) .+ h .* e,)))..., r..., i), 0.0) atol = 1e-6
+        end
+    end
+    # Stacked matrices: a row of `vcat(A, B)` is a row of `A` or of `B`, and
+    # operands of different widths fail as the whole program does.
+    sk = prepare(plate_cell(_cell_stacked, :dens; index = :i);
+        have = (:y, :A, :B, :g, :i), want = :dens_cell)
+    sfull = prepare(_cell_stacked; have = (:y, :A, :B, :g), want = :dens)
+    stacked(n) = (; y = sin.(1:n), A = reshape(collect(range(0, 1; length = 3n)), n, 3),
+        B = reshape(collect(range(-1, 0; length = 6)), 2, 3), g = [mod1(4j, n + 2) for j in 1:n])
+    s = stacked(9)
+    @test [sk(s..., i) for i in eachindex(s.y)] ≈ sfull(s...)
+    salloc(n) = let s = stacked(n); sk(s..., 2); @allocated sk(s..., 2) end
+    @test salloc(10) == salloc(10_000)
+    narrow = (; s..., B = s.B[:, 1:2])
+    @test_throws DimensionMismatch sfull(narrow...)
+    @test_throws DimensionMismatch sk(narrow..., 2)
+    # A converting declaration is computed whole, and still converts.
+    ck = prepare(plate_cell(_cell_converted, :dens; index = :i);
+        have = (:y, :x, :r, :i), want = :dens_cell)
+    cfull = prepare(_cell_converted; have = (:y, :x, :r), want = :dens)
+    c = (; y = cos.(1:6), x = collect(1:4), r = [1, 4, 2, 3, 3, 1])
+    @test [ck(c..., i) for i in 1:6] ≈ cfull(c...)
+    converted = let lp = ReactiveKernels._lowering_plan(ck.plan),
+                    cells = ReactiveKernels._cell_pushdowns(lp)
+        cells === nothing ? Set{String}() :
+            Set(String(cells.producer[v].outputs[1].name) for v in cells.pushed)
+    end
+    @test !("t" in converted)
+end
