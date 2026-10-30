@@ -966,6 +966,7 @@ _cq_form_data(n) = (; y1 = sin.(1:n), y2 = cos.(1:n), y3 = sin.(2 .* (1:n)),
         @test all(m -> m.values[2] ≈ m.dense_value ≈ m.compact_value, measured)
         @test all(m -> m.parity && m.central, measured)
     end
+end
 
 # A model value an ordinary function computes, read at a cell's rows, is
 # computed whole in every cell. `locality = :error` refuses the query naming
