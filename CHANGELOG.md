@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.14
+
+- The type-stability check's code audit (`type_stability_level = :rk` and the
+  default `:all`) no longer reports the code that Julia's logging macros
+  (`@debug`, `@info`, `@warn`, `@error`, `@logmsg`) write into a function's
+  body, the record's message and fields included. That code is Julia's own,
+  dispatches at run time by design, and runs only when its log statement is
+  reached. A dependency that logs on a cold branch, such as SpecialFunctions'
+  `beta_inc` with `@debug` on underflow (reached through a negative-binomial
+  cdf), therefore no longer makes `type_stability = :error` refuse the
+  program at `:all`. Other run-time dispatch in such a function is still
+  reported.
+
 ## 0.1.13
 
 - With an Enzyme that has `Enzyme.set_atomic_add` (EnzymeCore 0.8.27, the
