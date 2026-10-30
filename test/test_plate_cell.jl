@@ -793,6 +793,19 @@ end
     return dens
 end
 
+# One value read at two row sets by two definitions: computed once per cell,
+# at both sets of rows, with everything upstream of it.
+@kernel _cell_shared_reads(y, x, r1::Vector{Int}, r2::Vector{Int}, a::Float64) = begin
+    base = exp.(x .* a)
+    first = base[r1] .* 2.0
+    second = base[r2] .+ 1.0
+    total = first .+ second
+    dens = plate(total, y) do ti, yi
+        -(yi - ti)^2 / 2
+    end
+    return dens
+end
+
 # Matrices stacked by `vcat` and read by a row gather.
 @kernel _cell_stacked(y, A::Matrix{Float64}, B::Matrix{Float64}, g::Vector{Int}) = begin
     M = vcat(A, B)
@@ -815,7 +828,7 @@ end
     return dens
 end
 
-@testset "plate_cell: vcat operands, typed aliases, several gather indices and index-array plates at the cell's rows" begin
+@testset "plate_cell: vcat operands, typed aliases, several gather indices and index-array plates at the cell's rows, each value once" begin
     have = (:y, :observed, :mask, :lookup, :free, :scale, :z, :r1, :r2)
     k = prepare(plate_cell(_cell_completion, :dens; index = :i);
         have = (have..., :i), want = :dens_cell)
@@ -904,6 +917,23 @@ end
         e = setindex!(zeros(2), 1.0, j)
         @test dbeta[j] ≈ _cell_central(h -> tk(t..., beta .+ h .* e, 5), 0.0) rtol = 1e-6
     end
+    # A value read at two row sets is computed once, at both: one row check
+    # per value computed at rows (`base`, `first`, `second`, `total`).
+    rk = prepare(plate_cell(_cell_shared_reads, :dens; index = :i);
+        have = (:y, :x, :r1, :r2, :a, :i), want = :dens_cell)
+    rfull = prepare(_cell_shared_reads; have = (:y, :x, :r1, :r2, :a), want = :dens)
+    shared(n) = (; y = sin.(1:n), x = collect(range(-1, 1; length = n)),
+        r1 = [mod1(3j, n) for j in 1:n], r2 = [mod1(5j + 1, n) for j in 1:n])
+    sr = shared(11)
+    @test [rk(sr..., 0.4, i) for i in 1:11] ≈ rfull(sr..., 0.4)
+    code = string(ReactiveKernels.code_expr(rk))
+    @test length(findall("_cell_check_row", code)) == 4
+    @test occursin("_cell_union_rows", code)
+    ralloc(n) = let sr = shared(n); rk(sr..., 0.4, 2); @allocated rk(sr..., 0.4, 2) end
+    @test ralloc(11) == ralloc(11_000)
+    _, da = ad_value_and_gradient(prepare_ad(rk, backend, sr..., 0.4, 3; active = :a),
+        sr..., 0.4, 3)
+    @test da ≈ _cell_central(a -> rk(sr..., a, 3), 0.4) rtol = 1e-6
     # A converting declaration is computed whole, and still converts.
     ck = prepare(plate_cell(_cell_converted, :dens; index = :i);
         have = (:y, :x, :r, :i), want = :dens_cell)

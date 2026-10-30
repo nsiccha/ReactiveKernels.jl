@@ -257,6 +257,23 @@ end
 @inline _cell_gather_rows(ats...) =
     Int[row for at in ats for row in (at isa Integer ? (at,) : at)]
 
+# The rows several readers ask a value for, each once, in first-asked order.
+@inline _cell_union_rows(ats...) = unique!(_cell_gather_rows(ats...))
+
+# Rows `rows` of a value's window `data` computed at rows `union` (which hold
+# them), in the order asked, every later dimension whole.
+@inline function _cell_take_rows(data::AbstractArray{<:Any,N}, union::Vector{Int},
+                                 rows) where {N}
+    positions = Int[_cell_union_position(union, row)
+                    for row in (rows isa Integer ? (rows,) : rows)]
+    view(data, positions, ntuple(_ -> Colon(), Val(N - 1))...)
+end
+@inline function _cell_union_position(union::Vector{Int}, row)
+    k = findfirst(==(row), union)
+    k === nothing && throw(BoundsError(union, row))
+    k
+end
+
 # Rows of a product's left factor; bounds-checked, never extruded.
 @inline _cell_factor_rows(arg::AbstractArray{<:Any,N}, row::Integer) where {N} =
     view(arg, row:row, ntuple(_ -> Colon(), Val(N - 1))...)
@@ -708,7 +725,8 @@ argument values it is lowered with in `plates`). `captures[cell recipe id]`
 maps each shared argument position read at the cell's own rows to the batched
 argument holding those rows and the shared argument they are read through
 (`_cell_capture_positions`); `batched[cell recipe id]` names the cell's
-ordinary batched argument positions.
+ordinary batched argument positions; `order[recipe id]` is its position in the
+plan, producers first.
 """
 struct _CellPushdowns
     graph::Graph
@@ -720,6 +738,7 @@ struct _CellPushdowns
     batched::Dict{Int,Set{Int}}
     slots::Dict{Int,Int}
     plates::Dict{Int,Any}
+    order::Dict{Int,Int}
 end
 
 # Whether a producer reads an input in `role` at its own rows.
@@ -846,13 +865,23 @@ function _cell_pushdowns(p::Plan)
     recipes = Set(only(producers[cid]).id for cid in pushed)
     _CellPushdowns(g, pushed, recipes,
         Dict(cid => only(producers[cid]) for cid in pushed), forms, captures, batched,
-        Dict{Int,Int}(), Dict{Int,Any}())
+        Dict{Int,Int}(), Dict{Int,Any}(), Dict(r.id => k for (k, r) in enumerate(p.recipes)))
 end
 
 # ---------------------------------------------------------------- emission
 
-# Emits, into `body`, the rows of pushed values one cell reads. Shapes are
-# memoized per value, operand rows and windows per (value, row binding).
+# Emits, into `body`, the rows of pushed values one cell reads. Each pushed
+# value is computed ONCE per cell, at the union of the rows its readers ask for
+# (the cell's own reads, and each pushed reader's): a value two readers read at
+# different rows, such as a predictor gathered by two index vectors in two
+# definitions, or one whose readers read it at different rows of a shared
+# source, would otherwise be computed, with everything upstream of it, once
+# per read. The requests are collected first, from the readers down, in
+# reverse plan order (`_cell_emit_windows!`): every reader of a value comes
+# after it in the plan, so a value's rows are complete when it is reached.
+# The windows are then computed in plan order, each reader taking its rows from
+# its operand's window (`_cell_take!`, or a `_CellWindow` for a gather).
+# Shapes are memoized per value, operand row slices per (value, row binding).
 # `runtime_ops` / `runtime_recipes` are the operation table being built; a
 # pushed plate's code reads the slots reserved at its own position.
 struct _CellEmitter
@@ -863,12 +892,16 @@ struct _CellEmitter
     runtime_recipes::Vector{Recipe}
     shapes::Dict{ValueId,Symbol}
     rows::Dict{Tuple{ValueId,Symbol},Symbol}
-    windows::Dict{Tuple{ValueId,Symbol},Symbol}
+    requests::Dict{ValueId,Vector{Symbol}}
+    unions::Dict{ValueId,Symbol}
+    reads::Dict{ValueId,Vector{Any}}
+    data::Dict{ValueId,Symbol}
 end
 _CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes) =
     _CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes,
         Dict{ValueId,Symbol}(), Dict{Tuple{ValueId,Symbol},Symbol}(),
-        Dict{Tuple{ValueId,Symbol},Symbol}())
+        Dict{ValueId,Vector{Symbol}}(), Dict{ValueId,Symbol}(),
+        Dict{ValueId,Vector{Any}}(), Dict{ValueId,Symbol}())
 
 _cell_ref(name) = GlobalRef(@__MODULE__, name)
 
@@ -934,58 +967,131 @@ function _cell_operand_row!(e::_CellEmitter, cid::ValueId, row::Symbol)
     end
 end
 
-# The rows `row:row` of pushed value `cid`, by its own operation.
-function _cell_window!(e::_CellEmitter, cid::ValueId, row::Symbol)
-    haskey(e.windows, (cid, row)) && return e.windows[(cid, row)]
+# Asks for pushed value `cid` at rows `row` (one row or an integer vector).
+function _cell_request!(e::_CellEmitter, cid::ValueId, row::Symbol)
+    rows = get!(() -> Symbol[], e.requests, cid)
+    row in rows || push!(rows, row)
+    row
+end
+
+# The rows every request of `cid` reads: the one request, or their union.
+function _cell_union!(e::_CellEmitter, cid::ValueId)
+    rows = e.requests[cid]
+    e.unions[cid] = length(rows) == 1 ? only(rows) :
+        _cell_bind!(e, :cell_rows_union, Expr(:call, _cell_ref(:_cell_union_rows), rows...))
+end
+
+# The data of pushed value `cid` at rows `row`, one of its requests: its
+# window when that request is the window's rows, else those rows of it.
+function _cell_take!(e::_CellEmitter, cid::ValueId, row::Symbol)
+    e.unions[cid] === row && return e.data[cid]
+    _cell_bind!(e, :cell_taken,
+        Expr(:call, _cell_ref(:_cell_take_rows), e.data[cid], e.unions[cid], row))
+end
+
+# Computes every requested pushed value's window, once each: requests from the
+# readers down (reverse plan order), then the windows in plan order.
+function _cell_emit_windows!(e::_CellEmitter)
+    d = e.pushdowns
+    done = Set{ValueId}(keys(e.unions))
+    processed = ValueId[]
+    while true
+        pending = [cid for cid in keys(e.requests) if !(cid in done)]
+        isempty(pending) && break
+        cid = pending[argmax([d.order[d.producer[c].id] for c in pending])]
+        push!(done, cid)
+        push!(processed, cid)
+        _cell_union!(e, cid)
+        _cell_request_inputs!(e, cid)
+    end
+    for cid in sort!(processed; by = c -> d.order[d.producer[c].id])
+        e.data[cid] = _cell_window!(e, cid)
+    end
+    e
+end
+
+# The rows value `cid`'s window reads of each of its inputs, at its union rows
+# `U`: requested of a pushed input, and recorded (`reads[cid][j]`, or per
+# `vcat` operand) for the window to read.
+function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
     d = e.pushdowns
     r = d.producer[cid]
     f = d.forms[r.id]
-    f.kind === :vcat && return e.windows[(cid, row)] = _cell_vcat_window!(e, cid, r, f, row)
-    if f.kind in (:pointwise, :identity, :columns, :hcat)
-        push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row),
-            _cell_shape!(e, cid), row))
+    U = e.unions[cid]
+    if f.kind === :vcat
+        starts = _cell_bind!(e, :cell_starts,
+            Expr(:call, _cell_ref(:_cell_vcat_starts), _cell_vcat_part_shapes!(e, r, f)))
+        e.reads[cid] = Any[starts; map(enumerate(f.parts)) do (k, part)
+            part isa Int || return nothing
+            local_rows = _cell_bind!(e, :cell_row,
+                Expr(:call, _cell_ref(:_cell_vcat_part_rows), starts, k, U))
+            input = canon_id(d.graph, r.inputs[part].id)
+            input in d.pushed && _cell_request!(e, input, local_rows)
+            local_rows
+        end]
+        return
     end
-    args = Any[]
+    reads = Any[nothing for _ in r.inputs]
     for (j, input) in enumerate(r.inputs)
         icid = canon_id(d.graph, input.id)
         role = f.roles[j]
-        if role in (:leaf, :index, :column)
-            if icid in d.pushed
-                inner = _cell_bind!(e, :cell_row, Expr(:call, _cell_ref(:_cell_leaf_row),
-                    _cell_shape!(e, icid), row))
-                push!(args, _cell_window!(e, icid, inner))
-            else
-                push!(args, _cell_operand_row!(e, icid, row))
-            end
+        if role in (:leaf, :index, :column) && icid in d.pushed
+            reads[j] = _cell_request!(e, icid, _cell_bind!(e, :cell_row,
+                Expr(:call, _cell_ref(:_cell_leaf_row), _cell_shape!(e, icid), U)))
         elseif role in (:gather, :linear_gather) && icid in d.pushed
             # The rows every gather index reads (`_cell_gather_rows` joins
             # those of several indices).
             ats = map(f.indices[j]) do k
                 index = canon_id(d.graph, r.inputs[k].id)
-                at = _cell_operand_row!(e, index, row)
-                f.vias[j] == 0 ? Expr(:call, _cell_ref(:_cell_gather_row), at, row) :
+                at = _cell_operand_row!(e, index, U)
+                f.vias[j] == 0 ? Expr(:call, _cell_ref(:_cell_gather_row), at, U) :
                     Expr(:call, _cell_ref(:_cell_via_rows),
                         e.names[canon_id(d.graph, r.inputs[f.vias[j]].id)], at)
             end
             at = length(ats) == 1 ? only(ats) :
                 Expr(:call, _cell_ref(:_cell_gather_rows), ats...)
-            shape = role === :gather ? nothing : _cell_shape!(e, icid)
             role === :gather ||
-                (at = Expr(:call, _cell_ref(:_cell_linear_row), shape, at))
-            source_row = _cell_bind!(e, :cell_row, at)
-            window = _cell_window!(e, icid, source_row)
-            push!(args, _cell_bind!(e, :cell_window, Expr(:call,
-                _cell_ref(:_CellWindow), window, source_row, shape)))
+                (at = Expr(:call, _cell_ref(:_cell_linear_row), _cell_shape!(e, icid), at))
+            reads[j] = _cell_request!(e, icid, _cell_bind!(e, :cell_row, at))
         elseif role === :factor_leaf
             # The rows of the product `A * w` this operand broadcasts: rows of `A`.
-            inner = _cell_bind!(e, :cell_row, Expr(:call, _cell_ref(:_cell_leaf_row),
-                _cell_part_shape!(e, r, f, j), row))
-            push!(args, icid in d.pushed ? _cell_window!(e, icid, inner) :
-                Expr(:call, _cell_ref(:_cell_factor_rows), e.names[icid], inner))
-        elseif role === :factor && icid in d.pushed
-            push!(args, _cell_window!(e, icid, row))
+            reads[j] = _cell_bind!(e, :cell_row, Expr(:call, _cell_ref(:_cell_leaf_row),
+                _cell_part_shape!(e, r, f, j), U))
+            icid in d.pushed && _cell_request!(e, icid, reads[j])
         elseif role === :factor
-            push!(args, Expr(:call, _cell_ref(:_cell_factor_rows), e.names[icid], row))
+            reads[j] = U
+            icid in d.pushed && _cell_request!(e, icid, U)
+        end
+    end
+    e.reads[cid] = reads
+end
+
+# The window of pushed value `cid` at its union rows, by its own operation.
+function _cell_window!(e::_CellEmitter, cid::ValueId)
+    d = e.pushdowns
+    r = d.producer[cid]
+    f = d.forms[r.id]
+    U = e.unions[cid]
+    f.kind === :vcat && return _cell_vcat_window!(e, cid, r, f, U)
+    if f.kind in (:pointwise, :identity, :columns, :hcat)
+        push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row),
+            _cell_shape!(e, cid), U))
+    end
+    reads = e.reads[cid]
+    args = Any[]
+    for (j, input) in enumerate(r.inputs)
+        icid = canon_id(d.graph, input.id)
+        role = f.roles[j]
+        if role in (:leaf, :index, :column)
+            push!(args, icid in d.pushed ? _cell_take!(e, icid, reads[j]) :
+                _cell_operand_row!(e, icid, U))
+        elseif role in (:gather, :linear_gather) && icid in d.pushed
+            shape = role === :gather ? nothing : _cell_shape!(e, icid)
+            push!(args, _cell_bind!(e, :cell_window, Expr(:call,
+                _cell_ref(:_CellWindow), e.data[icid], e.unions[icid], shape)))
+        elseif role in (:factor_leaf, :factor)
+            push!(args, icid in d.pushed ? _cell_take!(e, icid, reads[j]) :
+                Expr(:call, _cell_ref(:_cell_factor_rows), e.names[icid], reads[j]))
         else
             push!(args, e.names[icid])
         end
@@ -997,45 +1103,45 @@ function _cell_window!(e::_CellEmitter, cid::ValueId, row::Symbol)
         window = gensym(:cell_rows)
         _lower_authored_plate_native!(e.body, e.runtime_ops[1:offset],
             e.runtime_recipes[1:offset], r.op, args, d.plates[r.id], window, nothing)
-        return e.windows[(cid, row)] = window
+        return window
     end
     call = Expr(:call, Expr(:ref, _OPS_ARG, d.slots[r.id]), args...)
     f.kind === :identity &&
         (call = Expr(:call, GlobalRef(Base, :convert), valtype(only(r.outputs)), call))
-    e.windows[(cid, row)] = _cell_bind!(e, :cell_rows, call)
+    _cell_bind!(e, :cell_rows, call)
 end
 
-# The rows `row` of a pushed `vcat`: each operand at the rows of it they hold
+# The rows `U` of a pushed `vcat`: each operand at the rows of it they hold
 # (possibly none), by its own producer when it is pushed and as a view of its
 # whole value otherwise, then those rows in the order read.
 function _cell_vcat_window!(e::_CellEmitter, cid::ValueId, r::Recipe, f::_CellForm,
-                            row::Symbol)
+                            U::Symbol)
     d = e.pushdowns
     shape = _cell_shape!(e, cid)
-    push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row), shape, row))
-    starts = _cell_bind!(e, :cell_starts,
-        Expr(:call, _cell_ref(:_cell_vcat_starts), _cell_vcat_part_shapes!(e, r, f)))
-    parts = map(enumerate(f.parts)) do (k, part)
+    push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row), shape, U))
+    starts, locals = e.reads[cid][1], e.reads[cid][2:end]
+    parts = map(zip(f.parts, locals)) do (part, local_rows)
         part isa Int || return part
-        local_rows = _cell_bind!(e, :cell_row,
-            Expr(:call, _cell_ref(:_cell_vcat_part_rows), starts, k, row))
         input = canon_id(d.graph, r.inputs[part].id)
-        input in d.pushed ? _cell_window!(e, input, local_rows) :
+        input in d.pushed ? _cell_take!(e, input, local_rows) :
             _cell_operand_row!(e, input, local_rows)
     end
-    _cell_bind!(e, :cell_rows, Expr(:call, _cell_ref(:_cell_vcat_rows), row, starts,
+    _cell_bind!(e, :cell_rows, Expr(:call, _cell_ref(:_cell_vcat_rows), U, starts,
         Expr(:tuple, parts...), shape))
 end
 
-# The window a cell reads in place of pushed capture `cid`, at linear
-# position `only(slice)` (the cell's batched element), or at `via[only(slice)]`;
-# either is one position or an integer vector of them.
-function _cell_capture!(e::_CellEmitter, cid::ValueId, slice, via = nothing)
+# The row a cell reads of pushed capture `cid`, at linear position
+# `only(slice)` (the cell's batched element), or at `via[only(slice)]`; either
+# is one position or an integer vector of them. Requested; read with
+# `_cell_capture!` once the windows are emitted.
+function _cell_capture_request!(e::_CellEmitter, cid::ValueId, slice, via = nothing)
     element = Expr(:call, GlobalRef(Base, :only), slice)
     via === nothing || (element = Expr(:call, GlobalRef(Base, :getindex), via, element))
     position = _cell_bind!(e, :cell_read, element)
-    shape = _cell_shape!(e, cid)
-    row = _cell_bind!(e, :cell_row, Expr(:call, _cell_ref(:_cell_linear_row), shape, position))
-    window = _cell_window!(e, cid, row)
-    _cell_bind!(e, :cell_capture, Expr(:call, _cell_ref(:_CellWindow), window, row, shape))
+    _cell_request!(e, cid, _cell_bind!(e, :cell_row,
+        Expr(:call, _cell_ref(:_cell_linear_row), _cell_shape!(e, cid), position)))
 end
+
+# The window a cell reads in place of pushed capture `cid`.
+_cell_capture!(e::_CellEmitter, cid::ValueId) = _cell_bind!(e, :cell_capture,
+    Expr(:call, _cell_ref(:_CellWindow), e.data[cid], e.unions[cid], _cell_shape!(e, cid)))
