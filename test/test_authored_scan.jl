@@ -721,3 +721,21 @@ const _scan_captured_shadowed = [100.0]
     @test prepare(_scan_captured_in_plate)([[1.0, 2.0], [2.0]], [2.0, 9.0]) ==
           [sum(cumsum([1.0, 2.0] .* 2.0)), sum(cumsum([2.0] .* 2.0))]
 end
+
+# An inline statement's locals carry the authored names (`#p_α#op1`), and
+# embedding a scan step renumbers them: a name that ends in a multibyte
+# character splits at a character boundary (snag `inline-shifted-l-b520877e`).
+@testset "authored scan step over non-ASCII names" begin
+    @kernel _scan_unicode_ports(xs, ws, c_γ) = begin
+        out = scan(xs, ws; init = 0.0) do carry, p_α, p_β
+            next = p_β * carry + p_α * c_γ
+            (next, next)
+        end
+        return out
+    end
+    @test prepare(_scan_unicode_ports)([1.0, 2.0, 3.0], [0.5, 0.5, 0.5], 2.0) ==
+          [2.0, 5.0, 8.5]
+    @test ReactiveKernels._inline_local_index(Symbol("#p_α#op1")) == 1
+    @test ReactiveKernels._inline_shifted_local(Symbol("#p_α#op1"), 2) ===
+          Symbol("#p_α#op3")
+end
