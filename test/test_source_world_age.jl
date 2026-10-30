@@ -44,6 +44,48 @@ end
     end
 end
 
+# A plate's buffer is typed from its cells' sources before the loop runs, so
+# that typing reads the builder's fresh sources in the builder's world too.
+# Typed through the authored closure, whose method the builder's world does not
+# see, a cell type inferred `Union{}`: the primal raised a `MethodError` in
+# `_static_plate_axis_class(::Type{Union{}})`, native Reverse an
+# `EnzymeRuntimeActivityError`, and a nested NLME fit that differentiated its
+# kernel in the fit's own world failed compiling it (snag
+# `brm-canonical-44-a1653c2a`).
+function immediate_plates(groups, s)
+    flat = authored(:(flat_cells(groups, s::Float64) = begin
+        cells = plate(groups) do g
+            scaled = g .* s
+            sum(scaled)
+        end
+        return cells
+    end))
+    nested = authored(:(nested_cells(groups, s::Float64) = begin
+        cells = plate(groups) do g
+            scaled = g .* s
+            shifted = plate(scaled) do v
+                v + s
+            end
+            sum(shifted)
+        end
+        return cells
+    end))
+    for (spec, slopes) in ((flat, sum.(groups)),
+                           (nested, sum.(groups) .+ length.(groups)))
+        kernel = prepare(spec)
+        @test kernel(groups, s) ≈ s .* slopes
+        @test only(only(Enzyme.autodiff(Enzyme.Reverse,
+            Enzyme.Const(t -> sum(kernel(groups, t))), Enzyme.Active,
+            Enzyme.Active(s)))) ≈ sum(slopes)
+    end
+end
+
+@testset "plate kernels execute and differentiate in their builder's world" begin
+    for s in (0.5, 2.0)
+        immediate_plates([[1.0, 2.0], [3.0], Float64[]], s)
+    end
+end
+
 @testset "authored source preserves captures and lexical scopes" begin
     spec = Core.eval(@__MODULE__, quote
         let offset = 1.0
