@@ -4276,7 +4276,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
                 Expr(:call, GlobalRef(@__MODULE__, :_cell_batched_slice), taken, cell)
         end
         later = _CellEmitter(body, d, windows.names, windows.runtime_ops,
-            windows.runtime_recipes)
+            windows.runtime_recipes; sorted = partition)
         foreach(c -> waits(c) && request!(later, c), captures)
         any(waits, captures) && _cell_emit_windows!(later)
         for c in captures
@@ -4712,7 +4712,8 @@ function _lower_with_ops_collecting(p::Plan;
             _lower_authored_plate_cell!(body, runtime_ops, runtime_recipes, r,
                 callargs, lhs;
                 windows = cells === nothing ? nothing :
-                    _CellEmitter(body, cells, names, runtime_ops, runtime_recipes))
+                    _CellEmitter(body, cells, names, runtime_ops, runtime_recipes;
+                                 sorted = r.op.rows))
             continue
         end
         if inline_embedded && r.op isa _AuthoredScanOp

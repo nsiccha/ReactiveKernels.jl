@@ -71,19 +71,21 @@
 # `on_error = :ignore` twins, is unchanged.
 
 """
-    _CellWindow(data, rows, shape)
+    _CellWindow(data, rows, shape, sorted)
 
 Rows of a value read by one cell. `rows` is one row (an `Int`), or the rows
-its readers read (a `Vector{Int}`, sorted and unique: `_cell_canonical_rows`).
-`data` holds the value at those rows, in that order along its first axis,
-every later dimension whole; `shape` is the value's full axes, or `nothing`
-when only row reads `v[I, j...]` are made of it. Reading any other row throws
-`BoundsError`.
+its readers read (a `Vector{Int}`): a cell's in the order read, repeats
+allowed; a partition's sorted and unique (`sorted`, `_cell_canonical_rows`),
+found by bisection. `data` holds the value at those rows, in that order
+along its first axis, every later dimension whole; `shape` is the value's
+full axes, or `nothing` when only row reads `v[I, j...]` are made of it.
+Reading any other row throws `BoundsError`.
 """
 struct _CellWindow{D,R<:Union{Int,Vector{Int}},S}
     data::D
     rows::R
     shape::S
+    sorted::Bool
 end
 
 # The position along `data`'s first axis of row `row`; `at` is the read. The
@@ -94,14 +96,20 @@ end
     firstindex(w.data, 1)
 end
 @inline function _cell_local_row(w::_CellWindow{<:Any,Vector{Int}}, row, at)
-    firstindex(w.data, 1) + _cell_sorted_position(w.rows, row, at) - 1
+    firstindex(w.data, 1) + _cell_row_position(w.rows, row, at, w.sorted) - 1
 end
-# The position of `row` among sorted unique `rows`, by bisection: O(log rows)
-# per read, never a scan of the rows, so a partition of r cells reading a
-# value row by row costs O(r log r), not O(r²).
-@inline function _cell_sorted_position(rows::Vector{Int}, row, at)
-    k = searchsortedfirst(rows, row)
-    (k > length(rows) || @inbounds(rows[k]) != row) && throw(BoundsError(rows, at))
+# The position of `row` among `rows`: by bisection when they are sorted and
+# unique (a partition's: O(log rows) per read, never a scan, so a partition of
+# r cells reading a value row by row costs O(r log r), not O(r²)), else the
+# first match (a cell's few rows).
+@inline function _cell_row_position(rows::Vector{Int}, row, at, sorted::Bool)
+    if sorted
+        k = searchsortedfirst(rows, row)
+        (k > length(rows) || @inbounds(rows[k]) != row) && throw(BoundsError(rows, at))
+        return k
+    end
+    k = findfirst(==(row), rows)
+    k === nothing && throw(BoundsError(rows, at))
     k
 end
 # The positions of rows `I`, computed before the data is read: a vector read
@@ -294,22 +302,54 @@ end
 
 # The rows a plate reads through its index array `w` at the positions `qs`
 # its index argument holds there (`v[w[q]]`): each `w[q]` is one row or several.
-@inline _cell_via_rows(w, qs) = _cell_canonical_rows(
-    Int[row for q in qs for row in (vec(w)[q] isa Integer ? (vec(w)[q],) : vec(w)[q])])
+@inline function _cell_via_rows(w, qs)
+    v = vec(w)
+    _cell_joined_rows(qs) do q
+        v[q]
+    end
+end
 
-# The rows several gather indices read, joined in order.
+# The rows several gather indices read, joined in order (a tuple of single rows
+# and vectors: the comprehension, which native Enzyme Reverse types; a sized
+# loop over the mixed tuple does not pass its type analysis).
 @inline _cell_gather_rows(ats...) =
     Int[row for at in ats for row in (at isa Integer ? (at,) : at)]
 
-# The rows several readers ask a value for, each once, sorted: the value is
-# computed at them in this order and read back by bisection (`_cell_local_row`).
-@inline _cell_union_rows(ats...) = unique!(sort!(_cell_gather_rows(ats...)))
-# Rows as every request holds them: sorted and unique (the rows themselves when
-# they already are), so one reader's request is its value's window as is, and
-# a value asked for at the same row by many readers is computed once. Every
-# helper that derives rows from rows (leaf, gather, linear, via) returns them
-# this way; the partition's own rows come sorted from its table. One row is
-# itself.
+# `f` of each entry of a vector `entries` (every entry one row or several, of
+# one type), joined in order into one vector sized first (a nested
+# comprehension grows it row by row).
+@inline function _cell_joined_rows(f::F, entries::AbstractVector) where {F}
+    n = 0
+    for q in entries
+        rows = f(q)
+        n += rows isa Integer ? 1 : length(rows)
+    end
+    out = Vector{Int}(undef, n)
+    k = 0
+    for q in entries
+        rows = f(q)
+        if rows isa Integer
+            k += 1
+            @inbounds out[k] = rows
+        else
+            for row in rows
+                k += 1
+                @inbounds out[k] = row
+            end
+        end
+    end
+    out
+end
+
+# The rows several readers ask a value for, each once: in first-asked order for
+# a cell, sorted for a partition (its windows are read by bisection).
+@inline _cell_union_rows(ats...) = unique!(_cell_gather_rows(ats...))
+@inline _cell_union_rows_sorted(ats...) = unique!(sort!(_cell_gather_rows(ats...)))
+# Rows as a partition's requests hold them: sorted and unique (the rows
+# themselves when they already are), so one reader's request is its value's
+# window as is and a value asked for at the same row by many cells is computed
+# once (`_CellEmitter.sorted` wraps every derived request; the partition's own
+# rows come sorted from its table). One row is itself.
 @inline _cell_canonical_rows(row::Integer) = row
 @inline function _cell_canonical_rows(rows::Vector{Int})
     for k in 2:length(rows)
@@ -321,15 +361,14 @@ end
 # Rows `rows` of a value's window `data` computed at rows `union` (which hold
 # them), in the order asked, every later dimension whole. A value without rows
 # (a dotted expression of numbers is a number) reads the same at every row.
-@inline _cell_take_rows(data::Number, ::Vector{Int}, rows) = data
-@inline _cell_take_rows(data::AbstractArray{<:Any,0}, ::Vector{Int}, rows) = data
+@inline _cell_take_rows(data::Number, ::Vector{Int}, rows, sorted::Bool) = data
+@inline _cell_take_rows(data::AbstractArray{<:Any,0}, ::Vector{Int}, rows, sorted::Bool) = data
 @inline function _cell_take_rows(data::AbstractArray{<:Any,N}, union::Vector{Int},
-                                 rows) where {N}
-    positions = Int[_cell_union_position(union, row)
+                                 rows, sorted::Bool) where {N}
+    positions = Int[_cell_row_position(union, row, row, sorted)
                     for row in (rows isa Integer ? (rows,) : rows)]
     view(data, positions, ntuple(_ -> Colon(), Val(N - 1))...)
 end
-@inline _cell_union_position(union::Vector{Int}, row) = _cell_sorted_position(union, row, row)
 
 # The source of a range view or a reshape at rows: a vector, its positions.
 @inline _cell_source_rows(source::AbstractVector, rows) = _cell_factor_rows(source, rows)
@@ -353,8 +392,15 @@ end
     valid || throw(BoundsError(CartesianIndices(shape), row))
     row
 end
-@inline function _cell_check_row(shape::Tuple, rows::Vector{Int})
-    foreach(row -> _cell_check_row(shape, row), rows)
+@inline _cell_check_row(shape::Tuple, row::Integer, sorted::Bool) = _cell_check_row(shape, row)
+@inline function _cell_check_row(shape::Tuple, rows::Vector{Int}, sorted::Bool = false)
+    if sorted && !isempty(rows)
+        # Sorted rows: the extremes bound them all.
+        _cell_check_row(shape, @inbounds(rows[1]))
+        _cell_check_row(shape, @inbounds(rows[end]))
+    else
+        foreach(row -> _cell_check_row(shape, row), rows)
+    end
     rows
 end
 
@@ -363,7 +409,8 @@ end
 @inline _cell_leaf_row(shape::Tuple, row::Integer) =
     length(first(shape)) == 1 ? Int(first(first(shape))) : row
 @inline _cell_leaf_row(shape::Tuple, rows::Vector{Int}) =
-    _cell_canonical_rows(Int[_cell_leaf_row(shape, row) for row in rows])
+    isempty(shape) || length(first(shape)) == 1 ?
+        Int[_cell_leaf_row(shape, row) for row in rows] : rows      # the rows themselves
 
 # A row window still spans a plate's trailing axes. A multidimensional cell
 # selects its remaining coordinates from that window; a vector row is already
@@ -384,11 +431,11 @@ end
 @inline _cell_linear_row(shape::Tuple, q::Integer) =
     Int(first(Tuple(CartesianIndices(shape)[q])))
 @inline _cell_linear_row(shape::Tuple, q::AbstractVector{<:Integer}) =
-    _cell_canonical_rows(Int[_cell_linear_row(shape, p) for p in q])
+    Int[_cell_linear_row(shape, p) for p in q]
 
 # The index a row of a gather index holds, or the indices its rows hold.
 @inline _cell_gather_row(index, row::Integer) = Int(only(index))
-@inline _cell_gather_row(index, rows::Vector{Int}) = _cell_canonical_rows(Int[i for i in index])
+@inline _cell_gather_row(index, rows::Vector{Int}) = Int[i for i in index]
 
 # A range view's range from its parts `(lo, hi)` or `(lo, step, hi)`, and its
 # full axes; the positions of its source that rows `rows` of the view read.
@@ -1376,12 +1423,20 @@ struct _CellEmitter
     unions::Dict{ValueId,Symbol}
     reads::Dict{ValueId,Vector{Any}}
     data::Dict{ValueId,Symbol}
+    # Whether every request's rows are sorted and unique (a partition's: its
+    # windows are then read by bisection, and a value asked for at the same
+    # row by many cells is computed once), or a cell's few rows as read.
+    sorted::Bool
 end
-_CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes) =
+_CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes; sorted::Bool = false) =
     _CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes,
         Dict{ValueId,Symbol}(), Dict{Tuple{ValueId,Symbol},Symbol}(),
         Dict{ValueId,Vector{Symbol}}(), Dict{ValueId,Symbol}(),
-        Dict{ValueId,Vector{Any}}(), Dict{ValueId,Symbol}())
+        Dict{ValueId,Vector{Any}}(), Dict{ValueId,Symbol}(), sorted)
+
+# A request's rows as the emitter holds them: canonical for a partition.
+_cell_canon(e::_CellEmitter, rows) =
+    e.sorted ? Expr(:call, _cell_ref(:_cell_canonical_rows), rows) : rows
 
 _cell_ref(name) = GlobalRef(@__MODULE__, name)
 
@@ -1472,7 +1527,8 @@ end
 function _cell_union!(e::_CellEmitter, cid::ValueId)
     rows = e.requests[cid]
     e.unions[cid] = length(rows) == 1 ? only(rows) :
-        _cell_bind!(e, :cell_rows_union, Expr(:call, _cell_ref(:_cell_union_rows), rows...))
+        _cell_bind!(e, :cell_rows_union, Expr(:call,
+            _cell_ref(e.sorted ? :_cell_union_rows_sorted : :_cell_union_rows), rows...))
 end
 
 # The data of pushed value `cid` at rows `row`, one of its requests: its
@@ -1480,7 +1536,7 @@ end
 function _cell_take!(e::_CellEmitter, cid::ValueId, row::Symbol)
     e.unions[cid] === row && return e.data[cid]
     _cell_bind!(e, :cell_taken,
-        Expr(:call, _cell_ref(:_cell_take_rows), e.data[cid], e.unions[cid], row))
+        Expr(:call, _cell_ref(:_cell_take_rows), e.data[cid], e.unions[cid], row, e.sorted))
 end
 
 # Computes every requested pushed value's window, once each: requests from the
@@ -1530,8 +1586,8 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
         icid = canon_id(d.graph, input.id)
         role = f.roles[j]
         if role in (:leaf, :index, :column) && icid in d.pushed
-            reads[j] = _cell_request!(e, icid, _cell_bind!(e, :cell_row,
-                Expr(:call, _cell_ref(:_cell_leaf_row), _cell_shape!(e, icid), U)))
+            reads[j] = _cell_request!(e, icid, _cell_bind!(e, :cell_row, _cell_canon(e,
+                Expr(:call, _cell_ref(:_cell_leaf_row), _cell_shape!(e, icid), U))))
         elseif role in (:gather, :linear_gather) && icid in d.pushed
             # The rows every gather index reads (`_cell_gather_rows` joins
             # those of several indices).
@@ -1546,11 +1602,11 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
                 Expr(:call, _cell_ref(:_cell_gather_rows), ats...)
             role === :gather ||
                 (at = Expr(:call, _cell_ref(:_cell_linear_row), _cell_shape!(e, icid), at))
-            reads[j] = _cell_request!(e, icid, _cell_bind!(e, :cell_row, at))
+            reads[j] = _cell_request!(e, icid, _cell_bind!(e, :cell_row, _cell_canon(e, at)))
         elseif role === :factor_leaf
             # The rows of the product `A * w` this operand broadcasts: rows of `A`.
-            reads[j] = _cell_bind!(e, :cell_row, Expr(:call, _cell_ref(:_cell_leaf_row),
-                _cell_part_shape!(e, r, f, j), U))
+            reads[j] = _cell_bind!(e, :cell_row, _cell_canon(e, Expr(:call,
+                _cell_ref(:_cell_leaf_row), _cell_part_shape!(e, r, f, j), U)))
             icid in d.pushed && _cell_request!(e, icid, reads[j])
         elseif role === :factor
             reads[j] = U
@@ -1577,7 +1633,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
     f.kind === :vcat && return _cell_vcat_window!(e, cid, r, f, U)
     if f.kind in (:pointwise, :identity, :columns, :hcat, :range_view, :reshape)
         push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row),
-            _cell_shape!(e, cid), U))
+            _cell_shape!(e, cid), U, e.sorted))
     end
     reads = e.reads[cid]
     if f.kind in (:range_view, :reshape)
@@ -1603,7 +1659,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
         elseif role in (:gather, :linear_gather) && icid in d.pushed
             shape = role === :gather ? nothing : _cell_shape!(e, icid)
             push!(args, _cell_bind!(e, :cell_window, Expr(:call,
-                _cell_ref(:_CellWindow), e.data[icid], e.unions[icid], shape)))
+                _cell_ref(:_CellWindow), e.data[icid], e.unions[icid], shape, e.sorted)))
         elseif role in (:gather, :linear_gather)
             # The whole source, read by the gather at its index's rows.
             for (k, via) in zip(f.indices[j], f.vias[j])
@@ -1644,7 +1700,7 @@ function _cell_vcat_window!(e::_CellEmitter, cid::ValueId, r::Recipe, f::_CellFo
                             U::Symbol)
     d = e.pushdowns
     shape = _cell_shape!(e, cid)
-    push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row), shape, U))
+    push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row), shape, U, e.sorted))
     starts, locals = e.reads[cid][1], e.reads[cid][2:end]
     parts = map(zip(f.parts, locals)) do (part, local_rows)
         part isa Int || return part
@@ -1665,8 +1721,8 @@ end
 function _cell_capture_request!(e::_CellEmitter, cid::ValueId, slice, via = nothing;
                                 rows::Bool = false)
     position = _cell_bind!(e, :cell_read, _cell_capture_element(slice, via; rows))
-    _cell_request!(e, cid, _cell_bind!(e, :cell_row,
-        Expr(:call, _cell_ref(:_cell_linear_row), _cell_shape!(e, cid), position)))
+    _cell_request!(e, cid, _cell_bind!(e, :cell_row, _cell_canon(e,
+        Expr(:call, _cell_ref(:_cell_linear_row), _cell_shape!(e, cid), position))))
 end
 
 # The positions a cell reads of a captured value: its batched element (one
@@ -1682,9 +1738,9 @@ end
 
 # The positions a partition's slice of a batched index argument holds: each
 # element one position or an integer vector of them, joined in order.
-@inline _cell_partition_positions(slice) =
-    Int[row for q in slice for row in (q isa Integer ? (q,) : q)]
+@inline _cell_partition_positions(slice) = _cell_joined_rows(identity, slice)
 
 # The window a cell reads in place of pushed capture `cid`.
 _cell_capture!(e::_CellEmitter, cid::ValueId) = _cell_bind!(e, :cell_capture,
-    Expr(:call, _cell_ref(:_CellWindow), e.data[cid], e.unions[cid], _cell_shape!(e, cid)))
+    Expr(:call, _cell_ref(:_CellWindow), e.data[cid], e.unions[cid], _cell_shape!(e, cid),
+         e.sorted))

@@ -1131,7 +1131,8 @@ end
     # holds the shared coordinates and its own groups' rows of `Z` only, and
     # its gradient is the dense one there.
     grt = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
-    gs = prepare_partition_sampler(gbuilt, gbound, :y, gu; by = :site, backend = grt)
+    gs = prepare_partition_sampler(gbuilt, gbound, :y, gu; by = :site, backend = grt,
+                                   compact = true)
     gdense = prepare_partition_sampler(gbuilt, gbound, :y, gu; by = :site, backend = grt,
                                        compact = false)
     gnames = String.(coordinate_names(gbuilt.layout))
@@ -1162,7 +1163,7 @@ end
     rt = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
     level_subject = [data.subject[findfirst(==(l), data.group)] for l in levels]
     compact = prepare_partition_sampler(built, bound, :y, u; by = :subject, backend = rt,
-                                        partitioned = (:z => level_subject,))
+                                        compact = true, partitioned = (:z => level_subject,))
     @test partition_labels(compact) == [1, 2, 3]
     gsum = zero(u)
     for label in 1:3

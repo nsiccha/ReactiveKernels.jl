@@ -1104,9 +1104,11 @@ those ports, throwing `PartitionSeparabilityError` otherwise.
 ReactiveKernelsPPL builds its partition queries and compact gradients on
 these (`prepare_partition`, `prepare_partition_sampler`).
 
-A value's window holds its rows sorted and unique, the union of what its
-readers ask for, and a read finds its row by bisection: a partition of r
-cells reading a value row by row costs O(r log r), never O(r²). A literal
+A partition's windows hold their rows sorted and unique, the union of what
+their readers ask for, and a read finds its row by bisection: a partition of
+r cells reading a value row by row costs O(r log r), never O(r²), and a value
+gathered at the rows of many cells is computed once per distinct row. A
+single cell's windows hold its few rows as read. A literal
 range `A[lo:hi]` or a reshape computed at rows reads a vector source only
 (linear positions of a matrix are not its rows): a matrix source is refused
 by name (`:operands`), an untyped one checked at evaluation.

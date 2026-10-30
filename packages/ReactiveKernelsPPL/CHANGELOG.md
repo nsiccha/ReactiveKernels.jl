@@ -33,7 +33,9 @@ are recorded in the git history only.
   (`ReactiveKernels.partition_footprint(s, label)` lists them; `g` has the
   footprint's length), the active coordinates overlaying a read-only packed
   base as in `prepare_compact_cell_sampler` (native Enzyme Reverse needs
-  `Enzyme.set_runtime_activity`). `partitioned` names the parameters whose
+  `Enzyme.set_runtime_activity`); `compact = false` gives a dense gradient
+  over the whole packed vector, nonzero only on the footprint (atlas-17, one
+  unit: compact 2.6 ms, dense 3.1 ms). `partitioned` names the parameters whose
   rows belong to one partition each, bare when indexed by the key column
   (`z[levels(subject)]`) or as `parameter => labels`; a partition that reads
   another label's rows of them is refused at preparation with a

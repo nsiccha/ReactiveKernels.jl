@@ -45,9 +45,11 @@ are recorded in the git history only.
 - A cell's row window reads a vector of rows as one gather of its data at
   the rows' positions (the positions computed first); the previous
   row-by-row read made native Enzyme Reverse refuse a partition's gather of
-  a product's rows (`EnzymeRuntimeActivityError`). A window holds its rows
-  sorted and unique and a read finds its row by bisection, so a partition of
-  r cells reading a value row by row costs O(r log r), not O(r²).
+  a product's rows (`EnzymeRuntimeActivityError`). A partition's windows
+  hold their rows sorted and unique and a read finds its row by bisection,
+  so a partition of r cells reading a value row by row costs O(r log r), not
+  O(r²), and a value gathered at the rows of many cells is computed once per
+  distinct row; a single cell's windows are unchanged.
 - A plate body reading a row of a shared matrix, `M[q, :]` with `q` the
   element of a batched integer argument, captures that row as `v[q]` captures
   an element: a cell or partition reads only its own rows of the matrix.
