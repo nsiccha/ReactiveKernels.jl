@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.21
+
+- One cell of a plate (`plate_cell`; RKPPL's `prepare_cell_query` and cell
+  samplers) computes a column view `view(A, :, k)` at the rows it reads, as it
+  computes the column read `A[:, k]`: alone and as an operand of a dotted
+  expression, so a product `A = X * W` and its `hcat` design are computed at
+  those rows too. RKPPL reads every column `P[:, j]` of a per-observation
+  value through such a view, as in the columns of a BRM joint population
+  effect for several responses. Earlier versions computed the view whole in
+  every cell, and with it the product, the design and everything upstream.
+  Values are unchanged.
+
 ## 0.1.20
 
 - **Breaking:** the iterative-method compiler, the NUTS/HMC sampler

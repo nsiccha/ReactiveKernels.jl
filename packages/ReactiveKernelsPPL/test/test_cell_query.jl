@@ -835,3 +835,61 @@ end
         end
     end
 end
+
+# A joint population effect for several responses, as BRM emits it (snag
+# `column-read-lowe-24508269`): a design with a gathered computed column, a
+# submodel returning `X * beta` and one definition per response column. RKPPL
+# reads each column `P[:, j]` of the per-observation product in place, through
+# `view(P, :, j)`; a cell of one response computes the product, the design and
+# the gathered column at its own row, so its cost does not grow with the
+# observations.
+@rkppl _cq_joint(X, K, T) = begin
+    beta[1:K, 1:T] .~ Normal.(0.0, 1.0)
+    return X * beta
+end
+
+const _CQ_JOINT_COLUMNS = quote
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    z[levels(g)] .~ Normal.(0, 1)
+    c = z[g]
+    X = hcat(ones(length(x)), x, c)
+    P ~ _cq_joint(X, 3, 3)
+    m1 = P[:, 1]
+    eta1 = m1 .+ a
+    y1 .~ Normal.(eta1, sigma)
+    y2 .~ Normal.(P[:, 2] .+ P[:, 3], sigma)
+end
+
+_cq_joint_columns_data(n) = (; x = collect(range(0.5, 1.5; length = n)),
+    g = [mod1(3j, 5) for j in 1:n],
+    y1 = [0.3 * sin(j) for j in 1:n], y2 = [0.2 * cos(j) for j in 1:n])
+
+@testset "cell query: column views of a joint product cost the cell's own row" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    measured = map((20, 2_000)) do n
+        data = _cq_joint_columns_data(n)
+        bound, built = _cq_bound(_CQ_JOINT_COLUMNS, data, (:y1, :y2))
+        @test occursin("Base.view(P", string(kernel_expr(bound, built.layout)))
+        q = prepare_cell_query(built, bound, :y1)
+        u = collect(range(-0.4, 0.5; length = built.layout.total))
+        pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u).y1
+        values = [q(u, i) for i in (1, 2, n)]
+        q(u, 3)
+        s = prepare_cell_sampler(built, bound, :y1, u; backend)
+        cells = map((2, 3)) do i
+            g = similar(u)
+            value, _ = cell_value_and_gradient!(s, g, u, i)
+            (; value, central = all(j -> isapprox(g[j], _cq_central(v -> q(v, i), u, j);
+                rtol = 1e-5, atol = 1e-8), eachindex(u)))
+        end
+        (; values, reference = pointwise[[1, 2, n]], bytes = (@allocated q(u, 3)), cells,
+           cell_values = [q(u, i) for i in (2, 3)])
+    end
+    @test all(m -> m.values ≈ m.reference, measured)
+    @test measured[1].bytes == measured[2].bytes
+    for m in measured
+        @test [c.value for c in m.cells] ≈ m.cell_values
+        @test all(c -> c.central, m.cells)
+    end
+end
