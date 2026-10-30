@@ -1126,6 +1126,35 @@ end
     @test gq(gu, "s1") + gq(gu, "s2") ≈
         Base.invokelatest(prepare_query(gbuilt, gbound, :likelihood), gu)
     @test all(e.status !== :whole for e in ReactiveKernels.partition_locality(gq.kernel))
+    # Its compact sampler, the loop body holding a nested plate and the effects
+    # coming through an LKJ factor (`R = Z * (sd .* L)'`): a site's footprint
+    # holds the shared coordinates and its own groups' rows of `Z` only, and
+    # its gradient is the dense one there.
+    grt = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    gs = prepare_partition_sampler(gbuilt, gbound, :y, gu; by = :site, backend = grt)
+    gdense = prepare_partition_sampler(gbuilt, gbound, :y, gu; by = :site, backend = grt,
+                                       compact = false)
+    gnames = String.(coordinate_names(gbuilt.layout))
+    zrow(n) = (m = match(r"^Z\.(\d+)", n); m === nothing ? nothing : parse(Int, m[1]))
+    glevels = sort(unique(gdata.group))
+    gg = similar(gu)
+    gunion = Set{Int}()
+    for (site, groups) in (("s1", ["g1", "g2"]), ("s2", ["g3", "g4", "g5"]))
+        footprint = partition_footprint(gs, site)
+        own = Set(findfirst(==(g), glevels) for g in groups)
+        @test all(n -> zrow(n) === nothing || zrow(n) in own, gnames[footprint])
+        @test any(n -> startswith(n, "L."), gnames[footprint])
+        gc = zeros(length(footprint))
+        value, _ = partition_value_and_gradient!(gs, gc, gu, site)
+        @test value ≈ gq(gu, site)
+        partition_value_and_gradient!(gdense, gg, gu, site)
+        @test gc ≈ gg[footprint]
+        @test all(iszero, gg[setdiff(eachindex(gu), footprint)])
+        union!(gunion, footprint)
+    end
+    gwhole = prepare_ad(prepare_query(gbuilt, gbound, :likelihood), grt, gu; active = :unconstrained)
+    _, ggrad = Base.invokelatest(ad_value_and_gradient, gwhole, gu)
+    @test findall(!iszero, ggrad) ⊆ sort!(collect(gunion))
 
     # The compact sampler: the gradient over each partition's footprint, the
     # packed coordinates it reads, equal to the dense one there; the

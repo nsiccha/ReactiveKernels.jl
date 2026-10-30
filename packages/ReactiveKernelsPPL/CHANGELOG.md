@@ -37,7 +37,13 @@ are recorded in the git history only.
   rows belong to one partition each, bare when indexed by the key column
   (`z[levels(subject)]`) or as `parameter => labels`; a partition that reads
   another label's rows of them is refused at preparation with a
-  `ReactiveKernels.PartitionSeparabilityError`.
+  `ReactiveKernels.PartitionSeparabilityError`. The sampler prepares the
+  footprint kernel once (`ReactiveKernels.partition_footprint_kernel`).
+- An LKJ factor's unconstrained block is read as a statement of its own
+  (`_ppl_lkj_raw_<name>`), as every other block is: read inside the `tanh.`
+  expression, a cell or partition counted the whole packed vector as read, so
+  a model with correlated group effects had every coordinate in every
+  partition's footprint.
 - `prepare_cell_query`, `prepare_cell_sampler` and
   `prepare_compact_cell_sampler` take `locality = :error | :warn | :ignore`
   (`nothing`, the default, reads ReactiveKernels' `cell_locality`

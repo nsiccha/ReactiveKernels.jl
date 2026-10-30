@@ -937,8 +937,12 @@ with `i` an integer element of a batched argument, is computed at that row
 only when its producer computes it row by row. So is one the cell reads at
 several rows: `v[r]` with `r` an integer-vector element of a batched argument,
 or `v[rows[k]]` through a shared index array `rows` (one integer vector per
-cell, as a total over a group of rows reads them). The native lowering
-supports these producers:
+cell, as a total over a group of rows reads them), and a matrix the cell
+reads a row of, `M[i, :]` (every later index the whole axis `:`), computed at
+that row. A capture whose index is not provably an integer position or a
+vector of them (an undeclared, unbound port) is read whole, and the locality
+report names it (`:untyped_index`). The native lowering supports these
+producers:
 
 - a dotted expression of inputs, numeric literals, gathers `A[I]` or
   `A[I, k]` (an integer vector input `I`, integer literals `k`), column reads
@@ -1021,6 +1025,13 @@ views, and Enzyme rejects Base `hcat` of views beside dense arrays (Enzyme snag
 `native-reverse-t-6d51cae6`). Values are exact; the gradient waits on that
 Enzyme fix (`test_plate_cell.jl` pins it broken).
 
+A plate body that reads a captured value through its window (a struct of
+active data beside constant rows, `M[q, :]` of a shared matrix) differentiates
+under registered Enzyme with `Enzyme.set_runtime_activity(Enzyme.Reverse)`:
+static activity refuses the constant rows a call returns stored beside active
+data (Enzyme snag `native-reverse-r-285478e2`), which the Enzyme dogfood
+branch repairs.
+
 Two more producers run at a cell's rows: `view(A, lo:hi)` or `A[lo:hi]` and
 `reshape(v, n, k...)`, with the bounds and dimensions integer literals or
 scalar inputs. These are the shapes ReactiveKernelsPPL unpacks a packed
@@ -1078,16 +1089,27 @@ reads. A plate whose domain is not one-dimensional is refused at evaluation.
 sorted linear positions the evaluation with those arguments reads, or
 `:whole` for a port read whole: the body is lowered once more in a mode that
 records every read of a port (the rows a value is sliced to, the positions
-gathers and captures read, the constant positions of a bound-indexed read)
-and returns them instead of the value. For a packed parameter vector this is
-the exact support of a partition's gradient; a lazy branch contributes both
-arms. `partitioned` adds the separability rule, pairs `port => labels` giving
-the label of each position of a per-partition port (`missing` for a shared
-position): `partition_separability(kernel, args...)` checks that the
-partition reads no other label's positions of those ports, throwing
-`PartitionSeparabilityError` otherwise. ReactiveKernelsPPL builds its
-partition queries and compact gradients on these (`prepare_partition`,
-`prepare_partition_sampler`).
+gathers and captures read, the constant positions of a bound-indexed read, a
+lane of one row as that row) and returns them instead of the value; a
+lowering nested in it (a plate body, an embedded kernel) runs blind to the
+recording. For a packed parameter vector this is the exact support of a
+partition's gradient; a lazy branch contributes both arms.
+`partition_footprint` keeps the footprint kernel it prepares for the process;
+`partition_footprint_kernel(kernel)` prepares one for a caller to hold and
+evaluate itself. `partitioned` adds the separability rule, pairs
+`port => labels` giving the label of each position of a per-partition port
+(`missing` for a shared position): `partition_separability(kernel, args...;
+footprint)` checks that the partition reads no other label's positions of
+those ports, throwing `PartitionSeparabilityError` otherwise.
+ReactiveKernelsPPL builds its partition queries and compact gradients on
+these (`prepare_partition`, `prepare_partition_sampler`).
+
+A value's window holds its rows sorted and unique, the union of what its
+readers ask for, and a read finds its row by bisection: a partition of r
+cells reading a value row by row costs O(r log r), never O(r²). A literal
+range `A[lo:hi]` or a reshape computed at rows reads a vector source only
+(linear positions of a matrix are not its rows): a matrix source is refused
+by name (`:operands`), an untyped one checked at evaluation.
 
 ### Inspecting structure
 

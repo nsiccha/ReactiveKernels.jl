@@ -1200,14 +1200,6 @@ ReactiveKernels.partition_footprint(s::PartitionSampler, label) = copy(get(s.foo
         "the labels are $(join(repr.(s.labels), ", "))"))
 end)
 
-# The packed positions a partition reads, by RK's footprint: `:whole` is every
-# position.
-function _partition_footprint_positions(kernel, u0, label, total)
-    read = Base.invokelatest(ReactiveKernels.partition_footprint, kernel, u0, label)
-    positions = read.unconstrained
-    positions === :whole ? collect(1:total) : positions
-end
-
 # The separability rule as RK takes it: the label of each packed coordinate
 # of the named parameters, `missing` for every other coordinate. A parameter
 # named bare is indexed by the key column itself (`z[levels(subject)]`), so
@@ -1313,10 +1305,13 @@ function prepare_partition_sampler(built, plan::StructuralPlan, observations,
         Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
     end
     footprints = Dict{Any,Vector{Int}}()
+    footprint = Base.invokelatest(ReactiveKernels.partition_footprint_kernel, kernel)
     for label in labels
+        read = Base.invokelatest(footprint, exemplar, label)
         isempty(rule) || Base.invokelatest(ReactiveKernels.partition_separability, kernel,
-                                           exemplar, label)
-        footprints[label] = _partition_footprint_positions(kernel, exemplar, label, layout.total)
+                                           exemplar, label; footprint = read)
+        positions = read.unconstrained
+        footprints[label] = positions === :whole ? collect(1:layout.total) : positions
     end
     if !compact
         ad = Base.invokelatest(prepare_ad, kernel, backend, exemplar, first(labels);

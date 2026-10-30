@@ -73,12 +73,12 @@
 """
     _CellWindow(data, rows, shape)
 
-Rows of a value read by one cell. `rows` is one row (an `Int`), or the rows a
-gather by an integer vector reads (a `Vector{Int}`, in the order read, repeats
-allowed). `data` holds the value at those rows, in that order along its first
-axis, every later dimension whole; `shape` is the value's full axes, or
-`nothing` when only row reads `v[I, j...]` are made of it. Reading any other
-row throws `BoundsError`.
+Rows of a value read by one cell. `rows` is one row (an `Int`), or the rows
+its readers read (a `Vector{Int}`, sorted and unique: `_cell_canonical_rows`).
+`data` holds the value at those rows, in that order along its first axis,
+every later dimension whole; `shape` is the value's full axes, or `nothing`
+when only row reads `v[I, j...]` are made of it. Reading any other row throws
+`BoundsError`.
 """
 struct _CellWindow{D,R<:Union{Int,Vector{Int}},S}
     data::D
@@ -94,9 +94,15 @@ end
     firstindex(w.data, 1)
 end
 @inline function _cell_local_row(w::_CellWindow{<:Any,Vector{Int}}, row, at)
-    k = findfirst(==(row), w.rows)
-    k === nothing && throw(BoundsError(w.rows, at))
-    firstindex(w.data, 1) + k - 1
+    firstindex(w.data, 1) + _cell_sorted_position(w.rows, row, at) - 1
+end
+# The position of `row` among sorted unique `rows`, by bisection: O(log rows)
+# per read, never a scan of the rows, so a partition of r cells reading a
+# value row by row costs O(r log r), not O(r²).
+@inline function _cell_sorted_position(rows::Vector{Int}, row, at)
+    k = searchsortedfirst(rows, row)
+    (k > length(rows) || @inbounds(rows[k]) != row) && throw(BoundsError(rows, at))
+    k
 end
 # The positions of rows `I`, computed before the data is read: a vector read
 # is then one gather of the data at those positions. Reading the data row by
@@ -141,11 +147,13 @@ end
     w.data[_cell_local_rows(w, I, I)]
 end
 
-# Row reads `v[i, j...]` and gathers `v[I, j...]`.
-@inline Base.getindex(w::_CellWindow, i::Integer, j::Integer, rest::Integer...) =
+# Row reads `v[i, j...]` and gathers `v[I, j...]`, each later index a position
+# or the whole axis `:` (`v[i, :]`, a row of a matrix).
+@inline Base.getindex(w::_CellWindow, i::Integer, j::Union{Integer,Colon},
+                      rest::Union{Integer,Colon}...) =
     w.data[_cell_local_row(w, i, (i, j, rest...)), j, rest...]
-@inline function Base.getindex(w::_CellWindow, I::AbstractVector{<:Integer}, j::Integer,
-                               rest::Integer...)
+@inline function Base.getindex(w::_CellWindow, I::AbstractVector{<:Integer},
+                               j::Union{Integer,Colon}, rest::Union{Integer,Colon}...)
     _cell_reads_rows(w, I) && return w.data[:, j, rest...]
     w.data[_cell_local_rows(w, I, (I, j, rest...)), j, rest...]
 end
@@ -293,25 +301,45 @@ end
 @inline _cell_gather_rows(ats...) =
     Int[row for at in ats for row in (at isa Integer ? (at,) : at)]
 
-# The rows several readers ask a value for, each once, in first-asked order.
-@inline _cell_union_rows(ats...) = unique!(_cell_gather_rows(ats...))
+# The rows several readers ask a value for, each once, sorted: the value is
+# computed at them in this order and read back by bisection (`_cell_local_row`).
+@inline _cell_union_rows(ats...) = unique!(sort!(_cell_gather_rows(ats...)))
+# One reader's rows as the value's window holds them: the rows themselves when
+# sorted and unique, else sorted and deduplicated. One row is itself.
+@inline _cell_canonical_rows(row::Integer) = row
+@inline function _cell_canonical_rows(rows::Vector{Int})
+    for k in 2:length(rows)
+        @inbounds rows[k - 1] < rows[k] || return unique!(sort(rows))
+    end
+    rows
+end
 
 # Rows `rows` of a value's window `data` computed at rows `union` (which hold
 # them), in the order asked, every later dimension whole. A value without rows
 # (a dotted expression of numbers is a number) reads the same at every row.
 @inline _cell_take_rows(data::Number, ::Vector{Int}, rows) = data
 @inline _cell_take_rows(data::AbstractArray{<:Any,0}, ::Vector{Int}, rows) = data
+@inline function _cell_take_rows(data, union::Integer, row::Integer)
+    row == union || throw(BoundsError(union, row))
+    data
+end
 @inline function _cell_take_rows(data::AbstractArray{<:Any,N}, union::Vector{Int},
                                  rows) where {N}
     positions = Int[_cell_union_position(union, row)
                     for row in (rows isa Integer ? (rows,) : rows)]
     view(data, positions, ntuple(_ -> Colon(), Val(N - 1))...)
 end
-@inline function _cell_union_position(union::Vector{Int}, row)
-    k = findfirst(==(row), union)
-    k === nothing && throw(BoundsError(union, row))
-    k
-end
+@inline _cell_union_position(union::Vector{Int}, row) = _cell_sorted_position(union, row, row)
+
+# The source of a range view or a reshape at rows: a vector, its positions.
+@inline _cell_source_rows(source::AbstractVector, rows) = _cell_factor_rows(source, rows)
+@inline _cell_source_rows(source::AbstractArray, rows) = throw(ArgumentError(
+    "a literal range or a reshape reads an array of $(ndims(source)) dimensions at a cell's " *
+    "rows; only a vector is read this way"))
+@inline _cell_vector_rows(rows::AbstractVector) = rows
+@inline _cell_vector_rows(rows::AbstractArray) = throw(ArgumentError(
+    "a literal range or a reshape reads an array of $(ndims(rows)) dimensions at a cell's " *
+    "rows; only a vector is read this way"))
 
 # Rows of a product's left factor; bounds-checked, never extruded.
 @inline _cell_factor_rows(arg::AbstractArray{<:Any,N}, row::Integer) where {N} =
@@ -832,10 +860,12 @@ _cell_colon(ex, mod) = _cell_binding(ex, mod) === Colon() ||
     Meta.isexpr(ex, :call, 1) && _cell_binding(ex.args[1], mod) === Colon
 
 # The positions `k` of the cell's shared arguments that its body reads only as
-# `v[q]` or `v[w[q]]`, each `q` the element of a batched argument `b` and `w`
-# another shared argument, as `k => [(b, w), ...]` (`w = 0` for `v[q]`), one
-# pair per distinct read (`_cell_capture_reader`). Each element `q`, or
-# `w[q]`, is a linear position or an integer vector of them.
+# `v[q]` or `v[w[q]]` (or `v[q, :]`, a row), each `q` the element of a batched
+# argument `b` and `w` another shared argument, as `k => [(b, w), ...]`
+# (`w = 0` for `v[q]`), one pair per distinct read (`_cell_capture_reader`).
+# Each element `q`, or `w[q]`, is a linear position or an integer vector of
+# them. The second value lists the positions read that way whose index is not
+# provably one: those are read whole, and the locality report names them.
 function _cell_capture_positions(r::Recipe, static_type)
     plate = (r.op::_AuthoredPlateCellOp).plate
     atomic = typeof(plate).parameters[2]
@@ -843,21 +873,23 @@ function _cell_capture_positions(r::Recipe, static_type)
     ig = inner.graph
     roots = ValueId[canon_id(ig, v.id) for v in inner.have]
     captures = Dict{Int,Vector{Tuple{Int,Int}}}()
-    length(roots) == length(r.inputs) - 1 && allunique(roots) || return captures
+    untyped = Int[]
+    length(roots) == length(r.inputs) - 1 && allunique(roots) || return captures, untyped
     wants = Set(canon_id(ig, w.id) for w in inner.want)
     for k in atomic
         roots[k] in wants && continue
         reads = _cell_capture_reader(inner, roots, atomic, roots[k])
         reads === nothing && continue
-        all(reads) do (b, via)
+        typed = all(reads) do (b, via)
             lane = static_type(r.inputs[1 + b])
             via == 0 ? _cell_positions_type(lane) :
                 lane <: AbstractArray{<:Integer} &&
                     _cell_positions_type(static_type(r.inputs[1 + via]))
-        end || continue
+        end
+        typed || (push!(untyped, k); continue)
         captures[k] = reads
     end
-    captures
+    captures, untyped
 end
 
 # An array whose elements are linear positions, or integer vectors of them.
@@ -901,9 +933,9 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid)
         recipe.op isa _KernelSourceOp || return nothing
         analyzed = _cell_native(recipe)
         analyzed === nothing && return nothing
-        native, params, _ = analyzed
+        native, params, mod = analyzed
         reads = Any[]
-        _cell_capture_reads!(reads, native, Set(params[slots])) || return nothing
+        _cell_capture_reads!(reads, native, Set(params[slots]), mod) || return nothing
         for read in reads
             q, via = read isa Symbol ? (read, nothing) : (read.args[2], read.args[1])
             b = root(params, recipe, q)
@@ -917,21 +949,23 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid)
 end
 
 # Whether `ex` reads the names `captured` only as `v[q]` or `v[w[q]]`, with `q`
-# and `w` names; each such `q`, or `w[q]`, is recorded.
-function _cell_capture_reads!(reads, ex, captured)
+# and `w` names, or as `v[q, :]` / `v[w[q], :]` with every later index the
+# whole axis `:` (a row of a matrix); each such `q`, or `w[q]`, is recorded.
+function _cell_capture_reads!(reads, ex, captured, mod)
     ex isa Symbol && return !(ex in captured)
     ex isa Expr || return true
     ex.head in _CELL_PLAIN_HEADS || return false
-    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] isa Symbol &&
+    if ex.head === :ref && length(ex.args) >= 2 && ex.args[1] isa Symbol &&
        ex.args[1] in captured
         index = ex.args[2]
         name(x) = x isa Symbol && !(x in captured)
         name(index) || Meta.isexpr(index, :ref, 2) && all(name, index.args) ||
             return false
+        all(arg -> _cell_colon(arg, mod), ex.args[3:end]) || return false
         push!(reads, index)
         return true
     end
-    all(arg -> _cell_capture_reads!(reads, arg, captured), ex.args)
+    all(arg -> _cell_capture_reads!(reads, arg, captured, mod), ex.args)
 end
 
 """
@@ -967,6 +1001,9 @@ struct _CellPushdowns
     requests::Dict{ValueId,Vector{Tuple{Int,Symbol}}}
     refused::Dict{ValueId,Symbol}
     dropped::Dict{ValueId,Int}
+    # Per cell recipe, the shared argument positions its body reads as `v[q]`
+    # with `q` of no known type: read whole, named `:untyped_index`.
+    untyped::Dict{Int,Vector{Int}}
 end
 
 # Whether an operation's output is a lazy view of its inputs, built at no cost
@@ -1091,13 +1128,15 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
             role === :scalar ? static_type(input) <: AbstractArray{<:Number} :
             role === :via ? _cell_positions_type(static_type(input)) :
             role in (:range_source, :reshape_source) ?
-                static_type(input) <: AbstractArray || form(cidof(input)) !== nothing :
+                static_type(input) <: AbstractVector ||
+                    (!(static_type(input) <: AbstractArray) && form(cidof(input)) !== nothing) :
             true
         end && all(f.literal === nothing ? () : f.literal) do part
             part isa Int || static_type(r.inputs[part.input]) <: Integer
         end
     end
     captures = Dict{Int,Dict{Int,Vector{Tuple{Int,Int}}}}()
+    untyped = Dict{Int,Vector{Int}}()
     batched = Dict{Int,Set{Int}}()
     pushed = Set{ValueId}()
     requests = Dict{ValueId,Vector{Tuple{Int,Symbol}}}()
@@ -1126,8 +1165,10 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
     end
     for r in p.recipes
         r.op isa _AuthoredPlateCellOp || continue
-        positions = _cell_capture_positions(r, static_type)
+        positions, unknown = _cell_capture_positions(r, static_type)
         isempty(positions) || (captures[r.id] = positions)
+        isempty(unknown) || (untyped[r.id] = unknown)
+        foreach(k -> get!(refused, cidof(r.inputs[1 + k]), :untyped_index), unknown)
         foreach(k -> reach!(cidof(r.inputs[1 + k]), :linear_gather, r.id), keys(positions))
         atomic = typeof(r.op.plate).parameters[2]
         lanes = Set(k for k in 1:length(r.inputs)-1 if !(k in atomic))
@@ -1176,7 +1217,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
     _CellPushdowns(g, pushed, recipes,
         Dict(cid => only(producers[cid]) for cid in pushed), forms, captures, batched,
         Dict{Int,Int}(), Dict{Int,Any}(), Dict(r.id => k for (k, r) in enumerate(p.recipes)),
-        requests, refused, dropped)
+        requests, refused, dropped, untyped)
 end
 
 # ---------------------------------------------------------------- outlining
@@ -1430,8 +1471,9 @@ end
 # The rows every request of `cid` reads: the one request, or their union.
 function _cell_union!(e::_CellEmitter, cid::ValueId)
     rows = e.requests[cid]
-    e.unions[cid] = length(rows) == 1 ? only(rows) :
-        _cell_bind!(e, :cell_rows_union, Expr(:call, _cell_ref(:_cell_union_rows), rows...))
+    e.unions[cid] = _cell_bind!(e, :cell_rows_union, length(rows) == 1 ?
+        Expr(:call, _cell_ref(:_cell_canonical_rows), only(rows)) :
+        Expr(:call, _cell_ref(:_cell_union_rows), rows...))
 end
 
 # The data of pushed value `cid` at rows `row`, one of its requests: its
@@ -1545,8 +1587,9 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
         j = only(f.leaves)
         icid = canon_id(d.graph, r.inputs[j].id)
         icid in d.pushed || _footprint_record!(icid, :rows, reads[j])
-        positions = icid in d.pushed ? _cell_take!(e, icid, reads[j]) :
-            Expr(:call, _cell_ref(:_cell_factor_rows), e.names[icid], reads[j])
+        positions = icid in d.pushed ?
+            Expr(:call, _cell_ref(:_cell_vector_rows), _cell_take!(e, icid, reads[j])) :
+            Expr(:call, _cell_ref(:_cell_source_rows), e.names[icid], reads[j])
         f.kind === :range_view && return _cell_bind!(e, :cell_rows, positions)
         return _cell_bind!(e, :cell_rows, Expr(:call, _cell_ref(:_cell_reshape_window),
             positions, U, _cell_literal!(e, r, f)))

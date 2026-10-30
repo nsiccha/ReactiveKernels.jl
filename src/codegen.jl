@@ -4500,6 +4500,17 @@ function _lower_with_ops_collecting(p::Plan;
         _lower_with_ops_collecting(p; inline_embedded, declare, recycle, pushdowns, outline,
                                    plate_element_types, type_hints, exemplar_types)
     end
+    # Only the lowering the footprint was asked for records reads and returns
+    # them: a lowering nested in it (a plate body, an embedded kernel) runs
+    # blind to the recording, its reads and its own return untouched.
+    recording = get(task_local_storage(), _FOOTPRINT, nothing)
+    if recording !== nothing
+        recording.active && return task_local_storage(_FOOTPRINT, nothing) do
+            _lower_with_ops_collecting(p; inline_embedded, declare, recycle, pushdowns, outline,
+                                       plate_element_types, type_hints, exemplar_types)
+        end
+        recording.active = true
+    end
     # Values plate cells read only at their own row, computed there
     # (`_cell_pushdowns`, cell_windows.jl). With `outline`, inline
     # subexpressions that block that become recipes of their own first

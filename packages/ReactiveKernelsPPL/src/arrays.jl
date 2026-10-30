@@ -1530,6 +1530,7 @@ end
 # compiled reverse pass keeps a statically sized tape, which a column loop
 # with an inner `1:(j - 1)` range does not.
 _lkj_array_partials(L::Symbol) = Symbol(:_ppl_lkj_partials_, L)
+_lkj_array_raw(L::Symbol) = Symbol(:_ppl_lkj_raw_, L)
 _lkj_array_logjac(L::Symbol) = Symbol(:_ppl_lkj_logjac_, L)
 _lkj_array_diagonal(L::Symbol) = Symbol(:_ppl_lkj_diagonal_, L)
 
@@ -1539,8 +1540,14 @@ function _lkj_array_transform_statements(e::LayoutEntry)
     row, col = _is_upper_lkj(e.transform) ? (:i, :j) : (:j, :i)
     z, lj = _lkj_array_partials(L), _lkj_array_logjac(L)
     diagonal = _lkj_array_diagonal(L)
+    raw = _lkj_array_raw(L)
     return Expr[
-        :($z::Vector{Float64} = tanh.($(block_read(e.offset, e.size)))),
+        # The block is read as a statement of its own, as every other block is:
+        # a read inside a larger expression has no row form, so a cell or
+        # partition reading the packed vector would count the whole vector as
+        # read (RK `partition_footprint`).
+        :($raw::AbstractVector{Float64} = $(block_read(e.offset, e.size))),
+        :($z::Vector{Float64} = tanh.($raw)),
         # The diagonal is part of constructing the factor. Publish it as a
         # graph value so a guarded prior need not share the whole matrix with
         # response products. Each diagonal entry is still computed once.

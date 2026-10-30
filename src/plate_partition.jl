@@ -75,6 +75,8 @@ function _locality_describe(entry)
         "its producer `$(entry.source)` has a row form, but the value's full shape is not known at rows" :
         entry.reason === :operands ?
         "its producer `$(entry.source)` has a row form, but an operand is not provably an integer index or an array" :
+        entry.reason === :untyped_index ?
+        "the cell's body reads it as `v[q]`, but `q` (a batched argument) is not provably an integer position or a vector of them (declare its type)" :
         entry.reason === :cascade ?
         "it is read whole by `$(entry.reader)`, which is itself computed whole" :
         "its producer `$(entry.source)`: $(entry.reason)"
@@ -134,9 +136,13 @@ function _cell_locality(p::Plan, d::_CellPushdowns)
             if r.op isa _AuthoredPlateCellOp
                 atomic = typeof(r.op.plate).parameters[2]
                 positions = get(d.captures, r.id, Dict{Int,Vector{Tuple{Int,Int}}}())
+                unknown = get(d.untyped, r.id, Int[])
                 # Read whole by the cell body: an atomic argument that is not
-                # a capture read at the cell's own rows.
-                return any(s -> s > 1 && (s - 1) in atomic && !haskey(positions, s - 1), slots)
+                # a capture read at the cell's own rows. One read that way but
+                # through an index of no known type is read whole, not
+                # legitimately (`:untyped_index`).
+                return any(s -> s > 1 && (s - 1) in atomic && !haskey(positions, s - 1) &&
+                           !((s - 1) in unknown), slots)
             end
             f = form(r)
             outputs = map(cidof, r.outputs)
@@ -207,7 +213,13 @@ function _cell_locality(p::Plan, d::_CellPushdowns)
                 untyped = d.refused[cid] === :no_form &&
                     !(static_type(g.values[cid]) <: AbstractArray) &&
                     !(r !== nothing && r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp})
-                (:whole, untyped ? :untyped : d.refused[cid], asker(first(requested)[1]))
+                (:whole, untyped ? :untyped : d.refused[cid],
+                 isempty(requested) ? cellname : asker(first(requested)[1]))
+            elseif haskey(d.dropped, cid)
+                # Pushed, then dropped: a reader computed at rows reads it in a
+                # row role but cannot take it there (its full shape is not
+                # known in that role).
+                (:whole, :unshaped, asker(d.dropped[cid]))
             else
                 (:whole, :cascade, cascade_reader())
             end
@@ -516,10 +528,14 @@ end
 # captures read, the constant positions of a bound-indexed read, or `:whole`.
 # Reads of values computed whole are whole; a port read by nothing is empty.
 const _FOOTPRINT = :ReactiveKernels_footprint
-struct _FootprintRecords
-    records::Dict{ValueId,Vector{Tuple{Symbol,Any}}}
+mutable struct _FootprintRecords
+    const records::Dict{ValueId,Vector{Tuple{Symbol,Any}}}
+    # Whether the lowering being footprinted has begun: a lowering nested in
+    # it (a plate body, an embedded kernel) runs blind to the recording
+    # (`_lower_with_ops_collecting`).
+    active::Bool
 end
-_FootprintRecords() = _FootprintRecords(Dict{ValueId,Vector{Tuple{Symbol,Any}}}())
+_FootprintRecords() = _FootprintRecords(Dict{ValueId,Vector{Tuple{Symbol,Any}}}(), false)
 
 _footprint_recording() = get(task_local_storage(), _FOOTPRINT, nothing) !== nothing
 function _footprint_record!(cid::ValueId, kind::Symbol, expr)
@@ -627,6 +643,8 @@ function _footprint_positions(port, records::Tuple)
         kind === :whole && return :whole
         if kind in (:rows, :cell, :gathered_rows)
             rows = kind === :cell ? Int[first(Tuple(read))] : _cell_partition_positions(read)
+            # A port of one row read as a lane is extruded: every row reads it.
+            kind === :gathered_rows || size(port, 1) != 1 || (rows = Int[firstindex(port, 1)])
             for row in rows, J in CartesianIndices(Base.tail(axes(port)))
                 push!(positions, LinearIndices(port)[row, Tuple(J)...])
             end
@@ -660,15 +678,25 @@ support of its gradient (`ReactiveKernelsPPL.partition_footprint`).
 """
 function partition_footprint(kernel::PreparedKernel, args...)
     footprint = lock(_FOOTPRINT_LOCK) do
-        get!(_FOOTPRINT_KERNELS, kernel) do
-            p = _lowering_plan(kernel.plan)
-            ast, ops, recipes = _sharing_cell_plans() do
-                _lower_with_ops(p; footprint = true)
-            end
-            _prepare(p, ast, ops, recipes)
-        end
+        get!(() -> partition_footprint_kernel(kernel), _FOOTPRINT_KERNELS, kernel)
     end
     Base.invokelatest(footprint, args...)
+end
+
+"""
+    partition_footprint_kernel(kernel::PreparedKernel) -> PreparedKernel
+
+The kernel [`partition_footprint`](@ref) evaluates: called with `kernel`'s HAVE
+arguments, it returns their footprint. `partition_footprint` prepares and keeps
+one per kernel for the process; a caller evaluating many labels prepares it
+once here and holds it itself.
+"""
+function partition_footprint_kernel(kernel::PreparedKernel)
+    p = _lowering_plan(kernel.plan)
+    ast, ops, recipes = _sharing_cell_plans() do
+        _lower_with_ops(p; footprint = true)
+    end
+    _prepare(p, ast, ops, recipes)
 end
 
 # ----------------------------------------------------------- separability
@@ -738,8 +766,8 @@ partitioned port carries its own label or `missing`. Returns the footprint
 naming the port and the other partitions' positions otherwise. A kernel with
 no partition, or one with no rule, passes.
 """
-function partition_separability(kernel::PreparedKernel, args...)
-    footprint = partition_footprint(kernel, args...)
+function partition_separability(kernel::PreparedKernel, args...; footprint = nothing)
+    footprint === nothing && (footprint = partition_footprint(kernel, args...))
     p = kernel.plan
     for r in p.recipes
         r.op isa _AuthoredPlateCellOp && r.op.rows && !isempty(r.op.partitioned) || continue

@@ -45,7 +45,24 @@ are recorded in the git history only.
 - A cell's row window reads a vector of rows as one gather of its data at
   the rows' positions (the positions computed first); the previous
   row-by-row read made native Enzyme Reverse refuse a partition's gather of
-  a product's rows (`EnzymeRuntimeActivityError`).
+  a product's rows (`EnzymeRuntimeActivityError`). A window holds its rows
+  sorted and unique and a read finds its row by bisection, so a partition of
+  r cells reading a value row by row costs O(r log r), not O(r²).
+- A plate body reading a row of a shared matrix, `M[q, :]` with `q` the
+  element of a batched integer argument, captures that row as `v[q]` captures
+  an element: a cell or partition reads only its own rows of the matrix.
+- Locality names two more cases that were computed whole silently: a
+  captured value whose index lane has no known type (`:untyped_index`), and a
+  value pushed for one reader and dropped because another reader at rows
+  cannot take it in its role (`:unshaped`, naming that reader). A literal
+  range or reshape of a matrix (linear positions, not rows) is refused as
+  `:operands`.
+- `partition_footprint` reads a lane of one row as that row (extruded over
+  the partition) instead of throwing, and a lowering nested in the footprint
+  lowering (a plate body, an embedded kernel) no longer records or returns
+  footprints of its own. `partition_footprint_kernel(kernel)` prepares the
+  footprint kernel for a caller to hold; `partition_separability` takes a
+  computed `footprint`.
 ## 0.1.22
 
 - One cell of a plate (`plate_cell`; RKPPL's `prepare_cell_query` and cell

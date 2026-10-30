@@ -301,3 +301,198 @@ end
     @test_throws ArgumentError plate_partition(_pp_subjects, :dens; by = :subject,
                                                partitioned = (:nope => labels,))
 end
+
+# A pushed plate reading rows of shared matrices, `tau[k, :]` (a class's
+# scales) and `Z[m, :]` (a muni's effects): captures gathered at the
+# partition's rows, so a subject's partition reads its own classes' and munis'
+# rows only.
+@kernel _pp_rows(u::AbstractVector{Float64}, muni::AbstractVector{Int},
+                 klass::AbstractVector{Int}, w::AbstractVector{Float64},
+                 subject::AbstractVector{Int}) = begin
+    tflat::AbstractVector{Float64} = view(u, 1:4)
+    tau::AbstractMatrix{Float64} = reshape(tflat, 2, 2)
+    zflat::AbstractVector{Float64} = view(u, 5:16)
+    Z::AbstractMatrix{Float64} = reshape(zflat, 6, 2)
+    eff = plate(muni, klass) do m, k
+        sum(tau[k, :] .* Z[m, :])
+    end
+    dens = plate(eff, w) do e, wi
+        -(wi - e)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+# Two munis per subject; subject 1 is class 1, the others class 2.
+function _pp_rows_data(per_subject)
+    subject = Int[s for (s, n) in enumerate(per_subject) for _ in 1:n]
+    muni = Int[2(s - 1) + 1 + i % 2 for (s, n) in enumerate(per_subject) for i in 1:n]
+    klass = Int[s == 1 ? 1 : 2 for s in subject]
+    w = [cos(i / 2) for i in eachindex(subject)]
+    u = [0.1 * ((k * 7) % 5 - 1.5) + 0.05 * k for k in 1:16]
+    (; u, muni, klass, w, subject)
+end
+const _PP_ROWS_HAVE = (:u, :muni, :klass, :w, :subject)
+
+# A lane of one row is extruded over the partition's rows.
+@kernel _pp_extruded(x::AbstractVector{Float64}, c::AbstractVector{Float64},
+                     subject::AbstractVector{Int}) = begin
+    dens = plate(x, c) do xi, ci
+        -(xi - ci)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+
+# A literal range of a matrix is a linear read, not rows: refused by name.
+@kernel _pp_matrix_range(M::AbstractMatrix{Float64}, g::AbstractVector{Int},
+                         w::AbstractVector{Float64}, subject::AbstractVector{Int}) = begin
+    v = M[2:3]
+    eta = v[g]
+    dens = plate(eta, w) do ei, wi
+        -(wi - ei)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+
+# A computed value captured as `field[q]` through a lane of no known type.
+@kernel _pp_untyped(v::AbstractVector{Float64}, q, w::AbstractVector{Float64},
+                    subject::AbstractVector{Int}) = begin
+    field = exp.(v)
+    dens = plate(w, q) do wi, qi
+        -(wi - field[qi])^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+
+# A product of unknown shape (`c` undeclared), gathered by one partitioned
+# plate and read as a lane by the other: pushed for the gather, then dropped
+# for the lane.
+@kernel _pp_dropped(u::AbstractVector{Float64}, c, g::AbstractVector{Int},
+                    w::AbstractVector{Float64}, subject::AbstractVector{Int},
+                    group_subject::AbstractVector{Int}) = begin
+    zflat::AbstractVector{Float64} = view(u, 1:20)
+    Z::AbstractMatrix{Float64} = reshape(zflat, 10, 2)
+    R = Z * c
+    eta = R[g]
+    dens = plate(eta, w) do ei, wi
+        -(wi - ei)^2 / 2
+    end
+    pen = plate(R) do ri
+        -ri^2 / 2
+    end
+    total = sum(dens) + sum(pen)
+    return total
+end
+
+@testset "plate_partition: rows of shared matrices, extruded lanes, named refusals" begin
+    # Rows of `tau` and `Z` gathered at the partition's rows.
+    spec = plate_partition(_pp_rows, :dens; by = :subject, index = :label)
+    d = _pp_rows_data((3, 4, 5))
+    have = (_PP_ROWS_HAVE..., :label)
+    bound = prepare(spec; have, want = :partition_total, bound = (; d.muni, d.klass, d.w, d.subject))
+    full = prepare(_pp_rows; have = _PP_ROWS_HAVE, want = :dens)
+    dens = full(d.u, d.muni, d.klass, d.w, d.subject)
+    report = partition_locality(bound)
+    @test all(e.status !== :whole for e in report)
+    statuses(name) = unique(e.status for e in report if e.value === name)
+    @test statuses(:tau) == [:rows] && statuses(:Z) == [:rows]
+    # The body reads the captured rows through windows (active data beside
+    # constant rows); on registered Enzyme that needs runtime activity (snag
+    # `Enzyme/snags?sig=native-reverse-r-285478e2`: repaired on the dogfood branch).
+    ad = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)),
+                    d.u, 1; active = :u)
+    gradient = similar(d.u)
+    for s in 1:3
+        @test bound(d.u, s) ≈ sum(dens[d.subject .== s])
+        classes = unique(d.klass[d.subject .== s])
+        munis = unique(d.muni[d.subject .== s])
+        expected = sort!(vcat([[k, k + 2] for k in classes]..., [[4 + m, 10 + m] for m in munis]...))
+        @test partition_footprint(bound, d.u, s).u == expected
+        ad_value_and_gradient!(ad, gradient, d.u, s)
+        @test findall(!iszero, gradient) == expected
+    end
+    # The cost of a partition does not grow with the other subjects' rows.
+    allocated(sizes) = let dd = _pp_rows_data(sizes),
+            k = prepare(spec; have, want = :partition_total,
+                        bound = (; dd.muni, dd.klass, dd.w, dd.subject))
+        k(dd.u, 1)
+        @allocated k(dd.u, 1)
+    end
+    @test allocated((5, 5, 5)) == allocated((5, 500, 500))
+
+    # An extruded lane: every row of the partition reads its one row.
+    x = [0.1, 0.4, 0.9, 0.3, 0.7]
+    subject = [1, 1, 2, 2, 2]
+    extruded = prepare(plate_partition(_pp_extruded, :dens; by = :subject, index = :label);
+                       have = (:x, :c, :subject, :label), want = :partition_total)
+    @test extruded(x, [0.4], subject, 2) ≈ sum(-(x[3:5] .- 0.4) .^ 2 ./ 2)
+    footprint = partition_footprint(extruded, x, [0.4], subject, 2)
+    @test footprint.x == [3, 4, 5] && footprint.c == [1]
+
+    # A literal range of a matrix reads linear positions, not rows: refused.
+    M = [1.0 3.0; 2.0 4.0]
+    g = [1, 2, 2, 1, 2]
+    w = [0.5, 0.1, 0.9, 0.2, 0.4]
+    range_spec = plate_partition(_pp_matrix_range, :dens; by = :subject, index = :label)
+    range_have = (:M, :g, :w, :subject, :label)
+    err = try
+        prepare(range_spec; have = range_have, want = :partition_total)
+        nothing
+    catch e
+        e
+    end
+    @test err isa PartitionLocalityError
+    @test any(v -> v.value === :v && v.reason === :operands, err.violations)
+    ignored = prepare(plate_partition(_pp_matrix_range, :dens; by = :subject, index = :label,
+                                      locality = :ignore);
+                      have = range_have, want = :partition_total)
+    v = M[2:3]
+    @test ignored(M, g, w, subject, 2) ≈ sum(-(w[3:5] .- v[g[3:5]]) .^ 2 ./ 2)
+
+    # A capture through a lane of no known type is read whole, and named.
+    vdata = [0.2, 0.5, 0.1]
+    q = [1, 3, 2, 2, 1]
+    untyped_spec = plate_partition(_pp_untyped, :dens; by = :subject, index = :label)
+    untyped_have = (:v, :q, :w, :subject, :label)
+    err = try
+        prepare(untyped_spec; have = untyped_have, want = :partition_total)
+        nothing
+    catch e
+        e
+    end
+    @test err isa PartitionLocalityError
+    @test any(e -> e.value === :field && e.reason === :untyped_index, err.violations)
+    @test occursin("not provably an integer position", sprint(showerror, err))
+    typed = prepare(untyped_spec; have = untyped_have, want = :partition_total,
+                    bound = (; q, w, subject))
+    @test all(e.status !== :whole for e in partition_locality(typed))
+    @test typed(vdata, 2) ≈ sum(-(w[3:5] .- exp.(vdata)[q[3:5]]) .^ 2 ./ 2)
+
+    # A value pushed for a gather and dropped for a lane is named, not silent.
+    dd = _pp_subject_data((4, 3, 5, 2, 6))
+    group_subject = [1 + (r - 1) ÷ 2 for r in 1:10]
+    dropped_spec = plate_partition(_pp_dropped, (:dens, :pen);
+                                   by = (dens = :subject, pen = :group_subject), index = :label)
+    dropped_have = (:u, :c, :g, :w, :subject, :group_subject, :label)
+    err = try
+        prepare(dropped_spec; have = dropped_have, want = :partition_total,
+                bound = (; dd.g, dd.w, dd.subject, group_subject))
+        nothing
+    catch e
+        e
+    end
+    @test err isa PartitionLocalityError
+    @test any(e -> e.value === :R && e.reason === :unshaped, err.violations)
+    c = [1.0, 0.5]
+    uR = [0.1 * ((k * 7) % 5 - 1.5) + 0.02 * k for k in 1:20]
+    silent = prepare(plate_partition(_pp_dropped, (:dens, :pen);
+                                     by = (dens = :subject, pen = :group_subject), index = :label,
+                                     locality = :ignore);
+                     have = dropped_have, want = :partition_total,
+                     bound = (; dd.g, dd.w, dd.subject, group_subject))
+    R = reshape(uR, 10, 2) * c
+    @test silent(uR, c, 3) ≈ sum(-(dd.w[dd.subject .== 3] .- R[dd.g[dd.subject .== 3]]) .^ 2 ./ 2) +
+        sum(-R[group_subject .== 3] .^ 2 ./ 2)
+end
