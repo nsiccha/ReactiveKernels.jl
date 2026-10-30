@@ -1,44 +1,5 @@
-using ReactiveKernelsCompatibilityExamples.ReactiveHMCExamples: riemannian_examples
-
 @testset "corrected core through preexisting ecosystem patterns" begin
-    @testset "partially supplied Riemannian geometry is authoritative" begin
-        riemannian = riemannian_examples().gaussian
-        spec = riemannian.spec
-        sources = riemannian.sources
-        pos = [0.25, -0.5]
-        supplied_metric = Diagonal([3.0, 4.0])
-
-        kernel = prepare(
-            spec;
-            have = (
-                spec.grad_f, spec.metric_f, spec.metric_grad_f,
-                spec.pos, spec.metric,
-            ),
-            want = (spec.metric, spec.dpot, spec.metric_grad),
-        )
-        metric, dpot, metric_grad = kernel(
-            sources.grad_f, sources.metric_f, sources.metric_grad_f,
-            pos, supplied_metric,
-        )
-        @test metric === supplied_metric
-        @test dpot == pos
-        @test size(metric_grad) == (2, 2, 2)
-
-        state = ReactiveState(spec)
-        set!(state, spec.grad_f, sources.grad_f)
-        set!(state, spec.metric_f, sources.metric_f)
-        set!(state, spec.metric_grad_f, sources.metric_grad_f)
-        set!(state, spec.pos, pos)
-        set!(state, spec.metric, supplied_metric)
-        metric, dpot, metric_grad = get!(
-            state, (spec.metric, spec.dpot, spec.metric_grad),
-        )
-        @test metric === supplied_metric
-        @test dpot == pos
-        @test size(metric_grad) == (2, 2, 2)
-    end
-
-    @testset "overlapping HMC oracle producers retain a valid schedule" begin
+    @testset "overlapping oracle producers retain a valid schedule" begin
         graph = Graph()
         pos = value!(graph, :pos, Float64)
         pot = value!(graph, :pot, Float64)
@@ -55,8 +16,8 @@ using ReactiveKernelsCompatibilityExamples.ReactiveHMCExamples: riemannian_examp
         @test length(kernel.plan.recipes) == 3
     end
 
-    @testset "effectful HMC diagnostics never alias pure oracle results" begin
-        # ReactiveHMC-style oracle wrappers often share a stable cache key even
+    @testset "effectful diagnostics never alias pure oracle results" begin
+        # Oracle wrappers often share a stable cache key even
         # when one wrapper exists only to log a diagnostic.  The effect marker
         # is part of recipe identity: the pure result must remain plannable and
         # the diagnostic result must remain rejected, in either insertion order.
@@ -136,33 +97,13 @@ using ReactiveKernelsCompatibilityExamples.ReactiveHMCExamples: riemannian_examp
         @test only(values(checkpoint(state, (adapted_scale,)))) == 11.0
     end
 
-    @testset "HMC query inputs and lowering names are validated" begin
+    @testset "query inputs and lowering names are validated" begin
         graph = Graph()
         user_ops = value!(graph, :__ops__, Float64)
         hamiltonian = value!(graph, :hamiltonian, Float64)
         add!(graph, user_ops => hamiltonian, x -> abs2(x))
         @test prepare(graph; have = (user_ops,), want = (hamiltonian,))(3.0) == 9.0
 
-        riemannian = riemannian_examples().gaussian
-        spec = riemannian.spec
-        sources = riemannian.sources
-        duplicate_have = prepare(
-            spec;
-            have = (
-                spec.grad_f, spec.metric_f, spec.metric_grad_f,
-                spec.pos, spec.pos, spec.metric,
-            ),
-            want = (spec.metric, spec.dpot),
-        )
-        @test inputs(duplicate_have) == (
-            spec.grad_f, spec.metric_f, spec.metric_grad_f,
-            spec.pos, spec.metric,
-        )
-        supplied_metric = Diagonal([3.0, 4.0])
-        @test duplicate_have(
-            sources.grad_f, sources.metric_f, sources.metric_grad_f,
-            [0.25, -0.5], supplied_metric,
-        )[1] === supplied_metric
 
         invalid_graph = Graph()
         pos = value!(invalid_graph, :pos, Float64)

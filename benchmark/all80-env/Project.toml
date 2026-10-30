@@ -1,6 +1,5 @@
 [deps]
 ADTypes = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
-AdvancedHMC = "0bf59076-c3b1-5ca4-86bd-e02cd72cde3d"
 Bijectors = "76274a88-744f-5084-9051-94815aaf08c4"
 BridgeStan = "c88b6f0a-829e-4b0b-94b7-f06ab5908f5a"
 Chairmarks = "0ca39b1e-fe0b-4e98-acfc-b1656634c4de"

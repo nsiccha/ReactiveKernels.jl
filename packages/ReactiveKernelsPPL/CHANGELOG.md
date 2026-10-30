@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.20
+
+- A constructed endpoint (`object(; …).endpoint(x)`) accepts any method-bearing
+  kernel object, including one a downstream front end builds on ReactiveKernels'
+  object skeleton. Requires ReactiveKernels 0.1.20.
+
 ## 0.1.19
 
 - A categorical's level labels no longer reach the generated program as a

@@ -117,63 +117,15 @@ function render_all80_speedup_plot(path = _ALL80_BENCHMARK_PATH)
             "gross-workload mismatch (Mb: rich " *
             "O(M) per-individual plate vs the comparator's O(1) sufficient statistics); no other model " *
             "is positively certified same-workload. GLMM's RK/Turing ratio is excluded (non-equivalent " *
-            "Turing support). See the reading guide for the preprocessing/endpoint/HMC categories.")
+            "Turing support). See the reading guide for the preprocessing/endpoint categories.")
 end
 
-# ---- Plot 2: Reactant compiled-loop regime — native vs Reactant HMC throughput ----
-# The load-bearing Reactant insight: a single small gradient loses under Reactant, but the
-# WHOLE HMC loop compiled as one program can win. y = log2(native / reactant) µs/transition
-# so >0 ⇒ Reactant faster; x = dimension. Only models whose Reactant HMC loop LOWERED
-# (a numeric hmc_rk_reactant) appear.
-function _all80_reactant_hmc_rows(models)
-    rows = NamedTuple[]
-    for (name, m) in models
-        haskey(m, "error") && continue
-        name in _ALL80_TIMING_QUARANTINED && continue   # timing quarantine (same as the speedup ranking)
-        d = get(m, "dim", missing)
-        (d isa Real && d > 0) || continue
-        s = _log2_speedup(get(m, "hmc_rk_reactant", missing), get(m, "hmc_rk_native", missing))
-        s === missing && continue
-        nt = get(m, "hmc_transitions", missing)
-        push!(rows, (; model = name, family = String(get(m, "family", "")),
-            dim = Float64(d), speedup = s,
-            native_T = nt isa Real ? Float64(nt) : missing))   # native batch size (Reactant is fixed T=4)
-    end
-    rows
-end
-
-function render_all80_reactant_hmc_plot(path = _ALL80_BENCHMARK_PATH)
-    rows = _all80_reactant_hmc_rows(_all80_models(path))
-    isempty(rows) && return _all80_plot_note(
-        "No model's Reactant HMC loop lowered in this run — see the coverage plot and the " *
-        "HMC-throughput table diagnostics.")
-    spec = data(rows) *
-        mapping(:dim => "Model dimension",
-            :speedup => "log₂(native µs/transition / Reactant µs/transition)";
-            color = :native_T => "native batch T (Reactant fixed at 4)") *
-        visual(Scatter)
-    _all80_fig(spec * config(width = 480, height = 320,
-            title = "Reactant HMC-loop CAPABILITY PROBE (T=4) vs native throughput (calibrated T)",
-            scales = scales(X = (; scale = log10)));
-        id = "all80-reactant-hmc",
-        title = "Reactant compiled-HMC-loop capability probe ($_REMOVED_REACTANT_LABEL) — NOT a matched long-chain ranking",
-        description = _REMOVED_REACTANT_NOTE * " " *
-            "One point per model whose Reactant HMC loop lowered. **Batch sizes DIFFER**: " *
-            "Reactant runs a FIXED 4 transitions per compiled call (with per-round RNG marshalling " *
-            "inside the timer), while native runs its calibrated batch T (30–1000; ~39/59 at 1000, " *
-            "shown by colour). The per-call XLA-launch overhead is amortized over T, so at T=4 " *
-            "Reactant's per-transition figure is inflated and this ratio is NOT a matched long-chain " *
-            "backend verdict — it is a lowering CAPABILITY probe (does the whole loop compile+run). " *
-            "Models whose loop did not lower are absent here and counted in the coverage plot.")
-end
-
-# ---- Plot 3: Reactant coverage — how many models lowered, how many failed (visibly) ----
-# For each Reactant cell (primal / gradient / HMC), stack {lowered, failed} across all 82
+# ---- Plot 2: Reactant coverage — how many models lowered, how many failed (visibly) ----
+# For each Reactant cell (primal / gradient), stack {lowered, failed} across all 82
 # models so the honest coverage — and the size of the still-failing set — is one glance.
 const _ALL80_REACTANT_CELLS = (
     ("primal_rk_reactant", "primal"),
-    ("gradient_rk_reactant", "gradient"),
-    ("hmc_rk_reactant", "HMC loop"))
+    ("gradient_rk_reactant", "gradient"))
 
 # `models` is the receipt's `models` Dict (name => cell-dict).
 function _all80_reactant_coverage_rows(models)
@@ -203,7 +155,7 @@ function render_all80_reactant_coverage_plot(path = _ALL80_BENCHMARK_PATH)
         description = _REMOVED_REACTANT_NOTE * " " *
             "For each operation, how many of the 82 faithful graphs lowered through " *
             "Reactant versus recorded an exact lowering diagnostic. On the natural-source base all " *
-            "82 lowered for all three operations (primal, gradient, and the compiled HMC loop).")
+            "82 lowered for both operations (primal and gradient).")
 end
 
 # ---- Batch-1 incremental additions (todo 1x4pytu) — SEPARATE receipt, rendered ALONGSIDE ----------

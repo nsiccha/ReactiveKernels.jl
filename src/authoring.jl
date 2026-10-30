@@ -1863,7 +1863,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 callee.args[1].head === :call) && !(callee.args[1] in scoped)
             object = _kernel_resolve_binding(mod, callee.args[1])
             name = callee.args[2].value
-            if object isa Union{KernelObjectSpec,_StatefulKernelSkeleton} &&
+            if object isa Union{KernelObjectSpec,_KernelObjectSkeleton} &&
                     name in kernel_endpoint_names(object)
                 signature = _kernel_cached_object_extract!(
                     endpoint_cache, object; want = name).call_signature
@@ -1883,7 +1883,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
             constructor = callee.args[1]
             object = _kernel_resolve_binding(mod, constructor.args[1])
             endpoint_name = callee.args[2].value
-            if object isa Union{_StatefulKernelSkeleton,KernelObjectSpec} &&
+            if object isa Union{_KernelObjectSkeleton,KernelObjectSpec} &&
                endpoint_name in kernel_endpoint_names(object)
                 endpoint_actuals = ex.args[2:end]
                 default_endpoint = _kernel_cached_object_extract!(
@@ -4079,7 +4079,7 @@ function _kernel_resolve_binding(mod::Module, callee)
         inner = callee.args[2].value
         if outerval isa Module
             inner isa Symbol && isdefined(outerval, inner) ? getglobal(outerval, inner) : nothing
-        elseif outerval isa Union{_StatefulKernelSkeleton,KernelObjectSpec}
+        elseif outerval isa Union{_KernelObjectSkeleton,KernelObjectSpec}
             inner in kernel_endpoint_names(outerval) ? getproperty(outerval, inner) : nothing
         else
             nothing
@@ -4621,7 +4621,8 @@ end
 
 function _kernel_definition_parts(ex::Expr)
     # Returns (name, inputs, call_signature, positional_names, raw_signature, block).
-    # `raw_signature` = `ex.args[1]` — the FULL authored signature AST (Mode-2 retains it).
+    # `raw_signature` = `ex.args[1]` — the FULL authored signature AST (a stateful
+    # front end retains it for free methods).
     if ex.head === :(=) && length(ex.args) == 2
         named = _kernel_named_signature(ex.args[1])
         named === nothing || return (named..., ex.args[1], ex.args[2])
@@ -4746,19 +4747,18 @@ All recipe bodies resolve and capture names in the caller's scope. The macro
 only constructs closures and graph metadata; recipe bodies run only when a
 prepared kernel is invoked.
 
-`@kernel` supports three authoring modes, discriminated by the body. A methodless
-recipe body authors a stateless graph `KernelSpec` — this docstring's primary form,
-byte-identical to earlier releases. A body with nested method definitions authors an
-OBJECT kernel with an IMPLICIT synthesized receiver: pure straight-line methods are
-transparent named endpoints, while effectful or control-flow methods remain available
-to the stricter stateful compiler. Nested methods declare no `self`/`__self__` formal,
-bare unshadowed names are the owner's fields, and `__self__` appears only as a sibling
-object-pass actual (`flip!(__self__, depth)`). A methodless body that mutates a field
-of its first positional subject — or ANY `!!` name (a strong same-object update) —
-authors a free METHOD (e.g.
-`leapfrog!(phasepoint; stepsize)`, `nuts!!(state; rng)`). Reactive mutation of a
-compiled stateless kernel remains available through [`prepare_reactive`](@ref),
-[`set!`](@ref), [`mutate!`](@ref), and [`touch!`](@ref).
+`@kernel` supports two authoring modes, discriminated by the body. A methodless
+recipe body authors a stateless graph `KernelSpec` — this docstring's primary form.
+A body with nested method definitions authors an OBJECT kernel with an IMPLICIT
+synthesized receiver: pure straight-line methods are transparent named endpoints.
+Nested methods declare no `self`/`__self__` formal, bare unshadowed names are the
+owner's fields, and `__self__` appears only as a sibling object-pass actual
+(`flip!(__self__, depth)`). ReactiveKernels compiles pure kernels only: a methodless
+body that mutates a field of its first positional subject, or any `!!` name (a
+strong same-object update such as `nuts!!(state; rng)`), is a stateful free method
+and raises an `ArgumentError`. Reactive mutation of a compiled stateless kernel
+remains available through [`prepare_reactive`](@ref), [`set!`](@ref),
+[`mutate!`](@ref), and [`touch!`](@ref).
 """
 macro kernel(ex)
     definition = ex isa Expr ? _kernel_definition_parts(ex) : nothing
@@ -4766,7 +4766,7 @@ macro kernel(ex)
        length(ex.args) == 2 && ex.args[1] isa Symbol &&
        ex.args[2] isa Expr && ex.args[2].head === :call
         target = _kernel_resolve_binding(__module__, ex.args[2].args[1])
-        if target isa Union{_StatefulKernelSkeleton,KernelObjectSpec}
+        if target isa Union{_KernelObjectSkeleton,KernelObjectSpec}
             # Construction-time specialization sugar.  The call returns a
             # transparent object specification; the new binding remains a
             # stable top-level definition just like a method-bearing @kernel.
@@ -4776,25 +4776,18 @@ macro kernel(ex)
     definition === nothing &&
         return esc(_kernel_expand(ex, Tuple{Symbol,Any}[], nothing, __module__))
     name, inputs, call_signature, positional_names, raw_signature, block = definition
-    # Discriminator (V7): nested methods ⇒ Mode-1 object kernel; else a methodless
-    # body that MUTATES a field of the FIRST positional subject ⇒ Mode-2 free method
-    # (independent of `!` spelling); else the byte-identical stateless expansion.
+    # Discriminator (V7): nested methods ⇒ object kernel; else a methodless body that
+    # MUTATES a field of the FIRST positional subject, or a `!!` name, is a stateful
+    # free method, which is rejected; else the stateless expansion.
     _kernel_body_has_methods(block) &&
         return _kernel_stateful_expand(name, inputs, call_signature, block, __module__)
-    # `!!` is an EXPLICIT strong same-object update registration (locked Form C): it
-    # routes Mode-2 regardless of whether the mutation is direct or through a
-    # registered/delegated call (`nuts!!(state; rng) = begin step!(state, rng); state end`).
-    if _kernel_is_bangbang_name(name)
-        isempty(positional_names) && throw(ArgumentError(
-            "stateful @kernel `$name` (`!!` strong same-object update) needs a first " *
-            "positional subject to update in place"))
-        return _kernel_mode2_expand(name, inputs, call_signature, block,
-                                    positional_names[1], raw_signature, __module__)
-    end
-    if !isempty(positional_names) &&
-       _kernel_body_mutates_subject(block, positional_names[1])
-        return _kernel_mode2_expand(name, inputs, call_signature, block,
-                                    positional_names[1], raw_signature, __module__)
+    if _kernel_is_bangbang_name(name) ||
+       (!isempty(positional_names) &&
+        _kernel_body_mutates_subject(block, positional_names[1]))
+        throw(ArgumentError(
+            "@kernel `$name` is a stateful free method: its body updates its first " *
+            "argument in place, or its name ends in `!!`. ReactiveKernels compiles " *
+            "pure kernels only."))
     end
     stateless_body = _kernel_expression_result_body(name, inputs, block, ex.head === :(=))
     esc(Expr(:(=), name,

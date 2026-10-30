@@ -35,8 +35,6 @@ const _RENDERED_DOCS_PAGE_OWNERS = Dict(
     "manual-derivative-rules.md" => "ReactiveKernels:reactant",
     "batched.md" => "ReactiveKernels:batching",
     "distributions.md" => "ReactiveKernels:distributions",
-    "nuts.md" => "ReactiveKernels:hmc",
-    "walnuts.md" => "ReactiveKernels:hmc",
     "rkppl.md" => "ReactiveKernels:rkppl",
 )
 
@@ -318,10 +316,6 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "distributions.md" => 19,
         "batched.md" => 1,
         "bijectors.md" => 1,
-        "pathfinder.md" => 3,
-        "reactivehmc-corpus.md" => 6,
-        "nuts.md" => 0,
-        "nutpie-diagonal.md" => 2,
         "rkppl.md" => 11,
         "eight-schools.md" => 1,
         "sum-to-zero.md" => 1,
@@ -361,7 +355,6 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "soil-incubation.md" => 1,
         "hmm-drive-1.md" => 1,
         "mnist-logistic.md" => 2,
-        "online-stats.md" => 1,
         "gp-regr.md" => 1,
         "gp-pois-regr.md" => 1,
         "accel-gp.md" => 1,
@@ -369,13 +362,10 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "kronecker-gp.md" => 1,
     )
     expected_source_examples = Dict(
-        "reactivehmc-corpus.md" => 5,
     )
     expected_source_interactions = Dict(
-        "reactivehmc-corpus.md" => 5,
     )
     expected_sortable_tables = Dict(
-        "probprog-mcmc.md" => 3,
         "distributions-ad.md" => 9,
         "distributions.md" => 1,
         "ppl-ad.md" => 10,
@@ -387,11 +377,8 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "eval-throughput.md" => 6,
         "mnist-logistic.md" => 8,
         "mnist-reactant.md" => 14,
-        "nuts.md" => 1,
-        "nuts-reactant.md" => 2,
     )
     expected_aov_panels = Dict(
-        "probprog-mcmc.md" => 1,
         "distributions-ad.md" => 9,
         "distributions.md" => 2,
         "ppl-ad.md" => 10,
@@ -402,8 +389,6 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "eval-throughput.md" => 6,
         "mnist-logistic.md" => 8,
         "mnist-reactant.md" => 14,
-        "nuts.md" => 1,
-        "nuts-reactant.md" => 1,
         # posteriordb-comparison.md is a generated benchmark page whose AoV
         # panels and sortable tables grow as models enter the sweep; it is
         # exempt from these frozen counts via _GENERATED_BENCHMARK_PAGES.
@@ -416,13 +401,6 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
     # review-state marker and must NOT be listed here — only pages that still
     # render a banner belong in this dict.
     expected_review_states = Dict(
-        "pathfinder.md" => "frozen",
-        "reactivehmc-corpus.md" => "frozen",
-        "nuts.md" => "frozen",
-        "nutpie-diagonal.md" => "frozen",
-        "walnuts.md" => "frozen",
-        "online-stats.md" => "frozen",
-        "nuts-reactant.md" => "frozen",
         "bijectors.md" => "frozen",
         "nonallocating.md" => "review-pending",
         "ppl-front-end.md" => "review-pending",
@@ -437,13 +415,6 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "One graph, selected cuts",
             "Two-stage reverse staging",
             "Generated adapters",
-        ),
-        "probprog-mcmc.md" => (
-            "NUTS sampling performance and diagnostics",
-            "Eight Schools posterior agreement",
-            "MNIST posterior agreement",
-            "benchmark/receipts/probprog-mcmc-v1.toml",
-            "probprog_mcmc_comparison_body.jl",
         ),
         "automatic-differentiation.md" => (
             "Prepared automatic differentiation",
@@ -504,14 +475,6 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "plot:normal-logdensity-reactant-cpu-relative",
             "plot:batched-authored-native-julia-relative",
             "plot:batched-authored-reactant-cpu-relative",
-        ),
-        "nuts-reactant.md" => (
-            "Adaptive NUTS through Reactant: static receipt",
-            "Frozen matched-control result",
-            "Compilation and first-call costs",
-            "Runtime ÷ baseline",
-            "plot:nuts-reactant-transition-relative",
-            "without executing NUTS compiler or runtime code",
         ),
         "compiler.md" => ("class=\"rk-pipeline\"",),
         "eight-schools-reactant.md" => (
@@ -578,55 +541,6 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "benchmark/receipts/mnist-reactant-wren-pca40-v1.toml",
             "benchmark/receipts/mnist-reactant-ad-wren-pca40-v1.toml",
         ),
-        "nuts.md" => (
-            "class=\"rk-status-grid\"",
-            "Compiler/runtime execution is disabled in docs",
-            "Sampler execution: not part of the docs build",
-            "G7 work-normalized comparison",
-            "Time / leapfrog step ÷ RK",
-            "plot:nuts-g7-relative",
-        ),
-        "nutpie-diagonal.md" => (
-            "@kernel nutpie_diagonal_initialize",
-            "@kernel nutpie_diagonal_adaptation",
-            "97be9ab88cfaadfafd9e5f4409a3b1d5af62805a",
-        ),
-        "pathfinder.md" => (
-            "Pathfinder Inverse Bfgs Geometry",
-            "Pathfinder Local Gaussian And Elbo",
-            "Pathfinder Jl Compact History",
-            "# Exact build-executed constructor / prepare / call",
-            "fixture.pathfinder_candidate",
-            "fixture.pathfinder_jl_compact_candidate",
-            "output = kernel(Tuple(inputs)...)",
-        ),
-        "reactivehmc-corpus.md" => (
-            "ReactiveHMC kernel corpus",
-            "Relativistic kinetic energy",
-            "Generalized leapfrog",
-            "Implicit midpoint",
-            "Trajectory and sampling statistics",
-            "Fixed-step HMC",
-            "# Exact build-executed constructor / prepare / call",
-            "compiled = RK.compile_stateful(",
-            "ReactiveKernels.compile_state_transition(",
-            "Fixture construction / MethodIR / independent-receipt inspection only",
-            "compiler_execution_claimed = false",
-            "ca9ea4ca41924bb0e1fadc01c717e1333916aba6",
-        ),
-        "walnuts.md" => (
-            "WALNUTS-D as mathematical `@kernel` source",
-            "Fixed macro time, dyadic micro grids",
-            "macro_step!(ep) = begin",
-            "reverse_num_steps = div(reverse_num_steps, 2)",
-            "step!(directions, exponentials) = begin",
-            "accepted = macro_step!(__self__, ep)",
-            "@kernel walnuts!!(state; momentum, directions, exponentials)",
-            "Compiler status: not executed during the docs build",
-            "does not claim full",
-            "recursive-SCC or WALNUTS compiler support",
-            "Complete authored WALNUTS-D fixture",
-        ),
         "visualization.md" =>
             ("class=\"rk-dag-legend\"", "class=\"rk-comparison-grid\""),
     )
@@ -640,21 +554,6 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "sum-to-zero.md" =>
             ("Sum To Zero Logdensity", "Raw input", "Generated kernel", "Compute DAG",
              "Sum-to-zero hot loop — Native primal"),
-        "nuts.md" =>
-            ("Compiler/runtime execution is disabled in docs",
-             "@kernel nuts!!", "Show the complete authoring fixture"),
-        "nutpie-diagonal.md" => (
-            "Nutpie Diagonal Initialize", "Nutpie Diagonal Adaptation",
-            "Raw input", "Generated kernel", "Compute DAG",
-        ),
-        "pathfinder.md" => (
-            "Pathfinder Inverse Bfgs Geometry",
-            "Pathfinder Local Gaussian And Elbo",
-            "Pathfinder Jl Compact History",
-            "Raw input",
-            "Generated kernel",
-            "Compute DAG",
-        ),
     )
 
     expected_panels = _contract_override(contracts, :panels, expected_panels)
@@ -758,38 +657,6 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
                 expected = marker, observed = "missing", artifact_ids,
                 detail = "human-facing structural marker drift",
             )
-        end
-
-        if source == "reactivehmc-corpus.md"
-            inventory_count = _occurrences(intermediate, "data-rk-corpus-id=")
-            inventory_count == 17 || _record_advisory!(
-                advisories; page = source, contract_kind = "corpus-inventory-count",
-                expected = 17, observed = inventory_count, artifact_ids,
-            )
-            for marker in (
-                    "data-rk-source-authority=\"relativistic_kinetic_energy\"",
-                    "data-rk-source-authority=\"generalized_leapfrog\"",
-                    "data-rk-source-authority=\"implicit_midpoint\"",
-                    "data-rk-source-authority=\"statistics_state\"",
-                    "data-rk-source-authority=\"fixed_step_hmc\"",
-                )
-                count = _occurrences(intermediate, marker)
-                count == 1 || error(
-                    "ReactiveHMC corpus marker $marker occurred $count times; expected exactly once",
-                )
-            end
-            for marker in (
-                    "data-rk-interaction=\"relativistic_kinetic_energy\"",
-                    "data-rk-interaction=\"generalized_leapfrog\"",
-                    "data-rk-interaction=\"implicit_midpoint\"",
-                    "data-rk-interaction=\"statistics_state\"",
-                    "data-rk-interaction=\"fixed_step_hmc\"",
-                )
-                count = _occurrences(intermediate, marker)
-                count == 1 || error(
-                    "ReactiveHMC interaction marker $marker occurred $count times; expected exactly once",
-                )
-            end
         end
 
         for marker in get(body_markers, source, ())

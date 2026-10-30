@@ -109,11 +109,10 @@ reactive state lets you change inputs in place through `set!`, `mutate!`, and
 `touch!`. A `@kernel` that contains its own inner methods can expose pure,
 straight-line methods as transparent endpoints; a branch in value position, a
 `let` and an authored `plate(...) do` cell are straight-line, since the recipe
-lowering owns them. Methods with mutation, loops, or statement-position control flow
-remain on the separate, stricter stateful compiler: it reads their source
-directly and only allows calls whose effects it can account for.
+lowering owns them. Methods with mutation, loops, or statement-position control
+flow are not pure endpoints, and ReactiveKernels does not compile them.
 The [compiler capability and limits](compiler.md) page covers the full planning,
-code-generation, state, control-flow, NUTS, and rejection rules.
+code-generation, state, control-flow, and rejection rules.
 
 ## Extend by named ports
 
@@ -336,9 +335,9 @@ Pure endpoints may call imported or module-qualified pure Julia functions
 directly—for example `erfc(z)` or `SpecialFunctions.erfc(z)`. Those bindings are
 resolved in the kernel's definition module and specialize like ordinary Julia
 calls; no wrapper recipe is needed. The authoring contract is referential
-transparency: syntactic mutation, bang calls (including qualified ones), and
-control flow are not exposed as pure endpoints and remain on the effect-aware
-stateful path.
+transparency: a method with syntactic mutation, bang calls (including
+qualified ones), or control flow is not a pure endpoint, and ReactiveKernels
+does not compile it.
 
 ## See the selected DAG
 
@@ -366,10 +365,7 @@ staying outside the generated kernel.
 
 `vectorize` / `prepare_batched` lift a whole scalar kernel across an extra
 position axis. ReactiveKernels no longer has a Reactant path; the receipts
-measured with it are kept under "Historical Reactant receipts". Sampling
-receipts are kept last and
-static; NUTS and WALNUTS compiler/runtime code is not executed during
-documentation builds.
+measured with it are kept under "Historical Reactant receipts".
 
 > **Status:** early development — the public API is still being shaped.
 

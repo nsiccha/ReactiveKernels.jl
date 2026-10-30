@@ -13,9 +13,6 @@ const LOCAL_PACKAGE_PATHS = (
     joinpath(@__DIR__, "ReactiveKernelsBatchingExamples"),
     joinpath(@__DIR__, "ReactiveKernelsPPLExamples"),
     joinpath(@__DIR__, "ReactiveKernelsCompatibilityExamples"),
-    joinpath(@__DIR__, "ReactiveKernelsNUTSExamples"),
-    joinpath(@__DIR__, "ReactiveKernelsStreamingStats"),
-    joinpath(@__DIR__, "ReactiveKernelsHMCDiagnostics"),
     joinpath(@__DIR__, "ReactiveKernelsPPL"),
 )
 

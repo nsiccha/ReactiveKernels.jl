@@ -15,18 +15,19 @@ the faithful graph lowered, or the exact lowering/AD diagnostic where it did not
 hand-rewritten "Reactant-friendly" density. The failures are kept explicit precisely so they
 can be improved or fixed.
 
-ReactiveKernels has since removed its Reactant path. Every Reactant cell, the Reactant coverage
-plot and the Reactant HMC-loop plot on this page are historical: they were measured with that
-path and are kept as recorded, and none of them describes a current backend.
+ReactiveKernels has since removed its Reactant path. Every Reactant cell and the Reactant
+coverage plot on this page are historical: they were measured with that path and are kept as
+recorded, and none of them describes a current backend. The receipts also record HMC throughput
+(a native ReactiveKernels HMC loop and AdvancedHMC on the Turing model); ReactiveKernels no
+longer contains sampler code, so this page does not show those cells.
 
 On this base the load-independent result is strong, stated precisely: **no RK gate failure is
 observed at the tested points** across all 82 models. Concretely, every native RK graph produces
-finite primal, gradient, and native-HMC values, and **81 of 82 pass parity** with reference Stan
+finite primal and gradient values, and **81 of 82 pass parity** with reference Stan
 and upstream Turing at the gate's probe points (native is a three-point check; the single
 non-pass, `GLMM_Poisson`, is a Turing prior-support non-equivalence, not an RK defect — see the
 reading guide). **All 82 graphs also lowered through the since-removed Reactant path** (primal and
-gradient at the selected probe `q`; the compiled HMC loop executed finitely) with no lowering or AD
-diagnostic.
+gradient at the selected probe `q`) with no lowering or AD diagnostic.
 This is finite-point gate evidence, not a proof of correctness over all inputs. The native gate
 failures that were open on the earlier frozen base are resolved by the inherited core compiler
 fixes, not by the data naturalization.
@@ -53,8 +54,7 @@ coverage and correctness below do not depend on host load and are the source of 
 
 Coverage first — how much of the faithful portfolio lowered through the since-removed Reactant
 path, and where each model recorded a numeric result versus an exact lowering/AD diagnostic. On
-this base **all 82 lowered for all three operations** (primal, gradient, and the compiled HMC
-loop):
+this base **all 82 lowered for both operations** (primal and gradient):
 
 ```@eval
 Main.ReactiveKernelsDocs.render_all80_reactant_coverage_plot()
@@ -68,26 +68,13 @@ is marked, and `GLMM`'s RK/Turing ratio is excluded (non-equivalent Turing suppo
 Main.ReactiveKernelsDocs.render_all80_speedup_plot()
 ```
 
-Historical Reactant compiled-HMC-loop throughput versus native RK (removed path; same load
-caveats; throughput only, **not verified-matched** — see the reading guide):
-
-```@eval
-Main.ReactiveKernelsDocs.render_all80_reactant_hmc_plot()
-```
-
 ## Protocol
 
 - Primal and value-plus-gradient cells are median wall-clock nanoseconds; lower is faster.
-- HMC uses the same fixed mechanics on both sides: multinomial HMC, **16 leapfrog steps per
-  transition**, step size `0.03`, one untimed warmup, and six timed rounds. The number of
-  transitions is chosen once per model from the slower measured gradient to target about
-  0.5 seconds per round, bounded at 4–1,000, and is shared by RK and AHMC. The receipt records
-  that count. Cells report median microseconds per transition; this is throughput, not ESS or
-  adaptation quality.
 - Native timings ran in a Julia subprocess that never loaded Reactant, preventing Reactant's
-  compiler state from perturbing native compilation and timing. The pinned environment could
-  load Turing, Mooncake, Enzyme, AdvancedHMC, BridgeStan, PosteriorDB, and Reactant together;
-  the process split was for measurement isolation, not dependency compatibility.
+  compiler state from perturbing native compilation and timing. The run's pinned environment
+  could load Turing, Mooncake, Enzyme, AdvancedHMC, BridgeStan, PosteriorDB, and Reactant
+  together; the process split was for measurement isolation, not dependency compatibility.
 - A declared additive density offset is accepted only when derived from the Stan/Turing
   sources and constant across evaluation points. Gradients and support must still match.
 
@@ -99,7 +86,7 @@ remains committed as historical provenance.
 
 ## All model rows
 
-The three tables are sortable. A `RK + Reactant (removed path)` cell is a historical numeric
+The two tables are sortable. A `RK + Reactant (removed path)` cell is a historical numeric
 timing where the faithful graph lowered through the since-removed Reactant path, or the exact
 lowering/AD diagnostic where it did not (sorted to the bottom). `unavailable` means the correctness or differentiation gate failed and includes the
 diagnostic that prevented a valid timing.
@@ -137,9 +124,6 @@ numerically/parity-valid ratio is **not** automatically a matched-workload verdi
 - **Turing support mismatch — `GLMM_Poisson`.** Upstream Turing declares `beta2 ~ Uniform(-10, 20)`
   where reference Stan uses the `uniform(-10, 10)` prior, so RK/Stan is a valid comparison but
   RK/Turing is non-equivalent and its ratio is excluded.
-- **HMC throughput is not verified-matched.** A configured 16 leapfrog steps is not an established
-  *executed* 16; all AHMC/RK throughput stays not-verified-matched pending gradient-call /
-  executed-step counters. HMC medians are large because each transition runs 16 leapfrog steps.
 - **What the "0 remaining RK defects" improvement is, and is not.** Relative to the earlier frozen
   base, the count of flagged comparison rows dropped from roughly twenty to one. That is *comparison
   certification*, not "twenty compiler bugs fixed", and decomposes into distinct causes: about
@@ -187,8 +171,8 @@ On this base the native value/gradient/support defects that were open on the ear
 are resolved — each by its inherited fix canonical, not by any workaround in the model sources
 (`dogs_hierarchical` → `1349092`, GLMM marker-six → `2ba4a639`, arma11 authored-scan →
 `bc17`/`d3cc5878`, `wells_dist` → the direct-logit source form). The Reactant phase, run once for
-numerical/diagnostic **coverage** while ReactiveKernels still had a Reactant path, lowered all
-three operations for all 82 graphs with no lowering or AD diagnostic.
+numerical/diagnostic **coverage** while ReactiveKernels still had a Reactant path, lowered the
+primal and the gradient for all 82 graphs with no lowering or AD diagnostic.
 
 Two things genuinely remain. **(1)** A certified-clean **timing** pass — the only thing that
 would turn these observed-load timings into a defensible performance ranking — still awaits a
@@ -197,9 +181,7 @@ currently **run-log-certified** for source identity (the harness's `source_ident
 its `assert_resume_source!` check exist but are not yet wired into resume verification, which
 validates schema and phase only); stamping one frozen process-start identity into the receipt is a
 separate hardening task. Until the clean timing window exists, correctness and coverage are the
-source of truth here and timing is provenance-only. The historical Reactant throughput figures
-were a capability probe, not a matched same-transition ranking; with the Reactant path removed,
-no matched comparison is pending.
+source of truth here and timing is provenance-only.
 
 The older hand-written flat-density and small-subset experiments answered useful compiler
 questions, but they are not substitutes for this full-data, rich-kernel comparison. Their

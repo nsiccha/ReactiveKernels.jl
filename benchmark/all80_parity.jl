@@ -33,7 +33,7 @@ scale_ok(delta, mag; atol = STAB_ATOL) = isfinite(delta) && isfinite(mag) &&
 # finite Stan is a wrong boundary/registry bug and ALWAYS throws. A per-side RK or Turing failure is
 # owned by THAT side: under `discover` it returns the side's diagnostic (row kept, correctness=false);
 # under strict it throws (fail closed). A FINITE Turing where RK+Stan are -Inf is NON-EQUIVALENT
-# support — NOT a valid reference success (no RK/Turing ratio, no matched-workload/HMC claim). Returns
+# support — NOT a valid reference success (no RK/Turing ratio, no matched-workload claim). Returns
 # (rk_boundary_diag, turing_support_ok, turing_support_diag) with `nothing` where that side is correct.
 # (GLMM: upstream Turing declares beta2~Uniform(-10,20) — the Stan TRANSFORM bound — instead of the
 #  uniform(-10,10) PRIOR, so it is finite at beta2≈19.8; offset log(30/20)=0.405465.)
@@ -46,7 +46,7 @@ function classify_boundary(vb_r, vb_s, vb_t; discover::Bool)
     turing_support_diag = turing_support_ok ? nothing :
         "turing_support: upstream Turing did NOT reject the out-of-support point " *
         "(vb_r=$vb_r, vb_s=$vb_s, vb_t=$vb_t; reference Stan=-Inf required) — NON-EQUIVALENT support; " *
-        "RK/Turing comparison INVALID for this model (no ratio, no HMC-success)"
+        "RK/Turing comparison INVALID for this model (no ratio)"
     (turing_support_ok || discover) || error("Turing boundary FAIL: $turing_support_diag")
     (rk_boundary_diag, turing_support_ok, turing_support_diag)
 end

@@ -9,10 +9,8 @@ This page compares **evaluation** throughput — how fast a log density is
 evaluated, differentiated, and turned into a generated quantity — between a
 ReactiveKernels `@kernel` and the equivalent `Turing.jl` model. It is **not** a
 sampler benchmark: it measures per-call primal / gradient / generated-quantity
-cost, not NUTS adaptation, draws, wall time, or ESS. For the sealed-native NUTS
-artifact and its separate, work-normalized inner-loop receipt see
-[NUTS sampling](nuts.md); end-to-end sampler speed against AdvancedHMC/DynamicHMC
-remains unmeasured and nothing here should be read as such.
+cost, not NUTS adaptation, draws, wall time, or ESS, and nothing here should be
+read as a sampler speed.
 
 Both sides evaluate the **same** model — an iid Normal log density of a position
 vector `x` given fixed `(μ, log σ)` — and every value is parity-checked against
@@ -85,8 +83,7 @@ Main.ReactiveKernelsDocs.render_eval_throughput_amortization()
 This is useful for independent likelihood evaluations, multiple chains, or other
 outer batches. A single Markov chain is sequential, so replica batching does not
 make one NUTS transition independent; there the analogous remedy is to compile
-the transition or sampler loop that contains the repeated evaluations, as in
-[NUTS sampling](nuts.md).
+the transition or sampler loop that contains the repeated evaluations.
 
 ## What the numbers say
 
