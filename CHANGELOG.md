@@ -30,8 +30,11 @@ are recorded in the git history only.
   never the operation, so one program's fresh builds share one kernel type
   without execution copies: `_KernelSourceFunction`, `_ExecutableSourceFunction`,
   `src/execution_sources.jl`, the guarded and latest-world call modes and the
-  per-process executable table are gone. A capture reads as
-  `getfield(getfield(__callables__[k], :captures), :c)`. `prepare_sampler`'s
+  per-process executable table are gone. A source's captured values sit in the
+  constants table at its recipe's position and a capture reads as
+  `getfield(__constants__[k], :c)`, so an inlined recipe's record leaves the
+  callables table and a captured array crosses native AD as a hidden operand
+  like bound data. `prepare_sampler`'s
   latest-world preparation and `_kernel_eval_definition`'s
   `latest_world_native_sources` are accepted and do nothing: a record is
   callable from any world. Values, gradients, plans and recipes are unchanged.

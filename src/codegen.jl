@@ -5055,27 +5055,39 @@ function _lower_with_ops_collecting(p::Plan;
 end
 
 # The two tables of a lowering over the operations it collected, one entry per
-# lowered recipe each: a bound constant's value in the constants table, every
-# other operation in the callables table, `nothing` in the other. A prepared
-# kernel then keeps only the callables its final body references
-# (`_native_table`): a recipe whose source runs in the body keeps no operation
-# unless the body reads a capture from it. The cell and step kernels the plate
-# and scan lowerings splice into their own tables keep every operation.
+# lowered recipe each: a bound constant's value, or a source's captured
+# values, in the constants table; every operation whose code is not its
+# source in the callables table; `nothing` elsewhere. A prepared kernel then
+# keeps only the callables its final body references (`_native_table`): a
+# recipe whose source runs in the body keeps no operation, its captures being
+# read from the constants table. The cell and step kernels the plate and scan
+# lowerings splice into their own tables keep every operation.
 function _lowering_tables(ops::Vector{Any})
     constants = Vector{Any}(nothing, length(ops))
     callables = Vector{Any}(nothing, length(ops))
     for (k, op) in enumerate(ops)
         if op isa _BoundConstant
             constants[k] = op.value
-        elseif op isa _KernelSourceOp
-            # The record or metadata that runs; the wrapper (token, form,
-            # module) stays with the recipe.
-            callables[k] = getfield(op, :f)
         else
-            callables[k] = op
+            # A source operation's record or metadata (the wrapper with the
+            # token, form and module stays with the recipe), else the
+            # operation itself.
+            entry = op isa _KernelSourceOp ? getfield(op, :f) : op
+            callables[k] = entry
+            constants[k] = _source_constant(entry)
         end
     end
     Tuple(constants), Tuple(callables)
+end
+
+# The constants-table entry of a source's record or metadata: its captured
+# values when it has any (an inlined statement reads them there,
+# `_inline_capture_expr`), else `nothing`.
+Base.@nospecializeinfer function _source_constant(@nospecialize(entry))
+    record = _source_record(entry)
+    record === nothing && return nothing
+    captures = _source_captures(record)
+    isempty(captures) ? nothing : captures
 end
 
 # The operations behind two tables and their recipes, one per position: a
@@ -7730,8 +7742,17 @@ end
 function _spelled_parameter_name(name::Symbol, spelled)
     name in spelled && return name
     gensym_name = Symbol("##", name)
-    gensym_name in spelled ? gensym_name : name
+    gensym_name in spelled && return gensym_name
+    # A companion spells a gensym parameter canonically (`##name#k`,
+    # `_canonical_locals`) while the source spells it with its own number;
+    # the source's one gensym of that base is the parameter.
+    base = _gensym_base(name)
+    base === nothing && return name
+    matches = Symbol[s for s in spelled if _gensym_base(s) == base]
+    length(matches) == 1 ? only(matches) : name
 end
+_gensym_base(name::Symbol) =
+    (m = match(r"^#*(.+)#\d+$", String(name))) === nothing ? nothing : m.captures[1]
 _source_symbols!(names, x::Symbol) = push!(names, x)
 _source_symbols!(names, x) = names
 function _source_symbols!(names, ex::Expr)
@@ -7759,7 +7780,7 @@ Base.@nospecializeinfer function _source_parameter_names(
     names = _branch_call_names(f)
     names === nothing || return length(names) == n ? names : nothing
     record = _source_record(f)
-    record === nothing ? _closure_parameter_names(f, n) : _source_params(record, n)
+    record === nothing ? _closure_parameter_names(f, n) : _source_params(record, n, source)
 end
 # The source record behind branch and reduction metadata is its whole call's.
 Base.@nospecializeinfer _source_record(@nospecialize(branch::_KernelBranch)) =

@@ -541,7 +541,7 @@ function _decompose_fused_recipe!(prog::_StepProgram, r::Recipe, callargs,
     record === nothing && return nothing
     # The source reads its inputs by its parameter names, not by the input
     # values' names (`_lane_source_params`); a capturing source keeps its step.
-    params = _lane_source_params(record, length(r.inputs))
+    params = _lane_source_params(record, length(r.inputs), r.source)
     params === nothing && return nothing
     ctx = _FusedDecomposition(_kernel_endpoint_source_module(op),
                               _lane_source_arguments(params, callargs),

@@ -3418,11 +3418,10 @@ Base.@nospecializeinfer function _kernel_source_function(@nospecialize(f), sourc
     # Such a closure keeps the type every build of its source shares.
     params = source.args[1]
     params = params isa Expr && params.head === :tuple ? params.args : Any[params]
-    P = all(p -> p isa Symbol, params) ? Tuple(Symbol[params...]) : Nothing
     if _kernel_source_native_scope(source.args[2]) ||
        any(value -> value isa Core.Box, values(captures))
         native = _kernel_shared_closure(f, source)
-        T = _KernelSource{P,typeof(captures),Nothing,typeof(native)}
+        T = _KernelSource{typeof(captures),Nothing,typeof(native)}
         return _kernel_new_instance(T, (captures, nothing, native))::_KernelSource
     end
     environment = gensym(:captures)
@@ -3432,10 +3431,11 @@ Base.@nospecializeinfer function _kernel_source_function(@nospecialize(f), sourc
     runtime_source = Expr(:->, Expr(:tuple, environment, params...), body)
     qualified = macroexpand(mod, Expr(Symbol("hygienic-scope"), runtime_source, mod))
     # Hygiene renames the parameters too; the authored names are what the
-    # readers of the companion's type and the JAX translation bind.
+    # readers of the companion's type and the JAX translation bind (`compile`
+    # then spells a gensym among them canonically, the same in every build).
     qualified = _native_parameter_names(runtime_source, qualified)
     companion = compile(qualified)
-    T = _KernelSource{P,typeof(captures),typeof(companion),Nothing}
+    T = _KernelSource{typeof(captures),typeof(companion),Nothing}
     _kernel_new_instance(T, (captures, companion, nothing))::_KernelSource
 end
 

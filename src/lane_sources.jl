@@ -173,7 +173,7 @@ function _lane_source_closure(r::Recipe; branches::Bool = false, outlined::Bool 
     branches || !(getfield(op, :f) isa _KernelBranch) || return nothing
     record = _source_record(_lane_source_callable(getfield(op, :f)))
     record === nothing && return nothing
-    params = _lane_source_params(record, length(r.inputs))
+    params = _lane_source_params(record, length(r.inputs), r.source)
     params === nothing && return nothing
     (record, params, _kernel_endpoint_source_module(op))
 end
@@ -184,9 +184,10 @@ end
 # reads its formals (`A * w`) over the caller's values (`X`, `b`), or over
 # values scoped under the caller's name (`pointwise.X`). A source over
 # captured values keeps its ordinary execution here.
-Base.@nospecializeinfer function _lane_source_params(@nospecialize(record::_KernelSource), n)
+Base.@nospecializeinfer function _lane_source_params(@nospecialize(record::_KernelSource), n,
+                                                     @nospecialize(source))
     isempty(_source_captures(record)) || return nothing
-    params = _source_params(record, n)
+    params = _source_params(record, n, source)
     params === nothing && return nothing
     allunique(params) || return nothing
     params

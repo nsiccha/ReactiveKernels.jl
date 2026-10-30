@@ -146,13 +146,18 @@ using ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels, T
             # of the same program at run time reuses them (`compile` returns a
             # loaded image's generated function). Every build resolves its
             # sources' names in `PPLGeneratedModels`.
+            # The companions a later image's build shares with an earlier
+            # image's are the earlier image's (B's load precedes P's), and
+            # the distribution helpers' companions are their packages'.
+            image_root(r) = r in (B, P, ReactiveKernelsPPL) ||
+                nameof(r) === :ReactiveKernelsDistributionKernels
             @test B in companion_roots(B.BUILT.spec)
-            @test P in companion_roots(P.BUILT.spec)
+            @test all(image_root, companion_roots(B.BUILT.spec))
+            @test all(image_root, companion_roots(P.BUILT.spec))
             runtime = build_kernel(B.PLAN)
             @test !isempty(companion_roots(runtime.spec))
-            @test companion_roots(runtime.spec) ⊆
-                  union(companion_roots(B.BUILT.spec), companion_roots(P.BUILT.spec))
-            @test all(m -> Base.moduleroot(m) === ReactiveKernelsPPL, source_modules(runtime.spec))
+            @test all(image_root, companion_roots(runtime.spec))
+            @test all(m -> image_root(Base.moduleroot(m)), source_modules(runtime.spec))
             @test prepare_query(runtime, B.PLAN, :sampler)([0.3, -0.2, 0.1]) ≈
                   density([0.3, -0.2, 0.1], x, y)
             end

@@ -144,7 +144,7 @@ function _cell_array_source(r::Recipe, args)
         return nothing
     record = _source_record(getfield(op, :f))
     record === nothing && return nothing
-    params = _lane_source_params(record, length(args))
+    params = _lane_source_params(record, length(args), r.source)
     params === nothing && return nothing
     mod = _kernel_endpoint_source_module(op)
     source = _lane_expand_dot(_lane_strip_lines(r.source), mod)

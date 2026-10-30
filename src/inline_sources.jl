@@ -13,9 +13,9 @@
 # with its locals named from the recipe's position `k` in the lowered recipes
 # (`_inline_local_name`), so the statement names its recipe for the passes
 # that read one (`_inline_statement_call`) and references no table. A source
-# with lexical captures reads them from its source record (`_KernelSource`),
-# which the callables table keeps for it under the type every build of the
-# program shares: `var"#c#opk" = getfield(getfield(__callables__[k], :captures), :c)`.
+# with lexical captures reads them from the constants table, where its
+# recipe's position holds the record's captured values
+# (`_lowering_tables`): `var"#c#opk" = getfield(__constants__[k], :c)`.
 # A literal statement is its literal (`shift::Float64 = -1.5`), an alias its
 # argument (`y = x`). The plan, its recipes and `Recipe.source` are untouched,
 # so `explain`, `recipe_inventory` and the structural graph read as before,
@@ -143,7 +143,7 @@ function _inline_source_form(r::Recipe, callargs, slot::Int)
     rewritten = _inline_qualify(body, mod, renamed)
     rewritten === nothing && return nothing
     # The parameters bound to the call's arguments, then the captures: each
-    # a field of the record's `captures` the callables table keeps at the
+    # a field of the captured values the constants table holds at the
     # recipe's position, read through that literal entry (never the bare
     # table, which the table analyses read as "the whole table" and
     # `_rewrite_embedded` cannot shift).
@@ -155,18 +155,16 @@ function _inline_source_form(r::Recipe, callargs, slot::Int)
     Expr(:let, Expr(:block, bindings...), rewritten), f
 end
 
-# `getfield(getfield(__callables__[k], :captures), :name)`: the captured value
-# `name` of the source record at position `k`.
+# `getfield(__constants__[k], :name)`: the captured value `name` of the source
+# at position `k`, whose captured values the constants table holds there.
 _inline_capture_expr(slot::Int, name::Symbol) =
-    Expr(:call, GlobalRef(Core, :getfield),
-         Expr(:call, GlobalRef(Core, :getfield), Expr(:ref, _CALLABLES_ARG, slot),
-              QuoteNode(:captures)),
+    Expr(:call, GlobalRef(Core, :getfield), Expr(:ref, _CONSTANTS_ARG, slot),
          QuoteNode(name))
 
 # An inlined statement's right-hand side read back as the call it replaced:
 # `(slot, callargs)` for `let var"#x#opk" = x, …; body end`, the position `k`
 # its locals were named from and the bound arguments, or `nothing` for any
-# other expression. A capture binding (`var"#c#opk" = getfield(getfield(__callables__[k], :captures), :c)`)
+# other expression. A capture binding (`var"#c#opk" = getfield(__constants__[k], :c)`)
 # is not an argument. A statement with no binding (a literal, an alias, a
 # source over no argument) names no recipe.
 function _inline_statement_call(rhs)
@@ -187,15 +185,9 @@ function _inline_statement_call(rhs)
     end
     slot, callargs
 end
-function _inline_capture_read(value, slot)
-    value isa Expr && value.head === :call && length(value.args) == 3 &&
-        value.args[1] == GlobalRef(Core, :getfield) && value.args[3] isa QuoteNode ||
-        return false
-    captures = value.args[2]
-    captures isa Expr && captures.head === :call && length(captures.args) == 3 &&
-        captures.args[1] == GlobalRef(Core, :getfield) &&
-        captures.args[3] == QuoteNode(:captures) && _callable_slot(captures.args[2]) == slot
-end
+_inline_capture_read(value, slot) = value isa Expr && value.head === :call &&
+    length(value.args) == 3 && value.args[1] == GlobalRef(Core, :getfield) &&
+    _constant_slot(value.args[2]) == slot && value.args[3] isa QuoteNode
 
 function _inline_contains_return(ex)
     ex isa Expr || return false

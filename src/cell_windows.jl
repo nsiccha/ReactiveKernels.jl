@@ -810,7 +810,7 @@ function _cell_identity_form(r::Recipe)
         getfield(op, :ignored_throws) !== nothing && length(r.inputs) == 1 || return nothing
     record = _source_record(_lane_source_callable(getfield(op, :f)))
     record === nothing && return nothing
-    params = _lane_source_params(record, 1)
+    params = _lane_source_params(record, 1, r.source)
     params === nothing && return nothing
     name = only(params)
     # A gensym parameter is stored without its `##` prefix (`_lane_source_arguments`).

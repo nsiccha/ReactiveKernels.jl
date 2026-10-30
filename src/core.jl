@@ -280,22 +280,19 @@ end
 #
 # The record holds executable state only: no token, parameter-name or module
 # value. The token and the module live on the recipe's operation
-# (`_KernelSourceOp`), which the plan and `lowered_recipes` keep; the authored
-# parameter names are the type parameter `P` (a tuple of symbols, `Nothing`
-# when the record was built without them), so the lowering reads them from
-# the type. The callables table of a prepared kernel holds the record, so a
-# capture-free table is free of heap references that Enzyme would otherwise
-# have to prove read-only (b259aa13f: such fields cost the Imperial COVID
-# model's gradients 446 → 762 allocations per call and 5 → 25 minutes of
-# compile time).
-struct _KernelSource{P,C,R,N} <: Function
+# (`_KernelSourceOp`), which the plan and `lowered_recipes` keep; the
+# parameter names are read from the companion's type (its argument names
+# after the captures environment, a gensym among them in `_canonical_locals`'
+# spelling, so two builds of one source have one type). The callables table
+# of a prepared kernel holds the record, so a capture-free table is free of
+# heap references that Enzyme would otherwise have to prove read-only
+# (b259aa13f: such fields cost the Imperial COVID model's gradients 446 → 762
+# allocations per call and 5 → 25 minutes of compile time).
+struct _KernelSource{C,R,N} <: Function
     captures::C
     companion::R
     native::N
 end
-_KernelSource(captures::C, companion::R, native::N; params = nothing) where {C,R,N} =
-    _KernelSource{params === nothing ? Nothing : Tuple(Symbol[params...]),C,R,N}(
-        captures, companion, native)
 
 # One instance for every source type (`@nospecialize`, `getfield`): lowering
 # reads these for every recipe of a program.
@@ -304,13 +301,26 @@ Base.@nospecializeinfer _source_record(@nospecialize(f::_KernelSource)) = f
 Base.@nospecializeinfer _source_captures(@nospecialize(f::_KernelSource)) = getfield(f, :captures)
 # The native closure of a source Julia owns, else `nothing`.
 Base.@nospecializeinfer _source_native(@nospecialize(f::_KernelSource)) = getfield(f, :native)
-# The source's parameter names when it takes `n`, else `nothing`: the authored
-# names in the record's type, or the native closure's method for a record
-# built without them.
+# The source's parameter names when it takes `n`, else `nothing`: the
+# companion's argument names after its captures environment (its type; a
+# gensym parameter in `_canonical_locals`' spelling, `##name#k`), or the
+# native closure's method. `_spelled_parameter_name` maps a name to the
+# spelling of the recipe's source.
 Base.@nospecializeinfer function _source_params(@nospecialize(f::_KernelSource), n)
-    P = (typeof(f)::DataType).parameters[1]
-    P === Nothing && return _closure_parameter_names(getfield(f, :native), n)
-    length(P) == n ? Symbol[P...] : nothing
+    native = getfield(f, :native)
+    native === nothing || return _closure_parameter_names(native, n)
+    companion = _native_generated_function(getfield(f, :companion))
+    names = (typeof(companion)::DataType).parameters[1]
+    names isa Tuple && length(names) == n + 1 || return nothing
+    Symbol[names[2:end]...]
+end
+# The same, as `source` spells them.
+Base.@nospecializeinfer function _source_params(@nospecialize(f::_KernelSource), n,
+                                                @nospecialize(source))
+    params = _source_params(f, n)
+    params === nothing && return nothing
+    spelled = _source_symbols!(Set{Symbol}(), source)
+    Symbol[_spelled_parameter_name(name, spelled) for name in params]
 end
 # The captured names of the source behind `f` (a record, or metadata whose
 # call is one); none for any other callable.
@@ -326,7 +336,7 @@ end
 # (a scan step's log-sum-exp): such a step became a call per scan step, and
 # native Enzyme reverse through it cost 2.5–3× the same kernel with the step
 # inlined (HMM forward pass, snag `rkppl-hmm-forwar-89257681`).
-@inline @generated function (f::_KernelSource{P,C,R,N})(args::Vararg{Any,K}) where {P,C,R,N,K}
+@inline @generated function (f::_KernelSource{C,R,N})(args::Vararg{Any,K}) where {C,R,N,K}
     forwarded = [:(getfield(args, $index)) for index in 1:K]
     N === Nothing && return Expr(:block, Expr(:meta, :inline),
         :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
@@ -1345,7 +1355,14 @@ Base.@nospecializeinfer function _KernelBranch(
     _kernel_new_instance(T, (call, condition, then_arm, else_arm,
                              then_spec, else_spec))::_KernelBranch
 end
-@inline (branch::_KernelBranch)(args...) = branch.call(args...)
+# Forwarded positionally and inlined (`Vararg{Any,N}` specializes on the
+# count; a merely forwarded `args...` is left unspecialized and boxes the
+# arguments as one tuple): the table holds the branch itself, which the
+# generated body calls directly.
+@inline @generated function (branch::_KernelBranch)(args::Vararg{Any,N}) where {N}
+    forwarded = [:(getfield(args, $index)) for index in 1:N]
+    :(Base.@inline getfield(branch, :call)($(forwarded...)))
+end
 
 """
     _KernelSplit{S}(call, wholes, splits, root)

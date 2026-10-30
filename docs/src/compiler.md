@@ -284,9 +284,10 @@ An exact call of a function or type bound `const` in its module is written by
 name (`c = cholesky(a)`), so the statement names exactly what runs and the
 table need not hold it.
 
-A source with lexical captures reads them from its source record, which the
-callables tuple keeps for it
-(`var"#c#op1" = getfield(getfield(__callables__[1], :captures), :c)`);
+A source with lexical captures reads them from the constants tuple, where its
+recipe's position holds the captured values
+(`var"#c#op1" = getfield(__constants__[1], :c)`), so the recipe's record leaves
+the callables tuple like any other inlined source's;
 a literal statement is its literal (`shift::Float64 = -1.5`) and an alias its
 argument. The source's own names are resolved in the module that defined it,
 as the rest of the body resolves globals. An operation whose code is not its
