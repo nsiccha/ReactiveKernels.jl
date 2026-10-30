@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.27
+
+- A kernel whose names end in a non-ASCII character (`p_α`) prepares again
+  when its body is embedded in another lowering, an authored scan's step for
+  one. 0.1.26 names an inline statement's locals after the authored names
+  (`#p_α#op1`) and renumbers them on embedding, and that renumbering cut the
+  name at a byte offset inside `α`: `prepare` threw `StringIndexError`
+  (snag `inline-shifted-l-b520877e`).
+
 ## 0.1.26
 
 - **Breaking:** the generated function takes two tables instead of the
