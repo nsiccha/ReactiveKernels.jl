@@ -26,8 +26,8 @@ are recorded in the git history only.
   gradient of a planned partition needs runtime activity
   (`AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`): the
   plan's row vectors meet the active vector in the body's views, which
-  Enzyme's static activity analysis refuses (snag on Enzyme from this
-  lane's reproducer). Requires ReactiveKernels 0.1.27.
+  Enzyme's static activity analysis refuses (Enzyme snag
+  `plan-const-int-r-4671f4a7`). Requires ReactiveKernels 0.1.27.
 ## 0.1.22
 
 - `prepare_compact_cell_ad(prepare_operator, built, plan, observations, base0,

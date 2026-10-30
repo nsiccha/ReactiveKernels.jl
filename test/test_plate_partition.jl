@@ -529,8 +529,8 @@ end
     @test (@allocated planned(d.u, 1, plans[1])) < (@allocated plain(d.u, 1))
     # The plan's row vectors meet the active vector in the body's views; on
     # registered Enzyme 0.13.216 (and dogfood `3e707d7`) that needs runtime
-    # activity, as the window reads above do (the Enzyme snag filed from this
-    # lane's reproducer, `repro_plan_enzyme.jl`, names the store).
+    # activity, as the window reads above do (Enzyme snag
+    # `Enzyme/snags?sig=plan-const-int-r-4671f4a7` names the store).
     ad = prepare_ad(planned, AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)),
                     d.u, 3, plans[3]; active = :u)
     gradient = similar(d.u)
