@@ -7491,12 +7491,15 @@ function _prepare_plan_body(p::Plan; passes = (), bound = (), on_error = nothing
         end
     end
     lowered_plan = _lowering_plan(p)
-    exact_signature = exemplar_types === nothing ? Nothing : Tuple{exemplar_types...}
+    record = _plan_exemplar_record(exemplars)
     native_ast, constants, callables, recipes = _sharing_cell_plans() do
-        _with_plan_exemplars(exemplars) do
+        _with_plan_exemplars(record) do
             _lower_with_ops(lowered_plan; exemplar_types)
         end
     end
+    # A plan port typed on the exemplars is called with plans of that type.
+    exemplar_types = _plan_typed_exemplars(exemplar_types, record)
+    exact_signature = exemplar_types === nothing ? Nothing : Tuple{exemplar_types...}
     isempty(passes) || (native_ast = transform(native_ast, passes...))
     # The callables the final body reads; a pass may read one the lowering's
     # body did not (`test_ad.jl`, a source transform over the scan metadata).

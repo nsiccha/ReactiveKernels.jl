@@ -22,7 +22,12 @@ are recorded in the git history only.
   prepare the partition with a plan port: each label's plan (ReactiveKernels
   `partition_plan`) is computed once at preparation (`PartitionQuery.plans`,
   `PartitionSampler.plans`) and passed to every evaluation and gradient, so a
-  call recomputes no row bookkeeping. Requires ReactiveKernels 0.1.27.
+  call recomputes no row bookkeeping. On registered Enzyme (0.13.216) the
+  gradient of a planned partition needs runtime activity
+  (`AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`): the
+  plan's row vectors meet the active vector in the body's views, which
+  Enzyme's static activity analysis refuses (snag on Enzyme from this
+  lane's reproducer). Requires ReactiveKernels 0.1.27.
 ## 0.1.22
 
 - `prepare_compact_cell_ad(prepare_operator, built, plan, observations, base0,

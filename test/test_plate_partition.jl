@@ -511,7 +511,7 @@ end
     planned = prepare(spec; have = (_PP_HAVE..., :label, :plan), want = :partition_total,
                       bound = (; d.g, d.w, d.subject), exemplars = (d.u, 1, nothing))
     plans = Dict(s => partition_plan(planned, d.u, s, nothing) for s in 1:5)
-    @test all(p -> all(x -> x isa Union{Integer,AbstractArray{<:Integer},Tuple}, p),
+    @test all(p -> all(x -> x isa Union{Integer,AbstractArray{<:Integer},Tuple,Nothing}, p),
               values(plans))
     @test all(p -> p isa NamedTuple && !isempty(p), values(plans))
     for s in 1:5

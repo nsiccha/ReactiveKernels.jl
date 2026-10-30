@@ -1144,8 +1144,10 @@ computes once per label from the bound data (`nothing` for the plan port
 among `args`); the body then reads it from the port instead of recomputing it
 on every call, and a derivative carries none of it. The plan holds index
 bookkeeping only: a bound value enters it only as a partition table, an
-index column, a mask or a count, never a data column. A statement whose value
-is a shape of a data value is computed in the plan from the exemplar and
+index column, a mask or a count, never a data column, an alias of a data
+value, or a type the body computes (those stay constants inference folds). A
+statement whose value is a shape of a data value is computed in the plan from
+the exemplar and
 checked against the value's shape on every call: arguments of another shape
 throw `ArgumentError` naming `partition_plan`. The plan's type is the port's
 declared type (`plan = port => T`), found by preparing the plan kernel first
@@ -1155,7 +1157,10 @@ its result), or, for an untyped port, by evaluating the plan on `prepare`'s
 `exemplars` (one value per HAVE port, `nothing` for the plan port); a plan
 port that cannot be typed is refused naming the remedy, never silently
 dropped. `partition_plan_kernel(kernel)` returns the plan kernel of a prepared
-partition; `partition_plan` keeps one per kernel for the process.
+partition; `partition_plan` keeps one per kernel for the process. Native
+Enzyme Reverse differentiates a planned partition with runtime activity on
+registered Enzyme (the plan's constant row vectors meet the active vector in
+the body's views, which static activity analysis refuses).
 
 A partition's windows hold their rows sorted and unique, the union of what
 their readers ask for, and a read finds its row by bisection: a partition of

@@ -421,7 +421,12 @@ end
                                ::Union{Nothing,Tuple{Base.OneTo}}) =
     Int[_cell_row_position(union, i, i, sorted) for i in I]
 @inline _cell_window_positions(::Vector{Int}, ::AbstractVector{<:Integer}, ::Bool, ::Tuple) = Int[]
-@inline _cell_window_positions(::Integer, ::AbstractVector{<:Integer}, ::Bool, ::Any) = Int[]
+# A single cell's window holds one row: every entry of the index is that row,
+# at the window's first position.
+@inline _cell_window_positions(union::Integer, I::AbstractVector{<:Integer}, ::Bool,
+                               ::Union{Nothing,Tuple{Base.OneTo}}) =
+    Int[(i == union || throw(BoundsError(union, i)); 1) for i in I]
+@inline _cell_window_positions(::Integer, ::AbstractVector{<:Integer}, ::Bool, ::Tuple) = Int[]
 @inline _cell_take_rows(data::Number, ::Vector{Int}) = data
 @inline _cell_take_rows(data::AbstractArray{<:Any,0}, ::Vector{Int}) = data
 @inline _cell_take_rows(data::AbstractArray{<:Any,N}, positions::Vector{Int}) where {N} =

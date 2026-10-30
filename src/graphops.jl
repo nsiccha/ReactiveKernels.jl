@@ -111,9 +111,26 @@ _plan_mode() = get(task_local_storage(), _PLAN_MODE, false)
 # The exemplars `prepare` received, one value per HAVE port in order, while it
 # lowers: the plan typing evaluates the plan on them (`_partition_plan_type`).
 const _PLAN_EXEMPLARS = :ReactiveKernels_partition_plan_exemplars
+# The record: the exemplars, and the plan port's position and type once the
+# lowering has typed it (`typed`), which replaces the port's exemplar type
+# (`Nothing`) in the kernel's exact signature.
+struct _PlanExemplars
+    exemplars::Tuple
+    typed::Base.RefValue{Any}
+end
+_plan_exemplar_record(::Nothing) = nothing
+_plan_exemplar_record(exemplars::Tuple) = _PlanExemplars(exemplars, Ref{Any}(nothing))
 _plan_exemplars() = get(task_local_storage(), _PLAN_EXEMPLARS, nothing)
 _with_plan_exemplars(f, ::Nothing) = f()
-_with_plan_exemplars(f, exemplars::Tuple) = task_local_storage(f, _PLAN_EXEMPLARS, exemplars)
+_with_plan_exemplars(f, record::_PlanExemplars) =
+    task_local_storage(f, _PLAN_EXEMPLARS, record)
+_plan_typed_exemplars(types, ::Nothing) = types
+function _plan_typed_exemplars(types, record::_PlanExemplars)
+    typed = record.typed[]
+    typed === nothing && return types
+    position, T = typed
+    Tuple(i == position ? T : t for (i, t) in enumerate(types))
+end
 
 function prepare!(cache::PreparationCache, g::Graph; have = (), want = (),
                   passes = (), bound = (), on_error = nothing, type_stability = nothing,

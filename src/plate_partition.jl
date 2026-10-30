@@ -850,6 +850,12 @@ function _plan_eligible(ex, data::Set{Symbol}, ops)
     ex isa Symbol && return !(ex in data)
     ex isa Expr || return true
     if ex.head === :call
+        # A type the body computes (`typeof`, `eltype`, `_promote_op`, a
+        # plate's element type) is a constant inference folds; read from the
+        # port it would be a run-time `DataType`, every use of it a dynamic
+        # dispatch, and native Reverse would meet the operation table's untyped
+        # metadata in a run-time `return_type` call.
+        _plan_call_name(ex.args[1]) in _PLAN_TYPE_CALLS && return false
         slot = _callable_slot(ex.args[1])
         if slot !== nothing
             _plan_eligible_op(ops[slot]) || return false
@@ -863,6 +869,13 @@ function _plan_eligible(ex, data::Set{Symbol}, ops)
                 :(::), :curly, :if) || return false
     all(a -> _plan_eligible(a, data, ops), ex.args)
 end
+
+const _PLAN_TYPE_CALLS = Set{Symbol}([:typeof, :eltype, :promote_type, :_promote_op,
+                                      :_plate_result_eltype])
+# The locals the lowering binds to types (`_bind_native_type_exprs!`, a
+# plate's element type): never planned, for the reason above.
+_plan_type_local(name::Symbol) = (text = String(name);
+    startswith(text, "##native_type") || startswith(text, "##plate_eltype"))
 
 # The helpers that read only the shapes of their arguments: a shape of a value
 # computed from the data is constant for arguments of one shape, so the plan
@@ -944,6 +957,9 @@ function _partition_plan_split(body::Expr, data_names, ops)
     kinds = Symbol[]
     for st in body.args
         kind = if st isa Expr && st.head === :(=) && st.args[1] isa Symbol &&
+                  _plan_type_local(st.args[1])
+            :main
+        elseif st isa Expr && st.head === :(=) && st.args[1] isa Symbol &&
                   _plan_eligible(st.args[2], data, ops)
             delete!(data, st.args[1])
             :plan
@@ -1063,7 +1079,8 @@ end
 function _partition_plan_type(plan_ast::Expr, p::Plan, runtime_ops, extra::Int, port::Symbol,
                               position::Int, labels, nm)
     f = compile(plan_ast)
-    exemplars = _plan_exemplars()
+    record = _plan_exemplars()
+    exemplars = record === nothing ? nothing : record.exemplars
     remedy = "prepare with `exemplars` (one value per HAVE port, `nothing` for the plan " *
              "port) or declare the port's type (`partition_plan_kernel(spec; …)`, " *
              "`plate_partition(…; plan = :$port => T)`)"
@@ -1095,6 +1112,7 @@ function _partition_plan_type(plan_ast::Expr, p::Plan, runtime_ops, extra::Int, 
     T = typeof(plan)
     T <: NamedTuple && isconcretetype(T) || throw(ArgumentError(
         "partition plan: the plan of :$port has type $T, which is not a concrete named tuple"))
+    record === nothing || (record.typed[] = (position, T))
     T
 end
 # A stand-in of the declared type of a data port the plan never reads.
