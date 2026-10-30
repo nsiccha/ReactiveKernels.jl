@@ -123,7 +123,7 @@ using ReactiveKernels, Test
                 # The generated native body, whose cells call the companions.
                 native = kernel.f isa RK._ArrayFunction ? kernel.f.native : kernel.f
                 body = RK._native_generated_function(native)
-                @test report(findings(body, (typeof(kernel.ops), argtypes...); recurse))
+                @test report(findings(body, (typeof(kernel.constants), typeof(kernel.callables), argtypes...); recurse))
             end
             @test report(findings(prepare(C.FOLDS), argtypes; recurse))
             # A kernel prepared while the image was built holds its body behind
@@ -141,7 +141,7 @@ using ReactiveKernels, Test
             xs = x[eachindex(w)]
             rebound = prepare(C.DOT; bound = (; w = w2))
             @test rebound.f === C.BOUND_DOT.f
-            @test rebound.ops === RK._execution_source(rebound.ops)
+            @test rebound.callables === RK._execution_source(rebound.callables)
             template = only(t for t in values(only(values(
                 RK._graph_preparations(C.DOT.graph).bound)).templates)
                 if t isa RK._BoundTemplate)

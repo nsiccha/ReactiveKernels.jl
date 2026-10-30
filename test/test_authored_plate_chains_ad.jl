@@ -106,7 +106,7 @@ end
     weights = [3.0, 1.5, 0.25, 2.0]
     kernel, control = prepare(D.cell), prepare(D.control)
     @test count(op -> op isa ReactiveKernels._KernelSourceOp &&
-                      op.f isa ReactiveKernels._KernelReduction, kernel.ops) == 1
+                      op.f isa ReactiveKernels._KernelReduction, kernel.callables) == 1
     for active in (:units, :weights, (:units, :weights))
         v, g = ad_value_and_gradient(prepare_ad(kernel, backend, plan, units, weights; active),
                                      plan, units, weights)
@@ -346,7 +346,7 @@ end
         args = (1:n, shifts, units, weights)
         reference_args = (1:n, shifts, copy(units), weights)
         @test count(op -> op isa ReactiveKernels._KernelSourceOp &&
-                          op.f isa ReactiveKernels._KernelReduction, kernel.ops) == 1
+                          op.f isa ReactiveKernels._KernelReduction, kernel.callables) == 1
         @test kernel(args...) == kernel(reference_args...)
         ad = prepare_ad(kernel, backend, args...; active=:weights)
         reference = prepare_ad(kernel, backend, reference_args...; active=:weights)
@@ -373,7 +373,8 @@ end
         # a constant view beside the active weights.
         warmed = ReactiveKernels._PrecompileWarmFunction(kernel.f.native)
         warm_call = ReactiveKernels._ADNativeKernelCall{
-            4,typeof(warmed),typeof(kernel.ops)}(warmed, kernel.ops)
+            4,typeof(warmed),typeof(kernel.constants),typeof(kernel.callables)}(
+            warmed, kernel.constants, kernel.callables)
         @test DifferentiationInterface.gradient(warm_call, backend, weights,
             Constant(args[1]), Constant(shifts), Constant(units)) ≈ gradient rtol=1e-12
         # A prepared gradient must read each call's constant view, including

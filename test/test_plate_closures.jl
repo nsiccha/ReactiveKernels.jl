@@ -10,9 +10,11 @@ using ReactiveKernels, DifferentiationInterface, Enzyme, Test
 # spellings compare equal exactly when they lower to the same program.
 function _closure_program(k)
     names = Dict{String,String}()
-    replace(string(ReactiveKernels._readable_expr(code_expr(k), k)),
+    replace(string(code_expr(k)),
             r"var\"[^\"]*\"" => m -> get!(names, m, "v$(length(names) + 1)"))
 end
+# The call of the callable `f` through its table position, as the body prints it.
+_callable_call(k, f) = "(__callables__[$(findfirst(op -> op === f, k.callables))])("
 
 # Each closure kernel below is paired with its `Ref` spelling: the captured
 # names passed as trailing `Ref` operands, in the order the body first reads
@@ -545,7 +547,8 @@ end
         @test k(t, dose, 0.3) == expected
         @test _SHARED_CALLS[] == 1
         program = _closure_program(k)
-        @test findfirst("_counted_exp(", program).start < findfirst("for ", program).start
+        @test findfirst(_callable_call(k, _counted_exp), program).start <
+              findfirst("for ", program).start
     end
     # The lifted value is one more invariant recipe of the cell.
     cell(spec) = only(r for r in plan(spec).recipes if recipe_kind(r) === :plate)
@@ -620,7 +623,8 @@ end
         @test k(t, dose, arg) == [_shared_decay(ti, d, exp(log_k)) for (ti, d) in zip(t, dose)]
         @test _SHARED_CALLS[] == 1
         program = _closure_program(k)
-        @test findfirst("_counted_exp(", program).start < findfirst("for ", program).start
+        @test findfirst(_callable_call(k, _counted_exp), program).start <
+              findfirst("for ", program).start
     end
     cell(spec) = only(r for r in plan(spec).recipes if recipe_kind(r) === :plate)
     @test length(plate_body(cell(_scalar_arg_inline)).recipes) == 2

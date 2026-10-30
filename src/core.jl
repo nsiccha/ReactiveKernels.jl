@@ -1832,19 +1832,6 @@ _astuple(v::AbstractVector) = Tuple(v)
 # 655 bound ports (snag stack-overflow-i-549143aa). Anything else (one value or
 # pair, an entry of another kind) is returned as it is, for the callee to take or
 # refuse as before.
-# The elements of a port tuple (a recipe's inputs; a plan's HAVE list is a
-# vector already) as a `Vector{Any}`, without a method per port count: a
-# typed comprehension over the tuple compiles `_array_for` for every tuple
-# type, and `map` and `collect` compile per type as well, while a `for` loop
-# over a tuple reads it through `iterate(@nospecialize(::Tuple))`.
-Base.@nospecializeinfer function _tuple_vector(@nospecialize(t))
-    out = Vector{Any}(undef, length(t))
-    for (i, x) in enumerate(t)
-        out[i] = x
-    end
-    out
-end
-
 Base.@nospecializeinfer function _value_list(@nospecialize(vs))
     vs isa Tuple || return vs
     list = Value[]

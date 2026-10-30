@@ -323,8 +323,10 @@ for prepare in (:prepare_query, :prepare_sampler, :prepare_cell_query,
     @eval $prepare(built, m::_PlanSource, args...; kwargs...) =
         $prepare(built, _bound_plan(m), args...; kwargs...)
 end
-prepare_query_ad(prepare_operator, built, m::_PlanSource, args...; kwargs...) =
-    prepare_query_ad(prepare_operator, built, _bound_plan(m), args...; kwargs...)
+for prepare in (:prepare_query_ad, :prepare_compact_cell_ad)
+    @eval $prepare(prepare_operator, built, m::_PlanSource, args...; kwargs...) =
+        $prepare(prepare_operator, built, _bound_plan(m), args...; kwargs...)
+end
 _model_source(m::_PlanSource, layout::LayoutTable) = _model_source(_bound_plan(m), layout)
 
 function _bind_immediate(m::RKPPLModel, data)

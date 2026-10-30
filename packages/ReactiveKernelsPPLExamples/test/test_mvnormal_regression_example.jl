@@ -32,14 +32,6 @@ end
         @test artifact.normal_object === normal
         @test artifact.mvnormal_object === mvnormal
 
-        raw_generated = code_expr(artifact.kernel)
-        readable = sprint(
-            Base.show_unquoted,
-            ReactiveKernels._readable_expr(raw_generated, artifact.kernel);
-            context = :limit => false,
-        )
-        @test !occursin(r"__ops__\[\d+\]", readable)
-        @test !occursin(r"\boperation\(", readable)
     end
 
     @testset "density vs the independent reference oracle" begin

@@ -24,6 +24,15 @@ _axis_counted_sum(values) = (_AXIS_ATOMIC_CALLS[] += 1; sum(values))
 _axis_reference(value, center, width) =
     -0.5 * log(2π) - log(width) - 0.5 * ((value - center) / width)^2
 
+# Whether a generated statement is recipe `k`'s: its source inlined with
+# locals named from the recipe's position (`var"#x#opk"`), or its call or
+# constant read through the tables at that position.
+function _names_recipe(statement, k::Int)
+    text = string(statement)
+    occursin("#op$k\"", text) || occursin("__callables__[$k]", text) ||
+        occursin("__constants__[$k]", text)
+end
+
 @testset "plate: graph dependencies determine broadcast-axis frequency" begin
     graph = Graph()
     x = value!(graph, :x, Float64)
@@ -182,12 +191,8 @@ _plate_call(k, xs, μ, logσ) = k(xs, μ, logσ)
         generated = string(code_expr(embedded))
         @test occursin("for ", generated)
         @test !occursin("similar", generated)
-        @test !any(op -> op isa ReactiveKernels.PreparedKernel, embedded.ops)
-        @test length(embedded.ops) == length(embedded_plate_nlogpdf.ops)
-        readable = string(ReactiveKernels._readable_expr(
-            code_expr(embedded), embedded))
-        @test !occursin(r"__ops__\[\d+\]", readable)
-        @test occursin("-0.5", readable)
+        @test !any(op -> op isa ReactiveKernels.PreparedKernel, embedded.callables)
+        @test length(embedded.callables) == length(embedded_plate_nlogpdf.callables)
     end
 
     @testset "two-level composition keeps one native loop product" begin
@@ -197,34 +202,35 @@ _plate_call(k, xs, μ, logσ) = k(xs, μ, logσ)
         @test embedded_plate_middle.f isa ReactiveKernels._ArrayFunction
         @test outer.f isa ReactiveKernels._ArrayFunction
         @test occursin("for ", string(code_expr(outer)))
-        @test !any(op -> op isa ReactiveKernels.PreparedKernel, outer.ops)
-        @test length(outer.ops) == length(embedded_plate_nlogpdf.ops)
+        @test !any(op -> op isa ReactiveKernels.PreparedKernel, outer.callables)
+        @test length(outer.callables) == length(embedded_plate_nlogpdf.callables)
     end
 
     @testset "public raw Plan lowering retains its outer operation table" begin
         raw_plan = plan(embedded_plate_shifted;
             have = (:x, :μ, :logσ), want = :shifted)
         raw_ast = ReactiveKernels.lower(raw_plan)
-        raw_ops = Tuple(recipe.op for recipe in raw_plan.recipes)
-        @test length(raw_ops) == 2
-        @test first(raw_ops) === embedded_plate_nlogpdf
-        @test ReactiveKernels.compile(raw_ast)(raw_ops, xs, μ, logσ) ≈
+        raw_callables = Tuple(recipe.op for recipe in raw_plan.recipes)
+        raw_constants = map(_ -> nothing, raw_callables)
+        @test length(raw_callables) == 2
+        @test first(raw_callables) === embedded_plate_nlogpdf
+        @test ReactiveKernels.compile(raw_ast)(raw_constants, raw_callables, xs, μ, logσ) ≈
               k(xs, μ, logσ) + μ
     end
 
     @testset "invariant `exp(logσ)` is hoisted ABOVE the loop (Stan-parity)" begin
-        # `__ops__[1]` is the `σ = exp(logσ)` recipe. It must be emitted once,
-        # above the loop, and NOT recomputed per element.
+        # Recipe 1 is `σ = exp(logσ)`. It must be emitted once, above the
+        # loop, and NOT recomputed per element.
         body = code_expr(k).args[2].args
         fori = findfirst(s -> s isa Expr && s.head === :for, body)
         @test fori !== nothing
         pre = body[1:(fori - 1)]
         loopbody = body[fori].args[2].args
-        @test any(s -> occursin("__ops__[1]", string(s)), pre)
-        @test !any(s -> occursin("__ops__[1]", string(s)), loopbody)
+        @test any(s -> _names_recipe(s, 1), pre)
+        @test !any(s -> _names_recipe(s, 1), loopbody)
         # The batch-dependent recipes DO run in the loop.
-        @test any(s -> occursin("__ops__[2]", string(s)), loopbody)
-        @test any(s -> occursin("__ops__[3]", string(s)), loopbody)
+        @test any(s -> _names_recipe(s, 2), loopbody)
+        @test any(s -> _names_recipe(s, 3), loopbody)
     end
 
     @testset "no per-element materialization (allocation is O(1) in the batch)" begin
@@ -263,8 +269,8 @@ _plate_call(k, xs, μ, logσ) = k(xs, μ, logσ)
         pre = body[1:(fori - 1)]
         loopbody = body[fori].args[2].args
         # The shared-scale recipe is hoisted once; both batched ports are indexed.
-        @test any(s -> occursin("__ops__[1]", string(s)), pre)
-        @test !any(s -> occursin("__ops__[1]", string(s)), loopbody)
+        @test any(s -> _names_recipe(s, 1), pre)
+        @test !any(s -> _names_recipe(s, 1), loopbody)
     end
 
     @testset "collect mode (reduce=nothing) — per-observation vector, hoisted" begin
@@ -287,7 +293,7 @@ _plate_call(k, xs, μ, logσ) = k(xs, μ, logσ)
 
         body = code_expr(kv).args[2].args
         fori = findfirst(s -> s isa Expr && s.head === :for, body)
-        @test any(s -> occursin("__ops__[1]", string(s)), body[1:(fori - 1)])
-        @test !any(s -> occursin("__ops__[1]", string(s)), body[fori].args[2].args)
+        @test any(s -> _names_recipe(s, 1), body[1:(fori - 1)])
+        @test !any(s -> _names_recipe(s, 1), body[fori].args[2].args)
     end
 end

@@ -96,7 +96,7 @@ using Test
 
     @testset "generated bindings are globally hygienic" begin
         g = Graph()
-        ops_named = value!(g, :__ops__, Float64)
+        ops_named = value!(g, :__callables__, Float64)
         y = value!(g, :y, Float64)
         add!(g, ops_named => y, x -> x + 1)
         @test prepare(g; have = (ops_named,), want = (y,))(2.0) == 3.0

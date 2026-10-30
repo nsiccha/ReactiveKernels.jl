@@ -55,7 +55,8 @@ end
                 first_built, first_query = built, q
             else
                 @test typeof(q.kernel.f) === typeof(first_query.kernel.f)
-                @test typeof(q.kernel.ops) === typeof(first_query.kernel.ops)
+                @test typeof(q.kernel.callables) === typeof(first_query.kernel.callables)
+                @test typeof(q.kernel.constants) === typeof(first_query.kernel.constants)
                 @test typeof(q.ad) === typeof(first_query.ad)
                 # The position reader of a rebuild reuses the first build's
                 # compiled reader (snag `compiled-reader-be3cadbb`).

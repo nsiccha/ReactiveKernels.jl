@@ -77,7 +77,7 @@ end
 # `code_typed` (not `return_types`) reaches through the generated RGF entry.
 _dot_return_type(k, argtypes...) = last(only(code_typed(
     _DOT_RGF.generated_callfunc,
-    Tuple{typeof(_dot_native(k)), typeof(k.ops), argtypes...})))
+    Tuple{typeof(_dot_native(k)), typeof(k.constants), typeof(k.callables), argtypes...})))
 _dot_declarations(ast::Expr) = [s.args[1] for s in ast.args[2].args
                                 if s isa Expr && s.head === :local]
 # The emitted declaration carries the type OBJECT, not a `curly` expression.
@@ -97,10 +97,10 @@ _dot_decl(name::Symbol, T) = Expr(:(::), name, T)
     # the parent infers exactly and the embedded plate loop dispatches statically.
     @test _dot_return_type(p, Vector{Float64}, Float64, Int) === Float64
     branch_index = findfirst(op -> op isa ReactiveKernels._KernelSourceOp &&
-                                   op.f isa ReactiveKernels._KernelBranch, p.ops)
+                                   op.f isa ReactiveKernels._KernelBranch, p.callables)
     # `code_typed` includes the callable type when checking a generated method;
     # `return_types` omits it on Julia 1.10 and rejects this concrete signature.
-    @test last(only(code_typed(p.ops[branch_index], (Int, Vector{Float64}, Float64)))) ===
+    @test last(only(code_typed(p.callables[branch_index], (Int, Vector{Float64}, Float64)))) ===
           Vector{Float64}
     # Value parity with the typed-HAVE cut, and the empty arm.
     q = prepare(_dot_parent; have = (:weights, :idx, :units), want = :total,
@@ -138,7 +138,7 @@ end
     bound = prepare(_dot_convert; have = (:n, :xs, :w), want = (:y, :z, :scaled),
                     bound = (; w = view(shifts, 2:3)))
     @test !(_dot_decl(:w, Vector{Float64}) in _dot_declarations(code_expr(bound)))
-    @test any(op -> op isa ReactiveKernels._BoundConstant && op.value isa SubArray, bound.ops)
+    @test any(value -> value isa SubArray, bound.constants)
     @test bound(2, [1.0, 2.0])[3] == [5.5, 9.5]
 end
 

@@ -192,6 +192,6 @@ end
 # A cell kernel over `plan`, with the readable recipes of its original cell.
 function _position_cell_kernel(plan::Plan, readable)
     kernel = _prepare(plan, _lower_with_ops(plan; inline_embedded = false)...)
-    _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
-        kernel.plan, kernel.ast, Tuple(readable[q.id] for q in plan.recipes))
+    _prepared_kernel(kernel.f, kernel.constants, kernel.callables, kernel.inputs,
+        kernel.outputs, kernel.plan, kernel.ast, Tuple(readable[q.id] for q in plan.recipes))
 end

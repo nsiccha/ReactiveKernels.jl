@@ -43,7 +43,7 @@ function op_call_indices(ast)
         if node.head === :call && node.args[1] isa Expr
             callee = node.args[1]
             if callee.head === :ref && length(callee.args) == 2 &&
-               callee.args[1] === :__ops__ && callee.args[2] isa Int
+               callee.args[1] === :__callables__ && callee.args[2] isa Int
                 push!(indices, callee.args[2])
             end
         end
@@ -83,10 +83,10 @@ end
         @test [r.id for r in p.recipes] == [to_a.id, to_b.id]
         @test op_call_indices(ast) == [1, 2]
         k = prepare(p)
-        @test length(k.ops) == 2
-        @test k.ops[1] === to_a.op
-        @test k.ops[2] === to_b.op
-        @test !any(op -> op === to_c.op, k.ops)
+        @test length(k.callables) == 2
+        @test k.callables[1] === to_a.op
+        @test k.callables[2] === to_b.op
+        @test !any(op -> op === to_c.op, k.callables)
         @test k(5.0) == 6.0
     end
 
@@ -193,9 +193,9 @@ end
         @test kc.recipes[2].op === finish
         @test op_call_indices(code_expr(kc)) == [1, 2]
         k = prepare(kc)
-        @test k.ops[1] === make_c
-        @test k.ops[2] === finish
-        @test !any(op -> op === cheap_a || op === combined_ab || op === make_b, k.ops)
+        @test k.callables[1] === make_c
+        @test k.callables[2] === finish
+        @test !any(op -> op === cheap_a || op === combined_ab || op === make_b, k.callables)
         # a=2, b=3: c=make_c(2)=1002, r=finish(3,1002)=1005
         @test k(2.0, 3.0) == 1005.0
     end

@@ -70,7 +70,8 @@ end
     # has one cell loop per arm.
     function generated_code_tree(kernel)
         parts = String[string(code_expr(kernel))]
-        for op in kernel.ops
+        for recipe in kernel.lowered_recipes
+            op = recipe.op
             op isa ReactiveKernels._AuthoredPlateOp || continue
             append!(parts, generated_code_tree(op.kernel))
         end

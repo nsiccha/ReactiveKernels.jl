@@ -89,7 +89,7 @@ end
             @test k.ast==asts[enabled]
         end
         @test occursin("run_partial",string(k.ast))==enabled
-        metas=[op.value for op in k.ops if op isa RK._BoundConstant && op.value isa RK._IndexRunData]
+        metas=[op.value for op in RK._kernel_ops(k) if op isa RK._BoundConstant && op.value isa RK._IndexRunData]
         @test length(metas)==1
         @test only(metas)[3]==length(idx)
         @test only(metas)[4]==enabled
@@ -116,7 +116,7 @@ end
         @test k(q)≈ref[1] rtol=1e-12 atol=1e-12
     end
     @test occursin("run_partial",string(last(kernels).ast))
-    @test RK._lower_index_runs_native(last(kernels).ast,last(kernels).ops)==last(kernels).ast
+    @test RK._lower_index_runs_native(last(kernels).ast,RK._kernel_ops(last(kernels)))==last(kernels).ast
     @test isempty(findings(last(kernels),(typeof(q),)))
     audit_ad=prepare_ad(last(kernels),AutoEnzyme(;mode=Enzyme.Reverse),q;
         active=:q,native_forward_batch=false)
@@ -127,7 +127,7 @@ end
     @test result[1] isa SubArray
     @test result[1]==q[idx]
     @test result[2]≈[-.5*(x[i]-q[idx[i]])^2 for i in eachindex(idx)]
-    @test isempty([op for op in query.ops if op===RK._readonly_gather_runs])
+    @test isempty([op for op in query.callables if op===RK._readonly_gather_runs])
     gather_query=prepare(subject;bound=(;idx,x),want=(:gathered,:total))
     gathered,total=gather_query(q)
     @test gathered isa SubArray
@@ -184,7 +184,7 @@ end
         refs=[oracle(q,idx,x[:,j]) for j in axes(x,2)]
         verify(k,q,(sum(first,refs),sum(last,refs)))
     end
-    @test RK._lower_index_runs_native(k.ast,k.ops)==k.ast
+    @test RK._lower_index_runs_native(k.ast,RK._kernel_ops(k))==k.ast
 end
 
 @testset "index runs: cells that hold vectors" begin

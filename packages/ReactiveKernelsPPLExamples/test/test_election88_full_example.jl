@@ -65,10 +65,6 @@ end
         @test !occursin("struct ", ELECTION88_FULL_SOURCE)
         @test artifact.normal_object === normal
         @test artifact.bernoulli_object === bernoulli
-        # (No `__ops__`/`operation(` readable-cleanliness assertions here: like
-        # the radon reference, this model has BOUND ports — the five index
-        # gathers and the group sizes — which legitimately render as nullary
-        # `operation()` placeholders in the readable generated code.)
     end
 
     @testset "constrain-only prunes the likelihood work" begin

@@ -82,11 +82,6 @@ end
         @test !occursin("struct ", HIER_2PL_SOURCE)
         @test artifact.exponential_object === exponential
 
-        raw_generated = code_expr(artifact.kernel)
-        readable = sprint(Base.show_unquoted,
-            ReactiveKernels._readable_expr(raw_generated, artifact.kernel);
-            context = :limit => false)
-        @test !occursin(r"__ops__\[\d+\]", readable)
     end
 
     @testset "posterior decomposition vs the independent reference oracle" begin

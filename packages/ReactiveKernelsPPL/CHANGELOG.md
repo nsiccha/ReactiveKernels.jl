@@ -23,6 +23,24 @@ are recorded in the git history only.
   `partition_plan`) is computed once at preparation (`PartitionQuery.plans`,
   `PartitionSampler.plans`) and passed to every evaluation and gradient, so a
   call recomputes no row bookkeeping. Requires ReactiveKernels 0.1.27.
+## 0.1.22
+
+- `prepare_compact_cell_ad(prepare_operator, built, plan, observations, base0,
+  indices0, backend, exemplars...; on_error, locality)` and `CompactCellAD`:
+  a ReactiveKernels derivative operator (`prepare_ad_hvp`, `prepare_ad_third`,
+  `prepare_ad`, `prepare_ad_pullback`, `prepare_ad_pushforward`) over one cell's
+  log density, active over a compact selection of packed coordinates, as
+  `prepare_compact_cell_sampler` is for the gradient. The ReactiveKernels
+  verbs take it with `base, active, indices, cell` last:
+  `ad_gradient_and_hvp(q, directions, base, active, indices, cell)` gives the
+  cell's `m × m` Hessian block over its `m` selected coordinates from one
+  call with the `m` unit directions, and
+  `ad_gradient_hvp_and_third(q, (v,), base, active, indices, cell)` the
+  third-order contraction `∇(vᵀ H v)` over the selection. Each call costs one
+  cell, not the model. Static (default-activity) Enzyme needs Enzyme
+  `dogfood` from `21a909f7`; registered Enzyme 0.13.216 raises
+  `EnzymeRuntimeActivityError` at the compact overlay's read (Enzyme snag
+  `static-reverse-s-f9483e9c`).
 
 ## 0.1.21
 

@@ -279,9 +279,10 @@ _nested_position_copy(kernel, position, xs) = copy(view(kernel(position, xs), :,
         @test batch(position, long) == expected(long)
         # Inspect the generated entry rather than only its wrapper.
         argtypes = reuse ?
-            Tuple{typeof(batch.native), typeof(batch.ops), typeof(batch.caches),
-                  typeof(position), typeof(long)} :
-            Tuple{typeof(batch.native), typeof(batch.ops), typeof(position), typeof(long)}
+            Tuple{typeof(batch.native), typeof(batch.constants), typeof(batch.callables),
+                  typeof(batch.caches), typeof(position), typeof(long)} :
+            Tuple{typeof(batch.native), typeof(batch.constants), typeof(batch.callables),
+                  typeof(position), typeof(long)}
         @test last(only(code_typed(ReactiveKernels.RuntimeGeneratedFunctions.generated_callfunc,
                                    argtypes))) === Matrix{Float64}
         short_bytes = _nested_position_bytes(batch, position, short)

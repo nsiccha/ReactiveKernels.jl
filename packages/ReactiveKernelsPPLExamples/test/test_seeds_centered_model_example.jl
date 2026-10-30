@@ -60,13 +60,6 @@ end
         @test artifact.cauchy_object === cauchy
         @test artifact.binomial_object === binomial
 
-        raw_generated = code_expr(artifact.kernel)
-        readable = sprint(
-            Base.show_unquoted,
-            ReactiveKernels._readable_expr(raw_generated, artifact.kernel);
-            context = :limit => false,
-        )
-        @test !occursin(r"__ops__\[\d+\]", readable)
     end
 
     @testset "constrain-only prunes the likelihood work" begin

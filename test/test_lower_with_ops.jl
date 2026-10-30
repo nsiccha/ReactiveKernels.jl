@@ -40,7 +40,8 @@ const _LWO_C = _LowerWithOpsCoeffs(0.2, 0.6, 0.4)
 const _LWO_TRIPLE = lower_with_ops(
     plan(_lower_with_ops_stage; have = _LOWER_WITH_OPS_HAVE, want = :u))
 const _LWO_FUNCTIONAL = compile(first(_LWO_TRIPLE))
-const _LWO_OPS = _LWO_TRIPLE[2]
+const _LWO_CONSTANTS = _LWO_TRIPLE[2]
+const _LWO_CALLABLES = _LWO_TRIPLE[3]
 
 # Public generated breadth for the construction-cost regression: a model with
 # many independent authored plates and selected sum consumers, without relying
@@ -73,8 +74,8 @@ function _lwo_looploss(x)
     u = copy(x)
     kk = _LWO_F(u, nothing, 0.0)
     for j in 1:3
-        u = _LWO_FUNCTIONAL(_LWO_OPS, _LWO_F, u, kk, nothing, 0.1 * j, 0.1,
-            _LWO_C)
+        u = _LWO_FUNCTIONAL(_LWO_CONSTANTS, _LWO_CALLABLES, _LWO_F, u, kk, nothing,
+            0.1 * j, 0.1, _LWO_C)
         kk = _LWO_F(u, nothing, 0.1 * j)
     end
     return sum(u)
@@ -93,50 +94,55 @@ end
         kernel = prepare(_lower_with_ops_literals)
         @test kernel(2.0) == (0.75 * (2.0 - 1.5), :shifted)
         statements = filter(s -> s isa Expr && s.head === :(=), code_expr(kernel).args[2].args)
-        applications = Dict(s.args[1] => ReactiveKernels._inline_statement_call(s.args[2])
-                            for s in statements)
-        # Each literal recipe names its slot and takes no argument; the slot
-        # keeps a zero-field closure, so no generated function carries `-1.5`.
+        # Each literal recipe's statement is its literal, and its tables hold
+        # nothing for it: no generated function carries `-1.5`.
         for (name, literal) in ((:shift, -1.5), (:scale, 0.75), (:label, QuoteNode(:shifted)))
-            slot, args = applications[name]
-            @test isempty(args)
             statement = only(filter(s -> s.args[1] === name, statements))
-            @test statement.args[2].args[2] == literal
-            @test fieldcount(typeof(kernel.ops[slot])) == 0
-            @test !(kernel.ops[slot] isa ReactiveKernels._KernelSourceOp)
+            @test statement.args[2] == literal
+            slot = findfirst(r -> only(r.outputs).name === name, kernel.lowered_recipes)
+            @test kernel.callables[slot] === nothing
+            @test kernel.constants[slot] === nothing
         end
-        @test Set(applications[:y][2]) == Set(Any[:scale, :x, :shift])
+        y_statement = only(filter(s -> s.args[1] === :y, statements))
+        slot, args = ReactiveKernels._inline_statement_call(y_statement.args[2])
+        @test kernel.lowered_recipes[slot] === kernel.lowered_recipes[findfirst(
+            r -> only(r.outputs).name === :y, kernel.lowered_recipes)]
+        @test Set(args) == Set(Any[:scale, :x, :shift])
     end
 
-    @testset "public triple contract" begin
+    @testset "public tables contract" begin
         @test :lower_with_ops in names(ReactiveKernels)
         p = plan(_lower_with_ops_stage; have = _LOWER_WITH_OPS_HAVE, want = :u)
-        ast, ops, recipes = lower_with_ops(p)
+        ast, constants, callables, recipes = lower_with_ops(p)
         @test ast == lower(p)
         @test ast.head === :function
         sig = ast.args[1]
-        @test sig.args[1] === :__ops__
-        portnames = map(sig.args[2:end]) do arg
+        @test sig.args[1] === :__constants__
+        @test sig.args[2] === :__callables__
+        portnames = map(sig.args[3:end]) do arg
             arg isa Symbol ? arg : arg.args[1]
         end
         @test Tuple(portnames) == _LOWER_WITH_OPS_HAVE
-        @test ops isa Tuple
+        @test constants isa Tuple
+        @test callables isa Tuple
         @test recipes isa Tuple
-        @test length(ops) == length(recipes)
+        @test length(constants) == length(callables) == length(recipes)
         @test all(recipe -> recipe isa Recipe, recipes)
+        # The plan binds nothing, so the constants table is empty of values.
+        @test all(isnothing, constants)
     end
 
     @testset "functional evaluation matches prepare bit-for-bit" begin
         p = plan(_lower_with_ops_stage; have = _LOWER_WITH_OPS_HAVE, want = :u)
-        ast, ops, _ = lower_with_ops(p)
+        ast, constants, callables, _ = lower_with_ops(p)
         prepared = prepare(p)
         values = (_LWO_F, [1.0, 2.0], [-0.5, -1.0], nothing, 0.0, 0.1, _LWO_C)
         reference = prepared(values...)
-        @test _bitwise_equal(compile(ast)(ops, values...), reference)
+        @test _bitwise_equal(compile(ast)(constants, callables, values...), reference)
         # Julia 1.12+ enforces the world age of bindings created by `Core.eval`;
         # call the freshly eval'd function in the latest world.
         @test _bitwise_equal(
-            Base.invokelatest(Core.eval(@__MODULE__, ast), ops, values...),
+            Base.invokelatest(Core.eval(@__MODULE__, ast), constants, callables, values...),
             reference)
     end
 
@@ -145,11 +151,11 @@ end
         x = [1.0, 2.0, 3.0]
         s = 2.0
         reference = prepare(p)(x, s)
-        ast, ops, _ = lower_with_ops(p)
-        @test compile(ast)(ops, x, s) == reference
-        inlined_ast, inlined_ops, _ =
+        ast, constants, callables, _ = lower_with_ops(p)
+        @test compile(ast)(constants, callables, x, s) == reference
+        inlined_ast, inlined_constants, inlined_callables, _ =
             lower_with_ops(p; inline_embedded = true)
-        @test compile(inlined_ast)(inlined_ops, x, s) == reference
+        @test compile(inlined_ast)(inlined_constants, inlined_callables, x, s) == reference
     end
 
     @testset "generated breadth of authored plate consumers" begin
@@ -160,9 +166,9 @@ end
         reference = sum(sum((log.(data) .+ index) .* q) for index in 1:64)
         prepared = prepare(p; bound = p.have[2] => data)
         @test prepared(q) == reference
-        ast, ops, recipes = lower_with_ops(p)
-        @test compile(ast)(ops, q, data) == reference
-        @test length(ops) == length(recipes)
+        ast, constants, callables, recipes = lower_with_ops(p)
+        @test compile(ast)(constants, callables, q, data) == reference
+        @test length(constants) == length(callables) == length(recipes)
     end
 
     @testset "reverse-mode gradient through the functional form" begin

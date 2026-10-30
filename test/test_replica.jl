@@ -114,7 +114,8 @@ end
     loop_body = expression.args[2].args[loop_index].args[2].args
     @test any(((slot, callargs),) -> slot == 1 && callargs == Any[:data], before_loop)
     @test !any(((slot, _),) -> slot == 1, recipe_applications(loop_body))
-    @test !occursin("__ops__[1]", string(expression.args[2].args[loop_index]))
+    loop_text = string(expression.args[2].args[loop_index])
+    @test !occursin("#op1\"", loop_text) && !occursin("__callables__[1]", loop_text)
 end
 
 @kernel replica_defaulted(x::Float64, offset::Float64 = 1.0) = begin

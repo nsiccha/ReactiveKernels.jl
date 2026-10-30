@@ -42,13 +42,6 @@ end
         @test !occursin("struct ", GLM_BINOMIAL_SOURCE)
         @test artifact.glm_object === binomial_logit_glm
 
-        raw_generated = code_expr(artifact.kernel)
-        readable = sprint(
-            Base.show_unquoted,
-            ReactiveKernels._readable_expr(raw_generated, artifact.kernel);
-            context = :limit => false,
-        )
-        @test !occursin(r"__ops__\[\d+\]", readable)
     end
 
     @testset "constrain-only prunes the likelihood work" begin

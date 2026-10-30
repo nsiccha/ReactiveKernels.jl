@@ -1032,7 +1032,7 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid)
         nothing
     end
     for recipe in inner.recipes
-        slots = findall(v -> canon_id(ig, v.id) == cid, _tuple_vector(recipe.inputs))
+        slots = findall(_input_list(v -> canon_id(ig, v.id) == cid, recipe.inputs))
         isempty(slots) && continue
         recipe.op isa _KernelSourceOp || return nothing
         analyzed = _cell_native(recipe)
@@ -1162,7 +1162,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
             r = only(candidates)
             k = findfirst(o -> cidof(o) == cid, r.outputs)
             declared = valtype(r.outputs[k])
-            inputs = Any[static_type(v) for v in _tuple_vector(r.inputs)]
+            inputs = _input_list(static_type, r.inputs)
             inferred = declared !== Any ? declared :
                 r.op isa _AuthoredPlateOp ?
                     (length(r.outputs) == 1 ? _cell_plate_output_type(r.op, inputs) : Any) :
@@ -1774,7 +1774,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
             e.runtime_recipes[1:offset], r.op, args, d.plates[r.id], window, nothing)
         return window
     end
-    call = Expr(:call, Expr(:ref, _OPS_ARG, d.slots[r.id]), args...)
+    call = _slot_call_expr(r, d.slots[r.id], args)
     f.kind === :identity &&
         (call = Expr(:call, GlobalRef(Base, :convert), valtype(only(r.outputs)), call))
     _cell_bind!(e, :cell_rows, call)

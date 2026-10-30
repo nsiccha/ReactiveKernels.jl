@@ -162,7 +162,7 @@ end
                     split(string(code_expr(posterior_kernel)), '\n')) == 2
         @test !occursin("similar", string(code_expr(posterior_kernel)))
         @test !any(op -> op isa ReactiveKernels.PreparedKernel,
-                   posterior_kernel.ops)
+                   posterior_kernel.callables)
     end
 
     @testset "constrained and unconstrained joint-density cuts share one graph" begin
@@ -296,7 +296,7 @@ end
 
         @testset "generated bindings are hygienic for PPL names" begin
             graph = Graph()
-            reserved = value!(graph, :__ops__, Vector{Float64})
+            reserved = value!(graph, :__callables__, Vector{Float64})
             location = value!(graph, :location, Float64)
             log_scale = value!(graph, :log_scale, Float64)
             effects = value!(graph, :effects, Vector{Float64})

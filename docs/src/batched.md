@@ -119,8 +119,10 @@ end
   `x[idx[i]]`, a lag `x[i - 1]`. An array the cell also reads whole stays a
   closure, read at `i` by a gather.
 - `z[i] = …` (optionally `z[i]::T = …`) names an output. Several outputs give
-  one plate each over the same cells. Names assigned inside the loop are
-  cell-local, and loops nest.
+  one plate each over the same cells, each over the loop statements its
+  output reads: it captures, zips and checks only what those statements read,
+  as the call form written for that output alone would. Names assigned inside
+  the loop are cell-local, and loops nest.
 - An array read at the loop index has exactly the loop's indices. A mismatch,
   a singleton included, is a `DimensionMismatch`; a singleton is never repeated
   across the domain.

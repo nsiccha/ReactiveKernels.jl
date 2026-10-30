@@ -261,28 +261,37 @@ assumed.
 
 ### 4. Lowering and emitted ABI
 
-Lowering turns the selected plan into a straight-line anonymous Julia function.
-It creates collision-free locals from canonical value identities and takes the
-selected operations in a positional tuple, one slot per recipe. A recipe whose
-operation is its authored source runs that source in the body, as a `let` that
-binds the slot first, then the source's parameters to the recipe's arguments
-and its captures to the fields of the authored closure the slot keeps:
+Lowering turns the selected plan into a straight-line anonymous Julia function
+`function (__constants__, __callables__, ports...) ... end`. It creates
+collision-free locals from canonical value identities and takes two positional
+tuples with one entry per lowered recipe: `__constants__` holds the values of
+the bound constants (`prepare(…; bound)`), `__callables__` the operations the
+body still calls, and every other entry is `nothing`. A recipe whose
+operation is its authored source runs that source in the body, as a `let`
+that binds the source's parameters to the recipe's arguments; its locals are
+named from the recipe's position, so the lowering mints no fresh symbol:
 
 ```julia
-a = let var"#op1" = __ops__[1], var"#x#op1" = x, var"#c#op1" = getfield(__ops__[1], :c)
-    <the recipe's source over x and c>
+a = let var"#x#op1" = x
+    <the recipe's source over x>
 end
+b = __constants__[2]
+c = (__callables__[3])(a, b)
 ```
 
-The source's own names are resolved in the module that defined it, as the
-rest of the body resolves globals. An operation whose code is not its source
-is called through its literal tuple index: a raw function, a plate, a scan, a
-branch, a bound constant, a source that reads a module binding the module can
-reassign (its generated source function names the value the binding held when
-the kernel was defined), or a source outside the emitter's grammar. HAVE
-values appear in their preserved boundary order; WANT values appear in their
-requested return order. A single WANT returns one value and multiple WANTS
-return a tuple.
+A source with lexical captures reads them from its authored closure, which the
+callables tuple keeps for it (`var"#c#op1" = getfield(__callables__[1], :c)`);
+a literal statement is its literal (`shift::Float64 = -1.5`) and an alias its
+argument. The source's own names are resolved in the module that defined it,
+as the rest of the body resolves globals. An operation whose code is not its
+source is called through its literal position in the callables tuple: a raw
+function, a plate, a scan, a branch, a source that reads a module binding the
+module can reassign (its generated source function names the value the binding
+held when the kernel was defined), or a source outside the emitter's grammar. A
+prepared kernel keeps only the callables its body references; a rebinding
+replaces the constants tuple alone. HAVE values appear in their preserved
+boundary order; WANT values appear in their requested return order. A single
+WANT returns one value and multiple WANTS return a tuple.
 
 Multi-output recipes use one tuple destructure. If a later recipe emits a value
 already owned by HAVE or an earlier selected producer, lowering binds that
@@ -947,6 +956,13 @@ read only by cells at one position (several `plate_cell` values sharing an
 index port): each of those cells runs it at that position. A position
 outside the domain throws `BoundsError`. Several plates can share one index
 port by passing the same `index` to successive `plate_cell` calls.
+
+A cell takes only the values its body reads. When several values come from
+one shared cell returning a tuple (`t = (a, b, c)`, read as `t[k]`, the cell
+RKPPL emits for an `@plate for` loop whose values share work), a cell of one
+value's reader runs the shared cell's work for that value alone, and the
+values only the other entries read (with everything upstream of them) are
+not computed.
 
 A whole array the cell captures and reads only at its own position, `v[i]`
 with `i` an integer element of a batched argument, is computed at that row

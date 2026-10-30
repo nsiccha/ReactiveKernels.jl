@@ -10,6 +10,20 @@ import Enzyme
 const PE_TEST_AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
 # Positional ops have no global names in lowered code; assert structurally.
+function pe_constant_read_indices(ast)
+    indices = Int[]
+    function visit(node)
+        node isa Expr || return
+        if node.head === :ref && length(node.args) == 2 &&
+           node.args[1] === :__constants__ && node.args[2] isa Int
+            push!(indices, node.args[2])
+            return
+        end
+        foreach(visit, node.args)
+    end
+    visit(ast)
+    indices
+end
 function pe_op_call_indices(ast)
     indices = Int[]
     function visit(node)
@@ -17,7 +31,7 @@ function pe_op_call_indices(ast)
         if node.head === :call && node.args[1] isa Expr
             callee = node.args[1]
             if callee.head === :ref && length(callee.args) == 2 &&
-               callee.args[1] === :__ops__ && callee.args[2] isa Int
+               callee.args[1] === :__callables__ && callee.args[2] isa Int
                 push!(indices, callee.args[2])
             end
         end
@@ -69,10 +83,11 @@ end
         @test Tuple(v.name for v in inputs(bound_kernel)) == (:x,)
         @test_throws MethodError bound_kernel(2.0, dval)
 
-        # The residual body contains the constant and the residual multiply,
-        # and none of the hoisted data ops.
+        # The residual body contains the constant's read and the residual
+        # multiply, and none of the hoisted data ops.
         residual_ops = pe_op_call_indices(code_expr(bound_kernel))
-        @test length(residual_ops) == 2
+        @test length(residual_ops) == 1
+        @test length(pe_constant_read_indices(code_expr(bound_kernel))) == 1
 
         # Warmed up above; the residual call allocates nothing. (Measure
         # through a function barrier so the non-const test binding does not
@@ -111,10 +126,7 @@ end
             ReactiveKernels._externalize_bound_arrays(bound_kernel)
         @test external_values == (dval,)
         @test external_call([1.0, 1.0], external_values...) == 5.0
-        @test all(external_call.ops) do op
-            !(op isa ReactiveKernels._BoundConstant &&
-              op.value isa AbstractArray)
-        end
+        @test !any(value -> value isa AbstractArray, external_call.constants)
 
         plain = prepare(g; have = (x, d), want = (r,))
         unchanged, no_values =
@@ -149,10 +161,7 @@ end
         @test copy_values == (yval[:, 1],)
         @test only(copy_values) isa Vector
         @test copy_call([1.0, 1.0, 1.0], copy_values...) == 6.0
-        @test all(copy_call.ops) do op
-            !(op isa ReactiveKernels._BoundConstant &&
-              op.value isa AbstractArray)
-        end
+        @test !any(value -> value isa AbstractArray, copy_call.constants)
     end
 
     @testset "data-only WANTs become constants" begin
@@ -271,10 +280,11 @@ end
         @test bound_kernel(5.0) == plain(5.0, dval)
         @test Tuple(v.name for v in inputs(bound_kernel)) == (:x,)
         # The plate (and its fused sum) ran at prepare time: the residual body
-        # has no broadcast left, only the constant fetch and the final +.
+        # has no broadcast left, only the constant's read and the final +.
         residual = code_expr(bound_kernel)
         @test !pe_contains_broadcast(residual)
-        @test length(pe_op_call_indices(residual)) == 2
+        @test length(pe_op_call_indices(residual)) == 1
+        @test length(pe_constant_read_indices(residual)) == 1
 
         # Parameter-dependent plates (broadcast-style arguments) stay
         # per-call and stay correct.
@@ -332,10 +342,7 @@ end
         @test keys(only(prepared.external_values)) == (:shifted,)
         @test prepared.call.kernel.call isa
               ReactiveKernels._ExternalizedBoundArrayCall
-        @test all(prepared.call.kernel.call.ops) do op
-            !(op isa ReactiveKernels._BoundConstant &&
-              op.value isa AbstractArray)
-        end
+        @test !any(value -> value isa AbstractArray, prepared.call.kernel.call.constants)
         q2 = [1.0, 2.0, -3.0]
         @test ad_gradient(prepared, q2) ≈ (dval .- 1.0) .- q2
 

@@ -968,6 +968,58 @@ _cq_form_data(n) = (; y1 = sin.(1:n), y2 = cos.(1:n), y3 = sin.(2 .* (1:n)),
     end
 end
 
+# Values of one `@plate for` loop that share cell work, as BRM's cell loop
+# computes several observations' arguments from shared group totals (snag
+# `sibling-only-pla-2b3df69e`). They run as one shared cell; a cell of one
+# observation computes only what that observation's arguments read, so it does
+# not compute the values only its sibling observations read.
+const _CQ_SIBLINGS = quote
+    sigma ~ Exponential(1)
+    c[1:3] .~ Normal.(0, 1)
+    la = c[1] .+ 0.1 .* x
+    lb = c[2] .+ 0.2 .* x
+    lr = c[3] .- 0.1 .* x
+    @plate for i in eachindex(y1)
+        s1 = sum(exp.(la[r1[i]]))
+        s2 = sum(exp.(lb[r2[i]]))
+        m1[i] = s1
+        m2[i] = s2
+        m3[i] = s1 + s2 + sum(exp.(lr[r3[i]]))
+    end
+    y1 .~ Normal.(m1, sigma)
+    y2 .~ Normal.(m2, sigma)
+    y3 .~ Normal.(m3, sigma)
+end
+_cq_sibling_data(n) = (; x = collect(range(-1, 1; length = n)),
+    r1 = [[1, 2], [n - 1, n], [3]], r2 = [[2], [n], [1, 4]], r3 = [[n], [5, 6], [1]],
+    y1 = [2.0, 2.1, 1.2], y2 = [1.0, 0.9, 2.0], y3 = [4.0, 4.5, 3.9])
+
+@testset "cell query: an observation's cell computes nothing only its sibling observations read" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for (obs, own) in ((:y1, [:la]), (:y2, [:lb]), (:y3, [:la, :lb, :lr]))
+        measured = map((40, 4_000)) do n
+            bound, built = _cq_bound(_CQ_SIBLINGS, _cq_sibling_data(n), (:y1, :y2, :y3))
+            q = prepare_cell_query(built, bound, obs; locality = :error)
+            names = Set(e.value for e in ReactiveKernels.partition_locality(q.kernel))
+            u = collect(range(-0.4, 0.5; length = built.layout.total))
+            pointwise = getproperty(
+                Base.invokelatest(prepare_query(built, bound, :pointwise), u), obs)
+            q(u, 2)
+            sampler = prepare_cell_sampler(built, bound, obs, u; backend)
+            g = similar(u)
+            value, _ = cell_value_and_gradient!(sampler, g, u, 2)
+            (; values = [q(u, i) for i in 1:3], reference = vec(pointwise), names,
+               bytes = (@allocated q(u, 2)), value,
+               central = g ≈ [_cq_central(v -> q(v, 2), u, j) for j in eachindex(u)])
+        end
+        @test all(m -> m.values ≈ m.reference, measured)
+        @test all(m -> issubset(own, m.names), measured)
+        @test all(m -> isdisjoint(setdiff([:la, :lb, :lr], own), m.names), measured)
+        @test measured[1].bytes == measured[2].bytes
+        @test all(m -> m.value ≈ m.values[2] && m.central, measured)
+    end
+end
+
 # A model value an ordinary function computes, read at a cell's rows, is
 # computed whole in every cell. `locality = :error` refuses the query naming
 # the statement (RK `plate_cell`, decision

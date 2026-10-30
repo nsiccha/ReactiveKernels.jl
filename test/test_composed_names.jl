@@ -137,12 +137,11 @@ _names_normal(x, location, scale) =
 _names_priors_reference(u) = _names_exponential(exp(u[1]), 4.0) +
     _names_exponential(u[2], 4.0) + _names_normal(u[3], -0.5, 2.0)
 
-# Source-aware recipe view for naming assertions; public `code_expr` keeps
-# executable operation slots and does not substitute recipe source.
-function _names_text(spec)
-    p = plan(spec)
-    string(ReactiveKernels._readable_expr(code_expr(p), p))
-end
+# The generated code: each recipe's source runs in the body over its
+# arguments, bound to locals named from the recipe's position (`var"#x#opk"`).
+_names_text(spec) = string(code_expr(plan(spec)))
+# A binding of an inline statement: `var"#name#opk" = value`.
+_binds(name, value) = Regex("var\"#$(name)#op\\d+\" = $(value)")
 _names_identity_recipes(spec) =
     count(recipe -> recipe.op === identity, kernel_graph(spec).recipes)
 
@@ -150,8 +149,8 @@ _names_identity_recipes(spec) =
     @testset "unannotated child boundaries read the caller's values" begin
         @test _names_identity_recipes(names_parent) == 0
         text = _names_text(names_parent)
-        # The child's formals read the caller's values in place.
-        @test occursin("z = x * y + 1.0", text)
+        # The child's formals are bound to the caller's values.
+        @test occursin(r"z = let var\"#[^\"]+#op\d+\" = x, var\"#[^\"]+#op\d+\" = y", text)
         @test !occursin("__return__", text)
         @test !occursin("identity(", text)
         @test prepare(names_parent)(1.5, 2.0) == 2 * (1.5 * 2.0 + 1.0)
@@ -165,7 +164,7 @@ _names_identity_recipes(spec) =
         conversions = [recipe for recipe in kernel_graph(names_pair_caller).recipes
                        if recipe.op === identity]
         @test sort!([only(recipe.outputs).name for recipe in conversions]) == [:a, :m]
-        @test occursin("a = identity(m)", _names_text(names_pair_caller))
+        @test occursin(r"a = \(__callables__\[\d+\]\)\(m\)", _names_text(names_pair_caller))
         @test prepare(names_pair_caller)(3) == 4 + 8
     end
 
@@ -181,19 +180,16 @@ _names_identity_recipes(spec) =
         # literal or computed argument is the child's own scoped value; the
         # program reads it by that name rather than a substituted value.
         @test occursin("var\"lp_s.scale\" = 4.0", text)
-        @test occursin("var\"lp_s.log_scale\" = log(var\"lp_s.scale\")", text)
-        @test occursin("var\"lp_t.log_scale\" = log(var\"lp_t.scale\")", text)
-        @test occursin("lp_s = ifelse(s >= 0, -var\"lp_s.log_scale\" - " *
-                       "s / var\"lp_s.scale\", -Inf)", text)
-        @test occursin("var\"lp_t.x\" = u[2]", text)
+        # `log(scale)` is a bare call, so it is called through the table.
+        @test occursin(r"var\"lp_s\.log_scale\" = \(__callables__\[\d+\]\)\(var\"lp_s\.scale\"\)", text)
+        @test occursin(r"var\"lp_t\.log_scale\" = \(__callables__\[\d+\]\)\(var\"lp_t\.scale\"\)", text)
+        @test occursin(r"lp_s = let var\"#[^\"]+#op\d+\" = s, var\"#[^\"]+#op\d+\" = var\"lp_s\.log_scale\", var\"#[^\"]+#op\d+\" = var\"lp_s\.scale\"", text)
+        @test occursin("var\"lp_t.x\" = ", text)
         # A bound child endpoint's scoped port reads its own value, not
         # `var"standard.z"`.
-        @test occursin("var\"lp_m.standardized\" = (var\"lp_m.x\" - " *
-                       "var\"lp_m.location\") / var\"lp_m.scale\"", text)
-        @test occursin("var\"lp_m.standard.logpdf\" = -0.5 * log(2π) - 0.5 * " *
-                       "var\"lp_m.standardized\" ^ 2", text)
+        @test occursin("var\"lp_m.standardized\" = ", text)
+        @test occursin("var\"lp_m.standard.logpdf\" = ", text)
         @test !occursin("standard.z", text)
-        @test !occursin("let ", text)
         parsed = Meta.parseall(text)
         @test !any(arg -> arg isa Expr && arg.head === :error, parsed.args)
 
@@ -214,8 +210,8 @@ _names_identity_recipes(spec) =
 
     @testset "a do-block parameter shadows only inside the block" begin
         text = _names_text(names_cell_parent)
-        @test occursin("p = plate(x, s) do values, scale", text)
-        @test !occursin("let ", text)
+        # The plate is called through the table over the caller's values.
+        @test occursin(r"p = \(__callables__\[\d+\]\)\(x, s\)", text)
         @test prepare(names_cell_parent)([1.0, 2.0, 4.0], 2.0) == 3.5
     end
 
@@ -251,12 +247,9 @@ _names_identity_recipes(spec) =
         @test ReactiveKernels.valtype(names_typed_parent.ports[:w]) ===
               AbstractVector{Float64}
         text = _names_text(names_typed_parent)
-        @test occursin("var\"r.names_typed_child\" = sum(w) * " *
-                       "var\"r.names_typed_child.s\"", text)
-        @test occursin("var\"r.names_typed_child_2.v\" = a .* 2.0", text)
-        @test occursin("var\"r.names_typed_child_2\" = " *
-                       "sum(var\"r.names_typed_child_2.v\") * " *
-                       "var\"r.names_typed_child_2.s\"", text)
+        @test occursin(r"var\"r\.names_typed_child\" = let var\"#[^\"]+#op\d+\" = w, var\"#[^\"]+#op\d+\" = var\"r\.names_typed_child\.s\"", text)
+        @test occursin(r"var\"r\.names_typed_child_2\.v\" = let var\"#[^\"]+#op\d+\" = a", text)
+        @test occursin(r"var\"r\.names_typed_child_2\" = let var\"#[^\"]+#op\d+\" = var\"r\.names_typed_child_2\.v\", var\"#[^\"]+#op\d+\" = var\"r\.names_typed_child_2\.s\"", text)
         @test !occursin("identity(", text)
         @test !occursin("##", text)
         kernel = prepare(names_typed_parent)
@@ -268,7 +261,7 @@ _names_identity_recipes(spec) =
         # A HAVE port is the kernel's public boundary: its declared type
         # (here none) is unchanged, so the formal keeps its conversion.
         @test only(inputs(names_typed_have)) isa ReactiveKernels.Value{Any}
-        @test occursin("identity(a)", _names_text(names_typed_have))
+        @test occursin(r"var\"r\.v\" = \(__callables__\[\d+\]\)\(a\)", _names_text(names_typed_have))
         @test prepare(names_typed_have)([1.0, 2.0]) == 6.0
     end
 
@@ -276,16 +269,15 @@ _names_identity_recipes(spec) =
         text = _names_text(names_lifted_calls)
         # Each call's values read under `<assigned>.<callee>`; a repeated
         # callee in one assignment counts up.
-        @test occursin("var\"mu.names_rise.xi\" = a .* 2.0", text)
-        @test occursin("var\"mu.names_rise\" = var\"mu.names_rise.xi\" .+ 1.0", text)
-        @test occursin("var\"mu.names_fall.xi_max\" = m .- 3.0", text)
-        @test occursin("mu = (a .* var\"mu.names_rise\") .* exp.(var\"mu.names_fall\")", text)
-        @test occursin("var\"twice.names_rise.x\" = a .* 3.0", text)
-        @test occursin("var\"twice.names_rise.xi\" = var\"twice.names_rise.x\" .* 2.0", text)
-        @test occursin("var\"twice.names_rise_2.xi\" = m .* 2.0", text)
-        @test occursin("twice = var\"twice.names_rise\" .+ var\"twice.names_rise_2\"", text)
+        @test occursin(r"var\"mu\.names_rise\.xi\" = let var\"#[^\"]+#op\d+\" = a", text)
+        @test occursin(r"var\"mu\.names_rise\" = let var\"#[^\"]+#op\d+\" = var\"mu\.names_rise\.xi\"", text)
+        @test occursin(r"var\"mu\.names_fall\.xi_max\" = let var\"#[^\"]+#op\d+\" = m", text)
+        @test occursin(r"mu = let var\"#[^\"]+#op\d+\" = a, var\"#[^\"]+#op\d+\" = var\"mu\.names_rise\", var\"#[^\"]+#op\d+\" = var\"mu\.names_fall\"", text)
+        @test occursin(r"var\"twice\.names_rise\.x\" = let var\"#[^\"]+#op\d+\" = a", text)
+        @test occursin(r"var\"twice\.names_rise\.xi\" = let var\"#[^\"]+#op\d+\" = var\"twice\.names_rise\.x\"", text)
+        @test occursin(r"var\"twice\.names_rise_2\.xi\" = let var\"#[^\"]+#op\d+\" = m", text)
+        @test occursin(r"twice = let var\"#[^\"]+#op\d+\" = var\"twice\.names_rise\", var\"#[^\"]+#op\d+\" = var\"twice\.names_rise_2\"", text)
         @test !occursin("##", text)
-        @test !occursin("let ", text)
         @test !occursin(r"\b(xi|value)_\d+\b", text)
         kernel = prepare(names_lifted_calls)
         a, m = [0.3, -0.2, 0.7], 0.5
@@ -300,8 +292,9 @@ _names_identity_recipes(spec) =
         # Julia reports a gensym parameter without its leading `##`; the
         # display still maps the source's spelling to the shown value.
         text = _names_text(names_lifted_return)
-        @test occursin("value = xi .+ 1.0", text)
-        @test !occursin("endpoint_value", text)
+        @test occursin(r"value = let var\"#[^\"]+#op\d+\" = xi", text)
+        # The lifted return reads the caller's `value`.
+        @test occursin(r"__return__ = let var\"#[^\"]+#op\d+\" = value", text)
         @test prepare(names_lifted_return)([1.0, 2.0]) == 2 * (3.0 + 5.0)
     end
 
@@ -309,8 +302,7 @@ _names_identity_recipes(spec) =
         text = _names_text(names_arm)
         # The arm binds the endpoint's own values by name; their operations
         # are the callables the generated code embeds.
-        @test occursin(r"let log_scale = \S+\(s\), standardized = ", text)
-        @test occursin("var\"standard.logpdf\", log_scale", text)
+        @test occursin(r"lp = \(__callables__\[\d+\]\)\(s, x\)", text)
         # No generated binding name (an embedded operation's type may carry
         # its definition token).
         @test !occursin("var\"##", text)

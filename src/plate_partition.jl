@@ -114,8 +114,8 @@ function _cell_locality(p::Plan, d::_CellPushdowns)
     readers = Dict{ValueId,Vector{Tuple{Recipe,Vector{Int}}}}()
     for r in p.recipes
         foreach(o -> push!(get!(producers, cidof(o), Recipe[]), r), r.outputs)
-        for cid in unique!(ValueId[cidof(v) for v in _tuple_vector(r.inputs)])
-            slots = findall(v -> cidof(v) == cid, _tuple_vector(r.inputs))
+        for cid in unique!(ValueId[_input_list(cidof, r.inputs)...])
+            slots = findall(_input_list(v -> cidof(v) == cid, r.inputs))
             push!(get!(readers, cid, Tuple{Recipe,Vector{Int}}[]), (r, slots))
         end
     end
@@ -239,7 +239,7 @@ end
 # whether a value is a number or an array matters here, so abstract types
 # such as `AbstractVector{Float64}` are kept.
 function _locality_value_types(p::Plan)
-    _plan_value_types(p, Any[valtype(v) for v in _tuple_vector(p.have)]) do recipe, input_types
+    _plan_value_types(p, Any[valtype(v) for v in p.have]) do recipe, input_types
         recipe.op isa _BoundConstant && return (typeof(recipe.op.value),)
         map(recipe.outputs) do value
             valtype(value) === Any || return valtype(value)
@@ -581,7 +581,7 @@ function _footprint_return(p::Plan, cells, names)
         for r in p.recipes
             r.op isa _AuthoredPlateCellOp && continue
             any(o -> cidof(o) in pushed, r.outputs) && continue
-            slots = findall(v -> cidof(v) == cid, _tuple_vector(r.inputs))
+            slots = findall(_input_list(v -> cidof(v) == cid, r.inputs))
             isempty(slots) && continue
             f = _cell_form(r)
             literal = f === nothing ? _footprint_literal_read(r) : nothing
@@ -706,10 +706,10 @@ once here and holds it itself.
 """
 function partition_footprint_kernel(kernel::PreparedKernel)
     p = _lowering_plan(kernel.plan)
-    ast, ops, recipes = _sharing_cell_plans() do
+    ast, constants, callables, recipes = _sharing_cell_plans() do
         _lower_with_ops(p; footprint = true)
     end
-    _prepare(p, ast, ops, recipes)
+    _prepare(p, ast, constants, _native_table(ast, callables), recipes)
 end
 
 # ----------------------------------------------------------- separability
@@ -844,21 +844,21 @@ _plan_bookkeeping(@nospecialize(_)) = false
 
 # Whether `ex` reads nothing that varies per call: no data symbol (an unbound
 # HAVE port other than the label, or a value computed from one) and no
-# operation call other than a bound getter or a partition table op.
+# operation call other than a partition table op, and no bound value other
+# than index bookkeeping (`__constants__[k]`, `_plan_bookkeeping`).
 function _plan_eligible(ex, data::Set{Symbol}, ops)
     ex isa Symbol && return !(ex in data)
     ex isa Expr || return true
     if ex.head === :call
-        f = ex.args[1]
-        if Meta.isexpr(f, :ref, 2) && f.args[1] === _OPS_ARG && f.args[2] isa Int
-            _plan_eligible_op(ops[f.args[2]]) || return false
+        slot = _callable_slot(ex.args[1])
+        if slot !== nothing
+            _plan_eligible_op(ops[slot]) || return false
             return all(a -> _plan_eligible(a, data, ops), ex.args[2:end])
         end
         return all(a -> _plan_eligible(a, data, ops), ex.args)
     end
-    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] === _OPS_ARG
-        return ex.args[2] isa Int && _plan_eligible_op(ops[ex.args[2]])
-    end
+    slot = _constant_slot(ex)
+    slot === nothing || return _plan_eligible_op(ops[slot])
     ex.head in (:tuple, :ref, :., :kw, :parameters, :vect, :quote, :&&, :||, :comparison,
                 :(::), :curly, :if) || return false
     all(a -> _plan_eligible(a, data, ops), ex.args)
@@ -1017,12 +1017,12 @@ function _partition_plan_lowering(p::Plan, body::Expr, argexprs, runtime_ops, nm
     cell = findfirst(r -> r.op isa _AuthoredPlateCellOp && r.op.plan !== nothing, p.recipes)
     cell === nothing && return nothing
     port = p.recipes[cell].op.plan
-    position = findfirst(v -> v.name === port, _tuple_vector(p.have))
+    position = findfirst(v -> v.name === port, p.have)
     position === nothing && return nothing
     # The label port is the input of the label check (`_PartitionLabel`); it
     # varies per call but names the plan, so it is not data.
     labels = Set{Symbol}(nm(r.inputs[1]) for r in p.recipes if r.op isa _PartitionLabel)
-    data = Symbol[nm(v) for v in _tuple_vector(p.have) if !(nm(v) in labels) && v.name !== port]
+    data = Symbol[nm(v) for v in p.have if !(nm(v) in labels) && v.name !== port]
     split = _partition_plan_split(body, data, runtime_ops)
     split === nothing && return nothing
     plan, main, needed, fields = split
@@ -1037,7 +1037,7 @@ function _partition_plan_lowering(p::Plan, body::Expr, argexprs, runtime_ops, nm
     T = valtype(p.have[position])
     if T === Any
         T = _partition_plan_type(Expr(:function, Expr(:tuple, argexprs...), plan_body), p,
-                                 runtime_ops, length(argexprs) - 1 - length(p.have),
+                                 runtime_ops, length(argexprs) - 2 - length(p.have),
                                  port, position, labels, nm)
     elseif !(T <: NamedTuple && isconcretetype(T))
         throw(ArgumentError("partition plan: the plan port :$port is declared $T, not the " *
@@ -1075,16 +1075,17 @@ function _partition_plan_type(plan_ast::Expr, p::Plan, runtime_ops, extra::Int, 
             "partition plan: the plan port :$port is untyped and no bound label names a " *
             "plan to type it from; $remedy"))
         label = first(keys_)
-        Any[nm(v) in labels ? label : _plan_dummy(valtype(v)) for v in _tuple_vector(p.have)]
+        Any[nm(v) in labels ? label : _plan_dummy(valtype(v)) for v in p.have]
     else
         length(exemplars) == length(p.have) || throw(ArgumentError(
             "internal: $(length(exemplars)) exemplars for $(length(p.have)) HAVE ports"))
-        _tuple_vector(exemplars)
+        _input_list(identity, exemplars)
     end
     arguments[position] = nothing
     append!(arguments, fill(nothing, extra))
+    constants, callables = _lowering_tables(runtime_ops)
     plan = try
-        Base.invokelatest(f, Tuple(runtime_ops), arguments...)
+        Base.invokelatest(f, constants, _native_table(plan_ast, callables), arguments...)
     catch err
         throw(ArgumentError(
             "partition plan: the plan port :$port is untyped and evaluating its plan on " *
@@ -1119,10 +1120,10 @@ process; a caller evaluating many labels prepares it once here and holds it.
 """
 function partition_plan_kernel(kernel::PreparedKernel)
     p = _lowering_plan(kernel.plan)
-    ast, ops, recipes = _sharing_cell_plans() do
+    ast, constants, callables, recipes = _sharing_cell_plans() do
         _lower_with_ops(p; partition_plan = true)
     end
-    _prepare(p, ast, ops, recipes)
+    _prepare(p, ast, constants, _native_table(ast, callables), recipes)
 end
 """
     partition_plan_kernel(spec::KernelSpec; have, want, bound, on_error) -> PreparedKernel

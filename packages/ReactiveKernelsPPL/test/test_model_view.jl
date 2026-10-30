@@ -70,7 +70,7 @@ _has_linenumber(x) = x isa LineNumberNode ||
         @test view.code == Base.remove_linenums!(deepcopy(code_expr(built.spec)))
         @test !occursin("#=", code)
         @test !_has_linenumber(view.code)
-        @test occursin("__ops__", code)
+        @test occursin("__callables__", code)
         @test occursin("posterior", code)
 
         text = sprint(show, MIME"text/plain"(), view)

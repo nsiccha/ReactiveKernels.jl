@@ -42,7 +42,7 @@ end
         (RK._lower_with_ops(lowered), RK._lower_with_ops(lowered))
     end
     identities(recipes) = [v.id for r in recipes for v in (r.inputs..., r.outputs...)]
-    @test identities(first_lowering[3]) == identities(second_lowering[3])
+    @test identities(first_lowering[4]) == identities(second_lowering[4])
     events = [Bool[1, 0, 1], Bool[0, 0, 1], Bool[1, 1, 1]]
     probabilities = [0.3 0.8; 0.6 0.2; 0.5 0.5]
     weights = [0.4, 0.6]

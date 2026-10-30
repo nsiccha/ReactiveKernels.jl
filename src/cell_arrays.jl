@@ -168,7 +168,7 @@ function _cell_array_expand_call(rhs, recipes)
     # An operation call, or the recipe's source inlined in its place
     # (`inline_sources.jl`): both name the recipe whose source is read.
     if rhs.head === :call
-        slot = _operation_slot(rhs.args[1])
+        slot = _callable_slot(rhs.args[1])
         slot === nothing && return rhs
         args = rhs.args[2:end]
     else
