@@ -1309,15 +1309,11 @@ end
             @test ds ≈ _cell_central(s -> k(d..., s, i), 0.7) atol = 1e-8
         end
         backend === runtime || continue
-        exact = try
-            ad = prepare_ad(k, plain, d..., 0.7, 1; active = :s)
-            last(ad_value_and_gradient(ad, d..., 0.7, 1)) ≈
-                _cell_central(s -> k(d..., s, 1), 0.7)
-        catch err
-            nameof(typeof(err)) === :EnzymeRuntimeActivityError || rethrow()
-            false
-        end
-        @test_broken exact
+        # Plain Reverse too: a window's rows are read positions-first, then
+        # gathered once (RK 0.1.24), which static activity analysis accepts.
+        ad = prepare_ad(k, plain, d..., 0.7, 1; active = :s)
+        @test last(ad_value_and_gradient(ad, d..., 0.7, 1)) ≈
+            _cell_central(s -> k(d..., s, 1), 0.7)
     end
 end
 
