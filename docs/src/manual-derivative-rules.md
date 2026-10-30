@@ -36,9 +36,8 @@ const loggamma = scalar_derivative_rule(
     loggamma_graph; primal = :y, partials = (x = :dy_dx,), name = :loggamma)
 ```
 
-`loggamma(x)` runs the primal cut (`want = :y`; the partial is pruned), and
-its signature is generic, so the same cut traces under Reactant. The activity
-pattern of a differentiated call selects the cut
+`loggamma(x)` runs the primal cut (`want = :y`; the partial is pruned). The
+activity pattern of a differentiated call selects the cut
 `want = (:y, partials of the active inputs...)` through
 [`derivative_cut`](@ref), and the scalar chain rule combines those partials
 with the backend's covector (reverse) or directions (forward, including batch
@@ -186,8 +185,7 @@ off the plan's top-level recipes, so a primal plate's output is retained
 rather than recomputed: a reverse branch that reads `y` stages with residuals
 `(inputs..., :y)`. The compiled body's operation table keeps only the slots it
 reads, so the rule stays an `isbits` value when its other operations are
-singletons. The body is native Julia: tracing such a cut under Reactant throws
-an `ArgumentError`.
+singletons.
 
 In a position residual (`vectorize`, `prepare_batched`) the rule's primal cut
 fills lane buffers instead of allocating its result at every cell and position
@@ -213,27 +211,6 @@ Each adapter is generic over the rule and is loaded with its AD package:
   pullback that holds the all-active pattern's staged residuals; `frule` runs the
   forward cut, with a zero direction for a `ZeroTangent`.
 
-Not generated: rule emission into EnzymeMLIR. Under Reactant a rule's callable
-and cuts trace into the compiled program as plain graph mathematics, but no
-custom rule is emitted, so Enzyme under Reactant differentiates the traced
-primal cut (see [Automatic differentiation through Reactant](reactant-ad.md)).
-The upstream mechanism is
-[EnzymeAD/Enzyme#2516](https://github.com/EnzymeAD/Enzyme/pull/2516)
-(`[mlir] Split mode & custom rules`). It is open, and no Reactant release
-carries it. Its `enzyme.custom_reverse_rule` augmented-primal and reverse
-regions correspond to `stage_primal` and `stage_reverse`, attached through
-`enzyme.custom_rule` on a callee that is not inlined. As proposed, it has no
-rule sets, so only the all-active activity pattern can be attached. It is
-reverse-only at batch width 1, and Reactant's pipeline does not yet run its
-lowering. ReactiveKernels generates this adapter once a Reactant release
-carries the mechanism.
-
-The first vector consumer is the backsolve adjoint of
-`ReactiveKernelsReactantODESolvers`: its right-hand side is a
-`DerivativeRule`, and the augmented adjoint system evaluates the rule's
-reverse cut once per stage, so nothing differentiates the adaptive loop or
-the right-hand side.
-
 The linear-algebra primitive is `ReactiveKernels.rk_expm`: ordinary reverse
 Enzyme through `LinearAlgebra.exp` fails on its LAPACK `ccall`, so the owned
 callable authors the primal plus JVP/VJP branches — each an augmented-matrix
@@ -246,7 +223,6 @@ including calls inside lazy branches, plates and scans. Scalar and dotted
 calls, other matrix types and locally shadowed bindings retain their Julia
 behavior. Calls hidden inside an ordinary Julia helper are outside this
 source lowering; use `@traceable` or the explicit owned `rk_expm` there.
-The tensorized path still needs backend matrix-exponential support.
 The raw Enzyme boundary has a backend-only reproducer at
 `benchmark/repro_enzyme_matrix_exp.jl` and is also reported in
 [EnzymeAD/Enzyme.jl#1222](https://github.com/EnzymeAD/Enzyme.jl/issues/1222).

@@ -394,8 +394,8 @@ end
 # The bernoulli object carries a per-HAVE `logpdf` route (a direct-p HAVE is not
 # routed through the singular `logit = log(p) - log1p(-p)`); the stable logit-HAVE
 # log-sum-exp form and the `logp`/`log1mp` object ports are retained. Gradient
-# finiteness at the boundary is exercised under AD in `test/test_ad.jl` and
-# `test/test_ad_reactant.jl`; this covers the primal, ports, and route shape.
+# finiteness at the boundary is exercised under AD in `test/test_ad.jl`; this
+# covers the primal, ports, and route shape.
 @testset "bernoulli direct-p boundary and logit-route stability" begin
     logp_at(have, args...) = prepare(bernoulli.logpdf; have, want = :logpdf)(args...)
 

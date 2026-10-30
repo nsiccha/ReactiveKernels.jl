@@ -142,8 +142,8 @@ end
     call = typeof(RK._kernel_source_call)
     # Distinct operations, called directly or forwarded, are well founded.
     @test relation(nothing, nothing, Tuple{A,Float64}, Tuple{B,Float64})
-    @test relation(nothing, nothing, Tuple{call,Val{:native},A,Float64,Float64},
-                   Tuple{call,Val{:native},B,Float64,Float64})
+    @test relation(nothing, nothing, Tuple{call,A,Float64,Float64},
+                   Tuple{call,B,Float64,Float64})
     # The same operation again, an operation wrapping its caller, and a call
     # that is not a source call keep Julia's default limiting.
     @test !relation(nothing, nothing, Tuple{A,Float64}, Tuple{A,Int})

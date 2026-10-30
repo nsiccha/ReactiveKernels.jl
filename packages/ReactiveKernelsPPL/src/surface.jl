@@ -5521,8 +5521,7 @@ function _plate_column_expr(nm::Symbol, call::Expr,
                 h = dim.args[2]
                 if dim.args[1] !== :levels || _levels_subset(dim) !== Colon() || h !== axis
                     # Align values by their declared labels before entering
-                    # the cell. A parameter can be a view; indexing that view
-                    # at a traced lane code is not supported by Reactant.
+                    # the cell.
                     ld = length(d) == 3 && length(idx) == 1 ? 3 : 1
                     value = lane(Expr(:call, :_ppl_level_gather, X, axis, ld),
                         Symbol(:_ppl_pv_, X))

@@ -65,7 +65,6 @@ const _RUNTIME_FILES = (
     "kernel_nuts_native.jl",
     "hmc.jl",
     "reactive_nuts.jl",
-    "kernel_nuts_reactant.jl",
 )
 
 for file in _RUNTIME_FILES
@@ -85,7 +84,5 @@ export compile_nuts_native_instrumented, nuts_sealed_op_stream
 export nuts_instrumented_counts, nuts_instrumented_recompute
 export nuts_instrumented_trace, nuts_instrumented_schedule
 export nuts_instrumented_mutate_metric!, nuts_instrumented_phasepoint
-export compile_nuts_reactant, nuts_reactant_bundle, nuts_reactant_state
-export nuts_reactant_rebundle, nuts_reactant_compile, nuts_reactant_writeback!
 
 end # module ReactiveKernelsNUTSExamples

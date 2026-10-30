@@ -1,20 +1,16 @@
 #!/usr/bin/env julia
 
-# batch_textnn_gate.jl — the four-part correctness gate for the text/neural
+# batch_textnn_gate.jl — the two-part correctness gate for the text/neural
 # posteriordb `@kernel` PPL translations (ldaK2, ldaK5, nn_rbm1bJ10,
 # nn_rbm1bJ100). Each model is checked, on its FULL real posteriordb data,
 # against the ACTUAL reference `.stan` via BridgeStan (propto = false,
-# jacobian = true) along four independent axes:
+# jacobian = true) along two independent axes:
 #
 #   1. NATIVE VALUE      — RK primal log-density vs BridgeStan log_density
 #                          (relative error < 1e-6).
 #   2. NATIVE GRADIENT   — RK gradient via plain DifferentiationInterface + Enzyme
-#                          reverse (no Reactant) vs BridgeStan log_density_gradient
+#                          reverse vs BridgeStan log_density_gradient
 #                          (relative error < 1e-3), finite at every probe.
-#   3. REACTANT PRIMAL   — the Reactant-compiled primal vs the native primal
-#                          (relative error < 1e-6).
-#   4. REACTANT GRADIENT — the Reactant-compiled gradient vs BridgeStan
-#                          (relative error < 2e-3), finite.
 #
 # Every axis is a hard `@assert`, so a regression exits nonzero. Graphs are built
 # from the installed package's `build_*_graph` (its templates are evaluated at
@@ -23,45 +19,22 @@
 # in-graph preprocessing (the simplex sum-to-zero basis, the per-word gather
 # indices, the transformed-data prior scales) is exercised by binding raw data.
 #
-# Run (needs BridgeStan 2.9 / Stan 2.39, PosteriorDB, Reactant, Enzyme — all in
+# Run (needs BridgeStan 2.9 / Stan 2.39, PosteriorDB, Enzyme — all in
 # the all80 environment):
 #   julia --project=benchmark/all80-env benchmark/batch_textnn_gate.jl
 #
 # Optional: TEXTNN_MODELS=ldaK2,rbmJ10 restricts the set.
-#
-# The Reactant axes (3, 4) and the two native axes (1, 2) MUST be certified in
-# SEPARATE processes: TEXTNN_REACTANT=0 never imports Reactant and asserts it is
-# not loaded, so axes 1 & 2 certify plain-native execution with the Reactant
-# extension genuinely absent; TEXTNN_REACTANT=1 imports Reactant and runs all
-# four. Because Reactant cannot be unloaded once imported, the split is a real
-# load boundary, not a runtime flag.
 
-const DO_REACTANT = get(ENV, "TEXTNN_REACTANT", "1") == "1"
 # Standard consumer acceptance uses the DEFAULT AutoEnzyme(mode=Enzyme.Reverse).
 # TEXTNN_AD_CONST=1 selects the stricter function_annotation=Const variant (what
 # the batch startup/acceptance drivers use); the two are labeled distinctly.
 const AD_CONST = get(ENV, "TEXTNN_AD_CONST", "0") == "1"
-
-# Reactant-absence gate for the native phase, asserted via Base.loaded_modules
-# (the authoritative loaded-package set) BEFORE any import — nothing has loaded
-# Reactant yet — and again after native work below.
-_reactant_loaded() = any(id -> id.name == "Reactant", keys(Base.loaded_modules))
-if !DO_REACTANT
-    @assert !_reactant_loaded() "TEXTNN_REACTANT=0: Reactant already loaded BEFORE imports"
-end
 
 using Random, LinearAlgebra
 import BridgeStan, PosteriorDB, Enzyme
 using ReactiveKernels, ReactiveKernelsDistributionKernels
 using ReactiveKernelsPPLExamples
 using DifferentiationInterface
-
-if DO_REACTANT
-    import Reactant
-end
-if !DO_REACTANT
-    @assert !_reactant_loaded() "TEXTNN_REACTANT=0 native phase must run with Reactant UNLOADED, but it is loaded after imports"
-end
 
 const PE = ReactiveKernelsPPLExamples
 const AE = AD_CONST ?
@@ -73,19 +46,16 @@ const AD_LABEL = AD_CONST ?
 
 const VALUE_TOL   = 1e-6      # native value vs Stan
 const GRAD_TOL    = 1e-3      # native plain-Enzyme gradient vs Stan
-const RPRIMAL_TOL = 1e-6      # Reactant primal vs native
-const RGRAD_TOL   = 2e-3      # Reactant gradient vs Stan
 
 # Receipt provenance (correction 6): exact toolchain + reference identity.
 println("== batch_textnn_gate provenance ==")
 println("  Julia ", VERSION, " | BridgeStan ", pkgversion(BridgeStan),
         " (Stan 2.39.0) | Enzyme ", pkgversion(Enzyme),
-        " | DifferentiationInterface ", pkgversion(DifferentiationInterface),
-        DO_REACTANT ? " | Reactant $(pkgversion(Reactant))" : " | Reactant UNLOADED")
+        " | DifferentiationInterface ", pkgversion(DifferentiationInterface))
 println("  AD backend: ", AD_LABEL)
 println("  reference oracle: BridgeStan.log_density(propto=false, jacobian=true) on the actual .stan")
-println("  native axes use scale*randn probes selected by REFERENCE (Stan) finiteness; the")
-println("  Reactant axes (3,4) evaluate at pts[1] only. Point counts printed per model below.")
+println("  probes are scale*randn draws selected by REFERENCE (Stan) finiteness;")
+println("  point counts printed per model below.")
 flush(stdout)
 
 sval(sm, q) = BridgeStan.log_density(sm, q; propto = false, jacobian = true)
@@ -116,8 +86,7 @@ function reference_points(sm, dim, seed, name, npts, scale)
     pts
 end
 
-function gate(name; graph, have, bind, scale = 0.3, npts = 4, seed = 468,
-              do_reactant = true, reactant_runtime = ())
+function gate(name; graph, have, bind, scale = 0.3, npts = 4, seed = 468)
     println("\n########## $name ##########"); flush(stdout)
     sm, post = bridge(name, seed)
     data = PosteriorDB.load(PosteriorDB.dataset(post))
@@ -126,7 +95,7 @@ function gate(name; graph, have, bind, scale = 0.3, npts = 4, seed = 468,
     dim = Int(BridgeStan.param_unc_num(sm))
     pts = reference_points(sm, dim, seed, name, npts, scale)
     println("  dim=$dim  seed=$seed  scale=$scale  native probes=$npts (reference-finite)  " *
-            "Reactant probe=pts[1]  AD=$AD_LABEL"); flush(stdout)
+            "AD=$AD_LABEL"); flush(stdout)
 
     # ---- axes 1 & 2: native value + native plain-Enzyme gradient vs Stan ----
     # (native axes bind ALL raw data — the faithful entry query.)
@@ -147,37 +116,8 @@ function gate(name; graph, have, bind, scale = 0.3, npts = 4, seed = 468,
     println("  [1] native value max_rel=$(round(max_v; sigdigits = 4)) (< $VALUE_TOL) PASS over $npts probes")
     println("  [2] native grad  max_rel=$(round(max_g; sigdigits = 4)) (< $GRAD_TOL) PASS over $npts probes  [$AD_LABEL]"); flush(stdout)
 
-    # ---- Reactant axes 3 & 4 (evaluated at pts[1] only). Ports named in
-    # `reactant_runtime` are moved from bound to a TRACED runtime input for the
-    # Reactant compile: on Reactant 0.2.285 a bound array is embedded as an XLA
-    # constant and, per the observed diagnostic, is refused above its configured
-    # constant threshold (104857600 bytes). The full-MNIST design matrix is
-    # 376,320,000 bytes and exceeds it — the reactivekernels-use §7e large-
-    # bound-data path. This is a DIFFERENT execution boundary (runtime input, not
-    # a matched all-bound backend workload); the graph, the value, and the
-    # gradient wrt the unconstrained parameters are identical (x stays inactive).
-    if do_reactant
-        if isempty(reactant_runtime)
-            _reactant_axes(name, kb, prep, sm, pts, ())
-        else
-            runtime_vals = Tuple(getfield(fullbound, k) for k in reactant_runtime)
-            rbound = NamedTuple(k => v for (k, v) in pairs(fullbound)
-                                if !(k in reactant_runtime))
-            kb_r = prepare(graph; have, want = :posterior, bound = rbound)
-            prep_r = prepare_ad(kb_r, AE, pts[1], runtime_vals...; active = :unconstrained)
-            @assert _relv(kb_r(pts[1], runtime_vals...), kb(pts[1])) < VALUE_TOL "$name: runtime-port graph disagrees with bound graph"
-            println("  (Reactant: $(join(reactant_runtime, ", ")) passed traced — §7e large-bound-data)")
-            _reactant_axes(name, kb_r, prep_r, sm, pts, runtime_vals)
-        end
-    end
     _RAN[] += 1
     return
-end
-
-if DO_REACTANT
-    include(joinpath(@__DIR__, "batch_textnn_gate_reactant.jl"))
-else
-    _reactant_axes(args...) = nothing
 end
 
 # ---- model registry -------------------------------------------------------
@@ -199,38 +139,27 @@ _want("ldaK2") && gate("three_men1-ldaK2";
     graph = PE.LDAExample.build_lda_graph(), have = _lda_have,
     bind = d -> (doc = Int.(d["doc"]), w = Int.(d["w"]),
                  alpha = ones(2), beta = ones(Int(d["V"])), M = Int(d["M"])),
-    scale = 0.3, do_reactant = DO_REACTANT)
+    scale = 0.3)
 
 # ldaK5 — alpha (5), beta (V) are data.
 _want("ldaK5") && gate("prideprejudice_chapter-ldaK5";
     graph = PE.LDAExample.build_lda_graph(), have = _lda_have,
     bind = d -> (doc = Int.(d["doc"]), w = Int.(d["w"]),
                  alpha = Float64.(d["alpha"]), beta = Float64.(d["beta"]), M = Int(d["M"])),
-    scale = 0.3, do_reactant = DO_REACTANT)
+    scale = 0.3)
 
 # rbmJ10 — mnist_100, J = 10 (transformed-data hidden-unit count).
 _want("rbmJ10") && gate("mnist_100-nn_rbm1bJ10";
     graph = PE.NNRBMExample.build_nn_rbm_graph(), have = _rbm_have,
     bind = d -> (x = _mat(d["x"]), y = Int.(d["y"]), K = Int(d["K"]), J = 10),
-    scale = 0.3, npts = 3, do_reactant = DO_REACTANT)
+    scale = 0.3, npts = 3)
 
-# rbmJ100 — full MNIST (N=60000), J = 100. The 376,320,000-byte design matrix `x`
-# is bound for the native axes but passed TRACED for the Reactant axes (exceeds
-# the observed Reactant-0.2.285 constant threshold 104857600 bytes; see §7e note
-# in `gate`) — a different runtime-input boundary, same value/gradient.
+# rbmJ100 — full MNIST (N=60000), J = 100.
 _want("rbmJ100") && gate("mnist-nn_rbm1bJ100";
     graph = PE.NNRBMExample.build_nn_rbm_graph(), have = _rbm_have,
     bind = d -> (x = _mat(d["x"]), y = Int.(d["y"]), K = Int(d["K"]), J = 100),
-    scale = 0.3, npts = 2, do_reactant = DO_REACTANT, reactant_runtime = (:x,))
+    scale = 0.3, npts = 2)
 
 @assert _RAN[] == length(SEL) "$(_RAN[]) gate(s) ran but $(length(SEL)) selected"
 @assert _RAN[] > 0 "no gates ran"
-# (3) post-native Reactant-absence assertion: the native phase must have run all
-# value/gradient work with Reactant still UNLOADED.
-if !DO_REACTANT
-    @assert !_reactant_loaded() "TEXTNN_REACTANT=0: Reactant became loaded during native work"
-end
-const _PHASE = DO_REACTANT ?
-    "all FOUR parts (native value+grad, Reactant primal+grad)" :
-    "the TWO native parts (Reactant UNLOADED; parts 3-4 deferred to a TEXTNN_REACTANT=1 run)"
-println("\n== batch_textnn_gate: $(_RAN[]) model(s) [$(join(SEL, ", "))] PASSED $_PHASE =="); flush(stdout)
+println("\n== batch_textnn_gate: $(_RAN[]) model(s) [$(join(SEL, ", "))] PASSED the two native parts =="); flush(stdout)

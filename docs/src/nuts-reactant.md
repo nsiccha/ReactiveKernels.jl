@@ -1,4 +1,9 @@
-# Adaptive NUTS through Reactant: static receipt
+# Adaptive NUTS through Reactant: historical receipt
+
+> **Historical receipt.** ReactiveKernels no longer has a Reactant path: its
+> Reactant extension, tensorized lowering and Reactant tests were removed. This
+> page keeps the measurements as recorded. Nothing on it runs Reactant, and the
+> RK functions and test files it names no longer exist.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_review_status(:frozen_sampling)

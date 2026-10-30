@@ -505,12 +505,6 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "plot:batched-authored-native-julia-relative",
             "plot:batched-authored-reactant-cpu-relative",
         ),
-        "reactant-ad.md" => (
-            "Automatic differentiation through Reactant",
-            "compile_ad_gradient",
-            "compile_ad_value_and_gradient",
-            "test/test_ad_reactant.jl",
-        ),
         "nuts-reactant.md" => (
             "Adaptive NUTS through Reactant: static receipt",
             "Frozen matched-control result",
@@ -545,7 +539,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
             "sum-to-zero-reactant-v1.toml",
             "Runtime ÷ baseline",
             "plot:sum-to-zero-hotloop-native-primal-relative",
-            "plot:sum-to-zero-hotloop-reactant-value-gradient-relative",
+            "plot:sum-to-zero-hotloop-reactant-value-gradient-removed-path-relative",
         ),
         "eval-throughput.md" => (
             "PracticalBayes",

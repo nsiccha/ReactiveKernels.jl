@@ -5,8 +5,7 @@
 # regression on a lag design matrix) and dugongs (nonlinear
 # von-Bertalanffy mean via computed-column extraction). Surface admission,
 # value parity vs Distributions.jl hand oracles,
-# Enzyme-vs-findiff gradients, O(1) emission, Reactant/XLA value+grad
-# (in test_sweep_replicate_reactant.jl).
+# Enzyme-vs-findiff gradients, and O(1) emission.
 # (`_findiff_grad` / `_GEN_BACKEND` come from test_generator.jl, included
 # first.)
 #

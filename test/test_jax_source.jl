@@ -61,18 +61,17 @@ end
     return t
 end
 
-# A helper written for the compiled path: `@trace` control flow, a counted
-# `while` loop (a `fori_loop`, which `jax.grad` reverses), and a branch whose
-# arms assign an outer local.
+# A helper with a counted `while` loop (a `fori_loop`, which `jax.grad`
+# reverses) and a branch whose arms assign an outer local.
 @traceable function jax_test_traced(x::Real)
     i = 0
     h = one(x)
-    ReactiveKernels.ReactantCore.@trace while i < 20
+    while i < 20
         h = h * (1 + x / (i + 1))
         i = i + 1
     end
     result = zero(x)
-    ReactiveKernels.ReactantCore.@trace if x > 0
+    if x > 0
         result = h
     else
         result = -h
@@ -169,12 +168,11 @@ end
     return m
 end
 
-# A plain helper whose compiled form is authored in place (`@trace`): its
-# source is recorded for `jax_source`, and it gains no `traced` method.
+# A plain helper whose source is recorded for `jax_source` as written.
 "The logarithm above one, the offset below it."
 ReactiveKernels.@_record_source function jax_test_recorded(x)
     result = zero(x)
-    ReactiveKernels.ReactantCore.@trace if x > 1
+    if x > 1
         result = log(x)
     else
         result = x - 1
@@ -267,9 +265,8 @@ end
 
 # Data preparation whose shapes follow the data's values (decision 1ooufd4):
 # with `data`, it is `prepare_data`, host NumPy with Python control flow.
-# Helpers whose loops `@traceable`'s traced form cannot carry (`break`,
-# `continue`, several ranges) record their source with `@_record_source`, as
-# RKPPL's own preparation helpers do.
+# Helpers with `break`, `continue` or several ranges record their source with
+# `@_record_source`, as RKPPL's own preparation helpers do.
 ReactiveKernels.@_record_source function jax_prep_codes(x::AbstractVector, levels::AbstractVector)
     codes = Vector{Int}(undef, length(x))
     for (i, v) in enumerate(x)
@@ -397,7 +394,6 @@ end
     @test occursin("jnp.where(kept", generators)
     @test !occursin(r"^\s*for "m, generators)
     @test ReactiveKernels._traceable_source(typeof(jax_test_recorded), Float64) !== nothing
-    @test !any(m -> occursin("jax_test_recorded", string(m.sig)), methods(ReactiveKernels.traced))
     @test occursin("logarithm above one", string(@doc jax_test_recorded))
     checked = string(jax_source(jax_checked; have = (:x,), want = :m))
     @test occursin("jax.debug.callback(", checked)

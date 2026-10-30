@@ -267,15 +267,14 @@ end
 # split.
 function _partial_split_parts(r::Recipe)
     r.op isa _KernelSourceOp || return nothing
-    native, tensor = r.op.f, r.op.tensor_f
-    native isa _KernelSplit && tensor isa _KernelSplit || return nothing
+    native = r.op.f
+    native isa _KernelSplit || return nothing
     shape = _kernel_split_spec(native)
-    _kernel_split_spec(tensor) == shape || return nothing
     ports = collect(Symbol, first(shape))
     length(ports) == length(r.inputs) || return nothing
     split = _kernel_split_nodes(r.source, ports)
     split === nothing || _kernel_split_shape(ports, split) == shape || return nothing
-    split === nothing ? nothing : (; native, tensor, split)
+    split === nothing ? nothing : (; native, split)
 end
 
 # Replace recipe `r` by the recipes of its parts, appended to `recipes`, with
@@ -283,7 +282,7 @@ end
 # reads bound data only.
 function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
                               r::Recipe, parts, dataonly::Vector{Bool}, fresh)
-    (; native, tensor, split) = parts
+    (; native, split) = parts
     nodes = split.nodes
     holds = copy(dataonly)
     for (i, node) in enumerate(nodes)          # post-order: kids come first
@@ -297,14 +296,14 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
         part = if dataonly[i] || !holds[i]
             Recipe(fresh(), Tuple(r.inputs[p] for p in node.own), (value,),
                    _KernelSourceOp(Val(Symbol(token, :_part, i)), Val(:fused),
-                                   native.wholes[i], tensor.wholes[i]),
+                                   native.wholes[i]),
                    r.cost, nothing, false, node.expr)
         else
             kids = Value[emit!(k) for k in node.kids]
             Recipe(fresh(), (Tuple(r.inputs[p] for p in node.direct)..., kids...),
                    (value,),
                    _KernelSourceOp(Val(Symbol(token, :_split, i)), Val(:fused),
-                                   native.splits[i], tensor.splits[i]),
+                                   native.splits[i]),
                    r.cost, nothing, false, node.body)
         end
         push!(recipes, part)
@@ -315,7 +314,7 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
     root = Recipe(r.id, (Tuple(r.inputs[p] for p in split.root.direct)..., kids...),
                   r.outputs,
                   _KernelSourceOp(Val(Symbol(token, :_root)), Val(kernel_sourceop_form(r.op)),
-                                  native.root, tensor.root),
+                                  native.root),
                   r.cost, nothing, false, split.root.body)
     push!(recipes, root)
     readable[r.id] = root
@@ -383,24 +382,22 @@ end
 # condition reads bound data only is left to the lane partition, after which
 # each arm is split without speculation.
 
-# The leaves of branch `(native, tensor)`, whose positions index the recipe's
-# inputs, each `(; path, positions, native, tensor, source, spec)`, or `nothing`
-# when a nested branch does not take every argument in order.
-function _partial_branch_leaves!(leaves, native::_KernelBranch, tensor::_KernelBranch,
-                                 source, path, count)
+# The leaves of `branch`, whose positions index the recipe's inputs, each
+# `(; path, positions, native, source, spec)`, or `nothing` when a nested
+# branch does not take every argument in order.
+function _partial_branch_leaves!(leaves, native::_KernelBranch, source, path, count)
     CI, TI, EI = typeof(native).parameters[1:3]
-    Tuple(typeof(tensor).parameters[1:3]) == (CI, TI, EI) || return nothing
     parts = source isa Expr ? _kernel_branch_parts(source) : nothing
     parts === nothing && return nothing
     for (side, positions, arm_source) in ((:then_arm, TI, parts[2]), (:else_arm, EI, parts[3]))
-        n, t = getfield(native, side), getfield(tensor, side)
+        n = getfield(native, side)
         if n isa _KernelBranch
-            t isa _KernelBranch && positions == Tuple(1:count) || return nothing
-            _partial_branch_leaves!(leaves, n, t, arm_source, (path..., side), count) ===
+            positions == Tuple(1:count) || return nothing
+            _partial_branch_leaves!(leaves, n, arm_source, (path..., side), count) ===
                 nothing && return nothing
         else
             push!(leaves, (; path = (path..., side), positions = collect(Int, positions),
-                             native = n, tensor = t, source = arm_source,
+                             native = n, source = arm_source,
                              spec = getfield(native, side === :then_arm ? :then_spec : :else_spec)))
         end
     end
@@ -413,43 +410,38 @@ _branch_call_names(branch::_KernelBranch) = _branch_call_names(branch.call)
 _branch_call_names(::_KernelBranchCall{CI,TI,EI,Names}) where {CI,TI,EI,Names} =
     collect(Symbol, Names)
 
-# The branch `(native, tensor)` with each leaf in `plans` reading its cached
-# nodes, appended as arguments `count + 1:count + added`. A leaf arm that is
+# The branch `native` with each leaf in `plans` reading its cached nodes, appended as arguments `count + 1:count + added`. A leaf arm that is
 # not rebuilt keeps its graph (`then_spec`/`else_spec`), which the shared
 # branch lowering may splice. Rebuilt graph arms keep their residual plan;
 # expression-only split arms have no graph metadata.
-function _partial_rebuild_branch(native::_KernelBranch, tensor::_KernelBranch, path,
-                                 plans, count, added, names)
+function _partial_rebuild_branch(native::_KernelBranch, path, plans, count, added, names)
     CI, TI, EI = typeof(native).parameters[1:3]
     all_positions = Tuple(1:(count + added))
     spec_field(side) = side === :then_arm ? :then_spec : :else_spec
     arm(side, positions) = begin
-        n, t = getfield(native, side), getfield(tensor, side)
+        n = getfield(native, side)
         key = (path..., side)
         if n isa _KernelBranch
-            (_partial_rebuild_branch(n, t, key, plans, count, added, names)...,
-             all_positions, nothing, nothing)
+            (_partial_rebuild_branch(n, key, plans, count, added, names),
+             all_positions, nothing)
         elseif haskey(plans, key)
             plan = plans[key]
             if hasproperty(plan, :native)
-                (plan.native, plan.tensor, plan.positions, plan.spec, plan.spec)
+                (plan.native, plan.positions, plan.spec)
             else
-                (_KernelSplitApply(Val(plan.plan), n), _KernelSplitApply(Val(plan.plan), t),
-                 (positions..., (count .+ plan.slots)...), nothing, nothing)
+                (_KernelSplitApply(Val(plan.plan), n),
+                 (positions..., (count .+ plan.slots)...), nothing)
             end
         else
-            (n, t, positions, getfield(native, spec_field(side)),
-             getfield(tensor, spec_field(side)))
+            (n, positions, getfield(native, spec_field(side)))
         end
     end
-    tn, tt, TI2, tns, tts = arm(:then_arm, TI)
-    en, et, EI2, ens, ets = arm(:else_arm, EI)
-    built(condition, then_arm, else_arm, then_spec, else_spec) =
-        _KernelBranch(Val(CI), Val(TI2), Val(EI2),
-            _KernelBranchCall(Val(CI), Val(TI2), Val(EI2), Val(names), condition,
-                              then_arm, else_arm),
-            condition, then_arm, else_arm, then_spec, else_spec)
-    built(native.condition, tn, en, tns, ens), built(tensor.condition, tt, et, tts, ets)
+    tn, TI2, tns = arm(:then_arm, TI)
+    en, EI2, ens = arm(:else_arm, EI)
+    _KernelBranch(Val(CI), Val(TI2), Val(EI2),
+        _KernelBranchCall(Val(CI), Val(TI2), Val(EI2), Val(names), native.condition,
+                          tn, en),
+        native.condition, tn, en, tns, ens)
 end
 
 """
@@ -494,7 +486,7 @@ function _partial_speculate_recipes(inner::Plan, bound::Set{ValueId}, excluded::
             part = Recipe(fresh(), Tuple(available[p] for p in node.inputs), (value,),
                           _KernelSourceOp(Val(Symbol(kernel_sourceop_token(r.op), :_arm,
                                                      length(values) + 1)),
-                                          Val(:fused), node.native, node.tensor),
+                                          Val(:fused), node.native),
                           r.cost, nothing, false, node.source)
             push!(recipes, part)
             readable[part.id] = part
@@ -517,14 +509,14 @@ end
 function _partial_speculate_recipe(r::Recipe, reads::Vector{Bool}, refused;
                                    bound_guards::Bool = false)
     r.op isa _KernelSourceOp || return nothing
-    native, tensor = r.op.f, r.op.tensor_f
-    native isa _KernelBranch && tensor isa _KernelBranch || return nothing
+    native = r.op.f
+    native isa _KernelBranch || return nothing
     count = length(r.inputs)
     # The outer cell's bound branch belongs to the lane partition. Inside
     # an unpartitioned arm graph it can use the same protected speculation.
     CI = typeof(native).parameters[1]
     !bound_guards && all(i -> reads[i], CI) && return nothing
-    leaves = _partial_branch_leaves!(Any[], native, tensor, r.source, (), count)
+    leaves = _partial_branch_leaves!(Any[], native, r.source, (), count)
     leaves === nothing && return nothing
     names = _recipe_source_names(r)
     length(names) == count || return nothing
@@ -532,7 +524,7 @@ function _partial_speculate_recipe(r::Recipe, reads::Vector{Bool}, refused;
     plans = Dict{Any,Any}()
     mapping = IdDict{Any,Any}()
     for leaf in leaves
-        parts = _partial_split_leaf(leaf.native, leaf.tensor, leaf.source, length(leaf.positions))
+        parts = _partial_split_leaf(leaf.native, leaf.source, length(leaf.positions))
         # A compound arm can have strict split nodes AND an inline endpoint.
         # Prefer its expanded graph when it exposes more than one recipe, so
         # splitting the surrounding arithmetic does not hide the endpoint.
@@ -569,8 +561,7 @@ function _partial_speculate_recipe(r::Recipe, reads::Vector{Bool}, refused;
             mapping[node.expr] = name
             push!(names, name)
             push!(nodes, (; inputs = leaf.positions[node.own], native = parts.native.wholes[i],
-                            tensor = parts.tensor.wholes[i], source = node.expr,
-                            key = (r.id, leaf.path, i)))
+                            source = node.expr, key = (r.id, leaf.path, i)))
             push!(slots, length(nodes))
             slot[i] = length(slots)
         end
@@ -580,10 +571,9 @@ function _partial_speculate_recipe(r::Recipe, reads::Vector{Bool}, refused;
         plans[leaf.path] = (; plan = Tuple(plan(k) for k in split.root.kids), slots)
     end
     isempty(nodes) && return nothing
-    native2, tensor2 = _partial_rebuild_branch(native, tensor, (), plans, count,
-                                               length(nodes), Tuple(names))
+    native2 = _partial_rebuild_branch(native, (), plans, count, length(nodes), Tuple(names))
     op = _KernelSourceOp(Val(Symbol(kernel_sourceop_token(r.op), :_speculative)),
-                         Val(kernel_sourceop_form(r.op)), native2, tensor2)
+                         Val(kernel_sourceop_form(r.op)), native2)
     (; nodes, op, source = _kernel_split_replace(r.source, mapping))
 end
 
@@ -635,7 +625,7 @@ function _partial_speculate_graph_arm!(nodes, plans, names, mapping,
         key = haskey(speculative, q.id) ? (node_key..., speculative[q.id]) :
                                          (prefix_key..., q.id)
         push!(nodes, (; inputs = [available[canon_id(arm.graph, v.id)] for v in q.inputs],
-                        native = q.op, tensor = q.op, source = q.source, key))
+                        native = q.op, source = q.source, key))
         available[canon_id(arm.graph, only(q.outputs).id)] = slot
     end
     ag = arm.graph
@@ -651,22 +641,20 @@ function _partial_speculate_graph_arm!(nodes, plans, names, mapping,
     cut = _partial_subplan(template, Value[arm.have..., mapped.(frontier)...],
                           Value[mapped(v) for v in arm.want], recipes)
     native = _partial_arm_function(cut)
-    tensor = _partial_arm_function(cut; tensorized = true)
     indices = Tuple(vcat([positions[v.name] for v in arm.have],
                          [available[canon_id(ag, v.id)] for v in frontier]))
-    plans[leaf.path] = (; native, tensor, positions = indices, spec = cut)
+    plans[leaf.path] = (; native, positions = indices, spec = cut)
     mapping[leaf.source] = Expr(:call, QuoteNode(native), (names[i] for i in indices)...)
     nothing
 end
 
 # The arm is a generated function over explicit data inputs, with code-only
 # operations bound as literals and its Plan retained for shared-arm lowering.
-# Like the containing native plate, its native body honors authored output
+# Like the containing native plate, its body honors authored output
 # declarations. This keeps nested calls concrete under Julia's recursive
-# inference heuristic. Its separate tensorized body omits host declarations.
-function _partial_arm_function(p::Plan; tensorized::Bool = false)
-    ast, ops, _ = _lower_with_ops(p; inline_embedded = false,
-                                 tensorized, declare = !tensorized)
+# inference heuristic.
+function _partial_arm_function(p::Plan)
+    ast, ops, _ = _lower_with_ops(p; inline_embedded = false, declare = true)
     popfirst!(ast.args[1].args) # the operation tuple becomes a literal
     bind(ex) = ex === :__ops__ ? QuoteNode(ops) :
         ex isa Expr && !(ex.head in (:quote, :inert)) ?
@@ -677,16 +665,15 @@ end
 
 # The split metadata of one arm and its decomposition from the arm's source,
 # or `nothing` (as `_partial_split_parts` for a whole recipe).
-function _partial_split_leaf(native, tensor, source, count)
-    native isa _KernelSplit && tensor isa _KernelSplit || return nothing
+function _partial_split_leaf(native, source, count)
+    native isa _KernelSplit || return nothing
     shape = _kernel_split_spec(native)
-    _kernel_split_spec(tensor) == shape || return nothing
     ports = collect(Symbol, first(shape))
     length(ports) == count || return nothing
     split = _kernel_split_nodes(source, ports)
     split === nothing && return nothing
     _kernel_split_shape(ports, split) == shape || return nothing
-    (; native, tensor, split)
+    (; native, split)
 end
 
 _partial_plate_recipe(g, recipe, known, op, rewrites) = nothing
@@ -934,7 +921,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
             else
                 # Preserve the broadcast container and concrete element type.
                 # Bool results may use packed BitArrays; bound-array
-                # externalization also supports these at the tensor boundary.
+                # externalization also supports these.
                 result = similar(batch, analysis.cell_types[cid])
                 arguments[cid] = _partial_cell_values!(result, batch)
             end
@@ -1105,9 +1092,8 @@ end
 # (`IllegalTypeAnalysisException`; a one-entry scan trajectory broadcast over
 # guarded observations in `test_scan_capabilities.jl`).  Lane indices are
 # fresh or bound `Int` vectors that nothing writes, so a native lane view needs
-# no unaliasing; its bounds are still checked.  Other operands, and tracing
-# backends, keep `_tensorized_view`.
-@inline _lane_view(x::AbstractArray, lanes) = _tensorized_view(x, lanes)
+# no unaliasing; its bounds are still checked.  Other operands keep `view`.
+@inline _lane_view(x::AbstractArray, lanes) = view(x, lanes)
 @inline function _lane_view(x::Vector, lanes::Vector{Int})
     checkbounds(x, lanes)
     Base.unsafe_view(x, lanes)
@@ -1116,14 +1102,10 @@ end
 # selected lanes. Keep the read-only parent instead: a partition of a gathered
 # argument then needs no new index vector on each evaluation. The bound lane
 # indices and every parent remain borrowed, just as for the dense case above.
-@inline _lane_view(x::SubArray{T,1}, lanes::Vector{Int}) where {T} =
-    _lane_subarray_view(_kernel_source_arg_style(x), x, lanes)
-@inline function _lane_subarray_view(::Val{:native}, x, lanes)
+@inline function _lane_view(x::SubArray{T,1}, lanes::Vector{Int}) where {T}
     checkbounds(x, lanes)
     Base.SubArray(x, (lanes,))
 end
-@inline _lane_subarray_view(::Val{:tensorized}, x, lanes) =
-    _tensorized_view(x, lanes)
 @noinline _lane_gather_mismatch(x, n) = throw(DimensionMismatch(
     "a partitioned plate argument of size $(size(x)) does not match its $n lanes"))
 # The gathered value is typed by the gather's own result (a view of an array
@@ -1181,31 +1163,6 @@ struct _LaneAnchored{F}
 end
 @inline (arm::_LaneAnchored)(anchor, args...) = arm.f(args...)
 
-# An ignored domain anchor does not make a shared branch condition vary by
-# lane. Retain its metadata with shifted argument positions, including when
-# several unused lane inputs anchor the terminal recipe.
-_plate_branch_anchor(operation) = nothing
-function _plate_branch_anchor(operation::_KernelSourceOp{D,F,N,T}) where
-        {D,F,N<:_KernelBranch,T<:_KernelBranch}
-    _KernelSourceOp(Val(D), Val(F), _plate_branch_anchor_metadata(operation.f),
-        _plate_branch_anchor_metadata(operation.tensor_f), operation.ignored_throws)
-end
-function _plate_branch_anchor_metadata(branch::_KernelBranch{CI,TI,EI}) where {CI,TI,EI}
-    shift(indices) = map(index -> index + 1, indices)
-    _KernelBranch(Val(shift(CI)), Val(shift(TI)), Val(shift(EI)),
-        _LaneAnchored(branch.call), branch.condition, branch.then_arm, branch.else_arm,
-        branch.then_spec, branch.else_spec)
-end
-function _plate_branch_anchor(operation::_LaneAnchored)
-    inner = _plate_branch_anchor(operation.f)
-    inner === nothing ? nothing : _plate_branch_anchor(inner)
-end
-@inline function _tensorized_plate_dispatch(operation::_LaneAnchored, args::Tuple)
-    branch = _plate_branch_anchor(operation.f)
-    branch === nothing ? _tensorized_plate_default_call(operation, args) :
-        _tensorized_plate_dispatch(branch, args)
-end
-
 _partition_plate_recipe(g, recipe, known, op, pending, want, fresh) = nothing
 # Branch partitioning likewise consumes the operation metadata dynamically;
 # its residual operation still retains the precise generated kernel type.
@@ -1261,8 +1218,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     # The first branch recipe whose condition reads bound data only.
     target = nothing
     for r in inner.recipes
-        r.op isa _KernelSourceOp && r.op.f isa _KernelBranch &&
-            r.op.tensor_f isa _KernelBranch || continue
+        r.op isa _KernelSourceOp && r.op.f isa _KernelBranch || continue
         CI = typeof(r.op.f).parameters[1]
         ports = [canon_id(inner.graph, r.inputs[i].id) for i in CI]
         all(cid -> haskey(bound, cid), ports) || continue
@@ -1271,7 +1227,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     end
     target === nothing && return nothing
     branch_recipe, cond_ports = target
-    native, tensor = branch_recipe.op.f, branch_recipe.op.tensor_f
+    native = branch_recipe.op.f
     pred = broadcast(native.condition, (bound[cid] for cid in cond_ports)...)
     arms = if pred isa Bool
         # A lane-invariant condition selects its arm statically.
@@ -1285,8 +1241,8 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     # An arm computed only from shared values (a constant fallback such as
     # `-Inf`) does not vary per lane; as its own plate its cell would be one
     # scalar rather than one value per lane. Such an arm is anchored to a
-    # bound lane argument (`_LaneAnchored`, which ignores it) so both the
-    # native loop and the tensorized batch evaluate it per lane. Known lane
+    # bound lane argument (`_LaneAnchored`, which ignores it) so the native
+    # loop evaluates it per lane. Known lane
     # values: bound lane-length vectors and live arguments declared as arrays,
     # plus every cell value computed from one.
     lane_values = Set{ValueId}()
@@ -1336,7 +1292,6 @@ Base.@nospecializeinfer function _partition_plate_recipe(
         # nested branch arm stays a `_KernelBranch` and partitions again).
         positions = typeof(native).parameters[side === :then ? 2 : 3]
         arm_f = getfield(native, side === :then ? :then_arm : :else_arm)
-        arm_tf = getfield(tensor, side === :then ? :then_arm : :else_arm)
         arm_inputs = Value[branch_recipe.inputs[i] for i in positions]
         anchored = !any(v -> canon_id(inner.graph, v.id) in lane_values, arm_inputs)
         spliced = anchored ||
@@ -1347,11 +1302,10 @@ Base.@nospecializeinfer function _partition_plate_recipe(
             (spliced = nothing)
         kernel = if spliced === nothing
             if anchored
-                arm_f, arm_tf = _LaneAnchored(arm_f), _LaneAnchored(arm_tf)
+                arm_f = _LaneAnchored(arm_f)
                 pushfirst!(arm_inputs, anchor)
             end
-            arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form),
-                                     arm_f, arm_tf)
+            arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form), arm_f)
             # The arm recipe's source is its own arm, which a nested branch arm
             # partitions again and a split arm decomposes.
             branch_parts = branch_recipe.source isa Expr ?

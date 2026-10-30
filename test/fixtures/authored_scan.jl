@@ -35,7 +35,7 @@ end
 # co-varying per-step sequences advanced in lockstep — the shape the single-`xs`
 # scan could not author (each per-step operand had to be a broadcast-invariant
 # `Ref`).  It feeds a plate + sum exactly like `authored_scan_arma`, so the same
-# fused/materialized/Reactant lowering paths exercise the multi-sequence step.
+# fused/materialized lowering paths exercise the multi-sequence step.
 @kernel authored_scan_lockstep(a::Vector{Float64}, b::Vector{Float64}) = begin
     seq::Vector{Float64} = scan(a, b; init = 0.0) do carry, ai, bi
         next = ai * carry + bi
@@ -60,10 +60,8 @@ end
 
 # A forward-algorithm-shaped scan over matrix ROWS with a vector carry — the
 # posteriordb hmm_drive_1 shape: `scan(eachrow(mat), Ref(gain); init = seed)`
-# threads a 2-vector belief state and emits a scalar per step. The Reactant
-# lowering keeps a single `stablehlo.while` for this shape (regression:
-# scan-while-claim-5006b5b9); `N == 1` is a first-class case with an empty
-# loop body after the eager first step.
+# threads a 2-vector belief state and emits a scalar per step. `N == 1` is a
+# first-class case with an empty loop body after the eager first step.
 @kernel authored_scan_eachrow(mat::Matrix{Float64}, gain::Float64) = begin
     seed::Vector{Float64} = [-0.6931471805599453, -0.6931471805599453]
     seq::Vector{Float64} = scan(eachrow(mat); init = seed) do carry, row

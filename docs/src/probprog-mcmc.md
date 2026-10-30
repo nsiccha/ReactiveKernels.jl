@@ -1,4 +1,9 @@
-# ProbProg MCMC: compiled NUTS over RK densities
+# ProbProg MCMC: compiled NUTS over RK densities (historical receipt)
+
+> **Historical receipt.** ReactiveKernels no longer has a Reactant path: its
+> Reactant extension, tensorized lowering and Reactant tests were removed. This
+> page keeps the measurements as recorded. Nothing on it runs Reactant, and the
+> RK functions and test files it names no longer exist.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_result_assets()
@@ -84,11 +89,12 @@ does not generalize.
 
 ## The executed harnesses
 
-```@eval
-Main.ReactiveKernelsDocs.render_probprog_mcmc_baselines()
-```
+The sampling harnesses and Turing twins the receipt executed are in
+`benchmark/probprog_mcmc_comparison_body.jl` at the receipt's pinned
+ReactiveKernels commit `958d9344234784a2380a84cea05e779364d43607`. The script
+was removed together with ReactiveKernels' Reactant path.
 
-The RK density enters each harness unmodified: `prepare` binds the data ports
+The RK density entered each harness unmodified: `prepare` binds the data ports
 at preparation (`bound = (; observations, observation_scales)` for Eight
 Schools, `bound = (; X, y, num_classes)` for MNIST), so every harness samples
 a single-argument packed log density. Constraint handling needs no sampler
@@ -96,26 +102,12 @@ support — the packed boundary already folds the `τ = exp(log τ)` transform a
 its Jacobian into the density, which is also why the unconstrained spaces
 match across harnesses.
 
-## Reproduce
+## Provenance
 
-The receipt generator requires a clean detached candidate so its commit pin is
-immutable. From a sibling directory:
-
-```sh
-git -C ReactiveKernels.jl worktree add --detach ReactiveKernels-probprog-receipt HEAD
-cd ReactiveKernels-probprog-receipt
-julia --startup-file=no benchmark/probprog_mcmc_comparison.jl \
-  --output=benchmark/receipts/probprog-mcmc-v1.toml
-julia --startup-file=no benchmark/receipts/validate_probprog_mcmc.jl \
-  benchmark/receipts/probprog-mcmc-v1.toml
-```
-
-The script provisions a fresh environment with Reactant pinned at 0.2.289 plus
-AdvancedHMC, Turing, and MCMCDiagnosticTools, and develops the exact candidate
-with its example packages. For a quick non-publication smoke run, set
-`RK_PROBPROG_MCMC_WARMUP=150` and `RK_PROBPROG_MCMC_SAMPLES=100`; the
-checked-in receipt keeps the publication protocol of 1000 + 1000. Each
-model's ProbProg attempt runs in a subprocess bounded by
-`RK_PROBPROG_MCMC_BUDGET_SECONDS` (default 600); a blown budget records the
-cell as unsupported rather than waiting. Note that ProbProg is a fast-moving
-`/dev` surface of Reactant — this page pins the exact version it measured.
+The receipt was generated from a clean detached checkout of the pinned commit
+above, in a fresh environment with Reactant pinned at 0.2.289 plus
+AdvancedHMC, Turing and MCMCDiagnosticTools, with the publication protocol of
+1000 warmup and 1000 retained draws. Each model's ProbProg attempt ran in a
+subprocess under a hard wall-clock budget (recorded in the receipt protocol).
+`benchmark/receipts/validate_probprog_mcmc.jl` still validates the checked-in
+receipt.

@@ -95,7 +95,6 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
             "render_manual_derivative_rule_cuts()",
             "render_manual_derivative_rule_source()",
             "result.residuals",
-            "Not generated: rule emission into EnzymeMLIR",
         )
         @test occursin(marker, manual_rules_docs)
     end
@@ -117,10 +116,11 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     @test occursin("declarations have been removed", nuts)
     @test occursin("The source below is the macro-free executable fixture", nuts)
 
-    # The review-first docs hierarchy keeps the detailed Reactant result on a
-    # static receipt page rather than repeating it on README, index, and the
+    # RK's Reactant path is removed; its NUTS result stays on a static,
+    # historical receipt page rather than on README, index, or the
     # source-oriented NUTS page.
     for marker in (
+            "**Historical receipt.**",
             "packages/ReactiveKernelsNUTSExamples/src/nuts_runtime/kernel_nuts_reactant.jl",
             "test/test_kernel_nuts_reactant.jl",
             "render_nuts_reactant_benchmark()",
@@ -168,7 +168,6 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "`structured_state_port(compiled_transition)`",
         "`StatefulStateValue`",
         "`rng_provider(State; normal_fill, bool_draw, exp_draw)`",
-        "`rng_provider(Val(:reactant))`",
         "`OrderedRNGReplay`",
         "`effect_lowering_port`",
         "`total_functional_lowering`",
@@ -178,10 +177,8 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         "internal conservative compiler rule",
         "a fill count, and\na sticky overflow flag",
         "explicitly recompile",
-        "no Reactant implementation",
         "one global\nordered event tape/cursor",
         "Native execution\ntherefore uses a standard Julia `AbstractRNG` directly",
-        "does not promise stream parity\nwith a Julia `AbstractRNG`",
         "exact recursive state layout, owned-array axes,\ncanonical aliases",
         "It does\nnot mislabel that token as an ordinary source callback",
         "authored Float64 `randexp`\nresult",

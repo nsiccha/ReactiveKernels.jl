@@ -65,19 +65,3 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
 Named nodes make alternate boundaries cheap: `want = :pointwise` cuts the same
 plate to the per-word marginal log-likelihoods; `want = :prior` or `:log_jacobian`
 prunes the likelihood entirely.
-
-## Reactant
-
-The exact authored graph compiles and executes through the public Reactant
-boundary with value and gradient parity — `benchmark/batch_textnn_gate.jl`
-`@compile`s both the primal and the gradient and asserts they match the native
-evaluation and the reference `.stan` (via BridgeStan). The in-graph sum-to-zero
-basis construction (comparison masks + matmul, all data-only) lowers cleanly, and
-the per-word integer gathers and the marginalizing `log_sum_exp` compile without
-special handling.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.LDAExample.demo()'
-```

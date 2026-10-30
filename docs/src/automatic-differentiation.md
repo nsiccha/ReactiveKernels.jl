@@ -188,9 +188,8 @@ keeps that sweep's writes. `ad_retains_primal_sweep(backend)` states it: core
 RK knows no engine and answers `false`, and the Enzyme extension declares
 reverse-mode `AutoEnzyme`. Preparation refuses other backends, which may
 evaluate perturbed points (finite differences), carry dual numbers, or
-restore mutated memory in the reverse pass. Retention is native: a
-`NonAllocatingKernel` and compiled (Reactant) staging do not retain values
-yet. `test/test_ad_retained_outputs.jl` checks the values, gradients and
+restore mutated memory in the reverse pass. A `NonAllocatingKernel` does not
+retain values yet. `test/test_ad_retained_outputs.jl` checks the values, gradients and
 refusals.
 
 ## Jacobian-vector and Hessian-vector products
@@ -259,8 +258,7 @@ direction and each result is a tuple of components). DifferentiationInterface
 0.7.21 cannot yet take a forward-over-reverse Hessian-vector product at such
 a structured point. A `NonAllocatingKernel` supports pushforwards; its
 Hessian-vector products fail Enzyme's static activity analysis, so take them
-from the dataflow kernel. Reactant-compiled pushforwards and Hessian-vector
-products are not provided; these operators run natively.
+from the dataflow kernel.
 
 ### Third-order directional derivatives
 
@@ -299,8 +297,8 @@ because every cross term `D³f[vᵢ, vⱼ, ·]` vanishes. A population with `K`
 effects per subject therefore needs `K` directions for every subject's
 contraction, whatever the number of subjects. A bilinear contraction follows
 by polarization, `D³f[w, v, ·] = (D³f[w + v, w + v, ·] - D³f[w - v, w - v, ·]) / 4`.
-The tuple-selector, non-allocating and Reactant boundaries of Hessian-vector
-products apply unchanged: on Julia 1.10 a `NonAllocatingKernel`'s third-order
+The tuple-selector and non-allocating boundaries of Hessian-vector products
+apply unchanged: on Julia 1.10 a `NonAllocatingKernel`'s third-order
 derivatives fail Enzyme's static activity analysis, as its Hessian-vector
 products do.
 
@@ -369,9 +367,9 @@ plate_gradient = ad_gradient(prepared_plate, parameters)
 
 Here `log(d)` runs during preparation and its cached values feed the live plate.
 Each data-only recipe uses its own broadcast coordinates, including singleton
-axes. Rebinding rebuilds the cache. Native execution, prepared AD, and Reactant
-consume the same residual graph. The focused native and Reactant tests exercise
-this example without adding an AD toolchain to the documentation build.
+axes. Rebinding rebuilds the cache. Native execution and prepared AD consume
+the same residual graph. The focused tests exercise this example without adding
+an AD toolchain to the documentation build.
 
 Caching adds preparation work and storage; cheap arithmetic may gain nothing or
 run slower. Original data arguments remain retained for shape validation even
@@ -400,8 +398,6 @@ its result; recipes that then read only bind-time values, such as a
 `reduce(vcat, …)` over its cells, are evaluated with it. Such an array result
 beside a live non-atomic input keeps its
 original execution, so a plate's output never stores the shared cached arrays.
-Under Reactant a tensorized plate still needs rectangular
-per-lane arrays; ragged lanes are refused there with or without the cache.
 Recipes still follow the pure-operation contract.
 An inline expression such as `theta * log(d)` is split along its authored
 structure: `log(d)` is cached and the cell computes `theta *` that value (see
@@ -454,8 +450,6 @@ The focused executable authority is
   objective and distribution gradient receipts.
 - [PPL automatic differentiation](ppl-ad.md) puts reviewed Eight Schools and
   MNIST model gradients first.
-- [Automatic differentiation through Reactant](reactant-ad.md) documents the
-  compiled prepared-AD boundary without making Reactant a docs dependency.
 
 The same native prepared boundary is also checked across bijectors and the
 remaining PPL walkthroughs. These checks establish correctness coverage; they do

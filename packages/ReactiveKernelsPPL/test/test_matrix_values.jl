@@ -479,7 +479,7 @@ end
         bound = bind_data(plan, case.data)
         built = build_kernel(bound)
         code = string(kernel_expr(bound, built.layout))
-        @test occursin("_tensorized_view", code) && !occursin(r"\w\[:, ", code)
+        @test occursin("Base.view(", code) && !occursin(r"\w\[:, ", code)
         observations = prepare_query(built, bound, :observations)
         u = [0.1i for i in 1:built.layout.total]
         first = Base.invokelatest(observations, u)

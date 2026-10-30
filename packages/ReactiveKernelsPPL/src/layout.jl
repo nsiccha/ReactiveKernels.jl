@@ -542,9 +542,8 @@ _simplex_logit(z::Real) = log(z) - log1p(-z)
     ordered_constrain(u) -> Vector
 
 Host-side ordered transform (Stan `ordered`): `y[1] = u[1]`,
-`y[i] = y[i-1] + exp(u[i])`. The native in-graph transform uses the same
-recurrence; its traced array expression is mathematically equivalent and may
-differ in floating-point rounding.
+`y[i] = y[i-1] + exp(u[i])`. The in-graph transform uses the same
+recurrence.
 Like every host transform, it follows the input's number type and returns
 `Float64` values for plain reals.
 """
@@ -559,7 +558,6 @@ end
 
 # The packed sampler input stays read-only. Native execution builds the
 # constrained vector in one fresh buffer, then reuses it for the prefix sum.
-# The traced path retains the vector expression used by the compiled backend.
 @inline function _ordered_constrain_native(u::AbstractVector{Float64})
     y = Vector{Float64}(undef, length(u))
     isempty(u) && return y
@@ -573,14 +571,8 @@ end
     return y
 end
 
-@inline function _ordered_constrain_kernel(u::AbstractVector{Float64}, lo::Int, hi::Int)
-    # Value-level is_traced walks an IdSet that native Enzyme cannot differentiate.
-    if ReactiveKernels.ReactantCore.within_compile()
-        return cumsum(vcat(Float64.(view(u, lo:lo)),
-            exp.(view(u, lo + 1:hi))))
-    end
-    return _ordered_constrain_native(view(u, lo:hi))
-end
+@inline _ordered_constrain_kernel(u::AbstractVector{Float64}, lo::Int, hi::Int) =
+    _ordered_constrain_native(view(u, lo:hi))
 
 # Build the native simplex and its log-Jacobian in one pass. Only the fresh
 # result is written; the packed coordinates remain read-only. The loop count
@@ -603,20 +595,8 @@ end
     return p, jac
 end
 
-@inline function _simplex_constrain_logjac_kernel(u::AbstractVector{Float64},
-                                                  lo::Int, hi::Int)
-    if ReactiveKernels.ReactantCore.within_compile()
-        K = hi - lo + 2
-        z = 1.0 ./ (1.0 .+ exp.(-(
-            ReactiveKernels._tensorized_view(u, lo:hi) .+
-                log.(K .- (1:(K - 1))))))
-        l = log1p.(-z)
-        lr = cumsum(vcat(0.0, l))
-        return exp.(lr) .* vcat(z, ones(1)),
-            sum(lr[1:(K - 1)] .+ log.(z) .+ l)
-    end
-    return _simplex_constrain_logjac_native(u, lo, hi)
-end
+@inline _simplex_constrain_logjac_kernel(u::AbstractVector{Float64}, lo::Int, hi::Int) =
+    _simplex_constrain_logjac_native(u, lo, hi)
 
 """Inverse of [`ordered_constrain`](@ref)."""
 function ordered_unconstrain(y::AbstractVector{<:Real})
@@ -649,9 +629,9 @@ the middle layer owns layout+transforms, the LKJ-factor precedent):
 break fractions `z[j] = σ(u[j] + log(K-j))`, stick remainders
 `r[j] = Π_{i<j} (1 - z[i])` (in closed form, `exp` of the running sum of
 `log1p(-z)`), `s[j] = r[j]*z[j]`, `s[K] = r[K]`. Empty input constrains
-to `[1.0]` (the deterministic 1-simplex, as in Stan). The traced in-graph
-twin uses these vector operations; native execution fuses them into one
-result buffer and a scalar log-Jacobian.
+to `[1.0]` (the deterministic 1-simplex, as in Stan). The in-graph
+transform fuses these vector operations into one result buffer and a scalar
+log-Jacobian.
 """
 function simplex_constrain(u::AbstractVector{<:Real})
     length(u) == 0 && return [one(_host_eltype(u))]
@@ -660,8 +640,7 @@ function simplex_constrain(u::AbstractVector{<:Real})
 end
 
 # Break fractions `z` (K−1), `l = log1p(-z)` (K−1), and log stick remainders
-# `lr` (K, `lr[1] = 0`) of the stick-breaking simplex — the vector operations
-# used by the traced in-graph twin.
+# `lr` (K, `lr[1] = 0`) of the stick-breaking simplex.
 function _simplex_breaks(u::AbstractVector{<:Real})
     K = length(u) + 1
     z = 1.0 ./ (1.0 .+ exp.(-(_host_real.(u) .+ log.(K .- (1:(K - 1))))))
@@ -1483,9 +1462,9 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
     return total
 end
 
-# Entry-level vector edges (host side). The traced in-graph twins in
-# `_vector_transform_statements`/`jacobian_term` use the same vector
-# operations. Native simplex execution uses the equivalent fused loop.
+# Entry-level vector edges (host side). `_vector_transform_statements` and
+# `jacobian_term` use the same vector operations in the graph; native simplex
+# execution uses the equivalent fused loop.
 _vector_constrain(e::LayoutEntry, seg) =
     e.transform === :identity ? Vector{_host_eltype(seg)}(seg) :
     e.transform === :ordered ? ordered_constrain(seg) :
@@ -1550,9 +1529,7 @@ end
 """
     coordinate_read(offset) -> Expr
 
-Scalar packed-coordinate read (`unconstrained[o]`). Compiled tracing lowers
-the kernel's integer read of a traced vector to the value-identical
-one-element reduction (`ReactiveKernels._tensorized_getindex`).
+Scalar packed-coordinate read (`unconstrained[o]`).
 """
 coordinate_read(offset::Int) = :(unconstrained[$offset])
 
@@ -1745,14 +1722,13 @@ end
 # companion `logjac` plate supplies the per-cell Jacobian this block's
 # `jacobian_term` sums (pruned by have→want when the Jacobian is not wanted).
 # A real-support block (per-cell latents, elementwise arrays, GLM vectors) is
-# its packed coordinates, read in place with no transform or Jacobian. Compiled
-# tracing reads the same block as a slice (`ReactiveKernels._tensorized_view`).
+# its packed coordinates, read in place with no transform or Jacobian.
 function _plate_transform_statements(e::LayoutEntry)
     lo = e.offset
     hi = e.offset + e.size - 1
     view_read = :(view(unconstrained, $lo:$hi))
     e.transform === :identity && return Expr[:($(e.name)::AbstractVector{Float64} =
-        ReactiveKernels._tensorized_view(unconstrained, $lo:$hi))]
+        Base.view(unconstrained, $lo:$hi))]
     if e.transform === :interval
         # Parameterized bounds ⇒ not in the (parameterless) bijector registry;
         # hand-rolled broadcast edges over the block view, with the host
@@ -1813,16 +1789,11 @@ _vector_simplex_logjac(e::LayoutEntry) = Symbol(:_ppl_simplex_logjac_, e.name)
 # Leveled vector edges (thresholds, threshold-coefficient packs,
 # simplexes): ONE vector-valued statement chain per entry, bound to the
 # entry's own name, whatever its (data-inferred) level count — the
-# statement count and the traced program do not grow with K (core
-# constraint 1). Traced execution uses the host vector mathematics;
-# native ordered and simplex execution use runtime loops.
+# statement count does not grow with K (core constraint 1). Ordered and
+# simplex execution use runtime loops.
 # Consumers gather from the vector (`Ref(v)` plate inputs, `v[idx]`).
-# The traced ordered path materializes its leading slice: a `vcat` mixing a
-# `SubArray` and a `Vector` lowers through a Union-typed path the native
-# Enzyme reverse pass rejects. Native ordered execution uses one buffer.
-# The native simplex path reads packed coordinates directly. Traced arrays
-# use an array slice through `_tensorized_view`, avoiding Reactant's nested
-# SubArray reindexing.
+# Native ordered execution uses one buffer. The native simplex path reads
+# packed coordinates directly.
 # Size specializations
 # (empty packs emit nothing — their consumers never read them; a one-element
 # ordered vector is its coordinate; a 1-simplex is the constant `[1.0]`)
@@ -1842,8 +1813,8 @@ function _vector_transform_statements(e::LayoutEntry)
     end
     if e.transform === :identity
         e.size == 0 && return Expr[]
-        # Materialize the ordinary range slice. A traced SubArray cannot
-        # be reindexed by the cumulative-cutpoint validity reduction.
+        # Materialize the ordinary range slice for the cumulative-cutpoint
+        # validity reduction.
         return Expr[:($(e.name)::AbstractVector{Float64} =
             unconstrained[$lo:$hi])]
     end

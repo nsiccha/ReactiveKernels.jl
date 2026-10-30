@@ -53,21 +53,5 @@ bound_kernel(q, responses)          # == the unbound kernel's density
 The optimization is not cosmetic. The unbound kernel recomputes the standardized
 design matrix on every call; the bound kernel does not, so its residual call
 allocates strictly less. `bound` is a general Plan → Plan partial-evaluation
-pre-pass — the same mechanism `prepare`, `prepare_ad`, and the Reactant boundary
-all consume — not a regression-specific shortcut: any subgraph that reads only
+pre-pass — the same mechanism `prepare` and `prepare_ad` both consume — not a regression-specific shortcut: any subgraph that reads only
 bound ports is hoisted, whatever the model.
-
-## Reactant
-
-Both the plain and the `bound` kernels compile and execute through the public
-Reactant boundary with value parity — `test/test_ppl_examples_reactant.jl`
-`@compile`s each and asserts the compiled result matches native. The bound
-kernel's hoisted standardized design matrix re-enters the compiled program as a
-constant, exactly as it does natively.
-
-Run the walkthrough — it prints the plain and bound kernels' input signatures and
-densities — from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.BoundRegressionExample.demo()'
-```

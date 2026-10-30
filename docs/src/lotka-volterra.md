@@ -38,9 +38,7 @@ active values in the problem object and can force Enzyme runtime-activity
 analysis. The natural adaptive call remains a foreign opaque node. Accepted
 evidence for this node: native primal/value plus ordinary-Reverse gradient,
 supported via landed core fix `55da875`/`f8acaa1` for snag
-`plain-enzyme-rev-3dc5d563`. Compiled Reactant primal/gradient is
-unsupported pending the separate Reactant survey; that resolution may change
-this boundary.
+`plain-enzyme-rev-3dc5d563`.
 
 The panel below shows three views of the model: **Raw input** (the exact
 executed source), a readable **Generated kernel**, and the **Compute DAG**.

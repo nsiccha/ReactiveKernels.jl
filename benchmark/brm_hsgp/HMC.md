@@ -1,5 +1,9 @@
 # Exact motorcycle model: native and Reactant HMC
 
+> **Historical analysis.** ReactiveKernels no longer has a Reactant path. The
+> Reactant numbers here were measured with that removed path, and the scripts
+> that produced them were removed with it.
+
 Reactant is **about 2.3× faster at 1,000 transitions per batch** in both measured
 coordinate frames. These are RK implementations: native uses prepared Enzyme;
 Reactant compiles Enzyme differentiation together with the existing authored

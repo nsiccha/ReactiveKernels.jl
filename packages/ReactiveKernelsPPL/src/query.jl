@@ -169,17 +169,6 @@ world-age safe (callable from compiled functions), but the RAW returned
 kernel closes over build-time eval'd code: call it from top level, wrap
 the call in `Base.invokelatest`, or use [`SamplerQuery`](@ref), whose
 call paths carry the barrier.
-
-Under Reactant the barrier goes AROUND the compile, never inside the traced
-call: `Reactant.@compile kernel(Reactant.to_rarray(u))` at top level, or
-`Base.invokelatest(Reactant.compile, kernel, (Reactant.to_rarray(u),))` from
-an older world. A traced wrapper `u -> Base.invokelatest(kernel, u)` is
-opaque to Reactant's tracing overlay and to RK's tensorized lowering, so the
-packed scalar reads `unconstrained[i]` reach Reactant's scalar-indexing ban
-and fail with `Scalar indexing is disallowed` (measured on Reactant 0.2.285
-with the earlier `sum(view(unconstrained, i:i))` spelling, which fell through
-to Base's scalar `mapreduce`; `test_reactant_joint.jl` pins the working
-shape).
 """
 function prepare_query(built, plan::StructuralPlan, preset::Symbol;
         on_error = nothing, exemplars = nothing)
@@ -319,11 +308,7 @@ end
 Reusable sampler-space density + gradient over a built program: the prepared
 `:posterior` value kernel plus its `prepare_ad` gradient preparation.
 Construct with [`prepare_sampler`](@ref); not thread-safe (one per caller).
-The call paths below carry a `Base.invokelatest` barrier, so they are not
-traceable by Reactant; compile the fields directly instead —
-`Reactant.@compile q.kernel(traced_u)` for the value and
-`compile_ad_value_and_gradient(q.ad, traced_u)` for value + gradient (see
-[`prepare_query`](@ref)).
+The call paths below carry a `Base.invokelatest` barrier.
 
 The barrier copies nothing: a gradient call allocates only what the prepared
 gradient itself allocates, and a value call adds one boxed `Float64`.
@@ -391,7 +376,7 @@ independent summed plate with one to four active coordinates. It differentiates
 the unchanged generated kernel, including priors and transforms. Explicit
 reverse mode, wider, effectful, scan, and retained-output programs keep the
 ordinary reverse preparation. The opt-in forward preparation keeps a reverse
-operator for traced calls and a later input with a different active shape.
+operator for a later input with a different active shape.
 
 `nonallocating = true` prepares the density and its gradient over
 `ReactiveKernels.prepare_nonallocating`, which needs `using MutatingFunctions`
@@ -403,8 +388,7 @@ ordinary sampler's. The density is usually faster, and loses less when another
 allocating process shares the CPU core; the reverse gradient is faster on some
 programs and slower on others, so measure both on the model you fit. The
 query keeps the buffers, which is why a query serves one caller at a time.
-The kernel and gradient are native only (ReactiveKernels does not compile a
-non-allocating kernel with Reactant). Native forward batching does not apply,
+Native forward batching does not apply,
 and ReactiveKernels does not build retained outputs over a non-allocating
 kernel yet, so `retain` fails there.
 """
@@ -513,7 +497,7 @@ argument: `ad_gradient(q, u)`, `ad_value_and_gradient!(q, g, u)`,
 `ad_third(q, tangents, u)`, `ad_gradient_hvp_and_third(q, tangents, u)` and
 their other value/in-place forms. Each call carries the `Base.invokelatest` barrier
 the query's build-time code needs, so they are safe from compiled callers.
-Not thread-safe (one per caller); not traceable by Reactant.
+Not thread-safe (one per caller).
 """
 mutable struct QueryAD{P,L}
     const prepared::P

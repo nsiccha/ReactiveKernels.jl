@@ -454,7 +454,7 @@ end
 # A pure endpoint body is straight-line: loops, closures, comprehensions and
 # statement-position branches are control flow.  A branch in VALUE position
 # — a ternary, an `if` expression that is the body's result, `a && b` — is a
-# lazy selection the recipe lowering owns (`_kernel_tensorized_rhs`), so it
+# lazy selection the recipe lowering owns (`_kernel_branch_parts`), so it
 # is straight-line like any other expression.  An authored `plate(...) do`
 # cell is likewise an RK subgraph the recipe lowering owns
 # (`_kernel_authored_plate_expr`), not an opaque closure: it is straight-line

@@ -10,7 +10,6 @@ const EXAMPLE_PACKAGES = (
     "ReactiveKernelsStreamingStats",
     "ReactiveKernelsHMCDiagnostics",
     "ReactiveKernelsPPL",
-    "ReactiveKernelsReactantODESolvers",
 )
 
 # No arguments test every package. Package names restrict the run to those

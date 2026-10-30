@@ -150,12 +150,12 @@ with `--project=<dir>`.
 | Entry points | Reason |
 |---|---|
 | `eight_schools_primal_comparison.jl`, `mnist_logistic_comparison.jl`, `partial_evaluation_comparison.jl`, `distributions_comparison.jl`, `scalar_distribution_gallery_comparison.jl`, `structured_distributions_comparison.jl` | Primal only; Enzyme is not in the timed region. |
-| `nuts_microbench.jl`, `nuts_microbench_ca9.jl`, `nuts_reactant_comparison.jl`, `cggibbs/`, `gibbs_poc/` | Analytic gradients; no Enzyme. |
+| `nuts_microbench.jl`, `nuts_microbench_ca9.jl`, `cggibbs/`, `gibbs_poc/` | Analytic gradients; no Enzyme. |
 | `fair_posteriordb_{b3,glm,gp,linear,mh,more}.jl`, `faithful_posteriordb.jl`, `faithful_staging.jl`, `all_sides_gaussian_regression.jl`, `all80_posteriordb.jl` and the `all80-env` scripts | They install and time a Mooncake comparator side, so running either variant would also run Mooncake. They become eligible once that side is removed. |
-| `*_reactant_*_comparison.jl`, `eval_throughput_comparison.jl`, `probprog_mcmc_comparison.jl`, `sampler_transpiler/`, `reactant_hmc_loop_*.jl`, `brm_hsgp/` | They depend on Reactant; Reactant suites are not part of this rollout. |
+| `eval_throughput_comparison.jl`, `sampler_transpiler/`, `brm_hsgp/` | Excluded while they depended on Reactant; not yet checked under the variants. |
 | `repro_*`, `probe_*`, `*_mwe.jl`, `joint_stan_tiled/`, `native_bdf/` | Reproducers and feasibility checks, not timing suites. |
 | `*_gate*.jl`, `*_fixture*.jl`, `*_corpus.jl`, `test_*_fixture.jl`, `verify_rename.jl` | Acceptance gates and fixtures; no timed comparison. |
-| `native_position_*`, `benchmark_nested_construction.jl`, `borrowed_batch_instances.jl`, `dose_outer_superposition/`, `reactant_handoff/`, `pathfinder_oracle/`, `walnuts_oracle/` | No Enzyme. |
+| `native_position_*`, `benchmark_nested_construction.jl`, `borrowed_batch_instances.jl`, `dose_outer_superposition/`, `pathfinder_oracle/`, `walnuts_oracle/` | No Enzyme. |
 
 Historical receipts in `receipts/` stay unchanged as records of their
 single-environment runs.

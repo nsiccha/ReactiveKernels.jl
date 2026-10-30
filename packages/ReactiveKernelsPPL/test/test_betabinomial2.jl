@@ -1,8 +1,7 @@
 # BetaBinomial2 response (SB `beta_binomial` mirror): surface admission,
 # value parity vs a Distributions.jl hand oracle (literal / Gamma-sampled /
 # per-observation / modeled phi, column / literal trials),
-# Enzyme-vs-findiff gradients, Reactant/XLA value+grad (in
-# test_betabinomial2_reactant.jl), and SB-parity
+# Enzyme-vs-findiff gradients, and SB-parity
 # probes (B1/B2 N=80, peer BridgeStan pins from brief
 # 2026-09-26T11-18-32-809-1kc4kdo; P3 modeled-precision N=6, pins from
 # term-nuisance spec brief 2026-09-27T14-14-33-651-1mcop44).

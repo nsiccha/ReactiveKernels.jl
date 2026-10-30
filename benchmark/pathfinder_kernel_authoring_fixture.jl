@@ -67,9 +67,8 @@ deterministic and backend-neutral; RNG ownership stays with the caller.
     # Algorithm 4 local Gaussian: mean = theta + Sigma * grad(log p).
     mean::Vector{Float64} = position .+ covariance * gradient
     covariance_factorization = cholesky(Symmetric(covariance))
-    # Use the factorization's generic packed-factor surface. Native Cholesky
-    # and the Reactant extension's traced Cholesky both store the
-    # authoritative upper factor there.
+    # Use the factorization's generic packed-factor surface, where Cholesky
+    # stores the authoritative upper factor.
     covariance_factor = UpperTriangular(covariance_factorization.factors)
     elbo_draws::Matrix{Float64} =
         mean .+ transpose(covariance_factor) * elbo_standard_draws
@@ -176,7 +175,7 @@ function run_single_path(
     )
 end
 
-"""Deterministic correlated-Gaussian fixture shared by native and Reactant gates."""
+"""Deterministic correlated-Gaussian fixture shared by the native gates."""
 function pathfinder_fixture_inputs()
     precision = [1.5 0.25; 0.25 0.8]
     positions = [

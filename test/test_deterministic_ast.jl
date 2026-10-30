@@ -125,9 +125,8 @@ end
                               want = :total, bound = (; data, scale = 2.0, n = 8))
     k1, k2 = bound_prepare(), bound_prepare()
     @test typeof(k1) === typeof(k2)                    # one PreparedKernel type
-    @test k1.f isa ReactiveKernels._EmbeddedFunctionPair
+    @test k1.f isa ReactiveKernels._ArrayFunction
     @test typeof(k1.f.native) === typeof(k2.f.native)
-    @test typeof(k1.f.tensorized) === typeof(k2.f.tensorized)
     # Same RGF id ⇒ one cached body: the compiled expressions are identical.
     @test _RGF.get_expression(k1.f.native) == _RGF.get_expression(k2.f.native)
     @test k1(amounts) == k2(amounts)

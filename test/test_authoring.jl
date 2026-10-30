@@ -340,21 +340,18 @@ end
         @test indexed_counter_kernel(2.0) == 3.0
         @test calls[:out][] == 1
 
-        # The tensorized companion turns indexing into calls, so `begin`/`end`
-        # inside an index must already be resolved against the indexed array
-        # (a traced body otherwise fails with `UndefVarError: end`). Natively
-        # its wrappers reduce to Base, so evaluating the rewrite checks it.
-        tensorized(body) = eval(Expr(:->, :(u, M, v),
-            ReactiveKernels._kernel_tensorized_rhs(body)))
+        # A rewrite that turns indexing into a call (RKPPL's gathers) must
+        # resolve `begin`/`end` inside an index against the indexed array
+        # first (`_kernel_ref_indices`), as Julia does while lowering `a[...]`.
+        as_call(ref) = Expr(:call, :getindex, ref.args[1],
+            ReactiveKernels._kernel_ref_indices(ref.args[1], ref.args[2:end])...)
         u = [1.0, 2.0, 3.0]; M = [1.0 2.0; 3.0 4.0; 5.0 6.0]; v = [2, 3]
         for body in (:(u[end:-1:1]), :(u[end]), :(u[begin]), :(u[begin+1:end]),
                      :(M[end, 1]), :(M[1, end]), :(M[end, :]), :(u[v[end]]),
-                     :(u[end - v[begin]]), :((2 .* u)[end]),
-                     :(let w = copy(u); w[end] = 0.0; w end))
-            @test Base.invokelatest(tensorized(body), u, M, v) ==
+                     :(u[end - v[begin]]))
+            @test Base.invokelatest(eval(Expr(:->, :(u, M, v), as_call(body))), u, M, v) ==
                 Base.invokelatest(eval(Expr(:->, :(u, M, v), body)), u, M, v)
         end
-        @test u == [1.0, 2.0, 3.0]
 
         @test_throws ArgumentError macroexpand(@__MODULE__, quote
             @kernel same_name(same_name) = same_name
@@ -1708,12 +1705,15 @@ end
             combined_shadow = merge(shadowed_before, shadowed_binding.after)
             @test prepare(combined_shadow; want = (:a, :b))(0.3) == independent_values
 
+            # A whole-recipe call `a = call(x)` keeps the helper bound when
+            # the kernel is defined, `@traceable` or not, so rebinding the
+            # local afterwards does not change it.
             captured_binding = AuthoringCapturedCallBindingFixture
             captured_before = captured_binding.make_before()
-            @test prepare(captured_before)(0.3) == 2.3
+            @test prepare(captured_before)(0.3) == 1.3
             @test prepare(captured_binding.after)(0.3) == 1.3
             combined_capture = merge(captured_before, captured_binding.after)
-            @test prepare(combined_capture; want = (:a, :b))(0.3) == (2.3, 1.3)
+            @test prepare(combined_capture; want = (:a, :b))(0.3) == (1.3, 1.3)
 
             changed_binding = AuthoringChangingCallBindingFixture
             @test prepare(changed_binding.before)(0.3) == exp(0.3)

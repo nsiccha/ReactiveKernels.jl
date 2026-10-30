@@ -131,9 +131,7 @@ using LogExpFunctions: xlogy
     # Full E_deaths grid: Stan's day-1 special case E_deaths[1,m] =
     # 1e-15 * prediction[1,m] (= 1e-15 * y[m]), the closed-form imputation days
     # 2:N0, then the renewal days. `permutedims(reduce(hcat, eds))` is the
-    # materialization that lowers through Reactant; `reduce(vcat,
-    # permutedims.(eds))` does not (traced-size typeassert), and `stack(eds)`
-    # is transposed (vectors become columns).
+    # materialization; `stack(eds)` is transposed (vectors become columns).
     edmat = vcat(permutedims(1e-15 .* y), ed_early,
                  permutedims(reduce(hcat, eds)))[1:N2, :]
 
@@ -245,7 +243,7 @@ scan over days i = 2:N2 whose NamedTuple carry threads a per-country
 shift-register prediction buffer plus cumulative infections over the renewal
 days, an exact closed-form block for the imputation days, and Stan's day-1
 `E_deaths` special case as its own node, so the natural sequential semantics
-stay ordinary-Enzyme-clean and lower through Reactant.
+stay ordinary-Enzyme-clean.
 Raw PosteriorDB arrays (`X`, `EpidemicStart`, `N`, `deaths`, `SI`, `f`, `pop`
 and the four dimension scalars) are the only data ports; the covariate reshape,
 the full observed-grid mask, the deaths grid, and the count log-factorial are

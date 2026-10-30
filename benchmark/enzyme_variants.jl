@@ -12,8 +12,8 @@
 #       --output=<path.toml>
 #
 # The derived environments are not precompiled as a whole: the script compiles
-# only the packages it loads, so unrelated environment members (for example
-# Reactant in the shared distributions project) are neither loaded nor built.
+# only the packages it loads, so unrelated environment members are neither
+# loaded nor built.
 
 import Pkg
 import TOML

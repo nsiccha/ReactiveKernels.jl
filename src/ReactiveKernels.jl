@@ -17,7 +17,6 @@ See the design brief this package implements for the full rationale.
 module ReactiveKernels
 
 using RuntimeGeneratedFunctions
-import ReactantCore
 import OutputSignatures
 using InverseFunctions: inverse, NoInverse
 using LinearAlgebra
@@ -99,7 +98,6 @@ export prepare_ad_pushforward, ad_pushforward, ad_value_and_pushforward
 export prepare_ad_hvp, ad_hvp, ad_hvp!, ad_gradient_and_hvp, ad_gradient_and_hvp!
 export prepare_ad_third, ad_third, ad_third!, ad_gradient_hvp_and_third,
     ad_gradient_hvp_and_third!
-export compile_ad_gradient, compile_ad_value_and_gradient
 export lower, lower_with_ops, lower_batched, replica, plate_body, plate_cell, scan_body, transform, compile
 export prepare_batched, vectorize
 export NativeScheduling

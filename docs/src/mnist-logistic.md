@@ -34,11 +34,10 @@ The coefficient prior reuses the shared
 the per-observation likelihood reuses a [`categorical_logit`](distributions.md)
 object — a softmax categorical over one logits vector — exactly as Eight
 Schools reuses `normal` per observation. The model says this directly as
-`plate(eachcol(logits), y)`: ordinary Julia executes the scalar plate, while
-Reactant lowers the same authored plate generically as batched column slices
-and traced gathers. The numerically stable log-sum-exp normalizer remains in
-the distribution object, not in the model. There is one likelihood expression,
-with no compiler-specific alternate body or private MNIST adapter.
+`plate(eachcol(logits), y)`, and ordinary Julia executes the scalar plate. The
+numerically stable log-sum-exp normalizer remains in the distribution object,
+not in the model. There is one likelihood expression, with no private MNIST
+adapter.
 
 The panel below shows the **Raw input** (the source), the readable **Generated
 kernel** derived from the executed kernel and selected plan, and the **Compute
@@ -92,7 +91,9 @@ fixed during preparation. Fixed `X`, `y`, and `num_classes` are the public
 partial-evaluation variant. With two model sources, the sampler headline is a
 20-cell matrix from the packed coefficient vector to the full joint; every one
 must be supported. Nonallocating AD and nonallocating Reactant remain explicit
-API exclusions until those public kernel types compose.
+API exclusions until those public kernel types compose. ReactiveKernels has
+since removed its Reactant path; the Reactant configurations' receipts stay as
+recorded.
 
 The receipt prepares the authored graphs from two starting boundaries —
 `Packed unconstrained` (a sampler's flattened `[vec(W); b]` vector) and

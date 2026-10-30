@@ -106,32 +106,6 @@ end
           0.7 * (sum(2.0 .* bound.x1) + sum(length, values(bound)[2:end]))
 end
 
-@testset "marker searches over a wide argument list infer in one frame" begin
-    n = 600
-    T = Tuple{(_wide_column_type(i) for i in 1:n)...}
-    @test _infer_on_small_stack(ReactiveKernels._dynamic_tensorized_marker, (T,)) ==
-          Any[Nothing]
-    # every argument a candidate axis, as for an untyped signature
-    candidates = Val{Tuple(1:n)}
-    @test _infer_on_small_stack(ReactiveKernels._dynamic_embedded_marker,
-                                (T, candidates)) == Any[Vector{Float64}]
-    # a record with as many fields
-    R = NamedTuple{Tuple(Symbol(:f, i) for i in 1:n),T}
-    @test _infer_on_small_stack(ReactiveKernels._dynamic_tensorized_value_marker,
-                                (R,)) == Any[Nothing]
-    @test _infer_on_small_stack(ReactiveKernels._embedded_axis_marker,
-                                (R,)) == Any[Vector{Float64}]
-    # the searches still find what they look for
-    values = Tuple(_wide_column(_wide_column_type(i), 2) for i in 1:n)
-    @test ReactiveKernels._dynamic_tensorized_marker(values) === nothing
-    @test ReactiveKernels._dynamic_tensorized_marker(()) === nothing
-    @test ReactiveKernels._dynamic_embedded_marker(values, Val(Tuple(2:n))) ===
-          values[2]
-    @test ReactiveKernels._dynamic_embedded_marker(values, Val(())) === nothing
-    @test ReactiveKernels._embedded_axis_marker((; a = 1.0, b = values[1])) ===
-          values[1]
-end
-
 @testset "a kernel with $n data columns prepares, infers and runs" for n in (200,)
     columns = [_wide_column(_wide_column_type(i), 3 + mod(i, 4)) for i in 1:n]
     expected = 0.7 * (sum(2.0 .* columns[1]) + sum(length, columns[2:end]))
@@ -139,8 +113,7 @@ end
     for typed in (true, false)
         spec = _wide_spec(typed ? :wide_typed : :wide_untyped, n; typed)
         kernel = prepare(spec)
-        @test kernel.f isa (typed ? ReactiveKernels._EmbeddedFunctionPair :
-                                    ReactiveKernels._DynamicEmbeddedFunctionPair)
+        @test kernel.f isa ReactiveKernels._ArrayFunction
         arguments = (0.7, columns...)
         @test _infer_on_small_stack(kernel, Tuple{map(typeof, arguments)...}) ==
               Any[Float64]

@@ -422,9 +422,10 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
-The scalar-family native/Reactant comparison now lives under
-[Distribution kernels through Reactant](distributions-reactant.md#scalar-families),
-while this page remains the source authority for the objects it measures.
+The historical scalar-family receipt, which compared native RK with RK's
+since-removed Reactant path, is kept under
+[Distribution kernels through Reactant (historical receipt)](distributions-reactant.md#scalar-families);
+this page remains the source authority for the objects it measures.
 
 ## Structured families: multivariate Normal and AR(1)
 
@@ -472,14 +473,15 @@ Both examples then apply `replica(...; batched = :x)`: a matrix holds independen
 vectors or independent series, one per column. The inner coordinate/time axis
 stays coupled, while the new trailing axis runs the whole kernel once per column.
 
-The structured native/Reactant comparison and its unsupported traced-array cells
-now live under
-[Distribution kernels through Reactant](distributions-reactant.md#structured-families).
+The historical structured-family receipt, measured with RK's since-removed
+Reactant path beside native RK, is kept under
+[Distribution kernels through Reactant (historical receipt)](distributions-reactant.md#structured-families).
 
-## Native and Reactant benchmark evidence
+## Historical benchmark receipts
 
-The scalar-plate comparison, compiled-call amortization, and machine-readable
-receipts now live together under
-[Distribution kernels through Reactant](distributions-reactant.md#scalar-plate-and-call-boundary-amortization).
+The scalar-plate comparison, the call-boundary amortization and their
+machine-readable receipts were measured while RK still had a Reactant path.
+They are kept as recorded under
+[Distribution kernels through Reactant (historical receipt)](distributions-reactant.md#scalar-plate-and-call-boundary-amortization).
 This page remains the sole displayed mathematical and executable source
 authority for the `normal.logpdf` object and its generic plate.

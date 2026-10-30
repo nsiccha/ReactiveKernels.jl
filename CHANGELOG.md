@@ -16,6 +16,30 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.15
+
+- **Breaking:** ReactiveKernels has no Reactant path. The Reactant extension
+  (`ReactiveKernelsReactantExt`), the tensorized lowering, the
+  `ReactiveKernelsReactantODESolvers` package and the `ReactantCore`
+  dependency are removed. Kernels, plates, scans, prepared AD and RKPPL run
+  natively as before. A program compiled through Reactant stays on 0.1.14.
+  What to change:
+  - `compile_ad_gradient` and `compile_ad_value_and_gradient` are removed;
+    use `ad_gradient` and `ad_value_and_gradient[!]`.
+  - `ReactiveKernels.traced` is removed; delete hand-written `traced`
+    methods. `@traceable` still defines the native method and records its
+    source.
+  - `lower_with_ops` no longer takes `tensorized`.
+  - `prepare_transpiled` no longer takes `backend` or `backend_options`, and
+    `rng_provider(Val(:reactant))` is removed.
+  - `jax_source` no longer recognizes `ReactantCore.@trace`; write plain
+    `if` and `while`, which it translates the same way.
+- A recipe that is exactly a call of a `@traceable` helper (`a = helper(x)`)
+  keeps the helper bound when the kernel is defined, as a call of any other
+  function does. On 0.1.14 and earlier such a call read the binding when the kernel was
+  prepared, so rebinding a captured local helper between definition and
+  preparation changed the result.
+
 ## 0.1.14
 
 - The type-stability check's code audit (`type_stability_level = :rk` and the

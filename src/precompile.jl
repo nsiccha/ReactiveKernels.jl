@@ -5,8 +5,7 @@
 # compiled this package code once, and Julia serializes that compilation
 # across threads. The workload authors, prepares and calls a small kernel
 # with an authored plate, the shape generated programs use, and authored
-# `for`/`while` loops, whose tensorized companions are expanded with
-# ReactantCore's `@trace` when a kernel is defined.
+# `for`/`while` loops.
 @setup_workload begin
     workload_definition = :(_precompile_workload(
             x::Vector{Float64}, a::Float64, b::Float64) = begin

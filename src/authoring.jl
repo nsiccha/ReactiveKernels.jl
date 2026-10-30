@@ -299,7 +299,7 @@ end
 # Otherwise the key names the computation: compiler-owned source operations
 # reuse their definition Token, except exact calls retained through lowering.
 # Those calls, like raw operations, key on callable identity, cost and output
-# types; the lowering mode also distinguishes their native/tensorized bodies.
+# types, and on the lowering mode (whether the recipe is pure).
 # Every other operation keys on
 # `(op, cost, output types)` so that repeated splices of the same pure call
 # merge instead of manufacturing one alternative producer per call site (the
@@ -1597,7 +1597,7 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
             endpoint_name, context, "one recipe has no source")
         if r.op isa Union{_KernelSourceOp,Function}
             # Authored operations already retain their defining module and
-            # native/traced bodies. Calling that operation inside the arm
+            # body. Calling that operation inside the arm
             # preserves globals, port order and lazy evaluation, including
             # recipes spliced from a differently scoped child endpoint. A
             # validated bare function operation also keeps its defining module.
@@ -2148,7 +2148,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
         # for an object endpoint under an arm: the arm still evaluates the
         # child only when taken, and the backend differentiates its math.
         # A child holding a plate or scan region is prepared once here and
-        # applied in place, so it keeps its own native and traced lowering.
+        # applied in place, so it keeps its own lowering.
         name = _kernel_inline_callee_name(rewritten_ex.args[1])
         rewritten_ex = lowering === :inline ?
             _kernel_inline_endpoint_call(
@@ -2667,9 +2667,8 @@ end
 # exactly like plate's atomic args).  The do-block returns the 2-tuple
 # `(new_carry, output)`; `scan` returns the vector `[output…]`, or, with the
 # literal `include_init = true`, `[init, output…]` in one buffer.  The step is an
-# ordinary TWO-`want` KernelSpec (`want = (:new_carry, :output)`); the native
-# path runs the plain ordered loop (already Reactant-unsafe only via scalar
-# indexing, which the tensorized lowering avoids by emitting a `stablehlo.while`).
+# ordinary TWO-`want` KernelSpec (`want = (:new_carry, :output)`), run as a
+# plain ordered loop.
 # With `history = h0` the do-block takes one more, LAST formal: the read-only
 # vector of the outputs so far (`h0` at and after the current step); `h0` is
 # the op's last argument, atomic like the carry seed.
@@ -2848,134 +2847,35 @@ function _is_broadcast_operator(sym::Symbol)
     length(s) >= 2 && s[1] === '.' && Base.isoperator(Symbol(s[2:end]))
 end
 
-# Cat-family callees plus the scalar-vector literal constructor `vect`,
-# rewritten in the tensorized body only.  The wrappers (core.jl) let a
-# tracing backend promote untraced constant-array operands to traced
-# constants before concatenating, and `_tensorized_vect` builds a real
-# traced vector from traced scalars; a callee shadowed by a graph port
-# keeps its port meaning and is never rewritten.
-_tensorized_callee_replacement(callee::Symbol) =
-    callee === :vcat ? :_tensorized_vcat :
-    callee === :hcat ? :_tensorized_hcat :
-    callee === :cat ? :_tensorized_cat :
-    callee === :vect ? :_tensorized_vect :
-    callee === :eachcol ? :_tensorized_eachcol :
-    callee === :getindex ? :_tensorized_getindex :
-    callee === :get ? :_tensorized_get :
-    callee === :dot ? :_tensorized_dot : nothing
-function _tensorized_callee_replacement(callee::GlobalRef)
-    isdefined(callee.mod, callee.name) || return nothing
-    _tensorized_function_replacement(getglobal(callee.mod, callee.name))
+# A recipe that is exactly a call of one of these Base functions (or of
+# `LinearAlgebra.dot`) over its ports stays a source operation rather than a
+# raw identity, as these calls always have; a callee shadowed by a graph port
+# keeps its port meaning.
+_kernel_source_op_callee(callee::Symbol) =
+    callee in (:vcat, :hcat, :cat, :vect, :eachcol, :getindex, :get, :dot)
+function _kernel_source_op_callee(callee::GlobalRef)
+    isdefined(callee.mod, callee.name) || return false
+    _kernel_source_op_function(getglobal(callee.mod, callee.name))
 end
-_tensorized_function_replacement(fn) = nothing
-function _tensorized_function_replacement(fn::Function)
+_kernel_source_op_function(fn) = false
+function _kernel_source_op_function(fn::Function)
     # A resolved call (including an imported binding or alias) names the
-    # same function as its bare spelling. Reuse that lowering without
-    # rewriting a caller-owned function that merely has the same name.
-    parentmodule(fn) === Base && return _tensorized_callee_replacement(nameof(fn))
-    fn === dot ? :_tensorized_dot : nothing
+    # same function as its bare spelling; a caller-owned function that merely
+    # has the same name is not one of them.
+    parentmodule(fn) === Base && return _kernel_source_op_callee(nameof(fn))
+    fn === dot
 end
-_tensorized_callee_replacement(callee) = nothing
-function _tensorized_callee_replacement(callee, mod::Union{Module,Nothing})
-    callee isa GlobalRef && return _tensorized_callee_replacement(callee)
-    mod === nothing && return _tensorized_callee_replacement(callee)
+_kernel_source_op_callee(callee) = false
+function _kernel_source_op_callee(callee, mod::Union{Module,Nothing})
+    callee isa GlobalRef && return _kernel_source_op_callee(callee)
+    mod === nothing && return _kernel_source_op_callee(callee)
     fn = _kernel_resolve_binding(mod, callee)
-    fn === nothing ? _tensorized_callee_replacement(callee) :
-        _tensorized_function_replacement(fn)
+    fn === nothing ? _kernel_source_op_callee(callee) : _kernel_source_op_function(fn)
 end
 
-# Factorization callees whose tensorized result passes through
-# `_tensorized_factorization` (core.jl).  The call itself is kept, so this
-# never changes which method runs; a bare `F = cholesky(A)` recipe keeps its
-# raw identity and is not rewritten.
-_tensorized_factorization_callee(callee::Symbol) = callee === :cholesky
-_tensorized_factorization_callee(callee::GlobalRef) =
-    callee.name === :cholesky && nameof(callee.mod) === :LinearAlgebra
-_tensorized_factorization_callee(callee::Expr) =
-    callee.head === :. && length(callee.args) == 2 &&
-    callee.args[2] == QuoteNode(:cholesky)
-_tensorized_factorization_callee(callee) = false
-
-function _kernel_tensorized_callee(callee, known::Set{Symbol}, mod)
-    callee isa Symbol && !(callee in known) && mod isa Module &&
-        isdefined(mod, callee) && return GlobalRef(mod, callee)
-    callee
-end
-
-# Whether a tensorized call goes through `traced` (core.jl), where a tracing
-# method of the callee can take it.  Only a positional call to a function
-# neither Base, Core nor this package owns: a tracing method of a function the
-# caller does not own would be piracy, and every other call keeps exactly its
-# emitted form.  A name unbound when the recipe is defined (a helper defined
-# later) routes too; without a tracing method the hook is the plain call.
-function _kernel_tensorized_routed(callee, arguments, mod)
-    any(arg -> arg isa Expr && arg.head in (:parameters, :kw), arguments) &&
-        return false
-    if callee isa GlobalRef
-        isdefined(callee.mod, callee.name) || return true
-        f = getglobal(callee.mod, callee.name)
-        f isa Function && !(f isa Type) || return false
-        return !(Base.moduleroot(parentmodule(f)) in (Base, Core, @__MODULE__))
-    end
-    callee isa Symbol && mod isa Module
-end
-
-# Whether `callee` names a function with its own `traced` method.  A whole
-# recipe `x = f(ports...)` keeps `f` itself as its operation, which a tracing
-# backend would call natively; with a `traced` method the recipe takes the
-# source-op path instead, whose tracing companion routes the call.  Methods
-# defined after the recipe are not seen.
-function _kernel_callee_has_traced_method(callee::Symbol, mod)
-    mod isa Module && isdefined(mod, callee) || return false
-    f = getglobal(mod, callee)
-    f isa Function && !(f isa Type) || return false
-    for m in methods(traced)
-        signature = Base.unwrap_unionall(m.sig)
-        length(signature.parameters) >= 2 && signature.parameters[2] === typeof(f) &&
-            return true
-    end
-    false
-end
-
-function _kernel_tensorized_assignment_head(head)
-    head === :(=) && return true
-    head isa Symbol || return false
-    spelling = String(head)
-    endswith(spelling, "=") || return false
-    !(spelling in ("==", "!=", "<=", ">=", "=>"))
-end
-
-function _kernel_tensorized_undef_vector(ex)
-    ex isa Expr && ex.head === :call && length(ex.args) == 3 || return nothing
-    callee = ex.args[1]
-    callee isa Expr && callee.head === :curly && length(callee.args) == 2 ||
-        return nothing
-    callee.args[1] === :Vector && ex.args[2] === :undef || return nothing
-    callee.args[2], ex.args[3]
-end
-
-# A lazy two-way branch in the tensorized companion: the condition and both
-# sides are tensorized, and `_recurrence_branch` evaluates exactly one arm.
-# Locals rebound by an arm cross it as explicit arguments and results.
-# An `elseif` chain
-# arrives as a nested `:elseif` expression on the else side and lowers
-# recursively; a block-wrapped condition (Julia's `elseif` spelling) is
-# unwrapped.
-# The tensorized companion of an authored `for`/`while`: the loop (iterator,
-# condition and body already tensorized) is expanded with `ReactantCore.@trace`
-# at kernel definition.  That transform turns the locals the body assigns into
-# a loop carry and emits ONE retained loop region under a tracing backend
-# (`stablehlo.while`), whatever the trip count; when nothing in the loop is
-# traced its expansion runs the plain Julia loop, so the companion stays
-# correct on every backend (`docs/src/constraints.md`).  `ReactantCore` is the
-# dependency-light macro package (no compiler runtime); Reactant's tracing
-# interpreter follows the expansion only as ordinary closure code, which is
-# why the transform runs at definition time rather than through a runtime
-# generated program.
-# `@trace for` handles one plain induction variable over a range; that is
-# the shape a data-length loop takes (`1:n`, `eachindex(x)`, `axes(x, 1)`).
-# A typed binding, destructuring, or iteration over a collection keeps the
-# authored loop unchanged (it iterates host structure, not a data length).
+# Whether a `for` iterator is a data-length range: `a:b`, `eachindex`, `axes`,
+# `range` or `OneTo` (`_kernel_native_folds` rewrites a generator fold over one
+# as an explicit-accumulator loop).
 _kernel_range_iterator(iter) =
     iter isa Expr && iter.head === :call && !isempty(iter.args) && (
         iter.args[1] === :(:) ||
@@ -2984,209 +2884,10 @@ _kernel_range_iterator(iter) =
          iter.args[1].args[end] isa QuoteNode &&
          iter.args[1].args[end].value in (:OneTo, :eachindex, :axes, :range)))
 
-# Locals of `scope` that a loop assigns (its carry): plain, updating and
-# destructuring assignments, and indexed writes (`v[i] = x` rebinds `v` in the
-# tensorized companion).
-function _kernel_loop_assigned!(names::Set{Symbol}, ex, scope)
-    ex isa Expr || return names
-    ex.head in (:quote, :inert, :meta, :line) && return names
-    if _kernel_tensorized_assignment_head(ex.head) && length(ex.args) == 2
-        target = ex.args[1]
-        while target isa Expr && target.head in (:ref, :(::))
-            target = target.args[1]
-        end
-        assigned = _lhs_symbols!(Set{Symbol}(), target)
-        union!(names, intersect(assigned, scope))
-    end
-    for arg in ex.args
-        _kernel_loop_assigned!(names, arg, scope)
-    end
-    names
-end
-
-# The tensorized companion of an authored `for`/`while`.  The loop (iterator,
-# condition and body tensorized) is expanded with `ReactantCore.@trace` at
-# kernel definition, which emits ONE retained loop region under a tracing
-# backend (`stablehlo.while`) whatever the trip count, and runs the plain
-# Julia loop when nothing it reads is traced (`docs/src/constraints.md`).
-# `ReactantCore` is the dependency-light macro package; Reactant's tracing
-# interpreter follows the expansion as ordinary closure code, which is why the
-# transform runs at definition time.
-#
-# `@trace` passes every local the loop reads to the tracer as a loop argument
-# and carries values by updating the traced objects that exist BEFORE the
-# loop; it never assigns results back to the enclosing variables.  Two
-# consequences the companion handles here:
-#
-# - a carry that starts on the host (`acc = 0.0`, a host `Vector`) has no
-#   traced object to update, so the loop's result was silently dropped: the
-#   loop returned its seed.  Each carried local is re-bound before the loop to
-#   a fresh traced copy (`_loop_seed`) whenever anything the loop reads is
-#   traced; with nothing traced the seed is unchanged and the loop is plain;
-# - a read-only local holding a host struct (a schedule plan with a
-#   `Vector{Int}` field) cannot be rebuilt with traced fields
-#   (`NoFieldMatchError`), so read-only locals cross the loop as captures that
-#   an untraced value enters wrapped (`_loop_capture` / `_loop_open`).
-#
-# `@trace for` handles one plain induction variable over a range; that is the
-# shape a data-length loop takes (`1:n`, `eachindex(x)`, `axes(x, 1)`).  A
-# typed binding, destructuring, or iteration over a collection keeps the
-# authored loop unchanged (it iterates host structure, not a data length), and
-# so does a loop in a scope that rebinds a name `@trace for` resolves there
-# (`_kernel_trace_for_hygienic`): per-iteration tracing is exact, a shadowed
-# `step` would not be.
-function _kernel_tensorized_loop(ex, known, mod, scope)
-    if ex.head === :for
-        binding, body = ex.args
-        binding isa Expr && binding.head === :(=) && length(binding.args) == 2 ||
-            throw(ArgumentError("unsupported authored loop binding `$(binding)` in a kernel recipe"))
-        loop_names = Set{Symbol}()
-        _lhs_symbols!(loop_names, binding.args[1])
-        retained = binding.args[1] isa Symbol &&
-            _kernel_range_iterator(binding.args[2]) &&
-            _kernel_trace_for_hygienic(known, scope, mod)
-        parts = (body,)
-    else
-        condition, body = ex.args
-        loop_names = Set{Symbol}()
-        retained = true
-        parts = (condition, body)
-    end
-    if !retained
-        ex.head === :for || error("unreachable")
-        return Expr(:for,
-            Expr(:(=), binding.args[1],
-                 _kernel_tensorized_rhs(binding.args[2], known, mod, scope)),
-            _kernel_tensorized_rhs(body, known, mod, union(scope, loop_names)))
-    end
-    outer = setdiff(scope, loop_names)
-    carried = Set{Symbol}()
-    read = Set{Symbol}()
-    for part in parts
-        _kernel_loop_assigned!(carried, part, outer)
-        _kernel_loop_captures!(read, part, outer)
-    end
-    setdiff!(read, carried)
-    captures = Dict(name => gensym(Symbol(name, :_capture)) for name in read)
-    # `@trace` finds its loop arguments by reading the loop body's syntax, and
-    # a local read only inside a closure — an arm of a lazy branch — is not
-    # found: the loop region then uses a value it was never handed, and the
-    # backend rejects the program ("expect operands to be compatible with body
-    # block arguments").  Every capture is therefore also named once at the top
-    # of the body; the statement computes nothing.
-    capture_reference = Expr(:tuple, (captures[name] for name in sort!(collect(read)))...)
-    substitute(part) = _kernel_loop_substitute(part, captures)
-    body_with_reference(part) = isempty(captures) ? substitute(part) :
-        Expr(:block, capture_reference, substitute(part))
-    inner = union(scope, loop_names, Set(values(captures)))
-    iterator = ex.head === :for ?
-        _kernel_tensorized_rhs(binding.args[2], known, mod, scope) : nothing
-    lowered = if ex.head === :for
-        Expr(:for, Expr(:(=), binding.args[1], iterator),
-             _kernel_tensorized_rhs(body_with_reference(body), known, mod, inner;
-                                    value_used = false))
-    else
-        Expr(:while,
-             _kernel_tensorized_rhs(substitute(condition), known, mod, inner),
-             _kernel_tensorized_rhs(body_with_reference(body), known, mod, inner;
-                                    value_used = false))
-    end
-    traced = Expr(:macrocall, GlobalRef(ReactantCore, Symbol("@trace")),
-                  LineNumberNode(@__LINE__, @__FILE__), lowered)
-    witnesses = Any[captures[name] for name in sort!(collect(read))]
-    append!(witnesses, sort!(collect(carried)))
-    seeds = Any[Expr(:(=), name, Expr(:call, GlobalRef(@__MODULE__, :_loop_seed),
-                                       name, witnesses...))
-                for name in sort!(collect(carried))]
-    bindings = Any[Expr(:(=), captures[name],
-                        Expr(:call, GlobalRef(@__MODULE__, :_loop_capture), name))
-                   for name in sort!(collect(read))]
-    # Captures are bound first: a seed's witnesses name them.
-    loop = isempty(captures) ? Expr(:block, seeds..., traced) :
-        Expr(:let, Expr(:block, bindings...), Expr(:block, seeds..., traced))
-    ex.head === :for || return loop
-    # `@trace for` traces its body once even for zero iterations, so a loop
-    # over an empty host range (the doses of an empty schedule) would still
-    # index its zero-length arrays and emit an invalid slice.  Such a loop runs
-    # zero times, as the plain loop does; the check reads the bounds exactly as
-    # `@trace for` does (`a:b` / `a:s:b` syntax, else the range value).
-    empty = iterator isa Expr && iterator.head === :call &&
-            iterator.args[1] === :(:) ?
-        Expr(:call, GlobalRef(@__MODULE__, :_loop_host_empty_colon), iterator.args[2:end]...) :
-        Expr(:call, GlobalRef(@__MODULE__, :_loop_host_empty), iterator)
-    Expr(:if, empty, nothing, loop)
-end
-
-function _kernel_tensorized_branch(condition, then_side, else_side, known, mod,
-                                   scope=known; value_used=true)
-    unwrap(x) = x isa Expr && x.head === :block ?
-        (filtered = [arg for arg in x.args if !(arg isa LineNumberNode)];
-         length(filtered) == 1 ? unwrap(only(filtered)) : x) : x
-    assigned = Set{Symbol}()
-    _kernel_loop_assigned!(assigned, then_side, scope)
-    _kernel_loop_assigned!(assigned, else_side, scope)
-    names = sort!(collect(assigned))
-    # An arm that assigns an enclosing local must return its new binding;
-    # mutating a closure box is not a conditional result or a loop carry.
-    # Explicit arguments also make those reads visible to `@trace`'s loop
-    # analysis. Both arms return the same state, including unchanged locals.
-    # A used branch expression retains its value beside that state. A
-    # discarded statement needs only the state, so `if p; x = ...; end`
-    # does not ask the backend to merge a value with implicit `nothing`.
-    function thunk(side)
-        lowered = _kernel_tensorized_rhs(unwrap(side), known, mod, scope;
-                                        value_used = value_used)
-        isempty(names) && return Expr(:->, Expr(:tuple), lowered)
-        if value_used
-            value = gensym(:branch_value)
-            body = Expr(:block, Expr(:(=), value, lowered),
-                        Expr(:tuple, value, names...))
-        else
-            body = Expr(:block, lowered, Expr(:tuple, names...))
-        end
-        Expr(:->, Expr(:tuple, names...), body)
-    end
-    call = Expr(:call, GlobalRef(@__MODULE__, :_recurrence_branch),
-         _kernel_tensorized_rhs(unwrap(condition), known, mod, scope),
-         thunk(then_side), thunk(else_side), Expr(:tuple, names...))
-    isempty(names) && return call
-    if !value_used
-        return Expr(:block, Expr(:(=), Expr(:tuple, names...), call), nothing)
-    end
-    result = gensym(:branch_result)
-    bindings = Any[Expr(:(=), name,
-        Expr(:call, GlobalRef(Core, :getfield), result, i + 1))
-        for (i, name) in enumerate(names)]
-    Expr(:block, Expr(:(=), result, call), bindings...,
-         Expr(:call, GlobalRef(Core, :getfield), result, 1))
-end
-
-# A generator reduction `sum(term for i in iter [if condition]; init = x)` in a
-# tensorized companion.  Base evaluates it as a left fold, `foldl(add_sum, …;
-# init)`, over the generator (and `Iterators.filter`).  Under a tracing backend
-# that fold is traced once per element of the host iterator — the emitted
-# program grows with the iterator's length, a dose count for a superposition —
-# and a filter condition on a traced value fails outright (`non-boolean
-# (TracedRNumber{Bool}) used in boolean context`).  The companion spells out
-# the same fold in two ways, both with Base's accumulation order, so the value
-# is Base's:
-#
-# - over a data-length iterator (`eachindex(x)`, `axes(x, d)`, `a:b`, `OneTo`:
-#   the authored-loop rule of `_kernel_range_iterator`) the fold becomes one
-#   authored loop with an explicit accumulator, which `_kernel_tensorized_loop`
-#   retains as one backend loop region whatever the length
-#   (`docs/src/constraints.md`, "Preserve data-dependent iteration").  The
-#   index is then a traced value: indexing written in the term is lowered by
-#   the tensorized rewrites (host tables included), while a helper function
-#   indexing with it has no traced method;
-# - over any other iterator (a helper returning a host collection) the fold is
-#   the ordinary per-element iteration, as before.
-#
-# In both, a filter is a lazy branch on the accumulator: `add_sum(acc, term)`
-# runs only in the taken arm, so a rejected element's indexing and arithmetic
-# stay inactive.  Only the `init` form is rewritten: without it the first
-# ACCEPTED element seeds the sum, which a traced condition cannot select at
-# trace time.
+# The parts `(; term, condition, variable, iterator, init)` of a generator
+# reduction `sum(term for i in iter [if condition]; init = x)`, or `nothing`.
+# Only the `init` form is decomposed: without it the first ACCEPTED element
+# seeds the sum.
 function _kernel_generator_sum_parts(ex)
     ex isa Expr && ex.head === :call && length(ex.args) >= 2 || return nothing
     callee = ex.args[1]
@@ -3229,128 +2930,6 @@ function _kernel_generator_sum_parts(ex)
     (; term, condition, variable = clause.args[1], iterator = clause.args[2], init)
 end
 
-# `ReactantCore.@trace for` over a non-literal range calls unqualified
-# `first`/`step`/`last` (and `one`/`zero`/`div`/`isqrt`/`error`) in the scope it
-# expands into (reactivekernels-use §7m).  Retain a generator's loop only when
-# none of those names is rebound there — a recipe argument, a port, or a global
-# of the defining module that is not Base's — so a local `step = dt` can never
-# silently change the iteration; otherwise the fold stays per element.
-const _TRACE_FOR_CALLER_NAMES = (:first, :step, :last, :one, :zero, :div, :isqrt, :error)
-function _kernel_trace_for_hygienic(known, scope, mod)
-    for name in _TRACE_FOR_CALLER_NAMES
-        (name in known || name in scope) && return false
-        if mod isa Module && isdefined(mod, name)
-            getglobal(mod, name) === getglobal(Base, name) || return false
-        end
-    end
-    true
-end
-
-# Every symbol of `ex` (a term or condition) that names a local in `scope`.
-function _kernel_loop_captures!(names::Set{Symbol}, ex, scope)
-    if ex isa Symbol
-        ex in scope && push!(names, ex)
-    elseif ex isa Expr && !(ex.head in (:quote, :inert, :meta, :line))
-        for (position, arg) in enumerate(ex.args)
-            # A keyword name is syntax, not a read of the local.
-            ex.head === :kw && position == 1 && continue
-            _kernel_loop_captures!(names, arg, scope)
-        end
-    end
-    names
-end
-
-# Replace each captured local by `_loop_open(<its capture>)`, leaving quoted
-# syntax and keyword names untouched and honoring names an inner lambda,
-# generator, `let` or loop binds (those are not the captured local).
-function _kernel_loop_substitute(ex, captures::Dict{Symbol,Symbol})
-    if ex isa Symbol
-        haskey(captures, ex) || return ex
-        return Expr(:call, GlobalRef(@__MODULE__, :_loop_open), captures[ex])
-    end
-    ex isa Expr || return ex
-    ex.head in (:quote, :inert, :meta, :line) && return ex
-    shadowed(names) = isempty(names) ? captures :
-        Dict(k => v for (k, v) in captures if !(k in names))
-    if ex.head === :-> && length(ex.args) == 2
-        formals = _lhs_symbols!(Set{Symbol}(), ex.args[1])
-        ex.args[1] isa Symbol && push!(formals, ex.args[1])
-        return Expr(:->, ex.args[1], _kernel_loop_substitute(ex.args[2], shadowed(formals)))
-    elseif ex.head === :generator
-        bound = Set{Symbol}()
-        for clause in ex.args[2:end]
-            clause isa Expr && clause.head === :filter && (clause = clause.args[end])
-            clause isa Expr && clause.head === :(=) && _lhs_symbols!(bound, clause.args[1])
-        end
-        inner = shadowed(bound)
-        return Expr(:generator, _kernel_loop_substitute(ex.args[1], inner),
-            (_kernel_loop_substitute_clause(clause, captures, inner)
-             for clause in ex.args[2:end])...)
-    elseif ex.head === :for && length(ex.args) == 2 && ex.args[1] isa Expr &&
-           ex.args[1].head === :(=)
-        bound = _lhs_symbols!(Set{Symbol}(), ex.args[1].args[1])
-        return Expr(:for,
-            Expr(:(=), ex.args[1].args[1], _kernel_loop_substitute(ex.args[1].args[2], captures)),
-            _kernel_loop_substitute(ex.args[2], shadowed(bound)))
-    end
-    args = Any[(ex.head === :kw && position == 1) ? arg :
-               _kernel_loop_substitute(arg, captures)
-               for (position, arg) in enumerate(ex.args)]
-    Expr(ex.head, args...)
-end
-
-# A generator clause: its iterator reads the enclosing captures, its filter
-# condition sees the generator's own bindings.
-function _kernel_loop_substitute_clause(clause, captures, inner)
-    if clause isa Expr && clause.head === :filter
-        return Expr(:filter, _kernel_loop_substitute(clause.args[1], inner),
-            (_kernel_loop_substitute_clause(c, captures, inner) for c in clause.args[2:end])...)
-    elseif clause isa Expr && clause.head === :(=)
-        return Expr(:(=), clause.args[1], _kernel_loop_substitute(clause.args[2], captures))
-    end
-    clause
-end
-
-function _kernel_tensorized_generator_sum(parts, known, mod, scope)
-    accumulator = gensym(:generator_sum)
-    variable = parts.variable
-    accept = Expr(:call, GlobalRef(Base, :add_sum), accumulator, parts.term)
-    if _kernel_range_iterator(parts.iterator) &&
-       _kernel_trace_for_hygienic(known, scope, mod)
-        # One authored loop with an explicit accumulator; the loop companion
-        # seeds the accumulator and captures the term's locals.  A filter
-        # selects the term or the additive identity `-zero(init)` lazily
-        # (`x + -0.0 === x` for every IEEE `x`, so a rejected element leaves
-        # the sum bitwise unchanged).  The identity is computed once before
-        # the loop: a branch that reads the loop-carried accumulator does not
-        # survive the backend's batching of a loop inside a batched plate cell.
-        identity = gensym(:generator_sum_identity)
-        update = parts.condition === nothing ? accept :
-            Expr(:call, GlobalRef(Base, :add_sum), accumulator,
-                 Expr(:if, parts.condition, parts.term, identity))
-        seed = Expr(:block, Expr(:(=), accumulator, parts.init),
-            Expr(:(=), identity, Expr(:call, GlobalRef(Base, :-),
-                                      Expr(:call, GlobalRef(Base, :zero), accumulator))))
-        loop = Expr(:let, seed, Expr(:block,
-            Expr(:for, Expr(:(=), variable, parts.iterator),
-                 Expr(:block, Expr(:(=), accumulator, update))),
-            accumulator))
-        return _kernel_tensorized_rhs(loop, known, mod, scope)
-    end
-    parts.condition === nothing && return nothing
-    inner = union(scope, Set((variable, accumulator)))
-    formals = Expr(:tuple, accumulator, variable)
-    step = Expr(:->, formals,
-        Expr(:call, GlobalRef(@__MODULE__, :_recurrence_branch),
-             _kernel_tensorized_rhs(parts.condition, known, mod, inner),
-             Expr(:->, formals, _kernel_tensorized_rhs(accept, known, mod, inner)),
-             Expr(:->, formals, accumulator), formals))
-    Expr(:call, GlobalRef(Base, :foldl),
-         Expr(:parameters, Expr(:kw, :init,
-              _kernel_tensorized_rhs(parts.init, known, mod, scope))),
-         step, _kernel_tensorized_rhs(parts.iterator, known, mod, scope))
-end
-
 # The NATIVE body of authored source (a recipe, a plate cell, a scan step, a
 # `@traceable` method) with each generator fold over a data-length iterator,
 # `sum(term for i in iter [if condition]; init = x)` with `iter` matching
@@ -3374,8 +2953,7 @@ end
 # dynamically and boxes (a 4 × 4 nested sum: 10 allocations per call), though
 # Julia 1.12 infers the same nest concretely.  The loop has no such
 # frame, so a fold the rewrite reaches never re-enters `mapfoldl`, and a nest
-# keeps at most one Base fold.  The tensorized companion keeps its own lowering
-# (`_kernel_tensorized_generator_sum`).
+# keeps at most one Base fold.
 #
 # The rewrite keeps to terms and conditions that are plain expressions.  One
 # that assigns, declares, returns, jumps, loops, or holds a macro call keeps
@@ -3435,8 +3013,7 @@ end
 # LinearAlgebra's generic `mul!` (core.jl).  A
 # callee that a port or local shadows keeps its own meaning, as does a
 # function that merely shares the name; bracket syntax always means Base's
-# functions, as in Julia.  The tensorized companion keeps its own lowering
-# (`_tensorized_hcat`, ...).
+# functions, as in Julia.
 function _kernel_native_calls(ex, mod, shadowed::Set{Symbol})
     ex isa Expr || return ex
     ex.head in (:quote, :inert, :meta, :macrocall) && return ex
@@ -3478,13 +3055,22 @@ function _native_callee_replacement(callee, mod)
     fn === nothing ? nothing : _native_function_replacement(fn)
 end
 
+# Whether `head` assigns: `=` and every updating form such as `+=` or `.=`.
+function _kernel_assignment_head(head)
+    head === :(=) && return true
+    head isa Symbol || return false
+    spelling = String(head)
+    endswith(spelling, "=") || return false
+    !(spelling in ("==", "!=", "<=", ">=", "=>"))
+end
+
 function _kernel_native_broadcasts(ex; in_dotted::Bool = false)
     ex isa Expr || return ex
     ex.head in (:quote, :inert, :meta, :macrocall) && return ex
     # Julia owns destination/alias handling for dotted assignments. Leave
     # their entire fused RHS intact, including compound forms such as .+=.
     startswith(String(ex.head), ".") &&
-        _kernel_tensorized_assignment_head(ex.head) && return ex
+        _kernel_assignment_head(ex.head) && return ex
     if ex.head === :call && !isempty(ex.args) &&
        ex.args[1] isa Symbol && _is_broadcast_operator(ex.args[1])
         callee = Symbol(String(ex.args[1])[2:end])
@@ -3572,7 +3158,7 @@ function _kernel_fold_term_escapes(ex)
     ex.head in (:return, :break, :continue, :local, :global, :const, :for, :while,
                 :try, :macrocall, :function, :symboliclabel, :symbolicgoto) &&
         return true
-    _kernel_tensorized_assignment_head(ex.head) && return true
+    _kernel_assignment_head(ex.head) && return true
     if ex.head === :kw && length(ex.args) == 2
         return _kernel_fold_term_escapes(ex.args[2])
     elseif ex.head === :generator || ex.head === :filter
@@ -3600,8 +3186,8 @@ function _kernel_fold_plain_let(ex::Expr)
 end
 
 # `begin`/`end` inside an index denote the indexed array's first/last index;
-# Julia resolves them while lowering `a[...]`. Once the tensorized body turns
-# the indexing into a call they would be free variables, so resolve them
+# Julia resolves them while lowering `a[...]`. Once a rewrite turns the
+# indexing into a call (RKPPL's gathers) they would be free variables, so resolve them
 # against the array first, as Julia does: in position `k` of `n` indices,
 # `end` becomes `lastindex(a, k)` (`lastindex(a)` for a single index) and
 # `begin` `firstindex`. A nested `b[...]` resolves its own endpoints.
@@ -3624,244 +3210,24 @@ function _kernel_ref_indices(array, indices)
     Any[_kernel_ref_endpoints(index, array, k, n) for (k, index) in enumerate(indices)]
 end
 
-function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
-                                mod::Union{Module,Nothing} = nothing,
-                                scope::Set{Symbol} = known;
-                                in_dotted::Bool = false,
-                                value_used::Bool = true)
-    ex isa Expr || return ex
-    ex.head in (:quote, :inert) && return ex
-    if ex.head === :macrocall && mod isa Module
-        # A macro reads the SYNTAX of its arguments: `@.` dots only the calls
-        # whose callee is a `Symbol`, `@view` accepts only index syntax.  The
-        # rewrites below replace callees and index syntax with compiler-owned
-        # references, so rewriting a macro's arguments before the macro runs
-        # hands it other syntax than the native body gives it.
-        # `@.(100 * (v - v[1]) / v[1])` kept every call undotted — a
-        # `MethodError` under a tracing backend, and silently the matrix
-        # product for `@.(a * b)` — and `@view v[1:2]` failed at kernel
-        # definition (snag `batched-broadcas-9269c801`).  Lower the macro's
-        # expansion instead: that is the code the native body runs.
-        return _kernel_tensorized_rhs(macroexpand(mod, ex), known, mod, scope;
-                                      in_dotted = in_dotted, value_used = value_used)
-    end
-    undef_vector = _kernel_tensorized_undef_vector(ex)
-    if undef_vector !== nothing
-        # A tracing backend cannot place traced scalars into a host
-        # `Vector{T}(undef, n)`.  Initialize the tensorized companion with a
-        # defined host constant; the first traced indexed write promotes it to
-        # backend storage.  The ordinary Julia body keeps the authored undef
-        # allocation unchanged.
-        element_type, length_expr = undef_vector
-        return Expr(:call, GlobalRef(Base, :zeros), element_type,
-                    _kernel_tensorized_rhs(length_expr, known, mod, scope))
-    elseif ex.head === :(=) && length(ex.args) == 2 &&
-           ex.args[1] isa Expr && ex.args[1].head === :ref &&
-           ex.args[1].args[1] isa Symbol
-        # Express a local indexed update functionally in the tensorized body.
-        # This lets tracing backends replace scalar mutation with copy/update
-        # while native execution retains the authored in-place loop.
-        target = ex.args[1]
-        array = target.args[1]
-        indices = _kernel_ref_indices(array, target.args[2:end])
-        return Expr(:(=), array,
-            Expr(:call, GlobalRef(@__MODULE__, :_tensorized_setindex), array,
-                 _kernel_tensorized_rhs(ex.args[2], known, mod, scope),
-                 (_kernel_tensorized_rhs(index, known, mod, scope)
-                  for index in indices)...))
-    elseif _kernel_tensorized_assignment_head(ex.head) && length(ex.args) == 2
-        # An indexed/property/destructuring assignment target is syntax, not a
-        # value read. Rewriting an l-value such as `calls[:b][]` into
-        # `_tensorized_getindex(...)` produces an invalid assignment location
-        # even when this optional tensorized companion is never selected.
-        # Preserve the authored target exactly and tensorize only the RHS.
-        return Expr(ex.head, ex.args[1],
-                    _kernel_tensorized_rhs(ex.args[2], known, mod, scope))
-    elseif ex.head === :ref
-        array = _kernel_tensorized_rhs(ex.args[1], known, mod, scope)
-        ref_indices = ex.args[2:end]
-        getindex_call = a -> Expr(:call, GlobalRef(@__MODULE__, :_tensorized_getindex), a,
-            (_kernel_tensorized_rhs(index, known, mod, scope)
-             for index in _kernel_ref_indices(a, ref_indices))...)
-        (array isa Symbol || !any(_kernel_ref_has_endpoint, ref_indices)) &&
-            return getindex_call(array)
-        # A computed array is evaluated once and its endpoints read from it.
-        indexed = gensym(:indexed)
-        return Expr(:let, Expr(:(=), indexed, array), getindex_call(indexed))
-    elseif ex.head === :call && !isempty(ex.args) &&
-           ex.args[1] isa Symbol && _is_broadcast_operator(ex.args[1])
-        operator = Symbol(String(ex.args[1])[2:end])
-        # Only the outermost dotted call of a nest materializes; nested ones
-        # stay lazy so Julia's broadcast fusion survives the lowering (snag
-        # `reactant-traced-ff8ff365`).  Every other descent keeps the default
-        # `in_dotted = false`, so a dotted call under any non-dotted parent
-        # still materializes exactly as before.
-        broadcast = in_dotted ? :_tensorized_lazy_broadcast : :_tensorized_broadcast
-        return Expr(:call, GlobalRef(@__MODULE__, broadcast),
-                    GlobalRef(Base, operator),
-                    (_kernel_tensorized_rhs(arg, known, mod, scope; in_dotted = true)
-                     for arg in ex.args[2:end])...)
-    elseif ex.head === :. && length(ex.args) == 2 &&
-           ex.args[2] isa Expr && ex.args[2].head === :tuple
-        broadcast = in_dotted ? :_tensorized_lazy_broadcast : :_tensorized_broadcast
-        return Expr(:call, GlobalRef(@__MODULE__, broadcast),
-                    _kernel_tensorized_callee(ex.args[1], known, mod),
-                    (_kernel_tensorized_rhs(arg, known, mod, scope; in_dotted = true)
-                     for arg in ex.args[2].args)...)
-    elseif ex.head in (:for, :while)
-        # An authored loop keeps its iteration on every backend: the
-        # tensorized companion expands it with `ReactantCore.@trace`, which
-        # runs it as a plain loop natively and as one retained loop region
-        # under a tracing backend — never once per iteration
-        # (`docs/src/constraints.md`).
-        return _kernel_tensorized_loop(ex, known, mod, scope)
-    elseif ex.head === :let && length(ex.args) == 2
-        # Sequential scope: a binding is in scope for the later bindings and
-        # the body (loops need to know which locals they can carry).
-        bindings = ex.args[1]
-        binding_list = bindings isa Expr && bindings.head === :block ?
-            bindings.args : Any[bindings]
-        inner = copy(scope)
-        lowered_bindings = Any[]
-        for binding in binding_list
-            if binding isa Expr && binding.head === :(=) && length(binding.args) == 2
-                push!(lowered_bindings, Expr(:(=), binding.args[1],
-                    _kernel_tensorized_rhs(binding.args[2], known, mod, inner)))
-                _lhs_symbols!(inner, binding.args[1])
-            else
-                push!(lowered_bindings, binding)
-                binding isa Symbol && push!(inner, binding)
-            end
-        end
-        lowered = length(lowered_bindings) == 1 ? only(lowered_bindings) :
-            Expr(:block, lowered_bindings...)
-        return Expr(:let, lowered, _kernel_tensorized_rhs(ex.args[2], known, mod, inner;
-                                                        value_used = value_used))
-    elseif ex.head === :block
-        inner = copy(scope)
-        statements = Any[]
-        tail = findlast(arg -> !(arg isa LineNumberNode), ex.args)
-        for (i, statement) in enumerate(ex.args)
-            push!(statements, _kernel_tensorized_rhs(statement, known, mod, inner;
-                value_used = value_used && i == tail))
-            statement isa Expr && _kernel_tensorized_assignment_head(statement.head) &&
-                length(statement.args) == 2 && _lhs_symbols!(inner, statement.args[1])
-        end
-        return Expr(:block, statements...)
-    elseif ex.head in (:if, :elseif) && 2 <= length(ex.args) <= 3
-        # Authored `if`/`?:` keep their lazy Julia semantics on every backend
-        # (`docs/src/constraints.md`): only the taken side is evaluated, so an
-        # inactive side's indexing, allocation, invalid arithmetic and
-        # derivative work never run.  `_recurrence_branch` is the native
-        # ternary and a backend's lazy conditional region (`stablehlo.if`
-        # under Reactant).  A scalar predicate selecting whole arrays stays a
-        # lazy branch too; elementwise selection is the authored `ifelse.`
-        # broadcast, which is left untouched.
-        return _kernel_tensorized_branch(
-            ex.args[1], ex.args[2],
-            length(ex.args) == 3 ? ex.args[3] : nothing, known, mod, scope;
-            value_used = value_used)
-    elseif ex.head === :&& && length(ex.args) == 2
-        return _kernel_tensorized_branch(
-            ex.args[1], ex.args[2], false, known, mod, scope;
-            value_used = value_used)
-    elseif ex.head === :|| && length(ex.args) == 2
-        return _kernel_tensorized_branch(
-            ex.args[1], true, ex.args[2], known, mod, scope;
-            value_used = value_used)
-    elseif ex.head === :call && !isempty(ex.args) &&
-           (!(ex.args[1] isa Symbol) || !(ex.args[1] in known))
-        reduction = _kernel_generator_sum_parts(ex)
-        if reduction !== nothing
-            lowered = _kernel_tensorized_generator_sum(reduction, known, mod, scope)
-            lowered === nothing || return lowered
-        end
-        replacement = _tensorized_callee_replacement(ex.args[1], mod)
-        callee = replacement === nothing ?
-            _kernel_tensorized_callee(ex.args[1], known, mod) :
-            GlobalRef(@__MODULE__, replacement)
-        arguments = Any[_kernel_tensorized_rhs(arg, known, mod, scope)
-                        for arg in ex.args[2:end]]
-        call = replacement === nothing &&
-               _kernel_tensorized_routed(callee, arguments, mod) ?
-            Expr(:call, GlobalRef(@__MODULE__, :traced), callee, arguments...) :
-            Expr(:call, callee, arguments...)
-        _tensorized_factorization_callee(ex.args[1]) || return call
-        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_factorization), call)
-    elseif ex.head in (:vcat, :hcat) &&
-           !any(arg -> arg isa Expr && arg.head === :row, ex.args)
-        # `[a; b]` / `[a b]` concatenation syntax; `:row`-bearing forms are
-        # `hvcat` semantics and keep their native lowering.
-        return Expr(:call,
-            GlobalRef(@__MODULE__, ex.head === :vcat ?
-                :_tensorized_vcat : :_tensorized_hcat),
-            (_kernel_tensorized_rhs(arg, known, mod, scope) for arg in ex.args)...)
-    elseif ex.head === :vect
-        # A scalar-vector literal (`[a, b, c]`); the companion builds a
-        # real traced vector when any element is traced, and reduces to
-        # `Base.vect` otherwise.
-        return Expr(:call, GlobalRef(@__MODULE__, :_tensorized_vect),
-            (_kernel_tensorized_rhs(arg, known, mod, scope) for arg in ex.args)...)
-    elseif ex.head === :call && !isempty(ex.args)
-        return Expr(:call,
-            _kernel_tensorized_callee(ex.args[1], known, mod),
-            (_kernel_tensorized_rhs(arg, known, mod, scope)
-             for arg in ex.args[2:end])...)
-    end
-    Expr(ex.head,
-         (_kernel_tensorized_rhs(arg, known, mod, scope) for arg in ex.args)...)
-end
-
 """
     @traceable f(args...) = body
     @traceable function f(args...) ... end
 
-Define an ordinary method of `f`, plus the [`ReactiveKernels.traced`](@ref)
-method with the same signature whose body is this body rewritten as a
-`@kernel` recipe body is.  Native execution calls the method as written,
-except that a generator fold over a data-length iterator,
-`sum(term for i in iter [if condition]; init = x)` with `iter` an `eachindex`,
-`axes`, `range` or `a:b` call, runs as its explicit-accumulator loop: Base's
-value, bitwise, without the `Any` that Julia 1.10 infers for a nested Base fold
-(the compiler page, "Lowering and emitted ABI").
-Under a tracing backend (Reactant), a recipe calling `f` reaches the rewritten
-body, so indexing, `get`, lazy branches and data-length loops inside the helper
-lower as they do written in the recipe.  One body serves both; write a
-`traced` method by hand instead when the tracing implementation must differ
-(an opaque or foreign component).
-
-The case it exists for is a per-type rule applied at a traced index, such as a
-dose superposition over several schedule-plan types summed as one retained
-loop:
-
-```julia
-@traceable row_index(t, p::LatticePlan, i) = t - p.shifts[i]
-@traceable row_index(row, ::ExactPlan, i) = row[i]
-
-@kernel cell(plan, units, weights) = begin
-    observations = domain(plan)
-    c::Vector{Float64} = plate(observations) do t
-        sum(weights[i] * get(units, row_index(t, plan, i), 0.0)
-            for i in eachindex(weights); init = 0.0)
-    end
-end
-```
-
-Under the retained loop `i` is a traced value.  Without `@traceable` the
-helper receives it and Reactant refuses the read (`Scalar indexing is
-disallowed`); with it, `p.shifts[i]` and `row[i]` are gathers as in the recipe.
-Dispatch is Julia's: the rewritten method has the authored signature, so each
-plan type selects its own rule.  Annotate the arguments that select the
-method; leave the arguments that carry traced values untyped.
+Define an ordinary method of `f` whose generator folds over a data-length
+iterator, `sum(term for i in iter [if condition]; init = x)` with `iter` an
+`eachindex`, `axes`, `range` or `a:b` call, run as their explicit-accumulator
+loop: Base's value, bitwise, without the `Any` that Julia 1.10 infers for a
+nested Base fold (the compiler page, "Lowering and emitted ABI"). The method's
+source is recorded for source-reading compilers ([`jax_source`](@ref)), and an
+`on_error = :ignore` preparation calls its throw-stripped twin.
 
 Supported: positional arguments with optional defaults, `where` clauses, and
-a return-type annotation (kept on the native method only).  A docstring before
-`@traceable` documents the method, as it does a plain definition.  A `@traceable`
-method of a function from Base, Core or ReactiveKernels is rejected, and so
-are keyword arguments and a `return` before the end of the body (write that
-branch as an expression).  Calls with keyword arguments are not routed to the
-rewritten method.  Calls the body makes to other helpers route through
-`traced` as well.
+a return-type annotation.  A docstring before `@traceable` documents the
+method, as it does a plain definition.  A `@traceable` method of a function
+from Base, Core or ReactiveKernels is rejected, and so are keyword arguments
+and a `return` before the end of the body (write that branch as an
+expression): a source-reading compiler translates the body as one expression.
 """
 macro traceable(def)
     _traceable_definition(def, __module__)
@@ -3904,19 +3270,11 @@ function _traceable_definition(def, mod::Module)
         parameter isa Expr && parameter.head in (:<:, :>:) && (parameter = parameter.args[1])
         parameter isa Symbol && push!(names, parameter)
     end
-    rewritten = _kernel_tensorized_rhs(_traceable_tail_body(body, signature),
-                                       names, mod, copy(names))
-    companion = Expr(:call, GlobalRef(@__MODULE__, :traced),
-                     Expr(:(::), Expr(:call, GlobalRef(Core, :typeof), callee)),
-                     formals...)
-    for layer in reverse(wheres)
-        companion = Expr(:where, companion, layer...)
-    end
+    _traceable_tail_body(body, signature)        # rejects an early `return`
     native = Expr(def.head, def.args[1], _kernel_native_body(body, mod, names))
     ignored = _kernel_ignored_traceable_methods(callee, formals, wheres, body, mod, names)
     source = _traceable_source_method(callee, formals, wheres, body, mod)
-    esc(Expr(:block, _documentable(native), Expr(:(=), companion, rewritten), ignored...,
-             source..., callee))
+    esc(Expr(:block, _documentable(native), ignored..., source..., callee))
 end
 
 # The authored method, marked for a preceding docstring to document it.
@@ -3927,10 +3285,9 @@ _documentable(def) = Expr(:macrocall, GlobalRef(Core, Symbol("@__doc__")), nothi
     @_record_source function f(args...) ... end
 
 Define the method as written and record its source for source-reading
-compilers (`jax_source`), as [`@traceable`](@ref) records it, without the
-`traced` companion: native and traced execution stay exactly the method's.
-For a helper whose compiled form is authored in place (`ReactantCore.@trace`
-control flow) rather than rewritten.
+compilers (`jax_source`), as [`@traceable`](@ref) records it, without
+`@traceable`'s fold rewrite or throw-stripped twin: execution stays exactly
+the method's.
 """
 macro _record_source(def)
     def isa Expr && def.head in (:(=), :function) && length(def.args) == 2 ||
@@ -3983,9 +3340,8 @@ function _traceable_source_method(callee, formals, wheres, body, mod)
     Any[Expr(:(=), signature, Expr(:tuple, QuoteNode(Tuple(names)), QuoteNode(body), mod))]
 end
 
-# The body with its tail-position `return`s replaced by their values: the
-# rewrite turns a branch into thunks, where `return` would leave the thunk
-# rather than the method.  Any other `return` is rejected.
+# The body with its tail-position `return`s replaced by their values, as a
+# source-reading compiler translates it.  Any other `return` is rejected.
 function _traceable_tail_body(ex, signature)
     if ex isa Expr && ex.head === :return
         return _traceable_no_return(isempty(ex.args) ? nothing : only(ex.args), signature)
@@ -4075,8 +3431,8 @@ end
 # Julia lowers a closure it owns (above) itself, and each evaluation of one
 # source defines a new closure type, so each build of one program had its own
 # executable types and compiled its readers and kernels again (snag
-# `compiled-reader-be3cadbb`: the tensorized arms of a branch in a kernel BRM
-# evaluates into a fresh module per build). A closure whose source, up to
+# `compiled-reader-be3cadbb`: the arms of a branch in a kernel BRM evaluates
+# into a fresh module per build). A closure whose source, up to
 # generated names and the owners of its qualified globals (`_canonical_globals`),
 # equals an earlier closure's, from a module that binds every unqualified name
 # the source mentions to the same value, takes that closure's type,
@@ -4161,7 +3517,7 @@ function _kernel_constant_callable(mod, callee)
 end
 
 function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
-                           tensorize::Bool = true,
+                           pure::Bool = true,
                            mod::Union{Module,Nothing} = nothing,
                            nested_specs = Dict{Symbol,Any}(),
                            branch_arms = nothing,
@@ -4185,8 +3541,7 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
             return generated_spec === nothing ? callee : generated_spec
         end
         if callee isa Symbol && !callee_is_port && !_is_broadcast_operator(callee) &&
-           (!tensorize || (_tensorized_callee_replacement(callee, mod) === nothing &&
-                           !_kernel_callee_has_traced_method(callee, mod))) &&
+           (!pure || !_kernel_source_op_callee(callee, mod)) &&
            _native_callee_replacement(callee, mod) === nothing &&
            length(args) == length(deps) &&
            all(i -> args[i] === deps[i], eachindex(args))
@@ -4196,7 +3551,7 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
            _kernel_constant_callable(mod, callee) &&
            length(args) == length(deps) &&
            all(i -> args[i] === deps[i], eachindex(args))
-            call_identity = Expr(:tuple, callee, tensorize)
+            call_identity = Expr(:tuple, callee, pure)
             call_capture_name = callee isa Symbol ? QuoteNode(callee) :
                 callee isa Expr ? QuoteNode(first(callee.args)) : nothing
             resolved_callable = QuoteNode(callee isa GlobalRef ?
@@ -4213,51 +3568,41 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
     deftoken = gensym(:rk_srcop)
     # An effectful recipe is never evaluated at preparation, so it keeps no
     # split nodes; neither does the throw-stripped twin.
-    split &= tensorize
+    split &= pure
     if _kernel_branch_parts(rhs) !== nothing
         # A top-level lazy branch keeps its parts as `_KernelBranch` metadata
         # (same lazy call semantics) so plate partial evaluation can split
         # lanes on a data-bound condition. In a plate cell its leaf arms also
         # carry their graphs (`branch_arms`, `_kernel_plate_branch_arms`).
-        native, _ = _kernel_branch_callable(rhs, deps, known, mod, false;
+        native, _ = _kernel_branch_callable(rhs, deps, known, mod;
                                             arms = branch_arms, split)
-        tensor, _ = _kernel_branch_callable(rhs, deps, known, mod, tensorize; split)
         return Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
              Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
-             Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)), native, tensor)
+             Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)), native)
     end
     reduction = _kernel_reduction_callable(rhs, deps, mod, known)
     if reduction !== nothing
         # A gathered generator sum keeps its parts as `_KernelReduction`
-        # metadata (same call semantics) for the native plate lowering; the
-        # tensorized companion is the ordinary one.
+        # metadata (same call semantics) for the native plate lowering.
         return Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
              Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
-             Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)), reduction,
-             Expr(:->, Expr(:tuple, deps...),
-                  tensorize ? _kernel_tensorized_rhs(rhs, known, mod, Set{Symbol}(deps)) : rhs))
+             Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)), reduction)
     end
     native = Expr(:->, Expr(:tuple, deps...), _kernel_native_body(rhs, mod, known))
-    tensor = Expr(:->, Expr(:tuple, deps...),
-                  tensorize ? _kernel_tensorized_rhs(rhs, known, mod, Set{Symbol}(deps)) : rhs)
     if split && form === :fused
         native = _kernel_split_callable(rhs, deps, native,
                                         _kernel_split_native_body(mod, known))
-        tensor = _kernel_split_callable(rhs, deps, tensor,
-                                        _kernel_split_tensor_body(mod, known))
     end
     Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)),
-         native, tensor, nothing, call_identity, call_capture_name, resolved_callable)
+         native, nothing, call_identity, call_capture_name, resolved_callable)
 end
 
-# Part bodies of a split expression: the same native or tensorized rewrite as
-# its whole body, with the kid placeholders among the closure's own names.
+# Part bodies of a split expression: the same native rewrite as its whole
+# body, with the kid placeholders among the closure's own names.
 _kernel_split_native_body(mod, known) =
     (e, params) -> _kernel_native_body(e, mod, union(known, params))
-_kernel_split_tensor_body(mod, known) =
-    (e, params) -> _kernel_tensorized_rhs(e, union(known, params), mod, Set{Symbol}(params))
 
 # `(condition, then, else)` of a value-producing top-level lazy branch —
 # `c ? a : b` / `if … elseif … else … end` (an `elseif` tail is the nested
@@ -4291,38 +3636,32 @@ end
 # (`(; then_arm, else_arm)`, `_kernel_plate_branch_arms`): a leaf arm's entry
 # is its graph's construction expression or `nothing`.
 function _kernel_branch_callable(part, deps::Vector{Symbol}, known::Set{Symbol},
-                                 mod, tensorize::Bool; leaf::Bool = false,
+                                 mod; leaf::Bool = false,
                                  arms = nothing, split::Bool = false)
     parts = leaf ? nothing : _kernel_branch_parts(part)
     if parts === nothing
         read = Set(_kernel_free_ports(part, Set{Symbol}(deps)))
         ports = Symbol[d for d in deps if d in read]
-        body = tensorize ?
-            _kernel_tensorized_rhs(part, known, mod, Set{Symbol}(ports)) :
-            _kernel_native_body(part, mod, known)
+        body = _kernel_native_body(part, mod, known)
         closure = Expr(:->, Expr(:tuple, ports...), body)
         # An arm leaf runs exactly when its lane takes it, so its split nodes
         # are evaluated at preparation on those lanes only. The condition is
         # read whole.
         if split && !leaf
-            closure = _kernel_split_callable(part, ports, closure, tensorize ?
-                _kernel_split_tensor_body(mod, known) :
+            closure = _kernel_split_callable(part, ports, closure,
                 _kernel_split_native_body(mod, known))
         end
         return closure, ports
     end
     condition, then_side, else_side = parts
     positions(ports) = Tuple(findfirst(==(p), deps) for p in ports)
-    call = Expr(:->, Expr(:tuple, deps...), tensorize ?
-        _kernel_tensorized_rhs(part, known, mod, Set{Symbol}(deps)) :
-        _kernel_native_body(part, mod, known))
-    cex, cports = _kernel_branch_callable(condition, deps, known, mod, tensorize;
-                                          leaf = true)
+    call = Expr(:->, Expr(:tuple, deps...), _kernel_native_body(part, mod, known))
+    cex, cports = _kernel_branch_callable(condition, deps, known, mod; leaf = true)
     then_arms = arms === nothing ? nothing : arms.then_arm
     else_arms = arms === nothing ? nothing : arms.else_arm
-    tex, tports = _kernel_branch_callable(then_side, deps, known, mod, tensorize;
+    tex, tports = _kernel_branch_callable(then_side, deps, known, mod;
         arms = then_arms isa NamedTuple ? then_arms : nothing, split)
-    eex, eports = _kernel_branch_callable(else_side, deps, known, mod, tensorize;
+    eex, eports = _kernel_branch_callable(else_side, deps, known, mod;
         arms = else_arms isa NamedTuple ? else_arms : nothing, split)
     val(ports) = Expr(:call, GlobalRef(Base, :Val), positions(ports))
     leaf_spec(entry) = entry isa NamedTuple || entry === nothing ? nothing :
@@ -4536,7 +3875,7 @@ _kernel_split_shape(ports, split) = (
 # Wrap the closure expression `closure` of authored expression `ex` over
 # `ports` in its `_KernelSplit` construction, or return it unchanged when `ex`
 # has no split node. `body(e, params)` builds a part's function body (the
-# native or the tensorized rewrite of `e`) for closure parameters `params`.
+# native rewrite of `e`) for closure parameters `params`.
 function _kernel_split_callable(ex, ports::Vector{Symbol}, closure, body)
     split = _kernel_split_nodes(ex, ports)
     split === nothing && return closure
@@ -4939,7 +4278,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                 # Materialize it as a hygienic named recipe, then feed that port
                 # through the same broadcast/Ref boundary as explicit authoring.
                 # This is source sugar for `columns = eachcol(matrix); plate(columns)`;
-                # the native/tensorized plate lowerers still own the sole traversal.
+                # the plate lowering still owns the sole traversal.
                 for (name, expression) in plate_expr.materialized_arguments
                     register!(name, nothing)
                     push!(entries,
@@ -5139,7 +4478,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         branch_arms = branch_arm_specs === nothing || length(outputs) != 1 ?
             nothing : get(branch_arm_specs, outputs[1][1], nothing)
         op = plate_expr === nothing ? _kernel_operation(
-            rhs, deps, known; tensorize = !effectful, mod = mod,
+            rhs, deps, known; pure = !effectful, mod = mod,
             nested_specs = nested_specs, branch_arms = branch_arms) :
             plate_expr.operation
         add = :($add_ref($graph_var, $dep_values, $out_values,
@@ -5888,9 +5227,8 @@ This is position batching, not a likelihood `plate`: one scalar parameter
 position is evaluated at each slice while data remains shared. The scalar graph
 stays the mathematical authority, `plan` still owns HAVE/WANT selection and CSE,
 and native execution evaluates independent positions in a generated typed
-driver. Reactant lowers the same map to a retained loop with output buffers; a
-`PreparedADKernel` lifted with [`replica`](@ref) produces one gradient per
-position.
+driver. A `PreparedADKernel` lifted with [`replica`](@ref) produces one
+gradient per position.
 
 The lifted kernel requires pure recipes and retains their internal loops and
 lazy branches. Native execution hoists shared-only recipes, including plates,
@@ -5909,8 +5247,7 @@ are caller-selected: there is no automatic cost threshold. Empty batches and
 one-worker calls use the ordinary serial driver. Scheduled instances, including
 owning ones, retain worker buffers and are not reentrant; use `copy(template)`
 per concurrent caller. Copies share computation and start with empty buffers.
-Owning Reactant calls retain the ordinary compiled position loop. Scheduling
-applies to native primal evaluation; prepare scalar AD with `scalar_kernel` and
+Scheduling applies to native primal evaluation; prepare scalar AD with `scalar_kernel` and
 lift it with `replica` for the existing per-position derivative path.
 
 `reuse=true` opts into native borrowed stacked-output buffers. A later call may
@@ -5926,8 +5263,7 @@ reseed buffers, and buffers aliasing this call's inputs detach. This reuses fina
 outputs and the native lane buffers: batched dense array inputs and the
 position values produced by authored plates and scans, top-level dotted calls
 and array slices, including those values inside a plate's cells other than
-each cell's result. Other scalar recipes may still allocate intermediates. Reactant
-uses the owning surface (`reuse=false`).
+each cell's result. Other scalar recipes may still allocate intermediates.
 
 To bind shared values, lift `prepare(spec; have, want, bound=(; shared...))` with
 `vectorize`. Rebinding new values to the same ports and vectorizing again
@@ -6010,9 +5346,8 @@ recipes that depend only on shared scalar ports are computed once, and the
 single scalar `want` is mapped over the batched values and reduced (a sum by
 default). Pass `reduce = nothing` to collect the per-element wants instead.
 
-The generated map/reduction form is both allocation-free for native reducing
-execution and traceable by array compilers such as Reactant. See
-[`lower_batched`](@ref).
+The generated map/reduction form is allocation-free for native reducing
+execution. See [`lower_batched`](@ref).
 """
 function plate(spec::KernelSpec; have, want, batched, reduce = :+)
     p = plan(spec; have = have, want = want)
@@ -6058,18 +5393,16 @@ With `history = leading` (a vector), the result starts with those entries:
 it is `[leading; output…]`, step `j` writes entry `length(leading) + j`, and
 the last argument is that whole vector, with entries not written yet at
 `zero(eltype(leading))`. A recurrence seeded with `a[1:m]` thus reads its seeds
-and earlier steps from one vector. Native only; the Reactant lowering refuses
-it.
+and earlier steps from one vector.
 
 With `history = (a = leading_a, b = leading_b, ...)`, each named column uses
 the number or vector semantics above independently. The last argument and
 the scan result are named tuples of column vectors; the step returns a named
 tuple of scalar outputs with those same names. Each vector seed contributes
-its own prefix, and each column retains its seed's element type. Native only.
+its own prefix, and each column retains its seed's element type.
 
-It lowers to an ordinary ordered loop natively, and to a `stablehlo.while` carry
-loop under Reactant — so a natural sequential recurrence lowers without unrolling
-into forbidden scalar indexing. This is `@kernel` authoring sugar recognized by
+It lowers to one retained ordered loop, so a natural sequential recurrence
+needs no closed-form rewrite. This is `@kernel` authoring sugar recognized by
 the macro as a recipe's right-hand side, like an authored `plate`; it is not a
 callable runtime function outside a kernel body.
 """

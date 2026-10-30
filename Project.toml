@@ -1,7 +1,7 @@
 name = "ReactiveKernels"
 uuid = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.14"
+version = "0.1.15"
 
 [deps]
 DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
@@ -12,7 +12,6 @@ OutputSignatures = "86cfaae4-1704-4c69-ba62-d919d81ae5f8"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 Preferences = "21216c6a-2e73-6563-6e65-726566657250"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
-ReactantCore = "a3311ec8-5e00-46d5-b541-4f83e724a433"
 RuntimeGeneratedFunctions = "7e49a35a-f44a-4d26-94aa-eba1b4ca6b47"
 
 [weakdeps]
@@ -22,7 +21,6 @@ Enzyme_jll = "7cc45869-7501-5eee-bdea-0790c847d4ef"
 MutatingFunctions = "8a4c2d94-4b3b-4f9e-be63-a3c0cd816e3a"
 OrdinaryDiffEqBDF = "6ad6398a-0878-4a85-9266-38940aa047c8"
 OrdinaryDiffEqLowOrderRK = "1344f307-1e59-4825-a18e-ace9aa3fa4c6"
-Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
 SciMLSensitivity = "1ed8b502-d754-442c-8d5d-10ac956f44a1"
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
@@ -33,7 +31,6 @@ ReactiveKernelsChainRulesCoreExt = "ChainRulesCore"
 ReactiveKernelsEnzymeExt = "Enzyme"
 ReactiveKernelsLowOrderRKExt = ["OrdinaryDiffEqLowOrderRK", "SciMLBase", "SciMLSensitivity"]
 ReactiveKernelsMutatingFunctionsExt = "MutatingFunctions"
-ReactiveKernelsReactantExt = "Reactant"
 ReactiveKernelsSciMLODEExt = ["SciMLBase", "SciMLSensitivity"]
 ReactiveKernelsSpecialFunctionsExt = "SpecialFunctions"
 
@@ -55,8 +52,6 @@ OrdinaryDiffEqBDF = "2.4"
 OrdinaryDiffEqLowOrderRK = "2.2"
 PrecompileTools = "1.2"
 Preferences = "1"
-Reactant = "0.2.289"
-ReactantCore = "0.1"
 RuntimeGeneratedFunctions = "0.5"
 # Core does not use SciMLBase; current BDF and sensitivity weakdeps require 3.x.
 SciMLBase = "2.150, 3.46"

@@ -24,16 +24,6 @@ _axis_counted_sum(values) = (_AXIS_ATOMIC_CALLS[] += 1; sum(values))
 _axis_reference(value, center, width) =
     -0.5 * log(2π) - log(width) - 0.5 * ((value - center) / width)^2
 
-struct _AxisBackendArray <: AbstractVector{Float64}
-    values::Vector{Float64}
-end
-Base.size(marker::_AxisBackendArray) = size(marker.values)
-Base.getindex(marker::_AxisBackendArray, index::Int) = marker.values[index]
-ReactiveKernels._requires_tensorized_marker(::_AxisBackendArray) = true
-ReactiveKernels._batched_call(
-        pair::ReactiveKernels._ArrayFunctionPair, ops, args,
-        ::_AxisBackendArray) = pair.tensorized(ops, args...)
-
 @testset "plate: graph dependencies determine broadcast-axis frequency" begin
     graph = Graph()
     x = value!(graph, :x, Float64)
@@ -137,18 +127,6 @@ ReactiveKernels._batched_call(
         @test atomic_kernel(values, Ref(shared_offsets)) == values .+ 1.0
         @test _AXIS_ATOMIC_CALLS[] == 1
     end
-
-
-    @testset "a later traced HAVE selects tensorized lowering" begin
-        native = (ops, args...) -> :native
-        tensorized = (ops, args...) -> :tensorized
-        pair = ReactiveKernels._BatchedFunctionPair{
-            1,(:x, :scale),:+,typeof(native),typeof(tensorized)}(
-                native, tensorized)
-        @test pair((), observations, scale_grid) === :native
-        @test pair((), observations, _AxisBackendArray(scales)) ===
-              :tensorized
-    end
 end
 
 # One scalar per-observation Gaussian log density, authored once.
@@ -212,14 +190,13 @@ _plate_call(k, xs, μ, logσ) = k(xs, μ, logσ)
         @test occursin("-0.5", readable)
     end
 
-    @testset "two-level composition preserves native and tensorized products" begin
+    @testset "two-level composition keeps one native loop product" begin
         outer = prepare(embedded_plate_outer;
             have = (:x, :μ, :logσ), want = :total)
         @test outer(xs, μ, logσ) ≈ k(xs, μ, logσ)
-        @test embedded_plate_middle.f isa ReactiveKernels._EmbeddedFunctionPair
-        @test outer.f isa ReactiveKernels._EmbeddedFunctionPair
+        @test embedded_plate_middle.f isa ReactiveKernels._ArrayFunction
+        @test outer.f isa ReactiveKernels._ArrayFunction
         @test occursin("for ", string(code_expr(outer)))
-        @test !occursin("for ", string(outer.f.tensorized_ast))
         @test !any(op -> op isa ReactiveKernels.PreparedKernel, outer.ops)
         @test length(outer.ops) == length(embedded_plate_nlogpdf.ops)
     end

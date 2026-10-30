@@ -60,8 +60,8 @@ const REQUIRED_FRONTIER_CAPABILITIES = (
 """
 Independent-oracle contract shared by every corpus entry.
 
-The expected state may not be produced by ReactiveKernels lowering, Reactant,
-or a re-expression that shares the candidate's implementation.  Recorded RNG
+The expected state may not be produced by ReactiveKernels lowering or a
+re-expression that shares the candidate's implementation.  Recorded RNG
 draws are inputs to replay, not replacement expected outputs.
 """
 const INDEPENDENT_ORACLE_CONTRACT = (
@@ -81,7 +81,6 @@ const INDEPENDENT_ORACLE_CONTRACT = (
     exact_rule = :exact_for_control_rng_order_and_ownership,
     prohibited_authorities = (
         :candidate_reactivekernels_lowering,
-        :candidate_reactant_executable,
         :same_engine_reimplementation,
     ),
 )
@@ -89,7 +88,7 @@ const INDEPENDENT_ORACLE_CONTRACT = (
 # Each entry is a logical algorithm rather than every local helper.  `members`
 # names overloads or public operations whose semantics are part of that entry.
 # Every entry has the same terminal gate: the minimally translated mathematical
-# source must execute natively and through Reactant via the generic compiler.
+# source must execute natively via the generic compiler.
 const CORPUS = (
     (
         id = :relativistic_kinetic_energy,
@@ -100,7 +99,7 @@ const CORPUS = (
                         :captured_callable_and_constant_ports, :unsupported_operation_rejection),
         oracle = :deterministic_upstream,
         comparison = :numeric_state,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :euclidean_phasepoint,
@@ -111,7 +110,7 @@ const CORPUS = (
                         :captured_callable_and_constant_ports),
         oracle = :deterministic_upstream,
         comparison = :numeric_state,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :riemannian_phasepoint,
@@ -121,7 +120,7 @@ const CORPUS = (
         capabilities = (:derived_mutable_state, :linear_algebra, :mapped_slices, :callback_effects),
         oracle = :deterministic_upstream,
         comparison = :numeric_state,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :softabs_phasepoint,
@@ -131,7 +130,7 @@ const CORPUS = (
         capabilities = (:derived_mutable_state, :eigendecomposition, :data_dependent_control, :mapped_slices),
         oracle = :deterministic_upstream,
         comparison = :numeric_state,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :relativistic_euclidean_phasepoint,
@@ -141,7 +140,7 @@ const CORPUS = (
         capabilities = (:derived_mutable_state, :linear_algebra, :scalar_parameters),
         oracle = :deterministic_upstream,
         comparison = :numeric_state,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :relativistic_riemannian_phasepoint,
@@ -151,7 +150,7 @@ const CORPUS = (
         capabilities = (:derived_mutable_state, :linear_algebra, :mapped_slices, :scalar_parameters),
         oracle = :deterministic_upstream,
         comparison = :numeric_state,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :relativistic_softabs_phasepoint,
@@ -161,7 +160,7 @@ const CORPUS = (
         capabilities = (:derived_mutable_state, :eigendecomposition, :data_dependent_control, :mapped_slices, :scalar_parameters),
         oracle = :deterministic_upstream,
         comparison = :numeric_state,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :leapfrog,
@@ -171,7 +170,7 @@ const CORPUS = (
         capabilities = (:derived_mutable_state, :ordered_mutation, :ownership_and_copy),
         oracle = :mutating_upstream,
         comparison = :ordered_numeric_mutation,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :generalized_leapfrog,
@@ -182,7 +181,7 @@ const CORPUS = (
         capabilities = (:derived_mutable_state, :static_iteration, :ordered_mutation, :ownership_and_copy),
         oracle = :mutating_upstream,
         comparison = :ordered_numeric_mutation,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :implicit_midpoint,
@@ -193,7 +192,7 @@ const CORPUS = (
         capabilities = (:derived_mutable_state, :static_iteration, :ordered_mutation, :ownership_and_copy),
         oracle = :mutating_upstream,
         comparison = :ordered_numeric_mutation,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :multistep,
@@ -204,7 +203,7 @@ const CORPUS = (
         capabilities = (:static_iteration, :higher_order_calls, :keyword_forwarding),
         oracle = :mutating_upstream,
         comparison = :ordered_numeric_mutation,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :fixed_step_hmc,
@@ -215,7 +214,7 @@ const CORPUS = (
         capabilities = (:derived_mutable_state, :static_iteration, :data_dependent_control, :early_exit, :rng_effects, :diagnostics, :ownership_and_copy),
         oracle = :recorded_rng_upstream,
         comparison = :rng_control_and_state,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :nuts,
@@ -229,7 +228,7 @@ const CORPUS = (
                         :explicit_capacity_and_overflow),
         oracle = :recorded_rng_upstream,
         comparison = :rng_control_and_state,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :dual_averaging,
@@ -239,7 +238,7 @@ const CORPUS = (
         capabilities = (:derived_mutable_state, :stateful_update),
         oracle = :mutating_upstream,
         comparison = :ordered_numeric_mutation,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :welford_variance,
@@ -249,7 +248,7 @@ const CORPUS = (
         capabilities = (:derived_mutable_state, :stateful_update, :static_iteration, :overloaded_entrypoints),
         oracle = :mutating_upstream,
         comparison = :ordered_numeric_mutation,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :trajectory_statistics,
@@ -262,7 +261,7 @@ const CORPUS = (
                         :explicit_capacity_and_overflow),
         oracle = :ordered_collection_upstream,
         comparison = :ordered_values_and_aliases,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :sampling_statistics,
@@ -273,7 +272,7 @@ const CORPUS = (
         capabilities = (:derived_mutable_state, :diagnostics, :dynamic_collections, :ownership_and_copy),
         oracle = :ordered_collection_upstream,
         comparison = :ordered_values_and_aliases,
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
 )
 
@@ -355,10 +354,8 @@ const REVIEW_STAGES = (
      evidence = (:separate_process_receipt, :raw_inputs, :raw_observables)),
     (stage = :native_reactive_parity, owner = :hmc_semantics,
      evidence = (:native_result, :mutation_trace, :ownership_checks)),
-    (stage = :generic_reactant_lowering, owner = :reactant_compiler,
-     evidence = (:same_authored_kernel, :generic_lowering_certificate, :compiled_result)),
     (stage = :independent_acceptance, owner = :non_candidate_reviewer,
-     evidence = (:oracle_receipt_validation, :native_comparison, :reactant_comparison)),
+     evidence = (:oracle_receipt_validation, :native_comparison)),
 )
 
 end # module ReactiveHMCAlgorithmCorpus

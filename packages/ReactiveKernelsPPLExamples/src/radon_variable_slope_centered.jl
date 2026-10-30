@@ -99,7 +99,7 @@ using LogExpFunctions: logistic, log1pexp
 
     # Hierarchical integer-array GATHER, done OUTSIDE any plate: the per-county
     # SLOPE gathered by the concrete data index. The docs_example binds
-    # `county_idx` at preparation so the Reactant path traces only floats + the
+    # `county_idx` at preparation so the prepared kernel takes only floats + the
     # parameter vector.
     beta_county = beta[county_idx]
 
@@ -129,7 +129,7 @@ floor_measure = RADON_VSC_FLOOR
 log_radon = RADON_VSC_LOG
 
 requested_nodes = (:parameters, :log_jacobian, :prior, :likelihood, :posterior)
-# Bind the integer gather index (spec addendum): the Reactant path then traces
+# Bind the integer gather index (spec addendum): the prepared kernel then takes
 # only the float inputs + the parameter vector.
 density_kernel = prepare(model;
     have = (:unconstrained, :county_idx, :floor_measure, :log_radon),

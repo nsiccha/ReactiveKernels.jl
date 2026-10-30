@@ -172,8 +172,8 @@ Build the posteriordb `iohmm_reg` model as a declarative
 probabilities `softmax_j(u[t]·w[j])` and emission means `u[t]·b[j]` both depend
 on a per-observation input vector `u[t] ∈ ℝ^M`. The forward-algorithm marginal
 likelihood is authored as a `scan` over a K-vector belief carry, each step
-reading its input-dependent transition/emission rows (lowers to a
-stablehlo.while carry loop). The Stan quirk that the transition enters the
+reading its input-dependent transition/emission rows (one retained carry
+loop). The Stan quirk that the transition enters the
 accumulator indexed by the PREVIOUS state only (`logA[t][i]`, the same for every
 current state) is reproduced exactly. Priors `w,b ~ N(0,5)`, `sigma ~ N(0,3)`;
 inverse-ILR simplex for `pi1` and `exp` for `sigma`. Named nodes for `pi1`,

@@ -1,5 +1,9 @@
 # What work accounts for the motorcycle timings?
 
+> **Historical analysis.** ReactiveKernels no longer has a Reactant path. The
+> Reactant numbers here were measured with that removed path, and the scripts
+> that produced them were removed with it.
+
 The full v2 comparison verifies the same normalized density and all 44
 derivatives against both references. That establishes mathematical parity;
 it does not require the compilers to execute identical operations.

@@ -1,7 +1,6 @@
 # Weibull response (SB `weibull` mirror): surface admission, value
 # parity vs a Distributions.jl oracle (literal / LogNormal-sampled /
-# per-observation k), Enzyme-vs-findiff gradients, Reactant/XLA
-# value+grad (in test_weibull_reactant.jl), O(1) emission, and W1 SB parity vs the peer lane's
+# per-observation k), Enzyme-vs-findiff gradients, O(1) emission, and W1 SB parity vs the peer lane's
 # BridgeStan numbers (brief 2026-09-27T10-57-58-691-f8l4sr on
 # BayesianRegressionModels:rk:parity-fam-weibull-probe). (`_findiff_grad`
 # / `_GEN_BACKEND` come from test_generator.jl, included first.)

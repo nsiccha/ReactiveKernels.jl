@@ -1,7 +1,6 @@
 # Occupancy building blocks (detection masking on the logit scale +
 # `logaddexp.` marginalization in derived columns): surface admission,
-# value parity vs hand oracles and Enzyme-vs-findiff gradients;
-# test_occupancy_reactant.jl adds Reactant/XLA value+grad. Full per-model occupancy programs
+# value parity vs hand oracles and Enzyme-vs-findiff gradients. Full per-model occupancy programs
 # (`multi_occupancy`, `mt`, `mtbh_model`, `mth_model`) extend this file.
 # (`_check_gradient` / `_findiff_grad` / `_GEN_BACKEND` come from
 # test_generator.jl, included first.)

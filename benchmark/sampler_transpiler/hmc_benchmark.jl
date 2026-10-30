@@ -7,14 +7,14 @@ include("position_multinomial_hmc_kernel.jl")
 const F = NUTSBMutationAuthoringFixture
 
 """Prepare the existing authored multinomial HMC loop for any RK density/AD pair."""
-function prepare_hmc(density, ad, position, rng; backend=:native,
+function prepare_hmc(density, ad, position, rng;
         transitions=1000, steps=16, stepsize=0.03,
         metric=Diagonal(ones(length(position))), context=())
     point = transpiled_endpoint(F.euclidean_phasepoint, F.leapfrog!,
         CallbackHandle(Potential(density, context)),
         CallbackHandle(Gradient(ad, context)), metric, position, zeros(length(position)))
     prepare_transpiled(PositionMultinomialHMCAuthoring.multinomial_hmc_state, point;
-        backend, method=:step!, argument=rng, iterations=transitions,
+        method=:step!, argument=rng, iterations=transitions,
         kernel_kwargs=(n_steps=steps, step_f=F.leapfrog!, stepsize),
         outputs=(position=(:init, :pos),))
 end
@@ -24,13 +24,13 @@ Measure synchronized batches through the public transpiled-program interface.
 RNG construction and result inspection are outside timing; wrapper-owned state
 copies/output snapshots remain inside. This measures throughput, not ESS.
 """
-function benchmark_hmc(density, ad, position, make_rng; backend=:native,
+function benchmark_hmc(density, ad, position, make_rng;
         transitions=1000, steps=16, stepsize=0.03, rounds=9,
         metric=Diagonal(ones(length(position))), context=())
     transitions > 0 && steps > 0 && rounds > 0 || error("positive work counts required")
     rng = make_rng(0)
     prepare_seconds = @elapsed program = prepare_hmc(density, ad, position, rng;
-        backend, transitions, steps, stepsize, metric, context)
+        transitions, steps, stepsize, metric, context)
     state = initial_transpiled_state(program)
     first_seconds = @elapsed first_result = program(state, rng)
     inspect(result) = begin
@@ -78,7 +78,7 @@ function benchmark_hmc(density, ad, position, make_rng; backend=:native,
     end
     moved > 0 || error("continuation never moved")
     any(>(0), displacements) || error("timed batches never moved from their initial position")
-    Dict("backend"=>string(backend), "transitions"=>transitions,
+    Dict("backend"=>"native", "transitions"=>transitions,
         "leapfrog_steps"=>steps, "leapfrog_steps_per_batch"=>transitions*steps,
         "stepsize"=>stepsize, "rounds"=>rounds, "extra_warmup_batches"=>warmup_batches,
         "warmup_seconds"=>warmup_seconds, "warmup_gc_seconds"=>warmup_gc_seconds,

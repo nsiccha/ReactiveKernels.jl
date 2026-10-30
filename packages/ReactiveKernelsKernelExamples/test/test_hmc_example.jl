@@ -1,7 +1,7 @@
 using ReactiveKernelsKernelExamples.HMCExample
 
 # The scalar single-chain HMC transition is the one mathematical source of truth RK batches
-# (via `replica`, ext/Reactant) into the multi-chain form. This test pins that the scalar
+# (via `replica`) into the multi-chain form. This test pins that the scalar
 # source is authored in the current `@kernel` syntax, plans/prepares, and samples correctly.
 @testset "Scalar HMC transition example" begin
     source = only(HMCExample.all_sources())
@@ -13,7 +13,7 @@ using ReactiveKernelsKernelExamples.HMCExample
         # scalar source auto-batchable over chains.
         @test occursin("accept ? qL : q", source)
         # Momentum + MH uniform are injected HAVE ports (deterministic transition, no RNG in
-        # the kernel) — the backend-neutral seam `replica` and Reactant rely on.
+        # the kernel) — the seam `replica` relies on.
         @test occursin("p0::Vector{Float64}", source)
         @test occursin(r"u::Float64", source)
         # grad_U / pot are ordinary scalar closures (Vector -> Vector / Vector -> scalar),

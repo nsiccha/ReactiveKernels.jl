@@ -156,26 +156,25 @@ end
     end
 end
 
-# Programs whose response locations are values, with the observed `levels`
-# and the `optimize` mode Reactant compiles them with.
+# Programs whose response locations are values, with the observed `levels`.
 function _vl_increment2_programs(levels)
     return [
         ("s ~ Exponential(1); y .~ Normal.(c,s)",
-            Dict{Symbol,Any}(:y => [0.1, -0.3, 0.7], :c => 0.3), :only_enzyme),
+            Dict{Symbol,Any}(:y => [0.1, -0.3, 0.7], :c => 0.3)),
         ("a ~ Normal(0,1); m = exp(a); y .~ Normal.(m,1.2)",
-            Dict{Symbol,Any}(:y => [0.1, -0.3, 0.7]), true),
+            Dict{Symbol,Any}(:y => [0.1, -0.3, 0.7])),
         ("a ~ Normal(0,1); y .~ Normal.(exp(a),1.2)",
-            Dict{Symbol,Any}(:y => [0.1, -0.3, 0.7]), true),
+            Dict{Symbol,Any}(:y => [0.1, -0.3, 0.7])),
         ("a ~ Normal(0,1); y .~ CategoricalLogit.(a,0.2)",
-            Dict{Symbol,Any}(:y => levels), true),
+            Dict{Symbol,Any}(:y => levels)),
         ("a ~ Normal(0,1); c ~ Ordered(Normal(0,1),2); " *
-            "y .~ OrderedLogistic.(a,Ref(c))", Dict{Symbol,Any}(:y => levels), true),
+            "y .~ OrderedLogistic.(a,Ref(c))", Dict{Symbol,Any}(:y => levels)),
         ("a ~ Normal(0,1); c[1:2] .~ Normal.(0,1); " *
             "y .~ Ordinal.(StoppingRatio(),LogitLink(),a,Ref(c))",
-            Dict{Symbol,Any}(:y => levels), true),
+            Dict{Symbol,Any}(:y => levels)),
         ("a ~ Normal(0,1); L_scales[1:2] .~ Exponential.(1); L_L_corr ~ LKJCholesky(2,2); L = L_scales .* L_L_corr; " *
             "[y,z] ~ MvNormalCholesky([a,0.2],L)",
-            Dict{Symbol,Any}(:y => [0.1, -0.3, 0.7], :z => [0.4, 0.7, -0.2]), true),
+            Dict{Symbol,Any}(:y => [0.1, -0.3, 0.7], :z => [0.4, 0.7, -0.2])),
     ]
 end
 
@@ -190,7 +189,7 @@ _vl_bigger(data) = Dict{Symbol,Any}(k => v isa AbstractVector ? repeat(v, 3) : v
     for ys in (levels, repeat(levels, 3))
         @test all(!_kinv_arithmetic(findall(==(k), ys)) for k in 1:3)
     end
-    for (body, data, _) in _vl_increment2_programs(levels)
+    for (body, data) in _vl_increment2_programs(levels)
         bigger = _vl_bigger(data)
         prog = _vl_program(body)
         small_plan = bind_data(lower_rkppl(prog, data; conditioned = data), data)

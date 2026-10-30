@@ -72,7 +72,7 @@ const CORPUS = (
             atol = 1e-12,
             rtol = 1e-12,
         ),
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
     (
         id = :pathfinder_jl_compact_lbfgs,
@@ -113,7 +113,7 @@ const CORPUS = (
             atol = 1e-12,
             rtol = 1e-12,
         ),
-        minimum_acceptance = :native_and_reactant,
+        minimum_acceptance = :native,
     ),
 )
 

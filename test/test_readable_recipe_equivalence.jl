@@ -1,22 +1,5 @@
 using Test, ReactiveKernels
 
-@testset "embedded readable recipes preserve graph wiring" begin
-    recipe(id, inputs, outputs) = ReactiveKernels.Recipe(id, inputs, outputs,
-        identity, 1.0, nothing, false)
-    a, b, c = (value(:a, Float64), value(:b, Float64), value(:c, Float64))
-    x, y, z = (value(:a, Float64), value(:b, Float64), value(:c, Float64))
-    left = [recipe(1, (a,), (b,)), recipe(2, (b,), (c,))]
-    renamed = [recipe(1, (x,), (y,)), recipe(2, (y,), (z,))]
-    @test ReactiveKernels._same_readable_recipes(left, renamed)
-
-    # A second value with the same readable name is a different graph edge.
-    disconnected = [recipe(1, (x,), (y,)),
-        recipe(2, (value(:b, Float64),), (z,))]
-    @test !ReactiveKernels._same_readable_recipes(left, disconnected)
-    @test !ReactiveKernels._same_readable_recipes(left,
-        [recipe(1, (x,), (y,)), recipe(2, (y,), (value(:c, Int),))])
-end
-
 # A law whose component plate nests an observation plate, composed into the
 # cells of an enclosing plate, as the whole-event mixture laws are.
 @kernel _weighted_log_sum(scores::Vector{Float64}, weights::Vector{Float64}) = begin
@@ -46,21 +29,20 @@ end
     return sum(scores)
 end
 
-@testset "backend products of one preparation share nested cell plans" begin
+@testset "lowerings of one preparation share nested cell plans" begin
     RK = ReactiveKernels
     # Composing a nested cell's plate chains gives the composed values fresh
-    # identities. Each product composed separately, so a fresh value could take
+    # identities. Each lowering composed separately, so a fresh value could take
     # an identity a package image had already given another value of the same
     # program, and preparation refused it (snag readable-recipe-75581e09).
     p = plan(_event_mixtures)
-    @test RK._needs_embedded_tensorization(p)
-    native, tensorized = RK._sharing_cell_plans() do
+    @test RK._owns_array_regions(p)
+    first_lowering, second_lowering = RK._sharing_cell_plans() do
         lowered = RK._lowering_plan(p)
-        (RK._lower_with_ops(lowered), RK._lower_with_ops(lowered; tensorized = true))
+        (RK._lower_with_ops(lowered), RK._lower_with_ops(lowered))
     end
     identities(recipes) = [v.id for r in recipes for v in (r.inputs..., r.outputs...)]
-    @test identities(native[3]) == identities(tensorized[3])
-    @test RK._same_readable_recipes(tensorized[3], native[3])
+    @test identities(first_lowering[3]) == identities(second_lowering[3])
     events = [Bool[1, 0, 1], Bool[0, 0, 1], Bool[1, 1, 1]]
     probabilities = [0.3 0.8; 0.6 0.2; 0.5 0.5]
     weights = [0.4, 0.6]

@@ -19,9 +19,9 @@ end
 end
 
 # BEGIN scalar consumer
-function scalar_example(; backend=:native)
+function scalar_example()
     program = prepare_transpiled(accumulating_value, 1.0;
-        backend, method=:advance!, argument=2.0, outputs=(value=:value,))
+        method=:advance!, argument=2.0, outputs=(value=:value,))
     initial = initial_transpiled_state(program)
     first = program(initial, 2.0)                 # value = 9
     continued = program(first.state, 3.0)         # value = 21
@@ -31,10 +31,10 @@ end
 # END scalar consumer
 
 # BEGIN vector consumer
-function vector_example(; backend=:native)
+function vector_example()
     input = [2.0, 4.0]
     program = prepare_transpiled(vector_relaxation, input;
-        backend, method=:advance!, argument=zeros(2),
+        method=:advance!, argument=zeros(2),
         outputs=(position=:position, squared=:squared))
     initial = initial_transpiled_state(program)
     first = program(initial, zeros(2))           # position = [0.5, 1.0]

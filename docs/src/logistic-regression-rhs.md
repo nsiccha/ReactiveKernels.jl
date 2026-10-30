@@ -55,18 +55,3 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
     setup = Main.ReactiveKernelsDocs.setup_logistic_regression_rhs!,
 )
 ```
-
-## Reactant
-
-The exact authored graph compiles and executes through the public Reactant
-boundary with value and gradient parity — `benchmark/batch1_gate.jl` `@compile`s
-both the primal and the gradient and asserts they match the native evaluation and
-the reference `.stan`. The horseshoe transforms (`lambda_tilde`, the `exp`
-scales), the `d = 1536` linear predictor, and the logit-route Bernoulli
-likelihood all lower cleanly.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.LogisticRegressionRHSExample.demo()'
-```

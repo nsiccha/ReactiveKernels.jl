@@ -160,9 +160,9 @@ using LogExpFunctions: logistic, log1pexp
 
     # Hierarchical integer-array GATHERS, done OUTSIDE any plate: each varying
     # intercept is gathered by its concrete data index into a length-N vector.
-    # A traced integer index does not lower, so the docs_example binds the five
-    # index vectors at preparation; then each gather traces as a concrete gather
-    # and the Reactant path sees only the float inputs + the parameter vector.
+    # The docs_example binds the five index vectors at preparation; then each
+    # gather reads a concrete index and the prepared kernel takes only the
+    # float inputs + the parameter vector.
     mu_a = a[age]
     mu_b = b[edu]
     mu_c = c[age_edu]
@@ -229,7 +229,7 @@ n_region_full = E88_N_REGION
 
 requested_nodes = (:parameters, :log_jacobian, :log_prior, :likelihood, :posterior)
 # Bind the integer gathers and group sizes so `a.inputs` excludes them and the
-# Reactant path traces only the float inputs + the parameter vector.
+# prepared kernel takes only the float inputs + the parameter vector.
 density_kernel = prepare(model;
     have = (:unconstrained, :age, :edu, :age_edu, :state, :region_full,
             :black, :female, :v_prev_full, :y,

@@ -84,9 +84,9 @@ using LogExpFunctions: logistic
 
     # 2-D IRT structure flattened to 1-D via concrete-index GATHERS done OUTSIDE
     # any plate: each (question k, student j) cell reads theta[j] and alpha[k].
-    # A traced integer index does not lower, so docs_example binds both indices;
-    # then the gathers trace as concrete gathers and the Reactant path sees only
-    # the float parameters + the integer response observation.
+    # docs_example binds both indices; then the gathers read concrete indices
+    # and the prepared kernel takes only the float parameters + the integer
+    # response observation.
     theta_flat = theta[student_idx]
     alpha_flat = alpha[question_idx]
 
@@ -124,8 +124,8 @@ question_idx = LSAT_QUESTION_IDX
 response = LSAT_RESP_FLAT
 
 requested_nodes = (:parameters, :log_jacobian, :prior, :likelihood, :posterior)
-# Bind the integer gather indices so `a.inputs` excludes them and the Reactant
-# path traces only the float parameters + the integer response (spec addendum).
+# Bind the integer gather indices so `a.inputs` excludes them and the prepared
+# kernel takes only the float parameters + the integer response (spec addendum).
 density_kernel = prepare(model;
     have = (:unconstrained, :student_idx, :question_idx, :response),
     want = requested_nodes,

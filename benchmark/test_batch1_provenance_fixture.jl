@@ -1,5 +1,5 @@
 # Focused producer/receipt contract for incremental all80 batches.
-# Stdlib-only: no RK, Enzyme, Reactant, PosteriorDB, model execution, or measurement.
+# Stdlib-only: no RK, Enzyme, PosteriorDB, model execution, or measurement.
 include(joinpath(@__DIR__, "all80_receipt.jl"))
 using Random
 using Test
@@ -17,7 +17,6 @@ function _snapshot(tmp; phase, run_id = "run-1", keys = ["m1"],
     snap = freeze_provenance!(; packages = Dict("tmppkg" => tmp),
         upstream_hash = "a7ef985b", harness_files = [
             "all80_posteriordb.jl", "all80_posteriordb_body.jl",
-            "all80_reactant_body.jl", "all80_reactant_evals.jl",
             "all80_registry.jl", "all80_receipt.jl", "all80_axes.jl",
             "all80_metadata.jl", "all80_parity.jl"],
         extra = Dict{String,Any}("batch" => batch, "phase" => phase,
@@ -44,12 +43,10 @@ function _complete_row()
         "gradient_turing" => 1.0, "gradient_stan" => 1.0,
         "hmc_ahmc_turing" => 1.0, "primal_rk" => 1.0,
         "gradient_rk" => 1.0, "hmc_rk_native" => 1.0,
-        "primal_rk_reactant" => 1.0, "gradient_rk_reactant" => 1.0,
-        "hmc_rk_reactant" => 1.0, "primal_opt_stan" => "deferred",
+        "primal_opt_stan" => "deferred",
         "primal_further_turing" => "deferred", "gradient_opt_stan" => "deferred",
         "gradient_further_turing" => "deferred", "parity_pass" => true,
-        "input_identity_native" => _identity("native"),
-        "input_identity_reactant" => _identity("reactant"))
+        "input_identity_native" => _identity("native"))
 end
 
 @testset "actual parent producer seams" begin
@@ -62,12 +59,11 @@ end
     write(producer_source, replace(source,
         entrypoint => "nothing", "@__DIR__" => repr(@__DIR__)))
     Base.include(producer, producer_source)
-    for phase in ("native", "reactant")
-        files = producer._phase_harness_files(phase)
-        @test "all80_receipt.jl" in files
-        @test all(f -> endswith(f, ".jl"), files)
-        @test count(f -> occursin("eight_schools_density", f), files) == 1
-    end
+    files = producer._phase_harness_files("native")
+    @test "all80_receipt.jl" in files
+    @test all(f -> endswith(f, ".jl"), files)
+    @test all(f -> isfile(joinpath(@__DIR__, f)), files)
+    @test count(f -> occursin("eight_schools_density", f), files) == 1
     @test length(rand(RandomDevice(), UInt8, 16)) == 16
 end
 
@@ -124,21 +120,6 @@ end
     @test certified["loaded_modules_certified"] == true
 end
 
-@testset "Reactant numeric digest helper seam" begin
-    source = read(joinpath(@__DIR__, "all80_reactant_body.jl"), String)
-    start = findfirst("_numeric_vector_sha256(values) =", source)
-    stop = findfirst("\nfunction reference_valid_probe", source)
-    start !== nothing && stop !== nothing && first(stop) > first(start) ||
-        error("could not extract numeric digest helper")
-    helper = source[first(start):first(stop)-1]
-    harness = Module(:ReactantDigestHarness, true, true)
-    Core.eval(harness, :(import Main.SHA))
-    Base.include_string(harness, helper)
-    @test length(harness._numeric_vector_sha256([0.1, -0.2])) == 64
-    @test harness._numeric_vector_sha256([0.1, -0.2]) ==
-        harness._numeric_vector_sha256([0.1, -0.2])
-end
-
 @testset "incremental source lock, loaded-root gate, and exact receipt publication" begin
     tmp = mktempdir(); mkpath(joinpath(tmp, "src")); mkpath(joinpath(tmp, "ext"))
     write(joinpath(tmp, "Project.toml"), "name = \"tmppkg\"\n")
@@ -185,33 +166,30 @@ end
     @test_throws ErrorException verify_provenance()
     write(joinpath(tmp, "ext", "x_ext.jl"), "const B = 2\n")
 
-    # Build a complete two-phase, exact-key receipt from producer-like snapshots.
+    # Build a complete exact-key receipt from a producer-like snapshot.
     certified_snapshot = _snapshot(gitroot; phase = "native")
     _PROV_START[] = certified_snapshot
     certified_snapshot = certify_loaded_modules!(
         Dict{String,Any}("tmppkg" => CertPkg))
     native_snapshot = _snapshot(gitroot; phase = "native")
-    reactant_snapshot = _snapshot(gitroot; phase = "reactant")
-    for snapshot in (native_snapshot, reactant_snapshot)
-        snapshot["loaded_module_paths"] = certified_snapshot["loaded_module_paths"]
-        snapshot["module_versions"] = certified_snapshot["module_versions"]
-        snapshot["loaded_modules_certified"] = true
-    end
-    native = joinpath(tmp, "native.toml"); reactant = joinpath(tmp, "reactant.toml")
+    native_snapshot["loaded_module_paths"] = certified_snapshot["loaded_module_paths"]
+    native_snapshot["module_versions"] = certified_snapshot["module_versions"]
+    native_snapshot["loaded_modules_certified"] = true
+    native = joinpath(tmp, "native.toml")
     write_phase(native, "native", Dict("m1" => _complete_row());
         provenance = native_snapshot)
-    write_phase(reactant, "reactant", Dict("m1" => _complete_row());
-        provenance = reactant_snapshot)
     parsed_native = TOML.parsefile(native)
     @test parsed_native["source_id"] == native_snapshot["source_id"]
     @test parsed_native["run_id"] == "run-1"
 
     out = joinpath(tmp, "batch1.toml")
-    aggregate([native, reactant], out; meta = Dict{String,Any}(
+    aggregate([native], out; meta = Dict{String,Any}(
         "batch" => "batch1", "args" => ["m1"]), preserve_provenance = true,
-        require_phases = ["native", "reactant"], expected_keys = ["m1"],
+        require_phases = ["native"], expected_keys = ["m1"],
         batch = "batch1")
-    @test isempty(validate_batch(out; expected_keys = ["m1"],
+    @test isempty(validate_batch(out; expected_keys = ["m1"], batch = "batch1"))
+    # A historical two-phase validation demands the Reactant provenance and identities.
+    @test !isempty(validate_batch(out; expected_keys = ["m1"],
         phases = ("native", "reactant"), batch = "batch1"))
     bad_identity = TOML.parsefile(out)
     row = bad_identity["models"]["m1"]
@@ -222,26 +200,17 @@ end
     row["input_identity_native"]["query"]["points"] = []
     bad_path = joinpath(tmp, "bad-identity.toml")
     open(bad_path, "w") do io; TOML.print(io, bad_identity; sorted = true); end
-    @test !isempty(validate_batch(bad_path; expected_keys = ["m1"],
-        phases = ("native", "reactant"), batch = "batch1"))
+    @test !isempty(validate_batch(bad_path; expected_keys = ["m1"], batch = "batch1"))
     extra_phase = TOML.parsefile(out)
     extra_phase["meta"]["provenance"]["unexpected"] =
         extra_phase["meta"]["provenance"]["native"]
     extra_path = joinpath(tmp, "extra-phase.toml")
     open(extra_path, "w") do io; TOML.print(io, extra_phase; sorted = true); end
-    @test !isempty(validate_batch(extra_path; expected_keys = ["m1"],
-        phases = ("native", "reactant"), batch = "batch1"))
+    @test !isempty(validate_batch(extra_path; expected_keys = ["m1"], batch = "batch1"))
 
-    # The actual producer writes provenance on BOTH phase paths, including Reactant.
-    @test Set(keys(TOML.parsefile(out)["meta"]["provenance"])) ==
-        Set(["native", "reactant"])
+    @test Set(keys(TOML.parsefile(out)["meta"]["provenance"])) == Set(["native"])
     @test All80Receipt.selected_point_stan_parity_ok(9.0, 10.0, 1.0)
     @test !All80Receipt.selected_point_stan_parity_ok(9.0, 11.0, 1.0)
-    reactant_evals = read(joinpath(@__DIR__, "all80_reactant_evals.jl"), String)
-    reactant_body = read(joinpath(@__DIR__, "all80_reactant_body.jl"), String)
-    @test occursin("All80Receipt.selected_point_stan_parity_ok", reactant_evals)
-    @test occursin("stan_value = probe.reference_value", reactant_body)
-    @test occursin("rk_offset = entry.off_rk", reactant_body)
 
     # Exact-key resume accepts its own checkpoint and refuses foreign/incompatible rows.
     assert_batch_resume!(parsed_native, native; phase = "native",
@@ -253,29 +222,29 @@ end
         phase = "native", targets = ["other"], provenance = native_snapshot)
 
     # Strict aggregation fails missing/duplicate/mismatched phases and incomplete key sets.
+    @test_throws ErrorException aggregate(String[], out;
+        require_phases = ["native"], expected_keys = ["m1"], batch = "batch1")
+    @test_throws ErrorException aggregate([native, native], out;
+        require_phases = ["native"], expected_keys = ["m1"], batch = "batch1")
+    @test_throws ErrorException aggregate([native], out;
+        require_phases = ["native"], expected_keys = ["other"], batch = "batch1")
     @test_throws ErrorException aggregate([native], out;
         require_phases = ["native", "reactant"], expected_keys = ["m1"], batch = "batch1")
-    @test_throws ErrorException aggregate([native, native], out;
-        require_phases = ["native", "reactant"], expected_keys = ["m1"], batch = "batch1")
-    @test_throws ErrorException aggregate([native, reactant], out;
-        require_phases = ["native", "reactant"], expected_keys = ["other"], batch = "batch1")
     incomplete = joinpath(tmp, "incomplete.toml")
-    write_phase(incomplete, "reactant", Dict{String,Any}();
-        provenance = reactant_snapshot)
-    @test_throws ErrorException aggregate([native, incomplete], out;
-        require_phases = ["native", "reactant"], expected_keys = ["m1"], batch = "batch1")
+    write_phase(incomplete, "native", Dict{String,Any}();
+        provenance = native_snapshot)
+    @test_throws ErrorException aggregate([incomplete], out;
+        require_phases = ["native"], expected_keys = ["m1"], batch = "batch1")
     no_provenance = joinpath(tmp, "no-provenance.toml")
-    write_phase(no_provenance, "reactant", Dict("m1" => _complete_row()))
-    @test_throws ErrorException aggregate([native, no_provenance], out;
-        require_phases = ["native", "reactant"], expected_keys = ["m1"], batch = "batch1")
+    write_phase(no_provenance, "native", Dict("m1" => _complete_row()))
+    @test_throws ErrorException aggregate([no_provenance], out;
+        require_phases = ["native"], expected_keys = ["m1"], batch = "batch1")
 
     # Frozen-82 default remains opt-out: no provenance is collected or emitted.
     frozen_native = joinpath(tmp, "frozen-native.toml")
-    frozen_reactant = joinpath(tmp, "frozen-reactant.toml")
     write_phase(frozen_native, "native", Dict("m1" => _complete_row()))
-    write_phase(frozen_reactant, "reactant", Dict("m1" => _complete_row()))
     frozen_out = joinpath(tmp, "frozen.toml")
-    aggregate([frozen_native, frozen_reactant], frozen_out;
+    aggregate([frozen_native], frozen_out;
         meta = Dict{String,Any}("args" => ["m1"]))
     @test !haskey(TOML.parsefile(frozen_out)["meta"], "provenance")
 end

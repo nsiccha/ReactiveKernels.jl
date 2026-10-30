@@ -30,7 +30,7 @@ definitions, or request captured MethodIR.
 ## State, bounds, and observable replay
 
 The authored state fixes the depth-10 default, macro-step refinement bound, and
-the independent observables a future accepted native/Reactant comparison must
+the independent observables a future accepted compiled comparison must
 use. All randomness is supplied as runtime data; stream positions and overflow
 are part of the result rather than hidden host RNG state.
 
@@ -97,7 +97,7 @@ compiler frontier: bounded recursive state-machine lowering is under
 development and its contract is still moving, so a build-executed frontier
 probe would pin the docs to a boundary that changes underneath them. This page
 therefore intentionally does **not** execute `walnuts!!`, does not compile a
-WALNUTS transition natively or with Reactant, and does not claim full
+WALNUTS transition, and does not claim full
 recursive-SCC or WALNUTS compiler support. The compiler-side boundary is owned
 by the focused compiler tests, not by this page.
 

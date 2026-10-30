@@ -121,7 +121,7 @@ using ReactiveKernels, Test
                 @test kernel(w, x) == [sum(term(j, xi) for j in eachindex(w); init = 0.0)
                                        for xi in x]
                 # The generated native body, whose cells call the companions.
-                native = kernel.f isa RK._ArrayFunctionPair ? kernel.f.native : kernel.f
+                native = kernel.f isa RK._ArrayFunction ? kernel.f.native : kernel.f
                 body = RK._native_generated_function(native)
                 @test report(findings(body, (typeof(kernel.ops), argtypes...); recurse))
             end

@@ -1,8 +1,8 @@
 # One evidence algebra for continuous and integer-valued univariate laws.
 # Bounds remain real values: F(floor(b)) includes b, while F(ceil(b)-1)
 # excludes it. The difference matters for fractional bounds and clamp atoms.
-_evidence_at(b, discrete::Bool) = discrete ? :(ReactiveKernels._tensorized_trunc(Int, floor($b))) : b
-_evidence_below(b, discrete::Bool) = discrete ? :(ReactiveKernels._tensorized_trunc(Int, ceil($b)) - 1) : b
+_evidence_at(b, discrete::Bool) = discrete ? :(Base.trunc(Int, floor($b))) : b
+_evidence_below(b, discrete::Bool) = discrete ? :(Base.trunc(Int, ceil($b)) - 1) : b
 
 function _evidence_logmass(cdf, ccdf, lo, hi)
     lo === nothing && hi === nothing && return :(0.0)
@@ -67,7 +67,7 @@ function _evidence_endpoint(cell::Expr)
     return cell.args[1].args[1]
 end
 
-_evidence_integer_index(ex, y) = ex == y ? :(ReactiveKernels._tensorized_trunc(Int, $y)) : ex isa Expr ?
+_evidence_integer_index(ex, y) = ex == y ? :(Base.trunc(Int, $y)) : ex isa Expr ?
     Expr(ex.head, (_evidence_integer_index(a, y) for a in ex.args)...) : ex
 
 function _evidence_integer_observation(ex, y)
@@ -77,7 +77,7 @@ function _evidence_integer_observation(ex, y)
     end
     if ex.head === :call && ex.args[1] isa Expr &&
             ex.args[1].head === :. && ex.args[1].args[2] == QuoteNode(:logpdf)
-        return Expr(:call, ex.args[1], :(ReactiveKernels._tensorized_trunc(Int, $y)))
+        return Expr(:call, ex.args[1], :(Base.trunc(Int, $y)))
     end
     return Expr(ex.head, (_evidence_integer_observation(a, y) for a in ex.args)...)
 end

@@ -74,9 +74,9 @@ end
 _LaneKernel{N}(f::F, ops::O) where {N,F,O} = _LaneKernel{N,F,O}(f, ops)
 
 # The operation table of a native body, with every slot the body does not read
-# set to `nothing`. A plate or scan keeps its operation in a slot only the
-# tensorized product reads, and that operation holds its prepared body; the
-# rest of the table is singleton source operations, so the callable holding
+# set to `nothing`. A plate or scan keeps its operation in a slot the native
+# body does not read, and that operation holds its prepared body; the rest of
+# the table is singleton source operations, so the callable holding
 # it stays isbits. A body that reads the table other than by literal index
 # keeps the whole table.
 function _native_table(ast::Expr, ops::Tuple)

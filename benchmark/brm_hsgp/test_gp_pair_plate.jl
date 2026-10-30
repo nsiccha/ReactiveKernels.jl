@@ -32,8 +32,7 @@ periodic_loss(q) = sum(gp_periodic_cov(q[5:end], q[1], q[2], q[3], q[4]))
 
 # These are ordinary HAVE cuts of the same production graphs. Validation
 # converts public scalar arguments into variance/denominator/jitter; these cuts
-# take those values directly, so backend acceptance measures the pair plate
-# without claiming that Reactant supports live Julia throwing validators.
+# take those values directly, so acceptance measures the pair plate alone.
 const EXP_CUT = prepare(gp_exp_quad_cov_graph;
     have = (:x, :variance, :denominator, :jit), want = :covariance)
 const PERIODIC_CUT = prepare(gp_periodic_cov_graph;

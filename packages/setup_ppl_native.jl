@@ -2,16 +2,15 @@ using Pkg
 using TOML
 include(joinpath(@__DIR__, "..", "deps", "source_dependencies.jl"))
 
-# Pkg.test installs every test extra, including Reactant. Build the native
-# acceptance environment from the same dependency UUIDs and compat bounds,
-# then run the ordinary test/runtests.jl with RKPPL_TEST_BACKENDS=native.
+# The focused PPL acceptance environment, built from PPL's dependency UUIDs,
+# test extras and compat bounds, with this checkout's core, distribution-kernel
+# and PPL packages developed together; then run the ordinary test/runtests.jl.
 length(ARGS) == 1 || error("usage: julia packages/setup_ppl_native.jl <environment>")
 root = normpath(joinpath(@__DIR__, ".."))
 ppl = joinpath(@__DIR__, "ReactiveKernelsPPL")
 project = TOML.parsefile(joinpath(ppl, "Project.toml"))
 deps = copy(project["deps"])
 for name in project["targets"]["test"]
-    name == "Reactant" && continue
     deps[name] = project["extras"][name]
 end
 deps[project["name"]] = project["uuid"]

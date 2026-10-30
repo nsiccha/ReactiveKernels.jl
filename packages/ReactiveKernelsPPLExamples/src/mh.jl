@@ -10,8 +10,8 @@ export MH_SOURCE, evaluate_mh_source
 # posteriordb `Mh_data-Mh_model` — capture-recapture with individual heterogeneity
 # and data augmentation (BPA ch. 6). The observed/unobserved split (y>0 vs y==0)
 # is a DATA mask, so the per-individual `log_sum_exp` marginalization over the
-# latent inclusion indicator vectorizes and lowers through Reactant when the data
-# (y, lchoose, T, M) is bound. Real data is M=385/T=5; a representative mixed
+# latent inclusion indicator vectorizes when the data (y, lchoose, T, M) is
+# bound. Real data is M=385/T=5; a representative mixed
 # subset (20 observed + 20 augmented, T=5) is embedded (graph rebinds full data).
 const MH_T = 5
 const MH_Y = [
@@ -137,8 +137,7 @@ heterogeneity and data augmentation) as a declarative `ReactiveKernels.KernelSpe
 transforms with their Jacobians (implicit uniform priors); `eps_raw ~ Normal(0,1)`;
 `eps = logit(mean_p) + sigma*eps_raw`. The likelihood marginalizes the latent
 inclusion indicator with a `log_sum_exp` over the never-detected individuals — the
-observed/unobserved split is a data mask, so it lowers through Reactant when the
-data is bound. Named nodes for the prior, transform Jacobian, `eps`,
+observed/unobserved split is a data mask. Named nodes for the prior, transform Jacobian, `eps`,
 pointwise/summed likelihood, densities and posterior.
 """
 function build_mh_graph()

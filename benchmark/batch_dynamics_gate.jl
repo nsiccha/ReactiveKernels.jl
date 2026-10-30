@@ -5,16 +5,11 @@
 # soil_incubation; lotka back in after core fix 96eaf14d).
 # Each model is checked, on its FULL real posteriordb
 # data, against the ACTUAL reference `.stan` via BridgeStan (propto = false,
-# jacobian = true) along four axes:
+# jacobian = true) along two axes:
 #
 #   1. NATIVE VALUE    — RK primal log-density vs BridgeStan log_density.
 #   2. NATIVE GRADIENT — RK gradient via plain DifferentiationInterface +
-#                        Enzyme reverse (no Reactant) vs BridgeStan
-#                        log_density_gradient.
-#   3. REACTANT PRIMAL — the Reactant-compiled primal vs the native primal,
-#                        checked at TWO probe points (a single-point check
-#                        admits constant-folded artifacts).
-#   4. REACTANT GRADIENT — the Reactant-compiled gradient vs BridgeStan.
+#                        Enzyme reverse vs BridgeStan log_density_gradient.
 #
 # Solver-policy basis: user-resolved decision 008vhy5 authorizes the Julia
 # DP5/FBDF-with-explicit-controls opaque nodes as the delivery vehicle —
@@ -22,51 +17,23 @@
 # measured RK-vs-Stan discrepancies rather than asserting the static-graph
 # family's 1e-6/1e-3 tolerances. What IS hard-asserted on every axis: RK
 # finiteness wherever Stan is finite (never filter an RK-nonfinite point
-# where Stan is finite), finite gradients, and Reactant-axis honesty (a
-# constant-folded "pass" fails the two-point check). Known probe evidence
-# (synthetic 2-state shape, Reactant 0.2.285): primal tracing of the natural
-# adaptive solve fails (scalar-indexing refusal; boolean-context failure in
-# the adaptive stepper), while ReactantVJP sensitivities match FD to ~4.5e-7.
-# Axes 3-4 are therefore ATTEMPTED with full receipts, not presumed green.
+# where Stan is finite) and finite gradients.
 #
 # Graphs are built from the installed package's `build_*_graph` and `prepare`d
 # here at top level (no world-age hazard). Only the raw data ports each model
 # declares are bound.
 #
-# Run (needs BridgeStan 2.9 / Stan 2.39, PosteriorDB, Reactant, Enzyme — all
+# Run (needs BridgeStan 2.9 / Stan 2.39, PosteriorDB, Enzyme — all
 # in the all80 environment):
 #   julia --project=benchmark/all80-env benchmark/batch_dynamics_gate.jl
 #
 # Optional: DYNAMICS_MODELS=sir,soil restricts the set.
-#
-# Accepted evidence path: native value + ordinary-Reverse gradient with
-# Reactant genuinely absent. Compiled Reactant primal/gradient is unsupported
-# for these adaptive-solver nodes pending the separate investigation, so the
-# DEFAULT run is native-only (green); DYNAMICS_REACTANT=1 additionally
-# attempts the Reactant axes for investigation (expected red per current
-# evidence — never the landing gate).
-#   DYNAMICS_REACTANT=0  native axes only, Reactant asserted UNLOADED (default)
-#   DYNAMICS_REACTANT=1  native axes + attempted Reactant axes
-
-const DO_REACTANT = get(ENV, "DYNAMICS_REACTANT", "0") == "1"
-
-_reactant_loaded() = any(id -> id.name == "Reactant", keys(Base.loaded_modules))
-if !DO_REACTANT
-    @assert !_reactant_loaded() "DYNAMICS_REACTANT=0: Reactant already loaded BEFORE imports"
-end
 
 using Random, LinearAlgebra
 import BridgeStan, PosteriorDB, Enzyme
 using ReactiveKernels, ReactiveKernelsDistributionKernels
 using ReactiveKernelsPPLExamples
 using DifferentiationInterface
-
-if DO_REACTANT
-    import Reactant
-end
-if !DO_REACTANT
-    @assert !_reactant_loaded() "DYNAMICS_REACTANT=0 native phase must run with Reactant UNLOADED, but it is loaded after imports"
-end
 
 const PE = ReactiveKernelsPPLExamples
 const AE = AutoEnzyme(mode = Enzyme.Reverse)
@@ -79,8 +46,7 @@ const AD_LABEL = "AutoEnzyme(mode=Enzyme.Reverse) [default annotation]"
 println("== batch_dynamics_gate provenance ==")
 println("  Julia ", VERSION, " | BridgeStan ", pkgversion(BridgeStan),
         " (Stan 2.39.0) | Enzyme ", pkgversion(Enzyme),
-        " | DifferentiationInterface ", pkgversion(DifferentiationInterface),
-        DO_REACTANT ? " | Reactant $(pkgversion(Reactant))" : " | Reactant UNLOADED")
+        " | DifferentiationInterface ", pkgversion(DifferentiationInterface))
 println("  AD backend: ", AD_LABEL)
 println("  reference oracle: BridgeStan.log_density(propto=false, jacobian=true) on the actual .stan")
 println("  solver policy: user-resolved 008vhy5 exception (Julia DP5/FBDF nodes, explicit controls)")
@@ -115,7 +81,7 @@ function reference_points(sm, dim, seed, name, npts, scale, center = zeros(dim))
 end
 
 function gate(name; graph, have, bind, scale = 0.3, npts = 4, seed = 468,
-              do_reactant = true, center = nothing, do_grad = true)
+              center = nothing, do_grad = true)
     println("\n########## $name ##########"); flush(stdout)
     sm, post = bridge(name, seed)
     data = PosteriorDB.load(PosteriorDB.dataset(post))
@@ -154,18 +120,8 @@ function gate(name; graph, have, bind, scale = 0.3, npts = 4, seed = 468,
         println("  [2] native grad SKIPPED-per-boundary (ordinary-Reverse unsupported; see model boundary)"); flush(stdout)
     end
 
-    # ---- axes 3 & 4: attempted Reactant axes (receipts, not presumed green) ----
-    if do_reactant
-        _reactant_axes(name, kb, prep, sm, pts)
-    end
     _RAN[] += 1
     return
-end
-
-if DO_REACTANT
-    include(joinpath(@__DIR__, "batch_dynamics_gate_reactant.jl"))
-else
-    _reactant_axes(args...) = nothing
 end
 
 # ---- model registry -------------------------------------------------------
@@ -183,8 +139,7 @@ const _RAN = Ref(0)
 
 # lotka: reference-checked native value + ordinary-Reverse gradient, enabled
 # by landed core fix 55da875/f8acaa1 (snag plain-enzyme-rev-3dc5d563: bound
-# views externalized as owning copies for prepared AD). Compiled Reactant
-# axes remain unsupported pending the separate survey.
+# views externalized as owning copies for prepared AD).
 _want("lotka") && gate("hudson_lynx_hare-lotka_volterra";
     graph = PE.LotkaVolterraExample.build_lotka_volterra_graph(),
     have = (:unconstrained, :ts, :y_init, :y),
@@ -211,10 +166,4 @@ _want("soil") && gate("soil_carbon-soil_incubation";
 
 @assert _RAN[] == length(SEL) "$(_RAN[]) gate(s) ran but $(length(SEL)) selected"
 @assert _RAN[] > 0 "no gates ran"
-if !DO_REACTANT
-    @assert !_reactant_loaded() "DYNAMICS_REACTANT=0: Reactant became loaded during native work"
-end
-const _PHASE = DO_REACTANT ?
-    "native value+grad (reported) + attempted Reactant axes" :
-    "the TWO native parts (Reactant UNLOADED; Reactant axes deferred to a DYNAMICS_REACTANT=1 run)"
-println("\n== batch_dynamics_gate: $(_RAN[]) model(s) [$(join(SEL, ", "))] DONE $_PHASE =="); flush(stdout)
+println("\n== batch_dynamics_gate: $(_RAN[]) model(s) [$(join(SEL, ", "))] DONE the two native parts =="); flush(stdout)

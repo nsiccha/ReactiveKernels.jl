@@ -53,8 +53,8 @@ provenance-aware invalidation and do not use the iterative-method compiler.
 **The iterative-method compiler** is the third pipeline listed above. It
 compiles stateful object kernels and free update methods (see [Two stateful
 authoring modes](#Two-stateful-authoring-modes)) into state machines. It is
-**frozen**: its tests stay green, but it takes no new features and no Reactant
-work until it is revisited. Its public entry points are:
+**frozen**: its tests stay green, but it takes no new features until it is
+revisited. Its public entry points are:
 
 - `compile_stateful`, `stateful_compiler_bindings`, `functionalize_stateful`,
    `stateful_snapshot`, `compile_state_transition`, `initial_transition_state`,
@@ -395,8 +395,7 @@ authored call: one whose term or condition assigns, declares, returns, jumps,
 loops or holds a macro call, one without `init`, one over another iterator (a
 tuple's fold is Base's unrolled one), and one whose `sum` is not Base's. A
 plain helper's own nested sum also keeps it, because RK never sees that body:
-define the helper with `@traceable`, or write it with loops. The tensorized
-companion keeps its own lowering of the same folds.
+define the helper with `@traceable`, or write it with loops.
 
 `transform` applies user-supplied expression passes between lowering and
 compilation. The compiler preserves pass order but cannot prove that a pass
@@ -505,8 +504,7 @@ lowering into type evidence from one exemplar per remaining positional HAVE
 port. Calls with different input types are refused; prepare again for those
 types. No exemplar length or value is baked into the loop. RKPPL's
 `prepare_sampler` uses the converted `Vector{Float64}` exemplar by default,
-and its public calls convert other real vectors to that type. Tensorized
-lowering retains the declared input types. A graph prepared with exemplars
+and its public calls convert other real vectors to that type. A graph prepared with exemplars
 compiles afresh rather than reusing its bound-preparation cache.
 The authored `AbstractVector{Float64}` boundary remains broad; for example,
 a coefficient slice can be a concrete `SubArray` view. Native plate inference
@@ -705,15 +703,11 @@ The prepared program contains no branch for that condition, so no backend
 receives one:
 
 - every lane evaluates exactly the arm it takes;
-- gathers inside an arm are in bounds by construction;
-- Reactant reverse mode compiles at every lane count, so the batched
-  lazy-branch limitation in the [core constraints](constraints.md) does not
-  arise.
+- gathers inside an arm are in bounds by construction.
 
 An empty bound domain has no lanes to group. It runs no cell and evaluates no
 condition. Its result is empty, with the element type inferred from the
-authored native cell, as in Julia's empty broadcast. Reactant compiles it
-without reading the zero-length operand.
+authored native cell, as in Julia's empty broadcast.
 
 The number of arm plates is bounded by the cell's branch structure, never by
 the data. A condition that reads a live value stays an ordinary lazy branch.
@@ -875,8 +869,7 @@ endpoints spliced into a plate cell get the same treatment: their authored
 branch-arm recipes are exposed to the plate lowering, so `loggamma(shape)` in
 a Gamma density or `log1p(-zi)` in a zero-inflated count density runs once at
 the first lane that takes its arm when its input is shared. Local bindings
-inside an arm remain separate recipes. The graph keeps the authored branch;
-the tensorized body decides a shared condition in its own batch dispatch.
+inside an arm remain separate recipes. The graph keeps the authored branch.
 
 A cell may return a tuple of its locals, `(m, s, d)`, that other plates read
 entry by entry (`c[2]`). Each query then runs only the cell statements of the
@@ -892,11 +885,7 @@ The per-element WANT is
 either accumulated with a reducer (sum by default) or collected in the one
 requested broadcast-shaped output.
 
-The native reducing body materializes no per-observation result vector. A
-second eager tensor body expresses dependent operations as broadcasts and the
-final reduction as a tensor operation; an optional array-compiler extension
-selects it for traced arrays while ordinary Julia arrays retain the native
-loop.
+The native reducing body materializes no per-observation result vector.
 
 The current plate domain is deliberately narrow:
 
@@ -943,9 +932,7 @@ Reverse differentiates the scale through both loops. No custom derivative
 rule is required. The native acceptance suite also replays the displayed
 authoring source in a fresh module without its producer's operation table.
 
-Compiled nested plate regions are not implemented yet: traced execution reports
-that capability gap explicitly. In native execution, a cell containing another
-plate computes work that reads only shared values (captured or `Ref` arrays,
+A cell containing another plate computes work that reads only shared values (captured or `Ref` arrays,
 scalars, and values computed from them alone) once before its outer loop. The
 cell reads those results whole; the rest of its graph, including inner loops,
 runs per outer coordinate.
@@ -1045,8 +1032,7 @@ The full broadcast shape of each such expression, and the full shape of each
 `hcat`, is still checked from its operands' axes (`DimensionMismatch`), and the
 cell's own reads and the factor rows are bounds-checked. An error that only
 another row would raise, such as an out-of-range gather index at another
-position, is not raised, just as the cell does not run other cells. The
-tensorized lowering computes these values whole.
+position, is not raised, just as the cell does not run other cells.
 
 Native Enzyme Reverse through an `hcat` read at several rows of a cell fails
 with `IllegalTypeAnalysisException` in Base's `_typed_hcat`: those rows are
@@ -1087,11 +1073,8 @@ For example, an author can prepare `reduced = plate(scalar_density; have =
 inside an outer `@kernel`. The outer prepared function contains the plated
 statements directly rather than a runtime call through `reduced`.
 
-Nested plates retain both compiler products: ordinary arrays select the
-native fused loop, while traced arrays select the tensorized broadcast/reduce
-body. This is the static-friendly density boundary used by the PPL examples:
-ordinary Julia consumers see one flat generated function, and Reactant still
-sees the array-native plate form.
+Nested plates lower to the native fused loop, so the PPL examples' consumers
+see one flat generated function.
 
 ### Position batching: lift the entire scalar callable
 
@@ -1106,17 +1089,12 @@ across replicas.
 Selected input and output types must be numbers or arrays. Native execution
 validates the extra rank and equal replica counts, evaluates scalar replicas,
 copies array slices, and stacks results, so it is a semantic transform rather
-than a native zero-allocation promise. Optional array-compiler integration may
-lower the same mapping as a backend batch primitive.
+than a native zero-allocation promise.
 
 The same transform accepts a scalar `PreparedADKernel`. `replica(ad; batched =
 :position)` slices each selected HAVE, runs the scalar reverse pass, and stacks
 the objective and active-port gradient along the replica axis. The scalar AD
 preparation remains the derivative authority; it is not re-prepared per replica.
-Under Reactant the replica axis is one retained loop: each iteration gathers
-its replica's slices dynamically, differentiates once, and writes the value and
-gradient into preallocated buffers, so the emitted program is independent of
-the replica count (the batching primitive cannot yet carry a reverse pass).
 See [Position batching](position-batching.md) for the full public contract.
 
 ## Incremental and compiled reactive execution
@@ -1359,8 +1337,7 @@ isolated, fully materialized named state while preserving external callable
 authorities by identity. Calling the result with that state is functional: an
 authored array write produces a new array value, invalidates the written
 source's transitive derived closure, and recomputes a stale derived field only
-at its next source-ordered read. The same generated program is ordinary Julia
-and static program metadata to optional array compilers such as Reactant.
+at its next source-ordered read. The generated program is ordinary Julia.
 Every call validates the exact recursive state layout, owned-array axes,
 canonical aliases, and external authority identities captured at construction.
 Group-aware structural copies isolate owned arrays without invoking user
@@ -1488,27 +1465,23 @@ control requires a positive finite loop bound. A bound violation, an active
 out-of-bounds indexed access, or exhausted effect storage sets a control
 overflow and rolls state plus auxiliary effects back atomically. The typed
 functional entry validates the outer plan's canonical aliases as well as any
-nested structured aliases. A fresh Reactant compilation rejects an
-independently converted counterfeit alias. For repeated calls, the raw backend
-executable must be wrapped with
-`validated_compiled_transition(compiled, transition)`. That generic host guard
+nested structured aliases. For repeated calls, a compiled executable must be
+wrapped with `validated_compiled_transition(compiled, transition)`. That generic host guard
 revalidates layout, shapes, canonical aliases, structured ports, and external
 authorities before dispatch. It restores frozen callable and nested structured
 external authorities (which are compiler metadata rather than backend data),
 then validates the returned owned-data alias topology. The
 effects-positional form also checks the dynamic effects carrier and method
-arguments. The backend executable itself enforces its traced leaf signature;
-the raw executable alone is outside the safe repeated-call contract because a
-flattened buffer ABI cannot represent Julia object identity. Straight-line and
+arguments. The raw executable alone is outside the safe repeated-call
+contract because a flattened buffer ABI cannot represent Julia object
+identity. Straight-line and
 state-machine gates both prove valid repeated execution, identity-preserving
 outputs, and rejection of an independently converted counterfeit alias.
 
 Every structured state-machine method with authored control flow — branches,
 guards, short circuits, `for` and `while` loops — lowers through the control
-program: the method's CFG becomes a set of blocks, and one retained loop
-(native `while`; a `stablehlo.while` region under Reactant) dispatches exactly
-one block per step by its (method, pc) address (`stablehlo.case` under
-Reactant). A branch therefore evaluates only its taken side and a loop body is
+program: the method's CFG becomes a set of blocks, and one retained `while`
+loop dispatches exactly one block per step by its (method, pc) address. A branch therefore evaluates only its taken side and a loop body is
 emitted once, whatever the admitted iteration count; each loop carries a
 counter checked against `max_iterations`, and exceeding it sets control
 overflow and rolls the transition back, exactly as before. Returned values
@@ -1545,15 +1518,8 @@ instead binds the same unannotated logical `rng` formal through
 compiler metadata; only its finite `State` crosses the dynamic ABI, and the
 updated state is returned at the same position in `result.arguments`. A source
 annotation such as `rng::AbstractRNG` intentionally rejects a tensor-state
-provider rather than capturing a host RNG in a traced executable. Changing
+provider rather than capturing a host RNG in a compiled executable. Changing
 provider type or backend state shape requires explicit recompilation.
-
-The Reactant extension supplies `rng_provider(Val(:reactant))`, backed by
-Reactant's native RNG operations over a two-word `Vector{UInt64}` logical seed.
-It generates fresh normal, Boolean, and exponential values inside the compiled
-program; it does not pre-generate host tapes and does not promise stream parity
-with a Julia `AbstractRNG`. Split/fold semantics are deliberately deferred
-until replica batching needs them.
 
 `OrderedRNGReplay` supplies deterministic draws for behavior and failure tests and infers its
 provider automatically. It carries independent floating normal, Boolean
@@ -1565,7 +1531,7 @@ descriptor. Conditional source paths consume only the effects they enter, and
 an event-kind mismatch or exhausted tape fails closed while preserving the
 attempted replay receipt. Every consumed normal column is rechecked for
 finiteness and every consumed exponential for finiteness and nonnegativity,
-including dynamic traced tapes; invalid consumed data sets sticky overflow and
+including dynamic tapes; invalid consumed data sets sticky overflow and
 atomically rolls state back, while unconsumed padding remains irrelevant.
 
 Causal auxiliary effects are explicit continuation state, not hidden compiler
@@ -1583,11 +1549,11 @@ change compiled semantics.
 The fixed-step ReactiveHMC fixture is the first combined acceptance case. Its
 unchanged mathematical source refreshes momentum, executes generalized
 leapfrog, records statistics before divergence exit, conditionally consumes an
-exponential draw, and copies an accepted endpoint. The statistics callback has
-no Reactant implementation: the generic compiler infers it is observational,
-returns its bounded records, and the Julia drain replays the collector after
-the barrier. The same generic compiler path matches the independent accept,
-reject, and divergence receipt in ordinary Julia and Reactant. A separate
+exponential draw, and copies an accepted endpoint. The generic compiler infers
+that the statistics callback is observational, returns its bounded records,
+and the Julia drain replays the collector after the barrier. The same generic
+compiler path matches the independent accept, reject, and divergence receipt.
+A separate
 pinned physical case locks Float32
 position/momentum/normal draws together with the authored Float64 `randexp`
 result, destination alias, and global RNG event order. That evidence
@@ -1601,8 +1567,7 @@ reference rounding pattern. Tests check useful sampler behavior, including
 valid trajectories, termination, divergence handling, RNG consumption, and
 repeated execution. The mixed-precision case also checks Float32/Float64 field
 types, the `randn!` result alias, tape and destination shapes, and rollback.
-A widened Float64 normal tape is rejected by both native and Reactant entry
-contracts.
+A widened Float64 normal tape is rejected by the entry contract.
 
 ## What the NUTS proof does and does not establish
 

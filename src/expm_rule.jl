@@ -10,9 +10,6 @@
 #
 # Native authored calls resolving to Base.exp use this owned primitive for
 # Matrix{Float64}; `_native_exp` preserves Base dispatch on all other inputs.
-# Under Reactant the cuts trace as plain graph mathematics only once the
-# backend supports `exp` on traced arrays (no release carries that yet); until
-# then compiled consumers retain that backend limitation.
 using LinearAlgebra: exp
 
 # Keep the rule graph's built-in calls distinct from the authored `exp`
@@ -63,9 +60,7 @@ Differentiating through it with Enzyme — directly or via
 `DifferentiationInterface` with `AutoEnzyme` — uses those generated cuts, so
 the LAPACK `ccall` inside is never differentiated. Native `@kernel` and
 `@traceable` source also selects this callable for resolved `exp` calls on
-`Matrix{Float64}`. No Reactant custom rule is
-emitted (see `docs/src/manual-derivative-rules.md`); tracing the primal needs
-backend `exp` support for traced arrays.
+`Matrix{Float64}` (see `docs/src/manual-derivative-rules.md`).
 """
 const rk_expm = derivative_rule(rk_expm_rule; primal = :Y,
     directions = (A = :A_dot,), tangent = :Y_dot,

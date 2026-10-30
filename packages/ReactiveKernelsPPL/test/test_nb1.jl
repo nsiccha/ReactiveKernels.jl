@@ -1,7 +1,6 @@
 # NB1 response (SB `neg_binomial` mirror): per-observation-p and
 # modeled-p value parity vs the Distributions.jl oracle,
-# Enzyme-vs-findiff gradients, O(1) emission, Reactant/XLA value+grad
-# parity (in test_nb1_reactant.jl), and the agreed SB parity datasets (N1/N2 gated regeneration;
+# Enzyme-vs-findiff gradients, O(1) emission, and the agreed SB parity datasets (N1/N2 gated regeneration;
 # B1 pins carried from term-nuisance spec `1mcop44`, confirmed against
 # the peer lane's fresh BridgeStan brief before landing — same flow as
 # hurdle). (`_findiff_grad` / `_GEN_BACKEND` come from test_generator.jl,

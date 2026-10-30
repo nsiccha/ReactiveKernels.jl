@@ -14,7 +14,6 @@ ReactiveKernels
 ├── ReactiveKernelsCompatibilityExamples
 ├── ReactiveKernelsNUTSExamples
 ├── ReactiveKernelsStreamingStats
-├── ReactiveKernelsReactantODESolvers
 └── ReactiveKernelsHMCDiagnostics
     ├── ReactiveKernelsNUTSExamples
     └── ReactiveKernelsStreamingStats
@@ -32,9 +31,6 @@ The general kernel-example package owns the distribution gallery, bijectors,
 fixed-step HMC, and runnable core walkthrough. Batching remains a separate
 package because its public boundary includes DifferentiationInterface cache
 semantics. Compatibility examples are isolated from current authoring examples.
-The Reactant ODE solvers package is a self-contained adaptive-Tsit5
-implementation written in Reactant-traceable form; it is solver support, not
-PosteriorDB support, until independently proven and separately reviewed.
 
 Julia 1.10 is still supported, so its package manager ignores `[sources]` and
 does not provide the newer workspace mechanism. Materialize the local paths
@@ -57,12 +53,7 @@ later file still runs, and the run then fails, listing each recorded failure.
 
 `RKPPL_TEST_FILES=a.jl,b.jl` runs only the named ReactiveKernelsPPL test files;
 earlier files still load, with their tests removed, for the helpers later files
-use. `RKPPL_TEST_BACKENDS=native` leaves out the Reactant files (names
-containing `reactant`) and needs no Reactant: `Pkg.test` installs every test
-dependency, so to test without Reactant run
-`packages/ReactiveKernelsPPL/test/runtests.jl` with an environment that develops
-the package and adds its dependencies and test dependencies except Reactant. Native files never
-use Reactant or a Reactant file's definitions; the suite checks this.
+use.
 
 The `rkppl-current` CI job runs contract, layout, preprocessing, generator,
 query, and corpus tests on Julia-current (`1`), alongside the full Julia 1.10
@@ -72,15 +63,14 @@ focused native leg with the current Julia executable:
 
 ```sh
 julia --startup-file=no packages/setup_ppl_native.jl /tmp/rkppl-native
-RKPPL_TEST_BACKENDS=native \
 RKPPL_TEST_FILES=test_contract.jl,test_layout.jl,test_preprocessing.jl,test_generator.jl,test_query.jl,test_corpus.jl \
 julia --startup-file=no --check-bounds=yes --project=/tmp/rkppl-native packages/ReactiveKernelsPPL/test/runtests.jl
 ```
 
-The setup script copies PPL's dependency UUIDs and compatibility bounds into
-the given environment, omits the Reactant test extra, and develops this
-checkout's core, distribution-kernel, and PPL packages together. The current
-leg is focused acceptance coverage, not the complete native or Reactant suite.
+The setup script copies PPL's dependency UUIDs, test extras and compatibility
+bounds into the given environment and develops this checkout's core,
+distribution-kernel, and PPL packages together. The current leg is focused
+acceptance coverage, not the complete suite.
 
 The checked-in `[sources]` entries become useful automatically on newer Julia
 versions; `setup.jl` remains the Julia-1.10-compatible source of local path
@@ -110,5 +100,5 @@ docs → all three
 
 The legacy `examples/nuts_runtime.jl` and `examples/online_stats.jl` files are
 thin launchers only. Package-owned source preserves the byte-locked NUTS fixture,
-independent eager oracle, native/Reactant parity, and the rule that bare
+independent eager oracle, and the rule that bare
 `using ReactiveKernels` loads no sampler API.

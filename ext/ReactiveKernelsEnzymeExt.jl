@@ -453,13 +453,4 @@ ReactiveKernels.ad_value_gradient_and_retained(prepared::_NativeForwardBatchAD,
     ReactiveKernels.ad_value_gradient_and_retained(prepared.reverse,
         args...; kwargs...)
 
-ReactiveKernels.compile_ad_gradient(prepared::_NativeForwardBatchAD,
-        args...; kwargs...) =
-    ReactiveKernels.compile_ad_gradient(prepared.reverse, args...; kwargs...)
-
-ReactiveKernels.compile_ad_value_and_gradient(prepared::_NativeForwardBatchAD,
-        args...; kwargs...) =
-    ReactiveKernels.compile_ad_value_and_gradient(prepared.reverse,
-                                                  args...; kwargs...)
-
 end # module

@@ -48,7 +48,7 @@ using LogExpFunctions: logsumexp
     # Shape-derived index structures (bound-only → folded by partial evaluation).
     # `sum_to_zero_constrain` is LINEAR, so it is one matmul x = B·free with a
     # constant K×(K-1) basis matrix B built here from K via comparison masks
-    # (matmul-only, so it lowers through Reactant — no vcat/scalar indexing):
+    # (matmul-only — no vcat/scalar indexing):
     #   A[k,j] = (j ≥ k) − (j == k−1)·j ;  B[k,j] = A[k,j] / sqrt(j(j+1)).
     Nf::Int = K - 1
     jcol::Vector{Float64} = collect(1.0:Nf)                   # 1 .. K-1
@@ -112,11 +112,9 @@ y = HMM_EXAMPLE_Y
 K = HMM_EXAMPLE_K
 
 requested_nodes = (:parameters, :prior, :log_jacobian, :likelihood, :posterior)
-# The raw observation series `y` enters as a TRACED argument (only the scalar
-# state count `K` is bound), so the `scan` forward recursion lowers to a
-# `stablehlo.while` carry loop under Reactant instead of unrolling over the
-# fixed-length series. Indices use the explicit `T`, not `end`, which does not
-# resolve on traced results.
+# The raw observation series `y` stays a live argument (only the scalar state
+# count `K` is bound), so the `scan` forward recursion is one retained loop over
+# the series.
 density_kernel = prepare(model;
     have = (:unconstrained, :y, :K),
     want = requested_nodes,
@@ -162,8 +160,7 @@ end
 Build the posteriordb `hmm_example` model as a declarative
 `ReactiveKernels.KernelSpec`: a 2-state unit-variance Gaussian HMM whose
 marginal likelihood is the sequential forward algorithm, authored with a
-`scan` over a K-vector belief-state carry (so it lowers through Reactant to a
-stablehlo.while carry loop). The Stan 2.39 support transforms are matched
+`scan` over a K-vector belief-state carry (one retained carry loop). The Stan 2.39 support transforms are matched
 exactly — the inverse-ILR simplex for `theta1`/`theta2` (Jacobian
 `sum(log z) + 0.5·log K`) and `positive_ordered` for `mu` (Jacobian `sum(u)`)
 — and the separated `mu[1] ~ N(3,1)`, `mu[2] ~ N(10,1)` prior is authored as

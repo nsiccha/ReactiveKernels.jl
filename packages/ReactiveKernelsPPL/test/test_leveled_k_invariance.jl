@@ -8,13 +8,10 @@ using ReactiveKernels
 using ReactiveKernelsPPL
 using Test
 
-# Every level present, in a deterministic irregular order. Reactant lowers a
-# gather by constant host indices that form an arithmetic progression as one
-# strided `slice` and any other index set as a `gather`: both are constant in
-# size, but a comparison of traced-program sizes across K must not mix them.
-# So no ordinal lane class (first / last / interior level rows) may be an
-# arithmetic progression; the first permutation seed with that property is
-# used, and the property is asserted.
+# Every level present, in a deterministic irregular order: no ordinal lane
+# class (first / last / interior level rows) is an arithmetic progression. The
+# first permutation seed with that property is used, and the property is
+# asserted.
 _kinv_arithmetic(v) = length(v) < 3 || allequal(diff(v))
 function _kinv_levels(K, n)
     base = [mod1(i, K) for i in 1:n]

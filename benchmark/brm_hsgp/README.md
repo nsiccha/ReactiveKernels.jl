@@ -7,31 +7,25 @@ Load RK and RKPPL, then use `BayesianRegressionModels.rk_model(:dual_hsgp)` and
 published BRM `1f296dac2c086347525194887500948edb213228` or a compatible descendant.
 [`examples/brm_hsgp.jl`](../../examples/brm_hsgp.jl) is a thin consumer and fixture
 loader. Owned preparation folds the data-only basis and squared frequencies; the 44-vector
-`q` and 40-vector of centeredness controls remain live. The benchmark separately
-prepares native Enzyme AD, compiles the primal through Reactant, and compiles
-value plus gradient through `compile_ad_value_and_gradient`. `compare.jl`
-measures isolated evaluations; `hmc.jl` measures the authored HMC loop below.
+`q` and 40-vector of centeredness controls remain live. The benchmark prepares
+native Enzyme AD. `compare.jl` measures isolated evaluations; `hmc.jl` measures
+the authored HMC loop below.
 
-## Native and Reactant HMC
+The checked-in receipts and the run history below were measured while RK still
+had a Reactant path: their Reactant fields come from ReactiveKernels' removed
+Reactant path, and [HMC.md](HMC.md) and [DIAGNOSTICS.md](DIAGNOSTICS.md) are
+historical analyses of them. The current scripts measure the native path only.
 
-The [measured comparison](HMC.md) includes full timings, preparation costs,
-variation, validation, and raw receipts.
+## Native HMC
 
 `hmc.jl` uses the shared `sampler_transpiler/hmc_benchmark.jl` helper, also used
 by the Eight Schools HMC timing driver. It prepares the existing multinomial
-HMC `@kernel` through `prepare_transpiled`; the algorithm and model source are
-identical for both backends. Native calls prepared Enzyme gradients. Reactant
-compiles the whole batch, including gradients, leapfrog steps, momentum draws,
-and multinomial proposal selection, and synchronizes once per batch.
+HMC `@kernel` through `prepare_transpiled` and calls prepared Enzyme gradients.
 
-After preparing the environment and downloading the bundle as described below,
-run each backend in a fresh process on the same CPU:
+After preparing the environment and downloading the bundle as described below:
 
 ```sh
-BRM_BUNDLE=BUNDLE_DIR HMC_BACKEND=native HMC_OUTPUT=native-hmc.toml \
-  JULIA_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 taskset -c 6 \
-  julia --startup-file=no --project=benchmark/brm_hsgp benchmark/brm_hsgp/hmc.jl
-BRM_BUNDLE=BUNDLE_DIR HMC_BACKEND=reactant HMC_OUTPUT=reactant-hmc.toml \
+BRM_BUNDLE=BUNDLE_DIR HMC_OUTPUT=native-hmc.toml \
   JULIA_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 taskset -c 6 \
   julia --startup-file=no --project=benchmark/brm_hsgp benchmark/brm_hsgp/hmc.jl
 ```
@@ -40,8 +34,8 @@ Defaults are matched batches of 4, 100, and 1,000 transitions, 16 leapfrog
 steps per transition, step size 0.03, and nine timed rounds. `HMC_BATCHES`,
 `HMC_STEPS`, `HMC_STEPSIZE`, `HMC_ROUNDS`, and `HMC_FRAMES` override these.
 Both noncentered and selected-partial frames start at column 5,000 of their
-supplied posterior bundle. Each frame uses the same fixed diagonal mass on both
-backends: inverse coordinate variance over its 10,000 supplied draws. This is
+supplied posterior bundle. Each frame uses a fixed diagonal mass: inverse
+coordinate variance over its 10,000 supplied draws. This is
 posterior-informed benchmark setup, not timed adaptation.
 
 Data-only design work is partially evaluated once. The density retains `(q,c)`
@@ -50,17 +44,14 @@ callback context for the entire run. Changing this context requires preparing
 a new sampler. Thus HMC measures fixed-frame sampling, whereas the isolated
 evaluation comparison exposes centeredness at every executable call.
 
-Receipts separate model/AD preparation, first native gradient, HMC preparation
-(including Reactant compilation), first batch execution, and raw warmed batch
-times. Compilation garbage is collected once, then additional untimed warmup
+Receipts separate model/AD preparation, first native gradient, HMC preparation,
+first batch execution, and raw warmed batch times. Compilation garbage is collected once, then additional untimed warmup
 runs for at least one second and three batches; timed rounds include normal
 GC costs. RNG construction and
 finite-density checks are outside timing. The
-prepared interface's state copies and output snapshots remain inside timing;
-Julia allocation counts exclude C++/device runtime allocations. Timed rounds
-start from the same initial position with distinct seeds. Four continued
-batches additionally check finite, moving execution. Different RNG engines are
-used, with no cross-backend trajectory equality requirement.
+prepared interface's state copies and output snapshots remain inside timing.
+Timed rounds start from the same initial position with distinct seeds. Four
+continued batches additionally check finite, moving execution.
 
 These runs retain only final positions and do not measure adaptation, history
 storage, ESS, or effective samples per second. Equal transition/leapfrog work
@@ -108,8 +99,7 @@ used for differentiation here.
 
 ## Reproduce
 
-Use Julia 1.10 and the benchmark project. Reactant is pinned to 0.2.289.
-The runnable consumer requires the published BRM adoption above. Historical
+Use Julia 1.10 and the benchmark project. The runnable consumer requires the published BRM adoption above. Historical
 receipts retain their measured sources and versions; the cleanup does not rerun
 the original posterior, gradient, timing or sampling campaigns.
 
@@ -144,13 +134,13 @@ each with all 44 coordinates. Expected SHA-256 hashes:
 
 ```sh
 julia --startup-file=no --project=benchmark/brm_hsgp benchmark/brm_hsgp/test_gp_binding.jl
-julia --startup-file=no --project=benchmark/brm_hsgp benchmark/brm_hsgp/test_gp_pair_plate_reactant.jl
+julia --startup-file=no --project=benchmark/brm_hsgp benchmark/brm_hsgp/test_gp_pair_plate.jl
 julia --startup-file=no --project=benchmark/brm_hsgp \
   benchmark/brm_hsgp/compare.jl BUNDLE_DIR OUTPUT_DIR
 ```
 
 The optional GP checks exercise ordinary name binding, graph composition, data
-folding and compiled covariance/AD cuts using BRM's owned graphs. The two plain
+folding and covariance/AD cuts using BRM's owned graphs. The two plain
 PPL consumer programs in `corpus/` use BRM helpers; they no longer participate
 in the default dependency-light PPL syntax corpus. Scientific GP/HSGP acceptance
 is owned by BRM (`test/rk_gp_covariance.jl`, `test/rk_dual_hsgp.jl`).
@@ -166,27 +156,24 @@ convert a native failure into a passing comparison.
 
 ## Measurement boundaries
 
-Preparation, first native gradient, Reactant primal compilation, Reactant
-gradient compilation, and first compiled execution have separate seconds fields.
-Warmed measurements use BenchmarkTools with `evals=1` and identical positions
-for all evaluators, reporting median/minimum nanoseconds and Julia allocations.
-BLAS has one thread. `reactant_resident` uses resident inputs and synchronous
-execution; `reactant_host` includes transferring `q` and materializing the value
-and gradient on the host. Centeredness stays resident between evaluations.
-Backend-managed memory is outside Julia's allocation counter.
+Kernel preparation, AD preparation and the first native gradient have separate
+seconds fields. Warmed measurements use BenchmarkTools with `evals=1` and
+identical positions for all evaluators, reporting median/minimum nanoseconds
+and Julia allocations. BLAS has one thread.
 
 The `≤1.25× StanBlocks` target must be judged with the measurement boundary
 stated. Compilation cost is never mixed into the warmed ratio. A native Turing
 target whose support differs from Stan is an unsupported comparison, not an
 opportunity to modify the model or discard posterior points.
 
-## Current verified CPU run
+## Latest recorded CPU run (historical)
 
 [`../receipts/brm-hsgp-reactant-v2.toml`](../receipts/brm-hsgp-reactant-v2.toml)
 records RK `0dfe2165f978b1fdb1332a4d089cb31dd8851d25` with the corrected BRM
 `d137c326fa6a30cf173bf81fd6767e440bf025c0` and WarmupHMC
 `ad1feb6a228b8e9437fa745ae19ad490a3af34b1`. All other measured versions and
-source hashes are in the receipt.
+source hashes are in the receipt. It was produced by `compare.jl` at that
+commit, which also measured the removed Reactant path.
 
 ```sh
 KB_COMPACT_KEEP_LOG=1 kb-run-compact taskset -c 6 \

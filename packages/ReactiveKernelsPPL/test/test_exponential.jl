@@ -1,7 +1,6 @@
 # Exponential response (SB `exponential_lpdf` mirror): surface
 # admission, value parity vs a Distributions.jl oracle (strictly
-# positive + zero response rows), Enzyme-vs-findiff gradients,
-# Reactant/XLA value+grad (in test_exponential_reactant.jl), O(1)
+# positive + zero response rows), Enzyme-vs-findiff gradients, O(1)
 # emission, and E1 SB parity vs the peer
 # lane's BridgeStan numbers (brief 2026-09-27T10-57-58-691-f8l4sr).
 # (`_findiff_grad` / `_GEN_BACKEND` come from test_generator.jl,

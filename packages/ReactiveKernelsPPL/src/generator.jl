@@ -514,8 +514,8 @@ function _affine_coefficient_statements(plan::StructuralPlan, layout::LayoutTabl
                 value = t.options.parameter
                 value = t.options.sign == 1 ? value : :(-$value)
                 push!(scalar_chunks, value)
-                # All concatenation inputs are vectors. Mixing a traced
-                # scalar with a vector takes Julia's scalar-fill cat path.
+                # All concatenation inputs are vectors, which keeps a scalar
+                # off Julia's scalar-fill cat path.
                 push!(chunks, t.kind in (FactorTerm, MatrixTerm) ?
                     :(Float64.($value)) : :([$value]))
             else
@@ -745,7 +745,6 @@ end
 # and native reverse mode then adds the copy's adjoint back into the value's,
 # so separate reads of one product cost more than separate products. The
 # value is never written after it is made, so the view reads the same numbers.
-# Compiled tracing reads the same slice (`ReactiveKernels._tensorized_view`).
 # A data-only value keeps Julia's copy: `bound=` folds the read once at
 # preparation, outside the evaluated program, and a view would hold the
 # caller's data.
@@ -757,7 +756,7 @@ function _observation_slice_views(ex, plan::StructuralPlan, dataonly::Set{Symbol
             _is_observation_slice(plan, ex)
         base = ex.args[1]
         indices = (_slice_view_index(i, base, k) for (k, i) in enumerate(ex.args[2:end]))
-        return :(ReactiveKernels._tensorized_view($base, $(indices...)))
+        return :(Base.view($base, $(indices...)))
     end
     return Expr(ex.head, (_observation_slice_views(a, plan, dataonly) for a in ex.args)...)
 end
@@ -1868,7 +1867,7 @@ _ppl_range_values(x::AbstractArray, indices) = x[indices]
 
 # `ones(n) .* x` without the ones operand: a number fills the rows, and a
 # vector already holding one Float64 per row is that location value itself,
-# including a view. Other values (traced, integer, singleton or mismatched)
+# including a view. Other values (integer, singleton or mismatched)
 # keep Julia's broadcast against the rows, including its dimension errors.
 @inline _ppl_rows(x::Float64, n::Int) = fill(x, n)
 @inline _ppl_rows(x::AbstractVector{Float64}, n::Int) =
@@ -2096,7 +2095,7 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
         return _bernoulli_plate_stmts(r, plan, node, pw)
     elseif r.family === PoissonLogFam
         # Base GLM case (no evidence, no weights, no literal range): fused
-        # whole-vector reduction (faster native + Reactant; the per-cell
+        # whole-vector reduction (faster; the per-cell
         # plate handles evidence/weights/ranges).
         r.evidence.kind === :none && r.weights === nothing &&
             r.range === nothing && r.mi_jobs === nothing && r.link === LogLink &&
@@ -2844,9 +2843,7 @@ _mi_gather_name(label::Symbol, ref::Symbol) = Symbol(:_ppl_mi_, label, :_, ref)
 # Gather a computed full-length node by `Jobs` (an lp/rate/shape/scale
 # node the emitter created), returning the short node. Scalars broadcast.
 # The gather is its own short plate over `Jobs` whose cell closes over the
-# source (the ordinal `c[yv]` per-lane-gather precedent): a caller-level
-# fancy `node[Jobs]` does not trace under Reactant (`TracedRArray[Vector{Int}]`
-# shape-inference failure), while per-lane scalar gathers do.
+# source (the ordinal `c[yv]` per-lane-gather precedent).
 function _mi_gather_node!(pre::Vector{Expr}, jobs::Symbol, node::Symbol,
         label::Symbol)
     g = _mi_gather_name(label, node)
@@ -3035,9 +3032,9 @@ end
 # constant, and a binding with other counts computes its own (it is not a
 # build-time literal). `_ppl_yf_<label> = Float64.(y)` is a NAMED
 # recipe so `bound=` folds it to a constant Float vector (no per-eval alloc)
-# AND gives the fused `dot` a Float operand (Reactant `dot_general` type match).
+# AND gives the fused `dot` a Float operand.
 # `sum(exp, η)` reduces without materialising the intermediate. Gradient stays
-# ordinary Enzyme/Reactant AD — no analytic adjoint.
+# ordinary Enzyme AD — no analytic adjoint.
 _yfloat_name(label::Symbol) = Symbol(:_ppl_yf_, label)
 
 # A fused form keeps its emitter's statements through the pointwise plate,
@@ -3173,10 +3170,8 @@ _poisson_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, etav::Symbol) =
 # The Poisson factor reuses the `poisson(; log_rate)` endpoint HAVE
 # (the Poisson-plate precedent). The truncation correction is the
 # closed form `log(-expm1(-λ))` (Poisson cdf(0) is exactly e^-λ; SB
-# subtracts `poisson_lccdf(0 | λ)` — the same quantity) — NOT the
-# `.cdf(0)` endpoint, whose `gamma_inc` has no Reactant tracing rule
-# (`MethodError` on compile; the truncated/censored Poisson cells
-# carry the same gap). The `y == 0` select is lazy, so the positive
+# subtracts `poisson_lccdf(0 | λ)` — the same quantity). The `y == 0`
+# select is lazy, so the positive
 # count's density and truncation correction remain inactive at zero.
 # p_zero threads scalar or via the `_ppl_sc_` node
 # (the scale-predictor precedent — a hurdle p_zero predictor is
@@ -4116,7 +4111,7 @@ function _ordinal_stopping_evidence_stmts(r, plan, node, pw, K)
     end
     link = r.link === LogitLink ? :(Val(:logit)) :
         r.link === ProbitLink ? :(Val(:probit)) : :(Val(:cloglog))
-    cell = :(rk_ordinal_stopping_logpdf($t, $eta, $d, $effects, $iv, ReactiveKernels._tensorized_trunc(Int, $yv), $link))
+    cell = :(rk_ordinal_stopping_logpdf($t, $eta, $d, $effects, $iv, Base.trunc(Int, $yv), $link))
     cell = _wrap_evidence!(r, plan, pre, inputs, cell;
         cdf=b -> :(rk_ordinal_stopping_tail($t, $eta, $d, $effects, $iv, $b, $link, false)),
         ccdf=b -> :(rk_ordinal_stopping_tail($t, $eta, $d, $effects, $iv, $b, $link, true)))
@@ -4206,10 +4201,7 @@ end
 # `L = diag_pre_multiply(scales, L_corr)`): one plate over the K outcome
 # columns + K mean LPs sums the per-row density. The row cell is scalar
 # forward substitution over threaded do-vars (the multinomial-cell shape —
-# no matrix, no triangular solve in the cell, so the tensorized plate
-# traces; a core-`mvnormal` splice was probed and fails Reactant primal
-# inside the plate — the in-cell `\` hits scalar indexing in Reactant's
-# `generic_trimatdiv!`, a primal gap distinct from the §7f gradient gap).
+# no matrix, no triangular solve in the cell).
 # The L entries materialize as `_ppl_mvn_Le_` scalars (row-scaled layout
 # temps) and thread as shared scalar plate inputs.
 function _mvn_cholesky_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
@@ -4865,9 +4857,8 @@ end
 
 # Sampling transforms enforce support; observations use a lazy density guard.
 function _untyped_branch_locals(ex::Expr)
-    # Branch locals are ordinary Julia assignments. Their annotations would
-    # convert traced numbers to Float64 during compiled execution; the enclosing
-    # kernel node already supplies the result type. Endpoint calls such as
+    # Branch locals are ordinary Julia assignments; the enclosing kernel node
+    # already supplies the result type. Endpoint calls such as
     # `normal(m, s).cdf(x)` stay source: ReactiveKernels lowers an object
     # endpoint under a branch arm inside that arm.
     if ex.head === :(=) && first(ex.args) isa Expr && first(ex.args).head === :(::)

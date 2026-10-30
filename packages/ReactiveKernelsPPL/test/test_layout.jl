@@ -257,19 +257,19 @@ end
         :identity, NaN, NaN, [2, 3], LayoutEntry[], nothing)
     @test transform_statements(zentry) == Expr[
         :(_ppl_arrflat_Z::AbstractVector{Float64} =
-            ReactiveKernels._tensorized_view(unconstrained, 7:12)),
+            Base.view(unconstrained, 7:12)),
         :(Z::AbstractMatrix{Float64} = reshape(_ppl_arrflat_Z, 2, 3)),
     ]
     ventry = LayoutEntry(:array, nothing, :v, Symbol.("v.", 1:3), 2, 3,
         :identity, NaN, NaN, [3], LayoutEntry[], nothing)
     @test transform_statements(ventry) ==
         Expr[:(v::AbstractVector{Float64} =
-            ReactiveKernels._tensorized_view(unconstrained, 2:4))]
+            Base.view(unconstrained, 2:4))]
     pentry = LayoutEntry(:plate, nothing, :theta, Symbol.("theta.", 1:4), 5, 4,
         :identity)
     @test transform_statements(pentry) ==
         Expr[:(theta::AbstractVector{Float64} =
-            ReactiveKernels._tensorized_view(unconstrained, 5:8))]
+            Base.view(unconstrained, 5:8))]
 end
 
 @testset "name hygiene" begin

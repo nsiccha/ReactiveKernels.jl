@@ -123,11 +123,6 @@ end
         inlined_ast, inlined_ops, _ =
             lower_with_ops(p; inline_embedded = true)
         @test compile(inlined_ast)(inlined_ops, x, s) == reference
-        _, tensorized_ops, _ = lower_with_ops(p; tensorized = true)
-        @test tensorized_ops == ops
-        _, tensorized_inlined_ops, _ =
-            lower_with_ops(p; tensorized = true, inline_embedded = true)
-        @test tensorized_inlined_ops == inlined_ops
     end
 
     @testset "generated breadth of authored plate consumers" begin

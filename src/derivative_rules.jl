@@ -19,9 +19,7 @@
 # while the operation tables are the only fields. The callable therefore holds
 # no runtime-generated code object: with singleton source operations it is an
 # `isbits` value, so a closure capturing it stays a plain value for every AD
-# backend, and its call is generic over the scalar type (a Reactant-traced
-# number takes the same cut, because the source operations select a native or
-# tensorized body by argument style).
+# backend, and its call is generic over the scalar type.
 
 """
     ScalarDerivativeRule{Name,N,Inputs}
@@ -210,7 +208,7 @@ function _derivative_cut_lowering(spec::KernelSpec, name::Symbol, have, want;
         "$(generator)($(name)): the planned HAVE order " *
         "$(Tuple(v.name for v in p.have)) differs from the signature order $(have)"))
     p = _fuse_authored_plate_chains(_partial_apply(p, ()))
-    _needs_embedded_tensorization(p) && return _rule_region_cut(p, name)
+    _owns_array_regions(p) && return _rule_region_cut(p, name)
     ast, ops, _ = _lower_with_ops(p)
     cut_spec = _encode_cut_body(ast, name, generator)
     (cut_spec, ops, cut_spec)
@@ -251,7 +249,7 @@ end
 
 The operation of a rule cut whose graph runs a plate, a scan or an embedded
 kernel (`_rule_region_cut`): the cut's compiled native body and the table it
-reads. The body is native Julia, so a traced call is refused explicitly.
+reads.
 """
 struct _RuleRegion{Name,F,O}
     f::F
@@ -261,16 +259,9 @@ _RuleRegion{Name}(f::F, ops::O) where {Name,F,O} = _RuleRegion{Name,F,O}(f, ops)
 
 @generated function (region::_RuleRegion{Name,F})(args::Vararg{Any,N}) where {Name,F,N}
     forwarded = Any[:(getfield(args, $index)) for index in 1:N]
-    quote
-        _dynamic_tensorized_marker(args) === nothing || _rule_region_traced($(QuoteNode(Name)))
-        $(_native_body_call_expr(F, :(getfield(region, :f)),
-                                 Any[:(getfield(region, :ops)), forwarded...]))
-    end
+    _native_body_call_expr(F, :(getfield(region, :f)),
+                           Any[:(getfield(region, :ops)), forwarded...])
 end
-
-@noinline _rule_region_traced(name::Symbol) = throw(ArgumentError(
-    "derivative rule $(name): a cut that runs a plate, a scan or an embedded " *
-    "kernel has a native body only; tracing it is not built"))
 
 _kernel_latest_source(region::_RuleRegion{Name}) where {Name} =
     _RuleRegion{Name}(region.f, _kernel_latest_source(region.ops))
@@ -625,7 +616,7 @@ HAVE ports that are neither directions nor the covector, in HAVE order.
 
 The graph may hold plates, scans and embedded kernels, in any branch. A cut
 that runs one is compiled from its native lowering, so its values are those
-of `prepare(graph; have, want)`, and it is not traced. In a position residual
+of `prepare(graph; have, want)`. In a position residual
 (`vectorize`, `prepare_batched`) the primal cut fills lane buffers like the
 same mathematics spliced into the caller.
 """

@@ -41,9 +41,7 @@ The solver boundary is deliberately authored for ordinary native AD:
 
 This shape matters because constructing or remaking a problem inside AD stores
 active values in the problem object and can force Enzyme runtime-activity
-analysis. The natural adaptive call remains a foreign opaque node, so loaded
-Reactant behavior is a separate acceptance axis rather than a claim made on
-this page.
+analysis. The natural adaptive call remains a foreign opaque node.
 
 The panel below shows three views of the model: **Raw input** (the exact
 executed source), a readable **Generated kernel**, and the **Compute DAG**.

@@ -177,25 +177,7 @@ jobs:
         run: julia --startup-file=no packages/setup_ppl_native.jl "$RUNNER_TEMP/rkppl-native"
       - name: Test native PPL on Julia-current
         env:
-          RKPPL_TEST_BACKENDS: native
           # Generator and query exercise fresh methods and explicit Enzyme
           # Reverse gradients; the runner preserves all earlier helper loads.
           RKPPL_TEST_FILES: test_contract.jl,test_layout.jl,test_preprocessing.jl,test_generator.jl,test_query.jl,test_corpus.jl
         run: julia --startup-file=no --check-bounds=yes --project="$RUNNER_TEMP/rkppl-native" packages/ReactiveKernelsPPL/test/runtests.jl
-
-  reactant-integration:
-    runs-on: ubuntu-latest
-    # The complete optional compiler suite is about 44 minutes on the pinned
-    # local acceptance host and can cross 60 minutes under hosted contention.
-    # Keep a bounded margin so a healthy suite is not reported as cancelled.
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-      - name: Configure git for source dependencies
-        run: git config --global url."https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/".insteadOf "https://github.com/"
-      - uses: julia-actions/setup-julia@v2
-        with:
-          version: '1.10'
-      - uses: julia-actions/cache@v2
-      - name: Test optional Reactant compiler extension
-        run: julia --startup-file=no test/run_reactant_integration.jl

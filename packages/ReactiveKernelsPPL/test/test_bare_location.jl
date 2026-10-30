@@ -2,7 +2,7 @@
 # over a constrained-scale param, no link inversion — the mixture bare-mean
 # slots, single-family form): surface admission, fail-closed battery, value
 # parity vs Distributions.jl oracles (rate_1..4 shapes), Enzyme-vs-findiff
-# gradients (Reactant/XLA value+grad: test_bare_location_reactant.jl).
+# gradients.
 # Then value locations: a scalar parameter or data column read as the
 # location under the written link.
 # (`_check_gradient` / `_findiff_grad` / `_GEN_BACKEND` come from

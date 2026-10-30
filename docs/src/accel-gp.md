@@ -6,8 +6,8 @@ motorcycle-acceleration data. It is a *distributional* model — a latent GP on
 **both** the mean and the log-standard-deviation of a Normal response. Its
 lesson is that an approximate/basis GP is **pure dense matrix-vector products
 with no covariance matrix and no Cholesky**, so — unlike the exact GPs
-([marginal](gp-regr.md), [latent Poisson](gp-pois-regr.md)) — it lowers all
-four acceptance axes through Reactant, gradient included. Full real data
+([marginal](gp-regr.md), [latent Poisson](gp-pois-regr.md)) — its cost is
+linear in the basis size. Full real data
 (`N = 133`) is loaded through `PosteriorDB.jl`.
 
 The complete runnable source is
@@ -50,19 +50,3 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
 The native primal and the plain-Enzyme reverse gradient match BridgeStan's
 reference `.stan` (`propto = false`, `jacobian = true`) to machine precision on
 the full data.
-
-## Reactant
-
-Because the HSGP is only dense matrix-vector products, the exact authored graph
-lowers **all four** acceptance axes through Reactant: primal (all data bound,
-only the unconstrained draw traced), and — unlike the dense-Cholesky GPs — the
-**compiled reverse gradient**, which matches BridgeStan to machine precision.
-This is the approximate-GP case that avoids the `stablehlo.cholesky` /
-`stablehlo.triangular_solve` adjoint gap documented in `reactivekernels-use`
-§7f.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.AccelGPExample.demo()'
-```

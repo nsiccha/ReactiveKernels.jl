@@ -155,9 +155,7 @@ to `solve` at call time.
 Accepted evidence path under decision `008vhy5`: native primal/value plus
 ordinary-Reverse gradient, supported via landed core fix `55da875`/`f8acaa1`
 for snag `plain-enzyme-rev-3dc5d563` (bound views externalized as owning
-copies for prepared AD). Compiled Reactant primal/gradient is unsupported
-pending the separate survey (investigation todo
-`2026-09-17T14-41-05-845-1k4a6ep`).
+copies for prepared AD).
 """
 function build_lotka_volterra_graph()
     compose(_LOTKA_VOLTERRA_GRAPH_TEMPLATE[])

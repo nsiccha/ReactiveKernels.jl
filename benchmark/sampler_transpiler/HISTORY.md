@@ -1,5 +1,9 @@
 # HMC transpiler experiment history
 
+> **Historical archive.** ReactiveKernels no longer has a Reactant path. The
+> Reactant backend, its traced-slot compiler and the scripts that measured it
+> were removed; this history describes them as they were.
+
 This archive retains earlier interfaces and measured checkpoints. Start with
 the current [prepared-program guide](README.md) for supported experimental usage.
 

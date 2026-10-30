@@ -1,4 +1,9 @@
-# MNIST kernels through Reactant
+# MNIST kernels through Reactant (historical receipt)
+
+> **Historical receipt.** ReactiveKernels no longer has a Reactant path: its
+> Reactant extension, tensorized lowering and Reactant tests were removed. This
+> page keeps the measurements as recorded. Nothing on it runs Reactant, and the
+> RK functions and test files it names no longer exist.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_result_assets()
@@ -101,56 +106,14 @@ Main.ReactiveKernelsDocs.render_mnist_reactant_wren_benchmark()
 Main.ReactiveKernelsDocs.render_mnist_reactant_ad_wren_benchmark()
 ```
 
-## Reproduce
+## Provenance
 
-The receipt generator requires a clean detached candidate so its full commit
-pin and source blob are immutable. From a sibling directory:
-
-```sh
-git -C ReactiveKernels.jl worktree add --detach ReactiveKernels-mnist-receipt HEAD
-cd ReactiveKernels-mnist-receipt
-julia --startup-file=no benchmark/mnist_reactant_comparison.jl \
-  --output=benchmark/receipts/mnist-reactant-v2.toml
-julia --startup-file=no benchmark/receipts/validate_mnist_reactant.jl \
-  benchmark/receipts/mnist-reactant-v2.toml
-```
-
-The script provisions a fresh environment with Reactant 0.2.289, develops the
-exact candidate plus its two example packages, loads the full MNIST training
-split via MLDatasets, and records environment setup, package precompilation,
-and data loading separately. For a quick non-publication smoke run, set
-`RK_MNIST_REACTANT_N=64` and `RK_MNIST_REACTANT_ROUNDS=2`; the checked-in
-receipt keeps the publication protocol of the full training split and at least
-ten rounds.
-
-The Reactant-compiled-AD receipt is generated the same way from the same clean
-detached candidate, and additionally resolves Enzyme and
-DifferentiationInterface into the pinned environment:
-
-```sh
-julia --startup-file=no benchmark/mnist_reactant_ad_comparison.jl \
-  --output=benchmark/receipts/mnist-reactant-ad-v2.toml
-julia --startup-file=no benchmark/receipts/validate_mnist_reactant_ad.jl \
-  benchmark/receipts/mnist-reactant-ad-v2.toml
-```
-
-Its quick-smoke knobs are `RK_MNIST_REACTANT_AD_N` and
-`RK_MNIST_REACTANT_AD_ROUNDS`.
-
-Generate the Wren-compatible receipts through the same wrappers with the
-explicit dataset selector. Supplying the copied CSV performs the
-publication-time equality check; PCA itself is reconstructed from MLDatasets.
-
-```sh
-julia --startup-file=no benchmark/mnist_reactant_comparison.jl \
-  --dataset=wren-pca40 --wren-reference=/path/to/mnist.csv \
-  --output=benchmark/receipts/mnist-reactant-wren-pca40-v1.toml
-julia --startup-file=no benchmark/receipts/validate_mnist_reactant.jl \
-  benchmark/receipts/mnist-reactant-wren-pca40-v1.toml
-
-julia --startup-file=no benchmark/mnist_reactant_ad_comparison.jl \
-  --dataset=wren-pca40 --wren-reference=/path/to/mnist.csv \
-  --output=benchmark/receipts/mnist-reactant-ad-wren-pca40-v1.toml
-julia --startup-file=no benchmark/receipts/validate_mnist_reactant_ad.jl \
-  benchmark/receipts/mnist-reactant-ad-wren-pca40-v1.toml
-```
+Each receipt was generated from a clean detached checkout of the
+ReactiveKernels commit it pins, in a fresh environment with Reactant 0.2.289,
+by `benchmark/mnist_reactant_comparison.jl` and
+`benchmark/mnist_reactant_ad_comparison.jl` at that commit (the Wren-compatible
+receipts with `--dataset=wren-pca40`). Both scripts were removed together with
+ReactiveKernels' Reactant path. The full-resolution receipts keep the
+publication protocol of the full training split and at least ten rounds, and
+`benchmark/receipts/validate_mnist_reactant.jl` and
+`validate_mnist_reactant_ad.jl` still validate them.

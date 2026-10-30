@@ -73,37 +73,3 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
     setup = Main.ReactiveKernelsDocs.setup_covid19imperial!,
 )
 ```
-
-## Reactant and AD support
-
-The natural batched recurrence lowers through Reactant directly — primal and
-reverse gradient — on the tested configuration (Julia 1.10.11, BridgeStan 2.9.0
-/ Stan 2.39, Reactant 0.2.285, Enzyme 0.13.201, DifferentiationInterface
-0.7.21, SpecialFunctions 2.9.0, LogExpFunctions 0.3.29). The committed
-`benchmark/pandemic_gate.jl` checks the graph against the actual `.stan` via
-BridgeStan (`propto=false, jacobian=true`) on reference-valid probes: native
-value and native reverse-gradient axes run for every selected posterior of the
-family, while the compiled Reactant primal/gradient axes are compiled once per
-DISTINCT dataset (ecdc0401 and ecdc0501) rather than separately for the
-byte-identical v2/v3 model names. Measured on that configuration: native value
-`4.0e-16`–`5.9e-16`, native reverse gradient `1.6e-15`–`2.9e-15`,
-Reactant-compiled primal `1.3e-16`–`1.8e-16`, Reactant-compiled gradient
-`2.2e-15`–`2.4e-15` relative error, plus small-shape boundary controls against
-actual Stan (early observation windows including day 1, and the empty renewal
-tail `N2 = N0`). These are correctness receipts on the named probe scope (five
-reference-valid probes per posterior for the native axes, one probe per
-compiled dataset for the Reactant axes), not timing claims.
-
-Three authoring details matter under AD and Reactant. The buffer shift is
-`vcat(permutedims(pred), buffer[1:(N2-1), :])`; `vcat(transpose(...), Matrix)`
-shapes fail ordinary Enzyme, the equally natural `reduce(vcat, permutedims.(eds))`
-materialization of the scan outputs fails under Reactant (traced-size
-typeassert in `_typed_vcat`), and `stack(eds)` is transposed (vectors become
-columns), so the E_deaths grid materializes as `permutedims(reduce(hcat, eds))`.
-A scan closure resolves free names in its enclosing module, not the `@kernel`
-body, so `N2` rides along as an explicit `Ref` operand. And under ordinary
-(unannotated) Enzyme the scan's `xs` matrix must stay purely param-derived —
-concatenating a constant phase column into it stores constant memory into
-differentiable state (a runtime-activity dependency) — which the exact
-closed-form imputation-day block makes unnecessary; the active per-country
-`ifr_noise` vector rides inside the scan carry for the same reason.

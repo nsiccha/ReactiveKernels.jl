@@ -1,5 +1,9 @@
 #!/usr/bin/env julia
 
+# Native scalar-distribution gallery benchmark. Writes a
+# `scalar-distribution-gallery-v2` receipt; the checked-in v1 receipts also carry
+# historical Reactant cells, measured with ReactiveKernels' removed Reactant path.
+
 module ScalarDistributionGalleryComparison
 
 include("distribution_benchmark_cases.jl")
@@ -8,11 +12,9 @@ using BenchmarkTools
 using Dates
 using Distributions
 using LogExpFunctions: logistic
-using Pkg
 using Printf
 using ProbabilityMeasures
 using Random
-using Reactant
 using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     cauchy, laplace, bernoulli, lognormal, exponential, geometric, uniform,
@@ -22,8 +24,6 @@ using TOML
 
 using .DistributionBenchmarkCases:
     SCALAR_GALLERY_FAMILIES, SCALAR_GALLERY_SIZES, scalar_family_inputs
-
-using Reactant: @compile
 
 const PROBABILITY_MEASURES_SHA = "7cf3a6e112aaae2097b8d401b256d1bce635e03e"
 const DEFAULT_SIZES = SCALAR_GALLERY_SIZES
@@ -119,15 +119,6 @@ probability_measures_binomial(observed, n, logit) = sum(
 # ProbabilityMeasures exposes no Gamma or Beta measure, so those comparator
 # cells stay blank rather than inventing a substitute implementation.
 
-_compile2(f, a, b) = @compile sync = true f(a, b)
-_compile3(f, a, b, c) = @compile sync = true f(a, b, c)
-
-function _compile(f, args)
-    length(args) == 2 && return _compile2(f, args...)
-    length(args) == 3 && return _compile3(f, args...)
-    error("unsupported gallery benchmark arity $(length(args))")
-end
-
 function _measurement(f, args...; rounds::Int)
     benchmark = @benchmarkable $f($args...)
     times_ns = Float64[]
@@ -186,21 +177,10 @@ _family_functions(::Val{:binomial_logit}) = (;
 function _family_case(family, n)
     tag = Val(Symbol(family))
     native = Tuple(scalar_family_inputs(tag, n))
-    traced = map(native) do value
-        value isa Number ? Reactant.to_rarray(value; track_numbers = true) :
-            Reactant.to_rarray(value)
-    end
-    (; native, traced, _family_functions(tag)...)
+    (; native, _family_functions(tag)...)
 end
 
 _git(repo, args...) = readchomp(Cmd(["git", "-C", repo, string.(args)...]))
-
-function _package_version(name)
-    for info in values(Pkg.dependencies())
-        info.name == name && return string(info.version)
-    end
-    error("package $name is absent from the benchmark environment")
-end
 
 function _sizes()
     raw = get(ENV, "RK_SCALAR_GALLERY_BENCH_SIZES", "")
@@ -226,12 +206,6 @@ function run_benchmark()
     Random.seed!(0x5ca1a7)
     rounds = parse(Int, get(
         ENV, "RK_SCALAR_GALLERY_BENCH_ROUNDS", string(DEFAULT_ROUNDS)))
-    support = Dict(family => Dict(
-        "rk_reactant" => true,
-        "probability_measures_reactant" => true,
-        "distributions_reactant" => true,
-    ) for family in FAMILIES)
-    support_errors = Dict(family => Dict{String,String}() for family in FAMILIES)
     rows = Dict{String,Any}[]
 
     for family in FAMILIES, n in _sizes()
@@ -240,64 +214,12 @@ function run_benchmark()
         has_pm = case.probability_measures !== nothing
         isapprox(case.distributions(case.native...), reference; rtol = 1e-11) ||
             error("native Distributions mismatch for $family at N=$n")
-        if has_pm
-            isapprox(case.probability_measures(case.native...), reference; rtol = 1e-11) ||
-                error("native ProbabilityMeasures mismatch for $family at N=$n")
-        else
-            # ProbabilityMeasures exposes no measure for this family; the cell
-            # stays blank rather than inventing a substitute.
-            support[family]["probability_measures_reactant"] = false
-            support_errors[family]["probability_measures_reactant"] =
-                "not exposed by ProbabilityMeasures"
-        end
+        has_pm &&
+            !isapprox(case.probability_measures(case.native...), reference; rtol = 1e-11) &&
+            error("native ProbabilityMeasures mismatch for $family at N=$n")
 
-        rk_compile_s = @elapsed rk_compiled = _compile(case.rk, case.traced)
-        rk_value = Float64(rk_compiled(case.traced...))
-        isapprox(rk_value, reference; rtol = 1e-11) ||
-            error("RK + Reactant value mismatch for $family at N=$n")
-
-        pm_compiled = nothing
-        pm_compile_s = nothing
-        pm_value = nothing
-        if has_pm
-            # ProbabilityMeasures native works, but some measures reject traced
-            # inputs (e.g. Binomial's Int trial count under Reactant). Treat a
-            # failed Reactant compile as an honest unsupported cell.
-            try
-                pm_compile_s = @elapsed pm_compiled =
-                    _compile(case.probability_measures, case.traced)
-                pm_value = Float64(pm_compiled(case.traced...))
-                isapprox(pm_value, reference; rtol = 1e-11) ||
-                    error("ProbabilityMeasures + Reactant value mismatch")
-            catch err
-                support[family]["probability_measures_reactant"] = false
-                support_errors[family]["probability_measures_reactant"] = _diagnostic(err)
-                pm_compiled = nothing
-                pm_compile_s = nothing
-                pm_value = nothing
-            end
-        end
-
-        dist_compiled = nothing
-        dist_compile_s = nothing
-        if support[family]["distributions_reactant"]
-            try
-                dist_compile_s = @elapsed dist_compiled =
-                    _compile(case.distributions, case.traced)
-                dist_value = Float64(dist_compiled(case.traced...))
-                isapprox(dist_value, reference; rtol = 1e-11) ||
-                    error("Distributions + Reactant value mismatch")
-            catch err
-                support[family]["distributions_reactant"] = false
-                support_errors[family]["distributions_reactant"] = _diagnostic(err)
-            end
-        end
-
-        observed = Any[reference, case.distributions(case.native...), rk_value]
+        observed = Any[reference, case.distributions(case.native...)]
         has_pm && push!(observed, case.probability_measures(case.native...))
-        pm_value === nothing || push!(observed, pm_value)
-        dist_compiled === nothing || push!(observed,
-            Float64(dist_compiled(case.traced...)))
         denominator = max(abs(reference), eps(Float64))
         row = Dict{String,Any}(
             "family" => family,
@@ -308,29 +230,17 @@ function run_benchmark()
             "rk_native" => _measurement(case.rk, case.native...; rounds),
             "distributions_native" =>
                 _measurement(case.distributions, case.native...; rounds),
-            "rk_reactant" => _measurement(rk_compiled, case.traced...; rounds),
-            "rk_reactant_compile_seconds" => rk_compile_s,
         )
         if has_pm
             row["probability_measures_native"] =
                 _measurement(case.probability_measures, case.native...; rounds)
-        end
-        if pm_compiled !== nothing
-            row["probability_measures_reactant"] =
-                _measurement(pm_compiled, case.traced...; rounds)
-            row["probability_measures_reactant_compile_seconds"] = pm_compile_s
-        end
-        if dist_compiled !== nothing
-            row["distributions_reactant"] =
-                _measurement(dist_compiled, case.traced...; rounds)
-            row["distributions_reactant_compile_seconds"] = dist_compile_s
         end
         push!(rows, row)
         @printf("family=%s N=%d complete\n", family, n)
     end
 
     receipt = Dict{String,Any}(
-        "schema" => "scalar-distribution-gallery-v1",
+        "schema" => "scalar-distribution-gallery-v2",
         "generated_at" => string(now(UTC), "Z"),
         "pins" => Dict(
             "reactivekernels_sha" => _git(repo, "rev-parse", "HEAD"),
@@ -338,8 +248,6 @@ function run_benchmark()
             "probability_measures_sha" => PROBABILITY_MEASURES_SHA,
             "probability_measures_version" => string(Base.pkgversion(ProbabilityMeasures)),
             "distributions_version" => string(Base.pkgversion(Distributions)),
-            "reactant_version" => string(Base.pkgversion(Reactant)),
-            "reactant_jll_version" => _package_version("Reactant_jll"),
             "julia_version" => string(VERSION),
         ),
         "environment" => Dict(
@@ -347,7 +255,6 @@ function run_benchmark()
             "arch" => string(Sys.ARCH),
             "cpu" => first(Sys.cpu_info()).model,
             "julia_threads" => Threads.nthreads(),
-            "reactant_backend" => "default CPU",
         ),
         "protocol" => Dict(
             "families" => collect(FAMILIES),
@@ -374,13 +281,7 @@ function run_benchmark()
             "estimator" => "median of per-round BenchmarkTools minimum times",
             "samples_per_round" => 200,
             "seconds_per_round" => 0.25,
-            "reactant_sync" => true,
-            "reactant_transfers_included" => false,
-            "reactant_parameters_traced" => true,
-            "reactant_compile_time_in_timed_region" => false,
         ),
-        "support" => support,
-        "support_errors" => support_errors,
         "measurements" => rows,
     )
 

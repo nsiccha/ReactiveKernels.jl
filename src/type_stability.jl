@@ -113,13 +113,7 @@ function _uninferred_values!(found::Vector{_UninferredValue}, p::Plan,
             return map(v -> _declared_value_type(declares, recipe, v), recipe.outputs)
         end
         # Bound data has its own runtime type; it is an input, not inferred.
-        # Traced data runs the tensorized product, which this check does not
-        # type.
-        if recipe.op isa _BoundConstant
-            value = recipe.op.value
-            return (_kernel_source_arg_style(value) === Val(:native) ?
-                    typeof(value) : Any,)
-        end
+        recipe.op isa _BoundConstant && return (typeof(recipe.op.value),)
         before = length(found)
         T = _checked_recipe_type!(found, recipe.op, input_types,
                                   [path; first(recipe.outputs).name])
@@ -196,7 +190,7 @@ function _checked_recipe_type!(found, op::_AuthoredScanOp, input_types, path)
     step = op.kernel.plan
     types = _uninferred_values!(found, step,
         _scan_step_argument_types(op, input_types), path,
-        _needs_embedded_tensorization(step))
+        _owns_array_regions(step))
     output = get(types, canon_id(step.graph, step.want[2].id), Any)
     _concrete_value_type(output) ? _scan_result_type(op, input_types, output) : nothing
 end
@@ -205,7 +199,7 @@ end
 function _checked_recipe_type!(found, op::PreparedKernel, input_types, path)
     p = op.plan
     types = _uninferred_values!(found, p, input_types, path,
-                                _needs_embedded_tensorization(p))
+                                _owns_array_regions(p))
     wants = Any[get(types, canon_id(p.graph, v.id), Any) for v in p.want]
     all(_concrete_value_type, wants) || return nothing
     length(wants) == 1 ? only(wants) : Tuple{wants...}
@@ -223,7 +217,7 @@ Base.@nospecializeinfer function _uninferred_values(@nospecialize(kernel), argum
     found = _UninferredValue[]
     length(p.have) == length(argument_types) || return found
     _uninferred_values!(found, p, collect(Any, argument_types), Symbol[],
-                        _needs_embedded_tensorization(p))
+                        _owns_array_regions(p))
     found
 end
 

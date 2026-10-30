@@ -44,22 +44,3 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
     setup = Main.ReactiveKernelsDocs.setup_bones!,
 )
 ```
-
-## Reactant
-
-The exact authored graph compiles and executes through the public Reactant
-boundary with value and gradient parity — `benchmark/batch_latent_gate.jl`
-`@compile`s both the primal and the gradient and asserts they match the native
-evaluation and the reference `.stan` (via BridgeStan, `propto = false`,
-`jacobian = true`). The in-graph `repeat` coordinates, the `grade`-derived cut
-indices, the `gamma`/`delta`/`theta` gathers and the comparison masks all lower
-cleanly.
-Evidence is bounded to six reference-finite native points (Reactant uses their
-first point) under BridgeStan 2.9 / Stan 2.39; finite-point parity is not an
-all-input proof.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.BonesModelExample.demo()'
-```

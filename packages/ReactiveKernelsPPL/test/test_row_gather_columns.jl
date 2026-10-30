@@ -56,7 +56,7 @@ end
         @test all(isapprox(joint.grad[name], direct.grad[name]; atol=1e-9, rtol=1e-9)
             for name in joint.names)
         code = string(kernel_expr(joint.bound, joint.built.layout))
-        @test occursin("_tensorized_view(P", code)
+        @test occursin("Base.view(P", code)
         observations = prepare_query(joint.built, joint.bound, :observations)
         locations = Base.invokelatest(observations, joint.u)
         @test all(getproperty(locations, y).location isa SubArray

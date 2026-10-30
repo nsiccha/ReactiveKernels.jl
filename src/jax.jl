@@ -443,10 +443,6 @@ _jax_expr(ctx::_JaxContext, ::Val{:continue}, ex) = ctx.host === nothing ?
     _jax_error("`continue` has no JAX translation", _jax_where(ctx)) : _host_jump(ctx, "continue")
 function _jax_expr(ctx::_JaxContext, ::Val{:macrocall}, ex)
     name = ex.args[1]
-    # `ReactantCore.@trace` marks the control flow a compiled backend keeps;
-    # its loop or branch is translated as written (options such as
-    # `checkpointing = …` are a compiler's concern, not the program's).
-    _jax_is_trace_macro(name) && return _jax_expr(ctx, ex.args[end])
     name in (Symbol("@inbounds"), Symbol("@fastmath"), Symbol("@inline"),
              Symbol("@noinline")) ||
         (name isa GlobalRef && name.name in (Symbol("@inbounds"), Symbol("@inline"))) ||
@@ -908,10 +904,6 @@ function _jax_expr(ctx::_JaxContext, ::Val{:comprehension}, ex)
     _PyVal(values.code, values.T, false, bound)
 end
 
-_jax_is_trace_macro(name) = name === Symbol("@trace") ||
-    (name isa GlobalRef && name.name === Symbol("@trace")) ||
-    (name isa Expr && name.head === :. && name.args[end] == QuoteNode(Symbol("@trace")))
-
 # A `while` loop: `jax.lax.while_loop` over the outer locals the body assigns.
 # JAX differentiates it forward only; `jax.grad` through it raises JAX's own
 # error, so a differentiated program writes the loop as a `for` over a range.
@@ -1343,8 +1335,7 @@ function _jax_local_callable(ctx::_JaxContext, name::Symbol)
     _jax_error("calling the local `", name, "` has no JAX translation", _jax_where(ctx))
 end
 
-_jax_is_indexing(f) = f === getindex || f === view || f === _tensorized_getindex ||
-    f === _tensorized_view || f === Base.maybeview
+_jax_is_indexing(f) = f === getindex || f === view || f === Base.maybeview
 
 _jax_call(ctx::_JaxContext, f, args::Vector{_PyVal}) = _jax_call(ctx, f, args, Pair{Symbol,_PyVal}[])
 
@@ -1726,7 +1717,7 @@ end
 
 # Rounding to an integer type, `floor(Int, x)`.
 for (f, name) in ((trunc, "jnp.trunc"), (floor, "jnp.floor"), (ceil, "jnp.ceil"),
-                  (round, "jnp.round"), (_tensorized_trunc, "jnp.trunc"))
+                  (round, "jnp.round"))
     @eval function _jax_function_call(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal})
         T = length(args) == 2 ? _jax_type_of_value(args[1]) : nothing
         T isa Type && T <: Integer ||

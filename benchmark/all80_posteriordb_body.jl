@@ -1,16 +1,15 @@
-# All-82 measurement body — ONE PHASE per subprocess (RK_ALL80_PHASE), so loading Reactant
-# never perturbs native timings. Reuses the pinned upstream driver's helpers
+# All-82 measurement body — runs in its own subprocess (the native phase). Reuses the pinned upstream driver's helpers
 # (bridge_model / make_model / CoordinateMap / stable_ldf / random_valid_points / draw_center)
 # for reference-Stan + upstream-Turing at a shared q, and the faithful registry graphs for RK.
-# HMC uses the SAME authored program as benchmark/reactant_hmc_loop_table.jl (transpiled_endpoint
-# / prepare_transpiled / multinomial_hmc_state, backend :native|:reactant) fed the faithful
-# kb/prep. AHMC-Turing uses AdvancedHMC on the Turing LDF. All timings via Chairmarks/@elapsed;
+# HMC uses the transpiled multinomial-HMC program (transpiled_endpoint / prepare_transpiled /
+# multinomial_hmc_state) fed the faithful kb/prep. AHMC-Turing uses AdvancedHMC on the Turing LDF. All timings via Chairmarks/@elapsed;
 # every side parity-gated against reference Stan (propto=false, jacobian=true) before timing.
 using Random, LinearAlgebra, Statistics
 import TOML, SHA
 
 const UP = ENV["RK_ALL80_UPSTREAM"]
 const PHASE = get(ENV, "RK_ALL80_PHASE", "native")
+PHASE == "native" || error("all80 body: unknown RK_ALL80_PHASE=$(PHASE) (expected native)")
 const RECEIPT = get(ENV, "RK_ALL80_RECEIPT", "")
 # DISCOVER: measurement/offset-discovery mode — RECORD parity_pass + the observed offset per
 # model and CATCH per-model, instead of erroring on the first undeclared offset. DEFAULT (unset)
@@ -36,7 +35,7 @@ include(joinpath(@__DIR__, "all80_axes.jl"))       # All80Axes.measure_native (n
 include(joinpath(@__DIR__, "all80_metadata.jl"))   # All80Metadata.meta(key): family/note + optional provenance
 const RK = All80Registry.REGISTRY
 
-# HMC transpiler machinery (Reactant-FREE to include; the :native backend needs no Reactant).
+# HMC transpiler machinery.
 const STD = joinpath(@__DIR__, "sampler_transpiler")
 include(joinpath(STD, "eight_schools_density.jl"))            # Potential, Gradient, CallbackHandle
 include(joinpath(@__DIR__, "nuts_kernel_authoring_fixture_b.jl"))  # F.euclidean_phasepoint, F.leapfrog!
@@ -44,23 +43,7 @@ include(joinpath(STD, "position_multinomial_hmc_kernel.jl"))  # PositionMultinom
 using .EightSchoolsDensity: Potential, Gradient, CallbackHandle
 const F = NUTSBMutationAuthoringFixture
 
-# Phase-conditional HEAVY imports: native loads AdvancedHMC (NO Reactant); reactant loads Reactant
-# + the per-operation Reactant.@compile cells (reactant_cells), kept in a separate file so the
-# macro is lowered ONLY where Reactant is loaded (a Reactant macro in run_one's body would be
-# expanded at run_one's DEFINITION and would fail in the native phase).
-if PHASE == "native"
-    @eval import AdvancedHMC
-elseif PHASE == "reactant"
-    @eval import Reactant
-    include(joinpath(@__DIR__, "all80_reactant_evals.jl"))
-else
-    error("all80 body: unknown RK_ALL80_PHASE=$(PHASE) (expected native|reactant)")
-end
-
-# FAIL-CLOSED isolation: the native phase must NOT have Reactant loaded (executable, not prose).
-_reactant_loaded() = any(m -> String(nameof(m)) == "Reactant", values(Base.loaded_modules))
-PHASE == "native" && _reactant_loaded() &&
-    error("native-phase isolation violated: Reactant is loaded before measurements")
+import AdvancedHMC
 
 # BATCH provenance: the parent froze source/environment bytes before spawn; this child loaded and
 # verified that lock BEFORE measured imports. Now certify the actual loaded module roots and all
@@ -136,22 +119,21 @@ function _rk_full_diag(cell, name, err, bt)
     string(cell, ": ", first(replace(full, "\n" => " "), 200), ref)
 end
 
-# ---- HMC loop (µs/transition) via the shared transpiled program, either backend ----
-# rng_factory yields a fresh sampler RNG (Xoshiro for :native; ReactantRNG for :reactant —
-# constructed only in the reactant phase, so `Reactant` is never referenced under :native).
-function hmc_loop(kb, prep, q, backend, rng_factory; T = 1000, steps = 16, rounds = 6)
+# ---- HMC loop (µs/transition) via the shared transpiled program ----
+# rng_factory yields a fresh sampler RNG for each round.
+function hmc_loop(kb, prep, q, rng_factory; T = 1000, steps = 16, rounds = 6)
     D = length(q)
     point = transpiled_endpoint(F.euclidean_phasepoint, F.leapfrog!,
         CallbackHandle(Potential(kb)), CallbackHandle(Gradient(prep)),
         Diagonal(ones(D)), copy(q), zeros(D))
     prog = prepare_transpiled(PositionMultinomialHMCAuthoring.multinomial_hmc_state, point;
-        backend, method = :step!, argument = rng_factory(), iterations = T,
+        method = :step!, argument = rng_factory(), iterations = T,
         kernel_kwargs = (n_steps = steps, step_f = F.leapfrog!, stepsize = 0.03),
         outputs = (position = (:init, :pos),))
     st = initial_transpiled_state(prog)
-    warm = prog(st, rng_factory())                    # warmup (compile+run for :reactant)
+    warm = prog(st, rng_factory())                    # warmup
     all(isfinite, Array(warm.outputs.position)) ||
-        error("$backend RK HMC produced a non-finite warmup position (chain exploded)")
+        error("RK HMC produced a non-finite warmup position (chain exploded)")
     # FAIL-CLOSED per TIMED round: validate the final position of every measured result
     # before accepting its duration (timing NaN/Inf is not a valid HMC cell). Fresh seed
     # each round (deterministic, symmetric with AHMC).
@@ -160,7 +142,7 @@ function hmc_loop(kb, prep, q, backend, rng_factory; T = 1000, steps = 16, round
         local r
         t = @elapsed (r = prog(st, rng_factory()))
         all(isfinite, Array(r.outputs.position)) ||
-            error("$backend RK HMC produced a non-finite position on a timed round (chain exploded)")
+            error("RK HMC produced a non-finite position on a timed round (chain exploded)")
         push!(times, t)
     end
     median(times) / T * 1e6
@@ -335,33 +317,25 @@ function run_one(name; seed = 468, scale = 0.2, draws = 3)
         rk_grad = () -> ReactiveKernels.ad_value_and_gradient!(prep, gbuf, q),
         tu_grad = () -> DynamicPPL.LogDensityProblems.logdensity_and_gradient(tldf, qt),
         stan_grad = () -> BridgeStan.log_density_gradient(sm, sq(q); propto = false, jacobian = true),
-        hmc_time_loop = (backend, transitions) ->
-            hmc_loop(kb, prep, q, backend, _native_rng;
+        hmc_time_loop = transitions ->
+            hmc_loop(kb, prep, q, _native_rng;
                 T = transitions, steps = All80Axes.HMC_STEPS,
                 rounds = All80Axes.HMC_ROUNDS),
         ahmc_time_loop = transitions ->
             ahmc_loop(tldf, qt; T = transitions, steps = All80Axes.HMC_STEPS,
                 rounds = All80Axes.HMC_ROUNDS))
 
-    row = if PHASE == "native"
-        r = All80Axes.measure_native(ctx)
-        # optional optimized-Stan / further-Turing cells: user-directive deferral provenance
-        # (phase-independent metadata; attached in the native phase, carried by the aggregate).
-        r["primal_opt_stan"] = md.primal_opt_stan; r["primal_further_turing"] = md.primal_further_turing
-        r["gradient_opt_stan"] = md.gradient_opt_stan; r["gradient_further_turing"] = md.gradient_further_turing
-        r["input_identity_native"] = input_identity
-        r
-    else   # reactant: the 3 cells, each numeric-or-diagnostic, caught independently
-        reactant_cells(kb, prep, q)
-    end
+    row = All80Axes.measure_native(ctx)
+    # optional optimized-Stan / further-Turing cells: user-directive deferral provenance
+    # (metadata carried by the aggregate).
+    row["primal_opt_stan"] = md.primal_opt_stan; row["primal_further_turing"] = md.primal_further_turing
+    row["gradient_opt_stan"] = md.gradient_opt_stan; row["gradient_further_turing"] = md.gradient_further_turing
+    row["input_identity_native"] = input_identity
     for (k, v) in sort(collect(row); by = first)
         v isa Real && occursin(r"^(primal|gradient)_", k) && println("  $(rpad(k,24)) $(fmt(v))")
         v isa Real && startswith(k, "hmc_") && println("  $(rpad(k,24)) $(round(v;sigdigits=3)) µs/it")
-        (v isa AbstractString && occursin("reactant", k)) && println("  $(rpad(k,24)) N/A → $(first(v,90))")
     end
-    PHASE == "native" && println("  HMC protocol: $(row["hmc_transitions"]) transitions × $(row["hmc_steps"]) steps × $(row["hmc_rounds"]) rounds")
-    PHASE == "native" && _reactant_loaded() &&
-        error("native-phase isolation violated: Reactant loaded DURING $name (transpiler :native must not pull it)")
+    println("  HMC protocol: $(row["hmc_transitions"]) transitions × $(row["hmc_steps"]) steps × $(row["hmc_rounds"]) rounds")
     println("MODEL_OK [$PHASE] $name")
     row
 end

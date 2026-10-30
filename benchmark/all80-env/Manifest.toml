@@ -2,7 +2,7 @@
 
 julia_version = "1.10.11"
 manifest_format = "2.0"
-project_hash = "86146748f5b6f62901db2dbdd3b1129dc9cd4d63"
+project_hash = "7a7e26e0054a51c94b25e865c994522926cd8a49"
 
 [[deps.ADTypes]]
 deps = ["PrecompileTools"]
@@ -273,11 +273,6 @@ deps = ["Downloads", "Inflate", "TOML", "Tar"]
 git-tree-sha1 = "3037ad381e5595495008cf529c7adb7146b689ac"
 uuid = "c88b6f0a-829e-4b0b-94b7-f06ab5908f5a"
 version = "2.9.0"
-
-[[deps.BufferedStreams]]
-git-tree-sha1 = "6863c5b7fc997eadcabdbaf6c5f201dc30032643"
-uuid = "e1450e63-4bb3-523b-b2a4-4ffa8c0fd77d"
-version = "1.2.2"
 
 [[deps.CEnum]]
 git-tree-sha1 = "389ad5c84de1ae7cf0e28e381131c98ea87d54fc"
@@ -981,12 +976,6 @@ git-tree-sha1 = "d77aea19c9a71059a021acd99b0a4343e9661d94"
 uuid = "dad2f222-ce93-54a1-a47d-0025e8a3acab"
 version = "0.0.47+0"
 
-[[deps.LLVMOpenMP_jll]]
-deps = ["Artifacts", "JLLWrappers", "Libdl"]
-git-tree-sha1 = "e5b100780d4d30d63b4618d7930d48af409c1772"
-uuid = "1d63c593-3942-5779-bab2-d838dc0a180e"
-version = "23.1.1+0"
-
 [[deps.LaTeXStrings]]
 git-tree-sha1 = "f88f3ccef05a6a72a0cf0ed417c8fd68530f4ab2"
 uuid = "b964fa9f-0449-5b57-a5c2-d3ea65f4040f"
@@ -1639,12 +1628,6 @@ git-tree-sha1 = "fbb92c6c56b34e1a2c4c36058f68f332bec840e7"
 uuid = "92933f4c-e287-5a05-a399-4b506db050ca"
 version = "1.11.0"
 
-[[deps.ProtoBuf]]
-deps = ["BufferedStreams", "EnumX", "TOML"]
-git-tree-sha1 = "da18083a52d9d57bbe6dadaacad39731e5f7be39"
-uuid = "3349acd9-ac6a-5e09-bcdb-63829b23a429"
-version = "1.3.0"
-
 [[deps.PtrArrays]]
 git-tree-sha1 = "4fbbafbc6251b883f4d2705356f3641f3652a7fe"
 uuid = "43287f4e-b6f4-7ad1-bb20-aadabca52c3d"
@@ -1684,89 +1667,11 @@ git-tree-sha1 = "c6ec94d2aaba1ab2ff983052cf6a606ca5985902"
 uuid = "e6cf234a-135c-5ec9-84dd-332b85af5143"
 version = "1.6.0"
 
-[[deps.Reactant]]
-deps = ["Adapt", "BFloat16s", "CEnum", "Crayons", "Downloads", "EnumX", "Enzyme", "EnzymeCore", "FileWatching", "Functors", "GPUArraysCore", "GPUCompiler", "JSON", "LLVM", "LLVMOpenMP_jll", "Libdl", "LinearAlgebra", "OrderedCollections", "PrecompileTools", "Preferences", "PrettyTables", "ProtoBuf", "Random", "ReactantCore", "Reactant_jll", "SHA", "ScopedValues", "Scratch", "Serialization", "Setfield", "Sockets", "StableRNGs", "StructUtils", "StyledStrings", "UUIDs", "p7zip_jll"]
-git-tree-sha1 = "f32f004d16bc562d52d1a1ad1837c5a9f0e519d4"
-uuid = "3c362404-f566-11ee-1572-e11a4b42c853"
-version = "0.2.289"
-
-    [deps.Reactant.extensions]
-    ReactantAbstractFFTsExt = "AbstractFFTs"
-    ReactantArrayInterfaceExt = "ArrayInterface"
-    ReactantCUDAExt = ["CUDA", "Enzyme", "GPUCompiler", "KernelAbstractions", "LLVM", "Printf"]
-    ReactantDLFP8TypesExt = "DLFP8Types"
-    ReactantDatesExt = "Dates"
-    ReactantFFTWExt = ["FFTW", "AbstractFFTs", "LinearAlgebra"]
-    ReactantFillArraysExt = "FillArrays"
-    ReactantFloat8sExt = "Float8s"
-    ReactantKernelAbstractionsExt = "KernelAbstractions"
-    ReactantLogExpFunctionsExt = ["IrrationalConstants", "LogExpFunctions"]
-    ReactantMCMCDiagnosticToolsExt = ["MCMCDiagnosticTools", "Statistics"]
-    ReactantMPIExt = "MPI"
-    ReactantNNlibExt = ["NNlib", "Statistics"]
-    ReactantNPZExt = "NPZ"
-    ReactantOffsetArraysExt = "OffsetArrays"
-    ReactantOneHotArraysExt = "OneHotArrays"
-    ReactantPDMatsExt = "PDMats"
-    ReactantPythonCallExt = "PythonCall"
-    ReactantRandom123Ext = "Random123"
-    ReactantSparseArraysExt = "SparseArrays"
-    ReactantSpecialFunctionsExt = "SpecialFunctions"
-    ReactantStaticArraysExt = "StaticArrays"
-    ReactantStaticExt = "Static"
-    ReactantStatisticsExt = "Statistics"
-    ReactantStructArraysExt = "StructArrays"
-    ReactantTablesExt = "Tables"
-    ReactantTensorOperationsExt = "TensorOperations"
-    ReactantVectorInterfaceExt = "VectorInterface"
-    ReactantYaoBlocksExt = "YaoBlocks"
-    ReactantZygoteExt = "Zygote"
-
-    [deps.Reactant.weakdeps]
-    AbstractFFTs = "621f4979-c628-5d54-868e-fcf4e3e8185c"
-    ArrayInterface = "4fba245c-0d91-5ea0-9b3e-6abc04ee57a9"
-    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
-    DLFP8Types = "f4c16678-4a16-415b-82ef-ed337c5d6c7c"
-    Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
-    FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
-    FillArrays = "1a297f60-69ca-5386-bcde-b61e274b549b"
-    Float8s = "81dfefd7-55b0-40c6-a251-db853704e186"
-    IrrationalConstants = "92d709cd-6900-40b7-9082-c6be49f344b6"
-    KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
-    LogExpFunctions = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
-    MCMCDiagnosticTools = "be115224-59cd-429b-ad48-344e309966f0"
-    MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
-    NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
-    NPZ = "15e1cf62-19b3-5cfa-8e77-841668bca605"
-    OffsetArrays = "6fe1bfb0-de20-5000-8ca7-80f57d26f881"
-    OneHotArrays = "0b1bfda6-eb8a-41d2-88d8-f5af5cad476f"
-    PDMats = "90014a1f-27ba-587c-ab20-58faa44d9150"
-    Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
-    PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
-    Random123 = "74087812-796a-5b5d-8853-05524746bad3"
-    SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
-    SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
-    Static = "aedffcd0-7271-4cad-89d0-dc628f76c6d3"
-    StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
-    Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
-    StructArrays = "09ab397b-f2b6-538f-b94a-2f83cf4a842a"
-    Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
-    TensorOperations = "6aa20fa7-93e2-5fca-9bc0-fbd0db3c71a2"
-    VectorInterface = "409d34a3-91d5-4945-b6ec-7529ddf182d8"
-    YaoBlocks = "418bc28f-b43b-5e0b-a6e7-61bbc1a2c1df"
-    Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
-
 [[deps.ReactantCore]]
 deps = ["ExpressionExplorer", "MacroTools"]
 git-tree-sha1 = "a77cc2ced73917e291f1de06a959e4c34a35c459"
 uuid = "a3311ec8-5e00-46d5-b541-4f83e724a433"
 version = "0.1.23"
-
-[[deps.Reactant_jll]]
-deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
-git-tree-sha1 = "8b4fa28857236fb3b88d40b45d2b7d4ce4f60109"
-uuid = "0192cb87-2b54-54ad-80e0-3be72ad8a3c0"
-version = "0.0.413+0"
 
 [[deps.ReactiveKernels]]
 deps = ["DifferentiationInterface", "InverseFunctions", "LinearAlgebra", "LogExpFunctions", "PrecompileTools", "Random", "ReactantCore", "RuntimeGeneratedFunctions"]
@@ -2136,12 +2041,6 @@ weakdeps = ["ChainRulesCore"]
 
     [deps.SpecialFunctions.extensions]
     SpecialFunctionsChainRulesCoreExt = "ChainRulesCore"
-
-[[deps.StableRNGs]]
-deps = ["Random"]
-git-tree-sha1 = "4f96c596b8c8258cc7d3b19797854d368f243ddc"
-uuid = "860ef19b-820b-49d6-a774-d7a799459cd3"
-version = "1.0.4"
 
 [[deps.StaticArrays]]
 deps = ["LinearAlgebra", "PrecompileTools", "Random", "StaticArraysCore"]

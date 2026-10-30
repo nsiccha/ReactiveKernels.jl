@@ -65,17 +65,6 @@ time-to-effective-sample.
 The ReactiveHMC.jl `ca9` structure is an **algorithm-structure reference only** — not
 a bitwise or RNG target; improvements may change arithmetic or ordering.
 
-## Reactant receipt
-
-The frozen adaptive-NUTS Reactant result now lives on the
-[static Reactant receipt page](nuts-reactant.md). That page is receipt-only: neither it
-nor this sampling page executes NUTS compiler/runtime code during the docs build.
-
-The separate [WALNUTS-D mathematical-kernel page](walnuts.md) keeps the same
-phase-point, leapfrog, and depth-10 multinomial-NUTS mathematics, but replaces
-each leaf with the released fixed-macro-time dyadic refinement and reverse-grid
-test. It shows the exact authored `@kernel` slices consumed by the compiler.
-
 ## The mathematical UX — what you write
 
 The design goal is that the *math is the code*: each `@kernel` reads as the recurrence

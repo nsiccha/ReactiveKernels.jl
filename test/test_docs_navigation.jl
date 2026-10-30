@@ -1,6 +1,6 @@
 using Test
 
-@testset "review-first docs hierarchy and Reactant ownership" begin
+@testset "review-first docs hierarchy and historical Reactant receipts" begin
     root = joinpath(@__DIR__, "..")
     make = read(joinpath(root, "docs", "make.jl"), String)
 
@@ -10,7 +10,7 @@ using Test
         "\"Distributions\" => [",
         "\"Probabilistic programming\" => [",
         "\"Automatic differentiation\" => [",
-        "\"Reactant\" => [",
+        "\"Historical Reactant receipts\" => [",
         "\"Non-allocating kernels\" => \"nonallocating.md\"",
         "\"Tools and reference\" => [",
         "\"Bijectors\" => \"bijectors.md\"",
@@ -41,11 +41,15 @@ using Test
     @test !isfile(joinpath(root, "docs", "src", "practicalbayes.md"))
 
     for page in (
-        "reactant.md", "distributions-reactant.md",
-        "eight-schools-reactant.md", "mnist-reactant.md",
-        "reactant-ad.md", "eval-throughput.md", "nuts-reactant.md",
+        "distributions-reactant.md", "eight-schools-reactant.md",
+        "mnist-reactant.md", "eval-throughput.md", "nuts-reactant.md",
     )
         @test occursin("\"$page\"", make)
+    end
+    # The Reactant path is removed; only its historical receipts stay.
+    for page in ("reactant.md", "reactant-ad.md")
+        @test !occursin("\"$page\"", make)
+        @test !isfile(joinpath(root, "docs", "src", page))
     end
 
     distributions = read(joinpath(root, "docs", "src", "distributions.md"), String)

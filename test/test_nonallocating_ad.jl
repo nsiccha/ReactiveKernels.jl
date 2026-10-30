@@ -172,8 +172,6 @@ end
                                               active = :nope)
         @test_throws ArgumentError prepare_ad(kbna, NA_AD_BACKEND, q;
                                               active = :unconstrained, foo = 1)
-        @test_throws ArgumentError compile_ad_gradient(prepna, q)
-        @test_throws ArgumentError compile_ad_value_and_gradient(prepna, q)
     end
 end
 

@@ -45,19 +45,3 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
     setup = Main.ReactiveKernelsDocs.setup_hier_2pl!,
 )
 ```
-
-## Reactant
-
-On the focused gate's finite BridgeStan-valid probes, the exact authored graph
-compiles and executes through the public Reactant boundary with value and
-gradient parity — primal and gradient both `@compile` and match native/the
-reference `.stan` (via BridgeStan, `propto = false`, `jacobian = true`) to
-machine precision. The `tanh`
-correlation reconstruction, the fused bivariate `multi_normal_cholesky` plate,
-and the reused `Normal`/`Exponential`/`Bernoulli` endpoints all lower cleanly.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.Hier2plExample.demo()'
-```

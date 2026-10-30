@@ -1,8 +1,7 @@
 # Inverse-Gaussian / Wald response (SB `brm_inverse_gaussian_lpdf`
 # mirror): surface admission, value parity vs a Distributions.jl oracle
 # (literal / LogNormal-sampled / per-observation / modeled lambda),
-# Enzyme-vs-findiff gradients, Reactant/XLA value+grad (in
-# test_inversegaussian_reactant.jl), O(1) emission,
+# Enzyme-vs-findiff gradients, O(1) emission,
 # W1/W2 SB parity vs the peer lane's BridgeStan numbers (brief
 # 2026-09-26T12-20-17-431-1qwuws0), and I1 modeled-lam SB parity vs the
 # term-nuisance SB pins (brief 2026-09-27T14-14-33-651-1mcop44).

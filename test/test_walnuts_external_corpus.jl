@@ -29,7 +29,7 @@ const WFX = _WalnutsFixtureTest.WalnutsKernelAuthoringFixture
     entry = only(WEC.EXTERNAL_CORPUS)
     @test propertynames(entry) == WEC.ENTRY_FIELDS
     @test entry.id == :walnuts_d
-    @test entry.minimum_acceptance == :native_and_reactant
+    @test entry.minimum_acceptance == :native
     @test entry.oracle == :separate_process_pinned_cpp_replay
     @test entry.id ∉ map(e -> e.id,
         WEC.ReactiveHMCAlgorithmCorpus.CORPUS)

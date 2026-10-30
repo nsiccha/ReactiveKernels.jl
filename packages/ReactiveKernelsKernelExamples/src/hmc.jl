@@ -7,9 +7,9 @@
 # The transition is written as a PURE FUNCTION of (state, injected randomness): the momentum
 # `p0` and the Metropolis uniform `u` are HAVE ports, not drawn inside the kernel. That keeps
 # the mathematical transition deterministic and backend-neutral, so:
-#   * the RNG lives entirely in the driver / a backend adapter (split-key under Reactant);
+#   * the RNG lives entirely in the driver;
 #   * `ReactiveKernels.replica(hmc_transition; batched = (:q, :p0, :u))` (the compiler-owned
-#     vmap, ext/Reactant) batches THIS unchanged kernel over chains — `grad_U`/`pot` stay on
+#     vmap) batches THIS unchanged kernel over chains — `grad_U`/`pot` stay on
 #     the scalar contract (`Vector -> Vector`, `Vector -> scalar`) and are mapped per slice.
 #
 # It has NO data-dependent control flow: the leapfrog loop is a static count and the
@@ -17,9 +17,7 @@
 # auto-batches cleanly (unlike NUTS, whose per-chain divergence would make a ragged batch).
 #
 # The kernel here is executed on the CPU against a correlated-Gaussian target as a
-# correctness check. No throughput, ESS, GPU, or Reactant claim is made in this file; the
-# Reactant single-chain `@jit` compilation and the multi-chain `replica` batching are proven
-# in the optional Reactant integration (ext/ReactiveKernelsReactantExt.jl + its tests).
+# correctness check. No throughput, ESS or GPU claim is made in this file.
 module HMCExample
 
 export HMC_SOURCE
@@ -102,8 +100,7 @@ n_recipes = length(plan(hmc_transition;
 # `replica` maps the whole scalar `hmc_transition` over a trailing chain axis: the batched ports
 # `q`, `p0` become `[params × chains]` and `u` becomes `[chains]`; `grad_U`/`pot` stay scalar and
 # are applied per chain slice. The scalar source is UNCHANGED — there is no hand-written batched
-# sampler. Natively `replica` maps + stacks; under the optional Reactant compiler it lowers the
-# same scalar callable to a batch primitive (proven in the Reactant integration).
+# sampler. `replica` maps + stacks.
 replica_kernel = replica(hmc_transition; batched = (:q, :p0, :u))
 
 n_chains = 8

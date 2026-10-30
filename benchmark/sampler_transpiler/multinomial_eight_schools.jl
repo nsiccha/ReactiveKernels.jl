@@ -47,20 +47,12 @@ function check_multinomial_native(prototype;n=1000)
     end
 end
 
-function write_multinomial_emissions(directory,native,result)
+function write_multinomial_emissions(directory,native)
     mkpath(directory)
     open(joinpath(directory,"native.jl"),"w") do io
         println(io,"# Inspection expression; requires the prepared stores/resources/constants.")
         Base.show_unquoted(io,native.expression)
         println(io)
-    end
-    if result !== nothing && hasproperty(result,:compiled)
-        open(joinpath(directory,"traced.jl"),"w") do io
-            println(io,"# Inspection expression; requires this preparation's numeric state/metadata.")
-            Base.show_unquoted(io,result.program.expression)
-            println(io)
-        end
-        write(joinpath(directory,"kernel.mlir"),result.compiled.module_string)
     end
     println("emissions_directory=",abspath(directory))
 end
@@ -72,15 +64,13 @@ if abspath(PROGRAM_FILE)==@__FILE__
     n>0 && (L>0 || (mode=="diagnostics" && L==0)) ||
         error("positive batch/count required (diagnostics admits zero steps)")
     prototype=build_multinomial_prototype(;L,
-        compiler_options=(peel_loops=mode=="reactant",count_gradients=mode=="diagnostics"))
-    result=if mode=="native"
+        compiler_options=(count_gradients=mode=="diagnostics",))
+    if mode=="native"
         run_prepared_comparison(prototype.prepared,prototype.comparator,L,n)
-    elseif mode=="reactant"
-        run_traced_comparison(prototype;n)
     elseif mode=="diagnostics"
         check_multinomial_native(prototype;n)
     else
-        error("expected native, reactant, or diagnostics")
+        error("expected native or diagnostics")
     end
-    length(ARGS)>3 && write_multinomial_emissions(ARGS[4],prototype.prepared.program,result)
+    length(ARGS)>3 && write_multinomial_emissions(ARGS[4],prototype.prepared.program)
 end

@@ -49,5 +49,5 @@ is separate evidence; it has not been repeated for this runtime API.
 `test/test_native_scheduling.jl` covers owned and borrowed lifetimes, nested
 outputs, output-to-input alias detachment, independent copies, read-only dense
 lane dispatch, task failure recovery, lazy branches and replicated scalar AD.
-`test/test_position_batching_reactant.jl` checks compiled parity and a retained
-position loop whose operation sequence stays fixed between 3 and 23 positions.
+Its Reactant companion test, which checked compiled parity and a retained
+position loop, was removed together with ReactiveKernels' Reactant path.

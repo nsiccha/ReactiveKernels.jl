@@ -12,8 +12,8 @@ export M0_SOURCE, evaluate_m0_source
 # individual's capture history collapses to its row sum s[i] = number of
 # detections, so the per-individual `binomial_lpmf(s[i] | T, p)` likelihood and
 # its data-augmentation `log_sum_exp` marginalization over the latent inclusion
-# indicator vectorize exactly like Mh, and lower through Reactant when the data
-# (s, lchoose, T, M) is bound. The observed/unobserved split (s>0 vs s==0) is a
+# indicator vectorize exactly like Mh when the data (s, lchoose, T, M) is
+# bound. The observed/unobserved split (s>0 vs s==0) is a
 # DATA mask. Real data is M=237/T=3 (C=87 observed, 150 augmented zeros); a
 # representative mixed subset (20 observed + 20 augmented, T=3) is embedded, and
 # the graph rebinds the full data.
@@ -135,8 +135,7 @@ single detection probability) as a declarative `ReactiveKernels.KernelSpec`.
 `omega`/`p` (∈[0,1]) use logistic interval transforms with their Jacobians
 (implicit uniform priors, contributing 0). The likelihood marginalizes the
 latent inclusion indicator with a `log_sum_exp` over the never-detected
-individuals — the observed/unobserved split is a data mask, so it lowers through
-Reactant when the data is bound. Named nodes for the transform Jacobian, the
+individuals — the observed/unobserved split is a data mask. Named nodes for the transform Jacobian, the
 `parameters` NamedTuple, pointwise/summed likelihood, densities, the posterior,
 and the `omega_nd` generated quantity.
 """

@@ -71,8 +71,8 @@ _gp_regr_sq_dist(x::Vector{Float64}) =
     # log-likelihood. Written through the Cholesky factorization exactly as the
     # `mvnormal` object's covariance route — half-log-det from the factor diagonal
     # and the quadratic form yᵀK⁻¹y from the factorization solve — which equals
-    # Stan's multi_normal_cholesky_lpdf(y | 0, L) and lowers through Reactant
-    # (no dense-factor materialization) with the response traced.
+    # Stan's multi_normal_cholesky_lpdf(y | 0, L) without materializing a dense
+    # factor.
     half_logdet::Float64 = sum(log, diag(cov_factor.factors))
     solved::Vector{Float64} = cov_factor \ y
     quadratic::Float64 = dot(y, solved)

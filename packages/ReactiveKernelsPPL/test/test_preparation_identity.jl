@@ -130,9 +130,9 @@ end
 end
 
 @testset "a positive prior's support branch rebuilds to the same query" begin
-    # The tensorized arm of the support branch is a closure Julia lowers
-    # itself (`ReactantCore.@trace`); each build defined a new closure type, so
-    # the query and the readers had new types (snag `compiled-reader-be3cadbb`).
+    # An arm of the support branch is a closure Julia lowers itself; each build
+    # defined a new closure type, so the query and the readers had new types
+    # (snag `compiled-reader-be3cadbb`).
     model = @rkppl begin
         a ~ Normal(0, 5)
         b ~ Normal(0, 2)

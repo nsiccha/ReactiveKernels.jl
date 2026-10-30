@@ -2516,8 +2516,7 @@ _guarded_argument_is_bound(ex, columns) =
 
 # A guarded data-only cell can return a numeric value or its integer neutral
 # arm. Its ordinary preparation-time result needs promoted concrete storage
-# before becoming an RK bound operand. Traced numeric arrays already have a
-# concrete element type; no value-dependent host work is performed on them.
+# before becoming an RK bound operand.
 function _concrete_guarded_numeric_storage(value)
     if value isa AbstractArray{<:Real} && !isconcretetype(eltype(value)) && !isempty(value)
         T = foldl((t, v) -> promote_type(t, typeof(v)), value; init=Union{})

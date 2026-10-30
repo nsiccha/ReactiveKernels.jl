@@ -45,23 +45,3 @@ Main.ReactiveKernelsDocs.execute_ppl_example(
 The native primal and the plain-Enzyme reverse gradient match BridgeStan's
 reference `.stan` (`propto = false`, `jacobian = true`) to machine precision on
 the full 933-dimensional data.
-
-## Reactant
-
-The authored graph compiles and executes its **primal** through Reactant with
-value parity — the ILR simplex, the dual Cholesky-factor matmuls, the reshape,
-and the index gathers all lower through XLA (all data bound, only the
-unconstrained draw traced).
-
-The **compiled Reactant reverse gradient does not lower for this shape**: the two
-per-year Cholesky factors hit the same upstream XLA / EnzymeMLIR adjoint gap for
-`stablehlo.cholesky` as the [latent Poisson GP](gp-pois-regr.md), documented in
-`reactivekernels-use` §7f. The supported AD path is the native primal plus the
-native plain-Enzyme reverse gradient (both machine-precision accurate against
-Stan), together with the Reactant primal.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.HierarchicalGPExample.demo()'
-```

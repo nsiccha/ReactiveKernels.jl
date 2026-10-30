@@ -1,16 +1,11 @@
 # Opt-in source policy, not exception catching. Only macro-captured source
 # participates; ordinary Julia methods stay opaque and keep their behavior.
 
-@inline _ignored_throw_call(f, args::Vararg{Any,N}) where {N} =
-    _ignored_throw_call(_kernel_source_style(args), f, args...)
-@inline _ignored_throw_call(::Val{:native}, f, args::Vararg{Any,N}) where {N} = f(args...)
-@inline _ignored_throw_call(::Val{:tensorized}, f, args::Vararg{Any,N}) where {N} =
-    traced(f, args...)
+@inline _ignored_throw_call(f, args::Vararg{Any,N}) where {N} = f(args...)
 
 # These are explicit captured checks, so the existing opt-in policy strips
 # them as it strips a captured throw. Ordinary preparation retains them.
-@inline _ignored_throw_call(::Val{:native}, ::typeof(_runtime_check), valid, error) = nothing
-@inline _ignored_throw_call(::Val{:tensorized}, ::typeof(_runtime_check), valid, error) = nothing
+@inline _ignored_throw_call(::typeof(_runtime_check), valid, error) = nothing
 
 struct _IgnoredThrowFunction{F}
     f::F
@@ -111,19 +106,12 @@ end
 function _kernel_ignored_traceable_methods(callee, formals, wheres, body, mod, names)
     ignored = _kernel_ignore_throw_source(body, mod, names)
     native = _kernel_native_body(ignored, mod, names)
-    tensorized = _kernel_tensorized_rhs(_traceable_tail_body(ignored, callee),
-                                      names, mod, copy(names))
-    methods = Expr[]
-    for (style, rhs) in ((:native, native), (:tensorized, tensorized))
-        signature = Expr(:call, GlobalRef(@__MODULE__, :_ignored_throw_call),
-            Expr(:(::), Expr(:curly, GlobalRef(Base, :Val), QuoteNode(style))),
-            Expr(:(::), Expr(:call, GlobalRef(Core, :typeof), callee)), formals...)
-        for layer in reverse(wheres)
-            signature = Expr(:where, signature, layer...)
-        end
-        push!(methods, Expr(:(=), signature, rhs))
+    signature = Expr(:call, GlobalRef(@__MODULE__, :_ignored_throw_call),
+        Expr(:(::), Expr(:call, GlobalRef(Core, :typeof), callee)), formals...)
+    for layer in reverse(wheres)
+        signature = Expr(:where, signature, layer...)
     end
-    methods
+    Expr[Expr(:(=), signature, native)]
 end
 
 # Graph assembly pairs each new source operation with its throw-stripped twin.
@@ -132,7 +120,7 @@ Base.@nospecializeinfer function _kernel_with_ignored_throws(
         @nospecialize(op::_KernelSourceOp), @nospecialize(ignored))
     T = typeof(op)::DataType
     _KernelSourceOp(Val(T.parameters[1]), Val(T.parameters[2]), getfield(op, :f),
-                    getfield(op, :tensor_f), ignored, getfield(op, :call_identity))
+                    ignored, getfield(op, :call_identity))
 end
 
 _kernel_ignore_throw_op(op) = _IgnoredThrowFunction(op)
