@@ -1317,6 +1317,112 @@ end
     end
 end
 
+# The outputs of one `@plate for` loop that read different cell statements, as
+# a BRM cell loop computes several observations' arguments (snag
+# `sibling-only-pla-2b3df69e`): a cell of one output computes what its own
+# statements read, at its rows, and nothing only a sibling output reads.
+@kernel _cell_siblings(a::Vector{Float64}, b::Vector{Float64}, ra::Vector{Vector{Int}},
+                       rb::Vector{Vector{Int}}, s::Float64) = begin
+    la = log.(a)
+    lb = log.(b)
+    @plate for i in eachindex(ra, rb)
+        x = sum(exp.(la[ra[i]]))
+        y = sum(exp.(lb[rb[i]]))
+        out_x[i] = x * s
+        out_y[i] = y * s
+        out_xy[i] = x + y
+    end
+    return (out_x, out_y, out_xy)
+end
+
+# The same work as one shared cell returning a tuple, each value a projection
+# `t[k]`: the shape RKPPL emits for a loop whose values share cell work. A cell
+# of one value's reader slices the shared cell to that entry and takes none of
+# the other entries' operands.
+@kernel _cell_shared_tuple(a::Vector{Float64}, b::Vector{Float64},
+                           ra::Vector{Vector{Int}}, rb::Vector{Vector{Int}},
+                           y::Vector{Float64}, z::Vector{Float64}, s::Float64) = begin
+    la = log.(a)
+    lb = log.(b)
+    shared = plate(ra, rb) do r1, r2
+        x = sum(exp.(la[r1]))
+        w = sum(exp.(lb[r2]))
+        first_value = x * s
+        second_value = x + w
+        (first_value, second_value)
+    end
+    m1 = plate(shared) do t
+        t[1]
+    end
+    m2 = plate(shared) do t
+        t[2]
+    end
+    dy = plate(m1, y) do mi, yi
+        -(yi - mi)^2 / 2
+    end
+    dz = plate(m2, z) do mi, zi
+        -(zi - mi)^2 / 2
+    end
+    return (dy, dz)
+end
+
+@testset "plate_cell: a cell of one value computes nothing only its sibling values read" begin
+    data(n) = (; a = collect(range(1.0, 2.0; length = n)),
+        b = collect(range(3.0, 4.0; length = n)),
+        ra = [[1, 2], [n - 1, n], [3]], rb = [[2], [n], [1, 4]])
+    plain = AutoEnzyme(; mode = Enzyme.Reverse)
+    shown(k) = Set(String(st.value) for st in partition_locality(k)
+                   if st.status !== :input && st.status !== :data)
+    rows(d, active) = (active === :a ? d.ra : d.rb)[2]
+    # The outputs of one loop, the index arrays bound as a model binds them.
+    full = prepare(_cell_siblings)
+    for (j, want, own, active) in ((1, :out_x, ["la"], :a), (2, :out_y, ["lb"], :b),
+                                   (3, :out_xy, ["la", "lb"], :a))
+        spec = plate_cell(_cell_siblings, want; index = :c, locality = :error)
+        cell(d) = prepare(spec; have = (:a, :b, :ra, :rb, :s, :c),
+                          want = Symbol(want, :_cell), bound = (; ra = d.ra, rb = d.rb))
+        d = data(10)
+        k = cell(d)
+        @test shown(k) == Set(own)
+        reference = full(d..., 0.5)[j]
+        @test [k(d.a, d.b, 0.5, c) for c in eachindex(reference)] == reference
+        allocated(n) = let d = data(n), k = cell(d)
+            k(d.a, d.b, 0.5, 2); @allocated k(d.a, d.b, 0.5, 2)
+        end
+        @test allocated(20) == allocated(20_000)
+        value, gradient = ad_value_and_gradient(
+            prepare_ad(k, plain, d.a, d.b, 0.5, 2; active), d.a, d.b, 0.5, 2)
+        @test value == reference[2]
+        expected = zeros(10)
+        expected[rows(d, active)] .= want === :out_xy ? 1.0 : 0.5
+        @test gradient ≈ expected
+    end
+    # One shared cell returning a tuple.
+    y, z = [0.1, 0.2, 0.3], [1.0, 2.0, 3.0]
+    have = (:a, :b, :ra, :rb, :y, :z, :s)
+    full = prepare(_cell_shared_tuple; have, want = (:dy, :dz))
+    for (j, want, own) in ((1, :dy, ["la"]), (2, :dz, ["la", "lb"]))
+        k = prepare(plate_cell(_cell_shared_tuple, want; index = :c, locality = :error);
+                    have = (have..., :c), want = Symbol(want, :_cell))
+        @test shown(k) == Set(own)
+        d = data(10)
+        reference = full(d..., y, z, 0.5)[j]
+        @test [k(d..., y, z, 0.5, c) for c in eachindex(reference)] == reference
+        allocated(n) = let d = data(n)
+            k(d..., y, z, 0.5, 2); @allocated k(d..., y, z, 0.5, 2)
+        end
+        @test allocated(20) == allocated(20_000)
+        value, gradient = ad_value_and_gradient(
+            prepare_ad(k, plain, d..., y, z, 0.5, 2; active = :a), d..., y, z, 0.5, 2)
+        @test value == reference[2]
+        x = sum(d.a[d.ra[2]])
+        expected = zeros(10)
+        expected[d.ra[2]] .= j == 1 ? (y[2] - 0.5x) * 0.5 :
+            z[2] - x - sum(d.b[d.rb[2]])
+        @test gradient ≈ expected
+    end
+end
+
 # ReactiveKernelsPPL unpacks a packed parameter vector into blocks as
 # `view(u, lo:hi)` and `reshape(flat, n, k)`. A block read at a cell's rows is
 # computed, as those rows, from the packed positions the rows hold, so a

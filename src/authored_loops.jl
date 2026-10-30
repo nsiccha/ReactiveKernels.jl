@@ -7,8 +7,11 @@
 #   other read is a closure capture (`sigma`, `x[idx[i]]`, `x[i - 1]`). An
 #   array the cell also reads whole stays a capture, read at `i` by a gather.
 # - `out[i] = expr` (optionally `out[i]::T = expr`) names an output of the
-#   loop; each output becomes its own `out = plate(...) do … end` over the same
-#   cell statements. The planner selects only the statements an output needs.
+#   loop; each output becomes its own `out = plate(...) do … end` over the cell
+#   statements it reads (`_kernel_plate_loop_slice`), exactly the call form
+#   written for that output alone: it captures, zips and checks only what those
+#   statements read, so a cell of one output computes nothing that only a
+#   sibling output reads (snag `sibling-only-pla-2b3df69e`).
 # - A zipped array has exactly the loop's indices. When that is not
 #   syntactically guaranteed (`@plate for i in eachindex(y)` reading only `y[i]`),
 #   the loop's domain is passed as a plate argument through
@@ -99,28 +102,16 @@ function _kernel_plate_loop_statements(statement::Expr, mod, line)
 
     taken = Set{Symbol}()
     _kernel_loop_symbols!(taken, loop)
-    fresh(base) = begin
-        name = Symbol(base, :_, index)
-        while name in taken
-            name = Symbol(name, :_)
-        end
-        push!(taken, name)
-        name
-    end
 
-    # Outputs and cell locals. An output is written once, at the loop index.
+    # Outputs. An output is written once, at the loop index.
     outputs = Tuple{Symbol,Any,Symbol}[]          # (name, element type, cell local)
-    locals = Set{Symbol}()
     for st in statements
         target = _kernel_plate_loop_output(st, index)
-        if target === nothing
-            st isa Expr && st.head === :(=) && _kernel_assignment_names!(locals, st.args[1])
-        else
-            name, T, _ = target
-            any(o -> o[1] === name, outputs) && throw(ArgumentError(
-                "`@plate for` writes `$name[$index]` twice"))
-            push!(outputs, (name, T, fresh(name)))
-        end
+        target === nothing && continue
+        name, T, _ = target
+        any(o -> o[1] === name, outputs) && throw(ArgumentError(
+            "`@plate for` writes `$name[$index]` twice"))
+        push!(outputs, (name, T, _kernel_loop_fresh!(taken, name, index)))
     end
     isempty(outputs) && throw(ArgumentError(
         "`@plate for $index in …` must write at least one output, " *
@@ -128,22 +119,100 @@ function _kernel_plate_loop_statements(statement::Expr, mod, line)
 
     mapping = Dict{Symbol,Symbol}(name => local_name for (name, _, local_name) in outputs)
     output_names = Set(first.(outputs))
+    # Each output is its own plate over the statements it reads, minting its
+    # zipped arguments' names as that output's call form alone would.
+    Any[_kernel_plate_loop_plate(
+            _kernel_plate_loop_slice(statements, index, name, mod), index, domain,
+            name, local_name, copy(mapping), output_names, copy(taken), mod, line)
+        for (name, _, local_name) in outputs]
+end
+
+# A cell-local name for `base` at loop index `index` that the loop does not use.
+function _kernel_loop_fresh!(taken, base, index)
+    name = Symbol(base, :_, index)
+    while name in taken
+        name = Symbol(name, :_)
+    end
+    push!(taken, name)
+    name
+end
+
+# The statements of a `@plate for` body that output `name` reads: its own write
+# and, to a fixpoint, every statement that writes a name a kept statement reads
+# (any symbol it holds, so a cell local shadowing an outer value counts). A
+# statement that writes no name, such as a check, is kept for every output.
+function _kernel_plate_loop_slice(statements, index, name, mod)
+    writes = Any[_kernel_loop_statement_writes(st, index, mod) for st in statements]
+    keep = Bool[w === nothing for w in writes]
+    needed = Set{Symbol}((name,))
+    foreach(j -> _kernel_loop_symbols!(needed, statements[j]), findall(keep))
+    changed = true
+    while changed
+        changed = false
+        for j in eachindex(statements)
+            keep[j] && continue
+            isdisjoint(writes[j], needed) && continue
+            keep[j] = true
+            _kernel_loop_symbols!(needed, statements[j])
+            changed = true
+        end
+    end
+    statements[keep]
+end
+
+# The names a statement of a `@plate for` body writes: `out` for an output
+# `out[i] = …`, the targets of an assignment, the arrays a nested `@plate for`
+# or `@scan` writes by index. `nothing` when it writes no name it can name.
+function _kernel_loop_statement_writes(st, index, mod)
+    st isa Expr || return nothing
+    if st.head === :(=) && length(st.args) == 2
+        target = _kernel_plate_loop_output(st, index)
+        target === nothing || return Set{Symbol}((target[1],))
+        names = _kernel_assignment_names!(Set{Symbol}(), st.args[1])
+        return isempty(names) ? nothing : names
+    end
+    if _kernel_is_plate_loop(mod, st) || _kernel_is_scan_loop(mod, st)
+        names = _kernel_loop_indexed_writes!(Set{Symbol}(), st)
+        return isempty(names) ? nothing : names
+    end
+    nothing
+end
+
+function _kernel_loop_indexed_writes!(names, ex)
+    ex isa Expr && ex.head !== :quote || return names
+    if ex.head === :(=) && length(ex.args) == 2
+        lhs = ex.args[1]
+        Meta.isexpr(lhs, :(::), 2) && (lhs = lhs.args[1])
+        Meta.isexpr(lhs, :ref) && lhs.args[1] isa Symbol && push!(names, lhs.args[1])
+    end
+    foreach(arg -> _kernel_loop_indexed_writes!(names, arg), ex.args)
+    names
+end
+
+# The `out = plate(...) do … end` of output `name` over its statements `own`.
+function _kernel_plate_loop_plate(own, index, domain, name, local_name, mapping,
+                                  output_names, taken, mod, line)
+    fresh(base) = _kernel_loop_fresh!(taken, base, index)
+    locals = Set{Symbol}()
+    for st in own
+        _kernel_plate_loop_output(st, index) === nothing && st isa Expr &&
+            st.head === :(=) && _kernel_assignment_names!(locals, st.args[1])
+    end
     # An array the cell also reads whole is captured; its reads at the index
     # are gathers from that capture rather than a second, zipped operand.
     whole = Set{Symbol}()
-    foreach(st -> _kernel_loop_whole_reads!(whole, st, index), statements)
+    foreach(st -> _kernel_loop_whole_reads!(whole, st, index), own)
     union!(locals, whole)
     zipped = Symbol[]
     cell = Any[]
-    for st in statements
+    for st in own
         target = _kernel_plate_loop_output(st, index)
         if target === nothing
             push!(cell, _kernel_loop_rewrite(st, index, mapping, zipped, locals, fresh))
         else
-            name, T, rhs = target
-            local_name = mapping[name]
+            written, T, rhs = target
             rewritten = _kernel_loop_rewrite(rhs, index, mapping, zipped, locals, fresh)
-            lhs = T === nothing ? local_name : Expr(:(::), local_name, T)
+            lhs = T === nothing ? mapping[written] : Expr(:(::), mapping[written], T)
             push!(cell, Expr(:(=), lhs, rewritten))
         end
     end
@@ -171,14 +240,8 @@ function _kernel_plate_loop_statements(statement::Expr, mod, line)
     append!(formals, (mapping[x] for x in zipped))
 
     plate_call = Expr(:call, GlobalRef(@__MODULE__, :plate), operands...)
-    lambda_formals = Expr(:tuple, formals...)
-    result = Any[]
-    for (name, _, local_name) in outputs
-        cell_body = Expr(:block, (line === nothing ? () : (line,))..., cell..., local_name)
-        push!(result, Expr(:(=), name,
-                           Expr(:do, plate_call, Expr(:(->), lambda_formals, cell_body))))
-    end
-    result
+    cell_body = Expr(:block, (line === nothing ? () : (line,))..., cell..., local_name)
+    Expr(:(=), name, Expr(:do, plate_call, Expr(:(->), Expr(:tuple, formals...), cell_body)))
 end
 
 # `out[i] = rhs` or `out[i]::T = rhs` at exactly the loop index.
