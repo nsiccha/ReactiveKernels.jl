@@ -46,6 +46,10 @@ _inline_sources_enabled() = get(ENV, "RK_INLINE_SOURCES", "1") != "0" &&
 _inline_slot_name(slot::Int) = Symbol("#op", slot)
 _inline_local_name(name::Symbol, slot::Int) = Symbol('#', name, "#op", slot)
 
+# A source that is its own value: a number, a string, a character, `nothing`
+# or a quoted symbol.
+_inline_literal(x) = x isa Union{Number,AbstractString,Char,Nothing,QuoteNode}
+
 # Heads whose symbol arguments are syntax, not names.
 const _INLINE_OPAQUE_HEADS = (:quote, :inert, :meta, :inbounds, :boundscheck,
                               :loopinfo, :simdloop, :gc_preserve_begin, :gc_preserve_end)
@@ -61,10 +65,14 @@ function _inline_source_form(r::Recipe, callargs, slot::Int)
     op = r.op
     op isa _KernelSourceOp || return nothing
     kernel_sourceop_form(op) === :fused || return nothing
-    # Only a plain source function inlines. A branch, a reduction or a split
-    # keeps its operation: the plate lowerings read its parts through the
-    # slot (`getfield(__ops__[k], :f)`), and its source is not its code.
+    # A plain source function inlines, and so does a fused source with
+    # data-only split nodes (`_KernelSplit`): a residual plan calls it whole,
+    # partial evaluation reads its parts from the plan's recipe, never from the
+    # slot, so the whole source is its code. A branch or a reduction keeps its
+    # operation: the plate lowerings read its parts through the slot
+    # (`getfield(__ops__[k], :f)`), and its source is not its code.
     f = getfield(op, :f)
+    f isa _KernelSplit && (f = getfield(f, :call))
     f isa _KernelSourceFunction || return nothing
     # The throw-stripped twin (`on_error = :ignore`) carries the authored
     # source, which is not its code: it keeps its call until it inlines its
@@ -72,6 +80,32 @@ function _inline_source_form(r::Recipe, callargs, slot::Int)
     # operation is the one that holds a twin.
     getfield(op, :ignored_throws) === nothing && return nothing
     source = r.source
+    if _inline_literal(source)
+        # A literal statement (`a::Float64 = -1.5`): the literal is its code.
+        # The statement still names the slot, which keeps the authored
+        # closure, so the passes keyed on a statement's recipe read it as
+        # every other inline statement.
+        isempty(callargs) || return nothing
+        closure = _kernel_native_source(f)
+        T = typeof(closure)
+        T isa DataType && closure isa Function && fieldcount(T) == 0 || return nothing
+        shared = _kernel_shared_closure(closure, Expr(:->, Expr(:tuple), source))
+        return Expr(:let, Expr(:block, Expr(:(=), _inline_slot_name(slot), Expr(:ref, _OPS_ARG, slot))),
+                    source), shared
+    end
+    if source isa Symbol
+        # An alias (`y::Float64 = x`): the statement binds its one argument
+        # and reads it back.
+        params = _recipe_source_names(r)
+        length(params) == length(callargs) == 1 && only(params) === source || return nothing
+        closure = _kernel_native_source(f)
+        T = typeof(closure)
+        T isa DataType && closure isa Function && fieldcount(T) == 0 || return nothing
+        shared = _kernel_shared_closure(closure, Expr(:->, Expr(:tuple, source), source))
+        name = _inline_local_name(source, slot)
+        return Expr(:let, Expr(:block, Expr(:(=), _inline_slot_name(slot), Expr(:ref, _OPS_ARG, slot)),
+                               Expr(:(=), name, only(callargs))), name), shared
+    end
     source isa Expr || return nothing
     params = _recipe_source_names(r)
     length(params) == length(callargs) && allunique(params) || return nothing

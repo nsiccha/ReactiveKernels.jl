@@ -80,7 +80,34 @@ function _lwo_looploss(x)
     return sum(u)
 end
 
+@kernel _lower_with_ops_literals(x::Float64) = begin
+    shift::Float64 = -1.5
+    scale::Float64 = 0.75
+    label::Symbol = :shifted
+    y::Float64 = scale * (x + shift)
+    return (y, label)
+end
+
 @testset "lower_with_ops" begin
+    @testset "literal statements run as their literal" begin
+        kernel = prepare(_lower_with_ops_literals)
+        @test kernel(2.0) == (0.75 * (2.0 - 1.5), :shifted)
+        statements = filter(s -> s isa Expr && s.head === :(=), code_expr(kernel).args[2].args)
+        applications = Dict(s.args[1] => ReactiveKernels._inline_statement_call(s.args[2])
+                            for s in statements)
+        # Each literal recipe names its slot and takes no argument; the slot
+        # keeps a zero-field closure, so no generated function carries `-1.5`.
+        for (name, literal) in ((:shift, -1.5), (:scale, 0.75), (:label, QuoteNode(:shifted)))
+            slot, args = applications[name]
+            @test isempty(args)
+            statement = only(filter(s -> s.args[1] === name, statements))
+            @test statement.args[2].args[2] == literal
+            @test fieldcount(typeof(kernel.ops[slot])) == 0
+            @test !(kernel.ops[slot] isa ReactiveKernels._KernelSourceOp)
+        end
+        @test Set(applications[:y][2]) == Set(Any[:scale, :x, :shift])
+    end
+
     @testset "public triple contract" begin
         @test :lower_with_ops in names(ReactiveKernels)
         p = plan(_lower_with_ops_stage; have = _LOWER_WITH_OPS_HAVE, want = :u)
