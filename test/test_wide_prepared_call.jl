@@ -123,3 +123,36 @@ end
         @test bound(0.7) ≈ expected
     end
 end
+
+# A plate-free program's prepared callable is the generated function itself,
+# entered with the operation table and one operand per HAVE port. Through the
+# RuntimeGeneratedFunction vararg wrapper that splat stayed a call dispatched
+# at run time past 32 operands, so `type_stability = :error` refused every such
+# program over 32 or more ports, and a bound one over as many columns (snag
+# prepared-entry-s-e3544953: BRM simulators over 37 and 39 data columns).
+function _wide_scalar_spec(name, n)
+    ports = [Symbol(:x, i) for i in 1:n]
+    signature = Any[:($(ports[i])::$(_wide_column_type(i))) for i in 1:n]
+    body = Any[:(m1 = theta * sum(x1))]
+    for i in 2:n
+        push!(body, :($(Symbol(:m, i)) = $(Symbol(:m, i - 1)) + length($(ports[i]))))
+    end
+    push!(body, :(total = $(Symbol(:m, n))), :(return total))
+    Core.eval(@__MODULE__, :(@kernel $name(theta::Float64, $(signature...)) =
+        $(Expr(:block, body...))))
+end
+
+@testset "a plate-free kernel with $n inputs prepares type stable" for n in (31, 40)
+    spec = _wide_scalar_spec(Symbol(:wide_scalar_, n), n)
+    columns = [_wide_column(_wide_column_type(i), 3 + mod(i, 4)) for i in 1:n]
+    expected = 0.7 * sum(columns[1]) + sum(length, columns[2:end])
+    kernel = prepare(spec; type_stability = :error)
+    @test kernel.f isa ReactiveKernels.RuntimeGeneratedFunctions.RuntimeGeneratedFunction
+    arguments = (0.7, columns...)
+    @test kernel(arguments...) ≈ expected
+    @test isempty(ReactiveKernels._code_findings(kernel, Tuple(map(typeof, arguments))))
+    names = Tuple(Symbol(:x, i) for i in 1:n)
+    bound = prepare(spec; bound = NamedTuple{names}(Tuple(columns)),
+                    type_stability = :error)
+    @test bound(0.7) ≈ expected
+end

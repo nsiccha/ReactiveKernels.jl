@@ -6790,11 +6790,17 @@ end
 
 # Emit positional arguments explicitly: on Julia 1.12, splatting the captured
 # `args` tuple into some RGF call shapes allocates even though the emitted
-# function itself is allocation-free. Keep the public call nongenerated so
+# function itself is allocation-free. The body is entered without the RGF
+# vararg wrapper (`_native_body_call_expr`), whose own splat stays a call
+# dispatched at run time past 32 operands, the operation table included: a
+# program over 32 or more HAVE ports that owns no array region
+# (`_owns_array_regions`) was refused by `type_stability = :error` (snag
+# `prepared-entry-s-e3544953`). Keep the public call nongenerated so
 # reflection over it continues to accept abstract argument types.
-@inline @generated function _prepared_call(k::PreparedKernel, args::A, ::Val{N}) where {A<:Tuple,N}
-    positional = [:(getfield(args, $index)) for index in 1:N]
-    :(Base.@inline k.f(k.ops, $(positional...)))
+@inline @generated function _prepared_call(
+        k::PreparedKernel{F}, args::A, ::Val{N}) where {F,A<:Tuple,N}
+    positional = Any[:(getfield(args, $index)) for index in 1:N]
+    _native_body_call_expr(F, :(k.f), Any[:(k.ops), positional...])
 end
 
 @inline function (k::PreparedKernel{F,O,IN,OUT,RR,S})(
