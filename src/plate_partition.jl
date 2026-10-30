@@ -661,8 +661,19 @@ end
 function _partition_rule(partitioned)
     entries = partitioned isa Pair ? (partitioned,) :
         partitioned isa Union{Tuple,AbstractVector} && all(x -> x isa Pair, partitioned) ?
-            partitioned : pairs(partitioned)
-    Tuple(Pair{Symbol,AbstractVector}[Symbol(k) => v for (k, v) in entries])
+            partitioned : partitioned isa Union{NamedTuple,AbstractDict} ? pairs(partitioned) :
+            throw(ArgumentError("plate_partition: `partitioned` must be pairs `port => labels`, " *
+                "each a port with the label of each of its positions; got $(repr(partitioned))"))
+    rule = Pair{Symbol,AbstractVector}[]
+    for (k, v) in entries
+        k isa Union{Symbol,AbstractString} || throw(ArgumentError(
+            "plate_partition: `partitioned` names ports by symbol; got $(repr(k))"))
+        v isa AbstractVector || throw(ArgumentError(
+            "plate_partition: `partitioned` gives :$k a $(typeof(v)); give the label of each " *
+            "of its positions (`missing` for a shared position)"))
+        push!(rule, Symbol(k) => v)
+    end
+    Tuple(rule)
 end
 
 """

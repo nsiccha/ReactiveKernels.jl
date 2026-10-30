@@ -889,13 +889,19 @@ end
 end
 
 # One partition of the observations: all cells whose key equals a label, as
-# one compiled pass (RK `plate_partition`, decision `08uci2h` option 1).
+# one compiled pass (RK `plate_partition`, decision `08uci2h` option 1). The
+# group effect is gathered by name: written inline in the predictor
+# (`a .+ 0.5 .* x .+ z[group]`) it is a factor term, which the affine lowering
+# turns into a one-hot design block times every level's coefficient, so every
+# partition reads every group's effect (todo
+# `ReactiveKernels:refactor.plate-partition/todos/2026-10-30T15-18-11-394-0mtcwfj`).
 const _CQ_ROWS = quote
     sigma ~ Exponential(1)
     a ~ Normal(0, 1)
     sd ~ Exponential(1)
     z[levels(group)] .~ Normal.(0, sd)
-    mu = a .+ 0.5 .* x .+ z[group]
+    eta = z[group]
+    mu = a .+ 0.5 .* x .+ eta
     y .~ Normal.(mu, sigma)
 end
 function _cq_rows_data(per_subject)
@@ -909,7 +915,8 @@ const _CQ_SUBJECT = quote
     sigma ~ Exponential(1)
     a ~ Normal(0, 1)
     z[levels(subject)] .~ Normal.(0, 1)
-    mu = a .+ z[subject]
+    eta = z[subject]
+    mu = a .+ eta
     y .~ Normal.(mu, sigma)
 end
 
@@ -945,7 +952,7 @@ end
     # The gradient of one subject's density is the full likelihood gradient
     # on the coordinates it reads and zero elsewhere.
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
-    s = prepare_partition_sampler(built, bound, :y, u; by = :subject, backend)
+    s = prepare_partition_sampler(built, bound, :y, u; by = :subject, backend, compact = false)
     @test s isa PartitionSampler
     full = prepare_ad(prepare_query(built, bound, :likelihood), backend, u;
         active = :unconstrained)
