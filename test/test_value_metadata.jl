@@ -144,4 +144,66 @@ end
     @test_throws BoundsError f([0.1], 0.2, 0.3, [0.4], [2])
     @test_throws DimensionMismatch f([0.1], 0.2, 0.3, [0.4, 0.5], [1, 1, 1])
 end
+
+@kernel metadata_plate(x, rows) = begin
+    values = plate(rows) do i
+        v::Float64 = opaque_value(x[i])
+        v
+    end
+    return values
+end
+
+@kernel metadata_design(x, rows, one, beta) = begin
+    values = metadata_plate(x, rows)
+    X = hcat(one, log.(values))
+    result = X * beta
+    return result
+end
+
+struct ConvertedVector <: AbstractVector{Float64}
+    data::Vector{Float64}
+end
+Base.size(x::ConvertedVector) = size(x.data)
+Base.getindex(x::ConvertedVector, i::Int) = x.data[i]
+Base.convert(::Type{ConvertedVector}, x::Vector{Float64}) =
+    (helper_calls[] += 1; ConvertedVector(x[1:1]))
+
+@kernel metadata_conversion(x::Vector{Float64}) = begin
+    result::ConvertedVector = x
+    return result
+end
+
+@kernel metadata_opaque(x) = begin
+    result = opaque_shape_change(x)
+    return result
+end
+
+@testset "visible kernel graphs retain plate axes without running cells" begin
+    calls = helper_calls[]
+    for n in (0, 1, 7, OS.SymbolicAxis(:rows), nothing)
+        axes = (n isa Int ? Base.OneTo(n) : n,)
+        args = OS.ValueInfo[OS.vector_info(Float64, n), OS.vector_info(Int, n)]
+        result = ReactiveKernels._call_metadata(:(metadata_plate(x, rows)), args,
+            @__MODULE__, ())
+        @test result.status === :unknown
+        @test OS.value_axes(result.value) == axes
+        @test OS.element_type(result.value) === Float64
+        design = ReactiveKernels._call_metadata(:(metadata_design(x, rows, one, beta)),
+            OS.ValueInfo[args; OS.vector_info(Float64, n); OS.vector_info(Float64, 2)],
+            @__MODULE__, ())
+        @test OS.value_axes(design.value) == axes
+        # These are graph facts, not permission to substitute an elementwise
+        # numerical rule for the kernel (whose cell can contain an opaque call).
+        @test OS.value_rank(ReactiveKernels._call_value_info(:(metadata_plate(x, rows)),
+            args, @__MODULE__, ())) === nothing
+    end
+    for kernel in (metadata_conversion, metadata_opaque)
+        result = ReactiveKernels._metadata_call(kernel,
+            OS.ValueInfo[OS.vector_info(Float64, 7)];
+            kwargs = Pair{Symbol,OS.ValueInfo}[])
+        @test result.status === :unknown
+        @test OS.value_axes(result.value) === nothing
+    end
+    @test helper_calls[] == calls
+end
 end

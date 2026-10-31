@@ -164,7 +164,7 @@ caller. `base` and `indices` are read only. Empty reductions have no summand
 calls and contribute a zero sum to the outer. `cell0` and `term0` select the
 preparation exemplar; use a nonempty cell for a backend that evaluates its
 summand exemplar. The outer's exemplar sums are evaluated from `base0` once
-at preparation.
+at preparation and always form a vector, including a single reduction.
 """
 function prepare_cell_factor_ad(prepare_operator, f::CellFactors, factor,
         base0::AbstractVector{Float64}, indices0::AbstractVector{Int}, backend, exemplars...;
@@ -188,7 +188,11 @@ function prepare_cell_factor_ad(prepare_operator, f::CellFactors, factor,
             have = (_query_have(f.plan)..., _CELL_PORT),
             want = Tuple(r.value for r in f.reductions),
             bound = _query_bound(f.plan), on_error = f.on_error)
-        collect(Float64, Base.invokelatest(sumkernel, base0, cell0))
+        values = Base.invokelatest(sumkernel, base0, cell0)
+        # A prepared kernel unwraps one WANT to a scalar. Collecting that
+        # scalar would produce a zero-dimensional array, not the promised
+        # one-element active sum vector.
+        length(f.reductions) == 1 ? Float64[values] : collect(Float64, values)
     else
         Float64[]
     end

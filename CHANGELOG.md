@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.35
+## 0.1.36
 
 - A plan holds every value computed from the bound data and the label alone:
   the index bookkeeping and label-constant data (a data column's rows, a
@@ -41,6 +41,17 @@ are recorded in the git history only.
   final loop state (`nothing` or a `CartesianIndex`). Reusing a
   plan with another label throws `ArgumentError` instead of silently returning
   the original label's value.
+
+
+## 0.1.35
+
+- Propagate shape facts through a visible `KernelSpec`'s recipes, including
+  authored plates, without executing its cells or opaque Julia helpers.
+  RKPPL can preserve the row axis of a grouped plate output through a
+  broadcast column, concatenated design, matrix product and offset, so a
+  strict observation cell computes only its owning group. Numerical
+  transfer rules remain in OutputSignatures; partial graph facts do not
+  authorize numerical substitutions.
 
 ## 0.1.34
 
