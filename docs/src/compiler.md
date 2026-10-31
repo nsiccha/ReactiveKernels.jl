@@ -1146,6 +1146,32 @@ those ports, throwing `PartitionSeparabilityError` otherwise.
 ReactiveKernelsPPL builds its partition queries and compact gradients on
 these (`prepare_partition`, `prepare_partition_sampler`).
 
+`plate_partition(…; plan = port)` declares one more HAVE port holding the
+partition's *plan*: the integer bookkeeping of a label (its positions, every
+pushed value's rows, the positions of gathers and captures in their windows,
+the shapes it checks), as a named tuple `partition_plan(kernel, args...)`
+computes once per label from the bound data (`nothing` for the plan port
+among `args`); the body then reads it from the port instead of recomputing it
+on every call, and a derivative carries none of it. The plan holds index
+bookkeeping only: a bound value enters it only as a partition table, an
+index column, a mask or a count, never a data column, an alias of a data
+value, or a type the body computes (those stay constants inference folds). A
+statement whose value is a shape of a data value is computed in the plan from
+the exemplar and
+checked against the value's shape on every call: arguments of another shape
+throw `ArgumentError` naming `partition_plan`. The plan's type is the port's
+declared type (`plan = port => T`), found by preparing the plan kernel first
+(`partition_plan_kernel(spec; have, want, bound)`, the same arguments as
+`prepare`, returns the kernel that computes a label's plan; `T` is the type of
+its result), or, for an untyped port, by evaluating the plan on `prepare`'s
+`exemplars` (one value per HAVE port, `nothing` for the plan port); a plan
+port that cannot be typed is refused naming the remedy, never silently
+dropped. `partition_plan_kernel(kernel)` returns the plan kernel of a prepared
+partition; `partition_plan` keeps one per kernel for the process. Native
+Enzyme Reverse differentiates a planned partition with runtime activity on
+registered Enzyme (the plan's constant row vectors meet the active vector in
+the body's views, which static activity analysis refuses).
+
 A partition's windows hold their rows sorted and unique, the union of what
 their readers ask for, and a read finds its row by bisection: a partition of
 r cells reading a value row by row costs O(r log r), never O(r²), and a value

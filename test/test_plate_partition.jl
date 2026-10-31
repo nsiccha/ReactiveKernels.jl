@@ -496,3 +496,74 @@ end
     @test silent(uR, c, 3) ≈ sum(-(dd.w[dd.subject .== 3] .- R[dd.g[dd.subject .== 3]]) .^ 2 ./ 2) +
         sum(-R[group_subject .== 3] .^ 2 ./ 2)
 end
+
+@testset "plate_partition: a plan per label" begin
+    # With a plan port the body reads its integer bookkeeping (rows, unions,
+    # positions, checks) from the port, computed once per label by
+    # `partition_plan`; values, footprints and gradients are those of the
+    # partition without a plan.
+    d = _pp_subject_data((4, 3, 5, 2, 6))
+    plain = prepare(plate_partition(_pp_subjects, :dens; by = :subject, index = :label);
+                    have = (_PP_HAVE..., :label), want = :partition_total,
+                    bound = (; d.g, d.w, d.subject))
+    spec = plate_partition(_pp_subjects, :dens; by = :subject, index = :label, plan = :plan)
+    # An untyped plan port is typed by evaluating the plan on the exemplars.
+    planned = prepare(spec; have = (_PP_HAVE..., :label, :plan), want = :partition_total,
+                      bound = (; d.g, d.w, d.subject), exemplars = (d.u, 1, nothing))
+    plans = Dict(s => partition_plan(planned, d.u, s, nothing) for s in 1:5)
+    @test all(p -> all(x -> x isa Union{Integer,AbstractArray{<:Integer},Tuple,Nothing}, p),
+              values(plans))
+    @test all(p -> p isa NamedTuple && !isempty(p), values(plans))
+    for s in 1:5
+        @test planned(d.u, s, plans[s]) ≈ plain(d.u, s)
+        @test partition_footprint(planned, d.u, s, nothing).u == partition_footprint(plain, d.u, s).u
+    end
+    @test_throws ArgumentError partition_plan(planned, d.u, 6, nothing)
+    # The planned body computes no rows of its own.
+    @test !occursin("_cell_canonical_rows", string(planned.ast))
+    @test !occursin("_cell_take_positions", string(planned.ast))
+    @test occursin("_cell_canonical_rows", string(partition_plan_kernel(planned).ast))
+    # A plan per label costs no bytes that grow with the other subjects, and
+    # fewer than the body without one.
+    planned(d.u, 1, plans[1])
+    @test (@allocated planned(d.u, 1, plans[1])) < (@allocated plain(d.u, 1))
+    # The plan's row vectors meet the active vector in the body's views; on
+    # registered Enzyme 0.13.216 (and dogfood `3e707d7`) that needs runtime
+    # activity, as the window reads above do (Enzyme snag
+    # `Enzyme/snags?sig=plan-const-int-r-4671f4a7` names the store).
+    ad = prepare_ad(planned, AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)),
+                    d.u, 3, plans[3]; active = :u)
+    gradient = similar(d.u)
+    value, _ = ad_value_and_gradient!(ad, gradient, d.u, 3, plans[3])
+    @test value ≈ plain(d.u, 3)
+    @test findall(!iszero, gradient) == partition_footprint(plain, d.u, 3).u
+    reference = similar(d.u)
+    ad_value_and_gradient!(prepare_ad(plain, AutoEnzyme(; mode = Enzyme.Reverse), d.u, 3; active = :u),
+                           reference, d.u, 3)
+    @test gradient ≈ reference
+    @test_throws ArgumentError plate_partition(_pp_subjects, :dens; by = :subject, index = :label,
+                                               plan = :label)
+    # Bound values a plan may hold: index bookkeeping, nested (a ragged row
+    # structure), never data.
+    @test ReactiveKernels._plan_bookkeeping([[1, 2], [3]])
+    @test ReactiveKernels._plan_bookkeeping(Dict(1 => 2:3))
+    @test ReactiveKernels._plan_bookkeeping((1, [2, 3]))
+    @test !ReactiveKernels._plan_bookkeeping([1.0, 2.0])
+    @test !ReactiveKernels._plan_bookkeeping([[1.0]])
+    # Without exemplars the plan reads `u` through the empty stand-ins and
+    # cannot be typed: the requested plan port is refused, never dropped.
+    @test_throws ArgumentError prepare(spec; have = (_PP_HAVE..., :label, :plan),
+                                       want = :partition_total, bound = (; d.g, d.w, d.subject))
+    # The plan kernel of the spec types the port: the same plans, the same values.
+    planner = partition_plan_kernel(spec; have = (_PP_HAVE..., :label, :plan),
+                                    want = :partition_total, bound = (; d.g, d.w, d.subject))
+    typed_plans = Dict(s => planner(d.u, s, nothing) for s in 1:5)
+    T = typeof(typed_plans[1])
+    @test all(p -> typeof(p) === T, values(typed_plans))
+    typed = prepare(plate_partition(_pp_subjects, :dens; by = :subject, index = :label,
+                                    plan = :plan => T);
+                    have = (_PP_HAVE..., :label, :plan), want = :partition_total,
+                    bound = (; d.g, d.w, d.subject))
+    @test all(s -> typed(d.u, s, typed_plans[s]) ≈ plain(d.u, s), 1:5)
+    @test !occursin("_cell_canonical_rows", string(typed.ast))
+end

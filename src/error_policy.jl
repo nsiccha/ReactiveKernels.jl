@@ -131,7 +131,7 @@ function _kernel_ignore_throw_op(op::_AuthoredPlateOp{K,A}) where {K,A}
 end
 _kernel_ignore_throw_op(op::_AuthoredPlateCellOp) =
     _AuthoredPlateCellOp(_kernel_ignore_throw_op(op.plate), op.locality, op.rows,
-                         op.partitioned)
+                         op.partitioned, op.plan)
 function _kernel_ignore_throw_op(op::_AuthoredScanOp{K,A,I,H}) where {K,A,I,H}
     kernel = prepare(op.kernel.plan; on_error = :ignore)
     _AuthoredScanOp{typeof(kernel),A,I,H}(kernel)

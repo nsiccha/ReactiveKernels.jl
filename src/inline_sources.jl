@@ -45,18 +45,24 @@ _inline_sources_enabled() = get(ENV, "RK_INLINE_SOURCES", "1") != "0" &&
 # does gensyms; an embedding shifts the position with the recipes
 # (`_embedded_statements`).
 _inline_local_name(name::Symbol, slot::Int) = Symbol('#', name, "#op", slot)
-# The position an inline statement's local was named from, or `nothing`.
-function _inline_local_index(name::Symbol)
+# An inline statement's local split into the name it was named from (with its
+# leading `#`) and its position, or `nothing`. The name may end in a multibyte
+# character (`#p_α#op1`), so the stem ends at `prevind` of the `#op`, never at
+# the byte before it (snag `inline-shifted-l-b520877e`).
+function _inline_local_parts(name::Symbol)
     text = String(name)
     startswith(text, '#') || return nothing
     i = findlast("#op", text)
     i === nothing && return nothing
     digits = SubString(text, last(i) + 1)
-    isempty(digits) || !all(isdigit, digits) ? nothing : parse(Int, digits)
+    isempty(digits) || !all(isdigit, digits) ? nothing :
+        (SubString(text, 1, prevind(text, first(i))), parse(Int, digits))
 end
-_inline_shifted_local(name::Symbol, offset::Int) = (index = _inline_local_index(name);
-    index === nothing ? name : Symbol(SubString(String(name), 1, findlast("#op", String(name))[1] - 1),
-                                      "#op", index + offset))
+# The position an inline statement's local was named from, or `nothing`.
+_inline_local_index(name::Symbol) = (parts = _inline_local_parts(name);
+    parts === nothing ? nothing : last(parts))
+_inline_shifted_local(name::Symbol, offset::Int) = (parts = _inline_local_parts(name);
+    parts === nothing ? name : Symbol(first(parts), "#op", last(parts) + offset))
 
 # A source that is its own value: a number, a string, a character, `nothing`
 # or a quoted symbol.
