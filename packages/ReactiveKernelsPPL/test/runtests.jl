@@ -103,6 +103,7 @@ const _PPL_TEST_FILES = (
     "test_dirichlet_multinomial_adapter.jl",
     "test_external_argument_sharing.jl",
     "test_graph_density.jl",
+    "test_graph_geometry.jl",
     "test_whole_event_mixture.jl",
     "test_whole_event_occupancy.jl",
     "test_hidden_markov.jl",

@@ -16,6 +16,19 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.27
+
+- `ParameterGeometry` accepts function-shaped `@kernel` endpoints in its
+  existing `constrain`, `unconstrain` and `logjac` slots. Host transforms retain
+  prepared callables; emitted transforms compose the authored graph at a full
+  argument boundary, including explicitly supplied keywords. This exposes
+  identity and row-local vector transforms to strict partitions while preserving
+  actual coupled dependencies and the caller's joint prior. Scalar cells
+  and joint cell latents use the same endpoints. Printed `kernel_expr` source
+  reconstructs the geometry through `sampling_geometry`. Ordinary callbacks,
+  omitted defaults and splatted arguments retain their numerical call path.
+  Requires ReactiveKernels 0.1.33.
+
 ## 0.1.26
 
 - `prepare_cell_factor_query(f, :outer)` and

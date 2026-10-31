@@ -541,15 +541,32 @@ function _expand_cell_joint_latents(st, taken, data::Set{Symbol}, mod::Module,
         push!(prelude, Expr(:(=), count, Expr(:call, ref(:_ppl_cell_latent_size), offsets)))
         push!(prelude, Expr(:call, :.~, Expr(:ref, site, Expr(:call, :(:), 1, count)),
             :(Flat.())))
-        endpoint(f) = _external_endpoint_call(ref(f),
-            Any[geometry, site, offsets, shapes, pos, positional...], keywords)
+        geometry_expr = Expr(:call, ref(:sampling_geometry), call.args[1],
+            Expr(:tuple, (_sampling_ast_literal(a) for a in call.args[2:end])...), Expr(:tuple))
+        function endpoint(f, edge)
+            graph = _sampling_graph_call(g, edge, geometry_expr,
+                Any[:($(ref(:_ppl_cell_joint_block))($site, $offsets, $pos)),
+                    :($shapes[$pos]), positional...], keywords)
+            graph === nothing && return _external_endpoint_call(ref(f),
+                Any[geometry, site, offsets, shapes, pos, positional...], keywords)
+            return graph
+        end
         push!(cells, Expr(:(=), pos, Expr(:call, ref(:_ppl_cell_scan_position), domain, ivar)))
         push!(locals, pos => Expr(:call, ref(:_ppl_cell_scan_position), domain, ivar))
-        push!(cells, Expr(:(=), c.args[2], endpoint(:_ppl_cell_joint_constrain)))
+        # The composed transform has the same shape check as the numerical
+        # endpoint. Keep the checked value in the dependency chain.
+        if g.constrain isa _SamplingGraphEndpoint
+            value = fresh(Symbol(prefix, :_value))
+            push!(cells, :($value = $(endpoint(:_ppl_cell_joint_constrain, :constrain))))
+            push!(cells, Expr(:(=), c.args[2],
+                :($(ref(:_ppl_cell_joint_checked))($value, $shapes[$pos], $pos))))
+        else
+            push!(cells, Expr(:(=), c.args[2], endpoint(:_ppl_cell_joint_constrain, :constrain)))
+        end
         push!(cells, Expr(:(=), Expr(:ref, Symbol(prior, :_cells), ivar),
             Expr(:call, ref(:sampling_logdensity), deepcopy(call), c.args[2])))
         push!(cells, Expr(:(=), Expr(:ref, Symbol(logjac, :_cells), ivar),
-            endpoint(:_ppl_cell_joint_logjac)))
+            endpoint(:_ppl_cell_joint_logjac, :logjac)))
         push!(priors, prior)
         push!(post, :($prior = sum($(Symbol(prior, :_cells)))))
         push!(post, :($logjac = sum($(Symbol(logjac, :_cells)))))
@@ -711,6 +728,11 @@ function _ppl_cell_joint_check(value, shape::Tuple, pos::Int)
         throw(ArgumentError("a cell latent's geometry constrained index $pos to " *
             "$(summary(value)); its shape there is $shape"))
     return nothing
+end
+
+function _ppl_cell_joint_checked(value, shape::Tuple, pos::Int)
+    _ppl_cell_joint_check(value, shape, pos)
+    return value
 end
 
 # A cell's block of the packed array: a number, a vector, or an array of
