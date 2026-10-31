@@ -100,6 +100,7 @@ const _PPL_TEST_FILES = (
     "test_scoped_submodels.jl",
     "test_qualified_submodels.jl",
     "test_external_sampling.jl",
+    "test_external_geometry_derivatives.jl",
     "test_dirichlet_multinomial_adapter.jl",
     "test_external_argument_sharing.jl",
     "test_graph_density.jl",

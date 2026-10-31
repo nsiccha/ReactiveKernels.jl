@@ -228,6 +228,18 @@ conforms.
 Standalone reproducers under `benchmark/` (the backend and its AD engine
 only, no ReactiveKernels code) isolate the remaining backend limitations:
 
+- On Julia 1.10.12, Enzyme dogfood from `f53965b` until `0e251cfb`
+  fails Reverse-over-Forward Hessian-vector products through a geometry
+  closure with unused trailing varargs, such as `(u, shape, lo, rest...)`.
+  Julia calls this closure through its boxed-argument ABI; Enzyme's dynamic-call
+  rule selected the inner derivative at run time, leaving the outer reverse
+  pass a non-constant function pointer. Primal inference and first-order
+  gradients pass. `repro_enzyme_geometry_hvp.jl` isolates the failure with
+  Enzyme only. Dogfood `0e251cfb` repairs the selection with the same
+  libEnzyme build `782c9d95`; registered Enzyme 0.13.216 also passes.
+  `test_external_geometry_derivatives.jl` checks the unchanged public RKPPL
+  query with empty and nonempty data-sized geometry. No RK lowering change
+  or runtime activity setting is needed.
 - Native Enzyme reverse mode aborts the process (an LLVM assertion in its
   shadow-allocation caching, reached while it differentiates SpecialFunctions'
   `logabsgamma` port) when lazily evaluated branches around
