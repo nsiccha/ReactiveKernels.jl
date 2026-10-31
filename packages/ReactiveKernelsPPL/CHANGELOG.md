@@ -16,6 +16,25 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.30
+
+- A partition's plan holds the bound data at the label's rows too (design
+  blocks included), and the compact sampler reads a packed block's rows from
+  its active vector at slots computed once per label from that label's slot
+  map, not through the overlay's per-element slot load and branch; a
+  partition reading a packed coordinate outside its footprint is refused by
+  name at preparation. Requires ReactiveKernels 0.1.36.
+- Grouped compact partitions on Julia 1.10 use ordinary Enzyme Reverse with
+  dogfood `a6458e9c` (constant-field repairs after `1280e6ee`). On the BRM
+  `4e53855` nested panel (42,768 rows, 12 regions), compact evaluation and
+  gradient take 2.55 ms versus 3.47 ms dense and 8.84 ms for BRM's unit path;
+  the whole sweep's per-unit share is 1.15 ms (compact 2.22×). These are
+  interleaved minima over 15 rounds on gordito, Julia 1.10.12, one Julia
+  thread, libEnzyme `782c9d95`; values and gradients pass independent checks.
+  The 1.5× target remains unmet. The earlier 2.04× measurement used runtime
+  activity and is not comparable ordinary-Reverse acceptance evidence.
+
+
 ## 0.1.29
 
 - Require ReactiveKernels 0.1.35 for graph-visible shape propagation.

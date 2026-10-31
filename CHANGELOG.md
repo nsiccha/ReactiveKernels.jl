@@ -16,6 +16,33 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.36
+
+- A plan holds every value computed from the bound data and the label alone:
+  the index bookkeeping and label-constant data (a data column's rows, a
+  design block's rows and their `hcat`), computed once per label by pure
+  operations (sources, plain functions, partition ops; plates, scans and
+  cells stay in the body); never a value computed from an unbound port, its
+  alias, a type the body computes, or a value the body writes into.
+- `plate_partition(…; plan_constant = (:port, …))` names HAVE ports whose
+  values are constant per label, which the plan may read; a lazy view of
+  inputs serves its rows from its parts through its own
+  `_cell_lazy_rows(op, inputs, rows, bind, constant)` method:
+  ReactiveKernelsPPL's compact overlay reads its active vector at slots
+  planned per label instead of a slot load and a branch per element.
+- Planned partitions use ordinary Enzyme Reverse. Enzyme dogfood from
+  `1280e6ee` repairs constant plan fields; grouped compact partitions on
+  Julia 1.10 also need `a6458e9c` (snag `static-reverse-g-173719b3`).
+  Registered 0.13.216 has the upstream activity-analysis defects; runtime
+  activity is not an accepted remedy.
+- Plan splitting preserves indexed/property writes, writes through aliases,
+  mutating calls and repeated assignments in the evaluation body. Empty and
+  nonempty plate portions share one plan type rather than exporting the
+  final loop state (`nothing` or a `CartesianIndex`). Reusing a
+  plan with another label throws `ArgumentError` instead of silently returning
+  the original label's value.
+
+
 ## 0.1.35
 
 - Propagate shape facts through a visible `KernelSpec`'s recipes, including

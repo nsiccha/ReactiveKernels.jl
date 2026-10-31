@@ -1068,11 +1068,10 @@ views, and Enzyme rejects Base `hcat` of views beside dense arrays (Enzyme snag
 Enzyme fix (`test_plate_cell.jl` pins it broken).
 
 A plate body that reads a captured value through its window (a struct of
-active data beside constant rows, `M[q, :]` of a shared matrix) differentiates
-under registered Enzyme with `Enzyme.set_runtime_activity(Enzyme.Reverse)`:
-static activity refuses the constant rows a call returns stored beside active
-data (Enzyme snag `native-reverse-r-285478e2`), which the Enzyme dogfood
-branch repairs.
+active data beside constant rows, `M[q, :]` of a shared matrix) requires the
+upstream repair on Enzyme's dogfood branch for ordinary Reverse. Registered
+Enzyme's static activity analysis rejects the constant rows returned beside
+active data (Enzyme snag `native-reverse-r-285478e2`).
 
 Two more producers run at a cell's rows: `view(A, lo:hi)` or `A[lo:hi]` and
 `reshape(v, n, k...)`, with the bounds and dimensions integer literals or
@@ -1198,14 +1197,19 @@ pushed value's rows, the positions of gathers and captures in their windows,
 the shapes it checks), as a named tuple `partition_plan(kernel, args...)`
 computes once per label from the bound data (`nothing` for the plan port
 among `args`); the body then reads it from the port instead of recomputing it
-on every call, and a derivative carries none of it. The plan holds index
-bookkeeping only: a bound value enters it only as a partition table, an
-index column, a mask or a count, never a data column, an alias of a data
-value, or a type the body computes (those stay constants inference folds). A
-statement whose value is a shape of a data value is computed in the plan from
-the exemplar and
+on every call, and a derivative carries none of it. The plan holds every
+value computed from the bound data and the label alone: the index bookkeeping
+and label-constant data (a data column's rows, a design block's rows and
+their `hcat`), computed once per label by pure operations (sources, plain
+functions, partition ops; plates, scans and cells stay in the body); never a
+value computed from an unbound port, an alias of one, a type the body
+computes (those stay constants inference folds), or a value the body writes
+into. A statement whose value is a shape of a data value is computed in the
+plan from the exemplar and
 checked against the value's shape on every call: arguments of another shape
-throw `ArgumentError` naming `partition_plan`. The plan's type is the port's
+throw `ArgumentError` naming `partition_plan`. Cached rows are checked against
+the call's label, throwing `ArgumentError` on a mismatch; compute a separate
+plan for each label. The plan's type is the port's
 declared type (`plan = port => T`), found by preparing the plan kernel first
 (`partition_plan_kernel(spec; have, want, bound)`, the same arguments as
 `prepare`, returns the kernel that computes a label's plan; `T` is the type of
@@ -1213,10 +1217,28 @@ its result), or, for an untyped port, by evaluating the plan on `prepare`'s
 `exemplars` (one value per HAVE port, `nothing` for the plan port); a plan
 port that cannot be typed is refused naming the remedy, never silently
 dropped. `partition_plan_kernel(kernel)` returns the plan kernel of a prepared
-partition; `partition_plan` keeps one per kernel for the process. Native
-Enzyme Reverse differentiates a planned partition with runtime activity on
-registered Enzyme (the plan's constant row vectors meet the active vector in
-the body's views, which static activity analysis refuses).
+partition; `partition_plan` keeps one per kernel for the process. Ordinary
+Enzyme Reverse differentiates a planned partition with the upstream repair
+on Enzyme's dogfood line from `1280e6ee`. Registered Enzyme 0.13.216 has an
+activity-analysis defect for constant plan fields beside active values
+(`plan-const-int-r-4671f4a7`); runtime activity is not an accepted remedy.
+Grouped compact RKPPL partitions on Julia 1.10 also require Enzyme dogfood
+from `a6458e9c` (`static-reverse-g-173719b3`). This second repair preserves
+the constant-field proof when a method receives two views of the plan,
+allowing ordinary Reverse through the overlay's choice of base or active data.
+`plan_constant`
+names HAVE ports whose values are constant per label (not data for the plan),
+and a lazy view of inputs may serve its rows from its parts
+(`_cell_lazy_rows(op, inputs, rows, bind, constant)`, the op's own method returning the
+expression): ReactiveKernelsPPL's compact overlay reads its active vector at
+the slots of a block's rows, computed once per label.
+
+On the BRM `4e53855` nested-panel fixture (42,768 rows, 12 regions), ordinary
+Reverse with Enzyme `a6458e9c` / libEnzyme `782c9d95` on Julia 1.10.12 gave
+2.55 ms per compact partition, 3.47 ms dense, and 8.84 ms for BRM's unit
+path. The whole sweep took 13.8 ms: compact cost 2.22× its per-region share,
+above the 1.5× optimization target. These are interleaved minima over 15
+rounds on gordito with one Julia thread; they describe this workload.
 
 A partition's windows hold their rows sorted and unique, the union of what
 their readers ask for, and a read finds its row by bisection: a partition of

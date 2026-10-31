@@ -398,10 +398,9 @@ end
     @test all(e.status !== :whole for e in report)
     statuses(name) = unique(e.status for e in report if e.value === name)
     @test statuses(:tau) == [:rows] && statuses(:Z) == [:rows]
-    # The body reads the captured rows through windows (active data beside
-    # constant rows); on registered Enzyme that needs runtime activity (snag
-    # `Enzyme/snags?sig=native-reverse-r-285478e2`: repaired on the dogfood branch).
-    ad = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)),
+    # Static Reverse is required; the upstream repair for constant window
+    # rows is recorded in Enzyme snag `native-reverse-r-285478e2`.
+    ad = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse),
                     d.u, 1; active = :u)
     gradient = similar(d.u)
     for s in 1:3
@@ -511,27 +510,40 @@ end
     planned = prepare(spec; have = (_PP_HAVE..., :label, :plan), want = :partition_total,
                       bound = (; d.g, d.w, d.subject), exemplars = (d.u, 1, nothing))
     plans = Dict(s => partition_plan(planned, d.u, s, nothing) for s in 1:5)
-    @test all(p -> all(x -> x isa Union{Integer,AbstractArray{<:Integer},Tuple,Nothing}, p),
-              values(plans))
+    # No plan field is a type, nor a scalar or an array computed from `u`
+    # (`u`'s values appear in no field).
+    @test all(values(plans)) do p
+        all(x -> !(x isa Type) && !(x isa AbstractFloat && x in d.u), p)
+    end
     @test all(p -> p isa NamedTuple && !isempty(p), values(plans))
     for s in 1:5
         @test planned(d.u, s, plans[s]) ≈ plain(d.u, s)
         @test partition_footprint(planned, d.u, s, nothing).u == partition_footprint(plain, d.u, s).u
+        before = deepcopy(plans[s])
+        for scale in (2.0, -1.0, 1.0)
+            @test planned(scale .* d.u, s, plans[s]) ≈ plain(scale .* d.u, s)
+            @test all(isequal(plans[s][i], before[i]) for i in eachindex(before)
+                      if before[i] isa AbstractArray)
+        end
     end
     @test_throws ArgumentError partition_plan(planned, d.u, 6, nothing)
-    # The planned body computes no rows of its own.
+    @test_throws ArgumentError planned(d.u, 2, plans[1])
+    @test_throws ArgumentError planned(d.u, 6, plans[1])
+    # The planned body computes no rows of its own, and reads no data column
+    # at rows: `w`'s rows are label-constant, computed once per label.
     @test !occursin("_cell_canonical_rows", string(planned.ast))
+    @test occursin("Base.broadcastable(w)", string(plain.ast))
+    @test !occursin("Base.broadcastable(w)", string(planned.ast))
     @test !occursin("_cell_take_positions", string(planned.ast))
     @test occursin("_cell_canonical_rows", string(partition_plan_kernel(planned).ast))
     # A plan per label costs no bytes that grow with the other subjects, and
     # fewer than the body without one.
     planned(d.u, 1, plans[1])
     @test (@allocated planned(d.u, 1, plans[1])) < (@allocated plain(d.u, 1))
-    # The plan's row vectors meet the active vector in the body's views; on
-    # registered Enzyme 0.13.216 (and dogfood `3e707d7`) that needs runtime
-    # activity, as the window reads above do (Enzyme snag
-    # `Enzyme/snags?sig=plan-const-int-r-4671f4a7` names the store).
-    ad = prepare_ad(planned, AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)),
+    # Plan fields must differentiate under ordinary Reverse. Enzyme's
+    # upstream repair is on dogfood from 1280e6ee; registered 0.13.216 has
+    # the known activity-analysis defect `plan-const-int-r-4671f4a7`.
+    ad = prepare_ad(planned, AutoEnzyme(; mode = Enzyme.Reverse),
                     d.u, 3, plans[3]; active = :u)
     gradient = similar(d.u)
     value, _ = ad_value_and_gradient!(ad, gradient, d.u, 3, plans[3])
@@ -543,8 +555,7 @@ end
     @test gradient ≈ reference
     @test_throws ArgumentError plate_partition(_pp_subjects, :dens; by = :subject, index = :label,
                                                plan = :label)
-    # Bound values a plan may hold: index bookkeeping, nested (a ragged row
-    # structure), never data.
+    # Index bookkeeping as against data, nested (a ragged row structure).
     @test ReactiveKernels._plan_bookkeeping([[1, 2], [3]])
     @test ReactiveKernels._plan_bookkeeping(Dict(1 => 2:3))
     @test ReactiveKernels._plan_bookkeeping((1, [2, 3]))
@@ -566,4 +577,106 @@ end
                     bound = (; d.g, d.w, d.subject))
     @test all(s -> typed(d.u, s, typed_plans[s]) ≈ plain(d.u, s), 1:5)
     @test !occursin("_cell_canonical_rows", string(typed.ast))
+end
+
+@testset "partition plans share one type across empty plate portions" begin
+    d = _pp_two_plate_data((5, 5, 5, 5, 5))
+    # Label 1 has observations only, label 5 has gathered group totals only,
+    # and label 2 has both. Both inferred and explicit plan ports must accept
+    # these different combinations of empty portions.
+    subject = [s == 5 ? 6 : s for s in d.subject]
+    group_subject = [s == 1 ? 2 : s for s in d.group_subject]
+    bound = (; d.g, d.observed, d.order, d.y, d.rows, d.totals, subject, group_subject)
+    by = (dens = :subject, group_totals = :group_subject)
+    spec = plate_partition(_pp_two_plates, (:dens, :group_totals);
+        by, index = :label, plan = :plan)
+    have = (_PP_TWO_HAVE..., :label, :plan)
+    planner = partition_plan_kernel(spec; have, want = :partition_total, bound)
+    labels = (1, 2, 5, 6)
+    plans = Dict(s => planner(d.u, s, nothing) for s in labels)
+    T = typeof(plans[2])
+    @test isconcretetype(T)
+    @test all(p -> typeof(p) === T, values(plans))
+    typed = prepare(plate_partition(_pp_two_plates, (:dens, :group_totals);
+        by, index = :label, plan = :plan => T);
+        have, want = :partition_total, bound)
+    full = prepare(_pp_two_plates; have = _PP_TWO_HAVE, want = (:dens, :group_totals))
+    for s in labels
+        automatic = prepare(spec; have, want = :partition_total, bound,
+            exemplars = (d.u, s, nothing))
+        for scale in (1.0, 1.2)
+            u = scale .* d.u
+            dens, totals = full(u, d.g, d.observed, d.order, d.y, d.rows,
+                d.totals, subject, group_subject)
+            expected = sum(dens[subject .== s]) + sum(totals[group_subject .== s])
+            @test typed(u, s, plans[s]) ≈ expected
+            @test automatic(u, s, plans[s]) ≈ expected
+        end
+    end
+end
+
+@testset "partition plans restart scheduled loops on every evaluation" begin
+    # The previous-coordinate cache is evaluation state. Preparing a shape
+    # may run the loop, but its final state must not become a plan field.
+    body = quote
+        rows = collect(1:label)
+        previous = nothing
+        first_coordinate = true
+        total = zero(x)
+        for i in rows
+            if first_coordinate || i != previous[1]
+                total = total + x * i
+            end
+            previous = CartesianIndex(i)
+            first_coordinate = false
+        end
+        return total
+    end
+    plan, main, needed, _ = ReactiveKernels._partition_plan_split(body, [:x], Any[])
+    planner = ReactiveKernels.compile(Expr(:function, Expr(:tuple, :x, :label),
+        Expr(:block, plan..., Expr(:return, Expr(:tuple, needed...)))))
+    reads = [Expr(:(=), name, :(p[$i])) for (i, name) in enumerate(needed)]
+    planned = ReactiveKernels.compile(Expr(:function, Expr(:tuple, :x, :label, :p),
+        Expr(:block, reads..., main...)))
+    plans = [planner(1.0, label) for label in (0, 1, 3)]
+    @test all(p -> typeof(p) === typeof(first(plans)), plans)
+    for (label, p) in zip((0, 1, 3), plans), x in (2.0, -3.0, 4.0)
+        @test planned(x, label, p) == x * label * (label + 1) / 2
+    end
+end
+
+@testset "partition plans preserve writes and scratch ownership" begin
+    # Execute the compiler split, reusing one plan with changing inputs.
+    # The final sum observes indexed/property writes, aliases, mutating
+    # calls whose destination is not first, and ordinary reassignments.
+    for work in (
+            :(begin a = zeros(2); a[1] = u; y = sum(a) end),
+            :(begin a = zeros(2); a[1] += u; y = sum(a) end),
+            :(begin a = zeros(2); b = view(a, :); b[1] = u; y = sum(a) end),
+            :(begin t = (zeros(2), 1); (a, b) = t; a[1] = u; y = sum(t[1]) + b end),
+            :(begin a = zeros(2); b = reshape(a, 1, 2); b .+= u; y = sum(a) end),
+            :(begin a = zeros(2); broadcast!(identity, a, u); y = sum(a) end),
+            :(begin a = zeros(2); fill!(a, 1.0); y = sum(a) * u end),
+            :(begin a = Ref(0.0); a.x = u; y = a[] end),
+            :(begin a = 0.0; a = u; y = a + 1 end),
+            :(begin a = 0.0; a += u; y = a + 1 end),
+            :(begin a = 0.0; a = 2.0; y = a * u end),
+            :(begin a = Float64[]; push!(a, u); dims = axes(a); y = sum(a) + length(dims[1]) end))
+        body = Expr(:block, :(saved = [1, 2]), work.args..., :(return y + sum(saved)))
+        split = ReactiveKernels._partition_plan_split(body, [:u], Any[])
+        @test split !== nothing
+        plan, main, needed, _ = split
+        planner = ReactiveKernels.compile(Expr(:function, Expr(:tuple, :u),
+            Expr(:block, plan..., Expr(:return, Expr(:tuple, needed...)))))
+        reads = [Expr(:(=), name, :(p[$i])) for (i, name) in enumerate(needed)]
+        planned = ReactiveKernels.compile(Expr(:function, Expr(:tuple, :u, :p),
+            Expr(:block, reads..., main...)))
+        plain = ReactiveKernels.compile(Expr(:function, Expr(:tuple, :u), body))
+        p = planner(1.0)
+        before = deepcopy(p)
+        for u in (2.0, -3.0, 4.0)
+            @test planned(u, p) == plain(u)
+            @test isequal(p, before)
+        end
+    end
 end

@@ -1505,12 +1505,16 @@ struct _CellEmitter
     # windows are then read by bisection, and a value asked for at the same
     # row by many cells is computed once), or a cell's few rows as read.
     sorted::Bool
+    # The names of the HAVE values constant per label (a partition's
+    # `plan_constant`): a lazy view may serve its rows from such a part.
+    constant::Set{Symbol}
 end
-_CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes; sorted::Bool = false) =
+_CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes; sorted::Bool = false,
+             constant::Set{Symbol} = Set{Symbol}()) =
     _CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes,
         Dict{ValueId,Symbol}(), Dict{Tuple{ValueId,Symbol},Symbol}(),
         Dict{ValueId,Vector{Symbol}}(), Dict{ValueId,Symbol}(),
-        Dict{ValueId,Vector{Any}}(), Dict{ValueId,Symbol}(), sorted)
+        Dict{ValueId,Vector{Any}}(), Dict{ValueId,Symbol}(), sorted, constant)
 
 # A request's rows as the emitter holds them: canonical for a partition.
 _cell_canon(e::_CellEmitter, rows) =
@@ -1724,6 +1728,34 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
     e.reads[cid] = reads
 end
 
+# The rows of an unpushed source: a lazy view of inputs (`_cell_lazy_view`)
+# may serve them from its parts (`_cell_lazy_rows`; a compact overlay reads
+# its active vector at the slots of the rows, bookkeeping a partition's plan
+# computes once per label), else the source itself is read at the rows.
+function _cell_source_rows_expr(e::_CellEmitter, icid::ValueId, rows)
+    d = e.pushdowns
+    # An unpushed value's producer is found in the graph (`d.producer` holds
+    # the pushed values' only).
+    ids = producers_of(d.graph, icid)
+    r = length(ids) == 1 ? d.graph.recipes[only(ids)] : nothing
+    if r !== nothing && _cell_lazy_view(r.op)
+        inputs = _input_list(v -> e.names[canon_id(d.graph, v.id)], r.inputs)
+        served = _cell_lazy_rows(r.op, inputs, rows,
+                                 (prefix, value) -> _cell_bind!(e, prefix, value),
+                                 name -> name in e.constant)
+        served === nothing || return served
+    end
+    Expr(:call, _cell_ref(:_cell_source_rows), e.names[icid], rows)
+end
+# The expression reading rows `rows` of a lazy view's value from its inputs'
+# names, or `nothing` to read the value itself; a lazy view op's own method.
+# `bind(prefix, expr)` emits a statement of its own and returns its name:
+# bookkeeping bound apart from the read (the slots of the rows) is a
+# statement a partition's plan computes once per label. `constant(name)`
+# tells whether an input is constant per label (`plan_constant`): a view
+# whose rows depend on a part that varies per call reads itself.
+_cell_lazy_rows(@nospecialize(op), inputs, rows, bind, constant) = nothing
+
 # The window of pushed value `cid` at its union rows, by its own operation.
 function _cell_window!(e::_CellEmitter, cid::ValueId)
     d = e.pushdowns
@@ -1744,7 +1776,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
         icid in d.pushed || _footprint_record!(icid, :rows, reads[j])
         positions = icid in d.pushed ?
             Expr(:call, _cell_ref(:_cell_vector_rows), _cell_take!(e, icid, reads[j])) :
-            Expr(:call, _cell_ref(:_cell_source_rows), e.names[icid], reads[j])
+            _cell_source_rows_expr(e, icid, reads[j])
         f.kind === :range_view && return _cell_bind!(e, :cell_rows, positions)
         return _cell_bind!(e, :cell_rows, Expr(:call, _cell_ref(:_cell_reshape_window),
             positions, U, _cell_literal!(e, r, f)))

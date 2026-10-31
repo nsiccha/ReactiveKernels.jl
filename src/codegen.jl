@@ -518,6 +518,9 @@ struct _AuthoredPlateCellOp{K,A}
     # `partition_plan`): the integer bookkeeping of a label, computed once and
     # read by the body instead of recomputed per call; `nothing` for none.
     plan::Union{Nothing,Symbol}
+    # HAVE ports whose values are constant per label (`plate_partition(…;
+    # plan_constant)`): the plan may read them (a compact overlay's slot map).
+    plan_constant::Tuple{Vararg{Symbol}}
 end
 _AuthoredPlateCellOp(plate::_AuthoredPlateOp) = _AuthoredPlateCellOp(plate, nothing, false, ())
 _AuthoredPlateCellOp(plate::_AuthoredPlateOp, locality) =
@@ -526,6 +529,8 @@ _AuthoredPlateCellOp(plate::_AuthoredPlateOp, locality, rows::Bool) =
     _AuthoredPlateCellOp(plate, locality, rows, ())
 _AuthoredPlateCellOp(plate::_AuthoredPlateOp, locality, rows::Bool, partitioned) =
     _AuthoredPlateCellOp(plate, locality, rows, partitioned, nothing)
+_AuthoredPlateCellOp(plate::_AuthoredPlateOp, locality, rows::Bool, partitioned, plan) =
+    _AuthoredPlateCellOp(plate, locality, rows, partitioned, plan, ())
 
 function (op::_AuthoredPlateCellOp{K,A})(index, args...) where {K,A}
     op.rows && return sum(op.plate(_plate_partition_slices(Val(A), index, args...)...))
@@ -1987,6 +1992,7 @@ struct _AuthoredPlateCellDraft{A}
     rows::Bool
     partitioned::Tuple{Vararg{Pair{Symbol,<:AbstractVector}}}
     plan::Union{Nothing,Symbol}
+    plan_constant::Tuple{Vararg{Symbol}}
 end
 const _AuthoredPlateLike = Union{_AuthoredPlateOp,_AuthoredPlateDraft}
 const _AuthoredPlateCellLike = Union{_AuthoredPlateCellOp,_AuthoredPlateCellDraft}
@@ -2006,7 +2012,7 @@ function _built_plate_op(draft::_AuthoredPlateDraft{A}) where {A}
 end
 _built_plate_op(draft::_AuthoredPlateCellDraft) =
     _AuthoredPlateCellOp(_built_plate_op(draft.plate), draft.locality, draft.rows,
-                         draft.partitioned, draft.plan)
+                         draft.partitioned, draft.plan, draft.plan_constant)
 _built_plate_recipe(r::Recipe) =
     r.op isa Union{_AuthoredPlateDraft,_AuthoredPlateCellDraft} ?
     Recipe(r.id, r.inputs, r.outputs, _built_plate_op(r.op), r.cost, r.cse_key,
@@ -2251,7 +2257,7 @@ function _plate_without_unread_operands(r::Recipe)
                           r.effectful, r.source)
     Recipe(r.id, (first(r.inputs), inputs[kept]...), r.outputs,
            _AuthoredPlateCellDraft(draft, r.op.locality, r.op.rows, r.op.partitioned,
-                                   r.op.plan),
+                                   r.op.plan, r.op.plan_constant),
            r.cost, nothing, r.effectful, r.source)
 end
 
@@ -2385,7 +2391,8 @@ function _compose_plate_into(g::Graph, producer::Recipe, consumer::Recipe, cid)
     cell || return composed
     Recipe(composed.id, (first(consumer.inputs), composed.inputs...), composed.outputs,
         _AuthoredPlateCellDraft(composed.op, consumer.op.locality, consumer.op.rows,
-                                consumer.op.partitioned, consumer.op.plan),
+                                consumer.op.partitioned, consumer.op.plan,
+                                consumer.op.plan_constant),
         composed.cost, nothing, false, composed.source)
 end
 
@@ -4883,7 +4890,9 @@ function _lower_with_ops_collecting(p::Plan;
                 callargs, lhs;
                 windows = cells === nothing ? nothing :
                     _CellEmitter(body, cells, names, runtime_ops, runtime_recipes;
-                                 sorted = r.op.rows))
+                                 sorted = r.op.rows,
+                                 constant = Set{Symbol}(names[canon_id(g, v.id)]
+                                     for v in p.have if v.name in r.op.plan_constant)))
             continue
         end
         if inline_embedded && r.op isa _AuthoredScanOp
