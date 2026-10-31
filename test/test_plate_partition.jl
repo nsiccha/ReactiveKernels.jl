@@ -511,16 +511,22 @@ end
     planned = prepare(spec; have = (_PP_HAVE..., :label, :plan), want = :partition_total,
                       bound = (; d.g, d.w, d.subject), exemplars = (d.u, 1, nothing))
     plans = Dict(s => partition_plan(planned, d.u, s, nothing) for s in 1:5)
-    @test all(p -> all(x -> x isa Union{Integer,AbstractArray{<:Integer},Tuple,Nothing}, p),
-              values(plans))
+    # No plan field is a type, nor a scalar or an array computed from `u`
+    # (`u`'s values appear in no field).
+    @test all(values(plans)) do p
+        all(x -> !(x isa Type) && !(x isa AbstractFloat && x in d.u), p)
+    end
     @test all(p -> p isa NamedTuple && !isempty(p), values(plans))
     for s in 1:5
         @test planned(d.u, s, plans[s]) ≈ plain(d.u, s)
         @test partition_footprint(planned, d.u, s, nothing).u == partition_footprint(plain, d.u, s).u
     end
     @test_throws ArgumentError partition_plan(planned, d.u, 6, nothing)
-    # The planned body computes no rows of its own.
+    # The planned body computes no rows of its own, and reads no data column
+    # at rows: `w`'s rows are label-constant, computed once per label.
     @test !occursin("_cell_canonical_rows", string(planned.ast))
+    @test occursin("Base.broadcastable(w)", string(plain.ast))
+    @test !occursin("Base.broadcastable(w)", string(planned.ast))
     @test !occursin("_cell_take_positions", string(planned.ast))
     @test occursin("_cell_canonical_rows", string(partition_plan_kernel(planned).ast))
     # A plan per label costs no bytes that grow with the other subjects, and
@@ -543,8 +549,7 @@ end
     @test gradient ≈ reference
     @test_throws ArgumentError plate_partition(_pp_subjects, :dens; by = :subject, index = :label,
                                                plan = :label)
-    # Bound values a plan may hold: index bookkeeping, nested (a ragged row
-    # structure), never data.
+    # Index bookkeeping as against data, nested (a ragged row structure).
     @test ReactiveKernels._plan_bookkeeping([[1, 2], [3]])
     @test ReactiveKernels._plan_bookkeeping(Dict(1 => 2:3))
     @test ReactiveKernels._plan_bookkeeping((1, [2, 3]))

@@ -830,11 +830,15 @@ const _PLAN_ARG = :__plan__
 # `_PLAN_MODE` / `_plan_mode()` (graphops.jl): set while `partition_plan_kernel(spec; …)`
 # prepares; the lowering then emits the plan body instead of the partition's.
 
-_plan_eligible_op(op) = op isa Union{_PartitionTable,_PartitionLabel,_PartitionLanes}
-# A bound value the plan may hold is index bookkeeping (a partition table, an
-# index column, a mask, a count), never data: the data columns stay the body's
-# hidden operands, and a derivative never meets them through the plan.
-_plan_eligible_op(op::_BoundConstant) = _plan_bookkeeping(op.value)
+# The operations a plan may apply: a value computed from bound data and the
+# label alone is the same on every call, so a pure operation over such
+# arguments (a source, a plain function, a partition op, a bound value of any
+# kind: an index column, a data column, a design matrix) is computed once per
+# label. Plates, scans and cells stay in the body.
+_plan_eligible_op(op) = op isa Union{_PartitionTable,_PartitionLabel,_PartitionLanes,
+                                     _BoundConstant,_KernelSourceOp,_TypeOperation} ||
+                        op isa Function
+# Whether a bound value is index bookkeeping (as against data); informational.
 _plan_bookkeeping(::Integer) = true
 _plan_bookkeeping(v::AbstractArray) = _plan_bookkeeping_type(eltype(v))
 _plan_bookkeeping(v::AbstractDict) = _plan_bookkeeping_type(Base.valtype(v))
@@ -957,14 +961,51 @@ end
 # the plan symbols the rest reads and their field names (`plan_k`, positional:
 # the plan-mode lowering of the same plan names them the same way).
 function _partition_plan_split(body::Expr, data_names, ops)
+    # A planned value the body writes into (an accumulation, a reassignment)
+    # would carry one call's values into the next: such a value is data, and
+    # the classification runs again without it until none is written.
+    forced = Set{Symbol}()
+    while true
+        split = _partition_plan_classify(body, data_names, ops, forced)
+        split === nothing && return nothing
+        plan, main, needed, fields = split
+        written = _written_plan_symbols(main, Set{Symbol}(needed))
+        isempty(written) && return split
+        union!(forced, written)
+    end
+end
+# The symbols of `names` that `main`'s statements write into: the first
+# argument of a mutating call (`f!(x, …)`), the target of `x .= …`, or a
+# second assignment.
+function _written_plan_symbols(main, names::Set{Symbol})
+    written = Set{Symbol}()
+    visit(ex) = begin
+        ex isa Expr || return
+        if ex.head === :call && length(ex.args) >= 2
+            name = _plan_call_name(ex.args[1])
+            if name isa Symbol && endswith(String(name), "!") && ex.args[2] isa Symbol &&
+               ex.args[2] in names
+                push!(written, ex.args[2])
+            end
+        elseif ex.head in (:(.=), :(=), :(+=), :(-=), :(.+=), :(.-=)) && ex.args[1] isa Symbol &&
+               ex.args[1] in names
+            push!(written, ex.args[1])
+        end
+        foreach(visit, ex.args)
+    end
+    foreach(visit, main)
+    written
+end
+function _partition_plan_classify(body::Expr, data_names, ops, forced::Set{Symbol})
     # Every symbol the body assigns anywhere is data until a plan statement
     # assigns it, so a reference ahead of a later or nested assignment can
-    # never leave the body.
-    data = union!(_assigned_names!(Set{Symbol}(), body), data_names)
+    # never leave the body; the hidden cache arguments are data too.
+    data = union!(_assigned_names!(Set{Symbol}(), body), data_names,
+                  (_CACHES_ARG, _CACHE_APPLY_ARG))
     kinds = Symbol[]
     for st in body.args
         kind = if st isa Expr && st.head === :(=) && st.args[1] isa Symbol &&
-                  _plan_type_local(st.args[1])
+                  (_plan_type_local(st.args[1]) || st.args[1] in forced)
             :main
         elseif st isa Expr && st.head === :(=) && st.args[1] isa Symbol &&
                   _plan_eligible(st.args[2], data, ops)

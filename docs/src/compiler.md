@@ -1142,12 +1142,15 @@ pushed value's rows, the positions of gathers and captures in their windows,
 the shapes it checks), as a named tuple `partition_plan(kernel, args...)`
 computes once per label from the bound data (`nothing` for the plan port
 among `args`); the body then reads it from the port instead of recomputing it
-on every call, and a derivative carries none of it. The plan holds index
-bookkeeping only: a bound value enters it only as a partition table, an
-index column, a mask or a count, never a data column, an alias of a data
-value, or a type the body computes (those stay constants inference folds). A
-statement whose value is a shape of a data value is computed in the plan from
-the exemplar and
+on every call, and a derivative carries none of it. The plan holds every
+value computed from the bound data and the label alone: the index bookkeeping
+and label-constant data (a data column's rows, a design block's rows and
+their `hcat`), computed once per label by pure operations (sources, plain
+functions, partition ops; plates, scans and cells stay in the body); never a
+value computed from an unbound port, an alias of one, a type the body
+computes (those stay constants inference folds), or a value the body writes
+into. A statement whose value is a shape of a data value is computed in the
+plan from the exemplar and
 checked against the value's shape on every call: arguments of another shape
 throw `ArgumentError` naming `partition_plan`. The plan's type is the port's
 declared type (`plan = port => T`), found by preparing the plan kernel first

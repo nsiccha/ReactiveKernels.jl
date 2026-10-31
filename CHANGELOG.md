@@ -28,10 +28,14 @@ are recorded in the git history only.
   `partition_plan_kernel(kernel)` returns the plan kernel of a prepared
   partition. An untyped plan port is typed by evaluating the plan on
   `prepare`'s `exemplars`; a plan port that cannot be typed is refused naming
-  the remedy. A plan holds index bookkeeping only: never a data column, a
-  data value's alias, or a type the body computes. On registered Enzyme a
-  planned partition's gradient needs runtime activity (the plan's constant
-  row vectors meet the active vector in the body's views).
+  the remedy. A plan holds every value computed from the bound data and the
+  label alone: index bookkeeping (positions, rows, unions, gather positions,
+  checked shapes) and label-constant data (a data column's rows, a design
+  block's rows and their `hcat`), computed once per label; never a value
+  computed from an unbound port, its alias, or a type the body computes, and
+  never a value the body writes into. On registered Enzyme a planned
+  partition's gradient needs runtime activity (the plan's constant vectors
+  meet the active vector in the body's views).
 - A partition's windows carry the positions of a gather index's entries,
   computed apart from the gather (once per label with a plan); row takes are
   a positions step and a view.
