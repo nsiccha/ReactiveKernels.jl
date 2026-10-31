@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.33
+
+- Generated programs can compose an authored graph reconstructed by an
+  explicitly registered structural constructor. The compiler resolves only
+  that constructor's static syntax; ordinary calls remain ordinary calls.
+  RKPPL uses this internal integration point to emit replayable caller-owned
+  parameter geometry without adding global bindings or opaque runtime graph
+  preparation. Nested graph recipes retain their normal locality analysis.
+
 ## 0.1.32
 
 - Retain sum and eager-operand source boundaries for factored cell queries,

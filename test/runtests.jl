@@ -45,6 +45,7 @@ const _MATRIX_CORE_TESTS = (
     "test_cholesky.jl",
     "test_authoring.jl",
     "test_globalref_composition.jl",
+    "test_graph_constructors.jl",
     "test_source_world_age.jl",
     "test_execution_sources.jl",
     "test_error_policy.jl",

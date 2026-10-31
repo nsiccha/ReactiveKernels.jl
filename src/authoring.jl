@@ -4127,13 +4127,27 @@ _kernel_has_node_marker(x) =
 
 # Resolve a callee/macro-head AST (`name`, `Mod.name`, `Mod.Sub.name`, or a `GlobalRef`) to its
 # BINDING VALUE in `mod`, or `nothing`. A qualified name resolves its owner first, at any depth.
-# Reads bindings only (no call eval) — inside the compiler boundary.
+# Reads bindings and opted-in structural graph constructors, never ordinary
+# Julia calls — inside the compiler boundary.
 _kernel_resolve_binding(::Module, callee::GlobalRef) =
     isdefined(callee.mod, callee.name) ? getglobal(callee.mod, callee.name) : nothing
+
+# Compiler integrations can reconstruct an authored graph from a printable
+# constructor expression. This is an opt-in structural operation, not Julia
+# evaluation: the default resolves no calls, and a specialization must decode
+# only its own static syntax and return a KernelSpec (or nothing). Active
+# arguments belong to the outer graph application, never this constructor.
+Base.@nospecializeinfer _kernel_resolve_graph_constructor(
+    @nospecialize(f), @nospecialize(arguments), mod::Module) = nothing
 
 function _kernel_resolve_binding(mod::Module, callee)
     if callee isa Symbol
         isdefined(mod, callee) ? getglobal(mod, callee) : nothing
+    elseif Meta.isexpr(callee, :call) && !isempty(callee.args)
+        f = _kernel_resolve_binding(mod, first(callee.args))
+        spec = Base.invokelatest(_kernel_resolve_graph_constructor,
+                                f, callee.args[2:end], mod)
+        spec isa KernelSpec ? spec : nothing
     elseif callee isa Expr && callee.head === :(.) && length(callee.args) == 2 &&
            callee.args[2] isa QuoteNode
         outerval = _kernel_resolve_binding(mod, callee.args[1])

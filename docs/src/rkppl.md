@@ -394,6 +394,50 @@ index; any other geometry makes it a joint latent per index (see "One joint
 latent per index"). The density and inverse must enforce the declared support;
 metadata alone adds no support check.
 
+The endpoint slots also accept function-shaped `@kernel` graphs (RKPPL 0.1.27).
+For example, a caller-owned vector law can expose its identity geometry:
+
+```julia
+@kernel identity_coordinates(u, shape, data) = begin
+    return u
+end
+@kernel identity_logjac(u, shape, data) = begin
+    return 0.0
+end
+struct IdentityVector{D}
+    data::D
+end
+ReactiveKernelsPPL.sampling_logdensity(::IdentityVector, w) = -sum(abs2, w)/2
+ReactiveKernelsPPL.sampling_geometry(::Type{IdentityVector}, args, shape) =
+    ParameterGeometry(shape, :(length($(args[1]))); support=:real,
+        constrain=identity_coordinates, unconstrain=identity_coordinates,
+        logjac=identity_logjac)
+
+model = @rkppl begin
+    w[1:length(data)] ~ IdentityVector(data)
+    y .~ Normal.(w, 1)
+end
+bound = model(; data=[0,0,0], key=[1,1,2]) | (;y=[0.1,0.2,0.3])
+built = build_kernel(bound)
+query = prepare_partition(built, bound, :y; by=:key, locality=:error)
+query(zeros(3), 1)
+println(Base.remove_linenums!(kernel_expr(bound, built.layout)))
+```
+
+RKPPL composes the actual transform graph, so identity and supported row-local
+operations expose their coordinate reads to strict partitions. A coupled
+transform retains its coupled reads. This does not change or factorize the
+law's joint prior. Host transforms retain prepared versions of the same
+endpoints; they do not prepare a kernel on each evaluation. Generated source
+reconstructs the graph through the caller's `sampling_geometry` method, so
+endpoints need no separate global registration.
+
+Graph composition currently consumes a full argument boundary: all positional
+and keyword arguments must be supplied explicitly. Omitted defaults and
+splatted arguments still execute through the prepared numerical endpoint,
+with the same conservative locality as an ordinary Julia callback. Scalar
+and joint cell latents use the same endpoint mechanism.
+
 An external frontend can supply a submodel without defining it through
 `@rkppl`: extend `sampling_fragment(binding)` to return a stable
 `RKPPLSubmodel(name, argument_names, body_ast, defining_module)`. Its ordinary
