@@ -35,11 +35,43 @@ const MODEL = quote
     y .~ Normal.(mu, 1)
 end
 
-function fixture(n)
-    coordinates = [collect((2g-1):(2g)) for g in 1:n]
-    owner = repeat(collect(1:n); inner = 2)
-    slot = repeat([2, 1], n)
-    (; packed = zeros(2n), groups = collect(1:n), coordinates,
+const layout_calls = Ref(0)
+function entry_layout(ends)
+    layout_calls[] += 1
+    (collect(eachindex(ends)), collect(1:last(ends)))
+end
+@kernel entry_axis(ends) = entry_layout(ends)[2]
+@kernel group_axis(ends) = entry_layout(ends)[1]
+
+function computed_model(kind)
+    source = deepcopy(MODEL)
+    kind === :supplied && return source
+    defs = Expr[:(computed_entries = entry_axis(ends))]
+    entry = :computed_entries
+    if kind === :alias
+        push!(defs, :(entry_alias = identity(computed_entries)))
+        entry = :entry_alias
+    end
+    group = :groups
+    if kind === :both
+        push!(defs, :(computed_groups = group_axis(ends)))
+        group = :computed_groups
+    end
+    i = findfirst(ex -> ex isa Expr && ex.head === :(=) &&
+        ex.args[1] === :values, source.args)
+    source.args[i] = :(values = grouped_column(z, $group, coordinates, $entry, owner, slot))
+    prepend!(source.args, defs)
+    return source
+end
+
+function fixture(n, ragged)
+    sizes = ragged ? repeat([0, 1, 5], n ÷ 3) : fill(2, n)
+    ends = cumsum(sizes)
+    starts = ends .- sizes .+ 1
+    coordinates = [collect(a:b) for (a, b) in zip(starts, ends)]
+    owner = reduce(vcat, [fill(g, sizes[g]) for g in 1:n])
+    slot = reduce(vcat, [collect(k:-1:1) for k in sizes])
+    (; packed = zeros(2n), groups = collect(1:n), ends, coordinates,
         entries = collect(1:2n), owner, slot, one = ones(2n),
         offset = fill(0.1, 2n), y = fill(0.7, 2n))
 end
@@ -47,43 +79,80 @@ end
 nodes(ex) = ex isa Expr ? 1 + sum(nodes, ex.args; init = 0) : 1
 
 @testset "a grouped kernel column stays local through a design and offset" begin
-    costs = Tuple{Int,Int}[]
-    for n in (3, 300)
-        data = fixture(n)
-        saved = deepcopy(data)
-        bound = bind_data(lower_rkppl(MODEL, data; conditioned = (:y,), mod = @__MODULE__), data)
-        built = build_kernel(bound)
-        q = prepare_cell_query(built, bound, :y; locality = :error)
-        names = coordinate_names(built.layout)
-        zi = [only(findall(==(Symbol("z.$j")), names)) for j in 1:2n]
-        bi = [only(findall(==(Symbol("beta.$j")), names)) for j in 1:2]
-        u = [0.1sin(j) for j in eachindex(names)]
-        sampler = prepare_cell_sampler(built, bound, :y, u;
-            locality = :error, backend = AutoEnzyme(; mode = Enzyme.Reverse))
-        for cell in (1, 4, 2n)
-            g = data.owner[cell]
-            zidx = zi[data.coordinates[g][data.slot[cell]]]
-            mu = u[bi[1]] + 2u[bi[2]] * u[zidx] + data.offset[cell]
-            expected = logpdf(Normal(mu, 1), data.y[cell])
-            point = RecordingPoint(copy(u), Int[])
-            @test q(point, cell) ≈ expected
-            @test sort!(unique!(point.seen)) == sort([zi[data.coordinates[g]]; bi])
-            gradient = zeros(length(u))
-            value, _ = cell_value_and_gradient!(sampler, gradient, u, cell)
-            reference = zeros(length(u))
-            residual = data.y[cell] - mu
-            reference[bi[1]] = residual
-            reference[bi[2]] = residual * 2u[zidx]
-            reference[zidx] = residual * 2u[bi[2]]
-            @test value ≈ expected
-            @test gradient ≈ reference
+    builds = Dict{Tuple{Symbol,Int},Any}()
+    for kind in (:supplied, :entries, :both, :alias), ragged in (false, true)
+        costs = Tuple{Int,Int}[]
+        for n in (3, 300)
+            data = fixture(n, ragged)
+            saved = deepcopy(data)
+            layout_calls[] = 0
+            source = computed_model(kind)
+            plan = lower_rkppl(source, data; conditioned = (:y,), mod = @__MODULE__)
+            @test layout_calls[] == 0
+            bound = bind_data(plan, data)
+            expected_calls = kind === :supplied ? 0 : kind === :both ? 2 : 1
+            @test layout_calls[] == expected_calls
+            built = build_kernel(bound)
+            q = prepare_cell_query(built, bound, :y; locality = :error)
+            reused = prepare_cell_query(get(builds, (kind, n), built), bound, :y; locality = :error)
+            builds[(kind, n)] = built
+            names = coordinate_names(built.layout)
+            zi = [only(findall(==(Symbol("z.$j")), names)) for j in 1:2n]
+            bi = [only(findall(==(Symbol("beta.$j")), names)) for j in 1:2]
+            u = [0.1sin(j) for j in eachindex(names)]
+            sampler = prepare_cell_sampler(built, bound, :y, u;
+                locality = :error, backend = AutoEnzyme(; mode = Enzyme.Reverse))
+            for cell in (1, 4, 2n)
+                g = data.owner[cell]
+                zidx = zi[data.coordinates[g][data.slot[cell]]]
+                mu = u[bi[1]] + 2u[bi[2]] * u[zidx] + data.offset[cell]
+                expected = logpdf(Normal(mu, 1), data.y[cell])
+                point = RecordingPoint(copy(u), Int[])
+                @test q(point, cell) ≈ expected
+                @test reused(u, cell) ≈ expected
+                @test sort!(unique!(point.seen)) == sort([zi[data.coordinates[g]]; bi])
+                gradient = zeros(length(u))
+                value, _ = cell_value_and_gradient!(sampler, gradient, u, cell)
+                reference = zeros(length(u))
+                residual = data.y[cell] - mu
+                reference[bi[1]] = residual
+                reference[bi[2]] = residual * 2u[zidx]
+                reference[zidx] = residual * 2u[bi[2]]
+                @test value ≈ expected
+                @test gradient ≈ reference
+            end
+            q(u, 1)
+            push!(costs, (minimum(@allocated(q(u, 1)) for _ in 1:3), nodes(code_expr(q.kernel))))
+            @info "grouped design cell" kind ragged groups=n allocated_bytes=costs[end][1] generated_nodes=costs[end][2]
+            @test layout_calls[] == expected_calls
+            @test data == saved
+            @test_throws BoundsError q(u, 2n + 1)
         end
-        q(u, 1)
-        push!(costs, (minimum(@allocated(q(u, 1)) for _ in 1:3), nodes(code_expr(q.kernel))))
-        @info "grouped design cell" groups=n allocated_bytes=costs[end][1] generated_nodes=costs[end][2]
-        @test data == saved
-        @test_throws BoundsError q(u, 2n + 1)
+        @test costs[1] == costs[2]
     end
-    @test costs[1] == costs[2]
+end
+
+const coordinate_calls = Ref(0)
+copy_coordinates(x) = (coordinate_calls[] += 1; map(copy, x))
+
+@testset "data-only captures keep preparation staging" begin
+    data = fixture(3, true)
+    source = computed_model(:entries)
+    pushfirst!(source.args, :(computed_coordinates = copy_coordinates(coordinates)))
+    i = findfirst(ex -> ex isa Expr && ex.head === :(=) &&
+        ex.args[1] === :values, source.args)
+    source.args[i] = :(values = grouped_column(z, groups, computed_coordinates,
+        computed_entries, owner, slot))
+    coordinate_calls[] = 0
+    bound = bind_data(lower_rkppl(source, data; conditioned = (:y,),
+        mod = @__MODULE__), data)
+    built = build_kernel(bound)
+    @test coordinate_calls[] == 0
+    q = prepare_cell_query(built, bound, :y; locality = :error)
+    @test coordinate_calls[] == 1
+    u = fill(0.1, length(coordinate_names(built.layout)))
+    @test isfinite(q(u, 1))
+    @test isfinite(q(u, 6))
+    @test coordinate_calls[] == 1
 end
 end

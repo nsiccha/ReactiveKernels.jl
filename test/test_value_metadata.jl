@@ -206,4 +206,22 @@ end
     end
     @test helper_calls[] == calls
 end
+
+@kernel metadata_domain_chain(x, rows) = begin
+    domain = opaque_shape_change(rows)
+    values = plate(domain) do i
+        v::Float64 = opaque_value(x[i])
+        v
+    end
+    return values
+end
+
+@testset "visible plate domain dependencies keep captured values separate" begin
+    calls = helper_calls[]
+    for kernel in (metadata_plate, metadata_domain_chain, metadata_design)
+        @test ReactiveKernels._kernel_plate_domain_inputs(kernel) == [2]
+    end
+    @test isempty(ReactiveKernels._kernel_plate_domain_inputs(metadata_opaque))
+    @test helper_calls[] == calls
+end
 end

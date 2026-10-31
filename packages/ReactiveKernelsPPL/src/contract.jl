@@ -7466,6 +7466,24 @@ function _uncached_module_data_names(plan::StructuralPlan, raw::AbstractSet{Symb
         foreach(gather_indices, ex.args)
     end
     foreach(gather_indices, values(nodes))
+    # A visible kernel's plate domain needs the same bind-time data facts
+    # as an explicit gather index. Otherwise its data-only producer would
+    # be deferred to preparation, too late for output-axis analysis.
+    function kernel_domains(ex)
+        ex isa Expr || return
+        if ex.head === :call && !isempty(ex.args)
+            f = ReactiveKernels._metadata_callable(ex.args[1], @__MODULE__, keys(nodes))
+            args = ex.args[2:end]
+            if f isa KernelSpec && length(args) == length(inputs(f)) &&
+                    !any(a -> a isa Expr && a.head in (:parameters, :kw, :...), args)
+                for i in ReactiveKernels._kernel_plate_domain_inputs(f)
+                    union!(axes, _expr_value_symbols(args[i]))
+                end
+            end
+        end
+        foreach(kernel_domains, ex.args)
+    end
+    foreach(kernel_domains, values(nodes))
     for p in plan.array_parameters, dim in p.dims
         g = _level_pool_source(dim)
         g === nothing || push!(axes, g)
