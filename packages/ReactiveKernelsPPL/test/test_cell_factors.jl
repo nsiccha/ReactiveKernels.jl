@@ -72,6 +72,21 @@ _cf_data(n = 6) = (; g = collect(1:n), x = sin.(collect(1:n)),
 _cf_unit(i, n) = Float64[j == i for j in 1:n]
 _cf_flat(x::Tuple) = vcat(x...)
 
+# A consumer-owned point that records actual scalar reads. Passing it through
+# the public query must not copy/traverse the entire packed vector.
+struct _CFReadPoint <: AbstractVector{Float64}
+    data::Vector{Float64}
+    reads::Vector{Int}
+end
+Base.size(u::_CFReadPoint) = size(u.data)
+Base.IndexStyle(::Type{_CFReadPoint}) = IndexLinear()
+Base.getindex(u::_CFReadPoint, i::Int) = (push!(u.reads, i); u.data[i])
+
+function _cf_support(fp, u, args...)
+    reads = Base.invokelatest(fp, u, args...).unconstrained
+    reads === :whole ? collect(eachindex(u)) : reads
+end
+
 const _CF_SHARED = @rkppl begin
     b ~ Normal(0, 1)
     z[levels(g)] .~ Normal.(0, 1)
@@ -152,30 +167,41 @@ end
         names = string.(coordinate_names(built.layout))
         b = u[findfirst(==("b"), names)]
         sigma = exp(u[findfirst(==("sigma"), names)])
+        bi, si = findfirst(==("b"), names), findfirst(==("sigma"), names)
         eta = [b * data.x[r] + u[findfirst(==("z.$(data.g[r])"), names)]
                for r in eachindex(data.x)]
         # Primal queries use the same factor graphs as derivative preparation.
         sums = Vector{Vector{Float64}}()
         for j in 1:2
-            spec, want = ReactiveKernelsPPL._cell_factor_spec(f, j)
-            k = prepare(spec; have = (ReactiveKernelsPPL._query_have(bound)...,
-                :_ppl_cell, :_ppl_cell_term), want,
-                bound = ReactiveKernelsPPL._query_bound(bound))
+            k = prepare_cell_factor_query(f, j)
+            @test k isa CellFactorQuery
+            fp = partition_footprint_kernel(k.kernel)
+            for c in 1:3, (t, row) in enumerate(reduction_rows(f, j, c))
+                point = _CFReadPoint(u, Int[])
+                @test k(point, c, t) ≈ k(u, c, t)
+                expected = sort([bi, findfirst(==("z.$(data.g[row])"), names)])
+                @test sort(unique(point.reads)) == expected
+                @test _cf_support(fp, u, c, t) == expected
+            end
             push!(sums, [sum((k(u, c, t) for t in eachindex(reduction_rows(f, j, c)));
                             init = 0.0) for c in 1:3])
             @test_throws BoundsError k(u, 3, 1)
         end
-        spec, want = ReactiveKernelsPPL._cell_factor_spec(f, :outer)
-        outer = prepare(spec; have = (ReactiveKernelsPPL._query_have(bound)...,
-            :_ppl_cell, :_ppl_cell_sums), want,
-            bound = ReactiveKernelsPPL._query_bound(bound))
+        outer = prepare_cell_factor_query(f, :outer)
+        ofp = partition_footprint_kernel(outer.kernel)
         for c in 1:3
             scale = model === _CF_ROW_SCALE ? sigma * (1 + abs(data.y[c])) : sigma
             expected = logpdf(Normal(log1p(sum(exp.(eta[data.r1[c]]))) +
                                      sum(abs2, eta[data.r2[c]]), scale), data.y[c])
-            @test outer(u, c, [s[c] for s in sums]) ≈ expected
+            @test outer(u, [s[c] for s in sums], c) ≈ expected
+            point = _CFReadPoint(u, Int[])
+            @test outer(point, [s[c] for s in sums], c) ≈ expected
+            @test sort(unique(point.reads)) == [si]
+            @test _cf_support(ofp, u, [s[c] for s in sums], c) == [si]
             @test whole[c] ≈ expected
         end
+        @test_throws ContractValidationError outer(u, Float64[], 1)
+        @test_throws ContractValidationError prepare_cell_factor_query(f, 0)
     end
 end
 
@@ -193,12 +219,9 @@ end
     built = build_kernel(bound)
     f = prepare_cell_factors(built, bound, :y; locality = :error)
     @test isempty(cell_reductions(f))
-    spec, want = ReactiveKernelsPPL._cell_factor_spec(f, :outer)
-    outer = prepare(spec; have = (ReactiveKernelsPPL._query_have(bound)...,
-        :_ppl_cell, :_ppl_cell_sums), want,
-        bound = ReactiveKernelsPPL._query_bound(bound))
+    outer = prepare_cell_factor_query(f, :outer)
     u = [0.2, -0.3]
-    values = [outer(u, c, Float64[]) for c in eachindex(y)]
+    values = [outer(u, Float64[], c) for c in eachindex(y)]
     @test values ≈ prepare_query(built, bound, :pointwise)(u).y
     @test values ≈ [logpdf(Normal(u[1] * x[c] + sum(abs2, x), exp(u[2])), y[c])
                     for c in eachindex(y)]
@@ -215,19 +238,13 @@ end
         @test length(cell_reductions(f)) == count
         u = zeros(built.layout.total)
         sums = map(1:count) do j
-            spec, want = ReactiveKernelsPPL._cell_factor_spec(f, j)
-            k = prepare(spec; have = (ReactiveKernelsPPL._query_have(bound)...,
-                :_ppl_cell, :_ppl_cell_term), want,
-                bound = ReactiveKernelsPPL._query_bound(bound))
+            k = prepare_cell_factor_query(f, j)
             sum((k(u, 1, t) for t in eachindex(reduction_rows(f, j, 1))); init = 0.0)
         end
-        spec, want = ReactiveKernelsPPL._cell_factor_spec(f, :outer)
-        outer = prepare(spec; have = (ReactiveKernelsPPL._query_have(bound)...,
-            :_ppl_cell, :_ppl_cell_sums), want,
-            bound = ReactiveKernelsPPL._query_bound(bound))
-        @test outer(u, 1, sums) ≈ getproperty(full, observation)[1]
+        outer = prepare_cell_factor_query(f, :outer)
+        @test outer(u, sums, 1) ≈ getproperty(full, observation)[1]
         mean = observation === :y2 ? 0.0 : Float64(length(data.r1[1]))
-        @test outer(u, 1, sums) ≈ logpdf(Normal(mean, 1), data.y[1])
+        @test outer(u, sums, 1) ≈ logpdf(Normal(mean, 1), data.y[1])
     end
 end
 
@@ -241,10 +258,18 @@ end
         names = string.(coordinate_names(built.layout))
         bi = findfirst(==("b"), names)
         si = findfirst(==("sigma"), names)
-        selection(row) = sort([bi, findfirst(==("z.$(data.g[row])"), names)])
+        # Discover each selection through the public value query, exactly as
+        # a consumer must before any compact derivative operator exists.
+        term_values = [prepare_cell_factor_query(f, j) for j in 1:2]
+        term_footprints = [partition_footprint_kernel(q.kernel) for q in term_values]
+        selection(j, c, t) = _cf_support(term_footprints[j], u, c, t)
+        outer_value = prepare_cell_factor_query(f, :outer)
+        outer_footprint = partition_footprint_kernel(outer_value.kernel)
+        oi = _cf_support(outer_footprint, u, zeros(2), 1)
+        @test oi == [si]
         units = ntuple(i -> _cf_unit(i, 2), 2)
         term_ops = map(1:2) do j
-            indices = selection(first(reduction_rows(f, j, 1)))
+            indices = selection(j, 1, 1)
             (prepare_cell_factor_ad(prepare_ad, f, j, u, indices, _CF_REVERSE),
              prepare_cell_factor_ad(prepare_ad_hvp, f, j, u, indices, _CF_SECOND, units),
              prepare_cell_factor_ad(prepare_ad_third, f, j, u, indices, _CF_THIRD, (v[indices],)))
@@ -253,10 +278,10 @@ end
             e = _cf_unit(i, 3)
             (e[1:2], e[3:3])
         end
-        outer_g = prepare_cell_factor_ad(prepare_ad, f, :outer, u, [si], _CF_REVERSE)
-        outer_h = prepare_cell_factor_ad(prepare_ad_hvp, f, :outer, u, [si],
+        outer_g = prepare_cell_factor_ad(prepare_ad, f, :outer, u, oi, _CF_REVERSE)
+        outer_h = prepare_cell_factor_ad(prepare_ad_hvp, f, :outer, u, oi,
                                         _CF_SECOND, outer_units)
-        outer_t = prepare_cell_factor_ad(prepare_ad_third, f, :outer, u, [si],
+        outer_t = prepare_cell_factor_ad(prepare_ad_third, f, :outer, u, oi,
                                         _CF_THIRD, ((zeros(2), zeros(1)),))
         allindices = collect(1:n)
         full_units = ntuple(i -> _cf_unit(i, n), n)
@@ -272,7 +297,7 @@ end
             for j in 1:2
                 tg, th, tt = term_ops[j]
                 for (t, row) in enumerate(reduction_rows(f, j, c))
-                    indices = selection(row)
+                    indices = selection(j, c, t)
                     point = (u, u[indices], indices, c, t)
                     value, gradient = ad_value_and_gradient(tg, point...)
                     _, columns = ad_gradient_and_hvp(th, units, point...)
@@ -283,7 +308,7 @@ end
                     Ts[j][indices] .+= third
                 end
             end
-            point = (u, sums, u[[si]], [si], c)
+            point = (u, sums, u[oi], oi, c)
             value, gout = ad_value_and_gradient(outer_g, point...)
             _, columns = ad_gradient_and_hvp(outer_h, outer_units, point...)
             gF, HF = _cf_flat(gout), hcat(_cf_flat.(columns)...)
@@ -313,12 +338,15 @@ end
         f = prepare_cell_factors(built, bound, :y; locality = :error)
         @test isempty(cell_reductions(f))
         u, indices = [0.2, -0.3], [1, 2]
+        value_query = prepare_cell_factor_query(f, :outer)
+        @test _cf_support(partition_footprint_kernel(value_query.kernel), u, Float64[], 2) == indices
         q = prepare_cell_factor_ad(prepare_ad, f, :outer, u, indices, _CF_REVERSE)
         whole = prepare_compact_cell_ad(prepare_ad, built, bound, :y, u, indices, _CF_REVERSE)
         value, (sums_gradient, gradient) = ad_value_and_gradient(q, u, Float64[], u, indices, 2)
         expected_value, expected_gradient = ad_value_and_gradient(whole, u, u, indices, 2)
         @test isempty(sums_gradient)
         @test value ≈ expected_value
+        @test value_query(u, Float64[], 2) ≈ expected_value
         @test gradient ≈ expected_gradient
 
         data = merge(_cf_data(), (; r1 = [Int[], [1, 2], Int[]], r2 = [Int[], [1], Int[]]))
@@ -351,11 +379,31 @@ end
             termcall() = ad_gradient_hvp_and_third(term, ([0.2, -0.3],), u, ta, ti, 1, 1)
             outercall() = ad_gradient_hvp_and_third(outer, (([0.2, -0.3], [0.1]),),
                                                   u, sums, oa, oi, 1)
-            (; term = merge(_cf_cost(termcall), (; nodes = _cf_nodes(code_expr(term.prepared.kernel)))),
+            tq, oq = prepare_cell_factor_query(f, 1), prepare_cell_factor_query(f, :outer)
+            tfp, ofp = partition_footprint_kernel(tq.kernel), partition_footprint_kernel(oq.kernel)
+            point = _CFReadPoint(u, Int[])
+            @test tq(point, 1, 1) ≈ tq(u, 1, 1)
+            @test sort(unique(point.reads)) == ti
+            @test length(point.reads) <= 8
+            empty!(point.reads)
+            @test oq(point, sums, 1) ≈ oq(u, sums, 1)
+            @test sort(unique(point.reads)) == oi
+            @test length(point.reads) <= 4
+            @test _cf_support(tfp, u, 1, 1) == ti
+            @test _cf_support(ofp, u, sums, 1) == oi
+            (; term_value = merge(_cf_cost(() -> tq(u, 1, 1)),
+                                 (; nodes = _cf_nodes(code_expr(tq.kernel)))),
+               outer_value = merge(_cf_cost(() -> oq(u, sums, 1)),
+                                   (; nodes = _cf_nodes(code_expr(oq.kernel)))),
+               term_footprint = merge(_cf_cost(() -> _cf_support(tfp, u, 1, 1)),
+                                      (; nodes = _cf_nodes(code_expr(tfp)))),
+               outer_footprint = merge(_cf_cost(() -> _cf_support(ofp, u, sums, 1)),
+                                       (; nodes = _cf_nodes(code_expr(ofp)))),
+               term = merge(_cf_cost(termcall), (; nodes = _cf_nodes(code_expr(term.prepared.kernel)))),
                outer = merge(_cf_cost(outercall), (; nodes = _cf_nodes(code_expr(outer.prepared.kernel)))))
         end
         @info "factored cell cost (32 vs 4096 rows and latent coordinates)" costs
-        for name in (:term, :outer)
+        for name in (:term, :outer, :term_value, :outer_value, :term_footprint, :outer_footprint)
             small, large = getproperty(costs[1], name), getproperty(costs[2], name)
             @test large.bytes <= small.bytes + 4096
             @test large.ns < 8small.ns

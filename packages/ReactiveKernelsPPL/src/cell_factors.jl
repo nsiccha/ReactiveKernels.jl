@@ -10,7 +10,9 @@ remain in the outer computation.
 When several operands gather different arrays, labels come from the first
 gather; each term still reads all operands at its corresponding position.
 
-Use [`prepare_cell_factor_ad`](@ref) for the outer density (`:outer`) or one
+Use [`prepare_cell_factor_query`](@ref) for values and packed-coordinate
+footprints before selecting coordinates for [`prepare_cell_factor_ad`](@ref).
+Both prepare the outer density (`:outer`) or one
 summand (reduction index `j`). With no sums the outer is the ordinary cell.
 The outer's sum inputs are independent values: their dependence on the packed
 point is supplied by the summand operators and the chain rule.
@@ -88,6 +90,60 @@ function _cell_factor_spec(f::CellFactors, factor)
     end
     spec, want
 end
+
+"""
+    prepare_cell_factor_query(f::CellFactors, factor) -> CellFactorQuery
+
+Prepare a scalar value query for the outer density (`factor = :outer`) or
+one summand (`factor = j`), without AD or a compact coordinate selection.
+Call the outer as `q(u, sums, cell)` and a summand as `q(u, cell, term)`.
+`sums` follows `cell_reductions(f)`; `term` is a position in
+`reduction_rows(f, j, cell)`, not a row label. Empty reductions have no
+summand calls. With no reductions, pass an empty sum vector to the outer.
+
+An `AbstractVector{Float64}` packed point is passed through without copying,
+so a recording vector can observe the reads made by that evaluation.
+Recording observes only the executed path. For a structural footprint,
+including both arms of retained branches, prepare
+`fp = ReactiveKernels.partition_footprint_kernel(q.kernel)` once and call
+`Base.invokelatest(fp, args...).unconstrained` with the same arguments as `q`.
+The result is sorted unique packed indices, or `:whole`; the latter means
+`collect(eachindex(u))`. Structural footprints may be conservative, as for
+`prepare_cell_query`. The outer footprint treats the supplied sums as
+independent and therefore contains only its direct packed-coordinate reads.
+
+Use these footprints to select compact coordinates for
+[`prepare_cell_factor_ad`](@ref). The public `kernel` property also supports
+RK's `code_expr` and `partition_locality` inspection. Other real-valued packed
+vectors are converted to `Vector{Float64}`, as for `CellQuery`.
+"""
+function prepare_cell_factor_query(f::CellFactors, factor)
+    spec, want = _cell_factor_spec(f, factor)
+    outer = factor === :outer
+    have = outer ? (_query_have(f.plan)..., :_ppl_cell_sums, _CELL_PORT) :
+                   (_query_have(f.plan)..., _CELL_PORT, :_ppl_cell_term)
+    kernel = Base.invokelatest(prepare, spec; have, want,
+        bound = _query_bound(f.plan), on_error = f.on_error)
+    CellFactorQuery(kernel, outer, length(f.reductions))
+end
+
+"Scalar outer or summand query; construct with [`prepare_cell_factor_query`](@ref)."
+struct CellFactorQuery{K}
+    kernel::K
+    outer::Bool
+    nsums::Int
+end
+
+function (q::CellFactorQuery)(u::AbstractVector{Float64}, a, b)
+    if q.outer
+        a isa AbstractVector{Float64} || throw(ContractValidationError(
+            "[query] an outer factor expects a Float64 sum vector and a cell"))
+        length(a) == q.nsums || throw(ContractValidationError(
+            "[query] expected $(q.nsums) sum values, got $(length(a))"))
+    end
+    Base.invokelatest(q.kernel, u, a, b)::Float64
+end
+(q::CellFactorQuery)(u::AbstractVector{<:Real}, a, b) = q(Vector{Float64}(u), a, b)
 
 """
     prepare_cell_factor_ad(prepare_operator, f, factor, base0, indices0, backend, exemplars...;

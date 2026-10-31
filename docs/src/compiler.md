@@ -1110,6 +1110,20 @@ inline, assigned to a local, or computed in an earlier plate whose output the
 observation reads. `cell_reductions(f)` gives their names in graph order and
 `reduction_rows(f, j, cell)` their row labels in term order.
 
+Before choosing compact coordinates, prepare scalar value queries with
+`outer = prepare_cell_factor_query(f, :outer)` and
+`term = prepare_cell_factor_query(f, j)`. Call `outer(u, sums, cell)` or
+`term(u, cell, term_position)`. The packed `AbstractVector{Float64}` is
+passed through without copying, so a recording vector observes that call's
+reads. For a structural read set including both arms of retained branches,
+prepare `fp = partition_footprint_kernel(term.kernel)` and call
+`Base.invokelatest(fp, u, cell, term_position).unconstrained`. The same
+operation on `outer.kernel` takes `u, sums, cell` and finds its direct packed
+reads, with the sums treated as independent inputs. A footprint is sorted
+unique packed indices or `:whole` (all indices); it may be conservative, as
+for other cell queries. Prepare these queries and footprint kernels once,
+then vary the cell and term. Value-only factor queries require RKPPL 0.1.26.
+
 `prepare_cell_factor_ad(prepare_operator, f, :outer, base, indices, backend,
 exemplars...)` prepares the density over independent sum values and selected
 direct packed coordinates. Its active point, directions and derivatives are

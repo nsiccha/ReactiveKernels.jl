@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.26
+
+- `prepare_cell_factor_query(f, :outer)` and
+  `prepare_cell_factor_query(f, j)` return scalar `CellFactorQuery` objects
+  for the outer density and one summand, before compact AD indices are
+  known. Call `outer(u, sums, cell)` or `term(u, cell, term_position)`.
+  Recording `AbstractVector{Float64}` points pass through without copying;
+  the public `kernel` supports RK's structural footprint API for discovering
+  each factor's packed-coordinate selection, including retained branches.
+  This completes the value/support preparation path for the sum-factored
+  derivatives added in 0.1.25.
+
 ## 0.1.25
 
 - `prepare_cell_factors(built, plan, observation)`, `cell_reductions` and
