@@ -262,4 +262,58 @@ end
         @test counts[1] == counts[2]
     end
 end
+
+@testset "whole-event arrays compose after lifting scalar operands" begin
+    model = quote
+        w ~ Uniform(0, 1)
+        p ~ Uniform(0, 1)
+        c ~ Uniform(0, 1)
+        @plate for i in eachindex(events)
+            present = p .+ (c - p) .* offsets[i]
+            events[i] ~ LogDensity(bernoulli_product_mixture_logdensity,
+                hcat(present, absent), [w, 1 - w])
+        end
+    end
+    function oracle(events, offsets, absent, u)
+        probabilities = 1 ./ (1 .+ exp.(-u))
+        w, p, c = probabilities
+        likelihood = sum(eachindex(events); init=0.0) do i
+            law = MixtureModel([
+                product_distribution(Bernoulli.(p .+ (c - p) .* offsets[i])),
+                product_distribution(Bernoulli.(absent))], [w, 1 - w])
+            logpdf(law, Int.(events[i]))
+        end
+        likelihood + sum(log.(probabilities) .+ log1p.(-probabilities))
+    end
+    for width in (2, 5)
+        counts = map((3, 60)) do n
+            events = [Bool[isodd(i + j) && i % 3 != 0 for j in 1:width] for i in 1:n]
+            offsets = [Float64[isodd(i * j) for j in 1:width] for i in 1:n]
+            absent = zeros(width)
+            data = (; events, offsets, absent)
+            bound = bind_data(lower_rkppl(model, data; mod=@__MODULE__,
+                conditioned=(:events,)), data)
+            built = build_kernel(bound)
+            u = [0.2, -0.3, 0.4]
+            sampler = prepare_sampler(built, bound, u;
+                backend=DI.AutoEnzyme(; mode=Enzyme.Reverse))
+            g = similar(u)
+            value, _ = sampler_value_and_gradient!(sampler, g, u)
+            @test value ≈ oracle(events, offsets, absent, u) rtol=1e-12
+            step = 1e-6
+            for j in eachindex(u)
+                plus, minus = copy(u), copy(u)
+                plus[j] += step
+                minus[j] -= step
+                target = (oracle(events, offsets, absent, plus) -
+                    oracle(events, offsets, absent, minus)) / (2step)
+                @test g[j] ≈ target rtol=2e-6 atol=2e-7
+            end
+            sampler(u)
+            ((@allocations sampler(u)),
+                (@allocations sampler_value_and_gradient!(sampler, g, u)))
+        end
+        @test counts[1] == counts[2]
+    end
+end
 end
