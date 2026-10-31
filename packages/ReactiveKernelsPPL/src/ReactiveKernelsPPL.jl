@@ -88,6 +88,8 @@ export prepare_cell_factors, CellFactors, cell_reductions, reduction_rows,
 export prepare_predictive, PredictiveQuery, PredictiveLaws, predictive_laws, predictive_draws!,
     predictive_draws, predictive_node, predictive_targets
 export restore_draws
+export prepare_smc, smc, initialize_smc, update_smc, smc_step, smc_checkpoint, resume_smc
+export SMCReference, SMCOptions
 export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
 export RKPPLModel, RKPPLBoundModel, RKPPLSubmodel, lower_rkppl, condition, @rkppl, SurfaceLoweringError
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
@@ -111,6 +113,7 @@ include("arrays.jl")
 include("query.jl")
 include("cell_factors.jl")
 include("predictive.jl")
+include("smc.jl")
 include("jax.jl")
 include("display.jl")
 include("distribution_defaults.jl")

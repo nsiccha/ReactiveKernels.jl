@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.34
+
+- Add optional SequentialMonteCarlo/WarmupHMC integration: `prepare_smc`,
+  `initialize_smc`, `smc`, `smc_step`, `update_smc`, `smc_checkpoint` and
+  `resume_smc`. Adaptive bridges start from a scored normalized diagonal
+  Gaussian reference or a previous posterior for cumulative data. Fixed NUTS
+  moves preserve the target; priors and coordinate Jacobians occur once.
+  Explicit RNG state, stage checkpoints, bounded diagnostics and ancestry
+  use linear-size storage. This first implementation runs particles serially
+  and replays complete data histories after parameter changes.
+
 ## 0.1.33
 
 - Require ReactiveKernels 0.1.39 for local direct reads in sum-factored
