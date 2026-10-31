@@ -799,6 +799,42 @@ end
 # with a typed loop instead (`_native_mul`).
 ReactiveKernels._native_mul_operand(::_CompactCellPoint) = true
 
+# The overlay's rows are its active vector at the rows' slots: a partition
+# reads only its footprint, so every row it reads has a slot, and a plan with
+# the label's slot map computes those slots once per label (RK
+# `_cell_lazy_rows`); the body then reads a plain view of the active vector,
+# no slot load and branch per element.
+function ReactiveKernels._cell_lazy_rows(::typeof(_compact_cell_point), inputs, rows, bind,
+                                         constant)
+    # Only where the slot map is constant per label (a partition, which reads
+    # its footprint only); a cell sampler's selection varies per call and may
+    # leave rows to the base.
+    constant(inputs[3]) || return nothing
+    slots = bind(:cell_positions,
+                 Expr(:call, GlobalRef(@__MODULE__, :_overlay_slots), inputs[3], rows))
+    Expr(:call, GlobalRef(ReactiveKernels, :_cell_source_rows), inputs[2], slots)
+end
+function _overlay_slots(slots::AbstractVector{Int32}, rows::AbstractVector{<:Integer})
+    out = Vector{Int}(undef, length(rows))
+    for (k, row) in enumerate(rows)
+        slot = slots[row]
+        iszero(slot) && _overlay_outside(rows, slots)
+        out[k] = Int(slot)
+    end
+    out
+end
+function _overlay_slots(slots::AbstractVector{Int32}, row::Integer)
+    slot = slots[row]
+    iszero(slot) && _overlay_outside(row:row, slots)
+    Int(slot)
+end
+@noinline function _overlay_outside(rows, slots)
+    outside = Int[row for row in rows if iszero(slots[row])]
+    throw(ContractValidationError("[query] a partition reads $(length(outside)) packed " *
+        "coordinate(s) outside its footprint: a block's rows $(length(rows)) long over " *
+        "$(extrema(rows)), outside from $(first(outside)) to $(last(outside))"))
+end
+
 function _check_compact_cell_lengths(base, active, indices, total)
     length(base) == total || throw(ContractValidationError(
         "[query] packed base length $(length(base)) ≠ layout total $total"))
@@ -1150,8 +1186,10 @@ const _PLAN_PORT = :_ppl_partition_plan
 # `partition_plan_kernel`), and the type of those plans, which declares the
 # plan port of the partition kernel to prepare.
 function _partition_plans(planner, labels, args...)
-    plans = Dict{Any,Any}(label => Base.invokelatest(planner, args..., label, nothing)
-                          for label in labels)
+    _partition_plans_each(label -> Base.invokelatest(planner, args..., label, nothing), labels)
+end
+function _partition_plans_each(plan_of, labels)
+    plans = Dict{Any,Any}(label => plan_of(label) for label in labels)
     types = unique!(Any[typeof(plan) for plan in values(plans)])
     length(types) == 1 || throw(ContractValidationError(
         "[query] the partition plans have several types: $(join(types, ", "))"))
@@ -1180,7 +1218,8 @@ end
 # Each observation's cell plate partitioned by its key, and their sum: the
 # plates of `_cell_query_spec`, through RK's `plate_partition`.
 function _partition_query_spec(built, plan::StructuralPlan, names, keys_by_name;
-                               locality, partitioned = (), plan_type = Any)
+                               locality, partitioned = (), plan_type = Any,
+                               plan_constant = ())
     locality in (nothing, :error, :warn, :ignore) || throw(ContractValidationError(
         "[query] locality must be :error, :warn, :ignore or nothing; got $(repr(locality))"))
     def = hasproperty(built, :program) ? built.program : kernel_expr(plan, built.layout)
@@ -1216,7 +1255,8 @@ function _partition_query_spec(built, plan::StructuralPlan, names, keys_by_name;
     spec = try
         plate_partition(built.spec, plates; by = keys_by_plate, index = _PARTITION_PORT,
                         name = _PARTITION_TOTAL, locality, partitioned,
-                        plan = plan_type === Any ? _PLAN_PORT : _PLAN_PORT => plan_type)
+                        plan = plan_type === Any ? _PLAN_PORT : _PLAN_PORT => plan_type,
+                        plan_constant)
     catch err
         err isa ArgumentError || rethrow()
         throw(ContractValidationError("[query] the observations have no partitionable " *
@@ -1484,16 +1524,24 @@ function prepare_partition_sampler(built, plan::StructuralPlan, observations,
     selected = copy(selections[first(labels)])
     slots = _compact_cell_slots(layout.total, selected)
     active = exemplar[selected]
+    # The slot map is constant per label, so the plan reads the active
+    # vector's slots of every row once per label (`_cell_lazy_rows`): each
+    # label's plan is computed with its own slot map.
     spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality,
-                                       partitioned = rule)
+                                       partitioned = rule, plan_constant = (:_ppl_cell_slots,))
     have = (_compact_overlay!(spec, plan)..., _PARTITION_PORT, _PLAN_PORT)
     planner = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(ReactiveKernels.partition_plan_kernel, spec; have, want,
                           bound = _query_bound(plan), on_error)
     end
-    plans, plan_type = _partition_plans(planner, labels, exemplar, active, slots)
+    plans, plan_type = _partition_plans_each(labels) do label
+        selection = selections[label]
+        Base.invokelatest(planner, exemplar, exemplar[selection],
+                          _compact_cell_slots(layout.total, selection), label, nothing)
+    end
     spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality,
-                                       partitioned = rule, plan_type)
+                                       partitioned = rule, plan_type,
+                                       plan_constant = (:_ppl_cell_slots,))
     _compact_overlay!(spec, plan)
     compact_kernel = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)

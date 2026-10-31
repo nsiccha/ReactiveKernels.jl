@@ -23,7 +23,10 @@ are recorded in the git history only.
   `partition_plan`) is computed once at preparation (`PartitionQuery.plans`,
   `PartitionSampler.plans`) and passed to every evaluation and gradient, so a
   call recomputes no row bookkeeping and gathers no bound data at the
-  label's rows (design blocks included). On registered Enzyme (0.13.216) the
+  label's rows (design blocks included); the compact sampler reads a packed
+  block's rows from its active vector at slots computed once per label, not
+  through the overlay's per-element slot load and branch. On registered
+  Enzyme (0.13.216) the
   gradient of a planned partition needs runtime activity
   (`AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`): the
   plan's row vectors meet the active vector in the body's views, which

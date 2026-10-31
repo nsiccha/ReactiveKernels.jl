@@ -1162,8 +1162,14 @@ port that cannot be typed is refused naming the remedy, never silently
 dropped. `partition_plan_kernel(kernel)` returns the plan kernel of a prepared
 partition; `partition_plan` keeps one per kernel for the process. Native
 Enzyme Reverse differentiates a planned partition with runtime activity on
-registered Enzyme (the plan's constant row vectors meet the active vector in
-the body's views, which static activity analysis refuses).
+registered Enzyme 0.13.216 (the plan's constant row vectors meet the active
+vector in the body's views, which its static activity analysis refuses; the
+Enzyme dogfood line from `1280e6ee` differentiates it as is). `plan_constant`
+names HAVE ports whose values are constant per label (not data for the plan),
+and a lazy view of inputs may serve its rows from its parts
+(`_cell_lazy_rows(op, inputs, rows)`, the op's own method returning the
+expression): ReactiveKernelsPPL's compact overlay reads its active vector at
+the slots of a block's rows, computed once per label.
 
 A partition's windows hold their rows sorted and unique, the union of what
 their readers ask for, and a read finds its row by bisection: a partition of

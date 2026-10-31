@@ -33,9 +33,16 @@ are recorded in the git history only.
   checked shapes) and label-constant data (a data column's rows, a design
   block's rows and their `hcat`), computed once per label; never a value
   computed from an unbound port, its alias, or a type the body computes, and
-  never a value the body writes into. On registered Enzyme a planned
-  partition's gradient needs runtime activity (the plan's constant vectors
-  meet the active vector in the body's views).
+  never a value the body writes into. On registered Enzyme (0.13.216) a
+  planned partition's gradient needs runtime activity (the plan's constant
+  vectors meet the active vector in the body's views; Enzyme snag
+  `plan-const-int-r-4671f4a7`); the Enzyme dogfood line from `1280e6ee`
+  differentiates it under plain Reverse.
+- A lazy view of inputs serves its rows from its parts (`_cell_lazy_rows`, an
+  op's own method), and `plate_partition(…; plan_constant)` names HAVE ports
+  whose values are constant per label, which the plan may read: RKPPL's
+  compact overlay reads its active vector at the slots of a block's rows,
+  computed once per label, instead of a slot load and a branch per element.
 - A partition's windows carry the positions of a gather index's entries,
   computed apart from the gather (once per label with a plan); row takes are
   a positions step and a view.

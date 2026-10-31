@@ -443,7 +443,8 @@ port of `spec` to partition several specs at the same label.
 function plate_partition(spec::KernelSpec, plates; by,
                          index::Symbol = :partition, name::Symbol = :partition_total,
                          locality::Union{Nothing,Symbol} = :error, partitioned = (),
-                         plan::Union{Nothing,Symbol,Pair{Symbol,<:Type}} = nothing)
+                         plan::Union{Nothing,Symbol,Pair{Symbol,<:Type}} = nothing,
+                         plan_constant::Tuple{Vararg{Symbol}} = ())
     locality in (nothing, :error, :warn, :ignore) || throw(ArgumentError(
         "plate_partition: locality must be :error, :warn, :ignore or nothing; got $(repr(locality))"))
     plan_port, plan_type = plan isa Pair ? (first(plan), last(plan)) : (plan, Any)
@@ -517,7 +518,8 @@ function plate_partition(spec::KernelSpec, plates; by,
         total = length(names) == 1 ? _kernel_declare!(copied, ports, order, name, T) :
             value!(copied, Symbol(:_partition_, plate), T)
         _add_recipe!(copied, (lanes, recipe.inputs...), (total,),
-                     _AuthoredPlateCellOp(recipe.op, locality, true, rule, plan_port), recipe.cost,
+                     _AuthoredPlateCellOp(recipe.op, locality, true, rule, plan_port,
+                                          plan_constant), recipe.cost,
                      nothing, false, recipe.source)
         push!(totals, total)
     end
@@ -1086,7 +1088,10 @@ function _partition_plan_lowering(p::Plan, body::Expr, argexprs, runtime_ops, nm
     # The label port is the input of the label check (`_PartitionLabel`); it
     # varies per call but names the plan, so it is not data.
     labels = Set{Symbol}(nm(r.inputs[1]) for r in p.recipes if r.op isa _PartitionLabel)
-    data = Symbol[nm(v) for v in p.have if !(nm(v) in labels) && v.name !== port]
+    # A port whose value is constant per label (`plan_constant`) is not data.
+    constant = p.recipes[cell].op.plan_constant
+    data = Symbol[nm(v) for v in p.have
+                  if !(nm(v) in labels) && v.name !== port && !(v.name in constant)]
     split = _partition_plan_split(body, data, runtime_ops)
     split === nothing && return nothing
     plan, main, needed, fields = split
