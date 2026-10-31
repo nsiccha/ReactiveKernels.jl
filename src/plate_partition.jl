@@ -680,14 +680,17 @@ const _FOOTPRINT_LOCK = ReentrantLock()
     partition_footprint(kernel::PreparedKernel, args...) -> NamedTuple
 
 The positions of each HAVE port of `kernel` that evaluating it with `args`
-(its HAVE arguments, in order: for a partition, the label last) reads:
+(its HAVE arguments, in order, including a plan port when present) reads:
 `port => Vector{Int}` of linear positions (sorted, unique), or `:whole` when
 the evaluation reads the port whole (a scalar port, a port read by a value
 computed whole). The positions follow from the bound index data and the
-label by the same row analysis that computes the partition: a lazy branch
-contributes both arms, a bound-indexed read its constant positions. For a
-partition of a packed parameter vector this is its exact coordinate set, the
-support of its gradient (`ReactiveKernelsPPL.partition_footprint`).
+label or cell index by the same row analysis that computes the evaluation:
+a lazy branch contributes both arms, a bound-indexed read its constant
+positions. For a partition or cell of a packed parameter vector this is its structural read
+set, a conservative support for its gradient; numerical zeros and
+cancellations do not remove positions. This also works on a `plate_cell`
+kernel, with its cell index among `args`. For a planned partition, pass
+`nothing` in the plan port: footprint lowering computes its own bookkeeping.
 """
 function partition_footprint(kernel::PreparedKernel, args...)
     footprint = lock(_FOOTPRINT_LOCK) do
@@ -701,8 +704,9 @@ end
 
 The kernel [`partition_footprint`](@ref) evaluates: called with `kernel`'s HAVE
 arguments, it returns their footprint. `partition_footprint` prepares and keeps
-one per kernel for the process; a caller evaluating many labels prepares it
-once here and holds it itself.
+one per kernel for the process; a caller evaluating many labels or cells
+prepares it once here and holds it itself. Call a freshly prepared kernel
+through `Base.invokelatest` when crossing Julia's world-age boundary.
 """
 function partition_footprint_kernel(kernel::PreparedKernel)
     p = _lowering_plan(kernel.plan)
@@ -773,8 +777,8 @@ end
 
 Check the separability rule of the partition in `kernel`
 (`plate_partition`'s `partitioned`) for the evaluation with `args` (the HAVE
-arguments, the label last): every position the partition reads of a
-partitioned port carries its own label or `missing`. Returns the footprint
+arguments in order, including a plan port when present): every position read
+of a partitioned port carries its own label or `missing`. Returns the footprint
 ([`partition_footprint`](@ref)); throws [`PartitionSeparabilityError`](@ref)
 naming the port and the other partitions' positions otherwise. A kernel with
 no partition, or one with no rule, passes.
