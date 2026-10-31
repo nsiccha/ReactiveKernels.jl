@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.31
+
+- Authored source companions infer and execute when ReactiveKernels loads
+  from source or a consumer prepares and warms a kernel during package
+  precompilation on Julia 1.12+. The precompile wrapper type is defined before
+  the source-call generator, and the generator reads a consumer's constant
+  expression-cache binding as compiler metadata even when that binding is
+  newer than its definition world. Strict type-stability checks remain
+  enabled, and the generated numerical body is unchanged.
+
 ## 0.1.30
 
 - Strict plate cells and partitions accept vector-valued products with an

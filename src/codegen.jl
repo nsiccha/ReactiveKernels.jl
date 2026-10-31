@@ -6190,10 +6190,6 @@ function _native_parameter_names(original, qualified)
     restore(qualified)
 end
 
-struct _PrecompileWarmFunction{F} <: Function
-    f::F
-end
-
 # Whether the generated method of the generated function `f` is visible in the
 # caller's world: `Core._hasmethod` on the complete signature, a constant
 # inference folds (as for a native source closure, `src/core.jl`). It is not
