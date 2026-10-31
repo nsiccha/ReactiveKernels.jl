@@ -3,7 +3,8 @@
 # vararg tail. On Julia 1.10.12, registered Enzyme 0.13.216 passes; dogfood
 # 3a89b497 with libEnzyme 782c9d95 raises EnzymeInternalError in
 # runtime_generic_fwd during Reverse over Forward. First-order Reverse and
-# Julia inference pass. Enzyme snag compute-an-ordin-902b6418 tracks repair.
+# Julia inference pass. Enzyme snag compute-an-ordin-902b6418 repaired this
+# in dogfood 0e251cfb with the same libEnzyme build.
 using Enzyme
 using Test
 
