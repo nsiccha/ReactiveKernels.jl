@@ -1233,6 +1233,13 @@ and a lazy view of inputs may serve its rows from its parts
 expression): ReactiveKernelsPPL's compact overlay reads its active vector at
 the slots of a block's rows, computed once per label.
 
+On the BRM `4e53855` nested-panel fixture (42,768 rows, 12 regions), ordinary
+Reverse with Enzyme `a6458e9c` / libEnzyme `782c9d95` on Julia 1.10.12 gave
+2.55 ms per compact partition, 3.47 ms dense, and 8.84 ms for BRM's unit
+path. The whole sweep took 13.8 ms: compact cost 2.22× its per-region share,
+above the 1.5× optimization target. These are interleaved minima over 15
+rounds on gordito with one Julia thread; they describe this workload.
+
 A partition's windows hold their rows sorted and unique, the union of what
 their readers ask for, and a read finds its row by bisection: a partition of
 r cells reading a value row by row costs O(r log r), never O(r²), and a value

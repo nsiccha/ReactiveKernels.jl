@@ -24,11 +24,15 @@ are recorded in the git history only.
   map, not through the overlay's per-element slot load and branch; a
   partition reading a packed coordinate outside its footprint is refused by
   name at preparation. Requires ReactiveKernels 0.1.36.
-- The earlier 2.04× sweep-share measurement used runtime activity and does
-  not establish ordinary-Reverse acceptance. Grouped compact partitions on
-  Julia 1.10 require Enzyme dogfood from `a6458e9c`, whose constant-field
-  analysis repairs the remaining `EnzymeRuntimeActivityError` after
-  `1280e6ee`. The partition tests exercise ordinary Reverse.
+- Grouped compact partitions on Julia 1.10 use ordinary Enzyme Reverse with
+  dogfood `a6458e9c` (constant-field repairs after `1280e6ee`). On the BRM
+  `4e53855` nested panel (42,768 rows, 12 regions), compact evaluation and
+  gradient take 2.55 ms versus 3.47 ms dense and 8.84 ms for BRM's unit path;
+  the whole sweep's per-unit share is 1.15 ms (compact 2.22×). These are
+  interleaved minima over 15 rounds on gordito, Julia 1.10.12, one Julia
+  thread, libEnzyme `782c9d95`; values and gradients pass independent checks.
+  The 1.5× target remains unmet. The earlier 2.04× measurement used runtime
+  activity and is not comparable ordinary-Reverse acceptance evidence.
 
 
 ## 0.1.29
