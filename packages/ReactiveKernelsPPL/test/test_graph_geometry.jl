@@ -248,6 +248,43 @@ ReactiveKernelsPPL.sampling_logdensity(::OpaqueVector,w) = -sum(abs2,w)/2
     @test length(small.built.spec.graph.recipes) == length(large.built.spec.graph.recipes)
 end
 
+struct SplatVector{D}
+    data::D
+end
+ReactiveKernelsPPL.sampling_geometry(::Type{SplatVector},args,shape) =
+    ParameterGeometry(shape, 3; support=:real, constrain=identity_coordinates,
+        unconstrain=identity_coordinates, logjac=zero_jacobian)
+ReactiveKernelsPPL.sampling_logdensity(::SplatVector,w) = -sum(abs2,w)/2
+geometry_keywords(rate) = (;rate)
+
+@testset "splatted calls preserve numerical endpoint lowering" begin
+    data = (;last=[1,2,3],y=[0.1,0.2,0.3],rate=1.7)
+    u = [0.1,-0.2,0.3]
+    for rhs in (:(SplatVector((last,)...)), :(ShiftVector(last,0.2;geometry_keywords(rate)...)))
+        bound = bind_data(lower_rkppl(quote
+            w[1:3] ~ $rhs
+            y .~ Normal.(w,1)
+        end,data;mod=@__MODULE__,conditioned=(:y,)),data)
+        built = build_kernel(bound)
+        nonlinear = rhs.args[1] === :ShiftVector
+        w = nonlinear ? 0.2 .+ exp.(u)./data.rate : u
+        jac = nonlinear ? sum(u)-length(u)*log(data.rate) : 0.0
+        expected = -sum(abs2,w)/2+jac+sum(-log(2pi)/2 .- (data.y .- w).^2 ./ 2)
+        source = kernel_expr(bound,built.layout)
+        @test !occursin("_sampling_graph_endpoint",string(source))
+        @test prepare_query(built,bound,:sampler)(u) ≈ expected
+        replay = ReactiveKernelsPPL._eval_kernel_def(
+            Meta.parse(string(Base.remove_linenums!(source))))
+        @test prepare_query((;spec=replay,layout=built.layout),bound,:sampler)(u) ≈ expected
+        if nonlinear
+            nt = constrain(built.layout,u)
+            @test nt.w ≈ w
+            @test unconstrain(built.layout,nt) ≈ u
+            @test logjac(built.layout,u) ≈ jac
+        end
+    end
+end
+
 @testset "graph endpoints in scalar and joint cells" begin
     for n in (0,3)
         data = (;parents=fill(0.2,n), y=fill(0.4,n))

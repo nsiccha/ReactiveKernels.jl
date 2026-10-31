@@ -375,6 +375,7 @@ end
 function _sampling_graph_call(g, edge, geometry_expr, arguments, keywords)
     endpoint = getproperty(g, edge)
     endpoint isa _SamplingGraphEndpoint || return nothing
+    any(a -> Meta.isexpr(a, :...), arguments) && return nothing
     spec = endpoint.graph
     ordered = Any[arguments...]
     signature = spec.call_signature
