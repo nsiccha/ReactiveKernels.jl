@@ -68,6 +68,32 @@ end
 
 _metadata_call(f, args; kwargs) = OutputSignatures.infer_call(f, args; kwargs)
 
+# Inputs whose values determine an authored plate's iteration domain. This
+# is a graph dependency query, not a numerical inference rule: opaque calls
+# on a path to a domain keep all their inputs, and no recipe is executed.
+# PPL uses it to stage data-only domain definitions with other bind-time
+# shape dependencies, before asking for the kernel's output metadata.
+function _kernel_plate_domain_inputs(spec::KernelSpec)
+    _kernel_inline_signature_supported(spec.call_signature) || return Int[]
+    p = plan(spec)
+    cid(v) = canon_id(p.graph, v.id)
+    needed = Set{ValueId}()
+    for r in p.recipes
+        r.op isa _AuthoredPlateOp || continue
+        atomic = typeof(r.op).parameters[2]
+        for (i, v) in enumerate(r.inputs)
+            i in atomic || push!(needed, cid(v))
+        end
+    end
+    # Recipes are topologically ordered; one reverse pass follows every
+    # domain dependency, including a domain computed inside the kernel.
+    for r in Iterators.reverse(p.recipes)
+        any(v -> cid(v) in needed, r.outputs) || continue
+        union!(needed, (cid(v) for v in r.inputs))
+    end
+    return Int[i for (i, v) in enumerate(p.have) if cid(v) in needed]
+end
+
 # A KernelSpec is already a visible graph, not an opaque Julia helper. Carry
 # facts through its selected recipes without executing any of them. Partial
 # facts deliberately remain :unknown: axes alone do not certify a numerical

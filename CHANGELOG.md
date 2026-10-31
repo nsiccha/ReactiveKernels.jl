@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.37
+
+- Track which visible `KernelSpec` inputs determine authored-plate domains,
+  including domains computed by earlier graph recipes. RKPPL can bind their
+  data-only definitions before output-shape analysis. Dependency analysis
+  executes no recipes, and authored plate loops remain runtime loops.
+
 ## 0.1.36
 
 - A plan holds every value computed from the bound data and the label alone:
