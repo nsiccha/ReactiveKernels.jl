@@ -738,6 +738,122 @@ Base.isequal(a::_PlateAnalysisKey, b::_PlateAnalysisKey) =
     a.recipe == b.recipe && a.inputs == b.inputs && isequal(a.types, b.types) &&
     isequal(a.refused, b.refused)
 
+# Expose a nested cell's shared, data-only scalar work to the enclosing
+# plate's binding pass. The nested loop itself stays in the residual. Every
+# lifted recipe is speculative: even a strict inner recipe may belong to an
+# empty inner domain, and a branch-arm recipe may never be reached. A failed
+# bind-time evaluation therefore restores it beneath its original guards.
+function _partial_nested_shared_recipes(inner::Plan, bound, bound_types,
+                                        excluded, readable, refused)
+    speculative = Dict{Int,Any}()
+    any(r -> r.op isa _AuthoredPlateOp, inner.recipes) || return inner, speculative
+    g = inner.graph
+    dataonly, types = copy(bound), copy(bound_types)
+    recipes = Recipe[]
+    copied = nothing
+    next_id = Ref(minimum((r.id for r in inner.recipes); init=0) - 1)
+    fresh() = (id = next_id[]; next_id[] -= 1; id)
+    for r in inner.recipes
+        if !(r.id in excluded) && all(v -> canon_id(g, v.id) in dataonly, r.inputs)
+            cid = canon_id(g, only(r.outputs).id)
+            push!(dataonly, cid)
+            types[cid] = Base.promote_op(r.op,
+                (get(types, canon_id(g, v.id), Any) for v in r.inputs)...)
+        end
+        nested = r.op isa _AuthoredPlateOp ?
+            _partial_nested_shared_recipe(g, r, dataonly, types, refused) : nothing
+        if nested === nothing
+            push!(recipes, r)
+            continue
+        end
+        copied === nothing && (copied = Graph(copy(g.values), copy(g.recipes),
+            copy(g.producers), copy(g.aliases), g.version))
+        ng = nested.inner.graph
+        available = Dict(canon_id(ng, v.id) => input
+            for (v, input) in zip(nested.inner.have, r.inputs))
+        for q in nested.selected
+            output = only(q.outputs)
+            value = value!(copied, Symbol(only(r.outputs).name, :_shared_, output.name),
+                           valtype(output))
+            part = Recipe(fresh(), Tuple(available[canon_id(ng, v.id)] for v in q.inputs),
+                (value,), q.op, q.cost, nothing, false, q.source)
+            push!(recipes, part)
+            readable[part.id] = part
+            speculative[part.id] = nested.keys[q.id]
+            available[canon_id(ng, output.id)] = value
+            push!(dataonly, value.id)
+            types[value.id] = nested.types[canon_id(ng, output.id)]
+        end
+        scalar = _partial_subplan(nested.inner,
+            vcat(nested.inner.have, nested.frontier), nested.inner.want, nested.residual)
+        kernel = _prepare(scalar, _lower_with_ops(scalar; inline_embedded=false)...)
+        kernel = _prepared_kernel(kernel.f, kernel.constants, kernel.callables,
+            kernel.inputs, kernel.outputs, kernel.plan, kernel.ast,
+            Tuple(get(nested.readable, q.id, q) for q in nested.residual))
+        atomic = Tuple([typeof(r.op).parameters[2]...;
+            (length(r.inputs) + 1):(length(r.inputs) + length(nested.frontier))])
+        op = _AuthoredPlateOp{typeof(kernel),atomic}(kernel, r.op.axis_checks)
+        inputs = (r.inputs..., (available[canon_id(ng, v.id)] for v in nested.frontier)...)
+        push!(recipes, Recipe(r.id, inputs, r.outputs, op, r.cost, nothing,
+            r.effectful, r.source))
+    end
+    copied === nothing && return inner, speculative
+    template = Plan(copied, inner.have, inner.want, inner.recipes, inner.producer,
+        inner.cost, inner.candidates)
+    _partial_subplan(template, inner.have, inner.want, recipes), speculative
+end
+
+function _partial_nested_shared_recipe(g, r, dataonly, outer_types, refused)
+    op = r.op
+    original = op.kernel.plan
+    length(original.have) == length(r.inputs) || return nothing
+    excluded = _partial_plate_excluded(original)
+    excluded === nothing && return nothing
+    atomic = typeof(op).parameters[2]
+    bound = Set{ValueId}()
+    types = Dict{ValueId,Any}()
+    for (i, (input, v)) in enumerate(zip(r.inputs, original.have))
+        cid = canon_id(g, input.id)
+        cid in dataonly || continue
+        T = get(outer_types, cid, valtype(input))
+        (i in atomic || T <: Number) || continue
+        nid = canon_id(original.graph, v.id)
+        push!(bound, nid)
+        types[nid] = T
+    end
+    isempty(bound) && return nothing
+    prefix_key = (:nested_recipe, r.id)
+    node_key = (:nested_node, r.id)
+    union!(excluded, (q.id for q in original.recipes if (prefix_key..., q.id) in refused))
+    readable = Dict{Int,Any}(q.id => source for (q, source) in
+        zip(original.recipes, op.kernel.lowered_recipes))
+    inner = _partial_split_recipes(original, bound, excluded, readable)
+    union!(excluded, (q.id for q in inner.recipes if (prefix_key..., q.id) in refused))
+    nested_refused = Set(key[3] for key in refused
+        if length(key) == 3 && key[1:2] == node_key)
+    inner, speculative = _partial_speculate_recipes(inner, bound, excluded, readable,
+        nested_refused; bound_guards=true)
+    prefix, residual, owned = _partial_split(inner, bound, excluded)
+    canon_id(inner.graph, only(inner.want).id) in owned && return nothing
+    frontier = filter(v -> !(canon_id(inner.graph, v.id) in bound),
+        _partial_constants(inner, owned, residual))
+    isempty(frontier) && return nothing
+    selected = _partial_frontier_prefix(inner, prefix, frontier)
+    for q in selected
+        types[canon_id(inner.graph, only(q.outputs).id)] = Base.promote_op(q.op,
+            (get(types, canon_id(inner.graph, v.id), Any) for v in q.inputs)...)
+    end
+    # This pass moves scalar arm invariants. Keeping arrays in their existing
+    # cell avoids introducing shared owned storage into a nested result.
+    all(frontier) do v
+        T = types[canon_id(inner.graph, v.id)]
+        T <: Number && isbitstype(T)
+    end || return nothing
+    keys = Dict(q.id => haskey(speculative, q.id) ?
+        (node_key..., speculative[q.id]) : (prefix_key..., q.id) for q in selected)
+    (; inner, selected, residual, frontier, types, readable, keys)
+end
+
 # Everything `_partial_plate_recipe` decides before it evaluates a cell
 # recipe: the split and speculated cell (`inner`, `speculative`, `readable`),
 # the cell recipes run at bind time (`selected`) and their cell types, the
@@ -759,8 +875,11 @@ Base.@nospecializeinfer function _partial_plate_analysis(
     while true
     readable, excluded = copy(original_readable), copy(original_excluded)
     inner = _partial_split_recipes(original, bound, excluded, readable)
+    inner, nested_speculative = _partial_nested_shared_recipes(inner, bound,
+        bound_types, excluded, readable, refused)
     inner, speculative = _partial_speculate_recipes(inner, bound, excluded, readable,
                                                     refused)
+    merge!(speculative, nested_speculative)
     have_ids = Set(canon_id(inner.graph, v.id) for v in inner.have)
     retry_speculation = false
     local residual, frontier, selected, cell_types, want_id
@@ -927,6 +1046,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     arguments = copy(original_arguments)
     inner = analysis.inner
     current = 0
+    retry_nonfinite = false
     try
         for r in analysis.selected
             current = r.id
@@ -941,6 +1061,21 @@ Base.@nospecializeinfer function _partial_plate_recipe(
                 # externalization also supports these.
                 result = similar(batch, analysis.cell_types[cid])
                 arguments[cid] = _partial_cell_values!(result, batch)
+            end
+            # Retain nonfinite floating-point work beneath its original
+            # nested guards: lifting these values can change a finite
+            # inactive-arm derivative to NaN under ordinary reverse. As for
+            # a speculative evaluation that throws, this only declines the
+            # new lift; it does not reject or change the authored arithmetic.
+            key = get(analysis.speculative, current, nothing)
+            if key !== nothing && first(key) in (:nested_recipe, :nested_node) &&
+                    analysis.cell_types[cid] <: Union{AbstractFloat,Complex{<:AbstractFloat}}
+                data = arguments[cid]
+                if !(data isa Ref ? isfinite(data[]) : all(isfinite, data))
+                    push!(refused, key)
+                    retry_nonfinite = true
+                    break
+                end
             end
         end
     catch err
@@ -961,6 +1096,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         fixed_domain && rethrow()
         return nothing
     end
+    retry_nonfinite && continue
     break
     end
     (; excluded, residual, frontier, whole) = analysis

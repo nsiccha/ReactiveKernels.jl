@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.34
+
+- Bound preparation caches shared data-only scalar work from nested plate
+  cells, including pure expressions inside lazy branch arms. A speculative
+  read that throws or produces a nonfinite floating-point value stays under
+  its original loop and branch, so empty groups and inactive invalid inputs
+  keep their values and ordinary derivatives. Both plate loops remain
+  runtime loops, and array results retain their per-evaluation storage.
+
 ## 0.1.33
 
 - Generated programs can compose an authored graph reconstructed by an
