@@ -11,6 +11,16 @@ const _CF_INLINE = @rkppl begin
     end
 end
 
+const _CF_SINGLE = @rkppl begin
+    b ~ Normal(0, 1)
+    z[levels(g)] .~ Normal.(0, 1)
+    sigma ~ Exponential(1)
+    eta = b .+ z[g]
+    @plate for k in eachindex(y)
+        y[k] ~ Normal(sum(exp.(eta[rows[k]])), sigma)
+    end
+end
+
 # Both the packed point and the reduction grow. A warmed factor call must
 # neither traverse all terms nor allocate a shadow of the whole packed point.
 function _cf_cost(call)
@@ -328,6 +338,60 @@ end
             @test hessian ≈ hcat(expected_H...) atol = 2e-9
             @test third ≈ expected_T atol = 2e-8
         end
+    end
+end
+
+@testset "one reduction keeps vector-shaped outer AD exemplars" begin
+    _cf_static() do
+        rows, y = [[1, 2, 2], [3], Int[]], [3.2, -0.4, 0.3]
+        bound = _CF_SINGLE(; g = [1, 2, 3], rows) | (; y)
+        built = build_kernel(bound)
+        f = prepare_cell_factors(built, bound, :y; locality = :error)
+        @test length(cell_reductions(f)) == 1
+        u = collect(range(-0.2, 0.3; length = built.layout.total))
+        si = findfirst(==(:sigma), coordinate_names(built.layout))
+        term = prepare_cell_factor_query(f, 1)
+        outer = prepare_cell_factor_query(f, :outer)
+        indices = _cf_support(partition_footprint_kernel(outer.kernel), u, [0.0], 1)
+        @test indices == [si]
+        units = (([1.0], [0.0]), ([0.0], [1.0]))
+        v = ([0.4], [-0.3])
+        # Exercise both an ordinary exemplar and an empty reduction. The
+        # calls retain the same vector shapes for every cell.
+        for cell0 in (1, 3)
+            g = prepare_cell_factor_ad(prepare_ad, f, :outer, u, indices, _CF_REVERSE; cell0)
+            h = prepare_cell_factor_ad(prepare_ad_hvp, f, :outer, u, indices,
+                                       _CF_SECOND, units; cell0)
+            t = prepare_cell_factor_ad(prepare_ad_third, f, :outer, u, indices,
+                                       _CF_THIRD, (v,); cell0)
+            for c in eachindex(y)
+                s = sum((term(u, c, k) for k in eachindex(reduction_rows(f, 1, c))); init = 0.0)
+                point = (u, [s], u[indices], indices, c)
+                value, gradient = ad_value_and_gradient(g, point...)
+                gh, columns = ad_gradient_and_hvp(h, units, point...)
+                gt, (hv,), (tv,) = ad_gradient_hvp_and_third(t, (v,), point...)
+                d, e = y[c] - s, exp(-2u[si])
+                expected_g = [d * e, -1 + d^2 * e]
+                H = [-e -2d*e; -2d*e -2d^2*e]
+                a, b = only(v[1]), only(v[2])
+                third = [4 * e * a * b + 4 * d * e * b^2,
+                         2 * e * a^2 + 8 * d * e * a * b + 4 * d^2 * e * b^2]
+                @test value ≈ outer(u, [s], c) ≈ logpdf(Normal(s, exp(u[si])), y[c])
+                @test _cf_flat(gradient) ≈ expected_g
+                @test _cf_flat(gh) ≈ expected_g
+                @test _cf_flat(gt) ≈ expected_g
+                @test hcat(_cf_flat.(columns)...) ≈ H
+                @test _cf_flat(hv) ≈ H * _cf_flat(v)
+                @test _cf_flat(tv) ≈ third
+            end
+        end
+        # A sum-only active point still has two vectors, the second empty.
+        sum_only = (([1.0], Float64[]),)
+        h = prepare_cell_factor_ad(prepare_ad_hvp, f, :outer, u, Int[],
+                                   _CF_SECOND, sum_only)
+        gradient, (hv,) = ad_gradient_and_hvp(h, sum_only, u, [3.0], Float64[], Int[], 1)
+        @test isempty(gradient[2]) && isempty(hv[2])
+        @test only(hv[1]) ≈ -exp(-2u[si])
     end
 end
 

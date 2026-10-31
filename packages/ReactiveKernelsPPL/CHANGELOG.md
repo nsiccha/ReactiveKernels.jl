@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.28
+
+- Fix outer `prepare_cell_factor_ad` preparation for exactly one sum.
+  Its active sum exemplar is always a vector, matching the documented
+  `(sums, direct_active)` directions; singleton kernel output unwrapping
+  previously produced a zero-dimensional array and rejected vector HVP
+  and third-order directions before differentiation.
+
 ## 0.1.27
 
 - `ParameterGeometry` accepts function-shaped `@kernel` endpoints in its
