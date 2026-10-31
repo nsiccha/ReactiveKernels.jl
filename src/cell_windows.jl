@@ -106,11 +106,21 @@ end
     firstindex(w.data, 1) + _cell_row_position(w.rows, row, at, w.sorted) - 1
 end
 # The position of `row` among `rows`: by bisection when they are sorted and
-# unique (a partition's: O(log rows) per read, never a scan, so a partition of
-# r cells reading a value row by row costs O(r log r), not O(r²)), else the
-# first match (a cell's few rows).
+# unique, or directly when those rows are contiguous. Otherwise use the
+# first match (a cell's few rows). A partition's lookup is at most O(log rows)
+# per read, never a scan, so r row reads cost at most O(r log r), not O(r²).
 @inline function _cell_row_position(rows::Vector{Int}, row, at, sorted::Bool)
     if sorted
+        # Sorted partition rows are unique, so their span proves contiguity.
+        # Ragged gathers of a contiguous window need only an offset, even
+        # when each gather has its own index vector and no cached positions.
+        if row isa Integer && !isempty(rows)
+            lo, hi = first(rows), last(rows)
+            if hi - lo == length(rows) - 1
+                lo <= row <= hi || throw(BoundsError(rows, at))
+                return Int(row - lo) + 1
+            end
+        end
         k = searchsortedfirst(rows, row)
         (k > length(rows) || @inbounds(rows[k]) != row) && throw(BoundsError(rows, at))
         return k

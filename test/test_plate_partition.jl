@@ -10,6 +10,57 @@ using ReactiveKernels, DifferentiationInterface, Enzyme, Test
 
 _pp_central(f, x; h = 1e-6) = (f(x + h) - f(x - h)) / (2h)
 
+function _pp_window_sum(x, rows, indices, sorted)
+    shape = (Base.OneTo(isempty(rows) ? 0 : maximum(rows)),)
+    window = ReactiveKernels._CellWindow(x, rows, shape, sorted)
+    sum(window[indices])
+end
+
+@testset "partition row lookup preserves window indexing" begin
+    # Contiguous, gapped, empty and extreme rows retain the window's checked
+    # membership semantics. Non-partition windows retain first-match order.
+    for rows in (Int[], [7], [7, 8, 9], [7, 9, 12],
+                 [typemin(Int), typemin(Int) + 1, typemin(Int) + 2],
+                 [typemax(Int) - 2, typemax(Int) - 1, typemax(Int)],
+                 [typemin(Int), typemax(Int)])
+        probes = isempty(rows) ? BigInt[0] :
+            unique([BigInt.(rows); BigInt(first(rows)) - 1; BigInt(last(rows)) + 1])
+        for row in probes
+            expected = findfirst(==(row), rows)
+            if expected === nothing
+                @test_throws BoundsError ReactiveKernels._cell_row_position(rows, row, row, true)
+            else
+                @test ReactiveKernels._cell_row_position(rows, row, row, true) === expected
+                @test ReactiveKernels._cell_row_position(rows, Int(row), row, true) === expected
+            end
+        end
+    end
+    @test_throws BoundsError ReactiveKernels._cell_row_position([7, 9, 12], 8, 8, true)
+    for row in (9, 7, 8)
+        @test ReactiveKernels._cell_row_position([9, 7, 9, 8], row, row, false) ==
+            findfirst(==(row), [9, 7, 9, 8])
+    end
+    @test_throws BoundsError ReactiveKernels._cell_row_position([9, 7, 9, 8], 6, 6, false)
+
+    # Exercise uncached gathers with repeats and reversed order, both with
+    # contiguous windows and the bisection fallback. Native Reverse must
+    # accumulate each repeated read at the same local position as Julia.
+    for n in (0, 1, 7, 37), stride in (1, 2)
+        rows = collect(11:stride:(11 + stride * (n - 1)))
+        indices = [reverse(rows); rows]
+        x = [0.2 + 0.1 * i for i in 1:n]
+        before = copy(rows)
+        expected = [count(==(row), indices) for row in rows]
+        @test _pp_window_sum(x, rows, indices, true) ≈ sum(x .* expected)
+        gradient = zeros(n)
+        Enzyme.autodiff(Enzyme.Reverse, _pp_window_sum, Enzyme.Active,
+            Enzyme.Duplicated(x, gradient), Enzyme.Const(rows),
+            Enzyme.Const(indices), Enzyme.Const(true))
+        @test gradient ≈ expected
+        @test rows == before
+    end
+end
+
 # Rung 1: rows with a subject key, a per-row predictor and a group effect
 # gathered by a group nested in the subject, with the parameters unpacked
 # from a packed vector as RKPPL unpacks them (a scalar, a 10 x 2 block, a
