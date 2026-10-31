@@ -144,14 +144,14 @@ function _cell_array_source(r::Recipe, args)
         return nothing
     f = getfield(op, :f)
     f isa _KernelBranch && (f = getfield(f, :call))
-    f = _kernel_native_source(f)
-    f isa Function && fieldcount(typeof(f)) == 0 || return nothing
-    params = _closure_parameter_names(f, length(args))
+    length(args) == length(r.inputs) || return nothing
+    params = _lane_source_params(f, r)
     params === nothing && return nothing
-    source = _lane_expand_dot(_lane_strip_lines(r.source), parentmodule(typeof(f)))
+    mod = _kernel_endpoint_source_module(op)
+    source = _lane_expand_dot(_lane_strip_lines(r.source), mod)
     source === nothing && return nothing
-    native = _kernel_native_body(source, parentmodule(typeof(f)), Set{Symbol}(params))
-    ctx = _LaneSourceContext(parentmodule(typeof(f)), Dict{Symbol,Any}(zip(params, args)))
+    native = _kernel_native_body(source, mod, Set{Symbol}(params))
+    ctx = _LaneSourceContext(mod, Dict{Symbol,Any}(zip(params, args)))
     _cell_array_source_node(ctx, native)
 end
 function _cell_array_source_node(ctx, x)
@@ -169,7 +169,12 @@ function _cell_array_expand_call(rhs, recipes)
     # (`inline_sources.jl`): both name the recipe whose source is read.
     if rhs.head === :call
         slot = _callable_slot(rhs.args[1])
-        slot === nothing && return rhs
+        if slot === nothing
+            # A call by name (`_const_call_ref`): an identity alias is its argument.
+            rhs.args[1] == GlobalRef(Base, :identity) && length(rhs.args) == 2 &&
+                return rhs.args[2]
+            return rhs
+        end
         args = rhs.args[2:end]
     else
         inlined = _inline_statement_call(rhs)

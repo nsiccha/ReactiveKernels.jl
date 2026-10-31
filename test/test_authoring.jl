@@ -197,9 +197,9 @@ end
 
         operation = first(kernel_graph(captured).recipes).op
         source_function = operation.f
-        @test source_function.runtime_f !== nothing
+        @test source_function.companion !== nothing
         @test ReactiveKernels.RuntimeGeneratedFunctions.generated_callfunc(
-            source_function.runtime_f, source_function.captures, 4,
+            source_function.companion, source_function.captures, 4,
         ) == 11
     end
 

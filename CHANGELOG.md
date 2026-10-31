@@ -16,6 +16,46 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.29
+
+- An authored recipe's operation carries its source as a record instead of a
+  closure (stage 3 of the operation-table migration, decision `0dgfkf5`).
+  `_KernelSource` holds what runs: the captured values, the source compiled
+  once as a runtime-generated function over them (its type carries the
+  canonical source's id; the record's type the authored parameter names), or the native
+  closure for a source Julia must own (a local function, a generator, an
+  exception scope, a boxed capture). The recipe's operation (`_KernelSourceOp`)
+  keeps the definition token, the form and the authoring module as values, not
+  type parameters, and a prepared kernel's callables table holds the record,
+  never the operation, so one program's fresh builds share one kernel type
+  without execution copies: `_KernelSourceFunction`, `_ExecutableSourceFunction`,
+  `src/execution_sources.jl`, the guarded and latest-world call modes and the
+  per-process executable table are gone. A source's captured values sit in the
+  constants table at its recipe's position and a capture reads as
+  `getfield(__constants__[k], :c)`, so an inlined recipe's record leaves the
+  callables table and a captured array crosses native AD as a hidden operand
+  like bound data. `prepare_sampler`'s
+  latest-world preparation and `_kernel_eval_definition`'s
+  `latest_world_native_sources` are accepted and do nothing: a record is
+  callable from any world. The record's call splices the companion's body
+  itself, so a source embedding other sources (a plate cell calling an
+  endpoint) nests one method over distinct record types, which inference
+  treats as well founded; values, gradients, plans and recipes are unchanged.
+- An exact call of a function or type bound `const` in its module is written
+  by name in the generated body (`w = Base.sin(z)`, `n = Base.length(v)`), so
+  the statement names exactly what runs and such an operation leaves the
+  callables table; a kernel of inline sources and exact calls has an empty
+  table. The nonallocating and derivative-rule lowerings, which key on the
+  table, keep every call in it as before. A scan's hoisted step statements
+  are found by their output locals, whatever their shape. A lazy branch at
+  the top level runs its whole source in the body too (`c ? a : b` as an
+  `if`); a plate cell's branch keeps its metadata at its position for the
+  lane lowerings.
+- A plate cell of one value that computes nothing only its sibling values
+  read prepares again: 0.1.28 gave the cell a plan port (`plate_partition(…;
+  plan)`) and the drop of its unread operands rebuilt the cell without that
+  field (`_AuthoredPlateCellDraft` with four arguments), a `MethodError` at
+  `prepare` (`test_plate_cell.jl`, RKPPL `test_cell_query.jl`).
 ## 0.1.28
 
 - `plate_partition(…; plan = port)` / `plan = port => T`: a plan port holding

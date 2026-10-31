@@ -537,13 +537,11 @@ function _decompose_fused_recipe!(prog::_StepProgram, r::Recipe, callargs,
                                   input_types, lhs)
     op = r.op
     kernel_sourceop_form(op) === :fused || return nothing
-    source_f = _kernel_native_source(getfield(op, :f))
-    fieldcount(typeof(source_f)) == 0 || return nothing # capturing closure
-    # The source reads its inputs by the closure's parameter names, not by the
-    # input values' names (`_lane_source_params`).
-    params = _lane_source_params(source_f, length(r.inputs))
+    # The source reads its inputs by its parameter names, not by the input
+    # values' names (`_lane_source_params`); a capturing source keeps its step.
+    params = _lane_source_params(getfield(op, :f), r)
     params === nothing && return nothing
-    ctx = _FusedDecomposition(parentmodule(typeof(source_f)),
+    ctx = _FusedDecomposition(_kernel_endpoint_source_module(op),
                               _lane_source_arguments(params, callargs),
                               _lane_source_arguments(params, input_types),
                               Any[], Any[], Any[], length(prog.ops),
@@ -748,7 +746,7 @@ function _nonalloc_step!(prog::_StepProgram, r::Recipe, i::Int,
     argtypes = _nonalloc_argument_types(types, callargs)
     T = _static_type(op, argtypes...)
     if !r.effectful
-        if op isa _KernelSourceOp && !(r.source isa _NoKernelSource)
+        if r.op isa _KernelSourceOp && !(r.source isa _NoKernelSource)
             dec = _decompose_fused_recipe!(prog, r, callargs, argtypes, lhs)
             if dec !== nothing
                 types[lhs] = dec[2]
@@ -756,7 +754,7 @@ function _nonalloc_step!(prog::_StepProgram, r::Recipe, i::Int,
             end
         end
         isconcretetype(T) && isbitstype(T) && return Any[stmt]
-        !(op isa _KernelSourceOp) && _nonalloc_is_lazy(op) && return Any[stmt]
+        !(r.op isa _KernelSourceOp) && _nonalloc_is_lazy(op) && return Any[stmt]
     end
     slot_type = T isa Type && isconcretetype(T) ? T : valtype(only(r.outputs))
     slot = _nonalloc_destination(prog.cache_apply, op, slot_type, argtypes) ?

@@ -182,25 +182,27 @@ struct _TypeOperation{T} end
 _type_operation_type(::_TypeOperation{T}) where {T} = T
 
 """
-    _KernelSourceOp{DefToken,Form,F,IG,CI}
+    _KernelSourceOp{F,IG,CI}
 
 An immutable wrapper marking a recipe operation SYNTHESIZED from captured `@kernel` source as
 COMPILER-OWNED provenance (RK 07:21). Authoring wraps ONLY the anonymous-closure path of
 `_kernel_operation` in this; a bare exact identity (`cholesky`/`+`/…) stays raw and is identity/domain
-validated (`_kernel_source_op_callee` lists the Base callees that stay wrapped). `DefToken` is a
+validated (`_kernel_source_op_callee` lists the Base callees that stay wrapped). `token` is a
 definition-unique gensym baked in at graph build — NOT a security boundary (an internal
-constructor/type parameter cannot prevent deliberate internal misuse); it is trusted only because the
+constructor cannot prevent deliberate internal misuse); it is trusted only because the
 supported authoring path is the ONLY thing that wraps a closure, so an arbitrary public Graph closure is
-never auto-wrapped. Graph operations retain distinct concrete types. A prepared
-execution copy (`_execution_source`) has `DefToken === nothing`: its plan and
-lowered recipes keep the original operation and its token, so provenance does
-not specialize an otherwise identical executable, and the differentiated
-callable holds no provenance value. No mutable registry is needed.
-`Form` (RK 07:24)
+never auto-wrapped. The token and the form are values, not type parameters (RK 0.1.27): the
+operation's type is its source's, so every build of one program shares one executable type
+and a prepared kernel holds the plan's operations themselves, with no execution copy.
+`form` (RK 07:24)
 distinguishes a `:portcall` — a call THROUGH A PORT, `callable(args…)`, whose first input is the callable
 source and the rest are ordered args — from a general `:fused` expression, so a prepared handle can
 self-derive the DESTINATION contract (a port-call with one owned buffer + one owned scalar output →
 `f(dest, args…)::scalar`) from source SHAPE + typed slot roles, never from a name/Recipe id/inspection.
+`f` is the source record (`_KernelSource`) or the metadata around one (`_KernelBranch`,
+`_KernelSplit`, `_KernelReduction`); `mod` the module the source's names resolve in
+(`nothing` for an operation built without one). A prepared kernel's callables table holds
+`f`, never this wrapper: the record is executable state, the wrapper is provenance.
 `IG` holds the captured source's throw-stripped twin, selected only by an
 explicit `on_error = :ignore` preparation; older internal fixtures use `nothing`.
 `CI` retains the callable and lowering mode of an exact positional call through
@@ -209,10 +211,13 @@ equating separately authored fused expressions or changing their definition toke
 The call forwards INLINE. A RAW anonymous closure inserted into a Graph carries no wrapper and is
 rejected as opaque when captured into a prepared handle.
 """
-struct _KernelSourceOp{DefToken,Form,F,IG,CI}
+struct _KernelSourceOp{F,IG,CI}
+    token::Symbol
+    form::Symbol
     f::F
     ignored_throws::IG
     call_identity::CI
+    mod::Any
 end
 
 # Every authored recipe creates source operations of new concrete types, and
@@ -222,10 +227,11 @@ end
 Base.@nospecializeinfer function _KernelSourceOp(
         @nospecialize(token::Val), @nospecialize(form::Val),
         @nospecialize(f),
-        @nospecialize(ignored_throws = nothing), @nospecialize(call_identity = nothing))
-    T = _KernelSourceOp{_val_parameter(token), _val_parameter(form),
-                        typeof(f), typeof(ignored_throws), typeof(call_identity)}
-    _kernel_new_instance(T, (f, ignored_throws, call_identity))::_KernelSourceOp
+        @nospecialize(ignored_throws = nothing), @nospecialize(call_identity = nothing),
+        @nospecialize(mod = nothing))
+    T = _KernelSourceOp{typeof(f), typeof(ignored_throws), typeof(call_identity)}
+    _kernel_new_instance(T, (_val_parameter(token)::Symbol, _val_parameter(form)::Symbol,
+                             f, ignored_throws, call_identity, mod))::_KernelSourceOp
 end
 
 Base.@nospecializeinfer _val_parameter(@nospecialize(value::Val)) =
@@ -249,80 +255,144 @@ end
 Base.@nospecializeinfer function _KernelSourceOp(
         @nospecialize(token::Val), @nospecialize(form::Val), @nospecialize(f),
         @nospecialize(ignored_throws), @nospecialize(call_identity),
-        @nospecialize(capture_name), @nospecialize(resolved_callable))
+        @nospecialize(capture_name), @nospecialize(resolved_callable), @nospecialize(mod))
     if call_identity !== nothing &&
        (first(call_identity) !== resolved_callable ||
         (capture_name !== nothing &&
-         capture_name in fieldnames(typeof(_kernel_native_source(f)))))
+         capture_name in _source_capture_names(f)))
         call_identity = nothing
     end
-    _KernelSourceOp(token, form, f, ignored_throws, call_identity)
+    _KernelSourceOp(token, form, f, ignored_throws, call_identity, mod)
 end
 
-# A runtime authoring expression can create a source method newer than its
-# caller's world. Keep ordinary, inlineable closure execution whenever that
-# method is visible. A generated body carries explicit lexical captures for
-# immediate execution of newly composed expressions, including ordinary AD.
-# Bodies with Julia's local function/macro/exception scopes keep native lowering.
-# The call mode is a type parameter so switching it never replaces the real
-# captures needed by the runtime fallback and source display.
-struct _KernelSourceFunction{F,RF,C,M} <: Function
-    f::F
-    runtime_f::RF
+# An authored source's executable record (RK 0.1.27, stage 3 of the
+# operation-table migration): what runs, as data. `captures` are the values
+# the source closed over (a `NamedTuple`, empty when none). `companion` is the
+# source compiled as a runtime-generated function over `(captures, params...)`,
+# callable from any later world without a method query; its type carries the
+# canonical source's id and the authored parameter names, so every build of
+# one program shares it and the compiled code behind it, and the names are
+# read from the type. `native` is the closure Julia itself lowered, kept only
+# for a source Julia must own (a local function, a generator or
+# comprehension, an exception scope, a shared `Core.Box` cell): such a record
+# has no companion and calls the closure, with a latest-world fallback where
+# its method is not yet visible.
+#
+# The record holds executable state only: no token, parameter-name or module
+# value. The token and the module live on the recipe's operation
+# (`_KernelSourceOp`), which the plan and `lowered_recipes` keep; the
+# parameter names are read from the companion's type (its argument names
+# after the captures environment, a gensym among them in `_canonical_locals`'
+# spelling, so two builds of one source have one type). The callables table
+# of a prepared kernel holds the record, so a capture-free table is free of
+# heap references that Enzyme would otherwise have to prove read-only
+# (b259aa13f: such fields cost the Imperial COVID model's gradients 446 → 762
+# allocations per call and 5 → 25 minutes of compile time).
+struct _KernelSource{C,R,N} <: Function
     captures::C
+    companion::R
+    native::N
 end
-_KernelSourceFunction(f::F, runtime_f::RF, captures::C) where {F,RF,C} =
-    _KernelSourceFunction{F,RF,C,Val{:guarded}}(f, runtime_f, captures)
 
 # One instance for every source type (`@nospecialize`, `getfield`): lowering
-# reads these for every recipe of a program (`_source_parameter_names`).
-Base.@nospecializeinfer _kernel_native_source(@nospecialize(f)) = f
-Base.@nospecializeinfer _kernel_native_source(@nospecialize(f::_KernelSourceFunction)) = getfield(f, :f)
+# reads these for every recipe of a program.
+Base.@nospecializeinfer _source_record(@nospecialize(f)) = nothing
+Base.@nospecializeinfer _source_record(@nospecialize(f::_KernelSource)) = f
+Base.@nospecializeinfer _source_captures(@nospecialize(f::_KernelSource)) = getfield(f, :captures)
+# The native closure of a source Julia owns, else `nothing`.
+Base.@nospecializeinfer _source_native(@nospecialize(f::_KernelSource)) = getfield(f, :native)
+# The source's parameter names when it takes `n`, else `nothing`: the
+# companion's argument names after its captures environment (its type; a
+# gensym parameter in `_canonical_locals`' spelling, `##name#k`), or the
+# native closure's method. `_spelled_parameter_name` maps a name to the
+# spelling of the recipe's source.
+Base.@nospecializeinfer function _source_params(@nospecialize(f::_KernelSource), n)
+    native = getfield(f, :native)
+    native === nothing || return _closure_parameter_names(native, n)
+    companion = _native_generated_function(getfield(f, :companion))
+    names = (typeof(companion)::DataType).parameters[1]
+    names isa Tuple && length(names) == n + 1 || return nothing
+    Symbol[names[2:end]...]
+end
+# The captured names of the source behind `f` (a record, or metadata whose
+# call is one); none for any other callable.
+Base.@nospecializeinfer function _source_capture_names(@nospecialize(f))
+    record = _source_record(f)
+    record === nothing ? () : keys(getfield(record, :captures))
+end
+
+# Defined before the generated call below: a generator runs in the world of
+# its definition and sees no later method.
+# The companion's body over the captures and the arguments, as
+# `RuntimeGeneratedFunctions.generated_callfunc` splices it, so the call is
+# this record method and not that generated function's: a source embedding
+# other sources (a plate cell calling an endpoint) nests calls of one method
+# over distinct record types, which `_mark_source_call_recursion!` tells
+# inference is well founded, where nested `generated_callfunc` frames over
+# distinct generated-function types hit Julia's recursion limit and infer
+# `Any` (the atlas model's branch cells and a cell query's gathered cell lost
+# their concrete types). `nothing` when the body is not in the cache.
+function _companion_call_body(@nospecialize(R), forwarded)
+    R isa DataType && R <: _PrecompileWarmFunction && (R = R.parameters[1])
+    R isa DataType && R <: RuntimeGeneratedFunctions.RuntimeGeneratedFunction || return nothing
+    argnames, cache_tag, _, id = R.parameters[1:4]
+    body = RuntimeGeneratedFunctions._lookup_body(cache_tag, id)
+    body === nothing && return nothing
+    argnames isa Tuple && length(argnames) == length(forwarded) + 1 || return nothing
+    # Every argument is read before any parameter is bound: a parameter may
+    # be named like this method's own `f` or `args`. Qualify the helper too:
+    # an authored parameter named `getfield` is local throughout this body.
+    temporaries = [gensym(:argument) for _ in forwarded]
+    environment = gensym(:captures)
+    setup = Any[Expr(:(=), environment,
+                     Expr(:call, GlobalRef(Core, :getfield), :f, QuoteNode(:captures)))]
+    append!(setup, (Expr(:(=), temporary, arg) for (temporary, arg) in zip(temporaries, forwarded)))
+    push!(setup, Expr(:(=), argnames[1], environment))
+    append!(setup, (Expr(:(=), name, temporary)
+                    for (name, temporary) in zip(argnames[2:end], temporaries)))
+    Expr(:block, Expr(:meta, :inline), setup..., body)
+end
 
 # The call is a forwarding shim and is never a call boundary: both generated
 # bodies declare themselves inline. `@inline` on a `@generated` definition does
 # not reach the generated code, and the call-site `@inline` of
-# `_kernel_source_call` did not inline the latest-world shim once the source
-# body was large (a scan step's log-sum-exp). `prepare_sampler` converts every
-# operation to that mode, so such a step became a call per scan step, and
+# `_kernel_source_call` did not inline the shim once the source body was large
+# (a scan step's log-sum-exp): such a step became a call per scan step, and
 # native Enzyme reverse through it cost 2.5–3× the same kernel with the step
 # inlined (HMM forward pass, snag `rkppl-hmm-forwar-89257681`).
-@inline @generated function (f::_KernelSourceFunction{F,RF,C,M})(args::Vararg{Any,N}) where {F,RF,C,M,N}
-    forwarded = [:(getfield(args, $index)) for index in 1:N]
-    M === Val{:latest_world} &&
-        return Expr(:block, Expr(:meta, :inline), :(Base.@inline f.f($(forwarded...))))
-    # The query is `Core._hasmethod` on the complete signature, which inference
-    # folds to a constant in the caller's world on every supported Julia.
-    # `hasmethod(f.f, argtypes)` folds too, but from Julia 1.12 it first
-    # validates its argument tuple type with `Base.to_tuple_type`, a loop over
-    # the signature's parameters that stayed in every call: a plate cell then
-    # walked its argument types once per cell and did not vectorize. The
-    # signature is built in the body, from `f.f`, so that the generator reads
-    # no more of the callable's type than the call mode.
+# The static parameters are named as no source can spell a local: a local of
+# the spliced body may not share a static parameter's name (`R = Z * F'` in a
+# model's cell: "local variable name R conflicts with a static parameter").
+@inline @generated function (f::_KernelSource{var"#C",var"#R",var"#N"})(
+        args::Vararg{Any,var"#K"}) where {var"#C",var"#R",var"#N",var"#K"}
+    forwarded = [Expr(:call, GlobalRef(Core, :getfield), :args, index)
+                 for index in 1:var"#K"]
+    if var"#N" === Nothing
+        spliced = _companion_call_body(var"#R", forwarded)
+        spliced === nothing || return spliced
+        return Expr(:block, Expr(:meta, :inline),
+            :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
+                getfield(f, :companion), getfield(f, :captures), $(forwarded...))))
+    end
+    # A native closure's method may be newer than the caller's world (a
+    # kernel authored at run time). The query is `Core._hasmethod` on the
+    # complete signature, which inference folds to a constant in the caller's
+    # world on every supported Julia; `hasmethod` validates its tuple type in
+    # a loop that stayed in every call from Julia 1.12 on, so a plate cell
+    # walked its argument types once per cell and did not vectorize.
     signature = Expr(:curly, GlobalRef(Core, :Tuple),
-                     :($(GlobalRef(Core, :Typeof))(f.f)), args...)
+                     :($(GlobalRef(Core, :Typeof))(getfield(f, :native))), args...)
     quote
         $(Expr(:meta, :inline))
-        # The type-only query uses the caller's world without boxing active
-        # argument values into a method-lookup array during ordinary AD.
         if Core._hasmethod($signature)
-            Base.@inline f.f($(forwarded...))
+            Base.@inline getfield(f, :native)($(forwarded...))
         else
-            Base.@inline _kernel_runtime_source_call(
-                f.runtime_f, f.f, f.captures, $(forwarded...))
+            Base.@inline _kernel_latest_native_call(getfield(f, :native), $(forwarded...))
         end
     end
 end
 
-@inline @generated function _kernel_runtime_source_call(
-        runtime_f, f, captures, args::Vararg{Any,N}) where {N}
-    forwarded = [:(getfield(args, $index)) for index in 1:N]
-    :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
-        runtime_f, captures, $(forwarded...)))
-end
-
-@inline function _kernel_runtime_source_call(::Nothing, f, captures,
-                                            args::Vararg{Any,N}) where {N}
+@inline function _kernel_latest_native_call(f, args::Vararg{Any,N}) where {N}
     result_type = Core.Compiler.return_type(f, typeof(args))
     Base.invokelatest(f, args...)::(result_type === Union{} ? Any : result_type)
 end
@@ -376,8 +446,24 @@ end
     forwarded = [:(getfield(args, $index)) for index in 1:N]
     :(_kernel_source_call(op, $(forwarded...)))
 end
-kernel_sourceop_token(::_KernelSourceOp{DefToken}) where {DefToken} = DefToken
-kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = Form
+# A deep copy of a plan copies its operations; the authoring module is a
+# global object the copy shares (`deepcopy` refuses a `Module`).
+function Base.deepcopy_internal(op::_KernelSourceOp, stackdict::IdDict)
+    haskey(stackdict, op) && return stackdict[op]
+    copy = _KernelSourceOp(Val(getfield(op, :token)), Val(getfield(op, :form)),
+                           Base.deepcopy_internal(getfield(op, :f), stackdict),
+                           Base.deepcopy_internal(getfield(op, :ignored_throws), stackdict),
+                           Base.deepcopy_internal(getfield(op, :call_identity), stackdict),
+                           getfield(op, :mod))
+    stackdict[op] = copy
+end
+
+# One instance for every operation type: the readers below run for every
+# recipe of a program.
+Base.@nospecializeinfer kernel_sourceop_token(@nospecialize(op::_KernelSourceOp)) =
+    getfield(op, :token)::Symbol
+Base.@nospecializeinfer kernel_sourceop_form(@nospecialize(op::_KernelSourceOp)) =
+    getfield(op, :form)::Symbol
 # The element type of an empty plate is Julia's empty-broadcast type: inferred
 # from the authored native cell over the operands' native element types, with
 # no cell evaluated. `nothing` for any other callable, or when inference gives
@@ -1302,7 +1388,14 @@ Base.@nospecializeinfer function _KernelBranch(
     _kernel_new_instance(T, (call, condition, then_arm, else_arm,
                              then_spec, else_spec))::_KernelBranch
 end
-@inline (branch::_KernelBranch)(args...) = branch.call(args...)
+# Forwarded positionally and inlined (`Vararg{Any,N}` specializes on the
+# count; a merely forwarded `args...` is left unspecialized and boxes the
+# arguments as one tuple): the table holds the branch itself, which the
+# generated body calls directly.
+@inline @generated function (branch::_KernelBranch)(args::Vararg{Any,N}) where {N}
+    forwarded = [:(getfield(args, $index)) for index in 1:N]
+    :(Base.@inline getfield(branch, :call)($(forwarded...)))
+end
 
 """
     _KernelSplit{S}(call, wholes, splits, root)
@@ -1346,9 +1439,9 @@ end
 _kernel_split_spec(::_KernelSplit{S}) where {S} = S
 # Source readers of the whole expression (destination forms, nonallocating
 # decomposition) read the authored closure the split metadata wraps.
-Base.@nospecializeinfer _kernel_native_source(@nospecialize(split::_KernelSplit)) =
-    _kernel_native_source(getfield(split, :call))
-# Forwarded positionally and inlined, as `_KernelSourceFunction` forwards.
+Base.@nospecializeinfer _source_record(@nospecialize(split::_KernelSplit)) =
+    _source_record(getfield(split, :call))
+# Forwarded positionally and inlined, as a source record's call forwards.
 @inline @generated function (split::_KernelSplit)(args::Vararg{Any,N}) where {N}
     forwarded = [:(getfield(args, $index)) for index in 1:N]
     :(Base.@inline split.call($(forwarded...)))
@@ -1385,8 +1478,8 @@ _KernelSplitApply(::Val{P}, split::S) where {P,S} = _KernelSplitApply{P,S}(split
     end
     :(Base.@inline getfield($split, :root)($(map(arg, root[1])...), $(map(node, P)...)))
 end
-Base.@nospecializeinfer _kernel_native_source(@nospecialize(apply::_KernelSplitApply)) =
-    _kernel_native_source(getfield(apply, :split))
+Base.@nospecializeinfer _source_record(@nospecialize(apply::_KernelSplitApply)) =
+    _source_record(getfield(apply, :split))
 
 # One arm of a `_KernelBranchCall`: its operation over the arguments at `I`.
 struct _KernelArm{I,F}
@@ -1513,7 +1606,7 @@ _KernelReduction(::Val{II}, ::Val{XI}, ::Val{KI}, ::Val{AI}, call::F,
 # The same callable again, or one whose type contains its caller's, keeps
 # Julia's default limiting.
 _source_callable_type(@nospecialize(T)) = false
-_source_callable_type(::Type{<:Union{_KernelSourceOp,_KernelSourceFunction,
+_source_callable_type(::Type{<:Union{_KernelSourceOp,_KernelSource,
                                      _KernelBranch,_KernelReduction}}) = true
 
 # The callee a source-call signature runs: its first source-callable parameter
@@ -1558,7 +1651,7 @@ function _mark_source_call_recursion!()
     hasfield(Method, :recursion_relation) || return nothing
     methods_to_mark = Method[
         which(Tuple{_KernelSourceOp,Vararg{Any}}),
-        which(Tuple{_KernelSourceFunction,Vararg{Any}}),
+        which(Tuple{_KernelSource,Vararg{Any}}),
         which(Tuple{_KernelBranch,Vararg{Any}}),
         which(Tuple{_KernelReduction,Vararg{Any}}),
         which(Tuple{_IgnoredThrowFunction,Vararg{Any}}),

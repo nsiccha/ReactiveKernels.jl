@@ -290,20 +290,21 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
     end
     output = only(r.outputs)
     token = kernel_sourceop_token(r.op)
+    mod = _kernel_endpoint_source_module(r.op)
     function emit!(i)
         node = nodes[i]
         value = value!(g, Symbol(output.name, :_part, i), Any)
         part = if dataonly[i] || !holds[i]
             Recipe(fresh(), Tuple(r.inputs[p] for p in node.own), (value,),
                    _KernelSourceOp(Val(Symbol(token, :_part, i)), Val(:fused),
-                                   native.wholes[i]),
+                                   native.wholes[i], nothing, nothing, mod),
                    r.cost, nothing, false, node.expr)
         else
             kids = Value[emit!(k) for k in node.kids]
             Recipe(fresh(), (Tuple(r.inputs[p] for p in node.direct)..., kids...),
                    (value,),
                    _KernelSourceOp(Val(Symbol(token, :_split, i)), Val(:fused),
-                                   native.splits[i]),
+                                   native.splits[i], nothing, nothing, mod),
                    r.cost, nothing, false, node.body)
         end
         push!(recipes, part)
@@ -314,7 +315,7 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
     root = Recipe(r.id, (Tuple(r.inputs[p] for p in split.root.direct)..., kids...),
                   r.outputs,
                   _KernelSourceOp(Val(Symbol(token, :_root)), Val(kernel_sourceop_form(r.op)),
-                                  native.root),
+                                  native.root, nothing, nothing, mod),
                   r.cost, nothing, false, split.root.body)
     push!(recipes, root)
     readable[r.id] = root
@@ -487,7 +488,8 @@ function _partial_speculate_recipes(inner::Plan, bound::Set{ValueId}, excluded::
             part = Recipe(fresh(), Tuple(available[p] for p in node.inputs), (value,),
                           _KernelSourceOp(Val(Symbol(kernel_sourceop_token(r.op), :_arm,
                                                      length(values) + 1)),
-                                          Val(:fused), node.native),
+                                          Val(:fused), node.native, nothing, nothing,
+                                          _kernel_endpoint_source_module(r.op)),
                           r.cost, nothing, false, node.source)
             push!(recipes, part)
             readable[part.id] = part
@@ -574,7 +576,8 @@ function _partial_speculate_recipe(r::Recipe, reads::Vector{Bool}, refused;
     isempty(nodes) && return nothing
     native2 = _partial_rebuild_branch(native, (), plans, count, length(nodes), Tuple(names))
     op = _KernelSourceOp(Val(Symbol(kernel_sourceop_token(r.op), :_speculative)),
-                         Val(kernel_sourceop_form(r.op)), native2)
+                         Val(kernel_sourceop_form(r.op)), native2, nothing, nothing,
+                         _kernel_endpoint_source_module(r.op))
     (; nodes, op, source = _kernel_split_replace(r.source, mapping))
 end
 
@@ -1312,7 +1315,9 @@ Base.@nospecializeinfer function _partition_plate_recipe(
                 arm_f = _LaneAnchored(arm_f)
                 pushfirst!(arm_inputs, anchor)
             end
-            arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form), arm_f)
+            arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form), arm_f,
+                                     nothing, nothing,
+                                     _kernel_endpoint_source_module(branch_recipe.op))
             # The arm recipe's source is its own arm, which a nested branch arm
             # partitions again and a split arm decomposes.
             branch_parts = branch_recipe.source isa Expr ?
@@ -1939,34 +1944,10 @@ function _rebound_table(fixed::Vector{Any}, slots::Vector{Int}, constants::Vecto
     table
 end
 
-# A kept callables table as this process executes it (`_execution_source`),
-# so a rebinding assembles its kernel without executing the whole table
-# again: 0.26 ms per binding of a simulator graph's 365 entries (snag
-# per-binding-resi-990b18ab). A table kept from a binding made in this process
-# is already the execution copy (`_prepared_kernel` made it). One kept while a
-# package image is generated can hold a source function whose compiled
-# companion is visible only once the image is loaded
-# (`_PrecompileWarmFunction`), so it is executed at the first rebinding of
-# each process that loads the image; no execution copy is kept while an image
-# is generated. The constants table needs none: a rebinding replaces it.
-struct _ExecutableTable
-    entries::Base.RefValue{Any}  # the executed callables, or `nothing`
-end
-_generating_image() = ccall(:jl_generating_output, Cint, ()) != 0
-_ExecutableTable(callables::Vector{Any}) =
-    _ExecutableTable(Ref{Any}(_generating_image() ? nothing : callables))
-
-function _executable_entries(e::_ExecutableTable, callables::Vector{Any})
-    entries = e.entries[]
-    entries === nothing || return entries::Vector{Any}
-    entries = Any[_execution_source(x) for x in callables]
-    _generating_image() || (e.entries[] = entries)
-    entries
-end
-
-# The kept callables as this process executes them, as a kernel's table.
-_executable_callables(e::_ExecutableTable, callables::Vector{Any}) =
-    Tuple(_executable_entries(e, callables))
+# The kept callables as a kernel's table. A source record (`_KernelSource`)
+# is its own execution in every process, so a rebinding reuses the kept
+# callables as they are.
+_executable_callables(callables::Vector{Any}) = Tuple(callables)
 
 # A plan's per-binding constant recipes, in plan order: the hoisted constants
 # and the values the inner-plate pass cached.
@@ -1997,7 +1978,6 @@ struct _BoundTemplate
     ast::Expr
     lowered::_RebindTable # the readable recipes without the constants
     vectorizations::_BoundVectorizations
-    executable::_ExecutableTable # `callables` as this process executes them
 end
 
 # A class's template before its first binding the inner-plate pass left alone.
@@ -2102,7 +2082,7 @@ function _bound_build(entry::_BoundEntry, @nospecialize(residual),
     isempty(constants) && return kernel, kernel
     callables = Any[kernel.callables...]
     _BoundTemplate(kernel.f, table, callables, kernel.inputs, kernel.outputs, kernel.ast,
-                   lowered, vectorizations, _ExecutableTable(callables)), kernel
+                   lowered, vectorizations), kernel
 end
 
 # `kernel`, linked to the vectorizations its template's bindings share.
@@ -2137,7 +2117,7 @@ function _bound_rebind(entry::_BoundEntry, template::_BoundTemplate,
     length(constants) == length(template.lowered.slots) ||
         return prepare(plan; passes = passes)
     table = Tuple(_rebound_table(template.constants, Any[c.op.value for c in constants]))
-    callables = _executable_callables(template.executable, template.callables)
+    callables = _executable_callables(template.callables)
     lowered = _rebound_table(template.lowered, constants)
     _executed_prepared_kernel(template.f, table, callables, template.inputs,
                               template.outputs, plan, template.ast, Tuple(lowered),

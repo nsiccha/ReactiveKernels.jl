@@ -38,25 +38,21 @@ end
     @test Base.invokelatest(kernels[1], 2.0) == Base.invokelatest(kernels[2], 2.0) == 5.0
     source = [only(filter(r -> r.op isa RK._KernelSourceOp, spec.graph.recipes)) for spec in specs]
     @test RK._kernel_source_token(source[1].op) !== RK._kernel_source_token(source[2].op)
-    # The differentiated callable holds only executable state: no token,
-    # parameter names or module value that Enzyme must prove read-only.
+    # The differentiated callable holds only executable state: the callables
+    # table holds each source operation's record (`_KernelSource`), never the
+    # operation with its token and module, so Enzyme has no heap reference to
+    # prove read-only.
     @test isbitstype(typeof(kernels[1].callables))
     @test isbitstype(typeof(kernels[1].constants))
     for (kernel, original) in zip(kernels, source),
-            (op, recipe) in zip(kernel.callables, kernel.lowered_recipes)
-        op isa RK._KernelSourceOp || continue
-        @test RK.kernel_sourceop_token(op) === nothing
+            (entry, recipe) in zip(kernel.callables, kernel.lowered_recipes)
+        recipe.op isa RK._KernelSourceOp || continue
+        @test entry === nothing || entry === recipe.op.f
+        @test !(entry isa RK._KernelSourceOp)
         @test RK.kernel_sourceop_token(recipe.op) === RK._kernel_source_token(original.op)
         @test RK._kernel_endpoint_source_module(recipe.op) === mod
-        # refused: an execution copy's type names no authoring module, or each
-        # lowering module would make one program a new executable (snag
-        # `compiled-reader-be3cadbb`); lowering reads the original operation.
-        @test_throws ArgumentError RK._kernel_endpoint_source_module(op)
         @test RK._source_parameter_names(recipe.op, recipe.source, length(recipe.inputs)) !==
             nothing
-        # refused: keying a token-free copy would merge separately authored
-        # definitions in graph CSE; recipes must hold the original operation.
-        @test_throws ArgumentError RK._kernel_source_token(op)
     end
     # Generated-source reuse must still observe ordinary Julia method changes.
     Core.eval(mod, :(shift(x) = 3.0x))
@@ -335,16 +331,17 @@ end
     end
 end
 
-@testset "execution branch metadata preserves host branch behavior" begin
+@testset "branch metadata preserves host branch behavior" begin
     call(x, scale) = scale > 0 ? x * log(scale) : -x
     branch = RK._KernelBranch(Val((2,)), Val((1, 2)), Val((1,)), call,
         scale -> scale > 0, (x, scale) -> x * log(scale), x -> -x)
-    source = RK._KernelSourceOp(Val(gensym(:branch)), Val(:fused), branch)
-    op = RK._execution_source(source)
-    @test RK.kernel_sourceop_token(op) === nothing
+    op = RK._KernelSourceOp(Val(gensym(:branch)), Val(:fused), branch)
+    @test RK.kernel_sourceop_token(op) isa Symbol
     @test op.f isa RK._KernelBranch
     @test [op(x, 2.0) for x in (2.0, 3.0)] ≈ [2.0, 3.0] .* log(2.0)
     @test [op(x, -2.0) for x in (2.0, 3.0)] == [-2.0, -3.0]
+    # The table holds the metadata, which runs the same.
+    @test [branch(x, 2.0) for x in (2.0, 3.0)] ≈ [2.0, 3.0] .* log(2.0)
 end
 
 @testset "runtime source conversion preserves lexical captures" begin

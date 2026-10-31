@@ -96,12 +96,13 @@ _dot_decl(name::Symbol, T) = Expr(:(::), name, T)
     # The prepared child's result stays concretely typed across the lazy arm, so
     # the parent infers exactly and the embedded plate loop dispatches statically.
     @test _dot_return_type(p, Vector{Float64}, Float64, Int) === Float64
-    branch_index = findfirst(op -> op isa ReactiveKernels._KernelSourceOp &&
-                                   op.f isa ReactiveKernels._KernelBranch, p.callables)
+    # The lazy branch runs inline in the body, so the table holds no entry for
+    # it; its metadata on the plan is the branch over the same arguments.
     # `code_typed` includes the callable type when checking a generated method;
     # `return_types` omits it on Julia 1.10 and rejects this concrete signature.
-    @test last(only(code_typed(p.callables[branch_index], (Int, Vector{Float64}, Float64)))) ===
-          Vector{Float64}
+    branch = only(r.op.f for r in p.lowered_recipes
+                  if r.op isa ReactiveKernels._KernelSourceOp && r.op.f isa ReactiveKernels._KernelBranch)
+    @test last(only(code_typed(branch, (Int, Vector{Float64}, Float64)))) === Vector{Float64}
     # Value parity with the typed-HAVE cut, and the empty arm.
     q = prepare(_dot_parent; have = (:weights, :idx, :units), want = :total,
                 bound = (; idx, units))

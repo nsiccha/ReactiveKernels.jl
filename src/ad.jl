@@ -308,10 +308,14 @@ function _hidden_operand_names(
         "$(length(recipes)) lowered recipes"))
     map(P) do slot
         recipe = recipes[slot]
-        recipe.op isa _BoundConstant ||
-            throw(ArgumentError("internal: constants table entry $slot is not " *
-                                "the bound constant of lowered recipe $slot"))
-        only(recipe.outputs).name
+        recipe.op isa _BoundConstant && return only(recipe.outputs).name
+        # A source's captured values sit at its recipe's position
+        # (`_lowering_tables`); their array leaves cross as operands too.
+        entry = recipe.op isa _KernelSourceOp ? getfield(recipe.op, :f) : recipe.op
+        _source_constant(entry) === nothing &&
+            throw(ArgumentError("internal: constants table entry $slot is neither " *
+                                "the bound constant nor the captures of lowered recipe $slot"))
+        Symbol(first(recipe.outputs).name, "#captures")
     end
 end
 

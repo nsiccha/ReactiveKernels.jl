@@ -23,7 +23,7 @@ const NA_AD_BACKEND = AutoEnzyme(mode = Enzyme.Reverse)
 # both hit it (about 16 B per element on Julia 1.12, 24 B for the cache step
 # on Julia 1.13) (`repro_enzyme_reuse_or_similar_shadow_tape.jl`, Enzyme snag
 # `julia-1-12-rever-30566488`). A plate cell's per-element method query, a
-# second trigger of the same size, is gone since `_KernelSourceFunction` asks
+# second trigger of the same size, is gone since the source call asks
 # `Core._hasmethod` (snag `guarded-kernelso-e7baca4c`).
 const NA_SHADOW_TAPE = VERSION >= v"1.12" && Base.JLOptions().check_bounds == 1
 

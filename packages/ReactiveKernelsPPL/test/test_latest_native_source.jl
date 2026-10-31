@@ -6,24 +6,12 @@ using ReactiveKernelsPPL
 using ReactiveKernelsDistributionKernels
 using Test
 
-function _embedded_native_source_ops(kernel)
-    found = Any[]
-    function visit(ex)
-        if ex isa QuoteNode && ex.value isa ReactiveKernels._KernelSourceOp
-            push!(found, ex.value)
-        elseif ex isa Expr
-            foreach(visit, ex.args)
-        end
-    end
-    for op in kernel.callables
-        op isa ReactiveKernels._KernelSourceOp || continue
-        op.f isa ReactiveKernels._KernelSourceFunction || continue
-        for method in methods(op.f.f), statement in Base.uncompressed_ast(method).code
-            visit(statement)
-        end
-    end
-    found
-end
+# Whether every source whose record the callables table keeps (for the plate
+# loops' type seeds, or a capture read) runs through its compiled companion,
+# callable from any world, rather than a native closure that would need a
+# latest-world fallback.
+_sources_world_free(kernel) = all(f -> !(f isa ReactiveKernels._KernelSource) ||
+                                       f.native === nothing, kernel.callables)
 
 # The GLM rule and half-prior helpers are created when their package loads.
 # A model created later may be called from an older world, so check both the
@@ -92,15 +80,15 @@ function _latest_source_fresh_model()
     # inlined into a source body under the Normal observation plate. A bare
     # raw query still uses its documented invokelatest call boundary. Those
     # operations' sources run in the generated body itself (ReactiveKernels'
-    # inline statement), so no separately generated source function is left
-    # in the table to carry a world mode; the sampler's entry is the
+    # inline statement) or through their compiled companions, so no source
+    # in the table depends on the caller's world; the sampler's entry is the
     # latest-world boundary, checked below.
     nested = Core.eval(mod, :nested_endpoint)
     nested_plan = nested(; sigma = [1.0, 1.3, 0.7]) | (; y = [0.2, -0.3, 0.4])
     nested_built = build_kernel(nested_plan)
     nested_u = zeros(nested_built.layout.total)
     nested_raw = prepare_query(nested_built, nested_plan, :sampler)
-    @test isempty(_embedded_native_source_ops(nested_raw))
+    @test _sources_world_free(nested_raw)
     nested_q = prepare_sampler(nested_built, nested_plan, nested_u;
         backend = AutoEnzyme(; mode = Enzyme.Reverse))
     @test Base.invokelatest(nested_raw, nested_u) ≈ nested_q(nested_u)
@@ -142,9 +130,7 @@ function _latest_source_fresh_model()
 end
 
 @testset "scoped native source calls across a fresh-model world age" begin
-    captured = ReactiveKernels._KernelSourceFunction(identity, nothing, (; kept = 2.0))
-    latest = ReactiveKernels._kernel_latest_source(captured)
-    @test latest.captures === captured.captures
-    @test latest(2.0) == captured(2.0)
+    captured = ReactiveKernels._KernelSource((; kept = 2.0), nothing, identity)
+    @test captured(2.0) == 2.0
     _latest_source_fresh_model()
 end

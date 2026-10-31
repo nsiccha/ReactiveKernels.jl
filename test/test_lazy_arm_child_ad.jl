@@ -165,7 +165,7 @@ end
 # The child's source runs in the body: no recipe calling `stable_softplus`
 # keeps a source operation in the callables table that the body calls.
 inlined(kernel) = (code = string(code_expr(kernel));
-    !any(i -> kernel.callables[i] isa ReactiveKernels._KernelSourceOp &&
+    !any(i -> kernel.lowered_recipes[i].op isa ReactiveKernels._KernelSourceOp &&
               occursin("stable_softplus", string(kernel.lowered_recipes[i].source)) &&
               occursin("(__callables__[$i])(", code), eachindex(kernel.callables)))
 

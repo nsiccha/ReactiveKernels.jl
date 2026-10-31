@@ -967,13 +967,13 @@ function _authored_scan_step(op::_AuthoredScanOp, callargs, offset, index, carry
     for i in shared_positions
         push!(arguments, callargs[i])
     end
+    # A hoisted statement's value is already in its strip buffer: it is
+    # found by its output local before the embedding renames the step's
+    # locals.
+    step_ast = strips !== nothing && !isempty(strips.hoisted) ?
+        _scan_hoisted_rewrite(step.ast, strips, index) : step.ast
     step_statements = _embedded_statements(
-        step.ast, arguments, Expr(:tuple, carry, output), offset)
-    if strips !== nothing && !isempty(strips.hoisted)
-        # A hoisted statement's value is already in its strip buffer.
-        step_statements = Any[_scan_hoisted_read(statement, strips, index)
-                              for statement in step_statements]
-    end
+        step_ast, arguments, Expr(:tuple, carry, output), offset)
     step_body = Expr(:block, elements..., step_statements...)
     # The step's static output type for an empty sequence: the step's argument
     # types are the carry seed, one element of each sequence and the shared
@@ -1310,19 +1310,20 @@ function _lower_authored_scan_slice_native!(body, op::_AuthoredScanOp, callargs,
     body
 end
 
-# `local = (__callables__[slot])(...)` (or the source inlined in its place) for a
-# hoisted step statement becomes a read of
-# its strip buffer at the step (`_lower_authored_scan_strips!`).
+# The step body with each hoisted statement, named by its output local
+# (`strips.hoisted`, from the step plan's `_varnames`), reading its strip
+# buffer at the step (`_lower_authored_scan_strips!`). The statement's shape
+# (a table call, an inlined source, a call by name) does not matter.
+function _scan_hoisted_rewrite(ast::Expr, strips, index)
+    signature, body = ast.args
+    Expr(:function, signature,
+         Expr(:block, Any[_scan_hoisted_read(statement, strips, index)
+                          for statement in body.args]...))
+end
 function _scan_hoisted_read(statement, strips, index)
-    statement isa Expr && statement.head === :(=) || return statement
-    call = statement.args[2]
-    call isa Expr || return statement
-    # The step statement is the operation's call, or its source inlined in
-    # its place (`inline_sources.jl`); either names the slot.
-    slot = call.head === :call ? _callable_slot(call.args[1]) :
-        (inlined = _inline_statement_call(call); inlined === nothing ? nothing : first(inlined))
-    slot === nothing && return statement
-    buffer = get(strips.hoisted, slot, nothing)
+    statement isa Expr && statement.head === :(=) && statement.args[1] isa Symbol ||
+        return statement
+    buffer = get(strips.hoisted, statement.args[1], nothing)
     buffer === nothing && return statement
     Expr(:(=), statement.args[1],
          _inbounds_value(:($buffer[$index - $(strips.lo) + 1])))
@@ -1782,8 +1783,7 @@ end
 # gathered generator sum (the dose-outer passes).
 _scan_step_fold(op) = false
 _scan_step_fold(::typeof(evalpoly)) = true
-Base.@nospecializeinfer _scan_step_fold(@nospecialize(op::_KernelSourceOp)) =
-    getfield(op, :f) isa _KernelReduction
+_scan_step_fold(::_KernelReduction) = true
 
 # Step recipe `index` as a one-cell plate: lanes are scan sequences
 # (`lane_of`) or earlier hoisted strip buffers (`hoisted_of`), `Ref` operands
@@ -1834,11 +1834,16 @@ end
 function _scan_hoisted_records!(records, scan_recipe::Recipe, callargs, hoisted,
                                 offset)
     slots = Dict{Int,Symbol}()
-    isempty(hoisted) && return (; slots, types = Any[])
+    lhs = Dict{Symbol,Symbol}()
+    isempty(hoisted) && return (; slots, lhs, types = Any[])
     op = scan_recipe.op
     step = op.kernel
     sp = step.plan
     cid(v) = canon_id(sp.graph, v.id)
+    # The step body names each value by the step plan's local (`_varnames`);
+    # a hoisted statement is found by that name, whatever its shape (a table
+    # call, an inlined source, a call by name).
+    step_names = _varnames(sp)
     atomic = typeof(op).parameters[2]
     count = length(sp.have)
     iterated = [i for i in 2:count if !(i in atomic)]
@@ -1869,11 +1874,12 @@ function _scan_hoisted_records!(records, scan_recipe::Recipe, callargs, hoisted,
                           offset = offset + index - 1, hoisted = true))
         hoisted_of[cid(output)] = buffer
         slots[offset + index] = buffer
+        lhs[step_names[cid(output)]] = buffer
         types[cid(output)] = _slot_type_expr(sp.recipes[index], offset + index,
             (types[cid(v)] for v in sp.recipes[index].inputs))
         push!(hoisted_types, types[cid(output)])
     end
-    (; slots, types = hoisted_types)
+    (; slots, lhs, types = hoisted_types)
 end
 
 # Whether every hoisted step value is a concrete number, so its strip buffer
@@ -1955,7 +1961,7 @@ function _lower_authored_scan_strips!(body, scan_recipe::Recipe, records,
     emit_plates!(bind_views(fused), true, false)
     _lower_authored_scan_native!(fused, op, callargs, lhs, offset; type_offset,
         recycled, columns, strips = (; positions, lo, hi, axis, refill,
-                                       hoisted = hoisting.slots))
+                                       hoisted = hoisting.lhs))
     ordinary = emit_plates!(Expr(:block), false, false; ordinary = true)
     _lower_authored_scan_native!(ordinary, op, callargs, lhs, offset; type_offset,
                                  recycled, columns)
@@ -2244,7 +2250,8 @@ function _plate_without_unread_operands(r::Recipe)
     cell || return Recipe(r.id, inputs[kept], r.outputs, draft, r.cost, nothing,
                           r.effectful, r.source)
     Recipe(r.id, (first(r.inputs), inputs[kept]...), r.outputs,
-           _AuthoredPlateCellDraft(draft, r.op.locality, r.op.rows, r.op.partitioned),
+           _AuthoredPlateCellDraft(draft, r.op.locality, r.op.rows, r.op.partitioned,
+                                   r.op.plan),
            r.cost, nothing, r.effectful, r.source)
 end
 
@@ -2580,11 +2587,10 @@ end
 # operation, or `nothing`. `dynamic(input)` names the plate roots an input
 # varies with; the fold's iterator and coefficients must vary with none.
 _plate_reduction_kind(op, recipe, recipe_index, roots, dynamic) = nothing
-# A generator sum: gathered (`get(A, K, D)`, dose-outer) or gather-free.
+# A generator sum (the table holds its parts, `_KernelReduction`): gathered
+# (`get(A, K, D)`, dose-outer) or gather-free.
 Base.@nospecializeinfer function _plate_reduction_kind(
-        @nospecialize(op::_KernelSourceOp), recipe, recipe_index, roots, dynamic)
-    f = getfield(op, :f)
-    f isa _KernelReduction || return nothing
+        @nospecialize(f::_KernelReduction), recipe, recipe_index, roots, dynamic)
     II, XI, KI, AI = (typeof(f)::DataType).parameters
     for position in (II..., AI...)
         isempty(dynamic(recipe.inputs[position])) || return nothing
@@ -2637,7 +2643,7 @@ function _plate_reduction_ready_call(reduction, inner::Plan, locals, root_positi
                 Expr(:call, GlobalRef(Base, :typeof), locals[canon_id(graph, input.id)])
                 for input in reduction.recipe.inputs]
     Expr(:call, GlobalRef(@__MODULE__, :_plate_reduction_ready),
-         :($(Expr(:ref, _CALLABLES_ARG, op_offset + reduction.recipe_index)).f),
+         Expr(:ref, _CALLABLES_ARG, op_offset + reduction.recipe_index),
          plate_eltype, Expr(:curly, GlobalRef(Core, :Tuple), types...))
 end
 
@@ -2754,7 +2760,7 @@ function _lower_plate_reduction_native(::Val{:gather}, reduction, inner::Plan,
         end
     end
     interchanged = quote
-        $parts = $(Expr(:ref, _CALLABLES_ARG, op_offset + reduction.recipe_index)).f
+        $parts = $(Expr(:ref, _CALLABLES_ARG, op_offset + reduction.recipe_index))
         $cells = $(GlobalRef(Base, :CartesianIndices))($output_axes)
         $count = length($cells)
         $count > 0 && $passes
@@ -2875,7 +2881,7 @@ function _lower_plate_reduction_native(::Val{:sum}, reduction, inner::Plan,
         end))
     end
     interchanged = quote
-        $parts = $(Expr(:ref, _CALLABLES_ARG, op_offset + reduction.recipe_index)).f
+        $parts = $(Expr(:ref, _CALLABLES_ARG, op_offset + reduction.recipe_index))
         $cells = $(GlobalRef(Base, :CartesianIndices))($output_axes)
         $count = $(GlobalRef(Base, :length))($cells)
         $count > 0 && $passes
@@ -3301,9 +3307,10 @@ Base.@nospecializeinfer function _plate_branch_arm_kernel(
     next_id = Ref(minimum((q.id for q in inner.recipes); init = 0) - 1)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     replacement = if spec === nothing
-        token, form = (typeof(r.op)::DataType).parameters
+        token, form = kernel_sourceop_token(r.op), kernel_sourceop_form(r.op)
         arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form),
-            getfield(native, then ? :then_arm : :else_arm))
+            getfield(native, then ? :then_arm : :else_arm), nothing, nothing,
+            _kernel_endpoint_source_module(r.op))
         Recipe[Recipe(r.id, Tuple(r.inputs[i] for i in positions), r.outputs,
                       arm_op, r.cost, nothing, false, r.source)]
     else
@@ -3411,7 +3418,7 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_arms!(
         output_axes, pointwise_lhs, total_lhs; recycled, input_type_hints,
         element_type, into, nonempty::Bool, types, total_fold = sum)
     operation = Expr(:ref, _CALLABLES_ARG, types.op_offset + branch.index)
-    condition = Expr(:call, :(getfield(getfield($operation, :f), :condition)),
+    condition = Expr(:call, :(getfield($operation, :condition)),
                      branch.condition_args...)
     arm(@nospecialize(kernel)) = _lower_authored_plate_cells_native!(
         Expr(:block), runtime_ops, runtime_recipes, kernel, atomic, callargs,
@@ -3440,9 +3447,10 @@ end
 
 # `recycled`: the lane slot of the recipe's value (`_lower_authored_plate_loop_native!`),
 # which a scan, dotted call or slice fills instead of allocating.
-# `slot_inlines`: whether the table holds the recipe's authored closure at
-# `operation` (the cell kernel's own lowering inlined it) rather than its
-# operation; a `Bool`, so the keyword call has one instance for every plate.
+# `slot_inlines`: whether this lowering emits sources inline (the cell
+# kernel's own lowering did the same, so the position's record is read for
+# its captures only); a `Bool`, so the keyword call has one instance for every
+# plate.
 function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots;
                                      recycled = nothing, slot_inlines::Bool = false)
     if recipe.op isa _AuthoredScanOp
@@ -3462,7 +3470,7 @@ function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots;
         push!(body.args, Expr(:(=), out, destination))
     elseif recipe.op isa _KernelSourceOp && getfield(recipe.op, :f) isa _KernelBranch
         push!(body.args, Expr(:(=), out,
-            _native_plate_branch_expr(getfield(recipe.op, :f), :(getfield($operation, :f)), args)))
+            _native_plate_branch_expr(getfield(recipe.op, :f), operation, args)))
     else
         # Where the cell kernel's own lowering emitted this recipe's source and
         # left its authored closure in the slot (`inline_sources.jl`), the cell
@@ -4033,7 +4041,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         haskey(getfield(c, :slices), recipe_index) || return _lower_plate_recipe_native!(
             block, inner.recipes[recipe_index], args, out, operation,
             get(getfield(c, :scan_offsets), recipe_index, nothing); recycled = slot_of(recipe_index),
-            slot_inlines = !(getfield(getfield(c, :inner_kernel), :callables)[recipe_index] isa _KernelSourceOp))
+            slot_inlines = _inline_sources_enabled())
         scan_index, demand = getfield(c, :slices)[recipe_index]
         scan_recipe = inner.recipes[scan_index]
         scan_args = Any[_authored_plate_scalar_ref(
@@ -4134,7 +4142,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
                 arm = lane_arms[recipe_index]
                 push!(assignments.args, Expr(:(=), out,
                     _native_plate_lane_branch_expr(arm.branch,
-                        :(getfield($operation, :f)), args, recipe.inputs,
+                        operation, args, recipe.inputs,
                         arm.names, arm.slots, shared, declarations)))
             else
                 lower_recipe!(assignments, recipe_index, args, out, operation, true)
@@ -5015,14 +5023,19 @@ function _lower_with_ops_collecting(p::Plan;
             destination === nothing ||
                 (destination = _lane_source_expr(r, callargs, destination))
             if destination === nothing && inline_sources
-                # The recipe's source in the body; its authored closure, whose
-                # fields the body reads as the captures, in the slot
-                # (`inline_sources.jl`).
+                # The recipe's source in the body; its record, whose captures
+                # the body reads, in the slot (`inline_sources.jl`).
                 inlined = _inline_source_form(r, callargs, length(runtime_ops))
                 if inlined !== nothing
                     runtime_ops[end] = inlined[2]
                     destination = inlined[1]
                 end
+            end
+            if destination === nothing && inline_sources
+                # An exact call of a constant module binding names it
+                # (`_const_call_ref`); the table entry then goes unreferenced.
+                ref = _const_call_ref(r.op)
+                ref === nothing || (destination = Expr(:call, ref, callargs...))
             end
             call = destination === nothing ?
                 Expr(:call, Expr(:ref, _CALLABLES_ARG, length(runtime_ops)), callargs...) :
@@ -5060,12 +5073,13 @@ function _lower_with_ops_collecting(p::Plan;
 end
 
 # The two tables of a lowering over the operations it collected, one entry per
-# lowered recipe each: a bound constant's value in the constants table, every
-# other operation in the callables table, `nothing` in the other. A prepared
-# kernel then keeps only the callables its final body references
-# (`_native_table`): a recipe whose source runs in the body keeps no operation
-# unless the body reads a capture from it. The cell and step kernels the plate
-# and scan lowerings splice into their own tables keep every operation.
+# lowered recipe each: a bound constant's value, or a source's captured
+# values, in the constants table; every operation whose code is not its
+# source in the callables table; `nothing` elsewhere. A prepared kernel then
+# keeps only the callables its final body references (`_native_table`): a
+# recipe whose source runs in the body keeps no operation, its captures being
+# read from the constants table. The cell and step kernels the plate and scan
+# lowerings splice into their own tables keep every operation.
 function _lowering_tables(ops::Vector{Any})
     constants = Vector{Any}(nothing, length(ops))
     callables = Vector{Any}(nothing, length(ops))
@@ -5073,10 +5087,25 @@ function _lowering_tables(ops::Vector{Any})
         if op isa _BoundConstant
             constants[k] = op.value
         else
-            callables[k] = op
+            # A source operation's record or metadata (the wrapper with the
+            # token, form and module stays with the recipe), else the
+            # operation itself.
+            entry = op isa _KernelSourceOp ? getfield(op, :f) : op
+            callables[k] = entry
+            constants[k] = _source_constant(entry)
         end
     end
     Tuple(constants), Tuple(callables)
+end
+
+# The constants-table entry of a source's record or metadata: its captured
+# values when it has any (an inlined statement reads them there,
+# `_inline_capture_expr`), else `nothing`.
+Base.@nospecializeinfer function _source_constant(@nospecialize(entry))
+    record = _source_record(entry)
+    record === nothing && return nothing
+    captures = _source_captures(record)
+    isempty(captures) ? nothing : captures
 end
 
 # The operations behind two tables and their recipes, one per position: a
@@ -5101,19 +5130,11 @@ Base.@nospecializeinfer function _table_ops(@nospecialize(constants::Tuple),
 end
 
 # The table entry a spliced recipe stands behind when its own kernel's body
-# references none: for a source recipe its authored closure under the type
-# every build of the program shares (`_kernel_shared_closure`, as the inline
-# statement's captures read it), else the operation itself.
+# references none: what the lowering's tables hold for it (`_lowering_tables`),
+# a source operation's record or metadata, else the operation itself.
 Base.@nospecializeinfer function _recipe_table_entry(@nospecialize(r::Recipe))
     op = r.op
-    op isa _KernelSourceOp && kernel_sourceop_form(op) === :fused || return op
-    f = getfield(op, :f)
-    f isa _KernelSplit && (f = getfield(f, :call))
-    f isa _KernelSourceFunction || return op
-    closure = _kernel_native_source(f)
-    closure isa Function || return op
-    params = _recipe_source_names(r)
-    _kernel_shared_closure(closure, Expr(:->, Expr(:tuple, params...), r.source))
+    op isa _KernelSourceOp ? getfield(op, :f) : op
 end
 
 # The positions a body reads in the callables table, or `nothing` when it
@@ -6175,7 +6196,7 @@ end
 
 # Whether the generated method of the generated function `f` is visible in the
 # caller's world: `Core._hasmethod` on the complete signature, a constant
-# inference folds (as for `_KernelSourceFunction`, `src/core.jl`). It is not
+# inference folds (as for a native source closure, `src/core.jl`). It is not
 # while the first compiling call of an image defines that method, and it is
 # once the image is loaded, so a loaded image's kernel calls carry no run-time
 # image check or latest-world branch.
@@ -6371,12 +6392,11 @@ Base.@nospecializeinfer function _prepared_kernel(
         @nospecialize(inputs::Tuple), @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
         @nospecialize(lowered_recipes::Tuple); exact_signature::Type = Nothing,
         @nospecialize(rebinding = nothing))
-    _executed_prepared_kernel(f, constants, _execution_source(callables), inputs, outputs,
+    _executed_prepared_kernel(f, constants, callables, inputs, outputs,
                               plan, ast, lowered_recipes, exact_signature, rebinding)
 end
 
-# The same, over a callables table that is already the execution copy
-# (`_execution_source`), as a rebinding keeps it (`_ExecutableTable`).
+# The same, as a rebinding builds it over the kept callables.
 Base.@nospecializeinfer function _executed_prepared_kernel(
         @nospecialize(f), @nospecialize(constants::Tuple), @nospecialize(callables::Tuple),
         @nospecialize(inputs::Tuple), @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
@@ -6397,104 +6417,12 @@ Base.@nospecializeinfer _kernel_ops(@nospecialize(kernel::PreparedKernel)) =
     _table_ops(getfield(kernel, :constants), getfield(kernel, :callables),
                getfield(kernel, :lowered_recipes))
 
-# A caller that guarantees execution through a latest-world entry may use the
-# authored closure directly. Ordinary prepare retains its world-age fallback.
-_kernel_latest_source(x) = x
-# A `map` over the operation table compiles once per table type, so once per
-# program (snag `rkbrmi-start-up-c31e3789`); build it as `_execution_source` does.
-Base.@nospecializeinfer function _kernel_latest_source(@nospecialize(xs::Tuple))
-    values = Vector{Any}(undef, nfields(xs))
-    for i in eachindex(values)
-        values[i] = _kernel_latest_source(getfield(xs, i))
-    end
-    Tuple(values)
-end
-
-# A generated kernel whose public entry guarantees a latest-world barrier can
-# carry that guarantee into literal source calls within its native recipe
-# bodies and retained arm plans. Only the body argument of a source-op
-# construction is visited; quoted source/provenance expressions remain
-# unchanged.
-function _kernel_latest_native_source_literals(ex)
-    ex isa Expr || return ex
-    ex.head in (:quote, :inert) && return ex
-    args = map(_kernel_latest_native_source_literals, ex.args)
-    if ex.head === :call && length(args) >= 4 &&
-       args[1] == GlobalRef(@__MODULE__, :_KernelSourceOp)
-        args[4] = _kernel_latest_literal_calls(args[4])
-    end
-    Expr(ex.head, args...)
-end
-
-function _kernel_latest_literal_calls(ex)
-    ex isa Expr || return ex
-    ex.head in (:quote, :inert) && return ex
-    args = map(_kernel_latest_literal_calls, ex.args)
-    if ex.head === :call && !isempty(args) && args[1] isa QuoteNode &&
-       args[1].value isa Union{_KernelSourceOp,_KernelSourceFunction,_KernelBranch,_KernelSplit}
-        args[1] = QuoteNode(_kernel_latest_source(args[1].value))
-    end
-    result = Expr(ex.head, args...)
-    _kernel_is_branch_arm_graph(result) ?
-        Expr(:call, GlobalRef(@__MODULE__, :_kernel_latest_arm_plan), result) : result
-end
-# Every operation and source function has its own concrete type; these copies
-# are built from their parameters without compiling once per operation.
-Base.@nospecializeinfer function _kernel_latest_source(@nospecialize(f::_KernelSourceFunction))
-    F, RF, C = (typeof(f)::DataType).parameters
-    _kernel_new_instance(_KernelSourceFunction{F,RF,C,Val{:latest_world}},
-        (getfield(f, :f), getfield(f, :runtime_f), getfield(f, :captures)))
-end
-Base.@nospecializeinfer function _kernel_latest_source(@nospecialize(op::_KernelSourceOp))
-    token, form = (typeof(op)::DataType).parameters
-    f = _kernel_latest_source(getfield(op, :f))
-    ignored_throws = _kernel_latest_source(getfield(op, :ignored_throws))
-    call_identity = getfield(op, :call_identity)
-    T = _KernelSourceOp{token,form,typeof(f),typeof(ignored_throws),typeof(call_identity)}
-    _kernel_new_instance(T, (f, ignored_throws, call_identity))::_KernelSourceOp
-end
-function _kernel_latest_source(split::_KernelSplit)
-    _KernelSplit(Val(_kernel_split_spec(split)),
-        _kernel_latest_source(split.call),
-        map(_kernel_latest_source, split.wholes),
-        map(_kernel_latest_source, split.splits),
-        _kernel_latest_source(split.root))
-end
-function _kernel_latest_source(branch::_KernelBranch{CI,TI,EI}) where {CI,TI,EI}
-    _KernelBranch(Val(CI), Val(TI), Val(EI),
-        _kernel_latest_source(branch.call),
-        _kernel_latest_source(branch.condition),
-        _kernel_latest_source(branch.then_arm),
-        _kernel_latest_source(branch.else_arm),
-        _kernel_latest_arm_plan(branch.then_spec),
-        _kernel_latest_arm_plan(branch.else_spec))
-end
-
-# Arm graphs are executable metadata: partial evaluation or shared-arm
-# lowering can use them instead of the original closure. Preserve the same
-# caller guarantee there, or each newly exposed source call would regain a
-# runtime method query. Keep the exact selection and leave the graph untouched.
-function _kernel_latest_arm_plan(spec)
-    spec === nothing && return nothing
-    p = _plate_arm_plan(spec)
-    recipes = Recipe[Recipe(r.id, r.inputs, r.outputs, _kernel_latest_source(r.op),
-        r.cost, r.cse_key, r.effectful, r.source) for r in p.recipes]
-    _partial_subplan(p, p.have, p.want, recipes)
-end
-Base.@nospecializeinfer function _kernel_latest_source(@nospecialize(op::_AuthoredPlateOp))
-    kernel = _kernel_latest_prepared(getfield(op, :kernel))
-    A = (typeof(op)::DataType).parameters[2]
-    _kernel_new_instance(_AuthoredPlateOp{typeof(kernel),A},
-                         (kernel, getfield(op, :axis_checks)))::_AuthoredPlateOp
-end
-Base.@nospecializeinfer function _kernel_latest_prepared(@nospecialize(kernel::PreparedKernel))
-    _prepared_kernel(getfield(kernel, :f), getfield(kernel, :constants),
-                     _kernel_latest_source(getfield(kernel, :callables)),
-                     getfield(kernel, :inputs), getfield(kernel, :outputs),
-                     getfield(kernel, :plan), getfield(kernel, :ast),
-                     getfield(kernel, :lowered_recipes);
-                     exact_signature = _exact_signature(kernel))
-end
+# A source record (`_KernelSource`) is callable from any world, so a kernel
+# prepared for a caller that guarantees a latest-world entry is the kernel
+# itself. The name remains for the callers that selected that mode
+# (ReactiveKernelsPPL's query path, ReactiveKernelsDistributionKernels' base
+# kernels).
+_kernel_latest_prepared(kernel::PreparedKernel) = kernel
 
 # Partial evaluation deliberately stores hoisted values in the prepared
 # kernel's constants tuple so the public residual kernel has only its unbound
@@ -6979,7 +6907,6 @@ Base.@nospecializeinfer function _replica_graph(@nospecialize(target::PreparedKe
     _replicated_graph_plan(plan) || throw(ArgumentError(
         "scalar kernel requires the complete-callable replica fallback"))
     ast, constants, callables = _lower_replicated_with_ops(plan; batched)
-    callables = _execution_source(callables)
     native = compile(ast)
     input_types = Tuple{Any[valtype(boundary[i]) for i in indices]...}
     output_types = Tuple{Any[valtype(value) for value in wants]...}
@@ -7114,7 +7041,6 @@ Base.@nospecializeinfer function _borrowed_batch(@nospecialize(target), p::Plan,
                                                  @nospecialize(batched))
     ast, constants, callables, slot_count = _lower_replicated_with_ops(p; batched, reuse=true)
     native = compile(ast)
-    callables = _execution_source(callables)
     caches = _borrowed_batch_caches(slot_count)
     T = BorrowedBatchedKernel{typeof(target),typeof(native),typeof(constants),
                               typeof(callables),typeof(caches)}
@@ -7653,6 +7579,31 @@ end
 # value read from the constants table, else the operation's call.
 _slot_call_expr(r::Recipe, k::Int, args) = r.op isa _BoundConstant ?
     Expr(:ref, _CONSTANTS_ARG, k) : Expr(:call, Expr(:ref, _CALLABLES_ARG, k), args...)
+# The constant global binding of a raw operation, as the `GlobalRef` the body
+# calls by name (`w = sin(z)`), or `nothing`: a singleton function, or the
+# type behind `_TypeOperation`, bound `const` under its own name in its home
+# module, so the call names exactly what runs and the callables table need not
+# hold it. One instance for every operation type.
+Base.@nospecializeinfer function _const_call_ref(@nospecialize(op))
+    op isa _TypeOperation && return _const_type_ref(_type_operation_type(op))
+    op isa Function || return nothing
+    T = typeof(op)
+    T isa DataType && Base.issingletontype(T) || return nothing
+    # `nameof` of the function value is its name (`:sin`); of its type, the
+    # type's (`Symbol("#sin")`).
+    home, name = parentmodule(T), nameof(op)
+    (isdefined(home, name) && isconst(home, name) && getglobal(home, name) === op) ||
+        return nothing
+    _canonical_global(GlobalRef(home, name))
+end
+Base.@nospecializeinfer function _const_type_ref(@nospecialize(T))
+    base = T isa UnionAll ? Base.unwrap_unionall(T) : T
+    base isa DataType || return nothing
+    home, name = base.name.module, base.name.name
+    (isdefined(home, name) && isconst(home, name) && getglobal(home, name) === T) ||
+        return nothing
+    _canonical_global(GlobalRef(home, name))
+end
 # The type expression of recipe `r`'s value at position `k` over its inputs'
 # type expressions: the constant's type, else `_promote_op` of the operation.
 _slot_type_expr(r::Recipe, k::Int, input_types) = r.op isa _BoundConstant ?
@@ -7804,8 +7755,7 @@ function _recipe_source_names(recipe::Recipe)
     spelled = Set{Symbol}()
     _source_symbols!(spelled, recipe.source)
     names = _source_parameter_names(recipe.op, recipe.source, length(recipe.inputs))
-    names === nothing ||
-        return Symbol[_spelled_parameter_name(name, spelled) for name in names]
+    names === nothing || return _spelled_parameter_names(names, spelled, recipe.inputs)
     Symbol[_unscoped_source_name(value.name, spelled) for value in recipe.inputs]
 end
 # Julia's lowering reports a gensym parameter (`##endpoint_value#7`) without
@@ -7814,8 +7764,38 @@ end
 function _spelled_parameter_name(name::Symbol, spelled)
     name in spelled && return name
     gensym_name = Symbol("##", name)
-    gensym_name in spelled ? gensym_name : name
+    gensym_name in spelled && return gensym_name
+    # A companion spells a gensym parameter canonically (`##name#k`,
+    # `_canonical_locals`) while the source spells it with its own number;
+    # the source's one gensym of that base is the parameter.
+    base = _gensym_base(name)
+    base === nothing && return name
+    matches = Symbol[s for s in spelled if _gensym_base(s) == base]
+    length(matches) == 1 ? only(matches) : name
 end
+# The same for the parameters of a source over `inputs` (the recipe's values,
+# one per parameter in order). A companion spells several parameters of one
+# gensym base canonically (two lifted cell invariants, `##cell_invariant#2`
+# and `##cell_invariant#3`) where the source spells as many of that base
+# (`##cell_invariant#231`, `##cell_invariant#232`); such a parameter is the
+# input at its position when the source spells that input's name. The inputs
+# tuple is read without specializing: its type names the recipe's port
+# selection, which preparation may not compile per port count.
+Base.@nospecializeinfer function _spelled_parameter_names(names, spelled,
+                                                          @nospecialize(inputs))
+    result = Symbol[_spelled_parameter_name(name, spelled) for name in names]
+    length(inputs) == length(names) || return result
+    for (index, name) in enumerate(names)
+        result[index] === name && !(name in spelled) || continue
+        base = _gensym_base(name)
+        base === nothing && continue
+        input = inputs[index].name
+        input in spelled && _gensym_base(input) == base && (result[index] = input)
+    end
+    result
+end
+_gensym_base(name::Symbol) =
+    (m = match(r"^#*(.+)#\d+$", String(name))) === nothing ? nothing : m.captures[1]
 _source_symbols!(names, x::Symbol) = push!(names, x)
 _source_symbols!(names, x) = names
 function _source_symbols!(names, ex::Expr)
@@ -7842,19 +7822,14 @@ Base.@nospecializeinfer function _source_parameter_names(
     f = getfield(op, :f)
     names = _branch_call_names(f)
     names === nothing || return length(names) == n ? names : nothing
-    _closure_parameter_names(_source_closure(f), n)
+    record = _source_record(f)
+    record === nothing ? _closure_parameter_names(f, n) : _source_params(record, n)
 end
-Base.@nospecializeinfer _source_closure(@nospecialize(f)) = f
-Base.@nospecializeinfer _source_closure(@nospecialize(f::_KernelSourceFunction)) =
-    _source_closure(getfield(f, :f))
-Base.@nospecializeinfer _source_closure(@nospecialize(branch::_KernelBranch)) =
-    _source_closure(getfield(branch, :call))
-Base.@nospecializeinfer _source_closure(@nospecialize(split::_KernelSplit)) =
-    _source_closure(getfield(split, :call))
-Base.@nospecializeinfer _source_closure(@nospecialize(apply::_KernelSplitApply)) =
-    _source_closure(getfield(apply, :split))
-Base.@nospecializeinfer _source_closure(@nospecialize(reduction::_KernelReduction)) =
-    _source_closure(getfield(reduction, :call))
+# The source record behind branch and reduction metadata is its whole call's.
+Base.@nospecializeinfer _source_record(@nospecialize(branch::_KernelBranch)) =
+    _source_record(getfield(branch, :call))
+Base.@nospecializeinfer _source_record(@nospecialize(reduction::_KernelReduction)) =
+    _source_record(getfield(reduction, :call))
 Base.@nospecializeinfer _source_parameter_names(@nospecialize(op::Function), source::Expr, n) =
     source.head === :call && length(source.args) == n + 1 &&
         all(arg -> arg isa Symbol, source.args[2:end]) ?

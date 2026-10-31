@@ -170,7 +170,7 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         # end): pre-fix, 1.12 emitted `jl_apply_generic` for this call and
         # Enzyme aborted the gradient.
         op = only(
-            o for o in kernel.callables if o isa ReactiveKernels._KernelSourceOp)
+            r.op for r in kernel.lowered_recipes if r.op isa ReactiveKernels._KernelSourceOp)
         llvm = sprint(code_llvm, ReactiveKernels._kernel_source_call,
             Tuple{typeof(op),ntuple(_ -> Float64, 40)...})
         @test !occursin("jl_apply_generic", llvm)
@@ -211,7 +211,7 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         @test destination ≈ fill(32.0, 3)
         # The op's entry call itself forwards statically.
         op = only(
-            o for o in kernel.callables if o isa ReactiveKernels._KernelSourceOp)
+            r.op for r in kernel.lowered_recipes if r.op isa ReactiveKernels._KernelSourceOp)
         llvm = sprint(code_llvm, op,
             Tuple{Vector{Float64},ntuple(_ -> Float64, 32)...})
         @test !occursin("jl_f__apply_iterate", llvm)
