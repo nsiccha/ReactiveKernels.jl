@@ -329,6 +329,36 @@ Base.@nospecializeinfer function _source_capture_names(@nospecialize(f))
     record === nothing ? () : keys(getfield(record, :captures))
 end
 
+# Defined before the generated call below: a generator runs in the world of
+# its definition and sees no later method.
+# The companion's body over the captures and the arguments, as
+# `RuntimeGeneratedFunctions.generated_callfunc` splices it, so the call is
+# this record method and not that generated function's: a source embedding
+# other sources (a plate cell calling an endpoint) nests calls of one method
+# over distinct record types, which `_mark_source_call_recursion!` tells
+# inference is well founded, where nested `generated_callfunc` frames over
+# distinct generated-function types hit Julia's recursion limit and infer
+# `Any` (the atlas model's branch cells and a cell query's gathered cell lost
+# their concrete types). `nothing` when the body is not in the cache.
+function _companion_call_body(@nospecialize(R), forwarded)
+    R isa DataType && R <: _PrecompileWarmFunction && (R = R.parameters[1])
+    R isa DataType && R <: RuntimeGeneratedFunctions.RuntimeGeneratedFunction || return nothing
+    argnames, cache_tag, _, id = R.parameters[1:4]
+    body = RuntimeGeneratedFunctions._lookup_body(cache_tag, id)
+    body === nothing && return nothing
+    argnames isa Tuple && length(argnames) == length(forwarded) + 1 || return nothing
+    # Every argument is read before any parameter is bound: a parameter may
+    # be named like this method's own `f` or `args`.
+    temporaries = [gensym(:argument) for _ in forwarded]
+    environment = gensym(:captures)
+    setup = Any[Expr(:(=), environment, :(getfield(f, :captures)))]
+    append!(setup, (Expr(:(=), temporary, arg) for (temporary, arg) in zip(temporaries, forwarded)))
+    push!(setup, Expr(:(=), argnames[1], environment))
+    append!(setup, (Expr(:(=), name, temporary)
+                    for (name, temporary) in zip(argnames[2:end], temporaries)))
+    Expr(:block, Expr(:meta, :inline), setup..., body)
+end
+
 # The call is a forwarding shim and is never a call boundary: both generated
 # bodies declare themselves inline. `@inline` on a `@generated` definition does
 # not reach the generated code, and the call-site `@inline` of
@@ -338,9 +368,13 @@ end
 # inlined (HMM forward pass, snag `rkppl-hmm-forwar-89257681`).
 @inline @generated function (f::_KernelSource{C,R,N})(args::Vararg{Any,K}) where {C,R,N,K}
     forwarded = [:(getfield(args, $index)) for index in 1:K]
-    N === Nothing && return Expr(:block, Expr(:meta, :inline),
-        :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
-            getfield(f, :companion), getfield(f, :captures), $(forwarded...))))
+    if N === Nothing
+        spliced = _companion_call_body(R, forwarded)
+        spliced === nothing || return spliced
+        return Expr(:block, Expr(:meta, :inline),
+            :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
+                getfield(f, :companion), getfield(f, :captures), $(forwarded...))))
+    end
     # A native closure's method may be newer than the caller's world (a
     # kernel authored at run time). The query is `Core._hasmethod` on the
     # complete signature, which inference folds to a constant in the caller's

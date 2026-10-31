@@ -37,7 +37,10 @@ are recorded in the git history only.
   like bound data. `prepare_sampler`'s
   latest-world preparation and `_kernel_eval_definition`'s
   `latest_world_native_sources` are accepted and do nothing: a record is
-  callable from any world. Values, gradients, plans and recipes are unchanged.
+  callable from any world. The record's call splices the companion's body
+  itself, so a source embedding other sources (a plate cell calling an
+  endpoint) nests one method over distinct record types, which inference
+  treats as well founded; values, gradients, plans and recipes are unchanged.
 - An exact call of a function or type bound `const` in its module is written
   by name in the generated body (`w = Base.sin(z)`, `n = Base.length(v)`), so
   the statement names exactly what runs and such an operation leaves the
