@@ -34,8 +34,9 @@
 #   column read or an `hcat`: row `r` of the product is `A[r:r, ...] * W...`.
 #   Its full axes, which a dotted reader and the cell's linear reads need,
 #   follow from `A`'s for a product of two operands whose right operand is an
-#   array or a number (`_cell_product_shape`); any other product is read only
-#   by gathers;
+#   array or a number (`_cell_product_shape`), or from its inferred vector
+#   result and `A`'s row axis, including `A * (weights .* z)` and `A * W * z`;
+#   a product without either shape proof is read only by gathers;
 # - an authored plate: row `r` of its value is the plate over row `r` of each
 #   batched argument, lowered natively over those one-row views at the reading
 #   cell. A shared argument its body reads only as `v[q]`, `q` the element of
@@ -924,12 +925,22 @@ end
 
 # The type of an authored plate's value from its input types: an array of its
 # cell's result type, typed from a walk of its body as the generated body
-# types the buffer it allocates (`_checked_plate_element!`, `_plate_similar_output`),
-# or `Any` when that type is unknown.
+# types the buffer it allocates (`_checked_plate_element!`, `_plate_similar_output`).
+# Preserve the buffer's rank when its batched inputs prove it; a product of
+# the plate's weights then keeps its vector shape through an inline broadcast.
+# An unknown buffer keeps only the known element type, or `Any` if neither is known.
 function _cell_plate_output_type(op::_AuthoredPlateOp, input_types)
     all(T -> T isa Type, input_types) || return Any
     element = _checked_plate_element!(_UninferredValue[], op, input_types, Symbol[])
     element isa Type && element !== Any && element !== Union{} || return Any
+    atomic = Val(typeof(op).parameters[2])
+    array = _plate_array_type(element, atomic, input_types...)
+    # Abstract array containers may hide `similar`'s result, as they hide a
+    # broadcast's. The same element/rank stand-ins used below recover rank.
+    array === Any && (array = _plate_array_type(element, atomic,
+        Any[_cell_standin_type(T) for T in input_types]...))
+    shaped = _cell_element_type(array)
+    shaped !== Any && return shaped
     isconcretetype(element) ? AbstractArray{element} : AbstractArray{<:element}
 end
 
@@ -1205,15 +1216,19 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
     # Full axes are known for pointwise values, identities, column reads,
     # `hcat`s, `vcat`s, range views and reshapes, and for a product of two
     # operands whose right operand is an array or a number
-    # (`_cell_product_shape`) and whose left factor's axes are known.
+    # (`_cell_product_shape`) and whose left factor's axes are known. A
+    # product inferred to return a vector needs only its left factor's row
+    # axis, including when its right operand is an expression rather than
+    # one input (`A * (weights .* z)`).
     function shaped(cid)
-        f = forms[only(producers[cid]).id]
+        r = only(producers[cid])
+        f = forms[r.id]
         f.kind in (:pointwise, :identity, :columns, :hcat, :vcat, :range_view, :reshape) &&
             return true
-        f.operand == 0 && return false
-        inputs = only(producers[cid]).inputs
+        inputs = r.inputs
         factor = cidof(inputs[findfirst(==(:factor), f.roles)])
-        static_type(inputs[f.operand]) <: Union{AbstractVecOrMat,Number} &&
+        (f.operand == 0 ? static_type(only(r.outputs)) <: AbstractVector :
+            static_type(inputs[f.operand]) <: Union{AbstractVecOrMat,Number}) &&
             (form(factor) === nothing || shaped(factor))
     end
     fits(cid, role) = form(cid) !== nothing && (!needs_shape(role) || shaped(cid))
@@ -1524,6 +1539,11 @@ function _cell_shape!(e::_CellEmitter, cid::ValueId)
         _cell_leaf_shape_expr(e, input)
     if f.kind === :product
         factor = canon_id(d.graph, r.inputs[findfirst(==(:factor), f.roles)].id)
+        # With no single right-operand port, `shaped` proved that the whole
+        # product is a vector. Its only axis is the left factor's row axis;
+        # do not evaluate the right expression to discover its shape.
+        f.operand == 0 && return e.shapes[cid] = _cell_bind!(e, :cell_shape,
+            Expr(:call, _cell_ref(:_cell_column_shape), input_shape(factor)))
         operand = canon_id(d.graph, r.inputs[f.operand].id)
         return e.shapes[cid] = _cell_bind!(e, :cell_shape,
             Expr(:call, _cell_ref(:_cell_product_shape), input_shape(factor),
