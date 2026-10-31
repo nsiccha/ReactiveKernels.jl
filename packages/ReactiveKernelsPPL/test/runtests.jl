@@ -238,6 +238,7 @@ const _PPL_TEST_FILES = (
     "test_authored_names.jl",
     "test_cell_query.jl",
     "test_cell_kernel_design.jl",
+    "test_cell_tuple_geometry.jl",
     "test_query_footprints.jl",
     "test_compact_cell_derivatives.jl",
     "test_cell_factors.jl",

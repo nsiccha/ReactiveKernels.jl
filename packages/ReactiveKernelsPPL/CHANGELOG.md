@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.32
+
+- Require ReactiveKernels 0.1.38 for visible-kernel metadata dependencies.
+  Data-only tuple components feeding completed-covariate gathers now bind
+  once before shape analysis. Strict cell queries retain local parameter
+  reads through the completed column, design product and gathered effect,
+  matching the same model supplied with those arrays directly.
+
 ## 0.1.31
 
 - Require ReactiveKernels 0.1.37 to identify visible kernel plate domains.

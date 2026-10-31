@@ -216,12 +216,25 @@ end
     return values
 end
 
-@testset "visible plate domain dependencies keep captured values separate" begin
+@kernel metadata_plate_domain(x, rows, choices) = begin
+    domain = plate(rows) do i
+        choices[i]
+    end
+    values = plate(domain) do i
+        v::Float64 = opaque_value(x[i])
+        v
+    end
+    return values
+end
+
+@testset "visible metadata dependencies keep plate captures separate" begin
     calls = helper_calls[]
     for kernel in (metadata_plate, metadata_domain_chain, metadata_design)
-        @test ReactiveKernels._kernel_plate_domain_inputs(kernel) == [2]
+        expected = kernel === metadata_design ? [2, 3, 4] : [2]
+        @test ReactiveKernels._kernel_metadata_inputs(kernel) == expected
     end
-    @test isempty(ReactiveKernels._kernel_plate_domain_inputs(metadata_opaque))
+    @test ReactiveKernels._kernel_metadata_inputs(metadata_plate_domain) == [2, 3]
+    @test ReactiveKernels._kernel_metadata_inputs(metadata_opaque) == [1]
     @test helper_calls[] == calls
 end
 end
