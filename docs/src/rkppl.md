@@ -1537,6 +1537,12 @@ from a sum of a predictor at two row indices
 function call, or read whole elsewhere in the program, is still computed for
 every index; so is such a value when it is one operand of a `vcat`, even when
 the cell reads only another operand's rows.
+A visible `KernelSpec` call can compose its plate output into the selected
+cell. Shape facts pass through its recipes, so a grouped vector plate and
+entry gather can feed `lx = log.(entries)`, `X = hcat(one, lx)` and
+`mu = X * beta .+ offset`. A strict query (`locality = :error`) then reads
+the selected entry's owning group and the shared coefficients. Shape analysis
+does not execute cells or opaque Julia helpers.
 When the queried observations read one shared cell (two outputs of one loop),
 each observation's cell runs that shared cell at the same index. An output of
 an earlier `@plate for` loop that the observation reads at its own index

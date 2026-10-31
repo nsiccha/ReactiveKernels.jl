@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.29
+
+- Require ReactiveKernels 0.1.35 for graph-visible shape propagation.
+  A grouped vector plate followed by an entry gather can feed
+  `lx = log.(entries)`, `X = hcat(one, lx)` and `mu = X * beta .+ offset`
+  in `prepare_cell_query(...; locality = :error)`. Each cell reads its
+  owning group and the shared coefficients. Previously lost shape facts
+  inserted a whole-vector normalization and strict preparation failed.
+
 ## 0.1.28
 
 - Fix outer `prepare_cell_factor_ad` preparation for exactly one sum.

@@ -60,10 +60,82 @@ function _call_metadata(ex::Expr, args::Vector{OutputSignatures.ValueInfo},
         args = OutputSignatures.ValueInfo[OutputSignatures.known_info(Base.:^),
             args[1], OutputSignatures.known_info(Val(operands[2]))]
     end
-    broadcasted || return OutputSignatures.infer_call(f, args; kwargs)
+    broadcasted || return _metadata_call(f, args; kwargs)
     isempty(kwargs) || return unknown("a broadcast call takes no keywords")
     return OutputSignatures.infer_call(broadcast,
         OutputSignatures.ValueInfo[OutputSignatures.known_info(f); args])
+end
+
+_metadata_call(f, args; kwargs) = OutputSignatures.infer_call(f, args; kwargs)
+
+# A KernelSpec is already a visible graph, not an opaque Julia helper. Carry
+# facts through its selected recipes without executing any of them. Partial
+# facts deliberately remain :unknown: axes alone do not certify a numerical
+# rule or authorize replacing a call with an elementwise operation.
+function _metadata_call(spec::KernelSpec, args; kwargs)
+    OS = OutputSignatures
+    unknown = OS.CallInfo(OS.ValueInfo(), :unknown, "kernel boundary is unavailable")
+    isempty(kwargs) && _kernel_inline_signature_supported(spec.call_signature) &&
+        length(args) == length(inputs(spec)) &&
+        length(outputs(spec)) == 1 || return unknown
+    p = plan(spec)
+    cid(v) = canon_id(p.graph, v.id)
+    values = Dict{ValueId,OS.ValueInfo}(cid(v) => a for (v, a) in zip(p.have, args))
+    for r in p.recipes
+        operands = OS.ValueInfo[get(values, cid(v), OS.ValueInfo()) for v in r.inputs]
+        result = _recipe_value_metadata(r, operands)
+        for (v, fact) in zip(r.outputs, result)
+            # A declared local can convert its assigned value. A conversion
+            # whose input type is not already within that declaration may
+            # change shape; retain only the declared type in that case.
+            T = valtype(v)
+            if !(r.op isa _BoundConstant) && !(OS.type_bound(fact) <: T)
+                fact = OS.ValueInfo(; type_bound = T)
+            end
+            values[cid(v)] = fact
+        end
+    end
+    OS.CallInfo(get(values, cid(only(p.want)), OS.ValueInfo()), :unknown,
+        "facts from a visible kernel graph")
+end
+
+function _recipe_value_metadata(r::Recipe, args)
+    OS = OutputSignatures
+    unknown() = fill(OS.ValueInfo(), length(r.outputs))
+    length(r.outputs) == 1 && !r.effectful || return unknown()
+    if r.op isa _BoundConstant
+        return [OS.known_info(r.op.value)]
+    elseif r.op isa _AuthoredPlateOp
+        op = r.op
+        atomic = typeof(op).parameters[2]
+        batched = OS.ValueInfo[a for (i, a) in enumerate(args) if !(i in atomic)]
+        domain = OS.infer_call(broadcast, OS.ValueInfo[OS.known_info(op.kernel); batched])
+        domain.status === :incompatible && return unknown()
+        axes = OS.value_axes(domain.value)
+        axes === nothing && return unknown()
+        types = map(OS.type_bound, args)
+        T = _cell_plate_output_type(op, types)
+        T <: AbstractArray || return [OS.ValueInfo(; axes)]
+        E = eltype(T)
+        buffer = _plate_array_type(E, Val(atomic), types...)
+        # Only a proved Base Array allocation carries standard numerical
+        # array semantics. A custom marker's similar result keeps just facts.
+        buffer !== Union{} && buffer <: Array ||
+            return [OS.ValueInfo(; type_bound = T, element_type = E, axes)]
+        dims = map(a -> a isa OS.SymbolicAxis ? a : OS.axis_length(a), axes)
+        return [OS.array_info(E, dims...; container_type = buffer)]
+    elseif r.op === identity && length(args) == 1
+        return args
+    elseif r.op isa _KernelSourceOp
+        closure = _lane_source_closure(r)
+        closure === nothing && return unknown()
+        _, params, mod = closure
+        bindings = _lane_source_arguments(params, args)
+        return [_expression_value_info(_lane_strip_lines(r.source), bindings, mod;
+            shadowed = params, partial = true)]
+    end
+    result = _metadata_call(r.op, args; kwargs = Pair{Symbol,OS.ValueInfo}[])
+    result.status === :incompatible ? unknown() : [result.value]
 end
 
 # Return the result descriptor for a source call whose operand descriptors
@@ -79,15 +151,17 @@ function _call_value_info(ex::Expr, args::Vector{OutputSignatures.ValueInfo},
 end
 
 """
-    _expression_value_info(ex, values, mod; shadowed=keys(values))
+    _expression_value_info(ex, values, mod; shadowed=keys(values), partial=false)
 
 Propagate numerical metadata through a visible scalar/vector expression.
 `values` maps lexical names to OutputSignatures descriptors, including unknown
 intermediates. `shadowed` includes local names even when their facts are absent.
 Opaque calls are queried by identity, never executed or recursively inferred.
+`partial=true` also retains sound partial facts, such as axes, from unknown
+calls and visible kernel graphs; these facts do not certify a numerical rule.
 """
 function _expression_value_info(ex, values, mod::Module;
-                                 shadowed = keys(values))
+                                 shadowed = keys(values), partial::Bool = false)
     ex isa Symbol && return get(values, ex, OutputSignatures.ValueInfo())
     ex isa Number && return OutputSignatures.known_info(ex)
     ex isa QuoteNode && return OutputSignatures.known_info(ex.value)
@@ -109,14 +183,18 @@ function _expression_value_info(ex, values, mod::Module;
                 Meta.isexpr(kw, :kw, 2) && kw.args[1] isa Symbol ||
                     return OutputSignatures.ValueInfo()
                 push!(kwargs, kw.args[1] =>
-                    _expression_value_info(kw.args[2], values, mod; shadowed))
+                    _expression_value_info(kw.args[2], values, mod; shadowed, partial))
             end
         elseif Meta.isexpr(operand, :kw, 2) && operand.args[1] isa Symbol
             push!(kwargs, operand.args[1] =>
-                _expression_value_info(operand.args[2], values, mod; shadowed))
+                _expression_value_info(operand.args[2], values, mod; shadowed, partial))
         else
-            push!(args, _expression_value_info(operand, values, mod; shadowed))
+            push!(args, _expression_value_info(operand, values, mod; shadowed, partial))
         end
+    end
+    if partial
+        result = _call_metadata(ex, args, mod, shadowed; kwargs)
+        return result.status === :incompatible ? OutputSignatures.ValueInfo() : result.value
     end
     return _call_value_info(ex, args, mod, shadowed; kwargs)
 end
