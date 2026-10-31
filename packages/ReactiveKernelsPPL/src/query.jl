@@ -632,6 +632,32 @@ computed whole. Observations without a pointwise plate (a scalar `~`
 observation, a joint multivariate response) are refused naming the
 observation. `plan` must generate the program `built` was built from, as for
 [`prepare_query`](@ref).
+
+For the packed coordinates a cell reads, use RK's structural footprint API:
+
+```julia
+q = prepare_cell_query(built, plan, :y; locality = :error)
+footprint = ReactiveKernels.partition_footprint_kernel(q.kernel)
+read = Base.invokelatest(footprint, u, i).unconstrained
+indices = read === :whole ? collect(eachindex(u)) : read
+```
+
+Prepare `q` and `footprint` once per selected observation (or observations
+sharing a cell position), then vary `i`. This needs no AD preparation, cell
+key column, or plan per cell. For a single call,
+`ReactiveKernels.partition_footprint(q.kernel, u, i).unconstrained` prepares
+and caches the footprint kernel. Positions are sorted, unique linear indices
+into `u`; `:whole` means the whole packed vector. This is a structural read
+set, including both arms of a retained lazy branch and reads multiplied by
+zero, not a numerical nonzero-gradient test. To form a sparse Hessian pattern,
+union the cliques of the individual cell supports (restricted to the desired
+coordinates); a clique of their union introduces cross-cell pairs.
+
+The set can be conservative: array captures read inside a retained conditional
+can contribute their entire packed block, even with `locality = :error`.
+That setting checks values requested at rows; it does not guarantee a minimal
+footprint for every capture. Inspect the supports of the actual model before
+assuming a fixed per-cell width.
 """
 function prepare_cell_query(built, plan::StructuralPlan, observations;
         on_error = nothing, locality = nothing)
@@ -1263,6 +1289,16 @@ for [`prepare_cell_query`](@ref), with the default `:error`: the query is
 prepared only when every value its cells read at rows is computed at those
 rows; otherwise preparation throws a `ReactiveKernels.PartitionLocalityError`
 naming each such value and its statement.
+
+For a value-only query's packed-coordinate footprint, call
+`ReactiveKernels.partition_footprint(q.kernel, u, label, nothing).unconstrained`.
+The final `nothing` supplies the plan port; the footprint kernel computes its
+own row bookkeeping. A result of `:whole` means all positions of `u`.
+For repeated calls, prepare `ReactiveKernels.partition_footprint_kernel(q.kernel)`
+once and call it with `(u, label, nothing)` through `Base.invokelatest`.
+This does not prepare AD. For individual cell supports, use the
+[`prepare_cell_query`](@ref) footprint recipe: preparing a partition with one
+label per cell would retain a partition plan for every cell.
 """
 function prepare_partition(built, plan::StructuralPlan, observations; by,
         locality = :error, on_error = nothing)
