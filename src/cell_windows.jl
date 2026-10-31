@@ -1180,6 +1180,9 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
             inferred = declared !== Any ? declared :
                 r.op isa _AuthoredPlateOp ?
                     (length(r.outputs) == 1 ? _cell_plate_output_type(r.op, inputs) : Any) :
+                r.op isa _AuthoredPlateCellOp && !r.op.rows ?
+                    _checked_plate_element!(_UninferredValue[], r.op.plate,
+                                            inputs[2:end], Symbol[]) :
                     _recipe_inferred_output_types(r, inputs)[k]
             if inferred === Any && !(r.op isa _AuthoredPlateOp) && form(cid) !== nothing
                 inferred = _cell_element_type(_recipe_inferred_output_types(r,

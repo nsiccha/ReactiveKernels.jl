@@ -3604,7 +3604,7 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
     native = Expr(:->, Expr(:tuple, deps...), _kernel_native_body(rhs, mod, known))
     if split && form === :fused
         native = _kernel_split_callable(rhs, deps, native,
-                                        _kernel_split_native_body(mod, known))
+            _kernel_split_native_body(mod, known), _kernel_split_ignored_body(mod, known))
     end
     Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
@@ -3617,6 +3617,10 @@ end
 # body, with the kid placeholders among the closure's own names.
 _kernel_split_native_body(mod, known) =
     (e, params) -> _kernel_native_body(e, mod, union(known, params))
+_kernel_split_ignored_body(mod, known) = (e, params) -> begin
+    names = union(known, params)
+    _kernel_native_body(_kernel_ignore_throw_source(e, mod, names), mod, names)
+end
 
 # `(condition, then, else)` of a value-producing top-level lazy branch —
 # `c ? a : b` / `if … elseif … else … end` (an `elseif` tail is the nested
@@ -3663,7 +3667,7 @@ function _kernel_branch_callable(part, deps::Vector{Symbol}, known::Set{Symbol},
         # read whole.
         if split && !leaf
             closure = _kernel_split_callable(part, ports, closure,
-                _kernel_split_native_body(mod, known))
+                _kernel_split_native_body(mod, known), _kernel_split_ignored_body(mod, known))
         end
         return closure, ports
     end
@@ -3699,7 +3703,9 @@ end
 # around it is not: a SPLIT NODE is a strict subexpression (a call, field read
 # or index, as `_kernel_hoist_cell_invariants` lifts) that reads some but
 # fewer of the expression's arguments than its nearest enclosing such
-# subexpression, and does work worth caching. For any bound set, the maximal
+# subexpression, and does work worth caching. A separate decomposition with
+# `factors=true` retains sums, their operands and eager broadcast operands
+# for cell factor queries. For any bound set, the maximal
 # data-only subexpressions are exactly the split nodes whose arguments are all
 # bound and whose enclosing split node (or root) reads a live one.
 #
@@ -3707,7 +3713,7 @@ end
 # closure, `let` or macro call keeps its own evaluation, so a node never runs
 # where the authored expression would not (docs/src/constraints.md, "Preserve
 # lazy branches"); its whole enclosing call can still be a node. A dotted call
-# is a node only as a whole, which keeps Base's broadcast fusion. The
+# keeps its nested dotted calls fused; its eager operands can be nodes. The
 # decomposition is a function of the expression and its argument names alone,
 # so preparation recomputes it from the recipe's retained source for the
 # readable recipes of the parts it splits out.
@@ -3807,8 +3813,11 @@ function _kernel_split_unique!(seen::Base.IdSet{Any}, ex)
     all(arg -> _kernel_split_unique!(seen, arg), ex.args)
 end
 
+_cell_sum_source(ex) = ex isa Expr && ex.head === :call && length(ex.args) == 2 &&
+    _kernel_split_callee_name(ex.args[1]) === :sum
+
 """
-    _kernel_split_nodes(ex, ports) -> nothing | (; root, nodes)
+    _kernel_split_nodes(ex, ports; factors = false) -> nothing | (; root, nodes)
 
 The split nodes of authored expression `ex` over its ordered argument names
 `ports`, or `nothing` when it has none. Each node, in post-order, is
@@ -3817,9 +3826,11 @@ The split nodes of authored expression `ex` over its ordered argument names
 indices of its immediately nested nodes, and its subexpression with those kids
 replaced by `_kernel_split_placeholder(kid)`. `root` has the same `direct`,
 `kids` and `body` for the whole expression. A pure function of `ex` and
-`ports`: preparation recomputes it from a recipe's source.
+`ports` and the boundary policy: preparation recomputes it from a recipe's
+source. `factors=true` adds sum and eager-operand boundaries while keeping
+nested broadcasts fused. Ordinary partial evaluation uses the default.
 """
-function _kernel_split_nodes(ex, ports::Vector{Symbol})
+function _kernel_split_nodes(ex, ports::Vector{Symbol}; factors::Bool = false)
     root = _kernel_branch_unwrap(ex)
     root isa Expr || return nothing
     _kernel_split_unique!(Base.IdSet{Any}(), root) || return nothing
@@ -3834,23 +3845,34 @@ function _kernel_split_nodes(ex, ports::Vector{Symbol})
     reference === nothing && return nothing
     found = Any[]
     failed = Ref(false)
-    function walk(e, enclosing::Set{Symbol})
+    function walk(e, enclosing::Set{Symbol}, in_sum::Bool = false)
         kids = Int[]
-        for child in _kernel_split_children(e)
+        in_sum |= _cell_sum_source(e)
+        children = factors && _cell_dotted_call(e) ? e.args[2].args :
+            _kernel_split_children(e)
+        for child in children
             child isa Expr || continue
             if _kernel_split_liftable(child)
                 reads = free(child)
                 reads === nothing && (failed[] = true; return kids)
-                if !isempty(reads) && length(reads) < length(enclosing) &&
-                   issubset(reads, enclosing) && _kernel_split_worthwhile(child)
-                    inner = walk(child, reads)
+                # Keep a sum and its operand as independent source functions
+                # even when they read the same ports. Cell factor queries cut
+                # here; ordinary execution still calls the original function.
+                reduction = factors && (_cell_sum_source(e) || _cell_sum_source(child) ||
+                    (in_sum && _cell_named_operand(e, child)) ||
+                    (_cell_dotted(e) && !_cell_dotted(child)) || e.head === :ref)
+                fused_child = factors && _cell_dotted(e) && _cell_dotted(child)
+                if !fused_child && !isempty(reads) && issubset(reads, enclosing) &&
+                   (reduction || (length(reads) < length(enclosing) &&
+                                  _kernel_split_worthwhile(child)))
+                    inner = walk(child, reads, in_sum)
                     push!(found, (child, reads, inner))
                     push!(kids, length(found))
                 else
-                    append!(kids, walk(child, reads))
+                    append!(kids, walk(child, reads, in_sum))
                 end
             else
-                append!(kids, walk(child, enclosing))
+                append!(kids, walk(child, enclosing, in_sum))
             end
         end
         kids
@@ -3890,11 +3912,25 @@ _kernel_split_shape(ports, split) = (
 # `ports` in its `_KernelSplit` construction, or return it unchanged when `ex`
 # has no split node. `body(e, params)` builds a part's function body (the
 # native rewrite of `e`) for closure parameters `params`.
-function _kernel_split_callable(ex, ports::Vector{Symbol}, closure, body)
+function _kernel_split_callable(ex, ports::Vector{Symbol}, closure, body, ignorebody = nothing)
     split = _kernel_split_nodes(ex, ports)
-    split === nothing && return closure
-    function lambda(params, e)
-        Expr(:->, Expr(:tuple, params...), body(e, params))
+    factors = _kernel_split_nodes(ex, ports; factors = true)
+    split === nothing && factors === nothing && return closure
+    # Even an identical boundary shape needs its factor-specific error-policy
+    # companions. Ordinary split functions retain their existing policy.
+    extra = factors === nothing ? nothing :
+        _kernel_split_expression(factors, ports, closure, body, ignorebody, nothing)
+    # Factor-only boundaries are not candidates for ordinary partial
+    # evaluation. Retain its original decomposition, including no nodes.
+    split === nothing && (split = (; nodes = Any[],
+        root = (; direct = collect(eachindex(ports)), kids = Int[],
+                  body = _kernel_branch_unwrap(ex))))
+    _kernel_split_expression(split, ports, closure, body, nothing, extra)
+end
+
+function _kernel_split_expression(split, ports, closure, body, ignorebody, factors)
+    function lambda(params, e, rewrite = body)
+        Expr(:->, Expr(:tuple, params...), rewrite(e, params))
     end
     kid_names(kids) = Symbol[_kernel_split_placeholder(k) for k in kids]
     wholes = Any[lambda(ports[n.own], n.expr) for n in split.nodes]
@@ -3903,9 +3939,20 @@ function _kernel_split_callable(ex, ports::Vector{Symbol}, closure, body)
                  for n in split.nodes]
     root = lambda(vcat(ports[split.root.direct], kid_names(split.root.kids)),
                   split.root.body)
+    ignored = if ignorebody === nothing
+        nothing
+    else
+        iw = Expr(:tuple, (lambda(ports[n.own], n.expr, ignorebody) for n in split.nodes)...)
+        ip = Expr(:tuple, (isempty(n.kids) ? nothing :
+            lambda(vcat(ports[n.direct], kid_names(n.kids)), n.body, ignorebody)
+            for n in split.nodes)...)
+        ir = lambda(vcat(ports[split.root.direct], kid_names(split.root.kids)),
+                    split.root.body, ignorebody)
+        Expr(:tuple, Expr(:(=), :wholes, iw), Expr(:(=), :splits, ip), Expr(:(=), :root, ir))
+    end
     Expr(:call, GlobalRef(@__MODULE__, :_KernelSplit),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(_kernel_split_shape(ports, split))),
-         closure, Expr(:tuple, wholes...), Expr(:tuple, splits...), root)
+         closure, Expr(:tuple, wholes...), Expr(:tuple, splits...), root, ignored, factors)
 end
 
 # The parts of a generator sum as a `_KernelReduction` construction

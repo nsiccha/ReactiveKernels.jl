@@ -1451,21 +1451,27 @@ followed by the root kids' values. Plate partial evaluation reads them
 (`_partial_split_recipes`): a node whose arguments are all bound data becomes
 its own recipe there, so preparation evaluates it once per lane.
 """
-struct _KernelSplit{S,F,W,P,R}
+struct _KernelSplit{S,F,W,P,R,I,Q}
     call::F
     wholes::W
     splits::P
     root::R
+    # Cold source companions for the optional factor decomposition. They
+    # preserve its ignore-mode policy without changing ordinary split choices.
+    ignored::I
+    factors::Q
 end
 # Built once per authored recipe, of a new concrete type each time: construct
 # it without compiling its constructor per type, as `_KernelSourceOp` does.
 Base.@nospecializeinfer function _KernelSplit(@nospecialize(spec::Val), @nospecialize(call),
                                               @nospecialize(wholes::Tuple),
                                               @nospecialize(splits::Tuple),
-                                              @nospecialize(root))
+                                              @nospecialize(root),
+                                              @nospecialize(ignored = nothing),
+                                              @nospecialize(factors = nothing))
     T = _KernelSplit{_val_parameter(spec), typeof(call), typeof(wholes),
-                     typeof(splits), typeof(root)}
-    _kernel_new_instance(T, (call, wholes, splits, root))::_KernelSplit
+                     typeof(splits), typeof(root), typeof(ignored), typeof(factors)}
+    _kernel_new_instance(T, (call, wholes, splits, root, ignored, factors))::_KernelSplit
 end
 _kernel_split_spec(::_KernelSplit{S}) where {S} = S
 # Source readers of the whole expression (destination forms, nonallocating

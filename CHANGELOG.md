@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.32
+
+- Retain sum and eager-operand source boundaries for factored cell queries,
+  separately from the boundaries used by ordinary partial evaluation. The
+  cut pieces keep their authored error policy and use the existing graph,
+  cell row lowering and derivative operators. Cell result types propagate
+  from their scalar bodies when one cell supplies another cell's row index.
+  ReactiveKernelsPPL 0.1.25 exposes the outer and summand queries.
+
 ## 0.1.31
 
 - Authored source companions infer and execute when ReactiveKernels loads
@@ -25,6 +34,7 @@ are recorded in the git history only.
   expression-cache binding as compiler metadata even when that binding is
   newer than its definition world. Strict type-stability checks remain
   enabled, and the generated numerical body is unchanged.
+
 
 ## 0.1.30
 
@@ -36,6 +46,7 @@ are recorded in the git history only.
   consume only the requested rows without computing the whole product or
   evaluating its right operand to discover its shape. This fixes strict
   partition preparation for BRM HSGP predictors.
+
 
 ## 0.1.29
 

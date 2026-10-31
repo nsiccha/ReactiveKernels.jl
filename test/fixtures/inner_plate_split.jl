@@ -10,6 +10,14 @@ counted_sum(y) = (calls[] += 1; sum(log1p, y))
 counted_pair(y) = (calls[] += 1; (y, y + 1.0))
 counted_span(y) = (calls[] += 1; y:(y + 1.0))
 
+@traceable function checked_square(x)
+    x > 0 || throw(ArgumentError("positive x required"))
+    x * x
+end
+@kernel factor_error_policy(x::Float64, y::Float64) = begin
+    result = checked_square(x) + y
+end
+
 # A data-only call beside a live term in one top-level recipe.
 @kernel top_level(q::Vector{Float64}, y) = begin
     total::Float64 = sum(y .* q) - counted_sum(y)
