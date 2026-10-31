@@ -401,7 +401,8 @@ _opname(::_PartitionLabel) = "partition_label"
 
 """
     plate_partition(spec::KernelSpec, plates; by, index = :partition, name = :partition_total,
-                    locality = :error, partitioned = ()) -> KernelSpec
+                    locality = :error, partitioned = (), plan = nothing,
+                    plan_constant = ()) -> KernelSpec
 
 A new kernel in which the value `name` is the sum of the cells of the authored
 plates named in `plates` (one name or several) whose key equals the label held
@@ -435,6 +436,14 @@ shared parameter). [`partition_separability`](@ref) then checks, for one
 label, that the partition reads no other label's positions of those ports;
 the check needs the kernel's arguments, so it runs where an exemplar exists
 (`ReactiveKernelsPPL.prepare_partition_sampler` runs it for every label).
+
+`plan = port` adds a HAVE port for [`partition_plan`](@ref), which caches
+label-constant bookkeeping and data. Declare its type with `port => T` or
+supply `exemplars` to `prepare`. Compute a plan for each label; cached rows
+are checked against that label, and planned shapes against the arguments
+at evaluation. `plan_constant` names
+additional HAVE ports whose values the caller guarantees are constant per
+label while reusing a plan.
 
 The default boundary of the result is the original HAVE ports plus `index`,
 and the WANT `name`. `spec` is unchanged. `index` may name an existing HAVE
@@ -819,7 +828,7 @@ end
 
 # ------------------------------------------------------------------ plans
 
-# The integer bookkeeping of a partition (its rows from the table, every pushed
+# The constant work of a partition (its rows from the table, every pushed
 # value's rows and unions, the positions a read bisects, the bounds checks,
 # the slices of bound lanes) depends on the label and the bound data only.
 # With a plan port (`plate_partition(…; plan)`), the generated body reads that
@@ -857,12 +866,13 @@ end
 
 # Whether `ex` reads nothing that varies per call: no data symbol (an unbound
 # HAVE port other than the label, or a value computed from one) and no
-# operation call other than a partition table op, and no bound value other
-# than index bookkeeping (`__constants__[k]`, `_plan_bookkeeping`).
+# operation other than a plan-eligible pure operation. Bound data and
+# explicitly label-constant ports may be read by the plan.
 function _plan_eligible(ex, data::Set{Symbol}, ops)
     ex isa Symbol && return !(ex in data)
     ex isa Expr || return true
     if ex.head === :call
+        _plan_mutating_call(ex, ops) && return false
         # A type the body computes (`typeof`, `eltype`, `_promote_op`, a
         # plate's element type) is a constant inference folds; read from the
         # port it would be a run-time `DataType`, every use of it a dynamic
@@ -963,35 +973,74 @@ end
 # the plan symbols the rest reads and their field names (`plan_k`, positional:
 # the plan-mode lowering of the same plan names them the same way).
 function _partition_plan_split(body::Expr, data_names, ops)
-    # A planned value the body writes into (an accumulation, a reassignment)
-    # would carry one call's values into the next: such a value is data, and
-    # the classification runs again without it until none is written.
-    forced = Set{Symbol}()
-    while true
-        split = _partition_plan_classify(body, data_names, ops, forced)
-        split === nothing && return nothing
-        plan, main, needed, fields = split
-        written = _written_plan_symbols(main, Set{Symbol}(needed))
-        isempty(written) && return split
-        union!(forced, written)
+    # Find writes before moving any statements. A write through an alias
+    # must keep its backing allocation in the body too, even when only the
+    # alias (or a reduction of the backing array) would be a plan field.
+    bindings = Dict{Symbol,Vector{Any}}()
+    function bind(ex)
+        ex isa Expr || return
+        if ex.head === :(=) || (_plan_update_head(ex.head) &&
+                !startswith(String(ex.head), ".") && ex.args[1] isa Symbol)
+            lhs = Expr(:(=), ex.args[1], nothing)
+            for name in _assigned_names!(Set{Symbol}(), lhs)
+                push!(get!(() -> Any[], bindings, name), ex.args[2])
+            end
+        end
+        foreach(bind, ex.args)
     end
+    bind(body)
+    names = _assigned_names!(Set{Symbol}(), body)
+    mutated = _written_plan_symbols(body.args, names, ops; reassign = false)
+    forced = copy(mutated)
+    union!(forced, (name for (name, values) in bindings if length(values) > 1))
+    # A function of a written value may alias it. Conservatively follow all
+    # bindings upstream; no alias promise is required of a pure helper.
+    # Rebinding a scalar accumulator does not write its input values. Only
+    # actual object mutations require following possible aliases upstream.
+    pending = collect(mutated)
+    followed = copy(mutated)
+    while !isempty(pending)
+        name = pop!(pending)
+        for value in get(bindings, name, ())
+            for ref in intersect(_symbol_refs!(Set{Symbol}(), value), names)
+                ref in followed && continue
+                push!(forced, ref)
+                push!(followed, ref)
+                push!(pending, ref)
+            end
+        end
+    end
+    _partition_plan_classify(body, data_names, ops, forced)
 end
-# The symbols of `names` that `main`'s statements write into: the first
-# argument of a mutating call (`f!(x, …)`), the target of `x .= …`, or a
-# second assignment.
-function _written_plan_symbols(main, names::Set{Symbol})
+function _plan_mutating_call(ex, ops)
+    slot = _callable_slot(ex.args[1])
+    f = slot === nothing ? ex.args[1] : ops[slot]
+    name = f isa Function ? nameof(f) : _plan_call_name(f)
+    name isa Symbol && name !== :! && endswith(String(name), "!")
+end
+_plan_update_head(head) = endswith(String(head), "=") &&
+    !(head in (:(=), :(==), :(===), :(!=), :(!==), :(<=), :(>=), :(=>)))
+# Mutating functions need not write their first argument (`broadcast!`), and
+# indexed/property updates write their base. Read-only arguments may be kept
+# in the body conservatively; preserving ownership takes priority here.
+function _written_plan_symbols(main, names::Set{Symbol}, ops; reassign = true)
     written = Set{Symbol}()
+    record(ex) = union!(written, intersect(_symbol_refs!(Set{Symbol}(), ex), names))
+    target(ex) = if ex isa Expr && ex.head in (:ref, :.)
+        target(ex.args[1])  # indices and property names are read, not written
+    else
+        record(ex)
+    end
     visit(ex) = begin
         ex isa Expr || return
-        if ex.head === :call && length(ex.args) >= 2
-            name = _plan_call_name(ex.args[1])
-            if name isa Symbol && endswith(String(name), "!") && ex.args[2] isa Symbol &&
-               ex.args[2] in names
-                push!(written, ex.args[2])
-            end
-        elseif ex.head in (:(.=), :(=), :(+=), :(-=), :(.+=), :(.-=)) && ex.args[1] isa Symbol &&
-               ex.args[1] in names
-            push!(written, ex.args[1])
+        if ex.head === :call && _plan_mutating_call(ex, ops)
+            foreach(record, ex.args[2:end])
+        elseif ex.head === :(=)
+            lhs = ex.args[1]
+            (reassign || (lhs isa Expr && lhs.head in (:ref, :.))) && target(lhs)
+        elseif _plan_update_head(ex.head)
+            (reassign || startswith(String(ex.head), ".") || !(ex.args[1] isa Symbol)) &&
+                target(ex.args[1])
         end
         foreach(visit, ex.args)
     end
@@ -1037,7 +1086,8 @@ function _partition_plan_classify(body::Expr, data_names, ops, forced::Set{Symbo
         st = body.args[k]
         if kinds[k] !== :main
             keep[k] = true
-        elseif any(n -> n in wanted, _assigned_names!(Set{Symbol}(), st))
+        elseif any(n -> n in wanted, union!(_assigned_names!(Set{Symbol}(), st),
+                    _written_plan_symbols((st,), wanted, ops)))
             keep[k] = true
             _symbol_refs!(wanted, st)
         end
@@ -1087,7 +1137,7 @@ function _partition_plan_lowering(p::Plan, body::Expr, argexprs, runtime_ops, nm
     position === nothing && return nothing
     # The label port is the input of the label check (`_PartitionLabel`); it
     # varies per call but names the plan, so it is not data.
-    labels = Set{Symbol}(nm(r.inputs[1]) for r in p.recipes if r.op isa _PartitionLabel)
+    labels = unique(Symbol[nm(r.inputs[1]) for r in p.recipes if r.op isa _PartitionLabel])
     # A port whose value is constant per label (`plan_constant`) is not data.
     constant = p.recipes[cell].op.plan_constant
     data = Symbol[nm(v) for v in p.have
@@ -1095,9 +1145,20 @@ function _partition_plan_lowering(p::Plan, body::Expr, argexprs, runtime_ops, nm
     split = _partition_plan_split(body, data, runtime_ops)
     split === nothing && return nothing
     plan, main, needed, fields = split
+    # A plan belongs to its label. The label's table lookup is planned too,
+    # so the body checks the caller's label before reading cached rows. Keep
+    # the selected row identities, not the label's concrete type: mixed key
+    # types in one column must still produce one concrete plan type.
+    planned = setdiff(_assigned_names!(Set{Symbol}(), Expr(:block, plan...)),
+                      _assigned_names!(Set{Symbol}(), Expr(:block, main...)))
+    checks = [r for r in p.recipes if r.op isa _PartitionLabel &&
+              all(v -> nm(v) in planned, r.outputs)]
+    guards = [Expr(:call, GlobalRef(@__MODULE__, :_partition_plan_label), nm(r.inputs[1]),
+                   Expr(:tuple, (nm(v) for v in r.inputs[2:end])...)) for r in checks]
+    push!(fields, :partition_labels)
     plan_body = Expr(:block, plan..., Expr(:return, Expr(:call,
         Expr(:curly, GlobalRef(Core, :NamedTuple), Expr(:tuple, (QuoteNode(f) for f in fields)...)),
-        Expr(:tuple, needed...))))
+        Expr(:tuple, needed..., Expr(:tuple, guards...)))))
     plan_mode && return plan_body
     # The port's declared type names the plan's type (`plate_partition(…;
     # plan = port => T)`, T the type of a plan the plan kernel computed); an
@@ -1114,11 +1175,28 @@ function _partition_plan_lowering(p::Plan, body::Expr, argexprs, runtime_ops, nm
             "computes a plan of that type, declare it with `plan = :$port => typeof(plan)`"))
     end
     reads = Any[Expr(:(=), _PLAN_ARG, Expr(:(::), nm(p.have[position]), T))]
+    push!(reads, Expr(:call, GlobalRef(@__MODULE__, :_partition_plan_labels_check),
+        Expr(:call, GlobalRef(Core, :getfield), _PLAN_ARG, QuoteNode(:partition_labels)),
+        Expr(:tuple, (nm(r.inputs[1]) for r in checks)...)))
     for (name, field) in zip(needed, fields)
         push!(reads, Expr(:(=), name, Expr(:call, GlobalRef(Core, :getfield), _PLAN_ARG,
                                              QuoteNode(field))))
     end
     Expr(:block, reads..., main...)
+end
+
+_partition_plan_label(label, tables::Tuple) =
+    (tables, map(table -> get(table, label, _PARTITION_NO_ROWS), tables))
+@inline function _partition_plan_label_matches(plan, label)
+    tables, rows = plan
+    all(map((table, expected) -> get(table, label, _PARTITION_NO_ROWS) === expected,
+            tables, rows))
+end
+@inline function _partition_plan_labels_check(planned, current)
+    all(map(_partition_plan_label_matches, planned, current)) || throw(ArgumentError(
+        "partition plan: labels $(repr(current)) differ from the plan's labels; " *
+        "compute the plan for these labels (`partition_plan`)"))
+    nothing
 end
 
 # The concrete named-tuple type the plan function returns, found by one
@@ -1185,7 +1263,7 @@ const _PLAN_LOCK = ReentrantLock()
 
 The kernel [`partition_plan`](@ref) evaluates: called with `kernel`'s HAVE
 arguments (the plan port's own value is ignored; pass `nothing`), it returns
-the plan: the named tuple of integer bookkeeping the partition's body reads
+the plan: the named tuple of label-constant bookkeeping and data the body reads
 from its plan port. `partition_plan` prepares and keeps one per kernel for the
 process; a caller evaluating many labels prepares it once here and holds it.
 """
@@ -1212,7 +1290,7 @@ partition_plan_kernel(spec::KernelSpec; kwargs...) =
     partition_plan(kernel::PreparedKernel, args...) -> NamedTuple
 
 The plan of a partition kernel prepared with a plan port
-(`plate_partition(…; plan)`): the integer bookkeeping of the label among
+(`plate_partition(…; plan)`): the constant bookkeeping and data of the label among
 `args` (the kernel's HAVE arguments in order; pass `nothing` for the plan
 port), computed from the bound data. The kernel's body reads it from the port
 instead of recomputing it per call, and a derivative carries none of it:

@@ -31,8 +31,13 @@ are recorded in the git history only.
   ReactiveKernelsPPL's compact overlay reads its active vector at slots
   planned per label instead of a slot load and a branch per element.
 - The Enzyme dogfood line from `1280e6ee` differentiates a planned partition
-  under plain Reverse; registered 0.13.216 keeps the runtime-activity
-  requirement (Enzyme snag `plan-const-int-r-4671f4a7`).
+  under plain Reverse; registered 0.13.216 has an upstream activity-analysis
+  defect (Enzyme snag `plan-const-int-r-4671f4a7`). Runtime activity is not
+  an accepted remedy.
+- Plan splitting preserves indexed/property writes, writes through aliases,
+  mutating calls and repeated assignments in the evaluation body. Reusing a
+  plan with another label throws `ArgumentError` instead of silently returning
+  the original label's value.
 
 ## 0.1.28
 

@@ -1281,15 +1281,9 @@ end
     literal(n) = (; y = cos.(1:n), x = sin.(1:n), w = [0.2, -0.3, 0.1],
         k = [mod1(5j, n) for j in 1:n])
     plain = AutoEnzyme(; mode = Enzyme.Reverse)
-    runtime = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
-    # Plain native Reverse through a gather of a plate whose cell reads a
-    # window (`m = a[k]`) raises `EnzymeRuntimeActivityError` on registered
-    # Enzyme, through one domain as through two and on canonical before this
-    # change (todo `ReactiveKernels/todos/2026-10-30T12-25-05-259-15v6ws6`);
-    # runtime activity differentiates it exactly.
     for (spec, data, rows, backend) in (
             (_cell_two_lanes, lanes, ["c", "xi"], plain),
-            (_cell_two_lane_plate, plated, ["c", "a", "m"], runtime),
+            (_cell_two_lane_plate, plated, ["c", "a", "m"], plain),
             (_cell_literal_reads, literal, ["mix", "p", "m"], plain))
         have = keys(data(4))
         k = prepare(plate_cell(spec, :dens; index = :i); have = (have..., :s, :i),
@@ -1308,12 +1302,6 @@ end
             @test value ≈ reference[i]
             @test ds ≈ _cell_central(s -> k(d..., s, i), 0.7) atol = 1e-8
         end
-        backend === runtime || continue
-        # Plain Reverse too: a window's rows are read positions-first, then
-        # gathered once (RK 0.1.24), which static activity analysis accepts.
-        ad = prepare_ad(k, plain, d..., 0.7, 1; active = :s)
-        @test last(ad_value_and_gradient(ad, d..., 0.7, 1)) ≈
-            _cell_central(s -> k(d..., s, 1), 0.7)
     end
 end
 

@@ -1064,7 +1064,7 @@ end
         obuilt, obound, :y, u0; backend = AutoEnzyme(; mode = Enzyme.Reverse), locality = :error)
     @test_throws ReactiveKernels.PartitionLocalityError prepare_compact_cell_sampler(
         obuilt, obound, :y, u0, [1, 2];
-        backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)),
+        backend = AutoEnzyme(; mode = Enzyme.Reverse),
         locality = :error)
     @test_throws ContractValidationError prepare_cell_query(obuilt, obound, :y; locality = :loud)
     qo = prepare_cell_query(obuilt, obound, :y; locality = :ignore)
@@ -1122,6 +1122,15 @@ end
     end
     @test sum(q(u, s) for s in 1:3) ≈ likelihood
     @test_throws ArgumentError q(u, 4)
+    # Labels may have different concrete types in one key column. The plan
+    # guard must preserve one plan type and dictionary key equality.
+    labels = Any[1, "two", :three]
+    mixed = (; data..., subject = Any[labels[i] for i in data.subject])
+    mbound, mbuilt = _cq_bound(_CQ_ROWS, mixed, (:y,))
+    mq = prepare_partition(mbuilt, mbound, :y; by = :subject)
+    @test partition_labels(mq) == labels
+    @test [mq(u, label) for label in labels] ≈ [q(u, s) for s in 1:3]
+    @test mq(u, 1.0) ≈ mq(u, 1)
     # The partition's cost does not grow with the other subjects' rows.
     allocated(sizes) = let d = _cq_rows_data(sizes), (b, k) = _cq_bound(_CQ_ROWS, d, (:y,)),
             p = prepare_partition(k, b, :y; by = :subject), v = zeros(k.layout.total)
@@ -1135,10 +1144,10 @@ end
     @test only(e.status for e in report if e.value === :mu) === :rows
     # The gradient of one subject's density is the full likelihood gradient
     # on the coordinates it reads and zero elsewhere.
-    # A planned partition reads its rows from the plan port; on registered
-    # Enzyme that needs runtime activity, as the compact samplers' window
-    # reads do (RK `test_plate_partition.jl`, "a plan per label").
-    backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    # Ordinary Reverse is required for both dense and compact samplers.
+    # Enzyme's plan-field activity repair is on dogfood from 1280e6ee
+    # (RK `test_plate_partition.jl`, "a plan per label").
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
     s = prepare_partition_sampler(built, bound, :y, u; by = :subject, backend, compact = false)
     @test s isa PartitionSampler
     full = prepare_ad(prepare_query(built, bound, :likelihood), backend, u;
@@ -1185,10 +1194,13 @@ end
     # coming through an LKJ factor (`R = Z * (sd .* L)'`): a site's footprint
     # holds the shared coordinates and its own groups' rows of `Z` only, and
     # its gradient is the dense one there.
-    grt = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
-    gs = prepare_partition_sampler(gbuilt, gbound, :y, gu; by = :site, backend = grt,
+    # This still exposes Enzyme snag `static-reverse-g-173719b3` on dogfood
+    # 1280e6ee: the compact overlay's base/active select is rejected. Keep
+    # ordinary Reverse here so that the unresolved limitation remains visible.
+    grouped_backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    gs = prepare_partition_sampler(gbuilt, gbound, :y, gu; by = :site, backend = grouped_backend,
                                    compact = true)
-    gdense = prepare_partition_sampler(gbuilt, gbound, :y, gu; by = :site, backend = grt,
+    gdense = prepare_partition_sampler(gbuilt, gbound, :y, gu; by = :site, backend = grouped_backend,
                                        compact = false)
     gnames = String.(coordinate_names(gbuilt.layout))
     zrow(n) = (m = match(r"^Z\.(\d+)", n); m === nothing ? nothing : parse(Int, m[1]))
@@ -1208,16 +1220,15 @@ end
         @test all(iszero, gg[setdiff(eachindex(gu), footprint)])
         union!(gunion, footprint)
     end
-    gwhole = prepare_ad(prepare_query(gbuilt, gbound, :likelihood), grt, gu; active = :unconstrained)
+    gwhole = prepare_ad(prepare_query(gbuilt, gbound, :likelihood), grouped_backend, gu; active = :unconstrained)
     _, ggrad = Base.invokelatest(ad_value_and_gradient, gwhole, gu)
     @test findall(!iszero, ggrad) ⊆ sort!(collect(gunion))
 
     # The compact sampler: the gradient over each partition's footprint, the
     # packed coordinates it reads, equal to the dense one there; the
     # footprints' union over the labels is the full likelihood gradient.
-    rt = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
     level_subject = [data.subject[findfirst(==(l), data.group)] for l in levels]
-    compact = prepare_partition_sampler(built, bound, :y, u; by = :subject, backend = rt,
+    compact = prepare_partition_sampler(built, bound, :y, u; by = :subject, backend,
                                         compact = true, partitioned = (:z => level_subject,))
     @test partition_labels(compact) == [1, 2, 3]
     gsum = zero(u)
@@ -1244,17 +1255,17 @@ end
     slevels = sort(unique(shared.group))
     slevel_subject = [shared.subject[findfirst(==(l), shared.group)] for l in slevels]
     @test_throws ReactiveKernels.PartitionSeparabilityError prepare_partition_sampler(
-        sbuilt, sbound, :y, u; by = :subject, backend = rt,
+        sbuilt, sbound, :y, u; by = :subject, backend,
         partitioned = (:z => slevel_subject,))
     @test_throws ContractValidationError prepare_partition_sampler(built, bound, :y, u;
-        by = :subject, backend = rt, partitioned = (:z,))        # z's axis is group, not subject
+        by = :subject, backend, partitioned = (:z,))        # z's axis is group, not subject
     @test_throws ContractValidationError prepare_partition_sampler(built, bound, :y, u;
-        by = :subject, backend = rt, partitioned = (:nope,))
+        by = :subject, backend, partitioned = (:nope,))
     # A parameter indexed by the key column itself is named bare.
     sdata = (; data..., subject = data.subject)
     kbound, kbuilt = _cq_bound(_CQ_SUBJECT, sdata, (:y,))
     ku = collect(range(-0.3, 0.4; length = kbuilt.layout.total))
-    ks = prepare_partition_sampler(kbuilt, kbound, :y, ku; by = :subject, backend = rt,
+    ks = prepare_partition_sampler(kbuilt, kbound, :y, ku; by = :subject, backend,
                                    partitioned = (:z,))
     knames = coordinate_names(kbuilt.layout)
     for label in 1:3

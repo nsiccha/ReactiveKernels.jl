@@ -1058,11 +1058,10 @@ views, and Enzyme rejects Base `hcat` of views beside dense arrays (Enzyme snag
 Enzyme fix (`test_plate_cell.jl` pins it broken).
 
 A plate body that reads a captured value through its window (a struct of
-active data beside constant rows, `M[q, :]` of a shared matrix) differentiates
-under registered Enzyme with `Enzyme.set_runtime_activity(Enzyme.Reverse)`:
-static activity refuses the constant rows a call returns stored beside active
-data (Enzyme snag `native-reverse-r-285478e2`), which the Enzyme dogfood
-branch repairs.
+active data beside constant rows, `M[q, :]` of a shared matrix) requires the
+upstream repair on Enzyme's dogfood branch for ordinary Reverse. Registered
+Enzyme's static activity analysis rejects the constant rows returned beside
+active data (Enzyme snag `native-reverse-r-285478e2`).
 
 Two more producers run at a cell's rows: `view(A, lo:hi)` or `A[lo:hi]` and
 `reshape(v, n, k...)`, with the bounds and dimensions integer literals or
@@ -1152,7 +1151,9 @@ computes (those stay constants inference folds), or a value the body writes
 into. A statement whose value is a shape of a data value is computed in the
 plan from the exemplar and
 checked against the value's shape on every call: arguments of another shape
-throw `ArgumentError` naming `partition_plan`. The plan's type is the port's
+throw `ArgumentError` naming `partition_plan`. Cached rows are checked against
+the call's label, throwing `ArgumentError` on a mismatch; compute a separate
+plan for each label. The plan's type is the port's
 declared type (`plan = port => T`), found by preparing the plan kernel first
 (`partition_plan_kernel(spec; have, want, bound)`, the same arguments as
 `prepare`, returns the kernel that computes a label's plan; `T` is the type of
@@ -1160,14 +1161,19 @@ its result), or, for an untyped port, by evaluating the plan on `prepare`'s
 `exemplars` (one value per HAVE port, `nothing` for the plan port); a plan
 port that cannot be typed is refused naming the remedy, never silently
 dropped. `partition_plan_kernel(kernel)` returns the plan kernel of a prepared
-partition; `partition_plan` keeps one per kernel for the process. Native
-Enzyme Reverse differentiates a planned partition with runtime activity on
-registered Enzyme 0.13.216 (the plan's constant row vectors meet the active
-vector in the body's views, which its static activity analysis refuses; the
-Enzyme dogfood line from `1280e6ee` differentiates it as is). `plan_constant`
+partition; `partition_plan` keeps one per kernel for the process. Ordinary
+Enzyme Reverse differentiates a planned partition with the upstream repair
+on Enzyme's dogfood line from `1280e6ee`. Registered Enzyme 0.13.216 has an
+activity-analysis defect for constant plan fields beside active values
+(`plan-const-int-r-4671f4a7`); runtime activity is not an accepted remedy.
+That repair does not cover every compact sampler: the grouped RKPPL
+partition test still raises `EnzymeRuntimeActivityError` at the compact
+overlay's choice between base and active data on the same Enzyme revision.
+Its ordinary-Reverse gradient remains an upstream limitation.
+`plan_constant`
 names HAVE ports whose values are constant per label (not data for the plan),
 and a lazy view of inputs may serve its rows from its parts
-(`_cell_lazy_rows(op, inputs, rows)`, the op's own method returning the
+(`_cell_lazy_rows(op, inputs, rows, bind, constant)`, the op's own method returning the
 expression): ReactiveKernelsPPL's compact overlay reads its active vector at
 the slots of a block's rows, computed once per label.
 

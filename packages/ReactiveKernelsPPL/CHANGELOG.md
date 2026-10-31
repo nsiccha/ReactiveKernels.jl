@@ -23,9 +23,12 @@ are recorded in the git history only.
   its active vector at slots computed once per label from that label's slot
   map, not through the overlay's per-element slot load and branch; a
   partition reading a packed coordinate outside its footprint is refused by
-  name at preparation. On BRM's nested panel at atlas-17 size the compact
-  gradient is 2.04× the sweep's per-unit share (2.3× with 0.1.23, 2.63×
-  before). Requires ReactiveKernels 0.1.29.
+  name at preparation. Requires ReactiveKernels 0.1.29.
+- The earlier 2.04× sweep-share measurement used runtime activity and does
+  not establish ordinary-Reverse acceptance. The grouped compact sampler
+  still raises `EnzymeRuntimeActivityError` on Enzyme dogfood `1280e6ee`,
+  despite that revision's repair for constant plan fields. This remains an
+  upstream limitation; the partition tests exercise ordinary Reverse.
 
 ## 0.1.23
 
