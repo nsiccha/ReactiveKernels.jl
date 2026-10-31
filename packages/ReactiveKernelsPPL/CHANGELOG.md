@@ -25,7 +25,8 @@ are recorded in the git history only.
   identity and row-local vector transforms to strict partitions while preserving
   actual coupled dependencies and the caller's joint prior. Scalar cells
   and joint cell latents use the same endpoints. Printed `kernel_expr` source
-  reconstructs the geometry through `sampling_geometry`. Ordinary callbacks,
+  reconstructs the geometry through `sampling_geometry`, including parametric
+  law constructors. Ordinary callbacks,
   omitted defaults and splatted arguments retain their numerical call path.
   Requires ReactiveKernels 0.1.33.
 

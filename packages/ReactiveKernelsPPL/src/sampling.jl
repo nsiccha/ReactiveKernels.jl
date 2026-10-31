@@ -358,6 +358,8 @@ _sampling_read_literal(x::Union{Symbol,GlobalRef}, mod) =
 function _sampling_read_literal(x::Expr, mod)
     x.head === :tuple && return Tuple(_sampling_read_literal(a, mod) for a in x.args)
     x.head === :. && return ReactiveKernels._kernel_resolve_binding(mod, x)
+    x.head === :curly && return _eval_type_application(x,
+        a -> _sampling_read_literal(a, mod))
     f = x.head === :call ? ReactiveKernels._kernel_resolve_binding(mod, first(x.args)) : nothing
     if f in (Core.Expr, Core.QuoteNode, Core.GlobalRef)
         return f((_sampling_read_literal(a, mod) for a in x.args[2:end])...)
