@@ -646,6 +646,7 @@ _data_arg(name::Symbol, ::AbstractArray{T,N}) where {T,N} = Expr(:(::), name, Ar
 # here (see `_eval_kernel_def`).
 module PPLGeneratedModels
 using ReactiveKernels
+import ..ReactiveKernelsPPL
 import ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,

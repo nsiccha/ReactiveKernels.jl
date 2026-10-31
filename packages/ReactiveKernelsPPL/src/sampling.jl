@@ -115,6 +115,13 @@ and inverse must enforce it. Endpoints are ordinary pure Julia callables:
 a packed vector, and the third the log absolute Jacobian. Host and kernel
 execution call these same endpoints. `coordinate_names`, when supplied, has
 one Symbol per packed coordinate. Draw generation is outside this contract.
+
+Endpoints may also be function-shaped `@kernel` graphs. The descriptor prepares
+their host callables once; generated transforms compose the graph when every
+argument is explicitly supplied (including keywords). Thus supported row
+operations retain their locality and actual coordinate dependencies. Calls with
+omitted defaults or splatted arguments retain the prepared numerical path, as
+do ordinary Julia callbacks. A local transform does not factorize its density.
 """
 struct ParameterGeometry{S,N,P,C,U,J,L}
     shape::S
@@ -125,10 +132,22 @@ struct ParameterGeometry{S,N,P,C,U,J,L}
     logjac::J
     coordinate_names::L
 end
+
+# Keep the authored graph for composition and prepare its host callable once,
+# when the structural descriptor is built, never in a transform evaluation.
+struct _SamplingGraphEndpoint{F}
+    graph::KernelSpec
+    prepared::F
+end
+(endpoint::_SamplingGraphEndpoint)(args...; kwargs...) = endpoint.prepared(args...; kwargs...)
+_sampling_endpoint(f) = f
+_sampling_endpoint(f::KernelSpec) = _SamplingGraphEndpoint(f, prepare(f))
+
 function ParameterGeometry(shape, unconstrained; support, constrain, unconstrain,
         logjac, coordinate_names=nothing)
-    return ParameterGeometry(Tuple(shape), unconstrained, support, constrain,
-        unconstrain, logjac, coordinate_names)
+    return ParameterGeometry(Tuple(shape), unconstrained, support,
+        _sampling_endpoint(constrain), _sampling_endpoint(unconstrain),
+        _sampling_endpoint(logjac), coordinate_names)
 end
 
 """
@@ -310,9 +329,73 @@ function _external_geometry_expr(e)
         Expr(:tuple, (_sampling_ast_literal(d) for d in e.sampling.geometry.shape)...))
 end
 function _external_edge(e, edge)
+    endpoint = edge === :_sampling_constrain ? :constrain : :logjac
+    graph = _sampling_graph_call(e.sampling.geometry, endpoint,
+        _external_geometry_expr(e),
+        Any[_external_u(e), Expr(:tuple, e.dims...), _external_arguments(e.sampling)...],
+        _external_keywords(e.sampling))
+    graph === nothing || return graph
     return _external_endpoint_call(GlobalRef(@__MODULE__, edge),
         Any[_external_geometry_name(e), _external_u(e), Expr(:tuple, e.dims...),
             _external_arguments(e.sampling)...], _external_keywords(e.sampling))
+end
+
+# A source-level constructor for the same graph held by ParameterGeometry.
+# Its arguments are the structural sampling_geometry arguments, not sampled
+# values. The positional view also allows explicitly supplied keyword ports
+# to be composed in the graph's declared order.
+function _sampling_graph_endpoint(constructor, arguments::Tuple, shape::Tuple, edge::Symbol)
+    geometry = sampling_geometry(constructor, arguments, shape)
+    return extract(getproperty(geometry, edge).graph)
+end
+
+# Decode only the literal syntax emitted by _sampling_ast_literal. Do not
+# evaluate arbitrary expressions or look up model-local values here.
+_sampling_read_literal(x::Union{Number,AbstractString,Char,Nothing,Module}, mod) = x
+_sampling_read_literal(x::QuoteNode, mod) = x.value
+_sampling_read_literal(x::Union{Symbol,GlobalRef}, mod) =
+    ReactiveKernels._kernel_resolve_binding(mod, x)
+function _sampling_read_literal(x::Expr, mod)
+    x.head === :tuple && return Tuple(_sampling_read_literal(a, mod) for a in x.args)
+    x.head === :. && return ReactiveKernels._kernel_resolve_binding(mod, x)
+    x.head === :curly && return _eval_type_application(x,
+        a -> _sampling_read_literal(a, mod))
+    f = x.head === :call ? ReactiveKernels._kernel_resolve_binding(mod, first(x.args)) : nothing
+    if f in (Core.Expr, Core.QuoteNode, Core.GlobalRef)
+        return f((_sampling_read_literal(a, mod) for a in x.args[2:end])...)
+    end
+    throw(ArgumentError("expected literal geometry constructor syntax, got $x"))
+end
+function ReactiveKernels._kernel_resolve_graph_constructor(
+        ::typeof(_sampling_graph_endpoint), arguments, mod::Module)
+    length(arguments) == 4 || return nothing
+    return _sampling_graph_endpoint((_sampling_read_literal(a, mod) for a in arguments)...)
+end
+
+function _sampling_graph_call(g, edge, geometry_expr, arguments, keywords)
+    endpoint = getproperty(g, edge)
+    endpoint isa _SamplingGraphEndpoint || return nothing
+    any(a -> Meta.isexpr(a, :...), arguments) && return nothing
+    spec = endpoint.graph
+    ordered = Any[arguments...]
+    signature = spec.call_signature
+    if signature isa ReactiveKernels._KernelCallSignature
+        positional, named = typeof(signature).parameters[1:2]
+        # Ordinary callbacks and graph calls with omitted/default or splatted
+        # arguments retain their prepared host semantics. Full boundaries
+        # compose, including keyword ports independent of call-site order.
+        length(positional) == length(arguments) || return nothing
+        all(k -> Meta.isexpr(k, :kw, 2) && k.args[1] isa Symbol, keywords) || return nothing
+        supplied = Dict(k.args[1] => k.args[2] for k in keywords)
+        length(supplied) == length(keywords) || return nothing
+        Set(keys(supplied)) == Set(named) || return nothing
+        append!(ordered, (supplied[name] for name in named))
+    else
+        isempty(keywords) || return nothing
+    end
+    callee = Expr(:call, GlobalRef(@__MODULE__, :_sampling_graph_endpoint),
+        geometry_expr.args[2:end]..., QuoteNode(edge))
+    return Expr(:call, callee, ordered...)
 end
 function _external_endpoint_call(head, args, keywords)
     return isempty(keywords) ? Expr(:call, head, args...) :
@@ -323,6 +406,9 @@ _sampling_logjac(g, u, shape, args...; kwargs...) = g.logjac(u, shape, args...; 
 
 function _sampling_scalar_constrain(g, u, args...; kwargs...)
     value = g.constrain([u], (), args...; kwargs...)
+    return _sampling_scalar_check(value)
+end
+function _sampling_scalar_check(value)
     value isa Number || throw(ArgumentError("scalar sampling geometry must constrain to a number"))
     return value
 end
@@ -355,8 +441,17 @@ function _external_cells_expr(e, edge)
     end
     endpoint = GlobalRef(@__MODULE__, Symbol(:_sampling_scalar_, edge))
     keywords = _external_cell_keywords!(inputs, e.sampling)
-    cell = _external_endpoint_call(endpoint,
-        Any[_external_geometry_expr(e), _dovar(1), arguments...], keywords)
+    graph = _sampling_graph_call(e.sampling.geometry, edge, _external_geometry_expr(e),
+        Any[Expr(:vect, _dovar(1)), Expr(:tuple), arguments...], keywords)
+    cell = if graph === nothing
+        _external_endpoint_call(endpoint,
+            Any[_external_geometry_expr(e), _dovar(1), arguments...], keywords)
+    elseif edge === :constrain
+        value = gensym(:_ppl_constrained)
+        Expr[:($value = $graph), :($(GlobalRef(@__MODULE__, :_sampling_scalar_check))($value))]
+    else
+        graph
+    end
     # Same retained plate body for transforms and log-Jacobians; only the
     # endpoint changes. Host broadcasting calls these identical endpoints.
     return first(_plate_sum_stmts(:unused, :unused_sum, inputs, cell)).args[2]

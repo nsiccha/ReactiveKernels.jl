@@ -1194,9 +1194,8 @@ end
     # coming through an LKJ factor (`R = Z * (sd .* L)'`): a site's footprint
     # holds the shared coordinates and its own groups' rows of `Z` only, and
     # its gradient is the dense one there.
-    # This still exposes Enzyme snag `static-reverse-g-173719b3` on dogfood
-    # 1280e6ee: the compact overlay's base/active select is rejected. Keep
-    # ordinary Reverse here so that the unresolved limitation remains visible.
+    # On Julia 1.10 this needs the second constant-field repair, Enzyme
+    # dogfood a6458e9c (`static-reverse-g-173719b3`), beyond 1280e6ee.
     grouped_backend = AutoEnzyme(; mode = Enzyme.Reverse)
     gs = prepare_partition_sampler(gbuilt, gbound, :y, gu; by = :site, backend = grouped_backend,
                                    compact = true)

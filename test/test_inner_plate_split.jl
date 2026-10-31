@@ -43,9 +43,21 @@ isdefined(@__MODULE__, :InnerPlateSplit) ||
               nothing
         @test RK._kernel_split_nodes(:(logit * (logit > 0 && log(y) > 0)), ports) ===
               nothing
-        # A dotted call is a node only as a whole.
+        # Partial evaluation retains its whole fused operand. Factor queries
+        # also address the sum operand, keeping its nested broadcasts fused.
         dotted = RK._kernel_split_nodes(:(sum(log.(y .+ 1.0)) * logit), ports)
         @test only(dotted.nodes).expr == :(sum(log.(y .+ 1.0)))
+        factors = RK._kernel_split_nodes(:(sum(log.(y .+ 1.0)) * logit), ports; factors = true)
+        @test [n.expr for n in factors.nodes] ==
+              [:(log.(y .+ 1.0)), :(sum(log.(y .+ 1.0)))]
+    end
+
+    @testset "factor cuts preserve their error policy at shared split boundaries" begin
+        f = RK._cell_factor_graph(C.factor_error_policy, :result)
+        @test isempty(f.sums)
+        @test_throws ArgumentError prepare(f.spec)(-2.0, 3.0)
+        @test prepare(f.spec; on_error = :ignore)(-2.0, 3.0) == 7.0
+        @test prepare(f.spec)(2.0, 3.0) == 7.0
     end
 
     for (label, kernel) in (("untyped live input", C.mixed),

@@ -67,6 +67,15 @@ end
     total = sum(values)
     return total
 end
+@kernel affine_columns(groups, scale::Float64) = begin
+    values = plate(eachindex(groups)) do event
+        shifted = scale .+ (scale - 1) .* groups[event]
+        table = hcat(shifted, groups[event])
+        column_squares(table)
+    end
+    total = sum(values)
+    return total
+end
 @kernel paired_broadcasts(x, c, scale::Float64) = begin
     left = x .* scale
     right = c .* scale
@@ -218,6 +227,8 @@ gathered_rows_data(groups, n) = (rows = [collect(g:groups:n) for g in 1:groups],
             (xs, s) -> 2s * sum(x -> sum(abs2, x; init=0.0), xs; init=0.0)),
         (inline_columns, (xs, s) -> sum(x -> sum(abs2, x; init=0.0) * (s^2 + 1), xs; init=0.0),
             (xs, s) -> 2s * sum(x -> sum(abs2, x; init=0.0), xs; init=0.0)),
+        (affine_columns, (xs, s) -> sum(x -> sum(v -> abs2(s + (s - 1) * v) + abs2(v), x; init=0.0), xs; init=0.0),
+            (xs, s) -> sum(x -> sum(v -> 2(s + (s - 1) * v) * (1 + v), x; init=0.0), xs; init=0.0)),
         (literal_columns, (xs, s) -> sum(x -> 2sum(abs2, x; init=0.0) + sum(v -> abs2(s + v), x; init=0.0), xs; init=0.0),
             (xs, s) -> sum(x -> sum(v -> 2(s + v), x; init=0.0), xs; init=0.0)))
         for data in (groups, [zeros(0)], Vector{Float64}[], [[1.0], [2.0, 3.0]],
@@ -302,8 +313,8 @@ gathered_rows_data(groups, n) = (rows = [collect(g:groups:n) for g in 1:groups],
     @test ad_gradient(ad_matrix, column) ≈ 4sum(column .+ row; dims=2)
 end
 
-function event_allocations(groups)
-    k = prepare(event_columns; bound=(; groups))
+function event_allocations(groups, spec=event_columns)
+    k = prepare(spec; bound=(; groups))
     ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), 0.6; active=:scale)
     k(0.6), ad_gradient(ad, 0.6)
     ((@allocations k(0.6)), (@allocations ad_gradient(ad, 0.6)))
@@ -311,6 +322,10 @@ end
 @testset "event-dependent recipes allocate independently of event count" begin
     vectors = map(n -> event_allocations([fill(0.1i, 3) for i in 1:n]), (3, 60))
     @test vectors[1] == vectors[2]
+    # The scalar subtraction is lifted out of the event loop. Its generated
+    # input name must still resolve when composing the remaining broadcast.
+    affine = map(n -> event_allocations([fill(0.1i, 3) for i in 1:n], affine_columns), (3, 60))
+    @test affine[1] == affine[2]
     # Matrix broadcasts still materialize per event (`_cell_array_broadcast`).
     matrices = map(n -> event_allocations([fill(0.1i, 2, 2) for i in 1:n]), (3, 60))
     @test_broken matrices[1] == matrices[2]

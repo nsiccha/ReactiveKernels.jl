@@ -100,8 +100,11 @@ const _PPL_TEST_FILES = (
     "test_scoped_submodels.jl",
     "test_qualified_submodels.jl",
     "test_external_sampling.jl",
+    "test_dirichlet_multinomial_adapter.jl",
     "test_external_argument_sharing.jl",
     "test_graph_density.jl",
+    "test_graph_geometry.jl",
+    "test_graph_geometry_constructors.jl",
     "test_whole_event_mixture.jl",
     "test_whole_event_occupancy.jl",
     "test_hidden_markov.jl",
@@ -235,6 +238,7 @@ const _PPL_TEST_FILES = (
     "test_cell_query.jl",
     "test_query_footprints.jl",
     "test_compact_cell_derivatives.jl",
+    "test_cell_factors.jl",
     "test_logistic_values.jl",
 )
 

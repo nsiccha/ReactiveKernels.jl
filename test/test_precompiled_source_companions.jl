@@ -52,9 +52,19 @@ using ReactiveKernels, Test
                     return s
                 end
                 bound = prepare(dot; bound = (; w = collect(range(0.1, 1.4; length = 14))))
-                folds, scaled, prepare(scaled), dot, bound
+                # Strict inference and an eager call both read source bodies
+                # while the consumer's cache binding is newer than RK's
+                # generated source-call method (Julia 1.12+).
+                scalar = @kernel scalar_branch(x::Float64) = begin
+                    y = x > 0 ? x * x + 1 : -x
+                    return y
+                end
+                checked = prepare(scalar; type_stability = :error,
+                                   type_stability_level = :all)
+                @assert Base.invokelatest(checked, 2.0) == 5.0
+                folds, scaled, prepare(scaled), dot, bound, checked
             end
-            const FOLDS, SCALED, SCALED_PREPARED, DOT, BOUND_DOT = make_graphs()
+            const FOLDS, SCALED, SCALED_PREPARED, DOT, BOUND_DOT, SCALAR = make_graphs()
             end
             """)
         setup = """
@@ -72,6 +82,23 @@ using ReactiveKernels, Test
                                     stdout = stdout, stderr = stderr))
         @test setup_ok
         setup_ok || return
+        # Loading RK from source preserves the definition worlds of its
+        # globals. A later-defined wrapper type must not be referenced by an
+        # earlier source-call generator, even for an ordinary RK-owned cache.
+        source_probe = """
+            using Test, ReactiveKernels
+            @kernel affine(x::Float64) = begin
+                y = 2 * x + 1
+                return y
+            end
+            kernel = prepare(affine; type_stability = :error,
+                             type_stability_level = :all)
+            @test (@inferred kernel(2.0)) == 5.0
+            println("SOURCE_LOADED_COMPANION_PASS")
+            """
+        @test success(pipeline(
+            `$julia --startup-file=no --compiled-modules=no --project=$env -e $source_probe`;
+            stdout = stdout, stderr = stderr))
         probe = """
             using Test, ReactiveKernels, WarmSourceConsumer
             include($(repr(audit)))
@@ -100,6 +127,8 @@ using ReactiveKernels, Test
             warm(spec::RK.KernelSpec) = warm(spec.graph)
             @testset "loaded image" begin
             @test C.WAS_PRECOMPILED
+            @test C.SCALAR(2.0) == 5.0
+            @test C.SCALAR(-2.0) == 2.0
             # The case under test: the image holds warm-wrapped companions.
             @test warm(C.FOLDS)
             @test warm(C.SCALED)

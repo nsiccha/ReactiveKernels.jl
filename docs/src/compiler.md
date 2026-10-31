@@ -1101,6 +1101,52 @@ inputs: an undeclared value with no row form may be an array computed whole,
 and is refused as `:untyped`, naming the declaration (`s::Float64 = …`) that
 settles it.
 
+### A cell factored at its sums
+
+ReactiveKernelsPPL's `prepare_cell_factors(built, plan, :y)` exposes a cell's
+sum reductions for sparse curvature calculations. It recognizes a sum written
+inline, assigned to a local, or computed in an earlier plate whose output the
+observation reads. `cell_reductions(f)` gives their names in graph order and
+`reduction_rows(f, j, cell)` their row labels in term order.
+
+Before choosing compact coordinates, prepare scalar value queries with
+`outer = prepare_cell_factor_query(f, :outer)` and
+`term = prepare_cell_factor_query(f, j)`. Call `outer(u, sums, cell)` or
+`term(u, cell, term_position)`. The packed `AbstractVector{Float64}` is
+passed through without copying, so a recording vector observes that call's
+reads. For a structural read set including both arms of retained branches,
+prepare `fp = partition_footprint_kernel(term.kernel)` and call
+`Base.invokelatest(fp, u, cell, term_position).unconstrained`. The same
+operation on `outer.kernel` takes `u, sums, cell` and finds its direct packed
+reads, with the sums treated as independent inputs. A footprint is sorted
+unique packed indices or `:whole` (all indices); it may be conservative, as
+for other cell queries. Prepare these queries and footprint kernels once,
+then vary the cell and term. Value-only factor queries require RKPPL 0.1.26.
+
+`prepare_cell_factor_ad(prepare_operator, f, :outer, base, indices, backend,
+exemplars...)` prepares the density over independent sum values and selected
+direct packed coordinates. Its active point, directions and derivatives are
+tuples `(sums, active)`. The RK derivative verbs take
+`base, sums, active, indices, cell` last. With reduction index `j` instead of
+`:outer`, the operator differentiates one summand over selected packed
+coordinates; its calls take `base, active, indices, cell, term` last. `term`
+is a position in the row vector, rather than its row label. `cell0` and
+`term0` keywords select a preparation exemplar when needed.
+
+For a density `F(s(x), x_direct)`, the pieces reconstruct its Hessian as
+`J' * H_F * J + sum(g_F[j] * H_s[j])`, including the direct coordinates in
+`J`. The same chain rule gives third-order contractions from the outer and
+summand operators. This avoids asking for a dense Hessian over every packed
+coordinate read by a long sum. Empty sums have no summand calls; a cell
+without sums has just its ordinary outer density.
+
+The supported reductions are `sum` of elementwise expressions over gathered,
+data-defined rows. Other reductions remain in the outer computation. Each
+piece is an ordinary graph: source metadata retains the cuts, and the same
+cell row lowering and AD preparation evaluate it. The extra cut boundaries
+do not change ordinary partial-evaluation choices. `locality` and
+`partition_locality` apply as for the other cell queries.
+
 ### A partition of plates by a key
 
 `plate_partition(spec, plates; by, index = :partition, name = :partition_total,
@@ -1176,10 +1222,10 @@ Enzyme Reverse differentiates a planned partition with the upstream repair
 on Enzyme's dogfood line from `1280e6ee`. Registered Enzyme 0.13.216 has an
 activity-analysis defect for constant plan fields beside active values
 (`plan-const-int-r-4671f4a7`); runtime activity is not an accepted remedy.
-That repair does not cover every compact sampler: the grouped RKPPL
-partition test still raises `EnzymeRuntimeActivityError` at the compact
-overlay's choice between base and active data on the same Enzyme revision.
-Its ordinary-Reverse gradient remains an upstream limitation.
+Grouped compact RKPPL partitions on Julia 1.10 also require Enzyme dogfood
+from `a6458e9c` (`static-reverse-g-173719b3`). This second repair preserves
+the constant-field proof when a method receives two views of the plan,
+allowing ordinary Reverse through the overlay's choice of base or active data.
 `plan_constant`
 names HAVE ports whose values are constant per label (not data for the plan),
 and a lazy view of inputs may serve its rows from its parts
