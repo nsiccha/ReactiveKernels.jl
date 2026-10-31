@@ -1006,6 +1006,15 @@ function _partition_plan_split(body::Expr, data_names, ops)
     while !isempty(pending)
         name = pop!(pending)
         for value in get(bindings, name, ())
+            # This allocator returns fresh storage. Writing its result does
+            # not write the axis marker, element-type inputs or shape used
+            # to allocate it. Following those as aliases would pull the
+            # marker's entire row-bookkeeping ancestry back into the body.
+            # Keep unknown calls conservative; match the owned allocator's
+            # identity, never an authored function with the same name.
+            Meta.isexpr(value, :call) &&
+                value.args[1] === GlobalRef(@__MODULE__, :_plate_similar_output) &&
+                continue
             for ref in intersect(_symbol_refs!(Set{Symbol}(), value), names)
                 ref in followed && continue
                 push!(forced, ref)

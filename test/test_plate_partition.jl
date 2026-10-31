@@ -29,6 +29,7 @@ _pp_central(f, x; h = 1e-6) = (f(x + h) - f(x - h)) / (2h)
     total = sum(dens)
     return total
 end
+
 # `per_subject[s]` rows for subject `s`, in two groups each.
 function _pp_subject_data(per_subject)
     subject = Int[s for (s, n) in enumerate(per_subject) for _ in 1:n]
@@ -679,4 +680,87 @@ end
             @test isequal(p, before)
         end
     end
+end
+
+@kernel _pp_buffered_rows(u::AbstractVector{Float64}, rows::AbstractVector{Int},
+                          subject::AbstractVector{Int}) = begin
+    transformed = plate(u) do x
+        x^2 + x
+    end
+    selected = transformed[rows]
+    dens = plate(selected) do x
+        -x^2
+    end
+    total = sum(dens)
+    return total
+end
+
+@testset "partition plans separate fresh buffers from allocation inputs" begin
+    # The allocator's marker and shape cannot alias the storage it returns.
+    # A write through a view must still keep that storage per call, while
+    # its read-only marker and row map can stay in the reusable plan.
+    for n in (0, 1, 5)
+        body = quote
+            rows = collect(1:$n)
+            marker = map(Float64, rows)
+            dims = axes(marker)
+            scratch = $(GlobalRef(ReactiveKernels, :_plate_similar_output))(marker, Float64, dims)
+            alias = view(scratch, :)
+            for i in eachindex(rows)
+                alias[i] = u * rows[i]
+            end
+            return sum(scratch) + sum(rows)
+        end
+        plan, main, needed, _ = ReactiveKernels._partition_plan_split(body, [:u], Any[])
+        @test :rows in needed
+        @test :marker in needed
+        @test :scratch ∉ needed && :alias ∉ needed
+        planner = ReactiveKernels.compile(Expr(:function, Expr(:tuple, :u),
+            Expr(:block, plan..., Expr(:return, Expr(:tuple, needed...)))))
+        reads = [Expr(:(=), name, :(p[$i])) for (i, name) in enumerate(needed)]
+        planned = ReactiveKernels.compile(Expr(:function, Expr(:tuple, :u, :p),
+            Expr(:block, reads..., main...)))
+        p = planner(1.0)
+        before = deepcopy(p)
+        for u in (2.0, -3.0, 4.0)
+            @test planned(u, p) == (u + 1) * n * (n + 1) / 2
+            @test isequal(p, before)
+        end
+    end
+
+    # Public lowering: an intermediate authored plate allocates a buffer,
+    # then a downstream gather reads it. Row bookkeeping belongs in the
+    # plan, but the intermediate values must follow every changed input.
+    loop_counts = Int[]
+    for n in (6, 30)
+        u = collect(range(0.1, 0.8; length = n))
+        rows = repeat(collect(1:n), 2)
+        subject = repeat([1, 2], n)
+        spec = plate_partition(_pp_buffered_rows, :dens;
+            by = :subject, index = :label, plan = :plan)
+        k = prepare(spec; have = (:u, :rows, :subject, :label, :plan),
+            want = :partition_total, bound = (; rows, subject),
+            exemplars = (u, 1, nothing))
+        ast = string(k.ast)
+        @test !occursin("_cell_canonical_rows", ast)
+        @test !occursin("_cell_window_positions", ast)
+        push!(loop_counts, length(findall("for ", ast)))
+        p = partition_plan(k, u, 1, nothing)
+        before = deepcopy(p)
+        for scale in (2.0, -1.0, 1.0)
+            x = scale .* u
+            selected = rows[subject .== 1]
+            @test k(x, 1, p) ≈ -sum((x[selected].^2 .+ x[selected]).^2)
+            @test isequal(p, before)
+        end
+        ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), u, 1, p; active = :u)
+        gradient = similar(u)
+        value, _ = ad_value_and_gradient!(ad, gradient, u, 1, p)
+        expected = [-count(==(i), rows[subject .== 1]) * 2 * (u[i]^2 + u[i]) *
+                    (2 * u[i] + 1) for i in eachindex(u)]
+        @test value ≈ k(u, 1, p)
+        @test gradient ≈ expected
+    end
+    @test first(loop_counts) > 0
+    @test first(loop_counts) == last(loop_counts)
 end
