@@ -236,6 +236,7 @@ const _PPL_TEST_FILES = (
     "test_cell_query.jl",
     "test_query_footprints.jl",
     "test_compact_cell_derivatives.jl",
+    "test_cell_factors.jl",
     "test_logistic_values.jl",
 )
 

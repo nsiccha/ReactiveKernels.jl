@@ -1102,6 +1102,38 @@ inputs: an undeclared value with no row form may be an array computed whole,
 and is refused as `:untyped`, naming the declaration (`s::Float64 = …`) that
 settles it.
 
+### A cell factored at its sums
+
+ReactiveKernelsPPL's `prepare_cell_factors(built, plan, :y)` exposes a cell's
+sum reductions for sparse curvature calculations. It recognizes a sum written
+inline, assigned to a local, or computed in an earlier plate whose output the
+observation reads. `cell_reductions(f)` gives their names in graph order and
+`reduction_rows(f, j, cell)` their row labels in term order.
+
+`prepare_cell_factor_ad(prepare_operator, f, :outer, base, indices, backend,
+exemplars...)` prepares the density over independent sum values and selected
+direct packed coordinates. Its active point, directions and derivatives are
+tuples `(sums, active)`. The RK derivative verbs take
+`base, sums, active, indices, cell` last. With reduction index `j` instead of
+`:outer`, the operator differentiates one summand over selected packed
+coordinates; its calls take `base, active, indices, cell, term` last. `term`
+is a position in the row vector, rather than its row label. `cell0` and
+`term0` keywords select a preparation exemplar when needed.
+
+For a density `F(s(x), x_direct)`, the pieces reconstruct its Hessian as
+`J' * H_F * J + sum(g_F[j] * H_s[j])`, including the direct coordinates in
+`J`. The same chain rule gives third-order contractions from the outer and
+summand operators. This avoids asking for a dense Hessian over every packed
+coordinate read by a long sum. Empty sums have no summand calls; a cell
+without sums has just its ordinary outer density.
+
+The supported reductions are `sum` of elementwise expressions over gathered,
+data-defined rows. Other reductions remain in the outer computation. Each
+piece is an ordinary graph: source metadata retains the cuts, and the same
+cell row lowering and AD preparation evaluate it. The extra cut boundaries
+do not change ordinary partial-evaluation choices. `locality` and
+`partition_locality` apply as for the other cell queries.
+
 ### A partition of plates by a key
 
 `plate_partition(spec, plates; by, index = :partition, name = :partition_total,

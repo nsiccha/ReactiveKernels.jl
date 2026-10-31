@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.25
+
+- `prepare_cell_factors(built, plan, observation)`, `cell_reductions` and
+  `reduction_rows` discover a cell's sums, including inline expressions,
+  local names and earlier plate outputs. `prepare_cell_factor_ad` prepares
+  any RK derivative operator for the outer density (`:outer`, active over
+  the sum vector and selected direct packed coordinates) or one summand
+  (a reduction index, active over selected packed coordinates). Calls use
+  the ordinary RK derivative verbs and compact coordinate selections.
+  Empty reductions make no summand calls; no-sum cells have an ordinary
+  outer density. The pieces support Hessian and third-order chain rules for
+  sparse Laplace without a dense block over every coordinate a sum reads.
+  Requires ReactiveKernels 0.1.32.
+
 ## 0.1.24
 
 - Document and test the corrected upstream `DirichletMultinomial` dependency
@@ -26,6 +40,7 @@ are recorded in the git history only.
   Other environments must select that dependency revision explicitly;
   upgrading RKPPL alone does not repair Distributions 0.25.132. The adapter
   continues to delegate directly to the distribution's public `logpdf`.
+
 
 ## 0.1.23
 

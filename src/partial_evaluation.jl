@@ -265,14 +265,15 @@ end
 # retained source, or `nothing`. The source supplies the parts' readable
 # recipes; a decomposition that does not match the metadata's shape is not
 # split.
-function _partial_split_parts(r::Recipe)
+function _partial_split_parts(r::Recipe; factors::Bool = false)
     r.op isa _KernelSourceOp || return nothing
     native = getfield(r.op, :f)
     native isa _KernelSplit || return nothing
+    factors && native.factors !== nothing && (native = native.factors)
     shape = _kernel_split_spec(native)
     ports = collect(Symbol, first(shape))
     length(ports) == length(r.inputs) || return nothing
-    split = _kernel_split_nodes(r.source, ports)
+    split = _kernel_split_nodes(r.source, ports; factors)
     split === nothing || _kernel_split_shape(ports, split) == shape || return nothing
     split === nothing ? nothing : (; native, split)
 end
@@ -291,20 +292,27 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
     output = only(r.outputs)
     token = kernel_sourceop_token(r.op)
     mod = _kernel_endpoint_source_module(r.op)
+    ignored = native.ignored
+    function operation(suffix, form, f, twin)
+        name = Val(Symbol(token, suffix))
+        ig = twin === nothing ? nothing : _KernelSourceOp(name, Val(form), twin,
+                                                         nothing, nothing, mod)
+        _KernelSourceOp(name, Val(form), f, ig, nothing, mod)
+    end
     function emit!(i)
         node = nodes[i]
         value = value!(g, Symbol(output.name, :_part, i), Any)
         part = if dataonly[i] || !holds[i]
             Recipe(fresh(), Tuple(r.inputs[p] for p in node.own), (value,),
-                   _KernelSourceOp(Val(Symbol(token, :_part, i)), Val(:fused),
-                                   native.wholes[i], nothing, nothing, mod),
+                   operation(Symbol(:_part, i), :fused, native.wholes[i],
+                             ignored === nothing ? nothing : ignored.wholes[i]),
                    r.cost, nothing, false, node.expr)
         else
             kids = Value[emit!(k) for k in node.kids]
             Recipe(fresh(), (Tuple(r.inputs[p] for p in node.direct)..., kids...),
                    (value,),
-                   _KernelSourceOp(Val(Symbol(token, :_split, i)), Val(:fused),
-                                   native.splits[i], nothing, nothing, mod),
+                   operation(Symbol(:_split, i), :fused, native.splits[i],
+                             ignored === nothing ? nothing : ignored.splits[i]),
                    r.cost, nothing, false, node.body)
         end
         push!(recipes, part)
@@ -314,8 +322,8 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
     kids = Value[emit!(k) for k in split.root.kids]
     root = Recipe(r.id, (Tuple(r.inputs[p] for p in split.root.direct)..., kids...),
                   r.outputs,
-                  _KernelSourceOp(Val(Symbol(token, :_root)), Val(kernel_sourceop_form(r.op)),
-                                  native.root, nothing, nothing, mod),
+                  operation(:_root, kernel_sourceop_form(r.op), native.root,
+                            ignored === nothing ? nothing : ignored.root),
                   r.cost, nothing, false, split.root.body)
     push!(recipes, root)
     readable[r.id] = root

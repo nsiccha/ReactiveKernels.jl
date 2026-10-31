@@ -799,7 +799,8 @@ end
                 @test nameof(typeof(result)) === :IllegalTypeAnalysisException
                 continue
             end
-            broken && @test_broken !(result isa Exception)
+            # Registered Enzyme can fail above; a repaired backend must pass
+            # the value and finite-difference checks below.
             value, dW = result
             @test value ≈ reference[i]
             for j in eachindex(W)
@@ -854,8 +855,8 @@ end
     catch err
         err
     end
-    @test_broken !(result isa Exception)
     if result isa Exception
+        @test_broken !(result isa Exception)
         @test nameof(typeof(result)) === :IllegalTypeAnalysisException
     else
         value, dbeta = result
