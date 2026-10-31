@@ -1348,8 +1348,11 @@ end
     # closure arguments are the do-block formals in recipe-input order.
     cell_index = only(i for (i, recipe) in enumerate(kernel.lowered_recipes)
                       if [v.name for v in recipe.outputs] == [:__plate_value__])
+    # The table holds the cell's source record; a loop-carrying cell is a
+    # source Julia owns, so the record calls its native closure.
     op = kernel.callables[cell_index]
-    @test op isa ReactiveKernels._KernelSourceOp
+    @test op isa ReactiveKernels._KernelSource
+    @test op.native !== nothing
     formal_types = Dict(:plan => typeof(plan), :observation => Int,
                         :units => typeof(units), :weights => typeof(weights))
     argtypes = Tuple(formal_types[v.name] for v in kernel.lowered_recipes[cell_index].inputs)
@@ -1360,16 +1363,14 @@ end
         callee isa Core.MethodInstance || return false
         # The specialized signature names the concrete closure type (a cell
         # closure over local helpers is parametric; the method's own `sig` is not).
-        callee.specTypes isa DataType && callee.specTypes.parameters[1] in
-            (typeof(op.f), typeof(ReactiveKernels._kernel_native_source(op.f)))
+        callee.specTypes isa DataType && callee.specTypes.parameters[1] === typeof(op.native)
     end
-    @test !invokes_closure(ReactiveKernels._kernel_source_call,
-                           (typeof(op), argtypes...))
+    @test !invokes_closure(op, argtypes)
     # Negative control: explicitly keep the same source callable as an invoke,
     # independently of the Julia version's ordinary inlining heuristic.
     # Fixed arity on purpose: a forwarded `args...` splat is left unspecialized
     # and lowers to a dynamic apply, which the `invoke` scan cannot see.
-    retained_call(op, a, b, c, d) = Base.@noinline op.f(a, b, c, d)
+    retained_call(op, a, b, c, d) = Base.@noinline op.native(a, b, c, d)
     @test length(argtypes) == 4
     @test invokes_closure(retained_call, (typeof(op), argtypes...))
 end
@@ -1966,8 +1967,10 @@ end
     end
     return concentration
 end
-_dose_outer_reductions(kernel) = count(op -> op isa ReactiveKernels._KernelSourceOp &&
-                                             op.f isa ReactiveKernels._KernelReduction, kernel.callables)
+# The callables table holds a generator sum's parts (`_KernelReduction`) at
+# the cell's position.
+_dose_outer_reductions(kernel) = count(op -> op isa ReactiveKernels._KernelReduction,
+                                       kernel.callables)
 _dose_outer_same(a, b) = length(a) == length(b) && all(map(===, a, b))
 
 @testset "authored plate block: a gathered generator sum runs dose-outer, bitwise" begin

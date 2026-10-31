@@ -166,7 +166,7 @@ end
     @test !RK._replicated_same_column(column, X, 1)
 
     scalar = prepare(view_superpose)
-    reduction = scalar.callables[1].f
+    reduction = scalar.callables[1]
     source_types = Tuple{typeof(column),typeof(column),Int,Vector{Int}}
     @test RK._plate_reduction_ready(reduction, Float64, source_types)
     @test RK._plate_reduction_ready(reduction, Float64,

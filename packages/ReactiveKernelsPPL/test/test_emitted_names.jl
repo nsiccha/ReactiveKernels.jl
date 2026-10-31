@@ -26,11 +26,12 @@ _text(bound) = sprint(print,
     Base.remove_linenums!(deepcopy(kernel_expr(bound, assign_layout(bound)))))
 # A planned statement runs its operation's source in the body, binding the
 # source's parameters first (`lhs = let var"#p#opN" = arg, …`); an operation
-# without a source stays a call (`lhs = (__callables__[N])(arg, …)`), a bound
+# without a source stays a call (`lhs = (__callables__[N])(arg, …)`, or by
+# name for a `const` module function, `lhs = Base.exp(arg)`), a bound
 # constant a read (`lhs = __constants__[N]`). `lhs` is a regular-expression
 # pattern.
 _slot_statement(lhs::AbstractString) = Regex("\\n\\s*" * lhs *
-    " = (let var\"#[^\"]+#op\\d+\" = |\\(__callables__\\[\\d+\\]\\)|__constants__\\[\\d+\\])")
+    " = (let var\"#[^\"]+#op\\d+\" = |\\(__callables__\\[\\d+\\]\\)|__constants__\\[\\d+\\]|[A-Za-z_][\\w.!]*\\()")
 _bound(ast, data; mod = Fns) =
     bind_data(lower_rkppl(ast, data; conditioned = (:y,), mod), data)
 

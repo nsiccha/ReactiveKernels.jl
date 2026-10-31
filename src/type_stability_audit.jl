@@ -36,7 +36,7 @@ const _CODE_FINDINGS_MAX_UNION = 4
 # `1hui2qi`: fix every site or justify it explicitly). Each entry is a call
 # chain; a statement whose inlining chain contains all of its names, in any
 # order, is exempt. None is exempt now: the one former entry, the Julia 1.12+
-# `hasmethod` → `to_tuple_type` loop of `_KernelSourceFunction`, is gone since
+# `hasmethod` → `to_tuple_type` loop of the guarded source call, is gone since
 # its method query is `Core._hasmethod` on the complete signature.
 const _CODE_FINDINGS_JUSTIFIED = ()
 

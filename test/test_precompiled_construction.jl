@@ -156,8 +156,14 @@ end
         probe = """
             using Test, ReactiveKernels, ArmSource, ArmConsumer
             const RK = ReactiveKernels
-            closure_roots(spec) = Set(Base.moduleroot(RK._kernel_endpoint_source_module(r.op))
-                                      for r in spec.graph.recipes)
+            # The module whose image owns each source companion (the cache of
+            # its generated function), and each source's authoring module.
+            companion_roots(spec) = Set(Base.moduleroot(parentmodule(
+                    typeof(RK._native_generated_function(f.companion)).parameters[2]))
+                for r in spec.graph.recipes if r.op isa RK._KernelSourceOp
+                for f in (RK._source_record(r.op.f),) if f !== nothing && f.companion !== nothing)
+            source_modules(spec) = Set(RK._kernel_endpoint_source_module(r.op)
+                for r in spec.graph.recipes if r.op isa RK._KernelSourceOp)
             @testset "loaded image" begin
             @test ArmConsumer.WAS_PRECOMPILED
             x = [-2.0, 1.0, -3.0, 0.5, 4.0]
@@ -170,16 +176,20 @@ end
                 @test prepare(ArmConsumer.GENERATED)(x, scale) ≈ law(scale) + 5log(scale)
             end
             @test x == saved
-            # The image owns the generated closures; a construction at run
-            # time is evaluated in the authoring module, as before.
-            @test ArmConsumer in closure_roots(ArmConsumer.GENERATED)
+            # The image owns the generated companions of a construction built
+            # while it was generated, and a construction of the same sources
+            # at run time reuses them (`compile` returns a loaded image's
+            # generated function). Both resolve their sources' names in the
+            # authoring module.
+            @test ArmConsumer in companion_roots(ArmConsumer.GENERATED)
+            @test source_modules(ArmConsumer.GENERATED) == Set([ArmSource])
             runtime = RK._kernel_eval_definition(ArmSource, deepcopy(ArmSource.DEFINITION))
-            @test ArmSource in closure_roots(runtime)
-            @test !(ArmConsumer in closure_roots(runtime))
+            @test companion_roots(runtime) == companion_roots(ArmConsumer.GENERATED)
+            @test source_modules(runtime) == Set([ArmSource])
             @test prepare(runtime)(x, 2.0) ≈ law(2.0) + 5log(2.0)
             # Names lowering reads from syntax, through a batched reader.
             syntax(scale) = scale * (sum(abs2, x) + abs(sum(x) - 1.0))
-            @test ArmConsumer in closure_roots(ArmConsumer.SYNTAX)
+            @test ArmConsumer in companion_roots(ArmConsumer.SYNTAX)
             @test ArmConsumer.SYNTAX_VALUE ≈ syntax.([2.0, 3.0])
             @test ArmConsumer.SYNTAX_READER(x, [0.5, 4.0]) ≈ syntax.([0.5, 4.0])
             @test vectorize(ArmConsumer.SYNTAX; batched = :scale)(x, [1.5]) ≈ [syntax(1.5)]

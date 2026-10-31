@@ -870,9 +870,7 @@ function _cell_identity_form(r::Recipe)
     op = r.op
     op isa _KernelSourceOp && kernel_sourceop_form(op) === :fused &&
         getfield(op, :ignored_throws) !== nothing && length(r.inputs) == 1 || return nothing
-    f = _kernel_native_source(_lane_source_callable(getfield(op, :f)))
-    fieldcount(typeof(f)) == 0 || return nothing
-    params = _lane_source_params(f, 1)
+    params = _lane_source_params(_lane_source_callable(getfield(op, :f)), r)
     params === nothing && return nothing
     name = only(params)
     # A gensym parameter is stored without its `##` prefix (`_lane_source_arguments`).

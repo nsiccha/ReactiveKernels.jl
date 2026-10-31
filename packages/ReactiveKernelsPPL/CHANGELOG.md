@@ -23,7 +23,7 @@ are recorded in the git history only.
   its active vector at slots computed once per label from that label's slot
   map, not through the overlay's per-element slot load and branch; a
   partition reading a packed coordinate outside its footprint is refused by
-  name at preparation. Requires ReactiveKernels 0.1.29.
+  name at preparation. Requires ReactiveKernels 0.1.30.
 - The earlier 2.04× sweep-share measurement used runtime activity and does
   not establish ordinary-Reverse acceptance. The grouped compact sampler
   still raises `EnzymeRuntimeActivityError` on Enzyme dogfood `1280e6ee`,

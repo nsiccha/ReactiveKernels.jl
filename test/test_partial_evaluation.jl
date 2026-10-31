@@ -24,6 +24,25 @@ function pe_constant_read_indices(ast)
     visit(ast)
     indices
 end
+# The recipe-level calls of a generated body: each statement whose right-hand
+# side calls an operation through the callables table or by name
+# (`w = Base.sin(z)`, a `const` module function). Reads inside an inlined
+# source are not statements of their own.
+function pe_recipe_calls(ast)
+    body = ast.args[2]
+    callees = Any[]
+    for statement in body.args
+        statement isa Expr && statement.head === :(=) || continue
+        rhs = statement.args[2]
+        rhs isa Expr && rhs.head === :call || continue
+        callee = rhs.args[1]
+        if callee isa GlobalRef || (callee isa Expr && callee.head === :ref &&
+                                    callee.args[1] === :__callables__)
+            push!(callees, callee)
+        end
+    end
+    callees
+end
 function pe_op_call_indices(ast)
     indices = Int[]
     function visit(node)
@@ -84,9 +103,11 @@ end
         @test_throws MethodError bound_kernel(2.0, dval)
 
         # The residual body contains the constant's read and the residual
-        # multiply, and none of the hoisted data ops.
-        residual_ops = pe_op_call_indices(code_expr(bound_kernel))
+        # multiply (an exact `*`, written by name), and none of the hoisted
+        # data ops.
+        residual_ops = pe_recipe_calls(code_expr(bound_kernel))
         @test length(residual_ops) == 1
+        @test only(residual_ops) == GlobalRef(Base, :*)
         @test length(pe_constant_read_indices(code_expr(bound_kernel))) == 1
 
         # Warmed up above; the residual call allocates nothing. (Measure
@@ -283,7 +304,7 @@ end
         # has no broadcast left, only the constant's read and the final +.
         residual = code_expr(bound_kernel)
         @test !pe_contains_broadcast(residual)
-        @test length(pe_op_call_indices(residual)) == 1
+        @test pe_recipe_calls(residual) == [GlobalRef(Base, :+)]
         @test length(pe_constant_read_indices(residual)) == 1
 
         # Parameter-dependent plates (broadcast-style arguments) stay

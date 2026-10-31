@@ -47,8 +47,9 @@ steady_bytes(k, args...) = (k(args...); k(args...); @allocated k(args...))
     # No recipe runs its fused source as one operation. Plates lower their
     # cells natively, so the program also calls the cells' scalar operations.
     kernel = prepare_nonallocating(g; have, want = :density)
-    @test !any(op -> op isa ReactiveKernels._KernelSourceOp &&
-                     any(r -> r.op === op, kernel.plan.recipes), called_ops(kernel))
+    @test !any(op -> source_entry(op) &&
+                     any(r -> r.op isa ReactiveKernels._KernelSourceOp && r.op.f === op,
+                         kernel.plan.recipes), called_ops(kernel))
 end
 
 @testset "MNIST graph non-allocating acceptance" begin
@@ -96,8 +97,9 @@ end
     # fused closure as one operation. Plates lower their cells natively, so the
     # program also calls the cells' scalar operations.
     k_joint = prepare_nonallocating(g; have = have, want = :density)
-    @test !any(op -> op isa ReactiveKernels._KernelSourceOp &&
-                     any(r -> r.op === op, k_joint.plan.recipes), called_ops(k_joint))
+    @test !any(op -> source_entry(op) &&
+                     any(r -> r.op isa ReactiveKernels._KernelSourceOp && r.op.f === op,
+                         k_joint.plan.recipes), called_ops(k_joint))
 
     # The natural consumer entry: wrap an already-prepared kernel.
     prepared = prepare(g; have = have, want = :density)

@@ -267,21 +267,15 @@ end
 
 # A definition-stable structural key for compiler-owned source operations.  It
 # is deliberately unavailable to arbitrary Graph closures: only `@kernel` can
-# mint `_KernelSourceOp{Token}`.  Reusing a captured child therefore reuses the
+# mint a `_KernelSourceOp` with a token.  Reusing a captured child therefore reuses the
 # key, while separately authored formulas have different Token parameters.
 struct _KernelProvenanceKey{Token} end
 
 # Graph assembly reads `recipe.op` as an unknown subtype of `_KernelSourceOp`.
-# The token comes from the op's type, so no reader is compiled again for every
-# authored op type. An execution copy has none; keying it would merge
-# separately authored definitions.
-Base.@nospecializeinfer function _kernel_source_token(@nospecialize(op::_KernelSourceOp))
-    token = (typeof(op)::DataType).parameters[1]
-    token === nothing && throw(ArgumentError(
-        "a prepared execution copy of a source operation has no definition " *
-        "token; graph recipes must hold the original operation"))
-    token
-end
+# The token is a field read with the `getfield` builtin, so no reader is
+# compiled again for every authored op type.
+Base.@nospecializeinfer _kernel_source_token(@nospecialize(op::_KernelSourceOp)) =
+    getfield(op, :token)::Symbol
 
 # Inverse recognition uses the callable retained when an exact call was
 # authored. Looking up a recipe's source binding later could observe a
@@ -1513,10 +1507,16 @@ end
 # One instance for every operation type (`@nospecialize`, `getfield`): see
 # `_source_parameter_names`.
 Base.@nospecializeinfer _kernel_endpoint_source_module(@nospecialize(op)) = parentmodule(typeof(op))
-Base.@nospecializeinfer _kernel_endpoint_source_module(@nospecialize(op::_KernelSourceFunction)) =
-    _kernel_endpoint_source_module(getfield(op, :f))
-Base.@nospecializeinfer _kernel_endpoint_source_module(@nospecialize(op::_KernelSourceOp)) =
-    _kernel_endpoint_source_module(getfield(op, :f))
+# A source record keeps no module; an operation built without one (a
+# hand-built fixture) resolves in its native closure's module, else here.
+Base.@nospecializeinfer function _kernel_endpoint_source_module(@nospecialize(f::_KernelSource))
+    native = getfield(f, :native)
+    native === nothing ? (@__MODULE__) : parentmodule(typeof(native))
+end
+Base.@nospecializeinfer function _kernel_endpoint_source_module(@nospecialize(op::_KernelSourceOp))
+    mod = getfield(op, :mod)
+    mod === nothing ? _kernel_endpoint_source_module(getfield(op, :f)) : mod::Module
+end
 Base.@nospecializeinfer _kernel_endpoint_source_module(@nospecialize(op::_KernelBranch)) =
     _kernel_endpoint_source_module(getfield(op, :call))
 # A rebuilt branch's call is RK's own `_KernelBranchCall`; its authored parts
@@ -3402,32 +3402,41 @@ function _kernel_source_functions(ex, mod)
     Expr(ex.head, Any[_kernel_source_functions(arg, mod) for arg in ex.args]...)
 end
 
-# Captures and the generated callable retain their concrete runtime types.
-# Inferring this source-construction helper for every fresh closure type only
-# repeats compiler work before the callable is prepared.
+# The record of an authored source closure `f` (`_KernelSource`, `src/core.jl`):
+# its captured values from the closure's fields, and either the source
+# compiled as a runtime-generated function over `(captures, params...)`, with
+# the authored parameter names kept in its type, or, for a source Julia must
+# own, the closure itself. Inferring this construction helper for every fresh
+# closure type only repeats compiler work before the callable is prepared.
 Base.@nospecializeinfer function _kernel_source_function(@nospecialize(f), source::Expr, mod::Module)
-    # Local functions, generators and exception scopes are lowered by Julia
-    # itself. Do not reinterpret those scopes through RGF's closure converter.
-    # The native closure remains the ordinary path in its visible world.
-    _kernel_source_native_scope(source.args[2]) &&
-        return _KernelSourceFunction(_kernel_shared_closure(f, source), nothing, nothing)
     names = fieldnames(typeof(f))
     captures = NamedTuple{names}(Tuple(Any[getfield(f, i) for i in 1:length(names)]))
+    # Local functions, generators and exception scopes are lowered by Julia
+    # itself. Do not reinterpret those scopes through RGF's closure converter.
     # Julia owns shared lexical cells too: retain their exact read/write and
     # undefined-binding behavior rather than reconstructing Box operations.
-    any(value -> value isa Core.Box, values(captures)) &&
-        return _KernelSourceFunction(_kernel_shared_closure(f, source), nothing, nothing)
+    # Such a closure keeps the type every build of its source shares.
+    params = source.args[1]
+    params = params isa Expr && params.head === :tuple ? params.args : Any[params]
+    if _kernel_source_native_scope(source.args[2]) ||
+       any(value -> value isa Core.Box, values(captures))
+        native = _kernel_shared_closure(f, source)
+        T = _KernelSource{typeof(captures),Nothing,typeof(native)}
+        return _kernel_new_instance(T, (captures, nothing, native))::_KernelSource
+    end
     environment = gensym(:captures)
     bindings = [Expr(:(=), name, Expr(:call, GlobalRef(Core, :getfield),
         environment, QuoteNode(name))) for name in names]
-    params = source.args[1]
-    params = params isa Expr && params.head === :tuple ? params.args : Any[params]
     body = Expr(:let, Expr(:block, bindings...), source.args[2])
     runtime_source = Expr(:->, Expr(:tuple, environment, params...), body)
     qualified = macroexpand(mod, Expr(Symbol("hygienic-scope"), runtime_source, mod))
-    runtime_f = compile(qualified)
-    T = _KernelSourceFunction{typeof(f),typeof(runtime_f),typeof(captures),Val{:guarded}}
-    _kernel_new_instance(T, (f, runtime_f, captures))::_KernelSourceFunction
+    # Hygiene renames the parameters too; the authored names are what the
+    # readers of the companion's type and the JAX translation bind (`compile`
+    # then spells a gensym among them canonically, the same in every build).
+    qualified = _native_parameter_names(runtime_source, qualified)
+    companion = compile(qualified)
+    T = _KernelSource{typeof(captures),typeof(companion),Nothing}
+    _kernel_new_instance(T, (captures, companion, nothing))::_KernelSource
 end
 
 # Julia lowers a closure it owns (above) itself, and each evaluation of one
@@ -3580,7 +3589,8 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
                                             arms = branch_arms, split)
         return Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
              Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
-             Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)), native)
+             Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)), native,
+             nothing, nothing, QuoteNode(mod))
     end
     reduction = _kernel_reduction_callable(rhs, deps, mod, known)
     if reduction !== nothing
@@ -3588,7 +3598,8 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
         # metadata (same call semantics) for the native plate lowering.
         return Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
              Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
-             Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)), reduction)
+             Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)), reduction,
+             nothing, nothing, QuoteNode(mod))
     end
     native = Expr(:->, Expr(:tuple, deps...), _kernel_native_body(rhs, mod, known))
     if split && form === :fused
@@ -3598,7 +3609,8 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
     Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)),
-         native, nothing, call_identity, call_capture_name, resolved_callable)
+         native, nothing, call_identity, call_capture_name, resolved_callable,
+         QuoteNode(mod))
 end
 
 # Part bodies of a split expression: the same native rewrite as its whole
@@ -4814,10 +4826,9 @@ lowering stays linear and the construction code runs in the top-level
 interpreter, so construction compiles no per-model code. Because closures are
 evaluated in `mod`'s global scope, `definition` cannot capture local variables.
 
-`latest_world_native_sources=true` is for a generated program whose callers
-guarantee a latest-world execution barrier. It propagates that guarantee to
-source operations embedded inside native recipe bodies, avoiding a per-call
-method query. Ordinary `@kernel` construction keeps its guarded source calls.
+`latest_world_native_sources` is accepted and ignored (RK 0.1.27): a source
+record (`_KernelSource`) is callable from any world, so no operation has a
+call mode to switch.
 
 While a package image is generated and `mod` belongs to another package, the
 closures are evaluated in a child module of the package being built, whose
@@ -4833,8 +4844,6 @@ function _kernel_eval_definition(mod::Module, definition::Expr;
         expanded.args[1] isa Symbol || throw(ArgumentError(
             "_kernel_eval_definition requires a stateless `name(args...) = body` " *
             "@kernel definition"))
-    latest_world_native_sources &&
-        (expanded = _kernel_latest_native_source_literals(expanded))
     _kernel_eval_construction(mod, expanded.args[2])
 end
 

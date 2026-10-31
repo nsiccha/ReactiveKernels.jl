@@ -187,7 +187,7 @@ end
 
         # Every fused captured source decomposed: the program calls no opaque
         # fused closure, and it calls the destination steps.
-        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k))
+        @test !any(source_entry, called_ops(k))
         @test any(op -> op isa ReactiveKernels._MaterializeStep, called_ops(k))
         @test any(op -> op isa ReactiveKernels._ConcatenateStep, called_ops(k))
         @test any(op -> op isa ReactiveKernels._FillConstructorStep, called_ops(k))
@@ -251,7 +251,7 @@ end
         u, X = data(8)
         @test k(u, X) == ordinary(u, X)
 
-        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k))
+        @test !any(source_entry, called_ops(k))
         @test any(op -> op isa ReactiveKernels._MaterializeStep, called_ops(k))
         @test any(op -> op isa ReactiveKernels._MatMulStep, called_ops(k))
 
@@ -272,7 +272,7 @@ end
         k = prepare_nonallocating(spec; have = (:x,), want = :out)
         x = randn(64)
         @test k(x) == ordinary(x)
-        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k))
+        @test !any(source_entry, called_ops(k))
         @test any(op -> op isa ReactiveKernels._MaterializeStep, called_ops(k))
         steady(k, args...) = (k(args...); @allocated k(args...))
         small = steady(k, randn(64))
@@ -298,7 +298,7 @@ end
         k_rs = prepare_nonallocating(reshape_spec; have = (:X, :a), want = :out)
         X, a = randn(32, 3), randn(3)
         @test k(X, a) == ordinary(X, a) == k_rs(X, a) == ordinary_rs(X, a)
-        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k))
+        @test !any(source_entry, called_ops(k))
         @test any(op -> op isa ReactiveKernels._MaterializeStep, called_ops(k))
         steady(k, args...) = (k(args...); @allocated k(args...))
         small = steady(k, randn(32, 3), randn(3))
@@ -325,7 +325,7 @@ end
         end
         ordinary = prepare(spec; have = (:m,), want = :out)
         k = prepare_nonallocating(spec; have = (:m,), want = :out)
-        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k))
+        @test !any(source_entry, called_ops(k))
         @test any(op -> op isa ReactiveKernels._RowReduceStep, called_ops(k))
         m = randn(64, 3)
         @test k(m) == ordinary(m)
@@ -362,13 +362,13 @@ end
         k = prepare_nonallocating(cumsum_spec; have = (:m,), want = :out)
         m = randn(16, 3)
         @test k(m) == ordinary(m)
-        @test any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k))
+        @test any(source_entry, called_ops(k))
         @test !any(op -> op isa ReactiveKernels._RowReduceStep, called_ops(k))
 
         ordinary_dyn = prepare(dyn_spec; have = (:m, :d), want = :out)
         k_dyn = prepare_nonallocating(dyn_spec; have = (:m, :d), want = :out)
         @test k_dyn(m, 2) == ordinary_dyn(m, 2)
-        @test any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k_dyn))
+        @test any(source_entry, called_ops(k_dyn))
         @test !any(op -> op isa ReactiveKernels._RowReduceStep, called_ops(k_dyn))
     end
 
@@ -440,7 +440,7 @@ end
         k = prepare_nonallocating(spec; have = (:X, :b, :x, :s), want = :total)
         args = data(8)
         @test k(args...) == ordinary(args...)
-        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k))
+        @test !any(source_entry, called_ops(k))
         @test any(op -> op isa ReactiveKernels._MatMulStep, called_ops(k))
 
         small = steady(k, data(8)...)

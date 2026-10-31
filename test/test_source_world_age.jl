@@ -44,6 +44,48 @@ end
     end
 end
 
+# A plate's buffer is typed from its cells' sources before the loop runs, so
+# that typing reads the builder's fresh sources in the builder's world too.
+# Typed through the authored closure, whose method the builder's world does not
+# see, a cell type inferred `Union{}`: the primal raised a `MethodError` in
+# `_static_plate_axis_class(::Type{Union{}})`, native Reverse an
+# `EnzymeRuntimeActivityError`, and a nested NLME fit that differentiated its
+# kernel in the fit's own world failed compiling it (snag
+# `brm-canonical-44-a1653c2a`).
+function immediate_plates(groups, s)
+    flat = authored(:(flat_cells(groups, s::Float64) = begin
+        cells = plate(groups) do g
+            scaled = g .* s
+            sum(scaled)
+        end
+        return cells
+    end))
+    nested = authored(:(nested_cells(groups, s::Float64) = begin
+        cells = plate(groups) do g
+            scaled = g .* s
+            shifted = plate(scaled) do v
+                v + s
+            end
+            sum(shifted)
+        end
+        return cells
+    end))
+    for (spec, slopes) in ((flat, sum.(groups)),
+                           (nested, sum.(groups) .+ length.(groups)))
+        kernel = prepare(spec)
+        @test kernel(groups, s) ≈ s .* slopes
+        @test only(only(Enzyme.autodiff(Enzyme.Reverse,
+            Enzyme.Const(t -> sum(kernel(groups, t))), Enzyme.Active,
+            Enzyme.Active(s)))) ≈ sum(slopes)
+    end
+end
+
+@testset "plate kernels execute and differentiate in their builder's world" begin
+    for s in (0.5, 2.0)
+        immediate_plates([[1.0, 2.0], [3.0], Float64[]], s)
+    end
+end
+
 @testset "authored source preserves captures and lexical scopes" begin
     spec = Core.eval(@__MODULE__, quote
         let offset = 1.0
@@ -191,29 +233,81 @@ function out_of_line_source_calls(kernel, args)
         statement isa Expr && statement.head === :invoke || return false
         instance = statement.args[1]
         instance isa Core.CodeInstance && (instance = instance.def)
-        instance.def.name in (:_KernelSourceFunction, :_ExecutableSourceFunction)
+        instance.def.name === :_KernelSource
     end
 end
 
-# `prepare_sampler` converts every operation of a prepared kernel to the
-# latest-world call mode. That mode once left a large step body behind a call
-# per scan step, which made native Enzyme reverse through an HMM forward pass
-# 2.5–3× slower than the same kernel in the guarded mode (snag
-# `rkppl-hmm-forwar-89257681`). Both modes inline the source call.
-@testset "latest-world source calls are inlined into their operations" begin
+# A scan step's source call is inlined into its operation: a large step body
+# behind a call per scan step once made native Enzyme reverse through an HMM
+# forward pass 2.5–3× slower than the same kernel with the step inlined (snag
+# `rkppl-hmm-forwar-89257681`). `prepare_sampler`'s latest-world preparation
+# is the same kernel: a source record is callable from any world.
+@testset "source calls are inlined into their operations" begin
     e = [sin(3t + k) for t in 1:40, k in 1:3]
     lt = log.([0.8 0.1 0.1; 0.2 0.6 0.2; 0.3 0.3 0.4])
-    guarded = prepare(scan_logsumexp)
-    latest = ReactiveKernels._kernel_latest_prepared(guarded)
-    @test out_of_line_source_calls(guarded, (e, lt)) == 0
-    @test out_of_line_source_calls(latest, (e, lt)) == 0
-    @test Base.invokelatest(latest, e, lt) == guarded(e, lt)
-    function gradient_of(kernel)
-        de = zero(e)
-        Base.invokelatest(Enzyme.autodiff, Enzyme.Reverse, Enzyme.Const(kernel),
-            Enzyme.Active, Enzyme.Duplicated(e, de), Enzyme.Const(lt))
-        de
+    kernel = prepare(scan_logsumexp)
+    @test ReactiveKernels._kernel_latest_prepared(kernel) === kernel
+    @test out_of_line_source_calls(kernel, (e, lt)) == 0
+    de = zero(e)
+    Base.invokelatest(Enzyme.autodiff, Enzyme.Reverse, Enzyme.Const(kernel),
+        Enzyme.Active, Enzyme.Duplicated(e, de), Enzyme.Const(lt))
+    @test isfinite(sum(de))
+end
+
+# The record's call splices the companion's body into its own generated
+# method, whose static parameters are named as no source can spell a local:
+# a model's `R = Z * F'` in a spliced body once failed to lower ("local
+# variable name R conflicts with a static parameter").
+@kernel static_parameter_names(x) = begin
+    result = begin
+        R = x .* 2
+        C = sum(R)
+        N = length(R)
+        K = C / N
+        K + first(R)
     end
-    @test gradient_of(latest) == gradient_of(guarded)
+    return result
+end
+
+@testset "a spliced source body may bind the call's static parameter names" begin
+    x = [0.5, 1.5, 2.5]
+    expected = 2 * sum(x) / length(x) + 2 * first(x)
+    @test prepare(static_parameter_names)(x) ≈ expected
+    recipe = only(plan(static_parameter_names; want = :result).recipes)
+    record = ReactiveKernels._source_record(getfield(recipe.op, :f))
+    @test record isa ReactiveKernels._KernelSource
+    @test record(x) ≈ expected
+end
+
+# Authored parameters share the spliced method's scope. They may name its
+# argument variables or the builtin used to unpack them, without changing
+# those reads or degrading a plate's inferred element type.
+@kernel source_parameter_names(getfield::Float64, f::Float64, args::Float64) = begin
+    result = getfield * getfield + 3f + 5args
+    return result
+end
+@kernel source_parameter_cells(values) = begin
+    result = plate(values) do getfield
+        getfield * getfield + 1
+    end
+    return result
+end
+
+@testset "source parameters cannot shadow generated argument reads" begin
+    recipe = only(plan(source_parameter_names).recipes)
+    record = ReactiveKernels._source_record(recipe.op.f)
+    @test @inferred(record(2.0, 3.0, 4.0)) == 33.0
+    for mode in ("0", "1")
+        withenv("RK_INLINE_SOURCES" => mode) do
+            kernel = prepare(source_parameter_names)
+            @test @inferred(kernel(2.0, 3.0, 4.0)) == 33.0
+            @test only(Enzyme.autodiff(Enzyme.Reverse, kernel, Enzyme.Active,
+                Enzyme.Active(2.0), Enzyme.Active(3.0), Enzyme.Active(4.0))) ==
+                (4.0, 3.0, 5.0)
+            cells = prepare(source_parameter_cells)
+            @test cells([1.0, 2.0]) == [2.0, 5.0]
+            @test cells(Float64[]) isa Vector{Float64}
+        end
+    end
 end
 end

@@ -579,6 +579,72 @@ end
     @test !occursin("_cell_canonical_rows", string(typed.ast))
 end
 
+@testset "partition plans share one type across empty plate portions" begin
+    d = _pp_two_plate_data((5, 5, 5, 5, 5))
+    # Label 1 has observations only, label 5 has gathered group totals only,
+    # and label 2 has both. Both inferred and explicit plan ports must accept
+    # these different combinations of empty portions.
+    subject = [s == 5 ? 6 : s for s in d.subject]
+    group_subject = [s == 1 ? 2 : s for s in d.group_subject]
+    bound = (; d.g, d.observed, d.order, d.y, d.rows, d.totals, subject, group_subject)
+    by = (dens = :subject, group_totals = :group_subject)
+    spec = plate_partition(_pp_two_plates, (:dens, :group_totals);
+        by, index = :label, plan = :plan)
+    have = (_PP_TWO_HAVE..., :label, :plan)
+    planner = partition_plan_kernel(spec; have, want = :partition_total, bound)
+    labels = (1, 2, 5, 6)
+    plans = Dict(s => planner(d.u, s, nothing) for s in labels)
+    T = typeof(plans[2])
+    @test isconcretetype(T)
+    @test all(p -> typeof(p) === T, values(plans))
+    typed = prepare(plate_partition(_pp_two_plates, (:dens, :group_totals);
+        by, index = :label, plan = :plan => T);
+        have, want = :partition_total, bound)
+    full = prepare(_pp_two_plates; have = _PP_TWO_HAVE, want = (:dens, :group_totals))
+    for s in labels
+        automatic = prepare(spec; have, want = :partition_total, bound,
+            exemplars = (d.u, s, nothing))
+        for scale in (1.0, 1.2)
+            u = scale .* d.u
+            dens, totals = full(u, d.g, d.observed, d.order, d.y, d.rows,
+                d.totals, subject, group_subject)
+            expected = sum(dens[subject .== s]) + sum(totals[group_subject .== s])
+            @test typed(u, s, plans[s]) ≈ expected
+            @test automatic(u, s, plans[s]) ≈ expected
+        end
+    end
+end
+
+@testset "partition plans restart scheduled loops on every evaluation" begin
+    # The previous-coordinate cache is evaluation state. Preparing a shape
+    # may run the loop, but its final state must not become a plan field.
+    body = quote
+        rows = collect(1:label)
+        previous = nothing
+        first_coordinate = true
+        total = zero(x)
+        for i in rows
+            if first_coordinate || i != previous[1]
+                total = total + x * i
+            end
+            previous = CartesianIndex(i)
+            first_coordinate = false
+        end
+        return total
+    end
+    plan, main, needed, _ = ReactiveKernels._partition_plan_split(body, [:x], Any[])
+    planner = ReactiveKernels.compile(Expr(:function, Expr(:tuple, :x, :label),
+        Expr(:block, plan..., Expr(:return, Expr(:tuple, needed...)))))
+    reads = [Expr(:(=), name, :(p[$i])) for (i, name) in enumerate(needed)]
+    planned = ReactiveKernels.compile(Expr(:function, Expr(:tuple, :x, :label, :p),
+        Expr(:block, reads..., main...)))
+    plans = [planner(1.0, label) for label in (0, 1, 3)]
+    @test all(p -> typeof(p) === typeof(first(plans)), plans)
+    for (label, p) in zip((0, 1, 3), plans), x in (2.0, -3.0, 4.0)
+        @test planned(x, label, p) == x * label * (label + 1) / 2
+    end
+end
+
 @testset "partition plans preserve writes and scratch ownership" begin
     # Execute the compiler split, reusing one plan with changing inputs.
     # The final sum observes indexed/property writes, aliases, mutating

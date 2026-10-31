@@ -35,7 +35,7 @@ end
 _display_expr(node::QuoteNode) = _display_quoted(node, node.value)
 _display_quoted(node::QuoteNode, value) = node
 _display_quoted(::QuoteNode,
-                op::Union{Function,_KernelSourceOp,_KernelSourceFunction,_KernelBranch}) =
+                op::Union{Function,_KernelSourceOp,_KernelBranch}) =
     _display_object(op)
 _display_quoted(::QuoteNode, child::_KernelPreparedChild) = child.name
 
@@ -82,10 +82,10 @@ function _display_capture_names!(renamed, x, captured)
     renamed
 end
 
-function _display_object(f::_KernelSourceFunction)
-    f.runtime_f isa RuntimeGeneratedFunctions.RuntimeGeneratedFunction ||
+function _display_object(f::_KernelSource)
+    f.companion isa RuntimeGeneratedFunctions.RuntimeGeneratedFunction ||
         return _opaque_object(f)
-    lambda = RuntimeGeneratedFunctions.get_expression(f.runtime_f)
+    lambda = RuntimeGeneratedFunctions.get_expression(f.companion)
     lambda isa Expr && lambda.head === :-> && lambda.args[1] isa Expr &&
         !isempty(lambda.args[1].args) || return _opaque_object(f)
     environment, params... = lambda.args[1].args
