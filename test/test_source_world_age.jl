@@ -278,4 +278,36 @@ end
     @test record isa ReactiveKernels._KernelSource
     @test record(x) ≈ expected
 end
+
+# Authored parameters share the spliced method's scope. They may name its
+# argument variables or the builtin used to unpack them, without changing
+# those reads or degrading a plate's inferred element type.
+@kernel source_parameter_names(getfield::Float64, f::Float64, args::Float64) = begin
+    result = getfield * getfield + 3f + 5args
+    return result
+end
+@kernel source_parameter_cells(values) = begin
+    result = plate(values) do getfield
+        getfield * getfield + 1
+    end
+    return result
+end
+
+@testset "source parameters cannot shadow generated argument reads" begin
+    recipe = only(plan(source_parameter_names).recipes)
+    record = ReactiveKernels._source_record(recipe.op.f)
+    @test @inferred(record(2.0, 3.0, 4.0)) == 33.0
+    for mode in ("0", "1")
+        withenv("RK_INLINE_SOURCES" => mode) do
+            kernel = prepare(source_parameter_names)
+            @test @inferred(kernel(2.0, 3.0, 4.0)) == 33.0
+            @test only(Enzyme.autodiff(Enzyme.Reverse, kernel, Enzyme.Active,
+                Enzyme.Active(2.0), Enzyme.Active(3.0), Enzyme.Active(4.0))) ==
+                (4.0, 3.0, 5.0)
+            cells = prepare(source_parameter_cells)
+            @test cells([1.0, 2.0]) == [2.0, 5.0]
+            @test cells(Float64[]) isa Vector{Float64}
+        end
+    end
+end
 end

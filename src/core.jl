@@ -340,10 +340,12 @@ function _companion_call_body(@nospecialize(R), forwarded)
     body === nothing && return nothing
     argnames isa Tuple && length(argnames) == length(forwarded) + 1 || return nothing
     # Every argument is read before any parameter is bound: a parameter may
-    # be named like this method's own `f` or `args`.
+    # be named like this method's own `f` or `args`. Qualify the helper too:
+    # an authored parameter named `getfield` is local throughout this body.
     temporaries = [gensym(:argument) for _ in forwarded]
     environment = gensym(:captures)
-    setup = Any[Expr(:(=), environment, :(getfield(f, :captures)))]
+    setup = Any[Expr(:(=), environment,
+                     Expr(:call, GlobalRef(Core, :getfield), :f, QuoteNode(:captures)))]
     append!(setup, (Expr(:(=), temporary, arg) for (temporary, arg) in zip(temporaries, forwarded)))
     push!(setup, Expr(:(=), argnames[1], environment))
     append!(setup, (Expr(:(=), name, temporary)
@@ -363,7 +365,8 @@ end
 # model's cell: "local variable name R conflicts with a static parameter").
 @inline @generated function (f::_KernelSource{var"#C",var"#R",var"#N"})(
         args::Vararg{Any,var"#K"}) where {var"#C",var"#R",var"#N",var"#K"}
-    forwarded = [:(getfield(args, $index)) for index in 1:var"#K"]
+    forwarded = [Expr(:call, GlobalRef(Core, :getfield), :args, index)
+                 for index in 1:var"#K"]
     if var"#N" === Nothing
         spliced = _companion_call_body(var"#R", forwarded)
         spliced === nothing || return spliced
