@@ -68,29 +68,39 @@ end
 
 _metadata_call(f, args; kwargs) = OutputSignatures.infer_call(f, args; kwargs)
 
-# Inputs whose values determine an authored plate's iteration domain. This
-# is a graph dependency query, not a numerical inference rule: opaque calls
-# on a path to a domain keep all their inputs, and no recipe is executed.
-# PPL uses it to stage data-only domain definitions with other bind-time
-# shape dependencies, before asking for the kernel's output metadata.
-function _kernel_plate_domain_inputs(spec::KernelSpec)
+# Inputs whose descriptors feed a visible kernel's output metadata, plus
+# values determining its authored plate domains. This is a graph dependency
+# query, not a numerical inference rule: ordinary recipes conservatively
+# keep all inputs, and no recipe is executed. A plate's shared captures do
+# not determine its output axes; only its batched arguments do. PPL stages
+# data-only definitions on this frontier before asking for output metadata.
+function _kernel_metadata_inputs(spec::KernelSpec)
     _kernel_inline_signature_supported(spec.call_signature) || return Int[]
     p = plan(spec)
     cid(v) = canon_id(p.graph, v.id)
-    needed = Set{ValueId}()
+    needed = Set{ValueId}(cid(v) for v in p.want)
+    domains = Set{ValueId}()
     for r in p.recipes
         r.op isa _AuthoredPlateOp || continue
         atomic = typeof(r.op).parameters[2]
         for (i, v) in enumerate(r.inputs)
-            i in atomic || push!(needed, cid(v))
+            i in atomic || push!(domains, cid(v))
         end
     end
     # Recipes are topologically ordered; one reverse pass follows every
-    # domain dependency, including a domain computed inside the kernel.
+    # dependency, including a domain computed inside the kernel. Captures
+    # used only inside a plate stay at their usual preparation stage.
     for r in Iterators.reverse(p.recipes)
+        # A domain's actual value can depend on any input, including a
+        # capture of a plate that produces the next plate's iterator.
+        if any(v -> cid(v) in domains, r.outputs)
+            union!(domains, (cid(v) for v in r.inputs))
+        end
         any(v -> cid(v) in needed, r.outputs) || continue
-        union!(needed, (cid(v) for v in r.inputs))
+        atomic = r.op isa _AuthoredPlateOp ? typeof(r.op).parameters[2] : ()
+        union!(needed, (cid(v) for (i, v) in enumerate(r.inputs) if !(i in atomic)))
     end
+    union!(needed, domains)
     return Int[i for (i, v) in enumerate(p.have) if cid(v) in needed]
 end
 

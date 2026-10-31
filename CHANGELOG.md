@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.38
+
+- Track visible kernel inputs needed for output metadata as well as plate
+  domains. Data-only array operands of concatenations and gathers can bind
+  before shape analysis, preserving row-local composition when those arrays
+  come from a tuple-valued helper. Shared plate captures retain their usual
+  preparation staging; dependency analysis executes no recipes.
+
 ## 0.1.37
 
 - Track which visible `KernelSpec` inputs determine authored-plate domains,
