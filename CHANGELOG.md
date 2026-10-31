@@ -51,6 +51,11 @@ are recorded in the git history only.
   the top level runs its whole source in the body too (`c ? a : b` as an
   `if`); a plate cell's branch keeps its metadata at its position for the
   lane lowerings.
+- A plate cell of one value that computes nothing only its sibling values
+  read prepares again: 0.1.28 gave the cell a plan port (`plate_partition(…;
+  plan)`) and the drop of its unread operands rebuilt the cell without that
+  field (`_AuthoredPlateCellDraft` with four arguments), a `MethodError` at
+  `prepare` (`test_plate_cell.jl`, RKPPL `test_cell_query.jl`).
 ## 0.1.28
 
 - `plate_partition(…; plan = port)` / `plan = port => T`: a plan port holding

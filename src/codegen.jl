@@ -2250,7 +2250,8 @@ function _plate_without_unread_operands(r::Recipe)
     cell || return Recipe(r.id, inputs[kept], r.outputs, draft, r.cost, nothing,
                           r.effectful, r.source)
     Recipe(r.id, (first(r.inputs), inputs[kept]...), r.outputs,
-           _AuthoredPlateCellDraft(draft, r.op.locality, r.op.rows, r.op.partitioned),
+           _AuthoredPlateCellDraft(draft, r.op.locality, r.op.rows, r.op.partitioned,
+                                   r.op.plan),
            r.cost, nothing, r.effectful, r.source)
 end
 
