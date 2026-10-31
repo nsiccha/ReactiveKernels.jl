@@ -35,6 +35,7 @@ ReactiveKernelsSciMLODEExt = ["SciMLBase", "SciMLSensitivity"]
 ReactiveKernelsSpecialFunctionsExt = "SpecialFunctions"
 
 [sources]
+Distributions = {url = "https://github.com/nsiccha/Distributions.jl.git", rev = "83cec5e3a8a35167d54f19da9dc5afb54f59273e"}
 OutputSignatures = {url = "https://github.com/nsiccha/OutputSignatures.jl.git", rev = "f971381f760e91986b3a728a719341e7e7761f55"}
 
 [compat]

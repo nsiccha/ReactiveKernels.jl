@@ -314,6 +314,27 @@ y .~ LogDensity.(normal_lpdf, a)
 
 With `Distributions` loaded, any `Distributions.Distribution` object uses its
 ordinary `Distributions.logpdf` method automatically, including custom types.
+Its support behavior comes from that method. Distributions 0.25.132 evaluates
+`DirichletMultinomial` outside its support: for example, counts `[2, 3, 1]`
+have a finite density even when the declared total is 5. Use the corrected
+[Distributions revision](https://github.com/nsiccha/Distributions.jl/commit/83cec5e3a8a35167d54f19da9dc5afb54f59273e)
+when using this adapter with that law:
+
+```julia
+using Pkg
+Pkg.add(PackageSpec(url="https://github.com/nsiccha/Distributions.jl.git",
+    rev="83cec5e3a8a35167d54f19da9dc5afb54f59273e"))
+```
+
+Run this in the consumer's active environment. RKPPL's optional dependency
+bounds alone cannot select an unreleased correction. The repository's root
+`[sources]` and `packages/setup_ppl_native.jl` select this exact revision for
+acceptance tests, including on Julia 1.10. On the corrected revision, invalid
+counts or totals give `-Inf`; valid densities and ordinary native Enzyme
+concentration gradients are preserved. Dimension mismatches still throw.
+This concerns the optional adapter; RKPPL model implementations continue to
+use the RK distribution stack.
+
 Other types extend `sampling_logdensity`. A module-visible RHS object can be
 used directly; a definition can also construct an RHS value. Undotted `~`
 evaluates one whole-event density; `.~` applies it over Julia broadcast cells,

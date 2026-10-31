@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.24
+
+- Document and test the corrected upstream `DirichletMultinomial` dependency
+  used by the optional Distributions adapter. The repository acceptance setup
+  pins Distributions commit `83cec5e3a8a35167d54f19da9dc5afb54f59273e`, whose
+  `logpdf` rejects invalid counts and mismatched totals before evaluating the
+  density. Native Enzyme gradients on valid observations are unchanged.
+  Other environments must select that dependency revision explicitly;
+  upgrading RKPPL alone does not repair Distributions 0.25.132. The adapter
+  continues to delegate directly to the distribution's public `logpdf`.
+
 ## 0.1.23
 
 - `prepare_partition` and `prepare_partition_sampler` (dense and compact)
