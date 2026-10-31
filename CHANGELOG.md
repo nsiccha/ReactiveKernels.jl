@@ -16,6 +16,24 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.29
+
+- A plan holds every value computed from the bound data and the label alone:
+  the index bookkeeping and label-constant data (a data column's rows, a
+  design block's rows and their `hcat`), computed once per label by pure
+  operations (sources, plain functions, partition ops; plates, scans and
+  cells stay in the body); never a value computed from an unbound port, its
+  alias, a type the body computes, or a value the body writes into.
+- `plate_partition(…; plan_constant = (:port, …))` names HAVE ports whose
+  values are constant per label, which the plan may read; a lazy view of
+  inputs serves its rows from its parts through its own
+  `_cell_lazy_rows(op, inputs, rows, bind, constant)` method:
+  ReactiveKernelsPPL's compact overlay reads its active vector at slots
+  planned per label instead of a slot load and a branch per element.
+- The Enzyme dogfood line from `1280e6ee` differentiates a planned partition
+  under plain Reverse; registered 0.13.216 keeps the runtime-activity
+  requirement (Enzyme snag `plan-const-int-r-4671f4a7`).
+
 ## 0.1.28
 
 - `plate_partition(…; plan = port)` / `plan = port => T`: a plan port holding
@@ -28,21 +46,10 @@ are recorded in the git history only.
   `partition_plan_kernel(kernel)` returns the plan kernel of a prepared
   partition. An untyped plan port is typed by evaluating the plan on
   `prepare`'s `exemplars`; a plan port that cannot be typed is refused naming
-  the remedy. A plan holds every value computed from the bound data and the
-  label alone: index bookkeeping (positions, rows, unions, gather positions,
-  checked shapes) and label-constant data (a data column's rows, a design
-  block's rows and their `hcat`), computed once per label; never a value
-  computed from an unbound port, its alias, or a type the body computes, and
-  never a value the body writes into. On registered Enzyme (0.13.216) a
+  the remedy. A plan holds index bookkeeping only: never a data column, a
+  data value's alias, or a type the body computes. On registered Enzyme a
   planned partition's gradient needs runtime activity (the plan's constant
-  vectors meet the active vector in the body's views; Enzyme snag
-  `plan-const-int-r-4671f4a7`); the Enzyme dogfood line from `1280e6ee`
-  differentiates it under plain Reverse.
-- A lazy view of inputs serves its rows from its parts (`_cell_lazy_rows`, an
-  op's own method), and `plate_partition(…; plan_constant)` names HAVE ports
-  whose values are constant per label, which the plan may read: RKPPL's
-  compact overlay reads its active vector at the slots of a block's rows,
-  computed once per label, instead of a slot load and a branch per element.
+  row vectors meet the active vector in the body's views).
 - A partition's windows carry the positions of a gather index's entries,
   computed apart from the gather (once per label with a plan); row takes are
   a positions step and a view.

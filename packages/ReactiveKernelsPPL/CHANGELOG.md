@@ -16,16 +16,24 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.24
+
+- A partition's plan holds the bound data at the label's rows too (design
+  blocks included), and the compact sampler reads a packed block's rows from
+  its active vector at slots computed once per label from that label's slot
+  map, not through the overlay's per-element slot load and branch; a
+  partition reading a packed coordinate outside its footprint is refused by
+  name at preparation. On BRM's nested panel at atlas-17 size the compact
+  gradient is 2.04× the sweep's per-unit share (2.3× with 0.1.23, 2.63×
+  before). Requires ReactiveKernels 0.1.29.
+
 ## 0.1.23
 
 - `prepare_partition` and `prepare_partition_sampler` (dense and compact)
   prepare the partition with a plan port: each label's plan (ReactiveKernels
   `partition_plan`) is computed once at preparation (`PartitionQuery.plans`,
   `PartitionSampler.plans`) and passed to every evaluation and gradient, so a
-  call recomputes no row bookkeeping and gathers no bound data at the
-  label's rows (design blocks included); the compact sampler reads a packed
-  block's rows from its active vector at slots computed once per label, not
-  through the overlay's per-element slot load and branch. On registered
+  call recomputes no row bookkeeping. On registered
   Enzyme (0.13.216) the
   gradient of a planned partition needs runtime activity
   (`AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`): the
