@@ -114,7 +114,7 @@ end
     wrongdata = target_for(GAUSSIAN,(; y=DATA .+ 1); binding_id="six",built=f.built)
     @test_throws ArgumentError resume_smc(wrongdata.target,smc_checkpoint(batch))
     @test_throws ArgumentError resume_smc(f.target,merge(checkpoint,(; schema_version=2)))
-    @test_throws ArgumentError resume_smc(f.target,merge(checkpoint,(; positions=zeros(0,2500))))
+    @test_throws ArgumentError resume_smc(f.target,merge(smc_checkpoint(batch),(; positions=zeros(0,2500))))
 end
 
 @testset "Constrained coordinate Jacobian and dependent priors" begin
@@ -244,7 +244,9 @@ end
     @test mean(prior.positions) ≈ 0 atol=0.07
     @test var(prior.positions) ≈ 1 atol=0.11
 
-    fixed = target_for(:(y .~ Normal.(0,1)),(; y=DATA); model_id="no-parameters")
+    fixed = target_for(quote
+        y .~ Normal.(0,1)
+    end,(; y=DATA); model_id="no-parameters")
     fixedfit = smc(fixed.target; rng=Xoshiro(66),particles=10)
     @test size(fixedfit.positions) == (0,10)
     @test fixedfit.log_normalizer ≈ sum(normal,DATA)
