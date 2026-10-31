@@ -17,31 +17,24 @@ using DifferentiationInterface: AutoEnzyme, SecondOrder
 # each testset records that gap as broken; drop the branch once a registered
 # Enzyme carries the repair.
 #
-# On dogfood, static reverse over forward still builds a zero shadow copy of
-# the constant packed base inside the forward call. Under `--check-bounds=yes`
-# the nonlinear grouped cell's outer Reverse fails to differentiate that copy
-# (`EnzymeInternalError` at `make_zero`); default bounds are exact. Both are
-# Enzyme snag `static-reverse-o-3d3debe4`; drop that branch when it lands.
+# Nested static modes keep no copy of the constant packed base on dogfood from
+# `7fad557` (Enzyme snag `static-reverse-o-3d3debe4`). Under `--check-bounds=yes`
+# the grouped decay-curve cell (an LKJ factor and `R = Z * F'`) still copies it
+# once per call (Enzyme todo `0t6ufcp`); its cost testset records that as
+# broken.
 
 const _CCD_SECOND = SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
                                 AutoEnzyme(; mode = Enzyme.Forward))
 const _CCD_THIRD = SecondOrder(_CCD_SECOND, AutoEnzyme(; mode = Enzyme.Forward))
 
-# Runs `f()`; returns `nothing` when static Enzyme meets one of the gaps
-# above, and rethrows anything else.
+# Runs `f()`; returns `nothing` when registered Enzyme refuses the overlay's
+# read, and rethrows anything else.
 function _ccd_static(f)
     try
         f()
     catch err
-        message = sprint(showerror, err)
-        if err isa Enzyme.Compiler.EnzymeRuntimeActivityError
-            @test occursin("Mismatched activity", message)
-        elseif err isa Enzyme.Compiler.EnzymeInternalError &&
-               Base.JLOptions().check_bounds == 1
-            @test occursin("make_zero", message)
-        else
-            rethrow()
-        end
+        err isa Enzyme.Compiler.EnzymeRuntimeActivityError || rethrow()
+        @test occursin("Mismatched activity", sprint(showerror, err))
         @test_broken false
         nothing
     end
@@ -231,11 +224,46 @@ end
     if all(!isnothing, measured)
         @test all(r -> r.H ≈ r.expected, measured)
         @test all(r -> r.third ≈ r.expected_third, measured)
-        # The cell's work is cell-local, but static reverse over forward copies
-        # the constant packed base once per call on Enzyme dogfood, where
-        # first-order static Reverse and Forward do not (Enzyme snag
-        # `static-reverse-o-3d3debe4`). Drop `_broken` when it lands.
-        @test_broken measured[2].hvp_bytes <= measured[1].hvp_bytes + 1024
-        @test_broken measured[2].third_bytes <= measured[1].third_bytes + 1024
+        # The cell's work is cell-local: nested static modes keep no copy of
+        # the constant packed base (above).
+        @test measured[2].hvp_bytes <= measured[1].hvp_bytes + 1024
+        @test measured[2].third_bytes <= measured[1].third_bytes + 1024
+    end
+end
+
+# `_cq_grouped_data`'s shape at `n` groups of three observations each.
+_ccd_grouped_data(n) = (; group = ["g$g" for g in 1:n],
+    w = [0.1mod(g, 5) - 0.2 for g in 1:n], amount = fill(10.0, n),
+    t = [[0.5, 1.0, 2.0] for _ in 1:n], y = [[1.8, 1.5, 1.1] .+ 0.01mod(g, 7) for g in 1:n])
+
+@testset "compact cell derivatives: a nonlinear grouped cell's cost does not grow with the number of groups" begin
+    measured = map((10, 2_000)) do n
+        bound, built = _cq_bound(_CQ_GROUPED, _ccd_grouped_data(n), (:y,))
+        u = collect(range(-0.4, 0.5; length = built.layout.total))
+        names = coordinate_names(built.layout)
+        indices = sort!([2, 3, 4, findall(s -> startswith(String(s), "Z.3."), names)...])
+        m = length(indices)
+        v = collect(range(0.3, -0.2; length = m))
+        h = prepare_compact_cell_ad(prepare_ad_hvp, built, bound, :y, u, indices,
+            _CCD_SECOND, (v,))
+        t = prepare_compact_cell_ad(prepare_ad_third, built, bound, :y, u, indices,
+            _CCD_THIRD, (v,))
+        active = u[indices] .+ 0.05
+        g, hout, tout = zeros(m), (zeros(m),), (zeros(m),)
+        _ccd_static() do
+            ad_gradient_and_hvp!(h, g, hout, (v,), u, active, indices, 3)
+            ad_gradient_hvp_and_third!(t, g, hout, tout, (v,), u, active, indices, 3)
+            (; hvp_bytes = (@allocated ad_gradient_and_hvp!(h, g, hout, (v,), u, active,
+                   indices, 3)),
+               third_bytes = (@allocated ad_gradient_hvp_and_third!(t, g, hout, tout, (v,),
+                   u, active, indices, 3)))
+        end
+    end
+    if all(!isnothing, measured)
+        # Under `--check-bounds=yes` this cell still copies the packed base once
+        # per call (Enzyme todo `0t6ufcp`, above).
+        forced_bounds = Base.JLOptions().check_bounds == 1
+        @test measured[2].hvp_bytes <= measured[1].hvp_bytes + 1024 broken = forced_bounds
+        @test measured[2].third_bytes <= measured[1].third_bytes + 1024 broken = forced_bounds
     end
 end
