@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.35
+
+- Propagate shape facts through a visible `KernelSpec`'s recipes, including
+  authored plates, without executing its cells or opaque Julia helpers.
+  RKPPL can preserve the row axis of a grouped plate output through a
+  broadcast column, concatenated design, matrix product and offset, so a
+  strict observation cell computes only its owning group. Numerical
+  transfer rules remain in OutputSignatures; partial graph facts do not
+  authorize numerical substitutions.
+
 ## 0.1.34
 
 - Bound preparation caches shared data-only scalar work from nested plate
