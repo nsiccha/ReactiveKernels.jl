@@ -2,7 +2,7 @@
 # recipes, so preparation, row pushdown and AD have one implementation.
 
 function _cell_factor_graph(spec::KernelSpec, want; have = spec.have_names,
-                            bound = NamedTuple(), on_error = nothing)
+                            bound = NamedTuple(), on_error = nothing, locality = nothing)
     p = _fuse_authored_plate_chains(plan(spec; have, want))
     argument_types = Any[haskey(bound, v.name) ? typeof(bound[v.name]) :
                          _cell_standin_type(valtype(v)) for v in p.have]
@@ -58,6 +58,7 @@ function _cell_factor_graph(spec::KernelSpec, want; have = spec.have_names,
         v
     end
     sums = NamedTuple[]
+    cell_outputs = Set{ValueId}()
     function emit(r, mapping = nothing)
         mapvalue(v) = mapping === nothing ? v : mapping[canon_id(mapping_graph[], v.id)]
         ins = Tuple(mapvalue(v) for v in r.inputs)
@@ -74,10 +75,12 @@ function _cell_factor_graph(spec::KernelSpec, want; have = spec.have_names,
             for part in expanded
                 q = _add_recipe!(g, part.inputs, part.outputs, part.op, part.cost,
                                  nothing, false, part.source)
+                mapping === nothing || union!(cell_outputs, (v.id for v in q.outputs))
                 record(q, part === last(expanded) ? only(r.outputs).name : only(part.outputs).name)
             end
         else
             q = _add_recipe!(g, ins, outs, r.op, r.cost, r.cse_key, r.effectful, r.source)
+            mapping === nothing || union!(cell_outputs, (v.id for v in q.outputs))
             record(q, first(r.outputs).name)
         end
     end
@@ -156,7 +159,62 @@ function _cell_factor_graph(spec::KernelSpec, want; have = spec.have_names,
     end
     result = KernelSpec(g, ports, order, Symbol[v.name for v in p.have],
                         Symbol[v.name for v in p.want], nothing)
+    result = _cell_factor_scalar_reads(result, cell_outputs; bound, locality)
     (; spec = result, sums)
+end
+
+# Flattening a plate leaves scalar reads of shared arrays as ordinary recipes.
+# Recover their row demand after splitting: otherwise a direct `eta[index]`
+# next to a sum materializes all of eta, even when the sum is an independent
+# input to the outer factor. Use the same identity cell as a summand, so value
+# lowering, footprints and AD all follow the selected row. Type inference
+# distinguishes a scalar vector read from a gathered vector or matrix slice.
+function _cell_factor_scalar_reads(spec::KernelSpec, cell_outputs; bound, locality)
+    p = plan(spec)
+    argument_types = Any[haskey(bound, v.name) ? typeof(bound[v.name]) :
+                         _cell_standin_type(valtype(v)) for v in p.have]
+    # A cell's index port may be untyped (linear or Cartesian). Its result
+    # type comes from the scalar body, independently of that index type.
+    types = _plan_value_types(p, argument_types) do r, inputs
+        T = _checked_recipe_type!(_UninferredValue[], r.op, inputs, Symbol[])
+        T === nothing ? map(valtype, r.outputs) : _recipe_output_types(r, T)
+    end
+    old = spec.graph
+    g = Graph(copy(old.values), Recipe[], Dict{ValueId,Vector{Int}}(),
+              copy(old.aliases), old.version, nothing)
+    for r in p.recipes
+        inputs, op = r.inputs, r.op
+        # Top-level recipes retain their original context. Only reads
+        # exposed by flattening a cell need their lost row demand restored.
+        analyzed = any(v -> v.id in cell_outputs, r.outputs) ?
+            _cell_native(r; outlined = true) : nothing
+        if length(r.outputs) == 1 && !r.effectful && analyzed !== nothing
+            native, params, mod = analyzed
+            if Meta.isexpr(native, :call, 3) &&
+               !_native_callee_shadowed(native.args[1], params) &&
+               _cell_binding(native.args[1], mod) === Base.getindex
+                native = Expr(:ref, native.args[2:end]...)
+            end
+            if Meta.isexpr(native, :ref, 2) && native.args[1] in params
+                a = r.inputs[findfirst(==(native.args[1]), params)]
+                index = native.args[2]
+                position = findfirst(==(index), params)
+                i = position === nothing ? nothing : r.inputs[position]
+                A = get(types, canon_id(old, a.id), Any)
+                I = i === nothing ? typeof(index) : get(types, canon_id(old, i.id), Any)
+                if A isa Type && A <: AbstractVector && I isa Type && I <: Integer && !(I <: Bool)
+                    if i === nothing
+                        i = value!(g, Symbol(only(r.outputs).name, :_index), I)
+                        _add_recipe!(g, (), (i,), _BoundConstant(index), 0.0, nothing, false, index)
+                    end
+                    inputs, op = (i, a), _cell_factor_index_op(locality)
+                end
+            end
+        end
+        _add_recipe!(g, inputs, r.outputs, op, r.cost, r.cse_key, r.effectful, r.source)
+    end
+    KernelSpec(g, copy(spec.ports), copy(spec.port_order), copy(spec.have_names),
+               copy(spec.want_names), nothing)
 end
 
 function _copy_cell_factor_spec(spec::KernelSpec; omit = Set{ValueId}())
@@ -201,14 +259,18 @@ end
 # Make one term an ordinary identity cell over the reduction's operand. Row
 # demand then propagates through its elementwise recipes and gathers.
 function _cell_factor_term!(spec::KernelSpec, argument::Value, index::Value, locality)
-    inner = Graph()
-    x = value!(inner, :term, Any)
-    scalar = prepare(inner; have = (x,), want = (x,))
-    plate = _AuthoredPlateOp{typeof(scalar),()}(scalar)
     output = value!(spec.graph, Symbol(argument.name, :_term), Any)
     spec.ports[output.name] = output
     push!(spec.port_order, output.name)
     _add_recipe!(spec.graph, (index, argument), (output,),
-        _AuthoredPlateCellOp(plate, locality), 1.0, nothing, false, nothing)
+        _cell_factor_index_op(locality), 1.0, nothing, false, nothing)
     output
+end
+
+function _cell_factor_index_op(locality)
+    inner = Graph()
+    x = value!(inner, :term, Any)
+    scalar = prepare(inner; have = (x,), want = (x,))
+    plate = _AuthoredPlateOp{typeof(scalar),()}(scalar)
+    _AuthoredPlateCellOp(plate, locality)
 end

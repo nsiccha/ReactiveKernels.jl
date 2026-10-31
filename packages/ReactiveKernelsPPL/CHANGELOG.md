@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.33
+
+- Require ReactiveKernels 0.1.39 for local direct reads in sum-factored
+  cells. An outer density combining independent sum inputs with scalar
+  predictor reads keeps only those predictors' packed coordinates, including
+  when several sums and direct reads are composed from an earlier plate.
+  Factor preparation passes its locality policy to the recovered row reads.
+
 ## 0.1.32
 
 - Require ReactiveKernels 0.1.38 for visible-kernel metadata dependencies.

@@ -26,7 +26,7 @@ function prepare_cell_factors(built, plan::StructuralPlan, observation::Symbol;
     spec, want = _cell_query_spec(built, plan, (observation,); locality)
     have = (_query_have(plan)..., _CELL_PORT)
     factors = ReactiveKernels._cell_factor_graph(spec, want;
-        have, bound = _query_bound(plan), on_error)
+        have, bound = _query_bound(plan), on_error, locality)
     reductions = map(factors.sums) do s
         rows = ReactiveKernels._cell_factor_rows(factors.spec, s.argument)
         rows === nothing && return nothing
@@ -111,6 +111,8 @@ The result is sorted unique packed indices, or `:whole`; the latter means
 `collect(eachindex(u))`. Structural footprints may be conservative, as for
 `prepare_cell_query`. The outer footprint treats the supplied sums as
 independent and therefore contains only its direct packed-coordinate reads.
+Scalar vector reads such as `eta[anchor[cell]]` retain row demand through
+elementwise predictors, including when the same predictor feeds a sum.
 
 Use these footprints to select compact coordinates for
 [`prepare_cell_factor_ad`](@ref). The public `kernel` property also supports

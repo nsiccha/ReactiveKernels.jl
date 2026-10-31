@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.39
+
+- Preserve scalar vector reads when decomposing cell factors. Direct reads
+  such as `eta[anchor[k]]` alongside sums retain row demand through the
+  predictor, so outer values, coordinate footprints and derivatives do not
+  traverse all latent levels. Bracket and `getindex` spellings, including
+  literal indices, share the existing cell lowering and bounds checks.
+
 ## 0.1.38
 
 - Track visible kernel inputs needed for output metadata as well as plate
