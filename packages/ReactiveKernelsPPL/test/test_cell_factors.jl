@@ -21,6 +21,31 @@ const _CF_SINGLE = @rkppl begin
     end
 end
 
+const _CF_DIRECT = @rkppl begin
+    b ~ Normal(0, 1)
+    z[levels(g)] .~ Normal.(0, 1)
+    scale ~ Exponential(1)
+    sigma ~ Exponential(1)
+    eta = b .+ scale .* z[g]
+    @plate for k in eachindex(y)
+        y[k] ~ Normal(sum(exp.(eta[rows[k]])) + eta[anchor[k]], sigma)
+    end
+end
+
+const _CF_DIRECT_MIXED = @rkppl begin
+    b ~ Normal(0, 1)
+    z[levels(g)] .~ Normal.(0, 1)
+    scale ~ Exponential(1)
+    sigma ~ Exponential(1)
+    eta = b .+ scale .* z[g]
+    @plate for k in eachindex(y)
+        s1 = sum(exp.(eta[rows[k]]))
+        s2 = sum(eta[rows2[k]] .^ 2)
+        mean[k] = log1p(s1) + s2 + eta[anchor[k]]^2 + getindex(eta, other[k]) + eta[1]
+    end
+    y .~ Normal.(mean, sigma)
+end
+
 # Both the packed point and the reduction grow. A warmed factor call must
 # neither traverse all terms nor allocate a shadow of the whole packed point.
 function _cf_cost(call)
@@ -35,6 +60,7 @@ function _cf_cost(call)
     end
     (; bytes, ns)
 end
+
 _cf_nodes(x) = x isa Expr ? 1 + sum(_cf_nodes, x.args; init = 0) : 1
 
 const _CF_LOCAL = @rkppl begin
@@ -472,6 +498,138 @@ end
             @test large.bytes <= small.bytes + 4096
             @test large.ns < 8small.ns
             @test large.nodes == small.nodes
+        end
+    end
+end
+
+# Independent small normal-density oracle. Coordinates are the supplied sum
+# followed by the four selected packed coordinates in their public order.
+function _cf_direct_derivatives(q, names, y)
+    b, a, s, z = (1 + findfirst(n -> startswith(n, key), names)
+                  for key in ("b", "scale", "sigma", "z."))
+    scale = exp(q[a])
+    d, e = y - (q[1] + q[b] + scale * q[z]), exp(-2q[s])
+    dm = zeros(5)
+    dm[1] = dm[b] = 1
+    dm[a], dm[z] = scale * q[z], scale
+    Hm = zeros(5, 5)
+    Hm[a, a], Hm[a, z], Hm[z, a] = scale * q[z], scale, scale
+    gradient = d * e * dm
+    gradient[s] += -1 + d^2 * e
+    H = -e * (dm * dm') + d * e * Hm
+    H[:, s] .-= 2d * e * dm
+    H[s, :] .-= 2d * e * dm
+    H[s, s] -= 2d^2 * e
+    gradient, H
+end
+
+@testset "outer factors keep direct scalar reads local" begin
+    _cf_static() do
+        costs = map((16, 64, 4096)) do n
+            rows, anchor, y = [collect(1:n), [n, 2, 2], Int[]], [1, n, 2], [1.2, -0.4, 0.3]
+            bound = _CF_DIRECT(; g = collect(1:n), rows, anchor) | (; y)
+            built = build_kernel(bound)
+            f = prepare_cell_factors(built, bound, :y; locality = :error)
+            @test length(cell_reductions(f)) == 1
+            u = collect(range(-0.2, 0.3; length = built.layout.total))
+            names = string.(coordinate_names(built.layout))
+            at(name) = findfirst(==(name), names)
+            globals = [at("b"), at("scale"), at("sigma")]
+            eta = [u[at("b")] + exp(u[at("scale")]) * u[at("z.$r")] for r in 1:n]
+            outer, term = prepare_cell_factor_query(f, :outer), prepare_cell_factor_query(f, 1)
+            ofp, tfp = partition_footprint_kernel(outer.kernel), partition_footprint_kernel(term.kernel)
+            selection(c) = sort([globals; at("z.$(anchor[c])")])
+            oi = selection(1)
+            v = ([0.2], [0.1, -0.3, 0.2, -0.1])
+            derivative = prepare_cell_factor_ad(prepare_ad_third, f, :outer, u, oi, _CF_THIRD, (v,))
+            for c in eachindex(y)
+                oi = selection(c)
+                sums = [sum(exp, eta[rows[c]]; init = 0.0)]
+                expected = logpdf(Normal(sums[1] + eta[anchor[c]], exp(u[at("sigma")])), y[c])
+                point = _CFReadPoint(u, Int[])
+                @test outer(point, sums, c) ≈ expected
+                @test sort(unique(point.reads)) == oi
+                @test length(point.reads) <= 8
+                @test _cf_support(ofp, u, sums, c) == oi
+                @test reduction_rows(f, 1, c) == rows[c]
+                for t in (isempty(rows[c]) ? () : (1, length(rows[c])))
+                    ti = sort([at("b"), at("scale"), at("z.$(rows[c][t])")])
+                    @test term(u, c, t) ≈ exp(eta[rows[c][t]])
+                    @test _cf_support(tfp, u, c, t) == ti
+                end
+                q, direction = [sums; u[oi]], _cf_flat(v)
+                g, H = _cf_direct_derivatives(q, names[oi], y[c])
+                h = 1e-5
+                _, Hp = _cf_direct_derivatives(q + h * direction, names[oi], y[c])
+                _, Hm = _cf_direct_derivatives(q - h * direction, names[oi], y[c])
+                gradient, (hv,), (third,) = ad_gradient_hvp_and_third(
+                    derivative, (v,), u, sums, u[oi], oi, c)
+                @test _cf_flat(gradient) ≈ g
+                @test _cf_flat(hv) ≈ H * direction
+                @test _cf_flat(third) ≈ (Hp - Hm) * direction / (2h) rtol = 2e-7
+            end
+            oi = selection(1)
+            sums, active = [0.0], u[oi]
+            (; value = merge(_cf_cost(() -> outer(u, sums, 1)),
+                             (; nodes = _cf_nodes(code_expr(outer.kernel)))),
+               footprint = merge(_cf_cost(() -> _cf_support(ofp, u, sums, 1)),
+                                 (; nodes = _cf_nodes(code_expr(ofp)))),
+               derivative = merge(_cf_cost(() -> ad_gradient_hvp_and_third(
+                    derivative, (v,), u, sums, active, oi, 1)),
+                    (; nodes = _cf_nodes(code_expr(derivative.prepared.kernel)))))
+        end
+        @info "outer factor with direct reads (16, 64, 4096 latent levels)" costs
+        for name in (:value, :footprint, :derivative), large in costs[2:end]
+            a, b = getproperty(first(costs), name), getproperty(large, name)
+            @test b.bytes <= a.bytes + 4096
+            @test b.ns < 8a.ns
+            @test b.nodes == a.nodes
+        end
+    end
+end
+
+@testset "multiple sums and direct reads composed from an earlier plate" begin
+    g, rows, rows2 = [1, 2, 1, 3], [[1, 2, 2], Int[]], [[3, 4], Int[]]
+    anchor, other, y = [4, 2], [1, 2], [0.4, -0.2]
+    bound = _CF_DIRECT_MIXED(; g, rows, rows2, anchor, other) | (; y)
+    built = build_kernel(bound)
+    f = prepare_cell_factors(built, bound, :y; locality = :error)
+    @test length(cell_reductions(f)) == 2
+    u = collect(range(-0.2, 0.3; length = built.layout.total))
+    names = string.(coordinate_names(built.layout))
+    at(name) = findfirst(==(name), names)
+    eta = [u[at("b")] + exp(u[at("scale")]) * u[at("z.$r")] for r in g]
+    outer = prepare_cell_factor_query(f, :outer)
+    fp = partition_footprint_kernel(outer.kernel)
+    whole = prepare_query(built, bound, :pointwise)(u).y
+    terms = [prepare_cell_factor_query(f, j) for j in 1:2]
+    for c in eachindex(y)
+        sums = [sum((terms[j](u, c, t)
+                     for t in eachindex(reduction_rows(f, j, c))); init = 0.0) for j in 1:2]
+        expected = logpdf(Normal(log1p(sum(exp, eta[rows[c]]; init = 0.0)) +
+            sum(abs2, eta[rows2[c]]; init = 0.0) + eta[anchor[c]]^2 + eta[other[c]] + eta[1],
+            exp(u[at("sigma")])), y[c])
+        oi = sort(unique([at("b"), at("scale"), at("sigma"),
+                          at("z.$(g[anchor[c]])"), at("z.$(g[other[c]])"), at("z.$(g[1])")]))
+        point = _CFReadPoint(u, Int[])
+        @test outer(point, sums, c) ≈ whole[c] ≈ expected
+        @test sort(unique(point.reads)) == oi
+        @test _cf_support(fp, u, sums, c) == oi
+    end
+end
+
+@testset "direct factor reads retain singleton bounds" begin
+    for anchor in ([1], [2])
+        bound = _CF_DIRECT(; g = [1], rows = [[1]], anchor) | (; y = [0.4])
+        built = build_kernel(bound)
+        f = prepare_cell_factors(built, bound, :y; locality = :error)
+        outer = prepare_cell_factor_query(f, :outer)
+        u = zeros(built.layout.total)
+        if anchor == [1]
+            @test outer(u, [1.0], 1) ≈ logpdf(Normal(1, 1), 0.4)
+            @test _cf_support(partition_footprint_kernel(outer.kernel), u, [1.0], 1) == collect(1:4)
+        else
+            @test_throws BoundsError outer(u, [1.0], 1)
         end
     end
 end

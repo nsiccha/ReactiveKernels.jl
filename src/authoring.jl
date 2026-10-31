@@ -3704,7 +3704,7 @@ end
 # or index, as `_kernel_hoist_cell_invariants` lifts) that reads some but
 # fewer of the expression's arguments than its nearest enclosing such
 # subexpression, and does work worth caching. A separate decomposition with
-# `factors=true` retains sums, their operands and eager broadcast operands
+# `factors=true` retains sums, indexed reads and eager broadcast operands
 # for cell factor queries. For any bound set, the maximal
 # data-only subexpressions are exactly the split nodes whose arguments are all
 # bound and whose enclosing split node (or root) reads a live one.
@@ -3816,6 +3816,9 @@ end
 _cell_sum_source(ex) = ex isa Expr && ex.head === :call && length(ex.args) == 2 &&
     _kernel_split_callee_name(ex.args[1]) === :sum
 
+_cell_index_source(ex) = ex isa Expr && (ex.head === :ref ||
+    ex.head === :call && _kernel_split_callee_name(ex.args[1]) === :getindex)
+
 """
     _kernel_split_nodes(ex, ports; factors = false) -> nothing | (; root, nodes)
 
@@ -3827,7 +3830,7 @@ indices of its immediately nested nodes, and its subexpression with those kids
 replaced by `_kernel_split_placeholder(kid)`. `root` has the same `direct`,
 `kids` and `body` for the whole expression. A pure function of `ex` and
 `ports` and the boundary policy: preparation recomputes it from a recipe's
-source. `factors=true` adds sum and eager-operand boundaries while keeping
+source. `factors=true` adds sum, index and eager-operand boundaries while keeping
 nested broadcasts fused. Ordinary partial evaluation uses the default.
 """
 function _kernel_split_nodes(ex, ports::Vector{Symbol}; factors::Bool = false)
@@ -3860,7 +3863,8 @@ function _kernel_split_nodes(ex, ports::Vector{Symbol}; factors::Bool = false)
                 # here; ordinary execution still calls the original function.
                 reduction = factors && (_cell_sum_source(e) || _cell_sum_source(child) ||
                     (in_sum && _cell_named_operand(e, child)) ||
-                    (_cell_dotted(e) && !_cell_dotted(child)) || e.head === :ref)
+                    (_cell_dotted(e) && !_cell_dotted(child)) ||
+                    _cell_index_source(e) || _cell_index_source(child))
                 fused_child = factors && _cell_dotted(e) && _cell_dotted(child)
                 if !fused_child && !isempty(reads) && issubset(reads, enclosing) &&
                    (reduction || (length(reads) < length(enclosing) &&
