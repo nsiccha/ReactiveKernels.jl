@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.30
+
+- Strict plate cells and partitions accept vector-valued products with an
+  inline right operand, such as `PHI * (weights .* z)`, and multi-factor
+  products such as `A * W * z`. When Julia infers a vector result, its full
+  shape follows from the left factor's row axis; plate-computed weights keep
+  the rank inferred from their batched inputs. Dotted readers can therefore
+  consume only the requested rows without computing the whole product or
+  evaluating its right operand to discover its shape. This fixes strict
+  partition preparation for BRM HSGP predictors.
+
 ## 0.1.29
 
 - An authored recipe's operation carries its source as a record instead of a
