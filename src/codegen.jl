@@ -7732,8 +7732,7 @@ function _recipe_source_names(recipe::Recipe)
     spelled = Set{Symbol}()
     _source_symbols!(spelled, recipe.source)
     names = _source_parameter_names(recipe.op, recipe.source, length(recipe.inputs))
-    names === nothing ||
-        return Symbol[_spelled_parameter_name(name, spelled) for name in names]
+    names === nothing || return _spelled_parameter_names(names, spelled, recipe.inputs)
     Symbol[_unscoped_source_name(value.name, spelled) for value in recipe.inputs]
 end
 # Julia's lowering reports a gensym parameter (`##endpoint_value#7`) without
@@ -7750,6 +7749,27 @@ function _spelled_parameter_name(name::Symbol, spelled)
     base === nothing && return name
     matches = Symbol[s for s in spelled if _gensym_base(s) == base]
     length(matches) == 1 ? only(matches) : name
+end
+# The same for the parameters of a source over `inputs` (the recipe's values,
+# one per parameter in order). A companion spells several parameters of one
+# gensym base canonically (two lifted cell invariants, `##cell_invariant#2`
+# and `##cell_invariant#3`) where the source spells as many of that base
+# (`##cell_invariant#231`, `##cell_invariant#232`); such a parameter is the
+# input at its position when the source spells that input's name. The inputs
+# tuple is read without specializing: its type names the recipe's port
+# selection, which preparation may not compile per port count.
+Base.@nospecializeinfer function _spelled_parameter_names(names, spelled,
+                                                          @nospecialize(inputs))
+    result = Symbol[_spelled_parameter_name(name, spelled) for name in names]
+    length(inputs) == length(names) || return result
+    for (index, name) in enumerate(names)
+        result[index] === name && !(name in spelled) || continue
+        base = _gensym_base(name)
+        base === nothing && continue
+        input = inputs[index].name
+        input in spelled && _gensym_base(input) == base && (result[index] = input)
+    end
+    result
 end
 _gensym_base(name::Symbol) =
     (m = match(r"^#*(.+)#\d+$", String(name))) === nothing ? nothing : m.captures[1]
@@ -7780,7 +7800,7 @@ Base.@nospecializeinfer function _source_parameter_names(
     names = _branch_call_names(f)
     names === nothing || return length(names) == n ? names : nothing
     record = _source_record(f)
-    record === nothing ? _closure_parameter_names(f, n) : _source_params(record, n, source)
+    record === nothing ? _closure_parameter_names(f, n) : _source_params(record, n)
 end
 # The source record behind branch and reduction metadata is its whole call's.
 Base.@nospecializeinfer _source_record(@nospecialize(branch::_KernelBranch)) =

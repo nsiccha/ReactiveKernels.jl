@@ -157,7 +157,7 @@ _lane_callee(child::_KernelPreparedChild) = getfield(child, :lane)
     end
 end
 
-# `(source record, parameter names, module)` of an eligible source operation,
+# `(source record or raw closure, parameter names, module)` of an eligible source operation,
 # or `nothing`. `branches`: whether a lazy branch's all-in-one closure counts
 # (`_lane_source_expr` only; the slice and window analyses read other shapes).
 # `outlined`: `r` is a part a cell lowering outlined from an authored
@@ -171,24 +171,34 @@ function _lane_source_closure(r::Recipe; branches::Bool = false, outlined::Bool 
     outlined || getfield(op, :ignored_throws) !== nothing || return nothing
     r.source isa Expr || return nothing
     branches || !(getfield(op, :f) isa _KernelBranch) || return nothing
-    record = _source_record(_lane_source_callable(getfield(op, :f)))
-    record === nothing && return nothing
-    params = _lane_source_params(record, length(r.inputs), r.source)
+    callable = _lane_source_callable(getfield(op, :f))
+    params = _lane_source_params(callable, r)
     params === nothing && return nothing
-    (record, params, _kernel_endpoint_source_module(op))
+    (callable, params, _kernel_endpoint_source_module(op))
 end
 
-# The parameter names of a capture-free source record, when it takes `n`
-# distinct named parameters, or `nothing`. The source reads its inputs by these
-# names, which need not be the input values' names: a composed child's recipe
-# reads its formals (`A * w`) over the caller's values (`X`, `b`), or over
-# values scoped under the caller's name (`pointwise.X`). A source over
-# captured values keeps its ordinary execution here.
-Base.@nospecializeinfer function _lane_source_params(@nospecialize(record::_KernelSource), n,
-                                                     @nospecialize(source))
-    isempty(_source_captures(record)) || return nothing
-    params = _source_params(record, n, source)
+# The parameter names of a capture-free source over the recipe `r`'s inputs,
+# as `r.source` spells them, when it takes as many distinct named parameters,
+# or `nothing`: a record's (`_KernelSource`), or a raw closure's through its
+# one method (an outlined cell part, `_cell_outline`, or a hand-built
+# operation). The source reads its inputs by these names, which need not be
+# the input values' names: a composed child's recipe reads its formals
+# (`A * w`) over the caller's values (`X`, `b`), or over values scoped under
+# the caller's name (`pointwise.X`). A source over captured values keeps its
+# ordinary execution here.
+Base.@nospecializeinfer function _lane_source_params(@nospecialize(f), r::Recipe)
+    n = length(r.inputs)
+    record = _source_record(f)
+    if record === nothing
+        f isa Function && fieldcount(typeof(f)) == 0 || return nothing
+        params = _closure_parameter_names(f, n)
+    else
+        isempty(_source_captures(record)) || return nothing
+        params = _source_params(record, n)
+    end
     params === nothing && return nothing
+    spelled = _source_symbols!(Set{Symbol}(), r.source)
+    params = _spelled_parameter_names(params, spelled, r.inputs)
     allunique(params) || return nothing
     params
 end

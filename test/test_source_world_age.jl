@@ -253,4 +253,29 @@ end
         Enzyme.Active, Enzyme.Duplicated(e, de), Enzyme.Const(lt))
     @test isfinite(sum(de))
 end
+
+# The record's call splices the companion's body into its own generated
+# method, whose static parameters are named as no source can spell a local:
+# a model's `R = Z * F'` in a spliced body once failed to lower ("local
+# variable name R conflicts with a static parameter").
+@kernel static_parameter_names(x) = begin
+    result = begin
+        R = x .* 2
+        C = sum(R)
+        N = length(R)
+        K = C / N
+        K + first(R)
+    end
+    return result
+end
+
+@testset "a spliced source body may bind the call's static parameter names" begin
+    x = [0.5, 1.5, 2.5]
+    expected = 2 * sum(x) / length(x) + 2 * first(x)
+    @test prepare(static_parameter_names)(x) ≈ expected
+    recipe = only(plan(static_parameter_names; want = :result).recipes)
+    record = ReactiveKernels._source_record(getfield(recipe.op, :f))
+    @test record isa ReactiveKernels._KernelSource
+    @test record(x) ≈ expected
+end
 end

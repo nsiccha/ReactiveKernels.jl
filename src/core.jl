@@ -314,14 +314,6 @@ Base.@nospecializeinfer function _source_params(@nospecialize(f::_KernelSource),
     names isa Tuple && length(names) == n + 1 || return nothing
     Symbol[names[2:end]...]
 end
-# The same, as `source` spells them.
-Base.@nospecializeinfer function _source_params(@nospecialize(f::_KernelSource), n,
-                                                @nospecialize(source))
-    params = _source_params(f, n)
-    params === nothing && return nothing
-    spelled = _source_symbols!(Set{Symbol}(), source)
-    Symbol[_spelled_parameter_name(name, spelled) for name in params]
-end
 # The captured names of the source behind `f` (a record, or metadata whose
 # call is one); none for any other callable.
 Base.@nospecializeinfer function _source_capture_names(@nospecialize(f))
@@ -366,10 +358,14 @@ end
 # (a scan step's log-sum-exp): such a step became a call per scan step, and
 # native Enzyme reverse through it cost 2.5–3× the same kernel with the step
 # inlined (HMM forward pass, snag `rkppl-hmm-forwar-89257681`).
-@inline @generated function (f::_KernelSource{C,R,N})(args::Vararg{Any,K}) where {C,R,N,K}
-    forwarded = [:(getfield(args, $index)) for index in 1:K]
-    if N === Nothing
-        spliced = _companion_call_body(R, forwarded)
+# The static parameters are named as no source can spell a local: a local of
+# the spliced body may not share a static parameter's name (`R = Z * F'` in a
+# model's cell: "local variable name R conflicts with a static parameter").
+@inline @generated function (f::_KernelSource{var"#C",var"#R",var"#N"})(
+        args::Vararg{Any,var"#K"}) where {var"#C",var"#R",var"#N",var"#K"}
+    forwarded = [:(getfield(args, $index)) for index in 1:var"#K"]
+    if var"#N" === Nothing
+        spliced = _companion_call_body(var"#R", forwarded)
         spliced === nothing || return spliced
         return Expr(:block, Expr(:meta, :inline),
             :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
