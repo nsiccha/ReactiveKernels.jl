@@ -265,6 +265,13 @@ Base.@nospecializeinfer function _KernelSourceOp(
     _KernelSourceOp(token, form, f, ignored_throws, call_identity, mod)
 end
 
+# A generated function whose cache-owning method is not yet visible during
+# consumer precompilation. Define the type before the source-call generator:
+# its definition world must see this binding even when RK loads from source.
+struct _PrecompileWarmFunction{F} <: Function
+    f::F
+end
+
 # An authored source's executable record (RK 0.1.27, stage 3 of the
 # operation-table migration): what runs, as data. `captures` are the values
 # the source closed over (a `NamedTuple`, empty when none). `companion` is the
@@ -321,6 +328,30 @@ Base.@nospecializeinfer function _source_capture_names(@nospecialize(f))
     record === nothing ? () : keys(getfield(record, :captures))
 end
 
+# A consumer owns its companion cache, whose binding can be newer than RK's
+# source-call generator. Read that fixed binding as compiler metadata.
+function _companion_cached_body(cache_tag, id)
+    @static if isdefined(Base, :lookup_binding_partition)
+        # A generator cannot advance its world with invokelatest. This is
+        # compiler metadata: RGF creates the constant cache binding once,
+        # before creating its tag type, and never replaces that binding.
+        binding = GlobalRef(parentmodule(cache_tag), RuntimeGeneratedFunctions._cachename)
+        partition = Base.lookup_binding_partition(typemax(UInt), binding)
+        Base.is_defined_const_binding(Base.binding_kind(partition)) || return nothing
+        cache = Base.partition_restriction(partition)
+        body = @static if isdefined(RuntimeGeneratedFunctions, :_cache_getindex)
+            RuntimeGeneratedFunctions._cache_getindex(cache, id)
+        else
+            lock(RuntimeGeneratedFunctions._cache_lock) do
+                cache[id]
+            end
+        end
+        return body isa WeakRef ? body.value : body
+    else
+        return RuntimeGeneratedFunctions._lookup_body(cache_tag, id)
+    end
+end
+
 # Defined before the generated call below: a generator runs in the world of
 # its definition and sees no later method.
 # The companion's body over the captures and the arguments, as
@@ -336,7 +367,7 @@ function _companion_call_body(@nospecialize(R), forwarded)
     R isa DataType && R <: _PrecompileWarmFunction && (R = R.parameters[1])
     R isa DataType && R <: RuntimeGeneratedFunctions.RuntimeGeneratedFunction || return nothing
     argnames, cache_tag, _, id = R.parameters[1:4]
-    body = RuntimeGeneratedFunctions._lookup_body(cache_tag, id)
+    body = _companion_cached_body(cache_tag, id)
     body === nothing && return nothing
     argnames isa Tuple && length(argnames) == length(forwarded) + 1 || return nothing
     # Every argument is read before any parameter is bound: a parameter may

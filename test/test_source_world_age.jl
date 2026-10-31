@@ -1,6 +1,23 @@
 module SourceWorldAgeTests
 using ReactiveKernels, Enzyme, Test
 
+# A consumer's cache binding is newer than RK's generated source-call method.
+# This is also the package-image case: its cache belongs to the consumer,
+# while the source record's call method belongs to the dependency.
+const RGF = ReactiveKernels.RuntimeGeneratedFunctions
+RGF.init(@__MODULE__)
+const consumer_companion = RGF.drop_expr(RGF.RuntimeGeneratedFunction(
+    @__MODULE__, @__MODULE__,
+    :((captures, x, location, scale) -> captures.offset + (x - location) / scale)))
+const consumer_source = ReactiveKernels._KernelSource(
+    (; offset=0.25), consumer_companion, nothing)
+
+@testset "source companions read newer consumer caches" begin
+    @test (@inferred consumer_source(3.0, 1.0, 2.0)) == 1.25
+    @test only(only(Enzyme.autodiff(Enzyme.Reverse,
+        x -> consumer_source(x, 1.0, 2.0), Enzyme.Active, Enzyme.Active(3.0)))) == 0.5
+end
+
 @kernel plus(x, y) = begin
     result = x + y
     return result
