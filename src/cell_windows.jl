@@ -1088,10 +1088,12 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid)
         k === nothing || return k
         j = findfirst(==(name), params)
         j === nothing && return nothing
-        cid = canon_id(ig, recipe.inputs[j].id)
+        # Keep the captured value's `cid` unchanged while resolving this
+        # index alias: later recipes may read the capture through other lanes.
+        via_id = canon_id(ig, recipe.inputs[j].id)
         for producer in inner.recipes
             length(producer.outputs) == 1 &&
-                canon_id(ig, only(producer.outputs).id) == cid || continue
+                canon_id(ig, only(producer.outputs).id) == via_id || continue
             analyzed = _cell_native(producer)
             analyzed === nothing && return nothing
             native, vec_params, _ = analyzed

@@ -195,10 +195,8 @@ end
               Set((Tuple(data.r1[1]), Tuple(data.r2[1])))
         @test all(isempty(reduction_rows(f, j, 3)) for j in 1:2)
         u = collect(range(-0.2, 0.3; length = built.layout.total))
-        # The full pointwise query is independent of cell row pushdown. The
-        # ordinary cell path has an existing shared-predictor window bug for
-        # the local spelling (owner finding 856af074); use the full density
-        # and an independent formula as the primal oracles for every spelling.
+        # The full pointwise query is independent of cell row pushdown; use
+        # it and an independent formula as the primal oracles for every spelling.
         whole = prepare_query(built, bound, :pointwise)(u).y
         names = string.(coordinate_names(built.layout))
         b = u[findfirst(==("b"), names)]
@@ -239,6 +237,73 @@ end
         @test_throws ContractValidationError outer(u, Float64[], 1)
         @test_throws ContractValidationError prepare_cell_factor_query(f, 0)
     end
+end
+
+@testset "ordinary cell windows include every named reduction's rows" begin
+    costs = NamedTuple[]
+    for (model, n) in ((_CF_LOCAL, 6), (_CF_INLINE, 6), (_CF_EARLIER, 6),
+                       (_CF_LOCAL, 6_000))
+        data = _cf_data(n)
+        bound = model(; data.g, data.x, data.r1, data.r2) | (; data.y)
+        built = build_kernel(bound)
+        q = prepare_cell_query(built, bound, :y; locality = :error)
+        fp = partition_footprint_kernel(q.kernel)
+        u = collect(range(-0.2, 0.3; length = built.layout.total))
+        names = string.(coordinate_names(built.layout))
+        bi, si = findfirst(==("b"), names), findfirst(==("sigma"), names)
+        zi = [findfirst(==("z.$g"), names) for g in data.g]
+        eta = u[bi] .* data.x .+ u[zi]
+        sigma = exp(u[si])
+        whole = prepare_query(built, bound, :pointwise)(u).y
+        sampler = n == 6 ? prepare_cell_sampler(
+            built, bound, :y, u; backend = _CF_REVERSE, locality = :error) : nothing
+        for c in eachindex(data.y)
+            terms = exp.(eta[data.r1[c]])
+            mu = log1p(sum(terms)) + sum(abs2, eta[data.r2[c]])
+            expected = logpdf(Normal(mu, sigma), data.y[c])
+            @test q(u, c) ≈ expected ≈ whole[c]
+            rows = union(data.r1[c], data.r2[c])
+            support = sort!(unique([bi; si; zi[rows]]))
+            point = _CFReadPoint(u, Int[])
+            @test q(point, c) ≈ expected
+            @test sort!(unique(point.reads)) == support
+            @test _cf_support(fp, u, c) == support
+            if sampler !== nothing
+                # Independent derivative, including repeated and overlapping
+                # rows. This is ordinary Reverse, without runtime activity.
+                dmu = zeros(n)
+                for (j, r) in enumerate(data.r1[c])
+                    dmu[r] += terms[j] / (1 + sum(terms))
+                end
+                for r in data.r2[c]
+                    dmu[r] += 2eta[r]
+                end
+                residual = data.y[c] - mu
+                expected_gradient = zeros(length(u))
+                expected_gradient[bi] = residual / sigma^2 * dot(dmu, data.x)
+                expected_gradient[si] = residual^2 / sigma^2 - 1
+                expected_gradient[zi] .= residual / sigma^2 .* dmu
+                value, gradient = cell_value_and_gradient!(sampler, similar(u), u, c)
+                @test value ≈ expected
+                @test gradient ≈ expected_gradient atol = 1e-12
+            end
+        end
+        if model === _CF_LOCAL
+            q(u, 2)
+            push!(costs, (; bytes = minimum(@allocated(q(u, 2)) for _ in 1:3),
+                           nodes = _cf_nodes(q.kernel.ast)))
+            # A bad row in the second reduction is checked only when its
+            # cell is requested; another cell keeps its ordinary result.
+            bad_r2 = copy(data.r2)
+            bad_r2[2] = [n + 1]
+            bad_bound = model(; data.g, data.x, data.r1, r2 = bad_r2) | (; data.y)
+            bad_q = prepare_cell_query(build_kernel(bad_bound), bad_bound, :y)
+            @test bad_q(u, 1) ≈ whole[1]
+            @test_throws BoundsError bad_q(u, 2)
+        end
+    end
+    @test costs[1].bytes == costs[2].bytes
+    @test costs[1].nodes == costs[2].nodes
 end
 
 @testset "row metadata on a singleton observation domain" begin
