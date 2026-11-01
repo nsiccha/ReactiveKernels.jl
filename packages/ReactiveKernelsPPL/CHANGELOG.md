@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.40
+
+- Fix ordinary cell queries for a named summand such as
+  `terms = exp.(eta[r1[k]])` followed by `sum(terms)` and
+  `sum(eta[r2[k]] .^ 2)`. Both gathers contribute their rows to the shared
+  predictor window; earlier versions could omit the second gather's rows
+  and throw `BoundsError`. Require ReactiveKernels 0.1.43 for this repair.
+
 ## 0.1.39
 
 - Preserve strict cell and partition locality through nested data-only calls
