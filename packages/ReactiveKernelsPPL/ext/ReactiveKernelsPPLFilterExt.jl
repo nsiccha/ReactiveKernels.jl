@@ -630,8 +630,9 @@ function _logsum(x)
     return m + log(sum(v -> exp(v-m), x))
 end
 
-function PPL.filter_step(state::FilterState, observation::NamedTuple;
-        inputs::NamedTuple=(;), condition_state_only::Bool=false, groups=nothing)
+function _filter_step(state::FilterState, observation::NamedTuple;
+        inputs::NamedTuple=(;), condition_state_only::Bool=false, groups=nothing,
+        zero_ok::Bool=false)
     all(n -> n in state.target.signature.observations,keys(observation)) || _fail("unknown observation name")
     keys(inputs) == state.target.signature.inputs || _fail("input names differ from target")
     known = state.target.signature.groups
@@ -683,6 +684,7 @@ function PPL.filter_step(state::FilterState, observation::NamedTuple;
         end
     end
     logmass = state.log_parameter_mass .+ increments
+    zero_ok && all(==(-Inf),logmass) && return nothing
     score = _logsum(logmass)
     isfinite(score) || _fail("non-finite predictive log score")
     mass = condition_state_only ? copy(state.parameter_mass) : exp.(logmass .- score)
@@ -700,6 +702,16 @@ function PPL.filter_step(state::FilterState, observation::NamedTuple;
     end
     return FilterState(state.target, carries, state.ensemble, mass, nextlogmass, repeat(mass ./ n; inner=n),
         n, rng, state.time+1, score, total, ancestors, lineage, history, state.history_limit,times)
+end
+
+function PPL.filter_step(state::FilterState, observation::NamedTuple;
+        inputs::NamedTuple=(;), condition_state_only::Bool=false, groups=nothing)
+    return _filter_step(state,observation;inputs,condition_state_only,groups)
+end
+
+function PPL._filter_step_or_zero(state::FilterState,observation::NamedTuple;
+        inputs::NamedTuple=(;),groups=nothing)
+    return _filter_step(state,observation;inputs,groups,zero_ok=true)
 end
 
 function PPL.filter_stream(state::FilterState, records; steps::Integer=typemax(Int),
@@ -764,5 +776,7 @@ function PPL.resume_filter(target::FilterTarget, checkpoint)
     return FilterState(target,c.carries,c.ensemble,c.parameter_mass,c.log_parameter_mass,c.weights,n,c.rng,c.time,
         c.predictive_logscore,c.log_normalizer,c.ancestors,c.lineage,c.history,c.history_limit,c.group_times)
 end
+
+include("filter_smc_boundary.jl")
 
 end

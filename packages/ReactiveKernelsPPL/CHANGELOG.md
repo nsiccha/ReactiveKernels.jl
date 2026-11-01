@@ -16,6 +16,23 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.44
+
+- Add `prepare_filter_smc`, `tune_filter_smc` and `initialize_filter_smc`
+  for bounded-window parameter learning over authored finite-state filters.
+  A shared carried Gaussian initializes the ensemble. Predictive scores
+  reweight its members; low ESS triggers replenishment and fixed-kernel
+  particle-Metropolis moves that rebuild the conditional states. Rejections
+  keep the previous likelihood estimate and state cloud. Independent pilot
+  kernels remain fixed throughout production.
+- Window boundaries explicitly approximate the joint posterior by Gaussian
+  marginal parameter moments and an independent pooled state distribution.
+  This discards parameter correlations and parameter-state dependence, and
+  is not exact full-history SMC². An ordinary state-only filter can supply
+  the initial pooled boundary without counting its training likelihood twice.
+  Records, diagnostics and data-only checkpoints have bounded retention;
+  replay validates source, coordinate, calibration and mapping identities.
+
 ## 0.1.43
 
 - Add `carry_smc`, `SMCCarriedReference` and `prepare_smc_window` for

@@ -660,4 +660,6 @@ function PPL.resume_smc(target::AbstractSMCTarget, checkpoint; previous=nothing)
         cp.lineage, cp.history, cp.update, cp.stage)
 end
 
+include("smc_filter.jl")
+
 end

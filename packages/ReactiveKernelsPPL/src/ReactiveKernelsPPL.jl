@@ -94,6 +94,7 @@ export SMCTuningSchedule, tune_smc, smc_reference
 export SMCCarriedReference, carry_smc, prepare_smc_window
 export prepare_filter, initialize_filter, filter_step, filter_stream,
     filter_checkpoint, resume_filter, filter_parameter_names, filter_parameters
+export prepare_filter_smc, tune_filter_smc, initialize_filter_smc
 export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
 export RKPPLModel, RKPPLBoundModel, RKPPLSubmodel, lower_rkppl, condition, @rkppl, SurfaceLoweringError
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
@@ -119,6 +120,7 @@ include("cell_factors.jl")
 include("predictive.jl")
 include("smc.jl")
 include("filter.jl")
+include("filter_smc.jl")
 include("jax.jl")
 include("display.jl")
 include("distribution_defaults.jl")
