@@ -584,8 +584,8 @@ const _CELL_PLAIN_HEADS = (:call, :ref, :tuple, :., Symbol("'"), :vect, :hcat,
     :vcat, :row, :nrow, :ncat, :parameters, :kw, :comparison, :&&, :||, :if,
     :curly, :..., :string, :(::))
 
-function _cell_native(r::Recipe; outlined::Bool = false)
-    closure = _lane_source_closure(r; outlined)
+function _cell_native(r::Recipe; outlined::Bool = false, branches::Bool = false)
+    closure = _lane_source_closure(r; outlined, branches)
     closure === nothing && return nothing
     _, params, mod = closure
     source = _lane_expand_dot(_lane_strip_lines(r.source), mod)
@@ -1039,7 +1039,7 @@ _cell_colon(ex, mod) = _cell_binding(ex, mod) === Colon() ||
 # Each element `q`, or `w[q]`, is a linear position or an integer vector of
 # them. The second value lists the positions read that way whose index is not
 # provably one: those are read whole, and the locality report names them.
-function _cell_capture_positions(r::Recipe, static_type)
+function _cell_capture_positions(r::Recipe, static_type; branch_read = nothing)
     plate = (r.op::_AuthoredPlateCellOp).plate
     atomic = typeof(plate).parameters[2]
     inner = plate.kernel.plan
@@ -1051,7 +1051,9 @@ function _cell_capture_positions(r::Recipe, static_type)
     wants = Set(canon_id(ig, w.id) for w in inner.want)
     for k in atomic
         roots[k] in wants && continue
-        reads = _cell_capture_reader(inner, roots, atomic, roots[k])
+        reads = _cell_capture_reader(inner, roots, atomic, roots[k];
+            branch_read = branch_read === nothing ? nothing :
+                (b, tail) -> branch_read(k, b, tail))
         reads === nothing && continue
         typed = all(reads) do (b, via)
             lane = static_type(r.inputs[1 + b])
@@ -1075,7 +1077,7 @@ _cell_positions_type(T) =
 # `nothing`. A value read through several batched arguments is read at the
 # rows of each: the plates of one `@plate for` loop's outputs, each over a
 # domain of its own, compose into one cell that reads it through each domain.
-function _cell_capture_reader(inner::Plan, roots, atomic, cid)
+function _cell_capture_reader(inner::Plan, roots, atomic, cid; branch_read = nothing)
     ig = inner.graph
     found = Tuple{Int,Int}[]
     root(params, recipe, name) = let j = findfirst(==(name), params)
@@ -1106,15 +1108,24 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid)
         slots = findall(_input_list(v -> canon_id(ig, v.id) == cid, recipe.inputs))
         isempty(slots) && continue
         recipe.op isa _KernelSourceOp || return nothing
-        analyzed = _cell_native(recipe)
+        branch = recipe.op.f isa _KernelBranch
+        analyzed = _cell_native(recipe; branches = branch_read !== nothing)
         analyzed === nothing && return nothing
         native, params, mod = analyzed
         reads = Any[]
-        _cell_capture_reads!(reads, native, Set(params[slots]), mod) || return nothing
-        for read in reads
+        tails = Any[]
+        _cell_capture_reads!(reads, native, Set(params[slots]), mod;
+            tails = branch ? tails : nothing) || return nothing
+        for (j, read) in enumerate(reads)
             q, via = read isa Symbol ? (read, nothing) : (read.args[2], read.args[1])
             b = root(params, recipe, q)
             (b === nothing || b in atomic) && return nothing
+            # A branch may not force an inactive index lookup. Only a direct
+            # read with bound, in-range indices is eligible for a window.
+            if branch
+                via === nothing && branch_read !== nothing &&
+                    branch_read(b, tails[j]) || return nothing
+            end
             w = via === nothing ? 0 : via_root(params, recipe, via)
             (w === nothing || (w != 0 && !(w in atomic)) || w == b) && return nothing
             (b, w) in found || push!(found, (b, w))
@@ -1126,7 +1137,7 @@ end
 # Whether `ex` reads the names `captured` only as `v[q]` or `v[w[q]]`, with `q`
 # and `w` names, or as `v[q, :]` / `v[w[q], :]` with every later index the
 # whole axis `:` (a row of a matrix); each such `q`, or `w[q]`, is recorded.
-function _cell_capture_reads!(reads, ex, captured, mod)
+function _cell_capture_reads!(reads, ex, captured, mod; tails = nothing)
     ex isa Symbol && return !(ex in captured)
     ex isa Expr || return true
     ex.head in _CELL_PLAIN_HEADS || return false
@@ -1136,11 +1147,85 @@ function _cell_capture_reads!(reads, ex, captured, mod)
         name(x) = x isa Symbol && !(x in captured)
         name(index) || Meta.isexpr(index, :ref, 2) && all(name, index.args) ||
             return false
-        all(arg -> _cell_colon(arg, mod), ex.args[3:end]) || return false
+        all(arg -> _cell_colon(arg, mod) || tails !== nothing && arg isa Int,
+            ex.args[3:end]) || return false
         push!(reads, index)
+        tails === nothing || push!(tails, Any[_cell_colon(arg, mod) ? Colon() : arg
+                                             for arg in ex.args[3:end]])
         return true
     end
-    all(arg -> _cell_capture_reads!(reads, arg, captured, mod), ex.args)
+    all(arg -> _cell_capture_reads!(reads, arg, captured, mod; tails), ex.args)
+end
+
+# Retained branches may request both arms' capture rows only when those
+# requests cannot introduce an inactive invalid access. Prove their indices
+# from bound data and their full shapes from the existing row forms. No arm,
+# condition, active parameter or captured producer is evaluated here. The
+# producers of a capture are strict, outside the retained branch already;
+# computing their in-range rows adds no branch-arm work. Unknown shapes or
+# indices keep the ordinary lazy whole-capture path.
+function _cell_bound_capture_check(p::Plan, producers, static_type, known, outlined)
+    g = p.graph
+    cidof(v) = canon_id(g, v.id)
+    producer(cid) = let rs = get(producers, cid, Recipe[])
+        length(rs) == 1 ? only(rs) : nothing
+    end
+    bound(v) = let r = producer(cidof(v))
+        r !== nothing && r.op isa _BoundConstant ? Some(r.op.value) : nothing
+    end
+    shapes = Dict{ValueId,Any}()
+    function shape(v)
+        cid = cidof(v)
+        haskey(shapes, cid) && return shapes[cid]
+        shapes[cid] = nothing
+        value = bound(v)
+        if value !== nothing
+            return shapes[cid] = axes(Base.broadcastable(something(value)))
+        end
+        static_type(v) <: Number && return shapes[cid] = ()
+        r = producer(cid)
+        r === nothing && return nothing
+        f = get!(() -> _cell_form(r; outlined = r.id in outlined), known, r)
+        f === nothing && return nothing
+        if f.kind in (:range_view, :reshape)
+            parts = Any[]
+            for part in f.literal
+                x = part isa Int ? Some(part) : bound(r.inputs[part.input])
+                x !== nothing && something(x) isa Integer || return nothing
+                push!(parts, something(x))
+            end
+            literal = Tuple(parts)
+            return shapes[cid] = f.kind === :range_view ?
+                _cell_range_shape(literal) : _cell_dims_shape(literal)
+        end
+        f.kind in (:identity, :pointwise, :columns, :hcat) || return nothing
+        parts = Any[]
+        for j in f.leaves
+            s = shape(r.inputs[j])
+            s === nothing && return nothing
+            f.roles[j] === :factor_leaf && return nothing
+            push!(parts, f.roles[j] === :column ? _cell_column_shape(s) : s)
+        end
+        shapes[cid] = f.kind === :columns ? _cell_column_shape(only(parts)) :
+            f.kind === :hcat ? _cell_hcat_shape(Tuple(parts)) :
+            _plate_broadcast_shape(Tuple(parts))
+    end
+    function valid(r, capture, lane, tail)
+        indices = bound(r.inputs[1 + lane])
+        indices === nothing && return false
+        indices = something(indices)
+        _cell_positions_type(typeof(indices)) || return false
+        s = shape(r.inputs[1 + capture])
+        s === nothing && return false
+        linear = LinearIndices(s)
+        all(indices) do qs
+            qs isa Integer && (qs = (qs,))
+            all(qs) do q
+                checkbounds(Bool, linear, q, tail...)
+            end
+        end
+    end
+    valid
 end
 
 """
@@ -1216,6 +1301,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
             typeof(only(candidates).op.value) :
             valtype(v) === Any ? get(types, cidof(v), Any) : valtype(v)
     end
+    branch_read = _cell_bound_capture_check(p, producers, static_type, known, outlined)
     # A lazy view's output is read like a HAVE port: at rows as a view.
     fixed = Set(cidof(v) for v in Iterators.flatten((p.have, p.want)))
     for r in p.recipes
@@ -1309,7 +1395,8 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
     end
     for r in p.recipes
         r.op isa _AuthoredPlateCellOp || continue
-        positions, unknown = _cell_capture_positions(r, static_type)
+        positions, unknown = _cell_capture_positions(r, static_type;
+            branch_read = (capture, lane, tail) -> branch_read(r, capture, lane, tail))
         isempty(positions) || (captures[r.id] = positions)
         isempty(unknown) || (untyped[r.id] = unknown)
         foreach(k -> get!(refused, cidof(r.inputs[1 + k]), :untyped_index), unknown)
