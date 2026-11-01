@@ -16,6 +16,24 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.36
+
+- Add optional finite-state filtering through `prepare_filter`,
+  `initialize_filter`, `filter_step`, `filter_stream`, `filter_checkpoint`
+  and `resume_filter`. Transitions derive from authored scans, submodels and
+  kernel providers. Fixed constrained parameter ensembles retain conditional
+  state clouds; state-only warm-up avoids reweighting calibrated parameters.
+  Authored parameter transitions support explicitly dynamic models.
+- Add `filter_parameter_names` and `filter_parameters` to select fixed
+  parameters from nested constrained draws without historical latent paths.
+  Bound-plan preparation selects required fixed inputs without retaining
+  training columns or freezing newly computed covariates. Frozen preprocessing,
+  temporal design rows and fixed-vector products, zero-state models,
+  selected fixed groups, predictive scores, bounded
+  diagnostics, explicit RNG ownership and portable continuation are covered.
+  Work and retained size remain bounded in elapsed time for fixed particles,
+  group count and finite lag depth. Requires ReactiveKernels 0.1.41.
+
 ## 0.1.35
 
 - Preserve natural scalar expressions in strict partition queries through

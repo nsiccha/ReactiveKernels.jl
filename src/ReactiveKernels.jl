@@ -64,6 +64,7 @@ include("symmetric_eigen_rules.jl")
 include("affine_logistic.jl")
 include("cholesky.jl")
 include("native_ode.jl")
+include("streaming.jl")
 include("jax.jl")
 include("jax_host.jl")
 
