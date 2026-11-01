@@ -1835,9 +1835,19 @@ function _shared_partition_gradient!(s::PartitionSampler, g, u, label, shared)
     end
     args = _compact(s) ? (u, s.active, s.slots, label, _partition_plan_of(s, label), cached...) :
                         (u, label, _partition_plan_of(s, label), cached...)
-    value, derivatives = ad_value_and_gradient(_partition_ad(s.ad, label), args...)
+    _shared_partition_evaluate!(s, g, u, label, shared,
+        _partition_ad(s.ad, label), args...)
+end
+
+# Plans are stored behind an abstract dictionary value. Cross this function
+# boundary before evaluating AD so the plan, frontier and operator types
+# specialize together, including when the label column mixes concrete types.
+function _shared_partition_evaluate!(s, g, u, label, shared,
+        ad, args::Vararg{Any,N}) where {N}
+    value, derivatives = ad_value_and_gradient(ad, args...)
     direct = first(derivatives)
     if shared
+        cache = s.prefix
         seed = _partition_frontier_seed(Base.tail(derivatives))
         propagated = ad_pullback(cache.ad, seed, u, cache.point, cache.slots)
         for (i, position) in enumerate(cache.positions)
