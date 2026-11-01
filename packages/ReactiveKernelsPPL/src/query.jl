@@ -1640,12 +1640,19 @@ end
 
 function _query_shared_parts(spec, plan, have, want, rule, varying, on_error)
     isempty(rule) && return nothing
+    # Binding the selected plan executes data-only helpers before the shared
+    # split. They may have been defined in the caller's fresh model module.
+    Base.invokelatest(_query_shared_parts_latest, spec, plan, have, want,
+        rule, varying, on_error)
+end
+
+function _query_shared_parts_latest(spec, plan, have, want, rule, varying, on_error)
     selected = ReactiveKernels.plan(spec; have, want)
     selected = ReactiveKernels._kernel_error_policy(selected, on_error)
     selected = ReactiveKernels._fuse_authored_plate_chains(selected; cells_only = true)
     bound_selected = ReactiveKernels._partial_apply(selected,
         ReactiveKernels._kernel_bound_pairs(spec, _query_bound(plan)))
-    Base.invokelatest(ReactiveKernels._partition_shared_parts, bound_selected, rule;
+    ReactiveKernels._partition_shared_parts(bound_selected, rule;
         varying, preserve_rows = true)
 end
 

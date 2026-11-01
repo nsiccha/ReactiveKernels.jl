@@ -243,6 +243,7 @@ const _PPL_TEST_FILES = (
     "test_partition_prefix_strict.jl",
     "test_shared_value_queries.jl",
     "test_shared_value_lifecycle.jl",
+    "test_shared_prefix_world_age.jl",
     "test_scalar_partition_reads.jl",
     "test_cell_kernel_design.jl",
     "test_cell_type_branches.jl",
