@@ -69,6 +69,7 @@ const _MATRIX_CORE_TESTS = (
     "test_readable_recipe_equivalence.jl",
     "test_native_type_queries.jl",
     "test_native_exemplar_rank.jl",
+    "test_type_stability_audit.jl",
     "test_type_stability.jl",
     "test_value_metadata.jl",
     "test_type_selected_branches.jl",
