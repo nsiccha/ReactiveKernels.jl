@@ -74,6 +74,49 @@ captured data and code must remain read-only for a target's lifetime.
 function prepare_smc end
 
 """
+    SMCNonfiniteError <: Exception
+
+An invalid SMC endpoint or bridge evaluation. `position` is a copied, exact
+unconstrained proposal; `value` is the evaluated log density or log-density
+ratio, and `gradient` is a copied gradient when one was evaluated (otherwise
+`nothing`). `quantity` is `:density`, `:gradient` or `:logratio`; `endpoint` is
+`:source`, `:target` or `:bridge`. `temperature` is the bridge temperature at
+evaluation, before advancement for weight/ratio checks.
+
+NaN and +Inf densities and nonfinite gradients at finite densities fail fast.
+The existing -Inf outside-support convention is preserved. Initial clouds
+are evaluated by their first `smc_step`, not by `initialize_smc`.
+
+Error display is bounded, including display with a backtrace: inspect the
+fields for the full numerical diagnostic, and `catch_backtrace()` for the
+caller stack. Mutation failures cross the worker-task boundary as this same
+exception, without a nested task trace. The input cloud and RNG are preserved.
+"""
+struct SMCNonfiniteError <: Exception
+    position::Vector{Float64}
+    value::Float64
+    gradient::Union{Nothing,Vector{Float64}}
+    quantity::Symbol
+    endpoint::Symbol
+    temperature::Float64
+    function SMCNonfiniteError(position, value, gradient, quantity, endpoint, temperature)
+        new(copy(position), value, gradient === nothing ? nothing : copy(gradient),
+            quantity, endpoint, temperature)
+    end
+end
+
+function Base.showerror(io::IO, err::SMCNonfiniteError)
+    print(io, "SMCNonfiniteError: invalid ", err.quantity, " at ", err.endpoint,
+        " endpoint, temperature=", err.temperature, ", value=", err.value,
+        ", dimension=", length(err.position),
+        ". Full numerical diagnostic: error.position, error.value, error.gradient.")
+end
+Base.show(io::IO, err::SMCNonfiniteError) = showerror(io, err)
+# Prepared target types can contain the entire model. Their stack frames are
+# not a bounded diagnostic; the ordinary catch_backtrace API remains available.
+Base.showerror(io::IO, err::SMCNonfiniteError, bt; backtrace=true) = showerror(io, err)
+
+"""
     initialize_smc(target; rng, particles=1000,
         reference=SMCReference(zeros(d), ones(d)), options=SMCOptions())
 
