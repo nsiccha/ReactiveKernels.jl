@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.35
+## 0.1.36
 
 - Add optional finite-state filtering through `prepare_filter`,
   `initialize_filter`, `filter_step`, `filter_stream`, `filter_checkpoint`
@@ -32,7 +32,15 @@ are recorded in the git history only.
   selected fixed groups, predictive scores, bounded
   diagnostics, explicit RNG ownership and portable continuation are covered.
   Work and retained size remain bounded in elapsed time for fixed particles,
-  group count and finite lag depth. Requires ReactiveKernels 0.1.40.
+  group count and finite lag depth. Requires ReactiveKernels 0.1.41.
+
+## 0.1.35
+
+- Preserve natural scalar expressions in strict partition queries through
+  ReactiveKernels 0.1.40. Scalar offsets beside a design product retain their
+  broadcast shape instead of passing through an opaque row-normalization
+  helper. Shared predictors may have a different row count from observations;
+  ordinary indexed `exp` and subtraction need no model annotations.
 
 ## 0.1.34
 

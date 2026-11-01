@@ -189,26 +189,16 @@ function _cell_factor_scalar_reads(spec::KernelSpec, cell_outputs; bound, locali
         analyzed = any(v -> v.id in cell_outputs, r.outputs) ?
             _cell_native(r; outlined = true) : nothing
         if length(r.outputs) == 1 && !r.effectful && analyzed !== nothing
-            native, params, mod = analyzed
-            if Meta.isexpr(native, :call, 3) &&
-               !_native_callee_shadowed(native.args[1], params) &&
-               _cell_binding(native.args[1], mod) === Base.getindex
-                native = Expr(:ref, native.args[2:end]...)
-            end
-            if Meta.isexpr(native, :ref, 2) && native.args[1] in params
-                a = r.inputs[findfirst(==(native.args[1]), params)]
-                index = native.args[2]
-                position = findfirst(==(index), params)
-                i = position === nothing ? nothing : r.inputs[position]
-                A = get(types, canon_id(old, a.id), Any)
-                I = i === nothing ? typeof(index) : get(types, canon_id(old, i.id), Any)
-                if A isa Type && A <: AbstractVector && I isa Type && I <: Integer && !(I <: Bool)
-                    if i === nothing
-                        i = value!(g, Symbol(only(r.outputs).name, :_index), I)
-                        _add_recipe!(g, (), (i,), _BoundConstant(index), 0.0, nothing, false, index)
-                    end
-                    inputs, op = (i, a), _cell_factor_index_op(locality)
+            read = _cell_scalar_index(analyzed..., r.inputs,
+                v -> get(types, canon_id(old, v.id), Any))
+            if read !== nothing
+                i = read.index
+                if !(i isa Value)
+                    i = value!(g, Symbol(only(r.outputs).name, :_index), read.type)
+                    _add_recipe!(g, (), (i,), _BoundConstant(read.index), 0.0, nothing,
+                                 false, read.index)
                 end
+                inputs, op = (i, read.array), _cell_index_op(locality)
             end
         end
         _add_recipe!(g, inputs, r.outputs, op, r.cost, r.cse_key, r.effectful, r.source)
@@ -263,14 +253,6 @@ function _cell_factor_term!(spec::KernelSpec, argument::Value, index::Value, loc
     spec.ports[output.name] = output
     push!(spec.port_order, output.name)
     _add_recipe!(spec.graph, (index, argument), (output,),
-        _cell_factor_index_op(locality), 1.0, nothing, false, nothing)
+        _cell_index_op(locality), 1.0, nothing, false, nothing)
     output
-end
-
-function _cell_factor_index_op(locality)
-    inner = Graph()
-    x = value!(inner, :term, Any)
-    scalar = prepare(inner; have = (x,), want = (x,))
-    plate = _AuthoredPlateOp{typeof(scalar),()}(scalar)
-    _AuthoredPlateCellOp(plate, locality)
 end
