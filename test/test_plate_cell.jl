@@ -1629,3 +1629,163 @@ end
     @test only(err.violations).value === :s && only(err.violations).reason === :untyped
     @test occursin("its type is not known to be a number", sprint(showerror, err))
 end
+
+# The grouped field BRM emits for `hsgp(x; by = g)`: `vec(sum(PHI .* rows;
+# dims = 2))` over the whole rows `scaled_z[g, :]` of `scaled_z = z .*
+# transpose(weights)` (snag `run-brm-s-full-g-2dc0667a`). Three producers run
+# at a cell's rows: a reduction over the axes other than the first (alone,
+# under `vec` or under `dropdims`), a gather `A[I, :]` of whole rows, and a
+# transposed vector (one row, read whole). Before, the reduction had no row
+# form and `locality = :error` refused the cell.
+@kernel _cell_field(PHI::Matrix{Float64}, z::Matrix{Float64}, omega2::Vector{Float64},
+                    sigma::Float64, rho::Float64, g::Vector{Int},
+                    y::Vector{Float64}) = begin
+    weights = plate(omega2) do w2
+        sigma * (rho * sqrt(2pi))^0.5 * exp(-0.25 * rho^2 * w2)
+    end
+    scaled_z = z .* transpose(weights)
+    rows = scaled_z[g, :]
+    value = vec(sum(PHI .* rows; dims = 2))
+    dens = plate(value, y) do v, yi
+        -(yi - v)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+function _cell_field_data(n; G = 4, B = 3)
+    PHI = [sin(0.3 * i * b) for i in 1:n, b in 1:B]
+    z = [0.1 * ((g * 7 + b * 3) % 5 - 2) + 0.05 for g in 1:G, b in 1:B]
+    omega2 = [(b * pi / 2)^2 for b in 1:B]
+    g = [mod1(i, G) for i in 1:n]
+    y = [cos(i / 3) for i in 1:n]
+    (PHI, z, omega2, 0.8, 1.3, g, y)
+end
+const _CELL_FIELD_HAVE = (:PHI, :z, :omega2, :sigma, :rho, :g, :y)
+# The same producers written otherwise: a reduced matrix read by column, a
+# `dropdims`, a `maximum`, an adjoint operand and `prod` over two axes of a cube.
+@kernel _cell_reductions(X::Matrix{Float64}, Q::Array{Float64,3}, w::Vector{Float64},
+                         y::Vector{Float64}) = begin
+    S = sum(X .* w'; dims = 2)
+    m = dropdims(maximum(X; dims = 2); dims = 2)
+    p = vec(prod(Q; dims = (2, 3)))
+    eta = S[:, 1] .+ m .+ p
+    dens = plate(eta, y) do ei, yi
+        -(yi - ei)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+# refused: `vec` of a cube reduced over its second axis only interleaves the
+# rows (the rank known, `:operands`); a matrix's transpose reads columns.
+@kernel _cell_vec_cube(Q::Array{Float64,3}, y::Vector{Float64}) = begin
+    v = vec(sum(Q; dims = 2))
+    dens = plate(v, y) do vi, yi
+        -(yi - vi)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+@kernel _cell_transposed_matrix(M::Matrix{Float64}, y::Vector{Float64}) = begin
+    T = transpose(M)
+    eta = T[:, 1] .+ y
+    dens = plate(eta, y) do ei, yi
+        -(yi - ei)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+# An operand of unknown rank passes the analysis; the window checks the shape.
+@kernel _cell_vec_untyped(Q, y::Vector{Float64}) = begin
+    v = vec(sum(Q; dims = 2))
+    dens = plate(v, y) do vi, yi
+        -(yi - vi)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+
+@testset "plate_cell: a row-wise reduction, whole-row gathers and a transposed vector run at the cell's rows" begin
+    args = _cell_field_data(12)
+    PHI, z, omega2, sigma, rho, g, y = args
+    full = prepare(_cell_field; have = _CELL_FIELD_HAVE, want = :dens)
+    dens = full(args...)
+    k = prepare(plate_cell(_cell_field, :dens; index = :i, locality = :error);
+                have = (_CELL_FIELD_HAVE..., :i), want = :dens_cell)
+    @test all(k(args..., i) ≈ dens[i] for i in eachindex(dens))
+    report = partition_locality(k)
+    entry(name) = only(e for e in report if e.value === name)
+    @test entry(:value).status === :rows && entry(:rows).status === :rows
+    @test entry(:scaled_z).status === :rows
+    @test entry(:weights).status === :shared          # one row, read whole
+    @test entry(:z).status === :input && entry(:PHI).status === :input
+    @test all(e.status !== :whole for e in report)
+    # The cell's cost does not grow with the rows of the field.
+    allocated(n) = (a = _cell_field_data(n); k(a..., 3); @allocated k(a..., 3))
+    @test allocated(10) == allocated(10_000)
+    # Native Reverse on the weights `z`: the gradient is exact and reads the
+    # cell's group's row of `z` only.
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for i in (1, 6, 12)
+        ad = prepare_ad(k, backend, args..., i; active = :z)
+        value, dz = ad_value_and_gradient(ad, args..., i)
+        @test value ≈ dens[i]
+        for c in CartesianIndices(z)
+            e = zeros(size(z)); e[c] = 1.0
+            @test dz[c] ≈ _cell_central(h -> full(PHI, z .+ h .* e, omega2, sigma, rho, g, y)[i],
+                                        0.0) atol = 1e-6
+        end
+        @test findall(r -> any(!iszero, dz[r, :]), axes(z, 1)) == [g[i]]
+    end
+
+    # The other spellings: a reduced matrix read by column, `dropdims`,
+    # `maximum`, an adjoint and a two-axis `prod`.
+    n = 12
+    X = [0.1 * i + 0.2 * j for i in 1:n, j in 1:3]
+    Q = [0.9 + 0.01 * (i + j + l) for i in 1:n, j in 1:2, l in 1:2]
+    w = [0.5, -0.25, 1.0]
+    full = prepare(_cell_reductions; have = (:X, :Q, :w, :y), want = :dens)(X, Q, w, y)
+    k = prepare(plate_cell(_cell_reductions, :dens; index = :i, locality = :error);
+                have = (:X, :Q, :w, :y, :i), want = :dens_cell)
+    @test all(k(X, Q, w, y, i) ≈ full[i] for i in 1:n)
+    report = partition_locality(k)
+    @test entry(:S).status === :rows && entry(:m).status === :rows && entry(:p).status === :rows
+    @test entry(:eta).status === :rows && entry(:w).status === :input
+    @test all(e.status !== :whole for e in report)
+
+    # refused by name, with the reason.
+    err = try
+        prepare(plate_cell(_cell_vec_cube, :dens; index = :i, locality = :error);
+                have = (:Q, :y, :i), want = :dens_cell)
+        nothing
+    catch e
+        e
+    end
+    @test err isa PartitionLocalityError
+    @test only(err.violations).value === :v && only(err.violations).reason === :operands
+    err = try
+        prepare(plate_cell(_cell_transposed_matrix, :dens; index = :i, locality = :error);
+                have = (:M, :y, :i), want = :dens_cell)
+        nothing
+    catch e
+        e
+    end
+    @test err isa PartitionLocalityError
+    @test only(err.violations).value === :T && only(err.violations).reason === :operands
+
+    # An operand of unknown rank: the row form holds for a matrix, and a cube
+    # whose `vec` would interleave rows is refused by the window, naming the axis.
+    k = prepare(plate_cell(_cell_vec_untyped, :dens; index = :i, locality = :error);
+                have = (:Q, :y, :i), want = :dens_cell)
+    @test all(e.status !== :whole for e in partition_locality(k))
+    Qm = [0.1 * i + 0.3 * j for i in 1:n, j in 1:2]
+    full = prepare(_cell_vec_untyped; have = (:Q, :y), want = :dens)(Qm, y)
+    @test all(k(Qm, y, i) ≈ full[i] for i in 1:n)
+    err = try
+        k(Q, y, 2)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin("axis 3 has length 2", sprint(showerror, err))
+end

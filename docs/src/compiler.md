@@ -1090,6 +1090,29 @@ scalar inputs. These are the shapes ReactiveKernelsPPL unpacks a packed
 parameter vector's blocks with, so a block read at a cell's rows reads only
 its own packed coordinates.
 
+Three more cover the grouped field BayesianRegressionModels emits for an
+`hsgp(x; by = g)` term, `vec(sum(PHI .* scaled_z[g, :]; dims = 2))` with
+`scaled_z = z .* transpose(weights)` (RK 0.1.45):
+
+- a reduction over the axes other than the first, `sum(X; dims = 2)` (also
+  `prod`, `maximum` and `minimum`; `dims` a literal axis or tuple of axes, all
+  at least 2), alone, under `vec` or under `dropdims(…; dims)` of reduced axes.
+  Its operand is an input or any broadcast operand above, a dotted expression
+  or a gather included, so `vec(sum(PHI .* rows; dims = 2))` is one producer.
+  Row `r` of it is the same reduction over row `r` of the operand. Under `vec`
+  the reduced value must keep one entry per row: when the operand's rank is
+  known statically, a `vec` that would interleave rows (a three-dimensional
+  operand reduced over its second axis only) is refused as `:operands`; when
+  it is not, the window checks the reduced shape and throws an `ArgumentError`
+  naming the axis;
+- a gather `A[I, :]` whose later indices are positions or the whole axis `:`
+  reads whole rows of its source, so `scaled_z[g, :]` computes `scaled_z` at
+  the rows `g` selects, and its full shape keeps the source's kept axes;
+- `transpose(w)`, `adjoint(w)` or `w'` of a vector input, alone or as a
+  broadcast operand, is one row that broadcasting extrudes along the rows, so
+  `w` is read whole (legitimately: the locality report lists it as `:shared`).
+  A matrix's transpose reads columns and has no row form (`:operands`).
+
 ### Locality: named, not silent
 
 A value a cell reads at its rows but whose producer has no row form was

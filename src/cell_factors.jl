@@ -32,7 +32,9 @@ function _cell_factor_graph(spec::KernelSpec, want; have = spec.have_names,
             r === nothing && return nothing
             form = _cell_form(r)
             form === nothing && return nothing
-            if form.kind in (:pointwise, :identity)
+            # A form whose axes come from more than its leaves (a transposed
+            # vector, a gather keeping axes of its source) is not shaped here.
+            if form.kind in (:pointwise, :identity) && isempty(_cell_extra_parts(form))
                 leaves = [data_shape(r.inputs[j]) for j in form.leaves]
                 any(isnothing, leaves) && return nothing
                 return _plate_broadcast_shape(Tuple(leaves))

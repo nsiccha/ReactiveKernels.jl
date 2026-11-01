@@ -16,6 +16,22 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.45
+
+- Row forms for the grouped field BayesianRegressionModels emits for
+  `hsgp(x; by = g)`: a reduction over the axes other than the first
+  (`sum(X; dims = 2)`, also `prod`, `maximum`, `minimum`; alone, under `vec`
+  or under `dropdims`) whose operand is an input or a broadcast operand, a
+  gather `A[I, :]` reading whole rows of its source, and `transpose(w)` /
+  `adjoint(w)` / `w'` of a vector as a broadcast operand or alone. A plate cell
+  or partition reading `vec(sum(PHI .* scaled_z[g, :]; dims = 2))` with
+  `scaled_z = z .* transpose(weights)` now computes the field at its rows
+  only, with ordinary native Reverse derivatives and a row footprint, instead
+  of refusing it under `locality = :error` (`PartitionLocalityError`, "its
+  producer `vec(sum(PHI .* rows; dims = 2))` has no row form"; snag
+  `run-brm-s-full-g-2dc0667a`). A `vec` that would interleave rows is refused
+  as `:operands` when the operand's rank is known, else checked by the window.
+
 ## 0.1.44
 
 - Keep cell footprints precise through retained lazy branches when bound
