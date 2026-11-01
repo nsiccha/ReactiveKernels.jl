@@ -692,6 +692,12 @@ function _cell_form(r::Recipe; outlined::Bool = false)
         roles[1] = :factor
         return _CellForm(:product, roles, zeros(Int, n), Int[], n == 2 ? 2 : 0)
     end
+    if (r.op === Base.transpose || r.op === Base.adjoint) && length(r.inputs) == 1
+        # A bare exact call `transpose(w)` likewise keeps Base's function as its
+        # operation: one row of a vector, read whole (a matrix is refused by
+        # `operands_fit`).
+        return _CellForm(:transposed, [:transposed], [0], Int[], 0)
+    end
     r.op isa _KernelSourceOp || return nothing
     analyzed = _cell_native(r; outlined)
     analyzed === nothing && return nothing

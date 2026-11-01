@@ -880,11 +880,13 @@ end
     total = sum(dens)
     return total
 end
-function _pp_field_data(n; B = 3, G = 4)
-    u = [0.8; 1.3; [0.1 * ((k * 7) % 5 - 2) + 0.05 for k in 1:(G * B)]]
+# Group 1 owns the first `first` rows; the other three groups share the rest, so
+# growing `n` grows the other groups only (the cost comparison below).
+function _pp_field_data(n; B = 3, first = 3)
+    u = [0.8; 1.3; [0.1 * ((k * 7) % 5 - 2) + 0.05 for k in 1:(4 * B)]]
     PHI = [sin(0.3 * i * b) for i in 1:n, b in 1:B]
     omega2 = [(b * pi / 2)^2 for b in 1:B]
-    g = [mod1(i, G) for i in 1:n]
+    g = [i <= first ? 1 : 2 + mod(i - first - 1, 3) for i in 1:n]
     y = [cos(i / 3) for i in 1:n]
     (; u, PHI, omega2, g, y)
 end
@@ -910,17 +912,38 @@ end
     for s in 1:4
         @test partition_footprint(bound, d.u, s).u == [1, 2, 2 + s, 6 + s, 10 + s]
     end
-    # Native Reverse: exact, with the footprint as its support.
-    ad = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), d.u, 2; active = :u)
-    gradient = similar(d.u)
-    value, _ = ad_value_and_gradient!(ad, gradient, d.u, 2)
-    @test value ≈ bound(d.u, 2)
-    for j in eachindex(d.u)
-        @test gradient[j] ≈ _pp_central(h -> bound(d.u .+ h .* (eachindex(d.u) .== j), 2),
-                                        0.0) atol = 1e-6
+    # Native Reverse through the partition: exact, with the footprint as its
+    # support. Enzyme's type analysis divides by a known-zero induction value
+    # (`FnTypeInfo::knownIntegralValues`, the `SDiv` fold) on a partition whose
+    # cells broadcast a data matrix read at rows against an active matrix
+    # window and read the result by column — `PHI .* Z` with `Z` a reshape of
+    # the packed vector trips it too, with no new form involved. That is an
+    # Enzyme gap, fixed in Enzyme rather than worked around here (Enzyme snag
+    # `enzyme-type-anal-b401ef8f`; user principle
+    # `enzyme-fixed-in-enzyme-everywhere`), so the gradient is pinned broken:
+    # an "Unexpected Pass" signals the repair. The one-cell gradient of the same
+    # field passes (`test_plate_cell.jl`).
+    result = try
+        ad = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), d.u, 2; active = :u)
+        gradient = similar(d.u)
+        value, _ = ad_value_and_gradient!(ad, gradient, d.u, 2)
+        (value, gradient)
+    catch e
+        e
     end
-    @test findall(!iszero, gradient) == partition_footprint(bound, d.u, 2).u
-    # The cost of a group's pass does not grow with the other groups' rows.
+    if result isa Exception
+        @test_broken !(result isa Exception)
+        @test result isa DivideError
+    else
+        value, gradient = result
+        @test value ≈ bound(d.u, 2)
+        for j in eachindex(d.u)
+            @test gradient[j] ≈ _pp_central(h -> bound(d.u .+ h .* (eachindex(d.u) .== j), 2),
+                                            0.0) atol = 1e-6
+        end
+        @test findall(!iszero, gradient) == partition_footprint(bound, d.u, 2).u
+    end
+    # The cost of group 1's pass (three rows) does not grow with the other groups' rows.
     allocated(n) = let e = _pp_field_data(n),
             b = prepare(spec; have, want = :partition_total,
                         bound = (; e.PHI, e.omega2, e.g, e.y))
