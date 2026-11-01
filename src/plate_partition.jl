@@ -646,9 +646,13 @@ function _partition_shared_parts(p::Plan, partitioned; varying = (), preserve_ro
     # lifting a gather or observation-sized broadcast would materialize work
     # that the residual can instead evaluate at the requested rows.
     row_values = Set{ValueId}()
+    row_types = Dict{ValueId,Any}()
     if preserve_rows
         p, cells = _cell_outlined_pushdowns(_lowering_plan(p))
-        cells === nothing || union!(row_values, cells.pushed)
+        if cells !== nothing
+            union!(row_values, cells.pushed)
+            row_types = cells.types
+        end
     end
     cidof(v) = canon_id(p.graph, v.id)
     rules = Dict(_partition_rule(partitioned))
@@ -680,6 +684,14 @@ function _partition_shared_parts(p::Plan, partitioned; varying = (), preserve_ro
     frontier = Value[v for v in _partial_constants(p, owned, residual)
                      if !(cidof(v) in static_owned) && !(cidof(v) in have_ids)]
     isempty(frontier) && return nothing
+    # The residual no longer contains the producers that proved a frontier
+    # operand's type. Retain their numeric element/rank facts so, for example,
+    # transpose(weights) still proves a single row. Do not retain a concrete
+    # array container: a caller may own a copied cache rather than a view.
+    map!(frontier, frontier) do v
+        T = typeintersect(valtype(v), _cell_element_type(get(row_types, cidof(v), Any)))
+        T === Union{} || T === valtype(v) ? v : Value{T}(v.id, v.name)
+    end
 
     # Prune against authoritative outputs in forward execution order before
     # walking backwards, so collateral duplicates cannot replace a producer.
