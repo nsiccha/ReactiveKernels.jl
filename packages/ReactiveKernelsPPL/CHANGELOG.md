@@ -16,9 +16,9 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.35
+## 0.1.36
 
-- Require ReactiveKernels 0.1.40. A partition sampler with `partitioned`
+- Require ReactiveKernels 0.1.41. A partition sampler with `partitioned`
   reuses shared-only intermediates across labels and local-coordinate
   changes, refreshing them when shared coordinate values change. Cached
   arrays own their storage, and failed refreshes remain invalid until retried
@@ -30,6 +30,14 @@ are recorded in the git history only.
   `partitioned` declaration; separability checks remain in force.
 - Accept bare Symbol and Pair partition declarations consistently. Prepare
   matching kernels and AD operators for mixed concrete partition-label types.
+
+## 0.1.35
+
+- Preserve natural scalar expressions in strict partition queries through
+  ReactiveKernels 0.1.40. Scalar offsets beside a design product retain their
+  broadcast shape instead of passing through an opaque row-normalization
+  helper. Shared predictors may have a different row count from observations;
+  ordinary indexed `exp` and subtraction need no model annotations.
 
 ## 0.1.34
 
