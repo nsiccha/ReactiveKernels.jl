@@ -1,6 +1,7 @@
 """
     prepare_filter(model::RKPPLModel; model_id, observations=(:y,), inputs=(),
                    parameters=(;), data=(;), drifting=(), groups=(;), frozen=FrozenValues())
+    prepare_filter(model::RKPPLModel, bound::StructuralPlan; kwargs...)
 
 Compile finite-lag `@scan` seeds, transitions and observation laws from the
 authored model, including expanded submodels and `@kernel` providers with
@@ -11,6 +12,16 @@ stream. `data` holds fixed model inputs, never an accumulating observation
 history. `frozen` substitutes a `FrozenValues` record directly, without retaining
 its original training inputs. New observations and covariates arrive as named
 tuples to `filter_step`.
+The bound-plan overload defaults to `frozen=bound.frozen`, obtains required
+fixed inputs from that binding, and retains only those read by the projected
+transition. It excludes observation/input histories and batch horizons.
+The returned `target.data` contains those selected fixed values; checkpoint
+resume compares them independently of `model_id`.
+Computed covariates/designs are recomputed from new input ports; only explicitly
+frozen definitions use their fitted values. Pass an exported `FrozenValues`
+record explicitly when the binding has not yet applied it. Unfrozen fixed
+inputs actually read by the transition remain retained. Scoped data names use
+the same authored dotted paths as fixed parameters.
 The scan's upper bound names the batch horizon; filtering extends the same
 recurrence one time slice at a time. Its seed observations are assimilated too.
 

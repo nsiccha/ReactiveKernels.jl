@@ -26,7 +26,9 @@ are recorded in the git history only.
   Authored parameter transitions support explicitly dynamic models.
 - Add `filter_parameter_names` and `filter_parameters` to select fixed
   parameters from nested constrained draws without historical latent paths.
-  Frozen preprocessing, selected fixed groups, predictive scores, bounded
+  Bound-plan preparation selects required fixed inputs without retaining
+  training columns or freezing newly computed covariates. Frozen preprocessing,
+  selected fixed groups, predictive scores, bounded
   diagnostics, explicit RNG ownership and portable continuation are covered.
   Work and retained size remain bounded in elapsed time for fixed particles,
   group count and finite lag depth. Requires ReactiveKernels 0.1.40.

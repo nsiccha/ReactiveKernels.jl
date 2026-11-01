@@ -164,7 +164,9 @@ end
             y[g] .~ Normal.(loc[g],0.5)
         end
     end
-    target=prepare_filter(model;model_id="groups",parameters=(;gain=0.5),groups=(;g=1:3))
+    target=prepare_filter(model;model_id="groups",parameters=(;gain=0.5),groups=(;g=1:3),
+        data=(;g=zeros(1000)))
+    @test isempty(target.data) # a loop binder does not retain a same-named training column
     s=initialize_filter(target;rng=Xoshiro(1),particles=8)
     s=filter_step(s,(;y=[0.5,1.0,1.5]))
     @test s.group_times.g == [1,1,1]
@@ -293,14 +295,29 @@ end
         gain ~ Normal()
         center=mean(x_fit)
         scaled=x .- center
+        unused_total=sum(y)
         loc=filter_provider(scaled,gain)
-        y .~ Normal.(loc,0.5)
+        y .~ Normal.(loc,obs_scale)
     end
-    bound=model(;gain=0.6,x=[0.1,0.2],x_fit=[0.1,0.2])|(;y=[0.0,0.0])
+    bound=model(;gain=0.6,x=[0.1,0.2],x_fit=[0.1,0.2],obs_scale=0.5)|(;y=[0.0,0.0])
     frozen=frozen_values(bound,(:center,))
-    target=prepare_filter(model;model_id="provider",parameters=(;gain=0.6),inputs=(:x,),frozen)
+    target=prepare_filter(model;model_id="provider",parameters=(;gain=0.6),inputs=(:x,),
+        frozen,data=(;obs_scale=0.5))
     @test Base.invokelatest(inferred_filter_transition,target,target.prototype,(;x=0.2),(;y=0.1)) isa Tuple
     @test !haskey(target.data,:x_fit)
+    frombound=prepare_filter(model,bound;model_id="provider",parameters=(;gain=0.6),inputs=(:x,),frozen)
+    @test frombound.data==target.data
+    @test Set(keys(frombound.data))==Set((:center,:obs_scale))
+    @test frombound.data.center≈0.15
+    @test Base.summarysize(frombound)==Base.summarysize(target)
+    large=model(;gain=0.6,x=zeros(10000),x_fit=fill(0.15,10000),obs_scale=0.5)|(;y=zeros(10000))
+    fromlarge=prepare_filter(model,large;model_id="provider",parameters=(;gain=0.6),inputs=(:x,),frozen)
+    @test fromlarge.signature==frombound.signature
+    @test Base.summarysize(fromlarge)==Base.summarysize(frombound)
+    changed=prepare_filter(model,bound;model_id="provider",parameters=(;gain=0.6),inputs=(:x,),
+        frozen,data=(;obs_scale=0.7))
+    @test_throws ArgumentError resume_filter(changed,
+        filter_checkpoint(initialize_filter(frombound;rng=Xoshiro(1),particles=8)))
     s=initialize_filter(target;rng=Xoshiro(1),particles=8)
     h=0.0
     for x in [0.2,0.6,-0.4,0.5]
@@ -308,6 +325,9 @@ end
         s=filter_step(s,(;y=0.1);inputs=(;x))
         @test s.predictive_logscore ≈ logpdf(Normal(h,0.5),0.1)
     end
+    a=initialize_filter(frombound;rng=Xoshiro(1),particles=8)
+    @test filter_checkpoint(filter_step(a,(;y=0.1);inputs=(;x=0.3)))==
+        filter_checkpoint(filter_step(initialize_filter(target;rng=Xoshiro(1),particles=8),(;y=0.1);inputs=(;x=0.3)))
 end
 
 const filter_work=Ref(0)

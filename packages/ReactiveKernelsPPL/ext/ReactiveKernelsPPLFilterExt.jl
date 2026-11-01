@@ -28,7 +28,7 @@ _global(name) = GlobalRef(@__MODULE__, name)
 
 function PPL.filter_parameter_names(model::RKPPLModel; observations=(:y,),inputs=(),data::NamedTuple=(;))
     supplied = Set{Symbol}((observations...,inputs...,keys(data)...,keys(model.fixed)...))
-    ast,scopes = PPL._expand_submodels(model.ast,supplied,model.mod;
+    ast,scopes = PPL._expand_submodels(model.ast,Set(n for n in supplied if !occursin('.',String(n))),model.mod;
         rewrites=model.rewrites,with_scopes=true)
     paths = PPL._scope_name_paths(scopes)
     found = Symbol[]
@@ -289,6 +289,26 @@ end
 
 function _compile_block!(c, block; group=nothing)
     stmts = _stmts(block)
+    assignments = [st for st in stmts if Meta.isexpr(st,:(=),2) && st.args[1] isa Symbol]
+    needed = Set{Symbol}()
+    for st in stmts
+        st in assignments && continue
+        if Meta.isexpr(st,:call,3) && st.args[1] in (:~,Symbol(".~"))
+            name = st.args[2] isa Symbol ? st.args[2] : st.args[2].args[1]
+            name in c.observations || continue # fixed priors are not scored
+        end
+        union!(needed,PPL._expr_value_symbols(st))
+    end
+    changed = true
+    while changed
+        old = length(needed)
+        for st in assignments
+            st.args[1] in needed && !haskey(c.data,st.args[1]) &&
+                union!(needed,PPL._expr_value_symbols(st.args[2]))
+        end
+        changed = old != length(needed)
+    end
+    filter!(st -> st ∉ assignments || st.args[1] in needed,stmts)
     # Batch horizon definitions (e.g. T=length(y[g])) are not stream inputs.
     horizons = Set{Symbol}()
     for st in stmts
@@ -389,6 +409,28 @@ function _compile_block!(c, block; group=nothing)
     return Expr(:block, result...)
 end
 
+function PPL.prepare_filter(model::RKPPLModel, bound::PPL.StructuralPlan;
+        observations=(:y,), inputs=(), parameters::NamedTuple=(;), data::NamedTuple=(;),
+        frozen::PPL.FrozenValues=bound.frozen, kwargs...)
+    PPL.isbound(bound) || _fail("prepare_filter requires a bound plan")
+    definitions,_ = PPL._definition_exprs(bound)
+    paths = PPL._scope_name_paths(bound.submodel_scopes)
+    value_inputs = PPL._bound_value_inputs(bound)
+    function public_name(n)
+        n in value_inputs && (n=Symbol(chopprefix(String(n),"_rkppl_value_")))
+        return haskey(paths,n) ? Symbol(join(paths[n],".")) : n
+    end
+    excluded = Set{Symbol}((observations...,inputs...,keys(parameters)...,keys(model.fixed)...))
+    # Recompute authored covariate definitions from new inputs. Only explicitly
+    # frozen definitions substitute their fitted value; never freeze a design
+    # merely because binding happened to evaluate it on training rows.
+    fixed = (; (public_name(n)=>v for (n,v) in bound.columns
+        if !haskey(definitions,n) && public_name(n) ∉ excluded)...)
+    frozen_values = (; (public_name(n)=>v for (n,v) in pairs(frozen.values))...)
+    return prepare_filter(model;observations,inputs,parameters,
+        data=merge(fixed,data),frozen=PPL.FrozenValues(frozen_values,(;)),kwargs...)
+end
+
 function PPL.prepare_filter(model::RKPPLModel; model_id::AbstractString,
         observations=(:y,), inputs=(), parameters::NamedTuple=(;), data::NamedTuple=(;),
         drifting=(), groups::NamedTuple=(;), frozen::PPL.FrozenValues=PPL.FrozenValues())
@@ -404,19 +446,24 @@ function PPL.prepare_filter(model::RKPPLModel; model_id::AbstractString,
     paths = Dict(n => Symbol(join(path,".")) for (n,path) in PPL._scope_name_paths(scopes))
     private_names = Dict(v=>k for (k,v) in paths)
     parameter_names = Tuple(get(private_names,n,n) for n in keys(parameters))
-    c = FilterCompiler(Tuple(observations), Tuple(inputs), parameter_names, data, groups,
+    compiler_data = NamedTuple{Tuple(get(private_names,n,n) for n in keys(data))}(values(data))
+    c = FilterCompiler(Tuple(observations), Tuple(inputs), parameter_names, compiler_data, groups,
         Dict{Symbol,Tuple{Symbol,Int,Any}}(), Pair{Symbol,Tuple{Int,Int}}[], Set{Symbol}(), Set{Symbol}(),
         model.mod,Any[],0,paths,Set{Symbol}((inputs...,observations...)))
     body = _compile_block!(c, ast)
+    # Inspect the actual projected code, after horizon removal and frozen
+    # substitution. Training observations, input columns and dead constants
+    # never enter the retained target merely because the binding held them.
+    reads = PPL._expr_value_symbols(body)
+    setdiff!(reads,PPL._lazy_value_locals!(Set{Symbol}(),body))
+    data = (; (n=>v for (n,v) in pairs(data) if get(private_names,n,n) in reads)...)
     isempty(c.shapes) && _fail("model has no authored finite-state scan")
     Set(observations) == c.observed || _fail("every observation must have an authored law")
     all(n -> n in c.sampled, drifting) || _fail("drifting parameters must name sampled carried states")
     bindings = Any[]
     append!(bindings,[Expr(:(=),get(private_names,n,n),_field(:_filter_parameters,n)) for n in keys(parameters)])
-    for (arg, fields) in ((:_filter_data, keys(data)),
-                         (:_filter_inputs, inputs))
-        append!(bindings, [Expr(:(=), n, _field(arg,n)) for n in fields])
-    end
+    append!(bindings,[Expr(:(=),get(private_names,n,n),_field(:_filter_data,n)) for n in keys(data)])
+    append!(bindings,[Expr(:(=),n,_field(:_filter_inputs,n)) for n in inputs])
     program = :((_filter_rng, _filter_carry, _filter_parameters, _filter_data,
                  _filter_inputs, _filter_observation, _filter_global_time, _filter_operations,
                  _filter_times, _filter_active) -> begin
