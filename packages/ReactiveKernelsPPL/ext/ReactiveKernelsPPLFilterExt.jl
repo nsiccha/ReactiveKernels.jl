@@ -87,6 +87,7 @@ mutable struct FilterCompiler
     provider_count::Int
     authored_names::Dict{Symbol,Symbol}
     series::Set{Symbol}
+    rows::Set{Symbol}
 end
 
 _bare_series(c,ex::Symbol) = ex in c.series
@@ -160,6 +161,10 @@ function _value(c, ex; time=nothing, seed=false, group=nothing, scalarize=false)
                 [_bare_series(c,a) for a in ex.args[2:end]],operation!,carry!)
         end
         if scalarize && _bare_series(c,ex)
+            projected = RK._stream_design_expression(ex,a -> _bare_series(c,a),
+                a -> RK._stream_is_row(a,c.rows),
+                a -> _value(c,a;time,seed,group,scalarize))
+            projected === nothing || return projected
             dotted = head isa Symbol && startswith(String(head),".")
             (dotted || head === :identity) || _fail(
                 "whole-trajectory call $head needs an authored pointwise broadcast or finite scan")
@@ -356,6 +361,16 @@ function _compile_block!(c, block; group=nothing)
             end
         end
     end
+    changed = true
+    while changed
+        changed = false
+        for st in assignments
+            if st.args[1] in c.series && st.args[1] ∉ c.rows &&
+                    RK._stream_is_row(st.args[2],c.rows)
+                push!(c.rows,st.args[1]); changed = true
+            end
+        end
+    end
     definitions = [st for st in stmts if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol &&
         st.args[1] ∉ horizons && !haskey(c.data,st.args[1]) &&
         st.args[1] ∉ c.series]
@@ -474,7 +489,7 @@ function PPL.prepare_filter(model::RKPPLModel; model_id::AbstractString,
     compiler_data = NamedTuple{Tuple(get(private_names,n,n) for n in keys(data))}(values(data))
     c = FilterCompiler(Tuple(observations), Tuple(inputs), parameter_names, compiler_data, groups,
         Dict{Symbol,Tuple{Symbol,Int,Any}}(), Pair{Symbol,Tuple{Int,Int}}[], Set{Symbol}(), Set{Symbol}(),
-        model.mod,Any[],0,paths,Set{Symbol}((inputs...,observations...)))
+        model.mod,Any[],0,paths,Set{Symbol}((inputs...,observations...)),Set{Symbol}())
     body = _compile_block!(c, ast)
     # Inspect the actual projected code, after horizon removal and frozen
     # substitution. Training observations, input columns and dead constants
@@ -482,7 +497,6 @@ function PPL.prepare_filter(model::RKPPLModel; model_id::AbstractString,
     reads = PPL._expr_value_symbols(body)
     setdiff!(reads,PPL._lazy_value_locals!(Set{Symbol}(),body))
     data = (; (n=>v for (n,v) in pairs(data) if get(private_names,n,n) in reads)...)
-    isempty(c.shapes) && _fail("model has no authored finite-state scan")
     Set(observations) == c.observed || _fail("every observation must have an authored law")
     all(n -> n in c.sampled, drifting) || _fail("drifting parameters must name sampled carried states")
     bindings = Any[]

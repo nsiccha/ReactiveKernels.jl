@@ -4,6 +4,53 @@
 _stream_has_series(ex::Symbol, names) = ex in names
 _stream_has_series(ex, names) = ex isa Expr && any(a -> _stream_has_series(a,names),ex.args)
 
+# A temporal design matrix is projected to one row, keeping its feature axis.
+# Its matrix/vector product then has one temporal output, hence one scalar.
+# These are algebraic row projections, not calls on a truncated history.
+_stream_call_is(ex, name) = Meta.isexpr(ex,:call) &&
+    (ex.args[1] === name || ex.args[1] == GlobalRef(Base,name))
+function _stream_is_row(ex, rows)
+    ex isa Symbol && return ex in rows
+    _stream_call_is(ex,:hcat) && return true
+    _stream_call_is(ex,:identity) && return _stream_is_row(ex.args[2],rows)
+    return false
+end
+
+function _stream_row_product(row::AbstractMatrix, coefficients::AbstractVector)
+    size(row,1)==1 || throw(ArgumentError("streamed design input must contain one observation row"))
+    return only(row * coefficients)
+end
+_stream_row_product(row, coefficients) = throw(ArgumentError(
+    "streamed design multiplication requires a design row and a fixed coefficient vector"))
+
+function _stream_design_expression(ex, isseries, isrow, project)
+    Meta.isexpr(ex,:call) || return nothing
+    args = ex.args[2:end]
+    if _stream_call_is(ex,:hcat) && any(isseries,args)
+        all(isseries,args) || throw(ArgumentError(
+            "streamed hcat columns must share the temporal axis; broadcast fixed columns over a stream"))
+        return Expr(:call,GlobalRef(Base,:hcat),map(project,args)...)
+    elseif _stream_call_is(ex,:*) && length(args)==2 && isrow(args[1])
+        !isseries(args[2]) || throw(ArgumentError("streamed design coefficients must be fixed"))
+        return Expr(:call,GlobalRef(@__MODULE__,:_stream_row_product),map(project,args)...)
+    end
+    # Constant columns whose sole dimension is an authored temporal length.
+    # Other constructors/reductions keep their ordinary unsupported boundary.
+    isempty(args) && return nothing
+    dim = last(args)
+    _stream_call_is(dim,:length) && length(dim.args)==2 && isseries(dim.args[2]) || return nothing
+    isrow(dim.args[2]) && return nothing # length(matrix) includes its feature axis
+    if _stream_call_is(ex,:ones) || _stream_call_is(ex,:zeros)
+        length(args) in (1,2) || return nothing
+        f = _stream_call_is(ex,:ones) ? :one : :zero
+        typ = length(args)==1 ? Float64 : project(args[1])
+        return Expr(:call,GlobalRef(Base,f),typ)
+    elseif _stream_call_is(ex,:fill) && length(args)==2 && !isseries(args[1])
+        return project(args[1])
+    end
+    return nothing
+end
+
 # A pointwise projection cannot reinterpret a vector reduction, gather or an
 # opaque whole-vector call as a call on its current element. Broadcast syntax
 # makes the authored elementwise contract explicit.

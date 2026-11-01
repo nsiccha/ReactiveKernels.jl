@@ -24,6 +24,10 @@ inputs actually read by the transition remain retained. Scoped data names use
 the same authored dotted paths as fixed parameters.
 The scan's upper bound names the batch horizon; filtering extends the same
 recurrence one time slice at a time. Its seed observations are assimilated too.
+Models with no carried state use the same path with empty carries. Temporal
+`hcat` design columns and their products with fixed coefficient vectors are
+projected one row at a time, including constant `ones`/`zeros`/`fill` columns
+whose dimension is `length` of a stream port.
 
 `drifting` names sampled carried states that the author interprets as dynamic
 parameters. Their authored transitions define the dynamic-parameter model;
@@ -43,7 +47,7 @@ general whole-trajectory transformations are refused. Omitted observation names
 or `missing` entries skip conditioning but advance selected groups; omitted
 groups do not advance. Missing observed recurrence states are drawn from their
 authored law. Observation/input arrays retain the original group positions.
-Whole-vector calls cannot be projected as elementwise work; author pointwise
+Other whole-vector calls cannot be projected as elementwise work; author pointwise
 operations with broadcasts. Opaque scalar user functions must themselves have
 bounded work/storage per invocation. Kernel-provider scans currently require
 scalar carry/output, invariant seeds/shared arguments and `include_init=false`.

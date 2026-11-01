@@ -28,6 +28,7 @@ are recorded in the git history only.
   parameters from nested constrained draws without historical latent paths.
   Bound-plan preparation selects required fixed inputs without retaining
   training columns or freezing newly computed covariates. Frozen preprocessing,
+  temporal design rows and fixed-vector products, zero-state models,
   selected fixed groups, predictive scores, bounded
   diagnostics, explicit RNG ownership and portable continuation are covered.
   Work and retained size remain bounded in elapsed time for fixed particles,

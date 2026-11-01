@@ -342,6 +342,43 @@ end
         filter_checkpoint(filter_step(initialize_filter(target;rng=Xoshiro(1),particles=8),(;y=0.1);inputs=(;x=0.3)))
 end
 
+@rkppl filter_design_submodel(X,ncoef,loc,scale) = begin
+    beta[1:ncoef] .~ Normal.(loc,scale)
+    return X * beta
+end
+
+@testset "Temporal design rows and zero-state updates" begin
+    model=@rkppl begin
+        center=mean(x_fit)
+        spread=std(x_fit)
+        scaled=(x .- center) ./ spread
+        X=hcat(ones(length(x)),scaled)
+        mu ~ filter_design_submodel(X,2,0.0,1.0)
+        y .~ Normal.(mu,0.5)
+    end
+    x=[0.2,0.6,-0.4,0.5]
+    y=[0.1,-0.2,0.3,0.4]
+    draw=(;mu=(;beta=[0.3,0.7]))
+    pars=filter_parameters(model,draw;inputs=(:x,),data=(;x_fit=x))
+    frozen=FrozenValues((;center=0.15,spread=0.4),(;))
+    bound=model(;x,x_fit=x)|(;y)
+    target=prepare_filter(model,bound;model_id="design",parameters=pars,inputs=(:x,),frozen)
+    @test Set(keys(target.data))==Set((:center,:spread))
+    @test isempty(target.prototype)
+    @test Base.invokelatest(inferred_filter_transition,target,target.prototype,(;x=0.2),(;y=0.1)) isa Tuple
+    s=initialize_filter(target;rng=Xoshiro(13),particles=4)
+    for i in eachindex(x)
+        s=filter_step(s,(;y=y[i]);inputs=(;x=x[i]))
+        @test s.predictive_logscore≈logpdf(Normal(0.3+0.7*(x[i]-0.15)/0.4,0.5),y[i])
+    end
+    large=model(;x=zeros(10000),x_fit=zeros(10000))|(;y=zeros(10000))
+    other=prepare_filter(model,large;model_id="design",parameters=pars,inputs=(:x,),frozen)
+    @test Base.summarysize(other)==Base.summarysize(target)
+    @test other.signature==target.signature
+    @test filter_checkpoint(filter_step(resume_filter(other,roundtrip_filter(filter_checkpoint(s))),
+        (;y=0.2);inputs=(;x=0.8)))==filter_checkpoint(filter_step(s,(;y=0.2);inputs=(;x=0.8)))
+end
+
 const filter_work=Ref(0)
 count_filter_step(x)=(filter_work[]+=1; x+1.0)
 
