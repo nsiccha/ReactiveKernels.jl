@@ -1554,17 +1554,39 @@ function prepare_partition_sampler(built, plan::StructuralPlan, observations,
     declarations = partitioned isa Union{Symbol,Pair} ? (partitioned,) : partitioned
     rule = isempty(declarations) ? () :
         (:unconstrained => _partition_coordinate_labels(plan, layout, declarations, keys_by_name),)
-    # The dense query: the values, the footprints and the separability check.
+    # Split before lowering enforces locality. A shared opaque producer may
+    # have no row form even though its cached frontier is a valid row input
+    # to every partition. The residual keeps the requested locality policy.
     spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality,
                                        partitioned = rule)
     have = (_query_have(plan)..., _PARTITION_PORT, _PLAN_PORT)
+    parts = if isempty(rule)
+        nothing
+    else
+        selected = ReactiveKernels.plan(spec; have, want)
+        selected = ReactiveKernels._kernel_error_policy(selected, on_error)
+        selected = ReactiveKernels._fuse_authored_plate_chains(selected; cells_only = true)
+        bound_selected = ReactiveKernels._partial_apply(selected,
+            ReactiveKernels._kernel_bound_pairs(spec, _query_bound(plan)))
+        Base.invokelatest(ReactiveKernels._partition_shared_parts, bound_selected, rule;
+            varying = (_PARTITION_PORT, _PLAN_PORT))
+    end
+    # This dense kernel supplies the original packed-coordinate footprints
+    # and separability check, including dependencies through the prefix. It
+    # is not the cached sampler's executable residual. Only that residual is
+    # subject to the requested locality check when a prefix exists.
+    dense_locality = parts === nothing ? locality : :ignore
+    if parts !== nothing
+        spec, want = _partition_query_spec(built, plan, names, keys_by_name;
+            locality = dense_locality, partitioned = rule)
+    end
     planner = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(ReactiveKernels.partition_plan_kernel, spec; have, want,
                           bound = _query_bound(plan), on_error)
     end
     plans, plan_type = _partition_plans(planner, labels, exemplar)
-    spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality,
-                                       partitioned = rule, plan_type)
+    spec, want = _partition_query_spec(built, plan, names, keys_by_name;
+                                       locality = dense_locality, partitioned = rule, plan_type)
     kernel = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
     end
@@ -1580,9 +1602,6 @@ function prepare_partition_sampler(built, plan::StructuralPlan, observations,
     local_footprints = isempty(rule) ? nothing :
         Dict{Any,Vector{Int}}(label => filter(p -> !ismissing(last(only(rule))[p]), footprint)
                              for (label, footprint) in footprints)
-    parts = isempty(rule) ? nothing : Base.invokelatest(
-        ReactiveKernels._partition_shared_parts, planner.plan, rule;
-        varying = (_PARTITION_PORT, _PLAN_PORT))
     if parts !== nothing
         return _prepare_shared_partition_sampler(kernel, parts, layout, names,
             keys_by_name, labels, exemplar, footprints, local_footprints,
