@@ -1608,7 +1608,7 @@ end
     # A kernel without cells reports nothing.
     @test isempty(partition_locality(prepare(_cell_shared; have = (:x, :w, :A), want = :dens)))
 
-    # An undeclared scalar is refused, naming the declaration.
+    # A scalar whose type inference cannot prove is refused with that reason.
     @kernel _cell_untyped(x::AbstractVector{Float64}, w::AbstractVector{Float64}) = begin
         s = sum(x)
         eta = w .* s
@@ -1627,5 +1627,5 @@ end
     end
     @test err isa PartitionLocalityError
     @test only(err.violations).value === :s && only(err.violations).reason === :untyped
-    @test occursin("s::Float64 = …", sprint(showerror, err))
+    @test occursin("its type is not known to be a number", sprint(showerror, err))
 end

@@ -3920,8 +3920,9 @@ function _kernel_split_callable(ex, ports::Vector{Symbol}, closure, body, ignore
     split = _kernel_split_nodes(ex, ports)
     factors = _kernel_split_nodes(ex, ports; factors = true)
     split === nothing && factors === nothing && return closure
-    # Even an identical boundary shape needs its factor-specific error-policy
-    # companions. Ordinary split functions retain their existing policy.
+    # Both decompositions retain their error-policy companions. Bound partial
+    # evaluation's residual parts, like factor parts, must remain eligible for
+    # native row analysis without confusing checked and ignore-mode bodies.
     extra = factors === nothing ? nothing :
         _kernel_split_expression(factors, ports, closure, body, ignorebody, nothing)
     # Factor-only boundaries are not candidates for ordinary partial
@@ -3929,7 +3930,7 @@ function _kernel_split_callable(ex, ports::Vector{Symbol}, closure, body, ignore
     split === nothing && (split = (; nodes = Any[],
         root = (; direct = collect(eachindex(ports)), kids = Int[],
                   body = _kernel_branch_unwrap(ex))))
-    _kernel_split_expression(split, ports, closure, body, nothing, extra)
+    _kernel_split_expression(split, ports, closure, body, ignorebody, extra)
 end
 
 function _kernel_split_expression(split, ports, closure, body, ignorebody, factors)

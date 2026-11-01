@@ -108,11 +108,15 @@ function preprocessing_recipes(plan::StructuralPlan)
         # A scalar summand does not make the complete offset scalar. Preserve
         # a sum whose inferred axes already match every located response, so
         # its arithmetic remains visible to the later plate-fusion pass.
+        # A proven scalar offset also broadcasts directly beside a nonempty
+        # design product; normalizing it through `_ppl_rows` would hide its
+        # row demand from a strict partition.
         offset_columns = Any[b.column for b in shape.blocks if b.kind === OffsetTerm]
         offset_sum = isempty(offset_columns) ? nothing :
             foldl((a, c) -> :($a .+ $c), offset_columns)
         retain_axes = _broadcast_affine(plan, pred) ||
-            _has_located_axes(plan, pred, offset_sum)
+            _has_located_axes(plan, pred, offset_sum) ||
+            (shape.width > 0 && _proven_scalar(plan, offset_sum))
         rows = isempty(scalars) || retain_axes ? 0 : _located_rows_source(plan, pred)
         off = offset_recipe(shape; scalars, n_rows = rows,
             broadcast = retain_axes)

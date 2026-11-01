@@ -70,7 +70,7 @@ function _locality_describe(entry)
         "its producer `$(entry.source)` has no row form" :
         entry.reason === :untyped ?
         "its producer `$(entry.source)` has no row form, and its type is not known to " *
-        "be a number (declare it, `$(entry.value)::Float64 = …`, if it is one)" :
+        "be a number" :
         entry.reason === :unshaped ?
         "its producer `$(entry.source)` has a row form, but the value's full shape is not known at rows" :
         entry.reason === :operands ?
@@ -124,7 +124,7 @@ function _cell_locality(p::Plan, d::_CellPushdowns)
     producer(cid) = let candidates = get(producers, cid, Recipe[])
         length(candidates) == 1 ? only(candidates) : nothing
     end
-    types = _locality_value_types(p)
+    types = d.types
     static_type(v) = get(types, cidof(v), Any)
     forms = Dict{Int,Union{Nothing,_CellForm}}()
     form(r) = get!(() -> get(d.forms, r.id, nothing) === nothing ? _cell_form(r) :
@@ -211,8 +211,7 @@ function _cell_locality(p::Plan, d::_CellPushdowns)
             elseif haskey(d.refused, cid)
                 # A value whose type neither a declaration, bound data nor
                 # inference knows may be a number (no rows, nothing to refuse)
-                # or an array computed whole: the refusal says so, and a
-                # declaration (`s::Float64 = …`) settles it.
+                # or an array computed whole: the refusal says so.
                 untyped = d.refused[cid] === :no_form &&
                     !(static_type(g.values[cid]) <: AbstractArray) &&
                     !(r !== nothing && r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp})
@@ -231,44 +230,6 @@ function _cell_locality(p::Plan, d::_CellPushdowns)
         end
     end
     entries
-end
-
-# The types of a plan's values as far as declarations, bound data and
-# inference over the recipes' operations say (`_promote_op`, as the
-# type-stability check infers them): `Any` where nothing is known. Only
-# whether a value is a number or an array matters here, so abstract types
-# such as `AbstractVector{Float64}` are kept.
-function _locality_value_types(p::Plan)
-    _plan_value_types(p, Any[valtype(v) for v in p.have]) do recipe, input_types
-        recipe.op isa _BoundConstant && return (typeof(recipe.op.value),)
-        map(recipe.outputs) do value
-            valtype(value) === Any || return valtype(value)
-            recipe.op isa Union{_AuthoredPlateOp,_AuthoredScanOp,_AuthoredPlateCellOp} &&
-                return Any
-            length(recipe.outputs) == 1 || return Any
-            # A literal read `a[k...]` of an array of numbers is one of them;
-            # a value with a row form over arrays of numbers is an array of
-            # numbers (Base computes its elements from its operands').
-            literal = _footprint_literal_read(recipe)
-            if literal !== nothing
-                S = input_types[first(literal)]
-                S isa Type && S <: AbstractArray && eltype(S) <: Number && return eltype(S)
-            end
-            f = _cell_form(recipe)
-            if f !== nothing && f.kind in (:pointwise, :identity, :columns, :hcat, :vcat,
-                                           :range_view, :reshape, :product)
-                elements = [eltype(S) for S in input_types
-                            if S isa Type && S <: AbstractArray && eltype(S) <: Number]
-                isempty(elements) || return AbstractArray{promote_type(elements...)}
-            end
-            T = try
-                _promote_op(recipe.op, input_types...)
-            catch
-                Any
-            end
-            T === Union{} ? Any : T
-        end
-    end
 end
 
 # The root violations of a cell's entries: `:whole` entries that are not

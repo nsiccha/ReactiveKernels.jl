@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.40
+
+- Strict cells and partitions preserve ordinary scalar indexed expressions,
+  including `w = exp.(a[1])` and `shift = a[2] .- a[1]`. Their vector
+  producers compute the indexed rows alongside the observation's row demand.
+  Shared type analysis retains array rank and recognizes inferred scalar
+  shapes; partial evaluation preserves the source companions needed for
+  subsequent row lowering. Footprints and native Reverse follow the same
+  generated program, without author annotations.
+
 ## 0.1.39
 
 - Preserve scalar vector reads when decomposing cell factors. Direct reads
