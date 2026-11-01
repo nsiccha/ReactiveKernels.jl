@@ -1543,6 +1543,13 @@ entry gather can feed `lx = log.(entries)`, `X = hcat(one, lx)` and
 `mu = X * beta .+ offset`. A strict query (`locality = :error`) then reads
 the selected entry's owning group and the shared coefficients. Shape analysis
 does not execute cells or opaque Julia helpers.
+A collector kernel may select that identity arm with an ordinary type test,
+such as `eltype(cells) <: Number ? cells : reduce(vcat, cells)`. When concrete
+types prove the condition, scalar plate output stays local through the
+collector and a following broadcast offset. `locality = :error` accepts
+the selected cell, and its ordinary Reverse gradient costs no full predictor
+allocation. Value-dependent conditions and the vector-flattening arm retain
+their existing locality limits.
 When the queried observations read one shared cell (two outputs of one loop),
 each observation's cell runs that shared cell at the same index. An output of
 an earlier `@plate for` loop that the observation reads at its own index

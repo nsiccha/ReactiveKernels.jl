@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.52
+
+- Require RK 0.1.49 for strict cell queries through a visible type-selected
+  scalar collector and broadcast offset. Selected values and ordinary Reverse
+  gradients keep constant allocation as the plate grows. Vector flattening
+  and conditions that depend on runtime values retain their locality limits.
+
 ## 0.1.51
 
 - Add optional `partitioned` and `u0` to `prepare_cell_query` and

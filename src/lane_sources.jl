@@ -169,7 +169,7 @@ function _lane_source_closure(r::Recipe; branches::Bool = false, outlined::Bool 
     # Ordinary authored operations carry their ignore-mode twin; the twin
     # itself (selected by `on_error = :ignore`) does not, and its body differs.
     outlined || getfield(op, :ignored_throws) !== nothing || return nothing
-    r.source isa Expr || return nothing
+    r.source isa Union{Expr,Symbol} || return nothing
     branches || !(getfield(op, :f) isa _KernelBranch) || return nothing
     callable = _lane_source_callable(getfield(op, :f))
     params = _lane_source_params(callable, r)

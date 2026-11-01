@@ -135,10 +135,58 @@ function _metadata_call(spec::KernelSpec, args; kwargs)
         "facts from a visible kernel graph")
 end
 
+# Select a lazy arm only when Julia reduces its condition to a literal return
+# for these input types. Requiring the *entire* optimized body to be that
+# return also proves that dropping the condition drops no effects or errors.
+# No input value, branch condition or arm is evaluated by this analysis.
+Base.@nospecializeinfer function _type_constant_bool(@nospecialize(f), types)
+    all(isconcretetype, types) || return nothing
+    inferred = Base.code_typed(f, Tuple{types...})
+    length(inferred) == 1 || return nothing
+    code = first(only(inferred)).code
+    length(code) == 1 || return nothing
+    node = only(code)
+    node isa Core.ReturnNode && isdefined(node, :val) || return nothing
+    value = node.val isa QuoteNode ? node.val.value : node.val
+    value isa Bool ? value : nothing
+end
+
+function _type_selected_branch(r::Recipe, types)
+    length(r.outputs) == 1 && !r.effectful && r.op isa _KernelSourceOp || return nothing
+    branch = r.op.f
+    branch isa _KernelBranch || return nothing
+    parts = _kernel_branch_parts(r.source)
+    parts === nothing && return nothing
+    CI, TI, EI = typeof(branch).parameters
+    chosen = _type_constant_bool(branch.condition, Any[types[i] for i in CI])
+    chosen === nothing && return nothing
+    positions = chosen ? TI : EI
+    field = chosen ? :then_arm : :else_arm
+    # Keep the separately authored throw-stripped twin for on_error=:ignore.
+    twin = r.op.ignored_throws
+    ignored = if twin isa _KernelSourceOp && twin.f isa _KernelBranch &&
+                 typeof(twin.f).parameters[chosen ? 2 : 3] == positions
+        _KernelSourceOp(Val(twin.token), Val(twin.form), getfield(twin.f, field),
+                        nothing, nothing, twin.mod)
+    else
+        nothing
+    end
+    op = _KernelSourceOp(Val(r.op.token), Val(r.op.form), getfield(branch, field),
+                         ignored, nothing, r.op.mod)
+    selected = Recipe(r.id, Tuple(r.inputs[i] for i in positions), r.outputs,
+                      op, r.cost, nothing, false, _kernel_branch_unwrap(parts[chosen ? 2 : 3]))
+    nested = _type_selected_branch(selected, Any[types[i] for i in positions])
+    nested === nothing && return (; recipe = selected, positions)
+    (; recipe = nested.recipe, positions = Tuple(positions[i] for i in nested.positions))
+end
+
 function _recipe_value_metadata(r::Recipe, args)
     OS = OutputSignatures
     unknown() = fill(OS.ValueInfo(), length(r.outputs))
     length(r.outputs) == 1 && !r.effectful || return unknown()
+    selected = _type_selected_branch(r, map(OS.type_bound, args))
+    selected === nothing || return _recipe_value_metadata(selected.recipe,
+        OS.ValueInfo[args[i] for i in selected.positions])
     if r.op isa _BoundConstant
         return [OS.known_info(r.op.value)]
     elseif r.op isa _AuthoredPlateOp
