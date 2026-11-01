@@ -3,16 +3,41 @@ module ReactiveKernelsPPLSMCExt
 using ReactiveKernelsPPL
 using ReactiveKernels
 using Random
-using LinearAlgebra: Diagonal, logabsdet
+using LinearAlgebra: Diagonal, logabsdet, ldiv!, dot, norm, qr, mul!
 using SequentialMonteCarlo: SMCModel, SMCIO, smc!
 using WarmupHMC: FixedKernelNUTSState, fixed_kernel_nuts_step
 using WarmupHMC: ContinuousNUTSState, continuous_nuts_step
 import WarmupHMC, SequentialMonteCarlo, LogDensityProblems
 import ReactiveKernelsPPL as PPL
 
+function _posterior_scale_in_basis(positions,weights,location,basis)
+    data=PPL._smc_scale(basis)
+    d=length(location)
+    PPL._smc_scale_dimension(data)==d || throw(DimensionMismatch("posterior basis and selected coordinates"))
+    operator=_metric(data)
+    centered=zeros(d)
+    whitened=zeros(d)
+    variance=zeros(d)
+    for j in axes(positions,2)
+        for i in 1:d
+            centered[i]=positions[i,j]-location[i]
+        end
+        ldiv!(whitened,operator,centered)
+        for i in 1:d
+            variance[i]+=weights[j]*abs2(whitened[i])
+        end
+    end
+    # L = H*D. Refit D in the supplied H frame, retaining no cloud or dense
+    # covariance. Original proposal magnitudes cancel from these moments.
+    diagonal=(data isa AbstractVector ? data : data.diagonal).*sqrt.(variance)
+    data isa AbstractVector ? diagonal : (;data...,diagonal)
+end
+
 PPL._smc_scale(scale::NamedTuple) = WarmupHMC.scale_data(WarmupHMC.scale_from_data(scale))
 _metric(scale::AbstractVector) = Diagonal(scale)
 _metric(scale::NamedTuple) = WarmupHMC.scale_from_data(scale)
+
+include("smc_spread.jl")
 
 struct SMCTarget{Q,B,S}
     query::Q
@@ -56,6 +81,7 @@ struct ReferenceTarget{R,K,A,C}
     kernel::K
     ad::A
     arguments::C
+    standard_deviation::Vector{Float64}
 end
 
 function _reference(target, reference)
@@ -71,7 +97,7 @@ function _reference(target, reference)
     end
     ad = Base.invokelatest(prepare_ad, kernel, target.backend,
         copy(r.location), arguments...; active=:u)
-    return ReferenceTarget(r, kernel, ad, arguments)
+    return ReferenceTarget(r, kernel, ad, arguments, _reference_sd(r.scale))
 end
 
 _density(t::SMCTarget, u) = t.query(u)
@@ -144,6 +170,8 @@ struct SMCStage
     evaluations::Int
     mean_squared_movement::Float64
     mean_acceptance::Union{Nothing,Float64}
+    coordinate_sd::Vector{Float64}
+    reference_sd::Union{Nothing,Vector{Float64}}
 end
 Base.:(==)(a::SMCStage, b::SMCStage) =
     all(getfield(a, k) == getfield(b, k) for k in fieldnames(SMCStage))
@@ -217,7 +245,7 @@ function _stage_kernel(options, d, beta)
 end
 
 function PPL.tune_smc(target::SMCTarget; rng::Xoshiro, init::AbstractVector,
-        reference=nothing, previous=nothing,
+        reference=nothing, previous=nothing, reference_inflation::Real=2.0,
         temperatures=(0.0, 1e-6, 1e-5, 1e-4, 1e-3, 0.01, 0.1, 0.5, 1.0),
         pilot_steps::Integer=64, pilot::Symbol=:continuous,
         max_reflections::Integer=16, recording_target::Integer=128,
@@ -231,6 +259,8 @@ function PPL.tune_smc(target::SMCTarget; rng::Xoshiro, init::AbstractVector,
     max_reflections >= 0 || throw(ArgumentError("max_reflections must be nonnegative"))
     recording_target >= 1 || throw(ArgumentError("recording_target must be positive"))
     pilot_evaluations >= 1 || throw(ArgumentError("pilot_evaluations must be positive"))
+    isfinite(reference_inflation) && reference_inflation > 0 ||
+        throw(ArgumentError("reference_inflation must be finite and positive"))
     options.tuning === nothing || throw(ArgumentError("pilot options must not already contain tuning"))
     grid = _temperatures(temperatures)
     scale = options.metric === nothing ? ones(d) : options.metric
@@ -244,8 +274,8 @@ function PPL.tune_smc(target::SMCTarget; rng::Xoshiro, init::AbstractVector,
         initial_source = _reference(target, SMCReference(zeros(d), ones(d)))
         learned = _adaptive_pilot(BridgeTarget(initial_source, target, 1.0, d),
             pilot_rng, init, scale, pilot_steps, max_reflections, recording_target,
-            pilot_evaluations, options.max_tree_depth)
-        reference = SMCReference(learned.location, learned.scale)
+            pilot_evaluations, options.max_tree_depth; reference_inflation)
+        reference = SMCReference(learned.location, learned.reference_scale)
         reference_work = learned.work
     end
     reference === nothing || reference isa SMCReference ||
@@ -304,7 +334,8 @@ function PPL.tune_smc(target::SMCTarget; rng::Xoshiro, init::AbstractVector,
             init=Vector{Float64}(init), steps=Int(pilot_steps), work, method=pilot))
 end
 
-function _adaptive_pilot(bridge, rng, init, scale, steps, reflections, recording, evaluations, depth)
+function _adaptive_pilot(bridge, rng, init, scale, steps, reflections, recording, evaluations, depth;
+        reference_inflation=nothing)
     seed = rand(rng, UInt64)
     result = WarmupHMC.adaptive_warmup_mcmc(Xoshiro(seed), bridge;
         init=(; position=Vector{Float64}(init), squared_scale=scale.^2),
@@ -313,13 +344,20 @@ function _adaptive_pilot(bridge, rng, init, scale, steps, reflections, recording
         nonlinear_adapt=false, monitor_ess=false)
     data = WarmupHMC.scale_data(result.scale_options[result.active_transformation])
     draws = result.posterior_position
+    n = size(draws, 2)
+    location = vec(sum(draws; dims=2)) ./ n
+    reference_scale = reference_inflation === nothing ? nothing :
+        _inflate_reference_scale(_posterior_scale_in_basis(draws, fill(1/n, n),
+            location, data), reference_inflation)
+    reference_work = reference_inflation === nothing ? (;) :
+        (; reference_inflation=Float64(reference_inflation), draw_sd=_cloud_sd(draws))
     return (; scale=data, stepsize=Float64(result.stepsize),
-        location=vec(sum(draws; dims=2))./size(draws,2),
+        location, reference_scale,
         position=Vector{Float64}(result.position_and_gradient.q),
         work=(; seed, retained_draws=size(draws,2),
             evaluations=Int(result.total_evaluation_counter),
             divergences=Int(result.n_divergent_samples),
-            family=result.active_transformation))
+            family=result.active_transformation, reference_work...))
 end
 
 PPL.smc_reference(state::SMCState) =
@@ -485,7 +523,9 @@ function PPL.smc_step(state::SMCState)
     kernel, tuning_index = _stage_kernel(state.options, d, beta)
     stage = SMCStage(state.update, state.stage+1, beta, ess, increment,
         length(Set(ancestors)), length(Set(lineage)), d == 0 ? 0 : n*kernel.moves,
-        divergences, deepcopy(kernel), tuning_index, evaluations, movement, acceptance)
+        divergences, deepcopy(kernel), tuning_index, evaluations, movement, acceptance,
+        _cloud_sd(positions),
+        state.source isa ReferenceTarget ? copy(state.source.standard_deviation) : nothing)
     history = [state.history; stage]
     if length(history) > state.options.history_limit
         deleteat!(history, 1:length(history)-state.options.history_limit)

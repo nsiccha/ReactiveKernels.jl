@@ -27,11 +27,22 @@ if mode == "write"
     state = initialize_smc(target; rng=Xoshiro(71), particles=64,
         reference=SMCReference([0.1,-0.1],scale),
         options=SMCOptions(metric=scale,stepsize=0.3))
-    serialize(path,(; checkpoint=smc_checkpoint(state), expected=signature(smc(state))))
+    tuning = tune_smc(target; rng=Xoshiro(910), init=zeros(2),
+        pilot=:adaptive, reference=:pilot, temperatures=(0.0, 1.0),
+        pilot_steps=32, pilot_evaluations=100, recording_target=32,
+        max_reflections=2, options=SMCOptions(moves=1, max_tree_depth=4))
+    tuned = initialize_smc(target; rng=Xoshiro(911), particles=64,
+        options=SMCOptions(tuning=tuning))
+    serialize(path,(; checkpoint=smc_checkpoint(state), expected=signature(smc(state)),
+        tuned_checkpoint=smc_checkpoint(tuned), tuned_expected=signature(smc(tuned)),
+        reference_work=tuning.pilot.reference_work))
 elseif mode == "read"
     payload = deserialize(path)
     state = resume_smc(target,payload.checkpoint)
     @test signature(smc(state)) == payload.expected
+    tuned = resume_smc(target, payload.tuned_checkpoint)
+    @test tuned.options.tuning.pilot.reference_work == payload.reference_work
+    @test signature(smc(tuned)) == payload.tuned_expected
 else
     error("expected write or read")
 end

@@ -124,7 +124,7 @@ function prepare_smc end
     tune_smc(target; rng::Xoshiro, init, reference=nothing, previous=nothing,
              temperatures=(0.0, 1e-6, 1e-5, 1e-4, 1e-3, 0.01, 0.1, 0.5, 1.0),
              pilot_steps=64, pilot=:continuous, max_reflections=16,
-             recording_target=128, pilot_evaluations=1000,
+             recording_target=128, pilot_evaluations=1000, reference_inflation=2.0,
              options=SMCOptions())
 
 Prepare all mutation tuning **before** creating a production cloud. `init` is
@@ -140,8 +140,20 @@ It does not adapt from production particles.
 
 For an initial bridge, supply a normalized `SMCReference` (default standard
 Normal). With `pilot=:adaptive`, `reference=:pilot` first runs a separate pilot
-at the full target and learns a normalized Gaussian from its draw mean and
-active scale. This reference is fixed before the grid pilots and production.
+at the full target and learns a normalized Gaussian from its retained draw mean
+and variances in the active scale's reflection basis. Cross-covariances in that
+basis are discarded. `reference_inflation` multiplies the fitted standard
+deviations (default 2; finite and positive). It applies only to `reference=:pilot`;
+1 uses the uninflated fitted moments, not the active mutation scale. The active
+mutation scale and its paired step size are exported unchanged by each knot's
+pilot. The reference is fixed before the grid pilots and production. Fitting
+costs O(N*d*k) for N retained draws, d coordinates and k bounded reflections
+(O(N*d) without reflections), with no dense covariance.
+
+Pilot exploration and wider references do not guarantee posterior coverage.
+`schedule.pilot.reference_work` records the inflation and native-coordinate
+`draw_sd`, alongside pilot work. A proposal reference is not a posterior-moment
+summary of the production cloud.
 `smc_reference(schedule)` returns the resulting data-only reference. For a
 cumulative-data update pass `previous=old_prepared_target` and no reference.
 The returned schedule is valid only for these exact endpoints. Supply it as
@@ -153,8 +165,9 @@ number of continuous adaptive transitions per knot. For `pilot=:adaptive` it is
 the retained-draw floor per warm-up, not an exact count; `pilot_evaluations`
 sets its first evaluation window, `recording_target` bounds its retained pool,
 and `max_reflections` bounds the learned operator. The schedule retains only
-scale data and scalar work records, including each pilot seed; its evaluation
-counts exclude upstream initialization and the initial step-size search.
+scale data, coordinate spread summaries and work records, including each pilot
+seed; its evaluation counts exclude upstream initialization and the initial
+step-size search.
 `options` supplies the initial diagonal metric,
 production move count and tree-depth limit; it must not itself contain tuning.
 The default grid includes near-zero knots. Supply a model-specific grid when
@@ -256,6 +269,12 @@ the transitions' tree acceptance probabilities (`nothing` for zero dimensions).
 is the mean squared unconstrained displacement from each resampled parent to
 its final child, after all moves. These describe mutation work and movement,
 not independent evidence that a posterior has been explored adequately.
+`coordinate_sd` gives native unconstrained-coordinate standard deviations of
+the post-mutation, equally weighted cloud; `reference_sd` gives the initial
+Gaussian reference's marginal standard deviations, or `nothing` for an exact
+posterior-to-posterior update. These vectors retain O(d*history_limit) values,
+not historical clouds. Compare spreads across stages and independent runs;
+neither a large first temperature step nor a high ESS alone diagnoses coverage.
 Failures propagate; the input state and its RNG remain usable.
 """
 function smc_step end
