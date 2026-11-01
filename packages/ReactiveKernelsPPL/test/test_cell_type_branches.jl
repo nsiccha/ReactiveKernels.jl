@@ -169,8 +169,11 @@ end
         expected = logpdf(Normal(u[1], 1), data.y[index])
         @test q(u, index) ≈ expected
         @test q(view(u, :), LinearIndices(data.y)[index]) ≈ expected
+        @test q(view(u, :), index) ≈ expected
+        @test q(view(u, :), Int32(LinearIndices(data.y)[index])) ≈ expected
     end
-    @test length(q.index_specializations.residuals) == 2
+    u[1] = 0.4
+    @test q(view(u, :), CartesianIndex(2, 3)) ≈ logpdf(Normal(0.4, 1), data.y[2, 3])
     @test_throws BoundsError q(u, CartesianIndex(0, 1))
     @test_throws ArgumentError q.kernel(view(u, :), 1)
 end

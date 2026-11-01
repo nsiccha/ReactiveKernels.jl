@@ -596,7 +596,7 @@ mutable struct CellQuery{K,L,C,I}
     const layout::L
     const observations::Tuple{Vararg{Symbol}}
     const prefix::C
-    const index_specializations::I
+    const specializations::I
 end
 CellQuery(kernel, layout, observations, prefix) =
     CellQuery(kernel, layout, observations, prefix, nothing)
@@ -606,20 +606,21 @@ CellQuery(kernel, layout, observations) = CellQuery(kernel, layout, observations
     Base.invokelatest(_cell_density, q, u, cell)::Float64
 (q::CellQuery)(u::AbstractVector{<:Real}, cell) = q(Vector{Float64}(u), cell)
 function _cell_density(q::CellQuery, u, cell)
-    # As in sampler and partition queries, native preparation uses the
-    # canonical packed storage type. Views and other real vectors retain
-    # their public query behavior by conversion at this boundary.
-    u isa Vector{Float64} || return _cell_density(q, Vector{Float64}(u), cell)
-    cell isa Integer && !(cell isa Union{Int,Bool}) &&
-        return _cell_density(q, u, Int(cell))
     if q.prefix === nothing
-        cell isa Int && return q.kernel(u, cell)
-        q.index_specializations === nothing && return q.kernel(u, cell)
-        kernel = _query_residual(q.index_specializations, cell, (u, cell))
+        u isa Vector{Float64} && cell isa Int && return q.kernel(u, cell)
+        q.specializations === nothing && return q.kernel(u, cell)
+        # Preserve local reads through views and custom packed vectors.
+        # Preparing by argument types does not copy or inspect their values.
+        args = (u, cell)
+        kernel = get!(q.specializations.kernels, typeof(args)) do
+            Base.invokelatest(prepare, q.kernel.plan;
+                exemplars = args, on_error = q.specializations.on_error)
+        end
         return kernel(u, cell)
     end
     length(u) == q.layout.total || throw(ContractValidationError(
         "[query] packed length $(length(u)) ≠ layout total $(q.layout.total)"))
+    u isa Vector{Float64} || return _cell_density(q, Vector{Float64}(u), cell)
     cached = _refresh_partition_prefix!(q.prefix.cache, u)
     residual = _query_residual(q.prefix, cell, (u, cell, cached...))
     residual(u, cell, cached...)
@@ -657,10 +658,12 @@ declaration identifies cache dependencies; it adds no per-key separability
 claim because a cell query has no partition key. A partition query checks
 separability when the same declaration is supplied.
 
-Native preparation uses the types of a packed `Vector{Float64}` and an `Int`
-cell position. Query calls convert other real vectors and integer positions
-to these types and cache additional specializations for Cartesian indices;
-direct calls to `q.kernel` require the initial exact types.
+Native preparation initially uses a packed `Vector{Float64}` and an `Int`
+cell position. Uncached query calls preserve other `AbstractVector{Float64}`
+inputs and cache specializations for their argument types, including Cartesian
+indices. Other element types are converted to `Float64`; prefix-cached queries
+also convert other packed storage types. Direct calls to `q.kernel` require
+the initial exact types.
 `u0` supplies a valid packed preparation point for the shared
 prefix; it defaults to zeros. It is copied. Each query owns its cache and is not
 thread-safe. `q.kernel` remains the original packed-coordinate kernel for
@@ -734,9 +737,9 @@ function prepare_cell_query(built, plan::StructuralPlan, observations;
         Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error,
             exemplars = (exemplar, 1))
     end
-    indices = prefix === nothing ?
-        _value_query_prefix(nothing, kernel, kernel.plan, 1, on_error) : nothing
-    return CellQuery(kernel, built.layout, names, prefix, indices)
+    specializations = prefix === nothing ?
+        (; kernels = Dict{DataType,Any}(), on_error) : nothing
+    return CellQuery(kernel, built.layout, names, prefix, specializations)
 end
 
 const _CELL_PORT = :_ppl_cell
