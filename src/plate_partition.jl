@@ -60,9 +60,10 @@ function Base.showerror(io::IO, err::PartitionLocalityError)
     end
     print(io, "\n  A value is computed at a cell's rows only when its producer has a row ",
           "form (a dotted expression, a gather, a column read, hcat/vcat, a product ",
-          "with an array left factor, a literal range view or reshape, an authored ",
-          "plate); see `partition_locality`. Pass `locality = :warn` to evaluate ",
-          "anyway.")
+          "with an array left factor, a literal range view or reshape, a reduction over ",
+          "the axes other than the first such as `vec(sum(x; dims = 2))`, a transposed ",
+          "vector, an authored plate); see `partition_locality`. Pass `locality = :warn` ",
+          "to evaluate anyway.")
 end
 
 function _locality_describe(entry)
@@ -74,7 +75,9 @@ function _locality_describe(entry)
         entry.reason === :unshaped ?
         "its producer `$(entry.source)` has a row form, but the value's full shape is not known at rows" :
         entry.reason === :operands ?
-        "its producer `$(entry.source)` has a row form, but an operand is not provably an integer index or an array" :
+        "its producer `$(entry.source)` has a row form, but an operand does not fit it (an index " *
+        "not provably an integer vector, a factor not an array, a transposed value not a vector, " *
+        "or a `vec` of a reduction that keeps another axis)" :
         entry.reason === :untyped_index ?
         "the cell's body reads it as `v[q]`, but `q` (a batched argument) is not provably an integer position or a vector of them (declare its type)" :
         entry.reason === :cascade ?

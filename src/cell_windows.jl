@@ -44,7 +44,19 @@
 #   arguments, as in a cell (`_cell_capture_reader`); its other shared
 #   arguments are read whole.
 #   Its full axes are its batched arguments' broadcast axes, as its loop
-#   combines them.
+#   combines them;
+# - a reduction over the axes other than the first, `sum(X; dims = 2)` (also
+#   `prod`, `maximum`, `minimum`; `dims` a literal axis or tuple of axes, all
+#   >= 2), alone, under `vec` (the reduced value then keeps one entry per row,
+#   which the window checks) or under `dropdims(…; dims)` of reduced axes. Its
+#   operand is an input or any broadcast operand above (a dotted expression, a
+#   gather): row `r` of it is the same reduction over row `r` of the operand,
+#   the shape BRM emits for a grouped HSGP field, `vec(sum(PHI .* rows;
+#   dims = 2))` (snag `run-brm-s-full-g-2dc0667a`). A gather `A[I, :]` (every
+#   later index a position or the whole axis `:`) reads whole rows of its
+#   source, and `transpose(w)`, `adjoint(w)` or `w'` of a vector input, alone or
+#   as a broadcast operand, is one row, read whole: broadcasting extrudes it
+#   along the rows.
 #
 # Row `r` of the dotted expression is the same expression over row `r` of each
 # array operand (the operand itself when broadcasting extrudes it), and row
@@ -275,6 +287,45 @@ end
 
 # The full axes of a column read `A[:, j...]`: `A`'s first axis.
 @inline _cell_column_shape(shape::Tuple) = (first(shape),)
+
+# The full axes of a gather `A[I, k...]` keeping the `Colon` axes of its tail
+# (`A[I, :]`): the index's axis, then each kept axis of the source (an axis past
+# the source's rank is the trailing singleton Julia's indexing allows).
+@generated function _cell_gather_shape(index::Tuple, source::Tuple, ::Val{tail}) where {tail}
+    n = fieldcount(source)
+    axes = Any[:(first(index))]
+    for (d, t) in enumerate(tail)
+        t isa Colon || continue
+        push!(axes, d + 1 <= n ? :(source[$(d + 1)]) : :(Base.OneTo(1)))
+    end
+    Expr(:tuple, axes...)
+end
+
+# The full axes of `transpose(w)` or `adjoint(w)` of a vector, one row; a
+# number's are its own.
+@inline _cell_transposed_shape(::Tuple{}) = ()
+@inline _cell_transposed_shape(shape::Tuple{Any}) = (Base.OneTo(1), first(shape))
+
+# The full axes of a reduction over the axes `dims` of a value with full axes
+# `shape`: each reduced axis a singleton, the axes `drop` dropped (`dropdims`);
+# under `vec`, the first axis alone, once every other axis is a singleton —
+# otherwise `vec` interleaves the rows and the value has no row form.
+@generated function _cell_reduce_shape(shape::Tuple, ::Val{dims}, ::Val{vec},
+                                       ::Val{drop}) where {dims,vec,drop}
+    n = fieldcount(shape)
+    axes = Any[d in dims ? :(Base.OneTo(1)) : :(shape[$d]) for d in 1:n]
+    if vec
+        checks = Any[:(length(shape[$d]) == 1 || _cell_reduce_vec_error($d, length(shape[$d])))
+                     for d in 2:n if !(d in dims)]
+        return Expr(:block, checks..., Expr(:tuple, n == 0 ? :(Base.OneTo(1)) : axes[1]))
+    end
+    Expr(:tuple, Any[axes[d] for d in 1:n if !(d in drop)]...)
+end
+@noinline _cell_reduce_vec_error(d, len) = throw(ArgumentError(
+    "`vec` of a reduction over the axes other than the first keeps one entry per row " *
+    "only when every other axis of the reduced value has length 1; axis $d has length " *
+    "$len, so the value has no row form (reduce over that axis too, or read the " *
+    "reduced array without `vec`)"))
 
 # The full axes of `hcat(xs...)` from its operands' full axes (`()` for a
 # number), as `hcat` forms them: the second dimension adds up, every other
@@ -567,6 +618,14 @@ struct _CellForm
     vias::Vector{Vector{Int}}
     # A `:range_view`'s literal range, or a `:reshape`'s literal dimensions.
     literal::Any
+    # Per input, the trailing indices a gather source is read with, `(k, Colon())`
+    # for `A[I, k, :]` and `()` for a linear gather `A[I]`; `nothing` for any
+    # other input. A `Colon` keeps that axis of the source in the gather's full
+    # shape (`_cell_gather_shape`).
+    tails::Vector{Any}
+    # A `:reduce`'s reduction `(; dims, vec, drop)`: the literal axes reduced,
+    # whether `vec` follows, and the axes `dropdims` drops; else `nothing`.
+    reduction::Any
 end
 _CellForm(kind, roles, gather_index, leaves, operand, indices = Vector{Int}[
         role in (:gather, :linear_gather) ? [gather_index[j]] : Int[]
@@ -575,6 +634,9 @@ _CellForm(kind, roles, gather_index, leaves, operand, indices = Vector{Int}[
         _cell_direct_reads(indices), nothing)
 _CellForm(kind, roles, gather_index, leaves, operand, indices, parts, vias) =
     _CellForm(kind, roles, gather_index, leaves, operand, indices, parts, vias, nothing)
+_CellForm(kind, roles, gather_index, leaves, operand, indices, parts, vias, literal) =
+    _CellForm(kind, roles, gather_index, leaves, operand, indices, parts, vias, literal,
+        Any[nothing for _ in roles], nothing)
 
 # Every index of every source read directly (no shared index array).
 _cell_direct_reads(indices) = Vector{Int}[zeros(Int, length(ix)) for ix in indices]
@@ -639,6 +701,7 @@ function _cell_form(r::Recipe; outlined::Bool = false)
     # A source's gather indices, in first-read order, and whether its gathers
     # are linear (`A[I]`) or row reads (`A[I, k...]`), the same for every read.
     gathers = Dict{Int,Tuple{Vector{Int},Bool}}()
+    tails = Dict{Int,Tuple}()
     products = Dict{Int,Int}()
     leaves = Int[]
     param(x) = x isa Symbol && haskey(position, x)
@@ -657,10 +720,13 @@ function _cell_form(r::Recipe; outlined::Bool = false)
         length(ex.args) >= 2 || return false
         source, index = ex.args[1], ex.args[2]
         haskey(position, source) && haskey(position, index) || return false
-        all(i -> i isa Int, ex.args[3:end]) || return false
+        tail = _cell_gather_tail(ex.args[3:end], mod)
+        tail === nothing && return false
         linear = length(ex.args) == 2
         found, linear_reads = get!(() -> (Int[], linear), gathers, position[source])
         linear_reads == linear || return false
+        # Every read of one source has the same trailing indices.
+        get!(tails, position[source], tail) == tail || return false
         position[index] in found || push!(found, position[index])
         push!(uses[position[source]], linear ? :linear_gather : :gather)
         push!(uses[position[index]], :index)
@@ -669,6 +735,8 @@ function _cell_form(r::Recipe; outlined::Bool = false)
     end
     function operand!(ex)
         _cell_broadcasted(ex) && return lazy!(ex)
+        # A broadcast a non-dotted parent materializes (`sum(a .* b; dims = 2)`).
+        _cell_materialize(ex) && return operand!(ex.args[2])
         if ex isa Symbol
             haskey(position, ex) || return false
             push!(uses[position[ex]], :leaf)
@@ -680,8 +748,16 @@ function _cell_form(r::Recipe; outlined::Bool = false)
         readonly(ex) && return gather!(Expr(:ref, ex.args[2], ex.args[3]))
         column = column_view(ex)
         column === nothing || return column!(column)
+        transposed = _cell_transposed(ex, position, mod)
+        transposed === nothing || return transposed!(transposed)
         ex isa Expr && ex.head === :call && return product!(ex)
         false
+    end
+    # `transpose(w)`, `adjoint(w)` or `w'` of a vector: one row that broadcasting
+    # extrudes along the rows, so `w` is read whole.
+    function transposed!(j)
+        push!(uses[j], :transposed)
+        true
     end
     # `A[:, k...]`: row `r` is `A[r, k...]`.
     function column!(ex)
@@ -714,6 +790,7 @@ function _cell_form(r::Recipe; outlined::Bool = false)
     operand = 0
     parts = Any[]
     literal = nothing
+    reduction = nothing
     native = something(column_view(native), native)
     if _cell_materialize(native)
         lazy = native.args[2]
@@ -788,10 +865,21 @@ function _cell_form(r::Recipe; outlined::Bool = false)
         push!(uses[source], :reshape_source)
         push!(leaves, source)
         foreach(part -> part isa Int || push!(uses[part.input], :whole), literal)
+    elseif (reduced = _cell_reduction(native, position, mod)) !== nothing
+        # `sum(X; dims = 2)` (also `prod`, `maximum`, `minimum`), alone, under
+        # `vec` or under `dropdims`: row `r` is the same reduction over row `r`
+        # of `X`, an input or a broadcast operand (`operand!`).
+        kind = :reduce
+        reduction = reduced.spec
+        operand!(reduced.operand) || return nothing
+    elseif (transposed = _cell_transposed(native, position, mod)) !== nothing
+        # `transpose(w)` of a vector input alone: one row, read whole.
+        kind = :transposed
+        push!(uses[transposed], :transposed)
     else
         return nothing
     end
-    kind === :pointwise && isempty(leaves) && return nothing
+    kind in (:pointwise, :reduce) && isempty(leaves) && return nothing
     roles = Symbol[]
     for used in uses
         role = isempty(used) ? :whole :
@@ -806,7 +894,8 @@ function _cell_form(r::Recipe; outlined::Bool = false)
     gather_index = Int[isempty(indices[j]) ? get(products, j, 0) : first(indices[j])
                        for j in eachindex(params)]
     _CellForm(kind, roles, gather_index, kind in (:hcat, :vcat) ? leaves : unique!(leaves),
-        operand, indices, parts, _cell_direct_reads(indices), literal)
+        operand, indices, parts, _cell_direct_reads(indices), literal,
+        Any[get(tails, j, nothing) for j in eachindex(params)], reduction)
 end
 
 # A literal of a range bound or a reshape dimension: an integer, or a scalar
@@ -870,6 +959,174 @@ function _cell_resolves_to(callee, mod, position, f)
         getglobal(callee.mod, callee.name) === f
     mod isa Module || return false
     _kernel_resolve_binding(mod, callee) === f
+end
+
+# The trailing indices of a gather `A[I, k...]`, each an integer literal or the
+# whole axis `:` (`A[I, :]`, whole rows of a matrix), as a tuple of `Int`s and
+# `Colon()`s; `nothing` for any other index.
+function _cell_gather_tail(exs, mod)
+    tail = Any[]
+    for ex in exs
+        if ex isa Int
+            push!(tail, ex)
+        elseif ex === :(:) || _cell_colon(ex, mod)
+            push!(tail, Colon())
+        else
+            return nothing
+        end
+    end
+    Tuple(tail)
+end
+
+# `transpose(w)`, `adjoint(w)` or `w'` of a parameter: its position, else `nothing`.
+function _cell_transposed(ex, position, mod)
+    ex isa Expr || return nothing
+    if ex.head === Symbol("'") && length(ex.args) == 1
+        arg = ex.args[1]
+    elseif ex.head === :call && length(ex.args) == 2 &&
+           (_cell_resolves_to(ex.args[1], mod, position, Base.transpose) ||
+            _cell_resolves_to(ex.args[1], mod, position, Base.adjoint))
+        arg = ex.args[2]
+    else
+        return nothing
+    end
+    arg isa Symbol && haskey(position, arg) ? position[arg] : nothing
+end
+
+# The reductions that keep an array's rows apart when they reduce its other
+# axes: row `r` of `f(X; dims = d)`, `d` axes other than the first, is
+# `f(X[r:r, …]; dims = d)`.
+const _CELL_ROW_REDUCTIONS = (Base.sum, Base.prod, Base.maximum, Base.minimum)
+
+# `f(X; dims = d)` with `f` one of `_CELL_ROW_REDUCTIONS` and `d` a literal
+# axis or tuple of axes, all >= 2 — alone, under `vec(…)` (the reduced value
+# keeps one entry per row when `d` covers every other axis, which the window
+# checks, `_cell_reduce_shape`) or under `dropdims(…; dims = d′)` with
+# `d′ ⊆ d`: `(; operand = X, spec = (; dims, vec, drop))`, else `nothing`.
+function _cell_reduction(native, position, mod)
+    native isa Expr && native.head === :call && !isempty(native.args) || return nothing
+    vectorized = false
+    drop = ()
+    inner = native
+    if _cell_resolves_to(native.args[1], mod, position, Base.vec)
+        length(native.args) == 2 || return nothing
+        vectorized = true
+        inner = native.args[2]
+    elseif _cell_resolves_to(native.args[1], mod, position, Base.dropdims)
+        parts = _cell_call_parts(native)
+        parts === nothing && return nothing
+        positional, keywords = parts
+        length(positional) == 1 && collect(keys(keywords)) == [:dims] || return nothing
+        dropped = _cell_literal_dims(keywords[:dims])
+        dropped === nothing && return nothing
+        drop = dropped
+        inner = only(positional)
+    end
+    inner isa Expr && inner.head === :call && !isempty(inner.args) || return nothing
+    any(f -> _cell_resolves_to(inner.args[1], mod, position, f), _CELL_ROW_REDUCTIONS) ||
+        return nothing
+    parts = _cell_call_parts(inner)
+    parts === nothing && return nothing
+    positional, keywords = parts
+    length(positional) == 1 && collect(keys(keywords)) == [:dims] || return nothing
+    dims = _cell_literal_dims(keywords[:dims])
+    dims === nothing && return nothing
+    issubset(drop, dims) || return nothing
+    (; operand = only(positional), spec = (; dims, vec = vectorized, drop))
+end
+
+# A call's positional arguments and its keyword arguments by name, written
+# `f(x; k = v)` or `f(x, k = v)`; `nothing` for a splat or a repeated name.
+function _cell_call_parts(ex::Expr)
+    positional = Any[]
+    keywords = Dict{Symbol,Any}()
+    function keyword!(kw)
+        Meta.isexpr(kw, :kw, 2) && kw.args[1] isa Symbol && !haskey(keywords, kw.args[1]) ||
+            return false
+        keywords[kw.args[1]] = kw.args[2]
+        true
+    end
+    for arg in ex.args[2:end]
+        if Meta.isexpr(arg, :parameters)
+            all(keyword!, arg.args) || return nothing
+        elseif Meta.isexpr(arg, :kw)
+            keyword!(arg) || return nothing
+        else
+            push!(positional, arg)
+        end
+    end
+    (positional, keywords)
+end
+
+# A literal reduction axis `d`, or tuple of axes `(d, …)`, every axis an integer
+# literal >= 2 (the first axis holds the rows), as a tuple; else `nothing`.
+function _cell_literal_dims(ex)
+    ex isa Int && return ex >= 2 ? (ex,) : nothing
+    Meta.isexpr(ex, :tuple) && !isempty(ex.args) &&
+        all(d -> d isa Int && d >= 2, ex.args) || return nothing
+    Tuple(Int.(ex.args))
+end
+
+# The operands of a form beyond its leaves whose axes shape its value: each a
+# transposed vector input (`kind = :transposed`), or a gather of `input` by
+# `index` keeping the `Colon` axes of its `tail` (`kind = :gather`). A gather
+# dropping every trailing axis adds nothing: its index is a leaf.
+function _cell_extra_parts(f::_CellForm)
+    extra = NamedTuple[]
+    for (j, role) in enumerate(f.roles)
+        if role === :transposed
+            push!(extra, (; kind = :transposed, input = j, index = 0, tail = ()))
+        elseif role === :gather && f.tails[j] !== nothing && any(t -> t isa Colon, f.tails[j])
+            for k in f.indices[j]
+                push!(extra, (; kind = :gather, input = j, index = k, tail = f.tails[j]))
+            end
+        end
+    end
+    extra
+end
+
+# The rank of an array type, `0` for a number; `nothing` when not known.
+_cell_static_ndims(T) = T isa Type && T !== Union{} && T <: Number ? 0 :
+    T isa Type && T <: AbstractArray && hasmethod(ndims, Tuple{Type{T}}) ? ndims(T) : nothing
+
+# The rank of a form's broadcast operand from its inputs' static types: the
+# largest rank among its parts; `nothing` when any part's rank is unknown.
+function _cell_operand_rank(r::Recipe, f::_CellForm, static_type)
+    rank = 0
+    for j in f.leaves
+        role = f.roles[j]
+        n = if role === :column
+            1
+        elseif role === :factor_leaf
+            W = static_type(r.inputs[f.gather_index[j]])
+            W isa Type && W <: AbstractVector ? 1 : W isa Type && W <: AbstractMatrix ? 2 :
+                W isa Type && W <: Number ? _cell_static_ndims(static_type(r.inputs[j])) : nothing
+        elseif role === :index
+            1
+        else
+            _cell_static_ndims(static_type(r.inputs[j]))
+        end
+        n === nothing && return nothing
+        rank = max(rank, n)
+    end
+    for part in _cell_extra_parts(f)
+        n = part.kind === :transposed ?
+            let T = static_type(r.inputs[part.input])
+                T isa Type && T <: Number ? 0 : T isa Type && T <: AbstractVector ? 2 : nothing
+            end : 1 + count(t -> t isa Colon, part.tail)
+        n === nothing && return nothing
+        rank = max(rank, n)
+    end
+    rank
+end
+
+# Whether a `:reduce` form under `vec` keeps one entry per row as far as its
+# operand's rank is known statically: every axis past the first is reduced.
+# An unknown rank passes here; the window checks the shape it computes.
+function _cell_reduce_fits(r::Recipe, f::_CellForm, static_type)
+    f.kind === :reduce && f.reduction.vec || return true
+    rank = _cell_operand_rank(r, f, static_type)
+    rank === nothing || all(d -> d in f.reduction.dims, 2:rank)
 end
 
 # An identity `b::T = a` (a typed alias RK keeps as a recipe): its rows are
@@ -1197,7 +1454,8 @@ function _cell_bound_capture_check(p::Plan, producers, static_type, known, outli
             return shapes[cid] = f.kind === :range_view ?
                 _cell_range_shape(literal) : _cell_dims_shape(literal)
         end
-        f.kind in (:identity, :pointwise, :columns, :hcat) || return nothing
+        f.kind in (:identity, :pointwise, :columns, :hcat, :reduce, :transposed) ||
+            return nothing
         parts = Any[]
         for j in f.leaves
             s = shape(r.inputs[j])
@@ -1205,9 +1463,27 @@ function _cell_bound_capture_check(p::Plan, producers, static_type, known, outli
             f.roles[j] === :factor_leaf && return nothing
             push!(parts, f.roles[j] === :column ? _cell_column_shape(s) : s)
         end
-        shapes[cid] = f.kind === :columns ? _cell_column_shape(only(parts)) :
-            f.kind === :hcat ? _cell_hcat_shape(Tuple(parts)) :
-            _plate_broadcast_shape(Tuple(parts))
+        for part in _cell_extra_parts(f)
+            s = shape(r.inputs[part.input])
+            s === nothing && return nothing
+            if part.kind === :transposed
+                length(s) <= 1 || return nothing
+                push!(parts, _cell_transposed_shape(s))
+            else
+                i = shape(r.inputs[part.index])
+                i === nothing && return nothing
+                push!(parts, _cell_gather_shape(i, s, Val(part.tail)))
+            end
+        end
+        f.kind === :columns && return shapes[cid] = _cell_column_shape(only(parts))
+        f.kind === :hcat && return shapes[cid] = _cell_hcat_shape(Tuple(parts))
+        full = _plate_broadcast_shape(Tuple(parts))
+        f.kind === :reduce || return shapes[cid] = full
+        (; dims, drop) = f.reduction
+        # A `vec` keeping another axis has no row form: no shape is proven.
+        f.reduction.vec && !all(d -> d in dims || length(full[d]) == 1, 2:length(full)) &&
+            return nothing
+        shapes[cid] = _cell_reduce_shape(full, Val(dims), Val(f.reduction.vec), Val(drop))
     end
     function valid(r, capture, lane, via, tail)
         indices = bound(r.inputs[1 + lane])
@@ -1338,8 +1614,8 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
     function shaped(cid)
         r = only(producers[cid])
         f = forms[r.id]
-        f.kind in (:pointwise, :identity, :columns, :hcat, :vcat, :range_view, :reshape) &&
-            return true
+        f.kind in (:pointwise, :identity, :columns, :hcat, :vcat, :range_view, :reshape,
+                   :reduce, :transposed) && return true
         inputs = r.inputs
         factor = cidof(inputs[findfirst(==(:factor), f.roles)])
         (f.operand == 0 ? static_type(only(r.outputs)) <: AbstractVector :
@@ -1367,10 +1643,13 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
             role in (:range_source, :reshape_source) ?
                 static_type(input) <: AbstractVector ||
                     (!(static_type(input) <: AbstractArray) && form(cidof(input)) !== nothing) :
+            # A transposed operand is one row only when it is a vector (a
+            # number transposes to itself); a matrix's transpose reads columns.
+            role === :transposed ? static_type(input) <: Union{AbstractVector,Number} :
             true
-        end && all(f.literal === nothing ? () : f.literal) do part
+        end && all(f.kind in (:range_view, :reshape) ? f.literal : ()) do part
             part isa Int || static_type(r.inputs[part.input]) <: Integer
-        end
+        end && _cell_reduce_fits(r, f, static_type)
     end
     captures = Dict{Int,Dict{Int,Vector{Tuple{Int,Int}}}}()
     untyped = Dict{Int,Vector{Int}}()
@@ -1491,8 +1770,16 @@ end
 function _cell_named_operand(parent::Expr, child)
     parent.head === :ref && return true
     _cell_dotted(parent) && return !_cell_dotted(child)
+    parent.head === Symbol("'") && return true
     parent.head === :call && !isempty(parent.args) || return false
-    _kernel_split_callee_name(parent.args[1]) in (:vcat, :hcat, :*)
+    name = _kernel_split_callee_name(parent.args[1])
+    name in (:vcat, :hcat, :*, :vec, :dropdims, :transpose, :adjoint) &&
+        return !(child isa Expr && child.head in (:parameters, :kw))
+    # The operand of a reduction over axes (`sum(x; dims = 2)`): the row forms
+    # read it by name; a keyword is not an operand.
+    name in (:sum, :prod, :maximum, :minimum) || return false
+    parts = _cell_call_parts(parent)
+    parts !== nothing && haskey(parts[2], :dims) && any(===(child), parts[1])
 end
 
 # The split parts of recipe `r` (`_partial_split_parts`) with the nodes to
@@ -1785,10 +2072,22 @@ function _cell_shape!(e::_CellEmitter, cid::ValueId)
     f.kind === :reshape && return e.shapes[cid] = _cell_bind!(e, :cell_shape,
         Expr(:call, _cell_ref(:_cell_dims_shape), _cell_literal!(e, r, f)))
     parts = Any[_cell_part_shape!(e, r, f, j) for j in f.leaves]
+    # A transposed vector is one row; a gather keeping axes of its source spans
+    # them (`_cell_extra_parts`).
+    for part in _cell_extra_parts(f)
+        source = input_shape(canon_id(d.graph, r.inputs[part.input].id))
+        push!(parts, part.kind === :transposed ?
+            Expr(:call, _cell_ref(:_cell_transposed_shape), source) :
+            Expr(:call, _cell_ref(:_cell_gather_shape),
+                 input_shape(canon_id(d.graph, r.inputs[part.index].id)), source,
+                 Val(part.tail)))
+    end
     shape = f.kind === :columns ?
         Expr(:call, _cell_ref(:_cell_column_shape), only(parts)) :
         f.kind === :hcat ? Expr(:call, _cell_ref(:_cell_hcat_shape), Expr(:tuple, parts...)) :
         Expr(:call, _cell_ref(:_plate_broadcast_shape), Expr(:tuple, parts...))
+    f.kind === :reduce && (shape = Expr(:call, _cell_ref(:_cell_reduce_shape), shape,
+        Val(f.reduction.dims), Val(f.reduction.vec), Val(f.reduction.drop)))
     e.shapes[cid] = _cell_bind!(e, :cell_shape, shape)
 end
 
@@ -1985,7 +2284,8 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
     f = d.forms[r.id]
     U = e.unions[cid]
     f.kind === :vcat && return _cell_vcat_window!(e, cid, r, f, U)
-    if f.kind in (:pointwise, :identity, :columns, :hcat, :range_view, :reshape)
+    if f.kind in (:pointwise, :identity, :columns, :hcat, :range_view, :reshape, :reduce,
+                  :transposed)
         push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row),
             _cell_shape!(e, cid), U, e.sorted))
     end

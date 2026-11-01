@@ -855,3 +855,77 @@ end
     @test first(loop_counts) > 0
     @test first(loop_counts) == last(loop_counts)
 end
+
+# The grouped field BRM emits for `hsgp(x; by = g)` (snag
+# `run-brm-s-full-g-2dc0667a`): one group's rows as one pass. The field
+# `vec(sum(PHI .* scaled_z[g, :]; dims = 2))` with `scaled_z = z .*
+# transpose(weights)` is computed at the group's rows; `z` is read at the
+# group's row only, so the footprint and the gradient's support are one row of
+# `z` beside the two scales.
+@kernel _pp_field(u::AbstractVector{Float64}, PHI::Matrix{Float64},
+                  omega2::Vector{Float64}, g::Vector{Int}, y::Vector{Float64}) = begin
+    sigma::Float64 = u[1]
+    rho::Float64 = u[2]
+    zflat::AbstractVector{Float64} = view(u, 3:14)
+    z::AbstractMatrix{Float64} = reshape(zflat, 4, 3)
+    weights = plate(omega2) do w2
+        sigma * (rho * sqrt(2pi))^0.5 * exp(-0.25 * rho^2 * w2)
+    end
+    scaled_z = z .* transpose(weights)
+    rows = scaled_z[g, :]
+    value = vec(sum(PHI .* rows; dims = 2))
+    dens = plate(value, y) do v, yi
+        -(yi - v)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+function _pp_field_data(n; B = 3, G = 4)
+    u = [0.8; 1.3; [0.1 * ((k * 7) % 5 - 2) + 0.05 for k in 1:(G * B)]]
+    PHI = [sin(0.3 * i * b) for i in 1:n, b in 1:B]
+    omega2 = [(b * pi / 2)^2 for b in 1:B]
+    g = [mod1(i, G) for i in 1:n]
+    y = [cos(i / 3) for i in 1:n]
+    (; u, PHI, omega2, g, y)
+end
+
+@testset "plate_partition: a grouped field's rows as one pass" begin
+    spec = plate_partition(_pp_field, :dens; by = :g, index = :label)
+    have = (:u, :PHI, :omega2, :g, :y, :label)
+    d = _pp_field_data(12)
+    full = prepare(_pp_field; have = (:u, :PHI, :omega2, :g, :y), want = :dens)
+    dens = full(d.u, d.PHI, d.omega2, d.g, d.y)
+    bound = prepare(spec; have, want = :partition_total,
+                    bound = (; d.PHI, d.omega2, d.g, d.y))
+    for s in 1:4
+        @test bound(d.u, s) ≈ sum(dens[d.g .== s])
+    end
+    report = partition_locality(bound)
+    @test all(e.status !== :whole for e in report)
+    status(name) = only(e.status for e in report if e.value === name)
+    @test status(:value) === :rows && status(:rows) === :rows
+    @test status(:scaled_z) === :rows && status(:z) === :rows && status(:zflat) === :rows
+    @test status(:weights) === :shared && status(:PHI) === :data
+    # The footprint of `u`: the scales and row `s` of `z` (`reshape(view(u, 3:14), 4, 3)`).
+    for s in 1:4
+        @test partition_footprint(bound, d.u, s).u == [1, 2, 2 + s, 6 + s, 10 + s]
+    end
+    # Native Reverse: exact, with the footprint as its support.
+    ad = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), d.u, 2; active = :u)
+    gradient = similar(d.u)
+    value, _ = ad_value_and_gradient!(ad, gradient, d.u, 2)
+    @test value ≈ bound(d.u, 2)
+    for j in eachindex(d.u)
+        @test gradient[j] ≈ _pp_central(h -> bound(d.u .+ h .* (eachindex(d.u) .== j), 2),
+                                        0.0) atol = 1e-6
+    end
+    @test findall(!iszero, gradient) == partition_footprint(bound, d.u, 2).u
+    # The cost of a group's pass does not grow with the other groups' rows.
+    allocated(n) = let e = _pp_field_data(n),
+            b = prepare(spec; have, want = :partition_total,
+                        bound = (; e.PHI, e.omega2, e.g, e.y))
+        b(e.u, 1)
+        @allocated b(e.u, 1)
+    end
+    @test allocated(12) == allocated(4_000)
+end
