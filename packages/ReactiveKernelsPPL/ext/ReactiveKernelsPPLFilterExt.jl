@@ -102,6 +102,27 @@ function _group_local(ex, g)
     return Expr(ex.head, (_group_local(a, g) for a in ex.args)...)
 end
 
+function _group_domain_value(c,ex,axis)
+    ex isa Integer && return ex
+    ex isa AbstractRange && return ex
+    ex isa Symbol && haskey(c.data,ex) && return getproperty(c.data,ex)
+    if Meta.isexpr(ex,:call)
+        head,args = ex.args[1],ex.args[2:end]
+        if head in (:eachindex,:length) && length(args)==1
+            n = only(args)
+            if n in (c.inputs...,c.observations...)
+                return head === :eachindex ? axis : length(axis)
+            end
+            value = _group_domain_value(c,n,axis)
+            value === nothing || return head === :eachindex ? eachindex(value) : length(value)
+        elseif head === :(:) && length(args)==2
+            lo,hi = map(a -> _group_domain_value(c,a,axis),args)
+            lo isa Integer && hi isa Integer && return lo:hi
+        end
+    end
+    return nothing
+end
+
 # Single-time-slice projection. Every carried read is either current or a
 # statically bounded lag. Whole-trajectory work is not silently truncated.
 function _value(c, ex; time=nothing, seed=false, group=nothing, scalarize=false)
@@ -363,6 +384,10 @@ function _compile_block!(c, block; group=nothing)
             hasproperty(c.groups, g) || _fail("supply fixed groups=(; $g=1:G) for this plate")
             getproperty(c.groups, g) == collect(1:length(getproperty(c.groups,g))) ||
                 _fail("group indices must be contiguous 1:G; retain external labels in frozen data")
+            axis = getproperty(c.groups,g)
+            domain = _group_domain_value(c,loop.args[1].args[2],axis)
+            domain !== nothing && collect(domain)==collect(axis) || _fail(
+                "authored group domain must match groups.$g; use eachindex of a stream port or a fixed bound range")
             oldstates = copy(c.states)
             # A grouped alias loc[g] is one local value in this cell. Its
             # readers use that same local, not indexing into a scalar.

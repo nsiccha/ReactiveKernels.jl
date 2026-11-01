@@ -181,6 +181,18 @@ end
     @test fmean(s,Symbol("g.h");g=1)==1.0
     @test s.predictive_logscore ≈ 0.0 atol=1e-12
     @test_throws ArgumentError filter_step(s,(;);groups=(;g=[4]))
+    subset=@rkppl begin
+        @plate for g in 2:3
+            @scan begin
+                h[1]=0.0
+                for t in 2:T
+                    h[t]=h[t-1]+1
+                end
+            end
+            y[g] .~ Normal.(h,1)
+        end
+    end
+    @test_throws ArgumentError prepare_filter(subset;model_id="domain-mismatch",groups=(;g=1:3))
 end
 
 @rkppl filter_ar(T) = begin

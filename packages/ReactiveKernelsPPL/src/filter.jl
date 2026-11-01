@@ -36,6 +36,8 @@ of fixed-size `@plate` groups. `groups=(;g=1:G)` fixes the plate's group axis;
 `filter_step(...;groups=(;g=[2,5]))` advances only selected groups, each on its
 own clock. Models mixing global and grouped recurrences require synchronized
 slices. All groups share each particle's global parameters.
+The authored plate domain must match that fixed axis: `eachindex`/`length`
+of a stream port or a fixed bound range is supported; domain mismatches fail.
 Arbitrary-history scans, growing groups,
 general whole-trajectory transformations are refused. Omitted observation names
 or `missing` entries skip conditioning but advance selected groups; omitted
