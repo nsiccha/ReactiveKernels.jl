@@ -1,17 +1,24 @@
 """
     prepare_filter_smc(filter_target, calibration::SMCCarriedReference;
-                       parameters, parameter_id, backend)
+                       parameters=nothing, parameter_id=nothing, backend,
+                       calibration_model_id=filter_target.signature.model_id)
 
 Prepare bounded-window parameter learning over an authored finite-state filter.
 `parameters(u)` maps an unconstrained position to the complete constrained
 parameter named tuple expected by `filter_target`; use the model's existing
 prepared parameter transformation. `parameter_id` identifies that pure,
 unchanging mapping and its frozen preprocessing. It must change when they do.
+Omit both to use the native mapping from `carry_smc(completed; parameters=...)`.
 `backend` prepares ordinary AD of the smooth Gaussian reference only. Load the
 SMC and filtering dependencies. No derivative of particle resampling is used.
 
 The same `SMCCarriedReference` can initialize `prepare_smc_window` and this
-filter. Its `frame.model_id` must match the filter's `model_id`. A completed
+filter. Its `frame.model_id` must match `calibration_model_id`. By default this
+is the filter's `model_id`. When a consumer has separately verified that its
+batch and streaming IDs name compatible source/frozen semantics, it can pass
+the exact batch ID explicitly. Both identities remain bound into checkpoints;
+the ordinary filter's identity is unchanged, including for boundary transfer.
+A completed
 SMC cloud is supplied through `carry_smc` (Gaussian moment approximation).
 The prepared target retains no calibration observations or trajectories.
 """

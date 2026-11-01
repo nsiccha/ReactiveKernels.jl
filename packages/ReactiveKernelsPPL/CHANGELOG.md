@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.45
+
+- Add selected-static `carry_smc(completed; parameters=...)` and
+  `smc_parameters(carried, u)`. Completed fits with latent histories can
+  carry only selected parameter moments and portable native geometry;
+  scan coordinates, unused bound data and unused definitions are discarded.
+  The filter uses that constrained-parameter mapping by default.
+- `prepare_filter_smc` accepts an explicit `calibration_model_id` when a
+  consumer's verified batch and streaming identity schemes differ. Both
+  identities remain checked and checkpointed, and the ordinary filter's
+  boundary identity is preserved.
+
 ## 0.1.44
 
 - Add `prepare_filter_smc`, `tune_filter_smc` and `initialize_filter_smc`

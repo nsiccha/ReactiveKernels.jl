@@ -33,15 +33,22 @@ function _filter_reference(calibration, backend)
 end
 
 function PPL.prepare_filter_smc(filter, calibration::SMCCarriedReference;
-        parameters, parameter_id::AbstractString, backend)
-    isempty(parameter_id) && throw(ArgumentError("parameter_id must identify the coordinate mapping"))
-    filter.signature.model_id == calibration.frame.model_id ||
-        throw(ArgumentError("filter and calibration model/preprocessing identities differ"))
+        parameters=nothing, parameter_id=nothing, backend,
+        calibration_model_id::AbstractString=filter.signature.model_id)
+    if parameters===nothing
+        parameters=PPL._smc_parameter_map(calibration)
+        parameter_id===nothing && (parameter_id="carried-native-geometry/v1")
+    end
+    parameter_id isa AbstractString && !isempty(parameter_id) ||
+        throw(ArgumentError("parameter_id must identify the coordinate mapping"))
+    calibration_model_id == calibration.frame.model_id ||
+        throw(ArgumentError("calibration model/preprocessing identity differs from the expected calibration_model_id"))
     proposal = _filter_reference(calibration,backend)
     mapped = parameters(copy(calibration.reference.location))
     typeof(mapped) == typeof(filter.parameters) ||
         throw(ArgumentError("parameter mapping must return the filter's complete parameter schema"))
     signature = deepcopy((; filter=filter.signature, calibration,
+        calibration_model_id=String(calibration_model_id),
         parameter_id=String(parameter_id)))
     return SMCFilterTarget(filter,deepcopy(calibration),parameters,proposal,signature)
 end

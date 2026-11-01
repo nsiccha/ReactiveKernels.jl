@@ -137,7 +137,7 @@ end
 
 """
     carry_smc(target, reference::SMCReference; calibration_id)
-    carry_smc(completed_state; calibration_id, scale=nothing)
+    carry_smc(completed_state; calibration_id, scale=nothing, parameters=nothing)
 
 Copy a normalized Gaussian reference into the target's coordinate frame for
 bounded-window updates. The first form accepts an independently learned
@@ -152,6 +152,17 @@ summary is exact only for a Gaussian posterior with matching moments; fitting
 it from a finite cloud introduces Monte Carlo error too. The cloud itself is
 not retained. This summary is a prior for subsequent windows, not production
 kernel adaptation. Mutation tuning still uses independent pilot RNGs/positions.
+
+`parameters=(:name, Symbol("nested.name"), ...)` selects complete authored
+static parameter blocks from a completed fit, excluding historical scan
+coordinates. The producer packs their unconstrained marginal and carries only
+their portable native geometry. `scale`, if supplied, must be in this selected
+frame; slicing a full correlated scale does not produce its marginal scale.
+Use [`smc_parameters`](@ref) to restore the selected constrained tuple.
+Static transform dependencies must also be selected. Data-only scalar bound
+expressions are folded once, so old observations are not retained. Custom
+geometry containing callable objects is not represented by this native
+projection; use a static-only calibration and an explicit mapping for it.
 """
 function carry_smc end
 

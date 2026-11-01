@@ -383,17 +383,26 @@ end
 PPL.smc_reference(state::SMCState) =
     state.source isa ReferenceTarget ? deepcopy(state.source.reference) : nothing
 
-function PPL.carry_smc(state::SMCState; calibration_id::AbstractString, scale=nothing)
+function PPL.carry_smc(state::SMCState; calibration_id::AbstractString, scale=nothing,parameters=nothing)
     state.temperature == 1 || throw(ArgumentError("complete the bridge before carrying its posterior"))
-    location = state.positions * state.weights
+    isempty(calibration_id) && throw(ArgumentError("calibration_id must identify this posterior summary"))
+    projection=parameters===nothing ? nothing :
+        PPL._smc_parameter_projection(state.target.query.layout,parameters)
+    positions=projection===nothing ? state.positions : view(state.positions,projection.indices,:)
+    location = positions * state.weights
     if scale === nothing
         variance = zeros(length(location))
-        for j in axes(state.positions, 2), i in eachindex(location)
-            variance[i] += state.weights[j] * abs2(state.positions[i,j]-location[i])
+        for j in axes(positions, 2), i in eachindex(location)
+            variance[i] += state.weights[j] * abs2(positions[i,j]-location[i])
         end
         scale = sqrt.(variance)
     end
-    return carry_smc(state.target, SMCReference(location, scale); calibration_id)
+    reference=SMCReference(location,scale)
+    projection===nothing && return carry_smc(state.target,reference;calibration_id)
+    compact=PPL._smc_projection_layout(projection.record)
+    frame=deepcopy((;model_id=state.target.signature.model_id,layout=_layout(compact),
+        parameters=(;layout=projection.record,names=projection.names,paths=projection.output_paths)))
+    return SMCCarriedReference(reference,frame,String(calibration_id))
 end
 
 function PPL.initialize_smc(target::AbstractSMCTarget; rng::Xoshiro, particles::Integer=1000,
