@@ -613,16 +613,18 @@ end
     @test ReactiveKernels._plan_bookkeeping((1, [2, 3]))
     @test !ReactiveKernels._plan_bookkeeping([1.0, 2.0])
     @test !ReactiveKernels._plan_bookkeeping([[1.0]])
-    # Without exemplars the plan reads `u` through the empty stand-ins and
-    # cannot be typed: the requested plan port is refused, never dropped.
-    @test_throws ArgumentError prepare(spec; have = (_PP_HAVE..., :label, :plan),
-                                       want = :partition_total, bound = (; d.g, d.w, d.subject))
+    # This plan's row bookkeeping depends only on bound data and the packed
+    # layout. Final loop axes no longer pull active values into preparation,
+    # so the plan port can also be typed without exemplar values.
+    automatic = prepare(spec; have = (_PP_HAVE..., :label, :plan),
+                        want = :partition_total, bound = (; d.g, d.w, d.subject))
     # The plan kernel of the spec types the port: the same plans, the same values.
     planner = partition_plan_kernel(spec; have = (_PP_HAVE..., :label, :plan),
                                     want = :partition_total, bound = (; d.g, d.w, d.subject))
     typed_plans = Dict(s => planner(d.u, s, nothing) for s in 1:5)
     T = typeof(typed_plans[1])
     @test all(p -> typeof(p) === T, values(typed_plans))
+    @test all(s -> automatic(d.u, s, typed_plans[s]) ≈ plain(d.u, s), 1:5)
     typed = prepare(plate_partition(_pp_subjects, :dens; by = :subject, index = :label,
                                     plan = :plan => T);
                     have = (_PP_HAVE..., :label, :plan), want = :partition_total,
@@ -744,6 +746,44 @@ end
     end
     total = sum(dens)
     return total
+end
+
+@kernel _pp_shape_only_prediction(u::AbstractVector{Float64}, x::AbstractVector{Float64},
+                                  subject::AbstractVector{Int}) = begin
+    a::Float64 = log(u[1])
+    prediction = a .* x
+    dens = plate(prediction) do value
+        value^2
+    end
+    total = sum(dens)
+    return total
+end
+
+@testset "partition planning does not evaluate predictions for loop axes" begin
+    x = [0.2, 0.4, 0.7, 0.9]
+    subject = [1, 2, 1, 2]
+    have = (:u, :x, :subject, :label, :plan)
+    spec = plate_partition(_pp_shape_only_prediction, :dens;
+        by = :subject, index = :label, plan = :plan)
+    planner = partition_plan_kernel(spec; have, want = :partition_total,
+        bound = (; x, subject))
+    # The exemplar gives the needed shapes. Its log is outside the value
+    # domain, but the partition's row bookkeeping does not read that value.
+    p = planner([-1.0], 1, nothing)
+    typed = plate_partition(_pp_shape_only_prediction, :dens;
+        by = :subject, index = :label, plan = :plan => typeof(p))
+    k = prepare(typed; have, want = :partition_total, bound = (; x, subject))
+    for value in (2.0, 4.0)
+        u = [value]
+        expected = log(value)^2 * sum(abs2, x[subject .== 1])
+        @test k(u, 1, p) ≈ expected
+        ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), u, 1, p; active = :u)
+        gradient = similar(u)
+        actual, _ = ad_value_and_gradient!(ad, gradient, u, 1, p)
+        @test actual ≈ expected
+        @test only(gradient) ≈ 2log(value) / value * sum(abs2, x[subject .== 1])
+    end
+    @test_throws DomainError k([-1.0], 1, p)
 end
 
 @testset "partition plans separate fresh buffers from allocation inputs" begin

@@ -1130,6 +1130,30 @@ function _partition_plan_classify(body::Expr, data_names, ops, forced::Set{Symbo
         end
         push!(kinds, kind)
     end
+    # Cache a shape read from active values only when another plan statement
+    # needs it. In particular, a final plate's loop axes belong in the value
+    # kernel: planning them would execute the entire active predictor just to
+    # discover those axes, although no row bookkeeping consumes them. Keep the
+    # original shape expression in the body, preserving its axes and checks.
+    shapes = Dict(st.args[1] => st.args[2] for (k, st) in enumerate(body.args)
+                  if kinds[k] === :shape)
+    refs = Set{Symbol}()
+    for (k, st) in enumerate(body.args)
+        kinds[k] === :plan && _symbol_refs!(refs, st)
+    end
+    needed_shapes = intersect(refs, keys(shapes))
+    pending_shapes = collect(needed_shapes)
+    while !isempty(pending_shapes)
+        name = pop!(pending_shapes)
+        for ref in _symbol_refs!(Set{Symbol}(), shapes[name])
+            haskey(shapes, ref) && !(ref in needed_shapes) || continue
+            push!(needed_shapes, ref)
+            push!(pending_shapes, ref)
+        end
+    end
+    for (k, st) in enumerate(body.args)
+        kinds[k] === :shape && !(st.args[1] in needed_shapes) && (kinds[k] = :main)
+    end
     any(k -> k !== :main, kinds) || return nothing
     # The plan's body: its statements with every statement they depend on (a
     # shape of a value computed from the data needs that value, computed from
@@ -1180,6 +1204,32 @@ end
 _declares_any(st, names::Set{Symbol}) =
     st isa Expr && st.head === :local && !isempty(intersect(_assigned_names!(Set{Symbol}(), st), names))
 
+# Planning and footprint queries reuse the existing row-bookkeeping helpers.
+# Inlining their vector loops and bounds checks at every read makes a wide
+# query's native body much larger than its source. Keep those calls separate
+# here; shape helpers still fold normally, and value/AD bodies are unchanged.
+const _PARTITION_METADATA_HELPERS = Set{Symbol}([
+    :_cell_slice_positions, :_cell_rows_view, :_cell_canonical_rows,
+    :_cell_leaf_row, :_cell_range_rows, :_cell_reshape_rows,
+    :_cell_vcat_part_rows, :_cell_window_positions, :_cell_take_positions,
+    :_cell_union_rows, :_cell_union_rows_sorted, :_cell_gather_row,
+    :_cell_factor_rows, :_cell_check_row, :_partition_check_rows, :_partition_rows,
+])
+function _partition_metadata_calls(body::Expr)
+    function annotate(ex)
+        ex isa Expr || return ex
+        ex.head === :quote && return ex
+        call = Expr(ex.head, (annotate(a) for a in ex.args)...)
+        if ex.head === :call && ex.args[1] isa GlobalRef &&
+                ex.args[1].mod === (@__MODULE__) &&
+                ex.args[1].name in _PARTITION_METADATA_HELPERS
+            return Expr(:macrocall, GlobalRef(Base, Symbol("@noinline")), LineNumberNode(0), call)
+        end
+        call
+    end
+    macroexpand(@__MODULE__, annotate(body))
+end
+
 # The body of a kernel whose partition has a plan port: in plan mode the plan's
 # statements returning the named tuple of plan fields; otherwise the rest of
 # the body reading those fields from the port, typed by the plan function's
@@ -1216,6 +1266,7 @@ function _partition_plan_lowering(p::Plan, body::Expr, argexprs, runtime_ops, nm
     plan_body = Expr(:block, plan..., Expr(:return, Expr(:call,
         Expr(:curly, GlobalRef(Core, :NamedTuple), Expr(:tuple, (QuoteNode(f) for f in fields)...)),
         Expr(:tuple, needed..., Expr(:tuple, guards...)))))
+    plan_body = _partition_metadata_calls(plan_body)
     plan_mode && return plan_body
     # The port's declared type names the plan's type (`plate_partition(…;
     # plan = port => T)`, T the type of a plan the plan kernel computed); an
