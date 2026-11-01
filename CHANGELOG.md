@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.46
+
+- Keep cell capture reads local through a scan's unchanged shared arguments.
+  A scan reading `sigma[rows[i]]` inside subject cell `i` now computes
+  row-wise sigma producers at that subject's rows, with the same structural
+  footprint and ordinary native Reverse derivatives. Bound indices and known
+  shapes must prove the reads valid, since an empty scan executes no steps.
+  Unknown or invalid proofs retain whole captures; scan carry, history and
+  iterated elements are not treated as unchanged cell indices. This repairs
+  foreign sigma-effect reads in BRM's grouped AR1 likelihood without changing
+  its model (`prepare-a-strict-3790e275`).
+
 ## 0.1.45
 
 - Row forms for the grouped field BayesianRegressionModels emits for

@@ -1334,14 +1334,54 @@ end
 _cell_positions_type(T) =
     T <: AbstractArray{<:Integer} || T <: AbstractArray{<:AbstractVector{<:Integer}}
 
+# Resolve an unchanged outer-cell argument, including a linear index alias.
+function _cell_capture_root(inner::Plan, roots, input)
+    ig = inner.graph
+    cid = canon_id(ig, input.id)
+    k = findfirst(==(cid), roots)
+    k === nothing || return k
+    # `vec` preserves linear positions, including when the alias crosses a
+    # scan's shared-argument boundary.
+    for producer in inner.recipes
+        length(producer.outputs) == 1 &&
+            canon_id(ig, only(producer.outputs).id) == cid || continue
+        if producer.op === Base.vec && length(producer.inputs) == 1
+            return findfirst(==(canon_id(ig, only(producer.inputs).id)), roots)
+        end
+        analyzed = _cell_native(producer)
+        analyzed === nothing && return nothing
+        native, params, _ = analyzed
+        length(params) == 1 &&
+            native == Expr(:call, GlobalRef(Base, :vec), only(params)) || return nothing
+        return findfirst(==(canon_id(ig, only(producer.inputs).id)), roots)
+    end
+    nothing
+end
+
+# Child formals that receive their parent's input unchanged. A scan's carry,
+# iterated elements and history are deliberately absent: they are not the
+# outer cell's indices or captures. A step may never run, so its capture
+# reads need the same bound-index proof as a lazy branch.
+_cell_capture_body(op, n) = nothing
+function _cell_capture_body(op::_AuthoredScanOp, n)
+    atomic = typeof(op).parameters[2]
+    last = n - _scan_has_history(op)
+    iterated = count(i -> !(i in atomic), 2:last)
+    shared = [i for i in 2:last if i in atomic]
+    pairs = [1 + iterated + j => i for (j, i) in enumerate(shared)]
+    (op.kernel.plan, pairs, true)
+end
+
 # How the plate body reads shared argument `cid`: only as `v[q]` or `v[w[q]]`,
 # `q` the element of a batched argument `b`, `w` one other shared argument.
 # Each distinct read `(b, w)`, `w = 0` for `v[q]`, in first-read order, or
-# `nothing`. A value read through several batched arguments is read at the
-# rows of each: the plates of one `@plate for` loop's outputs, each over a
-# domain of its own, compose into one cell that reads it through each domain.
-function _cell_capture_reader(inner::Plan, roots, atomic, cid; branch_read = nothing)
+# `nothing`. Nested scans retain the outer root numbering for unchanged
+# shared arguments; their carried and iterated values acquire no root.
+# A value read through several batched arguments is read at the rows of each.
+function _cell_capture_reader(inner::Plan, roots, atomic, cid;
+        branch_read = nothing, guarded = false)
     ig = inner.graph
+    any(v -> canon_id(ig, v.id) == cid, inner.want) && return nothing
     found = Tuple{Int,Int}[]
     root(params, recipe, name) = let j = findfirst(==(name), params)
         j === nothing ? nothing : findfirst(==(canon_id(ig, recipe.inputs[j].id)), roots)
@@ -1353,23 +1393,33 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid; branch_read = not
         k === nothing || return k
         j = findfirst(==(name), params)
         j === nothing && return nothing
-        # Keep the captured value's `cid` unchanged while resolving this
-        # index alias: later recipes may read the capture through other lanes.
-        via_id = canon_id(ig, recipe.inputs[j].id)
-        for producer in inner.recipes
-            length(producer.outputs) == 1 &&
-                canon_id(ig, only(producer.outputs).id) == via_id || continue
-            analyzed = _cell_native(producer)
-            analyzed === nothing && return nothing
-            native, vec_params, _ = analyzed
-            native == Expr(:call, GlobalRef(Base, :vec), only(vec_params)) || return nothing
-            return findfirst(==(canon_id(ig, only(producer.inputs).id)), roots)
-        end
-        nothing
+        _cell_capture_root(inner, roots, recipe.inputs[j])
     end
     for recipe in inner.recipes
         slots = findall(_input_list(v -> canon_id(ig, v.id) == cid, recipe.inputs))
         isempty(slots) && continue
+        nested = _cell_capture_body(recipe.op, length(recipe.inputs))
+        if nested !== nothing
+            child, pairs, conditional = nested
+            all(s -> any(p -> last(p) == s, pairs), slots) || return nothing
+            child_roots = Union{Nothing,ValueId}[nothing for _ in roots]
+            for (j, s) in pairs
+                k = _cell_capture_root(inner, roots, recipe.inputs[s])
+                k === nothing && continue
+                id = canon_id(child.graph, child.have[j].id)
+                child_roots[k] in (nothing, id) || return nothing
+                child_roots[k] = id
+            end
+            k = findfirst(==(cid), roots)
+            k === nothing && return nothing
+            reads = _cell_capture_reader(child, child_roots, atomic, child_roots[k];
+                branch_read, guarded = guarded || conditional)
+            reads === nothing && return nothing
+            for read in reads
+                read in found || push!(found, read)
+            end
+            continue
+        end
         recipe.op isa _KernelSourceOp || return nothing
         branch = recipe.op.f isa _KernelBranch
         analyzed = _cell_native(recipe; branches = branch_read !== nothing)
@@ -1378,7 +1428,7 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid; branch_read = not
         reads = Any[]
         tails = Any[]
         _cell_capture_reads!(reads, native, Set(params[slots]), mod;
-            tails = branch ? tails : nothing) || return nothing
+            tails = branch || guarded ? tails : nothing) || return nothing
         for (j, read) in enumerate(reads)
             q, via = read isa Symbol ? (read, nothing) : (read.args[2], read.args[1])
             b = root(params, recipe, q)
@@ -1387,7 +1437,7 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid; branch_read = not
             (w === nothing || (w != 0 && !(w in atomic)) || w == b) && return nothing
             # A branch may not force an inactive index lookup: both the
             # optional shared lookup and its result must be bound and valid.
-            if branch
+            if branch || guarded
                 branch_read !== nothing && branch_read(b, w, tails[j]) || return nothing
             end
             (b, w) in found || push!(found, (b, w))
