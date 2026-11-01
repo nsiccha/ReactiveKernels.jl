@@ -738,7 +738,10 @@ the evaluation reads the port whole (a scalar port, a port read by a value
 computed whole). The positions follow from the bound index data and the
 label or cell index by the same row analysis that computes the evaluation:
 a lazy branch contributes both arms, a bound-indexed read its constant
-positions. For a partition or cell of a packed parameter vector this is its structural read
+positions. Retained branches use capture row windows when bound indices
+prove both arms' requests in range; unproven requests may conservatively
+contribute the whole capture. Arm arithmetic remains lazy.
+For a partition or cell of a packed parameter vector this is its structural read
 set, a conservative support for its gradient; numerical zeros and
 cancellations do not remove positions. This also works on a `plate_cell`
 kernel, with its cell index among `args`. For a planned partition, pass

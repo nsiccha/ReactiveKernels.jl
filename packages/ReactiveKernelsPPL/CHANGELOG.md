@@ -16,6 +16,41 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.42
+
+- Add independent, pre-production pilot tuning with `tune_smc`, a data-only
+  `SMCTuningSchedule` and `SMCOptions(tuning=...)`. The fixed kernel chosen for
+  each production stage depends only on temperature and the prepared schedule.
+  Schedules validate their exact bridge identities and normalized reference;
+  cumulative updates require fresh tuning or explicit untuned options.
+  `smc_reference` returns an owned reference for initial bridges. Checkpoints
+  retain tuning without rerunning pilots. Bounded stage summaries record the
+  selected kernel, evaluation count, mean acceptance and particle displacement.
+- Support normalized correlated `SMCReference`s and fixed NUTS metrics from
+  WarmupHMC's plain bounded-reflection scale data. `pilot=:adaptive` learns a
+  portable active scale with its paired step size at each fixed temperature;
+  optional `reference=:pilot` learns and freezes a normalized reference before
+  the grid pilots and production. Explicit independent RNG/initial positions,
+  bounded geometry/recording pools and data-only checkpoints preserve the
+  separation from production adaptation. Requires WarmupHMC 0.2.9.
+
+## 0.1.41
+
+- Preserve row-local coordinate supports for retained conditional cell
+  predictors such as `a > 0 ? z[group[i],1] : z[group[i],2]`, including named
+  gathered columns and ragged index vectors. Footprints union both arms
+  when bound indices prove their reads in range; otherwise the conservative
+  whole-block support remains. Values, native Reverse and inactive-error
+  semantics are unchanged. Requires ReactiveKernels 0.1.44.
+
+## 0.1.40
+
+- Fix ordinary cell queries for a named summand such as
+  `terms = exp.(eta[r1[k]])` followed by `sum(terms)` and
+  `sum(eta[r2[k]] .^ 2)`. Both gathers contribute their rows to the shared
+  predictor window; earlier versions could omit the second gather's rows
+  and throw `BoundsError`. Require ReactiveKernels 0.1.43 for this repair.
+
 ## 0.1.39
 
 - Preserve strict cell and partition locality through nested data-only calls
