@@ -141,6 +141,14 @@ _code_valued(statement) =
     statement isa Expr && statement.head in (:call, :invoke, :new, :foreigncall, :splatnew) ||
     statement isa Core.PhiNode || statement isa Core.PiNode || statement isa GlobalRef
 
+# Julia 1.14 also embeds resolved global bindings in optimized IR. Query
+# the inferred partition, preserving its world, rather than the current global.
+@static if isdefined(Core.Compiler, :partition_singleton)
+    _code_callee(ci, x::Core.BindingPartition) = Core.Compiler.partition_singleton(x)
+    _code_argument_type(ci, x::Core.BindingPartition) = Core.Compiler.partition_rt_widened(x)
+    _code_valued(::Core.BindingPartition) = true
+end
+
 function _code_method_instance(statement::Expr)
     mi = statement.args[1]
     isdefined(Core, :CodeInstance) && mi isa Core.CodeInstance && (mi = mi.def)
@@ -185,7 +193,7 @@ function _code_inlining_chain(ci::Core.CodeInfo, i)
     if isdefined(ci, :debuginfo)
         info, pc = ci.debuginfo, i
         while true
-            _, edge, edge_pc = Base.IRShow.getdebugidx(info, pc)
+            _, edge, edge_pc = Core.Compiler.getdebugidx(info, pc)
             (edge == 0 || edge_pc <= 0) && break
             info, pc = info.edges[Int(edge)], Int(edge_pc)
             push!(chain, _code_frame_name(info.def))
@@ -283,6 +291,10 @@ function _code_audit!(found, seen, @nospecialize(tt), where, recurse)
         live, reads = _code_returning(ci), _code_used(ci)
         for (i, statement) in enumerate(ci.code)
             live[i] || continue
+            # A return produces no SSA value or call to audit; its operand's
+            # producer is checked separately. Julia can synthesize a lone
+            # constant return with an SSA count instead of a type vector.
+            statement isa Core.ReturnNode && continue
             T = _code_widen(ci.ssavaluetypes[i])
             unstable = reads[i] && _code_valued(statement) && !_code_stable(T)
             dynamic = statement isa Expr && _code_dynamic(ci, statement)
