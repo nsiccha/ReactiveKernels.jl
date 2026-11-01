@@ -404,18 +404,16 @@ function _compile_block!(c, block; group=nothing)
             domain !== nothing && collect(domain)==collect(axis) || _fail(
                 "authored group domain must match groups.$g; use eachindex of a stream port or a fixed bound range")
             oldstates = copy(c.states)
-            # A grouped alias loc[g] is one local value in this cell. Its
-            # readers use that same local, not indexing into a scalar.
+            # Indexed outputs connect successive authored plates. Keep one
+            # current value per group, with no temporal history. Declare the
+            # buffers outside the loop so later plates share their scope.
             localnames = Set{Symbol}()
             for item in _stmts(loop.args[2])
                 Meta.isexpr(item,:(=),2) && Meta.isexpr(item.args[1],:ref,2) &&
                     item.args[1].args[2] == g && push!(localnames,item.args[1].args[1])
             end
-            function localize(ex)
-                Meta.isexpr(ex,:ref,2) && ex.args[1] in localnames && ex.args[2] == g && return ex.args[1]
-                ex isa Expr ? Expr(ex.head,map(localize,ex.args)...) : ex
-            end
-            body = _compile_block!(c, localize(loop.args[2]); group=g)
+            isempty(localnames) || push!(result,Expr(:local,sort!(collect(localnames);by=string)...))
+            body = _compile_block!(c, loop.args[2]; group=g)
             c.states = oldstates
             inputbindings = [Expr(:(=),n,_ref(_field(:_filter_inputs,n),g)) for n in c.inputs]
             push!(result, quote
@@ -427,10 +425,24 @@ function _compile_block!(c, block; group=nothing)
                 _filter_time = _filter_global_time
             end)
         elseif Meta.isexpr(st, :(=), 2)
-            (st.args[1] in horizons || haskey(c.data,st.args[1])) && continue
             lhs = st.args[1]
+            lhs isa Symbol && (lhs in horizons || haskey(c.data,lhs)) && continue
             if group !== nothing && Meta.isexpr(lhs, :ref, 2) && lhs.args[2] == group
-                lhs = lhs.args[1]
+                value = _value(c,st.args[2];group,scalarize=true)
+                name = lhs.args[1]
+                name isa Symbol || _fail("group output must have a named array")
+                temporary = gensym(:group_output)
+                active = _field(:_filter_active,group)
+                count = length(getproperty(c.groups,group))
+                push!(result,quote
+                    $temporary = $value
+                    if $group == $(GlobalRef(Base,:first))($active)
+                        $name = $(GlobalRef(Base,:Vector)){$(GlobalRef(Core,:typeof))($temporary)}(
+                            $(GlobalRef(Core,:undef)),$count)
+                    end
+                    $lhs = $temporary
+                end)
+                continue
             end
             lhs isa Symbol || _fail("only scalar definitions are supported outside scans")
             push!(result, Expr(:(=), lhs, _value(c, st.args[2]; group, scalarize=true)))

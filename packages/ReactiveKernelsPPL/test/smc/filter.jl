@@ -297,9 +297,9 @@ end
     return sum(values)
 end
 
-function inferred_filter_transition(target,carry,inputs,observation)
+function inferred_filter_transition(target,carry,inputs,observation;times=(;),active=(;))
     @inferred target.advance(Xoshiro(1),carry,target.parameters,target.data,inputs,
-        observation,2,target.operations,(;),(;))
+        observation,2,target.operations,times,active)
 end
 
 @testset "Authored kernel provider and frozen preprocessing" begin
@@ -377,6 +377,52 @@ end
     @test other.signature==target.signature
     @test filter_checkpoint(filter_step(resume_filter(other,roundtrip_filter(filter_checkpoint(s))),
         (;y=0.2);inputs=(;x=0.8)))==filter_checkpoint(filter_step(s,(;y=0.2);inputs=(;x=0.8)))
+end
+
+@testset "Grouped drift outputs shared by successive plates" begin
+    model=@rkppl begin
+        @plate for i in eachindex(y_cell_input_y)
+            @scan begin
+                coefficient[1] ~ Normal(0,1)
+                for t in 2:T
+                    coefficient[t] ~ Normal(coefficient[t-1],0.35)
+                end
+            end
+            y_cell_argument_y_1[i]=coefficient
+        end
+        y_cell_argument_y_2=0.2
+        @plate for i in eachindex(y)
+            y[i] .~ Normal.(y_cell_argument_y_1[i],y_cell_argument_y_2)
+        end
+    end
+    training=[zeros(3),zeros(3)]
+    bound=model(;T=3,y_cell_input_y=training)|(;y=training)
+    target=prepare_filter(model,bound;model_id="grouped-drift",groups=(;i=1:2),
+        drifting=(Symbol("i.coefficient"),))
+    @test !haskey(target.data,:y_cell_input_y)
+    @test !haskey(target.data,:y)
+    @test !haskey(target.data,:T)
+    @test Base.invokelatest(inferred_filter_transition,target,target.prototype,(;),(;y=[0.1,0.2]);
+        times=(;i=[0,0]),active=(;i=[1,2])) isa Tuple
+    @test Base.invokelatest(inferred_filter_transition,target,target.prototype,(;),(;);
+        times=(;i=[0,0]),active=(;i=Int[]))==(target.prototype,0.0)
+    s=initialize_filter(target;rng=Xoshiro(37),particles=8192,history_limit=2)
+    means=zeros(2); variances=zeros(2); counts=zeros(Int,2)
+    for (g,y) in [(1,0.1),(2,-0.1),(1,0.4),(1,0.5),(2,0.2),(2,0.6)]
+        v=counts[g]==0 ? 1.0 : variances[g]+0.35^2
+        expected=logpdf(Normal(means[g],sqrt(v+0.2^2)),y)
+        values=Union{Missing,Float64}[missing,missing]; values[g]=y
+        s=filter_step(s,(;y=values);groups=(;i=[g]))
+        @test abs(s.predictive_logscore-expected)<0.12
+        # Inactive groups keep their clocks despite joint-particle resampling.
+        @test s.group_times.i[3-g]==counts[3-g]
+        gain=v/(v+0.2^2)
+        means[g]+=gain*(y-means[g]); variances[g]=(1-gain)*v; counts[g]+=1
+        @test abs(fmean(s,Symbol("i.coefficient");g)-means[g])<0.04
+    end
+    cp=roundtrip_filter(filter_checkpoint(s))
+    @test filter_checkpoint(filter_step(s,(;y=[0.7,0.8])))==
+        filter_checkpoint(filter_step(resume_filter(target,cp),(;y=[0.7,0.8])))
 end
 
 const filter_work=Ref(0)
