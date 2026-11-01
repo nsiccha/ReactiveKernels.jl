@@ -990,8 +990,14 @@ cell, as a total over a group of rows reads them), and a matrix the cell
 reads a row of, `M[i, :]` (every later index the whole axis `:`), computed at
 that row. A capture whose index is not provably an integer position or a
 vector of them (an undeclared, unbound port) is read whole, and the locality
-report names it (`:untyped_index`). The native lowering supports these
-producers:
+report names it (`:untyped_index`). These capture reads can also occur inside
+a scan in the cell: unchanged shared arguments retain their outer cell
+indices, including shared index arrays passed through `vec`. Bound indices
+and known shapes must prove the requested rows valid, because an empty scan
+runs no step. Unknown or invalid proofs keep the whole capture, preserving
+inactive invalid accesses. The scan's carry, history and iterated elements
+are not treated as unchanged outer indices. The native lowering supports
+these producers:
 
 - a dotted expression of inputs, numeric literals, gathers `A[I]` or
   `A[I, k]` (an integer vector input `I`, integer literals `k`), column reads
