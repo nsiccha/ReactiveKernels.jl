@@ -1208,6 +1208,10 @@ function _cell_plate_output_type(op::_AuthoredPlateOp, input_types)
     element isa Type && element !== Any && element !== Union{} || return Any
     atomic = Val(typeof(op).parameters[2])
     array = _plate_array_type(element, atomic, input_types...)
+    # This is the actual allocation type, before any abstract-array stand-in.
+    # Retain it so type-only branches can be proved without assuming that an
+    # arbitrary AbstractArray uses Base's eltype or other methods.
+    isconcretetype(array) && return array
     # Abstract array containers may hide `similar`'s result, as they hide a
     # broadcast's. The same element/rank stand-ins used below recover rank.
     array === Any && (array = _plate_array_type(element, atomic,
@@ -2064,6 +2068,17 @@ is dropped for good otherwise. `p` itself when nothing is outlined.
 """
 function _cell_outlined_pushdowns(p::Plan)
     any(r -> r.op isa _AuthoredPlateCellOp, p.recipes) || return p, nothing
+    if any(r -> r.op isa _KernelSourceOp && r.op.f isa _KernelBranch, p.recipes)
+        types = _cell_value_types(p)
+        recipes = map(p.recipes) do r
+            selected = _type_selected_branch(r,
+                Any[get(types, canon_id(p.graph, v.id), Any) for v in r.inputs])
+            selected === nothing ? r : selected.recipe
+        end
+        if any(pair -> pair[1] !== pair[2], zip(recipes, p.recipes))
+            p = _partial_subplan(p, p.have, p.want, recipes)
+        end
+    end
     p, scalar_outlined = _cell_scalar_reads(p)
     known = IdDict{Recipe,Any}()
     byid = Dict(r.id => r for r in p.recipes)

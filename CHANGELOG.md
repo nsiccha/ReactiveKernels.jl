@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.49
+
+- Preserve a visible lazy branch's selected shape and row form when concrete
+  input types prove its condition. A scalar plate passed through a collector
+  such as `eltype(cells) <: Number ? cells : reduce(vcat, cells)` retains
+  strict selected-row locality through a following broadcast offset, with
+  ordinary native Reverse derivatives. Analysis executes no condition or arm;
+  runtime and effectful conditions retain their authored behavior.
+
 ## 0.1.48
 
 - Preserve strict row locality when splitting shared partition prefixes.

@@ -244,6 +244,7 @@ const _PPL_TEST_FILES = (
     "test_shared_value_lifecycle.jl",
     "test_scalar_partition_reads.jl",
     "test_cell_kernel_design.jl",
+    "test_cell_type_branches.jl",
     "test_cell_tuple_geometry.jl",
     "test_query_footprints.jl",
     "test_compact_cell_derivatives.jl",

@@ -1121,6 +1121,15 @@ Three more cover the grouped field BayesianRegressionModels emits for an
 
 ### Locality: named, not silent
 
+A visible kernel's lazy branch retains the selected arm's shape and row
+form when its condition is proved constant from concrete input types alone.
+For example, a collector written as `eltype(cells) <: Number ? cells :
+reduce(vcat, cells)` passes a scalar plate's vector through to its reader;
+one selected row needs only that plate iteration. Conditions that inspect
+values or have effects remain dynamic. Analysis evaluates neither the
+condition nor an arm, and does not infer row locality for the vector-flattening
+arm merely because the scalar arm is local.
+
 A value a cell reads at its rows but whose producer has no row form was
 computed whole in every cell, silently. The rule is now checked at
 preparation: a value that every reader of the evaluation needs only at some
