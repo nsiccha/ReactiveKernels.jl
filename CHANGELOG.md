@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.44
+
+- Keep cell footprints precise through retained lazy branches when bound
+  index data proves both arms' capture reads in range. Direct matrix reads,
+  named gathered columns and shared ragged index vectors use the existing
+  row windows; structural supports union both arms while arithmetic stays
+  lazy. Unknown or invalid index proofs retain conservative whole-capture
+  reads, preserving inactive-error safety and ordinary derivatives.
+
 ## 0.1.43
 
 - Preserve all row requests when separate cell expressions read a shared

@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.41
+
+- Preserve row-local coordinate supports for retained conditional cell
+  predictors such as `a > 0 ? z[group[i],1] : z[group[i],2]`, including named
+  gathered columns and ragged index vectors. Footprints union both arms
+  when bound indices prove their reads in range; otherwise the conservative
+  whole-block support remains. Values, native Reverse and inactive-error
+  semantics are unchanged. Requires ReactiveKernels 0.1.44.
+
 ## 0.1.40
 
 - Fix ordinary cell queries for a named summand such as
