@@ -1176,7 +1176,7 @@ preparation: all cells whose key equals a label, as one compiled pass
 (RK `plate_partition`). Construct with [`prepare_partition`](@ref); call as
 `q(u, label)`. Not thread-safe: prepare one per thread.
 """
-mutable struct PartitionQuery{K,L}
+mutable struct PartitionQuery{K,L,T}
     const kernel::K
     const layout::L
     const observations::Tuple{Vararg{Symbol}}
@@ -1185,7 +1185,7 @@ mutable struct PartitionQuery{K,L}
     # Each label's plan (`ReactiveKernels.partition_plan`), computed at
     # preparation; a label without one is planned on the spot, which refuses
     # a label no observation has.
-    const plans::Dict{Any,Any}
+    const plans::Dict{Any,T}
 end
 
 (q::PartitionQuery)(u::AbstractVector{Float64}, label) =
@@ -1219,7 +1219,10 @@ function _partition_plans_each(plan_of, labels)
     types = unique!(Any[typeof(plan) for plan in values(plans)])
     length(types) == 1 || throw(ContractValidationError(
         "[query] the partition plans have several types: $(join(types, ", "))"))
-    plans, only(types)
+    # Preparation already requires one plan type across all labels. Preserve
+    # it at lookup rather than boxing the plan again on every evaluation.
+    plan_type = only(types)
+    Dict{Any,plan_type}(plans), plan_type
 end
 const _PARTITION_TOTAL = :_ppl_partition_total
 
@@ -1375,7 +1378,7 @@ whole packed vector. Construct with [`prepare_partition_sampler`](@ref); use
 [`partition_value_and_gradient!`](@ref) and [`partition_footprint`](@ref).
 Not thread-safe: prepare one per thread.
 """
-mutable struct PartitionSampler{K,P,L,C}
+mutable struct PartitionSampler{K,P,L,C,T}
     const kernel::K
     const ad::P
     const layout::L
@@ -1394,7 +1397,7 @@ mutable struct PartitionSampler{K,P,L,C}
     const active::Vector{Float64}
     const gradient::Vector{Float64}
     # Each label's plan of the differentiated kernel (`partition_plan`).
-    const plans::Dict{Any,Any}
+    const plans::Dict{Any,T}
     const prefix::C
     value::Float64
 end
@@ -1826,22 +1829,22 @@ end
 function _shared_partition_gradient!(s::PartitionSampler, g, u, label, shared)
     cache = s.prefix
     cached = _refresh_partition_prefix!(cache, u)
+    plan = _partition_plan_of(s, label)
+    ad = _partition_ad(s.ad, label)
     if _compact(s)
         selection = s.selections[label]
         _select_partition!(s, selection)
         for (i, position) in enumerate(selection)
             s.active[i] = u[position]
         end
+        return _shared_partition_evaluate!(s, g, u, label, shared,
+            ad, u, s.active, s.slots, label, plan, cached...)
     end
-    args = _compact(s) ? (u, s.active, s.slots, label, _partition_plan_of(s, label), cached...) :
-                        (u, label, _partition_plan_of(s, label), cached...)
-    _shared_partition_evaluate!(s, g, u, label, shared,
-        _partition_ad(s.ad, label), args...)
+    _shared_partition_evaluate!(s, g, u, label, shared, ad, u, label, plan, cached...)
 end
 
-# Plans are stored behind an abstract dictionary value. Cross this function
-# boundary before evaluating AD so the plan, frontier and operator types
-# specialize together, including when the label column mixes concrete types.
+# Keep each call's argument tuple length concrete, and specialize together on
+# its plan, frontier and AD operator even when label types differ.
 function _shared_partition_evaluate!(s, g, u, label, shared,
         ad, args::Vararg{Any,N}) where {N}
     value, derivatives = ad_value_and_gradient(ad, args...)
