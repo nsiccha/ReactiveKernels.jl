@@ -1,7 +1,7 @@
 name = "ReactiveKernelsPPL"
 uuid = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.47"
+version = "0.1.48"
 
 [deps]
 DataAPI = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
@@ -36,7 +36,7 @@ LogExpFunctions = "0.3, 1.0.2"
 LogDensityProblems = "2"
 Random = "1"
 SequentialMonteCarlo = "0.7"
-WarmupHMC = "0.2.9"
+WarmupHMC = "0.2.10"
 PrecompileTools = "1.2"
 ReactiveKernels = "0.1.47"
 ReactiveKernelsDistributionKernels = "0.1"

@@ -39,10 +39,19 @@ _metric(scale::NamedTuple) = WarmupHMC.scale_from_data(scale)
 
 include("smc_spread.jl")
 
-struct SMCTarget{Q,B,S}
+abstract type AbstractSMCTarget end
+
+struct SMCTarget{Q,B,S} <: AbstractSMCTarget
     query::Q
     backend::B
     signature::S
+end
+
+struct SMCWindowTarget{Q,B,S,R} <: AbstractSMCTarget
+    query::Q
+    backend::B
+    signature::S
+    prior::R
 end
 
 # Geometry metadata is structural; neither one entry per data row nor a dense
@@ -53,6 +62,18 @@ _sampling_id(s) = (; s.rhs, s.broadcast, s.constructor_broadcast)
 _entry(e) = (e.kind, e.predictor, e.name, e.labels, e.offset, e.size,
     e.transform, e.lo, e.hi, e.dims, map(_entry, e.scan_blocks), _sampling_id(e.sampling))
 _layout(layout) = (layout.total, map(_entry, layout.entries), layout.name_paths)
+
+_frame(target::AbstractSMCTarget) =
+    (; model_id=target.signature.model_id, layout=target.signature.layout)
+
+function PPL.carry_smc(target::AbstractSMCTarget, reference::SMCReference;
+        calibration_id::AbstractString)
+    isempty(calibration_id) && throw(ArgumentError("calibration_id must identify the carried posterior"))
+    length(reference.location) == target.query.layout.total ||
+        throw(DimensionMismatch("carried reference and target dimensions differ"))
+    return SMCCarriedReference(SMCReference(reference.location, reference.scale),
+        deepcopy(_frame(target)), String(calibration_id))
+end
 
 function PPL.prepare_smc(built, binding::StructuralPlan, u0::AbstractVector;
         backend, model_id::AbstractString, binding_id::AbstractString, kwargs...)
@@ -100,11 +121,48 @@ function _reference(target, reference)
     return ReferenceTarget(r, kernel, ad, arguments, _reference_sd(r.scale))
 end
 
+function PPL.prepare_smc_window(built, binding::StructuralPlan, u0::AbstractVector;
+        previous::SMCCarriedReference, backend, model_id::AbstractString,
+        binding_id::AbstractString, warm::Bool=false)
+    isempty(model_id) && throw(ArgumentError("model_id must name the model and coordinate frame"))
+    isempty(binding_id) && throw(ArgumentError("binding_id must name the exact new window"))
+    isempty(previous.calibration_id) && throw(ArgumentError("carried calibration identity is empty"))
+    hasproperty(built, :program) || throw(ArgumentError("prepare_smc_window needs a build_kernel result"))
+    length(u0) == built.layout.total || throw(DimensionMismatch("exemplar and window dimensions differ"))
+    frame = (; model_id=String(model_id), layout=_layout(built.layout))
+    _compatible(previous.frame, frame)
+    u = Vector{Float64}(u0)
+    kernel = ReactiveKernels._kernel_latest_prepared(
+        prepare_query(built, binding, :likelihood; exemplars=(u,)))
+    ad = Base.invokelatest(prepare_ad, kernel, backend, u; active=:unconstrained, warm)
+    query = SamplerQuery(kernel, ad, built.layout)
+    carried = carry_smc(SMCTarget(query, backend, frame), previous.reference;
+        calibration_id=previous.calibration_id)
+    signature = deepcopy((; model_id=String(model_id), binding_id=String(binding_id),
+        program=built.program, layout=frame.layout,
+        carried=(; reference=carried.reference, frame=carried.frame,
+            calibration_id=carried.calibration_id)))
+    prior = _reference(SMCTarget(query, backend, signature), carried.reference)
+    return SMCWindowTarget(query, backend, signature, prior)
+end
+
 _density(t::SMCTarget, u) = t.query(u)
 _density(t::ReferenceTarget, u) = Base.invokelatest(t.kernel, u, t.arguments...)::Float64
 _gradient(t::SMCTarget, g, u) = first(sampler_value_and_gradient!(t.query, g, u))
 _gradient(t::ReferenceTarget, g, u) = first(Base.invokelatest(ad_value_and_gradient!,
     t.ad, g, u, t.arguments...))
+_density(t::SMCWindowTarget, u) = _density(t.prior, u) + t.query(u)
+function _gradient(t::SMCWindowTarget, g, u)
+    value = first(sampler_value_and_gradient!(t.query, g, u))
+    h = similar(g)
+    value += _gradient(t.prior, h, u)
+    g .+= h
+    return value
+end
+
+_default_reference(t::SMCTarget) =
+    SMCReference(zeros(t.query.layout.total), ones(t.query.layout.total))
+_default_reference(t::SMCWindowTarget) = deepcopy(t.prior.reference)
 
 function _checked(value, u, endpoint, temperature, gradient=nothing)
     (isfinite(value) || value == -Inf) ||
@@ -244,7 +302,7 @@ function _stage_kernel(options, d, beta)
     return tuning.kernels[i], i
 end
 
-function PPL.tune_smc(target::SMCTarget; rng::Xoshiro, init::AbstractVector,
+function PPL.tune_smc(target::AbstractSMCTarget; rng::Xoshiro, init::AbstractVector,
         reference=nothing, previous=nothing, reference_inflation::Real=2.0,
         temperatures=(0.0, 1e-6, 1e-5, 1e-4, 1e-3, 0.01, 0.1, 0.5, 1.0),
         pilot_steps::Integer=64, pilot::Symbol=:continuous,
@@ -281,9 +339,9 @@ function PPL.tune_smc(target::SMCTarget; rng::Xoshiro, init::AbstractVector,
     reference === nothing || reference isa SMCReference ||
         throw(ArgumentError("reference must be SMCReference, :pilot, or nothing"))
     source = if previous === nothing
-        _reference(target, reference === nothing ? SMCReference(zeros(d), ones(d)) : reference)
+        _reference(target, reference === nothing ? _default_reference(target) : reference)
     else
-        previous isa SMCTarget || throw(ArgumentError("previous must be a prepared target, not a particle cloud"))
+        previous isa AbstractSMCTarget || throw(ArgumentError("previous must be a prepared target, not a particle cloud"))
         reference === nothing || throw(ArgumentError("posterior update tuning takes no reference"))
         _compatible(previous.signature, target.signature)
         previous
@@ -363,12 +421,49 @@ end
 PPL.smc_reference(state::SMCState) =
     state.source isa ReferenceTarget ? deepcopy(state.source.reference) : nothing
 
-function PPL.initialize_smc(target::SMCTarget; rng::Xoshiro, particles::Integer=1000,
+function PPL.carry_smc(state::SMCState; calibration_id::AbstractString, scale=nothing,
+        parameters=nothing,basis=nothing,max_reflections::Integer=16,
+        maxiter::Integer=100,progress=nothing)
+    state.temperature == 1 || throw(ArgumentError("complete the bridge before carrying its posterior"))
+    isempty(calibration_id) && throw(ArgumentError("calibration_id must identify this posterior summary"))
+    scale===nothing || basis===nothing || throw(ArgumentError("supply a calibrated scale or a basis to refit, not both"))
+    projection=parameters===nothing ? nothing :
+        PPL._smc_parameter_projection(state.target.query.layout,parameters)
+    positions=projection===nothing ? state.positions : view(state.positions,projection.indices,:)
+    location = positions * state.weights
+    diagnostics=nothing
+    if basis === :fit
+        summary=WarmupHMC.fit_gaussian_moments(positions; weights=state.weights,
+            max_reflections,maxiter,progress)
+        location,scale,diagnostics=summary.mean,summary.scale,summary.diagnostics
+    elseif basis !== nothing
+        basis isa Symbol && throw(ArgumentError("basis must be :fit or a portable scale"))
+        scale=_posterior_scale_in_basis(positions,state.weights,location,basis)
+    elseif scale === nothing
+        variance = zeros(length(location))
+        for j in axes(positions, 2), i in eachindex(location)
+            variance[i] += state.weights[j] * abs2(positions[i,j]-location[i])
+        end
+        scale = sqrt.(variance)
+    end
+    reference=SMCReference(location,scale)
+    if projection===nothing
+        carried=carry_smc(state.target,reference;calibration_id)
+        return SMCCarriedReference(carried.reference,carried.frame,
+            carried.calibration_id,deepcopy(diagnostics))
+    end
+    compact=PPL._smc_projection_layout(projection.record)
+    frame=deepcopy((;model_id=state.target.signature.model_id,layout=_layout(compact),
+        parameters=(;layout=projection.record,names=projection.names,paths=projection.output_paths)))
+    return SMCCarriedReference(reference,frame,String(calibration_id),deepcopy(diagnostics))
+end
+
+function PPL.initialize_smc(target::AbstractSMCTarget; rng::Xoshiro, particles::Integer=1000,
         reference=nothing, options=SMCOptions())
     particles >= 2 || throw(ArgumentError("SMC needs at least two particles"))
     if reference === nothing
         reference = options.tuning === nothing ?
-            SMCReference(zeros(target.query.layout.total), ones(target.query.layout.total)) :
+            _default_reference(target) :
             smc_reference(options.tuning)
         reference === nothing && throw(ArgumentError("posterior update tuning cannot initialize a reference cloud"))
     end
@@ -543,7 +638,7 @@ function PPL.smc(state::SMCState; stages::Integer=typemax(Int))
     end
     return state
 end
-PPL.smc(target::SMCTarget; stages::Integer=typemax(Int), kwargs...) =
+PPL.smc(target::AbstractSMCTarget; stages::Integer=typemax(Int), kwargs...) =
     smc(initialize_smc(target; kwargs...); stages)
 
 # Compare nested signature containers without depending on Expr's embedded-array
@@ -563,7 +658,7 @@ function _compatible(a, b)
         throw(ArgumentError("SMC update changes the model or source coordinate frame; start a new cloud"))
 end
 
-function PPL.update_smc(previous::SMCState, target::SMCTarget;
+function PPL.update_smc(previous::SMCState, target::AbstractSMCTarget;
         options=previous.options, stages::Integer=typemax(Int))
     previous.temperature == 1 || throw(ArgumentError("complete the previous bridge before updating data"))
     _compatible(previous.target.signature, target.signature)
@@ -576,7 +671,7 @@ end
 
 _versions() = (; julia=VERSION, ppl=Base.pkgversion(PPL), rk=Base.pkgversion(ReactiveKernels),
     smc=Base.pkgversion(SequentialMonteCarlo), nuts=Base.pkgversion(WarmupHMC))
-_source_id(t::SMCTarget) = (; kind=:posterior, signature=t.signature)
+_source_id(t::AbstractSMCTarget) = (; kind=:posterior, signature=t.signature)
 _source_id(t::ReferenceTarget) = (; kind=:reference, reference=t.reference)
 function _scores(t, positions, endpoint, temperature)
     return map(axes(positions, 2)) do i
@@ -596,7 +691,7 @@ function PPL.smc_checkpoint(state::SMCState)
         target_scores=_scores(state.target, state.positions, :target, state.temperature)))
 end
 
-function PPL.resume_smc(target::SMCTarget, checkpoint; previous=nothing)
+function PPL.resume_smc(target::AbstractSMCTarget, checkpoint; previous=nothing)
     cp = deepcopy(checkpoint)
     cp.schema_version == 1 || throw(ArgumentError("unsupported SMC checkpoint schema"))
     cp.versions == _versions() || throw(ArgumentError("SMC checkpoint Julia/package versions differ"))
@@ -608,7 +703,7 @@ function PPL.resume_smc(target::SMCTarget, checkpoint; previous=nothing)
         previous === nothing || throw(ArgumentError("a reference checkpoint takes no previous posterior"))
         _reference(target, cp.source.reference)
     elseif cp.source.kind === :posterior
-        previous isa SMCTarget || throw(ArgumentError("data-update checkpoint needs the previous prepared target"))
+        previous isa AbstractSMCTarget || throw(ArgumentError("data-update checkpoint needs the previous prepared target"))
         _same(cp.source.signature, previous.signature) || throw(ArgumentError("SMC checkpoint previous binding differs"))
         previous
     else
@@ -628,5 +723,7 @@ function PPL.resume_smc(target::SMCTarget, checkpoint; previous=nothing)
         cp.log_normalizer, cp.rng, _options(cp.options,d,source,target), cp.ancestors,
         cp.lineage, cp.history, cp.update, cp.stage)
 end
+
+include("smc_filter.jl")
 
 end

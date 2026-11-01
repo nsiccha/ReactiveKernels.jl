@@ -16,6 +16,58 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.48
+
+- Add `carry_smc(completed; basis=:fit, max_reflections=16, maxiter=100)`.
+  The public WarmupHMC 0.2.10 moment fitter learns bounded correlation
+  directions from the weighted completed cloud, including selected static
+  coordinates, and retains its owned data-only diagnostics. No old cloud or
+  dense covariance is retained. Finite fitting budgets can lose correlations;
+  convergence of fitted directions does not certify covariance accuracy.
+
+- Add `carry_smc(completed; basis=portable_scale)` to fit weighted posterior
+  moments in a supplied bounded-reflection basis. The learned orientation is
+  retained, while proposal magnitudes are replaced by posterior moments; no
+  dense covariance or retained cloud is introduced. Explicit `scale` keeps its
+  existing copy-as-given meaning. Clarify that a tuning reference is a normalized
+  proposal and need not have posterior covariance.
+- Document read-only learning-state positions, weights, retained-window length
+  and bounded replenishment/acceptance diagnostics for consumers.
+
+- Add selected-static `carry_smc(completed; parameters=...)` and
+  `smc_parameters(carried, u)`. Completed fits with latent histories can
+  carry only selected parameter moments and portable native geometry;
+  scan coordinates, unused bound data and unused definitions are discarded.
+  The filter uses that constrained-parameter mapping by default.
+- `prepare_filter_smc` accepts an explicit `calibration_model_id` when a
+  consumer's verified batch and streaming identity schemes differ. Both
+  identities remain checked and checkpointed, and the ordinary filter's
+  boundary identity is preserved.
+
+- Add `prepare_filter_smc`, `tune_filter_smc` and `initialize_filter_smc`
+  for bounded-window parameter learning over authored finite-state filters.
+  A shared carried Gaussian initializes the ensemble. Predictive scores
+  reweight its members; low ESS triggers replenishment and fixed-kernel
+  particle-Metropolis moves that rebuild the conditional states. Rejections
+  keep the previous likelihood estimate and state cloud. Independent pilot
+  kernels remain fixed throughout production.
+- Window boundaries explicitly approximate the joint posterior by Gaussian
+  marginal parameter moments and an independent pooled state distribution.
+  This discards parameter correlations and parameter-state dependence, and
+  is not exact full-history SMC². An ordinary state-only filter can supply
+  the initial pooled boundary without counting its training likelihood twice.
+  Records, diagnostics and data-only checkpoints have bounded retention;
+  replay validates source, coordinate, calibration and mapping identities.
+
+- Add `carry_smc`, `SMCCarriedReference` and `prepare_smc_window` for
+  bounded-window static-parameter updates. The carried normalized Gaussian
+  replaces the old posterior; only the new window's likelihood is evaluated.
+  Original priors and coordinate Jacobians are not counted again. Summaries
+  retain the coordinate/preprocessing identity and no old observations.
+  Correlated portable scales, independent pilot tuning, bounded diagnostics
+  and exact checkpoint continuation use the existing SMC engine. This is an
+  explicit assumed-density approximation, not full-history posterior replay.
+
 ## 0.1.47
 
 - Fit `tune_smc(...; pilot=:adaptive, reference=:pilot)` from retained pilot
