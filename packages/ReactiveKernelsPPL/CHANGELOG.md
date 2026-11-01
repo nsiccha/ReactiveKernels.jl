@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.38
+
+- Add independent, pre-production pilot tuning with `tune_smc`, a data-only
+  `SMCTuningSchedule` and `SMCOptions(tuning=...)`. The fixed kernel chosen for
+  each production stage depends only on temperature and the prepared schedule.
+  Schedules validate their exact bridge identities and normalized reference;
+  cumulative updates require fresh tuning or explicit untuned options.
+  `smc_reference` returns an owned reference for initial bridges. Checkpoints
+  retain tuning without rerunning pilots. Bounded stage summaries record the
+  selected kernel, evaluation count and actual particle displacement.
+
 ## 0.1.41
 
 - Preserve row-local coordinate supports for retained conditional cell

@@ -18,14 +18,41 @@ struct SMCReference
 end
 
 """
+    SMCTuningSchedule
+
+Data-only result of `tune_smc`. `temperatures` and `kernels` describe a finite,
+precomputed schedule. Each kernel records `stepsize`, `metric` (scales), `moves`
+and `max_tree_depth`. Production selects the nearest temperature knot (ties
+select the higher knot), using only its temperature and this configuration.
+`source` and `target` bind the schedule to the exact bridge; `reference` is the
+normalized initial reference, or `nothing` for a posterior update. `pilot`
+records the copied initial/final RNG, initial position and bounded pilot work.
+
+Arrays in this record must remain read-only. Initialization, updates and resume
+copy and validate the schedule. Checkpoints include it; resuming never reruns
+pilot adaptation. A schedule is not a stationary posterior sample.
+"""
+struct SMCTuningSchedule{S,T,R,K,P}
+    source::S
+    target::T
+    reference::R
+    temperatures::Vector{Float64}
+    kernels::Vector{K}
+    pilot::P
+end
+
+"""
     SMCOptions(; ess_fraction=0.8, stepsize=0.25, metric=nothing,
                moves=2, max_tree_depth=6, max_stages=1000,
-               min_increment=1e-12, history_limit=128)
+               min_increment=1e-12, history_limit=128, tuning=nothing)
 
 Adaptive bridge and fixed NUTS configuration. `metric` is a vector of positive
 diagonal **scales**, not variances or precisions; `nothing` means ones. The
 metric, step size and tree depth stay fixed during mutation, with no adaptation
-using the particles being moved. Each stage resamples, then takes `moves`
+using the particles being moved. `tuning=tune_smc(...)` instead selects a fixed
+kernel from an independent, precomputed, bridge-specific pilot schedule.
+Scheduled kernel settings override `stepsize`, `metric`, `moves` and
+`max_tree_depth` for production mutation. Each stage resamples, then takes `moves`
 invariant NUTS transitions. `ess_fraction` selects the next temperature by
 bisection on the weight ESS, before resampling. A bridge that cannot progress
 by `min_increment`, or needs more than `max_stages`, throws without advancing
@@ -40,9 +67,10 @@ struct SMCOptions
     max_stages::Int
     min_increment::Float64
     history_limit::Int
+    tuning::Union{Nothing,SMCTuningSchedule}
     function SMCOptions(; ess_fraction=0.8, stepsize=0.25, metric=nothing,
             moves=2, max_tree_depth=6, max_stages=1000, min_increment=1e-12,
-            history_limit=128)
+            history_limit=128, tuning=nothing)
         0 < ess_fraction < 1 || throw(ArgumentError("ess_fraction must be between 0 and 1"))
         isfinite(stepsize) && stepsize > 0 || throw(ArgumentError("stepsize must be finite and positive"))
         metric === nothing || (metric isa AbstractVector && all(x -> isfinite(x) && x > 0, metric)) ||
@@ -52,8 +80,10 @@ struct SMCOptions
         max_stages >= 1 || throw(ArgumentError("max_stages must be positive"))
         0 < min_increment < 1 || throw(ArgumentError("min_increment must be between 0 and 1"))
         history_limit >= 1 || throw(ArgumentError("history_limit must be positive"))
+        tuning === nothing || tuning isa SMCTuningSchedule ||
+            throw(ArgumentError("tuning must be a SMCTuningSchedule or nothing"))
         new(ess_fraction, stepsize, metric === nothing ? nothing : Vector{Float64}(metric),
-            moves, max_tree_depth, max_stages, min_increment, history_limit)
+            moves, max_tree_depth, max_stages, min_increment, history_limit, deepcopy(tuning))
     end
 end
 
@@ -72,6 +102,41 @@ captured data and code must remain read-only for a target's lifetime.
 `kwargs` are forwarded to `prepare_sampler`.
 """
 function prepare_smc end
+
+"""
+    tune_smc(target; rng::Xoshiro, init, reference=nothing, previous=nothing,
+             temperatures=(0.0, 0.05, 0.2, 0.5, 1.0), pilot_steps=64,
+             options=SMCOptions())
+
+Prepare all mutation tuning **before** creating a production cloud. `init` is
+an explicit finite unconstrained position and `rng` an explicit independent
+pilot RNG; both are copied. Do not supply production-derived positions or RNGs.
+The pilot follows the specified fixed temperature grid, adapting through
+WarmupHMC's continuous diagonal kernel, then freezes each knot's scale and step
+size. Its draws are discarded. It does not adapt from production particles.
+
+For an initial bridge, supply a normalized `SMCReference` (default standard
+Normal). The reference remains fixed throughout tuning and production. For a
+cumulative-data update pass `previous=old_prepared_target` and no reference.
+The returned schedule is valid only for these exact endpoints. Supply it as
+`SMCOptions(tuning=schedule)`. The production ESS temperature rule remains
+adaptive; this API does not claim exactly unbiased finite-particle evidence.
+
+`temperatures` must strictly increase from 0 to 1; `pilot_steps` is the positive
+number of adaptive transitions per knot. `options` supplies the initial metric,
+production move count and tree-depth limit; it must not itself contain tuning.
+"""
+function tune_smc end
+
+"""
+    smc_reference(state_or_schedule)
+
+Return an owned, data-only normalized reference for an initial bridge, or
+`nothing` for a posterior-to-posterior update. An update uses the previous
+prepared posterior as its source and does not need the original reference.
+"""
+function smc_reference end
+smc_reference(schedule::SMCTuningSchedule) = deepcopy(schedule.reference)
 
 """
     SMCNonfiniteError <: Exception
@@ -124,6 +189,8 @@ Draw the initial reference cloud, at temperature zero. Copies `rng` (an
 explicit `Random.Xoshiro`) and never advances the caller's RNG. The returned
 state owns its particle positions, normalized weights and continuation RNG.
 Call `smc_step` for one completed stage, or `smc` to finish the bridge.
+With `options.tuning`, an omitted reference uses the schedule's exact reference;
+an explicit different reference rejects before drawing any particles.
 """
 function initialize_smc end
 
@@ -146,6 +213,12 @@ Return the next complete resample/move stage. `history` holds bounded summaries
 (temperature, ESS before resampling, log normalizer increment, unique parents,
 surviving initial ancestors, moves and divergences). `ancestors` maps the most
 recent stage to its input cloud, and `lineage` tracks the initial cloud.
+Each summary's `kernel` records the actual scales, step size, moves per particle
+and depth limit; `tuning_index` is its schedule knot (zero when untuned).
+`evaluations` sums the transition evaluation counts; `mean_squared_movement`
+is the mean squared unconstrained displacement from each resampled parent to
+its final child, after all moves. These describe mutation work and movement,
+not independent evidence that a posterior has been explored adequately.
 Failures propagate; the input state and its RNG remain usable.
 """
 function smc_step end
@@ -159,6 +232,8 @@ is `(1-beta)*old_posterior + beta*new_posterior` in log space, so priors and
 Jacobians occur once. Every mutation evaluates the required old/new histories
 from their beginning. This is full-history updating, not constant-cost streaming
 or a latent-state particle filter. No old terminal scan state is reused.
+If `previous.options` contains tuning for its old bridge, the default rejects:
+supply a freshly prepared update schedule, or explicit untuned `SMCOptions`.
 """
 function update_smc end
 

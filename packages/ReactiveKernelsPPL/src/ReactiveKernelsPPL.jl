@@ -90,6 +90,7 @@ export prepare_predictive, PredictiveQuery, PredictiveLaws, predictive_laws, pre
 export restore_draws
 export prepare_smc, smc, initialize_smc, update_smc, smc_step, smc_checkpoint, resume_smc
 export SMCReference, SMCOptions, SMCNonfiniteError
+export SMCTuningSchedule, tune_smc, smc_reference
 export prepare_filter, initialize_filter, filter_step, filter_stream,
     filter_checkpoint, resume_filter, filter_parameter_names, filter_parameters
 export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
