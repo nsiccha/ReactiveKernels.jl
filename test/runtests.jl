@@ -83,6 +83,7 @@ const _MATRIX_CORE_TESTS = (
     "test_product_cell_shapes.jl",
     "test_scalar_cell_reads.jl",
     "test_plate_partition.jl",
+    "test_partition_prefix.jl",
     "test_authored_loops.jl",
     "test_jax_source.jl",
     "test_scan_columns.jl",

@@ -1176,7 +1176,7 @@ preparation: all cells whose key equals a label, as one compiled pass
 (RK `plate_partition`). Construct with [`prepare_partition`](@ref); call as
 `q(u, label)`. Not thread-safe: prepare one per thread.
 """
-mutable struct PartitionQuery{K,L}
+mutable struct PartitionQuery{K,L,T}
     const kernel::K
     const layout::L
     const observations::Tuple{Vararg{Symbol}}
@@ -1185,7 +1185,7 @@ mutable struct PartitionQuery{K,L}
     # Each label's plan (`ReactiveKernels.partition_plan`), computed at
     # preparation; a label without one is planned on the spot, which refuses
     # a label no observation has.
-    const plans::Dict{Any,Any}
+    const plans::Dict{Any,T}
 end
 
 (q::PartitionQuery)(u::AbstractVector{Float64}, label) =
@@ -1219,7 +1219,10 @@ function _partition_plans_each(plan_of, labels)
     types = unique!(Any[typeof(plan) for plan in values(plans)])
     length(types) == 1 || throw(ContractValidationError(
         "[query] the partition plans have several types: $(join(types, ", "))"))
-    plans, only(types)
+    # Preparation already requires one plan type across all labels. Preserve
+    # it at lookup rather than boxing the plan again on every evaluation.
+    plan_type = only(types)
+    Dict{Any,plan_type}(plans), plan_type
 end
 const _PARTITION_TOTAL = :_ppl_partition_total
 
@@ -1375,7 +1378,7 @@ whole packed vector. Construct with [`prepare_partition_sampler`](@ref); use
 [`partition_value_and_gradient!`](@ref) and [`partition_footprint`](@ref).
 Not thread-safe: prepare one per thread.
 """
-mutable struct PartitionSampler{K,P,L}
+mutable struct PartitionSampler{K,P,L,C,T}
     const kernel::K
     const ad::P
     const layout::L
@@ -1387,31 +1390,62 @@ mutable struct PartitionSampler{K,P,L}
     # its padded selection of one width, the selection in force, its slot
     # map, and the active and gradient buffers of that width.
     const footprints::Dict{Any,Vector{Int}}
+    const local_footprints::Union{Nothing,Dict{Any,Vector{Int}}}
     const selections::Dict{Any,Vector{Int}}
     const selected::Vector{Int}
     const slots::Vector{Int32}
     const active::Vector{Float64}
     const gradient::Vector{Float64}
     # Each label's plan of the differentiated kernel (`partition_plan`).
-    const plans::Dict{Any,Any}
+    const plans::Dict{Any,T}
+    const prefix::C
     value::Float64
 end
 _compact(s::PartitionSampler) = !isempty(s.slots)
 partition_labels(s::PartitionSampler) = copy(s.labels)
 
+# A label is constant to AD, but its concrete type is part of a backend's
+# preparation signature. Mixed key columns need one operator per label type.
+# The common homogeneous case keeps its concrete operator and direct call.
+struct _PartitionADByType
+    operators::Dict{DataType,Any}
+end
+function _partition_prepare_ad(prepare_label, labels)
+    first_type = typeof(first(labels))
+    all(label -> typeof(label) === first_type, labels) && return prepare_label(first(labels))
+    operators = Dict{DataType,Any}()
+    for label in labels
+        get!(() -> prepare_label(label), operators, typeof(label))
+    end
+    _PartitionADByType(operators)
+end
+_partition_ad(ad, label) = ad
+_partition_ad(ad::_PartitionADByType, label) = ad.operators[typeof(label)]
+_partition_gradient!(s, g, label, args::Vararg{Any,N}) where {N} =
+    first(ad_value_and_gradient!(_partition_ad(s.ad, label), g, args...))
+
+function _partition_gradient_footprint(s::PartitionSampler, label, shared::Bool)
+    footprints = shared ? s.footprints : s.local_footprints
+    footprints === nothing && throw(ContractValidationError(
+        "[query] `shared = false` requires `partitioned` at sampler preparation"))
+    get(footprints, label) do
+        throw(ContractValidationError("[query] no partition has the label $(repr(label)); " *
+            "the labels are $(join(repr.(s.labels), ", "))"))
+    end
+end
+
 """
-    partition_footprint(s::PartitionSampler, label) -> Vector{Int}
+    partition_footprint(s::PartitionSampler, label; shared = true) -> Vector{Int}
 
 The packed positions partition `label` reads (sorted, unique): the support of
 its gradient, computed at preparation from the bound index data by the row
 analysis that evaluates the partition (a method of ReactiveKernels'
 `partition_footprint`). A compact sampler's gradient is over exactly these,
-in this order.
+in this order. With `shared = false`, return only the coordinates declared
+per-partition by `partitioned`; this requires that declaration at preparation.
 """
-ReactiveKernels.partition_footprint(s::PartitionSampler, label) = copy(get(s.footprints, label) do
-    throw(ContractValidationError("[query] no partition has the label $(repr(label)); " *
-        "the labels are $(join(repr.(s.labels), ", "))"))
-end)
+ReactiveKernels.partition_footprint(s::PartitionSampler, label; shared::Bool = true) =
+    copy(_partition_gradient_footprint(s, label, shared))
 
 # The separability rule as RK takes it: the label of each packed coordinate
 # of the named parameters, `missing` for every other coordinate. A parameter
@@ -1480,11 +1514,9 @@ footprint, the packed coordinates it reads, computed at preparation for every
 label from the bound index data ([`partition_footprint`](@ref)); the active
 coordinates overlay a read-only packed base as in
 [`prepare_compact_cell_sampler`](@ref), so with native `AutoEnzyme` Reverse
-use `Enzyme.set_runtime_activity(Enzyme.Reverse)`. With `compact = false` the
+use ordinary `Enzyme.Reverse`. With `compact = false` the
 gradient is over the whole packed vector, nonzero only on the footprint, at
-the cost of zeroing the whole vector per call. On BRM's nested panel at
-atlas-17 size (34627 coordinates, a unit's footprint 2903) the compact
-gradient took 2.6 ms and the dense one 3.1 ms per unit.
+the cost of zeroing the whole vector per call.
 
 `partitioned` is the separability rule: the parameters whose rows belong to
 one partition each (an NLME unit's effects), named bare when indexed by the
@@ -1492,6 +1524,14 @@ key column itself (`z[levels(subject)]`) or as `parameter => labels` giving
 each level's label. Preparation then checks every label: a partition that
 reads another label's coordinates of those parameters, even genuinely, is
 refused with a `ReactiveKernels.PartitionSeparabilityError` naming them.
+The compiler also cuts out intermediates that structurally read only shared
+coordinates and bound data. The sampler keeps their values across labels and
+local-coordinate changes, and recomputes them when a shared coordinate changes.
+The cache belongs to this sampler; changes are compared by value, including
+in-place edits to `u`. Full gradients propagate cotangents through the prefix
+with the chosen backend. That pullback may recompute its forward work; no
+backend tape reuse is assumed. `shared = false` on the gradient call requests
+only local derivatives and skips that pullback.
 """
 function prepare_partition_sampler(built, plan::StructuralPlan, observations,
         u0::AbstractVector{<:Real}; by, backend, compact::Bool = true, partitioned = (),
@@ -1511,8 +1551,9 @@ function prepare_partition_sampler(built, plan::StructuralPlan, observations,
     labels = _partition_labels(plan, names, keys_by_name)
     isempty(labels) && throw(ContractValidationError(
         "[query] the partition key columns of $(join(names, ", ")) hold no label"))
-    rule = isempty(partitioned) ? () :
-        (:unconstrained => _partition_coordinate_labels(plan, layout, partitioned, keys_by_name),)
+    declarations = partitioned isa Union{Symbol,Pair} ? (partitioned,) : partitioned
+    rule = isempty(declarations) ? () :
+        (:unconstrained => _partition_coordinate_labels(plan, layout, declarations, keys_by_name),)
     # The dense query: the values, the footprints and the separability check.
     spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality,
                                        partitioned = rule)
@@ -1536,28 +1577,31 @@ function prepare_partition_sampler(built, plan::StructuralPlan, observations,
         positions = read.unconstrained
         footprints[label] = positions === :whole ? collect(1:layout.total) : positions
     end
+    local_footprints = isempty(rule) ? nothing :
+        Dict{Any,Vector{Int}}(label => filter(p -> !ismissing(last(only(rule))[p]), footprint)
+                             for (label, footprint) in footprints)
+    parts = isempty(rule) ? nothing : Base.invokelatest(
+        ReactiveKernels._partition_shared_parts, planner.plan, rule;
+        varying = (_PARTITION_PORT, _PLAN_PORT))
+    if parts !== nothing
+        return _prepare_shared_partition_sampler(kernel, parts, layout, names,
+            keys_by_name, labels, exemplar, footprints, local_footprints,
+            last(only(rule)), backend, compact, on_error)
+    end
     if !compact
-        ad = Base.invokelatest(prepare_ad, kernel, backend, exemplar, first(labels),
-            plans[first(labels)]; active = :unconstrained)
+        ad = _partition_prepare_ad(labels) do label
+            Base.invokelatest(prepare_ad, kernel, backend, exemplar, label,
+                plans[label]; active = :unconstrained)
+        end
         return PartitionSampler(kernel, ad, layout, names, keys_by_name, labels, exemplar,
-            footprints, Dict{Any,Vector{Int}}(), Int[], Int32[], Float64[], Float64[], plans,
-            NaN)
+            footprints, local_footprints, Dict{Any,Vector{Int}}(), Int[], Int32[],
+            Float64[], Float64[], plans, nothing, NaN)
     end
     # One selection width for every label: each footprint padded with the
     # smallest positions outside it (their derivative is zero).
-    width = maximum(length, values(footprints))
-    selections = Dict{Any,Vector{Int}}()
-    for (label, footprint) in footprints
-        selection = copy(footprint)
-        inside = Set(footprint)
-        position = 1
-        while length(selection) < width
-            position in inside || push!(selection, position)
-            position += 1
-        end
-        selections[label] = sort!(selection)
-    end
+    selections = _partition_selections(footprints)
     selected = copy(selections[first(labels)])
+    width = length(selected)
     slots = _compact_cell_slots(layout.total, selected)
     active = exemplar[selected]
     # The slot map is constant per label, so the plan reads the active
@@ -1582,39 +1626,62 @@ function prepare_partition_sampler(built, plan::StructuralPlan, observations,
     compact_kernel = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
     end
-    ad = Base.invokelatest(prepare_ad, compact_kernel, backend, exemplar, active, slots,
-        first(labels), plans[first(labels)]; active = :_ppl_cell_active)
+    ad = _partition_prepare_ad(labels) do label
+        selection = selections[label]
+        Base.invokelatest(prepare_ad, compact_kernel, backend, exemplar,
+            exemplar[selection], _compact_cell_slots(layout.total, selection),
+            label, plans[label]; active = :_ppl_cell_active)
+    end
     PartitionSampler(kernel, ad, layout, names, keys_by_name, labels, exemplar, footprints,
-        selections, selected, slots, active, zeros(width), plans, NaN)
+        local_footprints, selections, selected, slots, active, zeros(width), plans, nothing, NaN)
 end
 
 """
-    partition_value_and_gradient!(s::PartitionSampler, g, u, label)
+    partition_value_and_gradient!(s::PartitionSampler, g, u, label; shared = true)
 
 The partition `label`'s log density and its gradient, written into `g`:
 over [`partition_footprint`](@ref)`(s, label)`, in that order, for a compact
 sampler (`length(g)` must be the footprint's length), or over the whole
 packed vector otherwise. Returns `(value, g)`. `u` is read only.
+
+With `shared = false`, return only the derivatives of the coordinates named
+by `partitioned` at preparation. A compact destination follows
+`partition_footprint(s, label; shared = false)`; a dense destination retains
+the full packed length, with every shared-coordinate entry zero. The value
+is unchanged. This skips the shared prefix's pullback while reusing its value.
 """
 function partition_value_and_gradient!(s::PartitionSampler, g::AbstractVector,
-                                       u::Vector{Float64}, label)
-    _compact(s) || return (_latest_value(_cell_gradient!, s, g, u, label,
-                                         _partition_plan_of(s, label)), g)
+                                       u::Vector{Float64}, label; shared::Bool = true)
     length(u) == s.layout.total || throw(ContractValidationError(
         "[query] packed length $(length(u)) ≠ layout total $(s.layout.total)"))
-    footprint = get(s.footprints, label) do
-        throw(ContractValidationError("[query] no partition has the label $(repr(label)); " *
-            "the labels are $(join(repr.(s.labels), ", "))"))
+    footprint = _partition_gradient_footprint(s, label, shared)
+    expected = _compact(s) ? length(footprint) : s.layout.total
+    length(g) == expected || throw(ContractValidationError(
+        "[query] gradient length $(length(g)) ≠ expected length $expected " *
+        "of partition $(repr(label))"))
+    s.prefix === nothing || return (
+        _latest_value(_shared_partition_gradient!, s, g, u, label, shared), g)
+    if !_compact(s)
+        value = _latest_value(_partition_gradient!, s, g, label, u, label,
+                              _partition_plan_of(s, label))
+        if !shared
+            local_index = 1
+            for position in eachindex(g)
+                if local_index <= length(footprint) && position == footprint[local_index]
+                    local_index += 1
+                else
+                    g[position] = 0
+                end
+            end
+        end
+        return value, g
     end
-    length(g) == length(footprint) || throw(ContractValidationError(
-        "[query] compact gradient length $(length(g)) ≠ footprint length " *
-        "$(length(footprint)) of partition $(repr(label))"))
     selection = s.selections[label]
     _select_partition!(s, selection)
     for (k, position) in enumerate(selection)
         s.active[k] = u[position]
     end
-    value = _latest_value(_cell_gradient!, s, s.gradient, u, s.active, s.slots, label,
+    value = _latest_value(_partition_gradient!, s, s.gradient, label, u, s.active, s.slots, label,
                           _partition_plan_of(s, label))
     for (k, position) in enumerate(footprint)
         g[k] = s.gradient[s.slots[position]]
@@ -1622,8 +1689,190 @@ function partition_value_and_gradient!(s::PartitionSampler, g::AbstractVector,
     return value, g
 end
 partition_value_and_gradient!(s::PartitionSampler, g::AbstractVector, u::AbstractVector,
-                              label) =
-    partition_value_and_gradient!(s, g, Vector{Float64}(u), label)
+                              label; shared::Bool = true) =
+    partition_value_and_gradient!(s, g, Vector{Float64}(u), label; shared)
+
+# Pad each exact footprint to one AD input width across all labels.
+function _partition_selections(footprints)
+    width = maximum(length, values(footprints))
+    selections = Dict{Any,Vector{Int}}()
+    for (label, footprint) in footprints
+        selection = copy(footprint)
+        inside = Set(footprint)
+        position = 1
+        while length(selection) < width
+            position in inside || push!(selection, position)
+            position += 1
+        end
+        selections[label] = sort!(selection)
+    end
+    selections
+end
+
+# The existing compact overlay, applied to an exact selected Plan. Replanning
+# from its original graph could recover the shared producers just cut out.
+function _compact_partition_plan(p::ReactiveKernels.Plan)
+    old = p.graph
+    graph = Graph(copy(old.values), copy(old.recipes),
+        Dict(id => copy(ids) for (id, ids) in old.producers), copy(old.aliases), old.version, nothing)
+    overlay = map((:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots),
+                  (AbstractVector{Float64}, AbstractVector{Float64}, AbstractVector{Int32})) do name, type
+        any(v -> v.name === name, values(graph.values)) && throw(ContractValidationError(
+            "[query] compact cell port `$name` collides with a model port"))
+        value!(graph, name, type)
+    end
+    packed = only(v for v in p.have if v.name === :unconstrained)
+    recipe = ReactiveKernels._add_recipe!(graph, overlay, (packed,), _compact_cell_point,
+        1.0, nothing, false, ReactiveKernels._NO_KERNEL_SOURCE)
+    recipes = ReactiveKernels.Recipe[recipe]
+    for r in p.recipes
+        op = r.op
+        if op isa ReactiveKernels._AuthoredPlateCellOp && op.plan !== nothing
+            op = ReactiveKernels._AuthoredPlateCellOp(op.plate, op.locality, op.rows,
+                op.partitioned, op.plan, (op.plan_constant..., :_ppl_cell_slots))
+            r = ReactiveKernels.Recipe(r.id, r.inputs, r.outputs, op, r.cost,
+                r.cse_key, r.effectful, r.source)
+        end
+        push!(recipes, r)
+    end
+    template = ReactiveKernels.Plan(graph, p.have, p.want, p.recipes, p.producer,
+        p.cost, p.recipes)
+    ReactiveKernels._partial_subplan(template,
+        ReactiveKernels.Value[overlay..., filter(!=(packed), p.have)...], p.want, recipes)
+end
+
+mutable struct _PartitionPrefix{K,A,V}
+    const kernel::K
+    const ad::A
+    const positions::Vector{Int}
+    const point::Vector{Float64}
+    const slots::Vector{Int32}
+    values::V
+    valid::Bool
+end
+
+# Views must not keep mutable caller storage as the cached shared value.
+_partition_cache_value(x::AbstractArray) = copy(x)
+_partition_cache_value(x::Tuple) = map(_partition_cache_value, x)
+_partition_cache_value(x::NamedTuple) = map(_partition_cache_value, x)
+_partition_cache_value(x) = x
+_partition_seed(x::Number) = zero(x)
+_partition_seed(x::AbstractArray) = zero(x)
+_partition_seed(x::Tuple) = map(_partition_seed, x)
+_partition_seed(x::NamedTuple) = map(_partition_seed, x)
+_partition_frontier_values(kernel, value) = length(outputs(kernel)) == 1 ? (value,) : value
+_partition_frontier_seed(values::Tuple) = length(values) == 1 ? only(values) : values
+
+function _prepare_shared_partition_sampler(kernel, parts, layout, names, by, labels,
+        exemplar, footprints, local_footprints, coordinate_labels, backend, compact, on_error)
+    shared_positions = findall(ismissing, coordinate_labels)
+    shared_point = exemplar[shared_positions]
+    shared_slots = _compact_cell_slots(layout.total, shared_positions)
+    prefix = Base.invokelatest(prepare, _compact_partition_plan(parts.prefix);
+        exemplars = (exemplar, shared_point, shared_slots), on_error)
+    cached = map(_partition_cache_value, _partition_frontier_values(prefix,
+        Base.invokelatest(prefix, exemplar, shared_point, shared_slots)))
+    seed = _partition_frontier_seed(map(_partition_seed, cached))
+    prefix_ad = Base.invokelatest(prepare_ad_pullback, prefix, backend, seed,
+        exemplar, shared_point, shared_slots; active = :_ppl_cell_active)
+    cache = _PartitionPrefix(prefix, prefix_ad, shared_positions, shared_point,
+        shared_slots, cached, true)
+
+    selections = compact ? _partition_selections(footprints) : Dict{Any,Vector{Int}}()
+    selected = compact ? copy(selections[first(labels)]) : Int[]
+    slots = compact ? _compact_cell_slots(layout.total, selected) : Int32[]
+    active = exemplar[selected]
+    args = compact ? (exemplar, active, slots, first(labels), nothing, cached...) :
+                     (exemplar, first(labels), nothing, cached...)
+    residual_plan = compact ? _compact_partition_plan(parts.residual) : parts.residual
+    residual = Base.invokelatest(prepare, residual_plan; exemplars = args, on_error)
+    planner = Base.invokelatest(ReactiveKernels.partition_plan_kernel, residual)
+    plans, _ = _partition_plans_each(labels) do label
+        label_args = compact ? (exemplar, exemplar[selections[label]],
+            _compact_cell_slots(layout.total, selections[label]), label, nothing, cached...) :
+            (exemplar, label, nothing, cached...)
+        Base.invokelatest(planner, label_args...)
+    end
+    selector = (compact ? :_ppl_cell_active : :unconstrained,
+                (v.name for v in parts.frontier)...)
+    ad = _partition_prepare_ad(labels) do label
+        label_args = compact ? (exemplar, exemplar[selections[label]],
+            _compact_cell_slots(layout.total, selections[label]), label, plans[label], cached...) :
+            (exemplar, label, plans[label], cached...)
+        # Exemplar preparation also specializes the kernel's call boundary.
+        # Keep that boundary consistent with each AD context signature.
+        label_kernel = typeof(label) === typeof(first(labels)) ? residual :
+            Base.invokelatest(prepare, residual_plan; exemplars = label_args, on_error)
+        Base.invokelatest(prepare_ad, label_kernel, backend, label_args...; active = selector)
+    end
+    PartitionSampler(kernel, ad, layout, names, by, labels, exemplar, footprints,
+        local_footprints, selections, selected, slots, active, zeros(length(active)), plans, cache, NaN)
+end
+
+function _refresh_partition_prefix!(cache::_PartitionPrefix, u)
+    changed = !cache.valid || any(eachindex(cache.positions)) do i
+        !isequal(cache.point[i], u[cache.positions[i]])
+    end
+    changed || return cache.values
+    # A failed evaluation must not leave an old value marked valid for a new
+    # point. A later retry at that point recomputes the prefix.
+    cache.valid = false
+    for (i, position) in enumerate(cache.positions)
+        cache.point[i] = u[position]
+    end
+    cache.values = map(_partition_cache_value, _partition_frontier_values(cache.kernel,
+        cache.kernel(u, cache.point, cache.slots)))
+    cache.valid = true
+    cache.values
+end
+
+function _shared_partition_gradient!(s::PartitionSampler, g, u, label, shared)
+    cache = s.prefix
+    cached = _refresh_partition_prefix!(cache, u)
+    plan = _partition_plan_of(s, label)
+    ad = _partition_ad(s.ad, label)
+    if _compact(s)
+        selection = s.selections[label]
+        _select_partition!(s, selection)
+        for (i, position) in enumerate(selection)
+            s.active[i] = u[position]
+        end
+        return _shared_partition_evaluate!(s, g, u, label, shared,
+            ad, u, s.active, s.slots, label, plan, cached...)
+    end
+    _shared_partition_evaluate!(s, g, u, label, shared, ad, u, label, plan, cached...)
+end
+
+# Keep each call's argument tuple length concrete, and specialize together on
+# its plan, frontier and AD operator even when label types differ.
+function _shared_partition_evaluate!(s, g, u, label, shared,
+        ad, args::Vararg{Any,N}) where {N}
+    value, derivatives = ad_value_and_gradient(ad, args...)
+    direct = first(derivatives)
+    if shared
+        cache = s.prefix
+        seed = _partition_frontier_seed(Base.tail(derivatives))
+        propagated = ad_pullback(cache.ad, seed, u, cache.point, cache.slots)
+        for (i, position) in enumerate(cache.positions)
+            slot = _compact(s) ? s.slots[position] : position
+            iszero(slot) || (direct[slot] += propagated[i])
+        end
+    end
+    footprint = _partition_gradient_footprint(s, label, shared)
+    if _compact(s)
+        for (i, position) in enumerate(footprint)
+            g[i] = direct[s.slots[position]]
+        end
+    elseif shared
+        copyto!(g, direct)
+    else
+        fill!(g, 0)
+        for position in footprint
+            g[position] = direct[position]
+        end
+    end
+    value
+end
 
 # The plan of `label` for the sampler's differentiated kernel.
 _partition_plan_of(s::PartitionSampler, label) = get(s.plans, label) do

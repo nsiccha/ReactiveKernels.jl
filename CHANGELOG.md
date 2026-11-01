@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.42
+
+- Provide the shared-prefix partition split used by ReactiveKernelsPPL.
+  Structural reads of declared shared coordinates determine the cut;
+  selected producers and multi-output ownership are preserved. Intermediates
+  remain live inputs to the residual, allowing their cotangents to flow
+  through a separate generic pullback.
+
 ## 0.1.41
 
 - Add cold graph projection for incremental execution of authored finite

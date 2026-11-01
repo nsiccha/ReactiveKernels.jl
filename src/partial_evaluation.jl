@@ -55,14 +55,22 @@ including an empty one. Recipes whose ids are in `excluded` stay in the
 residual whatever their inputs, and so do their data-only consumers.
 """
 function _partial_split(p::Plan, bound::Set{ValueId}, excluded::Set{Int} = Set{Int}())
+    _partial_split(p, bound, excluded) do r, owned
+        all(inp -> canon_id(p.graph, inp.id) in owned, r.inputs)
+    end
+end
+
+# The same ownership walk with a structural read predicate. A mixed input
+# can be available to a recipe at selected positions without the whole input
+# being bound (the shared coordinates of a partitioned packed vector).
+function _partial_split(reads_bound, p::Plan, bound::Set{ValueId}, excluded::Set{Int})
     g = p.graph
     prefix_owned = copy(bound)
     assigned = Set(canon_id(g, v.id) for v in p.have)
     prefix = Recipe[]
     residual = Recipe[]
     for r in p.recipes
-        if !(r.id in excluded) &&
-           all(inp -> canon_id(g, inp.id) in prefix_owned, r.inputs)
+        if !(r.id in excluded) && reads_bound(r, prefix_owned)
             push!(prefix, r)
             for o in r.outputs
                 cid = canon_id(g, o.id)

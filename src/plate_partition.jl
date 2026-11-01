@@ -613,6 +613,86 @@ function _footprint_literal_read(r::Recipe)
     (j, Tuple(Int.(native.args[2:end])))
 end
 
+# ----------------------------------------------------------- shared prefix
+
+# Whether a recipe's read of one mixed HAVE port is confined to shared
+# positions. These are the same structural reads reported by the footprint;
+# an unknown read stays in the residual unless every position is shared.
+function _partition_shared_read(r::Recipe, slot::Int, labels, producers, cidof)
+    form = _cell_form(r)
+    positions = if form !== nothing
+        _footprint_constant(r, form, slot, producers, cidof)
+    else
+        literal = _footprint_literal_read(r)
+        literal !== nothing && first(literal) == slot && length(last(literal)) == 1 ?
+            last(literal) : nothing
+    end
+    positions === nothing && return false
+    all(i -> checkbounds(Bool, labels, i) && ismissing(labels[i]), positions)
+end
+
+# Split a selected, bound-data plan without replanning its producers. The
+# original HAVE boundary stays on the residual; shared intermediates enter
+# as additional ordinary HAVE values, so their cotangents can be propagated
+# through a separately prepared prefix pullback. They are NOT BoundConstants.
+# `varying` names controls such as the partition label and its row plan.
+# This internal compiler surface is also used by the PPL sampler; it carries
+# no mutable cache, backend choice, or packed-parameter naming convention.
+function _partition_shared_parts(p::Plan, partitioned; varying = ())
+    cidof(v) = canon_id(p.graph, v.id)
+    rules = Dict(_partition_rule(partitioned))
+    # Scan each declaration once, rather than once per recipe that reads it.
+    mixed = Dict(cidof(v) => rules[v.name] for v in p.have
+                 if haskey(rules, v.name) && !all(ismissing, rules[v.name]))
+    shared = Set(cidof(v) for v in p.have
+                 if !haskey(mixed, cidof(v)) && !(v.name in varying))
+    # Only data already bound into the plan may be duplicated as constant
+    # recipes on both sides. Other shared HAVE values still vary with theta.
+    static, _, static_owned = _partial_split(p, Set{ValueId}())
+    prefix, residual, owned = _partial_split(p, shared, Set{Int}()) do r, available
+        all(enumerate(r.inputs)) do (slot, input)
+            cid = cidof(input)
+            cid in available ||
+                (haskey(mixed, cid) &&
+                 _partition_shared_read(r, slot, mixed[cid], p.producer, cidof))
+        end
+    end
+    have_ids = Set(cidof(v) for v in p.have)
+    frontier = Value[v for v in _partial_constants(p, owned, residual)
+                     if !(cidof(v) in static_owned) && !(cidof(v) in have_ids)]
+    isempty(frontier) && return nothing
+
+    # Prune against authoritative outputs in forward execution order before
+    # walking backwards, so collateral duplicates cannot replace a producer.
+    assigned = copy(have_ids)
+    authoritative = Dict{Int,Vector{ValueId}}()
+    for r in p.recipes
+        outputs = ValueId[]
+        for output in r.outputs
+            cid = cidof(output)
+            cid in assigned && continue
+            push!(assigned, cid)
+            push!(outputs, cid)
+        end
+        authoritative[r.id] = outputs
+    end
+    needed = Set(cidof(v) for v in frontier)
+    selected = Recipe[]
+    for r in Iterators.reverse(prefix)
+        any(cid -> cid in needed, authoritative[r.id]) || continue
+        push!(selected, r)
+        union!(needed, (cidof(v) for v in r.inputs))
+    end
+    reverse!(selected)
+    prefix_have = Value[v for v in p.have if cidof(v) in needed]
+    prefix_plan = _partial_subplan(p, prefix_have, frontier, selected)
+    residual_ids = Set(r.id for r in residual)
+    union!(residual_ids, (r.id for r in static))
+    residual_recipes = Recipe[r for r in p.recipes if r.id in residual_ids]
+    residual_plan = _partial_subplan(p, [p.have; frontier], p.want, residual_recipes)
+    (; prefix = prefix_plan, residual = residual_plan, frontier)
+end
+
 # The footprint named tuple from the body's recorded reads.
 function _footprint_collect(entries::Tuple)
     names = Tuple(first(entry) for entry in entries)
