@@ -3,12 +3,16 @@ module ReactiveKernelsPPLSMCExt
 using ReactiveKernelsPPL
 using ReactiveKernels
 using Random
-using LinearAlgebra: Diagonal
+using LinearAlgebra: Diagonal, logabsdet
 using SequentialMonteCarlo: SMCModel, SMCIO, smc!
 using WarmupHMC: FixedKernelNUTSState, fixed_kernel_nuts_step
 using WarmupHMC: ContinuousNUTSState, continuous_nuts_step
 import WarmupHMC, SequentialMonteCarlo, LogDensityProblems
 import ReactiveKernelsPPL as PPL
+
+PPL._smc_scale(scale::NamedTuple) = WarmupHMC.scale_data(WarmupHMC.scale_from_data(scale))
+_metric(scale::AbstractVector) = Diagonal(scale)
+_metric(scale::NamedTuple) = WarmupHMC.scale_from_data(scale)
 
 struct SMCTarget{Q,B,S}
     query::Q
@@ -41,28 +45,40 @@ end
         sum(abs2, (u .- location) ./ scale) / 2
 end
 
-struct ReferenceTarget{K,A}
-    reference::SMCReference
+@kernel _structured_normal_reference(u::Vector{Float64}, location::Vector{Float64},
+        scale::AbstractMatrix{Float64}, logdet::Float64) = begin
+    z = scale \ (u .- location)
+    density = -length(u) * log(2pi) / 2 - logdet - sum(abs2, z) / 2
+end
+
+struct ReferenceTarget{R,K,A,C}
+    reference::R
     kernel::K
     ad::A
+    arguments::C
 end
 
 function _reference(target, reference)
     length(reference.location) == target.query.layout.total ||
         throw(DimensionMismatch("reference and target dimensions differ"))
     r = SMCReference(reference.location, reference.scale)
-    kernel = prepare(_normal_reference; want=:density)
+    kernel, arguments = if r.scale isa AbstractVector
+        prepare(_normal_reference; want=:density), (r.location, r.scale)
+    else
+        scale = _metric(r.scale)
+        prepare(_structured_normal_reference; want=:density),
+            (r.location, scale, first(logabsdet(scale)))
+    end
     ad = Base.invokelatest(prepare_ad, kernel, target.backend,
-        copy(r.location), r.location, r.scale; active=:u)
-    return ReferenceTarget(r, kernel, ad)
+        copy(r.location), arguments...; active=:u)
+    return ReferenceTarget(r, kernel, ad, arguments)
 end
 
 _density(t::SMCTarget, u) = t.query(u)
-_density(t::ReferenceTarget, u) = Base.invokelatest(t.kernel, u,
-    t.reference.location, t.reference.scale)::Float64
+_density(t::ReferenceTarget, u) = Base.invokelatest(t.kernel, u, t.arguments...)::Float64
 _gradient(t::SMCTarget, g, u) = first(sampler_value_and_gradient!(t.query, g, u))
 _gradient(t::ReferenceTarget, g, u) = first(Base.invokelatest(ad_value_and_gradient!,
-    t.ad, g, u, t.reference.location, t.reference.scale))
+    t.ad, g, u, t.arguments...))
 
 function _checked(value, u, endpoint, temperature, gradient=nothing)
     (isfinite(value) || value == -Inf) ||
@@ -123,10 +139,11 @@ struct SMCStage
     surviving_ancestors::Int
     moves::Int
     divergences::Int
-    kernel::NamedTuple{(:stepsize,:metric,:moves,:max_tree_depth),Tuple{Float64,Vector{Float64},Int,Int}}
+    kernel::NamedTuple
     tuning_index::Int
     evaluations::Int
     mean_squared_movement::Float64
+    mean_acceptance::Union{Nothing,Float64}
 end
 Base.:(==)(a::SMCStage, b::SMCStage) =
     all(getfield(a, k) == getfield(b, k) for k in fieldnames(SMCStage))
@@ -149,14 +166,13 @@ end
 
 function _kernel(options, d)
     return (; stepsize=options.stepsize,
-        metric=options.metric === nothing ? ones(d) : copy(options.metric),
+        metric=options.metric === nothing ? ones(d) : deepcopy(options.metric),
         moves=options.moves, max_tree_depth=options.max_tree_depth)
 end
 
 function _validate_kernel(kernel, d)
-    length(kernel.metric) == d || throw(DimensionMismatch("scheduled metric dimension differs"))
-    all(x -> isfinite(x) && x > 0, kernel.metric) ||
-        throw(ArgumentError("scheduled metric must have finite positive scales"))
+    scale = PPL._smc_scale(kernel.metric)
+    PPL._smc_scale_dimension(scale) == d || throw(DimensionMismatch("scheduled metric dimension differs"))
     isfinite(kernel.stepsize) && kernel.stepsize > 0 ||
         throw(ArgumentError("scheduled step size must be finite and positive"))
     kernel.moves isa Integer && kernel.moves >= 1 || throw(ArgumentError("invalid scheduled move count"))
@@ -174,7 +190,7 @@ function _temperatures(temperatures)
 end
 
 function _options(options, d, source, target)
-    options.metric === nothing || length(options.metric) == d ||
+    options.metric === nothing || PPL._smc_scale_dimension(options.metric) == d ||
         throw(DimensionMismatch("metric and target dimensions differ"))
     _validate_kernel(_kernel(options, d), d)
     tuning = options.tuning
@@ -201,15 +217,39 @@ function _stage_kernel(options, d, beta)
 end
 
 function PPL.tune_smc(target::SMCTarget; rng::Xoshiro, init::AbstractVector,
-        reference=nothing, previous=nothing, temperatures=(0.0, 0.05, 0.2, 0.5, 1.0),
-        pilot_steps::Integer=64, options=SMCOptions())
+        reference=nothing, previous=nothing,
+        temperatures=(0.0, 1e-6, 1e-5, 1e-4, 1e-3, 0.01, 0.1, 0.5, 1.0),
+        pilot_steps::Integer=64, pilot::Symbol=:continuous,
+        max_reflections::Integer=16, recording_target::Integer=128,
+        pilot_evaluations::Integer=1000, options=SMCOptions())
     d = target.query.layout.total
     length(init) == d || throw(DimensionMismatch("pilot initial position and target dimensions differ"))
     d > 0 || throw(ArgumentError("tuning needs at least one unconstrained coordinate"))
     all(isfinite, init) || throw(ArgumentError("pilot initial position must be finite"))
     pilot_steps >= 1 || throw(ArgumentError("pilot_steps must be positive"))
+    pilot in (:continuous, :adaptive) || throw(ArgumentError("pilot must be :continuous or :adaptive"))
+    max_reflections >= 0 || throw(ArgumentError("max_reflections must be nonnegative"))
+    recording_target >= 1 || throw(ArgumentError("recording_target must be positive"))
+    pilot_evaluations >= 1 || throw(ArgumentError("pilot_evaluations must be positive"))
     options.tuning === nothing || throw(ArgumentError("pilot options must not already contain tuning"))
     grid = _temperatures(temperatures)
+    scale = options.metric === nothing ? ones(d) : options.metric
+    scale isa AbstractVector || throw(ArgumentError("pilot initialization requires diagonal scales"))
+    _validate_kernel(_kernel(options, d), d)
+    pilot_rng = copy(rng)
+    reference_work = nothing
+    if reference === :pilot
+        previous === nothing && pilot === :adaptive || throw(ArgumentError(
+            "reference=:pilot requires an initial bridge and pilot=:adaptive"))
+        initial_source = _reference(target, SMCReference(zeros(d), ones(d)))
+        learned = _adaptive_pilot(BridgeTarget(initial_source, target, 1.0, d),
+            pilot_rng, init, scale, pilot_steps, max_reflections, recording_target,
+            pilot_evaluations, options.max_tree_depth)
+        reference = SMCReference(learned.location, learned.scale)
+        reference_work = learned.work
+    end
+    reference === nothing || reference isa SMCReference ||
+        throw(ArgumentError("reference must be SMCReference, :pilot, or nothing"))
     source = if previous === nothing
         _reference(target, reference === nothing ? SMCReference(zeros(d), ones(d)) : reference)
     else
@@ -219,7 +259,27 @@ function PPL.tune_smc(target::SMCTarget; rng::Xoshiro, init::AbstractVector,
         previous
     end
     options = _options(options, d, source, target)
-    scale = options.metric === nothing ? ones(d) : options.metric
+    if pilot === :adaptive
+        kernels, work = NamedTuple[], NamedTuple[]
+        position = Vector{Float64}(init)
+        for beta in grid
+            learned = _adaptive_pilot(BridgeTarget(source,target,beta,d), pilot_rng,
+                position, scale, pilot_steps, max_reflections, recording_target,
+                pilot_evaluations, options.max_tree_depth)
+            push!(kernels, _validate_kernel((; stepsize=learned.stepsize,
+                metric=learned.scale, moves=options.moves,
+                max_tree_depth=options.max_tree_depth), d))
+            push!(work, learned.work)
+            position = learned.position
+        end
+        return SMCTuningSchedule(deepcopy(_source_id(source)), deepcopy(target.signature),
+            source isa ReferenceTarget ? deepcopy(source.reference) : nothing,
+            grid, kernels, (; initial_rng=copy(rng), final_rng=copy(pilot_rng),
+                init=Vector{Float64}(init), steps=Int(pilot_steps), work,
+                method=pilot, max_reflections=Int(max_reflections),
+                recording_target=Int(recording_target),
+                pilot_evaluations=Int(pilot_evaluations), reference_work))
+    end
     chain = ContinuousNUTSState(copy(rng), BridgeTarget(source, target, first(grid), d);
         init=(; position=Vector{Float64}(init), squared_scale=scale.^2))
     kernels = typeof(_kernel(options, d))[]
@@ -241,7 +301,25 @@ function PPL.tune_smc(target::SMCTarget; rng::Xoshiro, init::AbstractVector,
     return SMCTuningSchedule(deepcopy(_source_id(source)), deepcopy(target.signature),
         source isa ReferenceTarget ? deepcopy(source.reference) : nothing,
         grid, kernels, (; initial_rng=copy(rng), final_rng=copy(chain.rng),
-            init=Vector{Float64}(init), steps=Int(pilot_steps), work))
+            init=Vector{Float64}(init), steps=Int(pilot_steps), work, method=pilot))
+end
+
+function _adaptive_pilot(bridge, rng, init, scale, steps, reflections, recording, evaluations, depth)
+    seed = rand(rng, UInt64)
+    result = WarmupHMC.adaptive_warmup_mcmc(Xoshiro(seed), bridge;
+        init=(; position=Vector{Float64}(init), squared_scale=scale.^2),
+        n_draws=steps, n_evaluations=evaluations, recording_target=recording,
+        max_reflections=reflections, max_tree_depth=depth,
+        nonlinear_adapt=false, monitor_ess=false)
+    data = WarmupHMC.scale_data(result.scale_options[result.active_transformation])
+    draws = result.posterior_position
+    return (; scale=data, stepsize=Float64(result.stepsize),
+        location=vec(sum(draws; dims=2))./size(draws,2),
+        position=Vector{Float64}(result.position_and_gradient.q),
+        work=(; seed, retained_draws=size(draws,2),
+            evaluations=Int(result.total_evaluation_counter),
+            divergences=Int(result.n_divergent_samples),
+            family=result.active_transformation))
 end
 
 PPL.smc_reference(state::SMCState) =
@@ -260,9 +338,21 @@ function PPL.initialize_smc(target::SMCTarget; rng::Xoshiro, particles::Integer=
     r = copy(rng)
     d, n = target.query.layout.total, Int(particles)
     options = _options(options, d, source, target)
-    positions = reference.location .+ reference.scale .* randn(r, d, n)
+    positions = _reference_draws(r, source.reference, d, n)
     return SMCState(source, target, positions, fill(1/n, n), 0.0, 0.0,
         r, options, collect(1:n), collect(1:n), SMCStage[], 0, 0)
+end
+
+function _reference_draws(rng, reference::SMCReference{<:AbstractVector}, d, n)
+    return reference.location .+ reference.scale .* randn(rng, d, n)
+end
+function _reference_draws(rng, reference::SMCReference{<:NamedTuple}, d, n)
+    scale = _metric(reference.scale)
+    positions = Matrix{Float64}(undef, d, n)
+    for i in 1:n
+        positions[:, i] = reference.location .+ scale * randn(rng, d)
+    end
+    return positions
 end
 
 # Stable ESS for the equal-weight input cloud. This calculation chooses a
@@ -312,10 +402,10 @@ function _library_stage(state, beta, delta, seed)
     positions = similar(state.positions)
     ancestors = Vector{Int}(undef, n)
     starts, finishes, divergences = Ref(0), Ref(0), Ref(0)
-    evaluations, movement = Ref(0), Ref(0.0)
+    evaluations, movement, acceptance = Ref(0), Ref(0.0), Ref(0.0)
     target = BridgeTarget(state.source, state.target, beta, d)
     options, _ = _stage_kernel(state.options, d, beta)
-    metric = Diagonal(options.metric)
+    metric = _metric(options.metric)
     mutation! = function (out, rng, step, parent, scratch)
         if step == 1
             i = starts[] += 1
@@ -333,6 +423,7 @@ function _library_stage(state, beta, delta, seed)
                     chain = transition.state
                     divergences[] += transition.divergent
                     evaluations[] += transition.stats.steps
+                    acceptance[] += transition.stats.acceptance_rate
                 end
                 u = chain.position
             end
@@ -364,7 +455,8 @@ function _library_stage(state, beta, delta, seed)
     result = fetch(task) # join every worker before returning or throwing
     result isa SMCNonfiniteError && throw(result)
     return positions, ancestors, output.logZhats[end], n*output.esses[1],
-        divergences[], evaluations[], movement[]/n
+        divergences[], evaluations[], movement[]/n,
+        d == 0 ? nothing : acceptance[]/(n*options.moves)
 end
 
 function PPL.smc_step(state::SMCState)
@@ -384,7 +476,7 @@ function PPL.smc_step(state::SMCState)
     end
     beta = _temperature(delta, state.temperature, state.options)
     rng = copy(state.rng)
-    positions, ancestors, increment, ess, divergences, evaluations, movement =
+    positions, ancestors, increment, ess, divergences, evaluations, movement, acceptance =
         _library_stage(state, beta, delta, rand(rng, UInt64))
     isfinite(increment) || throw(DomainError(increment, "non-finite SMC normalizer increment"))
     log_normalizer = state.log_normalizer+increment
@@ -393,7 +485,7 @@ function PPL.smc_step(state::SMCState)
     kernel, tuning_index = _stage_kernel(state.options, d, beta)
     stage = SMCStage(state.update, state.stage+1, beta, ess, increment,
         length(Set(ancestors)), length(Set(lineage)), d == 0 ? 0 : n*kernel.moves,
-        divergences, deepcopy(kernel), tuning_index, evaluations, movement)
+        divergences, deepcopy(kernel), tuning_index, evaluations, movement, acceptance)
     history = [state.history; stage]
     if length(history) > state.options.history_limit
         deleteat!(history, 1:length(history)-state.options.history_limit)

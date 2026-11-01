@@ -1,21 +1,38 @@
 """
     SMCReference(location, scale)
 
-A normalized product Normal distribution in the model's **unconstrained**
+A normalized Gaussian distribution in the model's **unconstrained**
 coordinates. This is an importance reference, not a draw from the model prior.
 The bridge scores its actual normalized density and the full model posterior
-(including dependent priors and the Jacobian). Both vectors are copied.
+(including dependent priors and the Jacobian). `scale` is a vector of diagonal
+scales or WarmupHMC's plain `scale_data` record (load the SMC dependencies first).
+The latter represents a correlated, bounded-reflection Gaussian without a dense
+covariance. Fields `location` and `scale` own validated copies; treat them as
+read-only. `smc_reference` returns another owned copy. A public two-dimensional
+example is `scale=(; diagonal=[sqrt(2.0),sqrt(0.02)], indices=[[1,2]],
+reflections=[[cos(pi/8),sin(pi/8)]])`, with covariance
+`[1.01 0.99; 0.99 1.01]`. See WarmupHMC's `scale_from_data`/`scale_data`
+contract for the operator representation. All sampling, scoring and mutation
+use the rebuilt data operator, including its floating-point representation.
 """
-struct SMCReference
+struct SMCReference{S}
     location::Vector{Float64}
-    scale::Vector{Float64}
-    function SMCReference(location::AbstractVector, scale::AbstractVector)
-        length(location) == length(scale) || throw(DimensionMismatch("reference location and scale"))
+    scale::S
+    function SMCReference(location::AbstractVector, scale)
+        copied = _smc_scale(scale)
+        length(location) == _smc_scale_dimension(copied) || throw(DimensionMismatch("reference location and scale"))
         all(isfinite, location) || throw(ArgumentError("reference location must be finite"))
-        all(x -> isfinite(x) && x > 0, scale) || throw(ArgumentError("reference scale must be finite and positive"))
-        new(Vector{Float64}(location), Vector{Float64}(scale))
+        new{typeof(copied)}(Vector{Float64}(location), copied)
     end
 end
+
+function _smc_scale(scale::AbstractVector)
+    all(x -> isfinite(x) && x > 0, scale) || throw(ArgumentError("scales must be finite and positive"))
+    return Vector{Float64}(scale)
+end
+_smc_scale(scale) = throw(ArgumentError("scale must be a positive vector or supported WarmupHMC scale_data record; load the SMC dependencies"))
+_smc_scale_dimension(scale::AbstractVector) = length(scale)
+_smc_scale_dimension(scale::NamedTuple) = length(scale.diagonal)
 
 """
     SMCTuningSchedule
@@ -47,7 +64,8 @@ end
                min_increment=1e-12, history_limit=128, tuning=nothing)
 
 Adaptive bridge and fixed NUTS configuration. `metric` is a vector of positive
-diagonal **scales**, not variances or precisions; `nothing` means ones. The
+diagonal **scales**, or WarmupHMC's plain `scale_data` record for a correlated
+bounded-reflection scale; `nothing` means ones. These are not precisions. The
 metric, step size and tree depth stay fixed during mutation, with no adaptation
 using the particles being moved. `tuning=tune_smc(...)` instead selects a fixed
 kernel from an independent, precomputed, bridge-specific pilot schedule.
@@ -61,7 +79,7 @@ its input state. Only the last `history_limit` stage summaries are retained.
 struct SMCOptions
     ess_fraction::Float64
     stepsize::Float64
-    metric::Union{Nothing,Vector{Float64}}
+    metric::Union{Nothing,Vector{Float64},NamedTuple}
     moves::Int
     max_tree_depth::Int
     max_stages::Int
@@ -73,8 +91,7 @@ struct SMCOptions
             history_limit=128, tuning=nothing)
         0 < ess_fraction < 1 || throw(ArgumentError("ess_fraction must be between 0 and 1"))
         isfinite(stepsize) && stepsize > 0 || throw(ArgumentError("stepsize must be finite and positive"))
-        metric === nothing || (metric isa AbstractVector && all(x -> isfinite(x) && x > 0, metric)) ||
-            throw(ArgumentError("metric must be a vector of finite positive scales"))
+        metric = metric === nothing ? nothing : _smc_scale(metric)
         moves >= 1 || throw(ArgumentError("moves must be positive"))
         max_tree_depth >= 1 || throw(ArgumentError("max_tree_depth must be positive"))
         max_stages >= 1 || throw(ArgumentError("max_stages must be positive"))
@@ -82,7 +99,7 @@ struct SMCOptions
         history_limit >= 1 || throw(ArgumentError("history_limit must be positive"))
         tuning === nothing || tuning isa SMCTuningSchedule ||
             throw(ArgumentError("tuning must be a SMCTuningSchedule or nothing"))
-        new(ess_fraction, stepsize, metric === nothing ? nothing : Vector{Float64}(metric),
+        new(ess_fraction, stepsize, metric,
             moves, max_tree_depth, max_stages, min_increment, history_limit, deepcopy(tuning))
     end
 end
@@ -105,26 +122,44 @@ function prepare_smc end
 
 """
     tune_smc(target; rng::Xoshiro, init, reference=nothing, previous=nothing,
-             temperatures=(0.0, 0.05, 0.2, 0.5, 1.0), pilot_steps=64,
+             temperatures=(0.0, 1e-6, 1e-5, 1e-4, 1e-3, 0.01, 0.1, 0.5, 1.0),
+             pilot_steps=64, pilot=:continuous, max_reflections=16,
+             recording_target=128, pilot_evaluations=1000,
              options=SMCOptions())
 
 Prepare all mutation tuning **before** creating a production cloud. `init` is
 an explicit finite unconstrained position and `rng` an explicit independent
 pilot RNG; both are copied. Do not supply production-derived positions or RNGs.
 The pilot follows the specified fixed temperature grid, adapting through
-WarmupHMC's continuous diagonal kernel, then freezes each knot's scale and step
-size. Its draws are discarded. It does not adapt from production particles.
+WarmupHMC's continuous diagonal kernel (`pilot=:continuous`), then freezes each
+knot's scale and step size. `pilot=:adaptive` instead runs ordinary adaptive
+warm-up at each knot and exports its active bounded-reflection or diagonal scale
+with that scale's own step size. Each run starts from an explicit diagonal
+initializer, avoiding a nonportable Pathfinder factor. Its draws are discarded.
+It does not adapt from production particles.
 
 For an initial bridge, supply a normalized `SMCReference` (default standard
-Normal). The reference remains fixed throughout tuning and production. For a
+Normal). With `pilot=:adaptive`, `reference=:pilot` first runs a separate pilot
+at the full target and learns a normalized Gaussian from its draw mean and
+active scale. This reference is fixed before the grid pilots and production.
+`smc_reference(schedule)` returns the resulting data-only reference. For a
 cumulative-data update pass `previous=old_prepared_target` and no reference.
 The returned schedule is valid only for these exact endpoints. Supply it as
 `SMCOptions(tuning=schedule)`. The production ESS temperature rule remains
 adaptive; this API does not claim exactly unbiased finite-particle evidence.
 
 `temperatures` must strictly increase from 0 to 1; `pilot_steps` is the positive
-number of adaptive transitions per knot. `options` supplies the initial metric,
+number of continuous adaptive transitions per knot. For `pilot=:adaptive` it is
+the retained-draw floor per warm-up, not an exact count; `pilot_evaluations`
+sets its first evaluation window, `recording_target` bounds its retained pool,
+and `max_reflections` bounds the learned operator. The schedule retains only
+scale data and scalar work records, including each pilot seed; its evaluation
+counts exclude upstream initialization and the initial step-size search.
+`options` supplies the initial diagonal metric,
 production move count and tree-depth limit; it must not itself contain tuning.
+The default grid includes near-zero knots. Supply a model-specific grid when
+its tempering regime needs finer resolution; a finite grid is not an automatic
+guarantee that the learned kernels explore every intermediate target well.
 """
 function tune_smc end
 
@@ -215,7 +250,9 @@ surviving initial ancestors, moves and divergences). `ancestors` maps the most
 recent stage to its input cloud, and `lineage` tracks the initial cloud.
 Each summary's `kernel` records the actual scales, step size, moves per particle
 and depth limit; `tuning_index` is its schedule knot (zero when untuned).
-`evaluations` sums the transition evaluation counts; `mean_squared_movement`
+`evaluations` sums the transition evaluation counts; `mean_acceptance` averages
+the transitions' tree acceptance probabilities (`nothing` for zero dimensions).
+`mean_squared_movement`
 is the mean squared unconstrained displacement from each resampled parent to
 its final child, after all moves. These describe mutation work and movement,
 not independent evidence that a posterior has been explored adequately.

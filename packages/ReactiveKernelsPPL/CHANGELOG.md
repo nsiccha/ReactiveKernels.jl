@@ -25,7 +25,14 @@ are recorded in the git history only.
   cumulative updates require fresh tuning or explicit untuned options.
   `smc_reference` returns an owned reference for initial bridges. Checkpoints
   retain tuning without rerunning pilots. Bounded stage summaries record the
-  selected kernel, evaluation count and actual particle displacement.
+  selected kernel, evaluation count, mean acceptance and particle displacement.
+- Support normalized correlated `SMCReference`s and fixed NUTS metrics from
+  WarmupHMC's plain bounded-reflection scale data. `pilot=:adaptive` learns a
+  portable active scale with its paired step size at each fixed temperature;
+  optional `reference=:pilot` learns and freezes a normalized reference before
+  the grid pilots and production. Explicit independent RNG/initial positions,
+  bounded geometry/recording pools and data-only checkpoints preserve the
+  separation from production adaptation. Requires WarmupHMC 0.2.9.
 
 ## 0.1.41
 
