@@ -200,8 +200,7 @@ function _cell_locality(p::Plan, d::_CellPushdowns)
                 found === nothing ? (isempty(requested) ? nothing : asker(first(requested)[1])) :
                     only(readers[cid][found][1].outputs).name
             end
-            status, reason, reader = if cid in have ||
-                                        (r !== nothing && _cell_lazy_view(r.op))
+            status, reason, reader = if cid in have || cid in d.views
                 (:input, isempty(requested) ? :read_whole : :read_at_rows, nothing)
             elseif r !== nothing && r.op isa _BoundConstant
                 (:data, isempty(requested) ? :read_whole : :read_at_rows, nothing)

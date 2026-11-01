@@ -61,10 +61,27 @@ function _cell_factor_graph(spec::KernelSpec, want; have = spec.have_names,
     end
     sums = NamedTuple[]
     cell_outputs = Set{ValueId}()
-    function emit(r, mapping = nothing)
+    tuple_fields = Dict{ValueId,Tuple}()
+    function emit(r, mapping = nothing, readable = r)
         mapvalue(v) = mapping === nothing ? v : mapping[canon_id(mapping_graph[], v.id)]
         ins = Tuple(mapvalue(v) for v in r.inputs)
         outs = Tuple(mapvalue(v) for v in r.outputs)
+        # Composition can leave a cell's tuple constructor beside its field
+        # reads. Preserve each field's own dependencies: a tuple of arrays is
+        # not an elementwise array operation, but reading its known field is
+        # an alias. A declared tuple may convert its fields, so leave it alone.
+        entry = _constant_tuple_entry(readable)
+        fields = entry === nothing ? nothing : get(tuple_fields, canon_id(g, only(ins).id), nothing)
+        if fields !== nothing && 1 <= entry <= length(fields) &&
+                (valtype(only(outs)) === Any || valtype(only(outs)) == valtype(fields[entry]))
+            _kernel_alias!(g, only(outs), fields[entry], identity, 0.0)
+            return
+        end
+        if r.op isa _KernelSourceOp && length(outs) == 1 && !r.effectful &&
+                valtype(only(outs)) === Any && Meta.isexpr(r.source, :tuple, length(ins)) &&
+                r.source.args == _recipe_source_names(readable)
+            tuple_fields[canon_id(g, only(outs).id)] = ins
+        end
         parts = _partial_split_parts(r; factors = true)
         if parts !== nothing
             # Asking the shared splitter for every leaf exposes every
@@ -153,8 +170,18 @@ function _cell_factor_graph(spec::KernelSpec, want; have = spec.have_names,
             mapping[canon_id(body.graph, v.id)] = fresh(v.name, valtype(v))
         end
         mapping_graph[] = body.graph
-        for q in body.recipes
-            emit(q, mapping)
+        originals = r.op.plate.kernel.lowered_recipes
+        aligned = length(originals) == length(body.recipes)
+        for (j, q) in enumerate(body.recipes)
+            # Composed recipes retain their original source argument names.
+            # Use that metadata only when it still describes this operation;
+            # a differently lowered body must never drop recipes or alias a
+            # field based on another operation's argument ordering.
+            original = aligned ? originals[j] : q
+            readable = original.op === q.op && isequal(original.source, q.source) &&
+                length(original.inputs) == length(q.inputs) &&
+                length(original.outputs) == length(q.outputs) ? original : q
+            emit(q, mapping, readable)
         end
         output = mapping[canon_id(body.graph, only(body.want).id)]
         _add_recipe!(g, (output,), r.outputs, identity, 0.0, nothing, false, output.name)
