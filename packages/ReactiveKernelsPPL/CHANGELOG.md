@@ -16,6 +16,21 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.35
+
+- Require ReactiveKernels 0.1.40. A partition sampler with `partitioned`
+  reuses shared-only intermediates across labels and local-coordinate
+  changes, refreshing them when shared coordinate values change. Cached
+  arrays own their storage, and failed refreshes remain invalid until retried
+  successfully. Full gradients retain the shared prefix's pullback.
+- Add `shared = false` to `partition_value_and_gradient!` and
+  `partition_footprint` for local derivatives only, skipping that pullback.
+  Compact destinations follow the local footprint; dense destinations keep
+  the full packed length with shared entries zero. This requires the existing
+  `partitioned` declaration; separability checks remain in force.
+- Accept bare Symbol and Pair partition declarations consistently. Prepare
+  matching kernels and AD operators for mixed concrete partition-label types.
+
 ## 0.1.34
 
 - Add optional SequentialMonteCarlo/WarmupHMC integration: `prepare_smc`,
