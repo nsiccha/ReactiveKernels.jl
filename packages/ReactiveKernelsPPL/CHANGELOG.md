@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.53
+
+- Prepare cell queries with the canonical packed `Vector{Float64}` and `Int`
+  position types, preserving strict locality through opaque scalar helpers,
+  type-selected collectors and guarded captured-array reads. Uncached queries
+  preserve local reads through other Float64 vector types, using cached
+  specializations for each packed-vector and position type, including Cartesian
+  indices. Require RK 0.1.51 for this lowering.
+- **Breaking:** direct calls to a cell query's `q.kernel` require those exact
+  argument types. Call `q(u, i)` for other vector and position types; the kernel
+  remains available for footprint analysis.
+
 ## 0.1.52
 
 - Require RK 0.1.49 for strict cell queries through a visible type-selected

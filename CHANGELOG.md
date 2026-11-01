@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.51
+
+- Carry exact exemplar argument types through selected-cell locality analysis,
+  retaining narrower inferred types at abstract ports. Scalar plate collectors
+  can then preserve locality through ordinary Julia helper calls.
+- Preserve lazy guarded reads of captured arrays while constructing selected
+  row windows. Inactive invalid indices request no rows; an active invalid
+  read still raises its bounds error in the authored cell body.
+
 ## 0.1.50
 
 - Keep repeated gathers from different columns of one source local to the

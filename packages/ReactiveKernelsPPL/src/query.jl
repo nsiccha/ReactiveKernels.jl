@@ -591,19 +591,33 @@ Construct with [`prepare_cell_query`](@ref) and call `q(u, i)`. The call paths
 carry the `Base.invokelatest` barrier, as `SamplerQuery`'s do. Not thread-safe:
 prepare one per thread.
 """
-mutable struct CellQuery{K,L,C}
+mutable struct CellQuery{K,L,C,I}
     const kernel::K
     const layout::L
     const observations::Tuple{Vararg{Symbol}}
     const prefix::C
+    const specializations::I
 end
+CellQuery(kernel, layout, observations, prefix) =
+    CellQuery(kernel, layout, observations, prefix, nothing)
 CellQuery(kernel, layout, observations) = CellQuery(kernel, layout, observations, nothing)
 
 (q::CellQuery)(u::AbstractVector{Float64}, cell) =
     Base.invokelatest(_cell_density, q, u, cell)::Float64
 (q::CellQuery)(u::AbstractVector{<:Real}, cell) = q(Vector{Float64}(u), cell)
 function _cell_density(q::CellQuery, u, cell)
-    q.prefix === nothing && return q.kernel(u, cell)
+    if q.prefix === nothing
+        u isa Vector{Float64} && cell isa Int && return q.kernel(u, cell)
+        q.specializations === nothing && return q.kernel(u, cell)
+        # Preserve local reads through views and custom packed vectors.
+        # Preparing by argument types does not copy or inspect their values.
+        args = (u, cell)
+        kernel = get!(q.specializations.kernels, typeof(args)) do
+            Base.invokelatest(prepare, q.kernel.plan;
+                exemplars = args, on_error = q.specializations.on_error)
+        end
+        return kernel(u, cell)
+    end
     length(u) == q.layout.total || throw(ContractValidationError(
         "[query] packed length $(length(u)) ≠ layout total $(q.layout.total)"))
     u isa Vector{Float64} || return _cell_density(q, Vector{Float64}(u), cell)
@@ -644,12 +658,18 @@ declaration identifies cache dependencies; it adds no per-key separability
 claim because a cell query has no partition key. A partition query checks
 separability when the same declaration is supplied.
 
-`u0` supplies a valid packed preparation point for the shared prefix; it
-defaults to zeros. It is copied. Each query owns its cache and is not
+Native preparation initially uses a packed `Vector{Float64}` and an `Int`
+cell position. Uncached query calls preserve other `AbstractVector{Float64}`
+inputs and cache specializations for their argument types, including Cartesian
+indices. Other element types are converted to `Float64`; prefix-cached queries
+also convert other packed storage types. Direct calls to `q.kernel` require
+the initial exact types.
+`u0` supplies a valid packed preparation point for the shared
+prefix; it defaults to zeros. It is copied. Each query owns its cache and is not
 thread-safe. `q.kernel` remains the original packed-coordinate kernel for
 the footprint recipe below; through-prefix dependencies are not lost.
 For cached evaluation call `q(u, i)`, and use `partition_locality(q)` to
-inspect its residual. Without a declaration, behavior is unchanged.
+inspect its residual.
 
 For an `@plate for i in eachindex(y)` loop holding one array per index
 (`y[i] .~ …`), entry `i` is the sum of iteration `i`'s densities. Several
@@ -703,10 +723,10 @@ function prepare_cell_query(built, plan::StructuralPlan, observations;
     have = (_query_have(plan)..., _CELL_PORT)
     rule = _query_partition_rule(plan, built.layout, partitioned, nothing)
     parts = _query_shared_parts(spec, plan, have, want, rule, (_CELL_PORT,), on_error)
+    exemplar = _query_exemplar(built.layout, u0)
     prefix = if parts === nothing
         nothing
     else
-        exemplar = _query_exemplar(built.layout, u0)
         cache = _prepare_value_prefix(parts, built.layout, last(only(rule)), exemplar, on_error)
         residual = Base.invokelatest(prepare, parts.residual;
             exemplars = (exemplar, 1, cache.values...), on_error)
@@ -714,9 +734,12 @@ function prepare_cell_query(built, plan::StructuralPlan, observations;
     end
     parts === nothing || ((spec, want) = _cell_query_spec(built, plan, names; locality = :ignore))
     kernel = _absent_refusal(plan, spec, have, want) do
-        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
+        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error,
+            exemplars = (exemplar, 1))
     end
-    return CellQuery(kernel, built.layout, names, prefix)
+    specializations = prefix === nothing ?
+        (; kernels = Dict{DataType,Any}(), on_error) : nothing
+    return CellQuery(kernel, built.layout, names, prefix, specializations)
 end
 
 const _CELL_PORT = :_ppl_cell
