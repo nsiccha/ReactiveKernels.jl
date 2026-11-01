@@ -7217,6 +7217,56 @@ end
 # a model-level assignment may be any number, vector or matrix. Whole-value
 # definitions used only by parameter-dependent calls fold at preparation.
 
+function _same_data_definition_split(a, b)
+    a === b && return true
+    (a === nothing || b === nothing) && return false
+    spelling(d) = (d.name, d.expr, d.label)
+    return all(k -> map(spelling, a[k]) == map(spelling, b[k]), keys(a))
+end
+
+# Expose the same eager data-only subexpressions that generation would split
+# for preparation. Named definitions let binding stage the subset needed for
+# metadata too: a helper inside `g(data) .+ exp.(z)` must have its real shape
+# before a downstream visible kernel's output axes are queried. This walk
+# reads names only, and the splitter never enters lazy arms or plate cells.
+function _split_data_definitions(plan::StructuralPlan, raw::Set{Symbol})
+    split = _structural(plan, (:split_data_definitions, _names_id(plan, raw));
+            columns = :none, fresh = false, same = _same_data_definition_split) do
+        definitions = Dict(d.name => d for d in _definitions(plan))
+        dataonly = copy(raw)
+        taken = union(raw, _all_names(plan))
+        rewritten = Dict{Symbol,Any}()
+        added = AssignmentSpec[]
+        # Rebinding can pass a bound plan. Dependency order needs no values;
+        # its bound validation must not run inside this structural cache.
+        unbound = _with(plan; columns = Dict{Symbol,ColumnData}(), n_obs = 0)
+        for name in topological_order(unbound)
+            haskey(definitions, name) || continue
+            d = definitions[name]
+            if _definition_reads(d.expr) ⊆ dataonly
+                push!(dataonly, name)
+                continue
+            end
+            stmts = Expr[]
+            ex = _split_data_calls!(stmts, name, d.expr, dataonly;
+                taken, prefix = :_rkppl_data_)
+            isempty(stmts) && continue
+            rewritten[name] = ex
+            for stmt in stmts
+                tmp, rhs = stmt.args
+                push!(added, AssignmentSpec(tmp, rhs, d.label))
+                push!(dataonly, tmp)
+            end
+        end
+        isempty(added) && return nothing
+        rewrite(d) = haskey(rewritten, d.name) ?
+            _with(d; expr = rewritten[d.name]) : d
+        (; assignments = [map(rewrite, plan.assignments); added],
+            derived = map(rewrite, plan.derived))
+    end
+    return split === nothing ? plan : _with(plan; split...)
+end
+
 # Plan names an expression reads (call heads, keyword names and function
 # values are not reads).
 # The names a definition reads. A plate column reads its inputs and the
@@ -7466,6 +7516,42 @@ function _uncached_module_data_names(plan::StructuralPlan, raw::AbstractSet{Symb
         foreach(gather_indices, ex.args)
     end
     foreach(gather_indices, values(nodes))
+    # Follow metadata through named compositions as well as direct kernel
+    # arguments. A sampled expression can still need a data-only operand's
+    # descriptor. Kernel plates expose only their metadata inputs, so this
+    # traversal does not pull shared cell captures into binding.
+    metadata_seen = Set{Symbol}()
+    function metadata_input(ex)
+        if ex isa Symbol
+            ex in metadata_seen && return
+            push!(metadata_seen, ex)
+            push!(axes, ex)
+            haskey(nodes, ex) && metadata_input(nodes[ex])
+            return
+        end
+        ex isa Expr || return
+        if _is_plate_column_expr(ex)
+            for arg in ex.args[1].args[2:end]
+                Meta.isexpr(arg, :call, 2) && arg.args[1] === :Ref && continue
+                metadata_input(arg)
+            end
+        elseif ex.head === :call && !isempty(ex.args)
+            f = ReactiveKernels._metadata_callable(ex.args[1], @__MODULE__, keys(nodes))
+            args = ex.args[2:end]
+            if f isa KernelSpec && length(args) == length(inputs(f)) &&
+                    !any(a -> a isa Expr && a.head in (:parameters, :kw, :...), args)
+                foreach(i -> metadata_input(args[i]), ReactiveKernels._kernel_metadata_inputs(f))
+            else
+                foreach(metadata_input, args)
+            end
+        elseif ex.head === :. && length(ex.args) == 2 && Meta.isexpr(ex.args[2], :tuple)
+            foreach(metadata_input, ex.args[2].args)
+        elseif Meta.isexpr(ex, :kw, 2)
+            metadata_input(ex.args[2])
+        elseif ex.head in (:ref, :tuple, :vect, :parameters)
+            foreach(metadata_input, ex.args)
+        end
+    end
     # Visible kernel outputs need descriptors for their array operands as
     # well as their plate domains. Otherwise, a data-only tuple component
     # feeding a concatenation or gather stays deferred until preparation,
@@ -7478,7 +7564,7 @@ function _uncached_module_data_names(plan::StructuralPlan, raw::AbstractSet{Symb
             if f isa KernelSpec && length(args) == length(inputs(f)) &&
                     !any(a -> a isa Expr && a.head in (:parameters, :kw, :...), args)
                 for i in ReactiveKernels._kernel_metadata_inputs(f)
-                    union!(axes, _expr_value_symbols(args[i]))
+                    metadata_input(args[i])
                 end
             end
         end
@@ -8618,6 +8704,7 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     _route_bound_values!(plan, columns)
     _absent_derived_responses!(plan, columns, frozen)
     _scalar_responses_as_observations!(plan, columns)
+    plan = _split_data_definitions(plan, Set{Symbol}(keys(columns)))
     # Value matrices bind next, as data: every later step reads them
     # exactly like a caller-supplied matrix.
     _materialize_value_matrices!(plan, columns)

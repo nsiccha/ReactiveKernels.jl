@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.39
+
+- Preserve strict cell and partition locality through nested data-only calls
+  in sampled compositions. Binding exposes eager data subexpressions and
+  follows visible kernels' metadata dependencies through named values, so
+  their actual shapes reach downstream concatenations, gathers and designs.
+  Helpers run once at their required stage; shared plate captures keep
+  preparation staging and lazy expressions retain their evaluation scope.
+
 ## 0.1.38
 
 - Require ReactiveKernels 0.1.42. A partition sampler with `partitioned`
