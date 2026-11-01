@@ -618,10 +618,11 @@ struct _CellForm
     vias::Vector{Vector{Int}}
     # A `:range_view`'s literal range, or a `:reshape`'s literal dimensions.
     literal::Any
-    # Per input, the trailing indices a gather source is read with, `(k, Colon())`
-    # for `A[I, k, :]` and `()` for a linear gather `A[I]`; `nothing` for any
-    # other input. A `Colon` keeps that axis of the source in the gather's full
-    # shape (`_cell_gather_shape`).
+    # Per input, each gather's index-input position and trailing-axis pattern,
+    # with integer indices represented by 1: `(1, Colon())` for `A[I, k, :]`.
+    # The authored operation keeps the actual indices. A `Colon` keeps that
+    # source axis in the gather's full shape (`_cell_gather_shape`).
+    # `nothing` for an input that is not gathered.
     tails::Vector{Any}
     # A `:reduce`'s reduction `(; dims, vec, drop)`: the literal axes reduced,
     # whether `vec` follows, and the axes `dropdims` drops; else `nothing`.
@@ -707,14 +708,16 @@ function _cell_form(r::Recipe; outlined::Bool = false)
     # A source's gather indices, in first-read order, and whether its gathers
     # are linear (`A[I]`) or row reads (`A[I, k...]`), the same for every read.
     gathers = Dict{Int,Tuple{Vector{Int},Bool}}()
-    tails = Dict{Int,Tuple}()
+    tails = Dict{Int,Vector{Tuple{Int,Tuple}}}()
     products = Dict{Int,Int}()
     leaves = Int[]
     param(x) = x isa Symbol && haskey(position, x)
-    # `_readonly_gather(A, I)`, RKPPL's view of a bare gathered definition: the
-    # linear gather `A[I]`.
+    # `_readonly_gather(A, I)` and `view(A, I)` have the linear gather's shape.
+    # Binding a range can turn `view(A, lo:hi)` into `view(A, bound_range)`.
+    # `operands_fit` still requires integer-vector indices.
     readonly(ex) = ex isa Expr && ex.head === :call && length(ex.args) == 3 &&
-        !(ex.args[1] in params) && _kernel_resolve_binding(mod, ex.args[1]) === _readonly_gather
+        param(ex.args[3]) && !_native_callee_shadowed(ex.args[1], params) &&
+        _cell_binding(ex.args[1], mod) in (_readonly_gather, Base.view)
     # `view(A, :, k...)`, RKPPL's in-place column read of a per-observation
     # value (`_observation_slice_views`): the column read `A[:, k...]`, as an
     # `Expr(:ref)`, or `nothing`.
@@ -731,8 +734,12 @@ function _cell_form(r::Recipe; outlined::Bool = false)
         linear = length(ex.args) == 2
         found, linear_reads = get!(() -> (Int[], linear), gathers, position[source])
         linear_reads == linear || return false
-        # Every read of one source has the same trailing indices.
-        get!(tails, position[source], tail) == tail || return false
+        # Every gather contributes its own kept axes. Different integer
+        # columns have identical shapes; their values stay in the source.
+        pattern = map(t -> t isa Colon ? t : 1, tail)
+        patterns = get!(Vector{Tuple{Int,Tuple}}, tails, position[source])
+        part = (position[index], pattern)
+        part in patterns || push!(patterns, part)
         position[index] in found || push!(found, position[index])
         push!(uses[position[source]], linear ? :linear_gather : :gather)
         push!(uses[position[index]], :index)
@@ -1082,9 +1089,10 @@ function _cell_extra_parts(f::_CellForm)
     for (j, role) in enumerate(f.roles)
         if role === :transposed
             push!(extra, (; kind = :transposed, input = j, index = 0, tail = ()))
-        elseif role === :gather && f.tails[j] !== nothing && any(t -> t isa Colon, f.tails[j])
-            for k in f.indices[j]
-                push!(extra, (; kind = :gather, input = j, index = k, tail = f.tails[j]))
+        elseif role === :gather && f.tails[j] !== nothing
+            for (k, tail) in f.tails[j]
+                any(t -> t isa Colon, tail) || continue
+                push!(extra, (; kind = :gather, input = j, index = k, tail))
             end
         end
     end

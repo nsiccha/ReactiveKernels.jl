@@ -161,6 +161,7 @@ const _PPL_TEST_FILES = (
     "test_declared_array_locations.jl",
     "test_matrix_values.jl",
     "test_row_gather_columns.jl",
+    "test_cell_gather_columns.jl",
     "test_live_matrix_axes.jl",
     "test_computed_matrix_values.jl",
     "test_named_matrix_products.jl",
