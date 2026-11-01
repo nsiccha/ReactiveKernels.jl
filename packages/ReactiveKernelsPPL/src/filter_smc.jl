@@ -73,6 +73,19 @@ and group clocks are preserved, but its training scores are not added again.
 The boundary filter must have the same source/configuration identity. The
 learning state retains the sampled pool, never that old filter or its history.
 Caller RNGs, input states and observations remain unchanged on success/failure.
+
+Supported read-only diagnostics on the returned state are `positions`
+(unconstrained static coordinates, one member per column), `parameter_mass`
+(normalized weights), `time`, `window`, `window_length`, `records` (the retained
+window; use `length(state.records)`), `predictive_logscore`, `log_normalizer`
+and `history`. Each retained history entry exposes `time`, `window`,
+`window_steps`, `parameter_ess_before`, `parameter_ess_after`, `replenished`,
+`boundary_reset`, `unique_parents`, `proposals`, `accepted`,
+`likelihood_evaluations`, `reference_evaluations` and `predictive_logscore`.
+History is capped by `history_limit`; counting `replenished` there counts only
+retained steps. For lifetime counts, accumulate the latest entry after each
+step with `history_limit >= 1`. Equal weights after resampling do not demonstrate
+mixing; inspect pre-resampling ESS, ancestry and proposal acceptance too.
 """
 function initialize_filter_smc end
 

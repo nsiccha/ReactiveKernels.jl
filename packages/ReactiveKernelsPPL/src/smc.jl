@@ -137,15 +137,27 @@ end
 
 """
     carry_smc(target, reference::SMCReference; calibration_id)
-    carry_smc(completed_state; calibration_id, scale=nothing, parameters=nothing)
+    carry_smc(completed_state; calibration_id, scale=nothing, parameters=nothing,
+              basis=nothing)
 
-Copy a normalized Gaussian reference into the target's coordinate frame for
-bounded-window updates. The first form accepts an independently learned
-reference, including `smc_reference(schedule)`. The second uses the completed
+Copy a calibrated Gaussian posterior into the target's coordinate frame for
+bounded-window updates. The first form accepts an externally calibrated
+reference. A tuning schedule's reference is a normalized proposal, not a
+posterior moment estimate. The second form uses the completed
 cloud's weighted mean and, by default, its marginal standard deviations
 (population moments, not a dense covariance). Supply a diagonal scale or a
 portable WarmupHMC `scale_data` record to preserve learned correlations.
 Zero or nonfinite marginal scales require an explicit valid scale.
+
+`basis=portable_scale` instead fits the completed cloud's weighted marginal
+variances after whitening by that scale, then replaces its diagonal magnitudes
+while retaining its learned reflection directions. Thus proposal scale inflation
+does not become posterior variance. This costs O(particles × dimension × bounded
+reflections), with O(dimension) working storage and no dense covariance. It
+discards cross-covariances in the supplied basis: exact covariance requires that
+basis to diagonalize the posterior covariance. Use an independently learned
+orientation, for example `smc_reference(schedule).scale`, in the selected frame.
+`basis` and explicit `scale` are mutually exclusive; `scale` is copied as given.
 
 This is an assumed-density approximation to the old posterior. A Gaussian
 summary is exact only for a Gaussian posterior with matching moments; fitting
@@ -213,8 +225,10 @@ For an initial bridge, supply a normalized `SMCReference` (default standard
 Normal). With `pilot=:adaptive`, `reference=:pilot` first runs a separate pilot
 at the full target and learns a normalized Gaussian from its draw mean and
 active scale. This reference is fixed before the grid pilots and production.
-`smc_reference(schedule)` returns the resulting data-only reference. For a
-cumulative-data update pass `previous=old_prepared_target` and no reference.
+`smc_reference(schedule)` returns the resulting data-only proposal reference.
+Its active scale is not a posterior moment estimate: for a subsequent window,
+fit the completed cloud with `carry_smc(...; basis=scale)`. For a cumulative-data
+update pass `previous=old_prepared_target` and no reference.
 The returned schedule is valid only for these exact endpoints. Supply it as
 `SMCOptions(tuning=schedule)`. The production ESS temperature rule remains
 adaptive; this API does not claim exactly unbiased finite-particle evidence.
@@ -240,6 +254,9 @@ function tune_smc end
 Return an owned, data-only normalized reference for an initial bridge, or
 `nothing` for a posterior-to-posterior update. An update uses the previous
 prepared posterior as its source and does not need the original reference.
+This returns the initial proposal distribution, not posterior moments from a
+completed cloud. Use `carry_smc(completed; basis=reference.scale, ...)` to fit
+moments in a learned basis before carrying a posterior into a new window.
 """
 function smc_reference end
 smc_reference(schedule::SMCTuningSchedule) = deepcopy(schedule.reference)

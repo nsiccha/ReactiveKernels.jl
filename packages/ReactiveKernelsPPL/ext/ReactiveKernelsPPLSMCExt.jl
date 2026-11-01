@@ -406,14 +406,18 @@ end
 PPL.smc_reference(state::SMCState) =
     state.source isa ReferenceTarget ? deepcopy(state.source.reference) : nothing
 
-function PPL.carry_smc(state::SMCState; calibration_id::AbstractString, scale=nothing,parameters=nothing)
+function PPL.carry_smc(state::SMCState; calibration_id::AbstractString, scale=nothing,
+        parameters=nothing,basis=nothing)
     state.temperature == 1 || throw(ArgumentError("complete the bridge before carrying its posterior"))
     isempty(calibration_id) && throw(ArgumentError("calibration_id must identify this posterior summary"))
+    scale===nothing || basis===nothing || throw(ArgumentError("supply a calibrated scale or a basis to refit, not both"))
     projection=parameters===nothing ? nothing :
         PPL._smc_parameter_projection(state.target.query.layout,parameters)
     positions=projection===nothing ? state.positions : view(state.positions,projection.indices,:)
     location = positions * state.weights
-    if scale === nothing
+    if basis !== nothing
+        scale=_posterior_scale_in_basis(positions,state.weights,location,basis)
+    elseif scale === nothing
         variance = zeros(length(location))
         for j in axes(positions, 2), i in eachindex(location)
             variance[i] += state.weights[j] * abs2(positions[i,j]-location[i])

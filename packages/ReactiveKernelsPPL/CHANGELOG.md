@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.46
+
+- Add `carry_smc(completed; basis=portable_scale)` to fit weighted posterior
+  moments in a supplied bounded-reflection basis. The learned orientation is
+  retained, while proposal magnitudes are replaced by posterior moments; no
+  dense covariance or retained cloud is introduced. Explicit `scale` keeps its
+  existing copy-as-given meaning. Clarify that a tuning reference is a normalized
+  proposal and need not have posterior covariance.
+- Document read-only learning-state positions, weights, retained-window length
+  and bounded replenishment/acceptance diagnostics for consumers.
+
 ## 0.1.45
 
 - Add selected-static `carry_smc(completed; parameters=...)` and
