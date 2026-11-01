@@ -1053,7 +1053,7 @@ function _cell_capture_positions(r::Recipe, static_type; branch_read = nothing)
         roots[k] in wants && continue
         reads = _cell_capture_reader(inner, roots, atomic, roots[k];
             branch_read = branch_read === nothing ? nothing :
-                (b, tail) -> branch_read(k, b, tail))
+                (b, via, tail) -> branch_read(k, b, via, tail))
         reads === nothing && continue
         typed = all(reads) do (b, via)
             lane = static_type(r.inputs[1 + b])
@@ -1120,14 +1120,14 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid; branch_read = not
             q, via = read isa Symbol ? (read, nothing) : (read.args[2], read.args[1])
             b = root(params, recipe, q)
             (b === nothing || b in atomic) && return nothing
-            # A branch may not force an inactive index lookup. Only a direct
-            # read with bound, in-range indices is eligible for a window.
-            if branch
-                via === nothing && branch_read !== nothing &&
-                    branch_read(b, tails[j]) || return nothing
-            end
-            w = via === nothing ? 0 : via_root(params, recipe, via)
+            w = via === nothing ? 0 : branch ? root(params, recipe, via) :
+                via_root(params, recipe, via)
             (w === nothing || (w != 0 && !(w in atomic)) || w == b) && return nothing
+            # A branch may not force an inactive index lookup: both the
+            # optional shared lookup and its result must be bound and valid.
+            if branch
+                branch_read !== nothing && branch_read(b, w, tails[j]) || return nothing
+            end
             (b, w) in found || push!(found, (b, w))
         end
     end
@@ -1210,7 +1210,7 @@ function _cell_bound_capture_check(p::Plan, producers, static_type, known, outli
             f.kind === :hcat ? _cell_hcat_shape(Tuple(parts)) :
             _plate_broadcast_shape(Tuple(parts))
     end
-    function valid(r, capture, lane, tail)
+    function valid(r, capture, lane, via, tail)
         indices = bound(r.inputs[1 + lane])
         indices === nothing && return false
         indices = something(indices)
@@ -1218,7 +1218,15 @@ function _cell_bound_capture_check(p::Plan, producers, static_type, known, outli
         s = shape(r.inputs[1 + capture])
         s === nothing && return false
         linear = LinearIndices(s)
+        shared = via == 0 ? nothing : bound(r.inputs[1 + via])
+        via == 0 || shared !== nothing &&
+            _cell_positions_type(typeof(something(shared))) || return false
         all(indices) do qs
+            if via != 0
+                source = something(shared)
+                checkbounds(Bool, source, qs) || return false
+                qs = source[qs]
+            end
             qs isa Integer && (qs = (qs,))
             all(qs) do q
                 checkbounds(Bool, linear, q, tail...)
@@ -1396,7 +1404,8 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
     for r in p.recipes
         r.op isa _AuthoredPlateCellOp || continue
         positions, unknown = _cell_capture_positions(r, static_type;
-            branch_read = (capture, lane, tail) -> branch_read(r, capture, lane, tail))
+            branch_read = (capture, lane, via, tail) ->
+                branch_read(r, capture, lane, via, tail))
         isempty(positions) || (captures[r.id] = positions)
         isempty(unknown) || (untyped[r.id] = unknown)
         foreach(k -> get!(refused, cidof(r.inputs[1 + k]), :untyped_index), unknown)
