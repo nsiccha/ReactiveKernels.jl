@@ -72,6 +72,7 @@ const _MATRIX_CORE_TESTS = (
     "test_type_stability.jl",
     "test_value_metadata.jl",
     "test_type_selected_branches.jl",
+    "test_cell_exemplar_types.jl",
     "test_nested_source_inference.jl",
     "test_authored_scan.jl",
     "test_scan_terminal_minima.jl",

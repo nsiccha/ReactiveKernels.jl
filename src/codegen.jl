@@ -4694,7 +4694,8 @@ function _lower_with_ops_collecting(p::Plan;
     # (`_cell_outlined_pushdowns`), so `p` is the plan lowered from here on.
     cells = nothing
     if inline_embedded && pushdowns && type_hints === nothing
-        p, cells = outline ? _cell_outlined_pushdowns(p) : (p, _cell_pushdowns(p))
+        p, cells = outline ? _cell_outlined_pushdowns(p; argument_types = exemplar_types) :
+            (p, _cell_pushdowns(p; argument_types = exemplar_types))
         # A value a cell reads at rows but would compute whole is refused or
         # reported by name (`locality`, plate_partition.jl).
         cells === nothing || _cell_locality_check!(p, cells)

@@ -1130,6 +1130,19 @@ values or have effects remain dynamic. Analysis evaluates neither the
 condition nor an arm, and does not infer row locality for the vector-flattening
 arm merely because the scalar arm is local.
 
+`prepare(...; exemplars=(...))` supplies its checked exact input types to
+this locality analysis as well as native plate lowering. Abstract port
+declarations retain narrower inferred types. This lets a scalar plate stay
+local through an opaque numerical helper whose result is inferable for the
+actual array type but not for an abstract array interface. Exemplar values
+and lengths are not specialized into the emitted body.
+
+A captured array read can remain inside a lazy condition, including a guard
+that skips index zero. Building its row window requests only valid positions;
+the authored condition and indexing expression remain in the cell. An active
+invalid index still throws when that expression is reached, and an inactive
+invalid index does not fetch a row.
+
 A value a cell reads at its rows but whose producer has no row form was
 computed whole in every cell, silently. The rule is now checked at
 preparation: a value that every reader of the evaluation needs only at some

@@ -603,10 +603,15 @@ CellQuery(kernel, layout, observations) = CellQuery(kernel, layout, observations
     Base.invokelatest(_cell_density, q, u, cell)::Float64
 (q::CellQuery)(u::AbstractVector{<:Real}, cell) = q(Vector{Float64}(u), cell)
 function _cell_density(q::CellQuery, u, cell)
+    # As in sampler and partition queries, native preparation uses the
+    # canonical packed storage type. Views and other real vectors retain
+    # their public query behavior by conversion at this boundary.
+    u isa Vector{Float64} || return _cell_density(q, Vector{Float64}(u), cell)
+    cell isa Integer && !(cell isa Union{Int,Bool}) &&
+        return _cell_density(q, u, Int(cell))
     q.prefix === nothing && return q.kernel(u, cell)
     length(u) == q.layout.total || throw(ContractValidationError(
         "[query] packed length $(length(u)) ≠ layout total $(q.layout.total)"))
-    u isa Vector{Float64} || return _cell_density(q, Vector{Float64}(u), cell)
     cached = _refresh_partition_prefix!(q.prefix.cache, u)
     residual = _query_residual(q.prefix, cell, (u, cell, cached...))
     residual(u, cell, cached...)
@@ -644,12 +649,14 @@ declaration identifies cache dependencies; it adds no per-key separability
 claim because a cell query has no partition key. A partition query checks
 separability when the same declaration is supplied.
 
-`u0` supplies a valid packed preparation point for the shared prefix; it
-defaults to zeros. It is copied. Each query owns its cache and is not
+Native preparation uses the types of a packed `Vector{Float64}` and an `Int`
+cell position. Query calls convert other real vectors and integer positions
+to these types. `u0` supplies a valid packed preparation point for the shared
+prefix; it defaults to zeros. It is copied. Each query owns its cache and is not
 thread-safe. `q.kernel` remains the original packed-coordinate kernel for
 the footprint recipe below; through-prefix dependencies are not lost.
 For cached evaluation call `q(u, i)`, and use `partition_locality(q)` to
-inspect its residual. Without a declaration, behavior is unchanged.
+inspect its residual.
 
 For an `@plate for i in eachindex(y)` loop holding one array per index
 (`y[i] .~ …`), entry `i` is the sum of iteration `i`'s densities. Several
@@ -703,10 +710,10 @@ function prepare_cell_query(built, plan::StructuralPlan, observations;
     have = (_query_have(plan)..., _CELL_PORT)
     rule = _query_partition_rule(plan, built.layout, partitioned, nothing)
     parts = _query_shared_parts(spec, plan, have, want, rule, (_CELL_PORT,), on_error)
+    exemplar = _query_exemplar(built.layout, u0)
     prefix = if parts === nothing
         nothing
     else
-        exemplar = _query_exemplar(built.layout, u0)
         cache = _prepare_value_prefix(parts, built.layout, last(only(rule)), exemplar, on_error)
         residual = Base.invokelatest(prepare, parts.residual;
             exemplars = (exemplar, 1, cache.values...), on_error)
@@ -714,7 +721,8 @@ function prepare_cell_query(built, plan::StructuralPlan, observations;
     end
     parts === nothing || ((spec, want) = _cell_query_spec(built, plan, names; locality = :ignore))
     kernel = _absent_refusal(plan, spec, have, want) do
-        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
+        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error,
+            exemplars = (exemplar, 1))
     end
     return CellQuery(kernel, built.layout, names, prefix)
 end

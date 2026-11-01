@@ -557,6 +557,23 @@ end
 @inline _cell_linear_row(shape::Tuple, q::AbstractVector{<:Integer}) =
     Int[_cell_linear_row(shape, p) for p in q]
 
+# A captured array's indices are still read by the authored cell body,
+# possibly inside a lazy branch. Window construction requests only existing
+# rows; it must not turn an inactive out-of-bounds read into an eager error.
+# The window retains the full axes and the original indexing expression, so
+# an active invalid read still throws at that read.
+@inline function _cell_capture_rows(shape::Tuple, positions)
+    domain = CartesianIndices(shape)
+    Int[_cell_linear_row(shape, q) for q in
+        (positions isa Integer ? (positions,) : positions) if checkbounds(Bool, domain, q)]
+end
+
+@inline function _cell_capture_via_rows(source, positions)
+    _cell_joined_rows(positions) do q
+        checkbounds(Bool, source, q) ? source[q] : ()
+    end
+end
+
 # The index a row of a gather index holds, or the indices its rows hold.
 @inline _cell_gather_row(index, row::Integer) = Int(only(index))
 @inline _cell_gather_row(index, rows::Vector{Int}) = Int[i for i in index]
@@ -1263,14 +1280,17 @@ end
 # array rank: forgetting it here also loses the scalar type of `exp(a[1])`.
 # Stand-ins are used for row forms and their transposes, whose element
 # operations and axes are known, never to infer an arbitrary function's
-# behavior on an abstract array.
-function _cell_value_types(p::Plan; outlined = Set{Int}(),
-                           known = IdDict{Recipe,Any}())
+# behavior on an abstract array. Exact exemplar types, when supplied by
+# preparation, survive abstract port declarations that already contain them.
+function _cell_value_types(p::Plan; argument_types = nothing,
+                           outlined = Set{Int}(), known = IdDict{Recipe,Any}())
+    argument_types === nothing && (argument_types = Any[valtype(v) for v in p.have])
     bound = Set(canon_id(p.graph, only(r.outputs).id) for r in p.recipes
                 if r.op isa _BoundConstant)
-    _plan_value_types(p, Any[valtype(v) for v in p.have]) do r, input_types
+    _plan_value_types(p, argument_types) do r, input_types
         r.op isa _BoundConstant && return (typeof(r.op.value),)
-        inputs = Any[valtype(v) !== Any && !(canon_id(p.graph, v.id) in bound) ?
+        inputs = Any[valtype(v) !== Any && !(T <: valtype(v)) &&
+                     !(canon_id(p.graph, v.id) in bound) ?
                      valtype(v) : T for (v, T) in zip(r.inputs, input_types)]
         inferred = if length(r.outputs) == 1 && r.op isa _AuthoredPlateOp
             (_cell_plate_output_type(r.op, inputs),)
@@ -1286,8 +1306,8 @@ function _cell_value_types(p::Plan; outlined = Set{Int}(),
         fallback = nothing
         map(eachindex(r.outputs)) do k
             declared = valtype(r.outputs[k])
-            declared !== Any && return declared
             T = inferred[k]
+            declared !== Any && !(T <: declared) && return declared
             if T === Any && literal !== nothing
                 S = inputs[first(literal)]
                 S isa Type && S <: AbstractArray && eltype(S) <: Number && return eltype(S)
@@ -1689,7 +1709,8 @@ _cell_row_role(role) =
 # already analyzed, by recipe.
 function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
                          blocked::Union{Nothing,Set{Int}} = nothing,
-                         known::IdDict{Recipe,Any} = IdDict{Recipe,Any}())
+                         known::IdDict{Recipe,Any} = IdDict{Recipe,Any}(),
+                         argument_types = nothing)
     any(r -> r.op isa _AuthoredPlateCellOp, p.recipes) || return nothing
     g = p.graph
     cidof(v) = canon_id(g, v.id)
@@ -1699,11 +1720,11 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
         foreach(o -> push!(get!(producers, cidof(o), Recipe[]), r), r.outputs)
         foreach(c -> push!(get!(readers, c, Recipe[]), r), unique(map(cidof, r.inputs)))
     end
-    types = _cell_value_types(p; outlined, known)
+    types = _cell_value_types(p; argument_types, outlined, known)
     static_type(v) = let candidates = get(producers, cidof(v), Recipe[])
         length(candidates) == 1 && only(candidates).op isa _BoundConstant ?
             typeof(only(candidates).op.value) :
-            valtype(v) === Any ? get(types, cidof(v), Any) : valtype(v)
+            get(types, cidof(v), valtype(v))
     end
     branch_read = _cell_bound_capture_check(p, producers, static_type, known, outlined)
     # An input-backed view's output is read like a HAVE port: at rows as a view.
@@ -1994,8 +2015,8 @@ end
 # such as `w = exp.(a[1])` has no row form itself, but its read must still
 # demand only row 1 of `a`. Splitting respects lazy branches and broadcast
 # fusion. Unknown index/container types keep their authored recipe.
-function _cell_scalar_reads(p::Plan)
-    types = _cell_value_types(p)
+function _cell_scalar_reads(p::Plan; argument_types = nothing)
+    types = _cell_value_types(p; argument_types)
     type_of(v) = get(types, canon_id(p.graph, v.id), Any)
     # Input and bound arrays already support a scalar read without computing
     # any other element. They need no implementation cell or extra report entry.
@@ -2034,7 +2055,7 @@ function _cell_scalar_reads(p::Plan)
     old = q.graph
     g = Graph(copy(old.values), copy(old.recipes), copy(old.producers),
               copy(old.aliases), old.version)
-    types = _cell_value_types(q; outlined)
+    types = _cell_value_types(q; argument_types, outlined)
     next_id = minimum((r.id for r in q.recipes); init = 0) - 1
     recipes = Recipe[]
     changed = !isempty(outlined)
@@ -2074,10 +2095,10 @@ has no cell). A recipe is outlined when a reader asks for its value at
 rows and it has no row form; the outline stays while the recipe is pushed, and
 is dropped for good otherwise. `p` itself when nothing is outlined.
 """
-function _cell_outlined_pushdowns(p::Plan)
+function _cell_outlined_pushdowns(p::Plan; argument_types = nothing)
     any(r -> r.op isa _AuthoredPlateCellOp, p.recipes) || return p, nothing
     if any(r -> r.op isa _KernelSourceOp && r.op.f isa _KernelBranch, p.recipes)
-        types = _cell_value_types(p)
+        types = _cell_value_types(p; argument_types)
         recipes = map(p.recipes) do r
             selected = _type_selected_branch(r,
                 Any[get(types, canon_id(p.graph, v.id), Any) for v in r.inputs])
@@ -2087,7 +2108,7 @@ function _cell_outlined_pushdowns(p::Plan)
             p = _partial_subplan(p, p.have, p.want, recipes)
         end
     end
-    p, scalar_outlined = _cell_scalar_reads(p)
+    p, scalar_outlined = _cell_scalar_reads(p; argument_types)
     known = IdDict{Recipe,Any}()
     byid = Dict(r.id => r for r in p.recipes)
     candidates = Dict{Int,Any}()
@@ -2099,7 +2120,7 @@ function _cell_outlined_pushdowns(p::Plan)
         q, outlined = _cell_outline(p, kept)
         union!(outlined, scalar_outlined)
         blocked = Set{Int}()
-        cells = _cell_pushdowns(q; outlined, blocked, known)
+        cells = _cell_pushdowns(q; argument_types, outlined, blocked, known)
         lost = Int[id for id in keys(kept) if cells === nothing || !(id in cells.recipes)]
         if !isempty(lost)
             union!(refused, lost)
@@ -2351,13 +2372,15 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
                 index = canon_id(d.graph, r.inputs[k].id)
                 at = _cell_operand_row!(e, index, U)
                 via == 0 ? Expr(:call, _cell_ref(:_cell_gather_row), at, U) :
-                    Expr(:call, _cell_ref(:_cell_via_rows),
+                    Expr(:call, _cell_ref(r.op isa _AuthoredPlateOp ?
+                        :_cell_capture_via_rows : :_cell_via_rows),
                         e.names[canon_id(d.graph, r.inputs[via].id)], at)
             end
             at = length(ats) == 1 ? only(ats) :
                 Expr(:call, _cell_ref(:_cell_gather_rows), ats...)
             role === :gather ||
-                (at = Expr(:call, _cell_ref(:_cell_linear_row), _cell_shape!(e, icid), at))
+                (at = Expr(:call, _cell_ref(r.op isa _AuthoredPlateOp ?
+                    :_cell_capture_rows : :_cell_linear_row), _cell_shape!(e, icid), at))
             reads[j] = _cell_request!(e, icid, _cell_bind!(e, :cell_row, _cell_canon(e, at)))
         elseif role === :factor_leaf
             # The rows of the product `A * w` this operand broadcasts: rows of `A`.
@@ -2447,7 +2470,8 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
             # One index lane read directly: its entries' positions in the
             # window's rows are computed apart from the gather (once per label
             # with a plan), and the gather `v[I]` of that slice reads them.
-            if length(f.indices[j]) == 1 && only(f.vias[j]) == 0
+            if !(r.op isa _AuthoredPlateOp) &&
+                    length(f.indices[j]) == 1 && only(f.vias[j]) == 0
                 index = canon_id(d.graph, r.inputs[only(f.indices[j])].id)
                 if !(index in d.pushed) && haskey(e.rows, (index, U))
                     slice = e.rows[(index, U)]
@@ -2518,9 +2542,11 @@ end
 # (`_cell_partition_positions`), or those `via` holds at them.
 function _cell_capture_request!(e::_CellEmitter, cid::ValueId, slice, via = nothing;
                                 rows::Bool = false)
-    position = _cell_bind!(e, :cell_read, _cell_capture_element(slice, via; rows))
+    position = _cell_bind!(e, :cell_read, via === nothing ?
+        _cell_capture_element(slice, nothing; rows) :
+        Expr(:call, _cell_ref(:_cell_capture_via_rows), via, slice))
     _cell_request!(e, cid, _cell_bind!(e, :cell_row, _cell_canon(e,
-        Expr(:call, _cell_ref(:_cell_linear_row), _cell_shape!(e, cid), position))))
+        Expr(:call, _cell_ref(:_cell_capture_rows), _cell_shape!(e, cid), position))))
 end
 
 # The positions a cell reads of a captured value: its batched element (one
