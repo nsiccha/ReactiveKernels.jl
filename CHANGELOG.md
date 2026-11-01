@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.50
+
+- Keep repeated gathers from different columns of one source local to the
+  requested cells. Gather shape analysis now retains each pattern of surviving
+  axes instead of requiring identical trailing indices. Dotted predictors such
+  as `B[I, 1] .* x .+ B[I, 2] .* z` preserve locality through packed views,
+  reshapes and matrix products, including when data is bound.
+- Preserve the row form of `view(A, I)` when binding precomputes an integer
+  range into an input. The same integer-index checks as ordinary gathers apply.
+
 ## 0.1.49
 
 - Preserve a visible lazy branch's selected shape and row form when concrete
