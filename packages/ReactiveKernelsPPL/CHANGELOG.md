@@ -16,6 +16,24 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.51
+
+- Add optional `partitioned` and `u0` to `prepare_cell_query` and
+  `prepare_partition`. A declared shared prefix caches whole group-level
+  producers before strict residual lowering. Shared-coordinate changes,
+  including in-place edits, refresh owned cache values; local changes reuse
+  them. Partition queries retain the sampler's separability check.
+- `partition_locality(q)` reports the executed residual. `q.kernel` retains
+  the original packed-coordinate footprint, including prefix dependencies;
+  call `q(u, index)` for cached evaluation. Undeclared queries retain their
+  behavior. Cached queries copy non-dense position vectors at preparation's
+  dense boundary and require separate instances for concurrent callers.
+- Apply the shared split before strict sampler preparation and preserve full
+  and local gradients through the prefix. Each query compares shared
+  coordinates in O(shared dimension); refreshing adds the shared computation.
+  Cache storage grows with group-level outputs, not row-capable observations.
+
+
 ## 0.1.48
 
 - Add `carry_smc(completed; basis=:fit, max_reflections=16, maxiter=100)`.
