@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.35
+
+- Preserve natural scalar expressions in strict partition queries through
+  ReactiveKernels 0.1.40. Scalar offsets beside a design product retain their
+  broadcast shape instead of passing through an opaque row-normalization
+  helper. Shared predictors may have a different row count from observations;
+  ordinary indexed `exp` and subtraction need no model annotations.
+
 ## 0.1.34
 
 - Add optional SequentialMonteCarlo/WarmupHMC integration: `prepare_smc`,

@@ -990,8 +990,12 @@ producers:
   `A[I, k]` (an integer vector input `I`, integer literals `k`), column reads
   `A[:, k]` (also written as the view `view(A, :, k)`, which RKPPL reads a
   per-observation value's column through), products `A * w` of two inputs,
-  and literal-position reads `a[1]` of an array of numbers (read whole, as in
-  `z .* tau[1]`). One source may be
+  and literal-position reads `a[1]` of an array of numbers (as in
+  `z .* tau[1]`). Scalar vector reads retain their own row demand, including
+  named expressions such as `w = exp.(a[1])` and `shift = a[2] .- a[1]`.
+  The vector's row forms compute those indexed rows; a following broadcast
+  also requests its selected rows. A shared predictor may have a different
+  row count from the observation. One source may be
   gathered by several index vectors, as in `exp.(t[r1]) .+ exp.(t[r2])`; it
   is then computed at the rows of every index;
 - such a gather alone, also written as the read-only view
@@ -1097,9 +1101,10 @@ whole by another refused value is marked as such in the report.
 `partition_locality(kernel)` lists every value a cell reads with its status
 (`:rows`, `:input`, `:data`, `:scalar`, `:shared`, `:whole`) and reason. A
 scalar's type must be known, by declaration, bound data or inference from its
-inputs: an undeclared value with no row form may be an array computed whole,
-and is refused as `:untyped`, naming the declaration (`s::Float64 = …`) that
-settles it.
+inputs. The analysis retains array rank through row forms and infers scalar
+indexed expressions without author annotations. A value whose type remains
+unknown and has no row form may be an array computed whole; it is reported
+as `:untyped`.
 
 ### A cell factored at its sums
 

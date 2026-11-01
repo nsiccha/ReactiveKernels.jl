@@ -966,6 +966,51 @@ _cell_element_type(S) =
         AbstractArray{eltype(S),ndims(S)} :
     S isa Type && S !== Union{} && S <: Number ? S : Any
 
+# One type analysis for row demand, scalar reads and locality reporting. Keep
+# array rank: forgetting it here also loses the scalar type of `exp(a[1])`.
+# Stand-ins are used only for row forms, whose element operations and axes are
+# known, never to infer an arbitrary function's behavior on an abstract array.
+function _cell_value_types(p::Plan; outlined = Set{Int}(),
+                           known = IdDict{Recipe,Any}())
+    bound = Set(canon_id(p.graph, only(r.outputs).id) for r in p.recipes
+                if r.op isa _BoundConstant)
+    _plan_value_types(p, Any[valtype(v) for v in p.have]) do r, input_types
+        r.op isa _BoundConstant && return (typeof(r.op.value),)
+        inputs = Any[valtype(v) !== Any && !(canon_id(p.graph, v.id) in bound) ?
+                     valtype(v) : T for (v, T) in zip(r.inputs, input_types)]
+        inferred = if length(r.outputs) == 1 && r.op isa _AuthoredPlateOp
+            (_cell_plate_output_type(r.op, inputs),)
+        elseif length(r.outputs) == 1 && r.op isa _AuthoredPlateCellOp && !r.op.rows
+            (_checked_plate_element!(_UninferredValue[], r.op.plate,
+                                     inputs[2:end], Symbol[]),)
+        else
+            _recipe_inferred_output_types(r, inputs)
+        end
+        # A checked literal array read has the array's element type even when
+        # inference through a partial-evaluation closure loses that fact.
+        literal = length(r.outputs) == 1 ? _footprint_literal_read(r) : nothing
+        fallback = nothing
+        map(eachindex(r.outputs)) do k
+            declared = valtype(r.outputs[k])
+            declared !== Any && return declared
+            T = inferred[k]
+            if T === Any && literal !== nothing
+                S = inputs[first(literal)]
+                S isa Type && S <: AbstractArray && eltype(S) <: Number && return eltype(S)
+            end
+            if T === Any && !(r.op isa _AuthoredPlateOp)
+                f = get!(() -> _cell_form(r; outlined = r.id in outlined), known, r)
+                if f !== nothing
+                    fallback === nothing && (fallback = _recipe_inferred_output_types(r,
+                        Any[_cell_standin_type(S) for S in inputs]))
+                    T = _cell_element_type(fallback[k])
+                end
+            end
+            T === Union{} ? Any : T
+        end
+    end
+end
+
 # `*` as the closure resolves it is Base's, or the native body's companion
 # for it (`_native_mul`, core.jl).
 function _cell_base_product(callee, mod, params)
@@ -1112,6 +1157,7 @@ plan, producers first.
 """
 struct _CellPushdowns
     graph::Graph
+    types::Dict{ValueId,Any}
     pushed::Set{ValueId}
     recipes::Set{Int}
     producer::Dict{ValueId,Recipe}
@@ -1162,50 +1208,11 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
         foreach(o -> push!(get!(producers, cidof(o), Recipe[]), r), r.outputs)
         foreach(c -> push!(get!(readers, c, Recipe[]), r), unique(map(cidof, r.inputs)))
     end
-    have_types = Dict{ValueId,Any}(cidof(v) => valtype(v) for v in p.have)
-    types = Dict{ValueId,Any}()
-    # A value's type: bound data's own type, else the type the reading value
-    # declares, else the one its producer's output declares (an alias such as
-    # `e = lr` reads `lr` under a name of its own that declares nothing), else
-    # what Julia infers the producer returns from its inputs' types, as the
-    # plan types plate inputs (`_recipe_inferred_output_types`; no recipe is
-    # run), or for an authored plate an array of its cell's result type
-    # (`_cell_plate_output_type`). Julia infers nothing for a broadcast over an
-    # abstract array type (`exp.(lr)` with `lr::AbstractVector{Float64}`), so a
-    # value with a row form, whose elements Base computes from its operands'
-    # elements, is typed by its element type and rank from concrete arrays of
-    # its operands' element types (`_cell_element_type`). A dotted value
-    # `e = exp.(lr)` read at literal positions, `e[1]`, is so known to hold
-    # numbers.
-    function value_type(cid)
-        haskey(types, cid) && return types[cid]
-        candidates = get(producers, cid, Recipe[])
-        T = if length(candidates) != 1
-            get(have_types, cid, Any)
-        else
-            r = only(candidates)
-            k = findfirst(o -> cidof(o) == cid, r.outputs)
-            declared = valtype(r.outputs[k])
-            inputs = _input_list(static_type, r.inputs)
-            inferred = declared !== Any ? declared :
-                r.op isa _AuthoredPlateOp ?
-                    (length(r.outputs) == 1 ? _cell_plate_output_type(r.op, inputs) : Any) :
-                r.op isa _AuthoredPlateCellOp && !r.op.rows ?
-                    _checked_plate_element!(_UninferredValue[], r.op.plate,
-                                            inputs[2:end], Symbol[]) :
-                    _recipe_inferred_output_types(r, inputs)[k]
-            if inferred === Any && !(r.op isa _AuthoredPlateOp) && form(cid) !== nothing
-                inferred = _cell_element_type(_recipe_inferred_output_types(r,
-                    Any[_cell_standin_type(T) for T in inputs])[k])
-            end
-            inferred === Union{} ? Any : inferred
-        end
-        types[cid] = T
-    end
+    types = _cell_value_types(p; outlined, known)
     static_type(v) = let candidates = get(producers, cidof(v), Recipe[])
         length(candidates) == 1 && only(candidates).op isa _BoundConstant ?
             typeof(only(candidates).op.value) :
-            valtype(v) === Any ? value_type(cidof(v)) : valtype(v)
+            valtype(v) === Any ? get(types, cidof(v), Any) : valtype(v)
     end
     # A lazy view's output is read like a HAVE port: at rows as a view.
     fixed = Set(cidof(v) for v in Iterators.flatten((p.have, p.want)))
@@ -1349,7 +1356,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
         end
     end
     recipes = Set(only(producers[cid]).id for cid in pushed)
-    _CellPushdowns(g, pushed, recipes,
+    _CellPushdowns(g, types, pushed, recipes,
         Dict(cid => only(producers[cid]) for cid in pushed), forms, captures, batched,
         Dict{Int,Int}(), Dict{Int,Any}(), Dict(r.id => k for (k, r) in enumerate(p.recipes)),
         requests, refused, dropped, untyped)
@@ -1448,6 +1455,112 @@ function _cell_outline(p::Plan, outlines::Dict{Int,Any})
     _partial_subplan(template, p.have, p.want, recipes), outlined
 end
 
+# A scalar vector index, proven from operand types. Inspect the resolved
+# getindex binding as for row forms; a shadowed function is not indexing.
+function _cell_scalar_index(native, params, mod, inputs, type_of)
+    if Meta.isexpr(native, :call, 3) &&
+       !_native_callee_shadowed(native.args[1], params) &&
+       _cell_binding(native.args[1], mod) === Base.getindex
+        native = Expr(:ref, native.args[2:end]...)
+    end
+    Meta.isexpr(native, :ref, 2) && native.args[1] in params || return nothing
+    a = inputs[findfirst(==(native.args[1]), params)]
+    index = native.args[2]
+    position = findfirst(==(index), params)
+    i = position === nothing ? nothing : inputs[position]
+    A = type_of(a)
+    I = i === nothing ? typeof(index) : type_of(i)
+    A isa Type && A <: AbstractVector && I isa Type && I <: Integer && !(I <: Bool) ||
+        return nothing
+    (; array = a, index = i === nothing ? index : i, type = I)
+end
+
+# An ordinary identity cell evaluates exactly one vector element. The same
+# operation serves scalar reads and individual terms of a cell factor.
+function _cell_index_op(locality)
+    inner = Graph()
+    x = value!(inner, :term, Any)
+    scalar = prepare(inner; have = (x,), want = (x,))
+    plate = _AuthoredPlateOp{typeof(scalar),()}(scalar)
+    _AuthoredPlateCellOp(plate, locality)
+end
+
+# Expose indexed scalar subexpressions along the strict split boundaries
+# retained at authoring, then lower them as identity cells. A named scalar
+# such as `w = exp.(a[1])` has no row form itself, but its read must still
+# demand only row 1 of `a`. Splitting respects lazy branches and broadcast
+# fusion. Unknown index/container types keep their authored recipe.
+function _cell_scalar_reads(p::Plan)
+    types = _cell_value_types(p)
+    type_of(v) = get(types, canon_id(p.graph, v.id), Any)
+    # Input and bound arrays already support a scalar read without computing
+    # any other element. They need no implementation cell or extra report entry.
+    fixed = Set(canon_id(p.graph, v.id) for v in p.have)
+    for r in p.recipes
+        r.op isa _BoundConstant || continue
+        union!(fixed, (canon_id(p.graph, v.id) for v in r.outputs))
+    end
+    # Only introduce row demand where a producer can carry it. Other reads
+    # retain their authored role: e.g. a broadcast's scalar coefficient may
+    # come from `vcat([sigma])`, whose whole construction is already legitimate.
+    row_sources = Set{ValueId}()
+    for r in p.recipes
+        _cell_form(r) === nothing && _cell_outline_nodes(r) === nothing && continue
+        union!(row_sources, (canon_id(p.graph, v.id) for v in r.outputs))
+    end
+    function scalar_read(args...)
+        read = _cell_scalar_index(args...)
+        read === nothing && return nothing
+        cid = canon_id(p.graph, read.array.id)
+        cid in row_sources && !(cid in fixed) ? read : nothing
+    end
+    outlines = Dict{Int,Any}()
+    for r in p.recipes
+        length(r.outputs) == 1 && !r.effectful || continue
+        parts = _partial_split_parts(r; factors = true)
+        parts === nothing && continue
+        params = collect(first(_kernel_split_spec(parts.native)))
+        mod = _kernel_endpoint_source_module(r.op)
+        marked = Bool[scalar_read(node.expr, params, mod, r.inputs, type_of) !==
+                      nothing for node in parts.split.nodes]
+        any(marked) && (outlines[r.id] = (; parts, marked))
+    end
+    q, outlined = _cell_outline(p, outlines)
+    # Copy even without an outline: a literal index needs a new graph value.
+    old = q.graph
+    g = Graph(copy(old.values), copy(old.recipes), copy(old.producers),
+              copy(old.aliases), old.version)
+    types = _cell_value_types(q; outlined)
+    next_id = minimum((r.id for r in q.recipes); init = 0) - 1
+    recipes = Recipe[]
+    changed = !isempty(outlined)
+    for r in q.recipes
+        analyzed = length(r.outputs) == 1 && !r.effectful ?
+            _cell_native(r; outlined = r.id in outlined) : nothing
+        read = analyzed === nothing ? nothing :
+            scalar_read(analyzed..., r.inputs, type_of)
+        if read === nothing
+            push!(recipes, r)
+            continue
+        end
+        i = read.index
+        if !(i isa Value)
+            i = value!(g, Symbol(only(r.outputs).name, :_index), read.type)
+            push!(recipes, Recipe(next_id, (), (i,), _BoundConstant(read.index),
+                                  0.0, nothing, false, read.index))
+            next_id -= 1
+        end
+        # The original cells still enforce their locality over the complete
+        # cone; implementation cells add no independent warning policy.
+        push!(recipes, Recipe(r.id, (i, read.array), r.outputs, _cell_index_op(:ignore),
+                              r.cost, nothing, false, r.source))
+        changed = true
+    end
+    changed || return p, outlined
+    template = Plan(g, q.have, q.want, q.recipes, q.producer, q.cost, q.candidates)
+    _partial_subplan(template, q.have, q.want, recipes), outlined
+end
+
 """
     _cell_outlined_pushdowns(p::Plan) -> (plan, pushdowns)
 
@@ -1459,6 +1572,7 @@ is dropped for good otherwise. `p` itself when nothing is outlined.
 """
 function _cell_outlined_pushdowns(p::Plan)
     any(r -> r.op isa _AuthoredPlateCellOp, p.recipes) || return p, nothing
+    p, scalar_outlined = _cell_scalar_reads(p)
     known = IdDict{Recipe,Any}()
     byid = Dict(r.id => r for r in p.recipes)
     candidates = Dict{Int,Any}()
@@ -1468,6 +1582,7 @@ function _cell_outlined_pushdowns(p::Plan)
     refused = Set{Int}()
     while true
         q, outlined = _cell_outline(p, kept)
+        union!(outlined, scalar_outlined)
         blocked = Set{Int}()
         cells = _cell_pushdowns(q; outlined, blocked, known)
         lost = Int[id for id in keys(kept) if cells === nothing || !(id in cells.recipes)]
@@ -1538,12 +1653,12 @@ function _cell_bind!(e::_CellEmitter, prefix::Symbol, value)
     name
 end
 
-# The full axes of an operand read whole: `()` for a value declared a number,
+# The full axes of an operand read whole: `()` for a value known to be a number,
 # so a partition's plan holds the shape without reading the value (a scalar
 # computed from the active vector would otherwise tie every row derived from
 # it to the data), else the axes of its broadcastable form.
 function _cell_leaf_shape_expr(e::_CellEmitter, input::ValueId)
-    valtype(e.pushdowns.graph.values[input]) <: Number && return Expr(:tuple)
+    get(e.pushdowns.types, input, Any) <: Number && return Expr(:tuple)
     Expr(:call, _cell_ref(:_cell_leaf_shape), e.names[input])
 end
 
