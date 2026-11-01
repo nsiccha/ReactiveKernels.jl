@@ -640,7 +640,20 @@ end
 # `varying` names controls such as the partition label and its row plan.
 # This internal compiler surface is also used by the PPL sampler; it carries
 # no mutable cache, backend choice, or packed-parameter naming convention.
-function _partition_shared_parts(p::Plan, partitioned; varying = ())
+function _partition_shared_parts(p::Plan, partitioned; varying = (), preserve_rows::Bool = false)
+    # Keep computations with row forms in the residual when preparing a
+    # strict shared query. Only their whole shared dependencies need caching;
+    # lifting a gather or observation-sized broadcast would materialize work
+    # that the residual can instead evaluate at the requested rows.
+    row_values = Set{ValueId}()
+    row_types = Dict{ValueId,Any}()
+    if preserve_rows
+        p, cells = _cell_outlined_pushdowns(_lowering_plan(p))
+        if cells !== nothing
+            union!(row_values, cells.pushed)
+            row_types = cells.types
+        end
+    end
     cidof(v) = canon_id(p.graph, v.id)
     rules = Dict(_partition_rule(partitioned))
     # Scan each declaration once, rather than once per recipe that reads it.
@@ -652,6 +665,14 @@ function _partition_shared_parts(p::Plan, partitioned; varying = ())
     # recipes on both sides. Other shared HAVE values still vary with theta.
     static, _, static_owned = _partial_split(p, Set{ValueId}())
     prefix, residual, owned = _partial_split(p, shared, Set{Int}()) do r, available
+        if any(v -> cidof(v) in row_values, r.outputs)
+            # Retain literal shared slices of a mixed input as owned cache
+            # values. They extract parameter blocks, not observation rows.
+            # The shared-read proof below still checks every extracted index.
+            form = _cell_form(r)
+            (form !== nothing && form.kind === :range_view &&
+             any(v -> haskey(mixed, cidof(v)), r.inputs)) || return false
+        end
         all(enumerate(r.inputs)) do (slot, input)
             cid = cidof(input)
             cid in available ||
@@ -663,6 +684,14 @@ function _partition_shared_parts(p::Plan, partitioned; varying = ())
     frontier = Value[v for v in _partial_constants(p, owned, residual)
                      if !(cidof(v) in static_owned) && !(cidof(v) in have_ids)]
     isempty(frontier) && return nothing
+    # The residual no longer contains the producers that proved a frontier
+    # operand's type. Retain their numeric element/rank facts so, for example,
+    # transpose(weights) still proves a single row. Do not retain a concrete
+    # array container: a caller may own a copied cache rather than a view.
+    map!(frontier, frontier) do v
+        T = typeintersect(valtype(v), _cell_element_type(get(row_types, cidof(v), Any)))
+        T === Union{} || T === valtype(v) ? v : Value{T}(v.id, v.name)
+    end
 
     # Prune against authoritative outputs in forward execution order before
     # walking backwards, so collateral duplicates cannot replace a producer.

@@ -985,10 +985,10 @@ function _ad_validate_unique_haves(spec::KernelSpec)
 end
 
 # Every value of the kernel's graph that some recipe reachable from the active
-# HAVE ports produces, the active ports included. The closure runs over every
-# recipe of the graph, not only the planned ones, so it over-approximates what
-# the active ports reach: a value outside it depends on no active port in any
-# plan.
+# HAVE ports produces, the active ports included. Include the selected plan's
+# recipes: lowering can introduce intermediate values and producers absent
+# from the source graph. Retain all graph recipes as well, so the closure
+# conservatively covers alternate producers and active-derived HAVE cuts.
 function _ad_active_downstream(kernel::_ADKernel, active_selector)
     graph = kernel.plan.graph
     active_indices = _ad_selector_indices(active_selector)
@@ -997,7 +997,7 @@ function _ad_active_downstream(kernel::_ADKernel, active_selector)
     changed = true
     while changed
         changed = false
-        for recipe in graph.recipes
+        for recipe in Iterators.flatten((graph.recipes, kernel.plan.recipes))
             any(input -> canon_id(graph, input.id) in downstream,
                 recipe.inputs) || continue
             for output in recipe.outputs
@@ -1154,8 +1154,8 @@ function _ad_resolve(resolver, args::Tuple, kwargs::NamedTuple)
     resolver(args...; kwargs...)
 end
 
-# A pullback passes its cotangent exemplar `seed`: over several selected WANT
-# ports it differentiates the seeded inner product (`_ADSeededCall`), whose
+# A pullback passes its cotangent exemplar `seed`: for array outputs or several
+# selected WANT ports it differentiates the seeded inner product (`_ADSeededCall`), whose
 # port values are kept for `ad_value_and_pullback` when `keep_values`.
 function _ad_call(kernel::_ADKernel, resolved::Tuple, active;
                   scalar_output::Bool = true, retain::Tuple = (),
@@ -1178,7 +1178,7 @@ function _ad_call(kernel::_ADKernel, resolved::Tuple, active;
     if call isa _ADConstantCall
         seed === nothing || _ad_check_seed(kernel, seed, _ad_call_exemplar(
             call, resolved, external_values, active_selector))
-    elseif seed !== nothing && length(outputs(kernel)) > 1
+    elseif seed !== nothing && (seed isa AbstractArray || length(outputs(kernel)) > 1)
         call, external_values = _ad_seeded_call(
             kernel, call, external_values, resolved, active_selector, seed,
             keep_values)
@@ -1368,13 +1368,16 @@ function _ad_retaining_call(kernel::NonAllocatingKernel, call, external_values,
         "prepare them from the dataflow kernel (`prepare`)"))
 end
 
-# Several selected WANT ports. The kernel returns them as one tuple from one
+# Array outputs or several selected WANT ports. The kernel returns them from one
 # primal sweep, and a pullback seeds that tuple with one cotangent per port.
 # The pullback at `seed` is the gradient of the seeded inner product
 # `Σᵢ ⟨seedᵢ, yᵢ⟩`: one primal sweep computes every port and one reverse sweep
 # accumulates every port's cotangent. DifferentiationInterface's pullback
-# through Enzyme seeds only a scalar or array output (its reverse extension
-# adds the seed into the output shadow with `.+=`), so the seed crosses as a
+# through Enzyme seeds only a scalar or writable array output (its reverse
+# extension adds the seed into the output shadow with `.+=`). A returned view
+# can have a read-only parent even when its elements depend on active inputs.
+# The inner product reads that view without requiring a writable shadow for
+# its array wrapper, so the seed crosses as a
 # `Constant` context of a gradient instead. When `V`, the port values of the
 # sweep are stored in an AD-owned box, a `Cache` context, as `_ADRetainingCall`
 # stores its retained values.
@@ -1613,8 +1616,8 @@ _ad_operator_preparation(::Val{:pullback}, ::_ADConstantCall, backend, point,
 _ad_operator_preparation(::Val{:pushforward}, ::_ADConstantCall, backend, point,
                          seeds, contexts) = nothing
 
-# A pullback hands `_ad_call` its seed, which differentiates several WANT
-# ports as their seeded inner product (`_ADSeededCall`).
+# A pullback hands `_ad_call` its seed, which differentiates array outputs or
+# several WANT ports as their seeded inner product (`_ADSeededCall`).
 _ad_operator_seeding(::Val{:pullback}, seeds, backend) =
     (; seed = only(seeds), keep_values = ad_retains_primal_sweep(backend))
 _ad_operator_seeding(::Val, seeds, backend) = (;)

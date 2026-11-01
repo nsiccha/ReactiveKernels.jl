@@ -121,4 +121,64 @@ end
     @test :opaque in (v.name for v in all_shared.frontier)
 end
 
+@testset "pullbacks include lowered producers absent from the source graph" begin
+    graph = Graph()
+    x = value!(graph, :x, Float64)
+    a = value!(graph, :a, Float64)
+    add!(graph, x => a, sin)
+    original = ReactiveKernels.plan(graph; have=(x,), want=(a,))
+    # Outlining introduces values and recipes in the selected plan without
+    # registering those producers as alternate source-graph recipes.
+    b = value!(graph, :b, Float64)
+    lowered = ReactiveKernels.Recipe(-1, (x, a), (b,), (x, a) -> x * a,
+        1.0, nothing, false, ReactiveKernels._NO_KERNEL_SOURCE)
+    cut = _PREFIX_RK._partial_subplan(original, ReactiveKernels.Value[x], ReactiveKernels.Value[a, b],
+        [original.recipes; lowered])
+    kernel = prepare(cut; exemplars=(0.4,))
+    pullback = prepare_ad_pullback(kernel, backend, (1.0, 1.0), 0.4; active=:x)
+    for point in (-0.3, 0.4), seed in ((1.0, 0.0), (0.0, 1.0), (1.3, -0.7))
+        value, derivative = ad_value_and_pullback(pullback, seed, point)
+        @test value == (sin(point), point * sin(point))
+        @test derivative ≈ seed[1] * cos(point) +
+                           seed[2] * (sin(point) + point * cos(point))
+    end
+end
+
+struct ReadOnlyPrefixVector{V<:AbstractVector{Float64}} <: AbstractVector{Float64}
+    values::V
+end
+Base.size(v::ReadOnlyPrefixVector) = size(v.values)
+Base.getindex(v::ReadOnlyPrefixVector, i::Int) = v.values[i]
+Base.IndexStyle(::Type{<:ReadOnlyPrefixVector}) = IndexLinear()
+
+@kernel _readonly_prefix_view(u::Vector{Float64}) = begin
+    readonly = ReadOnlyPrefixVector(u)
+    selected = view(readonly, 2:4)
+end
+
+@testset "pullback reads an array output with a read-only parent" begin
+    point = [0.1, -0.4, 0.3, 0.7, 0.2]
+    kernel = prepare(_readonly_prefix_view; have=:u, want=:selected)
+    for mode in (Enzyme.Reverse, Enzyme.Forward)
+        ad = AutoEnzyme(; mode)
+        prepared = prepare_ad_pullback(kernel, ad, ones(3), point; active=:u)
+        for shift in (0.0, 0.2), seed in ([1.0, -0.5, 0.3], [-0.2, 0.4, 0.7])
+            current = point .+ shift
+            before = copy(current)
+            expected = [0.0; seed; 0.0]
+            value, derivative = ad_value_and_pullback(prepared, seed, current)
+            @test value == current[2:4]
+            @test derivative ≈ expected
+            @test ad_pullback(prepared, seed, current) ≈ expected
+            @test ad_pullback(kernel, ad, seed, current; active=:u) ≈ expected
+            destination = fill(NaN, length(current))
+            value, returned = ad_value_and_pullback!(prepared, destination, seed, current)
+            @test returned === destination
+            @test value == current[2:4]
+            @test destination ≈ expected
+            @test current == before
+        end
+    end
+end
+
 end # module

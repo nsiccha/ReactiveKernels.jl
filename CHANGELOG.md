@@ -16,6 +16,21 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.48
+
+- Preserve strict row locality when splitting shared partition prefixes.
+  Row-capable gathers and broadcasts stay in the residual; opaque shared
+  producers become cached inputs. Literal parameter slices remain eligible
+  for the shared boundary. Preserve inferred numeric element types and ranks
+  at the new boundary, including when a cached view becomes an owned copy.
+- Include selected lowered-plan producers in AD activity reachability, so
+  outlined active outputs retain their derivatives even when their recipes
+  are absent from the source graph.
+- Compute array-output pullbacks through the seeded inner product. Returned
+  views over read-only array wrappers no longer require a writable output
+  shadow; ordinary reverse and forward AD retain the same primal graph.
+
+
 ## 0.1.47
 
 - Preserve field dependencies when factoring a cell that shares array-valued

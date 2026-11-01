@@ -591,19 +591,32 @@ Construct with [`prepare_cell_query`](@ref) and call `q(u, i)`. The call paths
 carry the `Base.invokelatest` barrier, as `SamplerQuery`'s do. Not thread-safe:
 prepare one per thread.
 """
-mutable struct CellQuery{K,L}
+mutable struct CellQuery{K,L,C}
     const kernel::K
     const layout::L
     const observations::Tuple{Vararg{Symbol}}
+    const prefix::C
 end
+CellQuery(kernel, layout, observations) = CellQuery(kernel, layout, observations, nothing)
 
 (q::CellQuery)(u::AbstractVector{Float64}, cell) =
     Base.invokelatest(_cell_density, q, u, cell)::Float64
 (q::CellQuery)(u::AbstractVector{<:Real}, cell) = q(Vector{Float64}(u), cell)
-_cell_density(q::CellQuery, u, cell) = q.kernel(u, cell)
+function _cell_density(q::CellQuery, u, cell)
+    q.prefix === nothing && return q.kernel(u, cell)
+    length(u) == q.layout.total || throw(ContractValidationError(
+        "[query] packed length $(length(u)) ≠ layout total $(q.layout.total)"))
+    u isa Vector{Float64} || return _cell_density(q, Vector{Float64}(u), cell)
+    cached = _refresh_partition_prefix!(q.prefix.cache, u)
+    residual = _query_residual(q.prefix, cell, (u, cell, cached...))
+    residual(u, cell, cached...)
+end
+ReactiveKernels.partition_locality(q::CellQuery) =
+    ReactiveKernels.partition_locality(q.prefix === nothing ? q.kernel : q.prefix.residual)
 
 """
-    prepare_cell_query(built, plan, observations; on_error = nothing, locality = nothing) -> CellQuery
+    prepare_cell_query(built, plan, observations; on_error = nothing, locality = nothing,
+                       partitioned = (), u0 = nothing) -> CellQuery
 
 Prepare the summed log density of ONE cell of the observations named in
 `observations` (a name or a collection of names), evaluated at an
@@ -618,7 +631,25 @@ rows but would compute whole (RK `plate_cell`): `:error` refuses the query
 with a `ReactiveKernels.PartitionLocalityError` naming each such value and its
 statement, `:warn` names each once per process, `:ignore` says nothing;
 `nothing` reads the ReactiveKernels preference `cell_locality` (`"warn"`
-unless set). `ReactiveKernels.partition_locality(q.kernel)` lists every value.
+unless set). `ReactiveKernels.partition_locality(q)` lists the executed
+residual's values.
+
+Optional `partitioned` identifies parameters that can change between local
+evaluations, using the names or `parameter => level_labels` accepted by
+[`prepare_partition_sampler`](@ref). Other coordinates are shared. The query
+caches their intermediate values across cells and local changes, compares
+shared coordinates by value (including in-place edits), and refreshes on a
+shared change. Row-capable calculations remain in the residual. This cell
+declaration identifies cache dependencies; it adds no per-key separability
+claim because a cell query has no partition key. A partition query checks
+separability when the same declaration is supplied.
+
+`u0` supplies a valid packed preparation point for the shared prefix; it
+defaults to zeros. It is copied. Each query owns its cache and is not
+thread-safe. `q.kernel` remains the original packed-coordinate kernel for
+the footprint recipe below; through-prefix dependencies are not lost.
+For cached evaluation call `q(u, i)`, and use `partition_locality(q)` to
+inspect its residual. Without a declaration, behavior is unchanged.
 
 For an `@plate for i in eachindex(y)` loop holding one array per index
 (`y[i] .~ …`), entry `i` is the sum of iteration `i`'s densities. Several
@@ -660,7 +691,7 @@ footprint for every capture. Inspect the supports of the actual model before
 assuming a fixed per-cell width.
 """
 function prepare_cell_query(built, plan::StructuralPlan, observations;
-        on_error = nothing, locality = nothing)
+        on_error = nothing, locality = nothing, partitioned = (), u0 = nothing)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_cell_query requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
@@ -670,10 +701,22 @@ function prepare_cell_query(built, plan::StructuralPlan, observations;
     _refuse_absent_cells(plan, names)
     spec, want = _cell_query_spec(built, plan, names; locality)
     have = (_query_have(plan)..., _CELL_PORT)
+    rule = _query_partition_rule(plan, built.layout, partitioned, nothing)
+    parts = _query_shared_parts(spec, plan, have, want, rule, (_CELL_PORT,), on_error)
+    prefix = if parts === nothing
+        nothing
+    else
+        exemplar = _query_exemplar(built.layout, u0)
+        cache = _prepare_value_prefix(parts, built.layout, last(only(rule)), exemplar, on_error)
+        residual = Base.invokelatest(prepare, parts.residual;
+            exemplars = (exemplar, 1, cache.values...), on_error)
+        _value_query_prefix(cache, residual, parts.residual, 1, on_error)
+    end
+    parts === nothing || ((spec, want) = _cell_query_spec(built, plan, names; locality = :ignore))
     kernel = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
     end
-    return CellQuery(kernel, built.layout, names)
+    return CellQuery(kernel, built.layout, names, prefix)
 end
 
 const _CELL_PORT = :_ppl_cell
@@ -1176,7 +1219,7 @@ preparation: all cells whose key equals a label, as one compiled pass
 (RK `plate_partition`). Construct with [`prepare_partition`](@ref); call as
 `q(u, label)`. Not thread-safe: prepare one per thread.
 """
-mutable struct PartitionQuery{K,L,T}
+mutable struct PartitionQuery{K,L,T,C}
     const kernel::K
     const layout::L
     const observations::Tuple{Vararg{Symbol}}
@@ -1186,14 +1229,30 @@ mutable struct PartitionQuery{K,L,T}
     # preparation; a label without one is planned on the spot, which refuses
     # a label no observation has.
     const plans::Dict{Any,T}
+    const prefix::C
 end
+PartitionQuery(kernel, layout, observations, by, labels, plans) =
+    PartitionQuery(kernel, layout, observations, by, labels, plans, nothing)
 
 (q::PartitionQuery)(u::AbstractVector{Float64}, label) =
     Base.invokelatest(_partition_density, q, u, label)::Float64
 (q::PartitionQuery)(u::AbstractVector{<:Real}, label) = q(Vector{Float64}(u), label)
-_partition_density(q::PartitionQuery, u, label) =
-    q.kernel(u, label, get(() -> ReactiveKernels.partition_plan(q.kernel, u, label, nothing),
-                           q.plans, label))
+function _partition_density(q::PartitionQuery, u, label)
+    if q.prefix === nothing
+        return q.kernel(u, label, get(() -> ReactiveKernels.partition_plan(q.kernel, u, label, nothing),
+                                     q.plans, label))
+    end
+    length(u) == q.layout.total || throw(ContractValidationError(
+        "[query] packed length $(length(u)) ≠ layout total $(q.layout.total)"))
+    u isa Vector{Float64} || return _partition_density(q, Vector{Float64}(u), label)
+    cached = _refresh_partition_prefix!(q.prefix.cache, u)
+    residual = _query_residual(q.prefix, label, (u, label, nothing, cached...))
+    plan = get(() -> ReactiveKernels.partition_plan(residual, u, label, nothing, cached...),
+               q.plans, label)
+    residual(u, label, plan, cached...)
+end
+ReactiveKernels.partition_locality(q::PartitionQuery) =
+    ReactiveKernels.partition_locality(q.prefix === nothing ? q.kernel : q.prefix.residual)
 
 """
     partition_labels(q) -> Vector
@@ -1309,7 +1368,8 @@ function _partition_labels(plan::StructuralPlan, names, keys_by_name)
 end
 
 """
-    prepare_partition(built, plan, observations; by, locality = :error, on_error = nothing) -> PartitionQuery
+    prepare_partition(built, plan, observations; by, locality = :error, on_error = nothing,
+                      partitioned = (), u0 = nothing) -> PartitionQuery
 
 Prepare the summed log density of ONE partition of the observations named in
 `observations` (a name or a collection of names): all cells whose key equals
@@ -1333,6 +1393,18 @@ prepared only when every value its cells read at rows is computed at those
 rows; otherwise preparation throws a `ReactiveKernels.PartitionLocalityError`
 naming each such value and its statement.
 
+With `partitioned`, use the same local/shared coordinate declaration and
+separability check as [`prepare_partition_sampler`](@ref). Shared intermediates
+are cached across labels and local changes, and the strict check applies to
+the remaining per-partition program. Row-capable calculations stay in that
+program. `u0` is an optional packed exemplar (zeros by default), as for
+[`prepare_cell_query`](@ref). `partition_locality(q)` reports the executed
+residual. The original `q.kernel` continues to supply packed-coordinate
+footprints including all dependencies through the prefix; call `q(u, label)`
+for cached evaluation. Comparing shared coordinates costs O(shared dimension)
+per call; refreshing the prefix adds its graph's work once per changed shared
+point. Cache storage is query-owned; prepare one query per concurrent caller.
+
 For a value-only query's packed-coordinate footprint, call
 `ReactiveKernels.partition_footprint(q.kernel, u, label, nothing).unconstrained`.
 The final `nothing` supplies the plan port; the footprint kernel computes its
@@ -1344,7 +1416,7 @@ This does not prepare AD. For individual cell supports, use the
 label per cell would retain a partition plan for every cell.
 """
 function prepare_partition(built, plan::StructuralPlan, observations; by,
-        locality = :error, on_error = nothing)
+        locality = :error, on_error = nothing, partitioned = (), u0 = nothing)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_partition requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
@@ -1355,18 +1427,46 @@ function prepare_partition(built, plan::StructuralPlan, observations; by,
     keys_by_name = _partition_keys(plan, names, by)
     labels = _partition_labels(plan, names, keys_by_name)
     have = (_query_have(plan)..., _PARTITION_PORT, _PLAN_PORT)
-    exemplar = zeros(built.layout.total)
-    spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality)
+    exemplar = _query_exemplar(built.layout, u0)
+    rule = _query_partition_rule(plan, built.layout, partitioned, keys_by_name)
+    spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality, partitioned = rule)
+    parts = _query_shared_parts(spec, plan, have, want, rule,
+        (_PARTITION_PORT, _PLAN_PORT), on_error)
+    dense_locality = parts === nothing ? locality : :ignore
+    if parts !== nothing
+        spec, want = _partition_query_spec(built, plan, names, keys_by_name;
+            locality = dense_locality, partitioned = rule)
+    end
     planner = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(ReactiveKernels.partition_plan_kernel, spec; have, want,
                           bound = _query_bound(plan), on_error)
     end
     plans, plan_type = _partition_plans(planner, labels, exemplar)
-    spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality, plan_type)
+    spec, want = _partition_query_spec(built, plan, names, keys_by_name;
+        locality = dense_locality, partitioned = rule, plan_type)
     kernel = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
     end
-    return PartitionQuery(kernel, built.layout, names, keys_by_name, labels, plans)
+    if !isempty(rule)
+        for label in labels
+            Base.invokelatest(ReactiveKernels.partition_separability, kernel, exemplar, label, nothing)
+        end
+    end
+    prefix = if parts === nothing
+        nothing
+    else
+        cache = _prepare_value_prefix(parts, built.layout, last(only(rule)), exemplar, on_error)
+        residual = Base.invokelatest(prepare, parts.residual;
+            exemplars = (exemplar, first(labels), nothing, cache.values...), on_error)
+        result = _value_query_prefix(cache, residual, parts.residual, first(labels), on_error)
+        plans, _ = _partition_plans_each(labels) do label
+            label_kernel = _query_residual(result, label, (exemplar, label, nothing, cache.values...))
+            Base.invokelatest(ReactiveKernels.partition_plan, label_kernel,
+                exemplar, label, nothing, cache.values...)
+        end
+        result
+    end
+    return PartitionQuery(kernel, built.layout, names, keys_by_name, labels, plans, prefix)
 end
 
 """
@@ -1470,7 +1570,7 @@ function _partition_coordinate_labels(plan::StructuralPlan, layout::LayoutTable,
             axis === nothing && throw(ContractValidationError(
                 "[query] `partitioned` names `$name`, whose first axis is not " *
                 "`levels(<column>)`; give its levels' labels as `$name => labels`"))
-            axis in values(keys_by_name) || throw(ContractValidationError(
+            (keys_by_name === nothing || axis in values(keys_by_name)) || throw(ContractValidationError(
                 "[query] `$name` is indexed by `levels($axis)`, not by the partition key " *
                 "$(join(unique(values(keys_by_name)), ", ")); give its levels' labels as " *
                 "`$name => labels`"))
@@ -1485,6 +1585,45 @@ function _partition_coordinate_labels(plan::StructuralPlan, layout::LayoutTable,
         end
     end
     labels
+end
+
+function _query_partition_rule(plan, layout, partitioned, keys_by_name)
+    declarations = partitioned isa Union{Symbol,Pair} ? (partitioned,) : partitioned
+    isempty(declarations) ? () :
+        (:unconstrained => _partition_coordinate_labels(plan, layout, declarations, keys_by_name),)
+end
+
+function _query_exemplar(layout, u0)
+    u0 === nothing && return zeros(layout.total)
+    length(u0) == layout.total || throw(ContractValidationError(
+        "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
+    Vector{Float64}(u0)
+end
+
+_value_query_prefix(cache, residual, residual_plan, index, on_error) =
+    (; cache, residual, residual_plan, index_type = typeof(index), on_error,
+       residuals = Dict{DataType,Any}(typeof(index) => residual))
+
+# Ordinary cell indices include CartesianIndex and multiple integer types;
+# partition keys can also have mixed types. Keep each prepared boundary
+# concrete without imposing the first exemplar's index type on later calls.
+function _query_residual(prefix, index, args)
+    typeof(index) === prefix.index_type && return prefix.residual
+    get!(prefix.residuals, typeof(index)) do
+        Base.invokelatest(prepare, prefix.residual_plan;
+            exemplars = args, on_error = prefix.on_error)
+    end
+end
+
+function _query_shared_parts(spec, plan, have, want, rule, varying, on_error)
+    isempty(rule) && return nothing
+    selected = ReactiveKernels.plan(spec; have, want)
+    selected = ReactiveKernels._kernel_error_policy(selected, on_error)
+    selected = ReactiveKernels._fuse_authored_plate_chains(selected; cells_only = true)
+    bound_selected = ReactiveKernels._partial_apply(selected,
+        ReactiveKernels._kernel_bound_pairs(spec, _query_bound(plan)))
+    Base.invokelatest(ReactiveKernels._partition_shared_parts, bound_selected, rule;
+        varying, preserve_rows = true)
 end
 
 # The column a parameter's first axis takes its levels from, `nothing` when
@@ -1551,20 +1690,31 @@ function prepare_partition_sampler(built, plan::StructuralPlan, observations,
     labels = _partition_labels(plan, names, keys_by_name)
     isempty(labels) && throw(ContractValidationError(
         "[query] the partition key columns of $(join(names, ", ")) hold no label"))
-    declarations = partitioned isa Union{Symbol,Pair} ? (partitioned,) : partitioned
-    rule = isempty(declarations) ? () :
-        (:unconstrained => _partition_coordinate_labels(plan, layout, declarations, keys_by_name),)
-    # The dense query: the values, the footprints and the separability check.
+    rule = _query_partition_rule(plan, layout, partitioned, keys_by_name)
+    # Split before lowering enforces locality. A shared opaque producer may
+    # have no row form even though its cached frontier is a valid row input
+    # to every partition. The residual keeps the requested locality policy.
     spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality,
                                        partitioned = rule)
     have = (_query_have(plan)..., _PARTITION_PORT, _PLAN_PORT)
+    parts = _query_shared_parts(spec, plan, have, want, rule,
+        (_PARTITION_PORT, _PLAN_PORT), on_error)
+    # This dense kernel supplies the original packed-coordinate footprints
+    # and separability check, including dependencies through the prefix. It
+    # is not the cached sampler's executable residual. Only that residual is
+    # subject to the requested locality check when a prefix exists.
+    dense_locality = parts === nothing ? locality : :ignore
+    if parts !== nothing
+        spec, want = _partition_query_spec(built, plan, names, keys_by_name;
+            locality = dense_locality, partitioned = rule)
+    end
     planner = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(ReactiveKernels.partition_plan_kernel, spec; have, want,
                           bound = _query_bound(plan), on_error)
     end
     plans, plan_type = _partition_plans(planner, labels, exemplar)
-    spec, want = _partition_query_spec(built, plan, names, keys_by_name; locality,
-                                       partitioned = rule, plan_type)
+    spec, want = _partition_query_spec(built, plan, names, keys_by_name;
+                                       locality = dense_locality, partitioned = rule, plan_type)
     kernel = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
     end
@@ -1580,9 +1730,6 @@ function prepare_partition_sampler(built, plan::StructuralPlan, observations,
     local_footprints = isempty(rule) ? nothing :
         Dict{Any,Vector{Int}}(label => filter(p -> !ismissing(last(only(rule))[p]), footprint)
                              for (label, footprint) in footprints)
-    parts = isempty(rule) ? nothing : Base.invokelatest(
-        ReactiveKernels._partition_shared_parts, planner.plan, rule;
-        varying = (_PARTITION_PORT, _PLAN_PORT))
     if parts !== nothing
         return _prepare_shared_partition_sampler(kernel, parts, layout, names,
             keys_by_name, labels, exemplar, footprints, local_footprints,
@@ -1763,8 +1910,7 @@ _partition_seed(x::NamedTuple) = map(_partition_seed, x)
 _partition_frontier_values(kernel, value) = length(outputs(kernel)) == 1 ? (value,) : value
 _partition_frontier_seed(values::Tuple) = length(values) == 1 ? only(values) : values
 
-function _prepare_shared_partition_sampler(kernel, parts, layout, names, by, labels,
-        exemplar, footprints, local_footprints, coordinate_labels, backend, compact, on_error)
+function _prepare_value_prefix(parts, layout, coordinate_labels, exemplar, on_error)
     shared_positions = findall(ismissing, coordinate_labels)
     shared_point = exemplar[shared_positions]
     shared_slots = _compact_cell_slots(layout.total, shared_positions)
@@ -1772,11 +1918,18 @@ function _prepare_shared_partition_sampler(kernel, parts, layout, names, by, lab
         exemplars = (exemplar, shared_point, shared_slots), on_error)
     cached = map(_partition_cache_value, _partition_frontier_values(prefix,
         Base.invokelatest(prefix, exemplar, shared_point, shared_slots)))
+    _PartitionPrefix(prefix, nothing, shared_positions, shared_point, shared_slots, cached, true)
+end
+
+function _prepare_shared_partition_sampler(kernel, parts, layout, names, by, labels,
+        exemplar, footprints, local_footprints, coordinate_labels, backend, compact, on_error)
+    initial = _prepare_value_prefix(parts, layout, coordinate_labels, exemplar, on_error)
+    cached = initial.values
     seed = _partition_frontier_seed(map(_partition_seed, cached))
-    prefix_ad = Base.invokelatest(prepare_ad_pullback, prefix, backend, seed,
-        exemplar, shared_point, shared_slots; active = :_ppl_cell_active)
-    cache = _PartitionPrefix(prefix, prefix_ad, shared_positions, shared_point,
-        shared_slots, cached, true)
+    prefix_ad = Base.invokelatest(prepare_ad_pullback, initial.kernel, backend, seed,
+        exemplar, initial.point, initial.slots; active = :_ppl_cell_active)
+    cache = _PartitionPrefix(initial.kernel, prefix_ad, initial.positions, initial.point,
+        initial.slots, cached, true)
 
     selections = compact ? _partition_selections(footprints) : Dict{Any,Vector{Int}}()
     selected = compact ? copy(selections[first(labels)]) : Int[]
