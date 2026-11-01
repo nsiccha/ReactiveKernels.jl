@@ -63,9 +63,16 @@ _gradient(t::SMCTarget, g, u) = first(sampler_value_and_gradient!(t.query, g, u)
 _gradient(t::ReferenceTarget, g, u) = first(Base.invokelatest(ad_value_and_gradient!,
     t.ad, g, u, t.reference.location, t.reference.scale))
 
-function _checked(value)
-    (isfinite(value) || value == -Inf) || throw(DomainError(value,
-        "SMC target returned NaN or +Inf; use -Inf only for points outside support"))
+function _checked(value, u, endpoint, temperature, gradient=nothing)
+    (isfinite(value) || value == -Inf) ||
+        throw(SMCNonfiniteError(u, value, gradient, :density, endpoint, temperature))
+    return value
+end
+
+function _checked_gradient(value, g, u, endpoint, temperature)
+    _checked(value, u, endpoint, temperature, g)
+    isfinite(value) && !all(isfinite, g) &&
+        throw(SMCNonfiniteError(u, value, g, :gradient, endpoint, temperature))
     return value
 end
 
@@ -80,10 +87,11 @@ LogDensityProblems.capabilities(::Type{<:BridgeTarget}) = LogDensityProblems.Log
 
 # Endpoints branch explicitly: 0 * -Inf must never contaminate the other end.
 function LogDensityProblems.logdensity(t::BridgeTarget, u)
-    t.temperature == 1 && return _checked(_density(t.target, u))
-    t.temperature == 0 && return _checked(_density(t.source, u))
-    a, b = _checked(_density(t.source, u)), _checked(_density(t.target, u))
-    return _checked((1-t.temperature) * a + t.temperature * b)
+    t.temperature == 1 && return _checked(_density(t.target, u), u, :target, t.temperature)
+    t.temperature == 0 && return _checked(_density(t.source, u), u, :source, t.temperature)
+    a = _checked(_density(t.source, u), u, :source, t.temperature)
+    b = _checked(_density(t.target, u), u, :target, t.temperature)
+    return _checked((1-t.temperature) * a + t.temperature * b, u, :bridge, t.temperature)
 end
 
 function LogDensityProblems.logdensity_and_gradient(t::BridgeTarget, u)
@@ -92,15 +100,15 @@ function LogDensityProblems.logdensity_and_gradient(t::BridgeTarget, u)
     a, b = t.temperature == 1 ? (t.target, nothing) :
         t.temperature == 0 ? (t.source, nothing) : (t.source, t.target)
     g = similar(u)
-    value = _checked(_gradient(a, g, u))
+    endpoint = t.temperature == 1 ? :target : :source
+    value = _checked_gradient(_gradient(a, g, u), g, u, endpoint, t.temperature)
     if b !== nothing
         h = similar(u)
-        other = _checked(_gradient(b, h, u))
-        value = _checked((1-t.temperature) * value + t.temperature * other)
+        other = _checked_gradient(_gradient(b, h, u), h, u, :target, t.temperature)
+        value = (1-t.temperature) * value + t.temperature * other
         g .= (1-t.temperature) .* g .+ t.temperature .* h
+        _checked_gradient(value, g, u, :bridge, t.temperature)
     end
-    isfinite(value) && !all(isfinite, g) && throw(DomainError(g,
-        "SMC target returned a non-finite gradient at a finite density"))
     return value, g
 end
 
@@ -233,10 +241,19 @@ function _library_stage(state, beta, delta, seed)
     # Julia >=1.10 floor task creation does not advance the parent's RNG.
     task = @task begin
         Random.seed!(seed)
-        smc!(model, output)
+        try
+            smc!(model, output)
+            nothing
+        catch err
+            # Transport only our numerical diagnostic as data. Other failures
+            # keep their ordinary task exception and original backtrace.
+            err isa SMCNonfiniteError || rethrow()
+            err
+        end
     end
     schedule(task)
-    fetch(task) # propagate callback/library failures; no detached work
+    result = fetch(task) # join every worker before returning or throwing
+    result isa SMCNonfiniteError && throw(result)
     return positions, ancestors, output.logZhats[end], n*output.esses[1], divergences[]
 end
 
@@ -248,11 +265,12 @@ function PPL.smc_step(state::SMCState)
     delta = Vector{Float64}(undef, n)
     for i in 1:n
         u = state.positions[:, i]
-        a, b = _checked(_density(state.source, u)), _checked(_density(state.target, u))
+        a = _checked(_density(state.source, u), u, :source, state.temperature)
+        b = _checked(_density(state.target, u), u, :target, state.temperature)
         isfinite(a) || throw(ArgumentError("SMC source density is zero at particle $i"))
-        delta[i] = _checked(b-a)
-        isfinite(b) && !isfinite(delta[i]) && throw(DomainError(delta[i],
-            "SMC log density ratio overflowed"))
+        delta[i] = b-a
+        isfinite(b) && !isfinite(delta[i]) &&
+            throw(SMCNonfiniteError(u, delta[i], nothing, :logratio, :bridge, state.temperature))
     end
     beta = _temperature(delta, state.temperature, state.options)
     rng = copy(state.rng)
@@ -315,7 +333,12 @@ _versions() = (; julia=VERSION, ppl=Base.pkgversion(PPL), rk=Base.pkgversion(Rea
     smc=Base.pkgversion(SequentialMonteCarlo), nuts=Base.pkgversion(WarmupHMC))
 _source_id(t::SMCTarget) = (; kind=:posterior, signature=t.signature)
 _source_id(t::ReferenceTarget) = (; kind=:reference, reference=t.reference)
-_scores(t, positions) = [_checked(_density(t, positions[:, i])) for i in axes(positions,2)]
+function _scores(t, positions, endpoint, temperature)
+    return map(axes(positions, 2)) do i
+        u = positions[:, i]
+        _checked(_density(t, u), u, endpoint, temperature)
+    end
+end
 
 function PPL.smc_checkpoint(state::SMCState)
     return deepcopy((; schema_version=1, versions=_versions(),
@@ -324,8 +347,8 @@ function PPL.smc_checkpoint(state::SMCState)
         log_normalizer=state.log_normalizer, rng=state.rng, options=state.options,
         ancestors=state.ancestors, lineage=state.lineage, history=state.history,
         update=state.update, stage=state.stage,
-        source_scores=_scores(state.source, state.positions),
-        target_scores=_scores(state.target, state.positions)))
+        source_scores=_scores(state.source, state.positions, :source, state.temperature),
+        target_scores=_scores(state.target, state.positions, :target, state.temperature)))
 end
 
 function PPL.resume_smc(target::SMCTarget, checkpoint; previous=nothing)
@@ -346,8 +369,8 @@ function PPL.resume_smc(target::SMCTarget, checkpoint; previous=nothing)
     else
         throw(ArgumentError("unknown SMC checkpoint source"))
     end
-    _scores(source, cp.positions) == cp.source_scores &&
-        _scores(target, cp.positions) == cp.target_scores ||
+    _scores(source, cp.positions, :source, cp.temperature) == cp.source_scores &&
+        _scores(target, cp.positions, :target, cp.temperature) == cp.target_scores ||
         throw(ArgumentError("SMC checkpoint endpoint densities differ; rebuild with the original code and data"))
     0 <= cp.temperature <= 1 && isfinite(cp.log_normalizer) ||
         throw(ArgumentError("invalid SMC checkpoint bridge state"))

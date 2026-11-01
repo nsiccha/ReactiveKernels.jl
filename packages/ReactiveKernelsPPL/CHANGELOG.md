@@ -16,6 +16,16 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.37
+
+- Report invalid SMC densities, gradients and density ratios with exported
+  `SMCNonfiniteError`, retaining copied exact unconstrained positions, values,
+  gradients, endpoint and bridge temperature. Error display is bounded and
+  mutation failures propagate directly across the worker task. Initial fits,
+  cumulative updates and checkpoint evaluation preserve fail-fast behavior
+  and input state/RNG ownership. **Breaking:** callers catching `DomainError`
+  for these numerical failures should catch `SMCNonfiniteError` instead.
+
 ## 0.1.36
 
 - Add optional finite-state filtering through `prepare_filter`,

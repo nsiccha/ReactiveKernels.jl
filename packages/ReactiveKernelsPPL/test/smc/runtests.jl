@@ -196,9 +196,9 @@ end
     @test_throws ArgumentError SMCOptions(ess_fraction=1)
     @test_throws ArgumentError SMCReference([0.0],[0.0])
     @test_throws ArgumentError EXT._temperature(fill(-Inf,4),0.0,SMCOptions())
-    @test_throws DomainError EXT._checked(NaN)
-    @test_throws DomainError EXT._checked(Inf)
-    @test EXT._checked(-Inf) == -Inf
+    @test_throws SMCNonfiniteError EXT._checked(NaN, [0.0], :target, 0.5)
+    @test_throws SMCNonfiniteError EXT._checked(Inf, [0.0], :target, 0.5)
+    @test EXT._checked(-Inf, [0.0], :target, 0.5) == -Inf
     @test EXT._ess([0.0,-Inf],1.0) == 1
     @test EXT._ess([-1e200,-1e200],1.0) == 2
     @test EXT._ess([-1e308,1e308],1e-308) ≈ (1+exp(-2))^2/(1+exp(-4))
@@ -259,8 +259,10 @@ end
     @test failed.temperature == 0
     @test failed.rng == failed_rng
     invalid = target_for(GAUSSIAN,(; y=[NaN]); binding_id="nan")
-    @test_throws DomainError smc(invalid.target; rng=Xoshiro(6),particles=8)
+    @test_throws SMCNonfiniteError smc(invalid.target; rng=Xoshiro(6),particles=8)
 end
+
+include("nonfinite.jl")
 
 @testset "Fresh-process checkpoint continuation" begin
     mktempdir() do directory
