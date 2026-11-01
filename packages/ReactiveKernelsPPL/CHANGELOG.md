@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.48
+
+- Add `carry_smc(completed; basis=:fit, max_reflections=16, maxiter=100)`.
+  The public WarmupHMC 0.2.10 moment fitter learns bounded correlation
+  directions from the weighted completed cloud, including selected static
+  coordinates, and retains its owned data-only diagnostics. No old cloud or
+  dense covariance is retained. Finite fitting budgets can lose correlations;
+  convergence of fitted directions does not certify covariance accuracy.
+
 ## 0.1.46
 
 - Add `carry_smc(completed; basis=portable_scale)` to fit weighted posterior

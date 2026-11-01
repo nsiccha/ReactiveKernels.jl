@@ -407,7 +407,8 @@ PPL.smc_reference(state::SMCState) =
     state.source isa ReferenceTarget ? deepcopy(state.source.reference) : nothing
 
 function PPL.carry_smc(state::SMCState; calibration_id::AbstractString, scale=nothing,
-        parameters=nothing,basis=nothing)
+        parameters=nothing,basis=nothing,max_reflections::Integer=16,
+        maxiter::Integer=100,progress=nothing)
     state.temperature == 1 || throw(ArgumentError("complete the bridge before carrying its posterior"))
     isempty(calibration_id) && throw(ArgumentError("calibration_id must identify this posterior summary"))
     scale===nothing || basis===nothing || throw(ArgumentError("supply a calibrated scale or a basis to refit, not both"))
@@ -415,7 +416,13 @@ function PPL.carry_smc(state::SMCState; calibration_id::AbstractString, scale=no
         PPL._smc_parameter_projection(state.target.query.layout,parameters)
     positions=projection===nothing ? state.positions : view(state.positions,projection.indices,:)
     location = positions * state.weights
-    if basis !== nothing
+    diagnostics=nothing
+    if basis === :fit
+        summary=WarmupHMC.fit_gaussian_moments(positions; weights=state.weights,
+            max_reflections,maxiter,progress)
+        location,scale,diagnostics=summary.mean,summary.scale,summary.diagnostics
+    elseif basis !== nothing
+        basis isa Symbol && throw(ArgumentError("basis must be :fit or a portable scale"))
         scale=_posterior_scale_in_basis(positions,state.weights,location,basis)
     elseif scale === nothing
         variance = zeros(length(location))
@@ -425,11 +432,15 @@ function PPL.carry_smc(state::SMCState; calibration_id::AbstractString, scale=no
         scale = sqrt.(variance)
     end
     reference=SMCReference(location,scale)
-    projection===nothing && return carry_smc(state.target,reference;calibration_id)
+    if projection===nothing
+        carried=carry_smc(state.target,reference;calibration_id)
+        return SMCCarriedReference(carried.reference,carried.frame,
+            carried.calibration_id,deepcopy(diagnostics))
+    end
     compact=PPL._smc_projection_layout(projection.record)
     frame=deepcopy((;model_id=state.target.signature.model_id,layout=_layout(compact),
         parameters=(;layout=projection.record,names=projection.names,paths=projection.output_paths)))
-    return SMCCarriedReference(reference,frame,String(calibration_id))
+    return SMCCarriedReference(reference,frame,String(calibration_id),deepcopy(diagnostics))
 end
 
 function PPL.initialize_smc(target::AbstractSMCTarget; rng::Xoshiro, particles::Integer=1000,

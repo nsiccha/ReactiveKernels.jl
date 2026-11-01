@@ -128,17 +128,22 @@ frame. Construct with [`carry_smc`](@ref). The owned `reference`, `frame` and
 `calibration_id` contain no old observations, prepared queries or trajectories.
 Treat them as read-only. The frame includes the caller's model/preprocessing
 identity and the packed layout; the calibration ID identifies this summary.
+`fit_diagnostics` is `nothing` for externally supplied or fixed-basis summaries;
+`basis=:fit` carries the bounded WarmupHMC fitting diagnostics as owned data.
 """
-struct SMCCarriedReference{R,F}
+struct SMCCarriedReference{R,F,D}
     reference::R
     frame::F
     calibration_id::String
+    fit_diagnostics::D
 end
+SMCCarriedReference(reference,frame,calibration_id::String) =
+    SMCCarriedReference(reference,frame,calibration_id,nothing)
 
 """
     carry_smc(target, reference::SMCReference; calibration_id)
     carry_smc(completed_state; calibration_id, scale=nothing, parameters=nothing,
-              basis=nothing)
+              basis=nothing, max_reflections=16, maxiter=100, progress=nothing)
 
 Copy a calibrated Gaussian posterior into the target's coordinate frame for
 bounded-window updates. The first form accepts an externally calibrated
@@ -158,6 +163,18 @@ discards cross-covariances in the supplied basis: exact covariance requires that
 basis to diagonalize the posterior covariance. Use an independently learned
 orientation, for example `smc_reference(schedule).scale`, in the selected frame.
 `basis` and explicit `scale` are mutually exclusive; `scale` is copied as given.
+
+`basis=:fit` learns directions from the completed weighted cloud through
+WarmupHMC's public `fit_gaussian_moments`, then carries its mean and portable
+scale. `max_reflections`, `maxiter` and `progress` apply to this fit. Use this
+route when a supplied pilot basis omits posterior correlations. It fits the
+selected coordinates when `parameters` is given, without slicing full-frame
+geometry. Work is O(d N (1 + k maxiter)), workspace O(d N + d k + N), and retained
+size O(d (1 + k)); no dense covariance or old cloud is retained. These are
+posterior summary moments, not production-kernel adaptation. The owned
+`fit_diagnostics` contains `reflections`, `iterations`, `relative_residuals`,
+`converged` and `effective_sample_size`. Residual convergence does not certify
+covariance accuracy; finite reflection/iteration budgets may lose correlations.
 
 This is an assumed-density approximation to the old posterior. A Gaussian
 summary is exact only for a Gaussian posterior with matching moments; fitting

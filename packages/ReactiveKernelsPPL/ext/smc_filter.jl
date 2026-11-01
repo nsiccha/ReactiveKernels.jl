@@ -1,7 +1,8 @@
 # Included by the SMC extension. Finite-state transitions and conditional
 # resampling remain in the authored filtering extension.
 _same(a::SMCCarriedReference,b::SMCCarriedReference) =
-    _same(a.reference,b.reference) && _same(a.frame,b.frame) && a.calibration_id==b.calibration_id
+    _same(a.reference,b.reference) && _same(a.frame,b.frame) && a.calibration_id==b.calibration_id &&
+    _same(a.fit_diagnostics,b.fit_diagnostics)
 
 struct FilterReferenceTarget{Q,B,S,R} <: AbstractSMCTarget
     query::Q
