@@ -121,6 +121,66 @@ captured data and code must remain read-only for a target's lifetime.
 function prepare_smc end
 
 """
+    SMCCarriedReference
+
+Data-only Gaussian summary of a posterior in a fixed unconstrained coordinate
+frame. Construct with [`carry_smc`](@ref). The owned `reference`, `frame` and
+`calibration_id` contain no old observations, prepared queries or trajectories.
+Treat them as read-only. The frame includes the caller's model/preprocessing
+identity and the packed layout; the calibration ID identifies this summary.
+"""
+struct SMCCarriedReference{R,F}
+    reference::R
+    frame::F
+    calibration_id::String
+end
+
+"""
+    carry_smc(target, reference::SMCReference; calibration_id)
+    carry_smc(completed_state; calibration_id, scale=nothing)
+
+Copy a normalized Gaussian reference into the target's coordinate frame for
+bounded-window updates. The first form accepts an independently learned
+reference, including `smc_reference(schedule)`. The second uses the completed
+cloud's weighted mean and, by default, its marginal standard deviations
+(population moments, not a dense covariance). Supply a diagonal scale or a
+portable WarmupHMC `scale_data` record to preserve learned correlations.
+Zero or nonfinite marginal scales require an explicit valid scale.
+
+This is an assumed-density approximation to the old posterior. A Gaussian
+summary is exact only for a Gaussian posterior with matching moments; fitting
+it from a finite cloud introduces Monte Carlo error too. The cloud itself is
+not retained. This summary is a prior for subsequent windows, not production
+kernel adaptation. Mutation tuning still uses independent pilot RNGs/positions.
+"""
+function carry_smc end
+
+"""
+    prepare_smc_window(built, binding, u0; previous::SMCCarriedReference,
+                       backend, model_id, binding_id, warm=false)
+
+Prepare a static-parameter target `log(previous.reference) + loglikelihood`
+for **new observations only**. The likelihood and its ordinary AD derivative
+come from the model's `:likelihood` query. Original priors and coordinate
+Jacobians are not added again: the carried reference is already a density in
+unconstrained coordinates. Parameter transformations in the likelihood remain.
+
+The model/preprocessing identity and packed layout must match `previous`.
+Keep fitted preprocessing frozen and pass it through the binding. Retained
+storage and each evaluation depend on this window, never on elapsed history.
+This does not carry latent trajectories across windows; use the filter for
+that task. A changing set of latent coordinates is a different frame.
+
+Use the ordinary `tune_smc`, `initialize_smc`, `smc`, `smc_checkpoint` and
+`resume_smc` APIs. The default initial reference is the carried prior. A
+checkpoint resumes from the rebuilt window target alone, without old data.
+Its log normalizer is the new window's predictive normalizer under the
+approximate carried prior, not exact full-history evidence. Supply each new
+window once; overlapping windows would count their observations again.
+"""
+function prepare_smc_window end
+
+"""
     tune_smc(target; rng::Xoshiro, init, reference=nothing, previous=nothing,
              temperatures=(0.0, 1e-6, 1e-5, 1e-4, 1e-3, 0.01, 0.1, 0.5, 1.0),
              pilot_steps=64, pilot=:continuous, max_reflections=16,

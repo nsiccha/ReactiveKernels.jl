@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.43
+
+- Add `carry_smc`, `SMCCarriedReference` and `prepare_smc_window` for
+  bounded-window static-parameter updates. The carried normalized Gaussian
+  replaces the old posterior; only the new window's likelihood is evaluated.
+  Original priors and coordinate Jacobians are not counted again. Summaries
+  retain the coordinate/preprocessing identity and no old observations.
+  Correlated portable scales, independent pilot tuning, bounded diagnostics
+  and exact checkpoint continuation use the existing SMC engine. This is an
+  explicit assumed-density approximation, not full-history posterior replay.
+
 ## 0.1.42
 
 - Add independent, pre-production pilot tuning with `tune_smc`, a data-only

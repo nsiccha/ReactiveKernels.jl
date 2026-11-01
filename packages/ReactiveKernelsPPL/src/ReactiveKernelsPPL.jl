@@ -91,6 +91,7 @@ export restore_draws
 export prepare_smc, smc, initialize_smc, update_smc, smc_step, smc_checkpoint, resume_smc
 export SMCReference, SMCOptions, SMCNonfiniteError
 export SMCTuningSchedule, tune_smc, smc_reference
+export SMCCarriedReference, carry_smc, prepare_smc_window
 export prepare_filter, initialize_filter, filter_step, filter_stream,
     filter_checkpoint, resume_filter, filter_parameter_names, filter_parameters
 export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
