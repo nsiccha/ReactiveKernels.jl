@@ -155,4 +155,23 @@ end
     end
     @test costs[1] == costs[2]
 end
+
+@testset "cell queries retain Cartesian positions with exact packed types" begin
+    data = (; y=reshape(collect(0.1:0.1:0.6), 2, 3))
+    source = quote
+        beta ~ Normal(0, 1)
+        y .~ Normal.(beta, 1.0)
+    end
+    bound = bind_data(lower_rkppl(source, data; conditioned=(:y,), mod=@__MODULE__), data)
+    q = prepare_cell_query(build_kernel(bound), bound, :y; locality=:error)
+    u = [0.2]
+    for index in CartesianIndices(data.y)
+        expected = logpdf(Normal(u[1], 1), data.y[index])
+        @test q(u, index) ≈ expected
+        @test q(view(u, :), LinearIndices(data.y)[index]) ≈ expected
+    end
+    @test length(q.index_specializations.residuals) == 2
+    @test_throws BoundsError q(u, CartesianIndex(0, 1))
+    @test_throws ArgumentError q.kernel(view(u, :), 1)
+end
 end
