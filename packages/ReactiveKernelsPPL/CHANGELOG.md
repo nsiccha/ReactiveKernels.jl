@@ -16,6 +16,24 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.47
+
+- Fit `tune_smc(...; pilot=:adaptive, reference=:pilot)` from retained pilot
+  draw moments in the learned reflection basis, with
+  `reference_inflation=2.0` multiplying fitted standard deviations. The
+  reference no longer reuses the pilot's local mutation scale. Cross-covariances
+  in that basis are discarded; inflation does not guarantee posterior coverage.
+  Each grid pilot still exports its mutation scale and paired step size unchanged.
+- Record the reference pilot's native-coordinate `draw_sd` and inflation in
+  `schedule.pilot.reference_work`. Bounded stage summaries add `coordinate_sd`
+  for the post-mutation cloud and `reference_sd` for the initial Gaussian
+  reference (`nothing` on exact posterior-to-posterior updates), without keeping
+  historical clouds or allocating a dense covariance.
+- **Breaking:** learned-reference runs change numerically. Setting
+  `reference_inflation=1` uses uninflated pilot moments, not the old mutation
+  scale. Checkpoint replay requires matching package versions and code; rebuild
+  schedules and checkpoints when upgrading.
+
 ## 0.1.43
 
 - Require ReactiveKernels 0.1.47 for strict factor queries of ragged censored
