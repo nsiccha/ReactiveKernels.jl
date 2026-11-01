@@ -112,4 +112,63 @@ end
         @test structures[1] == structures[2]
     end
 end
+
+# The shared right factor is a transposed broadcast over an abstract vector.
+# Its element type must survive to the scalar ratio, without granting matrix
+# transposes a row form (their rows would read columns of the source).
+@kernel scaled_right_factor(Z::AbstractMatrix{Float64}, scale::AbstractVector{Float64},
+                            L::Matrix{Float64}, x::Vector{Float64}, y::Vector{Float64}) = begin
+    right = transpose(scale .* L)
+    B = Z * right
+    c = exp.(B[:, 1])
+    d = exp.(B[:, 2])
+    ratio = c[1] / d[1]
+    dens = plate(x, y) do xi, yi
+        -(yi - sin(ratio * xi))^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+
+function scaled_right_oracle(Z, scale, L, x, y, i)
+    B = Z * transpose(scale .* L)
+    ratio = exp(B[1, 1]) / exp(B[1, 2])
+    -(y[i] - sin(ratio * x[i]))^2 / 2
+end
+
+@testset "scalar type through a shared transposed broadcast" begin
+    have = (:Z, :scale, :L, :x, :y, :i)
+    k = prepare(plate_cell(scaled_right_factor, :dens; index=:i, locality=:error);
+                have, want=:dens_cell)
+    structures = Int[]
+    scale, L = [0.5, 0.8], [1.0 0.0; 0.2 0.9]
+    for n in (6, 120)
+        Z = [sin(i + j) / 4 for i in 1:n, j in 1:2]
+        x, y = cos.(1:n), sin.(1:n)
+        bound = prepare(plate_cell(scaled_right_factor, :dens; index=:i, locality=:error);
+            have, want=:dens_cell, bound=(; Z, L, x, y))
+        push!(structures, astsize(code_expr(bound)))
+        for i in (1, n)
+            expected = scaled_right_oracle(Z, scale, L, x, y, i)
+            @test k(Z, scale, L, x, y, i) ≈ expected
+            @test bound(scale, i) ≈ expected
+            fp = partition_footprint(k, Z, scale, L, x, y, i)
+            @test fp.Z == [1, n + 1]
+            @test fp.x == [i] && fp.y == [i]
+            ad = prepare_ad(bound, AutoEnzyme(; mode=Enzyme.Reverse), scale, i; active=:scale)
+            value, gradient = ad_value_and_gradient(ad, scale, i)
+            @test value ≈ expected
+            for j in eachindex(scale)
+                plus, minus = copy(scale), copy(scale)
+                plus[j] += 1e-6
+                minus[j] -= 1e-6
+                fd = (scaled_right_oracle(Z, plus, L, x, y, i) -
+                      scaled_right_oracle(Z, minus, L, x, y, i)) / 2e-6
+                @test gradient[j] ≈ fd atol=2e-8 rtol=2e-6
+            end
+        end
+    end
+    @test structures[1] == structures[2]
+    @test all(e.status !== :whole for e in partition_locality(k))
+end
 end

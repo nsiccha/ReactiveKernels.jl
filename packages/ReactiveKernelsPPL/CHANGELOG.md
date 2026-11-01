@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.43
+
+- Require ReactiveKernels 0.1.47 for strict factor queries of ragged censored
+  observations sharing array-valued predictors with another in-cell
+  observation. Factors preserve empty and repeated rows, structural packed
+  reads, and ordinary Reverse derivatives through both censored atoms and
+  density terms.
+
 ## 0.1.42
 
 - Add independent, pre-production pilot tuning with `tune_smc`, a data-only

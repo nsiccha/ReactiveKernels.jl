@@ -1229,10 +1229,29 @@ _cell_element_type(S) =
         AbstractArray{eltype(S),ndims(S)} :
     S isa Type && S !== Union{} && S <: Number ? S : Any
 
+# A matrix transpose is not a row form: its rows read columns of its source.
+# It still preserves numeric element/rank information. A transpose of an
+# expression with a known row form may therefore use the same stand-ins for
+# type inference, without acquiring permission to compute at rows. This
+# matters for a product's shared right factor, e.g. transpose(scale .* L).
+function _cell_transpose_standin(r::Recipe; outlined::Bool = false)
+    analyzed = _cell_native(r; outlined)
+    analyzed === nothing && return false
+    native, params, mod = analyzed
+    Meta.isexpr(native, :call, 2) &&
+        !_native_callee_shadowed(native.args[1], params) &&
+        _cell_binding(native.args[1], mod) in (Base.transpose, Base.adjoint) || return false
+    Meta.isexpr(r.source, :call, 2) || return false
+    operand = Recipe(r.id, r.inputs, r.outputs, r.op, r.cost, r.cse_key,
+                     r.effectful, r.source.args[2])
+    _cell_form(operand; outlined) !== nothing
+end
+
 # One type analysis for row demand, scalar reads and locality reporting. Keep
 # array rank: forgetting it here also loses the scalar type of `exp(a[1])`.
-# Stand-ins are used only for row forms, whose element operations and axes are
-# known, never to infer an arbitrary function's behavior on an abstract array.
+# Stand-ins are used for row forms and their transposes, whose element
+# operations and axes are known, never to infer an arbitrary function's
+# behavior on an abstract array.
 function _cell_value_types(p::Plan; outlined = Set{Int}(),
                            known = IdDict{Recipe,Any}())
     bound = Set(canon_id(p.graph, only(r.outputs).id) for r in p.recipes
@@ -1263,7 +1282,7 @@ function _cell_value_types(p::Plan; outlined = Set{Int}(),
             end
             if T === Any && !(r.op isa _AuthoredPlateOp)
                 f = get!(() -> _cell_form(r; outlined = r.id in outlined), known, r)
-                if f !== nothing
+                if f !== nothing || _cell_transpose_standin(r; outlined = r.id in outlined)
                     fallback === nothing && (fallback = _recipe_inferred_output_types(r,
                         Any[_cell_standin_type(S) for S in inputs]))
                     T = _cell_element_type(fallback[k])
@@ -1584,6 +1603,7 @@ plan, producers first.
 struct _CellPushdowns
     graph::Graph
     types::Dict{ValueId,Any}
+    views::Set{ValueId}
     pushed::Set{ValueId}
     recipes::Set{Int}
     producer::Dict{ValueId,Recipe}
@@ -1613,6 +1633,39 @@ end
 # reads its inputs at those rows. Extend for an operation of that kind.
 _cell_lazy_view(@nospecialize(op)) = false
 
+# A cell returning one of its inputs without evaluating a body selects
+# existing storage. In particular, selecting one bound ragged array does not
+# compute its elements. Only input-backed projections qualify: selecting a
+# computed array of arrays must not hide the work that produced its elements.
+function _cell_input_views(p::Plan)
+    cid(v) = canon_id(p.graph, v.id)
+    storage = Set(cid(v) for v in p.have)
+    views = Set{ValueId}()
+    for r in p.recipes
+        if r.op isa _BoundConstant
+            union!(storage, (cid(v) for v in r.outputs))
+            continue
+        end
+        projection = if r.op isa _AuthoredPlateCellOp && !r.op.rows
+            body = r.op.plate.kernel.plan
+            if isempty(body.recipes) && length(body.want) == 1
+                input = findfirst(v -> canon_id(body.graph, v.id) ==
+                    canon_id(body.graph, only(body.want).id), body.have)
+                input !== nothing && cid(r.inputs[input + 1]) in storage
+            else
+                false
+            end
+        else
+            false
+        end
+        if _cell_lazy_view(r.op) || projection
+            union!(views, (cid(v) for v in r.outputs))
+            union!(storage, (cid(v) for v in r.outputs))
+        end
+    end
+    views
+end
+
 # Whether a producer reads an input in `role` at its own rows.
 _cell_row_role(role) =
     role in (:leaf, :gather, :linear_gather, :column, :factor_leaf, :factor, :part,
@@ -1641,11 +1694,10 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
             valtype(v) === Any ? get(types, cidof(v), Any) : valtype(v)
     end
     branch_read = _cell_bound_capture_check(p, producers, static_type, known, outlined)
-    # A lazy view's output is read like a HAVE port: at rows as a view.
+    # An input-backed view's output is read like a HAVE port: at rows as a view.
+    views = _cell_input_views(p)
     fixed = Set(cidof(v) for v in Iterators.flatten((p.have, p.want)))
-    for r in p.recipes
-        _cell_lazy_view(r.op) && union!(fixed, (cidof(o) for o in r.outputs))
-    end
+    union!(fixed, views)
     forms = Dict{Int,_CellForm}()
     function form(cid)
         candidates = get(producers, cid, Recipe[])
@@ -1788,7 +1840,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
         end
     end
     recipes = Set(only(producers[cid]).id for cid in pushed)
-    _CellPushdowns(g, types, pushed, recipes,
+    _CellPushdowns(g, types, views, pushed, recipes,
         Dict(cid => only(producers[cid]) for cid in pushed), forms, captures, batched,
         Dict{Int,Int}(), Dict{Int,Any}(), Dict(r.id => k for (k, r) in enumerate(p.recipes)),
         requests, refused, dropped, untyped)
