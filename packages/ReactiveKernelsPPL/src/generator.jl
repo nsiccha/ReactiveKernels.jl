@@ -950,7 +950,7 @@ end
 # operand of a lazy branch, a loop or a generator keeps its own
 # evaluation (snag `interpolated-err-41772e14`).
 function _split_data_calls!(stmts::Vector{Expr}, name::Symbol, ex,
-        dataonly::Set{Symbol})
+        dataonly::Set{Symbol}; taken = Set{Symbol}(), prefix = :_ppl_data_)
     count = 0
     function walk(node)
         node isa Expr || return node
@@ -959,7 +959,12 @@ function _split_data_calls!(stmts::Vector{Expr}, name::Symbol, ex,
                 _contains_module_call(node) &&
                 _expr_value_symbols(node) ⊆ dataonly
             count += 1
-            tmp = Symbol(:_ppl_data_, name, :_, count)
+            tmp = Symbol(prefix, name, :_, count)
+            while tmp in taken
+                count += 1
+                tmp = Symbol(prefix, name, :_, count)
+            end
+            push!(taken, tmp)
             push!(stmts, :($(tmp) = $(node)))
             return tmp
         end

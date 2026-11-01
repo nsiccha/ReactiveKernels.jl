@@ -51,6 +51,13 @@ It does not execute a helper, manufacture an example input, or ask Julia to
 infer an arbitrary helper body. Descriptors are ordinary data; graph contents,
 array lengths and literal exponents are not metadata type parameters.
 
+RKPPL exposes eager data-only subexpressions as named definitions before
+binding. Metadata dependencies of visible kernels follow named compositions,
+including sampled expressions such as `g(data) .+ exp.(z)`. Binding evaluates
+the data-only definitions needed for those shapes once; helpers used only as
+shared plate captures keep their preparation stage. The metadata query itself
+executes no helper, and lazy arms and plate cells retain their evaluation scope.
+
 The first consumer is PPL's pointwise arithmetic emission. Its former
 `_PointwiseValue.rank` and `.length` rules have been removed: indexing,
 scalar/vector arithmetic, broadcast axes, `sum` and numeric `vcat` now obtain

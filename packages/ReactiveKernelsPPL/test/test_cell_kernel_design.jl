@@ -136,23 +136,108 @@ const coordinate_calls = Ref(0)
 copy_coordinates(x) = (coordinate_calls[] += 1; map(copy, x))
 
 @testset "data-only captures keep preparation staging" begin
-    data = fixture(3, true)
-    source = computed_model(:entries)
-    pushfirst!(source.args, :(computed_coordinates = copy_coordinates(coordinates)))
-    i = findfirst(ex -> ex isa Expr && ex.head === :(=) &&
-        ex.args[1] === :values, source.args)
-    source.args[i] = :(values = grouped_column(z, groups, computed_coordinates,
-        computed_entries, owner, slot))
-    coordinate_calls[] = 0
-    bound = bind_data(lower_rkppl(source, data; conditioned = (:y,),
-        mod = @__MODULE__), data)
-    built = build_kernel(bound)
-    @test coordinate_calls[] == 0
-    q = prepare_cell_query(built, bound, :y; locality = :error)
-    @test coordinate_calls[] == 1
-    u = fill(0.1, length(coordinate_names(built.layout)))
-    @test isfinite(q(u, 1))
-    @test isfinite(q(u, 6))
-    @test coordinate_calls[] == 1
+    for inline in (false, true)
+        data = fixture(3, true)
+        source = computed_model(:entries)
+        inline || pushfirst!(source.args, :(computed_coordinates = copy_coordinates(coordinates)))
+        i = findfirst(ex -> ex isa Expr && ex.head === :(=) &&
+            ex.args[1] === :values, source.args)
+        coords = inline ? :(copy_coordinates(coordinates)) : :computed_coordinates
+        source.args[i] = :(values = grouped_column(z, groups, $coords,
+            computed_entries, owner, slot))
+        coordinate_calls[] = 0
+        bound = bind_data(lower_rkppl(source, data; conditioned = (:y,),
+            mod = @__MODULE__), data)
+        built = build_kernel(bound)
+        @test coordinate_calls[] == 0
+        q = prepare_cell_query(built, bound, :y; locality = :error)
+        @test coordinate_calls[] == 1
+        u = fill(0.1, length(coordinate_names(built.layout)))
+        @test isfinite(q(u, 1))
+        @test isfinite(q(u, 6))
+        @test coordinate_calls[] == 1
+    end
+end
+
+const bound_calls = Ref(0)
+lower_bounds(x) = (bound_calls[] += 1; max.(x, 0.0))
+@kernel completed(observed, missing, order) = vcat(observed, missing)[order]
+
+const DATA_METADATA_MODEL = quote
+    z[axes(lo, 1)] .~ Normal.(0, 1)
+    beta[1:2] .~ Normal.(0, 1)
+    free = lower_bounds(lo) .+ exp.(z)
+    values = completed(observed, free, order)
+    lx = log.(values)
+    X = hcat(one, lx)
+    mu = X * beta .+ offset
+    y .~ Normal.(mu, 1)
+end
+
+function data_metadata_fixture(n, empty)
+    lo = empty ? Float64[] : [isodd(i) ? -0.2 : 0.3 for i in 1:n]
+    observed = fill(2.0, n)
+    order = empty ? collect(n:-1:1) : vec(permutedims(hcat(n+1:2n, 1:n)))
+    (; lo, observed, order, one = ones(length(order)),
+        offset = fill(0.1, length(order)), y = fill(0.7, length(order)))
+end
+
+@testset "nested data calls provide metadata through sampled compositions" begin
+    for empty in (true, false)
+        bound_calls[] = 0
+        data = data_metadata_fixture(3, empty)
+        plan = lower_rkppl(DATA_METADATA_MODEL, data; conditioned = (:y,), mod = @__MODULE__)
+        original = deepcopy([(a.name, a.expr, a.label) for a in plan.assignments])
+        @test bound_calls[] == 0
+        costs = Tuple{Int,Int}[]
+        for (k, n) in enumerate((3, 300))
+            data = data_metadata_fixture(n, empty)
+            saved = deepcopy(data)
+            check = ReactiveKernelsPPL._STRUCTURAL_CACHE_CHECK[]
+            bound = try
+                ReactiveKernelsPPL._STRUCTURAL_CACHE_CHECK[] = true
+                bind_data(plan, data)
+            finally
+                ReactiveKernelsPPL._STRUCTURAL_CACHE_CHECK[] = check
+            end
+            @test bound_calls[] == k
+            @test [(a.name, a.expr, a.label) for a in plan.assignments] == original
+            meta = ReactiveKernelsPPL._value_metadata(bound, :values, Set{Symbol}(); data_axes = true)
+            @test ReactiveKernels.OutputSignatures.value_axes(meta) == axes(data.y)
+            built = build_kernel(bound)
+            q = prepare_cell_query(built, bound, :y; locality = :error)
+            names = coordinate_names(built.layout)
+            zi = [only(findall(==(Symbol("z.$i")), names)) for i in eachindex(data.lo)]
+            bi = [only(findall(==(Symbol("beta.$i")), names)) for i in 1:2]
+            u = [0.1sin(i) for i in eachindex(names)]
+            sampler = prepare_cell_sampler(built, bound, :y, u;
+                locality = :error, backend = AutoEnzyme(; mode = Enzyme.Reverse))
+            for cell in unique([1, 2, length(data.y)])
+                pos = data.order[cell]
+                zidx = pos <= n ? nothing : zi[pos - n]
+                value = pos <= n ? data.observed[pos] :
+                    max(data.lo[pos - n], 0.0) + exp(u[zidx])
+                mu = u[bi[1]] + u[bi[2]] * log(value) + data.offset[cell]
+                expected = logpdf(Normal(mu, 1), data.y[cell])
+                point = RecordingPoint(copy(u), Int[])
+                @test q(point, cell) ≈ expected
+                wanted = zidx === nothing ? bi : [bi; zidx]
+                @test sort!(unique!(point.seen)) == sort(wanted)
+                gradient = zeros(length(u))
+                got, _ = cell_value_and_gradient!(sampler, gradient, u, cell)
+                reference = zeros(length(u))
+                residual = data.y[cell] - mu
+                reference[bi] = [residual, residual * log(value)]
+                zidx === nothing || (reference[zidx] = residual * u[bi[2]] * exp(u[zidx]) / value)
+                @test got ≈ expected
+                @test gradient ≈ reference
+            end
+            q(u, 1)
+            push!(costs, (minimum(@allocated(q(u, 1)) for _ in 1:3), nodes(code_expr(q.kernel))))
+            @test bound_calls[] == k
+            @test data == saved
+        end
+        @test costs[1] == costs[2]
+    end
 end
 end
