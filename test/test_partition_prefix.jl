@@ -121,4 +121,27 @@ end
     @test :opaque in (v.name for v in all_shared.frontier)
 end
 
+@testset "pullbacks include lowered producers absent from the source graph" begin
+    graph = Graph()
+    x = value!(graph, :x, Float64)
+    a = value!(graph, :a, Float64)
+    add!(graph, x => a, sin)
+    original = ReactiveKernels.plan(graph; have=(x,), want=(a,))
+    # Outlining introduces values and recipes in the selected plan without
+    # registering those producers as alternate source-graph recipes.
+    b = value!(graph, :b, Float64)
+    lowered = ReactiveKernels.Recipe(-1, (x, a), (b,), (x, a) -> x * a,
+        1.0, nothing, false, ReactiveKernels._NO_KERNEL_SOURCE)
+    cut = _PREFIX_RK._partial_subplan(original, ReactiveKernels.Value[x], ReactiveKernels.Value[a, b],
+        [original.recipes; lowered])
+    kernel = prepare(cut; exemplars=(0.4,))
+    pullback = prepare_ad_pullback(kernel, backend, (1.0, 1.0), 0.4; active=:x)
+    for point in (-0.3, 0.4), seed in ((1.0, 0.0), (0.0, 1.0), (1.3, -0.7))
+        value, derivative = ad_value_and_pullback(pullback, seed, point)
+        @test value == (sin(point), point * sin(point))
+        @test derivative ≈ seed[1] * cos(point) +
+                           seed[2] * (sin(point) + point * cos(point))
+    end
+end
+
 end # module

@@ -985,10 +985,10 @@ function _ad_validate_unique_haves(spec::KernelSpec)
 end
 
 # Every value of the kernel's graph that some recipe reachable from the active
-# HAVE ports produces, the active ports included. The closure runs over every
-# recipe of the graph, not only the planned ones, so it over-approximates what
-# the active ports reach: a value outside it depends on no active port in any
-# plan.
+# HAVE ports produces, the active ports included. Include the selected plan's
+# recipes: lowering can introduce intermediate values and producers absent
+# from the source graph. Retain all graph recipes as well, so the closure
+# conservatively covers alternate producers and active-derived HAVE cuts.
 function _ad_active_downstream(kernel::_ADKernel, active_selector)
     graph = kernel.plan.graph
     active_indices = _ad_selector_indices(active_selector)
@@ -997,7 +997,7 @@ function _ad_active_downstream(kernel::_ADKernel, active_selector)
     changed = true
     while changed
         changed = false
-        for recipe in graph.recipes
+        for recipe in Iterators.flatten((graph.recipes, kernel.plan.recipes))
             any(input -> canon_id(graph, input.id) in downstream,
                 recipe.inputs) || continue
             for output in recipe.outputs
