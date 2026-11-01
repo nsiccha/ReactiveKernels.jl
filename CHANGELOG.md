@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.40
+
+- Add cold graph projection for incremental execution of authored finite
+  `scan` providers. The generated transition calls their original concrete
+  step kernels; pointwise work stays pointwise and whole-history operations
+  are rejected. ReactiveKernelsPPL uses this to derive streaming transitions
+  from ordinary provider graphs.
+
 ## 0.1.39
 
 - Preserve scalar vector reads when decomposing cell factors. Direct reads
