@@ -640,7 +640,16 @@ end
 # `varying` names controls such as the partition label and its row plan.
 # This internal compiler surface is also used by the PPL sampler; it carries
 # no mutable cache, backend choice, or packed-parameter naming convention.
-function _partition_shared_parts(p::Plan, partitioned; varying = ())
+function _partition_shared_parts(p::Plan, partitioned; varying = (), preserve_rows::Bool = false)
+    # Keep computations with row forms in the residual when preparing a
+    # strict shared query. Only their whole shared dependencies need caching;
+    # lifting a gather or observation-sized broadcast would materialize work
+    # that the residual can instead evaluate at the requested rows.
+    row_values = Set{ValueId}()
+    if preserve_rows
+        p, cells = _cell_outlined_pushdowns(_lowering_plan(p))
+        cells === nothing || union!(row_values, cells.pushed)
+    end
     cidof(v) = canon_id(p.graph, v.id)
     rules = Dict(_partition_rule(partitioned))
     # Scan each declaration once, rather than once per recipe that reads it.
@@ -652,6 +661,14 @@ function _partition_shared_parts(p::Plan, partitioned; varying = ())
     # recipes on both sides. Other shared HAVE values still vary with theta.
     static, _, static_owned = _partial_split(p, Set{ValueId}())
     prefix, residual, owned = _partial_split(p, shared, Set{Int}()) do r, available
+        if any(v -> cidof(v) in row_values, r.outputs)
+            # Retain literal shared slices of a mixed input as owned cache
+            # values. They extract parameter blocks, not observation rows.
+            # The shared-read proof below still checks every extracted index.
+            form = _cell_form(r)
+            (form !== nothing && form.kind === :range_view &&
+             any(v -> haskey(mixed, cidof(v)), r.inputs)) || return false
+        end
         all(enumerate(r.inputs)) do (slot, input)
             cid = cidof(input)
             cid in available ||
