@@ -94,6 +94,19 @@ const GUARDED_COLLECTED = quote
     y .~ Normal.(selected, 1.0)
 end
 
+# Same registered-Enzyme empty-window phi gap as the core exemplar test
+# (Enzyme snag ordinary-native-1d9d6afe). Pinned acceptance makes it fatal.
+function guarded_static_reverse(f)
+    try
+        f()
+    catch err
+        err isa Enzyme.Compiler.EnzymeRuntimeActivityError || rethrow()
+        get(ENV, "RK_TEST_REQUIRE_STATIC_ENZYME", "0") == "1" && rethrow()
+        @test occursin("Mismatched activity", sprint(showerror, err))
+        @test_broken false
+    end
+end
+
 @testset "packed exemplar types cross opaque helpers and guarded collectors" begin
     costs = Tuple{Int,Int,Int}[]
     for n in (16, 1024)
@@ -117,15 +130,17 @@ end
                 expected = logpdf(Normal(mean, 1), data.y[i])
                 @test q(x, i) ≈ expected
                 @test q(view(x, :), Int32(i)) ≈ expected
-                value, _ = cell_value_and_gradient!(cell, gradient, x, i)
                 expected_gradient = zeros(3)
                 if j > 0
                     for (k, w) in zip(data.groups[j], data.weights[j])
                         expected_gradient[k] += (data.y[i] - mean) * exp(x[k]) * w
                     end
                 end
-                @test value ≈ expected
-                @test gradient ≈ expected_gradient
+                guarded_static_reverse() do
+                    value, _ = cell_value_and_gradient!(cell, gradient, x, i)
+                    @test value ≈ expected
+                    @test gradient ≈ expected_gradient
+                end
             end
         end
         @test_throws BoundsError q(u, n + 1)

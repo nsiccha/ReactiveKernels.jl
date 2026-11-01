@@ -23,6 +23,9 @@ are recorded in the git history only.
   type-selected collectors and guarded captured-array reads. Query calls
   convert other real vectors and integer positions at this boundary, as cached
   queries already did for vectors. Require RK 0.1.51 for this lowering.
+- **Breaking:** direct calls to a cell query's `q.kernel` require those exact
+  argument types. Call `q(u, i)` for conversion of other real vectors and
+  integer positions; the kernel remains available for footprint analysis.
 
 ## 0.1.52
 

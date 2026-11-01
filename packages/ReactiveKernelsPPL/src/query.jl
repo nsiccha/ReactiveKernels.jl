@@ -651,7 +651,8 @@ separability when the same declaration is supplied.
 
 Native preparation uses the types of a packed `Vector{Float64}` and an `Int`
 cell position. Query calls convert other real vectors and integer positions
-to these types. `u0` supplies a valid packed preparation point for the shared
+to these types; direct calls to `q.kernel` require those exact types.
+`u0` supplies a valid packed preparation point for the shared
 prefix; it defaults to zeros. It is copied. Each query owns its cache and is not
 thread-safe. `q.kernel` remains the original packed-coordinate kernel for
 the footprint recipe below; through-prefix dependencies are not lost.
