@@ -1150,6 +1150,13 @@ inline, assigned to a local, or computed in an earlier plate whose output the
 observation reads. `cell_reductions(f)` gives their names in graph order and
 `reduction_rows(f, j, cell)` their row labels in term order.
 
+Array-valued predictors shared with another observation in the same authored
+cell retain their individual dependencies when the cell is factored. A term
+may select an existing ragged input and read only its requested position;
+this does not permit an opaque array computation to bypass strict locality.
+This supports censored ragged observations with shared vector locations and
+scales in RKPPL 0.1.43 / RK 0.1.47, including empty groups and repeated rows.
+
 Before choosing compact coordinates, prepare scalar value queries with
 `outer = prepare_cell_factor_query(f, :outer)` and
 `term = prepare_cell_factor_query(f, j)`. Call `outer(u, sums, cell)` or

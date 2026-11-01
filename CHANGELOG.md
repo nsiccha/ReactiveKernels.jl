@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.47
+
+- Preserve field dependencies when factoring a cell that shares array-valued
+  tuple outputs between observations. Literal reads of an unconverted tuple
+  forward its individual fields; selecting an existing ragged input remains
+  an input read. Strict factor queries retain local packed-coordinate reads
+  and ordinary Reverse derivatives for censored ragged observations.
+- Retain numeric element types through a shared transposed broadcast such as
+  `transpose(scale .* L)`, so downstream scalar ratios remain recognizable
+  as scalars during strict cell preparation. Matrix transposes still require
+  the original whole shared operand and acquire no row-local implementation.
+
 ## 0.1.46
 
 - Keep cell capture reads local through a scan's unchanged shared arguments.

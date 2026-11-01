@@ -72,8 +72,11 @@ end
     t = target()
     rng, init = Xoshiro(987), [0.1,-0.1]
     rng0, init0 = copy(rng), copy(init)
+    # Check statistical accuracy with the default bridge grid. A grid with
+    # only near-zero and terminal knots poorly tunes intermediate mutations
+    # when the fitted proposal is much wider than the target's narrow axis.
     schedule = tune_smc(t; rng, init, pilot=:adaptive, reference=:pilot,
-        temperatures=(0.0,1e-5,1.0), pilot_steps=64, pilot_evaluations=100,
+        pilot_steps=64, pilot_evaluations=100,
         recording_target=64, max_reflections=4,
         options=SMCOptions(moves=2,max_tree_depth=6))
     @test init == init0
@@ -83,7 +86,10 @@ end
     @test all(k -> k.metric isa NamedTuple, schedule.kernels)
     @test all(k -> length(k.metric.reflections) <= 4, schedule.kernels)
     @test smc_reference(schedule).scale isa NamedTuple
-    start = initialize_smc(t; rng=Xoshiro(438), particles=1000,
+    # The broad diagonal proposal has less overlap with this correlated
+    # target. Keep the same joint covariance/evidence tolerances at a larger
+    # particle count; pointwise density and moment-fit checks are separate.
+    start = initialize_smc(t; rng=Xoshiro(438), particles=4000,
         options=SMCOptions(tuning=schedule))
     cp = smc_checkpoint(start)
     final = smc(start)
@@ -99,3 +105,6 @@ end
     @info "Adaptive schedule" families=[w.family for w in schedule.pilot.work] reflections=[length(k.metric.reflections) for k in schedule.kernels]
 end
 end
+
+include("spread.jl")
+include("pilot_reference.jl")

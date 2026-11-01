@@ -25,8 +25,6 @@ are recorded in the git history only.
   dense covariance is retained. Finite fitting budgets can lose correlations;
   convergence of fitted directions does not certify covariance accuracy.
 
-## 0.1.46
-
 - Add `carry_smc(completed; basis=portable_scale)` to fit weighted posterior
   moments in a supplied bounded-reflection basis. The learned orientation is
   retained, while proposal magnitudes are replaced by posterior moments; no
@@ -35,8 +33,6 @@ are recorded in the git history only.
   proposal and need not have posterior covariance.
 - Document read-only learning-state positions, weights, retained-window length
   and bounded replenishment/acceptance diagnostics for consumers.
-
-## 0.1.45
 
 - Add selected-static `carry_smc(completed; parameters=...)` and
   `smc_parameters(carried, u)`. Completed fits with latent histories can
@@ -47,8 +43,6 @@ are recorded in the git history only.
   consumer's verified batch and streaming identity schemes differ. Both
   identities remain checked and checkpointed, and the ordinary filter's
   boundary identity is preserved.
-
-## 0.1.44
 
 - Add `prepare_filter_smc`, `tune_filter_smc` and `initialize_filter_smc`
   for bounded-window parameter learning over authored finite-state filters.
@@ -65,8 +59,6 @@ are recorded in the git history only.
   Records, diagnostics and data-only checkpoints have bounded retention;
   replay validates source, coordinate, calibration and mapping identities.
 
-## 0.1.43
-
 - Add `carry_smc`, `SMCCarriedReference` and `prepare_smc_window` for
   bounded-window static-parameter updates. The carried normalized Gaussian
   replaces the old posterior; only the new window's likelihood is evaluated.
@@ -75,6 +67,32 @@ are recorded in the git history only.
   Correlated portable scales, independent pilot tuning, bounded diagnostics
   and exact checkpoint continuation use the existing SMC engine. This is an
   explicit assumed-density approximation, not full-history posterior replay.
+
+## 0.1.47
+
+- Fit `tune_smc(...; pilot=:adaptive, reference=:pilot)` from retained pilot
+  draw moments in the learned reflection basis, with
+  `reference_inflation=2.0` multiplying fitted standard deviations. The
+  reference no longer reuses the pilot's local mutation scale. Cross-covariances
+  in that basis are discarded; inflation does not guarantee posterior coverage.
+  Each grid pilot still exports its mutation scale and paired step size unchanged.
+- Record the reference pilot's native-coordinate `draw_sd` and inflation in
+  `schedule.pilot.reference_work`. Bounded stage summaries add `coordinate_sd`
+  for the post-mutation cloud and `reference_sd` for the initial Gaussian
+  reference (`nothing` on exact posterior-to-posterior updates), without keeping
+  historical clouds or allocating a dense covariance.
+- **Breaking:** learned-reference runs change numerically. Setting
+  `reference_inflation=1` uses uninflated pilot moments, not the old mutation
+  scale. Checkpoint replay requires matching package versions and code; rebuild
+  schedules and checkpoints when upgrading.
+
+## 0.1.43
+
+- Require ReactiveKernels 0.1.47 for strict factor queries of ragged censored
+  observations sharing array-valued predictors with another in-cell
+  observation. Factors preserve empty and repeated rows, structural packed
+  reads, and ordinary Reverse derivatives through both censored atoms and
+  density terms.
 
 ## 0.1.42
 
