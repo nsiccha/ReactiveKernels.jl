@@ -3,12 +3,35 @@ module ReactiveKernelsPPLSMCExt
 using ReactiveKernelsPPL
 using ReactiveKernels
 using Random
-using LinearAlgebra: Diagonal, logabsdet
+using LinearAlgebra: Diagonal, logabsdet, ldiv!
 using SequentialMonteCarlo: SMCModel, SMCIO, smc!
 using WarmupHMC: FixedKernelNUTSState, fixed_kernel_nuts_step
 using WarmupHMC: ContinuousNUTSState, continuous_nuts_step
 import WarmupHMC, SequentialMonteCarlo, LogDensityProblems
 import ReactiveKernelsPPL as PPL
+
+function _posterior_scale_in_basis(positions,weights,location,basis)
+    data=PPL._smc_scale(basis)
+    d=length(location)
+    PPL._smc_scale_dimension(data)==d || throw(DimensionMismatch("posterior basis and selected coordinates"))
+    operator=_metric(data)
+    centered=zeros(d)
+    whitened=zeros(d)
+    variance=zeros(d)
+    for j in axes(positions,2)
+        for i in 1:d
+            centered[i]=positions[i,j]-location[i]
+        end
+        ldiv!(whitened,operator,centered)
+        for i in 1:d
+            variance[i]+=weights[j]*abs2(whitened[i])
+        end
+    end
+    # L = H*D. Refit D in the supplied H frame, retaining no cloud or dense
+    # covariance. Original proposal magnitudes cancel from these moments.
+    diagonal=(data isa AbstractVector ? data : data.diagonal).*sqrt.(variance)
+    data isa AbstractVector ? diagonal : (;data...,diagonal)
+end
 
 PPL._smc_scale(scale::NamedTuple) = WarmupHMC.scale_data(WarmupHMC.scale_from_data(scale))
 _metric(scale::AbstractVector) = Diagonal(scale)
