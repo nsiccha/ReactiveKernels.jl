@@ -22,7 +22,8 @@ are recorded in the git history only.
   position types, preserving strict locality through opaque scalar helpers,
   type-selected collectors and guarded captured-array reads. Query calls
   convert other real vectors and integer positions at this boundary, as cached
-  queries already did for vectors. Require RK 0.1.51 for this lowering.
+  queries already did for vectors; Cartesian indices use a cached specialization
+  for their type. Require RK 0.1.51 for this lowering.
 - **Breaking:** direct calls to a cell query's `q.kernel` require those exact
   argument types. Call `q(u, i)` for conversion of other real vectors and
   integer positions; the kernel remains available for footprint analysis.

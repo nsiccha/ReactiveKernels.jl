@@ -81,7 +81,7 @@ function weighted_readout(values, indices, weights)
 end
 
 const GUARDED_COLLECTED = quote
-    beta .~ Normal.(prior_mean, prior_sd)
+    beta[1:3] .~ Normal.(prior_mean, prior_sd)
     values = exp.(beta)
     @plate for i in eachindex(groups)
         readout_cells[i] = weighted_readout(values, groups[i], weights[i])
@@ -130,6 +130,7 @@ end
                 expected = logpdf(Normal(mean, 1), data.y[i])
                 @test q(x, i) ≈ expected
                 @test q(view(x, :), Int32(i)) ≈ expected
+                @test q(x, CartesianIndex(i)) ≈ expected
                 expected_gradient = zeros(3)
                 if j > 0
                     for (k, w) in zip(data.groups[j], data.weights[j])

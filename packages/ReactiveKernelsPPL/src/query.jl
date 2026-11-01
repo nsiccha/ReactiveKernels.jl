@@ -591,12 +591,15 @@ Construct with [`prepare_cell_query`](@ref) and call `q(u, i)`. The call paths
 carry the `Base.invokelatest` barrier, as `SamplerQuery`'s do. Not thread-safe:
 prepare one per thread.
 """
-mutable struct CellQuery{K,L,C}
+mutable struct CellQuery{K,L,C,I}
     const kernel::K
     const layout::L
     const observations::Tuple{Vararg{Symbol}}
     const prefix::C
+    const index_specializations::I
 end
+CellQuery(kernel, layout, observations, prefix) =
+    CellQuery(kernel, layout, observations, prefix, nothing)
 CellQuery(kernel, layout, observations) = CellQuery(kernel, layout, observations, nothing)
 
 (q::CellQuery)(u::AbstractVector{Float64}, cell) =
@@ -609,7 +612,12 @@ function _cell_density(q::CellQuery, u, cell)
     u isa Vector{Float64} || return _cell_density(q, Vector{Float64}(u), cell)
     cell isa Integer && !(cell isa Union{Int,Bool}) &&
         return _cell_density(q, u, Int(cell))
-    q.prefix === nothing && return q.kernel(u, cell)
+    if q.prefix === nothing
+        cell isa Int && return q.kernel(u, cell)
+        q.index_specializations === nothing && return q.kernel(u, cell)
+        kernel = _query_residual(q.index_specializations, cell, (u, cell))
+        return kernel(u, cell)
+    end
     length(u) == q.layout.total || throw(ContractValidationError(
         "[query] packed length $(length(u)) ≠ layout total $(q.layout.total)"))
     cached = _refresh_partition_prefix!(q.prefix.cache, u)
@@ -651,7 +659,8 @@ separability when the same declaration is supplied.
 
 Native preparation uses the types of a packed `Vector{Float64}` and an `Int`
 cell position. Query calls convert other real vectors and integer positions
-to these types; direct calls to `q.kernel` require those exact types.
+to these types and cache additional specializations for Cartesian indices;
+direct calls to `q.kernel` require the initial exact types.
 `u0` supplies a valid packed preparation point for the shared
 prefix; it defaults to zeros. It is copied. Each query owns its cache and is not
 thread-safe. `q.kernel` remains the original packed-coordinate kernel for
@@ -725,7 +734,9 @@ function prepare_cell_query(built, plan::StructuralPlan, observations;
         Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error,
             exemplars = (exemplar, 1))
     end
-    return CellQuery(kernel, built.layout, names, prefix)
+    indices = prefix === nothing ?
+        _value_query_prefix(nothing, kernel, kernel.plan, 1, on_error) : nothing
+    return CellQuery(kernel, built.layout, names, prefix, indices)
 end
 
 const _CELL_PORT = :_ppl_cell
