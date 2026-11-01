@@ -16,9 +16,9 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.36
+## 0.1.38
 
-- Require ReactiveKernels 0.1.41. A partition sampler with `partitioned`
+- Require ReactiveKernels 0.1.42. A partition sampler with `partitioned`
   reuses shared-only intermediates across labels and local-coordinate
   changes, refreshing them when shared coordinate values change. Cached
   arrays own their storage, and failed refreshes remain invalid until retried
@@ -30,6 +30,34 @@ are recorded in the git history only.
   `partitioned` declaration; separability checks remain in force.
 - Accept bare Symbol and Pair partition declarations consistently. Prepare
   matching kernels and AD operators for mixed concrete partition-label types.
+
+## 0.1.37
+
+- Report invalid SMC densities, gradients and density ratios with exported
+  `SMCNonfiniteError`, retaining copied exact unconstrained positions, values,
+  gradients, endpoint and bridge temperature. Error display is bounded and
+  mutation failures propagate directly across the worker task. Initial fits,
+  cumulative updates and checkpoint evaluation preserve fail-fast behavior
+  and input state/RNG ownership. **Breaking:** callers catching `DomainError`
+  for these numerical failures should catch `SMCNonfiniteError` instead.
+
+## 0.1.36
+
+- Add optional finite-state filtering through `prepare_filter`,
+  `initialize_filter`, `filter_step`, `filter_stream`, `filter_checkpoint`
+  and `resume_filter`. Transitions derive from authored scans, submodels and
+  kernel providers. Fixed constrained parameter ensembles retain conditional
+  state clouds; state-only warm-up avoids reweighting calibrated parameters.
+  Authored parameter transitions support explicitly dynamic models.
+- Add `filter_parameter_names` and `filter_parameters` to select fixed
+  parameters from nested constrained draws without historical latent paths.
+  Bound-plan preparation selects required fixed inputs without retaining
+  training columns or freezing newly computed covariates. Frozen preprocessing,
+  temporal design rows and fixed-vector products, zero-state models,
+  selected fixed groups, predictive scores, bounded
+  diagnostics, explicit RNG ownership and portable continuation are covered.
+  Work and retained size remain bounded in elapsed time for fixed particles,
+  group count and finite lag depth. Requires ReactiveKernels 0.1.41.
 
 ## 0.1.35
 

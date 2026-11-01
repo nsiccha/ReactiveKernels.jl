@@ -89,7 +89,9 @@ export prepare_predictive, PredictiveQuery, PredictiveLaws, predictive_laws, pre
     predictive_draws, predictive_node, predictive_targets
 export restore_draws
 export prepare_smc, smc, initialize_smc, update_smc, smc_step, smc_checkpoint, resume_smc
-export SMCReference, SMCOptions
+export SMCReference, SMCOptions, SMCNonfiniteError
+export prepare_filter, initialize_filter, filter_step, filter_stream,
+    filter_checkpoint, resume_filter, filter_parameter_names, filter_parameters
 export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
 export RKPPLModel, RKPPLBoundModel, RKPPLSubmodel, lower_rkppl, condition, @rkppl, SurfaceLoweringError
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
@@ -114,6 +116,7 @@ include("query.jl")
 include("cell_factors.jl")
 include("predictive.jl")
 include("smc.jl")
+include("filter.jl")
 include("jax.jl")
 include("display.jl")
 include("distribution_defaults.jl")
