@@ -2,6 +2,8 @@ module SMCThreadedTests
 using ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzyme
 using SequentialMonteCarlo, WarmupHMC, LogDensityProblems, Random
 using LinearAlgebra, Test, Serialization, MutatingFunctions
+include("window_fixture.jl")
+using .SMCWindowFixture
 
 const EXT = Base.get_extension(ReactiveKernelsPPL, :ReactiveKernelsPPLSMCExt)
 const BACKEND = AutoEnzyme(mode=Enzyme.Reverse)
@@ -91,5 +93,23 @@ end
     @test rand(copy(Random.default_rng()),UInt64,8) == rand(default_rng,UInt64,8)
     @test_throws ArgumentError SMCOptions(nthreads=0)
     @test_throws ArgumentError SMCOptions(nthreads=1.5)
+end
+
+@testset "Carried-window mutation owns likelihood and prior scratch" begin
+    t = SMCWindowFixture.window()
+    fork = EXT._worker_target(t)
+    @test fork.query !== t.query && fork.query.ad !== t.query.ad
+    @test fork.prior !== t.prior && fork.prior.ad !== t.prior.ad
+    @test fork.signature === t.signature
+    options(w) = SMCOptions(nthreads=w, moves=2, stepsize=0.15, max_tree_depth=5)
+    serial = smc(t; rng=Xoshiro(911), particles=37, options=options(1))
+    initial = initialize_smc(t; rng=Xoshiro(911), particles=37,
+        options=options(Threads.nthreads()))
+    partial = smc_step(initial)
+    final = smc(partial)
+    @test final.positions == serial.positions
+    @test final.log_normalizer == serial.log_normalizer
+    @test sum(h.evaluations for h in final.history) == sum(h.evaluations for h in serial.history)
+    same(final, smc(resume_smc(t, smc_checkpoint(partial))))
 end
 end

@@ -534,6 +534,8 @@ IndexParticle() = IndexParticle(0, 0.0)
 # Fork only execution objects: signatures describe immutable model identity and
 # need not be copied once per worker. Queries and AD preparations own scratch.
 _worker_target(t::SMCTarget) = SMCTarget(deepcopy(t.query), t.backend, t.signature)
+_worker_target(t::SMCWindowTarget) = SMCWindowTarget(deepcopy(t.query), t.backend,
+    t.signature, _worker_target(t.prior))
 _worker_target(t::ReferenceTarget) = deepcopy(t)
 _worker_target(t) = deepcopy(t)
 _worker_target(t::BridgeTarget) = BridgeTarget(_worker_target(t.source),
