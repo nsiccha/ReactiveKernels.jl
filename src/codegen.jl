@@ -5071,7 +5071,9 @@ function _lower_with_ops_collecting(p::Plan;
     # port's value, computed once per label; in plan mode the body computes
     # and returns that bookkeeping instead (`_partition_plan_lowering`,
     # plate_partition.jl).
-    if !_footprint_recording()
+    if _footprint_recording()
+        body = _partition_metadata_calls(body)
+    else
         planned = _partition_plan_lowering(p, body, argexprs, runtime_ops, nm,
                                            partition_plan || _plan_mode())
         planned === nothing || (body = planned)
