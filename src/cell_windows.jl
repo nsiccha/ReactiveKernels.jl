@@ -1120,8 +1120,7 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid; branch_read = not
             q, via = read isa Symbol ? (read, nothing) : (read.args[2], read.args[1])
             b = root(params, recipe, q)
             (b === nothing || b in atomic) && return nothing
-            w = via === nothing ? 0 : branch ? root(params, recipe, via) :
-                via_root(params, recipe, via)
+            w = via === nothing ? 0 : via_root(params, recipe, via)
             (w === nothing || (w != 0 && !(w in atomic)) || w == b) && return nothing
             # A branch may not force an inactive index lookup: both the
             # optional shared lookup and its result must be bound and valid.
