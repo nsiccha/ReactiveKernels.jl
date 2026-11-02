@@ -234,7 +234,10 @@ end
     ccdf(z::Float64)::Float64 = 0.5 - atan(z) / π
     logcdf(z::Float64)::Float64 = z < -1 ? log(atan(-inv(z)) / pi) :
         z > 1 ? log1p(-atan(inv(z)) / pi) : log(0.5 + atan(z) / pi)
-    logccdf(z::Float64)::Float64 = logcdf(-z)
+    logccdf(z::Float64)::Float64 = begin
+        reflected::Float64 = -z
+        logcdf(reflected)
+    end
     quantile(p::Float64)::Float64 = tanpi(p - 0.5)
 end
 
@@ -245,7 +248,10 @@ end
     ccdf(z::Float64)::Float64 =
         z >= 0 ? 0.5 * exp(-z) : 1 - 0.5 * exp(z)
     logcdf(z::Float64)::Float64 = z < 0 ? z - log(2.0) : log1p(-exp(-z) / 2)
-    logccdf(z::Float64)::Float64 = logcdf(-z)
+    logccdf(z::Float64)::Float64 = begin
+        reflected::Float64 = -z
+        logcdf(reflected)
+    end
     quantile(p::Float64)::Float64 =
         ifelse(p < 0.5, log(2p), -log(2 - 2p))
 end
@@ -305,10 +311,14 @@ end
         z::Float64 = scale == 0 && x == location ? inv(scale) : standardized(x)
         standard.ccdf(z)
     end
-    logcdf(x::Float64)::Float64 = standard.logcdf(
-        scale == 0 && x == location ? inv(scale) : standardized(x))
-    logccdf(x::Float64)::Float64 = standard.logccdf(
-        scale == 0 && x == location ? inv(scale) : standardized(x))
+    logcdf(x::Float64)::Float64 = begin
+        z::Float64 = scale == 0 && x == location ? inv(scale) : standardized(x)
+        standard.logcdf(z)
+    end
+    logccdf(x::Float64)::Float64 = begin
+        z::Float64 = scale == 0 && x == location ? inv(scale) : standardized(x)
+        standard.logccdf(z)
+    end
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard.quantile(p)
         inv(standardized, z)
@@ -343,8 +353,14 @@ end
         z::Float64 = standardized(x)
         standard_student_t(nu).ccdf(z)
     end
-    logcdf(x::Float64)::Float64 = standard_student_t(nu).logcdf(standardized(x))
-    logccdf(x::Float64)::Float64 = standard_student_t(nu).logccdf(standardized(x))
+    logcdf(x::Float64)::Float64 = begin
+        z::Float64 = standardized(x)
+        standard_student_t(nu).logcdf(z)
+    end
+    logccdf(x::Float64)::Float64 = begin
+        z::Float64 = standardized(x)
+        standard_student_t(nu).logccdf(z)
+    end
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard_student_t(nu).quantile(p)
         inv(standardized, z)
@@ -457,16 +473,27 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: _normal_logc
     end
     inv(standardized_log, z::Float64)::Float64 = exp(location + scale * z)
 
-    logpdf(x::Float64)::Float64 =
-        x <= 0 ? -Inf : normal(location, scale).logpdf(log(x)) - log(x)
-    cdf(x::Float64)::Float64 =
-        x <= 0 ? 0.0 : normal(location, scale).cdf(log(x))
-    ccdf(x::Float64)::Float64 =
-        x <= 0 ? 1.0 : normal(location, scale).ccdf(log(x))
-    logcdf(x::Float64)::Float64 =
-        x <= 0 ? -Inf : normal(location, scale).logcdf(log(x))
-    logccdf(x::Float64)::Float64 =
-        x <= 0 ? 0.0 : normal(location, scale).logccdf(log(x))
+    logpdf(x::Float64)::Float64 = begin
+        log_x::Float64 = x <= 0 ? -Inf : log(x)
+        jacobian::Float64 = x <= 0 ? 0.0 : log_x
+        normal(location, scale).logpdf(log_x) - jacobian
+    end
+    cdf(x::Float64)::Float64 = begin
+        log_x::Float64 = x <= 0 ? -Inf : log(x)
+        normal(location, scale).cdf(log_x)
+    end
+    ccdf(x::Float64)::Float64 = begin
+        log_x::Float64 = x <= 0 ? -Inf : log(x)
+        normal(location, scale).ccdf(log_x)
+    end
+    logcdf(x::Float64)::Float64 = begin
+        log_x::Float64 = x <= 0 ? -Inf : log(x)
+        normal(location, scale).logcdf(log_x)
+    end
+    logccdf(x::Float64)::Float64 = begin
+        log_x::Float64 = x <= 0 ? -Inf : log(x)
+        normal(location, scale).logccdf(log_x)
+    end
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard_normal.quantile(p)
         inv(standardized_log, z)

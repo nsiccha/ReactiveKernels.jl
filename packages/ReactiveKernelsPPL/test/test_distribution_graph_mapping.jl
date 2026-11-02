@@ -3,6 +3,8 @@ using Test, ReactiveKernels, ReactiveKernelsPPL
 import Distributions as D
 import Enzyme, DifferentiationInterface as DI
 
+const mapped_normal = D.Normal
+
 function endpoints(constructor, arguments)
     object = sampling_distribution_graph(constructor, arguments)
     @test object isa Expr
@@ -32,12 +34,14 @@ end
                 @test all(isapprox(a,b;rtol=5e-12,atol=1e-14,nans=true) for (a,b) in zip(got,expected))
             end
             count == 0 && continue
-            f = prepare(spec;bound=(x=0.7,))
-            g = Base.invokelatest(DI.gradient,f,DI.AutoEnzyme(;mode=Enzyme.Reverse),q)
-            oracle(w)=D.logpdf(constructor(w[1:count]...),0.7)
-            h=1e-5
-            fd=[(oracle(q .+ (1:2 .== i).*h)-oracle(q .- (1:2 .== i).*h))/(2h) for i in 1:2]
-            @test g ≈ fd rtol=2e-8 atol=1e-9
+            for (output, reference) in ((:density,D.logpdf),(:lower,D.logcdf),(:upper,D.logccdf))
+                f = prepare(spec;want=output,bound=(x=0.7,))
+                g = Base.invokelatest(DI.gradient,f,DI.AutoEnzyme(;mode=Enzyme.Reverse),q)
+                oracle(w)=reference(constructor(w[1:count]...),0.7)
+                h=1e-5
+                fd=[(oracle(q .+ (1:2 .== i).*h)-oracle(q .- (1:2 .== i).*h))/(2h) for i in 1:2]
+                @test g ≈ fd rtol=2e-8 atol=1e-9
+            end
         end
     end
     @test sampling_distribution_graph(identity,(:x,)) === nothing
@@ -55,6 +59,35 @@ end
             expected = (D.logpdf(law,x),D.logcdf(law,x),D.logccdf(law,x))
             @test all(isapprox(a,b;nans=true) for (a,b) in zip(actual,expected))
         end
+    end
+end
+
+@testset "qualified and aliased distribution graphs replay inside plates" begin
+    for head in (:mapped_normal, :(D.Normal)), count in (1,8)
+        data = (; y = collect(range(-0.4,0.8;length=count+1))[1:count])
+        saved = deepcopy(data)
+        ast = quote
+            mu ~ Normal(0,1)
+            log_scale ~ Normal(0,1)
+            y .~ $head.(mu,exp(log_scale))
+        end
+        plan = bind_data(lower_rkppl(ast,data;mod=@__MODULE__,conditioned=(:y,)),data)
+        built = build_kernel(plan)
+        source = kernel_expr(plan,built.layout)
+        @test !occursin("sampling_logdensity",string(source))
+        replayed = ReactiveKernelsPPL._eval_kernel_def(source)
+        replay = prepare_query((;spec=replayed,layout=built.layout),plan,:sampler)
+        q = [0.2,-0.3]
+        sampler = prepare_sampler(built,plan,q;backend=DI.AutoEnzyme(;mode=Enzyme.Reverse))
+        value,g = sampler_value_and_gradient!(sampler,similar(q),q)
+        oracle(w)=sum(D.logpdf.(D.Normal(w[1],exp(w[2])),data.y))+sum(D.logpdf.(D.Normal(),w))
+        @test value ≈ oracle(q)
+        @test Base.invokelatest(replay,q) ≈ oracle(q)
+        h=1e-5
+        fd=[(oracle(q .+ (1:2 .== i).*h)-oracle(q .- (1:2 .== i).*h))/(2h) for i in 1:2]
+        @test g ≈ fd rtol=2e-8 atol=1e-9
+        @test data == saved
+        @test q == [0.2,-0.3]
     end
 end
 end
