@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.52
+
+- Discover cell sums through typed identity assignments that already satisfy
+  their declaration, allowing earlier reduction plates to compose with their
+  consuming cells. Assignments that can convert the value remain in the graph.
+  Preserve a standard plate buffer's known rank when its element type is
+  unknown, so chained plates can prove an abstract array declaration redundant.
+
 ## 0.1.51
 
 - Carry exact exemplar argument types through selected-cell locality analysis,

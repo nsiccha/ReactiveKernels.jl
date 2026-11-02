@@ -1172,6 +1172,16 @@ inline, assigned to a local, or computed in an earlier plate whose output the
 observation reads. `cell_reductions(f)` gives their names in graph order and
 `reduction_rows(f, j, cell)` their row labels in term order.
 
+RKPPL 0.1.55 / RK 0.1.52 also traverses typed identity assignments between
+plates when the input already satisfies the declaration. Guarded
+`NegativeBinomial2` cells can therefore expose weighted sums such as
+`sum(exp.(eta[rows[k]]) .* w[rows[k]])`, or a local
+`mu = exp.(eta[rows[k]])` used by
+`NegativeBinomial2(sum(mu), phi * sum(mu)^2 / sum(mu .^ 2))`.
+Conversions that can change values remain in the graph. Follow the reported
+reduction order, including repeated authored sums; each summand retains its
+own footprint and the outer density retains its direct reads and guards.
+
 Array-valued predictors shared with another observation in the same authored
 cell retain their individual dependencies when the cell is factored. A term
 may select an existing ragged input and read only its requested position;

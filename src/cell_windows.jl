@@ -1230,8 +1230,20 @@ end
 function _cell_plate_output_type(op::_AuthoredPlateOp, input_types)
     all(T -> T isa Type, input_types) || return Any
     element = _checked_plate_element!(_UninferredValue[], op, input_types, Symbol[])
-    element isa Type && element !== Any && element !== Union{} || return Any
+    element isa Type && element !== Union{} || return Any
     atomic = Val(typeof(op).parameters[2])
+    if element === Any
+        # A standard array/tuple axis still proves the buffer's rank when an
+        # abstract live operand hides the cell's element type. Narrowing an
+        # Array's elements after the loop preserves that rank. A custom
+        # similar method may depend on the element type, so needs inference.
+        A = typeof(op).parameters[2]
+        batched = Tuple(input_types[i] for i in eachindex(input_types) if !(i in A))
+        _plate_marker_type(batched) <: Union{Array,Tuple} || return Any
+        ranks = map(T -> T <: Tuple ? 1 : _cell_static_ndims(T), batched)
+        any(isnothing, ranks) && return Any
+        return AbstractArray{<:Any,maximum(ranks)}
+    end
     array = _plate_array_type(element, atomic, input_types...)
     # This is the actual allocation type, before any abstract-array stand-in.
     # Retain it so type-only branches can be proved without assuming that an

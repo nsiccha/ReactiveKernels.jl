@@ -1,11 +1,42 @@
 # Factor a composed scalar cell at its sums. All pieces remain ordinary graph
 # recipes, so preparation, row pushdown and AD have one implementation.
 
+# Typed aliases can separate an earlier reduction plate from the scalar cell
+# that consumes it. Julia's typed local skips conversion when the value already
+# satisfies the declaration. Only remove aliases proved to meet that condition;
+# a declaration that can convert the value must remain part of the graph.
+function _cell_factor_aliases(p::Plan, argument_types)
+    candidates = filter(p.recipes) do r
+        length(r.outputs) == 1 && !r.effectful && _cell_identity_form(r) !== nothing
+    end
+    isempty(candidates) && return p
+    types = _cell_value_types(p; argument_types)
+    redundant = Set(r.id for r in candidates if
+        get(types, canon_id(p.graph, only(r.inputs).id), Any) <: valtype(only(r.outputs)))
+    isempty(redundant) && return p
+    old = p.graph
+    g = Graph(copy(old.values), Recipe[], Dict{ValueId,Vector{Int}}(),
+              copy(old.aliases), old.version, nothing)
+    for r in p.recipes
+        if r.id in redundant
+            g.aliases[canon_id(g, only(r.outputs).id)] = canon_id(g, only(r.inputs).id)
+        else
+            _add_recipe!(g, r.inputs, r.outputs, r.op, r.cost, r.cse_key, r.effectful, r.source)
+        end
+    end
+    plan(g; have = p.have, want = p.want)
+end
+
 function _cell_factor_graph(spec::KernelSpec, want; have = spec.have_names,
                             bound = NamedTuple(), on_error = nothing, locality = nothing)
-    p = _fuse_authored_plate_chains(plan(spec; have, want))
+    p = plan(spec; have, want)
+    # Prove aliases with the declared live input types, not dense stand-ins:
+    # factor value queries also accept other arrays with those declarations.
+    p = _cell_factor_aliases(p, Any[haskey(bound, v.name) ? typeof(bound[v.name]) :
+                                  valtype(v) for v in p.have])
     argument_types = Any[haskey(bound, v.name) ? typeof(bound[v.name]) :
                          _cell_standin_type(valtype(v)) for v in p.have]
+    p = _fuse_authored_plate_chains(p)
     types = _uninferred_values!(_UninferredValue[], p, argument_types, Symbol[], true)
     known = Dict{ValueId,Any}(canon_id(p.graph, v.id) => bound[v.name]
                              for v in p.have if haskey(bound, v.name))

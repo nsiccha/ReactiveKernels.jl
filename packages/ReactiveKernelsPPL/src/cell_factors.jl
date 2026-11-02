@@ -5,6 +5,11 @@ Discover sums read by one observation's cell, including sums in earlier
 plates composed into it. The model may name a sum or write it inline. Factored
 sums have elementwise operands with data-defined gathered rows; other sums
 remain in the outer computation.
+This includes weighted operands `sum(exp.(eta[rows[k]]) .* w[rows[k]])`
+and a cell-local `mu = exp.(eta[rows[k]])` used by several sums, such as
+`NegativeBinomial2(sum(mu), phi * sum(mu)^2 / sum(mu .^ 2))`.
+Typed identity assignments between plates do not hide these sums when the
+input already satisfies the declaration; real conversions remain in the graph.
 `cell_reductions(f)` gives the reductions in graph order;
 `reduction_rows(f, j, cell)` gives reduction `j`'s row labels in term order.
 When several operands gather different arrays, labels come from the first

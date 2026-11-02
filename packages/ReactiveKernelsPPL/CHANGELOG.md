@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.55
+
+- Discover gathered sums in guarded NegativeBinomial2 cells, including
+  weighted summands, cell-local vectors and nonlinear outer densities over
+  multiple sums. Preserve local summand footprints and ordinary native Enzyme
+  derivatives. Require RK 0.1.52 for typed identity traversal during factoring.
+
 ## 0.1.54
 
 - Add `SMCOptions(nthreads=Threads.nthreads())` for concurrent fixed-kernel
