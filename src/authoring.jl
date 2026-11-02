@@ -2004,7 +2004,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 # `normal(location, scale).logpdf(log(w))` as a hygienic caller
                 # recipe, typed by the endpoint's explicit boundary, so it lowers
                 # identically to the constructor-argument case rather than being
-                # rejected. A bare name still must resolve to a declared caller port.
+                # rejected. A bare name must resolve to a caller port or a declared
+                # cell local; the latter materializes like an owner binding above.
                 # Under a branch arm the argument stays inline, exactly like an
                 # owner binding above.
                 endpoint_ports = Any[]
