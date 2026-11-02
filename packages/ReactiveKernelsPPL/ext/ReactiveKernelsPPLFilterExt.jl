@@ -26,6 +26,12 @@ _ref(x, indices...) = Expr(:ref, x, indices...)
 _call(f, args...) = Expr(:call, f, args...)
 _global(name) = GlobalRef(@__MODULE__, name)
 
+function _declaration_name(lhs)
+    name = PPL._declared_value_name(lhs)
+    name isa Symbol || _fail("cannot identify static declaration $lhs")
+    return name
+end
+
 function PPL.filter_parameter_names(model::RKPPLModel; observations=(:y,),inputs=(),data::NamedTuple=(;))
     supplied = Set{Symbol}((observations...,inputs...,keys(data)...,keys(model.fixed)...))
     ast,scopes = PPL._expand_submodels(model.ast,Set(n for n in supplied if !occursin('.',String(n))),model.mod;
@@ -40,8 +46,7 @@ function PPL.filter_parameter_names(model::RKPPLModel; observations=(:y,),inputs
                 visit(st.args[end].args[2])
             elseif Meta.isexpr(st,:call,3) && st.args[1] in (:~,Symbol(".~"))
                 lhs = st.args[2]
-                name = lhs isa Symbol ? lhs : Meta.isexpr(lhs,:ref) ? lhs.args[1] : nothing
-                name isa Symbol || _fail("cannot identify static declaration $lhs")
+                name = _declaration_name(lhs)
                 public_name = haskey(paths,name) ? Symbol(join(paths[name],".")) : name
                 public_name in supplied || push!(found,public_name)
             end
@@ -320,7 +325,7 @@ function _compile_block!(c, block; group=nothing)
     for st in stmts
         st in assignments && continue
         if Meta.isexpr(st,:call,3) && st.args[1] in (:~,Symbol(".~"))
-            name = st.args[2] isa Symbol ? st.args[2] : st.args[2].args[1]
+            name = _declaration_name(st.args[2])
             name in c.observations || continue # fixed priors are not scored
         end
         union!(needed,PPL._expr_value_symbols(st))
@@ -448,11 +453,13 @@ function _compile_block!(c, block; group=nothing)
             push!(result, Expr(:(=), lhs, _value(c, st.args[2]; group, scalarize=true)))
         elseif Meta.isexpr(st, :call, 3) && st.args[1] in (:~, Symbol(".~"))
             lhs, rhs = st.args[2:3]
-            name = lhs isa Symbol ? lhs : Meta.isexpr(lhs, :ref, 2) ? lhs.args[1] : nothing
+            name = _declaration_name(lhs)
             if name in c.parameters || haskey(c.data,name)
                 continue # calibrated parameters: neither draw nor multiply their prior
             end
             name in c.observations || _fail("static declaration $lhs needs a calibrated parameter value")
+            lhs isa Symbol || Meta.isexpr(lhs, :ref, 2) || _fail(
+                "observation declaration $lhs needs a scalar or one group index")
             push!(result, _site(c, name, rhs, true; group))
         else
             _fail("unsupported finite-state model statement: $st")

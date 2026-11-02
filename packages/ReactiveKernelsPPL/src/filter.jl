@@ -8,7 +8,9 @@ authored model, including expanded submodels and `@kernel` providers with
 ordinary finite `scan` operations. Load `Distributions`, `Random` and
 `SequentialMonteCarlo` 0.7. `WarmupHMC` is not needed for filtering.
 `parameters` are calibrated, constrained values held fixed for the entire
-stream. `data` holds fixed model inputs, never an accumulating observation
+stream. Array declarations of any rank and `eachrow`/`eachcol` slice priors
+select the whole calibrated array; their priors are not evaluated or scored
+again. `data` holds fixed model inputs, never an accumulating observation
 history. `frozen` substitutes a `FrozenValues` record directly, without retaining
 its original training inputs. New observations and covariates arrive as named
 tuples to `filter_step`.

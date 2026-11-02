@@ -1,6 +1,8 @@
 using Test, Random, Distributions, SequentialMonteCarlo, Statistics, Serialization
 using ReactiveKernels, ReactiveKernelsPPL
 
+include("filter_static_arrays.jl")
+
 roundtrip_filter(x) = (io=IOBuffer(); serialize(io,x); seekstart(io); deserialize(io))
 bytes_filter(x) = (io=IOBuffer(); serialize(io,x); position(io))
 current(s,nm;g=1) = [getproperty(c,nm)[end,g] for c in s.carries]

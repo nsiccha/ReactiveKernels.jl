@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.56
+
+- Recognize calibrated arrays of any rank and `eachrow`/`eachcol` slice
+  declarations in finite-state filters and static parameter selection,
+  including scoped submodels. Their priors are neither evaluated nor scored
+  again. Missing calibration reports the authored declaration instead of an
+  internal `haskey(..., nothing)` error.
+
 ## 0.1.55
 
 - Discover gathered sums in guarded NegativeBinomial2 cells, including
