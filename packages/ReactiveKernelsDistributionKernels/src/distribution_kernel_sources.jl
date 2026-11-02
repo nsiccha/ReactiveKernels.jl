@@ -301,13 +301,15 @@ end
 @kernel location_scale(standard, location::Float64, scale::Float64) = begin
     log_scale::Float64 = log(scale)
 
-    standardized(x::Float64)::Float64 = (x - location) / scale
+    standardized(x::Float64)::Float64 =
+        (x - location) / (scale == 0 && x == location ? 1.0 : scale)
     inv(standardized, z::Float64)::Float64 = location + scale * z
 
     logpdf(x::Float64)::Float64 = begin
         z::Float64 = standardized(x)
-        scale == 0 ? (x == location ? Inf : (isnan(z) ? NaN : -Inf)) :
-            standard.logpdf(z) - log_scale
+        # Keep the standard density as a visible, independently selectable
+        # graph port. At zero scale only the point mass keeps log(scale).
+        standard.logpdf(z) - (scale == 0 && x != location ? 0.0 : log_scale)
     end
     cdf(x::Float64)::Float64 = begin
         z::Float64 = scale == 0 && x == location ? inv(scale) : standardized(x)
