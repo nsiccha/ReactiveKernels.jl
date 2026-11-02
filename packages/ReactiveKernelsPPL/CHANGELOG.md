@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.62
+## 0.1.63
 
 - Preserve vector-event broadcasts and grouped input axes in finite-state
   filters. Broadcast kernel-backed `LogDensity` laws and nested truncated
@@ -25,7 +25,18 @@ are recorded in the git history only.
   using declared input ports, including grouped recurrences and current-clock
   gathers. Drop unused group diagnostics and historical input columns.
   Whole-vector event laws keep their full helper computation. Requires RK
-  0.1.55; see `prepare_filter` for supported helper shapes and record examples.
+  0.1.56; see `prepare_filter` for supported helper shapes and record examples.
+
+## 0.1.62
+
+- Add `density_factors`, `select_factors`, `factor_coordinates` and
+  `factor_support` for authored
+  prior and coordinate-Jacobian events. `prepare_query` and `prepare_query_ad`
+  accept factor selections; `coordinates` prepares compact derivatives over
+  a read-only packed base. Joint laws and coupled transforms remain atomic,
+  and structural supports retain hyperparameter dependencies. Owned coordinates
+  are available separately from those transitive read supports. Requires
+  RK 0.1.55 for independent selected cells of shared upstream plates.
 
 ## 0.1.61
 
