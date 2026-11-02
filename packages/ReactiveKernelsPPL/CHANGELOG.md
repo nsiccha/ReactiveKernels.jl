@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.61
+
+- Preserve vector-event broadcasts and grouped input axes in finite-state
+  filters. Broadcast kernel-backed `LogDensity` laws and nested truncated
+  laws retain their observation semantics, including singleton records.
+- Infer current slices and finite carries from source-recorded vector helpers
+  using declared input ports, including grouped recurrences and current-clock
+  gathers. Drop unused group diagnostics and historical input columns.
+  Whole-vector event laws keep their full helper computation. Requires RK
+  0.1.54; see `prepare_filter` for supported helper shapes and record examples.
+
 ## 0.1.60
 
 - Compute interval-censored likelihoods and truncated-prior normalizers
