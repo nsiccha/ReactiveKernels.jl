@@ -14,6 +14,14 @@ reflections=[[cos(pi/8),sin(pi/8)]])`, with covariance
 `[1.01 0.99; 0.99 1.01]`. See WarmupHMC's `scale_from_data`/`scale_data`
 contract for the operator representation. All sampling, scoring and mutation
 use the rebuilt data operator, including its floating-point representation.
+
+Selective carries also produce `(kind=:diagonal_lowrank, diagonal=D,
+vectors=Q, values=v)`, representing covariance
+`Diagonal(sqrt.(D)) * (I + Q * Diagonal(v) * Q') * Diagonal(sqrt.(D))`.
+Here `D` is positive, `Q` has orthonormal columns and `v > -1` elementwise.
+This compact covariance is accepted as an importance reference, including for
+prepared-density targets; it is not a WarmupHMC mutation metric. Its storage
+is linear in dimension at fixed rank, with no dense covariance.
 """
 struct SMCReference{S}
     location::Vector{Float64}
@@ -166,8 +174,9 @@ frame. Construct with [`carry_smc`](@ref). The owned `reference`, `frame` and
 `calibration_id` contain no old observations, prepared queries or trajectories.
 Treat them as read-only. The frame includes the caller's model/preprocessing
 identity and the packed layout; the calibration ID identifies this summary.
-`fit_diagnostics` is `nothing` for externally supplied or fixed-basis summaries;
-`basis=:fit` carries the bounded WarmupHMC fitting diagnostics as owned data.
+For full-frame targets, `fit_diagnostics` is `nothing` for externally supplied
+or fixed-basis summaries; `basis=:fit` carries the bounded WarmupHMC fitting
+diagnostics as owned data. Selective carries also report joint recompression.
 """
 struct SMCCarriedReference{R,F,D}
     reference::R
@@ -180,6 +189,7 @@ SMCCarriedReference(reference,frame,calibration_id::String) =
 
 """
     carry_smc(target, reference::SMCReference; calibration_id)
+    carry_smc(selective_target, reference::SMCReference; calibration_id, maxrank=16)
     carry_smc(completed_state; calibration_id, scale=nothing, parameters=nothing,
               basis=nothing, max_reflections=16, maxiter=100, progress=nothing)
 
@@ -232,6 +242,12 @@ geometry containing callable objects is not represented by this native
 projection; use a static-only calibration and an explicit mapping for it.
 For selective windows (`coordinates=:auto`), omit `parameters`: carrying
 integrates the inactive conditional into the full joint Gaussian.
+The external-reference form bounds joint rank by `maxrank`; completed states
+use `max_reflections`. Completed selective states return `.fit_diagnostics.marginal`
+for the compact fit and `.joint` for recompression; the external form returns
+the joint diagnostics directly. Their `rank`, `discarded_rank` and
+`relative_loss` describe the retained rank and discarded correction's spectral
+norm in the diagonal-whitened frame, not posterior accuracy.
 """
 function carry_smc end
 
@@ -261,6 +277,15 @@ while keeping `model_id` and fitted preprocessing fixed. The target is
 Fresh factors include their native transforms and Jacobians once. Dependencies
 of fresh priors, including old hyperparameters absent from the likelihood,
 belong to the active set. Joint factors and coupled transforms remain intact.
+Fresh events are selected by [`factor_coordinates`](@ref) ownership, never by
+their read support. A density on a derived expression that owns no coordinates
+but reads fresh ones cannot be assigned automatically and is rejected rather
+than omitted. Fresh-factor discovery inherits [`density_factors`](@ref)'s
+explicit limitations for noncentered scans and stochastic scans inside cells.
+The likelihood must satisfy native partition locality. Sparse observations
+selecting elements of simplex/ordered slice-transformed arrays currently lack
+an observation row lowering and are rejected; their fresh atomic priors are
+supported. No full-coordinate fallback is performed.
 
 Inspect [`smc_window_coordinates`](@ref) before supplying a compact initial
 point, reference or mutation metric. Particle positions and gradients use that

@@ -39,8 +39,7 @@ function _prepare_smc_selective(built, binding, u0; previous, backend, model_id,
     ad = Base.invokelatest(prepare_ad, compact_kernel, backend, u;
         active=:_ppl_smc_active, warm)
     query = SamplerQuery(compact_kernel, ad, (; total=length(indices)))
-    prior_target = (; query=(; layout=(; total=length(active_old))), backend)
-    prior = _reference(prior_target, _gaussian_reference(marginal))
+    prior = _compact_reference(backend, length(active_old), _gaussian_reference(marginal))
     union_coordinates = vcat(previous.frame.coordinates, records[match.fresh])
     joint_indices = copy(match.old)
     joint_indices[match.fresh] = length(old.mean) .+ collect(eachindex(match.fresh))

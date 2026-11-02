@@ -30,8 +30,7 @@ end
         copied=SMCReference(reference.location,reference.scale)
         @test copied.location==reference.location
         @test copied.scale==reference.scale
-        target=(; query=(;layout=(;total=n)),backend=BACKEND)
-        prepared=EXT._reference(target,reference)
+        prepared=EXT._compact_reference(BACKEND,n,reference)
         u=randn(rng,n);g=zeros(n)
         covariance=Matrix(Diagonal(diagonal))+factors*factors'
         delta=u-mean
@@ -47,5 +46,22 @@ end
             @test copied.scale.diagonal[1]!=99
         end
     end
+end
+
+include("prepared_fixture.jl")
+@testset "Compact references compose with prepared-density targets" begin
+    target = PreparedSMCFixture.target(PreparedSMCFixture.GaussianFactory())
+    gaussian = EXT._gaussian(SMCReference([0.2, -0.1],
+        (; diagonal=[0.3, 1.2], indices=[[1, 2]],
+            reflections=[[cos(pi/8), sin(pi/8)]])))
+    reference = EXT._gaussian_reference(gaussian)
+    state = initialize_smc(target; reference, rng=Xoshiro(42), particles=17)
+    @test size(state.positions) == (2, 17)
+    @test smc_reference(state).scale == reference.scale
+    restored = resume_smc(target, smc_checkpoint(state))
+    @test restored.positions == state.positions
+    @test smc_reference(restored).scale == reference.scale
+    @test_throws DimensionMismatch EXT._reference(target,
+        EXT._gaussian_reference(EXT._gaussian(SMCReference(zeros(3), ones(3)))))
 end
 end

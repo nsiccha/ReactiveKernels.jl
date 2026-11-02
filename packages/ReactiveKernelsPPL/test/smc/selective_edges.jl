@@ -1,4 +1,4 @@
-include("selective_fixture.jl")
+isdefined(@__MODULE__, :SMCSelectiveFixture) || include("selective_fixture.jl")
 module SMCSelectiveEdgeTests
 using ..SMCSelectiveFixture
 using ReactiveKernels, ReactiveKernelsPPL, Random, Test

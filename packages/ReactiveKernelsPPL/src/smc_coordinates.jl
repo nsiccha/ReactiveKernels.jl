@@ -34,6 +34,50 @@ _smc_window_terms(built, binding, fresh, u0) = isempty(fresh) ?
     _smc_likelihood_terms(built, binding, u0) :
     _smc_fresh_window_terms(built, binding, fresh, u0)
 
+function _smc_fresh_window_terms(built, binding, fresh, u0)
+    catalogue = density_factors(built, binding)
+    isfresh = falses(built.layout.total)
+    isfresh[fresh] .= true
+    events = DensityFactor[]
+    for event in catalogue
+        owned = factor_coordinates(catalogue, event)
+        if isempty(owned)
+            # A density on a derived expression has no draw ownership. If
+            # fresh values enter it, silently omitting it changes the target;
+            # read support cannot supply the missing old/fresh assignment.
+            any(i -> isfresh[i], factor_support(catalogue, event; u0)) &&
+                throw(ArgumentError("selective SMC cannot assign an ownerless " *
+                    "density reading fresh coordinates: $event"))
+            continue
+        end
+        any(i -> isfresh[i], owned) || continue
+        all(i -> isfresh[i], owned) || throw(ArgumentError(
+            "selective SMC cannot split partly fresh atomic factor $event"))
+        push!(events, event)
+    end
+    selected = select_factors(catalogue, events)
+    factors = _density_selection_spec(built, binding, selected;
+        locality=:error, on_error=nothing, u0)
+    likelihood = _smc_likelihood_terms(built, binding, u0)
+    # Share only the inputs. Each cut keeps its own internal values so a
+    # whole-model producer cannot replace the selected producer of the same
+    # generated name when the two graphs are composed.
+    function boundary(terms)
+        names = unique([terms.have..., terms.want])
+        ReactiveKernels.KernelSpec(terms.spec.graph,
+            Dict(name => terms.spec.ports[name] for name in names), names,
+            collect(terms.have), [terms.want], nothing)
+    end
+    spec = merge(boundary(likelihood), boundary(factors))
+    want = :_ppl_smc_window
+    output = value!(spec.graph, want, Float64)
+    spec.ports[want] = output
+    push!(spec.port_order, want)
+    add!(spec.graph, (spec[likelihood.want], spec[factors.want]) => output, +)
+    (; spec, have=Tuple(unique([likelihood.have..., factors.have...])), want,
+        bound=merge(likelihood.bound, factors.bound))
+end
+
 function _smc_likelihood_terms(built, binding, u0)
     _check_built_program(built, binding)
     pointwise_kernel = _prepare_wants(built, binding, :pointwise; exemplars=(u0,))

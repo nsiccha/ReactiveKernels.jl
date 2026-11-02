@@ -1,4 +1,4 @@
-include("selective_fixture.jl")
+isdefined(@__MODULE__, :SMCSelectiveFixture) || include("selective_fixture.jl")
 module SMCSelectiveGrowthTests
 using ..SMCSelectiveFixture
 using ReactiveKernels, ReactiveKernelsPPL, Random, LinearAlgebra, Statistics, Test, Serialization

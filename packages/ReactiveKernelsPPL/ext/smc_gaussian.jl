@@ -37,12 +37,16 @@ _inflate_reference_scale(scale::CompactScale, factor) =
 end
 
 function _reference(target, reference::SMCReference{<:CompactScale})
-    length(reference.location) == target.query.layout.total ||
+    _compact_reference(target.backend, _dimension(target), reference)
+end
+
+function _compact_reference(backend, dimension, reference::SMCReference{<:CompactScale})
+    length(reference.location) == dimension ||
         throw(DimensionMismatch("reference and target dimensions differ"))
     r = SMCReference(reference.location, reference.scale)
     kernel = prepare(_compact_normal_reference; want=:density)
     arguments = (r.location, r.scale.diagonal, r.scale.vectors, r.scale.values)
-    ad = Base.invokelatest(prepare_ad, kernel, target.backend, copy(r.location), arguments...; active=:u)
+    ad = Base.invokelatest(prepare_ad, kernel, backend, copy(r.location), arguments...; active=:u)
     ReferenceTarget(r, kernel, ad, arguments, _reference_sd(r.scale))
 end
 
