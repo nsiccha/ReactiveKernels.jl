@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.67
+
+- Evaluate selected density events whose cell vectors were folded into bound
+  constants. Flat prior events retain their authored coordinate ownership and
+  empty read support, including dense and compact native derivatives and
+  selections mixed with active factors.
+
 ## 0.1.66
 
 - Compose authored Distributions Normal, LogNormal, Gamma, Exponential,

@@ -29,6 +29,7 @@ const _PPL_TEST_FILES = (
     "test_distributional_broadcasts.jl",
     "test_query.jl",
     "test_density_factors.jl",
+    "test_density_factor_constants.jl",
     "test_density_factor_structures.jl",
     "test_density_factor_cells.jl",
     "test_density_factor_coefficients.jl",
