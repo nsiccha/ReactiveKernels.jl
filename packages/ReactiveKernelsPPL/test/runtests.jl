@@ -262,6 +262,7 @@ const _PPL_TEST_FILES = (
     "test_cell_factor_ragged.jl",
     "test_cell_factor_typed.jl",
     "test_cell_shared.jl",
+    "test_cell_batch.jl",
     "test_logistic_values.jl",
 )
 

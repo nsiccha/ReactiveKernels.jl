@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.65
+
+- Add `with_cell_batch(owner, u) do batch` for value-only fixed-point sweeps
+  over cells, summands and outer factors. The callback owns a copied point,
+  refreshes shared values once, and rejects expired, mismatched or invalidated
+  batches without requiring an AD backend.
+- Add `partition_footprint_kernel(q; shared=false)` for structural footprints
+  restricted to declared local coordinates, including queries with no shared
+  prefix. Value and local-footprint queries also accept compatible active
+  `cell_pullback!` contexts. Full footprints and mixed derivatives remain
+  available through their existing APIs. Requires RK 0.1.58.
+
 ## 0.1.64
 
 - Caller-owned sampling laws may return a density `KernelSpec` from

@@ -591,13 +591,16 @@ Construct with [`prepare_cell_query`](@ref) and call `q(u, i)`. The call paths
 carry the `Base.invokelatest` barrier, as `SamplerQuery`'s do. Not thread-safe:
 prepare one per thread.
 """
-mutable struct CellQuery{K,L,C,I}
+mutable struct CellQuery{K,L,C,I,S}
     const kernel::K
     const layout::L
     const observations::Tuple{Vararg{Symbol}}
     const prefix::C
     const specializations::I
+    const shared::S
 end
+CellQuery(kernel, layout, observations, prefix, specializations) =
+    CellQuery(kernel, layout, observations, prefix, specializations, nothing)
 CellQuery(kernel, layout, observations, prefix) =
     CellQuery(kernel, layout, observations, prefix, nothing)
 CellQuery(kernel, layout, observations) = CellQuery(kernel, layout, observations, nothing)
@@ -607,23 +610,27 @@ CellQuery(kernel, layout, observations) = CellQuery(kernel, layout, observations
 (q::CellQuery)(u::AbstractVector{<:Real}, cell) = q(Vector{Float64}(u), cell)
 function _cell_density(q::CellQuery, u, cell)
     if q.prefix === nothing
-        u isa Vector{Float64} && cell isa Int && return q.kernel(u, cell)
-        q.specializations === nothing && return q.kernel(u, cell)
-        # Preserve local reads through views and custom packed vectors.
-        # Preparing by argument types does not copy or inspect their values.
-        args = (u, cell)
-        kernel = get!(q.specializations.kernels, typeof(args)) do
-            Base.invokelatest(prepare, q.kernel.plan;
-                exemplars = args, on_error = q.specializations.on_error)
-        end
-        return kernel(u, cell)
+        _refresh_cell_shared!(q.shared, u)
+        return _cell_density_uncached(q, u, cell)
     end
     length(u) == q.layout.total || throw(ContractValidationError(
         "[query] packed length $(length(u)) ≠ layout total $(q.layout.total)"))
     prefix = _query_prefix_kernel(q.prefix, u)
-    cached = _refresh_partition_prefix!(q.prefix.cache, u, prefix)
+    cached = q.shared === nothing ? _refresh_partition_prefix!(q.prefix.cache, u, prefix) :
+        _refresh_cell_shared!(q.shared, u, prefix)
     residual = _query_residual(q.prefix, (u, cell, cached...))
     residual(u, cell, cached...)
+end
+function _cell_density_uncached(q::CellQuery, u, cell)
+    u isa Vector{Float64} && cell isa Int && return q.kernel(u, cell)
+    q.specializations === nothing && return q.kernel(u, cell)
+    # Preserve local reads through views and custom packed vectors.
+    args = (u, cell)
+    kernel = get!(q.specializations.kernels, typeof(args)) do
+        Base.invokelatest(prepare, q.kernel.plan;
+            exemplars = args, on_error = q.specializations.on_error)
+    end
+    kernel(u, cell)
 end
 ReactiveKernels.partition_locality(q::CellQuery) =
     ReactiveKernels.partition_locality(q.prefix === nothing ? q.kernel : q.prefix.residual)
@@ -739,7 +746,9 @@ function prepare_cell_query(built, plan::StructuralPlan, observations;
     end
     specializations = prefix === nothing ?
         (; kernels = Dict{DataType,Any}(), on_error) : nothing
-    return CellQuery(kernel, built.layout, names, prefix, specializations)
+    shared = isempty(rule) ? nothing : _cell_shared(parts, last(only(rule)), exemplar,
+        prefix === nothing ? nothing : prefix.cache)
+    return CellQuery(kernel, built.layout, names, prefix, specializations, shared)
 end
 
 const _CELL_PORT = :_ppl_cell

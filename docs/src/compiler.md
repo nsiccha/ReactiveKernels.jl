@@ -1309,6 +1309,44 @@ leaves the output gradient unchanged; the next pass resets the accumulation
 storage. Changing shared coordinates through another operator during the
 callback invalidates the pass and throws.
 
+### Fixed-point values and local structural footprints
+
+For a value-only sweep, prepare the cell query with `partitioned` and use
+`with_cell_batch`. It copies the packed point and refreshes shared values once
+before calling the callback; no AD backend is required. A local footprint
+projects structural reads onto the declared partitioned coordinates before
+expanding them. It does not enumerate a large shared block for every cell.
+
+```julia
+q = prepare_cell_query(built, plan, :y; partitioned = :z, u0 = u)
+fp = partition_footprint_kernel(q; shared = false)
+with_cell_batch(q, u) do batch
+    for cell in cells
+        indices = fp(batch, cell).unconstrained
+        value = q(batch, cell)
+        # Consume this cell's local support and scalar value here.
+    end
+end
+```
+
+The returned indices are sorted and unique. Both arms of retained lazy
+branches still contribute to the structural support; numerical zeros do not
+remove coordinates. The declaration is retained even when there is no shared
+prefix. `partition_footprint_kernel(q)` and `q.kernel` inspection still expose
+the full shared dependencies.
+
+For factors, use `with_cell_batch(factors, u)`: summands accept
+`term(batch, cell, term_position)` and outers accept `outer(batch, sums, cell)`.
+Prepare their local footprints with the same `shared = false` keyword.
+Value and local-footprint queries also accept a compatible active
+`cell_pullback!` context and do not add to its gradient. Supplied outer sums
+remain independent; the caller supplies their chain rule as above.
+
+The batch expires when its callback returns or throws. It rejects operators
+from another cache and shared-coordinate changes through another operator.
+Raw-vector calls remain available and scan shared coordinates on each call.
+Each owner and its operators serve one concurrent caller.
+
 ### A partition of plates by a key
 
 `plate_partition(spec, plates; by, index = :partition, name = :partition_total,
