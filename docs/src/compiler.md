@@ -1249,6 +1249,66 @@ cell row lowering and AD preparation evaluate it. The extra cut boundaries
 do not change ordinary partial-evaluation choices. `locality` and
 `partition_locality` apply as for the other cell queries.
 
+### Shared prefixes for compact cell derivatives
+
+Pass `partitioned = :z` to `prepare_compact_cell_ad`, or
+`partitioned = :z, u0 = u` to `prepare_cell_factors`, when `z` contains the
+integrated coordinates. Whole-array helpers that read only shared coordinates
+are cached before strict row lowering. Updating integrated coordinates reuses
+the cache; updating shared coordinates refreshes it. Helpers that also read
+integrated coordinates remain subject to the ordinary locality check.
+
+The compact derivative selection then contains only integrated coordinates.
+Use these conditional derivatives for local gradients, Hessian blocks and
+third contractions. To differentiate those quantities with respect to shared
+coordinates, accumulate their frontier cotangents across the complete sweep:
+
+```julia
+third_backend = SecondOrder(SecondOrder(reverse_backend, forward_backend),
+                           forward_backend)
+q = prepare_compact_cell_ad(prepare_ad_third, built, plan, :y,
+    u, indices0, third_backend, (direction0,); partitioned = :z, locality = :error)
+mixed = prepare_cell_accumulator(q, third_backend, u; order = 2)
+pullback = prepare_cell_pullback(q, reverse_backend, u)
+gradient = similar(u)
+cell_pullback!(gradient, pullback, u) do batch
+    for i in eachindex(cells)
+        accumulate_cell!(batch, mixed, directions[i], weights[i],
+                         active[i], indices[i], cells[i])
+    end
+end
+```
+
+Here the directions and weights are held fixed. The result is the full packed
+gradient of the weighted local second-directional derivatives, including
+their shared-coordinate derivatives. Orders zero and one similarly accumulate
+gradients and mixed Hessian-vector products. Storage grows with the packed
+point and shared frontier, with one prefix pullback after the sweep.
+
+Within the callback, ordinary local derivative verbs can take `batch` in
+place of `base`, for example
+`ad_gradient_hvp_and_third(q, (direction,), batch, active, indices, cell)`.
+This uses the pass's copied point and checks its cache generation in constant
+time; raw-vector calls scan shared coordinates to detect changes. Ordinary
+verbs do not contribute to the accumulated gradient. This also supports
+local conditional solves at a fixed shared point before accumulating their
+mixed derivative contributions.
+
+Factor operators prepared from one `CellFactors` share its cache and can use
+one `prepare_cell_pullback(factors, reverse_backend, u)`. A summand's
+`accumulate_cell!` takes `active, indices, cell, term_position` last; an outer
+factor takes `sums, active, indices, cell`, with a direction
+`(sum_direction, coordinate_direction)`. The returned local derivative
+includes the outer's independent sum cotangent for the caller's chain rule.
+The call reuses that return storage. Sum dependence is supplied by the
+summands, as for ordinary factor AD. Value-query `kernel` inspection retains
+the full shared dependency graph.
+
+Each family and its pullback serve one caller at a time. A callback failure
+leaves the output gradient unchanged; the next pass resets the accumulation
+storage. Changing shared coordinates through another operator during the
+callback invalidates the pass and throws.
+
 ### A partition of plates by a key
 
 `plate_partition(spec, plates; by, index = :partition, name = :partition_total,

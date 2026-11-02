@@ -453,4 +453,22 @@ ReactiveKernels.ad_value_gradient_and_retained(prepared::_NativeForwardBatchAD,
     ReactiveKernels.ad_value_gradient_and_retained(prepared.reverse,
         args...; kwargs...)
 
+# This is an adapter to Enzyme's supplied-shadow API, not a derivative rule.
+# Unlike DI.gradient!, autodiff adds into Duplicated storage without first
+# clearing it. A cell sweep can therefore share one large cotangent buffer.
+const _AccumulatingEnzyme = ReactiveKernels.DifferentiationInterface.AutoEnzyme{
+    <:Union{Nothing,Enzyme.ReverseMode},<:Union{Nothing,Enzyme.Const}}
+ReactiveKernels._ad_accumulation_supported(::_AccumulatingEnzyme) = true
+
+function ReactiveKernels._ad_accumulate_backend!(backend::_AccumulatingEnzyme,
+        call, destination, point, direction, weight, contexts)
+    all(c -> c isa ReactiveKernels.DifferentiationInterface.Constant, contexts) ||
+        throw(ArgumentError("additive AD requires read-only Constant contexts"))
+    mode = backend.mode === nothing ? Enzyme.ReverseWithPrimal : Enzyme.WithPrimal(backend.mode)
+    annotations = map(c -> Enzyme.Const(c.data), contexts)
+    last(Enzyme.autodiff(mode, Enzyme.Const(call), Enzyme.Active,
+        Enzyme.Duplicated(point, destination), Enzyme.Const(direction),
+        Enzyme.Const(weight), annotations...))
+end
+
 end # module
