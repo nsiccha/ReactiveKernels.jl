@@ -85,6 +85,8 @@ export prepare_partition, PartitionQuery, prepare_partition_sampler, PartitionSa
 export prepare_compact_cell_sampler, CompactCellSampler, prepare_compact_cell_ad, CompactCellAD
 export prepare_cell_factors, CellFactors, cell_reductions, reduction_rows,
     prepare_cell_factor_query, CellFactorQuery, prepare_cell_factor_ad, CellFactorAD
+export prepare_cell_pullback, CellPullback, cell_pullback!,
+    prepare_cell_accumulator, CellAccumulator, accumulate_cell!
 export prepare_predictive, PredictiveQuery, PredictiveLaws, predictive_laws, predictive_draws!,
     predictive_draws, predictive_node, predictive_targets
 export restore_draws
@@ -118,6 +120,7 @@ include("generator.jl")
 include("arrays.jl")
 include("query.jl")
 include("cell_factors.jl")
+include("cell_shared.jl")
 include("predictive.jl")
 include("smc.jl")
 include("smc_projection.jl")

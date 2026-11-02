@@ -312,6 +312,28 @@ matrix-matrix product on every Julia version. The local Enzyme `dogfood` line
 fixes it from libEnzyme build `4be29b19`. The section on current backend
 limitations in `constraints.md` tracks it.
 
+## Accumulate mixed directional derivatives
+
+`prepare_ad_accumulator(kernel, backend, args...; active, directional, order)`
+prepares the gradient of a scalar directional contraction. `order=0`, `1`,
+or `2` selects `f`, `Df[v]`, or `D²f[v,v]`. The direction covers only the
+ports named by `directional`; the resulting gradient covers every port in
+`active`. Thus a local direction can produce a mixed derivative with respect
+to a large shared operand without allocating a full-sized zero direction.
+The backend is native reverse `AutoEnzyme` for order zero,
+`SecondOrder(reverse, forward)` for order one, and
+`SecondOrder(SecondOrder(reverse, forward), forward)` for order two.
+
+Allocate a destination once with `ad_accumulator_storage(prepared, args...)`.
+It is a tuple in active-port order, with `Ref` storage for scalar ports.
+`ad_accumulate!(prepared, destination, direction, weight, args...)` adds
+`weight * ∇Dⁿf[v,…]` and returns the weighted scalar contraction. Pass
+`nothing` for the direction at order zero. The direction and weight are held
+fixed in the reverse pass. The call neither clears nor copies the destination;
+reset it between complete accumulation passes. Destination storage must not
+alias the primal arguments. One prepared operator and its storage serve one
+caller at a time.
+
 ## Freeze data-only work during preparation
 
 When data stay fixed across many derivative calls, pass them in the named
