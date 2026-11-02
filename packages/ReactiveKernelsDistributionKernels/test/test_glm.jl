@@ -555,15 +555,15 @@ end
             have = (:y, :X, :beta, :phi), want = :logpdf,
             bound = (; X = X, y = y))
         sku = string(code_expr(ku))
-        # phi free: lgp stays a live call on runtime (y, phi).
-        @test occursin("logpdf__lgp", sku) && occursin(")(y, phi)", sku)
+        # phi free: the log-gamma normalizer still depends on runtime phi.
+        @test occursin("logpdf__lgp", sku) && occursin("loggamma", sku)
         kb = prepare(neg_binomial_2_log_glm.logpdf;
             have = (:y, :X, :beta, :phi), want = :logpdf,
             bound = (; X = X, y = y, phi = phi0))
         skb = string(code_expr(kb))
         # phi bound: normalizer subexpressions fold into cached values;
         # the live logpdf__lgp binding may disappear during that lowering.
-        @test !occursin(")(y, phi)", skb)
+        @test !occursin("loggamma", skb)
         @test !occursin("Distributions", skb)
         for coefficients in (beta, [-0.3, 0.8])
             for precision in (0.7, phi0, 5.0)
