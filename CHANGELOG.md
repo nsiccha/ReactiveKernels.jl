@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.56
+
+- Constructed RK object endpoints accept plate-local method arguments, as
+  their constructor arguments already do. A call such as
+  `normal(mu, sigma).logpdf(transformed)` may read `transformed` computed in
+  that cell, retaining its graph, lazy branches and native reverse derivatives.
+
 ## 0.1.55
 
 - Compose shared upstream plates into selected consumers with independent

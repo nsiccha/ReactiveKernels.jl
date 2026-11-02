@@ -110,6 +110,22 @@ end
     return total
 end
 
+@kernel plate_local_argument(x, m) = begin
+    cells = plate(x) do xi
+        transformed = xi^2 + 0.1
+        normal(m[1], 1.0).logpdf(transformed)
+    end
+    return sum(cells)
+end
+
+@kernel plate_guarded_local_argument(x, m) = begin
+    cells = plate(x) do xi
+        transformed = xi > 0 ? log(xi) : 0.0
+        normal(m[1], 1.0).logpdf(transformed)
+    end
+    return sum(cells)
+end
+
 const X = [0.3, 1.2, -0.4]
 const M = [0.0, 1.0]
 first_point(m) = sum(nlp(X[1], mu, 1.0) for mu in m)
@@ -132,6 +148,9 @@ every_point(m) = sum(nlp(xi, mu, 1.0) for xi in X, mu in m)
         (local_function, x1, first_point(M)),
         (plate_cell, X, every_point(M)),
         (scan_step, X, every_point(M)),
+        (plate_local_argument, X, sum(nlp(xi^2+0.1, M[1], 1.0) for xi in X)),
+        (plate_guarded_local_argument, X,
+            sum(nlp(xi > 0 ? log(xi) : 0.0, M[1], 1.0) for xi in X)),
     )
     for (spec, x, expected) in cases
         saved = (copy(x), copy(M))
@@ -154,6 +173,9 @@ end
         (local_function, X[1:1], [X[1] - M[1], X[1] - M[2]]),
         (plate_cell, X, [sum(X .- M[1]), sum(X .- M[2])]),
         (scan_step, X, [sum(X .- M[1]), sum(X .- M[2])]),
+        (plate_local_argument, X, [sum(X.^2 .+ 0.1 .- M[1]), 0.0]),
+        (plate_guarded_local_argument, X,
+            [sum((xi > 0 ? log(xi) : 0.0)-M[1] for xi in X), 0.0]),
     )
     for (spec, x, expected) in cases, bound in (false, true)
         k = bound ? prepare(spec; bound = (; x)) : prepare(spec)

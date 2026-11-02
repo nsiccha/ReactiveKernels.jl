@@ -2012,7 +2012,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     if actual isa Symbol && (actual in scoped || actual in locals)
                         push!(endpoint_ports, actual)
                         continue
-                    elseif actual isa Symbol
+                    elseif actual isa Symbol && !(actual in cell_locals)
                         throw(ArgumentError(
                             "endpoint :$endpoint_name argument $context refers to " *
                             "undeclared caller port :$actual"))
@@ -2020,7 +2020,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     rewritten_actual, _ = _kernel_constructed_endpoint(
                         actual, mod, locals, nested_specs, local_types;
                         context = context, materialized = materialized,
-                        straight = straight, scoped = scoped,
+                        cell_locals = cell_locals, straight = straight, scoped = scoped,
                         endpoint_cache = endpoint_cache,
                         lift_scope = lift_scope, boundary_types = boundary_types)
                     if straight
