@@ -4,6 +4,7 @@ import Distributions as D
 import Enzyme, DifferentiationInterface as DI
 
 const mapped_normal = D.Normal
+const mapped_lognormal = D.LogNormal
 
 function endpoints(constructor, arguments)
     object = sampling_distribution_graph(constructor, arguments)
@@ -63,8 +64,11 @@ end
 end
 
 @testset "qualified and aliased distribution graphs replay inside plates" begin
-    for head in (:mapped_normal, :(D.Normal)), count in (1,8)
-        data = (; y = collect(range(-0.4,0.8;length=count+1))[1:count])
+    for (head,family) in ((:mapped_normal,D.Normal), (:(D.Normal),D.Normal),
+                          (:mapped_lognormal,D.LogNormal), (:(D.LogNormal),D.LogNormal)),
+        count in (1,8)
+        observations = collect(range(-0.4,0.8;length=count+1))[1:count]
+        data = (; y = family === D.LogNormal ? exp.(observations) : observations)
         saved = deepcopy(data)
         ast = quote
             mu ~ Normal(0,1)
@@ -80,7 +84,7 @@ end
         q = [0.2,-0.3]
         sampler = prepare_sampler(built,plan,q;backend=DI.AutoEnzyme(;mode=Enzyme.Reverse))
         value,g = sampler_value_and_gradient!(sampler,similar(q),q)
-        oracle(w)=sum(D.logpdf.(D.Normal(w[1],exp(w[2])),data.y))+sum(D.logpdf.(D.Normal(),w))
+        oracle(w)=sum(D.logpdf.(family(w[1],exp(w[2])),data.y))+sum(D.logpdf.(D.Normal(),w))
         @test value ≈ oracle(q)
         @test Base.invokelatest(replay,q) ≈ oracle(q)
         h=1e-5
