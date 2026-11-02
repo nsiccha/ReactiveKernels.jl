@@ -13,6 +13,7 @@ include(joinpath(@__DIR__, "..", "examples", "manual_derivative_rule.jl"))
 import .ManualDerivativeRuleExample
 
 include("kernel_examples.jl")
+include("distribution_graph_examples.jl")
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "result_views.jl"))
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "rkppl_page.jl"))
 Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "all80_comparison_tables.jl"))

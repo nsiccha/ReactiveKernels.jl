@@ -2,12 +2,54 @@ module ReactiveKernelsPPLDistributionsExt
 
 import Distributions
 import ReactiveKernelsPPL
+import ReactiveKernelsDistributionKernels: DistributionKernelSources
 using LogExpFunctions: logistic
 
 # Distribution objects use their ordinary public logpdf. Parameter geometry
 # is a separate capability; it is never inferred by evaluating active args.
 ReactiveKernelsPPL.sampling_logdensity(d::Distributions.Distribution, value) =
     Distributions.logpdf(d, value)
+
+# Structural mappings consume authored arguments without evaluating them.
+# Defaults and Gamma's scale parameter follow the resolved Julia constructor.
+_graph_call(name, args...) = Expr(:call, GlobalRef(DistributionKernelSources, name), args...)
+_float_argument(x) = Expr(:call, GlobalRef(Base, :Float64), x)
+_checked_argument(x, nonnegative=false) = _graph_call(:_checked_distribution_parameter, x, nonnegative)
+
+function _location_scale_graph(name, args, nonnegative)
+    length(args) <= 2 || return nothing
+    location = isempty(args) ? 0.0 : args[1]
+    scale = length(args) < 2 ? 1.0 : args[2]
+    _graph_call(name, _float_argument(location), _checked_argument(scale, nonnegative))
+end
+
+ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Normal}, args::Tuple) =
+    _location_scale_graph(:normal, args, true)
+ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.LogNormal}, args::Tuple) =
+    _location_scale_graph(:lognormal, args, true)
+ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Cauchy}, args::Tuple) =
+    _location_scale_graph(:cauchy, args, false)
+ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Laplace}, args::Tuple) =
+    _location_scale_graph(:laplace, args, false)
+ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Logistic}, args::Tuple) =
+    _location_scale_graph(:logistic, args, false)
+
+function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Gamma}, args::Tuple)
+    length(args) <= 2 || return nothing
+    shape = isempty(args) ? 1.0 : args[1]
+    scale = length(args) < 2 ? 1.0 : args[2]
+    _graph_call(:gamma, Expr(:parameters,
+        Expr(:kw, :shape, _checked_argument(shape)),
+        Expr(:kw, :scale, _checked_argument(scale))))
+end
+function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Exponential}, args::Tuple)
+    length(args) <= 1 || return nothing
+    _graph_call(:exponential, _checked_argument(isempty(args) ? 1.0 : only(args)))
+end
+function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.DirichletMultinomial}, args::Tuple)
+    length(args) == 2 || return nothing
+    _graph_call(:dirichlet_multinomial, args...)
+end
 
 # ── Laws for posterior-predictive draws ──────────────────────────────────
 # Each observation's law cell (`ReactiveKernelsPPL._law_fields`) names the

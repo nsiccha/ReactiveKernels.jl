@@ -284,7 +284,7 @@ struct _KernelEndpointTemplates{B,N,A,F}
     builder::F
 end
 
-_kernel_endpoint_is_bang(name::Symbol) = endswith(String(name), "!")
+_kernel_endpoint_is_bang(name::Symbol) = name !== :! && endswith(String(name), "!")
 function _kernel_endpoint_is_bang(name)
     name isa Expr && name.head === :(.) && length(name.args) == 2 || return false
     leaf = name.args[2]
