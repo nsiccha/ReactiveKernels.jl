@@ -134,12 +134,10 @@ including where the corresponding probability underflows.
 `upper_truncated_lognormal(location, scale, upper)` provide zero-argument
 `mean()` and `var()` endpoints:
 
-```julia
-@kernel bounded_moment(location::Float64, scale::Float64, lower::Float64) = begin
-    return lower_truncated_lognormal(location, scale, lower).var()
-end
-moments = prepare(extract(lower_truncated_lognormal;
-    have=(:location, :scale, :lower), want=(:mean, :var)))
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionGraphExamples.moment_source(),
+)
 ```
 
 A nonpositive lower bound selects ordinary LogNormal moments. Use
@@ -174,6 +172,16 @@ event terms read the live concentrations and retain runtime loops. This reuse
 does not eliminate the active per-event array allocations.
 `dirichlet_multinomial_logdensity` is the extracted endpoint with positional
 arguments `(counts, n, alpha)`.
+
+The example reads the implemented count-density graph and binds two events.
+Its build checks changed concentrations and verifies that the count-only
+normalizer has left the residual evaluator:
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionGraphExamples.count_source(),
+)
+```
 
 ## Measuring composition and binding
 
