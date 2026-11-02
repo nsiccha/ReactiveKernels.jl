@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.59
+
+- Strict cell queries and outer factors accept ordinary helper gathers such
+  as `gather(z, indices) = [z[i] for i in indices]`, including wrappers and
+  row-wise scalar operations. Values, packed footprints and native compact
+  derivatives retain only the selected local coordinates. Requires RK 0.1.53;
+  cross-row helper work still faces locality checks.
+
 ## 0.1.58
 
 - Preserve ordinary reverse derivatives when mixture components have equal
