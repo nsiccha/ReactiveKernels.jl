@@ -140,7 +140,7 @@ function _cell_helper_ir(F, arguments; closure = nothing, scalar = false,
     end
 end
 
-function _cell_helper_form(r::Recipe, input_types; outlined = false)
+function _cell_helper_call(r::Recipe, input_types; outlined = false, stable = false)
     input_types === nothing && return nothing
     length(r.outputs) == 1 && !r.effectful || return nothing
     if r.op isa _KernelSourceOp
@@ -149,6 +149,7 @@ function _cell_helper_form(r::Recipe, input_types; outlined = false)
         ex, params, mod = source
         Meta.isexpr(ex, :call) || return nothing
         _native_callee_shadowed(ex.args[1], params) && return nothing
+        stable && !_kernel_constant_callable(mod, ex.args[1]) && return nothing
         f = _cell_binding(ex.args[1], mod)
         all(a -> a in params, ex.args[2:end]) || return nothing
         positions = [findfirst(==(a), params) for a in ex.args[2:end]]
@@ -157,9 +158,16 @@ function _cell_helper_form(r::Recipe, input_types; outlined = false)
         params = Symbol[v.name for v in r.inputs]
         positions = collect(eachindex(params))
     end
+    args = [_CellHelperArg(params[j], input_types[j]) for j in positions]
+    (; f, params, args)
+end
+
+function _cell_helper_form(r::Recipe, input_types; outlined = false)
+    call = _cell_helper_call(r, input_types; outlined)
+    call === nothing && return nothing
+    (; f, params, args) = call
     f isa Function && Base.issingletontype(typeof(f)) &&
         !(parentmodule(f) in (Core, Base)) || return nothing
-    args = [_CellHelperArg(params[j], input_types[j]) for j in positions]
     mapped = _cell_helper_ir(typeof(f), args)
     mapped isa _CellHelperGenerator || return nothing
     iterator = findfirst(==(mapped.iterator.expr), params)
@@ -205,6 +213,97 @@ function _cell_helper_form(r::Recipe, input_types; outlined = false)
     _CellForm(:pointwise, roles, Int[isempty(ix) ? 0 : first(ix) for ix in indices],
         [iterator], 0, indices, Any[], _cell_direct_reads(indices), nothing,
         tails, nothing, rowmap)
+end
+
+# Ordinary array arithmetic has stricter shape checks than broadcasting. Only
+# Base's array methods over standard storage have this row law. A custom array
+# can specialize either arithmetic or broadcasting, and an abstract array type
+# is not evidence that its concrete values use the standard methods.
+# A custom numeric element type can own array/broadcast overloads too.
+_cell_arithmetic_number(T) = T in (Bool, Int8, Int16, Int32, Int64, Int128,
+    UInt8, UInt16, UInt32, UInt64, UInt128, Float16, Float32, Float64, BigInt, BigFloat)
+_cell_arithmetic_number(::Type{Complex{T}}) where {T} = _cell_arithmetic_number(T)
+_cell_arithmetic_number(::Type{Rational{T}}) where {T} = _cell_arithmetic_number(T)
+_cell_arithmetic_array(T) = false
+_cell_arithmetic_array(::Type{<:Array{T}}) where {T} = _cell_arithmetic_number(T)
+_cell_arithmetic_array(::Type{<:SubArray{<:Number,N,P}}) where {N,P} =
+    _cell_arithmetic_array(P)
+
+# Abstract ports can still produce dense gathers. Prove the arithmetic for a
+# concrete storage type, then check the original producer's inferred type in
+# the emitted program before using that proof. A custom array is never treated
+# as dense merely because its port is abstract.
+function _cell_arithmetic_type(T)
+    _cell_arithmetic_array(T) && return T
+    T isa DataType && T <: AbstractArray{<:Number} || return nothing
+    isconcretetype(T) && return nothing
+    E = eltype(T)
+    _cell_arithmetic_number(E) || return nothing
+    S = Array{E,ndims(T)}
+    S <: T ? S : nothing
+end
+
+@inline function _cell_check_arithmetic_type(actual, expected)
+    actual <: expected || throw(ArgumentError(
+        "local array arithmetic requires an original operand of type $expected; inferred $actual"))
+    nothing
+end
+
+function _cell_forwarded_arithmetic(f, args, stack = Set{Any}())
+    if f in (Base.:+, Base.:-) && length(args) == 2
+        types = _cell_arithmetic_type.([a.type for a in args])
+        any(isnothing, types) && return nothing
+        matches = Base._methods_by_ftype(Tuple{typeof(f), types...},
+                                        -1, Base.get_world_counter())
+        matches === nothing && return nothing
+        length(matches) == 1 && only(matches).fully_covers || return nothing
+        method = only(matches).method
+        method.module === Base || return nothing
+        standard = which(f, Tuple{AbstractArray,AbstractArray})
+        dense = which(f, Tuple{Array,Array})
+        method in (standard, dense) || return nothing
+        return (; f, args, types)
+    end
+    f isa Function && Base.issingletontype(typeof(f)) &&
+        !(parentmodule(f) in (Core, Base)) || return nothing
+    key = (typeof(f), Tuple(a.type for a in args))
+    key in stack && return nothing
+    ci = _cell_helper_code(key...)
+    ci === nothing && return nothing
+    # A transparent wrapper does exactly one call and returns that call. In
+    # particular, do not discard unused calls, checks, conversions or effects.
+    statements = [(i, st) for (i, st) in enumerate(ci.code) if
+        !(st === nothing || st isa LineNumberNode || st isa Core.NewvarNode ||
+          st isa Expr && st.head in (:meta, :code_coverage_effect, :inbounds))]
+    length(statements) == 2 || return nothing
+    (index, ex), (_, ret) = statements
+    Meta.isexpr(ex, :call) && ret isa Core.ReturnNode && isdefined(ret, :val) &&
+        ret.val === Core.SSAValue(index) || return nothing
+    callee = ex.args[1]
+    callee isa GlobalRef && isdefined(callee.mod, callee.name) &&
+        isconst(callee.mod, callee.name) || return nothing
+    all(a -> a isa Core.SlotNumber && 2 <= a.id <= length(args) + 1,
+        ex.args[2:end]) || return nothing
+    push!(stack, key)
+    try
+        _cell_forwarded_arithmetic(getglobal(callee.mod, callee.name),
+            [args[a.id - 1] for a in ex.args[2:end]], stack)
+    finally
+        delete!(stack, key)
+    end
+end
+
+function _cell_arithmetic_form(r::Recipe, input_types; outlined = false)
+    call = _cell_helper_call(r, input_types; outlined, stable = true)
+    call === nothing && return nothing
+    arithmetic = _cell_forwarded_arithmetic(call.f, call.args)
+    arithmetic === nothing && return nothing
+    positions = Int[findfirst(==(a.expr), call.params) for a in arithmetic.args]
+    roles = fill(:whole, length(r.inputs))
+    roles[positions] .= :leaf
+    _CellForm(:array_arithmetic, roles, zeros(Int, length(roles)), positions, 0,
+        [Int[] for _ in roles], Any[], [Int[] for _ in roles],
+        (; f = arithmetic.f, positions, types = arithmetic.types))
 end
 
 function _cell_helper_window!(e, mapping, args)

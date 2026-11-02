@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.60
+
+- Evaluate binary ordinary array addition and subtraction at requested rows
+  when Base arithmetic over standard numeric arrays is proved, including
+  transparent forwarding helpers. Preserve full-array shape checks and
+  guard the original operand types before applying the local row form.
+- Use typed row forms when discovering a scalar cell's sum factors, so
+  gathered operands combined with ordinary addition retain their row labels.
+
 ## 0.1.59
 
 - Treat the Boolean `!` operator as a pure endpoint call, rather than a

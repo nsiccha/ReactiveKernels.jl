@@ -1313,7 +1313,9 @@ function _cell_value_types(p::Plan; argument_types = nothing,
                      valtype(v) : T for (v, T) in zip(r.inputs, input_types)]
         form = get!(() -> _cell_form(r; outlined = r.id in outlined), known, r)
         if form === nothing
-            known[r] = _cell_helper_form(r, inputs; outlined = r.id in outlined)
+            form = _cell_arithmetic_form(r, inputs; outlined = r.id in outlined)
+            known[r] = form === nothing ?
+                _cell_helper_form(r, inputs; outlined = r.id in outlined) : form
         end
         inferred = if length(r.outputs) == 1 && r.op isa _AuthoredPlateOp
             (_cell_plate_output_type(r.op, inputs),)
@@ -1592,7 +1594,8 @@ function _cell_bound_capture_check(p::Plan, producers, static_type, known, outli
             return shapes[cid] = f.kind === :range_view ?
                 _cell_range_shape(literal) : _cell_dims_shape(literal)
         end
-        f.kind in (:identity, :pointwise, :columns, :hcat, :reduce, :transposed) ||
+        f.kind in (:identity, :pointwise, :columns, :hcat, :reduce, :transposed,
+                   :array_arithmetic) ||
             return nothing
         parts = Any[]
         for j in f.leaves
@@ -1615,6 +1618,7 @@ function _cell_bound_capture_check(p::Plan, producers, static_type, known, outli
         end
         f.kind === :columns && return shapes[cid] = _cell_column_shape(only(parts))
         f.kind === :hcat && return shapes[cid] = _cell_hcat_shape(Tuple(parts))
+        f.kind === :array_arithmetic && return shapes[cid] = Base.promote_shape(parts...)
         full = _plate_broadcast_shape(Tuple(parts))
         f.kind === :reduce || return shapes[cid] = full
         (; dims, drop) = f.reduction
@@ -1787,7 +1791,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
         r = only(producers[cid])
         f = forms[r.id]
         f.kind in (:pointwise, :identity, :columns, :hcat, :vcat, :range_view, :reshape,
-                   :reduce, :transposed) && return true
+                   :reduce, :transposed, :array_arithmetic) && return true
         inputs = r.inputs
         factor = cidof(inputs[findfirst(==(:factor), f.roles)])
         (f.operand == 0 ? static_type(only(r.outputs)) <: AbstractVector :
@@ -2188,6 +2192,7 @@ struct _CellEmitter
     runtime_ops::Vector{Any}
     runtime_recipes::Vector{Recipe}
     shapes::Dict{ValueId,Symbol}
+    original_types::Dict{ValueId,Symbol}
     rows::Dict{Tuple{ValueId,Symbol},Symbol}
     requests::Dict{ValueId,Vector{Symbol}}
     unions::Dict{ValueId,Symbol}
@@ -2204,7 +2209,7 @@ end
 _CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes; sorted::Bool = false,
              constant::Set{Symbol} = Set{Symbol}()) =
     _CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes,
-        Dict{ValueId,Symbol}(), Dict{Tuple{ValueId,Symbol},Symbol}(),
+        Dict{ValueId,Symbol}(), Dict{ValueId,Symbol}(), Dict{Tuple{ValueId,Symbol},Symbol}(),
         Dict{ValueId,Vector{Symbol}}(), Dict{ValueId,Symbol}(),
         Dict{ValueId,Vector{Any}}(), Dict{ValueId,Symbol}(), sorted, constant)
 
@@ -2229,11 +2234,31 @@ function _cell_leaf_shape_expr(e::_CellEmitter, input::ValueId)
     Expr(:call, _cell_ref(:_cell_leaf_shape), e.names[input])
 end
 
+# Infer the value the original recipe would produce, without evaluating its
+# full array. Window operands have different types and cannot justify dispatch
+# of the original expression. `_promote_op` folds from the actual HAVE types.
+function _cell_original_type_expr(e::_CellEmitter, input::ValueId)
+    haskey(e.original_types, input) && return e.original_types[input]
+    d = e.pushdowns
+    input in d.pushed || return Expr(:call, GlobalRef(Core, :typeof), e.names[input])
+    r = d.producer[input]
+    types = Any[_cell_original_type_expr(e, canon_id(d.graph, v.id)) for v in r.inputs]
+    e.original_types[input] = _cell_bind!(e, :cell_type,
+        _slot_type_expr(r, d.slots[r.id], types))
+end
+
 function _cell_shape!(e::_CellEmitter, cid::ValueId)
     haskey(e.shapes, cid) && return e.shapes[cid]
     d = e.pushdowns
     r = d.producer[cid]
     f = d.forms[r.id]
+    if f.kind === :array_arithmetic
+        for (j, T) in zip(f.literal.positions, f.literal.types)
+            input = canon_id(d.graph, r.inputs[j].id)
+            push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_arithmetic_type),
+                _cell_original_type_expr(e, input), QuoteNode(T)))
+        end
+    end
     input_shape(input) = input in d.pushed ? _cell_shape!(e, input) :
         _cell_leaf_shape_expr(e, input)
     if f.kind === :product
@@ -2268,6 +2293,7 @@ function _cell_shape!(e::_CellEmitter, cid::ValueId)
     shape = f.kind === :columns ?
         Expr(:call, _cell_ref(:_cell_column_shape), only(parts)) :
         f.kind === :hcat ? Expr(:call, _cell_ref(:_cell_hcat_shape), Expr(:tuple, parts...)) :
+        f.kind === :array_arithmetic ? Expr(:call, GlobalRef(Base, :promote_shape), parts...) :
         Expr(:call, _cell_ref(:_plate_broadcast_shape), Expr(:tuple, parts...))
     f.kind === :reduce && (shape = Expr(:call, _cell_ref(:_cell_reduce_shape), shape,
         Val(f.reduction.dims), Val(f.reduction.vec), Val(f.reduction.drop)))
@@ -2473,7 +2499,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
     U = e.unions[cid]
     f.kind === :vcat && return _cell_vcat_window!(e, cid, r, f, U)
     if f.kind in (:pointwise, :identity, :columns, :hcat, :range_view, :reshape, :reduce,
-                  :transposed)
+                  :transposed, :array_arithmetic)
         push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row),
             _cell_shape!(e, cid), U, e.sorted))
     end
@@ -2544,7 +2570,9 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
             e.runtime_recipes[1:offset], r.op, args, d.plates[r.id], window, nothing)
         return window
     end
-    call = _slot_call_expr(r, d.slots[r.id], args)
+    call = f.kind === :array_arithmetic ?
+        Expr(:call, GlobalRef(Base, nameof(f.literal.f)), args[f.literal.positions]...) :
+        _slot_call_expr(r, d.slots[r.id], args)
     f.kind === :identity &&
         (call = Expr(:call, GlobalRef(Base, :convert), valtype(only(r.outputs)), call))
     _cell_bind!(e, :cell_rows, call)

@@ -8,6 +8,10 @@ remain in the outer computation.
 This includes weighted operands `sum(exp.(eta[rows[k]]) .* w[rows[k]])`
 and a cell-local `mu = exp.(eta[rows[k]])` used by several sums, such as
 `NegativeBinomial2(sum(mu), phi * sum(mu)^2 / sum(mu .^ 2))`.
+Ordinary array sums such as `sum(z[rows[k]] + w[rows[k]])` also expose
+local summands, including through transparent forwarding helpers. Base array
+dispatch and the original full-array shape checks must be proved; addition
+is not treated as a broadcast with singleton expansion.
 Typed identity assignments between plates do not hide these sums when the
 input already satisfies the declaration; real conversions remain in the graph.
 `cell_reductions(f)` gives the reductions in graph order;
@@ -59,7 +63,7 @@ function prepare_cell_factors(built, plan::StructuralPlan, observation::Symbol;
         end
     end
     reductions = map(factors.sums) do s
-        rows = ReactiveKernels._cell_factor_rows(factors.spec, s.argument)
+        rows = ReactiveKernels._cell_factor_rows(factors.spec, s.argument; bound = factor_bound)
         rows === nothing && return nothing
         # Removing the packed point proves the row query is data-defined.
         rowhave = Tuple(n for n in factors.spec.have_names if n !== :unconstrained &&

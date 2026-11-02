@@ -1094,6 +1094,18 @@ unproved helper bodies retain their ordinary whole-value path and locality
 checks. Emission retains a runtime loop and infers its fresh buffer from the
 actual prepared operand types. No model rewrite or derivative rule is needed.
 
+Binary ordinary array `+` and `-`, including transparent forwarding helpers
+such as `add_arrays(a, b) = a + b`, also have row forms when their dispatch
+resolves to Base arithmetic over standard numeric arrays. Their complete
+operand shapes still pass through `promote_shape`: a singleton axis that
+broadcasting would expand can still raise `DimensionMismatch` for ordinary
+addition. For abstract ports, the emitted program checks that the original
+operands infer to the dense types used by the proof before evaluating their
+local windows. A custom array whose arithmetic has not been proved is refused
+by that local query; ordinary whole-value evaluation retains its dispatch.
+Forwarding helpers with ambiguous dispatch, extra computations or effects
+retain their ordinary whole-value path.
+
 The full broadcast shape of each such expression, and the full shape of each
 `hcat`, is still checked from its operands' axes (`DimensionMismatch`), and the
 cell's own reads and the factor rows are bounds-checked. An error that only
