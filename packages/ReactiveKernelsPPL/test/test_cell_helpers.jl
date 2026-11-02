@@ -1,0 +1,127 @@
+module OrdinaryHelperCellTests
+using ReactiveKernels, ReactiveKernelsPPL, Enzyme, Test
+using DifferentiationInterface: AutoEnzyme
+
+plain(z, indices) = [z[i] for i in indices]
+wrapped(z, indices) = plain(z, indices)
+rowwise(z, indices, scale) = [scale * sin(z[i]) + z[i]^2 for i in indices]
+crossrow(z, indices) = [z[i] + sum(z) for i in indices]
+
+const plain_model = @rkppl begin
+    beta ~ Normal(0, 1)
+    z[1:n] .~ Normal.(0, 1)
+    field = plain(z, indices)
+    @plate for i in eachindex(x)
+        y[i] ~ Poisson(exp(beta * x[i] + field[i]))
+    end
+end
+const wrapped_model = @rkppl begin
+    beta ~ Normal(0, 1)
+    z[1:n] .~ Normal.(0, 1)
+    field = wrapped(z, indices)
+    @plate for i in eachindex(x)
+        y[i] ~ Poisson(exp(beta * x[i] + field[i]))
+    end
+end
+const rowwise_model = @rkppl begin
+    beta ~ Normal(0, 1)
+    z[1:n] .~ Normal.(0, 1)
+    field = rowwise(z, indices, beta)
+    @plate for i in eachindex(x)
+        y[i] ~ Poisson(exp(beta * x[i] + field[i]))
+    end
+end
+const crossrow_model = @rkppl begin
+    z[1:n] .~ Normal.(0, 1)
+    field = crossrow(z, indices)
+    @plate for i in eachindex(x)
+        y[i] ~ Poisson(exp(field[i]))
+    end
+end
+
+struct RecordingPoint <: AbstractVector{Float64}
+    values::Vector{Float64}
+    reads::Vector{Int}
+end
+Base.size(p::RecordingPoint) = size(p.values)
+Base.IndexStyle(::Type{RecordingPoint}) = IndexLinear()
+Base.getindex(p::RecordingPoint, i::Int) = (push!(p.reads, i); p.values[i])
+nodes(x::Expr) = 1 + sum(nodes, x.args; init = 0)
+nodes(x) = 0
+
+@testset "ordinary helper rows in strict values and factors" begin
+    for model in (plain_model, wrapped_model, rowwise_model)
+        structures = Int[]
+        for n in (4, 80)
+            indices, x = [n, 2, 1, 2], [0.4, -0.2, 0.8, 0.1]
+            bound = model(; n, indices, x) | (; y=ones(Int, length(indices)))
+            built = build_kernel(bound)
+            names = coordinate_names(built.layout)
+            beta = findfirst(==(:beta), names)
+            z = [findfirst(==(Symbol("z.$i")), names) for i in 1:n]
+            u = collect(range(-0.2, 0.3; length=length(names)))
+            q = prepare_cell_query(built, bound, :y; partitioned=(:z=>collect(1:n),),
+                                   locality=:error, u0=u)
+            factors = prepare_cell_factors(built, bound, :y; locality=:error)
+            outer = prepare_cell_factor_query(factors, :outer)
+            @test isempty(cell_reductions(factors))
+            push!(structures, nodes(code_expr(outer.kernel)))
+            for c in eachindex(indices)
+                zi = u[z[indices[c]]]
+                field = model === rowwise_model ? u[beta] * sin(zi) + zi^2 : zi
+                eta = u[beta] * x[c] + field
+                expected = eta - exp(eta)
+                @test q(u, c) ≈ expected
+                @test outer(u, Float64[], c) ≈ expected
+                p = RecordingPoint(u, Int[])
+                @test outer(p, Float64[], c) ≈ expected
+                @test sort!(unique!(p.reads)) == sort([beta, z[indices[c]]])
+                support = Base.invokelatest(partition_footprint_kernel(outer.kernel),
+                                           u, Float64[], c).unconstrained
+                @test support == sort([beta, z[indices[c]]])
+            end
+            old = q(u, 1)
+            u[z[3]] += 0.7
+            @test q(u, 1) == old
+            u[z[n]] += 0.2
+            @test q(u, 1) != old
+            u[beta] += 0.1
+            @test q(u, 1) ≈ outer(u, Float64[], 1)
+        end
+        @test structures[1] == structures[2]
+    end
+end
+
+@testset "ordinary helper native compact derivatives" begin
+    n, indices, x = 4, [4, 2, 1, 2], [0.4, -0.2, 0.8, 0.1]
+    for model in (plain_model, rowwise_model)
+        bound = model(; n, indices, x) | (; y=ones(Int, 4))
+        built = build_kernel(bound)
+        names = coordinate_names(built.layout)
+        beta = findfirst(==(:beta), names)
+        z = [findfirst(==(Symbol("z.$i")), names) for i in 1:n]
+        u = collect(range(-0.2, 0.3; length=length(names)))
+        selection = sort([beta, z[4]])
+        ad = prepare_compact_cell_ad(prepare_ad, built, bound, :y, u, selection,
+                                    AutoEnzyme(; mode=Enzyme.Reverse); locality=:error)
+        value, gradient = ad_value_and_gradient(ad, u, u[selection], selection, 1)
+        zi, b = u[z[4]], u[beta]
+        field = model === rowwise_model ? b * sin(zi) + zi^2 : zi
+        eta = b * x[1] + field
+        d_beta = model === rowwise_model ? x[1] + sin(zi) : x[1]
+        d_z = model === rowwise_model ? b * cos(zi) + 2zi : 1.0
+        @test value ≈ eta - exp(eta)
+        oracle = Dict(beta => (1-exp(eta))*d_beta, z[4] => (1-exp(eta))*d_z)
+        @test gradient ≈ [oracle[i] for i in selection]
+    end
+end
+
+@testset "cross-row helper keeps strict locality checks" begin
+    bound = crossrow_model(; n=4, indices=[4, 2, 1, 3], x=zeros(4)) | (; y=ones(Int, 4))
+    built = build_kernel(bound)
+    # Every output depends on every z through sum(z), so selecting one cell
+    # cannot satisfy the selected-coordinate locality contract.
+    @test_throws PartitionLocalityError prepare_cell_query(built, bound, :y;
+        partitioned=(:z=>collect(1:4),), locality=:error, u0=zeros(4))
+end
+end

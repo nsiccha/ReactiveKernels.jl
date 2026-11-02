@@ -644,7 +644,13 @@ struct _CellForm
     # A `:reduce`'s reduction `(; dims, vec, drop)`: the literal axes reduced,
     # whether `vec` follows, and the axes `dropdims` drops; else `nothing`.
     reduction::Any
+    # An ordinary helper's recovered element program, emitted at these rows.
+    rowmap::Any
 end
+_CellForm(kind, roles, gather_index, leaves, operand, indices, parts, vias,
+          literal, tails, reduction) =
+    _CellForm(kind, roles, gather_index, leaves, operand, indices, parts, vias,
+              literal, tails, reduction, nothing)
 _CellForm(kind, roles, gather_index, leaves, operand, indices = Vector{Int}[
         role in (:gather, :linear_gather) ? [gather_index[j]] : Int[]
         for (j, role) in enumerate(roles)], parts = Any[]) =
@@ -1304,6 +1310,10 @@ function _cell_value_types(p::Plan; argument_types = nothing,
         inputs = Any[valtype(v) !== Any && !(T <: valtype(v)) &&
                      !(canon_id(p.graph, v.id) in bound) ?
                      valtype(v) : T for (v, T) in zip(r.inputs, input_types)]
+        form = get!(() -> _cell_form(r; outlined = r.id in outlined), known, r)
+        if form === nothing
+            known[r] = _cell_helper_form(r, inputs; outlined = r.id in outlined)
+        end
         inferred = if length(r.outputs) == 1 && r.op isa _AuthoredPlateOp
             (_cell_plate_output_type(r.op, inputs),)
         elseif length(r.outputs) == 1 && r.op isa _AuthoredPlateCellOp && !r.op.rows
@@ -2512,6 +2522,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
             push!(args, e.names[icid])
         end
     end
+    f.rowmap === nothing || return _cell_helper_window!(e, f.rowmap, args)
     if r.op isa _AuthoredPlateOp
         # The plate over these one-row arguments, with the table slots reserved
         # at its own position (`_lower_with_ops`).
