@@ -713,11 +713,15 @@ using SpecialFunctions: gamma_inc, gamma_inc_inv
     scale::Float64 = 1 / rate
     rate::Float64 = 1 / scale
 
-    logpdf(x::Float64)::Float64 =
+    logpdf(x::Float64)::Float64 = begin
+        # This input-only term can bind once even when shape selects the
+        # zero-observation density branch. Guard negative observations before log.
+        log_x::Float64 = x < 0 ? -Inf : log(x)
         (x >= 0 || isnan(x)) & (shape > 0) & (log_rate > -Inf) ?
             (x == Inf ? -Inf : shape * log_rate - log_shape_gamma +
-             (shape == 1 ? 0.0 : (shape - 1) * log(x)) - rate * x) :
+             (x == 0 && shape == 1 ? 0.0 : (shape - 1) * log_x) - rate * x) :
             -Inf
+    end
     cdf(x::Float64)::Float64 =
         x <= 0 ? 0.0 : first(gamma_inc(shape, rate * x))
     ccdf(x::Float64)::Float64 =
