@@ -8,6 +8,7 @@ using SequentialMonteCarlo: SMCModel, SMCIO, smc!
 using WarmupHMC: FixedKernelNUTSState, fixed_kernel_nuts_step
 using WarmupHMC: ContinuousNUTSState, continuous_nuts_step
 import WarmupHMC, SequentialMonteCarlo, LogDensityProblems
+import LinearAlgebra
 import ReactiveKernelsPPL as PPL
 
 function _posterior_scale_in_basis(positions,weights,location,basis)
@@ -895,5 +896,6 @@ function PPL.resume_smc(target::AbstractSMCTarget, checkpoint; previous=nothing)
 end
 
 include("smc_filter.jl")
+include("smc_gaussian.jl")
 
 end
