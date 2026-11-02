@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.57
+
+- Add `prepare_smc(make_problem, u0; backend, model_id, binding_id, frame_id)`
+  for prepared LogDensityProblems densities with supplied gradients. The
+  factory rebuilds independent problem workspaces for pilots, production runs,
+  mutation workers, updates and resume. Reuse Gaussian-reference tempering,
+  fixed tuning schedules and nonfinite diagnostics; checkpoints retain data
+  and explicit identities without serializing the factory or solver state.
+
 ## 0.1.56
 
 - Recognize calibrated arrays of any rank and `eachrow`/`eachcol` slice

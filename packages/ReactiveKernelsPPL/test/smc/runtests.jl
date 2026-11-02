@@ -263,6 +263,7 @@ end
 end
 
 include("nonfinite.jl")
+include("prepared_logdensity.jl")
 
 @testset "Fresh-process checkpoint continuation" begin
     mktempdir() do directory
