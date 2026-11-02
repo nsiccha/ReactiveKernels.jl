@@ -288,6 +288,7 @@ struct SMCStage
     coordinate_sd::Vector{Float64}
     reference_sd::Union{Nothing,Vector{Float64}}
     nthreads::Int
+    kind::Symbol
 end
 Base.:(==)(a::SMCStage, b::SMCStage) =
     all(getfield(a, k) == getfield(b, k) for k in fieldnames(SMCStage))
@@ -627,10 +628,11 @@ function _mutate_particles!(positions, state, ancestors, seeds, target, options,
     return (; divergences, evaluations, movement, acceptance)
 end
 
-function _mutation!(positions, state, ancestors, seeds, beta)
+function _mutation!(positions, state, ancestors, seeds, beta;
+        kernel=first(_stage_kernel(state.options, size(positions, 1), beta)))
     d, n = size(positions)
     d == 0 && return (0, 0, 0.0, nothing, 1)
-    options, _ = _stage_kernel(state.options, d, beta)
+    options = kernel
     target = BridgeTarget(state.source, state.target, beta, d)
     workers = min(state.options.nthreads, Threads.nthreads(), n)
     targets = [i == 1 ? target : _worker_target(target) for i in 1:workers]
@@ -708,7 +710,32 @@ function _library_stage(state, beta, delta, seed)
         divergences, evaluations, movement, acceptance, workers
 end
 
+# Compare values, not variances (roundoff can give identical columns a nonzero
+# variance), ancestry, or density ratios (which may legitimately be constant).
+function _collapsed(positions)
+    d, n = size(positions)
+    d == 0 && return false
+    for j in 2:n, i in 1:d
+        positions[i,j] == positions[i,1] || return false
+    end
+    return true
+end
+
+function _check_cloud(state, positions, phase, diagnostics=nothing)
+    _collapsed(positions) && throw(PPL.SMCDegeneracyError(state, phase, diagnostics))
+    return nothing
+end
+
+function _history(state, stage)
+    history = [state.history; stage]
+    if length(history) > state.options.history_limit
+        deleteat!(history, 1:length(history)-state.options.history_limit)
+    end
+    return history
+end
+
 function PPL.smc_step(state::SMCState)
+    _check_cloud(state, state.positions, :input)
     state.temperature == 1 && return state
     state.stage < state.options.max_stages || throw(ArgumentError(
         "SMC reached max_stages before temperature 1; the input state is preserved"))
@@ -736,18 +763,42 @@ function PPL.smc_step(state::SMCState)
         length(Set(ancestors)), length(Set(lineage)), d == 0 ? 0 : n*kernel.moves,
         divergences, deepcopy(kernel), tuning_index, evaluations, movement, acceptance,
         _cloud_sd(positions),
-        state.source isa ReferenceTarget ? copy(state.source.standard_deviation) : nothing, workers)
-    history = [state.history; stage]
-    if length(history) > state.options.history_limit
-        deleteat!(history, 1:length(history)-state.options.history_limit)
-    end
+        state.source isa ReferenceTarget ? copy(state.source.standard_deviation) : nothing,
+        workers, :temper)
+    _check_cloud(state, positions, :stage, stage)
     return SMCState(state.source, state.target, positions, fill(1/n, n), beta,
         log_normalizer, rng, state.options, ancestors, lineage,
-        history, state.update, state.stage+1)
+        _history(state, stage), state.update, state.stage+1)
+end
+
+function PPL.rejuvenate_smc(state::SMCState; tuning::SMCTuningSchedule, moves::Integer)
+    moves >= 1 || throw(ArgumentError("rejuvenation moves must be positive"))
+    d, n = size(state.positions)
+    fields = (; (name => getfield(state.options, name) for name in fieldnames(SMCOptions))...)
+    options = _options(SMCOptions(; fields..., tuning), d, state.source, state.target)
+    kernel, tuning_index = _stage_kernel(options, d, state.temperature)
+    kernel = merge(kernel, (; moves=Int(moves)))
+    rng = copy(state.rng)
+    ancestors = collect(1:n)
+    seeds = d == 0 ? UInt64[] : rand(rng, UInt64, n)
+    positions = similar(state.positions)
+    divergences, evaluations, movement, acceptance, workers =
+        _mutation!(positions, state, ancestors, seeds, state.temperature; kernel)
+    stage = SMCStage(state.update, state.stage, state.temperature, Float64(n), 0.0,
+        n, length(Set(state.lineage)), d == 0 ? 0 : n*kernel.moves,
+        divergences, deepcopy(kernel), tuning_index, evaluations, movement, acceptance,
+        _cloud_sd(positions),
+        state.source isa ReferenceTarget ? copy(state.source.standard_deviation) : nothing,
+        workers, :rejuvenate)
+    _check_cloud(state, positions, :rejuvenation, stage)
+    return SMCState(state.source, state.target, positions, copy(state.weights),
+        state.temperature, state.log_normalizer, rng, options, ancestors,
+        copy(state.lineage), _history(state, stage), state.update, state.stage)
 end
 
 function PPL.smc(state::SMCState; stages::Integer=typemax(Int))
     stages >= 0 || throw(ArgumentError("stages must be nonnegative"))
+    _check_cloud(state, state.positions, :input)
     for _ in 1:stages
         state.temperature == 1 && break
         state = smc_step(state)
@@ -776,6 +827,7 @@ end
 
 function PPL.update_smc(previous::SMCState, target::AbstractSMCTarget;
         options=previous.options, stages::Integer=typemax(Int))
+    _check_cloud(previous, previous.positions, :input)
     previous.temperature == 1 || throw(ArgumentError("complete the previous bridge before updating data"))
     _compatible(previous.target.signature, target.signature)
     d, n = size(previous.positions)
