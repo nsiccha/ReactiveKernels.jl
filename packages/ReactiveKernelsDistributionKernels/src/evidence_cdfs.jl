@@ -19,8 +19,8 @@ ReactiveKernels.@_record_source function _ordinal_logistic_logcdf(z)
 end
 _ordinal_logcdf(::Val{:logit}, z) = _ordinal_logistic_logcdf(z)
 _ordinal_logccdf(::Val{:logit}, z) = _ordinal_logistic_logcdf(-z)
-_ordinal_logcdf(::Val{:probit}, z) = log(SpecialFunctions.erfc(-z / sqrt(2.0)) / 2)
-_ordinal_logccdf(::Val{:probit}, z) = log(SpecialFunctions.erfc(z / sqrt(2.0)) / 2)
+_ordinal_logcdf(::Val{:probit}, z) = _normal_logcdf(z)
+_ordinal_logccdf(::Val{:probit}, z) = _normal_logcdf(-z)
 _ordinal_logcdf(::Val{:cloglog}, z) = log(-expm1(-exp(z)))
 _ordinal_logccdf(::Val{:cloglog}, z) = -exp(z)
 @traceable _ordinal_effect(::Nothing, row, j) = 0.0

@@ -2296,7 +2296,7 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         push!(logweights, logw_k)
     end
     cell = foldl((a, b) -> :(logaddexp($a, $b)), terms)
-    function tail(b, upper)
+    function tail(b, upper, logspace=false)
         pieces = map(eachindex(distributions)) do k
             dist = distributions[k]
             t = if f === BernoulliLogitFam
@@ -2305,12 +2305,15 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
             else
                 upper ? :($dist.ccdf($b)) : :($dist.cdf($b))
             end
-            :(exp($(logweights[k])) * $t)
+            logspace ? :($(logweights[k]) + $(_evidence_logtail(t))) :
+                :(exp($(logweights[k])) * $t)
         end
-        foldl((a, b) -> :($a + $b), pieces)
+        logspace ? foldl((a, b) -> :(logaddexp($a, $b)), pieces) :
+            foldl((a, b) -> :($a + $b), pieces)
     end
     cell = _wrap_evidence!(r, plan, pre, inputs, cell;
-        cdf=b -> tail(b, false), ccdf=b -> tail(b, true))
+        cdf=b -> tail(b, false), ccdf=b -> tail(b, true),
+        logcdf=b -> tail(b, false, true), logccdf=b -> tail(b, true, true))
     if !isempty(parameter_guards)
         valid = foldl((a, b) -> :($a && $b), parameter_guards)
         shared = r.weights === nothing && r.range === nothing && r.mi_jobs === nothing ?
@@ -3874,25 +3877,20 @@ end
 # one-sided forms evaluated both, doubling every ordinal cell's work.
 _log_inv_logit(z) = :(-log1pexp(-$z))
 
-# Ordinal link log-CDF / log-CCDF over a scalar z (SB `brm_ordinal_logcdf`
-# / `brm_ordinal_logccdf`). Probit uses the slice-1 erfc treatment
-# (`0.5*erfc(∓z/√2)` under a log — accurate in moderate ranges; extreme
-# tails round, the accepted slice-1 probit caveat).
+# Ordinal link log-CDF / log-CCDF over a scalar z. Probit shares the
+# distribution's stable log tails with ordinary Normal evidence.
 function _ordinal_logF(link::LinkFunction, z)
     link === LogitLink && return _log_inv_logit(z)
-    link === ProbitLink && return :(log(0.5 * erfc(-$z / sqrt(2))))
+    link === ProbitLink && return :(normal(0.0, 1.0).logcdf($z))
     return :(log(-expm1(-exp($z))))
 end
 function _ordinal_logCC(link::LinkFunction, z)
     link === LogitLink && return _log_inv_logit(:(-$z))
-    link === ProbitLink && return :(log(0.5 * erfc($z / sqrt(2))))
+    link === ProbitLink && return :(normal(0.0, 1.0).logccdf($z))
     return :(-exp($z))
 end
 
-# Log-difference of log-probs (a ≥ b): `a + log1p(-exp(b - a))`. It
-# cancels as b - a → 0⁻; only the probit and cloglog interior levels use it,
-# below the upper tail, whose mass their log-CDFs round away.
-_log_diff_exp(a, b) = :($a + log1p(-exp($b - $a)))
+_log_diff_exp(a, b) = _evidence_logdifference(a, b)
 
 # Interior cumulative level `F(hi) - F(lo)` (hi = d*(c[y] - eta) ≥
 # lo = d*(c[y-1] - eta); `gap` = d*(c[y-1] - c[y]) = lo - hi ≤ 0). Logit
@@ -4815,7 +4813,8 @@ function _family_logpdf_expr(family::Symbol, a, x; float64_variate::Bool = false
 end
 
 # Normalize the base density over the declared support. Symmetric halves
-# at literal zero add log(2); general bounds use the owned CDF endpoints.
+# at literal zero add log(2); general bounds share the observation log-mass
+# algebra, including the owned log-tail endpoints.
 function _support_correction(family::Symbol, ov::SupportOverride, argvals;
         pre::Vector{Expr} = Expr[], stem::Symbol = :prior)
     ov === nothing && return nothing
@@ -4823,21 +4822,11 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals;
     ov isa Tuple && ov[1] === :restricted_half && return :(log(2))
     if ov isa Tuple && ov[1] === :truncated
         lo, hi = ov[2], ov[3]
-        cdf(x) = _prior_endpoint_expr(family, argvals, :cdf, x)
-        ccdf(x) = _prior_endpoint_expr(family, argvals, :ccdf, x)
+        logcdf = x -> _evidence_logtail(_prior_endpoint_expr(family, argvals, :cdf, x))
+        logccdf = x -> _evidence_logtail(_prior_endpoint_expr(family, argvals, :ccdf, x))
         lo == -Inf && hi == Inf && return nothing
-        lo == -Inf && return :(-log($(cdf(hi))))
-        hi == Inf && return :(-log($(ccdf(lo))))
-        # Use the upper tails when both endpoints are in that tail. The
-        # branch is lazy, so an unused difference is never differentiated.
-        fl, fh, sl, sh = (Symbol(:_ppl_tail_, stem, suffix)
-            for suffix in (:_fl, :_fh, :_sl, :_sh))
-        append!(pre, Expr[:($fl::Float64 = $(cdf(lo))),
-            :($fh::Float64 = $(cdf(hi))), :($sl::Float64 = $(ccdf(lo))),
-            :($sh::Float64 = $(ccdf(hi)))])
-        # The CDF values are defined on both sides. Keep log itself lazy:
-        # a rounded-to-zero inactive difference must never be logged or AD'd.
-        return :($fl > 0.5 ? -log($sl - $sh) : -log($fh - $fl))
+        return :(-$(_evidence_logmass(logcdf, logccdf,
+            lo == -Inf ? nothing : lo, hi == Inf ? nothing : hi)))
     end
     if ov isa Tuple
         if ov[1] === :lower
@@ -4847,12 +4836,13 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals;
             lo = ov[2]
             lo isa Real && lo == 0 && return nothing
             m, s = argvals[1], argvals[2]
-            tail = _prior_endpoint_expr(:normal, Any[:(-$m), s], :cdf, :(-log($lo)))
-            return :(-log($tail))
+            tail = _evidence_logtail(_prior_endpoint_expr(
+                :normal, Any[:(-$m), s], :cdf, :(-log($lo))))
+            return :(-$tail)
         end
         if ov[1] === :upper
             family === :flat && return nothing
-            return :(-log($(_prior_endpoint_expr(family, argvals, :cdf, ov[2]))))
+            return :(-$(_evidence_logtail(_prior_endpoint_expr(family, argvals, :cdf, ov[2]))))
         end
         ov[1] === :interval || throw(ContractValidationError(
             "[generator] tuple support override must be (:interval, lo, hi), " *
@@ -4860,9 +4850,9 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals;
         family === :flat && return nothing  # improper: Jacobian only
         lo, hi = ov[2], ov[3]
         mu, s = argvals[1], argvals[2]
-        upper = _prior_endpoint_expr(:normal, Any[mu, s], :cdf, hi)
-        lower = _prior_endpoint_expr(:normal, Any[mu, s], :cdf, lo)
-        return :(-log($upper - $lower))
+        logcdf = x -> _evidence_logtail(_prior_endpoint_expr(:normal, Any[mu, s], :cdf, x))
+        logccdf = x -> _evidence_logtail(_prior_endpoint_expr(:normal, Any[mu, s], :ccdf, x))
+        return :(-$(_evidence_logmass(logcdf, logccdf, lo, hi)))
     end
     ov === :positive || throw(ContractValidationError(
         "[generator] support override must be :positive, got $ov"))

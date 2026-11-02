@@ -3083,8 +3083,17 @@ Base.@nospecializeinfer function _plate_branch_with_source_graphs(
     CI, TI, EI = (typeof(branch)::DataType).parameters
     child(arm, entry) = arm isa _KernelBranch && entry isa NamedTuple ?
         _plate_branch_with_source_graphs(arm, entry, mod) : arm
-    spec(arm, entry) = arm isa _KernelBranch ? nothing :
-        (entry isa Expr ? _kernel_eval_construction(mod, entry) : nothing)
+    function spec(@nospecialize(arm), entry)
+        arm isa _KernelBranch && return nothing
+        entry isa Expr || return nothing
+        record = _source_record(arm)
+        # Julia-owned lexical scopes (in particular shared Core.Box cells)
+        # keep their original callable, as in source inlining. Reconstructing
+        # a local binding from a Box value would change what that name reads.
+        record === nothing || _source_native(record) === nothing || return nothing
+        captures = record === nothing ? NamedTuple() : _source_captures(record)
+        _kernel_eval_construction(mod, entry, captures)
+    end
     _KernelBranch(Val(CI), Val(TI), Val(EI), branch.call, branch.condition,
         child(branch.then_arm, entries.then_arm),
         child(branch.else_arm, entries.else_arm),
