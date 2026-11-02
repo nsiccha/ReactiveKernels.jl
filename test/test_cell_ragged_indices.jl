@@ -22,6 +22,31 @@ end
     end
 end
 
+@kernel logical_masks(z::Vector{Float64}, masks::AbstractVector{<:AbstractVector{Bool}},
+                      selected::Vector{Int}) = begin
+    field = 2 .* z
+    groups = plate(masks) do mask
+        sum(field[mask])
+    end
+    density = plate(selected) do i
+        groups[i]
+    end
+end
+
+@testset "logical masks are not proved as ragged position vectors" begin
+    z = [0.1, 0.2, 0.3, 0.4]
+    selected = [2, 1]
+    for vector in (Vector{Bool}, BitVector)
+        masks = [vector([true, false, true, false]), vector([false, true, false, true])]
+        bound = (; masks, selected)
+        full = prepare(logical_masks; have=(:z, :masks, :selected), want=:density, bound)
+        @test full(z) ≈ [sum(2 .* z[masks[i]]) for i in selected]
+        @test_throws PartitionLocalityError prepare(
+            plate_cell(logical_masks, :density; index=:i, locality=:error);
+            have=(:z, :masks, :selected, :i), want=:density_cell, bound)
+    end
+end
+
 const data = (ids=[4, 2, 1, 3, 2], coords=[[4, 2, 4], Int[], [6], [3, 1]],
               group_of=[3, 1, 5, 2, 4, 3], subject=[1, 2, 1, 2, 1, 2])
 const have = (:z, keys(data)...)

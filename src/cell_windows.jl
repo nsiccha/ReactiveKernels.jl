@@ -1410,8 +1410,11 @@ _cell_positions_type(T) =
 
 # An ordinary gather takes one integer per output row. A plate's element
 # can itself hold a vector of positions, including a bound per-cell cache.
+# A Boolean vector is a logical mask, not a vector of linear positions.
 _cell_index_type(op, T) = T <: AbstractVector{<:Integer}
-_cell_index_type(::_AuthoredPlateOp, T) = T <: AbstractVector && _cell_positions_type(T)
+_cell_index_type(::_AuthoredPlateOp, T) = T <: AbstractVector{<:Integer} ||
+    T <: AbstractVector{<:AbstractVector{<:Integer}} &&
+    typeintersect(eltype(eltype(T)), Bool) === Union{}
 
 # Resolve an unchanged outer-cell argument, including a linear index alias.
 function _cell_capture_root(inner::Plan, roots, input)
