@@ -180,13 +180,17 @@ struct CellFactorQuery{K,R,S}
     nsums::Int
 end
 
-function (q::CellFactorQuery)(u::AbstractVector{Float64}, a, b)
+function _check_cell_factor_args(q::CellFactorQuery, a)
     if q.outer
         a isa AbstractVector{Float64} || throw(ContractValidationError(
             "[query] an outer factor expects a Float64 sum vector and a cell"))
         length(a) == q.nsums || throw(ContractValidationError(
             "[query] expected $(q.nsums) sum values, got $(length(a))"))
     end
+    nothing
+end
+function (q::CellFactorQuery)(u::AbstractVector{Float64}, a, b)
+    _check_cell_factor_args(q, a)
     shared_values = Base.invokelatest(_refresh_cell_shared!, q.shared, u)
     Base.invokelatest(q.residual, u, a, b, shared_values...)::Float64
 end

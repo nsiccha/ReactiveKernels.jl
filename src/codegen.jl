@@ -4674,12 +4674,13 @@ function _lower_with_ops_collecting(p::Plan;
                          plate_element_types::Bool = false,
                          type_hints = nothing, exemplar_types = nothing,
                          footprint::Bool = false,
+                         footprint_selection = nothing,
                          partition_plan::Bool = false,
                          inline_sources::Bool = _inline_sources_enabled())
     # The footprint variant (`partition_footprint`, plate_partition.jl): the
     # body records every read of a HAVE port and returns them instead of the
     # wanted values.
-    footprint && return task_local_storage(_FOOTPRINT, _FootprintRecords()) do
+    footprint && return task_local_storage(_FOOTPRINT, _FootprintRecords(footprint_selection)) do
         _lower_with_ops_collecting(p; inline_embedded, declare, recycle, pushdowns, outline,
                                    plate_element_types, type_hints, exemplar_types, inline_sources)
     end

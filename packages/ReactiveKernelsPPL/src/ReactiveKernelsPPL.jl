@@ -89,6 +89,7 @@ export prepare_cell_factors, CellFactors, cell_reductions, reduction_rows,
     prepare_cell_factor_query, CellFactorQuery, prepare_cell_factor_ad, CellFactorAD
 export prepare_cell_pullback, CellPullback, cell_pullback!,
     prepare_cell_accumulator, CellAccumulator, accumulate_cell!
+export with_cell_batch, CellBatch
 export prepare_predictive, PredictiveQuery, PredictiveLaws, predictive_laws, predictive_draws!,
     predictive_draws, predictive_node, predictive_targets
 export restore_draws
@@ -101,6 +102,7 @@ export prepare_filter, initialize_filter, filter_step, filter_stream,
     filter_checkpoint, resume_filter, filter_parameter_names, filter_parameters
 export prepare_filter_smc, tune_filter_smc, initialize_filter_smc
 export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
+export sampling_distribution_graph
 export RKPPLModel, RKPPLBoundModel, RKPPLSubmodel, lower_rkppl, condition, @rkppl, SurfaceLoweringError
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
 export rk_expm
@@ -123,6 +125,7 @@ include("arrays.jl")
 include("query.jl")
 include("cell_factors.jl")
 include("cell_shared.jl")
+include("cell_batch.jl")
 include("density_factors.jl")
 include("predictive.jl")
 include("smc.jl")

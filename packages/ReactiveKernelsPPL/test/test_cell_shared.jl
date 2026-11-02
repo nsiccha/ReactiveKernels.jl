@@ -168,9 +168,15 @@ end
     q = prepare_cell_factor_ad(prepare_ad_third,f,1,u,[2],_CS_THIRD,([0.6],))
     a = prepare_cell_accumulator(q,_CS_THIRD,u;order=2)
     p = prepare_cell_pullback(f,_CS_REVERSE,u)
+    localterm = partition_footprint_kernel(term; shared=false)
+    localouter = partition_footprint_kernel(outer; shared=false)
     gradient = zeros(length(u))
     cell_pullback!(gradient,p,u) do batch
+        @test outer(batch,[sum(rate[data.rows[1]])],1) ≈ outer(u,[sum(rate[data.rows[1]])],1)
+        @test isempty(localouter(batch,[sum(rate[data.rows[1]])],1).unconstrained)
         for (j,r) in enumerate(data.rows[1])
+            @test term(batch,1,j) ≈ rate[r]
+            @test localterm(batch,1,j).unconstrained == [r+1]
             g, (hv,), (tv,) = ad_gradient_hvp_and_third(q, ([0.6],),
                 batch, u[[r+1]], [r+1], 1, j)
             @test g ≈ [rate[r]]

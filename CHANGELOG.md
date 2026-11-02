@@ -16,6 +16,29 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.58
+
+- Support local packed-coordinate footprint projection in RKPPL cell queries.
+  Footprint lowering can omit shared frontier ports and intersect constant
+  reads before expanding them, avoiding shared-block enumeration per cell.
+  Ordinary full structural footprints retain their existing semantics.
+
+## 0.1.57
+
+- Constructed RK object endpoints accept plate-local method arguments, as
+  their constructor arguments already do. A call such as
+  `normal(mu, sigma).logpdf(transformed)` may read `transformed` computed in
+  that cell, retaining its graph, lazy branches and native reverse derivatives.
+- Endpoint constructor and method arguments also recognize local assignments
+  inside lazy branch blocks, preserving their evaluation within the guard.
+
+## 0.1.56
+
+- Derive finite scalar recurrences from recorded `@traceable` vector helpers
+  for streaming consumers. Retain the original arithmetic, lazy branches,
+  output conversion and ordinary derivatives without executing the helper
+  during preparation or unrolling its data-dependent loop.
+
 ## 0.1.55
 
 - Compose shared upstream plates into selected consumers with independent
