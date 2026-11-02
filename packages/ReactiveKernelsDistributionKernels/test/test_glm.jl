@@ -223,12 +223,13 @@ end
         ku = prepare(poisson_log_glm.logpdf;
             have = (:y, :X, :beta), want = :logpdf, bound = (; X = X))
         sku = string(code_expr(ku))
-        @test occursin("logpdf__cterm", sku) && occursin(")(y)", sku)
+        @test occursin("logpdf__cterm", sku) && occursin("loggamma", sku)
         kb = prepare(poisson_log_glm.logpdf;
             have = (:y, :X, :beta), want = :logpdf, bound = (; X = X, y = y))
         skb = string(code_expr(kb))
-        @test occursin("logpdf__cterm", skb) && !occursin(")(y)", skb)
+        @test occursin("logpdf__cterm", skb) && !occursin("loggamma", skb)
         @test !occursin("Distributions", skb)
+        @test ku(y,beta) ≈ kb(beta) ≈ ref_total
     end
 
     @testset "lowered code is self-contained (no helper escapes)" begin
@@ -432,7 +433,7 @@ end
         ku = prepare(binomial_logit_glm.logpdf;
             have = (:y, :X, :beta, :N), want = :logpdf, bound = (; X = X))
         sku = string(code_expr(ku))
-        @test occursin("logpdf__lg", sku) && occursin(")(N, y)", sku)
+        @test occursin("logpdf__lg", sku) && occursin("loggamma", sku)
         kb = prepare(binomial_logit_glm.logpdf;
             have = (:y, :X, :beta, :N), want = :logpdf,
             bound = (; X = X, y = y, N = N))
@@ -440,8 +441,9 @@ end
         # The bound normalizer's sum folds too: the residual reads one
         # hoisted value and no longer the per-observation `lg` vector.
         @test occursin("logpdf_part", skb) && !occursin("logpdf__lg", skb) &&
-              !occursin(")(N, y)", skb)
+              !occursin("loggamma", skb)
         @test !occursin("Distributions", skb)
+        @test ku(y,beta,N) ≈ kb(beta) ≈ ref_total
     end
 
     @testset "lowered code is self-contained (no helper escapes)" begin

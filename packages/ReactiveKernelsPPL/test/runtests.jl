@@ -88,6 +88,7 @@ const _PPL_TEST_FILES = (
     "test_weibull_preparation.jl",
     "test_interval.jl",
     "test_interval_tails.jl",
+    "test_gamma_tails.jl",
     "test_varying_values.jl",
     "test_evidence_families.jl",
     "test_evidence_compositions.jl",
