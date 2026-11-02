@@ -85,6 +85,15 @@ end
         inputs=(:x,:index),groups=(;g=1:2))
     @test isempty(target.data)
     @test length(target.prototype) == 2
+    longx = [repeat(v,20) for v in x]
+    longy = [repeat(v,20) for v in y]
+    longindex = [collect(eachindex(v)) for v in longx]
+    longbound = model(;x=longx,index=longindex,pars...) | (;y=longy)
+    longtarget = prepare_filter(model,longbound;model_id="recorded-helper-long",parameters=pars,
+        inputs=(:x,:index),groups=(;g=1:2))
+    nodes(ex) = ex isa Expr ? 1 + sum(nodes,ex.args;init=0) : 1
+    @test nodes(target.program) == nodes(longtarget.program)
+    @test Base.summarysize(target.prototype) == Base.summarysize(longtarget.prototype)
     state = initialize_filter(target;rng=Xoshiro(6),particles=4,history_limit=2)
     paths = [filter_source_recurrence(v,pars.gain) for v in x]
     for t in 1:4

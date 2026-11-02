@@ -317,7 +317,12 @@ function _score(laws::AbstractArray, observation::AbstractArray)
     return sum(map(PPL.sampling_logdensity, laws, observation))
 end
 
-function _site(c, lhs, rhs, sampled; group=nothing, time=nothing, seed=false)
+function _broadcast_score(law, observation)
+    law isa AbstractArray && observation isa AbstractArray && return _score(law,observation)
+    return sum(broadcast(PPL.sampling_logdensity,law isa AbstractArray ? law : Ref(law),observation))
+end
+
+function _site(c, lhs, rhs, sampled; group=nothing, time=nothing, seed=false, broadcasted=false)
     nm = lhs isa Symbol ? lhs : lhs.args[1]
     observed = nm in c.observations
     value = if sampled
@@ -329,7 +334,7 @@ function _site(c, lhs, rhs, sampled; group=nothing, time=nothing, seed=false)
             absent = haskey(c.states,nm) ? _call(GlobalRef(Random,:rand),:_filter_rng,law) : nothing
             return quote
                 if hasproperty(_filter_observation,$(QuoteNode(nm))) && !ismissing($obs)
-                    _filter_score += $(_global(:_score))($law,$obs)
+                    _filter_score += $(_global(broadcasted ? :_broadcast_score : :_score))($law,$obs)
                     $lhs = $obs
                 else
                     $lhs = $absent
@@ -584,7 +589,7 @@ function _compile_block!(c, block; group=nothing, required=Set{Symbol}())
             name in c.observations || _fail("static declaration $lhs needs a calibrated parameter value")
             lhs isa Symbol || Meta.isexpr(lhs, :ref, 2) || _fail(
                 "observation declaration $lhs needs a scalar or one group index")
-            push!(result, _site(c, name, rhs, true; group))
+            push!(result, _site(c, name, rhs, true; group,broadcasted=st.args[1]===Symbol(".~")))
         else
             _fail("unsupported finite-state model statement: $st")
         end

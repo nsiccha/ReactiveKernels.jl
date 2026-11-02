@@ -50,6 +50,7 @@ end
     target = prepare_filter(model;model_id="broadcast-kernel-density",inputs=(:x,))
     state = initialize_filter(target;rng=Xoshiro(3),particles=2)
     @test filter_step(state,(;y=0.4);inputs=(;x=0.2)).predictive_logscore ≈ logpdf(Normal(0.2),0.4)
+    @test filter_step(state,(;y=[0.4]);inputs=(;x=0.2)).predictive_logscore ≈ logpdf(Normal(0.2),0.4)
     x, y = [0.2,-0.1], [0.4,0.3]
     @test filter_step(state,(;y);inputs=(;x)).predictive_logscore ≈ sum(logpdf.(Normal.(x),y))
     model = @rkppl begin
