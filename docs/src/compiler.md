@@ -1068,9 +1068,22 @@ rows read. A value is computed at rows only when every reader reads it this
 way, and it is computed once per cell, at all the rows its readers read: a
 predictor gathered by two index vectors in two definitions, or by a
 definition and a plate, runs once at both sets of rows, with everything
-upstream of it. A value read whole anywhere, wanted, or produced any other way (including
-through an opaque function call) is computed whole as before, also when it is
+upstream of it. A value read whole anywhere, wanted, or produced any other way
+is computed whole as before, also when it is
 an operand of a `vcat` whose read rows all fall in other operands.
+
+Ordinary Julia helpers can also supply a row form. A helper such as
+`gather(z, indices) = [z[i] for i in indices]`, including a straight-line
+wrapper calling it, runs only at the requested positions. The element body
+may combine several gathered arrays and scalar operations, for example
+`[scale * sin(z[i]) + z[i]^2 for i in indices]`. The analysis reads lowered
+Julia code without executing the helper, requires unambiguous helper dispatch,
+and proves that captured arrays are read only at the iterator's index.
+The supported iterator is a `Vector{<:Integer}` or standard integer range;
+custom iteration, filtered or nested comprehensions, cross-row reads and
+unproved helper bodies retain their ordinary whole-value path and locality
+checks. Emission retains a runtime loop and infers its fresh buffer from the
+actual prepared operand types. No model rewrite or derivative rule is needed.
 
 The full broadcast shape of each such expression, and the full shape of each
 `hcat`, is still checked from its operands' axes (`DimensionMismatch`), and the

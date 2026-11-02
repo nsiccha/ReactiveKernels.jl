@@ -239,6 +239,7 @@ const _PPL_TEST_FILES = (
     "test_inline_scalar_reads.jl",
     "test_authored_names.jl",
     "test_cell_query.jl",
+    "test_cell_helpers.jl",
     "test_branch_cell_footprints.jl",
     "test_partition_prefix.jl",
     "test_partition_prefix_strict.jl",

@@ -671,7 +671,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: logbeta
 # names in the assignment allowlist.
 using Statistics: mean, std, var
 using LinearAlgebra: dot
-using LogExpFunctions: log1pexp, logaddexp
+using LogExpFunctions: log1pexp
+# Keep finite-tie derivatives in mixture marginalization and the scalar /
+# dotted vocabulary, using the same primal as RK's streamed logsumexp fold.
+const logaddexp = ReactiveKernels._tie_exact_logaddexp
 # Plain `logistic` here is the Logistic distribution kernel object. Keep the
 # inverse link as ordinary stable math, including its differentiated graph:
 # differentiating a positive-tail exp(x)/(1 + exp(x)) produces Inf/Inf.

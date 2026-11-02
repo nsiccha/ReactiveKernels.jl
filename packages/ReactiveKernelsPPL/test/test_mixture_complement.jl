@@ -225,3 +225,42 @@ end
     u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
     _check_gradient(built.spec, bound, u)
 end
+
+@testset "complement mixture gradients at identical components" begin
+    # Corpus 81's all-zero initialization makes both components identical.
+    # Each gets half the likelihood gradient; the weight gradient is zero.
+    # Off-tie probes alone cannot detect a logaddexp implementation that
+    # replaces the difference of equal arguments by a constant.
+    prog = Meta.parse(read(joinpath(@__DIR__, "corpus", "81_mixture_complement.jl"), String))
+    for repeats in (0, 1, 4)
+        y = repeat([0.5, -1.0, 2.0], repeats)
+        bound, built, kern, lay = _mixc_query(prog, Dict{Symbol,AbstractVector}(:y => y))
+        u = unconstrain(lay, (; mu1=0.0, mu2=0.0, sigma1=1.0, sigma2=1.0, theta=0.5))
+        gradient = _check_gradient(built.spec, bound, u)
+        mean_gradient = sum(y) / 2
+        scale_gradient = (sum(abs2, y) - length(y)) / 2
+        @test gradient ≈ [mean_gradient, mean_gradient, scale_gradient, scale_gradient, 0.0] atol=1e-10
+        @test Base.invokelatest(kern, u) ≈
+            2logpdf(Normal(0, 2), 0.0) + 2logpdf(Exponential(1), 1.0) +
+            logpdf(Beta(5, 5), 0.5) + 2log(0.5) + sum(logpdf.(Normal(), y)) atol=1e-12
+    end
+end
+
+@testset "scalar and dotted logaddexp gradients at ties" begin
+    for location in (:(logaddexp(a, b)), :(logaddexp.(a .+ x, b .- x)))
+        prog = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            m = $location
+            y .~ Normal.(m, 1)
+        end
+        y = [0.4, 0.6, -0.2]
+        cols = Dict{Symbol,AbstractVector}(:y => y, :x => zeros(length(y)))
+        bound, built, kern, lay = _mixc_query(prog, cols)
+        u = zeros(lay.total)
+        gradient = _check_gradient(built.spec, bound, u)
+        @test gradient ≈ fill(sum(y .- log(2)) / 2, 2) atol=1e-10
+        @test Base.invokelatest(kern, u) ≈
+            2logpdf(Normal(), 0.0) + sum(logpdf.(Normal(log(2), 1), y)) atol=1e-12
+    end
+end
