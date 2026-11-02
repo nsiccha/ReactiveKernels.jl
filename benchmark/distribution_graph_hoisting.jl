@@ -4,7 +4,7 @@
 # Preparation is excluded. The compiler may optimize either implementation;
 # timings report the outcome rather than assuming every opaque call repeats work.
 # Run in an environment containing RK, DistributionKernels and Distributions:
-#   julia --project=<environment> benchmark/distribution_graph_hoisting.jl <output-dir>
+#   julia --project=<environment> benchmark/distribution_graph_hoisting.jl <output-dir> [family]
 module DistributionGraphHoisting
 using ReactiveKernels, ReactiveKernelsDistributionKernels, Statistics, TOML
 using SHA
@@ -62,10 +62,10 @@ function measure(f,q;repetitions=200)
     (; seconds=median(samples),allocated_bytes=@allocated(f(q)),checksum)
 end
 
-function run(output_dir)
+function run(output_dir;families=FAMILIES)
     mkpath(output_dir)
     rows = Dict{String,Any}[]
-    for (family,_,q) in FAMILIES, n in (1,64,1024)
+    for (family,_,q) in families, n in (1,64,1024)
         xs = [0.1 + 0.03mod(i,31) for i in 1:n]
         saved = copy(xs)
         owned = prepare(getfield(@__MODULE__,Symbol(family,:_owned));bound=(;xs))
@@ -104,4 +104,8 @@ function run(output_dir)
 end
 end
 
-DistributionGraphHoisting.run(isempty(ARGS) ? mktempdir() : only(ARGS))
+length(ARGS) <= 2 || error("expected output directory and optional family name")
+selected = length(ARGS) == 2 ? filter(x -> string(first(x)) == ARGS[2],
+    DistributionGraphHoisting.FAMILIES) : DistributionGraphHoisting.FAMILIES
+isempty(selected) && error("unknown family: $(ARGS[2])")
+DistributionGraphHoisting.run(isempty(ARGS) ? mktempdir() : first(ARGS);families=selected)

@@ -171,6 +171,29 @@ shared concentrations and bound observations are visible to the planner.
 `dirichlet_multinomial_logdensity` is the extracted endpoint with positional
 arguments `(counts, n, alpha)`.
 
+## Measuring composition and binding
+
+`benchmark/distribution_graph_hoisting.jl <output-dir> [family]` compares
+owned Normal, LogNormal, Gamma, Exponential, Cauchy, Laplace and Logistic
+graphs with per-observation `Distributions.logpdf` calls. Observations are
+bound; distribution parameters change on every measured call. The Gamma
+graph exposes the observation logarithm separately from its shape-dependent
+density, so that logarithm can be computed at binding.
+
+`benchmark/distribution_composite_hoisting.jl <output-dir>` compares
+DirichletMultinomial event batches at two category counts and measures shared
+lower- and upper-truncated LogNormal variances in central and tail regions.
+Its moment baseline invokes the same public RK arithmetic through an ordinary
+scalar function. This comparison measures the effect of graph visibility;
+it is not a comparison with a different numerical approximation.
+
+Both scripts retain runtime observation loops, consume every result, check
+matching checksums, and save the actual `code_expr` for each evaluator beside
+a TOML measurement receipt. Preparation is excluded. The native compiler may
+optimize either path, so inspect the generated code together with timings
+and allocations. A speed difference alone does not establish which work
+was moved or how often it executes.
+
 ## Other standard location-scale families
 
 Cauchy and Laplace use exactly the same `location_scale` graph. Their examples
