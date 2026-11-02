@@ -31,6 +31,27 @@ Models with no carried state use the same path with empty carries. Temporal
 projected one row at a time, including constant `ones`/`zeros`/`fill` columns
 whose dimension is `length` of a stream port.
 
+Source-recorded `@traceable` helpers can also supply a finite recurrence:
+a vector output allocated with `Vector{T}(undef,length(x))` or `similar(x)`,
+one `for t in eachindex(x)` loop, scalar carries initialized before the loop,
+current-element reads and output writes, and a returned output vector. The
+compiler derives the carries and transition from that source, preserving its
+arithmetic and lazy branches. It never executes or unrolls the helper during
+preparation. This projection currently accepts Float64 temporal inputs and
+carries; whole-history seeds, arbitrary gathers, nested loops and loop-control
+transfers (`break`/`continue`) are not yet
+projected. A gather of the projected output must equal the group's current
+clock. These are compiler limitations, not requirements on ordinary helpers.
+
+For a grouped helper `path=helper(x[g],...)`, declare `inputs=(:x,:index,...)`
+for every changing covariate. Each step supplies one current value per group,
+for example `inputs=(;x=[0.2,0.4],index=[1,1])`. A broadcast scalar observation
+law accepts `(;y=[0.1,0.3])` or singleton cell vectors. Time covariates and
+warm-up inputs must be supplied; new observations do not invent them.
+Fixed vector events retain their axes and authored broadcasts. A direct
+multivariate law or whole-event `LogDensity` retains its vector computation,
+including a helper call, instead of treating event entries as time steps.
+
 `drifting` names sampled carried states that the author interprets as dynamic
 parameters. Their authored transitions define the dynamic-parameter model;
 there is no implicit parameter jitter or reinterpretation of old carries.
@@ -49,8 +70,7 @@ general whole-trajectory transformations are refused. Omitted observation names
 or `missing` entries skip conditioning but advance selected groups; omitted
 groups do not advance. Missing observed recurrence states are drawn from their
 authored law. Observation/input arrays retain the original group positions.
-Other whole-vector calls cannot be projected as elementwise work; author pointwise
-operations with broadcasts. Opaque scalar user functions must themselves have
+Other whole-vector calls cannot yet be projected as elementwise work. Opaque scalar user functions must themselves have
 bounded work/storage per invocation. Kernel-provider scans currently require
 scalar carry/output, invariant seeds/shared arguments and `include_init=false`.
 `model_id` must change with captured code, frozen preprocessing or semantics;

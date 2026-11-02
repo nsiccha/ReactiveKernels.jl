@@ -223,12 +223,13 @@ end
         ku = prepare(poisson_log_glm.logpdf;
             have = (:y, :X, :beta), want = :logpdf, bound = (; X = X))
         sku = string(code_expr(ku))
-        @test occursin("logpdf__cterm", sku) && occursin(")(y)", sku)
+        @test occursin("logpdf__cterm", sku) && occursin("loggamma", sku)
         kb = prepare(poisson_log_glm.logpdf;
             have = (:y, :X, :beta), want = :logpdf, bound = (; X = X, y = y))
         skb = string(code_expr(kb))
-        @test occursin("logpdf__cterm", skb) && !occursin(")(y)", skb)
+        @test occursin("logpdf__cterm", skb) && !occursin("loggamma", skb)
         @test !occursin("Distributions", skb)
+        @test ku(y,beta) ≈ kb(beta) ≈ ref_total
     end
 
     @testset "lowered code is self-contained (no helper escapes)" begin
@@ -432,7 +433,7 @@ end
         ku = prepare(binomial_logit_glm.logpdf;
             have = (:y, :X, :beta, :N), want = :logpdf, bound = (; X = X))
         sku = string(code_expr(ku))
-        @test occursin("logpdf__lg", sku) && occursin(")(N, y)", sku)
+        @test occursin("logpdf__lg", sku) && occursin("loggamma", sku)
         kb = prepare(binomial_logit_glm.logpdf;
             have = (:y, :X, :beta, :N), want = :logpdf,
             bound = (; X = X, y = y, N = N))
@@ -440,8 +441,9 @@ end
         # The bound normalizer's sum folds too: the residual reads one
         # hoisted value and no longer the per-observation `lg` vector.
         @test occursin("logpdf_part", skb) && !occursin("logpdf__lg", skb) &&
-              !occursin(")(N, y)", skb)
+              !occursin("loggamma", skb)
         @test !occursin("Distributions", skb)
+        @test ku(y,beta,N) ≈ kb(beta) ≈ ref_total
     end
 
     @testset "lowered code is self-contained (no helper escapes)" begin
@@ -553,15 +555,15 @@ end
             have = (:y, :X, :beta, :phi), want = :logpdf,
             bound = (; X = X, y = y))
         sku = string(code_expr(ku))
-        # phi free: lgp stays a live call on runtime (y, phi).
-        @test occursin("logpdf__lgp", sku) && occursin(")(y, phi)", sku)
+        # phi free: the log-gamma normalizer still depends on runtime phi.
+        @test occursin("logpdf__lgp", sku) && occursin("loggamma", sku)
         kb = prepare(neg_binomial_2_log_glm.logpdf;
             have = (:y, :X, :beta, :phi), want = :logpdf,
             bound = (; X = X, y = y, phi = phi0))
         skb = string(code_expr(kb))
         # phi bound: normalizer subexpressions fold into cached values;
         # the live logpdf__lgp binding may disappear during that lowering.
-        @test !occursin(")(y, phi)", skb)
+        @test !occursin("loggamma", skb)
         @test !occursin("Distributions", skb)
         for coefficients in (beta, [-0.3, 0.8])
             for precision in (0.7, phi0, 5.0)
