@@ -24,7 +24,7 @@ supplied active and fresh coordinates exactly. Inactive old coordinates are
 drawn from `q_old(inactive | active)`, including its correlations. The returned
 order is `smc_window_coordinates(target_or_state).joint`. The supplied RNG
 advances; no production RNG is consumed implicitly and the compact point is read only.
-Recovery allocates one full vector only when requested.
+Full-sized recovery storage is allocated only when requested.
 """
 function smc_recover end
 
@@ -82,6 +82,18 @@ function _smc_likelihood_terms(built, binding, u0)
         add!(spec.graph, () => output, () -> 0.0)
     else
         add!(spec.graph, Tuple(spec[t] for t in terms) => output, +)
+    end
+    if any(value -> value isa Real, values(pointwise))
+        # A scalar observation has no authored plate. Give its indexed
+        # inputs the same local read semantics as observation cells, using
+        # the existing factor-query scalar-read lowering. In particular,
+        # z[2] must not count the whole packed view producing z as active.
+        selected = ReactiveKernels.KernelSpec(spec.graph, copy(spec.ports),
+            copy(spec.port_order), collect(have), [want], nothing)
+        selected_plan = ReactiveKernels.plan(selected)
+        outputs = Set(v.id for recipe in selected_plan.recipes for v in recipe.outputs)
+        spec = ReactiveKernels._cell_factor_scalar_reads(selected, outputs;
+            bound=(; bindings...), locality=:error)
     end
     (; spec, have, want, bound=(; bindings...))
 end

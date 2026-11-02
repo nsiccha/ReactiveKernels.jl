@@ -24,7 +24,7 @@ end
 @testset "Scalar observation keeps its sparse authored support" begin
     source=quote
         z[1:nb] .~ Normal.(0,1)
-        y ~ Normal(z[block],1)
+        y ~ Normal(z[2],1)
     end
     f=F.build(3,2,1.4;source)
     old=F.calibration(f,SMCReference([0.2,-0.1,0.7],[0.6,0.8,1.1]))
