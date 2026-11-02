@@ -34,6 +34,47 @@ end
     return output
 end
 
+@traceable function filter_dispatch_recurrence(x::AbstractVector)
+    output = similar(x)
+    carry = 2.0
+    for t in eachindex(x)
+        carry = carry + x[t]
+        output[t] = carry
+    end
+    return output
+end
+@traceable function filter_dispatch_recurrence(x::Vector{Float64})
+    output = similar(x)
+    carry = 1.0
+    for t in eachindex(x)
+        carry = carry + x[t]
+        output[t] = carry
+    end
+    return output
+end
+
+@testset "Bound temporal types select the original helper method" begin
+    model = @rkppl begin
+        loc = filter_dispatch_recurrence(x)
+        y .~ Normal.(loc,0.5)
+    end
+    values = [0.2,0.3]
+    for x in (values,view(values,:))
+        y = [0.1,0.4]
+        bound = model(;x) | (;y)
+        target = prepare_filter(model,bound;model_id="bound-helper-method",inputs=(:x,))
+        state = initialize_filter(target;rng=Xoshiro(4),particles=2)
+        path = filter_dispatch_recurrence(x)
+        for t in eachindex(x)
+            state = filter_step(state,(;y=y[t]);inputs=(;x=x[t]))
+            @test state.predictive_logscore ≈ logpdf(Normal(path[t],0.5),y[t])
+        end
+    end
+    bound = model(;x=Float32.(values)) | (;y=[0.1,0.4])
+    @test_throws r"Float64 vector elements" prepare_filter(model,bound;
+        model_id="unsupported-helper-element-type",inputs=(:x,))
+end
+
 @testset "Helper projection preserves branches and whole vector events" begin
     model = @rkppl begin
         loc = filter_source_branch(x)
@@ -62,6 +103,19 @@ end
     @test isempty(target.prototype)
     state = initialize_filter(target;rng=Xoshiro(9),particles=2)
     @test filter_step(state,(;y);inputs=(;x)).predictive_logscore ≈ logpdf(MvNormal(path,covariance),y)
+    ambiguous = @rkppl begin
+        path = filter_source_branch(x)
+        @scan begin
+            h[1] = 0.0
+            for t in 2:T
+                h[t] = h[t-1] + path[t]
+            end
+        end
+        y .~ Normal.(h,0.5)
+        z ~ MvNormal(path,covariance)
+    end
+    @test_throws r"temporal axis is ambiguous" prepare_filter(ambiguous;
+        model_id="conflicting-event-and-time",observations=(:y,:z),inputs=(:x,),data=(;covariance))
 end
 
 @testset "Recorded helper recurrence, grouped gathers and exact continuation" begin

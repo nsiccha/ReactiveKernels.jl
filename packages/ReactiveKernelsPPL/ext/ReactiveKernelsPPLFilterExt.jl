@@ -121,7 +121,8 @@ function _source_type(c,ex;group=nothing)
     ex isa QuoteNode && return typeof(ex.value)
     ex isa Expr || return typeof(ex)
     if Meta.isexpr(ex,:ref)
-        group !== nothing && length(ex.args)==2 && ex.args[2]==group && ex.args[1] in c.inputs &&
+        group !== nothing && length(ex.args)==2 && ex.args[2]==group &&
+            ex.args[1] in c.inputs && !haskey(c.types,ex.args[1]) &&
             return Vector{Float64}
         T = _source_type(c,ex.args[1];group)
         indices = [_source_type(c,i;group) for i in ex.args[2:end]]
@@ -193,6 +194,10 @@ function _value(c, ex; time=nothing, seed=false, group=nothing, scalarize=false)
         return ex
     end
     ex isa Expr || return ex
+    if time !== nothing && Meta.isexpr(ex,:ref,2) && ex.args[2] == time &&
+            ex.args[1] in c.events && ex.args[1] in c.series
+        _fail("$(ex.args[1]) is required both as a whole event and at the scan's current time; its temporal axis is ambiguous")
+    end
     if Meta.isexpr(ex,:call)
         head = ex.args[1]
         provider = _provider(c,head)
@@ -220,11 +225,14 @@ function _value(c, ex; time=nothing, seed=false, group=nothing, scalarize=false)
             types = [_source_type(c,a;group) for a in ex.args[2:end]]
             source = Base.invokelatest(RK._traceable_source,typeof(provider),types...)
             if source !== nothing
+                flags = [_bare_series(c,a;group) for a in ex.args[2:end]]
+                all(!flag || T <: AbstractVector{Float64} for (flag,T) in zip(flags,types)) ||
+                    _fail("recorded helper temporal arguments currently require Float64 vector elements")
                 c.provider_count += 1
                 prefix = Symbol("helper",c.provider_count)
                 args = [_value(c,a;time,seed,group,scalarize) for a in ex.args[2:end]]
                 return RK._stream_helper_expression(source,args,
-                    [_bare_series(c,a;group) for a in ex.args[2:end]],
+                    flags,
                     (name,initial) -> _carry_storage(c,prefix,name,initial,group),:_filter_time)
             end
         end
@@ -615,13 +623,18 @@ function PPL.prepare_filter(model::RKPPLModel, bound::PPL.StructuralPlan;
     fixed = (; (public_name(n)=>v for (n,v) in bound.columns
         if !haskey(definitions,n) && public_name(n) ∉ excluded)...)
     frozen_values = (; (public_name(n)=>v for (n,v) in pairs(frozen.values))...)
-    return prepare_filter(model;observations,inputs,parameters,
+    input_types = (; (public_name(n)=>typeof(v) for (n,v) in bound.columns
+        if public_name(n) in inputs)...)
+    return _prepare_filter(model;observations,inputs,parameters,_input_types=input_types,
         data=merge(fixed,data),frozen=PPL.FrozenValues(frozen_values,(;)),kwargs...)
 end
 
-function PPL.prepare_filter(model::RKPPLModel; model_id::AbstractString,
+PPL.prepare_filter(model::RKPPLModel;kwargs...) = _prepare_filter(model;kwargs...)
+
+function _prepare_filter(model::RKPPLModel; model_id::AbstractString,
         observations=(:y,), inputs=(), parameters::NamedTuple=(;), data::NamedTuple=(;),
-        drifting=(), groups::NamedTuple=(;), frozen::PPL.FrozenValues=PPL.FrozenValues())
+        drifting=(), groups::NamedTuple=(;), frozen::PPL.FrozenValues=PPL.FrozenValues(),
+        _input_types::NamedTuple=(;))
     isempty(model_id) && _fail("model_id must identify source, captured code and frozen transforms")
     isempty(model.conditioned) || _fail("pass stream observations to filter_step, not a conditioned model")
     data = merge((; model.fixed...), data, frozen.values)
@@ -639,7 +652,8 @@ function PPL.prepare_filter(model::RKPPLModel; model_id::AbstractString,
         Dict{Symbol,Tuple{Symbol,Int,Any}}(), Pair{Symbol,Tuple{Int,Int}}[], Set{Symbol}(), Set{Symbol}(),
         model.mod,Any[],0,paths,Set{Symbol}((inputs...,observations...)),Set{Symbol}(),
         Set{Tuple{Symbol,Symbol}}(),Set{Symbol}(),
-        Dict{Symbol,Any}(get(private_names,n,n)=>typeof(v) for (n,v) in pairs(merge(parameters,data))))
+        merge(Dict{Symbol,Any}(get(private_names,n,n)=>typeof(v) for (n,v) in pairs(merge(parameters,data))),
+            Dict{Symbol,Any}(get(private_names,n,n)=>T for (n,T) in pairs(_input_types))))
     body = _compile_block!(c, ast)
     # Inspect the actual projected code, after horizon removal and frozen
     # substitution. Training observations, input columns and dead constants
