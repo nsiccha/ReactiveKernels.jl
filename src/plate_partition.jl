@@ -287,7 +287,9 @@ preparation applied (`plate_cell`'s `locality`); for a kernel prepared with
 """
 function partition_locality(kernel::PreparedKernel)
     p = _lowering_plan(kernel.plan)
-    q, cells = _cell_outlined_pushdowns(p)
+    signature = _exact_signature(kernel)
+    argument_types = signature === Nothing ? nothing : Any[fieldtypes(signature)...]
+    q, cells = _cell_outlined_pushdowns(p; argument_types)
     cells === nothing && return Any[]
     _cell_locality(q, cells)
 end
@@ -860,10 +862,23 @@ through `Base.invokelatest` when crossing Julia's world-age boundary.
 partition_footprint_kernel(kernel::PreparedKernel) = _partition_footprint_kernel(kernel, nothing)
 function _partition_footprint_kernel(kernel::PreparedKernel, selection)
     p = _lowering_plan(kernel.plan)
-    ast, constants, callables, recipes = _sharing_cell_plans() do
-        _lower_with_ops(p; footprint = true, footprint_selection = selection)
+    # Row demand uses the value kernel's type evidence and retains its call
+    # guard, except for a plan port: footprints recompute that bookkeeping
+    # and ignore the supplied plan (the documented placeholder is nothing).
+    exact_signature = _exact_signature(kernel)
+    exemplar_types = exact_signature === Nothing ? nothing : Any[fieldtypes(exact_signature)...]
+    if exemplar_types !== nothing
+        for r in p.recipes
+            r.op isa _AuthoredPlateCellOp && r.op.plan !== nothing || continue
+            position = findfirst(v -> v.name === r.op.plan, p.have)
+            position === nothing || (exemplar_types[position] = Any)
+        end
+        exact_signature = Tuple{exemplar_types...}
     end
-    _prepare(p, ast, constants, _native_table(ast, callables), recipes)
+    ast, constants, callables, recipes = _sharing_cell_plans() do
+        _lower_with_ops(p; footprint = true, footprint_selection = selection, exemplar_types)
+    end
+    _prepare(p, ast, constants, _native_table(ast, callables), recipes; exact_signature)
 end
 
 # ----------------------------------------------------------- separability

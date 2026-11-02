@@ -91,6 +91,7 @@ const _MATRIX_CORE_TESTS = (
     "test_product_cell_shapes.jl",
     "test_gather_column_shapes.jl",
     "test_scalar_cell_reads.jl",
+    "test_selected_producer_rows.jl",
     "test_scan_cell_captures.jl",
     "test_plate_partition.jl",
     "test_partition_prefix.jl",
