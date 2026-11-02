@@ -35,6 +35,12 @@ end
         saved = deepcopy(data)
         alpha = [0.2,0.5,0.3]
         f = prepare(dm_events;bound=(events=data,n=6))
+        reference = sum(Distributions.logpdf(Distributions.DirichletMultinomial(6,alpha),y)
+            for y in data)
+        @test f(alpha) ≈ reference
+        evaluator = string(code_expr(f))
+        @test occursin("bound_plate_logpdf__coefficient",evaluator)
+        @test !occursin("coefficient.normalizers",evaluator)
         g = DI.gradient(f,DI.AutoEnzyme(;mode=Enzyme.Reverse),alpha)
         a0 = sum(alpha)
         expected = [sum(SpecialFunctions.digamma(a0)-SpecialFunctions.digamma(6+a0) +
@@ -46,6 +52,11 @@ end
         @test g ≈ fd rtol=1e-8 atol=1e-7
         @test data == saved
         @test alpha == [0.2,0.5,0.3]
+        other_data = [[6,0,0] for _ in 1:count]
+        rebound = prepare(dm_events;bound=(events=other_data,n=6))
+        @test rebound(alpha) ≈ count*Distributions.logpdf(
+            Distributions.DirichletMultinomial(6,alpha),[6,0,0])
+        @test f(alpha) ≈ reference
     end
 end
 end
