@@ -706,25 +706,31 @@ _partial_plate_recipe(g, recipe, known, op, rewrites) = nothing
 # The cell recipes that stay in the cell whatever is bound, or `nothing` when
 # the plate is left alone. Native scalar plate lowering expects one output per
 # recipe. Do not turn overlapping producer bindings or effects into a new
-# specialization boundary; the ordinary lowering remains authoritative. A
-# nested plate, scan or embedded kernel is never evaluated here: it stays in
-# the residual cell, lowered exactly as before, and only the cell's other
-# bound-only recipes are cached.
+# specialization boundary; the ordinary lowering remains authoritative.
+# Pure nested plates, scans and embedded kernels follow the same dependency
+# split as other recipes: an entirely bound call runs once during binding,
+# retaining its runtime loops, while a call with live inputs stays in the cell.
 function _partial_plate_excluded(inner::Plan)
     assigned = Set(canon_id(inner.graph, v.id) for v in inner.have)
     excluded = Set{Int}()
     for r in inner.recipes
         r.effectful && return nothing
         length(r.outputs) == 1 || return nothing
-        if r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
-           _embedded_kernel(r.op) !== nothing
-            push!(excluded, r.id)
-        end
         cid = canon_id(inner.graph, only(r.outputs).id)
         cid in assigned && return nothing
         push!(assigned, cid)
     end
     excluded
+end
+
+# Structured operations' fallback calls can infer only an abstract array,
+# even when their authored graphs prove the element and allocation types.
+# Use the same graph walk as native lowering's type check for these prefix
+# nodes.
+_partial_prefix_type(op, types) = Base.promote_op(op, types...)
+function _partial_prefix_type(op::Union{_AuthoredPlateOp,_AuthoredScanOp,PreparedKernel}, types)
+    T = _checked_recipe_type!(_UninferredValue[], op, types, Symbol[])
+    T === nothing ? Any : T
 end
 
 # What a plate's analysis follows from besides the plate itself: the plate
@@ -909,8 +915,8 @@ Base.@nospecializeinfer function _partial_plate_analysis(
         # any top-level hoisted value or bound array.
         cell_types = copy(bound_types)
         for r in selected
-            T = Base.promote_op(r.op,
-                (cell_types[canon_id(inner.graph, v.id)] for v in r.inputs)...)
+            T = _partial_prefix_type(r.op,
+                Any[cell_types[canon_id(inner.graph, v.id)] for v in r.inputs])
             isconcretetype(T) || return nothing
             cell_types[canon_id(inner.graph, only(r.outputs).id)] = T
         end
