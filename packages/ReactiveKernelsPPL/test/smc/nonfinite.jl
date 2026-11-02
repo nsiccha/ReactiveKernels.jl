@@ -29,7 +29,9 @@ end
 
 function state_for(source, target; temperature=0.0)
     n = 4
-    EXT.SMCState(source, target, zeros(1,n), fill(1/n,n), temperature, 0.0,
+    # Keep the first particle at zero for the exact diagnostic assertions,
+    # but exercise numerical failures from a cloud that has not collapsed.
+    EXT.SMCState(source, target, reshape(collect(0.0:n-1),1,n), fill(1/n,n), temperature, 0.0,
         Xoshiro(741), SMCOptions(moves=1), collect(1:n), collect(1:n), EXT.SMCStage[], 0, 0)
 end
 

@@ -371,6 +371,36 @@ Base.show(io::IO, err::SMCNonfiniteError) = showerror(io, err)
 Base.showerror(io::IO, err::SMCNonfiniteError, bt; backtrace=true) = showerror(io, err)
 
 """
+    SMCDegeneracyError <: Exception
+
+All particle positions are exactly equal in a positive-dimensional SMC cloud.
+`state` is the preserved input state (not a copy; treat it as read-only), including
+its unchanged continuation RNG and normalizer. `phase` is `:input`, `:stage` or
+`:rejuvenation`. `diagnostics` is the rejected stage summary, or `nothing` when
+the input itself was collapsed. A rejected stage is not appended to `state.history`.
+
+This detects full spatial collapse, not partial degeneracy or inadequate mixing.
+Constant density ratios, a constant coordinate, a single initial ancestor and
+zero movement alone do not trigger it. Zero-dimensional targets are exempt.
+Use independently prepared tuning with [`rejuvenate_smc`](@ref) to attempt
+recovery; a failure must not be treated as a completed posterior.
+"""
+struct SMCDegeneracyError{S,D} <: Exception
+    state::S
+    phase::Symbol
+    diagnostics::D
+end
+
+function Base.showerror(io::IO, err::SMCDegeneracyError)
+    print(io, "SMCDegeneracyError: all ", size(err.state.positions, 2),
+        " particles coincide (", err.phase, "), input temperature=", err.state.temperature,
+        ". Input state preserved in error.state; inspect error.diagnostics and use ",
+        "rejuvenate_smc with independently prepared tuning to attempt recovery.")
+end
+Base.show(io::IO, err::SMCDegeneracyError) = showerror(io, err)
+Base.showerror(io::IO, err::SMCDegeneracyError, bt; backtrace=true) = showerror(io, err)
+
+"""
     initialize_smc(target; rng, particles=1000,
         reference=SMCReference(zeros(d), ones(d)), options=SMCOptions())
 
@@ -392,6 +422,9 @@ is exactly 1. Positions are columns in the original unconstrained frame;
 `weights` are normalized. `log_normalizer` estimates the full target integral
 from the normalized reference. It is model evidence only when the authored
 density includes the necessary normalizing constants. No input state is mutated.
+An exactly collapsed positive-dimensional cloud throws [`SMCDegeneracyError`](@ref),
+including when supplied at temperature 1. Reaching temperature 1 does not otherwise
+certify convergence or adequate exploration.
 """
 function smc end
 
@@ -420,8 +453,38 @@ neither a large first temperature step nor a high ESS alone diagnoses coverage.
 threads and particles (one for a zero-dimensional target). Exact diagnostic
 replay requires the same available thread count as well as the same options.
 Failures propagate; the input state and its RNG remain usable.
+Full spatial collapse is checked before temperature selection and after mutation,
+including the final stage. It throws [`SMCDegeneracyError`](@ref) with the preserved
+input and, for a failed mutation, the rejected stage's diagnostics. Summary `kind`
+is `:temper` for this operation or `:rejuvenate` for explicit fixed-temperature work.
 """
 function smc_step end
+
+"""
+    rejuvenate_smc(state; tuning::SMCTuningSchedule, moves::Integer)
+
+Attempt recovery or additional exploration using exactly `moves` fixed-kernel
+NUTS transitions per particle at `state.temperature`. `tuning` must be prepared
+independently of the production particles, for these exact source/target endpoints
+and reference. Supply pilot initial positions and RNGs independently; include
+knots near the temperature needing recovery when calling `tune_smc`.
+
+There is no weighting, resampling, temperature advance, normalizer update, or
+movement-based stopping rule. Input state and RNG are preserved. The result owns
+new positions and RNG, identity `ancestors`, copied weights/lineage, and the newly
+validated schedule for subsequent `smc` stages. The requested `moves` overrides
+the selected kernel's move count for this call only. A bounded history entry with
+`kind=:rejuvenate` records the actual work and zero normalizer increment; `stage`
+still counts tempering stages, so recovery does not spend `max_stages`.
+Checkpoint/resume retains the new schedule and exact continuation without retuning.
+
+A still-collapsed result throws `SMCDegeneracyError` with the input state and the
+attempt's diagnostics. No automatic retry is made. Distinct output particles do
+not prove mixing; compare independent fits and posterior diagnostics. Rejuvenation
+cannot repair errors in normalizer increments accumulated before this call.
+Zero-dimensional targets perform no transitions and consume no RNG.
+"""
+function rejuvenate_smc end
 
 """
     update_smc(previous, target; options=previous.options, stages=typemax(Int))
