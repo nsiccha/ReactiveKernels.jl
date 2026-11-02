@@ -80,6 +80,22 @@ end
                 end
                 total::Float64 = sum(cells)
             end
+            @kernel base_law() = begin
+                logpdf(x::Float64)::Float64 = -x^2
+            end
+            @kernel scaled_law(base, scale::Float64) = begin
+                logpdf(x::Float64)::Float64 = begin
+                    z::Float64 = x / scale
+                    scale == 0 ? -Inf : base.logpdf(z) - log(scale)
+                end
+            end
+            @kernel simple_law = scaled_law(base_law)
+            @kernel captured_plate(x::Vector{Float64}, scale::Float64) = begin
+                cells = plate(x) do xi
+                    simple_law(scale).logpdf(xi)
+                end
+                return sum(cells)
+            end
             # `offset` is a top-level recipe closure, whose module the probe
             # reads (a bare call would use `scaled_log` itself as the recipe).
             const DEFINITION = :(generated(x::Vector{Float64}, scale::Float64) = begin
@@ -125,6 +141,9 @@ end
             const WAS_PRECOMPILED = ccall(:jl_generating_output, Cint, ()) != 0
             const PREPARED = prepare(ArmSource.endpoint_law_plate)
             const VALUE = PREPARED([-2.0, 1.0, -3.0, 0.5, 4.0], 2.0)
+            const CAPTURED = prepare(ArmSource.captured_plate;
+                bound = (x = [0.2, 0.7],))
+            const CAPTURED_VALUE = CAPTURED(1.0)
             const GENERATED = ReactiveKernels._kernel_eval_definition(ArmSource,
                 deepcopy(ArmSource.DEFINITION))
             const SYNTAX = ReactiveKernels._kernel_eval_definition(ArmSource,
@@ -170,6 +189,11 @@ end
             saved = copy(x)
             law(scale) = 5.0 + 5.5log(scale)
             @test ArmConsumer.VALUE ≈ law(2.0)
+            @test ArmConsumer.CAPTURED_VALUE ≈ -0.53
+            @test ArmConsumer.CAPTURED(2.0) ≈ -0.53 / 4 - 2log(2.0)
+            @test ArmConsumer.CAPTURED(0.0) == -Inf
+            @test prepare(ArmSource.captured_plate;
+                bound = (x = [1.0, 2.0, 3.0],))(1.0) == -14.0
             for scale in (0.5, 2.0, 3.0)
                 @test ArmConsumer.PREPARED(x, scale) ≈ law(scale)
                 @test prepare(ArmSource.endpoint_law_plate)(x, scale) ≈ law(scale)
