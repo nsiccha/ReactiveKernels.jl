@@ -38,6 +38,7 @@ isdefined(@__MODULE__, :InnerPlateSplit) ||
               RK._kernel_split_shape(ports, RK._kernel_split_nodes(normalizer, ports))
         # Cheap arithmetic alone is not worth a cached value.
         @test RK._kernel_split_nodes(:(y * logit + n - 1.0), ports) === nothing
+        @test RK._kernel_split_nodes(:(y[1] * logit + y[2]), ports) === nothing
         # Branch arms and short-circuit operands are not entered.
         @test RK._kernel_split_nodes(:(logit * (logit > 0 ? log(y) : 0.0)), ports) ===
               nothing

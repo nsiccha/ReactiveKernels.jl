@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.60
+## 0.1.61
 
 - Add `partitioned` to compact cell AD and cell factor preparation, caching
   shared-only whole-array producers while retaining strict local derivatives
@@ -25,7 +25,20 @@ are recorded in the git history only.
   and `accumulate_cell!`. Accumulate weighted local gradient, HVP and third
   contributions into shared cotangents, then apply the prefix pullback once
   per pass for exact mixed population derivatives with linear storage.
+  Local derivative verbs accept the active pass in place of their base
+  vector to avoid per-cell shared-coordinate scans.
   Require RK 0.1.54 for additive native Enzyme differentiation.
+
+## 0.1.60
+
+- Compute interval-censored likelihoods and truncated-prior normalizers
+  with shared log-space subtraction. Censored observations use the same
+  distribution log tails. Normal intervals in either far tail retain finite
+  log densities and ordinary native Reverse gradients; LogNormal and the
+  other closed-form log-tail families benefit from the same calculation.
+- Preserve log-space tail accumulation for mixture evidence and stable
+  Normal tails for probit ordinal observations. Interval endpoints and
+  censoring/truncation semantics are unchanged.
 
 ## 0.1.59
 
