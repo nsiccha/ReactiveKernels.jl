@@ -2302,18 +2302,15 @@ function _fuse_authored_plate_chains(original::Plan; cells_only = false)
             recipes[index] = nothing
             progressed = true
         end
-        # A plate read only by cells of other plates at one position
-        # (`plate_cell` values sharing an index port: one cell of several
-        # observations) composes into each of those cells, so each runs the
-        # plate's cell at that position instead of the whole plate.
+        # A plate read only by cells of other plates composes into each cell.
+        # Each consumer retains its own selected positions, so even disjoint
+        # selections run only the producer cells they actually read.
         for index in eachindex(recipes)
             found = consumers_of(index)
             found === nothing && continue
             cid, consumers = found
             length(consumers) >= 2 || continue
             all(c -> recipes[c].op isa _AuthoredPlateCellLike, consumers) || continue
-            length(unique(canon_id(p.graph, first(recipes[c].inputs).id)
-                for c in consumers)) == 1 || continue
             composed = [_compose_plate_into(p.graph, recipes[index], recipes[c], cid)
                 for c in consumers]
             any(isnothing, composed) && continue
