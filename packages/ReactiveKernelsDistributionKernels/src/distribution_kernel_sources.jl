@@ -1643,7 +1643,7 @@ docs_example = (;
 )
 """
 
-const LOGNORMAL_SOURCE = "using ReactiveKernelsDistributionKernels.DistributionKernelSources: standard_normal\n\n" *
+const LOGNORMAL_SOURCE = "using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, standard_normal\n\n" *
     LOGNORMAL_KERNEL_SOURCE * raw"""
 
 lognormal_kernel = prepare(lognormal.logpdf;
