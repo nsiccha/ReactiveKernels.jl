@@ -50,41 +50,43 @@ end
     end
     for (spec,upper,which) in ((lower_mean,false,1),(lower_var,false,2),
                                (upper_mean,true,1),(upper_var,true,2))
-        f = prepare(spec)
-        backend = DI.AutoEnzyme(;mode=Enzyme.Reverse)
-        for q in ([0.2,log(0.3),-0.1], [0.0,log(1e-3),0.01], [40.0,0.0,0.0])
-            before = copy(q)
-            g = DI.gradient(f,backend,q)
-            expected = setprecision(BigFloat,512) do
-                p = BigFloat.(q)
-                h = big"1e-40"
-                map(eachindex(p)) do i
-                    plus,minus = copy(p),copy(p)
-                    plus[i]+=h; minus[i]-=h
-                    (reference_moments(plus[1],exp(plus[2]),exp(plus[3]),upper)[which] -
-                     reference_moments(minus[1],exp(minus[2]),exp(minus[3]),upper)[which])/(2h)
+        @testset "native Reverse upper=$upper moment=$which" begin
+            f = prepare(spec)
+            backend = DI.AutoEnzyme(;mode=Enzyme.Reverse)
+            for q in ([0.2,log(0.3),-0.1], [0.0,log(1e-3),0.01], [40.0,0.0,0.0])
+                before = copy(q)
+                g = DI.gradient(f,backend,q)
+                expected = setprecision(BigFloat,512) do
+                    p = BigFloat.(q)
+                    h = big"1e-40"
+                    map(eachindex(p)) do i
+                        plus,minus = copy(p),copy(p)
+                        plus[i]+=h; minus[i]-=h
+                        (reference_moments(plus[1],exp(plus[2]),exp(plus[3]),upper)[which] -
+                         reference_moments(minus[1],exp(minus[2]),exp(minus[3]),upper)[which])/(2h)
+                    end
                 end
+                @test g ≈ Float64.(expected) rtol=2e-8 atol=1e-12
+                @test q == before
             end
-            @test g ≈ Float64.(expected) rtol=2e-8 atol=1e-12
-            @test q == before
         end
     end
-end
 
-@testset "LogNormal log tails retain extreme probabilities" begin
-    lcdf = prepare(extract(lognormal; have=(:x,:location,:scale),want=:logcdf))
-    lccdf = prepare(extract(lognormal; have=(:x,:location,:scale),want=:logccdf))
-    for z in (-1000.0,-40.0,-1.0,0.0,1.0,40.0,1000.0)
-        # x=1 permits a log-space displacement of 1000 without exp overflow.
-        expected = setprecision(BigFloat,256) do
-            log(SpecialFunctions.erfc(BigFloat(z)/sqrt(big(2)))/2)
+    @testset "LogNormal log tails retain extreme probabilities" begin
+        lcdf = prepare(extract(lognormal; have=(:x,:location,:scale),want=:logcdf))
+        lccdf = prepare(extract(lognormal; have=(:x,:location,:scale),want=:logccdf))
+        for z in (-1000.0,-40.0,-1.0,0.0,1.0,40.0,1000.0)
+            # x=1 permits a log-space displacement of 1000 without exp overflow.
+            expected = setprecision(BigFloat,256) do
+                log(SpecialFunctions.erfc(BigFloat(z)/sqrt(big(2)))/2)
+            end
+            @test lccdf(1.0,-z,1.0) ≈ Float64(expected) atol=1e-15 rtol=3e-15
+            @test lcdf(1.0,z,1.0) ≈ Float64(expected) atol=1e-15 rtol=3e-15
         end
-        @test lccdf(1.0,-z,1.0) ≈ Float64(expected) atol=1e-15 rtol=3e-15
-        @test lcdf(1.0,z,1.0) ≈ Float64(expected) atol=1e-15 rtol=3e-15
+        @test lcdf(0.0,0.0,1.0) == -Inf
+        @test lccdf(0.0,0.0,1.0) == 0.0
+        @test isnan(lcdf(NaN,0.0,1.0))
+        @test isnan(lccdf(NaN,0.0,1.0))
     end
-    @test lcdf(0.0,0.0,1.0) == -Inf
-    @test lccdf(0.0,0.0,1.0) == 0.0
-    @test isnan(lcdf(NaN,0.0,1.0))
-    @test isnan(lccdf(NaN,0.0,1.0))
 end
 end
