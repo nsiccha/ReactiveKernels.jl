@@ -9,7 +9,8 @@ using DifferentiationInterface: AutoEnzyme, SecondOrder
 # Helpers `_CQ_GROUPED`, `_cq_grouped_data`, `_cq_bound` and `_cq_central` come
 # from `test_cell_query.jl`.
 #
-# The backends are plain static Enzyme, reverse over forward (over forward).
+# The backends are plain static Enzyme: both Hessian compositions and
+# reverse over forward over forward for third-order contractions.
 # The compact overlay reads either a constant base entry or an active one;
 # registered Enzyme 0.13.216 refuses that read under static activity
 # (`EnzymeRuntimeActivityError`), and Enzyme `dogfood` repairs it from
@@ -25,6 +26,8 @@ using DifferentiationInterface: AutoEnzyme, SecondOrder
 
 const _CCD_SECOND = SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
                                 AutoEnzyme(; mode = Enzyme.Forward))
+const _CCD_FORWARD_REVERSE = SecondOrder(AutoEnzyme(; mode = Enzyme.Forward),
+                                        AutoEnzyme(; mode = Enzyme.Reverse))
 const _CCD_THIRD = SecondOrder(_CCD_SECOND, AutoEnzyme(; mode = Enzyme.Forward))
 
 # Runs `f()`; returns `nothing` when registered Enzyme refuses the overlay's
@@ -95,6 +98,8 @@ end
     v = [0.4, -0.7, 1.1, 0.3]
     h = prepare_compact_cell_ad(prepare_ad_hvp, built, bound, :y, u, selection(1),
         _CCD_SECOND, directions)
+    hf = prepare_compact_cell_ad(prepare_ad_hvp, built, bound, :y, u, selection(1),
+        _CCD_FORWARD_REVERSE, directions)
     t = prepare_compact_cell_ad(prepare_ad_third, built, bound, :y, u, selection(1),
         _CCD_THIRD, (v,))
     @test h isa CompactCellAD
@@ -113,6 +118,17 @@ end
             @test reduce(hcat, columns) ≈ H atol = 1e-12
             @test gh ≈ g atol = 1e-12
             @test q(overlaid, i) ≈ value atol = 1e-12
+            # Forward over reverse batches the directions through the reverse
+            # gradient. Preserve all mixed columns, including unused slots,
+            # when reusing the preparation at another point and cell.
+            gf, forward_columns = ad_gradient_and_hvp(hf, directions,
+                base, active, indices, i)
+            @test gf ≈ g atol = 1e-12
+            @test reduce(hcat, forward_columns) ≈ H atol = 1e-12
+            # The forward-over-reverse preparation fixes the direction tuple
+            # type; change its values while retaining its four directions.
+            mixed = (v, directions[2], directions[3], directions[4])
+            @test first(ad_hvp(hf, mixed, base, active, indices, i)) ≈ H * v atol = 1e-12
             gt, (hv,), (tv,) = ad_gradient_hvp_and_third(t, (v,), base, active, indices, i)
             @test gt ≈ g atol = 1e-12
             @test hv ≈ H * v atol = 1e-12
@@ -124,12 +140,20 @@ end
             ad_gradient_and_hvp!(h, gbuf, outs, directions, base, active, indices, i)
             @test gbuf ≈ g atol = 1e-12
             @test reduce(hcat, outs) ≈ H atol = 1e-12
+            fill!(gbuf, NaN)
+            foreach(out -> fill!(out, NaN), outs)
+            ad_gradient_and_hvp!(hf, gbuf, outs, directions, base, active, indices, i)
+            @test gbuf ≈ g atol = 1e-12
+            @test reduce(hcat, outs) ≈ H atol = 1e-12
             hout, tout = (zeros(m),), (zeros(m),)
             ad_gradient_hvp_and_third!(t, gbuf, hout, tout, (v,), base, active, indices, i)
             @test only(tout) ≈ third atol = 1e-12
             @test only(hout) ≈ H * v atol = 1e-12
             @test base == u
             @test indices == selection(i)
+            @test active == u[indices] .+ [0.05, -0.1, 0.2, 0.0]
+            @test directions == ntuple(k -> _ccd_unit(k, m), m)
+            @test v == [0.4, -0.7, 1.1, 0.3]
         end
     end
     # The trailing arguments are the compact sampler's.
@@ -154,6 +178,8 @@ end
     v = collect(range(0.3, -0.2; length = m))
     h = prepare_compact_cell_ad(prepare_ad_hvp, built, bound, :y, u, selection(1),
         _CCD_SECOND, directions)
+    hf = prepare_compact_cell_ad(prepare_ad_hvp, built, bound, :y, u, selection(1),
+        _CCD_FORWARD_REVERSE, directions)
     t = prepare_compact_cell_ad(prepare_ad_third, built, bound, :y, u, selection(1),
         _CCD_THIRD, (v,))
     dense = prepare_cell_sampler(built, bound, :y, u;
@@ -178,6 +204,10 @@ end
                 (cell_gradient(up, i) .- cell_gradient(down, i))[indices] ./ (2step)
             end for k in 1:m])
             @test H ≈ differences rtol = 1e-6 atol = 1e-7
+            gf, forward_columns = ad_gradient_and_hvp(hf, directions,
+                base, active, indices, i)
+            @test gf ≈ g
+            @test reduce(hcat, forward_columns) ≈ differences rtol = 1e-6 atol = 1e-7
             # ∇(vᵀ H v) against central differences of the exact vᵀ H v.
             quadratic(x) = dot(only(last(ad_gradient_and_hvp(h, (v,), base,
                 active .+ x, indices, i))), v)
