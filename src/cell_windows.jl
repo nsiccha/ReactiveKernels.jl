@@ -1725,6 +1725,22 @@ function _cell_input_views(p::Plan)
         else
             false
         end
+        # Flattening existing storage changes only its indexing. This also
+        # preserves provenance when a selected cell's body contains vec(data).
+        if !projection && !r.effectful && length(r.inputs) == 1 &&
+                length(r.outputs) == 1 && valtype(only(r.outputs)) === Any &&
+                cid(only(r.inputs)) in storage
+            analyzed = _cell_native(r; outlined = true)
+            if r.op === Base.vec
+                projection = true
+            elseif analyzed !== nothing
+                native, params, mod = analyzed
+                projection = Meta.isexpr(native, :call, 2) &&
+                    !_native_callee_shadowed(native.args[1], params) &&
+                    _cell_binding(native.args[1], mod) === Base.vec &&
+                    native.args[2] == only(params)
+            end
+        end
         if _cell_lazy_view(r.op) || projection
             union!(views, (cid(v) for v in r.outputs))
             union!(storage, (cid(v) for v in r.outputs))
@@ -2015,6 +2031,75 @@ function _cell_outline(p::Plan, outlines::Dict{Int,Any})
     _partial_subplan(template, p.have, p.want, recipes), outlined
 end
 
+# A selected producer cell may return an array whose reader asks for inner
+# rows. Expose that cell's pure body so the ordinary row forms can carry the
+# inner demand. Its input projections keep the outer index and the complete
+# broadcast domain (including absorbed checks); only projections of existing
+# storage are input-backed views. No data-sized domain is expanded here.
+function _cell_expand_selected(p::Plan, blocked, types)
+    selected = Set(r.id for r in p.recipes if r.id in blocked &&
+        r.op isa _AuthoredPlateCellOp && !r.op.rows && !r.effectful &&
+        !(get(types, canon_id(p.graph, only(r.outputs).id), Any) <: Number) &&
+        length(_plate_atomic(r.op.plate)) < length(r.op.plate.kernel.plan.have) &&
+        !isempty(r.op.plate.kernel.plan.recipes) &&
+        all(q -> !q.effectful, r.op.plate.kernel.plan.recipes))
+    isempty(selected) && return p
+    old = p.graph
+    g = Graph(copy(old.values), copy(old.recipes), copy(old.producers),
+              copy(old.aliases), old.version)
+    next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
+    freshid() = (id = next_id[]; next_id[] -= 1; id)
+    recipes = Recipe[]
+    for r in p.recipes
+        if !(r.id in selected)
+            push!(recipes, r)
+            continue
+        end
+        body = r.op.plate.kernel.plan
+        atomic = _plate_atomic(r.op.plate)
+        batched = [i for i in eachindex(body.have) if !(i in atomic)]
+        mapping = Dict{ValueId,Value}()
+        for (i, v) in enumerate(body.have)
+            mapping[canon_id(body.graph, v.id)] = if i in atomic
+                r.inputs[i + 1]
+            else
+                small = Graph()
+                roots = [value!(small, Symbol(:arg_, j), valtype(body.have[j])) for j in batched]
+                scalar = prepare(small; have = roots, want = roots[findfirst(==(i), batched)])
+                checks = Tuple(Tuple(findfirst(==(j), batched) for j in check)
+                               for check in r.op.plate.axis_checks)
+                plate = _AuthoredPlateOp{typeof(scalar),()}(scalar, checks)
+                output = value!(g, Symbol(only(r.outputs).name, :_input_, i), valtype(v))
+                push!(recipes, Recipe(freshid(),
+                    (first(r.inputs), Tuple(r.inputs[j + 1] for j in batched)...),
+                    (output,), _AuthoredPlateCellOp(plate, r.op.locality),
+                    r.cost, nothing, false, nothing))
+                output
+            end
+        end
+        for q in body.recipes, v in q.outputs
+            mapping[canon_id(body.graph, v.id)] =
+                value!(g, Symbol(only(r.outputs).name, :_, v.name), valtype(v))
+        end
+        mapped(v) = mapping[canon_id(body.graph, v.id)]
+        for q in body.recipes
+            push!(recipes, Recipe(freshid(), map(mapped, q.inputs), map(mapped, q.outputs),
+                                 q.op, q.cost, q.cse_key, q.effectful, q.source))
+        end
+        output = mapped(only(body.want))
+        target = only(r.outputs)
+        if valtype(target) === Any || valtype(target) === valtype(output)
+            g.aliases[canon_id(g, target.id)] = canon_id(g, output.id)
+            g.version += 1
+        else
+            push!(recipes, Recipe(r.id, (output,), r.outputs, identity,
+                                  0.0, nothing, false, output.name))
+        end
+    end
+    template = Plan(g, p.have, p.want, p.recipes, p.producer, p.cost, p.candidates)
+    _partial_subplan(template, p.have, p.want, recipes)
+end
+
 # A scalar vector index, proven from operand types. Inspect the resolved
 # getindex binding as for row forms; a shadowed function is not indexing.
 function _cell_scalar_index(native, params, mod, inputs, type_of)
@@ -2053,9 +2138,11 @@ end
 function _cell_scalar_reads(p::Plan; argument_types = nothing)
     types = _cell_value_types(p; argument_types)
     type_of(v) = get(types, canon_id(p.graph, v.id), Any)
-    # Input and bound arrays already support a scalar read without computing
-    # any other element. They need no implementation cell or extra report entry.
+    # Numeric input elements need no implementation cell. Array-valued
+    # elements do: the projection records their input-backed provenance when
+    # a downstream cell asks for rows inside that selected array.
     fixed = Set(canon_id(p.graph, v.id) for v in p.have)
+    union!(fixed, _cell_input_views(p))
     for r in p.recipes
         r.op isa _BoundConstant || continue
         union!(fixed, (canon_id(p.graph, v.id) for v in r.outputs))
@@ -2072,7 +2159,8 @@ function _cell_scalar_reads(p::Plan; argument_types = nothing)
         read = _cell_scalar_index(args...)
         read === nothing && return nothing
         cid = canon_id(p.graph, read.array.id)
-        cid in row_sources && !(cid in fixed) ? read : nothing
+        (cid in row_sources && !(cid in fixed) ||
+         cid in fixed && type_of(read.array) <: AbstractVector{<:AbstractArray}) ? read : nothing
     end
     outlines = Dict{Int,Any}()
     for r in p.recipes
@@ -2144,6 +2232,7 @@ function _cell_outlined_pushdowns(p::Plan; argument_types = nothing)
         end
     end
     p, scalar_outlined = _cell_scalar_reads(p; argument_types)
+    p = _fuse_authored_plate_chains(p; cells_only = true)
     known = IdDict{Recipe,Any}()
     byid = Dict(r.id => r for r in p.recipes)
     candidates = Dict{Int,Any}()
@@ -2156,6 +2245,9 @@ function _cell_outlined_pushdowns(p::Plan; argument_types = nothing)
         union!(outlined, scalar_outlined)
         blocked = Set{Int}()
         cells = _cell_pushdowns(q; argument_types, outlined, blocked, known)
+        cells === nothing && return q, cells
+        expanded = _cell_expand_selected(q, blocked, cells.types)
+        expanded === q || return _cell_outlined_pushdowns(expanded; argument_types)
         lost = Int[id for id in keys(kept) if cells === nothing || !(id in cells.recipes)]
         if !isempty(lost)
             union!(refused, lost)

@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.62
+
+- Carry row demand through a selected array-valued producer cell, preserving
+  both its outer index and the requested inner rows under strict locality.
+  Locality reports and footprint kernels retain a prepared kernel's exemplar
+  type evidence and call contract, preserving the ignored plan argument.
+
 ## 0.1.61
 
 - Supply compact Gaussian marginal, conditional and replacement algebra for
