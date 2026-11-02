@@ -66,7 +66,7 @@
 # indexed. A value is computed only at rows when every reader of it reads rows
 # this way, so the program computes no value twice in different ways. The
 # cell's batched element must be provably an integer (a linear position) or an
-# integer vector, each gather index provably an integer vector, and each array
+# integer vector, each ordinary gather index provably an integer vector, and each array
 # read at literal positions provably an array of numbers: by its declared type,
 # or by its producer's operands' types (`static_type` in `_cell_pushdowns`). A
 # recipe that holds one of these shapes inside one expression, such as a
@@ -1408,6 +1408,11 @@ end
 _cell_positions_type(T) =
     T <: AbstractArray{<:Integer} || T <: AbstractArray{<:AbstractVector{<:Integer}}
 
+# An ordinary gather takes one integer per output row. A plate's element
+# can itself hold a vector of positions, including a bound per-cell cache.
+_cell_index_type(op, T) = T <: AbstractVector{<:Integer}
+_cell_index_type(::_AuthoredPlateOp, T) = T <: AbstractVector && _cell_positions_type(T)
+
 # Resolve an unchanged outer-cell argument, including a linear index alias.
 function _cell_capture_root(inner::Plan, roots, input)
     ig = inner.graph
@@ -1798,7 +1803,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
         r = only(producers[cid])
         f = forms[r.id]
         all(zip(f.roles, r.inputs, f.gather_index)) do (role, input, paired)
-            role === :index ? static_type(input) <: AbstractVector{<:Integer} :
+            role === :index ? _cell_index_type(r.op, static_type(input)) :
             role === :factor ? static_type(input) <: AbstractArray || array_form(input) :
             role === :factor_leaf ? (static_type(input) <: AbstractArray || array_form(input)) &&
                 static_type(r.inputs[paired]) <: Union{AbstractVecOrMat,Number} :
@@ -2394,6 +2399,9 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
             ats = map(f.indices[j], f.vias[j]) do k, via
                 index = canon_id(d.graph, r.inputs[k].id)
                 at = _cell_operand_row!(e, index, U)
+                if via == 0 && r.op isa _AuthoredPlateOp
+                    return Expr(:call, _cell_ref(:_cell_partition_positions), at)
+                end
                 via == 0 ? Expr(:call, _cell_ref(:_cell_gather_row), at, U) :
                     Expr(:call, _cell_ref(r.op isa _AuthoredPlateOp ?
                         :_cell_capture_via_rows : :_cell_via_rows),
