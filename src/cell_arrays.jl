@@ -257,7 +257,8 @@ function _cell_array_broadcast_reads(x, names)
     !_cell_array_has(x, names) && return true
     x isa Symbol && return x in names
     x isa Expr && x.head === :call &&
-        _cell_array_function(x.args[1]) === Base.Broadcast.broadcasted || return false
+        _cell_array_function(x.args[1]) in (Base.Broadcast.broadcasted,
+                                          _native_broadcasted) || return false
     !_cell_array_has(x.args[2], names) &&
         all(a -> _cell_array_broadcast_reads(a, names), x.args[3:end])
 end
@@ -275,7 +276,8 @@ function _cell_array_child(x)
     producer = _cell_array_producer(x)
     producer === nothing || return producer
     if x isa Expr && x.head === :call &&
-            _cell_array_function(first(x.args)) === Base.Broadcast.broadcasted
+            _cell_array_function(first(x.args)) in (Base.Broadcast.broadcasted,
+                                                  _native_broadcasted)
         return Expr(:call, x.args[1], x.args[2], map(_cell_array_child, x.args[3:end])...)
     end
     x

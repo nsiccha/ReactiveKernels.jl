@@ -368,7 +368,10 @@ function _lane_source_node(ctx::_LaneSourceContext, node, ends)
         for arg in node.args
             rewritten = _lane_source_node(ctx, arg, ends)
             rewritten === nothing && return nothing
-            push!(args, rewritten)
+            # In `(; x)` and `f(; x)`, `x` is also the field/keyword label.
+            # Keep that label when its value becomes a scoped graph name.
+            push!(args, head === :parameters && arg isa Symbol ?
+                        Expr(:kw, arg, rewritten) : rewritten)
         end
         return Expr(head, args...)
     end

@@ -3090,7 +3090,7 @@ function _kernel_native_broadcasts(ex; in_dotted::Bool = false)
     any(arg -> arg isa Expr && arg.head === :parameters, arguments) && return ex
     # Match Julia's fusion boundary: a non-dotted parent materializes its
     # dotted children; only a directly nested dotted call stays lazy.
-    lazy = Expr(:call, GlobalRef(Base, :broadcasted), callee,
+    lazy = Expr(:call, GlobalRef(@__MODULE__, :_native_broadcasted), callee,
                 (_kernel_native_broadcasts(arg; in_dotted = true)
                  for arg in arguments)...)
     in_dotted && return lazy
@@ -4924,12 +4924,16 @@ end
 # Evaluate one already-expanded graph construction without compiling its
 # once-only recipe-construction groups. Plate lowering uses this for an arm
 # graph recovered from a constructed endpoint's authored recipe source.
-function _kernel_eval_construction(mod::Module, construction::Expr)
+function _kernel_eval_construction(mod::Module, construction::Expr,
+                                   @nospecialize(captures::NamedTuple = NamedTuple()))
     locals = Set{Symbol}()
     _kernel_construction_locals!(locals, construction)
     mod = _kernel_eval_module(mod, construction)
-    Core.eval(mod, Expr(:let, Expr(:block),
-                        _kernel_toplevel_construction(construction, mod, locals)))
+    # Bare exact callees are construction values rather than recipe closures;
+    # they read the same lexical environment as the separately built closures.
+    bindings = Any[Expr(:(=), name, QuoteNode(value)) for (name, value) in pairs(captures)]
+    Core.eval(mod, Expr(:let, Expr(:block, bindings...),
+                        _kernel_toplevel_construction(construction, mod, locals, captures)))
 end
 
 # While a package image is generated, Julia refuses evaluation into a module of
@@ -5053,20 +5057,29 @@ end
 
 # Inline the recipe groups and evaluate every closure the construction code
 # creates as its own top-level expression in `mod`.
-function _kernel_toplevel_construction(@nospecialize(ex), mod::Module, locals::Set{Symbol})
+function _kernel_toplevel_construction(@nospecialize(ex), mod::Module, locals::Set{Symbol},
+                                       @nospecialize(captures::NamedTuple = NamedTuple()))
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
     _kernel_is_group_call(ex) &&
-        return _kernel_toplevel_construction(ex.args[1].args[2], mod, locals)
+        return _kernel_toplevel_construction(ex.args[1].args[2], mod, locals, captures)
     if ex.head === :->
         _kernel_mentions_any(ex, locals) && throw(ArgumentError(
             "internal error: a @kernel recipe closure refers to a construction local; " *
             "it cannot be evaluated separately"))
-        return Expr(:call, GlobalRef(Core, :eval), mod, QuoteNode(ex))
+        # A recovered branch arm was authored in a lexical environment, not
+        # just in `mod`. Bind its free captures around each new closure so
+        # `_kernel_source_function` records them on the whole operation and
+        # on every split/ignore companion. Local binders still shadow them.
+        names = _kernel_free_ports(ex, Set{Symbol}(keys(captures)))
+        bindings = Any[Expr(:(=), name, QuoteNode(getfield(captures, name)))
+                       for name in names]
+        closure = isempty(bindings) ? ex : Expr(:let, Expr(:block, bindings...), ex)
+        return Expr(:call, GlobalRef(Core, :eval), mod, QuoteNode(closure))
     end
     args = Vector{Any}(undef, length(ex.args))
     for (index, arg) in enumerate(ex.args)
-        args[index] = _kernel_toplevel_construction(arg, mod, locals)
+        args[index] = _kernel_toplevel_construction(arg, mod, locals, captures)
     end
     Expr(ex.head, args...)
 end
