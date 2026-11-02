@@ -21,32 +21,57 @@ Both prepare the outer density (`:outer`) or one
 summand (reduction index `j`). With no sums the outer is the ordinary cell.
 The outer's sum inputs are independent values: their dependence on the packed
 point is supplied by the summand operators and the chain rule.
+
+Pass `partitioned = :z, u0 = u` to cache shared-only whole-array producers
+before factoring. Values refresh when the shared coordinates change. Compact
+factor AD then selects only partitioned coordinates. Mixed shared derivatives
+use [`prepare_cell_accumulator`](@ref) and [`cell_pullback!`](@ref); operators
+prepared from this factor family share one prefix cache and pullback pass.
 """
 function prepare_cell_factors(built, plan::StructuralPlan, observation::Symbol;
-        on_error = nothing, locality = nothing)
+        on_error = nothing, locality = nothing, partitioned = (), u0 = nothing)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_cell_factors requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
     _refuse_absent_cells(plan, (observation,))
     spec, want = _cell_query_spec(built, plan, (observation,); locality)
     have = (_query_have(plan)..., _CELL_PORT)
-    factors = ReactiveKernels._cell_factor_graph(spec, want;
-        have, bound = _query_bound(plan), on_error, locality)
+    rule = _query_partition_rule(plan, built.layout, partitioned, nothing)
+    parts = _query_shared_parts(spec, plan, have, want, rule, (_CELL_PORT,), on_error)
+    shared = isempty(rule) ? nothing : _make_cell_shared(parts, built.layout,
+        last(only(rule)), _query_exemplar(built.layout, u0), on_error)
+    factor_bound = _query_bound(plan)
+    factors = if parts === nothing
+        ReactiveKernels._cell_factor_graph(spec, want;
+            have, bound = factor_bound, on_error, locality)
+    else
+        Base.invokelatest(ReactiveKernels._cell_factor_graph, parts.residual,
+            spec.ports, spec.port_order; on_error, locality)
+    end
+    # Factoring exposes new expressions inside cells. Reintroduce the original
+    # data ports as bound HAVE values so ordinary partial evaluation can hoist
+    # those expressions too. The shared frontier stays a live HAVE boundary.
+    if parts !== nothing
+        for name in keys(factor_bound)
+            name in factors.spec.have_names || push!(factors.spec.have_names, name)
+        end
+    end
     reductions = map(factors.sums) do s
         rows = ReactiveKernels._cell_factor_rows(factors.spec, s.argument)
         rows === nothing && return nothing
         # Removing the packed point proves the row query is data-defined.
-        rowhave = Tuple(n for n in have if n !== :unconstrained)
+        rowhave = Tuple(n for n in factors.spec.have_names if n !== :unconstrained &&
+                        n ∉ _cell_frontier_names(shared))
         kernel = Base.invokelatest(prepare, factors.spec; have = rowhave,
-            want = rows, bound = _query_bound(plan), on_error)
+            want = rows, bound = factor_bound, on_error)
         (; s..., rows = kernel)
     end
     filter!(!isnothing, reductions)
     CellFactors(factors.spec, plan, built.layout, observation, want, reductions,
-                on_error, locality)
+                on_error, locality, shared)
 end
 
-struct CellFactors{S,P,L,R,E,C}
+struct CellFactors{S,P,L,R,E,C,H}
     spec::S
     plan::P
     layout::L
@@ -55,6 +80,7 @@ struct CellFactors{S,P,L,R,E,C}
     reductions::R
     on_error::E
     locality::C
+    shared::H
 end
 
 "Reduction names in the order used by the outer factor's sum vector."
@@ -127,16 +153,27 @@ vectors are converted to `Vector{Float64}`, as for `CellQuery`.
 function prepare_cell_factor_query(f::CellFactors, factor)
     spec, want = _cell_factor_spec(f, factor)
     outer = factor === :outer
-    have = outer ? (_query_have(f.plan)..., :_ppl_cell_sums, _CELL_PORT) :
-                   (_query_have(f.plan)..., _CELL_PORT, :_ppl_cell_term)
-    kernel = Base.invokelatest(prepare, spec; have, want,
-        bound = _query_bound(f.plan), on_error = f.on_error)
-    CellFactorQuery(kernel, outer, length(f.reductions))
+    frontiers = _cell_frontier_names(f.shared)
+    base_have = _query_have(f.plan)
+    tail = outer ? (:_ppl_cell_sums, _CELL_PORT) : (_CELL_PORT, :_ppl_cell_term)
+    have = (base_have..., tail..., frontiers...)
+    bound = _cell_factor_bound(f)
+    residual = Base.invokelatest(prepare, spec; have, want, bound, on_error = f.on_error)
+    kernel = if _cell_has_prefix(f.shared)
+        full = ReactiveKernels._cell_factor_full_spec(spec, f.shared.prefix_plan)
+        Base.invokelatest(prepare, full; have = (base_have..., tail...), want,
+                         bound, on_error = f.on_error)
+    else
+        residual
+    end
+    CellFactorQuery(kernel, residual, f.shared, outer, length(f.reductions))
 end
 
 "Scalar outer or summand query; construct with [`prepare_cell_factor_query`](@ref)."
-struct CellFactorQuery{K}
+struct CellFactorQuery{K,R,S}
     kernel::K
+    residual::R
+    shared::S
     outer::Bool
     nsums::Int
 end
@@ -148,7 +185,8 @@ function (q::CellFactorQuery)(u::AbstractVector{Float64}, a, b)
         length(a) == q.nsums || throw(ContractValidationError(
             "[query] expected $(q.nsums) sum values, got $(length(a))"))
     end
-    Base.invokelatest(q.kernel, u, a, b)::Float64
+    shared_values = Base.invokelatest(_refresh_cell_shared!, q.shared, u)
+    Base.invokelatest(q.residual, u, a, b, shared_values...)::Float64
 end
 (q::CellFactorQuery)(u::AbstractVector{<:Real}, a, b) = q(Vector{Float64}(u), a, b)
 
@@ -177,25 +215,30 @@ function prepare_cell_factor_ad(prepare_operator, f::CellFactors, factor,
         base0::AbstractVector{Float64}, indices0::AbstractVector{Int}, backend, exemplars...;
         cell0::Int = 1, term0::Int = 1)
     _check_compact_cell_indices(base0, indices0, indices0, f.layout.total)
+    _check_cell_local_selection(f.shared, indices0)
+    shared_values = Base.invokelatest(_refresh_cell_shared!, f.shared, base0)
     spec, want = _cell_factor_spec(f, factor)
     _compact_overlay!(spec, f.plan)
     outer = factor === :outer
     have = outer ?
         (:_ppl_cell_base, :_ppl_cell_sums, :_ppl_cell_active, :_ppl_cell_slots,
-         _query_columns(f.plan)..., _frozen_graph_names(f.plan)..., _CELL_PORT) :
+         _query_columns(f.plan)..., _frozen_graph_names(f.plan)..., _CELL_PORT,
+         _cell_frontier_names(f.shared)...) :
         (:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots,
-         _query_columns(f.plan)..., _frozen_graph_names(f.plan)..., _CELL_PORT, :_ppl_cell_term)
-    kernel = Base.invokelatest(prepare, spec; have, want, bound = _query_bound(f.plan),
+         _query_columns(f.plan)..., _frozen_graph_names(f.plan)..., _CELL_PORT, :_ppl_cell_term,
+         _cell_frontier_names(f.shared)...)
+    kernel = Base.invokelatest(prepare, spec; have, want, bound = _cell_factor_bound(f),
                               on_error = f.on_error)
     selected = Vector{Int}(indices0)
     slots = _compact_cell_slots(f.layout.total, selected)
     active0 = base0[indices0]
     sums0 = if outer && !isempty(f.reductions)
+        query_have = _query_have(f.plan)
         sumkernel = Base.invokelatest(prepare, f.spec;
-            have = (_query_have(f.plan)..., _CELL_PORT),
+            have = (query_have..., _CELL_PORT, _cell_frontier_names(f.shared)...),
             want = Tuple(r.value for r in f.reductions),
-            bound = _query_bound(f.plan), on_error = f.on_error)
-        values = Base.invokelatest(sumkernel, base0, cell0)
+            bound = _cell_factor_bound(f), on_error = f.on_error)
+        values = Base.invokelatest(sumkernel, base0, cell0, shared_values...)
         # A prepared kernel unwraps one WANT to a scalar. Collecting that
         # scalar would produce a zero-dimensional array, not the promised
         # one-element active sum vector.
@@ -206,17 +249,20 @@ function prepare_cell_factor_ad(prepare_operator, f::CellFactors, factor,
     point = outer ? (base0, sums0, active0, slots, cell0) :
                     (base0, active0, slots, cell0, term0)
     active = outer ? (:_ppl_cell_sums, :_ppl_cell_active) : :_ppl_cell_active
-    prepared = Base.invokelatest(prepare_operator, kernel, backend, exemplars..., point...; active)
-    CellFactorAD(prepared, f.layout, selected, slots, outer, length(f.reductions))
+    prepared = Base.invokelatest(prepare_operator, kernel, backend, exemplars...,
+        point..., shared_values...; active)
+    CellFactorAD(prepared, f.layout, selected, slots, outer, length(f.reductions), f.shared, sums0)
 end
 
-struct CellFactorAD{P,L}
+struct CellFactorAD{P,L,S}
     prepared::P
     layout::L
     selected::Vector{Int}
     slots::Vector{Int32}
     outer::Bool
     nsums::Int
+    shared::S
+    exemplar_sums::Vector{Float64}
 end
 
 for verb in (:ad_gradient, :ad_value_and_gradient, :ad_value_and_gradient!,
@@ -237,10 +283,14 @@ function _cell_factor_ad_call(verb, q::CellFactorAD, args::Vararg{Any,N}) where 
         length(sums) == q.nsums || throw(ContractValidationError(
             "[query] expected $(q.nsums) sum values, got $(length(sums))"))
         _select_compact_cells!(q, base, active, indices)
-        verb(q.prepared, leading..., base, sums, active, q.slots, cell)
+        _check_cell_local_selection(q.shared, indices)
+        shared_values = _refresh_cell_shared!(q.shared, base)
+        verb(q.prepared, leading..., base, sums, active, q.slots, cell, shared_values...)
     else
         base, active, indices, cell, term = args[N-4:N]
         _select_compact_cells!(q, base, active, indices)
-        verb(q.prepared, leading..., base, active, q.slots, cell, term)
+        _check_cell_local_selection(q.shared, indices)
+        shared_values = _refresh_cell_shared!(q.shared, base)
+        verb(q.prepared, leading..., base, active, q.slots, cell, term, shared_values...)
     end
 end

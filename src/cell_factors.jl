@@ -30,6 +30,13 @@ end
 function _cell_factor_graph(spec::KernelSpec, want; have = spec.have_names,
                             bound = NamedTuple(), on_error = nothing, locality = nothing)
     p = plan(spec; have, want)
+    _cell_factor_graph(p, spec.ports, spec.port_order; bound, on_error, locality)
+end
+
+# A shared-prefix cut is an authoritative selected plan. Do not replan from
+# its original graph: that would bring the removed shared producers back.
+function _cell_factor_graph(p::Plan, original_ports, original_order;
+                            bound = NamedTuple(), on_error = nothing, locality = nothing)
     # Prove aliases with the declared live input types, not dense stand-ins:
     # factor value queries also accept other arrays with those declarations.
     p = _cell_factor_aliases(p, Any[haskey(bound, v.name) ? typeof(bound[v.name]) :
@@ -78,7 +85,11 @@ function _cell_factor_graph(spec::KernelSpec, want; have = spec.have_names,
     original = p.graph
     g = Graph(copy(original.values), Recipe[], Dict{ValueId,Vector{Int}}(),
               copy(original.aliases), original.version, nothing)
-    ports, order = copy(spec.ports), copy(spec.port_order)
+    ports, order = copy(original_ports), copy(original_order)
+    for v in p.have
+        ports[v.name] = v
+        v.name in order || push!(order, v.name)
+    end
     serial = Ref(0)
     function fresh(label, type = Any)
         name = Symbol(:_rk_factor_, label, :_, (serial[] += 1))
@@ -221,6 +232,37 @@ function _cell_factor_graph(spec::KernelSpec, want; have = spec.have_names,
                         Symbol[v.name for v in p.want], nothing)
     result = _cell_factor_scalar_reads(result, cell_outputs; bound, locality)
     (; spec = result, sums)
+end
+
+# The public inspection kernel has the full dependency graph, while execution
+# uses the cut residual. Reconnect only the selected prefix recipes. Locality
+# here is descriptive; strict locality is checked on the executable residual.
+function _cell_factor_full_spec(spec::KernelSpec, prefix::Plan)
+    old = spec.graph
+    g = Graph(copy(old.values), Recipe[], Dict{ValueId,Vector{Int}}(),
+              copy(old.aliases), old.version, nothing)
+    assigned = Set{ValueId}()
+    for r in (prefix.recipes..., old.recipes...)
+        all(v -> canon_id(g, v.id) in assigned, r.outputs) && continue
+        op = r.op
+        if op isa _AuthoredPlateCellOp
+            op = _AuthoredPlateCellOp(op.plate, :ignore, op.rows,
+                op.partitioned, op.plan, op.plan_constant)
+        end
+        _add_recipe!(g, r.inputs, r.outputs, op, r.cost, r.cse_key, r.effectful, r.source)
+        union!(assigned, (canon_id(g, v.id) for v in r.outputs))
+    end
+    ports, order = copy(spec.ports), copy(spec.port_order)
+    for v in prefix.have
+        ports[v.name] = v
+        v.name in order || push!(order, v.name)
+    end
+    frontier = Set(v.name for v in prefix.want)
+    have = Symbol[n for n in spec.have_names if n ∉ frontier]
+    for v in prefix.have
+        v.name in have || push!(have, v.name)
+    end
+    KernelSpec(g, ports, order, have, copy(spec.want_names), nothing)
 end
 
 # Flattening a plate leaves scalar reads of shared arrays as ordinary recipes.

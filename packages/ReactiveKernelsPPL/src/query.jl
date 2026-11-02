@@ -1100,13 +1100,14 @@ other verbs [`QueryAD`](@ref) takes. Directions, gradients and results are over
 the selection, in `indices` order. `base` and `indices` are read only. Each
 call carries the `Base.invokelatest` barrier. Not thread-safe (one per caller).
 """
-mutable struct CompactCellAD{P,L,O}
+mutable struct CompactCellAD{P,L,O,S}
     const prepared::P
     const layout::L
     const observations::O
     # The selection `slots` maps, as for `CompactCellSampler`.
     const selected::Vector{Int}
     const slots::Vector{Int32}
+    const shared::S
 end
 
 """
@@ -1142,15 +1143,27 @@ contraction `D³ℓ[v, v, ·]` over the selection. At evaluation the selection m
 change, as for the compact sampler: the active vector and the selection keep
 the exemplar's type and length, and so do the directions. `locality` is as for
 [`prepare_cell_query`](@ref).
+
+With `partitioned = :z` (or the partition declaration accepted by cell
+queries), cache opaque whole-array computations that depend only on the
+remaining, shared coordinates. The compact selection must then contain only
+partitioned coordinates: these derivatives condition on the shared point.
+The cache refreshes when shared coordinates change. For exact mixed shared
+derivatives, prepare a [`prepare_cell_accumulator`](@ref) and accumulate a
+pass with [`cell_pullback!`](@ref), which applies the shared prefix's pullback
+once after collecting all cell contributions.
 """
 function prepare_compact_cell_ad(prepare_operator, built, plan::StructuralPlan, observations,
         base0::AbstractVector{Float64}, indices0::AbstractVector{Int}, backend, exemplars...;
-        on_error = nothing, locality = nothing)
+        on_error = nothing, locality = nothing, partitioned = ())
+    isempty(_query_partition_rule(plan, built.layout, partitioned, nothing)) ||
+        return _prepare_shared_compact_ad(prepare_operator, built, plan, observations,
+            base0, indices0, backend, exemplars...; on_error, locality, partitioned)
     c = _prepare_compact_cell(:prepare_compact_cell_ad, built, plan, observations,
         base0, indices0; on_error, locality)
     prepared = Base.invokelatest(prepare_operator, c.kernel, backend, exemplars...,
         base0, c.active0, c.slots, 1; active = :_ppl_cell_active)
-    CompactCellAD(prepared, built.layout, c.names, c.selected, c.slots)
+    CompactCellAD(prepared, built.layout, c.names, c.selected, c.slots, nothing)
 end
 
 for verb in (:ad_gradient, :ad_value_and_gradient, :ad_value_and_gradient!,
@@ -1175,8 +1188,10 @@ function _compact_cell_ad_call(verb::F, q::CompactCellAD, args::Vararg{Any,N}) w
         "active::AbstractVector{Float64}, indices::AbstractVector{Int}, cell::Int` last; got " *
         join(summary.((base, active, indices, cell)), ", ")))
     _select_compact_cells!(q, base, active, indices)
+    _check_cell_local_selection(q.shared, indices)
+    shared_values = _refresh_cell_shared!(q.shared, base)
     leading = ntuple(k -> args[k], Val(N - 4))
-    return verb(q.prepared, leading..., base, active, q.slots, cell)
+    return verb(q.prepared, leading..., base, active, q.slots, cell, shared_values...)
 end
 
 function _stack_restored_draws(values)
