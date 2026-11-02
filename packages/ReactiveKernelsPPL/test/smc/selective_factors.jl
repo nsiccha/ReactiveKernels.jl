@@ -4,14 +4,6 @@ using ..SMCSelectiveFixture
 using ReactiveKernels, ReactiveKernelsPPL, Random, LinearAlgebra, Test
 const F = SMCSelectiveFixture
 
-struct ReadPoint <: AbstractVector{Float64}
-    values::Vector{Float64}
-    reads::Vector{Int}
-end
-Base.size(point::ReadPoint) = size(point.values)
-Base.IndexStyle(::Type{ReadPoint}) = IndexLinear()
-Base.getindex(point::ReadPoint, i::Int) = (push!(point.reads, i); point.values[i])
-
 @testset "An old factor reading a fresh parent remains replaced by the carry" begin
     source = quote
         a[1:nb] .~ Normal.(0, 1)
@@ -143,10 +135,9 @@ end
         F.EXT._gradient(target, gradient, point)
         push!(allocated, @allocated F.EXT._gradient(target, gradient, point))
         push!(emitted, nodes(code_expr(target.query.kernel)))
-        recording = ReadPoint(point, Int[])
-        Base.invokelatest(target.query.kernel, recording)
-        @test sort(unique(recording.reads)) == [1, 2]
-        push!(reads, length(recording.reads))
+        footprint = Base.invokelatest(partition_footprint, target.query.kernel, point)
+        @test footprint._ppl_smc_active == [1, 2]
+        push!(reads, length(footprint._ppl_smc_active))
     end
     @test emitted[1] == emitted[2]
     @test reads[1] == reads[2]

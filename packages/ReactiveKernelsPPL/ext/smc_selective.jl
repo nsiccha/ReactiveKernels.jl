@@ -22,10 +22,7 @@ function _prepare_smc_selective(built, binding, u0; previous, backend, model_id,
     # This graph includes only new authored factors, along with the window
     # likelihood. Its structural read support closes over their hyperparameters.
     terms = PPL._smc_window_terms(built, binding, match.fresh, u0)
-    kernel = Base.invokelatest(prepare, terms.spec; have=terms.have,
-        want=terms.want, bound=terms.bound, exemplars=(u0,))
-    read = Base.invokelatest(partition_footprint, kernel, u0).unconstrained
-    indices = read === :whole ? collect(1:built.layout.total) : Vector{Int}(read)
+    indices = PPL._smc_read_support(terms, u0)
     # A new latent must enter its authored prior even if the likelihood omits it.
     indices = sort!(union(indices, match.fresh))
     active_slots = findall(i -> !iszero(match.old[i]), indices)

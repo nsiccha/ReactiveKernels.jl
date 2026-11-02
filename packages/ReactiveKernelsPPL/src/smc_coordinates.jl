@@ -38,16 +38,11 @@ function _smc_fresh_window_terms(built, binding, fresh, u0)
     catalogue = density_factors(built, binding)
     isfresh = falses(built.layout.total)
     isfresh[fresh] .= true
-    events = DensityFactor[]
+    events, ownerless = DensityFactor[], DensityFactor[]
     for event in catalogue
         owned = factor_coordinates(catalogue, event)
         if isempty(owned)
-            # A density on a derived expression has no draw ownership. If
-            # fresh values enter it, silently omitting it changes the target;
-            # read support cannot supply the missing old/fresh assignment.
-            any(i -> isfresh[i], factor_support(catalogue, event; u0)) &&
-                throw(ArgumentError("selective SMC cannot assign an ownerless " *
-                    "density reading fresh coordinates: $event"))
+            push!(ownerless, event)
             continue
         end
         any(i -> isfresh[i], owned) || continue
@@ -55,9 +50,20 @@ function _smc_fresh_window_terms(built, binding, fresh, u0)
             "selective SMC cannot split partly fresh atomic factor $event"))
         push!(events, event)
     end
+    if !isempty(ownerless)
+        # Scalar index reads need the same native locality lowering as the
+        # likelihood. The catalogue's conservative support can include a
+        # whole array even when an extra density reads only retained z[1].
+        selected = select_factors(catalogue, ownerless)
+        derived = _smc_scalar_reads(_density_selection_spec(built, binding, selected;
+            locality=:error, on_error=nothing, u0))
+        any(i -> isfresh[i], _smc_read_support(derived, u0)) &&
+            throw(ArgumentError("selective SMC cannot assign an ownerless " *
+                "density reading fresh coordinates: $ownerless"))
+    end
     selected = select_factors(catalogue, events)
-    factors = _density_selection_spec(built, binding, selected;
-        locality=:error, on_error=nothing, u0)
+    factors = _smc_scalar_reads(_density_selection_spec(built, binding, selected;
+        locality=:error, on_error=nothing, u0))
     likelihood = _smc_likelihood_terms(built, binding, u0)
     # Share only the inputs. Each cut keeps its own internal values so a
     # whole-model producer cannot replace the selected producer of the same
@@ -127,19 +133,33 @@ function _smc_likelihood_terms(built, binding, u0)
     else
         add!(spec.graph, Tuple(spec[t] for t in terms) => output, +)
     end
+    terms = (; spec, have, want, bound=(; bindings...))
     if any(value -> value isa Real, values(pointwise))
         # A scalar observation has no authored plate. Give its indexed
         # inputs the same local read semantics as observation cells, using
         # the existing factor-query scalar-read lowering. In particular,
         # z[2] must not count the whole packed view producing z as active.
-        selected = ReactiveKernels.KernelSpec(spec.graph, copy(spec.ports),
-            copy(spec.port_order), collect(have), [want], nothing)
-        selected_plan = ReactiveKernels.plan(selected)
-        outputs = Set(v.id for recipe in selected_plan.recipes for v in recipe.outputs)
-        spec = ReactiveKernels._cell_factor_scalar_reads(selected, outputs;
-            bound=(; bindings...), locality=:error)
+        return _smc_scalar_reads(terms)
     end
-    (; spec, have, want, bound=(; bindings...))
+    terms
+end
+
+function _smc_scalar_reads(terms)
+    spec = terms.spec
+    selected = ReactiveKernels.KernelSpec(spec.graph, copy(spec.ports),
+        copy(spec.port_order), collect(terms.have), [terms.want], nothing)
+    selected_plan = ReactiveKernels.plan(selected)
+    outputs = Set(v.id for recipe in selected_plan.recipes for v in recipe.outputs)
+    spec = ReactiveKernels._cell_factor_scalar_reads(selected, outputs;
+        bound=terms.bound, locality=:error)
+    (; terms..., spec)
+end
+
+function _smc_read_support(terms, u0)
+    kernel = Base.invokelatest(prepare, terms.spec; have=terms.have,
+        want=terms.want, bound=terms.bound, exemplars=(u0,))
+    read = Base.invokelatest(partition_footprint, kernel, u0).unconstrained
+    read === :whole ? collect(1:length(u0)) : Vector{Int}(read)
 end
 
 struct _SMCSelectedPoint{A<:AbstractVector{Float64}} <: AbstractVector{Float64}
