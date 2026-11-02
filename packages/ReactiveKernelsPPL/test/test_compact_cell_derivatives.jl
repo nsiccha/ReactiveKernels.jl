@@ -125,7 +125,10 @@ end
                 base, active, indices, i)
             @test gf ≈ g atol = 1e-12
             @test reduce(hcat, forward_columns) ≈ H atol = 1e-12
-            @test only(ad_hvp(hf, (v,), base, active, indices, i)) ≈ H * v atol = 1e-12
+            # The forward-over-reverse preparation fixes the direction tuple
+            # type; change its values while retaining its four directions.
+            mixed = (v, directions[2], directions[3], directions[4])
+            @test first(ad_hvp(hf, mixed, base, active, indices, i)) ≈ H * v atol = 1e-12
             gt, (hv,), (tv,) = ad_gradient_hvp_and_third(t, (v,), base, active, indices, i)
             @test gt ≈ g atol = 1e-12
             @test hv ≈ H * v atol = 1e-12
