@@ -1,6 +1,6 @@
 module OrdinaryHelperCellTests
 using ReactiveKernels, ReactiveKernelsPPL, Enzyme, Test
-using DifferentiationInterface: AutoEnzyme
+using DifferentiationInterface: AutoEnzyme, SecondOrder
 
 plain(z, indices) = [z[i] for i in indices]
 wrapped(z, indices) = plain(z, indices)
@@ -125,6 +125,42 @@ end
             @test isempty(sum_gradient)
             @test factor_gradient ≈ gradient
         end
+    end
+end
+
+@testset "ordinary helper compact Hessian and third-order contraction" begin
+    n, indices, x = 4, [4, 2, 1, 2], [0.4, -0.2, 0.8, 0.1]
+    bound = plain_model(; n, indices, x) | (; y=ones(Int, 4))
+    built = build_kernel(bound)
+    names = coordinate_names(built.layout)
+    beta = findfirst(==(:beta), names)
+    z = [findfirst(==(Symbol("z.$i")), names) for i in 1:n]
+    u = collect(range(-0.2, 0.3; length=length(names)))
+    selection(cell) = sort([beta, z[indices[cell]], z[3]])
+    units = ntuple(k -> Float64[j == k for j in 1:3], 3)
+    v = [0.4, -0.7, 1.1]
+    second = SecondOrder(AutoEnzyme(; mode=Enzyme.Reverse),
+                         AutoEnzyme(; mode=Enzyme.Forward))
+    third = SecondOrder(second, AutoEnzyme(; mode=Enzyme.Forward))
+    h = prepare_compact_cell_ad(prepare_ad_hvp, built, bound, :y, u, selection(1),
+                               second, units; locality=:error)
+    t = prepare_compact_cell_ad(prepare_ad_third, built, bound, :y, u, selection(1),
+                               third, (v,); locality=:error)
+    for cell in (1, 2)
+        slots = selection(cell)
+        coordinate = z[indices[cell]]
+        rate = exp(u[beta] * x[cell] + u[coordinate])
+        d = [j == beta ? x[cell] : j == coordinate ? 1.0 : 0.0 for j in slots]
+        gradient = (1-rate) .* d
+        hessian = -rate .* (d * d')
+        contraction = -rate * sum(d .* v)^2 .* d
+        gh, columns = ad_gradient_and_hvp(h, units, u, u[slots], slots, cell)
+        gt, (hv,), (tv,) = ad_gradient_hvp_and_third(t, (v,), u, u[slots], slots, cell)
+        @test gh ≈ gradient
+        @test reduce(hcat, columns) ≈ hessian
+        @test gt ≈ gradient
+        @test hv ≈ hessian * v
+        @test tv ≈ contraction
     end
 end
 
