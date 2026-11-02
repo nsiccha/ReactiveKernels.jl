@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.68
+
+- **Breaking:** SMC now raises `SMCDegeneracyError` instead of returning or
+  advancing an exactly collapsed positive-dimensional cloud, even at temperature
+  1. The exception preserves the input state and rejected-stage diagnostics.
+  Catch it explicitly when recovery is wanted; a single constant coordinate,
+  unchanged move or surviving ancestor is not a failure criterion.
+- `rejuvenate_smc(state; tuning, moves)` runs a fixed number of independently
+  tuned mutation transitions at the current temperature, without resampling or
+  changing weights or evidence. The new schedule and RNG continuation survive
+  checkpoints. Bounded stage histories distinguish `kind=:temper` and
+  `kind=:rejuvenate`; failed attempts never advance the input state. Recovery
+  restores an opportunity to explore, not a guarantee of posterior accuracy.
+
 ## 0.1.67
 
 - Evaluate selected density events whose cell vectors were folded into bound
