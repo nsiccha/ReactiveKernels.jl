@@ -61,7 +61,8 @@ end
 """
     SMCOptions(; ess_fraction=0.8, stepsize=0.25, metric=nothing,
                moves=2, max_tree_depth=6, max_stages=1000,
-               min_increment=1e-12, history_limit=128, tuning=nothing)
+               min_increment=1e-12, history_limit=128, tuning=nothing,
+               nthreads=Threads.nthreads())
 
 Adaptive bridge and fixed NUTS configuration. `metric` is a vector of positive
 diagonal **scales**, or WarmupHMC's plain `scale_data` record for a correlated
@@ -74,7 +75,14 @@ Scheduled kernel settings override `stepsize`, `metric`, `moves` and
 invariant NUTS transitions. `ess_fraction` selects the next temperature by
 bisection on the weight ESS, before resampling. A bridge that cannot progress
 by `min_increment`, or needs more than `max_stages`, throws without advancing
-its input state. Only the last `history_limit` stage summaries are retained.
+its input state. `nthreads` bounds the number of concurrent particle-mutation
+workers (default `Threads.nthreads()`); each owns its sampler and AD scratch.
+Weighting, resampling and child-seed draws retain their serial order. Particle
+counts need not divide the worker count. A fixed seed and worker count reproduce
+the cloud and diagnostics; `nthreads=1` preserves the serial random stream.
+Use an AD backend supporting concurrent evaluation (for Enzyme, the dogfood
+concurrent-GC repair is required until released). Only the last `history_limit`
+stage summaries are retained.
 """
 struct SMCOptions
     ess_fraction::Float64
@@ -86,12 +94,14 @@ struct SMCOptions
     min_increment::Float64
     history_limit::Int
     tuning::Union{Nothing,SMCTuningSchedule}
+    nthreads::Int
     function SMCOptions(; ess_fraction=0.8, stepsize=0.25, metric=nothing,
             moves=2, max_tree_depth=6, max_stages=1000, min_increment=1e-12,
-            history_limit=128, tuning=nothing)
+            history_limit=128, tuning=nothing, nthreads=Threads.nthreads())
         0 < ess_fraction < 1 || throw(ArgumentError("ess_fraction must be between 0 and 1"))
         isfinite(stepsize) && stepsize > 0 || throw(ArgumentError("stepsize must be finite and positive"))
         metric = metric === nothing ? nothing : _smc_scale(metric)
+        nthreads isa Integer && nthreads >= 1 || throw(ArgumentError("nthreads must be a positive integer"))
         moves >= 1 || throw(ArgumentError("moves must be positive"))
         max_tree_depth >= 1 || throw(ArgumentError("max_tree_depth must be positive"))
         max_stages >= 1 || throw(ArgumentError("max_stages must be positive"))
@@ -100,7 +110,7 @@ struct SMCOptions
         tuning === nothing || tuning isa SMCTuningSchedule ||
             throw(ArgumentError("tuning must be a SMCTuningSchedule or nothing"))
         new(ess_fraction, stepsize, metric,
-            moves, max_tree_depth, max_stages, min_increment, history_limit, deepcopy(tuning))
+            moves, max_tree_depth, max_stages, min_increment, history_limit, deepcopy(tuning), nthreads)
     end
 end
 
@@ -378,6 +388,9 @@ Gaussian reference's marginal standard deviations, or `nothing` for an exact
 posterior-to-posterior update. These vectors retain O(d*history_limit) values,
 not historical clouds. Compare spreads across stages and independent runs;
 neither a large first temperature step nor a high ESS alone diagnoses coverage.
+`nthreads` records the number of mutation workers, capped by available default
+threads and particles (one for a zero-dimensional target). Exact diagnostic
+replay requires the same available thread count as well as the same options.
 Failures propagate; the input state and its RNG remain usable.
 """
 function smc_step end

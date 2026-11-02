@@ -16,6 +16,16 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.54
+
+- Add `SMCOptions(nthreads=Threads.nthreads())` for concurrent fixed-kernel
+  particle mutation. Workers own sampler/AD scratch and disjoint output
+  columns. Serial weighting, resampling and child-seed draws preserve the
+  existing one-worker random stream, including for uneven particle counts.
+  Stage summaries record the mutation worker count; checkpoint continuation
+  retains the requested count. Concurrent Enzyme execution requires its
+  concurrent-GC repair, currently available on the dogfood line.
+
 ## 0.1.53
 
 - Prepare cell queries with the canonical packed `Vector{Float64}` and `Int`
@@ -51,6 +61,7 @@ are recorded in the git history only.
   and local gradients through the prefix. Each query compares shared
   coordinates in O(shared dimension); refreshing adds the shared computation.
   Cache storage grows with group-level outputs, not row-capable observations.
+
 
 
 ## 0.1.48
