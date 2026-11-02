@@ -2004,7 +2004,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 # `normal(location, scale).logpdf(log(w))` as a hygienic caller
                 # recipe, typed by the endpoint's explicit boundary, so it lowers
                 # identically to the constructor-argument case rather than being
-                # rejected. A bare name still must resolve to a declared caller port.
+                # rejected. A bare name must resolve to a caller port or a declared
+                # cell local; the latter materializes like an owner binding above.
                 # Under a branch arm the argument stays inline, exactly like an
                 # owner binding above.
                 endpoint_ports = Any[]
@@ -2012,7 +2013,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     if actual isa Symbol && (actual in scoped || actual in locals)
                         push!(endpoint_ports, actual)
                         continue
-                    elseif actual isa Symbol
+                    elseif actual isa Symbol && !(actual in cell_locals)
                         throw(ArgumentError(
                             "endpoint :$endpoint_name argument $context refers to " *
                             "undeclared caller port :$actual"))
@@ -2020,7 +2021,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     rewritten_actual, _ = _kernel_constructed_endpoint(
                         actual, mod, locals, nested_specs, local_types;
                         context = context, materialized = materialized,
-                        straight = straight, scoped = scoped,
+                        cell_locals = cell_locals, straight = straight, scoped = scoped,
                         endpoint_cache = endpoint_cache,
                         lift_scope = lift_scope, boundary_types = boundary_types)
                     if straight
@@ -2083,6 +2084,12 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
     child_types = Any[]
     child_scoped = _kernel_is_scope_expr(ex) ?
         _kernel_scope_binders!(copy(scoped), ex) : scoped
+    # A lazy branch block remains inside its recipe closure. Its assignments
+    # are local values, not exposed caller ports, just like assignments in a
+    # loop or `let` body. Keep endpoint arguments that read them in place.
+    if !straight && ex.head === :block
+        child_scoped = _kernel_scope_assignments!(copy(child_scoped), ex)
+    end
     for (i, arg) in enumerate(ex.args)
         child, child_type = _kernel_constructed_endpoint(
             arg, mod, locals, nested_specs, local_types;
