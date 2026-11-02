@@ -195,7 +195,11 @@ function _check_cell_factor_args(q::CellFactorQuery, a)
 end
 function (q::CellFactorQuery)(u::AbstractVector{Float64}, a, b)
     _check_cell_factor_args(q, a)
-    shared_values = Base.invokelatest(_refresh_cell_shared!, q.shared, u)
+    Base.invokelatest(_refresh_cell_shared!, q.shared, u)
+    # Keep the latest-world refresh, but read its stored values through the
+    # concrete cache type. Splatting invokelatest's Any result boxes the
+    # prepared callable repeatedly, even when the shared tuple is empty.
+    shared_values = _cell_shared_values(q.shared)
     Base.invokelatest(q.residual, u, a, b, shared_values...)::Float64
 end
 (q::CellFactorQuery)(u::AbstractVector{<:Real}, a, b) = q(Vector{Float64}(u), a, b)

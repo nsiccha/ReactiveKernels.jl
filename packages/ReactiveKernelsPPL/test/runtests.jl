@@ -264,6 +264,7 @@ const _PPL_TEST_FILES = (
     "test_query_footprints.jl",
     "test_compact_cell_derivatives.jl",
     "test_cell_factors.jl",
+    "test_cell_factor_values.jl",
     "test_cell_factor_ragged.jl",
     "test_cell_factor_array_add.jl",
     "test_cell_factor_typed.jl",
