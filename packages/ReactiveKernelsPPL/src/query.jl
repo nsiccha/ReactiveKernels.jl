@@ -620,9 +620,9 @@ function _cell_density(q::CellQuery, u, cell)
     end
     length(u) == q.layout.total || throw(ContractValidationError(
         "[query] packed length $(length(u)) ≠ layout total $(q.layout.total)"))
-    u isa Vector{Float64} || return _cell_density(q, Vector{Float64}(u), cell)
-    cached = _refresh_partition_prefix!(q.prefix.cache, u)
-    residual = _query_residual(q.prefix, cell, (u, cell, cached...))
+    prefix = _query_prefix_kernel(q.prefix, u)
+    cached = _refresh_partition_prefix!(q.prefix.cache, u, prefix)
+    residual = _query_residual(q.prefix, (u, cell, cached...))
     residual(u, cell, cached...)
 end
 ReactiveKernels.partition_locality(q::CellQuery) =
@@ -659,10 +659,9 @@ claim because a cell query has no partition key. A partition query checks
 separability when the same declaration is supplied.
 
 Native preparation initially uses a packed `Vector{Float64}` and an `Int`
-cell position. Uncached query calls preserve other `AbstractVector{Float64}`
+cell position. Query calls preserve other `AbstractVector{Float64}`
 inputs and cache specializations for their argument types, including Cartesian
-indices. Other element types are converted to `Float64`; prefix-cached queries
-also convert other packed storage types. Direct calls to `q.kernel` require
+indices. Other element types are converted to `Float64`. Direct calls to `q.kernel` require
 the initial exact types.
 `u0` supplies a valid packed preparation point for the shared
 prefix; it defaults to zeros. It is copied. Each query owns its cache and is not
@@ -730,7 +729,8 @@ function prepare_cell_query(built, plan::StructuralPlan, observations;
         cache = _prepare_value_prefix(parts, built.layout, last(only(rule)), exemplar, on_error)
         residual = Base.invokelatest(prepare, parts.residual;
             exemplars = (exemplar, 1, cache.values...), on_error)
-        _value_query_prefix(cache, residual, parts.residual, 1, on_error)
+        _value_query_prefix(cache, residual, parts.residual,
+            (exemplar, 1, cache.values...), on_error)
     end
     parts === nothing || ((spec, want) = _cell_query_spec(built, plan, names; locality = :ignore))
     kernel = _absent_refusal(plan, spec, have, want) do
@@ -1267,9 +1267,9 @@ function _partition_density(q::PartitionQuery, u, label)
     end
     length(u) == q.layout.total || throw(ContractValidationError(
         "[query] packed length $(length(u)) ≠ layout total $(q.layout.total)"))
-    u isa Vector{Float64} || return _partition_density(q, Vector{Float64}(u), label)
-    cached = _refresh_partition_prefix!(q.prefix.cache, u)
-    residual = _query_residual(q.prefix, label, (u, label, nothing, cached...))
+    prefix = _query_prefix_kernel(q.prefix, u)
+    cached = _refresh_partition_prefix!(q.prefix.cache, u, prefix)
+    residual = _query_residual(q.prefix, (u, label, nothing, cached...))
     plan = get(() -> ReactiveKernels.partition_plan(residual, u, label, nothing, cached...),
                q.plans, label)
     residual(u, label, plan, cached...)
@@ -1427,6 +1427,8 @@ footprints including all dependencies through the prefix; call `q(u, label)`
 for cached evaluation. Comparing shared coordinates costs O(shared dimension)
 per call; refreshing the prefix adds its graph's work once per changed shared
 point. Cache storage is query-owned; prepare one query per concurrent caller.
+Cached calls preserve `AbstractVector{Float64}` storage and prepare each
+argument-type specialization once, without copying the packed point.
 
 For a value-only query's packed-coordinate footprint, call
 `ReactiveKernels.partition_footprint(q.kernel, u, label, nothing).unconstrained`.
@@ -1481,9 +1483,10 @@ function prepare_partition(built, plan::StructuralPlan, observations; by,
         cache = _prepare_value_prefix(parts, built.layout, last(only(rule)), exemplar, on_error)
         residual = Base.invokelatest(prepare, parts.residual;
             exemplars = (exemplar, first(labels), nothing, cache.values...), on_error)
-        result = _value_query_prefix(cache, residual, parts.residual, first(labels), on_error)
+        result = _value_query_prefix(cache, residual, parts.residual,
+            (exemplar, first(labels), nothing, cache.values...), on_error)
         plans, _ = _partition_plans_each(labels) do label
-            label_kernel = _query_residual(result, label, (exemplar, label, nothing, cache.values...))
+            label_kernel = _query_residual(result, (exemplar, label, nothing, cache.values...))
             Base.invokelatest(ReactiveKernels.partition_plan, label_kernel,
                 exemplar, label, nothing, cache.values...)
         end
@@ -1623,29 +1626,46 @@ function _query_exemplar(layout, u0)
     Vector{Float64}(u0)
 end
 
-_value_query_prefix(cache, residual, residual_plan, index, on_error) =
-    (; cache, residual, residual_plan, index_type = typeof(index), on_error,
-       residuals = Dict{DataType,Any}(typeof(index) => residual))
+_value_query_prefix(cache, residual, residual_plan, args, on_error) =
+    (; cache, residual, residual_plan, argument_type = typeof(args), on_error,
+       residuals = Dict{DataType,Any}(typeof(args) => residual),
+       prefixes = Dict{DataType,Any}(Vector{Float64} => cache.kernel))
 
 # Ordinary cell indices include CartesianIndex and multiple integer types;
-# partition keys can also have mixed types. Keep each prepared boundary
-# concrete without imposing the first exemplar's index type on later calls.
-function _query_residual(prefix, index, args)
-    typeof(index) === prefix.index_type && return prefix.residual
-    get!(prefix.residuals, typeof(index)) do
+# partition keys can also have mixed types. Preserve custom packed storage
+# at each concrete prepared boundary instead of reading it all to copy it.
+function _query_residual(prefix, args)
+    typeof(args) === prefix.argument_type && return prefix.residual
+    get!(prefix.residuals, typeof(args)) do
         Base.invokelatest(prepare, prefix.residual_plan;
             exemplars = args, on_error = prefix.on_error)
     end
 end
 
+function _query_prefix_kernel(prefix, u)
+    u isa Vector{Float64} && return prefix.cache.kernel
+    get!(prefix.prefixes, typeof(u)) do
+        Base.invokelatest(prepare, prefix.cache.kernel.plan;
+            exemplars = (u, prefix.cache.point, prefix.cache.slots),
+            on_error = prefix.on_error)
+    end
+end
+
 function _query_shared_parts(spec, plan, have, want, rule, varying, on_error)
     isempty(rule) && return nothing
+    # Binding the selected plan executes data-only helpers before the shared
+    # split. They may have been defined in the caller's fresh model module.
+    Base.invokelatest(_query_shared_parts_latest, spec, plan, have, want,
+        rule, varying, on_error)
+end
+
+function _query_shared_parts_latest(spec, plan, have, want, rule, varying, on_error)
     selected = ReactiveKernels.plan(spec; have, want)
     selected = ReactiveKernels._kernel_error_policy(selected, on_error)
     selected = ReactiveKernels._fuse_authored_plate_chains(selected; cells_only = true)
     bound_selected = ReactiveKernels._partial_apply(selected,
         ReactiveKernels._kernel_bound_pairs(spec, _query_bound(plan)))
-    Base.invokelatest(ReactiveKernels._partition_shared_parts, bound_selected, rule;
+    ReactiveKernels._partition_shared_parts(bound_selected, rule;
         varying, preserve_rows = true)
 end
 
@@ -1985,7 +2005,7 @@ function _prepare_shared_partition_sampler(kernel, parts, layout, names, by, lab
         local_footprints, selections, selected, slots, active, zeros(length(active)), plans, cache, NaN)
 end
 
-function _refresh_partition_prefix!(cache::_PartitionPrefix, u)
+function _refresh_partition_prefix!(cache::_PartitionPrefix, u, kernel = cache.kernel)
     changed = !cache.valid || any(eachindex(cache.positions)) do i
         !isequal(cache.point[i], u[cache.positions[i]])
     end
@@ -1996,8 +2016,8 @@ function _refresh_partition_prefix!(cache::_PartitionPrefix, u)
     for (i, position) in enumerate(cache.positions)
         cache.point[i] = u[position]
     end
-    cache.values = map(_partition_cache_value, _partition_frontier_values(cache.kernel,
-        cache.kernel(u, cache.point, cache.slots)))
+    cache.values = map(_partition_cache_value, _partition_frontier_values(kernel,
+        kernel(u, cache.point, cache.slots)))
     cache.valid = true
     cache.values
 end
