@@ -2,6 +2,11 @@ using Test, Random, LinearAlgebra, Statistics
 import ReactiveKernels as RK
 
 @testset "Compact Gaussian marginal and conditional algebra" begin
+    empty_gaussian = first(RK._compact_gaussian(Float64[], Float64[]))
+    @test RK._gaussian_logdensity(empty_gaussian, Float64[]) == 0.0
+    independent = first(RK._compact_gaussian([0.0], [4.0]))
+    @test RK._gaussian_logdensity(independent, [1.0]) ≈
+        -(log(2pi) + log(4.0) + 0.25)/2
     rng = Xoshiro(164)
     mean = randn(rng, 9)
     diagonal = exp.(randn(rng, 9))

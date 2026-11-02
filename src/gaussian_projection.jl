@@ -121,7 +121,8 @@ end
 
 function _gaussian_logdensity(mean, diagonal, vectors, values, x)
     z = _gaussian_whiten(diagonal, vectors, values, x .- mean)
-    -(length(mean) * log(2pi) + sum(log, diagonal) + sum(log1p, values) + sum(abs2, z)) / 2
+    -(length(mean) * log(2pi) + sum(log, diagonal; init=0.0) +
+        sum(log1p, values; init=0.0) + sum(abs2, z)) / 2
 end
 _gaussian_logdensity(g::_CompactGaussian, x) =
     _gaussian_logdensity(g.mean, g.diagonal, g.vectors, g.values, x)
