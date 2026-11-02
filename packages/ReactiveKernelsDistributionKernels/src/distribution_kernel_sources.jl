@@ -34,6 +34,8 @@ const logbeta = scalar_derivative_rule(
     logbeta_graph; primal = :y, partials = (a = :dy_da, b = :dy_db),
     name = :logbeta)
 
+include("gamma_logtails.jl")
+
 # General symmetric-eigendecomposition primitives live in RK proper.
 # Preserve qualified consumer names as imports of the same owned graphs.
 using ReactiveKernels: rk_symmetric_eigvals_rule, rk_symmetric_eigvecs_rule
@@ -201,6 +203,18 @@ export ZERO_INFLATED_BINOMIAL_SOURCE
 export NEGATIVE_BINOMIAL_SOURCE
 export WEIBULL_SOURCE
 
+include("lognormal_moments.jl")
+
+# Constructor parameter validation for structural Distributions adapters. The
+# numerical law itself remains in the objects below; this scalar operation is
+# shared with the parameter it checks and never constructs a Distribution.
+function _checked_distribution_parameter(value::Real, nonnegative::Bool)
+    valid = nonnegative ? value >= 0 : value > 0
+    valid || throw(DomainError(value, nonnegative ?
+        "distribution parameter must be nonnegative" : "distribution parameter must be positive"))
+    Float64(value)
+end
+
 ReactiveKernels.@_record_source function _normal_logcdf(z)
     result = zero(z)
     if z < 0
@@ -262,6 +276,8 @@ end
         ((nu + 1) / 2) * log1p(z^2 / nu)
     cdf(z::Float64)::Float64 = rk_student_tail(nu, z, false)
     ccdf(z::Float64)::Float64 = rk_student_tail(nu, z, true)
+    logcdf(z::Float64)::Float64 = log(cdf(z))
+    logccdf(z::Float64)::Float64 = log(ccdf(z))
     quantile(p::Float64)::Float64 = begin
         lower::Bool = p < 0.5
         tail::Float64 = ifelse(lower, p, 1 - p)
@@ -276,7 +292,7 @@ end
 # is the logistic sigmoid and `quantile` the logit. It carries no parameters, so
 # unlike `standard_student_t` it binds directly through `location_scale`.
 @kernel standard_logistic() = begin
-    logpdf(z::Float64)::Float64 = -z - 2 * log1pexp(-z)
+    logpdf(z::Float64)::Float64 = -abs(z) - 2 * log1pexp(-abs(z))
     cdf(z::Float64)::Float64 = 1 / (1 + exp(-z))
     ccdf(z::Float64)::Float64 = 1 / (1 + exp(z))
     logcdf(z::Float64)::Float64 = -log1pexp(-z)
@@ -287,25 +303,32 @@ end
 @kernel location_scale(standard, location::Float64, scale::Float64) = begin
     log_scale::Float64 = log(scale)
 
-    standardized(x::Float64)::Float64 = (x - location) / scale
+    standardized(x::Float64)::Float64 =
+        (x - location) / (scale == 0 && x == location ? 1.0 : scale)
     inv(standardized, z::Float64)::Float64 = location + scale * z
 
     logpdf(x::Float64)::Float64 = begin
         z::Float64 = standardized(x)
-        standard.logpdf(z) - log_scale
+        # Keep the standard density as a visible, independently selectable
+        # graph port. At zero scale only the point mass keeps log(scale).
+        standard.logpdf(z) - (scale == 0 && x != location ? 0.0 : log_scale)
     end
     cdf(x::Float64)::Float64 = begin
-        z::Float64 = standardized(x)
+        z::Float64 = scale == 0 && x == location ? inv(scale) : standardized(x)
         standard.cdf(z)
     end
     ccdf(x::Float64)::Float64 = begin
-        z::Float64 = standardized(x)
+        z::Float64 = scale == 0 && x == location ? inv(scale) : standardized(x)
         standard.ccdf(z)
     end
-    logcdf(x::Float64)::Float64 =
-        x == -Inf ? -Inf : (x == Inf ? 0.0 : standard.logcdf(standardized(x)))
-    logccdf(x::Float64)::Float64 =
-        x == Inf ? -Inf : (x == -Inf ? 0.0 : standard.logccdf(standardized(x)))
+    logcdf(x::Float64)::Float64 = begin
+        z::Float64 = scale == 0 && x == location ? inv(scale) : standardized(x)
+        x == -Inf ? -Inf : (x == Inf ? 0.0 : standard.logcdf(z))
+    end
+    logccdf(x::Float64)::Float64 = begin
+        z::Float64 = scale == 0 && x == location ? inv(scale) : standardized(x)
+        x == Inf ? -Inf : (x == -Inf ? 0.0 : standard.logccdf(z))
+    end
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard.quantile(p)
         inv(standardized, z)
@@ -339,6 +362,14 @@ end
     ccdf(x::Float64)::Float64 = begin
         z::Float64 = standardized(x)
         standard_student_t(nu).ccdf(z)
+    end
+    logcdf(x::Float64)::Float64 = begin
+        z::Float64 = standardized(x)
+        standard_student_t(nu).logcdf(z)
+    end
+    logccdf(x::Float64)::Float64 = begin
+        z::Float64 = standardized(x)
+        standard_student_t(nu).logccdf(z)
     end
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard_student_t(nu).quantile(p)
@@ -443,6 +474,7 @@ end
 """
 
 const LOGNORMAL_KERNEL_SOURCE = raw"""
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: _normal_logccdf
 @kernel lognormal(location::Float64, scale::Float64) = begin
     log_scale::Float64 = log(scale)
 
@@ -451,17 +483,27 @@ const LOGNORMAL_KERNEL_SOURCE = raw"""
     end
     inv(standardized_log, z::Float64)::Float64 = exp(location + scale * z)
 
-    logpdf(x::Float64)::Float64 =
-        x > 0 ? standard_normal.logpdf((log(x) - location) / scale) -
-            log_scale - log(x) : -Inf
-    cdf(x::Float64)::Float64 =
-        x > 0 ? standard_normal.cdf((log(x) - location) / scale) : 0.0
-    ccdf(x::Float64)::Float64 =
-        x > 0 ? standard_normal.ccdf((log(x) - location) / scale) : 1.0
-    logcdf(x::Float64)::Float64 =
-        x <= 0 ? -Inf : (x == Inf ? 0.0 : standard_normal.logcdf((log(x) - location) / scale))
-    logccdf(x::Float64)::Float64 =
-        x <= 0 ? 0.0 : (x == Inf ? -Inf : standard_normal.logccdf((log(x) - location) / scale))
+    logpdf(x::Float64)::Float64 = begin
+        log_x::Float64 = x <= 0 ? -Inf : log(x)
+        jacobian::Float64 = x <= 0 ? 0.0 : log_x
+        normal(location, scale).logpdf(log_x) - jacobian
+    end
+    cdf(x::Float64)::Float64 = begin
+        log_x::Float64 = x <= 0 ? -Inf : log(x)
+        normal(location, scale).cdf(log_x)
+    end
+    ccdf(x::Float64)::Float64 = begin
+        log_x::Float64 = x <= 0 ? -Inf : log(x)
+        normal(location, scale).ccdf(log_x)
+    end
+    logcdf(x::Float64)::Float64 = begin
+        log_x::Float64 = x <= 0 ? -Inf : log(x)
+        normal(location, scale).logcdf(log_x)
+    end
+    logccdf(x::Float64)::Float64 = begin
+        log_x::Float64 = x <= 0 ? -Inf : log(x)
+        normal(location, scale).logccdf(log_x)
+    end
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard_normal.quantile(p)
         inv(standardized_log, z)
@@ -474,9 +516,9 @@ const EXPONENTIAL_KERNEL_SOURCE = raw"""
     log_scale::Float64 = log(scale)
 
     logpdf(x::Float64)::Float64 =
-        ifelse(x >= 0, -log_scale - x / scale, -Inf)
-    cdf(x::Float64)::Float64 = ifelse(x >= 0, -expm1(-x / scale), 0.0)
-    ccdf(x::Float64)::Float64 = x >= 0 ? exp(-x / scale) : 1.0
+        x < 0 ? -Inf : -log_scale - x / scale
+    cdf(x::Float64)::Float64 = x < 0 ? 0.0 : -expm1(-x / scale)
+    ccdf(x::Float64)::Float64 = x < 0 ? 1.0 : exp(-x / scale)
     logcdf(x::Float64)::Float64 =
         x <= 0 ? -Inf : (x == Inf ? 0.0 : log(-expm1(-x / scale)))
     logccdf(x::Float64)::Float64 = x < 0 ? 0.0 : (x == Inf ? -Inf : -x / scale)
@@ -659,10 +701,11 @@ end
 # route while the others become derived views. `logpdf` uses `log_rate` directly
 # for the normalization so no `log(exp(log_rate))` round trip enters the plan.
 const GAMMA_KERNEL_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, _gamma_log_tail
 using SpecialFunctions: gamma_inc, gamma_inc_inv
 
 @kernel gamma(shape::Float64, rate::Float64) = begin
+    log_shape_gamma::Float64 = shape > 0 ? loggamma(shape) : Inf
     # The log-rate view is also a captured density input. Guard its
     # undefined arithmetic before it reaches the rejecting logpdf arm.
     log_rate::Float64 = rate > 0 ? log(rate) : -Inf
@@ -670,15 +713,22 @@ using SpecialFunctions: gamma_inc, gamma_inc_inv
     scale::Float64 = 1 / rate
     rate::Float64 = 1 / scale
 
-    logpdf(x::Float64)::Float64 =
-        (x > 0) & (shape > 0) & (log_rate > -Inf) ?
-            (shape * log_rate - loggamma(shape) +
-             (shape - 1) * log(x) - rate * x) :
+    logpdf(x::Float64)::Float64 = begin
+        # This input-only term can bind once even when shape selects the
+        # zero-observation density branch. Guard zero as well: the finite
+        # unit-shape density must not differentiate an unused singular log.
+        log_x::Float64 = x <= 0 ? -Inf : log(x)
+        (x >= 0 || isnan(x)) & (shape > 0) & (log_rate > -Inf) ?
+            (x == Inf ? -Inf : shape * log_rate - log_shape_gamma +
+             (x == 0 && shape == 1 ? 0.0 : (shape - 1) * log_x) - rate * x) :
             -Inf
+    end
     cdf(x::Float64)::Float64 =
-        x > 0 ? first(gamma_inc(shape, rate * x)) : 0.0
+        x <= 0 ? 0.0 : first(gamma_inc(shape, rate * x))
     ccdf(x::Float64)::Float64 =
-        x > 0 ? last(gamma_inc(shape, rate * x)) : 1.0
+        x <= 0 ? 1.0 : last(gamma_inc(shape, rate * x))
+    logcdf(x::Float64)::Float64 = _gamma_log_tail(shape, rate * x, log_shape_gamma, false)
+    logccdf(x::Float64)::Float64 = _gamma_log_tail(shape, rate * x, log_shape_gamma, true)
     quantile(p::Float64)::Float64 = gamma_inc_inv(shape, p, 1 - p) / rate
 end
 """
@@ -1264,6 +1314,8 @@ const negative_binomial = _OTHER_DISTRIBUTION_BINDINGS[20]
 const weibull = _OTHER_DISTRIBUTION_BINDINGS[21]
 const zero_inflated_binomial = _OTHER_DISTRIBUTION_BINDINGS[22]
 const zero_inflated_binomial_logit_zi = _OTHER_DISTRIBUTION_BINDINGS[23]
+
+include("dirichlet_multinomial.jl")
 
 # One component is chosen for the entire observed vector. Columns of the
 # parameter matrices are component laws; rows are positions within the one

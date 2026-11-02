@@ -67,6 +67,7 @@ const _MATRIX_CORE_TESTS = (
     "test_nested_plate.jl",
     "test_cell_arrays.jl",
     "test_cell_helper_rows.jl",
+    "test_cell_ragged_indices.jl",
     "test_wide_nested_plate.jl",
     "test_readable_recipe_equivalence.jl",
     "test_native_type_queries.jl",

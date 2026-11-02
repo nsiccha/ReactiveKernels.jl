@@ -26,6 +26,7 @@ An object expression can be composed with `.logpdf(value)` or with the object's
 CDF/log-tail endpoints. This structural hook does not choose parameter
 geometry or evaluate a statistical constructor.
 
+The Distributions extension supplies mappings for supported base families.
 Caller-owned types may extend this hook with their own graphs, including a
 locally constructed spec reconstructed by calling the same structural hook;
 ordinary numerical RHS values retain [`sampling_logdensity`](@ref).

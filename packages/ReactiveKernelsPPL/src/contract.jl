@@ -8403,6 +8403,11 @@ function _eval_value_expr(ex, lookup, label; calls = nothing, kernels = nothing)
             ex.args[2].head === :tuple
         f = _eval_callee(ex.args[1], label)
         return Base.invokelatest(broadcast, f, map(ev, ex.args[2].args)...)
+    elseif h === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode
+        # Geometry hooks return authored AST, before model lowering rewrites
+        # property reads to calls. Preserve Julia's getproperty dispatch here
+        # too; the quoted property name is not a bound-data dependency.
+        return Base.invokelatest(getproperty, ev(ex.args[1]), ex.args[2].value)
     elseif h === :ref
         return getindex(ev(ex.args[1]), map(ev, ex.args[2:end])...)
     elseif h === :vect

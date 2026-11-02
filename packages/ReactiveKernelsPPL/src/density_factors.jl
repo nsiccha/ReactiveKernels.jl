@@ -387,11 +387,24 @@ const _DENSITY_TOTAL = :_ppl_density_selected
 const _DENSITY_LABEL = :_ppl_density_label
 const _DENSITY_PLAN = :_ppl_density_plan
 
+# Catalogue preparation can fold a whole data-only density plate. Its bound
+# cells still identify independent events, but no authored plate remains to
+# partition. Recognize the compiler's proof, not numerical zeros or a law name.
+function _density_bound_cells(c::DensityFactors, s::_DensitySite)
+    s.plate === nothing && return nothing
+    g = c.spec.graph
+    producers = ReactiveKernels.producers_of(g, c.spec[s.plate].id)
+    length(producers) == 1 || return nothing
+    op = g.recipes[only(producers)].op
+    op isa ReactiveKernels._BoundConstant ? op.value : nothing
+end
+
 function _density_selection_spec(built, plan, selection; locality, on_error, u0)
     _check_factor_selection(built, plan, selection)
     c = selection.catalogue
     spec = ReactiveKernels._copy_cell_factor_spec(c.spec)
     terms = Symbol[]
+    constant_terms = Float64[]
     plates = Symbol[]
     by = Dict{Symbol,Symbol}()
     bindings = Pair{Symbol,Any}[pairs(_query_bound(plan))...]
@@ -401,6 +414,8 @@ function _density_selection_spec(built, plan, selection; locality, on_error, u0)
         isempty(entries) && continue
         if s.plate === nothing
             push!(terms, s.total)
+        elseif (cells = _density_bound_cells(c, s)) !== nothing
+            push!(constant_terms, sum(i -> cells[i], entries; init = 0.0))
         else
             key = Symbol(:_ppl_density_membership_, j)
             spec.ports[key] = value!(spec.graph, key, Vector{Bool})
@@ -434,6 +449,14 @@ function _density_selection_spec(built, plan, selection; locality, on_error, u0)
         push!(terms, summed)
         push!(bindings, _DENSITY_LABEL => true, _DENSITY_PLAN => rowplan)
         have = (have..., _DENSITY_LABEL, _DENSITY_PLAN)
+    end
+    if !isempty(constant_terms)
+        name = :_ppl_density_constant
+        constant = value!(spec.graph, name, Float64)
+        spec.ports[name] = constant
+        push!(spec.port_order, name)
+        add!(spec.graph, () => constant, ReactiveKernels._BoundConstant(sum(constant_terms)))
+        push!(terms, name)
     end
     output = value!(spec.graph, _DENSITY_TOTAL, Float64)
     spec.ports[_DENSITY_TOTAL] = output
@@ -476,10 +499,11 @@ function factor_support(c::DensityFactors, factor::DensityFactor; u0 = nothing)
     exemplar = _query_exemplar(c.built.layout, u0)
     s = only(s for s in c.sites if s.kind === factor.kind && s.site === factor.site &&
         s.offset < factor.entry <= s.offset + s.count)
+    retained_plate = s.plate !== nothing && _density_bound_cells(c, s) === nothing
     kernel = lock(c.support_lock) do
         get!(c.support_kernels, (factor.kind, factor.site, s.offset)) do
-            spec, have, want = if s.plate === nothing
-                (c.spec, c.have, s.total)
+            spec, have, want = if !retained_plate
+                (c.spec, c.have, s.plate === nothing ? s.total : s.plate)
             else
                 index, name = :_ppl_density_entry, :_ppl_density_event
                 (plate_cell(c.spec, s.plate; index, name, locality = :error),
@@ -489,7 +513,7 @@ function factor_support(c::DensityFactors, factor::DensityFactor; u0 = nothing)
             Base.invokelatest(ReactiveKernels.partition_footprint_kernel, q)
         end
     end
-    args = s.plate === nothing ? (exemplar,) : (exemplar, factor.entry - s.offset)
+    args = retained_plate ? (exemplar, factor.entry - s.offset) : (exemplar,)
     footprint = Base.invokelatest(kernel, args...).unconstrained
     footprint === :whole ? collect(1:c.built.layout.total) : footprint
 end
