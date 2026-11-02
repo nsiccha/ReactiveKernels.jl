@@ -22,9 +22,10 @@ function replay_target(growing; changed=false)
     end
 end
 
-mode,path=ARGS
+mode,path=ARGS[1:2]
+cases = length(ARGS)==3 && ARGS[3]=="old-only" ? (false,) : (false,true)
 if mode == "write"
-    payload=map((false,true)) do growing
+    payload=map(cases) do growing
         target=replay_target(growing)
         partial=smc(target;rng=Xoshiro(71),particles=64,
             options=SMCOptions(stepsize=0.35,moves=2,max_tree_depth=4),stages=1)
@@ -36,7 +37,7 @@ if mode == "write"
     serialize(path,payload)
 elseif mode == "read"
     payload=deserialize(path)
-    for (growing,record) in zip((false,true),payload)
+    for (growing,record) in zip(cases,payload)
         target=replay_target(growing)
         completed=smc(resume_smc(target,record.checkpoint))
         @test F.signature(completed)==record.expected
