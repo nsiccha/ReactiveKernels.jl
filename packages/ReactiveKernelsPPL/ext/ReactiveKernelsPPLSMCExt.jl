@@ -196,7 +196,7 @@ function LogDensityProblems.logdensity(t::BridgeTarget, u)
 end
 
 function LogDensityProblems.logdensity_and_gradient(t::BridgeTarget, u)
-    # Sampler queries own scratch space and are used serially. Each returned
+    # Each mutation worker owns its sampler query and AD scratch. Each returned
     # gradient is fresh: WarmupHMC may retain it in a trajectory.
     a, b = t.temperature == 1 ? (t.target, nothing) :
         t.temperature == 0 ? (t.source, nothing) : (t.source, t.target)
@@ -230,6 +230,7 @@ struct SMCStage
     mean_acceptance::Union{Nothing,Float64}
     coordinate_sd::Vector{Float64}
     reference_sd::Union{Nothing,Vector{Float64}}
+    nthreads::Int
 end
 Base.:(==)(a::SMCStage, b::SMCStage) =
     all(getfield(a, k) == getfield(b, k) for k in fieldnames(SMCStage))
@@ -530,15 +531,86 @@ mutable struct IndexParticle
 end
 IndexParticle() = IndexParticle(0, 0.0)
 
+# Fork only execution objects: signatures describe immutable model identity and
+# need not be copied once per worker. Queries and AD preparations own scratch.
+_worker_target(t::SMCTarget) = SMCTarget(deepcopy(t.query), t.backend, t.signature)
+_worker_target(t::SMCWindowTarget) = SMCWindowTarget(deepcopy(t.query), t.backend,
+    t.signature, _worker_target(t.prior))
+_worker_target(t::ReferenceTarget) = deepcopy(t)
+_worker_target(t) = deepcopy(t)
+_worker_target(t::BridgeTarget) = BridgeTarget(_worker_target(t.source),
+    _worker_target(t.target), t.temperature, t.dimension)
+
+function _mutate_particles!(positions, state, ancestors, seeds, target, options, indices)
+    divergences, evaluations, movement, acceptance = 0, 0, 0.0, 0.0
+    metric = _metric(options.metric)
+    for i in indices
+        u = copy(state.positions[:, ancestors[i]])
+        chain = FixedKernelNUTSState(Xoshiro(seeds[i]), u;
+            metric, stepsize=options.stepsize, max_tree_depth=options.max_tree_depth)
+        for _ in 1:options.moves
+            transition = fixed_kernel_nuts_step(chain, target)
+            chain = transition.state
+            divergences += transition.divergent
+            evaluations += transition.stats.steps
+            acceptance += transition.stats.acceptance_rate
+        end
+        u = chain.position
+        movement += sum(abs2, u .- view(state.positions, :, ancestors[i]))
+        positions[:, i] = u
+    end
+    return (; divergences, evaluations, movement, acceptance)
+end
+
+function _mutation!(positions, state, ancestors, seeds, beta)
+    d, n = size(positions)
+    d == 0 && return (0, 0, 0.0, nothing, 1)
+    options, _ = _stage_kernel(state.options, d, beta)
+    target = BridgeTarget(state.source, state.target, beta, d)
+    workers = min(state.options.nthreads, Threads.nthreads(), n)
+    targets = [i == 1 ? target : _worker_target(target) for i in 1:workers]
+    # Explicit worker slots, not threadid(): a yielding task may migrate. Each
+    # slot owns its query, fixed range, counters, and disjoint output columns.
+    tasks = Task[]
+    for worker in 1:workers
+        indices = (fld((worker-1)*n, workers)+1):fld(worker*n, workers)
+        push!(tasks, Threads.@spawn begin
+            try
+                _mutate_particles!(positions, state, ancestors, seeds,
+                    targets[worker], options, indices)
+            catch err
+                err isa SMCNonfiniteError || rethrow()
+                err
+            end
+        end)
+    end
+    # Join every worker before propagating a failure. Fetch below preserves
+    # TaskFailedException for unrelated failures; numerical diagnostics cross
+    # tasks as data so callers receive SMCNonfiniteError directly.
+    for task in tasks
+        try
+            wait(task)
+        catch err
+            err isa TaskFailedException || rethrow()
+        end
+    end
+    results = map(fetch, tasks)
+    for result in results
+        result isa SMCNonfiniteError && throw(result)
+    end
+    divergences = sum(r.divergences for r in results)
+    evaluations = sum(r.evaluations for r in results)
+    movement = foldl((a,r) -> a+r.movement, results; init=0.0)
+    acceptance = foldl((a,r) -> a+r.acceptance, results; init=0.0)
+    return divergences, evaluations, movement/n, acceptance/(n*options.moves), workers
+end
+
 function _library_stage(state, beta, delta, seed)
     d, n = size(state.positions)
     positions = similar(state.positions)
     ancestors = Vector{Int}(undef, n)
-    starts, finishes, divergences = Ref(0), Ref(0), Ref(0)
-    evaluations, movement, acceptance = Ref(0), Ref(0.0), Ref(0.0)
-    target = BridgeTarget(state.source, state.target, beta, d)
-    options, _ = _stage_kernel(state.options, d, beta)
-    metric = _metric(options.metric)
+    seeds = Vector{UInt64}(undef, n)
+    starts, finishes = Ref(0), Ref(0)
     mutation! = function (out, rng, step, parent, scratch)
         if step == 1
             i = starts[] += 1
@@ -547,21 +619,7 @@ function _library_stage(state, beta, delta, seed)
         else
             i = finishes[] += 1
             ancestors[i] = parent.index
-            u = copy(state.positions[:, parent.index])
-            if d > 0
-                chain = FixedKernelNUTSState(Xoshiro(rand(rng, UInt64)), u;
-                    metric, stepsize=options.stepsize, max_tree_depth=options.max_tree_depth)
-                for _ in 1:options.moves
-                    transition = fixed_kernel_nuts_step(chain, target)
-                    chain = transition.state
-                    divergences[] += transition.divergent
-                    evaluations[] += transition.stats.steps
-                    acceptance[] += transition.stats.acceptance_rate
-                end
-                u = chain.position
-            end
-            movement[] += sum(abs2, u .- view(state.positions, :, parent.index))
-            positions[:, i] = u
+            d > 0 && (seeds[i] = rand(rng, UInt64))
             out.index = i
             out.logweight = 0.0
         end
@@ -570,26 +628,19 @@ function _library_stage(state, beta, delta, seed)
     potential = (step, particle, scratch) -> particle.logweight
     model = SMCModel(mutation!, potential, 2, IndexParticle, Nothing)
     output = SMCIO{IndexParticle,Nothing}(n, 2, 1, false)
-    # SMC 0.7 has no rng keyword. Seed only this owned child task. On our
-    # Julia >=1.10 floor task creation does not advance the parent's RNG.
+    # The library owns weighting and resampling. Keep its serial RNG order,
+    # drawing all child seeds after resampling and before launching mutation.
+    # This also permits any particle count and synchronized mutation rounds.
     task = @task begin
         Random.seed!(seed)
-        try
-            smc!(model, output)
-            nothing
-        catch err
-            # Transport only our numerical diagnostic as data. Other failures
-            # keep their ordinary task exception and original backtrace.
-            err isa SMCNonfiniteError || rethrow()
-            err
-        end
+        smc!(model, output)
     end
     schedule(task)
-    result = fetch(task) # join every worker before returning or throwing
-    result isa SMCNonfiniteError && throw(result)
+    fetch(task)
+    divergences, evaluations, movement, acceptance, workers =
+        _mutation!(positions, state, ancestors, seeds, beta)
     return positions, ancestors, output.logZhats[end], n*output.esses[1],
-        divergences[], evaluations[], movement[]/n,
-        d == 0 ? nothing : acceptance[]/(n*options.moves)
+        divergences, evaluations, movement, acceptance, workers
 end
 
 function PPL.smc_step(state::SMCState)
@@ -609,7 +660,7 @@ function PPL.smc_step(state::SMCState)
     end
     beta = _temperature(delta, state.temperature, state.options)
     rng = copy(state.rng)
-    positions, ancestors, increment, ess, divergences, evaluations, movement, acceptance =
+    positions, ancestors, increment, ess, divergences, evaluations, movement, acceptance, workers =
         _library_stage(state, beta, delta, rand(rng, UInt64))
     isfinite(increment) || throw(DomainError(increment, "non-finite SMC normalizer increment"))
     log_normalizer = state.log_normalizer+increment
@@ -620,7 +671,7 @@ function PPL.smc_step(state::SMCState)
         length(Set(ancestors)), length(Set(lineage)), d == 0 ? 0 : n*kernel.moves,
         divergences, deepcopy(kernel), tuning_index, evaluations, movement, acceptance,
         _cloud_sd(positions),
-        state.source isa ReferenceTarget ? copy(state.source.standard_deviation) : nothing)
+        state.source isa ReferenceTarget ? copy(state.source.standard_deviation) : nothing, workers)
     history = [state.history; stage]
     if length(history) > state.options.history_limit
         deleteat!(history, 1:length(history)-state.options.history_limit)
