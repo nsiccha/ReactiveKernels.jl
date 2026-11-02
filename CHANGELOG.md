@@ -25,6 +25,13 @@ are recorded in the git history only.
 - Endpoint constructor and method arguments also recognize local assignments
   inside lazy branch blocks, preserving their evaluation within the guard.
 
+## 0.1.56
+
+- Derive finite scalar recurrences from recorded `@traceable` vector helpers
+  for streaming consumers. Retain the original arithmetic, lazy branches,
+  output conversion and ordinary derivatives without executing the helper
+  during preparation or unrolling its data-dependent loop.
+
 ## 0.1.55
 
 - Compose shared upstream plates into selected consumers with independent

@@ -2,12 +2,15 @@ using Test, Random, Distributions, SequentialMonteCarlo, Statistics, Serializati
 using ReactiveKernels, ReactiveKernelsPPL
 
 include("filter_static_arrays.jl")
+include("filter_vector_events.jl")
 
 roundtrip_filter(x) = (io=IOBuffer(); serialize(io,x); seekstart(io); deserialize(io))
 bytes_filter(x) = (io=IOBuffer(); serialize(io,x); position(io))
 current(s,nm;g=1) = [getproperty(c,nm)[end,g] for c in s.carries]
 fmean(s,nm;g=1) = sum(current(s,nm;g).*s.weights)
 fvar(s,nm;g=1) = sum((current(s,nm;g).-fmean(s,nm;g)).^2 .* s.weights)
+
+include("filter_helpers.jl")
 
 @testset "Finite deterministic scan and full replay" begin
     model = @rkppl begin
