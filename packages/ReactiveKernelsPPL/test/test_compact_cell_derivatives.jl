@@ -1,5 +1,6 @@
 using ReactiveKernels, ReactiveKernelsPPL, Distributions, Enzyme, Test, LinearAlgebra
 using DifferentiationInterface: AutoEnzyme, SecondOrder
+using SpecialFunctions: digamma
 
 # Hessian-vector products and third-order contractions of ONE cell's log
 # density over a compact selection of packed coordinates
@@ -163,6 +164,80 @@ end
         base, u[selection(1)], [2, 1, 3, 4], 1)
     @test_throws ReactiveKernelsPPL.ContractValidationError ad_hvp(h, directions)
     @test data == _ccd_poisson_data(6)
+end
+
+# Independent negative-binomial derivatives in (intercept, log shape,
+# selected group effect, unused group effect) coordinates. Differencing this
+# gradient checks H*v without differentiating RK's generated logbeta rule.
+function _ccd_negbin_gradient(x, y)
+    mu, shape = exp(x[1] + x[3]), exp(x[2])
+    eta_gradient = y - (y + shape) * mu / (shape + mu)
+    shape_gradient = shape * (digamma(y + shape) - digamma(shape) +
+        log(shape) - log(shape + mu) + 1 - (y + shape) / (shape + mu))
+    [eta_gradient, shape_gradient, eta_gradient, 0.0]
+end
+
+@testset "compact cell derivatives: negative-binomial forward over reverse" begin
+    # An ordinary elementwise observation reads a gathered group effect and
+    # a shared shape. Its logbeta derivative graph contains digamma calls.
+    # Forward over reverse could not link those calls before Enzyme dogfood
+    # 474fd636 (snag forward-over-rev-188051dc); the primal stays unchanged.
+    ast = quote
+        a ~ Normal(0, 1)
+        shape ~ Exponential(1)
+        z[1:6] .~ Normal.(0, 1)
+        mu = exp.(a .+ z[idx])
+        y .~ NegativeBinomial2.(mu, shape)
+    end
+    data = (; idx = [1, 3, 2, 1], y = [0, 2, 5, 1])
+    saved_data = deepcopy(data)
+    bound, built = _cq_bound(ast, data, (:y,))
+    @test coordinate_names(built.layout) == [:a; :shape; [Symbol("z.", g) for g in 1:6]]
+    base = collect(range(-0.3, 0.4; length = built.layout.total))
+    saved_base = copy(base)
+    selection(i) = [1, 2, 2 + data.idx[i], 3 + data.idx[i]]
+    directions = ([0.2, -0.1, 0.3, 0.7], [-0.4, 0.2, 0.1, -0.5])
+    saved_directions = deepcopy(directions)
+    q = prepare_cell_query(built, bound, :y)
+    single = prepare_compact_cell_ad(prepare_ad_hvp, built, bound, :y,
+        base, selection(1), _CCD_FORWARD_REVERSE, (directions[1],))
+    batch = prepare_compact_cell_ad(prepare_ad_hvp, built, bound, :y,
+        base, selection(1), _CCD_FORWARD_REVERSE, directions)
+    _ccd_static() do
+        for (i, offset) in ((1, 0.0), (2, 0.15), (3, -0.2), (1, 0.1))
+            indices = selection(i)
+            active = base[indices] .+ offset
+            saved_active = copy(active)
+            overlaid = copy(base)
+            overlaid[indices] = active
+            mu, shape = exp(active[1] + active[3]), exp(active[2])
+            @test q(overlaid, i) ≈ logpdf(NegativeBinomial(shape, shape / (shape + mu)), data.y[i]) atol = 1e-12
+            expected_g = _ccd_negbin_gradient(active, data.y[i])
+            expected_hv = map(directions) do v
+                h = 1e-5
+                (_ccd_negbin_gradient(active + h * v, data.y[i]) -
+                    _ccd_negbin_gradient(active - h * v, data.y[i])) / (2h)
+            end
+            g, products = ad_gradient_and_hvp(batch, directions, base, active, indices, i)
+            @test g ≈ expected_g atol = 1e-11
+            for (product, expected) in zip(products, expected_hv)
+                @test product ≈ expected rtol = 2e-8 atol = 2e-9
+                @test iszero(product[4])
+            end
+            @test only(ad_hvp(single, (directions[1],), base, active, indices, i)) ≈
+                expected_hv[1] rtol = 2e-8 atol = 2e-9
+            gbuf, buffers = fill(NaN, 4), (fill(NaN, 4), fill(NaN, 4))
+            ad_gradient_and_hvp!(batch, gbuf, buffers, directions, base, active, indices, i)
+            @test gbuf ≈ expected_g atol = 1e-11
+            @test all(isapprox(got, expected; rtol = 2e-8, atol = 2e-9)
+                for (got, expected) in zip(buffers, expected_hv))
+            @test active == saved_active
+            @test indices == selection(i)
+        end
+    end
+    @test base == saved_base
+    @test data == saved_data
+    @test directions == saved_directions
 end
 
 @testset "compact cell derivatives: a nonlinear grouped cell against differences" begin
