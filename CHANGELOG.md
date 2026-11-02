@@ -22,6 +22,8 @@ are recorded in the git history only.
   their constructor arguments already do. A call such as
   `normal(mu, sigma).logpdf(transformed)` may read `transformed` computed in
   that cell, retaining its graph, lazy branches and native reverse derivatives.
+- Endpoint constructor and method arguments also recognize local assignments
+  inside lazy branch blocks, preserving their evaluation within the guard.
 
 ## 0.1.55
 

@@ -126,6 +126,17 @@ end
     return sum(cells)
 end
 
+@kernel branch_local_arguments(x, m) = begin
+    total = if x[1] > 0
+        z = log(x[1])
+        location = m[1] + 1.0
+        normal(location, 1.0).logpdf(z)
+    else
+        0.0
+    end
+    return total
+end
+
 const X = [0.3, 1.2, -0.4]
 const M = [0.0, 1.0]
 first_point(m) = sum(nlp(X[1], mu, 1.0) for mu in m)
@@ -151,6 +162,8 @@ every_point(m) = sum(nlp(xi, mu, 1.0) for xi in X, mu in m)
         (plate_local_argument, X, sum(nlp(xi^2+0.1, M[1], 1.0) for xi in X)),
         (plate_guarded_local_argument, X,
             sum(nlp(xi > 0 ? log(xi) : 0.0, M[1], 1.0) for xi in X)),
+        (branch_local_arguments, X, nlp(log(X[1]), M[1]+1.0, 1.0)),
+        (branch_local_arguments, [-0.4], 0.0),
     )
     for (spec, x, expected) in cases
         saved = (copy(x), copy(M))
@@ -176,6 +189,8 @@ end
         (plate_local_argument, X, [sum(X.^2 .+ 0.1 .- M[1]), 0.0]),
         (plate_guarded_local_argument, X,
             [sum((xi > 0 ? log(xi) : 0.0)-M[1] for xi in X), 0.0]),
+        (branch_local_arguments, X, [log(X[1])-M[1]-1.0, 0.0]),
+        (branch_local_arguments, [-0.4], [0.0, 0.0]),
     )
     for (spec, x, expected) in cases, bound in (false, true)
         k = bound ? prepare(spec; bound = (; x)) : prepare(spec)

@@ -2084,6 +2084,12 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
     child_types = Any[]
     child_scoped = _kernel_is_scope_expr(ex) ?
         _kernel_scope_binders!(copy(scoped), ex) : scoped
+    # A lazy branch block remains inside its recipe closure. Its assignments
+    # are local values, not exposed caller ports, just like assignments in a
+    # loop or `let` body. Keep endpoint arguments that read them in place.
+    if !straight && ex.head === :block
+        child_scoped = _kernel_scope_assignments!(copy(child_scoped), ex)
+    end
     for (i, arg) in enumerate(ex.args)
         child, child_type = _kernel_constructed_endpoint(
             arg, mod, locals, nested_specs, local_types;
