@@ -112,7 +112,20 @@ end
     end
     retained_old = F.calibration(F.build(1, Int[], Float64[]; source=retained_source),
         SMCReference([0.3], [0.4]))
-    fresh_only = F.window(F.build(2, [2], [1.4]; source=retained_source), retained_old)
+    # A compound scalar recipe currently has conservative whole-array
+    # support. Preserve the explicit refusal; do not infer its reads by value.
+    @test_throws ArgumentError F.window(
+        F.build(2, [2], [1.4]; source=retained_source), retained_old)
+    # Direct scalar indexing has native locality and is provably retained-only.
+    indexed_source = quote
+        z[1:nb] .~ Normal.(0, 1)
+        retained = z[1]
+        retained ~ Normal(0.3, 1.7)
+        y .~ Normal.(z[block], 1)
+    end
+    indexed_old = F.calibration(F.build(1, Int[], Float64[]; source=indexed_source),
+        SMCReference([0.3], [0.4]))
+    fresh_only = F.window(F.build(2, [2], [1.4]; source=indexed_source), indexed_old)
     @test smc_window_coordinates(fresh_only).current_indices == [2]
     @test F.EXT._density(fresh_only, [0.2]) ≈
         F.normal(0.2, 0, 1) + F.normal(1.4, 0.2, 1)
@@ -136,8 +149,10 @@ end
         push!(allocated, @allocated F.EXT._gradient(target, gradient, point))
         push!(emitted, nodes(code_expr(target.query.kernel)))
         footprint = Base.invokelatest(partition_footprint, target.query.kernel, point)
-        @test footprint._ppl_smc_active == [1, 2]
-        push!(reads, length(footprint._ppl_smc_active))
+        support = footprint._ppl_smc_active
+        support = support === :whole ? collect(eachindex(point)) : support
+        @test support == [1, 2]
+        push!(reads, length(support))
     end
     @test emitted[1] == emitted[2]
     @test reads[1] == reads[2]

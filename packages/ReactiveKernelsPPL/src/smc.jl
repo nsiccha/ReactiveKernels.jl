@@ -279,8 +279,11 @@ of fresh priors, including old hyperparameters absent from the likelihood,
 belong to the active set. Joint factors and coupled transforms remain intact.
 Fresh events are selected by [`factor_coordinates`](@ref) ownership, never by
 their read support. A density on a derived expression that owns no coordinates
-but reads fresh ones cannot be assigned automatically and is rejected rather
-than omitted. Fresh-factor discovery inherits [`density_factors`](@ref)'s
+and whose structural support includes fresh ones cannot be assigned automatically
+and is rejected rather than omitted. This support can conservatively include
+whole arrays for compound scalar expressions such as `z[1]^2`; direct scalar
+index reads use native locality lowering. Fresh-factor discovery inherits
+[`density_factors`](@ref)'s
 explicit limitations for noncentered scans and stochastic scans inside cells.
 The likelihood must satisfy native partition locality. Sparse observations
 selecting elements of simplex/ordered slice-transformed arrays currently lack

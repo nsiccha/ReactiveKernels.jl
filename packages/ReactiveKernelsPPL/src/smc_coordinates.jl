@@ -59,7 +59,7 @@ function _smc_fresh_window_terms(built, binding, fresh, u0)
             locality=:error, on_error=nothing, u0))
         any(i -> isfresh[i], _smc_read_support(derived, u0)) &&
             throw(ArgumentError("selective SMC cannot assign an ownerless " *
-                "density reading fresh coordinates: $ownerless"))
+                "density whose structural read support includes fresh coordinates: $ownerless"))
     end
     selected = select_factors(catalogue, events)
     factors = _smc_scalar_reads(_density_selection_spec(built, binding, selected;
