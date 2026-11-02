@@ -126,5 +126,9 @@ function _carry_summary(target::SMCSelectiveTarget, reference;
         deepcopy((; marginal=diagnostics, joint=carried.fit_diagnostics)))
 end
 
+_parameter_projection(::SMCSelectiveTarget, parameters) = throw(ArgumentError(
+    "parameters selection requires a full-frame SMC fit; omit parameters for " *
+    "a selective window to integrate its inactive conditional into the full joint carry"))
+
 _worker_target(t::SMCSelectiveTarget) = SMCSelectiveTarget(deepcopy(t.query), t.backend,
     t.signature, _worker_target(t.prior), t.conditional, t.selection)

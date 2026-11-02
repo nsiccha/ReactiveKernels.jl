@@ -221,7 +221,7 @@ not retained. This summary is a prior for subsequent windows, not production
 kernel adaptation. Mutation tuning still uses independent pilot RNGs/positions.
 
 `parameters=(:name, Symbol("nested.name"), ...)` selects complete authored
-static parameter blocks from a completed fit, excluding historical scan
+static parameter blocks from a completed full-frame fit, excluding historical scan
 coordinates. The producer packs their unconstrained marginal and carries only
 their portable native geometry. `scale`, if supplied, must be in this selected
 frame; slicing a full correlated scale does not produce its marginal scale.
@@ -230,6 +230,8 @@ Static transform dependencies must also be selected. Data-only scalar bound
 expressions are folded once, so old observations are not retained. Custom
 geometry containing callable objects is not represented by this native
 projection; use a static-only calibration and an explicit mapping for it.
+For selective windows (`coordinates=:auto`), omit `parameters`: carrying
+integrates the inactive conditional into the full joint Gaussian.
 """
 function carry_smc end
 

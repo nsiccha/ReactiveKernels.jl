@@ -15,6 +15,7 @@ const F=SMCSelectiveFixture
     @test size(fit.positions)==(0,8)
     @test fit.log_normalizer==0
     carried=carry_smc(fit;calibration_id="empty")
+    @test_throws ArgumentError carry_smc(fit;calibration_id="empty",parameters=(:z,))
     @test carried.reference.location==old.reference.location
     @test F.EXT._reference_sd(carried.reference.scale)≈old.reference.scale
     @test smc_recover(target,Float64[];rng=Xoshiro(17))==

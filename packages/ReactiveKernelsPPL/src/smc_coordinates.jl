@@ -139,16 +139,65 @@ end
 
 # Reuse the public authored coordinate inventory, including Cartesian/cell
 # indices, scoped names and coefficient levels. Offsets are never identities.
+function _smc_bound_identity(layout)
+    sampled = Dict(_smc_output_name(e) => _smc_output_path(layout, e) for e in layout.entries)
+    visiting = Set{Symbol}()
+    dynamic_cache = Dict{Symbol,Bool}()
+    function dynamic(name)
+        haskey(sampled, name) && return true
+        haskey(dynamic_cache, name) && return dynamic_cache[name]
+        haskey(layout.bound_values, name) && return false
+        haskey(layout.bound_exprs, name) || return false
+        name in visiting && throw(ArgumentError("cyclic SMC transform dependency $name"))
+        push!(visiting, name)
+        result = any(dynamic, _value_symbols(layout.bound_exprs[name]))
+        delete!(visiting, name)
+        dynamic_cache[name] = result
+        result
+    end
+    lookup = _layout_lookup(layout, Dict{Symbol,Any}())
+    frozen = Dict{Symbol,Any}()
+    function freeze(ex)
+        ex isa Real && return ex
+        if !any(dynamic, _value_symbols(ex))
+            # Fold data-only subexpressions, so a bound depending on a
+            # scalar summary retains that summary instead of old data.
+            return deepcopy(_eval_value_expr(ex, lookup, :smc_transform_bound))
+        elseif ex isa Symbol
+            haskey(sampled, ex) && return (; parameter=sampled[ex])
+            return get!(frozen, ex) do
+                freeze(layout.bound_exprs[ex])
+            end
+        elseif ex isa Expr
+            ex.head === :call && return Expr(:call, ex.args[1], map(freeze, ex.args[2:end])...)
+            return Expr(ex.head, map(freeze, ex.args)...)
+        end
+        deepcopy(ex)
+    end
+    freeze
+end
+
 function _smc_coordinate_records(layout::LayoutTable)
     records = NamedTuple[]
     labels = coordinate_names(layout)
+    bound_identity = _smc_bound_identity(layout)
     for entry in layout.entries
         path = _smc_output_path(layout, entry)
         sampling = entry.sampling === nothing ? nothing :
             (; entry.sampling.rhs, entry.sampling.broadcast, entry.sampling.constructor_broadcast)
-        coupled = !(entry.transform in (:identity, :exp, :logistic, :interval, :floored, :upper)) ||
-            entry.sampling !== nothing || haskey(layout.cell_geometries, entry.name)
-        event_shapes = fill(coupled ? (entry.size, Tuple(entry.dims)) : nothing, entry.size)
+        coupled = entry.kind !== :external_plate &&
+            (!(entry.transform in (:identity, :exp, :logistic, :interval, :floored, :upper)) ||
+             entry.sampling !== nothing || haskey(layout.cell_geometries, entry.name))
+        event_shape = coupled ? (entry.size, Tuple(entry.dims)) : nothing
+        if entry.kind === :array && _is_slice_transform(entry.transform)
+            axis = _slice_transform_orientation(entry.transform) isa _SliceRows ? 2 : 1
+            event_shape = (_slice_packed_dims(entry.transform, entry.dims)[axis],
+                (entry.dims[axis],))
+        elseif entry.kind === :array && _is_lkj_stack(entry.transform)
+            width = entry.dims[1]
+            event_shape = (width * (width-1) ÷ 2, (width, width))
+        end
+        event_shapes = fill(event_shape, entry.size)
         if haskey(layout.cell_geometries, entry.name)
             # A joint event is one cell, not the complete array of cells.
             # Store only shape/identity metadata, never callable geometry.
@@ -162,10 +211,11 @@ function _smc_coordinate_records(layout::LayoutTable)
             sampling = (; arguments=cell.arguments, keywords=cell.keywords,
                 coordinates=cell.geometry.coordinate_names)
         end
+        lo, hi = bound_identity(entry.lo), bound_identity(entry.hi)
         for j in 1:entry.size
             label = string(labels[entry.offset+j-1])
             geometry = (; kind=entry.kind, transform=entry.transform,
-                lo=entry.lo, hi=entry.hi, event_shape=event_shapes[j], sampling)
+                lo, hi, event_shape=event_shapes[j], sampling)
             push!(records, (; identity=(path, label), geometry))
         end
     end
