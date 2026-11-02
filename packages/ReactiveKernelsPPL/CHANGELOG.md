@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.61
+## 0.1.62
 
 - Preserve vector-event broadcasts and grouped input axes in finite-state
   filters. Broadcast kernel-backed `LogDensity` laws and nested truncated
@@ -25,7 +25,20 @@ are recorded in the git history only.
   using declared input ports, including grouped recurrences and current-clock
   gathers. Drop unused group diagnostics and historical input columns.
   Whole-vector event laws keep their full helper computation. Requires RK
-  0.1.54; see `prepare_filter` for supported helper shapes and record examples.
+  0.1.55; see `prepare_filter` for supported helper shapes and record examples.
+
+## 0.1.61
+
+- Add `partitioned` to compact cell AD and cell factor preparation, caching
+  shared-only whole-array producers while retaining strict local derivatives
+  over the partitioned coordinates. Factor preparation also accepts `u0`.
+- Add `prepare_cell_pullback`, `cell_pullback!`, `prepare_cell_accumulator`
+  and `accumulate_cell!`. Accumulate weighted local gradient, HVP and third
+  contributions into shared cotangents, then apply the prefix pullback once
+  per pass for exact mixed population derivatives with linear storage.
+  Local derivative verbs accept the active pass in place of their base
+  vector to avoid per-cell shared-coordinate scans.
+  Require RK 0.1.54 for additive native Enzyme differentiation.
 
 ## 0.1.60
 
