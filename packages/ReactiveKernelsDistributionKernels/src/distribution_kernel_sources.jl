@@ -34,6 +34,8 @@ const logbeta = scalar_derivative_rule(
     logbeta_graph; primal = :y, partials = (a = :dy_da, b = :dy_db),
     name = :logbeta)
 
+include("gamma_logtails.jl")
+
 # General symmetric-eigendecomposition primitives live in RK proper.
 # Preserve qualified consumer names as imports of the same owned graphs.
 using ReactiveKernels: rk_symmetric_eigvals_rule, rk_symmetric_eigvecs_rule
@@ -699,10 +701,11 @@ end
 # route while the others become derived views. `logpdf` uses `log_rate` directly
 # for the normalization so no `log(exp(log_rate))` round trip enters the plan.
 const GAMMA_KERNEL_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, _gamma_log_tail
 using SpecialFunctions: gamma_inc, gamma_inc_inv
 
 @kernel gamma(shape::Float64, rate::Float64) = begin
+    log_shape_gamma::Float64 = shape > 0 ? loggamma(shape) : Inf
     # The log-rate view is also a captured density input. Guard its
     # undefined arithmetic before it reaches the rejecting logpdf arm.
     log_rate::Float64 = rate > 0 ? log(rate) : -Inf
@@ -712,15 +715,15 @@ using SpecialFunctions: gamma_inc, gamma_inc_inv
 
     logpdf(x::Float64)::Float64 =
         (x >= 0 || isnan(x)) & (shape > 0) & (log_rate > -Inf) ?
-            (x == Inf ? -Inf : shape * log_rate - loggamma(shape) +
+            (x == Inf ? -Inf : shape * log_rate - log_shape_gamma +
              (shape == 1 ? 0.0 : (shape - 1) * log(x)) - rate * x) :
             -Inf
     cdf(x::Float64)::Float64 =
         x <= 0 ? 0.0 : first(gamma_inc(shape, rate * x))
     ccdf(x::Float64)::Float64 =
         x <= 0 ? 1.0 : last(gamma_inc(shape, rate * x))
-    logcdf(x::Float64)::Float64 = log(cdf(x))
-    logccdf(x::Float64)::Float64 = log(ccdf(x))
+    logcdf(x::Float64)::Float64 = _gamma_log_tail(shape, rate * x, log_shape_gamma, false)
+    logccdf(x::Float64)::Float64 = _gamma_log_tail(shape, rate * x, log_shape_gamma, true)
     quantile(p::Float64)::Float64 = gamma_inc_inv(shape, p, 1 - p) / rate
 end
 """

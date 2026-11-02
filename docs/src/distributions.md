@@ -142,12 +142,24 @@ moments = prepare(extract(lower_truncated_lognormal;
     have=(:location, :scale, :lower), want=(:mean, :var)))
 ```
 
+A nonpositive lower bound selects ordinary LogNormal moments. Use
+`lower_truncated_lognormal(location, scale, 0.0).mean()` and `.var()` for
+untruncated authored moments; negative lower bounds give the same result.
+Zero scale is supported. The `lognormal` object itself provides density and
+tail endpoints, while these moment endpoints belong to the truncated objects.
+
 These graphs use scaled complementary error functions and a second difference
 of the log Mills ratio. Close differences use quadrature; its normal tail
 variance uses a continued-fraction scan in the positive tail. The scan length
 depends on the parameter value and remains a runtime loop. The variance avoids
 subtracting two nearly equal raw moments. All arithmetic participates in RK
 composition, binding and plate planning.
+
+`gamma(shape, rate)` also provides `logcdf(x)` and `logccdf(x)`.
+Its log-shape normalizer is a shared graph node. Very small tails use a
+log-space positive series or continued fraction, preserving finite log
+probabilities after the corresponding probability underflows. Those iterations
+remain runtime loops and differentiate through their ordinary primal code.
 
 ## DirichletMultinomial events
 

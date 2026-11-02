@@ -32,7 +32,30 @@ end
     return upper_truncated_lognormal(q[1], exp(q[2]), exp(q[3])).var()
 end
 
+@kernel ordinary_mean(q::Vector{Float64}) = begin
+    return lower_truncated_lognormal(q[1], exp(q[2]), 0.0).mean()
+end
+@kernel ordinary_var(q::Vector{Float64}) = begin
+    return lower_truncated_lognormal(q[1], exp(q[2]), 0.0).var()
+end
+
 @testset "graph-visible one-sided LogNormal moments" begin
+    @testset "ordinary moments through a nonpositive lower bound" begin
+        moments = prepare(extract(lower_truncated_lognormal;
+            have=(:location,:scale,:lower), want=(:mean,:var)))
+        for mu in (-2.0,0.3), sigma in (0.0,0.01,2.0), lower in (-Inf,-1.0,0.0)
+            @test moments(mu,sigma,lower) ==
+                (exp(mu + sigma^2/2), exp(2mu + sigma^2)*expm1(sigma^2))
+        end
+        backend = DI.AutoEnzyme(;mode=Enzyme.Reverse)
+        q = [0.3,log(0.7)]
+        s2 = exp(2q[2])
+        m = exp(q[1] + s2/2)
+        v = exp(2q[1] + s2)*expm1(s2)
+        @test DI.gradient(prepare(ordinary_mean),backend,q) ≈ [m,s2*m]
+        @test DI.gradient(prepare(ordinary_var),backend,q) ≈
+            [2v,2s2*exp(2q[1]+s2)*(2exp(s2)-1)]
+    end
     for (upper, object, boundname) in ((false, lower_truncated_lognormal, :lower),
                                       (true, upper_truncated_lognormal, :upper))
         f = prepare(extract(object; have=(:location,:scale,boundname), want=(:mean,:var)))
