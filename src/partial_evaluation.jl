@@ -1843,13 +1843,16 @@ _partial_hoisted(p::Plan, b::_PartialBoundary, values::Tuple) =
     _partial_prefix_values(b.constants, _prepare_plan(_partial_prefix_plan(p, b))(values...))
 
 # The zero-input constant recipes carrying one binding's hoisted values into
-# the residual plan, under negative ids that cannot collide with graph recipes.
-function _partial_constant_recipes(constants::Vector{Value}, @nospecialize(hoisted))
+# the residual plan. Splitting and fusion can leave synthetic negative ids in
+# the residual, so allocate below those too, not just below graph recipe ids.
+function _partial_constant_recipes(constants::Vector{Value}, @nospecialize(hoisted),
+                                   residual::Vector{Recipe})
+    base = minimum((r.id for r in residual); init = 0)
     # A loop, not a comprehension: its closure would be typed by `hoisted` and
     # compiled again for every binding's value types.
     recipes = Vector{Recipe}(undef, length(constants))
     for (index, value) in enumerate(constants)
-        recipes[index] = Recipe(-index, (), (value,), _BoundConstant(hoisted[index]),
+        recipes[index] = Recipe(base - index, (), (value,), _BoundConstant(hoisted[index]),
                                 0.0, nothing, false)
     end
     recipes
@@ -1921,7 +1924,7 @@ end
 function _partial_residual_plan(p::Plan, b::_PartialBoundary, @nospecialize(hoisted),
                                 residual::Vector{Recipe})
     recipes = isempty(b.constants) ? residual :
-        vcat(_partial_constant_recipes(b.constants, hoisted), residual)
+        vcat(_partial_constant_recipes(b.constants, hoisted, residual), residual)
     _partial_subplan(p, b.remaining, p.want, recipes)
 end
 
