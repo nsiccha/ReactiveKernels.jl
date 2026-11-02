@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.61
+
+- Supply compact Gaussian marginal, conditional and replacement algebra for
+  selective carried inference. Diagonal plus bounded-rank covariance keeps
+  storage linear in dimension and supports ordinary native derivatives.
+
 ## 0.1.60
 
 - Evaluate binary ordinary array addition and subtraction at requested rows

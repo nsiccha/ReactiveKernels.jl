@@ -16,6 +16,21 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.70
+
+- Add `prepare_smc_window(...; coordinates=:auto)` for changing authored
+  coordinate sets. Compact targets combine the old active marginal, fresh
+  owned prior events and new observations, retaining native derivatives.
+- Add `smc_window_coordinates` and `smc_recover` for compact particle order
+  and lazy correlated recovery. Selective `carry_smc` integrates the inactive
+  conditional into one bounded-rank joint Gaussian with loss diagnostics.
+  Compact covariance scales also serve as normalized importance references.
+- Default `coordinates=:all` retains its strict frame contract. Selective
+  windows reject partly fresh atomic events, ownerless densities whose
+  structural support reaches fresh coordinates, and unsupported observation
+  locality. See `prepare_smc_window` for the supported boundaries. Requires
+  RK 0.1.61.
+
 ## 0.1.69
 
 - Expose strict local factors for ordinary array sums such as

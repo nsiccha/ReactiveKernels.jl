@@ -107,7 +107,18 @@ end
     @test Base.summarysize(small) == Base.summarysize(large)
     tsmall, tlarge = W.window(previous=small), W.window(previous=large)
     @test W.EXT._density(tsmall,[0.1,0.2]) == W.EXT._density(tlarge,[0.1,0.2])
-    @test Base.summarysize(tsmall) == Base.summarysize(tlarge)
+    # Graph Dict bucket capacity varies even between two builds with the
+    # same old history. Compare retained data and logical graph size, not
+    # spare compiler hash-table slots counted by whole-target summarysize.
+    @test W.EXT._same(tsmall.signature,tlarge.signature)
+    @test Base.summarysize(tsmall.query.kernel.constants) ==
+        Base.summarysize(tlarge.query.kernel.constants)
+    @test length(tsmall.query.kernel.plan.graph.values) ==
+        length(tlarge.query.kernel.plan.graph.values)
+    checkpoints = map((tsmall,tlarge)) do target
+        smc_checkpoint(initialize_smc(target;rng=Xoshiro(722),particles=8))
+    end
+    @test Base.summarysize(checkpoints[1]) == Base.summarysize(checkpoints[2])
     # Report wall time as measurement, not a timing-based correctness threshold.
     g,u = zeros(2),[0.1,0.2]
     for target in (tsmall,tlarge)
@@ -116,5 +127,5 @@ end
     times = map((tsmall,tlarge)) do target
         median([@elapsed(for _ in 1:1000; W.EXT._gradient(target,g,u); end) for _ in 1:5])/1000
     end
-    @info "Fixed three-row window at old history lengths 8 and 4096" summary_bytes=Base.summarysize(small) target_bytes=Base.summarysize(tsmall) gradient_seconds=times
+    @info "Fixed three-row window at old history lengths 8 and 4096" summary_bytes=Base.summarysize(small) target_bytes=Base.summarysize.((tsmall,tlarge)) checkpoint_bytes=Base.summarysize(checkpoints[1]) gradient_seconds=times
 end
