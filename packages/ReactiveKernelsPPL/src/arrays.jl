@@ -1431,12 +1431,15 @@ function _array_transform_statements(e::LayoutEntry)
     _is_lkj_stack(e.transform) && return _lkj_stack_transform_statements(e)
     if _is_slice_transform(e.transform)
         U = _array_slices_packed_name(e.name)
+        flat = _array_flat_name(U, 2)
+        raw = Symbol(flat, :_raw)
         lo, hi = e.offset, e.offset + e.size - 1
         cfn, _ = _slice_function_names(e.transform)
         o = _orientation_expr(_slice_transform_orientation(e.transform))
         return Expr[
-            :($U::Matrix{Float64} = reshape(Float64.(view(unconstrained,
-                $lo:$hi)), $(_slice_packed_dims(e.transform, e.dims)...))),
+            :($raw = view(unconstrained, $lo:$hi)),
+            :($flat = Float64.($raw)),
+            :($U::Matrix{Float64} = reshape($flat, $(_slice_packed_dims(e.transform, e.dims)...))),
             :($(e.name)::Matrix{Float64} = $cfn($o, $U)),
         ]
     end
@@ -1763,7 +1766,7 @@ end
 # Prior nodes `_ppl_prior_<name>` of the plan's array parameters.
 function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         plan::StructuralPlan, needed::Set{Tuple{Symbol,Symbol,Int}};
-        context = plan, pointwise = Pair{Symbol,Any}[])
+        context = plan, pointwise = Pair{Symbol,Any}[], density_sites = nothing)
     for p in plan.array_parameters
         dims = _array_dims(plan, p)
         node = Symbol(:_ppl_prior_, p.name)
@@ -1771,6 +1774,9 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             append!(stmts, _external_density_statements(p))
             push!(terms, node)
             push!(pointwise, p.name => Symbol(p.args.broadcast ? :_ppl_pw_prior_ : :_ppl_prior_, p.name))
+            _record_density!(density_sites, stmts, :prior, p.name, node;
+                pointwise = p.args.broadcast ? Symbol(:_ppl_pw_prior_, p.name) : nothing,
+                count = p.args.broadcast ? prod(dims) : 1)
             continue
         end
         if prod(dims) == 0
@@ -1788,6 +1794,7 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
                 :(zeros($(dims...)))
             end
             push!(pointwise, p.name => value)
+            _record_density!(density_sites, stmts, :prior, p.name, node; count = 0)
             continue
         end
         if p.family === :lkj_cholesky
@@ -1807,6 +1814,7 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             end
             push!(terms, node)
             push!(pointwise, p.name => node)
+            _record_density!(density_sites, stmts, :prior, p.name, node)
             continue
         end
         if p.family === :lkj_cholesky_stack
@@ -1814,11 +1822,13 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
                 dims[1], p.args.arg1; nstack = dims[3]))))
             push!(terms, node)
             # A stack is a broadcast of factor draws, one density per slice.
-            if p.name in plan.conditioned
+            if p.name in plan.conditioned || density_sites !== nothing
                 value = Symbol(:_ppl_pointwise_, p.name)
                 push!(stmts, :($value = $(_lkj_prior_terms(p.name,
                     dims[1], Float64(p.args.arg1); nstack = dims[3], pointwise = true))))
                 push!(pointwise, p.name => value)
+                _record_density!(density_sites, stmts, :prior, p.name, node;
+                    pointwise = value, count = dims[3])
             end
             continue
         end
@@ -1826,6 +1836,9 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             push!(stmts, :($node::Float64 = 0.0))
             push!(terms, node)
             push!(pointwise, p.name => :(0.0 .* $(p.name)))
+            haskey(context.cell_geometries, p.name) ||
+                _record_density!(density_sites, stmts, :prior, p.name, node;
+                    pointwise = :(zeros($(prod(dims)))), count = prod(dims))
             continue
         end
         if _is_slice_array(p)
@@ -1835,6 +1848,12 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             push!(terms, node)
             if _slice_kind(p) === :vector
                 push!(pointwise, p.name => node)
+                _record_density!(density_sites, stmts, :prior, p.name, node)
+            elseif density_sites !== nothing
+                count = _slice_kind(p) === :rows ? dims[1] : dims[2]
+                value = _density_slice_plate!(stmts, plan, p, density, dims)
+                _record_density!(density_sites, stmts, :prior, p.name, node;
+                    pointwise = value, count)
             elseif p.name in plan.conditioned
                 value = Symbol(:_ppl_pointwise_, p.name)
                 density = copy(density)
@@ -1883,6 +1902,8 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             float64_variate = p.name ∉ context.conditioned, label = p.name,
             float64_inputs, cell_names)
         push!(pointwise, p.name => :(reshape($(Symbol(:_ppl_pw_prior_, p.name)), size($(p.name)))))
+        _record_density!(density_sites, stmts, :prior, p.name, node;
+            pointwise = Symbol(:_ppl_pw_prior_, p.name), count = prod(dims))
     end
     return nothing
 end
