@@ -21,7 +21,7 @@ Base.deepcopy_internal(::GaussianProblem, ::IdDict) = error("rebuild this solver
 function value(p, u)
     p.fault === :density && return NaN
     p.fault === :support && return -Inf
-    return p.logmass - length(u)*log(2pi)/2 - sum(log, p.scale) -
+    return p.logmass - length(u)*log(2pi)/2 - sum(log, p.scale; init=0.0) -
         sum(abs2, (u .- p.location) ./ p.scale)/2
 end
 function LogDensityProblems.logdensity(p::GaussianProblem, u)
