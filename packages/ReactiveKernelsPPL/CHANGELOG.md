@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.69
+
+- Expose strict local factors for ordinary array sums such as
+  `sum(z[rows[k]] + w[rows[k]])`, including transparent forwarding helpers,
+  with or without shared-prefix caching. Each term retains both gathered
+  operands and the original addition's shape checks. Requires RK 0.1.60.
+
 ## 0.1.68
 
 - **Breaking:** SMC now raises `SMCDegeneracyError` instead of returning or

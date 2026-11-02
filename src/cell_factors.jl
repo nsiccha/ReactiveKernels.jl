@@ -344,8 +344,14 @@ end
 # The first gather reached from the term supplies its row labels. Several
 # operands may gather different arrays: their positions correspond by the
 # authored broadcast, and the term query retains every operand.
-function _cell_factor_rows(spec::KernelSpec, argument::Value)
+function _cell_factor_rows(spec::KernelSpec, argument::Value; bound = NamedTuple())
     g = spec.graph
+    # Split recipes can introduce internal values that are not named ports.
+    p = plan(g; have = [spec[n] for n in spec.have_names], want = [argument])
+    known = IdDict{Recipe,Any}()
+    argument_types = Any[haskey(bound, v.name) ? typeof(bound[v.name]) : valtype(v)
+                         for v in p.have]
+    _cell_value_types(p; argument_types, known)
     seen = Set{ValueId}()
     function walk(v)
         id = canon_id(g, v.id)
@@ -354,7 +360,7 @@ function _cell_factor_rows(spec::KernelSpec, argument::Value)
         ids = producers_of(g, id)
         length(ids) == 1 || return nothing
         r = g.recipes[only(ids)]
-        form = _cell_form(r)
+        form = get(known, r, nothing)
         form === nothing && return nothing
         index = findfirst(==(:index), form.roles)
         index === nothing || return r.inputs[index]
