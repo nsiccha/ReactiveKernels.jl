@@ -12,7 +12,7 @@
   and count-only coefficients evaluated at binding. Reject invalid counts
   and totals with `-Inf`, retaining dimension errors.
 - Expose shared and data-only arithmetic in scalar family densities. Require
-  RK 0.1.58 for Boolean negation in the new moment support guards.
+  RK 0.1.59 for Boolean negation in the new moment support guards.
 
 ## 0.1.1
 

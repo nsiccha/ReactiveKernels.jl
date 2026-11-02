@@ -518,12 +518,23 @@ end
 const _FOOTPRINT = :ReactiveKernels_footprint
 mutable struct _FootprintRecords
     const records::Dict{ValueId,Vector{Tuple{Symbol,Any}}}
+    const selection::Any
     # Whether the lowering being footprinted has begun: a lowering nested in
     # it (a plate body, an embedded kernel) runs blind to the recording
     # (`_lower_with_ops_collecting`).
     active::Bool
 end
-_FootprintRecords() = _FootprintRecords(Dict{ValueId,Vector{Tuple{Symbol,Any}}}(), false)
+_FootprintRecords(selection = nothing) =
+    _FootprintRecords(Dict{ValueId,Vector{Tuple{Symbol,Any}}}(), selection, false)
+
+# A packed-vector projection, owned by the prepared footprint. The sorted
+# indices let ranges skip excluded blocks without visiting their elements.
+struct _FootprintSelection
+    mask::BitVector
+    indices::Vector{Int}
+end
+_FootprintSelection(mask::AbstractVector{Bool}) =
+    _FootprintSelection(BitVector(mask), findall(mask))
 
 _footprint_recording() = get(task_local_storage(), _FOOTPRINT, nothing) !== nothing
 function _footprint_record!(cid::ValueId, kind::Symbol, expr)
@@ -549,6 +560,9 @@ function _footprint_return(p::Plan, cells, names)
     wants = Set(cidof(v) for v in p.want)
     entries = Any[]
     for port in p.have
+        selection = recording.selection
+        selection === nothing || port.name == first(selection) || continue
+        selected = selection === nothing ? nothing : last(selection)
         cid = cidof(port)
         records = Any[Expr(:tuple, QuoteNode(kind), expr === nothing ? nothing : expr)
                       for (kind, expr) in get(recording.records, cid, Tuple{Symbol,Any}[])]
@@ -563,6 +577,11 @@ function _footprint_return(p::Plan, cells, names)
             for s in slots
                 if f !== nothing
                     constant = _footprint_constant(r, f, s, producers, cidof)
+                    if constant !== nothing && selected !== nothing
+                        positions = Int[]
+                        _footprint_selected_positions!(positions, selected, constant)
+                        constant = positions
+                    end
                     push!(records, constant === nothing ?
                         Expr(:tuple, QuoteNode(:whole), nothing) :
                         Expr(:tuple, QuoteNode(:positions), constant))
@@ -573,7 +592,8 @@ function _footprint_return(p::Plan, cells, names)
                 end
             end
         end
-        push!(entries, Expr(:tuple, QuoteNode(port.name), names[cid], Expr(:tuple, records...)))
+        push!(entries, Expr(:tuple, QuoteNode(port.name), names[cid], Expr(:tuple, records...),
+                            QuoteNode(selected)))
     end
     Expr(:call, GlobalRef(@__MODULE__, :_footprint_collect), Expr(:tuple, entries...))
 end
@@ -597,7 +617,7 @@ function _footprint_constant(r::Recipe, f::_CellForm, s::Int, producers, cidof)
         return positions
     elseif role === :range_source && f.kind === :range_view
         all(part -> part isa Int, f.literal) || return nothing
-        return collect(_cell_range(f.literal))
+        return _cell_range(f.literal)
     end
     nothing
 end
@@ -728,8 +748,9 @@ end
 # The footprint named tuple from the body's recorded reads.
 function _footprint_collect(entries::Tuple)
     names = Tuple(first(entry) for entry in entries)
-    positions = map(entries) do (_, port, records)
-        _footprint_positions(port, records)
+    positions = map(entries) do (_, port, records, selection)
+        selection === nothing ? _footprint_positions(port, records) :
+            _footprint_selected(port, records, selection)
     end
     NamedTuple{names}(positions)
 end
@@ -756,6 +777,47 @@ function _footprint_positions(port, records::Tuple)
     unique!(sort!(positions))
 end
 @inline _cell_partition_positions(q::Integer) = Int[q]
+
+function _footprint_selected_positions!(out, selection, i::Integer)
+    checkbounds(Bool, selection.mask, i) && selection.mask[i] && push!(out, i)
+    out
+end
+function _footprint_selected_positions!(out, selection, read::AbstractRange{<:Integer})
+    isempty(read) && return out
+    lo, hi = minmax(first(read), last(read))
+    indices = selection.indices
+    for j in searchsortedfirst(indices, lo):searchsortedlast(indices, hi)
+        i = indices[j]
+        i in read && push!(out, i)
+    end
+    out
+end
+function _footprint_selected_positions!(out, selection, reads)
+    for read in reads
+        _footprint_selected_positions!(out, selection, read)
+    end
+    out
+end
+function _footprint_selected(port::AbstractVector, records::Tuple, selection::_FootprintSelection)
+    length(port) == length(selection.mask) || throw(DimensionMismatch(
+        "footprint selection must match the packed vector"))
+    positions = Int[]
+    for (kind, read) in records
+        kind === :whole && return copy(selection.indices)
+        if kind === :literal
+            _footprint_selected_positions!(positions, selection, LinearIndices(port)[read...])
+        elseif kind === :cell
+            _footprint_selected_positions!(positions, selection,
+                length(port) == 1 ? firstindex(port) : first(Tuple(read)))
+        elseif kind in (:rows, :gathered_rows, :gathered, :positions)
+            rows = kind === :rows && length(port) == 1 ? firstindex(port) : read
+            _footprint_selected_positions!(positions, selection, rows)
+        else
+            throw(ArgumentError("unknown footprint read kind $kind"))
+        end
+    end
+    unique!(sort!(positions))
+end
 
 const _FOOTPRINT_KERNELS = IdDict{Any,Any}()
 const _FOOTPRINT_LOCK = ReentrantLock()
@@ -795,10 +857,11 @@ one per kernel for the process; a caller evaluating many labels or cells
 prepares it once here and holds it itself. Call a freshly prepared kernel
 through `Base.invokelatest` when crossing Julia's world-age boundary.
 """
-function partition_footprint_kernel(kernel::PreparedKernel)
+partition_footprint_kernel(kernel::PreparedKernel) = _partition_footprint_kernel(kernel, nothing)
+function _partition_footprint_kernel(kernel::PreparedKernel, selection)
     p = _lowering_plan(kernel.plan)
     ast, constants, callables, recipes = _sharing_cell_plans() do
-        _lower_with_ops(p; footprint = true)
+        _lower_with_ops(p; footprint = true, footprint_selection = selection)
     end
     _prepare(p, ast, constants, _native_table(ast, callables), recipes)
 end
