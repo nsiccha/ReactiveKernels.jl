@@ -38,7 +38,8 @@ current-element reads and output writes, and a returned output vector. The
 compiler derives the carries and transition from that source, preserving its
 arithmetic and lazy branches. It never executes or unrolls the helper during
 preparation. This projection currently accepts Float64 temporal inputs and
-carries; whole-history seeds, arbitrary gathers and nested loops are not yet
+carries; whole-history seeds, arbitrary gathers, nested loops and loop-control
+transfers (`break`/`continue`) are not yet
 projected. A gather of the projected output must equal the group's current
 clock. These are compiler limitations, not requirements on ordinary helpers.
 
