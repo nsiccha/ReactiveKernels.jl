@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.53
+
+- Recover row locality through ordinary per-index helper comprehensions and
+  straight-line wrappers. Selected cells retain their gathered-coordinate
+  reads, including scalar operations and array-valued element helpers, using
+  runtime loops and ordinary native derivatives. Analysis executes no helper
+  and retains locality checks for cross-row or unproved helper bodies.
+
 ## 0.1.52
 
 - Discover cell sums through typed identity assignments that already satisfy

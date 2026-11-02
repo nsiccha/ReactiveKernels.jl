@@ -476,6 +476,10 @@ generated values to sampler coordinates.
   Responses with a strictly positive data domain require `true`.
 - `MixtureModel.(vcat.(C1, C2))` gives the components equal weights.
   Explicit shared weights use `MixtureModel.(vcat.(C1, C2), Ref(w))`.
+  Equal component log densities retain their ordinary reverse derivatives,
+  including all-zero initialization. The scalar and dotted `logaddexp`
+  built-ins likewise have partial derivatives `(1/2, 1/2)` at finite ties
+  (ReactiveKernelsPPL 0.1.58).
 - `Beta.(alpha, beta)` preserves argument order. Swapping the arguments in
   `Beta.(logistic.(eta) .* k, (1 .- logistic.(eta)) .* k)` changes its mean
   from `logistic.(eta)` to `1 .- logistic.(eta)`.

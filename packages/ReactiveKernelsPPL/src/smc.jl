@@ -116,6 +116,7 @@ end
 
 """
     prepare_smc(built, binding, u0; backend, model_id, binding_id, kwargs...)
+    prepare_smc(make_problem, u0; backend, model_id, binding_id, frame_id)
 
 Prepare a reusable SMC posterior target using `prepare_sampler`. Load
 `SequentialMonteCarlo`, `WarmupHMC`, `LogDensityProblems` and `Random` first.
@@ -127,6 +128,33 @@ with the data (for example, a longer scan). Each build must match its own
 binding. `model_id` is a caller-supplied identity, not an inferred code hash. Bindings,
 captured data and code must remain read-only for a target's lifetime.
 `kwargs` are forwarded to `prepare_sampler`.
+
+The two-argument method accepts a zero-argument factory `make_problem()` returning
+a prepared `LogDensityProblems` target with `dimension`, `logdensity` and
+`logdensity_and_gradient` (capability order at least one). `u0` supplies its
+coordinate dimension, not production particles. The supplied density already
+includes all priors, coordinate Jacobians and approximation terms: SMC adds none.
+Its gradient is used directly; `backend` prepares only the Gaussian reference's
+derivatives. A gradient returned in reusable storage is copied before retention.
+
+Each factory call must return the same density in the same coordinate frame,
+with independent mutable workspaces. Preparation calls it once; initialization,
+tuning, update, resume and additional mutation workers construct owned execution
+instances. Factories are invoked before launching mutation workers, never once
+per particle. Read-only data may be shared; do not share mutable solver state.
+Use `() -> deepcopy(problem)` only when copying is valid for that problem.
+Execution instances along one state's continuation may share scratch; do not
+concurrently advance or checkpoint the same continuation. Separate initializations
+and resumes have independent problem state.
+
+`model_id` covers density code and approximation configuration (including any
+inner-solver settings), `binding_id` covers exact data, and `frame_id` covers
+ordered coordinate meanings, transforms and preprocessing. These stable strings
+are caller assertions, not inferred hashes. Change them when semantics change.
+Updates require matching model/frame/dimension; resume and tuning also require
+the same binding. Checkpoints contain identities and endpoint scores, never the
+factory or its workspaces. Rebuild with the same code, data and configuration
+before `resume_smc`. This adapter does not infer named RKPPL parameter geometry.
 """
 function prepare_smc end
 

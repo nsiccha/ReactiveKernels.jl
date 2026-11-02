@@ -16,6 +16,39 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.59
+
+- Strict cell queries and outer factors accept ordinary helper gathers such
+  as `gather(z, indices) = [z[i] for i in indices]`, including wrappers and
+  row-wise scalar operations. Values, packed footprints and native compact
+  derivatives retain only the selected local coordinates. Requires RK 0.1.53;
+  cross-row helper work still faces locality checks.
+
+## 0.1.58
+
+- Preserve ordinary reverse derivatives when mixture components have equal
+  log densities, including all-zero initialization of complement-weight
+  mixtures. Scalar and dotted `logaddexp` vocabulary calls use RK's existing
+  stable primal, which retains the difference at finite ties. Values and
+  mixture weights are unchanged.
+
+## 0.1.57
+
+- Add `prepare_smc(make_problem, u0; backend, model_id, binding_id, frame_id)`
+  for prepared LogDensityProblems densities with supplied gradients. The
+  factory rebuilds independent problem workspaces for pilots, production runs,
+  mutation workers, updates and resume. Reuse Gaussian-reference tempering,
+  fixed tuning schedules and nonfinite diagnostics; checkpoints retain data
+  and explicit identities without serializing the factory or solver state.
+
+## 0.1.56
+
+- Recognize calibrated arrays of any rank and `eachrow`/`eachcol` slice
+  declarations in finite-state filters and static parameter selection,
+  including scoped submodels. Their priors are neither evaluated nor scored
+  again. Missing calibration reports the authored declaration instead of an
+  internal `haskey(..., nothing)` error.
+
 ## 0.1.55
 
 - Discover gathered sums in guarded NegativeBinomial2 cells, including
