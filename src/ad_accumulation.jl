@@ -46,6 +46,13 @@ end
         f.first_backend, point, contexts...)
 end
 
+"""
+    PreparedADAccumulator
+
+Prepared additive derivative operator returned by [`prepare_ad_accumulator`](@ref).
+Allocate its destination with [`ad_accumulator_storage`](@ref), then add weighted
+scalar-contraction derivatives with [`ad_accumulate!`](@ref).
+"""
 struct PreparedADAccumulator{P,F,I}
     prepared::P
     call::F
