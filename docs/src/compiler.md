@@ -543,6 +543,15 @@ preparation. Values needed by the residual body re-enter it through zero-input
 constant recipes, so downstream lowering sees an ordinary `Plan` and the hot
 path performs no graph traversal or data-only recomputation.
 
+Inside an authored plate, a nested plate, scan or prepared-kernel recipe
+whose inputs are all bound follows the same split. Its complete data-only
+region runs during binding, with its runtime loops intact; only the values
+needed by live recipes are cached. For example, a nested sum of logarithms
+over a bound vector of counts is computed once per outer cell, leaving its
+multiplication by a live parameter in the evaluator. A nested recipe that
+still reads a live input remains in the cell. This does not expose the body
+of an opaque child call inside a lazy branch for partial evaluation.
+
 Binding freezes values for that preparation; changing or mutating the data is
 not an invalidation signal. Rebind by preparing again from the original graph
 or plan. The pass does not rewrite mathematics or mutate the shared graph; it

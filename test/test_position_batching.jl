@@ -3,6 +3,74 @@ using ReactiveKernels
 using LinearAlgebra
 using InteractiveUtils: code_typed
 
+module ComposedPositionRecordTests
+using Test
+using ReactiveKernels
+
+@kernel record_child(x, offset) = begin
+    total = sum(x) + offset
+    record = (; tail = x[2:end], total, nested = (; total))
+    return record
+end
+@kernel record_pair(x, y, offset) = begin
+    left = record_child(x, offset)
+    right = record_child(y, offset)
+end
+
+keyword_record(tail; total) = (; tail, total)
+@kernel keyword_child(x, offset) = begin
+    total = sum(x) + offset
+    record = keyword_record(x[2:end]; total)
+    return record
+end
+@kernel keyword_parent(x, offset) = begin
+    record = keyword_child(x, offset)
+    return record
+end
+
+@testset "composed position records preserve shorthand labels" begin
+    offset = 0.5
+    scalar = prepare(record_pair; want = (:left, :right))
+    for bound in (NamedTuple(), (; offset)), want in (:left, (:left, :right)),
+        options in ((; reuse = false), (; reuse = true),
+                    (; reuse = true, schedule = NativeScheduling(workers = 2, chunk_size = 2)))
+        reader = isempty(bound) ?
+            prepare_batched(record_pair; batched = (:x, :y), want, options...) :
+            vectorize(prepare(record_pair; want, bound); batched = (:x, :y), options...)
+        expression = code_expr(reader)
+        for width in (1, 4), count in (1, 3, 7), shift in (0.0, 2.0)
+            x = reshape(collect(1.0:(width * count)), width, count) .+ shift
+            y = reverse(x; dims = 2) .+ 1.0
+            original = (copy(x), copy(y))
+            args = isempty(bound) ? (x, y, offset) : (x, y)
+            result = reader(args...)
+            records = want === :left ? (result,) : result
+            for (record, data) in zip(records, (x, y))
+                totals = vec(sum(data; dims = 1)) .+ offset
+                @test keys(record) == (:tail, :total, :nested)
+                @test keys(record.nested) == (:total,)
+                @test record == (; tail = data[2:end, :], total = totals,
+                                  nested = (; total = totals))
+            end
+            @test scalar(x[:, 1], y[:, 1], offset) ==
+                map(data -> (; tail = data[2:end, 1], total = sum(data[:, 1]) + offset,
+                              nested = (; total = sum(data[:, 1]) + offset)), (x, y))
+            @test (x, y) == original
+            @test code_expr(reader) === expression
+        end
+    end
+end
+
+@testset "composed position calls preserve shorthand keyword labels" begin
+    x = [1.0 4.0; 2.0 5.0; 3.0 6.0]
+    @test prepare(keyword_parent)(x[:, 1], 0.5) == (; tail = [2.0, 3.0], total = 6.5)
+    for reuse in (false, true)
+        reader = prepare_batched(keyword_parent; batched = :x, reuse)
+        @test reader(x, 0.5) == (; tail = x[2:end, :], total = [6.5, 15.5])
+    end
+end
+end
+
 struct PositionRankArray{T,A,N} <: AbstractArray{T,N}
     storage::A
 end
