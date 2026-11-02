@@ -312,10 +312,23 @@ y .~ MyNormal.(a)
 y .~ LogDensity.(normal_lpdf, a)
 ```
 
-With `Distributions` loaded, authored `DirichletMultinomial(n, alpha)` calls
-resolve by constructor identity and compose the RK density graph, including
-qualified and aliased constructors. Shared concentration terms and count-only
-normalizers are visible to RK. Invalid counts or totals return `-Inf`, and
+With `Distributions` loaded, authored `Normal`, `LogNormal`, `Gamma`,
+`Exponential`, `Cauchy`, `Laplace`, `Logistic`, and `DirichletMultinomial`
+constructors resolve by identity and compose RK distribution graphs, including
+qualified and aliased constructors. Defaults and constructor parameterizations
+are preserved: for example, `Distributions.Gamma(shape, scale)` supplies the
+owned Gamma graph's `scale` port.
+
+`sampling_distribution_graph(constructor, arguments::Tuple)` returns the
+expression constructing that graph, or `nothing` when no mapping is available.
+The arguments are expressions; the hook never evaluates them or chooses
+parameter geometry. Consumers may compose the returned object with its
+`logpdf`, `cdf`, `ccdf`, `logcdf`, or `logccdf` endpoints where the family
+provides them. Caller-owned families may extend this hook with module-visible
+RK objects.
+
+The DirichletMultinomial graph exposes shared concentration terms and
+count-only normalizers. Invalid counts or totals return `-Inf`, and
 incompatible vector lengths throw `DimensionMismatch`. This authored route
 does not need the Distributions support-fix pin.
 

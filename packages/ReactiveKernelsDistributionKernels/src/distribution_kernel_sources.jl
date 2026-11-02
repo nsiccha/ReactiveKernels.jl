@@ -232,8 +232,8 @@ end
     logpdf(z::Float64)::Float64 = -log(π) - log1p(z^2)
     cdf(z::Float64)::Float64 = 0.5 + atan(z) / π
     ccdf(z::Float64)::Float64 = 0.5 - atan(z) / π
-    logcdf(z::Float64)::Float64 = z < 0 ? log(atan(-inv(z)) / pi) :
-        log1p(-atan(inv(z)) / pi)
+    logcdf(z::Float64)::Float64 = z < -1 ? log(atan(-inv(z)) / pi) :
+        z > 1 ? log1p(-atan(inv(z)) / pi) : log(0.5 + atan(z) / pi)
     logccdf(z::Float64)::Float64 = logcdf(-z)
     quantile(p::Float64)::Float64 = tanpi(p - 0.5)
 end
@@ -278,7 +278,7 @@ end
 # is the logistic sigmoid and `quantile` the logit. It carries no parameters, so
 # unlike `standard_student_t` it binds directly through `location_scale`.
 @kernel standard_logistic() = begin
-    logpdf(z::Float64)::Float64 = -z - 2 * log1pexp(-z)
+    logpdf(z::Float64)::Float64 = -abs(z) - 2 * log1pexp(-abs(z))
     cdf(z::Float64)::Float64 = 1 / (1 + exp(-z))
     ccdf(z::Float64)::Float64 = 1 / (1 + exp(z))
     logcdf(z::Float64)::Float64 = -log1pexp(-z)
@@ -294,18 +294,21 @@ end
 
     logpdf(x::Float64)::Float64 = begin
         z::Float64 = standardized(x)
-        standard.logpdf(z) - log_scale
+        scale == 0 ? (x == location ? Inf : (isnan(z) ? NaN : -Inf)) :
+            standard.logpdf(z) - log_scale
     end
     cdf(x::Float64)::Float64 = begin
-        z::Float64 = standardized(x)
+        z::Float64 = scale == 0 && x == location ? inv(scale) : standardized(x)
         standard.cdf(z)
     end
     ccdf(x::Float64)::Float64 = begin
-        z::Float64 = standardized(x)
+        z::Float64 = scale == 0 && x == location ? inv(scale) : standardized(x)
         standard.ccdf(z)
     end
-    logcdf(x::Float64)::Float64 = standard.logcdf(standardized(x))
-    logccdf(x::Float64)::Float64 = standard.logccdf(standardized(x))
+    logcdf(x::Float64)::Float64 = standard.logcdf(
+        scale == 0 && x == location ? inv(scale) : standardized(x))
+    logccdf(x::Float64)::Float64 = standard.logccdf(
+        scale == 0 && x == location ? inv(scale) : standardized(x))
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard.quantile(p)
         inv(standardized, z)
@@ -455,16 +458,15 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: _normal_logc
     inv(standardized_log, z::Float64)::Float64 = exp(location + scale * z)
 
     logpdf(x::Float64)::Float64 =
-        x > 0 ? standard_normal.logpdf((log(x) - location) / scale) -
-            log_scale - log(x) : -Inf
+        x <= 0 ? -Inf : normal(location, scale).logpdf(log(x)) - log(x)
     cdf(x::Float64)::Float64 =
-        x > 0 ? standard_normal.cdf((log(x) - location) / scale) : 0.0
+        x <= 0 ? 0.0 : normal(location, scale).cdf(log(x))
     ccdf(x::Float64)::Float64 =
-        x > 0 ? standard_normal.ccdf((log(x) - location) / scale) : 1.0
+        x <= 0 ? 1.0 : normal(location, scale).ccdf(log(x))
     logcdf(x::Float64)::Float64 =
-        x <= 0 ? -Inf : _normal_logccdf((location - log(x)) / scale)
+        x <= 0 ? -Inf : normal(location, scale).logcdf(log(x))
     logccdf(x::Float64)::Float64 =
-        x <= 0 ? 0.0 : _normal_logccdf((log(x) - location) / scale)
+        x <= 0 ? 0.0 : normal(location, scale).logccdf(log(x))
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard_normal.quantile(p)
         inv(standardized_log, z)
@@ -477,9 +479,9 @@ const EXPONENTIAL_KERNEL_SOURCE = raw"""
     log_scale::Float64 = log(scale)
 
     logpdf(x::Float64)::Float64 =
-        ifelse(x >= 0, -log_scale - x / scale, -Inf)
-    cdf(x::Float64)::Float64 = ifelse(x >= 0, -expm1(-x / scale), 0.0)
-    ccdf(x::Float64)::Float64 = x >= 0 ? exp(-x / scale) : 1.0
+        x < 0 ? -Inf : -log_scale - x / scale
+    cdf(x::Float64)::Float64 = x < 0 ? 0.0 : -expm1(-x / scale)
+    ccdf(x::Float64)::Float64 = x < 0 ? 1.0 : exp(-x / scale)
     logcdf(x::Float64)::Float64 = x <= 0 ? -Inf : log(-expm1(-x / scale))
     logccdf(x::Float64)::Float64 = x < 0 ? 0.0 : -x / scale
     quantile(p::Float64)::Float64 = -scale * log1p(-p)
@@ -673,14 +675,14 @@ using SpecialFunctions: gamma_inc, gamma_inc_inv
     rate::Float64 = 1 / scale
 
     logpdf(x::Float64)::Float64 =
-        (x > 0) & (shape > 0) & (log_rate > -Inf) ?
-            (shape * log_rate - loggamma(shape) +
-             (shape - 1) * log(x) - rate * x) :
+        (x >= 0 || isnan(x)) & (shape > 0) & (log_rate > -Inf) ?
+            (x == Inf ? -Inf : shape * log_rate - loggamma(shape) +
+             (shape == 1 ? 0.0 : (shape - 1) * log(x)) - rate * x) :
             -Inf
     cdf(x::Float64)::Float64 =
-        x > 0 ? first(gamma_inc(shape, rate * x)) : 0.0
+        x <= 0 ? 0.0 : first(gamma_inc(shape, rate * x))
     ccdf(x::Float64)::Float64 =
-        x > 0 ? last(gamma_inc(shape, rate * x)) : 1.0
+        x <= 0 ? 1.0 : last(gamma_inc(shape, rate * x))
     logcdf(x::Float64)::Float64 = log(cdf(x))
     logccdf(x::Float64)::Float64 = log(ccdf(x))
     quantile(p::Float64)::Float64 = gamma_inc_inv(shape, p, 1 - p) / rate

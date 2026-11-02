@@ -84,5 +84,7 @@ end
     end
     @test lcdf(0.0,0.0,1.0) == -Inf
     @test lccdf(0.0,0.0,1.0) == 0.0
+    @test isnan(lcdf(NaN,0.0,1.0))
+    @test isnan(lccdf(NaN,0.0,1.0))
 end
 end

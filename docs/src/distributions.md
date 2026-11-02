@@ -91,6 +91,39 @@ dimensions zip or expand, and incompatible shapes fail before endpoint
 execution. A whole array that every scalar body invocation reads is not a plate
 argument: the cell closes over it.
 
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.VECTORIZED_SOURCE,
+)
+```
+
+The broadcast rules are worth making concrete. In the panel below one plate zips
+the observation vector with a per-observation location, repeats the scalar scale,
+and reads a whole vector by closing over it. The build checks the result
+against the equivalent hand-written broadcast:
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.BROADCAST_CLOSURE_SOURCE,
+)
+```
+
+Dependency-aware lowering also hoists complete invariants out of the broadcast
+loop. When `location` and `scale` are declared scalars shared across the batch,
+the scale-only `log_scale` term is emitted once in the loop preamble, while the
+observation-dependent standardization stays in the loop at the shallowest
+boundary that binds it. Through a port without a declared type, whose value can
+be a scalar or an axis, the term is still emitted once, inside the loop: it runs
+at the first coordinate when the value holds no axis and is reused after that.
+The generated-kernel pane below is the exact plan built during this docs build;
+the source asserts the hoisted `log_scale` op precedes the loop:
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionExamples.INVARIANT_HOISTING_SOURCE,
+)
+```
+
 ## LogNormal moments and log tails
 
 `DistributionKernelSources.lognormal(location, scale)` provides `logcdf(x)`
@@ -125,39 +158,6 @@ The concentration and count log-gamma terms are separate graph nodes, so
 shared concentrations and bound observations are visible to the planner.
 `dirichlet_multinomial_logdensity` is the extracted endpoint with positional
 arguments `(counts, n, alpha)`.
-
-```@eval
-Main.ReactiveKernelsDocs.execute_example(
-    @__MODULE__, Main.DistributionExamples.VECTORIZED_SOURCE,
-)
-```
-
-The broadcast rules are worth making concrete. In the panel below one plate zips
-the observation vector with a per-observation location, repeats the scalar scale,
-and reads a whole vector by closing over it. The build checks the result
-against the equivalent hand-written broadcast:
-
-```@eval
-Main.ReactiveKernelsDocs.execute_example(
-    @__MODULE__, Main.DistributionExamples.BROADCAST_CLOSURE_SOURCE,
-)
-```
-
-Dependency-aware lowering also hoists complete invariants out of the broadcast
-loop. When `location` and `scale` are declared scalars shared across the batch,
-the scale-only `log_scale` term is emitted once in the loop preamble, while the
-observation-dependent standardization stays in the loop at the shallowest
-boundary that binds it. Through a port without a declared type, whose value can
-be a scalar or an axis, the term is still emitted once, inside the loop: it runs
-at the first coordinate when the value holds no axis and is reused after that.
-The generated-kernel pane below is the exact plan built during this docs build;
-the source asserts the hoisted `log_scale` op precedes the loop:
-
-```@eval
-Main.ReactiveKernelsDocs.execute_example(
-    @__MODULE__, Main.DistributionExamples.INVARIANT_HOISTING_SOURCE,
-)
-```
 
 ## Other standard location-scale families
 

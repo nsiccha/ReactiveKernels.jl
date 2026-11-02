@@ -26,9 +26,10 @@ end
             q = constructor in (D.Normal,D.LogNormal,D.Cauchy,D.Laplace,D.Logistic) ? [0.2,0.7] : [1.3,0.7]
             law = constructor(q[1:count]...)
             joint = prepare(spec;want=(:density,:lower,:upper))
-            for x in (0.2,0.7,2.0)
+            for x in (-Inf,-1.0,-0.0,0.0,0.2,0.7,2.0,Inf,NaN)
                 got = Base.invokelatest(joint,x,q)
-                @test collect(got) ≈ [D.logpdf(law,x),D.logcdf(law,x),D.logccdf(law,x)] rtol=5e-12 atol=1e-14
+                expected = (D.logpdf(law,x),D.logcdf(law,x),D.logccdf(law,x))
+                @test all(isapprox(a,b;rtol=5e-12,atol=1e-14,nans=true) for (a,b) in zip(got,expected))
             end
             count == 0 && continue
             f = prepare(spec;bound=(x=0.7,))
@@ -41,5 +42,19 @@ end
     end
     @test sampling_distribution_graph(identity,(:x,)) === nothing
     @test sampling_distribution_graph(D.Normal,(:a,:b,:c)) === nothing
+end
+
+@testset "zero-scale Normal and LogNormal graph semantics" begin
+    for constructor in (D.Normal,D.LogNormal)
+        spec = endpoints(constructor, (:(q[1]), :(q[2])))
+        f = prepare(spec;want=(:density,:lower,:upper))
+        q = [0.0,0.0]
+        law = constructor(q...)
+        for x in (-Inf,-1.0,0.0,0.5,1.0,2.0,Inf,NaN)
+            actual = Base.invokelatest(f,x,q)
+            expected = (D.logpdf(law,x),D.logcdf(law,x),D.logccdf(law,x))
+            @test all(isapprox(a,b;nans=true) for (a,b) in zip(actual,expected))
+        end
+    end
 end
 end
