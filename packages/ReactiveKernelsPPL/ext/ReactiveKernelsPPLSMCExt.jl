@@ -8,6 +8,7 @@ using SequentialMonteCarlo: SMCModel, SMCIO, smc!
 using WarmupHMC: FixedKernelNUTSState, fixed_kernel_nuts_step
 using WarmupHMC: ContinuousNUTSState, continuous_nuts_step
 import WarmupHMC, SequentialMonteCarlo, LogDensityProblems
+import LinearAlgebra
 import ReactiveKernelsPPL as PPL
 
 function _posterior_scale_in_basis(positions,weights,location,basis)
@@ -105,6 +106,9 @@ _layout(layout) = (layout.total, map(_entry, layout.entries), layout.name_paths)
 
 _frame(target::AbstractSMCTarget) =
     (; model_id=target.signature.model_id, layout=target.signature.layout)
+_frame(target::Union{SMCTarget,SMCWindowTarget}) =
+    (; model_id=target.signature.model_id, layout=target.signature.layout,
+        coordinates=PPL._smc_coordinate_records(target.query.layout))
 
 function PPL.carry_smc(target::AbstractSMCTarget, reference::SMCReference;
         calibration_id::AbstractString)
@@ -163,7 +167,10 @@ end
 
 function PPL.prepare_smc_window(built, binding::StructuralPlan, u0::AbstractVector;
         previous::SMCCarriedReference, backend, model_id::AbstractString,
-        binding_id::AbstractString, warm::Bool=false)
+        binding_id::AbstractString, warm::Bool=false, coordinates=:all)
+    coordinates === :auto && return _prepare_smc_selective(built, binding, u0;
+        previous, backend, model_id, binding_id, warm)
+    coordinates === :all || throw(ArgumentError("coordinates must be :all or :auto"))
     isempty(model_id) && throw(ArgumentError("model_id must name the model and coordinate frame"))
     isempty(binding_id) && throw(ArgumentError("binding_id must name the exact new window"))
     isempty(previous.calibration_id) && throw(ArgumentError("carried calibration identity is empty"))
@@ -486,6 +493,12 @@ _parameter_projection(t::AbstractSMCTarget, parameters) =
 _parameter_projection(::PreparedSMCTarget, parameters) =
     throw(ArgumentError("named parameter projection requires RKPPL layout metadata"))
 
+function _carry_summary(target, reference; calibration_id, diagnostics, max_reflections)
+    carried=carry_smc(target,reference;calibration_id)
+    SMCCarriedReference(carried.reference,carried.frame,
+        carried.calibration_id,deepcopy(diagnostics))
+end
+
 function PPL.carry_smc(state::SMCState; calibration_id::AbstractString, scale=nothing,
         parameters=nothing,basis=nothing,max_reflections::Integer=16,
         maxiter::Integer=100,progress=nothing)
@@ -513,12 +526,12 @@ function PPL.carry_smc(state::SMCState; calibration_id::AbstractString, scale=no
     end
     reference=SMCReference(location,scale)
     if projection===nothing
-        carried=carry_smc(state.target,reference;calibration_id)
-        return SMCCarriedReference(carried.reference,carried.frame,
-            carried.calibration_id,deepcopy(diagnostics))
+        return _carry_summary(state.target,reference;
+            calibration_id,diagnostics,max_reflections)
     end
     compact=PPL._smc_projection_layout(projection.record)
     frame=deepcopy((;model_id=state.target.signature.model_id,layout=_layout(compact),
+        coordinates=PPL._smc_coordinate_records(compact),
         parameters=(;layout=projection.record,names=projection.names,paths=projection.output_paths)))
     return SMCCarriedReference(reference,frame,String(calibration_id),deepcopy(diagnostics))
 end
@@ -895,5 +908,7 @@ function PPL.resume_smc(target::AbstractSMCTarget, checkpoint; previous=nothing)
 end
 
 include("smc_filter.jl")
+include("smc_gaussian.jl")
+include("smc_selective.jl")
 
 end

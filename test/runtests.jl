@@ -44,6 +44,7 @@ const _MATRIX_CORE_TESTS = (
     "test_expm_rule.jl",
     "test_symmetric_eigen_rules.jl",
     "test_cholesky.jl",
+    "test_gaussian_projection.jl",
     "test_authoring.jl",
     "test_streaming_helpers.jl",
     "test_globalref_composition.jl",

@@ -14,6 +14,14 @@ reflections=[[cos(pi/8),sin(pi/8)]])`, with covariance
 `[1.01 0.99; 0.99 1.01]`. See WarmupHMC's `scale_from_data`/`scale_data`
 contract for the operator representation. All sampling, scoring and mutation
 use the rebuilt data operator, including its floating-point representation.
+
+Selective carries also produce `(kind=:diagonal_lowrank, diagonal=D,
+vectors=Q, values=v)`, representing covariance
+`Diagonal(sqrt.(D)) * (I + Q * Diagonal(v) * Q') * Diagonal(sqrt.(D))`.
+Here `D` is positive, `Q` has orthonormal columns and `v > -1` elementwise.
+This compact covariance is accepted as an importance reference, including for
+prepared-density targets; it is not a WarmupHMC mutation metric. Its storage
+is linear in dimension at fixed rank, with no dense covariance.
 """
 struct SMCReference{S}
     location::Vector{Float64}
@@ -166,8 +174,9 @@ frame. Construct with [`carry_smc`](@ref). The owned `reference`, `frame` and
 `calibration_id` contain no old observations, prepared queries or trajectories.
 Treat them as read-only. The frame includes the caller's model/preprocessing
 identity and the packed layout; the calibration ID identifies this summary.
-`fit_diagnostics` is `nothing` for externally supplied or fixed-basis summaries;
-`basis=:fit` carries the bounded WarmupHMC fitting diagnostics as owned data.
+For full-frame targets, `fit_diagnostics` is `nothing` for externally supplied
+or fixed-basis summaries; `basis=:fit` carries the bounded WarmupHMC fitting
+diagnostics as owned data. Selective carries also report joint recompression.
 """
 struct SMCCarriedReference{R,F,D}
     reference::R
@@ -180,6 +189,7 @@ SMCCarriedReference(reference,frame,calibration_id::String) =
 
 """
     carry_smc(target, reference::SMCReference; calibration_id)
+    carry_smc(selective_target, reference::SMCReference; calibration_id, maxrank=16)
     carry_smc(completed_state; calibration_id, scale=nothing, parameters=nothing,
               basis=nothing, max_reflections=16, maxiter=100, progress=nothing)
 
@@ -221,7 +231,7 @@ not retained. This summary is a prior for subsequent windows, not production
 kernel adaptation. Mutation tuning still uses independent pilot RNGs/positions.
 
 `parameters=(:name, Symbol("nested.name"), ...)` selects complete authored
-static parameter blocks from a completed fit, excluding historical scan
+static parameter blocks from a completed full-frame fit, excluding historical scan
 coordinates. The producer packs their unconstrained marginal and carries only
 their portable native geometry. `scale`, if supplied, must be in this selected
 frame; slicing a full correlated scale does not produce its marginal scale.
@@ -230,12 +240,20 @@ Static transform dependencies must also be selected. Data-only scalar bound
 expressions are folded once, so old observations are not retained. Custom
 geometry containing callable objects is not represented by this native
 projection; use a static-only calibration and an explicit mapping for it.
+For selective windows (`coordinates=:auto`), omit `parameters`: carrying
+integrates the inactive conditional into the full joint Gaussian.
+The external-reference form bounds joint rank by `maxrank`; completed states
+use `max_reflections`. Completed selective states return `.fit_diagnostics.marginal`
+for the compact fit and `.joint` for recompression; the external form returns
+the joint diagnostics directly. Their `rank`, `discarded_rank` and
+`relative_loss` describe the retained rank and discarded correction's spectral
+norm in the diagonal-whitened frame, not posterior accuracy.
 """
 function carry_smc end
 
 """
     prepare_smc_window(built, binding, u0; previous::SMCCarriedReference,
-                       backend, model_id, binding_id, warm=false)
+                       backend, model_id, binding_id, warm=false, coordinates=:all)
 
 Prepare a static-parameter target `log(previous.reference) + loglikelihood`
 for **new observations only**. The likelihood and its ordinary AD derivative
@@ -243,14 +261,52 @@ come from the model's `:likelihood` query. Original priors and coordinate
 Jacobians are not added again: the carried reference is already a density in
 unconstrained coordinates. Parameter transformations in the likelihood remain.
 
-The model/preprocessing identity and packed layout must match `previous`.
+With `coordinates=:all`, the model/preprocessing identity and packed layout
+must match `previous`.
 Keep fitted preprocessing frozen and pass it through the binding. Retained
 storage and each evaluation depend on this window, never on elapsed history.
-This does not carry latent trajectories across windows; use the filter for
-that task. A changing set of latent coordinates is a different frame.
+Use the filter for latent trajectories whose transitions are evaluated as
+successive observations arrive.
+
+With `coordinates=:auto`, the prepared target uses only the old coordinates
+read by this window's likelihood or fresh priors, and all fresh coordinates.
+Authored paths and coordinate labels match the previous carry; packed offsets
+may change. Rebuild and bind the current program when an array extent changes,
+while keeping `model_id` and fitted preprocessing fixed. The target is
+`q_old(active) * p(fresh | active) * likelihood(window | active, fresh)`.
+Fresh factors include their native transforms and Jacobians once. Dependencies
+of fresh priors, including old hyperparameters absent from the likelihood,
+belong to the active set. Joint factors and coupled transforms remain intact.
+Fresh events are selected by [`factor_coordinates`](@ref) ownership, never by
+their read support. A density on a derived expression that owns no coordinates
+and whose structural support includes fresh ones cannot be assigned automatically
+and is rejected rather than omitted. This support can conservatively include
+whole arrays for compound scalar expressions such as `z[1]^2`; direct scalar
+index reads use native locality lowering. Fresh-factor discovery inherits
+[`density_factors`](@ref)'s
+explicit limitations for noncentered scans and stochastic scans inside cells.
+The likelihood must satisfy native partition locality. Sparse observations
+selecting elements of simplex/ordered slice-transformed arrays currently lack
+an observation row lowering and are rejected; their fresh atomic priors are
+supported. No full-coordinate fallback is performed.
+
+Inspect [`smc_window_coordinates`](@ref) before supplying a compact initial
+point, reference or mutation metric. Particle positions and gradients use that
+compact order. [`smc_recover`](@ref) draws the inactive old coordinates lazily
+from their retained conditional; no full joint particle cloud is stored.
+`carry_smc(completed; max_reflections=16, ...)` integrates that conditional
+against the fitted compact Gaussian, flattens the joint covariance and caps
+its rank at the requested budget. Its full location vector follows the current
+layout, followed by retained coordinates absent from the current program.
+Recompression diagnostics report discarded rank and the spectral norm of the
+discarded covariance correction in the diagonal-whitened frame; this is not
+a posterior accuracy bound.
 
 Use the ordinary `tune_smc`, `initialize_smc`, `smc`, `smc_checkpoint` and
-`resume_smc` APIs. The default initial reference is the carried prior. A
+`resume_smc` APIs. The default initial reference is the carried prior for
+`:all`, or its active marginal with independent standard-normal fresh
+coordinates for `:auto`. This proposal does not replace the fresh priors in
+the target. A
 checkpoint resumes from the rebuilt window target alone, without old data.
 Its log normalizer is the new window's predictive normalizer under the
 approximate carried prior, not exact full-history evidence. Supply each new
