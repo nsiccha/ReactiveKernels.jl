@@ -3737,10 +3737,16 @@ _kernel_split_callee_name(callee) = nothing
 
 # Whether evaluating `ex` does work worth caching: a call other than the
 # cheap ones above, with Julia's literal integer powers counted as cheap
-# multiplications, or a loop, generator or macro.
+# multiplications, an index that may gather an array, or a loop, generator
+# or macro. Literal integer indices (notably tuple fields) stay cheap; other
+# indices cannot be classified as scalar from syntax alone.
 function _kernel_split_worthwhile(ex)
     ex isa Expr || return false
     ex.head in (:quote, :inert) && return false
+    if _cell_index_source(ex)
+        indices = ex.head === :ref ? ex.args[2:end] : ex.args[3:end]
+        any(index -> !(index isa Integer), indices) && return true
+    end
     ex.head in (:generator, :comprehension, :typed_comprehension, :macrocall,
                 :for, :while, :do) && return true
     if ex.head === :call && !isempty(ex.args)
@@ -3773,7 +3779,7 @@ _kernel_split_liftable(ex) = ex isa Expr && (
     ex.head === :ref)
 
 # The strict operand positions of `ex`, as `_kernel_lift_invariant_operands!`
-# enters them, except a dotted call's arguments.
+# enters them, including eager operands of dotted calls.
 function _kernel_split_children(ex)
     ex isa Expr || return ()
     head = ex.head
@@ -3782,6 +3788,8 @@ function _kernel_split_children(ex)
         return ex.args[2:end]
     elseif head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode
         return (ex.args[1],)
+    elseif _cell_dotted_call(ex) && !_kernel_mutating_callee(ex.args[1])
+        return ex.args[2].args
     elseif head === :ref && !isempty(ex.args)
         return Any[ex.args[1],
                    (arg for arg in ex.args[2:end] if !_kernel_reads_index_bound(arg))...]
@@ -4916,12 +4924,16 @@ end
 # Evaluate one already-expanded graph construction without compiling its
 # once-only recipe-construction groups. Plate lowering uses this for an arm
 # graph recovered from a constructed endpoint's authored recipe source.
-function _kernel_eval_construction(mod::Module, construction::Expr)
+function _kernel_eval_construction(mod::Module, construction::Expr,
+                                   @nospecialize(captures::NamedTuple = NamedTuple()))
     locals = Set{Symbol}()
     _kernel_construction_locals!(locals, construction)
     mod = _kernel_eval_module(mod, construction)
-    Core.eval(mod, Expr(:let, Expr(:block),
-                        _kernel_toplevel_construction(construction, mod, locals)))
+    # Bare exact callees are construction values rather than recipe closures;
+    # they read the same lexical environment as the separately built closures.
+    bindings = Any[Expr(:(=), name, QuoteNode(value)) for (name, value) in pairs(captures)]
+    Core.eval(mod, Expr(:let, Expr(:block, bindings...),
+                        _kernel_toplevel_construction(construction, mod, locals, captures)))
 end
 
 # While a package image is generated, Julia refuses evaluation into a module of
@@ -5045,20 +5057,29 @@ end
 
 # Inline the recipe groups and evaluate every closure the construction code
 # creates as its own top-level expression in `mod`.
-function _kernel_toplevel_construction(@nospecialize(ex), mod::Module, locals::Set{Symbol})
+function _kernel_toplevel_construction(@nospecialize(ex), mod::Module, locals::Set{Symbol},
+                                       @nospecialize(captures::NamedTuple = NamedTuple()))
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
     _kernel_is_group_call(ex) &&
-        return _kernel_toplevel_construction(ex.args[1].args[2], mod, locals)
+        return _kernel_toplevel_construction(ex.args[1].args[2], mod, locals, captures)
     if ex.head === :->
         _kernel_mentions_any(ex, locals) && throw(ArgumentError(
             "internal error: a @kernel recipe closure refers to a construction local; " *
             "it cannot be evaluated separately"))
-        return Expr(:call, GlobalRef(Core, :eval), mod, QuoteNode(ex))
+        # A recovered branch arm was authored in a lexical environment, not
+        # just in `mod`. Bind its free captures around each new closure so
+        # `_kernel_source_function` records them on the whole operation and
+        # on every split/ignore companion. Local binders still shadow them.
+        names = _kernel_free_ports(ex, Set{Symbol}(keys(captures)))
+        bindings = Any[Expr(:(=), name, QuoteNode(getfield(captures, name)))
+                       for name in names]
+        closure = isempty(bindings) ? ex : Expr(:let, Expr(:block, bindings...), ex)
+        return Expr(:call, GlobalRef(Core, :eval), mod, QuoteNode(closure))
     end
     args = Vector{Any}(undef, length(ex.args))
     for (index, arg) in enumerate(ex.args)
-        args[index] = _kernel_toplevel_construction(arg, mod, locals)
+        args[index] = _kernel_toplevel_construction(arg, mod, locals, captures)
     end
     Expr(ex.head, args...)
 end

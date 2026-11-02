@@ -16,6 +16,33 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.60
+
+- Compute interval-censored likelihoods and truncated-prior normalizers
+  with shared log-space subtraction. Censored observations use the same
+  distribution log tails. Normal intervals in either far tail retain finite
+  log densities and ordinary native Reverse gradients; LogNormal and the
+  other closed-form log-tail families benefit from the same calculation.
+- Preserve log-space tail accumulation for mixture evidence and stable
+  Normal tails for probit ordinal observations. Interval endpoints and
+  censoring/truncation semantics are unchanged.
+
+## 0.1.59
+
+- Strict cell queries and outer factors accept ordinary helper gathers such
+  as `gather(z, indices) = [z[i] for i in indices]`, including wrappers and
+  row-wise scalar operations. Values, packed footprints and native compact
+  derivatives retain only the selected local coordinates. Requires RK 0.1.53;
+  cross-row helper work still faces locality checks.
+
+## 0.1.58
+
+- Preserve ordinary reverse derivatives when mixture components have equal
+  log densities, including all-zero initialization of complement-weight
+  mixtures. Scalar and dotted `logaddexp` vocabulary calls use RK's existing
+  stable primal, which retains the difference at finite ties. Values and
+  mixture weights are unchanged.
+
 ## 0.1.57
 
 - Add `prepare_smc(make_problem, u0; backend, model_id, binding_id, frame_id)`

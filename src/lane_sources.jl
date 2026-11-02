@@ -14,7 +14,7 @@
 # array by its syntax (a dotted call, `zeros`/`ones`/`fill`, a slice by a
 # range or `:`): `i > 0 ? x[i] : 0.0` reads a scalar and keeps its call.
 #
-# A dotted call or a `reduce(vcat, cells)` nested inside such a source, as the
+# A slice, dotted call or `reduce(vcat, cells)` nested inside such a source, as the
 # argument of another call (`minimum(x .- y)`) or inside a branch arm, fills a
 # lane slot of its own. The recipe's value releases every such slot it may
 # hold (`_lane_release!`), so a value that keeps the buffer (an opaque function
@@ -308,8 +308,16 @@ function _lane_source_node(ctx::_LaneSourceContext, node, ends)
         owner === nothing && return nothing
         return Expr(:., owner, node.args[2])
     elseif head === :ref
-        # A nested slice keeps Julia's own lowering of its `end`/`begin`; its
-        # array expression still sees ours.
+        # A nested slice keeps its own slot, just like a nested dotted call.
+        # Unsupported index syntax retains Julia's ordinary lowering.
+        if ctx.nested !== nothing && length(node.args) >= 2 &&
+           !any(index -> Meta.isexpr(index, :...), node.args[2:end])
+            slot = gensym(:lane_nested)
+            expr = _lane_index_destination(ctx, node, slot, ends)
+            expr === nothing && return nothing
+            push!(ctx.nested, slot)
+            return expr
+        end
         length(node.args) >= 1 || return nothing
         array = _lane_source_node(ctx, node.args[1], ends)
         array === nothing && return nothing
@@ -360,16 +368,41 @@ function _lane_source_node(ctx::_LaneSourceContext, node, ends)
         for arg in node.args
             rewritten = _lane_source_node(ctx, arg, ends)
             rewritten === nothing && return nothing
-            push!(args, rewritten)
+            # In `(; x)` and `f(; x)`, `x` is also the field/keyword label.
+            # Keep that label when its value becomes a scoped graph name.
+            push!(args, head === :parameters && arg isa Symbol ?
+                        Expr(:kw, arg, rewritten) : rewritten)
         end
         return Expr(head, args...)
     end
     nothing
 end
 
+# Bind the array once, then resolve each index's `end`/`begin` against that
+# array. Its array expression can itself be an index of an enclosing slice;
+# only that expression sees the enclosing bounds.
+function _lane_index_destination(ctx::_LaneSourceContext, node, recycled, outer_ends)
+    any(index -> Meta.isexpr(index, :...), node.args[2:end]) && return nothing
+    array = _lane_source_node(ctx, node.args[1], outer_ends)
+    array === nothing && return nothing
+    held = gensym(:lane_array)
+    count = length(node.args) - 1
+    indices = Any[]
+    for (k, index) in enumerate(node.args[2:end])
+        position = count == 1 ? () : (k,)
+        ends = (Expr(:call, GlobalRef(Base, :lastindex), held, position...),
+                Expr(:call, GlobalRef(Base, :firstindex), held, position...))
+        rewritten = _lane_source_node(ctx, index, ends)
+        rewritten === nothing && return nothing
+        push!(indices, rewritten)
+    end
+    Expr(:let, Expr(:(=), held, array),
+         Expr(:call, _lane_source_ref(:_lane_getindex), recycled, held, indices...))
+end
+
 # The destination form of recipe `r`, whose arguments are `callargs`, filling
 # `recycled` (`_lower_with_ops`), or `nothing` for the ordinary call. `nested`
-# collects the lane slots of nested dotted calls; it defaults to the cell slots
+# collects the lane slots of nested array operations; it defaults to the cell slots
 # of the position residual being lowered (`_CELL_SLOTS`), and is `nothing`
 # outside one. The slots are added only when the form is returned.
 function _lane_source_expr(r::Recipe, callargs, recycled;
@@ -426,26 +459,8 @@ function _lane_destination(ctx::_LaneSourceContext, node, recycled,
         return (Expr(:call, _lane_source_ref(:_lane_broadcast), recycled, lazy), true)
     elseif node.head === :ref && length(node.args) >= 2
         slices === false && return plain()
-        array = _lane_source_node(ctx, node.args[1], nothing)
-        array === nothing && return nothing
-        any(index -> index isa Expr && index.head === :..., node.args[2:end]) &&
-            return nothing
-        # `end`/`begin` in the k-th of n indices are `lastindex(x, k)` and
-        # `firstindex(x, k)`, or the one-argument forms for a single index.
-        held = gensym(:lane_array)
-        count = length(node.args) - 1
-        indices = Any[]
-        for (k, index) in enumerate(node.args[2:end])
-            position = count == 1 ? () : (k,)
-            ends = (Expr(:call, GlobalRef(Base, :lastindex), held, position...),
-                    Expr(:call, GlobalRef(Base, :firstindex), held, position...))
-            rewritten = _lane_source_node(ctx, index, ends)
-            rewritten === nothing && return nothing
-            push!(indices, rewritten)
-        end
-        return (Expr(:let, Expr(:(=), held, array),
-            Expr(:call, _lane_source_ref(:_lane_getindex), recycled, held, indices...)),
-            true)
+        expr = _lane_index_destination(ctx, node, recycled, nothing)
+        return expr === nothing ? nothing : (expr, true)
     elseif _lane_reduce_vcat_call(ctx, node)
         cells = _lane_source_node(ctx, node.args[3], nothing)
         cells === nothing && return nothing

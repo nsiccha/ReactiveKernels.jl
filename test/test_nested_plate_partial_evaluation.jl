@@ -113,4 +113,177 @@ end
     @test kernel(0.3) ≈ expected
     @test (groups,cuts) == saved
 end
+
+@kernel count_terms(counts::Vector{Int}) = begin
+    terms = plate(counts) do y
+        log(Float64(y) + 1)
+    end
+    return sum(terms)
+end
+
+@kernel bound_nested_score(events::Vector{Vector{Int}}, a::Float64) = begin
+    terms = plate(events, Ref(a)) do y, a
+        count_terms(y) * a
+    end
+    return sum(terms)
+end
+
+const bound_calls = Ref(0)
+counted_term(y) = (bound_calls[] += 1; log(Float64(y) + 1))
+@kernel counted_terms(counts::Vector{Int}) = begin
+    terms = plate(counts) do y
+        counted_term(y)
+    end
+    return sum(terms)
+end
+@kernel counted_score(events::Vector{Vector{Int}}, a::Float64) = begin
+    terms = plate(events, Ref(a)) do y, a
+        counted_terms(y) * a
+    end
+    return sum(terms)
+end
+
+@kernel guarded_score(events::Vector{Vector{Int}}, a::Float64) = begin
+    terms = plate(events, Ref(a)) do y, a
+        a > 0 ? count_terms(y) * a : 0.0
+    end
+    return sum(terms)
+end
+
+@kernel safe_terms(counts::Vector{Int}) = begin
+    terms = plate(counts) do y
+        y >= 0 ? log(Float64(y) + 1) : 0.0
+    end
+    return sum(terms)
+end
+@kernel safe_score(events::Vector{Vector{Int}}, a::Float64) = begin
+    terms = plate(events, Ref(a)) do y, a
+        safe_terms(y) * a
+    end
+    return sum(terms)
+end
+
+@kernel scan_terms(counts::Vector{Int}) = begin
+    terms = scan(counts; init=0.0) do carry, y
+        next = carry + log(Float64(y) + 1)
+        (next, next)
+    end
+    return sum(terms)
+end
+const PREPARED_TERMS = prepare(count_terms)
+@kernel bound_scan_score(events::Vector{Vector{Int}}, a::Float64) = begin
+    terms = plate(events, Ref(a)) do y, a
+        scan_terms(y) * a
+    end
+    return sum(terms)
+end
+@kernel bound_prepared_score(events::Vector{Vector{Int}}, a::Float64) = begin
+    terms = plate(events, Ref(a)) do y, a
+        PREPARED_TERMS(y) * a
+    end
+    return sum(terms)
+end
+@kernel deep_terms(groups::Vector{Vector{Int}}) = begin
+    terms = plate(groups) do y
+        count_terms(y)
+    end
+    return sum(terms)
+end
+@kernel deep_score(events::Vector{Vector{Vector{Int}}}, a::Float64) = begin
+    terms = plate(events, Ref(a)) do y, a
+        deep_terms(y) * a
+    end
+    return sum(terms)
+end
+
+@testset "whole bound nested plate runs at preparation" begin
+    events = [[2, 3, 1], [0, 6, 0]]
+    saved = deepcopy(events)
+    kernel = prepare(bound_nested_score; bound=(; events), type_stability=:error)
+    slope = sum(y -> sum(c -> log(Float64(c) + 1), y), events)
+    for a in (0.5, -1.3)
+        @test kernel(a) ≈ a * slope
+        @test only(only(Enzyme.autodiff(Enzyme.Reverse, kernel,
+            Enzyme.Active, Enzyme.Active(a)))) ≈ slope
+    end
+    @test !occursin(".log(", string(code_expr(kernel)))
+    @test head_count(code_expr(kernel), :for) == 1
+    @test events == saved
+end
+
+@testset "bound nested regions retain iteration and rebind" begin
+    original = plan(counted_score)
+    graph_values = copy(original.graph.values)
+    graph_recipes = copy(original.graph.recipes)
+    first_kernel = nothing
+    for n in (2, 29)
+        events = [collect(0:(i % 7)) for i in 1:n]
+        bound_calls[] = 0
+        kernel = prepare(counted_score; bound=(; events), type_stability=:error)
+        @test bound_calls[] == sum(length, events)
+        slope = sum(y -> sum(c -> log(Float64(c) + 1), y), events)
+        @test kernel(0.3) ≈ 0.3slope
+        @test kernel(-1.2) ≈ -1.2slope
+        @test bound_calls[] == sum(length, events)
+        @test !occursin("counted_term", string(code_expr(kernel)))
+        @test head_count(code_expr(kernel), :for) == 1
+        if first_kernel === nothing
+            first_kernel = kernel
+        else
+            @test typeof(kernel.f) === typeof(first_kernel.f)
+            @test head_count(code_expr(kernel), :(=)) ==
+                  head_count(code_expr(first_kernel), :(=))
+        end
+    end
+    @test original.graph.values == graph_values
+    @test original.graph.recipes == graph_recipes
+end
+
+@testset "bound nested regions preserve empty cells and lazy guards" begin
+    for events in ([Int[], [2, 0], Int[]], [Int[]], Vector{Vector{Int}}())
+        kernel = prepare(bound_nested_score; bound=(; events), type_stability=:error)
+        slope = sum(y -> sum(c -> log(Float64(c) + 1), y; init=0.0),
+                    events; init=0.0)
+        @test kernel(0.7) ≈ 0.7slope
+        @test only(only(Enzyme.autodiff(Enzyme.Reverse, kernel,
+            Enzyme.Active, Enzyme.Active(0.7)))) ≈ slope
+    end
+    safe = prepare(safe_score; bound=(events=[[-2, 3], Int[]],),
+                   type_stability=:error)
+    @test safe(0.7) ≈ 0.7log(4.0)
+    @test !occursin(".log(", string(code_expr(safe)))
+    @test only(only(Enzyme.autodiff(Enzyme.Reverse, safe,
+        Enzyme.Active, Enzyme.Active(0.7)))) ≈ log(4.0)
+
+    # A child inside a lazy arm must stay under its live guard.
+    bad = prepare(guarded_score; bound=(events=[[-2]],))
+    @test bad(-0.7) == 0.0
+    @test_throws DomainError bad(0.7)
+    good = prepare(guarded_score; bound=(events=[[3], Int[]],),
+                   type_stability=:error)
+    @test good(-0.7) == 0.0
+    @test good(0.7) ≈ 0.7log(4.0)
+end
+
+@testset "bound nested scans, prepared calls and deeper plates" begin
+    events = [[2, 3, 1], Int[], [0, 6]]
+    for (spec, slope) in (
+        (bound_scan_score, sum(y -> sum(cumsum(log.(Float64.(y) .+ 1))), events)),
+        (bound_prepared_score, sum(y -> sum(log.(Float64.(y) .+ 1)), events)))
+        kernel = prepare(spec; bound=(; events), type_stability=:error)
+        @test kernel(0.5) ≈ 0.5slope
+        @test !occursin(".log(", string(code_expr(kernel)))
+        @test head_count(code_expr(kernel), :for) == 1
+        @test only(only(Enzyme.autodiff(Enzyme.Reverse, kernel,
+            Enzyme.Active, Enzyme.Active(0.5)))) ≈ slope
+    end
+    events = [[[2, 3], Int[]], [[0, 6], [1]], Vector{Vector{Int}}()]
+    slope = sum(g -> sum(y -> sum(log.(Float64.(y) .+ 1)), g; init=0.0), events)
+    kernel = prepare(deep_score; bound=(; events), type_stability=:error)
+    @test kernel(0.5) ≈ 0.5slope
+    @test !occursin(".log(", string(code_expr(kernel)))
+    @test head_count(code_expr(kernel), :for) == 1
+    @test only(only(Enzyme.autodiff(Enzyme.Reverse, kernel,
+        Enzyme.Active, Enzyme.Active(0.5)))) ≈ slope
+end
 end

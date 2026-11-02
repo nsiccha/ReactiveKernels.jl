@@ -543,6 +543,15 @@ preparation. Values needed by the residual body re-enter it through zero-input
 constant recipes, so downstream lowering sees an ordinary `Plan` and the hot
 path performs no graph traversal or data-only recomputation.
 
+Inside an authored plate, a nested plate, scan or prepared-kernel recipe
+whose inputs are all bound follows the same split. Its complete data-only
+region runs during binding, with its runtime loops intact; only the values
+needed by live recipes are cached. For example, a nested sum of logarithms
+over a bound vector of counts is computed once per outer cell, leaving its
+multiplication by a live parameter in the evaluator. A nested recipe that
+still reads a live input remains in the cell. This does not expose the body
+of an opaque child call inside a lazy branch for partial evaluation.
+
 Binding freezes values for that preparation; changing or mutating the data is
 not an invalidation signal. Rebind by preparing again from the original graph
 or plan. The pass does not rewrite mathematics or mutate the shared graph; it
@@ -1068,9 +1077,22 @@ rows read. A value is computed at rows only when every reader reads it this
 way, and it is computed once per cell, at all the rows its readers read: a
 predictor gathered by two index vectors in two definitions, or by a
 definition and a plate, runs once at both sets of rows, with everything
-upstream of it. A value read whole anywhere, wanted, or produced any other way (including
-through an opaque function call) is computed whole as before, also when it is
+upstream of it. A value read whole anywhere, wanted, or produced any other way
+is computed whole as before, also when it is
 an operand of a `vcat` whose read rows all fall in other operands.
+
+Ordinary Julia helpers can also supply a row form. A helper such as
+`gather(z, indices) = [z[i] for i in indices]`, including a straight-line
+wrapper calling it, runs only at the requested positions. The element body
+may combine several gathered arrays and scalar operations, for example
+`[scale * sin(z[i]) + z[i]^2 for i in indices]`. The analysis reads lowered
+Julia code without executing the helper, requires unambiguous helper dispatch,
+and proves that captured arrays are read only at the iterator's index.
+The supported iterator is a `Vector{<:Integer}` or standard integer range;
+custom iteration, filtered or nested comprehensions, cross-row reads and
+unproved helper bodies retain their ordinary whole-value path and locality
+checks. Emission retains a runtime loop and infers its fresh buffer from the
+actual prepared operand types. No model rewrite or derivative rule is needed.
 
 The full broadcast shape of each such expression, and the full shape of each
 `hcat`, is still checked from its operands' axes (`DimensionMismatch`), and the
