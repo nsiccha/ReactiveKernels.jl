@@ -677,7 +677,8 @@ end
 _cell_materialize(ex) = ex isa Expr && ex.head === :call && length(ex.args) == 2 &&
     ex.args[1] == GlobalRef(@__MODULE__, :_native_broadcast_materialize)
 _cell_broadcasted(ex) = ex isa Expr && ex.head === :call && length(ex.args) >= 2 &&
-    ex.args[1] == GlobalRef(Base, :broadcasted)
+    ex.args[1] in (GlobalRef(Base, :broadcasted),
+                  GlobalRef(@__MODULE__, :_native_broadcasted))
 
 # Whether `ex` reads none of `params` and binds no names.
 function _cell_free_of(ex, params)

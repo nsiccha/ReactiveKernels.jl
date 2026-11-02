@@ -518,6 +518,44 @@ end
     return Base.SubArray(array, (indices,))
 end
 
+# Base's generic broadcast constructor maps a wide operand tuple through a
+# heap vector, losing its concrete tuple type. For Base's n-ary arithmetic on
+# Base-owned numeric operands, spell out that structural map and style fold.
+# User-owned functions and operands retain their specialized broadcasted
+# dispatch, as do ranges, tuples and other containers with special protocols.
+const _NativeBroadcastReal = Union{Bool,Base.HWReal,Float16,Int128,UInt128}
+const _NativeBroadcastNumber = Union{_NativeBroadcastReal,Complex{<:_NativeBroadcastReal}}
+const _NativeBroadcastArithmetic = Union{typeof(+),typeof(*),typeof(min),typeof(max)}
+
+@inline _native_broadcast_operand(x) = false
+@inline _native_broadcast_operand(
+    x::Union{_NativeBroadcastNumber,Array{<:_NativeBroadcastNumber},BitArray,
+             Base.RefValue{<:_NativeBroadcastNumber}}) = true
+@inline _native_broadcast_operand(
+    bc::Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle}) =
+    bc.axes === nothing && bc.f isa _NativeBroadcastArithmetic &&
+    _native_broadcast_operands(bc.args)
+@inline @generated function _native_broadcast_operands(args::Tuple)
+    foldr((i, rest) -> :(_native_broadcast_operand(getfield(args, $i)) && $rest),
+          1:fieldcount(args); init=true)
+end
+
+@inline _native_broadcasted(f, args...) = Base.broadcasted(f, args...)
+@inline function _native_broadcasted(f::_NativeBroadcastArithmetic,
+                                     args::Vararg{Any,N}) where {N}
+    N > 32 && _native_broadcast_operands(args) || return Base.broadcasted(f, args...)
+    _native_broadcast_construct(f, args)
+end
+@inline @generated function _native_broadcast_construct(f, args::Tuple)
+    items = [:(getfield(mapped, $i)) for i in 1:fieldcount(args)]
+    styles = [:(Base.Broadcast.combine_styles($item)) for item in items]
+    style = foldr((a, b) -> :(Base.Broadcast.result_style($a, $b)), styles)
+    quote
+        mapped = _native_broadcast_map(Base.Broadcast.broadcastable, args)
+        Base.Broadcast.broadcasted($style, f, $(items...))
+    end
+end
+
 @inline _native_broadcast_materialize(value) = Base.materialize(value)
 # Base's scalar/zero-dimensional path skips axis instantiation, including
 # zero-argument dotted calls for which combine_axes has no method.
@@ -530,9 +568,18 @@ end
     # unannotated singleton combine_axes method. Passing its mixed active and
     # constant array descriptor across that call defeats native Reverse's
     # static activity analysis. Keep axis discovery at the materialization
-    # site; the descriptor stays lazy and Base still owns the element loop.
+    # site; the descriptor stays lazy until this materialization boundary.
     # Respect axes supplied by a specialized broadcasted implementation.
     bc.axes === nothing || return Base.materialize(bc)
+    if _native_broadcast_wide(bc)
+        # Computing these axes already checks every pair, just as Base's
+        # instantiate does when the original descriptor has no axes.
+        ax = _native_broadcast_axes(bc)
+        ready = Base.Broadcast.Broadcasted(bc.style, bc.f, bc.args, ax)
+        T = _native_broadcast_eltype(ready)
+        isconcretetype(T) || return Base.materialize(ready)
+        return _native_broadcast_wide_copyto!(similar(ready, T), ready)
+    end
     ax = Base.@inline Base.Broadcast.combine_axes(bc.args...)
     ready = Base.Broadcast.Broadcasted(bc.style, bc.f, bc.args, ax)
     _native_broadcast_copy(Base.Broadcast.instantiate(ready))
@@ -550,6 +597,83 @@ end
 # Other destination types retain their specialized copy/alias protocol.
 @inline _native_broadcast_copyto!(dest::Array, bc) =
     copyto!(dest, Base.Broadcast.preprocess(nothing, bc))
+
+# Base's recursive tuple tails and splats stop specializing past 32 operands.
+# Wide fused expressions then rebuild successively shorter heap tuples during
+# axis discovery, element typing, preprocessing and every element read. Expand
+# only the structural operand tuple; array elements still use a runtime loop.
+@inline _native_broadcast_wide(x) = false
+@inline @generated function _native_broadcast_wide(
+        bc::Base.Broadcast.Broadcasted{S,A,F,Args}) where {S,A,F,Args}
+    fieldcount(Args) > 32 && return true
+    foldr((i, rest) -> :(_native_broadcast_wide(getfield(bc.args, $i)) || $rest),
+          1:fieldcount(Args); init=false)
+end
+
+@inline @generated function _native_broadcast_map(f::F, args::Tuple) where {F}
+    Expr(:tuple, [:(f(getfield(args, $i))) for i in 1:fieldcount(args)]...)
+end
+
+@inline _native_broadcast_axes(x) = axes(x)
+@inline function _native_broadcast_axes(
+        bc::Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle})
+    bc.axes === nothing || return bc.axes
+    isempty(bc.args) && return ()
+    _plate_broadcast_shape(_native_broadcast_map(_native_broadcast_axes, bc.args))
+end
+
+@inline _native_broadcast_eltype(x) = Base.Broadcast._broadcast_getindex_eltype(x)
+@inline function _native_broadcast_eltype(
+        bc::Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle})
+    Base.promote_typejoin_union(
+        _native_broadcast_result_type(bc.f, bc.args))
+end
+@inline @generated function _native_broadcast_result_type(f, args::Tuple)
+    types = [:(_native_broadcast_eltype(getfield(args, $i)))
+             for i in 1:fieldcount(args)]
+    Expr(:call, :_promote_op, :f, types...)
+end
+
+@inline _native_broadcast_preprocess(x) = Base.Broadcast.preprocess(nothing, x)
+@inline function _native_broadcast_preprocess(
+        bc::Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle})
+    Base.Broadcast.Broadcasted(bc.style, bc.f,
+        _native_broadcast_map(_native_broadcast_preprocess, bc.args), bc.axes)
+end
+
+Base.@propagate_inbounds _native_broadcast_getindex(x, i) =
+    Base.Broadcast._broadcast_getindex(x, i)
+Base.@propagate_inbounds @generated function _native_broadcast_getindex(
+        bc::Base.Broadcast.Broadcasted{S,A,F,Args}, i) where
+        {S<:Base.Broadcast.DefaultArrayStyle,A,F,Args}
+    # As in Base, inbounds applies to operand reads, not to the user's f.
+    values = [:(_native_broadcast_getindex(getfield(bc.args, $j), i))
+              for j in 1:fieldcount(Args)]
+    Expr(:call, :_native_broadcast_eval, :(bc.f), Expr(:tuple, values...))
+end
+@inline @generated function _native_broadcast_eval(f::F, args::Tuple) where {F}
+    Expr(:call, :f, [:(getfield(args, $i)) for i in 1:fieldcount(args)]...)
+end
+# Base's n-ary methods for these scalar types are precisely a left fold.
+# Expand that same order over the structural operands, avoiding afoldl's wide
+# vararg splat. Other scalar functions/types retain their n-ary dispatch.
+@inline @generated function _native_broadcast_eval(f::_NativeBroadcastArithmetic,
+        args::Tuple{Vararg{_NativeBroadcastNumber,N}}) where {N}
+    values = [:(getfield(args, $i)) for i in 1:N]
+    N <= 32 && return Expr(:call, :f, values...)
+    foldl((a, b) -> Expr(:call, :f, a, b), values)
+end
+
+@inline _native_broadcast_wide_copyto!(dest, bc) = copyto!(dest, bc)
+@inline function _native_broadcast_wide_copyto!(dest::Union{Array,BitArray}, bc)
+    axes(dest) == axes(bc) || Base.Broadcast.throwdm(axes(dest), axes(bc))
+    # This output is fresh: preprocess once, without an alias check against it.
+    ready = _native_broadcast_preprocess(bc)
+    @inbounds @simd for i in eachindex(ready)
+        dest[i] = _native_broadcast_getindex(ready, i)
+    end
+    dest
+end
 
 # Native concatenation.  Base's methods for dense arrays of one element type,
 # `hcat`/`vcat` of `Vector{T}`s and the `typed_hcat`/`typed_vcat`/
