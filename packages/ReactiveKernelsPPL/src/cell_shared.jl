@@ -28,6 +28,7 @@ _cell_has_prefix(::Nothing) = false
 _cell_has_prefix(s::_CellShared) = s.cache !== nothing
 _cell_frontier_names(::Nothing) = ()
 _cell_frontier_names(s::_CellShared) = s.frontier
+_cell_shared_values(::Nothing) = ()
 _cell_shared_values(s::_CellShared) = s.cache === nothing ? () : s.cache.values
 _cell_factor_bound(f::CellFactors) = _query_bound(f.plan)
 
