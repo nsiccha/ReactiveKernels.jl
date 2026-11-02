@@ -47,8 +47,12 @@ bound_kernel = prepare(model;
     bound = (; raw_predictors))
 
 # `raw_predictors` has left the runtime signature; it is no longer passed.
-bound_kernel(q, responses)          # == the unbound kernel's density
+bound_kernel(q, responses)          # ≈ the unbound kernel's density
 ```
+
+Hoisting can change the last few bits of floating-point reductions. The
+executable example checks agreement with a relative tolerance of `8eps(Float64)`;
+its tests check both routes against a 256-bit reference.
 
 The optimization is not cosmetic. The unbound kernel recomputes the standardized
 design matrix on every call; the bound kernel does not, so its residual call

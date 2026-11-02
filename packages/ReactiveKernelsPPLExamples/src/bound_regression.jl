@@ -97,7 +97,8 @@ bound_kernel = prepare(model;
     want = requested_nodes,
     bound = (; raw_predictors))
 bound_output = bound_kernel(q, responses)
-@assert bound_output == output
+# Hoisting can change floating-point reduction rounding by a few ulps.
+@assert isapprox(bound_output, output; rtol = 8eps(Float64), atol = 0.0)
 
 docs_example = (;
     name = :bound_regression_density,

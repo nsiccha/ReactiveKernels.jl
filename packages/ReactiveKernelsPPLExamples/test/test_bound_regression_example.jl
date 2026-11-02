@@ -4,20 +4,23 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 # Graph-independent reference oracle: the standardization + Normal density,
 # evaluated directly.
 function _bound_reference_density(q)
+    T = eltype(q)
     α = q[1]
     β = q[2:3]
     log_σ = q[4]
     σ = exp(log_σ)
-    n = size(BOUND_RAW_X, 1)
-    means = sum(BOUND_RAW_X; dims = 1) ./ n
-    sds = sqrt.(sum(abs2, BOUND_RAW_X .- means; dims = 1) ./ n)
-    standardized = (BOUND_RAW_X .- means) ./ sds
+    raw_predictors = T.(BOUND_RAW_X)
+    n = size(raw_predictors, 1)
+    means = sum(raw_predictors; dims = 1) ./ n
+    sds = sqrt.(sum(abs2, raw_predictors .- means; dims = 1) ./ n)
+    standardized = (raw_predictors .- means) ./ sds
     mean = α .+ standardized * β
     normal_ld(x, location, scale) =
-        -0.5 * log(2π) - log(scale) - 0.5 * ((x - location) / scale)^2
+        -0.5 * log(T(2) * T(π)) - log(T(scale)) -
+        0.5 * ((x - location) / scale)^2
     prior = normal_ld(α, 0.0, 10.0) +
             sum(normal_ld(b, 0.0, 5.0) for b in β) +
-            log(2.0) + normal_ld(σ, 0.0, 5.0)
+            log(T(2)) + normal_ld(σ, 0.0, 5.0)
     log_jacobian = log_σ
     likelihood = sum(normal_ld(BOUND_Y[i], mean[i], σ) for i in eachindex(BOUND_Y))
     (; prior, log_jacobian, likelihood,
@@ -71,9 +74,20 @@ _plain_alloc(kernel, q, x, y) = (kernel(q, x, y); @allocated kernel(q, x, y))
         @test any(!isnothing, bound.constants)
         @test all(isnothing, plain.constants)
 
-        # Same modeled density, and the bound arg is no longer accepted.
-        @test bound(q, BOUND_Y) == plain(q, BOUND_RAW_X, BOUND_Y)
-        @test bound(q, BOUND_Y) ≈ _bound_reference_density(q).density
+        # Hoisted constants may change reduction rounding. Check both routes
+        # against the graph-independent 256-bit reference at changed inputs.
+        for position in (q, [-0.5, 0.4, 2.0, log(1.3)],
+                         [0.0, 0.0, 0.0, log(2.0)])
+            expected = setprecision(BigFloat, 256) do
+                _bound_reference_density(BigFloat.(position)).density
+            end
+            full_value = plain(position, BOUND_RAW_X, BOUND_Y)
+            bound_value = bound(position, BOUND_Y)
+            @test full_value ≈ expected rtol=8eps(Float64) atol=0.0
+            @test bound_value ≈ expected rtol=8eps(Float64) atol=0.0
+            @test bound_value ≈ full_value rtol=8eps(Float64) atol=0.0
+        end
+        # The bound arg is no longer accepted.
         @test_throws MethodError bound(q, BOUND_RAW_X, BOUND_Y)
 
         # The hoist is not merely cosmetic: the residual call no longer allocates
