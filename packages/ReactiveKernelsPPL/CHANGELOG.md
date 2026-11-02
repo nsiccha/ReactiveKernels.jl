@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.58
+
+- Preserve ordinary reverse derivatives when mixture components have equal
+  log densities, including all-zero initialization of complement-weight
+  mixtures. Scalar and dotted `logaddexp` vocabulary calls use RK's existing
+  stable primal, which retains the difference at finite ties. Values and
+  mixture weights are unchanged.
+
 ## 0.1.57
 
 - Add `prepare_smc(make_problem, u0; backend, model_id, binding_id, frame_id)`
