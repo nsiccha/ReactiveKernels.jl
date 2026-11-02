@@ -235,7 +235,7 @@ function carry_smc end
 
 """
     prepare_smc_window(built, binding, u0; previous::SMCCarriedReference,
-                       backend, model_id, binding_id, warm=false)
+                       backend, model_id, binding_id, warm=false, coordinates=:all)
 
 Prepare a static-parameter target `log(previous.reference) + loglikelihood`
 for **new observations only**. The likelihood and its ordinary AD derivative
@@ -243,14 +243,40 @@ come from the model's `:likelihood` query. Original priors and coordinate
 Jacobians are not added again: the carried reference is already a density in
 unconstrained coordinates. Parameter transformations in the likelihood remain.
 
-The model/preprocessing identity and packed layout must match `previous`.
+With `coordinates=:all`, the model/preprocessing identity and packed layout
+must match `previous`.
 Keep fitted preprocessing frozen and pass it through the binding. Retained
 storage and each evaluation depend on this window, never on elapsed history.
-This does not carry latent trajectories across windows; use the filter for
-that task. A changing set of latent coordinates is a different frame.
+Use the filter for latent trajectories whose transitions are evaluated as
+successive observations arrive.
+
+With `coordinates=:auto`, the prepared target uses only the old coordinates
+read by this window's likelihood or fresh priors, and all fresh coordinates.
+Authored paths and coordinate labels match the previous carry; packed offsets
+may change. Rebuild and bind the current program when an array extent changes,
+while keeping `model_id` and fitted preprocessing fixed. The target is
+`q_old(active) * p(fresh | active) * likelihood(window | active, fresh)`.
+Fresh factors include their native transforms and Jacobians once. Dependencies
+of fresh priors, including old hyperparameters absent from the likelihood,
+belong to the active set. Joint factors and coupled transforms remain intact.
+
+Inspect [`smc_window_coordinates`](@ref) before supplying a compact initial
+point, reference or mutation metric. Particle positions and gradients use that
+compact order. [`smc_recover`](@ref) draws the inactive old coordinates lazily
+from their retained conditional; no full joint particle cloud is stored.
+`carry_smc(completed; max_reflections=16, ...)` integrates that conditional
+against the fitted compact Gaussian, flattens the joint covariance and caps
+its rank at the requested budget. Its full location vector follows the current
+layout, followed by retained coordinates absent from the current program.
+Recompression diagnostics report discarded rank and the spectral norm of the
+discarded covariance correction in the diagonal-whitened frame; this is not
+a posterior accuracy bound.
 
 Use the ordinary `tune_smc`, `initialize_smc`, `smc`, `smc_checkpoint` and
-`resume_smc` APIs. The default initial reference is the carried prior. A
+`resume_smc` APIs. The default initial reference is the carried prior for
+`:all`, or its active marginal with independent standard-normal fresh
+coordinates for `:auto`. This proposal does not replace the fresh priors in
+the target. A
 checkpoint resumes from the rebuilt window target alone, without old data.
 Its log normalizer is the new window's predictive normalizer under the
 approximate carried prior, not exact full-history evidence. Supply each new
