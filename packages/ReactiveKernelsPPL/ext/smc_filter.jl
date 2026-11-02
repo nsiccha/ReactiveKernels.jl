@@ -57,6 +57,7 @@ end
 PPL.tune_filter_smc(target::SMCFilterTarget;kwargs...) = tune_smc(target.proposal;kwargs...)
 
 struct SMCFilterStage
+    kind::Symbol
     time::Int
     window::Int
     window_steps::Int
@@ -70,6 +71,40 @@ struct SMCFilterStage
     accepted::Int
     likelihood_evaluations::Int
     reference_evaluations::Int
+    distinct_members::Int
+    moved_members::Int
+    coordinate_sd::Vector{Float64}
+    kernel::NamedTuple
+end
+
+# Anchored moments give exactly zero for a constant coordinate, even when a
+# weighted sum of identical large values would round away from that value.
+function _filter_moments(positions,mass)
+    anchor = positions[:,1]
+    offset = zeros(length(anchor))
+    for j in axes(positions,2), i in eachindex(anchor)
+        offset[i] += mass[j]*(positions[i,j]-anchor[i])
+    end
+    variance = zeros(length(anchor))
+    for j in axes(positions,2), i in eachindex(anchor)
+        variance[i] += mass[j]*abs2((positions[i,j]-anchor[i])-offset[i])
+    end
+    return anchor+offset,sqrt.(variance)
+end
+
+function _filter_distinct(positions)
+    # Hash columns once: O(members*coordinates), not pairwise comparisons.
+    distinct = Set{Vector{Float64}}()
+    for column in eachcol(positions)
+        push!(distinct,map(x -> iszero(x) ? 0.0 : x,column))
+    end
+    return length(distinct)
+end
+
+function _filter_history(state,stage)
+    history = [state.history;stage]
+    length(history)>state.history_limit && deleteat!(history,1:length(history)-state.history_limit)
+    return history
 end
 Base.:(==)(a::SMCFilterStage,b::SMCFilterStage) =
     all(getfield(a,k)==getfield(b,k) for k in fieldnames(SMCFilterStage))
@@ -94,6 +129,30 @@ struct SMCFilterState{T,C,R,M,B}
     history_limit::Int
     predictive_logscore::Float64
     log_normalizer::Float64
+end
+
+PPL.tune_filter_smc(state::SMCFilterState;kwargs...) = tune_smc(state.proposal;kwargs...)
+
+function Base.showerror(io::IO, err::PPL.SMCDegeneracyError{<:SMCFilterState})
+    state = err.state
+    print(io, "SMCDegeneracyError: learning-filter degeneracy (", err.phase,
+        "), input time=", state.time, ", window=", state.window,
+        ", members=", length(state.members))
+    diagnostic = err.diagnostics
+    if diagnostic !== nothing
+        invalid = findall(x -> !(isfinite(x) && x>0),diagnostic.coordinate_sd)
+        print(io, ", invalid marginal scales=", length(invalid))
+        if diagnostic isa SMCFilterStage
+            print(io, ", distinct=", diagnostic.distinct_members,
+                ", moved=", diagnostic.moved_members, ", accepted=", diagnostic.accepted,
+                "/", diagnostic.proposals)
+        end
+    end
+    print(io, ". Input state/RNG preserved in error.state; a failed filter_step has not ",
+        "consumed its observation. Inspect error.diagnostics and its kernel; use ",
+        "tune_filter_smc(error.state; rng, init) with independent pilot inputs and ",
+        "rejuvenate_smc(error.state; tuning, moves), then retry the observation. ",
+        "Distinct members do not establish mixing.")
 end
 
 function _filter_cloud(target,calibration,boundary,rng,n,k)
@@ -150,13 +209,13 @@ function _window_filter(target,boundary,records,u,rng,n)
 end
 
 function _filter_rollover(state,rng)
+    location,coordinate_sd = _filter_moments(state.positions,state.parameter_mass)
+    invalid_coordinates = findall(x -> !(isfinite(x) && x>0),coordinate_sd)
+    isempty(invalid_coordinates) && all(isfinite,location) ||
+        throw(PPL.SMCDegeneracyError(state,:rollover,
+            (;coordinate_sd,invalid_coordinates,kernel=deepcopy(state.kernel))))
+    reference = SMCReference(location,coordinate_sd)
     boundary = PPL._filter_boundary(state.members,state.parameter_mass,rng)
-    location = state.positions*state.parameter_mass
-    variance = zeros(length(location))
-    for j in axes(state.positions,2),i in eachindex(location)
-        variance[i] += state.parameter_mass[j]*abs2(state.positions[i,j]-location[i])
-    end
-    reference = SMCReference(location,sqrt.(variance))
     calibration = SMCCarriedReference(reference,deepcopy(state.calibration.frame),
         string("filter-window-",string(state.window+1;base=16,pad=16)))
     proposal = _filter_reference(calibration,state.proposal.backend)
@@ -165,47 +224,49 @@ function _filter_rollover(state,rng)
     return calibration,proposal,boundary,positions,members
 end
 
-function _filter_replenish(target,calibration,proposal,boundary,records,kernel,rng,n,k,::Type{M}) where {M}
-    positions = _reference_draws(rng,calibration.reference,length(calibration.reference.location),k)
-    candidates = Vector{Union{Nothing,M}}(undef,k)
-    scores = Vector{Float64}(undef,k)
-    evaluations = 0
-    for j in 1:k
-        candidates[j],scores[j],work = _window_filter(target,boundary,records,
-            positions[:,j],Xoshiro(rand(rng,UInt64)),n)
-        evaluations += work
-    end
-    _filter_logsum(scores)
-    parents,_,_ = PPL._filter_resample(scores,rand(rng,UInt64))
-    positions = positions[:,parents]
-    members = [PPL._filter_with_rng(candidates[j],Xoshiro(rand(rng,UInt64))) for j in parents]
-    scores = scores[parents]
-    accepted,reference_evaluations = 0,0
+function _filter_move!(positions,members,target,proposal,boundary,records,kernel,rng)
+    n,k = first(members).particles,length(members)
+    scores = [m.log_normalizer for m in members]
+    accepted,moved,evaluations,reference_evaluations = 0,0,0,0
     reference = BridgeTarget(proposal.prior,proposal,1.0,size(positions,1))
-    metric = _metric(kernel.metric)
-    for j in 1:k, _ in 1:kernel.moves
-        chain = FixedKernelNUTSState(Xoshiro(rand(rng,UInt64)),copy(positions[:,j]);
-            metric,stepsize=kernel.stepsize,max_tree_depth=kernel.max_tree_depth)
-        transition = fixed_kernel_nuts_step(chain,reference)
-        reference_evaluations += transition.stats.steps
-        u = transition.state.position
-        candidate,score,work = _window_filter(target,boundary,records,u,
-            Xoshiro(rand(rng,UInt64)),n)
-        evaluations += work
-        # The proposal kernel is reversible for the Gaussian reference, so
-        # that density cancels. Keep the old estimate on rejection (PMMH).
-        if log(rand(rng)) < score-scores[j]
-            positions[:,j] = u
-            members[j] = candidate
-            scores[j] = score
-            accepted += 1
+    prototype = FixedKernelNUTSState(Xoshiro(0),positions[:,1];
+        metric=_metric(kernel.metric),stepsize=kernel.stepsize,max_tree_depth=kernel.max_tree_depth)
+    for j in 1:k
+        initial = positions[:,j]
+        for _ in 1:kernel.moves
+            chain = FixedKernelNUTSState(prototype; rng=Xoshiro(rand(rng,UInt64)),position=positions[:,j])
+            transition = fixed_kernel_nuts_step(chain,reference)
+            reference_evaluations += transition.stats.steps
+            u = transition.state.position
+            candidate,score,work = _window_filter(target,boundary,records,u,
+                Xoshiro(rand(rng,UInt64)),n)
+            evaluations += work
+            # The proposal is reversible for the window's Gaussian prior.
+            # Keep the previous likelihood estimate AND cloud on rejection.
+            if log(rand(rng)) < score-scores[j]
+                positions[:,j] = u
+                members[j] = candidate
+                scores[j] = score
+                accepted += 1
+            end
         end
+        moved += positions[:,j] != initial
     end
-    return positions,members,length(unique(parents)),accepted,evaluations,reference_evaluations
+    return accepted,moved,evaluations,reference_evaluations
+end
+
+function _filter_replenish(positions,members,logmass,target,proposal,boundary,records,kernel,rng)
+    parents,_,_ = PPL._filter_resample(logmass,rand(rng,UInt64))
+    positions = positions[:,parents]
+    members = [PPL._filter_with_rng(members[j],Xoshiro(rand(rng,UInt64))) for j in parents]
+    accepted,moved,evaluations,reference_evaluations =
+        _filter_move!(positions,members,target,proposal,boundary,records,kernel,rng)
+    return positions,members,length(unique(parents)),accepted,moved,evaluations,reference_evaluations
 end
 
 function PPL.filter_step(state::SMCFilterState,observation::NamedTuple;
         inputs::NamedTuple=(;),groups=nothing)
+    _check_cloud(state,state.positions,:input)
     rng = copy(state.rng)
     reset = length(state.records) == state.window_length
     calibration,proposal,boundary,positions,members = reset ? _filter_rollover(state,rng) :
@@ -233,30 +294,60 @@ function PPL.filter_step(state::SMCFilterState,observation::NamedTuple;
     mass = exp.(logmass)
     ess = inv(sum(abs2,mass))
     replenish = ess < state.ess_fraction*k || any(==(-Inf),logmass)
-    unique_parents,accepted,reference_evaluations = k,0,0
+    unique_parents,accepted,moved,reference_evaluations = k,0,0,0
     evaluations = k*n
     if replenish
-        positions,nextmembers,unique_parents,accepted,work,reference_evaluations =
-            _filter_replenish(state.target,calibration,proposal,boundary,records,
-                state.kernel,rng,n,k,eltype(nextmembers))
+        positions,nextmembers,unique_parents,accepted,moved,work,reference_evaluations =
+            _filter_replenish(positions,nextmembers,logmass,state.target,proposal,boundary,records,
+                state.kernel,rng)
         evaluations += work
         mass,logmass = fill(1/k,k),fill(-log(k),k)
     end
     total = state.log_normalizer+score
     isfinite(total) || throw(ArgumentError("streaming filter normalizer overflow"))
     window = state.window+Int(reset)
-    stage = SMCFilterStage(state.time+1,window,length(records),score,ess,
+    _,coordinate_sd = _filter_moments(positions,mass)
+    stage = SMCFilterStage(:assimilate,state.time+1,window,length(records),score,ess,
         inv(sum(abs2,mass)),replenish,reset,unique_parents,
-        replenish ? k*state.kernel.moves : 0,accepted,evaluations,reference_evaluations)
-    history = [state.history;stage]
-    length(history)>state.history_limit && deleteat!(history,1:length(history)-state.history_limit)
+        replenish ? k*state.kernel.moves : 0,accepted,evaluations,reference_evaluations,
+        _filter_distinct(positions),moved,coordinate_sd,deepcopy(state.kernel))
+    _check_cloud(state,positions,:filter_step,stage)
     return SMCFilterState(state.target,calibration,proposal,positions,nextmembers,
         mass,logmass,boundary,records,rng,state.time+1,window,state.window_length,
-        state.ess_fraction,state.kernel,history,state.history_limit,score,total)
+        state.ess_fraction,state.kernel,_filter_history(state,stage),state.history_limit,score,total)
+end
+
+function PPL.rejuvenate_smc(state::SMCFilterState; tuning::SMCTuningSchedule,moves::Integer)
+    moves>=1 || throw(ArgumentError("rejuvenation moves must be positive"))
+    options = _options(SMCOptions(;tuning),size(state.positions,1),state.proposal.prior,state.proposal)
+    nextkernel,_ = _stage_kernel(options,size(state.positions,1),1.0)
+    kernel = merge(nextkernel,(;moves=Int(moves)))
+    rng = copy(state.rng)
+    positions = copy(state.positions)
+    members = [PPL._filter_with_rng(m,copy(m.rng)) for m in state.members]
+    accepted,moved,evaluations,reference_evaluations = _filter_move!(positions,members,
+        state.target,state.proposal,state.boundary,state.records,kernel,rng)
+    _,coordinate_sd = _filter_moments(positions,state.parameter_mass)
+    k = length(members)
+    ess = inv(sum(abs2,state.parameter_mass))
+    stage = SMCFilterStage(:rejuvenate,state.time,state.window,length(state.records),0.0,
+        ess,ess,false,false,k,k*kernel.moves,accepted,evaluations,reference_evaluations,
+        _filter_distinct(positions),moved,coordinate_sd,deepcopy(kernel))
+    _check_cloud(state,positions,:rejuvenation,stage)
+    # At a full boundary, a recovery that still cannot supply a Gaussian
+    # marginal must fail here, before a subsequent rollover consumes data.
+    if length(state.records)==state.window_length && !all(x -> isfinite(x) && x>0,coordinate_sd)
+        throw(PPL.SMCDegeneracyError(state,:rejuvenation,stage))
+    end
+    return SMCFilterState(state.target,state.calibration,state.proposal,positions,members,
+        copy(state.parameter_mass),copy(state.log_parameter_mass),deepcopy(state.boundary),
+        deepcopy(state.records),rng,state.time,state.window,state.window_length,state.ess_fraction,
+        deepcopy(nextkernel),_filter_history(state,stage),state.history_limit,
+        state.predictive_logscore,state.log_normalizer)
 end
 
 function PPL.filter_checkpoint(state::SMCFilterState)
-    return deepcopy((; schema_version=1,kind=:parameter_learning,versions=_versions(),
+    return deepcopy((; schema_version=2,kind=:parameter_learning,versions=_versions(),
         signature=state.target.signature,calibration=state.calibration,
         positions=state.positions,members=map(filter_checkpoint,state.members),
         parameter_mass=state.parameter_mass,log_parameter_mass=state.log_parameter_mass,
@@ -269,7 +360,7 @@ end
 
 function PPL.resume_filter(target::SMCFilterTarget,checkpoint)
     c = deepcopy(checkpoint)
-    c.schema_version==1 && c.kind===:parameter_learning && c.versions==_versions() ||
+    c.schema_version==2 && c.kind===:parameter_learning && c.versions==_versions() ||
         throw(ArgumentError("parameter filter checkpoint schema/versions differ"))
     _same(c.signature,target.signature) ||
         throw(ArgumentError("parameter filter checkpoint model, mapping or frame differs"))

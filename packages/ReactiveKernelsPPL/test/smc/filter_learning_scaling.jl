@@ -41,7 +41,7 @@ end
         s=filter_stream(s,F.records([0.9,1.1]))
         measured=measure(s,(;y=0.8))
         @test measured.replenished
-        @test measured.evaluations==members*particles*(1+2*3)
+        @test measured.evaluations==members*particles*(1+3)
         @info "filter replenishment scaling" members particles window=3 measured
     end
 end

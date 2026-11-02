@@ -16,6 +16,24 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.73
+
+- **Breaking:** learning-filter replenishment now resamples the current weighted
+  parameter/filter pairs, then applies fixed particle-Metropolis moves. It no
+  longer discards learned positions to draw a fresh window-prior population.
+  Full spatial collapse raises `SMCDegeneracyError` after mutation; invalid
+  Gaussian rollover scales report coordinates and the preserved input state.
+  Failed steps consume neither their observation nor the input RNG.
+- `tune_filter_smc(state; ...)` independently tunes the current window reference;
+  `rejuvenate_smc(state; tuning, moves)` attempts fixed-budget recovery without
+  resampling, consuming data or changing weights/evidence. Failed attempts remain
+  transactional; retry a failed observation only after recovery succeeds.
+- Bounded learning histories distinguish assimilation and recovery, and report
+  distinct members, actual movement, weighted coordinate spread and kernel
+  budgets separately from acceptance and ESS. Parameter-learning checkpoints
+  use schema 2 and require matching versions. The marginal-Gaussian/independent
+  state boundary approximation is unchanged; diversity does not certify mixing.
+
 ## 0.1.72
 
 - `factor_support` of a vector simplex (`s ~ Dirichlet(alpha)`) or ordered
@@ -57,6 +75,7 @@ are recorded in the git history only.
   `sum(z[rows[k]] + w[rows[k]])`, including transparent forwarding helpers,
   with or without shared-prefix caching. Each term retains both gathered
   operands and the original addition's shape checks. Requires RK 0.1.60.
+
 
 ## 0.1.68
 
