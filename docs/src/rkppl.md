@@ -319,13 +319,43 @@ qualified and aliased constructors. Defaults and constructor parameterizations
 are preserved: for example, `Distributions.Gamma(shape, scale)` supplies the
 owned Gamma graph's `scale` port.
 
-`sampling_distribution_graph(constructor, arguments::Tuple)` returns the
-expression constructing that graph, or `nothing` when no mapping is available.
-The arguments are expressions; the hook never evaluates them or chooses
-parameter geometry. Consumers may compose the returned object with its
-`logpdf`, `cdf`, `ccdf`, `logcdf`, or `logccdf` endpoints where the family
-provides them. Caller-owned families may extend this hook with module-visible
-RK objects.
+A caller-owned law can expose its density arithmetic through
+`sampling_distribution_graph(constructor, argument_expressions::Tuple)`:
+
+```julia
+@kernel mynormal_density(value, mu) = begin
+    residual = value - mu
+    return -log(2pi)/2 - residual^2/2
+end
+ReactiveKernelsPPL.sampling_distribution_graph(::Type{MyNormal}, args::Tuple) =
+    mynormal_density
+```
+
+The function-shaped `KernelSpec` receives the sampled value first, followed by
+the law's positional and keyword arguments. Full explicit boundaries compose
+into the model, with keywords ordered by the graph declaration. Omitted
+defaults and splats retain the numerical `sampling_logdensity` path. The hook
+receives static authored syntax, including `Expr(:parameters, ...)` for
+keywords; it does not evaluate sampled arguments or construct the runtime law.
+It may also return an expression constructing an RK object with a
+`.logpdf(value)` endpoint, or `nothing` for the numerical path.
+
+Parameter use still declares `sampling_geometry` separately. This works for
+whole parameters and undotted joint latents inside `@plate`: identity or local
+coordinates do not factorize a joint density or turn it into observations.
+Locally constructed density specs are reconstructed through the same hook
+when the actual `kernel_expr` is printed and replayed. No registry or global
+binding for the returned spec is required. Graph-visible density and geometry
+allow native Enzyme Reverse to differentiate their composed arithmetic.
+
+The executable `examples/rkppl_owned_density_graph.jl` returns local specs for
+both arities of a caller's positive-law wrapper. Each composes an owned Normal
+endpoint with a lazy support check and the law's change-of-variable term;
+that term is separate from the sampler-coordinate Jacobian.
+
+When the hook returns an object expression, consumers may also compose its
+supported `cdf`, `ccdf`, `logcdf`, and `logccdf` endpoints. A function-shaped
+return defines the density endpoint only.
 
 The DirichletMultinomial graph exposes shared concentration terms and
 count-only normalizers. Invalid counts or totals return `-Inf`, and
@@ -334,9 +364,9 @@ does not need the Distributions support-fix pin.
 
 Other `Distributions.Distribution` objects use their ordinary public
 `Distributions.logpdf` method, including caller-owned types and stored
-distribution values. For custom laws whose arithmetic must participate in
-hoisting, use a module-visible `@kernel` with `LogDensity` as above. The numerical
-adapter preserves the support behavior of the supplied method.
+distribution values. Custom laws can expose their arithmetic through the hook above or a
+module-visible `@kernel` with `LogDensity`. The numerical adapter preserves
+the support behavior of the supplied method.
 Distributions 0.25.132 evaluates
 `DirichletMultinomial` outside its support: for example, counts `[2, 3, 1]`
 have a finite density even when the declared total is 5. Use the corrected
@@ -1209,15 +1239,16 @@ Native values and ordinary Enzyme Reverse gradients are supported. Not built
 yet: such latents over `levels(…)`, and predictive draws and `jax_source`
 of them.
 
-Two properties of the law keep its density differentiable by native Enzyme
-Reverse. Pass a distribution family as a type parameter, not a field: with
+For ordinary numerical callbacks, pass a distribution family as a type
+parameter, not a field: with
 `struct L{F,…}; family::F; …` holding `Normal` (a `UnionAll`), the density
-is not concretely typed, preparation warns, and the gradient fails. And a law
+is not concretely typed, preparation warns, and the gradient fails. A law
 holding data beside a sampled value (`TotalCoordinates(log.(mu[i]), s)`, with
 `s` sampled) fails Enzyme's static activity analysis when its
-`sampling_logdensity` is not inlined (see [Core constraints](constraints.md)):
-mark that method `@inline`, or prepare with
-`AutoEnzyme(mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`.
+`sampling_logdensity` is not inlined. Expose the law's density through
+`sampling_distribution_graph` to compose its arithmetic with the model.
+Remaining numerical callback failures are limitations to fix or report;
+they do not waive the [Core constraints](constraints.md).
 
 ## Submodels
 

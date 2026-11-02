@@ -14,15 +14,21 @@ end
 """
     sampling_distribution_graph(constructor, arguments::Tuple)
 
-Return a Julia expression constructing an owned RK distribution object, or
-`nothing` when this constructor/arity has no graph mapping. `constructor` is
-the resolved Julia binding; `arguments` contains authored expressions, not
-evaluated parameter values. The result can be composed with `.logpdf(value)`
-or with the object's CDF/log-tail endpoints. This structural hook does not
-choose parameter geometry or evaluate a statistical constructor.
+Return a function-shaped `KernelSpec`, a Julia expression constructing an owned
+RK distribution object, or `nothing` when this constructor/arity has no graph
+mapping. A density `KernelSpec` receives the sampled value first, then the
+constructor's positional and keyword arguments. Its complete explicit call
+boundary composes directly, including keyword ports in declaration order;
+omitted/default or splatted arguments retain the numerical RHS path.
+`constructor` is the resolved Julia binding; `arguments` contains authored expressions, not
+evaluated parameter values (keyword syntax is an `Expr(:parameters, ...)`).
+An object expression can be composed with `.logpdf(value)` or with the object's
+CDF/log-tail endpoints. This structural hook does not choose parameter
+geometry or evaluate a statistical constructor.
 
-The Distributions extension supplies mappings for the supported base families.
-Caller-owned types may extend this hook with their own module-visible graphs;
+The Distributions extension supplies mappings for supported base families.
+Caller-owned types may extend this hook with their own graphs, including a
+locally constructed spec reconstructed by calling the same structural hook;
 ordinary numerical RHS values retain [`sampling_logdensity`](@ref).
 """
 sampling_distribution_graph(constructor, arguments::Tuple) = nothing
@@ -377,10 +383,12 @@ function _sampling_read_literal(x::Expr, mod)
     x.head === :curly && return _eval_type_application(x,
         a -> _sampling_read_literal(a, mod))
     f = x.head === :call ? ReactiveKernels._kernel_resolve_binding(mod, first(x.args)) : nothing
-    if f in (Core.Expr, Core.QuoteNode, Core.GlobalRef)
+    # Julia prints a quoted generated symbol as Symbol("##name#..."). Decode
+    # that literal constructor too, so the printed source reconstructs it.
+    if f in (Core.Expr, Core.QuoteNode, Core.GlobalRef, Core.Symbol)
         return f((_sampling_read_literal(a, mod) for a in x.args[2:end])...)
     end
-    throw(ArgumentError("expected literal geometry constructor syntax, got $x"))
+    throw(ArgumentError("expected literal sampling graph constructor syntax, got $x"))
 end
 function ReactiveKernels._kernel_resolve_graph_constructor(
         ::typeof(_sampling_graph_endpoint), arguments, mod::Module)
@@ -388,11 +396,8 @@ function ReactiveKernels._kernel_resolve_graph_constructor(
     return _sampling_graph_endpoint((_sampling_read_literal(a, mod) for a in arguments)...)
 end
 
-function _sampling_graph_call(g, edge, geometry_expr, arguments, keywords)
-    endpoint = getproperty(g, edge)
-    endpoint isa _SamplingGraphEndpoint || return nothing
+function _sampling_graph_arguments(spec, arguments, keywords)
     any(a -> Meta.isexpr(a, :...), arguments) && return nothing
-    spec = endpoint.graph
     ordered = Any[arguments...]
     signature = spec.call_signature
     if signature isa ReactiveKernels._KernelCallSignature
@@ -409,9 +414,27 @@ function _sampling_graph_call(g, edge, geometry_expr, arguments, keywords)
     else
         isempty(keywords) || return nothing
     end
+    return ordered
+end
+function _sampling_graph_call(g, edge, geometry_expr, arguments, keywords)
+    endpoint = getproperty(g, edge)
+    endpoint isa _SamplingGraphEndpoint || return nothing
+    ordered = _sampling_graph_arguments(endpoint.graph, arguments, keywords)
+    ordered === nothing && return nothing
     callee = Expr(:call, GlobalRef(@__MODULE__, :_sampling_graph_endpoint),
         geometry_expr.args[2:end]..., QuoteNode(edge))
     return Expr(:call, callee, ordered...)
+end
+
+# Reconstruct a caller's density spec from static authored syntax, just as for
+# geometry endpoints. No runtime constructor or active model value is evaluated.
+function _sampling_distribution_endpoint(constructor, arguments::Tuple)
+    return extract(sampling_distribution_graph(constructor, arguments))
+end
+function ReactiveKernels._kernel_resolve_graph_constructor(
+        ::typeof(_sampling_distribution_endpoint), arguments, mod::Module)
+    length(arguments) == 2 || return nothing
+    return _sampling_distribution_endpoint((_sampling_read_literal(a, mod) for a in arguments)...)
 end
 function _external_endpoint_call(head, args, keywords)
     return isempty(keywords) ? Expr(:call, head, args...) :
@@ -503,13 +526,24 @@ end
 
 function _external_graph_density(args)
     constructor = _external_constructor(args)
-    constructor isa GlobalRef || return nothing
-    binding = getglobal(constructor.mod, constructor.name)
+    _is_constructor_head(constructor) || return nothing
+    binding = _call_head_value(constructor)
     if binding !== LogDensity
+        authored = Tuple(_external_authored_arguments(args))
+        object = sampling_distribution_graph(binding, authored)
+        if object isa KernelSpec
+            # Check before selecting the graph path. Incomplete calls keep the
+            # constructor's ordinary defaults and splat behavior.
+            ordered = _sampling_graph_arguments(object,
+                Any[:_value, _external_arguments(args)...], _external_keywords(args))
+            ordered === nothing && return nothing
+            endpoint = Expr(:call, GlobalRef(@__MODULE__, :_sampling_distribution_endpoint),
+                constructor, Expr(:tuple, (_sampling_ast_literal(a) for a in authored)...))
+            return (endpoint=endpoint, constructor=nothing, first_argument=1, graph=object)
+        end
         isempty(_external_keywords(args)) || return nothing
-        object = sampling_distribution_graph(binding, Tuple(_external_arguments(args)))
         return object === nothing ? nothing :
-            (endpoint=nothing, constructor=binding, first_argument=1)
+            (endpoint=nothing, constructor=binding, first_argument=1, graph=nothing)
     end
     positional = _external_arguments(args)
     isempty(positional) && return nothing
@@ -524,12 +558,16 @@ function _external_graph_density(args)
     end
     endpoint isa GlobalRef && getglobal(endpoint.mod, endpoint.name) isa KernelSpec ||
         return nothing
-    return (endpoint=endpoint, constructor=nothing, first_argument=2)
+    return (endpoint=endpoint, constructor=nothing, first_argument=2, graph=nothing)
 end
 
 # Direct nested-kernel calls consume graph ports. Preserve literal and computed
 # arguments as visible assignments before that call, including inside a plate.
 function _external_graph_density_call(graph_density, arguments, keywords)
+    if graph_density.graph !== nothing
+        arguments = _sampling_graph_arguments(graph_density.graph, arguments, keywords)
+        keywords = Any[]
+    end
     statements = Expr[]
     ports = Any[]
     for argument in arguments

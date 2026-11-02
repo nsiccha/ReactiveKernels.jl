@@ -565,8 +565,16 @@ function _expand_cell_joint_latents(st, taken, data::Set{Symbol}, mod::Module,
         else
             push!(cells, Expr(:(=), c.args[2], endpoint(:_ppl_cell_joint_constrain, :constrain)))
         end
-        push!(cells, Expr(:(=), Expr(:ref, Symbol(prior, :_cells), ivar),
-            Expr(:call, ref(:sampling_logdensity), deepcopy(call), c.args[2])))
+        density_graph = _external_graph_density((;rhs=call))
+        if density_graph === nothing
+            push!(cells, Expr(:(=), Expr(:ref, Symbol(prior, :_cells), ivar),
+                Expr(:call, ref(:sampling_logdensity), deepcopy(call), c.args[2])))
+        else
+            density = _external_graph_density_call(density_graph,
+                Any[c.args[2], positional[density_graph.first_argument:end]...], keywords)
+            density[end] = Expr(:(=), Expr(:ref, Symbol(prior, :_cells), ivar), density[end])
+            append!(cells, density)
+        end
         push!(cells, Expr(:(=), Expr(:ref, Symbol(logjac, :_cells), ivar),
             endpoint(:_ppl_cell_joint_logjac, :logjac)))
         push!(priors, prior)
