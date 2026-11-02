@@ -41,6 +41,18 @@ function projected(x,gain)
 end
 native(x,gain) = sum(recurrence(x,gain))
 
+@traceable function skipping_recurrence(x::AbstractVector)
+    output = similar(x)
+    carry = 0.0
+    for t in eachindex(x)
+        output[t] = carry
+        x[t] < 0 && continue
+        carry += x[t]
+        output[t] = carry
+    end
+    return output
+end
+
 @testset "Recorded helper ordinary Reverse and concrete transition" begin
     for n in (0,4,80)
         x = [sin(t) for t in 1:n]
@@ -53,5 +65,10 @@ native(x,gain) = sum(recurrence(x,gain))
     end
     @test only(code_typed(step,Tuple{Vector{Float64},Float64,Float64,Int})).second ==
         Tuple{Vector{Float64},Float64}
+    # Loop-local control must never escape into a consumer's group loop.
+    skipping_source = Base.invokelatest(ReactiveKernels._traceable_source,
+        typeof(skipping_recurrence),Vector{Float64})
+    @test_throws r"helper loop control continue" ReactiveKernels._stream_helper_expression(
+        skipping_source,[:x],[true],(name,initial) -> (initial,identity),:time)
 end
 end

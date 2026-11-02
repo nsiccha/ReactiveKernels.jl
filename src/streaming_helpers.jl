@@ -66,6 +66,8 @@ function _stream_source_value(ex, series, output, element_type, clock; prelude=f
         return Expr(:(=),output,Expr(:call,GlobalRef(Base,:convert),element_type,value))
     elseif Meta.isexpr(ex,:ref) && ex.args[1] == output
         _stream_error("helper output history requires an explicitly bounded carry")
+    elseif ex.head in (:break,:continue)
+        _stream_error("helper loop control $(ex.head) has no finite helper projection")
     elseif ex.head in (:for,:while,:generator,:comprehension,:macrocall,:function,:->,:return,:global)
         _stream_error("nested iteration or scope $(ex.head) has no finite helper projection")
     end
