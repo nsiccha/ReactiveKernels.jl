@@ -228,6 +228,13 @@ conforms.
 Standalone reproducers under `benchmark/` (the backend and its AD engine
 only, no ReactiveKernels code) isolate the remaining backend limitations:
 
+- On Julia 1.10.12 with SpecialFunctions 2.9.1, seeded Enzyme 0.13.206
+  (`c09f2f6`) gives wrong Gamma-derived shape gradients in the family
+  acceptance suite. The backend-only `repro_enzyme_gamma_inc_shape.jl`
+  instead fails to resolve `digamma` in that environment. The same reproducer
+  passes all 12 shape checks on dogfood `b916d65b` (Enzyme 0.13.217,
+  declared libEnzyme `df199913`). The Gamma arithmetic and ordinary Reverse
+  mode are unchanged; the observation concerns these two tested backend pins.
 - On Julia 1.10.12, Enzyme dogfood from `f53965b` until `0e251cfb`
   fails Reverse-over-Forward Hessian-vector products through a geometry
   closure with unused trailing varargs, such as `(u, shape, lo, rest...)`.

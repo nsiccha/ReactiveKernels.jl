@@ -33,6 +33,54 @@ ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Laplace}, ar
     _location_scale_graph(:laplace, args, false)
 ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Logistic}, args::Tuple) =
     _location_scale_graph(:logistic, args, false)
+ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Gumbel}, args::Tuple) =
+    _location_scale_graph(:gumbel, args, false)
+
+# Positive-parameter families share constructor validation, but their arities
+# and defaults remain those of the resolved Distributions.jl constructor.
+function _positive_pair_graph(name, args)
+    length(args) <= 2 || return nothing
+    first = isempty(args) ? 1.0 : args[1]
+    second = length(args) < 2 ? 1.0 : args[2]
+    _graph_call(name, _checked_argument(first), _checked_argument(second))
+end
+function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Weibull}, args::Tuple)
+    # The one-argument Julia constructor does not check its shape. Preserve
+    # that call's behavior; the two-argument constructor validates both ports.
+    length(args) == 1 && return _graph_call(:_unchecked_unit_weibull, _float_argument(only(args)))
+    _positive_pair_graph(:weibull, args)
+end
+ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.InverseGamma}, args::Tuple) =
+    _positive_pair_graph(:inverse_gamma, args)
+ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.InverseGaussian}, args::Tuple) =
+    _positive_pair_graph(:inverse_gaussian, args)
+
+function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.TDist}, args::Tuple)
+    length(args) == 1 || return nothing
+    _graph_call(:student_t, _checked_argument(only(args)), 0.0, 1.0)
+end
+function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Rayleigh}, args::Tuple)
+    length(args) <= 1 || return nothing
+    _graph_call(:rayleigh, _checked_argument(isempty(args) ? 1.0 : only(args)))
+end
+function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Chi}, args::Tuple)
+    length(args) == 1 || return nothing
+    _graph_call(:chi, _checked_argument(only(args)))
+end
+function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Chisq}, args::Tuple)
+    length(args) == 1 || return nothing
+    _graph_call(:chi_squared, _checked_argument(only(args)))
+end
+function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.FDist}, args::Tuple)
+    length(args) == 2 || return nothing
+    _graph_call(:f_dist, _checked_argument(args[1]), _checked_argument(args[2]))
+end
+function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.BetaPrime}, args::Tuple)
+    length(args) <= 2 || return nothing
+    alpha = isempty(args) ? 1.0 : args[1]
+    beta = length(args) < 2 ? alpha : args[2]
+    _graph_call(:beta_prime, _checked_argument(alpha), _checked_argument(beta))
+end
 
 function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Gamma}, args::Tuple)
     length(args) <= 2 || return nothing
@@ -88,6 +136,13 @@ _rk_law(::Val{:exponential}, c) = Distributions.Exponential(c._1)
 _rk_law(::Val{:uniform}, c) = Distributions.Uniform(c._1, c._2)
 _rk_law(::Val{:beta}, c) = Distributions.Beta(c._1, c._2)
 _rk_law(::Val{:inverse_gamma}, c) = Distributions.InverseGamma(c._1, c._2)
+_rk_law(::Val{:gumbel}, c) = Distributions.Gumbel(c._1, c._2)
+_rk_law(::Val{:rayleigh}, c) = Distributions.Rayleigh(c._1)
+_rk_law(::Val{:chi}, c) = Distributions.Chi(c._1)
+_rk_law(::Val{:chi_squared}, c) = Distributions.Chisq(c._1)
+_rk_law(::Val{:inverse_gaussian}, c) = Distributions.InverseGaussian(c._1, c._2)
+_rk_law(::Val{:beta_prime}, c) = Distributions.BetaPrime(c._1, c._2)
+_rk_law(::Val{:f_dist}, c) = Distributions.FDist(c._1, c._2)
 
 # `gamma(shape, rate)`: Distributions.jl takes the scale.
 function _rk_law(::Val{:gamma}, c)

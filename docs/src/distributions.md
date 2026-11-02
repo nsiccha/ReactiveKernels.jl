@@ -186,7 +186,9 @@ Main.ReactiveKernelsDocs.execute_example(
 ## Measuring composition and binding
 
 `benchmark/distribution_graph_hoisting.jl <output-dir> [family]` compares
-owned Normal, LogNormal, Gamma, Exponential, Cauchy, Laplace and Logistic
+owned Normal, LogNormal, Gamma, Exponential, Cauchy, Laplace, Logistic,
+Student-t, Gumbel, Weibull, InverseGamma, InverseGaussian, Rayleigh, Chi,
+Chi-squared, F and BetaPrime
 graphs with per-observation `Distributions.logpdf` calls. Observations are
 bound; distribution parameters change on every measured call. The Gamma
 graph exposes the observation logarithm separately from its shape-dependent

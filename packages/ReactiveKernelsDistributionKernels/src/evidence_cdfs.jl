@@ -1,4 +1,4 @@
-export rk_inverse_gaussian_tail, rk_von_mises_cdf
+export rk_inverse_gaussian_tail, rk_inverse_gaussian_logtail, rk_von_mises_cdf
 export rk_logprob_tail
 export rk_von_mises_periodic_cdf
 export rk_ordinal_stopping_logpdf, rk_ordinal_stopping_tail
@@ -151,22 +151,75 @@ ReactiveKernels.@_record_source function rk_beta_binomial_ccdf(n, a, b, k)
     return result
 end
 
-# Scaled erfc avoids exp(2lambda/mu) overflowing before it is multiplied by
-# a vanishing normal tail. Both formulas are ordinary differentiable math.
-ReactiveKernels.@_record_source function rk_inverse_gaussian_tail(mu, lambda, x, upper::Bool)
-    result = zero(mu + lambda)
-    if x <= 0
-        result = ifelse(upper, one(mu + lambda), zero(mu + lambda))
+# log(erfcx(a)-erfcx(b)), with b-a supplied before rounding either endpoint.
+# For a >= 8, subtract the asymptotic series symbolically: each odd inverse
+# power difference factors as (b-a)/(a*b) times a geometric polynomial.
+# Forty terms leave the first omitted term below 3e-25 at a=b=8.
+ReactiveKernels.@_record_source function _log_erfcx_difference(a, b, log_gap)
+    result = zero(a + b)
+    if a >= 8
+        r = inv(a)
+        s = inv(b)
+        previous = one(r)
+        current = r + s
+        coefficient = one(r)
+        series = one(r)
+        n = 0
+        while n < 40
+            n += 1
+            even = (r+s)*current - r*s*previous
+            coefficient *= -(2n-1)/2
+            series += coefficient*even
+            previous = even
+            current = (r+s)*even - r*s*current
+        end
+        result = log_gap - log(a) - log(b) - 0.5log(pi) + log(series)
+    elseif log_gap < log1p(a) - 19
+        # The midpoint derivative's relative error is O(gap^2); here that
+        # error is below Float64 rounding, including when erfcx(a)==erfcx(b).
+        midpoint = a + 0.5exp(log_gap)
+        slope = 2/sqrt(pi) - 2midpoint*SpecialFunctions.erfcx(midpoint)
+        result = log_gap + log(slope)
     else
-        u = sqrt(lambda / (2x))
-        v = x / mu
-        correction = exp(-lambda * (v - 1)^2 / (2x)) *
-            SpecialFunctions.erfcx(u * (v + 1))
-        lower = (SpecialFunctions.erfc(-u * (v - 1)) + correction) / 2
-        higher = (SpecialFunctions.erfc(u * (v - 1)) - correction) / 2
-        result = ifelse(upper, higher, lower)
+        leading = log(SpecialFunctions.erfcx(a))
+        result = leading + LogExpFunctions.log1mexp(log(SpecialFunctions.erfcx(b)) - leading)
     end
     return result
+end
+
+# Scaled erfc avoids exp(2lambda/mu) overflowing before it is multiplied by
+# a vanishing normal tail. Both formulas are ordinary differentiable math.
+ReactiveKernels.@_record_source function rk_inverse_gaussian_logtail(mu, lambda, x, upper::Bool)
+    result = zero(mu + lambda)
+    if x <= 0
+        result = upper ? 0.0 : -Inf
+    elseif x == Inf
+        result = upper ? -Inf : 0.0
+    else
+        u = sqrt(lambda) / sqrt(x) / sqrt(2.0)
+        v = x / mu
+        a = u * (v - 1)
+        b = u * (v + 1)
+        if a >= -0.5
+            # Cancel the common Gaussian exponent symbolically, before the
+            # difference of the two scaled tails. Subtracting full log tails
+            # would lose this difference when a^2 is large.
+            log_gap = 0.5 * (log(2.0) + log(lambda) - log(x))
+            survival = -a^2 - log(2.0) + _log_erfcx_difference(a, b, log_gap)
+            result = upper ? survival : LogExpFunctions.log1mexp(survival)
+        else
+            log_leading = log(SpecialFunctions.erfcx(-a))
+            log_correction = log(SpecialFunctions.erfcx(b))
+            lower = -a^2 - log(2.0) +
+                ReactiveKernels._tie_exact_logaddexp(log_leading, log_correction)
+            result = upper ? LogExpFunctions.log1mexp(lower) : lower
+        end
+    end
+    return result
+end
+
+ReactiveKernels.@_record_source function rk_inverse_gaussian_tail(mu, lambda, x, upper::Bool)
+    return exp(rk_inverse_gaussian_logtail(mu, lambda, x, upper))
 end
 
 # Fourier/Bessel CDF of the ordinary VonMises law on [mu-pi, mu+pi].

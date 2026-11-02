@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.3
+
+- Add Gumbel, Rayleigh, Chi, Chi-squared, inverse-Gaussian, BetaPrime and F
+  density/tail objects with shared parameter normalization. BetaPrime and F
+  share log-domain beta tails that retain extreme odds without rounding away
+  the smaller tail; inverse-Gaussian tails retain the scaled-normal difference.
+- Add inverse-Gamma log tails, share Student-t normalization and log tails,
+  and preserve Weibull's exact density limits at zero.
+
 ## 0.1.2
 
 - Add lower- and upper-truncated LogNormal objects with zero-argument

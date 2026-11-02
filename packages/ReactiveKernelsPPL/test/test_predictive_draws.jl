@@ -63,6 +63,8 @@ end
             (; x), yc),
         (@rkppl(begin a ~ Normal(0, 1); k ~ Exponential(1); y .~ Weibull.(k, exp.(a .+ x)) end),
             (; x), yc),
+        (@rkppl(begin a ~ Normal(0, 1); k ~ Exponential(1); y .~ InverseGaussian.(exp.(a .+ x), k) end),
+            (; x), yc),
         (@rkppl(begin a ~ Normal(0, 1); y .~ Exponential.(exp.(a .+ x)) end), (; x), yc),
         (@rkppl(begin a ~ Normal(0, 1); z ~ Beta(2, 2)
             y .~ ZeroInflatedPoisson.(exp.(a .+ x), z) end), (; x), yk),
