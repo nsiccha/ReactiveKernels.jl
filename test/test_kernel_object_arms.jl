@@ -28,6 +28,66 @@ end
 
 @kernel guarded_half = guarded_scale(half_log)
 
+@kernel quadratic_law() = begin
+    logpdf(x::Float64)::Float64 = -x^2
+end
+@kernel scaled_law(base, scale::Float64) = begin
+    logpdf(x::Float64)::Float64 = begin
+        z::Float64 = x / scale
+        scale == 0 ? -Inf : base.logpdf(z) - log(scale)
+    end
+end
+@kernel scaled_quadratic = scaled_law(quadratic_law)
+@kernel scaled_log = scaled_law(half_log)
+
+@kernel quadratic_scores(data::Vector{Float64}, scale::Float64) = begin
+    values = plate(data) do x
+        scaled_quadratic(scale).logpdf(x)
+    end
+    return sum(values)
+end
+@kernel log_scores(data::Vector{Float64}, scale::Float64) = begin
+    values = plate(data) do x
+        scaled_log(scale).logpdf(x)
+    end
+    return sum(values)
+end
+@kernel guarded_scores(data::Vector{Float64}, location::Float64, scale::Float64) = begin
+    values = plate(data) do x
+        guarded_half(location, scale).logpdf(x)
+    end
+    return sum(values)
+end
+
+# Ordinary lexical values and bare callees have the same reconstruction
+# contract as a prepared bound endpoint. A same-named global is a decoy.
+const captured_transform = x -> -1000.0
+const lexical_law = let captured_transform = x -> 2x, offset = [3.0]
+    @kernel lexical(scale::Float64, x::Float64) = begin
+        result::Float64 = scale > 0 ? captured_transform(x) : offset[1] + x
+    end
+end
+@kernel lexical_scores(data::Vector{Float64}, scale::Float64) = begin
+    values = plate(data) do x
+        lexical_law(scale, x)
+    end
+    return sum(values)
+end
+
+const boxed = let offset = 1.0
+    law = @kernel boxed_spec(scale::Float64, x::Float64) = begin
+        result::Float64 = scale > 0 ? x + offset : -x
+    end
+    (law, value -> (offset = value))
+end
+const boxed_law = first(boxed)
+@kernel boxed_scores(data::Vector{Float64}, scale::Float64) = begin
+    values = plate(data) do x
+        boxed_law(scale, x)
+    end
+    return sum(values)
+end
+
 @kernel arm_caller(scale::Float64, x::Float64) = begin
     y::Float64 = guarded(; scale = scale).f(x)
 end
@@ -79,6 +139,74 @@ end
     @test value == log(2.0) - log(2.0)
     @test gradient ≈ 1 / (5.0 - 1.0)
     @test ad_value_and_gradient(ad, 1.0, 2.0, 0.5) == (-Inf, 0.0)
+end
+
+@testset "recovered plate arms preserve bound endpoint captures" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    function regions(ex, counts = Dict(:for => 0, :while => 0, :if => 0))
+        ex isa Expr || return counts
+        haskey(counts, ex.head) && (counts[ex.head] += 1)
+        foreach(arg -> regions(arg, counts), ex.args)
+        counts
+    end
+    structures = Dict{Any,Any}()
+    # The shared scale guard makes lowering recover the arm's graph from its
+    # source. Its prepared base endpoint must remain a lexical capture in
+    # every split part, including on subsequent bindings and other aliases.
+    for n in (0, 2, 19)
+        data = [isodd(i) ? 0.2 : 0.7 for i in 1:n]
+        saved = copy(data)
+        unbound = prepare(quadratic_scores; type_stability = :error)
+        for policy in (nothing, :ignore)
+            bound = prepare(quadratic_scores; bound = (; data), on_error = policy,
+                            type_stability = :error)
+            for scale in (1.0, 2.0)
+                expected = -sum(abs2, data) / scale^2 - n * log(scale)
+                @test unbound(data, scale) ≈ expected
+                @test bound(scale) ≈ expected
+                ad = prepare_ad(bound, backend, scale; active = :scale)
+                value, gradient = ad_value_and_gradient(ad, scale)
+                @test value ≈ expected
+                @test gradient ≈ 2sum(abs2, data) / scale^3 - n / scale
+            end
+            @test bound(0.0) == (n == 0 ? 0.0 : -Inf)
+            # Growing bound data retains the same emitted loop/branch bodies.
+            # An empty domain may simplify them away (constraints.md).
+            if n > 0
+                shape = regions(code_expr(bound))
+                @test shape == get!(structures, policy, shape)
+                @test shape[:for] + shape[:while] > 0
+            end
+        end
+        @test data == saved
+    end
+    @test prepare(quadratic_scores; bound = (data = [0.2, 0.7],))(1.0) ≈ -0.53
+
+    logarithmic = prepare(log_scores; bound = (data = [0.2, 0.7],))
+    @test logarithmic(2.0) ≈ sum(log, [0.2, 0.7]) - 4log(2.0)
+    @test ad_value_and_gradient(prepare_ad(logarithmic, backend, 2.0;
+        active = :scale), 2.0)[2] ≈ -2.0
+    inactive = prepare(log_scores; bound = (data = [-1.0],))
+    @test inactive(0.0) == -Inf # log(-Inf) in the untaken endpoint must not run.
+    @test ad_value_and_gradient(prepare_ad(inactive, backend, 0.0;
+        active = :scale), 0.0) == (-Inf, 0.0)
+    @test_throws DomainError inactive(1.0)
+
+    # A lane-dependent condition uses the other arm-recovery entry point.
+    lane = prepare(guarded_scores; bound = (data = [0.2, 0.7],))
+    @test lane(0.0, 2.0) ≈ sum(log, [0.2, 0.7]) - 4log(2.0)
+    ad = prepare_ad(lane, backend, 0.0, 2.0; active = :scale)
+    @test ad_value_and_gradient(ad, 0.0, 2.0)[2] ≈ -2.0
+    @test ad_value_and_gradient(ad, 1.0, 2.0) == (-Inf, 0.0)
+
+    lexical = prepare(lexical_scores; bound = (data = [1.0, 2.0],))
+    @test lexical(1.0) == 6.0
+    @test lexical(-1.0) == 9.0
+    shared_cell = prepare(boxed_scores; bound = (data = [1.0, 2.0],))
+    @test shared_cell(1.0) == 5.0
+    last(boxed)(4.0)
+    @test shared_cell(1.0) == 11.0
+    @test shared_cell(-1.0) == -3.0
 end
 
 end
