@@ -77,6 +77,8 @@ export PPL_NODES, WORKFLOW_WANTS, workflow_wants
 export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!,
     sampler_value_gradient_and_retained!
 export QueryAD, prepare_query_ad
+export DensityFactor, DensityFactors, FactorSelection, density_factors, select_factors,
+    factor_coordinates, factor_support, FactorQueryAD
 export prepare_cell_query, CellQuery, prepare_cell_sampler, CellSampler, cell_value_and_gradient!
 export prepare_partition, PartitionQuery, prepare_partition_sampler, PartitionSampler,
     partition_value_and_gradient!, partition_labels
@@ -122,6 +124,7 @@ include("arrays.jl")
 include("query.jl")
 include("cell_factors.jl")
 include("cell_shared.jl")
+include("density_factors.jl")
 include("predictive.jl")
 include("smc.jl")
 include("smc_projection.jl")

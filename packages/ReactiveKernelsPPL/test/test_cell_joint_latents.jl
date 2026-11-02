@@ -344,10 +344,8 @@ end
         @test _cjl_q(built, bound, :sampler, u) ≈ oracle(u) rtol = 1e-12
         _cjl_check(built, bound, u, oracle)
     end
-    # Not built upstream: Enzyme's static activity analysis refuses the law
-    # object when it crosses a non-inlined density, as it refuses any fresh
-    # container storing constant data beside an active value
-    # (reactivekernels-use §7ak; Enzyme snag `fresh-container-48e64a0f`).
+    # The non-inlined law also keeps data beside an active scale. Check the
+    # native derivative against the same authored law, including changed inputs.
     callee = quote
         s ~ Exponential(1.0)
         @plate for i in eachindex(x)
@@ -357,9 +355,18 @@ end
     dz = (; x = [[0.1, -0.2, 0.4], [0.3, 0.1]])
     bound = bind_data(lower_rkppl(callee, dz), dz)
     built = build_kernel(bound)
-    u = [0.2, 0.3, -0.1, 0.4]
-    @test_broken (sampler_value_and_gradient!(prepare_sampler(built, bound, u;
-        backend = AutoEnzyme(; mode = Enzyme.Reverse)), similar(u), u); true)
+    function callee_oracle(u)
+        scale = exp(u[1])
+        value = logpdf(Exponential(1.0), scale) + u[1]
+        for (mean, block) in zip(dz.x, _cjl_blocks(u[2:end], length.(dz.x) .- 1))
+            z = _CJLFixtures.s2z_basis(length(mean)) * block
+            value += sum(logpdf.(Normal.(mean, scale), z))
+        end
+        value
+    end
+    for u in ([0.2, 0.3, -0.1, 0.4], [-0.3, 0.1, 0.2, -0.2])
+        _cjl_check(built, bound, u, callee_oracle)
+    end
 end
 
 @testset "a joint cell latent: matrices, live parents and keywords" begin

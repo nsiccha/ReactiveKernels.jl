@@ -207,6 +207,16 @@ end
     _CELL_FORK_CALLS[] = 0
     total(x, y, z, s)
     @test _CELL_FORK_CALLS[] == length(x)
+    # Distinct index ports retain independent positions without materializing
+    # their shared location plate.
+    separate = plate_cell(plate_cell(_cell_fork, :dy; index = :i), :dz; index = :j)
+    selected = prepare(separate; have = (:x, :y, :z, :s, :i, :j),
+        want = (:dy_cell, :dz_cell))
+    for (i, j) in ((1, 1), (2, 7), (9, 3))
+        _CELL_FORK_CALLS[] = 0
+        @test selected(x, y, z, s, i, j) == (dy[i], dz[j])
+        @test _CELL_FORK_CALLS[] == 2
+    end
 end
 
 @testset "plate_cell: native Enzyme Reverse through a composed cell" begin

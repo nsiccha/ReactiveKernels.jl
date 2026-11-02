@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.62
+
+- Add `density_factors`, `select_factors`, `factor_coordinates` and
+  `factor_support` for authored
+  prior and coordinate-Jacobian events. `prepare_query` and `prepare_query_ad`
+  accept factor selections; `coordinates` prepares compact derivatives over
+  a read-only packed base. Joint laws and coupled transforms remain atomic,
+  and structural supports retain hyperparameter dependencies. Owned coordinates
+  are available separately from those transitive read supports. Requires
+  RK 0.1.55 for independent selected cells of shared upstream plates.
+
 ## 0.1.61
 
 - Add `partitioned` to compact cell AD and cell factor preparation, caching

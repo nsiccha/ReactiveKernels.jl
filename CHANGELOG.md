@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.55
+
+- Compose shared upstream plates into selected consumers with independent
+  index ports. Each consumer evaluates only its selected cells, including
+  different row selections, while whole-plate queries retain their boundary.
+
 ## 0.1.54
 
 - Add `prepare_ad_accumulator`, `ad_accumulator_storage` and `ad_accumulate!`
