@@ -2,6 +2,17 @@ module SharedPrefixWorldAgeTests
 using ReactiveKernels, ReactiveKernelsPPL, Distributions, Enzyme, Test
 using DifferentiationInterface: AutoEnzyme
 
+struct RecordingPoint <: AbstractVector{Float64}
+    values::Vector{Float64}
+    reads::Vector{Int}
+end
+Base.size(point::RecordingPoint) = size(point.values)
+Base.IndexStyle(::Type{RecordingPoint}) = IndexLinear()
+function Base.getindex(point::RecordingPoint, i::Int)
+    push!(point.reads, i)
+    point.values[i]
+end
+
 function exercise(kind, n)
     mod = Module(gensym(:FreshSharedPrefix))
     Core.eval(mod, :(using ReactiveKernelsPPL, Distributions))
@@ -67,6 +78,9 @@ function exercise(kind, n)
             @test gradient ≈ oracle
             @test partition_footprint(q, label; shared=false) == [locals[label]]
         else
+            recorded = RecordingPoint(point, Int[])
+            @test q(recorded, index) ≈ expected
+            @test intersect(unique(recorded.reads), locals) == [locals[label]]
             @test q(point, index) ≈ expected
         end
     end
