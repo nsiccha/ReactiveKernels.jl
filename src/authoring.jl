@@ -3090,7 +3090,7 @@ function _kernel_native_broadcasts(ex; in_dotted::Bool = false)
     any(arg -> arg isa Expr && arg.head === :parameters, arguments) && return ex
     # Match Julia's fusion boundary: a non-dotted parent materializes its
     # dotted children; only a directly nested dotted call stays lazy.
-    lazy = Expr(:call, GlobalRef(Base, :broadcasted), callee,
+    lazy = Expr(:call, GlobalRef(@__MODULE__, :_native_broadcasted), callee,
                 (_kernel_native_broadcasts(arg; in_dotted = true)
                  for arg in arguments)...)
     in_dotted && return lazy
