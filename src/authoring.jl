@@ -3737,10 +3737,16 @@ _kernel_split_callee_name(callee) = nothing
 
 # Whether evaluating `ex` does work worth caching: a call other than the
 # cheap ones above, with Julia's literal integer powers counted as cheap
-# multiplications, or a loop, generator or macro.
+# multiplications, an index that may gather an array, or a loop, generator
+# or macro. Literal integer indices (notably tuple fields) stay cheap; other
+# indices cannot be classified as scalar from syntax alone.
 function _kernel_split_worthwhile(ex)
     ex isa Expr || return false
     ex.head in (:quote, :inert) && return false
+    if _cell_index_source(ex)
+        indices = ex.head === :ref ? ex.args[2:end] : ex.args[3:end]
+        any(index -> !(index isa Integer), indices) && return true
+    end
     ex.head in (:generator, :comprehension, :typed_comprehension, :macrocall,
                 :for, :while, :do) && return true
     if ex.head === :call && !isempty(ex.args)
@@ -3773,7 +3779,7 @@ _kernel_split_liftable(ex) = ex isa Expr && (
     ex.head === :ref)
 
 # The strict operand positions of `ex`, as `_kernel_lift_invariant_operands!`
-# enters them, except a dotted call's arguments.
+# enters them, including eager operands of dotted calls.
 function _kernel_split_children(ex)
     ex isa Expr || return ()
     head = ex.head
@@ -3782,6 +3788,8 @@ function _kernel_split_children(ex)
         return ex.args[2:end]
     elseif head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode
         return (ex.args[1],)
+    elseif _cell_dotted_call(ex) && !_kernel_mutating_callee(ex.args[1])
+        return ex.args[2].args
     elseif head === :ref && !isempty(ex.args)
         return Any[ex.args[1],
                    (arg for arg in ex.args[2:end] if !_kernel_reads_index_bound(arg))...]
