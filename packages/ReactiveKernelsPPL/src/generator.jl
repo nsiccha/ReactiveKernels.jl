@@ -68,7 +68,8 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     return _name_plate_cells(def, _location_value_aliases(plan, def))
 end
 
-function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model)
+function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable;
+        name::Symbol = :ppl_model, density_sites = nothing)
     validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] kernel_expr requires a bound plan (bind_data first)"))
@@ -78,7 +79,7 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Sy
     gathers = Set{Tuple{Symbol,Symbol,Int}}()
     assigns = _assignment_statements(plan; layout, gathers)
     free = _density_selection(plan, n -> n ∉ plan.conditioned)
-    priors = _prior_statements(free, layout; gathers, context = plan)
+    priors = _prior_statements(free, layout; gathers, context = plan, density_sites)
     transforms = Expr[]
     for e in layout.entries
         append!(transforms, transform_statements(e))
@@ -102,7 +103,7 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Sy
         Expr[args..., transforms..., coefs..., conditioned..., values...]))
     append!(stmts, likelihoods)
     append!(stmts, priors)
-    append!(stmts, _log_jacobian_statements(plan, layout))
+    append!(stmts, _log_jacobian_statements(plan, layout; density_sites))
     push!(stmts, :(posterior::Float64 = prior + likelihood + log_jacobian))
     push!(stmts, :(return posterior))
     sig = Expr(:call, name, args...)
@@ -621,7 +622,10 @@ function _coef_reassembly_statements(plan::StructuralPlan, layout::LayoutTable)
             if e.kind === :coefficient && e.predictor === pred.name]
         length(segs) <= 1 && continue
         sort!(segs; by = e -> e.offset)
-        mats = [:(Float64.($(s.name))) for s in segs]
+        mats = [Symbol(s.name, :_materialized) for s in segs]
+        for (s, name) in zip(segs, mats)
+            push!(stmts, :($name = Float64.($(s.name))))
+        end
         push!(stmts, :($(block_name(pred.name))::AbstractVector{Float64} =
             vcat($(mats...))))
     end
@@ -4391,7 +4395,7 @@ _population_endpoint_args(pr::PopulationPrior) = pr.family === :student_t ?
 # (data-derived widths stay in loops); flat addressees contribute nothing.
 function _mixed_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         pred::PredictorSpec, shape::DesignShape,
-        priors::Vector{PopulationPrior})
+        priors::Vector{PopulationPrior}; density_sites = nothing)
     by_addressee = Dict{Symbol,PopulationPrior}()
     for pr in priors
         pr.predictor === pred.name || continue
@@ -4407,8 +4411,16 @@ function _mixed_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
                 [by_addressee[e === nothing ? :Intercept : e]
                     for e in b.elements]
             fam = elrows[1].family
-            fam === :flat || _mixed_wide_block_stmts!(stmts, terms,
-                pred.name, b, coef, offset, elrows, fam)
+            if fam !== :flat
+                _mixed_wide_block_stmts!(stmts, terms,
+                    pred.name, b, coef, offset, elrows, fam; density_sites)
+            elseif density_sites !== nothing
+                tag = b.kind === FactorTerm ? b.addressee : b.column
+                node = Symbol(:_ppl_prior_, pred.name, :_, tag)
+                push!(stmts, :($node::Float64 = 0.0))
+                _record_density!(density_sites, stmts, :prior, (pred.name, tag), node;
+                    pointwise = :(zeros($(b.width))), count = b.width)
+            end
         else
             b.width == 1 || throw(ContractValidationError(
                 "[generator] internal: mixed-prior scalar block " *
@@ -4425,6 +4437,13 @@ function _mixed_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
                     Expr(:ref, coef, offset + 1))
                 push!(stmts, :($node::Float64 = $expr))
                 push!(terms, node)
+                _record_density!(density_sites, stmts, :prior,
+                    (pred.name, b.addressee), node)
+            elseif density_sites !== nothing
+                node = Symbol(:_ppl_prior_, pred.name, :_, b.addressee)
+                push!(stmts, :($node::Float64 = 0.0))
+                _record_density!(density_sites, stmts, :prior,
+                    (pred.name, b.addressee), node)
             end
         end
         offset += b.width
@@ -4436,7 +4455,7 @@ end
 # block's static-range slice with the block family's cell.
 function _mixed_wide_block_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         pname::Symbol, b::DesignBlock, coef::Symbol, offset::Int,
-        elrows::Vector{PopulationPrior}, fam::Symbol)
+        elrows::Vector{PopulationPrior}, fam::Symbol; density_sites = nothing)
     tag = b.kind === FactorTerm ? b.addressee : b.column
     node = Symbol(:_ppl_prior_, pname, :_, tag)
     pw = Symbol(:_ppl_pw_prior_, pname, :_, tag)
@@ -4452,6 +4471,8 @@ function _mixed_wide_block_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     _append_coef_plate!(stmts, slice, node, pw, mut, sdt, nut, loc, sca,
         nus, fam)
     push!(terms, node)
+    _record_density!(density_sites, stmts, :prior, (pname, tag), node;
+        pointwise = pw, count = b.width)
     return nothing
 end
 
@@ -4487,7 +4508,7 @@ function _parameter_prior_input(ps, plan, layout)
 end
 
 function _parameter_prior_statements!(stmts, terms, plan, layout;
-        prefix = :_ppl_prior_, group_scalars = true)
+        prefix = :_ppl_prior_, group_scalars = true, density_sites = nothing)
     grouped = Set{Symbol}()
     for ps in (group_scalars ? _parameter_prior_groups(plan) : Vector{SampledParameter}[])
         family = first(ps).family
@@ -4509,17 +4530,20 @@ function _parameter_prior_statements!(stmts, terms, plan, layout;
         if p.family === :external
             append!(stmts, _external_density_statements(p))
             push!(terms, node)
+            _record_density!(density_sites, stmts, :prior, p.name, node)
             continue
         end
         prior = _sampled_prior_expr(p; pre = stmts, conditioned = p.name in plan.conditioned,
             float64_args = _float64_inputs(plan, values(p.args)))
         push!(stmts, :($node::Float64 = $prior))
         push!(terms, node)
+        _record_density!(density_sites, stmts, :prior, p.name, node)
     end
     return nothing
 end
 
-function _factor_density_statements!(stmts, terms, plan; context = plan, pointwise = nothing)
+function _factor_density_statements!(stmts, terms, plan; context = plan,
+        pointwise = nothing, density_sites = nothing)
     for factor in plan.factors
         node = Symbol(:_ppl_factor_, factor.name)
         density = _sampled_prior_expr(factor; conditioned = true,
@@ -4527,12 +4551,14 @@ function _factor_density_statements!(stmts, terms, plan; context = plan, pointwi
         push!(stmts, :($node::Float64 = $density))
         push!(terms, node)
         pointwise === nothing || push!(pointwise, factor.name => node)
+        _record_density!(density_sites, stmts, :prior, factor.name, node; owner = nothing)
     end
     return nothing
 end
 
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
-        gathers::Set{Tuple{Symbol,Symbol,Int}} = Set{Tuple{Symbol,Symbol,Int}}(), context = plan)
+        gathers::Set{Tuple{Symbol,Symbol,Int}} = Set{Tuple{Symbol,Symbol,Int}}(),
+        context = plan, density_sites = nothing)
     stmts = Expr[]
     terms = Any[]
     for pred in plan.predictors
@@ -4556,17 +4582,33 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
             _append_coef_plate!(stmts, block_name(pred.name), node, pw,
                 mut, sdt, nut, loc, sca, nus, fams[1])
             push!(terms, node)
+            _record_density!(density_sites, stmts, :prior, pred.name, node;
+                pointwise = pw, count = shape.width)
         elseif all(==(:flat), fams)
             push!(stmts, :($node::Float64 = 0.0))
             push!(terms, node)
+            _record_density!(density_sites, stmts, :prior, pred.name, node;
+                pointwise = :(zeros($(shape.width))), count = shape.width)
         else
             _mixed_prior_stmts!(stmts, terms, pred, shape,
-                plan.population_priors)
+                plan.population_priors; density_sites)
         end
     end
-    _parameter_prior_statements!(stmts, terms, plan, layout)
+    _parameter_prior_statements!(stmts, terms, plan, layout;
+        group_scalars = density_sites === nothing, density_sites)
     append!(terms, plan.cell_priors)
-    _factor_density_statements!(stmts, terms, plan; context)
+    if density_sites !== nothing
+        for prior in plan.cell_priors
+            geometry = findfirst(g -> g.prior === prior, plan.cell_geometries)
+            geometry === nothing && throw(ContractValidationError(
+                "[query] authored density factors for cell scans are not implemented"))
+            g = plan.cell_geometries[geometry]
+            n = length(_layout_lookup(layout, Dict{Symbol,Any}())(g.shapes))
+            _record_density!(density_sites, stmts, :prior, g.name, prior;
+                pointwise = Symbol(prior, :_cells), count = n)
+        end
+    end
+    _factor_density_statements!(stmts, terms, plan; context, density_sites)
     # GLM-object coefficient vectors: the same plate-prior shape as a
     # population-prior coefficient block, driven by the response matrix
     # columns (priors addressed by response label — validation pins
@@ -4600,12 +4642,28 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         append!(stmts, _plate_sum_stmts(pw, node,
             Any[r.glm_beta, mut, sdt], cell))
         push!(terms, node)
+        _record_density!(density_sites, stmts, :prior, r.label, node;
+            pointwise = pw, count = length(cols), owner = r.glm_beta)
     end
     # Vector latents (cutpoints/thresholds/simplexes/coefficient packs,
     # joint-factor scales/Cholesky): one plate-sum or broadcast per vector
     # (bound plans carry concrete sizes). Empty packs contribute 0.0.
     for p in plan.vector_parameters
         _vector_parameter_prior_stmts!(stmts, terms, p)
+        if density_sites !== nothing
+            independent = haskey(_VECTOR_ELEMENT_FAMILIES, p.family) &&
+                !_is_ordered_parameter(p.family)
+            pw = independent && p.size > 0 ? Symbol(:_ppl_pw_prior_, p.name) : nothing
+            if p.family === :positive_exponential
+                independent = true
+                # This legacy pack's width is the authored joint-outcome
+                # dimension; its scalar edges already belong to those margins.
+                pw = Expr(:vect, [:(exponential($(p.args.arg1)).logpdf(
+                    $(_vector_elt_name(p.name, i)))) for i in 1:p.size]...)
+            end
+            _record_density!(density_sites, stmts, :prior, p.name, Symbol(:_ppl_prior_, p.name);
+                pointwise = pw, count = independent ? p.size : 1)
+        end
     end
     # Per-cell latent (plate) parameters: one plate over the block, summing the
     # shared-prior log-density across cells (the same plate-sum shape as a
@@ -4624,13 +4682,15 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
                 float64_variate = p.name ∉ plan.conditioned,
                 float64_inputs = _float64_inputs(plan, values(p.args)))
         end
+        _record_density!(density_sites, stmts, :prior, p.name, Symbol(:_ppl_prior_, p.name);
+            pointwise = Symbol(:_ppl_pw_prior_, p.name), count = _plate_rows(plan, p))
     end
     # Sequential-recurrence (scan) latents: setup + recurrence density.
-    scanstmts, scannodes = _scan_prior_statements(plan, layout)
+    scanstmts, scannodes = _scan_prior_statements(plan, layout; density_sites)
     append!(stmts, scanstmts)
     append!(terms, scannodes)
     # Declared array parameters (`arrays.jl`).
-    _array_prior_stmts!(stmts, terms, plan, gathers; context)
+    _array_prior_stmts!(stmts, terms, plan, gathers; context, density_sites)
     push!(stmts, :(prior::Float64 = $(_sum_terms(terms))))
     return stmts
 end
@@ -5426,12 +5486,15 @@ _scan_reads_carried(ex, s::ScanSpec) = ex isa Expr &&
 # state). Non-centered: conditional innovation densities over the `_ppl_scan_z_`
 # slice, with any state-dependent arguments reading the trajectories from
 # `_scan_reconstruction_statements`.
-function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
+function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable;
+        density_sites = nothing)
     stmts = Expr[]
     nodes = Symbol[]
     for raw in plan.scans
         sc = _resolve_scan(plan, raw)
         if _is_noncentered_scan(sc)
+            density_sites === nothing || throw(ContractValidationError(
+                "[query] authored density factors for noncentered scans are not implemented"))
             _scan_noncentered_prior!(stmts, nodes, sc, plan)
             continue
         end
@@ -5498,6 +5561,14 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
         total = Symbol(:_ppl_scan_, state)
         push!(stmts, :($total::Float64 = $(foldl((a, b) -> :($a + $b), terms))))
         push!(nodes, total)
+        if density_sites !== nothing
+            # Setup width is authored structure; recurrence length remains a
+            # retained plate. Concatenation preserves event order.
+            seeds = Any[Symbol(:_ppl_scan_seed_, state, :_, k) for k in 1:m]
+            pw = :(vcat([$(seeds...)], $recpw))
+            _record_density!(density_sites, stmts, :prior, state, total;
+                pointwise = pw, count = T)
+        end
     end
     return stmts, nodes
 end
@@ -5506,12 +5577,20 @@ end
 # named after the parameter (`var"sigma.logjac"`), so the built program reads
 # `log_jacobian = var"sigma.logjac" + …` with that term's definition shown,
 # not a value named after the sum.
-function _log_jacobian_statements(plan::StructuralPlan, layout::LayoutTable)
+function _log_jacobian_statements(plan::StructuralPlan, layout::LayoutTable;
+        density_sites = nothing)
     stmts = Expr[]
     terms = Any[]
     for e in layout.entries
         t = jacobian_term(e)
         t === nothing && continue
+        if density_sites !== nothing
+            node = Symbol(:_ppl_density_jacobian_, length(density_sites) + 1)
+            push!(stmts, :($node::Float64 = $t))
+            _record_jacobian!(density_sites, stmts, e, node)
+            push!(terms, node)
+            continue
+        end
         if _bijector_logjac_call(t)
             name = Symbol(e.name, ".logjac")
             push!(stmts, :($name::Float64 = $t))
@@ -5523,6 +5602,12 @@ function _log_jacobian_statements(plan::StructuralPlan, layout::LayoutTable)
     # (`cell_latent.jl`); its packed array itself is untransformed.
     for site in sort!(collect(keys(plan.cell_geometries)))
         push!(terms, plan.cell_geometries[site].logjac)
+        if density_sites !== nothing
+            g = plan.cell_geometries[site]
+            n = length(_layout_lookup(layout, Dict{Symbol,Any}())(g.shapes))
+            _record_density!(density_sites, stmts, :log_jacobian, g.name, g.logjac;
+                pointwise = Symbol(g.logjac, :_cells), count = n)
+        end
     end
     jac = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
     push!(stmts, :(log_jacobian::Float64 = $jac))

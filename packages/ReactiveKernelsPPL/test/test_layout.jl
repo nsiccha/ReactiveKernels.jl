@@ -400,7 +400,7 @@ end
     @test transform_statements(entry) == Expr[
         :(y_cutpoints::AbstractVector{Float64} =
             $(GlobalRef(ReactiveKernelsPPL, :_ordered_constrain_kernel))(
-                unconstrained, 2, 3)),
+                view(unconstrained, 2:3), 1, 2)),
     ]
     @test jacobian_term(entry) == :(sum(view(unconstrained, 3:3)))
     one_ord = LayoutEntry(:vector, nothing, :o, [:o_1], 7, 1, :ordered)
@@ -418,7 +418,7 @@ end
     @test transform_statements(sentry) == Expr[
         :(_ppl_simplex_pair_s =
             $(GlobalRef(ReactiveKernelsPPL, :_simplex_constrain_logjac_kernel))(
-                unconstrained, 6, 7)),
+                view(unconstrained, 6:7), 1, 2)),
         :(s::AbstractVector{Float64} = _ppl_simplex_pair_s[1]),
         :(_ppl_simplex_logjac_s::Float64 = _ppl_simplex_pair_s[2]),
     ]
