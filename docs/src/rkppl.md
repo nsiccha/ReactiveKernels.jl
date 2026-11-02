@@ -312,6 +312,13 @@ y .~ MyNormal.(a)
 y .~ LogDensity.(normal_lpdf, a)
 ```
 
+With `Distributions` loaded, authored `Normal`, `LogNormal`, `Gamma`,
+`Exponential`, `Cauchy`, `Laplace`, `Logistic`, and `DirichletMultinomial`
+constructors resolve by identity and compose RK distribution graphs, including
+qualified and aliased constructors. Defaults and constructor parameterizations
+are preserved: for example, `Distributions.Gamma(shape, scale)` supplies the
+owned Gamma graph's `scale` port.
+
 A caller-owned law can expose its density arithmetic through
 `sampling_distribution_graph(constructor, argument_expressions::Tuple)`:
 
@@ -346,13 +353,25 @@ both arities of a caller's positive-law wrapper. Each composes an owned Normal
 endpoint with a lazy support check and the law's change-of-variable term;
 that term is separate from the sampler-coordinate Jacobian.
 
-With `Distributions` loaded, any `Distributions.Distribution` object uses its
-ordinary `Distributions.logpdf` method automatically, including custom types.
-Its support behavior comes from that method. Distributions 0.25.132 evaluates
+When the hook returns an object expression, consumers may also compose its
+supported `cdf`, `ccdf`, `logcdf`, and `logccdf` endpoints. A function-shaped
+return defines the density endpoint only.
+
+The DirichletMultinomial graph exposes shared concentration terms and
+count-only normalizers. Invalid counts or totals return `-Inf`, and
+incompatible vector lengths throw `DimensionMismatch`. This authored route
+does not need the Distributions support-fix pin.
+
+Other `Distributions.Distribution` objects use their ordinary public
+`Distributions.logpdf` method, including caller-owned types and stored
+distribution values. Custom laws can expose their arithmetic through the hook above or a
+module-visible `@kernel` with `LogDensity`. The numerical adapter preserves
+the support behavior of the supplied method.
+Distributions 0.25.132 evaluates
 `DirichletMultinomial` outside its support: for example, counts `[2, 3, 1]`
 have a finite density even when the declared total is 5. Use the corrected
 [Distributions revision](https://github.com/nsiccha/Distributions.jl/commit/83cec5e3a8a35167d54f19da9dc5afb54f59273e)
-when using this adapter with that law:
+when passing an already-constructed DirichletMultinomial through that adapter:
 
 ```julia
 using Pkg

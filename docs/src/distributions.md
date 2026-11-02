@@ -124,6 +124,88 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
+## LogNormal moments and log tails
+
+`DistributionKernelSources.lognormal(location, scale)` provides `logcdf(x)`
+and `logccdf(x)` endpoints. They evaluate the logarithm of the tail directly,
+including where the corresponding probability underflows.
+
+`lower_truncated_lognormal(location, scale, lower)` and
+`upper_truncated_lognormal(location, scale, upper)` provide zero-argument
+`mean()` and `var()` endpoints:
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionGraphExamples.moment_source(),
+)
+```
+
+A nonpositive lower bound selects ordinary LogNormal moments. Use
+`lower_truncated_lognormal(location, scale, 0.0).mean()` and `.var()` for
+untruncated authored moments; negative lower bounds give the same result.
+Zero scale is supported. The `lognormal` object itself provides density and
+tail endpoints, while these moment endpoints belong to the truncated objects.
+
+These graphs use scaled complementary error functions and a second difference
+of the log Mills ratio. Close differences use quadrature; its normal tail
+variance uses a continued-fraction scan in the positive tail. The scan length
+depends on the parameter value and remains a runtime loop. The variance avoids
+subtracting two nearly equal raw moments. All arithmetic participates in RK
+composition, binding and plate planning.
+
+`gamma(shape, rate)` also provides `logcdf(x)` and `logccdf(x)`.
+Its log-shape normalizer is a shared graph node. Very small tails use a
+log-space positive series or continued fraction, preserving finite log
+probabilities after the corresponding probability underflows. Those iterations
+remain runtime loops and differentiate through their ordinary primal code.
+
+## DirichletMultinomial events
+
+`dirichlet_multinomial(n, alpha).logpdf(counts)` evaluates one count-vector
+event. Nonnegative integer counts must sum to `n`; invalid counts or totals
+return `-Inf`, and incompatible vector lengths throw `DimensionMismatch`.
+The concentration and count log-gamma terms are separate graph nodes, so
+shared concentration normalizers run once per evaluation. Binding the counts
+and total precomputes the count-only coefficient, including its nested plate;
+rebinding different observations computes a new coefficient. The remaining
+event terms read the live concentrations and retain runtime loops. This reuse
+does not eliminate the active per-event array allocations.
+`dirichlet_multinomial_logdensity` is the extracted endpoint with positional
+arguments `(counts, n, alpha)`.
+
+The example reads the implemented count-density graph and binds two events.
+Its build checks changed concentrations and verifies that the count-only
+normalizer has left the residual evaluator:
+
+```@eval
+Main.ReactiveKernelsDocs.execute_example(
+    @__MODULE__, Main.DistributionGraphExamples.count_source(),
+)
+```
+
+## Measuring composition and binding
+
+`benchmark/distribution_graph_hoisting.jl <output-dir> [family]` compares
+owned Normal, LogNormal, Gamma, Exponential, Cauchy, Laplace and Logistic
+graphs with per-observation `Distributions.logpdf` calls. Observations are
+bound; distribution parameters change on every measured call. The Gamma
+graph exposes the observation logarithm separately from its shape-dependent
+density, so that logarithm can be computed at binding.
+
+`benchmark/distribution_composite_hoisting.jl <output-dir>` compares
+DirichletMultinomial event batches at two category counts and measures shared
+lower- and upper-truncated LogNormal variances in central and tail regions.
+Its moment baseline invokes the same public RK arithmetic through an ordinary
+scalar function. This comparison measures the effect of graph visibility;
+it is not a comparison with a different numerical approximation.
+
+Both scripts retain runtime observation loops, consume every result, check
+matching checksums, and save the actual `code_expr` for each evaluator beside
+a TOML measurement receipt. Preparation is excluded. The native compiler may
+optimize either path, so inspect the generated code together with timings
+and allocations. A speed difference alone does not establish which work
+was moved or how often it executes.
+
 ## Other standard location-scale families
 
 Cauchy and Laplace use exactly the same `location_scale` graph. Their examples

@@ -174,7 +174,9 @@ function _cell_factor_graph(p::Plan, original_ports, original_order;
         batched = [i for i in eachindex(body.have) if !(i in atomic)]
         domain_inputs = [known[canon_id(p.graph, r.inputs[j + 1].id)]
                          for j in batched if haskey(known, canon_id(p.graph, r.inputs[j + 1].id))]
-        data_axes = Base.Broadcast.combine_axes(domain_inputs...)
+        # No bound operand contributes no known axes. Live operands still
+        # establish and validate the projection's broadcast domain below.
+        data_axes = isempty(domain_inputs) ? () : Base.Broadcast.combine_axes(domain_inputs...)
         mapping = Dict{ValueId,Value}()
         for (i, v) in enumerate(body.have)
             mapping[canon_id(body.graph, v.id)] = if i in atomic
@@ -195,11 +197,29 @@ function _cell_factor_graph(p::Plan, original_ports, original_order;
                         (T <: Number || shape !== nothing &&
                          _plate_broadcast_shape((data_axes, shape)) == data_axes))
                 end
+                # An absorbed check may have acquired its only array axis
+                # from an operand omitted above. Its axes are then already
+                # checked against the retained data domain; restricting that
+                # check to the remaining scalar would invent an axis-less
+                # plate. Scalar-only omissions cannot discharge that check.
+                retained_checks = Tuple[]
+                for check in r.op.plate.axis_checks
+                    implied = any(check) do j
+                        shape = data_shape(r.inputs[j + 1])
+                        !(j in projected) && shape !== nothing && !isempty(shape)
+                    end
+                    implied && continue
+                    if !isempty(check) && !any(j -> j in projected, check)
+                        push!(projected, first(check))
+                    end
+                    push!(retained_checks, check)
+                end
+                sort!(projected)
                 small = Graph()
                 roots = [value!(small, Symbol(:arg_, j), valtype(body.have[j])) for j in projected]
                 scalar = prepare(small; have = roots, want = roots[findfirst(==(i), projected)])
                 checks = Tuple(Tuple(findfirst(==(j), projected) for j in check if j in projected)
-                               for check in r.op.plate.axis_checks if any(j -> j in projected, check))
+                               for check in retained_checks)
                 plate = _AuthoredPlateOp{typeof(scalar),()}(scalar, checks)
                 output = fresh(:input, valtype(v))
                 _add_recipe!(g, (first(r.inputs), Tuple(r.inputs[j + 1] for j in projected)...),
