@@ -242,7 +242,7 @@ function _cell_factor_full_spec(spec::KernelSpec, prefix::Plan)
     g = Graph(copy(old.values), Recipe[], Dict{ValueId,Vector{Int}}(),
               copy(old.aliases), old.version, nothing)
     assigned = Set{ValueId}()
-    for r in (prefix.recipes..., old.recipes...)
+    for r in Iterators.flatten((prefix.recipes, old.recipes))
         all(v -> canon_id(g, v.id) in assigned, r.outputs) && continue
         op = r.op
         if op isa _AuthoredPlateCellOp

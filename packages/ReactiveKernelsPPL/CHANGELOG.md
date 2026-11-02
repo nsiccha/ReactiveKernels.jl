@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.60
+
+- Add `partitioned` to compact cell AD and cell factor preparation, caching
+  shared-only whole-array producers while retaining strict local derivatives
+  over the partitioned coordinates. Factor preparation also accepts `u0`.
+- Add `prepare_cell_pullback`, `cell_pullback!`, `prepare_cell_accumulator`
+  and `accumulate_cell!`. Accumulate weighted local gradient, HVP and third
+  contributions into shared cotangents, then apply the prefix pullback once
+  per pass for exact mixed population derivatives with linear storage.
+  Require RK 0.1.54 for additive native Enzyme differentiation.
+
 ## 0.1.59
 
 - Strict cell queries and outer factors accept ordinary helper gathers such

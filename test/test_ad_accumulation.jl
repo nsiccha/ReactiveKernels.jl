@@ -64,4 +64,14 @@ end
         active = :x, order = 3)
     @test_throws DimensionMismatch ad_accumulate!(q, (zeros(2),zeros(1),Ref(0.0)),
         ([0.5],[-0.25]), 1.0, x, y, 4.0)
+    # A public HAVE cut cannot freeze an active-derived value. Conditional
+    # PPL residuals use a distinct graph only after their partition proof.
+    @kernel unsafe_cut(point::Vector{Float64}) = begin
+        middle = copy(point)
+        derived = copy(middle)
+        density::Float64 = sum(derived)
+    end
+    cut = prepare(unsafe_cut; have=(:point,:derived), want=:density)
+    @test_throws ArgumentError prepare_ad_accumulator(cut, reverse, x, copy(x);
+        active=:point)
 end

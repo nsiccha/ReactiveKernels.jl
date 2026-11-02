@@ -1276,6 +1276,15 @@ their shared-coordinate derivatives. Orders zero and one similarly accumulate
 gradients and mixed Hessian-vector products. Storage grows with the packed
 point and shared frontier, with one prefix pullback after the sweep.
 
+Within the callback, ordinary local derivative verbs can take `batch` in
+place of `base`, for example
+`ad_gradient_hvp_and_third(q, (direction,), batch, active, indices, cell)`.
+This uses the pass's copied point and checks its cache generation in constant
+time; raw-vector calls scan shared coordinates to detect changes. Ordinary
+verbs do not contribute to the accumulated gradient. This also supports
+local conditional solves at a fixed shared point before accumulating their
+mixed derivative contributions.
+
 Factor operators prepared from one `CellFactors` share its cache and can use
 one `prepare_cell_pullback(factors, reverse_backend, u)`. A summand's
 `accumulate_cell!` takes `active, indices, cell, term_position` last; an outer

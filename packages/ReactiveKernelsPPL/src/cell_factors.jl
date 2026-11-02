@@ -27,6 +27,8 @@ before factoring. Values refresh when the shared coordinates change. Compact
 factor AD then selects only partitioned coordinates. Mixed shared derivatives
 use [`prepare_cell_accumulator`](@ref) and [`cell_pullback!`](@ref); operators
 prepared from this factor family share one prefix cache and pullback pass.
+Inside the callback, factor derivative verbs accept the active pullback in
+place of `base`, reusing its copied point without rescanning shared coordinates.
 """
 function prepare_cell_factors(built, plan::StructuralPlan, observation::Symbol;
         on_error = nothing, locality = nothing, partitioned = (), u0 = nothing)
@@ -279,18 +281,20 @@ function _cell_factor_ad_call(verb, q::CellFactorAD, args::Vararg{Any,N}) where 
     N >= 5 || throw(ContractValidationError("[query] a cell factor derivative needs five point arguments"))
     leading = ntuple(k -> args[k], Val(N - 5))
     if q.outer
-        base, sums, active, indices, cell = args[N-4:N]
+        base_arg, sums, active, indices, cell = args[N-4:N]
+        base = _cell_ad_base(q.shared, base_arg)
         length(sums) == q.nsums || throw(ContractValidationError(
             "[query] expected $(q.nsums) sum values, got $(length(sums))"))
         _select_compact_cells!(q, base, active, indices)
         _check_cell_local_selection(q.shared, indices)
-        shared_values = _refresh_cell_shared!(q.shared, base)
+        shared_values = _cell_ad_values(q.shared, base_arg)
         verb(q.prepared, leading..., base, sums, active, q.slots, cell, shared_values...)
     else
-        base, active, indices, cell, term = args[N-4:N]
+        base_arg, active, indices, cell, term = args[N-4:N]
+        base = _cell_ad_base(q.shared, base_arg)
         _select_compact_cells!(q, base, active, indices)
         _check_cell_local_selection(q.shared, indices)
-        shared_values = _refresh_cell_shared!(q.shared, base)
+        shared_values = _cell_ad_values(q.shared, base_arg)
         verb(q.prepared, leading..., base, active, q.slots, cell, term, shared_values...)
     end
 end

@@ -1152,6 +1152,8 @@ The cache refreshes when shared coordinates change. For exact mixed shared
 derivatives, prepare a [`prepare_cell_accumulator`](@ref) and accumulate a
 pass with [`cell_pullback!`](@ref), which applies the shared prefix's pullback
 once after collecting all cell contributions.
+Inside that callback, pass its active `CellPullback` in place of `base` to
+reuse the fixed point without checking all shared coordinates per cell.
 """
 function prepare_compact_cell_ad(prepare_operator, built, plan::StructuralPlan, observations,
         base0::AbstractVector{Float64}, indices0::AbstractVector{Int}, backend, exemplars...;
@@ -1181,7 +1183,8 @@ end
 function _compact_cell_ad_call(verb::F, q::CompactCellAD, args::Vararg{Any,N}) where {F,N}
     N >= 4 || throw(ContractValidationError(
         "[query] a compact cell derivative takes `base, active, indices, cell` last"))
-    base, active, indices, cell = args[N - 3], args[N - 2], args[N - 1], args[N]
+    base_arg, active, indices, cell = args[N - 3], args[N - 2], args[N - 1], args[N]
+    base = _cell_ad_base(q.shared, base_arg)
     base isa AbstractVector{Float64} && active isa AbstractVector{Float64} &&
         indices isa AbstractVector{Int} && cell isa Int || throw(ContractValidationError(
         "[query] a compact cell derivative takes `base::AbstractVector{Float64}, " *
@@ -1189,7 +1192,7 @@ function _compact_cell_ad_call(verb::F, q::CompactCellAD, args::Vararg{Any,N}) w
         join(summary.((base, active, indices, cell)), ", ")))
     _select_compact_cells!(q, base, active, indices)
     _check_cell_local_selection(q.shared, indices)
-    shared_values = _refresh_cell_shared!(q.shared, base)
+    shared_values = _cell_ad_values(q.shared, base_arg)
     leading = ntuple(k -> args[k], Val(N - 4))
     return verb(q.prepared, leading..., base, active, q.slots, cell, shared_values...)
 end

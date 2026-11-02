@@ -164,6 +164,10 @@ derivative. After the callback, one shared-prefix pullback propagates their
 combined cotangent. Local and direct packed derivatives are included too.
 
 The shared cache refreshes automatically when its population coordinates change.
+Ordinary compact/factor derivative verbs also accept the active `pullback`
+in place of their `base` argument. They use the copied point without scanning
+shared coordinates again, and do not add to the accumulated gradient. Raw
+vector calls check shared coordinates on every call.
 Do not change those coordinates through another operator during the callback:
 that invalidates the pass and throws. A failed callback produces no output;
 the next call resets all accumulation storage. Calls cannot be nested or run
@@ -215,9 +219,17 @@ end
 function _check_cell_pass(p::CellPullback, shared)
     p.active && p.shared === shared && p.generation == shared.generation ||
         throw(ContractValidationError(
-            "[query] accumulator must use this active cell pullback's unchanged shared cache"))
+            "[query] operator must use this active cell pullback's unchanged shared cache"))
     nothing
 end
+
+_cell_ad_base(shared, u) = u
+function _cell_ad_base(shared, p::CellPullback)
+    _check_cell_pass(p, shared)
+    p.base
+end
+_cell_ad_values(shared, u) = _refresh_cell_shared!(shared, u)
+_cell_ad_values(shared, p::CellPullback) = _cell_shared_values(shared)
 
 struct CellAccumulator{P,Q,S}
     prepared::P
