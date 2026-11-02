@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.56
+## 0.1.57
 
 - Constructed RK object endpoints accept plate-local method arguments, as
   their constructor arguments already do. A call such as

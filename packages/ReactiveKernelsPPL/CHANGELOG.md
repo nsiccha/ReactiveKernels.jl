@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.63
+## 0.1.64
 
 - Caller-owned sampling laws may return a density `KernelSpec` from
   `sampling_distribution_graph`, alongside an expression constructing an RK
@@ -25,7 +25,7 @@ are recorded in the git history only.
   `sampling_geometry`. Static reconstruction preserves printed source replay
   for local specs and parametric constructors; complete explicit keyword
   boundaries compose in declaration order. Omitted defaults and splats keep
-  the ordinary numerical RHS path. Requires RK 0.1.56 for object endpoint
+  the ordinary numerical RHS path. Requires RK 0.1.57 for object endpoint
   arguments computed inside a plate cell.
 
 ## 0.1.62
