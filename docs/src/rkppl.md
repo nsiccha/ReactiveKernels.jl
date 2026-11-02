@@ -313,11 +313,19 @@ y .~ LogDensity.(normal_lpdf, a)
 ```
 
 With `Distributions` loaded, authored `Normal`, `LogNormal`, `Gamma`,
-`Exponential`, `Cauchy`, `Laplace`, `Logistic`, and `DirichletMultinomial`
+`Exponential`, `Cauchy`, `Laplace`, `Logistic`, `TDist`, `Gumbel`, `Weibull`,
+`InverseGamma`, `InverseGaussian`, `Rayleigh`, `Chi`, `Chisq`, `FDist`,
+`BetaPrime`, and `DirichletMultinomial`
 constructors resolve by identity and compose RK distribution graphs, including
 qualified and aliased constructors. Defaults and constructor parameterizations
 are preserved: for example, `Distributions.Gamma(shape, scale)` supplies the
-owned Gamma graph's `scale` port.
+owned Gamma graph's `scale` port. `BetaPrime(a)` supplies both shape parameters
+as `a`; `TDist`, `Chi`, `Chisq`, and `FDist` keep their required arguments.
+These continuous-family objects expose `logpdf`, `cdf`, `ccdf`, `logcdf`, and
+`logccdf`. A caller composing a lower restriction reads the density with its
+support guard; a normalized truncation additionally subtracts the same
+object's `logccdf(lower)`. The lookup does not insert this normalization or
+change the caller's parameter geometry.
 
 A caller-owned law can expose its density arithmetic through
 `sampling_distribution_graph(constructor, argument_expressions::Tuple)`:

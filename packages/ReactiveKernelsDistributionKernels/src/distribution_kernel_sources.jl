@@ -40,8 +40,9 @@ include("gamma_logtails.jl")
 # Preserve qualified consumer names as imports of the same owned graphs.
 using ReactiveKernels: rk_symmetric_eigvals_rule, rk_symmetric_eigvecs_rule
 
-# Owned regularized incomplete beta, I_x(a, b), over the Student-t cdf
-# slice (one shape is 1/2, the other is nu/2 with nu > 0, x in [0, 1]).
+# Owned regularized incomplete beta, I_x(a, b). The probability helper is
+# used over the Student-t slice; beta_logtails.jl also uses its continued
+# fraction for the two free shape parameters of BetaPrime and FDist.
 # This spelling is plain transparent math — endpoint guards, reflection to
 # x <= (a+1)/(a+b+2), a logbeta front factor, and Lentz's continued fraction
 # over a FIXED count in one retained `while` loop — so it differentiates under
@@ -53,10 +54,8 @@ using ReactiveKernels: rk_symmetric_eigvals_rule, rk_symmetric_eigvecs_rule
 # `jax.grad` differentiates the continued fraction (`jax.scipy.special.betainc`
 # has no derivative in its shape parameters).
 #
-# Validated against `SpecialFunctions.beta_inc` on the slice (see
-# `test_rk_beta_inc.jl`); outside it use `SpecialFunctions.beta_inc`
-# (native) — the general-domain port is future work, not a silent
-# extension of this function.
+# `test_rk_beta_inc.jl` validates the Student-t slice, and
+# `test_positive_families.jl` validates the general log-tail route separately.
 const RK_BETA_INC_ITERS = 300
 const RK_BETA_INC_FPMIN = 1e-300
 
@@ -129,22 +128,13 @@ ReactiveKernels.@_record_source function rk_beta_inc_tail(a, b, x, upper::Bool)
 end
 rk_beta_inc(a, b, x) = rk_beta_inc_tail(a, b, x, false)
 
-# Near the centre, the beta change of variables has a removable 0*Inf
-# derivative. Integrating the smooth density's local series avoids that
-# singular coordinate while retaining ordinary differentiation of the primal.
+include("beta_logtails.jl")
+
+# Keep the standalone probability helper on the same arithmetic as the
+# object endpoints; the object exposes log_beta separately for shared work.
 ReactiveKernels.@_record_source function rk_student_tail(nu, z, upper::Bool)
-    result = zero(nu + z)
-    if abs(z) <= 1e-4 * sqrt(nu / (nu + 1))
-        t = z^2 / nu
-        c = exp(loggamma((nu + 1) / 2) - loggamma(nu / 2) - 0.5log(nu*3.141592653589793))
-        delta = c*z*(1 - (nu+1)*t/6 + (nu+1)*(nu+3)*t^2/40 -
-            (nu+1)*(nu+3)*(nu+5)*t^3/336)
-        result = ifelse(upper, 0.5 - delta, 0.5 + delta)
-    else
-        half = 0.5 * rk_beta_inc(nu / 2, 0.5, nu / (nu + z^2))
-        result = ifelse(ifelse(upper, z >= 0, z <= 0), half, 1 - half)
-    end
-    return result
+    log_beta = nu == Inf ? 0.0 : logbeta(nu / 2, 0.5)
+    return exp(_student_log_tail(nu, z, log_beta, upper))
 end
 
 export LOCATION_SCALE_SOURCE
@@ -226,7 +216,7 @@ ReactiveKernels.@_record_source function _normal_logcdf(z)
 end
 
 const LOCATION_SCALE_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, rk_beta_inc, rk_student_tail, _normal_logcdf
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, logbeta, rk_beta_inc, rk_student_tail, _normal_logcdf, _student_log_tail, _student_log_kernel
 using SpecialFunctions: erfc, erfcinv, beta_inc_inv
 using LogExpFunctions: log1pexp
 
@@ -268,16 +258,17 @@ end
 # `cdf`/`quantile` use the regularized incomplete beta with x = nu/(nu+z^2):
 # for z<=0, F(z) = I_x(nu/2, 1/2)/2; symmetry gives the upper tail and the
 # inverse. Only positive df is a valid parameter, so there is no domain guard.
-# `cdf` calls the owned `rk_beta_inc` (transparent math that Enzyme
-# differentiates without a rule).
+# The probability endpoints exponentiate owned log tails, retaining extreme
+# tail information and ordinary differentiation through the same graph.
 @kernel standard_student_t(nu::Float64) = begin
+    log_beta::Float64 = nu == Inf ? 0.0 : logbeta(nu / 2, 0.5)
+    log_normalizer::Float64 = nu == Inf ? -0.5log(2pi) : -0.5log(nu) - log_beta
     logpdf(z::Float64)::Float64 =
-        loggamma((nu + 1) / 2) - loggamma(nu / 2) - 0.5 * log(nu * π) -
-        ((nu + 1) / 2) * log1p(z^2 / nu)
-    cdf(z::Float64)::Float64 = rk_student_tail(nu, z, false)
-    ccdf(z::Float64)::Float64 = rk_student_tail(nu, z, true)
-    logcdf(z::Float64)::Float64 = log(cdf(z))
-    logccdf(z::Float64)::Float64 = log(ccdf(z))
+        log_normalizer + _student_log_kernel(nu, z)
+    cdf(z::Float64)::Float64 = exp(logcdf(z))
+    ccdf(z::Float64)::Float64 = exp(logccdf(z))
+    logcdf(z::Float64)::Float64 = _student_log_tail(nu, z, log_beta, false)
+    logccdf(z::Float64)::Float64 = _student_log_tail(nu, z, log_beta, true)
     quantile(p::Float64)::Float64 = begin
         lower::Bool = p < 0.5
         tail::Float64 = ifelse(lower, p, 1 - p)
@@ -929,16 +920,18 @@ const WEIBULL_KERNEL_SOURCE = raw"""
     inv_theta::Float64 = 1 / theta
 
     logpdf(x::Float64)::Float64 = begin
-        valid::Bool = (x > 0) & (k > 0) & (theta > 0)
+        valid::Bool = (x >= 0) & (k > 0) & (theta > 0)
         valid ?
-            (log(k) - log_theta + (k - 1) * (log(x) - log_theta) -
-             (x * inv_theta)^k) :
-            -Inf
+            (x == Inf ? -Inf : (x == 0 ?
+                (k == 1 ? -log_theta : (k < 1 ? Inf : -Inf)) :
+                (log(k) - log_theta + (k - 1) * (log(x) - log_theta) -
+                 (x * inv_theta)^k))) :
+            (isnan(x) ? NaN : -Inf)
     end
     cdf(x::Float64)::Float64 =
-        x > 0 ? -expm1(-((x * inv_theta)^k)) : 0.0
+        x <= 0 ? 0.0 : -expm1(-((x * inv_theta)^k))
     ccdf(x::Float64)::Float64 =
-        x > 0 ? exp(-((x * inv_theta)^k)) : 1.0
+        x <= 0 ? 1.0 : exp(-((x * inv_theta)^k))
     logcdf(x::Float64)::Float64 =
         x <= 0 ? -Inf : (x == Inf ? 0.0 : log(-expm1(-((x * inv_theta)^k))))
     logccdf(x::Float64)::Float64 =
@@ -981,21 +974,24 @@ end
 # regularized incomplete gamma Q(α, θ/x) — since 1/X ~ Gamma(α, rate = θ) — and
 # `quantile` inverts it through `gamma_inc_inv`.
 const INVERSE_GAMMA_KERNEL_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, _gamma_log_tail
 using SpecialFunctions: gamma_inc, gamma_inc_inv
 
 @kernel inverse_gamma(shape::Float64, scale::Float64) = begin
     log_scale::Float64 = log(scale)
+    log_gamma_shape::Float64 = loggamma(shape)
 
     logpdf(x::Float64)::Float64 =
         x > 0 ?
-            (shape * log_scale - loggamma(shape) -
+            (shape * log_scale - log_gamma_shape -
              (shape + 1) * log(x) - scale / x) :
             -Inf
-    cdf(x::Float64)::Float64 =
-        x > 0 ? last(gamma_inc(shape, scale / x)) : 0.0
-    ccdf(x::Float64)::Float64 =
-        x > 0 ? first(gamma_inc(shape, scale / x)) : 1.0
+    cdf(x::Float64)::Float64 = exp(logcdf(x))
+    ccdf(x::Float64)::Float64 = exp(logccdf(x))
+    logcdf(x::Float64)::Float64 =
+        x <= 0 ? -Inf : _gamma_log_tail(shape, scale / x, log_gamma_shape, true)
+    logccdf(x::Float64)::Float64 =
+        x <= 0 ? 0.0 : _gamma_log_tail(shape, scale / x, log_gamma_shape, false)
     quantile(p::Float64)::Float64 = scale / gamma_inc_inv(shape, 1 - p, p)
 end
 """
@@ -1316,6 +1312,7 @@ const zero_inflated_binomial = _OTHER_DISTRIBUTION_BINDINGS[22]
 const zero_inflated_binomial_logit_zi = _OTHER_DISTRIBUTION_BINDINGS[23]
 
 include("dirichlet_multinomial.jl")
+include("positive_families.jl")
 
 # One component is chosen for the entire observed vector. Columns of the
 # parameter matrices are component laws; rows are positions within the one

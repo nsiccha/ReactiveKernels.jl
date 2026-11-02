@@ -14,7 +14,13 @@ import ReactiveKernelsDistributionKernels.DistributionKernelSources as DKS
 const FAMILIES = ((:Normal,:normal,[0.3,1.2]), (:LogNormal,:lognormal,[0.3,1.2]),
     (:Gamma,:gamma,[2.3,1.2]), (:Exponential,:exponential,[1.2,0.0]),
     (:Cauchy,:cauchy,[0.3,1.2]), (:Laplace,:laplace,[0.3,1.2]),
-    (:Logistic,:logistic,[0.3,1.2]))
+    (:Logistic,:logistic,[0.3,1.2]), (:TDist,:student_t,[2.3,0.0]),
+    (:Gumbel,:gumbel,[0.3,1.2]), (:Weibull,:weibull,[2.3,1.2]),
+    (:InverseGamma,:inverse_gamma,[2.3,1.2]),
+    (:InverseGaussian,:inverse_gaussian,[2.3,1.2]),
+    (:Rayleigh,:rayleigh,[1.2,0.0]), (:Chi,:chi,[2.3,0.0]),
+    (:Chisq,:chi_squared,[2.3,0.0]), (:FDist,:f_dist,[2.3,4.1]),
+    (:BetaPrime,:beta_prime,[2.3,1.2]))
 
 for (family,object,_) in FAMILIES
     owned = Symbol(family,:_owned)
@@ -22,9 +28,11 @@ for (family,object,_) in FAMILIES
     callback = Symbol(family,:_density)
     constructor = GlobalRef(Distributions,family)
     graph = GlobalRef(DKS,object)
+    single = family in (:Exponential,:Rayleigh,:Chi,:Chisq,:TDist)
     law = family === :Gamma ? :($graph(;shape=q[1],scale=q[2])) :
-        family === :Exponential ? :($graph(q[1])) : :($graph(q[1],q[2]))
-    args = family === :Exponential ? [:(q[1])] : [:(q[1]),:(q[2])]
+        family === :TDist ? :($graph(q[1],0.0,1.0)) :
+        single ? :($graph(q[1])) : :($graph(q[1],q[2]))
+    args = single ? [:(q[1])] : [:(q[1]),:(q[2])]
     @eval begin
         $callback(x,q) = Distributions.logpdf($constructor($(args...)),x)
         @kernel $owned(xs::Vector{Float64},q::Vector{Float64}) = begin

@@ -655,7 +655,7 @@ import ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
     beta, inverse_gamma, binomial, negative_binomial2, beta_binomial,
-    negative_binomial, weibull,
+    negative_binomial, weibull, inverse_gaussian,
     uniform, laplace, logistic,
     student_t, zero_inflated_poisson, zero_inflated_binomial,
     zero_inflated_binomial_logit_zi,
@@ -3255,24 +3255,9 @@ function _hurdle_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symb
     return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
-# Inverse-Gaussian / Wald likelihood (SB `brm_inverse_gaussian_lpdf`
-# mirror): the closed form spelled operation-for-operation —
-# `(log(λ) - (log2π + 3*log(y)) - λ*(y-μ)²/(μ²*y))/2` — with the SB
-# `log2π` literal `1.8378770664093456` (`Float64(Distributions.log2π)`
-# exactly). The mean precomputes outside the cell (`_ppl_mu_`, the NB2
-# precedent — a computed `exp` constructor arg miscompiles the Enzyme
-# pullback); lambda threads via `_scale_plate_arg` (scalar
-# sampled/literal/assignment/column, or a log-link predictor — the
-# VonMises-kappa precedent, linked per use at the contract gate).
-# The `y > 0` guard is lazy `?:` (the DK gamma precedent, not eager
-# `ifelse`); `y` is bound data so preparation splits the plate per
-# taken arm and no backend receives the branch. μ/λ positivity is
-# guarded outside the evidence wrapper, including raw live values.
-# Evidence uses
-# the shared wrapper algebra and stable scaled-erfc tails before optional
-# weights. No whole-vector fusion yet
-# (the `3*log(y)` normalizer is data-only and would hoist) — a
-# perf-lane follow-up, not this slice.
+# The Inverse-Gaussian response and the structural constructor lookup use
+# one owned density/tail graph. Mean/link and shape placement remain the
+# ordinary response-plate machinery; evidence discovers the object's log tails.
 function _ig_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
     lp = _location_node(r, plan)
@@ -3283,12 +3268,8 @@ function _ig_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, 
     inputs = Any[y, mu]
     yv, muv = _dovar(1), _dovar(2)
     lamv = _thread_ref!(inputs, sarg)
-    base = :((log($lamv) - (1.8378770664093456 + 3.0 * log($yv)) -
-        $lamv * ($yv - $muv) * ($yv - $muv) / ($muv * $muv * $yv)) / 2.0)
-    cell = :($yv > 0 ? $base : -Inf)
-    cell = _wrap_evidence!(r, plan, pre, inputs, cell;
-        cdf = b -> :(rk_inverse_gaussian_tail($muv, $lamv, $b, false)),
-        ccdf = b -> :(rk_inverse_gaussian_tail($muv, $lamv, $b, true)))
+    cell = :(inverse_gaussian($muv, $lamv).logpdf($yv))
+    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
     cell = :($lamv > 0 && $muv > 0 ? $cell : -Inf)
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)

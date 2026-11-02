@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.71
+
+- Map resolved TDist, Gumbel, Weibull, InverseGamma, InverseGaussian,
+  Rayleigh, Chi, Chisq, FDist and BetaPrime constructors to owned distribution
+  graphs. Preserve their arities, defaults and parameterizations, including
+  BetaPrime's one-argument equal-shape constructor. Caller-authored restriction
+  and normalization remain distinct; custom laws retain the existing fallback.
+- Use the same inverse-Gaussian object for built-in responses and constructor
+  graphs, including evidence tails and posterior-predictive laws. Require
+  DistributionKernels 0.1.3.
+
 ## 0.1.70
 
 - Add `prepare_smc_window(...; coordinates=:auto)` for changing authored

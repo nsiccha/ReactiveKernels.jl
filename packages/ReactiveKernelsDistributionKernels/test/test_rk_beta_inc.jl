@@ -43,8 +43,7 @@ end
     end
 end
 
-@testset "standard_student_t cdf rides rk_beta_inc" begin
-    @test occursin("rk_student_tail(nu, z", LOCATION_SCALE_SOURCE)
+@testset "standard_student_t cdf uses owned arithmetic" begin
     @test !occursin("first(beta_inc(", LOCATION_SCALE_SOURCE)
     student_cdf = prepare(standard_student_t.cdf; have = (:z, :nu), want = :cdf)
     for nu in (1.0, 3.0, 4.0, 30.0)
