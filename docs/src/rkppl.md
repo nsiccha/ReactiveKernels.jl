@@ -341,6 +341,11 @@ when the actual `kernel_expr` is printed and replayed. No registry or global
 binding for the returned spec is required. Graph-visible density and geometry
 allow native Enzyme Reverse to differentiate their composed arithmetic.
 
+The executable `examples/rkppl_owned_density_graph.jl` returns local specs for
+both arities of a caller's positive-law wrapper. Each composes an owned Normal
+endpoint with a lazy support check and the law's change-of-variable term;
+that term is separate from the sampler-coordinate Jacobian.
+
 With `Distributions` loaded, any `Distributions.Distribution` object uses its
 ordinary `Distributions.logpdf` method automatically, including custom types.
 Its support behavior comes from that method. Distributions 0.25.132 evaluates

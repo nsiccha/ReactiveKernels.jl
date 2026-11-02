@@ -2,6 +2,7 @@ module OwnedDensityGraphTests
 using Test, ReactiveKernels, ReactiveKernelsPPL
 import DifferentiationInterface as DI
 import Enzyme
+include(joinpath(@__DIR__,"..","..","..","examples","rkppl_owned_density_graph.jl"))
 
 # A normalized triangular Gaussian law, owned entirely by this caller. Identity
 # coordinates do not make its density independent across adjacent coordinates.
@@ -259,5 +260,30 @@ end
     q = prepare_query(built,bound,:sampler)
     @test Base.invokelatest(q,[0.2]) ≈ -log(2pi)/2-0.2^2/2+
         score(data.y,data.location,data.previous,0.3,exp(0.2))
+end
+
+@testset "local wrapper graphs compose owned objects, support and law Jacobians" begin
+    E = CallerOwnedDensityExample
+    for arity in (1,2)
+        fx = E.build_example(arity)
+        function expected(u)
+            lower = arity == 1 ? 0.0 : u[2]
+            prior = -length(u)*log(2pi)/2-sum(abs2,u)/2
+            z = log.(fx.data.y .- lower)
+            prior-length(z)*(log(2pi)/2+u[1])-sum(abs2,z)/(2exp(2u[1]))-sum(z)
+        end
+        source = string(Base.remove_linenums!(kernel_expr(fx.bound,fx.built.layout)))
+        @test !occursin("sampling_logdensity",source)
+        replay = ReactiveKernelsPPL._eval_kernel_def(Meta.parse(source))
+        q = prepare_query((;spec=replay,layout=fx.built.layout),fx.bound,:sampler)
+        sampler = prepare_sampler(fx.built,fx.bound,fx.u;
+            backend=DI.AutoEnzyme(;mode=Enzyme.Reverse))
+        value, gradient = sampler_value_and_gradient!(sampler,similar(fx.u),fx.u)
+        @test value ≈ expected(fx.u)
+        @test Base.invokelatest(q,fx.u) ≈ expected(fx.u)
+        @test gradient ≈ finite_gradient(expected,fx.u) atol=2e-8 rtol=2e-7
+        invalid = E.build_example(arity;y=[-0.2])
+        @test Base.invokelatest(prepare_query(invalid.built,invalid.bound,:sampler),invalid.u) == -Inf
+    end
 end
 end
