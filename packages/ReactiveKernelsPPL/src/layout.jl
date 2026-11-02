@@ -1824,7 +1824,7 @@ function _vector_transform_statements(e::LayoutEntry)
             view(unconstrained, $lo:$lo))]
         f = GlobalRef(@__MODULE__, :_ordered_constrain_kernel)
         return Expr[:($(e.name)::AbstractVector{Float64} =
-            $f(unconstrained, $lo, $hi))]
+            $f($(block_read(lo, e.size)), 1, $(e.size)))]
     end
     # :simplex — stick-breaking (thin-layer-owned, not Stan's ILR).
     K = e.size + 1
@@ -1832,7 +1832,7 @@ function _vector_transform_statements(e::LayoutEntry)
     pair, jac = _vector_simplex_pair(e), _vector_simplex_logjac(e)
     f = GlobalRef(@__MODULE__, :_simplex_constrain_logjac_kernel)
     return Expr[
-        :($pair = $f(unconstrained, $lo, $hi)),
+        :($pair = $f($(block_read(lo, e.size)), 1, $(e.size))),
         :($(e.name)::AbstractVector{Float64} = $pair[1]),
         :($jac::Float64 = $pair[2]),
     ]
@@ -1896,16 +1896,18 @@ end
 
 # The vine's log-Jacobian over the `_ppl_rzb_` partials of factor `L`
 # (`nothing` at K=1); `stacked=true` sums each partial's S-vector.
-function _lkj_vine_logjac(L::Symbol, K::Int; stacked::Bool = false)
+function _lkj_vine_logjac(L::Symbol, K::Int; stacked::Bool = false,
+        pointwise::Bool = false)
     K == 1 && return nothing
     terms = Any[]
     for j in 2:K, i in 1:(j - 1)
         z = _rzb_name(L, i, j)
         w = (j - i + 1) / 2
-        push!(terms, stacked ? :($w * sum(log.(1 .- $z .^ 2))) :
+        push!(terms, stacked && pointwise ? :($w .* log.(1 .- $z .^ 2)) :
+            stacked ? :($w * sum(log.(1 .- $z .^ 2))) :
             :($w * log(1 - $z^2)))
     end
-    return foldl((a, b) -> :($a + $b), terms)
+    return foldl((a, b) -> stacked && pointwise ? :($a .+ $b) : :($a + $b), terms)
 end
 
 """

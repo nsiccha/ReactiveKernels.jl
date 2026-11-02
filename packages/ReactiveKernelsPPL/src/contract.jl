@@ -987,8 +987,9 @@ The caller-owned geometry of an undotted `@plate` cell latent `c[i] ~ F(args…)
 `sampling_geometry(F, args, ())` returned at lowering, the definitions holding
 each index's constrained shape and packed block bounds, how the host reads each
 argument at an index (`:cells => column` for a per-index value, `:shared =>
-expression` otherwise; keywords likewise), and the graph value summing the
-cells' log-Jacobians.
+expression` otherwise; keywords likewise), and the graph values summing the
+cells' log-Jacobians and prior densities. These retain authored provenance
+without asking consumers to parse generated names.
 """
 struct CellGeometry
     name::Symbol
@@ -998,6 +999,7 @@ struct CellGeometry
     arguments::Vector{Pair{Symbol,Any}}
     keywords::Vector{Pair{Symbol,Pair{Symbol,Any}}}
     logjac::Symbol
+    prior::Symbol
 end
 
 """

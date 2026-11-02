@@ -323,8 +323,8 @@ function _expand_cell_array_latents(st, taken, scope::_CellLatentScope)
                 c.args[1].args[2] === ivar &&
                 c.args[2].args[1] == GlobalRef(@__MODULE__, :_ppl_cell_joint_constrain)
             # A joint latent's value has its geometry's shape at the index.
-            _, _, _, shapes, pos = filter(a -> !Meta.isexpr(a, :parameters), c.args[2].args[2:end])
-            cx.arrays[c.args[1].args[1]] = (shapes, pos)
+            _, _, shape, pos = filter(a -> !Meta.isexpr(a, :parameters), c.args[2].args[2:end])
+            cx.arrays[c.args[1].args[1]] = (shape.args[1], pos)
         elseif Meta.isexpr(c, :(=), 2) && Meta.isexpr(c.args[1], :ref, 2) &&
                 c.args[1].args[2] === ivar && c.args[1].args[1] isa Symbol &&
                 !_is_cell_latent_block(c)
@@ -502,6 +502,7 @@ function _expand_cell_joint_latents(st, taken, data::Set{Symbol}, mod::Module,
         site, geometry = fresh(prefix), fresh(Symbol(prefix, :_geometry))
         shapecells, shapes = fresh(Symbol(prefix, :_shape_cells)), fresh(Symbol(prefix, :_shapes))
         sizecells, offsets = fresh(Symbol(prefix, :_size_cells)), fresh(Symbol(prefix, :_offsets))
+        blocks = fresh(Symbol(prefix, :_blocks))
         count, pos = fresh(Symbol(prefix, :_size)), fresh(Symbol(prefix, :_cell))
         prior, logjac = fresh(Symbol(prefix, :_prior)), fresh(Symbol(prefix, :_logjac))
         for s in (prior, logjac)
@@ -538,17 +539,18 @@ function _expand_cell_joint_latents(st, taken, data::Set{Symbol}, mod::Module,
         push!(prelude, Expr(:(=), sizecells, column(deepcopy(g.unconstrained))))
         push!(prelude, Expr(:(=), offsets, Expr(:call, ref(:_ppl_cell_joint_offsets),
             QuoteNode(name), sizecells)))
+        push!(prelude, Expr(:(=), blocks, Expr(:call, ref(:_ppl_cell_joint_blocks), offsets)))
         push!(prelude, Expr(:(=), count, Expr(:call, ref(:_ppl_cell_latent_size), offsets)))
         push!(prelude, Expr(:call, :.~, Expr(:ref, site, Expr(:call, :(:), 1, count)),
             :(Flat.())))
         geometry_expr = Expr(:call, ref(:sampling_geometry), call.args[1],
             Expr(:tuple, (_sampling_ast_literal(a) for a in call.args[2:end])...), Expr(:tuple))
         function endpoint(f, edge)
+            block = :($site[$blocks[$pos]])
             graph = _sampling_graph_call(g, edge, geometry_expr,
-                Any[:($(ref(:_ppl_cell_joint_block))($site, $offsets, $pos)),
-                    :($shapes[$pos]), positional...], keywords)
+                Any[block, :($shapes[$pos]), positional...], keywords)
             graph === nothing && return _external_endpoint_call(ref(f),
-                Any[geometry, site, offsets, shapes, pos, positional...], keywords)
+                Any[geometry, block, :($shapes[$pos]), pos, positional...], keywords)
             return graph
         end
         push!(cells, Expr(:(=), pos, Expr(:call, ref(:_ppl_cell_scan_position), domain, ivar)))
@@ -570,7 +572,7 @@ function _expand_cell_joint_latents(st, taken, data::Set{Symbol}, mod::Module,
         push!(priors, prior)
         push!(post, :($prior = sum($(Symbol(prior, :_cells)))))
         push!(post, :($logjac = sum($(Symbol(logjac, :_cells)))))
-        sites[site] = CellGeometry(name, g, shapes, offsets, arguments, hostkeywords, logjac)
+        sites[site] = CellGeometry(name, g, shapes, offsets, arguments, hostkeywords, logjac, prior)
     end
     return prelude, Expr(st.head, st.args[1:2]...,
         Expr(:for, loop.args[1], Expr(:block, cells...))), sites, priors, post
@@ -710,18 +712,24 @@ end
 _ppl_cell_joint_block(site, offsets, pos::Int) =
     view(site, (offsets[pos] + 1):offsets[pos + 1])
 
+# Data-only integer windows expose a cell's packed read to the graph compiler.
+# Materialize their indices once: a range-valued cell intermediate stays in
+# the residual, whereas these arrays cross the binding cache boundary.
+# The geometry receives the selected block, never the unrelated cells.
+_ppl_cell_joint_blocks(offsets) =
+    [collect((offsets[k] + 1):offsets[k + 1]) for k in 1:length(offsets)-1]
+
 # A cell's constrained value of its joint latent: the geometry's `constrain`
 # on its packed block, read in place, with the cell's argument values.
-function _ppl_cell_joint_constrain(endpoints::Tuple, site, offsets, shapes,
+function _ppl_cell_joint_constrain(endpoints::Tuple, block, shape,
         pos::Int, args...; kwargs...)
-    shape = shapes[pos]
-    value = first(endpoints)(_ppl_cell_joint_block(site, offsets, pos), shape, args...; kwargs...)
+    value = first(endpoints)(block, shape, args...; kwargs...)
     _ppl_cell_joint_check(value, shape, pos)
     return value
 end
-_ppl_cell_joint_logjac(endpoints::Tuple, site, offsets, shapes, pos::Int,
+_ppl_cell_joint_logjac(endpoints::Tuple, block, shape, pos::Int,
         args...; kwargs...) =
-    last(endpoints)(_ppl_cell_joint_block(site, offsets, pos), shapes[pos], args...; kwargs...)
+    last(endpoints)(block, shape, args...; kwargs...)
 
 function _ppl_cell_joint_check(value, shape::Tuple, pos::Int)
     (isempty(shape) ? value isa Number : value isa AbstractArray && size(value) == shape) ||
