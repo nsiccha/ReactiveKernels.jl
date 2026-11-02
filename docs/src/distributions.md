@@ -167,7 +167,11 @@ remain runtime loops and differentiate through their ordinary primal code.
 event. Nonnegative integer counts must sum to `n`; invalid counts or totals
 return `-Inf`, and incompatible vector lengths throw `DimensionMismatch`.
 The concentration and count log-gamma terms are separate graph nodes, so
-shared concentrations and bound observations are visible to the planner.
+shared concentration normalizers run once per evaluation. Binding the counts
+and total precomputes the count-only coefficient, including its nested plate;
+rebinding different observations computes a new coefficient. The remaining
+event terms read the live concentrations and retain runtime loops. This reuse
+does not eliminate the active per-event array allocations.
 `dirichlet_multinomial_logdensity` is the extracted endpoint with positional
 arguments `(counts, n, alpha)`.
 
