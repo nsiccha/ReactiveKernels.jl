@@ -14,6 +14,9 @@ end
 function _make_cell_shared(parts, layout, labels, exemplar, on_error)
     cache = parts === nothing ? nothing :
         _prepare_value_prefix(parts, layout, labels, exemplar, on_error)
+    _cell_shared(parts, labels, exemplar, cache)
+end
+function _cell_shared(parts, labels, exemplar, cache)
     positions = findall(ismissing, labels)
     point = cache === nothing ? exemplar[positions] : cache.point
     _CellShared(cache, parts === nothing ? nothing : parts.prefix,
@@ -38,7 +41,7 @@ function _check_cell_local_selection(s::_CellShared, indices)
 end
 
 _refresh_cell_shared!(::Nothing, u) = ()
-function _refresh_cell_shared!(s::_CellShared, u)
+function _refresh_cell_shared!(s::_CellShared, u, prefix = nothing)
     length(u) == length(s.local_positions) || throw(ContractValidationError(
         "[query] packed point has the wrong length for the shared cell cache"))
     changed = s.cache !== nothing && !s.cache.valid || any(eachindex(s.shared_positions)) do j
@@ -53,7 +56,7 @@ function _refresh_cell_shared!(s::_CellShared, u)
                 s.shared_point[j] = u[i]
             end
         else
-            _refresh_partition_prefix!(s.cache, u)
+            _refresh_partition_prefix!(s.cache, u, prefix === nothing ? s.cache.kernel : prefix)
         end
     end
     _cell_shared_values(s)
