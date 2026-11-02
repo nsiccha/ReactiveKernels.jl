@@ -104,15 +104,27 @@ end
         selection = sort([beta, z[4]])
         ad = prepare_compact_cell_ad(prepare_ad, built, bound, :y, u, selection,
                                     AutoEnzyme(; mode=Enzyme.Reverse); locality=:error)
-        value, gradient = ad_value_and_gradient(ad, u, u[selection], selection, 1)
-        zi, b = u[z[4]], u[beta]
-        field = model === rowwise_model ? b * sin(zi) + zi^2 : zi
-        eta = b * x[1] + field
-        d_beta = model === rowwise_model ? x[1] + sin(zi) : x[1]
-        d_z = model === rowwise_model ? b * cos(zi) + 2zi : 1.0
-        @test value ≈ eta - exp(eta)
-        oracle = Dict(beta => (1-exp(eta))*d_beta, z[4] => (1-exp(eta))*d_z)
-        @test gradient ≈ [oracle[i] for i in selection]
+        factors = prepare_cell_factors(built, bound, :y; locality=:error)
+        factor_ad = prepare_cell_factor_ad(prepare_ad, factors, :outer, u, selection,
+                                           AutoEnzyme(; mode=Enzyme.Reverse))
+        for cell in (1, 2, 4)
+            coordinate = z[indices[cell]]
+            selection = sort([beta, coordinate])
+            value, gradient = ad_value_and_gradient(ad, u, u[selection], selection, cell)
+            factor_value, (sum_gradient, factor_gradient) = ad_value_and_gradient(
+                factor_ad, u, Float64[], u[selection], selection, cell)
+            zi, b = u[coordinate], u[beta]
+            field = model === rowwise_model ? b * sin(zi) + zi^2 : zi
+            eta = b * x[cell] + field
+            d_beta = model === rowwise_model ? x[cell] + sin(zi) : x[cell]
+            d_z = model === rowwise_model ? b * cos(zi) + 2zi : 1.0
+            @test value ≈ eta - exp(eta)
+            oracle = Dict(beta => (1-exp(eta))*d_beta, coordinate => (1-exp(eta))*d_z)
+            @test gradient ≈ [oracle[i] for i in selection]
+            @test factor_value ≈ value
+            @test isempty(sum_gradient)
+            @test factor_gradient ≈ gradient
+        end
     end
 end
 
