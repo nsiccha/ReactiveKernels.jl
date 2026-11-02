@@ -216,6 +216,25 @@ end
     @test recipe_count(small.built.spec) == recipe_count(large.built.spec)
 end
 
+@testset "graph laws retain atomic prior ownership in density factor queries" begin
+    for cells in (false, true)
+        fx = cells ? fixture([2,1];cells=true) : fixture(3)
+        catalogue = density_factors(fx.built,fx.bound)
+        selected = select_factors(catalogue;kind=:prior,site=:w)
+        @test length(selected) == (cells ? length(fx.data.location) : 1)
+        @test factor_coordinates(selected) == collect(3:length(fx.u))
+        nt = constrain(fx.built.layout,fx.u)
+        expected = cells ? sum(score(nt.w[i],fx.data.location[i],fx.data.previous[i],
+            nt.rho,exp(nt.a)) for i in eachindex(nt.w)) :
+            score(nt.w,fx.data.location,fx.data.previous,nt.rho,exp(nt.a))
+        q = prepare_query(fx.built,fx.bound,selected;u0=fx.u)
+        @test Base.invokelatest(q,fx.u) ≈ expected
+        all_priors = select_factors(catalogue;kind=:prior)
+        prior = prepare_query(fx.built,fx.bound,all_priors;u0=fx.u)
+        @test Base.invokelatest(prior,fx.u) ≈ oracle(fx,fx.u).prior
+    end
+end
+
 @testset "caller-owned density graphs for whole-event observations" begin
     for cells in (false,true)
         data = cells ? (;location=[[0.1,0.2],[0.3]],previous=[[1,2],[1]],y=[[0.3,0.4],[0.1]]) :
