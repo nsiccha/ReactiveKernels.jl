@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.58
+
+- Treat the Boolean `!` operator as a pure endpoint call, rather than a
+  mutating method whose name ends in `!`. This permits lazy support guards
+  in composed distribution moment graphs.
+
 ## 0.1.57
 
 - Constructed RK object endpoints accept plate-local method arguments, as
