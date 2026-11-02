@@ -213,9 +213,18 @@ function _checked_distribution_parameter(value::Real, nonnegative::Bool)
     Float64(value)
 end
 
+ReactiveKernels.@_record_source function _normal_logcdf(z)
+    result = zero(z)
+    if z < 0
+        result = SpecialFunctions.logerfc(-z / sqrt(2.0)) - log(2.0)
+    else
+        result = log1p(-0.5 * SpecialFunctions.erfc(z / sqrt(2.0)))
+    end
+    return result
+end
+
 const LOCATION_SCALE_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, rk_beta_inc, rk_student_tail
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: _normal_logccdf
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, rk_beta_inc, rk_student_tail, _normal_logcdf
 using SpecialFunctions: erfc, erfcinv, beta_inc_inv
 using LogExpFunctions: log1pexp
 
@@ -223,8 +232,8 @@ using LogExpFunctions: log1pexp
     logpdf(z::Float64)::Float64 = -0.5 * log(2π) - 0.5 * z^2
     cdf(z::Float64)::Float64 = 0.5 * erfc(-z / sqrt(2))
     ccdf(z::Float64)::Float64 = 0.5 * erfc(z / sqrt(2))
-    logcdf(z::Float64)::Float64 = _normal_logccdf(-z)
-    logccdf(z::Float64)::Float64 = _normal_logccdf(z)
+    logcdf(z::Float64)::Float64 = _normal_logcdf(z)
+    logccdf(z::Float64)::Float64 = _normal_logcdf(-z)
     quantile(p::Float64)::Float64 = -sqrt(2) * erfcinv(2p)
 end
 
@@ -232,12 +241,12 @@ end
     logpdf(z::Float64)::Float64 = -log(π) - log1p(z^2)
     cdf(z::Float64)::Float64 = 0.5 + atan(z) / π
     ccdf(z::Float64)::Float64 = 0.5 - atan(z) / π
-    logcdf(z::Float64)::Float64 = z < -1 ? log(atan(-inv(z)) / pi) :
-        z > 1 ? log1p(-atan(inv(z)) / pi) : log(0.5 + atan(z) / pi)
-    logccdf(z::Float64)::Float64 = begin
-        reflected::Float64 = -z
-        logcdf(reflected)
-    end
+    logcdf(z::Float64)::Float64 =
+        z < -1 ? log(atan(-1 / z) / π) :
+            (z > 1 ? log1p(-atan(1 / z) / π) : log(0.5 + atan(z) / π))
+    logccdf(z::Float64)::Float64 =
+        z > 1 ? log(atan(1 / z) / π) :
+            (z < -1 ? log1p(-atan(-1 / z) / π) : log(0.5 - atan(z) / π))
     quantile(p::Float64)::Float64 = tanpi(p - 0.5)
 end
 
@@ -247,11 +256,8 @@ end
         ifelse(z < 0, 0.5 * exp(z), 1 - 0.5 * exp(-z))
     ccdf(z::Float64)::Float64 =
         z >= 0 ? 0.5 * exp(-z) : 1 - 0.5 * exp(z)
-    logcdf(z::Float64)::Float64 = z < 0 ? z - log(2.0) : log1p(-exp(-z) / 2)
-    logccdf(z::Float64)::Float64 = begin
-        reflected::Float64 = -z
-        logcdf(reflected)
-    end
+    logcdf(z::Float64)::Float64 = z < 0 ? z - log(2) : log1p(-0.5 * exp(-z))
+    logccdf(z::Float64)::Float64 = z > 0 ? -z - log(2) : log1p(-0.5 * exp(z))
     quantile(p::Float64)::Float64 =
         ifelse(p < 0.5, log(2p), -log(2 - 2p))
 end
@@ -313,11 +319,11 @@ end
     end
     logcdf(x::Float64)::Float64 = begin
         z::Float64 = scale == 0 && x == location ? inv(scale) : standardized(x)
-        standard.logcdf(z)
+        x == -Inf ? -Inf : (x == Inf ? 0.0 : standard.logcdf(z))
     end
     logccdf(x::Float64)::Float64 = begin
         z::Float64 = scale == 0 && x == location ? inv(scale) : standardized(x)
-        standard.logccdf(z)
+        x == Inf ? -Inf : (x == -Inf ? 0.0 : standard.logccdf(z))
     end
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard.quantile(p)
@@ -509,8 +515,9 @@ const EXPONENTIAL_KERNEL_SOURCE = raw"""
         x < 0 ? -Inf : -log_scale - x / scale
     cdf(x::Float64)::Float64 = x < 0 ? 0.0 : -expm1(-x / scale)
     ccdf(x::Float64)::Float64 = x < 0 ? 1.0 : exp(-x / scale)
-    logcdf(x::Float64)::Float64 = x <= 0 ? -Inf : log(-expm1(-x / scale))
-    logccdf(x::Float64)::Float64 = x < 0 ? 0.0 : -x / scale
+    logcdf(x::Float64)::Float64 =
+        x <= 0 ? -Inf : (x == Inf ? 0.0 : log(-expm1(-x / scale)))
+    logccdf(x::Float64)::Float64 = x < 0 ? 0.0 : (x == Inf ? -Inf : -x / scale)
     quantile(p::Float64)::Float64 = -scale * log1p(-p)
 end
 """
@@ -922,6 +929,10 @@ const WEIBULL_KERNEL_SOURCE = raw"""
         x > 0 ? -expm1(-((x * inv_theta)^k)) : 0.0
     ccdf(x::Float64)::Float64 =
         x > 0 ? exp(-((x * inv_theta)^k)) : 1.0
+    logcdf(x::Float64)::Float64 =
+        x <= 0 ? -Inf : (x == Inf ? 0.0 : log(-expm1(-((x * inv_theta)^k))))
+    logccdf(x::Float64)::Float64 =
+        x <= 0 ? 0.0 : (x == Inf ? -Inf : -((x * inv_theta)^k))
     quantile(p::Float64)::Float64 = theta * (-log1p(-p))^(1 / k)
 end
 """
