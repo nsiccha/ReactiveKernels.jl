@@ -1079,7 +1079,7 @@ may combine several gathered arrays and scalar operations, for example
 `[scale * sin(z[i]) + z[i]^2 for i in indices]`. The analysis reads lowered
 Julia code without executing the helper, requires unambiguous helper dispatch,
 and proves that captured arrays are read only at the iterator's index.
-The supported iterator is an integer vector or a standard integer range;
+The supported iterator is a `Vector{<:Integer}` or standard integer range;
 custom iteration, filtered or nested comprehensions, cross-row reads and
 unproved helper bodies retain their ordinary whole-value path and locality
 checks. Emission retains a runtime loop and infers its fresh buffer from the
