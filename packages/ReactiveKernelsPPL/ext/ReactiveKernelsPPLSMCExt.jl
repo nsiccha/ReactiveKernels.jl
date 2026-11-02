@@ -54,6 +54,46 @@ struct SMCWindowTarget{Q,B,S,R} <: AbstractSMCTarget
     prior::R
 end
 
+struct PreparedSMCTarget{F,P,B,S} <: AbstractSMCTarget
+    make_problem::F
+    problem::P
+    backend::B
+    signature::S
+end
+
+_dimension(t::AbstractSMCTarget) = t.query.layout.total
+_dimension(t::PreparedSMCTarget) = t.signature.layout.total
+
+function _smc_problem(make_problem, dimension)
+    problem = make_problem()
+    order = LogDensityProblems.capabilities(problem)
+    order isa LogDensityProblems.LogDensityOrder &&
+        !isless(order, LogDensityProblems.LogDensityOrder{1}()) ||
+        throw(ArgumentError("SMC needs a LogDensityProblems target with a supplied gradient"))
+    LogDensityProblems.dimension(problem) == dimension ||
+        throw(DimensionMismatch("prepared density and SMC coordinate dimensions differ"))
+    return problem
+end
+
+function PPL.prepare_smc(make_problem, u0::AbstractVector;
+        backend, model_id::AbstractString, binding_id::AbstractString,
+        frame_id::AbstractString)
+    isempty(model_id) && throw(ArgumentError("model_id must identify the density and approximation configuration"))
+    isempty(binding_id) && throw(ArgumentError("binding_id must identify the exact data"))
+    isempty(frame_id) && throw(ArgumentError("frame_id must identify the ordered unconstrained coordinates"))
+    d = length(u0)
+    problem = _smc_problem(make_problem, d)
+    signature = (; model_id=String(model_id), binding_id=String(binding_id),
+        layout=(; kind=:logdensity, total=d, frame_id=String(frame_id)))
+    return PreparedSMCTarget(make_problem, problem, backend, signature)
+end
+
+# A factory owns reconstruction of opaque solver state. Never deepcopy it or
+# the consumer's problem: shared immutable data may sit beside native resources.
+_execution_target(t::AbstractSMCTarget) = t
+_execution_target(t::PreparedSMCTarget) = PreparedSMCTarget(t.make_problem,
+    _smc_problem(t.make_problem, _dimension(t)), t.backend, t.signature)
+
 # Geometry metadata is structural; neither one entry per data row nor a dense
 # covariance is introduced. The caller's model_id additionally covers external
 # geometry/preprocessing semantics that cannot be inferred from coordinate names.
@@ -69,7 +109,7 @@ _frame(target::AbstractSMCTarget) =
 function PPL.carry_smc(target::AbstractSMCTarget, reference::SMCReference;
         calibration_id::AbstractString)
     isempty(calibration_id) && throw(ArgumentError("calibration_id must identify the carried posterior"))
-    length(reference.location) == target.query.layout.total ||
+    length(reference.location) == _dimension(target) ||
         throw(DimensionMismatch("carried reference and target dimensions differ"))
     return SMCCarriedReference(SMCReference(reference.location, reference.scale),
         deepcopy(_frame(target)), String(calibration_id))
@@ -106,7 +146,7 @@ struct ReferenceTarget{R,K,A,C}
 end
 
 function _reference(target, reference)
-    length(reference.location) == target.query.layout.total ||
+    length(reference.location) == _dimension(target) ||
         throw(DimensionMismatch("reference and target dimensions differ"))
     r = SMCReference(reference.location, reference.scale)
     kernel, arguments = if r.scale isa AbstractVector
@@ -147,6 +187,23 @@ function PPL.prepare_smc_window(built, binding::StructuralPlan, u0::AbstractVect
 end
 
 _density(t::SMCTarget, u) = t.query(u)
+_density(t::PreparedSMCTarget, u) = Float64(LogDensityProblems.logdensity(t.problem, u))
+function _gradient(t::PreparedSMCTarget, g, u)
+    value, gradient = LogDensityProblems.logdensity_and_gradient(t.problem, u)
+    value = Float64(value)
+    if !isfinite(value)
+        # LogDensityProblems leaves the gradient unspecified outside finite
+        # density. The bridge checks the value and preserves -Inf support.
+        fill!(g, 0)
+        return value
+    end
+    gradient isa AbstractVector && length(gradient) == length(g) ||
+        throw(DimensionMismatch("prepared density returned a gradient with the wrong shape"))
+    # The consumer may return a reused workspace. WarmupHMC retains gradients,
+    # so copy into the bridge's owned output before another density call.
+    copyto!(g, gradient)
+    return value
+end
 _density(t::ReferenceTarget, u) = Base.invokelatest(t.kernel, u, t.arguments...)::Float64
 _gradient(t::SMCTarget, g, u) = first(sampler_value_and_gradient!(t.query, g, u))
 _gradient(t::ReferenceTarget, g, u) = first(Base.invokelatest(ad_value_and_gradient!,
@@ -160,8 +217,8 @@ function _gradient(t::SMCWindowTarget, g, u)
     return value
 end
 
-_default_reference(t::SMCTarget) =
-    SMCReference(zeros(t.query.layout.total), ones(t.query.layout.total))
+_default_reference(t::Union{SMCTarget,PreparedSMCTarget}) =
+    SMCReference(zeros(_dimension(t)), ones(_dimension(t)))
 _default_reference(t::SMCWindowTarget) = deepcopy(t.prior.reference)
 
 function _checked(value, u, endpoint, temperature, gradient=nothing)
@@ -309,7 +366,8 @@ function PPL.tune_smc(target::AbstractSMCTarget; rng::Xoshiro, init::AbstractVec
         pilot_steps::Integer=64, pilot::Symbol=:continuous,
         max_reflections::Integer=16, recording_target::Integer=128,
         pilot_evaluations::Integer=1000, options=SMCOptions())
-    d = target.query.layout.total
+    target = _execution_target(target)
+    d = _dimension(target)
     length(init) == d || throw(DimensionMismatch("pilot initial position and target dimensions differ"))
     d > 0 || throw(ArgumentError("tuning needs at least one unconstrained coordinate"))
     all(isfinite, init) || throw(ArgumentError("pilot initial position must be finite"))
@@ -345,7 +403,7 @@ function PPL.tune_smc(target::AbstractSMCTarget; rng::Xoshiro, init::AbstractVec
         previous isa AbstractSMCTarget || throw(ArgumentError("previous must be a prepared target, not a particle cloud"))
         reference === nothing || throw(ArgumentError("posterior update tuning takes no reference"))
         _compatible(previous.signature, target.signature)
-        previous
+        _execution_target(previous)
     end
     options = _options(options, d, source, target)
     if pilot === :adaptive
@@ -422,6 +480,11 @@ end
 PPL.smc_reference(state::SMCState) =
     state.source isa ReferenceTarget ? deepcopy(state.source.reference) : nothing
 
+_parameter_projection(t::AbstractSMCTarget, parameters) =
+    PPL._smc_parameter_projection(t.query.layout, parameters)
+_parameter_projection(::PreparedSMCTarget, parameters) =
+    throw(ArgumentError("named parameter projection requires RKPPL layout metadata"))
+
 function PPL.carry_smc(state::SMCState; calibration_id::AbstractString, scale=nothing,
         parameters=nothing,basis=nothing,max_reflections::Integer=16,
         maxiter::Integer=100,progress=nothing)
@@ -429,7 +492,7 @@ function PPL.carry_smc(state::SMCState; calibration_id::AbstractString, scale=no
     isempty(calibration_id) && throw(ArgumentError("calibration_id must identify this posterior summary"))
     scale===nothing || basis===nothing || throw(ArgumentError("supply a calibrated scale or a basis to refit, not both"))
     projection=parameters===nothing ? nothing :
-        PPL._smc_parameter_projection(state.target.query.layout,parameters)
+        _parameter_projection(state.target,parameters)
     positions=projection===nothing ? state.positions : view(state.positions,projection.indices,:)
     location = positions * state.weights
     diagnostics=nothing
@@ -462,6 +525,7 @@ end
 function PPL.initialize_smc(target::AbstractSMCTarget; rng::Xoshiro, particles::Integer=1000,
         reference=nothing, options=SMCOptions())
     particles >= 2 || throw(ArgumentError("SMC needs at least two particles"))
+    target = _execution_target(target)
     if reference === nothing
         reference = options.tuning === nothing ?
             _default_reference(target) :
@@ -470,7 +534,7 @@ function PPL.initialize_smc(target::AbstractSMCTarget; rng::Xoshiro, particles::
     end
     source = _reference(target, reference)
     r = copy(rng)
-    d, n = target.query.layout.total, Int(particles)
+    d, n = _dimension(target), Int(particles)
     options = _options(options, d, source, target)
     positions = _reference_draws(r, source.reference, d, n)
     return SMCState(source, target, positions, fill(1/n, n), 0.0, 0.0,
@@ -534,6 +598,7 @@ IndexParticle() = IndexParticle(0, 0.0)
 # Fork only execution objects: signatures describe immutable model identity and
 # need not be copied once per worker. Queries and AD preparations own scratch.
 _worker_target(t::SMCTarget) = SMCTarget(deepcopy(t.query), t.backend, t.signature)
+_worker_target(t::PreparedSMCTarget) = _execution_target(t)
 _worker_target(t::SMCWindowTarget) = SMCWindowTarget(deepcopy(t.query), t.backend,
     t.signature, _worker_target(t.prior))
 _worker_target(t::ReferenceTarget) = deepcopy(t)
@@ -714,8 +779,9 @@ function PPL.update_smc(previous::SMCState, target::AbstractSMCTarget;
     previous.temperature == 1 || throw(ArgumentError("complete the previous bridge before updating data"))
     _compatible(previous.target.signature, target.signature)
     d, n = size(previous.positions)
-    state = SMCState(previous.target, target, copy(previous.positions), copy(previous.weights),
-        0.0, previous.log_normalizer, copy(previous.rng), _options(options,d,previous.target,target),
+    source, target = _execution_target(previous.target), _execution_target(target)
+    state = SMCState(source, target, copy(previous.positions), copy(previous.weights),
+        0.0, previous.log_normalizer, copy(previous.rng), _options(options,d,source,target),
         collect(1:n), copy(previous.lineage), copy(previous.history), previous.update+1, 0)
     return smc(state; stages)
 end
@@ -747,8 +813,9 @@ function PPL.resume_smc(target::AbstractSMCTarget, checkpoint; previous=nothing)
     cp.schema_version == 1 || throw(ArgumentError("unsupported SMC checkpoint schema"))
     cp.versions == _versions() || throw(ArgumentError("SMC checkpoint Julia/package versions differ"))
     _same(cp.target, target.signature) || throw(ArgumentError("SMC checkpoint target/model/binding differs"))
+    target = _execution_target(target)
     d, n = size(cp.positions)
-    d == target.query.layout.total && n >= 2 && all(isfinite, cp.positions) ||
+    d == _dimension(target) && n >= 2 && all(isfinite, cp.positions) ||
         throw(ArgumentError("invalid SMC checkpoint particle positions"))
     source = if cp.source.kind === :reference
         previous === nothing || throw(ArgumentError("a reference checkpoint takes no previous posterior"))
@@ -756,7 +823,7 @@ function PPL.resume_smc(target::AbstractSMCTarget, checkpoint; previous=nothing)
     elseif cp.source.kind === :posterior
         previous isa AbstractSMCTarget || throw(ArgumentError("data-update checkpoint needs the previous prepared target"))
         _same(cp.source.signature, previous.signature) || throw(ArgumentError("SMC checkpoint previous binding differs"))
-        previous
+        _execution_target(previous)
     else
         throw(ArgumentError("unknown SMC checkpoint source"))
     end
