@@ -749,6 +749,7 @@ end
 include("test_glm.jl")
 include("test_enzyme_rules.jl")
 include("test_rk_beta_inc.jl")
+include("test_logtails.jl")
 include("test_product_mixture.jl")
 include("test_zero_inflated_product_mixture.jl")
 include("test_hmm.jl")

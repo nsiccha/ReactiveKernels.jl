@@ -4,21 +4,55 @@
 _evidence_at(b, discrete::Bool) = discrete ? :(Base.trunc(Int, floor($b))) : b
 _evidence_below(b, discrete::Bool) = discrete ? :(Base.trunc(Int, ceil($b)) - 1) : b
 
-function _evidence_logmass(cdf, ccdf, lo, hi)
+# Select an owned log-tail endpoint at generation time when the distribution
+# supplies one. Other laws keep their existing CDF calculation; taking its
+# log here cannot repair underflow inside that family's CDF implementation.
+function _evidence_logtail(tail)
+    if tail isa Expr && tail.head === :call && length(tail.args) == 2
+        endpoint = tail.args[1]
+        if endpoint isa Expr && endpoint.head === :. &&
+                endpoint.args[2] in (QuoteNode(:cdf), QuoteNode(:ccdf))
+            dist = endpoint.args[1]
+            if dist isa Expr && dist.head === :call
+                head = dist.args[1]
+                object = head isa GlobalRef ? getfield(head.mod, head.name) :
+                    head isa Symbol && isdefined(PPLGeneratedModels, head) ?
+                        getfield(PPLGeneratedModels, head) : nothing
+                method = endpoint.args[2] == QuoteNode(:cdf) ? :logcdf : :logccdf
+                if applicable(ReactiveKernels.kernel_endpoint_names, object) &&
+                        method in ReactiveKernels.kernel_endpoint_names(object)
+                    return Expr(:call, Expr(:., dist, QuoteNode(method)), tail.args[2])
+                end
+            end
+        end
+    end
+    return :(log($tail))
+end
+
+function _evidence_logdifference(a, b)
+    # Equality includes two empty tails (-Inf). Avoid -Inf - -Inf before
+    # log1mexp; a zero interval mass has log mass -Inf.
+    return :($a == $b ? -Inf : $a + $(GlobalRef(LogExpFunctions, :log1mexp))($b - $a))
+end
+
+function _evidence_logmass(logcdf, logccdf, lo, hi)
     lo === nothing && hi === nothing && return :(0.0)
-    lo === nothing && return :(log($(cdf(hi))))
-    hi === nothing && return :(log($(ccdf(lo))))
-    # Both tails are defined; the inactive log remains inactive, including AD.
-    return :($(cdf(lo)) > 0.5 ?
-        log($(ccdf(lo)) - $(ccdf(hi))) : log($(cdf(hi)) - $(cdf(lo))))
+    lo === nothing && return logcdf(hi)
+    hi === nothing && return logccdf(lo)
+    # Subtract on the smaller tail, entirely in log space. The selected
+    # branch is lazy, including its derivative work.
+    return :($(logcdf(lo)) > -log(2) ?
+        $(_evidence_logdifference(logccdf(lo), logccdf(hi))) :
+        $(_evidence_logdifference(logcdf(hi), logcdf(lo))))
 end
 
 _evidence_cell(::Val{:none}, base, y, lo, hi, cdf, ccdf, discrete) = base
 
-function _evidence_cell(::Val{:truncated}, base, y, lo, hi, cdf, ccdf, discrete)
+function _evidence_cell(::Val{:truncated}, base, y, lo, hi, cdf, ccdf, discrete;
+        logcdf=b -> _evidence_logtail(cdf(b)), logccdf=b -> _evidence_logtail(ccdf(b)))
     below = lo === nothing ? nothing : _evidence_below(lo, discrete)
     at = hi === nothing ? nothing : _evidence_at(hi, discrete)
-    result = :($base - $(_evidence_logmass(cdf, ccdf, below, at)))
+    result = :($base - $(_evidence_logmass(logcdf, logccdf, below, at)))
     hi === nothing || (result = :($y > $hi ? -Inf : $result))
     lo === nothing || (result = :($y < $lo ? -Inf : $result))
     if lo !== nothing && hi !== nothing
@@ -27,12 +61,13 @@ function _evidence_cell(::Val{:truncated}, base, y, lo, hi, cdf, ccdf, discrete)
     return result
 end
 
-function _evidence_cell(::Val{:censored}, base, y, lo, hi, cdf, ccdf, discrete)
+function _evidence_cell(::Val{:censored}, base, y, lo, hi, cdf, ccdf, discrete;
+        logcdf=b -> _evidence_logtail(cdf(b)), logccdf=b -> _evidence_logtail(ccdf(b)))
     result = base
     hi === nothing || (result = :($y >= $hi ?
-        log($(ccdf(_evidence_below(hi, discrete)))) : $result))
+        $(logccdf(_evidence_below(hi, discrete))) : $result))
     lo === nothing || (result = :($y <= $lo ?
-        log($(cdf(_evidence_at(lo, discrete)))) : $result))
+        $(logcdf(_evidence_at(lo, discrete))) : $result))
     if lo !== nothing && hi !== nothing
         result = :($lo == $hi ? 0.0 : $result)
         result = :($lo <= $hi ? $result : -Inf)
@@ -42,8 +77,9 @@ function _evidence_cell(::Val{:censored}, base, y, lo, hi, cdf, ccdf, discrete)
     return result
 end
 
-function _evidence_cell(::Val{:interval_censored}, base, y, lo, hi, cdf, ccdf, discrete)
-    mass = _evidence_logmass(cdf, ccdf,
+function _evidence_cell(::Val{:interval_censored}, base, y, lo, hi, cdf, ccdf, discrete;
+        logcdf=b -> _evidence_logtail(cdf(b)), logccdf=b -> _evidence_logtail(ccdf(b)))
+    mass = _evidence_logmass(logcdf, logccdf,
         _evidence_at(y, discrete), _evidence_at(hi, discrete))
     return :($y < $hi ? $mass : -Inf)
 end
@@ -82,13 +118,14 @@ function _evidence_integer_observation(ex, y)
     return Expr(ex.head, (_evidence_integer_observation(a, y) for a in ex.args)...)
 end
 
-function _wrap_evidence!(r, plan, pre, inputs, base; cdf = nothing, ccdf = nothing)
+function _wrap_evidence!(r, plan, pre, inputs, base;
+        cdf=nothing, ccdf=nothing, logcdf=nothing, logccdf=nothing)
     r.evidence.kind === :none && return base
     # Parameter support remains outside the evidence computation. Its inactive
     # density, normalizer, tails and derivative work must stay unevaluated.
     if _evidence_density_guard(base) &&
             !(_dovar(1) in _expr_value_symbols(base.args[1]))
-        guarded = _wrap_evidence!(r, plan, pre, inputs, base.args[2]; cdf, ccdf)
+        guarded = _wrap_evidence!(r, plan, pre, inputs, base.args[2]; cdf, ccdf, logcdf, logccdf)
         return Expr(:if, base.args[1], guarded, base.args[3])
     end
     family = r.family === MixtureFam ? r.mixture_family :
@@ -105,6 +142,8 @@ function _wrap_evidence!(r, plan, pre, inputs, base; cdf = nothing, ccdf = nothi
             ccdf = b -> :($b < 0 ? 1.0 : ($b >= 1 ? 0.0 : $dist.cdf(true) - $dist.cdf(false)))
         end
     end
+    logcdf === nothing && (logcdf = b -> _evidence_logtail(cdf(b)))
+    logccdf === nothing && (logccdf = b -> _evidence_logtail(ccdf(b)))
     y = _dovar(1)
     if _is_bernoulli_family(family)
         # The logpdf's folded Bool input is independent of the real clamp
@@ -128,5 +167,5 @@ function _wrap_evidence!(r, plan, pre, inputs, base; cdf = nothing, ccdf = nothi
         _thread_ref!(inputs, b)
     end
     return _evidence_cell(Val(r.evidence.kind), base, y, bounds...,
-        cdf, ccdf, discrete)
+        cdf, ccdf, discrete; logcdf, logccdf)
 end
