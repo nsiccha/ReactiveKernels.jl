@@ -312,13 +312,23 @@ y .~ MyNormal.(a)
 y .~ LogDensity.(normal_lpdf, a)
 ```
 
-With `Distributions` loaded, any `Distributions.Distribution` object uses its
-ordinary `Distributions.logpdf` method automatically, including custom types.
-Its support behavior comes from that method. Distributions 0.25.132 evaluates
+With `Distributions` loaded, authored `DirichletMultinomial(n, alpha)` calls
+resolve by constructor identity and compose the RK density graph, including
+qualified and aliased constructors. Shared concentration terms and count-only
+normalizers are visible to RK. Invalid counts or totals return `-Inf`, and
+incompatible vector lengths throw `DimensionMismatch`. This authored route
+does not need the Distributions support-fix pin.
+
+Other `Distributions.Distribution` objects use their ordinary public
+`Distributions.logpdf` method, including caller-owned types and stored
+distribution values. For custom laws whose arithmetic must participate in
+hoisting, use a module-visible `@kernel` with `LogDensity` as above. The numerical
+adapter preserves the support behavior of the supplied method.
+Distributions 0.25.132 evaluates
 `DirichletMultinomial` outside its support: for example, counts `[2, 3, 1]`
 have a finite density even when the declared total is 5. Use the corrected
 [Distributions revision](https://github.com/nsiccha/Distributions.jl/commit/83cec5e3a8a35167d54f19da9dc5afb54f59273e)
-when using this adapter with that law:
+when passing an already-constructed DirichletMultinomial through that adapter:
 
 ```julia
 using Pkg

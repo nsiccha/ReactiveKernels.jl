@@ -201,8 +201,21 @@ export ZERO_INFLATED_BINOMIAL_SOURCE
 export NEGATIVE_BINOMIAL_SOURCE
 export WEIBULL_SOURCE
 
+include("lognormal_moments.jl")
+
+# Constructor parameter validation for structural Distributions adapters. The
+# numerical law itself remains in the objects below; this scalar operation is
+# shared with the parameter it checks and never constructs a Distribution.
+function _checked_distribution_parameter(value::Real, nonnegative::Bool)
+    valid = nonnegative ? value >= 0 : value > 0
+    valid || throw(DomainError(value, nonnegative ?
+        "distribution parameter must be nonnegative" : "distribution parameter must be positive"))
+    Float64(value)
+end
+
 const LOCATION_SCALE_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, rk_beta_inc, rk_student_tail
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: _normal_logccdf
 using SpecialFunctions: erfc, erfcinv, beta_inc_inv
 using LogExpFunctions: log1pexp
 
@@ -210,6 +223,8 @@ using LogExpFunctions: log1pexp
     logpdf(z::Float64)::Float64 = -0.5 * log(2π) - 0.5 * z^2
     cdf(z::Float64)::Float64 = 0.5 * erfc(-z / sqrt(2))
     ccdf(z::Float64)::Float64 = 0.5 * erfc(z / sqrt(2))
+    logcdf(z::Float64)::Float64 = _normal_logccdf(-z)
+    logccdf(z::Float64)::Float64 = _normal_logccdf(z)
     quantile(p::Float64)::Float64 = -sqrt(2) * erfcinv(2p)
 end
 
@@ -217,6 +232,9 @@ end
     logpdf(z::Float64)::Float64 = -log(π) - log1p(z^2)
     cdf(z::Float64)::Float64 = 0.5 + atan(z) / π
     ccdf(z::Float64)::Float64 = 0.5 - atan(z) / π
+    logcdf(z::Float64)::Float64 = z < 0 ? log(atan(-inv(z)) / pi) :
+        log1p(-atan(inv(z)) / pi)
+    logccdf(z::Float64)::Float64 = logcdf(-z)
     quantile(p::Float64)::Float64 = tanpi(p - 0.5)
 end
 
@@ -226,6 +244,8 @@ end
         ifelse(z < 0, 0.5 * exp(z), 1 - 0.5 * exp(-z))
     ccdf(z::Float64)::Float64 =
         z >= 0 ? 0.5 * exp(-z) : 1 - 0.5 * exp(z)
+    logcdf(z::Float64)::Float64 = z < 0 ? z - log(2.0) : log1p(-exp(-z) / 2)
+    logccdf(z::Float64)::Float64 = logcdf(-z)
     quantile(p::Float64)::Float64 =
         ifelse(p < 0.5, log(2p), -log(2 - 2p))
 end
@@ -242,6 +262,8 @@ end
         ((nu + 1) / 2) * log1p(z^2 / nu)
     cdf(z::Float64)::Float64 = rk_student_tail(nu, z, false)
     ccdf(z::Float64)::Float64 = rk_student_tail(nu, z, true)
+    logcdf(z::Float64)::Float64 = log(cdf(z))
+    logccdf(z::Float64)::Float64 = log(ccdf(z))
     quantile(p::Float64)::Float64 = begin
         lower::Bool = p < 0.5
         tail::Float64 = ifelse(lower, p, 1 - p)
@@ -259,6 +281,8 @@ end
     logpdf(z::Float64)::Float64 = -z - 2 * log1pexp(-z)
     cdf(z::Float64)::Float64 = 1 / (1 + exp(-z))
     ccdf(z::Float64)::Float64 = 1 / (1 + exp(z))
+    logcdf(z::Float64)::Float64 = -log1pexp(-z)
+    logccdf(z::Float64)::Float64 = -log1pexp(z)
     quantile(p::Float64)::Float64 = log(p) - log1p(-p)
 end
 
@@ -280,6 +304,8 @@ end
         z::Float64 = standardized(x)
         standard.ccdf(z)
     end
+    logcdf(x::Float64)::Float64 = standard.logcdf(standardized(x))
+    logccdf(x::Float64)::Float64 = standard.logccdf(standardized(x))
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard.quantile(p)
         inv(standardized, z)
@@ -314,6 +340,8 @@ end
         z::Float64 = standardized(x)
         standard_student_t(nu).ccdf(z)
     end
+    logcdf(x::Float64)::Float64 = standard_student_t(nu).logcdf(standardized(x))
+    logccdf(x::Float64)::Float64 = standard_student_t(nu).logccdf(standardized(x))
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard_student_t(nu).quantile(p)
         inv(standardized, z)
@@ -417,6 +445,7 @@ end
 """
 
 const LOGNORMAL_KERNEL_SOURCE = raw"""
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: _normal_logccdf
 @kernel lognormal(location::Float64, scale::Float64) = begin
     log_scale::Float64 = log(scale)
 
@@ -432,6 +461,10 @@ const LOGNORMAL_KERNEL_SOURCE = raw"""
         x > 0 ? standard_normal.cdf((log(x) - location) / scale) : 0.0
     ccdf(x::Float64)::Float64 =
         x > 0 ? standard_normal.ccdf((log(x) - location) / scale) : 1.0
+    logcdf(x::Float64)::Float64 =
+        x <= 0 ? -Inf : _normal_logccdf((location - log(x)) / scale)
+    logccdf(x::Float64)::Float64 =
+        x <= 0 ? 0.0 : _normal_logccdf((log(x) - location) / scale)
     quantile(p::Float64)::Float64 = begin
         z::Float64 = standard_normal.quantile(p)
         inv(standardized_log, z)
@@ -447,6 +480,8 @@ const EXPONENTIAL_KERNEL_SOURCE = raw"""
         ifelse(x >= 0, -log_scale - x / scale, -Inf)
     cdf(x::Float64)::Float64 = ifelse(x >= 0, -expm1(-x / scale), 0.0)
     ccdf(x::Float64)::Float64 = x >= 0 ? exp(-x / scale) : 1.0
+    logcdf(x::Float64)::Float64 = x <= 0 ? -Inf : log(-expm1(-x / scale))
+    logccdf(x::Float64)::Float64 = x < 0 ? 0.0 : -x / scale
     quantile(p::Float64)::Float64 = -scale * log1p(-p)
 end
 """
@@ -646,6 +681,8 @@ using SpecialFunctions: gamma_inc, gamma_inc_inv
         x > 0 ? first(gamma_inc(shape, rate * x)) : 0.0
     ccdf(x::Float64)::Float64 =
         x > 0 ? last(gamma_inc(shape, rate * x)) : 1.0
+    logcdf(x::Float64)::Float64 = log(cdf(x))
+    logccdf(x::Float64)::Float64 = log(ccdf(x))
     quantile(p::Float64)::Float64 = gamma_inc_inv(shape, p, 1 - p) / rate
 end
 """
@@ -1227,6 +1264,8 @@ const negative_binomial = _OTHER_DISTRIBUTION_BINDINGS[20]
 const weibull = _OTHER_DISTRIBUTION_BINDINGS[21]
 const zero_inflated_binomial = _OTHER_DISTRIBUTION_BINDINGS[22]
 const zero_inflated_binomial_logit_zi = _OTHER_DISTRIBUTION_BINDINGS[23]
+
+include("dirichlet_multinomial.jl")
 
 # One component is chosen for the entire observed vector. Columns of the
 # parameter matrices are component laws; rows are positions within the one

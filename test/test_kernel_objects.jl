@@ -142,6 +142,11 @@ end
     endpoint(xs::Vector{Int})::Vector{Int} = Base.push!(xs, 1)
 end
 
+@kernel logical_negation() = begin
+    bare(x::Float64)::Float64 = !(x > 0) ? 2.0 : x
+    qualified(x::Float64)::Float64 = Base.:!(x > 0) ? 2.0 : x
+end
+
 end
 
 @testset "transparent pure kernel objects and residual endpoints" begin
@@ -164,6 +169,10 @@ end
     @test prepare(P.bare_external.endpoint)(2.0) == 4.25
     @test prepare(P.qualified_external.endpoint)(2.0) == 4.25
     @test isempty(ReactiveKernels.kernel_endpoint_names(P.qualified_effect))
+    @test ReactiveKernels.kernel_endpoint_names(P.logical_negation) == (:bare, :qualified)
+    @test prepare(P.logical_negation.bare)(NaN) == 2.0
+    @test prepare(P.logical_negation.qualified)(-1.0) == 2.0
+    @test prepare(P.logical_negation.bare)(3.0) == 3.0
 
     @testset "dotted calls depend on same-body endpoint temporaries" begin
         X = [1.0 2.0; 1.0 3.0]

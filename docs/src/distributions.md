@@ -91,6 +91,41 @@ dimensions zip or expand, and incompatible shapes fail before endpoint
 execution. A whole array that every scalar body invocation reads is not a plate
 argument: the cell closes over it.
 
+## LogNormal moments and log tails
+
+`DistributionKernelSources.lognormal(location, scale)` provides `logcdf(x)`
+and `logccdf(x)` endpoints. They evaluate the logarithm of the tail directly,
+including where the corresponding probability underflows.
+
+`lower_truncated_lognormal(location, scale, lower)` and
+`upper_truncated_lognormal(location, scale, upper)` provide zero-argument
+`mean()` and `var()` endpoints:
+
+```julia
+@kernel bounded_moment(location::Float64, scale::Float64, lower::Float64) = begin
+    return lower_truncated_lognormal(location, scale, lower).var()
+end
+moments = prepare(extract(lower_truncated_lognormal;
+    have=(:location, :scale, :lower), want=(:mean, :var)))
+```
+
+These graphs use scaled complementary error functions and a second difference
+of the log Mills ratio. Close differences use quadrature; its normal tail
+variance uses a continued-fraction scan in the positive tail. The scan length
+depends on the parameter value and remains a runtime loop. The variance avoids
+subtracting two nearly equal raw moments. All arithmetic participates in RK
+composition, binding and plate planning.
+
+## DirichletMultinomial events
+
+`dirichlet_multinomial(n, alpha).logpdf(counts)` evaluates one count-vector
+event. Nonnegative integer counts must sum to `n`; invalid counts or totals
+return `-Inf`, and incompatible vector lengths throw `DimensionMismatch`.
+The concentration and count log-gamma terms are separate graph nodes, so
+shared concentrations and bound observations are visible to the planner.
+`dirichlet_multinomial_logdensity` is the extracted endpoint with positional
+arguments `(counts, n, alpha)`.
+
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
     @__MODULE__, Main.DistributionExamples.VECTORIZED_SOURCE,

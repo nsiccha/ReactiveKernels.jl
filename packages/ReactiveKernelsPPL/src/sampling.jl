@@ -12,6 +12,22 @@ function sampling_logdensity(rhs, value)
 end
 
 """
+    sampling_distribution_graph(constructor, arguments::Tuple)
+
+Return a Julia expression constructing an owned RK distribution object, or
+`nothing` when this constructor/arity has no graph mapping. `constructor` is
+the resolved Julia binding; `arguments` contains authored expressions, not
+evaluated parameter values. The result can be composed with `.logpdf(value)`
+or with the object's CDF/log-tail endpoints. This structural hook does not
+choose parameter geometry or evaluate a statistical constructor.
+
+The Distributions extension supplies mappings for the supported base families.
+Caller-owned types may extend this hook with their own module-visible graphs;
+ordinary numerical RHS values retain [`sampling_logdensity`](@ref).
+"""
+sampling_distribution_graph(constructor, arguments::Tuple) = nothing
+
+"""
     LogDensity(f, args...)
 
 Convenience sampling RHS whose density is `f(value, args...)`. Observed use
@@ -487,8 +503,14 @@ end
 
 function _external_graph_density(args)
     constructor = _external_constructor(args)
-    constructor isa GlobalRef && getglobal(constructor.mod, constructor.name) === LogDensity ||
-        return nothing
+    constructor isa GlobalRef || return nothing
+    binding = getglobal(constructor.mod, constructor.name)
+    if binding !== LogDensity
+        isempty(_external_keywords(args)) || return nothing
+        object = sampling_distribution_graph(binding, Tuple(_external_arguments(args)))
+        return object === nothing ? nothing :
+            (endpoint=nothing, constructor=binding, first_argument=1)
+    end
     positional = _external_arguments(args)
     isempty(positional) && return nothing
     endpoint = first(positional)
@@ -502,12 +524,12 @@ function _external_graph_density(args)
     end
     endpoint isa GlobalRef && getglobal(endpoint.mod, endpoint.name) isa KernelSpec ||
         return nothing
-    return endpoint
+    return (endpoint=endpoint, constructor=nothing, first_argument=2)
 end
 
 # Direct nested-kernel calls consume graph ports. Preserve literal and computed
 # arguments as visible assignments before that call, including inside a plate.
-function _external_graph_density_call(endpoint, arguments, keywords)
+function _external_graph_density_call(graph_density, arguments, keywords)
     statements = Expr[]
     ports = Any[]
     for argument in arguments
@@ -519,7 +541,13 @@ function _external_graph_density_call(endpoint, arguments, keywords)
             push!(ports, port)
         end
     end
-    push!(statements, _external_endpoint_call(endpoint, ports, keywords))
+    call = if graph_density.constructor === nothing
+        _external_endpoint_call(graph_density.endpoint, ports, keywords)
+    else
+        object = sampling_distribution_graph(graph_density.constructor, Tuple(ports[2:end]))
+        Expr(:call, Expr(:., object, QuoteNode(:logpdf)), first(ports))
+    end
+    push!(statements, call)
     return statements
 end
 
@@ -530,7 +558,7 @@ function _external_density_statements(p; observation = p.name)
     if !p.args.broadcast
         if graph_density !== nothing
             statements = _external_graph_density_call(graph_density,
-                Any[p.name, _external_arguments(p.args)[2:end]...],
+                Any[p.name, _external_arguments(p.args)[graph_density.first_argument:end]...],
                 _external_keywords(p.args))
             statements[end] = :($node::Float64 = $(statements[end]))
             return statements
@@ -553,7 +581,8 @@ function _external_density_statements(p; observation = p.name)
     end
     keywords = _external_cell_keywords!(inputs, p.args)
     if graph_density !== nothing
-        cell = _external_graph_density_call(graph_density, Any[_dovar(1), args[2:end]...], keywords)
+        cell = _external_graph_density_call(graph_density,
+            Any[_dovar(1), args[graph_density.first_argument:end]...], keywords)
         return _plate_sum_stmts(Symbol(:_ppl_pw_prior_, p.name), node, inputs, cell)
     end
     rhs = if _external_call(p.args)
