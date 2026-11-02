@@ -93,10 +93,62 @@ mutable struct FilterCompiler
     authored_names::Dict{Symbol,Symbol}
     series::Set{Symbol}
     rows::Set{Symbol}
+    group_series::Set{Tuple{Symbol,Symbol}}
+    events::Set{Symbol}
+    types::Dict{Symbol,Any}
 end
 
-_bare_series(c,ex::Symbol) = ex in c.series
-_bare_series(c,ex) = ex isa Expr && ex.head !== :ref && any(a -> _bare_series(c,a),ex.args)
+_bare_series(c,ex::Symbol;group=nothing) = ex in c.series
+function _bare_series(c,ex;group=nothing)
+    ex isa Expr || return false
+    if Meta.isexpr(ex,:ref)
+        return group !== nothing && length(ex.args)==2 && ex.args[2]==group &&
+            (ex.args[1] in c.inputs || (ex.args[1],group) in c.group_series)
+    end
+    return any(a -> _bare_series(c,a;group),ex.args)
+end
+_temporal(c,ex;group=nothing) = _bare_series(c,ex;group) ||
+    ex isa Expr && any(a -> _temporal(c,a;group),ex.args)
+
+_provider(c,head) = head isa GlobalRef ? getglobal(head.mod,head.name) :
+    head isa Symbol && isdefined(c.mod,head) ? getglobal(c.mod,head) : nothing
+
+# Types select the recorded method without executing it. Unbound temporal
+# ports use this filter's existing scalar-Float64 streaming contract.
+function _source_type(c,ex;group=nothing)
+    ex isa Symbol && return get(c.types,ex,ex in c.series ? Vector{Float64} : Any)
+    ex isa GlobalRef && return typeof(getglobal(ex.mod,ex.name))
+    ex isa QuoteNode && return typeof(ex.value)
+    ex isa Expr || return typeof(ex)
+    if Meta.isexpr(ex,:ref)
+        group !== nothing && length(ex.args)==2 && ex.args[2]==group && ex.args[1] in c.inputs &&
+            return Vector{Float64}
+        T = _source_type(c,ex.args[1];group)
+        indices = [_source_type(c,i;group) for i in ex.args[2:end]]
+        return T <: AbstractArray ? Core.Compiler.return_type(getindex,Tuple{T,indices...}) : Any
+    end
+    dotted = Meta.isexpr(ex,:.,2) && Meta.isexpr(ex.args[2],:tuple)
+    dotop = Meta.isexpr(ex,:call) && ex.args[1] isa Symbol && startswith(String(ex.args[1]),".")
+    if dotted || Meta.isexpr(ex,:call)
+        f = _provider(c,dotop ? Symbol(String(ex.args[1])[2:end]) : ex.args[1])
+        f === nothing && return Any
+        args = dotted ? ex.args[2].args : ex.args[2:end]
+        types = [_source_type(c,a;group) for a in args]
+        return dotted || dotop ? Core.Compiler.return_type(broadcast,Tuple{typeof(f),types...}) :
+            Core.Compiler.return_type(f,Tuple{types...})
+    end
+    return Any
+end
+
+function _carry_storage(c,prefix,name,initial,group)
+    key = Symbol(group === nothing ? "" : string(group)*".",prefix,".",name)
+    lanes = group === nothing ? 1 : length(getproperty(c.groups,group))
+    push!(c.shapes,key=>(1,lanes))
+    lane = something(group,1)
+    old = _ref(_field(:_filter_carry,key),1,lane)
+    dest = _ref(_field(:_filter_next,key),1,lane)
+    return (:(_filter_time == 1 ? $initial : $old),value -> Expr(:(=),dest,value))
+end
 
 function _group_local(ex, g)
     g === nothing && return ex
@@ -143,9 +195,8 @@ function _value(c, ex; time=nothing, seed=false, group=nothing, scalarize=false)
     ex isa Expr || return ex
     if Meta.isexpr(ex,:call)
         head = ex.args[1]
-        provider = head isa GlobalRef ? getglobal(head.mod,head.name) :
-            head isa Symbol && isdefined(c.mod,head) ? getglobal(c.mod,head) : nothing
-        if provider isa RK.KernelSpec
+        provider = _provider(c,head)
+        if scalarize && provider isa RK.KernelSpec
             c.provider_count += 1
             prefix = Symbol("kernel",c.provider_count)
             args = [_value(c,a;time,seed,group,scalarize) for a in ex.args[2:end]]
@@ -163,10 +214,22 @@ function _value(c, ex; time=nothing, seed=false, group=nothing, scalarize=false)
                 (:(_filter_time == 1 ? $initial : $old),value -> Expr(:(=),dest,value))
             end
             return RK._stream_point_expression(provider,args,
-                [_bare_series(c,a) for a in ex.args[2:end]],operation!,carry!)
+                [_bare_series(c,a;group) for a in ex.args[2:end]],operation!,carry!)
         end
-        if scalarize && _bare_series(c,ex)
-            projected = RK._stream_design_expression(ex,a -> _bare_series(c,a),
+        if scalarize && provider isa Function && any(a -> _bare_series(c,a;group),ex.args[2:end])
+            types = [_source_type(c,a;group) for a in ex.args[2:end]]
+            source = Base.invokelatest(RK._traceable_source,typeof(provider),types...)
+            if source !== nothing
+                c.provider_count += 1
+                prefix = Symbol("helper",c.provider_count)
+                args = [_value(c,a;time,seed,group,scalarize) for a in ex.args[2:end]]
+                return RK._stream_helper_expression(source,args,
+                    [_bare_series(c,a;group) for a in ex.args[2:end]],
+                    (name,initial) -> _carry_storage(c,prefix,name,initial,group),:_filter_time)
+            end
+        end
+        if scalarize && _bare_series(c,ex;group)
+            projected = RK._stream_design_expression(ex,a -> _bare_series(c,a;group),
                 a -> RK._stream_is_row(a,c.rows),
                 a -> _value(c,a;time,seed,group,scalarize))
             projected === nothing || return projected
@@ -199,14 +262,18 @@ function _value(c, ex; time=nothing, seed=false, group=nothing, scalarize=false)
     if Meta.isexpr(ex, :ref, 2) && ex.args[1] in (c.inputs..., c.observations...) && ex.args[2] == time
         return ex.args[1]
     end
-    # Broadcast laws/pointwise arithmetic become one observation's scalar work.
-    if scalarize && Meta.isexpr(ex, :., 2) && Meta.isexpr(ex.args[2], :tuple)
-        return _call(_value(c, ex.args[1]; time, seed, group, scalarize),
-            (_value(c, a; time, seed, group, scalarize) for a in ex.args[2].args)...)
+    if scalarize && Meta.isexpr(ex,:ref,2) && ex.args[1] isa Symbol &&
+            ex.args[1] in c.series && ex.args[1] ∉ (c.inputs...,c.observations...) &&
+            !haskey(c.states,ex.args[1])
+        index = _value(c,ex.args[2];time,seed,group,scalarize)
+        return Expr(:block,_call(GlobalRef(RK,:_stream_current_index),index,:_filter_time),ex.args[1])
     end
-    if scalarize && Meta.isexpr(ex, :call) && ex.args[1] isa Symbol && startswith(String(ex.args[1]), ".")
-        return _call(Symbol(String(ex.args[1])[2:end]),
-            (_value(c, a; time, seed, group, scalarize) for a in ex.args[2:end])...)
+    # Group input bindings already select this group. Preserve event axes in
+    # the selected value, including ordinary Julia broadcast semantics: a dot
+    # also works on scalars, but removing it breaks scalar/vector arithmetic.
+    if group !== nothing && Meta.isexpr(ex, :ref, 2) &&
+            ex.args[1] in c.inputs && ex.args[2] == group
+        return ex.args[1]
     end
     return Expr(ex.head, (_value(c, a; time, seed, group, scalarize) for a in ex.args)...)
 end
@@ -216,21 +283,38 @@ _half(::Val{:normal}, sigma) = D.truncated(D.Normal(0, sigma); lower=0)
 _half(::Val{:cauchy}, sigma) = D.truncated(D.Cauchy(0, sigma); lower=0)
 
 function _law(c, rhs; kwargs...)
-    rhs = _value(c, rhs; scalarize=true, kwargs...)
-    Meta.isexpr(rhs, :call) || _fail("expected a distribution law, got $rhs")
+    dotted = Meta.isexpr(rhs, :., 2) && Meta.isexpr(rhs.args[2], :tuple)
+    (dotted || Meta.isexpr(rhs, :call)) || _fail("expected a distribution law, got $rhs")
     head = rhs.args[1]
+    rawargs = dotted ? rhs.args[2].args : rhs.args[2:end]
+    nested = head in (:truncated, :censored)
+    args = Any[nested && i == 1 ? _law(c,a;kwargs...) :
+        _value(c, a; scalarize=!_event_law(c,rhs), kwargs...)
+        for (i,a) in enumerate(rawargs)]
+    # KernelSpec is a callable graph, but is not a Julia broadcast scalar.
+    # The PPL LogDensity protocol treats this argument as the density callable.
+    if dotted && _provider(c,head) === PPL.LogDensity &&
+            !isempty(rawargs) && _provider(c,first(rawargs)) isa RK.KernelSpec
+        args[1] = _call(GlobalRef(Base,:Ref),args[1])
+    end
     head === :Flat && _fail("an improper Flat law cannot generate a filtering transition")
     head === :restricted && _fail("restricted transitions are not normalized; use truncated for a transition law")
-    head === :StudentT && return _call(_global(:_student), rhs.args[2:end]...)
-    head in (:HalfNormal, :HalfCauchy) && return _call(_global(:_half),
-        QuoteNode(Val(head === :HalfNormal ? :normal : :cauchy)), rhs.args[2:end]...)
-    if head in (:truncated, :censored)
-        return _call(GlobalRef(D, head), _law(c, rhs.args[2]; kwargs...), rhs.args[3:end]...)
+    if head === :StudentT
+        head = _global(:_student)
+    elseif head in (:HalfNormal, :HalfCauchy)
+        pushfirst!(args, QuoteNode(Val(head === :HalfNormal ? :normal : :cauchy)))
+        head = _global(:_half)
     end
     if head isa Symbol && isdefined(D, head)
-        return _call(GlobalRef(D, head), rhs.args[2:end]...)
+        head = GlobalRef(D, head)
     end
-    return rhs # caller-owned normalized laws use the ordinary public protocol
+    return dotted ? Expr(:., head, Expr(:tuple, args...)) : _call(head, args...)
+end
+
+_score(law, observation) = PPL.sampling_logdensity(law, observation)
+function _score(laws::AbstractArray, observation::AbstractArray)
+    axes(laws) == axes(observation) || _fail("broadcast observation and law axes differ")
+    return sum(map(PPL.sampling_logdensity, laws, observation))
 end
 
 function _site(c, lhs, rhs, sampled; group=nothing, time=nothing, seed=false)
@@ -245,7 +329,7 @@ function _site(c, lhs, rhs, sampled; group=nothing, time=nothing, seed=false)
             absent = haskey(c.states,nm) ? _call(GlobalRef(Random,:rand),:_filter_rng,law) : nothing
             return quote
                 if hasproperty(_filter_observation,$(QuoteNode(nm))) && !ismissing($obs)
-                    _filter_score += $(GlobalRef(PPL,:sampling_logdensity))($law,$obs)
+                    _filter_score += $(_global(:_score))($law,$obs)
                     $lhs = $obs
                 else
                     $lhs = $absent
@@ -318,10 +402,20 @@ function _scan!(c, ex, group)
     end
 end
 
-function _compile_block!(c, block; group=nothing)
+_definition_name(st) = _declaration_name(st.args[1])
+
+function _event_law(c,rhs)
+    Meta.isexpr(rhs,:call) || return false
+    f = _provider(c,rhs.args[1])
+    return f === PPL.LogDensity || f isa Type && f <: D.MultivariateDistribution ||
+        rhs.args[1] in (:MvNormal,:MvNormalCanon,:MvTDist,:Dirichlet,:Multinomial)
+end
+
+function _compile_block!(c, block; group=nothing, required=Set{Symbol}())
     stmts = _stmts(block)
-    assignments = [st for st in stmts if Meta.isexpr(st,:(=),2) && st.args[1] isa Symbol]
-    needed = Set{Symbol}()
+    assignments = [st for st in stmts if Meta.isexpr(st,:(=),2) &&
+        (st.args[1] isa Symbol || group !== nothing && Meta.isexpr(st.args[1],:ref,2) && st.args[1].args[2]==group)]
+    needed = copy(required)
     for st in stmts
         st in assignments && continue
         if Meta.isexpr(st,:call,3) && st.args[1] in (:~,Symbol(".~"))
@@ -334,12 +428,27 @@ function _compile_block!(c, block; group=nothing)
     while changed
         old = length(needed)
         for st in assignments
-            st.args[1] in needed && !haskey(c.data,st.args[1]) &&
+            _definition_name(st) in needed && !haskey(c.data,_definition_name(st)) &&
                 union!(needed,PPL._expr_value_symbols(st.args[2]))
         end
         changed = old != length(needed)
     end
-    filter!(st -> st ∉ assignments || st.args[1] in needed,stmts)
+    filter!(st -> st ∉ assignments || _definition_name(st) in needed,stmts)
+    filter!(st -> st in stmts,assignments)
+    for st in stmts
+        if Meta.isexpr(st,:call,3) && st.args[1] === :~ &&
+                _declaration_name(st.args[2]) in c.observations && _event_law(c,st.args[3])
+            union!(c.events,PPL._expr_value_symbols(st.args[3]))
+        end
+    end
+    changed = true
+    while changed
+        old = length(c.events)
+        for st in assignments
+            _definition_name(st) in c.events && union!(c.events,PPL._expr_value_symbols(st.args[2]))
+        end
+        changed = length(c.events) != old
+    end
     # Batch horizon definitions (e.g. T=length(y[g])) are not stream inputs.
     horizons = Set{Symbol}()
     for st in stmts
@@ -360,9 +469,14 @@ function _compile_block!(c, block; group=nothing)
     while changed
         changed = false
         for st in stmts
-            if Meta.isexpr(st,:(=),2) && st.args[1] isa Symbol && !haskey(c.data,st.args[1]) &&
-                    st.args[1] ∉ c.series && _bare_series(c,st.args[2])
-                push!(c.series,st.args[1]); changed = true
+            if st in assignments && !haskey(c.data,_definition_name(st)) &&
+                    _temporal(c,st.args[2];group)
+                name = _definition_name(st)
+                if st.args[1] isa Symbol && name ∉ c.series
+                    push!(c.series,name); changed = true
+                elseif st.args[1] isa Expr && (name,group) ∉ c.group_series
+                    push!(c.group_series,(name,group)); changed = true
+                end
             end
         end
     end
@@ -370,7 +484,7 @@ function _compile_block!(c, block; group=nothing)
     while changed
         changed = false
         for st in assignments
-            if st.args[1] in c.series && st.args[1] ∉ c.rows &&
+            if st.args[1] isa Symbol && st.args[1] in c.series && st.args[1] ∉ c.rows &&
                     RK._stream_is_row(st.args[2],c.rows)
                 push!(c.rows,st.args[1]); changed = true
             end
@@ -390,7 +504,8 @@ function _compile_block!(c, block; group=nothing)
         push!(definitions,popat!(pending,index))
     end
     for st in definitions
-        push!(result, Expr(:(=), st.args[1], _value(c, st.args[2]; group, scalarize=true)))
+        c.types[st.args[1]] = _source_type(c,st.args[2];group)
+        push!(result, Expr(:(=), st.args[1], _value(c, st.args[2]; group, scalarize=st.args[1] ∉ c.events)))
     end
     for st in stmts
         st in definitions && continue
@@ -401,6 +516,7 @@ function _compile_block!(c, block; group=nothing)
             loop = st.args[end]
             Meta.isexpr(loop, :for) || _fail("expected @plate for")
             g = loop.args[1].args[1]
+            c.types[g] = Int
             hasproperty(c.groups, g) || _fail("supply fixed groups=(; $g=1:G) for this plate")
             getproperty(c.groups, g) == collect(1:length(getproperty(c.groups,g))) ||
                 _fail("group indices must be contiguous 1:G; retain external labels in frozen data")
@@ -418,7 +534,12 @@ function _compile_block!(c, block; group=nothing)
                     item.args[1].args[2] == g && push!(localnames,item.args[1].args[1])
             end
             isempty(localnames) || push!(result,Expr(:local,sort!(collect(localnames);by=string)...))
-            body = _compile_block!(c, loop.args[2]; group=g)
+            required = Set{Symbol}()
+            for other in stmts
+                other === st && continue
+                union!(required,PPL._expr_value_symbols(other))
+            end
+            body = _compile_block!(c, loop.args[2]; group=g,required)
             c.states = oldstates
             inputbindings = [Expr(:(=),n,_ref(_field(:_filter_inputs,n),g)) for n in c.inputs]
             push!(result, quote
@@ -433,9 +554,11 @@ function _compile_block!(c, block; group=nothing)
             lhs = st.args[1]
             lhs isa Symbol && (lhs in horizons || haskey(c.data,lhs)) && continue
             if group !== nothing && Meta.isexpr(lhs, :ref, 2) && lhs.args[2] == group
-                value = _value(c,st.args[2];group,scalarize=true)
                 name = lhs.args[1]
                 name isa Symbol || _fail("group output must have a named array")
+                T = _source_type(c,st.args[2];group)
+                c.types[name] = Vector{T}
+                value = _value(c,st.args[2];group,scalarize=name ∉ c.events)
                 temporary = gensym(:group_output)
                 active = _field(:_filter_active,group)
                 count = length(getproperty(c.groups,group))
@@ -450,7 +573,8 @@ function _compile_block!(c, block; group=nothing)
                 continue
             end
             lhs isa Symbol || _fail("only scalar definitions are supported outside scans")
-            push!(result, Expr(:(=), lhs, _value(c, st.args[2]; group, scalarize=true)))
+            c.types[lhs] = _source_type(c,st.args[2];group)
+            push!(result, Expr(:(=), lhs, _value(c, st.args[2]; group, scalarize=lhs ∉ c.events)))
         elseif Meta.isexpr(st, :call, 3) && st.args[1] in (:~, Symbol(".~"))
             lhs, rhs = st.args[2:3]
             name = _declaration_name(lhs)
@@ -508,7 +632,9 @@ function PPL.prepare_filter(model::RKPPLModel; model_id::AbstractString,
     compiler_data = NamedTuple{Tuple(get(private_names,n,n) for n in keys(data))}(values(data))
     c = FilterCompiler(Tuple(observations), Tuple(inputs), parameter_names, compiler_data, groups,
         Dict{Symbol,Tuple{Symbol,Int,Any}}(), Pair{Symbol,Tuple{Int,Int}}[], Set{Symbol}(), Set{Symbol}(),
-        model.mod,Any[],0,paths,Set{Symbol}((inputs...,observations...)),Set{Symbol}())
+        model.mod,Any[],0,paths,Set{Symbol}((inputs...,observations...)),Set{Symbol}(),
+        Set{Tuple{Symbol,Symbol}}(),Set{Symbol}(),
+        Dict{Symbol,Any}(get(private_names,n,n)=>typeof(v) for (n,v) in pairs(merge(parameters,data))))
     body = _compile_block!(c, ast)
     # Inspect the actual projected code, after horizon removal and frozen
     # substitution. Training observations, input columns and dead constants
