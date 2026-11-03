@@ -221,7 +221,12 @@ function _ad_native_callables(kernel::PreparedKernel)
     end
 end
 
-function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I}
+# Building the adapter is preparation work. Inferring it for a program's
+# complete constant/callable tables compiles another large native method
+# before the backend ever sees the differentiated call.
+Base.@nospecializeinfer function _ad_kernel_call(
+        @nospecialize(kernel::PreparedKernel), @nospecialize(args::Tuple),
+        ::Val{I}) where {I}
     if kernel.f isa _ArrayFunction
         callables = _ad_native_callables(kernel)
         constants = kernel.constants
@@ -233,14 +238,13 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
         externalized, values = _externalize_bound_array_call(
             kernel.f.native, constants, callables; materialize_view_copies = true,
             externalize_scalars = true)
-        isempty(values) && return (
-            _ADNativeKernelCall{I,typeof(kernel.f.native),typeof(constants),typeof(callables)}(
-                kernel.f.native, constants, callables),
-            (),
-        )
+        if isempty(values)
+            T = _ADNativeKernelCall{I,typeof(kernel.f.native),typeof(constants),typeof(callables)}
+            return _kernel_new_instance(T, (kernel.f.native, constants, callables)), ()
+        end
         packed, pack = _pack_hidden_operands(
             externalized, values, kernel.lowered_recipes, constants)
-        return _ADKernelCall{I,typeof(packed)}(packed), pack
+        return _kernel_new_instance(_ADKernelCall{I,typeof(packed)}, (packed,)), pack
     end
     externalized, values = _externalize_bound_arrays(
         kernel; materialize_view_copies = true, externalize_scalars = true)
@@ -249,15 +253,14 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
         # and its operands. Repacking the whole PreparedKernel also stores its
         # mutable graph/Expr metadata beside active arguments, which defeats
         # ordinary Enzyme activity analysis through a nested prepared callback.
-        return _ADNativeKernelCall{I,typeof(kernel.f),typeof(kernel.constants),
-                                   typeof(kernel.callables)}(
-            kernel.f, kernel.constants, kernel.callables), values
+        T = _ADNativeKernelCall{I,typeof(kernel.f),typeof(kernel.constants),typeof(kernel.callables)}
+        return _kernel_new_instance(T, (kernel.f, kernel.constants, kernel.callables)), values
     end
     isempty(values) &&
-        return _ADKernelCall{I,typeof(externalized)}(externalized), values
+        return _kernel_new_instance(_ADKernelCall{I,typeof(externalized)}, (externalized,)), values
     packed, pack = _pack_hidden_operands(
         externalized, values, kernel.lowered_recipes, kernel.constants)
-    _ADKernelCall{I,typeof(packed)}(packed), pack
+    _kernel_new_instance(_ADKernelCall{I,typeof(packed)}, (packed,)), pack
 end
 
 # Every hidden bound operand used to cross the backend as its own `Constant`
@@ -281,17 +284,23 @@ struct _PackedOperandCall{K}
     call::K
 end
 
-function _pack_hidden_operands(call, values::Tuple, recipes, constants)
+Base.@nospecializeinfer function _pack_hidden_operands(
+        @nospecialize(call), @nospecialize(values::Tuple),
+        @nospecialize(recipes), @nospecialize(constants))
     _pack_named_hidden_operands(call, values,
                                 _hidden_operand_names(recipes, constants, call), constants)
 end
 
-function _pack_named_hidden_operands(call, values::Tuple, slot_names::Tuple, constants)
+Base.@nospecializeinfer function _pack_named_hidden_operands(
+        @nospecialize(call), @nospecialize(values::Tuple), slot_names::Tuple,
+        @nospecialize(constants))
     names = _hidden_operand_leaf_names(call, slot_names, constants)
     length(names) == length(values) || throw(ArgumentError(
         "internal: $(length(values)) hidden operand(s) but $(length(names)) " *
         "name(s) derived from the bound slots"))
-    _PackedOperandCall(call), (NamedTuple{names}(values),)
+    packed = _kernel_new_instance(_PackedOperandCall{typeof(call)}, (call,))
+    operands = _kernel_new_instance(NamedTuple{names,typeof(values)}, values)
+    packed, (operands,)
 end
 
 # Each operand is named after the bound value it comes from (the output of its
