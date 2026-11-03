@@ -16,6 +16,35 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.65
+
+- `deepcopy` of a graph, plan, prepared or vectorized kernel (any object
+  holding a generated program) now succeeds when a recipe's authored source,
+  or a generated program that inlines it, holds a module as a literal value, as
+  ReactiveKernelsPPL's rebuilt law arguments do (`Core.GlobalRef(<module>,
+  :name)`). The copy owns its expressions and shares the modules in them, as
+  it already shared a source operation's module. Previously the copy failed
+  with `deepcopy of Modules not supported`.
+
+## 0.1.64
+
+- Apply an elementwise dotted call over an expanding gather by a cached index,
+  `f.(x[k])`, before the gather: under `bound=` and in position readers'
+  per-cell prefixes, a cell whose index reads every element of `x`'s first
+  `m` and is longer than `m` evaluates `f.(view(x, 1:m))[k]`. Values are
+  unchanged bit for bit and `f` runs on no element the authored form leaves
+  unread; reverse-mode derivatives agree up to floating-point rounding where
+  an index repeats. See `docs/src/compiler.md`, "Elementwise calls over a
+  data-indexed gather".
+
+## 0.1.63
+
+- Keep a shared-prefix cut's input types when preparing cell factors with
+  `partitioned`. A cell's per-index reads of earlier plates (`loc[i]`) are
+  then scalar reads, as without the cut, instead of a group sum whose rows are
+  the cell's own position; genuinely gathered sums prepare strict summands.
+  Factor discovery no longer takes a scalar position as a sum's row labels.
+
 ## 0.1.62
 
 - Carry row demand through a selected array-valued producer cell, preserving

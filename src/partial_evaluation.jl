@@ -290,9 +290,19 @@ end
 # their readable recipes in `readable`. `dataonly[i]` is whether node `i`
 # reads bound data only.
 function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
-                              r::Recipe, parts, dataonly::Vector{Bool}, fresh)
+                              r::Recipe, parts, dataonly::Vector{Bool}, fresh;
+                              gather_maps::Bool = false)
     (; native, split) = parts
     nodes = split.nodes
+    ports = collect(Symbol, first(_kernel_split_spec(native)))
+    # A live part reading cached data-only nodes may apply an elementwise
+    # call before an expanding gather by one of them (`src/gather_maps.jl`).
+    function maps!(part, direct, kids, stem)
+        gather_maps || return part
+        cached = Set{Symbol}(_kernel_split_placeholder(k) for k in kids if dataonly[k])
+        params = vcat(ports[direct], Symbol[_kernel_split_placeholder(k) for k in kids])
+        _partial_gather_maps!(recipes, readable, g, part, params, cached, fresh, stem)
+    end
     holds = copy(dataonly)
     for (i, node) in enumerate(nodes)          # post-order: kids come first
         holds[i] |= any(k -> holds[k], node.kids)
@@ -317,11 +327,12 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
                    r.cost, nothing, false, node.expr)
         else
             kids = Value[emit!(k) for k in node.kids]
-            Recipe(fresh(), (Tuple(r.inputs[p] for p in node.direct)..., kids...),
-                   (value,),
-                   operation(Symbol(:_split, i), :fused, native.splits[i],
-                             ignored === nothing ? nothing : ignored.splits[i]),
-                   r.cost, nothing, false, node.body)
+            maps!(Recipe(fresh(), (Tuple(r.inputs[p] for p in node.direct)..., kids...),
+                         (value,),
+                         operation(Symbol(:_split, i), :fused, native.splits[i],
+                                   ignored === nothing ? nothing : ignored.splits[i]),
+                         r.cost, nothing, false, node.body),
+                  node.direct, node.kids, Symbol(output.name, :_part, i))
         end
         push!(recipes, part)
         readable[part.id] = part
@@ -333,6 +344,7 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
                   operation(:_root, kernel_sourceop_form(r.op), native.root,
                             ignored === nothing ? nothing : ignored.root),
                   r.cost, nothing, false, split.root.body)
+    root = maps!(root, split.root.direct, split.root.kids, Symbol(output.name, :_root))
     push!(recipes, root)
     readable[r.id] = root
     recipes
@@ -374,7 +386,8 @@ function _partial_split_recipes(inner::Plan, bound::Set{ValueId}, excluded::Set{
         end
         copied === nothing && (copied = Graph(copy(g.values), copy(g.recipes),
             copy(g.producers), copy(g.aliases), g.version))
-        _partial_emit_split!(recipes, readable, copied, r, parts, nodedata, fresh)
+        _partial_emit_split!(recipes, readable, copied, r, parts, nodedata, fresh;
+                             gather_maps = true)
     end
     copied === nothing && return inner
     template = Plan(copied, inner.have, inner.want, inner.recipes, inner.producer,
@@ -1061,6 +1074,10 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     inner = analysis.inner
     current = 0
     retry_nonfinite = false
+    # The cell values of shared calls (`_partial_shared_by_value`): equal
+    # cells hold one object, so a later call reading them compares it by
+    # identity.
+    shared_ids = Set{ValueId}()
     try
         for r in analysis.selected
             current = r.id
@@ -1074,7 +1091,13 @@ Base.@nospecializeinfer function _partial_plate_recipe(
                 # Bool results may use packed BitArrays; bound-array
                 # externalization also supports these.
                 result = similar(batch, analysis.cell_types[cid])
-                arguments[cid] = _partial_cell_values!(result, batch)
+                by_value = _partial_shared_by_value(r, args, inner.graph, shared_ids)
+                arguments[cid] = if by_value === nothing
+                    _partial_cell_values!(result, batch)
+                else
+                    push!(shared_ids, cid)
+                    _shared_cell_values!(result, batch, Val(by_value))
+                end
             end
             # Retain nonfinite floating-point work beneath its original
             # nested guards: lifting these values can change a finite

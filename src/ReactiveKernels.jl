@@ -23,6 +23,7 @@ using LinearAlgebra
 using LogExpFunctions
 using Random
 import DifferentiationInterface
+import EnzymeCore
 import Preferences
 using PrecompileTools: @setup_workload, @compile_workload
 RuntimeGeneratedFunctions.init(@__MODULE__)
@@ -31,8 +32,10 @@ include("core.jl")
 include("planner.jl")
 include("codegen.jl")
 include("native_scheduling.jl")
+include("shared_cell_calls.jl")
 include("inverse_edges.jl")
 include("partial_evaluation.jl")
+include("gather_maps.jl")
 include("bound_vectorize.jl")
 include("position_cells.jl")
 include("index_runs.jl")
@@ -116,6 +119,7 @@ export reactive_program
 
 _mark_source_call_recursion!()
 
+include("deepcopy_code.jl")
 include("precompile.jl")
 
 end # module ReactiveKernels

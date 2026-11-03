@@ -16,6 +16,48 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.74
+
+- Prepared queries of a model whose caller-owned law takes an authored
+  argument with a resolved binding (a property read `holder.inner`, an array
+  literal `[1.0]`) can be deep-copied, for example once per chain, and the
+  copy evaluates as the original. This needs ReactiveKernels 0.1.65, now the
+  compat floor. `model_view(built; bound)` displays such a model's generated
+  source instead of failing with `deepcopy of Modules not supported`.
+
+## 0.1.73
+
+- **Breaking:** learning-filter replenishment now resamples the current weighted
+  parameter/filter pairs, then moves them with particle-Metropolis random walks
+  scaled by `2.38/sqrt(d)` times the members' weighted spread, accepted by the
+  window prior ratio times the window likelihood-estimate ratio. It no longer
+  discards learned positions to draw a fresh window-prior population, and the
+  tuned NUTS kernel now drives only explicit recovery (its `moves` still sets
+  proposals per member). Replenishment triggers on the ESS over distinct
+  parameter positions, so resampled copies sharing the weight no longer hide a
+  collapse. Full spatial collapse raises `SMCDegeneracyError` after mutation;
+  invalid Gaussian rollover scales report coordinates and the preserved input
+  state. Failed steps consume neither their observation nor the input RNG.
+- `tune_filter_smc(state; ...)` independently tunes the current window reference;
+  `rejuvenate_smc(state; tuning, moves)` attempts fixed-budget recovery without
+  resampling, consuming data or changing weights/evidence. Failed attempts remain
+  transactional; retry a failed observation only after recovery succeeds.
+- Bounded learning histories distinguish assimilation and recovery, and report
+  distinct members, distinct-position ESS, actual movement, weighted coordinate
+  spread, the random-walk scale and kernel budgets separately from acceptance
+  and member ESS. Parameter-learning checkpoints
+  use schema 2 and require matching versions. The marginal-Gaussian/independent
+  state boundary approximation is unchanged; diversity does not certify mixing.
+
+## 0.1.72
+
+- `factor_support` of a vector simplex (`s ~ Dirichlet(alpha)`) or ordered
+  vector (`c ~ Ordered(D, n)`) prior or Jacobian now names only the entry's
+  own packed block plus any sampled hyperparents; the ordering Jacobian names
+  all but the first coordinate. Earlier versions returned every packed
+  coordinate, because the transform read its block inside a larger
+  expression. Values, gradients and ownership are unchanged.
+
 ## 0.1.71
 
 - Map resolved TDist, Gumbel, Weibull, InverseGamma, InverseGaussian,
@@ -48,6 +90,7 @@ are recorded in the git history only.
   `sum(z[rows[k]] + w[rows[k]])`, including transparent forwarding helpers,
   with or without shared-prefix caching. Each term retains both gathered
   operands and the original addition's shape checks. Requires RK 0.1.60.
+
 
 ## 0.1.68
 

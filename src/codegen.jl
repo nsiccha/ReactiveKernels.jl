@@ -3465,7 +3465,15 @@ end
 # its captures only); a `Bool`, so the keyword call has one instance for every
 # plate.
 function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots;
-                                     recycled = nothing, slot_inlines::Bool = false)
+                                     recycled = nothing, slot_inlines::Bool = false,
+                                     shared::Union{Nothing,Symbol} = nothing)
+    # A shared call with the cell loop's table for it (`shared`): the step
+    # returns the table and the cell's value.
+    if shared !== nothing
+        push!(body.args, Expr(:(=), Expr(:tuple, shared, out),
+            Expr(:call, GlobalRef(@__MODULE__, :_shared_step), shared, operation, args...)))
+        return body
+    end
     if recipe.op isa _AuthoredScanOp
         _lower_authored_scan_native!(body, recipe.op, args, out, slots.offset;
                                      slots.type_offset, recycled)
@@ -3667,8 +3675,12 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
         end
         append!(cell_slots, (last(pair) for pair in recycle))
     end
+    # The cell's shared calls read tables the plate loop carries, passed in
+    # after the lane slots.
+    shares = Pair{Int,Symbol}[r.id => gensym(:shared_call_table)
+                              for r in scalar.recipes if r.op isa _SharedCall]
     ast, constants, callables, recipes = _lower_with_ops(scalar; type_hints, recycle,
-                                                         cell_slots, cell_tables)
+                                                         cell_slots, cell_tables, shares)
     cell_tables === nothing || append!(cell_slots, cell_tables)
     offset = length(runtime_ops)
     append!(runtime_ops, _table_ops(constants, callables, recipes))
@@ -3676,6 +3688,7 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
     T = types[canon_id(kernel.plan.graph, only(kernel.plan.want).id)]
     (; ast, offset, type = T, inputs = scalar.have,
        slots = Symbol[last(pair) for pair in recycle],
+       shares = Int[first(pair) for pair in shares],
        tables = cell_tables === nothing ? Symbol[] : cell_tables,
        invariants = hoisted === nothing ? Int[] : hoisted.moved,
        input_types = Any[types[cid] for cid in hint_ids])
@@ -4046,6 +4059,22 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     # `Ref{Any}` cells, one closure type serves every plate.
     captured = Ref{Any}((; inner_kernel, atomic, callargs, callvalues,
                            prepared_arguments, slices, sliced_scans, scan_offsets))
+    # Each call that cells with equal arguments share (shared_cell_calls.jl)
+    # keeps its table in a local the cell loop carries: `nothing` until the
+    # first cell that keys it, one table per evaluation of this plate.
+    shares = Dict{Int,Symbol}()
+    for recipe in inner.recipes
+        recipe.op isa _SharedCall || continue
+        shares[recipe.id] = gensym(:shared_call_table)
+        push!(body.args, Expr(:(=), shares[recipe.id], nothing))
+    end
+    if nested !== nothing
+        for id in nested.shares
+            haskey(shares, id) && continue
+            shares[id] = gensym(:shared_call_table)
+            push!(body.args, Expr(:(=), shares[id], nothing))
+        end
+    end
     function lower_recipe!(block, recipe_index, args, out, operation, looped)
         # `getfield`, not `.`: the cell is `Any`, and a property read would
         # compile once per plate's record type.
@@ -4054,7 +4083,8 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         haskey(getfield(c, :slices), recipe_index) || return _lower_plate_recipe_native!(
             block, inner.recipes[recipe_index], args, out, operation,
             get(getfield(c, :scan_offsets), recipe_index, nothing); recycled = slot_of(recipe_index),
-            slot_inlines = _inline_sources_enabled())
+            slot_inlines = _inline_sources_enabled(),
+            shared = looped ? get(shares, inner.recipes[recipe_index].id, nothing) : nothing)
         scan_index, demand = getfield(c, :slices)[recipe_index]
         scan_recipe = inner.recipes[scan_index]
         scan_args = Any[_authored_plate_scalar_ref(
@@ -4129,7 +4159,9 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         # domain must not evaluate new queries merely to bind an unused hint.
         input_types = _bind_native_type_exprs!(loopbody, nested.input_types)
         append!(loopbody.args,
-            _embedded_statements(nested.ast, [args; nested.slots; input_types],
+            _embedded_statements(nested.ast,
+                                 [args; nested.slots; Any[shares[id] for id in nested.shares];
+                                  input_types],
                                  nested_result, nested.offset))
     end
     # A lane branch with arm graphs is inlined with first-use shared work
@@ -4676,13 +4708,15 @@ function _lower_with_ops_collecting(p::Plan;
                          footprint::Bool = false,
                          footprint_selection = nothing,
                          partition_plan::Bool = false,
-                         inline_sources::Bool = _inline_sources_enabled())
+                         inline_sources::Bool = _inline_sources_enabled(),
+                         shares::Vector{Pair{Int,Symbol}} = Pair{Int,Symbol}[])
     # The footprint variant (`partition_footprint`, plate_partition.jl): the
     # body records every read of a HAVE port and returns them instead of the
     # wanted values.
     footprint && return task_local_storage(_FOOTPRINT, _FootprintRecords(footprint_selection)) do
         _lower_with_ops_collecting(p; inline_embedded, declare, recycle, pushdowns, outline,
-                                   plate_element_types, type_hints, exemplar_types, inline_sources)
+                                   plate_element_types, type_hints, exemplar_types, inline_sources,
+                                   shares)
     end
     # Only the lowering the footprint was asked for records reads and returns
     # them: a lowering nested in it (a plate body, an embedded kernel) runs
@@ -4691,7 +4725,8 @@ function _lower_with_ops_collecting(p::Plan;
     if recording !== nothing
         recording.active && return task_local_storage(_FOOTPRINT, nothing) do
             _lower_with_ops_collecting(p; inline_embedded, declare, recycle, pushdowns, outline,
-                                       plate_element_types, type_hints, exemplar_types, inline_sources)
+                                       plate_element_types, type_hints, exemplar_types, inline_sources,
+                                       shares)
         end
         recording.active = true
     end
@@ -4715,6 +4750,9 @@ function _lower_with_ops_collecting(p::Plan;
         push!(argexprs, :($(nm(v))::$(valtype(v))))
     end
     append!(argexprs, (last(pair) for pair in recycle))
+    # The tables of the shared calls (shared_cell_calls.jl) of a cell embedded
+    # in a plate loop, which carries them (`_plate_nested_native!`).
+    append!(argexprs, (last(pair) for pair in shares))
     type_hints === nothing || append!(argexprs, (last(pair) for pair in type_hints))
     type_hints = type_hints === nothing ? nothing : Dict{ValueId,Symbol}(type_hints)
     recycled(cid) = (index = findfirst(pair -> first(pair) == cid, recycle);
@@ -5030,6 +5068,14 @@ function _lower_with_ops_collecting(p::Plan;
             if r.op isa _BoundConstant
                 # A bound constant's value, from the constants table.
                 push!(body.args, Expr(:(=), lhs, Expr(:ref, _CONSTANTS_ARG, length(runtime_ops))))
+                continue
+            end
+            # A shared call with its plate loop's table (`shares`).
+            share = r.op isa _SharedCall ? _shared_table_param(shares, r.id) : nothing
+            if share !== nothing
+                push!(body.args, Expr(:(=), Expr(:tuple, share, lhs),
+                    Expr(:call, GlobalRef(@__MODULE__, :_shared_step), share,
+                         Expr(:ref, _CALLABLES_ARG, length(runtime_ops)), callargs...)))
                 continue
             end
             # A recycled dotted-call or slice result fills its lane buffer

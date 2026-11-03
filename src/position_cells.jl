@@ -169,6 +169,10 @@ Base.@nospecializeinfer function _replicated_split_plate(
     end
     reverse!(keep)
 
+    # Cells with equal arguments share the prefix cell's calls of cell-varying
+    # values (shared_cell_calls.jl).
+    selected = _shared_cell_calls(cg, selected, varying, readable)
+
     template = Plan(cg, inner.have, inner.want, inner.recipes, inner.producer,
                     inner.cost, inner.candidates)
     prefix_plan = _partial_subplan(template, inner.have[positions], Value[cells],

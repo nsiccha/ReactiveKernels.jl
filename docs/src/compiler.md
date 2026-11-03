@@ -552,12 +552,23 @@ multiplication by a live parameter in the evaluator. A nested recipe that
 still reads a live input remains in the cell. This does not expose the body
 of an opaque child call inside a lazy branch for partial evaluation.
 
+Cells with equal bound data share their cached values. A call whose
+cell-varying arguments include an array or a record runs once per distinct
+argument tuple, and the cells with that tuple hold the same result object. The
+call is an authored expression or a function of a package or of the authoring
+module. Bound subjects that share one design compute it once per binding and
+store it once. This uses the same comparison as position batching's
+[shared cell values](position-batching.md).
+
 Binding freezes values for that preparation; changing or mutating the data is
 not an invalidation signal. Rebind by preparing again from the original graph
-or plan. The pass does not rewrite mathematics or mutate the shared graph; it
-splits a recipe only along the structure its author wrote (see
-[Data-only subexpressions](#Data-only-subexpressions)). The default
-`bound = ()`/`bound = (;)` path is unchanged.
+or plan. The pass does not mutate the shared graph. It splits a recipe along
+the structure its author wrote (see
+[Data-only subexpressions](#Data-only-subexpressions)), with one rewrite of
+that structure: an elementwise call over an expanding gather by a cached index
+applies its function before the gather (see
+[Elementwise calls over a data-indexed gather](#Elementwise-calls-over-a-data-indexed-gather)).
+The default `bound = ()`/`bound = (;)` path is unchanged.
 
 The same named `bound` contract is available on `prepare_nonallocating`, whose
 lowering rewrites only the residual work. Optional downstream preparation
@@ -768,10 +779,53 @@ lane. Each cell computes only `yi * li - ni * log1pexp(li)` and adds it. With
   around distribution endpoints, without rewriting individual families.
 - The parts apply the authored operations to the same operands in the same
   order, so values and derivatives are unchanged; nothing is reassociated or
-  simplified.
+  simplified. The one exception follows: its values are unchanged and its
+  derivatives agree up to floating-point rounding.
 
 `code_expr` contains a cached part as `bound_plate_<name>` in a cell, or as a
 hoisted constant at top level, and the remaining recipe reading it by name.
+
+#### Elementwise calls over a data-indexed gather
+
+A dotted call `f.(x[k])` applies `f` once per element of the index `k`. When
+`k` is longer than `x` it applies `f` to some elements of `x` more than once.
+In the dose amounts of a pharmacokinetic event table,
+
+```julia
+amount = op_amount[op_rows[i]] .*
+    exp.(vcat(0.0, log_F[dose_rows[i]])[op_dose_pos[op_rows[i]] .+ 1])
+```
+
+each subject's few dose bioavailabilities are expanded to its several hundred
+event operations before `exp`. Where the index is one of the cached values
+above (under `bound=`, or in a position reader's per-cell prefix,
+[Position batching](batched.md)), preparation also caches its *cover*: the `m`
+such that `k` reads each of the linear indices `1:m` at least once and no
+other index, provided `k` is longer than `m`; otherwise 0. The part then reads
+
+```julia
+cover > 0 ? f.(view(x, 1:cover))[k] : f.(x[k])
+```
+
+so `f` runs once per element of `x` that `k` reads, here once per dose. A
+cell whose index leaves an element of `x` unread, has no repeat, or is not an
+integer array takes the authored arm, and each cell is decided on its own
+data. The test costs one comparison per evaluation.
+
+- `f` runs on exactly the elements the authored form reads, so the rewrite
+  raises no error and produces no `NaN` the authored form would not, and the
+  values are the authored values bit for bit. An `x` shorter than the cover
+  throws the `BoundsError` its gather throws.
+- Reverse-mode derivatives of the first arm add the cotangents of an element's
+  repeats before multiplying by `f'`; the authored form multiplies each repeat
+  first. The two agree up to floating-point rounding where an index repeats
+  (user decision
+  `ReactiveKernels:snag.data-only-subexp-c79363b3/decisions/2026-11-03T09-45-41-093-1j3rv6f`).
+- It applies to a named callee that is not one of the cheap calls listed
+  above and does not end in `!`, dotted over a single gather with a single
+  index, at a strict position of a capture-free authored source. An unbound
+  scalar `prepare` caches no index and keeps the authored form, as does JAX
+  emission.
 
 ### 5. Composition
 
