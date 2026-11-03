@@ -119,6 +119,7 @@ export reactive_program
 
 _mark_source_call_recursion!()
 
+include("deepcopy_code.jl")
 include("precompile.jl")
 
 end # module ReactiveKernels

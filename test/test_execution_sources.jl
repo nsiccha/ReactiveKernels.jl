@@ -61,6 +61,58 @@ end
     @test Base.invokelatest(kernels[1], 2.0) == 8.0
 end
 
+@testset "a deep copy shares the modules an authored source holds" begin
+    # ReactiveKernelsPPL rebuilds a resolved binding among a law's arguments as
+    # `Core.GlobalRef(<module>, :name)` so that the printed source replays: the
+    # recipe's authored source holds the module itself, which `deepcopy`
+    # refuses. Per-chain copies of prepared kernels deep-copy them (snag
+    # `prepared-query-h-b7bd890a`).
+    holds(x) = x isa Module || (x isa Expr && any(holds, x.args)) ||
+        (x isa QuoteNode && holds(x.value))
+    mod = Module(gensym(:ExecutionSource))
+    Core.eval(mod, :(using ReactiveKernels; arity(refs) = Float64(length(refs))))
+    rebuilt = Expr(:call, GlobalRef(Core, :GlobalRef), Base, QuoteNode(:vect))
+    definition = :(model(x::Float64) = begin
+        value::Float64 = x + arity(($rebuilt,))
+        return value
+    end)
+    spec = RK._kernel_eval_definition(mod, definition)
+    sources = [r.source for r in spec.graph.recipes if holds(r.source)]
+    @test !isempty(sources)
+    kernel = prepare(spec)
+    copied = deepcopy(kernel)
+    @test Base.invokelatest(copied, 2.0) == Base.invokelatest(kernel, 2.0) == 3.0
+    # The copy owns its expressions and shares the module they hold.
+    for (original, copy) in zip(sources,
+            [r.source for r in deepcopy(spec).graph.recipes if holds(r.source)])
+        @test copy == original && copy !== original
+    end
+    held = [r.source for r in copied.plan.graph.recipes if holds(r.source)]
+    @test !isempty(held) && !any(s -> any(o -> o === s, sources), held)
+    modules(x) = x isa Module ? Module[x] : x isa Expr ?
+        reduce(vcat, map(modules, x.args); init=Module[]) :
+        x isa QuoteNode ? modules(x.value) : Module[]
+    @test all(s -> modules(s) == [Base], held)
+    # A program that inlines the source holds the module too.
+    @test copied.ast == kernel.ast && copied.ast !== kernel.ast
+    @test !holds(kernel.ast) || modules(copied.ast) == modules(kernel.ast) == [Base]
+    reader = vectorize(spec; batched = :x)
+    @test Base.invokelatest(deepcopy(reader), [1.0, 2.0]) ==
+        Base.invokelatest(reader, [1.0, 2.0]) == [2.0, 3.0]
+    # Every type of the package holding a generated program copies it so.
+    holders = filter(names(RK; all = true)) do name
+        T = isdefined(RK, name) ? getfield(RK, name) : nothing
+        T isa Type || return false
+        U = Base.unwrap_unionall(T)
+        U isa DataType && !isabstracttype(U) && parentmodule(U) === RK &&
+            nameof(U) === name && any(t -> t === Expr, fieldtypes(U))
+    end
+    @test :PreparedKernel in holders
+    @test [name for name in holders
+           if which(Base.deepcopy_internal, Tuple{getfield(RK, name), IdDict}).module !==
+              RK] == Symbol[]
+end
+
 @testset "vectorized readers of fresh identical builds share executable types" begin
     # A rebuilt graph's position readers hold the token-free execution copies
     # `prepare` holds, so a rebuild of one program reuses the reader compiled
