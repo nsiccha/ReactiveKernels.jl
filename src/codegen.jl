@@ -5129,7 +5129,8 @@ function _lower_with_ops_collecting(p::Plan;
     end
     retval = length(p.want) == 1 ? nm(p.want[1]) :
              Expr(:tuple, (nm(w) for w in p.want)...)
-    _footprint_recording() && (retval = _footprint_return(p, cells, names, declared))
+    _footprint_recording() &&
+        (retval = _footprint_return(p, cells, names, declared, body))
     push!(body.args, Expr(:return, retval))
     # Compose before index runs duplicate a cell body into grouped/flat arms;
     # otherwise those mutually exclusive definitions appear to escape here.

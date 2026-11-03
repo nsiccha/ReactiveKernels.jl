@@ -77,6 +77,15 @@ function _footprint_index_free(ex, source, params, mod)
     all(a -> _footprint_index_free(a, source, params, mod), ex.args)
 end
 
+# The names a generated body binds at its top level, and its HAVE arguments.
+function _footprint_bound_names(body::Expr, p::Plan, names)
+    out = Set{Symbol}(names[canon_id(p.graph, v.id)] for v in p.have)
+    for st in body.args
+        Meta.isexpr(st, :(=)) && st.args[1] isa Symbol && push!(out, st.args[1])
+    end
+    out
+end
+
 _footprint_replace(ex::Symbol, mapping) = get(mapping, ex, ex)
 _footprint_replace(ex::Expr, mapping) =
     Expr(ex.head, (_footprint_replace(a, mapping) for a in ex.args)...)

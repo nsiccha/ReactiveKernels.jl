@@ -550,7 +550,7 @@ end
 # recorded reads, plus the reads of the recipes the window emitter never
 # saw (computed whole: a bound-indexed gather or literal range view reads
 # constant positions, anything else the whole port).
-function _footprint_return(p::Plan, cells, names, declared = nothing)
+function _footprint_return(p::Plan, cells, names, declared = nothing, body = nothing)
     recording = task_local_storage(_FOOTPRINT)
     g = p.graph
     cidof(v) = canon_id(g, v.id)
@@ -566,6 +566,10 @@ function _footprint_return(p::Plan, cells, names, declared = nothing)
     selected_cid = selected_port === nothing ? nothing : cidof(p.have[selected_port])
     reads = Dict(cid => copy(entries) for (cid, entries) in recording.records)
     record(cid, kind, expr) = push!(get!(() -> Tuple{Symbol,Any}[], reads, cid), (kind, expr))
+    # A view's reads are mapped at its binding: only a view whose value and
+    # operands the body binds at its top level (not one a scan, a fused plate
+    # or a branch arm absorbed) forwards its readers' positions.
+    bound = body === nothing ? Set{Symbol}() : _footprint_bound_names(body, p, names)
     for cid in wants
         record(cid, :whole, nothing)
     end
@@ -583,7 +587,9 @@ function _footprint_return(p::Plan, cells, names, declared = nothing)
         literal = f === nothing ? _footprint_literal_read(r) : nothing
         for (s, input) in enumerate(r.inputs)
             cid = cidof(input)
-            if view !== nothing && s == view.slot && _footprint_indices_free(view)
+            if view !== nothing && s == view.slot && _footprint_indices_free(view) &&
+                    all(v -> get(names, cidof(v), nothing) in bound,
+                        (r.inputs..., only(r.outputs)))
                 mapping = Dict{Symbol,Any}(view.params[j] => names[cidof(v)]
                                           for (j, v) in enumerate(r.inputs))
                 mapping[view.params[s]] = Expr(:call, GlobalRef(Base, :LinearIndices), names[cid])
