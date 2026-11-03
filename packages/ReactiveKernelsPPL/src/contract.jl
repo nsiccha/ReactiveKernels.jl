@@ -8706,6 +8706,9 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     # Rebinding a binding: what it left absent stays absent unless supplied.
     filter!(p -> _supplied(last(p)), columns)
     frozen_inputs = _bind_frozen!(plan, columns, frozen)
+    # Every step below sizes and evaluates with this binding's record, which
+    # `frozen` may supply in place of the plan's own (`bind_data(fit, …; frozen)`).
+    frozen === plan.frozen || (plan = _with(plan; frozen))
     _absent_observations!(plan, columns)
     _route_conditioned_values!(plan, columns)
     _route_bound_values!(plan, columns)
@@ -8983,7 +8986,7 @@ function _resolve_vector_extent(p::VectorParameter, plan, columns, responses)
             (plan === nothing ? () : _definitions(plan)))
         active = Set{Symbol}()
         function lookup(name)
-            haskey(columns,name) && return columns[name]
+            _holds_bound_value(plan, columns, name) && return _bound_value(plan, columns, name)
             haskey(definitions,name) && name ∉ active || _fail(p.label,
                 "vector $(p.name) length needs data-only value $name")
             push!(active,name)
