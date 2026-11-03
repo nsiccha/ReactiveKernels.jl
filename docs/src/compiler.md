@@ -552,6 +552,14 @@ multiplication by a live parameter in the evaluator. A nested recipe that
 still reads a live input remains in the cell. This does not expose the body
 of an opaque child call inside a lazy branch for partial evaluation.
 
+Cells with equal bound data share their cached values. A call whose
+cell-varying arguments include an array or a record runs once per distinct
+argument tuple, and the cells with that tuple hold the same result object. The
+call is an authored expression or a function of a package or of the authoring
+module. Bound subjects that share one design compute it once per binding and
+store it once. This uses the same comparison as position batching's
+[shared cell values](position-batching.md).
+
 Binding freezes values for that preparation; changing or mutating the data is
 not an invalidation signal. Rebind by preparing again from the original graph
 or plan. The pass does not rewrite mathematics or mutate the shared graph; it
