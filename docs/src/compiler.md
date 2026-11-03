@@ -1150,8 +1150,9 @@ actual prepared operand types. No model rewrite or derivative rule is needed.
 
 A helper that maps positions to rows also runs at a cell's rows
 (`src/cell_position_maps.jl`). Its row `g` may read each "position" argument
-only at `g`, and every other argument whole: `[field[ix] .+ r[g] for (g, ix)
-in enumerate(paths)]` reads `r` and `paths` at the row and `field` whole. The
+only at `g`, and every other array argument only by indexing it:
+`[field[ix] .+ r[g] for (g, ix) in enumerate(paths)]` reads `r` and `paths` at
+the row and looks `field` up, so `field` is passed whole. The
 iteration may be a comprehension or `map` over `eachindex(x)`, `axes(x, 1)`,
 `1:length(x)`, `Base.OneTo(length(x))`, `x` itself, or `enumerate`/`zip` of
 those, destructured or not, also through a straight-line wrapper. It may also
@@ -1164,8 +1165,9 @@ helper's lowered code without executing it. The position may only index a
 position argument. Locals must be assigned in each iteration before they are
 read. A position argument's `length` or type may not be read as a value, the
 result being built may not be read, and nothing created outside the iteration
-may be mutated. So `x[g] - x[g - 1]`, a running sum, `length(x)` in the body
-and a `continue` that skips the `push!` keep the helper without a row form.
+may be mutated. So `x[g] - x[g - 1]`, a running sum, `length(x)` in the body,
+a `continue` that skips the `push!`, and a row that reduces, iterates or
+broadcasts a whole array (`x[g] + sum(w)`) keep the helper without a row form.
 The argument passed whole is computed whole. Ordinary locality decides whether
 that is legitimate (shared or bound) or refused. The window calls the authored
 helper itself on fresh dense vectors of its position arguments' requested rows,

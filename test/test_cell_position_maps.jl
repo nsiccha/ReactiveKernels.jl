@@ -67,6 +67,10 @@ function skipping(x)
     out
 end
 positional(x) = [x[g] * g for g in eachindex(x)]
+# An array argument reduced or broadcast whole in each row is cross-row work.
+reduced(x, w) = [x[g] + sum(w) for g in eachindex(x)]
+spread(x, w) = [x[g] .* w for g in eachindex(x)]
+looked_up(x, w, ix) = [x[g] + w[ix[g]] for g in eachindex(x)]
 
 @testset "position-map proofs: accepted shapes and refusals" begin
     V, S = Vector{Float64}, typeof(view(zeros(5), 2:4))
@@ -84,9 +88,10 @@ positional(x) = [x[g] * g for g in eachindex(x)]
     # An abstract argument type keeps the proof, with a run-time check of the
     # original producer's type.
     @test proof(pushed, AbstractVector, V).checks == [(1, :eltype), (1, :standard)]
+    @test proof(looked_up, V, V, Vector{Int}).positions == [1, 3]
     for (f, T) in ((crossrow, (V,)), (lagged, (V,)), (normalized, (V,)),
                    (cumulative, (V,)), (counting, (V,)), (skipping, (V,)),
-                   (positional, (V,)))
+                   (positional, (V,)), (reduced, (V, V)), (spread, (V, V)))
         @test proof(f, T...) === nothing
     end
 end

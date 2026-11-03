@@ -21,8 +21,9 @@ are recorded in the git history only.
 - Compute per-position helpers at a cell's rows. Comprehensions and `map` over
   `eachindex`, `axes(x, 1)`, `1:length`, `enumerate` or `zip`, and loops that
   build one row per position by a single `push!` or `out[g] =`, are proved from
-  lowered code. Shared arrays the row body reads elsewhere are passed whole;
-  cross-row or carried work keeps the existing locality checks.
+  lowered code. Arrays a row only indexes elsewhere (`field[ix]`) are passed
+  whole; cross-row or carried work, including a whole-array reduction in a
+  row, keeps the existing locality checks.
 - In a strict cell factor, an index into one cell's own value (`row[hour]` of
   `row = air[traj]`) reads that value instead of demanding its rows, so outer
   factors of per-trajectory rows agree with cell queries.

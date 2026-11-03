@@ -208,12 +208,17 @@ function _pm_iterator(st::_PMState, v::_PMValue)
     _pm_fail()
 end
 
-# A value used whole as an argument of an ordinary call inside an iteration:
-# an argument is then read whole; iteration machinery may not escape.
+# A value used as an argument of an ordinary call inside an iteration. An
+# array argument a row hands whole to a call (a reduction, iteration, a whole
+# broadcast) is cross-row work: no row form. A scalar argument is read whole;
+# iteration machinery may not escape.
+_pm_array_argument(st::_PMState, j::Int) =
+    (T = st.types[j]; T === Any || T isa Type && T <: AbstractArray)
 function _pm_operand!(st::_PMState, v::_PMValue)
     k = v.kind
     k in (:const, :typeval, :local, :elem) && return
     k === :tuple && return foreach(x -> _pm_operand!(st, x), v.data)
+    k === :param && _pm_array_argument(st, v.data) && _pm_fail()
     k in (:param, :len, :typeof, :typeread) && return _pm_whole!(st, v.data)
     _pm_fail()
 end
@@ -369,6 +374,12 @@ function _pm_iteration_call(st::_PMState, fr::_PMFrame, fv, args::Vector{_PMValu
         a.kind === :param || _pm_fail()
         _pm_position!(st, a.data)
         return _PMValue(:elem, a.data)
+    end
+    if fv === Base.getindex && n >= 2 && args[1].kind === :param
+        # A lookup into an argument passed whole (`field[ix]`, `ix = paths[g]`).
+        _pm_whole!(st, args[1].data)
+        foreach(a -> _pm_operand!(st, a), args[2:end])
+        return _PMValue(:local)
     end
     if any(a -> a.kind === :acc, args)
         acc = fr.accumulator
