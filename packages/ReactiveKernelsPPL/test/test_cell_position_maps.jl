@@ -309,4 +309,144 @@ end
     @test_throws PartitionLocalityError prepare_cell_query(built, plan, :y;
         partitioned = (:rain_z => collect(1:length(zs)),), locality = :error, u0 = u)
 end
+
+# The per-measurement readout of an archive model beside a centred pool. A row
+# reads `cs` and `natural` only by index, through a closure and a helper, and
+# each arm of its branch writes the row once. `sum(pool_z)` of a partitioned
+# coordinate view is a number; only the packed point's type shows that.
+readout_mean(values, state, weight, column) =
+    sum(weight[j] * values[state[j], column] for j in eachindex(state))
+function readout(kind, label, measurement, states, weights, cs, natural, conversion, ratio)
+    out = similar(cs, length(kind))
+    for i in eachindex(kind)
+        tick()
+        m = measurement[i]; ix = states[m]; w = weights[m]; k = label[i]
+        if kind[i] == 1
+            out[i] = sum(w[t] * cs[ix[t]] for t in eachindex(ix)) * ratio
+        else
+            a = k == size(natural, 2) ? ratio : 1 - ratio
+            out[i] = a * readout_mean(natural, ix, w, k) * conversion[i]
+        end
+    end
+    out
+end
+const READOUT = @rkppl begin
+    pool_sd ~ Exponential(1.0)
+    pool_z[1:L] .~ Normal.(0.0, 1.0)
+    pool_total = sum(pool_z)
+    pool = pool_sd .* (pool_z .- pool_total / L)
+    log_conversion[1:L] .~ Normal.(0.0, 1.0)
+    log_cs[1:S] .~ Normal.(0.0, 1.0)
+    ratio_logit ~ Normal(0.0, 1.0)
+    cs = exp.(log_cs)
+    ratio = exp(ratio_logit) / (1 + exp(ratio_logit))
+    conversion = exp.(log_conversion[label])
+    readings = readout(kind, label, measurement, states, weights, cs, natural, conversion, ratio)
+    @plate for i in eachindex(y)
+        y[i] ~ Normal(readings[i] + pool[label[i]], 1.0)
+    end
+end
+
+function readout_fixture()
+    L, S = 3, 4
+    kind, label = [1, 2, 2, 1, 2, 2], [1, 2, 3, 2, 1, 3]
+    measurement = [1, 2, 3, 1, 2, 3]
+    states, weights = [[1, 3], [2], [4, 2, 1]], [[0.4, 0.6], [1.0], [0.2, 0.3, 0.5]]
+    natural = [0.3 1.2 0.6; 0.8 0.4 1.1; 1.5 0.9 0.2; 0.5 0.7 1.3]
+    y = collect(range(-0.2, 0.9; length = length(kind)))
+    plan = READOUT(; L, S, kind, label, measurement, states, weights, natural) | (; y)
+    built = build_kernel(plan)
+    names = coordinate_names(built.layout)
+    u = collect(range(-0.3, 0.4; length = length(names)))
+    positions(prefix) = [k for (k, n) in enumerate(names) if startswith(string(n), prefix)]
+    (; plan, built, u, y, label, pool = positions("pool_z"),
+       conversion = positions("log_conversion"), cs = positions("log_cs"))
+end
+
+@testset "strict cell factors type a centred pool and a readout from the packed point" begin
+    (; plan, built, u, y, label, pool, conversion, cs) = readout_fixture()
+    whole = prepare_cell_query(built, plan, :y; locality = :ignore)
+    full = prepare_query(built, plan, :pointwise)(u)[:y]
+    partitioned = (:pool_z => collect(1:length(pool)), :log_conversion => collect(1:length(conversion)))
+    factors = prepare_cell_factors(built, plan, :y; partitioned, locality = :error, u0 = u)
+    outer = prepare_cell_factor_query(factors, :outer)
+    roots(q) = [e for e in partition_locality(q.residual) if e.status === :whole && e.reason !== :cascade]
+    @test isempty(roots(outer))
+    # One readout row per cell; the row's own arithmetic, whatever `cs` holds.
+    ROWS[] = 0
+    @test [outer(u, Float64[], h) for h in eachindex(y)] ≈ full
+    @test ROWS[] == length(y)
+    # Other argument types prepare their own specialization.
+    @test outer(view(u, :), Float64[], 2) ≈ full[2]
+    @test outer(view(u, :), view(Float64[], 1:0), 3) ≈ full[3]
+    # A cell reads the whole pool (its sum) and its own label's conversion.
+    support(h) = sort(vcat(pool, conversion[label[h]]))
+    footprint = partition_footprint_kernel(outer; shared = false)
+    @test all(h -> footprint(u, Float64[], h).unconstrained == support(h), eachindex(y))
+    @test with_cell_batch(outer, u) do batch
+        all(eachindex(y)) do h
+            outer(batch, Float64[], h) ≈ full[h] &&
+                footprint(batch, Float64[], h).unconstrained == support(h)
+        end
+    end
+    @test footprint(view(u, :), Float64[], 1).unconstrained == support(1)
+    # Native derivatives over a cell's coordinates, conditional on shared ones.
+    ad = prepare_cell_factor_ad(prepare_ad, factors, :outer, u, support(1), REVERSE)
+    cell_ad = prepare_compact_cell_ad(prepare_ad, built, plan, :y, u, support(1), REVERSE;
+                                      partitioned, locality = :error)
+    for h in eachindex(y)
+        selected = support(h)
+        expected = [finite(p -> whole(p, h), u, j) for j in selected]
+        value, (sums, gradient) = ad_value_and_gradient(ad, u, Float64[], u[selected], selected, h)
+        @test value ≈ full[h]
+        @test isempty(sums)
+        @test gradient ≈ expected rtol = 1e-6 atol = 1e-8
+        value, gradient = ad_value_and_gradient(cell_ad, u, u[selected], selected, h)
+        @test value ≈ full[h]
+        @test gradient ≈ expected rtol = 1e-6 atol = 1e-8
+    end
+    # A strict compact cell over an overlay types its values the same way.
+    strict = prepare_cell_query(built, plan, :y; partitioned, locality = :error, u0 = u)
+    @test [strict(u, h) for h in eachindex(y)] ≈ full
+    # The row reads `cs` by index, so a partition over its coordinates computes
+    # it in each cell. That is reported, and every coordinate is in each cell's
+    # support, so a caller's width screen sees the cost.
+    by_cs = prepare_cell_factor_query(prepare_cell_factors(built, plan, :y;
+        partitioned = (:log_cs => collect(1:length(cs)),), locality = :error, u0 = u), :outer)
+    @test any(e -> e.value === :cs && e.status === :shared, partition_locality(by_cs.residual))
+    @test [by_cs(u, Float64[], h) for h in eachindex(y)] ≈ full
+    support_cs = partition_footprint_kernel(by_cs; shared = false)
+    @test all(h -> support_cs(u, Float64[], h).unconstrained == cs, eachindex(y))
+end
+
+# A row reducing a whole array is cross-row work, also beside typed arguments.
+function readout_reduced(kind, cs, conversion)
+    out = similar(cs, length(kind))
+    for i in eachindex(kind)
+        out[i] = conversion[i] + sum(cs)
+    end
+    out
+end
+const READOUT_REDUCED = @rkppl begin
+    log_conversion[1:L] .~ Normal.(0.0, 1.0)
+    log_cs[1:S] .~ Normal.(0.0, 1.0)
+    cs = exp.(log_cs)
+    conversion = exp.(log_conversion[label])
+    readings = readout_reduced(kind, cs, conversion)
+    @plate for i in eachindex(y)
+        y[i] ~ Normal(readings[i], 1.0)
+    end
+end
+@testset "a readout row reducing a whole array stays refused in strict cells" begin
+    label, kind = [1, 2, 1], [1, 2, 2]
+    y = [0.1, -0.2, 0.3]
+    plan = READOUT_REDUCED(; L = 2, S = 3, label, kind) | (; y)
+    built = build_kernel(plan)
+    u = collect(range(-0.3, 0.4; length = length(coordinate_names(built.layout))))
+    partitioned = (:log_conversion => collect(1:2),)
+    factors = prepare_cell_factors(built, plan, :y; partitioned, locality = :error, u0 = u)
+    @test_throws PartitionLocalityError prepare_cell_factor_query(factors, :outer)
+    @test_throws PartitionLocalityError prepare_cell_query(built, plan, :y; partitioned,
+                                                           locality = :error, u0 = u)
+end
 end

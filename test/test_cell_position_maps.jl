@@ -493,4 +493,152 @@ end
     end
     @test k(z, sd, 1) == 0.0
 end
+
+# A row reads whole arrays through closures and helpers that only index them,
+# and each arm of a branch writes the row once: the per-measurement readout of
+# an archive model. Row `i` reads `kind`, `label`, `measurement` and
+# `conversion` at `i`; `cs`, `natural`, `states` and `weights` are passed whole.
+column_mean(values, state, weight, column) =
+    sum(weight[j] * values[state[j], column] for j in eachindex(state))
+function readout(kind, label, measurement, states, weights, cs, natural, conversion, ratio)
+    out = similar(cs, length(kind))
+    for i in eachindex(kind)
+        m = measurement[i]; ix = states[m]; w = weights[m]; k = label[i]
+        if kind[i] == 1
+            out[i] = sum(w[t] * cs[ix[t]] for t in eachindex(ix)) * ratio
+        else
+            a = k == size(natural, 2) ? ratio : 1 - ratio
+            out[i] = a * column_mean(natural, ix, w, k) * conversion[i]
+        end
+    end
+    out
+end
+# Refused: a helper or a closure doing whole work on the array a row hands it,
+# one that mutates it, a row no path or two paths write, and a write in an
+# inner loop.
+total_of(w) = sum(w)
+helper_reduces(x, w) = [x[g] + total_of(w) for g in eachindex(x)]
+closure_reduces(x, w, ix) = [x[g] + sum(t -> t + sum(w), ix[g]) for g in eachindex(x)]
+closure_iterates(x, w) = [x[g] + sum(v * 2 for v in w) for g in eachindex(x)]
+overwrite(w, i) = (w[i] = 0.0; 1.0)
+helper_mutates(x, w, ix) = [x[g] + overwrite(w, ix[g]) for g in eachindex(x)]
+function one_arm(x)
+    out = similar(x)
+    for i in eachindex(x)
+        if x[i] > 0
+            out[i] = x[i]
+        end
+    end
+    out
+end
+function written_twice(x)
+    out = similar(x)
+    for i in eachindex(x)
+        out[i] = x[i]
+        if x[i] > 0
+            out[i] = 2x[i]
+        end
+    end
+    out
+end
+function written_in_loop(x)
+    out = similar(x)
+    for i in eachindex(x)
+        for t in 1:2
+            out[i] = t * x[i]
+        end
+    end
+    out
+end
+
+@testset "position-map proofs: rows reading whole arrays by index, writes per arm" begin
+    V, M, VI, VV = Vector{Float64}, Matrix{Float64}, Vector{Int}, Vector{Vector{Float64}}
+    VVI = Vector{Vector{Int}}
+    proof(f, T...) = RK._cell_position_proof(typeof(f), Any[T...])
+    p = proof(readout, VI, VI, VI, VVI, VV, V, M, V, Float64)
+    @test p.positions == [1, 2, 3, 8] && p.sources == [1]
+    # Without knowing a value is a number, the row's arithmetic may be whole work.
+    @test proof(readout, VI, VI, VI, VVI, VV, V, M, V, Any) === nothing
+    for (f, T) in ((helper_reduces, (V, V)), (closure_reduces, (V, V, VVI)),
+                   (closure_iterates, (V, V)), (helper_mutates, (V, V, VI)),
+                   (one_arm, (V,)), (written_twice, (V,)), (written_in_loop, (V,)))
+        @test proof(f, T...) === nothing
+    end
+end
+
+@kernel readout_rows(z::AbstractVector{Float64}, ratio::Float64, kind::Vector{Int},
+                     label::Vector{Int}, measurement::Vector{Int}, states::Vector{Vector{Int}},
+                     weights::Vector{Vector{Float64}}, cs::Vector{Float64},
+                     natural::Matrix{Float64}, y::Vector{Float64}) = begin
+    conversion = exp.(z[label])
+    mean = readout(kind, label, measurement, states, weights, cs, natural, conversion, ratio)
+    density = plate(mean, y) do m, v
+        -(v - m)^2 / 2
+    end
+end
+@testset "a readout reading whole arrays by index runs at a cell's rows" begin
+    kind, label = [1, 2, 2, 1, 2], [1, 2, 1, 2, 2]
+    measurement = [1, 2, 3, 1, 2]
+    states, weights = [[1, 3], [2], [3, 2, 1]], [[0.4, 0.6], [1.0], [0.2, 0.3, 0.5]]
+    cs = [1.1, 0.7, 1.9]
+    natural = [0.3 1.2; 0.8 0.4; 1.5 0.9]
+    y = [0.2, -0.1, 0.5, 0.3, 0.1]
+    z, ratio = [-0.4, 0.6], 0.7
+    bound = (; kind, label, measurement, states, weights, cs, natural, y)
+    ports = (:z, :ratio, :kind, :label, :measurement, :states, :weights, :cs, :natural, :y)
+    spec = plate_cell(readout_rows, :density; index = :cell, locality = :error)
+    k = prepare(spec; have = (ports..., :cell), want = :density_cell, bound)
+    whole = prepare(readout_rows; have = ports, want = :density, bound)
+    @test any(e -> e.value === :mean && e.status === :rows, partition_locality(k))
+    ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), z, ratio, 1; active = :z)
+    for cell in eachindex(y)
+        expected = whole(z, ratio)[cell]
+        @test k(z, ratio, cell) ≈ expected
+        value, gradient = ad_value_and_gradient(ad, z, ratio, cell)
+        @test value ≈ expected
+        @test gradient ≈ [finite(x -> whole(x, ratio)[cell], z, j)
+                          for j in eachindex(z)] rtol = 1e-6 atol = 1e-8
+    end
+end
+
+# A view of an input builds no elements, so one reader may read it whole (its
+# sum) while another reads it at rows. `u[2:5]` has the same row form but
+# copies its elements, so it stays a whole computation asked for at rows.
+@kernel view_read_whole(u::Vector{Float64}, label::Vector{Int}, y::Vector{Float64}) = begin
+    z = view(u, 2:5)
+    total = sum(z)
+    pool = z .- total / 4
+    density = plate(label, y) do l, v
+        -(v - pool[l])^2 / 2
+    end
+end
+@kernel copy_read_whole(u::Vector{Float64}, label::Vector{Int}, y::Vector{Float64}) = begin
+    z = u[2:5]
+    total = sum(z)
+    pool = z .- total / 4
+    density = plate(label, y) do l, v
+        -(v - pool[l])^2 / 2
+    end
+end
+@testset "a view read whole and at rows is an input; a copy is not" begin
+    label, y, u = [2, 4, 1], [0.1, -0.2, 0.3], collect(range(-0.5, 0.7; length = 6))
+    bound = (; label, y)
+    ports = (:u, :label, :y)
+    spec = plate_cell(view_read_whole, :density; index = :cell, locality = :error)
+    k = prepare(spec; have = (ports..., :cell), want = :density_cell, bound)
+    whole = prepare(view_read_whole; have = ports, want = :density, bound)
+    entries = partition_locality(k)
+    @test any(e -> e.value === :z && e.status === :input, entries)
+    @test any(e -> e.value === :pool && e.status === :rows, entries)
+    ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), u, 1; active = :u)
+    for cell in eachindex(y)
+        @test k(u, cell) ≈ whole(u)[cell]
+        value, gradient = ad_value_and_gradient(ad, u, cell)
+        @test value ≈ whole(u)[cell]
+        @test gradient ≈ [finite(x -> whole(x)[cell], u, j) for j in eachindex(u)] rtol = 1e-6 atol = 1e-8
+    end
+    copied = plate_cell(copy_read_whole, :density; index = :cell, locality = :error)
+    @test_throws PartitionLocalityError prepare(copied; have = (ports..., :cell),
+                                                want = :density_cell, bound)
+end
 end

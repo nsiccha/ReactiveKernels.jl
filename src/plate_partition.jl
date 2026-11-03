@@ -15,8 +15,9 @@
 # Classification of each value in a cell's cone (`_cell_locality`):
 #
 # - `:rows` — computed at the rows the cell reads (pushed);
-# - `:input` — a HAVE port, or a lazy view of inputs (`_cell_lazy_view`):
-#   read at rows as a view, or whole, never computed;
+# - `:input` — a HAVE port, a lazy view of inputs (`_cell_lazy_view`), or a
+#   `view(A, lo:hi)` of those that one reader also reads whole: read at rows
+#   as a view, or whole, never computed;
 # - `:data` — a bound constant (data): the same;
 # - `:scalar` — a number; it has no rows;
 # - `:shared` — computed whole because the evaluation genuinely needs it
@@ -166,6 +167,18 @@ function _cell_locality(p::Plan, d::_CellPushdowns)
         end
         legit[cid] = ok
     end
+    # Whether `cid` is existing storage or a `view` of it, which builds no
+    # elements however a reader reads it. `A[lo:hi]` shares its row form but
+    # copies, so it is not one.
+    function storage_view(cid)
+        (cid in have || cid in d.views) && return true
+        r = producer(cid)
+        r === nothing && return false
+        r.op isa _BoundConstant && return true
+        f = form(r)
+        f !== nothing && f.kind === :range_view && _cell_is_view_call(r) || return false
+        storage_view(cidof(r.inputs[findfirst(==(:range_source), f.roles)]))
+    end
     entries = Any[]
     for cell in p.recipes
         cell.op isa _AuthoredPlateCellOp || continue
@@ -213,6 +226,8 @@ function _cell_locality(p::Plan, d::_CellPushdowns)
                 (:scalar, :number, nothing)
             elseif whole_ok(cid)
                 (:shared, isempty(requested) ? :never_at_rows : :needed_whole, nothing)
+            elseif storage_view(cid)
+                (:input, isempty(requested) ? :read_whole : :read_at_rows, nothing)
             elseif haskey(d.refused, cid)
                 # A value whose type neither a declaration, bound data nor
                 # inference knows may be a number (no rows, nothing to refuse)

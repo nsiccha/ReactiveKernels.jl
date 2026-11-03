@@ -993,6 +993,14 @@ function _cell_range_view(native, position, mod)
     (position[source], parts)
 end
 
+# Whether a `:range_view` recipe is the `view` call, not the copying `A[lo:hi]`.
+function _cell_is_view_call(r::Recipe)
+    analyzed = _cell_native(r; outlined = true)
+    analyzed === nothing && return false
+    native = first(analyzed)
+    native isa Expr && native.head === :call
+end
+
 # `reshape(v, n, k...)` with `v` a parameter and the dimensions integer
 # literals or inputs: `(v's position, the dimensions' parts)`.
 function _cell_reshape(native, position, mod)
@@ -2090,8 +2098,16 @@ end
 # it (`_partial_emit_split!`).
 function _cell_outline_nodes(r::Recipe)
     length(r.outputs) == 1 && !r.effectful || return nothing
-    parts = _partial_split_parts(r)
-    parts === nothing && return nothing
+    # The strict boundaries also separate an undotted scalar argument of a
+    # broadcast (`sd .* (z .- total / n)`), which runs once before it either way.
+    for factors in (false, true)
+        parts = _partial_split_parts(r; factors)
+        found = parts === nothing ? nothing : _cell_marked_nodes(r, parts)
+        found === nothing || return found
+    end
+    nothing
+end
+function _cell_marked_nodes(r::Recipe, parts)
     nodes = parts.split.nodes
     index = IdDict{Any,Int}(node.expr => i for (i, node) in enumerate(nodes))
     named = falses(length(nodes))

@@ -69,16 +69,23 @@ end
 function (q::CellFactorQuery)(p::_CellValuePass, a, b)
     _check_cell_pass(p, q.shared)
     _check_cell_factor_args(q, a)
-    Base.invokelatest(q.residual, p.base, a, b, _cell_shared_values(q.shared)...)::Float64
+    Base.invokelatest(_cell_factor_value, q, p.base, a, b, _cell_shared_values(q.shared)...)::Float64
 end
 
-struct _CellFootprint{Q,K,P,S}
+struct _CellFootprint{Q,K,P,S,A}
     query::Q
     kernel::K
     plan::P
     selection::S
     specializations::Dict{DataType,Any}
+    argument_type::Type{A}
 end
+
+# The arguments a query's executed residual was typed from: a strict plan is
+# prepared again from them, and refuses a value it cannot type without them.
+_cell_query_args(q::CellFactorQuery) = q.args
+_cell_query_args(q::CellQuery) =
+    q.prefix === nothing ? (zeros(q.layout.total), 1) : q.prefix.args
 
 """
     partition_footprint_kernel(q::Union{CellQuery,CellFactorQuery}; shared=true)
@@ -106,10 +113,11 @@ function ReactiveKernels.partition_footprint_kernel(q::Union{CellQuery,CellFacto
     # original graph could otherwise reintroduce their shared producers.
     original = q isa CellQuery && q.prefix !== nothing ? q.prefix.residual_plan : residual.plan
     plan = _conditional_cell_plan(original)
-    kernel = Base.invokelatest(prepare, plan)
+    args = _cell_query_args(q)
+    kernel = Base.invokelatest(prepare, plan; exemplars = args)
     selection = :unconstrained => ReactiveKernels._FootprintSelection(q.shared.local_positions)
     footprint = Base.invokelatest(ReactiveKernels._partition_footprint_kernel, kernel, selection)
-    _CellFootprint(q, footprint, plan, selection, Dict{DataType,Any}())
+    _CellFootprint(q, footprint, plan, selection, Dict{DataType,Any}(), typeof(args))
 end
 function (fp::_CellFootprint)(u::AbstractVector{Float64}, args...)
     Base.invokelatest(_cell_footprint, fp, u, args...)
@@ -117,14 +125,16 @@ end
 (fp::_CellFootprint)(u::AbstractVector{<:Real}, args...) = fp(Vector{Float64}(u), args...)
 function (fp::_CellFootprint)(p::_CellValuePass, args...)
     _check_cell_pass(p, fp.query.shared)
-    Base.invokelatest(fp.kernel, p.base, args..., _cell_shared_values(fp.query.shared)...)
+    Base.invokelatest(_cell_footprint_at, fp, (p.base, args..., _cell_shared_values(fp.query.shared)...))
 end
 function _cell_footprint(fp::_CellFootprint, u, args...)
     q = fp.query
     prefix = q isa CellQuery && q.prefix !== nothing ? _query_prefix_kernel(q.prefix, u) : nothing
     values = _refresh_cell_shared!(q.shared, u, prefix)
-    point = (u, args..., values...)
-    kernel = if u isa Vector{Float64}
+    _cell_footprint_at(fp, (u, args..., values...))
+end
+function _cell_footprint_at(fp::_CellFootprint{<:Any,<:Any,<:Any,<:Any,A}, point) where {A}
+    kernel = if point isa A
         fp.kernel
     else
         get!(fp.specializations, typeof(point)) do

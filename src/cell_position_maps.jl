@@ -7,11 +7,12 @@
 # - a comprehension or `map` over `eachindex(x)`, `axes(x, 1)`, `1:length(x)`,
 #   `Base.OneTo(length(x))`, `x` itself, `enumerate(...)` or `zip(...)` of
 #   those (destructured or not), including straight-line wrappers;
-# - a loop over one such iterator that builds the result by exactly one
-#   unconditional `push!(out, row)` onto an empty vector, or `out[g] = row`
-#   into `similar(x)`, `zeros(T, length(x))` or `Vector{T}(undef, length(x))`.
-#   The body may hold branches, inner loops and nested calls on per-position
-#   values; its locals must be assigned in each iteration before they are read.
+# - a loop over one such iterator that builds the result by `push!(out, row)`
+#   onto an empty vector, or `out[g] = row` into `similar(x)`,
+#   `zeros(T, length(x))` or `Vector{T}(undef, length(x))`, once on every path
+#   through the body (each arm of a branch may write its own row). The body may
+#   hold branches, inner loops and nested calls on per-position values; its
+#   locals must be assigned in each iteration before they are read.
 #
 # A matrix argument is a position argument over its first axis: the loop runs
 # over `axes(x, 1)` (or `1:size(x, 1)`) and row `g` reads `x[g, d]` for any
@@ -31,8 +32,12 @@
 #
 # Every other argument (`field` in `field[ix]` with `ix = paths[g]`) is passed
 # whole, so it must be computed whole: the ordinary locality checks decide
-# whether that is legitimate (a shared or bound value) or refused. The
-# position `g` itself may only index a position argument; an expression of it
+# whether that is legitimate (a shared or bound value) or refused. A row may
+# hand such an array to a closure it builds (`sum(w[t] * cs[ix[t]] for t in
+# eachindex(ix))`) or to another helper (`mean_of(natural, ix, w, k)`) when that
+# code only indexes it. Its work is then the row's own, however long the array
+# is; any other use (`sum(natural)`) is cross-row work. The position `g` itself
+# may only index a position argument; an expression of it
 # (`x[g - 1]`), a read of another row of the result being built, a value
 # carried from one iteration to the next, `length(x)` of a position argument
 # read as a value, and mutation of anything not created in the iteration all
@@ -413,8 +418,9 @@ function _pm_call(st::_PMState, fr::_PMFrame, f::_PMValue, args::Vector{_PMValue
     if fv === Core.apply_type && n >= 1 && args[1].kind === :const &&
             args[1].data isa Type && args[1].data <: Function
         # A closure's type over its captures' types: the method is the same
-        # for every parameter.
-        all(a -> _pm_typelike(a) || a.kind === :typeof, args[2:end]) || _pm_fail()
+        # for every parameter. In a row, a capture may be a value of that row.
+        all(a -> _pm_typelike(a) || a.kind === :typeof || fr.iteration && a.kind === :local,
+            args[2:end]) || _pm_fail()
         return _PMValue(:closuretype, args[1].data)
     end
     if fv in _PM_TYPE_FUNCTIONS
@@ -565,7 +571,73 @@ function _pm_iteration_call(st::_PMState, fr::_PMFrame, fv, args::Vector{_PMValu
         return _PMValue(:local)
     end
     _pm_mutating(fv) && n >= 1 && args[1].kind !== :local && _pm_fail()
+    # A helper handed a whole array: its own body must only index it.
+    if fv isa Function && Base.issingletontype(typeof(fv)) &&
+            !(parentmodule(fv) in (Core, Base)) && any(a -> _pm_whole_array(st, a), args)
+        return _pm_row_function!(st, typeof(fv), args)
+    end
     foreach(a -> _pm_operand!(st, a), args)
+    _PMValue(:local)
+end
+
+# A value only an index read may use inside a row: an array argument passed
+# whole, or an array the prologue computed.
+_pm_whole_array(st::_PMState, a::_PMValue) =
+    a.kind === :param && _pm_array_argument(st, a.data) ||
+    a.kind === :shared && !_pm_shared_scalar(a.data)
+
+# One row's computation in a function body: a comprehension element, a closure
+# the row builds, a helper the row calls. Each call has fresh locals; their
+# values are joined over two passes so a branch or an inner loop sees every
+# assignment.
+function _pm_row_body!(st::_PMState, fr::_PMFrame)
+    code = fr.ci.code
+    for _ in 1:2, i in eachindex(code)
+        s = code[i]
+        if s isa Core.ReturnNode
+            isdefined(s, :val) || continue      # unreachable
+            _pm_operand!(st, _pm_value(fr, s.val))
+        elseif s isa Core.GotoNode
+            continue
+        elseif s isa Core.GotoIfNot
+            _pm_operand!(st, _pm_value(fr, s.cond))
+        elseif Meta.isexpr(s, :(=), 2) || !(_pm_noop(s))
+            _pm_statement!(st, fr, i)
+        end
+    end
+    nothing
+end
+
+# A closure a row builds over a whole array: however it is called, its element
+# is a value of this row, so its body is that row's work.
+function _pm_row_closure!(st::_PMState, T, fields::Vector{_PMValue})
+    found = _pm_method(T, (Any,))
+    found === nothing && _pm_fail()
+    method, ci = found
+    push!(st.calls, (T, nothing, method))
+    closure = _PMValue(:closure, (T, fields))
+    fr = _PMFrame(ci, Dict(1 => closure, 2 => _PMValue(:local)),
+                  Dict{Int,_PMValue}(), true, false, Int[], nothing, 0)
+    _pm_row_body!(st, fr)
+    _PMValue(:local)
+end
+
+# A helper a row calls with a whole array: its body runs under the row's rules.
+function _pm_row_function!(st::_PMState, F, args::Vector{_PMValue})
+    key = (F, Tuple(args))
+    key in st.stack && _pm_fail()
+    found = _pm_method(F, Tuple(_pm_static_type(st, a) for a in args))
+    found === nothing && _pm_fail()
+    method, ci = found
+    push!(st.calls, (F, args, method))
+    push!(st.stack, key)
+    try
+        slots = Dict{Int,_PMValue}(k + 1 => a for (k, a) in enumerate(args))
+        slots[1] = _PMValue(:const, F.instance)
+        _pm_row_body!(st, _PMFrame(ci, slots, Dict{Int,_PMValue}(), true, false, Int[], nothing, 0))
+    finally
+        delete!(st.stack, key)
+    end
     _PMValue(:local)
 end
 
@@ -582,6 +654,8 @@ function _pm_rhs(st::_PMState, fr::_PMFrame, ex)
         if fr.iteration
             T.kind in (:const, :closuretype, :typeval) || _pm_fail()
             T.kind === :const && T.data isa Type && T.data <: Core.Box && _pm_fail()
+            T.kind === :closuretype && any(a -> _pm_whole_array(st, a), fields) &&
+                return _pm_row_closure!(st, T.data, fields)
             foreach(a -> _pm_operand!(st, a), fields)
             return _PMValue(:local)
         end
@@ -602,6 +676,11 @@ function _pm_statement!(st::_PMState, fr::_PMFrame, i::Int)
     s isa Union{Core.GotoNode,Core.GotoIfNot,Core.ReturnNode} && _pm_fail()
     assigned = Meta.isexpr(s, :(=), 2)
     v = _pm_rhs(st, fr, assigned ? s.args[2] : s)
+    # A number read whole is one of the row's values, in any branch.
+    if assigned && fr.iteration && v.kind === :param && !_pm_array_argument(st, v.data)
+        _pm_whole!(st, v.data)
+        v = _PMValue(:local)
+    end
     fr.ssa[i] = v
     if assigned
         lhs = s.args[1]
@@ -626,23 +705,8 @@ function _pm_comprehension(st::_PMState, closure::_PMValue, iterator)
     found === nothing && _pm_fail()
     method, ci = found
     push!(st.calls, (T, nothing, method))
-    fr = _PMFrame(ci, Dict(1 => closure, 2 => _pm_element(iterator)),
-                  Dict{Int,_PMValue}(), true, false, Int[], nothing, 0)
-    # Each element call has fresh locals; their values are joined over two
-    # passes so a branch or an inner loop sees every assignment.
-    for _ in 1:2, i in eachindex(ci.code)
-        s = ci.code[i]
-        if s isa Core.ReturnNode
-            isdefined(s, :val) || continue      # unreachable
-            _pm_operand!(st, _pm_value(fr, s.val))
-        elseif s isa Core.GotoNode
-            continue
-        elseif s isa Core.GotoIfNot
-            _pm_operand!(st, _pm_value(fr, s.cond))
-        elseif Meta.isexpr(s, :(=), 2) || !(_pm_noop(s))
-            _pm_statement!(st, fr, i)
-        end
-    end
+    _pm_row_body!(st, _PMFrame(ci, Dict(1 => closure, 2 => _pm_element(iterator)),
+                               Dict{Int,_PMValue}(), true, false, Int[], nothing, 0))
     _PMValue(:rows, (iterator, ()))
 end
 
@@ -782,21 +846,36 @@ function _pm_loop(st::_PMState, fr::_PMFrame)
     v = _pm_value(fr, code[step].args[2].args[3])
     v.kind === :state && v.data == desc || _pm_fail()
     # A filled result may be read and written at its row any number of times;
-    # a row it never writes keeps the fill value. Otherwise exactly one
-    # accumulation of a whole row, executed once per iteration: no jump
-    # within the body passes over it or returns to before it.
+    # a row it never writes keeps the fill value. Otherwise every path through
+    # the body writes one whole row exactly once.
     if !(prealloc && accumulator.data[3])
-        length(fr.accumulations) == 1 && !fr.partial || _pm_fail()
-        p = only(fr.accumulations)
-        for i in body
-            r = code[i]
-            r isa Union{Core.GotoNode,Core.GotoIfNot} || continue
-            label = r isa Core.GotoNode ? r.label : r.dest
-            min(i, label) < p < max(i, label) && _pm_fail()
-        end
+        fr.partial && _pm_fail()
+        _pm_writes_once(code, head + 1, step, fr.accumulations) || _pm_fail()
     end
     _pm_assigned_before_read(code, head + 1, step, assigned) || _pm_fail()
     _PMValue(:rows, (desc, prealloc ? accumulator.data[4] : ()))
+end
+
+# Whether every path from `first` to `last` passes exactly one of `writes`. A
+# write in an inner loop reaches `last` with a count above one.
+function _pm_writes_once(code, first::Int, last::Int, writes::Vector{Int})
+    counts = Dict{Int,Set{Int}}(first => Set(0))
+    work = [first]
+    while !isempty(work)
+        i = pop!(work)
+        i == last && continue
+        s = code[i]
+        out = Set(min(c + (i in writes), 2) for c in counts[i])
+        for t in (s isa Core.GotoNode ? (s.label,) :
+                  s isa Core.GotoIfNot ? (i + 1, s.dest) : (i + 1,))
+            first <= t <= last || return false
+            seen = get!(Set{Int}, counts, t)
+            issubset(out, seen) && continue
+            union!(seen, out)
+            push!(work, t)
+        end
+    end
+    get(counts, last, Set{Int}()) == Set(1)
 end
 
 # Whether every read of a slot in `assigned` within `first:last` follows an
