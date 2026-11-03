@@ -4406,8 +4406,10 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
     if partition
         push!(body.args, Expr(:(=), cell,
             Expr(:call, GlobalRef(@__MODULE__, :_partition_rows), index_arg)))
-        push!(body.args, Expr(:call, GlobalRef(@__MODULE__, :_partition_check_rows),
-            domain, cell))
+        cells = windows === nothing ? nothing : _partition_cells_arguments(windows, recipe)
+        push!(body.args, cells === nothing ?
+            Expr(:call, GlobalRef(@__MODULE__, :_partition_check_rows), domain, cell) :
+            Expr(:call, GlobalRef(@__MODULE__, :_partition_check_rows), domain, cell, cells...))
         row = cell
     else
         push!(body.args, Expr(:(=), cell,

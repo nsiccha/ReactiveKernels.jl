@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.69
+
+- **Breaking:** `plate_partition` refuses a key whose length differs from its
+  plate's cell count, with an `ArgumentError` naming the key and both counts. A
+  shorter key used to be accepted: the cells past its end belonged to no
+  partition, so the labels no longer summed to the plate. A longer key used to
+  raise a `BoundsError` only for a label holding a position past the end. A
+  partition prepared with its label bound is not checked, because binding the
+  label folds the rows the check reads.
+
 ## 0.1.68
 
 - `plate_partition`'s `by` accepts the pairs its docstring promises: one

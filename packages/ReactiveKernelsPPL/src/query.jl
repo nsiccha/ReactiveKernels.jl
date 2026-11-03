@@ -1339,7 +1339,8 @@ const _PARTITION_TOTAL = :_ppl_partition_total
 # `by`. Every column must be a supplied data column of the binding.
 function _partition_keys(plan::StructuralPlan, names, by)
     keys_by_name = ReactiveKernels._partition_by_map(by, names; what = "observation",
-        refuse = message -> ContractValidationError("[query] " * message))
+        refuse = message -> ContractValidationError("[query] " * message *
+            ". A key is a column name or, per observation, a vector of labels"))
     columns = _query_columns(plan)
     for name in names
         key = keys_by_name[name]
@@ -1348,6 +1349,44 @@ function _partition_keys(plan::StructuralPlan, names, by)
             "the columns are $(join(columns, ", "))"))
     end
     keys_by_name
+end
+
+# Keys `by` gives as their labels (`observation => labels`), one label per cell.
+# A label need not be a model input, and no statement need read it, so it stays
+# out of the program: each is a fresh input of this query alone, a port on a copy
+# of the graph and a column of a copy of the binding, read from here on like any
+# data column. Returns the copies and `by` with each such key named by its port;
+# `built`, `plan` and `by` themselves when `by` gives no labels.
+function _partition_label_keys(built, plan::StructuralPlan, by)
+    gives_labels(entry) = entry isa Pair && first(entry) isa Union{Symbol,AbstractString} &&
+        last(entry) isa AbstractVector
+    entries = ReactiveKernels._partition_by_entries(by)
+    any(gives_labels, entries) || return built, plan, by
+    spec = ReactiveKernels._copy_cell_factor_spec(built.spec)
+    columns = copy(plan.columns)
+    labels_by_name = Dict{Symbol,Any}()
+    named = Any[]
+    for entry in entries
+        if gives_labels(entry)
+            name = Symbol(first(entry))
+            port = Symbol(:_ppl_partition_labels_, name)
+            if !haskey(labels_by_name, name)
+                labels = collect(last(entry))
+                labels_by_name[name] = labels
+                spec.ports[port] = value!(spec.graph, port, typeof(labels))
+                push!(spec.port_order, port)
+                push!(spec.have_names, port)
+                columns[port] = labels
+            elseif !isequal(labels_by_name[name], last(entry))
+                throw(ContractValidationError(
+                    "[query] `by` gives observation :$name two different vectors of labels"))
+            end
+            push!(named, name => port)
+        else
+            push!(named, entry isa Pair ? Pair(first(entry), last(entry)) : entry)
+        end
+    end
+    merge(built, (; spec)), _with(plan; columns), named
 end
 
 # Each observation's cell plate partitioned by its key, and their sum: the
@@ -1426,7 +1465,10 @@ entry per cell of each observation's plate (one row per entry of an
 elementwise observation, one per iteration of an `@plate for` loop), either
 one column name for every observation or, per observation, a named tuple, a
 dictionary, one `observation => column` pair or a collection of such pairs.
-[`partition_labels`](@ref) lists the labels.
+Per observation, `by` may instead give the labels themselves,
+`observation => labels`: a vector with one label per cell, which need not be
+data of the model and which no statement need read. A key of another length is
+refused. [`partition_labels`](@ref) lists the labels.
 
 A partition runs as one compiled pass over its cells (RK `plate_partition`):
 each plate loops once over the positions holding the label, and every value
@@ -1474,6 +1516,12 @@ function prepare_partition(built, plan::StructuralPlan, observations; by,
     isempty(names) && throw(ContractValidationError(
         "[query] prepare_partition needs at least one observation name"))
     _refuse_absent_cells(plan, names)
+    _prepare_partition(_partition_label_keys(built, plan, by)..., names;
+        locality, on_error, partitioned, u0)
+end
+
+function _prepare_partition(built, plan::StructuralPlan, by, names;
+        locality, on_error, partitioned, u0)
     keys_by_name = _partition_keys(plan, names, by)
     labels = _partition_labels(plan, names, keys_by_name)
     have = (_query_have(plan)..., _PARTITION_PORT, _PLAN_PORT)
@@ -1712,8 +1760,8 @@ end
     prepare_partition_sampler(built, plan, observations, u0; by, backend, compact = true,
                               partitioned = (), locality = :error, on_error = nothing) -> PartitionSampler
 
-[`prepare_partition`](@ref) plus a `prepare_ad` gradient; the label stays a
-constant. `u0` is a length-consistent exemplar and `backend` a
+[`prepare_partition`](@ref), with the same `by`, plus a `prepare_ad` gradient;
+the label stays a constant. `u0` is a length-consistent exemplar and `backend` a
 DifferentiationInterface backend, as for [`prepare_sampler`](@ref).
 
 With `compact = true` (the default) the gradient is over each partition's
@@ -1754,6 +1802,12 @@ function prepare_partition_sampler(built, plan::StructuralPlan, observations,
     isempty(names) && throw(ContractValidationError(
         "[query] prepare_partition_sampler needs at least one observation name"))
     _refuse_absent_cells(plan, names)
+    _prepare_partition_sampler(_partition_label_keys(built, plan, by)..., names,
+        layout, exemplar; backend, compact, partitioned, locality, on_error)
+end
+
+function _prepare_partition_sampler(built, plan::StructuralPlan, by, names, layout, exemplar;
+        backend, compact, partitioned, locality, on_error)
     keys_by_name = _partition_keys(plan, names, by)
     labels = _partition_labels(plan, names, keys_by_name)
     isempty(labels) && throw(ContractValidationError(
