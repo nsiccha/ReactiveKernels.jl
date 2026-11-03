@@ -25,6 +25,11 @@ are recorded in the git history only.
   block, or computes it whole, reads the cell's own block. Joint priors stay
   one factor per index; shape checks, values and ordinary Reverse gradients
   are unchanged, and a cell's work no longer grows with its block's length.
+- Strict cell factors (`prepare_cell_factors(...; locality = :error)`) now
+  accept such observations: a factor term reads only its row's coordinate,
+  with the joint shape check still applied to the whole value. Per-index
+  weights and indices may come as data columns or as one named tuple of row
+  vectors per index (`r = rows[i]; mu[i] = r.weight1 .* field[i][r.index1]`).
   Requires ReactiveKernels 0.1.67.
 
 ## 0.1.75

@@ -217,6 +217,11 @@ end
 # `MethodError`.
 @inline _readonly_gather(w::_CellWindow{<:Any,<:Any,<:Tuple{Any}},
                          indices::AbstractVector{<:Integer}) = w[indices]
+# `view(v, I)` of a vector has the linear gather's form (`_cell_form`): at a
+# cell's rows it reads the window's rows `I` as that gather does. Values are
+# read-only in a cell, so these rows serve as the view.
+@inline Base.view(w::_CellWindow{<:Any,<:Any,<:Tuple{Any}},
+                  indices::AbstractVector{<:Integer}) = w[indices]
 
 Base.show(io::IO, w::_CellWindow{<:Any,Int}) =
     print(io, "cell window at row ", w.rows, " of ", summary(w.data))
@@ -727,6 +732,8 @@ function _cell_form(r::Recipe; outlined::Bool = false)
     analyzed = _cell_native(r; outlined)
     analyzed === nothing && return nothing
     native, params, mod = analyzed
+    checked = _cell_checked_form(r, native, params, mod)
+    checked === nothing || return checked
     position = Dict{Symbol,Int}(name => j for (j, name) in enumerate(params))
     uses = [Set{Symbol}() for _ in params]
     # A source's gather indices, in first-read order, and whether its gathers
@@ -1167,6 +1174,37 @@ function _cell_reduce_fits(r::Recipe, f::_CellForm, static_type)
     rank === nothing || all(d -> d in f.reduction.dims, 2:rank)
 end
 
+# A checked alias `f(value, others...)` (`_footprint_checked_alias`) whose
+# owner supplies a validator (`_checked_alias_validator`): its rows are its
+# value argument's rows, and the validator checks the whole argument from its
+# type and axes once per evaluation, so the check still runs and no other row
+# is read. Every argument must be one input, the value only once.
+function _cell_checked_form(r::Recipe, native, params, mod)
+    Meta.isexpr(native, :call) && !_native_callee_shadowed(native.args[1], params) ||
+        return nothing
+    f = _cell_binding(native.args[1], mod)
+    k = _footprint_checked_alias(f)
+    k > 0 || return nothing
+    validator = _checked_alias_validator(f)
+    validator === nothing && return nothing
+    reference = GlobalRef(parentmodule(validator), nameof(validator))
+    isdefined(reference.mod, reference.name) &&
+        getglobal(reference.mod, reference.name) === validator || return nothing
+    arguments = native.args[2:end]
+    length(arguments) >= k && all(a -> a isa Symbol && a in params, arguments) ||
+        return nothing
+    slots = Int[findfirst(==(a), params) for a in arguments]
+    alias = slots[k]
+    count(==(alias), slots) == 1 || return nothing
+    n = length(r.inputs)
+    roles = fill(:whole, n)
+    roles[alias] = :leaf
+    indices = Vector{Int}[Int[] for _ in 1:n]
+    _CellForm(:checked, roles, zeros(Int, n), [alias], 0, indices, Any[],
+        _cell_direct_reads(indices),
+        (; validator = reference, others = Int[slots[i] for i in eachindex(slots) if i != k]))
+end
+
 # An identity `b::T = a` (a typed alias RK keeps as a recipe): its rows are
 # its input's rows, converted to the declared type as the typed local the
 # whole program assigns converts them (`_declare_typed_output!`). Only a
@@ -1597,7 +1635,7 @@ function _cell_bound_capture_check(p::Plan, producers, static_type, known, outli
             return shapes[cid] = f.kind === :range_view ?
                 _cell_range_shape(literal) : _cell_dims_shape(literal)
         end
-        f.kind in (:identity, :pointwise, :columns, :hcat, :reduce, :transposed,
+        f.kind in (:identity, :checked, :pointwise, :columns, :hcat, :reduce, :transposed,
                    :array_arithmetic, :position_map) ||
             return nothing
         parts = Any[]
@@ -1708,8 +1746,20 @@ _cell_lazy_view(@nospecialize(op)) = false
 # existing storage. In particular, selecting one bound ragged array does not
 # compute its elements. Only input-backed projections qualify: selecting a
 # computed array of arrays must not hide the work that produced its elements.
-function _cell_input_views(p::Plan)
+# A property read `x.name` that loads a field of `x`: `x` is a named tuple, or
+# a concrete struct whose `getproperty` is Base's `getfield` fallback. Any
+# other `getproperty` may compute its value.
+function _cell_field_projection(T)
+    T isa Type || return false
+    T <: NamedTuple && return true
+    isconcretetype(T) && isstructtype(T) || return false
+    m = which(Base.getproperty, Tuple{T,Symbol})
+    m.module === Base && m.sig == Tuple{typeof(Base.getproperty),Any,Symbol}
+end
+
+function _cell_input_views(p::Plan; types = nothing)
     cid(v) = canon_id(p.graph, v.id)
+    type_of(v) = types === nothing ? valtype(v) : get(types, cid(v), valtype(v))
     storage = Set(cid(v) for v in p.have)
     views = Set{ValueId}()
     for r in p.recipes
@@ -1743,6 +1793,16 @@ function _cell_input_views(p::Plan)
                     !_native_callee_shadowed(native.args[1], params) &&
                     _cell_binding(native.args[1], mod) === Base.vec &&
                     native.args[2] == only(params)
+                # A field of existing storage is existing storage: a cell's
+                # NamedTuple of row vectors (`rows[i].weight1`) is read at rows.
+                field = Meta.isexpr(native, :., 2) ? native.args :
+                    Meta.isexpr(native, :call, 3) &&
+                    !_native_callee_shadowed(native.args[1], params) &&
+                    _cell_binding(native.args[1], mod) === Base.getproperty ?
+                    native.args[2:3] : nothing
+                projection |= field !== nothing && first(field) == only(params) &&
+                    last(field) isa QuoteNode && last(field).value isa Symbol &&
+                    _cell_field_projection(type_of(only(r.inputs)))
             end
         end
         if _cell_lazy_view(r.op) || projection
@@ -1783,7 +1843,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
     end
     branch_read = _cell_bound_capture_check(p, producers, static_type, known, outlined)
     # An input-backed view's output is read like a HAVE port: at rows as a view.
-    views = _cell_input_views(p)
+    views = _cell_input_views(p; types)
     fixed = Set(cidof(v) for v in Iterators.flatten((p.have, p.want)))
     union!(fixed, views)
     forms = Dict{Int,_CellForm}()
@@ -1810,7 +1870,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
     function shaped(cid)
         r = only(producers[cid])
         f = forms[r.id]
-        f.kind in (:pointwise, :identity, :columns, :hcat, :vcat, :range_view, :reshape,
+        f.kind in (:pointwise, :identity, :checked, :columns, :hcat, :vcat, :range_view, :reshape,
                    :reduce, :transposed, :array_arithmetic, :position_map) && return true
         inputs = r.inputs
         factor = cidof(inputs[findfirst(==(:factor), f.roles)])
@@ -2146,7 +2206,7 @@ function _cell_scalar_reads(p::Plan; argument_types = nothing)
     # elements do: the projection records their input-backed provenance when
     # a downstream cell asks for rows inside that selected array.
     fixed = Set(canon_id(p.graph, v.id) for v in p.have)
-    union!(fixed, _cell_input_views(p))
+    union!(fixed, _cell_input_views(p; types))
     for r in p.recipes
         r.op isa _BoundConstant || continue
         union!(fixed, (canon_id(p.graph, v.id) for v in r.outputs))
@@ -2599,7 +2659,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
     f = d.forms[r.id]
     U = e.unions[cid]
     f.kind === :vcat && return _cell_vcat_window!(e, cid, r, f, U)
-    if f.kind in (:pointwise, :identity, :columns, :hcat, :range_view, :reshape, :reduce,
+    if f.kind in (:pointwise, :identity, :checked, :columns, :hcat, :range_view, :reshape, :reduce,
                   :transposed, :array_arithmetic, :position_map)
         push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row),
             _cell_shape!(e, cid), U, e.sorted))
@@ -2678,6 +2738,17 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
         _lower_authored_plate_native!(e.body, e.runtime_ops[1:offset],
             e.runtime_recipes[1:offset], r.op, args, d.plates[r.id], window, nothing)
         return window
+    end
+    if f.kind === :checked
+        # Validate the whole argument once, from its type and full axes, then
+        # read the argument's rows: the alias returns its argument unchanged.
+        k = only(f.leaves)
+        input = canon_id(d.graph, r.inputs[k].id)
+        shape = input in d.pushed ? _cell_shape!(e, input) : _cell_leaf_shape_expr(e, input)
+        push!(e.body.args, Expr(:call, f.literal.validator,
+            _cell_original_type_expr(e, input), shape, args[f.literal.others]...))
+        return _cell_bind!(e, :cell_rows,
+            Expr(:call, GlobalRef(Base, :convert), valtype(only(r.outputs)), args[k]))
     end
     call = f.kind === :array_arithmetic ?
         Expr(:call, GlobalRef(Base, nameof(f.literal.f)), args[f.literal.positions]...) :

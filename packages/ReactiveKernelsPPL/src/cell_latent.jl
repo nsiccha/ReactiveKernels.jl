@@ -760,6 +760,20 @@ end
 # reads of the block it checks (`ReactiveKernels._footprint_access`).
 ReactiveKernels._footprint_checked_alias(::typeof(_ppl_cell_joint_checked)) = 1
 
+# The same check from the value's type and axes, for a strict cell that reads
+# the value at rows (`ReactiveKernels._checked_alias_validator`). A value of
+# unknown abstract type is checked by its axes alone.
+function _ppl_cell_joint_check_rows(::Type{T}, axes::Tuple, shape::Tuple, pos::Int) where {T}
+    valid = isempty(shape) ? T <: Number :
+        (T <: AbstractArray || !(isconcretetype(T) || T <: Number)) &&
+            map(length, axes) == shape
+    valid || throw(ArgumentError("a cell latent's geometry constrained index $pos " *
+        "to a $T with axes $axes; its shape there is $shape"))
+    return nothing
+end
+ReactiveKernels._checked_alias_validator(::typeof(_ppl_cell_joint_checked)) =
+    _ppl_cell_joint_check_rows
+
 # A cell's block of the packed array: a number, a vector, or an array of
 # its dimensions. The packed values are read in place.
 _ppl_cell_latent_block(site, offsets, dims::AbstractVector{<:Tuple}, pos::Int) =

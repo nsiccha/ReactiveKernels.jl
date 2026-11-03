@@ -38,6 +38,19 @@ end
     return terms
 end
 
+# Weighted gathers inside one compound expression read the gathered entries.
+@kernel weighted(u::AbstractVector{Float64}, ranges::Vector{UnitRange{Int}},
+                 ks::Vector{Int}, picks::Vector{Vector{Int}},
+                 y::Vector{Vector{Float64}}) = begin
+    packed = view(u, 1:length(u))
+    terms = plate(ks, picks, y) do k, p, yk
+        block = view(packed, ranges[k])
+        m = 0.5 .* block[p] .+ block[p] .^ 2
+        return -sum(abs2, yk .- m) / 2
+    end
+    return terms
+end
+
 const HAVE = (:u, :ranges, :ks, :picks, :y, :t)
 
 function cases()
@@ -48,12 +61,15 @@ end
 
 reference(kind, u, d, t) = begin
     block = u[d.ranges[t]]
-    values = kind === :selected ? block : cumsum(block)
-    -sum(abs2, fill(0.1, length(d.picks[t])) .- values[d.picks[t]]; init = 0.0) / 2
+    values = kind === :coupled ? cumsum(block) : block
+    m = values[d.picks[t]]
+    kind === :weighted && (m = 0.5 .* m .+ m .^ 2)
+    -sum(abs2, fill(0.1, length(d.picks[t])) .- m; init = 0.0) / 2
 end
 
 @testset "cell footprints follow reads through views" begin
-    for (kind, k) in ((:selected, selected), (:coupled, coupled)), d in cases()
+    for (kind, k) in ((:selected, selected), (:coupled, coupled), (:weighted, weighted)),
+            d in cases()
         u = [0.1 + 0.07i for i in 1:last(last(d.ranges))]
         y = [fill(0.1, length(p)) for p in d.picks]
         ks = collect(eachindex(d.ranges))
@@ -69,7 +85,7 @@ end
             @test query(u, d.ranges, ks, d.picks, y, t) ≈ expected
             @test query(tracked, d.ranges, ks, d.picks, y, t) ≈ expected
             read = Base.invokelatest(footprint, u, d.ranges, ks, d.picks, y, t).u
-            if kind === :selected
+            if kind in (:selected, :weighted)
                 @test read == sort!(unique(d.ranges[t][d.picks[t]]))
                 @test sort!(unique(tracked.reads)) == read
             else
@@ -104,6 +120,45 @@ end
     second = head[2]
     value = second + sum(w)
     return value
+end
+
+# A field of existing storage is existing storage: a cell reads a named
+# tuple's vector field at its rows. A property that `getproperty` computes
+# would be computed whole, which strict locality refuses.
+@kernel fields(u::Vector{Float64}, data, y::Vector{Float64}) = begin
+    w = data.weight
+    mu = w .* u
+    terms = plate(mu, y) do m, yi
+        return -(m - yi)^2 / 2
+    end
+    return terms
+end
+struct ComputedWeight
+    raw::Vector{Float64}
+end
+Base.getproperty(c::ComputedWeight, s::Symbol) =
+    s === :weight ? 2 .* getfield(c, :raw) : getfield(c, s)
+
+@testset "cell reads of storage fields" begin
+    u, y = [0.1, 0.4, -0.2], [0.0, 0.3, 0.1]
+    data = (; weight = [0.5, 2.0, 1.5])
+    spec = plate_cell(fields, :terms; index = :t, locality = :error)
+    query = prepare(spec; have = (:u, :data, :y, :t), want = :terms_cell,
+        exemplars = (u, data, y, 1))
+    tracked = (; weight = ReadVector(copy(data.weight)))
+    traced = prepare(spec; have = (:u, :data, :y, :t), want = :terms_cell,
+        exemplars = (u, tracked, y, 1))
+    for t in 1:3
+        empty!(tracked.weight.reads)
+        expected = -(data.weight[t] * u[t] - y[t])^2 / 2
+        @test query(u, data, y, t) ≈ expected
+        @test traced(u, tracked, y, t) ≈ expected
+        @test unique(tracked.weight.reads) == [t]
+        @test partition_footprint(query, u, data, y, t).u == [t]
+    end
+    computed = ComputedWeight([0.25, 1.0, 0.75])
+    @test_throws PartitionLocalityError prepare(spec; have = (:u, :data, :y, :t),
+        want = :terms_cell, exemplars = (u, computed, y, 1))
 end
 
 @testset "footprints through typed and untyped views" begin

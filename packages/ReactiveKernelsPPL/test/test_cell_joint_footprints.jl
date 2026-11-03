@@ -204,4 +204,110 @@ end
         @test gradient ≈ central(joint, fx.u) atol = 1e-8 rtol = 1e-6
     end
 end
+
+# Observations of weighted reads of the block, the weights and indices as data
+# columns or as one NamedTuple per index. A strict factor term reads its row's
+# coordinate; a property of a cell's NamedTuple of row vectors is read at rows.
+struct ComputedRows
+    w::Vector{Float64}
+    index1::Vector{Int}
+end
+Base.getproperty(r::ComputedRows, s::Symbol) =
+    s === :weight1 ? 2 .* getfield(r, :w) : getfield(r, s)
+
+function weighted_fixture(law, spelling)
+    n, index1, weight1 = [3, 2], [[1, 3], [2]], [[0.5, 0.25], [2.0]]
+    y = [[0.1, 0.2], [0.3]]
+    L = GlobalRef(@__MODULE__, law)
+    data, ast = if spelling === :columns
+        (; n, index1, weight1, y), quote
+            @plate for i in eachindex(n)
+                field[i] ~ $L(n[i])
+                mu[i] = weight1[i] .* field[i][index1[i]]
+                y[i] .~ Normal.(mu[i], 0.2)
+            end
+        end
+    else
+        rows = spelling === :namedtuple ?
+            [(; index1 = index1[i], weight1 = weight1[i]) for i in 1:2] :
+            [ComputedRows(weight1[i] ./ 2, index1[i]) for i in 1:2]
+        (; n, rows, y), quote
+            @plate for i in eachindex(n)
+                field[i] ~ $L(n[i])
+                r = rows[i]
+                mu[i] = r.weight1 .* field[i][r.index1]
+                y[i] .~ Normal.(mu[i], 0.2)
+            end
+        end
+    end
+    bound = bind_data(lower_rkppl(ast, data; mod = @__MODULE__, conditioned = (:y,)), data)
+    built = build_kernel(bound)
+    u = [0.1 + 0.07i for i in 1:built.layout.total]
+    (; data, bound, built, u, n, index1, weight1, y, offsets = cumsum([0; n]))
+end
+
+term_value(fx, v, i, t) = -log(2pi) / 2 - log(0.2) -
+    ((fx.y[i][t] - fx.weight1[i][t] * v[fx.offsets[i] + fx.index1[i][t]]) / 0.2)^2 / 2
+
+@testset "joint cell latent factors read their selected coordinates at rows" begin
+    for spelling in (:columns, :namedtuple)
+        fx = weighted_fixture(:IdentityLaw, spelling)
+        saved = deepcopy((fx.data, fx.u))
+        f = prepare_cell_factors(fx.built, fx.bound, :y; locality = :error)
+        @test length(cell_reductions(f)) == 1
+        term = prepare_cell_factor_query(f, 1)
+        # The term reads the checked value at rows and validates it whole.
+        @test occursin("_ppl_cell_joint_check_rows", string(code_expr(term.kernel)))
+        term_footprint = partition_footprint_kernel(term.kernel)
+        ad = prepare_ad(term.kernel, AutoEnzyme(; mode = Enzyme.Reverse), fx.u, 1, 1;
+            active = :unconstrained)
+        cell = prepare_cell_query(fx.built, fx.bound, :y; locality = :error)
+        cell_footprint = partition_footprint_kernel(cell.kernel)
+        for i in 1:2
+            rows = reduction_rows(f, 1, i)
+            @test length(rows) == length(fx.index1[i])
+            total = 0.0
+            for t in eachindex(rows)
+                coordinate = fx.offsets[i] + fx.index1[i][t]
+                tracked = ReadVector(copy(fx.u), Int[])
+                value = Base.invokelatest(term, tracked, i, t)
+                @test value ≈ term_value(fx, fx.u, i, t)
+                @test unique(tracked.reads) == [coordinate]
+                @test Base.invokelatest(term_footprint, fx.u, i, t).unconstrained == [coordinate]
+                v, gradient = ad_value_and_gradient(ad, fx.u, i, t)
+                @test v ≈ value
+                @test gradient ≈ central(w -> term_value(fx, w, i, t), fx.u) atol = 1e-8 rtol = 1e-6
+                @test findall(!iszero, gradient) == [coordinate]
+                total += value
+            end
+            # The terms are the cell, whose gathers inside one compound
+            # expression read only the gathered coordinates.
+            @test total ≈ Base.invokelatest(cell, fx.u, i)
+            tracked = ReadVector(copy(fx.u), Int[])
+            Base.invokelatest(cell, tracked, i)
+            read = Base.invokelatest(cell_footprint, fx.u, i).unconstrained
+            @test read == sort!(unique(fx.offsets[i] .+ fx.index1[i]))
+            @test sort!(unique(tracked.reads)) == read
+        end
+        @test (fx.data, fx.u) == saved
+    end
+    check = ReactiveKernelsPPL._ppl_cell_joint_check_rows
+    @test check(Vector{Float64}, (Base.OneTo(3),), (3,), 1) === nothing
+    @test_throws ArgumentError check(Vector{Float64}, (Base.OneTo(2),), (3,), 1)
+    @test_throws ArgumentError check(Float64, (), (3,), 1)
+    @test check(Float64, (), (), 1) === nothing
+    @test_throws ArgumentError check(Vector{Float64}, (Base.OneTo(1),), (), 1)
+    # The shape check still covers the whole value when a term reads the
+    # checked value at rows. (This transform itself computes its value whole,
+    # so strict locality would refuse it first; `:warn` proceeds.)
+    fx = weighted_fixture(:ShortLaw, :columns)
+    f = prepare_cell_factors(fx.built, fx.bound, :y; locality = :warn)
+    term = prepare_cell_factor_query(f, 1)
+    @test_throws ArgumentError Base.invokelatest(term, fx.u, 1, 1)
+    # A property that `getproperty` computes is not storage: reading it at rows
+    # would compute it whole, which strict locality refuses.
+    fx = weighted_fixture(:IdentityLaw, :computed)
+    f = prepare_cell_factors(fx.built, fx.bound, :y; locality = :error)
+    @test_throws ReactiveKernels.PartitionLocalityError prepare_cell_factor_query(f, 1)
+end
 end

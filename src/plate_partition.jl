@@ -62,7 +62,8 @@ function Base.showerror(io::IO, err::PartitionLocalityError)
           "form (a dotted expression, a gather, a column read, hcat/vcat, a product ",
           "with an array left factor, a literal range view or reshape, a reduction over ",
           "the axes other than the first such as `vec(sum(x; dims = 2))`, a transposed ",
-          "vector, an authored plate, a proved per-index helper comprehension); ",
+          "vector, an authored plate, a proved per-index helper comprehension, a ",
+          "field of a named tuple of data, a shape check that returns its argument); ",
           "see `partition_locality`. Pass `locality = :warn` ",
           "to evaluate anyway.")
 end

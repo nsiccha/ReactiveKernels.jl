@@ -8,6 +8,13 @@
 # for its own checking helpers (ReactiveKernelsPPL's joint cell latents).
 _footprint_checked_alias(f) = 0
 
+# The validator of a checked alias's row form, or `nothing` (no row form).
+# Called as `validator(T, axes, others...)` with the type and full axes of the
+# alias's argument and `f`'s other arguments in order, it makes the checks
+# `f` makes and throws as `f` would. A cell then reads the argument at its rows
+# (`_cell_checked_form`), and the check still covers the whole argument.
+_checked_alias_validator(f) = nothing
+
 # A recipe that indexes one of its inputs without reading other entries:
 # `kind` is `:view` (`view(a, I...)`), `:read` (`a[I...]`) or `:alias` (a call
 # that returns its argument, `_footprint_checked_alias`), `slot` the indexed
@@ -161,6 +168,24 @@ function _footprint_capture_program(inner::Plan, root::Int)
             views[cid(only(r.outputs))] = views[cid(only(r.inputs))]
             continue
         end
+        # A compound recipe that reads index-mapped values only through
+        # gathers (`w .* v[I]`) reads the gathered positions.
+        mapped_slots = Int[j for j in slots if haskey(views, cid(r.inputs[j])) &&
+                           cid(r.inputs[j]) != cid(inner.have[root])]
+        gathers = isempty(mapped_slots) ? nothing :
+            _footprint_inner_gathers(r, mapped_slots, slots)
+        if gathers !== nothing && all(gathers) do (slot, refs, _)
+                    all(j -> j == slot || haskey(mapped, cid(r.inputs[j])), refs)
+                end
+            for (slot, refs, ex) in gathers
+                w = fresh()
+                f = compile(Expr(:->, Expr(:tuple, (r_params(r)[j] for j in refs)...), ex))
+                add!(g; inputs=Tuple(j == slot ? views[cid(r.inputs[j])] : mapped[cid(r.inputs[j])]
+                                     for j in refs), outputs=(w,), op=f)
+                push!(reads, w)
+            end
+            continue
+        end
         for j in slots
             v = r.inputs[j]
             haskey(views, cid(v)) || continue
@@ -179,6 +204,51 @@ function _footprint_capture_program(inner::Plan, root::Int)
     p = plan(g; have, want=result)
     _prepare(p, _lower_with_ops(p; inline_embedded=false)...)
 end
+
+r_params(r::Recipe) = _cell_native(r)[2]
+
+# The gathers `v[I...]` of index-mapped inputs (`mapped_slots`) inside a
+# compound recipe, as `(slot, referenced input slots, expression)`, when the
+# recipe reads those inputs in no other way and no index reads a dependent
+# value (`dependent_slots`) except a mapped source's shape. `nothing`
+# otherwise, or when the recipe cannot be analysed.
+function _footprint_inner_gathers(r::Recipe, mapped_slots, dependent_slots)
+    length(r.outputs) == 1 && !r.effectful || return nothing
+    analyzed = _cell_native(r)
+    analyzed === nothing && return nothing
+    native, params, mod = analyzed
+    sources = Dict{Symbol,Int}(params[j] => j for j in mapped_slots)
+    dependent = Set{Symbol}(params[j] for j in dependent_slots)
+    found = Tuple{Int,Vector{Int},Any}[]
+    function walk(ex)
+        ex isa Symbol && return !haskey(sources, ex)
+        ex isa Expr || return true
+        ex.head in _CELL_PLAIN_HEADS || return false
+        source, indices = if Meta.isexpr(ex, :ref) && length(ex.args) >= 2
+            ex.args[1], ex.args[2:end]
+        elseif Meta.isexpr(ex, :call) && length(ex.args) >= 3 &&
+                !_native_callee_shadowed(ex.args[1], params) &&
+                _cell_binding(ex.args[1], mod) === Base.getindex
+            ex.args[2], ex.args[3:end]
+        else
+            nothing, nothing
+        end
+        if source isa Symbol && haskey(sources, source)
+            others = setdiff(dependent, (source,))
+            all(i -> _footprint_index_free(i, Set([source]), params, mod) &&
+                     _cell_free_of(i, others), indices) || return false
+            gather = Expr(:call, GlobalRef(Base, :getindex), source, indices...)
+            refs = Int[j for (j, q) in enumerate(params) if _footprint_mentions(gather, q)]
+            push!(found, (sources[source], refs, gather))
+            return true
+        end
+        all(walk, ex.args)
+    end
+    walk(native) && !isempty(found) ? found : nothing
+end
+_footprint_mentions(ex::Symbol, q) = ex === q
+_footprint_mentions(ex::Expr, q) = any(a -> _footprint_mentions(a, q), ex.args)
+_footprint_mentions(ex, q) = false
 
 # Transfer reads of a view to its parent without materializing the parent.
 # LinearIndices supplies storage positions while retaining the view's axes,
