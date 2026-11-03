@@ -1445,7 +1445,9 @@ records every read of a port (the rows a value is sliced to, the positions
 gathers and captures read, the constant positions of a bound-indexed read, a
 lane of one row as that row) and returns them instead of the value; a
 lowering nested in it (a plate body, an embedded kernel) runs blind to the
-recording. For a packed parameter vector this is the exact support of a
+recording. Before that body is compiled, its statements that feed none of the
+recorded reads, such as the wanted value's own plate, are dropped; row and
+partition checks stay. For a packed parameter vector this is the exact support of a
 partition's gradient; a lazy branch contributes both arms.
 `partition_footprint` keeps the footprint kernel it prepares for the process;
 `partition_footprint_kernel(kernel)` prepares one for a caller to hold and

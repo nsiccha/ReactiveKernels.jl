@@ -1314,6 +1314,48 @@ end
 _declares_any(st, names::Set{Symbol}) =
     st isa Expr && st.head === :local && !isempty(intersect(_assigned_names!(Set{Symbol}(), st), names))
 
+# The statements of a footprint body that its result depends on. The body is
+# the value lowering with every HAVE read recorded, and it returns those
+# reads instead of the wanted values (`_footprint_return`). The wanted values'
+# own work (a density plate's loop, numeric cell rows) therefore reaches the
+# result only if a recorded read names it, yet Julia keeps and compiles it,
+# because allocation and loops are not removable: for the frozen Atlas the
+# footprint's native compile was half of preparing its partition sampler
+# (snag `frozen-atlas-fir-2d4269a6`). Keep, in the body's order: the return;
+# every statement assigning or writing a value a kept statement reads,
+# including writes through an alias (`_written_plan_symbols`, as the plan
+# split keeps them); and every statement that assigns no value of the body,
+# such as a row check, which may throw. A plain assignment nothing kept reads
+# is dropped, together with any check it held only for its own value.
+function _footprint_live_statements(body::Expr, ops)
+    statements = body.args
+    # The body's own values: every top-level assignment target (plain, tuple
+    # or typed) and declared local. Names assigned only inside a statement
+    # (a `let`'s or a loop's) are its own.
+    outer = Set{Symbol}()
+    for st in statements
+        Meta.isexpr(st, :(=)) &&
+            _assigned_names!(outer, Expr(:(=), st.args[1], nothing))
+        Meta.isexpr(st, :local) && _assigned_names!(outer, st)
+    end
+    wanted = Set{Symbol}()
+    keep = falses(length(statements))
+    for k in reverse(eachindex(statements))
+        st = statements[k]
+        st isa LineNumberNode && continue
+        defines = _assigned_names!(Set{Symbol}(), st)
+        writes = _written_plan_symbols((st,), outer, ops)
+        if Meta.isexpr(st, :return) ||
+           any(in(wanted), defines) || any(in(wanted), writes) ||
+           (isempty(intersect(defines, outer)) && isempty(writes))
+            keep[k] = true
+            _symbol_refs!(wanted, st)
+        end
+    end
+    Expr(body.head, (st for (k, st) in enumerate(statements)
+                     if keep[k] || st isa LineNumberNode)...)
+end
+
 # Planning and footprint queries reuse the existing row-bookkeeping helpers.
 # Inlining their vector loops and bounds checks at every read makes a wide
 # query's native body much larger than its source. Keep those calls separate

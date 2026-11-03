@@ -5126,7 +5126,7 @@ function _lower_with_ops_collecting(p::Plan;
     # and returns that bookkeeping instead (`_partition_plan_lowering`,
     # plate_partition.jl).
     if _footprint_recording()
-        body = _partition_metadata_calls(body)
+        body = _partition_metadata_calls(_footprint_live_statements(body, runtime_ops))
     else
         planned = _partition_plan_lowering(p, body, argexprs, runtime_ops, nm,
                                            partition_plan || _plan_mode())

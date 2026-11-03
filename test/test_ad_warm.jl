@@ -28,6 +28,10 @@ end
         prepare_ad(warm_objective, BACKEND, q, scale; want = :total, active = :q))
     warm, warm_runs = evaluations(() -> prepare_ad(warm_objective, BACKEND,
         q, scale; want = :total, active = :q, warm = true))
+    # `total` is untyped. Inference proves it a Number for the exemplar's
+    # types, so a cold preparation evaluates nothing: a gradient-only caller
+    # never compiles the primal (snag frozen-atlas-fir-2d4269a6).
+    @test cold_runs == 0
     @test warm_runs > cold_runs
     @test q == exemplar
     for point in (q, [1.0, 0.5, -0.25])

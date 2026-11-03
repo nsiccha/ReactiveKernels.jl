@@ -317,6 +317,14 @@ end
     gradient = similar(d.u)
     ad_value_and_gradient!(ad, gradient, d.u, 3)
     @test findall(!iszero, gradient) == partition_footprint(bound, d.u, 3).u
+    # A footprint returns the reads, not the wanted value: its body keeps the
+    # row checks but not the density plate that only the value needs, which
+    # the value kernel's body does compute (snag frozen-atlas-fir-2d4269a6).
+    value_code = sprint(show, code_expr(bound))
+    footprint_code = sprint(show, code_expr(partition_footprint_kernel(bound)))
+    @test occursin("_plate_total_value", value_code)
+    @test !occursin("_plate_total_value", footprint_code)
+    @test occursin("_partition_check_rows", footprint_code)
     # Unbound, the key and row-wise ports are read at the partition's rows.
     k = prepare(spec; have = (_PP_HAVE..., :label), want = :partition_total)
     footprint = partition_footprint(k, d.u, d.g, d.w, d.subject, 2)
