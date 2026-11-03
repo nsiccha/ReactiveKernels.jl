@@ -1,9 +1,11 @@
 module PositionMapCellTests
 using ReactiveKernels, ReactiveKernelsPPL, Enzyme, Test
 using DifferentiationInterface: AutoEnzyme, SecondOrder
+using LinearAlgebra: dot, norm
 
 const REVERSE = AutoEnzyme(; mode = Enzyme.Reverse)
-const SECOND = SecondOrder(REVERSE, AutoEnzyme(; mode = Enzyme.Forward))
+const FORWARD = AutoEnzyme(; mode = Enzyme.Forward)
+const SECOND = SecondOrder(REVERSE, FORWARD)
 
 # Per-trajectory helpers in the shapes of an archive model: row `g` reads
 # trajectory `g`'s values and shared arrays. `tick` counts the rows computed.
@@ -404,6 +406,53 @@ end
         value, gradient = ad_value_and_gradient(cell_ad, u, u[selected], selected, h)
         @test value ≈ full[h]
         @test gradient ≈ expected rtol = 1e-6 atol = 1e-8
+    end
+    # An outer factor with no reductions differentiates one active vector, so
+    # forward over reverse works; callers keep the `(sums, coordinates)` shape.
+    selected = support(1)
+    e = Float64[j == 1 for j in eachindex(selected)]
+    dirs = ((Float64[], e),)
+    second(p) = ad_value_and_gradient(ad, p, Float64[], p[selected], selected, 1)[2][2]
+    for composition in (SecondOrder(REVERSE, FORWARD), SecondOrder(FORWARD, REVERSE))
+        h = prepare_cell_factor_ad(prepare_ad_hvp, factors, :outer, u, selected, composition, dirs)
+        g, ((s, hv),) = ad_gradient_and_hvp(h, dirs, u, Float64[], u[selected], selected, 1)
+        @test isempty(first(g)) && isempty(s)
+        @test last(g) ≈ second(u)
+        @test norm(hv) > 0
+        @test hv ≈ finite(second, u, selected[1]; h = 1e-5) rtol = 1e-5 atol = 1e-6
+    end
+    third = prepare_cell_factor_ad(prepare_ad_third, factors, :outer, u, selected,
+        SecondOrder(SecondOrder(REVERSE, FORWARD), FORWARD), dirs)
+    g, (s, hv), (s3, tv) = let r = ad_gradient_hvp_and_third(third, dirs, u, Float64[], u[selected], selected, 1)
+        (r[1], only(r[2]), only(r[3]))
+    end
+    @test isempty(s) && isempty(s3)
+    # Shared-prefix accumulators keep the factor's shape and include shared coordinates.
+    pullback = prepare_cell_pullback(ad, REVERSE, u)
+    accumulator = prepare_cell_accumulator(ad, REVERSE, u; order = 0)
+    directional = prepare_cell_accumulator(third, SecondOrder(REVERSE, FORWARD), u; order = 1)
+    weights = collect(range(0.3, 1.1; length = length(y)))
+    gradient = zeros(length(u))
+    cell_pullback!(gradient, pullback, u) do batch
+        for h in eachindex(y)
+            S = support(h)
+            value, (sums, derivative) = accumulate_cell!(batch, accumulator, nothing, weights[h],
+                                                         Float64[], u[S], S, h)
+            @test isempty(sums) && length(derivative) == length(S)
+            @test value ≈ weights[h] * full[h]
+        end
+    end
+    weighted(p) = sum(weights[h] * whole(p, h) for h in eachindex(y))
+    @test gradient ≈ [finite(weighted, u, j) for j in eachindex(u)] rtol = 1e-6 atol = 1e-7
+    gradient = zeros(length(u))
+    cell_pullback!(gradient, pullback, u) do batch
+        contraction, (sums, derivative) = accumulate_cell!(batch, directional, (Float64[], e), 1.0,
+                                                           Float64[], u[selected], selected, 1)
+        @test isempty(sums)
+        @test contraction ≈ dot(second(u), e)
+        @test derivative ≈ ad_gradient_and_hvp(prepare_cell_factor_ad(prepare_ad_hvp, factors, :outer,
+            u, selected, SecondOrder(REVERSE, FORWARD), dirs), dirs, u, Float64[], u[selected],
+            selected, 1)[2][1][2]
     end
     # A strict compact cell over an overlay types its values the same way.
     strict = prepare_cell_query(built, plan, :y; partitioned, locality = :error, u0 = u)

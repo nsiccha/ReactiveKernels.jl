@@ -265,13 +265,15 @@ function prepare_cell_accumulator(q::Union{CompactCellAD,CellFactorAD}, backend,
     sums = outer ? (sums0 === nothing ? copy(q.exemplar_sums) : Vector{Float64}(sums0)) : Float64[]
     tail = q isa CompactCellAD ? (active0, q.slots, cell0) : outer ?
         (sums, active0, q.slots, cell0) : (active0, q.slots, cell0, term0)
-    local_ports = outer ? (:_ppl_cell_sums, :_ppl_cell_active) : (:_ppl_cell_active,)
-    directional = outer ? local_ports : only(local_ports)
+    # As in `prepare_cell_factor_ad`: no reductions, one active vector.
+    pair = outer && !_cell_single_active(q)
+    local_ports = pair ? (:_ppl_cell_sums, :_ppl_cell_active) : (:_ppl_cell_active,)
+    directional = pair ? local_ports : only(local_ports)
     prepared = Base.invokelatest(ReactiveKernels.prepare_ad_accumulator,
         q.prepared.kernel, backend, u0, tail..., values...;
         active = (:_ppl_cell_base, local_ports..., _cell_frontier_names(q.shared)...),
         directional, order)
-    shadow = outer ? (zero(sums), zero(active0)) : zero(active0)
+    shadow = pair ? (zero(sums), zero(active0)) : zero(active0)
     CellAccumulator(prepared, q, shadow)
 end
 
@@ -312,6 +314,13 @@ function _accumulate_cell!(p, a::CellAccumulator{P,Q}, direction, weight,
         sums, active, indices, cell = first, second, third, fourth
         length(sums) == q.nsums || throw(DimensionMismatch("wrong number of factor sums"))
         _prepare_cell_contribution!(p, a, active, indices)
+        if _cell_single_active(q)
+            value = ReactiveKernels.ad_accumulate!(a.prepared,
+                (p.gradient, a.local_shadow, p.shadows...), _cell_no_sums(direction), weight,
+                p.base, sums, active, q.slots, cell, _cell_shared_values(q.shared)...)
+            _scatter_cell_contribution!(p.gradient, a.local_shadow, indices)
+            return value, (q.exemplar_sums, a.local_shadow)
+        end
         value = ReactiveKernels.ad_accumulate!(a.prepared,
             (p.gradient, a.local_shadow..., p.shadows...), direction, weight,
             p.base, sums, active, q.slots, cell, _cell_shared_values(q.shared)...)

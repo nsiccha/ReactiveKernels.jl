@@ -289,10 +289,30 @@ function prepare_cell_factor_ad(prepare_operator, f::CellFactors, factor,
     kernel = Base.invokelatest(prepare, spec; have, want, bound = _cell_factor_bound(f),
                               on_error = f.on_error, exemplars = (point..., shared_values...))
     active = outer ? (:_ppl_cell_sums, :_ppl_cell_active) : :_ppl_cell_active
-    prepared = Base.invokelatest(prepare_operator, kernel, backend, exemplars...,
-        point..., shared_values...; active)
+    # An outer factor with no reductions differentiates its one active vector.
+    # Its sum operand is empty and unread; as a member of a tuple point it needs
+    # a tuple derivative, which forward over reverse cannot take and which static
+    # activity analysis refuses once a large cell is not inlined.
+    single = outer && isempty(f.reductions)
+    tangents = single ? map(_cell_no_sums, exemplars) : exemplars
+    prepared = Base.invokelatest(prepare_operator, kernel, backend, tangents...,
+        point..., shared_values...; active = single ? :_ppl_cell_active : active)
     CellFactorAD(prepared, f.layout, selected, slots, outer, length(f.reductions), f.shared, sums0)
 end
+
+# The `(sum_part, coordinate_part)` shape a caller uses for an outer factor, to
+# and from the one active vector of an outer factor with no reductions.
+_cell_no_sums(x) = x
+_cell_no_sums(x::Tuple) = map(_cell_no_sums, x)
+function _cell_no_sums(x::Tuple{AbstractVector{<:Real},AbstractVector{<:Real}})
+    isempty(first(x)) || throw(ContractValidationError(
+        "[query] this outer factor has no sums, so a direction's sum part must be empty"))
+    last(x)
+end
+_cell_with_sums(x, empty) = x
+_cell_with_sums(x::Tuple, empty) = map(v -> _cell_with_sums(v, empty), x)
+_cell_with_sums(x::AbstractVector{<:Real}, empty) = (empty, x)
+_cell_single_active(q) = q.outer && q.nsums == 0
 
 struct CellFactorAD{P,L,S}
     prepared::P
@@ -326,7 +346,10 @@ function _cell_factor_ad_call(verb, q::CellFactorAD, args::Vararg{Any,N}) where 
         _select_compact_cells!(q, base, active, indices)
         _check_cell_local_selection(q.shared, indices)
         shared_values = _cell_ad_values(q.shared, base_arg)
-        verb(q.prepared, leading..., base, sums, active, q.slots, cell, shared_values...)
+        _cell_single_active(q) || return verb(q.prepared, leading..., base, sums, active,
+            q.slots, cell, shared_values...)
+        _cell_with_sums(verb(q.prepared, map(_cell_no_sums, leading)..., base, sums, active,
+            q.slots, cell, shared_values...), q.exemplar_sums)
     else
         base_arg, active, indices, cell, term = args[N-4:N]
         base = _cell_ad_base(q.shared, base_arg)
