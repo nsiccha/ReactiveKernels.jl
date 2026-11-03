@@ -1100,6 +1100,27 @@ function _ad_output_positions(kernel::_ADKernel, retain::Tuple)
     only(objective), retained
 end
 
+# The objective's type, inferred for the exemplar's argument types without
+# running the kernel. Running a prepared kernel only to learn that type
+# compiles its whole native primal, which a gradient-only caller never calls;
+# for a large partition program that compile was about 30% of preparing its
+# sampler (frozen Atlas, snag `frozen-atlas-fir-2d4269a6`). Inference is sound,
+# so a `Number` it proves holds for every call with these argument types.
+# Validation runs the exemplar for any other result, and always for a
+# `NonAllocatingKernel`, whose first call seeds its caches.
+Base.@nospecializeinfer function _ad_inferred_objective_type(
+        @nospecialize(kernel::PreparedKernel), @nospecialize(args::Tuple),
+        objective::Int, @nospecialize(retain::Tuple))
+    T = Base._return_type(kernel, Tuple{Any[Core.Typeof(arg) for arg in args]...})
+    isempty(retain) && return T
+    T isa DataType && T <: Tuple && !Base.isvatuple(T) &&
+        objective <= fieldcount(T) || return Any
+    fieldtype(T, objective)
+end
+Base.@nospecializeinfer _ad_inferred_objective_type(
+    @nospecialize(kernel), @nospecialize(args::Tuple), objective::Int,
+    @nospecialize(retain::Tuple)) = Any
+
 function _ad_validate_kernel(kernel::_ADKernel, active_selector,
                              args::Tuple; scalar_output::Bool = true,
                              retain::Tuple = ())
@@ -1112,8 +1133,12 @@ function _ad_validate_kernel(kernel::_ADKernel, active_selector,
         output = outputs(kernel)[objective]
         output_type = valtype(output)
         if !(output_type <: Number)
+            inferred = isconcretetype(output_type) ? Any :
+                _ad_inferred_objective_type(kernel, args, objective, retain)
             observed_type = if isconcretetype(output_type)
                 output_type
+            elseif inferred !== Union{} && inferred <: Number
+                inferred
             elseif isempty(retain)
                 typeof(kernel(args...))
             else
