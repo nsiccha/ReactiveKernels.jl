@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.75
+
+- Strict cell queries, compact cell derivatives and cell factors compute
+  per-position helpers at the cell's rows, including enumerated
+  comprehensions and loops that push one row per trajectory. The outer factor
+  and the cell query now agree on such helpers. Require ReactiveKernels 0.1.66.
+
 ## 0.1.74
 
 - Prepared queries of a model whose caller-owned law takes an authored
