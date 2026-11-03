@@ -46,7 +46,7 @@ make_geometries(ns) = make_geometry.(ns)
 nested_geometry(n) = (; inner=make_geometry(n))
 
 function fixture(ns; cells=false, getter=false, record=false, nested=false,
-        property_shape=false)
+        property_shape=false, argument_property=false)
     head = getter ? :GetterLaw : :PropertyLaw
     raw = ns
     y = cells ? [[0.1i for i in 1:n] for n in ns] : [0.1i for i in 1:ns]
@@ -54,6 +54,7 @@ function fixture(ns; cells=false, getter=false, record=false, nested=false,
     definition = cells ? :(geometry = make_geometries(raw)) :
         record ? :(geometry = Dimensions(raw)) :
         nested ? :(geometry = nested_geometry(raw).inner) :
+        argument_property ? :(holder = nested_geometry(raw)) :
         :(geometry = make_geometry(raw))
     dimension = property_shape ? :(geometry.ncoordinates) : :(length(y))
     statements = cells ? quote
@@ -61,6 +62,9 @@ function fixture(ns; cells=false, getter=false, record=false, nested=false,
             w[i] ~ $head(geometry[i], a)
             y[i] .~ Normal.(w[i], 1)
         end
+    end : argument_property ? quote
+        w[1:$dimension] ~ $head(holder.inner, a)
+        y .~ Normal.(w, 1)
     end : quote
         w[1:$dimension] ~ $head(geometry, a)
         y .~ Normal.(w, 1)
@@ -82,14 +86,23 @@ function oracle(fx, u)
     (; prior, likelihood, sampler=prior+likelihood)
 end
 nodes(ex) = ex isa Expr ? 1 + sum(nodes, ex.args; init=0) : 0
+holds_module(x) = x isa Module || (x isa Expr && any(holds_module, x.args)) ||
+    (x isa QuoteNode && holds_module(x.value))
 
 function check(fx; reverse=false)
     saved = deepcopy((fx.data, fx.u))
     source = kernel_expr(fx.bound, fx.built.layout)
+    # `copy`: a law argument's rebuilt binding holds its module, which
+    # `deepcopy` refuses; the printed source names it and replays.
     replay = ReactiveKernelsPPL._eval_kernel_def(
-        Meta.parse(string(Base.remove_linenums!(deepcopy(source)))))
+        Meta.parse(string(Base.remove_linenums!(copy(source)))))
     replay_query = prepare_query((; spec=replay, layout=fx.built.layout), fx.bound, :sampler)
     queries = map(cut -> prepare_query(fx.built, fx.bound, cut), (:prior, :likelihood, :sampler))
+    # Per-chain copies deep-copy prepared queries, including the authored
+    # source a rebuilt argument's module is part of (snag
+    # `prepared-query-h-b7bd890a`).
+    copies = map(deepcopy, queries)
+    @test model_view(fx.built; bound=fx.bound).source isa Expr
     catalogue = density_factors(fx.built, fx.bound)
     priors = select_factors(catalogue; kind=:prior, site=:w)
     @test length(priors) == (fx.cells ? length(fx.data.y) : 1)
@@ -105,6 +118,9 @@ function check(fx; reverse=false)
         u = fx.u .+ shift
         expected = oracle(fx, u)
         for (q, value) in zip(queries, values(expected))
+            @test Base.invokelatest(q, u) ≈ value
+        end
+        for (q, value) in zip(copies, values(expected))
             @test Base.invokelatest(q, u) ≈ value
         end
         @test Base.invokelatest(replay_query, u) ≈ expected.sampler
@@ -142,6 +158,11 @@ end
     check(fixture(3; record=true); reverse=true)
     check(fixture(3; nested=true))
     check(fixture(3; property_shape=true))
+    # A resolved binding in the law's own argument (`holder.inner` calls
+    # `Base.getproperty`): the geometry recipe's source holds `Base`.
+    argument = fixture(3; argument_property=true)
+    @test any(r -> holds_module(r.source), argument.built.spec.graph.recipes)
+    check(argument; reverse=true)
     for ns in ([2, 1, 3], [0, 2], Int[])
         fx = fixture(ns; cells=true)
         @test fx.built.layout.total == sum(ns)+1

@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.65
+
+- `deepcopy` of a graph, plan, prepared or vectorized kernel (any object
+  holding a generated program) now succeeds when a recipe's authored source,
+  or a generated program that inlines it, holds a module as a literal value, as
+  ReactiveKernelsPPL's rebuilt law arguments do (`Core.GlobalRef(<module>,
+  :name)`). The copy owns its expressions and shares the modules in them, as
+  it already shared a source operation's module. Previously the copy failed
+  with `deepcopy of Modules not supported`.
+
 ## 0.1.64
 
 - Apply an elementwise dotted call over an expanding gather by a cached index,
