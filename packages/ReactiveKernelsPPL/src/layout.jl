@@ -524,8 +524,11 @@ function assign_layout(plan::StructuralPlan)
     for (site, g) in plan.cell_geometries
         paths[site] = get(paths, g.name, (g.name,))
     end
+    # Host-side reads (external arguments, dynamic bounds, cell geometries)
+    # take a frozen whole value the graph keeps as bound, like a column
+    # (`_holds_bound_value`), never re-evaluating it over absent inputs.
     return LayoutTable(entries, offset - 1, paths,
-        Dict{Symbol,Any}(plan.columns),
+        merge!(Dict{Symbol,Any}(plan.columns), pairs(_frozen_graph_values(plan))),
         Dict{Symbol,Any}(a.name => a.expr for a in _definitions(plan)),
         plan.cell_latents, plan.cell_geometries)
 end
