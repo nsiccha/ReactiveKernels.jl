@@ -556,6 +556,10 @@ exactly `moves` proposals per member. Prepare `tuning` independently with
 reference. Its final-temperature kernel becomes the stream's fixed kernel;
 `moves` overrides that kernel's move count for this recovery call only.
 
+Unlike assimilation replenishment, whose random walk is scaled by the members'
+own spread, recovery uses the tuned prior-reversible NUTS kernel, so it can
+move a population whose spread has vanished.
+
 This overload neither resamples nor assimilates an observation. Weights, time,
 window, records and accumulated normalizer stay unchanged. Rejections retain
 the old conditional cloud and likelihood estimate. A bounded `:rejuvenate`

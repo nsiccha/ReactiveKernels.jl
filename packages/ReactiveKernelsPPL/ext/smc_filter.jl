@@ -64,6 +64,8 @@ struct SMCFilterStage
     predictive_logscore::Float64
     parameter_ess_before::Float64
     parameter_ess_after::Float64
+    distinct_ess_before::Float64
+    distinct_ess_after::Float64
     replenished::Bool
     boundary_reset::Bool
     unique_parents::Int
@@ -75,6 +77,7 @@ struct SMCFilterStage
     moved_members::Int
     coordinate_sd::Vector{Float64}
     kernel::NamedTuple
+    proposal_scale::Vector{Float64}
 end
 
 # Anchored moments give exactly zero for a constant coordinate, even when a
@@ -92,14 +95,20 @@ function _filter_moments(positions,mass)
     return anchor+offset,sqrt.(variance)
 end
 
-function _filter_distinct(positions)
-    # Hash columns once: O(members*coordinates), not pairwise comparisons.
-    distinct = Set{Vector{Float64}}()
-    for column in eachcol(positions)
-        push!(distinct,map(x -> iszero(x) ? 0.0 : x,column))
+# Group bitwise-identical parameter columns (signed zeros merged), summing their
+# masses. Hash each column once: O(members*coordinates), never pairwise.
+function _filter_groups(positions,mass)
+    groups = Dict{Vector{Float64},Float64}()
+    for j in axes(positions,2)
+        key = map(x -> iszero(x) ? 0.0 : x,positions[:,j])
+        groups[key] = get(groups,key,0.0)+mass[j]
     end
-    return length(distinct)
+    return groups
 end
+_filter_distinct(positions) = length(_filter_groups(positions,zeros(size(positions,2))))
+# Copies of one parameter value count once: member ESS cannot see that
+# resampled duplicates with identical conditional scores share their weight.
+_filter_distinct_ess(positions,mass) = inv(sum(abs2,values(_filter_groups(positions,mass))))
 
 function _filter_history(state,stage)
     history = [state.history;stage]
@@ -144,6 +153,7 @@ function Base.showerror(io::IO, err::PPL.SMCDegeneracyError{<:SMCFilterState})
         print(io, ", invalid marginal scales=", length(invalid))
         if diagnostic isa SMCFilterStage
             print(io, ", distinct=", diagnostic.distinct_members,
+                ", distinct ESS=", round(diagnostic.distinct_ess_after;sigdigits=3),
                 ", moved=", diagnostic.moved_members, ", accepted=", diagnostic.accepted,
                 "/", diagnostic.proposals)
         end
@@ -224,6 +234,8 @@ function _filter_rollover(state,rng)
     return calibration,proposal,boundary,positions,members
 end
 
+# Explicit recovery only: fixed NUTS proposals reversible for the window's
+# Gaussian prior, independent of the members' (possibly vanished) spread.
 function _filter_move!(positions,members,target,proposal,boundary,records,kernel,rng)
     n,k = first(members).particles,length(members)
     scores = [m.log_normalizer for m in members]
@@ -255,13 +267,51 @@ function _filter_move!(positions,members,target,proposal,boundary,records,kernel
     return accepted,moved,evaluations,reference_evaluations
 end
 
+# Random-walk scale for a d-dimensional Gaussian target (Roberts, Gelman and
+# Gilks 1997), applied per coordinate to the population's weighted spread.
+_filter_walk_scale(sd) = (2.38/sqrt(length(sd))) .* sd
+
+# Population-scaled particle-Metropolis moves (the SMC² move of Chopin, Jacob
+# and Papaspiliopoulos). The scale is fixed for the whole replenishment, so
+# each move is invariant for prior × window likelihood estimate.
+function _filter_walk!(positions,members,target,proposal,boundary,records,moves,scale,rng)
+    n,k,d = first(members).particles,length(members),size(positions,1)
+    scores = [m.log_normalizer for m in members]
+    priors = [_density(proposal.prior,positions[:,j]) for j in 1:k]
+    accepted,moved,evaluations = 0,0,0
+    for j in 1:k
+        initial = positions[:,j]
+        for _ in 1:moves
+            u = positions[:,j] .+ scale .* randn(rng,d)
+            prior = _density(proposal.prior,u)
+            candidate,score,work = _window_filter(target,boundary,records,u,
+                Xoshiro(rand(rng,UInt64)),n)
+            evaluations += work
+            # Symmetric proposal: the prior ratio times the window likelihood
+            # estimate ratio. Keep the previous estimate AND cloud on rejection.
+            if log(rand(rng)) < (prior-priors[j])+(score-scores[j])
+                positions[:,j] = u
+                members[j] = candidate
+                scores[j] = score
+                priors[j] = prior
+                accepted += 1
+            end
+        end
+        moved += positions[:,j] != initial
+    end
+    return accepted,moved,evaluations
+end
+
 function _filter_replenish(positions,members,logmass,target,proposal,boundary,records,kernel,rng)
+    # Scale from the weighted population before resampling discards its spread.
+    _,spread = _filter_moments(positions,exp.(logmass))
+    scale = _filter_walk_scale(spread)
     parents,_,_ = PPL._filter_resample(logmass,rand(rng,UInt64))
     positions = positions[:,parents]
     members = [PPL._filter_with_rng(members[j],Xoshiro(rand(rng,UInt64))) for j in parents]
-    accepted,moved,evaluations,reference_evaluations =
-        _filter_move!(positions,members,target,proposal,boundary,records,kernel,rng)
-    return positions,members,length(unique(parents)),accepted,moved,evaluations,reference_evaluations
+    accepted,moved,evaluations =
+        _filter_walk!(positions,members,target,proposal,boundary,records,kernel.moves,scale,rng)
+    return positions,members,length(unique(parents)),accepted,moved,evaluations,scale
 end
 
 function PPL.filter_step(state::SMCFilterState,observation::NamedTuple;
@@ -293,11 +343,13 @@ function PPL.filter_step(state::SMCFilterState,observation::NamedTuple;
     logmass .-= score
     mass = exp.(logmass)
     ess = inv(sum(abs2,mass))
-    replenish = ess < state.ess_fraction*k || any(==(-Inf),logmass)
-    unique_parents,accepted,moved,reference_evaluations = k,0,0,0
+    distinct_ess = _filter_distinct_ess(positions,mass)
+    replenish = distinct_ess < state.ess_fraction*k || any(==(-Inf),logmass)
+    unique_parents,accepted,moved = k,0,0
+    proposal_scale = Float64[]
     evaluations = k*n
     if replenish
-        positions,nextmembers,unique_parents,accepted,moved,work,reference_evaluations =
+        positions,nextmembers,unique_parents,accepted,moved,work,proposal_scale =
             _filter_replenish(positions,nextmembers,logmass,state.target,proposal,boundary,records,
                 state.kernel,rng)
         evaluations += work
@@ -308,9 +360,9 @@ function PPL.filter_step(state::SMCFilterState,observation::NamedTuple;
     window = state.window+Int(reset)
     _,coordinate_sd = _filter_moments(positions,mass)
     stage = SMCFilterStage(:assimilate,state.time+1,window,length(records),score,ess,
-        inv(sum(abs2,mass)),replenish,reset,unique_parents,
-        replenish ? k*state.kernel.moves : 0,accepted,evaluations,reference_evaluations,
-        _filter_distinct(positions),moved,coordinate_sd,deepcopy(state.kernel))
+        inv(sum(abs2,mass)),distinct_ess,_filter_distinct_ess(positions,mass),replenish,reset,
+        unique_parents,replenish ? k*state.kernel.moves : 0,accepted,evaluations,0,
+        _filter_distinct(positions),moved,coordinate_sd,deepcopy(state.kernel),proposal_scale)
     _check_cloud(state,positions,:filter_step,stage)
     return SMCFilterState(state.target,calibration,proposal,positions,nextmembers,
         mass,logmass,boundary,records,rng,state.time+1,window,state.window_length,
@@ -331,8 +383,10 @@ function PPL.rejuvenate_smc(state::SMCFilterState; tuning::SMCTuningSchedule,mov
     k = length(members)
     ess = inv(sum(abs2,state.parameter_mass))
     stage = SMCFilterStage(:rejuvenate,state.time,state.window,length(state.records),0.0,
-        ess,ess,false,false,k,k*kernel.moves,accepted,evaluations,reference_evaluations,
-        _filter_distinct(positions),moved,coordinate_sd,deepcopy(kernel))
+        ess,ess,_filter_distinct_ess(state.positions,state.parameter_mass),
+        _filter_distinct_ess(positions,state.parameter_mass),false,false,k,k*kernel.moves,
+        accepted,evaluations,reference_evaluations,_filter_distinct(positions),moved,
+        coordinate_sd,deepcopy(kernel),Float64[])
     _check_cloud(state,positions,:rejuvenation,stage)
     # At a full boundary, a recovery that still cannot supply a Gaussian
     # marginal must fail here, before a subsequent rollover consumes data.
