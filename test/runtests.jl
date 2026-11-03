@@ -29,6 +29,7 @@ const _MATRIX_CORE_TESTS = (
     "test_lower_with_ops.jl",
     "test_declared_output_types.jl",
     "test_partial_evaluation.jl",
+    "test_bound_recipe_ids.jl",
     "test_shared_preparation.jl",
     "test_wide_prepared_call.jl",
     "test_index_runs.jl",
