@@ -31,6 +31,45 @@ function correlated_target()
         parameter_id="a-b/v1",backend=F.BACKEND)
 end
 
+@testset "Partial coordinate collapse is allowed until Gaussian rollover" begin
+    target=correlated_target()
+    state=initialize_filter_smc(target;rng=Xoshiro(73),members=32,particles=1,
+        window_length=1,ess_fraction=0.01,
+        options=SMCOptions(stepsize=1e-200,moves=1,max_tree_depth=1))
+    positions=copy(state.positions)
+    positions[2,:].=0.3
+    members=[first(F.EXT._window_filter(target,state.boundary,state.records,
+        positions[:,j],Xoshiro(400+j),1)) for j in 1:32]
+    fields=(; (k=>getfield(state,k) for k in fieldnames(typeof(state)))...)
+    state=F.EXT.SMCFilterState(values(merge(fields,(;positions,members)))...)
+    state=filter_step(state,(;))
+    @test last(state.history).distinct_members==32
+    @test last(state.history).coordinate_sd[2]==0.0
+    saved=deepcopy(filter_checkpoint(state))
+    err=try
+        filter_step(state,(;y=0.4))
+        nothing
+    catch e
+        e
+    end
+    @test err isa SMCDegeneracyError
+    @test err.phase==:rollover
+    @test err.state===state
+    @test err.diagnostics.invalid_coordinates==[2]
+    @test F.EXT._same(filter_checkpoint(state),saved)
+    schedule=tune_filter_smc(state;rng=Xoshiro(801),init=[0.0,0.0],pilot_steps=24,
+        temperatures=(0.0,1.0),options=SMCOptions(max_tree_depth=2))
+    bad=deepcopy(schedule)
+    for i in eachindex(bad.kernels)
+        bad.kernels[i]=merge(bad.kernels[i],(;stepsize=1e-200))
+    end
+    @test_throws SMCDegeneracyError rejuvenate_smc(state;tuning=bad,moves=2)
+    recovered=rejuvenate_smc(state;tuning=schedule,moves=8)
+    @test all(>(0),last(recovered.history).coordinate_sd)
+    @test filter_step(recovered,(;y=0.4)).time==state.time+1
+    @test F.EXT._same(filter_checkpoint(state),saved)
+end
+
 @testset "Correlated calibration and diagonal boundary transition" begin
     target=correlated_target()
     s=initialize_filter_smc(target;rng=Xoshiro(29),members=512,particles=1,

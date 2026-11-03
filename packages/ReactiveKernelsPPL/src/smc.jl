@@ -440,6 +440,14 @@ Constant density ratios, a constant coordinate, a single initial ancestor and
 zero movement alone do not trigger it. Zero-dimensional targets are exempt.
 Use independently prepared tuning with [`rejuvenate_smc`](@ref) to attempt
 recovery; a failure must not be treated as a completed posterior.
+
+For a parameter-learning filter, `phase` can also be `:filter_step` or
+`:rollover`. The latter reports nonpositive/nonfinite Gaussian marginal scales,
+including partial coordinate degeneracy. The failed observation is not consumed.
+`diagnostics` holds the attempted filter stage, or rollover scale/coordinate
+details. Use `tune_filter_smc(error.state; rng, init, ...)` to independently
+prepare recovery at the current window, then `rejuvenate_smc` and retry the
+failed observation. Input and recovery failure semantics are the same.
 """
 struct SMCDegeneracyError{S,D} <: Exception
     state::S
@@ -539,6 +547,31 @@ attempt's diagnostics. No automatic retry is made. Distinct output particles do
 not prove mixing; compare independent fits and posterior diagnostics. Rejuvenation
 cannot repair errors in normalizer increments accumulated before this call.
 Zero-dimensional targets perform no transitions and consume no RNG.
+
+For parameter-learning filters:
+
+Attempt fixed-budget particle-Metropolis recovery on the retained window, using
+exactly `moves` proposals per member. Prepare `tuning` independently with
+`tune_filter_smc(state; rng, init, ...)`; it must name this exact current-window
+reference. Its final-temperature kernel becomes the stream's fixed kernel;
+`moves` overrides that kernel's move count for this recovery call only.
+
+Unlike assimilation replenishment, whose random walk is scaled by the members'
+own spread, recovery uses the tuned prior-reversible NUTS kernel, so it can
+move a population whose spread has vanished.
+
+This overload neither resamples nor assimilates an observation. Weights, time,
+window, records and accumulated normalizer stay unchanged. Rejections retain
+the old conditional cloud and likelihood estimate. A bounded `:rejuvenate`
+history entry records zero score increment and the actual work. Checkpoint and
+resume retain the replacement kernel and exact continuation without retuning.
+
+`SMCDegeneracyError` preserves the input and attempt's diagnostics if all members
+still coincide, or a full window still lacks positive finite marginal scales
+for rollover. No automatic retry or adaptive stopping occurs. If recovering
+from a failed `filter_step`, retry that observation on the returned state: the
+failed step consumed nothing. Recovery cannot repair past evidence estimates
+or certify coverage of lost modes.
 """
 function rejuvenate_smc end
 

@@ -47,7 +47,7 @@ for members in (16,32),particles in (128,256)
     state=filter_stream(state,F.records([0.9,1.1]))
     result=measure(state,(;y=0.8))
     @assert result.replenished
-    @assert result.evaluations==members*particles*(1+2*3)
+    @assert result.evaluations==members*particles*(1+3)
     @info "Warm replenishment scaling" members particles window=3 result
 end
 end

@@ -68,6 +68,22 @@ function support_target()
     prepare_filter_smc(filter,calibration();parameters,parameter_id=PARAMETER_ID,backend=BACKEND)
 end
 
+function direct_target(;scale=0.1)
+    model=@rkppl begin
+        theta ~ Normal()
+        @scan begin
+            h[1]=theta
+            for t in 2:T
+                h[t]=theta
+            end
+        end
+        y .~ Normal.(h,observation_scale)
+    end
+    filter=prepare_filter(model;model_id=ID,parameters=parameters([0.0]),
+        data=(;observation_scale=scale))
+    prepare_filter_smc(filter,calibration();parameters,parameter_id=PARAMETER_ID,backend=BACKEND)
+end
+
 function kalman_score(y,theta)
     m,v,total = theta,0.6^2,0.0
     for t in eachindex(y)

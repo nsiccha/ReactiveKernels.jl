@@ -26,12 +26,21 @@ function prepare_filter_smc end
 
 """
     tune_filter_smc(target; rng, init, kwargs...)
+    tune_filter_smc(state; rng, init, kwargs...)
 
 Tune fixed NUTS proposals on the carried reference with the existing independent
 `tune_smc` pilot. Pass its schedule as `SMCOptions(tuning=schedule)` to
-`initialize_filter_smc`. The final temperature's numerical kernel is frozen
-for the stream. It is never adapted from production members, even at a window
-boundary. This tunes a reference-reversible proposal, not a noisy likelihood.
+`initialize_filter_smc`. The final temperature's kernel is frozen for the
+stream: its `moves` sets the proposals per member at each replenishment, and
+its NUTS settings drive only explicit `rejuvenate_smc` recovery. That kernel is
+never adapted from production members, even at a window boundary.
+Replenishment itself proposes population-scaled random-walk moves; see
+`initialize_filter_smc`. This tunes a reference-reversible proposal, not a
+noisy likelihood.
+The state overload tunes its **current window** reference for explicit recovery
+with `rejuvenate_smc(state; tuning, moves)`. Supply pilot initial positions and
+RNGs independently of production members. A longer reference pilot alone does
+not establish exploration of the observed-window posterior.
 """
 function tune_filter_smc end
 
@@ -43,24 +52,41 @@ function tune_filter_smc end
 
 Initialize an owned parameter ensemble from its carried Gaussian and a separate
 conditional particle filter per member. Each new record reweights members by
-their predictive scores. Below `ess_fraction*members`, draw a fresh ensemble
-from the current window prior, replay only the retained window and importance
-weight by its particle likelihood estimates, then resample and rejuvenate.
-Only one replenishment is attempted per step; diagnostics show remaining ESS.
+their predictive scores. Replenishment is triggered by the effective sample
+size over *distinct* parameter positions: the weights of bitwise-identical
+members are summed, so resampled copies count once. When it falls below
+`ess_fraction*members`, or any member has zero likelihood, resample the current
+parameter/conditional-filter pairs by their updated weights and move the
+selected members. Their retained window likelihood estimates and conditional
+clouds survive selection. Only one fixed-budget replenishment is attempted per
+step.
 
-A rejuvenation proposal is a fixed WarmupHMC NUTS transition reversible with
-respect to the current Gaussian prior. Its particle-Metropolis acceptance
-ratio is the proposed/current *window* likelihood estimate. Each proposal
-rebuilds conditional states from the frozen boundary. Rejections retain the
-previous estimate and conditional cloud. Fixed-kernel settings stay unchanged.
+Each move proposes a Gaussian random walk whose per-coordinate scale is
+`2.38/sqrt(d)` times the members' weighted marginal spread before resampling
+(Roberts, Gelman and Gilks' scaling; diagonal, O(members × d)). The scale is
+fixed for the whole replenishment. Its particle-Metropolis acceptance ratio is
+the window Gaussian prior ratio times the proposed/current *window* likelihood
+estimate ratio. Each proposal rebuilds conditional states from the frozen
+boundary. Rejections retain the previous estimate and conditional cloud. The
+kernel contributes only `moves`, the proposals per member. A coordinate whose
+weighted spread is zero cannot move: a population whose spread has vanished
+stays collapsed and fails as described below. Its recovery needs the
+independently tuned kernel of `rejuvenate_smc`.
 
 After `window_length` records, replace the parameter posterior by its weighted
 Gaussian marginal-moment summary and independently resample the weighted finite
 states into a pool of `particles` states as the next boundary. Draw a new ensemble and independent initial state
 clouds from these summaries. This discards parameter–state dependence and
 Gaussianizes the parameter posterior; it is an explicit assumed-density
-approximation, **not exact full-history SMC²**. Degenerate marginal variance
-fails visibly rather than inventing a scale. Cost and retained state are bounded
+approximation, **not exact full-history SMC²**. Nonpositive/nonfinite marginal
+scales fail with `SMCDegeneracyError` at rollover; no scale is invented.
+Full spatial coincidence is checked on input and **after** the configured
+mutation pass, so resampling from one parent still gets its chance to move.
+An error preserves the input state in `error.state` and the rejected summary
+in `error.diagnostics`; no observation or RNG draw is committed on failure.
+Attempt explicit `rejuvenate_smc` recovery before retrying that observation.
+A constant coordinate alone is allowed within a window, until a Gaussian
+boundary needs its positive marginal scale. Cost and retained state are bounded
 by members, particles, groups and the chosen window length, not elapsed time.
 
 Use `filter_step`/`filter_stream`, `filter_checkpoint` and
@@ -79,15 +105,26 @@ Supported read-only diagnostics on the returned state are `positions`
 (normalized weights), `time`, `window`, `window_length`, `records` (the retained
 window; use `length(state.records)`), `predictive_logscore`, `log_normalizer`
 and `history`. Each retained history entry exposes `time`, `window`,
-`window_steps`, `parameter_ess_before`, `parameter_ess_after`, `replenished`,
-`boundary_reset`, `unique_parents`, `proposals`, `accepted`,
-`likelihood_evaluations`, `reference_evaluations` and `predictive_logscore`.
+`window_steps`, `parameter_ess_before`, `parameter_ess_after`,
+`distinct_ess_before`, `distinct_ess_after`, `replenished`, `boundary_reset`,
+`unique_parents`, `proposals`, `accepted`, `distinct_members`, `moved_members`,
+`coordinate_sd`, `kernel`, `proposal_scale`, `kind`, `likelihood_evaluations`,
+`reference_evaluations` and `predictive_logscore`. `kind` is `:assimilate` or
+`:rejuvenate`. `parameter_ess_*` counts members, copies included;
+`distinct_ess_*` counts distinct parameter positions and triggers
+replenishment. `proposal_scale` is the random-walk scale used by an
+assimilation replenishment (empty otherwise). `reference_evaluations` counts
+NUTS steps on the Gaussian reference, which only `:rejuvenate` recovery takes.
+`moved_members` counts final positions differing from the selected parent (or
+recovery input); accepted proposals may leave a position unchanged.
+`coordinate_sd` is the weighted marginal spread in unconstrained coordinates.
 History is capped by `history_limit`; counting `replenished` there counts only
 retained steps. For lifetime counts, accumulate the latest entry after each
 step with `history_limit >= 1`. Equal weights after resampling do not demonstrate
-mixing; inspect pre-resampling ESS, ancestry and proposal acceptance too.
+mixing; inspect pre-resampling ESS, ancestry, actual movement and spread too.
 """
 function initialize_filter_smc end
+
 
 # The authored filtering extension owns finite-state storage and transitions.
 # The SMC extension uses these narrow internal operations without retranscribing

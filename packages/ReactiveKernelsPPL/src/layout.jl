@@ -1788,6 +1788,13 @@ _vector_elt_name(name::Symbol, i::Int) = Symbol(:_ppl_v_, name, :_, i)
 _vector_elt(e::LayoutEntry, i::Int) = _vector_elt_name(e.name, i)
 _vector_simplex_pair(e::LayoutEntry) = Symbol(:_ppl_simplex_pair_, e.name)
 _vector_simplex_logjac(e::LayoutEntry) = Symbol(:_ppl_simplex_logjac_, e.name)
+# The packed block of an ordered or simplex entry, and the coordinates an
+# ordered entry's Jacobian reads (all but the first). Each is read as a
+# statement of its own, as every other block is: a read nested inside a larger
+# expression has no row form, so RK's footprint would count the whole packed
+# vector as read (`factor_support`, `partition_footprint`).
+_vector_block(e::LayoutEntry) = Symbol(:_ppl_vector_block_, e.name)
+_vector_ordered_tail(e::LayoutEntry) = Symbol(:_ppl_ordered_tail_, e.name)
 
 # Leveled vector edges (thresholds, threshold-coefficient packs,
 # simplexes): ONE vector-valued statement chain per entry, bound to the
@@ -1826,16 +1833,23 @@ function _vector_transform_statements(e::LayoutEntry)
         e.size == 1 && return Expr[:($(e.name)::AbstractVector{Float64} =
             view(unconstrained, $lo:$lo))]
         f = GlobalRef(@__MODULE__, :_ordered_constrain_kernel)
-        return Expr[:($(e.name)::AbstractVector{Float64} =
-            $f($(block_read(lo, e.size)), 1, $(e.size)))]
+        block, tail = _vector_block(e), _vector_ordered_tail(e)
+        return Expr[
+            :($block::AbstractVector{Float64} = $(block_read(lo, e.size))),
+            :($(e.name)::AbstractVector{Float64} = $f($block, 1, $(e.size))),
+            # Read only by the Jacobian (`jacobian_term`); pruned otherwise.
+            :($tail::AbstractVector{Float64} = $(block_read(lo + 1, e.size - 1))),
+        ]
     end
     # :simplex — stick-breaking (thin-layer-owned, not Stan's ILR).
     K = e.size + 1
     K == 1 && return Expr[:($(e.name)::AbstractVector{Float64} = ones(1))]
     pair, jac = _vector_simplex_pair(e), _vector_simplex_logjac(e)
     f = GlobalRef(@__MODULE__, :_simplex_constrain_logjac_kernel)
+    block = _vector_block(e)
     return Expr[
-        :($pair = $f($(block_read(lo, e.size)), 1, $(e.size))),
+        :($block::AbstractVector{Float64} = $(block_read(lo, e.size))),
+        :($pair = $f($block, 1, $(e.size))),
         :($(e.name)::AbstractVector{Float64} = $pair[1]),
         :($jac::Float64 = $pair[2]),
     ]
@@ -1949,9 +1963,10 @@ function jacobian_term(e::LayoutEntry)
     e.kind === :array && return _array_jacobian_term(e)
     if e.kind === :vector
         if e.transform === :ordered
-            # Σ u[2:end] over one packed slice (the host `ordered_logjac`).
+            # Σ u[2:end] over one packed slice (the host `ordered_logjac`),
+            # read by its own transform statement.
             e.size < 2 && return nothing
-            return :(sum(view(unconstrained, $(e.offset + 1):$(e.offset + e.size - 1))))
+            return :(sum($(_vector_ordered_tail(e))))
         end
         if e.transform === :exp
             # :exp — Σ u (the exp log-Jacobian is the unconstrained value).
