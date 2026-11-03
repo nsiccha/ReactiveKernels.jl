@@ -263,6 +263,7 @@ const _PPL_TEST_FILES = (
     "test_cell_type_branches.jl",
     "test_cell_tuple_geometry.jl",
     "test_query_footprints.jl",
+    "test_cell_joint_footprints.jl",
     "test_compact_cell_derivatives.jl",
     "test_cell_factors.jl",
     "test_cell_factor_values.jl",

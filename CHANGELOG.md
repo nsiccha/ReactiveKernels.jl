@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.67
+
+- Footprints follow reads through views: a view contributes the parent
+  positions its readers read, including views whose indices read the parent's
+  shape. A typed local that converts a view into a copy still reads every
+  viewed position. Inside a plate cell, a shared array read through views and
+  argument-returning shape checks is read at the positions the cell's
+  selections reach, so a strict cell that selects entries of its own block
+  reports those positions only.
+
 ## 0.1.66
 
 - Compute per-position helpers at a cell's rows. Comprehensions and `map` over

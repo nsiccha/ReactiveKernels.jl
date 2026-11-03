@@ -4416,6 +4416,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
             Expr(:call, GlobalRef(Base, :getindex), cell, 1))
     end
     slices = Any[]
+    footprint_programs = Pair{Int,Any}[]
     lane_rows = Dict{Int,Symbol}()
     for (position, arg) in enumerate(plate_args)
         if position in atomic
@@ -4457,7 +4458,12 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
                         via == 0 ? nothing : slices[via]; rows = partition))
                 end
             else
-                _footprint_record!(cid, :whole, nothing)
+                program = _footprint_capture_program(plate.kernel.plan, position)
+                if program === nothing
+                    _footprint_record!(cid, :whole, nothing)
+                else
+                    push!(footprint_programs, position => program)
+                end
             end
         end
     end
@@ -4496,6 +4502,14 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
             position, value = c[1], c[2]
             slices[position] = _cell_capture!(waits(c) ? later : windows, value)
         end
+    end
+    for (position, program) in footprint_programs
+        readplate = _AuthoredPlateOp{typeof(program),atomic}(program)
+        reads = gensym(:cell_reads)
+        _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
+            readplate, slices, plate_values, reads, nothing; element_type=Vector{Int})
+        _footprint_record!(canon_id(windows.pushdowns.graph, plate_values[position].id),
+                           :gathered, reads)
     end
     if partition
         _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
@@ -5115,7 +5129,7 @@ function _lower_with_ops_collecting(p::Plan;
     end
     retval = length(p.want) == 1 ? nm(p.want[1]) :
              Expr(:tuple, (nm(w) for w in p.want)...)
-    _footprint_recording() && (retval = _footprint_return(p, cells, names))
+    _footprint_recording() && (retval = _footprint_return(p, cells, names, declared))
     push!(body.args, Expr(:return, retval))
     # Compose before index runs duplicate a cell body into grouped/flat arms;
     # otherwise those mutually exclusive definitions appear to escape here.

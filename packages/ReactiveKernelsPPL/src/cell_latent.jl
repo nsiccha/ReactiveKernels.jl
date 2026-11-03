@@ -546,7 +546,8 @@ function _expand_cell_joint_latents(st, taken, data::Set{Symbol}, mod::Module,
         geometry_expr = Expr(:call, ref(:sampling_geometry), call.args[1],
             Expr(:tuple, (_sampling_ast_literal(a) for a in call.args[2:end])...), Expr(:tuple))
         function endpoint(f, edge)
-            block = :($site[$blocks[$pos]])
+            # A view: constructing it reads no coordinates (`_ppl_cell_joint_blocks`).
+            block = Expr(:call, GlobalRef(Base, :view), site, :($blocks[$pos]))
             graph = _sampling_graph_call(g, edge, geometry_expr,
                 Any[block, :($shapes[$pos]), positional...], keywords)
             graph === nothing && return _external_endpoint_call(ref(f),
@@ -720,12 +721,17 @@ end
 _ppl_cell_joint_block(site, offsets, pos::Int) =
     view(site, (offsets[pos] + 1):offsets[pos + 1])
 
-# Data-only integer windows expose a cell's packed read to the graph compiler.
-# Materialize their indices once: a range-valued cell intermediate stays in
-# the residual, whereas these arrays cross the binding cache boundary.
+# Each index's packed block, as data: a bound table exposes a cell's packed
+# read to the graph compiler, whereas a range computed in the cell stays in
+# the residual. The cell reads its block through a view (the endpoint `block`
+# above), so an observation that selects entries reads only those
+# coordinates, and so does its strict footprint. The table holds unit ranges:
+# a view indexed by an integer vector loaded from data is a container of
+# constant memory beside the active packed vector, which native Enzyme
+# Reverse rejects (docs/src/constraints.md); a range holds no array.
 # The geometry receives the selected block, never the unrelated cells.
 _ppl_cell_joint_blocks(offsets) =
-    [collect((offsets[k] + 1):offsets[k + 1]) for k in 1:length(offsets)-1]
+    UnitRange{Int}[(offsets[k] + 1):offsets[k + 1] for k in 1:length(offsets)-1]
 
 # A cell's constrained value of its joint latent: the geometry's `constrain`
 # on its packed block, read in place, with the cell's argument values.
@@ -750,6 +756,9 @@ function _ppl_cell_joint_checked(value, shape::Tuple, pos::Int)
     _ppl_cell_joint_check(value, shape, pos)
     return value
 end
+# The shape check returns its first argument: the checked value's reads are
+# reads of the block it checks (`ReactiveKernels._footprint_access`).
+ReactiveKernels._footprint_checked_alias(::typeof(_ppl_cell_joint_checked)) = 1
 
 # A cell's block of the packed array: a number, a vector, or an array of
 # its dimensions. The packed values are read in place.
