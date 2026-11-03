@@ -106,11 +106,12 @@ const _PP_HAVE = (:u, :g, :w, :subject)
         @test_throws message prepare(spec; have = (_PP_HAVE..., :label), want = :partition_total,
             bound = (; subject = key))(d.u, d.g, d.w, 1)
     end
-    # Planned, at the plan: the bound key is checked once per label, before any evaluation.
+    # With the plate's data bound too, the plan knows its domain, so the check
+    # runs when each label is planned, before any evaluation.
     planned = plate_partition(_pp_subjects, :dens; by = :subject, index = :label, plan = :rows)
-    planner = partition_plan_kernel(planned; have = (:u, :g, :w, :label, :rows),
-        want = :partition_total, bound = (; subject = d.subject[1:(n - 1)]))
-    @test_throws "has $(n - 1) entries, but its plate has $n cells" planner(d.u, d.g, d.w, 1, nothing)
+    planner = partition_plan_kernel(planned; have = (_PP_HAVE..., :label, :rows),
+        want = :partition_total, bound = (; d.g, d.w, subject = d.subject[1:(n - 1)]))
+    @test_throws "has $(n - 1) entries, but its plate has $n cells" planner(d.u, 1, nothing)
 end
 
 @testset "plate_partition: one subject's cells as one pass" begin
