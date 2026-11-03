@@ -48,7 +48,7 @@ function tune_filter_smc end
     initialize_filter_smc(target; rng::Xoshiro, members=64, particles=128,
                           window_length=32, ess_fraction=0.5,
                           options=SMCOptions(), history_limit=32,
-                          boundary=nothing)
+                          boundary=nothing, max_reflections=16)
 
 Initialize an owned parameter ensemble from its carried Gaussian and a separate
 conditional particle filter per member. Each new record reweights members by
@@ -61,10 +61,20 @@ selected members. Their retained window likelihood estimates and conditional
 clouds survive selection. Only one fixed-budget replenishment is attempted per
 step.
 
-Each move proposes a Gaussian random walk whose per-coordinate scale is
-`2.38/sqrt(d)` times the members' weighted marginal spread before resampling
-(Roberts, Gelman and Gilks' scaling; diagonal, O(members × d)). The scale is
-fixed for the whole replenishment. Its particle-Metropolis acceptance ratio is
+Each move proposes a Gaussian random walk whose covariance is `2.38^2/d` times
+the members' weighted covariance before resampling (Roberts, Gelman and Gilks'
+scaling), fixed for the whole replenishment. That covariance keeps up to
+`max_reflections` leading correlation directions of the members, fitted in their
+marginally standardized frame with `WarmupHMC.fit_gaussian_moments`, so
+coordinates on very different scales are treated alike. The retained directions
+keep their weighted variance, and the remaining directions share the remaining
+standardized variance equally (probabilistic PCA). At most the
+distinct-position ESS minus 2 directions are kept. With none, or
+`max_reflections=0`, the walk is diagonal with the members' weighted marginal
+spread. Work and storage are O(members × d × directions), and no d × d matrix is
+formed. A diagonal walk leaves the narrow parameter combinations that the data
+pin down, such as a hierarchical intercept plus its group effects, and is
+rejected there. Its particle-Metropolis acceptance ratio is
 the window Gaussian prior ratio times the proposed/current *window* likelihood
 estimate ratio. Each proposal rebuilds conditional states from the frozen
 boundary. Rejections retain the previous estimate and conditional cloud. The
@@ -73,13 +83,27 @@ weighted spread is zero cannot move: a population whose spread has vanished
 stays collapsed and fails as described below. Its recovery needs the
 independently tuned kernel of `rejuvenate_smc`.
 
-After `window_length` records, replace the parameter posterior by its weighted
-Gaussian marginal-moment summary and independently resample the weighted finite
-states into a pool of `particles` states as the next boundary. Draw a new ensemble and independent initial state
-clouds from these summaries. This discards parameter–state dependence and
-Gaussianizes the parameter posterior; it is an explicit assumed-density
-approximation, **not exact full-history SMC²**. Nonpositive/nonfinite marginal
-scales fail with `SMCDegeneracyError` at rollover; no scale is invented.
+After `window_length` records, replace the parameter posterior by a Gaussian
+with the members' weighted mean and their weighted covariance, summarized as
+above (up to `max_reflections` leading correlation directions). Then
+independently resample the weighted finite states into a pool of `particles`
+states as the next boundary, and draw a new ensemble and independent initial
+state clouds from these summaries. A diagonal boundary (`max_reflections=0`) treats the
+marginal widths of correlated parameters as independent information. Where the
+data inform only combinations, such as a hierarchical intercept and its group
+effects, the next window then contracts the population again, and every window
+compounds it. The calibration you supply is the first window's prior, so carry
+it with the same correlated summary
+(`carry_smc(fit; parameters, basis=:correlation)`); a diagonal calibration
+over-contracts the first window, and `basis=:fit` keeps few correlations when
+parameters differ greatly in scale. This discards
+parameter–state dependence and Gaussianizes the parameter posterior; it is an
+explicit assumed-density approximation, **not exact full-history SMC²**. With a
+finite ensemble, the spread in directions that the data never inform still
+drifts downward from window to window, because each boundary estimates it
+again from the members; more members reduce the drift.
+Nonpositive/nonfinite marginal scales fail with `SMCDegeneracyError` at
+rollover; no scale is invented.
 Full spatial coincidence is checked on input and **after** the configured
 mutation pass, so resampling from one parent still gets its chance to move.
 An error preserves the input state in `error.state` and the rejected summary
@@ -107,13 +131,17 @@ window; use `length(state.records)`), `predictive_logscore`, `log_normalizer`
 and `history`. Each retained history entry exposes `time`, `window`,
 `window_steps`, `parameter_ess_before`, `parameter_ess_after`,
 `distinct_ess_before`, `distinct_ess_after`, `replenished`, `boundary_reset`,
-`unique_parents`, `proposals`, `accepted`, `distinct_members`, `moved_members`,
-`coordinate_sd`, `kernel`, `proposal_scale`, `kind`, `likelihood_evaluations`,
+`boundary_directions`, `unique_parents`, `proposals`, `accepted`,
+`distinct_members`, `moved_members`, `coordinate_sd`, `kernel`,
+`proposal_scale`, `proposal_directions`, `kind`, `likelihood_evaluations`,
 `reference_evaluations` and `predictive_logscore`. `kind` is `:assimilate` or
 `:rejuvenate`. `parameter_ess_*` counts members, copies included;
 `distinct_ess_*` counts distinct parameter positions and triggers
-replenishment. `proposal_scale` is the random-walk scale used by an
-assimilation replenishment (empty otherwise). `reference_evaluations` counts
+replenishment. `proposal_scale` is the random walk's per-coordinate standard
+deviation in an assimilation replenishment (empty otherwise), and
+`proposal_directions` the correlation directions it kept.
+`boundary_directions` is the number the step's rollover kept (0 without one).
+`reference_evaluations` counts
 NUTS steps on the Gaussian reference, which only `:rejuvenate` recovery takes.
 `moved_members` counts final positions differing from the selected parent (or
 recovery input); accepted proposals may leave a position unchanged.

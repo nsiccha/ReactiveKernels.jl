@@ -223,6 +223,25 @@ posterior summary moments, not production-kernel adaptation. The owned
 `fit_diagnostics` contains `reflections`, `iterations`, `relative_residuals`,
 `converged` and `effective_sample_size`. Residual convergence does not certify
 covariance accuracy; finite reflection/iteration budgets may lose correlations.
+`:fit` learns the leading *covariance* directions in native coordinates, so when
+coordinates differ greatly in scale its reflections go to the widest ones and
+correlations among narrow coordinates are discarded.
+
+`basis=:correlation` instead fits the leading *correlation* directions: it
+standardizes the weighted cloud by its marginal standard deviations, finds up
+to `max_reflections` directions with the same fitter (`maxiter` applies), keeps
+their weighted variance, and lets the remaining directions share the remaining
+standardized variance equally (probabilistic PCA). At most the distinct-position
+ESS minus 2 directions are kept; with none, the carry is the diagonal one. The
+reference scale is the diagonal-plus-low-rank form
+`(kind=:diagonal_lowrank, diagonal, vectors, values)`, which is invariant to
+rescaling coordinates. It is what the learning filter's window boundaries use,
+and it is the calibration to use for parameter learning in a model whose
+posterior correlates parameters on different scales (hierarchical intercepts
+and group effects). As an importance reference it is not a mutation metric.
+Work O(d N k maxiter), retained size O(d (1 + k)); no dense covariance is
+formed. `fit_diagnostics` holds `directions` and `effective_sample_size` (over
+distinct positions).
 
 This is an assumed-density approximation to the old posterior. A Gaussian
 summary is exact only for a Gaussian posterior with matching moments; fitting

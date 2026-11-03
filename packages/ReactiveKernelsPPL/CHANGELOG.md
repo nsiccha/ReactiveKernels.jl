@@ -16,6 +16,37 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.77
+
+- **Breaking:** the learning filter's window boundary keeps correlations. At each
+  rollover the members' weighted covariance is summarized by up to
+  `max_reflections` leading correlation directions (new
+  `initialize_filter_smc` keyword, default 16), fitted in the members'
+  marginally standardized frame with `WarmupHMC.fit_gaussian_moments`; the
+  remaining directions share the remaining standardized variance equally. The
+  next window's prior and ensemble draws use this diagonal-plus-low-rank
+  Gaussian instead of the marginal moments. A diagonal boundary treated the
+  marginal widths of correlated parameters (a hierarchical intercept and its
+  group effects) as independent information, so every window contracted the
+  directions the data do not inform, compounding to about 1 % of the exact
+  posterior width after twelve windows. `max_reflections=0` restores the
+  diagonal boundary and walk.
+- Replenishment random walks use the same correlated covariance of the weighted
+  members (`2.38^2/d` times it), so moves stay inside the narrow parameter
+  combinations the data pin down instead of being rejected there. At most the
+  distinct-position ESS minus 2 directions are kept; with none the walk stays
+  diagonal.
+- `carry_smc(completed; basis=:correlation)` carries the same standardized
+  correlation summary (diagonal-plus-low-rank reference, `max_reflections`
+  directions). Unlike `basis=:fit`, which learns covariance directions in native
+  coordinates and spends them on the widest coordinates, it keeps correlations
+  among parameters on very different scales; use it for a learning-filter
+  calibration. `fit_diagnostics` reports `directions` and
+  `effective_sample_size`.
+- History entries add `boundary_directions` and `proposal_directions`;
+  `proposal_scale` is the walk's per-coordinate standard deviation.
+  Parameter-learning checkpoints use schema 3 and record `max_reflections`.
+
 ## 0.1.76
 
 - A joint cell latent's cell reads its packed block through a view of the
