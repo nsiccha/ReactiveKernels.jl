@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.74
+
+- Prepared queries of a model whose caller-owned law takes an authored
+  argument with a resolved binding (a property read `holder.inner`, an array
+  literal `[1.0]`) can be deep-copied, for example once per chain, and the
+  copy evaluates as the original. This needs ReactiveKernels 0.1.65, now the
+  compat floor. `model_view(built; bound)` displays such a model's generated
+  source instead of failing with `deepcopy of Modules not supported`.
+
 ## 0.1.73
 
 - **Breaking:** learning-filter replenishment now resamples the current weighted
