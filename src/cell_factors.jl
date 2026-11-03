@@ -33,10 +33,37 @@ function _cell_factor_graph(spec::KernelSpec, want; have = spec.have_names,
     _cell_factor_graph(p, spec.ports, spec.port_order; bound, on_error, locality)
 end
 
+# A shared-prefix cut types its frontier inputs from the producers it removed
+# (`_partition_shared_parts`), on the cut plan's HAVE values only. Planning
+# from a graph reads each HAVE value from the graph's table, and adding a
+# recipe registers the input values it holds, which keep the original, often
+# untyped, declaration. Without these facts the factor graph cannot prove a
+# flattened cell's per-index read `a[i]` scalar: the read stays a whole-array
+# `getindex` and its position `i` looks like a gather's rows. Give the cut's
+# readers the typed values in an owned copy, so every later copy keeps them.
+function _cell_factor_typed_inputs(p::Plan)
+    g = p.graph
+    cid(v) = canon_id(g, v.id)
+    typed = Dict{ValueId,Value}(cid(v) => v for v in p.have
+                                if valtype(v) !== valtype(g.values[cid(v)]))
+    isempty(typed) && return p
+    h = Graph(copy(g.values), Recipe[], Dict{ValueId,Vector{Int}}(), copy(g.aliases),
+              g.version, nothing)
+    for r in p.recipes
+        inputs = Tuple(get(typed, cid(v), v) for v in r.inputs)
+        _add_recipe!(h, inputs, r.outputs, r.op, r.cost, r.cse_key, r.effectful, r.source)
+    end
+    for (id, v) in typed
+        h.values[id] = v.id == id ? v : Value{valtype(v)}(id, v.name)
+    end
+    plan(h; have = p.have, want = p.want)
+end
+
 # A shared-prefix cut is an authoritative selected plan. Do not replan from
 # its original graph: that would bring the removed shared producers back.
 function _cell_factor_graph(p::Plan, original_ports, original_order;
                             bound = NamedTuple(), on_error = nothing, locality = nothing)
+    p = _cell_factor_typed_inputs(p)
     # Prove aliases with the declared live input types, not dense stand-ins:
     # factor value queries also accept other arrays with those declarations.
     p = _cell_factor_aliases(p, Any[haskey(bound, v.name) ? typeof(bound[v.name]) :
@@ -351,7 +378,7 @@ function _cell_factor_rows(spec::KernelSpec, argument::Value; bound = NamedTuple
     known = IdDict{Recipe,Any}()
     argument_types = Any[haskey(bound, v.name) ? typeof(bound[v.name]) : valtype(v)
                          for v in p.have]
-    _cell_value_types(p; argument_types, known)
+    types = _cell_value_types(p; argument_types, known)
     seen = Set{ValueId}()
     function walk(v)
         id = canon_id(g, v.id)
@@ -363,7 +390,14 @@ function _cell_factor_rows(spec::KernelSpec, argument::Value; bound = NamedTuple
         form = get(known, r, nothing)
         form === nothing && return nothing
         index = findfirst(==(:index), form.roles)
-        index === nothing || return r.inputs[index]
+        if index !== nothing
+            # A position known not to be an array selects one element (a
+            # cell's own array, say), not rows. That element's entries are
+            # labelled by no gather here, so the sum stays in the outer.
+            I = get(types, canon_id(g, r.inputs[index].id), Any)
+            I isa Type && I !== Any && !(I <: AbstractArray) && return nothing
+            return r.inputs[index]
+        end
         for (i, input) in enumerate(r.inputs)
             _cell_row_role(form.roles[i]) || continue
             rows = walk(input)

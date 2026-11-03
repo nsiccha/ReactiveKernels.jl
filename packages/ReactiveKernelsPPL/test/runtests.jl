@@ -271,6 +271,7 @@ const _PPL_TEST_FILES = (
     "test_cell_shared.jl",
     "test_cell_factor_axes.jl",
     "test_cell_factor_producers.jl",
+    "test_cell_factor_cell_reads.jl",
     "test_cell_batch.jl",
     "test_logistic_values.jl",
 )
