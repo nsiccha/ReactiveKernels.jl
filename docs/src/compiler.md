@@ -1544,6 +1544,11 @@ Grouped compact RKPPL partitions on Julia 1.10 also require Enzyme dogfood
 from `a6458e9c` (`static-reverse-g-173719b3`). This second repair preserves
 the constant-field proof when a method receives two views of the plan,
 allowing ordinary Reverse through the overlay's choice of base or active data.
+`prepare_ad` passes a named-tuple plan to the differentiated call behind a
+reference: as a by-value aggregate of every field, it made LLVM's constant
+propagation take a steeply growing share of the first gradient's compile time
+as the plan widened. Callers still pass, and `partition_plan` still returns,
+the named tuple.
 `plan_constant`
 names HAVE ports whose values are constant per label (not data for the plan),
 and a lazy view of inputs may serve its rows from its parts

@@ -613,6 +613,31 @@ end
     ad_value_and_gradient!(prepare_ad(plain, AutoEnzyme(; mode = Enzyme.Reverse), d.u, 3; active = :u),
                            reference, d.u, 3)
     @test gradient ≈ reference
+    # The differentiated call receives the plan behind a reference, not as a
+    # by-value aggregate of every field (snag frozen-atlas-fir-2d4269a6);
+    # callers still pass the named tuple, and every label's plan is boxed alike.
+    _, contexts = ReactiveKernels._ad_prepared_arguments(ad, (d.u, 3, plans[3]), (;))
+    @test any(c -> DifferentiationInterface.unwrap(c) isa ReactiveKernels._PartitionPlanRef, contexts)
+    @test !any(c -> DifferentiationInterface.unwrap(c) isa typeof(plans[3]), contexts)
+    for s in (1, 5)
+        expected = similar(d.u)
+        ad_value_and_gradient!(prepare_ad(plain, AutoEnzyme(; mode = Enzyme.Reverse), d.u, s; active = :u),
+                               expected, d.u, s)
+        @test last(ad_value_and_gradient!(ad, similar(d.u), d.u, s, plans[s])) ≈ expected
+    end
+    # Every prepared operator pairs the boxed plan of its preparation with its
+    # evaluation, not only the gradient.
+    direction = cos.(eachindex(d.u))
+    pullback = prepare_ad_pullback(planned, AutoEnzyme(; mode = Enzyme.Reverse), 1.0,
+                                   d.u, 3, plans[3]; active = :u)
+    @test ad_pullback(pullback, 1.0, d.u, 3, plans[3]) ≈ reference
+    pushforward = prepare_ad_pushforward(planned, AutoEnzyme(; mode = Enzyme.Forward), (direction,),
+                                         d.u, 3, plans[3]; active = :u)
+    @test only(ad_pushforward(pushforward, (direction,), d.u, 3, plans[3])) ≈ sum(reference .* direction)
+    second_order = SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse), AutoEnzyme(; mode = Enzyme.Forward))
+    hvp = prepare_ad_hvp(planned, second_order, (direction,), d.u, 3, plans[3]; active = :u)
+    plain_hvp = prepare_ad_hvp(plain, second_order, (direction,), d.u, 3; active = :u)
+    @test only(ad_hvp(hvp, (direction,), d.u, 3, plans[3])) ≈ only(ad_hvp(plain_hvp, (direction,), d.u, 3))
     @test_throws ArgumentError plate_partition(_pp_subjects, :dens; by = :subject, index = :label,
                                                plan = :label)
     # Index bookkeeping as against data, nested (a ragged row structure).

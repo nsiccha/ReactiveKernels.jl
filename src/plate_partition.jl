@@ -1026,6 +1026,23 @@ end
 # label, bound constants (`_BoundConstant` getters, the partition table ops)
 # and other such statements, or it stays in the body.
 const _PLAN_ARG = :__plan__
+
+# A label's plan is one named tuple of every row-bookkeeping value of the
+# partition: thousands of fields for a large model (4,561 for the frozen
+# Atlas's dense partition). Passed by value into a differentiated call it is an
+# LLVM aggregate, and LLVM's sparse conditional constant propagation visits every
+# field on each insertion: that pass's share of the first gradient's compile time
+# grew about cubically with the plan's width (snag `frozen-atlas-fir-2d4269a6`). A
+# differentiated call therefore receives the plan behind this reference
+# (`_ad_box_plan`, ad.jl), and the body reads either form through
+# `_partition_plan_value`. This is a compile-time measure: a warm gradient takes
+# about as long either way. Callers still pass, and `partition_plan` still
+# returns, the named tuple.
+mutable struct _PartitionPlanRef{T}
+    const plan::T
+end
+@inline _partition_plan_value(plan) = plan
+@inline _partition_plan_value(plan::_PartitionPlanRef) = getfield(plan, :plan)
 # `_PLAN_MODE` / `_plan_mode()` (graphops.jl): set while `partition_plan_kernel(spec; …)`
 # prepares; the lowering then emits the plan body instead of the partition's.
 
@@ -1464,7 +1481,8 @@ function _partition_plan_lowering(p::Plan, body::Expr, argexprs, runtime_ops, nm
             "concrete named-tuple type of its plan; `partition_plan_kernel(spec; …)` " *
             "computes a plan of that type, declare it with `plan = :$port => typeof(plan)`"))
     end
-    reads = Any[Expr(:(=), _PLAN_ARG, Expr(:(::), nm(p.have[position]), T))]
+    reads = Any[Expr(:(=), _PLAN_ARG, Expr(:(::), Expr(:call,
+        GlobalRef(@__MODULE__, :_partition_plan_value), nm(p.have[position])), T))]
     push!(reads, Expr(:call, GlobalRef(@__MODULE__, :_partition_plan_labels_check),
         Expr(:call, GlobalRef(Core, :getfield), _PLAN_ARG, QuoteNode(:partition_labels)),
         Expr(:tuple, (nm(r.inputs[1]) for r in checks)...)))
