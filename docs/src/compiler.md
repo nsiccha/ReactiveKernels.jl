@@ -1176,6 +1176,40 @@ window types must dispatch to the same single method. An iterated argument must
 be a vector Base iterates in its linear order from position 1; an abstract port
 type is checked against the original producer's type at run time.
 
+A matrix argument is a position argument over its first axis. The loop runs
+over `axes(x, 1)` or `1:size(x, 1)`, and row `g` reads `x[g, d]` for any `d`;
+`size(x, 2)` and `axes(x, 2)` are the same for its rows, so an inner loop may
+run over them. The result may be filled before the loop, as
+`zeros(T, size(x, 1), m...)` or `ones`. A filled result may be read and written
+at its own row any number of times (`out[g, k] += v`). A row no iteration
+writes keeps its fill value, as in the whole helper. An unfilled result
+(`similar(x)`, `Matrix{T}(undef, …)`) is written once per row, as a whole row
+(`out[g, :] = row`). Each trailing extent `m` is a literal or the `size` of an
+argument, so the result's shape is known before the call. Before the loop, a
+prologue may compute values from the arguments passed whole, literals and
+those extents:
+
+```julia
+coefficients = L * reshape(z, size(L, 1), :)
+scale = sd / sqrt(size(frequency, 2))
+```
+
+Such a value is the same for a window as for the whole helper. A row may read a
+number computed this way and index an array (`coefficients[k, offset + j]`).
+Handing such an array to a call in a row (`sum(coefficients)`) is whole work in
+every row, as for an argument, so the helper keeps no row form. A prologue call
+may not mutate (`!`), and it may not read a position argument or its row count.
+Its arguments are therefore passed whole, and the prologue runs once per cell
+call. A coefficient vector of partitioned coordinates read this way puts every
+one of its coordinates in each cell's footprint. The window calls the helper on
+fresh dense matrices of a matrix argument's rows.
+
+`vec(x)` of an array whose rows are known also has a row form. Position `u` of
+the result is row `mod1(u, n)` of `x` at trailing position `cld(u, n)`,
+column-major, where `n` is `x`'s row count. A cell's window reads only the rows
+of `x` that its positions lie in, so `vec` of an `n × 1` result is the identity
+on rows.
+
 A field of existing storage is existing storage. A cell reads `data.weight`,
 or `rows[i].weight1` from a named tuple of row vectors per index, at its rows,
 as it reads a port. This holds for a named tuple, and for a concrete struct

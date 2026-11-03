@@ -9,33 +9,55 @@
 #   those (destructured or not), including straight-line wrappers;
 # - a loop over one such iterator that builds the result by exactly one
 #   unconditional `push!(out, row)` onto an empty vector, or `out[g] = row`
-#   into `similar(x)`, `zeros(T, length(x))` or `Vector{T}(undef, length(x))`,
-#   after a prologue of type computations only. The body may hold branches,
-#   inner loops and nested calls on per-position values; its locals must be
-#   assigned in each iteration before they are read.
+#   into `similar(x)`, `zeros(T, length(x))` or `Vector{T}(undef, length(x))`.
+#   The body may hold branches, inner loops and nested calls on per-position
+#   values; its locals must be assigned in each iteration before they are read.
+#
+# A matrix argument is a position argument over its first axis: the loop runs
+# over `axes(x, 1)` (or `1:size(x, 1)`) and row `g` reads `x[g, d]` for any
+# `d`; `size(x, 2)` and `axes(x, 2)` are the same for its rows. A result
+# filled before the loop, `zeros(T, size(x, 1), m...)` or `ones`, may also be
+# read and written at its own row any number of times (`out[g, k] += ...`): a
+# row no iteration reaches keeps the fill value, as in the whole helper. Each
+# trailing extent `m` is a literal or the `size` of an argument, so the
+# result's shape is known before the call. An unfilled result must be written
+# once per row, as a whole row (`out[g, :] = row`).
+#
+# Before the loop, the prologue may compute values from the arguments passed
+# whole, literals and those extents (`coefficients = L * reshape(z, k, :)`,
+# `scale = sd / sqrt(size(frequency, 2))`). Such a value is the same for a
+# window as for the whole helper; a row may read and index it. No prologue
+# call may mutate (`!`), and none may read a position argument or a row count.
 #
 # Every other argument (`field` in `field[ix]` with `ix = paths[g]`) is passed
 # whole, so it must be computed whole: the ordinary locality checks decide
 # whether that is legitimate (a shared or bound value) or refused. The
 # position `g` itself may only index a position argument; an expression of it
-# (`x[g - 1]`), a read of the result being built, a value carried from one
-# iteration to the next, `length(x)` of a position argument read as a value,
-# and mutation of anything not created in the iteration all keep the helper
-# without a row form.
+# (`x[g - 1]`), a read of another row of the result being built, a value
+# carried from one iteration to the next, `length(x)` of a position argument
+# read as a value, and mutation of anything not created in the iteration all
+# keep the helper without a row form.
 #
-# A cell's window calls the authored helper on fresh dense vectors of its
-# position arguments' requested rows, and its other arguments unchanged. Both
-# the original and the window argument types must dispatch to the same single
-# method, so the authored loops, branches and errors run as written.
+# A cell's window calls the authored helper on fresh dense vectors (matrices)
+# of its position arguments' requested rows, and its other arguments
+# unchanged. Both the original and the window argument types must dispatch to
+# the same single method, so the authored loops, branches and errors run as
+# written.
 
 struct _CellPositionMap
     # The recipe inputs whose length gives the row count (`zip`: the least).
     sources::Vector{Int}
     # Facts the proof assumed of an input whose static type does not show
     # them: `(input, :standard)`, a vector iterated in its linear order from 1;
+    # `(input, :standard_rows)`, a matrix whose first axis starts at 1;
     # `(input, :eltype)`, a concrete element type, so `eltype(x[1])` is the same
     # for every element. Checked on the original producer's type at run time.
     checks::Vector{Tuple{Int,Symbol}}
+    # The inputs read at rows of a matrix (`x[g, d]`).
+    matrices::Vector{Int}
+    # The result's axes after its rows, for an array result built row by row:
+    # `(:const, m)` or `(:size, input, axis)`. Empty for a vector result.
+    extents::Vector{Tuple{Symbol,Vararg{Int}}}
 end
 
 struct _PMFail <: Exception end
@@ -50,7 +72,11 @@ _pm_fail() = throw(_PMFail())
 # element read only for its type, an argument's length), `:iter` (data: an
 # iterator descriptor), `:istate`/`:state`/`:ibool` (the iteration protocol),
 # `:tuple` (data: its items), `:closure`/`:closuretype`/`:gen`, `:acc` (the
-# result being built; data `:push` or `(:prealloc, j)`), `:rows` (a result).
+# result being built; data `:push` or `(:prealloc, j, filled, extents)`),
+# `:accread` (that result read at the current row), `:shared` (a value the
+# prologue computed from arguments passed whole), `:extent` (data `(j, k)`:
+# `size(x, k)` of an argument, the same for its rows when `k >= 2`), `:rows`
+# (a result; data `(iterator, extents)`).
 struct _PMValue
     kind::Symbol
     data::Any
@@ -102,13 +128,30 @@ function _pm_standard_vector(T)
 end
 _pm_vector_eltype(T) = T isa Type && T !== Union{} && T <: AbstractArray &&
     isconcretetype(eltype(T))
+# A matrix whose first axis is `Base.OneTo`, as `axes(x, 1)` iterates its
+# rows: an `Array`, a view of one-based indices, or a concrete matrix whose
+# `axes` is Base's generic method. Offset axes are not.
+function _pm_standard_matrix(T)
+    T isa Type && T !== Union{} && T <: AbstractMatrix || return false
+    T <: Array{<:Any,2} && return true
+    if T isa DataType && T <: SubArray
+        I = T.parameters[4]
+        return I isa DataType && all(_pm_onebased_index, I.parameters)
+    end
+    isconcretetype(T) && !(T <: Base.ReinterpretArray) || return false
+    m = which(axes, Tuple{T})
+    m.module === Base && m.sig isa DataType && m.sig.parameters[2] in (AbstractArray, Any)
+end
+_pm_is_matrix(T) = T isa Type && T !== Union{} && T <: AbstractMatrix
+_pm_matrix(st, j::Int) = _pm_is_matrix(st.types[j])
 
 # A fact of argument `j`'s type: proven statically, checked at run time when
 # its static type is abstract (the original producer's inferred type), or
 # failed when its concrete static type lacks it.
 function _pm_require!(st::_PMState, j::Int, fact::Symbol)
     T = st.types[j]
-    holds = fact === :standard ? _pm_standard_vector(T) : _pm_vector_eltype(T)
+    holds = fact === :standard ? _pm_standard_vector(T) :
+        fact === :standard_rows ? _pm_standard_matrix(T) : _pm_vector_eltype(T)
     holds && return nothing
     T === Any || T isa Type && !isconcretetype(T) && T <: AbstractArray || _pm_fail()
     push!(st.checks, (j, fact))
@@ -125,15 +168,22 @@ end
 function _pm_position!(st::_PMState, j::Int)
     j in st.whole && _pm_fail()
     T = st.types[j]
-    T === Any || T isa Type && T <: AbstractVector || _pm_whole!(st, j)
+    T === Any || T isa Type && (T <: AbstractVector || _pm_is_matrix(T)) || _pm_whole!(st, j)
     nothing
 end
 
+# Argument `j` iterated by row: a vector by position, a matrix by its first axis.
 function _pm_iterated!(st::_PMState, j::Int)
     _pm_position!(st, j)
-    _pm_require!(st, j, :standard)
+    _pm_require!(st, j, _pm_matrix(st, j) ? :standard_rows : :standard)
     push!(st.iterated, j)
     nothing
+end
+# Argument `j` iterated by its linear positions or elements (`eachindex(x)`,
+# `for v in x`): one row per position of a vector only.
+function _pm_linear_iterated!(st::_PMState, j::Int)
+    _pm_matrix(st, j) && _pm_fail()
+    _pm_iterated!(st, j)
 end
 
 _pm_static_type(st::_PMState, v::_PMValue) =
@@ -180,7 +230,11 @@ mutable struct _PMFrame
     accumulations::Vector{Int}
     accumulator::Union{Nothing,_PMValue}
     statement::Int
+    # Whether some write sets part of a row (`out[g, k] = v`).
+    partial::Bool
 end
+_PMFrame(ci, slots, ssa, iteration, sparams, accumulations, accumulator, statement) =
+    _PMFrame(ci, slots, ssa, iteration, sparams, accumulations, accumulator, statement, false)
 
 function _pm_value(fr::_PMFrame, x)
     x isa Core.SSAValue && return get(() -> _pm_fail(), fr.ssa, x.id)
@@ -196,16 +250,78 @@ function _pm_value(fr::_PMFrame, x)
 end
 
 _pm_typelike(v::_PMValue) = v.kind in (:const, :typeval)
-_pm_value_kind(v::_PMValue) = v.kind in (:const, :typeval, :local, :elem)
+_pm_value_kind(v::_PMValue) = v.kind in (:const, :typeval, :local, :elem, :accread, :shared,
+                                         :extent)
+# The same for a window as for the whole helper.
+_pm_invariant(v::_PMValue) = v.kind in (:const, :typeval, :shared, :extent)
 
 # An iterator from a value: a descriptor, an argument iterated directly.
 function _pm_iterator(st::_PMState, v::_PMValue)
     v.kind === :iter && return v.data
     if v.kind === :param
-        _pm_iterated!(st, v.data)
+        _pm_linear_iterated!(st, v.data)
         return (:over, v.data)
     end
     _pm_fail()
+end
+
+# A value the prologue computes by calling `fv` on arguments passed whole,
+# literals, types and extents: the same for a window as for the whole helper.
+# A call that may mutate is not one, and a position argument, its row count
+# or its type read this way is read whole.
+function _pm_shared_call!(st::_PMState, fv, args::Vector{_PMValue})
+    _pm_mutating(fv) && _pm_fail()
+    foreach(a -> _pm_shared_operand!(st, a), args)
+    # Its inferred type: a row may read a number, but only index an array.
+    T = Core.Compiler.return_type(fv, Tuple{Any[_pm_shared_type(st, a) for a in args]...})
+    _PMValue(:shared, T)
+end
+_pm_shared_type(st::_PMState, a::_PMValue) =
+    a.kind === :const ? Core.Typeof(a.data) :
+    a.kind === :param ? st.types[a.data] :
+    a.kind === :shared ? a.data :
+    a.kind in (:extent, :len) ? Int :
+    a.kind === :tuple ? Tuple{Any[_pm_shared_type(st, x) for x in a.data]...} : Any
+# A prologue value a row hands to a call: a number, or an integer range it
+# iterates (`axes(x, 2)`); an array (`coefficients`) is only indexed.
+_pm_shared_scalar(T) = T isa Type && T !== Union{} &&
+    (T <: Number || T <: AbstractRange{<:Integer})
+function _pm_shared_operand!(st::_PMState, a::_PMValue)
+    k = a.kind
+    _pm_invariant(a) && return
+    k === :tuple && return foreach(x -> _pm_shared_operand!(st, x), a.data)
+    k in (:param, :len, :typeof, :typeread) && return _pm_whole!(st, a.data)
+    _pm_fail()
+end
+
+# `size(x, k)`: an extent the same for x's rows when `k >= 2` and x is an
+# array; the row count when `k == 1`. An argument of unknown rank is whole.
+function _pm_size!(st::_PMState, j::Int, k::Int)
+    k >= 1 || _pm_fail()
+    k == 1 && return _PMValue(:len, j)
+    T = st.types[j]
+    T isa Type && T !== Union{} && T <: AbstractArray || _pm_whole!(st, j)
+    _PMValue(:extent, (j, k))
+end
+
+# A result `fill`ed before the loop, or not, with rows from argument `j` and
+# trailing axes `rest`: each a literal, an extent or the row count of an
+# argument passed whole.
+function _pm_prealloc!(st::_PMState, j::Int, rest, filled::Bool)
+    extents = Tuple{Symbol,Vararg{Int}}[]
+    for a in rest
+        if a.kind === :const && a.data isa Integer
+            push!(extents, (:const, Int(a.data)))
+        elseif a.kind === :extent
+            push!(extents, (:size, a.data...))
+        elseif a.kind === :len
+            _pm_whole!(st, a.data)
+            push!(extents, (:size, a.data, 1))
+        else
+            _pm_fail()
+        end
+    end
+    _PMValue(:acc, (:prealloc, j, filled, Tuple(extents)))
 end
 
 # A value used as an argument of an ordinary call inside an iteration. An
@@ -216,7 +332,8 @@ _pm_array_argument(st::_PMState, j::Int) =
     (T = st.types[j]; T === Any || T isa Type && T <: AbstractArray)
 function _pm_operand!(st::_PMState, v::_PMValue)
     k = v.kind
-    k in (:const, :typeval, :local, :elem) && return
+    k in (:const, :typeval, :local, :elem, :accread, :extent) && return
+    k === :shared && return _pm_shared_scalar(v.data) ? nothing : _pm_fail()
     k === :tuple && return foreach(x -> _pm_operand!(st, x), v.data)
     k === :param && _pm_array_argument(st, v.data) && _pm_fail()
     k in (:param, :len, :typeof, :typeread) && return _pm_whole!(st, v.data)
@@ -232,12 +349,24 @@ function _pm_call(st::_PMState, fr::_PMFrame, f::_PMValue, args::Vector{_PMValue
             return _PMValue(:local)
         end
         n == 0 && return _PMValue(:acc, :push)
-        n == 2 && args[1].kind === :const && args[1].data === undef &&
-            args[2].kind === :len && return _PMValue(:acc, (:prealloc, args[2].data))
+        n >= 2 && args[1].kind === :const && args[1].data === undef &&
+            args[2].kind === :len &&
+            return _pm_prealloc!(st, args[2].data, args[3:end], false)
         _pm_fail()
     end
     f.kind === :const || _pm_fail()
     fv = f.data
+    # Extents: `size(x, k)` and `axes(x, k)` of an argument; past its first
+    # axis, the same for its rows.
+    if fv in (Base.size, Base.axes) && n == 2 && args[1].kind === :param &&
+            args[2].kind === :const && args[2].data isa Integer && args[2].data >= 2
+        extent = _pm_size!(st, args[1].data, Int(args[2].data))
+        return fv === Base.size ? extent : _PMValue(:shared, Base.OneTo{Int})
+    end
+    if fv === Base.size && n == 2 && args[1].kind === :param &&
+            args[2].kind === :const && args[2].data == 1
+        return _pm_size!(st, args[1].data, 1)
+    end
     # Protocol and structure, in and outside an iteration.
     if fv === Core.getfield && n >= 2
         a, field = args[1], args[2]
@@ -279,7 +408,7 @@ function _pm_call(st::_PMState, fr::_PMFrame, f::_PMValue, args::Vector{_PMValue
             _pm_require!(st, a.data, :eltype)
             return _PMValue(:typeval)
         end
-        _pm_typelike(a) && return _PMValue(:typeval)
+        _pm_invariant(a) && return _PMValue(:typeval)
     end
     if fv === Core.apply_type && n >= 1 && args[1].kind === :const &&
             args[1].data isa Type && args[1].data <: Function
@@ -292,7 +421,8 @@ function _pm_call(st::_PMState, fr::_PMFrame, f::_PMValue, args::Vector{_PMValue
         for a in args
             a.kind === :typeof && _pm_whole!(st, a.data)
         end
-        all(_pm_typelike, args) && return _PMValue(:typeval)
+        # The type of an argument passed whole is the original's.
+        all(a -> _pm_typelike(a) || a.kind === :typeof, args) && return _PMValue(:typeval)
     end
     fr.iteration ? _pm_iteration_call(st, fr, fv, args) : _pm_outer_call(st, fr, fv, args)
 end
@@ -303,12 +433,14 @@ function _pm_outer_call(st::_PMState, fr::_PMFrame, fv, args::Vector{_PMValue})
     n = length(args)
     param(k) = n >= k && args[k].kind === :param
     if fv === Base.eachindex && n == 1 && param(1)
-        _pm_iterated!(st, args[1].data)
+        _pm_linear_iterated!(st, args[1].data)
         return _PMValue(:iter, (:positions, args[1].data))
     elseif fv === Base.axes && n == 2 && param(1) && args[2].kind === :const && args[2].data == 1
         _pm_iterated!(st, args[1].data)
         return _PMValue(:iter, (:positions, args[1].data))
     elseif fv === Base.length && n == 1 && param(1)
+        # A matrix's length is not its row count.
+        _pm_matrix(st, args[1].data) && return _pm_shared_call!(st, fv, args)
         return _PMValue(:len, args[1].data)
     elseif fv === Base.:(:) && n == 2 && args[1].kind === :const && args[1].data === 1 &&
             args[2].kind === :len
@@ -337,57 +469,97 @@ function _pm_outer_call(st::_PMState, fr::_PMFrame, fv, args::Vector{_PMValue})
         return _PMValue(:typeread, args[1].data)   # `x[1]`, only for its type
     elseif fv isa Type && n == 0
         return _PMValue(:acc, :push)               # `Vector{T}()`
-    elseif fv isa Type && n == 2 && args[1].kind === :const && args[1].data === undef &&
+    elseif fv isa Type && n >= 2 && args[1].kind === :const && args[1].data === undef &&
             args[2].kind === :len
-        return _PMValue(:acc, (:prealloc, args[2].data))
+        # `Vector{T}(undef, length(x))`, `Matrix{T}(undef, size(x, 1), m)`
+        return _pm_prealloc!(st, args[2].data, args[3:end], false)
     elseif fv === Base.similar && n in (1, 2) && param(1) && (n == 1 || _pm_typelike(args[2]))
-        _pm_position!(st, args[1].data)
-        return _PMValue(:acc, (:prealloc, args[1].data))
+        j = args[1].data
+        _pm_position!(st, j)
+        return _pm_prealloc!(st, j, _pm_matrix(st, j) ? [_PMValue(:extent, (j, 2))] : (), false)
     elseif fv === Base.similar && n in (2, 3) && args[end].kind === :len &&
             (n == 2 || _pm_typelike(args[2]))
         args[1].kind === :param && _pm_whole!(st, args[1].data)
         args[1].kind in (:param, :const, :typeval) || _pm_fail()
-        return _PMValue(:acc, (:prealloc, args[end].data))
-    elseif fv in (Base.zeros, Base.ones) && n in (1, 2) && args[end].kind === :len &&
-            (n == 1 || _pm_typelike(args[1]))
-        return _PMValue(:acc, (:prealloc, args[end].data))
-    elseif fv === Base.fill && n == 2 && _pm_typelike(args[1]) && args[2].kind === :len
-        return _PMValue(:acc, (:prealloc, args[2].data))
+        return _pm_prealloc!(st, args[end].data, (), false)
+    elseif fv in (Base.zeros, Base.ones) && n >= 1
+        # `zeros(T, size(x, 1), m...)`: every entry holds its fill value.
+        dims = _pm_typelike(args[1]) && !(args[1].kind === :const && args[1].data isa Integer) ?
+            args[2:end] : args
+        !isempty(dims) && dims[1].kind === :len || _pm_fail()
+        return _pm_prealloc!(st, dims[1].data, dims[2:end], true)
+    elseif fv === Base.fill && n >= 2 && _pm_typelike(args[1]) && args[2].kind === :len
+        # A number fills; another value is one object every row would share.
+        filled = args[1].kind === :const && args[1].data isa Number
+        return _pm_prealloc!(st, args[2].data, args[3:end], filled)
     end
-    # A wrapper: another helper over arguments, constants and types.
+    # A wrapper: another helper over arguments, constants and types. One
+    # that maps no positions is a value of the prologue.
     if fv isa Function && Base.issingletontype(typeof(fv)) &&
             !(parentmodule(fv) in (Core, Base)) &&
-            all(a -> a.kind in (:param, :const, :typeval), args)
-        return _pm_function(st, typeof(fv), args)
+            all(a -> a.kind in (:param, :const, :typeval), args) &&
+            any(a -> a.kind === :param && !(a.data in st.whole), args)
+        calls, checks, iterated = copy(st.calls), copy(st.checks), copy(st.iterated)
+        try
+            return _pm_function(st, typeof(fv), args)
+        catch err
+            err isa _PMFail || rethrow()
+            st.calls, st.checks, st.iterated = calls, checks, iterated
+        end
     end
-    _pm_fail()
+    fv isa Function || fv isa Type || _pm_fail()
+    _pm_shared_call!(st, fv, args)
 end
 
 # Inside one row's computation.
 function _pm_iteration_call(st::_PMState, fr::_PMFrame, fv, args::Vector{_PMValue})
     n = length(args)
-    any(a -> a.kind === :pos, args) && !(fv === Base.getindex && n == 2 && args[2].kind === :pos) &&
-        !(fv === Base.setindex! && n == 3 && args[1].kind === :acc && args[3].kind === :pos) &&
-        _pm_fail()
-    if fv === Base.getindex && n == 2 && args[2].kind === :pos
+    # The result being built, at its own row and one index per trailing axis.
+    acc = fr.accumulator
+    at_row(first) = n >= first && args[first].kind === :pos && args[1].kind === :acc &&
+        args[1] == acc && acc.data isa Tuple && n - first == length(acc.data[4]) &&
+        !any(a -> a.kind === :pos, args[first+1:end])
+    if fv === Base.getindex && n >= 2 && args[2].kind === :pos
         a = args[1]
+        if a.kind === :acc
+            # Only a filled result holds a value before the row writes it.
+            at_row(2) && acc.data[3] || _pm_fail()
+            foreach(x -> _pm_operand!(st, x), args[3:end])
+            return _PMValue(:accread)
+        end
         a.kind === :param || _pm_fail()
         _pm_position!(st, a.data)
+        any(x -> x.kind === :pos, args[3:end]) && _pm_fail()
+        # A vector at the position; a matrix at its row (`x[g, d]`), never by
+        # the linear index `x[g]`.
+        n == (_pm_matrix(st, a.data) ? 3 : 2) || _pm_fail()
+        foreach(x -> _pm_operand!(st, x), args[3:end])
         return _PMValue(:elem, a.data)
     end
+    if fv === Base.setindex! && n >= 3 && args[3].kind === :pos
+        at_row(3) || _pm_fail()
+        foreach(x -> _pm_operand!(st, x), args[4:end])
+        _pm_operand!(st, args[2])
+        push!(fr.accumulations, fr.statement)
+        # A whole row: one index (a vector) or `out[g, :]`.
+        all(x -> x.kind === :const && x.data isa Colon, args[4:end]) || (fr.partial = true)
+        return _PMValue(:local)
+    end
+    any(a -> a.kind === :pos, args) && _pm_fail()
     if fv === Base.getindex && n >= 2 && args[1].kind === :param
         # A lookup into an argument passed whole (`field[ix]`, `ix = paths[g]`).
         _pm_whole!(st, args[1].data)
         foreach(a -> _pm_operand!(st, a), args[2:end])
         return _PMValue(:local)
     end
+    if fv === Base.getindex && n >= 2 && args[1].kind === :shared
+        # A lookup into a prologue value (`coefficients[k, offset + j]`).
+        foreach(a -> _pm_operand!(st, a), args[2:end])
+        return _PMValue(:local)
+    end
     if any(a -> a.kind === :acc, args)
-        acc = fr.accumulator
         acc === nothing && _pm_fail()
-        ok = fv === Base.push! && n == 2 && args[1].kind === :acc && acc.data === :push ||
-            fv === Base.setindex! && n == 3 && args[1].kind === :acc &&
-                args[3].kind === :pos && acc.data isa Tuple
-        ok || _pm_fail()
+        fv === Base.push! && n == 2 && args[1] == acc && acc.data === :push || _pm_fail()
         _pm_operand!(st, args[2])
         push!(fr.accumulations, fr.statement)
         return _PMValue(:local)
@@ -471,7 +643,7 @@ function _pm_comprehension(st::_PMState, closure::_PMValue, iterator)
             _pm_statement!(st, fr, i)
         end
     end
-    _PMValue(:rows, iterator)
+    _PMValue(:rows, (iterator, ()))
 end
 
 # One helper method over abstract arguments.
@@ -537,10 +709,16 @@ function _pm_loop(st::_PMState, fr::_PMFrame)
         c.dest
     end
     exit = check(setup + 1)
-    head = setup + 4
+    # The loop's top may declare the body's locals (`NewvarNode`) before the
+    # head reads `I`; the back edge returns to the top.
+    top = setup + 4
+    head = top
+    while head < exit - 1 && _pm_noop(code[head])
+        head += 1
+    end
     head < exit - 1 && _pm_slot(code[head]) == I || _pm_fail()
     back = exit - 1
-    code[back] isa Core.GotoNode && code[back].label == head || _pm_fail()
+    code[back] isa Core.GotoNode && code[back].label == top || _pm_fail()
     step = back - 4
     step > head || _pm_fail()
     s = code[step]
@@ -603,18 +781,22 @@ function _pm_loop(st::_PMState, fr::_PMFrame)
     end
     v = _pm_value(fr, code[step].args[2].args[3])
     v.kind === :state && v.data == desc || _pm_fail()
-    # Exactly one accumulation, executed once per iteration: no jump within
-    # the body passes over it or returns to before it.
-    length(fr.accumulations) == 1 || _pm_fail()
-    p = only(fr.accumulations)
-    for i in body
-        r = code[i]
-        r isa Union{Core.GotoNode,Core.GotoIfNot} || continue
-        label = r isa Core.GotoNode ? r.label : r.dest
-        min(i, label) < p < max(i, label) && _pm_fail()
+    # A filled result may be read and written at its row any number of times;
+    # a row it never writes keeps the fill value. Otherwise exactly one
+    # accumulation of a whole row, executed once per iteration: no jump
+    # within the body passes over it or returns to before it.
+    if !(prealloc && accumulator.data[3])
+        length(fr.accumulations) == 1 && !fr.partial || _pm_fail()
+        p = only(fr.accumulations)
+        for i in body
+            r = code[i]
+            r isa Union{Core.GotoNode,Core.GotoIfNot} || continue
+            label = r isa Core.GotoNode ? r.label : r.dest
+            min(i, label) < p < max(i, label) && _pm_fail()
+        end
     end
     _pm_assigned_before_read(code, head + 1, step, assigned) || _pm_fail()
-    _PMValue(:rows, desc)
+    _PMValue(:rows, (desc, prealloc ? accumulator.data[4] : ()))
 end
 
 # Whether every read of a slot in `assigned` within `first:last` follows an
@@ -683,13 +865,17 @@ function _cell_position_proof(F, types::Vector{Any})
             rethrow()
         end
         result.kind === :rows || return nothing
-        sources = _pm_sources(result.data)
+        desc, extents = result.data
+        sources = _pm_sources(desc)
         isempty(sources) && return nothing
         positions = Int[j for j in eachindex(types) if !(j in st.whole) &&
-                        (types[j] === Any || types[j] isa Type && types[j] <: AbstractVector)]
+                        (types[j] === Any || types[j] isa Type &&
+                         (types[j] <: AbstractVector || _pm_is_matrix(types[j])))]
         all(j -> j in positions, sources) || return nothing
+        matrices = Int[j for j in positions if _pm_is_matrix(types[j])]
         # The window call must reach the same methods as the original.
-        window(j) = j in positions ? Vector{<:eltype(types[j])} : types[j]
+        window(j) = !(j in positions) ? types[j] :
+            j in matrices ? Matrix{<:eltype(types[j])} : Vector{<:eltype(types[j])}
         for (G, args, method) in st.calls
             args === nothing && continue
             wtypes = Tuple(a.kind === :param ? window(a.data) : _pm_static_type(st, a)
@@ -698,7 +884,8 @@ function _cell_position_proof(F, types::Vector{Any})
             found === nothing && return nothing
             first(found) === method || return nothing
         end
-        return (; positions, sources, checks = sort!(collect(st.checks)))
+        return (; positions, sources, checks = sort!(collect(st.checks)), matrices,
+                extents = collect(Tuple{Symbol,Vararg{Int}}, extents))
     end
     nothing
 end
@@ -720,11 +907,14 @@ function _cell_position_form(r::Recipe, input_types; outlined = false)
     end
     sources = unique!(Int[inputs[k] for k in proof.sources])
     checks = unique!(Tuple{Int,Symbol}[(inputs[k], fact) for (k, fact) in proof.checks])
+    matrices = unique!(Int[inputs[k] for k in proof.matrices])
+    extents = Tuple{Symbol,Vararg{Int}}[e[1] === :size ? (:size, inputs[e[2]], e[3]) : e
+                                        for e in proof.extents]
     n = length(params)
     indices = [Int[] for _ in 1:n]
     _CellForm(:position_map, roles, zeros(Int, n), sources, 0, indices, Any[],
         _cell_direct_reads(indices), nothing, Any[nothing for _ in 1:n], nothing,
-        _CellPositionMap(sources, checks))
+        _CellPositionMap(sources, checks, matrices, extents))
 end
 
 # ------------------------------------------------------------------ runtime
@@ -734,6 +924,9 @@ end
 @inline _cell_position_shape(shape::Tuple) = (Base.OneTo(length(first(shape))),)
 @inline _cell_position_shape(first_shape::Tuple, shapes::Tuple...) =
     (Base.OneTo(minimum(s -> length(first(s)), (first_shape, shapes...))),)
+# An array result's full axes: its rows, then its trailing extents.
+@inline _cell_position_extents(shape::Tuple, extents::Tuple) =
+    (first(shape), map(Base.OneTo, extents)...)
 
 # A fresh dense vector of rows of a position argument, in the requested order.
 function _cell_dense_rows(x::AbstractVector)
@@ -743,13 +936,28 @@ function _cell_dense_rows(x::AbstractVector)
     end
     rows
 end
+# A fresh dense matrix of rows of a matrix position argument.
+function _cell_dense_rows(x::AbstractMatrix)
+    rows = Matrix{eltype(x)}(undef, size(x, 1), size(x, 2))
+    @inbounds for (j, jx) in enumerate(axes(x, 2)), (i, ix) in enumerate(axes(x, 1))
+        rows[i, j] = x[ix, jx]
+    end
+    rows
+end
 _cell_dense_rows(x) = throw(ArgumentError(
-    "a helper's per-row argument must be a vector at a cell's rows; got $(typeof(x))"))
+    "a helper's per-row argument must be a vector or a matrix at a cell's rows; " *
+    "got $(typeof(x))"))
 
 @inline function _cell_check_position_type(::Type{T}, ::Val{:standard}) where {T}
     _pm_standard_vector(T) || throw(ArgumentError(
         "a helper iterates an argument of type $T at a cell's rows; its rows are proved " *
         "only for vectors Base iterates in linear order from position 1"))
+    nothing
+end
+@inline function _cell_check_position_type(::Type{T}, ::Val{:standard_rows}) where {T}
+    _pm_standard_matrix(T) || throw(ArgumentError(
+        "a helper iterates the rows of an argument of type $T at a cell's rows; its rows " *
+        "are proved only for matrices whose first axis starts at 1"))
     nothing
 end
 @inline function _cell_check_position_type(::Type{T}, ::Val{:eltype}) where {T}
@@ -765,14 +973,21 @@ end
 @inline _cell_check_position_rows(rows::AbstractVector, ::Val{:eltype}) =
     _cell_check_position_type(typeof(rows), Val(:eltype))
 @inline _cell_check_position_rows(rows, ::Val{:standard}) = nothing
+@inline _cell_check_position_rows(rows, ::Val{:standard_rows}) = nothing
 
 @inline _cell_position_empty(::Type{T}) where {T<:AbstractVector} =
     isconcretetype(T) ? T(undef, 0) : Any[]
 @inline _cell_position_empty(@nospecialize(T)) = Any[]
+# No rows of an array result keep its trailing axes.
+@inline _cell_position_empty(::Type{T}, shape::Tuple) where {T<:AbstractArray} =
+    isconcretetype(T) ? T(undef, 0, map(length, Base.tail(shape))...) :
+    Array{Any}(undef, 0, map(length, Base.tail(shape))...)
+@inline _cell_position_empty(@nospecialize(T), shape::Tuple) =
+    Array{Any}(undef, 0, map(length, Base.tail(shape))...)
 
 # The window of a position map at rows `U`: the helper over its position
 # arguments' rows and its other arguments whole.
-function _cell_position_window!(e, r::Recipe, f, args, U::Symbol)
+function _cell_position_window!(e, cid, r::Recipe, f, args, U::Symbol)
     d = e.pushdowns
     for (j, fact) in f.rowmap.checks
         input = canon_id(d.graph, r.inputs[j].id)
@@ -784,6 +999,39 @@ function _cell_position_window!(e, r::Recipe, f, args, U::Symbol)
     call = _slot_call_expr(r, d.slots[r.id], args)
     T = _slot_type_expr(r, d.slots[r.id],
         Any[Expr(:call, GlobalRef(Core, :typeof), a) for a in args])
+    empty = isempty(f.rowmap.extents) ?
+        Expr(:call, _cell_ref(:_cell_position_empty), T) :
+        Expr(:call, _cell_ref(:_cell_position_empty), T, e.shapes[cid])
     _cell_bind!(e, :cell_rows, Expr(:if, Expr(:call, GlobalRef(Base, :isempty), U),
-        Expr(:call, _cell_ref(:_cell_position_empty), T), call))
+        empty, call))
+end
+
+# The shape expression of a position map: the row axis of its sources
+# (`parts`), then, for an array result, each trailing extent from a literal or
+# an input's shape (`input_shape`, by input id).
+function _cell_position_shape_expr!(e, r::Recipe, f, parts, input_shape)
+    rows = Expr(:call, _cell_ref(:_cell_position_shape), parts...)
+    isempty(f.rowmap.extents) && return rows
+    d = e.pushdowns
+    extents = map(f.rowmap.extents) do x
+        x[1] === :const && return x[2]
+        shape = input_shape(canon_id(d.graph, r.inputs[x[2]].id))
+        Expr(:call, GlobalRef(Base, :length), Expr(:call, GlobalRef(Base, :getindex), shape, x[3]))
+    end
+    Expr(:call, _cell_ref(:_cell_position_extents), rows, Expr(:tuple, extents...))
+end
+
+# `vec(x)` of an array: position `u` of the result is a position of one row
+# of `x` (`_cell_vec_rows`), so the result has a row form whenever `x`'s rows
+# are known, and reads only the rows of `x` the requested positions lie in.
+function _cell_vec_form(r::Recipe, input_types; outlined = false)
+    call = _cell_helper_call(r, input_types; outlined, stable = true)
+    call === nothing && return nothing
+    call.f === Base.vec && length(call.args) == 1 || return nothing
+    T = only(call.args).type
+    T isa Type && T !== Union{} && T <: AbstractArray || return nothing
+    j = findfirst(==(only(call.args).expr), call.params)
+    roles = fill(:whole, length(call.params))
+    roles[j] = :vec_source
+    _CellForm(:vec, roles, zeros(Int, length(roles)), [j], 0)
 end
