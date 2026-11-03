@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.72
+
+- `factor_support` of a vector simplex (`s ~ Dirichlet(alpha)`) or ordered
+  vector (`c ~ Ordered(D, n)`) prior or Jacobian now names only the entry's
+  own packed block plus any sampled hyperparents; the ordering Jacobian names
+  all but the first coordinate. Earlier versions returned every packed
+  coordinate, because the transform read its block inside a larger
+  expression. Values, gradients and ownership are unchanged.
+
 ## 0.1.71
 
 - Map resolved TDist, Gumbel, Weibull, InverseGamma, InverseGaussian,

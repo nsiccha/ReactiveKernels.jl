@@ -397,12 +397,18 @@ end
     layout = assign_layout(plan)
     entry = layout.entries[2]
     # Ordered: one call of the native ordered kernel over the packed slice.
+    # The slice and the Jacobian's tail are reads of their own, so the
+    # structural footprint is the block, not the whole packed vector.
     @test transform_statements(entry) == Expr[
+        :(_ppl_vector_block_y_cutpoints::AbstractVector{Float64} =
+            view(unconstrained, 2:3)),
         :(y_cutpoints::AbstractVector{Float64} =
             $(GlobalRef(ReactiveKernelsPPL, :_ordered_constrain_kernel))(
-                view(unconstrained, 2:3), 1, 2)),
+                _ppl_vector_block_y_cutpoints, 1, 2)),
+        :(_ppl_ordered_tail_y_cutpoints::AbstractVector{Float64} =
+            view(unconstrained, 3:3)),
     ]
-    @test jacobian_term(entry) == :(sum(view(unconstrained, 3:3)))
+    @test jacobian_term(entry) == :(sum(_ppl_ordered_tail_y_cutpoints))
     one_ord = LayoutEntry(:vector, nothing, :o, [:o_1], 7, 1, :ordered)
     @test transform_statements(one_ord) == Expr[
         :(o::AbstractVector{Float64} = view(unconstrained, 7:7))]
@@ -416,9 +422,10 @@ end
     # break Jacobian together (K=3 here).
     sentry = LayoutEntry(:vector, nothing, :s, [:s_1, :s_2], 6, 2, :simplex)
     @test transform_statements(sentry) == Expr[
+        :(_ppl_vector_block_s::AbstractVector{Float64} = view(unconstrained, 6:7)),
         :(_ppl_simplex_pair_s =
             $(GlobalRef(ReactiveKernelsPPL, :_simplex_constrain_logjac_kernel))(
-                view(unconstrained, 6:7), 1, 2)),
+                _ppl_vector_block_s, 1, 2)),
         :(s::AbstractVector{Float64} = _ppl_simplex_pair_s[1]),
         :(_ppl_simplex_logjac_s::Float64 = _ppl_simplex_pair_s[2]),
     ]
