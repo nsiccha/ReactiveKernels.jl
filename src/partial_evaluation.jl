@@ -1061,6 +1061,10 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     inner = analysis.inner
     current = 0
     retry_nonfinite = false
+    # The cell values of shared calls (`_partial_shared_by_value`): equal
+    # cells hold one object, so a later call reading them compares it by
+    # identity.
+    shared_ids = Set{ValueId}()
     try
         for r in analysis.selected
             current = r.id
@@ -1074,7 +1078,13 @@ Base.@nospecializeinfer function _partial_plate_recipe(
                 # Bool results may use packed BitArrays; bound-array
                 # externalization also supports these.
                 result = similar(batch, analysis.cell_types[cid])
-                arguments[cid] = _partial_cell_values!(result, batch)
+                by_value = _partial_shared_by_value(r, args, inner.graph, shared_ids)
+                arguments[cid] = if by_value === nothing
+                    _partial_cell_values!(result, batch)
+                else
+                    push!(shared_ids, cid)
+                    _shared_cell_values!(result, batch, Val(by_value))
+                end
             end
             # Retain nonfinite floating-point work beneath its original
             # nested guards: lifting these values can change a finite

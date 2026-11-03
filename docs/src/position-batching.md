@@ -178,6 +178,35 @@ position reuses a lane slot (below), so a one-position read allocates it where
 it did not before. Up to RK `f7bc80cb`, every value of a position-dependent
 plate's cell ran once per cell and position.
 
+Cells with equal data share one such value. In the moved plate, a call whose
+arguments compared by value include an array or a record runs once per distinct
+argument tuple and call. The call is an authored expression or a function of a
+package or of the authoring module. Every cell with that tuple reads the same
+result object. A population whose subjects share one regimen and one
+observation grid therefore computes one design per call instead of one per
+subject, and keeps one copy of it for the position loop.
+
+An argument that varies across cells is compared by value (`hash`, then
+`isequal`). An argument every cell reads as the same object is compared by
+identity: a closure or `Ref` operand, or the result of an earlier shared call,
+which equal cells already share.
+
+Some calls still run in every cell, because they cost about what their key
+costs:
+- a call of numbers alone (an index, a gathered scalar);
+- Base's and Core's own functions (indexing, arithmetic, concatenation).
+
+ReactiveKernels' structural operations (nested plates, scans, derivative
+rules) also stay per cell. Where cells differ, sharing costs one `hash` of
+each call's per-cell arguments.
+
+Values are unchanged. Equal cells' values are one read-only object, which only
+`===` can tell apart. The table of a call's shared values is made by that call
+and dropped after it, so a caller may change or mutate its data between calls.
+`bound=` preparation shares the same calls when it caches cell values (see
+[Preparation-time partial evaluation](compiler.md#preparation-time-partial-evaluation)). Up to RK `cece76ee`, every cell
+computed and kept its own copy.
+
 Up to canonical `d4f65756` the position driver instead called every plate
 through the plate operation's per-cell fallback. On the ShinyRK superposition
 plate (6529 observations, 14 doses, 32 positions per read) that allocated

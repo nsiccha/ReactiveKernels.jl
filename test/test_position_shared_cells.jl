@@ -197,6 +197,112 @@ end
     @test isequal(value, reduce(hcat, [scalar(ts[3], etas[:, k], thetas[k]) for k in 1:NPOS]))
 end
 
+# Equal cells share one value (snag data-only-node-r-85fe8c3f): a call of
+# per-cell arrays or records runs once per distinct argument tuple and call,
+# and the cells with that tuple read the same object.
+const SCALAR_CALLS = Ref(0)
+scaled_number(x) = (SCALAR_CALLS[] += 1; 2x)
+const RANGE_CALLS = Ref(0)
+window(t, grid) = (RANGE_CALLS[] += 1; searchsortedfirst.(Ref(grid), t))
+@kernel number_cell(ws, eta, theta) = begin
+    cells = plate(ws, eta) do w, e
+        s = scaled_number(w)
+        s * (theta + e)
+    end
+    return cells
+end
+# A per-cell array and an operand every cell reads whole (`Ref`).
+@kernel operand_cell(ts, grid, eta, theta) = begin
+    cells = plate(ts, Ref(grid), eta) do t, g, e
+        k = window(t, g)
+        sum(k) * (theta + e)
+    end
+    return cells
+end
+
+@testset "equal cells share one value per call" begin
+    same = [collect(1.0:5.0) for _ in 1:NSUB]               # equal, not identical
+    @test !any(t -> t === same[1], same[2:end])
+    halves = [collect(1.0:(isodd(s) ? 5.0 : 3.0)) for s in 1:NSUB]
+    # The branch takes the call in the odd cells only, which are equal.
+    taken = [collect(1.0:(isodd(s) ? 5.0 : 2.0)) for s in 1:NSUB]
+    for (spec, have, args, distinct) in (
+            (named_cell, (:ts, :eta, :theta), (same,), 1),
+            (named_cell, (:ts, :eta, :theta), (halves,), 2),
+            (record_cell, (:ts, :eta, :theta), (same,), 1),
+            (destructured_cell, (:ts, :eta, :theta), (same,), 1),
+            (inline_cell, (:ts, :eta, :theta), (same,), 1),
+            (several_cell, (:ts, :w, :eta, :theta), (same, w), 2),
+            (branch_cell, (:ts, :eta, :theta), (taken,), 1))
+        scalar = prepare(spec; have, want = :cells)
+        expected = reduce(hcat, [scalar(args..., etas[:, k], thetas[k]) for k in 1:NPOS])
+        for (mode, reader) in pairs(readers(scalar))
+            count, value = calls(reader, args..., etas, thetas)
+            @test count == distinct
+            @test isequal(value, expected)
+        end
+    end
+    # A value compared by identity: every cell reads the same grid object.
+    grid = collect(0.0:0.5:10.0)
+    scalar = prepare(operand_cell; have = (:ts, :grid, :eta, :theta), want = :cells)
+    expected = reduce(hcat, [scalar(same, grid, etas[:, k], thetas[k]) for k in 1:NPOS])
+    for (mode, reader) in pairs(readers(scalar))
+        reader(same, grid, etas, thetas)
+        RANGE_CALLS[] = 0
+        @test isequal(reader(same, grid, etas, thetas), expected)
+        @test RANGE_CALLS[] == 1
+    end
+    # A call of numbers alone costs less than its key: every cell runs it.
+    ws = fill(0.5, NSUB)
+    scalar = prepare(number_cell; have = (:ws, :eta, :theta), want = :cells)
+    for (mode, reader) in pairs(readers(scalar))
+        reader(ws, etas, thetas)
+        SCALAR_CALLS[] = 0
+        reader(ws, etas, thetas)
+        @test SCALAR_CALLS[] == NSUB
+    end
+    # Nothing is kept across calls: data changed in place between two calls
+    # gives the new values.
+    scalar = prepare(named_cell; have = (:ts, :eta, :theta), want = :cells)
+    for (mode, reader) in pairs(readers(scalar))
+        rows = [collect(1.0:4.0) for _ in 1:NSUB]
+        before = copy(reader(rows, etas, thetas))
+        foreach(t -> t .*= 2, rows)
+        count, value = calls(reader, rows, etas, thetas)
+        @test count == 1
+        @test isequal(value, reduce(hcat, [scalar(rows, etas[:, k], thetas[k]) for k in 1:NPOS]))
+        @test !isequal(value, before)
+    end
+end
+
+@testset "equal cells share under on_error = :ignore" begin
+    # The throw-stripped twin of a call is shared as the call is.
+    same = [collect(1.0:5.0) for _ in 1:NSUB]
+    scalar = prepare(named_cell; have = (:ts, :eta, :theta), want = :cells)
+    ignoring = prepare(named_cell; have = (:ts, :eta, :theta), want = :cells,
+                       on_error = :ignore)
+    expected = reduce(hcat, [scalar(same, etas[:, k], thetas[k]) for k in 1:NPOS])
+    for (mode, reader) in pairs(readers(ignoring))
+        count, value = calls(reader, same, etas, thetas)
+        @test count == 1
+        @test isequal(value, expected)
+    end
+end
+
+@testset "bind-time cell values are shared by equal cells" begin
+    same = [collect(1.0:5.0) for _ in 1:NSUB]
+    scalar = prepare(named_cell; have = (:ts, :eta, :theta), want = :cells)
+    expected = reduce(hcat, [scalar(same, etas[:, k], thetas[k]) for k in 1:NPOS])
+    for spec in (named_cell, record_cell)
+        CALLS[] = 0
+        bound = prepare(spec; have = (:ts, :eta, :theta), want = :cells, bound = (; ts = same))
+        @test CALLS[] == 1
+        count, value = calls(vectorize(bound; batched = (:eta, :theta)), etas, thetas)
+        @test count == 0
+        spec === named_cell && @test isequal(value, expected)
+    end
+end
+
 @testset "errors" begin
     scalar = prepare(named_cell; have = (:ts, :eta, :theta), want = :cells)
     reader = vectorize(scalar; batched = (:eta, :theta))
