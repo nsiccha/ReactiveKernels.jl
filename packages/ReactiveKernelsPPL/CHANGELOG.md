@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.78
+
+- `prepare_partition` and `prepare_partition_sampler` accept the pairs their
+  documentation promises for `by`: one `observation => column` pair or a
+  collection of such pairs (a vector, a tuple, a generator), besides one column
+  name, a named tuple and a dictionary. A vector or tuple of pairs used to be
+  read by position and refused as giving no key column, and a single pair raised
+  a `MethodError`. Any other `by`, such as a vector of names, raises a
+  `ContractValidationError` that names the accepted spellings, as does a `by`
+  that gives no key for a named observation; an observation given two different
+  columns raises one naming both. Requires ReactiveKernels 0.1.68.
+
 ## 0.1.77
 
 - **Breaking:** the learning filter's window boundary keeps correlations. At each

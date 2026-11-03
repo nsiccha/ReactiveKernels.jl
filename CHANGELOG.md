@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.68
+
+- `plate_partition`'s `by` accepts the pairs its docstring promises: one
+  `plate => key` pair or a collection of such pairs (a vector, a tuple, a
+  generator), besides one name, a named tuple and a dictionary. A vector or
+  tuple of pairs used to be read by position and refused as giving no key, and
+  a single pair raised a `MethodError`. Any other `by`, such as a vector of
+  names, raises an `ArgumentError` that names the accepted spellings, as does
+  a `by` that gives no key for a named plate; a plate given two different keys
+  raises an `ArgumentError` naming both.
+
 ## 0.1.67
 
 - Footprints follow reads through views: a view contributes the parent

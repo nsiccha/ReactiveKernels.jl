@@ -1335,16 +1335,13 @@ function _partition_plans_each(plan_of, labels)
 end
 const _PARTITION_TOTAL = :_ppl_partition_total
 
-# The key column of each observation: one column name for all of them, or
-# a named tuple / pairs `observation => column`. Every column must be a
-# supplied data column of the binding.
+# The key column of each observation, spelled as RK's `plate_partition` reads
+# `by`. Every column must be a supplied data column of the binding.
 function _partition_keys(plan::StructuralPlan, names, by)
-    keys_by_name = by isa Symbol ? Dict{Symbol,Symbol}(name => by for name in names) :
-        Dict{Symbol,Symbol}(Symbol(k) => Symbol(v) for (k, v) in pairs(by))
+    keys_by_name = ReactiveKernels._partition_by_map(by, names; what = "observation",
+        refuse = message -> ContractValidationError("[query] " * message))
     columns = _query_columns(plan)
     for name in names
-        haskey(keys_by_name, name) || throw(ContractValidationError(
-            "[query] `by` gives no key column for observation `$name`"))
         key = keys_by_name[name]
         key in columns || throw(ContractValidationError(
             "[query] the partition key `$key` of `$name` is not a supplied data column; " *
@@ -1427,8 +1424,9 @@ a label, such as one subject's observations, evaluated at an unconstrained
 point `u`: `q(u, label)`. `by` names the key: a supplied data column with one
 entry per cell of each observation's plate (one row per entry of an
 elementwise observation, one per iteration of an `@plate for` loop), either
-one column name for every observation or a named tuple or pairs
-`observation => column`. [`partition_labels`](@ref) lists the labels.
+one column name for every observation or, per observation, a named tuple, a
+dictionary, one `observation => column` pair or a collection of such pairs.
+[`partition_labels`](@ref) lists the labels.
 
 A partition runs as one compiled pass over its cells (RK `plate_partition`):
 each plate loops once over the positions holding the label, and every value
