@@ -38,6 +38,10 @@ const BACKEND = AutoEnzyme(; mode=Enzyme.Reverse)
             sampler = prepare_partition_sampler(built, bound, :y, u; by=:subject,
                 backend=BACKEND, compact, partitioned=(:Z => [1, 1, 2, 2, 3, 3],))
             @test sampler.prefix !== nothing
+            # The residual gradient receives each label's plan behind a
+            # reference, never as a by-value aggregate of all its fields.
+            @test ReactiveKernelsPPL._partition_ad(sampler.ad, 1).resolver isa
+                  ReactiveKernels._ADPlanBoxing
             shared_positions = sampler.prefix.positions
             local_positions = setdiff(eachindex(u), shared_positions)
             initial_values = sampler.prefix.values

@@ -1188,6 +1188,37 @@ function _ad_resolve(resolver, args::Tuple, kwargs::NamedTuple)
     resolver(args...; kwargs...)
 end
 
+# The position of a partition kernel's plan port among its HAVE ports, or
+# `nothing`. A differentiated call receives a named-tuple plan behind a
+# `_PartitionPlanRef` (plate_partition.jl), never as a by-value aggregate. A body
+# that plans reads the port through `_partition_plan_value`; one that does not
+# never reads it.
+_ad_plan_position(kernel) = nothing
+function _ad_plan_position(kernel::PreparedKernel)
+    p = getfield(kernel, :plan)::Plan
+    for r in p.recipes
+        r.op isa _AuthoredPlateCellOp && r.op.plan !== nothing || continue
+        return findfirst(v -> v.name === r.op.plan, p.have)
+    end
+    nothing
+end
+
+# `args` with the plan at position `P` behind a reference, decided by type.
+@generated function _ad_box_plan(args::A, ::Val{P}) where {A<:Tuple,P}
+    P isa Int && 1 <= P <= fieldcount(A) && fieldtype(A, P) <: NamedTuple || return :args
+    Expr(:tuple, (i == P ?
+        :($(GlobalRef(@__MODULE__, :_PartitionPlanRef))(getfield(args, $i))) :
+        :(getfield(args, $i)) for i in 1:fieldcount(A))...)
+end
+
+# A prepared operator's resolver: every evaluation boxes the plan as its
+# preparation did, without searching the kernel again.
+struct _ADPlanBoxing{P,R}
+    resolver::R
+end
+(b::_ADPlanBoxing{P})(args...; kwargs...) where {P} =
+    _ad_box_plan(getfield(b, :resolver)(args...; kwargs...), Val(P))
+
 # A pullback passes its cotangent exemplar `seed`: for array outputs or several
 # selected WANT ports it differentiates the seeded inner product (`_ADSeededCall`), whose
 # port values are kept for `ad_value_and_pullback` when `keep_values`.
@@ -1217,8 +1248,8 @@ function _ad_call(kernel::_ADKernel, resolved::Tuple, active;
             kernel, call, external_values, resolved, active_selector, seed,
             keep_values)
     end
-    point, contexts = _ad_arguments(
-        Val(active_selector), (resolved..., external_values...))
+    point, contexts = _ad_arguments(Val(active_selector),
+        (_ad_box_plan(resolved, Val(_ad_plan_position(kernel)))..., external_values...))
     call, point, contexts, active_selector, external_values
 end
 
@@ -1921,6 +1952,9 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
         _type_stability())
     preparation = _ad_operator_preparation(
         op, call, backend, point, seeds, contexts)
+    position = _ad_plan_position(kernel)
+    position === nothing ||
+        (resolver = _ADPlanBoxing{position,typeof(resolver)}(resolver))
     # Built without compiling the constructor for this program's types.
     prepared = _kernel_new_instance(PreparedADOperator{
         active_selector,typeof(kernel),typeof(resolver),typeof(call),
