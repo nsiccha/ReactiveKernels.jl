@@ -485,6 +485,12 @@ query(zeros(3), 1)
 println(Base.remove_linenums!(kernel_expr(bound, built.layout)))
 ```
 
+A partition key is a label per cell, not a model input, so `by` may give the
+labels themselves, per observation: `by=(; y=[1,1,2])`. They need not be in the
+binding, and the query keeps its own copy. A model bound through BRM needs this
+form for a key no statement reads, because BRM binds only the columns a statement
+reads. Either form must hold one entry per cell; another length is refused.
+
 RKPPL composes the actual transform graph, so identity and supported row-local
 operations expose their coordinate reads to strict partitions. A coupled
 transform retains its coupled reads. This does not change or factorize the

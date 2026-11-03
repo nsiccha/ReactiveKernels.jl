@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.79
+
+- `prepare_partition` and `prepare_partition_sampler` accept a key as its labels,
+  per observation: `by = (; y = labels)`, or `y => labels` pairs, with one label
+  per cell. The labels need not be data of the model and no statement need read
+  them, which is what a model bound through BRM needs: BRM binds only the columns
+  a statement reads. They stay out of the program; the query owns a copy, and
+  `built` and `plan` are unchanged. A parameter named in `partitioned` under such
+  a key gives its levels' labels, `parameter => labels`.
+- **Breaking:** a partition key whose length differs from its plate's cell count
+  is refused at preparation (RK 0.1.69). A shorter key used to be accepted and
+  left the cells past its end out of every partition, so the labels no longer
+  summed to the likelihood. Requires RK 0.1.69.
+
 ## 0.1.78
 
 - `prepare_partition` and `prepare_partition_sampler` accept the pairs their

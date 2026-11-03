@@ -93,6 +93,27 @@ function _pp_subject_data(per_subject)
 end
 const _PP_HAVE = (:u, :g, :w, :subject)
 
+@testset "plate_partition: a key holds one entry per cell" begin
+    d = _pp_subject_data((3, 4, 5))
+    spec = plate_partition(_pp_subjects, :dens; by = :subject, index = :label)
+    k = prepare(spec; have = (_PP_HAVE..., :label), want = :partition_total)
+    @test k(d.u, d.g, d.w, d.subject, 1) isa Float64
+    n = length(d.subject)
+    # A short key would leave cells in no partition, whatever label is asked.
+    for key in (d.subject[1:(n - 1)], [d.subject; 1])
+        message = "the key :subject has $(length(key)) entries, but its plate has $n cells"
+        @test_throws message k(d.u, d.g, d.w, key, 1)
+        @test_throws message prepare(spec; have = (_PP_HAVE..., :label), want = :partition_total,
+            bound = (; subject = key))(d.u, d.g, d.w, 1)
+    end
+    # With the plate's data bound too, the plan knows its domain, so the check
+    # runs when each label is planned, before any evaluation.
+    planned = plate_partition(_pp_subjects, :dens; by = :subject, index = :label, plan = :rows)
+    planner = partition_plan_kernel(planned; have = (_PP_HAVE..., :label, :rows),
+        want = :partition_total, bound = (; d.g, d.w, subject = d.subject[1:(n - 1)]))
+    @test_throws "has $(n - 1) entries, but its plate has $n cells" planner(d.u, 1, nothing)
+end
+
 @testset "plate_partition: one subject's cells as one pass" begin
     spec = plate_partition(_pp_subjects, :dens; by = :subject, index = :label)
     @test spec isa KernelSpec

@@ -1461,7 +1461,8 @@ equals the label held by the new HAVE port `index`: a partition, such as one
 subject's observations. `by` gives each plate's key, a value of `spec` with
 one entry per cell in the plate's linear order (usually bound data), as one
 name for every plate or, per plate, a named tuple, a dictionary, one
-`plate => key` pair or a collection of such pairs.
+`plate => key` pair or a collection of such pairs. A key of another length is
+refused, so no cell can fall outside every partition.
 
 A partition runs as one compiled pass over its cells: each named plate loops
 once over the positions holding the label, through its own scalar body and

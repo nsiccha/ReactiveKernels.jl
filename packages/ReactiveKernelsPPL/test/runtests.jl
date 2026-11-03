@@ -253,6 +253,7 @@ const _PPL_TEST_FILES = (
     "test_cell_helpers.jl",
     "test_cell_position_maps.jl",
     "test_branch_cell_footprints.jl",
+    "test_partition_labels.jl",
     "test_partition_prefix.jl",
     "test_partition_prefix_strict.jl",
     "test_shared_value_queries.jl",
