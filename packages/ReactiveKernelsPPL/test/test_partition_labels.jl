@@ -182,4 +182,3 @@ central(f, u, j; h = 1e-6) = (f(setindex!(copy(u), u[j] + h, j)) - f(setindex!(c
     end
 end
 end
-end
