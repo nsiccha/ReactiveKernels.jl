@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.66
+
+- Compute per-position helpers at a cell's rows. Comprehensions and `map` over
+  `eachindex`, `axes(x, 1)`, `1:length`, `enumerate` or `zip`, and loops that
+  build one row per position by a single `push!` or `out[g] =`, are proved from
+  lowered code. Shared arrays the row body reads elsewhere are passed whole;
+  cross-row or carried work keeps the existing locality checks.
+- In a strict cell factor, an index into one cell's own value (`row[hour]` of
+  `row = air[traj]`) reads that value instead of demanding its rows, so outer
+  factors of per-trajectory rows agree with cell queries.
+
 ## 0.1.65
 
 - `deepcopy` of a graph, plan, prepared or vectorized kernel (any object

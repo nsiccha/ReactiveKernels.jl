@@ -1314,8 +1314,11 @@ function _cell_value_types(p::Plan; argument_types = nothing,
         form = get!(() -> _cell_form(r; outlined = r.id in outlined), known, r)
         if form === nothing
             form = _cell_arithmetic_form(r, inputs; outlined = r.id in outlined)
-            known[r] = form === nothing ?
-                _cell_helper_form(r, inputs; outlined = r.id in outlined) : form
+            form === nothing &&
+                (form = _cell_helper_form(r, inputs; outlined = r.id in outlined))
+            form === nothing &&
+                (form = _cell_position_form(r, inputs; outlined = r.id in outlined))
+            known[r] = form
         end
         inferred = if length(r.outputs) == 1 && r.op isa _AuthoredPlateOp
             (_cell_plate_output_type(r.op, inputs),)
@@ -1595,7 +1598,7 @@ function _cell_bound_capture_check(p::Plan, producers, static_type, known, outli
                 _cell_range_shape(literal) : _cell_dims_shape(literal)
         end
         f.kind in (:identity, :pointwise, :columns, :hcat, :reduce, :transposed,
-                   :array_arithmetic) ||
+                   :array_arithmetic, :position_map) ||
             return nothing
         parts = Any[]
         for j in f.leaves
@@ -1617,6 +1620,7 @@ function _cell_bound_capture_check(p::Plan, producers, static_type, known, outli
             end
         end
         f.kind === :columns && return shapes[cid] = _cell_column_shape(only(parts))
+        f.kind === :position_map && return shapes[cid] = _cell_position_shape(parts...)
         f.kind === :hcat && return shapes[cid] = _cell_hcat_shape(Tuple(parts))
         f.kind === :array_arithmetic && return shapes[cid] = Base.promote_shape(parts...)
         full = _plate_broadcast_shape(Tuple(parts))
@@ -1752,7 +1756,7 @@ end
 # Whether a producer reads an input in `role` at its own rows.
 _cell_row_role(role) =
     role in (:leaf, :gather, :linear_gather, :column, :factor_leaf, :factor, :part,
-             :range_source, :reshape_source)
+             :range_source, :reshape_source, :row)
 
 # `outlined` are the ids of the recipes a cell lowering outlined (`_cell_outline`);
 # `blocked`, when given, collects the ids of the producers whose values a reader
@@ -1807,7 +1811,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
         r = only(producers[cid])
         f = forms[r.id]
         f.kind in (:pointwise, :identity, :columns, :hcat, :vcat, :range_view, :reshape,
-                   :reduce, :transposed, :array_arithmetic) && return true
+                   :reduce, :transposed, :array_arithmetic, :position_map) && return true
         inputs = r.inputs
         factor = cidof(inputs[findfirst(==(:factor), f.roles)])
         (f.operand == 0 ? static_type(only(r.outputs)) <: AbstractVector :
@@ -2384,6 +2388,7 @@ function _cell_shape!(e::_CellEmitter, cid::ValueId)
     end
     shape = f.kind === :columns ?
         Expr(:call, _cell_ref(:_cell_column_shape), only(parts)) :
+        f.kind === :position_map ? Expr(:call, _cell_ref(:_cell_position_shape), parts...) :
         f.kind === :hcat ? Expr(:call, _cell_ref(:_cell_hcat_shape), Expr(:tuple, parts...)) :
         f.kind === :array_arithmetic ? Expr(:call, GlobalRef(Base, :promote_shape), parts...) :
         Expr(:call, _cell_ref(:_plate_broadcast_shape), Expr(:tuple, parts...))
@@ -2542,6 +2547,10 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
         elseif role === :factor
             reads[j] = U
             icid in d.pushed && _cell_request!(e, icid, U)
+        elseif role === :row
+            # A position map's argument at exactly its rows, never extruded.
+            reads[j] = U
+            icid in d.pushed && _cell_request!(e, icid, U)
         elseif role === :range_source
             reads[j] = _cell_bind!(e, :cell_row,
                 Expr(:call, _cell_ref(:_cell_range_rows), _cell_literal!(e, r, f), U))
@@ -2591,7 +2600,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
     U = e.unions[cid]
     f.kind === :vcat && return _cell_vcat_window!(e, cid, r, f, U)
     if f.kind in (:pointwise, :identity, :columns, :hcat, :range_view, :reshape, :reduce,
-                  :transposed, :array_arithmetic)
+                  :transposed, :array_arithmetic, :position_map)
         push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row),
             _cell_shape!(e, cid), U, e.sorted))
     end
@@ -2643,6 +2652,13 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
                 _footprint_record!(icid, role === :gather ? :gathered_rows : :gathered, at)
             end
             push!(args, e.names[icid])
+        elseif role === :row
+            # Fresh dense rows: the helper is proven for vectors of the
+            # argument's element type (`_cell_position_proof`).
+            icid in d.pushed || _footprint_record!(icid, :rows, U)
+            rows = icid in d.pushed ? _cell_take!(e, icid, reads[j]) :
+                _cell_source_rows_expr(e, icid, U)
+            push!(args, _cell_bind!(e, :cell_rows, Expr(:call, _cell_ref(:_cell_dense_rows), rows)))
         elseif role in (:factor_leaf, :factor)
             icid in d.pushed || _footprint_record!(icid, :rows, reads[j])
             push!(args, icid in d.pushed ? _cell_take!(e, icid, reads[j]) :
@@ -2652,6 +2668,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
             push!(args, e.names[icid])
         end
     end
+    f.rowmap isa _CellPositionMap && return _cell_position_window!(e, r, f, args, U)
     f.rowmap === nothing || return _cell_helper_window!(e, f.rowmap, args)
     if r.op isa _AuthoredPlateOp
         # The plate over these one-row arguments, with the table slots reserved

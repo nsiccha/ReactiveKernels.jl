@@ -331,6 +331,7 @@ function _cell_factor_scalar_reads(spec::KernelSpec, cell_outputs; bound, locali
     old = spec.graph
     g = Graph(copy(old.values), Recipe[], Dict{ValueId,Vector{Int}}(),
               copy(old.aliases), old.version, nothing)
+    cellvalues = Set{ValueId}()
     for r in p.recipes
         inputs, op = r.inputs, r.op
         # Top-level recipes retain their original context. Only reads
@@ -340,6 +341,9 @@ function _cell_factor_scalar_reads(spec::KernelSpec, cell_outputs; bound, locali
         if length(r.outputs) == 1 && !r.effectful && analyzed !== nothing
             read = _cell_scalar_index(analyzed..., r.inputs,
                 v -> get(types, canon_id(old, v.id), Any))
+            # One cell's value (`row = air[traj]`, itself such a read) has no
+            # rows to demand: an index into it (`row[hour]`) reads that value.
+            read !== nothing && canon_id(old, read.array.id) in cellvalues && (read = nothing)
             if read !== nothing
                 i = read.index
                 if !(i isa Value)
@@ -351,6 +355,8 @@ function _cell_factor_scalar_reads(spec::KernelSpec, cell_outputs; bound, locali
             end
         end
         _add_recipe!(g, inputs, r.outputs, op, r.cost, r.cse_key, r.effectful, r.source)
+        op isa _AuthoredPlateCellOp && !op.rows &&
+            union!(cellvalues, (canon_id(old, v.id) for v in r.outputs))
     end
     KernelSpec(g, copy(spec.ports), copy(spec.port_order), copy(spec.have_names),
                copy(spec.want_names), nothing)
