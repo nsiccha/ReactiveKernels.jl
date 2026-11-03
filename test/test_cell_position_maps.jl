@@ -187,20 +187,18 @@ end
         -(v - background[t][h])^2 / 2
     end
 end
-@testset "position maps in partitions: several, repeated, reordered and no rows" begin
+@testset "position maps in partitions: several, repeated and reordered rows" begin
     d = fixture()
     z, beta = collect(range(-0.3, 0.4; length = d.G)), 0.35
     ports = (:z, :beta, :s, :rain, :paths, :traj, :hour, :y)
-    # Label 3 has no observations: its partition reads no rows of `air`,
-    # whose prologue reads `paths[1]` for its element type.
-    label = [l == 3 ? 1 : l for l in [2, 1, 2, 1, 4, 4, 1, 2, 2, 4, 1, 1]]
+    label = [2, 1, 2, 1, 4, 4, 1, 2, 2, 4, 1, 1]
     bound = (; d.s, d.rain, d.paths, d.traj, d.hour, d.y, label)
     spec = plate_partition(partitioned_rows, :density; by = :label, index = :which,
                            locality = :error)
     k = prepare(spec; have = (ports..., :label, :which), want = :partition_total, bound)
     whole = prepare(partitioned_rows; have = (ports..., :label), want = :density, bound)
     ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), z, beta, 1; active = :z)
-    for which in 1:4
+    for which in (1, 2, 4)
         members = findall(==(which), label)
         expected = sum(whole(z, beta)[members]; init = 0.0)
         @test k(z, beta, which) ≈ expected
@@ -209,6 +207,40 @@ end
         @test gradient ≈ [finite(x -> sum(whole(x, beta)[members]; init = 0.0), z, j)
                           for j in eachindex(z)] rtol = 1e-6 atol = 1e-8
     end
+end
+
+@kernel selected_rows(z::AbstractVector{Float64}, rain::Vector{Float64},
+                      paths::Vector{Vector{Int}}, selections::Vector{Vector{Int}}) = begin
+    recovery = exp.(z)
+    path = plate(paths, z) do ix, a
+        hcat(a .* rain[ix], (a + 1) .* rain[ix])
+    end
+    air = pushed(path, recovery)
+    density = plate(selections) do selected
+        sum(sum, air[selected]; init = 0.0)
+    end
+end
+@testset "a cell reading no rows of a loop helper with a typed prologue" begin
+    d = fixture()
+    z = collect(range(-0.3, 0.4; length = d.G))
+    # `pushed` reads `paths[1]` for its element type; a window of no rows
+    # must not call it.
+    selections = [Int[], [3, 1], [2, 2, 4]]
+    bound = (; d.rain, d.paths, selections)
+    spec = plate_cell(selected_rows, :density; index = :cell, locality = :error)
+    k = prepare(spec; have = (:z, :rain, :paths, :selections, :cell),
+                want = :density_cell, bound)
+    whole = prepare(selected_rows; have = (:z, :rain, :paths, :selections),
+                    want = :density, bound)
+    ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), z, 1; active = :z)
+    for cell in eachindex(selections)
+        expected = whole(z)[cell]
+        @test k(z, cell) ≈ expected
+        value, gradient = ad_value_and_gradient(ad, z, cell)
+        @test value ≈ expected
+        @test gradient ≈ [finite(x -> whole(x)[cell], z, j) for j in eachindex(z)] rtol = 1e-6 atol = 1e-8
+    end
+    @test k(z, 1) == 0.0
 end
 
 @kernel crossrow_rows(z::AbstractVector{Float64}, traj::Vector{Int}) = begin
