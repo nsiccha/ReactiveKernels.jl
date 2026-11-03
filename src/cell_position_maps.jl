@@ -100,7 +100,8 @@ function _pm_standard_vector(T)
                        m.sig.parameters[2] in (AbstractArray, AbstractVector, Any))
     generic(iterate, Tuple{T}) && generic(eachindex, Tuple{T}) && generic(axes, Tuple{T})
 end
-_pm_vector_eltype(T) = T isa Type && T <: AbstractArray && isconcretetype(eltype(T))
+_pm_vector_eltype(T) = T isa Type && T !== Union{} && T <: AbstractArray &&
+    isconcretetype(eltype(T))
 
 # A fact of argument `j`'s type: proven statically, checked at run time when
 # its static type is abstract (the original producer's inferred type), or
@@ -747,6 +748,13 @@ end
     nothing
 end
 
+# A pushed argument is never computed whole: its rows come from the same RK
+# producer and element-type inference as its whole value would. Its element
+# type is checked on those rows; RK producers build Base arrays.
+@inline _cell_check_position_rows(rows::AbstractVector, ::Val{:eltype}) =
+    _cell_check_position_type(typeof(rows), Val(:eltype))
+@inline _cell_check_position_rows(rows, ::Val{:standard}) = nothing
+
 @inline _cell_position_empty(::Type{T}) where {T<:AbstractVector} =
     isconcretetype(T) ? T(undef, 0) : Any[]
 @inline _cell_position_empty(@nospecialize(T)) = Any[]
@@ -756,8 +764,11 @@ end
 function _cell_position_window!(e, r::Recipe, f, args, U::Symbol)
     d = e.pushdowns
     for (j, fact) in f.rowmap.checks
-        push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_position_type),
-            _cell_original_type_expr(e, canon_id(d.graph, r.inputs[j].id)), Val(fact)))
+        input = canon_id(d.graph, r.inputs[j].id)
+        push!(e.body.args, input in d.pushed ?
+            Expr(:call, _cell_ref(:_cell_check_position_rows), args[j], Val(fact)) :
+            Expr(:call, _cell_ref(:_cell_check_position_type),
+                 Expr(:call, GlobalRef(Core, :typeof), e.names[input]), Val(fact)))
     end
     call = _slot_call_expr(r, d.slots[r.id], args)
     T = _slot_type_expr(r, d.slots[r.id],
