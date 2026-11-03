@@ -93,8 +93,10 @@ marginal widths of correlated parameters as independent information. Where the
 data inform only combinations, such as a hierarchical intercept and its group
 effects, the next window then contracts the population again, and every window
 compounds it. The calibration you supply is the first window's prior, so carry
-it with its correlations too (`carry_smc(fit; parameters, basis=:fit)`); a
-diagonal calibration over-contracts the first window. This discards
+it with the same correlated summary
+(`carry_smc(fit; parameters, basis=:correlation)`); a diagonal calibration
+over-contracts the first window, and `basis=:fit` keeps few correlations when
+parameters differ greatly in scale. This discards
 parameter–state dependence and Gaussianizes the parameter posterior; it is an
 explicit assumed-density approximation, **not exact full-history SMC²**. With a
 finite ensemble, the spread in directions that the data never inform still

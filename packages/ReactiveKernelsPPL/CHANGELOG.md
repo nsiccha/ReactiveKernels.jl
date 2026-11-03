@@ -36,6 +36,13 @@ are recorded in the git history only.
   combinations the data pin down instead of being rejected there. At most the
   distinct-position ESS minus 2 directions are kept; with none the walk stays
   diagonal.
+- `carry_smc(completed; basis=:correlation)` carries the same standardized
+  correlation summary (diagonal-plus-low-rank reference, `max_reflections`
+  directions). Unlike `basis=:fit`, which learns covariance directions in native
+  coordinates and spends them on the widest coordinates, it keeps correlations
+  among parameters on very different scales; use it for a learning-filter
+  calibration. `fit_diagnostics` reports `directions` and
+  `effective_sample_size`.
 - History entries add `boundary_directions` and `proposal_directions`;
   `proposal_scale` is the walk's per-coordinate standard deviation.
   Parameter-learning checkpoints use schema 3 and record `max_reflections`.

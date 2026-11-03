@@ -183,3 +183,55 @@ end
     @test checkpoint.schema_version==3 && checkpoint.max_reflections==16
     @test_throws ArgumentError initialize_filter_smc(target;rng=Xoshiro(1),max_reflections=-1)
 end
+
+@testset "basis=:correlation carries correlations across coordinate scales" begin
+    # A cloud whose narrow coordinates (scale 1e-4) are as strongly correlated
+    # as its wide ones (scale 1): the native-coordinate fit spends its one
+    # reflection on the wide pair; the standardized fit keeps both pairs.
+    rng=Xoshiro(91)
+    n=4000
+    common=randn(rng,n); other=randn(rng,n)
+    scales=[1.0,1.0,1e-4,1e-4]
+    positions=permutedims(hcat(common.+0.1randn(rng,n),common.+0.1randn(rng,n),
+        other.+0.1randn(rng,n),other.+0.1randn(rng,n))).*scales
+    w=fill(1/n,n)
+    m=positions*w
+    X=positions.-m
+    # The d=4 oracle alone forms the dense weighted covariance.
+    C=(X.*w')*X'
+    sd=sqrt.(diag(C))
+    scale=F.EXT._correlation_scale(positions,w,m,sd,2)
+    @test scale.kind===:diagonal_lowrank && size(scale.vectors)==(4,2)
+    dense(s)=sqrt.(s.diagonal).*(I+s.vectors*Diagonal(s.values)*s.vectors').*sqrt.(s.diagonal)'
+    R(A)=A./(sqrt.(diag(A))*sqrt.(diag(A))')
+    @test R(dense(scale))[3,4]≈R(C)[3,4] rtol=0.05
+    @test R(dense(scale))[1,2]≈R(C)[1,2] rtol=0.05
+    raw=WarmupHMC.fit_gaussian_moments(positions;weights=w,max_reflections=1).scale
+    L=WarmupHMC.scale_from_data(raw)
+    Craw=reduce(hcat,[L*Matrix(1.0I,4,4)[:,j] for j in 1:4]); Craw=Craw*Craw'
+    @test abs(R(Craw)[3,4])<0.1<R(C)[3,4]
+    # Rescaling coordinates rescales the summary and keeps its directions.
+    D=[3.0,0.5,2e3,7e2]
+    rescaled=F.EXT._correlation_scale(D.*positions,w,D.*m,D.*sd,2)
+    @test dense(rescaled)≈(D.*dense(scale).*D') rtol=1e-6
+    # carry_smc(completed; basis=:correlation) on a completed SMC fit: in two
+    # dimensions one direction plus the remainder reproduces the covariance.
+    data=(;y=[1.1,0.9,1.0])
+    plan=bind_data(lower_rkppl(quote
+        a ~ Normal()
+        b ~ Normal()
+        y .~ Normal.(a+b,0.3)
+    end,data;conditioned=(:y,)),data)
+    target=prepare_smc(build_kernel(plan),plan,[0.0,0.0];backend=F.BACKEND,
+        model_id="correlation-carry",binding_id="y3")
+    fit=smc(target;rng=Xoshiro(17),particles=512,
+        options=SMCOptions(stepsize=0.3,moves=4,max_tree_depth=3))
+    carried=carry_smc(fit;calibration_id="correlation",basis=:correlation)
+    @test carried.reference.scale.kind===:diagonal_lowrank
+    @test carried.fit_diagnostics.directions==1
+    P,wt=fit.positions,fit.weights
+    Xc=P.-P*wt
+    @test dense(carried.reference.scale)≈(Xc.*wt')*Xc' rtol=1e-6
+    @test carried.reference.location≈P*wt rtol=1e-12
+    @test_throws ArgumentError carry_smc(fit;calibration_id="x",basis=:unknown)
+end

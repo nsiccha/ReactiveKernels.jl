@@ -224,54 +224,16 @@ function _window_filter(target,boundary,records,u,rng,n)
     return state,state.log_normalizer,evaluations
 end
 
-# Leading correlation directions of weighted members. A diagonal summary
-# discards them: where the data inform only combinations of parameters (a
-# hierarchical intercept and its group effects), a diagonal window prior treats
-# the marginal widths as independent information and contracts the population
-# every window, and a diagonal random walk leaves the narrow combinations at
-# once and is rejected. WarmupHMC's moment fitter finds the directions in the
-# marginally standardized frame, so coordinates on different scales are treated
-# alike. Retained directions keep their weighted variance; the remaining ones
-# share the remaining variance equally (probabilistic PCA), which keeps the total
-# standardized variance. At most `max_reflections` directions, and fewer than
-# the distinct-position ESS supports. Work O(d*members*directions*iterations),
-# storage O(d*directions); no d x d matrix is formed. `nothing` when no direction
-# is estimable; then the caller uses the diagonal marginal moments.
-function _filter_covariance(positions,mass,location,sd,max_reflections)
-    d = length(location)
-    r = min(max_reflections,d-1,floor(Int,_filter_distinct_ess(positions,mass))-2)
-    r >= 1 || return nothing
-    standardized = (positions .- location) ./ sd
-    fit = WarmupHMC.fit_gaussian_moments(standardized;weights=mass,max_reflections=r)
-    scale = fit.scale.diagonal
-    k = length(fit.scale.reflections)
-    k >= 1 || return nothing
-    rotation = WarmupHMC.scale_from_data(fit.scale)
-    vectors,unit,column = zeros(d,k),zeros(d),zeros(d)
-    for j in 1:k
-        fill!(unit,0.0)
-        unit[j] = 1.0
-        mul!(column,rotation,unit)
-        vectors[:,j] .= column ./ scale[j]
-    end
-    remainder = sum(abs2,view(scale,k+1:d))/(d-k)
-    isfinite(remainder) && remainder > 0 || return nothing
-    return (; kind=:diagonal_lowrank,diagonal=abs2.(sd) .* remainder,
-        vectors,values=abs2.(view(scale,1:k)) ./ remainder .- 1)
-end
-_filter_directions(::Nothing) = 0
-_filter_directions(scale) = size(scale.vectors,2)
-
 function _filter_rollover(state,rng)
     location,coordinate_sd = _filter_moments(state.positions,state.parameter_mass)
     invalid_coordinates = findall(x -> !(isfinite(x) && x>0),coordinate_sd)
     isempty(invalid_coordinates) && all(isfinite,location) ||
         throw(PPL.SMCDegeneracyError(state,:rollover,
             (;coordinate_sd,invalid_coordinates,kernel=deepcopy(state.kernel))))
-    covariance = _filter_covariance(state.positions,state.parameter_mass,location,coordinate_sd,
+    covariance = _correlation_scale(state.positions,state.parameter_mass,location,coordinate_sd,
         state.max_reflections)
     reference = SMCReference(location,covariance === nothing ? coordinate_sd : covariance)
-    directions = _filter_directions(covariance)
+    directions = _correlation_directions(covariance)
     boundary = PPL._filter_boundary(state.members,state.parameter_mass,rng)
     calibration = SMCCarriedReference(reference,deepcopy(state.calibration.frame),
         string("filter-window-",string(state.window+1;base=16,pad=16)))
@@ -359,7 +321,7 @@ function _filter_replenish(positions,members,logmass,target,proposal,boundary,re
     mass = exp.(logmass)
     location,spread = _filter_moments(positions,mass)
     covariance = all(x -> isfinite(x) && x>0,spread) ?
-        _filter_covariance(positions,mass,location,spread,max_reflections) : nothing
+        _correlation_scale(positions,mass,location,spread,max_reflections) : nothing
     geometry = covariance === nothing ? nothing :
         CompactGaussian(zeros(length(location)),covariance.diagonal,covariance.vectors,covariance.values)
     scale = _filter_walk_scale(covariance === nothing ? spread : _reference_sd(covariance))
@@ -369,7 +331,7 @@ function _filter_replenish(positions,members,logmass,target,proposal,boundary,re
     accepted,moved,evaluations =
         _filter_walk!(positions,members,target,proposal,boundary,records,kernel.moves,scale,geometry,rng)
     return positions,members,length(unique(parents)),accepted,moved,evaluations,scale,
-        _filter_directions(covariance)
+        _correlation_directions(covariance)
 end
 
 function PPL.filter_step(state::SMCFilterState,observation::NamedTuple;

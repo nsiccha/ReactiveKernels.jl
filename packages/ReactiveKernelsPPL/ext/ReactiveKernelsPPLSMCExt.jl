@@ -514,8 +514,20 @@ function PPL.carry_smc(state::SMCState; calibration_id::AbstractString, scale=no
         summary=WarmupHMC.fit_gaussian_moments(positions; weights=state.weights,
             max_reflections,maxiter,progress)
         location,scale,diagnostics=summary.mean,summary.scale,summary.diagnostics
+    elseif basis === :correlation
+        sd = zeros(length(location))
+        for j in axes(positions, 2), i in eachindex(location)
+            sd[i] += state.weights[j] * abs2(positions[i,j]-location[i])
+        end
+        sd .= sqrt.(sd)
+        all(x -> isfinite(x) && x > 0, sd) || throw(ArgumentError(
+            "basis=:correlation needs positive finite marginal spread on every coordinate"))
+        covariance=_correlation_scale(positions,state.weights,location,sd,max_reflections)
+        scale=covariance===nothing ? sd : covariance
+        diagnostics=(; directions=_correlation_directions(covariance),
+            effective_sample_size=_filter_distinct_ess(positions,state.weights))
     elseif basis !== nothing
-        basis isa Symbol && throw(ArgumentError("basis must be :fit or a portable scale"))
+        basis isa Symbol && throw(ArgumentError("basis must be :fit, :correlation or a portable scale"))
         scale=_posterior_scale_in_basis(positions,state.weights,location,basis)
     elseif scale === nothing
         variance = zeros(length(location))

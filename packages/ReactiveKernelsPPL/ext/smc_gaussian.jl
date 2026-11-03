@@ -59,6 +59,45 @@ function _reference_draws(rng, reference::SMCReference{<:CompactScale}, d, n)
     positions
 end
 
+# Leading correlation directions of a weighted cloud, as a diagonal-plus-low-rank
+# scale: carry_smc(...; basis=:correlation), the learning filter's window
+# boundary and its replenishment walk. A diagonal summary discards them: where
+# the data inform only combinations of parameters (a hierarchical intercept and
+# its group effects), a diagonal prior treats the marginal widths as independent
+# information, and a diagonal random walk leaves the narrow combinations at once
+# and is rejected. WarmupHMC's moment fitter finds the directions in the
+# marginally standardized frame, so coordinates on different scales are treated
+# alike. Retained directions keep their weighted variance; the remaining ones
+# share the remaining variance equally (probabilistic PCA), which keeps the total
+# standardized variance. At most min(max_reflections, d-1, distinct-position
+# ESS - 2) directions. Work O(d*members*directions*iterations),
+# storage O(d*directions); no d x d matrix is formed. `nothing` when no direction
+# is estimable; then the caller uses the diagonal marginal moments.
+function _correlation_scale(positions,mass,location,sd,max_reflections)
+    d = length(location)
+    r = min(max_reflections,d-1,floor(Int,_filter_distinct_ess(positions,mass))-2)
+    r >= 1 || return nothing
+    standardized = (positions .- location) ./ sd
+    fit = WarmupHMC.fit_gaussian_moments(standardized;weights=mass,max_reflections=r)
+    scale = fit.scale.diagonal
+    k = length(fit.scale.reflections)
+    k >= 1 || return nothing
+    rotation = WarmupHMC.scale_from_data(fit.scale)
+    vectors,unit,column = zeros(d,k),zeros(d),zeros(d)
+    for j in 1:k
+        fill!(unit,0.0)
+        unit[j] = 1.0
+        mul!(column,rotation,unit)
+        vectors[:,j] .= column ./ scale[j]
+    end
+    remainder = sum(abs2,view(scale,k+1:d))/(d-k)
+    isfinite(remainder) && remainder > 0 || return nothing
+    return (; kind=:diagonal_lowrank,diagonal=abs2.(sd) .* remainder,
+        vectors,values=abs2.(view(scale,1:k)) ./ remainder .- 1)
+end
+_correlation_directions(::Nothing) = 0
+_correlation_directions(scale) = size(scale.vectors,2)
+
 # A covariance projection is an importance reference, not one of WarmupHMC's
 # portable mutation metrics. Never send it to the generic dense-Cholesky path.
 _metric(::CompactScale) = throw(ArgumentError(
