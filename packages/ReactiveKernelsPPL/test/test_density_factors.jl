@@ -34,6 +34,13 @@ end
     simplex = select_factors(c; site = :simplex)
     e = only(e for e in built.layout.entries if e.name === :simplex)
     @test factor_coordinates(simplex) == collect(e.offset:e.offset + e.size - 1)
+    # Its prior reads its own block and the concentration's hyperparent; its
+    # Jacobian reads the block alone (snag factor-support-r-2b8c2968).
+    block = collect(e.offset:e.offset + e.size - 1)
+    @test factor_support(select_factors(c; kind = :prior, site = :simplex);
+        u0 = u) == sort([location; block])
+    @test factor_support(select_factors(c; kind = :log_jacobian, site = :simplex);
+        u0 = u) == block
     @test factor_support(c, only(joint); u0 = u) == joint_support
     selected = select_factors(c)
     q = prepare_query_ad(prepare_ad, built, plan, selected, _FACTOR_REVERSE, u)

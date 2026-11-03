@@ -97,6 +97,63 @@ end
     end
 end
 
+# Snag factor-support-r-2b8c2968: a vector simplex or ordered entry read its
+# packed block inside the transform call, so its prior and Jacobian reported
+# every packed coordinate as support. Each event reads only its own block,
+# plus a sampled hyperparent.
+@testset "vector simplex and ordered events read only their own block" begin
+    simplex = RKPPLModel(quote
+        sigma ~ Exponential(1)
+        z[1:J] .~ Normal(0.0, 1.0)
+        s ~ Dirichlet([1.0, 2.0, 1.5])
+        @plate for i in eachindex(y)
+            y[i] ~ Normal(z[g[i]] + s[1], sigma)
+        end
+    end, @__MODULE__)
+    ordered = RKPPLModel(quote
+        scale ~ Exponential(1)
+        z[1:J] .~ Normal(0.0, 1.0)
+        c ~ Ordered(Normal(0.0, 2scale), 4)
+        @plate for i in eachindex(y)
+            y[i] ~ Normal(z[g[i]] + c[1], 1.0)
+        end
+    end, @__MODULE__)
+    for J in (3, 103)
+        observed = (; y = [0.1sin(i) for i in 1:J])
+        plan = simplex(; J, g = collect(1:J)) | observed
+        built = build_kernel(plan)
+        u = [0.2sin(i) for i in 1:built.layout.total]
+        catalogue = density_factors(built, plan)
+        e = only(e for e in built.layout.entries if e.name === :s)
+        block = collect(e.offset:e.offset + e.size - 1)
+        prior = select_factors(catalogue; kind = :prior, site = :s)
+        jacobian = select_factors(catalogue; kind = :log_jacobian, site = :s)
+        @test factor_coordinates(prior) == factor_coordinates(jacobian) == block
+        _check_density_structure(built, plan, prior, u, block, point ->
+            Distributions.logpdf(Distributions.Dirichlet([1.0, 2.0, 1.5]),
+                simplex_constrain(point[block])))
+        _check_density_structure(built, plan, jacobian, u, block,
+            point -> simplex_logjac(point[block]))
+
+        plan = ordered(; J, g = collect(1:J)) | observed
+        built = build_kernel(plan)
+        u = [0.2sin(i) for i in 1:built.layout.total]
+        catalogue = density_factors(built, plan)
+        e = only(e for e in built.layout.entries if e.name === :c)
+        block = collect(e.offset:e.offset + e.size - 1)
+        scale = only(e.offset for e in built.layout.entries if e.name === :scale)
+        prior = select_factors(catalogue; kind = :prior, site = :c)
+        jacobian = select_factors(catalogue; kind = :log_jacobian, site = :c)
+        @test factor_coordinates(prior) == factor_coordinates(jacobian) == block
+        _check_density_structure(built, plan, prior, u, sort([scale; block]), point ->
+            sum(Distributions.logpdf.(Distributions.Normal(0.0, 2exp(point[scale])),
+                ordered_constrain(point[block]))))
+        # The ordering Jacobian reads all but the first coordinate.
+        _check_density_structure(built, plan, jacobian, u, block[2:end],
+            point -> ordered_logjac(point[block]))
+    end
+end
+
 @rkppl _density_named_child(m) = begin
     b ~ Normal(m, 1.7)
     return b
