@@ -263,6 +263,69 @@ _pp_opaque_field(x, s) = s .* cumsum(x)
     return total
 end
 
+@testset "plate_partition: the spellings of `by`" begin
+    # The docstring promises `plate => key` pairs, and a vector or tuple of them
+    # used to be read by position (snag `prepare-partitio-1865f53f`).
+    keys_by_plate = Dict(:dens => :subject, :group_totals => :group_subject)
+    names = (:dens, :group_totals)
+    for by in ((dens = :subject, group_totals = :group_subject), keys_by_plate,
+               pairs((dens = :subject, group_totals = :group_subject)),
+               [:dens => :subject, :group_totals => :group_subject],
+               (:dens => :subject, :group_totals => :group_subject),
+               (name => keys_by_plate[name] for name in names),
+               ["dens" => "subject", "group_totals" => "group_subject"],
+               [:dens => :subject, :group_totals => :group_subject, :dens => :subject],
+               # Loosely typed containers hold the same names.
+               Dict{Symbol,Any}(:dens => :subject, :group_totals => :group_subject),
+               Pair{Any,Any}[:dens => :subject, "group_totals" => :group_subject],
+               Any[:dens => :subject, :group_totals => "group_subject"])
+        @test ReactiveKernels._partition_by_map(by, names) == keys_by_plate
+    end
+    @test ReactiveKernels._partition_by_map(:dens => :subject, (:dens,)) == Dict(:dens => :subject)
+    @test ReactiveKernels._partition_by_map(:subject, names) ==
+        Dict(:dens => :subject, :group_totals => :subject)
+
+    # End to end, against the plates' own cells.
+    spec = plate_partition(_pp_two_plates, names;
+        by = [:dens => :subject, :group_totals => :group_subject], index = :label)
+    k = prepare(spec; have = (_PP_TWO_HAVE..., :label), want = :partition_total)
+    full = prepare(_pp_two_plates; have = _PP_TWO_HAVE, want = names)
+    d = _pp_two_plate_data((4, 6, 3, 5, 7))
+    args = (d.u, d.g, d.observed, d.order, d.y, d.rows, d.totals, d.subject, d.group_subject)
+    dens, group_totals = full(args...)
+    @test [k(args..., s) for s in 1:5] ≈ [sum(dens[d.subject .== s]) +
+        sum(group_totals[d.group_subject .== s]) for s in 1:5]
+
+    # A `by` that selects no key is refused naming the accepted spellings (the
+    # reported error named none, and a pair or `nothing` raised a `MethodError`).
+    function refusal(by)
+        try
+            plate_partition(_pp_subjects, :dens; by)
+            nothing
+        catch err
+            err
+        end
+    end
+    for by in ([:subject], "subject", 1, nothing, [:dens => 1])
+        err = refusal(by)
+        @test err isa ArgumentError
+        @test occursin("`by` must be", err.msg)
+        @test occursin("`plate => key` pair", err.msg)
+    end
+    for (by, named) in ([:other => :subject] => ":other", (; other = :subject) => ":other",
+                        Pair{Symbol,Symbol}[] => "nothing")
+        err = refusal(by)
+        @test err isa ArgumentError
+        @test occursin("no key for plate :dens; it names $named", err.msg)
+        @test occursin("`plate => key` pair", err.msg)
+    end
+    # Two keys partition one plate's cells in two different ways, so the choice
+    # cannot be left to the entries' order.
+    err = refusal([:dens => :subject, :dens => :g])
+    @test err isa ArgumentError
+    @test occursin("plate :dens two keys, :subject and :g", err.msg)
+end
+
 @testset "plate_partition: refusals and arguments" begin
     @test_throws ArgumentError plate_partition(_pp_subjects, :total; by = :subject)
     @test_throws ArgumentError plate_partition(_pp_subjects, :dens; by = (; other = :subject))

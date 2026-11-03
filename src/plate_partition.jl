@@ -366,6 +366,46 @@ end
 _readable_callee(::_PartitionLabel) = :partition_label
 _opname(::_PartitionLabel) = "partition_label"
 
+_partition_by_entries(by::Union{NamedTuple,AbstractDict}) = pairs(by)
+_partition_by_entries(by::Pair) = (by,)
+_partition_by_entries(by) = applicable(iterate, by) ? by : (by,)
+
+# The key of each name in `names`: `by` is one key for all of them or, per name,
+# a named tuple, a dictionary, one `name => key` pair or a collection of such
+# pairs. PPL's observation queries read their `by` here too: `what` is the word
+# for a name in a refusal, and `refuse` builds its exception.
+function _partition_by_map(by, names; what = "plate",
+                           refuse = message -> ArgumentError("plate_partition: " * message))
+    forms = "one key for every $what or, per $what, a named tuple, a dictionary, one " *
+        "`$what => key` pair or a collection of such pairs"
+    keys_by_name = Dict{Symbol,Symbol}()
+    if by isa Symbol
+        for name in names
+            keys_by_name[name] = by
+        end
+    else
+        for entry in _partition_by_entries(by)
+            # By value: a `Dict{Symbol,Any}` or `Any[...]` holds names as well.
+            entry isa Pair && first(entry) isa Union{Symbol,AbstractString} &&
+                last(entry) isa Union{Symbol,AbstractString} ||
+                throw(refuse("`by` must be $forms; got $(repr(by))"))
+            name, key = Symbol(first(entry)), Symbol(last(entry))
+            # Two keys are two different partitions of one name's cells, so
+            # neither entry can silently win.
+            get(keys_by_name, name, key) === key || throw(refuse(
+                "`by` gives $what :$name two keys, :$(keys_by_name[name]) and :$key"))
+            keys_by_name[name] = key
+        end
+    end
+    for name in names
+        haskey(keys_by_name, name) || throw(refuse(
+            "`by` gives no key for $what :$name; it names " *
+            "$(isempty(keys_by_name) ? "nothing" : join(repr.(sort!(collect(keys(keys_by_name)))), ", ")). " *
+            "Give $forms"))
+    end
+    keys_by_name
+end
+
 """
     plate_partition(spec::KernelSpec, plates; by, index = :partition, name = :partition_total,
                     locality = :error, partitioned = (), plan = nothing,
@@ -376,7 +416,8 @@ plates named in `plates` (one name or several) whose key equals the label held
 by the HAVE port `index`: a *partition* of the plates, such as one subject's
 observations. `by` gives each plate's key, a value of `spec` (usually a bound
 data port) with one entry per cell of the plate in the plate's linear order:
-one name for every plate, or a named tuple or pairs `plate => key`.
+one name for every plate or, per plate, a named tuple, a dictionary, one
+`plate => key` pair or a collection of such pairs.
 
 A partition runs as ONE compiled pass over its cells: each named plate loops
 once over the positions holding the label, through the plate's own scalar body
@@ -428,12 +469,7 @@ function plate_partition(spec::KernelSpec, plates; by,
         "plate_partition: the plan port must differ from the index port :$index"))
     names = plates isa Symbol ? (plates,) : Tuple(Symbol.(collect(plates)))
     isempty(names) && throw(ArgumentError("plate_partition: name at least one plate"))
-    keys_by_plate = by isa Symbol ? Dict{Symbol,Symbol}(plate => by for plate in names) :
-        Dict{Symbol,Symbol}(Symbol(k) => Symbol(v) for (k, v) in pairs(by))
-    for plate in names
-        haskey(keys_by_plate, plate) || throw(ArgumentError(
-            "plate_partition: `by` gives no key for plate :$plate"))
-    end
+    keys_by_plate = _partition_by_map(by, names)
     rule = _partition_rule(partitioned)
     for (port, labels) in rule
         haskey(spec.ports, port) || throw(ArgumentError(
