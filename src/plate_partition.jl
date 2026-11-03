@@ -62,7 +62,8 @@ function Base.showerror(io::IO, err::PartitionLocalityError)
           "form (a dotted expression, a gather, a column read, hcat/vcat, a product ",
           "with an array left factor, a literal range view or reshape, a reduction over ",
           "the axes other than the first such as `vec(sum(x; dims = 2))`, a transposed ",
-          "vector, an authored plate, a proved per-index helper comprehension); ",
+          "vector, an authored plate, a proved per-index helper comprehension, a ",
+          "field of a named tuple of data, a shape check that returns its argument); ",
           "see `partition_locality`. Pass `locality = :warn` ",
           "to evaluate anyway.")
 end
@@ -550,7 +551,7 @@ end
 # recorded reads, plus the reads of the recipes the window emitter never
 # saw (computed whole: a bound-indexed gather or literal range view reads
 # constant positions, anything else the whole port).
-function _footprint_return(p::Plan, cells, names)
+function _footprint_return(p::Plan, cells, names, declared = nothing, body = nothing)
     recording = task_local_storage(_FOOTPRINT)
     g = p.graph
     cidof(v) = canon_id(g, v.id)
@@ -560,40 +561,67 @@ function _footprint_return(p::Plan, cells, names)
         producers[cidof(o)] = r
     end
     wants = Set(cidof(v) for v in p.want)
+    selection = recording.selection
+    selected_port = selection === nothing ? nothing :
+        findfirst(port -> port.name == first(selection), p.have)
+    selected_cid = selected_port === nothing ? nothing : cidof(p.have[selected_port])
+    reads = Dict(cid => copy(entries) for (cid, entries) in recording.records)
+    record(cid, kind, expr) = push!(get!(() -> Tuple{Symbol,Any}[], reads, cid), (kind, expr))
+    # A view's reads are mapped at its binding: only a view whose value and
+    # operands the body binds at its top level (not one a scan, a fused plate
+    # or a branch arm absorbed) forwards its readers' positions.
+    bound = body === nothing ? Set{Symbol}() : _footprint_bound_names(body, p, names)
+    for cid in wants
+        record(cid, :whole, nothing)
+    end
+    # Walk consumers before producers so an actual view forwards its readers'
+    # positions to the parent. Constructing a view only reads shape/index
+    # metadata; a copying gather retains the ordinary eager read below.
+    for r in reverse(p.recipes)
+        r.op isa _AuthoredPlateCellOp && continue
+        any(o -> cidof(o) in pushed, r.outputs) && continue
+        typed = declared === nothing ||
+            any(o -> get(names, cidof(o), nothing) in declared, r.outputs)
+        access = _footprint_access(r; typed)
+        view = access !== nothing && access.kind === :view ? access : nothing
+        f = _cell_form(r)
+        literal = f === nothing ? _footprint_literal_read(r) : nothing
+        for (s, input) in enumerate(r.inputs)
+            cid = cidof(input)
+            if view !== nothing && s == view.slot && _footprint_indices_free(view) &&
+                    all(v -> get(names, cidof(v), nothing) in bound,
+                        (r.inputs..., only(r.outputs)))
+                mapping = Dict{Symbol,Any}(view.params[j] => names[cidof(v)]
+                                          for (j, v) in enumerate(r.inputs))
+                mapping[view.params[s]] = Expr(:call, GlobalRef(Base, :LinearIndices), names[cid])
+                indexmap = _footprint_replace(view.native, mapping)
+                out = cidof(only(r.outputs))
+                entries = Expr(:tuple, (Expr(:tuple, QuoteNode(k), e)
+                    for (k, e) in get(reads, out, Tuple{Symbol,Any}[]))...)
+                record(cid, :gathered, Expr(:call,
+                    GlobalRef(@__MODULE__, :_footprint_view_positions), indexmap, names[out], entries))
+            elseif f !== nothing
+                constant = _footprint_constant(r, f, s, producers, cidof)
+                if constant !== nothing && cid == selected_cid
+                    positions = Int[]
+                    _footprint_selected_positions!(positions, last(selection), constant)
+                    constant = positions
+                end
+                record(cid, constant === nothing ? :whole : :positions, constant)
+            elseif literal !== nothing && first(literal) == s
+                record(cid, :literal, last(literal))
+            else
+                record(cid, :whole, nothing)
+            end
+        end
+    end
     entries = Any[]
     for port in p.have
-        selection = recording.selection
         selection === nothing || port.name == first(selection) || continue
         selected = selection === nothing ? nothing : last(selection)
         cid = cidof(port)
         records = Any[Expr(:tuple, QuoteNode(kind), expr === nothing ? nothing : expr)
-                      for (kind, expr) in get(recording.records, cid, Tuple{Symbol,Any}[])]
-        cid in wants && push!(records, Expr(:tuple, QuoteNode(:whole), nothing))
-        for r in p.recipes
-            r.op isa _AuthoredPlateCellOp && continue
-            any(o -> cidof(o) in pushed, r.outputs) && continue
-            slots = findall(_input_list(v -> cidof(v) == cid, r.inputs))
-            isempty(slots) && continue
-            f = _cell_form(r)
-            literal = f === nothing ? _footprint_literal_read(r) : nothing
-            for s in slots
-                if f !== nothing
-                    constant = _footprint_constant(r, f, s, producers, cidof)
-                    if constant !== nothing && selected !== nothing
-                        positions = Int[]
-                        _footprint_selected_positions!(positions, selected, constant)
-                        constant = positions
-                    end
-                    push!(records, constant === nothing ?
-                        Expr(:tuple, QuoteNode(:whole), nothing) :
-                        Expr(:tuple, QuoteNode(:positions), constant))
-                elseif literal !== nothing && first(literal) == s
-                    push!(records, Expr(:tuple, QuoteNode(:literal), last(literal)))
-                else
-                    push!(records, Expr(:tuple, QuoteNode(:whole), nothing))
-                end
-            end
-        end
+                      for (kind, expr) in get(reads, cid, Tuple{Symbol,Any}[])]
         push!(entries, Expr(:tuple, QuoteNode(port.name), names[cid], Expr(:tuple, records...),
                             QuoteNode(selected)))
     end
@@ -834,7 +862,9 @@ the evaluation reads the port whole (a scalar port, a port read by a value
 computed whole). The positions follow from the bound index data and the
 label or cell index by the same row analysis that computes the evaluation:
 a lazy branch contributes both arms, a bound-indexed read its constant
-positions. Retained branches use capture row windows when bound indices
+positions, and a view the parent positions its readers read (constructing a
+view reads none; a typed local that converts a view into a copy reads every
+viewed position). Retained branches use capture row windows when bound indices
 prove both arms' requests in range; unproven requests may conservatively
 contribute the whole capture. Arm arithmetic remains lazy.
 For a partition or cell of a packed parameter vector this is its structural read

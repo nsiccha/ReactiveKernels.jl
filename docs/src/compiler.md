@@ -1176,6 +1176,17 @@ window types must dispatch to the same single method. An iterated argument must
 be a vector Base iterates in its linear order from position 1; an abstract port
 type is checked against the original producer's type at run time.
 
+A field of existing storage is existing storage. A cell reads `data.weight`,
+or `rows[i].weight1` from a named tuple of row vectors per index, at its rows,
+as it reads a port. This holds for a named tuple, and for a concrete struct
+whose `getproperty` is Base's `getfield` fallback. A `getproperty` method that
+computes its value keeps the ordinary whole-value path, which strict locality
+refuses. A package's argument-returning check (`_footprint_checked_alias`)
+with a validator (`_checked_alias_validator`) passes its argument's rows
+through. The validator checks the whole argument once per evaluation from
+its type and axes, so a check is never skipped. ReactiveKernelsPPL's joint
+cell latents use this for their shape check.
+
 Binary ordinary array `+` and `-`, including transparent forwarding helpers
 such as `add_arrays(a, b) = a + b`, also have row forms when their dispatch
 resolves to Base arithmetic over standard numeric arrays. Their complete
@@ -1473,10 +1484,21 @@ records every read of a port (the rows a value is sliced to, the positions
 gathers and captures read, the constant positions of a bound-indexed read, a
 lane of one row as that row) and returns them instead of the value; a
 lowering nested in it (a plate body, an embedded kernel) runs blind to the
-recording. Before that body is compiled, its statements that feed none of the
-recorded reads, such as the wanted value's own plate, are dropped; row and
-partition checks stay. For a packed parameter vector this is the exact support of a
-partition's gradient; a lazy branch contributes both arms.
+recording. Constructing a view reads none of its parent: a view
+(`view(u, 2:4)`, including one whose indices read the parent's shape, as
+`view(u, 1:length(u))`) contributes the parent positions its readers read,
+mapped through the view's indices. A typed local whose declared type the
+view does not have (`head::Vector{Float64} = view(u, 2:4)`) converts it into
+a copy, which reads every viewed position. A plate cell's shared array read
+through views and shape checks that return their argument
+(`_footprint_checked_alias`) is read at the positions the cell's own
+selections reach, computed per cell from those index maps alone, including
+gathers inside one compound expression (`w .* v[I]`); an opaque reader of
+such a view reads all of it. Before that body is compiled, its statements that
+feed none of the recorded reads, such as the wanted value's own plate, are
+dropped; row and partition checks stay. For a packed parameter vector this is
+the exact support of a partition's gradient; a lazy branch contributes both
+arms.
 `partition_footprint` keeps the footprint kernel it prepares for the process;
 `partition_footprint_kernel(kernel)` prepares one for a caller to hold and
 evaluate itself. `partitioned` adds the separability rule, pairs

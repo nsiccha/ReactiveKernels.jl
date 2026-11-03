@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.67
+
+- Footprints follow reads through views: a view contributes the parent
+  positions its readers read, including views whose indices read the parent's
+  shape. A typed local that converts a view into a copy still reads every
+  viewed position. Inside a plate cell, a shared array read through views and
+  argument-returning shape checks is read at the positions the cell's
+  selections reach, so a strict cell that selects entries of its own block
+  reports those positions only. Gathers inside one compound expression
+  (`w .* v[I]`) count as reads of the gathered positions.
+- A cell reads a field of existing storage at its rows: a named tuple's
+  vector field, or a field of a concrete struct whose `getproperty` is
+  Base's `getfield` fallback (`rows[i].weight1`). A computed property keeps
+  its whole-value path.
+- A package's argument-returning check with a validator
+  (`_checked_alias_validator`) passes its argument's rows to a strict cell
+  and validates the whole argument once from its type and axes. `view(v, I)`
+  of a vector reads a cell window's rows as a gather does.
+
 ## 0.1.66
 
 - Compute per-position helpers at a cell's rows. Comprehensions and `map` over
