@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.63
+
+- Keep a shared-prefix cut's input types when preparing cell factors with
+  `partitioned`. A cell's per-index reads of earlier plates (`loc[i]`) are
+  then scalar reads, as without the cut, instead of a group sum whose rows are
+  the cell's own position; genuinely gathered sums prepare strict summands.
+  Factor discovery no longer takes a scalar position as a sum's row labels.
+
 ## 0.1.62
 
 - Carry row demand through a selected array-valued producer cell, preserving
