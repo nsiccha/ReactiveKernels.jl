@@ -84,6 +84,19 @@ function _check_frozen_definition(plan::StructuralPlan, exprs::AbstractDict, nm:
     return nothing
 end
 
+# Whether a binding holds `name`'s value outright, and that value: its column
+# in `columns`, else the value `plan`'s record froze. Every evaluator of bound
+# data (array extents, Dirichlet concentrations, vector lengths) reads a
+# frozen definition here before its expression. A frozen whole value the
+# graph keeps (`_frozen_graph_names`, a NamedTuple of fitted geometry) has
+# no column, and its expression reads inputs the binding leaves absent: an
+# absent stand-in answers only its recorded shape, so evaluating it either
+# fails (`x_fit[1]`) or recomputes from that shape what the record holds.
+_holds_bound_value(plan, columns::AbstractDict, name::Symbol) =
+    haskey(columns, name) || (plan !== nothing && haskey(plan.frozen.values, name))
+_bound_value(plan, columns::AbstractDict, name::Symbol) =
+    haskey(columns, name) ? columns[name] : plan.frozen.values[name]
+
 # The type a program declares for a data input (`_data_arg`) and its size.
 _frozen_input_info(v::_AbsentNumber{T}) where {T} = (type = T, size = ())
 _frozen_input_info(v::Number) = (type = typeof(v), size = ())

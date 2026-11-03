@@ -270,7 +270,7 @@ function _bound_data_value(plan, ex, name, what)
     expressions = Dict(a.name=>a.expr for a in _definitions(plan))
     active = Set{Symbol}()
     function lookup(n)
-        haskey(plan.columns, n) && return plan.columns[n]
+        _holds_bound_value(plan, plan.columns, n) && return _bound_value(plan, plan.columns, n)
         (haskey(expressions, n) && n ∉ active) || _fail(name,
             "$what must depend only on bound data; unavailable $n")
         push!(active, n)

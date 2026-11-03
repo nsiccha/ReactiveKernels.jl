@@ -305,3 +305,90 @@ end
         mod = @__MODULE__)
     @test _fz_refused(() -> frozen_values(unbound, :x_mean), "bound plan")
 end
+
+# A frozen whole value the graph keeps (a NamedTuple of fitted geometry, not
+# a column) sizes the program: array extents, an external law's dimension and
+# its host-side arguments, and a Dirichlet concentration read the frozen
+# value, never its omitted fit-role input. Snag frozen-value-com-ce8957be: an
+# indexed read (`x_fit[1]`) of the absent input failed, and an unindexed one
+# replayed only because the absent stand-in answers its recorded shape.
+struct _FzIdentityVector{N}
+    n::N
+end
+@kernel _fz_identity_coordinates(u, shape, n) = begin
+    return u
+end
+@kernel _fz_zero_jacobian(u, shape, n) = begin
+    return 0.0
+end
+ReactiveKernelsPPL.sampling_geometry(::Type{_FzIdentityVector}, args, shape) =
+    ParameterGeometry(isempty(shape) ? (args[1],) : shape, args[1]; support = :real,
+        constrain = _fz_identity_coordinates, unconstrain = _fz_identity_coordinates,
+        logjac = _fz_zero_jacobian)
+ReactiveKernelsPPL.sampling_logdensity(::_FzIdentityVector, w) = -sum(abs2, w) / 2
+_fz_support(v) = (; geometry = (; n = length(v)))
+_fz_value_support(v) = (; n = round(Int, maximum(v)))
+_fz_concentration(v) = (; alpha = fill(1.5, length(v)))
+@rkppl _fz_field(geometry, picks) = begin
+    z[1:geometry.n] ~ _FzIdentityVector(geometry.n)
+    return z[picks]
+end
+const _FZ_SIZED = [
+    # An external law sized through a submodel, from an indexed fit input.
+    (quote
+        support = _fz_support(x_fit[1])
+        field ~ _fz_field(support.geometry, picks)
+        y .~ Normal.(field, 0.2)
+    end, [[0.1, 0.2, 0.3]], :support),
+    # An ordinary declared array, same value.
+    (quote
+        support = _fz_support(x_fit[1])
+        z[1:support.geometry.n] .~ Normal(0, 1)
+        y .~ Normal.(z[picks], 0.2)
+    end, [[0.1, 0.2, 0.3]], :support),
+    # An unindexed read whose extent depends on the input's values.
+    (quote
+        support = _fz_value_support(x_fit)
+        z[1:support.n] .~ Normal(0, 1)
+        y .~ Normal.(z[picks], 0.2)
+    end, [1.0, 2.0, 3.0], :support),
+    # A Dirichlet concentration (its length and its values).
+    (quote
+        conc = _fz_concentration(x_fit[1])
+        w ~ Dirichlet(conc.alpha)
+        y .~ Normal.(w[picks], 0.2)
+    end, [[0.1, 0.2, 0.3]], :conc),
+]
+
+@testset "frozen definitions: a frozen whole value sizes the program" begin
+    for (src, x_fit, name) in _FZ_SIZED
+        data = (; x_fit, picks = [1, 3], y = [0.2, 0.4])
+        fit = bind_data(lower_rkppl(src, data; conditioned = (:y,), mod = @__MODULE__), data)
+        state = frozen_values(fit, name)
+        design = (; picks = [3], y = [0.4])
+        reference = bind_data(fit, (; design..., x_fit))
+        built = build_kernel(reference)
+        u = 0.3 .* sin.(1:built.layout.total) .- 0.1
+        lowered = lower_rkppl(src, design; conditioned = (:y,), mod = @__MODULE__,
+            frozen = state)
+        ReactiveKernelsPPL._STRUCTURAL_CACHE_CHECK[] = true
+        replays = try
+            # Lowered without the training data, and the fit rebound.
+            (bind_data(lowered, design), bind_data(fit, design; frozen = state))
+        finally
+            ReactiveKernelsPPL._STRUCTURAL_CACHE_CHECK[] = false
+        end
+        for replay in replays
+            @test ReactiveKernelsPPL._frozen_graph_names(replay) == [name]
+            @test !ReactiveKernelsPPL._supplied(replay.columns[:x_fit])
+            own = build_kernel(replay)
+            @test own.program == built.program
+            for preset in (:sampler, :prior)
+                @test isequal(_fz_eval(prepare_query(own, replay, preset), u),
+                    _fz_eval(prepare_query(built, reference, preset), u))
+            end
+            @test isequal(constrain(own.layout, u), constrain(built.layout, u))
+            @test unconstrain(own.layout, constrain(own.layout, u)) ≈ u
+        end
+    end
+end
