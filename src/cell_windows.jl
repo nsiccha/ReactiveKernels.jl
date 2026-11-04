@@ -824,6 +824,10 @@ end
 function _cell_form(r::Recipe; outlined::Bool = false)
     length(r.outputs) == 1 && !r.effectful || return nothing
     r.op isa _AuthoredPlateOp && return _cell_plate_form(r)
+    # A product over a bound sparse factor's rows (cell_sparse_products.jl): its
+    # operand is read at the columns those rows store.
+    r.op isa _CellSparseProduct &&
+        return _CellForm(:sparse_product, [:sparse_rows, :sparse_operand], [0, 0], Int[], 2)
     r.source isa Symbol && return _cell_identity_form(r)
     if r.op === Base.:* && length(r.inputs) >= 2
         # A bare exact call `A * B...` keeps Base's `*` itself as its
@@ -1992,7 +1996,7 @@ end
 # Whether a producer reads an input in `role` at its own rows.
 _cell_row_role(role) =
     role in (:leaf, :gather, :linear_gather, :column, :factor_leaf, :factor, :part,
-             :range_source, :reshape_source, :row, :vec_source)
+             :range_source, :reshape_source, :row, :vec_source, :sparse_operand)
 
 # `outlined` are the ids of the recipes a cell lowering outlined (`_cell_outline`);
 # `blocked`, when given, collects the ids of the producers whose values a reader
@@ -2047,7 +2051,8 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
         r = only(producers[cid])
         f = forms[r.id]
         f.kind in (:pointwise, :identity, :checked, :columns, :hcat, :vcat, :range_view, :reshape,
-                   :reduce, :transposed, :array_arithmetic, :position_map, :vec, :rows) && return true
+                   :reduce, :transposed, :array_arithmetic, :position_map, :vec, :rows,
+                   :sparse_product) && return true
         inputs = r.inputs
         factor = cidof(inputs[findfirst(==(:factor), f.roles)])
         (f.operand == 0 ? static_type(only(r.outputs)) <: AbstractVector :
@@ -2131,6 +2136,14 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
         r = only(producers[cid])
         f = forms[r.id]
         for (j, input) in enumerate(r.inputs)
+            # A sparse product's operand is computed at the rows it reads when it
+            # can be. Otherwise it is computed whole, as the right operand of any
+            # product is, and that is no violation.
+            if f.roles[j] === :sparse_operand
+                operand = cidof(input)
+                operand in pushed || (form(operand) !== nothing &&
+                    fits(operand, :sparse_operand) && operands_fit(operand)) || continue
+            end
             _cell_row_role(f.roles[j]) && reach!(cidof(input), f.roles[j], r.id)
         end
     end
@@ -2613,6 +2626,7 @@ function _cell_outlined_pushdowns(p::Plan; argument_types = nothing)
         end
     end
     p, scalar_outlined = _cell_scalar_reads(p; argument_types)
+    p = _cell_sparse_products(p; argument_types, outlined = scalar_outlined)
     p = _fuse_authored_plate_chains(p; cells_only = true)
     known = IdDict{Recipe,Any}()
     byid = Dict(r.id => r for r in p.recipes)
@@ -2736,6 +2750,9 @@ function _cell_shape!(e::_CellEmitter, cid::ValueId)
     end
     input_shape(input) = input in d.pushed ? _cell_shape!(e, input) :
         _cell_leaf_shape_expr(e, input)
+    f.kind === :sparse_product && return e.shapes[cid] = _cell_bind!(e, :cell_shape,
+        Expr(:call, _cell_ref(:_cell_sparse_shape), e.names[canon_id(d.graph, r.inputs[1].id)],
+            input_shape(canon_id(d.graph, r.inputs[2].id))))
     if f.kind === :product
         factor = canon_id(d.graph, r.inputs[findfirst(==(:factor), f.roles)].id)
         # With no single right-operand port, `shaped` proved that the whole
@@ -2933,6 +2950,11 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
         elseif role === :factor
             reads[j] = U
             icid in d.pushed && _cell_request!(e, icid, U)
+        elseif role === :sparse_operand
+            # The columns the product's rows store are the operand's rows.
+            reads[j] = _cell_bind!(e, :cell_row, _cell_canon(e, Expr(:call,
+                _cell_ref(:_cell_sparse_columns), e.names[canon_id(d.graph, r.inputs[1].id)], U)))
+            icid in d.pushed && _cell_request!(e, icid, reads[j])
         elseif role === :row
             # A position map's argument at exactly its rows, never extruded.
             reads[j] = U
@@ -2992,7 +3014,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
     U = e.unions[cid]
     f.kind === :vcat && return _cell_vcat_window!(e, cid, r, f, U)
     if f.kind in (:pointwise, :identity, :checked, :columns, :hcat, :range_view, :reshape, :reduce,
-                  :transposed, :array_arithmetic, :position_map, :vec, :rows)
+                  :transposed, :array_arithmetic, :position_map, :vec, :rows, :sparse_product)
         push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row),
             _cell_shape!(e, cid), U, e.sorted))
     end
@@ -3075,6 +3097,10 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
             icid in d.pushed || _footprint_record!(icid, :rows, reads[j])
             push!(args, icid in d.pushed ? _cell_take!(e, icid, reads[j]) :
                 Expr(:call, _cell_ref(:_cell_factor_rows), e.names[icid], reads[j]))
+        elseif role === :sparse_operand
+            icid in d.pushed || _footprint_record!(icid, :gathered_rows, reads[j])
+            push!(args, icid in d.pushed ? _cell_take!(e, icid, reads[j]) :
+                Expr(:call, _cell_ref(:_cell_factor_rows), e.names[icid], reads[j]))
         else
             _footprint_record!(icid, :whole, nothing)
             push!(args, e.names[icid])
@@ -3082,6 +3108,8 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
     end
     f.rowmap isa _CellRowMethod && return _cell_bind!(e, :cell_rows, Expr(:call, f.rowmap.at, U,
         Any[a isa _CellInputLiteral ? args[a.input] : a for a in f.rowmap.arguments]...))
+    f.kind === :sparse_product && return _cell_bind!(e, :cell_rows, Expr(:call,
+        _cell_ref(:_cell_sparse_product), args[1], U, reads[2], args[2]))
     f.rowmap isa _CellPositionMap && return _cell_position_window!(e, cid, r, f, args, U)
     f.rowmap === nothing || return _cell_helper_window!(e, f.rowmap, args)
     if r.op isa _AuthoredPlateOp

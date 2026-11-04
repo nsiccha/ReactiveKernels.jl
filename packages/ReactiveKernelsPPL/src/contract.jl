@@ -8187,8 +8187,11 @@ function _materialize_module_data!(plan::StructuralPlan,
             v isa ColumnData || continue
         end
         # Dense storage retains every observation operand's rank and axes.
-        # An `Array` is dense already, and no step writes a bound value.
-        columns[nm] = v isa _Absent || v isa Array ? v :
+        # An `Array` is dense already, and no step writes a bound value. A sparse
+        # value keeps its axes too, and its stored entries are structure a cell
+        # reads through (`L * eta`, RK's `_cell_sparse_products`).
+        columns[nm] = v isa _Absent || v isa Array ||
+                ReactiveKernels._cell_sparse_type(typeof(v)) ? v :
             v isa AbstractVector ? collect(v) : v isa AbstractArray ? Array(v) : v
     end
     return names

@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.77
+
+- A cell or partition of a product over a bound sparse factor, `L * eta` with `L`
+  a `SparseMatrixCSC` bound as data and `eta` a dense vector or matrix, reads
+  `eta` only at the columns the rows store. It computes `eta` at those rows and
+  its footprint holds them, instead of the whole operand; values equal the
+  authored sparse product exactly, and the rows are indexed once, when the data
+  is bound, so a cell costs its own stored entries. A dense factor's numeric zeros
+  still remove no read. The product must be a statement of its own: inside a larger
+  expression it still reads `eta` whole. Needs `SparseArrays` loaded, as a bound
+  sparse matrix does.
+- `partition_footprint` reads a view or a read nested in a larger expression at
+  its literal positions, as in `tanh.(view(u, 2:3:8))` or `exp(u[3])`. It used to
+  report the whole port, which hid every other precise read of it: one stacked LKJ
+  edge made a stratified group effect's cells report every subject's coordinates.
+  A shared-prefix split reads such a recipe the same way.
+
 ## 0.1.76
 
 - Internal support for ReactiveKernelsPPL 0.1.84's handling of a sum whose
