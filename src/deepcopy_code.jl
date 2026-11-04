@@ -1,9 +1,8 @@
 # Deep copies of the objects that hold code.
 #
 # A recipe's authored source and a prepared object's generated program are
-# expressions, and an expression may hold a module as a literal value:
-# ReactiveKernelsPPL rebuilds a resolved binding among a law's arguments as
-# `Core.GlobalRef(<module>, :name)` so that the printed source replays, and a
+# expressions, and an expression may hold a module as a literal value: source
+# that interpolates one, such as `Core.GlobalRef(<module>, :name)`, and a
 # program that inlines that source calls it as written. `deepcopy` refuses a
 # `Module`, so a per-chain deep copy of a prepared kernel failed (snag
 # `prepared-query-h-b7bd890a`). A deep copy of these objects copies their

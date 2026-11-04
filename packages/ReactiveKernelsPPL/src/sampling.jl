@@ -336,12 +336,22 @@ _sampling_rhs_broadcast(rhs::Union{AbstractArray,Tuple,Ref}) = rhs
 _sampling_rhs_broadcast(rhs) = Ref(rhs)
 _external_u(e) = :(unconstrained[$(e.offset):$(e.offset + e.size - 1)])
 _external_geometry_name(e) = Symbol(:_ppl_geometry_, e.name)
+# The authored argument expressions, rebuilt as source that evaluates to them.
+# That source reaches every object holding the program, the layout and the plan
+# among them, so it holds no module: `deepcopy` refuses one, and so does a cell
+# definition's validation. A module is read through its own binding instead,
+# which a module made with default names has. A resolved binding is rebuilt by
+# a call, because a quoted `GlobalRef` prints as `$(QuoteNode(...))`, which does
+# not parse back into the source that printed it.
 _sampling_ast_literal(x) = x
 _sampling_ast_literal(x::Symbol) = QuoteNode(x)
+_sampling_ast_literal(m::Module) =
+    isdefined(m, nameof(m)) && getglobal(m, nameof(m)) === m ? GlobalRef(m, nameof(m)) : m
 _sampling_ast_literal(x::Expr) = Expr(:call, GlobalRef(Core, :Expr), QuoteNode(x.head),
     (_sampling_ast_literal(a) for a in x.args)...)
 _sampling_ast_literal(x::QuoteNode) = Expr(:call, GlobalRef(Core, :QuoteNode), _sampling_ast_literal(x.value))
-_sampling_ast_literal(x::GlobalRef) = Expr(:call, GlobalRef(Core, :GlobalRef), x.mod, QuoteNode(x.name))
+_sampling_ast_literal(x::GlobalRef) = Expr(:call, GlobalRef(Core, :GlobalRef),
+    _sampling_ast_literal(x.mod), QuoteNode(x.name))
 function _external_geometry_expr(e)
     # Reconstruct the same structural descriptor through the public method.
     # Quoted authored expressions are constants, never active model values.

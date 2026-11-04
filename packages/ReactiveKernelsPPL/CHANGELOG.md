@@ -16,6 +16,24 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.81
+
+- Every object of a model whose caller-owned law takes an argument with a
+  resolved binding (a property read `cells[i].geometry`, an array literal
+  `[1.0, 0.4]`) deep-copies, at model level and in an `@plate` cell: the layout,
+  the plan, the built program, `density_factors`, `prepare_cell_query` and
+  `prepare_cell_factors`. `deepcopy` failed with `deepcopy of Modules not
+  supported`, because the generated program rebuilt such a binding as
+  `Core.GlobalRef(<module>, :name)`, holding the module as a value. It now reads
+  the module through its own binding, so `kernel_expr` and `code_expr` print
+  `Core.GlobalRef(Base.Base, :vect)` where they printed
+  `Core.GlobalRef(Base, :vect)`. The printed source still replays, and such a
+  law's value and gradient are unchanged. A joint cell latent's printed source
+  whose law takes such an argument now replays too; it held
+  `$(QuoteNode(:(Base.vect)))`, which does not parse back into that source.
+- `RKPPLModel`, a binding of one (`model(; x)`) and `RKPPLSubmodel` deep-copy too;
+  the copy shares the module the source resolves in.
+
 ## 0.1.80
 
 - Strict cell factors now know which values are numbers, as `prepare_cell_query`

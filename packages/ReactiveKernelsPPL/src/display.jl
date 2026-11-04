@@ -61,8 +61,7 @@ function model_view(spec::KernelSpec, layout::LayoutTable;
 end
 
 # `copy` gives fresh `Expr` nodes throughout, which is all `remove_linenums!`
-# edits. The values the code holds are only printed; a rebuilt law argument
-# holds a module, which `deepcopy` refuses (snag `prepared-query-h-b7bd890a`).
+# edits. The values the code holds are only printed.
 _model_visible_expr(expr::Expr) = Base.remove_linenums!(copy(expr))
 
 _model_source(::Nothing, layout) = nothing
