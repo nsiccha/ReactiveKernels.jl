@@ -532,7 +532,7 @@ function _expand_cell_joint_latents(st, taken, data::Set{Symbol}, mod::Module,
         hostkeywords = Pair{Symbol,Pair{Symbol,Any}}[k.args[1] => hostvalue(k.args[2], k.args[1])
             for k in keywords]
         push!(prelude, Expr(:(=), geometry, Expr(:call, ref(:_ppl_cell_joint_endpoints),
-            call.args[1], Expr(:tuple, (_cell_ast_literal(a) for a in call.args[2:end])...))))
+            call.args[1], Expr(:tuple, (_sampling_ast_literal(a) for a in call.args[2:end])...))))
         push!(prelude, Expr(:(=), shapecells, column(Expr(:tuple, deepcopy.(g.shape)...))))
         push!(prelude, Expr(:(=), shapes, Expr(:call, ref(:_ppl_cell_joint_shapes),
             QuoteNode(name), shapecells)))
@@ -673,15 +673,6 @@ function _ppl_cell_latent_flatten(cells::AbstractVector)
     end
     return out
 end
-
-# The authored argument expressions, rebuilt as a value a definition holds.
-# A resolved binding stays a quoted `GlobalRef`: definitions hold no modules.
-_cell_ast_literal(x) = x
-_cell_ast_literal(x::Symbol) = QuoteNode(x)
-_cell_ast_literal(x::GlobalRef) = QuoteNode(x)
-_cell_ast_literal(x::QuoteNode) = Expr(:call, GlobalRef(Core, :QuoteNode), _cell_ast_literal(x.value))
-_cell_ast_literal(x::Expr) = Expr(:call, GlobalRef(Core, :Expr), QuoteNode(x.head),
-    (_cell_ast_literal(a) for a in x.args)...)
 
 # The geometry's `constrain` and `logjac` endpoints, the only parts the cells
 # call: its shape expressions are evaluated at binding instead, and as AST

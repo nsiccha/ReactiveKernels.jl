@@ -37,6 +37,12 @@ using DifferentiationInterface, Enzyme, ReactiveKernels, ReactiveKernelsPPL, Tes
     @test same(identity(rebuilt(a)), identity(rebuilt(b)))
     @test !same(identity(rebuilt(Base)), identity(rebuilt(Main)))
     @test !same(identity(rebuilt(a)), identity(rebuilt(Main)))
+    # A rebuilt binding reads its module through the module's own binding.
+    through(m) = Expr(:call, GlobalRef(Core, :GlobalRef), GlobalRef(m, nameof(m)), QuoteNode(:f))
+    @test same(identity(through(a)), identity(through(b)))
+    @test !same(identity(through(Base)), identity(through(Main)))
+    @test !same(identity(through(a)), identity(through(Main)))
+    @test same(identity(through(a)), identity(rebuilt(a)))
     # A differing statement that holds a module is named, not copied.
     held(m) = Expr(:function, :(f(x)), Expr(:block, LineNumberNode(1),
         Expr(:(=), :ref, rebuilt(m))))

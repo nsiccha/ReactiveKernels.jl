@@ -154,6 +154,13 @@ RKPPLSubmodel(name, args, body, mod, kwdefaults) =
 _submodel_args(sm::RKPPLSubmodel) = [sm.argnames; first.(sm.kwdefaults)]
 sampling_fragment(sm::RKPPLSubmodel) = sm
 
+# A captured program's module is the namespace its source resolves in, which a
+# copy shares; `deepcopy` itself refuses a module.
+for T in (RKPPLModel, RKPPLSubmodel)
+    @eval Base.deepcopy_internal(x::$T, stackdict::IdDict) =
+        ReactiveKernels._deepcopy_code_fields(x, stackdict)
+end
+
 """True for the submodel-definition head `sm(args...) = begin ... end`."""
 _is_submodel_def(body) =
     Meta.isexpr(body, :(=), 2) && Meta.isexpr(first(body.args), :call)

@@ -62,11 +62,10 @@ end
 end
 
 @testset "a deep copy shares the modules an authored source holds" begin
-    # ReactiveKernelsPPL rebuilds a resolved binding among a law's arguments as
-    # `Core.GlobalRef(<module>, :name)` so that the printed source replays: the
-    # recipe's authored source holds the module itself, which `deepcopy`
-    # refuses. Per-chain copies of prepared kernels deep-copy them (snag
-    # `prepared-query-h-b7bd890a`).
+    # Source that interpolates a module, such as
+    # `Core.GlobalRef(<module>, :name)`: the recipe's authored source holds the
+    # module itself, which `deepcopy` refuses. Per-chain copies of prepared
+    # kernels deep-copy them (snag `prepared-query-h-b7bd890a`).
     holds(x) = x isa Module || (x isa Expr && any(holds, x.args)) ||
         (x isa QuoteNode && holds(x.value))
     mod = Module(gensym(:ExecutionSource))
