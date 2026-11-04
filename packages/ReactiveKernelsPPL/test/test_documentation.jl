@@ -216,11 +216,12 @@ end
         ["Initial scoped state.", "Scoped state transition."]
 end
 
+_doc_center(v) = sum(v) / length(v)
 @testset "documentation does not keep unused frozen inputs live" begin
     m = @rkppl begin
         "An unused data definition."
-        unused = sum(x_fit)
-        center = sum(x_fit) / length(x_fit)
+        unused = _doc_center(x_fit)
+        center = _doc_center(x_fit)
         a ~ Normal(0, 1)
         mu = a .+ x .- center
         y .~ Normal.(mu, 1)
