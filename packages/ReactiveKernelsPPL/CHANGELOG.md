@@ -16,6 +16,21 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.82
+
+- Strict cell queries and cell factors read one element of a computed matrix at
+  the cell's row, through ReactiveKernels 0.1.73: a producer plate's
+  `signal[p] = exp(a[p]) .* paths[p] .+ b[p, 2]` with `b = z * F` reads only row
+  `p` of `z`. Its footprint is that row's coordinates and the coordinates of `F`.
+- `prepare_cell_factors(...; partitioned)` computes an array-valued producer
+  plate's cell at the selected row, so a term's local footprint is that
+  trajectory's coordinates. 0.1.79 refused such a cell, and from 0.1.80 it
+  prepared with the producer's input read whole in every term.
+- **Breaking:** under `locality = :error`, a matrix with no row form read as
+  `M[p, 2]` is now refused by name, as `v[p]` of such a value already was
+  (ReactiveKernels 0.1.73 says what to change).
+- Requires ReactiveKernels 0.1.73.
+
 ## 0.1.81
 
 - Every object of a model whose caller-owned law takes an argument with a

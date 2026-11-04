@@ -8,7 +8,8 @@
 # plate. A cell whose batched element is an integer vector `r` reads the rows
 # `log_w[r]`, and a cell that reads its rows through a shared index array,
 # `log_w[rows[k]]` (`rows` read whole or through `vec`), reads `rows[k]`: one
-# row or several. A cell may read it through several batched elements (the
+# row or several. A matrix read as `M[i, :]` or `M[i, 2]` is read at those rows
+# too. A cell may read it through several batched elements (the
 # outputs of one `@plate for` loop compose into the cell, each over a domain of
 # its own): it reads the rows of each. When that array's producer computes it
 # row by row, the native lowering runs the producer's own operation on those
@@ -746,6 +747,8 @@ function _cell_form(r::Recipe; outlined::Bool = false)
         roles[1] = :factor
         return _CellForm(:product, roles, zeros(Int, n), Int[], n == 2 ? 2 : 0)
     end
+    # The column of a scalar read: row `r` of `A[:, j...]` is `A[r, j...]`.
+    r.op isa _CellColumnRead && return _CellForm(:columns, [:leaf], [0], [1], 0)
     if (r.op === Base.transpose || r.op === Base.adjoint) && length(r.inputs) == 1
         # A bare exact call `transpose(w)` likewise keeps Base's function as its
         # operation: one row of a vector, read whole (a matrix is refused by
@@ -1605,8 +1608,9 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid;
 end
 
 # Whether `ex` reads the names `captured` only as `v[q]` or `v[w[q]]`, with `q`
-# and `w` names, or as `v[q, :]` / `v[w[q], :]` with every later index the
-# whole axis `:` (a row of a matrix); each such `q`, or `w[q]`, is recorded.
+# and `w` names, or as `v[q, j...]` / `v[w[q], j...]` with every later index the
+# whole axis `:` (a row of a matrix) or a literal position (an element of that
+# row); each such `q`, or `w[q]`, is recorded.
 function _cell_capture_reads!(reads, ex, captured, mod; tails = nothing)
     ex isa Symbol && return !(ex in captured)
     ex isa Expr || return true
@@ -1617,8 +1621,7 @@ function _cell_capture_reads!(reads, ex, captured, mod; tails = nothing)
         name(x) = x isa Symbol && !(x in captured)
         name(index) || Meta.isexpr(index, :ref, 2) && all(name, index.args) ||
             return false
-        all(arg -> _cell_colon(arg, mod) || tails !== nothing && arg isa Int,
-            ex.args[3:end]) || return false
+        all(arg -> _cell_colon(arg, mod) || arg isa Int, ex.args[3:end]) || return false
         push!(reads, index)
         tails === nothing || push!(tails, Any[_cell_colon(arg, mod) ? Colon() : arg
                                              for arg in ex.args[3:end]])
@@ -2233,25 +2236,43 @@ function _cell_expand_selected(p::Plan, blocked, types)
     _partial_subplan(template, p.have, p.want, recipes)
 end
 
-# A scalar vector index, proven from operand types. Inspect the resolved
-# getindex binding as for row forms; a shadowed function is not indexing.
+# A scalar index, proven from operand types: `v[i]` of a vector, or `A[i, j...]`
+# with every later index a literal position and one index per axis of `A`.
+# Inspect the resolved getindex binding as for row forms; a shadowed function
+# is not indexing.
 function _cell_scalar_index(native, params, mod, inputs, type_of)
-    if Meta.isexpr(native, :call, 3) &&
+    if Meta.isexpr(native, :call) && length(native.args) >= 3 &&
        !_native_callee_shadowed(native.args[1], params) &&
        _cell_binding(native.args[1], mod) === Base.getindex
         native = Expr(:ref, native.args[2:end]...)
     end
-    Meta.isexpr(native, :ref, 2) && native.args[1] in params || return nothing
+    Meta.isexpr(native, :ref) && length(native.args) >= 2 && native.args[1] in params ||
+        return nothing
+    tail = native.args[3:end]
+    all(j -> j isa Int, tail) || return nothing
     a = inputs[findfirst(==(native.args[1]), params)]
     index = native.args[2]
     position = findfirst(==(index), params)
     i = position === nothing ? nothing : inputs[position]
     A = type_of(a)
     I = i === nothing ? typeof(index) : type_of(i)
-    A isa Type && A <: AbstractVector && I isa Type && I <: Integer && !(I <: Bool) ||
-        return nothing
-    (; array = a, index = i === nothing ? index : i, type = I)
+    A isa Type && A <: AbstractArray{<:Any,1 + length(tail)} &&
+        I isa Type && I <: Integer && !(I <: Bool) || return nothing
+    (; array = a, index = i === nothing ? index : i, type = I, tail = Tuple{Vararg{Int}}(tail))
 end
+
+"""
+    _CellColumnRead(tail)
+
+The operation `A -> A[:, tail...]` of a scalar read `A[i, tail...]`: row `i` of
+this column is that element, so the read's identity cell (`_cell_index_op`)
+computes `A` at row `i` when `A` has a row form. It is an operation rather than
+a source so that cell lowering introduces the column without an authored one.
+"""
+struct _CellColumnRead{J<:Tuple{Vararg{Int}}}
+    tail::J
+end
+@inline (c::_CellColumnRead)(A) = A[:, c.tail...]
 
 # An ordinary identity cell evaluates exactly one vector element. The same
 # operation serves scalar reads and individual terms of a cell factor.
@@ -2261,6 +2282,52 @@ function _cell_index_op(locality)
     scalar = prepare(inner; have = (x,), want = (x,))
     plate = _AuthoredPlateOp{typeof(scalar),()}(scalar)
     _AuthoredPlateCellOp(plate, locality)
+end
+
+# The scalar reads at strict positions of a recipe with no split boundaries, with
+# that recipe recompiled over them. Binding data emits a maximal live node of a
+# cell's body as one closure (`_partial_emit_split!`): `exp(a[p])` beside a hoisted
+# `paths[p]`. Inference through it on an abstract `a` finds no number, and it would
+# read `a` whole. `read_of(ex)` proves one read, or returns `nothing`. Returns
+# `(; reads, inputs, op, source)`, with `reads` as `expression => read` in the
+# order `op` takes them after `inputs`, or `nothing`.
+function _cell_part_reads(r::Recipe, params, mod, read_of)
+    op = r.op
+    op isa _KernelSourceOp && kernel_sourceop_form(op) === :fused && mod isa Module ||
+        return nothing
+    record = getfield(op, :f)
+    record isa _KernelSource && _source_native(record) === nothing &&
+        isempty(_source_captures(record)) || return nothing
+    r.source isa Expr || return nothing
+    body = _lane_strip_lines(r.source)
+    body isa Expr || return nothing
+    reads = Pair{Any,Any}[]
+    function visit(ex)
+        ex isa Expr || return
+        read = read_of(ex)
+        if read === nothing
+            foreach(visit, _kernel_split_children(ex))
+        else
+            push!(reads, ex => read)
+        end
+    end
+    visit(body)
+    isempty(reads) && return nothing
+    spelled = _kernel_collect_symbols!(Set{Symbol}(params), body)
+    # One argument per distinct read: `a[p]` read twice is one element.
+    distinct = unique(first.(reads))
+    names = Symbol[Symbol("__rk_read_", k) for k in eachindex(distinct)]
+    any(n -> n in spelled, names) && return nothing
+    mapping = IdDict{Any,Any}(ex => names[findfirst(isequal(ex), distinct)] for (ex, _) in reads)
+    source = _kernel_split_replace(body, mapping)
+    used = _kernel_collect_symbols!(Set{Symbol}(), source)
+    kept = Int[j for j in eachindex(params) if params[j] in used]
+    operation = _gather_map_op(kernel_sourceop_token(op), :_reads,
+        vcat(params[kept], names), source, mod)
+    operation === nothing && return nothing
+    (; reads = Pair{Any,Any}[ex => last(reads[findfirst(q -> isequal(first(q), ex), reads)])
+                             for ex in distinct],
+       inputs = r.inputs[kept], op = operation, source)
 end
 
 # Expose indexed scalar subexpressions along the strict split boundaries
@@ -2315,26 +2382,53 @@ function _cell_scalar_reads(p::Plan; argument_types = nothing)
     next_id = minimum((r.id for r in q.recipes); init = 0) - 1
     recipes = Recipe[]
     changed = !isempty(outlined)
+    # The identity cell of one read, its output `output`. The original cells
+    # still enforce their locality over the complete cone; implementation cells
+    # add no independent warning policy.
+    function read_cell!(read, id, output, cost, source)
+        stem = only(output).name
+        i = read.index
+        if !(i isa Value)
+            i = value!(g, Symbol(stem, :_index), read.type)
+            push!(recipes, Recipe(next_id, (), (i,), _BoundConstant(read.index),
+                                  0.0, nothing, false, read.index))
+            next_id -= 1
+        end
+        array = read.array
+        if !isempty(read.tail)
+            array = value!(g, Symbol(stem, :_column), Any)
+            push!(recipes, Recipe(next_id, (read.array,), (array,),
+                                  _CellColumnRead(read.tail), cost, nothing, false, nothing))
+            next_id -= 1
+        end
+        push!(recipes, Recipe(id, (i, array), output, _cell_index_op(:ignore),
+                              cost, nothing, false, source))
+    end
     for r in q.recipes
         analyzed = length(r.outputs) == 1 && !r.effectful ?
             _cell_native(r; outlined = r.id in outlined) : nothing
         read = analyzed === nothing ? nothing :
             scalar_read(analyzed..., r.inputs, type_of)
-        if read === nothing
+        if read !== nothing
+            read_cell!(read, r.id, r.outputs, r.cost, r.source)
+            changed = true
+            continue
+        end
+        parts = analyzed === nothing ? nothing : _cell_part_reads(r, analyzed[2], analyzed[3],
+            ex -> scalar_read(ex, analyzed[2], analyzed[3], r.inputs, type_of))
+        if parts === nothing
             push!(recipes, r)
             continue
         end
-        i = read.index
-        if !(i isa Value)
-            i = value!(g, Symbol(only(r.outputs).name, :_index), read.type)
-            push!(recipes, Recipe(next_id, (), (i,), _BoundConstant(read.index),
-                                  0.0, nothing, false, read.index))
+        values = Value[]
+        for (k, (ex, part)) in enumerate(parts.reads)
+            value = value!(g, Symbol(only(r.outputs).name, :_read, k), Any)
+            read_cell!(part, next_id, (value,), r.cost, ex)
             next_id -= 1
+            push!(values, value)
         end
-        # The original cells still enforce their locality over the complete
-        # cone; implementation cells add no independent warning policy.
-        push!(recipes, Recipe(r.id, (i, read.array), r.outputs, _cell_index_op(:ignore),
-                              r.cost, nothing, false, r.source))
+        push!(recipes, Recipe(r.id, (parts.inputs..., values...), r.outputs, parts.op,
+                              r.cost, nothing, false, parts.source))
         changed = true
     end
     changed || return p, outlined
@@ -2799,7 +2893,13 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
                 at = _cell_operand_row!(e, canon_id(d.graph, r.inputs[k].id), U)
                 via == 0 || (at = Expr(:call, _cell_ref(:_cell_via_rows),
                     e.names[canon_id(d.graph, r.inputs[via].id)], at))
-                _footprint_record!(icid, role === :gather ? :gathered_rows : :gathered, at)
+                if role === :gather
+                    _footprint_record!(icid, :gathered_rows, at)
+                elseif r.op isa _AuthoredPlateOp
+                    _footprint_record_capture!(d, icid, at)
+                else
+                    _footprint_record!(icid, :gathered, at)
+                end
             end
             push!(args, e.names[icid])
         elseif role === :row

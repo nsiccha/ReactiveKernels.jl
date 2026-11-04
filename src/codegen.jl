@@ -4456,7 +4456,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
             cid in d.pushed && continue
             if haskey(positions, position)
                 for (batched, via) in positions[position]
-                    _footprint_record!(cid, :gathered, _cell_capture_element(slices[batched],
+                    _footprint_record_capture!(d, cid, _cell_capture_element(slices[batched],
                         via == 0 ? nothing : slices[via]; rows = partition))
                 end
             else

@@ -16,6 +16,29 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.73
+
+- A cell reads one element of a computed matrix at its row. `b[q, 2]` in a plate
+  body, with `q` the element of a batched integer argument and every later index
+  a literal position or `:`, now computes `b` at the rows `q` selects when `b`
+  has a row form, as `v[q]` and `M[q, :]` already did. So does a top-level
+  literal read such as `b[1, 2]`. `b = z * F` then reads only those rows of `z`,
+  in strict cell queries and in cell factors, whose flattened bodies used to
+  refuse this read.
+- A scalar read keeps its row demand when binding data splits its expression.
+  Binding hoists `paths[p]` out of `exp(a[p]) .* paths[p]` and leaves `exp(a[p])`
+  as one closure, which read `a` whole. A cell factor prepared with `partitioned`
+  refused it as a value of unknown type before ReactiveKernelsPPL 0.1.80, and
+  computed `a` whole in every term from that release until this one.
+- A footprint of a matrix port read as `X[q, :]` or `X[q, 2]` in a cell reports
+  the positions of those rows. It used to report the rows' indices as linear
+  positions, which missed the later columns.
+- **Breaking:** under `locality = :error`, a matrix with no row form read this
+  way is now refused by name, as `v[q]` of such a value already was. It used to
+  count as read whole legitimately, and every cell computed it whole. Give it a
+  row form, compute it from shared coordinates only and declare the others
+  `partitioned`, or pass `locality = :warn`.
+
 ## 0.1.72
 
 - Equal plate cells also share a value computed by a plate that reads data

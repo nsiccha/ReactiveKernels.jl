@@ -1074,8 +1074,9 @@ only when its producer computes it row by row. So is one the cell reads at
 several rows: `v[r]` with `r` an integer-vector element of a batched argument,
 or `v[rows[k]]` through a shared index array `rows` (one integer vector per
 cell, as a total over a group of rows reads them), and a matrix the cell
-reads a row of, `M[i, :]` (every later index the whole axis `:`), computed at
-that row. A capture whose index is not provably an integer position or a
+reads a row or one element of a row of, `M[i, :]` or `M[i, 2]` (every later
+index the whole axis `:` or a literal position), computed at that row. A
+capture whose index is not provably an integer position or a
 vector of them (an undeclared, unbound port) is read whole, and the locality
 report names it (`:untyped_index`). These capture reads can also occur inside
 a scan in the cell: unchanged shared arguments retain their outer cell
@@ -1376,6 +1377,13 @@ plates when the input already satisfies the declaration. Guarded
 Conversions that can change values remain in the graph. Follow the reported
 reduction order, including repeated authored sums; each summand retains its
 own footprint and the outer density retains its direct reads and guards.
+
+Factoring flattens a plate body, which leaves its scalar reads as ordinary
+recipes. A read `a[p]` of a vector, or `b[p, 2]` of a matrix with literal later
+indices, keeps its row demand as an identity cell: over `a` itself, or over the
+column `b[:, 2]`. So `b = z * F` read that way computes only row `p`, reading
+`p`'s row of `z` and `F` whole. A top-level literal read such as `b[1, 2]` takes
+the same route.
 
 Array-valued predictors shared with another observation in the same authored
 cell retain their individual dependencies when the cell is factored. A term
