@@ -1970,6 +1970,7 @@ function _ranged_response_stmts(r, plan, stmts)
             end
         end
         r.thresholds isa ThresholdRows && push!(rows, r.thresholds.name)
+        r.mixture_weights isa MixtureWeightRows && push!(rows, r.mixture_weights.name)
         for (i, value) in enumerate(sort!(collect(rows)))
             value === r.response && continue
             _selected_cell_value(plan, r, value) && continue
@@ -2274,6 +2275,7 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     logw_lit = w isa Vector ? log.(w) : nothing
     lwv = nothing
     logw_comp = nothing
+    weight_guard = nothing
     if w isa Symbol
         logp = _logp_name(r.label)
         push!(pre, :($logp::AbstractVector{Float64} = log.($w)))
@@ -2290,11 +2292,20 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
             :($logq::Float64 = log1p(-$(w.param))))
         pv, qv = _thread_ref!(inputs, logp), _thread_ref!(inputs, logq)
         logw_comp = w.param_first ? (pv, qv) : (qv, pv)
+    elseif w isa MixtureWeightRows
+        weights = _thread_ref!(inputs, w.name)
+        # Each cell reads its own authored vector. Check its support before
+        # taking any logarithm, including when a live expression is invalid.
+        weight_guard = :($weights isa AbstractVector{<:Real} &&
+            length($weights) == $K && all(isfinite, $weights) &&
+            all(>=(0), $weights) && isapprox(sum($weights), 1.0; atol = 1e-8))
+        logw_comp = [:(log($weights[$k])) for k in 1:K]
     end
     terms = Expr[]
     distributions = Any[]
     logweights = Any[]
     parameter_guards = Any[]
+    weight_guard === nothing || push!(parameter_guards, weight_guard)
     for k in 1:K
         klab = Symbol(r.label, :_mix, k)
         locref, is_lp = _mixture_loc_ref(r, plan, k)

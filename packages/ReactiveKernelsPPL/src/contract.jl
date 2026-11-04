@@ -233,6 +233,12 @@ struct MixtureComplementWeights
     param_first::Bool
 end
 
+# An ordinary broadcast operand holding one probability vector per cell.
+# A Symbol in mixture_weights continues to mean one shared simplex.
+struct MixtureWeightRows
+    name::Symbol
+end
+
 # A broadcast argument containing one data vector per observation. A Symbol
 # in LikelihoodSpec.thresholds instead denotes one shared threshold vector.
 struct ThresholdRows
@@ -375,7 +381,8 @@ their defaults:
 - `mixture_weights`: the length-K mixing weights: a literal
   `Vector{Float64}` (finite, nonnegative, sums to 1), a
   shared bound numeric vector, a `:simplex_dirichlet` [`VectorParameter`](@ref) name, or a
-  [`MixtureComplementWeights`](@ref) pair (K == 2), `nothing`
+  [`MixtureComplementWeights`](@ref) pair (K == 2), or `MixtureWeightRows`
+  naming an ordinary value with one probability vector per observation; `nothing`
   otherwise.
 - `mixture_trials`: one trial-count column or literal per Binomial component
   when their arguments differ. Empty when `trials` supplies the shared argument.
@@ -440,7 +447,7 @@ struct LikelihoodSpec
     mixture_family::Union{Nothing,LikelihoodFamily}
     mixture_locs::Vector{Union{Symbol,Real}}
     mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}}
-    mixture_weights::Union{Nothing,Symbol,Vector{Float64},MixtureComplementWeights}
+    mixture_weights::Union{Nothing,Symbol,Vector{Float64},MixtureComplementWeights,MixtureWeightRows}
     mixture_trials::Vector{Union{ColumnRef,Int}}
     nu::Union{Nothing,ParamName,Real,ScalePredictorRef}
     zi::Union{Nothing,ParamName,Real,ScalePredictorRef}
@@ -491,7 +498,7 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         mixture_locs::Vector{Union{Symbol,Real}} = Union{Symbol,Real}[],
         mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}} =
             Union{Nothing,Symbol,Real,ScalePredictorRef}[],
-        mixture_weights::Union{Nothing,Symbol,Vector{Float64},MixtureComplementWeights} = nothing,
+        mixture_weights::Union{Nothing,Symbol,Vector{Float64},MixtureComplementWeights,MixtureWeightRows} = nothing,
         mixture_trials::Vector{Union{ColumnRef,Int}} = Union{ColumnRef,Int}[],
         nu::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
         zi::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
@@ -5990,6 +5997,9 @@ function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
             "complement-pair mixture weights take exactly 2 components " *
             "(got $K)")
         _validate_mixture_complement_support(r, plan)
+    elseif w isa MixtureWeightRows
+        !isbound(plan) || w.name in _all_name_set(plan) || haskey(plan.columns, w.name) || _fail(r.label,
+            "mixture weights reference undeclared value $(w.name)")
     else
         _validate_mixture_weights(r, w, K)
     end
@@ -6322,6 +6332,13 @@ function _validate_response_data(r::LikelihoodSpec, plan::StructuralPlan)
         w = r.mixture_weights
         haskey(plan.columns, w) || _fail(r.label, "mixture weights $w are not bound")
         _validate_mixture_weights(r, plan.columns[w], length(r.mixture_locs))
+    elseif r.family === MixtureFam && r.mixture_weights isa MixtureWeightRows
+        w = r.mixture_weights.name
+        if haskey(plan.columns, w)
+            for row in plan.columns[w]
+                _validate_mixture_weights(r, row, length(r.mixture_locs))
+            end
+        end
     end
     _validate_mi_data(r, plan)
     _validate_response_column(r, plan)
@@ -7819,7 +7836,8 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
             end
         elseif f === :responses
             for r in plan.responses
-                _drop_held_names!(free, r.family === MixtureFam ?
+                _drop_held_names!(free, r.family === MixtureFam &&
+                    !(r.mixture_weights isa MixtureWeightRows) ?
                     _with(r; mixture_weights = nothing) : _observation_fields(r))
             end
         elseif f === :matrices
