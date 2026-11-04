@@ -1623,7 +1623,9 @@ the selected cell, and its ordinary Reverse gradient costs no full predictor
 allocation. Value-dependent conditions and the vector-flattening arm retain
 their existing locality limits.
 When the queried observations read one shared cell (two outputs of one loop),
-each observation's cell runs that shared cell at the same index. An output of
+their cells run that shared cell once, at that index, and a partition of them
+(`prepare_partition(built, plan, (:y, :z); by)`) runs it once per cell of the
+label, as the whole density does (RK 0.1.75). An output of
 an earlier `@plate for` loop that the observation reads at its own index
 (`pred[i]`) is computed at that index too, whatever law observes it: a
 `Normal` observation and a caller-owned law such as

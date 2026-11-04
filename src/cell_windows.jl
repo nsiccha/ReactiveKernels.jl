@@ -2552,6 +2552,44 @@ function _cell_scalar_reads(p::Plan; argument_types = nothing)
     _partial_subplan(template, q.have, q.want, recipes), outlined
 end
 
+# The plates several cells read that fusion left for the cell lowering
+# (`_shared_cell_producer`, codegen.jl) but that the pushdowns `cells` do not
+# compute at rows: each is composed into its cells after all, as before, and
+# `again` analyzes the composed plan. `(p, cells)` when there is none.
+function _cell_compose_unpushed(again, p::Plan, cells)
+    cells === nothing && return p, cells
+    unpushed = _cell_shared_producers(p, cells.pushed)
+    isempty(unpushed) && return p, cells
+    composed = _fuse_authored_plate_chains(p; cells_only = true, compose_shared = unpushed)
+    composed === p ? (p, cells) : again(composed)
+end
+
+# `p` with every plate read only by several cells composed into those cells.
+function _cell_compose_shared(p::Plan)
+    shared = _cell_shared_producers(p, ())
+    isempty(shared) ? p :
+        _fuse_authored_plate_chains(p; cells_only = true, compose_shared = shared)
+end
+
+# The outputs of the plates read only by several cells, other than `pushed`.
+function _cell_shared_producers(p::Plan, pushed)
+    g = p.graph
+    boundary = Set(canon_id(g, v.id) for v in vcat(p.have, p.want))
+    readers = Dict{ValueId,Vector{Recipe}}()
+    for r in p.recipes, cid in unique(canon_id(g, v.id) for v in r.inputs)
+        push!(get!(readers, cid, Recipe[]), r)
+    end
+    shared = Set{ValueId}()
+    for r in p.recipes
+        r.op isa _AuthoredPlateOp && length(r.outputs) == 1 || continue
+        cid = canon_id(g, only(r.outputs).id)
+        (cid in boundary || cid in pushed) && continue
+        rs = get(readers, cid, Recipe[])
+        length(rs) >= 2 && all(q -> q.op isa _AuthoredPlateCellOp, rs) && push!(shared, cid)
+    end
+    shared
+end
+
 """
     _cell_outlined_pushdowns(p::Plan) -> (plan, pushdowns)
 
@@ -2599,7 +2637,9 @@ function _cell_outlined_pushdowns(p::Plan; argument_types = nothing)
         end
         new = Int[id for id in blocked if !haskey(kept, id) && !(id in refused) &&
                   candidate(id) !== nothing]
-        isempty(new) && return q, cells
+        isempty(new) && return _cell_compose_unpushed(q, cells) do composed
+            _cell_outlined_pushdowns(composed; argument_types)
+        end
         foreach(id -> kept[id] = candidates[id], new)
     end
 end

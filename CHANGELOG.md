@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.75
+
+- Cells that read one shared plate compute it once. A partition over several
+  plates (`plate_partition`), or several `plate_cell`s at one position, that
+  read the same plate at their cells (an `@plate for` cell observed twice)
+  now compute that plate, and every value computed at rows, once at the union
+  of the rows they read, as the whole kernel computes it once per cell.
+  Earlier versions copied the shared plate into each reading cell and gave
+  each cell its own row computations, so one unit's partition over two
+  observations ran the shared cell body twice. A shared plate whose rows
+  cannot be computed this way is still copied into each cell, so locality is
+  unchanged.
+
 ## 0.1.74
 
 - A dotted expression whose operand is a number computed from literals and named

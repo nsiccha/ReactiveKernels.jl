@@ -244,9 +244,10 @@ end
     @test _PCO_DATA[] == prepared
 end
 
-# One cell of the observations a shared cell feeds runs that cell at its index
-# only: each observation's cell composes the shared plate, as it composed each
-# output's plate before (`plate_cell`).
+# One cell of the observations a shared cell feeds runs that cell once, at its
+# index only: the observations' cells compute the shared plate together at the
+# index they read (`plate_cell`), not once per observation (snag
+# `partition-over-s-c28c8326`).
 @testset "a cell query of a shared @plate cell runs it at that index" begin
     for kind in (:arrays_two_outputs, :cell_observations)
         fx = _pco_fixture(kind, 9)
@@ -255,9 +256,7 @@ end
         for i in (1, 5, 9)
             _PCO_LIVE[] = 0
             value = q(fx.u, i)
-            # The selected argument now composes into the observation cell
-            # after its range spelling is normalized (d612f24c).
-            @test _PCO_LIVE[] == 2
+            @test _PCO_LIVE[] == 1
             @test value ≈ sum(pointwise.y1[i]) + sum(pointwise.y2[i]) rtol = 1e-12
         end
         sampler = prepare_cell_sampler(fx.built, fx.bound, (:y1, :y2), fx.u;
@@ -266,6 +265,35 @@ end
             value, gradient = cell_value_and_gradient!(sampler, similar(fx.u), fx.u, i)
             @test value ≈ q(fx.u, i) rtol = 1e-12
             @test gradient ≈ _pco_fd(u -> q(u, i), fx.u) rtol = 1e-6 atol = 1e-8
+        end
+    end
+end
+
+# A partition of the observations a shared cell feeds (one unit's cells of
+# both) runs the shared cell once per cell of the unit, as the whole density
+# does, not once per observation (snag `partition-over-s-c28c8326`).
+@testset "a partition of a shared @plate cell's observations runs it once per cell" begin
+    for kind in (:arrays_two_outputs, :cell_observations)
+        fx = _pco_fixture(kind, 9)
+        g = fx.data[:g]
+        q = prepare_partition(fx.built, fx.bound, (:y1, :y2); by = :g)
+        pointwise = Base.invokelatest(prepare_query(fx.built, fx.bound, :pointwise), fx.u)
+        for label in partition_labels(q)
+            rows = findall(==(label), g)
+            _PCO_LIVE[] = 0
+            value = q(fx.u, label)
+            @test _PCO_LIVE[] == length(rows)
+            @test value ≈ sum(sum(pointwise.y1[i]) + sum(pointwise.y2[i]) for i in rows) rtol = 1e-12
+        end
+        sampler = prepare_partition_sampler(fx.built, fx.bound, (:y1, :y2), fx.u; by = :g,
+            backend = AutoEnzyme(; mode = Enzyme.Reverse), compact = false)
+        for label in (1, 3)
+            gradient = similar(fx.u)
+            _PCO_LIVE[] = 0
+            value, _ = partition_value_and_gradient!(sampler, gradient, fx.u, label)
+            @test _PCO_LIVE[] == count(==(label), g)
+            @test value ≈ q(fx.u, label) rtol = 1e-12
+            @test gradient ≈ _pco_fd(u -> q(u, label), fx.u) rtol = 1e-6 atol = 1e-8
         end
     end
 end

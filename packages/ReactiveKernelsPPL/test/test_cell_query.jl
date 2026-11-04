@@ -380,8 +380,8 @@ _cq_scaled(w, rate) = (_CQ_CALLS[] += 1; w * exp(rate))
             (one_observation(:(eachindex(y1))), (:y1,), 1, y1_density),
             (one_observation(:(axes(y1, 1))), (:y1,), 1, y1_density),
             (two_observations, (:y1,), 1, y1_density),
-            # Each observation's argument has its own plate: one call each.
-            (two_observations, (:y1, :y2), 2, i -> y1_density(i) + y2_density(i)))
+            # Both observations read one value of the cell: one call.
+            (two_observations, (:y1, :y2), 1, i -> y1_density(i) + y2_density(i)))
         bound, built = _cq_bound(ast, data, (:y1, :y2))
         pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
         q = prepare_cell_query(built, bound, observations)

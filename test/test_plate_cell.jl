@@ -195,10 +195,12 @@ end
     x, y, z, s = data(9)
     dy, dz = full(x, y, z, s)
     @test all(k(x, y, z, s, i) == (dy[i], dz[i]) for i in eachindex(x))
-    # Each cell runs the location at its position: not the whole plate.
+    # The cells run the location once, at their position: not the whole
+    # plate, and not once per cell (snag `partition-over-s-c28c8326`).
     _CELL_FORK_CALLS[] = 0
     k(x, y, z, s, 4)
-    @test _CELL_FORK_CALLS[] == 2
+    @test _CELL_FORK_CALLS[] == 1
+    @test length(findall("_cell_fork_exp", string(k.ast))) == 1
     allocated(args...) = (k(args..., 3); @allocated k(args..., 3))
     small, large = allocated(data(10)...), allocated(data(100_000)...)
     @test large == small
@@ -208,14 +210,14 @@ end
     total(x, y, z, s)
     @test _CELL_FORK_CALLS[] == length(x)
     # Distinct index ports retain independent positions without materializing
-    # their shared location plate.
+    # their shared location plate: it runs at each distinct position read.
     separate = plate_cell(plate_cell(_cell_fork, :dy; index = :i), :dz; index = :j)
     selected = prepare(separate; have = (:x, :y, :z, :s, :i, :j),
         want = (:dy_cell, :dz_cell))
     for (i, j) in ((1, 1), (2, 7), (9, 3))
         _CELL_FORK_CALLS[] = 0
         @test selected(x, y, z, s, i, j) == (dy[i], dz[j])
-        @test _CELL_FORK_CALLS[] == 2
+        @test _CELL_FORK_CALLS[] == (i == j ? 1 : 2)
     end
 end
 
