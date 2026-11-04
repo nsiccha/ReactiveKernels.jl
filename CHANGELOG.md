@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.70
+
+- Per-position helpers gain row forms for more shapes. A matrix is a position
+  argument over its first axis (`x[g, d]`, with `axes(x, 1)` or
+  `1:size(x, 1)`); a `zeros`/`ones` result may be read and written at its own
+  row any number of times; a prologue may compute values from arguments passed
+  whole (`L * reshape(z, k, :)`); and each arm of a branch may write the row, as
+  long as every path writes it exactly once. `vec(x)` of a value with rows reads
+  only the rows of `x` its positions lie in.
+- A helper's row may hand a whole array to a closure it builds or to a helper
+  with one applicable method, when that code only indexes it
+  (`sum(w[t] * cs[ix[t]] for t in eachindex(ix))`). A row that reduces or
+  iterates the array stays without a row form.
+- A `view(A, lo:hi)` of an input that one reader reads whole and another at rows
+  counts as an input, since it builds no elements. `A[lo:hi]` copies and stays a
+  strict-locality violation.
+- A cell's outlining also uses the strict split boundaries when the ordinary ones
+  hold nothing, so `sd .* (z .- total / n)` has a row form on the cell-query path.
+
 ## 0.1.69
 
 - **Breaking:** `plate_partition` refuses a key whose length differs from its

@@ -16,6 +16,27 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.80
+
+- Strict cell factors now know which values are numbers, as `prepare_cell_query`
+  already did: `prepare_cell_factor_query`, `prepare_cell_factor_ad`, compact
+  cell derivatives and local footprints prepare from the packed point (`u0`, or
+  zeros). A centred pool's `sum(z)` and a readout's scalar arguments no longer
+  refuse. Query calls with other argument types cache a specialization, so a
+  recording vector is still passed through without copying.
+- **Breaking:** without a shared prefix, direct calls to a `CellFactorQuery`'s
+  `q.kernel` and its full footprint kernel need the exact prepared types
+  (`Vector{Float64}`, `Int` positions, a `Vector{Float64}` of sums). Call `q(...)`
+  instead, or `partition_footprint_kernel(q; shared = false)`.
+- A value now known to be a number has no rows, so what it reads is read whole by
+  each cell and appears in that cell's footprint, where it used to be refused.
+  Values and derivatives are right; a caller screening cell width sees the cost.
+- An outer factor with no reductions differentiates one active vector. Callers
+  keep the `(sums, coordinates)` shape for directions and results. Forward over
+  reverse now works on such a factor, and large cells no longer raise
+  `EnzymeRuntimeActivityError` on the unused sum operand under reverse over forward.
+- Requires ReactiveKernels 0.1.70.
+
 ## 0.1.79
 
 - `prepare_partition` and `prepare_partition_sampler` accept a key as its labels,
