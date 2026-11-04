@@ -2335,8 +2335,17 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         logw_k = logw_lit === nothing ?
             (logw_comp === nothing ? :($lwv[$k]) : logw_comp[k]) :
             logw_lit[k]
-        push!(terms, :($logw_k + $lpdf))
         r.evidence.kind === :none || push!(distributions, _evidence_endpoint(lpdf))
+        if !isempty(r.mixture_components)
+            # A graph call must be a statement of its own: burying it in
+            # the log-sum expression hides its independent recipes from
+            # plate scheduling. Keep these statements inside the support
+            # guard below, including their argument bindings.
+            density = gensym(:_ppl_component_density)
+            push!(component_statements, :($density = $lpdf))
+            lpdf = density
+        end
+        push!(terms, :($logw_k + $lpdf))
         push!(logweights, logw_k)
     end
     cell = foldl((a, b) -> :(logaddexp($a, $b)), terms)
@@ -2358,6 +2367,10 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     cell = _wrap_evidence!(r, plan, pre, inputs, cell;
         cdf=b -> tail(b, false), ccdf=b -> tail(b, true),
         logcdf=b -> tail(b, false, true), logccdf=b -> tail(b, true, true))
+    if !isempty(component_statements)
+        cell = Expr(:block, component_statements...,
+            (cell isa Vector ? cell : Expr[cell])...)
+    end
     if !isempty(parameter_guards)
         valid = foldl((a, b) -> :($a && $b), parameter_guards)
         shared = r.weights === nothing && r.range === nothing && r.mi_jobs === nothing ?
@@ -2375,9 +2388,7 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         wv = _thread_ref!(inputs, r.weights)
         cell = _weighted_cell(wv, cell)
     end
-    body = isempty(component_statements) ? cell :
-        Expr[component_statements...; (cell isa Vector ? cell : Expr[cell])...]
-    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, body)...]
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 function _mixture_graph_component_call(component, inputs, y)
