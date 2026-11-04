@@ -1211,6 +1211,46 @@ mutable struct _PartitionPlanRef{T}
 end
 @inline _partition_plan_value(plan) = plan
 @inline _partition_plan_value(plan::_PartitionPlanRef) = getfield(plan, :plan)
+
+# A planned body is one function to LLVM and Enzyme unless something keeps its
+# statements apart, and their slowest passes are superlinear per function: the
+# frozen Atlas's first gradient spent all of about 5 h in Enzyme on one
+# `CreatePrimalAndGradient` (snag `frozen-atlas-fir-2d4269a6`). So a statement of the
+# body with an array operand calls through this `@noinline` wrapper, which compiles
+# once per signature and which LLVM cannot inline back, as a call-site annotation
+# allows it to. Identical operations then share one compiled function. First-gradient
+# CPU on a synthetic partition went from 216 to 67 s at 64 blocks and from 899 to 199 s
+# at 128. Warm gradients were about 15% slower at 8 blocks and no slower at 32 or more.
+# Scalar statements stay inline (`_partition_statement_call`), and so do plate loops:
+# moving them into separate functions in one module made compile time worse.
+@noinline _partition_array_call(f::F, args::Vararg{Any,N}) where {F,N} = f(args...)
+@inline @generated function _partition_statement_call(f, args::Vararg{Any,N}) where {N}
+    array = any(T -> T <: Union{AbstractArray,Base.Broadcast.Broadcasted}, args)
+    array ? :(_partition_array_call(f, args...)) : :(f(args...))
+end
+_partition_has_loop(@nospecialize(x)) =
+    x isa Expr && (x.head in (:for, :while) || any(_partition_has_loop, x.args))
+_partition_keeps_inline(@nospecialize(f)) = f === :tuple || f === :getfield ||
+    f === :(===) || f === :typeof || (f isa GlobalRef && f.mod === Core) ||
+    (f isa Expr && f.head === :. && f.args[1] === :Core)
+function _partition_separate_call(@nospecialize(x))
+    x isa Expr || return x
+    x.head === :let && return Expr(:let, x.args[1], _partition_separate_call(x.args[2]))
+    x.head === :block && return Expr(:block, map(_partition_separate_call, x.args)...)
+    statement = GlobalRef(@__MODULE__, :_partition_statement_call)
+    if x.head === :ref && !any(a -> a === :end, x.args)
+        return Expr(:call, statement, GlobalRef(Base, :getindex), x.args...)
+    elseif x.head === :call && !_partition_keeps_inline(x.args[1]) &&
+           !any(a -> a isa Expr && a.head in (:parameters, :kw, :..., :(=)), x.args[2:end])
+        return Expr(:call, statement, x.args...)
+    end
+    x
+end
+function _partition_separate_statement(@nospecialize(s))
+    s isa Expr && !_partition_has_loop(s) || return s
+    s.head === :(=) && return Expr(:(=), s.args[1], _partition_separate_call(s.args[2]))
+    s.head in (:call, :let, :block) ? _partition_separate_call(s) : s
+end
 # `_PLAN_MODE` / `_plan_mode()` (graphops.jl): set while `partition_plan_kernel(spec; …)`
 # prepares; the lowering then emits the plan body instead of the partition's.
 
@@ -1660,7 +1700,7 @@ function _partition_plan_lowering(p::Plan, body::Expr, argexprs, runtime_ops, nm
         push!(reads, Expr(:(=), name, Expr(:call, GlobalRef(Core, :getfield), _PLAN_ARG,
                                              QuoteNode(field))))
     end
-    Expr(:block, reads..., main...)
+    Expr(:block, reads..., map(_partition_separate_statement, main)...)
 end
 
 _partition_plan_label(label, tables::Tuple) =
