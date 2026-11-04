@@ -3935,13 +3935,22 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         end
     end
     # `types`: this kernel's operations are already in the table there.
-    (; op_offset, scan_offsets, plate_type_exprs, nested, lane_arms) =
-        types === nothing ? task_local_storage(_SCHEDULED_PREFIX_LOWERING, false) do
-            _plate_cell_types!(runtime_ops, runtime_recipes,
+    if types === nothing
+        # A do-block here specializes its closure on the inner kernel, even
+        # though this lowering does not specialize on it. Rebinding would then
+        # compile another closure for a newly bound inner kernel.
+        scheduled = get(task_local_storage(), _SCHEDULED_PREFIX_LOWERING, false)
+        scheduled && task_local_storage(_SCHEDULED_PREFIX_LOWERING, false)
+        try
+            types = _plate_cell_types!(runtime_ops, runtime_recipes,
                 inner_kernel, atomic, callargs, callvalues, raw_arguments,
                 input_type_hints;
                 result_slot = _plate_stores_cells(pointwise_lhs, into, cells))
-        end : types
+        finally
+            scheduled && task_local_storage(_SCHEDULED_PREFIX_LOWERING, true)
+        end
+    end
+    (; op_offset, scan_offsets, plate_type_exprs, nested, lane_arms) = types
     inferred_eltype = nested === nothing ?
         get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
             GlobalRef(Core, :Any)) : nested.type
