@@ -16,6 +16,19 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.90
+
+- Native `MixtureModel` also accepts computed shared probability vectors
+  through `Ref`, including `Ref([1 - w, w])` for a derived logistic scalar,
+  named vectors, and general-K expressions. These values retain their
+  authored priors and whole-vector input axes. Existing literal, simplex
+  and bounded sampled-complement validation remains. Computed data-only
+  vectors are validated at binding; general live vectors are checked for
+  finite, nonnegative, normalized probabilities before logs.
+- Regression coverage checks normalized density, ordinary Enzyme Reverse,
+  pointwise likelihood, full printed-source replay, zero probabilities,
+  changed shared data, support, type stability and bounded emitted size.
+
 ## 0.1.89
 
 - Export `parameter_metadata(built/layout)` to inspect stored constrained

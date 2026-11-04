@@ -551,6 +551,10 @@ generated values to sampler coordinates.
   live probabilities give `-Inf` before any logarithm is evaluated.
   The same form supports more than two components. Requires
   ReactiveKernelsPPL 0.1.87; `Ref(w)` still shares one vector.
+  From ReactiveKernelsPPL 0.1.90, `Ref` also accepts computed shared vectors:
+  `a ~ Normal(0, 1); w = logistic(a)` can feed `Ref([1 - w, w])`, or a
+  named vector. The authored prior remains; the same probability checks
+  apply to shared expressions, including vectors with more than two entries.
   Equal component log densities retain their ordinary reverse derivatives,
   including all-zero initialization. The scalar and dotted `logaddexp`
   built-ins likewise have partial derivatives `(1/2, 1/2)` at finite ties

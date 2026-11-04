@@ -48,16 +48,16 @@ _mixc_posterior(kern, lay, q::NamedTuple) =
     rr = only(rplan.responses)
     @test rr.mixture_weights == MixtureComplementWeights(:theta, false)
 
-    # Non-complement sampled vectors stay fail-closed.
-    # refused: [a, b] from independent Betas does not sum to 1 (probabilities not summing to 1)
-    @test_throws SurfaceLoweringError lower_rkppl(Meta.parse("""begin
+    # General computed vectors use the ordinary value graph. Their live
+    # simplex support is checked by the likelihood (test_mixture_weight_rows).
+    @test lower_rkppl(Meta.parse("""begin
         mu1 ~ Normal(0.0, 2.0)
         mu2 ~ Normal(0.0, 2.0)
         sigma ~ Exponential(1.0)
         a ~ Beta(2.0, 2.0)
         b ~ Beta(2.0, 2.0)
         y .~ MixtureModel.(vcat.(Normal.(mu1, sigma), Normal.(mu2, sigma)), Ref([a, b]))
-    end"""), (:y,); conditioned = (:y,))
+    end"""), (:y,); conditioned = (:y,)) isa StructuralPlan
 
     # Non-unit params fail at contract.
     # refused: [s, 1 - s] with s ~ Exponential gives a negative weight (support mismatch)

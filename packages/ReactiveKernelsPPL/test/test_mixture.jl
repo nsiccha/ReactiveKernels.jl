@@ -393,7 +393,12 @@ end
     capabilities = Set(["heterogeneous links, same base", "probit outside v1", "boolean weights", "bare predictor"])
     for (label, prog, E) in cases
         @testset "$label" begin
-            if label in supported || label in ("heterogeneous links, same base", "probit outside v1", "bare predictor")
+            if label in ("non-literal weights element", "empty weights")
+                # Computed shared vectors are ordinary value expressions;
+                # their data-only probability domain is checked at binding.
+                plan = lower_rkppl(prog, (:y,); conditioned = (:y,))
+                @test_throws ContractValidationError bind_data(plan, (; y = [0.1]))
+            elseif label in supported || label in ("heterogeneous links, same base", "probit outside v1", "bare predictor")
                 # Density and gradient oracles: test_response_combinations.jl.
                 @test lower_rkppl(prog, (:y, :x, :n1, :n2, :wt);
                     conditioned = (:y, :x, :n1, :n2, :wt)) isa StructuralPlan
