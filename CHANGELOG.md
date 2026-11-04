@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.76
+
+- Internal support for ReactiveKernelsPPL 0.1.84's handling of a sum whose
+  summands read another sum (`_cell_factor_nesting`, `_cell_factor_sum_cell!`,
+  `_CellFactorSumRead`). No public API changes.
+
 ## 0.1.75
 
 - Cells that read one shared plate compute it once. A partition over several

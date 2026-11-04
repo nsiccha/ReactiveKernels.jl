@@ -1405,6 +1405,27 @@ column `b[:, 2]`. So `b = z * F` read that way computes only row `p`, reading
 `p`'s row of `z` and `F` whole. A top-level literal read such as `b[1, 2]` takes
 the same route.
 
+A sum whose summands read another sum is not a factor of its own. In
+
+```julia
+dose = sum(amount[events[i]] .* exp.(e[events[i]]))
+loc = 0.01 * dose .* exp.(eta[obs[i]])
+y[i] .~ Normal.(loc, sigma)
+```
+
+the density total is a sum over `obs[i]` whose summands read `dose`. Only `dose`
+is a reduction. The total stays in the outer factor, which reads `dose` from its
+sum vector as one number. As a factor of its own, each of the total's terms would
+recompute `dose`, so a cell's terms would cost the product of the two lengths, and
+each would read all of `dose`'s coordinates. The outer factor computes the total
+at its own rows, as a term does: `eta[obs[i]]` computes those rows of `eta`, and
+the cell's `locality` applies to what it reads. A sum between two others, read by
+a total and reading a reduction, is refused in the outer factor, because the total
+asks for it at rows and its type is not known to be a number. Other reductions
+over a gather, such as `prod(exp.(eta[rows[k]]))`, stay in the outer factor as
+authored. They read `eta` whole, and `locality` does not report it; the cell query
+reads only those rows.
+
 Array-valued predictors shared with another observation in the same authored
 cell retain their individual dependencies when the cell is factored. A term
 may select an existing ragged input and read only its requested position;

@@ -420,6 +420,62 @@ function _cell_factor_rows(spec::KernelSpec, argument::Value; bound = NamedTuple
     walk(argument)
 end
 
+# Whether `value` or anything its producers read, transitively, is in `others`.
+function _cell_factor_reads(spec::KernelSpec, value::Value, others)
+    g = spec.graph
+    seen = Set{ValueId}()
+    stack = ValueId[canon_id(g, value.id)]
+    while !isempty(stack)
+        id = pop!(stack)
+        id in seen && continue
+        push!(seen, id)
+        id in others && return true
+        for k in producers_of(g, id), v in g.recipes[k].inputs
+            push!(stack, canon_id(g, v.id))
+        end
+    end
+    false
+end
+
+# A sum whose summands read another sum (`dose = sum(...)`, then a density total
+# over `dose .* f.(t)`) is not a separate factor. As one, each of its terms would
+# recompute the inner sum, so a cell's terms would cost the product of the two
+# lengths and each would read all of the inner sum's coordinates. It stays in the
+# outer factor instead, where the inner sum is one input: `(innermost, enclosing)`.
+function _cell_factor_nesting(spec::KernelSpec, sums)
+    g = spec.graph
+    values = Set(canon_id(g, s.value.id) for s in sums)
+    enclosing(s) = _cell_factor_reads(spec, s.argument,
+                                      setdiff(values, (canon_id(g, s.value.id),)))
+    filter(!enclosing, sums), filter(enclosing, sums)
+end
+
+# One sum read from the outer factor's sum vector. The port holds `Float64`s, so
+# the read is a number to the row analysis (`0.01 * dose .* f.(t)` has no rows to
+# ask `dose` for), which inference cannot see through an abstract vector's `getindex`.
+struct _CellFactorSumRead
+    position::Int
+end
+(r::_CellFactorSumRead)(sums::AbstractVector{Float64}) = sums[r.position]::Float64
+
+_cell_factor_positions(rows) = collect(eachindex(rows))
+
+# Compute a sum left in the outer factor over its own rows, as a partition of the
+# identity cell over its operand, so the locality rule covers its reads and a
+# gather in it computes its source at those rows, as a summand does. A partition
+# holds the sum of its cells, so the value is the authored sum.
+function _cell_factor_sum_cell!(spec::KernelSpec, s, locality)
+    g = spec.graph
+    # An internal value: authored sums can share a name, and no port reads it.
+    positions = value!(g, Symbol(:_rk_factor_positions_, canon_id(g, s.value.id)), Vector{Int})
+    add!(g, (s.positions,) => positions, _cell_factor_positions)
+    index = _cell_index_op(locality)
+    _add_recipe!(g, (positions, s.argument), (s.value,),
+        _AuthoredPlateCellOp(index.plate, locality, true), 1.0, nothing, false,
+        Expr(:call, :sum, s.argument.name))
+    nothing
+end
+
 # Make one term an ordinary identity cell over the reduction's operand. Row
 # demand then propagates through its elementwise recipes and gathers.
 function _cell_factor_term!(spec::KernelSpec, argument::Value, index::Value, locality)
