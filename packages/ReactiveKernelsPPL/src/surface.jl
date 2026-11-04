@@ -3052,9 +3052,15 @@ function _map_rhs_arguments(f, ex, head = nothing, position = 0, nargs = 0)
     # A mixture's component constructors are sampling syntax even when the
     # caller owns their bindings. Visit their arguments without hoisting the
     # distribution object itself into an opaque model value.
-    if head === :vcat && _is_dotted_call(ex)
-        return Expr(:., ex.args[1], Expr(:tuple,
-            _map_rhs_positions(f, ex.args[2].args, _rhs_head_symbol(ex.args[1]))...))
+    if head === :MixtureModel && position == 1 &&
+            _is_dotted_call(ex) && ex.args[1] === :vcat
+        components = map(ex.args[2].args) do component
+            _is_dotted_call(component) || return f(component, :vcat, 0, 0)
+            Expr(:., component.args[1], Expr(:tuple,
+                _map_rhs_positions(f, component.args[2].args,
+                    _rhs_head_symbol(component.args[1]))...))
+        end
+        return Expr(:., :vcat, Expr(:tuple, components...))
     end
     if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
             _rhs_spelling_head(ex.args[1], false)
@@ -8200,6 +8206,7 @@ function _lower_graph_mixture_response(lhs, components, wraw, range, weights,
                 observed=true, broadcast=true)
         else
             call = Expr(:call, head, component.args[2].args...)
+            _plain_args(call, string(head))
             (;rhs=call, geometry=nothing, broadcast=true, constructor_broadcast=true)
         end
         builtin === nothing && _external_graph_density(args) === nothing &&
