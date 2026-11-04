@@ -35,12 +35,14 @@ end
 ReactiveKernelsPPL.sampling_distribution_graph(::Type{CountedLaw}, args::Tuple) = counted_score
 
 function fixture(n; kind=:builtin, shared=false, weights=[0.8,0.2], scale=0.7,
-        rowweights=false)
+        rowweights=false, sharedweights=:none)
     x = [0.2sin(i) for i in 1:n]
     y = [0.4cos(i) for i in 1:n]
-    data = rowweights ? (;x,y,scale) : (;x,y,scale,weights)
+    data = rowweights || sharedweights === :parameter ? (;x,y,scale) : (;x,y,scale,weights)
     weight_expression = rowweights ?
-        :(vcat.(1 .- logistic.(b .+ x), logistic.(b .+ x))) : :(Ref(weights))
+        :(vcat.(1 .- logistic.(b .+ x), logistic.(b .+ x))) :
+        sharedweights === :parameter ? :(Ref([1-logistic(b), logistic(b)])) :
+        sharedweights === :data ? :(Ref(weights ./ sum(weights))) : :(Ref(weights))
     location = shared ? :a : :(a .+ b .* curved)
     other = kind === :builtin ? :(Cauchy.(mu, exp(s))) :
         kind === :student ? :(D.TDist.(exp(s))) :
@@ -57,7 +59,7 @@ function fixture(n; kind=:builtin, shared=false, weights=[0.8,0.2], scale=0.7,
     plan = lower_rkppl(ast,data;mod=@__MODULE__,conditioned=(:y,))
     bound = bind_data(plan,data)
     built = build_kernel(bound)
-    (;data,plan,bound,built,u=[0.2,-0.3,-0.1],kind,shared,rowweights)
+    (;data,plan,bound,built,u=[0.2,-0.3,-0.1],kind,shared,rowweights,sharedweights)
 end
 function oracle(fx,u)
     a,b,s = u
@@ -68,8 +70,11 @@ function oracle(fx,u)
             fx.kind === :custom ? D.Normal(mu+sin(b),sqrt(exp(2s)+0.3^2)) :
             D.Normal(mu,exp(s))
         # An independent probability sum suffices for these moderate toy values.
-        w = fx.rowweights ? inv(1+exp(-b-fx.data.x[i])) : fx.data.weights[2]
-        first_weight = fx.rowweights ? 1-w : fx.data.weights[1]
+        w = fx.rowweights ? inv(1+exp(-b-fx.data.x[i])) :
+            fx.sharedweights === :parameter ? inv(1+exp(-b)) :
+            fx.sharedweights === :data ? fx.data.weights[2]/sum(fx.data.weights) :
+            fx.data.weights[2]
+        first_weight = fx.rowweights || fx.sharedweights !== :none ? 1-w : fx.data.weights[1]
         log(first_weight*D.pdf(D.Normal(mu,fx.data.scale),fx.data.y[i]) +
             w*D.pdf(law,fx.data.y[i]))
     end
@@ -140,6 +145,15 @@ end
     end
     for kind in (:builtin,:custom)
         check(fixture(5;kind,rowweights=true);reverse=true)
+        check(fixture(5;kind,sharedweights=:parameter);reverse=true)
+        fx = check(fixture(5;kind,sharedweights=:data,weights=[2.0,3.0]);reverse=true)
+        changed = merge(fx.data,(;weights=[4.0,1.0]))
+        rebound = bind_data(fx.plan,changed)
+        check(merge(fx,(;data=changed,bound=rebound,built=build_kernel(rebound))))
+        for weights in ([1.0], [1.0,2.0,3.0], [0.0,0.0], [2.0,-1.0])
+            @test_throws ReactiveKernelsPPL.ContractValidationError bind_data(
+                fx.plan,merge(fx.data,(;weights)))
+        end
     end
     small,large = fixture(3;kind=:custom),fixture(19;kind=:custom)
     @test recipe_count(small.built.spec) == recipe_count(large.built.spec)
