@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.86
+
+- Host transforms synchronize their lazy bijector caches. Concurrent
+  `constrain` calls can share a completed, read-only layout, including on first
+  use. Caller-owned geometry and bound functions must also support concurrent
+  calls. Draw restoration shapes and selective graph queries are unchanged.
+
 ## 0.1.85
 
 - A data-only definition that computes a sparse array stays sparse when bound

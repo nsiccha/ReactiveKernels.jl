@@ -6,6 +6,7 @@ using Test
 const _PPL_TEST_FILES = (
     "test_changelog.jl",
     "test_parse_hygiene.jl",
+    "test_host_draw_queries.jl",
     "test_contract.jl",
     "test_layout.jl",
     "test_host_transform_numbers.jl",
