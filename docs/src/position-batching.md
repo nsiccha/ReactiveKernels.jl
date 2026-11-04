@@ -186,19 +186,52 @@ result object. A population whose subjects share one regimen and one
 observation grid therefore computes one design per call instead of one per
 subject, and keeps one copy of it for the position loop.
 
-An argument that varies across cells is compared by value (`hash`, then
-`isequal`). An argument every cell reads as the same object is compared by
-identity: a closure or `Ref` operand, or the result of an earlier shared call,
-which equal cells already share.
+A plate that reads data alone does the same, whether its value is computed in
+a cell that also reads a position or in a plate of its own:
 
-Some calls still run in every cell, because they cost about what their key
-costs:
+```julia
+designs = plate(obs_time, assay) do t, a
+    subject_design(t, a)        # once per distinct (t, a) and call
+end
+locs = plate(designs, eta) do design, e
+    design.grid .* exp(e)       # reads the design without hashing it
+end
+```
+
+Such a plate is rewritten only when a cell calls a function of a package or of
+the authoring module, or reads a value equal cells already share. A cell of
+Base arithmetic (`2 .* t`) keeps its plate's own loop and any vectorized form of
+it. A plate the caller receives also stays as it is: it keeps one array per
+cell, which the caller may write.
+
+Cells compare a call's arguments by identity first, which costs the same whatever
+their size, so a later cell holding the same objects hashes nothing. When the
+objects are new, an argument that varies across cells is compared by value
+(`hash`, then `isequal`), at most once per distinct object. That is what shares
+equal values in different objects: each subject's rows of a data column are
+different indices, so equal subjects hold equal values in fresh objects.
+
+Some arguments are compared by identity alone:
+- a closure or `Ref` operand, which is one object in every cell;
+- in an expression of Base's functions, a value equal cells usually hold as one
+  object, since such an expression costs about what its key costs. That is the
+  result of an earlier shared call, in this plate or another, a field read of such
+  a value, or the cell of an earlier data-only plate whose cells are such values.
+  A call of a package's function compares these by value when their objects are
+  new, so it still shares when equal cells hold different objects.
+
+Some calls still run in every cell, because they cost no more than their key:
 - a call of numbers alone (an index, a gathered scalar);
-- Base's and Core's own functions (indexing, arithmetic, concatenation).
+- a field read `x.name` bound to its own name, whose key would hash the whole
+  record to save a load. A later call of that name keys the field, not the
+  record. A field read inside a larger expression, such as `design(x.t)`, is part
+  of that call, whose key is still the whole record;
+- in a moved plate value, Base's and Core's own functions (indexing, arithmetic,
+  concatenation) when an argument would be compared by value.
 
 ReactiveKernels' structural operations (nested plates, scans, derivative
-rules) also stay per cell. Where cells differ, sharing costs one `hash` of
-each call's per-cell arguments.
+rules) also stay per cell. Where cells differ, sharing costs one `hash` of each
+new object compared by value, per call.
 
 Values are unchanged. Equal cells' values are one read-only object, which only
 `===` can tell apart. The table of a call's shared values is made by that call

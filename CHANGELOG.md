@@ -16,6 +16,37 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.72
+
+- Equal plate cells also share a value computed by a plate that reads data
+  alone, in a position-batched reader's prefix and in `bound=` preparation. A
+  design in a plate of its own ran once per cell, kept one copy per cell, and a
+  plate reading it hashed the whole design for every cell. It now runs once per
+  distinct input and keeps one copy. The plate's cell values are one object per
+  equal group, as a moved cell value's already are. A plate the caller receives
+  keeps one array per cell, and a plate of Base arithmetic keeps its loop.
+- A shared call compares its arguments by identity first, then by value when
+  their objects are new, so it hashes each distinct object at most once however
+  many cells hold it. A call of a package's function now also shares equal values
+  in different objects. Each subject's rows of a data column are different indices,
+  so equal subjects hold equal values in fresh objects: such a call ran once per
+  subject and now runs once per distinct input. An expression of Base's functions
+  over a value equal cells usually hold as one object still compares by identity
+  alone.
+- A field read `x.name` bound to its own name in a plate cell no longer keys the
+  whole record.
+
+## 0.1.71
+
+- A code finding of the type-stability check now names where its statement was
+  written: under the statement, one `at name @ file:line` line per frame,
+  innermost first, including the functions it was inlined from and the macro
+  expansions between them. The warning and `TypeInstabilityError` print the same
+  text. Before, an instability in a helper inlined into the prepared program was
+  reported as "the prepared program's entry call" with only an SSA index and the
+  statement. The warning's once-per-process key now includes the location, so
+  the same statement written elsewhere warns again.
+
 ## 0.1.70
 
 - Per-position helpers gain row forms for more shapes. A matrix is a position

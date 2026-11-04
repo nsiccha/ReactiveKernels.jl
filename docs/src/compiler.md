@@ -444,8 +444,30 @@ differentiates. How far the check reaches is `type_stability_level`:
 | level | checks |
 |---|---|
 | `:values` | every value of the program: a recipe whose inputs are concretely typed but whose result Julia does not infer concretely (`Any`, an abstract type, a `Union`, or an array of such elements) is reported, naming the value and its recipe. Values computed from such a value, or from a HAVE port whose type is not known, are not reported again. |
-| `:rk` | also the code of the prepared program: the body ReactiveKernels generates and the functions of ReactiveKernels' packages it calls. A used value Julia does not infer concretely, or a call dispatched at run time, is reported with its method. Every other function is a leaf: its call must dispatch statically and return a concrete type. |
+| `:rk` | also the code of the prepared program: the body ReactiveKernels generates and the functions of ReactiveKernels' packages it calls. A used value Julia does not infer concretely, or a call dispatched at run time, is reported with its method and its source. Every other function is a leaf: its call must dispatch statically and return a concrete type. |
 | `:all` (default) | also every function that code calls, a client helper's body included, except Julia's own Base, Core and standard libraries, which stay leaves. |
+
+The source of a code finding is one `at name @ file:line` line per frame,
+innermost first: the function the statement was written in, each function that
+was inlined into, and the macro expansions between them. So a helper inlined
+into the prepared program is named even though the finding's method is then the
+program's entry call:
+
+```
+ReactiveKernels: The prepared program's entry call is not type stable:
+  - %29 is a call dispatched at run time: `Core._apply_iterate(Base.iterate, Base.getindex, (Float64,), %25)`
+      at harmonics @ /path/to/client.jl:4
+      at macro expansion @ /path/to/RuntimeGeneratedFunctions.jl:243
+      at macro expansion @ none:0
+      at generated_callfunc @ none:0
+      at macro expansion @ none:0
+      at _prepared_call @ none:0
+      at PreparedKernel @ /path/to/ReactiveKernels/src/codegen.jl:7226
+```
+
+A frame of the body ReactiveKernels generates has no line, `none:0`. The
+statement is the optimized code's own text, here a splat into the typed array
+literal `Float64[repeat(1:K, 2)...]` that `harmonics` is written with.
 
 So at `:all`, a helper that dispatches at run time but asserts its result
 (`f(x) = (g(x))::Float64` over an uninferred `g`) is reported, and so is a
@@ -557,7 +579,9 @@ cell-varying arguments include an array or a record runs once per distinct
 argument tuple, and the cells with that tuple hold the same result object. The
 call is an authored expression or a function of a package or of the authoring
 module. Bound subjects that share one design compute it once per binding and
-store it once. This uses the same comparison as position batching's
+store it once, whether the design is computed in the cell that reads a live
+value or in a plate of its own that reads bound data alone. This uses the same
+comparison as position batching's
 [shared cell values](position-batching.md).
 
 Binding freezes values for that preparation; changing or mutating the data is
