@@ -49,7 +49,7 @@ jobs:
           clone_pin https://github.com/nsiccha/DynamicObjects.jl.git  872311e13739b0dd6440fd63072718c9957e1ad3 "$DEPS/DynamicObjects.jl"  # kb-impl/DynamicObjects-sbpmx-reflect
           clone_pin https://github.com/nsiccha/HTMX.jl.git            d52ce5be0f42e3c375370c85499ba5c395f781a8 "$DEPS/HTMX.jl"           # dev
           clone_pin https://github.com/nsiccha/HTMXObjects.jl.git     aaffb38fa1e430becd8ba1e9199b55c659d2418c "$DEPS/HTMXObjects.jl"    # devibe
-          clone_pin https://github.com/nsiccha/Treebars.jl.git        e502929e702b5bf6bf92512bde678c152eac320f "$DEPS/Treebars.jl"        # default HEAD
+          clone_pin https://github.com/nsiccha/Treebars.jl.git        44c37e60e22bab9e8a0d3ab88bd47b575dec6bb0 "$DEPS/Treebars.jl"        # main; PPL requires Treebars 0.1.5
           clone_pin https://github.com/nsiccha/BayesianRegressionModels.jl.git 1f296dac2c086347525194887500948edb213228 "$DEPS/BayesianRegressionModels.jl" # ns/devibe; GP/HSGP adoption
           # Supply BRM's unregistered deps and its published StanBlocks API floor.
           clone_pin https://github.com/nsiccha/MutatingFunctions.jl.git 12b953dc4ac494fabca5e145f3470bca468235ff "$DEPS/MutatingFunctions.jl"
