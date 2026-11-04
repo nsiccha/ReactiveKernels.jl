@@ -28,9 +28,10 @@ function _cell_factor_aliases(p::Plan, argument_types)
 end
 
 function _cell_factor_graph(spec::KernelSpec, want; have = spec.have_names,
-                            bound = NamedTuple(), on_error = nothing, locality = nothing)
+                            bound = NamedTuple(), on_error = nothing, locality = nothing,
+                            _data_cache = nothing)
     p = plan(spec; have, want)
-    _cell_factor_graph(p, spec.ports, spec.port_order; bound, on_error, locality)
+    _cell_factor_graph(p, spec.ports, spec.port_order; bound, on_error, locality, _data_cache)
 end
 
 # A shared-prefix cut types its frontier inputs from the producers it removed
@@ -62,7 +63,8 @@ end
 # A shared-prefix cut is an authoritative selected plan. Do not replan from
 # its original graph: that would bring the removed shared producers back.
 function _cell_factor_graph(p::Plan, original_ports, original_order;
-                            bound = NamedTuple(), on_error = nothing, locality = nothing)
+                            bound = NamedTuple(), on_error = nothing, locality = nothing,
+                            _data_cache = nothing)
     p = _cell_factor_typed_inputs(p)
     # Prove aliases with the declared live input types, not dense stand-ins:
     # factor value queries also accept other arrays with those declarations.
@@ -79,10 +81,16 @@ function _cell_factor_graph(p::Plan, original_ports, original_order;
     if !isempty(frontier)
         data_have = Value[v for v in p.have if haskey(known, canon_id(p.graph, v.id))]
         data_plan = _partial_subplan(p, data_have, frontier, prefix)
-        data_kernel = prepare(data_plan; on_error)
-        result = Base.invokelatest(data_kernel,
-            (known[canon_id(p.graph, v.id)] for v in data_have)...)
-        for (v, x) in zip(frontier, _partial_prefix_values(frontier, result))
+        data = Tuple(known[canon_id(p.graph, v.id)] for v in data_have)
+        values = if _data_cache === nothing
+            data_kernel = prepare(data_plan; on_error)
+            _partial_prefix_values(frontier, Base.invokelatest(data_kernel, data...))
+        else
+            effective = _kernel_error_policy(data_plan, on_error)
+            boundary = _partial_boundary(effective, data_have)
+            Base.invokelatest(_data_prefix!, _data_cache, effective, boundary, data)
+        end
+        for (v, x) in zip(frontier, values)
             known[canon_id(p.graph, v.id)] = x
         end
     end

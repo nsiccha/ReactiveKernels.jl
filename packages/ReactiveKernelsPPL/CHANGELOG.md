@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.88
+
+- Each bound plan reuses demanded data-only results across binding, layout,
+  building and query preparation. Whole-value preprocessing used to run again
+  for parameter sizes and each prepared query. New bindings have independent
+  stores, unused expressions remain lazy, and `frozen_values` can read an
+  existing result. Results live with the binding; bound inputs and results
+  remain read-only. Requires ReactiveKernels 0.1.79.
+
 ## 0.1.87
 
 - Native `MixtureModel` responses accept an expression-valued probability

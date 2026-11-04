@@ -53,8 +53,10 @@ function prepare_cell_factors(built, plan::StructuralPlan, observation::Symbol;
         last(only(rule)), exemplar, on_error)
     factor_bound = _query_bound(plan)
     factors = if parts === nothing
-        ReactiveKernels._cell_factor_graph(spec, want;
-            have, bound = factor_bound, on_error, locality)
+        _with_query_data(plan, spec, on_error) do cache
+            ReactiveKernels._cell_factor_graph(spec, want;
+                have, bound = factor_bound, on_error, locality, _data_cache = cache)
+        end
     else
         Base.invokelatest(ReactiveKernels._cell_factor_graph, parts.residual,
             spec.ports, spec.port_order; on_error, locality)
@@ -77,7 +79,7 @@ function prepare_cell_factors(built, plan::StructuralPlan, observation::Symbol;
     rowhave = Tuple(n for n in factors.spec.have_names if n !== :unconstrained &&
                     n ∉ _cell_frontier_names(shared))
     reductions = map(innermost) do s
-        kernel = Base.invokelatest(prepare, factors.spec; have = rowhave,
+        kernel = Base.invokelatest(_prepare_cached, plan, factors.spec; have = rowhave,
             want = s.positions, bound = factor_bound, on_error)
         (; s..., rows = kernel)
     end
@@ -186,11 +188,11 @@ function prepare_cell_factor_query(f::CellFactors, factor)
     bound = _cell_factor_bound(f)
     args = (f.exemplar, (outer ? (zeros(length(f.reductions)), 1) : (1, 1))...,
             _cell_shared_values(f.shared)...)
-    residual = Base.invokelatest(prepare, spec; have, want, bound, on_error = f.on_error,
+    residual = Base.invokelatest(_prepare_cached, f.plan, spec; have, want, bound, on_error = f.on_error,
                                  exemplars = args)
     kernel = if _cell_has_prefix(f.shared)
         full = ReactiveKernels._cell_factor_full_spec(spec, f.shared.prefix_plan)
-        Base.invokelatest(prepare, full; have = (base_have..., tail...), want,
+        Base.invokelatest(_prepare_cached, f.plan, full; have = (base_have..., tail...), want,
                          bound, on_error = f.on_error)
     else
         residual
@@ -275,7 +277,7 @@ function prepare_cell_factor_ad(prepare_operator, f::CellFactors, factor,
     active0 = base0[indices0]
     sums0 = if outer && !isempty(f.reductions)
         query_have = _query_have(f.plan)
-        sumkernel = Base.invokelatest(prepare, f.spec;
+        sumkernel = Base.invokelatest(_prepare_cached, f.plan, f.spec;
             have = (query_have..., _CELL_PORT, _cell_frontier_names(f.shared)...),
             want = Tuple(r.value for r in f.reductions),
             bound = _cell_factor_bound(f), on_error = f.on_error,
@@ -297,7 +299,7 @@ function prepare_cell_factor_ad(prepare_operator, f::CellFactors, factor,
         (:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots,
          _query_columns(f.plan)..., _frozen_graph_names(f.plan)..., _CELL_PORT, :_ppl_cell_term,
          _cell_frontier_names(f.shared)...)
-    kernel = Base.invokelatest(prepare, spec; have, want, bound = _cell_factor_bound(f),
+    kernel = Base.invokelatest(_prepare_cached, f.plan, spec; have, want, bound = _cell_factor_bound(f),
                               on_error = f.on_error, exemplars = (point..., shared_values...))
     active = outer ? (:_ppl_cell_sums, :_ppl_cell_active) : :_ppl_cell_active
     # An outer factor with no reductions differentiates its one active vector.

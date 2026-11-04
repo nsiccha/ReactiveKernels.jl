@@ -659,12 +659,23 @@ Composition exposes the child's execution capabilities. Ordinary native
 Enzyme reverse covers empty and nonempty child scans, including inside a bound
 `eachcol` subject plate.
 
-A data-only call used only by a parameter-dependent function runs once when
-`prepare_query` or `prepare_sampler` prepares the graph. It may return a tuple or
-named tuple containing arrays. Named definitions, aliases and inline
-calls follow the same rule, including beside declared vector or matrix
-parameters. A value also needed during binding, such as a prior argument or an
-array dimension, keeps its bind-time evaluation and validation.
+A data-only call used by a parameter-dependent function runs when first
+needed by a bound plan. Its result is reused by later layout, build and query
+preparations of that binding, including `prepare_query` and `prepare_sampler`.
+It may return a tuple or named tuple containing arrays. Named definitions,
+aliases and inline calls follow this rule, including beside declared vector
+or matrix parameters. A value needed during binding, such as a prior argument
+or array dimension, is evaluated and validated there and reused afterward.
+Unused expressions and lazy branches retain their ordinary demand and error
+behavior. Preparation does not evaluate every data-only definition eagerly.
+
+The binding retains these results for its lifetime. Each `bind_data` call,
+including rebinding an existing bound plan, starts a separate store; it does
+not reuse another binding's results by comparing its input arrays. Bound
+inputs and results remain read-only. `frozen_values` reads already computed
+definitions when available; explicitly freezing still transfers chosen values
+to another binding. Direct core `prepare(spec; bound=...)` calls retain their
+per-preparation behavior.
 
 ## Factor levels
 

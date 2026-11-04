@@ -7619,10 +7619,10 @@ nested ones included, and cached preparations are kept per setting.
 """
 function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
                  exemplars = nothing, type_stability = nothing,
-                 type_stability_level = nothing)
+                 type_stability_level = nothing, _data_cache = nothing)
     _with_type_stability(type_stability, type_stability_level) do
         kernel = _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
-                               exemplars)
+                               exemplars, _data_cache)
         _check_uninferred_values(kernel)
         kernel
     end
@@ -7632,21 +7632,21 @@ end
 # it prepares another (the data-only prefix of a bound preparation): its values
 # feed the checked program as bound data of their runtime types.
 function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing,
-                       exemplars = nothing)
+                       exemplars = nothing, _data_cache = nothing)
     on_error === nothing || return task_local_storage(_INLINE_SOURCES_OFF, true) do
-        _prepare_plan_body(p; passes, bound, on_error, exemplars)
+        _prepare_plan_body(p; passes, bound, on_error, exemplars, _data_cache)
     end
-    _prepare_plan_body(p; passes, bound, on_error, exemplars)
+    _prepare_plan_body(p; passes, bound, on_error, exemplars, _data_cache)
 end
 
 function _prepare_plan_body(p::Plan; passes = (), bound = (), on_error = nothing,
-                            exemplars = nothing)
+                            exemplars = nothing, _data_cache = nothing)
     p = _kernel_error_policy(p, on_error)
     # Compose cell-only producers before the top-level bound split. Other
     # eligible chains compose after that split but before guarded cells are
     # partitioned, so data-only producers can still be cached.
     bound === () || (p = _fuse_authored_plate_chains(p; cells_only = true))
-    p = _partial_apply(p, bound)
+    p = _partial_apply(p, bound; _data_cache)
     exemplar_types = if exemplars === nothing
         nothing
     else
@@ -7686,14 +7686,16 @@ end
 
 function prepare(g::Graph; have = (), want = (), passes = (), bound = (),
                  on_error = nothing, exemplars = nothing, type_stability = nothing,
-                 type_stability_level = nothing)
+                 type_stability_level = nothing, _data_cache = nothing)
     # One type for every selection's width before the closure captures them.
     haves, wants, binding = _value_list(have), _value_list(want), _bound_list(bound)
     _with_type_stability(type_stability, type_stability_level) do
         exemplars === nothing && _reuses_bound_preparation(binding, passes) &&
-            return _graph_bound_preparation(g, haves, wants, passes, binding, on_error)
+            return _graph_bound_preparation(g, haves, wants, passes, binding, on_error;
+                _data_cache)
         p = plan(g; have = haves, want = wants)
-        prepare(p; passes = passes, bound = binding, on_error = on_error, exemplars)
+        prepare(p; passes = passes, bound = binding, on_error = on_error, exemplars,
+            _data_cache)
     end
 end
 

@@ -1009,6 +1009,13 @@ struct CellGeometry
     prior::Symbol
 end
 
+struct _BindingData
+    lock::ReentrantLock
+    values::Dict{Symbol,Any}
+    graphs::IdDict{Any,Any}
+end
+_BindingData() = _BindingData(ReentrantLock(), Dict{Symbol,Any}(), IdDict{Any,Any}())
+
 """
     StructuralPlan(responses, predictors, population_priors, parameters,
                    assignments, derived, columns, n_obs)
@@ -1080,7 +1087,24 @@ struct StructuralPlan
     cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}}
     # Packed array of each joint cell latent => its caller-owned geometry.
     cell_geometries::Dict{Symbol,CellGeometry}
+    # Runtime data, owned by this binding and excluded from structural keys.
+    data_values::Union{Nothing,_BindingData}
 end
+
+# The former all-fields constructor creates an unbound structural plan.
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+    conditioned, indexed_observations, external_observations,
+    cell_broadcasts, named_values, factors, cell_priors, frozen::FrozenValues,
+    cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}},
+    cell_geometries::Dict{Symbol,CellGeometry}) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+        scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+        conditioned, indexed_observations, external_observations,
+        cell_broadcasts, named_values, factors, cell_priors, frozen, cell_latents,
+        cell_geometries, nothing)
 
 # Plans authored before joint cell latents carry none.
 StructuralPlan(responses, predictors, population_priors, parameters,
@@ -1730,7 +1754,7 @@ const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :matrices,
     :array_parameters, :indexed_observations, :external_observations,
     :cell_broadcasts, :named_values, :factors, :cell_priors, :frozen,
-    :cell_latents, :cell_geometries)
+    :cell_latents, :cell_geometries, :data_values)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
@@ -2097,7 +2121,7 @@ function _read_only_by_selection(plan::StructuralPlan, name::Symbol)
     end
     for f in fieldnames(StructuralPlan)
         f in (:columns, :roles, :n_obs, :submodel_scopes, :responses,
-            :indexed_observations, :cell_broadcasts, :frozen) && continue
+            :indexed_observations, :cell_broadcasts, :frozen, :data_values) && continue
         visit(getfield(plan, f))
     end
     for r in plan.responses, f in fieldnames(LikelihoodSpec)
@@ -2874,7 +2898,7 @@ function _uncached_label_only_columns(plan::StructuralPlan)
     end
     for f in fieldnames(StructuralPlan)
         f in (:columns, :roles, :n_obs, :submodel_scopes, :cell_broadcasts,
-            :frozen) && continue
+            :frozen, :data_values) && continue
         visit(getfield(plan, f))
     end
     return setdiff!(labels, numeric)
@@ -7652,7 +7676,7 @@ function _preparation_data_names(plan, nodes, raw, onlydata, names;
     free = Set{Symbol}(keys(nodes))
     for f in fieldnames(StructuralPlan)
         f in (:assignments, :derived, :columns, :submodel_scopes,
-            :cell_broadcasts, :factors, :conditioned, :frozen) && continue
+            :cell_broadcasts, :factors, :conditioned, :frozen, :data_values) && continue
         _drop_held_names!(free, getfield(plan, f))
     end
     # Whole-value classification exempts `axes(M, d)` from observation
@@ -7709,7 +7733,7 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
     unused = Set{Symbol}(raw)
     for f in fieldnames(StructuralPlan)
         f in (:columns, :n_obs, :roles, :submodel_scopes, :cell_broadcasts,
-            :frozen) && continue
+            :frozen, :data_values) && continue
         _drop_held_names!(unused, getfield(plan, f))
     end
     defs = Pair{Symbol,Any}[a.name => a.expr for a in plan.assignments]
@@ -7807,7 +7831,7 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
     named = copy(free)
     for f in fieldnames(StructuralPlan)
         f in (:assignments, :derived, :columns, :n_obs, :roles,
-            :submodel_scopes, :frozen) && continue
+            :submodel_scopes, :frozen, :data_values) && continue
         if f === :parameters
             for p in plan.parameters
                 p.family === :external && p.name in plan.conditioned && continue
@@ -8091,7 +8115,7 @@ function _uncached_bound_value_inputs(plan::StructuralPlan)
     found = Set{Symbol}()
     seen = Base.IdSet{Any}()
     for f in fieldnames(StructuralPlan)
-        f in (:columns, :submodel_scopes, :frozen) && continue
+        f in (:columns, :submodel_scopes, :frozen, :data_values) && continue
         _collect_bound_value_inputs!(found, getfield(plan, f), seen)
     end
     return found
@@ -8178,7 +8202,8 @@ function _materialize_module_data!(plan::StructuralPlan,
     exprs, vector_defs = _definition_exprs(plan)
     # A frozen definition has its value: every definition reading it reads
     # that value, and nothing it reads is evaluated for it.
-    memo = Dict{Symbol,Any}(pairs(frozen))
+    memo = plan.data_values === nothing ? Dict{Symbol,Any}() : plan.data_values.values
+    merge!(memo, pairs(frozen))
     lookup = _definition_lookup(plan, columns, exprs, vector_defs, memo)
     absent = _absent_definition_sources(plan, columns; supplied = keys(frozen))
     for nm in sort!(collect(names))
@@ -8212,6 +8237,7 @@ function _materialize_module_data!(plan::StructuralPlan,
         columns[nm] = v isa _Absent || v isa Array ||
                 ReactiveKernels._cell_sparse_type(typeof(v)) ? v :
             v isa AbstractVector ? collect(v) : v isa AbstractArray ? Array(v) : v
+        memo[nm] = columns[nm]
     end
     return names
 end
@@ -8232,9 +8258,9 @@ _definition_exprs(plan::StructuralPlan) =
 # identical module calls share one evaluation (`(Xf, Zp) = f(x)` reads
 # `f(x)` twice): within one evaluation every name has one value.
 function _definition_lookup(plan::StructuralPlan, columns::AbstractDict, exprs,
-        vector_defs, memo::Dict{Symbol,Any} = Dict{Symbol,Any}())
+        vector_defs, memo::Dict{Symbol,Any} = _definition_memo(plan))
     calls = Dict{Any,Any}()
-    function lookup(nm::Symbol)
+    function read(nm::Symbol)
         haskey(memo, nm) && return memo[nm]
         haskey(columns, nm) && return columns[nm]
         haskey(exprs, nm) || throw(ContractValidationError(
@@ -8248,6 +8274,11 @@ function _definition_lookup(plan::StructuralPlan, columns::AbstractDict, exprs,
         memo[nm] = _eval_value_expr(ex, lookup, nm; calls,
             kernels = spec -> _prepared_kernel(plan, spec))
         return memo[nm]
+    end
+    function lookup(nm::Symbol)
+        plan.data_values !== nothing && memo === plan.data_values.values &&
+            return lock(() -> read(nm), plan.data_values.lock)
+        read(nm)
     end
     return lookup
 end
@@ -8730,7 +8761,8 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     frozen_inputs = _bind_frozen!(plan, columns, frozen)
     # Every step below sizes and evaluates with this binding's record, which
     # `frozen` may supply in place of the plan's own (`bind_data(fit, …; frozen)`).
-    frozen === plan.frozen || (plan = _with(plan; frozen))
+    plan = _with(plan; frozen, data_values = _BindingData())
+    merge!(plan.data_values.values, pairs(frozen.values))
     _absent_observations!(plan, columns)
     _route_conditioned_values!(plan, columns)
     _route_bound_values!(plan, columns)
@@ -9012,7 +9044,9 @@ function _resolve_vector_extent(p::VectorParameter, plan, columns, responses)
             haskey(definitions,name) && name ∉ active || _fail(p.label,
                 "vector $(p.name) length needs data-only value $name")
             push!(active,name)
-            value = _eval_value_expr(resolve_levels(definitions[name]),lookup,p.label)
+            value = _memoized_data(plan, name) do
+                _eval_value_expr(resolve_levels(definitions[name]),lookup,p.label)
+            end
             delete!(active,name)
             return value
         end
