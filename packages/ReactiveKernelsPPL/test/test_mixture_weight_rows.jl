@@ -197,4 +197,89 @@ end
     query = prepare_query(build_kernel(bound), bound, :likelihood)
     @test query([0.3]) == -Inf
 end
+
+@testset "computed shared mixture probability vectors" begin
+    function shared_source(weights)
+        quote
+            a ~ Normal(0, 1)
+            w = 1 / (1 + exp(-a))
+            probabilities = [1 - w, w]
+            y .~ MixtureModel.(vcat.(Normal.(0, 1), Normal.(2, 1)), $weights)
+        end
+    end
+    function oracle(p, d)
+        w = sigmoid(p.a)
+        dist = D.MixtureModel([D.Normal(0, 1), D.Normal(2, 1)], [1 - w, w])
+        normal_prior(p.a) + sum(y -> D.logpdf(dist, y), d.y; init = 0.0)
+    end
+    forms = (:(Ref([1 - w, w])), :(Ref([1 .- w, w])), :(Ref(probabilities)))
+    for n in (0, 1, 7), (j, form) in enumerate(forms)
+        d = (; y = cos.(1:n))
+        result = check(shared_source(form), d, (; a = 0.3), oracle;
+            audit = n == 7 && j == 1)
+        w = sigmoid(0.3)
+        dist = D.MixtureModel([D.Normal(0, 1), D.Normal(2, 1)], [1 - w, w])
+        @test result.pointwise ≈ D.logpdf.(Ref(dist), d.y)
+    end
+    for a in (-50.0, 50.0)
+        check(shared_source(first(forms)), (; y = [-0.3, 0.2, 1.1]), (; a), oracle;
+            replay = false)
+    end
+    # Shared source size does not grow with the observation count.
+    expr_count(x) = x isa Expr ? 1 + sum(expr_count, x.args; init = 0) : 0
+    counts = map((3, 30)) do n
+        bound = bind_data(lower_rkppl(shared_source(first(forms)), (:y,);
+            conditioned = (:y,)), (; y = zeros(n)))
+        expr_count(kernel_expr(bound, assign_layout(bound)))
+    end
+    @test counts[1] == counts[2]
+
+    source = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        p = logistic(a)
+        q = logistic(b)
+        probabilities = [p, (1 - p) * q, (1 - p) * (1 - q)]
+        y .~ MixtureModel.(vcat.(Normal.(0, 1), Normal.(1, 2), Normal.(-2, 0.7)),
+            Ref(probabilities))
+    end
+    function oracle3(p, d)
+        u, v = sigmoid(p.a), sigmoid(p.b)
+        dist = D.MixtureModel([D.Normal(0, 1), D.Normal(1, 2), D.Normal(-2, 0.7)],
+            [u, (1 - u) * v, (1 - u) * (1 - v)])
+        normal_prior(p.a) + normal_prior(p.b) + sum(y -> D.logpdf(dist, y), d.y)
+    end
+    check(source, (; y = [-0.2, 0.4, 1.3, -0.7]), (; a = -0.4, b = 0.6),
+        oracle3; audit = true)
+
+    # Data-only vectors keep their own axis; changing observations does not
+    # change how the shared probability expression is evaluated.
+    data_source = quote
+        a ~ Normal(0, 1)
+        probabilities = mass ./ sum(mass)
+        y .~ MixtureModel.(vcat.(Normal.(a, 1), Normal.(2, 1)), Ref(probabilities))
+    end
+    data_oracle(p, d) = normal_prior(p.a) + sum(y -> D.logpdf(
+        D.MixtureModel([D.Normal(p.a, 1), D.Normal(2, 1)], d.mass ./ sum(d.mass)), y), d.y)
+    for d in ((; y = [-0.2, 0.5, 1.2], mass = [3.0, 7.0]),
+            (; y = [0.4, -0.7, 1.3, 0.2, 0.9], mass = [4.0, 1.0]))
+        check(data_source, d, (; a = 0.3), data_oracle)
+    end
+    for mass in ([1.0], [-1.0, 2.0], [Inf, 1.0], [NaN, 1.0])
+        plan = lower_rkppl(data_source, (:y, :mass); conditioned = (:y,))
+        @test_throws ContractValidationError bind_data(plan, (; y = [0.1, 0.2, 0.3], mass))
+    end
+
+    live = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        y .~ MixtureModel.(vcat.(Normal.(0, 1), Normal.(2, 1)), Ref([a, b]))
+    end
+    bound = bind_data(lower_rkppl(live, (:y,); conditioned = (:y,)), (; y = [0.4]))
+    query = prepare_query(build_kernel(bound), bound, :likelihood)
+    @test isfinite(query([0.3, 0.7]))
+    for point in ([0.3, 0.6], [-0.3, 1.3], [NaN, 0.7], [Inf, 0.7])
+        @test query(point) == -Inf
+    end
+end
 end

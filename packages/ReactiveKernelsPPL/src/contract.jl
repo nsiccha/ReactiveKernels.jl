@@ -239,6 +239,11 @@ struct MixtureWeightRows
     name::Symbol
 end
 
+# A computed probability vector read whole by every observation via Ref.
+struct MixtureWeightValue
+    name::Symbol
+end
+
 # A broadcast argument containing one data vector per observation. A Symbol
 # in LikelihoodSpec.thresholds instead denotes one shared threshold vector.
 struct ThresholdRows
@@ -447,7 +452,7 @@ struct LikelihoodSpec
     mixture_family::Union{Nothing,LikelihoodFamily}
     mixture_locs::Vector{Union{Symbol,Real}}
     mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}}
-    mixture_weights::Union{Nothing,Symbol,Vector{Float64},MixtureComplementWeights,MixtureWeightRows}
+    mixture_weights::Union{Nothing,Symbol,Vector{Float64},MixtureComplementWeights,MixtureWeightRows,MixtureWeightValue}
     mixture_trials::Vector{Union{ColumnRef,Int}}
     nu::Union{Nothing,ParamName,Real,ScalePredictorRef}
     zi::Union{Nothing,ParamName,Real,ScalePredictorRef}
@@ -498,7 +503,7 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         mixture_locs::Vector{Union{Symbol,Real}} = Union{Symbol,Real}[],
         mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}} =
             Union{Nothing,Symbol,Real,ScalePredictorRef}[],
-        mixture_weights::Union{Nothing,Symbol,Vector{Float64},MixtureComplementWeights,MixtureWeightRows} = nothing,
+        mixture_weights::Union{Nothing,Symbol,Vector{Float64},MixtureComplementWeights,MixtureWeightRows,MixtureWeightValue} = nothing,
         mixture_trials::Vector{Union{ColumnRef,Int}} = Union{ColumnRef,Int}[],
         nu::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
         zi::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
@@ -6024,7 +6029,7 @@ function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
             "complement-pair mixture weights take exactly 2 components " *
             "(got $K)")
         _validate_mixture_complement_support(r, plan)
-    elseif w isa MixtureWeightRows
+    elseif w isa Union{MixtureWeightRows,MixtureWeightValue}
         !isbound(plan) || w.name in _all_name_set(plan) || haskey(plan.columns, w.name) || _fail(r.label,
             "mixture weights reference undeclared value $(w.name)")
     else
@@ -6359,6 +6364,13 @@ function _validate_response_data(r::LikelihoodSpec, plan::StructuralPlan)
         w = r.mixture_weights
         haskey(plan.columns, w) || _fail(r.label, "mixture weights $w are not bound")
         _validate_mixture_weights(r, plan.columns[w], length(r.mixture_locs))
+    elseif r.family === MixtureFam && r.mixture_weights isa MixtureWeightValue
+        w = r.mixture_weights.name
+        if _holds_bound_value(plan, plan.columns, w) ||
+                _reads_data_only(plan, w, _all_name_set(plan), Set{Symbol}())
+            value = _bound_data_value(plan, w, r.label, "mixture weights")
+            _validate_mixture_weights(r, value, length(r.mixture_locs))
+        end
     elseif r.family === MixtureFam && r.mixture_weights isa MixtureWeightRows
         w = r.mixture_weights.name
         if haskey(plan.columns, w)
@@ -7807,9 +7819,11 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
         push!(defs, Symbol(:_ppl_scan_input_, s.label) => Expr(:tuple, exprs...))
     end
     for r in plan.responses
-        r.family === MixtureFam && r.mixture_weights isa Symbol || continue
+        r.family === MixtureFam &&
+            r.mixture_weights isa Union{Symbol,MixtureWeightValue} || continue
+        name = r.mixture_weights isa Symbol ? r.mixture_weights : r.mixture_weights.name
         push!(defs, Symbol(:_ppl_weights_input_, r.label) =>
-            Expr(:call, GlobalRef(Base, :identity), r.mixture_weights))
+            Expr(:call, GlobalRef(Base, :identity), name))
     end
     for r in plan.responses
         _is_ordered_family(r.family) && r.thresholds isa Symbol || continue

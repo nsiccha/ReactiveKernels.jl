@@ -2292,10 +2292,11 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
             :($logq::Float64 = log1p(-$(w.param))))
         pv, qv = _thread_ref!(inputs, logp), _thread_ref!(inputs, logq)
         logw_comp = w.param_first ? (pv, qv) : (qv, pv)
-    elseif w isa MixtureWeightRows
-        weights = _thread_ref!(inputs, w.name)
-        # Each cell reads its own authored vector. Check its support before
-        # taking any logarithm, including when a live expression is invalid.
+    elseif w isa Union{MixtureWeightRows,MixtureWeightValue}
+        push!(inputs, w isa MixtureWeightValue ? :(Ref($(w.name))) : w.name)
+        weights = _dovar(length(inputs))
+        # Ref keeps a computed vector whole; an ordinary operand supplies
+        # one vector per cell. Check support before taking any logarithm.
         weight_guard = :($weights isa AbstractVector{<:Real} &&
             length($weights) == $K && all(isfinite, $weights) &&
             all(>=(0), $weights) && isapprox(sum($weights), 1.0; atol = 1e-8))

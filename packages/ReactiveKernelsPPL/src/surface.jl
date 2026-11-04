@@ -1545,7 +1545,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # retained recurrence body. Keep their definition dependencies too.
     needed = copy(declaration_dependencies)
     for r in responses
-        r.mixture_weights isa MixtureWeightRows && push!(needed, r.mixture_weights.name)
+        r.mixture_weights isa Union{MixtureWeightRows,MixtureWeightValue} &&
+            push!(needed, r.mixture_weights.name)
     end
     # A predictor term can read another location as an ordinary column.
     # That definition must survive even when its own response absorbed it
@@ -8074,7 +8075,7 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
     wraw = if length(args) == 1
         Expr(:vect, fill(1.0 / K, K)...)
     elseif _is_ref_call(args[2])
-        args[2].args[2]
+        _lower_shared_mixture_weights(lhs, args[2].args[2], ctx)
     else
         weight_rows = args[2]
         # Broadcasting a flat numeric vector supplies scalar weights to
@@ -8376,11 +8377,29 @@ function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
         "uses the ordinary response value lowering")
 end
 
-# Mixture weights: a literal numeric vector, a simplex parameter name,
-# or a complement pair (length/sum/concentration checked at contract —
-# structural, normative).
+# Ref retains a shared probability vector, either on a dedicated literal,
+# simplex/complement path or as an ordinary computed value.
+function _lower_shared_mixture_weights(lhs, raw, ctx)
+    # Keep the dedicated literal, input/simplex and sampled-complement
+    # paths. Derived values retain their authored graph and prior.
+    raw isa Symbol && !haskey(ctx.detmap, raw) && return raw
+    if raw isa Expr && raw.head === :vect
+        all(x -> x isa Real, raw.args) && return raw
+        if length(raw.args) == 2
+            pair = _mixture_complement_pair(raw.args)
+            pair !== nothing && pair.param in ctx.prior_names && return raw
+        end
+        any(x -> _canon_shape(x, ctx) in (:vector, :array, :matrix), raw.args) &&
+            _sfail("response $lhs: mixture probability-vector entries must be numeric scalars")
+    end
+    value = _lower_argument_value(lhs, :mixture_weights, raw, ctx)
+    value isa Symbol || _sfail("response $lhs: shared mixture weights " *
+        "must be a probability vector, got $(repr(raw))")
+    return MixtureWeightValue(value)
+end
+
 function _lower_mixture_weights(lhs, wraw)
-    wraw isa MixtureWeightRows && return wraw
+    wraw isa Union{MixtureWeightRows,MixtureWeightValue} && return wraw
     wraw isa Symbol && return wraw
     wraw isa Expr && wraw.head === :vect || _sfail("response $lhs: " *
         "mixture weights are a literal vector (`[0.4, 0.6]`), a " *
@@ -8425,7 +8444,7 @@ function _mixture_anchor(lhs, loc_uses, scale_uses, w, prednames, ctx)
     end
     w isa Symbol && return w
     w isa MixtureComplementWeights && return w.param
-    w isa MixtureWeightRows && return w.name
+    w isa Union{MixtureWeightRows,MixtureWeightValue} && return w.name
     for loc in loc_uses
         loc isa Symbol && loc in ctx.prior_names && return loc
     end
