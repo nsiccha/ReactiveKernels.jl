@@ -99,6 +99,12 @@ normal_prior(x) = D.logpdf(D.Normal(), x)
                 [1 - w, w]), data.y[i])
         end for i in eachindex(data.y)]
         @test inline.pointwise ≈ expected
+        if n == 7
+            # Equal component densities still differentiate both locations,
+            # scales and the predictor-dependent probabilities normally.
+            check(source(false), data, merge(p, (; sigma = 1.0, tau = 1.0)),
+                oracle; replay = false)
+        end
     end
     expr_count(x) = x isa Expr ? 1 + sum(expr_count, x.args; init = 0) : 0
     counts = map((3, 30)) do n
