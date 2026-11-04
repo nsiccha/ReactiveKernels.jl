@@ -3,6 +3,8 @@ module ReactiveKernelsPPLSMCExt
 using ReactiveKernelsPPL
 using ReactiveKernels
 using Random
+using Serialization: serialize, deserialize
+using Treebars: with_progress, update_progress!, interrupt_requested
 using LinearAlgebra: Diagonal, logabsdet, ldiv!, dot, norm, qr, mul!
 using SequentialMonteCarlo: SMCModel, SMCIO, smc!
 using WarmupHMC: FixedKernelNUTSState, fixed_kernel_nuts_step
@@ -373,7 +375,9 @@ function PPL.tune_smc(target::AbstractSMCTarget; rng::Xoshiro, init::AbstractVec
         temperatures=(0.0, 1e-6, 1e-5, 1e-4, 1e-3, 0.01, 0.1, 0.5, 1.0),
         pilot_steps::Integer=64, pilot::Symbol=:continuous,
         max_reflections::Integer=16, recording_target::Integer=128,
-        pilot_evaluations::Integer=1000, options=SMCOptions())
+        pilot_evaluations::Integer=1000, options=SMCOptions(),
+        progress=nothing, callback=nothing, checkpoint_dir=nothing,
+        resume=false, overwrite::Bool=false)
     target = _execution_target(target)
     d = _dimension(target)
     length(init) == d || throw(DimensionMismatch("pilot initial position and target dimensions differ"))
@@ -391,20 +395,18 @@ function PPL.tune_smc(target::AbstractSMCTarget; rng::Xoshiro, init::AbstractVec
     scale = options.metric === nothing ? ones(d) : options.metric
     scale isa AbstractVector || throw(ArgumentError("pilot initialization requires diagonal scales"))
     _validate_kernel(_kernel(options, d), d)
-    pilot_rng = copy(rng)
-    reference_work = nothing
-    if reference === :pilot
-        previous === nothing && pilot === :adaptive || throw(ArgumentError(
-            "reference=:pilot requires an initial bridge and pilot=:adaptive"))
-        initial_source = _reference(target, SMCReference(zeros(d), ones(d)))
-        learned = _adaptive_pilot(BridgeTarget(initial_source, target, 1.0, d),
-            pilot_rng, init, scale, pilot_steps, max_reflections, recording_target,
-            pilot_evaluations, options.max_tree_depth; reference_inflation)
-        reference = SMCReference(learned.location, learned.reference_scale)
-        reference_work = learned.work
+    if pilot === :adaptive
+        return _tune_adaptive(target; rng, init, reference, previous,
+            reference_inflation, grid, pilot_steps, max_reflections,
+            recording_target, pilot_evaluations, options, scale,
+            progress, callback, checkpoint_dir, resume, overwrite)
     end
+    (progress === nothing && callback === nothing && checkpoint_dir === nothing &&
+        resume === false && !overwrite) || throw(ArgumentError(
+        "tuning progress, interruption and recovery require pilot=:adaptive"))
+    reference === :pilot && throw(ArgumentError("reference=:pilot requires pilot=:adaptive"))
     reference === nothing || reference isa SMCReference ||
-        throw(ArgumentError("reference must be SMCReference, :pilot, or nothing"))
+        throw(ArgumentError("reference must be SMCReference or nothing for pilot=:continuous"))
     source = if previous === nothing
         _reference(target, reference === nothing ? _default_reference(target) : reference)
     else
@@ -414,27 +416,6 @@ function PPL.tune_smc(target::AbstractSMCTarget; rng::Xoshiro, init::AbstractVec
         _execution_target(previous)
     end
     options = _options(options, d, source, target)
-    if pilot === :adaptive
-        kernels, work = NamedTuple[], NamedTuple[]
-        position = Vector{Float64}(init)
-        for beta in grid
-            learned = _adaptive_pilot(BridgeTarget(source,target,beta,d), pilot_rng,
-                position, scale, pilot_steps, max_reflections, recording_target,
-                pilot_evaluations, options.max_tree_depth)
-            push!(kernels, _validate_kernel((; stepsize=learned.stepsize,
-                metric=learned.scale, moves=options.moves,
-                max_tree_depth=options.max_tree_depth), d))
-            push!(work, learned.work)
-            position = learned.position
-        end
-        return SMCTuningSchedule(deepcopy(_source_id(source)), deepcopy(target.signature),
-            source isa ReferenceTarget ? deepcopy(source.reference) : nothing,
-            grid, kernels, (; initial_rng=copy(rng), final_rng=copy(pilot_rng),
-                init=Vector{Float64}(init), steps=Int(pilot_steps), work,
-                method=pilot, max_reflections=Int(max_reflections),
-                recording_target=Int(recording_target),
-                pilot_evaluations=Int(pilot_evaluations), reference_work))
-    end
     chain = ContinuousNUTSState(copy(rng), BridgeTarget(source, target, first(grid), d);
         init=(; position=Vector{Float64}(init), squared_scale=scale.^2))
     kernels = typeof(_kernel(options, d))[]
@@ -459,14 +440,7 @@ function PPL.tune_smc(target::AbstractSMCTarget; rng::Xoshiro, init::AbstractVec
             init=Vector{Float64}(init), steps=Int(pilot_steps), work, method=pilot))
 end
 
-function _adaptive_pilot(bridge, rng, init, scale, steps, reflections, recording, evaluations, depth;
-        reference_inflation=nothing)
-    seed = rand(rng, UInt64)
-    result = WarmupHMC.adaptive_warmup_mcmc(Xoshiro(seed), bridge;
-        init=(; position=Vector{Float64}(init), squared_scale=scale.^2),
-        n_draws=steps, n_evaluations=evaluations, recording_target=recording,
-        max_reflections=reflections, max_tree_depth=depth,
-        nonlinear_adapt=false, monitor_ess=false)
+function _finish_adaptive_pilot(result, seed; reference_inflation=nothing)
     data = WarmupHMC.scale_data(result.scale_options[result.active_transformation])
     draws = result.posterior_position
     n = size(draws, 2)
@@ -484,6 +458,8 @@ function _adaptive_pilot(bridge, rng, init, scale, steps, reflections, recording
             divergences=Int(result.n_divergent_samples),
             family=result.active_transformation, reference_work...))
 end
+
+include("smc_tuning.jl")
 
 PPL.smc_reference(state::SMCState) =
     state.source isa ReferenceTarget ? deepcopy(state.source.reference) : nothing
