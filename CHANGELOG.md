@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.74
+
+- A dotted expression whose operand is a number computed from literals and named
+  constants, `sigma .* (rho .* sqrt(2pi)) .^ (1 / 2)`, now has a row form, so a
+  strict cell computes it at its rows. A parameter-free call that returns an
+  array keeps no row form.
+- A package can give its own function a row form with
+  `_cell_row_method(::typeof(f)) = (; at, rows, dims)` (the compiler page,
+  "Locality: named, not silent"). ReactiveKernelsPPL 0.1.83 requires it.
+
 ## 0.1.73
 
 - A cell reads one element of a computed matrix at its row. `b[q, 2]` in a plate

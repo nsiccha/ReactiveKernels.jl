@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.83
+
+- Strict cell queries accept a response location whose sum has a summand of
+  unknown shape, and a declared `LKJCholesky` factor read at rows. `mu = .+(r, f)`
+  with `f` a submodel's result is computed at the cell's rows, as is the factor
+  in `b = L * z`, instead of being refused as `PartitionLocalityError` (or
+  computed whole per cell under `locality = :warn`). Values and derivatives are
+  unchanged. A value of neither one entry nor one per row keeps its
+  `DimensionMismatch`, and a reader of the whole factor (`sum(L)`) still keeps
+  it whole. Requires ReactiveKernels 0.1.74.
+
 ## 0.1.82
 
 - Strict cell queries and cell factors read one element of a computed matrix at

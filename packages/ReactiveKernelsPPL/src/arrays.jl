@@ -1537,10 +1537,70 @@ _lkj_array_raw(L::Symbol) = Symbol(:_ppl_lkj_raw_, L)
 _lkj_array_logjac(L::Symbol) = Symbol(:_ppl_lkj_logjac_, L)
 _lkj_array_diagonal(L::Symbol) = Symbol(:_ppl_lkj_diagonal_, L)
 
+for (name, row, col) in ((:_ppl_lkj_lower, :j, :i), (:_ppl_lkj_upper, :i, :j))
+    @eval @traceable function $name(z, diagonal, K, P)
+        out = zeros(Float64, K, K)
+        out[1, 1] = 1.0
+        i, j, w = 1, 2, 1.0
+        for p in 1:P
+            out[$row, $col] = z[p] * w
+            w = w * sqrt(1 - z[p]^2)
+            if i + 1 < j
+                i = i + 1
+            else
+                out[j, j] = diagonal[j]
+                i, j, w = 1, j + 1, 1.0
+            end
+        end
+        out
+    end
+end
+
+# The rows of the factor at a cell's rows (`ReactiveKernels._cell_row_method`),
+# by the same arithmetic in the same order: column block j holds the partials
+# (j - 1)(j - 2)/2 + 1, ... and carries its running product over them from 1.
+# Row r of the lower factor is block r; row r of the upper factor holds entry r
+# of every later block.
+_ppl_lkj_row_base(j) = (j - 1) * (j - 2) ÷ 2
+
+function _ppl_lkj_lower_rows(rows, z, diagonal, K, P)
+    out = zeros(Float64, length(rows), K)
+    for (k, r) in enumerate(rows)
+        base = _ppl_lkj_row_base(r)
+        w = 1.0
+        for i in 1:(r - 1)
+            out[k, i] = z[base + i] * w
+            w = w * sqrt(1 - z[base + i]^2)
+        end
+        out[k, r] = r == 1 ? 1.0 : diagonal[r]
+    end
+    out
+end
+
+function _ppl_lkj_upper_rows(rows, z, diagonal, K, P)
+    out = zeros(Float64, length(rows), K)
+    for (k, r) in enumerate(rows)
+        out[k, r] = r == 1 ? 1.0 : diagonal[r]
+        for j in (r + 1):K
+            base = _ppl_lkj_row_base(j)
+            w = 1.0
+            for i in 1:(r - 1)
+                w = w * sqrt(1 - z[base + i]^2)
+            end
+            out[k, j] = z[base + r] * w
+        end
+    end
+    out
+end
+
+ReactiveKernels._cell_row_method(::typeof(_ppl_lkj_lower)) =
+    (; at = _ppl_lkj_lower_rows, rows = (), dims = (3, 3))
+ReactiveKernels._cell_row_method(::typeof(_ppl_lkj_upper)) =
+    (; at = _ppl_lkj_upper_rows, rows = (), dims = (3, 3))
+
 function _lkj_array_transform_statements(e::LayoutEntry)
     L, K = e.name, e.dims[1]
     P = K * (K - 1) ÷ 2
-    row, col = _is_upper_lkj(e.transform) ? (:i, :j) : (:j, :i)
     z, lj = _lkj_array_partials(L), _lkj_array_logjac(L)
     diagonal = _lkj_array_diagonal(L)
     raw = _lkj_array_raw(L)
@@ -1568,22 +1628,8 @@ function _lkj_array_transform_statements(e::LayoutEntry)
             end
             out
         end),
-        :($L::Matrix{Float64} = let
-            out = zeros(Float64, $K, $K)
-            out[1, 1] = 1.0
-            i, j, w = 1, 2, 1.0
-            for p in 1:$P
-                out[$row, $col] = $z[p] * w
-                w = w * sqrt(1 - $z[p]^2)
-                if i + 1 < j
-                    i = i + 1
-                else
-                    out[j, j] = $diagonal[j]
-                    i, j, w = 1, j + 1, 1.0
-                end
-            end
-            out
-        end),
+        :($L::Matrix{Float64} = $(GlobalRef(@__MODULE__,
+            _is_upper_lkj(e.transform) ? :_ppl_lkj_upper : :_ppl_lkj_lower))($z, $diagonal, $K, $P)),
         :($lj::Float64 = let
             total = 0.0
             i, j = 1, 2

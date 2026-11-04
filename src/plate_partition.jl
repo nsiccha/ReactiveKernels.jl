@@ -65,7 +65,8 @@ function Base.showerror(io::IO, err::PartitionLocalityError)
           "the axes other than the first such as `vec(sum(x; dims = 2))`, a transposed ",
           "vector, an authored plate, a proved per-index helper comprehension or ",
           "per-position loop over vector or matrix rows, `vec` of a value with rows, a ",
-          "field of a named tuple of data, a shape check that returns its argument); ",
+          "field of a named tuple of data, a shape check that returns its argument, ",
+          "a function whose package gives it a row method); ",
           "see `partition_locality`. Pass `locality = :warn` ",
           "to evaluate anyway.")
 end

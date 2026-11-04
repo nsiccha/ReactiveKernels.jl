@@ -1124,9 +1124,18 @@ function _predictor_statements(plan::StructuralPlan)
         # on `_ppl_rows`'s run-time length test.
         if rows
             n = _located_rows_source(plan, pred)
-            rhs = _known_row_mismatch(plan, pred, rhs) ?
-                Expr(:call, :.*, Expr(:call, :ones, n), rhs) :
-                Expr(:call, GlobalRef(@__MODULE__, :_ppl_rows), rhs, n)
+            if _known_row_mismatch(plan, pred, rhs)
+                rhs = Expr(:call, :.*, Expr(:call, :ones, n), rhs)
+            else
+                # The value gets its rows apart from its own computation, so
+                # a cell computes that at its rows (`_ppl_rows_at`).
+                if rhs isa Expr
+                    summed = Symbol(:_ppl_located_, lp)
+                    push!(stmts, :($summed = $rhs))
+                    rhs = summed
+                end
+                rhs = Expr(:call, GlobalRef(@__MODULE__, :_ppl_rows), rhs, n)
+            end
         end
         # A proven scalar declares its type, so plates statically read it
         # as a shared argument rather than through a runtime axis test.
@@ -1918,6 +1927,15 @@ _ppl_range_values(x::AbstractArray, indices) = x[indices]
 @inline _ppl_rows(x::AbstractVector{Float64}, n::Int) =
     axes(x, 1) == Base.OneTo(n) ? x : ones(n) .* x
 @inline _ppl_rows(x, n::Int) = ones(n) .* x
+
+# The same at a cell's rows (`ReactiveKernels._cell_row_method`): the cell reads
+# the location at its rows, so it reads `x` at them and never computes all of
+# `x`. Those rows are already aligned, so each call keeps one type.
+@inline _ppl_rows_at(rows, x::Float64, n) = fill(x, length(rows))
+@inline _ppl_rows_at(rows, x::AbstractArray{Float64}, n) = x
+@inline _ppl_rows_at(rows, x, n) = ones(length(rows)) .* x
+ReactiveKernels._cell_row_method(::typeof(_ppl_rows)) =
+    (; at = _ppl_rows_at, rows = (1,), dims = (2,))
 
 # A selected plate column already holds one value per selected response cell
 # (`_selected_plate_indices`); only whole operands are gathered at the
