@@ -417,7 +417,8 @@ function _code_finding_message(method::String, found)
     lines = map(shown) do f
         what = f.kind === :dynamic ? "is a call dispatched at run time" :
             "infers `$(f.type)`"
-        "  - %$(f.index) $what: `$(f.statement)`"
+        join(["  - %$(f.index) $what: `$(f.statement)`";
+              ["      at $frame" for frame in f.location]], "\n")
     end
     following = length(found) - length(shown)
     follow = following == 1 ? "1 further value follows" :
@@ -439,7 +440,7 @@ function _report_type_stability(values, code, ::Val{:warn})
             u.input_types)
     end
     for (method, found) in _code_findings_by_method(code)
-        id = (:code_finding, method, map(f -> (f.kind, f.statement), found))
+        id = (:code_finding, method, map(f -> (f.kind, f.statement, f.location), found))
         @warn _code_finding_message(method, found) _group = :type_stability maxlog = 1 _id = id
     end
 end

@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.71
+
+- A code finding of the type-stability check now names where its statement was
+  written: under the statement, one `at name @ file:line` line per frame,
+  innermost first, including the functions it was inlined from and the macro
+  expansions between them. The warning and `TypeInstabilityError` print the same
+  text. Before, an instability in a helper inlined into the prepared program was
+  reported as "the prepared program's entry call" with only an SSA index and the
+  statement. The warning's once-per-process key now includes the location, so
+  the same statement written elsewhere warns again.
+
 ## 0.1.70
 
 - Per-position helpers gain row forms for more shapes. A matrix is a position
