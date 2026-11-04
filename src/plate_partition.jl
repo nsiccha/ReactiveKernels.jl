@@ -162,7 +162,9 @@ function _cell_locality(p::Plan, d::_CellPushdowns)
             # a reader computed whole needs every input whole, legitimately
             # when it is itself legitimately whole.
             if f !== nothing && any(o -> o in d.pushed, outputs)
-                return any(s -> !_cell_row_role(f.roles[s]), slots)
+                # A sparse product's operand computed whole is needed whole.
+                return any(s -> !_cell_row_role(f.roles[s]) ||
+                               f.roles[s] === :sparse_operand && !(cid in d.pushed), slots)
             end
             all(whole_ok, outputs)
         end
@@ -712,18 +714,17 @@ function _footprint_return(p::Plan, cells, names, declared = nothing, body = not
                     for (k, e) in get(reads, out, Tuple{Symbol,Any}[]))...)
                 record(cid, :gathered, Expr(:call,
                     GlobalRef(@__MODULE__, :_footprint_view_positions), indexmap, names[out], entries))
-            elseif f !== nothing
-                constant = _footprint_constant(r, f, s, producers, cidof)
+            elseif literal !== nothing && first(literal) == s
+                record(cid, :literal, last(literal))
+            else
+                constant = f === nothing ? nothing : _footprint_constant(r, f, s, producers, cidof)
+                constant === nothing && (constant = _footprint_inline_positions(r, s))
                 if constant !== nothing && cid == selected_cid
                     positions = Int[]
                     _footprint_selected_positions!(positions, last(selection), constant)
                     constant = positions
                 end
                 record(cid, constant === nothing ? :whole : :positions, constant)
-            elseif literal !== nothing && first(literal) == s
-                record(cid, :literal, last(literal))
-            else
-                record(cid, :whole, nothing)
             end
         end
     end
@@ -778,6 +779,52 @@ function _footprint_literal_read(r::Recipe)
     (j, Tuple(Int.(native.args[2:end])))
 end
 
+# The positions a literal index selects (`3`, `2:4`, `8:3:14`), or `nothing`.
+_footprint_literal_index(ex::Integer) = Int[ex]
+_footprint_literal_index(ex::AbstractRange{<:Integer}) = collect(Int, ex)
+function _footprint_literal_index(ex::Expr)
+    ex.head === :call && ex.args[1] === :(:) && length(ex.args) in (3, 4) &&
+        all(a -> a isa Integer, ex.args[2:end]) || return nothing
+    collect(Int, (:)(ex.args[2:end]...))
+end
+_footprint_literal_index(ex) = nothing
+
+# The positions a recipe computed whole reads of its input `s` when every read
+# of that input, however deep in the expression, selects literal linear
+# positions: `tanh.(view(u, 8:3:14))` (RKPPL's stacked LKJ edges), `f(u[3])`.
+# The reader of such a view may read all of it, never more, so this is a
+# structural read set; `nothing` when any read is bare, has another index, or
+# sits under a branch, whose inactive arm may hold an invalid literal.
+function _footprint_inline_positions(r::Recipe, s::Int)
+    analyzed = _cell_native(r)
+    analyzed === nothing && return nothing
+    native, params, mod = analyzed
+    source = params[s]
+    positions = Int[]
+    function walk(ex)
+        ex isa Symbol && return ex !== source
+        ex isa Expr || return true
+        ex.head in _CELL_PLAIN_HEADS && !(ex.head in (:if, :&&, :||)) || return false
+        target, index = if ex.head === :ref && length(ex.args) == 2
+            ex.args[1], ex.args[2]
+        elseif ex.head === :call && length(ex.args) == 3 &&
+                !_native_callee_shadowed(ex.args[1], params) &&
+                _cell_binding(ex.args[1], mod) in (Base.view, Base.getindex)
+            ex.args[2], ex.args[3]
+        else
+            nothing, nothing
+        end
+        if target === source
+            selected = _footprint_literal_index(index)
+            selected === nothing && return false
+            append!(positions, selected)
+            return true
+        end
+        all(walk, ex.args)
+    end
+    walk(native) && !isempty(positions) ? positions : nothing
+end
+
 # ----------------------------------------------------------- shared prefix
 
 # Whether a recipe's read of one mixed HAVE port is confined to shared
@@ -792,6 +839,7 @@ function _partition_shared_read(r::Recipe, slot::Int, labels, producers, cidof)
         literal !== nothing && first(literal) == slot && length(last(literal)) == 1 ?
             last(literal) : nothing
     end
+    positions === nothing && (positions = _footprint_inline_positions(r, slot))
     positions === nothing && return false
     all(i -> checkbounds(Bool, labels, i) && ismissing(labels[i]), positions)
 end
@@ -976,7 +1024,9 @@ label or cell index by the same row analysis that computes the evaluation:
 a lazy branch contributes both arms, a bound-indexed read its constant
 positions, and a view the parent positions its readers read (constructing a
 view reads none; a typed local that converts a view into a copy reads every
-viewed position). Retained branches use capture row windows when bound indices
+viewed position). A read nested in a larger expression, `tanh.(view(u, 2:3:8))`,
+contributes its literal positions. A product over a bound sparse factor reads its
+operand at the columns its rows store. Retained branches use capture row windows when bound indices
 prove both arms' requests in range; unproven requests may conservatively
 contribute the whole capture. Arm arithmetic remains lazy.
 For a partition or cell of a packed parameter vector this is its structural read
@@ -1229,6 +1279,7 @@ _plan_type_local(name::Symbol) = (text = String(name);
 # holds it, and the body checks the plan's shape against the value's on every
 # call (`_cell_plan_check`).
 const _PLAN_SHAPE_HELPERS = Set{Symbol}([:_cell_leaf_shape, :_cell_product_shape,
+    :_cell_sparse_shape,
     :_cell_factor_shape, :_cell_column_shape, :_cell_hcat_shape, :_cell_vcat_shape,
     :_cell_vcat_starts, :_plate_broadcast_shape, :_plate_require_axes, :_cell_dims_shape,
     :_cell_range_shape, :axes])

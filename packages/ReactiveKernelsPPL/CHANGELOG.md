@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.85
+
+- A data-only definition that computes a sparse array stays sparse when bound
+  (`L = sparse(F)`). It used to be converted to a dense array, which lost the
+  structure a cell reads through: a `SparseMatrixCSC` left factor reads its right
+  operand only at the columns its rows store (RK 0.1.77). A dense value keeps
+  being bound as before.
+
 ## 0.1.84
 
 - `prepare_cell_factors`: a sum whose summands read another sum is no longer a

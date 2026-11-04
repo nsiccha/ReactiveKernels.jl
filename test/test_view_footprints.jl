@@ -161,6 +161,56 @@ Base.getproperty(c::ComputedWeight, s::Symbol) =
         want = :terms_cell, exemplars = (u, computed, y, 1))
 end
 
+# A view or a read inside a larger expression reads its literal positions.
+@kernel stacked_edge(u::AbstractVector{Float64}, c::Float64) = begin
+    edge = tanh.(view(u, 2:3:8))
+    value = sum(edge) + c
+    return value
+end
+@kernel reversed_edge(u::AbstractVector{Float64}, c::Float64) = begin
+    edge = tanh.(view(u, 8:-3:2))
+    value = sum(edge) + c
+    return value
+end
+@kernel nested_reads(u::AbstractVector{Float64}, c::Float64) = begin
+    value = exp(u[3]) + sum(exp.(view(u, 5:6))) + c
+    return value
+end
+# Any other read of the port in that expression reads it whole.
+@kernel bare_beside(u::AbstractVector{Float64}, c::Float64) = begin
+    value = sum(view(u, 2:3)) + sum(u) + c
+    return value
+end
+@kernel computed_range(u::AbstractVector{Float64}, c::Float64, k::Int) = begin
+    value = sum(exp.(view(u, 1:k))) + c
+    return value
+end
+# An inactive arm may hold an invalid literal, which must not be evaluated.
+@kernel inactive_arm(u::AbstractVector{Float64}, c::Float64) = begin
+    value = c > 0 ? exp(u[1]) : exp(u[100])
+    return value
+end
+
+@testset "reads nested in a larger expression" begin
+    u, c = collect(0.1:0.1:0.9), 1.5
+    for (k, expected) in ((stacked_edge, [2, 5, 8]), (reversed_edge, [2, 5, 8]),
+                          (nested_reads, [3, 5, 6]))
+        kernel = prepare(k; have = (:u, :c), want = :value)
+        tracked = ReadVector(copy(u))
+        @test kernel(tracked, c) ≈ kernel(u, c)
+        @test sort!(unique(tracked.reads)) == expected
+        @test partition_footprint(kernel, u, c).u == expected
+    end
+    bare = prepare(bare_beside; have = (:u, :c), want = :value)
+    @test partition_footprint(bare, u, c).u === :whole
+    computed = prepare(computed_range; have = (:u, :c, :k), want = :value)
+    @test computed(u, c, 2) ≈ exp(u[1]) + exp(u[2]) + c
+    @test partition_footprint(computed, u, c, 2).u === :whole
+    arm = prepare(inactive_arm; have = (:u, :c), want = :value)
+    @test arm(u, c) ≈ exp(u[1])
+    @test partition_footprint(arm, u, c).u === :whole
+end
+
 @testset "footprints through typed and untyped views" begin
     u, c = collect(0.1:0.1:0.6), [1.0, 2.0]
     for (k, expected) in ((typed_copy, [2, 3, 4]), (untyped_view, [3]))

@@ -1120,6 +1120,20 @@ these producers:
   operand is an array or a number, such as `X * beta`, can be read like any
   other value; other products only by gathers `R[g, k]`, since their full
   shape is not known before they run;
+- a product `L * W` whose left factor is bound sparse data (a `SparseMatrixCSC`)
+  and whose right operand is a dense vector or matrix. Row `r` is the sum over the
+  entries stored in row `r`, in the order of Julia's own sparse product, so it
+  equals the authored product's row exactly and reads `W` only at those entries'
+  columns. `W` is computed at those rows when it has a row form of its own;
+  otherwise it is computed whole, as any product's right operand is, and that is
+  no violation. The rows are indexed once, when the data is bound, so a cell costs
+  its own stored entries however large `L` is, and the product's full shape is
+  still checked. Stored entries are the structure: a dense factor's numeric zeros
+  keep reading the whole operand (`0 * Inf` is `NaN` there), and an explicitly
+  stored zero is read. Bind a factor with known zeros as `sparse(L)` to declare
+  them. The product must be a statement of its own: inside a larger expression
+  (`a .+ L * w`, or over a computed operand `L * (c .* w)`) it keeps the row form
+  above and reads the operand whole;
 - an authored plate. Row `r` of its value is the plate over row `r` of each
   batched argument, so the cell runs that plate's body at row `r` only. A
   shared array the plate reads only at its own position, `u[j]` with `j` an
@@ -1617,7 +1631,10 @@ such a view reads all of it. Before that body is compiled, its statements that
 feed none of the recorded reads, such as the wanted value's own plate, are
 dropped; row and partition checks stay. For a packed parameter vector this is
 the exact support of a partition's gradient; a lazy branch contributes both
-arms.
+arms. A view or a read nested in a larger expression reads its literal positions
+(`tanh.(view(u, 2:3:8))` reads `[2, 5, 8]`, `exp(u[3])` reads `[3]`); a bare read
+of the port beside it, an index that is not literal, or a read under a branch
+reads the port whole, since an inactive arm may hold an invalid literal.
 `partition_footprint` keeps the footprint kernel it prepares for the process;
 `partition_footprint_kernel(kernel)` prepares one for a caller to hold and
 evaluate itself. `partitioned` adds the separability rule, pairs
