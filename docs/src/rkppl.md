@@ -555,7 +555,7 @@ generated values to sampler coordinates.
   `a ~ Normal(0, 1); w = logistic(a)` can feed `Ref([1 - w, w])`, or a
   named vector. The authored prior remains; the same probability checks
   apply to shared expressions, including vectors with more than two entries.
-  From ReactiveKernelsPPL 0.1.91, full-real component laws may differ: for example,
+  From ReactiveKernelsPPL 0.1.92, full-real component laws may differ: for example,
   `MixtureModel.(vcat.(Normal.(mu, sigma), Cauchy.(mu, tau)), Ref([0.9, 0.1]))`.
   A caller-owned constructor participates through `sampling_distribution_graph`;
   each component keeps its own positional and keyword arguments. The component

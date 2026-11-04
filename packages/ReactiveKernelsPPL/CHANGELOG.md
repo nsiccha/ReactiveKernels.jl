@@ -16,13 +16,26 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.91
+## 0.1.92
 
 - Native `MixtureModel` observations compose heterogeneous full-real component
   graphs, including Normal/Cauchy and caller-owned `sampling_distribution_graph`
   mappings with independent argument counts. Components retain their ordinary
   value computations inside the existing weighted log-sum-exp lowering.
   Requires ReactiveKernels 0.1.80 for shared component work inside support guards.
+
+## 0.1.91
+
+- Adaptive `tune_smc` accepts nested Treebars progress, an observational stop
+  callback, and atomic latest checkpoints through `checkpoint_dir`, `resume`
+  and `overwrite`. Cooperative interruption returns `SMCTuningPartial`, never
+  a usable schedule. Resumption restores WarmupHMC's active sampler and both
+  random streams while retaining completed reference/grid pilots; target,
+  binding/frame, endpoint scores, configuration and versions are checked.
+  In-memory partials can also be serialized and passed as `resume=partial`.
+  Boundary history and obsolete checkpoint retention are bounded; the active
+  sampler payload still contains its retained draws. Stops occur at sampler
+  initialization/window boundaries or between pilots, not at hard deadlines.
 
 ## 0.1.90
 
