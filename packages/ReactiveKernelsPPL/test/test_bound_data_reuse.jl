@@ -106,4 +106,59 @@ end
     @test Base.invokelatest(r, 2.0) == 10.0
     @test guarded_calls[] == 1
 end
+
+@testset "composed SMC queries share binding data" begin
+    for inline in (false, true)
+        rhs = inline ? :(a .* x .+ support(x_fit).shift) : :(a .* x .+ s.shift)
+        source = quote
+            s = support(x_fit)
+            a ~ Normal(0, 1)
+            mu = $rhs
+            y .~ Normal.(mu, 1)
+        end
+        data = (x = [0.5, 1.0, 1.5], x_fit = [0.2, 0.4], y = [0.1, 0.3, 0.5])
+        calls[] = 0
+        bound = bind_data(lower_rkppl(source, keys(data);
+            conditioned = (:y,), mod = @__MODULE__), data)
+        built = build_kernel(bound)
+        u = zeros(built.layout.total)
+        sampler = Base.invokelatest(prepare_query(built, bound, :sampler), u)
+        likelihood = Base.invokelatest(prepare_query(built, bound, :likelihood), u)
+        for fresh in (Int[], collect(eachindex(u)))
+            terms = ReactiveKernelsPPL._smc_window_terms(built, bound, fresh, u)
+            kernel = ReactiveKernelsPPL._smc_selected_kernel(terms, collect(eachindex(u)), u)
+            @test calls[] == 1
+            @test Base.invokelatest(kernel, u) ≈ (isempty(fresh) ? likelihood : sampler)
+        end
+    end
+end
+
+@traceable function checked_shift(x)
+    x > 0 || throw(ArgumentError("positive support required"))
+    (shift = x + 1,)
+end
+checked_location(a, s) = fill(a + s.shift, 2)
+
+@testset "ignored errors do not populate the ordinary binding cache" begin
+    source = quote
+        s = checked_shift(x_fit)
+        a ~ Normal(0, 1)
+        mu = checked_location(a, s)
+        y .~ Normal.(mu, 1)
+    end
+    data = (x_fit = -2.0, y = [0.0, 0.0])
+    bound = bind_data(lower_rkppl(source, keys(data);
+        conditioned = (:y,), mod = @__MODULE__), data)
+    spec = @kernel begin
+        x_fit::Float64
+        a::Float64
+        s = checked_shift(x_fit)
+        result = a + s.shift
+    end
+    q = ReactiveKernelsPPL._prepare_cached(bound, spec; have = (:x_fit, :a),
+        want = :result, bound = (; x_fit = -2.0), on_error = :ignore)
+    @test Base.invokelatest(q, 0.0) == -1.0
+    @test_throws "positive support required" ReactiveKernelsPPL._prepare_cached(bound, spec;
+        have = (:x_fit, :a), want = :result, bound = (; x_fit = -2.0))
+end
 end
