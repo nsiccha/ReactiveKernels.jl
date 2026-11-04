@@ -95,7 +95,7 @@ export prepare_predictive, PredictiveQuery, PredictiveLaws, predictive_laws, pre
 export restore_draws
 export prepare_smc, smc, initialize_smc, update_smc, smc_step, smc_checkpoint, resume_smc
 export SMCReference, SMCOptions, SMCNonfiniteError, SMCDegeneracyError, rejuvenate_smc
-export SMCTuningSchedule, tune_smc, smc_reference
+export SMCTuningSchedule, SMCTuningPartial, tune_smc, smc_reference
 export SMCCarriedReference, carry_smc, prepare_smc_window
 export smc_parameters
 export smc_window_coordinates, smc_recover

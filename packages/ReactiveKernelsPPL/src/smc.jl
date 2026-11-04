@@ -67,6 +67,23 @@ struct SMCTuningSchedule{S,T,R,K,P}
 end
 
 """
+    SMCTuningPartial
+
+An interrupted adaptive `tune_smc` call, not a production tuning schedule.
+`progress` is the last observational boundary record; `checkpoint` owns the
+outer tuning continuation and WarmupHMC's active checkpoint payload, including
+its RNG and retained draws. Treat both fields as read-only. Resume with
+`tune_smc(target; resume=partial, original_keywords...)`, or serialize this
+record for a fresh process. With `checkpoint_dir`, `resume=true` reads the
+directory's latest checkpoint instead. See `tune_smc` for identity checks,
+configuration, disk retention and cooperative stop boundaries.
+"""
+struct SMCTuningPartial{C,P}
+    checkpoint::C
+    progress::P
+end
+
+"""
     SMCOptions(; ess_fraction=0.8, stepsize=0.25, metric=nothing,
                moves=2, max_tree_depth=6, max_stages=1000,
                min_increment=1e-12, history_limit=128, tuning=nothing,
@@ -338,7 +355,8 @@ function prepare_smc_window end
              temperatures=(0.0, 1e-6, 1e-5, 1e-4, 1e-3, 0.01, 0.1, 0.5, 1.0),
              pilot_steps=64, pilot=:continuous, max_reflections=16,
              recording_target=128, pilot_evaluations=1000, reference_inflation=2.0,
-             options=SMCOptions())
+             options=SMCOptions(), progress=nothing, callback=nothing,
+             checkpoint_dir=nothing, resume=false, overwrite=false)
 
 Prepare all mutation tuning **before** creating a production cloud. `init` is
 an explicit finite unconstrained position and `rng` an explicit independent
@@ -386,6 +404,68 @@ production move count and tree-depth limit; it must not itself contain tuning.
 The default grid includes near-zero knots. Supply a model-specific grid when
 its tempering regime needs finer resolution; a finite grid is not an automatic
 guarantee that the learned kernels explore every intermediate target well.
+
+## Adaptive progress, interruption and recovery
+
+The lifecycle keywords apply to `pilot=:adaptive`. A completed call returns a
+`SMCTuningSchedule`; a cooperative stop before completion returns a distinct
+`SMCTuningPartial`, which `SMCOptions(tuning=...)` rejects. The reference pilot
+must finish before its Gaussian is fitted, and every grid pilot must finish
+before its kernel is published. Zero-draw initialization stops are supported.
+
+`progress` is a Treebars parent node. Tuning creates a parent under it and a
+transient child for the reference pilot or current grid pilot, with WarmupHMC's
+own progress underneath. Finished pilot subtrees are detached; the parent
+reports the current phase, boundary, window, evaluations and completed knots.
+The inner window counter can restart and is not a total-work percentage.
+`callback(snapshot, boundary)` is observational: only literal `true` requests
+a stop. `boundary` is `:init`, `:window`, or `:pilot` after a completed pilot.
+The immutable scalar snapshot records `phase` (`:reference`/`:grid`), `knot`
+(zero for the reference), `temperature`, `boundary`, `completed_knots`,
+`window`, `retained_draws` and `evaluations`. The window is zero at `:pilot`;
+the evaluation count is for that pilot, with WarmupHMC's initialization
+exclusions above. A stop at the last completed pilot returns the ready schedule.
+
+Requesting a Treebars interrupt on the supplied parent stops at initialization,
+an outer warm-up window or between pilots, just like the callback. These are
+cooperative boundaries, not hard wall-clock guarantees: initialization and a
+single window may exceed a host deadline. A pre-existing interrupt returns a
+partial before starting a pilot. Resume under a fresh, uninterrupted node.
+
+With `checkpoint_dir=dir`, `dir/tuning_latest.jls` is atomically replaced before
+each callback and before starting a pilot. It contains the completed reference,
+completed kernels and work, outer RNG, current pilot seed and WarmupHMC's active
+checkpoint payload. A failure during a window can restart from the preceding
+boundary; work since that boundary is not saved. Only this latest outer record
+is retained. The active payload includes sampler draws and can grow with the
+active pilot; completed pilots retain no draws. Boundary history is capped by
+`options.history_limit`, independently of the finite grid's completed work.
+
+To resume, rebuild the original target (and `previous`, for an update), then
+call `tune_smc` with the original tuning keywords and either `checkpoint_dir=dir,
+resume=true` or `resume=partial`. The partial can also be serialized and restored
+in a fresh process. Both paths copy the saved continuation, skip completed
+pilots, and restore the active sampler through WarmupHMC's public resume API.
+The required `rng` argument is ignored on resume: the
+checkpoint supplies both RNG streams. No callback is repeated at the restored
+initialization/window boundary. Resuming a completed file returns its schedule
+without running another pilot or callback.
+
+Resume checks Julia/package and checkpoint versions, target and previous-endpoint
+identities, binding, coordinate frame, tuning configuration and endpoint scores
+at saved positions. Caller IDs remain assertions about code/data semantics;
+finite score probes cannot prove arbitrary functions equivalent. Keep the code,
+data and non-default tuning settings unchanged. Progress and callback handles
+are supplied afresh, never serialized. Inputs and a supplied partial stay
+unchanged. Treat checkpoint arrays as read-only and do not advance/write one
+continuation concurrently. Deserialize only trusted checkpoints.
+
+A fresh call refuses an existing `tuning_latest.jls` unless `overwrite=true`;
+overwrite cannot combine with resume and replaces only that file, preserving
+unrelated directory contents. `resume=partial` optionally writes its continuation
+to `checkpoint_dir`, allowing an explicitly selected saved boundary to be forked.
+Without a directory, an orderly stop still returns an in-memory checkpoint;
+unexpected exceptions or process loss then have no automatic disk recovery.
 """
 function tune_smc end
 
