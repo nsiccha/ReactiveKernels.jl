@@ -201,12 +201,12 @@ struct CellFactorQuery{K,R,S,A,E}
     on_error::E
 end
 
-function _cell_factor_value(q::CellFactorQuery, args...)
-    residual = typeof(args) === typeof(q.args) ? q.residual :
-        get!(q.specializations, typeof(args)) do
-            Base.invokelatest(prepare, q.residual.plan; exemplars = args, on_error = q.on_error)
-        end
-    Base.invokelatest(residual, args...)
+# The residual for these arguments: the prepared one is known from the types
+# alone, so a call with its exact types never reaches the cache or boxes it.
+@inline _cell_factor_residual(q::CellFactorQuery{<:Any,<:Any,<:Any,A}, args::A) where {A} =
+    q.residual
+_cell_factor_residual(q::CellFactorQuery, args) = get!(q.specializations, typeof(args)) do
+    Base.invokelatest(prepare, q.residual.plan; exemplars = args, on_error = q.on_error)
 end
 
 function _check_cell_factor_args(q::CellFactorQuery, a)
@@ -224,8 +224,8 @@ function (q::CellFactorQuery)(u::AbstractVector{Float64}, a, b)
     # Keep the latest-world refresh, but read its stored values through the
     # concrete cache type. Splatting invokelatest's Any result boxes the
     # prepared callable repeatedly, even when the shared tuple is empty.
-    shared_values = _cell_shared_values(q.shared)
-    Base.invokelatest(_cell_factor_value, q, u, a, b, shared_values...)::Float64
+    args = (u, a, b, _cell_shared_values(q.shared)...)
+    Base.invokelatest(_cell_factor_residual(q, args), args...)::Float64
 end
 (q::CellFactorQuery)(u::AbstractVector{<:Real}, a, b) = q(Vector{Float64}(u), a, b)
 

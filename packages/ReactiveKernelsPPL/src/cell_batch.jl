@@ -69,7 +69,8 @@ end
 function (q::CellFactorQuery)(p::_CellValuePass, a, b)
     _check_cell_pass(p, q.shared)
     _check_cell_factor_args(q, a)
-    Base.invokelatest(_cell_factor_value, q, p.base, a, b, _cell_shared_values(q.shared)...)::Float64
+    args = (p.base, a, b, _cell_shared_values(q.shared)...)
+    Base.invokelatest(_cell_factor_residual(q, args), args...)::Float64
 end
 
 struct _CellFootprint{Q,K,P,S,A}
