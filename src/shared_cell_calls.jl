@@ -24,8 +24,9 @@
 # Every key compares identities first, which costs the same whatever an argument's
 # size: arguments that are the same objects have equal values, so the second cell
 # holding them hashes nothing. An argument that varies across cells is compared by
-# value (`hash`, then `isequal`) when its object is new, at most once per distinct
-# object: the same object says the values are equal, but different objects do not
+# value when its object is new, at most once per distinct object: `isequal` alone
+# while the table holds one value, otherwise `hash` then `isequal`. The same
+# object says the values are equal, but different objects do not
 # say they differ. Each subject's rows of a data column are different indices, so
 # the column's values gathered for equal subjects are equal values in fresh objects,
 # and a call reading them shares only by value.
@@ -108,6 +109,15 @@ end
 # first cell with equal arguments.
 @inline function _shared_result(f::F, table::_SharedTable, objects, key, args::Tuple) where {F}
     get!(table.objects, objects) do
+        # A common plate has only one distinct argument tuple, but gathers
+        # produce a fresh copy in every cell. Compare that sole entry directly:
+        # hashing its arrays first costs more than the equality check itself.
+        # Once a second distinct tuple appears, keep the dictionary lookup so
+        # diverse cells never search a growing list of earlier arguments.
+        if length(table.values) == 1
+            entry = first(table.values)
+            isequal(first(entry), key) && return last(entry)
+        end
         get!(() -> f(args...), table.values, key)
     end
 end
