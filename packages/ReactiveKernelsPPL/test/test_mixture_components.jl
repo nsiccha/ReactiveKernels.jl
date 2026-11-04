@@ -43,6 +43,7 @@ function fixture(n; kind=:builtin, shared=false, weights=[0.8,0.2], scale=0.7,
         :(vcat.(1 .- logistic.(b .+ x), logistic.(b .+ x))) : :(Ref(weights))
     location = shared ? :a : :(a .+ b .* curved)
     other = kind === :builtin ? :(Cauchy.(mu, exp(s))) :
+        kind === :student ? :(D.TDist.(exp(s))) :
         kind === :custom ? :(ShiftedLaw.(mu, s, b, 0.3)) :
         :(KeywordLaw.(mu; scale=exp(s)))
     ast = quote
@@ -63,6 +64,7 @@ function oracle(fx,u)
     points = map(eachindex(fx.data.y)) do i
         mu = fx.shared ? a : a+b*sin(fx.data.x[i])
         law = fx.kind === :builtin ? D.Cauchy(mu,exp(s)) :
+            fx.kind === :student ? D.TDist(exp(s)) :
             fx.kind === :custom ? D.Normal(mu+sin(b),sqrt(exp(2s)+0.3^2)) :
             D.Normal(mu,exp(s))
         # An independent probability sum suffices for these moderate toy values.
@@ -128,7 +130,7 @@ end
 @testset "native heterogeneous component graphs" begin
     @test Base.get_extension(ReactiveKernels,:ReactiveKernelsEnzymeExt) !== nothing
     @test Base.get_extension(ReactiveKernelsPPL,:ReactiveKernelsPPLDistributionsExt) !== nothing
-    for kind in (:builtin,:custom,:keyword), shared in (false,true)
+    for kind in (:builtin,:student,:custom,:keyword), shared in (false,true)
         for n in (0,1,5)
             check(fixture(n;kind,shared);reverse=n==5)
         end
