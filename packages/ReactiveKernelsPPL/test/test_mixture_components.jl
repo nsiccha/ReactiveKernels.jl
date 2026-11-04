@@ -33,10 +33,13 @@ struct CountedLaw end
 end
 ReactiveKernelsPPL.sampling_distribution_graph(::Type{CountedLaw}, args::Tuple) = counted_score
 
-function fixture(n; kind=:builtin, shared=false, weights=[0.8,0.2], scale=0.7)
+function fixture(n; kind=:builtin, shared=false, weights=[0.8,0.2], scale=0.7,
+        rowweights=false)
     x = [0.2sin(i) for i in 1:n]
     y = [0.4cos(i) for i in 1:n]
-    data = (;x,y,scale,weights)
+    data = rowweights ? (;x,y,scale) : (;x,y,scale,weights)
+    weight_expression = rowweights ?
+        :(vcat.(1 .- logistic.(b .+ x), logistic.(b .+ x))) : :(Ref(weights))
     location = shared ? :a : :(a .+ b .* curved)
     other = kind === :builtin ? :(Cauchy.(mu, exp(s))) :
         kind === :custom ? :(ShiftedLaw.(mu, s, b, 0.3)) :
@@ -47,12 +50,12 @@ function fixture(n; kind=:builtin, shared=false, weights=[0.8,0.2], scale=0.7)
         s ~ Normal(0,1)
         curved = sin.(x)
         mu = $location
-        y .~ MixtureModel.(vcat.(Normal.(mu, scale), $other), Ref(weights))
+        y .~ MixtureModel.(vcat.(Normal.(mu, scale), $other), $weight_expression)
     end
     plan = lower_rkppl(ast,data;mod=@__MODULE__,conditioned=(:y,))
     bound = bind_data(plan,data)
     built = build_kernel(bound)
-    (;data,plan,bound,built,u=[0.2,-0.3,-0.1],kind,shared)
+    (;data,plan,bound,built,u=[0.2,-0.3,-0.1],kind,shared,rowweights)
 end
 function oracle(fx,u)
     a,b,s = u
@@ -62,8 +65,10 @@ function oracle(fx,u)
             fx.kind === :custom ? D.Normal(mu+sin(b),sqrt(exp(2s)+0.3^2)) :
             D.Normal(mu,exp(s))
         # An independent probability sum suffices for these moderate toy values.
-        log(fx.data.weights[1]*D.pdf(D.Normal(mu,fx.data.scale),fx.data.y[i]) +
-            fx.data.weights[2]*D.pdf(law,fx.data.y[i]))
+        w = fx.rowweights ? inv(1+exp(-b-fx.data.x[i])) : fx.data.weights[2]
+        first_weight = fx.rowweights ? 1-w : fx.data.weights[1]
+        log(first_weight*D.pdf(D.Normal(mu,fx.data.scale),fx.data.y[i]) +
+            w*D.pdf(law,fx.data.y[i]))
     end
     prior = sum(D.logpdf(D.Normal(),v) for v in u)
     (;points,prior,total=prior+sum(points;init=0.0))
@@ -127,6 +132,9 @@ end
     end
     for weights in ([0.0,1.0],[1.0,0.0])
         check(fixture(3;kind=:custom,weights);reverse=true)
+    end
+    for kind in (:builtin,:custom)
+        check(fixture(5;kind,rowweights=true);reverse=true)
     end
     small,large = fixture(3;kind=:custom),fixture(19;kind=:custom)
     @test recipe_count(small.built.spec) == recipe_count(large.built.spec)
