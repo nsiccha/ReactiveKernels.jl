@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.78
+
+- `derivative_rule` accepts literal `nothing` entries in its `directions` and
+  `cotangents` mappings to declare data-only inputs, including structured data.
+  Every input must still be named, and both branches must agree on data-only
+  positions. No dummy graph direction or cotangent output is needed. Forward
+  cuts take directions only for differentiable inputs; reverse activity masks
+  keep the original input positions and reject data-only bits. Enzyme skips
+  directions for `Const` data and rejects active data; ChainRules pullbacks
+  return `NoTangent()` at data positions.
+- Batched reverse accumulation through generated vector rules no longer hits
+  an ambiguous method at the end of the argument tuple.
+
 ## 0.1.77
 
 - A cell or partition of a product over a bound sparse factor, `L * eta` with `L`

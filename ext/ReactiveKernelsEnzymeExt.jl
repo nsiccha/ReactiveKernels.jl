@@ -11,7 +11,8 @@ module ReactiveKernelsEnzymeExt
 
 using ReactiveKernels: ScalarDerivativeRule, derivative_cut, DerivativeRule, forward_cut,
     has_forward_branch, has_reverse_branch, stage_primal, stage_reverse
-using ReactiveKernels: _stage_residual_sources
+using ReactiveKernels: _stage_residual_sources, _rule_activity, _derivative_inputs,
+    rule_inputs
 import ReactiveKernels
 import Enzyme
 using Enzyme: Const, Active, Duplicated, DuplicatedNoNeed, BatchDuplicated,
@@ -148,6 +149,19 @@ const _ReverseActive = Union{Active,Duplicated,BatchDuplicated}
     :(Val{$mask}())
 end
 
+# A data declaration is a promise about this primitive's derivative domain,
+# not a numerical zero. Reject active data instead of manufacturing a shadow
+# for it (a data record may itself contain floating-point coordinates).
+@generated function _check_data_activity(rule, ::Val{D}, args::Tuple) where {D}
+    for (i, T) in enumerate(args.parameters)
+        if D & (1 << (i - 1)) == 0 && !(T <: Const)
+            return :(throw(ArgumentError("Enzyme through " * string(rule) *
+                ": data-only input :" * string(rule_inputs(rule)[$i]) * " requires Const")))
+        end
+    end
+    :(nothing)
+end
+
 @inline _zero_shadow(::Val{1}, primal) = _zero_like(primal)
 @inline _zero_shadow(::Val{W}, primal) where {W} = ntuple(_ -> _zero_like(primal), Val(W))
 @inline _zero_like(x::AbstractArray) = zero(x)
@@ -172,6 +186,7 @@ end
 function EnzymeRules.augmented_primal(
         config::RevConfig, rule::Const{<:DerivativeRule}, ::Type{RT},
         args::Vararg{Annotation,N}) where {RT,N}
+    _check_data_activity(rule.val, _rule_activity(rule.val), args)
     mask = _reverse_mask(args)
     values = _values(args)
     if mask === Val(0) || RT <: Const
@@ -229,7 +244,7 @@ end
         (nothing, _apply_cotangents(Base.tail(args), cotangents)...)
     end
 end
-@inline _apply_cotangent_lanes(::Tuple{}, lanes, ::Val) = ()
+@inline _apply_cotangent_lanes(::Tuple{}, lanes::Tuple, ::Val) = ()
 @inline function _apply_cotangent_lanes(args::Tuple, lanes::Tuple, ::Val{W}) where {W}
     arg = first(args)
     if arg isa Active
@@ -257,6 +272,8 @@ end
 function EnzymeRules.forward(
         config::FwdConfig, rule::Const{<:DerivativeRule}, ::Type{RT},
         args::Vararg{Annotation,N}) where {RT,N}
+    activity = _rule_activity(rule.val)
+    _check_data_activity(rule.val, activity, args)
     values = _values(args)
     if RT <: Const || !needs_shadow(config)
         primal = rule.val(values...)
@@ -265,12 +282,13 @@ function EnzymeRules.forward(
     has_forward_branch(rule.val) || throw(ArgumentError(
         "forward-mode Enzyme through $(rule.val): the rule has no forward branch " *
         "(author a directions + tangent branch in its graph)"))
+    differentiated = _derivative_inputs(activity, args)
     if width(config) == 1
-        primal, tangent = forward_cut(rule.val, values..., map(_direction, args)...)
+        primal, tangent = forward_cut(rule.val, values..., map(_direction, differentiated)...)
         return needs_primal(config) ? Duplicated(primal, tangent) : tangent
     end
     lanes = ntuple(Val(width(config))) do w
-        forward_cut(rule.val, values..., map(arg -> _direction(arg, w), args)...)
+        forward_cut(rule.val, values..., map(arg -> _direction(arg, w), differentiated)...)
     end
     tangents = map(last, lanes)
     needs_primal(config) ? BatchDuplicated(first(lanes)[1], tangents) : tangents
