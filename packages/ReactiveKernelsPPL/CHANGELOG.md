@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.92
+
+- Native `MixtureModel` observations compose heterogeneous full-real component
+  graphs, including Normal/Cauchy and caller-owned `sampling_distribution_graph`
+  mappings with independent argument counts. Components retain their ordinary
+  value computations inside the existing weighted log-sum-exp lowering.
+  Requires ReactiveKernels 0.1.80 for shared component work inside support guards.
+
 ## 0.1.91
 
 - Adaptive `tune_smc` accepts nested Treebars progress, an observational stop

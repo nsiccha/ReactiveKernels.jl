@@ -128,7 +128,7 @@ function _wrap_evidence!(r, plan, pre, inputs, base;
         guarded = _wrap_evidence!(r, plan, pre, inputs, base.args[2]; cdf, ccdf, logcdf, logccdf)
         return Expr(:if, base.args[1], guarded, base.args[3])
     end
-    family = r.family === MixtureFam ? r.mixture_family :
+    family = r.family === MixtureFam ? something(r.mixture_family, GaussianFam) :
         r.family === NormalIDGLMFam ? GaussianFam :
         r.family === BernoulliLogitGLMFam ? BernoulliLogitFam :
         r.family === PoissonLogGLMFam ? PoissonLogFam : r.family

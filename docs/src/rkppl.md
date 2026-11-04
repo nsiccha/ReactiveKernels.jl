@@ -555,6 +555,13 @@ generated values to sampler coordinates.
   `a ~ Normal(0, 1); w = logistic(a)` can feed `Ref([1 - w, w])`, or a
   named vector. The authored prior remains; the same probability checks
   apply to shared expressions, including vectors with more than two entries.
+  From ReactiveKernelsPPL 0.1.92, full-real component laws may differ: for example,
+  `MixtureModel.(vcat.(Normal.(mu, sigma), Cauchy.(mu, tau)), Ref([0.9, 0.1]))`.
+  A caller-owned constructor participates through `sampling_distribution_graph`;
+  each component keeps its own positional and keyword arguments. The component
+  graphs compose into the observation plate and the existing stable weighted
+  log-sum-exp. A density-only mapping supplies exact observations; evidence
+  wrappers additionally need the object's CDF endpoints.
   Equal component log densities retain their ordinary reverse derivatives,
   including all-zero initialization. The scalar and dotted `logaddexp`
   built-ins likewise have partial derivatives `(1/2, 1/2)` at finite ties
