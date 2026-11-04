@@ -16,6 +16,21 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.84
+
+- `prepare_cell_factors`: a sum whose summands read another sum is no longer a
+  reduction. With `dose = sum(a[events[i]] .* exp.(e[events[i]]))` and
+  `y[i] .~ Normal.(0.01 * dose .* exp.(eta[obs[i]]), sigma)`, only `dose` is one;
+  the density total stays in the outer factor, which reads `dose` from its sum
+  vector as a number and computes the total at its own rows. Such a cell used to
+  be refused under `locality = :error` (`0.01dose has no row form, and its type is
+  not known to be a number`). When that type was known, each term of the density
+  total recomputed `dose` and read all of its source, every cell's coordinates,
+  with no refusal. Requires RK 0.1.76.
+- **Breaking:** `cell_reductions(f)` of such a cell lists one sum fewer, so the sum
+  vector passed to the outer factor is shorter and the total has no summand query.
+  Follow `cell_reductions(f)`; sums that read no other sum are unchanged.
+
 ## 0.1.83
 
 - Strict cell queries accept a response location whose sum has a summand of

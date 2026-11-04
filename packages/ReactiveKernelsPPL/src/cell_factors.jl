@@ -26,6 +26,10 @@ summand (reduction index `j`). With no sums the outer is the ordinary cell.
 The outer's sum inputs are independent values: their dependence on the packed
 point is supplied by the summand operators and the chain rule.
 
+A sum whose summands read another sum (a density total over `dose .* f.(t)`, with
+`dose` a sum) is no reduction: it stays in the outer factor, which reads the inner
+sum from its sum vector and computes the total at its own rows.
+
 Pass `partitioned = :z, u0 = u` to cache shared-only whole-array producers
 before factoring. Values refresh when the shared coordinates change. Compact
 factor AD then selects only partitioned coordinates. Mixed shared derivatives
@@ -63,28 +67,33 @@ function prepare_cell_factors(built, plan::StructuralPlan, observation::Symbol;
             name in factors.spec.have_names || push!(factors.spec.have_names, name)
         end
     end
-    reductions = map(factors.sums) do s
+    gathered = NamedTuple[]
+    for s in factors.sums
         rows = ReactiveKernels._cell_factor_rows(factors.spec, s.argument; bound = factor_bound)
-        rows === nothing && return nothing
-        # Removing the packed point proves the row query is data-defined.
-        rowhave = Tuple(n for n in factors.spec.have_names if n !== :unconstrained &&
-                        n ∉ _cell_frontier_names(shared))
+        rows === nothing || push!(gathered, (; s..., positions = rows))
+    end
+    innermost, enclosing = ReactiveKernels._cell_factor_nesting(factors.spec, gathered)
+    # Removing the packed point proves the row query is data-defined.
+    rowhave = Tuple(n for n in factors.spec.have_names if n !== :unconstrained &&
+                    n ∉ _cell_frontier_names(shared))
+    reductions = map(innermost) do s
         kernel = Base.invokelatest(prepare, factors.spec; have = rowhave,
-            want = rows, bound = factor_bound, on_error)
+            want = s.positions, bound = factor_bound, on_error)
         (; s..., rows = kernel)
     end
-    filter!(!isnothing, reductions)
-    CellFactors(factors.spec, plan, built.layout, observation, want, reductions,
+    CellFactors(factors.spec, plan, built.layout, observation, want, reductions, enclosing,
                 on_error, locality, shared, exemplar)
 end
 
-struct CellFactors{S,P,L,R,E,C,H}
+struct CellFactors{S,P,L,R,N,E,C,H}
     spec::S
     plan::P
     layout::L
     observation::Symbol
     want::Symbol
     reductions::R
+    # Sums that read a reduction: part of the outer factor (`_cell_factor_nesting`).
+    enclosing::N
     on_error::E
     locality::C
     shared::H
@@ -104,7 +113,8 @@ function _cell_factor_spec(f::CellFactors, factor)
     outer = factor === :outer
     outer || factor isa Integer && 1 <= factor <= length(f.reductions) ||
         throw(ContractValidationError("[query] factor must be :outer or a reduction index"))
-    omit = outer ? Set(r.value.id for r in f.reductions) : Set{RK.ValueId}()
+    omit = outer ? Set(r.value.id for r in Iterators.flatten((f.reductions, f.enclosing))) :
+        Set{RK.ValueId}()
     spec = RK._copy_cell_factor_spec(f.spec; omit)
     if outer
         name = :_ppl_cell_sums
@@ -115,8 +125,9 @@ function _cell_factor_spec(f::CellFactors, factor)
         push!(spec.port_order, name)
         push!(spec.have_names, name)
         for (j, r) in enumerate(f.reductions)
-            add!(spec.graph, (sums,) => r.value, Base.Fix2(getindex, j))
+            add!(spec.graph, (sums,) => r.value, RK._CellFactorSumRead(j))
         end
+        foreach(s -> RK._cell_factor_sum_cell!(spec, s, f.locality), f.enclosing)
         want = f.want
     else
         name = :_ppl_cell_term
