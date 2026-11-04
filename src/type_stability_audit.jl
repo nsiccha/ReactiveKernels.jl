@@ -17,7 +17,18 @@
 # instability and is reported as `:root`. Statements inlined from a call chain
 # in `_CODE_FINDINGS_JUSTIFIED` are exempt; each entry carries its
 # justification. So are the statements of an expansion of Julia's logging
-# macros (`_code_logging`).
+# macros (`_code_logging`). A finding records where its statement was written
+# (`_code_frames`): after inlining, its method alone does not say.
+
+# One frame of a statement's source: a function or a macro expansion, and the
+# line it was written on.
+struct _CodeFrame
+    name::Symbol
+    file::Symbol
+    line::Int
+end
+
+Base.show(io::IO, f::_CodeFrame) = print(io, f.name, " @ ", f.file, ":", f.line)
 
 struct _CodeFinding
     kind::Symbol
@@ -25,10 +36,13 @@ struct _CodeFinding
     index::Int
     type::Any
     statement::String
+    location::Vector{_CodeFrame} # innermost first
 end
 
-Base.show(io::IO, f::_CodeFinding) = print(io, f.kind, " in ", f.method, " %", f.index,
-    " :: ", f.type, "  ", f.statement)
+function Base.show(io::IO, f::_CodeFinding)
+    print(io, f.kind, " in ", f.method, " %", f.index, " :: ", f.type, "  ", f.statement)
+    isempty(f.location) || print(io, "  at ", first(f.location))
+end
 
 const _CODE_FINDINGS_MAX_UNION = 4
 
@@ -183,64 +197,47 @@ _code_frame_name(m) = m
 
 _code_frame_name(m::Core.CodeInstance) = _code_frame_name(m.def)
 
-# The names of the methods statement `i` was inlined from, outermost first
-# (needs the code inferred with `debuginfo = :source`). From Julia 1.12 each
-# inlined frame is an edge of the caller's `DebugInfo`; `buildLineInfoNode`
-# returns nothing for a statement whose own line is unknown, as in a body
-# RuntimeGeneratedFunctions generates, so the edges are walked directly.
-function _code_inlining_chain(ci::Core.CodeInfo, i)
-    chain = Any[]
-    if isdefined(ci, :debuginfo)
-        info, pc = ci.debuginfo, i
-        while true
-            _, edge, edge_pc = Core.Compiler.getdebugidx(info, pc)
-            (edge == 0 || edge_pc <= 0) && break
-            info, pc = info.edges[Int(edge)], Int(edge_pc)
-            push!(chain, _code_frame_name(info.def))
-        end
-        return chain
-    end
-    location = ci.codelocs[i]
-    while location != 0
-        node = ci.linetable[location]
-        push!(chain, _code_frame_name(node.method))
-        location = node.inlined_at
-    end
-    chain
-end
+_code_frame(@nospecialize(method), file, line) =
+    _CodeFrame(Symbol(_code_frame_name(method)), Symbol(file), Int(line))
 
-_code_justified(ci, i) = let chain = _code_inlining_chain(ci, i)
-    any(entry -> all(in(chain), entry), _CODE_FINDINGS_JUSTIFIED)
-end
-
-# The source files of the macro expansions statement `i` lies in, at any
-# inlining depth. From Julia 1.12 a macro expansion is a frame of the
-# `DebugInfo` line tables, which the compiler's own walk (`append_scopes!`)
-# names `macro expansion`; before, a `LineInfoNode` of that name.
-function _code_expansion_files(ci::Core.CodeInfo, i)
+# The source of statement `i`, innermost frame first: the function it was
+# written in, each function that was inlined into, and the macro expansions in
+# between (needs the code inferred with `debuginfo = :source`). A frame of a body
+# RuntimeGeneratedFunctions generates has no line, `none:0`. From Julia 1.12 the
+# frames are the `DebugInfo` line tables and inlining edges, which the compiler's
+# own walk (`append_scopes!`) lists outermost first; before, a `LineInfoNode`
+# chain from the innermost frame.
+function _code_frames(ci::Core.CodeInfo, i)
+    frames = _CodeFrame[]
     if isdefined(ci, :debuginfo)
         scopes = Base.IRShow.LineInfoNode[]
         Base.IRShow.append_scopes!(scopes, i, ci.debuginfo, nothing)
-        return Symbol[s.file for s in scopes if s.method === Symbol("macro expansion")]
+        for node in Iterators.reverse(scopes)
+            push!(frames, _code_frame(node.method, node.file, node.line))
+        end
+        return frames
     end
-    files = Symbol[]
     location = ci.codelocs[i]
     while location != 0
         node = ci.linetable[location]
-        node.method === Symbol("macro expansion") && push!(files, node.file)
+        push!(frames, _code_frame(node.method, node.file, node.line))
         location = node.inlined_at
     end
-    files
+    frames
+end
+
+_code_justified(frames) = let chain = (f.name for f in frames)
+    any(entry -> all(in(chain), entry), _CODE_FINDINGS_JUSTIFIED)
 end
 
 # Base's logging source, where the code its logging macros (`@debug`, `@info`,
 # `@warn`, `@error`, `@logmsg`) expand to is written.
 const _LOGGING_SOURCES = Set{Symbol}(m.file for m in methods(Base.CoreLogging.logmsg_code))
 
-# Whether statement `i` belongs to an expansion of Julia's logging macros. That
-# code is Julia's own, written into the caller's body by the macro, and it
-# dispatches at run time by design: the logger is a dynamically scoped
-# `AbstractLogger`, and `shouldlog` and `handle_message` are called in the
+# Whether a statement with these frames belongs to an expansion of Julia's
+# logging macros. That code is Julia's own, written into the caller's body by
+# the macro, and it dispatches at run time by design: the logger is a dynamically
+# scoped `AbstractLogger`, and `shouldlog` and `handle_message` are called in the
 # latest world. It runs only when its log statement is reached, and dispatches
 # only when a logger accepts the record, so no client can make it concrete.
 # The audit therefore treats it as it treats the bodies of Julia's own
@@ -249,7 +246,8 @@ const _LOGGING_SOURCES = Set{Symbol}(m.file for m in methods(Base.CoreLogging.lo
 # 1.12.7 and 1.13.1 (snag `type-stability-a-a6941de1`: the `@debug` calls on
 # the underflow branches of SpecialFunctions' `beta_inc` refused a
 # negative-binomial likelihood at `type_stability_level = :all`).
-_code_logging(ci, i) = any(in(_LOGGING_SOURCES), _code_expansion_files(ci, i))
+_code_logging(frames) =
+    any(f -> f.name === Symbol("macro expansion") && f.file in _LOGGING_SOURCES, frames)
 
 function _within_module(m::Module, root::Module)
     while true
@@ -305,16 +303,17 @@ function _code_audit!(found, seen, @nospecialize(tt), where, recurse)
             # The exemptions read the statement's debug info, so only for a
             # statement the audit would report or enter.
             unstable || dynamic || recursing || continue
-            (_code_justified(ci, i) || _code_logging(ci, i)) && continue
+            frames = _code_frames(ci, i)
+            (_code_justified(frames) || _code_logging(frames)) && continue
             if unstable
                 root = statement isa Expr && statement.head in (:call, :invoke) &&
                     all(x -> _code_stable(_code_argument_type(ci, x)),
                         _code_call_arguments(statement))
                 push!(found, _CodeFinding(root ? :root : :nonconcrete, where, i, T,
-                                          _code_statement_text(statement)))
+                                          _code_statement_text(statement), frames))
             end
             dynamic && push!(found, _CodeFinding(:dynamic, where, i, T,
-                                                 _code_statement_text(statement)))
+                                                 _code_statement_text(statement), frames))
             recursing && _code_audit!(found, seen, mi.specTypes, _code_label(callee), recurse)
         end
     end
