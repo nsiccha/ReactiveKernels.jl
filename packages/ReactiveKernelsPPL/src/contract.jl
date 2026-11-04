@@ -1104,7 +1104,24 @@ struct StructuralPlan
     cell_geometries::Dict{Symbol,CellGeometry}
     # Runtime data, owned by this binding and excluded from structural keys.
     data_values::Union{Nothing,_BindingData}
+    # Authored prose and provenance, excluded from numerical analysis/cache keys.
+    documentation::Vector{RKPPLDocumentation}
 end
+
+# Plans authored before retained docstrings carry no documentation.
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+    conditioned, indexed_observations, external_observations,
+    cell_broadcasts, named_values, factors, cell_priors, frozen::FrozenValues,
+    cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}},
+    cell_geometries::Dict{Symbol,CellGeometry}, data_values::Union{Nothing,_BindingData}) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+        scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+        conditioned, indexed_observations, external_observations,
+        cell_broadcasts, named_values, factors, cell_priors, frozen, cell_latents,
+        cell_geometries, data_values, RKPPLDocumentation[])
 
 # The former all-fields constructor creates an unbound structural plan.
 StructuralPlan(responses, predictors, population_priors, parameters,
@@ -1331,14 +1348,15 @@ function StructuralPlan(
         frozen::FrozenValues = FrozenValues(),
         cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}} =
             Dict{Symbol,Tuple{Symbol,Symbol}}(),
-        cell_geometries::Dict{Symbol,CellGeometry} = Dict{Symbol,CellGeometry}())
+        cell_geometries::Dict{Symbol,CellGeometry} = Dict{Symbol,CellGeometry}(),
+        documentation::Vector{RKPPLDocumentation} = RKPPLDocumentation[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans,
         vector_parameters, matrices,
         array_parameters, submodel_scopes, conditioned, indexed_observations,
         external_observations, cell_broadcasts, named_values, factors, cell_priors,
-        frozen, cell_latents, cell_geometries)
+        frozen, cell_latents, cell_geometries, nothing, documentation)
 end
 
 # Every definition of `plan`: its assignments, then its per-observation
@@ -1772,7 +1790,7 @@ const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :matrices,
     :array_parameters, :indexed_observations, :external_observations,
     :cell_broadcasts, :named_values, :factors, :cell_priors, :frozen,
-    :cell_latents, :cell_geometries, :data_values)
+    :cell_latents, :cell_geometries, :data_values, :documentation)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
@@ -2139,7 +2157,7 @@ function _read_only_by_selection(plan::StructuralPlan, name::Symbol)
     end
     for f in fieldnames(StructuralPlan)
         f in (:columns, :roles, :n_obs, :submodel_scopes, :responses,
-            :indexed_observations, :cell_broadcasts, :frozen, :data_values) && continue
+            :indexed_observations, :cell_broadcasts, :frozen, :data_values, :documentation) && continue
         visit(getfield(plan, f))
     end
     for r in plan.responses, f in fieldnames(LikelihoodSpec)
@@ -2916,7 +2934,7 @@ function _uncached_label_only_columns(plan::StructuralPlan)
     end
     for f in fieldnames(StructuralPlan)
         f in (:columns, :roles, :n_obs, :submodel_scopes, :cell_broadcasts,
-            :frozen, :data_values) && continue
+            :frozen, :data_values, :documentation) && continue
         visit(getfield(plan, f))
     end
     return setdiff!(labels, numeric)
@@ -7714,7 +7732,7 @@ function _preparation_data_names(plan, nodes, raw, onlydata, names;
     free = Set{Symbol}(keys(nodes))
     for f in fieldnames(StructuralPlan)
         f in (:assignments, :derived, :columns, :submodel_scopes,
-            :cell_broadcasts, :factors, :conditioned, :frozen, :data_values) && continue
+            :cell_broadcasts, :factors, :conditioned, :frozen, :data_values, :documentation) && continue
         _drop_held_names!(free, getfield(plan, f))
     end
     # Whole-value classification exempts `axes(M, d)` from observation
@@ -7771,7 +7789,7 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
     unused = Set{Symbol}(raw)
     for f in fieldnames(StructuralPlan)
         f in (:columns, :n_obs, :roles, :submodel_scopes, :cell_broadcasts,
-            :frozen, :data_values) && continue
+            :frozen, :data_values, :documentation) && continue
         _drop_held_names!(unused, getfield(plan, f))
     end
     defs = Pair{Symbol,Any}[a.name => a.expr for a in plan.assignments]
@@ -7871,7 +7889,7 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
     named = copy(free)
     for f in fieldnames(StructuralPlan)
         f in (:assignments, :derived, :columns, :n_obs, :roles,
-            :submodel_scopes, :frozen, :data_values) && continue
+            :submodel_scopes, :frozen, :data_values, :documentation) && continue
         if f === :parameters
             for p in plan.parameters
                 p.family === :external && p.name in plan.conditioned && continue
@@ -8155,7 +8173,7 @@ function _uncached_bound_value_inputs(plan::StructuralPlan)
     found = Set{Symbol}()
     seen = Base.IdSet{Any}()
     for f in fieldnames(StructuralPlan)
-        f in (:columns, :submodel_scopes, :frozen, :data_values) && continue
+        f in (:columns, :submodel_scopes, :frozen, :data_values, :documentation) && continue
         _collect_bound_value_inputs!(found, getfield(plan, f), seen)
     end
     return found

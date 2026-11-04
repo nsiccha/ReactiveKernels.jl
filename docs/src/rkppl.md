@@ -22,6 +22,54 @@ canonical programs come verbatim from the package's corpus
 (`packages/ReactiveKernelsPPL/test/corpus/`), which also pins how each one
 lowers.
 
+## Authored documentation
+
+An ordinary literal Julia docstring before a `~`, `.~` or `=` declaration is
+retained as raw Markdown. The same spelling documents a component use, or a
+reusable definition with a docstring immediately before `@rkppl name(args...) =
+begin ... end`. Declarations inside plates and scans retain their text too.
+
+`rkppl_documentation(model_or_plan; path=nothing)` returns a fresh vector of
+immutable `RKPPLDocumentation` records. Captured models and submodels expose
+their own source documentation. Lowered plans additionally include documentation
+from nested component instances; querying a captured model does not resolve or
+expand its components. A bound model awaiting lowering exposes its captured
+model's records. Bind once and query the resulting plan for expanded records.
+
+Each record carries `path`, `owner`, `markdown`, `definition`, `origin`, `file`
+and `line`. Paths are tuples of literal authored Symbols: `(:fit, :slope)` is
+distinct from `(Symbol("fit.slope"),)`. `owner` is `:declaration`, `:instance`
+for an expanded component use, or `:definition`. Definition records have an
+empty path on a captured submodel and the instance path on a plan. A component
+can retain both its use-site text and its definition's text. `definition` names
+the reusable definition that supplied a record, or is `nothing` for caller
+text; `origin` is the declaration's path in that source. `file` and `line`
+retain available source locations. `path=(:fit, :slope)` selects exact matches.
+Indexed declarations use their array's authored name; paths do not address
+individual elements of a fused vector or matrix declaration. An emitter must
+retain any finer source-to-element correspondence in its own metadata.
+
+Records retain source order within each captured scope, followed by expanded
+scopes in depth-first use order. Repeated component calls get distinct paths.
+A declaration inside a plate contributes one record regardless of row count.
+Rebinding, conditioning, copying and pinning retain documentation. A replacement
+without a docstring retains its logical declaration's text; an annotated
+replacement updates it. Replacing a component changes the definition and local
+documentation expanded from that component.
+
+Emitters can use Julia's ordinary parsed wrapper,
+`Expr(:macrocall, GlobalRef(Core, Symbol("@doc")), location, markdown, statement)`,
+where `location` is a `LineNumberNode` and `markdown` is a literal `String`.
+The captured source keeps these wrappers for printing and parsing. Reusable
+definition text is snapshotted at definition time, so later redefinitions cannot
+change the text retained by an earlier captured submodel.
+
+The accessor does not evaluate models, data, component callbacks or Markdown.
+Documentation is excluded from numerical analyses, graphs and structural cache
+keys. Renderers can use these records for separately labelled authored
+documentation in code, HTML or PDF. `kernel_expr` and `model_view` continue to
+show the actual generated numerical program.
+
 ## A first model
 
 Bind inputs by keyword, then observe responses with `model(; x) | (; y)`.
