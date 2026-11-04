@@ -1532,6 +1532,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
             for l in r.mixture_locs
                 l isa Symbol && push!(used_locs, l)
             end
+            for component in r.mixture_components
+                union!(used_locs, _value_symbols(component.args.rhs))
+            end
             for s in r.mixture_scales
                 s isa ScalePredictorRef && push!(used_locs, s.predictor)
             end
@@ -3046,6 +3049,13 @@ _map_rhs_values(f, ex) = _map_rhs_arguments((value, _, _, _) -> f(value), ex)
 # `head` spells (`Normal.(mu, s)`: `s` is 2 of 2 of `:Normal`), or the
 # keyword's name as `position`.
 function _map_rhs_arguments(f, ex, head = nothing, position = 0, nargs = 0)
+    # A mixture's component constructors are sampling syntax even when the
+    # caller owns their bindings. Visit their arguments without hoisting the
+    # distribution object itself into an opaque model value.
+    if head === :vcat && _is_dotted_call(ex)
+        return Expr(:., ex.args[1], Expr(:tuple,
+            _map_rhs_positions(f, ex.args[2].args, _rhs_head_symbol(ex.args[1]))...))
+    end
     if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
             _rhs_spelling_head(ex.args[1], false)
         return Expr(:call, ex.args[1],
@@ -8049,8 +8059,8 @@ function _mixture_component_context(thunk, lhs, k::Int)
     end
 end
 
-# `y .~ MixtureModel.(vcat.(C1, ..., CK), Ref(w))` — K same-family univariate
-# components + mixing weights (SB `MixtureModel` mirror). Each component
+# `y .~ MixtureModel.(vcat.(C1, ..., CK), Ref(w))` — K univariate
+# components + mixing weights (SB `MixtureModel` mirror). Legacy components
 # lowers through the single-family base spelling (decomposed twin:
 # predictors wrapped, params/literals bare); locations route to predictors
 # (link-space) or scalar slots (sampled params / literals,
@@ -8088,6 +8098,14 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
         value isa Symbol || _sfail("response $lhs: mixture weights need one " *
             "probability vector per observation; wrap shared weights in `Ref(w)`")
         MixtureWeightRows(value)
+    end
+    if any(c -> _is_dotted_call(c) &&
+            _rhs_head_symbol(c.args[1]) ∉ (:Normal, :Bernoulli, :BernoulliLogit,
+                :Poisson, :PoissonLog, :Binomial, :BinomialLogit,
+                :NegativeBinomial2, :NegativeBinomial2Log, :Gamma, :GammaLog,
+                :Beta, :BetaLogit), components)
+        return _lower_graph_mixture_response(lhs, components, wraw, range,
+            weights, evidence, ctx, predictors, pred_idx, coefuse)
     end
     fams = LikelihoodFamily[]
     llinks = LinkFunction[]
@@ -8165,6 +8183,51 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
         mixture_weights = w,
         mixture_trials = f === BinomialLogitFam && trials === nothing ?
             Union{ColumnRef,Int}[trials_raw...] : Union{ColumnRef,Int}[])
+end
+
+# Graph-backed components have independent argument boundaries. Keep those
+# boundaries in the plan and compose the existing constructor mapping at
+# emission, exactly as for a standalone caller-owned density.
+function _lower_graph_mixture_response(lhs, components, wraw, range, weights,
+        evidence, ctx, predictors, pred_idx, coefuse)
+    graphs = NamedTuple[]
+    for (k, component) in enumerate(components)
+        _is_dotted_call(component) || _sfail("response $lhs: mixture component $k needs a dotted constructor")
+        head = component.args[1]
+        builtin = head isa Symbol && head in (:Normal, :Cauchy, :StudentT) ? head : nothing
+        args = if builtin === nothing
+            _external_parameter(lhs, component, (), ctx.mod, ctx.taken;
+                observed=true, broadcast=true)
+        else
+            call = Expr(:call, head, component.args[2].args...)
+            (;rhs=call, geometry=nothing, broadcast=true, constructor_broadcast=true)
+        end
+        builtin === nothing && _external_graph_density(args) === nothing &&
+            _sfail("response $lhs: mixture component $k needs a sampling_distribution_graph mapping")
+        values = Any[]
+        for (j, value) in enumerate(_external_arguments(args))
+            push!(values, value isa Number || value isa GlobalRef || value isa QuoteNode ? value :
+                _lower_argument_predictor!(lhs, value, ctx, predictors, pred_idx,
+                    coefuse, Symbol(lhs, :_mix_, k, :_arg_, j)))
+        end
+        keywords = Any[]
+        for keyword in _external_keywords(args)
+            value = keyword.args[end]
+            lowered_value = value isa Number || value isa GlobalRef || value isa QuoteNode ? value :
+                _lower_argument_predictor!(lhs, value, ctx, predictors, pred_idx,
+                    coefuse, Symbol(lhs, :_mix_, k, :_kw_, length(keywords) + 1))
+            push!(keywords, Expr(keyword.head, keyword.args[1:end-1]..., lowered_value))
+        end
+        lowered = merge(args, (;rhs=_external_endpoint_call(
+            _external_constructor(args), values, keywords)))
+        push!(graphs, (;args=lowered, builtin))
+    end
+    wraw isa Symbol && wraw ∉ ctx.data && wraw ∉ ctx.dirichlet_names &&
+        _sfail("response $lhs: mixture weights $wraw are undeclared; bind an input or state a Dirichlet prior")
+    w = _lower_mixture_weights(lhs, wraw)
+    return LikelihoodSpec(MixtureFam, IdentityLink, lhs, lhs, nothing, weights,
+        evidence, Symbol(lhs, :_resp), nothing, range;
+        mixture_weights=w, mixture_components=graphs)
 end
 
 # Dotted→call conversion for one mixture component: like
@@ -10289,6 +10352,9 @@ function _check_coefficient_readers(coefuse, ctx, predictors, priors,
         end
         foreach(v -> read!(who, v), r.mixture_locs)
         foreach(v -> read!(who, v), r.mixture_scales)
+        for component in r.mixture_components, v in _value_symbols(component.args.rhs)
+            read!(who, v)
+        end
     end
     return nothing
 end

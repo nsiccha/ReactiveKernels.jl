@@ -2247,7 +2247,7 @@ end
 function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         node::Symbol, pw::Symbol)
     f = r.mixture_family
-    K = length(r.mixture_locs)
+    K = _mixture_component_count(r)
     y = r.response
     inputs = Any[y]
     yv = _dovar(1)
@@ -2310,14 +2310,20 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     logweights = Any[]
     parameter_guards = Any[]
     weight_guard === nothing || push!(parameter_guards, weight_guard)
+    component_statements = Expr[]
     for k in 1:K
         klab = Symbol(r.label, :_mix, k)
-        locref, is_lp = _mixture_loc_ref(r, plan, k)
-        nk = isempty(r.mixture_trials) ? nref :
-            _thread_ref!(inputs, r.mixture_trials[k], true)
-        normal_params = Any[]
-        lpdf = _mixture_component_lpdf(f, r, plan, pre, inputs, k, klab,
-            locref, is_lp, yv, yref, nk; normal_params)
+        lpdf = if isempty(r.mixture_components)
+            locref, is_lp = _mixture_loc_ref(r, plan, k)
+            nk = isempty(r.mixture_trials) ? nref :
+                _thread_ref!(inputs, r.mixture_trials[k], true)
+            _mixture_component_lpdf(f, r, plan, pre, inputs, k, klab,
+                locref, is_lp, yv, yref, nk)
+        else
+            statements = _mixture_graph_component_call(r.mixture_components[k], inputs, yv)
+            append!(component_statements, statements[1:end-1])
+            last(statements)
+        end
         if lpdf.head === :if
             push!(parameter_guards, lpdf.args[1])
             # One lazy domain guard encloses the entire mixture, including
@@ -2330,7 +2336,7 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
             (logw_comp === nothing ? :($lwv[$k]) : logw_comp[k]) :
             logw_lit[k]
         push!(terms, :($logw_k + $lpdf))
-        push!(distributions, _evidence_endpoint(lpdf))
+        r.evidence.kind === :none || push!(distributions, _evidence_endpoint(lpdf))
         push!(logweights, logw_k)
     end
     cell = foldl((a, b) -> :(logaddexp($a, $b)), terms)
@@ -2369,7 +2375,32 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         wv = _thread_ref!(inputs, r.weights)
         cell = _weighted_cell(wv, cell)
     end
-    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+    body = isempty(component_statements) ? cell :
+        Expr[component_statements...; (cell isa Vector ? cell : Expr[cell])...]
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, body)...]
+end
+
+function _mixture_graph_component_call(component, inputs, y)
+    args = component.args
+    ports = Any[value isa Number || value isa GlobalRef || value isa QuoteNode ? value :
+        _thread_ref!(inputs, value) for value in _external_arguments(args)]
+    keywords = _external_cell_keywords!(inputs, args)
+    if component.builtin !== nothing
+        head = component.builtin
+        if head in (:Normal, :Cauchy)
+            length(ports) <= 2 || throw(ContractValidationError("$head takes at most two arguments"))
+            mu = isempty(ports) ? 0.0 : ports[1]
+            sigma = length(ports) < 2 ? 1.0 : ports[2]
+            object = head === :Normal ? :normal : :cauchy
+            return Expr[:($sigma > 0 ? $object($mu, $sigma).logpdf($y) : -Inf)]
+        end
+        length(ports) == 3 || throw(ContractValidationError("StudentT takes degrees of freedom, location and scale"))
+        nu, mu, sigma = ports
+        return Expr[:($nu > 0 && $sigma > 0 ? student_t($nu, $mu, $sigma).logpdf($y) : -Inf)]
+    end
+    graph = _external_graph_density(args)
+    return _external_graph_density_call(graph,
+        Any[y, ports[graph.first_argument:end]...], keywords)
 end
 
 function _shared_mixture_guard(valid, inputs, plan, pre)

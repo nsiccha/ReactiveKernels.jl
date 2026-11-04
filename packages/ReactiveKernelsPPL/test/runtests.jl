@@ -67,6 +67,7 @@ const _PPL_TEST_FILES = (
     "test_mi.jl",
     "test_scalar_mi_families.jl",
     "test_mixture.jl",
+    "test_mixture_components.jl",
     "test_response_combinations.jl",
     "test_bare_location.jl",
     "test_student_evidence.jl",
