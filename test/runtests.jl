@@ -112,6 +112,7 @@ const _MATRIX_CORE_TESTS = (
     "test_position_record_reverse.jl",
     "test_position_batching_reuse.jl",
     "test_native_scheduling.jl",
+    "test_scheduled_prefix.jl",
     "test_position_batching_allocation_slices.jl",
     "test_position_lane_scratch.jl",
     "test_position_cell_lane_slots.jl",

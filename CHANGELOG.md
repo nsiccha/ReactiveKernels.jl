@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.80
+
+- Multi-worker `NativeScheduling` calls also schedule materialized data-only
+  prefix plates within their worker budget. Equal cells share one result per
+  call across workers; changed inputs are recomputed on later calls. Prefix
+  tasks join before position workers begin. Scalar dependencies, reductions,
+  scans and one-worker calls keep their native order.
+
 ## 0.1.79
 
 - Bound preparation can reuse data-only prefix results in a frontend-owned
