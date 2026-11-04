@@ -579,7 +579,9 @@ cell-varying arguments include an array or a record runs once per distinct
 argument tuple, and the cells with that tuple hold the same result object. The
 call is an authored expression or a function of a package or of the authoring
 module. Bound subjects that share one design compute it once per binding and
-store it once. This uses the same comparison as position batching's
+store it once, whether the design is computed in the cell that reads a live
+value or in a plate of its own that reads bound data alone. This uses the same
+comparison as position batching's
 [shared cell values](position-batching.md).
 
 Binding freezes values for that preparation; changing or mutating the data is

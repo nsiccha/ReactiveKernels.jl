@@ -303,6 +303,329 @@ end
     end
 end
 
+# A design computed by a plate of its own (snag rk-shared-cell-k-4ee0c500): the
+# plate reads data alone, so it joins the reader's prefix whole. Its call is
+# shared like a moved one, and the plate reading its cells holds one object per
+# equal group. `Hashed` counts every content hash of a design's arrays.
+const HASHES = Ref(0)
+struct Hashed <: AbstractVector{Float64}
+    x::Vector{Float64}
+end
+Base.size(h::Hashed) = size(h.x)
+Base.getindex(h::Hashed, i::Int) = h.x[i]
+Base.hash(h::Hashed, seed::UInt) = (HASHES[] += 1; hash(h.x, seed))
+Base.isequal(a::Hashed, b::Hashed) = isequal(a.x, b.x)
+hashed_design(t) = (CALLS[] += 1; (; c = Hashed(cumsum(t)), s = Hashed(2 .* t), n = length(t)))
+read_design(d) = (RANGE_CALLS[] += 1; sum(d.c))
+add_columns(c, s) = c .+ s
+
+@kernel design_plate(ts, eta, theta) = begin
+    designs = plate(ts) do t
+        hashed_design(t)
+    end
+    cells = plate(designs, eta) do d, e
+        sum(d.c) * (theta + e) + d.n
+    end
+    return cells
+end
+# Fields read by name, then a call of the fields.
+@kernel design_plate_fields(ts, eta, theta) = begin
+    designs = plate(ts) do t
+        hashed_design(t)
+    end
+    cells = plate(designs, eta) do d, e
+        c = d.c
+        s = d.s
+        sum(add_columns(c, s)) * (theta + e)
+    end
+    return cells
+end
+# An opaque call of the whole record.
+@kernel design_plate_call(ts, eta, theta) = begin
+    designs = plate(ts) do t
+        hashed_design(t)
+    end
+    cells = plate(designs, eta) do d, e
+        read_design(d) * (theta + e)
+    end
+    return cells
+end
+# A chain of data-only plates, one reading the last.
+@kernel design_plate_chain(ts, eta, theta) = begin
+    designs = plate(ts) do t
+        hashed_design(t)
+    end
+    columns = plate(designs) do d
+        add_columns(d.c, d.s)
+    end
+    cells = plate(columns, eta) do c, e
+        sum(c) * (theta + e)
+    end
+    return cells
+end
+# Two plates read the same design plate.
+@kernel design_plate_two_readers(ts, eta, theta) = begin
+    designs = plate(ts) do t
+        hashed_design(t)
+    end
+    firsts = plate(designs, eta) do d, e
+        sum(d.c) * (theta + e)
+    end
+    seconds = plate(designs, eta) do d, e
+        sum(d.s) * (theta - e)
+    end
+    cells = firsts .+ seconds
+    return cells
+end
+# The same fields read inside one plate: the field reads keep the design's identity.
+@kernel one_plate_fields(ts, eta, theta) = begin
+    cells = plate(ts, eta) do t, e
+        d = hashed_design(t)
+        c = d.c
+        s = d.s
+        sum(add_columns(c, s)) * (theta + e)
+    end
+    return cells
+end
+# A caller's own records: a field read keys nothing, and a call of the field
+# keys that field alone.
+@kernel caller_records(rs, eta, theta) = begin
+    cells = plate(rs, eta) do r, e
+        t = r.t
+        d = design(t)
+        sum(d) * (theta + e)
+    end
+    return cells
+end
+# The same field read inside the call's own expression.
+@kernel caller_records_inline(rs, eta, theta) = begin
+    cells = plate(rs, eta) do r, e
+        d = design(r.t)
+        sum(d) * (theta + e)
+    end
+    return cells
+end
+# Base arithmetic in a plate of its own stays in that plate's own loop.
+@kernel arithmetic_plate(ts, eta, theta) = begin
+    rows = plate(ts) do t
+        2 .* t
+    end
+    cells = plate(rows, eta) do r, e
+        sum(r) * (theta + e)
+    end
+    return cells
+end
+# The plate the caller reads back.
+@kernel wanted_plate(ts, eta, theta) = begin
+    designs = plate(ts) do t
+        design(t)
+    end
+    cells = plate(designs, eta) do d, e
+        sum(d) * (theta + e)
+    end
+    return (; designs, cells)
+end
+
+# A design of values gathered per subject (snag rk-shared-cell-k-4ee0c500, on the
+# real read): each subject's rows of a column are different indices, so equal
+# subjects hold equal values in fresh objects, and the call shares only by value.
+pick_rows(column, r) = column[r]
+@kernel gathered_cell(column, rows, eta, theta) = begin
+    cells = plate(rows, eta) do r, e
+        t = column[r]
+        d = hashed_design(t)
+        c = d.c
+        sum(c) * (theta + e)
+    end
+    return cells
+end
+# The rows selected by a package's function.
+@kernel gathered_by_call(column, rows, eta, theta) = begin
+    cells = plate(rows, eta) do r, e
+        t = pick_rows(column, r)
+        d = hashed_design(t)
+        c = d.c
+        sum(c) * (theta + e)
+    end
+    return cells
+end
+# The gather and the design in a plate that reads data alone.
+@kernel gathered_plate(column, rows, eta, theta) = begin
+    designs = plate(rows) do r
+        t = column[r]
+        hashed_design(t)
+    end
+    cells = plate(designs, eta) do d, e
+        sum(d.c) * (theta + e)
+    end
+    return cells
+end
+
+function hashed_calls(reader, args...)
+    reader(args...)
+    CALLS[] = 0
+    HASHES[] = 0
+    value = reader(args...)
+    CALLS[], HASHES[], value
+end
+
+reader_split(scalar) = begin
+    plan = scalar.plan
+    batched = (:eta, :theta)
+    ReactiveKernels._replicated_shared_cells(plan, Set(
+        ReactiveKernels.canon_id(plan.graph, v.id) for v in plan.have if !(v.name in batched)))
+end
+
+@testset "a plate that reads data alone shares its calls" begin
+    same = [collect(1.0:5.0) for _ in 1:NSUB]
+    halves = [collect(1.0:(isodd(s) ? 5.0 : 3.0)) for s in 1:NSUB]
+    for spec in (design_plate, design_plate_fields, design_plate_call, design_plate_chain,
+                 design_plate_two_readers, one_plate_fields)
+        scalar = prepare(spec; have = (:ts, :eta, :theta), want = :cells)
+        for (args, distinct) in (((same,), 1), ((halves,), 2))
+            expected = reduce(hcat, [scalar(args..., etas[:, k], thetas[k]) for k in 1:NPOS])
+            for (mode, reader) in pairs(readers(scalar))
+                count, hashes, value = hashed_calls(reader, args..., etas, thetas)
+                @test count == distinct
+                # Equal cells hold one design. A package's call of its arrays hashes
+                # each once per distinct design; an expression of Base's reads
+                # none. Neither depends on how many cells read it.
+                @test hashes == (spec in (design_plate, design_plate_two_readers) ? 0 : 2distinct)
+                @test isequal(value, expected)
+            end
+        end
+    end
+    # An opaque call of the whole record also runs once per distinct design.
+    scalar = prepare(design_plate_call; have = (:ts, :eta, :theta), want = :cells)
+    for (mode, reader) in pairs(readers(scalar))
+        reader(same, etas, thetas)
+        RANGE_CALLS[] = 0
+        reader(same, etas, thetas)
+        @test RANGE_CALLS[] == 1
+    end
+    # Nothing is kept across calls here either.
+    scalar = prepare(design_plate; have = (:ts, :eta, :theta), want = :cells)
+    for (mode, reader) in pairs(readers(scalar))
+        rows = [collect(1.0:4.0) for _ in 1:NSUB]
+        before = copy(reader(rows, etas, thetas))
+        foreach(t -> t .*= 2, rows)
+        value = reader(rows, etas, thetas)
+        @test isequal(value, reduce(hcat, [scalar(rows, etas[:, k], thetas[k]) for k in 1:NPOS]))
+        @test !isequal(value, before)
+    end
+    # The scalar kernel on its own runs the call in every cell.
+    CALLS[] = 0
+    scalar(same, etas[:, 1], thetas[1])
+    @test CALLS[] == NSUB
+end
+
+@testset "equal values in fresh objects share by value" begin
+    grid = collect(1.0:5.0)
+    rows = [collect(((s - 1) * 5 + 1):(s * 5)) for s in 1:NSUB]
+    column = repeat(grid, NSUB)
+    # Two designs: odd subjects on one grid, even subjects on another.
+    alternating = reduce(vcat, [isodd(s) ? grid : 2 .* grid for s in 1:NSUB])
+    have = (:column, :rows, :eta, :theta)
+    for spec in (gathered_cell, gathered_by_call, gathered_plate)
+        scalar = prepare(spec; have, want = :cells)
+        for (data, distinct) in ((column, 1), (alternating, 2))
+            expected = reduce(hcat, [scalar(data, rows, etas[:, k], thetas[k]) for k in 1:NPOS])
+            for (mode, reader) in pairs(readers(scalar))
+                count, hashes, value = hashed_calls(reader, data, rows, etas, thetas)
+                @test count == distinct
+                # The arguments are compared; the record they make is not.
+                @test hashes == 0
+                @test isequal(value, expected)
+            end
+            CALLS[] = 0
+            bound = prepare(spec; have, want = :cells, bound = (; column = data, rows))
+            @test CALLS[] == distinct
+            @test isequal(bound(etas[:, 1], thetas[1]), expected[:, 1])
+        end
+    end
+    # The same objects compare by identity after the first cell: the values are
+    # hashed once per distinct object, however many cells hold it.
+    hashed_rows = [Hashed(fill(Float64(iseven(s)), 3)) for s in 1:2]
+    subjects = [hashed_rows[isodd(s) ? 1 : 2] for s in 1:NSUB]
+    scalar = prepare(design_plate; have = (:ts, :eta, :theta), want = :cells)
+    for (mode, reader) in pairs(readers(scalar))
+        count, hashes, value = hashed_calls(reader, subjects, etas, thetas)
+        @test count == 2
+        @test hashes == 2
+    end
+end
+
+@testset "a field read keys nothing" begin
+    # The record is not hashed to save a load; the call keys the field it reads.
+    records = [(; t = collect(1.0:5.0), h = Hashed(fill(1.0, 3))) for _ in 1:NSUB]
+    scalar = prepare(caller_records; have = (:rs, :eta, :theta), want = :cells)
+    expected = reduce(hcat, [scalar(records, etas[:, k], thetas[k]) for k in 1:NPOS])
+    for (mode, reader) in pairs(readers(scalar))
+        count, hashes, value = hashed_calls(reader, records, etas, thetas)
+        @test count == 1
+        @test hashes == 0
+        @test isequal(value, expected)
+    end
+    # Read inside a larger expression, the key is still the whole record: the
+    # values are right and the call is shared, at the cost of hashing `h`.
+    scalar = prepare(caller_records_inline; have = (:rs, :eta, :theta), want = :cells)
+    expected = reduce(hcat, [scalar(records, etas[:, k], thetas[k]) for k in 1:NPOS])
+    for (mode, reader) in pairs(readers(scalar))
+        count, hashes, value = hashed_calls(reader, records, etas, thetas)
+        @test count == 1
+        @test_broken hashes == 0
+        @test isequal(value, expected)
+    end
+end
+
+@testset "what a data-only plate does not share" begin
+    # Base arithmetic keeps its plate untouched: it costs about what its key costs.
+    scalar = prepare(arithmetic_plate; have = (:ts, :eta, :theta), want = :cells)
+    rows_plate(plan) = only(r for r in plan.recipes if any(v -> v.name === :rows, r.outputs))
+    @test rows_plate(reader_split(scalar)).op === rows_plate(scalar.plan).op
+    expected = reduce(hcat, [scalar(ts, etas[:, k], thetas[k]) for k in 1:NPOS])
+    for (mode, reader) in pairs(readers(scalar))
+        @test isequal(reader(ts, etas, thetas), expected)
+    end
+    # A plate the caller receives keeps one array per cell, which it may write.
+    same = [collect(1.0:5.0) for _ in 1:NSUB]
+    CALLS[] = 0
+    kept = prepare(wanted_plate; have = (:ts, :eta, :theta), want = (:designs, :cells),
+                   bound = (; ts = same))
+    @test CALLS[] == NSUB
+    designs = first(kept(etas[:, 1], thetas[1]))
+    @test all(i -> designs[i] !== designs[1], 2:NSUB)
+    @test isequal(designs, cumsum.(same))
+end
+
+@testset "a bound plate that reads data alone keeps one object" begin
+    same = [collect(1.0:5.0) for _ in 1:NSUB]
+    for spec in (design_plate, design_plate_fields, design_plate_call, design_plate_chain,
+                 design_plate_two_readers)
+        scalar = prepare(spec; have = (:ts, :eta, :theta), want = :cells)
+        expected = reduce(hcat, [scalar(same, etas[:, k], thetas[k]) for k in 1:NPOS])
+        CALLS[] = 0
+        HASHES[] = 0
+        bound = prepare(spec; have = (:ts, :eta, :theta), want = :cells, bound = (; ts = same))
+        @test CALLS[] == 1
+        @test HASHES[] == (spec in (design_plate, design_plate_two_readers) ? 0 : 2)
+        count, value = calls(vectorize(bound; batched = (:eta, :theta)), etas, thetas)
+        @test count == 0
+        @test isequal(value, expected)
+    end
+    # Two bindings of one cached preparation each compute their own designs.
+    cache = PreparationCache()
+    for (rows, distinct) in (([collect(1.0:5.0) for _ in 1:NSUB], 1),
+                             ([collect(1.0:(isodd(s) ? 5.0 : 3.0)) for s in 1:NSUB], 2))
+        scalar = prepare(design_plate; have = (:ts, :eta, :theta), want = :cells)
+        CALLS[] = 0
+        bound = prepare!(cache, design_plate; have = (:ts, :eta, :theta), want = :cells,
+                         bound = (; ts = rows))
+        @test CALLS[] == distinct
+        @test isequal(bound(etas[:, 1], thetas[1]), scalar(rows, etas[:, 1], thetas[1]))
+    end
+end
+
 @testset "errors" begin
     scalar = prepare(named_cell; have = (:ts, :eta, :theta), want = :cells)
     reader = vectorize(scalar; batched = (:eta, :theta))

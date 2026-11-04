@@ -1810,6 +1810,19 @@ function _cell_field_projection(T)
     m.module === Base && m.sig == Tuple{typeof(Base.getproperty),Any,Symbol}
 end
 
+# Whether the native form `native` of a source over `params` is the property
+# read `x.name` of its one parameter.
+function _native_field_read(native, params, mod)
+    length(params) == 1 || return false
+    field = Meta.isexpr(native, :., 2) ? native.args :
+        Meta.isexpr(native, :call, 3) &&
+        !_native_callee_shadowed(native.args[1], params) &&
+        _cell_binding(native.args[1], mod) === Base.getproperty ?
+        native.args[2:3] : nothing
+    field !== nothing && first(field) == only(params) &&
+        last(field) isa QuoteNode && last(field).value isa Symbol
+end
+
 function _cell_input_views(p::Plan; types = nothing)
     cid(v) = canon_id(p.graph, v.id)
     type_of(v) = types === nothing ? valtype(v) : get(types, cid(v), valtype(v))
@@ -1848,13 +1861,7 @@ function _cell_input_views(p::Plan; types = nothing)
                     native.args[2] == only(params)
                 # A field of existing storage is existing storage: a cell's
                 # NamedTuple of row vectors (`rows[i].weight1`) is read at rows.
-                field = Meta.isexpr(native, :., 2) ? native.args :
-                    Meta.isexpr(native, :call, 3) &&
-                    !_native_callee_shadowed(native.args[1], params) &&
-                    _cell_binding(native.args[1], mod) === Base.getproperty ?
-                    native.args[2:3] : nothing
-                projection |= field !== nothing && first(field) == only(params) &&
-                    last(field) isa QuoteNode && last(field).value isa Symbol &&
+                projection |= _native_field_read(native, params, mod) &&
                     _cell_field_projection(type_of(only(r.inputs)))
             end
         end

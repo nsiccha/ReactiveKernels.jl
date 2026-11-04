@@ -714,7 +714,7 @@ function _partial_split_leaf(native, source, count)
     (; native, split)
 end
 
-_partial_plate_recipe(g, recipe, known, op, rewrites) = nothing
+_partial_plate_recipe(g, recipe, known, op, rewrites, one_object) = nothing
 
 # The cell recipes that stay in the cell whatever is bound, or `nothing` when
 # the plate is left alone. Native scalar plate lowering expects one output per
@@ -986,8 +986,10 @@ Base.@nospecializeinfer function _partial_plate_analysis(
         all(index -> index in atomic_inputs || index in key.inputs,
             eachindex(recipe.inputs))
     want_cached && !whole && cell_types[want_id] <: AbstractArray && return nothing
+    field_reads = Set{Int}(r.id for r in selected if _shared_field_read(r))
+    package_calls = Set{Int}(r.id for r in selected if _shared_package_call(r))
     return (; inner, speculative, readable, excluded, residual, frontier, selected,
-            cell_types, want_id, whole, refused)
+            cell_types, want_id, whole, refused, field_reads, package_calls)
     end
 end
 
@@ -1014,7 +1016,8 @@ _plate_cell_ops_length(@nospecialize(op::_AuthoredPlateOp)) =
 # Generated inner-kernel types are data to this structural pass. Specializing
 # on them recompiles the entire partial evaluator once per authored plate.
 Base.@nospecializeinfer function _partial_plate_recipe(
-        g, recipe, known, @nospecialize(op::_AuthoredPlateOp), rewrites)
+        g, recipe, known, @nospecialize(op::_AuthoredPlateOp), rewrites,
+        one_object::Set{ValueId})
     atomic_inputs = typeof(op).parameters[2]
     inner = _plate_cell_kernel(op).plan
     length(inner.have) == length(recipe.inputs) || return nothing
@@ -1075,9 +1078,15 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     current = 0
     retry_nonfinite = false
     # The cell values of shared calls (`_partial_shared_by_value`): equal
-    # cells hold one object, so a later call reading them compares it by
-    # identity.
+    # cells usually hold one object, so a later expression of Base's functions
+    # reading them compares it by identity alone. So do the cells of a data-only
+    # plate that shared its result.
     shared_ids = Set{ValueId}()
+    for index in eachindex(recipe.inputs)
+        index in atomic_inputs && continue
+        canon_id(g, recipe.inputs[index].id) in one_object &&
+            push!(shared_ids, canon_id(inner.graph, inner.have[index].id))
+    end
     try
         for r in analysis.selected
             current = r.id
@@ -1091,7 +1100,12 @@ Base.@nospecializeinfer function _partial_plate_recipe(
                 # Bool results may use packed BitArrays; bound-array
                 # externalization also supports these.
                 result = similar(batch, analysis.cell_types[cid])
-                by_value = _partial_shared_by_value(r, args, inner.graph, shared_ids)
+                field_read = r.id in analysis.field_reads
+                field_read && canon_id(inner.graph, only(r.inputs).id) in shared_ids &&
+                    push!(shared_ids, cid)
+                by_value = field_read ? nothing :
+                    _partial_shared_by_value(r, args, inner.graph, shared_ids,
+                                             r.id in analysis.package_calls)
                 arguments[cid] = if by_value === nothing
                     _partial_cell_values!(result, batch)
                 else
@@ -1617,13 +1631,14 @@ function _partition_sum_consumer(consumers)
     length(r.outputs) == 1 && _plain_sum_recipe(r) ? r : nothing
 end
 
-_partial_inner_plates(p::Plan, known) = first(_partial_inner_plates(p, known, nothing))
+_partial_inner_plates(p::Plan, known, one_object::Set{ValueId}) =
+    first(_partial_inner_plates(p, known, nothing, one_object))
 
 # The specialized plan and its signature: `()` when the pass left `p` alone,
 # the keys of its plate rewrites when it only rewrote plates through
 # `rewrites` (every later binding with the same signature then has the same
 # plan up to its `_BoundConstant` values), and `nothing` otherwise.
-function _partial_inner_plates(p::Plan, known, rewrites)
+function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId})
     any(r -> r.op isa _AuthoredPlateOp, p.recipes) || return p, ()
     # A shallow structural copy preserves public Value identities and recipe
     # operations. Only its value registry is extended; no shared graph changes.
@@ -1650,7 +1665,7 @@ function _partial_inner_plates(p::Plan, known, rewrites)
         # Plates a partition emits get ids of this pass, which another binding
         # may give a different plate: only the plan's own plates share rewrites.
         specialized = _partial_plate_recipe(copied, r, known, r.op,
-                                            keyed ? rewrites : nothing)
+                                            keyed ? rewrites : nothing, one_object)
         if specialized !== nothing
             changed = true
             push!(signature, specialized.key)
@@ -1808,6 +1823,9 @@ struct _PartialBoundary
     residual::Vector{Recipe}
     constants::Vector{Value}
     plate_slots::Vector{Int}
+    # The prefix plates' outputs whose equal cells are one object
+    # (`_shared_data_plate`).
+    one_object::Set{ValueId}
 end
 
 # `p` with each top-level recipe that reads a live value split around its
@@ -1835,8 +1853,11 @@ function _partial_boundary(p::Plan, bound_values::Vector{Value})
     remaining = Value[v for v in p.have if !(canon_id(g, v.id) in bound_ids)]
     prefix, residual, prefix_owned = _partial_split(p, bound_ids)
     constants = _partial_constants(p, prefix_owned, residual)
+    kept = _shared_kept_values(p)
+    one_object = Set{ValueId}()
+    prefix = Recipe[_shared_data_plate(g, r, r.op, kept, one_object) for r in prefix]
     _PartialBoundary(bound_values, remaining, prefix, residual, constants,
-                     _partial_plate_slots(g, residual, constants))
+                     _partial_plate_slots(g, residual, constants), one_object)
 end
 
 function _partial_plate_slots(g::Graph, residual::Vector{Recipe},
@@ -1977,7 +1998,7 @@ function _partial_residual(p::Plan, b::_PartialBoundary, @nospecialize(hoisted))
     # producers before branch partitioning replaces their consumer edges with
     # lane selections; a later pass cannot see those edges again.
     residual = _fuse_authored_plate_chains(residual)
-    residual, _partial_inner_plates(residual, _partial_known_values(p, b, hoisted))
+    residual, _partial_inner_plates(residual, _partial_known_values(p, b, hoisted), b.one_object)
 end
 
 # ---------------------------------------------------------------------------
@@ -2231,7 +2252,7 @@ function _bound_residual(entry::_BoundEntry, cache,
                                       _bound_fused_residual(entry, cache, classes))
     rewrites = lock(() -> get!(_PlateRewrites, entry.rewrites, classes), cache.lock)
     specialized, signature = _partial_inner_plates(residual,
-        _partial_known_values(entry.plan, b, hoisted), rewrites)
+        _partial_known_values(entry.plan, b, hoisted), rewrites, b.one_object)
     residual, specialized, signature
 end
 
