@@ -105,10 +105,12 @@ export prepare_filter_smc, tune_filter_smc, initialize_filter_smc
 export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
 export sampling_distribution_graph
 export RKPPLModel, RKPPLBoundModel, RKPPLSubmodel, lower_rkppl, condition, @rkppl, SurfaceLoweringError
+export RKPPLDocumentation, rkppl_documentation
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
 export rk_expm
 export rk_symmetric_eigvals, rk_symmetric_eigvecs
 
+include("documentation.jl")
 include("contract.jl")
 include("structural_cache.jl")
 include("frozen.jl")

@@ -71,7 +71,7 @@ _sorted_names(names) = Tuple(sort!(collect(Symbol, names); by = objectid))
 # interns the fields it rebuilds (`_interned`), so equal ones are identical.
 @generated function _structure_fields(plan::StructuralPlan)
     Expr(:tuple, (:(getfield(plan, $(QuoteNode(f)))) for f in fieldnames(StructuralPlan)
-        if f ∉ (:assignments, :columns, :n_obs, :data_values))...)
+        if f ∉ (:assignments, :columns, :n_obs, :data_values, :documentation))...)
 end
 
 # A set of names, or a column table's names with each value's type, as an

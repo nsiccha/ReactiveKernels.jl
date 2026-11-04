@@ -2033,7 +2033,7 @@ end
     @test length(got.predictors) == 1
     @test got.responses[1].predictor === :mu
     @test got.responses[2].predictor === :mu
-    # Leading docstring-to-be is ignored in slice 1.
+    # A leading docstring is retained outside the numerical plan.
     got = lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
@@ -2042,6 +2042,7 @@ end
         y .~ Normal.(mu, 2.0)
     end, (:y, :x); conditioned = (:y, :x))
     @test length(got.responses) == 1
+    @test only(rkppl_documentation(got)).markdown == "my model"
     # Strip-list macros unwrap.
     got = lower_rkppl(quote
         a ~ Normal(0, 1)

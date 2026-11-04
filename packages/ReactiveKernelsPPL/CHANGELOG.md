@@ -16,6 +16,19 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.93
+
+- Export `rkppl_documentation(model_or_plan; path=nothing)` and immutable
+  `RKPPLDocumentation` records. Literal Julia docstrings on declarations,
+  reusable definitions and component uses retain raw Markdown, authored paths,
+  definition provenance and source locations outside the numerical graph.
+  Lowered plans instantiate nested and repeated component documentation once
+  per authored scope, including per-cell components. Binding, pins and
+  unannotated replacements preserve it; annotated replacements update it.
+- Documentation queries copy the record vector without resolving components,
+  evaluating data or rendering Markdown. Generated kernel source remains the
+  actual numerical program; authored documentation is available separately.
+
 ## 0.1.92
 
 - Native `MixtureModel` observations compose heterogeneous full-real component
