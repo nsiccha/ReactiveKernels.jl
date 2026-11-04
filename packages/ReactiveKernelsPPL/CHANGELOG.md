@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.89
+
+- Export `parameter_metadata(built/layout)` to inspect stored constrained
+  parameter ranks and shapes, ragged cell shapes, authored name paths and
+  packed coordinate counts without evaluating or preparing the model.
+
 ## 0.1.88
 
 - Each bound plan reuses demanded data-only results across binding, layout,
