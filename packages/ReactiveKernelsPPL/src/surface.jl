@@ -1544,6 +1544,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # other consumers, including reductions, extracted leaves and the
     # retained recurrence body. Keep their definition dependencies too.
     needed = copy(declaration_dependencies)
+    for r in responses
+        r.mixture_weights isa MixtureWeightRows && push!(needed, r.mixture_weights.name)
+    end
     # A predictor term can read another location as an ordinary column.
     # That definition must survive even when its own response absorbed it
     # as a predictor. Replan the conflicting name as a value below, so both
@@ -8070,10 +8073,20 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
     K >= 1 || _sfail("response $lhs: `MixtureModel` needs ≥ 1 component")
     wraw = if length(args) == 1
         Expr(:vect, fill(1.0 / K, K)...)
-    else
-        _is_ref_call(args[2]) || _sfail("response $lhs: mixture weights are " *
-            "shared as a vector — use `Ref(w)` in `MixtureModel.(..., Ref(w))`")
+    elseif _is_ref_call(args[2])
         args[2].args[2]
+    else
+        weight_rows = args[2]
+        # Broadcasting a flat numeric vector supplies scalar weights to
+        # each constructor, not a probability vector for each observation.
+        (weight_rows isa Real || (weight_rows isa Expr && weight_rows.head === :vect &&
+            all(x -> x isa Real, weight_rows.args))) &&
+            _sfail("response $lhs: mixture weights need one probability vector " *
+                "per observation; wrap shared weights in `Ref(w)`")
+        value = _lower_argument_value(lhs, :mixture_weights, weight_rows, ctx)
+        value isa Symbol || _sfail("response $lhs: mixture weights need one " *
+            "probability vector per observation; wrap shared weights in `Ref(w)`")
+        MixtureWeightRows(value)
     end
     fams = LikelihoodFamily[]
     llinks = LinkFunction[]
@@ -8367,6 +8380,7 @@ end
 # or a complement pair (length/sum/concentration checked at contract —
 # structural, normative).
 function _lower_mixture_weights(lhs, wraw)
+    wraw isa MixtureWeightRows && return wraw
     wraw isa Symbol && return wraw
     wraw isa Expr && wraw.head === :vect || _sfail("response $lhs: " *
         "mixture weights are a literal vector (`[0.4, 0.6]`), a " *
@@ -8411,6 +8425,7 @@ function _mixture_anchor(lhs, loc_uses, scale_uses, w, prednames, ctx)
     end
     w isa Symbol && return w
     w isa MixtureComplementWeights && return w.param
+    w isa MixtureWeightRows && return w.name
     for loc in loc_uses
         loc isa Symbol && loc in ctx.prior_names && return loc
     end

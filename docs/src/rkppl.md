@@ -543,6 +543,14 @@ generated values to sampler coordinates.
   Responses with a strictly positive data domain require `true`.
 - `MixtureModel.(vcat.(C1, C2))` gives the components equal weights.
   Explicit shared weights use `MixtureModel.(vcat.(C1, C2), Ref(w))`.
+  Per-observation probability vectors are an ordinary broadcast operand:
+  `MixtureModel.(vcat.(Normal.(mu, sigma), Normal.(mu, tau)),
+  vcat.(1 .- w, w))`, where `w = logistic.(a .+ z[g])`, for example.
+  A named value of those vectors works too. Each vector has one probability
+  per component, with finite nonnegative entries summing to one; invalid
+  live probabilities give `-Inf` before any logarithm is evaluated.
+  The same form supports more than two components. Requires
+  ReactiveKernelsPPL 0.1.87; `Ref(w)` still shares one vector.
   Equal component log densities retain their ordinary reverse derivatives,
   including all-zero initialization. The scalar and dotted `logaddexp`
   built-ins likewise have partial derivatives `(1/2, 1/2)` at finite ties

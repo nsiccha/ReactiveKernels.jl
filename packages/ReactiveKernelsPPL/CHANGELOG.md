@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.87
+
+- Native `MixtureModel` responses accept an expression-valued probability
+  vector per observation, such as `vcat.(1 .- w, w)` for a logistic predictor
+  `w`. Inline expressions and named values read the same graph, with the
+  authored priors, coordinates and component laws. Each probability vector
+  must have one entry per component, be finite and nonnegative, and sum to
+  one. Zero-probability components retain finite gradients when logistic
+  probabilities saturate. Shared probabilities continue to use `Ref(weights)`,
+  with an axis independent of the observations even for scalar component locations.
+
 ## 0.1.86
 
 - Host transforms synchronize their lazy bijector caches. Concurrent

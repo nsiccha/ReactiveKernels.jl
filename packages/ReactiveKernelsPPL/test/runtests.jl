@@ -70,6 +70,7 @@ const _PPL_TEST_FILES = (
     "test_bare_location.jl",
     "test_student_evidence.jl",
     "test_mixture_complement.jl",
+    "test_mixture_weight_rows.jl",
     "test_occupancy.jl",
     "test_composed.jl",
     "test_values_compose.jl",
