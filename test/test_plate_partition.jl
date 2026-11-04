@@ -673,6 +673,22 @@ end
     @test_throws ArgumentError partition_plan(planned, d.u, 6, nothing)
     @test_throws ArgumentError planned(d.u, 2, plans[1])
     @test_throws ArgumentError planned(d.u, 6, plans[1])
+    # A statement with an array operand compiles once per signature, behind a
+    # `@noinline` wrapper. Scalar statements and plate loops stay inline. This
+    # changes compile time only: the values above are the unplanned kernel's.
+    let mentions(x, s) = x === s || (x isa GlobalRef && x.name === s) ||
+            (x isa Expr && any(a -> mentions(a, s), x.args))
+        @test mentions(ReactiveKernels.code_expr(planned), :_partition_statement_call)
+    end
+    separated(T...) = occursin("_partition_array_call", string(first(only(
+        code_typed(ReactiveKernels._partition_statement_call, T)))))
+    @test separated(typeof(sum), Vector{Float64})
+    @test !separated(typeof(+), Float64, Float64)
+    @test ReactiveKernels._partition_statement_call(sum, [1.0, 2.0]) === 3.0
+    @test ReactiveKernels._partition_statement_call(+, 1.0, 2.0) === 3.0
+    let loop = :(for i in r; x = f(a); end)
+        @test ReactiveKernels._partition_separate_statement(loop) === loop
+    end
     # The planned body computes no rows of its own, and reads no data column
     # at rows: `w`'s rows are label-constant, computed once per label.
     @test !occursin("_cell_canonical_rows", string(planned.ast))

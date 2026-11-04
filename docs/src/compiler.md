@@ -1685,6 +1685,11 @@ reference: as a by-value aggregate of every field, it made LLVM's constant
 propagation take a steeply growing share of the first gradient's compile time
 as the plan widened. Callers still pass, and `partition_plan` still returns,
 the named tuple.
+A statement of a planned body with an array operand calls through one
+`@noinline` wrapper, which compiles once per signature, so Enzyme and LLVM do
+not analyse every array operation as part of one function. Scalar statements
+and plate loops stay inline. This shows in `code_expr` as
+`_partition_statement_call`.
 `plan_constant`
 names HAVE ports whose values are constant per label (not data for the plan),
 and a lazy view of inputs may serve its rows from its parts
