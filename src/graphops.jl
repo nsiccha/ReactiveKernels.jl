@@ -280,7 +280,7 @@ for (f, types) in ((_bound_entry, (Plan, Any)), (_bound_hoisted, (_BoundEntry, T
                    (_partial_residual, (Plan, _PartialBoundary, Any)),
                    (_partial_plate_classes, (_PartialBoundary, Any)),
                    (_partial_narrow_plate_inputs, (Graph, _PartialBoundary, Tuple)),
-                   (_partial_inner_plates, (Plan, Dict{ValueId,Any}, _PlateRewrites)),
+                   (_partial_inner_plates, (Plan, Dict{ValueId,Any}, _PlateRewrites, Set{ValueId})),
                    (_plate_exclusions, (_PlateRewrites, Int, Plan)),
                    (_plate_analysis, (_PlateRewrites, _PlateAnalysisKey, Recipe,
                                       _AuthoredPlateOp, Set{Int}, Set{ValueId},

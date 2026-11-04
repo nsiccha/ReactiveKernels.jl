@@ -47,27 +47,36 @@ function _replicated_shared_cells(p::Plan, shared::Set{ValueId})
     g = p.graph
     _, residual, owned = _partial_split(p, shared)
     candidates = Set(r.id for r in residual if r.op isa _AuthoredPlateOp)
-    isempty(candidates) && return p
     read_by_cells = Set{ValueId}()
     for r in p.recipes
         r.op isa _AuthoredPlateCellLike || continue
         foreach(v -> push!(read_by_cells, canon_id(g, v.id)), r.inputs)
     end
+    kept = _shared_kept_values(p)
     copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers),
                    copy(g.aliases), g.version)
     next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     recipes = Recipe[]
     changed = false
+    # Plates that read data alone share their cells' calls, and a plate reading
+    # their cells usually holds them as one object.
+    one_object = Set{ValueId}()
     for r in p.recipes
-        if r.id in candidates &&
-           !any(v -> canon_id(g, v.id) in read_by_cells, r.outputs)
-            split = _replicated_split_plate(copied, r, owned, fresh, r.op)
-            if split !== nothing
-                push!(recipes, split.prefix, split.position)
-                changed = true
-                continue
+        if r.id in candidates
+            if !any(v -> canon_id(g, v.id) in read_by_cells, r.outputs)
+                split = _replicated_split_plate(copied, r, owned, fresh, r.op, one_object)
+                if split !== nothing
+                    push!(recipes, split.prefix, split.position)
+                    changed = true
+                    continue
+                end
             end
+        elseif r.op isa _AuthoredPlateOp
+            q = _shared_data_plate(copied, r, r.op, kept, one_object)
+            changed |= q !== r
+            push!(recipes, q)
+            continue
         end
         push!(recipes, r)
     end
@@ -77,29 +86,16 @@ function _replicated_shared_cells(p::Plan, shared::Set{ValueId})
     _partial_subplan(template, p.have, p.want, recipes)
 end
 
-_replicated_split_plate(g, recipe, owned, fresh, op) = nothing
+_replicated_split_plate(g, recipe, owned, fresh, op, one_object) = nothing
 # Generated inner-kernel types are data to this structural pass, as they are
 # to `_partial_plate_recipe`.
 Base.@nospecializeinfer function _replicated_split_plate(
         g, recipe::Recipe, owned::Set{ValueId}, fresh,
-        @nospecialize(op::_AuthoredPlateOp))
+        @nospecialize(op::_AuthoredPlateOp), one_object::Set{ValueId})
+    _plate_cell_rewritable(recipe, op) || return nothing
     atomic = _plate_atomic(op)
     kernel = op.kernel
     inner = kernel.plan
-    length(recipe.outputs) == 1 || return nothing
-    length(inner.have) == length(recipe.inputs) || return nothing
-    length(inner.want) == 1 || return nothing
-    length(kernel.lowered_recipes) == length(inner.recipes) || return nothing
-    # One output per recipe, as the native plate lowering and
-    # `_partial_plate_recipe` expect.
-    assigned = Set(canon_id(inner.graph, v.id) for v in inner.have)
-    for q in inner.recipes
-        q.effectful && return nothing
-        length(q.outputs) == 1 || return nothing
-        cid = canon_id(inner.graph, only(q.outputs).id)
-        cid in assigned && return nothing
-        push!(assigned, cid)
-    end
     positions = Int[j for (j, v) in enumerate(recipe.inputs)
                     if canon_id(g, v.id) in owned]
     any(j -> !(j in atomic), positions) || return nothing
@@ -171,7 +167,9 @@ Base.@nospecializeinfer function _replicated_split_plate(
 
     # Cells with equal arguments share the prefix cell's calls of cell-varying
     # values (shared_cell_calls.jl).
-    selected = _shared_cell_calls(cg, selected, varying, readable)
+    same = Set{ValueId}(canon_id(ig, inner.have[j].id) for j in positions
+                        if !(j in atomic) && canon_id(g, recipe.inputs[j].id) in one_object)
+    selected = _shared_cell_calls(cg, selected, varying, readable, same)
 
     template = Plan(cg, inner.have, inner.want, inner.recipes, inner.producer,
                     inner.cost, inner.candidates)
