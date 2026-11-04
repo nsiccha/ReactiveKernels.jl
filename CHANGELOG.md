@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.80
+
+- Lazy plate arms retain complete positional single-output child graphs over
+  named ports. Their shared recipes can run once within the selected arm,
+  including after binding its condition, while empty and untaken arms remain
+  unevaluated.
+
 ## 0.1.79
 
 - Bound preparation can reuse data-only prefix results in a frontend-owned

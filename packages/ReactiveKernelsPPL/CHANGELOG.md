@@ -22,6 +22,7 @@ are recorded in the git history only.
   graphs, including Normal/Cauchy and caller-owned `sampling_distribution_graph`
   mappings with independent argument counts. Components retain their ordinary
   value computations inside the existing weighted log-sum-exp lowering.
+  Requires ReactiveKernels 0.1.80 for shared component work inside support guards.
 
 ## 0.1.90
 
