@@ -1069,3 +1069,85 @@ end
     end
     @test allocated(12) == allocated(4_000)
 end
+
+# Two plates of a partition reading one shared plate (an `@plate for` cell
+# observed twice): the shared plate runs once per row the partition reads, as
+# the whole kernel runs it once per cell, not once per reading plate, and the
+# value pushed to its rows is computed once (snag `partition-over-s-c28c8326`).
+const _PP_SHARED_CALLS = Ref(0)
+_pp_shared_exp(v) = (_PP_SHARED_CALLS[] += 1; exp(v))
+@kernel _pp_shared(u::AbstractVector{Float64}, g::AbstractVector{Int},
+                   y::AbstractVector{Float64}, z::AbstractVector{Float64},
+                   subject::AbstractVector{Int}, other::AbstractVector{Int}) = begin
+    a::Float64 = u[1]
+    b::AbstractVector{Float64} = view(u, 2:11)
+    eta = a .+ b[g]
+    loc = plate(eta) do e
+        _pp_shared_exp(2e)
+    end
+    dy = plate(loc, y) do li, yi
+        -(yi - li)^2 / 2
+    end
+    dz = plate(loc, z) do li, zi
+        -(zi - 2li)^2 / 2
+    end
+    total = sum(dy) + sum(dz)
+    return total
+end
+function _pp_shared_data(per_subject)
+    subject = Int[s for (s, n) in enumerate(per_subject) for _ in 1:n]
+    n = length(subject)
+    (; u = [0.2; [0.1 * ((k * 3) % 7 - 3) for k in 1:10]],
+       g = Int[mod1(2s + i, 10) for (i, s) in enumerate(subject)],
+       y = [0.5 + sin(i / 3) for i in 1:n], z = [cos(i / 4) for i in 1:n],
+       subject, other = Int[mod1(i, length(per_subject)) for i in 1:n])
+end
+const _PP_SHARED_HAVE = (:u, :g, :y, :z, :subject, :other)
+
+@testset "plate_partition: a plate two partition plates read runs once per row" begin
+    d = _pp_shared_data((3, 5, 4, 6))
+    args(d) = (d.u, d.g, d.y, d.z, d.subject, d.other)
+    full = prepare(_pp_shared; have = _PP_SHARED_HAVE, want = (:dy, :dz))
+    dy, dz = full(args(d)...)
+    for (by, rows_of) in (((dy = :subject, dz = :subject), s -> findall(==(s), d.subject)),
+                          ((dy = :subject, dz = :other),
+                           s -> sort!(union(findall(==(s), d.subject), findall(==(s), d.other)))))
+        spec = plate_partition(_pp_shared, (:dy, :dz); by, index = :label)
+        expected(s) = sum(dy[d.subject .== s]) + sum(dz[getproperty(d, by.dz) .== s])
+        k = prepare(spec; have = (_PP_SHARED_HAVE..., :label), want = :partition_total)
+        bound = prepare(spec; have = (_PP_SHARED_HAVE..., :label), want = :partition_total,
+            bound = (; d.g, d.y, d.z, d.subject, d.other))
+        for s in 1:4
+            @test k(args(d)..., s) ≈ expected(s)
+            _PP_SHARED_CALLS[] = 0
+            @test bound(d.u, s) ≈ expected(s)
+            @test _PP_SHARED_CALLS[] == length(rows_of(s))
+        end
+        # The shared plate is lowered once, at the rows of both plates.
+        @test length(findall("_pp_shared_exp", string(bound.ast))) == 1
+        report = partition_locality(bound)
+        @test all(e.status !== :whole for e in report)
+        @test unique(e.status for e in report if e.value in (:eta, :loc)) == [:rows]
+        # Ordinary Reverse: exact, supported by the label's rows of `b`.
+        ad = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), d.u, 2; active = :u)
+        gradient = similar(d.u)
+        value, _ = ad_value_and_gradient!(ad, gradient, d.u, 2)
+        @test value ≈ expected(2)
+        for j in eachindex(d.u)
+            @test gradient[j] ≈ _pp_central(h -> bound(d.u .+ h .* (eachindex(d.u) .== j), 2),
+                                            0.0) atol = 1e-6
+        end
+        @test findall(!iszero, gradient) == partition_footprint(bound, d.u, 2).u
+        allocated(sizes) = let e = _pp_shared_data(sizes),
+                b = prepare(spec; have = (_PP_SHARED_HAVE..., :label), want = :partition_total,
+                    bound = (; e.g, e.y, e.z, e.subject, e.other))
+            b(e.u, 1)
+            @allocated b(e.u, 1)
+        end
+        by.dz === :subject && @test allocated((4, 4, 4, 4)) == allocated((4, 400, 400, 400))
+    end
+    # The whole kernel still runs the shared plate once per cell.
+    _PP_SHARED_CALLS[] = 0
+    prepare(_pp_shared; have = _PP_SHARED_HAVE, want = :total)(args(d)...)
+    @test _PP_SHARED_CALLS[] == length(d.subject)
+end

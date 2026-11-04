@@ -1003,7 +1003,13 @@ through `Base.invokelatest` when crossing Julia's world-age boundary.
 """
 partition_footprint_kernel(kernel::PreparedKernel) = _partition_footprint_kernel(kernel, nothing)
 function _partition_footprint_kernel(kernel::PreparedKernel, selection)
-    p = _lowering_plan(kernel.plan)
+    # A plate several cells read is composed into them first: each composed
+    # cell's reads are recorded at that cell's positions
+    # (`_footprint_capture_program`), and their union is what computing the
+    # plate once at the union of the rows reads. Composing here, before
+    # lowering, also keeps a view the plate read from becoming a typed local
+    # (`_owns_array_regions`), which a footprint must take as a whole read.
+    p = _cell_compose_shared(_lowering_plan(kernel.plan))
     # Row demand uses the value kernel's type evidence and retains its call
     # guard, except for a plan port: footprints recompute that bookkeeping
     # and ignore the supplied plan (the documented placeholder is nothing).

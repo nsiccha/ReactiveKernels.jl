@@ -2261,7 +2261,40 @@ function _plate_without_unread_operands(r::Recipe)
            r.cost, nothing, r.effectful, r.source)
 end
 
-function _fuse_authored_plate_chains(original::Plan; cells_only = false)
+# Whether a plate several cells read (`consumers`, cell recipes) is left for the
+# cell lowering to compute at the union of the rows those cells read
+# (`_cell_pushdowns` / `_CellEmitter`, cell_windows.jl) instead of being copied
+# into each cell. Copying runs the plate's cell once per reading cell: an
+# `@plate for` cell observed twice (snag `partition-over-s-c28c8326`) ran its
+# whole body once for each observation's plate in a partition, where the whole
+# kernel runs it once. Leaving it needs a row form (`_cell_plate_form`: its
+# inputs are its body's distinct HAVE ports and it has a batched one) and each
+# cell reading it only as a batched argument of one kind of cell. The cell
+# lowering composes it after all when its pushdown is then refused
+# (`_cell_outlined_pushdowns`).
+function _shared_cell_producer(g::Graph, producer::Recipe, consumers)
+    producer.op isa _AuthoredPlateLike && length(producer.outputs) == 1 || return false
+    inner = producer.op isa _AuthoredPlateOp ? producer.op.kernel.plan : producer.op.plan
+    roots = ValueId[canon_id(inner.graph, v.id) for v in inner.have]
+    length(roots) == length(producer.inputs) && allunique(roots) || return false
+    atomic = _plate_atomic(producer.op)
+    any(k -> !(k in atomic), eachindex(producer.inputs)) || return false
+    cid = canon_id(g, only(producer.outputs).id)
+    rows = first(consumers).op.rows
+    all(consumers) do c
+        c.op isa _AuthoredPlateCellLike && c.op.rows === rows || return false
+        shared = _plate_atomic(c.op.plate)
+        canon_id(g, first(c.inputs).id) != cid &&
+            all(k -> canon_id(g, c.inputs[k].id) != cid || !(k - 1 in shared),
+                2:length(c.inputs))
+    end
+end
+
+# `compose_shared`: whether a plate read only by several cells is copied into
+# each of them (`true`), left for the cell lowering when `_shared_cell_producer`
+# admits it (`false`), or copied only when its output is in the given set.
+function _fuse_authored_plate_chains(original::Plan; cells_only = false,
+                                     compose_shared::Union{Bool,Set{ValueId}} = false)
     p = _drop_unread_plate_entries(original)
     recipes = Union{Nothing,Recipe}[p.recipes...]
     boundary = Set(canon_id(p.graph, v.id) for v in vcat(p.have, p.want))
@@ -2302,15 +2335,20 @@ function _fuse_authored_plate_chains(original::Plan; cells_only = false)
             recipes[index] = nothing
             progressed = true
         end
-        # A plate read only by cells of other plates composes into each cell.
-        # Each consumer retains its own selected positions, so even disjoint
-        # selections run only the producer cells they actually read.
+        # A plate read only by cells of other plates composes into each cell,
+        # unless the cell lowering computes it once at the union of their rows
+        # (`_shared_cell_producer`). Each consumer retains its own selected
+        # positions, so even disjoint selections run only the producer cells
+        # they actually read.
         for index in eachindex(recipes)
             found = consumers_of(index)
             found === nothing && continue
             cid, consumers = found
             length(consumers) >= 2 || continue
             all(c -> recipes[c].op isa _AuthoredPlateCellLike, consumers) || continue
+            compose = compose_shared isa Bool ? compose_shared : cid in compose_shared
+            compose || !_shared_cell_producer(p.graph, recipes[index],
+                Recipe[recipes[c] for c in consumers]) || continue
             composed = [_compose_plate_into(p.graph, recipes[index], recipes[c], cid)
                 for c in consumers]
             any(isnothing, composed) && continue
@@ -4371,6 +4409,155 @@ end
 Base.@nospecializeinfer function _lower_authored_plate_cell!(
         body, runtime_ops, runtime_recipes, @nospecialize(recipe::Recipe),
         callargs, lhs; windows = nothing)
+    _lower_authored_plate_cells!(body, runtime_ops, runtime_recipes,
+        Any[(recipe, callargs, lhs)]; windows)
+end
+
+# Several cells of one kind (`_cell_lowering_groups`) with one emitter: every
+# value pushed to rows is computed once, at the union of the rows all of them
+# read, before any of their plates runs; each cell then takes its own rows. A
+# partition of several plates (`plate_partition`), or a cell query of several
+# observations, so computes a value they share once, as the whole kernel does
+# (snag `partition-over-s-c28c8326`). One member lowers exactly as one cell.
+Base.@nospecializeinfer function _lower_authored_plate_cells!(
+        body, runtime_ops, runtime_recipes, members; windows = nothing)
+    states = Any[_cell_lowering_setup!(body, recipe, callargs, lhs, windows)
+                 for (recipe, callargs, lhs) in members]
+    # A shared array read only at the cell's own rows whose producer computes
+    # it row by row is computed at those rows (`_CellEmitter`, cell_windows.jl).
+    # Every pushed value is computed once, at all the rows the cells' lanes and
+    # captures read of it; a capture read at a pushed lane's element waits for
+    # that lane, so it is computed in a second round. A capture read through
+    # several lanes is requested at each lane's rows, in one round.
+    if windows !== nothing
+        d = windows.pushdowns
+        partition = first(states).partition
+        waits(s, c) = any(((batched, via),) -> haskey(s.pushed_lanes, batched) ||
+            (via != 0 && haskey(s.pushed_lanes, via)), c[3])
+        request!(emitter, s, (_, value, reads)) = foreach(reads) do (batched, via)
+            _cell_capture_request!(emitter, value, s.slices[batched],
+                via == 0 ? nothing : s.slices[via]; rows = partition)
+        end
+        for s in states
+            foreach(c -> waits(s, c) || request!(windows, s, c), s.captures)
+        end
+        _cell_emit_windows!(windows)
+        for s in states
+            for (position, lane_row) in s.lane_rows
+                taken = _cell_take!(windows, s.pushed_lanes[position], lane_row)
+                s.slices[position] = partition ? taken :
+                    Expr(:call, GlobalRef(@__MODULE__, :_cell_batched_slice), taken, s.cell)
+            end
+        end
+        later = _CellEmitter(body, d, windows.names, windows.runtime_ops,
+            windows.runtime_recipes; sorted = partition)
+        for s in states
+            foreach(c -> waits(s, c) && request!(later, s, c), s.captures)
+        end
+        any(s -> any(c -> waits(s, c), s.captures), states) && _cell_emit_windows!(later)
+        for s in states, c in s.captures
+            position, value = c[1], c[2]
+            s.slices[position] = _cell_capture!(waits(s, c) ? later : windows, value)
+        end
+    end
+    for s in states
+        for (position, program) in s.footprint_programs
+            readplate = _AuthoredPlateOp{typeof(program),s.atomic}(program)
+            reads = gensym(:cell_reads)
+            _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
+                readplate, s.slices, s.plate_values, reads, nothing; element_type=Vector{Int})
+            _footprint_record!(canon_id(windows.pushdowns.graph, s.plate_values[position].id),
+                               :gathered, reads)
+        end
+        if s.partition
+            _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
+                s.plate, s.slices, s.plate_values, nothing, s.lhs)
+            continue
+        end
+        pointwise = gensym(:cell_pointwise)
+        _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
+            s.plate, s.slices, s.plate_values, pointwise, nothing)
+        push!(body.args, Expr(:(=), s.lhs, Expr(:call, GlobalRef(Base, :only), pointwise)))
+    end
+    body
+end
+
+# The cells of plan `p` that lower with one emitter
+# (`_lower_authored_plate_cells!`): cells of one kind (partitions or single
+# cells, with the same plan port and label-constant ports) that compute a
+# pushed value in common (`d.pushed`: one they read at a lane or a capture, or
+# one such a value is computed from), unless a recipe from the first of them to
+# the last reads one of their outputs, since the group lowers at its last
+# member. Each member's id maps to its group's ids in plan order; a cell that
+# shares no pushed value with another lowers alone, as before.
+function _cell_lowering_groups(p::Plan, d)
+    g = p.graph
+    cid(v) = canon_id(g, v.id)
+    # The pushed values each cell computes: its pushed lanes and captures,
+    # and their pushed inputs, transitively.
+    function computed(r)
+        work = ValueId[]
+        for k in get(d.batched, r.id, Set{Int}())
+            push!(work, cid(r.inputs[1 + k]))
+        end
+        for k in keys(get(d.captures, r.id, Dict{Int,Vector{Tuple{Int,Int}}}()))
+            push!(work, cid(r.inputs[1 + k]))
+        end
+        seen = Set{ValueId}()
+        while !isempty(work)
+            v = pop!(work)
+            v in d.pushed && !(v in seen) || continue
+            push!(seen, v)
+            foreach(input -> push!(work, cid(input)), d.producer[v].inputs)
+        end
+        seen
+    end
+    kinds = Dict{Any,Vector{Tuple{Int,Set{ValueId}}}}()
+    for (position, r) in enumerate(p.recipes)
+        r.op isa _AuthoredPlateCellOp || continue
+        reached = computed(r)
+        isempty(reached) && continue
+        push!(get!(() -> Tuple{Int,Set{ValueId}}[], kinds,
+            (r.op.rows, r.op.plan, r.op.plan_constant)), (position, reached))
+    end
+    groups = Dict{Int,Vector{Int}}()
+    for cells in values(kinds)
+        # Connected components of cells sharing a computed value.
+        components = Vector{Tuple{Vector{Int},Set{ValueId}}}()
+        for (position, reached) in cells
+            joined = [c for c in components if !isdisjoint(c[2], reached)]
+            merged = (Int[position], copy(reached))
+            for c in joined
+                append!(merged[1], c[1])
+                union!(merged[2], c[2])
+            end
+            filter!(c -> !any(j -> j === c, joined), components)
+            push!(components, merged)
+        end
+        for (positions, _) in components
+            length(positions) >= 2 || continue
+            sort!(positions)
+            members = Set(positions)
+            outputs = Set{ValueId}()
+            independent = all(first(positions):last(positions)) do position
+                r = p.recipes[position]
+                any(v -> cid(v) in outputs, r.inputs) && return false
+                position in members && foreach(v -> push!(outputs, cid(v)), r.outputs)
+                true
+            end
+            independent || continue
+            group = Int[p.recipes[position].id for position in positions]
+            foreach(id -> groups[id] = group, group)
+        end
+    end
+    groups
+end
+
+# One cell's slices, rows and requests (`_lower_authored_plate_cells!`): its
+# batched arguments' raw forms and slices, its domain check, each pushed lane
+# requested at the cell's rows, and its pushed captures, not yet requested.
+Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recipe::Recipe),
+                                                      callargs, lhs, windows)
     op = recipe.op::_AuthoredPlateCellOp
     plate = op.plate
     atomic = typeof(plate).parameters[2]
@@ -4469,60 +4656,17 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
             end
         end
     end
-    # A shared array read only at the cell's own rows whose producer computes
-    # it row by row is computed at those rows (`_CellEmitter`, cell_windows.jl).
-    # Every pushed value is computed once, at all the rows the cell's lanes and
-    # captures read of it; a capture read at a pushed lane's element waits for
-    # that lane, so it is computed in a second round. A capture read through
-    # several lanes is requested at each lane's rows, in one round.
+    captures = Tuple{Int,ValueId,Vector{Tuple{Int,Int}}}[]
     if windows !== nothing
         d = windows.pushdowns
-        captures = Tuple{Int,ValueId,Vector{Tuple{Int,Int}}}[]
         for (position, reads) in sort!(collect(get(d.captures, recipe.id,
                 Dict{Int,Vector{Tuple{Int,Int}}}())); by = first)
             value = canon_id(d.graph, plate_values[position].id)
             value in d.pushed && push!(captures, (position, value, reads))
         end
-        waits(c) = any(((batched, via),) -> haskey(pushed_lanes, batched) ||
-            (via != 0 && haskey(pushed_lanes, via)), c[3])
-        request!(emitter, (_, value, reads)) = foreach(reads) do (batched, via)
-            _cell_capture_request!(emitter, value, slices[batched],
-                via == 0 ? nothing : slices[via]; rows = partition)
-        end
-        foreach(c -> waits(c) || request!(windows, c), captures)
-        _cell_emit_windows!(windows)
-        for (position, lane_row) in lane_rows
-            taken = _cell_take!(windows, pushed_lanes[position], lane_row)
-            slices[position] = partition ? taken :
-                Expr(:call, GlobalRef(@__MODULE__, :_cell_batched_slice), taken, cell)
-        end
-        later = _CellEmitter(body, d, windows.names, windows.runtime_ops,
-            windows.runtime_recipes; sorted = partition)
-        foreach(c -> waits(c) && request!(later, c), captures)
-        any(waits, captures) && _cell_emit_windows!(later)
-        for c in captures
-            position, value = c[1], c[2]
-            slices[position] = _cell_capture!(waits(c) ? later : windows, value)
-        end
     end
-    for (position, program) in footprint_programs
-        readplate = _AuthoredPlateOp{typeof(program),atomic}(program)
-        reads = gensym(:cell_reads)
-        _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
-            readplate, slices, plate_values, reads, nothing; element_type=Vector{Int})
-        _footprint_record!(canon_id(windows.pushdowns.graph, plate_values[position].id),
-                           :gathered, reads)
-    end
-    if partition
-        _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
-            plate, slices, plate_values, nothing, lhs)
-        return body
-    end
-    pointwise = gensym(:cell_pointwise)
-    _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
-        plate, slices, plate_values, pointwise, nothing)
-    push!(body.args, Expr(:(=), lhs, Expr(:call, GlobalRef(Base, :only), pointwise)))
-    body
+    (; plate, atomic, plate_values, partition, pushed_lanes, cell, slices, lane_rows, captures,
+       footprint_programs, lhs)
 end
 
 # A recipe output authored with a type (`weights::Vector{Float64} = ...`) is
@@ -4750,13 +4894,22 @@ function _lower_with_ops_collecting(p::Plan;
     # (`_cell_pushdowns`, cell_windows.jl). With `outline`, inline
     # subexpressions that block that become recipes of their own first
     # (`_cell_outlined_pushdowns`), so `p` is the plan lowered from here on.
+    # A plate several cells read that fusion left for this lowering
+    # (`_shared_cell_producer`) is composed into those cells when nothing
+    # computes it at their rows: without pushdowns, or when they refuse it.
     cells = nothing
     if inline_embedded && pushdowns && type_hints === nothing
+        pushdowns_of(q) = _cell_compose_unpushed(q, _cell_pushdowns(q;
+            argument_types = exemplar_types)) do composed
+            pushdowns_of(composed)
+        end
         p, cells = outline ? _cell_outlined_pushdowns(p; argument_types = exemplar_types) :
-            (p, _cell_pushdowns(p; argument_types = exemplar_types))
+            pushdowns_of(p)
         # A value a cell reads at rows but would compute whole is refused or
         # reported by name (`locality`, plate_partition.jl).
         cells === nothing || _cell_locality_check!(p, cells)
+    elseif any(r -> r.op isa _AuthoredPlateCellOp, p.recipes)
+        p = _cell_compose_shared(p)
     end
     g = p.graph
     names = _varnames(p)
@@ -4806,6 +4959,12 @@ function _lower_with_ops_collecting(p::Plan;
     # Column projections a native scan writes directly
     # (`_authored_scan_column_projections`); each keeps its table slots.
     scan_columns = Set{Int}()
+    # Cells sharing one emitter (`_cell_lowering_groups`), each group's
+    # members as the loop reaches them.
+    cell_groups = inline_embedded && cells !== nothing ? _cell_lowering_groups(p, cells) :
+        Dict{Int,Vector{Int}}()
+    cell_pending = IdDict{Vector{Int},Vector{Any}}(group => Any[]
+        for group in unique(values(cell_groups)))
     for r in p.recipes
         r.id in skipped_recipes && continue
         if r.id in terminal_skips
@@ -4948,8 +5107,15 @@ function _lower_with_ops_collecting(p::Plan;
         end
         lhs = length(lhsnames) == 1 ? only(lhsnames) : Expr(:tuple, lhsnames...)
         if inline_embedded && r.op isa _AuthoredPlateCellOp
-            _lower_authored_plate_cell!(body, runtime_ops, runtime_recipes, r,
-                callargs, lhs;
+            # A group's cells lower together, with one emitter, at the last
+            # of them (`_cell_lowering_groups`).
+            group = get(cell_groups, r.id, nothing)
+            if group !== nothing
+                push!(cell_pending[group], (r, callargs, lhs))
+                length(cell_pending[group]) < length(group) && continue
+            end
+            members = group === nothing ? Any[(r, callargs, lhs)] : cell_pending[group]
+            _lower_authored_plate_cells!(body, runtime_ops, runtime_recipes, members;
                 windows = cells === nothing ? nothing :
                     _CellEmitter(body, cells, names, runtime_ops, runtime_recipes;
                                  sorted = r.op.rows,
@@ -5129,6 +5295,8 @@ function _lower_with_ops_collecting(p::Plan;
                     _embedded_statements(inner_ast, callargs, lhs, op_offset))
         end
     end
+    all(((group, pending),) -> length(pending) == length(group), cell_pending) ||
+        error("internal: a group of plate cells was not lowered completely")
     retval = length(p.want) == 1 ? nm(p.want[1]) :
              Expr(:tuple, (nm(w) for w in p.want)...)
     _footprint_recording() &&
