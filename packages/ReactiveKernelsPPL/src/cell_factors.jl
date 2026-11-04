@@ -44,8 +44,9 @@ function prepare_cell_factors(built, plan::StructuralPlan, observation::Symbol;
     have = (_query_have(plan)..., _CELL_PORT)
     rule = _query_partition_rule(plan, built.layout, partitioned, nothing)
     parts = _query_shared_parts(spec, plan, have, want, rule, (_CELL_PORT,), on_error)
+    exemplar = _query_exemplar(built.layout, u0)
     shared = isempty(rule) ? nothing : _make_cell_shared(parts, built.layout,
-        last(only(rule)), _query_exemplar(built.layout, u0), on_error)
+        last(only(rule)), exemplar, on_error)
     factor_bound = _query_bound(plan)
     factors = if parts === nothing
         ReactiveKernels._cell_factor_graph(spec, want;
@@ -74,7 +75,7 @@ function prepare_cell_factors(built, plan::StructuralPlan, observation::Symbol;
     end
     filter!(!isnothing, reductions)
     CellFactors(factors.spec, plan, built.layout, observation, want, reductions,
-                on_error, locality, shared)
+                on_error, locality, shared, exemplar)
 end
 
 struct CellFactors{S,P,L,R,E,C,H}
@@ -87,6 +88,8 @@ struct CellFactors{S,P,L,R,E,C,H}
     on_error::E
     locality::C
     shared::H
+    # The packed point that types strict preparation (`u0`, or zeros).
+    exemplar::Vector{Float64}
 end
 
 "Reduction names in the order used by the outer factor's sum vector."
@@ -155,6 +158,12 @@ Use these footprints to select compact coordinates for
 [`prepare_cell_factor_ad`](@ref). The public `kernel` property also supports
 RK's `code_expr` and `partition_locality` inspection. Other real-valued packed
 vectors are converted to `Vector{Float64}`, as for `CellQuery`.
+
+Native preparation uses a packed `Vector{Float64}`, `Int` positions and a
+`Vector{Float64}` of sums, so that a strict cell knows which of its values are
+numbers. Query calls keep other argument types by preparing and caching a
+specialization for them, as `CellQuery` does. Without a shared prefix, direct
+calls to `q.kernel` and its full footprint kernel require those exact types.
 """
 function prepare_cell_factor_query(f::CellFactors, factor)
     spec, want = _cell_factor_spec(f, factor)
@@ -164,7 +173,10 @@ function prepare_cell_factor_query(f::CellFactors, factor)
     tail = outer ? (:_ppl_cell_sums, _CELL_PORT) : (_CELL_PORT, :_ppl_cell_term)
     have = (base_have..., tail..., frontiers...)
     bound = _cell_factor_bound(f)
-    residual = Base.invokelatest(prepare, spec; have, want, bound, on_error = f.on_error)
+    args = (f.exemplar, (outer ? (zeros(length(f.reductions)), 1) : (1, 1))...,
+            _cell_shared_values(f.shared)...)
+    residual = Base.invokelatest(prepare, spec; have, want, bound, on_error = f.on_error,
+                                 exemplars = args)
     kernel = if _cell_has_prefix(f.shared)
         full = ReactiveKernels._cell_factor_full_spec(spec, f.shared.prefix_plan)
         Base.invokelatest(prepare, full; have = (base_have..., tail...), want,
@@ -172,16 +184,29 @@ function prepare_cell_factor_query(f::CellFactors, factor)
     else
         residual
     end
-    CellFactorQuery(kernel, residual, f.shared, outer, length(f.reductions))
+    CellFactorQuery(kernel, residual, f.shared, outer, length(f.reductions), args,
+                    Dict{DataType,Any}(), f.on_error)
 end
 
 "Scalar outer or summand query; construct with [`prepare_cell_factor_query`](@ref)."
-struct CellFactorQuery{K,R,S}
+struct CellFactorQuery{K,R,S,A,E}
     kernel::K
     residual::R
     shared::S
     outer::Bool
     nsums::Int
+    # The arguments `residual` was prepared for, and its other specializations.
+    args::A
+    specializations::Dict{DataType,Any}
+    on_error::E
+end
+
+# The residual for these arguments: the prepared one is known from the types
+# alone, so a call with its exact types never reaches the cache or boxes it.
+@inline _cell_factor_residual(q::CellFactorQuery{<:Any,<:Any,<:Any,A}, args::A) where {A} =
+    q.residual
+_cell_factor_residual(q::CellFactorQuery, args) = get!(q.specializations, typeof(args)) do
+    Base.invokelatest(prepare, q.residual.plan; exemplars = args, on_error = q.on_error)
 end
 
 function _check_cell_factor_args(q::CellFactorQuery, a)
@@ -199,8 +224,8 @@ function (q::CellFactorQuery)(u::AbstractVector{Float64}, a, b)
     # Keep the latest-world refresh, but read its stored values through the
     # concrete cache type. Splatting invokelatest's Any result boxes the
     # prepared callable repeatedly, even when the shared tuple is empty.
-    shared_values = _cell_shared_values(q.shared)
-    Base.invokelatest(q.residual, u, a, b, shared_values...)::Float64
+    args = (u, a, b, _cell_shared_values(q.shared)...)
+    Base.invokelatest(_cell_factor_residual(q, args), args...)::Float64
 end
 (q::CellFactorQuery)(u::AbstractVector{<:Real}, a, b) = q(Vector{Float64}(u), a, b)
 
@@ -234,15 +259,6 @@ function prepare_cell_factor_ad(prepare_operator, f::CellFactors, factor,
     spec, want = _cell_factor_spec(f, factor)
     _compact_overlay!(spec, f.plan)
     outer = factor === :outer
-    have = outer ?
-        (:_ppl_cell_base, :_ppl_cell_sums, :_ppl_cell_active, :_ppl_cell_slots,
-         _query_columns(f.plan)..., _frozen_graph_names(f.plan)..., _CELL_PORT,
-         _cell_frontier_names(f.shared)...) :
-        (:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots,
-         _query_columns(f.plan)..., _frozen_graph_names(f.plan)..., _CELL_PORT, :_ppl_cell_term,
-         _cell_frontier_names(f.shared)...)
-    kernel = Base.invokelatest(prepare, spec; have, want, bound = _cell_factor_bound(f),
-                              on_error = f.on_error)
     selected = Vector{Int}(indices0)
     slots = _compact_cell_slots(f.layout.total, selected)
     active0 = base0[indices0]
@@ -251,7 +267,8 @@ function prepare_cell_factor_ad(prepare_operator, f::CellFactors, factor,
         sumkernel = Base.invokelatest(prepare, f.spec;
             have = (query_have..., _CELL_PORT, _cell_frontier_names(f.shared)...),
             want = Tuple(r.value for r in f.reductions),
-            bound = _cell_factor_bound(f), on_error = f.on_error)
+            bound = _cell_factor_bound(f), on_error = f.on_error,
+            exemplars = (base0, cell0, shared_values...))
         values = Base.invokelatest(sumkernel, base0, cell0, shared_values...)
         # A prepared kernel unwraps one WANT to a scalar. Collecting that
         # scalar would produce a zero-dimensional array, not the promised
@@ -262,11 +279,40 @@ function prepare_cell_factor_ad(prepare_operator, f::CellFactors, factor,
     end
     point = outer ? (base0, sums0, active0, slots, cell0) :
                     (base0, active0, slots, cell0, term0)
+    have = outer ?
+        (:_ppl_cell_base, :_ppl_cell_sums, :_ppl_cell_active, :_ppl_cell_slots,
+         _query_columns(f.plan)..., _frozen_graph_names(f.plan)..., _CELL_PORT,
+         _cell_frontier_names(f.shared)...) :
+        (:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots,
+         _query_columns(f.plan)..., _frozen_graph_names(f.plan)..., _CELL_PORT, :_ppl_cell_term,
+         _cell_frontier_names(f.shared)...)
+    kernel = Base.invokelatest(prepare, spec; have, want, bound = _cell_factor_bound(f),
+                              on_error = f.on_error, exemplars = (point..., shared_values...))
     active = outer ? (:_ppl_cell_sums, :_ppl_cell_active) : :_ppl_cell_active
-    prepared = Base.invokelatest(prepare_operator, kernel, backend, exemplars...,
-        point..., shared_values...; active)
+    # An outer factor with no reductions differentiates its one active vector.
+    # Its sum operand is empty and unread; as a member of a tuple point it needs
+    # a tuple derivative, which forward over reverse cannot take and which static
+    # activity analysis refuses once a large cell is not inlined.
+    single = outer && isempty(f.reductions)
+    tangents = single ? map(_cell_no_sums, exemplars) : exemplars
+    prepared = Base.invokelatest(prepare_operator, kernel, backend, tangents...,
+        point..., shared_values...; active = single ? :_ppl_cell_active : active)
     CellFactorAD(prepared, f.layout, selected, slots, outer, length(f.reductions), f.shared, sums0)
 end
+
+# The `(sum_part, coordinate_part)` shape a caller uses for an outer factor, to
+# and from the one active vector of an outer factor with no reductions.
+_cell_no_sums(x) = x
+_cell_no_sums(x::Tuple) = map(_cell_no_sums, x)
+function _cell_no_sums(x::Tuple{AbstractVector{<:Real},AbstractVector{<:Real}})
+    isempty(first(x)) || throw(ContractValidationError(
+        "[query] this outer factor has no sums, so a direction's sum part must be empty"))
+    last(x)
+end
+_cell_with_sums(x, empty) = x
+_cell_with_sums(x::Tuple, empty) = map(v -> _cell_with_sums(v, empty), x)
+_cell_with_sums(x::AbstractVector{<:Real}, empty) = (empty, x)
+_cell_single_active(q) = q.outer && q.nsums == 0
 
 struct CellFactorAD{P,L,S}
     prepared::P
@@ -300,7 +346,10 @@ function _cell_factor_ad_call(verb, q::CellFactorAD, args::Vararg{Any,N}) where 
         _select_compact_cells!(q, base, active, indices)
         _check_cell_local_selection(q.shared, indices)
         shared_values = _cell_ad_values(q.shared, base_arg)
-        verb(q.prepared, leading..., base, sums, active, q.slots, cell, shared_values...)
+        _cell_single_active(q) || return verb(q.prepared, leading..., base, sums, active,
+            q.slots, cell, shared_values...)
+        _cell_with_sums(verb(q.prepared, map(_cell_no_sums, leading)..., base, sums, active,
+            q.slots, cell, shared_values...), q.exemplar_sums)
     else
         base_arg, active, indices, cell, term = args[N-4:N]
         base = _cell_ad_base(q.shared, base_arg)

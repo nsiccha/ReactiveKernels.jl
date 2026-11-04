@@ -608,6 +608,30 @@ end
 @inline _cell_reshape_window(data, rows::Vector{Int}, dims::Tuple) =
     reshape(data, length(rows), Base.tail(dims)...)
 
+# `vec(x)` of an array `x` with axes `shape`: position `u` is row
+# `mod1(u, n)` of `x` at trailing position `cld(u, n)` (column-major), `n`
+# its row count. The rows of `x` positions `U` read, sorted and unique; the
+# window then reads each position from `x`'s rows (`_cell_vec_window`).
+@inline _cell_vec_shape(shape::Tuple) = (Base.OneTo(prod(length, shape; init = 1)),)
+@inline _cell_vec_rows(shape::Tuple, u::Integer) =
+    isempty(shape) ? 1 : mod1(u, length(first(shape)))
+@inline _cell_vec_rows(shape::Tuple, U::Vector{Int}) =
+    isempty(shape) ? (isempty(U) ? Int[] : [1]) :
+    sort!(unique!(Int[mod1(u, length(first(shape))) for u in U]))
+@inline _cell_vec_window(data, R::Integer, u::Integer, shape::Tuple) =
+    [_cell_vec_entry(data, 1, isempty(shape) ? 1 : cld(u, length(first(shape))))]
+function _cell_vec_window(data, R::Vector{Int}, U::Vector{Int}, shape::Tuple)
+    isempty(shape) && return [_cell_vec_entry(data, 1, 1) for _ in U]
+    n = length(first(shape))
+    [_cell_vec_entry(data, searchsortedfirst(R, mod1(u, n)), cld(u, n)) for u in U]
+end
+# Entry `t` (linear over the trailing axes) of window row `p`.
+@inline _cell_vec_entry(data::Number, p::Int, t::Int) = data
+@inline _cell_vec_entry(data::AbstractVector, p::Int, t::Int) =
+    (t == 1 || throw(BoundsError(data, (p, t))); data[p])
+@inline _cell_vec_entry(data::AbstractArray, p::Int, t::Int) =
+    data[p, CartesianIndices(Base.tail(axes(data)))[t]]
+
 # ---------------------------------------------------------------- analysis
 
 # How a source recipe computes its value row by row. `roles[j]` is how input
@@ -967,6 +991,14 @@ function _cell_range_view(native, position, mod)
     parts = _cell_literal_parts(range.args[2:end], position, source)
     parts === nothing && return nothing
     (position[source], parts)
+end
+
+# Whether a `:range_view` recipe is the `view` call, not the copying `A[lo:hi]`.
+function _cell_is_view_call(r::Recipe)
+    analyzed = _cell_native(r; outlined = true)
+    analyzed === nothing && return false
+    native = first(analyzed)
+    native isa Expr && native.head === :call
 end
 
 # `reshape(v, n, k...)` with `v` a parameter and the dimensions integer
@@ -1356,6 +1388,7 @@ function _cell_value_types(p::Plan; argument_types = nothing,
                 (form = _cell_helper_form(r, inputs; outlined = r.id in outlined))
             form === nothing &&
                 (form = _cell_position_form(r, inputs; outlined = r.id in outlined))
+            form === nothing && (form = _cell_vec_form(r, inputs; outlined = r.id in outlined))
             known[r] = form
         end
         inferred = if length(r.outputs) == 1 && r.op isa _AuthoredPlateOp
@@ -1635,6 +1668,10 @@ function _cell_bound_capture_check(p::Plan, producers, static_type, known, outli
             return shapes[cid] = f.kind === :range_view ?
                 _cell_range_shape(literal) : _cell_dims_shape(literal)
         end
+        if f.kind === :vec
+            s = shape(r.inputs[only(f.leaves)])
+            return shapes[cid] = s === nothing ? nothing : _cell_vec_shape(s)
+        end
         f.kind in (:identity, :checked, :pointwise, :columns, :hcat, :reduce, :transposed,
                    :array_arithmetic, :position_map) ||
             return nothing
@@ -1658,7 +1695,23 @@ function _cell_bound_capture_check(p::Plan, producers, static_type, known, outli
             end
         end
         f.kind === :columns && return shapes[cid] = _cell_column_shape(only(parts))
-        f.kind === :position_map && return shapes[cid] = _cell_position_shape(parts...)
+        if f.kind === :position_map
+            # An array result's trailing extents: literals, or sizes of
+            # inputs of known shape.
+            extents = Int[]
+            for x in f.rowmap.extents
+                if x[1] === :const
+                    push!(extents, x[2])
+                else
+                    s = shape(r.inputs[x[2]])
+                    (s === nothing || x[3] > length(s)) && return nothing
+                    push!(extents, length(s[x[3]]))
+                end
+            end
+            rows = _cell_position_shape(parts...)
+            return shapes[cid] = isempty(extents) ? rows :
+                _cell_position_extents(rows, Tuple(extents))
+        end
         f.kind === :hcat && return shapes[cid] = _cell_hcat_shape(Tuple(parts))
         f.kind === :array_arithmetic && return shapes[cid] = Base.promote_shape(parts...)
         full = _plate_broadcast_shape(Tuple(parts))
@@ -1816,7 +1869,7 @@ end
 # Whether a producer reads an input in `role` at its own rows.
 _cell_row_role(role) =
     role in (:leaf, :gather, :linear_gather, :column, :factor_leaf, :factor, :part,
-             :range_source, :reshape_source, :row)
+             :range_source, :reshape_source, :row, :vec_source)
 
 # `outlined` are the ids of the recipes a cell lowering outlined (`_cell_outline`);
 # `blocked`, when given, collects the ids of the producers whose values a reader
@@ -1871,7 +1924,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
         r = only(producers[cid])
         f = forms[r.id]
         f.kind in (:pointwise, :identity, :checked, :columns, :hcat, :vcat, :range_view, :reshape,
-                   :reduce, :transposed, :array_arithmetic, :position_map) && return true
+                   :reduce, :transposed, :array_arithmetic, :position_map, :vec) && return true
         inputs = r.inputs
         factor = cidof(inputs[findfirst(==(:factor), f.roles)])
         (f.operand == 0 ? static_type(only(r.outputs)) <: AbstractVector :
@@ -1902,6 +1955,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
             # A transposed operand is one row only when it is a vector (a
             # number transposes to itself); a matrix's transpose reads columns.
             role === :transposed ? static_type(input) <: Union{AbstractVector,Number} :
+            role === :vec_source ? static_type(input) <: AbstractArray :
             true
         end && all(f.kind in (:range_view, :reshape) ? f.literal : ()) do part
             part isa Int || static_type(r.inputs[part.input]) <: Integer
@@ -2044,8 +2098,16 @@ end
 # it (`_partial_emit_split!`).
 function _cell_outline_nodes(r::Recipe)
     length(r.outputs) == 1 && !r.effectful || return nothing
-    parts = _partial_split_parts(r)
-    parts === nothing && return nothing
+    # The strict boundaries also separate an undotted scalar argument of a
+    # broadcast (`sd .* (z .- total / n)`), which runs once before it either way.
+    for factors in (false, true)
+        parts = _partial_split_parts(r; factors)
+        found = parts === nothing ? nothing : _cell_marked_nodes(r, parts)
+        found === nothing || return found
+    end
+    nothing
+end
+function _cell_marked_nodes(r::Recipe, parts)
     nodes = parts.split.nodes
     index = IdDict{Any,Int}(node.expr => i for (i, node) in enumerate(nodes))
     named = falses(length(nodes))
@@ -2435,6 +2497,9 @@ function _cell_shape!(e::_CellEmitter, cid::ValueId)
         Expr(:call, _cell_ref(:_cell_range_shape), _cell_literal!(e, r, f)))
     f.kind === :reshape && return e.shapes[cid] = _cell_bind!(e, :cell_shape,
         Expr(:call, _cell_ref(:_cell_dims_shape), _cell_literal!(e, r, f)))
+    f.kind === :vec && return e.shapes[cid] = _cell_bind!(e, :cell_shape,
+        Expr(:call, _cell_ref(:_cell_vec_shape),
+             input_shape(canon_id(d.graph, r.inputs[only(f.leaves)].id))))
     parts = Any[_cell_part_shape!(e, r, f, j) for j in f.leaves]
     # A transposed vector is one row; a gather keeping axes of its source spans
     # them (`_cell_extra_parts`).
@@ -2448,7 +2513,7 @@ function _cell_shape!(e::_CellEmitter, cid::ValueId)
     end
     shape = f.kind === :columns ?
         Expr(:call, _cell_ref(:_cell_column_shape), only(parts)) :
-        f.kind === :position_map ? Expr(:call, _cell_ref(:_cell_position_shape), parts...) :
+        f.kind === :position_map ? _cell_position_shape_expr!(e, r, f, parts, input_shape) :
         f.kind === :hcat ? Expr(:call, _cell_ref(:_cell_hcat_shape), Expr(:tuple, parts...)) :
         f.kind === :array_arithmetic ? Expr(:call, GlobalRef(Base, :promote_shape), parts...) :
         Expr(:call, _cell_ref(:_plate_broadcast_shape), Expr(:tuple, parts...))
@@ -2619,6 +2684,12 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
             reads[j] = _cell_bind!(e, :cell_row,
                 Expr(:call, _cell_ref(:_cell_reshape_rows), _cell_literal!(e, r, f), U))
             icid in d.pushed && _cell_request!(e, icid, reads[j])
+        elseif role === :vec_source
+            # The rows of the source that the requested positions lie in.
+            shape = icid in d.pushed ? _cell_shape!(e, icid) : _cell_leaf_shape_expr(e, icid)
+            reads[j] = _cell_bind!(e, :cell_row,
+                Expr(:call, _cell_ref(:_cell_vec_rows), shape, U))
+            icid in d.pushed && _cell_request!(e, icid, reads[j])
         end
     end
     e.reads[cid] = reads
@@ -2660,11 +2731,23 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
     U = e.unions[cid]
     f.kind === :vcat && return _cell_vcat_window!(e, cid, r, f, U)
     if f.kind in (:pointwise, :identity, :checked, :columns, :hcat, :range_view, :reshape, :reduce,
-                  :transposed, :array_arithmetic, :position_map)
+                  :transposed, :array_arithmetic, :position_map, :vec)
         push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row),
             _cell_shape!(e, cid), U, e.sorted))
     end
     reads = e.reads[cid]
+    if f.kind === :vec
+        # The source's rows, by its own window when it is pushed and as a
+        # bounds-checked view of its whole value otherwise.
+        j = only(f.leaves)
+        icid = canon_id(d.graph, r.inputs[j].id)
+        icid in d.pushed || _footprint_record!(icid, :rows, reads[j])
+        rows = icid in d.pushed ? _cell_take!(e, icid, reads[j]) :
+            Expr(:call, _cell_ref(:_cell_factor_rows), e.names[icid], reads[j])
+        shape = icid in d.pushed ? _cell_shape!(e, icid) : _cell_leaf_shape_expr(e, icid)
+        return _cell_bind!(e, :cell_rows,
+            Expr(:call, _cell_ref(:_cell_vec_window), rows, reads[j], U, shape))
+    end
     if f.kind in (:range_view, :reshape)
         # The source's positions, by the source's own window when it is pushed
         # and as a bounds-checked view of its whole value otherwise.
@@ -2713,11 +2796,13 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
             end
             push!(args, e.names[icid])
         elseif role === :row
-            # Fresh dense rows: the helper is proven for vectors of the
-            # argument's element type (`_cell_position_proof`).
+            # Fresh dense rows: the helper is proven for vectors (matrices) of
+            # the argument's element type (`_cell_position_proof`).
             icid in d.pushed || _footprint_record!(icid, :rows, U)
             rows = icid in d.pushed ? _cell_take!(e, icid, reads[j]) :
-                _cell_source_rows_expr(e, icid, U)
+                j in f.rowmap.matrices ?
+                    Expr(:call, _cell_ref(:_cell_factor_rows), e.names[icid], U) :
+                    _cell_source_rows_expr(e, icid, U)
             push!(args, _cell_bind!(e, :cell_rows, Expr(:call, _cell_ref(:_cell_dense_rows), rows)))
         elseif role in (:factor_leaf, :factor)
             icid in d.pushed || _footprint_record!(icid, :rows, reads[j])
@@ -2728,7 +2813,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
             push!(args, e.names[icid])
         end
     end
-    f.rowmap isa _CellPositionMap && return _cell_position_window!(e, r, f, args, U)
+    f.rowmap isa _CellPositionMap && return _cell_position_window!(e, cid, r, f, args, U)
     f.rowmap === nothing || return _cell_helper_window!(e, f.rowmap, args)
     if r.op isa _AuthoredPlateOp
         # The plate over these one-row arguments, with the table slots reserved

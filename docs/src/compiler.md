@@ -1156,10 +1156,11 @@ the row and looks `field` up, so `field` is passed whole. The
 iteration may be a comprehension or `map` over `eachindex(x)`, `axes(x, 1)`,
 `1:length(x)`, `Base.OneTo(length(x))`, `x` itself, or `enumerate`/`zip` of
 those, destructured or not, also through a straight-line wrapper. It may also
-be one `for` loop that builds the result by a single unconditional
-`push!(out, row)` onto an empty vector, or `out[g] = row` into `similar(x)`,
-`zeros(T, length(x))` or `Vector{T}(undef, length(x))`, after a prologue of type
-computations only (`Vector{eltype(paths[1])}[]`). Its body may branch, run inner
+be one `for` loop that builds the result by `push!(out, row)` onto an empty
+vector, or `out[g] = row` into `similar(x)`, `similar(y, length(x))`,
+`zeros(T, length(x))` or `Vector{T}(undef, length(x))`, once on every path
+through the body, so each arm of a branch may write its own row. The loop follows
+a prologue of type computations only (`Vector{eltype(paths[1])}[]`). Its body may branch, run inner
 loops and call other functions on per-position values. The analysis reads the
 helper's lowered code without executing it. The position may only index a
 position argument. Locals must be assigned in each iteration before they are
@@ -1168,13 +1169,56 @@ result being built may not be read, and nothing created outside the iteration
 may be mutated. So `x[g] - x[g - 1]`, a running sum, `length(x)` in the body,
 a `continue` that skips the `push!`, and a row that reduces, iterates or
 broadcasts a whole array (`x[g] + sum(w)`) keep the helper without a row form.
-The argument passed whole is computed whole. Ordinary locality decides whether
-that is legitimate (shared or bound) or refused. The window calls the authored
+A row may hand a whole array to a closure it builds
+(`sum(w[t] * cs[ix[t]] for t in eachindex(ix))`) or to another helper with one
+applicable method (`column_mean(natural, ix, w, k)`) when that code only indexes
+it. The analysis reads the closure's or the helper's lowered body under the same
+rules, so the work is the row's own, bounded by what the row looks up. A helper
+that reduces the array it receives keeps the row without a form. Arithmetic on
+an argument needs its type to show it is a number; without that it may be an
+array, and the helper has no row form.
+The argument passed whole is computed whole. It is shared or bound, or else the
+cell computes it and reports it as `:shared`, with every coordinate it reads in
+the cell's footprint, so a caller screening cell width sees the cost. The window calls the authored
 helper itself on fresh dense vectors of its position arguments' requested rows,
 so its loops, branches and errors run as written. Both the original and those
 window types must dispatch to the same single method. An iterated argument must
 be a vector Base iterates in its linear order from position 1; an abstract port
 type is checked against the original producer's type at run time.
+
+A matrix argument is a position argument over its first axis. The loop runs
+over `axes(x, 1)` or `1:size(x, 1)`, and row `g` reads `x[g, d]` for any `d`;
+`size(x, 2)` and `axes(x, 2)` are the same for its rows, so an inner loop may
+run over them. The result may be filled before the loop, as
+`zeros(T, size(x, 1), m...)` or `ones`. A filled result may be read and written
+at its own row any number of times (`out[g, k] += v`). A row no iteration
+writes keeps its fill value, as in the whole helper. An unfilled result
+(`similar(x)`, `Matrix{T}(undef, …)`) is written once per row, as a whole row
+(`out[g, :] = row`). Each trailing extent `m` is a literal or the `size` of an
+argument, so the result's shape is known before the call. Before the loop, a
+prologue may compute values from the arguments passed whole, literals and
+those extents:
+
+```julia
+coefficients = L * reshape(z, size(L, 1), :)
+scale = sd / sqrt(size(frequency, 2))
+```
+
+Such a value is the same for a window as for the whole helper. A row may read a
+number computed this way and index an array (`coefficients[k, offset + j]`).
+Handing such an array to a call in a row (`sum(coefficients)`) is whole work in
+every row, as for an argument, so the helper keeps no row form. A prologue call
+may not mutate (`!`), and it may not read a position argument or its row count.
+Its arguments are therefore passed whole, and the prologue runs once per cell
+call. A coefficient vector of partitioned coordinates read this way puts every
+one of its coordinates in each cell's footprint. The window calls the helper on
+fresh dense matrices of a matrix argument's rows.
+
+`vec(x)` of an array whose rows are known also has a row form. Position `u` of
+the result is row `mod1(u, n)` of `x` at trailing position `cld(u, n)`,
+column-major, where `n` is `x`'s row count. A cell's window reads only the rows
+of `x` that its positions lie in, so `vec` of an `n × 1` result is the identity
+on rows.
 
 A field of existing storage is existing storage. A cell reads `data.weight`,
 or `rows[i].weight1` from a named tuple of row vectors per index, at its rows,

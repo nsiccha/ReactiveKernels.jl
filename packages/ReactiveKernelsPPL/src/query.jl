@@ -1051,7 +1051,8 @@ function _prepare_compact_cell(caller::Symbol, built, plan::StructuralPlan, obse
     spec, want = _cell_query_spec(built, plan, names; locality)
     have = _compact_overlay!(spec, plan)
     kernel = _absent_refusal(plan, spec, have, want) do
-        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
+        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error,
+                          exemplars = (base0, active0, slots, 1))
     end
     (; kernel, names, active0, selected, slots)
 end
@@ -1700,7 +1701,7 @@ function _query_exemplar(layout, u0)
 end
 
 _value_query_prefix(cache, residual, residual_plan, args, on_error) =
-    (; cache, residual, residual_plan, argument_type = typeof(args), on_error,
+    (; cache, residual, residual_plan, args, argument_type = typeof(args), on_error,
        residuals = Dict{DataType,Any}(typeof(args) => residual),
        prefixes = Dict{DataType,Any}(Vector{Float64} => cache.kernel))
 
