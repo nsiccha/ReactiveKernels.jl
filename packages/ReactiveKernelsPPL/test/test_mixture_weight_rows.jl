@@ -146,6 +146,22 @@ end
     end
 end
 
+@testset "saturated logistic mixture probabilities" begin
+    ex = quote
+        a ~ Normal(0, 1)
+        w = logistic.(a .+ x)
+        y .~ MixtureModel.(vcat.(Normal.(0, 1), Normal.(1, 2)), vcat.(1 .- w, w))
+    end
+    data = (; x = [0.1, 0.2], y = [0.3, -0.5])
+    oracle(p, d) = normal_prior(p.a) + sum(eachindex(d.y)) do i
+        w = sigmoid(p.a + d.x[i])
+        D.logpdf(D.MixtureModel([D.Normal(0, 1), D.Normal(1, 2)], [1 - w, w]), d.y[i])
+    end
+    for a in (-50.0, 50.0)
+        check(ex, data, (; a), oracle)
+    end
+end
+
 @testset "live mixture weight support" begin
     ex = quote
         a ~ Normal(0, 1)

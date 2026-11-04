@@ -23,7 +23,9 @@ are recorded in the git history only.
   `w`. Inline expressions and named values read the same graph, with the
   authored priors, coordinates and component laws. Each probability vector
   must have one entry per component, be finite and nonnegative, and sum to
-  one. Shared probabilities continue to use `Ref(weights)`.
+  one. Zero-probability components retain finite gradients when logistic
+  probabilities saturate. Shared probabilities continue to use `Ref(weights)`,
+  with an axis independent of the observations even for scalar component locations.
 
 ## 0.1.86
 

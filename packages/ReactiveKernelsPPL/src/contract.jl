@@ -4250,9 +4250,12 @@ _is_glm_family(f) = f === NormalIDGLMFam || f === BernoulliLogitGLMFam ||
 
 # The fields a response's observations read entry by entry. A GLM object
 # reads its intercept and coefficients whole: neither has an observation
-# axis.
+# axis. A mixture reads its component slots; its predictor is only an
+# anchor and can name a shared weight vector with an independent axis.
 _observation_fields(r::LikelihoodSpec) = _is_glm_family(r.family) ?
     _with(r; glm_alpha = nothing, glm_beta = nothing) :
+    r.family === MixtureFam ? _with(r; predictor = r.response,
+        mixture_weights = r.mixture_weights isa MixtureWeightRows ? r.mixture_weights : nothing) :
     _is_ordered_family(r.family) && r.thresholds isa Symbol ?
         _with(r; thresholds = nothing) : r
 
@@ -7836,9 +7839,7 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
             end
         elseif f === :responses
             for r in plan.responses
-                _drop_held_names!(free, r.family === MixtureFam &&
-                    !(r.mixture_weights isa MixtureWeightRows) ?
-                    _with(r; mixture_weights = nothing) : _observation_fields(r))
+                _drop_held_names!(free, _observation_fields(r))
             end
         elseif f === :matrices
             # Affine/GLM matrices retain their row contract. Value-matrix

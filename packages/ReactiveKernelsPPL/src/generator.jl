@@ -2299,7 +2299,10 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         weight_guard = :($weights isa AbstractVector{<:Real} &&
             length($weights) == $K && all(isfinite, $weights) &&
             all(>=(0), $weights) && isapprox(sum($weights), 1.0; atol = 1e-8))
-        logw_comp = [:(log($weights[$k])) for k in 1:K]
+        # A zero-probability component contributes exactly zero density.
+        # Keep that arm constant instead of differentiating log(0), which
+        # is singular even when a logistic probability has saturated.
+        logw_comp = [:($weights[$k] == 0 ? -Inf : log($weights[$k])) for k in 1:K]
     end
     terms = Expr[]
     distributions = Any[]
