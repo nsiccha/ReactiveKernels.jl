@@ -52,6 +52,12 @@ end
 sigmoid(x) = 1 / (1 + exp(-x))
 normal_prior(x) = D.logpdf(D.Normal(), x)
 
+const SHARED_WEIGHT_CALLS = Ref(0)
+function shared_probabilities(mass)
+    SHARED_WEIGHT_CALLS[] += 1
+    mass ./ sum(mass)
+end
+
 @testset "predictor-dependent mixture weights" begin
     function source(named)
         ex = quote
@@ -269,6 +275,32 @@ end
         plan = lower_rkppl(data_source, (:y, :mass); conditioned = (:y,))
         @test_throws ContractValidationError bind_data(plan, (; y = [0.1, 0.2, 0.3], mass))
     end
+
+    # Binding validation and later queries reuse the authored computation.
+    # Rebinding the same plan with new data owns a separate result.
+    cached_source = quote
+        a ~ Normal(0, 1)
+        probabilities = shared_probabilities(mass)
+        y .~ MixtureModel.(vcat.(Normal.(a, 1), Normal.(2, 1)), Ref(probabilities))
+    end
+    plan = lower_rkppl(cached_source, (:y, :mass); conditioned = (:y,), mod = @__MODULE__)
+    data = (; y = [0.1, 0.2, 0.3], mass = [3.0, 7.0])
+    SHARED_WEIGHT_CALLS[] = 0
+    bound = bind_data(plan, data)
+    @test SHARED_WEIGHT_CALLS[] == 1
+    built = build_kernel(bound)
+    for preset in (:likelihood, :sampler, :pointwise)
+        prepare_query(built, bound, preset)([0.3])
+    end
+    @test SHARED_WEIGHT_CALLS[] == 1
+    changed = merge(data, (; mass = [4.0, 1.0]))
+    rebound = bind_data(bound, changed)
+    q = prepare_query(built, rebound, :likelihood)
+    @test q([0.3]) ≈ data_oracle((; a = 0.3), changed) - normal_prior(0.3)
+    @test SHARED_WEIGHT_CALLS[] == 2
+    old = prepare_query(built, bound, :likelihood)
+    @test old([0.3]) ≈ data_oracle((; a = 0.3), data) - normal_prior(0.3)
+    @test SHARED_WEIGHT_CALLS[] == 2
 
     live = quote
         a ~ Normal(0, 1)
