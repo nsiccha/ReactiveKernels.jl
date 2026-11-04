@@ -20,7 +20,8 @@
 # (`_kernel_native_body`):
 #
 # - a dotted expression (one fused broadcast) whose operands are recipe
-#   inputs, numeric literals, gathers `A[I]` / `A[I, 1, ...]` of an input by
+#   inputs, numeric literals, numbers computed from them alone (`sqrt(2pi)`,
+#   `1 / 2`), gathers `A[I]` / `A[I, 1, ...]` of an input by
 #   an integer vector input `I` (integer literals after it), column reads
 #   `A[:, 1, ...]` (also as `view(A, :, 1, ...)`, the view RKPPL reads a
 #   per-observation value's column through), products `A * w` of two inputs,
@@ -57,7 +58,10 @@
 #   later index a position or the whole axis `:`) reads whole rows of its
 #   source, and `transpose(w)`, `adjoint(w)` or `w'` of a vector input, alone or
 #   as a broadcast operand, is one row, read whole: broadcasting extrudes it
-#   along the rows.
+#   along the rows;
+# - a call of a function whose owning package gives it a row method
+#   (`_cell_row_method`): RKPPL's `_ppl_rows(x, n)`, whose row `r` is row `r` of
+#   `x`, and its LKJ factors, whose row `r` reads their partials.
 #
 # Row `r` of the dotted expression is the same expression over row `r` of each
 # array operand (the operand itself when broadcasting extrudes it), and row
@@ -695,6 +699,88 @@ _CellForm(kind, roles, gather_index, leaves, operand, indices, parts, vias, lite
 # Every index of every source read directly (no shared index array).
 _cell_direct_reads(indices) = Vector{Int}[zeros(Int, length(ix)) for ix in indices]
 
+# A package's own function with a row form its source does not show: `nothing`,
+# or `(; at, rows, dims)` for the calls `f(args...)` of `f`.
+#
+# `at(U, args...)` returns the value at `U` (one row, or a vector of rows), with
+# those rows along its first axis and every later axis whole. The arguments at
+# the positions `rows` are given at `U`, as a broadcast reads them (a number stays
+# a number, and a one-row operand repeats its row); every other argument is whole,
+# so `at` may read all of it. Only `at` is called at rows: it needs none of `f`'s
+# run-time tests of the whole value, and every call keeps one type.
+#
+# The value's full axes are `1:args[d]` for the positions `d` in `dims`, broadcast
+# with the axes of the `rows` arguments. Each call argument is a recipe input or
+# a literal; an argument nested in the source is outlined when the recipe can be
+# split, and otherwise leaves the call without a form.
+_cell_row_method(f) = nothing
+
+# The row method of a recipe (`_CellForm.rowmap`): `at`, and the arguments of the
+# authored call, each a literal or a `_CellInputLiteral`.
+struct _CellRowMethod
+    at::GlobalRef
+    arguments::Vector{Any}
+end
+
+# The form of a call of a function with a row method, its arguments as
+# `_cell_row_method` describes them; `nothing` when they do not fit.
+function _cell_row_method_form(r::Recipe, f, arguments)
+    method = _cell_row_method(f)
+    method === nothing && return nothing
+    at = GlobalRef(parentmodule(method.at), nameof(method.at))
+    isdefined(at.mod, at.name) && getglobal(at.mod, at.name) === method.at || return nothing
+    all(a -> a isa Union{_CellInputLiteral,Number}, arguments) || return nothing
+    n = length(r.inputs)
+    roles = fill(:whole, n)
+    leaves = Int[]
+    for k in method.rows
+        arguments[k] isa _CellInputLiteral || return nothing
+        input = arguments[k].input
+        roles[input] = :leaf
+        push!(leaves, input)
+    end
+    # An input read at rows cannot also be read whole by the same call.
+    allunique(leaves) && all(enumerate(arguments)) do (k, a)
+        k in method.rows || !(a isa _CellInputLiteral) || roles[a.input] === :whole
+    end || return nothing
+    literal = Tuple(arguments[d] for d in method.dims)
+    all(part -> part isa Union{Int,_CellInputLiteral}, literal) || return nothing
+    indices = Vector{Int}[Int[] for _ in 1:n]
+    _CellForm(:rows, roles, zeros(Int, n), leaves, 0, indices, Any[],
+        _cell_direct_reads(indices), literal, Any[nothing for _ in 1:n], nothing,
+        _CellRowMethod(at, arguments))
+end
+
+# The type of a number computed from literals and named constants alone
+# (`sqrt(2pi)`, `1 / 2`), inferred without running it, or `nothing`. Broadcasting
+# extrudes such an operand, so it reads no row; its source is evaluated as
+# authored. Any other parameter-free call may return an array (`ones(3)`) that a
+# window could not broadcast against, and a call of no argument may depend on
+# state (`rand()`): both stay without a row form.
+function _cell_constant_number(ex, params, mod)
+    ex isa Number && return typeof(ex)
+    if ex isa Symbol || ex isa GlobalRef
+        ex isa Symbol && ex in params && return nothing
+        constant = ex isa GlobalRef ? isconst(ex.mod, ex.name) :
+            mod isa Module && isdefined(mod, ex) && isconst(mod, ex)
+        constant || return nothing
+        value = _cell_binding(ex, mod)
+        return value isa Number ? typeof(value) : nothing
+    end
+    Meta.isexpr(ex, :call) && length(ex.args) >= 2 &&
+        !_native_callee_shadowed(ex.args[1], params) || return nothing
+    f = _cell_binding(ex.args[1], mod)
+    f isa Function || return nothing
+    types = Any[]
+    for arg in ex.args[2:end]
+        T = _cell_constant_number(arg, params, mod)
+        T === nothing && return nothing
+        push!(types, T)
+    end
+    T = Base.promote_op(f, types...)
+    isconcretetype(T) && T <: Number ? T : nothing
+end
+
 # Expression heads that bind no names; any other head declines the rewrite.
 const _CELL_PLAIN_HEADS = (:call, :ref, :tuple, :., Symbol("'"), :vect, :hcat,
     :vcat, :row, :nrow, :ncat, :parameters, :kw, :comparison, :&&, :||, :if,
@@ -755,12 +841,23 @@ function _cell_form(r::Recipe; outlined::Bool = false)
         # `operands_fit`).
         return _CellForm(:transposed, [:transposed], [0], Int[], 0)
     end
-    r.op isa _KernelSourceOp || return nothing
+    # So does a bare exact call of a function with a row method.
+    r.op isa _KernelSourceOp || return _cell_row_method_form(r, r.op,
+        Any[_CellInputLiteral(j) for j in eachindex(r.inputs)])
     analyzed = _cell_native(r; outlined)
     analyzed === nothing && return nothing
     native, params, mod = analyzed
     checked = _cell_checked_form(r, native, params, mod)
     checked === nothing || return checked
+    if Meta.isexpr(native, :call) && !_native_callee_shadowed(native.args[1], params)
+        callee = _cell_binding(native.args[1], mod)
+        if _cell_row_method(callee) !== nothing
+            slots = Dict{Symbol,Int}(name => j for (j, name) in enumerate(params))
+            return _cell_row_method_form(r, callee, Any[
+                a isa Symbol && haskey(slots, a) ? _CellInputLiteral(slots[a]) : a
+                for a in native.args[2:end]])
+        end
+    end
     position = Dict{Symbol,Int}(name => j for (j, name) in enumerate(params))
     uses = [Set{Symbol}() for _ in params]
     # A source's gather indices, in first-read order, and whether its gathers
@@ -815,6 +912,7 @@ function _cell_form(r::Recipe; outlined::Bool = false)
             return true
         end
         ex isa Union{Int,Float64,Bool} && return true
+        _cell_constant_number(ex, params, mod) === nothing || return true
         ex isa Expr && ex.head === :ref && return gather!(ex) || column!(ex) || scalar!(ex)
         readonly(ex) && return gather!(Expr(:ref, ex.args[2], ex.args[3]))
         column = column_view(ex)
@@ -1675,6 +1773,21 @@ function _cell_bound_capture_check(p::Plan, producers, static_type, known, outli
             s = shape(r.inputs[only(f.leaves)])
             return shapes[cid] = s === nothing ? nothing : _cell_vec_shape(s)
         end
+        if f.kind === :rows
+            parts = Any[]
+            for part in f.literal
+                x = part isa Int ? Some(part) : bound(r.inputs[part.input])
+                x !== nothing && something(x) isa Integer || return nothing
+                push!(parts, something(x))
+            end
+            full = Any[_cell_dims_shape(Tuple(parts))]
+            for j in f.leaves
+                s = shape(r.inputs[j])
+                s === nothing && return nothing
+                push!(full, s)
+            end
+            return shapes[cid] = _plate_broadcast_shape(Tuple(full))
+        end
         f.kind in (:identity, :checked, :pointwise, :columns, :hcat, :reduce, :transposed,
                    :array_arithmetic, :position_map) ||
             return nothing
@@ -1934,7 +2047,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
         r = only(producers[cid])
         f = forms[r.id]
         f.kind in (:pointwise, :identity, :checked, :columns, :hcat, :vcat, :range_view, :reshape,
-                   :reduce, :transposed, :array_arithmetic, :position_map, :vec) && return true
+                   :reduce, :transposed, :array_arithmetic, :position_map, :vec, :rows) && return true
         inputs = r.inputs
         factor = cidof(inputs[findfirst(==(:factor), f.roles)])
         (f.operand == 0 ? static_type(only(r.outputs)) <: AbstractVector :
@@ -1967,7 +2080,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
             role === :transposed ? static_type(input) <: Union{AbstractVector,Number} :
             role === :vec_source ? static_type(input) <: AbstractArray :
             true
-        end && all(f.kind in (:range_view, :reshape) ? f.literal : ()) do part
+        end && all(f.kind in (:range_view, :reshape, :rows) ? f.literal : ()) do part
             part isa Int || static_type(r.inputs[part.input]) <: Integer
         end && _cell_reduce_fits(r, f, static_type)
     end
@@ -2092,6 +2205,9 @@ function _cell_named_operand(parent::Expr, child)
     _cell_dotted(parent) && return !_cell_dotted(child)
     parent.head === Symbol("'") && return true
     parent.head === :call && !isempty(parent.args) || return false
+    # A row method's source names its function: its arguments are read by name.
+    parent.args[1] isa GlobalRef &&
+        _cell_row_method(_cell_binding(parent.args[1], nothing)) !== nothing && return true
     name = _kernel_split_callee_name(parent.args[1])
     name in (:vcat, :hcat, :*, :vec, :dropdims, :transpose, :adjoint) &&
         return !(child isa Expr && child.head in (:parameters, :kw))
@@ -2601,6 +2717,10 @@ function _cell_shape!(e::_CellEmitter, cid::ValueId)
     f.kind === :vec && return e.shapes[cid] = _cell_bind!(e, :cell_shape,
         Expr(:call, _cell_ref(:_cell_vec_shape),
              input_shape(canon_id(d.graph, r.inputs[only(f.leaves)].id))))
+    f.kind === :rows && return e.shapes[cid] = _cell_bind!(e, :cell_shape,
+        Expr(:call, _cell_ref(:_plate_broadcast_shape), Expr(:tuple,
+            Expr(:call, _cell_ref(:_cell_dims_shape), _cell_literal!(e, r, f)),
+            Any[_cell_part_shape!(e, r, f, j) for j in f.leaves]...)))
     parts = Any[_cell_part_shape!(e, r, f, j) for j in f.leaves]
     # A transposed vector is one row; a gather keeping axes of its source spans
     # them (`_cell_extra_parts`).
@@ -2832,7 +2952,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
     U = e.unions[cid]
     f.kind === :vcat && return _cell_vcat_window!(e, cid, r, f, U)
     if f.kind in (:pointwise, :identity, :checked, :columns, :hcat, :range_view, :reshape, :reduce,
-                  :transposed, :array_arithmetic, :position_map, :vec)
+                  :transposed, :array_arithmetic, :position_map, :vec, :rows)
         push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row),
             _cell_shape!(e, cid), U, e.sorted))
     end
@@ -2920,6 +3040,8 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
             push!(args, e.names[icid])
         end
     end
+    f.rowmap isa _CellRowMethod && return _cell_bind!(e, :cell_rows, Expr(:call, f.rowmap.at, U,
+        Any[a isa _CellInputLiteral ? args[a.input] : a for a in f.rowmap.arguments]...))
     f.rowmap isa _CellPositionMap && return _cell_position_window!(e, cid, r, f, args, U)
     f.rowmap === nothing || return _cell_helper_window!(e, f.rowmap, args)
     if r.op isa _AuthoredPlateOp

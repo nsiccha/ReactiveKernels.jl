@@ -71,17 +71,21 @@ end
 `_ppl_offset_<pred> = col1 .+ col2 .+ …` over offset-term columns, or
 `nothing` when the predictor has no offset terms. A sum with a scalar
 assignment from `scalars` gets `n_rows` rows (`_ppl_rows`; a number or an
-expression over bound data) unless `broadcast` retains its scalar shape.
+expression over bound data) unless `broadcast` retains its scalar shape; the
+sum is then a statement of its own, returned before it in a block, so a cell
+computes it at its rows (`_ppl_rows_at`).
 """
 function offset_recipe(shape::DesignShape; scalars = Set{Symbol}(), n_rows = 0,
         broadcast = false)
     cols = Any[b.column for b in shape.blocks if b.kind === OffsetTerm]
     isempty(cols) && return nothing
     total = foldl((a, c) -> :($a .+ $c), cols)
-    !broadcast && any(in(scalars), cols) &&
-        (total = Expr(:call, GlobalRef(@__MODULE__, :_ppl_rows), total, n_rows))
     name = offset_name(shape.predictor)
-    return :($name = $total)
+    !broadcast && any(in(scalars), cols) || return :($name = $total)
+    rows(x) = :($name = $(Expr(:call, GlobalRef(@__MODULE__, :_ppl_rows), x, n_rows)))
+    total isa Expr || return rows(total)
+    summed = Symbol(:_ppl_summed_, name)
+    return Expr(:block, :($summed = $total), rows(summed))
 end
 
 """
@@ -120,7 +124,7 @@ function preprocessing_recipes(plan::StructuralPlan)
         rows = isempty(scalars) || retain_axes ? 0 : _located_rows_source(plan, pred)
         off = offset_recipe(shape; scalars, n_rows = rows,
             broadcast = retain_axes)
-        off !== nothing && push!(stmts, off)
+        off === nothing || (Meta.isexpr(off, :block) ? append!(stmts, off.args) : push!(stmts, off))
     end
     # GLM-object response matrices: one `X = Float64.(hcat(...))` recipe
     # per matrix (emitted once, shared across responses). Columns are

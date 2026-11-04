@@ -33,10 +33,17 @@ end
     for producer in (:(groupmix(L, Z)), :(L * Z))
         (; bound, built, u) = fixture(producer)
         # Without a local/shared declaration the existing strict guarantee
-        # still applies. The split must not turn into a blanket exemption.
-        @test_throws ReactiveKernels.PartitionLocalityError prepare_partition(
-            built, bound, :y; by=:unit, locality=:error)
+        # still applies to a producer with no row form. The split must not turn
+        # into a blanket exemption. `L * Z` has one: `L` computes its rows and
+        # `Z` is read whole, as the right operand of a product always is.
         query = prepare_partition(built, bound, :y; by=:unit, locality=:ignore)
+        if producer == :(groupmix(L, Z))
+            @test_throws ReactiveKernels.PartitionLocalityError prepare_partition(
+                built, bound, :y; by=:unit, locality=:error)
+        else
+            strict = prepare_partition(built, bound, :y; by=:unit, locality=:error)
+            @test all(l -> strict(u, l) ≈ query(u, l), (1, 2, 3))
+        end
         baseline = prepare_partition_sampler(built, bound, :y, u; by=:unit,
             backend=BACKEND, compact=false, locality=:ignore)
         for compact in (true, false)

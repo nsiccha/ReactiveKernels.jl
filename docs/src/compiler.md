@@ -1315,6 +1315,24 @@ Three more cover the grouped field BayesianRegressionModels emits for an
   `w` is read whole (legitimately: the locality report lists it as `:shared`).
   A matrix's transpose reads columns and has no row form (`:operands`).
 
+A dotted expression's operand may also be a number computed from literals and
+named constants alone, `sigma .* (rho .* sqrt(2pi)) .^ (1 / 2)`: broadcasting
+extrudes it, so it reads no row. Only a number inferred from those numbers
+qualifies. A parameter-free call that returns an array, `s .* ones(3)`, has no
+row form, because a window could not broadcast against it.
+
+A package gives its own function a row form its source does not show by
+extending `ReactiveKernels._cell_row_method(::typeof(f))` with
+`(; at, rows, dims)`. A call `f(args...)` is then computed at a cell's rows `U`
+as `at(U, args...)`, the arguments at the positions `rows` read at `U` as a
+broadcast reads them and every other argument read whole. The value's full axes
+are `1:args[d]` for each position `d` in `dims`, broadcast with the axes of the
+`rows` arguments, so a mismatched operand still throws `DimensionMismatch`.
+ReactiveKernelsPPL uses this for two producers. `_ppl_rows(x, n)` gives a
+location of unknown shape its `n` rows, and its row `r` is row `r` of `x`.
+A declared LKJ factor's row `r` needs only the partials of that row, read
+through the whole partial vector, so its partials and diagonal are `:shared`.
+
 ### Locality: named, not silent
 
 A visible kernel's lazy branch retains the selected arm's shape and row
