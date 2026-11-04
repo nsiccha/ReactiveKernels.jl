@@ -372,7 +372,7 @@ the primal's inferred result type for the graph's declared input types, when
 both are concrete (`_promote_op`), or is `nothing`.
 """
 struct DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged,PO,FO,RO,SO,LO,
-                      Result} <: Function
+                      Result,Differentiable} <: Function
     primal_ops::PO
     forward_ops::FO
     reverse_ops::RO
@@ -435,6 +435,26 @@ The input port names of a generated rule, in signature order.
 rule_inputs(::ScalarDerivativeRule{Name,N,Inputs}) where {Name,N,Inputs} = Inputs
 rule_inputs(::DerivativeRule{Name,N,Inputs}) where {Name,N,Inputs} = Inputs
 
+# Keep activity in the type: large rule types may skip value-level constant
+# propagation, but adapters must still select one concrete staged tape.
+_rule_activity(::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged,
+        PO,FO,RO,SO,LO,Result,D}) where
+        {Name,N,Inputs,Primal,Forward,Reverse,Staged,PO,FO,RO,SO,LO,Result,D} = Val(D)
+
+@generated function _derivative_inputs(::Val{D}, args::Tuple) where {D}
+    Expr(:tuple, (:(getfield(args, $i)) for i in 1:length(args.parameters)
+                  if D & (1 << (i - 1)) != 0)...)
+end
+
+function _rule_activity_error(operation, name, inputs, cuts, mask)
+    (1 <= mask <= length(cuts)) ||
+        return "$(operation): activity mask $(mask) is out of range"
+    cuts[mask] !== nothing && return nothing
+    data = Tuple(inputs[i] for i in eachindex(inputs)
+                 if mask & (1 << (i - 1)) != 0 && cuts[1 << (i - 1)] === nothing)
+    "$(operation): rule $(name) cannot differentiate data-only inputs $(data)"
+end
+
 """
     has_forward_branch(rule::DerivativeRule) -> Bool
     has_reverse_branch(rule::DerivativeRule) -> Bool
@@ -448,17 +468,19 @@ has_reverse_branch(::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse}) where
     forward_cut(rule::DerivativeRule, inputs..., directions...) -> (y, ẏ)
 
 Run the graph's JVP branch: the primal together with the tangent for the
-given directions (one per input, in input order; an inactive input takes a
-zero direction). Requires the rule to have a forward branch.
+given directions (one per differentiable input, in input order; an inactive
+differentiable input takes a zero direction). Data-only inputs have no
+direction argument. Requires the rule to have a forward branch.
 """
 @generated function forward_cut(
         rule::DerivativeRule{Name,N,Inputs,Primal,Forward},
         args::Vararg{Any,M}) where {Name,N,Inputs,Primal,Forward,M}
     Forward === nothing && return :(throw(ArgumentError(
         "forward_cut: rule " * $(string(Name)) * " has no forward branch")))
-    M == 2N || return :(throw(ArgumentError(
+    directions = length(Forward[1]) - N
+    M == N + directions || return :(throw(ArgumentError(
         "forward_cut: expected " * $(string(N)) * " inputs followed by " *
-        $(string(N)) * " directions, got " * $(string(M)) * " arguments")))
+        $(string(directions)) * " directions, got " * $(string(M)) * " arguments")))
     _rule_body_expr(Forward, :(getfield(rule, :forward_ops)))
 end
 
@@ -474,6 +496,8 @@ staging boundary and may pass `nothing` for the others.
         ::Val{M}) where {Name,N,Inputs,Primal,Forward,Reverse,M}
     Reverse === nothing && return :(throw(ArgumentError(
         "reverse_residuals: rule " * $(string(Name)) * " has no reverse branch")))
+    error = _rule_activity_error(:reverse_residuals, Name, Inputs, Reverse, M)
+    error === nothing || return :(throw(ArgumentError($error)))
     Reverse[M][4]
 end
 
@@ -483,7 +507,9 @@ end
 
 Run the graph's VJP branch for one activity pattern. Inputs the cut does not
 read (see [`reverse_residuals`](@ref)) may be passed as `nothing`. Always
-returns a tuple. Requires the rule to have a reverse branch.
+returns a tuple. Requires the rule to have a reverse branch and at least one
+active input. Bits retain their original input positions; selecting a
+data-only input is an error.
 """
 @generated function reverse_cut(
         rule::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse}, ::Val{M},
@@ -493,8 +519,8 @@ returns a tuple. Requires the rule to have a reverse branch.
     K == N + 1 || return :(throw(ArgumentError(
         "reverse_cut: expected " * $(string(N)) * " inputs followed by the " *
         "covector, got " * $(string(K)) * " arguments")))
-    (1 <= M <= length(Reverse)) || return :(throw(ArgumentError(
-        "reverse_cut: activity mask " * $(string(M)) * " is out of range")))
+    error = _rule_activity_error(:reverse_cut, Name, Inputs, Reverse, M)
+    error === nothing || return :(throw(ArgumentError($error)))
     _rule_body_expr(Reverse[M], :(getfield(getfield(rule, :reverse_ops), $M));
                     tuple_return = true)
 end
@@ -514,8 +540,8 @@ function stage_residuals(
         ::Val{M}) where {Name,N,Inputs,Primal,Forward,Reverse,Staged,M}
     Staged === nothing && throw(ArgumentError(
         "stage_residuals: rule " * string(Name) * " has no reverse branch"))
-    (1 <= M <= length(Staged)) || throw(ArgumentError(
-        "stage_residuals: activity mask " * string(M) * " is out of range"))
+    error = _rule_activity_error(:stage_residuals, Name, Inputs, Staged, M)
+    error === nothing || throw(ArgumentError(error))
     Staged[M][3]
 end
 
@@ -543,8 +569,8 @@ of the graph (shared intermediates are computed once).
         "stage_primal: rule " * $(string(Name)) * " has no reverse branch")))
     K == N || return :(throw(ArgumentError(
         "stage_primal: expected " * $(string(N)) * " inputs, got " * $(string(K)))))
-    (1 <= M <= length(Staged)) || return :(throw(ArgumentError(
-        "stage_primal: activity mask " * $(string(M)) * " is out of range")))
+    error = _rule_activity_error(:stage_primal, Name, Inputs, Staged, M)
+    error === nothing || return :(throw(ArgumentError($error)))
     stage_spec, _, frontier = Staged[M]
     block, localof = _rule_body_expr_mapped(stage_spec,
         :(getfield(getfield(getfield(rule, :staged_ops), $M), 1)))
@@ -570,8 +596,8 @@ stage_reverse(rule::DerivativeRule, mask::Val, residuals::Tuple, covector) =
         args::Vararg{Any,K}) where {Name,N,Inputs,Primal,Forward,Reverse,Staged,M,K}
     Staged === nothing && return :(throw(ArgumentError(
         "stage_reverse: rule " * $(string(Name)) * " has no reverse branch")))
-    (1 <= M <= length(Staged)) || return :(throw(ArgumentError(
-        "stage_reverse: activity mask " * $(string(M)) * " is out of range")))
+    error = _rule_activity_error(:stage_reverse, Name, Inputs, Staged, M)
+    error === nothing || return :(throw(ArgumentError($error)))
     _, back_spec, frontier = Staged[M]
     K == length(frontier) + 1 || return :(throw(ArgumentError(
         "stage_reverse: expected " * $(string(length(frontier))) *
@@ -611,6 +637,16 @@ optional, but at least one must be given; every AD adapter is generated from
 the cuts of this one graph, attached to the returned callable. Inputs are the
 HAVE ports that are neither directions nor the covector, in HAVE order.
 
+Each mapping must name every input in that order. A literal `nothing` entry
+declares a data-only input, with no corresponding graph port, for example
+`cotangents = (x = :x_bar, geometry = nothing)` and
+`directions = (x = :x_dot, geometry = nothing)`. When both branches are given,
+their data-only declarations must agree. Data still participates in the
+primal and any derivative that reads it; requesting its derivative is an
+error. Enzyme callers pass it as `Const`, and ChainRules pullbacks return
+`NoTangent()` for it. A symbol naming a graph output that returns `nothing`
+does not declare a data-only input.
+
 The graph may hold plates, scans and embedded kernels, in any branch. A cut
 that runs one is compiled from its native lowering, so its values are those
 of `prepare(graph; have, want)`. In a position residual
@@ -640,7 +676,7 @@ function derivative_rule(spec::KernelSpec; primal::Symbol,
             "a reverse branch needs both `covector::Symbol` and `cotangents::NamedTuple`")
         covector in haves || fail("covector port :$(covector) is not a HAVE port; HAVE ports are $(haves)")
     end
-    direction_names = has_forward ? Tuple(values(directions)) : ()
+    direction_names = has_forward ? Tuple(d for d in values(directions) if d !== nothing) : ()
     inputs = Tuple(h for h in haves if !(h in direction_names) && h !== covector)
     isempty(inputs) && fail("no input port remains once directions and the covector are removed from $(haves)")
     N = length(inputs)
@@ -648,21 +684,30 @@ function derivative_rule(spec::KernelSpec; primal::Symbol,
         keys(directions) == inputs || fail(
             "directions must name every input in signature order $(inputs); got $(keys(directions))")
         for (input, direction) in pairs(directions)
-            direction isa Symbol || fail("the direction for :$(input) must be a HAVE port name, got $(repr(direction))")
+            direction === nothing && continue
+            direction isa Symbol || fail("the direction for :$(input) must be a HAVE port name or nothing, got $(repr(direction))")
             direction in haves || fail("direction port :$(direction) (for :$(input)) is not a HAVE port; HAVE ports are $(haves)")
         end
-        length(unique(direction_names)) == N || fail("direction ports must be distinct; got $(direction_names)")
+        length(unique(direction_names)) == length(direction_names) || fail("direction ports must be distinct; got $(direction_names)")
     end
     if has_reverse
         keys(cotangents) == inputs || fail(
             "cotangents must name every input in signature order $(inputs); got $(keys(cotangents))")
         for (input, cotangent) in pairs(cotangents)
-            cotangent isa Symbol || fail("the cotangent for :$(input) must be a WANT port name, got $(repr(cotangent))")
+            cotangent === nothing && continue
+            cotangent isa Symbol || fail("the cotangent for :$(input) must be a WANT port name or nothing, got $(repr(cotangent))")
             cotangent in wants || fail("cotangent port :$(cotangent) (for :$(input)) is not a WANT port; WANT ports are $(wants)")
             cotangent === primal && fail("cotangent port :$(cotangent) (for :$(input)) is the primal port")
         end
-        length(unique(Tuple(values(cotangents)))) == N || fail("cotangent ports must be distinct; got $(Tuple(values(cotangents)))")
+        cotangent_names = Tuple(c for c in values(cotangents) if c !== nothing)
+        length(unique(cotangent_names)) == length(cotangent_names) || fail("cotangent ports must be distinct; got $(cotangent_names)")
     end
+    if has_forward && has_reverse
+        map(isnothing, values(directions)) == map(isnothing, values(cotangents)) ||
+            fail("directions and cotangents must declare the same data-only inputs with nothing")
+    end
+    mapping = has_forward ? directions : cotangents
+    differentiable = _activity_mask(map(!isnothing, values(mapping)), 1)
     generator = :derivative_rule
     cut(have, want) = _derivative_cut_lowering(spec, name, have, want; generator)
     primal_spec, primal_ops = cut(inputs, primal)
@@ -670,6 +715,7 @@ function derivative_rule(spec::KernelSpec; primal::Symbol,
         cut((inputs..., direction_names...), (primal, tangent)) : (nothing, nothing)
     reverse = if has_reverse
         ntuple(2^N - 1) do mask
+            mask & ~differentiable == 0 || return nothing
             active = Tuple(cotangents[i] for i in 1:N if (mask >> (i - 1)) & 1 == 1)
             want = length(active) == 1 ? active[1] : active
             cut_spec, ops, structure = cut((inputs..., covector), want)
@@ -680,10 +726,11 @@ function derivative_rule(spec::KernelSpec; primal::Symbol,
     else
         nothing
     end
-    reverse_specs = reverse === nothing ? nothing : map(first, reverse)
-    reverse_ops = reverse === nothing ? nothing : map(r -> r[2], reverse)
+    reverse_specs = reverse === nothing ? nothing : map(r -> r === nothing ? nothing : first(r), reverse)
+    reverse_ops = reverse === nothing ? nothing : map(r -> r === nothing ? nothing : r[2], reverse)
     staged = if has_reverse
         ntuple(2^N - 1) do mask
+            mask & ~differentiable == 0 || return nothing
             frontier = _reverse_frontier(reverse[mask][3], covector, inputs)
             extra = Tuple(n for n in frontier if !(n in inputs) && n !== primal)
             stage_want = isempty(extra) ? primal : (primal, extra...)
@@ -696,13 +743,13 @@ function derivative_rule(spec::KernelSpec; primal::Symbol,
     else
         nothing
     end
-    staged_specs = staged === nothing ? nothing : map(first, staged)
-    staged_ops = staged === nothing ? nothing : map(last, staged)
+    staged_specs = staged === nothing ? nothing : map(s -> s === nothing ? nothing : first(s), staged)
+    staged_ops = staged === nothing ? nothing : map(s -> s === nothing ? nothing : last(s), staged)
     lane = _lane_kernel(_partial_apply(plan(spec; have = inputs, want = primal), ()))
     rule(Result) = DerivativeRule{name,N,inputs,primal_spec,forward_spec,reverse_specs,
                                   staged_specs,typeof(primal_ops),typeof(forward_ops),
                                   typeof(reverse_ops),typeof(staged_ops),typeof(lane),
-                                  Result}(
+                                  Result,differentiable}(
         primal_ops, forward_ops, reverse_ops, staged_ops, lane)
     rule(_rule_result_type(rule(nothing), spec, inputs))
 end

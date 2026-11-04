@@ -14,9 +14,10 @@ Two generators cover two shapes of graph:
 
 - [`scalar_derivative_rule`](@ref) — scalar inputs and a scalar result; the
   graph authors the primal plus one partial derivative per input.
-- [`derivative_rule`](@ref) — array or scalar inputs and results; the graph
-  authors a forward branch (one direction per input → the tangent), a reverse
-  branch (the output covector → one cotangent per input), or both.
+- [`derivative_rule`](@ref) — array or scalar inputs and results, with optional
+  data-only inputs; the graph authors a forward branch (one direction per
+  differentiable input → the tangent), a reverse branch (the output covector
+  → one cotangent per differentiable input), or both.
 
 The docstrings of both generators, their callables and cut accessors are on
 the [API reference](api.md) page.
@@ -65,6 +66,50 @@ neither directions nor the covector, in HAVE order (`A`, `x`). The returned
 - [`reverse_cut`](@ref)`(matvec, Val(mask), A, x, y_bar)` runs the VJP branch
   for one activity mask (bit `i` set when input `i` is active) and returns
   the cotangents of the active inputs only.
+
+## Data-only inputs
+
+From version 0.1.78, a literal `nothing` in a derivative mapping declares an
+input to be fixed data. Name every input in signature order; omitting one is
+still an error. There is no graph direction or cotangent port for that input:
+
+```julia
+struct Geometry
+    scale::Float64
+    index::Int
+end
+@kernel scaled_graph(x::Float64, geometry::Geometry, x_dot::Float64,
+        y_bar::Float64) = begin
+    y::Float64 = x * geometry.scale
+    y_dot::Float64 = x_dot * geometry.scale
+    x_bar::Float64 = y_bar * geometry.scale
+    return y, y_dot, x_bar
+end
+scaled = derivative_rule(scaled_graph; primal = :y,
+    directions = (x = :x_dot, geometry = nothing), tangent = :y_dot,
+    covector = :y_bar, cotangents = (x = :x_bar, geometry = nothing))
+geometry = Geometry(3.0, 1)
+forward_cut(scaled, 2.0, geometry, 1.0)  # (6.0, 3.0)
+reverse_cut(scaled, Val(1), 2.0, geometry, 1.0)  # (3.0,)
+```
+
+When both branches are present, their `nothing` entries must agree. Forward
+cuts take all primal inputs followed by directions for differentiable inputs
+only. Reverse masks retain the original input-position bits; setting a
+data-only bit is an error. The data remains available to the primal and to
+any derivative that reads it, including reverse-stage residuals.
+
+Enzyme callers pass data as `Const(geometry)`. Active data is rejected: the
+rule has no authored derivative for it, even if the record contains floating
+point fields. The forward adapter never constructs a zero direction for the
+record. ChainRules `frule` accepts `NoTangent()` or `ZeroTangent()` at data
+positions, and its pullback returns `NoTangent()` there.
+
+Use `geometry = nothing` in the mapping, not a symbol such as
+`geometry = :geometry_bar` naming a graph output whose value happens to be
+`nothing`. That symbol declares an ordinary cotangent output and does not
+mark the input as data-only. Existing symbol-valued mappings retain their
+meaning.
 
 ## One graph, selected cuts
 
@@ -208,8 +253,9 @@ Each adapter is generic over the rule and is loaded with its AD package:
   the same rules.
 - **ChainRules** (`ext/ReactiveKernelsChainRulesCoreExt.jl`, loaded with
   `ChainRulesCore`). `rrule` returns the primal and a concretely typed
-  pullback that holds the all-active pattern's staged residuals; `frule` runs the
-  forward cut, with a zero direction for a `ZeroTangent`.
+  pullback that holds the staged residuals for all differentiable inputs and
+  returns `NoTangent()` for data-only inputs; `frule` runs the forward cut,
+  with a zero direction for a differentiable input's `ZeroTangent`.
 
 The linear-algebra primitive is `ReactiveKernels.rk_expm`: ordinary reverse
 Enzyme through `LinearAlgebra.exp` fails on its LAPACK `ccall`, so the owned

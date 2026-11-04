@@ -13,6 +13,169 @@ using ReactiveKernels
 using ReactiveKernels: derivative_cut
 using Test
 
+module DerivativeRuleDataGraphs
+using ReactiveKernels
+
+struct Geometry
+    weights::Vector{Float64}
+end
+
+# Data at both ends makes the active bits (2, 4) differ from a compressed
+# two-parameter mask. No graph direction/cotangent ports exist for the data.
+@kernel weighted(data::Geometry, s::Float64, x::Vector{Float64}, repeats::Int,
+        s_dot::Float64, x_dot::Vector{Float64}, y_bar::Vector{Float64}) = begin
+    y::Vector{Float64} = s .* x .* data.weights .* repeats
+    y_dot::Vector{Float64} = (s_dot .* x .+ s .* x_dot) .* data.weights .* repeats
+    s_bar::Float64 = sum(y_bar .* x .* data.weights) * repeats
+    x_bar::Vector{Float64} = s .* y_bar .* data.weights .* repeats
+    return y, y_dot, s_bar, x_bar
+end
+
+@kernel four_parameters(a::Float64, b::Float64, c::Float64, x::Vector{Float64},
+        data::Geometry, y_bar::Float64) = begin
+    y::Float64 = a * b + c * sum(x .* data.weights)
+    a_bar::Float64 = y_bar * b
+    b_bar::Float64 = y_bar * a
+    c_bar::Float64 = y_bar * sum(x .* data.weights)
+    x_bar::Vector{Float64} = y_bar .* c .* data.weights
+    return y, a_bar, b_bar, c_bar, x_bar
+end
+
+@kernel fixed(data::Geometry, y_bar::Vector{Float64}) = begin
+    y::Vector{Float64} = copy(data.weights)
+    return y
+end
+@kernel fixed_forward(data::Geometry) = begin
+    y::Vector{Float64} = copy(data.weights)
+    y_dot::Vector{Float64} = zero(y)
+    return y, y_dot
+end
+end
+
+@testset "declared data-only derivative inputs" begin
+    graphs = DerivativeRuleDataGraphs
+    directions = (data = nothing, s = :s_dot, x = :x_dot, repeats = nothing)
+    cotangents = (data = nothing, s = :s_bar, x = :x_bar, repeats = nothing)
+    rule = derivative_rule(graphs.weighted; primal = :y, directions,
+        tangent = :y_dot, covector = :y_bar, cotangents, name = :weighted)
+    data = graphs.Geometry([0.5, 2.0, -1.5])
+    s = 1.4; x = [0.2, -0.8, 1.1]; repeats = 2
+    sd = 0.3; xd = [-0.1, 0.7, 0.2]; yb = [0.4, -0.2, 0.8]
+    inputs = (data, s, x, repeats)
+    expected = s .* x .* data.weights .* repeats
+    jvp = (sd .* x .+ s .* xd) .* data.weights .* repeats
+    sb = sum(yb .* x .* data.weights) * repeats
+    xb = s .* yb .* data.weights .* repeats
+    data_before = copy(data.weights); x_before = copy(x)
+    @test rule_inputs(rule) == (:data, :s, :x, :repeats)
+    @test rule(inputs...) ≈ expected
+    @test @inferred(forward_cut(rule, inputs..., sd, xd)) == (expected, jvp)
+    @test @inferred(reverse_cut(rule, Val(6), inputs..., yb)) == (sb, xb)
+    @test reverse_cut(rule, Val(2), inputs..., yb) == (sb,)
+    @test reverse_cut(rule, Val(4), inputs..., yb) == (xb,)
+    @test reverse_residuals(rule, Val(4)) == (true, true, false, true)
+    primal, residuals = @inferred stage_primal(rule, Val(6), inputs...)
+    @test primal == expected
+    @test :data in stage_residuals(rule, Val(6))
+    @test @inferred(stage_reverse(rule, Val(6), residuals, yb)) == (sb, xb)
+    @test dot(yb, jvp) ≈ sb * sd + dot(xb, xd)
+    for mask in (1, 7, 8, 15)
+        @test_throws r"data-only" reverse_cut(rule, Val(mask), inputs..., yb)
+        @test_throws r"data-only" reverse_residuals(rule, Val(mask))
+        @test_throws r"data-only" stage_residuals(rule, Val(mask))
+        @test_throws r"data-only" stage_primal(rule, Val(mask), inputs...)
+        @test_throws r"data-only" stage_reverse(rule, Val(mask), (), yb)
+    end
+    @test_throws ArgumentError reverse_residuals(rule, Val(0))
+    @test_throws ArgumentError reverse_residuals(rule, Val(16))
+    @test_throws ArgumentError forward_cut(rule, inputs..., nothing, sd, xd, nothing)
+    @test_throws r"every input" derivative_rule(graphs.weighted; primal = :y,
+        directions, tangent = :y_dot, covector = :y_bar,
+        cotangents = (s = :s_bar, x = :x_bar, repeats = nothing))
+    @test_throws r"same data-only" derivative_rule(graphs.weighted; primal = :y,
+        directions, tangent = :y_dot, covector = :y_bar,
+        cotangents = (data = :s_bar, s = nothing, x = :x_bar, repeats = nothing))
+
+    # Both adapters skip the data record entirely when making zero directions.
+    fwd = Enzyme.autodiff(ForwardWithPrimal, Const(rule), Duplicated,
+        Const(data), Duplicated(s, sd), Duplicated(x, xd), Const(repeats))
+    @test Tuple(fwd) == (jvp, expected)
+    @test only(Enzyme.autodiff(Forward, Const(rule), Duplicated,
+        Const(data), Const(s), Duplicated(x, xd), Const(repeats))) ≈
+        s .* xd .* data.weights .* repeats
+    batch = Enzyme.autodiff(Forward, Const(rule), BatchDuplicated,
+        Const(data), BatchDuplicated(s, (sd, 0.0)),
+        BatchDuplicated(x, (zero(x), xd)), Const(repeats))
+    @test batch[1][1] ≈ sd .* x .* data.weights .* repeats
+    @test batch[1][2] ≈ s .* xd .* data.weights .* repeats
+    loss(d, ss, xx, r) = sum(rule(d, ss, xx, r) .* yb)
+    dx = zero(x)
+    ((_, ds, _, _),) = Enzyme.autodiff(Reverse, Const(loss), Active,
+        Const(data), Active(s), Duplicated(x, dx), Const(repeats))
+    @test ds ≈ sb
+    @test dx ≈ xb
+    dxs = (zero(x), zero(x))
+    ((_, dss, _, _),) = Enzyme.autodiff(Reverse, Const(loss), Active,
+        Const(data), Active(s), BatchDuplicated(x, dxs), Const(repeats))
+    @test collect(dss) ≈ [sb, sb]
+    @test all(dx -> dx ≈ xb, dxs)
+    @test_throws r"data-only input :data requires Const" Enzyme.autodiff(
+        Forward, Const(rule), Duplicated, Duplicated(data, graphs.Geometry(zero(x))),
+        Const(s), Const(x), Const(repeats))
+    @test_throws r"data-only input :data requires Const" Enzyme.autodiff(
+        Reverse, Const(loss), Active, Duplicated(data, graphs.Geometry(zero(x))),
+        Active(s), Const(x), Const(repeats))
+
+    @test ChainRulesCore.frule((NoTangent(), NoTangent(), sd, xd, ZeroTangent()),
+        rule, inputs...) == (expected, jvp)
+    @test ChainRulesCore.frule((NoTangent(), ZeroTangent(), ZeroTangent(), xd, NoTangent()),
+        rule, inputs...)[2] ≈ s .* xd .* data.weights .* repeats
+    @test_throws r"data-only input :data" ChainRulesCore.frule(
+        (NoTangent(), graphs.Geometry(zero(x)), sd, xd, NoTangent()), rule, inputs...)
+    cy, pullback = @inferred ChainRulesCore.rrule(rule, inputs...)
+    @test cy == expected
+    @test @inferred(pullback(yb)) == (NoTangent(), NoTangent(), sb, xb, NoTangent())
+    @test x == x_before && data.weights == data_before
+    changed = graphs.Geometry([2.0, -3.0, 0.7])
+    @test rule(changed, s, x, repeats) == s .* x .* changed.weights .* repeats
+    @test reverse_cut(rule, Val(4), changed, s, x, repeats, yb) ==
+        (s .* yb .* changed.weights .* repeats,)
+    for n in (0, 9)
+        dn = graphs.Geometry(fill(0.7, n)); xn = fill(0.2, n); yn = ones(n)
+        @test rule(dn, s, xn, repeats) == s .* xn .* dn.weights .* repeats
+        @test reverse_cut(rule, Val(4), dn, s, xn, repeats, yn) ==
+            (s .* yn .* dn.weights .* repeats,)
+        dxn = zero(xn)
+        Enzyme.autodiff(Reverse, Const((d, xx) -> sum(rule(d, s, xx, repeats))),
+            Active, Const(dn), Duplicated(xn, dxn))
+        @test dxn ≈ s .* dn.weights .* repeats
+    end
+
+    # The reported shape has four differentiable parameters and a fifth data
+    # record. This independent graph guards large-rule tape inference too.
+    four = derivative_rule(graphs.four_parameters; primal = :y, covector = :y_bar,
+        cotangents = (a = :a_bar, b = :b_bar, c = :c_bar, x = :x_bar, data = nothing))
+    dx = zero(x)
+    ((da, db, dc, _, _),) = Enzyme.autodiff(Reverse, Const(four), Active,
+        Active(2.0), Active(3.0), Active(4.0), Duplicated(x, dx), Const(data))
+    @test [da, db, dc] ≈ [3.0, 2.0, sum(x .* data.weights)]
+    @test dx ≈ 4.0 .* data.weights
+    _, back = @inferred ChainRulesCore.rrule(four, 2.0, 3.0, 4.0, x, data)
+    @test @inferred(back(1.0)) ==
+        (NoTangent(), 3.0, 2.0, sum(x .* data.weights), 4.0 .* data.weights, NoTangent())
+
+    fixed = derivative_rule(graphs.fixed; primal = :y, covector = :y_bar,
+        cotangents = (data = nothing,))
+    fy, fixed_back = ChainRulesCore.rrule(fixed, data)
+    @test fy == data.weights && fy !== data.weights
+    @test fixed_back(yb) == (NoTangent(), NoTangent())
+    fixed_fwd = derivative_rule(graphs.fixed_forward; primal = :y,
+        directions = (data = nothing,), tangent = :y_dot)
+    @test forward_cut(fixed_fwd, data) == (data.weights, zero(data.weights))
+    @test ChainRulesCore.frule((NoTangent(), NoTangent()), fixed_fwd, data) ==
+        (data.weights, zero(data.weights))
+end
+
 module DerivativeRuleTestGraphs
 using ReactiveKernels
 
