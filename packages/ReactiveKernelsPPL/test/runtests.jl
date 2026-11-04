@@ -9,6 +9,7 @@ const _PPL_TEST_FILES = (
     "test_host_draw_queries.jl",
     "test_contract.jl",
     "test_layout.jl",
+    "test_parameter_metadata.jl",
     "test_host_transform_numbers.jl",
     "test_preprocessing.jl",
     "test_generator.jl",

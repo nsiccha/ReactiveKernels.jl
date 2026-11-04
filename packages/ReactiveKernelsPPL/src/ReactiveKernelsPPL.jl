@@ -60,7 +60,7 @@ export build_kernel, kernel_expr
 export jax_source
 export model_view, RKPPLModelView
 export DesignShape, DesignBlock, design_shape, coefficient_priors
-export LayoutTable, LayoutEntry, assign_layout, coordinate_names
+export LayoutTable, LayoutEntry, assign_layout, coordinate_names, parameter_metadata
 export constrain, unconstrain, logjac, support_of
 export ordered_constrain, ordered_unconstrain, ordered_logjac
 export simplex_constrain, simplex_unconstrain, simplex_logjac
@@ -120,6 +120,7 @@ include("design.jl")
 include("bijectors.jl")
 include("mv_slices.jl")
 include("layout.jl")
+include("parameter_metadata.jl")
 include("preprocessing.jl")
 include("generator.jl")
 include("arrays.jl")
