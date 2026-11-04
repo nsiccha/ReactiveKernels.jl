@@ -170,15 +170,22 @@ end
         bound = bind_data(lower_rkppl(quote
             s ~ Normal(0,1)
             y .~ MixtureModel.(vcat.(Normal.(0.0,1.0),
-                CountedLaw.(0.0,$scale)), Ref([0.6,0.4]))
+                CountedLaw.(0.0,$scale)), Ref([0.0,1.0]))
         end,data;mod=@__MODULE__,conditioned=(:y,)),data)
         built = build_kernel(bound)
         prepared = prepare_query(built,bound,:sampler)
-        for s in (0.3,-0.2)
+        for s in (0.3,-0.2,800.0)
             NORMALIZERS[] = 0
             value = Base.invokelatest(prepared,[s])
             @test isfinite(value)
             @test NORMALIZERS[] == (scope === :bound ? 0 : scope === :shared ? 1 : n)
+            if s == 800 && scope !== :bound
+                # The component consumes log-scale directly; no exp(800)
+                # physical scale may be introduced by mixture lowering.
+                expected = D.logpdf(D.Normal(),s)-n*(s+log(2pi)/2)-
+                    (scope === :row ? sum(data.x) : 0.0)
+                @test value ≈ expected
+            end
         end
     end
 end
