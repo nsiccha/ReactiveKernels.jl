@@ -8106,10 +8106,10 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
         MixtureWeightRows(value)
     end
     if any(c -> _is_dotted_call(c) &&
-            _rhs_head_symbol(c.args[1]) ∉ (:Normal, :Bernoulli, :BernoulliLogit,
+            !(c.args[1] isa Symbol && c.args[1] in (:Normal, :Bernoulli, :BernoulliLogit,
                 :Poisson, :PoissonLog, :Binomial, :BinomialLogit,
                 :NegativeBinomial2, :NegativeBinomial2Log, :Gamma, :GammaLog,
-                :Beta, :BetaLogit), components)
+                :Beta, :BetaLogit)), components)
         return _lower_graph_mixture_response(lhs, components, wraw, range,
             weights, evidence, ctx, predictors, pred_idx, coefuse)
     end
