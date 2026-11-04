@@ -70,14 +70,16 @@ function _layout_bound(plan::StructuralPlan, x)
     exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
     merge!(exprs, Dict(d.name => d.expr for d in plan.derived))
     function lookup(nm)
-        haskey(plan.columns, nm) && return plan.columns[nm]
-        haskey(exprs, nm) && return _eval_value_expr(exprs[nm], lookup, nm)
+        _holds_bound_value(plan, plan.columns, nm) && return _bound_value(plan, plan.columns, nm)
+        haskey(exprs, nm) && return _memoized_data(plan, nm) do
+            _eval_value_expr(exprs[nm], lookup, nm)
+        end
         return nm
     end
     # A definition reading sampled values remains a graph expression.
     refs = _value_symbols(x)
     function isdata(nm, seen = Set{Symbol}())
-        haskey(plan.columns, nm) && return true
+        _holds_bound_value(plan, plan.columns, nm) && return true
         nm in seen && return false
         haskey(exprs, nm) || return false
         all(r -> isdata(r, union(seen, Set([nm]))), _value_symbols(exprs[nm]))
@@ -528,7 +530,8 @@ function assign_layout(plan::StructuralPlan)
     # take a frozen whole value the graph keeps as bound, like a column
     # (`_holds_bound_value`), never re-evaluating it over absent inputs.
     return LayoutTable(entries, offset - 1, paths,
-        merge!(Dict{Symbol,Any}(plan.columns), pairs(_frozen_graph_values(plan))),
+        merge!(Dict{Symbol,Any}(plan.columns), _definition_memo(plan),
+            pairs(_frozen_graph_values(plan))),
         Dict{Symbol,Any}(a.name => a.expr for a in _definitions(plan)),
         plan.cell_latents, plan.cell_geometries)
 end

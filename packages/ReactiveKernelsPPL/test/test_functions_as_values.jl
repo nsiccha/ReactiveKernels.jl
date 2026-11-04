@@ -977,15 +977,16 @@ end
     end
     u = [0.2, -0.3]
     for ast in (named, inline)
+        _FV.UNWRAPS[] = 0
         plan, bound, built = _fv_build(ast, cols)
         th = ReactiveKernelsPPL.constrain(built.layout, u)
         r = th.b .* sched.a .+ sched.k
         ll = sum(logpdf(Normal(r[cols[:oi][i]], th.sigma), cols[:y][i])
             for i in 1:4)
         @test _fv_value(built, bound, :likelihood, u) ≈ ll
-        _FV.UNWRAPS[] = 0
+        @test _FV.UNWRAPS[] == 1               # first likelihood preparation
         q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
-        @test _FV.UNWRAPS[] == 1               # folded once by preparation
+        @test _FV.UNWRAPS[] == 1               # reused by sampler preparation
         g = similar(u)
         for w in (u, [0.7, 0.1])
             Base.invokelatest(ReactiveKernels.ad_value_and_gradient!, q.ad,

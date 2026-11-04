@@ -187,14 +187,16 @@ function _reuses_bound_preparation(@nospecialize(bound), @nospecialize(passes))
 end
 
 _graph_bound_preparation(g::Graph, @nospecialize(have), @nospecialize(want),
-                         @nospecialize(passes), @nospecialize(bound), on_error = nothing) =
-    _prepare_bound!(_graph_preparations(g), g, have, want, passes, bound, nothing; on_error)
+                         @nospecialize(passes), @nospecialize(bound), on_error = nothing;
+                         _data_cache = nothing) =
+    _prepare_bound!(_graph_preparations(g), g, have, want, passes, bound, nothing;
+        on_error, _data_cache)
 
 # `graph_key` names the graph in a caller-owned cache (its `objectid`), and is
 # `nothing` in the graph's own cache.
 function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
                          @nospecialize(want), @nospecialize(passes), @nospecialize(bound),
-                         graph_key; on_error = nothing)
+                         graph_key; on_error = nothing, _data_cache = nothing)
     ports, data = _partial_bound_pairs(bound)
     isempty(ports) && return prepare!(cache, g; have = have, want = want,
                                      passes = passes, on_error = on_error)
@@ -218,7 +220,8 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
         existing
     end
     # The per-binding mathematics runs outside the lock.
-    hoisted = _bound_hoisted(entry, data)
+    hoisted = _data_cache === nothing ? _bound_hoisted(entry, data) :
+        _data_prefix!(_data_cache, entry.plan, entry.boundary, data)
     classes = _partial_plate_classes(entry.boundary, hoisted)
     _, specialized, signature = _bound_residual(entry, cache, hoisted, classes)
     # A residual the inner-plate pass rewrote other than through its shared

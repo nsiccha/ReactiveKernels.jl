@@ -279,7 +279,7 @@ function density_factors(built, plan::StructuralPlan)
     wanted = unique(vcat([s.total for s in sites],
         [s.plate for s in sites if s.plate !== nothing]))
     if !isempty(wanted)
-        prepared = Base.invokelatest(prepare, spec; have = _query_have(plan),
+        prepared = Base.invokelatest(_prepare_cached, plan, spec; have = _query_have(plan),
             want = Tuple(wanted), bound = binding)
         p = prepared.plan
         old = p.graph
@@ -433,7 +433,7 @@ function _density_selection_spec(built, plan, selection; locality, on_error, u0)
         spec = plate_partition(spec, plates; by, index = _DENSITY_LABEL,
             name = summed, locality, plan = _DENSITY_PLAN)
         planning_have = (have..., _DENSITY_LABEL, _DENSITY_PLAN)
-        planner = Base.invokelatest(ReactiveKernels.partition_plan_kernel, spec;
+        planner = Base.invokelatest(_prepare_cached_partition, plan, spec;
             have = planning_have, want = summed, bound = (; bindings...), on_error)
         rowplan = Base.invokelatest(planner, u0, true, nothing)
         # Rebuild with the concrete plan type: ordinary native AD sees the
@@ -466,7 +466,7 @@ function _density_selection_spec(built, plan, selection; locality, on_error, u0)
     else
         add!(spec.graph, Tuple(spec[t] for t in terms) => output, +)
     end
-    (; spec, have, bound = (; bindings...), want = _DENSITY_TOTAL)
+    (; spec, have, bound = (; bindings...), want = _DENSITY_TOTAL, binding = plan)
 end
 
 "Prepare the sum of selected authored density events, callable with a packed point."
@@ -474,7 +474,7 @@ function prepare_query(built, plan::StructuralPlan, selection::FactorSelection;
         on_error = nothing, locality = :error, u0 = nothing)
     exemplar = _query_exemplar(built.layout, u0)
     q = _density_selection_spec(built, plan, selection; locality, on_error, u0 = exemplar)
-    Base.invokelatest(prepare, q.spec; have = q.have, want = q.want, bound = q.bound, on_error)
+    Base.invokelatest(_prepare_cached, plan, q.spec; have = q.have, want = q.want, bound = q.bound, on_error)
 end
 
 """
@@ -509,7 +509,7 @@ function factor_support(c::DensityFactors, factor::DensityFactor; u0 = nothing)
                 (plate_cell(c.spec, s.plate; index, name, locality = :error),
                     (c.have..., index), name)
             end
-            q = Base.invokelatest(prepare, spec; have, want, bound = c.binding)
+            q = Base.invokelatest(_prepare_cached, c.plan, spec; have, want, bound = c.binding)
             Base.invokelatest(ReactiveKernels.partition_footprint_kernel, q)
         end
     end
@@ -532,7 +532,7 @@ function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
             (n for n in q.have if n !== :unconstrained)...)
         slots = _compact_cell_slots(built.layout.total, selected)
         bound = merge(q.bound, (; _ppl_cell_slots = slots))
-        kernel = Base.invokelatest(prepare, q.spec; have, want = q.want, bound, on_error)
+        kernel = Base.invokelatest(_prepare_cached, plan, q.spec; have, want = q.want, bound, on_error)
         prepared = Base.invokelatest(prepare_operator, kernel, backend,
             Base.front(exemplars)..., u0, u0[selected]; active = :_ppl_cell_active)
         return FactorQueryAD(prepared, built.layout, selected)

@@ -34,6 +34,94 @@ residual plan. Calling it returns the stored value; it allocates nothing.
 struct _BoundConstant{T}
     value::T
 end
+
+# Values belong to one data binding, never to a graph's shared preparation
+# cache. Frontends may retain this store across preparations of that binding.
+mutable struct _DataValues
+    graph::Graph
+    version::UInt
+    inputs::Vector{Pair{Value,Any}}
+    values::Dict{Any,Any}
+    supplied::Dict{ValueId,Any}
+end
+_DataValues(g::Graph) = _DataValues(g, UInt(g.version), Pair{Value,Any}[],
+    Dict{Any,Any}(), Dict{ValueId,Any}())
+
+# Prefix splitting creates private values with selection-dependent ids. Key
+# those by their producer and inputs; original graph values keep their ids.
+function _data_value_keys(p::Plan, original::Graph)
+    keys = Dict{ValueId,Any}()
+    function key(v)
+        cid = canon_id(p.graph, v.id)
+        get!(keys, cid) do
+            haskey(original.values, cid) && return cid
+            r = p.producer[cid]
+            (:part, r.op, Tuple(key(i) for i in r.inputs),
+                findfirst(o -> canon_id(p.graph, o.id) == cid, r.outputs))
+        end
+    end
+    return key
+end
+
+# Run only missing producers of the demanded prefix frontier. Returning all
+# their owned outputs also retains intermediate results used by another query.
+# No unselected recipe or lazy arm is inspected or evaluated here.
+function _data_prefix!(cache::_DataValues, p::Plan, b, data::Tuple)
+    binding = Pair{Value,Any}[v => x for (v, x) in zip(b.bound, data)]
+    same = length(binding) == length(cache.inputs) &&
+        all(zip(binding, cache.inputs)) do (a, z)
+            first(a) == first(z) && last(a) === last(z)
+        end
+    if !isempty(cache.inputs) && (!same || cache.version != UInt(cache.graph.version))
+        empty!(cache.values)
+    end
+    cache.inputs = binding
+    cache.version = UInt(cache.graph.version)
+    merge!(cache.values, cache.supplied)
+    key = _data_value_keys(p, cache.graph)
+    known = Dict{ValueId,Any}(canon_id(p.graph, v.id) => x for (v, x) in binding)
+    producer = Dict{ValueId,Recipe}()
+    for r in b.prefix, v in r.outputs
+        cid = canon_id(p.graph, v.id)
+        haskey(known, cid) || get!(producer, cid, r)
+    end
+    selected = Set{Int}()
+    function need(v)
+        cid = canon_id(p.graph, v.id)
+        haskey(known, cid) && return
+        k = key(v)
+        if haskey(cache.values, k)
+            known[cid] = cache.values[k]
+            return
+        end
+        r = producer[cid]
+        r.id in selected && return
+        push!(selected, r.id)
+        foreach(need, r.inputs)
+    end
+    foreach(need, b.constants)
+    recipes = Recipe[r for r in b.prefix if r.id in selected]
+    outputs = Value[]
+    seen = Set(keys(known))
+    for r in recipes, v in r.outputs
+        cid = canon_id(p.graph, v.id)
+        cid in seen && continue
+        push!(seen, cid)
+        push!(outputs, p.graph.values[cid])
+    end
+    if !isempty(outputs)
+        ids = sort!(collect(keys(known)))
+        have = Value[p.graph.values[id] for id in ids]
+        prefix = _partial_subplan(p, have, outputs, recipes)
+        values = _partial_prefix_values(outputs,
+            _prepare_plan(prefix)((known[id] for id in ids)...))
+        for (v, x) in zip(outputs, values)
+            cache.values[key(v)] = x
+            known[canon_id(p.graph, v.id)] = x
+        end
+    end
+    Tuple(known[canon_id(p.graph, v.id)] for v in b.constants)
+end
 @inline (c::_BoundConstant)() = c.value
 Base.show(io::IO, c::_BoundConstant) = print(io, "bound_constant(",
                                              summary(c.value), ")")
@@ -1791,7 +1879,7 @@ mutates the original graph. New cached value identities use a private graph
 copy. Rebinding new data means running the pass
 again from the same original plan.
 """
-function partial_evaluation(p::Plan, bound, values)
+function partial_evaluation(p::Plan, bound, values; _data_cache = nothing)
     bound_values = _value_vector(bound)
     value_tuple = Tuple(_astuple(values))
     length(bound_values) == length(value_tuple) || throw(ArgumentError(
@@ -1800,7 +1888,8 @@ function partial_evaluation(p::Plan, bound, values)
     p = _partial_split_bound(p, bound_values)
     p = _partial_index_runs(p, bound_values)
     boundary = _partial_boundary(p, bound_values)
-    hoisted = _partial_hoisted(p, boundary, value_tuple)
+    hoisted = _data_cache === nothing ? _partial_hoisted(p, boundary, value_tuple) :
+        _data_prefix!(_data_cache, p, boundary, value_tuple)
     last(_partial_residual(p, boundary, hoisted))
 end
 
@@ -2352,9 +2441,9 @@ Apply the partial-evaluation pre-pass when `bound` is non-empty; otherwise
 return `p` unchanged (the no-flag path stays byte-identical). `bound` is one
 `Value => data` pair or an iterable of them.
 """
-function _partial_apply(p::Plan, bound)
+function _partial_apply(p::Plan, bound; _data_cache = nothing)
     bound === () && return p
     ports, data = _partial_bound_pairs(bound)
     isempty(ports) && return p
-    partial_evaluation(p, ports, data)
+    partial_evaluation(p, ports, data; _data_cache)
 end

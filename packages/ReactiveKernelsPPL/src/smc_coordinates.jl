@@ -81,7 +81,7 @@ function _smc_fresh_window_terms(built, binding, fresh, u0)
     push!(spec.port_order, want)
     add!(spec.graph, (spec[likelihood.want], spec[factors.want]) => output, +)
     (; spec, have=Tuple(unique([likelihood.have..., factors.have...])), want,
-        bound=merge(likelihood.bound, factors.bound))
+        bound=merge(likelihood.bound, factors.bound), binding)
 end
 
 function _smc_likelihood_terms(built, binding, u0)
@@ -116,7 +116,7 @@ function _smc_likelihood_terms(built, binding, u0)
         have = (have..., _PARTITION_PORT, _PLAN_PORT)
         partition_spec, partition_want = _partition_query_spec(local_build, binding,
             names, keys_by_name; locality=:error)
-        planner = Base.invokelatest(ReactiveKernels.partition_plan_kernel,
+        planner = Base.invokelatest(_prepare_cached_partition, binding,
             partition_spec; have, want=partition_want, bound=(; bindings...))
         rowplan = Base.invokelatest(planner, u0, true, nothing)
         spec, partition_want = _partition_query_spec(local_build, binding,
@@ -133,7 +133,7 @@ function _smc_likelihood_terms(built, binding, u0)
     else
         add!(spec.graph, Tuple(spec[t] for t in terms) => output, +)
     end
-    terms = (; spec, have, want, bound=(; bindings...))
+    terms = (; spec, have, want, bound=(; bindings...), binding)
     if any(value -> value isa Real, values(pointwise))
         # A scalar observation has no authored plate. Give its indexed
         # inputs the same local read semantics as observation cells, using
@@ -156,7 +156,7 @@ function _smc_scalar_reads(terms)
 end
 
 function _smc_read_support(terms, u0)
-    kernel = Base.invokelatest(prepare, terms.spec; have=terms.have,
+    kernel = Base.invokelatest(_prepare_cached, terms.binding, terms.spec; have=terms.have,
         want=terms.want, bound=terms.bound, exemplars=(u0,))
     read = Base.invokelatest(partition_footprint, kernel, u0).unconstrained
     read === :whole ? collect(1:length(u0)) : Vector{Int}(read)
@@ -196,7 +196,7 @@ function _smc_selected_kernel(terms, indices, u0)
         (name for name in terms.have if name !== :unconstrained)...)
     slots = _compact_cell_slots(length(u0), indices)
     bound = merge(terms.bound, (; _ppl_smc_slots=slots))
-    kernel = Base.invokelatest(prepare, spec; have, want=terms.want, bound,
+    kernel = Base.invokelatest(_prepare_cached, terms.binding, spec; have, want=terms.want, bound,
         exemplars=(Vector{Float64}(u0[indices]),))
     ReactiveKernels._kernel_latest_prepared(kernel)
 end

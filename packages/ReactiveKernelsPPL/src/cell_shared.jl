@@ -103,7 +103,7 @@ function _prepare_shared_compact_ad(prepare_operator, built, plan, observations,
     point = (base0, active0, slots, 1, _cell_shared_values(shared)...)
     kernel = if parts === nothing
         have = _compact_overlay!(spec, plan)
-        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error,
+        Base.invokelatest(_prepare_cached, plan, spec; have, want, bound = _query_bound(plan), on_error,
                           exemplars = point)
     else
         residual = _conditional_cell_plan(_compact_partition_plan(parts.residual))

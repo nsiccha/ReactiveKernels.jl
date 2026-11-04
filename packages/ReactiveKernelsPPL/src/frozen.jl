@@ -20,8 +20,9 @@ of them) in the binding `bound`, as [`bind_data`](@ref)'s `frozen` keyword
 takes them. A definition is data-only when it reads data alone, never a
 parameter: one binding evaluates (a fitted mean, a level set) or one RK
 preparation folds (a whole value a parameter-dependent call reads, such as an
-HSGP interval), which `bound.columns` does not hold. Each is evaluated once,
-from `bound`'s data, as binding evaluates it; a definition `bound` itself
+HSGP interval), which `bound.columns` does not hold. Each uses the binding's
+existing result or is evaluated on first demand from `bound`'s data;
+a definition `bound` itself
 froze keeps its frozen value. The result also records the type and size of
 every data input those definitions read (never its values), so a binding
 that omits such an input still generates the same program.
@@ -40,8 +41,7 @@ function frozen_values(plan::StructuralPlan, names)
     for nm in want
         _check_frozen_definition(plan, exprs, nm)
     end
-    lookup = _definition_lookup(plan, plan.columns, exprs, vector_defs,
-        Dict{Symbol,Any}(pairs(plan.frozen.values)))
+    lookup = _definition_lookup(plan, plan.columns, exprs, vector_defs)
     values = map(want) do nm
         v = try
             lookup(nm)
@@ -92,10 +92,28 @@ end
 # no column, and its expression reads inputs the binding leaves absent: an
 # absent stand-in answers only its recorded shape, so evaluating it either
 # fails (`x_fit[1]`) or recomputes from that shape what the record holds.
-_holds_bound_value(plan, columns::AbstractDict, name::Symbol) =
-    haskey(columns, name) || (plan !== nothing && haskey(plan.frozen.values, name))
-_bound_value(plan, columns::AbstractDict, name::Symbol) =
-    haskey(columns, name) ? columns[name] : plan.frozen.values[name]
+_definition_memo(plan::StructuralPlan) = plan.data_values === nothing ?
+    Dict{Symbol,Any}(pairs(plan.frozen.values)) : plan.data_values.values
+
+function _memoized_data(f, plan, name::Symbol)
+    (plan === nothing || plan.data_values === nothing) && return f()
+    lock(plan.data_values.lock) do
+        get!(f, plan.data_values.values, name)
+    end
+end
+
+function _holds_bound_value(plan, columns::AbstractDict, name::Symbol)
+    haskey(columns, name) && return true
+    plan === nothing && return false
+    haskey(plan.frozen.values, name) && return true
+    plan.data_values === nothing && return false
+    lock(() -> haskey(plan.data_values.values, name), plan.data_values.lock)
+end
+function _bound_value(plan, columns::AbstractDict, name::Symbol)
+    haskey(columns, name) && return columns[name]
+    haskey(plan.frozen.values, name) && return plan.frozen.values[name]
+    lock(() -> plan.data_values.values[name], plan.data_values.lock)
+end
 
 # The type a program declares for a data input (`_data_arg`) and its size.
 _frozen_input_info(v::_AbsentNumber{T}) where {T} = (type = T, size = ())
@@ -158,7 +176,7 @@ _live_names(plan::StructuralPlan, given::Set{Symbol}, inputs::Set{Symbol}) =
         free = copy(candidates)
         for f in fieldnames(StructuralPlan)
             f in (:assignments, :derived, :columns, :roles, :n_obs,
-                :submodel_scopes, :frozen) && continue
+                :submodel_scopes, :frozen, :data_values) && continue
             _drop_held_names!(free, getfield(plan, f))
         end
         live = setdiff(candidates, free)

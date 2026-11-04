@@ -90,6 +90,47 @@ function _query_bound(plan::StructuralPlan)
         _frozen_graph_values(plan))
 end
 
+# One binding owns both the interpreter's named values and the core graph's
+# prefix results. Graph copies for specialized queries share authored data
+# definitions through their port names; anonymous values stay graph-local.
+function _with_query_data(f, plan::StructuralPlan, spec, on_error)
+    data = plan.data_values
+    data === nothing && return f(nothing)
+    lock(data.lock) do
+        policies = get!(Dict{Any,Any}, data.graphs, spec.graph)
+        cache = get!(policies, (on_error, ReactiveKernels._plan_mode())) do
+            ReactiveKernels._DataValues(spec.graph)
+        end
+        exprs, _ = _definition_exprs(plan)
+        empty!(cache.supplied)
+        if on_error === nothing
+            for (nm, value) in data.values
+                haskey(exprs, nm) && haskey(spec.ports, nm) && _supplied(value) || continue
+                cache.supplied[ReactiveKernels.canon_id(spec.graph, spec[nm].id)] = value
+            end
+        end
+        result = f(cache)
+        if on_error === nothing
+            for nm in keys(exprs)
+                haskey(spec.ports, nm) || continue
+                key = ReactiveKernels.canon_id(spec.graph, spec[nm].id)
+                haskey(cache.values, key) && (data.values[nm] = cache.values[key])
+            end
+        end
+        result
+    end
+end
+
+function _prepare_cached(plan::StructuralPlan, spec; on_error = nothing, kwargs...)
+    _with_query_data(plan, spec, on_error) do cache
+        prepare(spec; kwargs..., on_error, _data_cache = cache)
+    end
+end
+
+_prepare_cached_partition(plan, spec; kwargs...) =
+    task_local_storage(() -> _prepare_cached(plan, spec; kwargs...),
+        ReactiveKernels._PLAN_MODE, true)
+
 # Run a preparation of `want` from `have` over `plan`'s inputs. When it
 # needs a value the binding leaves absent, RK's planner finds no producer for
 # that input; planning again with the absent inputs available shows which
@@ -188,7 +229,7 @@ function _prepare_wants(built, plan::StructuralPlan, want;
     # run at the latest world. Same barrier guards every call below.
     have = _query_have(plan)
     return _absent_refusal(plan, built.spec, have, want) do
-        Base.invokelatest(prepare, built.spec; have,
+        Base.invokelatest(_prepare_cached, plan, built.spec; have,
             want, bound = _query_bound(plan), on_error, exemplars)
     end
 end
@@ -741,7 +782,7 @@ function prepare_cell_query(built, plan::StructuralPlan, observations;
     end
     parts === nothing || ((spec, want) = _cell_query_spec(built, plan, names; locality = :ignore))
     kernel = _absent_refusal(plan, spec, have, want) do
-        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error,
+        Base.invokelatest(_prepare_cached, plan, spec; have, want, bound = _query_bound(plan), on_error,
             exemplars = (exemplar, 1))
     end
     specializations = prefix === nothing ?
@@ -1051,7 +1092,7 @@ function _prepare_compact_cell(caller::Symbol, built, plan::StructuralPlan, obse
     spec, want = _cell_query_spec(built, plan, names; locality)
     have = _compact_overlay!(spec, plan)
     kernel = _absent_refusal(plan, spec, have, want) do
-        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error,
+        Base.invokelatest(_prepare_cached, plan, spec; have, want, bound = _query_bound(plan), on_error,
                           exemplars = (base0, active0, slots, 1))
     end
     (; kernel, names, active0, selected, slots)
@@ -1537,14 +1578,14 @@ function _prepare_partition(built, plan::StructuralPlan, by, names;
             locality = dense_locality, partitioned = rule)
     end
     planner = _absent_refusal(plan, spec, have, want) do
-        Base.invokelatest(ReactiveKernels.partition_plan_kernel, spec; have, want,
+        Base.invokelatest(_prepare_cached_partition, plan, spec; have, want,
                           bound = _query_bound(plan), on_error)
     end
     plans, plan_type = _partition_plans(planner, labels, exemplar)
     spec, want = _partition_query_spec(built, plan, names, keys_by_name;
         locality = dense_locality, partitioned = rule, plan_type)
     kernel = _absent_refusal(plan, spec, have, want) do
-        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
+        Base.invokelatest(_prepare_cached, plan, spec; have, want, bound = _query_bound(plan), on_error)
     end
     if !isempty(rule)
         for label in labels
@@ -1737,8 +1778,11 @@ function _query_shared_parts_latest(spec, plan, have, want, rule, varying, on_er
     selected = ReactiveKernels.plan(spec; have, want)
     selected = ReactiveKernels._kernel_error_policy(selected, on_error)
     selected = ReactiveKernels._fuse_authored_plate_chains(selected; cells_only = true)
-    bound_selected = ReactiveKernels._partial_apply(selected,
-        ReactiveKernels._kernel_bound_pairs(spec, _query_bound(plan)))
+    bound_selected = _with_query_data(plan, spec, on_error) do cache
+        ReactiveKernels._partial_apply(selected,
+            ReactiveKernels._kernel_bound_pairs(spec, _query_bound(plan));
+            _data_cache = cache)
+    end
     ReactiveKernels._partition_shared_parts(bound_selected, rule;
         varying, preserve_rows = true)
 end
@@ -1832,14 +1876,14 @@ function _prepare_partition_sampler(built, plan::StructuralPlan, by, names, layo
             locality = dense_locality, partitioned = rule)
     end
     planner = _absent_refusal(plan, spec, have, want) do
-        Base.invokelatest(ReactiveKernels.partition_plan_kernel, spec; have, want,
+        Base.invokelatest(_prepare_cached_partition, plan, spec; have, want,
                           bound = _query_bound(plan), on_error)
     end
     plans, plan_type = _partition_plans(planner, labels, exemplar)
     spec, want = _partition_query_spec(built, plan, names, keys_by_name;
                                        locality = dense_locality, partitioned = rule, plan_type)
     kernel = _absent_refusal(plan, spec, have, want) do
-        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
+        Base.invokelatest(_prepare_cached, plan, spec; have, want, bound = _query_bound(plan), on_error)
     end
     footprints = Dict{Any,Vector{Int}}()
     footprint = Base.invokelatest(ReactiveKernels.partition_footprint_kernel, kernel)
@@ -1881,7 +1925,7 @@ function _prepare_partition_sampler(built, plan::StructuralPlan, by, names, layo
                                        partitioned = rule, plan_constant = (:_ppl_cell_slots,))
     have = (_compact_overlay!(spec, plan)..., _PARTITION_PORT, _PLAN_PORT)
     planner = _absent_refusal(plan, spec, have, want) do
-        Base.invokelatest(ReactiveKernels.partition_plan_kernel, spec; have, want,
+        Base.invokelatest(_prepare_cached_partition, plan, spec; have, want,
                           bound = _query_bound(plan), on_error)
     end
     plans, plan_type = _partition_plans_each(labels) do label
@@ -1894,7 +1938,7 @@ function _prepare_partition_sampler(built, plan::StructuralPlan, by, names, layo
                                        plan_constant = (:_ppl_cell_slots,))
     _compact_overlay!(spec, plan)
     compact_kernel = _absent_refusal(plan, spec, have, want) do
-        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
+        Base.invokelatest(_prepare_cached, plan, spec; have, want, bound = _query_bound(plan), on_error)
     end
     ad = _partition_prepare_ad(labels) do label
         selection = selections[label]

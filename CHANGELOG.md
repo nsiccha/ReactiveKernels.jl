@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.79
+
+- Bound preparation can reuse data-only prefix results in a frontend-owned
+  binding store, including intermediate results and split data subexpressions.
+  The shared compilation caches retain no binding's values. Ordinary core
+  `prepare(...; bound)` calls keep their per-preparation behavior.
+
 ## 0.1.78
 
 - `derivative_rule` accepts literal `nothing` entries in its `directions` and
