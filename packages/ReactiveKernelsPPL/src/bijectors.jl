@@ -55,9 +55,19 @@ end
 # endpoint) prepares once, then runs the compiled scalar kernel. Lazy —
 # populated on first host-side use, never at precompile time.
 const _PREPARED_ENDPOINTS = Dict{Tuple{Symbol,Symbol},Any}()
+const _HOST_BIJECTOR_LOCK = ReentrantLock()
+
+# Both hits and misses must be protected: a different endpoint can be inserted
+# while another task reads this Dict. Only preparation/lookup is serialized;
+# callers execute the returned pure kernel after releasing the lock.
+function _host_bijector_endpoint(f, cache, key)
+    return lock(_HOST_BIJECTOR_LOCK) do
+        get!(f, cache, key)
+    end
+end
 
 function _prepared_endpoint(transform::Symbol, endpoint::Symbol)
-    get!(_PREPARED_ENDPOINTS, (transform, endpoint)) do
+    _host_bijector_endpoint(_PREPARED_ENDPOINTS, (transform, endpoint)) do
         prepare(getproperty(_bijector_for(transform), endpoint))
     end
 end
@@ -88,7 +98,7 @@ end
 const _PREPARED_INTERVAL = Dict{Tuple{Float64,Float64,Symbol},Any}()
 
 function _prepared_interval_endpoint(lo::Float64, hi::Float64, endpoint::Symbol)
-    get!(_PREPARED_INTERVAL, (lo, hi, endpoint)) do
+    _host_bijector_endpoint(_PREPARED_INTERVAL, (lo, hi, endpoint)) do
         prepare(getproperty(interval_bijector, endpoint); bound = (; lo = lo, hi = hi))
     end
 end
@@ -110,7 +120,7 @@ end
 const _PREPARED_FLOORED = Dict{Tuple{Float64,Symbol},Any}()
 
 function _prepared_floored_endpoint(lo::Float64, endpoint::Symbol)
-    get!(_PREPARED_FLOORED, (lo, endpoint)) do
+    _host_bijector_endpoint(_PREPARED_FLOORED, (lo, endpoint)) do
         prepare(getproperty(floored_bijector, endpoint); bound = (; lo = lo))
     end
 end
@@ -133,7 +143,7 @@ end
 const _PREPARED_UPPER = Dict{Tuple{Float64,Symbol},Any}()
 
 function _prepared_upper_endpoint(hi::Float64, endpoint::Symbol)
-    get!(_PREPARED_UPPER, (hi, endpoint)) do
+    _host_bijector_endpoint(_PREPARED_UPPER, (hi, endpoint)) do
         prepare(getproperty(upper_bijector, endpoint); bound = (; hi = hi))
     end
 end

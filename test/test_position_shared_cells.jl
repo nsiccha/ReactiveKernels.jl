@@ -555,6 +555,34 @@ end
     end
 end
 
+@testset "fresh equal arrays avoid repeated content hashes" begin
+    scalar = prepare(design_plate; have = (:ts, :eta, :theta), want = :cells)
+    for (mode, reader) in pairs(readers(scalar)), n in (0, 3, 1024)
+        rows = [Hashed(fill(1.0, n)) for _ in 1:NSUB]
+        expected = reduce(hcat, [scalar(rows, etas[:, k], thetas[k]) for k in 1:NPOS])
+        count, hashes, value = hashed_calls(reader, rows, etas, thetas)
+        @test count == 1
+        @test hashes == 1
+        @test isequal(value, expected)
+        @test all(row -> row.x == fill(1.0, n), rows)
+        n == 0 && continue
+        # A difference at the end must not be missed, and values from the
+        # previous read must not survive an in-place input change.
+        rows[end].x[end] = 2.0
+        expected = reduce(hcat, [scalar(rows, etas[:, k], thetas[k]) for k in 1:NPOS])
+        count, hashes, value = hashed_calls(reader, rows, etas, thetas)
+        @test count == 2
+        @test hashes == 2
+        @test isequal(value, expected)
+        # Once diverse keys appear, later equal copies still share by value.
+        rows[2].x[end] = 2.0
+        expected = reduce(hcat, [scalar(rows, etas[:, k], thetas[k]) for k in 1:NPOS])
+        count, hashes, value = hashed_calls(reader, rows, etas, thetas)
+        @test count == 2
+        @test isequal(value, expected)
+    end
+end
+
 @testset "a field read keys nothing" begin
     # The record is not hashed to save a load; the call keys the field it reads.
     records = [(; t = collect(1.0:5.0), h = Hashed(fill(1.0, 3))) for _ in 1:NSUB]
