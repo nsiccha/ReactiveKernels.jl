@@ -652,6 +652,8 @@ _data_arg(name::Symbol, ::AbstractArray{T,N}) where {T,N} = Expr(:(::), name, Ar
 module PPLGeneratedModels
 using ReactiveKernels
 import ..ReactiveKernelsPPL
+# Printed graph-mapped endpoints qualify their helpers with this module.
+import ReactiveKernelsDistributionKernels
 import ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
