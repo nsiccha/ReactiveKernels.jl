@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.94
+
+- A built observation graph can be rebound between empty and nonempty data
+  with unchanged parameter layout and data types. Empty observations retain
+  their plates and contribute zero likelihood while priors, Jacobians and
+  ordinary reverse-mode gradients remain active. This includes heterogeneous
+  mixtures, ranged observations and arrays observed inside plate cells.
+
 ## 0.1.93
 
 - Export `rkppl_documentation(model_or_plan; path=nothing)` and immutable

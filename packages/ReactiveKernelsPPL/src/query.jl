@@ -239,7 +239,7 @@ end
 # gensym-created lowering namespace) evaluates on it exactly as on its own
 # build. A binding that generates another program
 # (other level labels or parameter sizes, data element types, missing
-# entries, an empty response, another broadcast shape) needs its own build;
+# entries, another broadcast shape) needs its own build;
 # evaluating the old graph on it can be silently wrong, so it is refused.
 # Values made outside `build_kernel` carry no `program` and are not checked.
 # A value the binding leaves absent has the type its input has in the built
