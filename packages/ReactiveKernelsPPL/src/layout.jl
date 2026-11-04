@@ -1177,6 +1177,11 @@ type of `unconstrained` (`Float64` for plain reals). Deterministic submodel
 locals and return values are read in the model rather than included in this
 draw container. The generator emits the equivalent transforms inside the
 mathematical graph.
+
+Concurrent calls may share a completed layout when its inputs and bound values
+remain read-only. Built-in transforms synchronize their lazy endpoint caches;
+caller-owned geometry and functions evaluated in bounds must themselves allow
+concurrent calls. Each call constructs its own result containers.
 """
 function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
     length(u) == layout.total ||
