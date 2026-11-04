@@ -4,6 +4,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 import Distributions as D
 import DifferentiationInterface as DI
 import Enzyme
+include(joinpath(pkgdir(ReactiveKernels), "test", "type_stability_audit.jl"))
 
 struct ShiftedLaw end
 struct KeywordLaw end
@@ -111,6 +112,8 @@ function check(fx; reverse=false)
     if reverse
         prepared = prepare_sampler(fx.built,fx.bound,fx.u;
             backend=DI.AutoEnzyme(;mode=Enzyme.Reverse))
+        @test isempty(TypeStabilityAudit.findings(prepared.kernel, (Vector{Float64},)))
+        @test isempty(TypeStabilityAudit.ad_call_findings(prepared.ad, fx.u))
         for shift in (0.0,0.09)
             u = fx.u .+ shift
             value,gradient = sampler_value_and_gradient!(prepared,similar(u),u)

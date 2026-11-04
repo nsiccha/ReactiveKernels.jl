@@ -10,6 +10,36 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
 const _ARM_CALLS = Ref(0)
 _counted_log(s) = (_ARM_CALLS[] += 1; log(s))
 
+@kernel _counted_child(x, s) = begin
+    normalizer = _counted_log(s)
+    return x * normalizer
+end
+@kernel _guarded_child(x::Vector{Float64}, s::Float64, take::Bool) = begin
+    cells = plate(x, s, take) do xi, si, selected
+        if selected
+            density = _counted_child(xi, si)
+            density + xi
+        else
+            -xi
+        end
+    end
+    total::Float64 = sum(cells)
+    return total
+end
+
+@testset "graph children retain shared work inside lazy arms" begin
+    for n in (0, 3, 11), bind_condition in (false, true), take in (false, true)
+        x = collect(1.0:n)
+        prepared = prepare(_guarded_child;
+            bound = bind_condition ? (; x, take) : (; x))
+        s = take ? 2.0 : -1.0
+        _ARM_CALLS[] = 0
+        result = bind_condition ? prepared(s) : prepared(s, take)
+        @test result ≈ (take ? sum(x) * (log(s) + 1) : -sum(x))
+        @test _ARM_CALLS[] == (take && n > 0 ? 1 : 0)
+    end
+end
+
 # The support guard of a Normal observation with a shared scale.
 @kernel _guarded_normal(y::Vector{Float64}, mu::Vector{Float64}, sigma::Float64) = begin
     pointwise = plate(y, mu, sigma) do y, mu, sigma
