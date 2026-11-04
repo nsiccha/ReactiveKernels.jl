@@ -46,6 +46,71 @@ astsize(x) = 0
     return total
 end
 
+# One element of a matrix: at the cell's row (`b[q, 2]`) and at a literal row
+# (`b[1, 2]`). A row of `b = Z * M` reads only that row of `Z`.
+@kernel matrix_read(Z::AbstractMatrix{Float64}, s::Float64, y::AbstractVector{Float64},
+                    rows::AbstractVector{Int}, key::AbstractVector{Int}) = begin
+    M = [1.0 s; 0.0 1.0]
+    b = Z * M
+    anchor = exp(b[1, 2])
+    dens = plate(rows, y) do q, yi
+        -(anchor * b[q, 2] - yi)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+
+# A row of this matrix is computed from another row: it stays cross-row work.
+@kernel matrix_read_reversed(Z::AbstractMatrix{Float64}, y::AbstractVector{Float64},
+                             rows::AbstractVector{Int}, key::AbstractVector{Int}) = begin
+    b = reverse(Z; dims = 1)
+    dens = plate(rows, y) do q, yi
+        -(b[q, 2] - yi)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+
+# The same read of a matrix port, of bound data and of a computed vector.
+@kernel matrix_read_port(X::AbstractMatrix{Float64}, y::AbstractVector{Float64},
+                         rows::AbstractVector{Int}, key::AbstractVector{Int}) = begin
+    dens = plate(rows, y) do q, yi
+        -(X[q, 2] - yi)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+@kernel matrix_row_port(X::AbstractMatrix{Float64}, y::AbstractVector{Float64},
+                        rows::AbstractVector{Int}, key::AbstractVector{Int}) = begin
+    dens = plate(rows, y) do q, yi
+        -(sum(X[q, :]) - yi)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+@kernel vector_read_literal(x::AbstractVector{Float64}, y::AbstractVector{Float64},
+                            rows::AbstractVector{Int}, key::AbstractVector{Int}) = begin
+    v = exp.(x)
+    dens = plate(rows, y) do q, yi
+        -(v[q, 1] - yi)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+
+# Binding `w` splits `sum(w)` out of `anchor`, leaving `exp(v[1])` one closure.
+@kernel bound_part_read(x::AbstractVector{Float64}, w::AbstractVector{Float64},
+                        y::AbstractVector{Float64}, rows::AbstractVector{Int},
+                        key::AbstractVector{Int}) = begin
+    v = exp.(x)
+    anchor = exp(v[1]) * sum(w) + v[1]
+    dens = plate(rows, y) do q, yi
+        -(anchor * v[q] - yi)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+
 @testset "scalar index spelling and bounds" begin
     k = prepare(plate_partition(indexed, :dens; by = :key, locality = :error);
         have = (:x, :scale, :key, :partition), want = :partition_total)
@@ -134,6 +199,123 @@ function scaled_right_oracle(Z, scale, L, x, y, i)
     B = Z * transpose(scale .* L)
     ratio = exp(B[1, 1]) / exp(B[1, 2])
     -(y[i] - sin(ratio * x[i]))^2 / 2
+end
+
+@testset "one element of a matrix is read at its row" begin
+    have = (:Z, :s, :y, :rows, :key, :partition)
+    partition = plate_partition(matrix_read, :dens; by = :key, locality = :error)
+    kernel = prepare(partition; have, want = :partition_total)
+    status = Dict(e.value => e.status for e in partition_locality(kernel))
+    @test status[:b] === :rows
+    allocations, structures = Int[], Int[]
+    for n in (6, 6000)
+        Z = [sin(i + 2j) / 3 for i in 1:n, j in 1:2]
+        rows = [4, n, 2, 4]
+        y = [0.3, -0.2, 0.1, 0.4]
+        key = [1, 1, 2, 2]
+        s = 0.4
+        element(i) = Z[i, 1] * s + Z[i, 2]
+        anchor = exp(element(1))
+        expected(k) = sum(-(anchor * element(rows[j]) - y[j])^2 / 2 for j in findall(==(k), key))
+        @test kernel(Z, s, y, rows, key, 1) ≈ expected(1)
+        @test kernel(Z, s, y, rows, key, 2) ≈ expected(2)
+        # Row 1 for the anchor and the cells' own rows, whatever the data's size.
+        linear(i) = LinearIndices(Z)[i, :]
+        read = partition_footprint(kernel, Z, s, y, rows, key, 1).Z
+        @test read == sort!(vcat(linear(1), linear(4), linear(n)))
+        bound = prepare(partition; have, want = :partition_total, bound = (; y, rows, key))
+        bound(Z, s, 1)
+        push!(allocations, @allocated bound(Z, s, 1))
+        push!(structures, astsize(code_expr(bound)))
+        derivative = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), Z, s, 1; active = :Z)
+        value, gradient = ad_value_and_gradient(derivative, Z, s, 1)
+        @test value ≈ expected(1)
+        analytic = zeros(size(Z))
+        for j in findall(==(1), key)
+            residual = -(anchor * element(rows[j]) - y[j])
+            analytic[1, :] .+= residual * anchor * element(rows[j]) .* [s, 1.0]
+            analytic[rows[j], :] .+= residual * anchor .* [s, 1.0]
+        end
+        @test gradient ≈ analytic atol = 1e-12
+    end
+    @test structures[1] == structures[2]
+    @test allocations[1] == allocations[2]
+    # A row outside the matrix still throws.
+    Z = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+    @test_throws BoundsError kernel(Z, 0.1, [0.0], [4], [1], 1)
+end
+
+@testset "one element of a port, of bound data and of a vector" begin
+    X = [sin(i + 2j) for i in 1:5, j in 1:2]
+    y, rows, key = [0.2, -0.1, 0.4], [4, 2, 4], [1, 1, 2]
+    expected(k) = sum(-(X[rows[j], 2] - y[j])^2 / 2 for j in findall(==(k), key))
+    have = (:X, :y, :rows, :key, :partition)
+    partition = plate_partition(matrix_read_port, :dens; by = :key, locality = :error)
+    live = prepare(partition; have, want = :partition_total)
+    @test live(X, y, rows, key, 1) ≈ expected(1)
+    @test partition_footprint(live, X, y, rows, key, 1).X ==
+          sort!(vcat(LinearIndices(X)[4, :], LinearIndices(X)[2, :]))
+    bound = prepare(partition; have, want = :partition_total, bound = (; X, y, rows, key))
+    @test bound(1) ≈ expected(1)
+    @test bound(2) ≈ expected(2)
+    # A selected row of a matrix port reports that row's positions, every column.
+    rowwise = prepare(plate_partition(matrix_row_port, :dens; by = :key, locality = :error);
+        have, want = :partition_total)
+    @test rowwise(X, y, rows, key, 1) ≈
+          sum(-(sum(X[rows[j], :]) - y[j])^2 / 2 for j in findall(==(1), key))
+    @test partition_footprint(rowwise, X, y, rows, key, 1).X ==
+          sort!(vcat(LinearIndices(X)[4, :], LinearIndices(X)[2, :]))
+
+    x = [0.1, 0.2, 0.3, 0.4, 0.5]
+    vector = prepare(plate_partition(vector_read_literal, :dens; by = :key, locality = :error);
+        have = (:x, :y, :rows, :key, :partition), want = :partition_total)
+    @test vector(x, y, rows, key, 1) ≈
+          sum(-(exp(x[rows[j]]) - y[j])^2 / 2 for j in findall(==(1), key))
+    @test partition_footprint(vector, x, y, rows, key, 1).x == [2, 4]
+end
+
+@testset "a scalar read in a part split out by binding data" begin
+    allocations, structures = Int[], Int[]
+    for n in (6, 6000)
+        x = [sin(i) / 3 for i in 1:n]
+        w, y, rows, key = [0.5, 0.25], [0.1, -0.2, 0.3], [3, n, 3], [1, 1, 2]
+        kernel = prepare(plate_partition(bound_part_read, :dens; by = :key, locality = :error);
+            have = (:x, :w, :y, :rows, :key, :partition), want = :partition_total,
+            bound = (; w, y, rows, key))
+        v = exp.(x)
+        anchor = exp(v[1]) * sum(w) + v[1]
+        expected = sum(-(anchor * v[rows[j]] - y[j])^2 / 2 for j in 1:2)
+        @test kernel(x, 1) ≈ expected
+        @test partition_footprint(kernel, x, 1).x == [1, 3, n]
+        status = Dict(e.value => e.status for e in partition_locality(kernel))
+        @test status[:v] === :rows
+        push!(allocations, @allocated kernel(x, 1))
+        push!(structures, astsize(code_expr(kernel)))
+        derivative = prepare_ad(kernel, AutoEnzyme(; mode = Enzyme.Reverse), x, 1; active = :x)
+        value, gradient = ad_value_and_gradient(derivative, x, 1)
+        @test value ≈ expected
+        analytic = zeros(n)
+        slope = exp(v[1]) * sum(w) + 1
+        for j in 1:2
+            residual = -(anchor * v[rows[j]] - y[j])
+            analytic[1] += residual * v[rows[j]] * slope * v[1]
+            analytic[rows[j]] += residual * anchor * v[rows[j]]
+        end
+        @test gradient ≈ analytic atol = 1e-10
+    end
+    @test structures[1] == structures[2]
+    @test allocations[1] == allocations[2]
+end
+
+@testset "an element of a matrix without a row form stays refused" begin
+    have = (:Z, :y, :rows, :key, :partition)
+    @test_throws PartitionLocalityError prepare(
+        plate_partition(matrix_read_reversed, :dens; by = :key, locality = :error);
+        have, want = :partition_total)
+    kernel = prepare(plate_partition(matrix_read_reversed, :dens; by = :key, locality = :ignore);
+        have, want = :partition_total)
+    Z = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+    @test kernel(Z, [0.5], [1], [1], 1) ≈ -(reverse(Z; dims = 1)[1, 2] - 0.5)^2 / 2
 end
 
 @testset "scalar type through a shared transposed broadcast" begin

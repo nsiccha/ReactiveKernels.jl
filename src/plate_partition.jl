@@ -648,6 +648,16 @@ function _footprint_record!(cid::ValueId, kind::Symbol, expr)
     nothing
 end
 
+# A capture reads linear positions `v[q]` of a vector. Of any other array it may
+# read `M[q, :]` or `M[q, 2]` instead, and the capture records no later indices:
+# report the positions and those whole rows, which covers either read. Without
+# the rows, `X[q, 2]` of a matrix port reported positions of its first column.
+function _footprint_record_capture!(d, cid::ValueId, expr)
+    _footprint_record!(cid, :gathered, expr)
+    get(d.types, cid, Any) <: AbstractVector || _footprint_record!(cid, :gathered_rows, expr)
+    nothing
+end
+
 # The return expression of a footprint body: each HAVE port's name, value and
 # recorded reads, plus the reads of the recipes the window emitter never
 # saw (computed whole: a bound-indexed gather or literal range view reads

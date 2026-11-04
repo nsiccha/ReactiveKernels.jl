@@ -351,7 +351,13 @@ function _cell_factor_scalar_reads(spec::KernelSpec, cell_outputs; bound, locali
                     _add_recipe!(g, (), (i,), _BoundConstant(read.index), 0.0, nothing,
                                  false, read.index)
                 end
-                inputs, op = (i, read.array), _cell_index_op(locality)
+                array = read.array
+                if !isempty(read.tail)
+                    array = value!(g, Symbol(only(r.outputs).name, :_column), Any)
+                    _add_recipe!(g, (read.array,), (array,), _CellColumnRead(read.tail),
+                                 r.cost, nothing, false, nothing)
+                end
+                inputs, op = (i, array), _cell_index_op(locality)
             end
         end
         _add_recipe!(g, inputs, r.outputs, op, r.cost, r.cse_key, r.effectful, r.source)
