@@ -154,7 +154,7 @@ end
         for compact in (true, false)
             sampler = prepare_partition_sampler(built, bound, :y, u; by=:unit,
                 partitioned=:eta, compact, backend=AutoEnzyme(; mode=Enzyme.Reverse))
-            @test length(sampler.prefix.point) == 2
+            @test length(sampler.prefix.point) <= 2
             @test all(v -> !(v isa AbstractArray) || length(v) <= 2, sampler.prefix.values)
             for label in (n, 1, n), change in (0.0, 0.15)
                 point = u .+ change

@@ -51,7 +51,7 @@ end
                 backend=BACKEND, compact, partitioned=:eta, locality=:error)
             @test sampler.prefix !== nothing
             cached = sampler.prefix.values
-            local_positions = setdiff(eachindex(u), sampler.prefix.positions)
+            local_positions = findall(==(:eta), coordinate_names(built.layout))
             for label in (1, 3, 2), change in (0.0, 0.2)
                 point = copy(u)
                 point[local_positions] .+= change

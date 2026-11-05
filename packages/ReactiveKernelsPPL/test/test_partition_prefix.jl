@@ -20,6 +20,7 @@ function build_model(model, data)
     bound, build_kernel(bound)
 end
 const BACKEND = AutoEnzyme(; mode=Enzyme.Reverse)
+sharedview(theta) = view(theta, :)
 
 @testset "shared prefix reuse and compact/dense full/local gradients" begin
     for sizes in ((2, 3, 4, 5, 2, 3), (3, 2, 25, 40, 80, 60))
@@ -42,8 +43,8 @@ const BACKEND = AutoEnzyme(; mode=Enzyme.Reverse)
             # reference, never as a by-value aggregate of all its fields.
             @test ReactiveKernelsPPL._partition_ad(sampler.ad, 1).resolver isa
                   ReactiveKernels._ADPlanBoxing
-            shared_positions = sampler.prefix.positions
-            local_positions = setdiff(eachindex(u), shared_positions)
+            local_positions = findall(==(:Z), coordinate_names(built.layout))
+            shared_positions = setdiff(eachindex(u), local_positions)
             initial_values = sampler.prefix.values
             for value in initial_values
                 value isa AbstractArray && @test !Base.mightalias(value, u)
@@ -184,53 +185,62 @@ end
 end
 
 @testset "shared array views and mixed partition labels" begin
-    model = quote
-        theta[1:4] .~ Normal.(0, 1)
-        z[levels(unit)] .~ Normal.(0, 1)
-        eta = z[unit]
-        mu = theta[g] .+ eta
-        y .~ Normal.(mu, 1)
-    end
-    labels = Any[1, "two", :three]
-    unit = [1, 1, 2, 2, 2, 3]
-    data = (; unit, subject=labels[unit], g=[1, 1, 2, 3, 2, 4], y=[0.2, -0.1, 0.3, 0.1, -0.2, 0.4])
-    bound, built = build_model(model, data)
-    u = collect(range(-0.4, 0.3; length=built.layout.total))
-    baseline = prepare_partition_sampler(built, bound, :y, u; by=:subject,
-        backend=BACKEND, compact=false)
-    for compact in (true, false)
-        point = copy(u)
-        sampler = prepare_partition_sampler(built, bound, :y, point; by=:subject,
-            backend=BACKEND, compact, partitioned=:z => labels)
-        @test sampler.prefix !== nothing
-        initial = sampler.prefix.values
-        @test any(x -> x isa AbstractArray, initial)
-        for x in initial
-            x isa AbstractArray && @test !Base.mightalias(x, point)
+    for producer in (:theta, :(sharedview(theta)))
+        model = quote
+            theta[1:4] .~ Normal.(0, 1)
+            z[levels(unit)] .~ Normal.(0, 1)
+            eta = z[unit]
+            shared_theta = $producer
+            mu = shared_theta[g] .+ eta
+            y .~ Normal.(mu, 1)
         end
-        for label in labels[[1, 2, 3, 1]]
-            fp = partition_footprint(sampler, label)
-            gradient = zeros(compact ? length(fp) : length(point))
-            value, _ = partition_value_and_gradient!(sampler, gradient, point, label)
+        labels = Any[1, "two", :three]
+        unit = [1, 1, 2, 2, 2, 3]
+        data = (; unit, subject=labels[unit], g=[1, 1, 2, 3, 2, 4], y=[0.2, -0.1, 0.3, 0.1, -0.2, 0.4])
+        bound, built = build_model(model, data)
+        u = collect(range(-0.4, 0.3; length=built.layout.total))
+        baseline = prepare_partition_sampler(built, bound, :y, u; by=:subject,
+            backend=BACKEND, compact=false, locality=:ignore)
+        shared_positions = findall(==(:theta), coordinate_names(built.layout))
+        for compact in (true, false)
+            point = copy(u)
+            sampler = prepare_partition_sampler(built, bound, :y, point; by=:subject,
+                backend=BACKEND, compact, partitioned=:z => labels)
+            # Direct row reads remain compact in the residual. The opaque view
+            # still crosses a shared cache boundary and must own its storage.
+            cached = producer !== :theta
+            @test (sampler.prefix !== nothing) == cached
+            initial = cached ? sampler.prefix.values : nothing
+            if cached
+                @test any(x -> x isa AbstractArray, initial)
+                for x in initial
+                    x isa AbstractArray && @test !Base.mightalias(x, point)
+                end
+            end
+            for label in labels[[1, 2, 3, 1]]
+                fp = partition_footprint(sampler, label)
+                gradient = zeros(compact ? length(fp) : length(point))
+                value, _ = partition_value_and_gradient!(sampler, gradient, point, label)
+                expected = zero(point)
+                expected_value, _ = partition_value_and_gradient!(baseline, expected, point, label)
+                @test value ≈ expected_value
+                @test gradient ≈ (compact ? expected[fp] : expected)
+                @test all(iszero, expected[setdiff(eachindex(point), fp)])
+                cached && @test sampler.prefix.values === initial
+            end
+            saved = deepcopy(initial)
+            point[shared_positions] .+= 0.5
+            cached && @test all(isequal.(sampler.prefix.values, saved))
+            fp = partition_footprint(sampler, "two"; shared=false)
+            local_gradient = zeros(compact ? length(fp) : length(point))
+            value, _ = partition_value_and_gradient!(sampler, local_gradient, point, "two"; shared=false)
+            cached && @test sampler.prefix.values !== initial
             expected = zero(point)
-            expected_value, _ = partition_value_and_gradient!(baseline, expected, point, label)
+            expected_value, _ = partition_value_and_gradient!(baseline, expected, point, "two")
             @test value ≈ expected_value
-            @test gradient ≈ (compact ? expected[fp] : expected)
-            @test all(iszero, expected[setdiff(eachindex(point), fp)])
-            @test sampler.prefix.values === initial
+            @test (compact ? local_gradient : local_gradient[fp]) ≈ expected[fp]
+            compact || @test all(iszero, local_gradient[setdiff(eachindex(point), fp)])
         end
-        saved = deepcopy(initial)
-        point[sampler.prefix.positions] .+= 0.5
-        @test all(isequal.(sampler.prefix.values, saved))
-        fp = partition_footprint(sampler, "two"; shared=false)
-        local_gradient = zeros(compact ? length(fp) : length(point))
-        value, _ = partition_value_and_gradient!(sampler, local_gradient, point, "two"; shared=false)
-        @test sampler.prefix.values !== initial
-        expected = zero(point)
-        expected_value, _ = partition_value_and_gradient!(baseline, expected, point, "two")
-        @test value ≈ expected_value
-        @test (compact ? local_gradient : local_gradient[fp]) ≈ expected[fp]
-        compact || @test all(iszero, local_gradient[setdiff(eachindex(point), fp)])
     end
 end
 end # module
