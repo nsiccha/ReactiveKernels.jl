@@ -26,6 +26,10 @@ are recorded in the git history only.
   (valid cutpoints, positive discrimination) now leave the nested cell loop.
   Values, ordinary derivatives, laziness and empty-domain behaviour are
   unchanged.
+- Binding a guarded arm of a nested cell whose speculation excludes nothing no
+  longer fails with a `MethodError` (`_partial_split_recipes` and a
+  `Set{Union{}}`) on Julia 1.13; RKPPL's group-indexed `Ref` cutpoints with a
+  cumulative or stopping-ratio ordinal prepare again.
 
 ## 0.1.86
 

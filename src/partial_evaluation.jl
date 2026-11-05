@@ -767,15 +767,18 @@ Base.@nospecializeinfer function _partial_speculate_graph_arm!(nodes, plans, nam
     positions = Dict(name => i for (i, name) in enumerate(original_names))
     all(v -> haskey(positions, v.name), arm.have) || return
     g = arm.graph
-    bound = Set(canon_id(g, v.id) for v in arm.have if reads[positions[v.name]])
+    # Typed sets: an empty filtered generator over an arm the caller holds
+    # untyped would otherwise build a `Set{Union{}}`, which the typed
+    # helpers below do not accept.
+    bound = Set{ValueId}(canon_id(g, v.id) for v in arm.have if reads[positions[v.name]])
     isempty(bound) && return
     # As for expression arms, split mixed computations only. Returning a
     # cached array as the whole arm would publish shared bind-time storage.
     all(v -> canon_id(g, v.id) in bound, arm.have) && return
     prefix_key = (:arm_recipe, r.id, getfield(leaf, :path))
     node_key = (:arm_node, r.id, getfield(leaf, :path))
-    excluded = Set(q.id for q in arm.recipes if (prefix_key..., q.id) in refused)
-    nested_refused = Set(key[4] for key in refused
+    excluded = Set{Int}(q.id for q in arm.recipes if (prefix_key..., q.id) in refused)
+    nested_refused = Set{Int}(key[4] for key in refused
                          if length(key) == 4 && key[1:3] == node_key)
     readable = Dict{Int,Any}()
     arm = _partial_split_recipes(arm, bound, excluded, readable)
