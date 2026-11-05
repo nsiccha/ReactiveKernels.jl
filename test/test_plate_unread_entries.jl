@@ -85,6 +85,72 @@ end
     total::Float64 = sum(loc)
     return total
 end
+
+# Both selected observation plates read the projections as whole arrays, so
+# fusion cannot absorb those projections into their consumers. Retrying their
+# composition must terminate even though the tuple producer remains live.
+@kernel partitioned(q::Vector{Float64}, x::Vector{Float64}, key::Vector{Int}) = begin
+    a = sum(q)
+    cell = plate(x, a) do xi, ai
+        m = exp(ai * xi)
+        s = 1 + m
+        d = derived(m)
+        (m, s, d)
+    end
+    loc = plate(cell) do c
+        c[1]
+    end
+    scale = plate(cell) do c
+        c[2]
+    end
+    first = plate(x, Ref(loc), Ref(scale)) do xi, ls, ss
+        sum(ls) + sum(ss) + xi
+    end
+    second = plate(x, Ref(loc), Ref(scale)) do xi, ls, ss
+        sum(ls) * sum(ss) + xi
+    end
+    total = sum(first) + sum(second)
+    return total
+end
+end
+
+@testset "tuple-entry pruning reaches a fixed point with shared projections" begin
+    RK = ReactiveKernels
+    p = plan(PlateUnreadEntries.shared; want = (:loc, :scale))
+    lowered = RK._fuse_authored_plate_chains(p; cells_only = true)
+    @test lowered !== p
+    @test RK._fuse_authored_plate_chains(lowered; cells_only = true) === lowered
+    @test RK._fuse_authored_plate_chains(lowered) === lowered
+    # Both projections keep the tuple producer live. Repeated pruning must
+    # retain their values and leave the unread derived entry unevaluated.
+    q, x = [0.3], [-1.0, 0.5, 2.0]
+    PlateUnreadEntries.CALLS[] = 0
+    loc, scale = prepare(lowered)(q, x, zeros(length(x)))
+    @test loc == exp.(only(q) .* x)
+    @test scale == 1 .+ loc
+    @test PlateUnreadEntries.CALLS[] == 0
+end
+
+@testset "partition preparation terminates with shared tuple projections" begin
+    P = PlateUnreadEntries
+    partition = plate_partition(P.partitioned, (:first, :second); by = :key,
+                                locality = :error)
+    for n in (0, 3, 20)
+        q, x = [0.3], collect(range(-1.0, 1.0; length = n))
+        key = [isodd(i) ? 1 : 2 for i in 1:n]
+        kernel = prepare(partition; bound = (; x, key))
+        m = exp.(only(q) .* x)
+        s = 1 .+ m
+        @test_throws ArgumentError kernel(q, 3)
+        for label in unique(key)
+            indices = findall(==(label), key)
+            expected = length(indices) * (sum(m) + sum(s) + sum(m) * sum(s)) +
+                       2sum(x[indices])
+            P.CALLS[] = 0
+            @test kernel(q, label) ≈ expected
+            @test P.CALLS[] == 0
+        end
+    end
 end
 
 @testset "a plate computes only the tuple entries a query reads" begin

@@ -97,6 +97,8 @@ const _MATRIX_CORE_TESTS = (
     "test_view_footprints.jl",
     "test_sparse_product_cells.jl",
     "test_scan_cell_captures.jl",
+    "test_capture_vec_aliases.jl",
+    "test_unread_cell_captures.jl",
     "test_plate_partition.jl",
     "test_partition_prefix.jl",
     "test_partition_prefix_types.jl",
