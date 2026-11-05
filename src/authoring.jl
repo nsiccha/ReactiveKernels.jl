@@ -2568,8 +2568,8 @@ end
 
 # A leaf arm's graph over the cell names it reads, or `nothing` for an arm that
 # is not a pure value expression: a bare name (there is nothing to lift),
-# loops, closures, macro calls, or a call of a function-shaped graph, which a
-# cell splices only over ports. Sequential local bindings in an arm remain
+# loops, closures, macro calls, or graph calls that cannot splice over ports.
+# Sequential local bindings in an arm remain
 # separate recipes, so a plate can share a binding without evaluating the arm
 # on a lane that does not take it.
 function _kernel_plate_arm_spec(side, names, shared, mod, scope; endpoint_cache)
@@ -2609,8 +2609,18 @@ function _kernel_plate_arm_value(ex, mod)
     ex.head in (:call, :., :ref, :tuple, :vect, :hcat, :vcat, :row, :comparison,
                 :&&, :||, :if, :elseif, :kw, :parameters, :(::), :..., :curly,
                 :string) || return false
-    ex.head === :call && _kernel_called_spec(
-        ex, mod, Set{Symbol}(), Dict{Symbol,Any}()) !== nothing && return false
+    if ex.head === :call
+        child = _kernel_called_spec(ex, mod, Set{Symbol}(), Dict{Symbol,Any}())
+        if child !== nothing
+            # The arm's cell builder splices this complete positional call
+            # into its graph. Preserve that graph boundary so a shared arm
+            # can schedule the child's invariant recipes independently.
+            arguments = ex.args[2:end]
+            return _kernel_inline_signature_supported(child.call_signature) &&
+                length(arguments) == length(inputs(child)) &&
+                length(outputs(child)) == 1 && all(arg -> arg isa Symbol, arguments)
+        end
+    end
     all(arg -> _kernel_plate_arm_value(arg, mod), ex.args)
 end
 

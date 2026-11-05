@@ -56,7 +56,10 @@ struct RKPPLModel
     fixed::Dict{Symbol,ColumnData}
     rewrites::Vector{Expr}
     conditioned::Dict{Symbol,ColumnData}
+    documentation::Vector{RKPPLDocumentation}
 end
+RKPPLModel(ast, mod, fixed, rewrites, conditioned) =
+    RKPPLModel(ast, mod, fixed, rewrites, conditioned, last(_documentation_source(ast)))
 RKPPLModel(ast, mod) = RKPPLModel(ast, mod, Dict{Symbol,ColumnData}(), Expr[], Dict{Symbol,ColumnData}())
 RKPPLModel(ast, mod, fixed) = RKPPLModel(ast, mod, fixed, Expr[])
 RKPPLModel(ast, mod, fixed, rewrites) = RKPPLModel(ast, mod, fixed, rewrites, Dict{Symbol,ColumnData}())
@@ -146,13 +149,35 @@ struct RKPPLSubmodel
     kwdefaults::Vector{Pair{Symbol,Any}}
     rewrites::Vector{Expr}
     fixed::Dict{Symbol,ColumnData}
+    documentation::Vector{RKPPLDocumentation}
 end
+RKPPLSubmodel(name, args, body, mod, kwdefaults, rewrites, fixed) =
+    RKPPLSubmodel(name, args, body, mod, kwdefaults, rewrites, fixed,
+        last(_documentation_source(body; definition=name)))
 RKPPLSubmodel(name, args, body, mod) =
     RKPPLSubmodel(name, args, body, mod, Pair{Symbol,Any}[])
 RKPPLSubmodel(name, args, body, mod, kwdefaults) =
     RKPPLSubmodel(name, args, body, mod, kwdefaults, Expr[], Dict{Symbol,ColumnData}())
 _submodel_args(sm::RKPPLSubmodel) = [sm.argnames; first.(sm.kwdefaults)]
 sampling_fragment(sm::RKPPLSubmodel) = sm
+
+rkppl_documentation(m::Union{RKPPLModel,RKPPLSubmodel,StructuralPlan}; path=nothing) =
+    _documentation_records(m.documentation; path)
+rkppl_documentation(m::RKPPLBoundModel; path=nothing) =
+    rkppl_documentation(m.model; path)
+
+function _capture_definition_documentation(sm::RKPPLSubmodel, previous)
+    doc = _binding_documentation(sm.mod, sm.name)
+    if doc !== nothing && doc !== previous && length(doc.text) == 1 &&
+            first(doc.text) isa String
+        file = get(doc.data, :path, nothing)
+        record = RKPPLDocumentation((), :definition, first(doc.text), sm.name, (),
+            file === nothing ? nothing : Symbol(file), get(doc.data, :linenumber, 0))
+        return RKPPLSubmodel(sm.name, sm.argnames, sm.body, sm.mod, sm.kwdefaults,
+            sm.rewrites, sm.fixed, [record; sm.documentation])
+    end
+    return sm
+end
 
 # A captured program's module is the namespace its source resolves in, which a
 # copy shares; `deepcopy` itself refuses a module.
@@ -203,8 +228,13 @@ function _submodel_def_expr(def::Expr, mod::Module)
     argvec = Expr(:vect, [QuoteNode(a) for a in argnames]...)
     kwvec = Expr(:vect, [:( $(QuoteNode(k)) => $(Meta.quot(v)) )
         for (k, v) in kwdefaults]...)
-    return esc(:($name = $(RKPPLSubmodel)($(QuoteNode(name)), $argvec,
-                                          $(Meta.quot(body)), $mod, $kwvec)))
+    previous = gensym(:previous_doc)
+    return esc(quote
+        local $previous = $(_binding_documentation)($mod, $(QuoteNode(name)))
+        Base.@__doc__ $name = $(RKPPLSubmodel)($(QuoteNode(name)), $argvec,
+            $(Meta.quot(body)), $mod, $kwvec)
+        $name = $(_capture_definition_documentation)($name, $previous)
+    end)
 end
 
 """Capture a model block, or define a reusable submodel
@@ -260,7 +290,8 @@ end
 function condition(m::RKPPLModel; kwargs...)
     observations = merge(copy(m.conditioned),
         Dict{Symbol,ColumnData}(k => _check_col(k, v) for (k, v) in kwargs))
-    return RKPPLModel(m.ast, m.mod, copy(m.fixed), copy(m.rewrites), observations)
+    return RKPPLModel(m.ast, m.mod, copy(m.fixed), copy(m.rewrites), observations,
+        copy(m.documentation))
 end
 condition(m::RKPPLBoundModel; kwargs...) =
     bind_data(RKPPLBoundModel(condition(m.model; kwargs...), copy(m.data)))
@@ -444,7 +475,8 @@ function Base.merge(m::RKPPLModel, override::Expr)
         end
         delete!(fixed, nm)
     end
-    return RKPPLModel(Expr(:block, out...), m.mod, fixed, rewrites, copy(m.conditioned))
+    docs = _merge_documentation(m.documentation, last(_documentation_source(override)))
+    return RKPPLModel(Expr(:block, out...), m.mod, fixed, rewrites, copy(m.conditioned), docs)
 end
 
 Base.merge(m::RKPPLModel, fix::NamedTuple) = _merge_fixes(m, fix)
@@ -491,7 +523,8 @@ function _merge_fixes(m::RKPPLModel, fix::NamedTuple; scoped_keys::Bool = true)
         new_fixed[nm] = val
     end
     kept = Any[a for (i, a) in enumerate(out) if i ∉ drop]
-    return RKPPLModel(Expr(:block, kept...), m.mod, new_fixed, copy(m.rewrites), observations)
+    return RKPPLModel(Expr(:block, kept...), m.mod, new_fixed, copy(m.rewrites), observations,
+        copy(m.documentation))
 end
 
 function Base.merge(m::RKPPLModel, first, rest...)
@@ -606,9 +639,12 @@ function _merge_check_lhs(override, base)
 end
 
 function Base.merge(sm::RKPPLSubmodel, part::Union{Expr,NamedTuple}, rest...)
-    stmts, ret = _submodel_body_parts(sm)
+    _submodel_body_parts(sm) # validate the trailing return and statement forms
+    source = Any[a for a in sm.body.args if !(a isa LineNumberNode)]
+    stmts, ret = source[1:end-1], last(source)
     model = Base.merge(RKPPLModel(Expr(:block, stmts...), sm.mod,
-        copy(sm.fixed), copy(sm.rewrites)), part, rest...)
+        copy(sm.fixed), copy(sm.rewrites), Dict{Symbol,ColumnData}(),
+        copy(sm.documentation)), part, rest...)
     # Pins become pure data-only definitions in the variant's own scope.
     for (nm, value) in model.fixed
         occursin('.', String(nm)) && continue
@@ -618,7 +654,8 @@ function Base.merge(sm::RKPPLSubmodel, part::Union{Expr,NamedTuple}, rest...)
     end
     return RKPPLSubmodel(sm.name, copy(sm.argnames),
         Expr(:block, model.ast.args..., ret), sm.mod, copy(sm.kwdefaults), copy(model.rewrites),
-        Dict(k => v for (k, v) in model.fixed if occursin('.', String(k))))
+        Dict(k => v for (k, v) in model.fixed if occursin('.', String(k))),
+        [_doc_record(d; definition=sm.name) for d in model.documentation])
 end
 
 # Julia 1.12 also versions global bindings. A builder may eval a named
@@ -635,7 +672,9 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     scoped_observed = Dict(k => pop!(values, k) for k in collect(keys(values))
         if occursin('.', String(k)) && k in observing)
     data = Set(keys(values))
-    ast = Expr(:block, _desugar_destructuring(m.ast.args)...)
+    source, _ = _documentation_source(m.ast)
+    documentation = copy(m.documentation)
+    ast = Expr(:block, _desugar_destructuring(source.args)...)
     # Observations the call leaves without a value bind absent.
     union!(data, _conditioned_without_value(ast, observing, data,
         _conditioned_parameters(ast, observing, m.mod)))
@@ -644,7 +683,7 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     union!(observing, unsupplied)
     scoped_values = Dict{Symbol,ColumnData}()
     ast, scopes = _expand_submodels(ast, data, m.mod; with_scopes = true,
-        rewrites = m.rewrites, fixes = scoped, bound_values = scoped_values)
+        rewrites = m.rewrites, fixes = scoped, bound_values = scoped_values, documentation)
     merge!(values, scoped_values)
     used = Set{Symbol}()
     _all_symbols!(used, ast)
@@ -677,7 +716,7 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     for name in _conditioned_inputs(plan)
         values[_conditioned_input(name)] = pop!(values, name)
     end
-    return plan, values
+    return _with(plan; documentation), values
 end
 
 lower_rkppl(m::RKPPLModel, data::NamedTuple; conditioned=keys(m.conditioned)) = first(_lower_model(m, data; conditioned))
@@ -994,12 +1033,13 @@ function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
     end
     ast isa Expr && ast.head === :block ||
         _sfail("lower_rkppl takes a `begin ... end` block AST")
+    ast, documentation = _documentation_source(ast)
     ast = Expr(:block, _desugar_destructuring(ast.args)...)
     observing = Set{Symbol}(_conditioned_names(conditioned))
     primitive = _conditioned_parameters(ast, observing, mod)
     setdiff!(data, primitive)
     union!(data, _conditioned_without_value(ast, observing, data, primitive))
-    ast, scopes = _expand_submodels(ast, data, mod; with_scopes = true)
+    ast, scopes = _expand_submodels(ast, data, mod; with_scopes = true, documentation)
     observed_parameters = _conditioned_declarations(ast, observing)
     setdiff!(data, observed_parameters)
     _check_observed_inputs(ast, data, observing)
@@ -1007,8 +1047,9 @@ function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
         _value_array_entries(ast, data, values, mod)
     ast, data = _scalar_value_definitions(ast, data, setdiff(scalars, observed_parameters))
     ast = _indexed_observation_definitions(ast, data)
-    return _lower_rkppl_once(ast, data, mod;
+    plan = _lower_rkppl_once(ast, data, mod;
         submodel_scopes = scopes, conditioned = observed_parameters, array_entries)
+    return _with(plan; documentation)
 
 end
 
@@ -1531,6 +1572,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         if r.family === MixtureFam
             for l in r.mixture_locs
                 l isa Symbol && push!(used_locs, l)
+            end
+            for component in r.mixture_components
+                union!(used_locs, _value_symbols(component.args.rhs))
             end
             for s in r.mixture_scales
                 s isa ScalePredictorRef && push!(used_locs, s.predictor)
@@ -3046,6 +3090,19 @@ _map_rhs_values(f, ex) = _map_rhs_arguments((value, _, _, _) -> f(value), ex)
 # `head` spells (`Normal.(mu, s)`: `s` is 2 of 2 of `:Normal`), or the
 # keyword's name as `position`.
 function _map_rhs_arguments(f, ex, head = nothing, position = 0, nargs = 0)
+    # A mixture's component constructors are sampling syntax even when the
+    # caller owns their bindings. Visit their arguments without hoisting the
+    # distribution object itself into an opaque model value.
+    if head === :MixtureModel && position == 1 &&
+            _is_dotted_call(ex) && ex.args[1] === :vcat
+        components = map(ex.args[2].args) do component
+            _is_dotted_call(component) || return f(component, :vcat, 0, 0)
+            Expr(:., component.args[1], Expr(:tuple,
+                _map_rhs_positions(f, component.args[2].args,
+                    _rhs_head_symbol(component.args[1]))...))
+        end
+        return Expr(:., :vcat, Expr(:tuple, components...))
+    end
     if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
             _rhs_spelling_head(ex.args[1], false)
         return Expr(:call, ex.args[1],
@@ -6670,7 +6727,9 @@ function _parse_glm_stmt(st::Expr, line::Int, data::Set{Symbol})
 end
 
 _is_doc_macro(m) =
-    m === Symbol("@doc") || (m isa GlobalRef && m.name === Symbol("@doc"))
+    m === Symbol("@doc") || (m isa GlobalRef && m.name === Symbol("@doc")) ||
+    (Meta.isexpr(m, :., 2) && first(m.args) in (:Core, :Base) &&
+        last(m.args) isa QuoteNode && last(m.args).value === Symbol("@doc"))
 
 function _unwrap_trivia(st::Expr)
     while st.head === :macrocall
@@ -6680,7 +6739,7 @@ function _unwrap_trivia(st::Expr)
         m = st.args[1]
         if _is_doc_macro(m)
             # A leading string before a statement parses as `@doc "str" stmt`;
-            # docstrings are unsupported in slice 1, so drop and lower the rest.
+            # documentation capture retains it separately; lower the statement.
             length(st.args) >= 4 && st.args[3] isa String &&
                 st.args[end] isa Expr ||
                 _sfail("only `@doc \"...\" <statement>` docstring form " *
@@ -6858,10 +6917,28 @@ mutable struct _ScopeExpansion
     fixes::Dict{Symbol,ColumnData}
     bound_values::Union{Nothing,Dict{Symbol,ColumnData}}
     declared::Set{Symbol}
+    documentation::Vector{RKPPLDocumentation}
 end
 _ScopeExpansion(scopes, bindings, paths, used) =
     _ScopeExpansion(scopes, bindings, paths, used,
-        Tuple{Expr,Module}[], Dict{Symbol,ColumnData}(), nothing, Set{Symbol}())
+        Tuple{Expr,Module}[], Dict{Symbol,ColumnData}(), nothing, Set{Symbol}(),
+        RKPPLDocumentation[])
+
+function _instantiate_documentation!(ctx::_ScopeExpansion, scope, sm)
+    for (i, d) in pairs(ctx.documentation)
+        d.path == scope.path && d.owner === :declaration || continue
+        ctx.documentation[i] = _doc_record(d; owner=:instance)
+    end
+    overrides = Set(d.path for d in ctx.documentation if d.owner !== :definition)
+    for d in sm.documentation
+        path = (scope.path..., d.path...)
+        # A caller's annotated scoped replacement takes precedence over the
+        # declaration supplied by the reusable definition.
+        d.owner === :definition || path ∉ overrides || continue
+        push!(ctx.documentation, _doc_record(d; path))
+    end
+    return nothing
+end
 
 function _new_submodel_scope!(ctx::_ScopeExpansion, binding::Symbol;
         per_cell::Bool = false)
@@ -6942,7 +7019,8 @@ function _resolve_scope_properties(ex::Expr, ctx::_ScopeExpansion)
 end
 
 function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module;
-        with_scopes::Bool = false, rewrites = Expr[], fixes = Dict(), bound_values = nothing)
+        with_scopes::Bool = false, rewrites = Expr[], fixes = Dict(), bound_values = nothing,
+        documentation = RKPPLDocumentation[])
     if !any(_stmt_is_submodel_call(a, mod) || _plate_has_submodel_cell(a, mod) for a in ast.args)
         isempty(rewrites) && isempty(fixes) || _sfail("merge scoped target matches no submodel declaration")
         return with_scopes ? (ast, SubmodelScope[]) : ast
@@ -6970,6 +7048,7 @@ function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module;
     ctx.rewrites = Tuple{Expr,Module}[(edit, mod) for edit in rewrites]
     ctx.fixes = Dict{Symbol,ColumnData}(fixes)
     ctx.bound_values = bound_values
+    ctx.documentation = documentation
     for arg in ast.args
         _expand_submodel_stmt!(out, arg, mod, data, ctx,
             RKPPLSubmodel[])
@@ -7091,7 +7170,8 @@ end
 # program statement — the downstream lowering owns their gates, exactly as
 # for the hand-inlined program; `@plate` / `@scan` blocks stay raw.
 function _submodel_body_parts(sm::RKPPLSubmodel)
-    items = Any[a for a in sm.body.args if !(a isa LineNumberNode)]
+    source, _ = _documentation_source(sm.body; definition=sm.name)
+    items = Any[a for a in source.args if !(a isa LineNumberNode)]
     isempty(items) && _sfail("submodel `$(sm.name)` has an empty body")
     ret = last(items)
     if Meta.isexpr(ret, :return)
@@ -7509,6 +7589,7 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
     # its private name beside every other binder in the call's namespace.
     keep = observed ? Dict{Symbol,Any}(ret => lhs) : Dict{Symbol,Any}()
     scope = _new_submodel_scope!(used, lhs)
+    _instantiate_documentation!(used, scope, sm)
     submap = _submodel_substitution(sm, stmts, ret,
         callargs, data, _NsRoot(lhs, nothing, scope, used), keep)
     # Body definitions call functions visible in the submodel's OWN module
@@ -7778,6 +7859,7 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
         slot === nothing || latent_stream ? Dict{Symbol,Any}() :
         Dict{Symbol,Any}(_stmt_lhs(lines[slot]) => colref)
     scope = _new_submodel_scope!(used, col; per_cell = true)
+    _instantiate_documentation!(used, scope, sm)
     submap = _submodel_substitution(sm, stmts, ret,
         callargs, data, _NsRoot(col, ivar, scope, used), keep)
     # Scan-scoped names keep a bare private spelling, as in a hand-written
@@ -8049,8 +8131,8 @@ function _mixture_component_context(thunk, lhs, k::Int)
     end
 end
 
-# `y .~ MixtureModel.(vcat.(C1, ..., CK), Ref(w))` — K same-family univariate
-# components + mixing weights (SB `MixtureModel` mirror). Each component
+# `y .~ MixtureModel.(vcat.(C1, ..., CK), Ref(w))` — K univariate
+# components + mixing weights (SB `MixtureModel` mirror). Legacy components
 # lowers through the single-family base spelling (decomposed twin:
 # predictors wrapped, params/literals bare); locations route to predictors
 # (link-space) or scalar slots (sampled params / literals,
@@ -8088,6 +8170,14 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
         value isa Symbol || _sfail("response $lhs: mixture weights need one " *
             "probability vector per observation; wrap shared weights in `Ref(w)`")
         MixtureWeightRows(value)
+    end
+    if any(c -> _is_dotted_call(c) &&
+            !(c.args[1] isa Symbol && c.args[1] in (:Normal, :Bernoulli, :BernoulliLogit,
+                :Poisson, :PoissonLog, :Binomial, :BinomialLogit,
+                :NegativeBinomial2, :NegativeBinomial2Log, :Gamma, :GammaLog,
+                :Beta, :BetaLogit)), components)
+        return _lower_graph_mixture_response(lhs, components, wraw, range,
+            weights, evidence, ctx, predictors, pred_idx, coefuse)
     end
     fams = LikelihoodFamily[]
     llinks = LinkFunction[]
@@ -8165,6 +8255,52 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
         mixture_weights = w,
         mixture_trials = f === BinomialLogitFam && trials === nothing ?
             Union{ColumnRef,Int}[trials_raw...] : Union{ColumnRef,Int}[])
+end
+
+# Graph-backed components have independent argument boundaries. Keep those
+# boundaries in the plan and compose the existing constructor mapping at
+# emission, exactly as for a standalone caller-owned density.
+function _lower_graph_mixture_response(lhs, components, wraw, range, weights,
+        evidence, ctx, predictors, pred_idx, coefuse)
+    graphs = NamedTuple[]
+    for (k, component) in enumerate(components)
+        _is_dotted_call(component) || _sfail("response $lhs: mixture component $k needs a dotted constructor")
+        head = component.args[1]
+        builtin = head isa Symbol && head in (:Normal, :Cauchy, :StudentT) ? head : nothing
+        args = if builtin === nothing
+            _external_parameter(lhs, component, (), ctx.mod, ctx.taken;
+                observed=true, broadcast=true)
+        else
+            call = Expr(:call, head, component.args[2].args...)
+            _plain_args(call, string(head))
+            (;rhs=call, geometry=nothing, broadcast=true, constructor_broadcast=true)
+        end
+        builtin === nothing && _external_graph_density(args) === nothing &&
+            _sfail("response $lhs: mixture component $k needs a sampling_distribution_graph mapping")
+        values = Any[]
+        for (j, value) in enumerate(_external_arguments(args))
+            push!(values, value isa Number || value isa GlobalRef || value isa QuoteNode ? value :
+                _lower_argument_predictor!(lhs, value, ctx, predictors, pred_idx,
+                    coefuse, Symbol(lhs, :_mix_, k, :_arg_, j)))
+        end
+        keywords = Any[]
+        for keyword in _external_keywords(args)
+            value = keyword.args[end]
+            lowered_value = value isa Number || value isa GlobalRef || value isa QuoteNode ? value :
+                _lower_argument_predictor!(lhs, value, ctx, predictors, pred_idx,
+                    coefuse, Symbol(lhs, :_mix_, k, :_kw_, length(keywords) + 1))
+            push!(keywords, Expr(keyword.head, keyword.args[1:end-1]..., lowered_value))
+        end
+        lowered = merge(args, (;rhs=_external_endpoint_call(
+            _external_constructor(args), values, keywords)))
+        push!(graphs, (;args=lowered, builtin))
+    end
+    wraw isa Symbol && wraw ∉ ctx.data && wraw ∉ ctx.dirichlet_names &&
+        _sfail("response $lhs: mixture weights $wraw are undeclared; bind an input or state a Dirichlet prior")
+    w = _lower_mixture_weights(lhs, wraw)
+    return LikelihoodSpec(MixtureFam, IdentityLink, lhs, lhs, nothing, weights,
+        evidence, Symbol(lhs, :_resp), nothing, range;
+        mixture_weights=w, mixture_components=graphs)
 end
 
 # Dotted→call conversion for one mixture component: like
@@ -10289,6 +10425,9 @@ function _check_coefficient_readers(coefuse, ctx, predictors, priors,
         end
         foreach(v -> read!(who, v), r.mixture_locs)
         foreach(v -> read!(who, v), r.mixture_scales)
+        for component in r.mixture_components, v in _value_symbols(component.args.rhs)
+            read!(who, v)
+        end
     end
     return nothing
 end

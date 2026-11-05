@@ -391,12 +391,15 @@ their defaults:
   otherwise.
 - `mixture_trials`: one trial-count column or literal per Binomial component
   when their arguments differ. Empty when `trials` supplies the shared argument.
+- `mixture_components`: lowered constructor graphs for heterogeneous full-real
+  components. Each carries its own argument list; the legacy family/location/
+  scale slots remain empty on this route.
 
 `predictor` is an anchor only (first location predictor, else first
 scale predictor, else the weights simplex name, else the first
 location/scale parameter name, else the response name); `scale` is `nothing`.
-Mixture widths are structural
-(K = `length(mixture_locs)`): no `n_levels`, no bind-time size
+Mixture widths are structural (the number of component graphs or location slots):
+no `n_levels`, no bind-time size
 inference. Binomial components may have distinct trial counts.
 Case-A `mi()` missingness (SB parity, log density only) names its observed-row
 index column in the trailing `mi_jobs` field, built with keywords (`mi_jobs=`);
@@ -459,7 +462,10 @@ struct LikelihoodSpec
     mi_jobs::Union{Nothing,ColumnRef}
     interval::Union{Nothing,Tuple{Union{Real,Symbol},Union{Real,Symbol}}}
     threshold_effects::Union{Nothing,Symbol}
+    mixture_components::Vector{NamedTuple}
 end
+# Preserve the all-fields constructor predating graph-backed mixture components.
+LikelihoodSpec(args::Vararg{Any,33}) = LikelihoodSpec(args..., NamedTuple[])
 # Preserve the all-fields constructor predating per-component trials.
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label, trials, range, n_levels, thresholds, extra_predictors, count_columns,
@@ -509,7 +515,8 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         zi::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
         mi_jobs::Union{Nothing,ColumnRef} = nothing,
         interval::Union{Nothing,Tuple{Union{Real,Symbol},Union{Real,Symbol}}} = nothing,
-        threshold_effects::Union{Nothing,Symbol} = nothing)
+        threshold_effects::Union{Nothing,Symbol} = nothing,
+        mixture_components::Vector{NamedTuple} = NamedTuple[])
     return LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, trials, range, n_levels, thresholds,
         extra_predictors, count_columns, ordinal_structure, discrimination,
@@ -517,8 +524,11 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         factor_corr, glm_alpha isa Real ? Float64(glm_alpha) : glm_alpha,
         glm_beta, mixture_family, mixture_locs,
         mixture_scales, mixture_weights, mixture_trials, nu, zi, mi_jobs, interval,
-        threshold_effects)
+        threshold_effects, mixture_components)
 end
+
+_mixture_component_count(r::LikelihoodSpec) = isempty(r.mixture_components) ?
+    length(r.mixture_locs) : length(r.mixture_components)
 
 """
     TermSpec(kind, columns, options, addressee, label)
@@ -1094,7 +1104,24 @@ struct StructuralPlan
     cell_geometries::Dict{Symbol,CellGeometry}
     # Runtime data, owned by this binding and excluded from structural keys.
     data_values::Union{Nothing,_BindingData}
+    # Authored prose and provenance, excluded from numerical analysis/cache keys.
+    documentation::Vector{RKPPLDocumentation}
 end
+
+# Plans authored before retained docstrings carry no documentation.
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+    conditioned, indexed_observations, external_observations,
+    cell_broadcasts, named_values, factors, cell_priors, frozen::FrozenValues,
+    cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}},
+    cell_geometries::Dict{Symbol,CellGeometry}, data_values::Union{Nothing,_BindingData}) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+        scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+        conditioned, indexed_observations, external_observations,
+        cell_broadcasts, named_values, factors, cell_priors, frozen, cell_latents,
+        cell_geometries, data_values, RKPPLDocumentation[])
 
 # The former all-fields constructor creates an unbound structural plan.
 StructuralPlan(responses, predictors, population_priors, parameters,
@@ -1321,14 +1348,15 @@ function StructuralPlan(
         frozen::FrozenValues = FrozenValues(),
         cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}} =
             Dict{Symbol,Tuple{Symbol,Symbol}}(),
-        cell_geometries::Dict{Symbol,CellGeometry} = Dict{Symbol,CellGeometry}())
+        cell_geometries::Dict{Symbol,CellGeometry} = Dict{Symbol,CellGeometry}(),
+        documentation::Vector{RKPPLDocumentation} = RKPPLDocumentation[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans,
         vector_parameters, matrices,
         array_parameters, submodel_scopes, conditioned, indexed_observations,
         external_observations, cell_broadcasts, named_values, factors, cell_priors,
-        frozen, cell_latents, cell_geometries)
+        frozen, cell_latents, cell_geometries, nothing, documentation)
 end
 
 # Every definition of `plan`: its assignments, then its per-observation
@@ -1699,6 +1727,9 @@ function _response_uses_predictor(r::LikelihoodSpec, pname::Symbol)
     for s in r.mixture_scales
         s isa ScalePredictorRef && s.predictor === pname && return true
     end
+    for component in r.mixture_components
+        pname in _value_symbols(component.args.rhs) && return true
+    end
     return false
 end
 
@@ -1759,7 +1790,7 @@ const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :matrices,
     :array_parameters, :indexed_observations, :external_observations,
     :cell_broadcasts, :named_values, :factors, :cell_priors, :frozen,
-    :cell_latents, :cell_geometries, :data_values)
+    :cell_latents, :cell_geometries, :data_values, :documentation)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
@@ -2126,7 +2157,7 @@ function _read_only_by_selection(plan::StructuralPlan, name::Symbol)
     end
     for f in fieldnames(StructuralPlan)
         f in (:columns, :roles, :n_obs, :submodel_scopes, :responses,
-            :indexed_observations, :cell_broadcasts, :frozen, :data_values) && continue
+            :indexed_observations, :cell_broadcasts, :frozen, :data_values, :documentation) && continue
         visit(getfield(plan, f))
     end
     for r in plan.responses, f in fieldnames(LikelihoodSpec)
@@ -2903,7 +2934,7 @@ function _uncached_label_only_columns(plan::StructuralPlan)
     end
     for f in fieldnames(StructuralPlan)
         f in (:columns, :roles, :n_obs, :submodel_scopes, :cell_broadcasts,
-            :frozen, :data_values) && continue
+            :frozen, :data_values, :documentation) && continue
         visit(getfield(plan, f))
     end
     return setdiff!(labels, numeric)
@@ -5940,69 +5971,78 @@ function _validate_mixture_complement_support(r::LikelihoodSpec, plan::Structura
 end
 
 # A finite-mixture response (SB `y ~ MixtureModel(comps, w)` mirror):
-# K same-family components over dedicated slots, validated whole. The
+# Legacy same-family slots or per-component constructor graphs, validated whole. The
 # anchor in `predictor` is never resolved here (it may name a
 # parameter); component predictors join `used_predictors` like any
 # location/scale predictor. Sharing one predictor across components is
-# unambiguous and admitted; fully-fixed mixtures fail closed (a
-# constant density has no plan).
+# unambiguous and admitted.
 function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
         used_predictors::Set{Symbol})
     f = r.mixture_family
-    f === nothing && _fail(r.label,
-        "a mixture response requires its mixture_family")
-    f in _MIXTURE_V1_FAMILIES || _fail(r.label,
-        "mixture components over $f are not admitted in v1 (admitted: " *
-        "Gaussian/identity, Bernoulli-logit, Poisson-log, Binomial-logit, " *
-        "NB2-log, Gamma-log, Beta-logit)")
-    K = length(r.mixture_locs)
-    K >= 1 || _fail(r.label, "a mixture response needs ≥ 1 component")
-    length(r.mixture_scales) == K || _fail(r.label,
-        "mixture has $K locations but $(length(r.mixture_scales)) scales " *
-        "(one scale slot per component)")
-    loc_preds = Symbol[]
-    for (k, loc) in enumerate(r.mixture_locs)
-        if loc isa Real
-            _validate_mixture_literal_loc(r, f, k, loc)
-        elseif loc isa Symbol
-            i = findfirst(p -> p.name === loc, plan.predictors)
-            if i !== nothing
-                pred = plan.predictors[i]
-                (f, r.link, pred.link) in ADMITTED_TRIPLES || _fail(r.label,
-                    "mixture component $k link triple ($f, $(r.link), " *
-                    "$(pred.link)) not admitted")
-                push!(used_predictors, loc)
-                push!(loc_preds, loc)
-            elseif any(p -> p.name === loc, plan.parameters)
-                nothing # A sampled scalar parameter: constrained-scale, prior-owned.
-            elseif any(a -> a.name === loc, plan.assignments)
-                _fail(r.label, "mixture component $k location $loc is a " *
-                    "scalar assignment — v1 locations are predictors, " *
-                    "sampled parameters, or literals")
+    K = _mixture_component_count(r)
+    if isempty(r.mixture_components)
+        f === nothing && _fail(r.label,
+            "a mixture response requires its mixture_family")
+        f in _MIXTURE_V1_FAMILIES || _fail(r.label,
+            "mixture components over $f are not admitted in v1 (admitted: " *
+            "Gaussian/identity, Bernoulli-logit, Poisson-log, Binomial-logit, " *
+            "NB2-log, Gamma-log, Beta-logit)")
+        K >= 1 || _fail(r.label, "a mixture response needs ≥ 1 component")
+        length(r.mixture_scales) == K || _fail(r.label,
+            "mixture has $K locations but $(length(r.mixture_scales)) scales " *
+            "(one scale slot per component)")
+        loc_preds = Symbol[]
+        for (k, loc) in enumerate(r.mixture_locs)
+            if loc isa Real
+                _validate_mixture_literal_loc(r, f, k, loc)
+            elseif loc isa Symbol
+                i = findfirst(p -> p.name === loc, plan.predictors)
+                if i !== nothing
+                    pred = plan.predictors[i]
+                    (f, r.link, pred.link) in ADMITTED_TRIPLES || _fail(r.label,
+                        "mixture component $k link triple ($f, $(r.link), " *
+                        "$(pred.link)) not admitted")
+                    push!(used_predictors, loc)
+                    push!(loc_preds, loc)
+                elseif any(p -> p.name === loc, plan.parameters)
+                    nothing # A sampled scalar parameter: constrained-scale, prior-owned.
+                elseif any(a -> a.name === loc, plan.assignments)
+                    _fail(r.label, "mixture component $k location $loc is a " *
+                        "scalar assignment — v1 locations are predictors, " *
+                        "sampled parameters, or literals")
+                else
+                    _fail(r.label, "mixture component $k location $loc is not " *
+                        "a predictor, sampled parameter, or literal")
+                end
             else
-                _fail(r.label, "mixture component $k location $loc is not " *
-                    "a predictor, sampled parameter, or literal")
+                _fail(r.label, "mixture component $k location has no lowering " *
+                    "(predictor, sampled parameter, or literal)")
             end
-        else
-            _fail(r.label, "mixture component $k location has no lowering " *
-                "(predictor, sampled parameter, or literal)")
         end
-    end
-    need = _scale_need(f)
-    for (k, s) in enumerate(r.mixture_scales)
-        if need === nothing
-            s === nothing || _fail(r.label,
-                "mixture component $k takes no scale auxiliary ($f " *
-                "components carry location only)")
-        else
-            s === nothing &&
-                _fail(r.label, "$need (mixture component $k)")
+        need = _scale_need(f)
+        for (k, s) in enumerate(r.mixture_scales)
+            if need === nothing
+                s === nothing || _fail(r.label,
+                    "mixture component $k takes no scale auxiliary ($f " *
+                    "components carry location only)")
+            else
+                s === nothing &&
+                    _fail(r.label, "$need (mixture component $k)")
+            end
+            s isa Bool && _fail(r.label,
+                "mixture component $k scale is Boolean — scales are numeric")
+            _validate_scale_use(r, plan, s, "mixture component $k scale", f,
+                loc_preds)
+            s isa ScalePredictorRef && push!(used_predictors, s.predictor)
         end
-        s isa Bool && _fail(r.label,
-            "mixture component $k scale is Boolean — scales are numeric")
-        _validate_scale_use(r, plan, s, "mixture component $k scale", f,
-            loc_preds)
-        s isa ScalePredictorRef && push!(used_predictors, s.predictor)
+    else
+        for component in r.mixture_components, value in _value_symbols(component.args.rhs)
+            if any(p -> p.name === value, plan.predictors)
+                push!(used_predictors, value)
+            elseif value ∉ _all_names(plan) && !haskey(plan.columns, value)
+                _fail(r.label, "mixture component references unknown value $value")
+            end
+        end
     end
     w = r.mixture_weights
     w === nothing && _fail(r.label,
@@ -6363,19 +6403,19 @@ function _validate_response_data(r::LikelihoodSpec, plan::StructuralPlan)
             !any(p -> p.name === r.mixture_weights, plan.vector_parameters)
         w = r.mixture_weights
         haskey(plan.columns, w) || _fail(r.label, "mixture weights $w are not bound")
-        _validate_mixture_weights(r, plan.columns[w], length(r.mixture_locs))
+        _validate_mixture_weights(r, plan.columns[w], _mixture_component_count(r))
     elseif r.family === MixtureFam && r.mixture_weights isa MixtureWeightValue
         w = r.mixture_weights.name
         if _holds_bound_value(plan, plan.columns, w) ||
                 _reads_data_only(plan, w, _all_name_set(plan), Set{Symbol}())
             value = _bound_data_value(plan, w, r.label, "mixture weights")
-            _validate_mixture_weights(r, value, length(r.mixture_locs))
+            _validate_mixture_weights(r, value, _mixture_component_count(r))
         end
     elseif r.family === MixtureFam && r.mixture_weights isa MixtureWeightRows
         w = r.mixture_weights.name
         if haskey(plan.columns, w)
             for row in plan.columns[w]
-                _validate_mixture_weights(r, row, length(r.mixture_locs))
+                _validate_mixture_weights(r, row, _mixture_component_count(r))
             end
         end
     end
@@ -6699,6 +6739,10 @@ end
 # component family (same-family mixtures share one support — SB's rule).
 function _validate_mixture_response_column(r::LikelihoodSpec,
         plan::StructuralPlan, col::AbstractVector)
+    if !isempty(r.mixture_components)
+        eltype(col) <: Real || _fail(r.label, "mixture response must be numeric")
+        return nothing
+    end
     f = r.mixture_family
     if f === BernoulliLogitFam
         eltype(col) === Bool && return nothing
@@ -7688,7 +7732,7 @@ function _preparation_data_names(plan, nodes, raw, onlydata, names;
     free = Set{Symbol}(keys(nodes))
     for f in fieldnames(StructuralPlan)
         f in (:assignments, :derived, :columns, :submodel_scopes,
-            :cell_broadcasts, :factors, :conditioned, :frozen, :data_values) && continue
+            :cell_broadcasts, :factors, :conditioned, :frozen, :data_values, :documentation) && continue
         _drop_held_names!(free, getfield(plan, f))
     end
     # Whole-value classification exempts `axes(M, d)` from observation
@@ -7745,7 +7789,7 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
     unused = Set{Symbol}(raw)
     for f in fieldnames(StructuralPlan)
         f in (:columns, :n_obs, :roles, :submodel_scopes, :cell_broadcasts,
-            :frozen, :data_values) && continue
+            :frozen, :data_values, :documentation) && continue
         _drop_held_names!(unused, getfield(plan, f))
     end
     defs = Pair{Symbol,Any}[a.name => a.expr for a in plan.assignments]
@@ -7845,7 +7889,7 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
     named = copy(free)
     for f in fieldnames(StructuralPlan)
         f in (:assignments, :derived, :columns, :n_obs, :roles,
-            :submodel_scopes, :frozen, :data_values) && continue
+            :submodel_scopes, :frozen, :data_values, :documentation) && continue
         if f === :parameters
             for p in plan.parameters
                 p.family === :external && p.name in plan.conditioned && continue
@@ -8129,7 +8173,7 @@ function _uncached_bound_value_inputs(plan::StructuralPlan)
     found = Set{Symbol}()
     seen = Base.IdSet{Any}()
     for f in fieldnames(StructuralPlan)
-        f in (:columns, :submodel_scopes, :frozen, :data_values) && continue
+        f in (:columns, :submodel_scopes, :frozen, :data_values, :documentation) && continue
         _collect_bound_value_inputs!(found, getfield(plan, f), seen)
     end
     return found
@@ -9200,7 +9244,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
                 "disagrees with n_levels $K")
             push!(out_v, _with(p; size = K))
         elseif haskey(mixture_link, p.name)
-            K = length(by_label[mixture_link[p.name]].mixture_locs)
+            K = _mixture_component_count(by_label[mixture_link[p.name]])
             K >= 1 || _fail(p.label, "internal: linked mixture unresolved")
             p.size === nothing || p.size == K || _fail(p.label,
                 "mixture weights size $(p.size) disagrees with the " *

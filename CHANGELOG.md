@@ -16,13 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.80
+## 0.1.81
 
 - Multi-worker `NativeScheduling` calls also schedule materialized data-only
   prefix plates within their worker budget. Equal cells share one result per
   call across workers; changed inputs are recomputed on later calls. Prefix
   tasks join before position workers begin. Scalar dependencies, reductions,
   scans and one-worker calls keep their native order.
+
+## 0.1.80
+
+- Lazy plate arms retain complete positional single-output child graphs over
+  named ports. Their shared recipes can run once within the selected arm,
+  including after binding its condition, while empty and untaken arms remain
+  unevaluated.
 
 ## 0.1.79
 
