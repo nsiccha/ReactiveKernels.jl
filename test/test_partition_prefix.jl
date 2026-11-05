@@ -50,6 +50,7 @@ kernel = prepare(spec; have=(:u, :group, :y, :subject, :label), want=:partition_
                  bound=(; group, y, subject))
 split = _PREFIX_RK._partition_shared_parts(kernel.plan, (:u => coordinate_labels,); varying=(:label,))
 @test getproperty.(split.frontier, :name) == [:offset]
+@test _PREFIX_RK._partition_prefix_positions(split.prefix, :u) == [1, 2, 3]
 prefix = prepare(split.prefix; exemplars=(u,))
 cached = prefix(u)
 residual = prepare(split.residual; exemplars=(u, 1, cached))
@@ -119,6 +120,16 @@ end
     all_shared = _PREFIX_RK._partition_shared_parts(original.plan, (:u => fill(missing, 5),);
         varying=(:chosen, :label))
     @test :opaque in (v.name for v in all_shared.frontier)
+    @test _PREFIX_RK._partition_prefix_positions(all_shared.prefix, :u) === :whole
+end
+
+@kernel _prefix_branch_reads(u::Vector{Float64}) = begin
+    value = u[1] > 0 ? exp(u[2]) : exp(u[3])
+end
+@testset "prefix active reads never specialize to an exemplar's branch" begin
+    kernel = prepare(_prefix_branch_reads; have=:u, want=:value,
+        exemplars=([1.0, 0.2, 0.3],))
+    @test _PREFIX_RK._partition_prefix_positions(kernel.plan, :u) === :whole
 end
 
 @testset "pullbacks include lowered producers absent from the source graph" begin

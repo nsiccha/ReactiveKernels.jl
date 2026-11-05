@@ -338,7 +338,7 @@ function _lane_source_node(ctx::_LaneSourceContext, node, ends)
             push!(indices, rewritten)
         end
         return Expr(:ref, array, indices...)
-    elseif head === :call && ctx.nested !== nothing && _lane_broadcasted_call(node) &&
+    elseif head === :call && _lane_broadcasted_call(node) &&
            any(_lane_slice_node, @view node.args[3:end])
         # A slice operand of a dotted call is read in place by the fused
         # broadcast (`_lane_gather_operand`); the callee and every other

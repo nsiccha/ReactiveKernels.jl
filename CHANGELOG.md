@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.89
+
+- Composed cell broadcasts read direct row-slice operands in place, including
+  rows of producer windows, without changing ordinary slice ownership or
+  dispatch. Planned partitions retain only the selected rows of bound dense
+  operands, preserving their view types and axes, so ordinary reverse calls
+  do not allocate shadows of an unselected parent panel. Lazy cell-view
+  construction stays visible to its readers across planned array operations.
+  Contiguous window gathers check the window span once before their row loop.
+  Shared-prefix splitting keeps parameter views in the residual when their
+  readers need only selected rows, avoiding whole-block derivative frontiers.
+
 ## 0.1.88
 
 - A plate nested in another plate's cell decides a lazy branch whose condition
