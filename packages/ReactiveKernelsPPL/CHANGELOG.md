@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.96
+
+- `L ~ LKJCholesky(K, eta)` accepts positive integer dimensions from bound
+  scalar data and data-only expressions such as `length(channels)`, including
+  reusable submodel arguments. Rebinding the same definition fixes the packed
+  coordinate count at `K*(K-1)÷2`, including the constant factor at `K=1`, with
+  the existing normalized prior, Jacobian and native Reverse path.
+
 ## 0.1.95
 
 - Require ReactiveKernels 0.1.83 for precise cell-query footprints through

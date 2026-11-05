@@ -46,6 +46,106 @@ function _rlkj_gradient(fx, u)
     out
 end
 
+@rkppl _rlkj_correlation(K, eta) = begin
+    C ~ LKJCholesky(K, eta)
+    return C
+end
+
+@testset "LKJ dimensions are bound data in reusable models" begin
+    direct = @rkppl begin
+        L ~ LKJCholesky(K, eta)
+        y .~ Normal.(L[end, 1] .* x, 0.7)
+    end
+    expression = @rkppl begin
+        L ~ LKJCholesky(length(channels), eta)
+        y .~ Normal.(L[end, 1] .* x, 0.7)
+    end
+    assigned = @rkppl begin
+        K = length(channels)
+        L ~ LKJCholesky(K, eta)
+        y .~ Normal.(L[end, 1] .* x, 0.7)
+    end
+    component = @rkppl begin
+        L ~ _rlkj_correlation(K, eta)
+        y .~ Normal.(L[end, 1] .* x, 0.7)
+    end
+    # Replay the complete authored source in a fresh module. The component
+    # definition is printed once, with its ordinary K/eta formals intact.
+    source = quote
+        using ReactiveKernelsPPL
+        @rkppl _rlkj_correlation(K, eta) = begin
+            C ~ LKJCholesky(K, eta)
+            return C
+        end
+        model = @rkppl begin
+            L ~ _rlkj_correlation(K, eta)
+            y .~ Normal.(L[end, 1] .* x, 0.7)
+        end
+    end
+    Base.remove_linenums!(source)
+    printed = join((sprint(Base.show_unquoted, statement) for statement in source.args), "\n\n")
+    replay_module = Module(gensym(:LKJReplay))
+    Base.include_string(replay_module, printed, "lkj_source_replay.jl")
+    replay = getfield(replay_module, :model)
+    for model in (direct, expression, assigned, component, replay)
+        authored = deepcopy(model.ast)
+        sizes = Tuple{Int,Int}[]
+        for K in (1, 2, 4), eta in (0.7, 2.3)
+            inputs = model in (expression, assigned) ?
+                (; channels = collect(1:K), eta, x = [0.3, -0.5, 0.7]) :
+                (; K, eta, x = [0.3, -0.5, 0.7])
+            y = [0.1, -0.2, 0.3]
+            saved = deepcopy(inputs)
+            bound = model(; inputs...) | (; y)
+            built = build_kernel(bound)
+            @test built.layout.total == K * (K - 1) ÷ 2
+            u = [0.3 * sin(i) for i in 1:built.layout.total]
+            original = copy(u)
+            fx = (; K, eta, data = Dict(:x => inputs.x, :y => y))
+            L = _query(built.spec, bound, :L, u)
+            @test L == lkj_chol_constrain(u, K)
+            expected_prior = K == 1 ? 0.0 :
+                logpdf(LKJCholesky(K, eta), Cholesky(LowerTriangular(L)))
+            @test Base.invokelatest(prepare_query(built, bound, :prior), u) ≈ expected_prior
+            @test Base.invokelatest(prepare_query(built, bound, :log_jacobian), u) ==
+                lkj_chol_logjac(u, K)
+            sampler = prepare_sampler(built, bound, u;
+                backend = AutoEnzyme(; mode = Enzyme.Reverse))
+            value, grad = sampler_value_and_gradient!(sampler, similar(u), u)
+            @test value ≈ _rlkj_oracle(fx, u) rtol = 1e-12
+            @test grad ≈ _rlkj_gradient(fx, u) rtol = 1e-10 atol = 1e-11
+            @test inputs == saved
+            @test u == original
+            @test model.ast == authored
+            K > 1 && push!(sizes, (_bound_extent_nodes(kernel_expr(bound, built.layout)),
+                _bound_extent_nodes(code_expr(built.spec))))
+        end
+        # Data-sized triangular work keeps the same emitted body as K grows.
+        @test allequal(sizes)
+    end
+end
+
+@testset "LKJ bound dimensions require positive data-only integers" begin
+    model = @rkppl begin
+        L ~ LKJCholesky(K, eta)
+        y ~ Normal(L[1, 1], 0.3)
+    end
+    # A correlation factor has at least one margin, and its coordinate pack
+    # is fixed at binding. These are the distribution/layout requirements.
+    for K in (0, -1, 1.5, true, [2])
+        @test_throws ContractValidationError model(; K, eta = 2.0) | (; y = 0.1)
+    end
+    # Scalar missing is rejected by the ordinary data-input boundary first.
+    @test_throws SurfaceLoweringError model(; K = missing, eta = 2.0) | (; y = 0.1)
+    @test_throws ContractValidationError model(; eta = 2.0) | (; y = 0.1)
+    live = @rkppl begin
+        K ~ Normal(2, 1)
+        L ~ LKJCholesky(K, 2.0)
+        y ~ Normal(L[1, 1], 0.3)
+    end
+    @test_throws ContractValidationError live() | (; y = 0.1)
+end
+
 @testset "declared LKJ factors retain triangular iteration" begin
     counts = Int[]
     for literal in (false, true), eta in (1.0, 2.3), K in (1, 2, 4, 8)

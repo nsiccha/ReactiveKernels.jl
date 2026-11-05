@@ -809,6 +809,14 @@ third argument `'U'` returns its upper-triangular counterpart. Sized vectors
 Julia values. Their priors are explicit, and their dimensions determine their
 packed coordinates.
 
+For an LKJ factor, `K` may be a positive integer literal, bound scalar data,
+or a data-only integer expression such as `length(channels)`, `size(M, 2)`,
+or a definition `K = J + 1`. The same submodel can take `K` as an argument
+and be rebound at another dimension without changing its definition.
+Binding fixes the `K * (K - 1) ÷ 2` coordinates; `K = 1` has no coordinates
+and returns `[1.0;;]`. Rebind and prepare again to change `K`. Missing,
+fractional, Boolean, nonpositive or sampled-value dimensions are rejected.
+
 The LKJ shape `eta` is a scalar value: it can be a positive literal, bound
 data, a sampled parameter, or a definition using those values. A per-level
 LKJ prior can share that same value across all its factors.
