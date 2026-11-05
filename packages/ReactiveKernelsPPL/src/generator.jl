@@ -1472,6 +1472,8 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
     points = Pair{Symbol,Any}[]
     arguments = Pair{Symbol,Any}[]
     laws = Pair{Symbol,Any}[]
+    latents = Pair{Symbol,Any}[]
+    uncovered_latents = Symbol[]
     for r in plan.responses
         # A plate loop covers its whole response, so a cell-broadcast
         # response observes every entry of each index's array.
@@ -1484,6 +1486,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
         args === nothing || push!(arguments, r.response => args)
         law = _law_entry(r, plan, rs)
         law === nothing || push!(laws, r.response => law)
+        _membership_entry!(latents, uncovered_latents, r, rs)
         push!(terms, _lik_name(r.label))
         pw = _pw_name(r.label)
         if !_cell_broadcast_response(plan, r)
@@ -1503,6 +1506,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
         append!(stmts, selection)
         append!(stmts, _cell_broadcast_observation(plan, p.name) ?
             _cell_broadcast_stmts(p, plan, ps, vcat(upstream, selection)) : ps)
+        _hidden_state_entry!(stmts, latents, uncovered_latents, plan, p)
         push!(terms, Symbol(:_ppl_prior_, p.name))
         # An undotted observation is one whole-event density.
         push!(points, p.name => Symbol(
@@ -1515,6 +1519,8 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
     for p in observed.parameters
         push!(points, p.name => Symbol(
             p.family === :external && p.args.broadcast ? :_ppl_pw_prior_ : :_ppl_prior_, p.name))
+        p.family === :external &&
+            _hidden_state_entry!(stmts, latents, uncovered_latents, plan, p)
     end
     for p in observed.vector_parameters
         _vector_parameter_prior_stmts!(stmts, terms, p)
@@ -1526,6 +1532,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
     for p in observed.plate_parameters
         if p.family === :external
             append!(stmts, _external_density_statements(p))
+            _hidden_state_entry!(stmts, latents, uncovered_latents, plan, p)
             push!(terms, Symbol(:_ppl_prior_, p.name))
         else
             _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
@@ -1544,6 +1551,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
     push!(stmts, Expr(:(=), :pointwise, values))
     push!(stmts, _observations_statement(points, arguments))
     push!(stmts, _predictive_statement(points, laws))
+    _latents_statement!(stmts, latents, uncovered_latents)
     return stmts
 end
 
@@ -2352,6 +2360,14 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     cell = _wrap_evidence!(r, plan, pre, inputs, cell;
         cdf=b -> tail(b, false), ccdf=b -> tail(b, true),
         logcdf=b -> tail(b, false, true), logccdf=b -> tail(b, true, true))
+    # Each observation's posterior over its component, from the same weighted
+    # component terms (`prepare_discrete_latents`). Only for a plain response:
+    # evidence, weights, presence masks, packed rows, ranges and arrays per
+    # index have no membership plate, and the query refuses them by name.
+    memberships = _mixture_memberships(r, plan) ? Expr(:block,
+        component_statements...,
+        :($(GlobalRef(@__MODULE__, :_ppl_membership_probabilities))(($(terms...),)))) :
+        nothing
     if !isempty(component_statements)
         cell = Expr(:block, component_statements...,
             (cell isa Vector ? cell : Expr[cell])...)
@@ -2368,12 +2384,17 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
             valid = _thread_ref!(inputs, support)
         end
         cell = :($valid ? $cell : -Inf)
+        memberships === nothing || (memberships = :($valid ? $memberships :
+            $(GlobalRef(@__MODULE__, :_ppl_membership_nan))($(GlobalRef(Base, :Val))($K))))
     end
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = _weighted_cell(wv, cell)
     end
-    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+    stmts = Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+    memberships === nothing || push!(stmts, :($(_membership_name(r.label)) =
+        $(_plate_closure(inputs, Expr[memberships]))))
+    return stmts
 end
 
 function _mixture_graph_component_call(component, inputs, y)
