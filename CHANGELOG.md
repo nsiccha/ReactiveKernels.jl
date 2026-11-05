@@ -24,6 +24,7 @@ are recorded in the git history only.
   operands, preserving their view types and axes, so ordinary reverse calls
   do not allocate shadows of an unselected parent panel. Lazy cell-view
   construction stays visible to its readers across planned array operations.
+  Contiguous window gathers check the window span once before their row loop.
 
 ## 0.1.86
 

@@ -46,6 +46,32 @@ end
     @test row_objective(data, rows, indices) ≈ sum(abs2, data[[3, 1, 3, 2], :])
 end
 
+function gathered_objective(data, rows, indices, sorted)
+    w = Window(data, rows, (Base.OneTo(20),), sorted)
+    sum(abs2, w[indices])
+end
+
+@testset "window gathers preserve repeated, empty and invalid rows" begin
+    data = [0.2, -0.3, 0.7]
+    for (rows, sorted) in (([7, 8, 9], true), ([2, 5, 9], true),
+                           ([9, 2, 5], false))
+        w = Window(data, rows, (Base.OneTo(20),), sorted)
+        indices = rows[[3, 1, 3, 2]]
+        @test w[indices] == data[[3, 1, 3, 2]]
+        @test isempty(w[Int[]])
+        @test_throws BoundsError w[[first(rows), 20]]
+        gradient = zero(data)
+        Enzyme.autodiff(Enzyme.Reverse, gathered_objective, Enzyme.Active,
+            Enzyme.Duplicated(data, gradient), Enzyme.Const(rows),
+            Enzyme.Const(indices), Enzyme.Const(sorted))
+        @test gradient ≈ 2 .* data .* [1, 1, 2]
+        @test data == [0.2, -0.3, 0.7]
+    end
+    empty = Window(Float64[], Int[], (Base.OneTo(20),), true)
+    @test isempty(empty[Int[]])
+    @test_throws BoundsError empty[[1]]
+end
+
 @testset "repeated read-only cell rows do not allocate row copies" begin
     data = reshape(collect(0.1:0.1:1.2), 3, 4)
     w = Window(data, [2, 5, 9], (Base.OneTo(10), axes(data, 2)), true)
