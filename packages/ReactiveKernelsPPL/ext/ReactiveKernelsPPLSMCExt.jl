@@ -100,10 +100,8 @@ _execution_target(t::PreparedSMCTarget) = PreparedSMCTarget(t.make_problem,
 # Geometry metadata is structural; neither one entry per data row nor a dense
 # covariance is introduced. The caller's model_id additionally covers external
 # geometry/preprocessing semantics that cannot be inferred from coordinate names.
-_sampling_id(::Nothing) = nothing
-_sampling_id(s) = (; s.rhs, s.broadcast, s.constructor_broadcast)
 _entry(e) = (e.kind, e.predictor, e.name, e.labels, e.offset, e.size,
-    e.transform, e.lo, e.hi, e.dims, map(_entry, e.scan_blocks), _sampling_id(e.sampling))
+    e.transform, e.lo, e.hi, e.dims, map(_entry, e.scan_blocks), PPL._smc_sampling_id(e.sampling))
 _layout(layout) = (layout.total, map(_entry, layout.entries), layout.name_paths)
 
 _frame(target::AbstractSMCTarget) =

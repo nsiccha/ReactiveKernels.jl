@@ -353,4 +353,139 @@ end
     @test structures[1] == structures[2]
     @test all(e.status !== :whole for e in partition_locality(k))
 end
+
+@kernel absent_scalar(u::AbstractVector{Float64}, y::AbstractVector{Float64},
+                      extra::AbstractVector{Float64}, key::AbstractVector{Int},
+                      extra_key::AbstractVector{Int}, anchor::Int) = begin
+    m = log.(u)
+    one = exp(m[anchor]) + m[anchor]
+    a = plate(extra, one) do yi, mu
+        -(yi - mu)^2 / 2
+    end
+    b = plate(y, m) do yi, mu
+        -(yi - mu)^2 / 2
+    end
+end
+
+@kernel absent_factor(u::AbstractVector{Float64}, Z::AbstractMatrix{Float64},
+                      L::AbstractMatrix{Float64}, rows::AbstractVector{Int},
+                      y::AbstractVector{Float64}, extra::AbstractVector{Float64},
+                      key::AbstractVector{Int}, extra_key::AbstractVector{Int}) = begin
+    raw = u[3:4]
+    scale = log.(raw)
+    F = scale .* L
+    R = Z * F'
+    mu = R[rows, 1] .+ R[rows, 2]
+    a = plate(extra, mu) do yi, m
+        -(yi - m)^2 / 2
+    end
+    b = plate(y, u[1:2]) do yi, m
+        -(yi - m)^2 / 2
+    end
+end
+
+_absent_factor_add(a, b) = a + b
+
+@kernel absent_factor_capture(u::AbstractVector{Float64}, Z::AbstractMatrix{Float64},
+                      L::AbstractMatrix{Float64}, rows::AbstractVector{Int},
+                      y::AbstractVector{Float64}, extra::AbstractVector{Float64},
+                      key::AbstractVector{Int}, extra_key::AbstractVector{Int}) = begin
+    raw = u[3:4]
+    scale = log.(raw)
+    F = scale .* L
+    R = Z * F'
+    ma = R[rows, 1]
+    mb = R[rows, 2]
+    a = plate(extra, eachindex(extra)) do yi, i
+        -(yi - _absent_factor_add(ma[i], mb[i]))^2 / 2
+    end
+    b = plate(y, u[1:2]) do yi, m
+        -(yi - m)^2 / 2
+    end
+end
+
+@testset "empty observation portions skip exclusive whole factors" begin
+    structures = Dict{Any,Vector{Int}}()
+    for model in (absent_factor, absent_factor_capture), n in (2, 200)
+        spec = plate_partition(model, (:a, :b);
+            by = (a = :extra_key, b = :key), locality = :error)
+        bound = (; Z = [0.2 -0.1; 0.4 0.3], L = [1.0 0.0; 0.3 0.8],
+            rows = repeat([1, 2], n ÷ 2), y = [0.1, 0.2],
+            extra = fill(0.3, n), key = [1, 2], extra_key = fill(1, n))
+        q = prepare(spec; want = :partition_total, bound)
+        push!(get!(structures, model, Int[]), astsize(code_expr(q)))
+        u = [0.2, -0.1, 1.2, 1.4]
+        original = copy(u)
+        for label in (1, 2)
+            R = bound.Z * (log.(u[3:4]) .* bound.L)'
+            mu = R[bound.rows, 1] .+ R[bound.rows, 2]
+            expected = -(u[label] - bound.y[label])^2 / 2
+            label == 1 && (expected -= sum(abs2, mu .- bound.extra) / 2)
+            @test q(u, label) ≈ expected
+            @test partition_footprint(q, u, label).u == (label == 1 ? [1, 3, 4] : [2])
+            ad = prepare_ad(q, AutoEnzyme(; mode = Enzyme.Reverse), u, label; active = :u)
+            value, gradient = ad_value_and_gradient(ad, u, label)
+            @test value ≈ expected
+            for j in eachindex(u)
+                plus, minus = copy(u), copy(u)
+                plus[j] += 1e-6
+                minus[j] -= 1e-6
+                @test gradient[j] ≈ (q(plus, label) - q(minus, label)) / 2e-6 atol=2e-8 rtol=2e-6
+            end
+        end
+        @test u == original
+        u[3] = -1.0
+        @test q(u, 2) ≈ -(u[2] - bound.y[2])^2 / 2
+        ad = prepare_ad(q, AutoEnzyme(; mode = Enzyme.Reverse), u, 2; active = :u)
+        value, gradient = ad_value_and_gradient(ad, u, 2)
+        @test value ≈ q(u, 2)
+        @test gradient ≈ [0.0, bound.y[2] - u[2], 0.0, 0.0]
+        @test_throws DomainError q(u, 1)
+        whole = prepare(spec; want = (:partition_total, :F), bound)
+        @test_throws DomainError whole(u, 2)
+    end
+    @test all(s -> s[1] == s[2], values(structures))
+end
+
+@testset "empty observation portions do not demand scalar dependencies" begin
+    spec = plate_partition(absent_scalar, (:a, :b);
+        by = (a = :extra_key, b = :key), locality = :error)
+    structures = Int[]
+    for n in (3, 300)
+        bound = (; y = fill(0.1, n), extra = [0.4], key = collect(1:n),
+            extra_key = [1], anchor = 1)
+        q = prepare(spec; want = :partition_total, bound)
+        push!(structures, astsize(code_expr(q)))
+        u = fill(1.2, n)
+        for label in (1, 2, n)
+            expected = -(log(u[label]) - 0.1)^2 / 2
+            label == 1 && (expected -= (u[1] + log(u[1]) - 0.4)^2 / 2)
+            @test q(u, label) ≈ expected
+            @test partition_footprint(q, u, label).u == [label]
+        end
+        # An absent factor must skip arithmetic that would fail if evaluated.
+        u[1] = -1.0
+        @test q(u, 2) ≈ -(log(u[2]) - 0.1)^2 / 2
+        @test_throws DomainError q(u, 1)
+        # Selecting one total retains the label universe of both observations.
+        # The remaining partition can therefore still have an empty portion.
+        extra_total = only(v for v in values(spec.graph.values) if v.name === :_partition_a)
+        partial = prepare(spec.graph;
+            have = Tuple(spec[name] for name in (:u, :y, :extra, :key, :extra_key, :anchor, :partition)),
+            want = extra_total, bound = [spec[name] => getproperty(bound, name) for name in keys(bound)])
+        @test partial(u, 2) == 0.0
+        @test isempty(partition_footprint(partial, u, 2).u)
+        @test_throws DomainError partial(u, 1)
+        # The same applies to an invalid scalar index, not just arithmetic.
+        invalid = prepare(spec; want = :partition_total,
+            bound = merge(bound, (; anchor = n + 1)))
+        @test invalid(u, 2) ≈ -(log(u[2]) - 0.1)^2 / 2
+        @test_throws BoundsError invalid(abs.(u), 1)
+        # A scalar requested as an output is still evaluated as a scalar.
+        both = prepare(spec; want = (:partition_total, :one), bound)
+        @test_throws DomainError both(u, 2)
+        @test both(abs.(u), 2)[2] isa Float64
+    end
+    @test structures[1] == structures[2]
+end
 end

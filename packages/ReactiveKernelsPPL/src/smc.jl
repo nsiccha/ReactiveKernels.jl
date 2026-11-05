@@ -451,6 +451,13 @@ checkpoint supplies both RNG streams. No callback is repeated at the restored
 initialization/window boundary. Resuming a completed file returns its schedule
 without running another pilot or callback.
 
+From 0.1.98, custom sampling expressions in coordinate identities use the same
+generated-namespace normalization as the built program. Rebuilt helper modules
+therefore need no aliases to the producing process's temporary module names.
+This does not migrate older checkpoints: keep their original runtime/package
+versions, and a file that already refers to a missing generated module cannot
+be recovered merely by rebuilding an equivalent module under a new name.
+
 Resume checks Julia/package and checkpoint versions, target and previous-endpoint
 identities, binding, coordinate frame, tuning configuration and endpoint scores
 at saved positions. Caller IDs remain assertions about code/data semantics;

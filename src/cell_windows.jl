@@ -2505,7 +2505,7 @@ function _cell_part_reads(r::Recipe, params, mod, read_of)
     source = _kernel_split_replace(body, mapping)
     used = _kernel_collect_symbols!(Set{Symbol}(), source)
     kept = Int[j for j in eachindex(params) if params[j] in used]
-    operation = _gather_map_op(kernel_sourceop_token(op), :_reads,
+    operation = _partial_source_op(kernel_sourceop_token(op), :_reads,
         vcat(params[kept], names), source, mod)
     operation === nothing && return nothing
     (; reads = Pair{Any,Any}[ex => last(reads[findfirst(q -> isequal(first(q), ex), reads)])
@@ -2619,6 +2619,142 @@ function _cell_scalar_reads(p::Plan; argument_types = nothing)
     _partial_subplan(template, q.have, q.want, recipes), outlined
 end
 
+# A numeric scalar needed only by partition rows has a singleton demand
+# domain. Represent that domain as an implementation plate: a nonempty
+# consumer requests its one cell, while an empty consumer requests none.
+# Existing plate fusion and shared row windows then carry that demand back
+# through scalar arithmetic and indexed reads, including their footprints.
+# Scalars with whole-value readers or boundary outputs keep their original
+# representation. Row-method consumers must already be pushed, so their
+# broadcast operands are read through the row method, never its whole call.
+function _cell_scalar_plates(p::Plan; argument_types = nothing,
+                             outlined::Set{Int} = Set{Int}())
+    partitions = Set(r.id for r in p.recipes if r.op isa _AuthoredPlateCellOp && r.op.rows)
+    isempty(partitions) && return p
+    cid(v) = canon_id(p.graph, v.id)
+    # A partial WANT or bound label can retain fewer plates than the original
+    # label check. Only use that check's nonempty guarantee when the retained
+    # plates still cover every table it accepts.
+    tables = Set(cid(v) for r in p.recipes if r.op isa _PartitionLabel for v in r.inputs[2:end])
+    covered = Set{ValueId}()
+    for r in p.recipes
+        r.id in partitions || continue
+        lanes = get(p.producer, cid(first(r.inputs)), nothing)
+        lanes !== nothing && lanes.op isa _PartitionLanes && push!(covered, cid(first(lanes.inputs)))
+    end
+    complete = !isempty(tables) && issubset(tables, covered)
+    complete && length(partitions) == 1 && return p
+    cells = _cell_pushdowns(p; argument_types, outlined)
+    types = cells.types
+    boundary = Set(cid(v) for v in (p.have..., p.want...))
+    readers = Dict{ValueId,Vector{Recipe}}()
+    for r in p.recipes, v in r.inputs
+        push!(get!(readers, cid(v), Recipe[]), r)
+    end
+    # Every valid label occurs in at least one queried plate. A scalar needed
+    # by all of them is therefore always needed, and keeps its scalar form.
+    # Boundary outputs are needed independently of the partition as well.
+    needed = Dict(id => copy(partitions) for id in boundary)
+    for r in reverse(p.recipes)
+        uses = r.id in partitions ? Set((r.id,)) : Set{Int}()
+        if !(r.id in partitions)
+            for v in r.outputs
+                union!(uses, get(needed, cid(v), Set{Int}()))
+            end
+        end
+        for v in r.inputs
+            union!(get!(needed, cid(v), Set{Int}()), uses)
+        end
+    end
+    lifted = Set{ValueId}()
+    function accepts(r, id)
+        length(r.outputs) == 1 && cid(only(r.outputs)) in lifted && return true
+        slots = findall(v -> cid(v) == id, r.inputs)
+        if r.op isa _AuthoredPlateCellOp && r.op.rows
+            return all(>(1), slots)
+        end
+        length(r.outputs) == 1 && cid(only(r.outputs)) in cells.pushed || return false
+        f = get(cells.forms, r.id, nothing)
+        f !== nothing && f.kind in (:pointwise, :rows) &&
+            all(j -> f.roles[j] === :leaf, slots)
+    end
+    for r in reverse(p.recipes)
+        length(r.outputs) == 1 && !r.effectful || continue
+        id = cid(only(r.outputs))
+        T = get(types, id, Any)
+        id in boundary && continue
+        complete && get(needed, id, partitions) == partitions && continue
+        T <: Number && isconcretetype(T) || continue
+        r.op isa _BoundConstant && continue
+        if r.op isa _AuthoredPlateCellOp
+            inner = r.op.plate.kernel.plan
+            !r.op.rows && length(r.inputs) == 2 && isempty(inner.recipes) &&
+                get(types, cid(first(r.inputs)), Any) <: Integer || continue
+        end
+        rs = get(readers, id, Recipe[])
+        !isempty(rs) && all(q -> accepts(q, id), rs) && push!(lifted, id)
+    end
+    isempty(lifted) && return p
+    g = Graph(copy(p.graph.values), copy(p.graph.recipes), copy(p.graph.producers),
+        copy(p.graph.aliases), p.graph.version)
+    replacements = Dict(id => Value{AbstractVector{types[id]}}(id, g.values[id].name)
+        for id in lifted)
+    for (id, v) in replacements
+        g.values[id] = v
+    end
+    mapped(v) = get(replacements, cid(v), v)
+    recipes = Recipe[]
+    next_id = minimum((r.id for r in p.recipes); init = 0) - 1
+    singleton = value!(g, :_cell_scalar_axis, UnitRange{Int})
+    push!(recipes, Recipe(next_id, (), (singleton,), _BoundConstant(1:1), 0.0, nothing, false, nothing))
+    next_id -= 1
+    for r in p.recipes
+        inputs = Tuple(mapped(v) for v in r.inputs)
+        outputs = Tuple(mapped(v) for v in r.outputs)
+        if length(outputs) == 1 && cid(only(r.outputs)) in lifted
+            inner = Graph()
+            if r.op isa _AuthoredPlateCellOp
+                # A scalar indexed read becomes a one-row gather, so an empty
+                # downstream partition requests no source position at all.
+                index_type = get(types, cid(first(r.inputs)), Int)
+                index = value!(g, Symbol(only(outputs).name, :_indices), Vector{index_type})
+                index_op = _partial_source_op(:cell_scalar, :indices, [:i], :(vcat(i)), @__MODULE__)
+                push!(recipes, Recipe(next_id, (inputs[1],), (index,),
+                    index_op, 0.0, nothing, false, :(vcat(i))))
+                next_id -= 1
+                i = value!(inner, :i, index_type)
+                x = value!(inner, :x, get(types, cid(r.inputs[2]), Any))
+                result = value!(inner, :result, get(types, cid(only(r.outputs)), Any))
+                op = _partial_source_op(:cell_scalar, :index, [:i, :x], :(x[i]), @__MODULE__)
+                add!(inner, (i, x) => result, op; source = :(x[i]))
+                kernel = prepare(inner; have = (i, x), want = result)
+                plate = _AuthoredPlateOp{typeof(kernel),(2,)}(kernel)
+                push!(recipes, Recipe(r.id, (index, inputs[2]), outputs, plate, r.cost, nothing, false, nothing))
+            else
+                axis = value!(inner, :_scalar_axis, Int)
+                roots = [value!(inner, Symbol(:input_, j), get(types, cid(v), valtype(v)))
+                    for (j, v) in enumerate(r.inputs)]
+                result = value!(inner, :result, get(types, cid(only(r.outputs)), Any))
+                add!(inner, Tuple(roots) => result, r.op; source = r.source)
+                kernel = prepare(inner; have = (axis, roots...), want = result)
+                atomic = Tuple(j + 1 for j in eachindex(r.inputs) if !(cid(r.inputs[j]) in lifted))
+                plate = _AuthoredPlateOp{typeof(kernel),atomic}(kernel)
+                push!(recipes, Recipe(r.id, (singleton, inputs...), outputs, plate, r.cost, nothing, false, nothing))
+            end
+        else
+            op = r.op
+            if op isa _AuthoredPlateCellOp
+                atomic = Tuple(j for j in _plate_atomic(op.plate) if !(cid(r.inputs[j + 1]) in lifted))
+                plate = _AuthoredPlateOp{typeof(op.plate.kernel),atomic}(op.plate.kernel, op.plate.axis_checks)
+                op = _AuthoredPlateCellOp(plate, op.locality, op.rows, op.partitioned, op.plan, op.plan_constant)
+            end
+            push!(recipes, Recipe(r.id, inputs, outputs, op, r.cost, r.cse_key, r.effectful, r.source))
+        end
+    end
+    template = Plan(g, p.have, p.want, recipes, p.producer, p.cost, p.candidates)
+    _partial_subplan(template, p.have, p.want, recipes)
+end
+
 # The plates several cells read that fusion left for the cell lowering
 # (`_shared_cell_producer`, codegen.jl) but that the pushdowns `cells` do not
 # compute at rows: each is composed into its cells after all, as before, and
@@ -2680,6 +2816,7 @@ function _cell_outlined_pushdowns(p::Plan; argument_types = nothing)
         end
     end
     p, scalar_outlined = _cell_scalar_reads(p; argument_types)
+    p = _cell_scalar_plates(p; argument_types, outlined = scalar_outlined)
     p = _cell_sparse_products(p; argument_types, outlined = scalar_outlined)
     p = _fuse_authored_plate_chains(p; cells_only = true)
     known = IdDict{Recipe,Any}()
@@ -2710,6 +2847,90 @@ function _cell_outlined_pushdowns(p::Plan; argument_types = nothing)
         end
         foreach(id -> kept[id] = candidates[id], new)
     end
+end
+
+# Whole work used exclusively by one partition sum can execute in that sum's
+# nonempty-row scope. Row pushdowns already avoid unused rows, but an atomic
+# operand (for example the right factor of a matrix product) has no row domain
+# of its own. Its entire pure dependency chain belongs to its sole consumer.
+# Keep shared producers, query outputs, row-index dependencies and effects in
+# the enclosing plan. Cells sharing a window emitter are also left together.
+function _cell_partition_sum_type(p, cells, r)
+    inputs = Any[get(cells.types, canon_id(p.graph, v.id), valtype(v))
+                 for v in r.inputs[2:end]]
+    T = _checked_plate_element!(_UninferredValue[], r.op.plate, inputs, Symbol[])
+    if T === Any
+        # A pushed capture is read only by indexed element/row accesses, as
+        # proved by the capture analysis. Its generated window has the known
+        # numeric element type and rank even when the original container is
+        # abstract. Use those facts when inferring scalar helpers around the
+        # accesses; never substitute an arbitrary whole-array argument.
+        captured = get(cells.captures, r.id, Dict{Int,Vector{Tuple{Int,Int}}}())
+        window_inputs = Any[k in keys(captured) &&
+            canon_id(p.graph, r.inputs[k + 1].id) in cells.pushed ?
+            _cell_standin_type(S) : S for (k, S) in enumerate(inputs)]
+        window_inputs == inputs || (T = _checked_plate_element!(
+            _UninferredValue[], r.op.plate, window_inputs, Symbol[]))
+    end
+    T isa Type && T <: Number && isconcretetype(T) &&
+        Base.promote_op(+, T, T) === T ? T : Any
+end
+
+function _cell_partition_regions(p::Plan, cells, groups)
+    cells === nothing && return Dict{Int,Int}()
+    cid(v) = canon_id(p.graph, v.id)
+    boundary = Set(cid(v) for v in (p.have..., p.want...))
+    readers = Dict{ValueId,Vector{Int}}()
+    for r in p.recipes, v in r.inputs
+        push!(get!(readers, cid(v), Int[]), r.id)
+    end
+    # A region's guard must be available before any of its work is evaluated.
+    indices = Set(cid(first(r.inputs)) for r in p.recipes
+                  if r.op isa _AuthoredPlateCellOp)
+    for r in reverse(p.recipes)
+        any(v -> cid(v) in indices, r.outputs) || continue
+        union!(indices, (cid(v) for v in r.inputs))
+    end
+    regions = Dict{Int,Int}()
+    for r in reverse(p.recipes)
+        if r.op isa _AuthoredPlateCellOp
+            r.op.rows && !haskey(groups, r.id) || continue
+            T = length(r.outputs) == 1 ? _cell_partition_sum_type(p, cells, r) : Any
+            T <: Number && isconcretetype(T) && (regions[r.id] = r.id)
+            continue
+        end
+        (r.effectful || r.op isa _BoundConstant ||
+         any(v -> cid(v) in boundary || cid(v) in indices, r.outputs)) && continue
+        uses = unique(get(regions, reader, 0) for v in r.outputs
+                      for reader in get(readers, cid(v), Int[]))
+        length(uses) == 1 && only(uses) != 0 && (regions[r.id] = only(uses))
+    end
+    # Do not add guards where row demand already accounts for all numerical
+    # work. In particular a source view is only metadata, not a whole read.
+    views = _cell_input_views(p; types = cells.types)
+    needed = Set{Int}()
+    for r in p.recipes
+        owner = get(regions, r.id, 0)
+        owner == 0 && continue
+        r.id in cells.recipes && continue
+        r.op isa _AuthoredPlateCellOp && continue
+        any(v -> !(cid(v) in views) && get(cells.types, cid(v), Any) <: AbstractArray,
+            r.outputs) && push!(needed, owner)
+    end
+    filter!(pair -> last(pair) in needed, regions)
+    # Deferring a potentially throwing pure calculation past an effect would
+    # change their observable order on a populated partition.
+    starts = Dict{Int,Int}()
+    effects = 0
+    for r in p.recipes
+        effects += r.effectful
+        owner = get(regions, r.id, 0)
+        owner == 0 && continue
+        first_effects = get!(starts, owner, effects)
+        r.id == owner && effects != first_effects && delete!(needed, owner)
+    end
+    filter!(pair -> last(pair) in needed, regions)
+    regions
 end
 
 # ---------------------------------------------------------------- emission
