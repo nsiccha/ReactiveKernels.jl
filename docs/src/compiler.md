@@ -1689,7 +1689,11 @@ A statement of a planned body with an array operand calls through one
 `@noinline` wrapper, which compiles once per signature, so Enzyme and LLVM do
 not analyse every array operation as part of one function. Scalar statements
 and plate loops stay inline. This shows in `code_expr` as
-`_partition_statement_call`.
+`_partition_statement_call`. A type or function argument of such a statement
+crosses the wrapper in a carrier (`_PartitionType`, `_PartitionFunction`):
+Julia compiles a `Vararg{Any}` position holding a type as `::Type`, and one
+holding a function the method does not call as `::Function`, so without it
+the wrapper dispatched the statement at run time.
 `plan_constant`
 names HAVE ports whose values are constant per label (not data for the plan),
 and a lazy view of inputs may serve its rows from its parts

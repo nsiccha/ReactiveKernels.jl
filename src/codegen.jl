@@ -2179,6 +2179,11 @@ function _plate_keeping_entries(producer::Recipe, read::Set{Int})
     !isempty(read) && issubset(read, 1:n) && length(read) < n || return nothing
     stand_in = tuple.inputs[minimum(read)]
     inputs = Tuple(k in read ? tuple.inputs[k] : stand_in for k in 1:n)
+    # A later fusion pass can see the same unread slots after they have
+    # already been replaced. Preserve plan identity when no dependency changes;
+    # cell composition uses it to detect that it has reached a fixed point.
+    all(k -> canon_id(ig, inputs[k].id) == canon_id(ig, tuple.inputs[k].id), 1:n) &&
+        return nothing
     recipes = Recipe[q for q in inner.recipes]
     recipes[at] = Recipe(tuple.id, inputs, tuple.outputs, tuple.op, tuple.cost,
                          nothing, false, tuple.source)
@@ -2199,12 +2204,12 @@ function _plate_keeping_entries(producer::Recipe, read::Set{Int})
            nothing, producer.effectful, producer.source)
 end
 
-# A plate this pass drafts (sliced to the tuple entries its readers read, or
-# composed with its producer) whose planned cell no longer reads a shared
-# operand (a capture or `Ref`) stops taking it, and the work only such operands
+# A plate whose planned cell no longer reads a shared operand (a capture or
+# `Ref`) stops taking it, and the work only such operands
 # needed leaves the plan: a cell of one value of a shared cell computes nothing
 # only the other values read (snag `sibling-only-pla-2b3df69e`). A zipped
-# operand stays, as it shapes the domain; an undrafted plate keeps its operands.
+# operand stays, as it shapes the domain. Already-built cells may retain
+# unused formals after their own planning, so they need the same pruning.
 function _drop_unread_plate_operands!(g::Graph, recipes, want)
     changed = false
     for (index, r) in enumerate(recipes)
@@ -2228,13 +2233,15 @@ function _drop_unread_plate_operands!(g::Graph, recipes, want)
     true
 end
 
-# Drafted plate (or cell) recipe `r` without the shared operands its cell does
+# Plate (or cell) recipe `r` without the shared operands its cell does
 # not read, or `nothing` when it reads them all.
 function _plate_without_unread_operands(r::Recipe)
-    cell = r.op isa _AuthoredPlateCellDraft
+    cell = r.op isa _AuthoredPlateCellLike
     op = cell ? r.op.plate : r.op
-    op isa _AuthoredPlateDraft || return nothing
-    inner = op.plan
+    op isa _AuthoredPlateLike || return nothing
+    body = _plate_body(op)
+    inner = body.plan
+    length(body.lowered_recipes) == length(inner.recipes) || return nothing
     ig = inner.graph
     read = Set(canon_id(ig, v.id) for v in inner.want)
     for q in inner.recipes, v in q.inputs
@@ -2252,7 +2259,7 @@ function _plate_without_unread_operands(r::Recipe)
     draft = _AuthoredPlateDraft{Tuple(moved[position] for position in atomic
                                       if haskey(moved, position))}(
         _partial_subplan(inner, inner.have[kept], inner.want, collect(inner.recipes)),
-        op.lowered_recipes, checks)
+        body.lowered_recipes, checks)
     cell || return Recipe(r.id, inputs[kept], r.outputs, draft, r.cost, nothing,
                           r.effectful, r.source)
     Recipe(r.id, (first(r.inputs), inputs[kept]...), r.outputs,

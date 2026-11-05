@@ -112,6 +112,7 @@ const _PPL_TEST_FILES = (
     "test_corpus.jl",
     "test_submodels_full.jl",
     "test_scoped_submodels.jl",
+    "test_submodel_return_values.jl",
     "test_qualified_submodels.jl",
     "test_external_sampling.jl",
     "test_external_geometry_derivatives.jl",

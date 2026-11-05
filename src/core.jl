@@ -1393,11 +1393,27 @@ const _LaneIndex = Union{Integer,AbstractRange{<:Integer},Colon,AbstractVector{<
 @inline function _lane_getindex(recycled,
         A::Union{Array{T},SubArray{T,<:Any,<:Array}}, I::Vararg{_LaneIndex}) where {T}
     all(index -> index isa Integer, I) && return A[I...]
+    # One bounds check over the indices: the checked indices then read in
+    # place, as `getindex` itself reads after its own check.
     checkbounds(A, I...)
     J = to_indices(A, I)
     buffer = _lane_reuse(recycled, T, Base.index_shape(J...))
-    buffer === nothing && return _lane_keep!(recycled, A[I...])
-    copyto!(buffer, view(A, J...))
+    buffer === nothing && return _lane_keep!(recycled, @inbounds A[I...])
+    copyto!(buffer, @inbounds view(A, J...))
+end
+
+# A slice that a dotted call reads as one of its operands, `f.(x[k])` or
+# `a .* x[k]` (`_lane_gather_operand`). The broadcast materializes its result
+# before anything else runs, so a dense array's slice is read in place: a
+# checked view has the slice's axes, element type and values, and throws the
+# `BoundsError` the slice throws. The broadcast unaliases a view from the
+# buffer it fills (`Base.Broadcast.preprocess`). A scalar index and any other
+# array keep `getindex`.
+@inline _lane_gathered(A, I...) = A[I...]
+@inline function _lane_gathered(A::Union{Array,SubArray{<:Any,<:Any,<:Array}},
+                                I::Vararg{_LaneIndex})
+    all(index -> index isa Integer, I) && return A[I...]
+    view(A, I...)
 end
 
 # `reduce(vcat, A)` (`_lane_source_expr`). For a vector of dense vectors,
@@ -1422,6 +1438,28 @@ end
     end
     Base._typed_vcat!(buffer, A)
 end
+
+# `vcat(args...)` of the native body (`_native_vcat`), nested in a position
+# residual's source, as in `vcat(0.0, x[k])`. Numbers and dense vectors of a
+# bits element type fill a matching recycled `Vector`, operand by operand, as
+# `_native_vcat` fills its fresh one; any other operands, and an operand that
+# may share memory with the buffer, take `_native_vcat`.
+@inline _lane_vcat(recycled, args...) = _native_vcat(args...)
+@inline function _lane_vcat(recycled, a::_NativeColumnOperand,
+                            rest::Vararg{_NativeColumnOperand,N}) where {N}
+    args = (a, rest...)
+    T = Base.promote_eltypeof(args...)
+    isbitstype(T) || return _native_vcat(args...)
+    n = _native_cat_height_sum(args)
+    buffer = _lane_reuse(recycled, T, (Base.OneTo(n),))
+    buffer === nothing && return _lane_keep!(recycled, _native_vcat(args...))
+    _lane_vcat_aliases(buffer, args) && return _lane_keep!(recycled, _native_vcat(args...))
+    _native_vcat_copy!(buffer, n, 0, args)
+end
+@inline _lane_vcat_aliases(buffer, ::Tuple{}) = false
+@inline _lane_vcat_aliases(buffer, args::Tuple) =
+    (first(args) isa AbstractArray && Base.mightalias(first(args), buffer)) ||
+    _lane_vcat_aliases(buffer, Base.tail(args))
 
 # `zeros`, `ones` and `fill` of integer dimensions in a lazy-branch arm
 # (`_lane_source_expr`): Base's fresh array, or a matching recycled buffer
