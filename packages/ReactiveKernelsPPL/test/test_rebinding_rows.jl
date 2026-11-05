@@ -180,6 +180,31 @@ function _rr_case(kind)
         end
         bind = n -> m(; x = _rr_x(n)) | (; y = _rr_y(n))
         lik = (nt, n) -> sum(logpdf.(Normal.(nt.a .+ _rr_x(n), nt.s), _rr_y(n)))
+    elseif kind === :ordinal
+        m = @rkppl begin
+            a ~ Normal(0, 1)
+            thresholds[1:2] .~ Normal.(0, 1)
+            y .~ Ordinal.(StoppingRatio(), LogitLink(), a .+ x, Ref(thresholds))
+        end
+        ys = n -> [mod1(i, 3) for i in 1:n]
+        bind = n -> m(; x = _rr_x(n)) | (; y = ys(n))
+        lik = (nt, n) -> sum(zip(_rr_x(n), ys(n)); init = 0.0) do (x, y)
+            stop = cdf.(Logistic(), nt.thresholds .- nt.a .- x)
+            log(prod(1 .- stop[1:y-1]; init = 1.0) * (y == 3 ? 1.0 : stop[y]))
+        end
+    elseif kind === :ragged
+        m = @rkppl begin
+            a ~ Normal(0, 1)
+            s ~ Exponential(1)
+            @plate for i in eachindex(y)
+                y[i] .~ Normal.(a .+ x[i], s)
+            end
+        end
+        xs = n -> [[0.2k * j for j in 1:mod(k, 3)] for k in 1:n]
+        ys = n -> [0.3 .* x .+ 0.01 for x in xs(n)]
+        bind = n -> m(; x = xs(n)) | (; y = ys(n))
+        lik = (nt, n) -> sum((sum(logpdf.(Normal.(nt.a .+ x, nt.s), y))
+            for (x, y) in zip(xs(n), ys(n))); init = 0.0)
     end
     return (; bind, lik)
 end
@@ -207,6 +232,11 @@ function _rr_check(kind; fit = 9, new = 6)
     nt = constrain(built.layout, u)
     lik = Base.invokelatest(prepare_query(built, other, :likelihood), u)
     @test lik ≈ case.lik(nt, new) rtol = 1e-12
+    if kind === :ordinal
+        points = Base.invokelatest(prepare_query(built, other, :pointwise), u).y
+        @test length(points) == new
+        @test sum(points) ≈ lik
+    end
     # The original binding still evaluates on the same graph.
     @test Base.invokelatest(prepare_query(built, fitted, :likelihood), u) ≈
         case.lik(nt, fit) rtol = 1e-12
@@ -229,6 +259,17 @@ end
         @testset "$kind" begin
             _rr_check(kind)
             _rr_check(kind; fit = 6, new = 9)
+        end
+    end
+end
+
+@testset "a built graph rebinds empty observation domains in either direction" begin
+    for kind in (:function_location, :scalar_location, :expression_location,
+            :affine, :scalar_offset, :design, :design_intercept_column,
+            :log_rate, :glm, :ranged, :plate, :ragged, :ordinal)
+        @testset "$kind" begin
+            _rr_check(kind; fit = 6, new = 0)
+            _rr_check(kind; fit = 0, new = 6)
         end
     end
 end
@@ -264,11 +305,6 @@ end
         s ~ Exponential(1)
         y .~ Normal.(a, s)
     end
-    empty = build_kernel(scalar() | (; y = Float64[]))
-    # refused: an empty response's likelihood is the constant zero, so the
-    # empty build evaluates no observation for a binding with rows (snag
-    # rkppl-opaque-loc-37de7b80)
-    @test_throws ContractValidationError prepare_query(empty, scalar() | (; y), :likelihood)
     # refused: the graph's data arguments are typed by the build's data
     # (`Vector{Float64}`), so integer data generate another program
     @test_throws "in the data arguments" prepare_query(
