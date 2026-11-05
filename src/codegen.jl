@@ -6238,12 +6238,144 @@ image compiled for it.
 compile(ast::Expr) =
     _compile(ast, @__MODULE__, GlobalRef(@__MODULE__, Symbol("@_native_context")))
 
+# RuntimeGeneratedFunctions names a module in a program's content id by its
+# path (`fullname`), so that the id a package image computed for a program is
+# the id of the same program once the image is loaded. Re-evaluating a module
+# definition (a REPL or test file `include`d again, `include_string`) makes a
+# second module object at the first one's path, and the two modules' programs
+# then had one id although each reads its own bindings: RGF's body cache
+# returned the first body for that id, and the method compiled for the
+# callable's type ran it. A kernel prepared from the new module's `@kernel`
+# silently called the old module's functions (snag `prepared-kernel-b879ce51`).
+# So each module a program names has a generation in this process: the number
+# of distinct module objects at its path that were named before it, 0 for the
+# first. A program naming a module of a later generation begins with a
+# `_ModuleGenerations` statement listing those, which changes its id and lowers
+# to nothing. A program naming only first modules keeps the id it has in every
+# process. Registering a loaded image makes the image's modules the first at
+# their paths (`_register_image_programs`), so a module that replaces one of
+# them is never served the image's programs.
+struct _ModuleGenerations
+    generations::Tuple
+end
+
+# Each path's module objects in the order they were first named. Their indices
+# are their generations, so a collected module keeps its slot.
+const _MODULE_GENERATIONS = Dict{Tuple{Vararg{Symbol}},Vector{WeakRef}}()
+const _MODULE_GENERATIONS_LOCK = ReentrantLock()
+
+function _module_generation(m::Module)
+    path = fullname(m)
+    @lock _MODULE_GENERATIONS_LOCK begin
+        named = get!(() -> WeakRef[], _MODULE_GENERATIONS, path)
+        for (index, ref) in pairs(named)
+            ref.value === m && return index - 1
+        end
+        push!(named, WeakRef(m))
+        length(named) - 1
+    end
+end
+
+# Make `m` and its submodules the first modules at their paths.
+function _first_module_generations!(m::Module, visited::Vector{Module} = Module[])
+    any(v -> v === m, visited) && return nothing
+    push!(visited, m)
+    _module_generation(m)
+    for name in names(m; all = true)
+        Base.invokelatest(isdefined, m, name) || continue
+        value = Base.invokelatest(getglobal, m, name)
+        value isa Module && value !== m && parentmodule(value) === m &&
+            _first_module_generations!(value, visited)
+    end
+    nothing
+end
+
+_note_module!(found::Vector{Module}, m::Module) =
+    (any(f -> f === m, found) || push!(found, m); nothing)
+
+# The modules a program's content id names (RuntimeGeneratedFunctions'
+# `expr_to_id`): those of its global references and module literals, and the
+# modules of the types it embeds, of the values it embeds and of their fields.
+function _program_modules!(found::Vector{Module}, @nospecialize(x), seen::IdDict{Any,Nothing})
+    if ismutable(x)
+        haskey(seen, x) && return nothing
+        seen[x] = nothing
+    end
+    if x isa Expr
+        for arg in x.args
+            _program_modules!(found, arg, seen)
+        end
+    elseif x isa GlobalRef
+        _note_module!(found, x.mod)
+    elseif x isa Module
+        _note_module!(found, x)
+    elseif x isa Symbol || x isa LineNumberNode || x isa String
+        nothing
+    elseif x isa DataType
+        _note_module!(found, x.name.module)
+        for p in x.parameters
+            _program_modules!(found, p, seen)
+        end
+    elseif x isa Union
+        _program_modules!(found, x.a, seen)
+        _program_modules!(found, x.b, seen)
+    elseif x isa UnionAll
+        _program_modules!(found, x.var, seen)
+        _program_modules!(found, x.body, seen)
+    elseif x isa TypeVar
+        _program_modules!(found, x.lb, seen)
+        _program_modules!(found, x.ub, seen)
+    else
+        T = typeof(x)
+        _program_modules!(found, T, seen)
+        if x isa Array || (@static isdefined(Core, :GenericMemory) ? x isa Core.GenericMemory : false)
+            isprimitivetype(eltype(x)) && return nothing
+            for i in eachindex(x)
+                isassigned(x, i) && _program_modules!(found, x[i], seen)
+            end
+        elseif !isprimitivetype(T)
+            for i in 1:nfields(x)
+                isdefined(x, i) && _program_modules!(found, getfield(x, i), seen)
+            end
+        end
+    end
+    nothing
+end
+
+# `ast` with a `_ModuleGenerations` statement when it names a module that is
+# not the first at its path.
+function _distinguish_module_generations(ast::Expr)
+    found = Module[]
+    _program_modules!(found, ast, IdDict{Any,Nothing}())
+    generations = Tuple{Tuple{Vararg{Symbol}},Int}[]
+    for m in found
+        generation = _module_generation(m)
+        generation == 0 || push!(generations, (fullname(m), generation))
+    end
+    isempty(generations) && return ast
+    ast.head in (:->, :function) && length(ast.args) == 2 || throw(ArgumentError(
+        "cannot compile `$(ast.head)` expression: expected a function expression"))
+    Expr(ast.head, ast.args[1],
+         Expr(:block, _ModuleGenerations(Tuple(sort!(generations))), ast.args[2]))
+end
+
+# The expression of the compiled program `f` as it was lowered, without the
+# statement `_distinguish_module_generations` added.
+function _program_expression(@nospecialize(f))
+    ex = RuntimeGeneratedFunctions.get_expression(f)
+    ex isa Expr && length(ex.args) == 2 || return ex
+    body = ex.args[2]
+    body isa Expr && body.head === :block && length(body.args) == 2 &&
+        body.args[1] isa _ModuleGenerations || return ex
+    Expr(ex.head, ex.args[1], body.args[2])
+end
+
 # `compile` with the body's global names resolved in `context` instead of RK.
 # `native_context` names a macro defined in `context` that returns its argument
 # unchanged, as `@_native_context` below does: its hygiene qualifies the globals.
 # A package whose lowered bodies name its own functions compiles them this way.
 function _compile(ast::Expr, context::Module, native_context::GlobalRef)
-    ast = _canonical_locals(_canonical_globals(ast))
+    ast = _distinguish_module_generations(_canonical_locals(_canonical_globals(ast)))
     f = RuntimeGeneratedFunction(context, context, ast)
     image = _image_program(f)
     image === nothing || return image
@@ -6644,6 +6776,8 @@ end
 function _register_image_programs(package::Base.PkgId)
     mod = Base.root_module(package)
     isdefined(mod, _IMAGE_PROGRAMS) || return nothing
+    # A module that later replaces one of the image's is not served its programs.
+    _first_module_generations!(mod)
     table = getglobal(mod, _IMAGE_PROGRAMS)::_ImagePrograms
     @lock _LOADED_IMAGE_PROGRAMS.lock begin
         tables = @atomic :acquire _LOADED_IMAGE_PROGRAMS.tables
@@ -6945,7 +7079,7 @@ _externalize_bound_array_body(f, positions, values) = nothing
 function _externalize_bound_array_body(
         f::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction,
                  _PrecompileWarmFunction}, positions, values)
-    ast = deepcopy(RuntimeGeneratedFunctions.get_expression(f))
+    ast = deepcopy(_program_expression(f))
     operands = Symbol[]
     loads = Dict{Int,Any}()
     for (index, value) in zip(positions, values)

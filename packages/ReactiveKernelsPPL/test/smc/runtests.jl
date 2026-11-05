@@ -268,6 +268,8 @@ include("rejuvenation.jl")
 include("selective.jl")
 include("tuning_lifecycle.jl")
 include("tuning_lifecycle_replay.jl")
+include("tuning_parallel.jl")
+include("worker_resume_replay.jl")
 include("generated_tuning_replay.jl")
 
 @testset "Fresh-process checkpoint continuation" begin
