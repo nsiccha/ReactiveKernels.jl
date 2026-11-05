@@ -101,3 +101,8 @@ over these hand-authored kernels — `gibbs(...)` / `Gibbs`, with automatic
 conditional derivation, conjugacy detection, and Metropolis-within-Gibbs
 fallback (`packages/ReactiveKernelsPPLExamples/src/ppl_gibbs.jl`). The kernels on
 this page are the layer it lowers to.
+
+For `@rkppl` models whose discrete latents can be summed out (a hidden Markov
+model's state path, a mixture's components), [Discrete latent
+variables](discrete-latents.md) recovers them exactly at each posterior draw
+instead of sampling them in a Gibbs sweep.
