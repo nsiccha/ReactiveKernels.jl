@@ -21,6 +21,9 @@ function build_model(model, data)
 end
 const BACKEND = AutoEnzyme(; mode=Enzyme.Reverse)
 sharedview(theta) = view(theta, :)
+parameter_positions(layout, name) = let e = only(e for e in layout.entries if e.name === name)
+    collect(e.offset:(e.offset + e.size - 1))
+end
 
 @testset "shared prefix reuse and compact/dense full/local gradients" begin
     for sizes in ((2, 3, 4, 5, 2, 3), (3, 2, 25, 40, 80, 60))
@@ -43,7 +46,8 @@ sharedview(theta) = view(theta, :)
             # reference, never as a by-value aggregate of all its fields.
             @test ReactiveKernelsPPL._partition_ad(sampler.ad, 1).resolver isa
                   ReactiveKernels._ADPlanBoxing
-            local_positions = findall(==(:Z), coordinate_names(built.layout))
+            local_positions = parameter_positions(built.layout, :Z)
+            @test length(local_positions) == 12
             shared_positions = setdiff(eachindex(u), local_positions)
             initial_values = sampler.prefix.values
             for value in initial_values
@@ -201,7 +205,8 @@ end
         u = collect(range(-0.4, 0.3; length=built.layout.total))
         baseline = prepare_partition_sampler(built, bound, :y, u; by=:subject,
             backend=BACKEND, compact=false, locality=:ignore)
-        shared_positions = findall(==(:theta), coordinate_names(built.layout))
+        shared_positions = parameter_positions(built.layout, :theta)
+        @test length(shared_positions) == 4
         for compact in (true, false)
             point = copy(u)
             sampler = prepare_partition_sampler(built, bound, :y, point; by=:subject,

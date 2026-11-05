@@ -51,7 +51,10 @@ end
                 backend=BACKEND, compact, partitioned=:eta, locality=:error)
             @test sampler.prefix !== nothing
             cached = sampler.prefix.values
-            local_positions = findall(==(:eta), coordinate_names(built.layout))
+            local_positions = let e = only(e for e in built.layout.entries if e.name === :eta)
+                collect(e.offset:(e.offset + e.size - 1))
+            end
+            @test length(local_positions) == 3
             for label in (1, 3, 2), change in (0.0, 0.2)
                 point = copy(u)
                 point[local_positions] .+= change
