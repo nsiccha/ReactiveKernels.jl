@@ -200,10 +200,10 @@ via `bound=`). Thin wrapper over `ReactiveKernels.prepare` with
 optional `exemplars` tuple is forwarded to RK's native type-evidence path.
 The returned kernel maps an unconstrained float vector to the preset node's
 value. `plan` may be any binding that generates the same program as `built`
-(other row counts and data values, or the same source lowered in another
-gensym-created isolation module); one that generates another program
-(other levels or parameter sizes, data element types, missing entries, an
-empty response, another broadcast shape) is refused with a
+(other row counts, including zero, and data values, or the same source lowered
+in another gensym-created isolation module); one that generates another program
+(other levels or parameter sizes, data element types, missing entries,
+another broadcast shape) is refused with a
 `ContractValidationError` naming the first difference, since the graph would
 evaluate the wrong program for it. The preparation itself is
 world-age safe (callable from compiled functions), but the RAW returned
