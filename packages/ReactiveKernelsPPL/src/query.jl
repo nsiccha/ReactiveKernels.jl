@@ -901,11 +901,12 @@ _cell_gradient!(s, g, args::Vararg{Any,N}) where {N} =
 # `slots[j]` is packed coordinate `j`'s position in `active`, or 0 when `j`
 # reads `base`. The packed base and the slot map cross the AD boundary as
 # constants; the graph still contains every model calculation after this
-# selection. A read is one slot load and a branch, where a binary search over
-# the selection cost O(log selection) per read (snag
+# selection. Mutable cell samplers use dense maps: one slot load and a branch,
+# where a binary search over the selection cost O(log selection) per read (snag
 # `compact-cell-cal-58569833`). Native Reverse multiplied that search's cost
 # inside gathers far beyond its primal cost; that is Enzyme snag
-# `reverse-over-a-g-a9ee15bb`.
+# `reverse-over-a-g-a9ee15bb`). Fixed factor queries instead use support-sized
+# sparse maps; their native Reverse cost is covered by the preparation probe.
 struct _CompactCellPoint{B<:AbstractVector{Float64},A<:AbstractVector{Float64},S<:AbstractVector{Int32}} <: AbstractVector{Float64}
     base::B
     active::A
@@ -935,6 +936,11 @@ function _compact_cell_slots(total::Int, indices)
     end
     slots
 end
+
+# Fixed factor queries own only their structural support. Mutable cell samplers
+# keep the dense map above, which they update in place when the selection moves.
+_fixed_cell_slots(total::Int, indices) =
+    sparsevec(indices, Int32.(eachindex(indices)), total)
 
 # A parameter block read from the overlay is not strided, so a product of it
 # would take LinearAlgebra's generic `mul!`; RK's native product computes it
