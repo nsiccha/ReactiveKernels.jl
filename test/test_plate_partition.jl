@@ -686,6 +686,27 @@ end
     @test !separated(typeof(+), Float64, Float64)
     @test ReactiveKernels._partition_statement_call(sum, [1.0, 2.0]) === 3.0
     @test ReactiveKernels._partition_statement_call(+, 1.0, 2.0) === 3.0
+    # Julia compiles a `Vararg{Any}` position holding a type as `::Type`, and one
+    # holding a function the method does not call as `::Function`. The wrapper
+    # read the type and dispatched `similar` (or `map`) at run time; BRM's NLME
+    # partition sampler warned on it (snag partition-array-bb24ae62). The
+    # wrapper RK actually invokes is audited here, not only its inferred result.
+    let x = [1.0, 2.0], output_axes = (Base.OneTo(3),), scale = 2.0
+        statement = ReactiveKernels._partition_statement_call
+        audit(T...) = ReactiveKernels._code_findings(statement, T)
+        allocate = ReactiveKernels._plate_similar_output
+        @test isempty(audit(typeof(allocate), Vector{Float64}, Type{Float64},
+                            typeof(output_axes)))
+        @test isempty(audit(typeof(map), typeof(abs2), Vector{Float64}))
+        scaled = z -> scale * z
+        @test isempty(audit(typeof(map), typeof(scaled), Vector{Float64}))
+        @test separated(typeof(allocate), Vector{Float64}, Type{Float64}, typeof(output_axes))
+        @test separated(typeof(map), typeof(scaled), Vector{Float64})
+        y = statement(allocate, x, Float32, output_axes)
+        @test y isa Vector{Float32} && length(y) == 3
+        @test statement(map, abs2, x) == [1.0, 4.0]
+        @test statement(map, scaled, x) == [2.0, 4.0]
+    end
     let loop = :(for i in r; x = f(a); end)
         @test ReactiveKernels._partition_separate_statement(loop) === loop
     end

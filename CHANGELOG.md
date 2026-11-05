@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.85
+
+- A planned partition's array statement that takes a type or a function
+  argument (for example the output allocation `similar(marker, T, axes)`)
+  is compiled for that exact type or function behind the statement wrapper,
+  instead of dispatching at run time. Preparing such a program no longer
+  warns that `_partition_array_call` is not type stable. Values are unchanged.
+
 ## 0.1.84
 
 - Fixed selections prepared by frontends can pass precomputed partition rows
