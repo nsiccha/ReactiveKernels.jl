@@ -3935,11 +3935,22 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         end
     end
     # `types`: this kernel's operations are already in the table there.
-    (; op_offset, scan_offsets, plate_type_exprs, nested, lane_arms) =
-        types === nothing ? _plate_cell_types!(runtime_ops, runtime_recipes,
-            inner_kernel, atomic, callargs, callvalues, raw_arguments,
-            input_type_hints;
-            result_slot = _plate_stores_cells(pointwise_lhs, into, cells)) : types
+    if types === nothing
+        # A do-block here specializes its closure on the inner kernel, even
+        # though this lowering does not specialize on it. Rebinding would then
+        # compile another closure for a newly bound inner kernel.
+        scheduled = get(task_local_storage(), _SCHEDULED_PREFIX_LOWERING, false)
+        scheduled && task_local_storage(_SCHEDULED_PREFIX_LOWERING, false)
+        try
+            types = _plate_cell_types!(runtime_ops, runtime_recipes,
+                inner_kernel, atomic, callargs, callvalues, raw_arguments,
+                input_type_hints;
+                result_slot = _plate_stores_cells(pointwise_lhs, into, cells))
+        finally
+            scheduled && task_local_storage(_SCHEDULED_PREFIX_LOWERING, true)
+        end
+    end
+    (; op_offset, scan_offsets, plate_type_exprs, nested, lane_arms) = types
     inferred_eltype = nested === nothing ?
         get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
             GlobalRef(Core, :Any)) : nested.type
@@ -3956,7 +3967,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         output_axes, pointwise_lhs, total_lhs, recycled, into, cells,
         plate_eltype, index, previous, first_coordinate, root_positions,
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
-        lane_arms; nonempty, total_fold)
+        lane_arms; nonempty, total_fold, runtime_ops, runtime_recipes)
 end
 
 # Append a cell kernel's operations to the table and build the type expression
@@ -4036,7 +4047,8 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         pointwise_lhs, total_lhs, recycled, into::Bool, cells::Bool,
         plate_eltype, index, previous, first_coordinate, root_positions,
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
-        lane_arms; nonempty::Bool = false, total_fold = sum)
+        lane_arms; nonempty::Bool = false, total_fold = sum,
+        runtime_ops, runtime_recipes)
     groups = nested === nothing ? _authored_plate_recipe_groups(
         inner, dependencies, root_positions, atomic, callvalues) :
         [(Set{ValueId}(), nested.invariants)]
@@ -4071,6 +4083,13 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     # The cell's result is stored by reference, so it keeps one only where a
     # per-cell table keeps its buffer for that cell.
     cell_slots = get(task_local_storage(), _CELL_SLOTS, nothing)
+    reduction = cells && nested === nothing &&
+            (total_lhs === nothing || total_fold === sum) ? _plate_reduction_plan(
+        inner, inner_kernel, dependencies, root_positions, atomic, callvalues,
+        pointwise_lhs) : nothing
+    parallel_cells = get(task_local_storage(), _SCHEDULED_PREFIX_LOWERING, false) &&
+        reduction === nothing && cells && pointwise_lhs !== nothing &&
+        total_lhs === nothing && cell_slots === nothing && !into && recycled === nothing
     slotted = Pair{Int,Symbol}[]
     if cell_slots !== nothing
         emitted = Set(i for (_, indices) in groups for i in indices)
@@ -4104,13 +4123,15 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     for recipe in inner.recipes
         recipe.op isa _SharedCall || continue
         shares[recipe.id] = gensym(:shared_call_table)
-        push!(body.args, Expr(:(=), shares[recipe.id], nothing))
+        push!(body.args, Expr(:(=), shares[recipe.id], parallel_cells ?
+            Expr(:call, GlobalRef(@__MODULE__, :_ConcurrentSharedTable)) : nothing))
     end
     if nested !== nothing
         for id in nested.shares
             haskey(shares, id) && continue
             shares[id] = gensym(:shared_call_table)
-            push!(body.args, Expr(:(=), shares[id], nothing))
+            push!(body.args, Expr(:(=), shares[id], parallel_cells ?
+                Expr(:call, GlobalRef(@__MODULE__, :_ConcurrentSharedTable)) : nothing))
         end
     end
     function lower_recipe!(block, recipe_index, args, out, operation, looped)
@@ -4355,10 +4376,11 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
             LineNumberNode(0), simd_loop)
         cell_loop = macroexpand(@__MODULE__, simd)
     end
-    reduction = cells && nested === nothing &&
-            (accumulator === nothing || total_fold === sum) ? _plate_reduction_plan(
-        inner, inner_kernel, dependencies, root_positions, atomic, callvalues,
-        pointwise_lhs) : nothing
+    if parallel_cells
+        cell_loop = _scheduled_prefix_loop!(runtime_ops, runtime_recipes, body,
+            invariants, declarations, loopbody, callargs, index, previous,
+            first_coordinate, shares, output_axes)
+    end
     if cells
         append!(body.args, declarations)
         execution = Expr(:block, invariants.args...)
