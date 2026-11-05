@@ -1442,7 +1442,7 @@ function _ordinal_pointwise_stmts(r, plan; grouped = false)
     pw = _pw_name(r.label)
     if !(r.family === OrdinalFam && r.ordinal_structure === :stopping &&
             r.evidence.kind === :none && r.n_levels > 1 &&
-            _response_rows(plan, r) > 0 && _has_observed_response(plan, r))
+            (_response_rows(plan, r) == 0 || _has_observed_response(plan, r)))
         return Expr[], pw
     end
     # A stopping-ratio lane represents a visited stage. Zero-threshold
@@ -1614,18 +1614,6 @@ _ppl_observations_unsupported(names::Tuple) = throw(ContractValidationError(
 # response's shape: one array of observation densities per index.
 function _cell_broadcast_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         stmts::Vector{Expr}, upstream::Vector{Expr})
-    # No index: the ordinary empty-domain statements already sum to zero.
-    if _response_rows(plan, r) == 0
-        r.family in _OBSERVATION_LOCATION_SCALE_FAMILIES || return stmts
-        full = _response_likelihood_stmts_full(_with(r; range = nothing), plan)
-        arguments = _observation_argument_inputs(r, full)
-        arguments === nothing && return stmts
-        generated = _cell_broadcast_group(plan, r.response, _lik_name(r.label),
-            _pw_name(r.label), full, upstream, [p.name for p in plan.predictors],
-            "response $(r.label) observes one array per index, and its $(r.family) statements";
-            arguments, argument_node = Symbol(:_ppl_obsargs_, r.label))
-        return Expr[stmts..., generated[4:end]...]
-    end
     # The response's predictor nodes lie on its observation axis, here the
     # indices.
     pointstmts, pointvalue = _ordinal_pointwise_stmts(r, plan; grouped = true)
@@ -1948,11 +1936,7 @@ function _ranged_response_stmts(r, plan, stmts)
     idx = Symbol(:_ppl_range_indices_, r.label)
     selected = Symbol(:_ppl_range_response_, r.label)
     pre = Expr[:($idx = collect($(_range_index_expr(r))))]
-    if _response_rows(plan, r) == 0 && r.response in plan.indexed_observations
-        push!(pre, :($selected = zeros(0)))
-    else
-        push!(pre, Expr(:(=), selected, Expr(:ref, r.response, idx, r.range.args[3:end]...)))
-    end
+    push!(pre, Expr(:(=), selected, Expr(:ref, r.response, idx, r.range.args[3:end]...)))
     aliases = Dict{Symbol,Symbol}(r.response => selected)
     if r.response in plan.indexed_observations
         rows = Set{Symbol}()
@@ -1991,9 +1975,10 @@ end
 _mixture_normal_cdf(x, mu, sigma) = 0.5 * erfc((mu - x) / (sqrt(2.0) * sigma))
 
 function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
-    # No cell is evaluated on an empty bound observation domain. Its sum is
-    # the additive identity, independently of the response family.
-    if _response_rows(plan, r) == 0 || !_has_observed_response(plan, r)
+    # Keep the authored plate on an empty domain: it evaluates no cells and
+    # sums to zero, while the same graph can later observe nonempty data.
+    # Nonempty all-missing responses retain their presence specialization.
+    if _response_rows(plan, r) > 0 && !_has_observed_response(plan, r)
         obs = _observation_axes(plan)
         shape = obs !== nothing && hasproperty(obs, :domains) ?
             length.(obs.domains[r.label]) :
@@ -2001,8 +1986,6 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         stmts = Expr[
         :($(_pw_name(r.label)) = zeros($shape)),
         :($(_lik_name(r.label))::Float64 = 0.0)]
-        # An empty response draws nothing, so its law reads nothing.
-        _response_rows(plan, r) == 0 && push!(stmts, :($(_law_name(r.label)) = ()))
         return stmts
     end
     stmts = _response_likelihood_stmts_full(r, plan)

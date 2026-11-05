@@ -374,6 +374,51 @@ function _partial_split_parts(r::Recipe; factors::Bool = false)
     split === nothing ? nothing : (; native, split)
 end
 
+# Splitting out cached operands must not materialize a live dotted child of
+# another broadcast. Reinsert only those children into the residual source;
+# data-only children remain cache boundaries and ordinary calls remain eager.
+# As for gather-map interchange, closure-owned source keeps its original path.
+function _partial_fuse_broadcasts(part, op, native, nodes, dataonly, holds, ports)
+    record = getfield(op, :f)
+    record isa _KernelSource && _source_native(record) === nothing &&
+        isempty(_source_captures(record)) || return part, op
+    indices = Dict(_kernel_split_placeholder(k) => k for k in eachindex(nodes))
+    changed = Ref(false)
+    function fuse(ex, operand = false)
+        if operand && ex isa Symbol && haskey(indices, ex)
+            k = indices[ex]
+            if !dataonly[k] && _cell_dotted(nodes[k].expr)
+                child = holds[k] ? native.splits[k] : native.wholes[k]
+                child isa _KernelSource && _source_native(child) === nothing &&
+                    isempty(_source_captures(child)) || return ex
+                changed[] = true
+                return fuse(holds[k] ? nodes[k].body : nodes[k].expr)
+            end
+        end
+        ex isa Expr && !(ex.head in (:quote, :inert)) || return ex
+        if _cell_dotted_call(ex)
+            return Expr(:., ex.args[1], Expr(:tuple,
+                (fuse(arg, true) for arg in ex.args[2].args)...))
+        elseif _cell_dotted(ex)
+            return Expr(:call, ex.args[1],
+                (fuse(arg, true) for arg in ex.args[2:end])...)
+        end
+        Expr(ex.head, (fuse(arg) for arg in ex.args)...)
+    end
+    body = fuse(part.body)
+    changed[] || return part, op
+    reads = Set(_kernel_free_ports(body, Set(ports)))
+    direct = Int[i for i in eachindex(ports) if ports[i] in reads]
+    spelled = _kernel_collect_symbols!(Set{Symbol}(), body)
+    kids = Int[k for k in eachindex(nodes) if _kernel_split_placeholder(k) in spelled]
+    params = vcat(ports[direct], Symbol[_kernel_split_placeholder(k) for k in kids])
+    fused = _partial_source_op(kernel_sourceop_token(op), :_broadcast, params, body,
+                               _kernel_endpoint_source_module(op);
+                               form = kernel_sourceop_form(op))
+    fused === nothing && return part, op
+    (; direct, kids, body), fused
+end
+
 # Replace recipe `r` by the recipes of its parts, appended to `recipes`, with
 # their readable recipes in `readable`. `dataonly[i]` is whether node `i`
 # reads bound data only.
@@ -414,11 +459,13 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
                              ignored === nothing ? nothing : ignored.wholes[i]),
                    r.cost, nothing, false, node.expr)
         else
+            op = operation(Symbol(:_split, i), :fused, native.splits[i],
+                           ignored === nothing ? nothing : ignored.splits[i])
+            node, op = _partial_fuse_broadcasts(node, op, native, nodes, dataonly, holds, ports)
             kids = Value[emit!(k) for k in node.kids]
             maps!(Recipe(fresh(), (Tuple(r.inputs[p] for p in node.direct)..., kids...),
                          (value,),
-                         operation(Symbol(:_split, i), :fused, native.splits[i],
-                                   ignored === nothing ? nothing : ignored.splits[i]),
+                         op,
                          r.cost, nothing, false, node.body),
                   node.direct, node.kids, Symbol(output.name, :_part, i))
         end
@@ -426,13 +473,14 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
         readable[part.id] = part
         value
     end
-    kids = Value[emit!(k) for k in split.root.kids]
-    root = Recipe(r.id, (Tuple(r.inputs[p] for p in split.root.direct)..., kids...),
+    rootop = operation(:_root, kernel_sourceop_form(r.op), native.root,
+                       ignored === nothing ? nothing : ignored.root)
+    top, rootop = _partial_fuse_broadcasts(split.root, rootop, native, nodes, dataonly, holds, ports)
+    kids = Value[emit!(k) for k in top.kids]
+    root = Recipe(r.id, (Tuple(r.inputs[p] for p in top.direct)..., kids...),
                   r.outputs,
-                  operation(:_root, kernel_sourceop_form(r.op), native.root,
-                            ignored === nothing ? nothing : ignored.root),
-                  r.cost, nothing, false, split.root.body)
-    root = maps!(root, split.root.direct, split.root.kids, Symbol(output.name, :_root))
+                  rootop, r.cost, nothing, false, top.body)
+    root = maps!(root, top.direct, top.kids, Symbol(output.name, :_root))
     push!(recipes, root)
     readable[r.id] = root
     recipes

@@ -46,8 +46,9 @@
 # `===`. The table of one shared call is a local of the native plate loop
 # (`_lower_authored_plate_loop_native!`): `nothing` before the first cell, a
 # `_SharedTable` typed by that call's keys and result from then on, gone when the
-# plate returns. It is never kept on a kernel, shared between reader copies or
-# threads, or reused by a later call, so a caller may change its data between
+# plate returns. A scheduled prefix's chunks share a synchronized table. It is
+# never kept on a kernel, shared between reader copies, or reused by a later call,
+# so a caller may change its data between
 # calls. Anywhere else (a cell kernel called on its own, the plate operation's
 # per-cell fallback) the call runs in every cell.
 #
@@ -162,6 +163,65 @@ end
 # A cell whose arguments have other types than the first keyed cell's keeps
 # its own evaluation.
 @inline _shared_table(table, ::Type, ::Type, ::Type) = nothing
+
+# A scheduled prefix shares one table across its chunks, for this call only.
+# Reserve a key under the lock, then evaluate outside it: distinct expensive
+# calls run concurrently, while equal cells wait for the same result. Failed
+# evaluations also wake every waiter before the scheduler joins the tasks.
+mutable struct _ConcurrentSharedTable
+    lock::ReentrantLock
+    table::Any
+end
+_ConcurrentSharedTable() = _ConcurrentSharedTable(ReentrantLock(), nothing)
+
+mutable struct _SharedPending{T}
+    ready::Base.Event
+    value::Union{Nothing,Some{T}}
+    error::Any
+end
+_SharedPending{T}() where {T} = _SharedPending{T}(Base.Event(), nothing, nothing)
+
+@inline function _shared_step(slot::_ConcurrentSharedTable, c::_SharedCall{V},
+                              args::Vararg{Any,N}) where {V,N}
+    (EnzymeCore.within_autodiff() || !_shared_worthwhile(Val(V), args)) &&
+        return (slot, c.f(args...))
+    objects, key = _shared_objects(args), _shared_key(Val(V), args)
+    R = _promote_op(c.f, map(typeof, args)...)
+    T = isconcretetype(R) ? R : Any
+    pending, owner = _shared_reserve!(slot, objects, key, T)
+    pending === nothing && return (slot, c.f(args...))
+    if owner
+        try
+            pending.value = Some{T}(c.f(args...))
+        catch error
+            pending.error = Some(error)
+        finally
+            notify(pending.ready)
+        end
+    else
+        wait(pending.ready)
+    end
+    pending.error === nothing || throw(something(pending.error))
+    (slot, something(pending.value)::T)
+end
+
+function _shared_reserve!(slot::_ConcurrentSharedTable, objects::O, key::K,
+                          ::Type{T}) where {O,K,T}
+    lock(slot.lock)
+    try
+        table = _shared_table(slot.table, O, K, _SharedPending{T})
+        table === nothing && return (nothing, false)
+        slot.table = table
+        owner = false
+        pending = _shared_result(table, objects, key, ()) do
+            owner = true
+            _SharedPending{T}()
+        end
+        (pending, owner)
+    finally
+        unlock(slot.lock)
+    end
+end
 
 # The parameter of a cell lowering that holds recipe `id`'s table, or `nothing`
 # when the lowering is not embedded in a plate loop that carries one.

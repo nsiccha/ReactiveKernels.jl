@@ -7,6 +7,11 @@ worker's output buffers; `workers` is an upper bound, capped by available Julia
 execution threads and chunks. Both must be positive integers. There is no
 automatic cost estimate: choose these hints for the workload you measured.
 
+For calls using several position workers, materialized data-only prefix plates
+also use the worker budget. Their cells share equal-input results within the
+call; changing data between calls recomputes the prefix. Scalar dependencies,
+reductions and scans retain their native order.
+
 Ordinary batching stays serial. The schedule applies to native primal calls;
 an owning batch retains its ordinary serial compiler path. Per-position AD uses
 the scalar kernel with `prepare_ad` and `replica`, independently of this hint.
@@ -19,6 +24,75 @@ struct NativeScheduling
         chunk_size > 0 || throw(ArgumentError("chunk_size must be positive"))
         new(Int(workers), Int(chunk_size))
     end
+end
+
+const _SCHEDULED_PREFIX_WORKERS = :ReactiveKernels_scheduled_prefix_workers
+const _SCHEDULED_PREFIX_LOWERING = :ReactiveKernels_scheduled_prefix_lowering
+
+function _scheduled_prefix(p::Plan)
+    isempty(p.want) && return nothing
+    # Rebound readers reuse this program even when their worker budget changes.
+    # The call supplies that budget; one-job calls never enter the prefix.
+    task_local_storage(_SCHEDULED_PREFIX_LOWERING, true) do
+        prepare(p)
+    end
+end
+
+# Separate generated cell code from the task launcher. The launcher's closure
+# must not be parametrized by the prefix's (potentially very large) tables.
+function _scheduled_prefix_cells(@nospecialize(f), @nospecialize(args), domain)
+    workers = get(task_local_storage(), _SCHEDULED_PREFIX_WORKERS, 1)::Int
+    count = length(domain)
+    jobs = min(workers, count)
+    jobs == 0 && return nothing
+    jobs == 1 && return f(args..., domain, 1:count)
+    captured = Ref{Any}((f, args, domain))
+    @sync for worker in 1:jobs
+        range = fld((worker - 1) * count, jobs) + 1:fld(worker * count, jobs)
+        Threads.@spawn _scheduled_prefix_range(captured[], range)
+    end
+    nothing
+end
+
+function _scheduled_prefix_range(captured, range)
+    f, args, domain = captured
+    f(args..., domain, range)
+    nothing
+end
+
+# Extract the native loop, retaining its hoisted values and operation tables.
+# Each chunk owns its coordinate cache; cells write disjoint output indices.
+function _scheduled_prefix_loop!(runtime_ops, runtime_recipes, body, invariants,
+        declarations, loopbody, callargs, index, previous, first_coordinate,
+        shares, output_axes)
+    domain, range, linear = gensym(:domain), gensym(:range), gensym(:linear)
+    chunk = Expr(:block, :($previous = nothing), :($first_coordinate = true),
+        declarations...,
+        Expr(:for, Expr(:(=), linear, range),
+            Expr(:block, :($index = $domain[$linear]), loopbody.args...)),
+        :(return nothing))
+    bound = _local_symbols!(Set{Symbol}(), body)
+    _local_symbols!(bound, invariants)
+    foreach(arg -> _source_symbols!(bound, arg), callargs)
+    union!(bound, (_CONSTANTS_ARG, _CALLABLES_ARG))
+    used = _source_symbols!(Set{Symbol}(), chunk)
+    assigned = _local_symbols!(Set{Symbol}(), chunk)
+    captures = sort!(collect(union(intersect(setdiff(used, assigned), bound),
+                                    intersect(used, Set(values(shares))))); by=string)
+    ast = Expr(:function, Expr(:tuple, captures..., domain, range), chunk)
+    native = compile(ast)
+    push!(runtime_ops, native)
+    # This is executable table metadata, not an added graph recipe.
+    push!(runtime_recipes, Recipe(0, (), (), native, 0.0, nothing, false))
+    # Spell the table's reads explicitly so _native_table can still discard
+    # unused prepared plate/scan operations in the surrounding kernel.
+    reads = _callable_reads(chunk)
+    arguments = Any[name === _CALLABLES_ARG && reads !== nothing ?
+        Expr(:tuple, (i in reads ? Expr(:ref, _CALLABLES_ARG, i) : nothing
+                       for i in 1:maximum(reads; init=0))...) : name for name in captures]
+    Expr(:call, GlobalRef(@__MODULE__, :_scheduled_prefix_cells),
+        Expr(:ref, _CALLABLES_ARG, length(runtime_ops)), Expr(:tuple, arguments...),
+        Expr(:call, GlobalRef(Base, :CartesianIndices), output_axes))
 end
 
 # This read-only wrapper preserves the dense parent's native lane projection:
@@ -97,7 +171,7 @@ function _position_schedule(@nospecialize(kernel::GraphReplicatedKernel),
     batched = batched_ports(kernel)
     analysis = _replicated_dependency_analysis(kernel.plan, batched)
     parts = _replicated_parts(kernel.plan, analysis)
-    prefix = isempty(parts.prefix.want) ? nothing : prepare(parts.prefix)
+    prefix = _scheduled_prefix(parts.prefix)
     residual = _scheduled_residual(parts.residual, batched)
     graph = kernel.plan.graph
     input_ids = [canon_id(graph, value.id) for value in inputs(kernel)]
@@ -147,7 +221,9 @@ end
 
 function _scheduled_shared(k::_ScheduledBatchedKernel{R,S,B,BT,PS}, args) where {R,S,B,BT,PS}
     k.prefix === nothing && return ()
-    result = k.prefix(ntuple(i -> getfield(args, PS[i]), length(PS))...)
+    result = task_local_storage(_SCHEDULED_PREFIX_WORKERS, length(k.workers)) do
+        k.prefix(ntuple(i -> getfield(args, PS[i]), length(PS))...)
+    end
     length(outputs(k.prefix)) == 1 ? (result,) : result
 end
 

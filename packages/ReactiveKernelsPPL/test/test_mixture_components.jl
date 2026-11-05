@@ -34,10 +34,11 @@ struct CountedLaw end
 end
 ReactiveKernelsPPL.sampling_distribution_graph(::Type{CountedLaw}, args::Tuple) = counted_score
 
+observations(n) = (; x = [0.2sin(i) for i in 1:n], y = [0.4cos(i) for i in 1:n])
+
 function fixture(n; kind=:builtin, shared=false, weights=[0.8,0.2], scale=0.7,
         rowweights=false, sharedweights=:none)
-    x = [0.2sin(i) for i in 1:n]
-    y = [0.4cos(i) for i in 1:n]
+    (; x, y) = observations(n)
     data = rowweights || sharedweights === :parameter ? (;x,y,scale) : (;x,y,scale,weights)
     weight_expression = rowweights ?
         :(vcat.(1 .- logistic.(b .+ x), logistic.(b .+ x))) :
@@ -130,6 +131,19 @@ function check(fx; reverse=false)
     end
     @test (fx.data,fx.u) == saved
     fx
+end
+
+@testset "heterogeneous mixtures reuse a graph across empty observation domains" begin
+    for kind in (:builtin, :student, :custom, :keyword), shared in (false, true)
+        for initial in (0, 3)
+            original = fixture(initial; kind, shared)
+            for n in (0, 1, 7)
+                changed = merge(original.data, observations(n))
+                rebound = bind_data(original.plan, changed)
+                check(merge(original, (; data = changed, bound = rebound)); reverse = true)
+            end
+        end
+    end
 end
 
 @testset "native heterogeneous component graphs" begin

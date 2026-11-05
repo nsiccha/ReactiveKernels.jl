@@ -463,6 +463,12 @@ values = reader(positions, 0.5)
 `workers` is an upper bound capped by available Julia execution threads and
 runtime chunks. `chunk_size` is required and positive: it bounds the positions
 stored in each worker's stacked buffers. Shared-only work runs once per call.
+For calls using several workers, materialized data-only prefix plates split
+their cells into runtime ranges within the same worker budget. Equal-input
+cells share one evaluation, including across ranges; distinct cells can run
+concurrently. The tables live for this call only, so changing data in place
+between calls recomputes the prefix. Scalar dependencies, reductions and scans
+keep their native order. Prefix tasks join before position workers start.
 Workers process bounded chunks, copy them into disjoint positions of the final
 result, and join before returning, including when a task fails. Every
 worker's first chunk starts at once, and the first worker's chunk fixes the

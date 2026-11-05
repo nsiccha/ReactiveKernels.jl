@@ -23,6 +23,14 @@ end
     total::Float64 = sum(y .* q) - counted_sum(y)
 end
 
+# Keep a data-only dotted term cached while fusing the live dotted residual.
+@kernel dotted_residual(q, t, dose) = begin
+    cells = plate(eachindex(t)) do i
+        dose[i] .* exp.(-exp(q[1]) .* t[i]) .+ counted_term.(t[i])
+    end
+    total = sum(sum, cells)
+end
+
 # A data-only subexpression inside a cell recipe that also reads a live value.
 @kernel mixed(q, y) = begin
     pointwise = plate(y, q) do d, parameter
