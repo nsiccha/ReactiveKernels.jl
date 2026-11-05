@@ -353,4 +353,59 @@ end
     @test structures[1] == structures[2]
     @test all(e.status !== :whole for e in partition_locality(k))
 end
+
+@kernel absent_scalar(u::AbstractVector{Float64}, y::AbstractVector{Float64},
+                      extra::AbstractVector{Float64}, key::AbstractVector{Int},
+                      extra_key::AbstractVector{Int}, anchor::Int) = begin
+    m = log.(u)
+    one = exp(m[anchor]) + m[anchor]
+    a = plate(extra, one) do yi, mu
+        -(yi - mu)^2 / 2
+    end
+    b = plate(y, m) do yi, mu
+        -(yi - mu)^2 / 2
+    end
+end
+
+@testset "empty observation portions do not demand scalar dependencies" begin
+    spec = plate_partition(absent_scalar, (:a, :b);
+        by = (a = :extra_key, b = :key), locality = :error)
+    structures = Int[]
+    for n in (3, 300)
+        bound = (; y = fill(0.1, n), extra = [0.4], key = collect(1:n),
+            extra_key = [1], anchor = 1)
+        q = prepare(spec; want = :partition_total, bound)
+        push!(structures, astsize(code_expr(q)))
+        u = fill(1.2, n)
+        for label in (1, 2, n)
+            expected = -(log(u[label]) - 0.1)^2 / 2
+            label == 1 && (expected -= (u[1] + log(u[1]) - 0.4)^2 / 2)
+            @test q(u, label) ≈ expected
+            @test partition_footprint(q, u, label).u == [label]
+        end
+        # An absent factor must skip arithmetic that would fail if evaluated.
+        u[1] = -1.0
+        @test q(u, 2) ≈ -(log(u[2]) - 0.1)^2 / 2
+        @test_throws DomainError q(u, 1)
+        # Selecting one total retains the label universe of both observations.
+        # The remaining partition can therefore still have an empty portion.
+        extra_total = only(v for v in values(spec.graph.values) if v.name === :_partition_a)
+        partial = prepare(spec.graph;
+            have = Tuple(spec[name] for name in (:u, :y, :extra, :key, :extra_key, :anchor, :partition)),
+            want = extra_total, bound = [spec[name] => getproperty(bound, name) for name in keys(bound)])
+        @test partial(u, 2) == 0.0
+        @test isempty(partition_footprint(partial, u, 2).u)
+        @test_throws DomainError partial(u, 1)
+        # The same applies to an invalid scalar index, not just arithmetic.
+        invalid = prepare(spec; want = :partition_total,
+            bound = merge(bound, (; anchor = n + 1)))
+        @test invalid(u, 2) ≈ -(log(u[2]) - 0.1)^2 / 2
+        @test_throws BoundsError invalid(abs.(u), 1)
+        # A scalar requested as an output is still evaluated as a scalar.
+        both = prepare(spec; want = (:partition_total, :one), bound)
+        @test_throws DomainError both(u, 2)
+        @test both(abs.(u), 2)[2] isa Float64
+    end
+    @test structures[1] == structures[2]
+end
 end
