@@ -3725,7 +3725,8 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
     shares = Pair{Int,Symbol}[r.id => gensym(:shared_call_table)
                               for r in scalar.recipes if r.op isa _SharedCall]
     ast, constants, callables, recipes = _lower_with_ops(scalar; type_hints, recycle,
-                                                         cell_slots, cell_tables, shares)
+        cell_slots, cell_tables, shares,
+        cell_have_types = _nested_cell_have_types(kernel.plan, scalar, atomic, callvalues))
     cell_tables === nothing || append!(cell_slots, cell_tables)
     offset = length(runtime_ops)
     append!(runtime_ops, _table_ops(constants, callables, recipes))
@@ -3737,6 +3738,28 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
        tables = cell_tables === nothing ? Symbol[] : cell_tables,
        invariants = hoisted === nothing ? Int[] : hoisted.moved,
        input_types = Any[types[cid] for cid in hint_ids])
+end
+
+# The type of the value one cell of a plate receives for an operand declared
+# `T`: the whole operand when it is atomic or a number, and otherwise one
+# element of it (`Base.Broadcast._broadcast_getindex` reads an array's
+# `eltype`). Anything else stays unknown.
+Base.@nospecializeinfer _plate_cell_value_type(@nospecialize(T), atomic::Bool) =
+    atomic || T <: Number ? T : T <: AbstractArray ? eltype(T) : Any
+
+# The types the cell ports of `inner` (a plate's cell plan) receive from the
+# plate's call values, keyed by their identities in the cell's scalar plan.
+# The ports themselves are declared untyped; a plate nested in the cell reads
+# these to tell a number shared by all of its cells (a branch condition it
+# decides once per call, `_plate_shared_branch`) from a per-cell array.
+Base.@nospecializeinfer function _nested_cell_have_types(
+        inner::Plan, scalar::Plan, @nospecialize(atomic), @nospecialize(callvalues))
+    types = Dict{ValueId,Any}()
+    for (position, v) in enumerate(inner.have)
+        T = _plate_cell_value_type(valtype(callvalues[position]), position in atomic)
+        T === Any || (types[canon_id(scalar.graph, v.id)] = T)
+    end
+    types
 end
 
 # Each authored plate carries a generated kernel type. The lowering itself is
@@ -4746,8 +4769,12 @@ end
 # example), and a plate must classify them as shared without asserting a
 # particular numeric type or changing the authored assignment. An opt-in
 # exemplar also proves array rank from the parent DAG. This reads types only;
-# no recipe or sample value is evaluated to obtain evidence.
-function _plate_inferred_input_types(p::Plan; exemplar_types = nothing)
+# no recipe or sample value is evaluated to obtain evidence. `have_types`
+# narrows the types of HAVE ports by value identity: a nested cell's ports are
+# declared untyped, but the enclosing plate's operand types say what each cell
+# receives (`_nested_cell_have_types`).
+function _plate_inferred_input_types(p::Plan; exemplar_types = nothing,
+                                     have_types = nothing)
     g = p.graph
     target = Set(canon_id(g, v.id) for r in p.recipes
         if r.op isa _AuthoredPlateOp &&
@@ -4764,8 +4791,10 @@ function _plate_inferred_input_types(p::Plan; exemplar_types = nothing)
         push!(needed, recipe.id)
         union!(target, (canon_id(g, v.id) for v in recipe.inputs))
     end
+    have_type(v) = have_types === nothing ? valtype(v) :
+        get(have_types, canon_id(g, v.id), valtype(v))
     types = Dict{ValueId,Any}(canon_id(g, v.id) =>
-        (exemplar_types === nothing ? valtype(v) : exemplar_types[i])
+        (exemplar_types === nothing ? have_type(v) : exemplar_types[i])
         for (i, v) in enumerate(p.have))
     for recipe in p.recipes
         recipe.id in needed || continue
@@ -4908,14 +4937,15 @@ function _lower_with_ops_collecting(p::Plan;
                          footprint_selection = nothing,
                          partition_plan::Bool = false,
                          inline_sources::Bool = _inline_sources_enabled(),
-                         shares::Vector{Pair{Int,Symbol}} = Pair{Int,Symbol}[])
+                         shares::Vector{Pair{Int,Symbol}} = Pair{Int,Symbol}[],
+                         cell_have_types = nothing)
     # The footprint variant (`partition_footprint`, plate_partition.jl): the
     # body records every read of a HAVE port and returns them instead of the
     # wanted values.
     footprint && return task_local_storage(_FOOTPRINT, _FootprintRecords(footprint_selection)) do
         _lower_with_ops_collecting(p; inline_embedded, declare, recycle, pushdowns, outline,
                                    plate_element_types, type_hints, exemplar_types, inline_sources,
-                                   shares)
+                                   shares, cell_have_types)
     end
     # Only the lowering the footprint was asked for records reads and returns
     # them: a lowering nested in it (a plate body, an embedded kernel) runs
@@ -4925,7 +4955,7 @@ function _lower_with_ops_collecting(p::Plan;
         recording.active && return task_local_storage(_FOOTPRINT, nothing) do
             _lower_with_ops_collecting(p; inline_embedded, declare, recycle, pushdowns, outline,
                                        plate_element_types, type_hints, exemplar_types, inline_sources,
-                                       shares)
+                                       shares, cell_have_types)
         end
         recording.active = true
     end
@@ -5035,12 +5065,17 @@ function _lower_with_ops_collecting(p::Plan;
         if inline_embedded && r.op isa _AuthoredPlateOp
             callvalues = r.inputs
             # Shared-branch arm slots use source-inferred scalar inputs;
-            # exemplars add rank evidence only.
+            # exemplars add rank evidence only. A nested cell's lowering
+            # (`type_hints`) infers them from the enclosing plate's operand
+            # types (`cell_have_types`), so a branch condition reading a
+            # number the cell received is decided once per nested call.
             branch = any(q -> _plate_branch_operation(q.op),
                          r.op.kernel.plan.recipes)
-            if type_hints === nothing && (exemplar_types !== nothing || branch)
+            if (type_hints === nothing || cell_have_types !== nothing) &&
+                    (exemplar_types !== nothing || branch)
                 inferred_plate_types === nothing &&
-                    (inferred_plate_types = _plate_inferred_input_types(p))
+                    (inferred_plate_types = _plate_inferred_input_types(p;
+                        have_types = cell_have_types))
                 if exemplar_types !== nothing
                     inferred_exemplar_types === nothing &&
                         (inferred_exemplar_types =
