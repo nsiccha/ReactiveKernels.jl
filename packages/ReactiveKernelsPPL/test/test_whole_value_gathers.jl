@@ -140,6 +140,9 @@ end
 
 _wvg_derived(fx) = Set(d.name for d in fx.bound.derived)
 
+# Elementwise agreement far below the oracle's 1e-5 and far above rounding.
+_wvg_same_to_rounding(a, b) = all(isapprox.(a, b; rtol = 1e-10))
+
 @testset "whole-value gathers: naming a gather keeps its shape" begin
     @testset "multi-membership over a submodel value, $axis" for axis in
             (:observations, :groups)
@@ -268,7 +271,15 @@ end
             r = Dict(s => Base.invokelatest(_wvg_native, fx, u, Val(:field))
                 for (s, fx) in fxs)
             @test r[:model_scope].value == r[:in_cell].value == r[:renamed].value
-            @test r[:model_scope].grad == r[:in_cell].grad == r[:renamed].grad
+            # `renamed` lowers to the same program as `model_scope`, so its
+            # gradient is the same to the bit. The in-cell `vcat` stays under
+            # the plate's non-empty guard instead, a different program: its
+            # primal does the same arithmetic (equal values above), but the
+            # reverse pass sums the observation scale's adjoint over its reads
+            # in an order the compiled program chooses, so the gradients agree
+            # to rounding (1-2 ulp on hosted Julia 1.10.13, run 42106406451).
+            @test r[:model_scope].grad == r[:renamed].grad
+            @test _wvg_same_to_rounding(r[:model_scope].grad, r[:in_cell].grad)
         end
         @test data == before
         # The group plate stays one retained plate as groups grow.

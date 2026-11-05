@@ -16,14 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.101
+## 0.1.102
 
 - Partition sampler gradients with `shared=false` differentiate a compact
   conditional program over local coordinates. They reuse shared prefix values
   without allocating cotangents for that frontier, and mixed shared/local
   parameter reads materialize only the selected rows. Full gradients retain
   the shared-prefix pullback; compact and dense destinations keep their existing
-  values and coordinate order. Requires ReactiveKernels 0.1.87.
+  values and coordinate order. Requires ReactiveKernels 0.1.89.
 - Shared-prefix active storage and cache invalidation follow the coordinates
   actually read by that prefix. Shared parameters read only at selected rows
   remain in the compact residual instead of creating whole-panel cotangents.
@@ -31,6 +31,18 @@ are recorded in the git history only.
   observation partition, avoiding a shadow of the full packed point.
   Conditional row reads gather their base rows before mixing them with active
   coordinates, so the mixed call retains only those rows in either AD direction.
+
+## 0.1.101
+
+- Add `prepare_discrete_latents(built, plan)`, `discrete_latent_draws` and
+  `discrete_latents_node`: the posteriors of the discrete latents a program
+  sums out, at given parameters, and exact draws from them. A whole-event
+  hidden Markov observation (`y ~ LogDensity(normal_hmm_logdensity, …)` and
+  the other RK hidden Markov laws, observed or conditioned) gives its state
+  path's posterior; a plain `MixtureModel` response gives each observation's
+  component probabilities. The graph computes the posteriors; drawing happens
+  in plain Julia at the query boundary. Other summed-out latents are refused,
+  naming them. Requires ReactiveKernelsDistributionKernels 0.1.4.
 
 ## 0.1.100
 

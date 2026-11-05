@@ -161,9 +161,10 @@ end
         args = ((; xs = [1.0, 2.0, 3.0], tag = 1), 2.0)
         exemplar = prepare_nonallocating(FIELD_SCALE, args...; want = :ys)
         untyped = prepare_nonallocating(FIELD_SCALE; want = :ys)
+        # After the constants, callables and caches tables and the cache driver.
         signature = code_expr(exemplar).args[1].args
-        @test signature[4] == Expr(:(::), :sched, typeof(args[1]))
-        @test signature[5] == Expr(:(::), :factor, Float64)
+        @test signature[5] == Expr(:(::), :sched, typeof(args[1]))
+        @test signature[6] == Expr(:(::), :factor, Float64)
         @test exemplar(args...) == prepare(FIELD_SCALE; want = :ys)(args...)
         @test exemplar((; xs = [4.0, 5.0], tag = 3), 0.5) == [2.0, 2.5]
         @test ownership_allocations(exemplar, args) == 0
