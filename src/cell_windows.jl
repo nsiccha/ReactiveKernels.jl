@@ -2849,6 +2849,77 @@ function _cell_outlined_pushdowns(p::Plan; argument_types = nothing)
     end
 end
 
+# Whole work used exclusively by one partition sum can execute in that sum's
+# nonempty-row scope. Row pushdowns already avoid unused rows, but an atomic
+# operand (for example the right factor of a matrix product) has no row domain
+# of its own. Its entire pure dependency chain belongs to its sole consumer.
+# Keep shared producers, query outputs, row-index dependencies and effects in
+# the enclosing plan. Cells sharing a window emitter are also left together.
+function _cell_partition_sum_type(p, cells, r)
+    inputs = Any[get(cells.types, canon_id(p.graph, v.id), valtype(v))
+                 for v in r.inputs[2:end]]
+    T = _checked_plate_element!(_UninferredValue[], r.op.plate, inputs, Symbol[])
+    T isa Type && T <: Number && isconcretetype(T) &&
+        Base.promote_op(+, T, T) === T ? T : Any
+end
+
+function _cell_partition_regions(p::Plan, cells, groups)
+    cells === nothing && return Dict{Int,Int}()
+    cid(v) = canon_id(p.graph, v.id)
+    boundary = Set(cid(v) for v in (p.have..., p.want...))
+    readers = Dict{ValueId,Vector{Int}}()
+    for r in p.recipes, v in r.inputs
+        push!(get!(readers, cid(v), Int[]), r.id)
+    end
+    # A region's guard must be available before any of its work is evaluated.
+    indices = Set(cid(first(r.inputs)) for r in p.recipes
+                  if r.op isa _AuthoredPlateCellOp)
+    for r in reverse(p.recipes)
+        any(v -> cid(v) in indices, r.outputs) || continue
+        union!(indices, (cid(v) for v in r.inputs))
+    end
+    regions = Dict{Int,Int}()
+    for r in reverse(p.recipes)
+        if r.op isa _AuthoredPlateCellOp
+            r.op.rows && !haskey(groups, r.id) || continue
+            T = length(r.outputs) == 1 ? _cell_partition_sum_type(p, cells, r) : Any
+            T <: Number && isconcretetype(T) && (regions[r.id] = r.id)
+            continue
+        end
+        (r.effectful || r.op isa _BoundConstant ||
+         any(v -> cid(v) in boundary || cid(v) in indices, r.outputs)) && continue
+        uses = unique(get(regions, reader, 0) for v in r.outputs
+                      for reader in get(readers, cid(v), Int[]))
+        length(uses) == 1 && only(uses) != 0 && (regions[r.id] = only(uses))
+    end
+    # Do not add guards where row demand already accounts for all numerical
+    # work. In particular a source view is only metadata, not a whole read.
+    views = _cell_input_views(p; types = cells.types)
+    needed = Set{Int}()
+    for r in p.recipes
+        owner = get(regions, r.id, 0)
+        owner == 0 && continue
+        r.id in cells.recipes && continue
+        r.op isa _AuthoredPlateCellOp && continue
+        any(v -> !(cid(v) in views) && get(cells.types, cid(v), Any) <: AbstractArray,
+            r.outputs) && push!(needed, owner)
+    end
+    filter!(pair -> last(pair) in needed, regions)
+    # Deferring a potentially throwing pure calculation past an effect would
+    # change their observable order on a populated partition.
+    starts = Dict{Int,Int}()
+    effects = 0
+    for r in p.recipes
+        effects += r.effectful
+        owner = get(regions, r.id, 0)
+        owner == 0 && continue
+        first_effects = get!(starts, owner, effects)
+        r.id == owner && effects != first_effects && delete!(needed, owner)
+    end
+    filter!(pair -> last(pair) in needed, regions)
+    regions
+end
+
 # ---------------------------------------------------------------- emission
 
 # Emits, into `body`, the rows of pushed values one cell reads. Each pushed

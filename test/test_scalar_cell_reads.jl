@@ -367,6 +367,66 @@ end
     end
 end
 
+@kernel absent_factor(u::AbstractVector{Float64}, Z::AbstractMatrix{Float64},
+                      L::AbstractMatrix{Float64}, rows::AbstractVector{Int},
+                      y::AbstractVector{Float64}, extra::AbstractVector{Float64},
+                      key::AbstractVector{Int}, extra_key::AbstractVector{Int}) = begin
+    raw = u[3:4]
+    scale = log.(raw)
+    F = scale .* L
+    R = Z * F'
+    mu = R[rows, 1] .+ R[rows, 2]
+    a = plate(extra, mu) do yi, m
+        -(yi - m)^2 / 2
+    end
+    b = plate(y, u[1:2]) do yi, m
+        -(yi - m)^2 / 2
+    end
+end
+
+@testset "empty observation portions skip exclusive whole factors" begin
+    spec = plate_partition(absent_factor, (:a, :b);
+        by = (a = :extra_key, b = :key), locality = :error)
+    structures = Int[]
+    for n in (2, 200)
+        bound = (; Z = [0.2 -0.1; 0.4 0.3], L = [1.0 0.0; 0.3 0.8],
+            rows = repeat([1, 2], n ÷ 2), y = [0.1, 0.2],
+            extra = fill(0.3, n), key = [1, 2], extra_key = fill(1, n))
+        q = prepare(spec; want = :partition_total, bound)
+        push!(structures, astsize(code_expr(q)))
+        u = [0.2, -0.1, 1.2, 1.4]
+        original = copy(u)
+        for label in (1, 2)
+            R = bound.Z * (log.(u[3:4]) .* bound.L)'
+            mu = R[bound.rows, 1] .+ R[bound.rows, 2]
+            expected = -(u[label] - bound.y[label])^2 / 2
+            label == 1 && (expected -= sum(abs2, mu .- bound.extra) / 2)
+            @test q(u, label) ≈ expected
+            @test partition_footprint(q, u, label).u == (label == 1 ? [1, 3, 4] : [2])
+            ad = prepare_ad(q, AutoEnzyme(; mode = Enzyme.Reverse), u, label; active = :u)
+            value, gradient = ad_value_and_gradient(ad, u, label)
+            @test value ≈ expected
+            for j in eachindex(u)
+                plus, minus = copy(u), copy(u)
+                plus[j] += 1e-6
+                minus[j] -= 1e-6
+                @test gradient[j] ≈ (q(plus, label) - q(minus, label)) / 2e-6 atol=2e-8 rtol=2e-6
+            end
+        end
+        @test u == original
+        u[3] = -1.0
+        @test q(u, 2) ≈ -(u[2] - bound.y[2])^2 / 2
+        ad = prepare_ad(q, AutoEnzyme(; mode = Enzyme.Reverse), u, 2; active = :u)
+        value, gradient = ad_value_and_gradient(ad, u, 2)
+        @test value ≈ q(u, 2)
+        @test gradient ≈ [0.0, bound.y[2] - u[2], 0.0, 0.0]
+        @test_throws DomainError q(u, 1)
+        whole = prepare(spec; want = (:partition_total, :F), bound)
+        @test_throws DomainError whole(u, 2)
+    end
+    @test structures[1] == structures[2]
+end
+
 @testset "empty observation portions do not demand scalar dependencies" begin
     spec = plate_partition(absent_scalar, (:a, :b);
         by = (a = :extra_key, b = :key), locality = :error)
