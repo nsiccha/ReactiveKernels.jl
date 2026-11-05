@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.99
+
+- Submodel tuple and named-tuple returns preserve whole vector fields,
+  including unread returns and fields whose labels match caller bindings.
+  A returned field shared between a bare likelihood argument and arithmetic
+  keeps its value in either response order. This restores the documented
+  Julia return-value semantics without changing the local-first meaning of
+  `call.local` or explicit return-property reads with `getproperty`.
+
 ## 0.1.98
 
 - SMC checkpoint and carried-coordinate identities normalize caller-owned
