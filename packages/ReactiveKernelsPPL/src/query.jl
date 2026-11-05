@@ -928,6 +928,28 @@ end
 # analysis, `reactivekernels-use` §4i).
 ReactiveKernels._cell_lazy_view(::typeof(_compact_cell_point)) = true
 
+# A conditional partition may read shared base coordinates beside its local
+# active coordinates. Its row form materializes only the requested rows, so
+# downstream reshapes and row reads do not retain the full packed base.
+@inline _local_cell_point(base, active, slots) = _CompactCellPoint(base, active, slots)
+ReactiveKernels._cell_lazy_view(::typeof(_local_cell_point)) = true
+function ReactiveKernels._cell_lazy_rows(::typeof(_local_cell_point), inputs, rows, bind,
+                                         constant)
+    constant(inputs[3]) || return nothing
+    slots = bind(:cell_positions, Expr(:ref, inputs[3], rows))
+    Expr(:call, GlobalRef(@__MODULE__, :_local_cell_rows), inputs[1], inputs[2], slots, rows)
+end
+@inline function _local_cell_rows(base, active, slots::AbstractVector, rows::AbstractVector)
+    result = Vector{Float64}(undef, length(rows))
+    for i in eachindex(rows, slots)
+        slot = slots[i]
+        result[i] = iszero(slot) ? base[rows[i]] : active[slot]
+    end
+    result
+end
+@inline _local_cell_rows(base, active, slot::Integer, row::Integer) =
+    [iszero(slot) ? base[row] : active[slot]]
+
 # The slot map of a selection over `total` packed coordinates.
 function _compact_cell_slots(total::Int, indices)
     slots = zeros(Int32, total)
@@ -1850,7 +1872,8 @@ The cache belongs to this sampler; changes are compared by value, including
 in-place edits to `u`. Full gradients propagate cotangents through the prefix
 with the chosen backend. That pullback may recompute its forward work; no
 backend tape reuse is assumed. `shared = false` on the gradient call requests
-only local derivatives and skips that pullback.
+only local derivatives. It differentiates a separate compact conditional
+program, avoiding cotangents for the cached shared frontier and its pullback.
 """
 function prepare_partition_sampler(built, plan::StructuralPlan, observations,
         u0::AbstractVector{<:Real}; by, backend, compact::Bool = true, partitioned = (),
@@ -1981,7 +2004,8 @@ With `shared = false`, return only the derivatives of the coordinates named
 by `partitioned` at preparation. A compact destination follows
 `partition_footprint(s, label; shared = false)`; a dense destination retains
 the full packed length, with every shared-coordinate entry zero. The value
-is unchanged. This skips the shared prefix's pullback while reusing its value.
+is unchanged. This reuses the shared prefix's value and differentiates only
+local coordinates, without allocating derivatives for its cached frontier.
 """
 function partition_value_and_gradient!(s::PartitionSampler, g::AbstractVector,
                                        u::Vector{Float64}, label; shared::Bool = true)
@@ -2026,16 +2050,15 @@ partition_value_and_gradient!(s::PartitionSampler, g::AbstractVector, u::Abstrac
     partition_value_and_gradient!(s, g, Vector{Float64}(u), label; shared)
 
 # Pad each exact footprint to one AD input width across all labels.
-function _partition_selections(footprints)
+function _partition_selections(footprints; padding=Iterators.countfrom(1))
     width = maximum(length, values(footprints))
     selections = Dict{Any,Vector{Int}}()
     for (label, footprint) in footprints
         selection = copy(footprint)
         inside = Set(footprint)
-        position = 1
-        while length(selection) < width
+        for position in padding
+            length(selection) == width && break
             position in inside || push!(selection, position)
-            position += 1
         end
         selections[label] = sort!(selection)
     end
@@ -2044,7 +2067,7 @@ end
 
 # The existing compact overlay, applied to an exact selected Plan. Replanning
 # from its original graph could recover the shared producers just cut out.
-function _compact_partition_plan(p::ReactiveKernels.Plan)
+function _compact_partition_plan(p::ReactiveKernels.Plan; whole_footprint::Bool=true)
     old = p.graph
     graph = Graph(copy(old.values), copy(old.recipes),
         Dict(id => copy(ids) for (id, ids) in old.producers), copy(old.aliases), old.version, nothing)
@@ -2055,7 +2078,8 @@ function _compact_partition_plan(p::ReactiveKernels.Plan)
         value!(graph, name, type)
     end
     packed = only(v for v in p.have if v.name === :unconstrained)
-    recipe = ReactiveKernels._add_recipe!(graph, overlay, (packed,), _compact_cell_point,
+    point = whole_footprint ? _compact_cell_point : _local_cell_point
+    recipe = ReactiveKernels._add_recipe!(graph, overlay, (packed,), point,
         1.0, nothing, false, ReactiveKernels._NO_KERNEL_SOURCE)
     recipes = ReactiveKernels.Recipe[recipe]
     for r in p.recipes
@@ -2074,13 +2098,24 @@ function _compact_partition_plan(p::ReactiveKernels.Plan)
         ReactiveKernels.Value[overlay..., filter(!=(packed), p.have)...], p.want, recipes)
 end
 
-mutable struct _PartitionPrefix{K,A,V}
+struct _PartitionLocal{A,T}
+    ad::A
+    selections::Dict{Any,Vector{Int}}
+    selected::Vector{Int}
+    slots::Vector{Int32}
+    active::Vector{Float64}
+    gradient::Vector{Float64}
+    plans::Dict{Any,T}
+end
+
+mutable struct _PartitionPrefix{K,A,V,L}
     const kernel::K
     const ad::A
     const positions::Vector{Int}
     const point::Vector{Float64}
     const slots::Vector{Int32}
     values::V
+    const local_state::L
     valid::Bool
 end
 
@@ -2104,7 +2139,42 @@ function _prepare_value_prefix(parts, layout, coordinate_labels, exemplar, on_er
         exemplars = (exemplar, shared_point, shared_slots), on_error)
     cached = map(_partition_cache_value, _partition_frontier_values(prefix,
         Base.invokelatest(prefix, exemplar, shared_point, shared_slots)))
-    _PartitionPrefix(prefix, nothing, shared_positions, shared_point, shared_slots, cached, true)
+    _PartitionPrefix(prefix, nothing, shared_positions, shared_point, shared_slots, cached, nothing, true)
+end
+
+function _prepare_partition_local(parts, layout, labels, exemplar, footprints,
+        coordinate_labels, cached, backend, on_error)
+    # Padding must remain local too: the prefix is constant only with respect
+    # to local coordinates, including unused slots in a shorter partition.
+    selections = _partition_selections(footprints;
+        padding=findall(label -> !ismissing(label), coordinate_labels))
+    selected = copy(selections[first(labels)])
+    slots = _compact_cell_slots(layout.total, selected)
+    active = exemplar[selected]
+    args = (exemplar, active, slots, first(labels), nothing, cached...)
+    # Use the same conditional graph as compact cell AD. The shared splitter
+    # proved independence from every local coordinate, and the selection
+    # above contains only those coordinates. Full derivatives retain the
+    # original residual graph and propagate all frontier cotangents.
+    # The conditional overlay's planned rows retain the base/active choice
+    # for a mixed parameter block, in compact storage owned by this call.
+    plan = _conditional_cell_plan(_compact_partition_plan(parts.residual; whole_footprint=false))
+    kernel = Base.invokelatest(prepare, plan; exemplars=args, on_error)
+    planner = Base.invokelatest(ReactiveKernels.partition_plan_kernel, kernel)
+    plans, _ = _partition_plans_each(labels) do label
+        selection = selections[label]
+        Base.invokelatest(planner, exemplar, exemplar[selection],
+            _compact_cell_slots(layout.total, selection), label, nothing, cached...)
+    end
+    ad = _partition_prepare_ad(labels) do label
+        selection = selections[label]
+        label_args = (exemplar, exemplar[selection],
+            _compact_cell_slots(layout.total, selection), label, plans[label], cached...)
+        label_kernel = typeof(label) === typeof(first(labels)) ? kernel :
+            Base.invokelatest(prepare, plan; exemplars=label_args, on_error)
+        Base.invokelatest(prepare_ad, label_kernel, backend, label_args...; active=:_ppl_cell_active)
+    end
+    _PartitionLocal(ad, selections, selected, slots, active, zeros(length(active)), plans)
 end
 
 function _prepare_shared_partition_sampler(kernel, parts, layout, names, by, labels,
@@ -2114,8 +2184,6 @@ function _prepare_shared_partition_sampler(kernel, parts, layout, names, by, lab
     seed = _partition_frontier_seed(map(_partition_seed, cached))
     prefix_ad = Base.invokelatest(prepare_ad_pullback, initial.kernel, backend, seed,
         exemplar, initial.point, initial.slots; active = :_ppl_cell_active)
-    cache = _PartitionPrefix(initial.kernel, prefix_ad, initial.positions, initial.point,
-        initial.slots, cached, true)
 
     selections = compact ? _partition_selections(footprints) : Dict{Any,Vector{Int}}()
     selected = compact ? copy(selections[first(labels)]) : Int[]
@@ -2144,6 +2212,10 @@ function _prepare_shared_partition_sampler(kernel, parts, layout, names, by, lab
             Base.invokelatest(prepare, residual_plan; exemplars = label_args, on_error)
         Base.invokelatest(prepare_ad, label_kernel, backend, label_args...; active = selector)
     end
+    local_state = _prepare_partition_local(parts, layout, labels, exemplar,
+        local_footprints, coordinate_labels, cached, backend, on_error)
+    cache = _PartitionPrefix(initial.kernel, prefix_ad, initial.positions, initial.point,
+        initial.slots, cached, local_state, true)
     PartitionSampler(kernel, ad, layout, names, by, labels, exemplar, footprints,
         local_footprints, selections, selected, slots, active, zeros(length(active)), plans, cache, NaN)
 end
@@ -2168,6 +2240,7 @@ end
 function _shared_partition_gradient!(s::PartitionSampler, g, u, label, shared)
     cache = s.prefix
     cached = _refresh_partition_prefix!(cache, u)
+    shared || return _local_partition_gradient!(s, g, u, label, cache.local_state, cached)
     plan = _partition_plan_of(s, label)
     ad = _partition_ad(s.ad, label)
     if _compact(s)
@@ -2180,6 +2253,22 @@ function _shared_partition_gradient!(s::PartitionSampler, g, u, label, shared)
             ad, u, s.active, s.slots, label, plan, cached...)
     end
     _shared_partition_evaluate!(s, g, u, label, shared, ad, u, label, plan, cached...)
+end
+
+function _local_partition_gradient!(s, g, u, label, state::_PartitionLocal, cached::Tuple)
+    selection = state.selections[label]
+    _select_partition!(state, selection)
+    for (i, position) in enumerate(selection)
+        state.active[i] = u[position]
+    end
+    value, _ = ad_value_and_gradient!(_partition_ad(state.ad, label), state.gradient,
+        u, state.active, state.slots, label, state.plans[label], cached...)
+    footprint = _partition_gradient_footprint(s, label, false)
+    _compact(s) || fill!(g, 0)
+    for (i, position) in enumerate(footprint)
+        g[_compact(s) ? i : position] = state.gradient[state.slots[position]]
+    end
+    value
 end
 
 # Keep each call's argument tuple length concrete, and specialize together on
@@ -2220,7 +2309,7 @@ _partition_plan_of(s::PartitionSampler, label) = get(s.plans, label) do
 end
 
 # Point the slot map at `selection` when it differs from the one in force.
-function _select_partition!(s::PartitionSampler, selection::Vector{Int})
+function _select_partition!(s::Union{PartitionSampler,_PartitionLocal}, selection::Vector{Int})
     _same_selection(s.selected, selection) && return nothing
     for position in s.selected
         s.slots[position] = 0

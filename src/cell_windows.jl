@@ -221,6 +221,12 @@ end
 @inline Base.getindex(w::_CellWindow, i::Integer, j::Union{Integer,Colon},
                       rest::Union{Integer,Colon}...) =
     w.data[_cell_local_row(w, i, (i, j, rest...)), j, rest...]
+# A dotted call consumes this row before the slice can escape. Delegate to
+# the same checked read-in-place path as a dense operand. Ordinary indexing
+# above keeps its owning copy and concrete dispatch semantics.
+@inline _lane_gathered(w::_CellWindow, i::Integer, j::Union{Integer,Colon},
+                       rest::Union{Integer,Colon}...) =
+    _lane_gathered(w.data, _cell_local_row(w, i, (i, j, rest...)), j, rest...)
 @inline function Base.getindex(w::_CellWindow, I::AbstractVector{<:Integer},
                                j::Union{Integer,Colon}, rest::Union{Integer,Colon}...)
     _cell_reads_rows(w, I) && return w.data[:, j, rest...]

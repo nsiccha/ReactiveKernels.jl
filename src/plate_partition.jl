@@ -1287,8 +1287,12 @@ end
 end
 _partition_has_loop(@nospecialize(x)) =
     x isa Expr && (x.head in (:for, :while) || any(_partition_has_loop, x.args))
+# A lazy view only packages existing storage. Keep that construction visible
+# to its readers: an outlined mixed base/active overlay can require a shadow
+# of its whole inactive base at the return boundary, before any row is read.
 _partition_keeps_inline(@nospecialize(f)) = f === :tuple || f === :getfield ||
     f === :(===) || f === :typeof || (f isa GlobalRef && f.mod === Core) ||
+    (f isa GlobalRef && isdefined(f.mod, f.name) && _cell_lazy_view(getglobal(f.mod, f.name))) ||
     (f isa Expr && f.head === :. && f.args[1] === :Core)
 function _partition_separate_call(@nospecialize(x))
     x isa Expr || return x
@@ -1326,6 +1330,31 @@ _plan_bookkeeping(v::AbstractArray) = _plan_bookkeeping_type(eltype(v))
 _plan_bookkeeping(v::AbstractDict) = _plan_bookkeeping_type(Base.valtype(v))
 _plan_bookkeeping(v::Tuple) = all(_plan_bookkeeping, v)
 _plan_bookkeeping(@nospecialize(_)) = false
+
+# A planned row operand is fixed for the label. Store just those rows of a
+# dense input, retaining the view's concrete type and axes. Keeping a view of
+# the whole panel here makes every local call carry the whole parent across
+# its outlined array operations; ordinary reverse may then zero that parent
+# even though the call reads only this label's rows. This is plan storage,
+# shared by primal and derivative execution, and costs nothing per evaluation.
+_cell_plan_rows(arg, positions) = _cell_rows_view(arg, positions)
+function _cell_plan_rows(arg::Array, positions::Vector{Int})
+    selected = copy(_cell_rows_view(arg, positions))
+    _cell_rows_view(selected, collect(axes(selected, 1)))
+end
+function _cell_plan_rows(arg::Array, position::Integer)
+    selected = copy(_cell_rows_view(arg, position))
+    _cell_rows_view(selected, 1)
+end
+
+function _plan_row_storage(st)
+    Meta.isexpr(st, :(=), 2) || return st
+    rhs = st.args[2]
+    Meta.isexpr(rhs, :call) &&
+        rhs.args[1] === GlobalRef(@__MODULE__, :_cell_rows_view) || return st
+    Expr(:(=), st.args[1], Expr(:call, GlobalRef(@__MODULE__, :_cell_plan_rows),
+                              rhs.args[2:end]...))
+end
 # An element type of index bookkeeping: integers, or arrays, ranges and
 # tuples of them, nested (a ragged row structure is a vector of row vectors).
 function _plan_bookkeeping_type(@nospecialize(T))
@@ -1597,7 +1626,8 @@ function _partition_plan_classify(body::Expr, data_names, ops, forced::Set{Symbo
             _symbol_refs!(wanted, st)
         end
     end
-    plan = Any[st for (k, st) in enumerate(body.args) if keep[k] && !(st isa LineNumberNode)]
+    plan = Any[kinds[k] === :plan ? _plan_row_storage(st) : st
+               for (k, st) in enumerate(body.args) if keep[k] && !(st isa LineNumberNode)]
     # The kernel's body: everything else, a shape statement checked against the
     # plan's value where it stood.
     main = Any[]
@@ -1675,7 +1705,7 @@ end
 # query's native body much larger than its source. Keep those calls separate
 # here; shape helpers still fold normally, and value/AD bodies are unchanged.
 const _PARTITION_METADATA_HELPERS = Set{Symbol}([
-    :_cell_slice_positions, :_cell_rows_view, :_cell_canonical_rows,
+    :_cell_slice_positions, :_cell_rows_view, :_cell_plan_rows, :_cell_canonical_rows,
     :_cell_leaf_row, :_cell_range_rows, :_cell_reshape_rows,
     :_cell_vcat_part_rows, :_cell_window_positions, :_cell_take_positions,
     :_cell_union_rows, :_cell_union_rows_sorted, :_cell_gather_row,
