@@ -198,4 +198,118 @@ end
     end
 end
 
+# A cell that expands a short live vector across a longer data-indexed one
+# (snag bruno-lpk-genera-3087b1c9): the slices that a dotted call reads as
+# operands are read in place by the fused broadcast (`_lane_gathered`), and a
+# nested `vcat` of a number and a slice fills a lane slot (`_lane_vcat`,
+# todo 00zzurd), so a borrowed read allocates nothing per cell and position.
+@kernel expanded(theta, amount, rows, drows, pos, dx) = begin
+    lf = theta[1] .+ theta[2] .* dx
+    cells = plate(eachindex(rows)) do i
+        amount[rows[i]] .* exp.(vcat(0.0, lf[drows[i]])[pos[rows[i]] .+ 1])
+    end
+    return reduce(vcat, cells)
+end
+
+# Slices of live arrays read as operands: with `end`, by a matrix row, by a
+# scalar, and by indices the reader validates. (Slices of data alone are
+# computed once, in the data-only prefix.)
+@kernel operands(theta, x, k, M, j) = begin
+    y = theta[1] .* x
+    Y = theta[2] .* M
+    cells = plate(eachindex(k)) do i
+        a = 2.0 .* y[k[i]] .+ y[2:end][k[i]]
+        b = Y[j[i], :] .+ y[j[i]]
+        c = exp.(y[k[i]])
+        sum(a) + sum(b) + sum(c) + sum(vcat(theta[1], y[k[i]], 2.0))
+    end
+    return sum(cells)
+end
+
+function expanded_inputs(groups, events, doses, positions)
+    rows = [collect((g - 1) * events + 1:g * events) for g in 1:groups]
+    drows = [collect((g - 1) * doses + 1:g * doses) for g in 1:groups]
+    pos = Int[min(doses, (e - 1) * (doses + 1) ÷ events) for g in 1:groups for e in 1:events]
+    amount = [1.0 + 0.001 * e for e in 1:groups * events]
+    dx = [0.01 * d for d in 1:groups * doses]
+    theta = [0.1 .+ 0.001 .* (1:positions)'; 0.2 .+ 0.0005 .* (1:positions)']
+    theta, (; amount, rows, drows, pos, dx)
+end
+
+@testset "position lane forms: slice operands and nested vcat" begin
+    for bound in (false, true), (groups, events, doses) in ((6, 40, 3), (1, 5, 1))
+        theta, data = expanded_inputs(groups, events, doses, 5)
+        cut = bound ? prepare(expanded; bound = data) : prepare(expanded)
+        args = bound ? () : Tuple(data)
+        scalar = prepare(expanded)
+        expected = [scalar(theta[:, p], data...) for p in axes(theta, 2)]
+        for r in (vectorize(cut; batched = :theta), copy(vectorize(cut; batched = :theta, reuse = true)),
+                  copy(vectorize(cut; batched = :theta, reuse = true,
+                                 schedule = NativeScheduling(workers = 2, chunk_size = 2))))
+            for call in 1:2
+                result = r(theta, args...)
+                @test all(p -> same(column(result, p), expected[p]), axes(theta, 2))
+            end
+        end
+    end
+    source = string(code_expr(copy(vectorize(prepare(expanded); batched = :theta, reuse = true))))
+    @test occursin("_lane_gathered", source)
+    @test occursin("_lane_vcat", source)
+    # Per cell and position the borrowed read allocates nothing: before, the
+    # `vcat` allocated a fresh vector at each (96 B in todo 00zzurd).
+    for bound in (false, true)
+        growth = map((2, 16)) do positions
+            theta, data = expanded_inputs(16, 64, 4, positions)
+            cut = bound ? prepare(expanded; bound = data) : prepare(expanded)
+            r = copy(vectorize(cut; batched = :theta, reuse = true))
+            bytes(r, theta, (bound ? () : Tuple(data))...)
+        end
+        @test growth[2] - growth[1] < 16 * 14 * 8
+    end
+
+    x = [0.5, 1.5, 2.5, 3.5, 4.5]
+    M = reshape(collect(1.0:15.0), 3, 5)
+    k = [[1, 3, 2], Int[], [4, 4, 1, 2]]
+    j = [1, 3, 2]
+    theta = [0.1 0.2 0.3; 0.4 0.5 0.6]
+    scalar = prepare(operands)
+    expected = [scalar(theta[:, p], x, k, M, j) for p in axes(theta, 2)]
+    for r in (vectorize(operands; batched = :theta),
+              copy(vectorize(operands; batched = :theta, reuse = true)))
+        for call in 1:2
+            @test all(p -> same(r(theta, x, k, M, j)[p], expected[p]), axes(theta, 2))
+        end
+        # An index past the array throws the slice's `BoundsError`.
+        @test_throws BoundsError scalar(theta[:, 1], x, [[6]], M, [1])
+        @test_throws BoundsError r(theta, x, [[6]], M, [1])
+        @test_throws BoundsError r(theta, x, [[1]], M, [4])
+    end
+    @test occursin("_lane_gathered",
+                   string(code_expr(copy(vectorize(operands; batched = :theta, reuse = true)))))
+
+    # The helpers' own contracts: a view of the slice, read before the buffer
+    # it fills is written, and `vcat`'s values for any operands.
+    gathered = ReactiveKernels._lane_gathered
+    @test gathered(x, [3, 1]) isa SubArray && gathered(x, [3, 1]) == x[[3, 1]]
+    @test gathered(x, 2) === x[2] && gathered(1:5, [2, 1]) == [2, 1]
+    @test gathered(M, 2, :) == M[2, :] && gathered(M, [1, 3], 2:3) == M[[1, 3], 2:3]
+    @test_throws BoundsError gathered(x, [6])
+    buffer = copy(x)
+    slot = Base.RefValue{Any}(buffer)
+    bc = ReactiveKernels._native_broadcasted(+, gathered(buffer, [5, 4, 3, 2, 1]), 0.0)
+    filled = ReactiveKernels._lane_broadcast(slot, bc)
+    @test filled == reverse(x) && filled === buffer
+    lv = ReactiveKernels._lane_vcat
+    v = [1.0, 2.0]
+    vslot = Base.RefValue{Any}(zeros(3))
+    @test lv(vslot, 0.0, v) == [0.0, 1.0, 2.0] && lv(vslot, 0.0, v) === vslot[]
+    @test lv(Base.RefValue{Any}(zeros(3)), 0, [1, 2]) == vcat(0, [1, 2])
+    @test lv(nothing, 0.0, Float64[]) == [0.0]
+    @test lv(Base.RefValue{Any}(zeros(2)), [1.0], [:a]) == vcat([1.0], [:a])
+    # An operand that shares the slot's buffer is not overwritten mid-copy.
+    own = [1.0, 2.0, 3.0]
+    @test lv(Base.RefValue{Any}(own), 9.0, view(own, 1:2)) == [9.0, 1.0, 2.0]
+    @test lv(Base.RefValue{Any}(zeros(3)), 0, [1, 2]) isa Vector{Int}
+end
+
 end
