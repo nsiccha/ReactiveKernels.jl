@@ -16,6 +16,30 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.88
+
+- A plate nested in another plate's cell decides a lazy branch whose condition
+  reads only a number that its cell received from the outer plate (an element
+  of a `Vector{Float64}` or `BitVector` operand, for example) once per outer
+  cell, as a top-level plate already does for a shared condition, instead of
+  in every nested cell. RKPPL's support guards on a ragged observation group
+  (valid cutpoints, positive discrimination) now leave the nested cell loop.
+  Values, ordinary derivatives, laziness and empty-domain behaviour are
+  unchanged.
+- Binding a guarded arm of a nested cell whose speculation excludes nothing no
+  longer fails with a `MethodError` (`_partial_split_recipes` and a
+  `Set{Union{}}`) on Julia 1.13; RKPPL's group-indexed `Ref` cutpoints with a
+  cumulative or stopping-ratio ordinal prepare again.
+
+## 0.1.87
+
+- A kernel prepared from a module that replaced another module at the same
+  path (a REPL or test file `include`d again, `include_string`, re-evaluating
+  a submodule of a package) runs its own module's functions. Before, it could
+  run the code compiled for the replaced module, including a package image's
+  program for it, so an edited definition silently kept its old behaviour.
+  Kernels of the replaced module keep running that module's code.
+
 ## 0.1.86
 
 - Position-batched readers read a slice that is directly an operand of a dotted

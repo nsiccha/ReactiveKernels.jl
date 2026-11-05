@@ -206,7 +206,7 @@ function _ad_native_callables(kernel::PreparedKernel)
         RuntimeGeneratedFunctions.RuntimeGeneratedFunction || return ops
     # Inspect the compiled callable's cached source, not the separately mutable
     # display AST exposed by code_expr(kernel).
-    ast = RuntimeGeneratedFunctions.get_expression(native)
+    ast = _program_expression(native)
     used = Set{Int}()
     _ad_operation_slots!(used, ast.args[2]) || return ops
     # Native plate/scan bodies are inlined, but the callables table also holds

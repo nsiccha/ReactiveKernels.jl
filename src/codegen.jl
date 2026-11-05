@@ -3725,7 +3725,8 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
     shares = Pair{Int,Symbol}[r.id => gensym(:shared_call_table)
                               for r in scalar.recipes if r.op isa _SharedCall]
     ast, constants, callables, recipes = _lower_with_ops(scalar; type_hints, recycle,
-                                                         cell_slots, cell_tables, shares)
+        cell_slots, cell_tables, shares,
+        cell_have_types = _nested_cell_have_types(kernel.plan, scalar, atomic, callvalues))
     cell_tables === nothing || append!(cell_slots, cell_tables)
     offset = length(runtime_ops)
     append!(runtime_ops, _table_ops(constants, callables, recipes))
@@ -3737,6 +3738,28 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
        tables = cell_tables === nothing ? Symbol[] : cell_tables,
        invariants = hoisted === nothing ? Int[] : hoisted.moved,
        input_types = Any[types[cid] for cid in hint_ids])
+end
+
+# The type of the value one cell of a plate receives for an operand declared
+# `T`: the whole operand when it is atomic or a number, and otherwise one
+# element of it (`Base.Broadcast._broadcast_getindex` reads an array's
+# `eltype`). Anything else stays unknown.
+Base.@nospecializeinfer _plate_cell_value_type(@nospecialize(T), atomic::Bool) =
+    atomic || T <: Number ? T : T <: AbstractArray ? eltype(T) : Any
+
+# The types the cell ports of `inner` (a plate's cell plan) receive from the
+# plate's call values, keyed by their identities in the cell's scalar plan.
+# The ports themselves are declared untyped; a plate nested in the cell reads
+# these to tell a number shared by all of its cells (a branch condition it
+# decides once per call, `_plate_shared_branch`) from a per-cell array.
+Base.@nospecializeinfer function _nested_cell_have_types(
+        inner::Plan, scalar::Plan, @nospecialize(atomic), @nospecialize(callvalues))
+    types = Dict{ValueId,Any}()
+    for (position, v) in enumerate(inner.have)
+        T = _plate_cell_value_type(valtype(callvalues[position]), position in atomic)
+        T === Any || (types[canon_id(scalar.graph, v.id)] = T)
+    end
+    types
 end
 
 # Each authored plate carries a generated kernel type. The lowering itself is
@@ -4746,8 +4769,12 @@ end
 # example), and a plate must classify them as shared without asserting a
 # particular numeric type or changing the authored assignment. An opt-in
 # exemplar also proves array rank from the parent DAG. This reads types only;
-# no recipe or sample value is evaluated to obtain evidence.
-function _plate_inferred_input_types(p::Plan; exemplar_types = nothing)
+# no recipe or sample value is evaluated to obtain evidence. `have_types`
+# narrows the types of HAVE ports by value identity: a nested cell's ports are
+# declared untyped, but the enclosing plate's operand types say what each cell
+# receives (`_nested_cell_have_types`).
+function _plate_inferred_input_types(p::Plan; exemplar_types = nothing,
+                                     have_types = nothing)
     g = p.graph
     target = Set(canon_id(g, v.id) for r in p.recipes
         if r.op isa _AuthoredPlateOp &&
@@ -4764,8 +4791,10 @@ function _plate_inferred_input_types(p::Plan; exemplar_types = nothing)
         push!(needed, recipe.id)
         union!(target, (canon_id(g, v.id) for v in recipe.inputs))
     end
+    have_type(v) = have_types === nothing ? valtype(v) :
+        get(have_types, canon_id(g, v.id), valtype(v))
     types = Dict{ValueId,Any}(canon_id(g, v.id) =>
-        (exemplar_types === nothing ? valtype(v) : exemplar_types[i])
+        (exemplar_types === nothing ? have_type(v) : exemplar_types[i])
         for (i, v) in enumerate(p.have))
     for recipe in p.recipes
         recipe.id in needed || continue
@@ -4908,14 +4937,15 @@ function _lower_with_ops_collecting(p::Plan;
                          footprint_selection = nothing,
                          partition_plan::Bool = false,
                          inline_sources::Bool = _inline_sources_enabled(),
-                         shares::Vector{Pair{Int,Symbol}} = Pair{Int,Symbol}[])
+                         shares::Vector{Pair{Int,Symbol}} = Pair{Int,Symbol}[],
+                         cell_have_types = nothing)
     # The footprint variant (`partition_footprint`, plate_partition.jl): the
     # body records every read of a HAVE port and returns them instead of the
     # wanted values.
     footprint && return task_local_storage(_FOOTPRINT, _FootprintRecords(footprint_selection)) do
         _lower_with_ops_collecting(p; inline_embedded, declare, recycle, pushdowns, outline,
                                    plate_element_types, type_hints, exemplar_types, inline_sources,
-                                   shares)
+                                   shares, cell_have_types)
     end
     # Only the lowering the footprint was asked for records reads and returns
     # them: a lowering nested in it (a plate body, an embedded kernel) runs
@@ -4925,7 +4955,7 @@ function _lower_with_ops_collecting(p::Plan;
         recording.active && return task_local_storage(_FOOTPRINT, nothing) do
             _lower_with_ops_collecting(p; inline_embedded, declare, recycle, pushdowns, outline,
                                        plate_element_types, type_hints, exemplar_types, inline_sources,
-                                       shares)
+                                       shares, cell_have_types)
         end
         recording.active = true
     end
@@ -5035,12 +5065,17 @@ function _lower_with_ops_collecting(p::Plan;
         if inline_embedded && r.op isa _AuthoredPlateOp
             callvalues = r.inputs
             # Shared-branch arm slots use source-inferred scalar inputs;
-            # exemplars add rank evidence only.
+            # exemplars add rank evidence only. A nested cell's lowering
+            # (`type_hints`) infers them from the enclosing plate's operand
+            # types (`cell_have_types`), so a branch condition reading a
+            # number the cell received is decided once per nested call.
             branch = any(q -> _plate_branch_operation(q.op),
                          r.op.kernel.plan.recipes)
-            if type_hints === nothing && (exemplar_types !== nothing || branch)
+            if (type_hints === nothing || cell_have_types !== nothing) &&
+                    (exemplar_types !== nothing || branch)
                 inferred_plate_types === nothing &&
-                    (inferred_plate_types = _plate_inferred_input_types(p))
+                    (inferred_plate_types = _plate_inferred_input_types(p;
+                        have_types = cell_have_types))
                 if exemplar_types !== nothing
                     inferred_exemplar_types === nothing &&
                         (inferred_exemplar_types =
@@ -6238,12 +6273,144 @@ image compiled for it.
 compile(ast::Expr) =
     _compile(ast, @__MODULE__, GlobalRef(@__MODULE__, Symbol("@_native_context")))
 
+# RuntimeGeneratedFunctions names a module in a program's content id by its
+# path (`fullname`), so that the id a package image computed for a program is
+# the id of the same program once the image is loaded. Re-evaluating a module
+# definition (a REPL or test file `include`d again, `include_string`) makes a
+# second module object at the first one's path, and the two modules' programs
+# then had one id although each reads its own bindings: RGF's body cache
+# returned the first body for that id, and the method compiled for the
+# callable's type ran it. A kernel prepared from the new module's `@kernel`
+# silently called the old module's functions (snag `prepared-kernel-b879ce51`).
+# So each module a program names has a generation in this process: the number
+# of distinct module objects at its path that were named before it, 0 for the
+# first. A program naming a module of a later generation begins with a
+# `_ModuleGenerations` statement listing those, which changes its id and lowers
+# to nothing. A program naming only first modules keeps the id it has in every
+# process. Registering a loaded image makes the image's modules the first at
+# their paths (`_register_image_programs`), so a module that replaces one of
+# them is never served the image's programs.
+struct _ModuleGenerations
+    generations::Tuple
+end
+
+# Each path's module objects in the order they were first named. Their indices
+# are their generations, so a collected module keeps its slot.
+const _MODULE_GENERATIONS = Dict{Tuple{Vararg{Symbol}},Vector{WeakRef}}()
+const _MODULE_GENERATIONS_LOCK = ReentrantLock()
+
+function _module_generation(m::Module)
+    path = fullname(m)
+    @lock _MODULE_GENERATIONS_LOCK begin
+        named = get!(() -> WeakRef[], _MODULE_GENERATIONS, path)
+        for (index, ref) in pairs(named)
+            ref.value === m && return index - 1
+        end
+        push!(named, WeakRef(m))
+        length(named) - 1
+    end
+end
+
+# Make `m` and its submodules the first modules at their paths.
+function _first_module_generations!(m::Module, visited::Vector{Module} = Module[])
+    any(v -> v === m, visited) && return nothing
+    push!(visited, m)
+    _module_generation(m)
+    for name in names(m; all = true)
+        Base.invokelatest(isdefined, m, name) || continue
+        value = Base.invokelatest(getglobal, m, name)
+        value isa Module && value !== m && parentmodule(value) === m &&
+            _first_module_generations!(value, visited)
+    end
+    nothing
+end
+
+_note_module!(found::Vector{Module}, m::Module) =
+    (any(f -> f === m, found) || push!(found, m); nothing)
+
+# The modules a program's content id names (RuntimeGeneratedFunctions'
+# `expr_to_id`): those of its global references and module literals, and the
+# modules of the types it embeds, of the values it embeds and of their fields.
+function _program_modules!(found::Vector{Module}, @nospecialize(x), seen::IdDict{Any,Nothing})
+    if ismutable(x)
+        haskey(seen, x) && return nothing
+        seen[x] = nothing
+    end
+    if x isa Expr
+        for arg in x.args
+            _program_modules!(found, arg, seen)
+        end
+    elseif x isa GlobalRef
+        _note_module!(found, x.mod)
+    elseif x isa Module
+        _note_module!(found, x)
+    elseif x isa Symbol || x isa LineNumberNode || x isa String
+        nothing
+    elseif x isa DataType
+        _note_module!(found, x.name.module)
+        for p in x.parameters
+            _program_modules!(found, p, seen)
+        end
+    elseif x isa Union
+        _program_modules!(found, x.a, seen)
+        _program_modules!(found, x.b, seen)
+    elseif x isa UnionAll
+        _program_modules!(found, x.var, seen)
+        _program_modules!(found, x.body, seen)
+    elseif x isa TypeVar
+        _program_modules!(found, x.lb, seen)
+        _program_modules!(found, x.ub, seen)
+    else
+        T = typeof(x)
+        _program_modules!(found, T, seen)
+        if x isa Array || (@static isdefined(Core, :GenericMemory) ? x isa Core.GenericMemory : false)
+            isprimitivetype(eltype(x)) && return nothing
+            for i in eachindex(x)
+                isassigned(x, i) && _program_modules!(found, x[i], seen)
+            end
+        elseif !isprimitivetype(T)
+            for i in 1:nfields(x)
+                isdefined(x, i) && _program_modules!(found, getfield(x, i), seen)
+            end
+        end
+    end
+    nothing
+end
+
+# `ast` with a `_ModuleGenerations` statement when it names a module that is
+# not the first at its path.
+function _distinguish_module_generations(ast::Expr)
+    found = Module[]
+    _program_modules!(found, ast, IdDict{Any,Nothing}())
+    generations = Tuple{Tuple{Vararg{Symbol}},Int}[]
+    for m in found
+        generation = _module_generation(m)
+        generation == 0 || push!(generations, (fullname(m), generation))
+    end
+    isempty(generations) && return ast
+    ast.head in (:->, :function) && length(ast.args) == 2 || throw(ArgumentError(
+        "cannot compile `$(ast.head)` expression: expected a function expression"))
+    Expr(ast.head, ast.args[1],
+         Expr(:block, _ModuleGenerations(Tuple(sort!(generations))), ast.args[2]))
+end
+
+# The expression of the compiled program `f` as it was lowered, without the
+# statement `_distinguish_module_generations` added.
+function _program_expression(@nospecialize(f))
+    ex = RuntimeGeneratedFunctions.get_expression(f)
+    ex isa Expr && length(ex.args) == 2 || return ex
+    body = ex.args[2]
+    body isa Expr && body.head === :block && length(body.args) == 2 &&
+        body.args[1] isa _ModuleGenerations || return ex
+    Expr(ex.head, ex.args[1], body.args[2])
+end
+
 # `compile` with the body's global names resolved in `context` instead of RK.
 # `native_context` names a macro defined in `context` that returns its argument
 # unchanged, as `@_native_context` below does: its hygiene qualifies the globals.
 # A package whose lowered bodies name its own functions compiles them this way.
 function _compile(ast::Expr, context::Module, native_context::GlobalRef)
-    ast = _canonical_locals(_canonical_globals(ast))
+    ast = _distinguish_module_generations(_canonical_locals(_canonical_globals(ast)))
     f = RuntimeGeneratedFunction(context, context, ast)
     image = _image_program(f)
     image === nothing || return image
@@ -6644,6 +6811,8 @@ end
 function _register_image_programs(package::Base.PkgId)
     mod = Base.root_module(package)
     isdefined(mod, _IMAGE_PROGRAMS) || return nothing
+    # A module that later replaces one of the image's is not served its programs.
+    _first_module_generations!(mod)
     table = getglobal(mod, _IMAGE_PROGRAMS)::_ImagePrograms
     @lock _LOADED_IMAGE_PROGRAMS.lock begin
         tables = @atomic :acquire _LOADED_IMAGE_PROGRAMS.tables
@@ -6945,7 +7114,7 @@ _externalize_bound_array_body(f, positions, values) = nothing
 function _externalize_bound_array_body(
         f::Union{RuntimeGeneratedFunctions.RuntimeGeneratedFunction,
                  _PrecompileWarmFunction}, positions, values)
-    ast = deepcopy(RuntimeGeneratedFunctions.get_expression(f))
+    ast = deepcopy(_program_expression(f))
     operands = Symbol[]
     loads = Dict{Int,Any}()
     for (index, value) in zip(positions, values)

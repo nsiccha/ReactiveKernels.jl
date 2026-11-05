@@ -932,7 +932,12 @@ the traversal, and then runs the cells of the taken arm alone. Each plain arm
 expression is also authored as a cell of its own, so its shared work is
 lifted like any other invariant: the support guard
 `sigma > 0 ? normal(mu, sigma).logpdf(y) : -Inf` computes `log(sigma)` once
-per call, and only when `sigma > 0`. An empty domain evaluates neither the
+per call, and only when `sigma > 0`. A plate nested in another plate's cell
+receives one element of each of the outer plate's operands: when the outer
+operand's type says that element is a number (an element of a
+`Vector{Float64}` or a `BitVector`, say), the nested plate treats it as such a
+shared value, so a guard on it is decided once per outer cell instead of in
+every nested cell. An empty domain evaluates neither the
 condition nor an arm. A condition that reads the cell, including a combined
 one such as `s > 0 && x > 0`, keeps its branch in every cell. An arm with
 shared work is inlined into the cell loop, and that work runs at the first

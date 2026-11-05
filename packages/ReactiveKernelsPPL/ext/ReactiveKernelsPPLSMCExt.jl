@@ -375,7 +375,7 @@ function PPL.tune_smc(target::AbstractSMCTarget; rng::Xoshiro, init::AbstractVec
         max_reflections::Integer=16, recording_target::Integer=128,
         pilot_evaluations::Integer=1000, options=SMCOptions(),
         progress=nothing, callback=nothing, checkpoint_dir=nothing,
-        resume=false, overwrite::Bool=false)
+        resume=false, overwrite::Bool=false, grid_start::Symbol=:sequential)
     target = _execution_target(target)
     d = _dimension(target)
     length(init) == d || throw(DimensionMismatch("pilot initial position and target dimensions differ"))
@@ -383,6 +383,10 @@ function PPL.tune_smc(target::AbstractSMCTarget; rng::Xoshiro, init::AbstractVec
     all(isfinite, init) || throw(ArgumentError("pilot initial position must be finite"))
     pilot_steps >= 1 || throw(ArgumentError("pilot_steps must be positive"))
     pilot in (:continuous, :adaptive) || throw(ArgumentError("pilot must be :continuous or :adaptive"))
+    grid_start in (:sequential, :independent) || throw(ArgumentError(
+        "grid_start must be :sequential or :independent"))
+    pilot === :adaptive || grid_start === :sequential || throw(ArgumentError(
+        "independent grid starts require pilot=:adaptive"))
     max_reflections >= 0 || throw(ArgumentError("max_reflections must be nonnegative"))
     recording_target >= 1 || throw(ArgumentError("recording_target must be positive"))
     pilot_evaluations >= 1 || throw(ArgumentError("pilot_evaluations must be positive"))
@@ -397,7 +401,7 @@ function PPL.tune_smc(target::AbstractSMCTarget; rng::Xoshiro, init::AbstractVec
         return _tune_adaptive(target; rng, init, reference, previous,
             reference_inflation, grid, pilot_steps, max_reflections,
             recording_target, pilot_evaluations, options, scale,
-            progress, callback, checkpoint_dir, resume, overwrite)
+            progress, callback, checkpoint_dir, resume, overwrite, grid_start)
     end
     (progress === nothing && callback === nothing && checkpoint_dir === nothing &&
         resume === false && !overwrite) || throw(ArgumentError(
@@ -458,6 +462,7 @@ function _finish_adaptive_pilot(result, seed; reference_inflation=nothing)
 end
 
 include("smc_tuning.jl")
+include("smc_tuning_parallel.jl")
 
 PPL.smc_reference(state::SMCState) =
     state.source isa ReferenceTarget ? deepcopy(state.source.reference) : nothing
@@ -859,7 +864,9 @@ function PPL.smc_checkpoint(state::SMCState)
         target_scores=_scores(state.target, state.positions, :target, state.temperature)))
 end
 
-function PPL.resume_smc(target::AbstractSMCTarget, checkpoint; previous=nothing)
+function PPL.resume_smc(target::AbstractSMCTarget, checkpoint; previous=nothing, nthreads=nothing)
+    nthreads === nothing || (nthreads isa Integer && nthreads >= 1) ||
+        throw(ArgumentError("nthreads must be a positive integer or nothing"))
     cp = deepcopy(checkpoint)
     cp.schema_version == 1 || throw(ArgumentError("unsupported SMC checkpoint schema"))
     cp.versions == _versions() || throw(ArgumentError("SMC checkpoint Julia/package versions differ"))
@@ -888,8 +895,14 @@ function PPL.resume_smc(target::AbstractSMCTarget, checkpoint; previous=nothing)
     length(cp.ancestors) == length(cp.lineage) == n &&
         all(i -> 1 <= i <= n, cp.ancestors) && all(i -> 1 <= i <= n, cp.lineage) ||
         throw(ArgumentError("invalid SMC checkpoint ancestry"))
+    options = if nthreads === nothing
+        cp.options
+    else
+        fields = (; (name => getfield(cp.options, name) for name in fieldnames(SMCOptions))...)
+        SMCOptions(; fields..., nthreads)
+    end
     return SMCState(source, target, cp.positions, cp.weights, cp.temperature,
-        cp.log_normalizer, cp.rng, _options(cp.options,d,source,target), cp.ancestors,
+        cp.log_normalizer, cp.rng, _options(options,d,source,target), cp.ancestors,
         cp.lineage, cp.history, cp.update, cp.stage)
 end
 

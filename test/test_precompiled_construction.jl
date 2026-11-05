@@ -125,6 +125,18 @@ end
             @kernel model(a, b, t) = begin
                 mu = a .+ b .* t
             end
+            # A submodule whose definition a developer may evaluate again; the
+            # image keeps the program of its kernel.
+            module Replaceable
+            using ReactiveKernels
+            const C = Ref(0)
+            counted(x) = (C[] += 1; 2x)
+            @kernel scalar(x::Float64) = begin
+                y = counted(x)
+                return y
+            end
+            end
+            const REPLACEABLE = prepare(Replaceable.scalar)
             end
             """)
         write(joinpath(consumer, "Project.toml"), """
@@ -224,6 +236,37 @@ end
             @test ArmConsumer.RENAMED_VALUE == total(1.0, 2.0)
             @test ArmConsumer.RENAMED_READER(-1.0, 4.0, t, rows) == total(-1.0, 4.0)
             @test haskey(ArmConsumer.RENAMED, :mu) && !haskey(ArmConsumer.RENAMED, :prediction)
+            end
+            # A module that replaces one of the image's, before anything
+            # prepared the image's kernel in this process, runs its own code,
+            # not the program the image keeps for the module it replaced
+            # (snag `prepared-kernel-b879ce51`).
+            @testset "a replaced image module" begin
+            image_root(prepared) = Base.moduleroot(parentmodule(
+                typeof(RK._native_generated_function(prepared.f)).parameters[2]))
+            old = ArmSource.Replaceable
+            Core.eval(ArmSource, :(module Replaceable
+                using ReactiveKernels
+                const C = Ref(0)
+                counted(x) = (C[] += 1; 3x)
+                @kernel scalar(x::Float64) = begin
+                    y = counted(x)
+                    return y
+                end
+                end))
+            new = Base.invokelatest(getglobal, ArmSource, :Replaceable)
+            @test new !== old && fullname(new) == fullname(old)
+            calls = old.C[]
+            replaced = prepare(new.scalar)
+            @test replaced(1.0) == 3.0
+            @test (old.C[], new.C[]) == (calls, 1)
+            @test image_root(replaced) === ReactiveKernels
+            # The image's module still runs the program the image keeps.
+            kept = prepare(old.scalar)
+            @test image_root(kept) === ArmSource
+            @test image_root(ArmSource.REPLACEABLE) === ArmSource
+            @test kept(1.0) == 2.0
+            @test (old.C[], new.C[]) == (calls + 1, 1)
             end
             println("PRECOMPILED_CONSTRUCTION_PASS")
             """

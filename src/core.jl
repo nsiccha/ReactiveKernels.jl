@@ -82,6 +82,9 @@ function __init__()
     # process that generates an image gives that image a key of its own.
     generating = ccall(:jl_generating_output, Cint, ()) != 0
     _VALUE_NAMESPACE[] = ValueNamespace(generating ? rand(RandomDevice(), UInt) : zero(UInt))
+    # The module generations an image generated (`_module_generation`) name
+    # that process's module objects.
+    @lock _MODULE_GENERATIONS_LOCK empty!(_MODULE_GENERATIONS)
     # Programs that package images loaded from now on compiled (`compile`).
     push!(Base.package_callbacks, _register_image_programs)
     # This process reads its own project's type-stability preferences.

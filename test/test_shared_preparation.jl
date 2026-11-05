@@ -620,6 +620,9 @@ end
     cut = prepare(F.graph; have, want, bound = first(designs))
     vectorize(cut; batched, reuse = true, schedule = NativeScheduling(chunk_size = 2))
     rebound = prepare(F.graph; have, want, bound = designs[2])
+    # The plate reads only the cached entries of `d`, so the residual kernel
+    # drops the bound `d` itself; the binding still rebinds the template.
+    @test rebound.f === cut.f
     # Read both counters before any arithmetic on them.
     Base.cumulative_compile_timing(true)
     before = Base.cumulative_compile_time_ns()
