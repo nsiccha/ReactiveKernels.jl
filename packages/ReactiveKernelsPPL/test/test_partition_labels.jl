@@ -181,4 +181,55 @@ central(f, u, j; h = 1e-6) = (f(setindex!(copy(u), u[j] + h, j)) - f(setindex!(c
             by = [:lower => LOWER_UNIT, :limit => 1])
     end
 end
+
+@testset "whole compressed transforms use constrained-axis labels" begin
+    model = quote
+        a ~ Normal(0, 1)
+        L ~ LKJCholesky(K, 2.0)
+        M ~ LKJCholesky(K, 2.0)
+        y .~ Normal.(a .+ L[end, 1], 1.0)
+        z .~ Normal.(a .+ M[end, 1], 1.0)
+    end
+    for K in (2, 4)
+        data = (; K, y = [0.2, -0.4, 0.1], z = [-0.3, 0.5])
+        bound = bind_data(lower_rkppl(model, data; conditioned = (:y, :z),
+            mod = @__MODULE__), data)
+        built = build_kernel(bound)
+        metadata = only(filter(p -> p.path == (:L,), parameter_metadata(built)))
+        @test metadata.shape == (K, K)
+        @test metadata.ncoordinates == K * (K - 1) ÷ 2
+        @test metadata.ncoordinates != K
+        u = collect(range(-0.3, 0.4; length = built.layout.total))
+        original = copy(u)
+        by = (; y = fill(:left, length(data.y)), z = fill(:right, length(data.z)))
+        rule = (:L => fill(:left, K), :M => fill(:right, K))
+        positions(name) = let e = only(filter(e -> e.name == name, built.layout.entries))
+            collect(e.offset:(e.offset + e.size - 1))
+        end
+        local_positions = Dict(:left => positions(:L), :right => positions(:M))
+        function reference(point, label)
+            p = constrain(built.layout, point)
+            observations, factor = label === :left ? (data.y, p.L) : (data.z, p.M)
+            sum(logpdf(Normal(p.a + factor[end, 1], 1.0), y) for y in observations)
+        end
+        for (observation, label) in ((:y, :left), (:z, :right))
+            query = prepare_partition(built, bound, observation; by, partitioned = rule, u0 = u)
+            for point in (u, u .+ 0.15)
+                fp = ReactiveKernels.partition_footprint(query.kernel, point, label, nothing).unconstrained
+                @test fp == sort!([positions(:a); local_positions[label]])
+                @test query(point, label) ≈ reference(point, label)
+            end
+        end
+        @test u == original
+        # The public declaration counts constrained first-axis entries, not
+        # packed coordinates, even when the latter are fewer or more.
+        @test_throws "has $K levels" prepare_partition(built, bound, :y;
+            by, partitioned = (:L => fill(:left, metadata.ncoordinates),), u0 = u)
+        # Atomicity does not waive separability: assigning all of L to the
+        # other unit would let :left read a foreign local block.
+        @test_throws ReactiveKernels.PartitionSeparabilityError prepare_partition(
+            built, bound, :y; by,
+            partitioned = (:L => fill(:right, K), :M => fill(:right, K)), u0 = u)
+    end
+end
 end
