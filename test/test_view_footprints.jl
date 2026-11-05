@@ -137,6 +137,12 @@ end
         exp(r > 0 ? u[a[r][1]] : u[100])
     end
 end
+@kernel generator_shadow(u::AbstractVector{Float64}, Int::Vector{Vector{Int64}}) = begin
+    rows = eachindex(Int)
+    terms = plate(rows) do r
+        sum(u[Int[r][j]]^2 for j in eachindex(Int[r]); init = 0.0)
+    end
+end
 
 @testset "scalar generator footprints" begin
     u = collect(0.1:0.1:1.0)
@@ -177,6 +183,10 @@ end
         have = (:u, :a, :t), want = :terms_cell, bound = (; a = [[0, 3, 0, 1]]))
     @test filtered(u, 1) ≈ 4sum(abs2, u[[3, 1]])
     @test partition_footprint(filtered, u, 1).u == [1, 3]
+    shadow = prepare(plate_cell(generator_shadow, :terms; index = :t, locality = :error);
+        have = (:u, :Int, :t), want = :terms_cell, bound = (; Int = a))
+    @test shadow(u, 1) ≈ sum(abs2, u[a[1]])
+    @test partition_footprint(shadow, u, 1).u == [1, 3]
     @test (u, a) == saved
 end
 

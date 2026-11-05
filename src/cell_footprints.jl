@@ -121,7 +121,7 @@ function _footprint_loop(gather, clauses)
         end
         body = Expr(:for, clause, body)
     end
-    Expr(:let, Expr(:(=), out, :(Int[])), Expr(:block, body, out))
+    Expr(:let, Expr(:(=), out, Expr(:call, QuoteNode(Vector{Int}))), Expr(:block, body, out))
 end
 
 # A selected plate's footprint for one shared array. Independent recipes
