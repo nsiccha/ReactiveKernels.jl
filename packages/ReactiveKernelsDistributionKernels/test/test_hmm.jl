@@ -3,6 +3,12 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     hmm_logdensity, normal_hmm_logdensity, exponential_hmm_logdensity,
     hmm_log_weights_logdensity, normal_hmm_log_weights_logdensity,
     exponential_hmm_log_weights_logdensity
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    hmm_state_posterior, normal_hmm_state_posterior, exponential_hmm_state_posterior,
+    hmm_log_weights_state_posterior, normal_hmm_log_weights_state_posterior,
+    exponential_hmm_log_weights_state_posterior, hmm_state_posterior_name,
+    draw_hmm_states, draw_hmm_states!
+using Random: Xoshiro
 using Distributions: Exponential, Normal, logpdf
 import DifferentiationInterface as DI
 import Enzyme
@@ -307,4 +313,181 @@ end
             normal_log_law(streams, locations, scales, minus, log_start)) / (2step)
         @test gradient[i] ≈ expected rtol=1e-6 atol=1e-8
     end
+end
+
+# The posterior of the state path, enumerated in 512-bit arithmetic: each
+# path's weight is the summand of the forward sum. Returns the per-step
+# marginals, the filtered marginals (each step given the steps up to it) and
+# every path's probability.
+function hmm_path_posterior(log_emissions, log_step_weight, log_initial)
+    setprecision(BigFloat, 512) do
+        T, K = size(log_emissions)
+        marginals = zeros(BigFloat, T, K)
+        paths = Dict{Vector{Int},BigFloat}()
+        total = big(0.0)
+        for path in Iterators.product(ntuple(_ -> 1:K, T)...)
+            w = exp(big(log_initial[path[1]]) + big(log_emissions[1, path[1]]))
+            for t in 2:T
+                w *= exp(big(log_step_weight(path[t - 1], path[t], t)) +
+                    big(log_emissions[t, path[t]]))
+            end
+            total += w
+            paths[collect(path)] = w
+            for t in 1:T
+                marginals[t, path[t]] += w
+            end
+        end
+        filtered = zeros(BigFloat, T, K)
+        for t in 1:T
+            prefix = hmm_log_path_reference(log_emissions[1:t, :], log_step_weight,
+                log_initial)
+            for k in 1:K
+                ends_in_k = big(0.0)
+                for path in Iterators.product(ntuple(_ -> 1:K, t)...)
+                    path[t] == k || continue
+                    w = exp(big(log_initial[path[1]]) + big(log_emissions[1, path[1]]))
+                    for s in 2:t
+                        w *= exp(big(log_step_weight(path[s - 1], path[s], s)) +
+                            big(log_emissions[s, path[s]]))
+                    end
+                    ends_in_k += w
+                end
+                filtered[t, k] = ends_in_k / exp(prefix)
+            end
+        end
+        (; marginals = Float64.(marginals ./ total), filtered = Float64.(filtered),
+            paths = Dict(p => Float64(w / total) for (p, w) in paths))
+    end
+end
+
+@testset "state posterior against state-path enumeration" begin
+    posterior = prepare(hmm_log_weights_state_posterior)
+    log_emissions = [-1.2 -0.4 -2.0; -0.3 -1.9 -0.8; -2.2 -0.6 -1.1;
+        -0.9 -0.9 -0.2; -1.5 -0.1 -3.0]
+    transition = [0.7 0.2 0.1; 0.1 0.8 0.1; 0.3 0.3 0.4]
+    zeroed = [0.6 0.4 0.0; 0.0 0.5 0.5; 0.2 0.0 0.8]
+    varying = cat((rand_stochastic(3, seed) for seed in 1:4)...; dims = 3)
+    previous_only = reshape([0.2 0.5 0.3 0.9; 0.7 0.1 0.6 0.05; 0.1 0.4 0.1 0.05],
+        3, 1, 4)
+    initial = [0.5, 0.3, 0.2]
+    # Full, structurally zero, step-dependent and destination-independent moves,
+    # with normalized and all-ones initial weights.
+    cases = (
+        (transition, (i, j, t) -> transition[i, j], initial),
+        (zeroed, (i, j, t) -> zeroed[i, j], ones(3)),
+        (varying, (i, j, t) -> varying[i, j, t - 1], initial),
+        (previous_only, (i, j, t) -> previous_only[i, 1, t - 1], initial),
+    )
+    for (weights, move, start) in cases
+        reference = hmm_path_posterior(log_emissions, (i, j, t) -> log(move(i, j, t)),
+            log.(start))
+        value = posterior(log_emissions, log.(weights), log.(start))
+        @test value.probabilities ≈ reference.marginals rtol=1e-12
+        @test exp.(value.log_filtered) ≈ reference.filtered rtol=1e-12
+        @test value.log_transition == log.(weights)
+        # The probability twin is the log-weights twin at the logarithms.
+        twin = prepare(hmm_state_posterior)(log_emissions, weights, start)
+        @test twin.probabilities == value.probabilities
+        @test twin.log_filtered == value.log_filtered
+    end
+
+    # One step is the initial-weighted posterior; an empty sequence has no
+    # states. An impossible observation leaves no posterior.
+    one = posterior(log_emissions[1:1, :], log.(transition), log.(initial))
+    @test vec(one.probabilities) ≈ initial .* exp.(log_emissions[1, :]) ./
+        sum(initial .* exp.(log_emissions[1, :])) rtol=1e-14
+    empty = posterior(zeros(0, 3), log.(transition), log.(initial))
+    @test size(empty.probabilities) == (0, 3) && size(empty.log_filtered) == (0, 3)
+    @test draw_hmm_states(Xoshiro(1), empty) == Int[]
+    impossible = copy(log_emissions)
+    impossible[3, :] .= -Inf
+    @test all(isnan, posterior(impossible, log.(transition), log.(initial)).probabilities)
+    @test_throws ArgumentError draw_hmm_states(Xoshiro(1),
+        posterior(impossible, log.(transition), log.(initial)))
+
+    @test_throws DimensionMismatch posterior(log_emissions, log.(transition), log.([0.5, 0.5]))
+    @test_throws DimensionMismatch posterior(log_emissions, log.(transition[1:2, :]),
+        log.(initial))
+end
+
+@testset "family state posteriors read the law's arguments" begin
+    transition = [0.8 0.2; 0.3 0.7]
+    initial = [0.4, 0.6]
+    y = [0.3, 2.9, 3.1, 0.2, -0.1]
+    mu, sigma = [0.0, 3.0], [1.0, 0.5]
+    emissions = [logpdf(Normal(mu[k], sigma[k]), y[t]) for t in eachindex(y), k in 1:2]
+    reference = hmm_path_posterior(emissions, (i, j, t) -> log(transition[i, j]),
+        log.(initial)).marginals
+    @test prepare(normal_hmm_state_posterior)(y, mu, sigma, transition,
+        initial).probabilities ≈ reference rtol=1e-12
+    @test prepare(normal_hmm_log_weights_state_posterior)(y, mu, sigma,
+        log.(transition), log.(initial)).probabilities ≈ reference rtol=1e-12
+
+    positive = [0.4, 2.5, 3.1, 0.2, 0.9]
+    scales = [0.5, 2.0]
+    exponential_emissions = [logpdf(Exponential(scales[k]), positive[t])
+        for t in eachindex(positive), k in 1:2]
+    reference = hmm_path_posterior(exponential_emissions,
+        (i, j, t) -> log(transition[i, j]), log.(initial)).marginals
+    @test prepare(exponential_hmm_state_posterior)(positive, scales, transition,
+        initial).probabilities ≈ reference rtol=1e-12
+    @test prepare(exponential_hmm_log_weights_state_posterior)(positive, scales,
+        log.(transition), log.(initial)).probabilities ≈ reference rtol=1e-12
+
+    # Each law names its twin; nothing else has one.
+    laws = (hmm_logdensity, hmm_log_weights_logdensity, normal_hmm_logdensity,
+        normal_hmm_log_weights_logdensity, exponential_hmm_logdensity,
+        exponential_hmm_log_weights_logdensity)
+    twins = (:hmm_state_posterior, :hmm_log_weights_state_posterior,
+        :normal_hmm_state_posterior, :normal_hmm_log_weights_state_posterior,
+        :exponential_hmm_state_posterior, :exponential_hmm_log_weights_state_posterior)
+    @test map(hmm_state_posterior_name, laws) == twins
+    @test hmm_state_posterior_name(normal_hmm_state_posterior) === nothing
+    @test hmm_state_posterior_name(sum) === nothing
+end
+
+@testset "state paths drawn from the exact path posterior" begin
+    # Two states over four steps: sixteen paths, each drawn with its
+    # enumerated probability.
+    log_emissions = [-0.2 -1.0; -1.3 -0.1; -0.7 -0.6; -0.1 -2.0]
+    transition = [0.75 0.25; 0.4 0.6]
+    initial = [0.3, 0.7]
+    reference = hmm_path_posterior(log_emissions, (i, j, t) -> log(transition[i, j]),
+        log.(initial)).paths
+    value = prepare(hmm_state_posterior)(log_emissions, transition, initial)
+    rng = Xoshiro(20261105)
+    draws = 200_000
+    counts = Dict{Vector{Int},Int}()
+    path = zeros(Int, 4)
+    for _ in 1:draws
+        draw_hmm_states!(rng, path, value)
+        counts[copy(path)] = get(counts, path, 0) + 1
+    end
+    for (p, probability) in reference
+        # Four binomial standard deviations around each path's probability.
+        @test abs(get(counts, p, 0) / draws - probability) <=
+            4 * sqrt(probability * (1 - probability) / draws)
+    end
+    # The RNG is the only source of randomness.
+    @test draw_hmm_states(Xoshiro(5), value) == draw_hmm_states(Xoshiro(5), value)
+    # A structural zero is never crossed.
+    stay = [1.0 0.0; 0.5 0.5]
+    held = prepare(hmm_state_posterior)(log_emissions, stay, [1.0, 0.0])
+    @test all(draw_hmm_states(Xoshiro(seed), held) == ones(Int, 4) for seed in 1:50)
+    @test_throws DimensionMismatch draw_hmm_states!(Xoshiro(1), zeros(Int, 3), value)
+end
+
+@testset "filtered probabilities are normalized beside the law's density" begin
+    # The law and its state posterior share one forward kernel: each step's
+    # filtered probabilities sum to one, and the law still sums every path.
+    log_emissions = [-1.2 -0.4 -2.0; -0.3 -1.9 -0.8; -2.2 -0.6 -1.1;
+        -0.9 -0.9 -0.2; -1.5 -0.1 -3.0]
+    transition = [0.7 0.2 0.1; 0.1 0.8 0.1; 0.3 0.3 0.4]
+    initial = [0.5, 0.3, 0.2]
+    value = prepare(hmm_state_posterior)(log_emissions, transition, initial)
+    density = prepare(hmm_logdensity)(log_emissions, transition, initial)
+    last = vec(value.log_filtered[end, :])
+    @test sum(exp.(last)) ≈ 1 rtol=1e-14
+    @test density ≈ hmm_path_reference(log_emissions, (i, j, t) -> transition[i, j],
+        initial) rtol=1e-13
 end
