@@ -447,6 +447,118 @@ end
     @test all(s -> s[1] == s[2], values(structures))
 end
 
+# Two partition sums sharing a pushed value (`s`) lower with one cell emitter.
+# Sum `a` has cells only in label 1 and alone reads a whole factor (`F`) and a
+# scalar (`tau`) of label-1 coordinates (snag `absent-odl-vecto-d98e48bf`).
+@kernel grouped_absent_factor(u::AbstractVector{Float64}, Z::AbstractMatrix{Float64},
+                              L::AbstractMatrix{Float64}, rows::AbstractVector{Int},
+                              arow::AbstractVector{Int}, y::AbstractVector{Float64},
+                              extra::AbstractVector{Float64}, key::AbstractVector{Int},
+                              extra_key::AbstractVector{Int}) = begin
+    s = exp.(u[1:2])
+    raw = u[3:4]
+    scale = log.(raw)
+    F = scale .* L
+    R = Z * F'
+    mu = R[rows, 1] .+ R[rows, 2]
+    tau::Float64 = exp(u[5])
+    sa = s[arow]
+    a = plate(extra, mu, sa, tau) do yi, m, si, t
+        density::Float64 = -(yi - m - si)^2 / 2 * t
+        density
+    end
+    b = plate(y, s) do yi, si
+        density::Float64 = -(yi - si)^2 / 2
+        density
+    end
+end
+
+# The rows `a` reads of the shared `X` depend on `a`'s own whole factor `w`.
+@kernel grouped_absent_rows(u::AbstractVector{Float64}, Z::AbstractMatrix{Float64},
+                            L::AbstractMatrix{Float64}, rows::AbstractVector{Int},
+                            arow::AbstractVector{Int}, y::AbstractVector{Float64},
+                            extra::AbstractVector{Float64}, key::AbstractVector{Int},
+                            extra_key::AbstractVector{Int}) = begin
+    s = exp.(u[1:2])
+    X = Z .* s
+    w::Vector{Float64} = log.(u[3:4]) .+ u[5]
+    m = exp.(X * w)
+    ma = m[rows]
+    a = plate(extra, ma) do yi, mi
+        density::Float64 = -(yi - mi)^2 / 2
+        density
+    end
+    b = plate(y, X[:, 1]) do yi, x
+        density::Float64 = -(yi - x)^2 / 2
+        density
+    end
+end
+
+function _grouped_absent_expected(model, bound, u, label)
+    s = exp.(u[1:2])
+    if model === grouped_absent_factor
+        value = -(s[label] - bound.y[label])^2 / 2
+        label == 1 || return value
+        R = bound.Z * (log.(u[3:4]) .* bound.L)'
+        mu = R[bound.rows, 1] .+ R[bound.rows, 2]
+        return value - sum(abs2, bound.extra .- mu .- s[bound.arow]) / 2 * exp(u[5])
+    end
+    X = bound.Z .* s
+    value = -(X[label, 1] - bound.y[label])^2 / 2
+    label == 1 || return value
+    m = exp.(X * (log.(u[3:4]) .+ u[5]))
+    value - sum(abs2, bound.extra .- m[bound.rows]) / 2
+end
+
+@testset "grouped partition sums skip an empty member's exclusive work" begin
+    structures = Dict{Any,Vector{Int}}()
+    for model in (grouped_absent_factor, grouped_absent_rows), plan in (nothing, :plan),
+            n in (2, 200)
+        # `a` reads both rows of `X`, so `u[2]` is shared in the second model.
+        factor = model === grouped_absent_factor
+        labels = Union{Missing,Int}[1, factor ? 2 : missing, 1, 1, 1]
+        spec = plate_partition(model, (:a, :b); by = (a = :extra_key, b = :key),
+            locality = :error, partitioned = (:u => labels,), plan)
+        bound = (; Z = [0.2 -0.1; 0.4 0.3], L = [1.0 0.0; 0.3 0.8],
+            rows = repeat([1, 2], n ÷ 2), arow = fill(1, n), y = [0.1, 0.2],
+            extra = fill(0.3, n), key = [1, 2], extra_key = fill(1, n))
+        u = [0.2, -0.1, 1.2, 1.4, 0.3]
+        q = plan === nothing ? prepare(spec; want = :partition_total, bound) :
+            prepare(spec; want = :partition_total, bound, exemplars = (u, 1, nothing))
+        push!(get!(structures, (model, plan), Int[]), astsize(code_expr(q)))
+        extra(label, u) = plan === nothing ? () : (partition_plan(q, u, label, nothing),)
+        footprint(label, u) = plan === nothing ? partition_footprint(q, u, label).u :
+            partition_footprint(q, u, label, nothing).u
+        original = copy(u)
+        for label in (1, 2)
+            expected = _grouped_absent_expected(model, bound, u, label)
+            @test q(u, label, extra(label, u)...) ≈ expected
+            # Label 2 reads only its own coordinate of `u`, so the strict
+            # separability check accepts it.
+            @test footprint(label, u) ==
+                  (label == 2 ? [2] : factor ? [1, 3, 4, 5] : [1, 2, 3, 4, 5])
+            plan === nothing && @test partition_separability(q, u, label).u == footprint(label, u)
+            ad = prepare_ad(q, AutoEnzyme(; mode = Enzyme.Reverse), u, label,
+                            extra(label, u)...; active = :u)
+            value, gradient = ad_value_and_gradient(ad, u, label, extra(label, u)...)
+            @test value ≈ expected
+            for j in eachindex(u)
+                plus, minus = copy(u), copy(u)
+                plus[j] += 1e-6
+                minus[j] -= 1e-6
+                @test gradient[j] ≈ (q(plus, label, extra(label, plus)...) -
+                                     q(minus, label, extra(label, minus)...)) / 2e-6 atol=2e-8 rtol=2e-6
+            end
+        end
+        @test u == original
+        # An empty member evaluates none of its own work, even invalid work.
+        u[3] = -1.0
+        @test q(u, 2, extra(2, u)...) ≈ _grouped_absent_expected(model, bound, u, 2)
+        @test_throws DomainError q(u, 1, extra(1, u)...)
+    end
+    @test all(s -> s[1] == s[2], values(structures))
+end
+
 @testset "empty observation portions do not demand scalar dependencies" begin
     spec = plate_partition(absent_scalar, (:a, :b);
         by = (a = :extra_key, b = :key), locality = :error)

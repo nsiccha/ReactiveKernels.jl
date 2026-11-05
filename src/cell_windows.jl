@@ -2893,7 +2893,9 @@ end
 # operand (for example the right factor of a matrix product) has no row domain
 # of its own. Its entire pure dependency chain belongs to its sole consumer.
 # Keep shared producers, query outputs, row-index dependencies and effects in
-# the enclosing plan. Cells sharing a window emitter are also left together.
+# the enclosing plan. A sum lowered with others by one window emitter
+# (`_cell_lowering_groups`) keeps its region: the group's statements are then
+# placed under each member's guard by what they read (`_cell_guard_group`).
 function _cell_partition_sum_type(p, cells, r)
     inputs = Any[get(cells.types, canon_id(p.graph, v.id), valtype(v))
                  for v in r.inputs[2:end]]
@@ -2933,7 +2935,7 @@ function _cell_partition_regions(p::Plan, cells, groups)
     regions = Dict{Int,Int}()
     for r in reverse(p.recipes)
         if r.op isa _AuthoredPlateCellOp
-            r.op.rows && !haskey(groups, r.id) || continue
+            r.op.rows || continue
             T = length(r.outputs) == 1 ? _cell_partition_sum_type(p, cells, r) : Any
             T <: Number && isconcretetype(T) && (regions[r.id] = r.id)
             continue
@@ -2946,30 +2948,191 @@ function _cell_partition_regions(p::Plan, cells, groups)
     end
     # Do not add guards where row demand already accounts for all numerical
     # work. In particular a source view is only metadata, not a whole read.
+    # A region that reads a port of its sum's separability rule directly (a
+    # scalar coordinate `u[7]`) is kept even without array work: unguarded, an
+    # empty partition would read another partition's coordinates.
     views = _cell_input_views(p; types = cells.types)
+    ruled = Dict{Int,Set{ValueId}}()
+    for r in p.recipes
+        r.op isa _AuthoredPlateCellOp && get(regions, r.id, 0) == r.id &&
+            !isempty(r.op.partitioned) || continue
+        ports = Set{Symbol}(first(rule) for rule in r.op.partitioned)
+        ruled[r.id] = Set{ValueId}(cid(v) for v in p.have if v.name in ports)
+    end
     needed = Set{Int}()
     for r in p.recipes
         owner = get(regions, r.id, 0)
         owner == 0 && continue
         r.id in cells.recipes && continue
         r.op isa _AuthoredPlateCellOp && continue
-        any(v -> !(cid(v) in views) && get(cells.types, cid(v), Any) <: AbstractArray,
-            r.outputs) && push!(needed, owner)
+        (any(v -> !(cid(v) in views) && get(cells.types, cid(v), Any) <: AbstractArray,
+             r.outputs) ||
+         any(v -> cid(v) in get(ruled, owner, ()), r.inputs)) && push!(needed, owner)
     end
     filter!(pair -> last(pair) in needed, regions)
     # Deferring a potentially throwing pure calculation past an effect would
-    # change their observable order on a populated partition.
+    # change their observable order on a populated partition. A grouped sum's
+    # region runs where its group lowers, at the group's last member.
+    emitted_at = Dict{Int,Int}(owner => (group = get(groups, owner, nothing);
+                                         group === nothing ? owner : last(group))
+                               for owner in unique(values(regions)))
     starts = Dict{Int,Int}()
     effects = 0
     for r in p.recipes
         effects += r.effectful
         owner = get(regions, r.id, 0)
-        owner == 0 && continue
-        first_effects = get!(starts, owner, effects)
-        r.id == owner && effects != first_effects && delete!(needed, owner)
+        owner == 0 || get!(starts, owner, effects)
+        for (o, at) in emitted_at
+            at == r.id && effects != get(starts, o, effects) && delete!(needed, o)
+        end
     end
     filter!(pair -> last(pair) in needed, regions)
     regions
+end
+
+# The members of one emitter group with an exclusive region, while the group
+# is emitted (`_lower_authored_plate_cells!`): which member owns each value
+# (an exclusive pushed value, or whole work its region computes), each member's
+# nonempty-row guard, the names its region binds, and, per emitted statement,
+# the member it is forced to (`_CELL_UNGUARDED`, or `_CELL_BY_READS` to follow
+# what it reads). `requested` holds every row binding asked of a pushed value.
+mutable struct _CellRegions
+    const owner::Dict{ValueId,Int}
+    const guards::Dict{Int,Any}
+    const symbols::Dict{Symbol,Int}
+    const tags::Vector{Int}
+    const requested::Set{Symbol}
+    forced::Int
+end
+const _CELL_UNGUARDED = 0
+const _CELL_BY_READS = -1
+_CellRegions(owner, guards, symbols) = _CellRegions(owner, guards, symbols, Int[],
+    Set{Symbol}(), _CELL_UNGUARDED)
+
+# The rows of a request exported from a member's guard to a shared value, as
+# one vector type whether the member is empty or not.
+@inline _cell_rows_vector(row::Integer) = Int[row]
+@inline _cell_rows_vector(rows::Vector{Int}) = rows
+@inline _cell_rows_vector(rows::AbstractVector{<:Integer}) = Vector{Int}(rows)
+@inline _cell_no_rows() = Int[]
+
+# Places the statements of an emitter group with guarded members (`_CellRegions`,
+# one tag per statement) under those members' guards, after each member's
+# region (`preludes`). A statement forced to a member goes under its guard; one
+# that follows what it reads goes under the guard of the member whose values it
+# reads, or stays unguarded when it reads none. An unguarded statement may read
+# a guarded member's request rows: they are exported as no rows when the member
+# is empty, since an empty member asks for none. Each member's last guarded
+# block assigns its sum zero otherwise (`defaults`). Returns the statements and
+# the member owning each name bound under a guard, or `nothing` when a
+# statement reads two members' values, or an unguarded statement reads a
+# member's value other than request rows.
+function _cell_guard_group(statements::Vector{Any}, t::_CellRegions,
+                           preludes::Dict{Int,Vector{Any}}, defaults::Dict{Int,Any},
+                           order::Vector{Int})
+    length(t.tags) == length(statements) ||
+        error("internal: $(length(t.tags)) tags for $(length(statements)) group statements")
+    owned = copy(t.symbols)
+    out = Any[]
+    pending = Dict{Int,Vector{Any}}(m => copy(get(preludes, m, Any[])) for m in order)
+    exported = Dict{Symbol,Symbol}()
+    function flush!(member)
+        isempty(pending[member]) && return
+        push!(out, Expr(:if, copy(t.guards[member]), Expr(:block, pending[member]...)))
+        pending[member] = Any[]
+    end
+    for (k, st) in enumerate(statements)
+        read = Dict{Int,Vector{Symbol}}()
+        for name in _symbol_refs!(Set{Symbol}(), st)
+            m = get(owned, name, _CELL_UNGUARDED)
+            m == _CELL_UNGUARDED || push!(get!(() -> Symbol[], read, m), name)
+        end
+        member = t.tags[k]
+        if member == _CELL_BY_READS
+            length(read) > 1 && return nothing
+            member = isempty(read) ? _CELL_UNGUARDED : only(keys(read))
+        end
+        for (m, names) in read
+            m == member && continue
+            member == _CELL_UNGUARDED && all(in(t.requested), names) || return nothing
+            mapping = Dict{Symbol,Any}()
+            for name in names
+                x = get(exported, name, nothing)
+                if x === nothing
+                    flush!(m)
+                    x = gensym(:cell_rows_exported)
+                    push!(out, Expr(:(=), x, Expr(:if, copy(t.guards[m]),
+                        Expr(:call, _cell_ref(:_cell_rows_vector), name),
+                        Expr(:call, _cell_ref(:_cell_no_rows)))))
+                    exported[name] = x
+                end
+                mapping[name] = x
+            end
+            st = _footprint_replace(st, mapping)
+        end
+        if member == _CELL_UNGUARDED
+            push!(out, st)
+        else
+            haskey(pending, member) ||
+                error("internal: a group statement is forced to unguarded member $member")
+            push!(pending[member], st)
+            foreach(name -> owned[name] = member, _assigned_names!(Set{Symbol}(), st))
+        end
+    end
+    for member in order
+        push!(out, Expr(:if, copy(t.guards[member]), Expr(:block, pending[member]...),
+                        Expr(:block, defaults[member])))
+    end
+    out, owned
+end
+
+# The read expression of a footprint entry under its guards, and those guards.
+function _footprint_entry_parts(kind, expr)
+    guards = Any[]
+    while kind === :conditional
+        push!(guards, expr[1])
+        kind, expr = expr[2], expr[3]
+    end
+    kind, expr, guards
+end
+
+# Footprint entries recorded while a group with guarded members lowered
+# (`snapshot`: each value's entry count before it): an entry reading a name
+# bound under a member's guard (`owned`) is recorded under that guard too.
+function _footprint_guard_reads!(recording, snapshot, owned::Dict{Symbol,Int}, guards)
+    for (cid, entries) in recording.records
+        for k in get(snapshot, cid, 0) + 1:length(entries)
+            kind, expr = entries[k]
+            _, inner, present = _footprint_entry_parts(kind, expr)
+            for name in _symbol_refs!(Set{Symbol}(), inner)
+                m = get(owned, name, _CELL_UNGUARDED)
+                m == _CELL_UNGUARDED && continue
+                guard = guards[m]
+                any(x -> x == guard, present) && continue
+                push!(present, guard)
+                kind, expr = :conditional, (guard, kind, expr)
+            end
+            entries[k] = (kind, expr)
+        end
+    end
+    recording
+end
+
+# The same entries when the group lowers unguarded after all: without the
+# members' guards.
+function _footprint_unguard_reads!(recording, snapshot, guards)
+    for (cid, entries) in recording.records
+        for k in get(snapshot, cid, 0) + 1:length(entries)
+            inner_kind, inner, present = _footprint_entry_parts(entries[k]...)
+            entry = (inner_kind, inner)
+            for guard in Iterators.reverse(present)
+                any(x -> x == guard, guards) && continue
+                entry = (:conditional, (guard, entry...))
+            end
+            entries[k] = entry
+        end
+    end
+    recording
 end
 
 # ---------------------------------------------------------------- emission
@@ -3008,13 +3171,51 @@ struct _CellEmitter
     # The names of the HAVE values constant per label (a partition's
     # `plan_constant`): a lazy view may serve its rows from such a part.
     constant::Set{Symbol}
+    # A group with guarded members (`_CellRegions`), or `nothing`.
+    regions::Union{Nothing,_CellRegions}
 end
 _CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes; sorted::Bool = false,
-             constant::Set{Symbol} = Set{Symbol}()) =
+             constant::Set{Symbol} = Set{Symbol}(),
+             regions::Union{Nothing,_CellRegions} = nothing) =
     _CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes,
         Dict{ValueId,Symbol}(), Dict{ValueId,Symbol}(), Dict{Tuple{ValueId,Symbol},Symbol}(),
         Dict{ValueId,Vector{Symbol}}(), Dict{ValueId,Symbol}(),
-        Dict{ValueId,Vector{Any}}(), Dict{ValueId,Symbol}(), sorted, constant)
+        Dict{ValueId,Vector{Any}}(), Dict{ValueId,Symbol}(), sorted, constant, regions)
+
+# The member that owns value `cid` in a group with guarded members, else
+# `_CELL_UNGUARDED`.
+_cell_owner(e::_CellEmitter, cid::ValueId) =
+    e.regions === nothing ? _CELL_UNGUARDED : get(e.regions.owner, cid, _CELL_UNGUARDED)
+# Bookkeeping of value `cid` (its shape, rows and requests): a shared value's
+# stays outside every guard; an exclusive value's follows what it reads, so the
+# label-only part of it remains plannable once per label.
+_cell_bookkeeping(e::_CellEmitter, cid::ValueId) =
+    _cell_owner(e, cid) == _CELL_UNGUARDED ? _CELL_UNGUARDED : _CELL_BY_READS
+
+# Forces the statements emitted from here on to `member` (tagging those emitted
+# so far with the previous force), and records footprint reads under that
+# member's guard. Returns the previous force.
+function _cell_force!(e::_CellEmitter, member::Int)
+    t = e.regions
+    t === nothing && return member
+    n = length(e.body.args)
+    length(t.tags) < n && append!(t.tags, fill(t.forced, n - length(t.tags)))
+    previous = t.forced
+    t.forced = member
+    recording = get(task_local_storage(), _FOOTPRINT, nothing)
+    recording === nothing ||
+        (recording.guard = member > 0 ? t.guards[member] : nothing)
+    previous
+end
+function _cell_forced(f, e::_CellEmitter, member::Int)
+    e.regions === nothing && return f()
+    previous = _cell_force!(e, member)
+    try
+        f()
+    finally
+        _cell_force!(e, previous)
+    end
+end
 
 # A request's rows as the emitter holds them: canonical for a partition.
 _cell_canon(e::_CellEmitter, rows) =
@@ -3044,13 +3245,20 @@ function _cell_original_type_expr(e::_CellEmitter, input::ValueId)
     haskey(e.original_types, input) && return e.original_types[input]
     d = e.pushdowns
     input in d.pushed || return Expr(:call, GlobalRef(Core, :typeof), e.names[input])
-    r = d.producer[input]
-    types = Any[_cell_original_type_expr(e, canon_id(d.graph, v.id)) for v in r.inputs]
-    e.original_types[input] = _cell_bind!(e, :cell_type,
-        _slot_type_expr(r, d.slots[r.id], types))
+    _cell_forced(e, _cell_bookkeeping(e, input)) do
+        r = d.producer[input]
+        types = Any[_cell_original_type_expr(e, canon_id(d.graph, v.id)) for v in r.inputs]
+        e.original_types[input] = _cell_bind!(e, :cell_type,
+            _slot_type_expr(r, d.slots[r.id], types))
+    end
 end
 
+# A shape is bookkeeping of its value (`_cell_bookkeeping`), memoized once.
 function _cell_shape!(e::_CellEmitter, cid::ValueId)
+    haskey(e.shapes, cid) && return e.shapes[cid]
+    _cell_forced(() -> _cell_compute_shape!(e, cid), e, _cell_bookkeeping(e, cid))
+end
+function _cell_compute_shape!(e::_CellEmitter, cid::ValueId)
     haskey(e.shapes, cid) && return e.shapes[cid]
     d = e.pushdowns
     r = d.producer[cid]
@@ -3150,6 +3358,13 @@ end
 
 function _cell_operand_row!(e::_CellEmitter, cid::ValueId, row::Symbol)
     _footprint_record!(cid, :rows, row)
+    haskey(e.rows, (cid, row)) && return e.rows[(cid, row)]
+    # The slice follows what it reads: the operand, and the rows.
+    _cell_forced(e, _CELL_BY_READS) do
+        _cell_compute_operand_row!(e, cid, row)
+    end
+end
+function _cell_compute_operand_row!(e::_CellEmitter, cid::ValueId, row::Symbol)
     get!(e.rows, (cid, row)) do
         # The positions read, decided on the operand's shape apart from the
         # view (`_cell_slice_positions`): a partition's plan decides them once
@@ -3167,6 +3382,7 @@ end
 function _cell_request!(e::_CellEmitter, cid::ValueId, row::Symbol)
     rows = get!(() -> Symbol[], e.requests, cid)
     row in rows || push!(rows, row)
+    e.regions === nothing || push!(e.regions.requested, row)
     row
 end
 
@@ -3199,11 +3415,14 @@ function _cell_emit_windows!(e::_CellEmitter)
         cid = pending[argmax([d.order[d.producer[c].id] for c in pending])]
         push!(done, cid)
         push!(processed, cid)
-        _cell_union!(e, cid)
-        _cell_request_inputs!(e, cid)
+        _cell_forced(e, _cell_bookkeeping(e, cid)) do
+            _cell_union!(e, cid)
+            _cell_request_inputs!(e, cid)
+        end
     end
+    # A value one guarded member owns is computed only under its guard.
     for cid in sort!(processed; by = c -> d.order[d.producer[c].id])
-        e.data[cid] = _cell_window!(e, cid)
+        e.data[cid] = _cell_forced(() -> _cell_window!(e, cid), e, _cell_owner(e, cid))
     end
     e
 end
