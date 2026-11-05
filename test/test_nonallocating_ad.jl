@@ -15,13 +15,13 @@ using Test
 const NA_AD_BACKEND = AutoEnzyme(mode = Enzyme.Reverse)
 
 # NA gradients stay size-invariant on every Julia version, bounds checks on.
-# On Julia 1.12+ with `--check-bounds=yes`, Enzyme tapes the shadow of a
-# cached buffer's `Memory` pointer once per element when a loop stores into
-# the buffer and the buffer is then stored back into its `Ref` slot
+# Registered Enzyme on Julia 1.12+ with `--check-bounds=yes` taped the shadow
+# of a cached buffer's `Memory` pointer once per element when a loop stored
+# into the buffer and the buffer was then stored back into its `Ref` slot
 # (`repro_enzyme_reuse_or_similar_shadow_tape.jl`, Enzyme snag
-# `julia-1-12-rever-30566488`). The differentiated program never stores into
-# its slots (`ReactiveKernels._ad_na_cache_driver`), so its plate loops and
-# cache steps do not hit that trigger.
+# `julia-1-12-rever-30566488`). These checks pass on Julia 1.13.1 with the
+# Enzyme dogfood line (b2bb4cb6), and the differentiated program no longer
+# stores into its slots (`ReactiveKernels._ad_na_cache_driver`).
 
 nlp_naad(x, m, s) = -0.5 * log(2π) - log(s) - 0.5 * ((x - m) / s)^2
 g_prior_naad(q) = nlp_naad(q[1], 0.0, 5.0) + nlp_naad(q[2], 0.0, 5.0) +
@@ -740,4 +740,37 @@ end
         nameof(typeof(error)) === :EnzymeRuntimeActivityError || rethrow()
         false
     end broken = VERSION < v"1.12"
+end
+
+# The differentiated program's cache driver (`_ad_na_cache_driver`) and its AD
+# loops fill a slot's seeded buffer in place and never store into the slot: a
+# result of another shape is returned and not kept. Storing the filled buffer
+# back cost reverse mode a second pass over a matrix-vector product's operands
+# (Enzyme snag `enzyme-reverse-g-294ad104`) and the per-element shadow tape the
+# size-invariance tests above pin.
+@testset "the differentiated program's cache slots are read-only" begin
+    ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsMutatingFunctionsExt)
+    driver = ReactiveKernels._ad_na_cache_driver(ext.cache_apply!)
+    @test driver === ext.cache_fill!
+    A = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+    x = [1.0, -1.0]
+    buffer = zeros(3)
+    slot = Ref(buffer)
+    y = driver(slot, ReactiveKernels._MatMulStep(), A, x)
+    @test y === buffer
+    @test y == A * x
+    z = driver(slot, ReactiveKernels._MatMulStep(), A[1:2, :], x)
+    @test z == A[1:2, :] * x
+    @test slot[] === buffer
+
+    bc = Base.Broadcast.broadcasted(*, 2.0, [1.0, 2.0, 3.0])
+    @test ReactiveKernels._ad_na_materialize_loop!(slot, bc) === buffer
+    @test buffer == [2.0, 4.0, 6.0]
+    wide = Base.Broadcast.broadcasted(*, 2.0, [1.0, 2.0, 3.0, 4.0])
+    @test ReactiveKernels._ad_na_materialize_loop!(slot, wide) == [2.0, 4.0, 6.0, 8.0]
+    @test slot[] === buffer
+    @test ReactiveKernels._ad_na_arith_loop!(slot, +, [1.0, 1.0, 1.0], [2.0, 2.0, 2.0]) === buffer
+    @test buffer == [3.0, 3.0, 3.0]
+    @test ReactiveKernels._ad_na_arith_loop!(slot, -, [1.0, 1.0], [2.0, 2.0]) == [-1.0, -1.0]
+    @test slot[] === buffer
 end
