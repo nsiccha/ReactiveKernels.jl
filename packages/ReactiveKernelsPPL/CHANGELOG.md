@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.101
+
+- Partition sampler gradients with `shared=false` differentiate a compact
+  conditional program over local coordinates. They reuse shared prefix values
+  without allocating cotangents for that frontier, and mixed shared/local
+  parameter reads materialize only the selected rows. Full gradients retain
+  the shared-prefix pullback; compact and dense destinations keep their existing
+  values and coordinate order. Requires ReactiveKernels 0.1.87.
+
 ## 0.1.100
 
 - Adaptive `tune_smc(...; grid_start=:independent)` starts each grid pilot at
