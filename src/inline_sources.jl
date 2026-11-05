@@ -99,6 +99,7 @@ function _inline_source_form(r::Recipe, callargs, slot::Int)
     f = entry
     f isa _KernelBranch && (f = getfield(f, :call))
     f isa _KernelSplit && (f = getfield(f, :call))
+    f isa _KernelGatherMap && (f = getfield(f, :call))
     f isa _KernelSource || return nothing
     # A source whose closure Julia must own (a local function, a generator or
     # comprehension, an exception scope, a boxed capture) keeps its native

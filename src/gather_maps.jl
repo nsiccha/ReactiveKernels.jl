@@ -72,6 +72,18 @@ end
 _rk_gather_source(x::AbstractArray, c::Int) = view(x, Base.OneTo(c))
 _rk_gather_source(x, c::Int) = x[Base.OneTo(c)]
 
+# Only the interchange below creates this marker. Its cover proves that the
+# two arms read exactly the same source elements. Capture analysis can use the
+# authored arm without treating an arbitrary user-written guard as equivalent.
+# The executable state remains just the generated call, including its guard.
+struct _KernelGatherMap{F}
+    call::F
+end
+@inline (map::_KernelGatherMap)(args::Vararg{Any,N}) where {N} =
+    @inline map.call(args...)
+Base.@nospecializeinfer _source_record(@nospecialize(map::_KernelGatherMap)) =
+    _source_record(getfield(map, :call))
+
 # `(; f, x, k)` when `ex` is an eligible `f.(x[k])` with `k` among `cached`,
 # else `nothing`.
 function _gather_map_site(ex, cached::Set{Symbol})
@@ -175,6 +187,9 @@ function _partial_gather_maps!(recipes::Vector{Recipe}, readable, g::Graph, part
     operation = _partial_source_op(token, :_gather, vcat(params, Symbol[covers[k] for k in indices]),
                                source, mod)
     operation === nothing && return part
+    operation = _KernelSourceOp(Val(kernel_sourceop_token(operation)),
+        Val(kernel_sourceop_form(operation)), _KernelGatherMap(operation.f),
+        operation.ignored_throws, operation.call_identity, operation.mod)
     cover_values = Value[]
     for (k, cop, cover) in cover_ops
         input = part.inputs[findfirst(==(k), params)]
