@@ -133,7 +133,7 @@ end
     end
 end
 
-@testset "full gradients retain only the shared rows a unit reads" begin
+@testset "full and local gradients retain only the shared rows a unit reads" begin
     model = quote
         a ~ Normal(0, 1)
         sigma ~ Exponential(1)
@@ -144,6 +144,7 @@ end
         y .~ Normal.(mu, sigma)
     end
     allocations = Int[]
+    local_allocations = Int[]
     for n in (6, 96)
         data = (; unit=collect(1:n), ncoeff=2n, c1=collect(1:2:2n),
             c2=collect(2:2:2n), w=sin.(1:n), y=cos.(1:n))
@@ -173,14 +174,26 @@ end
                 if !compact
                     @test all(iszero, gradient[setdiff(eachindex(u), fp)])
                 end
+                local_fp = partition_footprint(sampler, label; shared=false)
+                local_gradient = zeros(compact ? length(local_fp) : length(u))
+                local_value, _ = partition_value_and_gradient!(sampler,
+                    local_gradient, point, label; shared=false)
+                @test local_value ≈ value
+                @test local_gradient ≈ (compact ? gradient[indexin(local_fp, fp)] :
+                    [i in local_fp ? gradient[i] : 0.0 for i in eachindex(u)])
             end
             if compact
                 gradient = zeros(length(partition_footprint(sampler, 1)))
                 partition_value_and_gradient!(sampler, gradient, u, 1)
                 push!(allocations, @allocated partition_value_and_gradient!(sampler, gradient, u, 1))
+                local_gradient = zeros(length(partition_footprint(sampler, 1; shared=false)))
+                partition_value_and_gradient!(sampler, local_gradient, u, 1; shared=false)
+                push!(local_allocations, @allocated partition_value_and_gradient!(sampler,
+                    local_gradient, u, 1; shared=false))
             end
         end
     end
     @test allocations[2] <= allocations[1] + 256
+    @test local_allocations[2] <= local_allocations[1] + 256
 end
 end

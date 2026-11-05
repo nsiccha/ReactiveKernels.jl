@@ -937,18 +937,22 @@ function ReactiveKernels._cell_lazy_rows(::typeof(_local_cell_point), inputs, ro
                                          constant)
     constant(inputs[3]) || return nothing
     slots = bind(:cell_positions, Expr(:ref, inputs[3], rows))
-    Expr(:call, GlobalRef(@__MODULE__, :_local_cell_rows), inputs[1], inputs[2], slots, rows)
+    # Gather the constant base separately before mixing it with active values.
+    # Otherwise the outlined mixed read carries the whole packed vector and
+    # ordinary reverse can allocate a shadow for that entire inactive base.
+    base_rows = bind(:cell_base_rows, Expr(:ref, inputs[1], rows))
+    Expr(:call, GlobalRef(@__MODULE__, :_local_cell_rows), base_rows, inputs[2], slots)
 end
-@inline function _local_cell_rows(base, active, slots::AbstractVector, rows::AbstractVector)
-    result = Vector{Float64}(undef, length(rows))
-    for i in eachindex(rows, slots)
+@inline function _local_cell_rows(base_rows::AbstractVector, active, slots::AbstractVector)
+    result = Vector{Float64}(undef, length(slots))
+    for i in eachindex(base_rows, slots)
         slot = slots[i]
-        result[i] = iszero(slot) ? base[rows[i]] : active[slot]
+        result[i] = iszero(slot) ? base_rows[i] : active[slot]
     end
     result
 end
-@inline _local_cell_rows(base, active, slot::Integer, row::Integer) =
-    [iszero(slot) ? base[row] : active[slot]]
+@inline _local_cell_rows(base_row::Float64, active, slot::Integer) =
+    [iszero(slot) ? base_row : active[slot]]
 
 # The slot map of a selection over `total` packed coordinates.
 function _compact_cell_slots(total::Int, indices)

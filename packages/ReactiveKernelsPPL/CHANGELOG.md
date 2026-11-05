@@ -29,6 +29,8 @@ are recorded in the git history only.
   remain in the compact residual instead of creating whole-panel cotangents.
   Auxiliary scalar predictor cells use the same compact slot map as the
   observation partition, avoiding a shadow of the full packed point.
+  Conditional row reads gather their base rows before mixing them with active
+  coordinates, so the mixed call retains only those rows in either AD direction.
 
 ## 0.1.100
 
