@@ -2073,13 +2073,12 @@ function _jax_source_call(ctx::_JaxContext, b::_KernelBranch{CI,TI,EI},
 end
 _jax_source_call(ctx::_JaxContext, f, args::Vector{_PyVal}, mod) = _jax_call(ctx, f, args)
 
-const _JAX_RGF = RuntimeGeneratedFunctions
 # The parameters and body of a source function: its runtime-generated body
 # when it has one (its first parameter is the captures), else its source.
 function _jax_op_body(f::_KernelSource)
     f.companion === nothing &&
         _jax_error("an embedded operation whose source Julia owns has no generated body")
-    ex = _JAX_RGF.get_expression(f.companion)
+    ex = _program_expression(f.companion)
     ex isa Expr && ex.head === :-> || _jax_error("an unexpected generated body `", ex, "`")
     params = ex.args[1] isa Expr ? Symbol[a for a in ex.args[1].args] : Symbol[ex.args[1]]
     params[2:end], ex.args[2]

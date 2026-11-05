@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.100
+## 0.1.101
 
 - Add `prepare_discrete_latents(built, plan)`, `discrete_latent_draws` and
   `discrete_latents_node`: the posteriors of the discrete latents a program
@@ -27,6 +27,20 @@ are recorded in the git history only.
   component probabilities. The graph computes the posteriors; drawing happens
   in plain Julia at the query boundary. Other summed-out latents are refused,
   naming them. Requires ReactiveKernelsDistributionKernels 0.1.4.
+
+## 0.1.100
+
+- Adaptive `tune_smc(...; grid_start=:independent)` starts each grid pilot at
+  its own copy of `init` and runs up to `options.nthreads` pilots concurrently.
+  Seeds and completed schedules are independent of worker count; evaluators
+  and sampler state are privately owned. The reference pilot remains serial.
+  The default `:sequential` strategy retains its preceding-knot warm starts.
+- Independent tuning checkpoints retain every active/completed knot and resume
+  with a different worker count. Callbacks and atomic checkpoint writes are
+  serialized, stops are cooperative, and workers join before return or error.
+- `resume_smc(...; nthreads=n)` overrides the saved production worker cap.
+  Omission retains it. Numerical clouds, evidence and RNG streams are preserved;
+  worker-count history and reduction diagnostics may differ across counts.
 
 ## 0.1.99
 

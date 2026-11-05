@@ -101,7 +101,8 @@ invariant NUTS transitions. `ess_fraction` selects the next temperature by
 bisection on the weight ESS, before resampling. A bridge that cannot progress
 by `min_increment`, or needs more than `max_stages`, throws without advancing
 its input state. `nthreads` bounds the number of concurrent particle-mutation
-workers (default `Threads.nthreads()`); each owns its sampler and AD scratch.
+workers and independent adaptive grid pilots (default `Threads.nthreads()`);
+each owns its sampler and AD scratch.
 Weighting, resampling and child-seed draws retain their serial order. Particle
 counts need not divide the worker count. A fixed seed and worker count reproduce
 the cloud and diagnostics; `nthreads=1` preserves the serial random stream.
@@ -356,7 +357,8 @@ function prepare_smc_window end
              pilot_steps=64, pilot=:continuous, max_reflections=16,
              recording_target=128, pilot_evaluations=1000, reference_inflation=2.0,
              options=SMCOptions(), progress=nothing, callback=nothing,
-             checkpoint_dir=nothing, resume=false, overwrite=false)
+             checkpoint_dir=nothing, resume=false, overwrite=false,
+             grid_start=:sequential)
 
 Prepare all mutation tuning **before** creating a production cloud. `init` is
 an explicit finite unconstrained position and `rng` an explicit independent
@@ -368,6 +370,19 @@ warm-up at each knot and exports its active bounded-reflection or diagonal scale
 with that scale's own step size. Each run starts from an explicit diagonal
 initializer, avoiding a nonportable Pathfinder factor. Its draws are discarded.
 It does not adapt from production particles.
+
+For `pilot=:adaptive`, `grid_start=:sequential` preserves the default: the first
+grid pilot starts at `init`, and each later pilot starts at the previous pilot's
+final position. Opt into `grid_start=:independent` to start every grid pilot at
+its own copy of `init`, with up to `options.nthreads` concurrent pilots, capped
+by available default Julia threads and unfinished knots. The reference pilot
+still finishes first. Each knot's seed is reserved in grid order before launch;
+private evaluators, sampler state and indexed results make the completed
+schedule identical across worker counts for the same independent run. The
+independent and sequential strategies generally learn different schedules.
+The continuous pilot supports only the sequential strategy. Independent pilots
+use more live sampler/evaluator memory; speedup depends on grid workload and
+the serial reference fit, checkpoint and callback costs.
 
 For an initial bridge, supply a normalized `SMCReference` (default standard
 Normal). With `pilot=:adaptive`, `reference=:pilot` first runs a separate pilot
@@ -414,10 +429,14 @@ must finish before its Gaussian is fitted, and every grid pilot must finish
 before its kernel is published. Zero-draw initialization stops are supported.
 
 `progress` is a Treebars parent node. Tuning creates a parent under it and a
-transient child for the reference pilot or current grid pilot, with WarmupHMC's
+transient child for the reference pilot or each active grid pilot, with WarmupHMC's
 own progress underneath. Finished pilot subtrees are detached; the parent
 reports the current phase, boundary, window, evaluations and completed knots.
 The inner window counter can restart and is not a total-work percentage.
+Independent grid callbacks and checkpoint writes are serialized. Event order
+and the subset finished at a stop can vary with scheduling. After a stop request,
+other active pilots reach cooperative boundaries and may deliver callbacks;
+all workers join before the call returns or propagates an error.
 `callback(snapshot, boundary)` is observational: only literal `true` requests
 a stop. `boundary` is `:init`, `:window`, or `:pilot` after a completed pilot.
 The immutable scalar snapshot records `phase` (`:reference`/`:grid`), `knot`
@@ -440,6 +459,9 @@ boundary; work since that boundary is not saved. Only this latest outer record
 is retained. The active payload includes sampler draws and can grow with the
 active pilot; completed pilots retain no draws. Boundary history is capped by
 `options.history_limit`, independently of the finite grid's completed work.
+Independent-grid checkpoints retain each knot's seed and its active payload
+or completed kernel/work, plus the grid-start strategy. Their live payloads
+can therefore occupy memory for several pilots at once.
 
 To resume, rebuild the original target (and `previous`, for an update), then
 call `tune_smc` with the original tuning keywords and either `checkpoint_dir=dir,
@@ -450,6 +472,9 @@ The required `rng` argument is ignored on resume: the
 checkpoint supplies both RNG streams. No callback is repeated at the restored
 initialization/window boundary. Resuming a completed file returns its schedule
 without running another pilot or callback.
+`options.nthreads` may change on resume; it controls worker allocation, not
+the saved numerical continuation. Keep `grid_start` and other tuning settings
+unchanged. Switching strategy requires a fresh tuning run.
 
 From 0.1.98, custom sampling expressions in coordinate identities use the same
 generated-namespace normalization as the built program. Rebuilt helper modules
@@ -697,7 +722,7 @@ function update_smc end
 
 """
     smc_checkpoint(state)
-    resume_smc(target, checkpoint; previous=nothing)
+    resume_smc(target, checkpoint; previous=nothing, nthreads=nothing)
 
 Copy the completed-stage state into a versioned, data-only checkpoint. Persist
 it with Julia `Serialization` in a trusted file. Rebuild the target after a
@@ -707,6 +732,13 @@ are checked. Queries, compiled code and AD caches are never serialized.
 Exact seeded continuation requires the same Julia/package versions, data,
 model code and configuration. This API does not write files or promise atomic
 disk persistence. The caller owns file replacement and model/data retention.
+Omitting `nthreads` preserves the saved worker cap. Pass a positive integer,
+for example `nthreads=Threads.nthreads()`, to override only that cap; actual
+workers remain bounded by available default threads and particle count.
+Changing it preserves the particle cloud, evidence and RNG stream. History
+records the workers used at each stage; floating-point reductions in movement
+and mean-acceptance diagnostics can differ in their last bits across counts.
+The checkpoint itself is unchanged.
 """
 function smc_checkpoint end
 function resume_smc end

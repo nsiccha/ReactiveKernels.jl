@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.87
+
+- A kernel prepared from a module that replaced another module at the same
+  path (a REPL or test file `include`d again, `include_string`, re-evaluating
+  a submodule of a package) runs its own module's functions. Before, it could
+  run the code compiled for the replaced module, including a package image's
+  program for it, so an edited definition silently kept its old behaviour.
+  Kernels of the replaced module keep running that module's code.
+
 ## 0.1.86
 
 - Position-batched readers read a slice that is directly an operand of a dotted
