@@ -114,16 +114,15 @@ end
     for kind in (:direct, :indexed, :nonlinear), shared in (false, true)
         expression = kind === :direct ? :(z[1]) :
             kind === :indexed ? :(mu[1]) : :(exp(mu[1]) + mu[1])
-        other = shared ? :(second .~ Normal.(one, 1.0)) : nothing
         names = shared ? (:extra, :second, :y) : (:extra, :y)
         source = quote
             z[1:3] .~ Normal.(0.0, 1.0)
             mu = exp.(z)
             one = $expression
             extra .~ Normal.(one, 1.0)
-            $other
             y .~ Normal.(mu, 1.0)
         end
+        shared && push!(source.args, :(second .~ Normal.(one, 1.0)))
         plan = bind_data(lower_rkppl(source, data;
             conditioned=names, mod=@__MODULE__), data)
         built = build_kernel(plan)
