@@ -1830,6 +1830,19 @@ key column itself (`z[levels(subject)]`) or as `parameter => labels` giving
 each level's label. Preparation then checks every label: a partition that
 reads another label's coordinates of those parameters, even genuinely, is
 refused with a `ReactiveKernels.PartitionSeparabilityError` naming them.
+
+For `parameter => labels`, the label count is the first constrained dimension
+(`first(parameter_metadata(built)[i].shape)`), or the packed count for a scalar.
+Labels cycle in order over that parameter's packed coordinates. The packed
+count need not equal or be divisible by the label count. For a whole local
+coupled transform, repeat its unit's label across that constrained axis:
+`L ~ LKJCholesky(2, eta)` takes `partitioned = (:L => fill(unit, 2),)`, even
+though `L` has only one packed coordinate. More generally an LKJ factor of
+width `K` takes `fill(unit, K)` to assign all `K*(K-1)/2` coordinates to `unit`.
+This declaration assigns coordinate ownership; it does not split the transform
+or its atomic prior/Jacobian factors. A partition query still selects only
+the requested observations, not those prior/Jacobian terms.
+
 The compiler also cuts out intermediates that structurally read only shared
 coordinates and bound data. The sampler keeps their values across labels and
 local-coordinate changes, and recomputes them when a shared coordinate changes.
