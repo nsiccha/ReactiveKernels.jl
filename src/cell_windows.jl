@@ -1688,6 +1688,23 @@ function _cell_capture_body(op::_AuthoredScanOp, n)
     (op.kernel.plan, pairs, true)
 end
 
+# The compiler's gather-map interchange preserves its authored arm's read set
+# by construction (_rk_gather_cover). Keep that read proof when analysing a
+# capture: the generated _rk_gather_source call otherwise looks like a whole
+# argument use, forcing even an absent observation's producer to execute.
+# Numerical lowering still runs the full guarded source. No authored branch
+# acquires this equivalence merely by having the same expression shape.
+function _cell_capture_native(r::Recipe; branches::Bool = false)
+    analyzed = _cell_native(r; branches)
+    analyzed === nothing && return nothing
+    r.op.f isa _KernelGatherMap || return analyzed
+    _, params, mod = analyzed
+    source = _lane_expand_dot(_lane_strip_lines(r.source), mod)
+    Meta.isexpr(source, :if, 3) || return nothing
+    native = _lane_strip_lines(_kernel_native_body(source.args[3], mod, Set{Symbol}(params)))
+    (native, params, mod)
+end
+
 # How the plate body reads shared argument `cid`: only as `v[q]` or `v[w[q]]`,
 # `q` the element of a batched argument `b`, `w` one other shared argument.
 # Each distinct read `(b, w)`, `w = 0` for `v[q]`, in first-read order, or
@@ -1738,7 +1755,7 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid;
         end
         recipe.op isa _KernelSourceOp || return nothing
         branch = recipe.op.f isa _KernelBranch
-        analyzed = _cell_native(recipe; branches = branch_read !== nothing)
+        analyzed = _cell_capture_native(recipe; branches = branch_read !== nothing)
         analyzed === nothing && return nothing
         native, params, mod = analyzed
         reads = Any[]
