@@ -108,4 +108,101 @@ end
         end
     end
 end
+
+_scalar_covariance_add(a, b) = a + b
+
+@testset "absent observation with a whole covariance factor" begin
+    for captured in (false, true)
+        data = (; y = [0.1, 0.2], soil = [0.3, 0.4], group = [1, 2])
+        location = captured ? quote
+            ra = R[group, 1]
+            rb = R[group, 2]
+            @plate for i in eachindex(soil)
+                mu[i] = _scalar_covariance_add(ra[i], rb[i])
+            end
+        end : quote
+            mu = R[group, 1] .+ R[group, 2]
+        end
+        source = quote
+            a[1:2] .~ Normal.(0.0, 1.0)
+            sd[1:2] .~ Exponential.(1.0)
+            L ~ LKJCholesky(2, 2.0)
+            Z[1:2, 1:2] .~ Normal.(0.0, 1.0)
+            F = sd .* L
+            R = Z * F'
+            $(location.args...)
+            y .~ Normal.(a, 1.0)
+            soil .~ Normal.(mu, 1.0)
+        end
+        plan = bind_data(lower_rkppl(source, data;
+            conditioned = (:y, :soil), mod = @__MODULE__), data)
+        built = build_kernel(plan)
+        u = collect(range(-0.3, 0.3; length = built.layout.total))
+        by = (; y = [1, 2], soil = [1, 1])
+        partitioned = (:a => [1, 2], :sd => [1, 1], :L => [1, 1], :Z => [1, 1])
+        query = prepare_partition(built, plan, (:y, :soil); by, partitioned, u0 = u)
+        full = prepare_query(built, plan, :likelihood)
+        for point in (u, u .+ 0.2)
+            @test partition_footprint(query.kernel, point, 1, nothing).unconstrained ==
+                [1, 3, 4, 5, 6, 7, 8, 9]
+            @test partition_footprint(query.kernel, point, 2, nothing).unconstrained == [2]
+            @test sum(query(point, label) for label in (1, 2)) ≈ full(point)
+            @test query(point, 2) ≈ -(log(2pi) + (point[2] - data.y[2])^2) / 2
+        end
+        # The active covariance still reads all three of its coordinates: moving
+        # its ownership to another label must remain a separability violation.
+        @test_throws PartitionSeparabilityError prepare_partition(built, plan, (:y, :soil);
+            by, partitioned = (:a => [1, 2], :sd => [2, 2], :L => [2, 2], :Z => [1, 1]), u0 = u)
+    end
+end
+
+@testset "absent scalar observation" begin
+    data = (; y=[0.1, 0.2, 0.3], extra=0.4, second=0.8)
+    for kind in (:direct, :indexed, :nonlinear), shared in (false, true)
+        expression = kind === :direct ? :(z[1]) :
+            kind === :indexed ? :(mu[1]) : :(exp(mu[1]) + mu[1])
+        names = shared ? (:extra, :second, :y) : (:extra, :y)
+        source = quote
+            z[1:3] .~ Normal.(0.0, 1.0)
+            mu = exp.(z)
+            one = $expression
+            extra .~ Normal.(one, 1.0)
+            y .~ Normal.(mu, 1.0)
+        end
+        shared && push!(source.args, :(second .~ Normal.(one, 1.0)))
+        plan = bind_data(lower_rkppl(source, data;
+            conditioned=names, mod=@__MODULE__), data)
+        built = build_kernel(plan)
+        by = shared ? (; extra=[1], second=[1], y=[1,2,3]) : (; extra=[1], y=[1,2,3])
+        query = prepare_partition(built, plan, names; by,
+            u0=[0.2, 0.4, 0.6], partitioned=(:z => [1,2,3],))
+        for compact in (false, true)
+            sampler = prepare_partition_sampler(built, plan, names, [0.2,0.4,0.6];
+                by, partitioned=(:z => [1,2,3],), compact,
+                backend=AutoEnzyme(; mode=Enzyme.Reverse))
+            for u in ([0.2,0.4,0.6], [-0.1,0.3,-0.2]), label in 1:3
+                @test partition_footprint(sampler, label) == [label]
+                gradient = zeros(compact ? 1 : 3)
+                value, _ = partition_value_and_gradient!(sampler, gradient, u, label)
+                @test value ≈ query(u, label)
+                expected_value = -(log(2pi) + (exp(u[label]) - data.y[label])^2) / 2
+                expected = zeros(3)
+                mu = exp.(u)
+                expected[label] = -(mu[label] - data.y[label]) * mu[label]
+                if label == 1
+                    one = kind === :direct ? u[1] : kind === :indexed ? mu[1] : exp(mu[1]) + mu[1]
+                    derivative = kind === :direct ? 1.0 : kind === :indexed ? mu[1] : (exp(mu[1]) + 1) * mu[1]
+                    for observed in (shared ? (data.extra, data.second) : (data.extra,))
+                        expected[1] -= (one - observed) * derivative
+                        expected_value -= (log(2pi) + (one - observed)^2) / 2
+                    end
+                end
+                @test value ≈ expected_value
+                @test gradient ≈ (compact ? expected[[label]] : expected)
+            end
+        end
+        @test_throws PartitionSeparabilityError prepare_partition(built, plan, names;
+            by=merge(by, (; extra=[2])), u0=[0.2,0.4,0.6], partitioned=(:z => [1,2,3],))
+    end
+end
 end

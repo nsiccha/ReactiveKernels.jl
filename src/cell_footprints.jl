@@ -85,11 +85,16 @@ function _footprint_index_free(ex, source, params, mod)
 end
 
 # The names a generated body binds at its top level, and its HAVE arguments.
-function _footprint_bound_names(body::Expr, p::Plan, names)
+# An exclusive partition region's bindings are visible under the same guard
+# in the recorded reads; other branch-local bindings remain excluded.
+function _footprint_bound_names(body::Expr, p::Plan, names; guards = ())
     out = Set{Symbol}(names[canon_id(p.graph, v.id)] for v in p.have)
-    for st in body.args
+    function visit(st)
         Meta.isexpr(st, :(=)) && st.args[1] isa Symbol && push!(out, st.args[1])
+        Meta.isexpr(st, :block) && foreach(visit, st.args)
+        Meta.isexpr(st, :if) && first(st.args) in guards && foreach(visit, st.args[2:end])
     end
+    foreach(visit, body.args)
     out
 end
 

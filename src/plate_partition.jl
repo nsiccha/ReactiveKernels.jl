@@ -641,9 +641,11 @@ mutable struct _FootprintRecords
     # it (a plate body, an embedded kernel) runs blind to the recording
     # (`_lower_with_ops_collecting`).
     active::Bool
+    # Nonempty-row guard of the exclusive region currently being emitted.
+    guard::Any
 end
 _FootprintRecords(selection = nothing) =
-    _FootprintRecords(Dict{ValueId,Vector{Tuple{Symbol,Any}}}(), selection, false)
+    _FootprintRecords(Dict{ValueId,Vector{Tuple{Symbol,Any}}}(), selection, false, nothing)
 
 # A packed-vector projection, owned by the prepared footprint. The sorted
 # indices let ranges skip excluded blocks without visiting their elements.
@@ -658,8 +660,20 @@ _footprint_recording() = get(task_local_storage(), _FOOTPRINT, nothing) !== noth
 function _footprint_record!(cid::ValueId, kind::Symbol, expr)
     recording = get(task_local_storage(), _FOOTPRINT, nothing)
     recording === nothing && return
-    push!(get!(() -> Tuple{Symbol,Any}[], recording.records, cid), (kind, expr))
+    push!(get!(() -> Tuple{Symbol,Any}[], recording.records, cid),
+        _footprint_guarded(recording.guard, kind, expr))
     nothing
+end
+
+_footprint_guarded(guard, kind, expr) = guard === nothing ? (kind, expr) :
+    (:conditional, (guard, kind, expr))
+# Keep the read expression itself lazy: its view or row metadata may only be
+# bound inside the same nonempty region in the value lowering.
+function _footprint_entry(kind, expr)
+    kind === :conditional || return Expr(:tuple, QuoteNode(kind), expr)
+    guard, inner_kind, inner_expr = expr
+    Expr(:if, guard, _footprint_entry(inner_kind, inner_expr),
+        Expr(:tuple, QuoteNode(:positions), Expr(:ref, Int)))
 end
 
 # A capture reads linear positions `v[q]` of a vector. Of any other array it may
@@ -676,7 +690,8 @@ end
 # recorded reads, plus the reads of the recipes the window emitter never
 # saw (computed whole: a bound-indexed gather or literal range view reads
 # constant positions, anything else the whole port).
-function _footprint_return(p::Plan, cells, names, declared = nothing, body = nothing)
+function _footprint_return(p::Plan, cells, names, declared = nothing, body = nothing;
+                           guards = Dict{Int,Any}())
     recording = task_local_storage(_FOOTPRINT)
     g = p.graph
     cidof(v) = canon_id(g, v.id)
@@ -691,11 +706,14 @@ function _footprint_return(p::Plan, cells, names, declared = nothing, body = not
         findfirst(port -> port.name == first(selection), p.have)
     selected_cid = selected_port === nothing ? nothing : cidof(p.have[selected_port])
     reads = Dict(cid => copy(entries) for (cid, entries) in recording.records)
-    record(cid, kind, expr) = push!(get!(() -> Tuple{Symbol,Any}[], reads, cid), (kind, expr))
+    guard = nothing
+    record(cid, kind, expr) = push!(get!(() -> Tuple{Symbol,Any}[], reads, cid),
+        _footprint_guarded(guard, kind, expr))
     # A view's reads are mapped at its binding: only a view whose value and
     # operands the body binds at its top level (not one a scan, a fused plate
     # or a branch arm absorbed) forwards its readers' positions.
-    bound = body === nothing ? Set{Symbol}() : _footprint_bound_names(body, p, names)
+    bound = body === nothing ? Set{Symbol}() :
+        _footprint_bound_names(body, p, names; guards = values(guards))
     for cid in wants
         record(cid, :whole, nothing)
     end
@@ -703,6 +721,7 @@ function _footprint_return(p::Plan, cells, names, declared = nothing, body = not
     # positions to the parent. Constructing a view only reads shape/index
     # metadata; a copying gather retains the ordinary eager read below.
     for r in reverse(p.recipes)
+        guard = get(guards, r.id, nothing)
         r.op isa _AuthoredPlateCellOp && continue
         any(o -> cidof(o) in pushed, r.outputs) && continue
         typed = declared === nothing ||
@@ -721,7 +740,7 @@ function _footprint_return(p::Plan, cells, names, declared = nothing, body = not
                 mapping[view.params[s]] = Expr(:call, GlobalRef(Base, :LinearIndices), names[cid])
                 indexmap = _footprint_replace(view.native, mapping)
                 out = cidof(only(r.outputs))
-                entries = Expr(:tuple, (Expr(:tuple, QuoteNode(k), e)
+                entries = Expr(:tuple, (_footprint_entry(k, e)
                     for (k, e) in get(reads, out, Tuple{Symbol,Any}[]))...)
                 record(cid, :gathered, Expr(:call,
                     GlobalRef(@__MODULE__, :_footprint_view_positions), indexmap, names[out], entries))
@@ -744,7 +763,7 @@ function _footprint_return(p::Plan, cells, names, declared = nothing, body = not
         selection === nothing || port.name == first(selection) || continue
         selected = selection === nothing ? nothing : last(selection)
         cid = cidof(port)
-        records = Any[Expr(:tuple, QuoteNode(kind), expr === nothing ? nothing : expr)
+        records = Any[_footprint_entry(kind, expr)
                       for (kind, expr) in get(reads, cid, Tuple{Symbol,Any}[])]
         push!(entries, Expr(:tuple, QuoteNode(port.name), names[cid], Expr(:tuple, records...),
                             QuoteNode(selected)))
