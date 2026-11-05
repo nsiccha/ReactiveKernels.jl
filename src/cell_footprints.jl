@@ -101,9 +101,27 @@ _footprint_replace(ex, mapping) = ex
 function _footprint_join(reads...)
     out = Int[]
     for read in reads
-        read isa Integer ? push!(out, read) : append!(out, vec(read))
+        _footprint_append!(out, read)
     end
     unique!(sort!(out))
+end
+_footprint_append!(out, read) =
+    read isa Integer ? push!(out, read) : append!(out, vec(read))
+
+# Keep generator binders and guards in runtime loops over integer maps. No
+# closure or data-length argument tuple is introduced in the footprint kernel.
+function _footprint_loop(gather, clauses)
+    isempty(clauses) && return gather
+    out = gensym(:positions)
+    body = Expr(:call, GlobalRef(@__MODULE__, :_footprint_append!), out, gather)
+    for clause in Iterators.reverse(clauses)
+        if Meta.isexpr(clause, :filter)
+            body = Expr(:if, clause.args[1], body)
+            clause = clause.args[2]
+        end
+        body = Expr(:for, clause, body)
+    end
+    Expr(:let, Expr(:(=), out, Expr(:call, QuoteNode(Vector{Int}))), Expr(:block, body, out))
 end
 
 # A selected plate's footprint for one shared array. Independent recipes
@@ -127,7 +145,7 @@ function _footprint_capture_program(inner::Plan, root::Int)
     add!(g; inputs=(have[root],), outputs=(indices,), op=LinearIndices)
     views[cid(inner.have[root])] = indices
     reads = Value[]
-    seen_view = false
+    seen_access = false
     for r in inner.recipes
         slots = findall(v -> cid(v) in dependent, r.inputs)
         if isempty(slots)
@@ -157,10 +175,10 @@ function _footprint_capture_program(inner::Plan, root::Int)
                 add!(g; inputs=args, outputs=(w,), op=f)
                 if access.kind === :view
                     views[cid(only(r.outputs))] = w
-                    seen_view = true
                 else
                     push!(reads, w)
                 end
+                seen_access = true
                 continue
             end
         elseif _cell_identity_form(r) !== nothing && length(slots) == 1 &&
@@ -170,8 +188,7 @@ function _footprint_capture_program(inner::Plan, root::Int)
         end
         # A compound recipe that reads index-mapped values only through
         # gathers (`w .* v[I]`) reads the gathered positions.
-        mapped_slots = Int[j for j in slots if haskey(views, cid(r.inputs[j])) &&
-                           cid(r.inputs[j]) != cid(inner.have[root])]
+        mapped_slots = Int[j for j in slots if haskey(views, cid(r.inputs[j]))]
         gathers = isempty(mapped_slots) ? nothing :
             _footprint_inner_gathers(r, mapped_slots, slots)
         if gathers !== nothing && all(gathers) do (slot, refs, _)
@@ -184,6 +201,7 @@ function _footprint_capture_program(inner::Plan, root::Int)
                                      for j in refs), outputs=(w,), op=f)
                 push!(reads, w)
             end
+            seen_access = true
             continue
         end
         for j in slots
@@ -193,7 +211,7 @@ function _footprint_capture_program(inner::Plan, root::Int)
             push!(reads, views[cid(v)])
         end
     end
-    seen_view || return nothing
+    seen_access || return nothing
     for v in inner.want
         haskey(views, cid(v)) || continue
         cid(v) == cid(inner.have[root]) && return nothing
@@ -207,6 +225,38 @@ end
 
 r_params(r::Recipe) = _cell_native(r)[2]
 
+# A direct scalar expression's index program can also request a producer's
+# numerical rows. Unlike footprint-only view traversal, this needs the body
+# to accept a sparse window: constructing an inner view may read more of that
+# window than the final consumer does. Keep such bodies on the ordinary path.
+function _cell_capture_index_program(inner::Plan, root::Int)
+    length(inner.recipes) == 1 || return nothing
+    r = only(inner.recipes)
+    cid(v) = canon_id(inner.graph, v.id)
+    slot = findfirst(v -> cid(v) == cid(inner.have[root]), r.inputs)
+    slot === nothing && return nothing
+    _footprint_inner_gathers(r, [slot], [slot]) === nothing && return nothing
+    _footprint_capture_program(inner, root)
+end
+
+function _cell_index_dependencies(program)
+    p = program.plan
+    cid(v) = canon_id(p.graph, v.id)
+    used = Set(cid(v) for r in p.recipes for v in r.inputs)
+    Set(k for (k, v) in enumerate(p.have) if cid(v) in used)
+end
+
+# Evaluate the index program over exactly the plate lanes the value reads,
+# both for selected top-level cells and for a producer plate's row window.
+function _footprint_plate_reads!(body, runtime_ops, runtime_recipes,
+                                 program, atomic, args, values)
+    readplate = _AuthoredPlateOp{typeof(program),atomic}(program)
+    reads = gensym(:cell_reads)
+    _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
+        readplate, args, values, reads, nothing; element_type = Vector{Int})
+    reads
+end
+
 # The gathers `v[I...]` of index-mapped inputs (`mapped_slots`) inside a
 # compound recipe, as `(slot, referenced input slots, expression)`, when the
 # recipe reads those inputs in no other way and no index reads a dependent
@@ -214,20 +264,44 @@ r_params(r::Recipe) = _cell_native(r)[2]
 # otherwise, or when the recipe cannot be analysed.
 function _footprint_inner_gathers(r::Recipe, mapped_slots, dependent_slots)
     length(r.outputs) == 1 && !r.effectful || return nothing
-    analyzed = _cell_native(r)
+    # Read the authored generator before native fold lowering introduces its
+    # accumulator and loop. The numerical recipe itself is left unchanged.
+    analyzed = _cell_source(r)
     analyzed === nothing && return nothing
     native, params, mod = analyzed
+    mod isa Module || return nothing
     sources = Dict{Symbol,Int}(params[j] => j for j in mapped_slots)
     dependent = Set{Symbol}(params[j] for j in dependent_slots)
     found = Tuple{Int,Vector{Int},Any}[]
-    function walk(ex)
+    function walk(ex, clauses = Any[], bound = Set{Symbol}(params))
         ex isa Symbol && return !haskey(sources, ex)
         ex isa Expr || return true
+        if Meta.isexpr(ex, :call) && !isempty(ex.args) &&
+                !_native_callee_shadowed(ex.args[1], bound) &&
+                _cell_binding(ex.args[1], mod) === Base.sum
+            parts = _kernel_generator_sum_parts(
+                Expr(:call, GlobalRef(Base, :sum), ex.args[2:end]...))
+            if parts !== nothing
+                # Only eager sums with data-only domains and guards. An
+                # arbitrary generator consumer may stop before a later read.
+                parts.variable in bound && return false
+                _cell_free_of(parts.iterator, dependent) || return false
+                _cell_free_of(parts.condition, dependent) || return false
+                walk(parts.init, clauses, bound) || return false
+                clause = Expr(:(=), parts.variable, parts.iterator)
+                parts.condition === nothing ||
+                    (clause = Expr(:filter, parts.condition, clause))
+                return walk(parts.term, [clauses; clause], union(bound, [parts.variable]))
+            end
+        end
         ex.head in _CELL_PLAIN_HEADS || return false
+        # Do not hoist a possibly invalid read out of a lazy term branch.
+        ex.head in (:if, :&&, :||) &&
+            !_cell_free_of(ex, Set(keys(sources))) && return false
         source, indices = if Meta.isexpr(ex, :ref) && length(ex.args) >= 2
             ex.args[1], ex.args[2:end]
         elseif Meta.isexpr(ex, :call) && length(ex.args) >= 3 &&
-                !_native_callee_shadowed(ex.args[1], params) &&
+                !_native_callee_shadowed(ex.args[1], bound) &&
                 _cell_binding(ex.args[1], mod) === Base.getindex
             ex.args[2], ex.args[3:end]
         else
@@ -238,11 +312,16 @@ function _footprint_inner_gathers(r::Recipe, mapped_slots, dependent_slots)
             all(i -> _footprint_index_free(i, Set([source]), params, mod) &&
                      _cell_free_of(i, others), indices) || return false
             gather = Expr(:call, GlobalRef(Base, :getindex), source, indices...)
+            names = Dict(q => q for q in bound)
+            gather = _inline_qualify(gather, mod, names)
+            qualified_clauses = Any[_inline_qualify(c, mod, names) for c in clauses]
+            (gather === nothing || any(isnothing, qualified_clauses)) && return false
+            gather = _footprint_loop(gather, qualified_clauses)
             refs = Int[j for (j, q) in enumerate(params) if _footprint_mentions(gather, q)]
             push!(found, (sources[source], refs, gather))
             return true
         end
-        all(walk, ex.args)
+        all(a -> walk(a, clauses, bound), ex.args)
     end
     walk(native) && !isempty(found) ? found : nothing
 end

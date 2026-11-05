@@ -1026,7 +1026,14 @@ positions, and a view the parent positions its readers read (constructing a
 view reads none; a typed local that converts a view into a copy reads every
 viewed position). A read nested in a larger expression, `tanh.(view(u, 2:3:8))`,
 contributes its literal positions. A product over a bound sparse factor reads its
-operand at the columns its rows store. Retained branches use capture row windows when bound indices
+operand at the columns its rows store. A scalar generator sum with `init`
+contributes its visible gathers, including through views, when its domains,
+filters and indices do not read the captured array's values. Nested sums keep
+runtime loops; empty domains contribute no positions. Opaque reads, lazy term
+branches and other generator consumers retain conservative footprints.
+Direct captures in one scalar expression also request only the needed rows of
+eligible producers, including copying packed-parameter slices.
+Retained branches use capture row windows when bound indices
 prove both arms' requests in range; unproven requests may conservatively
 contribute the whole capture. Arm arithmetic remains lazy.
 For a partition or cell of a packed parameter vector this is its structural read

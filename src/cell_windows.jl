@@ -112,6 +112,17 @@ struct _CellWindow{D,R<:Union{Int,Vector{Int}},S,X}
 end
 _CellWindow(data, rows, shape, sorted::Bool) = _CellWindow(data, rows, shape, sorted, nothing, Int[])
 
+Base.axes(w::_CellWindow{<:Any,<:Any,<:Tuple}) = w.shape
+Base.size(w::_CellWindow{<:Any,<:Any,<:Tuple}) = map(length, w.shape)
+Base.length(w::_CellWindow{<:Any,<:Any,<:Tuple}) = prod(length, w.shape; init = 1)
+Base.ndims(w::_CellWindow{<:Any,<:Any,<:Tuple}) = length(w.shape)
+Base.axes(w::_CellWindow{<:Any,<:Any,<:Tuple}, d::Integer) = axes(LinearIndices(w.shape), d)
+Base.size(w::_CellWindow{<:Any,<:Any,<:Tuple}, d::Integer) = size(LinearIndices(w.shape), d)
+Base.firstindex(w::_CellWindow{<:Any,<:Any,<:Tuple}, args...) =
+    firstindex(LinearIndices(w.shape), args...)
+Base.lastindex(w::_CellWindow{<:Any,<:Any,<:Tuple}, args...) =
+    lastindex(LinearIndices(w.shape), args...)
+
 # The position along `data`'s first axis of row `row`; `at` is the read. The
 # lookup reads the window's rows only, so native reverse differentiation sees
 # index arithmetic apart from the data (below).
@@ -658,6 +669,10 @@ end
 # role `:part`. `vias[j][m]` is the shared index array an authored plate reads
 # source `j` through at its `m`th index (`v[w[q]]`, `q` the element of index
 # input `indices[j][m]`), 0 for a direct read; that index array has role `:via`.
+# A `:program_gather` uses the scalar body's integer index program, held in
+# `literal.programs`; its data dependencies are `literal.dependencies`.
+# A batched `:program_lane` supplies index metadata before windows are built,
+# so its producer remains whole while its selected rows feed the scalar body.
 struct _CellForm
     kind::Symbol
     roles::Vector{Symbol}
@@ -667,7 +682,7 @@ struct _CellForm
     indices::Vector{Vector{Int}}
     parts::Vector{Any}
     vias::Vector{Vector{Int}}
-    # A `:range_view`'s literal range, or a `:reshape`'s literal dimensions.
+    # A range/reshape's literal dimensions, or a plate's capture index programs.
     literal::Any
     # Per input, each gather's index-input position and trailing-axis pattern,
     # with integer indices represented by 1: `(1, Colon())` for `A[I, k, :]`.
@@ -786,12 +801,19 @@ const _CELL_PLAIN_HEADS = (:call, :ref, :tuple, :., Symbol("'"), :vect, :hcat,
     :vcat, :row, :nrow, :ncat, :parameters, :kw, :comparison, :&&, :||, :if,
     :curly, :..., :string, :(::))
 
-function _cell_native(r::Recipe; outlined::Bool = false, branches::Bool = false)
+function _cell_source(r::Recipe; outlined::Bool = false, branches::Bool = false)
     closure = _lane_source_closure(r; outlined, branches)
     closure === nothing && return nothing
     _, params, mod = closure
     source = _lane_expand_dot(_lane_strip_lines(r.source), mod)
     source isa Expr && !_lane_has_macro(source) || return nothing
+    (source, params, mod)
+end
+
+function _cell_native(r::Recipe; outlined::Bool = false, branches::Bool = false)
+    analyzed = _cell_source(r; outlined, branches)
+    analyzed === nothing && return nothing
+    source, params, mod = analyzed
     native = _lane_strip_lines(_kernel_native_body(source, mod, Set{Symbol}(params)))
     (native, params, mod)
 end
@@ -1400,7 +1422,30 @@ function _cell_plate_form(r::Recipe)
         end
     end
     foreach(w -> roles[w] = :via, through)
-    _CellForm(:pointwise, roles, gather_index, leaves, 0, indices, Any[], vias)
+    programs = Dict{Int,Any}()
+    dependencies = Dict{Int,Set{Int}}()
+    for k in atomic
+        roles[k] === :whole || continue
+        program = _cell_capture_index_program(inner, k)
+        program === nothing && continue
+        programs[k] = program
+        dependencies[k] = _cell_index_dependencies(program)
+    end
+    # Index metadata must remain available before producer windows are built.
+    # A capture used to find another capture's indices is therefore not pushed.
+    metadata = Set(j for (k, js) in dependencies for j in js if j != k)
+    for k in collect(keys(programs))
+        k in metadata && (delete!(programs, k); delete!(dependencies, k))
+    end
+    if !isempty(programs)
+        metadata = Set(j for (k, js) in dependencies for j in js if j != k)
+        for j in metadata
+            roles[j] = j in atomic ? :whole : :program_lane
+        end
+        foreach(k -> roles[k] = :program_gather, keys(programs))
+    end
+    _CellForm(:pointwise, roles, gather_index, leaves, 0, indices, Any[], vias,
+        (; programs, dependencies))
 end
 
 # The type of an authored plate's value from its input types: an array of its
@@ -1965,6 +2010,14 @@ function _cell_input_views(p::Plan; types = nothing)
         else
             false
         end
+        # A genuine view of existing storage also stays lazy when its bounds
+        # are shape expressions rather than a literal range row form. Typed
+        # conversions that copy the view are excluded by _footprint_access.
+        if !projection
+            access = _footprint_access(r)
+            projection = access !== nothing && access.kind === :view &&
+                _footprint_indices_free(access) && cid(r.inputs[access.slot]) in storage
+        end
         # Flattening existing storage changes only its indexing. This also
         # preserves provenance when a selected cell's body contains vec(data).
         if !projection && !r.effectful && length(r.inputs) == 1 &&
@@ -1996,7 +2049,8 @@ end
 # Whether a producer reads an input in `role` at its own rows.
 _cell_row_role(role) =
     role in (:leaf, :gather, :linear_gather, :column, :factor_leaf, :factor, :part,
-             :range_source, :reshape_source, :row, :vec_source, :sparse_operand)
+             :range_source, :reshape_source, :row, :vec_source, :sparse_operand,
+             :program_gather)
 
 # `outlined` are the ids of the recipes a cell lowering outlined (`_cell_outline`);
 # `blocked`, when given, collects the ids of the producers whose values a reader
@@ -2919,7 +2973,39 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
     for (j, input) in enumerate(r.inputs)
         icid = canon_id(d.graph, input.id)
         role = f.roles[j]
-        if role in (:leaf, :index, :column) && icid in d.pushed
+        if role === :program_gather
+            program = f.literal.programs[j]
+            dependencies = f.literal.dependencies[j]
+            atomic = typeof(r.op).parameters[2]
+            args = Any[if k == j
+                    shape = icid in d.pushed ? _cell_shape!(e, icid) :
+                        _cell_leaf_shape_expr(e, icid)
+                    Expr(:call, GlobalRef(Base, :LinearIndices), shape)
+                elseif !(k in atomic) && k in dependencies
+                    _cell_operand_row!(e, canon_id(d.graph, v.id), U)
+                elseif !(k in atomic)
+                    # An unused lane contributes axes only. Its numerical
+                    # producer may itself be awaiting these window requests.
+                    lane = canon_id(d.graph, v.id)
+                    shape = lane in d.pushed ? _cell_shape!(e, lane) :
+                        _cell_leaf_shape_expr(e, lane)
+                    positions = Expr(:call, _cell_ref(:_cell_slice_positions), shape, U)
+                    Expr(:call, _cell_ref(:_cell_rows_view),
+                        Expr(:call, GlobalRef(Base, :LinearIndices), shape), positions)
+                elseif k in dependencies
+                    _footprint_record!(canon_id(d.graph, v.id), :whole, nothing)
+                    e.names[canon_id(d.graph, v.id)]
+                else
+                    nothing
+                end for (k, v) in enumerate(r.inputs)]
+            gathered = _footprint_plate_reads!(e.body, e.runtime_ops, e.runtime_recipes,
+                program, atomic, args, d.plates[r.id])
+            at = Expr(:call, _cell_ref(:_cell_partition_positions), gathered)
+            icid in d.pushed && (at = Expr(:call, _cell_ref(:_cell_capture_rows),
+                _cell_shape!(e, icid), at))
+            reads[j] = _cell_bind!(e, :cell_row, _cell_canon(e, at))
+            icid in d.pushed && _cell_request!(e, icid, reads[j])
+        elseif role in (:leaf, :index, :column) && icid in d.pushed
             reads[j] = _cell_request!(e, icid, _cell_bind!(e, :cell_row, _cell_canon(e,
                 Expr(:call, _cell_ref(:_cell_leaf_row), _cell_shape!(e, icid), U))))
         elseif role in (:gather, :linear_gather) && icid in d.pushed
@@ -3045,13 +3131,14 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
             positions, U, _cell_literal!(e, r, f)))
     end
     args = Any[]
+    footprint_programs = Pair{Int,Any}[]
     for (j, input) in enumerate(r.inputs)
         icid = canon_id(d.graph, input.id)
         role = f.roles[j]
-        if role in (:leaf, :index, :column)
+        if role in (:leaf, :index, :column, :program_lane)
             push!(args, icid in d.pushed ? _cell_take!(e, icid, reads[j]) :
                 _cell_operand_row!(e, icid, U))
-        elseif role in (:gather, :linear_gather) && icid in d.pushed
+        elseif role in (:gather, :linear_gather, :program_gather) && icid in d.pushed
             shape = role === :gather ? nothing : _cell_shape!(e, icid)
             window = Any[e.data[icid], e.unions[icid], shape, e.sorted]
             # One index lane read directly: its entries' positions in the
@@ -3069,6 +3156,9 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
             end
             push!(args, _cell_bind!(e, :cell_window, Expr(:call, _cell_ref(:_CellWindow),
                                                           window...)))
+        elseif role === :program_gather
+            _footprint_record!(icid, :gathered, reads[j])
+            push!(args, e.names[icid])
         elseif role in (:gather, :linear_gather)
             # The whole source, read by the gather at its index's rows.
             for (k, via) in zip(f.indices[j], f.vias[j])
@@ -3102,7 +3192,13 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
             push!(args, icid in d.pushed ? _cell_take!(e, icid, reads[j]) :
                 Expr(:call, _cell_ref(:_cell_factor_rows), e.names[icid], reads[j]))
         else
-            _footprint_record!(icid, :whole, nothing)
+            program = _footprint_recording() && role === :whole &&
+                r.op isa _AuthoredPlateOp ? _footprint_capture_program(r.op.kernel.plan, j) : nothing
+            if program === nothing
+                _footprint_record!(icid, :whole, nothing)
+            else
+                push!(footprint_programs, j => program)
+            end
             push!(args, e.names[icid])
         end
     end
@@ -3113,6 +3209,11 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
     f.rowmap isa _CellPositionMap && return _cell_position_window!(e, cid, r, f, args, U)
     f.rowmap === nothing || return _cell_helper_window!(e, f.rowmap, args)
     if r.op isa _AuthoredPlateOp
+        for (j, program) in footprint_programs
+            positions = _footprint_plate_reads!(e.body, e.runtime_ops, e.runtime_recipes,
+                program, typeof(r.op).parameters[2], args, d.plates[r.id])
+            _footprint_record!(canon_id(d.graph, r.inputs[j].id), :gathered, positions)
+        end
         # The plate over these one-row arguments, with the table slots reserved
         # at its own position (`_lower_with_ops`).
         offset = d.slots[r.id]
