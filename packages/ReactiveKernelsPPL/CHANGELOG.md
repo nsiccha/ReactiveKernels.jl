@@ -16,6 +16,16 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.98
+
+- SMC checkpoint and carried-coordinate identities normalize caller-owned
+  sampling expressions just as built programs do. Helpers resolved in a fresh
+  generated model module no longer make adaptive tuning, production or carried
+  checkpoints depend on that transient module when deserialized. The sampler
+  state and RNG restoration are unchanged. Existing checkpoints still require
+  their original Julia/package versions; this does not migrate older files
+  that already contain missing generated-module references.
+
 ## 0.1.97
 
 - `L ~ LKJCholesky(K, eta)` accepts positive integer dimensions from bound

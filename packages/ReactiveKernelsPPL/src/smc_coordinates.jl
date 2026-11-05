@@ -241,14 +241,19 @@ function _smc_bound_identity(layout)
     freeze
 end
 
+# Sampling expressions are identity metadata, never executable checkpoint
+# state. Use the same namespace normalization as the built program: a fresh
+# lowering module must not survive inside a serialized coordinate frame.
+_smc_sampling_id(::Nothing) = nothing
+_smc_sampling_id(s) = (; rhs=_program_identity(s.rhs), s.broadcast, s.constructor_broadcast)
+
 function _smc_coordinate_records(layout::LayoutTable)
     records = NamedTuple[]
     labels = coordinate_names(layout)
     bound_identity = _smc_bound_identity(layout)
     for entry in layout.entries
         path = _smc_output_path(layout, entry)
-        sampling = entry.sampling === nothing ? nothing :
-            (; entry.sampling.rhs, entry.sampling.broadcast, entry.sampling.constructor_broadcast)
+        sampling = _smc_sampling_id(entry.sampling)
         coupled = entry.kind !== :external_plate &&
             (!(entry.transform in (:identity, :exp, :logistic, :interval, :floored, :upper)) ||
              entry.sampling !== nothing || haskey(layout.cell_geometries, entry.name))
