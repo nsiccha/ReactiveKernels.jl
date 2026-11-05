@@ -4985,7 +4985,16 @@ function _lower_with_ops_collecting(p::Plan;
         Dict{Int,Vector{Int}}()
     cell_pending = IdDict{Vector{Int},Vector{Any}}(group => Any[]
         for group in unique(values(cell_groups)))
+    regions = _cell_partition_regions(p, cells, cell_groups)
+    region_bodies = Dict(id => Expr(:block) for id in unique(values(regions)))
+    region_guards = Dict(r.id => Expr(:call, GlobalRef(Base, :!),
+        Expr(:call, GlobalRef(Base, :isempty), nm(first(r.inputs))))
+        for r in p.recipes if get(regions, r.id, 0) == r.id)
+    outer_body = body
     for r in p.recipes
+        owner = get(regions, r.id, 0)
+        body = owner == 0 ? outer_body : region_bodies[owner]
+        recording === nothing || (recording.guard = get(region_guards, owner, nothing))
         r.id in skipped_recipes && continue
         if r.id in terminal_skips
             # The native scan computed this value. Keep its original slots in
@@ -5141,6 +5150,11 @@ function _lower_with_ops_collecting(p::Plan;
                                  sorted = r.op.rows,
                                  constant = Set{Symbol}(names[canon_id(g, v.id)]
                                      for v in p.have if v.name in r.op.plan_constant)))
+            if owner != 0
+                T = _cell_partition_sum_type(p, cells, r)
+                empty = Expr(:(=), lhs, Expr(:call, GlobalRef(Base, :zero), T))
+                push!(outer_body.args, Expr(:if, region_guards[owner], body, empty))
+            end
             continue
         end
         if inline_embedded && r.op isa _AuthoredScanOp
@@ -5315,12 +5329,15 @@ function _lower_with_ops_collecting(p::Plan;
                     _embedded_statements(inner_ast, callargs, lhs, op_offset))
         end
     end
+    body = outer_body
+    recording === nothing || (recording.guard = nothing)
     all(((group, pending),) -> length(pending) == length(group), cell_pending) ||
         error("internal: a group of plate cells was not lowered completely")
     retval = length(p.want) == 1 ? nm(p.want[1]) :
              Expr(:tuple, (nm(w) for w in p.want)...)
     _footprint_recording() &&
-        (retval = _footprint_return(p, cells, names, declared, body))
+        (retval = _footprint_return(p, cells, names, declared, body;
+            guards = Dict(id => region_guards[owner] for (id, owner) in regions)))
     push!(body.args, Expr(:return, retval))
     # Compose before index runs duplicate a cell body into grouped/flat arms;
     # otherwise those mutually exclusive definitions appear to escape here.
