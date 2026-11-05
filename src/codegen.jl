@@ -2179,6 +2179,11 @@ function _plate_keeping_entries(producer::Recipe, read::Set{Int})
     !isempty(read) && issubset(read, 1:n) && length(read) < n || return nothing
     stand_in = tuple.inputs[minimum(read)]
     inputs = Tuple(k in read ? tuple.inputs[k] : stand_in for k in 1:n)
+    # A later fusion pass can see the same unread slots after they have
+    # already been replaced. Preserve plan identity when no dependency changes;
+    # cell composition uses it to detect that it has reached a fixed point.
+    all(k -> canon_id(ig, inputs[k].id) == canon_id(ig, tuple.inputs[k].id), 1:n) &&
+        return nothing
     recipes = Recipe[q for q in inner.recipes]
     recipes[at] = Recipe(tuple.id, inputs, tuple.outputs, tuple.op, tuple.cost,
                          nothing, false, tuple.source)
