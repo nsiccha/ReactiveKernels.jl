@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.82
+
+- Partial evaluation preserves fusion between live dotted subexpressions while
+  retaining cached data-only operands. Position-batched borrowed readers of
+  indexed ragged vector cells reuse their cell buffers without allocating a
+  temporary vector per cell and position, including with bound data. Source
+  that requires lexical captures keeps its existing closure path.
+
 ## 0.1.81
 
 - Multi-worker `NativeScheduling` calls also schedule materialized data-only

@@ -92,6 +92,42 @@ isdefined(@__MODULE__, :InnerPlateSplit) ||
         @test gradient(bound, q) == gradient(plain, q, y)
     end
 
+    @testset "live broadcast fusion retains cached dotted data and ordinary AD" begin
+        t = [[0.1, 0.3], [0.2, 0.4, 0.7]]
+        dose = [1.0, 1.2]
+        point = [0.2]
+        plain = prepare(C.dotted_residual)
+        expected = sum(sum(dose[i] .* exp.(-exp(point[1]) .* t[i]) .+
+                           log.(t[i] .+ 1.0)) for i in eachindex(t))
+        C.calls[] = 0
+        bound = prepare(C.dotted_residual; bound = (; t, dose))
+        @test C.calls[] == sum(length, t)
+        @test bound(point) ≈ expected
+        @test bound(2 .* point) ≈ plain(2 .* point, t, dose)
+        @test C.calls[] == 2sum(length, t) # only the plain call repeated the logs
+        @test gradient(bound, point) ≈ gradient(plain, point, t, dose)
+        derivative = -exp(point[1]) * sum(sum(dose[i] .* t[i] .*
+            exp.(-exp(point[1]) .* t[i])) for i in eachindex(t))
+        @test only(gradient(bound, point)) ≈ derivative
+
+        # A child may capture a lexical value even when its split parent does
+        # not. It must keep that closure instead of recompiling a global name.
+        captured = Core.eval(C, quote
+            let offset = 0.7
+                @kernel captured_dotted(q, t, dose) = begin
+                    cells = plate(eachindex(t)) do i
+                        dose[i] .* exp.(q[1] .* t[i] .+ offset)
+                    end
+                    total = sum(sum, cells)
+                end
+            end
+        end)
+        expected = sum(sum(dose[i] .* exp.(point[1] .* t[i] .+ 0.7))
+                       for i in eachindex(t))
+        @test Base.invokelatest(prepare(captured), point, t, dose) ≈ expected
+        @test Base.invokelatest(prepare(captured; bound = (; t, dose)), point) ≈ expected
+    end
+
     @testset "nested data-only nodes cache their maximal node" begin
         n = [3.0, 4.0, 9.0, 2.0, 8.0]
         plain = prepare(C.nested; have = (:q, :y, :n), want = :total)
