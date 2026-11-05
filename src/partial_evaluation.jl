@@ -2300,16 +2300,13 @@ _bound_constants(p::Plan) = Recipe[r for r in p.recipes if r.op isa _BoundConsta
 # programs of the first binding it lowered, without that binding's constants
 # (`_RebindReplicated` and friends, bound_vectorize.jl); a later binding's
 # `vectorize` places its own constants in their positions of the products'
-# constants tables instead of lowering and compiling them again. `slots` are
-# the positions of the kernel's constants in its constants table and lowered
-# recipes.
+# constants tables instead of lowering and compiling them again. Each binding's
+# constants come from its kernel's plan (`_RebindConstants`).
 struct _BoundVectorizations
-    slots::Vector{Int}
     products::Dict{Any,Any}
     lock::ReentrantLock
 end
-_BoundVectorizations(slots::Vector{Int}) =
-    _BoundVectorizations(slots, Dict{Any,Any}(), ReentrantLock())
+_BoundVectorizations() = _BoundVectorizations(Dict{Any,Any}(), ReentrantLock())
 
 struct _BoundTemplate
     f::Any                # the compiled residual callable, shared by every binding
@@ -2320,6 +2317,8 @@ struct _BoundTemplate
     ast::Expr
     lowered::_RebindTable # the readable recipes without the constants
     vectorizations::_BoundVectorizations
+    read::Vector{Int}     # the positions, among the plan's constants, of those it reads
+    count::Int            # the plan's number of constants
 end
 
 # A class's template before its first binding the inner-plate pass left alone.
@@ -2336,8 +2335,8 @@ struct _BoundEntry
     fused::Dict{Any,Vector{Recipe}}
     # Per (plate classes, index-run schedule classes, plate-rewrite
     # signature): a `_BoundTemplate`; the kernel itself when it has no
-    # constant slots; or `nothing` (a residual whose constants do not fill
-    # exactly their own operation-table slots: the per-binding path). An
+    # constant slots; or `nothing` (a residual whose read constants do not
+    # fill exactly their own operation-table slots: the per-binding path). An
     # absent key is unbuilt.
     templates::Dict{Any,Any}
     # Per plate-class tuple, the inner-plate pass's plate rewrites.
@@ -2402,29 +2401,56 @@ _bound_residual_plan(::_BoundEntry, residual::Plan, @nospecialize(hoisted)) = re
 _bound_residual_plan(entry::_BoundEntry, ::Nothing, @nospecialize(hoisted)) =
     _partial_residual_plan(entry.plan, entry.boundary, hoisted)
 
+# The positions, among a plan's constants, of those its kernel reads. The
+# lowering drops a constant no operation reads: a plate operand its cell does
+# not read leaves the plan with the work only it needed
+# (`_drop_unread_plate_operands!`), such as a bound vector whose entries the
+# inner-plate pass cached per cell. Such a constant has no slot to rebind, and
+# the template key, which fixes the plan up to its constants, drops it for
+# every binding. `nothing` when the constants table still holds an unread
+# constant's value, which rebinding could not replace.
+function _read_bound_constants(@nospecialize(kernel::PreparedKernel),
+                               constants::Vector{Recipe})
+    recipes = getfield(kernel, :lowered_recipes)
+    table = getfield(kernel, :constants)
+    read = Int[]
+    for (j, c) in enumerate(constants)
+        if any(x -> x === c, recipes)
+            push!(read, j)
+        else
+            value = c.op.value
+            any(x -> x === value, table) && return nothing
+        end
+    end
+    read
+end
+
 # The first binding of a template key: the ordinary preparation, capturing
-# the template when each of the plan's constants fills exactly its own
-# operation-table slot. Returns the template (or `nothing`) and this
+# the template when each of the constants its kernel reads fills exactly its
+# own operation-table slot. Returns the template (or `nothing`) and this
 # binding's kernel.
 function _bound_build(entry::_BoundEntry, @nospecialize(residual),
                       @nospecialize(hoisted), @nospecialize(passes))
     plan = _bound_residual_plan(entry, residual, hoisted)
     kernel = prepare(plan; passes = passes)
     constants = _bound_constants(plan)
+    read = _read_bound_constants(kernel, constants)
+    read === nothing && return nothing, kernel
+    used = constants[read]
     # Rebinding replaces the constants' values in the constants table and
     # their readable recipes, so each must fill one position of the recipes,
     # and no other entry may hold it; the constants table holds the value at
     # that same position (`_lowering_tables`).
-    lowered = _rebind_table(kernel.lowered_recipes, constants)
+    lowered = _rebind_table(kernel.lowered_recipes, used)
     lowered === nothing && return nothing, kernel
-    table = _constants_rebind_table(kernel, lowered.slots, constants)
+    table = _constants_rebind_table(kernel, lowered.slots, used)
     table === nothing && return nothing, kernel
-    vectorizations = _BoundVectorizations(lowered.slots)
+    vectorizations = _BoundVectorizations()
     kernel = _rebinding_kernel(kernel, vectorizations)
     isempty(constants) && return kernel, kernel
     callables = Any[kernel.callables...]
     _BoundTemplate(kernel.f, table, callables, kernel.inputs, kernel.outputs, kernel.ast,
-                   lowered, vectorizations), kernel
+                   lowered, vectorizations, read, length(constants)), kernel
 end
 
 # `kernel`, linked to the vectorizations its template's bindings share.
@@ -2456,8 +2482,8 @@ function _bound_rebind(entry::_BoundEntry, template::_BoundTemplate,
     constants = _bound_constants(plan)
     # The key fixes the plan up to its constants; a different count would mean
     # it does not, and the ordinary preparation is the safe answer.
-    length(constants) == length(template.lowered.slots) ||
-        return prepare(plan; passes = passes)
+    length(constants) == template.count || return prepare(plan; passes = passes)
+    constants = constants[template.read]
     table = Tuple(_rebound_table(template.constants, Any[c.op.value for c in constants]))
     callables = _executable_callables(template.callables)
     lowered = _rebound_table(template.lowered, constants)
