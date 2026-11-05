@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.84
+
+- Fixed selections prepared by frontends can pass precomputed partition rows
+  without allocating and scanning a key for every unselected plate cell.
+  Partition domain checks and ordinary native evaluation are unchanged.
+
 ## 0.1.83
 
 - Plate-cell and producer-window footprints follow visible gathers inside

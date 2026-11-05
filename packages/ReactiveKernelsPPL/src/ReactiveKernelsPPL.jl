@@ -26,6 +26,7 @@ using SpecialFunctions: erfc, loggamma
 import LogExpFunctions
 using LogExpFunctions: logaddexp, log1pexp, logit
 using Statistics: mean, std, var
+using SparseArrays: sparsevec
 using PrecompileTools: @setup_workload, @compile_workload
 
 export ColumnRef, ParamName, ColumnData
