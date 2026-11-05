@@ -860,7 +860,7 @@ end
 # Whether a recipe's read of one mixed HAVE port is confined to shared
 # positions. These are the same structural reads reported by the footprint;
 # an unknown read stays in the residual unless every position is shared.
-function _partition_shared_read(r::Recipe, slot::Int, labels, producers, cidof)
+function _partition_shared_read_positions(r::Recipe, slot::Int, producers, cidof)
     form = _cell_form(r)
     positions = if form !== nothing
         _footprint_constant(r, form, slot, producers, cidof)
@@ -870,8 +870,30 @@ function _partition_shared_read(r::Recipe, slot::Int, labels, producers, cidof)
             last(literal) : nothing
     end
     positions === nothing && (positions = _footprint_inline_positions(r, slot))
-    positions === nothing && return false
-    all(i -> checkbounds(Bool, labels, i) && ismissing(labels[i]), positions)
+    positions
+end
+function _partition_shared_read(r::Recipe, slot::Int, labels, producers, cidof)
+    positions = _partition_shared_read_positions(r, slot, producers, cidof)
+    positions !== nothing &&
+        all(i -> checkbounds(Bool, labels, i) && ismissing(labels[i]), positions)
+end
+
+# A prefix's fixed read set of one packed input. Unknown reads keep the whole
+# input: a footprint evaluated at the exemplar could omit another arm's reads
+# and would not be a valid active boundary or cache-invalidation key.
+function _partition_prefix_positions(p::Plan, name::Symbol)
+    cidof(v) = canon_id(p.graph, v.id)
+    port = only(v for v in p.have if v.name === name)
+    cid = cidof(port)
+    any(v -> cidof(v) == cid, p.want) && return :whole
+    positions = Int[]
+    for r in p.recipes, (slot, input) in enumerate(r.inputs)
+        cidof(input) == cid || continue
+        read = _partition_shared_read_positions(r, slot, p.producer, cidof)
+        read === nothing && return :whole
+        append!(positions, read)
+    end
+    sort!(unique!(positions))
 end
 
 # Split a selected, bound-data plan without replanning its producers. The
@@ -906,14 +928,10 @@ function _partition_shared_parts(p::Plan, partitioned; varying = (), preserve_ro
     # recipes on both sides. Other shared HAVE values still vary with theta.
     static, _, static_owned = _partial_split(p, Set{ValueId}())
     prefix, residual, owned = _partial_split(p, shared, Set{Int}()) do r, available
-        if any(v -> cidof(v) in row_values, r.outputs)
-            # Retain literal shared slices of a mixed input as owned cache
-            # values. They extract parameter blocks, not observation rows.
-            # The shared-read proof below still checks every extracted index.
-            form = _cell_form(r)
-            (form !== nothing && form.kind === :range_view &&
-             any(v -> haskey(mixed, cidof(v)), r.inputs)) || return false
-        end
+        # This includes views of shared parameter blocks: when every reader
+        # needs selected rows, caching the whole view would turn a compact
+        # read into a whole-block active frontier at the derivative boundary.
+        any(v -> cidof(v) in row_values, r.outputs) && return false
         all(enumerate(r.inputs)) do (slot, input)
             cid = cidof(input)
             cid in available ||

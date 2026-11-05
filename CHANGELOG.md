@@ -25,6 +25,8 @@ are recorded in the git history only.
   do not allocate shadows of an unselected parent panel. Lazy cell-view
   construction stays visible to its readers across planned array operations.
   Contiguous window gathers check the window span once before their row loop.
+  Shared-prefix splitting keeps parameter views in the residual when their
+  readers need only selected rows, avoiding whole-block derivative frontiers.
 
 ## 0.1.86
 

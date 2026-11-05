@@ -132,4 +132,55 @@ end
         end
     end
 end
+
+@testset "full gradients retain only the shared rows a unit reads" begin
+    model = quote
+        a ~ Normal(0, 1)
+        sigma ~ Exponential(1)
+        eta[levels(unit)] .~ Normal.(0, 1)
+        z[1:ncoeff] .~ Normal.(0, 1)
+        local_eta = eta[unit]
+        mu = a .+ local_eta .+ z[c1] .+ w .* z[c2]
+        y .~ Normal.(mu, sigma)
+    end
+    allocations = Int[]
+    for n in (6, 96)
+        data = (; unit=collect(1:n), ncoeff=2n, c1=collect(1:2:2n),
+            c2=collect(2:2:2n), w=sin.(1:n), y=cos.(1:n))
+        bound = bind_data(lower_rkppl(model, data; conditioned=(:y,), mod=@__MODULE__), data)
+        built = build_kernel(bound)
+        u = collect(range(-0.2, 0.3; length=built.layout.total))
+        query = prepare_partition(built, bound, :y; by=:unit, partitioned=:eta)
+        for compact in (true, false)
+            sampler = prepare_partition_sampler(built, bound, :y, u; by=:unit,
+                partitioned=:eta, compact, backend=AutoEnzyme(; mode=Enzyme.Reverse))
+            @test length(sampler.prefix.point) == 2
+            @test all(v -> !(v isa AbstractArray) || length(v) <= 2, sampler.prefix.values)
+            for label in (n, 1, n), change in (0.0, 0.15)
+                point = u .+ change
+                fp = partition_footprint(sampler, label)
+                @test length(fp) == 5
+                gradient = zeros(compact ? length(fp) : length(u))
+                value, _ = partition_value_and_gradient!(sampler, gradient, point, label)
+                @test value ≈ query(point, label)
+                for (slot, position) in enumerate(fp)
+                    plus, minus = copy(point), copy(point)
+                    plus[position] += 1e-6
+                    minus[position] -= 1e-6
+                    @test gradient[compact ? slot : position] ≈
+                        (query(plus, label) - query(minus, label)) / 2e-6 atol=1e-6 rtol=1e-6
+                end
+                if !compact
+                    @test all(iszero, gradient[setdiff(eachindex(u), fp)])
+                end
+            end
+            if compact
+                gradient = zeros(length(partition_footprint(sampler, 1)))
+                partition_value_and_gradient!(sampler, gradient, u, 1)
+                push!(allocations, @allocated partition_value_and_gradient!(sampler, gradient, u, 1))
+            end
+        end
+    end
+    @test allocations[2] <= allocations[1] + 256
+end
 end

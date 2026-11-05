@@ -24,6 +24,9 @@ are recorded in the git history only.
   parameter reads materialize only the selected rows. Full gradients retain
   the shared-prefix pullback; compact and dense destinations keep their existing
   values and coordinate order. Requires ReactiveKernels 0.1.87.
+- Shared-prefix active storage and cache invalidation follow the coordinates
+  actually read by that prefix. Shared parameters read only at selected rows
+  remain in the compact residual instead of creating whole-panel cotangents.
 
 ## 0.1.100
 

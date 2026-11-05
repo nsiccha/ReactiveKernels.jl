@@ -2133,6 +2133,13 @@ _partition_frontier_seed(values::Tuple) = length(values) == 1 ? only(values) : v
 
 function _prepare_value_prefix(parts, layout, coordinate_labels, exemplar, on_error)
     shared_positions = findall(ismissing, coordinate_labels)
+    # The prefix may use only a few shared coordinates. Its active vector
+    # and invalidation key follow those structural reads, not every shared
+    # parameter in the model (some remain row-local in the residual).
+    reads = ReactiveKernels._partition_prefix_positions(parts.prefix, :unconstrained)
+    if reads !== :whole
+        intersect!(shared_positions, reads)
+    end
     shared_point = exemplar[shared_positions]
     shared_slots = _compact_cell_slots(layout.total, shared_positions)
     prefix = Base.invokelatest(prepare, _compact_partition_plan(parts.prefix);
