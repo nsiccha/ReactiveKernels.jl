@@ -1464,6 +1464,40 @@ constrain(built.layout, u)               # named constrained values
 restore_draws(built.layout, U)           # U: layout.total × draws
 ```
 
+### Families of authored density queries
+
+`density_factors(built, plan)` inventories the model's original prior and
+coordinate-Jacobian events. `factor_coordinates(catalogue, event)` reports
+the coordinates an event owns; `factor_support(catalogue, event; u0=u)` also
+includes hyperparameters and other structural reads. Joint laws and coupled
+transforms remain indivisible events. Support follows both branch arms and
+bound indices, independently of numerical zeros.
+
+Prepare many selections from one catalogue in one call:
+
+```julia
+catalogue = density_factors(built, plan)
+selections = [select_factors(catalogue, (event,)) for event in catalogue]
+queries = prepare_query_ad(prepare_ad, built, plan, selections,
+    AutoEnzyme(; mode = Enzyme.Reverse), u; coordinates = :support)
+query = first(queries)
+active = u[query.coordinates]
+value, gradient = ad_value_and_gradient(query, u, active)
+```
+
+The result follows selection order. Each query reads the full point as a
+constant base and differentiates its compact `active` vector, including any
+shared hyperparameters in its support. Each concurrent caller owns its query's
+mutable derivative workspace. An empty selection returns zero with empty
+support; an empty batch returns an empty vector.
+
+Batch preparation compares the bound data with the catalogue once and shares
+one packed exemplar; fixed slot maps and selected plate rows occupy compact
+storage. A changed binding is still rejected, as with single-selection query
+preparation. Event inventory uses the catalogue's captured binding and cached
+footprint kernels. Its supplied exemplar is read-only; calls omitting `u0`
+share a default point owned by the catalogue.
+
 An explicit `AutoEnzyme(mode=Reverse)` always uses reverse mode. Native forward
 batching is disabled by default. To request that optimization explicitly, use
 `AutoEnzyme()` without a mode together with `native_forward_batch=true`.
