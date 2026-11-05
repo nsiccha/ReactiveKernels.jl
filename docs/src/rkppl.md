@@ -809,6 +809,14 @@ third argument `'U'` returns its upper-triangular counterpart. Sized vectors
 Julia values. Their priors are explicit, and their dimensions determine their
 packed coordinates.
 
+For an LKJ factor, `K` may be a positive integer literal, bound scalar data,
+or a data-only integer expression such as `length(channels)`, `size(M, 2)`,
+or a definition `K = J + 1`. The same submodel can take `K` as an argument
+and be rebound at another dimension without changing its definition.
+Binding fixes the `K * (K - 1) ÷ 2` coordinates; `K = 1` has no coordinates
+and returns `[1.0;;]`. Rebind and prepare again to change `K`. Missing,
+fractional, Boolean, nonpositive or sampled-value dimensions are rejected.
+
 The LKJ shape `eta` is a scalar value: it can be a positive literal, bound
 data, a sampled parameter, or a definition using those values. A per-level
 LKJ prior can share that same value across all its factors.
@@ -1455,6 +1463,40 @@ prepare_query(built, plan, :likelihood)  # presets: :sampler | :likelihood | :pr
 constrain(built.layout, u)               # named constrained values
 restore_draws(built.layout, U)           # U: layout.total × draws
 ```
+
+### Families of authored density queries
+
+`density_factors(built, plan)` inventories the model's original prior and
+coordinate-Jacobian events. `factor_coordinates(catalogue, event)` reports
+the coordinates an event owns; `factor_support(catalogue, event; u0=u)` also
+includes hyperparameters and other structural reads. Joint laws and coupled
+transforms remain indivisible events. Support follows both branch arms and
+bound indices, independently of numerical zeros.
+
+Prepare many selections from one catalogue in one call:
+
+```julia
+catalogue = density_factors(built, plan)
+selections = [select_factors(catalogue, (event,)) for event in catalogue]
+queries = prepare_query_ad(prepare_ad, built, plan, selections,
+    AutoEnzyme(; mode = Enzyme.Reverse), u; coordinates = :support)
+query = first(queries)
+active = u[query.coordinates]
+value, gradient = ad_value_and_gradient(query, u, active)
+```
+
+The result follows selection order. Each query reads the full point as a
+constant base and differentiates its compact `active` vector, including any
+shared hyperparameters in its support. Each concurrent caller owns its query's
+mutable derivative workspace. An empty selection returns zero with empty
+support; an empty batch returns an empty vector.
+
+Batch preparation compares the bound data with the catalogue once and shares
+one packed exemplar; fixed slot maps and selected plate rows occupy compact
+storage. A changed binding is still rejected, as with single-selection query
+preparation. Event inventory uses the catalogue's captured binding and cached
+footprint kernels. Its supplied exemplar is read-only; calls omitting `u0`
+share a default point owned by the catalogue.
 
 An explicit `AutoEnzyme(mode=Reverse)` always uses reverse mode. Native forward
 batching is disabled by default. To request that optimization explicitly, use

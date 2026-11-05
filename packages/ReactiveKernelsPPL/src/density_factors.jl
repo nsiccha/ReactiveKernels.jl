@@ -217,6 +217,7 @@ struct DensityFactors{B,P,S,H,D}
     binding::D
     sites::Vector{_DensitySite}
     coordinates::Vector{_DensityCoordinates}
+    support_exemplar::Vector{Float64}
     support_kernels::Dict{Tuple{Symbol,Symbol,Int},Any}
     support_lock::ReentrantLock
 end
@@ -293,6 +294,7 @@ function density_factors(built, plan::StructuralPlan)
             copy(spec.have_names), copy(spec.want_names), nothing)
     end
     DensityFactors(built, plan, spec, _query_have(plan), binding, sites, coordinates,
+        zeros(built.layout.total),
         Dict{Tuple{Symbol,Symbol,Int},Any}(), ReentrantLock())
 end
 
@@ -376,6 +378,10 @@ factor_coordinates(s::FactorSelection) =
 function _check_factor_selection(built, plan, selection)
     c = selection.catalogue
     select_factors(c, selection.factors)
+    _check_factor_binding(built, plan, c)
+end
+
+function _check_factor_binding(built, plan, c)
     _check_built_program(built, plan)
     _same_program(built.program, c.built.program) &&
         isequal(_query_bound(plan), c.binding) || throw(ContractValidationError(
@@ -399,8 +405,9 @@ function _density_bound_cells(c::DensityFactors, s::_DensitySite)
     op isa ReactiveKernels._BoundConstant ? op.value : nothing
 end
 
-function _density_selection_spec(built, plan, selection; locality, on_error, u0)
-    _check_factor_selection(built, plan, selection)
+function _density_selection_spec(built, plan, selection; locality, on_error, u0,
+        checked = false)
+    checked || _check_factor_selection(built, plan, selection)
     c = selection.catalogue
     spec = ReactiveKernels._copy_cell_factor_spec(c.spec)
     terms = Symbol[]
@@ -418,10 +425,9 @@ function _density_selection_spec(built, plan, selection; locality, on_error, u0)
             push!(constant_terms, sum(i -> cells[i], entries; init = 0.0))
         else
             key = Symbol(:_ppl_density_membership_, j)
-            spec.ports[key] = value!(spec.graph, key, Vector{Bool})
+            spec.ports[key] = value!(spec.graph, key, ReactiveKernels._PartitionIndex{Bool})
             push!(spec.port_order, key)
-            membership = fill(false, s.count)
-            membership[entries] .= true
+            membership = ReactiveKernels._PartitionIndex(Dict(true => sort!(unique!(entries))), s.count)
             push!(bindings, key => membership)
             by[s.plate] = key
             push!(plates, s.plate)
@@ -441,7 +447,7 @@ function _density_selection_spec(built, plan, selection; locality, on_error, u0)
         spec = ReactiveKernels._copy_cell_factor_spec(c.spec)
         for p in plates
             key = by[p]
-            spec.ports[key] = value!(spec.graph, key, Vector{Bool})
+            spec.ports[key] = value!(spec.graph, key, ReactiveKernels._PartitionIndex{Bool})
             push!(spec.port_order, key)
         end
         spec = plate_partition(spec, plates; by, index = _DENSITY_LABEL,
@@ -472,9 +478,18 @@ end
 "Prepare the sum of selected authored density events, callable with a packed point."
 function prepare_query(built, plan::StructuralPlan, selection::FactorSelection;
         on_error = nothing, locality = :error, u0 = nothing)
-    exemplar = _query_exemplar(built.layout, u0)
+    exemplar = _factor_exemplar(selection.catalogue, u0)
     q = _density_selection_spec(built, plan, selection; locality, on_error, u0 = exemplar)
     Base.invokelatest(_prepare_cached, plan, q.spec; have = q.have, want = q.want, bound = q.bound, on_error)
+end
+
+# Support and row planning read exemplars, never retain or mutate a caller's
+# packed point. The catalogue supplies one default point for all its events.
+function _factor_exemplar(c::DensityFactors, u0)
+    u0 === nothing && return c.support_exemplar
+    length(u0) == c.built.layout.total || throw(ContractValidationError(
+        "[query] exemplar length $(length(u0)) ≠ layout total $(c.built.layout.total)"))
+    u0
 end
 
 """
@@ -487,16 +502,21 @@ an exemplar; the support follows the bound indices and both branch arms.
 """
 function factor_support(s::FactorSelection; u0 = nothing)
     c = s.catalogue
-    exemplar = _query_exemplar(c.built.layout, u0)
-    q = prepare_query(c.built, c.plan, s; u0 = exemplar)
-    footprint = Base.invokelatest(partition_footprint, q, exemplar).unconstrained
-    footprint === :whole ? collect(1:c.built.layout.total) : footprint
+    _check_factor_selection(c.built, c.plan, s)
+    _factor_support(s, _factor_exemplar(c, u0))
+end
+function _factor_support(s::FactorSelection, exemplar)
+    support = Int[]
+    for factor in s
+        append!(support, factor_support(s.catalogue, factor; u0 = exemplar))
+    end
+    sort!(unique!(support))
 end
 function factor_support(c::DensityFactors, factor::DensityFactor; u0 = nothing)
     # Reuse a dynamic-cell footprint across the entries of each graph segment.
     # Catalogue consumers can classify every event without compiling per entry.
     select_factors(c, (factor,))
-    exemplar = _query_exemplar(c.built.layout, u0)
+    exemplar = _factor_exemplar(c, u0)
     s = only(s for s in c.sites if s.kind === factor.kind && s.site === factor.site &&
         s.offset < factor.entry <= s.offset + s.count)
     retained_plate = s.plate !== nothing && _density_bound_cells(c, s) === nothing
@@ -522,22 +542,62 @@ function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
         selection::FactorSelection, backend, exemplars...; on_error = nothing,
         locality = :error, coordinates = nothing)
     isempty(exemplars) && throw(ArgumentError("prepare_query_ad needs a packed exemplar"))
+    _check_factor_selection(built, plan, selection)
     u0 = _query_exemplar(built.layout, last(exemplars))
+    _prepare_factor_query_ad(prepare_operator, built, plan, selection, backend, exemplars,
+        u0; on_error, locality, coordinates)
+end
+
+"""
+    prepare_query_ad(prepare_operator, built, plan, selections::AbstractVector{<:FactorSelection},
+                     backend, exemplars...; coordinates = nothing, kwargs...)
+
+Prepare a family of authored density queries in selection order. All selections
+must come from one catalogue. The batch checks its bound program once, then
+shares one packed exemplar across preparation. With `coordinates = :support`,
+each returned `FactorQueryAD` owns a compact derivative workspace; fixed row
+and coordinate metadata use storage proportional to the selected supports.
+Empty selections return zero-valued queries; an empty batch returns no queries.
+Single-selection calls retain their bound-program validation.
+"""
+function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
+        selections::AbstractVector{<:FactorSelection}, backend, exemplars...;
+        on_error = nothing, locality = :error, coordinates = nothing)
+    isempty(exemplars) && throw(ArgumentError("prepare_query_ad needs a packed exemplar"))
+    u0 = _query_exemplar(built.layout, last(exemplars))
+    if isempty(selections)
+        _check_built_program(built, plan)
+        return coordinates === nothing ? QueryAD[] : FactorQueryAD[]
+    end
+    c = first(selections).catalogue
+    _check_factor_binding(built, plan, c)
+    for selection in selections
+        selection.catalogue === c || throw(ArgumentError(
+            "prepare_query_ad selections must come from one density catalogue"))
+        select_factors(c, selection.factors)
+    end
+    [_prepare_factor_query_ad(prepare_operator, built, plan, selection, backend, exemplars,
+        u0; on_error, locality, coordinates) for selection in selections]
+end
+
+function _prepare_factor_query_ad(prepare_operator, built, plan, selection, backend,
+        exemplars, u0; on_error, locality, coordinates)
+    q = _density_selection_spec(built, plan, selection; locality, on_error, u0, checked = true)
     if coordinates !== nothing
-        selected = coordinates === :support ? factor_support(selection; u0) : collect(Int, coordinates)
+        selected = coordinates === :support ? _factor_support(selection, u0) : collect(Int, coordinates)
         _check_compact_cell_indices(u0, selected, selected, built.layout.total)
-        q = _density_selection_spec(built, plan, selection; locality, on_error, u0)
         _compact_overlay!(q.spec, plan)
         have = (:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots,
             (n for n in q.have if n !== :unconstrained)...)
-        slots = _compact_cell_slots(built.layout.total, selected)
+        slots = _fixed_cell_slots(built.layout.total, selected)
         bound = merge(q.bound, (; _ppl_cell_slots = slots))
         kernel = Base.invokelatest(_prepare_cached, plan, q.spec; have, want = q.want, bound, on_error)
         prepared = Base.invokelatest(prepare_operator, kernel, backend,
             Base.front(exemplars)..., u0, u0[selected]; active = :_ppl_cell_active)
         return FactorQueryAD(prepared, built.layout, selected)
     end
-    kernel = prepare_query(built, plan, selection; on_error, locality, u0)
+    kernel = Base.invokelatest(_prepare_cached, plan, q.spec; have = q.have, want = q.want,
+        bound = q.bound, on_error)
     prepared = Base.invokelatest(prepare_operator, kernel, backend,
         Base.front(exemplars)..., u0; active = :unconstrained)
     QueryAD(prepared, built.layout)

@@ -351,6 +351,16 @@ positions holding it, in order. Reads only the key, so under `bound=` it is
 computed once per binding.
 """
 struct _PartitionTable end
+
+# A frontend that already owns a partition's row inventory need not expand it
+# to one key per cell and scan it again. Omitted labels have no selected rows;
+# `cells` still describes the complete domain for the usual shape checks.
+struct _PartitionIndex{K}
+    table::Dict{K,Vector{Int}}
+    cells::Int
+end
+(::_PartitionTable)(key::_PartitionIndex) = key.table
+
 function (::_PartitionTable)(key)
     table = Dict{eltype(key),Vector{Int}}()
     for (position, label) in enumerate(vec(key))
@@ -370,6 +380,7 @@ binding.
 """
 struct _PartitionCells end
 (::_PartitionCells)(key) = length(key)
+(::_PartitionCells)(key::_PartitionIndex) = key.cells
 _readable_callee(::_PartitionCells) = :partition_cells
 _opname(::_PartitionCells) = "partition_cells"
 

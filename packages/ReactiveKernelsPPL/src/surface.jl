@@ -12485,8 +12485,8 @@ _is_lkj_cholesky_call(rhs) =
     rhs.args[1] === :LKJCholesky
 
 # `L ~ LKJCholesky(K, eta)` (Distributions.jl; the optional third argument
-# is `'L'` or `'U'`). `K` is a literal or `size(M, d)` of
-# a matrix `M`; `eta` is a scalar prior value.
+# is `'L'` or `'U'`). `K` is a positive integer literal or a bound-data
+# extent; `eta` is a scalar prior value.
 function _lower_lkj_cholesky(lhs, rhs)
     args = _plain_args(rhs, "`LKJCholesky`")
     (length(args) == 2 || length(args) == 3) || _sfail("parameter $lhs: " *
@@ -12503,9 +12503,11 @@ function _lower_lkj_cholesky(lhs, rhs)
     elseif K isa Expr && K.head === :call && length(K.args) == 3 &&
             K.args[1] === :size && K.args[2] isa Symbol && K.args[3] in (1, 2)
         Expr(:call, :size, K.args[2], K.args[3])
+    elseif _is_bound_extent_dim(K) || _levels_count(K) !== nothing
+        K
     else
-        _sfail("parameter $lhs: `LKJCholesky` dimension is a literal or " *
-            "`size(M, d)` of a matrix `M`, got $(repr(K))")
+        _sfail("parameter $lhs: `LKJCholesky` dimension must be a positive " *
+            "integer literal or a bound-data scalar expression, got $(repr(K))")
     end
     (eta isa Symbol || (eta isa Real && !(eta isa Bool) && isfinite(eta) &&
         eta > 0)) || _sfail("parameter $lhs: LKJ shape `eta` must be a " *
