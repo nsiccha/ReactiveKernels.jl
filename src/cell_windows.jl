@@ -2859,6 +2859,19 @@ function _cell_partition_sum_type(p, cells, r)
     inputs = Any[get(cells.types, canon_id(p.graph, v.id), valtype(v))
                  for v in r.inputs[2:end]]
     T = _checked_plate_element!(_UninferredValue[], r.op.plate, inputs, Symbol[])
+    if T === Any
+        # A pushed capture is read only by indexed element/row accesses, as
+        # proved by the capture analysis. Its generated window has the known
+        # numeric element type and rank even when the original container is
+        # abstract. Use those facts when inferring scalar helpers around the
+        # accesses; never substitute an arbitrary whole-array argument.
+        captured = get(cells.captures, r.id, Dict{Int,Vector{Tuple{Int,Int}}}())
+        window_inputs = Any[k in keys(captured) &&
+            canon_id(p.graph, r.inputs[k + 1].id) in cells.pushed ?
+            _cell_standin_type(S) : S for (k, S) in enumerate(inputs)]
+        window_inputs == inputs || (T = _checked_plate_element!(
+            _UninferredValue[], r.op.plate, window_inputs, Symbol[]))
+    end
     T isa Type && T <: Number && isconcretetype(T) &&
         Base.promote_op(+, T, T) === T ? T : Any
 end

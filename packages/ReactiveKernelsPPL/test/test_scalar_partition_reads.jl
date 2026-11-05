@@ -109,38 +109,51 @@ end
     end
 end
 
+_scalar_covariance_add(a, b) = a + b
+
 @testset "absent observation with a whole covariance factor" begin
-    data = (; y = [0.1, 0.2], soil = [0.3, 0.4], group = [1, 2])
-    source = quote
-        a[1:2] .~ Normal.(0.0, 1.0)
-        sd[1:2] .~ Exponential.(1.0)
-        L ~ LKJCholesky(2, 2.0)
-        Z[1:2, 1:2] .~ Normal.(0.0, 1.0)
-        F = sd .* L
-        R = Z * F'
-        mu = R[group, 1] .+ R[group, 2]
-        y .~ Normal.(a, 1.0)
-        soil .~ Normal.(mu, 1.0)
+    for captured in (false, true)
+        data = (; y = [0.1, 0.2], soil = [0.3, 0.4], group = [1, 2])
+        location = captured ? quote
+            ra = R[group, 1]
+            rb = R[group, 2]
+            @plate for i in eachindex(soil)
+                mu[i] = _scalar_covariance_add(ra[i], rb[i])
+            end
+        end : quote
+            mu = R[group, 1] .+ R[group, 2]
+        end
+        source = quote
+            a[1:2] .~ Normal.(0.0, 1.0)
+            sd[1:2] .~ Exponential.(1.0)
+            L ~ LKJCholesky(2, 2.0)
+            Z[1:2, 1:2] .~ Normal.(0.0, 1.0)
+            F = sd .* L
+            R = Z * F'
+            $(location.args...)
+            y .~ Normal.(a, 1.0)
+            soil .~ Normal.(mu, 1.0)
+        end
+        plan = bind_data(lower_rkppl(source, data;
+            conditioned = (:y, :soil), mod = @__MODULE__), data)
+        built = build_kernel(plan)
+        u = collect(range(-0.3, 0.3; length = built.layout.total))
+        by = (; y = [1, 2], soil = [1, 1])
+        partitioned = (:a => [1, 2], :sd => [1, 1], :L => [1, 1], :Z => [1, 1])
+        query = prepare_partition(built, plan, (:y, :soil); by, partitioned, u0 = u)
+        full = prepare_query(built, plan, :likelihood)
+        for point in (u, u .+ 0.2)
+            @test partition_footprint(query.kernel, point, 1, nothing).unconstrained ==
+                [1, 3, 4, 5, 6, 7, 8, 9]
+            @test partition_footprint(query.kernel, point, 2, nothing).unconstrained == [2]
+            @test sum(query(point, label) for label in (1, 2)) ≈ full(point)
+            @test query(point, 2) ≈ -(log(2pi) + (point[2] - data.y[2])^2) / 2
+        end
+        # The active covariance still reads all three of its coordinates: moving
+        # its ownership to another label must remain a separability violation.
+        @test_throws PartitionSeparabilityError prepare_partition(built, plan, (:y, :soil);
+            by, partitioned = (:a => [1, 2], :sd => [2, 2], :L => [2, 2], :Z => [1, 1]), u0 = u)
     end
-    plan = bind_data(lower_rkppl(source, data;
-        conditioned = (:y, :soil), mod = @__MODULE__), data)
-    built = build_kernel(plan)
-    u = collect(range(-0.3, 0.3; length = built.layout.total))
-    by = (; y = [1, 2], soil = [1, 1])
-    partitioned = (:a => [1, 2], :sd => [1, 1], :L => [1, 1], :Z => [1, 1])
-    query = prepare_partition(built, plan, (:y, :soil); by, partitioned, u0 = u)
-    full = prepare_query(built, plan, :likelihood)
-    for point in (u, u .+ 0.2)
-        @test partition_footprint(query.kernel, point, 1, nothing).unconstrained ==
-            [1, 3, 4, 5, 6, 7, 8, 9]
-        @test partition_footprint(query.kernel, point, 2, nothing).unconstrained == [2]
-        @test sum(query(point, label) for label in (1, 2)) ≈ full(point)
-        @test query(point, 2) ≈ -(log(2pi) + (point[2] - data.y[2])^2) / 2
-    end
-    # The active covariance still reads all three of its coordinates: moving
-    # its ownership to another label must remain a separability violation.
-    @test_throws PartitionSeparabilityError prepare_partition(built, plan, (:y, :soil);
-        by, partitioned = (:a => [1, 2], :sd => [2, 2], :L => [2, 2], :Z => [1, 1]), u0 = u)
 end
 
 @testset "absent scalar observation" begin

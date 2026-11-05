@@ -384,16 +384,36 @@ end
     end
 end
 
+_absent_factor_add(a, b) = a + b
+
+@kernel absent_factor_capture(u::AbstractVector{Float64}, Z::AbstractMatrix{Float64},
+                      L::AbstractMatrix{Float64}, rows::AbstractVector{Int},
+                      y::AbstractVector{Float64}, extra::AbstractVector{Float64},
+                      key::AbstractVector{Int}, extra_key::AbstractVector{Int}) = begin
+    raw = u[3:4]
+    scale = log.(raw)
+    F = scale .* L
+    R = Z * F'
+    ma = R[rows, 1]
+    mb = R[rows, 2]
+    a = plate(extra, eachindex(extra)) do yi, i
+        -(yi - _absent_factor_add(ma[i], mb[i]))^2 / 2
+    end
+    b = plate(y, u[1:2]) do yi, m
+        -(yi - m)^2 / 2
+    end
+end
+
 @testset "empty observation portions skip exclusive whole factors" begin
-    spec = plate_partition(absent_factor, (:a, :b);
-        by = (a = :extra_key, b = :key), locality = :error)
-    structures = Int[]
-    for n in (2, 200)
+    structures = Dict{Any,Vector{Int}}()
+    for model in (absent_factor, absent_factor_capture), n in (2, 200)
+        spec = plate_partition(model, (:a, :b);
+            by = (a = :extra_key, b = :key), locality = :error)
         bound = (; Z = [0.2 -0.1; 0.4 0.3], L = [1.0 0.0; 0.3 0.8],
             rows = repeat([1, 2], n ÷ 2), y = [0.1, 0.2],
             extra = fill(0.3, n), key = [1, 2], extra_key = fill(1, n))
         q = prepare(spec; want = :partition_total, bound)
-        push!(structures, astsize(code_expr(q)))
+        push!(get!(structures, model, Int[]), astsize(code_expr(q)))
         u = [0.2, -0.1, 1.2, 1.4]
         original = copy(u)
         for label in (1, 2)
@@ -424,7 +444,7 @@ end
         whole = prepare(spec; want = (:partition_total, :F), bound)
         @test_throws DomainError whole(u, 2)
     end
-    @test structures[1] == structures[2]
+    @test all(s -> s[1] == s[2], values(structures))
 end
 
 @testset "empty observation portions do not demand scalar dependencies" begin
