@@ -2505,7 +2505,7 @@ function _cell_part_reads(r::Recipe, params, mod, read_of)
     source = _kernel_split_replace(body, mapping)
     used = _kernel_collect_symbols!(Set{Symbol}(), source)
     kept = Int[j for j in eachindex(params) if params[j] in used]
-    operation = _gather_map_op(kernel_sourceop_token(op), :_reads,
+    operation = _partial_source_op(kernel_sourceop_token(op), :_reads,
         vcat(params[kept], names), source, mod)
     operation === nothing && return nothing
     (; reads = Pair{Any,Any}[ex => last(reads[findfirst(q -> isequal(first(q), ex), reads)])
@@ -2718,14 +2718,14 @@ function _cell_scalar_plates(p::Plan; argument_types = nothing,
                 # downstream partition requests no source position at all.
                 index_type = get(types, cid(first(r.inputs)), Int)
                 index = value!(g, Symbol(only(outputs).name, :_indices), Vector{index_type})
-                index_op = _gather_map_op(:cell_scalar, :indices, [:i], :(vcat(i)), @__MODULE__)
+                index_op = _partial_source_op(:cell_scalar, :indices, [:i], :(vcat(i)), @__MODULE__)
                 push!(recipes, Recipe(next_id, (inputs[1],), (index,),
                     index_op, 0.0, nothing, false, :(vcat(i))))
                 next_id -= 1
                 i = value!(inner, :i, index_type)
                 x = value!(inner, :x, get(types, cid(r.inputs[2]), Any))
                 result = value!(inner, :result, get(types, cid(only(r.outputs)), Any))
-                op = _gather_map_op(:cell_scalar, :index, [:i, :x], :(x[i]), @__MODULE__)
+                op = _partial_source_op(:cell_scalar, :index, [:i, :x], :(x[i]), @__MODULE__)
                 add!(inner, (i, x) => result, op; source = :(x[i]))
                 kernel = prepare(inner; have = (i, x), want = result)
                 plate = _AuthoredPlateOp{typeof(kernel),(2,)}(kernel)
