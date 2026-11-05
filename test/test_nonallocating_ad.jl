@@ -709,37 +709,24 @@ end
         active = :q)
     @test only(ad_pushforward(pushforward, (v,), q, s, data)) ≈
           dot(data .* s .* exp.(s .* q) .- q, v)
-    # On Julia 1.10, second-order passes through the AD-owned `Cache`
-    # contexts fail Enzyme's static activity analysis in both orders
-    # (EnzymeRuntimeActivityError, Enzyme 0.13.210 through 0.13.216); the
-    # dataflow kernel's Hessian-vector products work. Julia 1.12 and 1.13
-    # differentiate both orders (Enzyme 0.13.216).
+    # Second-order passes through the AD-owned `Cache` contexts, in both
+    # orders, and the third order. Julia 1.10 used to fail Enzyme's static
+    # activity analysis here (EnzymeRuntimeActivityError, Enzyme 0.13.210
+    # through 0.13.216); it passes with the Enzyme dogfood line (b2bb4cb6).
     hessian = Diagonal(data .* s^2 .* exp.(s .* q)) - I
     for backend in (SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
                                 AutoEnzyme(; mode = Enzyme.Forward)),
                     SecondOrder(AutoEnzyme(; mode = Enzyme.Forward),
                                 AutoEnzyme(; mode = Enzyme.Reverse)))
-        @test try
-            prepared = prepare_ad_hvp(kernel, backend, (v,), q, s, data;
-                                      active = :q)
-            only(ad_hvp(prepared, (v,), q, s, data)) ≈ hessian * v
-        catch error
-            nameof(typeof(error)) === :EnzymeRuntimeActivityError || rethrow()
-            false
-        end broken = VERSION < v"1.12"
+        prepared = prepare_ad_hvp(kernel, backend, (v,), q, s, data; active = :q)
+        @test only(ad_hvp(prepared, (v,), q, s, data)) ≈ hessian * v
     end
     third_order = SecondOrder(SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
                                           AutoEnzyme(; mode = Enzyme.Forward)),
                               AutoEnzyme(; mode = Enzyme.Forward))
-    @test try
-        prepared = prepare_ad_third(kernel, third_order, (v,), q, s, data;
-                                    active = :q)
-        only(ad_third(prepared, (v,), q, s, data)) ≈
-            data .* s^3 .* exp.(s .* q) .* v .^ 2
-    catch error
-        nameof(typeof(error)) === :EnzymeRuntimeActivityError || rethrow()
-        false
-    end broken = VERSION < v"1.12"
+    prepared = prepare_ad_third(kernel, third_order, (v,), q, s, data; active = :q)
+    @test only(ad_third(prepared, (v,), q, s, data)) ≈
+        data .* s^3 .* exp.(s .* q) .* v .^ 2
 end
 
 # The differentiated program's cache driver (`_ad_na_cache_driver`) and its AD
