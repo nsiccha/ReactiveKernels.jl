@@ -1065,7 +1065,7 @@ keeps the active AD point and gradient proportional to the selected cell's
 coordinates rather than the full layout. A packed read selects either an active
 coordinate or a constant base coordinate. Ordinary native
 `AutoEnzyme(; mode = Enzyme.Reverse)` differentiates that read on the Enzyme
-`dogfood` line; registered Enzyme 0.13.216 refuses it under static activity
+`dogfood` line; registered Enzyme (0.13.218 measured) refuses it under static activity
 (`EnzymeRuntimeActivityError`), an Enzyme limitation tracked by Enzyme snag
 `static-reverse-s-f9483e9c`. The sampler holds one `Int32` per packed
 coordinate, mapping each to its position in the selection.

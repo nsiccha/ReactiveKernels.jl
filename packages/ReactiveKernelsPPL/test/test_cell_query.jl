@@ -106,14 +106,19 @@ const _CQ_REVERSE = AutoEnzyme(; mode = Enzyme.Reverse)
             @test base == u
             @test active == overlaid[indices]
             if i == 1
-                # BRM's direct-Enzyme path differentiates the compact η
-                # vector and then evaluates the cell again for its value.
+                # BRM's former direct-Enzyme path: differentiate the query's
+                # value call over the compact overlay. The value call comes
+                # first: a query's first call with a new point type prepares
+                # a kernel for it, and static Enzyme refuses to differentiate
+                # that preparation (IllegalTypeAnalysisException in the
+                # planner; todo ReactiveKernels:runtime-activity-guidance
+                # 0y9ztxg).
+                direct_value = _cq_direct_compact_value(q, base, active, indices, i)
                 direct_gradient = zeros(length(active))
                 Enzyme.autodiff(Enzyme.Reverse,
                     _cq_direct_compact_value, Enzyme.Active, Enzyme.Const(q),
                     Enzyme.Const(base), Enzyme.Duplicated(active, direct_gradient),
                     Enzyme.Const(indices), Enzyme.Const(i))
-                direct_value = _cq_direct_compact_value(q, base, active, indices, i)
                 @test compact_value ≈ direct_value
                 @test compact_gradient ≈ direct_gradient
             end
