@@ -14,18 +14,14 @@ using Test
 # callable holds no data a plain backend must prove readonly.
 const NA_AD_BACKEND = AutoEnzyme(mode = Enzyme.Reverse)
 
-# A known Julia 1.12+ reverse-mode trigger that keeps some NA gradients from
-# being size-invariant, absent on Julia 1.10: with bounds checks forced on
-# (`--check-bounds=yes`, the integration lane's flag), Enzyme tapes the shadow
-# of a cached buffer's `Memory` pointer once per element when a loop stores
-# into the buffer and the buffer is then stored back into its `Ref` slot: the
-# AD plate loop's reuse-or-`similar` result and a cache step's `broadcast!`
-# both hit it (about 16 B per element on Julia 1.12, 24 B for the cache step
-# on Julia 1.13) (`repro_enzyme_reuse_or_similar_shadow_tape.jl`, Enzyme snag
-# `julia-1-12-rever-30566488`). A plate cell's per-element method query, a
-# second trigger of the same size, is gone since the source call asks
-# `Core._hasmethod` (snag `guarded-kernelso-e7baca4c`).
-const NA_SHADOW_TAPE = VERSION >= v"1.12" && Base.JLOptions().check_bounds == 1
+# NA gradients stay size-invariant on every Julia version, bounds checks on.
+# On Julia 1.12+ with `--check-bounds=yes`, Enzyme tapes the shadow of a
+# cached buffer's `Memory` pointer once per element when a loop stores into
+# the buffer and the buffer is then stored back into its `Ref` slot
+# (`repro_enzyme_reuse_or_similar_shadow_tape.jl`, Enzyme snag
+# `julia-1-12-rever-30566488`). The differentiated program never stores into
+# its slots (`ReactiveKernels._ad_na_cache_driver`), so its plate loops and
+# cache steps do not hit that trigger.
 
 nlp_naad(x, m, s) = -0.5 * log(2π) - log(s) - 0.5 * ((x - m) / s)^2
 g_prior_naad(q) = nlp_naad(q[1], 0.0, 5.0) + nlp_naad(q[2], 0.0, 5.0) +
@@ -55,6 +51,8 @@ end
 # folded values leave the table as placeholders and cross as the pack.
 naad_ad_constants(prepared) = prepared.call.constants === nothing ?
     prepared.call.f.call.constants : prepared.call.constants
+naad_ad_callables(prepared) = prepared.call.callables === nothing ?
+    prepared.call.f.call.callables : prepared.call.callables
 naad_hidden(prepared) =
     ReactiveKernels._ad_hidden_operands(prepared.call, prepared.external_values)
 
@@ -245,8 +243,7 @@ isdefined(@__MODULE__, :AuthoredPlateChains) ||
 # cell kernel hoisted to a direct literal (`_ad_na_plate_loop!`): calling the
 # closure-held nested kernel trips Enzyme static activity analysis. Single
 # (`flat`) and chained (`chain`) plates agree with dataflow, the analytic
-# gradient, and central differences, with size-invariant allocations on
-# Julia 1.10 (Julia 1.12+: `NA_SHADOW_TAPE` at the top of this file).
+# gradient, and central differences, with size-invariant allocations.
 @testset "prepare_ad over NonAllocatingKernel with authored plates" begin
     C = AuthoredPlateChains
     q = [0.7]
@@ -277,17 +274,15 @@ isdefined(@__MODULE__, :AuthoredPlateChains) ||
         ad_value_and_gradient!(prepna, gna, q)
         @allocated ad_value_and_gradient!(prepna, gna, q)
     end
-    @test alloc_bytes[1] == alloc_bytes[2] broken = NA_SHADOW_TAPE
+    @test alloc_bytes[1] == alloc_bytes[2]
 end
 
 # Partitioned plates gather live lane arguments at run time (`_LaneGather`).
 # Arithmetic cells keep the plate bodies free of transcendental calls, so the
-#gradient's only per-lane work is gathers plus arithmetic: on Julia 1.12 the
-#gather loop's per-element bounds checks allocated ~17.6 bytes/lane under
-#reverse-mode Enzyme (the same class as the plate-loop `checkbounds`
-#regression), and the NA gradient must stay size-invariant there too. Each
-#partition is a plate, so the Julia 1.12+ plate cost
-#(`NA_SHADOW_TAPE`, top of this file) applies to it as well.
+# gradient's only per-lane work is gathers plus arithmetic: on Julia 1.12 the
+# gather loop's per-element bounds checks allocated ~17.6 bytes/lane under
+# reverse-mode Enzyme (the same class as the plate-loop `checkbounds`
+# regression), and the NA gradient must stay size-invariant there too.
 @kernel arith_partition_naad(x::Vector{Float64}, y::Vector{Float64}) = begin
     pointwise = plate(x, y) do xi, yi
         cell::Float64 = yi > 0 ? xi * yi : 2.0 * xi + 1.0
@@ -336,7 +331,7 @@ end
         na_bytes
     end
     println("NONALLOCATING_AD_ALLOC\tpartition_arith\t", alloc_bytes)
-    @test alloc_bytes[1] == alloc_bytes[2] broken = NA_SHADOW_TAPE
+    @test alloc_bytes[1] == alloc_bytes[2]
 end
 
 fscale_naad(a, b) = a * b
@@ -367,10 +362,8 @@ fscale_naad(a, b) = a * b
     println("NONALLOCATING_AD_ALLOC\tdataflow\t", dataflow_bytes)
     println("NONALLOCATING_AD_ALLOC\tnonalloc\t", na_bytes)
     @test dataflow_bytes > 0
-    # The cache step's `broadcast!` writes back into its slot
-    # (`NA_SHADOW_TAPE`, top of this file).
-    @test na_bytes <= 64 broken = NA_SHADOW_TAPE
-    @test na_bytes < dataflow_bytes broken = NA_SHADOW_TAPE
+    @test na_bytes <= 64
+    @test na_bytes < dataflow_bytes
 end
 
 @testset "bound-only steps fold once per preparation" begin
@@ -557,8 +550,8 @@ end
     @test any(op -> op === -, kbna.callables)
     prep = prepare_ad(kb, NA_AD_BACKEND, a0; active = :a)
     prepna = prepare_ad(kbna, NA_AD_BACKEND, a0; active = :a)
-    @test any(op -> op === +, naad_ad_ops(prepna))
-    @test any(op -> op === -, naad_ad_ops(prepna))
+    @test any(op -> op === +, naad_ad_callables(prepna))
+    @test any(op -> op === -, naad_ad_callables(prepna))
     g, gna = similar(a0), similar(a0)
     v, _ = ad_value_and_gradient!(prep, g, a0)
     vna, _ = ad_value_and_gradient!(prepna, gna, a0)
@@ -580,7 +573,7 @@ end
     @test any(op -> op isa ReactiveKernels._MaterializeStep, kbna.callables)
     prep = prepare_ad(kb, NA_AD_BACKEND, a0; active = :a)
     prepna = prepare_ad(kbna, NA_AD_BACKEND, a0; active = :a)
-    @test any(op -> op isa ReactiveKernels._MaterializeStep, naad_ad_ops(prepna))
+    @test any(op -> op isa ReactiveKernels._MaterializeStep, naad_ad_callables(prepna))
     g, gna = similar(a0), similar(a0)
     v, _ = ad_value_and_gradient!(prep, g, a0)
     vna, _ = ad_value_and_gradient!(prepna, gna, a0)
