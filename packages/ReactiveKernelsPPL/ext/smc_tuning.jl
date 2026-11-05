@@ -31,7 +31,14 @@ end
 
 function _capture_tuning(cp, source, target; warmup=cp.warmup)
     position = warmup === nothing ? cp.position : warmup.position_and_gradient.q
-    probes = hcat(cp.config.init, position)
+    positions = [cp.config.init, position]
+    if cp.config.grid_start === :independent && cp.phase !== :reference
+        for pilot in cp.pilots
+            pilot.warmup === nothing && continue
+            push!(positions, pilot.warmup.position_and_gradient.q)
+        end
+    end
+    probes = reduce(hcat, positions)
     return deepcopy(merge(cp, (; warmup, probes,
         source_scores=_scores(source, probes, :source, _tuning_temperature(cp)),
         target_scores=_scores(target, probes, :target, _tuning_temperature(cp)))))
@@ -55,7 +62,8 @@ end
 
 function _validate_tuning_checkpoint(cp, target, previous, config)
     cp isa NamedTuple && hasproperty(cp, :kind) && cp.kind === :smc_tuning &&
-        hasproperty(cp, :schema_version) && cp.schema_version == 1 ||
+        hasproperty(cp, :schema_version) &&
+        cp.schema_version == (config.grid_start === :independent ? 2 : 1) ||
         throw(ArgumentError("unsupported SMC tuning checkpoint"))
     cp.versions == _versions() || throw(ArgumentError(
         "SMC tuning checkpoint Julia/package versions differ"))
@@ -66,12 +74,16 @@ function _validate_tuning_checkpoint(cp, target, previous, config)
     _same(cp.previous, previous === nothing ? nothing : previous.signature) ||
         throw(ArgumentError("SMC tuning checkpoint previous endpoint differs"))
     source = _tuning_source(target, previous, cp.reference)
-    valid_phase = cp.phase === :reference ? cp.knot == 1 && config.reference === :pilot :
+    valid_phase = if config.grid_start === :independent && cp.phase !== :reference
+        _valid_grid_checkpoint(cp, _dimension(target))
+    else
+        (cp.phase === :reference ? cp.knot == 1 && config.reference === :pilot :
         cp.phase === :grid ? 1 <= cp.knot <= length(config.temperatures) :
         cp.phase === :complete && cp.knot == length(config.temperatures) + 1 &&
-            cp.warmup === nothing && cp.seed === nothing
-    valid_phase &&
-        length(cp.kernels) == length(cp.work) == cp.knot - 1 ||
+            cp.warmup === nothing && cp.seed === nothing) &&
+            length(cp.kernels) == length(cp.work) == cp.knot - 1
+    end
+    valid_phase ||
         throw(ArgumentError("invalid SMC tuning checkpoint phase"))
     foreach(kernel -> _validate_kernel(kernel, _dimension(target)), cp.kernels)
     _scores(source, cp.probes, :source, _tuning_temperature(cp)) == cp.source_scores &&
@@ -88,7 +100,8 @@ function _tuning_schedule(cp, source)
         (; initial_rng=copy(cp.initial_rng), final_rng=copy(cp.rng), init=copy(c.init),
             steps=c.pilot_steps, work=deepcopy(cp.work), method=:adaptive,
             max_reflections=c.max_reflections, recording_target=c.recording_target,
-            pilot_evaluations=c.pilot_evaluations, reference_work=deepcopy(cp.reference_work)))
+            pilot_evaluations=c.pilot_evaluations, reference_work=deepcopy(cp.reference_work),
+            grid_start=c.grid_start))
 end
 
 function _run_tuning_pilot(bridge, cp, progress, callback)
@@ -122,7 +135,7 @@ end
 function _tune_adaptive(target; rng, init, reference, previous,
         reference_inflation, grid, pilot_steps, max_reflections,
         recording_target, pilot_evaluations, options, scale,
-        progress, callback, checkpoint_dir, resume, overwrite)
+        progress, callback, checkpoint_dir, resume, overwrite, grid_start)
     resume isa Bool || resume isa SMCTuningPartial || throw(ArgumentError(
         "resume must be a Bool or SMCTuningPartial"))
     resume === false || !overwrite || throw(ArgumentError("resume and overwrite cannot be combined"))
@@ -141,7 +154,7 @@ function _tune_adaptive(target; rng, init, reference, previous,
         pilot_steps=Int(pilot_steps), max_reflections=Int(max_reflections),
         recording_target=Int(recording_target), pilot_evaluations=Int(pilot_evaluations),
         scale, moves=options.moves, max_tree_depth=options.max_tree_depth,
-        history_limit=options.history_limit))
+        history_limit=options.history_limit, grid_start))
     path = checkpoint_dir === nothing ? nothing :
         joinpath(checkpoint_dir, _TUNING_CHECKPOINT_FILE)
     if resume === true
@@ -155,14 +168,15 @@ function _tune_adaptive(target; rng, init, reference, previous,
         initial_reference = previous !== nothing ? nothing : reference === :pilot ?
             SMCReference(zeros(d), ones(d)) : reference === nothing ?
             deepcopy(_default_reference(target)) : deepcopy(reference)
-        (; kind=:smc_tuning, schema_version=1, versions=_versions(),
+        (; kind=:smc_tuning, schema_version=grid_start === :independent ? 2 : 1, versions=_versions(),
             target=deepcopy(target.signature),
             previous=previous === nothing ? nothing : deepcopy(previous.signature),
             config, initial_rng=copy(rng), rng=copy(rng),
             reference=initial_reference, reference_work=nothing,
             kernels=NamedTuple[], work=NamedTuple[], history=NamedTuple[],
             phase=reference === :pilot ? :reference : :grid, knot=1,
-            position=Vector{Float64}(init), seed=nothing, warmup=nothing)
+            position=Vector{Float64}(init), seed=nothing, warmup=nothing,
+            pilots=NamedTuple[])
     else
         deepcopy(resume isa SMCTuningPartial ? resume.checkpoint : deserialize(path))
     end
@@ -181,6 +195,10 @@ function _tune_adaptive(target; rng, init, reference, previous,
                 return SMCTuningPartial(cp, event)
             end
             if cp.seed === nothing
+                if cp.phase === :grid && grid_start === :independent
+                    return _tune_independent_grid(cp, source, target, options,
+                        tuning_progress, callback, checkpoint_dir, observing)
+                end
                 cp = merge(cp, (; seed=rand(cp.rng, UInt64)))
             end
             if observing
