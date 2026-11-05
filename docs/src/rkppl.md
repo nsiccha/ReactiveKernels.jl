@@ -1613,6 +1613,11 @@ prepare_query(built, design, :sampler)        # refused: `y` is absent
 
 ### Predictive draws
 
+The discrete latents a model sums out (a hidden Markov observation's state
+path, a mixture's components) are recovered by `prepare_discrete_latents`;
+see [Discrete latent variables](discrete-latents.md).
+
+
 `prepare_predictive` draws every observation from the law the model gives
 it at given parameter values: posterior-predictive draws when the values are
 posterior draws, on the fitted binding or on a prediction design without the

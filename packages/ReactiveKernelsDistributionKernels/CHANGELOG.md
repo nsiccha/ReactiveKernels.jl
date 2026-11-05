@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.4
+
+- Add a state-posterior twin for each hidden Markov law, taking the law's own
+  arguments: `hmm_state_posterior`, `normal_hmm_state_posterior` and
+  `exponential_hmm_state_posterior`, and the log-weight twins
+  `hmm_log_weights_state_posterior`, `normal_hmm_log_weights_state_posterior`
+  and `exponential_hmm_log_weights_state_posterior`. Each returns the smoothed
+  state probabilities (`probabilities[t, k]`), the filtered log probabilities
+  (`log_filtered[t, k]`) and the `log_transition` weights the law reads.
+  `hmm_state_posterior_name(law)` names a law's twin.
+- Add `draw_hmm_states(rng, posterior)` and `draw_hmm_states!`: one exact draw
+  of the state path from a twin's value (forward filtering, backward
+  sampling), with `rng` as the only source of randomness.
+- The laws and their twins share one forward-pass kernel and one log-emission
+  kernel per family. Densities are unchanged.
+
 ## 0.1.3
 
 - Add Gumbel, Rayleigh, Chi, Chi-squared, inverse-Gaussian, BetaPrime and F

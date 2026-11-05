@@ -21,6 +21,7 @@ Base.include(ReactiveKernelsDocs, joinpath(@__DIR__, "all80_benchmark_plots.jl")
 include("check_rendered.jl")
 include("test_all80_contracts.jl")
 include("gibbs_page.jl")
+include("discrete_latents_page.jl")
 
 site_pages = [
     "Home" => "index.md",
@@ -35,6 +36,7 @@ site_pages = [
     "Probabilistic programming" => [
         "Writing models with @rkppl" => "rkppl.md",
         "Smooths and HSGPs with @rkppl" => "rkppl-smooths.md",
+        "Discrete latent variables" => "discrete-latents.md",
         "Eight schools" => "eight-schools.md",
         "Sum-to-zero recovery" => "sum-to-zero.md",
         "MNIST multinomial logistic" => "mnist-logistic.md",

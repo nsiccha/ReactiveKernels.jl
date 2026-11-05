@@ -93,6 +93,8 @@ export prepare_cell_pullback, CellPullback, cell_pullback!,
 export with_cell_batch, CellBatch
 export prepare_predictive, PredictiveQuery, PredictiveLaws, predictive_laws, predictive_draws!,
     predictive_draws, predictive_node, predictive_targets
+export prepare_discrete_latents, DiscreteLatentQuery, discrete_latents_node,
+    discrete_latent_draws
 export restore_draws
 export prepare_smc, smc, initialize_smc, update_smc, smc_step, smc_checkpoint, resume_smc
 export SMCReference, SMCOptions, SMCNonfiniteError, SMCDegeneracyError, rejuvenate_smc
@@ -133,6 +135,7 @@ include("cell_shared.jl")
 include("cell_batch.jl")
 include("density_factors.jl")
 include("predictive.jl")
+include("discrete_latents.jl")
 include("smc.jl")
 include("smc_projection.jl")
 include("smc_coordinates.jl")
