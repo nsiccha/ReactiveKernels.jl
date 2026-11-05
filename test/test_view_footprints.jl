@@ -53,6 +53,184 @@ end
 
 const HAVE = (:u, :ranges, :ks, :picks, :y, :t)
 
+# Scalar generator sums keep their visible parameter gathers, including a
+# data-only domain/index helper and a captured source without an inner view.
+read_slots(a, r) = eachindex(a[r])
+read_coordinate(a, r, j) = a[r][j]
+@kernel generator_capture(u::AbstractVector{Float64}, a::Vector{Vector{Int}}) = begin
+    rows = eachindex(a)
+    terms = plate(rows) do r
+        sum(u[read_coordinate(a, r, j)]^2 for j in read_slots(a, r); init = 0.0)
+    end
+end
+@kernel generator_view(u::AbstractVector{Float64}, a::Vector{Vector{Int}}) = begin
+    rows = eachindex(a)
+    terms = plate(rows) do r
+        field = view(u, 2:(length(u) - 1))
+        sum(field[a[r][j]]^2 for j in 1:length(a[r]); init = 0.0)
+    end
+end
+@kernel generator_nested(u::AbstractVector{Float64}, a::Vector{Vector{Int}}) = begin
+    rows = eachindex(a)
+    terms = plate(rows) do r
+        sum(sum(sum(u[[a[r][j], a[r][j]]].^2) for k in 1:2; init = 0.0)
+            for j in read_slots(a, r) if a[r][j] > 0; init = 0.0)
+    end
+end
+@kernel generator_producer(u::AbstractVector{Float64}, a::Vector{Vector{Int}},
+                           picks::Vector{Int}) = begin
+    rows = eachindex(a)
+    field = view(u, 2:(length(u) - 1))
+    values = plate(rows) do r
+        sum(field[read_coordinate(a, r, j)]^2 for j in read_slots(a, r); init = 0.0)
+    end
+    terms = plate(picks) do p
+        exp(values[p])
+    end
+end
+@kernel generator_copy(u::AbstractVector{Float64}, a::Vector{Vector{Int}},
+                       picks::Vector{Int}) = begin
+    rows = eachindex(a)
+    field = u[2:9]
+    values = plate(rows) do r
+        sum(field[read_coordinate(a, r, j)]^2 for j in read_slots(a, r); init = 0.0)
+    end
+    terms = plate(picks) do p
+        exp(values[p])
+    end
+end
+@kernel generator_copy_lanes(u::AbstractVector{Float64}, a::Vector{Vector{Int}},
+                             picks::Vector{Int}) = begin
+    rows = eachindex(a)
+    field = u[2:9]
+    scales = exp.(u[1:3])
+    values = plate(rows, scales) do r, scale
+        scale * sum(field[read_coordinate(a, r, j)]^2 for j in read_slots(a, r); init = 0.0)
+    end
+    terms = plate(picks) do p
+        exp(values[p])
+    end
+end
+# Short-circuit consumers and parameter-dependent indices keep a conservative
+# footprint. Evaluating the generator's unconsumed tail would throw.
+@kernel generator_short(u::AbstractVector{Float64}, a::Vector{Vector{Int}}) = begin
+    rows = eachindex(a)
+    terms = plate(rows) do r
+        first(u[j] for j in (a[r][1], 100))
+    end
+end
+@kernel generator_dependent(u::AbstractVector{Float64}, a::Vector{Vector{Int}}) = begin
+    rows = eachindex(a)
+    terms = plate(rows) do r
+        sum(u[clamp(round(Int, u[1]), 1, length(u))] for j in a[r]; init = 0.0)
+    end
+end
+@kernel generator_lazy(u::AbstractVector{Float64}, a::Vector{Vector{Int}}) = begin
+    rows = eachindex(a)
+    terms = plate(rows) do r
+        sum(j > 0 ? u[j] : u[100] for j in a[r]; init = 0.0)
+    end
+end
+@kernel capture_lazy(u::AbstractVector{Float64}, a::Vector{Vector{Int}}) = begin
+    rows = eachindex(a)
+    terms = plate(rows) do r
+        exp(r > 0 ? u[a[r][1]] : u[100])
+    end
+end
+
+@testset "scalar generator footprints" begin
+    u = collect(0.1:0.1:1.0)
+    a = [[3, 1, 3], Int[], [2, 4]]
+    saved = deepcopy((u, a))
+    for (k, offset, scale) in ((generator_capture, 0, 1),
+                              (generator_view, 1, 1), (generator_nested, 0, 4))
+        spec = plate_cell(k, :terms; index = :t, locality = :error)
+        query = prepare(spec; have = (:u, :a, :rows, :t), want = :terms_cell)
+        bound = prepare(spec; have = (:u, :a, :t), want = :terms_cell, bound = (; a))
+        ad = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), u, 1; active = :u)
+        for t in eachindex(a)
+            positions = a[t] .+ offset
+            expected = scale * sum(abs2, u[positions]; init = 0.0)
+            tracked = ReadVector(copy(u))
+            @test query(tracked, a, eachindex(a), t) ≈ expected
+            reads = sort!(unique(positions))
+            @test sort!(unique(tracked.reads)) == reads
+            @test partition_footprint(query, u, a, eachindex(a), t).u == reads
+            @test partition_footprint(bound, u, t).u == reads
+            value, gradient = ad_value_and_gradient(ad, u, t)
+            expected_gradient = zeros(length(u))
+            for i in positions
+                expected_gradient[i] += 2scale * u[i]
+            end
+            @test value ≈ expected
+            @test gradient ≈ expected_gradient
+        end
+    end
+    for k in (generator_short, generator_dependent, generator_lazy, capture_lazy)
+        spec = plate_cell(k, :terms; index = :t, locality = :error)
+        query = prepare(spec; have = (:u, :a, :t), want = :terms_cell, bound = (; a))
+        tracked = ReadVector(copy(u))
+        @test isfinite(query(tracked, 1))
+        @test partition_footprint(query, u, 1).u === :whole
+    end
+    filtered = prepare(plate_cell(generator_nested, :terms; index = :t, locality = :error);
+        have = (:u, :a, :t), want = :terms_cell, bound = (; a = [[0, 3, 0, 1]]))
+    @test filtered(u, 1) ≈ 4sum(abs2, u[[3, 1]])
+    @test partition_footprint(filtered, u, 1).u == [1, 3]
+    @test (u, a) == saved
+end
+
+@testset "generator reads through a producer plate" begin
+    u = collect(0.1:0.1:1.0)
+    a, picks = [[3, 1, 3], Int[], [2, 4]], [3, 1, 3, 2]
+    saved = deepcopy((u, a, picks))
+    for kernel in (generator_producer, generator_copy)
+        spec = plate_cell(kernel, :terms; index = :t, locality = :error)
+        query = prepare(spec; have = (:u, :a, :picks, :t), want = :terms_cell,
+            bound = (; a, picks))
+        ad = prepare_ad(query, AutoEnzyme(; mode = Enzyme.Reverse), u, 1; active = :u)
+        for t in eachindex(picks)
+            positions = a[picks[t]] .+ 1
+            expected = exp(sum(abs2, u[positions]; init = 0.0))
+            tracked = ReadVector(copy(u))
+            @test query(tracked, t) ≈ expected
+            reads = sort!(unique(positions))
+            @test sort!(unique(tracked.reads)) == reads
+            @test partition_footprint(query, u, t).u == reads
+            value, gradient = ad_value_and_gradient(ad, u, t)
+            expected_gradient = zeros(length(u))
+            for i in positions
+                expected_gradient[i] += 2u[i] * expected
+            end
+            @test value ≈ expected
+            @test gradient ≈ expected_gradient
+        end
+    end
+    query = prepare(plate_cell(generator_copy_lanes, :terms; index = :t, locality = :error);
+        have = (:u, :a, :picks, :t), want = :terms_cell, bound = (; a, picks))
+    ad = prepare_ad(query, AutoEnzyme(; mode = Enzyme.Reverse), u, 1; active = :u)
+    for t in eachindex(picks)
+        r = picks[t]
+        positions = a[r] .+ 1
+        square = sum(abs2, u[positions]; init = 0.0)
+        expected = exp(exp(u[r]) * square)
+        tracked = ReadVector(copy(u))
+        @test query(tracked, t) ≈ expected
+        reads = sort!(unique([positions; r]))
+        @test sort!(unique(tracked.reads)) == reads
+        @test partition_footprint(query, u, t).u == reads
+        value, gradient = ad_value_and_gradient(ad, u, t)
+        expected_gradient = zeros(length(u))
+        expected_gradient[r] += expected * exp(u[r]) * square
+        for i in positions
+            expected_gradient[i] += 2u[i] * expected * exp(u[r])
+        end
+        @test value ≈ expected
+        @test gradient ≈ expected_gradient
+    end
+    @test (u, a, picks) == saved
+end
+
 function cases()
     ((; ranges = [1:3, 4:5], picks = [[1], Int[]]),
      (; ranges = [1:3, 4:5, 6:5], picks = [[3, 1], [2], Int[]]),

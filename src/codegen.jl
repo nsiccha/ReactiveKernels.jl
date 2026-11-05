@@ -4462,10 +4462,8 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
     end
     for s in states
         for (position, program) in s.footprint_programs
-            readplate = _AuthoredPlateOp{typeof(program),s.atomic}(program)
-            reads = gensym(:cell_reads)
-            _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
-                readplate, s.slices, s.plate_values, reads, nothing; element_type=Vector{Int})
+            reads = _footprint_plate_reads!(body, runtime_ops, runtime_recipes,
+                program, s.atomic, s.slices, s.plate_values)
             _footprint_record!(canon_id(windows.pushdowns.graph, s.plate_values[position].id),
                                :gathered, reads)
         end

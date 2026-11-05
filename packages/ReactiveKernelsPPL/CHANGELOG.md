@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.94
+
+- Require ReactiveKernels 0.1.82 for precise cell-query footprints through
+  visible scalar generator sums, including GMRF readers with data-only index
+  helpers. The authored model and ordinary native Reverse remain unchanged.
+
 ## 0.1.93
 
 - Export `rkppl_documentation(model_or_plan; path=nothing)` and immutable

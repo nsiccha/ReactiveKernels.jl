@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.82
+
+- Plate-cell and producer-window footprints follow visible gathers inside
+  scalar generator sums with `init`, including views, data-only index helpers,
+  nested sums and filters. Direct scalar captures also request only the needed
+  rows of eligible producers, including copying packed-parameter slices.
+  Shape-based views retain their storage identity. Index programs keep runtime
+  loops, the authored callback and ordinary Reverse; unproved or lazy reads
+  retain conservative footprints.
+
 ## 0.1.80
 
 - Lazy plate arms retain complete positional single-output child graphs over
