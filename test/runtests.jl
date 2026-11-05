@@ -89,6 +89,7 @@ const _MATRIX_CORE_TESTS = (
     "test_plate_closures.jl",
     "test_plate_cell_destructuring.jl",
     "test_plate_shared_branch.jl",
+    "test_nested_plate_shared_branch.jl",
     "test_empty_plate_invariants.jl",
     "test_plate_cell.jl",
     "test_product_cell_shapes.jl",

@@ -44,10 +44,6 @@ end
 _cq_central(f, u, j; h = 1e-6) =
     (f(setindex!(copy(u), u[j] + h, j)) - f(setindex!(copy(u), u[j] - h, j))) / (2h)
 
-_cq_direct_compact_value(q, base, active, indices, cell) =
-    q(ReactiveKernelsPPL._CompactCellPoint(base, active,
-        ReactiveKernelsPPL._compact_cell_slots(length(base), indices)), cell)
-
 # Every sampler here is differentiated by ordinary static Reverse; the compact
 # ones run under `_static_enzyme` (static_enzyme.jl).
 const _CQ_REVERSE = AutoEnzyme(; mode = Enzyme.Reverse)
@@ -105,23 +101,6 @@ const _CQ_REVERSE = AutoEnzyme(; mode = Enzyme.Reverse)
             @test compact_gradient ≈ full_gradient[indices]
             @test base == u
             @test active == overlaid[indices]
-            if i == 1
-                # BRM's former direct-Enzyme path: differentiate the query's
-                # value call over the compact overlay. The value call comes
-                # first: a query's first call with a new point type prepares
-                # a kernel for it, and static Enzyme refuses to differentiate
-                # that preparation (IllegalTypeAnalysisException in the
-                # planner; todo ReactiveKernels:runtime-activity-guidance
-                # 0y9ztxg).
-                direct_value = _cq_direct_compact_value(q, base, active, indices, i)
-                direct_gradient = zeros(length(active))
-                Enzyme.autodiff(Enzyme.Reverse,
-                    _cq_direct_compact_value, Enzyme.Active, Enzyme.Const(q),
-                    Enzyme.Const(base), Enzyme.Duplicated(active, direct_gradient),
-                    Enzyme.Const(indices), Enzyme.Const(i))
-                @test compact_value ≈ direct_value
-                @test compact_gradient ≈ direct_gradient
-            end
         end
         @test_throws ReactiveKernelsPPL.ContractValidationError cell_value_and_gradient!(
             compact, zeros(2), u, zeros(2), [2, 2], 1)

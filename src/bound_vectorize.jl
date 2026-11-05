@@ -16,11 +16,13 @@
 # constants in their slots, exactly as `_bound_rebind` rebuilds the scalar
 # kernel.
 #
-# A product is kept only when each of its constants tables holds each
-# constant's value exactly once, in plan order, and nothing else of that
-# binding; every other product is lowered afresh per call, as before. The key
-# includes the types of the kernel's two tables, so the constants' types are
-# those the kept programs were lowered for. Nothing here is on a call path, and the products'
+# A product is kept only when each of its constants tables holds each of the
+# plan's constants' values exactly once, in plan order, and nothing else of
+# that binding; every other product is lowered afresh per call, as before.
+# These are all of the plan's constants, including those the scalar kernel no
+# longer reads: the product's own lowering may still read them. The key
+# includes the types of the kernel's two tables and of every constant, so the
+# constants' types are those the kept programs were lowered for. Nothing here is on a call path, and the products'
 # types are as varied as the graphs, so these functions take their arguments
 # unspecialized.
 
@@ -68,23 +70,20 @@ struct _RebindScheduled
     residual::BorrowedBatchedKernel
 end
 
-# A kernel's constants: their values in its constants table and their
-# readable recipes, at its template's constant slots, in plan order.
+# A kernel's constants: their values and readable recipes, in plan order.
+# They come from its plan, not its lowered tables. A vectorized product is
+# lowered from that plan, so it can still read a constant the scalar kernel's
+# lowering dropped (`_read_bound_constants`), and a kept product must take
+# each constant from the binding it serves. The plan's recipes are a vector:
+# reading them boxes no tuple table of an unspecialized kernel (snag
+# per-binding-resi-990b18ab: 1.8 MB per binding when each tuple was copied).
 struct _RebindConstants
     values::Vector{Any}
     recipes::Vector{Any}
 end
-# `getfield`, not `getindex`: on an unspecialized kernel each `getindex` was a
-# dynamic dispatch on the type of a table of hundreds of entries. Each table
-# is read from the kernel once: a tuple field of an unspecialized kernel is
-# boxed, a copy of the whole table, at every read, which inside the loop was
-# 1.8 MB per binding of a simulator graph with 56 constants among 365 entries
-# (snag per-binding-resi-990b18ab).
-function _RebindConstants(@nospecialize(kernel::PreparedKernel), slots::Vector{Int})
-    constants = getfield(kernel, :constants)
-    recipes = getfield(kernel, :lowered_recipes)
-    _RebindConstants(Any[getfield(constants, k) for k in slots],
-                     Any[getfield(recipes, k) for k in slots])
+function _RebindConstants(@nospecialize(kernel::PreparedKernel))
+    recipes = _bound_constants(getfield(kernel, :plan))
+    _RebindConstants(Any[r.op.value for r in recipes], Any[r for r in recipes])
 end
 
 _holds_constant(@nospecialize(table), constants::Vector{Any}) =
@@ -97,11 +96,13 @@ _vectorize(::Nothing, kernel::PreparedKernel, @nospecialize(batched), reuse::Boo
 function _vectorize(vectorizations::_BoundVectorizations,
                     @nospecialize(kernel::PreparedKernel), @nospecialize(batched),
                     reuse::Bool, @nospecialize(schedule))
+    constants = _RebindConstants(kernel)
+    # The types of every constant, including those the scalar kernel's
+    # constants table no longer holds.
     key = (_replica_batch_indices(inputs(kernel), batched), reuse,
            schedule === nothing, fieldtype(typeof(kernel), :constants),
-           fieldtype(typeof(kernel), :callables))
+           fieldtype(typeof(kernel), :callables), Tuple(map(typeof, constants.values)))
     kept = lock(() -> get(vectorizations.products, key, nothing), vectorizations.lock)
-    constants = _RebindConstants(kernel, vectorizations.slots)
     kept === nothing || return _rebound(kept, kernel, constants, schedule)
     product = _vectorize(nothing, kernel, batched, reuse, schedule)
     kept = _rebind_template(product, kernel, constants)
