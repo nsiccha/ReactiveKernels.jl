@@ -1658,9 +1658,11 @@ function _cell_capture_root(inner::Plan, roots, input)
         end
         analyzed = _cell_native(producer)
         analyzed === nothing && return nothing
-        native, params, _ = analyzed
-        length(params) == 1 &&
-            native == Expr(:call, GlobalRef(Base, :vec), only(params)) || return nothing
+        native, params, mod = analyzed
+        length(params) == 1 && Meta.isexpr(native, :call, 2) &&
+            native.args[2] === only(params) &&
+            !_native_callee_shadowed(native.args[1], params) &&
+            _cell_binding(native.args[1], mod) === Base.vec || return nothing
         return findfirst(==(canon_id(ig, only(producer.inputs).id)), roots)
     end
     nothing
