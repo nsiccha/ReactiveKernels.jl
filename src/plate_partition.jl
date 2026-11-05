@@ -1260,10 +1260,30 @@ end
 # at 128. Warm gradients were about 15% slower at 8 blocks and no slower at 32 or more.
 # Scalar statements stay inline (`_partition_statement_call`), and so do plate loops:
 # moving them into separate functions in one module made compile time worse.
-@noinline _partition_array_call(f::F, args::Vararg{Any,N}) where {F,N} = f(args...)
+#
+# Julia compiles a `Vararg{Any}` position that holds a type as `::Type`, and one
+# that holds a function the method does not call as `::Function`. The compiled
+# wrapper would then read the type's parameter and dispatch the statement at run
+# time: `_plate_similar_output(marker, T, axes)` called `similar` dynamically and
+# allocated on every evaluation (snag `partition-array-bb24ae62`). So each such
+# argument crosses the wrapper in a carrier whose concrete type holds it, and
+# the wrapper unwraps it before the call.
+struct _PartitionType{T} end
+struct _PartitionFunction{F}
+    f::F
+end
+@inline _partition_carry(x) = x
+@inline _partition_carry(::Type{T}) where {T} = _PartitionType{T}()
+@inline _partition_carry(f::Function) = _PartitionFunction(f)
+@inline _partition_uncarry(x) = x
+@inline _partition_uncarry(::_PartitionType{T}) where {T} = T
+@inline _partition_uncarry(f::_PartitionFunction) = getfield(f, :f)
+@noinline @generated _partition_array_call(f::F, args::Vararg{Any,N}) where {F,N} =
+    :(f($((:(_partition_uncarry(args[$i])) for i in 1:N)...)))
 @inline @generated function _partition_statement_call(f, args::Vararg{Any,N}) where {N}
     array = any(T -> T <: Union{AbstractArray,Base.Broadcast.Broadcasted}, args)
-    array ? :(_partition_array_call(f, args...)) : :(f(args...))
+    array || return :(f(args...))
+    :(_partition_array_call(f, $((:(_partition_carry(args[$i])) for i in 1:N)...)))
 end
 _partition_has_loop(@nospecialize(x)) =
     x isa Expr && (x.head in (:for, :while) || any(_partition_has_loop, x.args))
