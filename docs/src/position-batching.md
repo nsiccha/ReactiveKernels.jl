@@ -278,8 +278,9 @@ that container. Declared types keep their ordinary Julia conversion semantics.
 Position intermediates use the same destination protocol. A residual value
 produced by an authored plate or scan, or by a recipe whose source is a
 top-level dotted call (including `@.`), an array slice such as `y[2:2:end]`
-or `m[:, j]`, or `reduce(vcat, cells)` of dense vectors, keeps its dense
-buffer in a lane slot. Later positions overwrite that buffer when its element
+or `m[:, j]`, `reduce(vcat, cells)` of dense vectors, or a `vcat` of numbers
+and dense vectors such as `vcat(0.0, v[rows])`, keeps its dense buffer in a
+lane slot. Later positions overwrite that buffer when its element
 type and axes match, and allocate afresh otherwise. An owning call keeps its
 slots for that call; a borrowed reader and each scheduled worker keep them
 between calls. A WANT produced by a dotted call, a slice or
@@ -319,11 +320,15 @@ type each time the condition runs, about 160 bytes per position as in any
 loop, while `AbstractVector` and `AbstractVector{Float64}` are constants.
 An `@rkppl` model writes the same recipe as a definition over a `@plate`
 cell's results ([RKPPL](rkppl.md)) and keeps the slot.
-A dotted call or a
-`reduce(vcat, cells)` nested in another call of a source, as in
+A dotted call, a
+`reduce(vcat, cells)` or such a `vcat` nested in another call of a source, as in
 `minimum(100 .* (v .- b))`, `2 .* reduce(vcat, cells)` or inside a branch arm,
 keeps a lane slot of its own; the recipe's value releases that slot when it
 may hold the buffer (an opaque function returned it, a tuple holds it). A
+slice that a dotted call reads directly as an operand, as in `a .* x[k]` or
+`exp.(y[k])`, needs no slot: the fused broadcast reads it in place through a
+checked view of the dense array, with the slice's values, element type and
+`BoundsError`. A
 source recipe of any other shape, one whose source captures a local variable,
 or one prepared with `on_error = :ignore` keeps its ordinary call; such
 recipes, opaque functions, other concatenations and matrix products allocate as
