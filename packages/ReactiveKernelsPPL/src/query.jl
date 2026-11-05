@@ -2084,7 +2084,11 @@ function _compact_partition_plan(p::ReactiveKernels.Plan; whole_footprint::Bool=
     recipes = ReactiveKernels.Recipe[recipe]
     for r in p.recipes
         op = r.op
-        if op isa ReactiveKernels._AuthoredPlateCellOp && op.plan !== nothing
+        if op isa ReactiveKernels._AuthoredPlateCellOp
+            # Every cell in this compact program uses the same fixed slot
+            # map, including scalar predictor cells without their own plan
+            # port. Their row reads must also use the active slots directly
+            # instead of carrying the whole packed overlay into a call.
             op = ReactiveKernels._AuthoredPlateCellOp(op.plate, op.locality, op.rows,
                 op.partitioned, op.plan, (op.plan_constant..., :_ppl_cell_slots))
             r = ReactiveKernels.Recipe(r.id, r.inputs, r.outputs, op, r.cost,

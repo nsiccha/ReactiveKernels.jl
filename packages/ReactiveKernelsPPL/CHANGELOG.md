@@ -27,6 +27,8 @@ are recorded in the git history only.
 - Shared-prefix active storage and cache invalidation follow the coordinates
   actually read by that prefix. Shared parameters read only at selected rows
   remain in the compact residual instead of creating whole-panel cotangents.
+  Auxiliary scalar predictor cells use the same compact slot map as the
+  observation partition, avoiding a shadow of the full packed point.
 
 ## 0.1.100
 
