@@ -59,6 +59,17 @@ end
     slot[] = MutatingFunctions.apply!!(slot[], op, args...)
 end
 
+# The differentiated program's driver (`ReactiveKernels._ad_na_cache_driver`):
+# its slots are seeded and read-only. `apply!!` fills the slot's buffer when
+# the result fits it and returns any other result, which is not kept. A nested
+# plate's slot holds the cell kernel and its arrays, and keeps its driver.
+@inline cache_fill!(slot::Base.RefValue, op, args...) =
+    MutatingFunctions.apply!!(slot[], op, args...)
+@inline cache_fill!(slot::Base.RefValue{<:_NestedPlateCache},
+                    op::ReactiveKernels._AuthoredPlateOp, args...) =
+    cache_apply!(slot, op, args...)
+ReactiveKernels._ad_na_cache_driver(::typeof(cache_apply!)) = cache_fill!
+
 # The reactive getter injects a `cache_apply(cache, op, args...) -> newcache`
 # helper that takes the slot VALUE (not the Ref) and returns the value the
 # getter stores back. `MutatingFunctions.apply!!` already has that exact
