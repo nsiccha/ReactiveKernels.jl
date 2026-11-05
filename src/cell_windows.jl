@@ -165,6 +165,20 @@ end
 @inline function _cell_local_rows(w::_CellWindow{<:Any,<:Any,<:Any,Nothing},
                                   I::AbstractVector{<:Integer}, at)
     positions = Vector{Int}(undef, length(I))
+    # A partition often holds one contiguous block. Decide that once for the
+    # gather: repeating the span proof inside every row lookup also repeats
+    # its control flow in the ordinary reverse pass.
+    if w.rows isa Vector{Int} && w.sorted && !isempty(w.rows)
+        lo, hi = first(w.rows), last(w.rows)
+        if hi - lo == length(w.rows) - 1
+            offset = firstindex(w.data, 1) - lo
+            for (k, i) in enumerate(I)
+                lo <= i <= hi || throw(BoundsError(w.rows, at))
+                positions[k] = Int(i) + offset
+            end
+            return positions
+        end
+    end
     for (k, i) in enumerate(I)
         positions[k] = _cell_local_row(w, i, at)
     end
@@ -221,6 +235,12 @@ end
 @inline Base.getindex(w::_CellWindow, i::Integer, j::Union{Integer,Colon},
                       rest::Union{Integer,Colon}...) =
     w.data[_cell_local_row(w, i, (i, j, rest...)), j, rest...]
+# A dotted call consumes this row before the slice can escape. Delegate to
+# the same checked read-in-place path as a dense operand. Ordinary indexing
+# above keeps its owning copy and concrete dispatch semantics.
+@inline _lane_gathered(w::_CellWindow, i::Integer, j::Union{Integer,Colon},
+                       rest::Union{Integer,Colon}...) =
+    _lane_gathered(w.data, _cell_local_row(w, i, (i, j, rest...)), j, rest...)
 @inline function Base.getindex(w::_CellWindow, I::AbstractVector{<:Integer},
                                j::Union{Integer,Colon}, rest::Union{Integer,Colon}...)
     _cell_reads_rows(w, I) && return w.data[:, j, rest...]

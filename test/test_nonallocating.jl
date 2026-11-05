@@ -336,6 +336,10 @@ end
             @test k(mn) == sum(vec(maximum(mn; dims = 2)))
         end
         steady(k, args...) = (k(args...); @allocated k(args...))
+        # Julia 1.13's `@allocated` measures a splatted call through a fresh
+        # closure, which compiles within the measurement on its first use
+        # (644960 B here, then 32 B).
+        steady(k, randn(2, 3))
         small = steady(k, randn(64, 3))
         large = steady(k, randn(257, 3))
         println("NONALLOCATING_ALLOC_BYTES\trowmax_dims_small\t", small)

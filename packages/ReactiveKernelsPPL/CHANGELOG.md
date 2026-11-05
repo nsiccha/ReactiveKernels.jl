@@ -16,6 +16,22 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.102
+
+- Partition sampler gradients with `shared=false` differentiate a compact
+  conditional program over local coordinates. They reuse shared prefix values
+  without allocating cotangents for that frontier, and mixed shared/local
+  parameter reads materialize only the selected rows. Full gradients retain
+  the shared-prefix pullback; compact and dense destinations keep their existing
+  values and coordinate order. Requires ReactiveKernels 0.1.89.
+- Shared-prefix active storage and cache invalidation follow the coordinates
+  actually read by that prefix. Shared parameters read only at selected rows
+  remain in the compact residual instead of creating whole-panel cotangents.
+  Auxiliary scalar predictor cells use the same compact slot map as the
+  observation partition, avoiding a shadow of the full packed point.
+  Conditional row reads gather their base rows before mixing them with active
+  coordinates, so the mixed call retains only those rows in either AD direction.
+
 ## 0.1.101
 
 - Add `prepare_discrete_latents(built, plan)`, `discrete_latent_draws` and

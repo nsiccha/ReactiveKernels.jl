@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.89
+## 0.1.90
 
 - A partition sum that shares a computed value with the other sums of its
   partition (so they lower with one cell emitter) and has no cell with the
@@ -32,6 +32,18 @@ are recorded in the git history only.
   rows, and row bookkeeping that reads only the label and bound data stays in a
   partition's plan. A partition sum with a separability rule also guards
   whole work that reads only scalars of the ruled port (`u[7]`).
+
+## 0.1.89
+
+- Composed cell broadcasts read direct row-slice operands in place, including
+  rows of producer windows, without changing ordinary slice ownership or
+  dispatch. Planned partitions retain only the selected rows of bound dense
+  operands, preserving their view types and axes, so ordinary reverse calls
+  do not allocate shadows of an unselected parent panel. Lazy cell-view
+  construction stays visible to its readers across planned array operations.
+  Contiguous window gathers check the window span once before their row loop.
+  Shared-prefix splitting keeps parameter views in the residual when their
+  readers need only selected rows, avoiding whole-block derivative frontiers.
 
 ## 0.1.88
 
