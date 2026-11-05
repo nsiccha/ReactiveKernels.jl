@@ -3454,9 +3454,12 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
     if head === :ref
         return _collect_model_value_ref!(refs, ex, plan, label, bound)
     end
-    if head === :vect || head === :tuple
+    # Tuple fields hold whole Julia values, just as module-call arguments
+    # do. A derived vector remains a vector when placed in a record.
+    head === :tuple &&
+        return _collect_opaque_refs!(refs, ex, plan, label, bound)
+    if head === :vect
         for a in ex.args
-            head === :tuple && (a = _tuple_field_value(a))
             _collect_assignment_refs!(refs, a, plan, label, bound)
         end
         return nothing
@@ -8020,8 +8023,8 @@ _has_observation_axis(plan) = !isempty(plan.responses) ||
 _scan_length_bound(plan, s::ScanSpec) = s.hi isa Int || haskey(plan.columns, s.hi)
 
 # Reads of `raw` names in `ex` (the reads `_expr_value_symbols` sees):
-# inside an argument of an undotted module call into `whole`, anywhere
-# else into `per_obs`. The vector of a matrix product `M * v`, with `M`
+# inside a tuple field or an argument of an undotted module call into
+# `whole`, anywhere else into `per_obs`. The vector of a matrix product `M * v`, with `M`
 # one of `matrices` (`_matrix_product_operand`), is a whole read too, and
 # so is the argument of a built-in reduction: `mean(x_fit)` reads the whole
 # array, exactly as the qualified `Statistics.mean(x_fit)` does.
@@ -8048,6 +8051,10 @@ function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
             foreach(a -> visit(a, true), _plate_column_captures(ex))
         elseif ex.head === :kw && length(ex.args) == 2
             visit(ex.args[2], inside)
+        elseif ex.head === :tuple
+            for a in ex.args
+                visit(_tuple_field_value(a), true)
+            end
         elseif ex.head === :call && length(ex.args) == 3 &&
                 ex.args[1] === :* && _matrix_product_operand(ex.args[2], matrices)
             # As in Julia, `M * v` contracts `v` with the columns of the

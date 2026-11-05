@@ -11121,10 +11121,23 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
 end
 function _inline_structure_expr(ex, ctx, visited, where)
     ex isa Expr || return ex
+    sub(a) = _inline_structure(a, ctx, visited, where)
     # The quoted cell body reads the named dependencies carried beside it.
     # Keep both together: substituting only the dependency arguments would
     # discard definitions that the body still indexes by their original name.
     _is_plate_column_call(ex) && return ex
+    if ex.head === :kw && length(ex.args) == 2
+        return Expr(:kw, ex.args[1], sub(ex.args[2]))
+    elseif ex.head === :tuple
+        # A named-tuple field label is not a read of a same-named local.
+        return Expr(:tuple, (Meta.isexpr(a, :(=), 2) && a.args[1] isa Symbol ?
+            Expr(:(=), a.args[1], sub(a.args[2])) : sub(a)
+            for a in ex.args)...)
+    elseif ex.head === :parameters
+        # Shorthand `(; name)` keeps the label when its value is inlined.
+        return Expr(:parameters, (a isa Symbol ? Expr(:kw, a, sub(a)) : sub(a)
+            for a in ex.args)...)
+    end
     if ex.head === :ref && _is_model_value_def(ex.args[1], ctx)
         return Expr(:ref, ex.args[1],
             (_inline_structure(a, ctx, visited, where) for a in ex.args[2:end])...)
@@ -11150,11 +11163,12 @@ _inlined_computed_defs(ctx, canonmap, data) = Set{Symbol}(nm for nm in ctx.inlin
         _computed_value_def(nm, ctx, canonmap, data))
 
 # A module call's model-level result, written inline or read through a
-# definition that stays named for its readers: a shared definition (the
-# definitions below it are no longer inlined either), or the value a
-# positional read indexes, which `_inline_structure_expr` keeps named.
+# definition that stays named for its readers: a shared or retained
+# definition (the definitions below it are no longer inlined either), or
+# the value a positional read indexes, which `_inline_structure_expr` keeps named.
 _reads_module_value(ex, ctx) = _contains_module_call(ex) ||
-    any(s -> s in ctx.shared_defs && _def_reads_module(s, ctx),
+    any(s -> (s in ctx.shared_defs || s in ctx.value_defs) &&
+        _def_reads_module(s, ctx),
         _value_symbols(ex)) ||
     _indexes_module_value(ex, ctx)
 # `bt = f(x, a); bt[1]` indexes the call's result exactly as the inline
