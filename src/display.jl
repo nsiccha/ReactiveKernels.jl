@@ -85,7 +85,7 @@ end
 function _display_object(f::_KernelSource)
     f.companion isa RuntimeGeneratedFunctions.RuntimeGeneratedFunction ||
         return _opaque_object(f)
-    lambda = RuntimeGeneratedFunctions.get_expression(f.companion)
+    lambda = _program_expression(f.companion)
     lambda isa Expr && lambda.head === :-> && lambda.args[1] isa Expr &&
         !isempty(lambda.args[1].args) || return _opaque_object(f)
     environment, params... = lambda.args[1].args

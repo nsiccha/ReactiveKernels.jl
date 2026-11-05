@@ -1062,10 +1062,13 @@ Prepare a cell value and gradient over the sorted, unique packed positions
 active vector and selection retain the exemplar's type and length. The packed
 base is passed read-only; selected coordinates are supplied separately. This
 keeps the active AD point and gradient proportional to the selected cell's
-coordinates rather than the full layout. With native `AutoEnzyme` Reverse, use
-`Enzyme.set_runtime_activity(Enzyme.Reverse)`: packed reads can select either an
-active coordinate or a constant base coordinate. The sampler holds one `Int32`
-per packed coordinate, mapping each to its position in the selection.
+coordinates rather than the full layout. A packed read selects either an active
+coordinate or a constant base coordinate. Ordinary native
+`AutoEnzyme(; mode = Enzyme.Reverse)` differentiates that read on the Enzyme
+`dogfood` line; registered Enzyme (0.13.218 measured) refuses it under static activity
+(`EnzymeRuntimeActivityError`), an Enzyme limitation tracked by Enzyme snag
+`static-reverse-s-f9483e9c`. The sampler holds one `Int32` per packed
+coordinate, mapping each to its position in the selection.
 """
 function prepare_compact_cell_sampler(built, plan::StructuralPlan, observations,
         base0::AbstractVector{Float64}, indices0::AbstractVector{Int};
