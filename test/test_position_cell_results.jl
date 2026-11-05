@@ -94,6 +94,17 @@ end
     return loc
 end
 
+# Indexed data operands are split into a shared prefix. The live exponential
+# must stay fused with the outer product (snag brm-emitted-plat-618eb328).
+@kernel flat_indexed(theta, t, dose) = begin
+    cells = plate(eachindex(t)) do i
+        dose[i] .* exp.(-exp(theta[1]) .* t[i])
+    end
+    loc = eltype(cells) <: Number ? cells :
+          isempty(cells) ? eltype(eltype(cells))[] : reduce(vcat, cells)
+    return loc
+end
+
 @kernel flat_by_bound(theta, t) = begin
     cells = plate(t) do ti
         theta[1] .* exp.(-theta[2] .* ti)
@@ -272,6 +283,58 @@ end
     # Ragged cells keep a buffer each.
     reader = copy(vectorize(flat; batched = :theta, want = :loc, reuse = true))
     @test bytes(reader, thetas(8), rows(isodd(k) ? 900 : 1100 for k in 1:24)) < 4096
+end
+
+@testset "indexed ragged cells keep their authored broadcast fused" begin
+    for count in (8, 64)
+        t = rows(150 + 7 * (i % 11) for i in 1:count)
+        dose = [1.0 + 0.01i for i in 1:count]
+        original = deepcopy((t, dose))
+        for bound in (false, true)
+            cut = bound ? prepare(flat_indexed; bound = (; t, dose)) :
+                          prepare(flat_indexed)
+            args = bound ? () : (t, dose)
+            reader = copy(vectorize(cut; batched = :theta, reuse = true))
+            allocated = Int[]
+            for positions in (8, 32)
+                theta = thetas(positions)
+                expected = hcat((reduce(vcat,
+                    [dose[i] .* exp.(-exp(theta[1, p]) .* t[i]) for i in 1:count])
+                    for p in 1:positions)...)
+                result = reader(theta, args...)
+                @test result isa Matrix{Float64}
+                @test result ≈ expected
+                push!(allocated, bytes(reader, theta, args...))
+            end
+            @test maximum(allocated) < 4096
+            @test allocated[2] - allocated[1] < sizeof(Float64) * sum(length, t)
+            owning = vectorize(cut; batched = :theta)
+            kept = owning(thetas(3), args...)
+            saved = copy(kept)
+            owning(2 .* thetas(3), args...)
+            @test isequal(kept, saved)
+            # Each copied borrowed reader owns its workspace.
+            separate = copy(reader)
+            kept = reader(thetas(3), args...)
+            saved = copy(kept)
+            separate(2 .* thetas(3), args...)
+            @test isequal(kept, saved)
+        end
+        @test isequal((t, dose), original)
+    end
+    # The same split also handles scalar cells, empty cells and no cells.
+    for t in (Vector{Float64}[], [Float64[], [0.1, 0.3], Float64[]], [0.1, 0.3]),
+            bound in (false, true)
+        dose = ones(length(t))
+        cut = bound ? prepare(flat_indexed; bound = (; t, dose)) : prepare(flat_indexed)
+        reader = copy(vectorize(cut; batched = :theta, reuse = true))
+        args = bound ? () : (t, dose)
+        theta = thetas(3)
+        expected = hcat((reduce(vcat,
+            [dose[i] .* exp.(-exp(theta[1, p]) .* t[i]) for i in eachindex(t)];
+            init = Float64[]) for p in 1:3)...)
+        @test reader(theta, args...) == expected
+    end
 end
 
 end

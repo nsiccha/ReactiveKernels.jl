@@ -108,8 +108,8 @@ end
 # A source operation over `params` whose source is `body`, compiled as RK
 # compiles an authored capture-free source (`_kernel_source_function`), with
 # its throw-stripped twin; `nothing` when the body needs a closure Julia owns.
-function _gather_map_op(token::Symbol, suffix::Symbol, params::Vector{Symbol}, body,
-                        mod::Module)
+function _partial_source_op(token::Symbol, suffix::Symbol, params::Vector{Symbol}, body,
+                            mod::Module; form::Symbol = :fused)
     names = Set{Symbol}(params)
     native = _kernel_native_body(body, mod, names)
     stripped = _kernel_ignore_throw_source(body, mod, names)
@@ -121,8 +121,8 @@ function _gather_map_op(token::Symbol, suffix::Symbol, params::Vector{Symbol}, b
     twin = _kernel_source_function(identity,
         Expr(:->, Expr(:tuple, params...), twin_native), mod)
     name = Val(Symbol(token, suffix))
-    ignored = _KernelSourceOp(name, Val(:fused), twin, nothing, nothing, mod)
-    _KernelSourceOp(name, Val(:fused), record, ignored, nothing, mod)
+    ignored = _KernelSourceOp(name, Val(form), twin, nothing, nothing, mod)
+    _KernelSourceOp(name, Val(form), record, ignored, nothing, mod)
 end
 
 """
@@ -157,7 +157,7 @@ function _partial_gather_maps!(recipes::Vector{Recipe}, readable, g::Graph, part
     cover_ops = Any[]
     for k in indices
         cover = Expr(:call, GlobalRef(@__MODULE__, :_rk_gather_cover), k)
-        cop = _gather_map_op(token, Symbol(:_cover_, k), Symbol[k], cover, mod)
+        cop = _partial_source_op(token, Symbol(:_cover_, k), Symbol[k], cover, mod)
         cop === nothing && return part
         push!(cover_ops, (k, cop, cover))
     end
@@ -172,7 +172,7 @@ function _partial_gather_maps!(recipes::Vector{Recipe}, readable, g::Graph, part
     tests = Any[Expr(:call, GlobalRef(Base, :>), covers[k], 0) for k in indices]
     condition = foldl((a, b) -> Expr(:&&, a, b), tests)
     source = Expr(:if, condition, interchanged, copy(body))
-    operation = _gather_map_op(token, :_gather, vcat(params, Symbol[covers[k] for k in indices]),
+    operation = _partial_source_op(token, :_gather, vcat(params, Symbol[covers[k] for k in indices]),
                                source, mod)
     operation === nothing && return part
     cover_values = Value[]
