@@ -205,4 +205,35 @@ end
             by=merge(by, (; extra=[2])), u0=[0.2,0.4,0.6], partitioned=(:z => [1,2,3],))
     end
 end
+
+# A fresh window latent whose prior reads a retained scalar: the density cell
+# reads `m` through a one-row gather of the packed vector whose index the cell
+# computes at its rows. Its read support follows that index once it exists
+# (snag selective-carrie-1aa69e67: it was spliced in as `nothing` before).
+@testset "fresh window factor reads a retained scalar hyperparameter" begin
+    normal(x, m, s) = -(log(2pi) + 2log(s) + abs2((x - m) / s)) / 2
+    records(built) = ReactiveKernelsPPL._smc_coordinate_records(built.layout)
+    for source in (quote
+                m ~ Normal(0, 4)
+                z[1:nb] .~ Normal.(m, 2)
+                y .~ Normal.(z[block], 1)
+            end, quote
+                m ~ Normal(0, 4)
+                z[1:nb] .~ Normal.(m, 2)
+                mu = z[block]
+                y .~ Normal.(mu, 1)
+            end)
+        _, old = build(source, (; nb = 2, block = [1, 2], y = [0.0, 0.0]))
+        bound, built = build(source, (; nb = 3, block = [3], y = [0.8]))
+        fresh = ReactiveKernelsPPL._smc_match_coordinates(records(old), records(built)).fresh
+        @test coordinate_names(built.layout)[fresh] == [Symbol("z.3")]
+        u = [0.3, -0.2, 0.5, 0.7]
+        terms = ReactiveKernelsPPL._smc_window_terms(built, bound, fresh, u)
+        indices = ReactiveKernelsPPL._smc_read_support(terms, u)
+        @test indices == [1, 4]
+        kernel = ReactiveKernelsPPL._smc_selected_kernel(terms, indices, u)
+        @test Base.invokelatest(kernel, u[indices]) ≈
+            normal(0.8, u[4], 1) + normal(u[4], u[1], 2)
+    end
+end
 end

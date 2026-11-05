@@ -4483,6 +4483,11 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
         end
     end
     for s in states
+        for (cid, batched, via) in s.footprint_captures
+            _footprint_record_capture!(windows.pushdowns, cid,
+                _cell_capture_element(s.slices[batched], via == 0 ? nothing : s.slices[via];
+                    rows = s.partition))
+        end
         for (position, program) in s.footprint_programs
             reads = _footprint_plate_reads!(body, runtime_ops, runtime_recipes,
                 program, s.atomic, s.slices, s.plate_values)
@@ -4652,7 +4657,10 @@ Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recip
     end
     # The footprint of the shared arguments: a capture of a value not computed
     # at rows is read at its positions, any other shared argument whole; the
-    # index (or rows) argument is read whole.
+    # index (or rows) argument is read whole. A capture read at a pushed lane's
+    # element has no positions until that lane is taken: like its value read,
+    # it is recorded after the windows (`_lower_authored_plate_cells!`).
+    footprint_captures = Tuple{ValueId,Int,Int}[]
     if _footprint_recording() && windows !== nothing
         d = windows.pushdowns
         _footprint_record!(canon_id(d.graph, first(recipe.inputs).id), :whole, nothing)
@@ -4663,6 +4671,10 @@ Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recip
             cid in d.pushed && continue
             if haskey(positions, position)
                 for (batched, via) in positions[position]
+                    if haskey(pushed_lanes, batched) || (via != 0 && haskey(pushed_lanes, via))
+                        push!(footprint_captures, (cid, batched, via))
+                        continue
+                    end
                     _footprint_record_capture!(d, cid, _cell_capture_element(slices[batched],
                         via == 0 ? nothing : slices[via]; rows = partition))
                 end
@@ -4686,7 +4698,7 @@ Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recip
         end
     end
     (; plate, atomic, plate_values, partition, pushed_lanes, cell, slices, lane_rows, captures,
-       footprint_programs, lhs)
+       footprint_programs, footprint_captures, lhs)
 end
 
 # A recipe output authored with a type (`weights::Vector{Float64} = ...`) is
