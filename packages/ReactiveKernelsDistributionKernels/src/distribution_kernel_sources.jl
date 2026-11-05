@@ -166,6 +166,10 @@ export zero_inflated_binomial_logit_product_mixture_logdensity
 export hmm_logdensity, normal_hmm_logdensity, exponential_hmm_logdensity
 export hmm_log_weights_logdensity, normal_hmm_log_weights_logdensity,
     exponential_hmm_log_weights_logdensity
+export hmm_state_posterior, normal_hmm_state_posterior, exponential_hmm_state_posterior
+export hmm_log_weights_state_posterior, normal_hmm_log_weights_state_posterior,
+    exponential_hmm_log_weights_state_posterior
+export hmm_state_posterior_name, draw_hmm_states, draw_hmm_states!
 export icar_logdensity
 export categorical_logit, categorical_logit_ref
 export poisson, gamma, beta, binomial, negative_binomial2
@@ -1495,16 +1499,21 @@ end
     total
 end
 
-@kernel hmm_log_weights_logdensity(log_emissions, log_transition,
+_hmm_checked_emissions(log_emissions, K) = K >= 1 && ndims(log_emissions) == 2 &&
+    size(log_emissions, 2) == K ? log_emissions :
+    throw(DimensionMismatch("log emissions must be steps × states, one column per initial weight"))
+_hmm_checked_transition(log_transition, K, T) =
+    _hmm_broadcasts(log_transition, K, K, max(T - 1, 1)) ? log_transition :
+    throw(DimensionMismatch("transition weights must broadcast over states × states × (steps - 1)"))
+
+# The forward pass: entry `(t - 1) * K + k` of the history is the log weight
+# of every path that is in state k at step t, with the first t emissions.
+@kernel _hmm_log_weights_forward(log_emissions, log_transition,
         log_initial) = begin
     K = length(log_initial)
     T = size(log_emissions, 1)
-    checked_emissions = K >= 1 && ndims(log_emissions) == 2 &&
-        size(log_emissions, 2) == K ? log_emissions :
-        throw(DimensionMismatch("log emissions must be steps × states, one column per initial weight"))
-    checked_transition = _hmm_broadcasts(log_transition, K, K, max(T - 1, 1)) ?
-        log_transition :
-        throw(DimensionMismatch("transition weights must broadcast over states × states × (steps - 1)"))
+    checked_emissions = _hmm_checked_emissions(log_emissions, K)
+    checked_transition = _hmm_checked_transition(log_transition, K, T)
     # A singleton destination axis weighs a move by its origin only, so every
     # state of a step receives the same incoming term: the step's first cell
     # computes it and the carry hands it to the others.
@@ -1516,6 +1525,14 @@ end
             _hmm_incoming(earlier, (t - 2) * K, checked_transition, j, t - 1, K)
         (incoming, incoming + checked_emissions[t, j])
     end
+    return forward
+end
+
+@kernel hmm_log_weights_logdensity(log_emissions, log_transition,
+        log_initial) = begin
+    K = length(log_initial)
+    T = size(log_emissions, 1)
+    forward = _hmm_log_weights_forward(log_emissions, log_transition, log_initial)
     return T == 0 ? 0.0 : _hmm_total(forward, (T - 1) * K, K)
 end
 
@@ -1523,6 +1540,92 @@ end
     log_transition = log.(transition)
     log_initial = log.(initial)
     return hmm_log_weights_logdensity(log_emissions, log_transition, log_initial)
+end
+
+# The state path's posterior. Each law sums the weights of every state path;
+# normalized, those weights are the distribution of the path given the
+# observations and the parameters. Each law has a state-posterior twin with
+# the same arguments (`hmm_state_posterior`, `normal_hmm_state_posterior`,
+# ...), returning
+#
+# - `probabilities[t, k]`, the posterior probability of state k at step t
+#   (forward-backward smoothing);
+# - `log_filtered[t, k]`, the log probability of state k at step t given the
+#   first t steps alone (the normalized forward pass);
+# - `log_transition`, the log transition weights as the law reads them.
+#
+# The last two are the arguments of the path's law: `draw_hmm_states` draws a
+# path from them exactly, last step first (forward filtering, backward
+# sampling). The backward pass is a second history scan over the (step,
+# state) cells, from the last step back.
+
+# The log of the weighted sum over the K successors of a step, through step
+# `s`'s emissions, when the transition does not depend on the destination.
+@inline function _hmm_rest(later, following, log_emissions, s, K)
+    total = log_emissions[s, 1] + later[following + 1]
+    for j in 2:K
+        total = ReactiveKernels._tie_exact_logaddexp(total,
+            log_emissions[s, j] + later[following + j])
+    end
+    total
+end
+# The same sum out of state i at step t, through every destination's move.
+@inline function _hmm_outgoing(later, following, log_emissions, log_transition, i,
+        t, K)
+    total = _hmm_at(log_transition, i, 1, t) + log_emissions[t + 1, 1] +
+        later[following + 1]
+    for j in 2:K
+        total = ReactiveKernels._tie_exact_logaddexp(total,
+            _hmm_at(log_transition, i, j, t) + log_emissions[t + 1, j] +
+            later[following + j])
+    end
+    total
+end
+
+@kernel hmm_log_weights_state_posterior(log_emissions, log_transition,
+        log_initial) = begin
+    K = length(log_initial)
+    T = size(log_emissions, 1)
+    checked_emissions = _hmm_checked_emissions(log_emissions, K)
+    checked_transition = _hmm_checked_transition(log_transition, K, T)
+    forward = _hmm_log_weights_forward(log_emissions, log_transition, log_initial)
+    # Cell `(T - t) * K + i` holds the log weight of every continuation of
+    # state i at step t through the remaining emissions. A singleton
+    # destination axis shares one sum over the successors, as forward.
+    shared_outgoing = size(checked_transition, 2) == 1
+    backward = scan(1:(T * K); init = 0.0, history = 0.0) do carry, cell, later
+        t = T - (cell - 1) ÷ K
+        i = (cell - 1) % K + 1
+        rest = t == T ? 0.0 : shared_outgoing ? (i > 1 ? carry :
+            _hmm_rest(later, (T - t - 1) * K, checked_emissions, t + 1, K)) :
+            _hmm_outgoing(later, (T - t - 1) * K, checked_emissions,
+                checked_transition, i, t, K)
+        (rest, t == T || !shared_outgoing ? rest :
+            _hmm_at(checked_transition, i, 1, t) + rest)
+    end
+    log_evidence = T == 0 ? 0.0 : _hmm_total(forward, (T - 1) * K, K)
+    step_totals = plate(1:T) do t
+        _hmm_total(forward, (t - 1) * K, K)
+    end
+    probability_cells = plate(1:(T * K)) do cell
+        t = (cell - 1) % T + 1
+        k = (cell - 1) ÷ T + 1
+        exp(forward[(t - 1) * K + k] + backward[(T - t) * K + k] - log_evidence)
+    end
+    filtered_cells = plate(1:(T * K)) do cell
+        t = (cell - 1) % T + 1
+        k = (cell - 1) ÷ T + 1
+        forward[(t - 1) * K + k] - step_totals[t]
+    end
+    probabilities = reshape(probability_cells, T, K)
+    log_filtered = reshape(filtered_cells, T, K)
+    return (; probabilities, log_filtered, log_transition = checked_transition)
+end
+
+@kernel hmm_state_posterior(log_emissions, transition, initial) = begin
+    log_transition = log.(transition)
+    log_initial = log.(initial)
+    return hmm_log_weights_state_posterior(log_emissions, log_transition, log_initial)
 end
 
 # Emission laws observe a vector (one stream) or a steps × streams matrix whose
@@ -1537,9 +1640,9 @@ end
 # before.
 @inline _hmm_log_scales(scales, cells) = cells == 0 ? float.(scales) : log.(scales)
 
-@kernel normal_hmm_log_weights_logdensity(observed, locations, scales,
-        log_transition, log_initial) = begin
-    K = length(log_initial)
+# Each emission family's steps × states log emissions: the law and its
+# state-posterior twin read the same matrix.
+@kernel _normal_hmm_log_emissions(observed, locations, scales, K) = begin
     T = size(observed, 1)
     S = size(observed, 2)
     checked_observed = ndims(observed) <= 2 ? observed :
@@ -1558,20 +1661,10 @@ end
             log_scale = _hmm_at(log_scales, k, s, t)).logpdf(checked_observed[t, s])
     end
     log_emissions = dropdims(sum(reshape(cells, T, K, S); dims = 3); dims = 3)
-    return hmm_log_weights_logdensity(log_emissions, log_transition, log_initial)
+    return log_emissions
 end
 
-@kernel normal_hmm_logdensity(observed, locations, scales, transition,
-        initial) = begin
-    log_transition = log.(transition)
-    log_initial = log.(initial)
-    return normal_hmm_log_weights_logdensity(observed, locations, scales,
-        log_transition, log_initial)
-end
-
-@kernel exponential_hmm_log_weights_logdensity(observed, scales, log_transition,
-        log_initial) = begin
-    K = length(log_initial)
+@kernel _exponential_hmm_log_emissions(observed, scales, K) = begin
     T = size(observed, 1)
     S = size(observed, 2)
     checked_observed = ndims(observed) <= 2 ? observed :
@@ -1587,6 +1680,43 @@ end
             log_scale = _hmm_at(log_scales, k, s, t)).logpdf(checked_observed[t, s])
     end
     log_emissions = dropdims(sum(reshape(cells, T, K, S); dims = 3); dims = 3)
+    return log_emissions
+end
+
+@kernel normal_hmm_log_weights_logdensity(observed, locations, scales,
+        log_transition, log_initial) = begin
+    log_emissions = _normal_hmm_log_emissions(observed, locations, scales,
+        length(log_initial))
+    return hmm_log_weights_logdensity(log_emissions, log_transition, log_initial)
+end
+
+@kernel normal_hmm_logdensity(observed, locations, scales, transition,
+        initial) = begin
+    log_transition = log.(transition)
+    log_initial = log.(initial)
+    return normal_hmm_log_weights_logdensity(observed, locations, scales,
+        log_transition, log_initial)
+end
+
+@kernel normal_hmm_log_weights_state_posterior(observed, locations, scales,
+        log_transition, log_initial) = begin
+    log_emissions = _normal_hmm_log_emissions(observed, locations, scales,
+        length(log_initial))
+    return hmm_log_weights_state_posterior(log_emissions, log_transition, log_initial)
+end
+
+@kernel normal_hmm_state_posterior(observed, locations, scales, transition,
+        initial) = begin
+    log_transition = log.(transition)
+    log_initial = log.(initial)
+    return normal_hmm_log_weights_state_posterior(observed, locations, scales,
+        log_transition, log_initial)
+end
+
+@kernel exponential_hmm_log_weights_logdensity(observed, scales, log_transition,
+        log_initial) = begin
+    log_emissions = _exponential_hmm_log_emissions(observed, scales,
+        length(log_initial))
     return hmm_log_weights_logdensity(log_emissions, log_transition, log_initial)
 end
 
@@ -1596,6 +1726,94 @@ end
     log_initial = log.(initial)
     return exponential_hmm_log_weights_logdensity(observed, scales, log_transition,
         log_initial)
+end
+
+@kernel exponential_hmm_log_weights_state_posterior(observed, scales,
+        log_transition, log_initial) = begin
+    log_emissions = _exponential_hmm_log_emissions(observed, scales,
+        length(log_initial))
+    return hmm_log_weights_state_posterior(log_emissions, log_transition, log_initial)
+end
+
+@kernel exponential_hmm_state_posterior(observed, scales, transition,
+        initial) = begin
+    log_transition = log.(transition)
+    log_initial = log.(initial)
+    return exponential_hmm_log_weights_state_posterior(observed, scales,
+        log_transition, log_initial)
+end
+
+# The state-posterior twin of each hidden Markov law, by name: the kernel
+# that takes the law's arguments and returns its path's posterior. `nothing`
+# for any other value.
+function hmm_state_posterior_name(law)
+    law === hmm_logdensity && return :hmm_state_posterior
+    law === hmm_log_weights_logdensity && return :hmm_log_weights_state_posterior
+    law === normal_hmm_logdensity && return :normal_hmm_state_posterior
+    law === normal_hmm_log_weights_logdensity &&
+        return :normal_hmm_log_weights_state_posterior
+    law === exponential_hmm_logdensity && return :exponential_hmm_state_posterior
+    law === exponential_hmm_log_weights_logdensity &&
+        return :exponential_hmm_log_weights_state_posterior
+    return nothing
+end
+
+"""
+    draw_hmm_states(rng, posterior) -> Vector{Int}
+    draw_hmm_states!(rng, path, posterior) -> path
+
+One exact draw of a hidden Markov law's state path from its posterior, the
+value of the law's state-posterior twin (`normal_hmm_state_posterior` and so
+on). The last state is drawn from its filtered probabilities, then each
+earlier state given its successor, from the filtered probabilities weighed by
+the move into that successor (forward filtering, backward sampling). Only
+`rng` supplies randomness, so a seeded `rng` reproduces the path. Throws an
+`ArgumentError` when the observations are impossible under every path.
+"""
+draw_hmm_states(rng, posterior) =
+    draw_hmm_states!(rng, Vector{Int}(undef, size(posterior.log_filtered, 1)), posterior)
+
+function draw_hmm_states!(rng, path::AbstractVector{<:Integer}, posterior)
+    log_filtered = posterior.log_filtered
+    log_transition = posterior.log_transition
+    T, K = size(log_filtered)
+    length(path) == T || throw(DimensionMismatch("the path has $(length(path)) " *
+        "steps, the posterior $T"))
+    T == 0 && return path
+    weights = Vector{Float64}(undef, K)
+    path[T] = _draw_log_weighted(rng, weights, k -> log_filtered[T, k])
+    for t in (T - 1):-1:1
+        j = path[t + 1]
+        path[t] = _draw_log_weighted(rng, weights,
+            i -> log_filtered[t, i] + _hmm_at(log_transition, i, j, t))
+    end
+    return path
+end
+
+# One index drawn with probability proportional to `exp(log_weight(k))`.
+function _draw_log_weighted(rng, weights, log_weight)
+    top = -Inf
+    for k in eachindex(weights)
+        weights[k] = log_weight(k)
+        top = max(top, weights[k])
+    end
+    isfinite(top) || throw(ArgumentError("no hidden state has a positive, finite " *
+        "posterior weight (largest log weight $top): the observations are " *
+        "impossible under every state path"))
+    total = 0.0
+    last = 0
+    for k in eachindex(weights)
+        weights[k] = exp(weights[k] - top)
+        total += weights[k]
+        weights[k] > 0 && (last = k)
+    end
+    u = rand(rng) * total
+    accumulated = 0.0
+    for k in 1:(last - 1)
+        accumulated += weights[k]
+        u < accumulated && return k
+    end
+    return last
 end
 
 # Intrinsic conditional autoregression (ICAR). `phi[k]` is the value at node
