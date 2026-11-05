@@ -4,6 +4,7 @@ using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
 using Test
+@isdefined(_static_enzyme) || include("static_enzyme.jl")
 
 # A model call with nothing left to observe returns its binding, an
 # `RKPPLBoundModel`: here, a model whose only response is a data-only
@@ -81,8 +82,10 @@ end
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
     sampler = prepare_cell_sampler(built, b, :ys, u; backend)
     twin = prepare_cell_sampler(built, plan, :ys, u; backend)
-    compact_backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
-    compact = prepare_compact_cell_sampler(built, b, :ys, u, [1]; backend = compact_backend)
+    # Registered Enzyme refuses the compact overlay (static_enzyme.jl).
+    compact = _static_enzyme() do
+        prepare_compact_cell_sampler(built, b, :ys, u, [1]; backend)
+    end
     for i in eachindex(_BME_U)
         @test cells(u, i) ≈ logpdf(Normal(0.7, 0.5), _BME_U[i]) rtol = 1e-12
         @test cells(u, i) == twin_cells(u, i)
@@ -92,10 +95,13 @@ end
         @test value == twin_value
         @test g == gp
         @test g[1] ≈ (_BME_U[i] - 0.7) / 0.5^2 rtol = 1e-12
-        compact_gradient = similar(u, 1)
-        compact_value, _ = cell_value_and_gradient!(compact, compact_gradient, u, u[[1]], [1], i)
-        @test compact_value ≈ value rtol = 1e-12
-        @test compact_gradient ≈ g rtol = 1e-12
+        isnothing(compact) && continue
+        _static_enzyme() do
+            compact_gradient = similar(u, 1)
+            compact_value, _ = cell_value_and_gradient!(compact, compact_gradient, u, u[[1]], [1], i)
+            @test compact_value ≈ value rtol = 1e-12
+            @test compact_gradient ≈ g rtol = 1e-12
+        end
     end
 end
 

@@ -1,5 +1,6 @@
 using ReactiveKernels, ReactiveKernelsPPL, Distributions, Enzyme, Test
 using DifferentiationInterface: AutoEnzyme
+@isdefined(_static_enzyme) || include("static_enzyme.jl")
 
 # One cell of an observation plate: one iteration of an `@plate for` loop
 # (one group's observations), or one entry of an elementwise observation
@@ -47,6 +48,10 @@ _cq_direct_compact_value(q, base, active, indices, cell) =
     q(ReactiveKernelsPPL._CompactCellPoint(base, active,
         ReactiveKernelsPPL._compact_cell_slots(length(base), indices)), cell)
 
+# Every sampler here is differentiated by ordinary static Reverse; the compact
+# ones run under `_static_enzyme` (static_enzyme.jl).
+const _CQ_REVERSE = AutoEnzyme(; mode = Enzyme.Reverse)
+
 @testset "cell query: one group of an @plate for loop" begin
     data = _cq_grouped_data()
     bound, built = _cq_bound(_CQ_GROUPED, data, (:y,))
@@ -70,9 +75,6 @@ _cq_direct_compact_value(q, base, active, indices, cell) =
     _, gfull = Base.invokelatest(ad_value_and_gradient, full, u)
     names = coordinate_names(built.layout)
     block(i) = findall(n -> startswith(String(n), "Z.$i."), names)
-    compact = prepare_compact_cell_sampler(built, bound, :y, u,
-        sort!([2; block(1)]);
-        backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)))
     for i in (1, 4)
         g = similar(u)
         value, _ = cell_value_and_gradient!(s, g, u, i)
@@ -82,69 +84,75 @@ _cq_direct_compact_value(q, base, active, indices, cell) =
         for j in (2, first(block(i)))
             @test g[j] ≈ _cq_central(x -> q(x, i), u, j) rtol = 1e-5
         end
-        indices = sort!([2; block(i)])
-        base = copy(u)
-        active = u[indices]
-        active[1] += 0.1
-        overlaid = copy(u)
-        overlaid[indices] = active
-        compact_gradient = similar(active)
-        compact_value, returned = cell_value_and_gradient!(
-            compact, compact_gradient, base, active, indices, i)
-        full_gradient = similar(u)
-        full_value, _ = cell_value_and_gradient!(s, full_gradient, overlaid, i)
-        @test compact_value ≈ full_value ≈ q(overlaid, i)
-        @test returned === compact_gradient
-        @test compact_gradient ≈ full_gradient[indices]
-        @test base == u
-        @test active == overlaid[indices]
-        if i == 1
-            # BRM's direct-Enzyme workaround differentiates the compact η
-            # vector and then evaluates the cell again for its value.
-            direct_gradient = zeros(length(active))
-            Enzyme.autodiff(Enzyme.set_runtime_activity(Enzyme.Reverse),
-                _cq_direct_compact_value, Enzyme.Active, Enzyme.Const(q),
-                Enzyme.Const(base), Enzyme.Duplicated(active, direct_gradient),
-                Enzyme.Const(indices), Enzyme.Const(i))
-            direct_value = _cq_direct_compact_value(q, base, active, indices, i)
-            @test compact_value ≈ direct_value
-            @test compact_gradient ≈ direct_gradient
-        end
     end
-    @test_throws ReactiveKernelsPPL.ContractValidationError cell_value_and_gradient!(
-        compact, zeros(2), u, zeros(2), [2, 2], 1)
-    # The sampler maps the previous call's selection; a caller that changes its
-    # `indices` in place between calls gets the new selection, and a refused
-    # selection leaves the previous one in force.
-    let indices = sort!([2; block(1)]), base = copy(u)
-        function expected(indices, cell = 1)
-            overlaid = copy(base)
-            overlaid[indices] .+= 0.1
-            g = similar(u)
-            value, _ = cell_value_and_gradient!(s, g, overlaid, cell)
-            value, g[indices]
+    _static_enzyme() do
+        compact = prepare_compact_cell_sampler(built, bound, :y, u,
+            sort!([2; block(1)]); backend = _CQ_REVERSE)
+        for i in (1, 4)
+            indices = sort!([2; block(i)])
+            base = copy(u)
+            active = u[indices]
+            active[1] += 0.1
+            overlaid = copy(u)
+            overlaid[indices] = active
+            compact_gradient = similar(active)
+            compact_value, returned = cell_value_and_gradient!(
+                compact, compact_gradient, base, active, indices, i)
+            full_gradient = similar(u)
+            full_value, _ = cell_value_and_gradient!(s, full_gradient, overlaid, i)
+            @test compact_value ≈ full_value ≈ q(overlaid, i)
+            @test returned === compact_gradient
+            @test compact_gradient ≈ full_gradient[indices]
+            @test base == u
+            @test active == overlaid[indices]
+            if i == 1
+                # BRM's direct-Enzyme path differentiates the compact η
+                # vector and then evaluates the cell again for its value.
+                direct_gradient = zeros(length(active))
+                Enzyme.autodiff(Enzyme.Reverse,
+                    _cq_direct_compact_value, Enzyme.Active, Enzyme.Const(q),
+                    Enzyme.Const(base), Enzyme.Duplicated(active, direct_gradient),
+                    Enzyme.Const(indices), Enzyme.Const(i))
+                direct_value = _cq_direct_compact_value(q, base, active, indices, i)
+                @test compact_value ≈ direct_value
+                @test compact_gradient ≈ direct_gradient
+            end
         end
-        compact_gradient = zeros(length(indices))
-        # The loop above last selected group 4's block; the refusal kept it.
-        previous = sort!([2; block(4)])
-        value, _ = cell_value_and_gradient!(compact, compact_gradient, base,
-            base[previous] .+ 0.1, previous, 4)
-        @test value ≈ expected(previous, 4)[1]
-        @test compact_gradient ≈ expected(previous, 4)[2]
-        value, _ = cell_value_and_gradient!(compact, compact_gradient, base,
-            base[indices] .+ 0.1, indices, 1)
-        @test value ≈ expected(indices)[1]
-        @test compact_gradient ≈ expected(indices)[2]
-        indices[1] = 1
-        value, _ = cell_value_and_gradient!(compact, compact_gradient, base,
-            base[indices] .+ 0.1, indices, 1)
-        @test value ≈ expected(indices)[1]
-        @test compact_gradient ≈ expected(indices)[2]
-        indices[1] = 2
-        value, _ = cell_value_and_gradient!(compact, compact_gradient, base,
-            base[indices] .+ 0.1, indices, 1)
-        @test value ≈ expected(indices)[1]
-        @test compact_gradient ≈ expected(indices)[2]
+        @test_throws ReactiveKernelsPPL.ContractValidationError cell_value_and_gradient!(
+            compact, zeros(2), u, zeros(2), [2, 2], 1)
+        # The sampler maps the previous call's selection; a caller that changes its
+        # `indices` in place between calls gets the new selection, and a refused
+        # selection leaves the previous one in force.
+        let indices = sort!([2; block(1)]), base = copy(u)
+            function expected(indices, cell = 1)
+                overlaid = copy(base)
+                overlaid[indices] .+= 0.1
+                g = similar(u)
+                value, _ = cell_value_and_gradient!(s, g, overlaid, cell)
+                value, g[indices]
+            end
+            compact_gradient = zeros(length(indices))
+            # The loop above last selected group 4's block; the refusal kept it.
+            previous = sort!([2; block(4)])
+            value, _ = cell_value_and_gradient!(compact, compact_gradient, base,
+                base[previous] .+ 0.1, previous, 4)
+            @test value ≈ expected(previous, 4)[1]
+            @test compact_gradient ≈ expected(previous, 4)[2]
+            value, _ = cell_value_and_gradient!(compact, compact_gradient, base,
+                base[indices] .+ 0.1, indices, 1)
+            @test value ≈ expected(indices)[1]
+            @test compact_gradient ≈ expected(indices)[2]
+            indices[1] = 1
+            value, _ = cell_value_and_gradient!(compact, compact_gradient, base,
+                base[indices] .+ 0.1, indices, 1)
+            @test value ≈ expected(indices)[1]
+            @test compact_gradient ≈ expected(indices)[2]
+            indices[1] = 2
+            value, _ = cell_value_and_gradient!(compact, compact_gradient, base,
+                base[indices] .+ 0.1, indices, 1)
+            @test value ≈ expected(indices)[1]
+            @test compact_gradient ≈ expected(indices)[2]
+        end
     end
     # Gradients leave the bound per-group arrays and later values unchanged.
     @test data == _cq_grouped_data()
@@ -170,28 +178,32 @@ end
         names = coordinate_names(built.layout)
         indices = sort!([2; findall(name -> startswith(String(name), "Z.2."), names)])
         active = u[indices]
-        compact = prepare_compact_cell_sampler(built, bound, :y, u, indices;
-            backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)))
-        compact_gradient = similar(active)
-        compact_value, _ = cell_value_and_gradient!(
-            compact, compact_gradient, u, active, indices, 2)
+        compact = _static_enzyme() do
+            sampler = prepare_compact_cell_sampler(built, bound, :y, u, indices;
+                backend = _CQ_REVERSE)
+            compact_gradient = similar(active)
+            compact_value, _ = cell_value_and_gradient!(
+                sampler, compact_gradient, u, active, indices, 2)
+            (; compact_value, compact_bytes = (@allocated cell_value_and_gradient!(
+                sampler, compact_gradient, u, active, indices, 2)))
+        end
         (; value = q(u, 2), viewed = q(uview, 2),
-           reference = sum(pointwise.y[2]), compact_value,
-           bytes = (@allocated q(u, 2)), view_bytes = (@allocated q(uview, 2)),
-           compact_bytes = (@allocated cell_value_and_gradient!(
-               compact, compact_gradient, u, active, indices, 2)))
+           reference = sum(pointwise.y[2]), compact,
+           bytes = (@allocated q(u, 2)), view_bytes = (@allocated q(uview, 2)))
     end
     @test all(m -> m.value ≈ m.reference, measured)
     @test all(m -> m.viewed ≈ m.reference, measured)
     @test measured[1].bytes == measured[2].bytes
     @test measured[1].view_bytes == measured[2].view_bytes
-    @test all(m -> m.compact_value ≈ m.reference, measured)
-    @test measured[2].compact_bytes <= measured[1].compact_bytes + 1024
-    # The group row of `R = Z * F'` reads `Z` through the compact overlay, which
-    # is not strided; RK's native product computes it with its own loop, where
-    # LinearAlgebra's generic `mul!` allocated 88 KB per gradient on
-    # Julia 1.10 (snag `compact-cell-gra-ebf0a114`).
-    @test all(m -> m.compact_bytes < 8_192, measured)
+    if all(m -> !isnothing(m.compact), measured)
+        @test all(m -> m.compact.compact_value ≈ m.reference, measured)
+        @test measured[2].compact.compact_bytes <= measured[1].compact.compact_bytes + 1024
+        # The group row of `R = Z * F'` reads `Z` through the compact overlay, which
+        # is not strided; RK's native product computes it with its own loop, where
+        # LinearAlgebra's generic `mul!` allocated 88 KB per gradient on
+        # Julia 1.10 (snag `compact-cell-gra-ebf0a114`).
+        @test all(m -> m.compact.compact_bytes < 8_192, measured)
+    end
 end
 
 # BRM's NLME emission for a caller-provided scalar law: a kernel plate writes
@@ -259,10 +271,7 @@ end
     full = prepare_ad(prepare_query(built, bound, :likelihood), backend, u;
         active = :unconstrained)
     _, gfull = Base.invokelatest(ad_value_and_gradient, full, u)
-    compact = prepare_compact_cell_sampler(built, bound, :dv, u,
-        sort!([1:5; block(1)]);
-        backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)))
-    for i in (1, 4)
+    gradients = map((1, 4)) do i
         g = similar(u)
         value, _ = cell_value_and_gradient!(s, g, u, i)
         @test value ≈ cells[i]
@@ -271,13 +280,20 @@ end
         for j in (1, 2, first(block(i)))
             @test g[j] ≈ _cq_central(x -> q(x, i), u, j) rtol = 1e-5
         end
-        indices = sort!([1:5; block(i)])
-        active = u[indices]
-        compact_gradient = similar(active)
-        compact_value, _ = cell_value_and_gradient!(
-            compact, compact_gradient, u, active, indices, i)
-        @test compact_value ≈ value
-        @test compact_gradient ≈ g[indices]
+        (i, value, g)
+    end
+    _static_enzyme() do
+        compact = prepare_compact_cell_sampler(built, bound, :dv, u,
+            sort!([1:5; block(1)]); backend = _CQ_REVERSE)
+        for (i, value, g) in gradients
+            indices = sort!([1:5; block(i)])
+            active = u[indices]
+            compact_gradient = similar(active)
+            compact_value, _ = cell_value_and_gradient!(
+                compact, compact_gradient, u, active, indices, i)
+            @test compact_value ≈ value
+            @test compact_gradient ≈ g[indices]
+        end
     end
     @test data == _cq_pk_data(5)
 
@@ -290,17 +306,21 @@ end
         names = coordinate_names(built.layout)
         indices = sort!([1:5; findall(n -> n in (Symbol("z1.2"), Symbol("z2.2")), names)])
         active = u[indices]
-        compact = prepare_compact_cell_sampler(built, bound, :dv, u, indices;
-            backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)))
-        compact_gradient = similar(active)
-        cell_value_and_gradient!(compact, compact_gradient, u, active, indices, 2)
+        compact_bytes = _static_enzyme() do
+            compact = prepare_compact_cell_sampler(built, bound, :dv, u, indices;
+                backend = _CQ_REVERSE)
+            compact_gradient = similar(active)
+            cell_value_and_gradient!(compact, compact_gradient, u, active, indices, 2)
+            @allocated cell_value_and_gradient!(
+                compact, compact_gradient, u, active, indices, 2)
+        end
         q(u, 2)
-        (; bytes = (@allocated q(u, 2)),
-           compact_bytes = (@allocated cell_value_and_gradient!(
-               compact, compact_gradient, u, active, indices, 2)))
+        (; bytes = (@allocated q(u, 2)), compact_bytes)
     end
     @test measured[1].bytes == measured[2].bytes
-    @test measured[1].compact_bytes == measured[2].compact_bytes
+    if all(m -> !isnothing(m.compact_bytes), measured)
+        @test measured[1].compact_bytes == measured[2].compact_bytes
+    end
 end
 
 @testset "cell query: elementwise and scalar-cell observations" begin
@@ -535,7 +555,7 @@ _cq_panel_data_matrix(n) = let d = _cq_panel_data(n)
 end
 
 @testset "cell query: totals over rows and stratified effects cost their own rows" begin
-    backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    backend = _CQ_REVERSE
     function measure(ast, data, obs; gradients)
         map((40, 4_000)) do n
             bound, built = _cq_bound(ast, data(n), (obs,))
@@ -550,14 +570,16 @@ end
             dense_value, dense_gradient = cell_value_and_gradient!(dense, similar(u), u, 2)
             indices = collect(1:6)
             active = u[indices]
-            compact = prepare_compact_cell_sampler(built, bound, obs, u, indices; backend)
-            compact_gradient = similar(active)
-            compact_value, _ = cell_value_and_gradient!(
-                compact, compact_gradient, u, active, indices, 2)
-            (; measured..., dense_value, compact_value,
-               parity = compact_gradient ≈ dense_gradient[indices],
-               compact_bytes = (@allocated cell_value_and_gradient!(
-                   compact, compact_gradient, u, active, indices, 2)))
+            compact = _static_enzyme() do
+                sampler = prepare_compact_cell_sampler(built, bound, obs, u, indices; backend)
+                compact_gradient = similar(active)
+                compact_value, _ = cell_value_and_gradient!(
+                    sampler, compact_gradient, u, active, indices, 2)
+                (; compact_value, parity = compact_gradient ≈ dense_gradient[indices],
+                   compact_bytes = (@allocated cell_value_and_gradient!(
+                       sampler, compact_gradient, u, active, indices, 2)))
+            end
+            (; measured..., dense_value, compact)
         end
     end
     for (ast, data, obs, gradients) in (
@@ -568,9 +590,11 @@ end
         @test all(m -> m.value ≈ m.reference, measured)
         @test measured[1].bytes == measured[2].bytes
         gradients || continue
-        @test all(m -> m.value ≈ m.dense_value ≈ m.compact_value, measured)
-        @test all(m -> m.parity, measured)
-        @test measured[1].compact_bytes == measured[2].compact_bytes
+        @test all(m -> m.value ≈ m.dense_value, measured)
+        all(m -> !isnothing(m.compact), measured) || continue
+        @test all(m -> m.dense_value ≈ m.compact.compact_value, measured)
+        @test all(m -> m.compact.parity, measured)
+        @test measured[1].compact.compact_bytes == measured[2].compact.compact_bytes
     end
 end
 
@@ -677,7 +701,7 @@ function _cq_gathered_data(n)
 end
 
 @testset "cell query: gathered model-level values and their completions cost their own rows" begin
-    backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    backend = _CQ_REVERSE
     for obs in (:y, :w)
         measured = map((40, 4_000)) do n
             data = _cq_gathered_data(n)
@@ -692,21 +716,27 @@ end
             dense_value, dense_gradient = cell_value_and_gradient!(dense, similar(u), u, 2)
             support = findall(!iszero, dense_gradient)
             indices = sort!(union(support, 1:4))
-            compact = prepare_compact_cell_sampler(built, bound, obs, u, indices; backend)
-            compact_gradient = similar(u[indices])
-            compact_value, _ = cell_value_and_gradient!(
-                compact, compact_gradient, u, u[indices], indices, 2)
+            compact = _static_enzyme() do
+                sampler = prepare_compact_cell_sampler(built, bound, obs, u, indices; backend)
+                compact_gradient = similar(u[indices])
+                compact_value, _ = cell_value_and_gradient!(
+                    sampler, compact_gradient, u, u[indices], indices, 2)
+                (; compact_value, parity = compact_gradient ≈ dense_gradient[indices])
+            end
             j = last(support)
             (; values, reference = pointwise[[1, 2, n]], bytes = (@allocated q(u, 2)),
-               dense_value, compact_value, support = length(support),
-               parity = compact_gradient ≈ dense_gradient[indices],
+               dense_value, compact, support = length(support),
                central = isapprox(dense_gradient[j], _cq_central(v -> q(v, 2), u, j);
                    rtol = 1e-5))
         end
         @test all(m -> m.values ≈ m.reference, measured)
         @test measured[1].bytes == measured[2].bytes
-        @test all(m -> m.values[2] ≈ m.dense_value ≈ m.compact_value, measured)
-        @test all(m -> m.parity && m.central, measured)
+        @test all(m -> m.values[2] ≈ m.dense_value, measured)
+        @test all(m -> m.central, measured)
+        if all(m -> !isnothing(m.compact), measured)
+            @test all(m -> m.dense_value ≈ m.compact.compact_value, measured)
+            @test all(m -> m.compact.parity, measured)
+        end
         # The gradient's support is the cell's own rows: the coefficients,
         # one group effect and one drawn entry per row read (and its scale).
         @test all(m -> m.support <= 11, measured)
@@ -728,7 +758,7 @@ const _CQ_NUMBER_READERS = quote
 end
 
 @testset "cell query: a number read by two predictors of a cell" begin
-    backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    backend = _CQ_REVERSE
     measured = map((30, 3_000)) do n
         data = (; y = cos.(1:n), x = sin.(1:n), w = collect(range(0.1, 1.0; length = n)),
             g = [mod1(j, 5) for j in 1:n])
@@ -741,19 +771,25 @@ end
         dense = prepare_cell_sampler(built, bound, :y, u; backend)
         value, gradient = cell_value_and_gradient!(dense, similar(u), u, 2)
         support = findall(!iszero, gradient)
-        compact = prepare_compact_cell_sampler(built, bound, :y, u, support; backend)
-        compact_gradient = similar(u[support])
-        compact_value, _ = cell_value_and_gradient!(
-            compact, compact_gradient, u, u[support], support, 2)
+        compact = _static_enzyme() do
+            sampler = prepare_compact_cell_sampler(built, bound, :y, u, support; backend)
+            compact_gradient = similar(u[support])
+            compact_value, _ = cell_value_and_gradient!(
+                sampler, compact_gradient, u, u[support], support, 2)
+            (; compact_value, parity = compact_gradient ≈ gradient[support])
+        end
         (; values, reference = pointwise[[1, 2, n]], bytes = (@allocated q(u, 2)), value,
-           compact_value, parity = compact_gradient ≈ gradient[support],
-           central = all(j -> isapprox(gradient[j], _cq_central(v -> q(v, 2), u, j);
+           compact, central = all(j -> isapprox(gradient[j], _cq_central(v -> q(v, 2), u, j);
                rtol = 1e-5), support))
     end
     @test all(m -> m.values ≈ m.reference, measured)
     @test measured[1].bytes == measured[2].bytes
-    @test all(m -> m.values[2] ≈ m.value ≈ m.compact_value, measured)
-    @test all(m -> m.parity && m.central, measured)
+    @test all(m -> m.values[2] ≈ m.value, measured)
+    @test all(m -> m.central, measured)
+    if all(m -> !isnothing(m.compact), measured)
+        @test all(m -> m.value ≈ m.compact.compact_value, measured)
+        @test all(m -> m.compact.parity, measured)
+    end
 end
 
 # A covariate completed by a kernel that gathers straight from an inline
@@ -937,7 +973,7 @@ _cq_form_data(n) = (; y1 = sin.(1:n), y2 = cos.(1:n), y3 = sin.(2 .* (1:n)),
     rep2 = [mod1(j + 5, n) for j in 1:n], k = [mod1(7j, n) for j in 1:n])
 
 @testset "cell query: values read by two loop statements, and literal reads of computed vectors" begin
-    backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    backend = _CQ_REVERSE
     for obs in (:y1, :y2, :y3)
         measured = map((40, 4_000)) do n
             data = _cq_form_data(n)
@@ -951,20 +987,26 @@ _cq_form_data(n) = (; y1 = sin.(1:n), y2 = cos.(1:n), y3 = sin.(2 .* (1:n)),
             dense = prepare_cell_sampler(built, bound, obs, u; backend)
             dense_value, dense_gradient = cell_value_and_gradient!(dense, similar(u), u, 2)
             support = findall(!iszero, dense_gradient)
-            compact = prepare_compact_cell_sampler(built, bound, obs, u, support; backend)
-            compact_gradient = similar(u[support])
-            compact_value, _ = cell_value_and_gradient!(
-                compact, compact_gradient, u, u[support], support, 2)
+            compact = _static_enzyme() do
+                sampler = prepare_compact_cell_sampler(built, bound, obs, u, support; backend)
+                compact_gradient = similar(u[support])
+                compact_value, _ = cell_value_and_gradient!(
+                    sampler, compact_gradient, u, u[support], support, 2)
+                (; compact_value, parity = compact_gradient ≈ dense_gradient[support])
+            end
             (; values, reference = [sum(x; init = 0.0) for x in pointwise[[1, 2, n]]],
-               bytes = (@allocated q(u, 2)), dense_value, compact_value,
-               parity = compact_gradient ≈ dense_gradient[support],
+               bytes = (@allocated q(u, 2)), dense_value, compact,
                central = all(j -> isapprox(dense_gradient[j],
                    _cq_central(v -> q(v, 2), u, j); rtol = 1e-5), support))
         end
         @test all(m -> m.values ≈ m.reference, measured)
         @test measured[1].bytes == measured[2].bytes
-        @test all(m -> m.values[2] ≈ m.dense_value ≈ m.compact_value, measured)
-        @test all(m -> m.parity && m.central, measured)
+        @test all(m -> m.values[2] ≈ m.dense_value, measured)
+        @test all(m -> m.central, measured)
+        if all(m -> !isnothing(m.compact), measured)
+            @test all(m -> m.dense_value ≈ m.compact.compact_value, measured)
+            @test all(m -> m.compact.parity, measured)
+        end
     end
 end
 

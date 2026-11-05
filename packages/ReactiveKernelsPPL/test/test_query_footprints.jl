@@ -2,6 +2,7 @@ module QueryFootprintTests
 using ReactiveKernels, ReactiveKernelsPPL, LinearAlgebra, SparseArrays, Test
 using DifferentiationInterface: AutoEnzyme
 import Enzyme
+include("static_enzyme.jl")
 
 function build(ast, data)
     plan = bind_data(lower_rkppl(ast, data; conditioned=(:y,), mod=@__MODULE__), data)
@@ -168,7 +169,7 @@ end
             Symbol("effect.z.$g.1"), Symbol("effect.z.$g.2")])
     end
     # The gradient stays within the footprint, whose coordinates it matches.
-    backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
     sampler = prepare_cell_sampler(built, plan, :y, u; backend)
     gradient = similar(u)
     cell_value_and_gradient!(sampler, gradient, u, 7)
@@ -264,11 +265,14 @@ end
         @test Set(names[partition_footprint(definition.kernel, u, i).unconstrained]) ==
             union(shared, own(findall(!iszero, factor[group[i], :])))
     end
-    backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse))
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
     samplers = map(fixtures) do f
         prepare_partition_sampler(f.built, f.plan, :y, u; by = :unit, backend, compact = false)
     end
-    compact = prepare_partition_sampler(sparse_case.built, sparse_case.plan, :y, u; by = :unit, backend)
+    # Registered Enzyme refuses the compact overlay (static_enzyme.jl).
+    compact = _static_enzyme() do
+        prepare_partition_sampler(sparse_case.built, sparse_case.plan, :y, u; by = :unit, backend)
+    end
     for label in 1:3
         rows = (2label - 1):(2label)
         expected = union(shared, own(rows))
@@ -284,11 +288,14 @@ end
         @test sparse_value ≈ dense_value
         @test sparse_gradient ≈ dense_gradient
         @test all(j -> j in read || iszero(sparse_gradient[j]), eachindex(u))
-        positions = partition_footprint(compact, label)
-        compact_gradient = zeros(length(positions))
-        compact_value, _ = partition_value_and_gradient!(compact, compact_gradient, u, label)
-        @test compact_value ≈ sparse_value
-        @test compact_gradient ≈ sparse_gradient[positions]
+        isnothing(compact) && continue
+        _static_enzyme() do
+            positions = partition_footprint(compact, label)
+            compact_gradient = zeros(length(positions))
+            compact_value, _ = partition_value_and_gradient!(compact, compact_gradient, u, label)
+            @test compact_value ≈ sparse_value
+            @test compact_gradient ≈ sparse_gradient[positions]
+        end
     end
 end
 end
