@@ -6,7 +6,8 @@
 # (`_lane_allocation`); this file gives the same destination protocol to the
 # source shapes that produce a dense array of known shape: a top-level dotted
 # call (including `@.`), a top-level array slice `x[i, j...]`, a top-level
-# `reduce(vcat, cells)` of dense vectors, and a top-level lazy branch
+# `reduce(vcat, cells)` of dense vectors, a top-level `vcat` of numbers and
+# dense vectors (`_lane_vcat`), and a top-level lazy branch
 # (`c ? a : b`, `if`/`elseif`/`else`) whose arms produce arrays. Each arm of
 # such a branch that is one of these shapes, or `zeros`/`ones`/`fill` of
 # integer dimensions, fills the recipe's buffer; the branch stays lazy, so
@@ -14,20 +15,23 @@
 # array by its syntax (a dotted call, `zeros`/`ones`/`fill`, a slice by a
 # range or `:`): `i > 0 ? x[i] : 0.0` reads a scalar and keeps its call.
 #
-# A slice, dotted call or `reduce(vcat, cells)` nested inside such a source, as the
-# argument of another call (`minimum(x .- y)`) or inside a branch arm, fills a
-# lane slot of its own. The recipe's value releases every such slot it may
-# hold (`_lane_release!`), so a value that keeps the buffer (an opaque function
-# returned it, a tuple holds it) is never overwritten. Nested slots are free names the position driver binds
-# (`_CELL_SLOTS`); outside a position residual a nested call keeps its own
-# allocation.
+# A slice, dotted call, `reduce(vcat, cells)` or `vcat` nested inside such a
+# source, as the argument of another call (`minimum(x .- y)`) or inside a
+# branch arm, fills a lane slot of its own. The recipe's value releases every
+# such slot it may hold (`_lane_release!`), so a value that keeps the buffer
+# (an opaque function returned it, a tuple holds it) is never overwritten.
+# Nested slots are free names the position driver binds (`_CELL_SLOTS`);
+# outside a position residual a nested call keeps its own allocation. A slice
+# that is directly an operand of a dotted call (`a .* x[k]`, `f.(x[k])`) needs
+# no slot: the fused broadcast reads it in place (`_lane_gathered`), so the
+# gathered values are not copied before the elementwise call reads them.
 #
 # The recipe's native closure computes `_native_broadcast_materialize(bc)`,
 # `x[...]` or `reduce(vcat, cells)` from its captured source. The destination
 # form evaluates the same lazy broadcast, indices or cells from that source and
 # writes the result into a matching recycled buffer (`_lane_broadcast`,
-# `_lane_getindex`, `_lane_reduce_vcat`, `_lane_zeros`, `_lane_ones`,
-# `_lane_fill`), returning exactly the value the closure would. The source is
+# `_lane_getindex`, `_lane_reduce_vcat`, `_lane_vcat`, `_lane_zeros`,
+# `_lane_ones`, `_lane_fill`), returning exactly the value the closure would. The source is
 # reinterpreted only when that is unambiguous:
 #
 # - the operation is an ordinary-mode `:fused` source closure without
@@ -278,6 +282,12 @@ _lane_materialize_call(node) = node isa Expr && node.head === :call &&
     length(node.args) == 2 &&
     node.args[1] == _lane_source_ref(:_native_broadcast_materialize)
 
+# A lazy dotted call of the native body, `_native_broadcasted(f, operands...)`
+# (`_kernel_native_broadcasts`): only ever materialized whole.
+_lane_broadcasted_call(node) = node isa Expr && node.head === :call &&
+    length(node.args) >= 2 &&
+    node.args[1] == _lane_source_ref(:_native_broadcasted)
+
 # Rewrite one node of the native source: inputs become their call arguments,
 # other names `GlobalRef`s. `ends` holds the expressions that `end`/`begin`
 # mean at this position (inside an index of the enclosing slice), or `nothing`
@@ -328,6 +338,19 @@ function _lane_source_node(ctx::_LaneSourceContext, node, ends)
             push!(indices, rewritten)
         end
         return Expr(:ref, array, indices...)
+    elseif head === :call && ctx.nested !== nothing && _lane_broadcasted_call(node) &&
+           any(_lane_slice_node, @view node.args[3:end])
+        # A slice operand of a dotted call is read in place by the fused
+        # broadcast (`_lane_gather_operand`); the callee and every other
+        # operand are rewritten as usual.
+        args = Any[]
+        for (k, arg) in enumerate(node.args)
+            rewritten = k >= 3 && _lane_slice_node(arg) ?
+                _lane_gather_operand(ctx, arg, ends) : _lane_source_node(ctx, arg, ends)
+            rewritten === nothing && return nothing
+            push!(args, rewritten)
+        end
+        return Expr(:call, args...)
     elseif head === :call && ctx.nested !== nothing && _lane_materialize_call(node)
         # A nested dotted call fills its own lane slot.
         lazy = _lane_source_node(ctx, node.args[2], ends)
@@ -342,6 +365,13 @@ function _lane_source_node(ctx::_LaneSourceContext, node, ends)
         slot = gensym(:lane_nested)
         push!(ctx.nested, slot)
         return Expr(:call, _lane_source_ref(:_lane_reduce_vcat), slot, cells)
+    elseif head === :call && ctx.nested !== nothing && _lane_vcat_call(node)
+        # And a nested `vcat` of numbers and dense vectors (`_lane_vcat`).
+        operands = _lane_source_operands(ctx, node, ends)
+        operands === nothing && return nothing
+        slot = gensym(:lane_nested)
+        push!(ctx.nested, slot)
+        return Expr(:call, _lane_source_ref(:_lane_vcat), slot, operands...)
     elseif head in (:<:, :>:) && length(node.args) == 2
         # Julia lowers `a <: b` to a call of the `<:` its module resolves. The
         # one-operand form is a bound in a type application, outside the grammar.
@@ -382,6 +412,20 @@ end
 # array. Its array expression can itself be an index of an enclosing slice;
 # only that expression sees the enclosing bounds.
 function _lane_index_destination(ctx::_LaneSourceContext, node, recycled, outer_ends)
+    _lane_index_call(ctx, node, outer_ends, _lane_source_ref(:_lane_getindex), recycled)
+end
+
+# A slice that is directly an operand of a dotted call: the fused broadcast
+# reads it in place (`_lane_gathered`) instead of a copy in a lane slot of its
+# own.
+_lane_gather_operand(ctx::_LaneSourceContext, node, outer_ends) =
+    _lane_index_call(ctx, node, outer_ends, _lane_source_ref(:_lane_gathered))
+
+_lane_slice_node(node) = node isa Expr && node.head === :ref && length(node.args) >= 2
+
+# `callee(leading..., array, indices...)` for the slice `node`, the array bound
+# once so that each index's `end`/`begin` resolves against it.
+function _lane_index_call(ctx::_LaneSourceContext, node, outer_ends, callee, leading...)
     any(index -> Meta.isexpr(index, :...), node.args[2:end]) && return nothing
     array = _lane_source_node(ctx, node.args[1], outer_ends)
     array === nothing && return nothing
@@ -397,7 +441,7 @@ function _lane_index_destination(ctx::_LaneSourceContext, node, recycled, outer_
         push!(indices, rewritten)
     end
     Expr(:let, Expr(:(=), held, array),
-         Expr(:call, _lane_source_ref(:_lane_getindex), recycled, held, indices...))
+         Expr(:call, callee, leading..., held, indices...))
 end
 
 # The destination form of recipe `r`, whose arguments are `callargs`, filling
@@ -465,6 +509,10 @@ function _lane_destination(ctx::_LaneSourceContext, node, recycled,
         cells = _lane_source_node(ctx, node.args[3], nothing)
         cells === nothing && return nothing
         return (Expr(:call, _lane_source_ref(:_lane_reduce_vcat), recycled, cells), true)
+    elseif _lane_vcat_call(node)
+        operands = _lane_source_operands(ctx, node, nothing)
+        operands === nothing && return nothing
+        return (Expr(:call, _lane_source_ref(:_lane_vcat), recycled, operands...), true)
     elseif (fill = _lane_fill_call(ctx, node)) !== nothing
         args = Any[]
         for arg in node.args[2:end]
@@ -531,6 +579,22 @@ function _lane_fill_call(ctx::_LaneSourceContext, node)
     f = _lane_binding(ctx, node.args[1])
     f === Base.zeros ? :_lane_zeros : f === Base.ones ? :_lane_ones :
         f === Base.fill ? :_lane_fill : nothing
+end
+
+# Whether `node` is the native body's `vcat` (`_native_vcat`, from any
+# spelling of Base's `vcat` or `[a; b]`), without keywords or splats.
+_lane_vcat_call(node) = _lane_plain_call(node) &&
+    node.args[1] == _lane_source_ref(:_native_vcat)
+
+# The rewritten operands of a call node, or `nothing` outside the grammar.
+function _lane_source_operands(ctx::_LaneSourceContext, node, ends)
+    operands = Any[]
+    for arg in node.args[2:end]
+        rewritten = _lane_source_node(ctx, arg, ends)
+        rewritten === nothing && return nothing
+        push!(operands, rewritten)
+    end
+    operands
 end
 
 # Whether `node` is Base's `reduce(vcat, x)`, without keywords (an `init`
