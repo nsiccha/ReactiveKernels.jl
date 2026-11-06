@@ -398,17 +398,15 @@ end
     entry = layout.entries[2]
     # Ordered: one call of the native ordered kernel over the packed slice.
     # The slice and the Jacobian's tail are reads of their own, so the
-    # structural footprint is the block, not the whole packed vector. Its
-    # length follows the response's levels, so the program reads it from them.
+    # structural footprint is the block, not the whole packed vector.
     @test transform_statements(entry) == Expr[
         :(_ppl_vector_block_y_cutpoints::AbstractVector{Float64} =
-            view(unconstrained, 2:_ppl_last_y_cutpoints)),
+            view(unconstrained, 2:3)),
         :(y_cutpoints::AbstractVector{Float64} =
             $(GlobalRef(ReactiveKernelsPPL, :_ordered_constrain_kernel))(
-                _ppl_vector_block_y_cutpoints, 1,
-                $(GlobalRef(Base, :length))(_ppl_vector_block_y_cutpoints))),
+                _ppl_vector_block_y_cutpoints, 1, 2)),
         :(_ppl_ordered_tail_y_cutpoints::AbstractVector{Float64} =
-            view(unconstrained, 3:_ppl_last_y_cutpoints)),
+            view(unconstrained, 3:3)),
     ]
     @test jacobian_term(entry) == :(sum(_ppl_ordered_tail_y_cutpoints))
     one_ord = LayoutEntry(:vector, nothing, :o, [:o_1], 7, 1, :ordered)
