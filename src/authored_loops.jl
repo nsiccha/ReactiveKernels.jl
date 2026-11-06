@@ -473,7 +473,7 @@ function _kernel_scan_loop_statements(statement::Expr, mod, line)
     # Seed values are named once; a seed may read earlier seeds of any array.
     seed_names = Dict{Tuple{Symbol,Int},Symbol}()
     for name in carried, k in 1:depth
-        seed_names[(name, k)] = gensym(Symbol(name, :_seed, k))
+        seed_names[(name, k)] = _kernel_gensym(Symbol(name, :_seed, k))
     end
     result = Any[]
     for name in carried, k in 1:depth
@@ -543,7 +543,7 @@ function _kernel_scan_loop_statements(statement::Expr, mod, line)
     next = Expr(:tuple, Expr(:parameters, (
         Expr(:kw, Symbol(name, :_lag, k), k == 1 ? step_locals[name] : lag(name, k - 1))
         for name in carried for k in 1:depth)...))
-    steps = gensym(:scan_steps)
+    steps = _kernel_gensym(:scan_steps)
     one_output = length(carried) == 1
     output = one_output ? step_locals[only(carried)] :
         _scan_named_tuple_expr(carried, name -> step_locals[name])
@@ -552,7 +552,7 @@ function _kernel_scan_loop_statements(statement::Expr, mod, line)
     push!(result, Expr(:(=), steps,
                        Expr(:do, call, Expr(:(->), Expr(:tuple, carry, index), step_body))))
     for name in carried
-        column = one_output ? steps : gensym(Symbol(name, :_steps))
+        column = one_output ? steps : _kernel_gensym(Symbol(name, :_steps))
         one_output || push!(result, Expr(:(=), column, _scan_column_expr(steps, name)))
         push!(result, Expr(:(=), name, Expr(:call, GlobalRef(Base, :vcat),
                                             Expr(:vect, (seed_names[(name, k)] for k in 1:depth)...),
@@ -722,7 +722,7 @@ function _kernel_scan_history_folds(statements, summaries, reads, index, domain,
     step_body = Expr(:block, lines..., step..., Expr(:tuple, next, output))
     fold = Expr(:do, call, Expr(:(->), Expr(:tuple, carry, index, history), step_body))
     result = Any[]
-    trajectories = scalar ? only(carried) : gensym(:scan_trajectories)
+    trajectories = scalar ? only(carried) : _kernel_gensym(:scan_trajectories)
     push!(result, Expr(:(=), trajectories, fold))
     if !scalar
         for a in carried

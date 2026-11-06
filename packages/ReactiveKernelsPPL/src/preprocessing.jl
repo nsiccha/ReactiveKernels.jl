@@ -331,9 +331,9 @@ wherever a program reads an axis's labels, indexed by the axis's selection
 call folds under `bound=`, and no label reaches compiled code: before, every
 label was spliced into the program as a literal, which LLVM compiled as one
 store per label (two 10,950-label statements took 60 s and 45 s on the
-ArbeitsplatzAtlas program). The labels are still the program's:
-`_program_identity` replaces each call by its value as quoted data, so a
-binding with other labels is another program (`rkppl-use` §14).
+ArbeitsplatzAtlas program). So a binding with other labels, or another number
+of them, generates the same program and evaluates on the same build
+(`rkppl-use` §14).
 """
 ReactiveKernels.@_record_source _ppl_levels(col::AbstractVector) = Vector(DataAPI.levels(col))
 ReactiveKernels.@_record_source _ppl_unique(col::AbstractVector) = unique(col)

@@ -132,3 +132,223 @@ end
     plate_only = prepare(_det_child_plate)
     @test typeof(plate_only) !== typeof(k1)
 end
+
+# --- one definition built twice: one set of types --------------------------------
+# A generator evaluates its definition anew per build (RKPPL's `build_kernel`), so
+# what the expansion names and what a build's value ids order must not differ
+# between two builds of one program: any difference is a new type, and every
+# reader of it compiles again (snag `gensym-in-kernel-54164b85`).
+function _det_types!(types, x, seen = IdDict{Any,Nothing}())
+    x isa Union{Module,Type,Symbol,Number,AbstractString,Expr,QuoteNode,LineNumberNode,
+                Task,Base.AbstractLock} && return types
+    isbitstype(typeof(x)) && return types
+    haskey(seen, x) && return types
+    seen[x] = nothing
+    push!(types, string(typeof(x)))
+    if x isa AbstractArray
+        isbitstype(eltype(x)) && return types
+        for i in eachindex(x)
+            isassigned(x, i) && _det_types!(types, x[i], seen)
+        end
+    elseif x isa AbstractDict
+        for (k, v) in x
+            _det_types!(types, k, seen)
+            _det_types!(types, v, seen)
+        end
+    else
+        for f in 1:fieldcount(typeof(x))
+            isdefined(x, f) && _det_types!(types, getfield(x, f), seen)
+        end
+    end
+    types
+end
+_det_types(x) = _det_types!(Set{String}(), x)
+
+function _det_build(definition)
+    mod = Module(gensym(:DetBuild))
+    Core.eval(mod, :(using ReactiveKernels))
+    ReactiveKernels._kernel_eval_definition(mod, definition)
+end
+
+@testset "one definition built twice spells one set of types" begin
+    # `exp(log_k)` lifts out of the cell, and the rest of the recipe keeps split
+    # nodes, whose type carries the lifted name.
+    definition = :(f(xs::Vector{Float64}, ws::Vector{Float64}, log_k::Float64) = begin
+        out::Vector{Float64} = plate(xs, ws) do x, w
+            r = sin(exp(log_k)) * cos(x * w) + w
+            r
+        end
+        return sum(out)
+    end)
+    spec1, spec2 = _det_build(definition), _det_build(definition)
+    types1, types2 = _det_types(spec1), _det_types(spec2)
+    # The comparison means something only if a generated name reaches a type.
+    @test any(t -> occursin("_KernelSplit", t) && occursin("##cell_invariant#", t), types1)
+    @test types1 == types2
+    k1, k2 = prepare(spec1), prepare(spec2)
+    @test typeof(k1) === typeof(k2)
+    xs, ws = [0.5, -1.0, 2.0], [0.25, 1.5, -0.75]
+    @test k1(xs, ws, 0.3) == k2(xs, ws, 0.3)
+    @test k1(xs, ws, 0.3) ≈ sum(sin(exp(0.3)) * cos(x * w) + w for (x, w) in zip(xs, ws))
+    # A different definition keeps its own names.
+    other = _det_build(:(f(xs::Vector{Float64}, ws::Vector{Float64}, log_k::Float64) = begin
+        out::Vector{Float64} = plate(xs, ws) do x, w
+            r = sin(exp(log_k)) * cos(x + w) + w
+            r
+        end
+        return sum(out)
+    end))
+    # By its 12-digit fingerprint and 6-digit position; the generated body's
+    # canonical `##cell_invariant#2` is the same in every program.
+    names(types) = Set(m.match for t in types for m in eachmatch(r"##cell_invariant#\d{18}", t))
+    @test !isempty(names(types1))
+    @test isdisjoint(names(types1), names(_det_types(other)))
+end
+
+@testset "a generated name is a function of the definition and its position" begin
+    RK = ReactiveKernels
+    fingerprint = RK._kernel_source_fingerprint
+    source = :(f(x) = begin
+        y = g(x, 1.0)
+        return y
+    end)
+    # Line numbers, a literal's value, a generator's numbering and a fresh module
+    # are not part of the program's identity here.
+    @test fingerprint(source) == fingerprint(Base.remove_linenums!(copy(source)))
+    @test fingerprint(:(g(x, 1.0))) == fingerprint(:(g(x, 2.0)))
+    a, b = gensym(:t), gensym(:t)
+    @test fingerprint(:($a + $b)) == fingerprint(:($(gensym(:t)) + $(gensym(:t))))
+    @test fingerprint(:($a + $a)) != fingerprint(:($a + $b))
+    fresh() = Module(gensym(:Fresh))
+    @test fingerprint(GlobalRef(fresh(), :g)) == fingerprint(GlobalRef(fresh(), :g))
+    @test fingerprint(GlobalRef(Base, :g)) != fingerprint(GlobalRef(Core, :g))
+    # Authored names and structure are.
+    @test fingerprint(:(g(x))) != fingerprint(:(h(x)))
+    @test fingerprint(:(g(x))) != fingerprint(:(g(y)))
+    @test fingerprint(:(g(x, y))) != fingerprint(:(g(y, x)))
+    @test fingerprint(:(g(x)[1])) != fingerprint(:(g(x)))
+
+    names() = RK._with_kernel_names(() -> (RK._kernel_gensym(:v), RK._kernel_gensym(:v)), source)
+    n1, n2 = names()
+    @test n1 !== n2
+    @test names() === (n1, n2)
+    # The shape everything that recognizes a generated name reads.
+    @test RK._lowering_gensym(n1)
+    @test Base.isgensym(n1)
+    @test RK._generated_value_name(n1)
+    @test RK._gensym_base(n1) == "v"
+    @test startswith(String(RK._value_local_name(n1)), "#v#")
+    @test RK._canonical_locals(:($n1 + $n2)) == RK._canonical_locals(:($(gensym(:v)) + $(gensym(:v))))
+    # A nested expansion keeps its own position and restores the outer one.
+    outer = RK._with_kernel_names(source) do
+        first = RK._kernel_gensym(:v)
+        RK._with_kernel_names(() -> RK._kernel_gensym(:v), :(other_source))
+        (first, RK._kernel_gensym(:v))
+    end
+    @test outer === (n1, n2)
+    # A generator's steps continue one count, inside one another or inside an
+    # expansion, so a submodel called twice is named apart.
+    continued = RK._within_kernel_names(source) do
+        first = RK._kernel_gensym(:v)
+        (first, RK._within_kernel_names(() -> RK._kernel_gensym(:v), source))
+    end
+    @test continued === (n1, n2)
+    # Outside an expansion it is `gensym`.
+    @test RK._kernel_gensym(:v) !== RK._kernel_gensym(:v)
+end
+
+# One source with different meanings: two definitions spell the same generated
+# names, and must still be two computations in one graph.
+const _DET_SAME_ONE = let c = 1.0
+    @kernel f(xs::Vector{Float64}, k::Float64) = begin
+        out::Vector{Float64} = plate(xs) do x
+            r = x * sin(exp(k) + c)
+            r
+        end
+        return sum(out)
+    end
+end
+const _DET_SAME_TWO = let c = 2.0
+    @kernel f(xs::Vector{Float64}, k::Float64) = begin
+        out::Vector{Float64} = plate(xs) do x
+            r = x * sin(exp(k) + c)
+            r
+        end
+        return sum(out)
+    end
+end
+module _DetFirst
+using ReactiveKernels
+g(x) = x + 1.0
+@kernel f(xs::Vector{Float64}, k::Float64) = begin
+    out::Vector{Float64} = plate(xs) do x
+        r = sin(g(x) * exp(k))
+        r
+    end
+    return sum(out)
+end
+end
+module _DetSecond
+using ReactiveKernels
+g(x) = x + 2.0
+@kernel f(xs::Vector{Float64}, k::Float64) = begin
+    out::Vector{Float64} = plate(xs) do x
+        r = sin(g(x) * exp(k))
+        r
+    end
+    return sum(out)
+end
+end
+@kernel _det_same_source(xs::Vector{Float64}, k::Float64) = begin
+    a::Float64 = _DET_SAME_ONE(xs, k)
+    b::Float64 = _DET_SAME_TWO(xs, k)
+    c::Float64 = _DetFirst.f(xs, k)
+    d::Float64 = _DetSecond.f(xs, k)
+    return (a, b, c, d)
+end
+
+@testset "two definitions of one source stay two computations" begin
+    xs = [0.5, -1.0, 2.0]
+    k = 0.3
+    a, b, c, d = prepare(_det_same_source)(xs, k)
+    @test a ≈ sum(x * sin(exp(k) + 1.0) for x in xs)
+    @test b ≈ sum(x * sin(exp(k) + 2.0) for x in xs)
+    @test c ≈ sum(sin((x + 1.0) * exp(k)) for x in xs)
+    @test d ≈ sum(sin((x + 2.0) * exp(k)) for x in xs)
+    @test a != b
+    @test c != d
+end
+
+@testset "a build's value ids order nothing a type reads" begin
+    RK = ReactiveKernels
+    # A bound plate's axes do not depend on the order of its arguments, and are
+    # what splatting them gives.
+    args = Any[[1, 2, 3], Ref([1.0, 2.0]), [1.0, 2.0, 3.0], Ref(1.0), fill(0.5, 1)]
+    @test RK._partial_bound_axes(args) === Base.Broadcast.combine_axes(args...)
+    @test RK._partial_bound_axes(reverse(args)) === Base.Broadcast.combine_axes(args...)
+    @test RK._partial_bound_axes(Any[Ref(1.0)]) === ()
+    @test RK._partial_bound_axes(Any[Float64[], [1.0]]) === (Base.OneTo(0),)
+    @test_throws DimensionMismatch RK._partial_bound_axes(Any[[1, 2], [1, 2, 3]])
+    # A child's snapshot follows the order the graph was built in, whatever its
+    # dictionaries hold, so two builds of one child have one snapshot type.
+    snapshot = RK._kernel_capture_child(:child, _DET_SAME_ONE)
+    ids = [value.id for value in snapshot.values]
+    @test issorted(ids)
+    @test length(ids) == length(_DET_SAME_ONE.graph.values)
+    producers = [first(p) for p in snapshot.producers]
+    @test issorted(producers)
+    @test length(producers) == length(_DET_SAME_ONE.graph.producers)
+    rebuilt = RK._kernel_reconstruct(snapshot)
+    @test rebuilt.graph.values == _DET_SAME_ONE.graph.values
+    @test rebuilt.graph.producers == _DET_SAME_ONE.graph.producers
+    # Many values of two types, so a dictionary's order shows in the tuple's type.
+    definition = Expr(:(=), :(f(x::Float64)), Expr(:block,
+        Any[:($(Symbol(:a, i))::Float64 = x + $i) for i in 1:40]...,
+        :(u = identity(a1)),
+        Any[:($(Symbol(:b, i))::Float64 = u + $(Symbol(:a, i))) for i in 1:40]...,
+        :(return b40)))
+    tuples = [typeof(RK._kernel_capture_child(:child, _det_build(definition)).values)
+              for _ in 1:4]
+    @test Value{Any} in fieldtypes(first(tuples))
+    @test allequal(tuples)
+end

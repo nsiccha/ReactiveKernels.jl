@@ -318,7 +318,11 @@ end
         gensym(:_rkppl_selected)
     end
     later_plan = lower_rkppl(selected_ast, data; conditioned = data)
-    @test sprint(_canon, first_plan) != sprint(_canon, later_plan)
+    # Lowering names its private binders by the source and their position, not
+    # by `gensym`'s counter, so one source lowers to one spelling however many
+    # gensyms run in between (snag `gensym-in-kernel-54164b85`).
+    @test occursin("##_rkppl_selected#", sprint(_canon, first_plan))
+    @test sprint(_canon, first_plan) == sprint(_canon, later_plan)
     @test sprint(_corpus_canon, first_plan, selected_ast) ==
         sprint(_corpus_canon, later_plan, selected_ast)
 end
