@@ -274,7 +274,9 @@ name, a bound data name, a finite-positive literal, or a
 own `_ppl_sc_<label>_nu` node so scale and nu predictors coexist).
 `zi` is the ZIP/ZIB zero-inflation probability and accepts the same value
 forms. Fixed `nu` data must be finite positive reals; fixed `zi` data must
-be finite reals in [0, 1]. Model-valued inputs use the lazy density guard.
+be finite reals in [0, 1]. A value is fixed when it reads no sampled name, as a
+column, a computed argument or a definition, and binding checks the rows the
+response observes. Model-valued inputs use the lazy density guard.
 `weights` is a
 frequency/power-objective column (D1); analytic/precision weights fail
 closed emitter-side. `trials` is the Binomial/BetaBinomial2 trial count
@@ -6884,8 +6886,8 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
 end
 
 # Bound scale data must satisfy their distribution's domain and row count.
-# Derived and sampled arguments are checked by the value graph and density
-# endpoint because their values depend on the query.
+# Arguments that read a sampled value are checked by the value graph and
+# density endpoint because their values depend on the query.
 function _validate_scale_data(r::LikelihoodSpec, plan::StructuralPlan)
     if r.family === MixtureFam
         for s in r.mixture_scales
@@ -6899,8 +6901,13 @@ end
 function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
     (s === nothing || s isa Real) && return nothing
     # A predictor-fed scale is an n_obs LP by construction (design over the
-    # bound rows); there is no column length to check at bind.
-    s isa ScalePredictorRef && return nothing
+    # bound rows); there is no column length to check at bind, only the values
+    # of one that reads no coefficient.
+    if s isa ScalePredictorRef
+        col = _fixed_predictor_value(r, plan, s)
+        col === nothing || _check_scale_domain(r, col, s.predictor)
+        return nothing
+    end
     s isa Symbol || return nothing
     # A data-only scalar definition used as a scale is materialized at bind.
     # Validate that value just like a caller-supplied scale; live definitions
@@ -6910,7 +6917,14 @@ function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
     haskey(plan.columns, s) ||
         _fail(r.label, "scale references unknown name $s")
     value = plan.columns[s]
+    _supplied(value) || return nothing
     col = value isa Number ? value : _response_slot_column(plan, r, s, "scale column")
+    _check_scale_domain(r, col, _slot_value_label(plan, s))
+    # The observation domain validates every broadcast dimension.
+    return nothing
+end
+
+function _check_scale_domain(r::LikelihoodSpec, col, s)
     if r.family === HurdlePoissonFam
         (eltype(col) <: Real && all(isfinite, col) &&
             all(x -> 0 <= x <= 1, col)) ||
@@ -6925,14 +6939,46 @@ function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
         (eltype(col) <: Real && all(isfinite, col) && all(>(0), col)) ||
             _fail(r.label, "per-observation scale $s must be finite positive numerics")
     end
-    # The observation domain validates every broadcast dimension.
     return nothing
+end
+
+# A generated name means nothing to the author of a computed argument: a
+# refusal says what they wrote.
+function _slot_value_label(plan::StructuralPlan, name::Symbol)
+    startswith(String(name), "_rkppl_") || return String(name)
+    ex = get(first(_definition_exprs(plan)), name, nothing)
+    ex === nothing && return String(name)
+    _is_plate_column_expr(ex) && return "computed in a plate cell"
+    return "`$(_authored_spelling(ex))`"
+end
+
+# The value of a predictor-fed slot whose definition reads no coefficient
+# (`zz = z .- 0.1`, offsets only), over the rows its response observes, or
+# `nothing` for a predictor whose value depends on the query or on an input
+# this binding leaves absent.
+function _fixed_predictor_value(r::LikelihoodSpec, plan::StructuralPlan,
+        s::ScalePredictorRef)
+    terms = _predictor(plan, s.predictor).terms
+    names = _all_name_set(plan)
+    all(t -> t.kind === OffsetTerm &&
+        _reads_data_only(plan, only(t.columns), names, Set{Symbol}()), terms) ||
+        return nothing
+    readsabsent = _absent_definition_sources(plan, plan.columns)
+    all(t -> _supplied(get(plan.columns, only(t.columns), nothing)) &&
+        !haskey(readsabsent, only(t.columns)), terms) || return nothing
+    lp = mapreduce((a, b) -> a .+ b, terms) do t
+        _bound_data_value(plan, only(t.columns), r.label, "predictor $(s.predictor)")
+    end
+    value = _eval_value_expr(_inverse_link_expr(s.link, :lp), _ -> lp, r.label)
+    return value isa Number ? value :
+        _response_slot_column(plan, r, s.predictor, "predictor"; value)
 end
 
 # Student degrees of freedom: required (a sampled parameter/assignment
 # name, a finite-positive literal, or a predictor-fed per-observation nu),
 # scalar or per observation. Declared value nodes resolve structurally;
-# their values are guarded by the density endpoint.
+# binding checks a fixed value (`_validate_auxiliary_data`) and the density
+# endpoint guards a live one.
 function _validate_nu(r::LikelihoodSpec, plan::StructuralPlan)
     if r.family !== StudentTFam
         r.nu === nothing ||
@@ -6957,7 +7003,8 @@ end
 # Zero-inflation probability: required (a sampled parameter/assignment
 # name, a literal in [0, 1], or a predictor-fed zi submodel), scalar or
 # per-observation value. Declared value nodes resolve structurally;
-# their values are guarded by the density endpoint.
+# binding checks a fixed value (`_validate_auxiliary_data`) and the density
+# endpoint guards a live one.
 function _validate_zi(r::LikelihoodSpec, plan::StructuralPlan)
     if r.family !== ZeroInflatedPoissonFam &&
             r.family !== ZeroInflatedBinomialFam
@@ -6977,17 +7024,30 @@ function _validate_zi(r::LikelihoodSpec, plan::StructuralPlan)
     return nothing
 end
 
-# Raw data arguments resolve at binding, like scales. Live definitions and
-# sampled values keep the ordinary endpoint's lazy support guard.
+# Data arguments resolve at binding, like scales: a column, a data-only
+# definition (which binding materialized) and a predictor that reads no
+# coefficient. Live definitions and sampled values keep the ordinary
+# endpoint's lazy support guard.
 function _validate_auxiliary_data(r::LikelihoodSpec, plan::StructuralPlan, value,
         slot::Symbol)
+    if value isa ScalePredictorRef
+        selected = _fixed_predictor_value(r, plan, value)
+        selected === nothing ||
+            _check_auxiliary_domain(r, selected, value.predictor, slot)
+        return nothing
+    end
     value isa Symbol || return nothing
     value in _all_name_set(plan) && !haskey(plan.columns, value) && return nothing
     haskey(plan.columns, value) ||
         _fail(r.label, "$slot references unknown name $value")
     data = plan.columns[value]
+    _supplied(data) || return nothing
     selected = data isa Number ? data :
         _response_slot_column(plan, r, value, "$slot data")
+    return _check_auxiliary_domain(r, selected, _slot_value_label(plan, value), slot)
+end
+
+function _check_auxiliary_domain(r::LikelihoodSpec, selected, value, slot::Symbol)
     (eltype(selected) <: Real && all(isfinite, selected)) ||
         _fail(r.label, "$slot data $value must be finite real numerics")
     if slot === :nu
@@ -7540,8 +7600,9 @@ _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
 function _uncached_module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         bind_only = false, unbound::Bool=false)
     required = Set{Symbol}(r.weights for r in plan.responses if r.weights !== nothing)
-    for r in plan.responses, scale in (r.scale, r.mixture_scales...)
-        scale isa Symbol && push!(required, scale)
+    # An auxiliary slot's fixed value validates at bind, like the data it reads.
+    for r in plan.responses, slot in (r.scale, r.nu, r.zi, r.mixture_scales...)
+        slot isa Symbol && push!(required, slot)
     end
     # Trials are data: a data-only definition there binds, as weights do.
     for r in plan.responses, t in (r.trials, r.mixture_trials...)
@@ -7682,7 +7743,7 @@ function _uncached_module_data_names(plan::StructuralPlan, raw::AbstractSet{Symb
     end
     union!(required, axes)
     # A data-only plate column binds only for a bind-time slot (weights, a
-    # scale, a dimension or index); otherwise preparation folds it.
+    # scale, nu or zi, a dimension or index); otherwise preparation folds it.
     names = Set{Symbol}(nm for (nm, ex) in nodes
         if nm ∉ resps && !_constructed_endpoint_call(ex) &&
             ((_contains_module_call(ex) && !_is_plate_column_expr(ex)) ||

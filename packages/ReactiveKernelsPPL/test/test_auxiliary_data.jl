@@ -129,6 +129,153 @@ end
     end
 end
 
+# A value fixed by bound data validates at bind on every route the surface lowers
+# it by: a bare column, a computed argument, a named definition and an offsets-only
+# predictor. Refusal is the documented contract of `LikelihoodSpec`'s nu and zi.
+_aux_message(ast,data) = try
+    bind_data(lower_rkppl(ast,data; conditioned=(:y,)),data)
+    nothing
+catch e
+    e isa ContractValidationError ? sprint(showerror,e) : rethrow()
+end
+function _aux_likelihood(ast,data,u)
+    plan=bind_data(lower_rkppl(ast,data; conditioned=(:y,)),data)
+    built=build_kernel(plan)
+    Base.invokelatest(prepare_query(built,plan,:likelihood),fill(u,built.layout.total))
+end
+_aux_zip_ast(arg,defs...) = :(begin
+    a ~ Normal(0,1)
+    $(defs...)
+    y .~ ZeroInflatedPoisson.(exp.(a .* x),$arg)
+end)
+_aux_student_ast(arg,defs...) = :(begin
+    a ~ Normal(0,1)
+    $(defs...)
+    y .~ StudentT.($arg,a .* x,1.0)
+end)
+_aux_zip_density(x,y,z,u) = sum(eachindex(y)) do i
+    rate=exp(u*x[i])
+    y[i] == 0 ? log(z[i]+(1-z[i])*exp(-rate)) : log1p(-z[i])+logpdf(Poisson(rate),y[i])
+end
+_aux_student_density(x,y,nu,u) = sum(logpdf.(TDist.(nu),y .- u .* x))
+
+@testset "a fixed nu or zi value validates at bind on every surface route" begin
+    x=collect(range(-1.0,1.0; length=6))
+    counts=[0,2,0,1,3,0]
+    y=[-0.4,0.1,0.3,0.2,0.7,1.1]
+    u=0.2
+    first_row(v,rest) = [v; fill(rest,5)]
+    # (spelling, its value given the bound column, a column that stays in
+    # support, a column that leaves it, how the refusal names the value)
+    zi_routes=(
+        (_aux_zip_ast(:z),identity,fill(0.3,6),first_row(1.5,0.3),"z"),
+        (_aux_zip_ast(:z),identity,fill(0.3,6),first_row(-0.2,0.3),"z"),
+        (_aux_zip_ast(:(z ./ 2)),v->v./2,fill(0.3,6),first_row(4.0,0.3),"`z ./ 2`"),
+        (_aux_zip_ast(:zz,:(zz=1.5 .* z)),v->1.5.*v,fill(0.3,6),first_row(4.0,0.3),"zz"),
+        (_aux_zip_ast(:zz,:(zz=z)),identity,fill(0.3,6),first_row(1.5,0.3),"zz"),
+        (_aux_zip_ast(:zz,:(zz=z .- 0.1)),v->v.-0.1,fill(0.3,6),first_row(0.05,0.3),"zz"),
+        (_aux_zip_ast(:(exp.(zz)),:(zz=z)),v->exp.(v),fill(-1.0,6),first_row(1.0,-1.0),"zz"),
+    )
+    for (ast,value,good,bad,name) in zi_routes
+        data=(; x,y=counts,z=good)
+        @test _aux_likelihood(ast,data,u) ≈ _aux_zip_density(x,counts,value(good),u)
+        @test occursin("[y_resp] zi data $name must lie in [0, 1]",
+            something(_aux_message(ast,(; x,y=counts,z=bad)),""))
+    end
+    nu_routes=(
+        (_aux_student_ast(:nuc),identity,fill(4.0,6),first_row(-1.0,4.0),"nuc"),
+        (_aux_student_ast(:(nuc .- 5)),v->v.-5,fill(8.0,6),first_row(4.0,8.0),"`nuc .- 5`"),
+        (_aux_student_ast(:nn,:(nn=2 .* nuc)),v->2 .*v,fill(4.0,6),first_row(-1.0,4.0),"nn"),
+        (_aux_student_ast(:nn,:(nn=nuc .+ 1)),v->v.+1,fill(3.0,6),first_row(-2.0,3.0),"nn"),
+    )
+    for (ast,value,good,bad,name) in nu_routes
+        data=(; x,y,nuc=good)
+        @test _aux_likelihood(ast,data,u) ≈ _aux_student_density(x,y,value(good),u)
+        @test occursin("[y_resp] nu data $name must be finite positive numerics",
+            something(_aux_message(ast,(; x,y,nuc=bad)),""))
+    end
+    # A column reads as authored, in the response's plan and in integer form.
+    ast=_aux_student_ast(:nuc)
+    @test only(lower_rkppl(ast,(; x,y,nuc=fill(4,6)); conditioned=(:y,)).responses).nu === :nuc
+    @test _aux_likelihood(ast,(; x,y,nuc=fill(4,6)),u) ≈ _aux_student_density(x,y,fill(4,6),u)
+    # Fixed values must be finite, as a literal and a scalar column must.
+    @test occursin("nu data nuc must be finite real numerics",
+        something(_aux_message(ast,(; x,y,nuc=first_row(Inf,4.0))),""))
+    ast=_aux_zip_ast(:z)
+    @test occursin("zi data z must be finite real numerics",
+        something(_aux_message(ast,(; x,y=counts,z=first_row(NaN,0.3))),""))
+    # A Bool or integer probability column keeps its ordinary meaning.
+    @test _aux_likelihood(ast,(; x,y=counts,z=Bool[1,0,1,0,0,1]),u) ≈
+        _aux_zip_density(x,counts,Bool[1,0,1,0,0,1],u)
+    # The scalar and per-row forms refuse alike.
+    @test occursin("zi data z must lie in [0, 1]",
+        something(_aux_message(ast,(; x,y=counts,z=2.0)),""))
+    # ZIB shares the slot.
+    @test occursin("[y_resp] zi data z must lie in [0, 1]",
+        something(_aux_message(:(begin
+            a ~ Normal(0,1)
+            y .~ ZeroInflatedBinomial.(8,logistic.(a .* x),z)
+        end),(; x,y=counts,z=first_row(1.5,0.3))),""))
+    # A plate cell reads the same column.
+    plate_zi=quote
+        a ~ Normal(0,1)
+        @plate for i in eachindex(y)
+            y[i] ~ ZeroInflatedPoisson(exp(a*x[i]),z[i])
+        end
+    end
+    @test _aux_likelihood(plate_zi,(; x,y=counts,z=fill(0.3,6)),u) ≈
+        _aux_zip_density(x,counts,fill(0.3,6),u)
+    @test occursin("[y_resp] zi data z must lie in [0, 1]",
+        something(_aux_message(plate_zi,(; x,y=counts,z=first_row(1.5,0.3))),""))
+    plate_nu=quote
+        a ~ Normal(0,1)
+        @plate for i in eachindex(y)
+            y[i] ~ StudentT(nuc[i],a*x[i],1.0)
+        end
+    end
+    @test occursin("[y_resp] nu data nuc must be finite positive numerics",
+        something(_aux_message(plate_nu,(; x,y,nuc=first_row(-1.0,4.0))),""))
+    # Only the rows a response observes must lie in support.
+    gappy=Union{Missing,Int}[missing; counts[2:end]]
+    bad=first_row(1.5,0.3)
+    @test isfinite(_aux_likelihood(ast,(; x,y=gappy,z=bad),u))
+    @test occursin("zi data z must lie in [0, 1]",
+        something(_aux_message(ast,(; x,y=Union{Missing,Int}[counts[1:end-1]; missing],z=bad)),""))
+    # The scale slot's own computed routes refuse by what the author wrote.
+    normal(arg,defs...) = :(begin
+        a ~ Normal(0,1)
+        $(defs...)
+        y .~ Normal.(a .* x,$arg)
+    end)
+    @test occursin("per-observation scale `w .- 3` must be finite positive numerics",
+        something(_aux_message(normal(:(w .- 3)),(; x,y,w=fill(2.0,6))),""))
+    @test occursin("per-observation scale sd must be finite positive numerics",
+        something(_aux_message(normal(:sd,:(sd=w .- 3)),(; x,y,w=fill(2.0,6))),""))
+    @test _aux_likelihood(normal(:sd,:(sd=w .- 3)),(; x,y,w=fill(5.0,6)),u) ≈
+        sum(logpdf.(Normal.(u .* x,2.0),y))
+    # A design that leaves the response absent still checks the values it
+    # binds, and has no value to check for a slot that reads the response.
+    fit=Dict{Symbol,Any}(:x=>x,:y=>counts,:z=>fill(0.3,6))
+    rebound(ast,design) = bind_data(bind_data(lower_rkppl(ast,fit; conditioned=(:y,)),fit),design)
+    @test ReactiveKernelsPPL._absent_observations(
+        rebound(ast,Dict{Symbol,Any}(:x=>x,:z=>fill(0.3,6)))) == [:y]
+    @test_throws ContractValidationError rebound(ast,Dict{Symbol,Any}(:x=>x,:z=>first_row(1.5,0.3)))
+    for definition in (:(zz=0.1 .+ 0 .* y),:(zz=y .- y .+ 0.1),:(zz=0.1 .* y))
+        @test ReactiveKernelsPPL._absent_observations(
+            rebound(_aux_zip_ast(:zz,definition),Dict{Symbol,Any}(:x=>x,:z=>fill(0.3,6)))) == [:y]
+    end
+    # A value that reads a sampled name is only known per query: its lazy
+    # density guard answers, at every coordinate that leaves the support.
+    live=_aux_zip_ast(:(g .* z),:(g ~ Normal(0,1)))
+    @test _aux_message(live,(; x,y=counts,z=first_row(4.0,0.3))) === nothing
+    plan=bind_data(lower_rkppl(live,(; x,y=counts,z=first_row(4.0,0.3)); conditioned=(:y,)),
+        (; x,y=counts,z=first_row(4.0,0.3)))
+    built=build_kernel(plan)
+    k=prepare_query(built,plan,:likelihood)
+    @test Base.invokelatest(k,unconstrain(built.layout,(; a=u,g=1.0))) == -Inf
+    @test isfinite(Base.invokelatest(k,unconstrain(built.layout,(; a=u,g=0.1))))
+end
+
 @testset "transformed cell-latent scale retains density Jacobian and lazy reverse" begin
     f=_aux_cell_scale_fixture(3)
     @test f.built.layout.total == 5

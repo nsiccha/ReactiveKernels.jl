@@ -9767,11 +9767,6 @@ function _lower_argument_use(lhs, slot, value, ctx, predictors, pred_idx,
             return ScalePredictorRef(pname, link)
         end
     end
-    # Bare data in nu/zi uses the same derived-value graph as an inline
-    # expression, so its declared shape is present before data binding.
-    if slot !== :scale && value isa Symbol && value in ctx.data
-        return _extract_column(lhs, Expr(:call, :.*, 1.0, value), ctx)
-    end
     return _lower_argument_value(lhs, slot, value, ctx)
 end
 
