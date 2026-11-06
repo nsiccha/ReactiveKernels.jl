@@ -28,6 +28,9 @@ are recorded in the git history only.
   as `reshape(v, n, 2)`: a cell reads only the packed positions its own rows
   hold. A bare call of inputs alone used to be computed whole.
   ReactiveKernelsPPL 0.1.104 reads its packed blocks both ways.
+- A plate operand inferred as `Union{}`, as the cell of an empty plate can be, no
+  longer raises `Tuple field type cannot be Union{}` while typing the plate's
+  output: the plate's region validates its axis, as for an unknown operand.
 
 ## 0.1.91
 

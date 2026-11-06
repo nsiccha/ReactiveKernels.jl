@@ -3652,6 +3652,9 @@ end
     # Base.combine_axes over a wide operand list can take minutes and gigabytes.
     # Keep every type operand positional as well: a forwarded splat or Base's
     # promote_op leaves runtime inference once Julia's tuple-splat limit is hit.
+    # An operand inferred as bottom has no axes to type: it comes from the cell
+    # of an empty plate, whose element access can only throw.
+    any(j -> !(j in A) && args[j] === Type{Union{}}, 1:N) && return :(Any)
     batched = Any[:(getfield(args, $j)) for j in 1:N if !(j in A)]
     shapes = Any[:(_promote_op(axes, $arg)) for arg in batched]
     quote

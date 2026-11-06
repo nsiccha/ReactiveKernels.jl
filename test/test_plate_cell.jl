@@ -1505,6 +1505,12 @@ _cell_packed_data(m) = (; u = [0.3; [0.1 * ((k * 7) % 5 - 2) for k in 1:10]; 0.7
     end
 end
 
+@testset "plate types: an operand inferred as bottom has no axes to type" begin
+    # The cell of an empty plate, whose element access can only throw.
+    @test ReactiveKernels._plate_array_type(Float64, Val(()), Vector{Float64}, Union{}) === Any
+    @test ReactiveKernels._plate_array_type(Float64, Val(()), Vector{Float64}) === Vector{Float64}
+end
+
 @testset "plate_cell: packed blocks (a literal range view and a reshape) read at the cell's rows" begin
     spec = plate_cell(_cell_packed, :dens; index = :i, locality = :error)
     k = prepare(spec; have = (:u, :g, :w, :i), want = :dens_cell)

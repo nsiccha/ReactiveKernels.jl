@@ -70,22 +70,6 @@ _bound_value_input(name::Symbol) = Symbol("_rkppl_value_", name)
 # inputs at `1:n`, where `n` is the latent's own cell count. Binding
 # supplies `n` under this internal input (`_bind_plate_extents!`).
 _plate_extent_input(name::Symbol) = Symbol("_rkppl_cells_", name)
-# A packed block's range and shape and a data-derived transform bound are
-# binding inputs, never literals of the program: binding supplies them under
-# these internal inputs (`_bind_layout_inputs!`), so one program serves every
-# extent and value of one declaration, and no block's range depends on the
-# extents of the blocks packed before it.
-_layout_position_inputs(name::Symbol) =
-    (Symbol("_ppl_first_", name), Symbol("_ppl_last_", name))
-_layout_axis_input(name::Symbol, axis::Int) = Symbol("_ppl_axis", axis, "_", name)
-_layout_bound_inputs(name::Symbol) = (Symbol("_ppl_lo_", name), Symbol("_ppl_hi_", name))
-_scan_range_inputs(zname::Symbol, j::Int) = _layout_position_inputs(Symbol(zname, :_, j))
-_is_layout_input(name::Symbol) = occursin(r"^_ppl_(first|last|lo|hi|axis\d+)_", String(name))
-# The position inputs an entry's program reads, when its binding supplies them.
-function _bound_layout_positions(plan, name::Symbol)
-    inputs = _layout_position_inputs(name)
-    haskey(plan.columns, first(inputs)) ? inputs : nothing
-end
 # Messages name a data value as its author wrote it, never its internal
 # input (`ReactiveKernelsPPL._bound_value(_rkppl_value_s)` reads `s`).
 _author_names(msg::AbstractString) = replace(String(msg),
@@ -3199,9 +3183,7 @@ function _validate_column_names(plan::StructuralPlan)
         "parameter/assignment/derived/plate names collide with raw columns: $(join(col_overlap, ", "))",
     )
     for n in keys(plan.columns)
-        # Binding supplies the layout inputs itself (a caller's are dropped,
-        # `_bind_data_latest`).
-        _is_layout_input(n) || _check_name_hygiene(n)
+        _check_name_hygiene(n)
     end
     return nothing
 end
@@ -8841,9 +8823,6 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     columns = _checked_columns(columns)
     # Rebinding a binding: what it left absent stays absent unless supplied.
     filter!(p -> _supplied(last(p)), columns)
-    # Layout inputs belong to the binding that computes them (a rebinding
-    # passes its predecessor's columns back).
-    filter!(p -> !_is_layout_input(first(p)), columns)
     frozen_inputs = _bind_frozen!(plan, columns, frozen)
     # Every step below sizes and evaluates with this binding's record, which
     # `frozen` may supply in place of the plan's own (`bind_data(fit, …; frozen)`).
@@ -8934,7 +8913,6 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     _size_absent_conditioned_arrays!(bound)
     _validate_conditioned_values(bound)
     validate_data(bound)
-    _bind_layout_inputs!(bound)
     return bound
 end
 
