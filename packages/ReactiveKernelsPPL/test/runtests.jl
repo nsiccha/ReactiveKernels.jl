@@ -267,6 +267,7 @@ const _PPL_TEST_FILES = (
     "test_partition_labels.jl",
     "test_partition_prefix.jl",
     "test_partition_prefix_strict.jl",
+    "test_partition_batch.jl",
     "test_partition_local_storage.jl",
     "test_partition_value_call.jl",
     "test_shared_value_queries.jl",

@@ -1702,6 +1702,18 @@ those ports, throwing `PartitionSeparabilityError` otherwise.
 ReactiveKernelsPPL builds its partition queries and compact gradients on
 these (`prepare_partition`, `prepare_partition_sampler`).
 
+Those queries also compute a value that reads only shared coordinates once and
+reuse it across partitions, when `partitioned` declares what a partition owns,
+or `partitioned = :none` declares that partitions own no parameter. Strict
+locality then applies to the rest of the program, and a declaration that names
+nothing leaves the value refused. A partition's full gradient runs a pullback
+through the reused values, so sweeping with `partition_value_and_gradient!` runs
+one per partition. `partition_batch_value_and_gradient!(s, g, u, labels; weights)`
+adds each label's derivative to one cotangent of those values and runs one
+pullback, so a batch costs its partitions' footprints plus that pullback. The
+pullback is still whole, so an ordinary whole-model gradient can be cheaper for
+most of a model's partitions.
+
 `plate_partition(…; plan = port)` declares one more HAVE port holding the
 partition's *plan*: the integer bookkeeping of a label (its positions, every
 pushed value's rows, the positions of gathers and captures in their windows,
