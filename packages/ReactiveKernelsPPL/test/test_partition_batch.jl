@@ -292,7 +292,7 @@ end
     end
     batch_bytes(sampler, g, u, labels) =
         @allocated partition_batch_value_and_gradient!(sampler, g, u, labels)
-    extra = map((80, 800)) do n
+    bytes = map((80, 800)) do n
         fx = fixture(SHARED; n, units=8)
         sampler = prepare_partition_sampler(fx.built, fx.bound, :y, fx.u; by=:unit,
             backend=BACKEND, locality=:error, partitioned=:none)
@@ -308,9 +308,14 @@ end
         whole = batch_bytes(sampler, g, fx.u, labels)
         one = batch_bytes(sampler, g, fx.u, labels[1:1])
         sweep = per_label_bytes(sampler, gradients, fx.u, labels)
-        @test whole < sweep / 2
-        whole - one
+        (; n, whole, one, sweep)
     end
+    @info "batch and per-label sweep allocations, 8 units" bytes
+    # With 800 shared entries the sweep's per-label cotangents dominate and the
+    # batch keeps one. With 80, eight cotangents (5 KiB) weigh less than the
+    # batch's own fixed storage, so the comparison would test that instead.
+    @test bytes[2].whole < bytes[2].sweep / 2
+    extra = map(b -> b.whole - b.one, bytes)
     # Each of the 8 units reads 10 and then 100 rows, so a label's own work grows
     # with its rows: 10 times the rows may not cost more than 10 times the bytes,
     # while a cotangent per label would add 8 times the 800-entry shared value.
