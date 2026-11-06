@@ -683,3 +683,24 @@ only, no ReactiveKernels code) isolate the remaining backend limitations:
   does not avoid it. The repair belongs in Enzyme; `test_scan_plate_ad.jl`
   pins the two-or-more-step cases as broken on Julia 1.12 and later and skips
   the one-step case, which corrupts the heap.
+- On Julia 1.10.12, Enzyme `dogfood` `b2bb4cb6` and `33f9dd31` raise
+  `EnzymeRuntimeActivityError` for a compact factor query
+  (`prepare_query_ad(...; coordinates = :support)`) whose body is large and
+  also reads a block through `view(u, r)` beside a plate. The plate's row
+  restriction `view(_, rows::Vector{Int})` reaches Base's default `dataids`,
+  `objectid(A)`, which passes the compact overlay's stack slot to an opaque
+  runtime call, so Enzyme's constant-field proof gives up on the slot. In a
+  large body the tuple of constant operands also stays on the stack, so the
+  overlay's base pointer is a load from that tuple. The mixed-activity handler
+  cannot trace that load to its `Const` argument and raises. A small body
+  stores the argument directly and passes with the same reads, and a selection
+  whose body has no such `view` passes at any size measured. So whether a
+  selection fails depends on its optimized IR, not on one law: a whole-model
+  selection of a mesh `gmrf` field fails where the same field's factor alone
+  passes. The derivative is defined: with the view's `objectid` call removed
+  (a diagnostic control, not adopted) the same query equals the full query. The
+  repair belongs in Enzyme (snag `static-reverse-o-c5bf409d`). No backend-only
+  reproducer exists yet: reductions without RK passed, so
+  `test_density_factor_overlay_views.jl` is the reproducer, and it accepts only
+  the exact gradient or this refusal. No activity configuration or derivative
+  rule is involved, and RK's emission is unchanged.
