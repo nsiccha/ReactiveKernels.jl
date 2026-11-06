@@ -440,7 +440,10 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
     for (i, node) in enumerate(nodes)          # post-order: kids come first
         holds[i] |= any(k -> holds[k], node.kids)
     end
-    output = only(r.outputs)
+    # An authored destructuring has several outputs. Its parts have one value
+    # each, and its root keeps every output: the statement still binds its names
+    # from one call. The first output only names the parts.
+    label = first(r.outputs).name
     token = kernel_sourceop_token(r.op)
     mod = _kernel_endpoint_source_module(r.op)
     ignored = native.ignored
@@ -452,7 +455,7 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
     end
     function emit!(i)
         node = nodes[i]
-        value = value!(g, Symbol(output.name, :_part, i), Any)
+        value = value!(g, Symbol(label, :_part, i), Any)
         part = if dataonly[i] || !holds[i]
             Recipe(fresh(), Tuple(r.inputs[p] for p in node.own), (value,),
                    operation(Symbol(:_part, i), :fused, native.wholes[i],
@@ -467,7 +470,7 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
                          (value,),
                          op,
                          r.cost, nothing, false, node.body),
-                  node.direct, node.kids, Symbol(output.name, :_part, i))
+                  node.direct, node.kids, Symbol(label, :_part, i))
         end
         push!(recipes, part)
         readable[part.id] = part
@@ -480,7 +483,7 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
     root = Recipe(r.id, (Tuple(r.inputs[p] for p in top.direct)..., kids...),
                   r.outputs,
                   rootop, r.cost, nothing, false, top.body)
-    root = maps!(root, top.direct, top.kids, Symbol(output.name, :_root))
+    root = maps!(root, top.direct, top.kids, Symbol(label, :_root))
     push!(recipes, root)
     readable[r.id] = root
     recipes
@@ -1628,20 +1631,27 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     lanes_value = Dict{Symbol,Value}()
     expansion = Recipe[]
     arm_outputs = Value[]
-    # An arm with its own graph that holds work over live shared plate
-    # arguments runs as that graph's recipes, as the native shared-condition
-    # lowering runs it (`_plate_shared_branch`), so that work is hoisted above
-    # the lane loop instead of running inside an opaque per-lane arm call.
+    # An arm with its own graph that holds work over shared plate arguments or
+    # bound values runs as that graph's recipes, as the native shared-condition
+    # lowering runs it (`_plate_shared_branch`), so that work runs once, above
+    # the lane loop or at preparation, instead of inside an opaque per-lane arm
+    # call. A value that reads bound data alone is as good as shared to the
+    # arm's graph: it does not change between calls.
     branch_index = findfirst(r -> r === branch_recipe, inner.recipes)
     names = _recipe_source_names(branch_recipe)
     root_positions = Dict(canon_id(inner.graph, v.id) => position
                           for (position, v) in enumerate(inner.have))
+    dependencies = _plate_dependencies(inner, Set(keys(root_positions))).values
     _, shared = _plate_branch_source_inputs(inner, branch_recipe, atomic_inputs,
-        recipe.inputs, _plate_dependencies(inner, Set(keys(root_positions))).values,
-        root_positions)
+        recipe.inputs, dependencies, root_positions)
+    bound_roots = intersect(Set(keys(root_positions)), keys(bound))
+    for (name, v) in zip(names, branch_recipe.inputs)
+        issubset(get(dependencies, canon_id(inner.graph, v.id), Set{ValueId}()),
+                 bound_roots) && push!(shared, name)
+    end
     graphs = _plate_branch_source_graphs(branch_recipe, names, shared)
     lane_roots = intersect(lane_values, keys(root_positions))
-    live_roots = setdiff(Set(keys(root_positions)), lane_roots, keys(bound))
+    shared_roots = setdiff(Set(keys(root_positions)), lane_roots)
     cell_ids = Set(r.id for r in inner.recipes)
     readable = Dict(r.id => source for (r, source) in
                     zip(inner.recipes, op.kernel.lowered_recipes))
@@ -1656,7 +1666,8 @@ Base.@nospecializeinfer function _partition_plate_recipe(
             getfield(graphs, side === :then ? :then_spec : :else_spec) === nothing ?
             nothing : _plate_branch_arm_kernel(inner, branch_index, side, graphs, names)
         spliced === nothing ||
-            _partition_arm_hoists(spliced.plan, cell_ids, lane_roots, live_roots) ||
+            _partition_arm_hoists(spliced.plan, cell_ids, lane_roots, shared_roots,
+                                  bound_roots) ||
             (spliced = nothing)
         kernel = if spliced === nothing
             if anchored
@@ -1767,14 +1778,22 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     (; expansion, rewrite = nothing)
 end
 
-# Whether a spliced arm hoists work: one of its recipes reads a live shared
-# plate argument and no lane value. Otherwise the arm's own closure is kept,
-# whose constants stay compile-time literals inside each lane's call.
-function _partition_arm_hoists(variant::Plan, cell_ids, lane_roots, live_roots)
-    roots = _plate_dependencies(variant, union(lane_roots, live_roots)).recipes
+# Whether a spliced arm runs less per lane than its closure: one of its recipes
+# reads a shared value and no lane value, so it runs once (above the lane loop,
+# or at preparation when the value is bound); reads bound values alone, so
+# preparation caches it per lane; or computes from literals what the compiler
+# does not fold, such as a log normalizer's `logbeta`. Base's functions over the
+# closure's literals, such as `log(0.2)`, do fold, so an arm with no other such
+# work keeps its closure, whose constants stay compile-time literals inside each
+# lane's call; splicing those slowed a two-component mixture cell by 8%.
+function _partition_arm_hoists(variant::Plan, cell_ids, lane_roots, shared_roots,
+                               bound_roots)
+    roots = _plate_dependencies(variant, union(lane_roots, shared_roots)).recipes
     any(eachindex(variant.recipes)) do i
-        !(variant.recipes[i].id in cell_ids) &&
-            isdisjoint(roots[i], lane_roots) && !isdisjoint(roots[i], live_roots)
+        q = variant.recipes[i]
+        q.id in cell_ids && return false
+        isempty(roots[i]) ? _shared_call_op(q.op) && _kernel_split_worthwhile(q.source) :
+            isdisjoint(roots[i], lane_roots) || issubset(roots[i], bound_roots)
     end
 end
 

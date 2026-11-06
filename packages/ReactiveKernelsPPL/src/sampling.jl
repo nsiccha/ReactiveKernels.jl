@@ -336,7 +336,7 @@ _external_keywords(args) = Any[k for a in _external_authored_arguments(args)
 _external_constructor(args) = _external_call(args) ? args.rhs.args[1] : args.rhs
 _sampling_rhs_broadcast(rhs::Union{AbstractArray,Tuple,Ref}) = rhs
 _sampling_rhs_broadcast(rhs) = Ref(rhs)
-_external_u(e) = :(unconstrained[$(e.offset):$(e.offset + e.size - 1)])
+_external_u(e) = :(unconstrained[$(_entry_range(e))])
 _external_geometry_name(e) = Symbol(:_ppl_geometry_, e.name)
 # The authored argument expressions, rebuilt as source that evaluates to them.
 # That source reaches every object holding the program, the layout and the plan

@@ -3822,7 +3822,7 @@ const _KERNEL_SPLIT_CHEAP = Set{Symbol}([
     :<, :<=, :>, :>=, :(==), :!=, :!, :&, :|, :xor, :sign, :copysign, :flipsign,
     :zero, :one, :oftype, :convert, :float, :Float64, :Float32, :Float16, :Int,
     :Int64, :Int32, :Bool, :identity, :first, :last, :getindex, :getfield,
-    :length, :size, :tuple])
+    :length, :size, :tuple, :(:)])
 
 _kernel_split_callee_name(callee::Symbol) = callee
 _kernel_split_callee_name(callee::GlobalRef) = callee.name

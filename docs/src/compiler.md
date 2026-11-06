@@ -746,11 +746,19 @@ or a bound-only cell value that the pass has already evaluated per lane.
 A lane-invariant condition selects its arm without splitting.
 
 An arm with its own graph (a plain arm expression, authored as a cell of its
-own as described below) becomes that graph's recipes in its plate, as in the
-native shared-condition lowering. Its work over shared plate arguments
-therefore runs once per call, above the lane loop, and only when some lane
-takes the arm. An arm without a graph, or one reading no lane value, runs as
-its closure on each of its lanes.
+own as described below) that holds work over shared plate arguments or bound
+values becomes that graph's recipes in its plate, as in the native
+shared-condition lowering. Its work over a live shared argument therefore runs
+once per call, above the lane loop, and only when some lane takes the arm. Its
+work over bound values runs at preparation, on the arm's lanes only: under
+`noise > 0 ? normal(mu, noise).logpdf(y) : -Inf` with `noise` and `y` bound,
+`log(noise)` is one value of the binding, read at run time like any other bound
+value, and a nonpositive `noise` takes the fallback arm without evaluating it.
+Work over literals alone that the compiler does not fold, such as the `logbeta`
+of a written `student_t(4.0, mu, 0.2)`, runs there as well. Any other arm runs as
+its closure on each of its lanes, which keeps its literal constants compile-time
+constants, as in `normal(mu, 0.2)`: an arm without a graph, an arm reading no lane
+value, and an arm whose graph holds no such work.
 
 The prepared program contains no branch for that condition, so no backend
 receives one:
@@ -786,7 +794,9 @@ enclosing them, and that call more than cheap arithmetic (comparison,
 Under `bound=`, each maximal one whose arguments are all bound becomes a recipe
 of its own. At top level it joins the data-only prefix and runs once per
 binding; in a plate cell it is cached per lane like any bound-only cell value.
-The rest of the recipe reads its value.
+The rest of the recipe reads its value. A destructuring splits the same way:
+`(s, q) = f(exp.(x), a)` under `bound = (; x)` computes `exp.(x)` once per
+binding and still binds both names from one call of `f` per evaluation.
 
 ```julia
 @kernel binomial_loglik(logit, y, n) = begin
@@ -1532,10 +1542,12 @@ Pass `partitioned = :z` to `prepare_compact_cell_ad`, or
 `partitioned = :z, u0 = u` to `prepare_cell_factors`, when `z` contains the
 integrated coordinates. Whole-array helpers that read only shared coordinates
 are cached before strict row lowering. Updating integrated coordinates reuses
-the cache; updating shared coordinates refreshes it. Helpers that also read
-integrated coordinates remain subject to the ordinary locality check.
+the cache, and so does updating a shared coordinate those helpers do not read;
+updating one they read refreshes it. Helpers that also read integrated
+coordinates remain subject to the ordinary locality check.
 
-The compact derivative selection then contains only integrated coordinates.
+The compact derivative selection then contains only integrated coordinates. A
+shared coordinate the cell reads at rows comes from the packed base.
 Use these conditional derivatives for local gradients, Hessian blocks and
 third contractions. To differentiate those quantities with respect to shared
 coordinates, accumulate their frontier cotangents across the complete sweep:
@@ -1566,7 +1578,8 @@ Within the callback, ordinary local derivative verbs can take `batch` in
 place of `base`, for example
 `ad_gradient_hvp_and_third(q, (direction,), batch, active, indices, cell)`.
 This uses the pass's copied point and checks its cache generation in constant
-time; raw-vector calls scan shared coordinates to detect changes. Ordinary
+time; raw-vector calls scan the coordinates the cache reads to detect changes,
+or every shared coordinate when nothing is cached. Ordinary
 verbs do not contribute to the accumulated gradient. This also supports
 local conditional solves at a fixed shared point before accumulating their
 mixed derivative contributions.
@@ -1583,8 +1596,10 @@ the full shared dependency graph.
 
 Each family and its pullback serve one caller at a time. A callback failure
 leaves the output gradient unchanged; the next pass resets the accumulation
-storage. Changing shared coordinates through another operator during the
-callback invalidates the pass and throws.
+storage. Changing a coordinate the cache reads through another operator during
+the callback invalidates the pass and throws. A shared coordinate it does not
+read reaches a cell only through the pass's copied point, so changing it
+elsewhere leaves the pass valid.
 
 ### Fixed-point values and local structural footprints
 
@@ -1620,8 +1635,9 @@ Value and local-footprint queries also accept a compatible active
 remain independent; the caller supplies their chain rule as above.
 
 The batch expires when its callback returns or throws. It rejects operators
-from another cache and shared-coordinate changes through another operator.
-Raw-vector calls remain available and scan shared coordinates on each call.
+from another cache and changes through another operator to a coordinate the
+cache reads, as for a derivative pass above.
+Raw-vector calls remain available and scan those coordinates on each call.
 Each owner and its operators serve one concurrent caller.
 
 ### A partition of plates by a key

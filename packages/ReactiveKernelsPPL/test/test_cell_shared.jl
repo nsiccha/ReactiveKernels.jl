@@ -52,6 +52,42 @@ const _CS_VARYING = @rkppl begin
     field = _cs_field(grid, beta + sum(z))
     y .~ Poisson.(field)
 end
+# The prefix caches sigma's transform; `a` is shared too, but only the residual
+# reads it, at rows. In both orders the prefix reads fewer coordinates than are
+# shared, and which one it reads comes first in the second model.
+const _CS_READS_FIRST = @rkppl begin
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    z[levels(id)] .~ Normal.(0, 1)
+    mu = a .+ z[id] .* grid
+    y .~ Normal.(mu, sigma)
+end
+const _CS_READS_SECOND = @rkppl begin
+    a ~ Normal(0, 1)
+    sigma ~ Exponential(1)
+    z[levels(id)] .~ Normal.(0, 1)
+    mu = a .+ z[id] .* grid
+    y .~ Normal.(mu, sigma)
+end
+const _CS_READS_BLOCK = @rkppl begin
+    sigma ~ Exponential(1)
+    w[1:2] .~ Normal.(0, 1)
+    z[1:4] .~ Normal.(0, 1)
+    @plate for k in eachindex(y)
+        y[k] ~ Normal(w[grp[k]] + sum(z[rows[k]]), sigma)
+    end
+end
+const _CS_READS_SUM = @rkppl begin
+    sigma ~ Exponential(1)
+    w[1:2] .~ Normal.(0, 1)
+    z[levels(id)] .~ Normal.(0, 1)
+    rate = exp.(z[id])
+    @plate for k in eachindex(y)
+        y[k] ~ Normal(log1p(sum(rate[rows[k]])) + w[grp[k]], sigma)
+    end
+end
+@isdefined(_static_enzyme) || include("static_enzyme.jl")
+
 const _CS_REVERSE = AutoEnzyme(; mode = Enzyme.Reverse)
 const _CS_SECOND = SecondOrder(_CS_REVERSE, AutoEnzyme(; mode = Enzyme.Forward))
 const _CS_THIRD = SecondOrder(_CS_SECOND, AutoEnzyme(; mode = Enzyme.Forward))
@@ -324,4 +360,196 @@ end
     @test_throws ReactiveKernels.PartitionLocalityError prepare_compact_cell_ad(
         prepare_ad_third,varying_built,varying,:y,zeros(4),[2],_CS_THIRD,([0.6],);
         partitioned=:z,locality=:error)
+end
+
+@testset "A prefix reads only some shared coordinates: read at $read, not at $unread" for
+        (model, read, unread) in ((_CS_READS_FIRST, 1, 2), (_CS_READS_SECOND, 2, 1))
+    data = (; id = repeat(1:4, inner = 2), grid = sin.(1:8), y = cos.(1:8))
+    bound = model(; data.id, data.grid) | (; data.y)
+    built = build_kernel(bound)
+    u = collect(range(-0.3, 0.4; length = built.layout.total))
+    local_position(i) = 2 + data.id[i]
+    residual(point, i) = data.y[i] - point[unread] - point[local_position(i)] * data.grid[i]
+    density(point, i) = logpdf(Normal(0, exp(point[read])), residual(point, i))
+    moved(position) = (point = copy(u); point[position] += 0.25; point)
+
+    q = prepare_cell_query(built, bound, :y; partitioned = :z, locality = :ignore)
+    # The shape under test: without it, nothing below exercises a partial read.
+    @test q.shared.cache.positions == [read]
+    @test q(u, 1) ≈ density(u, 1)
+    before, values = q.shared.generation, q.shared.cache.values
+    for i in (1, 1, 2, 8)
+        @test q(u, i) ≈ density(u, i)
+    end
+    @test q.shared.generation == before
+    # A local or residual-only shared coordinate changes the value, not the cache.
+    for position in (3, unread)
+        @test q(moved(position), 1) ≈ density(moved(position), 1)
+        @test q.shared.generation == before
+        @test q.shared.cache.values === values
+    end
+    @test q(moved(read), 1) ≈ density(moved(read), 1)
+    @test q.shared.generation == before + 1
+    @test q.shared.cache.values !== values
+    @test q(u, 1) ≈ density(u, 1)
+
+    fp = partition_footprint_kernel(q; shared = false)
+    for _ in 1:2
+        @test fp(u, 1).unconstrained == [3]
+    end
+    # A live pass reads its own copied point and the cache. The residual-only
+    # coordinate reaches neither, so changing it elsewhere leaves the pass exact.
+    result = with_cell_batch(q, u) do batch
+        @test q(batch, 1) ≈ density(u, 1)
+        @test q(u, 2) ≈ density(u, 2)
+        @test q(moved(unread), 1) ≈ density(moved(unread), 1)
+        @test q(batch, 1) ≈ density(u, 1)
+        @test fp(batch, 1).unconstrained == [3]
+        :result
+    end
+    @test result === :result
+    @test_throws ContractValidationError with_cell_batch(q, u) do batch
+        q(moved(read), 1)
+        q(batch, 1)
+    end
+
+    c = prepare_compact_cell_ad(prepare_ad_third, built, bound, :y, u, [3],
+        _CS_THIRD, ([0.6],); partitioned = :z, locality = :ignore)
+    @test c.shared.cache.positions == [read]
+    @test_throws ContractValidationError prepare_compact_cell_ad(prepare_ad_third,
+        built, bound, :y, u, [unread], _CS_THIRD, ([0.6],);
+        partitioned = :z, locality = :ignore)
+    # Analytic local derivatives of each cell's density in its own z.
+    local_gradient(point, i) = residual(point, i) * data.grid[i] / exp(2point[read])
+    local_curvature(i, point) = -data.grid[i]^2 / exp(2point[read])
+    for i in (1, 1, 2)
+        g, (hv,), (tv,) = ad_gradient_hvp_and_third(c, ([0.6],),
+            u, u[[local_position(i)]], [local_position(i)], i)
+        @test only(g) ≈ local_gradient(u, i)
+        @test only(hv) ≈ 0.6 * local_curvature(i, u)
+        @test only(tv) ≈ 0.0 atol = 1e-12
+    end
+    p = prepare_cell_pullback(c, _CS_REVERSE, u)
+    weights = [0.3, -0.4, 1.2, 0.8, -0.5, 0.7, 0.2, -1.1]
+    contraction(point, order) = sum(eachindex(data.y)) do i
+        weights[i] * (order == 0 ? density(point, i) :
+            order == 1 ? 0.6 * local_gradient(point, i) : 0.6^2 * local_curvature(i, point))
+    end
+    for (order, backend) in ((0, _CS_REVERSE), (1, _CS_SECOND), (2, _CS_THIRD))
+        a = prepare_cell_accumulator(c, backend, u; order)
+        gradient = zeros(length(u))
+        for point in (u, moved(unread), moved(read))
+            cell_pullback!(gradient, p, point) do batch
+                for i in eachindex(data.y)
+                    accumulate_cell!(batch, a, order == 0 ? nothing : [0.6], weights[i],
+                        point[[local_position(i)]], [local_position(i)], i)
+                end
+            end
+            epsilon = 1e-5
+            fd = map(eachindex(point)) do j
+                hi, lo = copy(point), copy(point)
+                hi[j] += epsilon; lo[j] -= epsilon
+                (contraction(hi, order) - contraction(lo, order)) / (2epsilon)
+            end
+            @test gradient ≈ fd rtol = 2e-8 atol = 2e-8
+        end
+    end
+end
+
+@testset "A prefix reads only some shared coordinates beside a local block read at rows" begin
+    data = (; grp = [1, 2, 1], rows = [[1, 2], [3, 4], [2, 3]], y = [0.2, 0.4, 0.0])
+    bound = _CS_READS_BLOCK(; data.grp, data.rows) | (; data.y)
+    built = build_kernel(bound)
+    u = [0.2, -0.1, 0.3, 0.4, 0.1, -0.2, 0.25]
+    c = prepare_compact_cell_ad(prepare_ad, built, bound, :y, u, [4, 5], _CS_REVERSE;
+        partitioned = :z => collect(1:4), locality = :ignore)
+    @test c.shared.cache.positions == [1]
+    # `_local_cell_rows` picks each row from the gathered base or the active
+    # vector (static_enzyme.jl). Dogfood validation requires the gradient.
+    _static_enzyme() do
+        for i in (1, 1, 2, 3)
+            selection = 3 .+ data.rows[i]
+            mu = u[1 + data.grp[i]] + sum(u[selection])
+            value, gradient = ad_value_and_gradient(c, u, u[selection], selection, i)
+            @test value ≈ logpdf(Normal(mu, exp(u[1])), data.y[i])
+            @test gradient ≈ fill((data.y[i] - mu) / exp(2u[1]), 2)
+        end
+    end
+end
+
+@testset "Factors whose prefix reads only some shared coordinates" begin
+    data = (; id = collect(1:4), grp = [1, 2, 1], rows = [[1, 2, 2], [3, 4], Int[]],
+        y = [0.2, 0.4, 0.0])
+    bound = _CS_READS_SUM(; data.id, data.grp, data.rows) | (; data.y)
+    built = build_kernel(bound)
+    u = [0.2, -0.1, 0.3, 0.4, 0.1, -0.2, 0.25]
+    f = prepare_cell_factors(built, bound, :y; partitioned = :z, u0 = u, locality = :ignore)
+    # The shape under test: the outer reads `w` at rows, the prefix only sigma.
+    @test f.shared.cache.positions == [1]
+    term = prepare_cell_factor_query(f, 1)
+    outer = prepare_cell_factor_query(f, :outer)
+    rate(point) = exp.(point[4:7])
+    total(point, i) = sum(rate(point)[data.rows[i]]; init = 0.0)
+    location(point, s, i) = log1p(s) + point[1 + data.grp[i]]
+    outer_density(point, s, i) = logpdf(Normal(location(point, s, i), exp(point[1])), data.y[i])
+    function check(point)
+        for i in 1:3
+            s = total(point, i)
+            @test outer(point, [s], i) ≈ outer_density(point, s, i)
+            for (t, row) in enumerate(data.rows[i])
+                @test term(point, i, t) ≈ rate(point)[row]
+            end
+        end
+    end
+    check(u); check(u)
+    before = f.shared.generation
+    residual_only = copy(u); residual_only[2] += 0.25
+    check(residual_only)
+    @test f.shared.generation == before
+    read = copy(u); read[1] += 0.25
+    check(read)
+    @test f.shared.generation == before + 1
+    s = total(u, 1)
+    with_cell_batch(f, u) do batch
+        @test outer(batch, [s], 1) ≈ outer_density(u, s, 1)
+        @test outer(residual_only, [s], 1) ≈ outer_density(residual_only, s, 1)
+        @test outer(batch, [s], 1) ≈ outer_density(u, s, 1)
+    end
+
+    q = prepare_cell_factor_ad(prepare_ad_third, f, 1, u, [4], _CS_THIRD, ([0.6],))
+    for (i, t, row) in ((1, 1, 1), (1, 1, 1), (2, 1, 3))
+        g, (hv,), (tv,) = ad_gradient_hvp_and_third(q, ([0.6],), u, u[[row + 3]], [row + 3], i, t)
+        @test only(g) ≈ rate(u)[row]
+        @test only(hv) ≈ rate(u)[row] * 0.6
+        @test only(tv) ≈ rate(u)[row] * 0.6^2
+    end
+    a = prepare_cell_accumulator(q, _CS_THIRD, u; order = 2)
+    p = prepare_cell_pullback(f, _CS_REVERSE, u)
+    gradient = zeros(length(u))
+    cell_pullback!(gradient, p, u) do batch
+        for (t, row) in enumerate(data.rows[1])
+            accumulate_cell!(batch, a, [0.6], 1.0, u[[row + 3]], [row + 3], 1, t)
+        end
+    end
+    @test gradient[4:7] ≈ [1, 2, 0, 0] .* rate(u) .* 0.6^2
+    @test all(iszero, gradient[1:3])
+
+    # Sum values are independent: this is the mixed derivative at a fixed `s`, so
+    # sigma comes through the prefix's pullback and `w` from the packed base.
+    directions = (([0.6], Float64[]),)
+    qouter = prepare_cell_factor_ad(prepare_ad_third, f, :outer, u, Int[], _CS_THIRD, directions)
+    gouter, _, _ = ad_gradient_hvp_and_third(qouter, directions, u, [s], Float64[], Int[], 1)
+    @test only(first(gouter)) ≈ (data.y[1] - location(u, s, 1)) / exp(2u[1]) / (1 + s)
+    curvature(point) = 0.6^2 * -(1 + data.y[1] - location(point, s, 1)) / (exp(2point[1]) * (1 + s)^2)
+    aouter = prepare_cell_accumulator(qouter, _CS_THIRD, u; order = 2)
+    cell_pullback!(gradient, p, u) do batch
+        accumulate_cell!(batch, aouter, only(directions), 1.0, [s], Float64[], Int[], 1)
+    end
+    epsilon = 1e-5
+    fd = map(eachindex(u)) do j
+        hi, lo = copy(u), copy(u)
+        hi[j] += epsilon; lo[j] -= epsilon
+        (curvature(hi) - curvature(lo)) / (2epsilon)
+    end
+    @test gradient ≈ fd rtol = 2e-8 atol = 2e-8
 end

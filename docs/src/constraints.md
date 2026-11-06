@@ -34,9 +34,11 @@ The primary instruction is the user's September 22 decision `1rvu25u`, recorded
 under `ReactiveKernels:brm:tgi:reactant:no-unroll`, decision
 `2026-09-22T08-49-18-901-1rvu25u`: retain real loops or batched-array structure.
 Retain a runtime loop, scan, or equivalent batched array structure. Stateful
-iteration needs the appropriate carried state and output storage. Shapes may
-specialize an executable; the lowering must not duplicate the body according
-to those shapes or values. Native execution retains ordinary iteration.
+iteration needs the appropriate carried state and output storage. A backend
+that compiles for concrete shapes may specialize its own executable; the
+lowering must not duplicate the body according to those shapes or values, and
+the program it generates keeps them as data ("Keep sizes and numeric values out
+of generated programs" below). Native execution retains ordinary iteration.
 Fixed structural algebra, such as the scalar entries of an intrinsically
 three-compartment operator, is distinct
 from data-derived iteration and may be expanded.
@@ -140,6 +142,29 @@ values alone (`:values`) (user decision
 and its comment: "maybe have different levels, which may then include either
 everything rk, or everything everything?").
 
+## Keep sizes and numeric values out of generated programs
+
+The user's November 6 direction (`ODLPlaus:precompile`, decision
+`2026-11-06T01-09-46-212-0ikeidi`, feedback 1) governs every ReactiveKernels,
+ReactiveKernelsPPL and BayesianRegressionModels model: "THIS HOLDS FOR ALL RK /
+BRM MODELS! BAKING IN SIZE OR EVEN FLOAT CONSTANTS INTO THE MODEL IS COMPLETELY
+IDIOTIC AND NEEDS TO BE AVOIDED AT BASICALLY ALL COST!" It followed the same
+user's request about a dataset-sized literal extent, "Can we please make sure
+this never happens again....". **Keep sizes and numeric values, including
+floating-point prior and configuration values, as runtime model inputs; do not
+splice them into model source or its specialization.** A backend that compiles
+for concrete shapes still specializes its own executable; that is the backend's
+compilation, not the model's source, and it binds no generated program to a size.
+
+RKPPL's generated program reads packed positions, axis lengths, scan lengths,
+ordered level counts and data-derived transform bounds from the data it already
+has, so one program serves every extent and value of one declaration
+(`test_bound_array_extents.jl`). Known remaining paths, which are limitations
+to fix and not precedents, are listed under ReactiveKernelsPPL 0.1.108 in its
+changelog. A prepared type may still depend on which data-bound branch arms
+have lanes ("Data-bound branches in plate cells"), which the lazy-branch
+constraint above requires.
+
 ## Derivative rules come from one mathematical graph, never by hand
 
 **Do not write backend-specific derivative rules as durable code, and never
@@ -200,8 +225,8 @@ Interpret acceptance evidence according to what it establishes:
 
 Compare retained control-flow regions, nonlinear work and indexing across all
 tested data sizes, and keep complete optimized operation inventories as
-diagnostics. Shape specialization may share constants, simplify scalar
-arithmetic or simplify singleton derivative tapes, including an identity
+diagnostics. A backend's own shape specialization may share constants, simplify
+scalar arithmetic or simplify singleton derivative tapes, including an identity
 broadcast of one scalar tape index, so small shapes need not
 have identical raw inventories. The bounded-inventory criterion `1arw7kp` was
 an agent engineering choice following the user's scoped no-preference
@@ -683,3 +708,24 @@ only, no ReactiveKernels code) isolate the remaining backend limitations:
   does not avoid it. The repair belongs in Enzyme; `test_scan_plate_ad.jl`
   pins the two-or-more-step cases as broken on Julia 1.12 and later and skips
   the one-step case, which corrupts the heap.
+- On Julia 1.10.12, Enzyme `dogfood` `b2bb4cb6` and `33f9dd31` raise
+  `EnzymeRuntimeActivityError` for a compact factor query
+  (`prepare_query_ad(...; coordinates = :support)`) whose body is large and
+  also reads a block through `view(u, r)` beside a plate. The plate's row
+  restriction `view(_, rows::Vector{Int})` reaches Base's default `dataids`,
+  `objectid(A)`, which passes the compact overlay's stack slot to an opaque
+  runtime call, so Enzyme's constant-field proof gives up on the slot. In a
+  large body the tuple of constant operands also stays on the stack, so the
+  overlay's base pointer is a load from that tuple. The mixed-activity handler
+  cannot trace that load to its `Const` argument and raises. A small body
+  stores the argument directly and passes with the same reads, and a selection
+  whose body has no such `view` passes at any size measured. So whether a
+  selection fails depends on its optimized IR, not on one law: a whole-model
+  selection of a mesh `gmrf` field fails where the same field's factor alone
+  passes. The derivative is defined: with the view's `objectid` call removed
+  (a diagnostic control, not adopted) the same query equals the full query. The
+  repair belongs in Enzyme (snag `static-reverse-o-c5bf409d`). No backend-only
+  reproducer exists yet: reductions without RK passed, so
+  `test_density_factor_overlay_views.jl` is the reproducer, and it accepts only
+  the exact gradient or this refusal. No activity configuration or derivative
+  rule is involved, and RK's emission is unchanged.

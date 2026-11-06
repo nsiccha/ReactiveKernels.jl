@@ -163,10 +163,21 @@ struct LayoutEntry
     dims::Vector{Int} # declared-array axes, including :cholesky_corr (else empty)
     scan_blocks::Vector{LayoutEntry} # structural latent-family blocks (else empty)
     sampling::Union{Nothing,NamedTuple} # external RHS and its geometry
+    # How the generated program reads what the data determine, so that it does
+    # not depend on this binding's sizes or numbers (`_layout_reads`). `positions`
+    # is the packed range as `(first, last)`, each a literal or a name; `nothing`
+    # reads the literal `offset:offset + size - 1`. `axes` is the packed block's
+    # shape when an axis reads data. `bound_reads` is the authored data expression
+    # of `lo`/`hi`, which keep their numbers for host transforms.
+    positions::Union{Nothing,NTuple{2,Union{Int,Symbol}}}
+    axes::Union{Nothing,Vector{Any}}
+    bound_reads::NTuple{2,Any}
     LayoutEntry(kind, predictor, name, labels, offset, size, transform, lo, hi,
-            dims, scan_blocks, sampling) =
+            dims, scan_blocks, sampling, positions = nothing, axes = nothing,
+            bound_reads = (nothing, nothing)) =
         new(kind, predictor, name, labels, offset, size, transform,
-            _layout_bound(lo), _layout_bound(hi), dims, scan_blocks, sampling)
+            _layout_bound(lo), _layout_bound(hi), dims, scan_blocks, sampling,
+            positions, axes, bound_reads)
 end
 
 # Host transforms (`constrain`, `unconstrain`, `logjac` and the exported
@@ -218,6 +229,7 @@ function _scan_layout_entry(plan, s, name, offset, T)
         width == 0 && continue
         args = NamedTuple{Tuple(Symbol(:arg, i) for i in eachindex(st.args))}(Tuple(st.args))
         transform, lo, hi = _entry_transform(st.family, st.support, args)
+        bound_reads = (nothing, nothing)
         if transform in (:interval, :floored, :upper)
             # One block transforms every step with the same bounds.
             locals = Set(step.target for step in s.step if !step.indexed)
@@ -227,11 +239,14 @@ function _scan_layout_entry(plan, s, name, offset, T)
                 _fail(s.label, "scan prior bounds that vary by step (reading " *
                     "a carried array, the loop index or a step local) are not " *
                     "supported yet")
+            authored = (lo, hi)
             lo, hi = _layout_bound(plan, lo), _layout_bound(plan, hi)
+            bound_reads = _data_bound_reads(authored, lo, hi)
         end
         blockname = Symbol(name, :_block_, length(blocks) + 1)
         push!(blocks, LayoutEntry(:plate, nothing, blockname, Symbol[], pos,
-            width, transform, lo, hi))
+            width, transform, lo, hi, Int[], LayoutEntry[], nothing, nothing, nothing,
+            bound_reads))
         pos += width
     end
     n = pos - offset
@@ -250,9 +265,17 @@ struct LayoutTable
     bound_exprs::Dict{Symbol,Any}
     # The packed array of a dotted cell latent => (authored name, dimensions).
     cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}}
-    # The packed array of a joint cell latent => its caller-owned geometry.
+    # The joint cell latent's packed array => its caller-owned geometry.
     cell_geometries::Dict{Symbol,CellGeometry}
+    # The program's named data-derived positions and axis lengths (`_layout_reads`).
+    reads::Vector{Expr}
 end
+LayoutTable(entries::Vector{LayoutEntry}, total::Int, paths::Dict{Symbol,Tuple{Vararg{Symbol}}},
+        bound_values::Dict{Symbol,Any}, bound_exprs::Dict{Symbol,Any},
+        cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}},
+        cell_geometries::Dict{Symbol,CellGeometry}) =
+    LayoutTable(entries, total, paths, bound_values, bound_exprs, cell_latents,
+        cell_geometries, Expr[])
 LayoutTable(entries::Vector{LayoutEntry}, total::Int, paths::Dict{Symbol,Tuple{Vararg{Symbol}}},
         bound_values::Dict{Symbol,Any}, bound_exprs::Dict{Symbol,Any},
         cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}}) =
@@ -517,6 +540,7 @@ function assign_layout(plan::StructuralPlan)
     # simplexes reuse the `:cholesky_corr` / `:vector` edges, elementwise
     # arrays pack one `:array` block each.
     offset = _array_layout_entries!(entries, plan, offset)
+    entries, reads = _layout_reads(plan, entries)
     # A dotted cell latent's packed array draws under its authored name.
     paths = _scope_layout_paths(plan)
     for (site, (name, _)) in plan.cell_latents
@@ -533,7 +557,7 @@ function assign_layout(plan::StructuralPlan)
         merge!(Dict{Symbol,Any}(plan.columns), _definition_memo(plan),
             pairs(_frozen_graph_values(plan))),
         Dict{Symbol,Any}(a.name => a.expr for a in _definitions(plan)),
-        plan.cell_latents, plan.cell_geometries)
+        plan.cell_latents, plan.cell_geometries, reads)
 end
 
 """Constrained length of a `:vector` entry: simplex packs K−1 logits
@@ -1552,6 +1576,281 @@ Packed-slice read (`view(unconstrained, lo:hi)`, `@ppl` vector shape).
 block_read(offset::Int, width::Int) =
     :(view(unconstrained, $offset:$(offset + width - 1)))
 
+# The packed range an entry's program reads.
+_entry_range(e::LayoutEntry) = e.positions === nothing ?
+    :($(e.offset):$(e.offset + e.size - 1)) :
+    :($(e.positions[1]):$(e.positions[2]))
+_entry_view(e::LayoutEntry) = :(view(unconstrained, $(_entry_range(e))))
+
+# Sizes and data-derived numbers stay data in the generated program, never this
+# binding's literals (user principle
+# `ODLPlaus:precompile/decisions/2026-11-06T01-09-46-212-0ikeidi`). Layout reads
+# them from the values the program already has: a block sized `1:n` is
+# `view(unconstrained, 1:n)`, and the next block starts after it. One program
+# then serves every extent and value of one declaration; a raw cut supplies the
+# same data it always did. A literal extent stays a literal, so an entry whose
+# position and size depend on no data reads exactly as before.
+#
+# A read is an `Int`, a name, or an expression over data. Literal arithmetic
+# folds, so a read stays as plain as the authored extent.
+_read_add(a::Int, b::Int) = a + b
+_read_add(a, b::Int) = b == 0 ? a : b < 0 ? :($a - $(-b)) : :($a + $b)
+_read_add(a::Int, b) = a == 0 ? b : :($a + $b)
+_read_add(a, b) = :($a + $b)
+_read_mul(a::Int, b::Int) = a * b
+_read_mul(a::Int, b) = a == 0 ? 0 : a == 1 ? b : :($a * $b)
+_read_mul(a, b::Int) = _read_mul(b, a)
+_read_mul(a, b) = :($a * $b)
+_read_length(x) = Expr(:call, GlobalRef(Base, :length), x)
+_read_size(x, d) = Expr(:call, GlobalRef(Base, :size), x, d)
+
+# A range endpoint or `reshape` dimension is a literal or a name, the forms RK
+# reads per row; any other read gets a statement of its own.
+function _named_read!(reads::Vector{Expr}, name::Symbol, read)
+    (read isa Int || read isa Symbol) && return read
+    push!(reads, :($name::Int = $read))
+    return name
+end
+
+# Which reads a binding's program may use. A read must name data that every
+# binding of this model has: an observation can be absent, so nothing reads one
+# (a design binding of a fit's build generates the same program). And it must
+# evaluate to the size this binding packs: a read that disagrees would silently
+# read other coordinates, so that block keeps its literal size instead.
+function _read_tests(plan::StructuralPlan)
+    exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
+    merge!(exprs, Dict{Symbol,Any}(d.name => d.expr for d in plan.derived))
+    observed = union(Set{Symbol}(plan.conditioned),
+        Set{Symbol}(r.response for r in plan.responses if r.response isa Symbol))
+    known = Dict{Symbol,Bool}()
+    function isdata(name)
+        name in observed && return false
+        _holds_bound_value(plan, plan.columns, name) &&
+            return _supplied(get(plan.columns, name, nothing))
+        haskey(exprs, name) || return false
+        return get!(known, name) do
+            known[name] = false # a cyclic definition is not data
+            all(isdata, _value_symbols(exprs[name]))
+        end
+    end
+    # A read of no name at all, `length([1.0, 1.0])`, is a literal.
+    reads_data(ex) = (names = _value_symbols(ex); !isempty(names) && all(isdata, names))
+    function lookup(name)
+        _holds_bound_value(plan, plan.columns, name) && return _bound_value(plan, plan.columns, name)
+        return _memoized_data(plan, name) do
+            _eval_value_expr(exprs[name], lookup, name)
+        end
+    end
+    # Sizes evaluate at binding anyway; one that cannot evaluate here keeps the
+    # literal the binding already computed.
+    agrees(read, value::Int) = try
+        x = _eval_value_expr(read, lookup, :layout_read)
+        x isa Integer && !(x isa Bool) && x == value
+    catch
+        false
+    end
+    return (; reads_data, agrees)
+end
+
+# `read` when it reads data and agrees with this binding's `value`, else `value`.
+_checked_read(tests, read, value::Int) =
+    tests.reads_data(read) && tests.agrees(read, value) ? read : value
+
+# An array axis as the program reads it; `value` is this binding's length.
+function _array_dim_read(plan::StructuralPlan, tests, d, value::Int)
+    d isa Int && return d
+    if _is_levels_dim(d)
+        read = _read_length(_axis_labels_expr(d))
+    elseif (cnt = _levels_count(d)) !== nothing
+        read = _read_add(_read_length(_axis_labels_expr(:levels, cnt[1], Colon())), -cnt[2])
+    elseif _is_bound_extent_dim(d)
+        d isa Symbol && haskey(plan.columns, d) && !(plan.columns[d] isa Integer) && return value
+        read = d
+    else
+        read = _read_size(d.args[2], d.args[3])
+    end
+    return _checked_read(tests, read, value)
+end
+
+function _array_packed_reads(plan::StructuralPlan, tests, e::LayoutEntry)
+    p = _array_param(plan, e.name)
+    dims = Any[_array_dim_read(plan, tests, d, n) for (d, n) in zip(p.dims, e.dims)]
+    e.transform === :simplex_rows && return Any[dims[1], _read_add(dims[2], -1)]
+    e.transform === :simplex_cols && return Any[_read_add(dims[1], -1), dims[2]]
+    return dims
+end
+
+# A plate latent's rows as the program reads them.
+function _plate_rows_read(plan::StructuralPlan, tests, p::PlateParameter, value::Int)
+    r = p.range
+    r isa UnitRange && return value
+    iterator = r isa Symbol ? Expr(:call, :eachindex, r) : r
+    if iterator isa Expr
+        Meta.isexpr(iterator, :call) && !isempty(iterator.args) &&
+            iterator.args[1] in (:eachindex, :axes) || return value
+        return _checked_read(tests, _read_length(iterator), value)
+    end
+    # No authored range: the rows of the data the latent reads (`_value_rows`).
+    columns = sort!(collect(_response_reads(plan, p.name, _row_columns(plan))))
+    isempty(columns) && return value
+    return _checked_read(tests, _read_size(first(columns), 1), value)
+end
+
+# A threshold or simplex vector's packed length as the program reads it: its
+# authored extent, when that reads data. A count inferred from a response stays
+# literal: the response can be absent, and it can declare unobserved levels.
+function _vector_size_read(plan::StructuralPlan, tests, e::LayoutEntry)
+    i = findfirst(p -> p.name === e.name, plan.vector_parameters)
+    i === nothing && return e.size
+    extent = plan.vector_parameters[i].extent_expr
+    extent === nothing && return e.size
+    packed = e.transform === :simplex ? _read_add(extent, -1) : extent
+    return _checked_read(tests, packed, e.size)
+end
+
+# Whether an entry's program reads `positions`. Scalars, per-coordinate positive
+# vectors and LKJ scalar edges and stacks read one literal coordinate per
+# statement.
+_reads_positions(e::LayoutEntry) = e.kind === :cholesky_corr ?
+    !isempty(e.dims) && !_is_lkj_stack(e.transform) :
+    e.kind === :vector ? e.transform !== :exp :
+    e.kind === :array ? !_is_lkj_stack(e.transform) :
+    e.kind in (:plate, :glm, :coefficient, :scan, :external, :external_plate)
+
+_scan_read_length(plan::StructuralPlan, s::ScanSpec, T::Int) =
+    s.hi isa Symbol && get(plan.columns, s.hi, nothing) isa Integer ? s.hi : T
+
+# A scan's innovation ranges in its latent slice, as the program reads them.
+function _scan_read_ranges(plan::StructuralPlan, s::ScanSpec, ranges, T::Int)
+    read = _scan_read_length(plan, s, T)
+    read isa Int && return ranges
+    seeds = count(f -> f.kind === :sample, s.setup)
+    n = _read_add(read, -(s.lo - 1))
+    return Any[(_read_add(_read_add(seeds, _read_mul(j - 1, n)), 1),
+        _read_add(seeds, _read_mul(j, n))) for j in eachindex(ranges)]
+end
+
+# A data-derived bound is read as authored; a literal one stays a literal. A
+# bound that evaluated to a finite number read data alone (`_layout_bound`).
+_data_bound_reads(authored, lo, hi) =
+    (!(authored[1] isa Real) && lo isa Real && isfinite(lo) ? authored[1] : nothing,
+     !(authored[2] isa Real) && hi isa Real && isfinite(hi) ? authored[2] : nothing)
+
+function _authored_bounds(p)
+    ov = p.support_override
+    if ov isa Tuple && length(ov) == 3 && support_of(p.family, ov) === :truncated
+        _, lo, hi = _entry_transform(p.family, ov, p.args)
+        return lo, hi
+    elseif ov isa Tuple && length(ov) == 2
+        return ov[1] === :upper ? (NaN, ov[2]) : (ov[2], NaN)
+    elseif ov === nothing && p.family === :uniform
+        return p.args.arg1, p.args.arg2
+    end
+    return NaN, NaN
+end
+
+# The program's reads for every entry, in packing order, with the statements
+# that name them.
+function _layout_reads(plan::StructuralPlan, entries::Vector{LayoutEntry})
+    reads = Expr[]
+    tests = _read_tests(plan)
+    parameters = Dict{Symbol,Any}()
+    for ps in (plan.parameters, plan.plate_parameters, plan.array_parameters), p in ps
+        parameters[p.name] = p
+    end
+    scans = Dict{Symbol,ScanSpec}()
+    for raw in plan.scans
+        s = _resolve_scan(plan, raw)
+        scans[_is_noncentered_scan(s) ? _scan_innovation_name(s) : only(s.states)] = s
+    end
+    at = 1
+    out = LayoutEntry[]
+    for e in entries
+        bound_reads = e.transform in (:interval, :floored, :upper) &&
+            haskey(parameters, e.name) && parameters[e.name].family !== :external ?
+            _data_bound_reads(_authored_bounds(parameters[e.name]), e.lo, e.hi) : e.bound_reads
+        bound_reads = map(x -> x !== nothing && tests.reads_data(x) ? x : nothing, bound_reads)
+        entry, at = _entry_reads!(reads, plan, tests, e, at, get(scans, e.name, nothing), bound_reads)
+        push!(out, entry)
+    end
+    return out, reads
+end
+
+# The first read at `at`, and the read after a block of `size` coordinates.
+function _block_reads!(reads, name::Symbol, at, size)
+    start = _named_read!(reads, Symbol(:_ppl_first_, name), at)
+    # Literal arithmetic folds: a block from position 1 ends at its own size.
+    stop = start isa Int ? _read_add(start - 1, size) : _read_add(start, _read_add(size, -1))
+    stop = _named_read!(reads, Symbol(:_ppl_last_, name), stop)
+    return start, stop, _read_add(stop, 1)
+end
+
+function _entry_reads!(reads, plan, tests, e::LayoutEntry, at, scan, bound_reads)
+    with(positions, axes = nothing, blocks = e.scan_blocks) =
+        LayoutEntry(e.kind, e.predictor, e.name, e.labels, e.offset, e.size, e.transform,
+            e.lo, e.hi, e.dims, blocks, e.sampling, positions, axes, bound_reads)
+    if !_reads_positions(e)
+        return with(nothing), _read_add(at, e.size)
+    end
+    axes = nothing
+    if !isempty(e.scan_blocks)
+        # One block per sampled statement: a seed is one coordinate, a step
+        # statement one per iteration.
+        T = _scan_read_length(plan, scan, _scan_length(plan, scan))
+        steps = _read_add(T, -(scan.lo - 1))
+        sampled = [st for st in (scan.setup..., scan.step...) if st.kind === :sample &&
+            (st isa ScanSetup || _scan_length(plan, scan) > scan.lo - 1)]
+        blocks = LayoutEntry[]
+        for (b, st) in zip(e.scan_blocks, sampled)
+            start, stop, next = at isa Int && T isa Int ? (nothing, nothing, _read_add(at, b.size)) :
+                _block_reads!(reads, b.name, at, st isa ScanSetup ? 1 : steps)
+            push!(blocks, LayoutEntry(b.kind, b.predictor, b.name, b.labels, b.offset, b.size,
+                b.transform, b.lo, b.hi, b.dims, b.scan_blocks, b.sampling,
+                start === nothing ? nothing : (start, stop), nothing,
+                map(x -> x !== nothing && tests.reads_data(x) ? x : nothing, b.bound_reads)))
+            at = next
+        end
+        return with(nothing, nothing, blocks), at
+    elseif e.kind === :array
+        packed = _array_packed_reads(plan, tests, e)
+        if !all(a -> a isa Int, packed)
+            axes = Any[_named_read!(reads, Symbol(:_ppl_axis, d, :_, e.name), a)
+                for (d, a) in enumerate(packed)]
+        end
+        size = foldl(_read_mul, something(axes, packed); init = 1)
+    elseif e.kind === :plate
+        i = findfirst(p -> p.name === e.name, plan.plate_parameters)
+        size = i === nothing ? e.size : _plate_rows_read(plan, tests, plan.plate_parameters[i], e.size)
+    elseif e.kind === :vector
+        size = _vector_size_read(plan, tests, e)
+    elseif e.kind === :scan
+        T = _scan_read_length(plan, scan, _scan_length(plan, scan))
+        size = T isa Int ? e.size : !_is_noncentered_scan(scan) ? T :
+            _read_add(count(f -> f.kind === :sample, scan.setup),
+                _read_mul(length(_scan_innovations(scan)), _read_add(T, -(scan.lo - 1))))
+    else
+        size = e.size
+    end
+    # Literal position and size: the literal range, as ever.
+    at isa Int && size isa Int && return with(nothing), at + size
+    start, stop, next = _block_reads!(reads, e.name, at, size)
+    # The Jacobian of an ordered vector reads its tail on its own.
+    if e.kind === :vector && e.transform === :ordered
+        _named_read!(reads, _vector_ordered_tail_first(e), _read_add(start, 1))
+    end
+    return with((start, stop), axes), next
+end
+
+# The entry as its generated program reads it: a data-derived bound is its
+# authored expression, never this binding's number.
+function _program_entry(e::LayoutEntry)
+    e.bound_reads === (nothing, nothing) && return e
+    return LayoutEntry(e.kind, e.predictor, e.name, e.labels, e.offset, e.size,
+        e.transform, something(e.bound_reads[1], e.lo),
+        something(e.bound_reads[2], e.hi), e.dims, e.scan_blocks, e.sampling,
+        e.positions, e.axes)
+end
+
 # Bound arithmetic of the parameterized (`:interval`/`:floored`/`:upper`)
 # inverse, Jacobian and one-sided edges. Literal operands fold
 # (`(0.5 - 0.0)` is `0.5`, `x - -1.0` is `x + 1.0`) and a literal zero
@@ -1607,6 +1906,7 @@ sampled entry (`:exp`/`:logistic`) splices the bijector's `constrain` endpoint,
 which the planner inlines.
 """
 function transform_statements(e::LayoutEntry)
+    e = _program_entry(e)
     e.kind === :external_plate && return Expr[
         :($(e.name) = $(_external_cells_expr(e, :constrain))),
         :($(_plate_logjac_name(e.name)) = $(_external_cells_expr(e, :logjac)))]
@@ -1617,9 +1917,9 @@ function transform_statements(e::LayoutEntry)
         stmts = Expr[]
         for b in e.scan_blocks
             if b.transform === :identity
-                push!(stmts, :($(b.name)::Vector{Float64} = copy($(block_read(b.offset, b.size)))))
+                push!(stmts, :($(b.name)::Vector{Float64} = copy($(_entry_view(b)))))
             else
-                append!(stmts, _plate_transform_statements(b))
+                append!(stmts, _plate_transform_statements(_program_entry(b)))
             end
         end
         push!(stmts, :($(e.name)::AbstractVector{Float64} = vcat($([b.name for b in e.scan_blocks]...))))
@@ -1630,19 +1930,14 @@ function transform_statements(e::LayoutEntry)
         # a non-centered scan's `_ppl_scan_z_<state>` innovation slice, or
         # a dar trajectory's `_ppl_dar_z_<state>` slice — the emitter
         # reconstructs from the innovation slices)
-        lo = e.offset
-        hi = e.offset + e.size - 1
-        return Expr[:($(e.name)::AbstractVector{Float64} =
-            view(unconstrained, $lo:$hi))]
+        return Expr[:($(e.name)::AbstractVector{Float64} = $(_entry_view(e)))]
     end
     if e.kind === :coefficient
         # Coefficient runs: identity runs read a view; interval runs
         # (uniform coefficients) hand-roll the broadcast constrain edge
         # with the host `_*_elt` path's math (mirroring the plate
         # `:interval` arm below).
-        lo = e.offset
-        hi = e.offset + e.size - 1
-        view_read = :(view(unconstrained, $lo:$hi))
+        view_read = _entry_view(e)
         e.transform === :identity &&
             return Expr[:($(e.name)::AbstractVector{Float64} = $view_read)]
         e.transform === :interval || throw(ContractValidationError(
@@ -1735,11 +2030,10 @@ end
 # A real-support block (per-cell latents, elementwise arrays, GLM vectors) is
 # its packed coordinates, read in place with no transform or Jacobian.
 function _plate_transform_statements(e::LayoutEntry)
-    lo = e.offset
-    hi = e.offset + e.size - 1
-    view_read = :(view(unconstrained, $lo:$hi))
+    range = _entry_range(e)
+    view_read = :(view(unconstrained, $range))
     e.transform === :identity && return Expr[:($(e.name)::AbstractVector{Float64} =
-        Base.view(unconstrained, $lo:$hi))]
+        Base.view(unconstrained, $range))]
     if e.transform === :interval
         # Parameterized bounds ⇒ not in the (parameterless) bijector registry;
         # hand-rolled broadcast edges over the block view, with the host
@@ -1803,6 +2097,7 @@ _vector_simplex_logjac(e::LayoutEntry) = Symbol(:_ppl_simplex_logjac_, e.name)
 # vector as read (`factor_support`, `partition_footprint`).
 _vector_block(e::LayoutEntry) = Symbol(:_ppl_vector_block_, e.name)
 _vector_ordered_tail(e::LayoutEntry) = Symbol(:_ppl_ordered_tail_, e.name)
+_vector_ordered_tail_first(e::LayoutEntry) = Symbol(:_ppl_first_ordered_tail_, e.name)
 
 # Leveled vector edges (thresholds, threshold-coefficient packs,
 # simplexes): ONE vector-valued statement chain per entry, bound to the
@@ -1822,7 +2117,9 @@ _vector_ordered_tail(e::LayoutEntry) = Symbol(:_ppl_ordered_tail_, e.name)
 # structural per-entry L algebra; they keep per-element scalar edges (the
 # plate `:exp` bijector shape).
 function _vector_transform_statements(e::LayoutEntry)
-    lo, hi = e.offset, e.offset + e.size - 1
+    range = _entry_range(e)
+    # A data-sized vector takes its length from its own block.
+    size_read = e.positions === nothing ? e.size : _read_length(_vector_block(e))
     if e.transform === :exp
         bij = _bijector_name(:exp)
         return Expr[:($(_vector_elt(e, i))::Float64 =
@@ -1834,19 +2131,21 @@ function _vector_transform_statements(e::LayoutEntry)
         # Materialize the ordinary range slice for the cumulative-cutpoint
         # validity reduction.
         return Expr[:($(e.name)::AbstractVector{Float64} =
-            unconstrained[$lo:$hi])]
+            unconstrained[$range])]
     end
     if e.transform === :ordered
         e.size == 0 && return Expr[]
-        e.size == 1 && return Expr[:($(e.name)::AbstractVector{Float64} =
-            view(unconstrained, $lo:$lo))]
+        e.size == 1 && e.positions === nothing &&
+            return Expr[:($(e.name)::AbstractVector{Float64} = view(unconstrained, $range))]
         f = GlobalRef(@__MODULE__, :_ordered_constrain_kernel)
         block, tail = _vector_block(e), _vector_ordered_tail(e)
+        tail_range = e.positions === nothing ? :($(e.offset + 1):$(e.offset + e.size - 1)) :
+            :($(let f = e.positions[1]; f isa Int ? f + 1 : _vector_ordered_tail_first(e) end):$(e.positions[2]))
         return Expr[
-            :($block::AbstractVector{Float64} = $(block_read(lo, e.size))),
-            :($(e.name)::AbstractVector{Float64} = $f($block, 1, $(e.size))),
+            :($block::AbstractVector{Float64} = view(unconstrained, $range)),
+            :($(e.name)::AbstractVector{Float64} = $f($block, 1, $size_read)),
             # Read only by the Jacobian (`jacobian_term`); pruned otherwise.
-            :($tail::AbstractVector{Float64} = $(block_read(lo + 1, e.size - 1))),
+            :($tail::AbstractVector{Float64} = view(unconstrained, $tail_range)),
         ]
     end
     # :simplex — stick-breaking (thin-layer-owned, not Stan's ILR).
@@ -1856,8 +2155,8 @@ function _vector_transform_statements(e::LayoutEntry)
     f = GlobalRef(@__MODULE__, :_simplex_constrain_logjac_kernel)
     block = _vector_block(e)
     return Expr[
-        :($block::AbstractVector{Float64} = $(block_read(lo, e.size))),
-        :($pair = $f($block, 1, $(e.size))),
+        :($block::AbstractVector{Float64} = view(unconstrained, $range)),
+        :($pair = $f($block, 1, $size_read)),
         :($(e.name)::AbstractVector{Float64} = $pair[1]),
         :($jac::Float64 = $pair[2]),
     ]
@@ -1948,6 +2247,7 @@ declared LKJ entry reads the retained sum over the partials shared with its
 transform. Legacy structural-margin LKJ blocks sum their named scalar edges.
 """
 function jacobian_term(e::LayoutEntry)
+    e = _program_entry(e)
     e.kind === :external_plate && return :(sum($(_plate_logjac_name(e.name))))
     e.kind === :external && return _external_edge(e, :_sampling_logjac)
     e.transform === :identity && return nothing
@@ -1962,7 +2262,7 @@ function jacobian_term(e::LayoutEntry)
         e.transform === :interval || throw(ContractValidationError(
             "[layout] coefficient block $(e.name) has no Jacobian rule " *
             "for $(e.transform) (admitted: :identity, :interval)"))
-        return _interval_logjac(e.lo, e.hi, block_read(e.offset, e.size); dot = true)
+        return _interval_logjac(e.lo, e.hi, _entry_view(e); dot = true)
     end
     if e.kind === :cholesky_corr
         isempty(e.dims) || return _lkj_array_logjac(e.name)
@@ -1972,8 +2272,9 @@ function jacobian_term(e::LayoutEntry)
     if e.kind === :vector
         if e.transform === :ordered
             # Σ u[2:end] over one packed slice (the host `ordered_logjac`),
-            # read by its own transform statement.
-            e.size < 2 && return nothing
+            # read by its own transform statement. A vector read at its
+            # binding's positions has one program for every length.
+            e.size < (e.positions === nothing ? 2 : 1) && return nothing
             return :(sum($(_vector_ordered_tail(e))))
         end
         if e.transform === :exp
@@ -1995,10 +2296,10 @@ function jacobian_term(e::LayoutEntry)
         # `_plate_transform_statements`. GLM vectors use the same shape.
         # Missing companion plates must fail explicitly.
         e.transform === :interval &&
-            return _interval_logjac(e.lo, e.hi, block_read(e.offset, e.size); dot = true)
+            return _interval_logjac(e.lo, e.hi, _entry_view(e); dot = true)
         if e.transform === :upper || e.transform === :floored
             # Both one-sided exp transforms have the bare-coordinate Jacobian.
-            return :(sum($(block_read(e.offset, e.size))))
+            return :(sum($(_entry_view(e))))
         end
         e.transform === :exp || e.transform === :logistic ||
             throw(ContractValidationError("[layout] $(e.kind) block " *

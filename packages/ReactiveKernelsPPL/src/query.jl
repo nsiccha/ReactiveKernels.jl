@@ -200,9 +200,9 @@ via `bound=`). Thin wrapper over `ReactiveKernels.prepare` with
 optional `exemplars` tuple is forwarded to RK's native type-evidence path.
 The returned kernel maps an unconstrained float vector to the preset node's
 value. `plan` may be any binding that generates the same program as `built`
-(other row counts, including zero, and data values, or the same source lowered
-in another gensym-created isolation module); one that generates another program
-(other levels or parameter sizes, data element types, missing entries,
+(other row counts, including zero, parameter extents and data values, or the
+same source lowered in another gensym-created isolation module); one that
+generates another program (other levels, data element types, missing entries,
 another broadcast shape) is refused with a
 `ContractValidationError` naming the first difference, since the graph would
 evaluate the wrong program for it. The preparation itself is
@@ -234,11 +234,25 @@ function _prepare_wants(built, plan::StructuralPlan, want;
     end
 end
 
+# A build serves every binding of its program, and each binding packs its own
+# coordinates: a query reads this binding's layout, never the one the build was
+# made with. The same positions keep the build itself.
+function _binding_build(built, plan::StructuralPlan)
+    (built isa NamedTuple && hasproperty(built, :layout) && isbound(plan)) || return built
+    layout = assign_layout(plan)
+    _same_positions(layout, built.layout) && return built
+    return merge(built, (; layout))
+end
+_same_positions(a::LayoutTable, b::LayoutTable) = a.total == b.total &&
+    length(a.entries) == length(b.entries) &&
+    all(x.name === y.name && x.offset == y.offset && x.size == y.size
+        for (x, y) in zip(a.entries, b.entries))
+
 # A built graph evaluates the program its build generated. A binding that
-# generates the same program (other row counts and data values, or another
-# gensym-created lowering namespace) evaluates on it exactly as on its own
-# build. A binding that generates another program
-# (other level labels or parameter sizes, data element types, missing
+# generates the same program (other row counts, parameter extents and data
+# values, or another gensym-created lowering namespace) evaluates on it exactly
+# as on its own build. A binding that generates another program
+# (other level labels, data element types, missing
 # entries, another broadcast shape) needs its own build;
 # evaluating the old graph on it can be silently wrong, so it is refused.
 # Values made outside `build_kernel` carry no `program` and are not checked.
@@ -449,6 +463,7 @@ kernel yet, so `retain` fails there.
 function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real};
         backend, on_error = nothing, retain::Tuple = (), warm::Bool = false,
         native_forward_batch::Bool = false, nonallocating::Bool = false)
+    built = _binding_build(built, plan)
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
@@ -596,6 +611,7 @@ backend's packages must be loaded in the calling session.
 """
 function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
         preset::Symbol, backend, exemplars...; on_error = nothing)
+    built = _binding_build(built, plan)
     layout = built.layout::LayoutTable
     isempty(exemplars) && throw(ContractValidationError(
         "[query] prepare_query_ad needs an unconstrained exemplar u0 as its last argument"))
@@ -700,8 +716,9 @@ Optional `partitioned` identifies parameters that can change between local
 evaluations, using the names or `parameter => level_labels` accepted by
 [`prepare_partition_sampler`](@ref). Other coordinates are shared. The query
 caches their intermediate values across cells and local changes, compares
-shared coordinates by value (including in-place edits), and refreshes on a
-shared change. Row-capable calculations remain in the residual. This cell
+the shared coordinates those values read by value (including in-place edits),
+and refreshes when one changes. A shared coordinate they do not read needs no
+refresh. Row-capable calculations remain in the residual. This cell
 declaration identifies cache dependencies; it adds no per-key separability
 claim because a cell query has no partition key. A partition query checks
 separability when the same declaration is supplied.
@@ -759,6 +776,7 @@ assuming a fixed per-cell width.
 """
 function prepare_cell_query(built, plan::StructuralPlan, observations;
         on_error = nothing, locality = nothing, partitioned = (), u0 = nothing)
+    built = _binding_build(built, plan)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_cell_query requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
@@ -875,6 +893,7 @@ as for [`prepare_sampler`](@ref). `locality` is passed to
 """
 function prepare_cell_sampler(built, plan::StructuralPlan, observations,
         u0::AbstractVector{<:Real}; backend, on_error = nothing, locality = nothing)
+    built = _binding_build(built, plan)
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
@@ -1099,6 +1118,7 @@ coordinate, mapping each to its position in the selection.
 function prepare_compact_cell_sampler(built, plan::StructuralPlan, observations,
         base0::AbstractVector{Float64}, indices0::AbstractVector{Int};
         backend, on_error = nothing, locality = nothing)
+    built = _binding_build(built, plan)
     c = _prepare_compact_cell(:prepare_compact_cell_sampler, built, plan, observations,
         base0, indices0; on_error, locality)
     ad = Base.invokelatest(prepare_ad, c.kernel, backend, base0, c.active0, c.slots, 1;
@@ -1112,6 +1132,7 @@ end
 function _prepare_compact_cell(caller::Symbol, built, plan::StructuralPlan, observations,
         base0::AbstractVector{Float64}, indices0::AbstractVector{Int};
         on_error = nothing, locality = nothing)
+    built = _binding_build(built, plan)
     layout = built.layout::LayoutTable
     _check_compact_cell_indices(base0, indices0, indices0, layout.total)
     active0 = base0[indices0]
@@ -1244,6 +1265,7 @@ reuse the fixed point without checking all shared coordinates per cell.
 function prepare_compact_cell_ad(prepare_operator, built, plan::StructuralPlan, observations,
         base0::AbstractVector{Float64}, indices0::AbstractVector{Int}, backend, exemplars...;
         on_error = nothing, locality = nothing, partitioned = ())
+    built = _binding_build(built, plan)
     isempty(_query_partition_rule(plan, built.layout, partitioned, nothing)) ||
         return _prepare_shared_compact_ad(prepare_operator, built, plan, observations,
             base0, indices0, backend, exemplars...; on_error, locality, partitioned)
@@ -1598,6 +1620,7 @@ label per cell would retain a partition plan for every cell.
 """
 function prepare_partition(built, plan::StructuralPlan, observations; by,
         locality = :error, on_error = nothing, partitioned = (), u0 = nothing)
+    built = _binding_build(built, plan)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_partition requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
@@ -1900,6 +1923,7 @@ program, avoiding cotangents for the cached shared frontier and its pullback.
 function prepare_partition_sampler(built, plan::StructuralPlan, observations,
         u0::AbstractVector{<:Real}; by, backend, compact::Bool = true, partitioned = (),
         locality = :error, on_error = nothing)
+    built = _binding_build(built, plan)
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))

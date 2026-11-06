@@ -1424,8 +1424,9 @@ _array_slices_packed_name(name::Symbol) = Symbol(:_ppl_arru_, name)
 # slice in one call.
 function _array_transform_statements(e::LayoutEntry)
     # There are no bijector cells in an empty elementwise array. Preserve its
-    # value shape with an owned empty output, without evaluating a cell.
-    e.size == 0 && !_is_slice_transform(e.transform) &&
+    # value shape with an owned empty output, without evaluating a cell. A
+    # data-sized array keeps one program for every extent, the empty one too.
+    e.size == 0 && e.positions === nothing && !_is_slice_transform(e.transform) &&
         !_is_lkj_stack(e.transform) && return Expr[:($(e.name)::Array{Float64,$(length(e.dims))} =
         zeros(Float64, $(e.dims...)))]
     _is_lkj_stack(e.transform) && return _lkj_stack_transform_statements(e)
@@ -1433,30 +1434,36 @@ function _array_transform_statements(e::LayoutEntry)
         U = _array_slices_packed_name(e.name)
         flat = _array_flat_name(U, 2)
         raw = Symbol(flat, :_raw)
-        lo, hi = e.offset, e.offset + e.size - 1
         cfn, _ = _slice_function_names(e.transform)
         o = _orientation_expr(_slice_transform_orientation(e.transform))
         return Expr[
-            :($raw = view(unconstrained, $lo:$hi)),
+            :($raw = $(_entry_view(e))),
             :($flat = Float64.($raw)),
-            :($U::Matrix{Float64} = reshape($flat, $(_slice_packed_dims(e.transform, e.dims)...))),
+            :($U::Matrix{Float64} = reshape($flat, $(_entry_axes(e)...))),
             :($(e.name)::Matrix{Float64} = $cfn($o, $U)),
         ]
     end
     flat = _array_flat_name(e.name, length(e.dims))
-    fe = LayoutEntry(:plate, nothing, flat, e.labels, e.offset, e.size,
-        e.transform, e.lo, e.hi)
-    stmts = _plate_transform_statements(fe)
+    stmts = _plate_transform_statements(_array_flat_entry(e, flat))
     length(e.dims) == 1 && return stmts
     # The column-major reshape shares the flat block's storage: the packed
     # coordinates themselves, or the transform's fresh output. A `Matrix`
     # declaration would copy the former on every evaluation.
-    push!(stmts, :($(e.name)::AbstractMatrix{Float64} = reshape($flat, $(e.dims...))))
+    push!(stmts, :($(e.name)::AbstractMatrix{Float64} = reshape($flat, $(_entry_axes(e)...))))
     return stmts
 end
 
+# The flat `:plate` block of an elementwise array, read at the array's range.
+_array_flat_entry(e::LayoutEntry, flat::Symbol) = LayoutEntry(:plate, nothing,
+    flat, e.labels, e.offset, e.size, e.transform, e.lo, e.hi, Int[],
+    LayoutEntry[], nothing, e.positions)
+
+# The shape an array's flat packed block has, as its program reads it.
+_entry_axes(e::LayoutEntry) = something(e.axes, _is_slice_transform(e.transform) ?
+    _slice_packed_dims(e.transform, e.dims) : e.dims)
+
 function _array_jacobian_term(e::LayoutEntry)
-    e.size == 0 && return nothing
+    e.size == 0 && e.positions === nothing && return nothing
     _is_lkj_stack(e.transform) &&
         return _lkj_vine_logjac(e.name, e.dims[1]; stacked = true)
     if _is_slice_transform(e.transform)
@@ -1465,8 +1472,7 @@ function _array_jacobian_term(e::LayoutEntry)
         return :($jfn($o, $(_array_slices_packed_name(e.name))))
     end
     flat = _array_flat_name(e.name, length(e.dims))
-    return jacobian_term(LayoutEntry(:plate, nothing, flat, e.labels,
-        e.offset, e.size, e.transform, e.lo, e.hi))
+    return jacobian_term(_array_flat_entry(e, flat))
 end
 
 # A per-level LKJ stack (`:lkj_stack`, dims `[K, K, S]`): the stacked
@@ -1609,7 +1615,7 @@ function _lkj_array_transform_statements(e::LayoutEntry)
         # a read inside a larger expression has no row form, so a cell or
         # partition reading the packed vector would count the whole vector as
         # read (RK `partition_footprint`).
-        :($raw::AbstractVector{Float64} = $(block_read(e.offset, e.size))),
+        :($raw::AbstractVector{Float64} = $(_entry_view(e))),
         :($z::Vector{Float64} = tanh.($raw)),
         # The diagonal is part of constructing the factor. Publish it as a
         # graph value so a guarded prior need not share the whole matrix with
@@ -1825,7 +1831,11 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
                 count = p.args.broadcast ? prod(dims) : 1)
             continue
         end
-        if prod(dims) == 0
+        # A data-sized array keeps one program for every extent: its density
+        # plate is empty when it is.
+        data_sized = !(p.name in plan.conditioned) &&
+            !(p.family in (:lkj_cholesky, :lkj_cholesky_stack)) && !all(d -> d isa Int, p.dims)
+        if prod(dims) == 0 && !data_sized
             # An elementwise declaration over no elements has no density
             # cells. Scalar priors elsewhere in the model remain intact.
             push!(stmts, :($node::Float64 = 0.0))

@@ -82,7 +82,7 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable;
     assigns = _assignment_statements(plan; layout, gathers)
     free = _density_selection(plan, n -> n ∉ plan.conditioned)
     priors = _prior_statements(free, layout; gathers, context = plan, density_sites)
-    transforms = Expr[]
+    transforms = Expr[layout.reads...]
     for e in layout.entries
         append!(transforms, transform_statements(e))
     end
@@ -602,6 +602,9 @@ function _parameter_coordinate_view(reads, layout)
         i === nothing && return nothing
         e = layout.entries[i]
         e.transform === :identity && e.size == width || return nothing
+        # An entry read at its binding's positions is its own view.
+        e.positions === nothing ||
+            return length(reads) == 1 ? _entry_view(e) : nothing
         stop === nothing || e.offset == stop + 1 || return nothing
         start === nothing && (start = e.offset)
         stop = e.offset + e.size - 1
@@ -911,6 +914,8 @@ end
 function _unit_sample_coordinate(layout::LayoutTable, name::Symbol)
     for e in layout.entries
         e.kind === :sampled && e.name === name || continue
+        # The rewrite below would depend on a data-derived bound's value.
+        e.bound_reads === (nothing, nothing) || return nothing
         (e.transform === :logistic ||
             (e.transform === :interval && e.lo isa Real && e.hi isa Real &&
                 iszero(e.lo) && isone(e.hi))) ||
@@ -1459,7 +1464,9 @@ function _ordinal_pointwise_stmts(r, plan; grouped = false)
         obs = _stage_lane(r.label, :obs)
         :(searchsortedlast.(Ref($obs), eachindex($observed)))
     else
-        stages = _group_thresholds(plan, r) ? :(length($(r.thresholds))) : r.n_levels - 1
+        levels = _ordinal_read_levels(plan, r)
+        stages = _group_thresholds(plan, r) ? :(length($(r.thresholds))) :
+            levels isa Int ? levels - 1 : :($levels - 1)
         :(cumsum(min.($observed, $stages)))
     end
     return Expr[:($ends = $endexpr),
@@ -4078,8 +4085,22 @@ _threshold_stages(name::Symbol, obs, stage) = :($name[$stage])
 _threshold_stages(rows::ThresholdRows, obs, stage) =
     :(getindex.(_broadcast_gather($(rows.name), $obs), $stage))
 
+# An ordered response's level count as its program reads it: the length of a
+# data-sized threshold vector, never this binding's number. Another count stays
+# as authored: its thresholds need not be one vector of `K - 1`.
+function _ordinal_read_levels(plan::StructuralPlan, r::LikelihoodSpec)
+    _group_thresholds(plan, r) && return :(length($(r.thresholds)) + 1)
+    (r.thresholds isa Symbol && r.n_levels isa Integer && r.n_levels > 1) || return r.n_levels
+    i = findfirst(p -> p.name === r.thresholds, plan.vector_parameters)
+    i === nothing && return r.n_levels
+    p = plan.vector_parameters[i]
+    extent = p.extent_expr
+    return extent !== nothing && p.size == r.n_levels - 1 &&
+        _read_tests(plan).reads_data(extent) ? :(length($(r.thresholds)) + 1) : r.n_levels
+end
+
 function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
-    K = _group_thresholds(plan, r) ? :(length($(r.thresholds)) + 1) : r.n_levels
+    K = _ordinal_read_levels(plan, r)
     K === nothing && throw(ContractValidationError(
         "[generator] ordered response $(r.label) has unresolved n_levels " *
         "(bind_data infers it)"))
@@ -4774,7 +4795,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
             push!(terms, Symbol(:_ppl_prior_, p.name))
         else
             _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
-                p.support_override; rows = _plate_rows(plan, p),
+                p.support_override; rows = p.range isa UnitRange ? _plate_rows(plan, p) : nothing,
                 float64_variate = p.name ∉ plan.conditioned,
                 float64_inputs = _float64_inputs(plan, values(p.args)))
         end
@@ -5472,6 +5493,8 @@ function _scan_reconstruction_statements(plan::StructuralPlan,
             throw(ContractValidationError("$(_scan_where(s)): layout has no " *
                 "latent slice :$zname"))
         seedpos, ranges = _scan_latent_positions(s, innov, T)
+        ranges = _scan_read_ranges(plan, s, ranges, T)
+        read_T = _scan_read_length(plan, s, T)
         for f in s.setup
             nm = _scan_init_name(f.target, f.index)
             val = f.kind === :sample ? :($zname[$(seedpos[(f.target, f.index)])]) :
@@ -5489,7 +5512,7 @@ function _scan_reconstruction_statements(plan::StructuralPlan,
         history = _scan_has_history(s)
         if length(s.states) == 1
             a = only(s.states)
-            fold = _scan_fold(s, innov, ranges, zname, T, a, scalars;
+            fold = _scan_fold(s, innov, ranges, zname, read_T, a, scalars;
                 hist = history ? a : nothing)
             if history
                 push!(stmts, :($a = $fold))
@@ -5503,7 +5526,7 @@ function _scan_reconstruction_statements(plan::StructuralPlan,
         end
         outputs = s.states
         shared = Symbol(:_ppl_scan_outputs_, first(s.states))
-        fold = _scan_fold(s, innov, ranges, zname, T, outputs, scalars;
+        fold = _scan_fold(s, innov, ranges, zname, read_T, outputs, scalars;
             hist = history ? s.states : nothing)
         push!(stmts, :($shared = $fold))
         for a in outputs
@@ -5547,6 +5570,7 @@ function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
     scalars = _scan_readable_names(plan, s)
     zname = _scan_innovation_name(s)
     seedpos, ranges = _scan_latent_positions(s, innov, T)
+    ranges = _scan_read_ranges(plan, s, ranges, T)
     head = first(s.states)
     terms = Any[]
     for f in s.setup
@@ -5561,7 +5585,7 @@ function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
         pointwise = Symbol(:_ppl_scan_density_, head)
         node = Symbol(:_ppl_scan_stepslp_, head)
         push!(stmts, :($pointwise = $(_scan_density_plate(s, innov, ranges,
-            zname, T, scalars))))
+            zname, _scan_read_length(plan, s, T), scalars))))
         push!(stmts, :($node::Float64 = sum($pointwise)))
         push!(terms, node)
     end
@@ -5613,15 +5637,17 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable;
             push!(terms, seed)
         end
         lags = sort!(collect(_scan_lags([step], [state], sc.loopvar)[state]))
-        inputs = Any[:(view($(state), $(m + 1):$T))]     # hcur → do-var _ppl_c1
+        read_T = _scan_read_length(plan, sc, T)
+        inputs = Any[:(view($(state), $(m + 1):$read_T))]     # hcur → do-var _ppl_c1
         dovar = Dict{Int,Symbol}()
         for (i, j) in enumerate(lags)
-            push!(inputs, :(view($(state), $(m + 1 - j):$(T - j))))
+            stop = read_T isa Int ? read_T - j : :($read_T - $j)
+            push!(inputs, :(view($(state), $(m + 1 - j):$stop)))
             dovar[j] = _dovar(i + 1)
         end
         # Substitute the lag reads; the cell reads the recurrence's other
         # scalars (params/assignments) by closing over them.
-        push!(inputs, :($(sc.lo):$T))
+        push!(inputs, :($(sc.lo):$read_T))
         cellarg(a) = _subst_syms(_subst_scan_lags(a, state, sc.loopvar, dovar),
             Dict(sc.loopvar => _dovar(length(inputs))))
         # History reads (`h[s]` under `for s in 1:(t - 1)`) read the sampled

@@ -189,6 +189,68 @@ end
     total::Float64 = sum(pointwise)
 end
 
+# The same object with a counted `log`, under a support guard as a likelihood
+# emits it: the arm's graph holds `log_scale`, which reads the scale alone, while
+# its closure would run it on every lane.
+@kernel counted_location_scale(standard, location::Float64, scale::Float64) = begin
+    log_scale::Float64 = counted_log(scale)
+    standardized(x::Float64)::Float64 = (x - location) / scale
+    logpdf(x::Float64)::Float64 = begin
+        z::Float64 = standardized(x)
+        standard.logpdf(z) - log_scale
+    end
+end
+
+@kernel counted_normal = counted_location_scale(endpoint_standard_normal)
+
+@kernel guarded_scale(y::Vector{Float64}, m::Float64, s::Float64) = begin
+    pointwise = plate(y, m, s) do yi, mi, si
+        cell::Float64 = si > 0 ? counted_normal(mi, si).logpdf(yi) : -Inf
+        cell
+    end
+    total::Float64 = sum(pointwise)
+end
+
+# The scale's port undeclared, as a plate reading any bound number has it.
+@kernel guarded_scale_undeclared(y::Vector{Float64}, m::Float64, s) = begin
+    pointwise = plate(y, m, s) do yi, mi, si
+        cell::Float64 = si > 0 ? counted_normal(mi, si).logpdf(yi) : -Inf
+        cell
+    end
+    total::Float64 = sum(pointwise)
+end
+
+# One scale per lane: the guard splits the lanes, and each valid lane's `log`
+# is its own value.
+@kernel guarded_lane_scale(y::Vector{Float64}, m::Float64, s::Vector{Float64}) = begin
+    pointwise = plate(y, m, s) do yi, mi, si
+        cell::Float64 = si > 0 ? counted_normal(mi, si).logpdf(yi) : -Inf
+        cell
+    end
+    total::Float64 = sum(pointwise)
+end
+
+# A per-lane missingness guard beside a shared scale: two arm plates, and the
+# scale's `log` belongs to the one arm that reads it.
+@kernel missing_guard_scale(y::Vector{Float64}, m::Float64, s::Float64,
+                            g::Vector{Int}) = begin
+    pointwise = plate(y, m, s, g) do yi, mi, si, gi
+        cell::Float64 = gi == 0 ? counted_normal(mi, si).logpdf(yi) : 0.0
+        cell
+    end
+    total::Float64 = sum(pointwise)
+end
+
+# A written scale: `counted_log` over the literal is a package call the compiler
+# does not fold, while `guarded_endpoint`'s Base `log` over its literal does.
+@kernel guarded_written_scale(y::Vector{Float64}, m::Float64, g::Vector{Int}) = begin
+    pointwise = plate(y, m, g) do yi, mi, gi
+        cell::Float64 = gi == 0 ? counted_normal(mi, 1.5).logpdf(yi) : 0.0
+        cell
+    end
+    total::Float64 = sum(pointwise)
+end
+
 # The endpoint is invalid off-arm (`log` of a nonpositive scale): it must
 # never evaluate on lanes that do not take its arm, bound or not.
 @kernel lazy_endpoint_arm(y::Vector{Float64}, m::Vector{Float64},
