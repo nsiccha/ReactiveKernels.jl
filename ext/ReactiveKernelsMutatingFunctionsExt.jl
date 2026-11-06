@@ -43,7 +43,7 @@ end
             "an authored plate requires at least one non-Ref batched argument"))
         result = _authored_plate_array_cache(cache.result, combined_axes)
         for $index in CartesianIndices(combined_axes)
-            value = cache.kernel.f($(cellargs...))
+            value = cache.kernel($(cellargs...))
             if isassigned(result, $index) && axes(result[$index]) == axes(value)
                 copyto!(result[$index], value)
             else

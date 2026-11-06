@@ -17,6 +17,7 @@ const _CONSTANTS_ARG = :__constants__
 const _CALLABLES_ARG = :__callables__
 const _CACHES_ARG = :__caches__
 const _CACHE_APPLY_ARG = :__cache_apply__
+const _TABLES_ARG = :__tables__
 
 # Names a `@kernel` generates rather than authors: gensyms and the synthesized
 # result ports of a computed `return` and of a plate cell's final expression.
@@ -78,7 +79,8 @@ function _varnames(p::Plan)
     for r in p.recipes, o in r.outputs; push!(ids, canon_id(g, o.id)); end
     for w in p.want; push!(ids, canon_id(g, w.id)); end
     unique!(ids)
-    used = Set{Symbol}((_CONSTANTS_ARG, _CALLABLES_ARG, _CACHES_ARG, _CACHE_APPLY_ARG))
+    used = Set{Symbol}((_CONSTANTS_ARG, _CALLABLES_ARG, _CACHES_ARG, _CACHE_APPLY_ARG,
+                        _TABLES_ARG))
     out = Dict{ValueId,Symbol}()
     named = _class_name_values(g)
     # Plan order is stable across equivalent graphs; graph IDs are not. Use
@@ -7808,6 +7810,18 @@ end
 # on first use; later calls feed the stored value back to the extension helper.
 _cache_slot(::Value{T}) where {T} = Ref{Union{Nothing,T}}(nothing)
 
+# A non-allocating kernel's tables, behind one reference its generated body
+# receives. A mutable object, so the reference exists once: a tuple passed by
+# value to a body Julia does not inline is boxed on every call, 672 B per call
+# for a plate of array cells on Julia 1.10, whose body holds a nested body and
+# so is not inlined. Its fields never change.
+mutable struct _NonallocTables{K,O,C,A}
+    const constants::K
+    const callables::O
+    const caches::C
+    const cache_apply::A
+end
+
 """
     NonAllocatingKernel
 
@@ -7834,6 +7848,7 @@ struct NonAllocatingKernel{F,K,O,C,A,IN,OUT,S}
     callables::O
     caches::C
     cache_apply::A
+    tables::_NonallocTables{K,O,C,A}
     inputs::IN
     outputs::OUT
     plan::Plan
@@ -7844,7 +7859,8 @@ NonAllocatingKernel{S}(f::F, constants::K, callables::O, caches::C, cache_apply:
                        inputs::IN, outputs::OUT, plan::Plan,
                        ast::Expr) where {F,K,O,C,A,IN,OUT,S} =
     NonAllocatingKernel{F,K,O,C,A,IN,OUT,S}(f, constants, callables, caches, cache_apply,
-                                            inputs, outputs, plan, ast)
+        _NonallocTables{K,O,C,A}(constants, callables, caches, cache_apply),
+        inputs, outputs, plan, ast)
 
 # Emit positional arguments explicitly: splatting the captured `args` tuple
 # into the RGF call allocates (one tuple box per call) even though the emitted
@@ -7855,7 +7871,7 @@ NonAllocatingKernel{S}(f::F, constants::K, callables::O, caches::C, cache_apply:
 @generated function _nonallocating_call(
         k::NonAllocatingKernel{F}, args::A, ::Val{N}) where {F,A<:Tuple,N}
     positional = Any[:(getfield(args, $index)) for index in 1:N]
-    _native_body_call_expr(F, :(k.f), positional)
+    _native_body_call_expr(F, :(k.f), Any[:(k.tables), positional...])
 end
 
 @inline function (k::NonAllocatingKernel{F,K,O,C,A,IN,OUT,S})(
@@ -7882,37 +7898,32 @@ function _prepare_nonallocating(p::Plan, cache_apply; have_types=nothing,
                                                                      cache_apply, passes)
     exact_signature &&
         (rewritten = _nonalloc_exact_signature(rewritten, have_types))
-    # Compile with the two tables and the cache tuple bound as constants inside
-    # the body. Passing them as call arguments re-tuples the non-isbits tables
-    # on every invocation at the runtime-generated call boundary — a measured
-    # fixed per-call heap cost. `k.ast` keeps the unbound, readable form; the
-    # caches are empty/unseeded at preparation, so embedding them is cheap and
-    # the compiled body sees them as constants.
-    f = compile(_bind_nonallocating_constants(rewritten, constants, callables, caches,
-                                              cache_apply))
+    f = compile(_nonallocating_body(rewritten))
     S = exact_signature ? Tuple{have_types...} : Nothing
     NonAllocatingKernel{S}(f, constants, callables, caches, cache_apply, Tuple(p.have),
                            Tuple(p.want), p, rewritten)
 end
 
-function _bind_nonallocating_constants(ast::Expr, constants::Tuple, callables::Tuple,
-                                       caches::Tuple, cache_apply)
-    signature = ast.args[1]
-    runtime_args = signature.args[5:end]
-    body = ast.args[2]
-    Expr(:function, Expr(:tuple, runtime_args...),
+# The body a kernel compiles from its step program (`k.ast`): the same statements,
+# reading the two tables, cache tuple and driver from the one reference each call
+# passes (`_NonallocTables`). The body holds code only. RGF caches bodies by
+# content, so preparations of one program share one body and one type, whatever
+# values their tables hold, and each kernel still owns its slots, which belong to
+# the kernel and not to the shared code. A body that held its caches would need
+# its own identity per kernel, so its own type and compile per preparation; one
+# that held bound numbers would specialize on their values (the user's direction
+# on numeric values, `ODLPlaus:precompile` decision
+# `2026-11-06T01-09-46-212-0ikeidi`).
+function _nonallocating_body(ast::Expr)
+    read(name, field) = Expr(:(=), name,
+        Expr(:call, GlobalRef(Core, :getfield), _TABLES_ARG, QuoteNode(field)))
+    Expr(:function, Expr(:tuple, _TABLES_ARG, ast.args[1].args[5:end]...),
          Expr(:block,
-              # RGF caches bodies by content. Equal-looking unseeded cache
-              # tuples still belong to different kernels: reusing the first
-              # body would bind its slots into every later callable. A quoted
-              # per-binding token preserves that identity through local-name
-              # canonicalization and disappears from executable code.
-              QuoteNode(gensym(:_rk_nonallocating_binding)),
-              Expr(:(=), _CONSTANTS_ARG, constants),
-              Expr(:(=), _CALLABLES_ARG, callables),
-              Expr(:(=), _CACHES_ARG, caches),
-              Expr(:(=), _CACHE_APPLY_ARG, cache_apply),
-              body.args...))
+              read(_CONSTANTS_ARG, :constants),
+              read(_CALLABLES_ARG, :callables),
+              read(_CACHES_ARG, :caches),
+              read(_CACHE_APPLY_ARG, :cache_apply),
+              ast.args[2].args...))
 end
 
 """
