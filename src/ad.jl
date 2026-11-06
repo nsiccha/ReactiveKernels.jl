@@ -305,8 +305,8 @@ end
 
 # Each operand is named after the bound value it comes from (the output of its
 # `_BoundConstant` recipe: a bound port, a cached `bound_plate_<name>`, a
-# folded intermediate), with the field path appended for an array leaf of a
-# structured bound value. The leaf order mirrors `_bound_array_leaves`.
+# folded intermediate), with the field path appended for a leaf of a structured
+# bound value. The leaf order mirrors `_bound_operand_leaves`.
 # `recipes` is the kernel's flattened `lowered_recipes`, which matches its
 # constants table one to one, nested plate and scan bodies included (the
 # plan's own recipes cover only the top level).
@@ -357,10 +357,12 @@ _bound_leaf_paths(value::Tuple) = Tuple(
     (index, path...) for (index, field) in enumerate(value)
     for path in _bound_leaf_paths(field))
 _bound_leaf_paths(::AbstractArray) = ((),)
-_bound_leaf_paths(value) = _bound_record(value) ? Tuple(
-    (name, path...) for (name, field) in
-        zip(fieldnames(typeof(value)), _bound_record_fields(value))
-    for path in _bound_leaf_paths(field)) : ()
+_bound_leaf_paths(value) =
+    _bound_value_leaf(value) ? ((),) :
+    _bound_record(value) ? Tuple(
+        (name, path...) for (name, field) in
+            zip(fieldnames(typeof(value)), _bound_record_fields(value))
+        for path in _bound_leaf_paths(field)) : ()
 
 function _unique_symbols(names)
     seen = Set{Symbol}()

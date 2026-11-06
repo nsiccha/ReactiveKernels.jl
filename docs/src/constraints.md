@@ -160,7 +160,7 @@ RKPPL's generated program reads packed positions, axis lengths, scan lengths,
 ordered level counts and data-derived transform bounds from the data it already
 has, so one program serves every extent and value of one declaration
 (`test_bound_array_extents.jl`). Known remaining paths, which are limitations
-to fix and not precedents, are listed under ReactiveKernelsPPL 0.1.106 in its
+to fix and not precedents, are listed under ReactiveKernelsPPL 0.1.107 in its
 changelog. A prepared type may still depend on which data-bound branch arms
 have lanes ("Data-bound branches in plate cells"), which the lazy-branch
 constraint above requires.
@@ -331,7 +331,7 @@ only, no ReactiveKernels code) isolate the remaining backend limitations:
   data-only call that a parameter-dependent call consumes as its own
   statement, so preparation folds it once and the gradient never
   differentiates it. A bound tuple or named tuple then crosses the
-  differentiated call as one operand per array leaf. Helpers inside a
+  differentiated call as one operand per array or numeric leaf. Helpers inside a
   parameter-dependent function remain the backend's limitation.
 - Native Enzyme 0.13.209 reverse mode fails static activity analysis
   (`EnzymeRuntimeActivityError`) when buffers allocated in the two arms of a

@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.95
+## 0.1.96
 
 - A range of scalars (`lo:hi`) inside a larger expression is no longer split
   out as a cached partial-evaluation value: constructing it costs no more
@@ -27,10 +27,30 @@ are recorded in the git history only.
 - `reshape(v, n, k)` with every dimension an input now has the same row form
   as `reshape(v, n, 2)`: a cell reads only the packed positions its own rows
   hold. A bare call of inputs alone used to be computed whole.
-  ReactiveKernelsPPL 0.1.106 reads its packed blocks both ways.
+  ReactiveKernelsPPL 0.1.107 reads its packed blocks both ways.
 - A plate operand inferred as `Union{}`, as the cell of an empty plate can be, no
   longer raises `Tuple field type cannot be Union{}` while typing the plate's
   output: the plate's region validates its axis, as for an unknown operand.
+
+## 0.1.95
+
+- A bound number's value no longer changes a prepared derivative's type.
+  `prepare_ad` rewrites the generated body when a bound value is a tuple or a
+  record holding arrays, and that rewrite spelled every bound number in it: a
+  scalar beside that value, and the value's own numeric leaves. Each value was
+  then another generated function, so another type and a new compile of the
+  whole derivative. Numbers, and pointer-free immutables that hold them (a range,
+  a scale), now cross as hidden operands like the arrays do. Values and
+  derivatives are unchanged. A leaf that holds pointers but no array (a `Ref`, a
+  `String`) stays a literal of the rebuild.
+- A program that took that rewrite no longer has those numbers folded into its
+  compiled derivative, so its gradient computes what they had folded away. A
+  bound response scale then computes `log(scale)` on every row in the gradient,
+  as it already did in the primal and in every program without the rewrite. On
+  12 blocks of 2000 rows a gradient took 113 us with the numbers in the body and
+  271 us without them, at one load in one process. Bound prior numbers, which
+  run above their loop, cost about 6 percent. Lifting that work out of the loop
+  is tracked by snag `bound-response-s-9739d33d`.
 
 ## 0.1.94
 
