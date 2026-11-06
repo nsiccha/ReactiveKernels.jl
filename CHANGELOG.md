@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.93
+## 0.1.94
 
 - A cell or partition query of a tuple-valued plate whose readers read different
   entries runs each of the plate's statements only at rows where one of those
@@ -24,6 +24,14 @@ are recorded in the git history only.
   computes nor reads what only another entry needs, so `partition_footprint` and
   `partition_separability` no longer report those coordinates for it. Values are
   unchanged.
+
+## 0.1.93
+
+- `prepare` with `bound=` data no longer fails with a `MethodError` (`Cannot
+  convert` a tuple to `Int64`) when a data-only computation under two guards of
+  a plate cell throws, such as `sqrt(d)` for a negative `d` in an arm of an
+  inlined endpoint. The computation stays under both guards, as authored. The
+  failure came from 0.1.88's typed sets for nested-arm speculation.
 
 ## 0.1.92
 
