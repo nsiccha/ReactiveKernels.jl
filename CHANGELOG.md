@@ -16,6 +16,21 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.98
+
+- A plate cell whose lazy branch is decided by bound data, such as a response
+  density under `noise > 0 ? normal(mu, noise).logpdf(y) : -Inf` with `noise` and
+  `y` bound, runs its arm's work over bound values at preparation instead of on
+  every lane. `log(noise)` is one value of the binding, read at run time, and
+  `log(y)` one value per lane, so a known scale costs no more per call than a
+  sampled one. An arm's work over literals that the compiler does not fold, such
+  as a written Student-t's `logbeta`, moves the same way. Gradients are unchanged,
+  and values agree up to the rounding of a loop that now vectorizes. An invalid
+  bound scale still takes the fallback arm without evaluating the other.
+- This removes the per-row `log(scale)` that 0.1.95's entry describes. On its 12
+  blocks of 2000 rows the gradient falls from 291 to 126 us and the density from
+  203 to 57 us, in one process at one load.
+
 ## 0.1.97
 
 - A range of scalars (`lo:hi`) inside a larger expression is no longer split

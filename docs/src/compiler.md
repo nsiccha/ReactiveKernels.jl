@@ -731,11 +731,19 @@ or a bound-only cell value that the pass has already evaluated per lane.
 A lane-invariant condition selects its arm without splitting.
 
 An arm with its own graph (a plain arm expression, authored as a cell of its
-own as described below) becomes that graph's recipes in its plate, as in the
-native shared-condition lowering. Its work over shared plate arguments
-therefore runs once per call, above the lane loop, and only when some lane
-takes the arm. An arm without a graph, or one reading no lane value, runs as
-its closure on each of its lanes.
+own as described below) that holds work over shared plate arguments or bound
+values becomes that graph's recipes in its plate, as in the native
+shared-condition lowering. Its work over a live shared argument therefore runs
+once per call, above the lane loop, and only when some lane takes the arm. Its
+work over bound values runs at preparation, on the arm's lanes only: under
+`noise > 0 ? normal(mu, noise).logpdf(y) : -Inf` with `noise` and `y` bound,
+`log(noise)` is one value of the binding, read at run time like any other bound
+value, and a nonpositive `noise` takes the fallback arm without evaluating it.
+Work over literals alone that the compiler does not fold, such as the `logbeta`
+of a written `student_t(4.0, mu, 0.2)`, runs there as well. Any other arm runs as
+its closure on each of its lanes, which keeps its literal constants compile-time
+constants, as in `normal(mu, 0.2)`: an arm without a graph, an arm reading no lane
+value, and an arm whose graph holds no such work.
 
 The prepared program contains no branch for that condition, so no backend
 receives one:
