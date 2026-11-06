@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.104
+
+- Each observation's pointwise density plate declares its cell's density as
+  `Float64`, as a grouped observation's totals plate already did. A partition
+  of several observations (`prepare_partition`) then knows each observation's
+  sum type even when its density comes from a helper or a censoring branch
+  that inference cannot type, so with a ReactiveKernels release that guards a
+  partition sum without cells (0.1.90 and later) a unit with no cell of such
+  an observation neither computes nor reads the work only that observation
+  needs. Values are unchanged.
+
 ## 0.1.103
 
 - `prepare_partition` and `prepare_partition_sampler` with `partitioned`

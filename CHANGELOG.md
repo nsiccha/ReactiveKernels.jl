@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.92
+
+- In a partition over several plates lowered with one cell emitter, work that
+  only some of the plates read runs when one of those plates has a cell with
+  the label: a whole value shared by two plates that both have no cell for the
+  label is neither computed nor read, as one only a single plate reads already
+  was (0.1.90).
+
 ## 0.1.91
 
 - `partition_plan_kernel(kernel)` and `partition_plan(kernel, …)` lower a

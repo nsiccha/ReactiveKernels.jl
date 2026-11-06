@@ -559,6 +559,87 @@ end
     @test all(s -> s[1] == s[2], values(structures))
 end
 
+# Sums `a` and `b` share a whole factor of label-1 coordinates and both have
+# cells only in label 1; `c` has cells in both labels and shares the pushed `s`
+# with them, so all three lower with one emitter.
+@kernel grouped_shared_factor(u::AbstractVector{Float64}, Z::AbstractMatrix{Float64},
+                              L::AbstractMatrix{Float64}, rows::AbstractVector{Int},
+                              arow::AbstractVector{Int}, ya::AbstractVector{Float64},
+                              yb::AbstractVector{Float64}, yc::AbstractVector{Float64},
+                              akey::AbstractVector{Int}, bkey::AbstractVector{Int},
+                              ckey::AbstractVector{Int}) = begin
+    s = exp.(u[1:2])
+    raw = u[3:4]
+    scale = log.(raw)
+    F = scale .* L
+    R = Z * F'
+    ma = R[rows, 1] .+ s[arow]
+    mb = R[rows, 2] .- s[arow]
+    a = plate(ya, ma) do y, m
+        density::Float64 = -(y - m)^2 / 2
+        density
+    end
+    b = plate(yb, mb) do y, m
+        density::Float64 = -(y - m)^2 / 2
+        density
+    end
+    c = plate(yc, s) do y, si
+        density::Float64 = -(y - si)^2 / 2
+        density
+    end
+end
+
+@testset "work several grouped sums share follows its readers" begin
+    factor_bound = (; Z = [0.2 -0.1; 0.4 0.3], L = [1.0 0.0; 0.3 0.8],
+        rows = repeat([1, 2], 2), arow = fill(1, 4), ya = fill(0.3, 4), yb = fill(-0.2, 4),
+        yc = [0.1, 0.2], akey = fill(1, 4), bkey = fill(1, 4), ckey = [1, 2])
+    function factor_expected(u, label)
+        d = factor_bound
+        s = exp.(u[1:2])
+        value = -(d.yc[label] - s[label])^2 / 2
+        label == 1 || return value
+        R = d.Z * (log.(u[3:4]) .* d.L)'
+        value - sum(abs2, d.ya .- (R[d.rows, 1] .+ s[1])) / 2 -
+            sum(abs2, d.yb .- (R[d.rows, 2] .- s[1])) / 2
+    end
+    cases = ((grouped_shared_factor, (:a, :b, :c), (a = :akey, b = :bkey, c = :ckey),
+              factor_bound, factor_expected),)
+    for (model, plates, by, bound, expected) in cases, plan in (nothing, :plan)
+        spec = plate_partition(model, plates; by, locality = :error,
+            partitioned = (:u => Union{Missing,Int}[1, 2, 1, 1],), plan)
+        u = [0.2, -0.1, 1.2, 1.4]
+        q = plan === nothing ? prepare(spec; want = :partition_total, bound) :
+            prepare(spec; want = :partition_total, bound, exemplars = (u, 1, nothing))
+        extra(label, u) = plan === nothing ? () : (partition_plan(q, u, label, nothing),)
+        footprint(label, u) = plan === nothing ? partition_footprint(q, u, label).u :
+            partition_footprint(q, u, label, nothing).u
+        for label in (1, 2)
+            @test q(u, label, extra(label, u)...) ≈ expected(u, label)
+            # Label 2 has no cell of the sums that read coordinates 3 and 4.
+            @test footprint(label, u) == (label == 1 ? [1, 3, 4] : [2])
+            plan === nothing && @test partition_separability(q, u, label).u == footprint(label, u)
+            ad = prepare_ad(q, AutoEnzyme(; mode = Enzyme.Reverse), u, label,
+                            extra(label, u)...; active = :u)
+            value, gradient = ad_value_and_gradient(ad, u, label, extra(label, u)...)
+            @test value ≈ expected(u, label)
+            for j in eachindex(u)
+                plus, minus = copy(u), copy(u)
+                plus[j] += 1e-6
+                minus[j] -= 1e-6
+                @test gradient[j] ≈ (q(plus, label, extra(label, plus)...) -
+                                     q(minus, label, extra(label, minus)...)) / 2e-6 atol=2e-8 rtol=2e-6
+            end
+        end
+    end
+    # The shared factor is not evaluated for label 2, even when invalid there.
+    spec = plate_partition(grouped_shared_factor, (:a, :b, :c);
+        by = (a = :akey, b = :bkey, c = :ckey), locality = :error)
+    q = prepare(spec; want = :partition_total, bound = factor_bound)
+    v = [0.2, -0.1, -1.0, 1.4]
+    @test q(v, 2) ≈ factor_expected(v, 2)
+    @test_throws DomainError q(v, 1)
+end
+
 @testset "empty observation portions do not demand scalar dependencies" begin
     spec = plate_partition(absent_scalar, (:a, :b);
         by = (a = :extra_key, b = :key), locality = :error)
