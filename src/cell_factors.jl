@@ -172,7 +172,7 @@ function _cell_factor_graph(p::Plan, original_ports, original_order;
                 q = _add_recipe!(g, part.inputs, part.outputs, part.op, part.cost,
                                  nothing, false, part.source)
                 mapping === nothing || union!(cell_outputs, (v.id for v in q.outputs))
-                record(q, part === last(expanded) ? only(r.outputs).name : only(part.outputs).name)
+                record(q, first(part === last(expanded) ? r.outputs : part.outputs).name)
             end
         else
             q = _add_recipe!(g, ins, outs, r.op, r.cost, r.cse_key, r.effectful, r.source)
