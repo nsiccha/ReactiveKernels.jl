@@ -16,6 +16,24 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.109
+
+- `partitioned = :none` declares that partitions own no parameter, for
+  `prepare_partition`, `prepare_partition_sampler`, `prepare_cell_query`,
+  `prepare_cell_factors` and `prepare_compact_cell_ad`. Every coordinate is then
+  shared, as with an all-`missing` label vector on some parameter, which keeps
+  working. The default `partitioned = ()` still declares nothing, so strict
+  locality still refuses a value with no row form. A parameter named `none` makes
+  the bare symbol ambiguous and is refused; `(:none,)` still names that parameter.
+- `partition_batch_value_and_gradient!(s, g, u, labels; weights = nothing)` gives a
+  batch of partitions' summed value and its gradient over the whole packed vector,
+  running one pullback through the shared values instead of one per label. Sweeping
+  400 units of one space-time toy took 7.0 s through `partition_value_and_gradient!`
+  and about 70 ms this way, with the same values and gradients. A whole-model
+  gradient took 23 ms there, so a batch is for a subset of the units. It requires
+  native `AutoEnzyme` reverse. `PartitionSampler` gains a type parameter.
+- Requires ReactiveKernels 0.1.99, whose refusal names these routes.
+
 ## 0.1.108
 
 - Sizes and data-derived numbers stay data in the generated program, never one

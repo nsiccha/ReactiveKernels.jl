@@ -364,7 +364,10 @@ end
     end
     @test err isa PartitionLocalityError
     @test [v.value for v in err.violations] == [:field]
-    warned = @test_logs (:warn, r"computes a value whole") prepare(
+    # The refusal names both ways on: at the value's whole cost per partition, or shared.
+    @test occursin("locality = :warn", sprint(showerror, err))
+    @test occursin("partitioned = :none", sprint(showerror, err))
+    warned = @test_logs (:warn, r"computes a value whole.*partitioned = :none") prepare(
         plate_partition(_pp_opaque, :dens; by = :key, index = :label, locality = :warn);
         have = (:x, :s, :w, :key, :label), want = :partition_total)
     x, w, key = [1.0, 2.0, 3.0, 4.0], [0.1, 0.2, 0.3, 0.4], [1, 2, 1, 2]

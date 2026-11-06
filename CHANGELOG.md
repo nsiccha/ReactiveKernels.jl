@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.99
+
+- `PartitionLocalityError` and the `locality = :warn` warning name the route for
+  a value that reads only shared parameters: `partitioned` in the queries of
+  ReactiveKernelsPPL 0.1.109, or `partitioned = :none` when partitions own no
+  parameter. The refusal also says that `locality = :warn` computes such a value
+  again for every cell or partition, instead of offering it as the only way on.
+
 ## 0.1.98
 
 - A plate cell whose lazy branch is decided by bound data, such as a response

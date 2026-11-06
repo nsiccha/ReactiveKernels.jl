@@ -713,7 +713,7 @@ unless set). `ReactiveKernels.partition_locality(q)` lists the executed
 residual's values.
 
 Optional `partitioned` identifies parameters that can change between local
-evaluations, using the names or `parameter => level_labels` accepted by
+evaluations, using the names, `parameter => level_labels` or `:none` accepted by
 [`prepare_partition_sampler`](@ref). Other coordinates are shared. The query
 caches their intermediate values across cells and local changes, compares
 the shared coordinates those values read by value (including in-place edits),
@@ -1595,7 +1595,8 @@ rows; otherwise preparation throws a `ReactiveKernels.PartitionLocalityError`
 naming each such value and its statement.
 
 With `partitioned`, use the same local/shared coordinate declaration and
-separability check as [`prepare_partition_sampler`](@ref). Shared intermediates
+separability check as [`prepare_partition_sampler`](@ref), including
+`partitioned = :none` when partitions own no parameter. Shared intermediates
 are cached across labels and local changes, and the strict check applies to
 the remaining per-partition program. Row-capable calculations stay in that
 program. `u0` is an optional packed exemplar (zeros by default), as for
@@ -1686,10 +1687,10 @@ end
 A [`PartitionQuery`](@ref) with its `prepare_ad` gradient: compact, over each
 partition's footprint (the packed coordinates it reads), or dense over the
 whole packed vector. Construct with [`prepare_partition_sampler`](@ref); use
-[`partition_value_and_gradient!`](@ref) and [`partition_footprint`](@ref).
-Not thread-safe: prepare one per thread.
+[`partition_value_and_gradient!`](@ref), [`partition_batch_value_and_gradient!`](@ref)
+and [`partition_footprint`](@ref). Not thread-safe: prepare one per thread.
 """
-mutable struct PartitionSampler{K,P,L,C,T}
+mutable struct PartitionSampler{K,P,L,C,T,B}
     const kernel::K
     const ad::P
     const layout::L
@@ -1710,6 +1711,11 @@ mutable struct PartitionSampler{K,P,L,C,T}
     # Each label's plan of the differentiated kernel (`partition_plan`).
     const plans::Dict{Any,T}
     const prefix::C
+    # The backend and active ports a batch's additive operators are prepared
+    # from, on the first batch: a sampler that never runs one pays nothing.
+    const backend::B
+    const selector::Tuple{Vararg{Symbol}}
+    batch::Any
     value::Float64
 end
 _compact(s::PartitionSampler) = !isempty(s.slots)
@@ -1799,9 +1805,19 @@ function _partition_coordinate_labels(plan::StructuralPlan, layout::LayoutTable,
 end
 
 function _query_partition_rule(plan, layout, partitioned, keys_by_name)
+    partitioned === :none && return _query_no_owner_rule(layout)
     declarations = partitioned isa Union{Symbol,Pair} ? (partitioned,) : partitioned
     isempty(declarations) ? () :
         (:unconstrained => _partition_coordinate_labels(plan, layout, declarations, keys_by_name),)
+end
+
+# `partitioned = :none`: no partition owns a coordinate, so every one is shared.
+function _query_no_owner_rule(layout)
+    any(e -> e.name === :none, layout.entries) && throw(ContractValidationError(
+        "[query] `partitioned = :none` is ambiguous: this model has a parameter named " *
+        "`none`. Write `partitioned = (:none,)` or `(:none => labels,)` to name it, or " *
+        "`(:none => fill(missing, n),)` to declare that partitions own nothing"))
+    (:unconstrained => Vector{Any}(missing, layout.total),)
 end
 
 function _query_exemplar(layout, u0)
@@ -1898,6 +1914,13 @@ each level's label. Preparation then checks every label: a partition that
 reads another label's coordinates of those parameters, even genuinely, is
 refused with a `ReactiveKernels.PartitionSeparabilityError` naming them.
 
+`partitioned = :none` declares that partitions own no parameter: every coordinate
+is shared, so a value with no row form that reads only parameters is computed
+once and read at each partition's rows. This differs from the default `()`, which
+declares nothing and leaves such a value to the `locality` check. `shared = false`
+then has no coordinate to differentiate. A parameter literally named `none` makes
+the bare symbol ambiguous, and is refused; `(:none,)` still names that parameter.
+
 For `parameter => labels`, the label count is the first constrained dimension
 (`first(parameter_metadata(built)[i].shape)`), or the packed count for a scalar.
 Labels cycle in order over that parameter's packed coordinates. The packed
@@ -1919,6 +1942,9 @@ with the chosen backend. That pullback may recompute its forward work; no
 backend tape reuse is assumed. `shared = false` on the gradient call requests
 only local derivatives. It differentiates a separate compact conditional
 program, avoiding cotangents for the cached shared frontier and its pullback.
+Each full gradient call runs that pullback once, so sweeping units one call at a
+time costs one whole pullback per unit;
+[`partition_batch_value_and_gradient!`](@ref) runs it once per batch.
 """
 function prepare_partition_sampler(built, plan::StructuralPlan, observations,
         u0::AbstractVector{<:Real}; by, backend, compact::Bool = true, partitioned = (),
@@ -1997,7 +2023,7 @@ function _prepare_partition_sampler(built, plan::StructuralPlan, by, names, layo
         end
         return PartitionSampler(kernel, ad, layout, names, keys_by_name, labels, exemplar,
             footprints, local_footprints, Dict{Any,Vector{Int}}(), Int[], Int32[],
-            Float64[], Float64[], plans, nothing, NaN)
+            Float64[], Float64[], plans, nothing, backend, (:unconstrained,), nothing, NaN)
     end
     # One selection width for every label: each footprint padded with the
     # smallest positions outside it (their derivative is zero).
@@ -2035,7 +2061,8 @@ function _prepare_partition_sampler(built, plan::StructuralPlan, by, names, layo
             label, plans[label]; active = :_ppl_cell_active)
     end
     PartitionSampler(kernel, ad, layout, names, keys_by_name, labels, exemplar, footprints,
-        local_footprints, selections, selected, slots, active, zeros(width), plans, nothing, NaN)
+        local_footprints, selections, selected, slots, active, zeros(width), plans, nothing,
+        backend, (:_ppl_cell_active,), nothing, NaN)
 end
 
 """
@@ -2094,6 +2121,121 @@ end
 partition_value_and_gradient!(s::PartitionSampler, g::AbstractVector, u::AbstractVector,
                               label; shared::Bool = true) =
     partition_value_and_gradient!(s, g, Vector{Float64}(u), label; shared)
+
+"""
+    partition_batch_value_and_gradient!(s::PartitionSampler, g, u, labels; weights = nothing)
+
+The summed log density of the partitions in the collection `labels`, and its
+gradient over the whole packed vector, written into `g` for a compact sampler
+too. Returns `(value, g)`. `u` is read only. A label may repeat, which counts its
+partition again, and an empty collection gives zero. `weights`, one number per
+label, multiplies each partition's term, as a minibatch's scale does.
+
+Every label adds to one cotangent of the shared values, and one pullback through
+them runs at the end, so a batch costs its partitions' footprints plus one
+pullback. Sweeping the same labels through
+[`partition_value_and_gradient!`](@ref) runs that pullback once per label. A
+batch does not make the shared values local, so it costs at least that one
+pullback: for most of a model's partitions an ordinary whole-model gradient can
+be cheaper. A sampler prepared without `partitioned` or without shared values
+has no pullback to share, and its batch is the plain sum.
+
+The first call prepares the batch's operators, and native `AutoEnzyme` reverse
+is required, as for [`prepare_cell_accumulator`](@ref). A unit's own coordinates
+are at `partition_footprint(s, label; shared = false)` in `g`.
+"""
+function partition_batch_value_and_gradient!(s::PartitionSampler, g::AbstractVector,
+        u::Vector{Float64}, labels; weights = nothing)
+    length(u) == s.layout.total || throw(ContractValidationError(
+        "[query] packed length $(length(u)) ≠ layout total $(s.layout.total)"))
+    length(g) == s.layout.total || throw(ContractValidationError(
+        "[query] a batch's gradient is over the whole packed vector: gradient length " *
+        "$(length(g)) ≠ layout total $(s.layout.total)"))
+    weights === nothing || length(weights) == length(labels) || throw(ContractValidationError(
+        "[query] $(length(weights)) weights for $(length(labels)) labels"))
+    foreach(label -> _partition_plan_of(s, label), labels)
+    if isempty(labels)
+        fill!(g, 0.0)
+        return 0.0, g
+    end
+    s.batch === nothing && (s.batch = Base.invokelatest(_prepare_partition_batch, s))
+    (_latest_value(_partition_batch!, s, s.batch, g, u, labels, weights), g)
+end
+partition_batch_value_and_gradient!(s::PartitionSampler, g::AbstractVector, u::AbstractVector,
+                                    labels; weights = nothing) =
+    partition_batch_value_and_gradient!(s, g, Vector{Float64}(u), labels; weights)
+
+# A batch's storage: one additive operator per label type, the pass's packed
+# gradient, one partition's compact derivative, and the one cotangent of the
+# shared values that every label adds to.
+mutable struct _PartitionBatch{A,V}
+    const accumulators::A
+    const gradient::Vector{Float64}
+    const compact_gradient::Vector{Float64}
+    shadows::V
+end
+
+function _prepare_partition_batch(s::PartitionSampler)
+    cached = s.prefix === nothing ? () : s.prefix.values
+    accumulators = _partition_prepare_ad(s.labels) do label
+        args = if _compact(s)
+            selection = s.selections[label]
+            (s.exemplar, s.exemplar[selection], _compact_cell_slots(s.layout.total, selection),
+             label, s.plans[label], cached...)
+        else
+            (s.exemplar, label, s.plans[label], cached...)
+        end
+        ReactiveKernels.prepare_ad_accumulator(_partition_ad(s.ad, label).kernel, s.backend,
+            args...; active = s.selector, directional = first(s.selector), order = 0)
+    end
+    shadows = map(v -> ReactiveKernels._ad_zero_cotangent(
+        ReactiveKernels._ad_active_point_component(v)), cached)
+    _PartitionBatch(accumulators, zeros(s.layout.total), zeros(length(s.active)), shadows)
+end
+
+function _partition_batch!(s::PartitionSampler, batch::_PartitionBatch, g, u, labels, weights)
+    cached = s.prefix === nothing ? () : _refresh_partition_prefix!(s.prefix, u)
+    point = map(ReactiveKernels._ad_active_point_component, cached)
+    if !ReactiveKernels._ad_tangent_matches(point, batch.shadows)
+        batch.shadows = map(ReactiveKernels._ad_zero_cotangent, point)
+    end
+    _zero_cell_shadow!(batch.shadows)
+    fill!(batch.gradient, 0.0)
+    total = 0.0
+    for (label, weight) in zip(labels, weights === nothing ? Iterators.repeated(1.0) : weights)
+        total += _partition_accumulate!(s, _partition_ad(batch.accumulators, label), batch,
+            u, label, Float64(weight), cached)
+    end
+    if s.prefix !== nothing
+        seed = _partition_frontier_seed(map(ReactiveKernels._ad_active_value, batch.shadows))
+        propagated = ad_pullback(s.prefix.ad, seed, u, s.prefix.point, s.prefix.slots)
+        for (i, position) in enumerate(s.prefix.positions)
+            batch.gradient[position] += propagated[i]
+        end
+    end
+    # Only here, so a failed pass leaves the caller's `g` as it was.
+    copyto!(g, batch.gradient)
+    total
+end
+
+function _partition_accumulate!(s, accumulator, batch, u, label, weight, cached)
+    plan = s.plans[label]
+    _compact(s) || return ReactiveKernels.ad_accumulate!(accumulator,
+        (batch.gradient, batch.shadows...), nothing, weight, u, label, plan, cached...)
+    selection = s.selections[label]
+    _select_partition!(s, selection)
+    for (i, position) in enumerate(selection)
+        s.active[i] = u[position]
+    end
+    fill!(batch.compact_gradient, 0.0)
+    value = ReactiveKernels.ad_accumulate!(accumulator,
+        (batch.compact_gradient, batch.shadows...), nothing, weight,
+        u, s.active, s.slots, label, plan, cached...)
+    for position in s.footprints[label]
+        batch.gradient[position] += batch.compact_gradient[s.slots[position]]
+    end
+    value
+end
 
 # Pad each exact footprint to one AD input width across all labels.
 function _partition_selections(footprints; padding=Iterators.countfrom(1))
@@ -2274,7 +2416,8 @@ function _prepare_shared_partition_sampler(kernel, parts, layout, names, by, lab
     cache = _PartitionPrefix(initial.kernel, prefix_ad, initial.positions, initial.point,
         initial.slots, cached, local_state, true)
     PartitionSampler(kernel, ad, layout, names, by, labels, exemplar, footprints,
-        local_footprints, selections, selected, slots, active, zeros(length(active)), plans, cache, NaN)
+        local_footprints, selections, selected, slots, active, zeros(length(active)), plans, cache,
+        backend, selector, nothing, NaN)
 end
 
 function _refresh_partition_prefix!(cache::_PartitionPrefix, u, kernel = cache.kernel)
