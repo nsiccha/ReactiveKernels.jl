@@ -248,4 +248,74 @@ end
         end
     end
 end
+
+# A joint vector observation cell under a shared prefix: the program BRM
+# emits for connected NLME units (snag `brm-joint-cell-s-2d923270`), whose
+# cell mean vectors come from an argument plate and whose group scale is read
+# as `tau[1]`. The residual is prepared from exemplars and its plan port is
+# typed by the plan its exemplar-typed lowering computes; each label's plan
+# must come from that same lowering. An untyped plan lowering made other
+# type-dependent choices for this program (a scalar parameter `tau` forms no
+# shared prefix here) and emitted other plan fields, so every prefixed
+# call refused its own plan and the sampler failed at preparation.
+@testset "joint vector cells under a shared prefix" begin
+    model = quote
+        tau[1:1] .~ LogNormal.(0, 1)
+        z[1:3, 1:1] .~ Normal.(0, 1)
+        b_subject = z .* tau[1]
+        ranef = b_subject[subject_level, 1]
+        intercept ~ Normal(0.0, 1.0)
+        mu = intercept .+ ranef
+        beta ~ Normal(0.0, 1.0)
+        @plate for i in eachindex(y_cell)
+            y_mean[i] = [mu[left[i]], mu[right[i]]]
+        end
+        shared_y .~ Normal.(beta, 1)
+        @plate for i in eachindex(y)
+            y[i] ~ MvNormal(y_mean[i], C)
+        end
+    end
+    data = (; subject_level=[1, 2, 3], left=[1, 3], right=[2, 3], y_cell=[1, 2],
+        y=[[0.1, 0.2], [-0.1, 0.4]], C=[1.0 0.2; 0.2 1.0], shared_y=[0.3])
+    names = (:y, :shared_y)
+    by = (; y=[1, 2], shared_y=[1])
+    rule = (:z => [1, 1, 2],)
+    plan = lower_rkppl(model, data; conditioned=names, mod=@__MODULE__)
+    bound = bind_data(plan, data)
+    built = build_kernel(bound)
+    position(name) = only(e.offset for e in built.layout.entries if e.name === name)
+    function density(u, label)
+        b, tau, beta = u[position(:intercept)], exp(u[position(:tau)]), u[position(:beta)]
+        mu = b .+ tau .* u[position(:z) .+ (0:2)]
+        total = label == 1 ? logpdf(Normal(beta, 1), only(data.shared_y)) : 0.0
+        for i in eachindex(data.y)
+            by.y[i] == label || continue
+            total += logpdf(MvNormal([mu[data.left[i]], mu[data.right[i]]], data.C), data.y[i])
+        end
+        total
+    end
+    u = collect(range(-0.3, 0.4; length=built.layout.total))
+    query = prepare_partition(built, bound, names; by, locality=:error, partitioned=rule, u0=u)
+    @test query.prefix !== nothing
+    for point in (u, u .+ 0.1), label in (2, 1)
+        @test query(point, label) ≈ density(point, label)
+    end
+    plain = prepare_partition(built, bound, names; by, locality=:error)
+    for compact in (true, false)
+        sampler = prepare_partition_sampler(built, bound, names, u; by, backend=BACKEND,
+            compact, partitioned=rule)
+        @test sampler.prefix !== nothing
+        baseline = prepare_partition_sampler(built, bound, names, u; by, backend=BACKEND,
+            compact=false)
+        for label in (2, 1)
+            fp = partition_footprint(sampler, label)
+            gradient = zeros(compact ? length(fp) : length(u))
+            value, _ = partition_value_and_gradient!(sampler, gradient, u, label)
+            expected = zero(u)
+            expected_value, _ = partition_value_and_gradient!(baseline, expected, u, label)
+            @test value ≈ density(u, label) ≈ plain(u, label) ≈ expected_value
+            @test gradient ≈ (compact ? expected[fp] : expected)
+        end
+    end
+end
 end # module

@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.91
+
+- `partition_plan_kernel(kernel)` and `partition_plan(kernel, …)` lower a
+  label's plan from the argument types `kernel` was prepared with (its
+  exemplars, `nothing` at the plan port), as `prepare` lowered the kernel. A
+  kernel prepared from exemplars types its plan port by that lowering, while
+  the plan kernel lowered without those types and could compute a plan with
+  other fields, which the kernel then refused (`this kernel was prepared from
+  exemplar argument types …`). RKPPL's `prepare_partition` and
+  `prepare_partition_sampler` with `partitioned` (a shared prefix) failed this
+  way on a joint vector observation cell, such as `y[i] ~ MvNormal(…)` in an
+  `@plate for` loop. Kernels prepared without exemplars are unchanged.
+
 ## 0.1.90
 
 - A partition sum that shares a computed value with the other sums of its

@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.103
+
+- `prepare_partition` and `prepare_partition_sampler` with `partitioned`
+  (a cached shared prefix) evaluate a joint vector observation cell, such as
+  `y[i] ~ MvNormal([mu[left[i]], mu[right[i]]], C)` in an `@plate for` loop,
+  again: every call refused the label's own plan with `this kernel was
+  prepared from exemplar argument types …`. Requires ReactiveKernels 0.1.91.
+
 ## 0.1.102
 
 - Partition sampler gradients with `shared=false` differentiate a compact
