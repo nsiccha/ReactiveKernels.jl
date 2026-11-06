@@ -436,10 +436,11 @@ _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
             @test sampler.layout.total == n
             value, gradient = sampler_value_and_gradient!(sampler, zeros(n), u)
             @test value ≈ want
-            @test gradient ≈ _extent_central(x -> Base.invokelatest(q, x), u) atol = 1e-5
             @test coordinate_names(sampler.layout) == [Symbol("z.", i) for i in 1:n]
-            # A cell query reads this binding's rows and coordinates too.
+            @test length(gradient) == n
             n == 0 && continue
+            @test gradient ≈ _extent_central(x -> Base.invokelatest(q, x), u) atol = 1e-5
+            # A cell query reads this binding's rows and coordinates too.
             cells = prepare_cell_query(built, bound, :y; locality = :error)
             for i in 1:n
                 @test Base.invokelatest(cells, u, i) ≈ logpdf(Normal(d.x[i] * z[i], d.observation_sd), d.y[i])
