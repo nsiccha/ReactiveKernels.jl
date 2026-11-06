@@ -274,7 +274,7 @@ end
     end
 end
 
-@testset "a build refuses a binding that generates another program" begin
+@testset "a build serves a binding with other level labels" begin
     u3 = [0.1, -0.2, 0.3, 0.2, -0.1]
     m = @rkppl begin
         a ~ Normal(0, 1)
@@ -286,15 +286,14 @@ end
     y = _rr_y(6)
     built = build_kernel(m(; g = [1, 2, 3, 1, 2, 3]) | (; y))
     relabeled = m(; g = [2, 3, 4, 2, 3, 4]) | (; y)
-    # refused: the graph holds the build's level labels (1, 2, 3); on the
-    # labels 2, 3, 4 it would evaluate another model without an error
-    # (snag rkppl-opaque-loc-37de7b80)
-    @test_throws ContractValidationError prepare_query(built, relabeled, :likelihood)
-    @test_throws "needs its own `build_kernel(plan)`" prepare_query(built, relabeled, :likelihood)
+    # The graph reads the binding's labels, so on the labels 2, 3, 4 it evaluates
+    # this model, not the build's (the wrong-model read of snag
+    # rkppl-opaque-loc-37de7b80 needed the labels in the graph).
     own = build_kernel(relabeled)
     nt = constrain(own.layout, u3)
-    @test Base.invokelatest(prepare_query(own, relabeled, :likelihood), u3) ≈
-        sum(logpdf.(Normal.(nt.a .+ nt.c[[1, 2, 3, 1, 2, 3]], nt.s), y)) rtol = 1e-12
+    expected = sum(logpdf.(Normal.(nt.a .+ nt.c[[1, 2, 3, 1, 2, 3]], nt.s), y))
+    @test Base.invokelatest(prepare_query(own, relabeled, :likelihood), u3) ≈ expected rtol = 1e-12
+    @test Base.invokelatest(prepare_query(built, relabeled, :likelihood), u3) ≈ expected rtol = 1e-12
     # Same labels in another order and count: the same program.
     regrouped = m(; g = [3, 1, 2, 2]) | (; y = y[1:4])
     @test Base.invokelatest(prepare_query(built, regrouped, :likelihood), u3) ≈

@@ -234,26 +234,26 @@ function _prepare_wants(built, plan::StructuralPlan, want;
     end
 end
 
-# A build serves every binding of its program, and each binding packs its own
-# coordinates: a query reads this binding's layout, never the one the build was
-# made with. The same positions keep the build itself.
+# A build serves every binding of its program, and each binding packs and names
+# its own coordinates: a query reads this binding's layout, never the one the
+# build was made with. The same positions and labels keep the build itself.
 function _binding_build(built, plan::StructuralPlan)
     (built isa NamedTuple && hasproperty(built, :layout) && isbound(plan)) || return built
     layout = assign_layout(plan)
-    _same_positions(layout, built.layout) && return built
+    _same_layout(layout, built.layout) && return built
     return merge(built, (; layout))
 end
-_same_positions(a::LayoutTable, b::LayoutTable) = a.total == b.total &&
+_same_layout(a::LayoutTable, b::LayoutTable) = a.total == b.total &&
     length(a.entries) == length(b.entries) &&
-    all(x.name === y.name && x.offset == y.offset && x.size == y.size
-        for (x, y) in zip(a.entries, b.entries))
+    all(x.name === y.name && x.offset == y.offset && x.size == y.size &&
+        isequal(x.labels, y.labels) for (x, y) in zip(a.entries, b.entries))
 
 # A built graph evaluates the program its build generated. A binding that
-# generates the same program (other row counts, parameter extents and data
-# values, or another gensym-created lowering namespace) evaluates on it exactly
-# as on its own build. A binding that generates another program
-# (other level labels, data element types, missing
-# entries, another broadcast shape) needs its own build;
+# generates the same program (other row counts, parameter extents, level labels
+# and data values, or another gensym-created lowering namespace) evaluates on it
+# exactly as on its own build. A binding that generates another program
+# (data element types, missing entries, another broadcast shape) needs its own
+# build;
 # evaluating the old graph on it can be silently wrong, so it is refused.
 # Values made outside `build_kernel` carry no `program` and are not checked.
 # A value the binding leaves absent has the type its input has in the built
@@ -262,7 +262,7 @@ function _check_built_program(built, plan::StructuralPlan)
     hasproperty(built, :program) || return nothing
     _checked_program(plan, built.program) && return nothing
     typed = _absent_typed_as(plan, built.program)
-    program = _program_identity(kernel_expr(typed, assign_layout(typed)), typed)
+    program = _program_identity(kernel_expr(typed, assign_layout(typed)))
     _same_program(program, built.program) || throw(ContractValidationError(
         "[query] this binding generates a " *
         "different program than the one this graph was built from, so it " *

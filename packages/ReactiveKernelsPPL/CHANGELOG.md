@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.109
+
+- One `build_kernel` now also serves a binding with other level labels, or
+  another number of them: `prepare_query`, `prepare_sampler` and the cell and
+  partition preparations no longer refuse it with "needs its own
+  `build_kernel(plan)`". The program reads the labels from the binding, so the
+  build was already correct for them; only the check compared their values. Each
+  query reads this binding's layout, whose `coordinate_names` are this binding's
+  labels. A path that still holds a literal sized by the labels, such as a legacy
+  coefficient width or a response-derived threshold count, generates another
+  program and is still refused.
+
 ## 0.1.108
 
 - Sizes and data-derived numbers stay data in the generated program, never one
