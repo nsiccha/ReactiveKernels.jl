@@ -771,7 +771,9 @@ enclosing them, and that call more than cheap arithmetic (comparison,
 Under `bound=`, each maximal one whose arguments are all bound becomes a recipe
 of its own. At top level it joins the data-only prefix and runs once per
 binding; in a plate cell it is cached per lane like any bound-only cell value.
-The rest of the recipe reads its value.
+The rest of the recipe reads its value. A destructuring splits the same way:
+`(s, q) = f(exp.(x), a)` under `bound = (; x)` computes `exp.(x)` once per
+binding and still binds both names from one call of `f` per evaluation.
 
 ```julia
 @kernel binomial_loglik(logit, y, n) = begin
