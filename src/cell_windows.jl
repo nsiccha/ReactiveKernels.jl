@@ -2844,6 +2844,193 @@ function _cell_shared_producers(p::Plan, pushed)
     shared
 end
 
+# A cell lowering computes a plate once, at the union of the rows its readers ask
+# for. A tuple-valued plate then computes every entry at every such row, so a
+# reader of one entry also runs the statements only another entry needs and reads
+# their inputs, such as another partition's coordinates (snag
+# `absent-odl-vecto-d98e48bf`). When its readers read different constant entries
+# (`t[k]`), the plate is split by which of those readers' entry sets each statement
+# serves. Each statement goes to the one part for exactly that set, and a part
+# reads earlier parts' values as ordinary batched lanes, so row demand reaches a
+# part only from the readers it serves. Each statement therefore still runs once
+# per row, now only at rows where something reads its result. Each set of entries
+# keeps a part of the plate's tuple arity, an unread entry taking the value of a
+# read one, so its readers are otherwise unchanged. Effectful work stays together.
+function _cell_split_tuple_plates(p::Plan)
+    old = p.graph
+    cid(v) = canon_id(old, v.id)
+    boundary = Set(cid(v) for v in vcat(p.have, p.want))
+    splits = Dict{Int,Any}()
+    for producer in p.recipes
+        producer.op isa _AuthoredPlateLike && length(producer.outputs) == 1 || continue
+        output = cid(only(producer.outputs))
+        output in boundary && continue
+        readers = Recipe[r for r in p.recipes if any(v -> cid(v) == output, r.inputs)]
+        reads = Any[_plate_entries_read(old, Recipe[r], output) for r in readers]
+        any(isnothing, reads) && continue
+        groups = unique(reads)
+        length(groups) >= 2 || continue
+        parts = _plate_entry_parts(producer, groups)
+        parts === nothing && continue
+        splits[producer.id] = (; parts, readers, group = [findfirst(==(read), groups) for read in reads])
+    end
+    isempty(splits) && return p
+    g = Graph(copy(old.values), copy(old.recipes), copy(old.producers),
+              copy(old.aliases), old.version)
+    next_id = minimum((r.id for r in p.recipes); init = 0) - 1
+    # The part each reader of a split plate reads instead, by reader and plate output.
+    finals = Dict{Tuple{Int,ValueId},Value}()
+    recipes = Recipe[]
+    for r in p.recipes
+        inputs = Tuple(get(finals, (r.id, cid(v)), v) for v in r.inputs)
+        split = get(splits, r.id, nothing)
+        if split === nothing
+            push!(recipes, inputs == r.inputs ? r :
+                Recipe(r.id, inputs, r.outputs, r.op, r.cost, r.cse_key, r.effectful, r.source))
+            continue
+        end
+        output = only(r.outputs)
+        values = Value[]
+        for (i, part) in enumerate(split.parts.parts)
+            value = value!(g, Symbol(output.name, :_part, i), Any)
+            recipe = Recipe(next_id, (inputs..., values[part.lanes]...), (value,), part.draft,
+                            part.cost, nothing, false, r.source)
+            next_id -= 1
+            push!(recipes, _built_plate_recipe(something(_plate_without_unread_operands(recipe), recipe)))
+            push!(values, value)
+        end
+        for (reader, group) in zip(split.readers, split.group)
+            finals[(reader.id, cid(output))] = values[split.parts.finals[group]]
+        end
+    end
+    template = Plan(g, p.have, p.want, recipes, p.producer, p.cost, p.candidates)
+    _partial_subplan(template, p.have, p.want, recipes)
+end
+
+# The parts of tuple plate `producer` for readers reading the entry sets `groups`:
+# `parts` in reading order, each a cell draft with the plate's inputs followed by
+# the outputs of its `lanes` (earlier parts), and `finals`, the part holding each
+# group's tuple. `nothing` when the plate's cell is not a source tuple of its inputs,
+# has effectful work, or every statement serves every group.
+function _plate_entry_parts(producer::Recipe, groups::Vector)
+    op = producer.op
+    body = _plate_body(op)
+    inner = body.plan
+    ig = inner.graph
+    length(body.lowered_recipes) == length(inner.recipes) || return nothing
+    at = _plate_tuple_statement(inner)
+    at === nothing && return nothing
+    tuple = inner.recipes[at]
+    all(entries -> !isempty(entries) && issubset(entries, eachindex(tuple.inputs)), groups) ||
+        return nothing
+    any(q -> q.effectful, inner.recipes) && return nothing
+    cid(v) = canon_id(ig, v.id)
+    # The groups each value serves, through the cell's statements.
+    serves = Dict{ValueId,Set{Int}}()
+    for (group, entries) in enumerate(groups), k in entries
+        push!(get!(Set{Int}, serves, cid(tuple.inputs[k])), group)
+    end
+    for index in reverse(eachindex(inner.recipes))
+        index == at && continue
+        q = inner.recipes[index]
+        users = get(serves, cid(only(q.outputs)), nothing)
+        users === nothing && continue
+        foreach(v -> union!(get!(Set{Int}, serves, cid(v)), users), q.inputs)
+    end
+    # A `vec` of an input only re-indexes it, and the cell lowering sees through
+    # it to read a capture at rows (`_cell_capture_root`), which a lane would hide:
+    # each part keeps its own.
+    roots = ValueId[cid(v) for v in inner.have]
+    aliases = Int[index for index in eachindex(inner.recipes)
+                  if index != at &&
+                     _cell_capture_root(inner, roots, only(inner.recipes[index].outputs)) !== nothing]
+    live = Int[index for index in eachindex(inner.recipes)
+               if index != at && !(index in aliases) &&
+                  haskey(serves, cid(only(inner.recipes[index].outputs)))]
+    set_of(index) = sort!(collect(serves[cid(only(inner.recipes[index].outputs))]))
+    all(index -> length(set_of(index)) == length(groups), live) && return nothing
+    # A value's statement reads only values serving at least its sets, so larger
+    # sets come first.
+    sets = unique!(Vector{Int}[set_of.(live); [[group] for group in eachindex(groups)]])
+    sort!(sets; by = set -> (-length(set), set))
+    home = Dict{ValueId,Int}(cid(only(inner.recipes[index].outputs)) =>
+                             findfirst(==(set_of(index)), sets) for index in live)
+    statements = [Int[index for index in live if set_of(index) == set] for set in sets]
+    finals = [findfirst(==([group]), sets) for group in eachindex(groups)]
+    # The inputs of each part's tuple, its group's entries and stand-ins for the rest.
+    tuples = Dict{Int,Vector{Value}}(finals[group] =>
+        Value[tuple.inputs[k in entries ? k : minimum(entries)] for k in eachindex(tuple.inputs)]
+        for (group, entries) in enumerate(groups))
+    # What each part reads from other parts, and the values other parts read from it.
+    reads = [ValueId[] for _ in sets]
+    frontier = [ValueId[] for _ in sets]
+    for (i, indices) in enumerate(statements)
+        for v in Iterators.flatten((get(tuples, i, Value[]),
+                                    (w for index in indices for w in inner.recipes[index].inputs)))
+            u = get(home, cid(v), i)
+            u == i && continue
+            cid(v) in reads[i] || push!(reads[i], cid(v))
+            cid(v) in frontier[u] || push!(frontier[u], cid(v))
+        end
+    end
+    parts = map(eachindex(sets)) do i
+        scalar = Graph()
+        have = Value[value!(scalar, v.name, valtype(v)) for v in inner.have]
+        mapped = Dict{ValueId,Value}(cid(v) => h for (v, h) in zip(inner.have, have))
+        readable = Dict{Int,Recipe}()
+        lanes = sort!(unique(home[id] for id in reads[i]))
+        for u in lanes
+            lane = value!(scalar, Symbol(:_plate_part_, u), Any)
+            push!(have, lane)
+            if length(frontier[u]) == 1
+                mapped[only(frontier[u])] = lane
+                continue
+            end
+            for (k, id) in enumerate(frontier[u])
+                id in reads[i] || continue
+                source = Expr(:ref, lane.name, k)
+                entry = value!(scalar, ig.values[id].name, valtype(ig.values[id]))
+                new = add!(scalar, (lane,) => (entry,),
+                           _partial_source_op(:plate_part, Symbol(:_lane, k), Symbol[lane.name],
+                                              source, @__MODULE__); source)
+                readable[new.id] = new
+                mapped[id] = entry
+            end
+        end
+        for index in Iterators.flatten((aliases, statements[i]))
+            q = inner.recipes[index]
+            outputs = Tuple(get!(mapped, cid(v)) do
+                value!(scalar, v.name, valtype(v))
+            end for v in q.outputs)
+            new = add!(scalar, Tuple(mapped[cid(v)] for v in q.inputs) => outputs, q.op;
+                       cost = q.cost, source = q.source)
+            readable[new.id] = body.lowered_recipes[index]
+        end
+        result = if haskey(tuples, i)
+            value = value!(scalar, only(tuple.outputs).name, valtype(only(tuple.outputs)))
+            new = add!(scalar, Tuple(mapped[cid(v)] for v in tuples[i]) => (value,), tuple.op;
+                       cost = tuple.cost, source = tuple.source)
+            readable[new.id] = body.lowered_recipes[at]
+            value
+        elseif length(frontier[i]) == 1
+            mapped[only(frontier[i])]
+        else
+            names = Symbol[Symbol(:value_, k) for k in eachindex(frontier[i])]
+            source = Expr(:tuple, names...)
+            value = value!(scalar, :_plate_part_values, Any)
+            new = add!(scalar, Tuple(mapped[id] for id in frontier[i]) => (value,),
+                       _partial_source_op(:plate_part, :_values, names, source, @__MODULE__); source)
+            readable[new.id] = new
+            value
+        end
+        planned = plan(scalar; have, want = (result,))
+        (; draft = _AuthoredPlateDraft{_plate_atomic(op)}(planned,
+               Tuple(readable[r.id] for r in planned.recipes), op.axis_checks),
+           lanes, cost = sum(inner.recipes[index].cost for index in statements[i]; init = tuple.cost))
+    end
+    (; parts, finals)
+end
+
 """
     _cell_outlined_pushdowns(p::Plan) -> (plan, pushdowns)
 
@@ -2869,6 +3056,7 @@ function _cell_outlined_pushdowns(p::Plan; argument_types = nothing)
     p, scalar_outlined = _cell_scalar_reads(p; argument_types)
     p = _cell_scalar_plates(p; argument_types, outlined = scalar_outlined)
     p = _cell_sparse_products(p; argument_types, outlined = scalar_outlined)
+    p = _cell_split_tuple_plates(p)
     p = _fuse_authored_plate_chains(p; cells_only = true)
     known = IdDict{Recipe,Any}()
     byid = Dict(r.id => r for r in p.recipes)

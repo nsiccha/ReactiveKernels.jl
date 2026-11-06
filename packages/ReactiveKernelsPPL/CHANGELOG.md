@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.105
+## 0.1.106
 
 - Sizes and data-derived numbers stay data in the generated program, never one
   binding's literals. A packed block reads its range from the data the program
@@ -30,7 +30,7 @@ are recorded in the git history only.
   (elementwise and slices), `@plate` latents over data, scans (centered and
   non-centered, with their prior bounds), threshold vectors, an ordered
   response's level count, and the positions of coefficient, GLM, external and
-  LKJ array blocks. Requires ReactiveKernels 0.1.93.
+  LKJ array blocks. Requires ReactiveKernels 0.1.95.
 - The prepared query type is the same whenever the data take the same arms: RK
   still splits a plate's data-bound branch by the arms its lanes take, so an
   empty likelihood, or an ordered response with no interior level, prepares its
@@ -46,6 +46,22 @@ are recorded in the git history only.
   a bound's value decides it (an infinite data-derived bound); and a number the
   model's author wrote. Density-factor queries keep their own literal row counts
   and windows.
+
+## 0.1.105
+
+- Binding refuses a fixed `nu` or `zi` outside its support on every spelling. A
+  `ZeroInflatedPoisson.(rate, z)` or `StudentT.(nu, mu, s)` column, in a dotted
+  observation or a `@plate` cell, a computed argument (`z ./ 2`) and a definition
+  (`zz = 1.5 .* z`, `zz = z .- 0.1`) built before, and the likelihood was `-Inf`
+  at every coordinate; only a scalar was refused. They now fail
+  `[y_resp] zi data z must lie in [0, 1]` or
+  `[y_resp] nu data nu must be finite positive numerics`, over the rows the
+  response observes. An infinite `nu` column, which gave a finite density, is
+  refused as a scalar and a literal already were. A value that reads a sampled
+  name keeps its lazy `-Inf` branch, and values in support have the same density.
+- A scale fixed by an offsets-only definition (`sd = w .- 3`) is refused the same
+  way, and a refusal of a computed scale says what was written instead of
+  `_rkppl_synth_1`.
 
 ## 0.1.104
 

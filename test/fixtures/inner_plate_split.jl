@@ -144,6 +144,21 @@ end
     total::Float64 = sum(pointwise)
 end
 
+# The throwing call sits under a second live guard inside the endpoint, so
+# refusing its speculation records a key nested in the outer arm's.
+@kernel nested_domain_endpoint(scale::Float64) = begin
+    value(d::Float64)::Float64 = begin
+        live = scale + 1.0
+        live > 1.5 ? live * counted_root(d) : live
+    end
+end
+@kernel guarded_nested_domain(q, y) = begin
+    pointwise = plate(y, q) do d, parameter
+        parameter > 0 ? nested_domain_endpoint(parameter).value(d) : 0.0
+    end
+    total::Float64 = sum(pointwise)
+end
+
 @kernel sequential_arm(q, y) = begin
     pointwise = plate(y, q) do d, parameter
         if parameter > 0

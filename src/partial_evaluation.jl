@@ -778,8 +778,9 @@ Base.@nospecializeinfer function _partial_speculate_graph_arm!(nodes, plans, nam
     prefix_key = (:arm_recipe, r.id, getfield(leaf, :path))
     node_key = (:arm_node, r.id, getfield(leaf, :path))
     excluded = Set{Int}(q.id for q in arm.recipes if (prefix_key..., q.id) in refused)
-    nested_refused = Set{Int}(key[4] for key in refused
-                         if length(key) == 4 && key[1:3] == node_key)
+    # A nested refusal key is the inner arm's own key, not a recipe id.
+    nested_refused = Set{Any}(key[4] for key in refused
+                              if length(key) == 4 && key[1:3] == node_key)
     readable = Dict{Int,Any}()
     arm = _partial_split_recipes(arm, bound, excluded, readable)
     # Split-created ids are deterministic too and may have been refused.

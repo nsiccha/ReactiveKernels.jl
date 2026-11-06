@@ -960,6 +960,20 @@ and a reader that takes the tuple other than by a literal entry (`first(c)`, a
 plates, so a per-index value that no density reads costs the sampler and its
 gradient nothing, and adds none of its AD requirements to them.
 
+A cell or partition query computes a plate once, at the union of the rows its
+readers ask for. When the readers of such a tuple plate read different entries,
+the query splits the plate by which of those readers' entry sets each statement
+serves. A part reads earlier parts' values as ordinary batched operands, so row
+demand reaches it only from the readers it serves: each statement still runs
+once per row, and only at rows where something reads its result. In a partition,
+a label whose cells read one entry therefore neither runs nor reads what only
+another entry needs. A `vec` of an input stays in each part that reads it, so a
+capture read through it is still read at rows. The plate stays whole when every
+statement serves every reader, when the cell has an effectful statement, or when
+a reader reads entries other than as a plain `t[k]` statement, such as
+`c[1] + c[2]` inline: its values are unchanged, and each entry is computed at
+every row any reader asks for.
+
 The per-element WANT is
 either accumulated with a reducer (sum by default) or collected in the one
 requested broadcast-shaped output.

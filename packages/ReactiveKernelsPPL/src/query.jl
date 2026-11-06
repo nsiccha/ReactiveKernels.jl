@@ -1386,18 +1386,30 @@ PartitionQuery(kernel, layout, observations, by, labels, plans) =
     Base.invokelatest(_partition_density, q, u, label)::Float64
 (q::PartitionQuery)(u::AbstractVector{<:Real}, label) = q(Vector{Float64}(u), label)
 function _partition_density(q::PartitionQuery, u, label)
-    if q.prefix === nothing
-        return q.kernel(u, label, get(() -> ReactiveKernels.partition_plan(q.kernel, u, label, nothing),
-                                     q.plans, label))
-    end
+    q.prefix === nothing && return q.kernel(u, label, _partition_plan_of(q, u, label))
     length(u) == q.layout.total || throw(ContractValidationError(
         "[query] packed length $(length(u)) ≠ layout total $(q.layout.total)"))
     prefix = _query_prefix_kernel(q.prefix, u)
     cached = _refresh_partition_prefix!(q.prefix.cache, u, prefix)
     residual = _query_residual(q.prefix, (u, label, nothing, cached...))
-    plan = get(() -> ReactiveKernels.partition_plan(residual, u, label, nothing, cached...),
-               q.plans, label)
-    residual(u, label, plan, cached...)
+    _partition_residual_density(residual, q, u, label, cached)
+end
+# The residual of another argument type comes from a dictionary, so this call
+# can be dynamic. The plan is looked up on its far side and never crosses it:
+# boxing the plan would copy every field of it on each call.
+_partition_residual_density(residual, q, u, label, cached) =
+    residual(u, label, _partition_plan_of(q, u, label), cached...)
+# The plan of `label` for the kernel `q` evaluates. Preparation computed one per
+# label, all of the type `T`, so this is a typed lookup. A label without one is
+# planned on the spot, which refuses a label no observation has. The closure
+# captures no kernel: a prepared kernel is held inline, so it would be copied.
+_partition_plan_of(q::PartitionQuery{<:Any,<:Any,T}, u, label) where {T} =
+    get(() -> _partition_plan_on_the_spot(q, u, label)::T, q.plans, label)
+function _partition_plan_on_the_spot(q::PartitionQuery, u, label)
+    q.prefix === nothing && return ReactiveKernels.partition_plan(q.kernel, u, label, nothing)
+    cached = q.prefix.cache.values
+    residual = _query_residual(q.prefix, (u, label, nothing, cached...))
+    ReactiveKernels.partition_plan(residual, u, label, nothing, cached...)
 end
 ReactiveKernels.partition_locality(q::PartitionQuery) =
     ReactiveKernels.partition_locality(q.prefix === nothing ? q.kernel : q.prefix.residual)
@@ -1799,15 +1811,18 @@ function _query_exemplar(layout, u0)
 end
 
 _value_query_prefix(cache, residual, residual_plan, args, on_error) =
-    (; cache, residual, residual_plan, args, argument_type = typeof(args), on_error,
+    (; cache, residual, residual_plan, args, on_error,
        residuals = Dict{DataType,Any}(typeof(args) => residual),
        prefixes = Dict{DataType,Any}(Vector{Float64} => cache.kernel))
 
 # Ordinary cell indices include CartesianIndex and multiple integer types;
 # partition keys can also have mixed types. Preserve custom packed storage
 # at each concrete prepared boundary instead of reading it all to copy it.
+# Comparing the two types folds at compile time, so the exemplar's own argument
+# types infer the concrete residual and call it directly. Otherwise this returns
+# `Any`, which boxes the residual `prefix` holds inline: a copy on every call.
 function _query_residual(prefix, args)
-    typeof(args) === prefix.argument_type && return prefix.residual
+    typeof(args) === typeof(prefix.args) && return prefix.residual
     get!(prefix.residuals, typeof(args)) do
         Base.invokelatest(prepare, prefix.residual_plan;
             exemplars = args, on_error = prefix.on_error)
