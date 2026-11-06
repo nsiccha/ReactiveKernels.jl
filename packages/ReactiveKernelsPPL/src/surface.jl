@@ -7897,14 +7897,15 @@ end
 
 # Value-position symbols (call heads and dotted function names excluded):
 # coefficient-discipline scans must not mistake `log` in `log.(z)` for a
-# coefficient named `log`.
+# coefficient named `log`. `end` and `begin` are positions of the value they
+# index, wherever they sit in the index (`levels(g)[2:end]`), never names.
 function _value_symbols(ex)
     out = Set{Symbol}()
     _value_symbols!(out, ex)
     return out
 end
 function _value_symbols!(out::Set{Symbol}, ex)
-    ex isa Symbol && return push!(out, ex)
+    ex isa Symbol && return _is_endpoint(ex) ? nothing : push!(out, ex)
     ex isa Expr || return nothing
     ex.head === :generator && return (_generator_symbols!(_value_symbols!, out, ex); nothing)
     # A keyword argument's name is not a value (`f(x; k = 4)`).

@@ -23,10 +23,16 @@ are recorded in the git history only.
   partition preparations no longer refuse it with "needs its own
   `build_kernel(plan)`". The program reads the labels from the binding, so the
   build was already correct for them; only the check compared their values. Each
-  query reads this binding's layout, whose `coordinate_names` are this binding's
-  labels. A path that still holds a literal sized by the labels, such as a legacy
-  coefficient width or a response-derived threshold count, generates another
-  program and is still refused.
+  query reads this binding's layout, so a factor term's coefficient names
+  (`coordinate_names`, such as `mu.g_b`) are this binding's. A path that still
+  holds a literal sized by the labels, such as a legacy coefficient width or a
+  response-derived threshold count, generates another program and is still
+  refused.
+- A selection of levels that runs to the end, `c[levels(g)[2:end]] .~ …`, reads
+  its extent from the binding like every other level axis. Before, its size
+  stayed one binding's literal: the check that a size reads data took `end` for
+  a name, and the bind-time evaluator could not evaluate it. Both now treat
+  `end` and `begin` in an index as Julia does.
 
 ## 0.1.108
 
