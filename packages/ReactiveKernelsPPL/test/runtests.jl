@@ -36,6 +36,7 @@ const _PPL_TEST_FILES = (
     "test_density_factor_cells.jl",
     "test_density_factor_coefficients.jl",
     "test_density_factor_preparation.jl",
+    "test_density_factor_overlay_views.jl",
     "test_jax_source.jl",
     "test_derived_affine_fusion.jl",
     "test_scalar_prior_packing.jl",

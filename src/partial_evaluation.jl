@@ -440,7 +440,10 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
     for (i, node) in enumerate(nodes)          # post-order: kids come first
         holds[i] |= any(k -> holds[k], node.kids)
     end
-    output = only(r.outputs)
+    # An authored destructuring has several outputs. Its parts have one value
+    # each, and its root keeps every output: the statement still binds its names
+    # from one call. The first output only names the parts.
+    label = first(r.outputs).name
     token = kernel_sourceop_token(r.op)
     mod = _kernel_endpoint_source_module(r.op)
     ignored = native.ignored
@@ -452,7 +455,7 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
     end
     function emit!(i)
         node = nodes[i]
-        value = value!(g, Symbol(output.name, :_part, i), Any)
+        value = value!(g, Symbol(label, :_part, i), Any)
         part = if dataonly[i] || !holds[i]
             Recipe(fresh(), Tuple(r.inputs[p] for p in node.own), (value,),
                    operation(Symbol(:_part, i), :fused, native.wholes[i],
@@ -467,7 +470,7 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
                          (value,),
                          op,
                          r.cost, nothing, false, node.body),
-                  node.direct, node.kids, Symbol(output.name, :_part, i))
+                  node.direct, node.kids, Symbol(label, :_part, i))
         end
         push!(recipes, part)
         readable[part.id] = part
@@ -480,7 +483,7 @@ function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
     root = Recipe(r.id, (Tuple(r.inputs[p] for p in top.direct)..., kids...),
                   r.outputs,
                   rootop, r.cost, nothing, false, top.body)
-    root = maps!(root, top.direct, top.kids, Symbol(output.name, :_root))
+    root = maps!(root, top.direct, top.kids, Symbol(label, :_root))
     push!(recipes, root)
     readable[r.id] = root
     recipes

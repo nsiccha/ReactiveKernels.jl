@@ -17,7 +17,10 @@ function _make_cell_shared(parts, layout, labels, exemplar, on_error)
     _cell_shared(parts, labels, exemplar, cache)
 end
 function _cell_shared(parts, labels, exemplar, cache)
-    positions = findall(ismissing, labels)
+    # A cached prefix's reads are its invalidation key (`_prepare_value_prefix`).
+    # A shared coordinate it does not read reaches a cell only through the packed
+    # point, which a pass copies, so changing one leaves cache and pass valid.
+    positions = cache === nothing ? findall(ismissing, labels) : cache.positions
     point = cache === nothing ? exemplar[positions] : cache.point
     _CellShared(cache, parts === nothing ? nothing : parts.prefix,
         parts === nothing ? () : Tuple(v.name for v in parts.frontier),
@@ -107,7 +110,12 @@ function _prepare_shared_compact_ad(prepare_operator, built, plan, observations,
         Base.invokelatest(_prepare_cached, plan, spec; have, want, bound = _query_bound(plan), on_error,
                           exemplars = point)
     else
-        residual = _conditional_cell_plan(_compact_partition_plan(parts.residual))
+        # A selection holds only local coordinates. A prefix reading every shared
+        # coordinate leaves the residual only those, and rows are plain slots.
+        # Otherwise it may read shared ones at rows: those come from the base, as
+        # for a local partition.
+        whole_footprint = length(shared.cache.positions) == count(ismissing, last(only(rule)))
+        residual = _conditional_cell_plan(_compact_partition_plan(parts.residual; whole_footprint))
         Base.invokelatest(prepare, residual;
                          exemplars = point, on_error)
     end
@@ -169,13 +177,16 @@ each weighted value, first directional derivative, or second directional
 derivative. After the callback, one shared-prefix pullback propagates their
 combined cotangent. Local and direct packed derivatives are included too.
 
-The shared cache refreshes automatically when its population coordinates change.
-Ordinary compact/factor derivative verbs also accept the active `pullback`
-in place of their `base` argument. They use the copied point without scanning
-shared coordinates again, and do not add to the accumulated gradient. Raw
-vector calls check shared coordinates on every call.
+The shared cache refreshes automatically when a coordinate its prefix reads
+changes. Ordinary compact/factor derivative verbs also accept the active
+`pullback` in place of their `base` argument. They use the copied point without
+scanning shared coordinates again, and do not add to the accumulated gradient.
+Raw vector calls check the prefix's coordinates on every call, or every shared
+coordinate when there is no prefix.
 Do not change those coordinates through another operator during the callback:
-that invalidates the pass and throws. A failed callback produces no output;
+that invalidates the pass and throws. A shared coordinate the prefix does not
+read reaches a cell only through the pass's copied point, so changing it
+elsewhere leaves the pass valid. A failed callback produces no output;
 the next call resets all accumulation storage. Calls cannot be nested or run
 concurrently on the same pullback.
 

@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.107
+## 0.1.108
 
 - Sizes and data-derived numbers stay data in the generated program, never one
   binding's literals. A packed block reads its range from the data the program
@@ -30,7 +30,7 @@ are recorded in the git history only.
   (elementwise and slices), `@plate` latents over data, scans (centered and
   non-centered, with their prior bounds), threshold vectors, an ordered
   response's level count, and the positions of coefficient, GLM, external and
-  LKJ array blocks. Requires ReactiveKernels 0.1.96.
+  LKJ array blocks. Requires ReactiveKernels 0.1.97.
 - The prepared query type is the same whenever the data take the same arms: RK
   still splits a plate's data-bound branch by the arms its lanes take, so an
   empty likelihood, or an ordered response with no interior level, prepares its
@@ -47,6 +47,28 @@ are recorded in the git history only.
   model's author wrote. Density-factor queries keep their own literal row counts
   and windows.
 
+## 0.1.107
+
+- A `partitioned` cell family (`prepare_cell_query`, `prepare_cell_factors`,
+  `prepare_compact_cell_ad` and their operators) works when its shared prefix
+  reads only some shared coordinates. Since 0.1.102 such a family threw
+  `BoundsError` at an unchanged point, or, when the coordinate the prefix reads
+  came later in the packed vector, counted every call as a shared change, so
+  any raw call ended a live `with_cell_batch` or `cell_pullback!` pass. Values
+  were never stale.
+- `prepare_compact_cell_ad` with `partitioned` reads a shared coordinate its
+  residual reads at rows from the base, as a local partition does. Since 0.1.102
+  its derivatives otherwise refused such a coordinate as outside the footprint,
+  although a compact selection may hold only partitioned coordinates. A prefix
+  that reads every shared coordinate compiles as before. A cell that also reads
+  a block at rows can still raise `EnzymeRuntimeActivityError` under static
+  Reverse until Enzyme carries the repair of its read of base and active rows
+  (Enzyme snag `static-reverse-m-c913effd`).
+- With a prefix, a pass and a raw call's comparison now follow the coordinates
+  the prefix reads, as its cache does since 0.1.102. Changing a shared
+  coordinate the prefix does not read leaves a live pass valid; the pass reads
+  its own copied point, so its results are unchanged. A family with no prefix
+  still counts every shared coordinate.
 ## 0.1.106
 
 - `prepare_sampler` has one type across the values of a bound number, such as a
