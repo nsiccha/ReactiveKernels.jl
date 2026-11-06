@@ -16,6 +16,37 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.108
+
+- Sizes and data-derived numbers stay data in the generated program, never one
+  binding's literals. A packed block reads its range from the data the program
+  already has: `z[1:n] .~ LogNormal.(mu, sd)` is `view(unconstrained, 1:n)`, the
+  next block starts at `n + 1`, `Z[1:r, 1:k]` is `reshape(flat, r, k)`, and
+  `s ~ truncated(Normal(0, 1), floor, Inf)` is `floor + exp(u)`. Every extent of
+  one declaration and every value of such a bound now generates the same
+  `kernel_expr`, and one `build_kernel` serves every binding. No input is added,
+  so a cut needs the data it always did, and a model whose positions depend on
+  no data generates the program it always did. This covers declared arrays
+  (elementwise and slices), `@plate` latents over data, scans (centered and
+  non-centered, with their prior bounds), threshold vectors, an ordered
+  response's level count, and the positions of coefficient, GLM, external and
+  LKJ array blocks. Requires ReactiveKernels 0.1.97.
+- The prepared query type is the same whenever the data take the same arms: RK
+  still splits a plate's data-bound branch by the arms its lanes take, so an
+  empty likelihood, or an ordered response with no interior level, prepares its
+  own type from the same program. Other level labels keep the program and its
+  type, and still ask for their own `build_kernel` (`_program_identity`).
+- What stays literal: any size read from an observation, since it can be absent
+  in a design binding (a `@plate` latent over `eachindex(y)`, thresholds counted
+  from `levels(y)`); a read that does not evaluate to the size binding packs;
+  legacy coefficient and GLM block widths, and so the scalar coordinates packed
+  after them; positive vectors and LKJ scalar edges and stacks, whose statements
+  are one per coordinate; an LKJ array's dimension; an external law's geometry
+  shape and size; a plate latent over a computed value; a transform's kind when
+  a bound's value decides it (an infinite data-derived bound); and a number the
+  model's author wrote. Density-factor queries keep their own literal row counts
+  and windows.
+
 ## 0.1.107
 
 - A `partitioned` cell family (`prepare_cell_query`, `prepare_cell_factors`,

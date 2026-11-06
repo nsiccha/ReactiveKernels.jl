@@ -789,8 +789,17 @@ function _footprint_constant(r::Recipe, f::_CellForm, s::Int, producers, cidof)
         end
         return positions
     elseif role === :range_source && f.kind === :range_view
-        all(part -> part isa Int, f.literal) || return nothing
-        return _cell_range(f.literal)
+        # An endpoint read from bound data (RKPPL's binding-supplied packed
+        # positions) is as fixed for this binding as a literal one.
+        parts = map(f.literal) do part
+            part isa Int && return part
+            producer = get(producers, cidof(r.inputs[part.input]), nothing)
+            producer !== nothing && producer.op isa _BoundConstant &&
+                producer.op.value isa Integer || return nothing
+            Int(producer.op.value)
+        end
+        any(isnothing, parts) && return nothing
+        return _cell_range(parts)
     end
     nothing
 end

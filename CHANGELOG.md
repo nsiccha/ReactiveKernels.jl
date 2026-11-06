@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.97
+## 0.1.98
 
 - A plate cell whose lazy branch is decided by bound data, such as a response
   density under `noise > 0 ? normal(mu, noise).logpdf(y) : -Inf` with `noise` and
@@ -30,6 +30,22 @@ are recorded in the git history only.
 - This removes the per-row `log(scale)` that 0.1.95's entry describes. On its 12
   blocks of 2000 rows the gradient falls from 291 to 126 us and the density from
   203 to 57 us, in one process at one load.
+
+## 0.1.97
+
+- A range of scalars (`lo:hi`) inside a larger expression is no longer split
+  out as a cached partial-evaluation value: constructing it costs no more
+  than the arithmetic already kept inline. `view(A, lo:hi)` with `lo` and
+  `hi` bound data therefore keeps its range-view row form, and partition
+  footprints, shared-prefix read sets and cell shapes resolve its bound
+  endpoints exactly as literal ones.
+- `reshape(v, n, k)` with every dimension an input now has the same row form
+  as `reshape(v, n, 2)`: a cell reads only the packed positions its own rows
+  hold. A bare call of inputs alone used to be computed whole.
+  ReactiveKernelsPPL 0.1.108 reads its packed blocks both ways.
+- A plate operand inferred as `Union{}`, as the cell of an empty plate can be, no
+  longer raises `Tuple field type cannot be Union{}` while typing the plate's
+  output: the plate's region validates its axis, as for an unknown operand.
 
 ## 0.1.96
 

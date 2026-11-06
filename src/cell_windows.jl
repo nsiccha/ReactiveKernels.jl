@@ -887,6 +887,18 @@ function _cell_form(r::Recipe; outlined::Bool = false)
         # `operands_fit`).
         return _CellForm(:transposed, [:transposed], [0], Int[], 0)
     end
+    if r.op === Base.reshape && length(r.inputs) >= 3
+        # A bare exact call `reshape(v, n, k...)`, every dimension a distinct
+        # input, keeps Base's `reshape` as its operation: the same form as
+        # `reshape(v, n, 2)`, which `_cell_reshape` reads from its source.
+        n = length(r.inputs)
+        roles = fill(:whole, n)
+        roles[1] = :reshape_source
+        indices = Vector{Int}[Int[] for _ in 1:n]
+        return _CellForm(:reshape, roles, zeros(Int, n), [1], 0, indices, Any[],
+            _cell_direct_reads(indices), Tuple(_CellInputLiteral(j) for j in 2:n),
+            Any[nothing for _ in 1:n], nothing)
+    end
     # So does a bare exact call of a function with a row method.
     r.op isa _KernelSourceOp || return _cell_row_method_form(r, r.op,
         Any[_CellInputLiteral(j) for j in eachindex(r.inputs)])

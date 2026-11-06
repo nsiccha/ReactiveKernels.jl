@@ -34,9 +34,11 @@ The primary instruction is the user's September 22 decision `1rvu25u`, recorded
 under `ReactiveKernels:brm:tgi:reactant:no-unroll`, decision
 `2026-09-22T08-49-18-901-1rvu25u`: retain real loops or batched-array structure.
 Retain a runtime loop, scan, or equivalent batched array structure. Stateful
-iteration needs the appropriate carried state and output storage. Shapes may
-specialize an executable; the lowering must not duplicate the body according
-to those shapes or values. Native execution retains ordinary iteration.
+iteration needs the appropriate carried state and output storage. A backend
+that compiles for concrete shapes may specialize its own executable; the
+lowering must not duplicate the body according to those shapes or values, and
+the program it generates keeps them as data ("Keep sizes and numeric values out
+of generated programs" below). Native execution retains ordinary iteration.
 Fixed structural algebra, such as the scalar entries of an intrinsically
 three-compartment operator, is distinct
 from data-derived iteration and may be expanded.
@@ -140,6 +142,29 @@ values alone (`:values`) (user decision
 and its comment: "maybe have different levels, which may then include either
 everything rk, or everything everything?").
 
+## Keep sizes and numeric values out of generated programs
+
+The user's November 6 direction (`ODLPlaus:precompile`, decision
+`2026-11-06T01-09-46-212-0ikeidi`, feedback 1) governs every ReactiveKernels,
+ReactiveKernelsPPL and BayesianRegressionModels model: "THIS HOLDS FOR ALL RK /
+BRM MODELS! BAKING IN SIZE OR EVEN FLOAT CONSTANTS INTO THE MODEL IS COMPLETELY
+IDIOTIC AND NEEDS TO BE AVOIDED AT BASICALLY ALL COST!" It followed the same
+user's request about a dataset-sized literal extent, "Can we please make sure
+this never happens again....". **Keep sizes and numeric values, including
+floating-point prior and configuration values, as runtime model inputs; do not
+splice them into model source or its specialization.** A backend that compiles
+for concrete shapes still specializes its own executable; that is the backend's
+compilation, not the model's source, and it binds no generated program to a size.
+
+RKPPL's generated program reads packed positions, axis lengths, scan lengths,
+ordered level counts and data-derived transform bounds from the data it already
+has, so one program serves every extent and value of one declaration
+(`test_bound_array_extents.jl`). Known remaining paths, which are limitations
+to fix and not precedents, are listed under ReactiveKernelsPPL 0.1.108 in its
+changelog. A prepared type may still depend on which data-bound branch arms
+have lanes ("Data-bound branches in plate cells"), which the lazy-branch
+constraint above requires.
+
 ## Derivative rules come from one mathematical graph, never by hand
 
 **Do not write backend-specific derivative rules as durable code, and never
@@ -200,8 +225,8 @@ Interpret acceptance evidence according to what it establishes:
 
 Compare retained control-flow regions, nonlinear work and indexing across all
 tested data sizes, and keep complete optimized operation inventories as
-diagnostics. Shape specialization may share constants, simplify scalar
-arithmetic or simplify singleton derivative tapes, including an identity
+diagnostics. A backend's own shape specialization may share constants, simplify
+scalar arithmetic or simplify singleton derivative tapes, including an identity
 broadcast of one scalar tape index, so small shapes need not
 have identical raw inventories. The bounded-inventory criterion `1arw7kp` was
 an agent engineering choice following the user's scoped no-preference
