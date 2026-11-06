@@ -564,8 +564,8 @@ _level_code(g, labels) = [findfirst(==(x), labels) for x in g]
         @test coordinate_names(reused.layout) == coordinate_names(fown.layout) ==
             [Symbol("mu.Intercept"), Symbol("mu.g_q"), Symbol("mu.g_r"), :sigma]
         u = [0.3, 0.1, -0.2, 0.0]
-        @test Base.invokelatest(prepare_query(fbuilt, relabeled, :posterior), u) ≈
-            Base.invokelatest(prepare_query(fown, relabeled, :posterior), u)
+        @test Base.invokelatest(prepare_query(fbuilt, relabeled, :sampler), u) ≈
+            Base.invokelatest(prepare_query(fown, relabeled, :sampler), u)
     end
     @testset "a cell and a partition read this binding's labels" begin
         source = quote
