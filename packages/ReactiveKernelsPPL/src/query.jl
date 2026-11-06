@@ -700,8 +700,9 @@ Optional `partitioned` identifies parameters that can change between local
 evaluations, using the names or `parameter => level_labels` accepted by
 [`prepare_partition_sampler`](@ref). Other coordinates are shared. The query
 caches their intermediate values across cells and local changes, compares
-shared coordinates by value (including in-place edits), and refreshes on a
-shared change. Row-capable calculations remain in the residual. This cell
+the shared coordinates those values read by value (including in-place edits),
+and refreshes when one changes. A shared coordinate they do not read needs no
+refresh. Row-capable calculations remain in the residual. This cell
 declaration identifies cache dependencies; it adds no per-key separability
 claim because a cell query has no partition key. A partition query checks
 separability when the same declaration is supplied.

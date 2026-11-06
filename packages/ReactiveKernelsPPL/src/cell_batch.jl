@@ -24,9 +24,12 @@ end
 ```
 
 A batch belongs to its owner's cache and expires when the callback exits,
-including on error. Changing shared coordinates through another operator
-invalidates it. Prepare a separate owner per concurrent caller. Input `u`
-may be changed after entry; the batch keeps its own point.
+including on error. Changing a shared coordinate its prefix reads (every shared
+coordinate when there is no prefix) through another operator invalidates it.
+A shared coordinate the prefix does not read reaches a cell only through the
+batch's copied point, so changing it elsewhere leaves the batch valid. Prepare
+a separate owner per concurrent caller. Input `u` may be changed after entry;
+the batch keeps its own point.
 """
 function with_cell_batch(visit::F,
         owner::Union{CellQuery,CellFactors,CellFactorQuery},

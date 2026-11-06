@@ -1517,10 +1517,12 @@ Pass `partitioned = :z` to `prepare_compact_cell_ad`, or
 `partitioned = :z, u0 = u` to `prepare_cell_factors`, when `z` contains the
 integrated coordinates. Whole-array helpers that read only shared coordinates
 are cached before strict row lowering. Updating integrated coordinates reuses
-the cache; updating shared coordinates refreshes it. Helpers that also read
-integrated coordinates remain subject to the ordinary locality check.
+the cache, and so does updating a shared coordinate those helpers do not read;
+updating one they read refreshes it. Helpers that also read integrated
+coordinates remain subject to the ordinary locality check.
 
-The compact derivative selection then contains only integrated coordinates.
+The compact derivative selection then contains only integrated coordinates. A
+shared coordinate the cell reads at rows comes from the packed base.
 Use these conditional derivatives for local gradients, Hessian blocks and
 third contractions. To differentiate those quantities with respect to shared
 coordinates, accumulate their frontier cotangents across the complete sweep:
@@ -1551,7 +1553,8 @@ Within the callback, ordinary local derivative verbs can take `batch` in
 place of `base`, for example
 `ad_gradient_hvp_and_third(q, (direction,), batch, active, indices, cell)`.
 This uses the pass's copied point and checks its cache generation in constant
-time; raw-vector calls scan shared coordinates to detect changes. Ordinary
+time; raw-vector calls scan the coordinates the cache reads to detect changes,
+or every shared coordinate when nothing is cached. Ordinary
 verbs do not contribute to the accumulated gradient. This also supports
 local conditional solves at a fixed shared point before accumulating their
 mixed derivative contributions.
@@ -1568,8 +1571,10 @@ the full shared dependency graph.
 
 Each family and its pullback serve one caller at a time. A callback failure
 leaves the output gradient unchanged; the next pass resets the accumulation
-storage. Changing shared coordinates through another operator during the
-callback invalidates the pass and throws.
+storage. Changing a coordinate the cache reads through another operator during
+the callback invalidates the pass and throws. A shared coordinate it does not
+read reaches a cell only through the pass's copied point, so changing it
+elsewhere leaves the pass valid.
 
 ### Fixed-point values and local structural footprints
 
@@ -1605,8 +1610,9 @@ Value and local-footprint queries also accept a compatible active
 remain independent; the caller supplies their chain rule as above.
 
 The batch expires when its callback returns or throws. It rejects operators
-from another cache and shared-coordinate changes through another operator.
-Raw-vector calls remain available and scan shared coordinates on each call.
+from another cache and changes through another operator to a coordinate the
+cache reads, as for a derivative pass above.
+Raw-vector calls remain available and scan those coordinates on each call.
 Each owner and its operators serve one concurrent caller.
 
 ### A partition of plates by a key
