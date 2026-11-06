@@ -4587,19 +4587,25 @@ _cell_forced(f, ::Nothing, ::Int) = f()
 # lowers as before, its regions computed whole.
 function _lower_guarded_cell_group!(outer_body::Expr, runtime_ops, runtime_recipes,
         members, guarded::Vector{Int}, p::Plan, cells, names, regions::Dict{Int,Int},
-        region_bodies, region_guards; sorted::Bool, constant::Set{Symbol})
+        region_sets::Dict{Int,Vector{Int}}, region_bodies, region_guards;
+        sorted::Bool, constant::Set{Symbol})
     g = p.graph
+    # This group's keys: its guarded members, and sets of them sharing work.
+    sets = Dict{Int,Vector{Int}}(key => set for (key, set) in region_sets
+                                 if issubset(set, guarded))
+    keys = Int[guarded; collect(Base.keys(sets))]
     owner = Dict{ValueId,Int}()
     for r in p.recipes
-        member = get(regions, r.id, 0)
-        member in guarded && !(r.op isa _AuthoredPlateCellOp) || continue
-        foreach(v -> owner[canon_id(g, v.id)] = member, r.outputs)
+        key = get(regions, r.id, 0)
+        key in keys && !(r.op isa _AuthoredPlateCellOp) || continue
+        foreach(v -> owner[canon_id(g, v.id)] = key, r.outputs)
     end
     symbols = Dict{Symbol,Int}()
-    for member in guarded, name in _assigned_names!(Set{Symbol}(), region_bodies[member])
-        symbols[name] = member
+    for key in keys, name in _assigned_names!(Set{Symbol}(), region_bodies[key])
+        symbols[name] = key
     end
-    state = _CellRegions(owner, Dict{Int,Any}(m => region_guards[m] for m in guarded), symbols)
+    state = _CellRegions(owner, Dict{Int,Any}(k => region_guards[k] for k in keys), sets,
+                         symbols)
     recording = get(task_local_storage(), _FOOTPRINT, nothing)
     snapshot = recording === nothing ? nothing :
         Dict(cid => length(entries) for (cid, entries) in recording.records)
@@ -4615,14 +4621,14 @@ function _lower_guarded_cell_group!(outer_body::Expr, runtime_ops, runtime_recip
         T = _cell_partition_sum_type(p, cells, r)
         defaults[r.id] = Expr(:(=), lhs, Expr(:call, GlobalRef(Base, :zero), T))
     end
+    guards = collect(values(state.guards))
     placed = _cell_guard_group(body.args, state,
-        Dict{Int,Vector{Any}}(m => region_bodies[m].args for m in guarded), defaults, guarded)
+        Dict{Int,Vector{Any}}(k => region_bodies[k].args for k in keys), defaults)
     if placed === nothing
-        foreach(m -> append!(outer_body.args, region_bodies[m].args), guarded)
+        foreach(k -> append!(outer_body.args, region_bodies[k].args), _cell_region_order(keys, sets))
         append!(outer_body.args, body.args)
-        filter!(pair -> !(last(pair) in guarded), regions)
-        recording === nothing ||
-            _footprint_unguard_reads!(recording, snapshot, collect(values(state.guards)))
+        filter!(pair -> !(last(pair) in keys), regions)
+        recording === nothing || _footprint_unguard_reads!(recording, snapshot, guards)
     else
         statements, owned = placed
         append!(outer_body.args, statements)
@@ -4631,6 +4637,10 @@ function _lower_guarded_cell_group!(outer_body::Expr, runtime_ops, runtime_recip
     end
     nothing
 end
+
+# Region keys in an order whose bodies read only earlier ones: sets of more
+# members first.
+_cell_region_order(keys, sets) = sort(keys; by = k -> (k > 0 ? -1 : -length(sets[k]), k))
 
 # The cells of plan `p` that lower with one emitter
 # (`_lower_authored_plate_cells!`): cells of one kind (partitions or single
@@ -5131,11 +5141,15 @@ function _lower_with_ops_collecting(p::Plan;
         Dict{Int,Vector{Int}}()
     cell_pending = IdDict{Vector{Int},Vector{Any}}(group => Any[]
         for group in unique(values(cell_groups)))
-    regions = _cell_partition_regions(p, cells, cell_groups)
+    regions, region_sets = _cell_partition_regions(p, cells, cell_groups)
     region_bodies = Dict(id => Expr(:block) for id in unique(values(regions)))
-    region_guards = Dict(r.id => Expr(:call, GlobalRef(Base, :!),
+    region_guards = Dict{Int,Any}(r.id => Expr(:call, GlobalRef(Base, :!),
         Expr(:call, GlobalRef(Base, :isempty), nm(first(r.inputs))))
         for r in p.recipes if get(regions, r.id, 0) == r.id)
+    # Work several grouped sums share runs when any of them has a cell.
+    for (key, set) in region_sets
+        region_guards[key] = foldl((a, b) -> Expr(:||, a, b), (region_guards[m] for m in set))
+    end
     outer_body = body
     for r in p.recipes
         owner = get(regions, r.id, 0)
@@ -5299,7 +5313,7 @@ function _lower_with_ops_collecting(p::Plan;
                 Int[m.id for (m, _, _) in members if get(regions, m.id, 0) == m.id]
             if !isempty(guarded)
                 _lower_guarded_cell_group!(outer_body, runtime_ops, runtime_recipes,
-                    members, guarded, p, cells, names, regions, region_bodies,
+                    members, guarded, p, cells, names, regions, region_sets, region_bodies,
                     region_guards; sorted = r.op.rows,
                     constant = Set{Symbol}(names[canon_id(g, v.id)]
                         for v in p.have if v.name in r.op.plan_constant))
