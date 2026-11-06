@@ -28,10 +28,10 @@ are recorded in the git history only.
 - `partition_batch_value_and_gradient!(s, g, u, labels; weights = nothing)` gives a
   batch of partitions' summed value and its gradient over the whole packed vector,
   running one pullback through the shared values instead of one per label. Sweeping
-  400 units of one space-time toy took 7.0 s through `partition_value_and_gradient!`
-  and about 70 ms this way, with the same values and gradients. A whole-model
-  gradient took 23 ms there, so a batch is for a subset of the units. It requires
-  native `AutoEnzyme` reverse. `PartitionSampler` gains a type parameter.
+  400 units of one space-time toy took 8.9 s through `partition_value_and_gradient!`
+  and 69 ms this way, with the same values and gradients. A whole-model gradient
+  took 23 ms there, so a batch is for a subset of the units. It requires native
+  `AutoEnzyme` reverse. `PartitionSampler` gains a type parameter.
 - Requires ReactiveKernels 0.1.99, whose refusal names these routes.
 
 ## 0.1.108
