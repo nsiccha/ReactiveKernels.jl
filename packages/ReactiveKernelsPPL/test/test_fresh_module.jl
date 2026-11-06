@@ -319,4 +319,113 @@ end
     # Required by ordinary name resolution: no binding supplies this callee.
     @test_throws SurfaceLoweringError lower_rkppl(ast, DATA; mod, conditioned = (:y,))
 end
+
+@testset "one program built twice compiles once, and another stays another" begin
+    # A build evaluates its definition anew. What the expansion names (a lifted
+    # cell invariant, in a recipe whose split nodes carry it in their type) must
+    # come out the same, or every reader of the type compiles again on every
+    # build (snag `gensym-in-kernel-54164b85`). Two programs that differ only in
+    # a literal share those names, so the guard against evaluating one with the
+    # other's build (snag `rkppl-opaque-loc-37de7b80`) has to hold regardless.
+    source(scale) = quote
+        log_k ~ Normal(0.0, 1.0)
+        z[levels(g)] .~ Normal.(0.0, 1.0)
+        s ~ Exponential(1.0)
+        @plate for k in eachindex(y)
+            y[k] ~ Normal(sin(exp(log_k)) * cos(x[k] * w[k]) * $scale + z[g[k]],
+                s + exp(log_k))
+        end
+    end
+    data = (; x = [-0.5, 0.0, 0.5, 1.0], w = [0.1, 0.2, 0.3, 0.4], g = [1, 1, 2, 2],
+        y = [-1.0, 0.1, 1.0, 0.4])
+    function build(ast)
+        mod = Module(gensym(:FreshBuild))
+        Core.eval(mod, :(using ReactiveKernelsPPL, Distributions))
+        plan = bind_data(lower_rkppl(ast, keys(data); mod, conditioned = (:y,)), data)
+        built = build_kernel(plan)
+        (; plan, built, query = prepare_query(built, plan, :sampler))
+    end
+    operations(spec) = Set(string(typeof(r.op)) for r in spec.graph.recipes)
+    one, two, other = build(source(1.5)), build(source(1.5)), build(source(2.5))
+    @test typeof(one.query) === typeof(two.query)
+    @test operations(one.built.spec) == operations(two.built.spec)
+    # The comparison means something only if a generated name reaches a type.
+    @test any(occursin("##cell_invariant#", t) for t in operations(one.built.spec))
+    @test typeof(prepare_query(one.built, two.plan, :sampler)) === typeof(one.query)
+    @test_throws "different program" prepare_query(one.built, other.plan, :sampler)
+    density(u, scale) = begin
+        log_k, s, z = u[1], exp(u[2]), u[3:4]
+        lp = logpdf(Normal(0.0, 1.0), log_k) + logpdf(Exponential(1.0), s) + u[2] +
+             sum(logpdf.(Normal(0.0, 1.0), z))
+        for k in eachindex(data.y)
+            m = sin(exp(log_k)) * cos(data.x[k] * data.w[k]) * scale + z[data.g[k]]
+            lp += logpdf(Normal(m, s + exp(log_k)), data.y[k])
+        end
+        lp
+    end
+    for u in ([0.2, -0.3, 0.4, 0.1], [-0.6, 0.5, -0.2, 0.7])
+        @test Base.invokelatest(one.query, u) == Base.invokelatest(two.query, u)
+        @test Base.invokelatest(one.query, u) ≈ density(u, 1.5)
+        @test Base.invokelatest(other.query, u) ≈ density(u, 2.5)
+    end
+
+    # What lowering itself names reaches the split nodes' types too: a selected
+    # argument with no definition of its own.
+    selected = quote
+        z[levels(g)] .~ Normal.(0.0, 1.0)
+        s ~ Exponential(1.0)
+        @plate for k in eachindex(y)
+            d = log1p(exp(z[g[k]]) * w[k])
+            y[k] ~ Normal(d + cos(x[k]), exp(d) + s)
+        end
+    end
+    one, two = build(selected), build(selected)
+    @test any(occursin("##_rkppl_selected#", t) for t in operations(one.built.spec))
+    @test operations(one.built.spec) == operations(two.built.spec)
+    @test typeof(one.query) === typeof(two.query)
+    u = [-0.2, 0.3, -0.4]
+    z = u[2:3]
+    lp = logpdf(Exponential(1.0), exp(u[1])) + u[1] + sum(logpdf.(Normal(0.0, 1.0), z))
+    for k in eachindex(data.y)
+        d = log1p(exp(z[data.g[k]]) * data.w[k])
+        lp += logpdf(Normal(d + cos(data.x[k]), exp(d) + exp(u[1])), data.y[k])
+    end
+    @test Base.invokelatest(one.query, u) ≈ lp
+    @test Base.invokelatest(two.query, u) == Base.invokelatest(one.query, u)
+end
+
+@testset "a submodel called twice keeps two sets of generated names" begin
+    # A submodel lowers inside its caller and into one flat program, so what its
+    # lowering names must differ between the calls (snag `gensym-in-kernel-54164b85`).
+    mod = Module(gensym(:FreshBuild))
+    Core.eval(mod, :(using ReactiveKernelsPPL, Distributions))
+    Core.eval(mod, quote
+        @rkppl term(v, rows) = begin
+            b ~ Normal(0.0, 1.0)
+            @plate for k in eachindex(rows)
+                d = log1p(exp(b) * v[k]^2)
+                rows[k] ~ Normal(d + cos(v[k]), exp(d) + 1.0)
+            end
+            return b
+        end
+    end)
+    ast = quote
+        first_term ~ term(x, y)
+        second_term ~ term(w, r)
+    end
+    data = (; x = [-0.5, 0.5], w = [0.1, 0.4], y = [-1.0, 0.1], r = [1.0, 0.4])
+    plan = bind_data(lower_rkppl(ast, keys(data); mod, conditioned = (:y, :r)), data)
+    built = build_kernel(plan)
+    selected = Set(m.match for r in built.spec.graph.recipes
+                   for m in eachmatch(r"##_rkppl_selected#\d+", string(typeof(r.op))))
+    @test length(selected) >= 2
+    query = prepare_query(built, plan, :sampler)
+    u = [0.2, -0.3]
+    expected = sum(logpdf(Normal(0.0, 1.0), b) for b in u)
+    for (b, v, o) in ((u[1], data.x, data.y), (u[2], data.w, data.r)), k in eachindex(o)
+        d = log1p(exp(b) * v[k]^2)
+        expected += logpdf(Normal(d + cos(v[k]), exp(d) + 1.0), o[k])
+    end
+    @test Base.invokelatest(query, u) ≈ expected
+end
 end
