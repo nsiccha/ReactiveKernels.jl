@@ -383,12 +383,12 @@ end
     @test any(occursin("##_rkppl_selected#", t) for t in operations(one.built.spec))
     @test operations(one.built.spec) == operations(two.built.spec)
     @test typeof(one.query) === typeof(two.query)
-    u = [0.3, -0.4, -0.2]
-    lp = logpdf(Normal(0.0, 1.0), u[1]) + logpdf(Normal(0.0, 1.0), u[2]) +
-         logpdf(Exponential(1.0), exp(u[3])) + u[3]
+    u = [-0.2, 0.3, -0.4]
+    z = u[2:3]
+    lp = logpdf(Exponential(1.0), exp(u[1])) + u[1] + sum(logpdf.(Normal(0.0, 1.0), z))
     for k in eachindex(data.y)
-        d = log1p(exp(u[data.g[k]]) * data.w[k])
-        lp += logpdf(Normal(d + cos(data.x[k]), exp(d) + exp(u[3])), data.y[k])
+        d = log1p(exp(z[data.g[k]]) * data.w[k])
+        lp += logpdf(Normal(d + cos(data.x[k]), exp(d) + exp(u[1])), data.y[k])
     end
     @test Base.invokelatest(one.query, u) ≈ lp
     @test Base.invokelatest(two.query, u) == Base.invokelatest(one.query, u)

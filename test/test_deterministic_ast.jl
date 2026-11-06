@@ -198,7 +198,9 @@ end
         end
         return sum(out)
     end))
-    names(types) = Set(m.match for t in types for m in eachmatch(r"##cell_invariant#\d+", t))
+    # By its 12-digit fingerprint and 6-digit position; the generated body's
+    # canonical `##cell_invariant#2` is the same in every program.
+    names(types) = Set(m.match for t in types for m in eachmatch(r"##cell_invariant#\d{18}", t))
     @test !isempty(names(types1))
     @test isdisjoint(names(types1), names(_det_types(other)))
 end
