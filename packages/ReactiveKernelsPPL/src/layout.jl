@@ -1656,6 +1656,22 @@ end
 _checked_read(tests, read, value::Int) =
     tests.reads_data(read) && tests.agrees(read, value) ? read : value
 
+# A property read in an extent, `support.geometry.n`, as the model reads any
+# value's property: `getproperty(getproperty(support, :geometry), :n)`. An
+# authored extent and a geometry hook's AST keep Julia's dotted syntax, which
+# `_value_symbols` takes for a module path, so the read would name no data. A
+# callee keeps its path (`Base.length(x)`).
+_property_read(ex) = ex
+function _property_read(ex::Expr)
+    if ex.head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode &&
+            ex.args[2].value isa Symbol
+        return Expr(:call, GlobalRef(Base, :getproperty), _property_read(ex.args[1]), ex.args[2])
+    end
+    callee = ex.head === :call || (ex.head === :. && length(ex.args) == 2)
+    return Expr(ex.head, Any[callee && i == 1 ? a : _property_read(a)
+        for (i, a) in enumerate(ex.args)]...)
+end
+
 # An array axis as the program reads it; `value` is this binding's length.
 function _array_dim_read(plan::StructuralPlan, tests, d, value::Int)
     d isa Int && return d
@@ -1665,7 +1681,7 @@ function _array_dim_read(plan::StructuralPlan, tests, d, value::Int)
         read = _read_add(_read_length(_axis_labels_expr(:levels, cnt[1], Colon())), -cnt[2])
     elseif _is_bound_extent_dim(d)
         d isa Symbol && haskey(plan.columns, d) && !(plan.columns[d] isa Integer) && return value
-        read = d
+        read = _property_read(d)
     else
         read = _read_size(d.args[2], d.args[3])
     end
@@ -1694,6 +1710,19 @@ function _plate_rows_read(plan::StructuralPlan, tests, p::PlateParameter, value:
     columns = sort!(collect(_response_reads(plan, p.name, _row_columns(plan))))
     isempty(columns) && return value
     return _checked_read(tests, _read_size(first(columns), 1), value)
+end
+
+# An external law's axes and packed size as the program reads them: its
+# declared axes, which are its geometry's shape, and its geometry's count of
+# packed coordinates, each when it reads data. The constrain and Jacobian
+# endpoints then receive the shape the data give, not this binding's numbers.
+function _external_reads(plan::StructuralPlan, tests, e::LayoutEntry)
+    i = findfirst(p -> p.name === e.name, plan.array_parameters)
+    dims = i === nothing ? Any[] : Any[_array_dim_read(plan, tests, d, n)
+        for (d, n) in zip(plan.array_parameters[i].dims, e.dims)]
+    packed = e.sampling.geometry.unconstrained
+    size = packed isa Int ? e.size : _checked_read(tests, _property_read(packed), e.size)
+    return dims, size
 end
 
 # A threshold or simplex vector's packed length as the program reads it: its
@@ -1818,7 +1847,13 @@ function _entry_reads!(reads, plan, tests, e::LayoutEntry, at, scan, bound_reads
                 for (d, a) in enumerate(packed)]
         end
         size = foldl(_read_mul, something(axes, packed); init = 1)
-    elseif e.kind === :plate
+    elseif e.kind === :external
+        dims, size = _external_reads(plan, tests, e)
+        if !all(a -> a isa Int, dims)
+            axes = Any[_named_read!(reads, Symbol(:_ppl_axis, d, :_, e.name), a)
+                for (d, a) in enumerate(dims)]
+        end
+    elseif e.kind === :plate || e.kind === :external_plate
         i = findfirst(p -> p.name === e.name, plan.plate_parameters)
         size = i === nothing ? e.size : _plate_rows_read(plan, tests, plan.plate_parameters[i], e.size)
     elseif e.kind === :vector

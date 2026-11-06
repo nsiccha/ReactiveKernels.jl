@@ -154,6 +154,8 @@ function _extent_check(source, datasets, want; conditioned = (:y,), same_type = 
 end
 
 _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
+# A value the model computes from data, as BRM's field support is.
+_extent_support(n) = (geometry = (n = n,),)
 
 @testset "one program for every extent of every packed block" begin
     @testset "one-axis arrays, the empty extent, and blocks packed after them" begin
@@ -221,6 +223,19 @@ _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
         level_builds = build_kernel.(level_bound)
         @test ==(map((b, l) -> Base.remove_linenums!(kernel_expr(b, l.layout)), level_bound, level_builds)...)
         @test ==(map((b, l) -> typeof(prepare_query(l, b, :sampler)), level_bound, level_builds)...)
+    end
+    @testset "an extent read through a property of bound data" begin
+        # `support.geometry.n` is a property of a value, as the model reads it,
+        # not a module path (snag `gmrf-field-packe-ab48cb09`).
+        programs = _extent_check(quote
+                support = _extent_support(N)
+                z[1:support.geometry.n] .~ Normal.(0, 1)
+                y .~ Normal.(z[k], 1.0)
+            end,
+            [(N = n, k = [1, n], y = [0.9, 1.0]) for n in (2, 5)],
+            (v, d) -> _normals(v.z) + sum(logpdf.(Normal.(v.z[d.k], 1.0), d.y)))
+        @test occursin("Base.getproperty(Base.getproperty(support, :geometry), :n)",
+            string(first(programs)))
     end
     @testset "plate latents, the empty loop included" begin
         loop = quote
