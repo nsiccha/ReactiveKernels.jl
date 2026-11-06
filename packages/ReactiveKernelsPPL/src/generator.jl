@@ -1549,6 +1549,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
         push!(points, p.name => Symbol(:_ppl_pw_prior_, p.name))
     end
     _array_prior_stmts!(stmts, terms, observed, gathers; context = plan, pointwise = points)
+    _declare_observation_densities!(stmts, points)
     push!(stmts, :(likelihood::Float64 = $(_sum_terms(terms))))
     names = first.(points)
     length(unique(names)) == length(names) || throw(ContractValidationError(
@@ -1838,6 +1839,36 @@ _array_type_annotation(T::Symbol) =
     T in (:AbstractArray, :AbstractVector, :AbstractMatrix, :Array, :Vector, :Matrix)
 _array_type_annotation(T::Expr) =
     Meta.isexpr(T, :curly) && _array_type_annotation(T.args[1])
+
+# Every observation density is a `Float64` (`likelihood::Float64`). Declaring
+# the density each cell of an observation's pointwise plate returns, as a
+# grouped observation's totals plate already does, gives a partition of the
+# observations (`prepare_partition`) the type of each observation's sum where
+# inference through a helper (`*_scalar_logdensity`) or a censoring branch would
+# give `Any`. RK guards an observation sum with no cell for a label, and the
+# work only it reads, only for a known numeric sum (snag
+# `absent-odl-vecto-d98e48bf`). A grouped observation's pointwise plate returns
+# each group's densities; its `_totals` plate is the declared one.
+function _declare_observation_densities!(stmts, points)
+    plates = Set{Symbol}(value for (_, value) in points if value isa Symbol)
+    assigned = Set{Symbol}()
+    foreach(st -> (name = _assigned_name(st); name === nothing || push!(assigned, name)), stmts)
+    for st in stmts
+        name = _assigned_name(st)
+        name !== nothing && name in plates || continue
+        Symbol(name, :_totals) in assigned && continue
+        rhs = st.args[2]
+        Meta.isexpr(rhs, :do, 2) && Meta.isexpr(rhs.args[1], :call) &&
+            rhs.args[1].args[1] === :plate && Meta.isexpr(rhs.args[2], :(->), 2) &&
+            Meta.isexpr(rhs.args[2].args[2], :block) || continue
+        body = rhs.args[2].args[2]
+        any(a -> Meta.isexpr(a, :(=), 2) && a.args[1] == :(_ppl_density::Float64), body.args) &&
+            continue
+        any(a -> !(a isa LineNumberNode), body.args) || continue
+        _declare_cell_result!(rhs.args[2])
+    end
+    return stmts
+end
 
 function _declare_cell_result!(lambda::Expr)
     body = lambda.args[2]

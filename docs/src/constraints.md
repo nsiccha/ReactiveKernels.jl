@@ -156,7 +156,7 @@ RKPPL's generated program reads packed positions, axis lengths, scan lengths,
 ordered level counts and data-derived transform bounds from the data it already
 has, so one program serves every extent and value of one declaration
 (`test_bound_array_extents.jl`). Known remaining paths, which are limitations
-to fix and not precedents, are listed under ReactiveKernelsPPL 0.1.104 in its
+to fix and not precedents, are listed under ReactiveKernelsPPL 0.1.105 in its
 changelog. A prepared type may still depend on which data-bound branch arms
 have lanes ("Data-bound branches in plate cells"), which the lazy-branch
 constraint above requires.

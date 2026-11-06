@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.104
+## 0.1.105
 
 - Sizes and data-derived numbers stay data in the generated program, never one
   binding's literals. A packed block reads its range from the data the program
@@ -30,19 +30,33 @@ are recorded in the git history only.
   (elementwise and slices), `@plate` latents over data, scans (centered and
   non-centered, with their prior bounds), threshold vectors, an ordered
   response's level count, and the positions of coefficient, GLM, external and
-  LKJ array blocks. Requires ReactiveKernels 0.1.92.
+  LKJ array blocks. Requires ReactiveKernels 0.1.93.
 - The prepared query type is the same whenever the data take the same arms: RK
   still splits a plate's data-bound branch by the arms its lanes take, so an
   empty likelihood, or an ordered response with no interior level, prepares its
   own type from the same program. Other level labels keep the program and its
   type, and still ask for their own `build_kernel` (`_program_identity`).
-- What stays literal: legacy coefficient and GLM block widths, and so the scalar
-  coordinates packed after them; positive vectors and LKJ scalar edges and
-  stacks, whose statements are one per coordinate; an LKJ array's dimension; an
-  external law's geometry shape and size; a plate latent over a computed value;
-  a transform's kind when a bound's value decides it (an infinite data-derived
-  bound); and a number the model's author wrote. Density-factor queries keep
-  their own literal row counts and windows.
+- What stays literal: any size read from an observation, since it can be absent
+  in a design binding (a `@plate` latent over `eachindex(y)`, thresholds counted
+  from `levels(y)`); a read that does not evaluate to the size binding packs;
+  legacy coefficient and GLM block widths, and so the scalar coordinates packed
+  after them; positive vectors and LKJ scalar edges and stacks, whose statements
+  are one per coordinate; an LKJ array's dimension; an external law's geometry
+  shape and size; a plate latent over a computed value; a transform's kind when
+  a bound's value decides it (an infinite data-derived bound); and a number the
+  model's author wrote. Density-factor queries keep their own literal row counts
+  and windows.
+
+## 0.1.104
+
+- Each observation's pointwise density plate declares its cell's density as
+  `Float64`, as a grouped observation's totals plate already did. A partition
+  of several observations (`prepare_partition`) then knows each observation's
+  sum type even when its density comes from a helper or a censoring branch
+  that inference cannot type, so with a ReactiveKernels release that guards a
+  partition sum without cells (0.1.90 and later) a unit with no cell of such
+  an observation neither computes nor reads the work only that observation
+  needs. Values are unchanged.
 
 ## 0.1.103
 

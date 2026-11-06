@@ -156,6 +156,48 @@ _scalar_covariance_add(a, b) = a + b
     end
 end
 
+# An observation law whose density inference cannot type (as for a model's
+# own helper density): its sum in a partition is typed by the density RKPPL
+# declares on each cell, so a unit without its cells skips its work.
+struct OpaqueNormal{T}
+    mu::T
+end
+ReactiveKernelsPPL.sampling_logdensity(d::OpaqueNormal, x) =
+    Base.inferencebarrier(-(log(2pi) + (x - d.mu)^2) / 2)
+
+@testset "absent observation whose density helper is not inferred" begin
+    data = (; y = [0.1, 0.2], soil = [0.3, 0.4], group = [1, 1])
+    source = quote
+        a[1:2] .~ Normal.(0.0, 1.0)
+        sd[1:2] .~ Exponential.(1.0)
+        L ~ LKJCholesky(2, 2.0)
+        Z[1:2, 1:2] .~ Normal.(0.0, 1.0)
+        F = sd .* L
+        R = Z * F'
+        mu = R[group, 1] .+ R[group, 2] .+ a[group]
+        y .~ Normal.(a, 1.0)
+        @plate for i in eachindex(soil)
+            soil[i] ~ OpaqueNormal(mu[i])
+        end
+    end
+    plan = bind_data(lower_rkppl(source, data;
+        conditioned = (:y, :soil), mod = @__MODULE__), data)
+    built = build_kernel(plan)
+    program = hasproperty(built, :program) ? built.program :
+        ReactiveKernelsPPL.kernel_expr(plan, built.layout)
+    @test occursin("_ppl_density::Float64", string(program))
+    u = collect(range(-0.3, 0.3; length = built.layout.total))
+    by = (; y = [1, 2], soil = [1, 1])
+    partitioned = (:a => [1, 2], :sd => [1, 1], :L => [1, 1], :Z => [1, 1])
+    query = prepare_partition(built, plan, (:y, :soil); by, partitioned, u0 = u)
+    full = prepare_query(built, plan, :likelihood)
+    for point in (u, u .+ 0.2)
+        @test partition_footprint(query.kernel, point, 2, nothing).unconstrained == [2]
+        @test sum(query(point, label) for label in (1, 2)) ≈ full(point)
+        @test query(point, 2) ≈ -(log(2pi) + (point[2] - data.y[2])^2) / 2
+    end
+end
+
 @testset "absent scalar observation" begin
     data = (; y=[0.1, 0.2, 0.3], extra=0.4, second=0.8)
     for kind in (:direct, :indexed, :nonlinear), shared in (false, true)

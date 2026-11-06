@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.92
+## 0.1.93
 
 - A range of scalars (`lo:hi`) inside a larger expression is no longer split
   out as a cached partial-evaluation value: constructing it costs no more
@@ -27,10 +27,18 @@ are recorded in the git history only.
 - `reshape(v, n, k)` with every dimension an input now has the same row form
   as `reshape(v, n, 2)`: a cell reads only the packed positions its own rows
   hold. A bare call of inputs alone used to be computed whole.
-  ReactiveKernelsPPL 0.1.104 reads its packed blocks both ways.
+  ReactiveKernelsPPL 0.1.105 reads its packed blocks both ways.
 - A plate operand inferred as `Union{}`, as the cell of an empty plate can be, no
   longer raises `Tuple field type cannot be Union{}` while typing the plate's
   output: the plate's region validates its axis, as for an unknown operand.
+
+## 0.1.92
+
+- In a partition over several plates lowered with one cell emitter, work that
+  only some of the plates read runs when one of those plates has a cell with
+  the label: a whole value shared by two plates that both have no cell for the
+  label is neither computed nor read, as one only a single plate reads already
+  was (0.1.90).
 
 ## 0.1.91
 
