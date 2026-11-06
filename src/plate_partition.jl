@@ -1118,20 +1118,29 @@ function _partition_footprint_kernel(kernel::PreparedKernel, selection)
     # Row demand uses the value kernel's type evidence and retains its call
     # guard, except for a plan port: footprints recompute that bookkeeping
     # and ignore the supplied plan (the documented placeholder is nothing).
-    exact_signature = _exact_signature(kernel)
-    exemplar_types = exact_signature === Nothing ? nothing : Any[fieldtypes(exact_signature)...]
-    if exemplar_types !== nothing
-        for r in p.recipes
-            r.op isa _AuthoredPlateCellOp && r.op.plan !== nothing || continue
-            position = findfirst(v -> v.name === r.op.plan, p.have)
-            position === nothing || (exemplar_types[position] = Any)
-        end
-        exact_signature = Tuple{exemplar_types...}
-    end
+    exemplar_types = _plan_port_exemplar_types(p, kernel, Any)
+    exact_signature = exemplar_types === nothing ? Nothing : Tuple{exemplar_types...}
     ast, constants, callables, recipes = _sharing_cell_plans() do
         _lower_with_ops(p; footprint = true, footprint_selection = selection, exemplar_types)
     end
     _prepare(p, ast, constants, _native_table(ast, callables), recipes; exact_signature)
+end
+
+# The argument types `kernel` was prepared from (its exact signature), with
+# the type at every plan port replaced by `T`; `nothing` for a kernel
+# prepared without exemplars. A prepared kernel's signature carries its plan
+# type at the plan port, while its lowering saw the exemplar there
+# (`nothing`, `_plan_typed_exemplars`).
+function _plan_port_exemplar_types(p::Plan, kernel::PreparedKernel, T)
+    signature = _exact_signature(kernel)
+    signature === Nothing && return nothing
+    types = Any[fieldtypes(signature)...]
+    for r in p.recipes
+        r.op isa _AuthoredPlateCellOp && r.op.plan !== nothing || continue
+        position = findfirst(v -> v.name === r.op.plan, p.have)
+        position === nothing || (types[position] = T)
+    end
+    types
 end
 
 # ----------------------------------------------------------- separability
@@ -1889,11 +1898,21 @@ arguments (the plan port's own value is ignored; pass `nothing`), it returns
 the plan: the named tuple of label-constant bookkeeping and data the body reads
 from its plan port. `partition_plan` prepares and keeps one per kernel for the
 process; a caller evaluating many labels prepares it once here and holds it.
+A kernel prepared from exemplars has its plan lowered from the same argument
+types, with `nothing` at the plan port as `prepare` documents, so the plan
+has the type `prepare` gave `kernel`'s plan port.
 """
 function partition_plan_kernel(kernel::PreparedKernel)
     p = _lowering_plan(kernel.plan)
+    # Lower the plan from the type evidence the kernel's own lowering had:
+    # its exemplars, with `nothing` at the plan port. Row demand, scalar row
+    # plates and partition-sum regions depend on those types, and a plan
+    # lowered without them can carry other fields than the plan type the
+    # kernel reads (snag `brm-joint-cell-s-2d923270`). The plan kernel keeps
+    # no call guard, as before: one plan kernel serves labels of mixed types.
+    exemplar_types = _plan_port_exemplar_types(p, kernel, Nothing)
     ast, constants, callables, recipes = _sharing_cell_plans() do
-        _lower_with_ops(p; partition_plan = true)
+        _lower_with_ops(p; partition_plan = true, exemplar_types)
     end
     _prepare(p, ast, constants, _native_table(ast, callables), recipes)
 end

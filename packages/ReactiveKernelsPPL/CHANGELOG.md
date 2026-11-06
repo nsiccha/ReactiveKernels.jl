@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.103
+## 0.1.104
 
 - Each observation's pointwise density plate declares its cell's density as
   `Float64`, as a grouped observation's totals plate already did. A partition
@@ -26,6 +26,14 @@ are recorded in the git history only.
   partition sum without cells (0.1.90 and later) a unit with no cell of such
   an observation neither computes nor reads the work only that observation
   needs. Values are unchanged.
+
+## 0.1.103
+
+- `prepare_partition` and `prepare_partition_sampler` with `partitioned`
+  (a cached shared prefix) evaluate a joint vector observation cell, such as
+  `y[i] ~ MvNormal([mu[left[i]], mu[right[i]]], C)` in an `@plate for` loop,
+  again: every call refused the label's own plan with `this kernel was
+  prepared from exemplar argument types …`. Requires ReactiveKernels 0.1.91.
 
 ## 0.1.102
 
