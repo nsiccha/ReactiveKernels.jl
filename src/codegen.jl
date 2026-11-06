@@ -2158,6 +2158,21 @@ function _constant_tuple_entry(q::Recipe)
     source.args[2]
 end
 
+# The position in `inner.recipes` of the source tuple of its inputs a plate cell
+# returns, or `nothing` when the cell returns anything else.
+function _plate_tuple_statement(inner::Plan)
+    ig = inner.graph
+    result = canon_id(ig, only(inner.want).id)
+    at = findfirst(q -> any(v -> canon_id(ig, v.id) == result, q.outputs), inner.recipes)
+    at === nothing && return nothing
+    tuple = inner.recipes[at]
+    tuple.op isa _KernelSourceOp && length(tuple.outputs) == 1 && !tuple.effectful ||
+        return nothing
+    Meta.isexpr(tuple.source, :tuple, length(tuple.inputs)) &&
+        tuple.source.args == _recipe_source_names(tuple) || return nothing
+    at
+end
+
 # `producer` with a cell computing only tuple entries `read`, or `nothing` when
 # its cell is not a source tuple of its inputs, every entry is read, or the
 # entries left unread need effectful work.
@@ -2168,14 +2183,10 @@ function _plate_keeping_entries(producer::Recipe, read::Set{Int})
     ig = inner.graph
     length(body.lowered_recipes) == length(inner.recipes) || return nothing
     result = canon_id(ig, only(inner.want).id)
-    at = findfirst(q -> any(v -> canon_id(ig, v.id) == result, q.outputs), inner.recipes)
+    at = _plate_tuple_statement(inner)
     at === nothing && return nothing
     tuple = inner.recipes[at]
-    tuple.op isa _KernelSourceOp && length(tuple.outputs) == 1 && !tuple.effectful ||
-        return nothing
     n = length(tuple.inputs)
-    Meta.isexpr(tuple.source, :tuple, n) &&
-        tuple.source.args == _recipe_source_names(tuple) || return nothing
     !isempty(read) && issubset(read, 1:n) && length(read) < n || return nothing
     stand_in = tuple.inputs[minimum(read)]
     inputs = Tuple(k in read ? tuple.inputs[k] : stand_in for k in 1:n)
