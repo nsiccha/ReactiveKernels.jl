@@ -600,7 +600,7 @@ end
     built = build_kernel(fit)
     # Only observations may be absent: other data stay required.
     @test_throws ContractValidationError bind_data(fit, Dict{Symbol,Any}(:x_fit => X))
-    # Another program (other factor levels) still needs its own build.
+    # Other factor levels are the same program, on the same build.
     src = quote
         a ~ Normal(0, 1); s ~ Exponential(1)
         c[levels(g)] .~ Normal.(0, 1)
@@ -610,7 +610,9 @@ end
         conditioned = (:y,), mod = @__MODULE__), Dict{Symbol,Any}(:g => [1, 2, 1, 2], :y => X[1:4]))
     gbuilt = build_kernel(gfit)
     d = bind_data(gfit, Dict{Symbol,Any}(:g => [1, 2, 3]))
-    @test_throws "different program" prepare_query(gbuilt, d, :prior)
+    u = [0.2, -0.1, 0.3, -0.4, 0.1]
+    @test Base.invokelatest(prepare_query(gbuilt, d, :prior), u) ≈
+        Base.invokelatest(prepare_query(build_kernel(d), d, :prior), u)
     # The documented raw cut reads the binding's columns: available values
     # evaluate, and reading the absent response names it.
     d = bind_data(fit, Dict{Symbol,Any}(:x => X[1:2], :x_fit => X))

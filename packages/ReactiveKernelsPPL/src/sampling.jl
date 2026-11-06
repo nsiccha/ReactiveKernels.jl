@@ -498,7 +498,7 @@ function _external_cells_expr(e, edge)
         _external_endpoint_call(endpoint,
             Any[_external_geometry_expr(e), _dovar(1), arguments...], keywords)
     elseif edge === :constrain
-        value = gensym(:_ppl_constrained)
+        value = ReactiveKernels._kernel_gensym(:_ppl_constrained)
         Expr[:($value = $graph), :($(GlobalRef(@__MODULE__, :_sampling_scalar_check))($value))]
     else
         graph
@@ -586,7 +586,7 @@ function _external_graph_density_call(graph_density, arguments, keywords)
         if argument isa Symbol
             push!(ports, argument)
         else
-            port = gensym(:_ppl_density_arg)
+            port = ReactiveKernels._kernel_gensym(:_ppl_density_arg)
             push!(statements, :($port = $argument))
             push!(ports, port)
         end

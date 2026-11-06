@@ -2573,7 +2573,9 @@ function _guard_missing_observation_argument(name, ex, plan, columns)
     skipped = _guarded_argument_is_bound(ex, columns) ? 0 : 0.0
     guarded = deepcopy(ex)
     inputs, lambda = guarded.args
-    lane = gensym(:_rkppl_argument_present)
+    # Named by its position among the cell's formals: it is local to this cell,
+    # and a binding of one program spells one type (snag `gensym-in-kernel-54164b85`).
+    lane = Symbol("##_rkppl_argument_present#", length(lambda.args[1].args))
     push!(inputs.args, QuoteNode(present))
     push!(lambda.args[1].args, lane)
     lambda.args[2] = Expr(:block, LineNumberNode(0, :rkppl_plate),
@@ -8588,7 +8590,10 @@ function _eval_value_expr(ex, lookup, label; calls = nothing, kernels = nothing)
         # too; the quoted property name is not a bound-data dependency.
         return Base.invokelatest(getproperty, ev(ex.args[1]), ex.args[2].value)
     elseif h === :ref
-        return getindex(ev(ex.args[1]), map(ev, ex.args[2:end])...)
+        a = ev(ex.args[1])
+        n = length(ex.args) - 1
+        return getindex(a, (ev(_endpoints_of(i, a, d, n))
+            for (d, i) in enumerate(ex.args[2:end]))...)
     elseif h === :vect
         return Base.vect(map(ev, ex.args)...)
     elseif h === :tuple
@@ -8608,6 +8613,17 @@ function _eval_value_expr(ex, lookup, label; calls = nothing, kernels = nothing)
     end
     throw(ContractValidationError(
         "[bind] $label: unsupported expression head $h in a data definition"))
+end
+
+# Index `i` at position `d` of `n` into the value `a`, with Julia's `end` and
+# `begin` as `a`'s last and first index there (along all of `a` for a single
+# index): `levels(g)[2:end]` is `levels(g)[2:lastindex(levels(g))]`. A nested
+# index has its own.
+function _endpoints_of(i, a, d::Int, n::Int)
+    i === :end && return n == 1 ? lastindex(a) : lastindex(a, d)
+    i === :begin && return n == 1 ? firstindex(a) : firstindex(a, d)
+    i isa Expr && i.head !== :ref || return i
+    return Expr(i.head, Any[_endpoints_of(x, a, d, n) for x in i.args]...)
 end
 
 # A branch arm's statements in order, its locals read before the

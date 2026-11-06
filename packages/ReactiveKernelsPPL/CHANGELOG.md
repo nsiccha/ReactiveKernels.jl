@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.109
+## 0.1.111
 
 - `partitioned = :none` declares that partitions own no parameter, for
   `prepare_partition`, `prepare_partition_sampler`, `prepare_cell_query`,
@@ -32,7 +32,35 @@ are recorded in the git history only.
   and 69 ms this way, with the same values and gradients. A whole-model gradient
   took 23 ms there, so a batch is for a subset of the units. It requires native
   `AutoEnzyme` reverse. `PartitionSampler` gains a type parameter.
-- Requires ReactiveKernels 0.1.99, whose refusal names these routes.
+- Requires ReactiveKernels 0.1.100, whose refusal names these routes.
+
+## 0.1.110
+
+- One `build_kernel` now also serves a binding with other level labels, or
+  another number of them: `prepare_query`, `prepare_sampler` and the cell and
+  partition preparations no longer refuse it with "needs its own
+  `build_kernel(plan)`". The program reads the labels from the binding, so the
+  build was already correct for them; only the check compared their values. Each
+  query reads this binding's layout, so a factor term's coefficient names
+  (`coordinate_names`, such as `mu.g_b`) are this binding's. A path that still
+  holds a literal sized by the labels, such as a legacy coefficient width or a
+  response-derived threshold count, generates another program and is still
+  refused.
+- A selection of levels that runs to the end, `c[levels(g)[2:end]] .~ …`, reads
+  its extent from the binding like every other level axis. Before, its size
+  stayed one binding's literal: the check that a size reads data took `end` for
+  a name, and the bind-time evaluator could not evaluate it. Both now treat
+  `end` and `begin` in an index as Julia does.
+
+## 0.1.109
+
+- Lowering one source twice gives one set of generated names (a selected
+  argument, an index, a destructured value, a density port), so with
+  ReactiveKernels 0.1.99 two builds of one model in a process share their
+  types and the second compiles nothing more. A name is a function of the
+  source and its position in the lowering, instead of `gensym`. A submodel
+  called twice still has its names apart: one lowering counts once over its
+  submodels. Requires ReactiveKernels 0.1.99.
 
 ## 0.1.108
 
