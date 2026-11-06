@@ -4,6 +4,76 @@
 # expands to ordinary `Graph`, `Value`, and `Recipe` construction, while
 # `KernelSpec` only remembers stable names and a default have/want boundary.
 
+# Expanding a `@kernel` names what the author left unnamed: a lifted cell
+# invariant, a computed endpoint binding, a plate's computed argument. Such a
+# name reaches types, as `_KernelSplit` carries its ports as a type parameter.
+# Drawn from `gensym`'s process-global counter, it made each build of one program
+# spell new types and compile its preparation again, without end (snag
+# `gensym-in-kernel-54164b85`). So a name is a function of the definition and of
+# its position in the expansion: `##base#<fingerprint><position>`, the shape of
+# a `gensym`, which everything that recognizes one keeps recognizing.
+#
+# Two definitions with one fingerprint then spell the same names, as one
+# definition called twice always has: a `Value` is identified by its id, a
+# child's generated names are cloned into its caller unchanged, and `_varnames`
+# gives each value its own local whatever it is called. A construction binds
+# these names only inside its `let`, never in a module. What must distinguish
+# separately authored definitions stays process-unique: the source operation's
+# provenance token.
+mutable struct _KernelExpansionNames
+    const fingerprint::String
+    count::Int
+end
+
+# Task-local, as generators build programs from concurrent tasks.
+const _KERNEL_EXPANSION_NAMES = :_rk_kernel_expansion_names
+
+_with_kernel_names(f, source) = task_local_storage(f, _KERNEL_EXPANSION_NAMES,
+    _KernelExpansionNames(_kernel_source_fingerprint(source), 0))
+
+# A generator names a whole program in several steps and calls itself for its
+# parts (RKPPL lowers a submodel inside its caller's lowering). They share one
+# flat program, so they continue one count instead of starting their own.
+_within_kernel_names(f, source) =
+    get(task_local_storage(), _KERNEL_EXPANSION_NAMES, nothing) === nothing ?
+    _with_kernel_names(f, source) : f()
+
+# Code that runs outside an expansion keeps `gensym`. A generated function's body
+# must too: it runs when Julia compiles it, so it would advance this count in the
+# first build only.
+function _kernel_gensym(base)
+    names = get(task_local_storage(), _KERNEL_EXPANSION_NAMES, nothing)
+    names === nothing && return gensym(base)
+    names = names::_KernelExpansionNames
+    names.count += 1
+    Symbol("##", base, '#', names.fingerprint, lpad(names.count, 6, '0'))
+end
+
+_kernel_source_fingerprint(source) =
+    lpad(_kernel_source_hash(source, Dict{Symbol,Int}(), UInt(0)) % UInt(10)^12, 12, '0')
+
+# What a definition's fingerprint reads: its structure and authored names. A
+# generator's own generated names count by first occurrence and a fresh module
+# not at all, since each build mints new ones. A literal's value plays no part,
+# so a value spliced into the source keeps the program's names.
+_kernel_source_hash(@nospecialize(x), names, h::UInt) = hash(0x01, h)
+_kernel_source_hash(::LineNumberNode, names, h::UInt) = h
+_kernel_source_hash(x::QuoteNode, names, h::UInt) =
+    _kernel_source_hash(x.value, names, hash(0x02, h))
+_kernel_source_hash(x::GlobalRef, names, h::UInt) =
+    _kernel_source_hash(x.name, names, _kernel_source_hash(x.mod, names, h))
+_kernel_source_hash(x::Module, names, h::UInt) =
+    _anonymous_module(x) ? hash(0x03, h) : hash(String(nameof(x)), h)
+_kernel_source_hash(x::Symbol, names, h::UInt) = _lowering_gensym(x) ?
+    hash(get!(names, x, length(names) + 1), h) : hash(String(x), h)
+function _kernel_source_hash(x::Expr, names, h::UInt)
+    h = hash(String(x.head), h)
+    for arg in x.args
+        h = _kernel_source_hash(arg, names, h)
+    end
+    h
+end
+
 """
     KernelSpec
 
@@ -268,8 +338,12 @@ end
 # A definition-stable structural key for compiler-owned source operations.  It
 # is deliberately unavailable to arbitrary Graph closures: only `@kernel` can
 # mint a `_KernelSourceOp` with a token.  Reusing a captured child therefore reuses the
-# key, while separately authored formulas have different Token parameters.
-struct _KernelProvenanceKey{Token} end
+# key, while separately authored formulas have different tokens. A field, not a
+# type parameter: the token is unique per definition, so as a parameter each build
+# of one program compiled the recipes that hold it again.
+struct _KernelProvenanceKey
+    token::Symbol
+end
 
 # Graph assembly reads `recipe.op` as an unknown subtype of `_KernelSourceOp`.
 # The token is a field read with the `getfield` builtin, so no reader is
@@ -308,7 +382,7 @@ function _kernel_provenance_key(recipe::Recipe)
     if op isa _KernelSourceOp
         call_identity = getfield(op, :call_identity)
         call_identity === nothing &&
-            return _KernelProvenanceKey{_kernel_source_token(op)}()
+            return _KernelProvenanceKey(_kernel_source_token(op))
         return (:kernel_lowered_call, call_identity, recipe.cost,
                 map(valtype, recipe.outputs))
     end
@@ -1175,7 +1249,7 @@ function _kernel_hygienic_catches(ex, known::Set{Symbol})
         if length(args) >= 3 && args[2] isa Symbol && args[2] in known &&
            args[3] !== false
             original = args[2]
-            fresh = gensym(original)
+            fresh = _kernel_gensym(original)
             args[2] = fresh
             args[3] = Expr(:let, Expr(:(=), original, fresh), args[3])
         end
@@ -1571,7 +1645,7 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
             scoped = endpoint_name isa Symbol ?
                 _kernel_scoped_port(endpoint_name, name) : nothing
             name = scoped === nothing || _generated_value_name(name) ||
-                scoped in taken ? gensym(name) : scoped
+                scoped in taken ? _kernel_gensym(name) : scoped
         end
         push!(taken, name)
         name
@@ -1779,7 +1853,10 @@ _kernel_lift_scope(lhs) = nothing
 
 # A generated object-endpoint view is named by its endpoint (`logjac`); any
 # other callee by the name it is called by.
-function _kernel_lifted_call_name(callee, spec::KernelSpec, nested_specs)
+# The signature type is new for every endpoint view; this reads no part of it.
+Base.@nospecializeinfer function _kernel_lifted_call_name(@nospecialize(callee),
+                                                          @nospecialize(spec::KernelSpec),
+                                                          nested_specs)
     if callee isa Symbol && haskey(nested_specs, callee)
         names = getfield(spec, :want_names)
         return length(names) == 1 && !_generated_value_name(only(names)) ?
@@ -1794,7 +1871,7 @@ function _kernel_lifted_call_name(callee, spec::KernelSpec, nested_specs)
 end
 
 function _kernel_lifted_port(locals, scope, name)
-    (scope === nothing || name === nothing) && return gensym(:endpoint_value)
+    (scope === nothing || name === nothing) && return _kernel_gensym(:endpoint_value)
     base = _kernel_scoped_port(scope, name)
     port, count = base, 1
     while port in locals
@@ -1986,7 +2063,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                         scoped = scoped, endpoint_cache = endpoint_cache,
                         lift_scope = lift_scope, boundary_types = boundary_types)
                     if straight
-                        generated_port = gensym(Symbol(formal, :_binding))
+                        generated_port = _kernel_gensym(Symbol(formal, :_binding))
                         generated_type = valtype(endpoint_inputs[index])
                         push!(materialized,
                               (generated_port, generated_type, rewritten_actual))
@@ -2025,7 +2102,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                         endpoint_cache = endpoint_cache,
                         lift_scope = lift_scope, boundary_types = boundary_types)
                     if straight
-                        generated_port = gensym(Symbol(explicit[index], :_argument))
+                        generated_port = _kernel_gensym(Symbol(explicit[index], :_argument))
                         generated_type = valtype(
                             endpoint_inputs[length(owner_formals) + index])
                         push!(materialized,
@@ -2043,7 +2120,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                         _kernel_note_endpoint_port_type!(
                             local_types, actual, formal)
                     end
-                    generated = gensym(Symbol(endpoint_name, :_endpoint))
+                    generated = _kernel_gensym(Symbol(endpoint_name, :_endpoint))
                     retargeted = _kernel_endpoint_call_signature(
                         Val(Tuple(owner_ports)), Val(explicit))
                     # The retargeted signature type is new for every endpoint
@@ -2140,7 +2217,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 T === Any || push!(get!(Vector{Any}, boundary_types, arg), T)
                 continue
             end
-            argument_port = gensym(:kernel_argument)
+            argument_port = _kernel_gensym(:kernel_argument)
             push!(materialized, (argument_port, T === Any ? nothing : T, arg))
             push!(locals, argument_port)
             rewritten[i] = argument_port
@@ -2282,7 +2359,7 @@ function _kernel_lift_invariant_operands!(lifted, ex, variant, invariant,
     if liftable && isempty(_kernel_free_ports(ex, variant)) &&
        !isempty(_kernel_free_ports(ex, invariant)) &&
        !(indexing && _kernel_reads_index_bound(ex))
-        name = gensym(:cell_invariant)
+        name = _kernel_gensym(:cell_invariant)
         push!(lifted, Expr(:(=), name, ex))
         return name
     end
@@ -2416,14 +2493,14 @@ function _kernel_authored_plate_expr(rhs, mod,
             name = if value isa Symbol
                 value
             else
-                generated = gensym(:plate_argument)
+                generated = _kernel_gensym(:plate_argument)
                 push!(materialized_arguments, (generated, value))
                 generated
             end
             push!(arguments, name)
             push!(atomic, index)
         else
-            generated = gensym(:plate_argument)
+            generated = _kernel_gensym(:plate_argument)
             push!(materialized_arguments, (generated, argument))
             push!(arguments, generated)
         end
@@ -2766,7 +2843,7 @@ function _kernel_authored_scan_expr(rhs, mod,
         name = if value isa Symbol
             value
         else
-            generated = gensym(:scan_argument)
+            generated = _kernel_gensym(:scan_argument)
             push!(materialized_arguments, (generated, value))
             generated
         end
@@ -3145,8 +3222,8 @@ function _kernel_native_folds_walk(ex)
     if parts !== nothing && _kernel_native_range_iterator(parts.iterator) &&
        !_kernel_fold_term_escapes(parts.term) &&
        (parts.condition === nothing || !_kernel_fold_term_escapes(parts.condition))
-        iterator = gensym(:native_sum_iterator)
-        accumulator = gensym(:native_sum)
+        iterator = _kernel_gensym(:native_sum_iterator)
+        accumulator = _kernel_gensym(:native_sum)
         update = Expr(:(=), accumulator, Expr(:call, GlobalRef(Base, :add_sum),
                                               accumulator,
                                               _kernel_native_folds_walk(parts.term)))
@@ -3593,6 +3670,8 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
     # A recipe operation synthesized from captured @kernel source, wrapped as COMPILER-OWNED provenance
     # with a definition-unique gensym token (RK 07:21) + its Form, so a prepared handle distinguishes it
     # from a manually-inserted raw (opaque) closure without IR inspection. Call forwards inline.
+    # `gensym`, not `_kernel_gensym`: CSE merges recipes on this token, and two
+    # definitions of one source can capture different values.
     deftoken = gensym(:rk_srcop)
     # An effectful recipe is never evaluated at preparation, so it keeps no
     # split nodes; neither does the throw-stripped twin.
@@ -4010,8 +4089,8 @@ function _kernel_reduction_callable(rhs, deps::Vector{Symbol}, mod,
     end
     positions(ports) = Expr(:call, GlobalRef(Base, :Val),
                             Tuple(findfirst(==(p), deps) for p in ports))
-    accumulator = gensym(:reduction_sum)
-    element = gensym(:reduction_element)
+    accumulator = _kernel_gensym(:reduction_sum)
+    element = _kernel_gensym(:reduction_element)
     bind(body) = Expr(:let, Expr(:(=), variable, element), body)
     add(term) = Expr(:call, GlobalRef(Base, :add_sum), accumulator, term)
     closure(formals, body) = Expr(:->, Expr(:tuple, formals...),
@@ -4032,7 +4111,7 @@ function _kernel_reduction_callable(rhs, deps::Vector{Symbol}, mod,
     path, source, index, default = gather
     source_ports = own(source, portset)
     index_ports = own(index, setdiff(portset, (variable,)))
-    gathered = gensym(:reduction_gathered)
+    gathered = _kernel_gensym(:reduction_gathered)
     Expr(:call, GlobalRef(@__MODULE__, :_KernelReduction), fold...,
          positions(index_ports), positions(source_ports), calls...,
          closure(Any[element, index_ports...], bind(index)),
@@ -4229,7 +4308,7 @@ function _kernel_lift_nodes(block, mod)
                     "(->/function/do/let/quote), whose local bindings a hoisted node would " *
                     "escape. Increment 1 rejects it rather than silently changing semantics."))
                 inner = rewrite(x.args[end], straight)      # nested @node promoted first
-                nm = gensym(:node)
+                nm = _kernel_gensym(:node)
                 push!(lifted, Expr(:(=), nm, inner))
                 promoted[] += 1
                 return nm
@@ -4259,7 +4338,7 @@ function _kernel_lift_plate_expressions(statements, mod)
                 call = ex.args[1]
                 if call isa Expr && call.head === :call &&
                    _kernel_resolve_binding(mod, call.args[1]) === plate && !root
-                    name = gensym(:nested_plate)
+                    name = _kernel_gensym(:nested_plate)
                     push!(lifted, Expr(:(=), name, ex))
                     return name
                 end
@@ -4295,13 +4374,13 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     declarations = _kernel_enclosing_declarations(statements, signature_inputs)
     enclosing_ports = Set{Symbol}(name for (name, _) in declarations)
     scalar_ports = _kernel_scalar_ports(declarations, mod)
-    graph_var = gensym(:kernel_graph)
-    ports_var = gensym(:kernel_ports)
-    order_var = gensym(:kernel_port_order)
-    have_var = gensym(:kernel_have)
-    want_var = gensym(:kernel_want)
+    graph_var = _kernel_gensym(:kernel_graph)
+    ports_var = _kernel_gensym(:kernel_ports)
+    order_var = _kernel_gensym(:kernel_port_order)
+    have_var = _kernel_gensym(:kernel_have)
+    want_var = _kernel_gensym(:kernel_want)
     port_indices = Dict{Symbol,Int}()
-    port_values_var = gensym(:kernel_port_values)
+    port_values_var = _kernel_gensym(:kernel_port_values)
     port_order = Symbol[]
     annotations = Dict{Symbol,Vector{Any}}()
     have_names = Symbol[]
@@ -4866,6 +4945,10 @@ remains available through [`prepare_reactive`](@ref), [`set!`](@ref),
 [`mutate!`](@ref), and [`touch!`](@ref).
 """
 macro kernel(ex)
+    _with_kernel_names(() -> _kernel_macro(ex, __module__), ex)
+end
+
+function _kernel_macro(ex, __module__)
     definition = ex isa Expr ? _kernel_definition_parts(ex) : nothing
     if definition === nothing && ex isa Expr && ex.head === :(=) &&
        length(ex.args) == 2 && ex.args[1] isa Symbol &&

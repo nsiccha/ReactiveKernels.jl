@@ -62,7 +62,9 @@ be a binding with nothing left to observe (`model(; x)`), read as
 `bind_data(binding)`, exactly as [`build_kernel`](@ref) reads it.
 """
 function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model)
-    def = Base.invokelatest(_kernel_expr_latest, plan, layout; name)
+    def = ReactiveKernels._within_kernel_names(name) do
+        Base.invokelatest(_kernel_expr_latest, plan, layout; name)
+    end
     def = _elide_named_location_aliases(plan, def)
     def = _pointwise_arithmetic_plates(plan, def)
     return _name_plate_cells(def, _location_value_aliases(plan, def))
@@ -2365,7 +2367,7 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
             # the log-sum expression hides its independent recipes from
             # plate scheduling. Keep these statements inside the support
             # guard below, including their argument bindings.
-            density = gensym(:_ppl_component_density)
+            density = ReactiveKernels._kernel_gensym(:_ppl_component_density)
             push!(component_statements, :($density = $lpdf))
             lpdf = density
         end

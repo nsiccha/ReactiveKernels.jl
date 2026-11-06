@@ -1153,6 +1153,17 @@ _plate_cell_kernel(@nospecialize(op::_AuthoredPlateOp)) = getfield(op, :kernel)
 _plate_cell_ops_length(@nospecialize(op::_AuthoredPlateOp)) =
     fieldcount(fieldtype(fieldtype(typeof(op), :kernel), :callables))
 
+# The axes a plate's bound arguments broadcast to. One at a time, in input order:
+# splatting them compiles `combine_axes` once per sequence of argument types, and
+# a dictionary keyed by value ids gives one program another sequence per build.
+function _partial_bound_axes(arguments::Vector{Any})
+    shape = ()
+    for argument in arguments
+        shape = Base.Broadcast.broadcast_shape(axes(argument), shape)
+    end
+    shape
+end
+
 # Generated inner-kernel types are data to this structural pass. Specializing
 # on them recompiles the entire partial evaluator once per authored plate.
 Base.@nospecializeinfer function _partial_plate_recipe(
@@ -1171,6 +1182,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     bound_types = Dict{ValueId,Any}()
     known_indices = Int[]
     known_types = Any[]
+    bound_arguments = Any[]
     # An index loop: iterating `zip` over the plate's heterogeneous input
     # tuple allocated at every step of this untyped pass.
     for index in eachindex(inner.have)
@@ -1183,6 +1195,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         push!(bound, cid)
         push!(known_indices, index)
         arguments[cid] = index in atomic_inputs ? Ref(data) : data
+        push!(bound_arguments, arguments[cid])
         bound_types[cid] = index in atomic_inputs || data isa Number ?
             typeof(data) : eltype(data)
         push!(known_types, bound_types[cid])
@@ -1193,7 +1206,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
 
     # A known empty domain has no data-dependent cells to evaluate. Keeping the
     # original plate also preserves its empty-result typing and error behavior.
-    bound_axes = Base.Broadcast.combine_axes(values(arguments)...)
+    bound_axes = _partial_bound_axes(bound_arguments)
     any(isempty, bound_axes) && return nothing
     fixed_domain = all(enumerate(recipe.inputs)) do (index, input)
         index in atomic_inputs || haskey(known, canon_id(g, input.id)) ||
