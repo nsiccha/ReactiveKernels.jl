@@ -7092,8 +7092,8 @@ end
 
 @generated function (call::_ExternalizedBoundArrayCall{F,C,O,I,H,E})(
         args::Vararg{Any,N}) where {F,C,O,I,H,E,N}
-    # Replaced positions and trailing operands differ in a rewritten body:
-    # records contribute each array leaf, while numeric positions become literals.
+    # Replaced positions and trailing operands differ in a rewritten body: a
+    # structured value contributes each of its leaves (`_bound_operand_leaves`).
     external_count = E
     public_count = N - external_count
     public_count >= 0 || return :(throw(ArgumentError(
@@ -7134,9 +7134,11 @@ operand it must read. By default every array is externalized. A tuple or named
 tuple containing arrays crosses without capturing the arrays in the
 differentiated callable, and it crosses when any of its array leaves meets
 `min_elements`. When the compiled body reads the operation table at literal
-positions, each array leaf crosses as its own operand (depth-first order) and
-the body rebuilds the tuple where it was read, with non-array leaves as
-literals; otherwise the value crosses as one structured operand.
+positions, each array or value leaf (`_bound_value_leaf`) crosses as its own
+operand (depth-first order) and the body rebuilds the tuple where it was read,
+with only the leaves no value can change as literals; otherwise the value
+crosses as one structured operand. Either way the body holds no bound number,
+so another value of one keeps the body and the callable's type.
 
 This is a backend ABI adapter, not a different model boundary: `kernel` keeps
 its original public inputs, and `call(public_args..., values...)` is exactly
@@ -7150,11 +7152,10 @@ unboxes the parent pointer into an active slot), while an owning array with
 identical contents differentiates cleanly (snag plain-enzyme-rev-3dc5d563).
 
 With `externalize_scalars`, bound numeric values also leave the callable's
-operation table. They follow the literal rebuilding rule above for a rewritten
-structured body, and otherwise cross as inactive operands. Leaving their fields
-in the callable can defeat native Enzyme's readonly analysis when it
-reconstructs that callable beside active values; moving the same fixed values
-out of those fields preserves the public kernel boundary.
+operation table and cross as inactive operands. Leaving their fields in the
+callable can defeat native Enzyme's readonly analysis when it reconstructs that
+callable beside active values; moving the same fixed values out of those fields
+preserves the public kernel boundary.
 """
 Base.@nospecializeinfer function _externalize_bound_array_call(@nospecialize(f),
         @nospecialize(constants::Tuple), @nospecialize(callables::Tuple);
@@ -7186,7 +7187,7 @@ Base.@nospecializeinfer function _externalize_bound_array_call(@nospecialize(f),
     external_body = structured ?
         _externalize_bound_array_body(f, positions, values) : nothing
     callable = external_body === nothing ? f : external_body
-    external_values = external_body === nothing ? values : _bound_array_leaves(values)
+    external_values = external_body === nothing ? values : _bound_operand_leaves(values)
     call = _kernel_new_instance(_ExternalizedBoundArrayCall{
         typeof(callable),typeof(stripped),typeof(callables),positions,
         external_body !== nothing,length(external_values)},
@@ -7194,18 +7195,29 @@ Base.@nospecializeinfer function _externalize_bound_array_call(@nospecialize(f),
     call, external_values
 end
 
-# A rewritten body takes every array leaf of a structured bound value as its
-# own operand and rebuilds the tuple or named tuple where the table was read;
-# non-array leaves stay literals of that rebuild. A multi-field structure
-# crossing as one operand beside a view of the active input fails native
-# Enzyme's static activity analysis, while its leaves cross cleanly (snag
-# `interpolated-err-41772e14`).
-_bound_array_leaves(values::Tuple) =
-    Tuple(Iterators.flatten(map(_bound_array_leaves, values)))
-_bound_array_leaves(value::NamedTuple) = _bound_array_leaves(Tuple(value))
-_bound_array_leaves(value::AbstractArray) = (value,)
-_bound_array_leaves(value) = _bound_record(value) ?
-    _bound_array_leaves(_bound_record_fields(value)) : ()
+# A rewritten body takes every array and value leaf of a bound value as its own
+# operand and rebuilds the tuple or named tuple where the table was read. A
+# multi-field structure crossing as one operand beside a view of the active
+# input fails native Enzyme's static activity analysis, while its leaves cross
+# cleanly (snag `interpolated-err-41772e14`).
+_bound_operand_leaves(values::Tuple) =
+    Tuple(Iterators.flatten(map(_bound_operand_leaves, values)))
+_bound_operand_leaves(value::NamedTuple) = _bound_operand_leaves(Tuple(value))
+_bound_operand_leaves(value::AbstractArray) = (value,)
+_bound_operand_leaves(value) =
+    _bound_value_leaf(value) ? (value,) :
+    _bound_record(value) ? _bound_operand_leaves(_bound_record_fields(value)) : ()
+
+# A leaf whose value its type does not determine: a number, or a pointer-free
+# immutable that holds one, such as a range or a scale. Spelled in the body, it
+# would make each value another generated function, so another type, and a new
+# compile of the whole derivative (snag `prepare-sampler-e69f1b38`; the user's
+# direction on numeric values, `ODLPlaus:precompile` decision
+# `2026-11-06T01-09-46-212-0ikeidi`). Tuples and records never reach this as a
+# whole. Anything else, a singleton or a name such as a `Symbol` or a type, has
+# no number to keep out of the body and stays a literal of the rebuild.
+_bound_value_leaf(value) = value isa Number ||
+    (isbits(value) && !Base.issingletontype(typeof(value)))
 
 # A bound immutable struct whose fields hold arrays (a model's wrapper around
 # a data matrix, say) is a record: its array leaves leave the callable like a
@@ -7231,6 +7243,7 @@ _bound_rebuild_expr(value::Tuple, ports, next::Ref{Int}) =
 _bound_rebuild_expr(::AbstractArray, ports, next::Ref{Int}) =
     ports[next[] += 1]
 function _bound_rebuild_expr(value, ports, next::Ref{Int})
+    _bound_value_leaf(value) && return ports[next[] += 1]
     _bound_record(value) || return QuoteNode(value)
     fields = Any[_bound_rebuild_expr(v, ports, next) for v in _bound_record_fields(value)]
     Expr(:new, typeof(value), fields...)
@@ -7251,7 +7264,7 @@ function _externalize_bound_array_body(
     loads = Dict{Int,Any}()
     for (index, value) in zip(positions, values)
         ports = [gensym(:_rk_bound_operand)
-                 for _ in 1:length(_bound_array_leaves(value))]
+                 for _ in 1:length(_bound_operand_leaves(value))]
         append!(operands, ports)
         loads[index] = _bound_rebuild_expr(value, ports, Ref(0))
     end

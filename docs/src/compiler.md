@@ -618,6 +618,13 @@ entry, and its generic compiled bodies specialize per concrete type on first
 use as any Julia call does; a lazy branch on a hoisted constant remains a
 per-call branch and follows each binding's value.
 
+A prepared derivative follows the same rule. `prepare_ad` passes bound numbers,
+like bound arrays, as hidden operands of the differentiated call, including the
+numeric leaves of a bound tuple or record, so another value of a bound number
+has the same prepared type and reuses the compiled derivative. A binding that
+changes a value's type, or moves an index run between its flat and grouped
+schedules, is another program and compiles once more.
+
 The graph holds these entries itself, so they live exactly as long as the
 graph: a graph authored as a module constant keeps them for the process, a
 graph built per request drops them with it, and a mutation of the graph starts

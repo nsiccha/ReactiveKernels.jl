@@ -1,5 +1,6 @@
 using DifferentiationInterface
 import Enzyme
+import LinearAlgebra
 using InteractiveUtils: code_llvm
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: bernoulli
 
@@ -698,25 +699,77 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         q, y = [0.3,-0.4], [1.0 4.0;2.0 5.0;3.0 6.0]
         kernel = prepare(structured_bound_like;
                          have=(:q,:y),want=:objective,bound=(;y))
-        # Each array leaf crosses as its own operand (depth-first); the
-        # scalar leaf stays a literal of the in-body rebuild.
+        # Each array and scalar leaf crosses as its own operand (depth-first),
+        # so the in-body rebuild holds no bound number.
         external, values = ReactiveKernels._externalize_bound_arrays(kernel)
-        @test length(values) == 3
+        @test length(values) == 4
         @test values[1] isa SubArray && values[3] isa SubArray
         @test values[2] == [2,1,2]
+        @test values[4] === 0.5
         @test external(q,values...) == kernel(q)
         unchanged, none = ReactiveKernels._externalize_bound_arrays(
             kernel;min_elements=4)
         @test unchanged === kernel && isempty(none)
         prepared = prepare_ad(kernel,TEST_AD_BACKEND,q;active=:q)
-        weights, rows, nested = ReactiveKernels._ad_hidden_operands(prepared)
+        weights, rows, nested, shift = ReactiveKernels._ad_hidden_operands(prepared)
         @test weights isa Vector && nested isa Vector
         @test weights == y[:,1] && rows == [2,1,2] && nested == y[:,2]
+        @test shift === 0.5
         g = zeros(length(q))
         value,returned = ad_value_and_gradient!(prepared,g,q)
         @test value ≈ 2q[1]^2+4q[2]^2+0.5
         @test returned === g
         @test g ≈ [4q[1],8q[2]]
+    end
+
+    @testset "a bound number's value keeps the prepared derivative's type" begin
+        # A structured bound value rewrites the generated body. Spelling a bound
+        # number in it, the value's own leaves or a scalar beside it, made each
+        # value another generated function and so another compiled derivative
+        # (snag `prepare-sampler-e69f1b38`).
+        numbers_objective(q, data) = begin
+            total = data.pair[1] * data.pair[2]
+            for i in data.rows
+                total += data.weights[i] * data.law.λ * q[i]^2
+            end
+            total
+        end
+        @kernel numbers_beside_structure(q::Vector{Float64}, y::Vector{Float64},
+                a::Float64, n::Int, flag::Bool) = begin
+            data = (weights=y, law=a * LinearAlgebra.I, rows=Base.OneTo(n),
+                    pair=(a + 1.0, flag ? 2.0 : 3.0))
+            objective::Float64 = a * numbers_objective(q, data) + n
+        end
+        oracle(q, y, a, n, flag) = begin
+            value = a * (sum(y[i] * a * q[i]^2 for i in 1:n) +
+                         (a + 1.0) * (flag ? 2.0 : 3.0)) + n
+            gradient = zeros(length(q))
+            for i in 1:n
+                gradient[i] = 2a^2 * y[i] * q[i]
+            end
+            value, gradient
+        end
+        q = [0.3, -0.4, 0.9]
+        bindings = ((y=[1.0, 2.0, 3.0], a=0.25, n=3, flag=true),
+                    (y=[-1.0, 4.0, 0.5], a=1.75, n=2, flag=false),
+                    (y=[1.0, 2.0, 3.0], a=0.25, n=3, flag=true))
+        prepared = map(bindings) do bound
+            kernel = prepare(numbers_beside_structure;
+                             have=(:q,:y,:a,:n,:flag), want=:objective, bound)
+            prepare_ad(kernel, TEST_AD_BACKEND, q; active=:q)
+        end
+        @test allequal(typeof.(prepared))
+        # The values reach the derivative as hidden operands, not through its type.
+        hidden = ReactiveKernels._ad_hidden_operands(prepared[2])
+        @test any(==(1.75), Iterators.filter(v -> v isa Number, hidden))
+        @test any(==(Base.OneTo(2)), Iterators.filter(v -> v isa Base.OneTo, hidden))
+        for (bound, one) in zip(bindings, prepared)
+            expected, expected_gradient = oracle(q, bound.y, bound.a, bound.n, bound.flag)
+            g = zeros(length(q))
+            value, _ = ad_value_and_gradient!(one, g, q)
+            @test value ≈ expected
+            @test g ≈ expected_gradient
+        end
     end
 
     @testset "a folded multi-field schedule beside a view-read parameter" begin
