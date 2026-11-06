@@ -1612,25 +1612,52 @@ function _named_read!(reads::Vector{Expr}, name::Symbol, read)
     return name
 end
 
-# Whether an expression reads bound data and data-only definitions alone.
-function _data_read_test(plan::StructuralPlan)
+# Which reads a binding's program may use. A read must name data that every
+# binding of this model has: an observation can be absent, so nothing reads one
+# (a design binding of a fit's build generates the same program). And it must
+# evaluate to the size this binding packs: a read that disagrees would silently
+# read other coordinates, so that block keeps its literal size instead.
+function _read_tests(plan::StructuralPlan)
     exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
     merge!(exprs, Dict{Symbol,Any}(d.name => d.expr for d in plan.derived))
+    observed = union(Set{Symbol}(plan.conditioned),
+        Set{Symbol}(r.response for r in plan.responses if r.response isa Symbol))
     known = Dict{Symbol,Bool}()
     function isdata(name)
-        _holds_bound_value(plan, plan.columns, name) && return true
+        name in observed && return false
+        _holds_bound_value(plan, plan.columns, name) &&
+            return _supplied(get(plan.columns, name, nothing))
         haskey(exprs, name) || return false
         return get!(known, name) do
             known[name] = false # a cyclic definition is not data
             all(isdata, _value_symbols(exprs[name]))
         end
     end
-    return ex -> all(isdata, _value_symbols(ex))
+    # A read of no name at all, `length([1.0, 1.0])`, is a literal.
+    reads_data(ex) = (names = _value_symbols(ex); !isempty(names) && all(isdata, names))
+    function lookup(name)
+        _holds_bound_value(plan, plan.columns, name) && return _bound_value(plan, plan.columns, name)
+        return _memoized_data(plan, name) do
+            _eval_value_expr(exprs[name], lookup, name)
+        end
+    end
+    # Sizes evaluate at binding anyway; one that cannot evaluate here keeps the
+    # literal the binding already computed.
+    agrees(read, value::Int) = try
+        x = _eval_value_expr(read, lookup, :layout_read)
+        x isa Integer && !(x isa Bool) && x == value
+    catch
+        false
+    end
+    return (; reads_data, agrees)
 end
 
-# An array axis as the program reads it; `value` is this binding's length, kept
-# when the axis reads anything but data.
-function _array_dim_read(plan::StructuralPlan, isdata, d, value::Int)
+# `read` when it reads data and agrees with this binding's `value`, else `value`.
+_checked_read(tests, read, value::Int) =
+    tests.reads_data(read) && tests.agrees(read, value) ? read : value
+
+# An array axis as the program reads it; `value` is this binding's length.
+function _array_dim_read(plan::StructuralPlan, tests, d, value::Int)
     d isa Int && return d
     if _is_levels_dim(d)
         read = _read_length(_axis_labels_expr(d))
@@ -1642,52 +1669,43 @@ function _array_dim_read(plan::StructuralPlan, isdata, d, value::Int)
     else
         read = _read_size(d.args[2], d.args[3])
     end
-    return isdata(read) ? read : value
+    return _checked_read(tests, read, value)
 end
 
-function _array_packed_reads(plan::StructuralPlan, isdata, e::LayoutEntry)
+function _array_packed_reads(plan::StructuralPlan, tests, e::LayoutEntry)
     p = _array_param(plan, e.name)
-    dims = Any[_array_dim_read(plan, isdata, d, n) for (d, n) in zip(p.dims, e.dims)]
+    dims = Any[_array_dim_read(plan, tests, d, n) for (d, n) in zip(p.dims, e.dims)]
     e.transform === :simplex_rows && return Any[dims[1], _read_add(dims[2], -1)]
     e.transform === :simplex_cols && return Any[_read_add(dims[1], -1), dims[2]]
     return dims
 end
 
 # A plate latent's rows as the program reads them.
-function _plate_rows_read(plan::StructuralPlan, isdata, p::PlateParameter, value::Int)
+function _plate_rows_read(plan::StructuralPlan, tests, p::PlateParameter, value::Int)
     r = p.range
     r isa UnitRange && return value
     iterator = r isa Symbol ? Expr(:call, :eachindex, r) : r
     if iterator isa Expr
         Meta.isexpr(iterator, :call) && !isempty(iterator.args) &&
-            iterator.args[1] in (:eachindex, :axes) && isdata(iterator.args[2]) || return value
-        return _read_length(iterator)
+            iterator.args[1] in (:eachindex, :axes) || return value
+        return _checked_read(tests, _read_length(iterator), value)
     end
-    # No authored range: the rows of the data the latent reads, else of the
-    # response it feeds (`_value_rows`).
+    # No authored range: the rows of the data the latent reads (`_value_rows`).
     columns = sort!(collect(_response_reads(plan, p.name, _row_columns(plan))))
-    isempty(columns) || return _read_size(first(columns), 1)
-    names = Set{Symbol}([p.name])
-    for x in plan.responses
-        p.name in _response_reads(plan, x, names) && haskey(plan.columns, x.response) &&
-            return _read_size(x.response, 1)
-    end
-    return value
+    isempty(columns) && return value
+    return _checked_read(tests, _read_size(first(columns), 1), value)
 end
 
-# A threshold or simplex vector's packed length as the program reads it.
-function _vector_size_read(plan::StructuralPlan, isdata, e::LayoutEntry)
+# A threshold or simplex vector's packed length as the program reads it: its
+# authored extent, when that reads data. A count inferred from a response stays
+# literal: the response can be absent, and it can declare unobserved levels.
+function _vector_size_read(plan::StructuralPlan, tests, e::LayoutEntry)
     i = findfirst(p -> p.name === e.name, plan.vector_parameters)
     i === nothing && return e.size
     extent = plan.vector_parameters[i].extent_expr
-    read = extent !== nothing && isdata(extent) ? extent : nothing
-    if read === nothing
-        k = findfirst(x -> x.thresholds === e.name && haskey(plan.columns, x.response) &&
-            x.n_levels isa Integer, plan.responses)
-        k === nothing && return e.size
-        read = _read_add(_read_length(_axis_labels_expr(:levels, plan.responses[k].response, Colon())), -1)
-    end
-    return e.transform === :simplex ? _read_add(read, -1) : read
+    extent === nothing && return e.size
+    packed = e.transform === :simplex ? _read_add(extent, -1) : extent
+    return _checked_read(tests, packed, e.size)
 end
 
 # Whether an entry's program reads `positions`. Scalars, per-coordinate positive
@@ -1735,7 +1753,7 @@ end
 # that name them.
 function _layout_reads(plan::StructuralPlan, entries::Vector{LayoutEntry})
     reads = Expr[]
-    isdata = _data_read_test(plan)
+    tests = _read_tests(plan)
     parameters = Dict{Symbol,Any}()
     for ps in (plan.parameters, plan.plate_parameters, plan.array_parameters), p in ps
         parameters[p.name] = p
@@ -1751,7 +1769,8 @@ function _layout_reads(plan::StructuralPlan, entries::Vector{LayoutEntry})
         bound_reads = e.transform in (:interval, :floored, :upper) &&
             haskey(parameters, e.name) && parameters[e.name].family !== :external ?
             _data_bound_reads(_authored_bounds(parameters[e.name]), e.lo, e.hi) : e.bound_reads
-        entry, at = _entry_reads!(reads, plan, isdata, e, at, get(scans, e.name, nothing), bound_reads)
+        bound_reads = map(x -> x !== nothing && tests.reads_data(x) ? x : nothing, bound_reads)
+        entry, at = _entry_reads!(reads, plan, tests, e, at, get(scans, e.name, nothing), bound_reads)
         push!(out, entry)
     end
     return out, reads
@@ -1766,7 +1785,7 @@ function _block_reads!(reads, name::Symbol, at, size)
     return start, stop, _read_add(stop, 1)
 end
 
-function _entry_reads!(reads, plan, isdata, e::LayoutEntry, at, scan, bound_reads)
+function _entry_reads!(reads, plan, tests, e::LayoutEntry, at, scan, bound_reads)
     with(positions, axes = nothing, blocks = e.scan_blocks) =
         LayoutEntry(e.kind, e.predictor, e.name, e.labels, e.offset, e.size, e.transform,
             e.lo, e.hi, e.dims, blocks, e.sampling, positions, axes, bound_reads)
@@ -1787,12 +1806,13 @@ function _entry_reads!(reads, plan, isdata, e::LayoutEntry, at, scan, bound_read
                 _block_reads!(reads, b.name, at, st isa ScanSetup ? 1 : steps)
             push!(blocks, LayoutEntry(b.kind, b.predictor, b.name, b.labels, b.offset, b.size,
                 b.transform, b.lo, b.hi, b.dims, b.scan_blocks, b.sampling,
-                start === nothing ? nothing : (start, stop), nothing, b.bound_reads))
+                start === nothing ? nothing : (start, stop), nothing,
+                map(x -> x !== nothing && tests.reads_data(x) ? x : nothing, b.bound_reads)))
             at = next
         end
         return with(nothing, nothing, blocks), at
     elseif e.kind === :array
-        packed = _array_packed_reads(plan, isdata, e)
+        packed = _array_packed_reads(plan, tests, e)
         if !all(a -> a isa Int, packed)
             axes = Any[_named_read!(reads, Symbol(:_ppl_axis, d, :_, e.name), a)
                 for (d, a) in enumerate(packed)]
@@ -1800,9 +1820,9 @@ function _entry_reads!(reads, plan, isdata, e::LayoutEntry, at, scan, bound_read
         size = foldl(_read_mul, something(axes, packed); init = 1)
     elseif e.kind === :plate
         i = findfirst(p -> p.name === e.name, plan.plate_parameters)
-        size = i === nothing ? e.size : _plate_rows_read(plan, isdata, plan.plate_parameters[i], e.size)
+        size = i === nothing ? e.size : _plate_rows_read(plan, tests, plan.plate_parameters[i], e.size)
     elseif e.kind === :vector
-        size = _vector_size_read(plan, isdata, e)
+        size = _vector_size_read(plan, tests, e)
     elseif e.kind === :scan
         T = _scan_read_length(plan, scan, _scan_length(plan, scan))
         size = T isa Int ? e.size : !_is_noncentered_scan(scan) ? T :

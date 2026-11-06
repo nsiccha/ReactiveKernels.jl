@@ -123,8 +123,7 @@ _extent_central(f, u; h = 1e-6) =
 # Each binding's density from the host's constrained values and log-Jacobian,
 # which do not read the generated program: `(constrained, data) -> density`
 # without the Jacobian.
-function _extent_check(source, datasets, want; conditioned = (:y,), same_type = true,
-        reuse = true)
+function _extent_check(source, datasets, want; conditioned = (:y,), same_type = true)
     plan = lower_rkppl(source, first(datasets); conditioned)
     bound = [bind_data(plan, d) for d in datasets]
     builds = build_kernel.(bound)
@@ -137,9 +136,8 @@ function _extent_check(source, datasets, want; conditioned = (:y,), same_type = 
         u = [0.3sin(i) for i in 1:built.layout.total]
         expected = want(constrain(built.layout, u), d) + logjac(built.layout, u)
         @test Base.invokelatest(q, u) ≈ expected
-        # The first binding's build serves this one, derivative included. Other
-        # level labels ask for their own build (`rkppl-use` section 14).
-        reused = reuse ? prepare_query(first(builds), b, :sampler) : q
+        # The first binding's build serves this one, derivative included.
+        reused = prepare_query(first(builds), b, :sampler)
         @test Base.invokelatest(reused, u) ≈ expected
         isempty(u) && continue
         ad = prepare_ad(reused, AutoEnzyme(; mode = Enzyme.Reverse), u; active = :unconstrained)
@@ -222,17 +220,28 @@ _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
     end
     @testset "plate latents, the empty loop included" begin
         loop = quote
-            @plate for i in eachindex(y)
-                a[i] ~ Normal(0, 1)
-                y[i] ~ Normal(a[i], 1.0)
+            @plate for i in eachindex(x)
+                a[i] ~ Normal(x[i], 1)
             end
             w[1:2] .~ Normal.(0, 1)
+            y .~ Normal.(w[1], 1.0)
         end
-        _extent_check(loop, [(y = [0.9, 1.0],), (y = [0.9, 1.0, 1.1, 0.7],)],
-            (v, d) -> _normals(v.a) + _normals(v.w) + sum(logpdf.(Normal.(v.a, 1.0), d.y)))
-        _extent_check(loop, [(y = [0.9, 1.0],), (y = Float64[],)],
-            (v, d) -> _normals(v.a) + _normals(v.w) +
-                sum(logpdf.(Normal.(v.a, 1.0), d.y); init = 0.0); same_type = false)
+        want = (v, d) -> sum(logpdf.(Normal.(d.x, 1), v.a); init = 0.0) + _normals(v.w) +
+            sum(logpdf.(Normal.(v.w[1], 1.0), d.y))
+        _extent_check(loop, [(x = [0.9, 1.0], y = [0.5]), (x = [0.9, 1.0, 1.1, 0.7], y = [0.5])], want)
+        _extent_check(loop, [(x = [0.9, 1.0], y = [0.5]), (x = Float64[], y = [0.5])], want;
+            same_type = false)
+        # A latent over an observation's rows stays literal: the observation can
+        # be absent, and a design binding of a fit's build generates this program.
+        over_response = lower_rkppl(quote
+                @plate for i in eachindex(y)
+                    a[i] ~ Normal(0, 1)
+                    y[i] ~ Normal(a[i], 1.0)
+                end
+            end, (y = [0.9, 1.0],); conditioned = (:y,))
+        fit = bind_data(over_response, (y = [0.9, 1.0],))
+        @test occursin("view(unconstrained, 1:2)",
+            string(kernel_expr(fit, build_kernel(fit).layout)))
     end
     @testset "scans, centered and non-centered" begin
         _extent_check(quote
@@ -273,16 +282,25 @@ _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
             k == length(c) + 1 ? log1p(-logistic(c[end])) :
             log(logistic(c[k]) - logistic(c[k - 1]))
         ordered = quote
-            c ~ Ordered(Normal(0, 1), length(levels(k)) - 1)
+            c ~ Ordered(Normal(0, 1), K - 1)
             k .~ OrderedLogistic.(0.0, Ref(c))
         end
         want = (v, d) -> _normals(v.c) + sum(logit_mass.(Ref(v.c), d.k))
-        _extent_check(ordered, [(k = [1, 2, 3],), (k = [1, 2, 3, 4],)], want;
-            conditioned = (:k,), reuse = false)
+        _extent_check(ordered, [(K = 3, k = [1, 2, 3]), (K = 4, k = [1, 2, 3, 4])], want;
+            conditioned = (:k,))
         # Two levels have no interior observation. RK splits the data-bound
         # branch by the arms its lanes take, so that query's type is its own.
-        _extent_check(ordered, [(k = [1, 2, 1],), (k = [1, 2, 3],)], want;
-            conditioned = (:k,), same_type = false, reuse = false)
+        _extent_check(ordered, [(K = 2, k = [1, 2, 1]), (K = 3, k = [1, 2, 3])], want;
+            conditioned = (:k,), same_type = false)
+        # A level count inferred from the response stays as declared: observed
+        # levels need not be all of them, and the response can be absent.
+        inferred = lower_rkppl(quote
+                c ~ Ordered(Normal(0, 1), length(levels(k)) - 1)
+                k .~ OrderedLogistic.(0.0, Ref(c))
+            end, (k = [1, 2, 3],); conditioned = (:k,))
+        fit = bind_data(inferred, (k = [1, 2, 3],))
+        @test occursin("view(unconstrained, 1:2)",
+            string(kernel_expr(fit, build_kernel(fit).layout)))
     end
     @testset "data-derived transform bounds are inputs, not numbers" begin
         programs = _extent_check(quote

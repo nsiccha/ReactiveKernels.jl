@@ -4052,12 +4052,19 @@ _threshold_stages(name::Symbol, obs, stage) = :($name[$stage])
 _threshold_stages(rows::ThresholdRows, obs, stage) =
     :(getindex.(_broadcast_gather($(rows.name), $obs), $stage))
 
-# An ordered response's level count as its program reads it: its thresholds'
-# length, never this binding's number. One level is a zero-information
-# likelihood with no thresholds, a structure of its own.
-_ordinal_read_levels(plan::StructuralPlan, r::LikelihoodSpec) =
-    _group_thresholds(plan, r) || (r.thresholds isa Symbol && r.n_levels isa Integer && r.n_levels > 1) ?
-        :(length($(r.thresholds)) + 1) : r.n_levels
+# An ordered response's level count as its program reads it: the length of a
+# data-sized threshold vector, never this binding's number. Another count stays
+# as authored: its thresholds need not be one vector of `K - 1`.
+function _ordinal_read_levels(plan::StructuralPlan, r::LikelihoodSpec)
+    _group_thresholds(plan, r) && return :(length($(r.thresholds)) + 1)
+    (r.thresholds isa Symbol && r.n_levels isa Integer && r.n_levels > 1) || return r.n_levels
+    i = findfirst(p -> p.name === r.thresholds, plan.vector_parameters)
+    i === nothing && return r.n_levels
+    p = plan.vector_parameters[i]
+    extent = p.extent_expr
+    return extent !== nothing && p.size == r.n_levels - 1 &&
+        _read_tests(plan).reads_data(extent) ? :(length($(r.thresholds)) + 1) : r.n_levels
+end
 
 function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     K = _ordinal_read_levels(plan, r)
