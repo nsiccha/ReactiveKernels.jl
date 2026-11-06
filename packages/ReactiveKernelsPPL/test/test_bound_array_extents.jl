@@ -123,7 +123,8 @@ _extent_central(f, u; h = 1e-6) =
 # Each binding's density from the host's constrained values and log-Jacobian,
 # which do not read the generated program: `(constrained, data) -> density`
 # without the Jacobian.
-function _extent_check(source, datasets, want; conditioned = (:y,), same_type = true)
+function _extent_check(source, datasets, want; conditioned = (:y,), same_type = true,
+        reuse = true)
     plan = lower_rkppl(source, first(datasets); conditioned)
     bound = [bind_data(plan, d) for d in datasets]
     builds = build_kernel.(bound)
@@ -136,8 +137,9 @@ function _extent_check(source, datasets, want; conditioned = (:y,), same_type = 
         u = [0.3sin(i) for i in 1:built.layout.total]
         expected = want(constrain(built.layout, u), d) + logjac(built.layout, u)
         @test Base.invokelatest(q, u) ≈ expected
-        # The first binding's build serves this one, derivative included.
-        reused = prepare_query(first(builds), b, :sampler)
+        # The first binding's build serves this one, derivative included. Other
+        # level labels ask for their own build (`rkppl-use` section 14).
+        reused = reuse ? prepare_query(first(builds), b, :sampler) : q
         @test Base.invokelatest(reused, u) ≈ expected
         isempty(u) && continue
         ad = prepare_ad(reused, AutoEnzyme(; mode = Enzyme.Reverse), u; active = :unconstrained)
@@ -161,8 +163,12 @@ _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
             [(n = n, mu = -0.2, sd = 0.3, obs_sd = 0.7, y = [0.9 + 0.1i for i in 1:n]) for n in (2, 4)],
             (v, d) -> sum(logpdf.(LogNormal(d.mu, d.sd), v.z)) +
                 _normals(v.M) + _normals(v.w) + sum(logpdf.(Normal.(v.z, d.obs_sd), d.y)))
-        # No packed position or extent is a literal of the program.
-        @test !occursin("unconstrained, 1:", string(first(programs)))
+        # The program reads the extent itself. `M` and `w` keep their literal
+        # shapes and start where the data-sized block ends.
+        text = string(first(programs))
+        @test occursin("view(unconstrained, 1:n)", text)
+        @test occursin("_ppl_first_M::Int = n + 1", text)
+        @test occursin("reshape(_ppl_arrflat_M, 2, 3)", text)
         # An empty array keeps the program. Its prepared query does not: RK
         # splits a data-bound branch of the likelihood by its lanes, and zero
         # lanes keep the guarded branch.
@@ -271,11 +277,12 @@ _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
             k .~ OrderedLogistic.(0.0, Ref(c))
         end
         want = (v, d) -> _normals(v.c) + sum(logit_mass.(Ref(v.c), d.k))
-        _extent_check(ordered, [(k = [1, 2, 3],), (k = [1, 2, 3, 4],)], want; conditioned = (:k,))
+        _extent_check(ordered, [(k = [1, 2, 3],), (k = [1, 2, 3, 4],)], want;
+            conditioned = (:k,), reuse = false)
         # Two levels have no interior observation. RK splits the data-bound
         # branch by the arms its lanes take, so that query's type is its own.
         _extent_check(ordered, [(k = [1, 2, 1],), (k = [1, 2, 3],)], want;
-            conditioned = (:k,), same_type = false)
+            conditioned = (:k,), same_type = false, reuse = false)
     end
     @testset "data-derived transform bounds are inputs, not numbers" begin
         programs = _extent_check(quote
@@ -319,17 +326,75 @@ _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
             end, (y = [0.9, 1.0],); conditioned = (:y,)), (y = [0.9, 1.0],))
         @test occursin("0.25", string(kernel_expr(literal, build_kernel(literal).layout)))
     end
-    @testset "a rebinding computes its own inputs" begin
+    @testset "literal extents stay literal" begin
+        # A model whose positions depend on no data is the program it always was.
+        plan = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                w[1:2] .~ Normal.(0, 1)
+                M[1:2, 1:3] .~ Normal.(0, 1)
+                y .~ Normal.(a .+ w[1], 1.0)
+            end, (y = [0.9, 1.0],); conditioned = (:y,))
+        bound = bind_data(plan, (y = [0.9, 1.0],))
+        text = string(kernel_expr(bound, build_kernel(bound).layout))
+        @test occursin("view(unconstrained, 2:3)", text)
+        @test occursin("view(unconstrained, 4:9)", text)
+        @test occursin("reshape(_ppl_arrflat_M, 2, 3)", text)
+        @test !occursin("_ppl_first_", text) && !occursin("_ppl_last_", text)
+    end
+    @testset "a cut needs only the model's own data" begin
+        # Positions read the data the model already has, so they add no input
+        # for `have` or `bound` to name (`rkppl-use` section 14).
+        data = (n = 3, m = 2, y = [0.9, 1.0])
+        plan = lower_rkppl(quote
+                z[1:n] .~ Normal.(0, 1)
+                w[1:m] .~ Normal.(0, 1)
+                mu = w[1] .+ z[1]
+                y .~ Normal.(mu, 1.0)
+            end, data; conditioned = (:y,))
+        bound = bind_data(plan, data)
+        built = build_kernel(bound)
+        u = [0.3sin(i) for i in 1:built.layout.total]
+        v = constrain(built.layout, u)
+        cut = Base.invokelatest(ReactiveKernels.prepare, built.spec;
+            have = (:unconstrained, keys(data)...), want = :w, bound = data)
+        @test Base.invokelatest(cut, u) == v.w
+        # Without `bound=`, the same cut reads the extents at run time.
+        live = Base.invokelatest(ReactiveKernels.prepare, built.spec;
+            have = (:unconstrained, :n, :m), want = :w)
+        @test Base.invokelatest(live, u, 3, 2) == v.w
+    end
+    @testset "a cell reads its own coordinates through data-derived positions" begin
+        ids = [2, 1, 2, 3]
+        data(n, k) = (n = n, k = k, ids = ids, x = [0.2, 0.3, -0.4, 0.0],
+            y = [0.1, 0.7, -0.2, 0.5])
+        plan = lower_rkppl(quote
+                a[1:n] .~ Normal.(0, 1)
+                Z[1:n, 1:k] .~ Normal.(0, 1)
+                mu = Z[ids, 1] .* x .+ a[ids]
+                y .~ Normal.(mu, 1.0)
+            end, data(3, 2); conditioned = (:y,))
+        for (n, k) in ((3, 2), (4, 3))
+            bound = bind_data(plan, data(n, k))
+            built = build_kernel(bound)
+            q = prepare_cell_query(built, bound, :y; locality = :error)
+            u = [0.3sin(i) for i in 1:built.layout.total]
+            v = constrain(built.layout, u)
+            mu = v.Z[ids, 1] .* data(n, k).x .+ v.a[ids]
+            for i in eachindex(ids)
+                @test Base.invokelatest(q, u, i) ≈ logpdf(Normal(mu[i], 1.0), data(n, k).y[i])
+            end
+            # Cell `i` reads `a[ids[i]]` and row `ids[i]` of `Z`, packed after `a`:
+            # a position for each column, whatever the extents, and no other row.
+            reads = Base.invokelatest(partition_footprint, q.kernel, u, 2).unconstrained
+            @test sort!(collect(reads)) == [ids[2]; [n + ids[2] + n * (j - 1) for j in 1:k]]
+        end
+    end
+    @testset "a rebinding reads its own extents" begin
         plan = lower_rkppl(quote
                 z[1:n] .~ Normal.(0, 1)
                 y .~ Normal.(z[1], 1.0)
             end, (n = 2, y = [0.9]); conditioned = (:y,))
         bound = bind_data(plan, (n = 4, y = [0.9]))
-        rebound = bind_data(bound, (n = 2, y = [0.9]))
-        @test build_kernel(rebound).layout.total == 2
-        @test rebound.columns[ReactiveKernelsPPL._layout_position_inputs(:z)[2]] == 2
-        # A caller's value never replaces a position the binding computes.
-        spoofed = bind_data(plan, (n = 2, y = [0.9], _ppl_last_z = 7))
-        @test spoofed.columns[:_ppl_last_z] == 2
+        @test build_kernel(bind_data(bound, (n = 2, y = [0.9]))).layout.total == 2
     end
 end

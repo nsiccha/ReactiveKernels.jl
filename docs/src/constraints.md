@@ -152,9 +152,9 @@ this never happens again....". **Keep sizes and numeric values, including
 floating-point prior and configuration values, as runtime model inputs; do not
 splice them into model source or its specialization.**
 
-RKPPL binding supplies packed positions, axis lengths, scan lengths, ordered
-level counts and data-derived transform bounds as internal inputs, so one
-generated program serves every extent and value of one declaration
+RKPPL's generated program reads packed positions, axis lengths, scan lengths,
+ordered level counts and data-derived transform bounds from the data it already
+has, so one program serves every extent and value of one declaration
 (`test_bound_array_extents.jl`). Known remaining paths, which are limitations
 to fix and not precedents, are listed under ReactiveKernelsPPL 0.1.104 in its
 changelog. A prepared type may still depend on which data-bound branch arms

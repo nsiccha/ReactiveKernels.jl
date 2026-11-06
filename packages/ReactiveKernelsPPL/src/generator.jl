@@ -80,7 +80,7 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable;
     assigns = _assignment_statements(plan; layout, gathers)
     free = _density_selection(plan, n -> n ∉ plan.conditioned)
     priors = _prior_statements(free, layout; gathers, context = plan, density_sites)
-    transforms = Expr[]
+    transforms = Expr[layout.reads...]
     for e in layout.entries
         append!(transforms, transform_statements(e))
     end
@@ -913,7 +913,7 @@ function _unit_sample_coordinate(layout::LayoutTable, name::Symbol)
     for e in layout.entries
         e.kind === :sampled && e.name === name || continue
         # The rewrite below would depend on a data-derived bound's value.
-        e.bound_inputs === (nothing, nothing) || return nothing
+        e.bound_reads === (nothing, nothing) || return nothing
         (e.transform === :logistic ||
             (e.transform === :interval && e.lo isa Real && e.hi isa Real &&
                 iszero(e.lo) && isone(e.hi))) ||
@@ -4053,12 +4053,11 @@ _threshold_stages(rows::ThresholdRows, obs, stage) =
     :(getindex.(_broadcast_gather($(rows.name), $obs), $stage))
 
 # An ordered response's level count as its program reads it: its thresholds'
-# length, or the binding's input (`_bind_ordinal_inputs!`). One level is a
-# zero-information likelihood with no thresholds, a structure of its own.
+# length, never this binding's number. One level is a zero-information
+# likelihood with no thresholds, a structure of its own.
 _ordinal_read_levels(plan::StructuralPlan, r::LikelihoodSpec) =
-    _group_thresholds(plan, r) ? :(length($(r.thresholds)) + 1) :
-    haskey(plan.columns, _layout_axis_input(r.label, 1)) ?
-        _layout_axis_input(r.label, 1) : r.n_levels
+    _group_thresholds(plan, r) || (r.thresholds isa Symbol && r.n_levels isa Integer && r.n_levels > 1) ?
+        :(length($(r.thresholds)) + 1) : r.n_levels
 
 function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     K = _ordinal_read_levels(plan, r)
@@ -4756,8 +4755,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
             push!(terms, Symbol(:_ppl_prior_, p.name))
         else
             _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
-                p.support_override; rows = _bound_layout_positions(plan, p.name) === nothing ?
-                    _plate_rows(plan, p) : nothing,
+                p.support_override; rows = p.range isa UnitRange ? _plate_rows(plan, p) : nothing,
                 float64_variate = p.name ∉ plan.conditioned,
                 float64_inputs = _float64_inputs(plan, values(p.args)))
         end
@@ -5232,14 +5230,6 @@ function _scan_latent_positions(s::ScanSpec, innov, T::Int)
     return seedpos, ranges
 end
 
-# A scan's length and its latent blocks' ranges as its program reads them: the
-# binding's inputs (`_bind_scan_inputs!`), so one program serves every length.
-_scan_read_length(plan::StructuralPlan, s::ScanSpec, T::Int) =
-    haskey(plan.columns, _scan_length_input(s)) ? _scan_length_input(s) : T
-_scan_read_ranges(plan::StructuralPlan, zname::Symbol, ranges) =
-    Any[haskey(plan.columns, first(_scan_range_inputs(zname, j))) ?
-        _scan_range_inputs(zname, j) : r for (j, r) in enumerate(ranges)]
-
 # In-graph name of a seed's value (`_ppl_scan_init_<state>_<k>`).
 _scan_init_name(a::Symbol, k::Int) = Symbol(:_ppl_scan_init_, a, :_, k)
 
@@ -5463,7 +5453,7 @@ function _scan_reconstruction_statements(plan::StructuralPlan,
             throw(ContractValidationError("$(_scan_where(s)): layout has no " *
                 "latent slice :$zname"))
         seedpos, ranges = _scan_latent_positions(s, innov, T)
-        ranges = _scan_read_ranges(plan, zname, ranges)
+        ranges = _scan_read_ranges(plan, s, ranges, T)
         read_T = _scan_read_length(plan, s, T)
         for f in s.setup
             nm = _scan_init_name(f.target, f.index)
@@ -5540,7 +5530,7 @@ function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
     scalars = _scan_readable_names(plan, s)
     zname = _scan_innovation_name(s)
     seedpos, ranges = _scan_latent_positions(s, innov, T)
-    ranges = _scan_read_ranges(plan, zname, ranges)
+    ranges = _scan_read_ranges(plan, s, ranges, T)
     head = first(s.states)
     terms = Any[]
     for f in s.setup

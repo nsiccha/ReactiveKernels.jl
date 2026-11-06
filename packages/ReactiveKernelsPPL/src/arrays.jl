@@ -1424,9 +1424,8 @@ _array_slices_packed_name(name::Symbol) = Symbol(:_ppl_arru_, name)
 # slice in one call.
 function _array_transform_statements(e::LayoutEntry)
     # There are no bijector cells in an empty elementwise array. Preserve its
-    # value shape with an owned empty output, without evaluating a cell. An
-    # array read at its binding's positions keeps one program for every
-    # extent, the empty one included.
+    # value shape with an owned empty output, without evaluating a cell. A
+    # data-sized array keeps one program for every extent, the empty one too.
     e.size == 0 && e.positions === nothing && !_is_slice_transform(e.transform) &&
         !_is_lkj_stack(e.transform) && return Expr[:($(e.name)::Array{Float64,$(length(e.dims))} =
         zeros(Float64, $(e.dims...)))]
@@ -1460,10 +1459,8 @@ _array_flat_entry(e::LayoutEntry, flat::Symbol) = LayoutEntry(:plate, nothing,
     LayoutEntry[], nothing, e.positions)
 
 # The shape an array's flat packed block has, as its program reads it.
-_array_packed_dims(e::LayoutEntry) = _is_slice_transform(e.transform) ?
-    _slice_packed_dims(e.transform, e.dims) : e.dims
-_entry_axes(e::LayoutEntry) = e.positions === nothing ? _array_packed_dims(e) :
-    Any[_layout_axis_input(e.name, d) for d in eachindex(_array_packed_dims(e))]
+_entry_axes(e::LayoutEntry) = something(e.axes, _is_slice_transform(e.transform) ?
+    _slice_packed_dims(e.transform, e.dims) : e.dims)
 
 function _array_jacobian_term(e::LayoutEntry)
     e.size == 0 && e.positions === nothing && return nothing
@@ -1834,12 +1831,11 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
                 count = p.args.broadcast ? prod(dims) : 1)
             continue
         end
-        # An array read at its binding's positions keeps one program for
-        # every extent: its density plate is empty when it is.
-        positioned = !(p.name in plan.conditioned) &&
-            !(p.family in (:lkj_cholesky, :lkj_cholesky_stack)) &&
-            _bound_layout_positions(plan, p.name) !== nothing
-        if prod(dims) == 0 && !positioned
+        # A data-sized array keeps one program for every extent: its density
+        # plate is empty when it is.
+        data_sized = !(p.name in plan.conditioned) &&
+            !(p.family in (:lkj_cholesky, :lkj_cholesky_stack)) && !all(d -> d isa Int, p.dims)
+        if prod(dims) == 0 && !data_sized
             # An elementwise declaration over no elements has no density
             # cells. Scalar priors elsewhere in the model remain intact.
             push!(stmts, :($node::Float64 = 0.0))

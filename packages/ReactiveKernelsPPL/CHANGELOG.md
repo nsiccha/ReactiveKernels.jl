@@ -18,30 +18,29 @@ are recorded in the git history only.
 
 ## 0.1.104
 
-- Sizes and data-derived numbers are binding inputs, never literals of the
-  generated program. Binding supplies a packed block's first and last position
-  and a packed array's axis lengths as internal integer inputs
-  (`_ppl_first_<name>`, `_ppl_last_<name>`, `_ppl_axis<d>_<name>`), and a
-  transform bound computed from data as a number input (`_ppl_lo_<name>`,
-  `_ppl_hi_<name>`). Every extent of one declaration, such as
-  `z[1:n] .~ LogNormal.(mu, sd)` or `Z[1:r, 1:k] .~ Normal.(0, 1)`, and every
-  value of such a bound, as in `s ~ truncated(Normal(0, 1), floor, Inf)`, now
-  generates the same `kernel_expr`, and one `build_kernel` serves every
-  binding. This covers declared arrays (elementwise and slices), `@plate`
-  latents, scans (centered and non-centered, whose lengths are inputs too),
-  coefficient, GLM and threshold vectors, external laws' packed ranges, an LKJ
-  array's position and an ordered response's level count. A block packed after
-  a data-sized one no longer changes with that extent either. Requires
-  ReactiveKernels 0.1.92.
+- Sizes and data-derived numbers stay data in the generated program, never one
+  binding's literals. A packed block reads its range from the data the program
+  already has: `z[1:n] .~ LogNormal.(mu, sd)` is `view(unconstrained, 1:n)`, the
+  next block starts at `n + 1`, `Z[1:r, 1:k]` is `reshape(flat, r, k)`, and
+  `s ~ truncated(Normal(0, 1), floor, Inf)` is `floor + exp(u)`. Every extent of
+  one declaration and every value of such a bound now generates the same
+  `kernel_expr`, and one `build_kernel` serves every binding. No input is added,
+  so a cut needs the data it always did, and a model whose positions depend on
+  no data generates the program it always did. This covers declared arrays
+  (elementwise and slices), `@plate` latents over data, scans (centered and
+  non-centered, with their prior bounds), threshold vectors, an ordered
+  response's level count, and the positions of coefficient, GLM, external and
+  LKJ array blocks. Requires ReactiveKernels 0.1.92.
 - The prepared query type is the same whenever the data take the same arms: RK
   still splits a plate's data-bound branch by the arms its lanes take, so an
   empty likelihood, or an ordered response with no interior level, prepares its
-  own type from the same program.
-- What stays literal: scalar coordinates, which precede every data-sized block
-  except legacy coefficient and GLM blocks; positive vectors and LKJ scalar edges
-  and stacks, whose statements are one per coordinate; an LKJ array's dimension;
-  an external law's geometry shape; a scan prior's data-derived bound; a
-  transform's kind when a bound's value decides it (an infinite data-derived
+  own type from the same program. Other level labels keep the program and its
+  type, and still ask for their own `build_kernel` (`_program_identity`).
+- What stays literal: legacy coefficient and GLM block widths, and so the scalar
+  coordinates packed after them; positive vectors and LKJ scalar edges and
+  stacks, whose statements are one per coordinate; an LKJ array's dimension; an
+  external law's geometry shape and size; a plate latent over a computed value;
+  a transform's kind when a bound's value decides it (an infinite data-derived
   bound); and a number the model's author wrote. Density-factor queries keep
   their own literal row counts and windows.
 
