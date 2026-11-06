@@ -1458,8 +1458,52 @@ end
     total = sum(dens)
     return total
 end
+# Every dimension an input: `reshape(zflat, n, k)` is a bare exact call, so it
+# keeps Base's `reshape` as its operation rather than authored source.
+@kernel _cell_packed_all_inputs(u::AbstractVector{Float64}, g::AbstractVector{Int},
+                                w::AbstractVector{Float64}, lo::Int, hi::Int, n::Int, k::Int) = begin
+    a::Float64 = u[1]
+    zflat::AbstractVector{Float64} = view(u, lo:hi)
+    Z::AbstractMatrix{Float64} = reshape(zflat, n, k)
+    log_k = a .+ w .+ Z[g, 1]
+    dens = plate(log_k, w) do lk, wi
+        -(wi - exp(lk))^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
 _cell_packed_data(m) = (; u = [0.3; [0.1 * ((k * 7) % 5 - 2) for k in 1:10]; 0.7],
     g = [1 + (i - 1) % 5 for i in 1:m], w = [sin(i / 3) for i in 1:m])
+
+@testset "plate_cell: a reshape whose dimensions are all inputs keeps its row form" begin
+    have = (:u, :g, :w, :lo, :hi, :n, :k)
+    spec = plate_cell(_cell_packed_all_inputs, :dens; index = :i, locality = :error)
+    full = prepare(_cell_packed_all_inputs; have, want = :dens)
+    d = _cell_packed_data(9)
+    for kernel in (prepare(spec; have = (have..., :i), want = :dens_cell),
+            prepare(spec; have = (have..., :i), want = :dens_cell, bound = (; lo = 2, hi = 11, n = 5, k = 2)))
+        report = partition_locality(kernel)
+        status(name) = only(e.status for e in report if e.value === name)
+        @test status(:zflat) === :rows && status(:Z) === :rows
+        @test all(e.status !== :whole for e in report)
+    end
+    k = prepare(spec; have = (have..., :i), want = :dens_cell)
+    # One preparation serves every shape of the block.
+    for (n, m) in ((5, 2), (2, 5), (10, 1))
+        g = [1 + (i - 1) % n for i in 1:9]
+        @test [k(d.u, g, d.w, 2, 11, n, m, i) for i in 1:9] ≈ full(d.u, g, d.w, 2, 11, n, m)
+        # A cell reads the packed position of its own row of the first column.
+        ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), d.u, g, d.w, 2, 11, n, m, 3; active = :u)
+        gradient = similar(d.u)
+        value, _ = ad_value_and_gradient!(ad, gradient, d.u, g, d.w, 2, 11, n, m, 3)
+        @test value ≈ full(d.u, g, d.w, 2, 11, n, m)[3]
+        @test findall(!iszero, gradient) == [1, 1 + g[3]]
+        for j in (1, 1 + g[3])
+            @test gradient[j] ≈ _cell_central(h -> k(d.u .+ h .* (eachindex(d.u) .== j),
+                g, d.w, 2, 11, n, m, 3), 0.0) atol = 1e-6
+        end
+    end
+end
 
 @testset "plate_cell: packed blocks (a literal range view and a reshape) read at the cell's rows" begin
     spec = plate_cell(_cell_packed, :dens; index = :i, locality = :error)

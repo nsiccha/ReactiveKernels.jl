@@ -111,8 +111,15 @@ function _cell_factor_graph(p::Plan, original_ports, original_order;
                 leaves = [data_shape(r.inputs[j]) for j in form.leaves]
                 any(isnothing, leaves) && return nothing
                 return _plate_broadcast_shape(Tuple(leaves))
-            elseif form.kind === :range_view && all(x -> x isa Int, form.literal)
-                return _cell_range_shape(Tuple(form.literal))
+            elseif form.kind === :range_view
+                # Endpoints are literals or bound data (packed positions).
+                parts = map(form.literal) do part
+                    part isa Int && return part
+                    x = get(known, canon_id(p.graph, r.inputs[part.input].id), nothing)
+                    x isa Integer ? Int(x) : nothing
+                end
+                any(isnothing, parts) && return nothing
+                return _cell_range_shape(Tuple(parts))
             end
             nothing
         end
