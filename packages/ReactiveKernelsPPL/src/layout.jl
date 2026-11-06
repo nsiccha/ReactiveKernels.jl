@@ -163,10 +163,20 @@ struct LayoutEntry
     dims::Vector{Int} # declared-array axes, including :cholesky_corr (else empty)
     scan_blocks::Vector{LayoutEntry} # structural latent-family blocks (else empty)
     sampling::Union{Nothing,NamedTuple} # external RHS and its geometry
+    # The program's packed range: `nothing` reads the literal
+    # `offset:offset + size - 1`; `(first, last)` names the binding's integer
+    # inputs holding them (`_layout_position_inputs`), so the generated program
+    # does not depend on this binding's extents.
+    positions::Union{Nothing,NTuple{2,Symbol}}
+    # The binding's inputs holding a data-derived `lo`/`hi`
+    # (`_layout_bound_inputs`); `lo`/`hi` keep their numbers for host transforms.
+    bound_inputs::NTuple{2,Union{Nothing,Symbol}}
     LayoutEntry(kind, predictor, name, labels, offset, size, transform, lo, hi,
-            dims, scan_blocks, sampling) =
+            dims, scan_blocks, sampling, positions = nothing,
+            bound_inputs = (nothing, nothing)) =
         new(kind, predictor, name, labels, offset, size, transform,
-            _layout_bound(lo), _layout_bound(hi), dims, scan_blocks, sampling)
+            _layout_bound(lo), _layout_bound(hi), dims, scan_blocks, sampling,
+            positions, bound_inputs)
 end
 
 # Host transforms (`constrain`, `unconstrain`, `logjac` and the exported
@@ -517,6 +527,7 @@ function assign_layout(plan::StructuralPlan)
     # simplexes reuse the `:cholesky_corr` / `:vector` edges, elementwise
     # arrays pack one `:array` block each.
     offset = _array_layout_entries!(entries, plan, offset)
+    entries = LayoutEntry[_with_layout_inputs(plan, e) for e in entries]
     # A dotted cell latent's packed array draws under its authored name.
     paths = _scope_layout_paths(plan)
     for (site, (name, _)) in plan.cell_latents
@@ -1552,6 +1563,134 @@ Packed-slice read (`view(unconstrained, lo:hi)`, `@ppl` vector shape).
 block_read(offset::Int, width::Int) =
     :(view(unconstrained, $offset:$(offset + width - 1)))
 
+# The packed range an entry's program reads: its binding's position inputs
+# when it has them, else the literal offsets.
+_entry_range(e::LayoutEntry) = e.positions === nothing ?
+    :($(e.offset):$(e.offset + e.size - 1)) :
+    :($(e.positions[1]):$(e.positions[2]))
+_entry_view(e::LayoutEntry) = :(view(unconstrained, $(_entry_range(e))))
+
+# An entry with the binding's inputs its generated program reads, once
+# `_bind_layout_inputs!` has supplied them.
+function _with_layout_inputs(plan::StructuralPlan, e::LayoutEntry)
+    positions = _bound_layout_positions(plan, e.name)
+    lo, hi = _layout_bound_inputs(e.name)
+    bounds = (haskey(plan.columns, lo) ? lo : nothing,
+        haskey(plan.columns, hi) ? hi : nothing)
+    positions === nothing && bounds === (nothing, nothing) &&
+        isempty(e.scan_blocks) && return e
+    return LayoutEntry(e.kind, e.predictor, e.name, e.labels, e.offset, e.size,
+        e.transform, e.lo, e.hi, e.dims,
+        LayoutEntry[_with_layout_inputs(plan, b) for b in e.scan_blocks],
+        e.sampling, positions, bounds)
+end
+
+# Whether a packed block's program reads its binding's inputs. Scalars keep
+# their literal coordinate; so do per-coordinate positive vectors, LKJ scalar
+# edges and stacks, whose statements are one per coordinate.
+_reads_layout_inputs(e::LayoutEntry) = e.kind === :cholesky_corr ?
+    !isempty(e.dims) && !_is_lkj_stack(e.transform) :
+    e.kind === :vector ? e.transform !== :exp :
+    e.kind === :array ? !_is_lkj_stack(e.transform) :
+    e.kind in (:plate, :glm, :coefficient, :scan, :external, :external_plate)
+
+# Which of `p`'s bounds its authored source computes from data, rather than
+# stating as a literal.
+function _data_bound_sides(p)
+    lo = hi = false
+    ov = p.support_override
+    if ov isa Tuple && length(ov) == 3
+        lo, hi = !(ov[2] isa Real), !(ov[3] isa Real)
+    elseif ov isa Tuple && length(ov) == 2 && !(ov[2] isa Real)
+        ov[1] === :upper ? (hi = true) : (lo = true)
+    end
+    if p.family === :uniform
+        lo |= !(p.args.arg1 isa Real)
+        hi |= !(p.args.arg2 isa Real)
+    end
+    return lo, hi
+end
+
+function _bind_entry_inputs!(plan::StructuralPlan, e::LayoutEntry, sides)
+    if _reads_layout_inputs(e)
+        start, stop = _layout_position_inputs(e.name)
+        plan.columns[start] = e.offset
+        plan.columns[stop] = e.offset + e.size - 1
+        if e.kind === :array
+            for (axis, n) in enumerate(_array_packed_dims(e))
+                plan.columns[_layout_axis_input(e.name, axis)] = n
+            end
+        elseif e.kind === :vector
+            plan.columns[_layout_axis_input(e.name, 1)] = e.size
+            plan.columns[first(_layout_position_inputs(_vector_ordered_tail(e)))] = e.offset + 1
+        end
+    end
+    for b in e.scan_blocks
+        _bind_entry_inputs!(plan, b, sides)
+    end
+    lo, hi = get(sides, e.name, (false, false))
+    lo_input, hi_input = _layout_bound_inputs(e.name)
+    lo && e.lo isa Real && isfinite(e.lo) && (plan.columns[lo_input] = e.lo)
+    hi && e.hi isa Real && isfinite(e.hi) && (plan.columns[hi_input] = e.hi)
+    return plan
+end
+
+# Supply every input `_with_layout_inputs` reads from this binding's layout, so
+# the generated program is the same for every extent of one declaration and
+# every value of its data-derived bounds (user principle
+# `ODLPlaus:precompile/decisions/2026-11-06T01-09-46-212-0ikeidi`: sizes and
+# numeric values are runtime model inputs).
+function _bind_layout_inputs!(plan::StructuralPlan)
+    sides = Dict{Symbol,NTuple{2,Bool}}()
+    for ps in (plan.parameters, plan.plate_parameters, plan.array_parameters), p in ps
+        p.family === :external || (sides[p.name] = _data_bound_sides(p))
+    end
+    for e in assign_layout(plan).entries
+        _bind_entry_inputs!(plan, e, sides)
+    end
+    _bind_scan_inputs!(plan)
+    _bind_ordinal_inputs!(plan)
+    return plan
+end
+
+function _bind_ordinal_inputs!(plan::StructuralPlan)
+    for r in plan.responses
+        (r.family === OrderedLogisticFam || r.family === OrdinalFam) &&
+            r.n_levels isa Integer && r.n_levels > 1 &&
+            !_group_thresholds(plan, r) || continue
+        plan.columns[_layout_axis_input(r.label, 1)] = r.n_levels
+    end
+    return plan
+end
+
+_scan_length_input(s::ScanSpec) = _layout_axis_input(first(s.states), 1)
+
+function _bind_scan_inputs!(plan::StructuralPlan)
+    for raw in plan.scans
+        s = _resolve_scan(plan, raw)
+        T = _scan_length(plan, s)
+        plan.columns[_scan_length_input(s)] = T
+        _is_noncentered_scan(s) || continue
+        zname = _scan_innovation_name(s)
+        for (j, r) in enumerate(last(_scan_latent_positions(s, _scan_innovations(s), T)))
+            start, stop = _scan_range_inputs(zname, j)
+            plan.columns[start] = first(r)
+            plan.columns[stop] = last(r)
+        end
+    end
+    return plan
+end
+
+# The entry as its generated program reads it: a data-derived bound is its
+# binding input, never that binding's number.
+function _program_entry(e::LayoutEntry)
+    e.bound_inputs === (nothing, nothing) && return e
+    return LayoutEntry(e.kind, e.predictor, e.name, e.labels, e.offset, e.size,
+        e.transform, something(e.bound_inputs[1], e.lo),
+        something(e.bound_inputs[2], e.hi), e.dims, e.scan_blocks, e.sampling,
+        e.positions)
+end
+
 # Bound arithmetic of the parameterized (`:interval`/`:floored`/`:upper`)
 # inverse, Jacobian and one-sided edges. Literal operands fold
 # (`(0.5 - 0.0)` is `0.5`, `x - -1.0` is `x + 1.0`) and a literal zero
@@ -1607,6 +1746,7 @@ sampled entry (`:exp`/`:logistic`) splices the bijector's `constrain` endpoint,
 which the planner inlines.
 """
 function transform_statements(e::LayoutEntry)
+    e = _program_entry(e)
     e.kind === :external_plate && return Expr[
         :($(e.name) = $(_external_cells_expr(e, :constrain))),
         :($(_plate_logjac_name(e.name)) = $(_external_cells_expr(e, :logjac)))]
@@ -1617,7 +1757,7 @@ function transform_statements(e::LayoutEntry)
         stmts = Expr[]
         for b in e.scan_blocks
             if b.transform === :identity
-                push!(stmts, :($(b.name)::Vector{Float64} = copy($(block_read(b.offset, b.size)))))
+                push!(stmts, :($(b.name)::Vector{Float64} = copy($(_entry_view(b)))))
             else
                 append!(stmts, _plate_transform_statements(b))
             end
@@ -1630,19 +1770,14 @@ function transform_statements(e::LayoutEntry)
         # a non-centered scan's `_ppl_scan_z_<state>` innovation slice, or
         # a dar trajectory's `_ppl_dar_z_<state>` slice — the emitter
         # reconstructs from the innovation slices)
-        lo = e.offset
-        hi = e.offset + e.size - 1
-        return Expr[:($(e.name)::AbstractVector{Float64} =
-            view(unconstrained, $lo:$hi))]
+        return Expr[:($(e.name)::AbstractVector{Float64} = $(_entry_view(e)))]
     end
     if e.kind === :coefficient
         # Coefficient runs: identity runs read a view; interval runs
         # (uniform coefficients) hand-roll the broadcast constrain edge
         # with the host `_*_elt` path's math (mirroring the plate
         # `:interval` arm below).
-        lo = e.offset
-        hi = e.offset + e.size - 1
-        view_read = :(view(unconstrained, $lo:$hi))
+        view_read = _entry_view(e)
         e.transform === :identity &&
             return Expr[:($(e.name)::AbstractVector{Float64} = $view_read)]
         e.transform === :interval || throw(ContractValidationError(
@@ -1735,11 +1870,10 @@ end
 # A real-support block (per-cell latents, elementwise arrays, GLM vectors) is
 # its packed coordinates, read in place with no transform or Jacobian.
 function _plate_transform_statements(e::LayoutEntry)
-    lo = e.offset
-    hi = e.offset + e.size - 1
-    view_read = :(view(unconstrained, $lo:$hi))
+    range = _entry_range(e)
+    view_read = :(view(unconstrained, $range))
     e.transform === :identity && return Expr[:($(e.name)::AbstractVector{Float64} =
-        Base.view(unconstrained, $lo:$hi))]
+        Base.view(unconstrained, $range))]
     if e.transform === :interval
         # Parameterized bounds ⇒ not in the (parameterless) bijector registry;
         # hand-rolled broadcast edges over the block view, with the host
@@ -1822,7 +1956,9 @@ _vector_ordered_tail(e::LayoutEntry) = Symbol(:_ppl_ordered_tail_, e.name)
 # structural per-entry L algebra; they keep per-element scalar edges (the
 # plate `:exp` bijector shape).
 function _vector_transform_statements(e::LayoutEntry)
-    lo, hi = e.offset, e.offset + e.size - 1
+    range = _entry_range(e)
+    # A vector read at its binding's positions takes its length from it too.
+    size_read = e.positions === nothing ? e.size : _layout_axis_input(e.name, 1)
     if e.transform === :exp
         bij = _bijector_name(:exp)
         return Expr[:($(_vector_elt(e, i))::Float64 =
@@ -1834,19 +1970,21 @@ function _vector_transform_statements(e::LayoutEntry)
         # Materialize the ordinary range slice for the cumulative-cutpoint
         # validity reduction.
         return Expr[:($(e.name)::AbstractVector{Float64} =
-            unconstrained[$lo:$hi])]
+            unconstrained[$range])]
     end
     if e.transform === :ordered
         e.size == 0 && return Expr[]
-        e.size == 1 && return Expr[:($(e.name)::AbstractVector{Float64} =
-            view(unconstrained, $lo:$lo))]
+        e.size == 1 && e.positions === nothing &&
+            return Expr[:($(e.name)::AbstractVector{Float64} = view(unconstrained, $range))]
         f = GlobalRef(@__MODULE__, :_ordered_constrain_kernel)
         block, tail = _vector_block(e), _vector_ordered_tail(e)
+        tail_range = e.positions === nothing ? :($(e.offset + 1):$(e.offset + e.size - 1)) :
+            :($(_layout_position_inputs(tail)[1]):$(e.positions[2]))
         return Expr[
-            :($block::AbstractVector{Float64} = $(block_read(lo, e.size))),
-            :($(e.name)::AbstractVector{Float64} = $f($block, 1, $(e.size))),
+            :($block::AbstractVector{Float64} = view(unconstrained, $range)),
+            :($(e.name)::AbstractVector{Float64} = $f($block, 1, $size_read)),
             # Read only by the Jacobian (`jacobian_term`); pruned otherwise.
-            :($tail::AbstractVector{Float64} = $(block_read(lo + 1, e.size - 1))),
+            :($tail::AbstractVector{Float64} = view(unconstrained, $tail_range)),
         ]
     end
     # :simplex — stick-breaking (thin-layer-owned, not Stan's ILR).
@@ -1856,8 +1994,8 @@ function _vector_transform_statements(e::LayoutEntry)
     f = GlobalRef(@__MODULE__, :_simplex_constrain_logjac_kernel)
     block = _vector_block(e)
     return Expr[
-        :($block::AbstractVector{Float64} = $(block_read(lo, e.size))),
-        :($pair = $f($block, 1, $(e.size))),
+        :($block::AbstractVector{Float64} = view(unconstrained, $range)),
+        :($pair = $f($block, 1, $size_read)),
         :($(e.name)::AbstractVector{Float64} = $pair[1]),
         :($jac::Float64 = $pair[2]),
     ]
@@ -1948,6 +2086,7 @@ declared LKJ entry reads the retained sum over the partials shared with its
 transform. Legacy structural-margin LKJ blocks sum their named scalar edges.
 """
 function jacobian_term(e::LayoutEntry)
+    e = _program_entry(e)
     e.kind === :external_plate && return :(sum($(_plate_logjac_name(e.name))))
     e.kind === :external && return _external_edge(e, :_sampling_logjac)
     e.transform === :identity && return nothing
@@ -1962,7 +2101,7 @@ function jacobian_term(e::LayoutEntry)
         e.transform === :interval || throw(ContractValidationError(
             "[layout] coefficient block $(e.name) has no Jacobian rule " *
             "for $(e.transform) (admitted: :identity, :interval)"))
-        return _interval_logjac(e.lo, e.hi, block_read(e.offset, e.size); dot = true)
+        return _interval_logjac(e.lo, e.hi, _entry_view(e); dot = true)
     end
     if e.kind === :cholesky_corr
         isempty(e.dims) || return _lkj_array_logjac(e.name)
@@ -1972,8 +2111,9 @@ function jacobian_term(e::LayoutEntry)
     if e.kind === :vector
         if e.transform === :ordered
             # Σ u[2:end] over one packed slice (the host `ordered_logjac`),
-            # read by its own transform statement.
-            e.size < 2 && return nothing
+            # read by its own transform statement. A vector read at its
+            # binding's positions has one program for every length.
+            e.size < (e.positions === nothing ? 2 : 1) && return nothing
             return :(sum($(_vector_ordered_tail(e))))
         end
         if e.transform === :exp
@@ -1995,10 +2135,10 @@ function jacobian_term(e::LayoutEntry)
         # `_plate_transform_statements`. GLM vectors use the same shape.
         # Missing companion plates must fail explicitly.
         e.transform === :interval &&
-            return _interval_logjac(e.lo, e.hi, block_read(e.offset, e.size); dot = true)
+            return _interval_logjac(e.lo, e.hi, _entry_view(e); dot = true)
         if e.transform === :upper || e.transform === :floored
             # Both one-sided exp transforms have the bare-coordinate Jacobian.
-            return :(sum($(block_read(e.offset, e.size))))
+            return :(sum($(_entry_view(e))))
         end
         e.transform === :exp || e.transform === :logistic ||
             throw(ContractValidationError("[layout] $(e.kind) block " *

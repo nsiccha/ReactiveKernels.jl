@@ -65,13 +65,14 @@ function _record_jacobian!(sites, stmts, e::LayoutEntry, total;
     elseif e.kind !== :external && e.transform in (:exp, :logistic, :interval, :floored, :upper)
         # The same scalar Jacobian emitter used by the sampler. Parameters
         # of bounds remain graph inputs, so their support is retained.
+        program = _program_entry(e)
         scalar = LayoutEntry(:sampled, nothing, e.name, Symbol[], 1, 1,
-            e.transform, e.lo, e.hi)
+            e.transform, program.lo, program.hi)
         value = _dovar(1)
         expression = _replace_density_coordinate(jacobian_term(scalar), value)
         pw = Symbol(:_ppl_density_jacobian_cells_, length(sites) + 1)
         append!(stmts, _plate_sum_stmts(pw, Symbol(pw, :_sum),
-            Any[block_read(e.offset, e.size)], Expr(:block, expression)))
+            Any[_entry_view(e)], Expr(:block, expression)))
         _record_density!(sites, stmts, :log_jacobian, site, total;
             pointwise = pw, count = e.size, owner = e)
     else

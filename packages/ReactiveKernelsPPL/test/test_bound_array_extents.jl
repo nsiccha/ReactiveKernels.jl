@@ -1,4 +1,7 @@
+using DifferentiationInterface
 using Distributions
+using Enzyme
+using LogExpFunctions: logistic
 using ReactiveKernels
 using ReactiveKernelsPPL
 using Test
@@ -107,4 +110,226 @@ end
     # A sampled value cannot set the structural coordinate pack at bind.
     @test_throws ContractValidationError bind_data(live,
         Dict{Symbol,Any}(:y => [0.2]))
+end
+
+# Sizes and data-derived numbers are runtime model inputs (user principle
+# `ODLPlaus:precompile/decisions/2026-11-06T01-09-46-212-0ikeidi`; snag
+# `rkppl-sized-vect-69604d32`): every extent of one declaration, and every value
+# of a data-derived transform bound, generates the same program and the same
+# prepared query type, and one build serves every binding.
+_extent_central(f, u; h = 1e-6) =
+    [(f(u .+ h .* (eachindex(u) .== i)) - f(u .- h .* (eachindex(u) .== i))) / 2h for i in eachindex(u)]
+
+# Each binding's density from the host's constrained values and log-Jacobian,
+# which do not read the generated program: `(constrained, data) -> density`
+# without the Jacobian.
+function _extent_check(source, datasets, want; conditioned = (:y,), same_type = true)
+    plan = lower_rkppl(source, first(datasets); conditioned)
+    bound = [bind_data(plan, d) for d in datasets]
+    builds = build_kernel.(bound)
+    programs = [Base.remove_linenums!(kernel_expr(b, built.layout))
+        for (b, built) in zip(bound, builds)]
+    @test all(==(first(programs)), programs)
+    queries = [prepare_query(built, b, :sampler) for (b, built) in zip(bound, builds)]
+    same_type && @test allequal(typeof.(queries))
+    for (b, built, q, d) in zip(bound, builds, queries, datasets)
+        u = [0.3sin(i) for i in 1:built.layout.total]
+        expected = want(constrain(built.layout, u), d) + logjac(built.layout, u)
+        @test Base.invokelatest(q, u) ≈ expected
+        # The first binding's build serves this one, derivative included.
+        reused = prepare_query(first(builds), b, :sampler)
+        @test Base.invokelatest(reused, u) ≈ expected
+        isempty(u) && continue
+        ad = prepare_ad(reused, AutoEnzyme(; mode = Enzyme.Reverse), u; active = :unconstrained)
+        value, gradient = Base.invokelatest(ad_value_and_gradient, ad, u)
+        @test value ≈ expected
+        @test gradient ≈ _extent_central(x -> Base.invokelatest(reused, x), u) atol = 1e-5
+    end
+    return programs
+end
+
+_normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
+
+@testset "one program for every extent of every packed block" begin
+    @testset "one-axis arrays, the empty extent, and blocks packed after them" begin
+        programs = _extent_check(quote
+                z[1:n] .~ LogNormal.(mu, sd)
+                M[1:2, 1:3] .~ Normal.(0, 1)
+                w[1:3] .~ Normal.(0, 1)
+                y .~ Normal.(z, obs_sd)
+            end,
+            [(n = n, mu = -0.2, sd = 0.3, obs_sd = 0.7, y = [0.9 + 0.1i for i in 1:n]) for n in (2, 4)],
+            (v, d) -> sum(logpdf.(LogNormal(d.mu, d.sd), v.z)) +
+                _normals(v.M) + _normals(v.w) + sum(logpdf.(Normal.(v.z, d.obs_sd), d.y)))
+        # No packed position or extent is a literal of the program.
+        @test !occursin("unconstrained, 1:", string(first(programs)))
+        # An empty array keeps the program. Its prepared query does not: RK
+        # splits a data-bound branch of the likelihood by its lanes, and zero
+        # lanes keep the guarded branch.
+        _extent_check(quote
+                z[1:n] .~ LogNormal.(mu, sd)
+                w[1:2] .~ Normal.(0, 1)
+                y .~ Normal.(w[1], 1.0)
+            end,
+            [(n = n, mu = 0.1, sd = 0.3, y = [0.9, 1.0]) for n in (2, 0)],
+            (v, d) -> sum(logpdf.(LogNormal(d.mu, d.sd), v.z); init = 0.0) + _normals(v.w) +
+                sum(logpdf.(Normal.(v.w[1], 1.0), d.y)); same_type = false)
+    end
+    @testset "two-axis arrays with both axes data" begin
+        _extent_check(quote
+                Z[1:r, 1:k] .~ Normal.(0, 1)
+                t[1:2] .~ Normal.(0, 1)
+                y .~ Normal.(Z[ids, 1] .+ t[1], 1.0)
+            end,
+            [(r = 2, k = 8, ids = [1, 2, 1], y = [0.9, 1.0, 1.1]),
+                (r = 3, k = 24, ids = [1, 3, 2], y = [0.9, 1.0, 1.1])],
+            (v, d) -> _normals(v.Z) + _normals(v.t) +
+                sum(logpdf.(Normal.(v.Z[d.ids, 1] .+ v.t[1], 1.0), d.y)))
+        _extent_check(quote
+                Z[1:r, 1:k] .~ Exponential.(1.0)
+                y .~ Normal.(Z[ids, 1], 1.0)
+            end,
+            [(r = 2, k = 3, ids = [1, 2, 1], y = [0.9, 1.0, 1.1]),
+                (r = 4, k = 2, ids = [1, 3, 2], y = [0.9, 1.0, 1.1])],
+            (v, d) -> sum(logpdf.(Exponential(1.0), v.Z)) +
+                sum(logpdf.(Normal.(v.Z[d.ids, 1], 1.0), d.y)))
+        _extent_check(quote
+                eachrow(P[1:g, 1:3]) .~ Dirichlet(ones(3))
+                w[1:2] .~ Normal.(0, 1)
+                y .~ Normal.(P[ids, 1] .+ w[1], 1.0)
+            end,
+            [(g = 2, ids = [1, 2], y = [0.9, 1.0]), (g = 4, ids = [1, 4], y = [0.9, 1.0])],
+            (v, d) -> sum(logpdf(Dirichlet(ones(3)), Vector(r)) for r in eachrow(v.P)) +
+                _normals(v.w) + sum(logpdf.(Normal.(v.P[d.ids, 1] .+ v.w[1], 1.0), d.y)))
+        # A selection of an array's axes: the levels are the binding's. Other
+        # labels keep the program, and `_program_identity` asks for their own
+        # build (`rkppl-use` section 14).
+        plan = lower_rkppl(quote
+                b[levels(g)] .~ Normal.(0, 1)
+                y .~ Normal.(b[g], 1.0)
+            end, (g = ["a", "b", "a"], y = [0.9, 1.0, 1.1]); conditioned = (:y,))
+        level_bound = [bind_data(plan, (g = g, y = [0.9, 1.0, 1.1]))
+            for g in (["a", "b", "a"], ["a", "b", "c"])]
+        level_builds = build_kernel.(level_bound)
+        @test ==(map((b, l) -> Base.remove_linenums!(kernel_expr(b, l.layout)), level_bound, level_builds)...)
+        @test ==(map((b, l) -> typeof(prepare_query(l, b, :sampler)), level_bound, level_builds)...)
+    end
+    @testset "plate latents, the empty loop included" begin
+        loop = quote
+            @plate for i in eachindex(y)
+                a[i] ~ Normal(0, 1)
+                y[i] ~ Normal(a[i], 1.0)
+            end
+            w[1:2] .~ Normal.(0, 1)
+        end
+        _extent_check(loop, [(y = [0.9, 1.0],), (y = [0.9, 1.0, 1.1, 0.7],)],
+            (v, d) -> _normals(v.a) + _normals(v.w) + sum(logpdf.(Normal.(v.a, 1.0), d.y)))
+        _extent_check(loop, [(y = [0.9, 1.0],), (y = Float64[],)],
+            (v, d) -> _normals(v.a) + _normals(v.w) +
+                sum(logpdf.(Normal.(v.a, 1.0), d.y); init = 0.0); same_type = false)
+    end
+    @testset "scans, centered and non-centered" begin
+        _extent_check(quote
+                @scan begin
+                    s[1] ~ Normal(0, 1)
+                    for t in 2:T
+                        s[t] ~ Normal(s[t - 1], 1.0)
+                    end
+                end
+                w[1:2] .~ Normal.(0, 1)
+                y .~ Normal.(s, 1.0)
+            end,
+            [(T = 2, y = [0.9, 1.0]), (T = 4, y = [0.9, 1.0, 1.1, 0.7])],
+            (v, d) -> logpdf(Normal(), v.s[1]) +
+                sum(logpdf.(Normal.(v.s[1:(end - 1)], 1.0), v.s[2:end])) +
+                _normals(v.w) + sum(logpdf.(Normal.(v.s, 1.0), d.y)))
+        _extent_check(quote
+                @scan begin
+                    s[1] ~ Normal(0, 1)
+                    for t in 2:T
+                        e ~ Normal(0, 1)
+                        s[t] = s[t - 1] + 0.5 * e
+                    end
+                end
+                w[1:2] .~ Normal.(0, 1)
+                y .~ Normal.(s, 1.0)
+            end,
+            [(T = 2, y = [0.9, 1.0]), (T = 4, y = [0.9, 1.0, 1.1, 0.7])],
+            (v, d) -> begin
+                # The host returns the sampled seed and innovations.
+                z = v._ppl_scan_z_s
+                _normals(z) + _normals(v.w) +
+                    sum(logpdf.(Normal.(z[1] .+ 0.5 .* [0.0; cumsum(z[2:end])], 1.0), d.y))
+            end)
+    end
+    @testset "ordered thresholds and their level count" begin
+        logit_mass(c, k) = k == 1 ? log(logistic(c[1])) :
+            k == length(c) + 1 ? log1p(-logistic(c[end])) :
+            log(logistic(c[k]) - logistic(c[k - 1]))
+        ordered = quote
+            c ~ Ordered(Normal(0, 1), length(levels(k)) - 1)
+            k .~ OrderedLogistic.(0.0, Ref(c))
+        end
+        want = (v, d) -> _normals(v.c) + sum(logit_mass.(Ref(v.c), d.k))
+        _extent_check(ordered, [(k = [1, 2, 3],), (k = [1, 2, 3, 4],)], want; conditioned = (:k,))
+        # Two levels have no interior observation. RK splits the data-bound
+        # branch by the arms its lanes take, so that query's type is its own.
+        _extent_check(ordered, [(k = [1, 2, 1],), (k = [1, 2, 3],)], want;
+            conditioned = (:k,), same_type = false)
+    end
+    @testset "data-derived transform bounds are inputs, not numbers" begin
+        programs = _extent_check(quote
+                floor_ = minimum(x) / 2
+                s ~ truncated(Normal(0, 1), floor_, Inf)
+                y .~ Normal.(s, 1.0)
+            end,
+            [(x = [1.0, 2.0], y = [0.9, 1.0]), (x = [3.0, 2.5], y = [0.9, 1.0])],
+            (v, d) -> logpdf(truncated(Normal(0, 1), minimum(d.x) / 2, Inf), v.s) +
+                sum(logpdf.(Normal.(v.s, 1.0), d.y)))
+        @test !occursin("1.25", string(first(programs)))
+        # `restricted` keeps the prior's unnormalized density over the same
+        # data-derived bound.
+        programs = _extent_check(quote
+                floor_ = minimum(x) / 2
+                s ~ restricted(Normal(0, 1), floor_, Inf)
+                y .~ Normal.(s, 1.0)
+            end,
+            [(x = [1.0, 2.0], y = [0.9, 1.0]), (x = [3.0, 2.5], y = [0.9, 1.0])],
+            (v, d) -> logpdf(Normal(0, 1), v.s) + sum(logpdf.(Normal.(v.s, 1.0), d.y)))
+        @test !occursin("1.25", string(first(programs)))
+        _extent_check(quote
+                s ~ Uniform(a, b)
+                y .~ Normal.(s, 1.0)
+            end,
+            [(a = -1.0, b = 2.0, y = [0.9, 1.0]), (a = -3.0, b = 5.0, y = [0.9, 1.0])],
+            (v, d) -> logpdf(Uniform(d.a, d.b), v.s) + sum(logpdf.(Normal.(v.s, 1.0), d.y)))
+        _extent_check(quote
+                z[1:n] .~ Normal.(0, 1)
+                s[1:m] .~ Uniform.(lo, hi)
+                y .~ Normal.(s[ids], 1.0)
+            end,
+            [(n = 2, m = 2, lo = 0.0, hi = 2.0, ids = [1, 2], y = [0.9, 1.0]),
+                (n = 5, m = 3, lo = 0.5, hi = 2.5, ids = [1, 3], y = [0.9, 1.0])],
+            (v, d) -> _normals(v.z) + sum(logpdf.(Uniform(d.lo, d.hi), v.s)) +
+                sum(logpdf.(Normal.(v.s[d.ids], 1.0), d.y)))
+        # A literal bound stays literal: it is part of the authored source.
+        literal = bind_data(lower_rkppl(quote
+                s ~ truncated(Normal(0, 1), 0.25, Inf)
+                y .~ Normal.(s, 1.0)
+            end, (y = [0.9, 1.0],); conditioned = (:y,)), (y = [0.9, 1.0],))
+        @test occursin("0.25", string(kernel_expr(literal, build_kernel(literal).layout)))
+    end
+    @testset "a rebinding computes its own inputs" begin
+        plan = lower_rkppl(quote
+                z[1:n] .~ Normal.(0, 1)
+                y .~ Normal.(z[1], 1.0)
+            end, (n = 2, y = [0.9]); conditioned = (:y,))
+        bound = bind_data(plan, (n = 4, y = [0.9]))
+        rebound = bind_data(bound, (n = 2, y = [0.9]))
+        @test build_kernel(rebound).layout.total == 2
+        @test rebound.columns[ReactiveKernelsPPL._layout_position_inputs(:z)[2]] == 2
+        # A caller's value never replaces a position the binding computes.
+        spoofed = bind_data(plan, (n = 2, y = [0.9], _ppl_last_z = 7))
+        @test spoofed.columns[:_ppl_last_z] == 2
+    end
 end

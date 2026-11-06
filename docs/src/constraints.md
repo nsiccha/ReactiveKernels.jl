@@ -140,6 +140,27 @@ values alone (`:values`) (user decision
 and its comment: "maybe have different levels, which may then include either
 everything rk, or everything everything?").
 
+## Keep sizes and numeric values out of generated programs
+
+The user's November 6 direction (`ODLPlaus:precompile`, decision
+`2026-11-06T01-09-46-212-0ikeidi`, feedback 1) governs every ReactiveKernels,
+ReactiveKernelsPPL and BayesianRegressionModels model: "THIS HOLDS FOR ALL RK /
+BRM MODELS! BAKING IN SIZE OR EVEN FLOAT CONSTANTS INTO THE MODEL IS COMPLETELY
+IDIOTIC AND NEEDS TO BE AVOIDED AT BASICALLY ALL COST!" It followed the same
+user's request about a dataset-sized literal extent, "Can we please make sure
+this never happens again....". **Keep sizes and numeric values, including
+floating-point prior and configuration values, as runtime model inputs; do not
+splice them into model source or its specialization.**
+
+RKPPL binding supplies packed positions, axis lengths, scan lengths, ordered
+level counts and data-derived transform bounds as internal inputs, so one
+generated program serves every extent and value of one declaration
+(`test_bound_array_extents.jl`). Known remaining paths, which are limitations
+to fix and not precedents, are listed under ReactiveKernelsPPL 0.1.104 in its
+changelog. A prepared type may still depend on which data-bound branch arms
+have lanes ("Data-bound branches in plate cells"), which the lazy-branch
+constraint above requires.
+
 ## Derivative rules come from one mathematical graph, never by hand
 
 **Do not write backend-specific derivative rules as durable code, and never
