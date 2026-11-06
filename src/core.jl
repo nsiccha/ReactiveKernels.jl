@@ -511,11 +511,14 @@ end
 # Read-only graph gathers may share their parent's storage, including in queries.
 # Keep a packed vector's contiguous slice as the parent: Base.view would eagerly
 # materialize range[indices] to flatten this pair of views. As with other borrowed
-# graph values, neither the parent nor the indices are writable cache storage.
+# graph values, neither the parent nor the indices are writable cache storage, so
+# a `Vector` parent skips the alias check Base.view runs on each call too: a plate
+# cell gathers once per outer cell, and on Julia 1.12 and later that check cost a
+# nested gather's reverse pass more than a third of the whole gradient.
 @inline _readonly_gather(array::AbstractVector, indices::AbstractVector{<:Integer}) =
     view(array, indices)
 @inline function _readonly_gather(
-        array::SubArray{Float64,1,Vector{Float64},Tuple{UnitRange{Int}},true},
+        array::Union{Vector,SubArray{Float64,1,Vector{Float64},Tuple{UnitRange{Int}},true}},
         indices::Vector{Int})
     checkbounds(array, indices)
     return Base.SubArray(array, (indices,))
