@@ -502,7 +502,8 @@ end
         scalar_args = _ad_na_scalar_args(args_tuple, hoisted, index)
         result[index] = kernel(scalar_args...)
     end
-    slot[] = result
+    # The slot is read-only here (`_ad_na_cache_driver`): a fresh result for
+    # another shape is returned, not kept.
     return result
 end
 
@@ -548,12 +549,10 @@ end
         @inbounds for index in eachindex(instantiated)
             cache[index] = f(_ad_na_scalar_args(args_tuple, hoisted, index)...)
         end
-        slot[] = cache
         return cache
     end
-    result = Base.Broadcast.materialize(bc)
-    slot[] = result
-    return result
+    # Read-only slot (`_ad_na_cache_driver`): another shape's result is not kept.
+    return Base.Broadcast.materialize(bc)
 end
 
 # AD-only plain-`+`/`-` array application into an owned cache slot. The
@@ -583,12 +582,10 @@ end
         @inbounds for index in eachindex(instantiated)
             cache[index] = f(_ad_na_scalar_args(args_tuple, hoisted, index)...)
         end
-        slot[] = cache
         return cache
     end
-    result = f(args...)
-    slot[] = result
-    return result
+    # Read-only slot (`_ad_na_cache_driver`): another shape's result is not kept.
+    return f(args...)
 end
 
 @inline _ad_na_arith_matches(cache::Array{T,N}, args) where {T,N} =
@@ -759,6 +756,20 @@ function _ad_na_concretize_cache(slot::Base.RefValue, step::Int, ::_NonallocLane
     Base.RefValue{typeof(seeded)}(copy(seeded))
 end
 
+# The cache driver of the differentiated program. Its slots are the owned
+# copies above, seeded by the exemplar call, and there they are read-only, as
+# lane slots are (`_lane_acquire`): a step fills its slot's buffer in place
+# when the result has that buffer's axes and element type, and returns any
+# other result without keeping it. The primal driver (`cache_apply`) stores
+# each result back into its slot, which is how a slot is seeded; in the
+# differentiated program that store writes the same buffer back on every
+# call, and reverse mode pays for it: an Enzyme-only matrix-vector product
+# into a `Ref`-held buffer differentiated 1.5x slower with the store-back than
+# without it, and diamonds' (5000 x 24 design) non-allocating gradient ran
+# 1.3x the ordinary one. The MutatingFunctions extension supplies the
+# read-only twin of its driver.
+_ad_na_cache_driver(cache_apply) = cache_apply
+
 # Name each externalized position after the variable its program reads it
 # into (`X = __constants__[1]`: a bound port or a folded step's result),
 # falling back to the position for a read that is not a whole statement.
@@ -832,6 +843,7 @@ end
 function _ad_kernel_call(kernel::NonAllocatingKernel, args::Tuple,
                          ::Val{I}) where {I}
     f, ad_caches, ad_constants, ad_callables, stmts = _ad_na_program(kernel, I, args)
+    driver = _ad_na_cache_driver(kernel.cache_apply)
     # A cacheless step program still carries the positional cache-table ABI,
     # but asking the backend to shadow `Tuple{Nothing,...}` marks a ghost-only
     # type differentiable. Keep that inert table Constant; any retained slot
@@ -849,15 +861,15 @@ function _ad_kernel_call(kernel::NonAllocatingKernel, args::Tuple,
         externalize_scalars = true)
     if externalized === nothing
         return _ADNonAllocatingKernelCall{I,false,typeof(f),typeof(ad_constants),
-                                          typeof(ad_callables),typeof(kernel.cache_apply)}(
-            f, ad_constants, ad_callables, kernel.cache_apply), (cache_context,)
+                                          typeof(ad_callables),typeof(driver)}(
+            f, ad_constants, ad_callables, driver), (cache_context,)
     end
     packed, pack = _pack_named_hidden_operands(
         externalized, values,
         _ad_na_slot_names(stmts, _externalized_slots(externalized)), ad_constants)
     _ADNonAllocatingKernelCall{I,true,typeof(packed),Nothing,Nothing,
-                               typeof(kernel.cache_apply)}(
-        packed, nothing, nothing, kernel.cache_apply), (pack..., cache_context)
+                               typeof(driver)}(
+        packed, nothing, nothing, driver), (pack..., cache_context)
 end
 
 @generated function (call::_ADKernelCall{I})(

@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.89
+## 0.1.91
 
 - `partition_plan_kernel(kernel)` and `partition_plan(kernel, …)` lower a
   label's plan from the argument types `kernel` was prepared with (its
@@ -28,6 +28,35 @@ are recorded in the git history only.
   `prepare_partition_sampler` with `partitioned` (a shared prefix) failed this
   way on a joint vector observation cell, such as `y[i] ~ MvNormal(…)` in an
   `@plate for` loop. Kernels prepared without exemplars are unchanged.
+
+## 0.1.90
+
+- A partition sum that shares a computed value with the other sums of its
+  partition (so they lower with one cell emitter) and has no cell with the
+  label now computes and reads none of its own work: whole values only it
+  reads, the rows of values only it reads, and its plate run under its
+  nonempty-row guard, and the sum is zero otherwise, as for a partition sum
+  lowered alone. Before, an empty sum in such a group still evaluated that
+  work, so the label's footprint held coordinates only the sum's other labels
+  read (`partition_separability` then refused them, for example RKPPL
+  `prepare_partition` over several observations with one observation absent
+  from a unit), and invalid values there (a negative `log` argument) failed the
+  label. Values the sums share are still computed once, at the union of their
+  rows, and row bookkeeping that reads only the label and bound data stays in a
+  partition's plan. A partition sum with a separability rule also guards
+  whole work that reads only scalars of the ruled port (`u[7]`).
+
+## 0.1.89
+
+- Composed cell broadcasts read direct row-slice operands in place, including
+  rows of producer windows, without changing ordinary slice ownership or
+  dispatch. Planned partitions retain only the selected rows of bound dense
+  operands, preserving their view types and axes, so ordinary reverse calls
+  do not allocate shadows of an unselected parent panel. Lazy cell-view
+  construction stays visible to its readers across planned array operations.
+  Contiguous window gathers check the window span once before their row loop.
+  Shared-prefix splitting keeps parameter views in the residual when their
+  readers need only selected rows, avoiding whole-block derivative frontiers.
 
 ## 0.1.88
 

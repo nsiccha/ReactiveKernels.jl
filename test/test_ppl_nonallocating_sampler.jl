@@ -64,24 +64,12 @@ _na_sampler_cases() = (
 
 _na_density_bytes(q, u) = (q(u); q(u); @allocated q(u))
 
-# Julia 1.10 under `--check-bounds=yes` (this runner's flag): Enzyme's static
-# activity analysis rejects the non-allocating reverse gradient of the scan
-# recurrence. Default bounds checking and Julia 1.13 differentiate it. Tracked
-# by ReactiveKernels todo 2026-10-16T02-45-16-840-00lejdv.
-_na_scan_gradient_gap(label) = label == "scan recurrence" &&
-    VERSION < v"1.11" && Base.JLOptions().check_bounds == 1
-
 @testset "non-allocating sampler equals the ordinary sampler" begin
     for (label, plan) in _na_sampler_cases()
         @testset "$label" begin
             built = build_kernel(plan)
             n = built.layout.total
             us = [[0.1 * sin(k + s) for k in 1:n] for s in 0:2]
-            if _na_scan_gradient_gap(label)
-                @test_broken (prepare_sampler(built, plan, us[1]; backend = NA_SAMPLER_BACKEND,
-                    warm = true, nonallocating = true); true)
-                continue
-            end
             q = prepare_sampler(built, plan, us[1]; backend = NA_SAMPLER_BACKEND, warm = true)
             qna = prepare_sampler(built, plan, us[1]; backend = NA_SAMPLER_BACKEND,
                 warm = true, nonallocating = true)

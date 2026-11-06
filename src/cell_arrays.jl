@@ -82,6 +82,8 @@ end
 # over ordinary floating storage. Every other runtime type keeps materialization.
 _cell_array_operand(x) = false
 _cell_array_operand(x::Union{Float32,Float64,Array{Float32},Array{Float64},_CellArray}) = true
+_cell_array_operand(x::SubArray{<:Union{Float32,Float64},<:Any,<:Array}) =
+    all(i -> i isa Union{Int,Base.Slice{Base.OneTo{Int}},UnitRange{Int},Vector{Int}}, x.indices)
 _cell_array_operand(x::Union{Int,Int32,Bool}) = true
 _cell_array_operand(x::Base.Broadcast.Broadcasted) =
     _cell_total_function(x.f) && all(_cell_array_operand, x.args)

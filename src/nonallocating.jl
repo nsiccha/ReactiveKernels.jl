@@ -116,13 +116,15 @@ end
 # so the plain call does no more work.
 #
 # The decomposition's own step operations carry destination-passing methods in
-# the extension. `_LaneGather` is the exception to their fresh ordinary result:
-# it returns a view, so its non-allocating slot is seeded with an owned vector
-# by `_nonalloc_slot` below.
+# the extension. A partitioned plate's lane gather (`_LaneGather`) is not one:
+# it returns a view of its argument, which allocates nothing, so it is a plain
+# call, as in the ordinary program. Copying it into an owned vector instead
+# cost a gather per call and a scatter in the reverse pass, and left the seeds
+# models' non-allocating gradients 3-5 % slower than the ordinary ones.
 _nonalloc_fresh_step(op) = false
 _nonalloc_fresh_step(::Union{_MaterializeStep,_GatherStep,_MatMulStep,
                              _ConcatenateStep,_FillConstructorStep,
-                             _RowReduceStep,_LaneGather}) = true
+                             _RowReduceStep}) = true
 
 # Whether a step with operation `op`, inferred result type `T` and argument
 # types `argtypes` keeps a cache slot. The extension adds the method for its
@@ -153,18 +155,7 @@ function _static_type(f, argtypes...)
 end
 
 _nonalloc_slot(::Type{T}) where {T} = Ref{Union{Nothing,T}}(nothing)
-
-# `_LaneGather` returns a view for ordinary execution. Its non-allocating
-# destination must instead own storage: caching that view would make the next
-# call write through it into the caller's input. Keep a concrete vector slot
-# for the extension's elementwise gather, even though the ordinary result type
-# is a SubArray.
 _nonalloc_slot(op, ::Type{T}) where {T} = _nonalloc_slot(T)
-function _nonalloc_slot(::_LaneGather, ::Type{T}) where {T<:AbstractVector}
-    E = eltype(T)
-    isconcretetype(E) ? Ref(Vector{E}()) : nothing
-end
-_nonalloc_slot(::_LaneGather, ::Type) = nothing
 
 # Identity-preserving wrappers that are cheaper to rebuild inline than to
 # cache: caching them buys no buffer reuse and may force conversion copies.

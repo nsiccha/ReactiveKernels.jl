@@ -4473,8 +4473,15 @@ end
 # (snag `partition-over-s-c28c8326`). One member lowers exactly as one cell.
 Base.@nospecializeinfer function _lower_authored_plate_cells!(
         body, runtime_ops, runtime_recipes, members; windows = nothing)
-    states = Any[_cell_lowering_setup!(body, recipe, callargs, lhs, windows)
-                 for (recipe, callargs, lhs) in members]
+    # In a group with guarded members (`_CellRegions`), a guarded member's
+    # bookkeeping follows what it reads and its plate runs under its guard.
+    ids = Int[recipe.id for (recipe, _, _) in members]
+    states = Any[]
+    for (recipe, callargs, lhs) in members
+        push!(states, _cell_forced(windows, _cell_member_force(windows, recipe.id, false)) do
+            _cell_lowering_setup!(body, recipe, callargs, lhs, windows)
+        end)
+    end
     # A shared array read only at the cell's own rows whose producer computes
     # it row by row is computed at those rows (`_CellEmitter`, cell_windows.jl).
     # Every pushed value is computed once, at all the rows the cells' lanes and
@@ -4490,51 +4497,139 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
             _cell_capture_request!(emitter, value, s.slices[batched],
                 via == 0 ? nothing : s.slices[via]; rows = partition)
         end
-        for s in states
-            foreach(c -> waits(s, c) || request!(windows, s, c), s.captures)
+        member(f, id) = _cell_forced(f, windows, _cell_member_force(windows, id, false))
+        for (id, s) in zip(ids, states)
+            member(id) do
+                foreach(c -> waits(s, c) || request!(windows, s, c), s.captures)
+            end
         end
         _cell_emit_windows!(windows)
-        for s in states
-            for (position, lane_row) in s.lane_rows
-                taken = _cell_take!(windows, s.pushed_lanes[position], lane_row)
-                s.slices[position] = partition ? taken :
-                    Expr(:call, GlobalRef(@__MODULE__, :_cell_batched_slice), taken, s.cell)
+        for (id, s) in zip(ids, states)
+            member(id) do
+                for (position, lane_row) in s.lane_rows
+                    taken = _cell_take!(windows, s.pushed_lanes[position], lane_row)
+                    s.slices[position] = partition ? taken :
+                        Expr(:call, GlobalRef(@__MODULE__, :_cell_batched_slice), taken, s.cell)
+                end
             end
         end
         later = _CellEmitter(body, d, windows.names, windows.runtime_ops,
-            windows.runtime_recipes; sorted = partition)
-        for s in states
-            foreach(c -> waits(s, c) && request!(later, s, c), s.captures)
+            windows.runtime_recipes; sorted = partition, regions = windows.regions)
+        for (id, s) in zip(ids, states)
+            member(id) do
+                foreach(c -> waits(s, c) && request!(later, s, c), s.captures)
+            end
         end
         any(s -> any(c -> waits(s, c), s.captures), states) && _cell_emit_windows!(later)
-        for s in states, c in s.captures
-            position, value = c[1], c[2]
-            s.slices[position] = _cell_capture!(waits(s, c) ? later : windows, value)
+        for (id, s) in zip(ids, states)
+            member(id) do
+                for c in s.captures
+                    position, value = c[1], c[2]
+                    s.slices[position] = _cell_capture!(waits(s, c) ? later : windows, value)
+                end
+            end
         end
     end
-    for s in states
-        for (cid, batched, via) in s.footprint_captures
-            _footprint_record_capture!(windows.pushdowns, cid,
-                _cell_capture_element(s.slices[batched], via == 0 ? nothing : s.slices[via];
-                    rows = s.partition))
+    for (id, s) in zip(ids, states)
+        _cell_forced(windows, _cell_member_force(windows, id, true)) do
+            _lower_authored_plate_cell_state!(body, runtime_ops, runtime_recipes, s, windows)
         end
-        for (position, program) in s.footprint_programs
-            reads = _footprint_plate_reads!(body, runtime_ops, runtime_recipes,
-                program, s.atomic, s.slices, s.plate_values)
-            _footprint_record!(canon_id(windows.pushdowns.graph, s.plate_values[position].id),
-                               :gathered, reads)
-        end
-        if s.partition
-            _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
-                s.plate, s.slices, s.plate_values, nothing, s.lhs)
-            continue
-        end
-        pointwise = gensym(:cell_pointwise)
-        _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
-            s.plate, s.slices, s.plate_values, pointwise, nothing)
-        push!(body.args, Expr(:(=), s.lhs, Expr(:call, GlobalRef(Base, :only), pointwise)))
     end
     body
+end
+
+# One cell's footprint reads and plate, once its slices are taken.
+function _lower_authored_plate_cell_state!(body, runtime_ops, runtime_recipes, s, windows)
+    for (cid, batched, via) in s.footprint_captures
+        _footprint_record_capture!(windows.pushdowns, cid,
+            _cell_capture_element(s.slices[batched], via == 0 ? nothing : s.slices[via];
+                rows = s.partition))
+    end
+    for (position, program) in s.footprint_programs
+        reads = _footprint_plate_reads!(body, runtime_ops, runtime_recipes,
+            program, s.atomic, s.slices, s.plate_values)
+        _footprint_record!(canon_id(windows.pushdowns.graph, s.plate_values[position].id),
+                           :gathered, reads)
+    end
+    if s.partition
+        _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
+            s.plate, s.slices, s.plate_values, nothing, s.lhs)
+        return
+    end
+    pointwise = gensym(:cell_pointwise)
+    _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
+        s.plate, s.slices, s.plate_values, pointwise, nothing)
+    push!(body.args, Expr(:(=), s.lhs, Expr(:call, GlobalRef(Base, :only), pointwise)))
+    nothing
+end
+
+# What a group member's statements are forced to (`_cell_force!`): a guarded
+# member's plate (`plate`) to its guard, its other statements to what they read;
+# everything of an unguarded member, or outside such a group, unguarded.
+function _cell_member_force(windows, id::Int, plate::Bool)
+    windows === nothing && return _CELL_UNGUARDED
+    t = windows.regions
+    t === nothing && return _CELL_UNGUARDED
+    haskey(t.guards, id) || return _CELL_UNGUARDED
+    plate ? id : _CELL_BY_READS
+end
+_cell_forced(f, ::Nothing, ::Int) = f()
+
+# A group of cells lowered with one emitter (`_cell_lowering_groups`) whose
+# members include partition sums with an exclusive region
+# (`_cell_partition_regions`): each such member's region (`region_bodies`), the
+# work only it reads and its plate run under its nonempty-row guard, and its sum
+# is zero otherwise, so an empty member neither computes nor reads its work
+# (snag `absent-odl-vecto-d98e48bf`). Values the members share are still
+# computed once, at the union of their rows. Statements reading only labels and
+# bound data stay unguarded, where a partition's plan computes them per label.
+# When the statements cannot be so placed (`_cell_guard_group`), the group
+# lowers as before, its regions computed whole.
+function _lower_guarded_cell_group!(outer_body::Expr, runtime_ops, runtime_recipes,
+        members, guarded::Vector{Int}, p::Plan, cells, names, regions::Dict{Int,Int},
+        region_bodies, region_guards; sorted::Bool, constant::Set{Symbol})
+    g = p.graph
+    owner = Dict{ValueId,Int}()
+    for r in p.recipes
+        member = get(regions, r.id, 0)
+        member in guarded && !(r.op isa _AuthoredPlateCellOp) || continue
+        foreach(v -> owner[canon_id(g, v.id)] = member, r.outputs)
+    end
+    symbols = Dict{Symbol,Int}()
+    for member in guarded, name in _assigned_names!(Set{Symbol}(), region_bodies[member])
+        symbols[name] = member
+    end
+    state = _CellRegions(owner, Dict{Int,Any}(m => region_guards[m] for m in guarded), symbols)
+    recording = get(task_local_storage(), _FOOTPRINT, nothing)
+    snapshot = recording === nothing ? nothing :
+        Dict(cid => length(entries) for (cid, entries) in recording.records)
+    recording === nothing || (recording.guard = nothing)
+    body = Expr(:block)
+    windows = _CellEmitter(body, cells, names, runtime_ops, runtime_recipes; sorted,
+                           constant, regions = state)
+    _lower_authored_plate_cells!(body, runtime_ops, runtime_recipes, members; windows)
+    _cell_force!(windows, _CELL_UNGUARDED)
+    defaults = Dict{Int,Any}()
+    for (r, _, lhs) in members
+        r.id in guarded || continue
+        T = _cell_partition_sum_type(p, cells, r)
+        defaults[r.id] = Expr(:(=), lhs, Expr(:call, GlobalRef(Base, :zero), T))
+    end
+    placed = _cell_guard_group(body.args, state,
+        Dict{Int,Vector{Any}}(m => region_bodies[m].args for m in guarded), defaults, guarded)
+    if placed === nothing
+        foreach(m -> append!(outer_body.args, region_bodies[m].args), guarded)
+        append!(outer_body.args, body.args)
+        filter!(pair -> !(last(pair) in guarded), regions)
+        recording === nothing ||
+            _footprint_unguard_reads!(recording, snapshot, collect(values(state.guards)))
+    else
+        statements, owned = placed
+        append!(outer_body.args, statements)
+        recording === nothing ||
+            _footprint_guard_reads!(recording, snapshot, owned, state.guards)
+    end
+    nothing
 end
 
 # The cells of plan `p` that lower with one emitter
@@ -4691,7 +4786,9 @@ Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recip
     # element has no positions until that lane is taken: like its value read,
     # it is recorded after the windows (`_lower_authored_plate_cells!`).
     footprint_captures = Tuple{ValueId,Int,Int}[]
-    if _footprint_recording() && windows !== nothing
+    # The plate reads these, so a guarded member records them under its guard.
+    _footprint_recording() && windows !== nothing &&
+            _cell_forced(windows, _cell_member_force(windows, recipe.id, true)) do
         d = windows.pushdowns
         _footprint_record!(canon_id(d.graph, first(recipe.inputs).id), :whole, nothing)
         positions = get(d.captures, recipe.id, Dict{Int,Vector{Tuple{Int,Int}}}())
@@ -5198,6 +5295,16 @@ function _lower_with_ops_collecting(p::Plan;
                 length(cell_pending[group]) < length(group) && continue
             end
             members = group === nothing ? Any[(r, callargs, lhs)] : cell_pending[group]
+            guarded = group === nothing || cells === nothing ? Int[] :
+                Int[m.id for (m, _, _) in members if get(regions, m.id, 0) == m.id]
+            if !isempty(guarded)
+                _lower_guarded_cell_group!(outer_body, runtime_ops, runtime_recipes,
+                    members, guarded, p, cells, names, regions, region_bodies,
+                    region_guards; sorted = r.op.rows,
+                    constant = Set{Symbol}(names[canon_id(g, v.id)]
+                        for v in p.have if v.name in r.op.plan_constant))
+                continue
+            end
             _lower_authored_plate_cells!(body, runtime_ops, runtime_recipes, members;
                 windows = cells === nothing ? nothing :
                     _CellEmitter(body, cells, names, runtime_ops, runtime_recipes;
