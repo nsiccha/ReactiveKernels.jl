@@ -368,6 +368,132 @@ end
         @test nested(yy, mm, gg) ≈ 2ref
     end
 
+    @testset "an arm's work over bound values runs at preparation" begin
+        y = [0.5, -1.0, 2.0, 0.25, 1.5]
+        m = 0.75
+        ref(y, m, s) = sum(nlogpdf(yi, m, s) for yi in y)
+        reverse_gradient(k, m) = begin
+            ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), m; active = :m)
+            RK.ad_value_and_gradient(ad, m)
+        end
+
+        # A valid bound number selects the arm: one plate and no branch, and
+        # `log(s)` runs once per binding and never in a call, for a declared
+        # and for an undeclared scale port alike.
+        for spec in (C.guarded_scale, C.guarded_scale_undeclared)
+            have = (:y, :m, :s)
+            C.arm_calls[] = 0
+            k = prepare(spec; have, want = :total, bound = (; y, s = 1.5))
+            @test C.arm_calls[] == 1
+            @test length(plates(k.plan)) == 1
+            @test !has_branch(plate_body(only(plates(k.plan))))
+            C.arm_calls[] = 0
+            @test k(m) ≈ ref(y, m, 1.5)
+            @test k(m + 1.0) ≈ ref(y, m + 1.0, 1.5)
+            @test C.arm_calls[] == 0
+            value, gradient = reverse_gradient(k, m)
+            @test value ≈ ref(y, m, 1.5)
+            @test gradient ≈ sum((yi - m) / 1.5^2 for yi in y)
+            @test C.arm_calls[] == 0
+        end
+
+        # The value is read at run time: a second value is its own binding of
+        # the same program, and it does not change the first.
+        k1 = prepare(C.guarded_scale; have = (:y, :m, :s), want = :total,
+                     bound = (; y, s = 1.5))
+        k2 = prepare(C.guarded_scale; have = (:y, :m, :s), want = :total,
+                     bound = (; y, s = 0.5))
+        @test k1(m) ≈ ref(y, m, 1.5)
+        @test k2(m) ≈ ref(y, m, 0.5)
+        @test k1(m) ≈ ref(y, m, 1.5)
+
+        # An invalid bound scale takes the fallback arm on every lane without
+        # evaluating the other arm: `log` of a nonpositive number would throw.
+        for s in (-1.0, 0.0, NaN)
+            C.arm_calls[] = 0
+            k = prepare(C.guarded_scale; have = (:y, :m, :s), want = :total,
+                        bound = (; y, s))
+            @test k(m) == -Inf
+            @test C.arm_calls[] == 0
+            value, gradient = reverse_gradient(k, m)
+            @test value == -Inf
+            @test gradient == 0.0
+            @test C.arm_calls[] == 0
+        end
+
+        # A scale per lane: a valid lane's `log` is cached, and an invalid
+        # lane's is never evaluated.
+        scales = [1.5, -1.0, 2.0, 0.0, 0.5]
+        valid = findall(>(0), scales)
+        C.arm_calls[] = 0
+        k = prepare(C.guarded_lane_scale; have = (:y, :m, :s), want = :total,
+                    bound = (; y, s = scales))
+        @test C.arm_calls[] == length(valid)
+        C.arm_calls[] = 0
+        @test k(m) == -Inf
+        @test C.arm_calls[] == 0
+        allvalid = abs.(scales) .+ 0.25
+        C.arm_calls[] = 0
+        k = prepare(C.guarded_lane_scale; have = (:y, :m, :s), want = :total,
+                    bound = (; y, s = allvalid))
+        @test C.arm_calls[] == length(y)
+        C.arm_calls[] = 0
+        @test k(m) ≈ sum(nlogpdf(yi, m, si) for (yi, si) in zip(y, allvalid))
+        value, gradient = reverse_gradient(k, m)
+        @test value ≈ k(m)
+        @test gradient ≈ sum((yi - m) / si^2 for (yi, si) in zip(y, allvalid))
+        @test C.arm_calls[] == 0
+
+        # Beside a per-lane guard, the shared `log` belongs to the taken arm.
+        g = [0, 1, 0, 1, 0]
+        expected = sum(nlogpdf(yi, m, 1.5) for (yi, gi) in zip(y, g) if gi == 0)
+        C.arm_calls[] = 0
+        k = prepare(C.missing_guard_scale; have = (:y, :m, :s, :g), want = :total,
+                    bound = (; y, s = 1.5, g))
+        @test C.arm_calls[] == 1
+        @test length(plates(k.plan)) == 2
+        C.arm_calls[] = 0
+        @test k(m) ≈ expected
+        @test C.arm_calls[] == 0
+        # No lane takes the arm, so even an invalid scale is never read.
+        C.arm_calls[] = 0
+        k = prepare(C.missing_guard_scale; have = (:y, :m, :s, :g), want = :total,
+                    bound = (; y, s = -1.0, g = ones(Int, length(y))))
+        @test k(m) == 0.0
+        @test C.arm_calls[] == 0
+
+        # The cell's shape follows the program, not the number of lanes.
+        sizes = map((5, 500)) do n
+            ys = collect(range(-1.0, 1.0; length = n))
+            k = prepare(C.guarded_scale; have = (:y, :m, :s), want = :total,
+                        bound = (; y = ys, s = 1.5))
+            @test k(m) ≈ ref(ys, m, 1.5)
+            (length(recipe_inventory(k)),
+             length(plate_body(only(plates(k.plan))).recipes))
+        end
+        @test sizes[1] == sizes[2]
+
+        # Over a literal, the package call runs at preparation like a bound
+        # value's, while Base's `log` stays folded in the arm's closure.
+        C.arm_calls[] = 0
+        k = prepare(C.guarded_written_scale; have = (:y, :m, :g), want = :total,
+                    bound = (; y, g))
+        @test C.arm_calls[] == 1
+        C.arm_calls[] = 0
+        @test k(m) ≈ expected
+        @test C.arm_calls[] == 0
+        folded = prepare(C.guarded_endpoint; have = (:y_full, :lp, :mis_pos),
+                         want = :total, bound = (; y_full, mis_pos))
+        @test length(plate_body(first(plates(folded.plan))).recipes) == 1
+
+        # A live scale keeps the shared-condition lowering: once per call.
+        C.arm_calls[] = 0
+        live = prepare(C.guarded_scale; have = (:y, :m, :s), want = :total,
+                       bound = (; y))
+        @test live(m, 1.5) ≈ ref(y, m, 1.5)
+        @test C.arm_calls[] == 1
+    end
+
     @testset "else arm, named and computed bindings, && guard" begin
         ref_else = sum(mp == 0 ? 0.0 : nlogpdf(yf, lpi, 1.5)
                        for (yf, lpi, mp) in zip(y_full, lp, mis_pos))
