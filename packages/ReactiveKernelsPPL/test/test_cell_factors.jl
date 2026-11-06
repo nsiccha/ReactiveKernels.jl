@@ -698,3 +698,117 @@ end
         end
     end
 end
+
+# A destructuring outside a plate is one recipe with several outputs. Factoring
+# splits it at its index and sum boundaries like any other recipe, so an index
+# read or a sum in its right-hand side prepares and factors as it does in a
+# statement of its own (snag `prepare-cell-fac-469bcafb`).
+_cf_basis(t, k, p) = (hcat(sin.(t ./ p), cos.(t ./ p)) .* k, Float64[1.0, 2.0], 0.1)
+_cf_decay(w, rho) = exp.(-w .* rho)
+@rkppl _cf_effect(P, w, floor) = begin
+    rho ~ restricted(LogNormal(0.0, 1.0), floor, Inf)
+    z[axes(P, 2)] .~ Normal.(0, 1)
+    return P * (_cf_decay(w, rho) .* z)
+end
+const _CF_BASIS_INLINE = @rkppl begin
+    (P, w, floor) = _cf_basis(t, modes[1], settings[1])
+    f ~ _cf_effect(P, w, floor)
+    @plate for i in eachindex(y)
+        y[i] ~ Normal(f[i], 1)
+    end
+end
+const _CF_BASIS_HOISTED = @rkppl begin
+    k = modes[1]
+    p = settings[1]
+    (P, w, floor) = _cf_basis(t, k, p)
+    f ~ _cf_effect(P, w, floor)
+    @plate for i in eachindex(y)
+        y[i] ~ Normal(f[i], 1)
+    end
+end
+_cf_location_scale(s, a) = (s + a, exp(a))
+const _CF_TUPLE_SUM_INLINE = @rkppl begin
+    a ~ Normal(0, 1)
+    z[levels(g)] .~ Normal.(0, 1)
+    (m, sd) = _cf_location_scale(sum(exp.(z[g[rows]])), a)
+    @plate for i in eachindex(y)
+        y[i] ~ Normal(m, sd)
+    end
+end
+const _CF_TUPLE_SUM_HOISTED = @rkppl begin
+    a ~ Normal(0, 1)
+    z[levels(g)] .~ Normal.(0, 1)
+    total = sum(exp.(z[g[rows]]))
+    (m, sd) = _cf_location_scale(total, a)
+    @plate for i in eachindex(y)
+        y[i] ~ Normal(m, sd)
+    end
+end
+
+@testset "a destructuring's right-hand side factors as its own statements do" begin
+    data = (; t = collect(1.0:6.0), modes = [2], settings = [24.0])
+    y = [0.1, 0.2, -0.1, 0.4, 0.0, 0.3]
+    function basis(model)
+        bound = model(; data...) | (; y)
+        built = build_kernel(bound)
+        # Strict factors prepare under strict type stability, data prefix included.
+        ReactiveKernels._with_type_stability(:error, :all) do
+            @test prepare_cell_factors(built, bound, :y; locality = :error) isa CellFactors
+        end
+        # The location reads `f` whole, so its outer query needs the lenient policy.
+        f = prepare_cell_factors(built, bound, :y; locality = :ignore)
+        u = collect(range(-0.2, 0.3; length = built.layout.total))
+        outer = prepare_cell_factor_query(f, :outer)
+        (; count = length(cell_reductions(f)),
+           whole = prepare_query(built, bound, :pointwise)(u).y,
+           values = [outer(u, Float64[], c) for c in eachindex(y)],
+           support = _cf_support(partition_footprint_kernel(outer.kernel), u, Float64[], 1))
+    end
+    inline, hoisted = basis(_CF_BASIS_INLINE), basis(_CF_BASIS_HOISTED)
+    @test inline.count == hoisted.count == 0
+    @test inline.values ≈ inline.whole
+    @test inline.values ≈ hoisted.values
+    @test inline.support == hoisted.support
+
+    sum_data = (; g = [1, 2, 3, 4, 5, 6], rows = [2, 5])
+    sum_y = [0.1, 0.2, -0.1]
+    function summed(model)
+        bound = model(; sum_data...) | (; y = sum_y)
+        built = build_kernel(bound)
+        f = prepare_cell_factors(built, bound, :y; locality = :error)
+        u = collect(range(-0.2, 0.3; length = built.layout.total))
+        names = string.(coordinate_names(built.layout))
+        term, outer = prepare_cell_factor_query(f, 1), prepare_cell_factor_query(f, :outer)
+        rows = reduction_rows(f, 1, 1)
+        total = sum(term(u, 1, t) for t in eachindex(rows))
+        term_indices = _cf_support(partition_footprint_kernel(term.kernel), u, 1, 1)
+        outer_indices = _cf_support(partition_footprint_kernel(outer.kernel), u, [total], 1)
+        (; f, u, rows, total, term_indices, outer_indices,
+           count = length(cell_reductions(f)),
+           term_names = names[term_indices], outer_names = names[outer_indices],
+           values = [outer(u, [total], c) for c in eachindex(sum_y)],
+           whole = prepare_query(built, bound, :pointwise)(u).y)
+    end
+    a, b = summed(_CF_TUPLE_SUM_INLINE), summed(_CF_TUPLE_SUM_HOISTED)
+    @test a.count == b.count == 1
+    @test collect(a.rows) == collect(b.rows) == [2, 5]
+    @test a.term_names == b.term_names == ["z.2"]
+    # The outer reads the sum, not the two `z` it adds.
+    @test a.outer_names == b.outer_names == ["a"]
+    @test a.total ≈ b.total
+    @test a.values ≈ a.whole
+    @test a.values ≈ b.values
+
+    _cf_static() do
+        derivative(c) = (
+            last(ad_value_and_gradient(prepare_cell_factor_ad(prepare_ad, c.f, :outer, c.u,
+                    c.outer_indices, _CF_REVERSE),
+                c.u, [c.total], c.u[c.outer_indices], c.outer_indices, 1)),
+            last(ad_value_and_gradient(prepare_cell_factor_ad(prepare_ad, c.f, 1, c.u,
+                    c.term_indices, _CF_REVERSE),
+                c.u, c.u[c.term_indices], c.term_indices, 1, 1)))
+        (outer_a, term_a), (outer_b, term_b) = derivative(a), derivative(b)
+        @test all(outer_a .≈ outer_b)
+        @test term_a ≈ term_b
+    end
+end

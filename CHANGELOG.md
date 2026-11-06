@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.96
+
+- A destructuring outside a plate whose right-hand side holds a data-only part or
+  an index or sum boundary, such as `(s, q) = f(exp.(x), a)` under `bound = (; x)`
+  or `(P, w) = f(t, modes[1])` in a model passed to `prepare_cell_factors`, no
+  longer fails with `ArgumentError: Tuple contains 2 elements, must contain
+  exactly 1 element`. It splits as a statement with one name does: the data-only
+  part runs once per binding, a sum over gathered rows becomes a cell reduction,
+  and the call still runs once per evaluation and binds every name.
+
 ## 0.1.95
 
 - A bound number's value no longer changes a prepared derivative's type.
