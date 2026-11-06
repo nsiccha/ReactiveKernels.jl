@@ -254,6 +254,7 @@ or [`prepare_query_ad`](@ref). Catalogue and query preparation may inspect the
 whole model; repeated selected evaluation uses precomputed row plans.
 """
 function density_factors(built, plan::StructuralPlan)
+    built = _binding_build(built, plan)
     _check_built_program(built, plan)
     sites = _DensitySite[]
     def = Base.invokelatest(_kernel_expr_latest, plan, built.layout; density_sites = sites)
@@ -542,6 +543,7 @@ end
 function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
         selection::FactorSelection, backend, exemplars...; on_error = nothing,
         locality = :error, coordinates = nothing)
+    built = _binding_build(built, plan)
     isempty(exemplars) && throw(ArgumentError("prepare_query_ad needs a packed exemplar"))
     _check_factor_selection(built, plan, selection)
     u0 = _query_exemplar(built.layout, last(exemplars))
@@ -564,6 +566,7 @@ Single-selection calls retain their bound-program validation.
 function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
         selections::AbstractVector{<:FactorSelection}, backend, exemplars...;
         on_error = nothing, locality = :error, coordinates = nothing)
+    built = _binding_build(built, plan)
     isempty(exemplars) && throw(ArgumentError("prepare_query_ad needs a packed exemplar"))
     u0 = _query_exemplar(built.layout, last(exemplars))
     if isempty(selections)

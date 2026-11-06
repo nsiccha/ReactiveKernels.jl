@@ -35,6 +35,7 @@ _smc_window_terms(built, binding, fresh, u0) = isempty(fresh) ?
     _smc_fresh_window_terms(built, binding, fresh, u0)
 
 function _smc_fresh_window_terms(built, binding, fresh, u0)
+    built = _binding_build(built, binding)
     catalogue = density_factors(built, binding)
     isfresh = falses(built.layout.total)
     isfresh[fresh] .= true

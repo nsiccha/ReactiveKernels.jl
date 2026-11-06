@@ -84,6 +84,7 @@ end
 
 function _prepare_shared_compact_ad(prepare_operator, built, plan, observations,
         base0, indices0, backend, exemplars...; on_error, locality, partitioned)
+    built = _binding_build(built, plan)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_compact_cell_ad requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)

@@ -144,6 +144,11 @@ function _extent_check(source, datasets, want; conditioned = (:y,), same_type = 
         value, gradient = Base.invokelatest(ad_value_and_gradient, ad, u)
         @test value ≈ expected
         @test gradient ≈ _extent_central(x -> Base.invokelatest(reused, x), u) atol = 1e-5
+        # So does its sampler, which packs this binding's coordinates.
+        sampler = prepare_sampler(first(builds), b, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        sampled, sampled_gradient = sampler_value_and_gradient!(sampler, zeros(length(u)), u)
+        @test sampled ≈ expected
+        @test sampled_gradient ≈ gradient
     end
     return programs
 end
@@ -406,6 +411,43 @@ _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
             reads = Base.invokelatest(partition_footprint, q.kernel, u, 2).unconstrained
             @test sort!(collect(reads)) == [ids[2]; [n + ids[2] + n * (j - 1) for j in 1:k]]
         end
+    end
+    @testset "one retained build serves larger, smaller and empty bindings in turn" begin
+        # The reporter's sequence (`ODLPlaus:precompile`, RK `bcb8134e`).
+        data(n) = (n = n, prior_mu = -0.2, prior_sd = 0.3, observation_sd = 0.7,
+            x = [0.5 + 0.1i for i in 1:n], y = [0.9 + 0.1i for i in 1:n])
+        plan = lower_rkppl(quote
+                z[1:n] .~ LogNormal.(prior_mu, prior_sd)
+                y .~ Normal.(x .* z, observation_sd)
+            end, data(2); conditioned = (:y,))
+        built = build_kernel(bind_data(plan, data(2)))
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)
+        for n in (2, 4, 2, 0, 2)
+            d = data(n)
+            bound = bind_data(plan, d)
+            u = [0.3sin(i) for i in 1:n]
+            @test assign_layout(bound).total == n
+            q = prepare_query(built, bound, :sampler)
+            z = exp.(u)
+            want = sum(logpdf.(LogNormal(d.prior_mu, d.prior_sd), z); init = 0.0) + sum(u; init = 0.0) +
+                sum(logpdf.(Normal.(d.x .* z, d.observation_sd), d.y); init = 0.0)
+            @test Base.invokelatest(q, u) ≈ want
+            sampler = prepare_sampler(built, bound, u; backend)
+            @test sampler.layout.total == n
+            value, gradient = sampler_value_and_gradient!(sampler, zeros(n), u)
+            @test value ≈ want
+            @test gradient ≈ _extent_central(x -> Base.invokelatest(q, x), u) atol = 1e-5
+            @test coordinate_names(sampler.layout) == [Symbol("z.", i) for i in 1:n]
+            # A cell query reads this binding's rows and coordinates too.
+            n == 0 && continue
+            cells = prepare_cell_query(built, bound, :y; locality = :error)
+            for i in 1:n
+                @test Base.invokelatest(cells, u, i) ≈ logpdf(Normal(d.x[i] * z[i], d.observation_sd), d.y[i])
+            end
+        end
+        # A wrong-length point still names the binding's own size.
+        @test_throws "exemplar length 3 ≠ layout total 4" prepare_sampler(built,
+            bind_data(plan, data(4)), zeros(3); backend)
     end
     @testset "a rebinding reads its own extents" begin
         plan = lower_rkppl(quote
