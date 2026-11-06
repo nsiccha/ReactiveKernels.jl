@@ -65,13 +65,14 @@ function _record_jacobian!(sites, stmts, e::LayoutEntry, total;
     elseif e.kind !== :external && e.transform in (:exp, :logistic, :interval, :floored, :upper)
         # The same scalar Jacobian emitter used by the sampler. Parameters
         # of bounds remain graph inputs, so their support is retained.
+        program = _program_entry(e)
         scalar = LayoutEntry(:sampled, nothing, e.name, Symbol[], 1, 1,
-            e.transform, e.lo, e.hi)
+            e.transform, program.lo, program.hi)
         value = _dovar(1)
         expression = _replace_density_coordinate(jacobian_term(scalar), value)
         pw = Symbol(:_ppl_density_jacobian_cells_, length(sites) + 1)
         append!(stmts, _plate_sum_stmts(pw, Symbol(pw, :_sum),
-            Any[block_read(e.offset, e.size)], Expr(:block, expression)))
+            Any[_entry_view(e)], Expr(:block, expression)))
         _record_density!(sites, stmts, :log_jacobian, site, total;
             pointwise = pw, count = e.size, owner = e)
     else
@@ -253,6 +254,7 @@ or [`prepare_query_ad`](@ref). Catalogue and query preparation may inspect the
 whole model; repeated selected evaluation uses precomputed row plans.
 """
 function density_factors(built, plan::StructuralPlan)
+    built = _binding_build(built, plan)
     _check_built_program(built, plan)
     sites = _DensitySite[]
     def = Base.invokelatest(_kernel_expr_latest, plan, built.layout; density_sites = sites)
@@ -541,6 +543,7 @@ end
 function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
         selection::FactorSelection, backend, exemplars...; on_error = nothing,
         locality = :error, coordinates = nothing)
+    built = _binding_build(built, plan)
     isempty(exemplars) && throw(ArgumentError("prepare_query_ad needs a packed exemplar"))
     _check_factor_selection(built, plan, selection)
     u0 = _query_exemplar(built.layout, last(exemplars))
@@ -563,6 +566,7 @@ Single-selection calls retain their bound-program validation.
 function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
         selections::AbstractVector{<:FactorSelection}, backend, exemplars...;
         on_error = nothing, locality = :error, coordinates = nothing)
+    built = _binding_build(built, plan)
     isempty(exemplars) && throw(ArgumentError("prepare_query_ad needs a packed exemplar"))
     u0 = _query_exemplar(built.layout, last(exemplars))
     if isempty(selections)

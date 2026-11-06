@@ -39,6 +39,23 @@ end
     end
 end
 
+# The same model reading its packed blocks at bound positions, as
+# ReactiveKernelsPPL reads declared arrays (snag `rkppl-sized-vect-69604d32`):
+# its bound endpoints keep the range view, read exactly as a literal one.
+@kernel _prefix_bound_range_model(u::Vector{Float64}, group::Vector{Int},
+                     y::Vector{Float64}, subject::Vector{Int}, lo::Int, hi::Int,
+                     zlo::Int, zhi::Int) = begin
+    theta = view(u, lo:hi)
+    transformed = exp.(theta)
+    offset::Float64 = sum(transformed)
+    z = view(u, zlo:zhi)
+    mu = offset .+ z[group]
+    density = plate(mu, y) do m, obs
+        -(obs - m)^2 / 2
+    end
+    total = sum(density)
+end
+
 u = [0.1, 0.2, -0.3, -0.2, 0.3, 0.1, 0.6, -0.4, 0.2]
 group = [1, 2, 1, 3, 4, 3, 5, 6, 5]
 subject = repeat(1:3; inner=3)
@@ -51,6 +68,19 @@ kernel = prepare(spec; have=(:u, :group, :y, :subject, :label), want=:partition_
 split = _PREFIX_RK._partition_shared_parts(kernel.plan, (:u => coordinate_labels,); varying=(:label,))
 @test getproperty.(split.frontier, :name) == [:offset]
 @test _PREFIX_RK._partition_prefix_positions(split.prefix, :u) == [1, 2, 3]
+@testset "bound range endpoints keep the prefix's exact read set" begin
+    bound_spec = plate_partition(_prefix_bound_range_model, :density; by=:subject,
+        index=:label, partitioned=(:u => coordinate_labels,))
+    bound_kernel = prepare(bound_spec;
+        have=(:u, :group, :y, :subject, :lo, :hi, :zlo, :zhi, :label),
+        want=:partition_total, bound=(; group, y, subject, lo=1, hi=3, zlo=4, zhi=9))
+    bound_split = _PREFIX_RK._partition_shared_parts(bound_kernel.plan,
+        (:u => coordinate_labels,); varying=(:label,))
+    @test _PREFIX_RK._partition_prefix_positions(bound_split.prefix, :u) == [1, 2, 3]
+    for label in 1:3
+        @test bound_kernel(u, label) == kernel(u, label)
+    end
+end
 prefix = prepare(split.prefix; exemplars=(u,))
 cached = prefix(u)
 residual = prepare(split.residual; exemplars=(u, 1, cached))

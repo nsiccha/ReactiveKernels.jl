@@ -40,6 +40,7 @@ place of `base`, reusing its copied point without rescanning shared coordinates.
 """
 function prepare_cell_factors(built, plan::StructuralPlan, observation::Symbol;
         on_error = nothing, locality = nothing, partitioned = (), u0 = nothing)
+    built = _binding_build(built, plan)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_cell_factors requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)

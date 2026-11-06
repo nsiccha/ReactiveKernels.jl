@@ -32,6 +32,7 @@ Julia's dimension order and integer index data stay 1-based. See
 """
 function ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan;
                                     values = (), doc = nothing)
+    built = _binding_build(built, plan)
     isbound(plan) || throw(ContractValidationError(
         "[jax] jax_source requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
