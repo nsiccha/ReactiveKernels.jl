@@ -104,6 +104,62 @@ end
     end
 end
 
+@testset "a bound number's value keeps the prepared sampler's type" begin
+    # `z[idx]` gives the gather its index-run metadata, a tuple of arrays and
+    # numbers, which rewrites the gradient's generated body. That body spelled
+    # every bound number, so each value was another type and a new compile of
+    # the whole derivative (snag `prepare-sampler-e69f1b38`).
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    source = @rkppl begin
+        z[1:z_length] .~ LogNormal.(mu, sd)
+        y .~ Normal.(z[idx], noise)
+    end
+    function density(u, d)
+        lp = 0.0
+        for ui in u
+            lp += -(ui - d.mu)^2 / (2d.sd^2) - log(d.sd) - log(2pi) / 2
+        end
+        for (j, i) in enumerate(d.idx)
+            lp += -(d.y[j] - exp(u[i]))^2 / (2d.noise^2) - log(d.noise) - log(2pi) / 2
+        end
+        lp
+    end
+    function density_gradient(u, d)
+        g = [-(ui - d.mu) / d.sd^2 for ui in u]
+        for (j, i) in enumerate(d.idx)
+            g[i] += (d.y[j] - exp(u[i])) * exp(u[i]) / d.noise^2
+        end
+        g
+    end
+    # Both schedules of the gather: flat, and grouped from a mean run of 8. The
+    # schedule is the one finite class a binding may change a body by, so each
+    # keeps one type across values and row counts on its own.
+    for idx_of in (n -> repeat(1:3, n), n -> repeat(1:3, inner = 8n))
+        d(mu, sd, noise, n) = begin
+            idx = idx_of(n)
+            (; y = collect(range(0.1, 0.9; length = length(idx))), idx, z_length = 3,
+               mu, sd, noise)
+        end
+        A = d(0.1, 0.5, 0.2, 1)
+        fit = source(; A.idx, A.z_length, A.mu, A.sd, A.noise) | (; A.y)
+        built = build_kernel(fit)
+        u = [0.1, -0.2, 0.3]
+        bindings = (A, d(0.7, 1.3, 0.4, 1), d(-0.4, 0.9, 0.3, 2), A)
+        queries = map(b -> prepare_sampler(built, bind_data(fit, b), u; backend), bindings)
+        @test allequal(typeof.(queries))
+        retained = map(b -> prepare_sampler(built, bind_data(fit, b), u; backend,
+            retain = (:pointwise,)), bindings)
+        @test allequal(typeof.(retained))
+        for (b, q) in zip(bindings, queries)
+            g = similar(u)
+            value, _ = sampler_value_and_gradient!(q, g, u)
+            @test value ≈ density(u, b)
+            @test q(u) ≈ density(u, b)
+            @test g ≈ density_gradient(u, b)
+        end
+    end
+end
+
 @testset "a lazy branch over bound lanes rebuilds to the same reader" begin
     # The bound lanes of a lazy arm are named after a generated plate argument
     # (`lane_then_##plate_argument#N`). The reader's generated body must not

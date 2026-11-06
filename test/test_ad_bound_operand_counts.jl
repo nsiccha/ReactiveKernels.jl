@@ -8,8 +8,9 @@ end
 
 @testset "structured bound operand counts" begin
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
-    # Four bound slots contribute one, four, or six array leaves. Numeric
-    # slots become literals in a rewritten body, rather than hidden operands.
+    # Four bound slots contribute one, four, or six array leaves, and each
+    # numeric slot one more operand: a rewritten body holds no bound number
+    # (snag `prepare-sampler-e69f1b38`).
     for n in (3, 9), leaves in (1, 4, 6), record in (:tuple, :namedtuple)
         weights = collect(range(0.4, 1.2; length = n))
         extra = ntuple(i -> fill(Float64(i), n), leaves - 1)
@@ -23,7 +24,9 @@ end
         ast = deepcopy(code_expr(kernel))
         external, values = ReactiveKernels._externalize_bound_arrays(
             kernel; externalize_scalars = true)
-        @test length(values) == leaves
+        @test length(values) == leaves + 3
+        @test count(value -> value isa AbstractArray, values) == leaves
+        @test issetequal(filter(value -> value isa Number, values), (a, b, c))
         @test Tuple(input.name for input in inputs(kernel)) == (:scale, :q)
 
         point = collect(range(-0.2, 0.5; length = n))

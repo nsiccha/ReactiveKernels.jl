@@ -306,7 +306,7 @@ only, no ReactiveKernels code) isolate the remaining backend limitations:
   data-only call that a parameter-dependent call consumes as its own
   statement, so preparation folds it once and the gradient never
   differentiates it. A bound tuple or named tuple then crosses the
-  differentiated call as one operand per array leaf. Helpers inside a
+  differentiated call as one operand per array or numeric leaf. Helpers inside a
   parameter-dependent function remain the backend's limitation.
 - Native Enzyme 0.13.209 reverse mode fails static activity analysis
   (`EnzymeRuntimeActivityError`) when buffers allocated in the two arms of a

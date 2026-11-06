@@ -18,6 +18,11 @@ are recorded in the git history only.
 
 ## 0.1.105
 
+- `prepare_sampler` has one type across the values of a bound number, such as a
+  prior's location or scale, as `prepare_query` already had. Rebinding one build
+  with other numbers reuses the compiled gradient instead of compiling it again;
+  another row count does too, on the same gather schedule. Requires
+  ReactiveKernels 0.1.93. Values and gradients are unchanged.
 - Binding refuses a fixed `nu` or `zi` outside its support on every spelling. A
   `ZeroInflatedPoisson.(rate, z)` or `StudentT.(nu, mu, s)` column, in a dotted
   observation or a `@plate` cell, a computed argument (`z ./ 2`) and a definition
