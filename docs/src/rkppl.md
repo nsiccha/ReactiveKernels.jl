@@ -642,7 +642,11 @@ generated values to sampler coordinates.
   phi)` mean what `rate = …; Poisson.(rate)` does. One predictor may feed several slots or responses under
   different links, with its original parameter names and priors.
   Values outside parameter support contribute `-Inf` through a lazy
-  density branch. Mixture components may use independent links.
+  density branch. A scale, `nu` or `zi` that reads no sampled name is fixed
+  by the data, so binding refuses it by name when a row the response observes
+  leaves that support: a bound column (`ZeroInflatedPoisson.(rate, z)` with a
+  `z` outside `[0, 1]`), a computed argument (`StudentT.(nu .- 5, mu, s)`) or
+  a definition (`sd = w .- 3`). Mixture components may use independent links.
   A computed coefficient such as `b = z * lambda * tau` reads its
   declared parameters, so using it as a scale retains the same priors.
   Native value and reverse checks cover this form.

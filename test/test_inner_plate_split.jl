@@ -241,6 +241,19 @@ isdefined(@__MODULE__, :InnerPlateSplit) ||
         @test C.calls[] == 2
     end
 
+    @testset "a refused node nested under two live guards keeps both" begin
+        data = [4.0, -1.0, 9.0]
+        plain = prepare(C.guarded_nested_domain)
+        bound = prepare(C.guarded_nested_domain; bound = (; y = data))
+        # Lane 2 reads the invalid datum only when its inner guard passes.
+        for x in ([0.6, 0.2, 0.7], [-0.5, -1.0, -0.25])
+            @test bound(x) == plain(x, data)
+            @test gradient(bound, x) == gradient(plain, x, data)
+        end
+        @test bound([0.6, 0.2, 0.7]) ≈ 1.6 * 2.0 + 1.2 + 1.7 * 3.0
+        @test_throws DomainError bound([0.6, 0.6, 0.7])
+    end
+
     @testset "an error a live input may avoid keeps the cell" begin
         plain = prepare(C.guarded_domain; have = (:q, :y), want = :total)
         bound = prepare(C.guarded_domain; have = (:q, :y), want = :total,

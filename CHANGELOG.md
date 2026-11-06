@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.93
+
+- `prepare` with `bound=` data no longer fails with a `MethodError` (`Cannot
+  convert` a tuple to `Int64`) when a data-only computation under two guards of
+  a plate cell throws, such as `sqrt(d)` for a negative `d` in an arm of an
+  inlined endpoint. The computation stays under both guards, as authored. The
+  failure came from 0.1.88's typed sets for nested-arm speculation.
+
 ## 0.1.92
 
 - In a partition over several plates lowered with one cell emitter, work that
