@@ -341,8 +341,8 @@ end
 
 function _program_difference(built::Expr, other::Expr)
     # Fresh `Expr` nodes for `remove_linenums!` to edit; the values they hold
-    # are only printed. A long quoted array (a level axis's labels) prints as
-    # its summary and ends.
+    # are only printed. A long quoted array (a presence mask) prints as its
+    # summary and ends.
     text(x) = x === nothing ? "(absent)" :
         sprint(print, x isa Expr ? Base.remove_linenums!(_elide_long_arrays(x)) :
             _elide_long_arrays(x))
