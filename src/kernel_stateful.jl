@@ -236,11 +236,14 @@ end
 "Capture a frozen, detached immutable snapshot of a child `KernelSpec` value."
 function _kernel_capture_child(name::Symbol, child::KernelSpec)
     g = child.graph
+    # In id order, the order the graph was built in. Ids come from a
+    # process-global counter, so a dictionary's own order differs between two
+    # builds of one child, and with it these tuples' types.
     _ChildSnapshot(
         name,
-        Tuple(Base.values(g.values)),
+        Tuple(g.values[id] for id in sort!(collect(keys(g.values)))),
         Tuple(g.recipes),
-        Tuple((id, Tuple(idxs)) for (id, idxs) in g.producers),
+        Tuple((id, Tuple(g.producers[id])) for id in sort!(collect(keys(g.producers)))),
         Tuple(k => v for (k, v) in g.aliases),
         g.version,
         Tuple(k => v.id for (k, v) in child.ports),
@@ -596,7 +599,7 @@ function _kernel_endpoint_binding_spec!(st::_KernelEndpointBuildState,
                                         root::Symbol, method::Symbol)
     key = (root, method)
     get!(st.binding_specs, key) do
-        var = gensym(Symbol(root, :_, method, :_endpoint))
+        var = _kernel_gensym(Symbol(root, :_, method, :_endpoint))
         bound = Expr(:call, GlobalRef(Core, :getfield), st.bindings_var, QuoteNode(root))
         endpoint = Expr(:call, GlobalRef(Base, :getproperty), bound, QuoteNode(method))
         rhs = Expr(:call, GlobalRef(@__MODULE__, :_kernel_scope_spec),
@@ -633,7 +636,7 @@ function _kernel_endpoint_lift!(st::_KernelEndpointBuildState, x, lifted::Vector
                 "pure endpoint :$(st.current_method) must assign expression arguments " *
                 "to named ports before calling :$callee"))
             spec = st.endpoint_vars[callee]
-            placeholder = gensym(Symbol(callee, :_call))
+            placeholder = _kernel_gensym(Symbol(callee, :_call))
             st.nested_specs[placeholder] = spec
             out = _kernel_endpoint_named_output!(st, callee)
             out_type = st.endpoint_returns[callee]
@@ -659,7 +662,7 @@ function _kernel_endpoint_lift!(st::_KernelEndpointBuildState, x, lifted::Vector
                 Any[st.residual_owner_names...; value], scoped)
             value isa Symbol || throw(ArgumentError(
                 "inv($target, value) in :$(st.current_method) requires a named value port"))
-            placeholder = gensym(Symbol(target, :_inverse_call))
+            placeholder = _kernel_gensym(Symbol(target, :_inverse_call))
             st.nested_specs[placeholder] = inverse_spec()
             out = _kernel_endpoint_named_output!(st, input_name)
             actuals = Any[st.residual_owner_names...; value]
@@ -676,7 +679,7 @@ function _kernel_endpoint_lift!(st::_KernelEndpointBuildState, x, lifted::Vector
                 args, scoped)
             all(arg -> arg isa Symbol, args) || throw(ArgumentError(
                 "bound endpoint `$root.$method` in :$(st.current_method) requires named port arguments"))
-            placeholder = gensym(Symbol(root, :_, method, :_call))
+            placeholder = _kernel_gensym(Symbol(root, :_, method, :_call))
             st.nested_specs[placeholder] = spec
             out = _kernel_endpoint_named_output!(
                 st, _kernel_scoped_port(root, method))
@@ -856,9 +859,9 @@ function _kernel_endpoint_templates_expr(signature_inputs, recipe_stmts,
         inverse_targets[m.name] = formals[1]
     end
 
-    owner_var = gensym(:endpoint_owner_spec)
-    bindings_var = gensym(:endpoint_bindings)
-    endpoint_vars = Dict(name => gensym(Symbol(name, :_endpoint_spec)) for name in endpoint_names)
+    owner_var = _kernel_gensym(:endpoint_owner_spec)
+    bindings_var = _kernel_gensym(:endpoint_bindings)
+    endpoint_vars = Dict(name => _kernel_gensym(Symbol(name, :_endpoint_spec)) for name in endpoint_names)
     state = _KernelEndpointBuildState(
         owner_names, Set(owner_names), residual_owner_names, endpoint_names,
         endpoint_vars, endpoint_formals, endpoint_returns, inverse_targets,

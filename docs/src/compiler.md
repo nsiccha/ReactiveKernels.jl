@@ -338,6 +338,21 @@ selection, topological sort, cache lookup, or dynamic scheduling. Julia still
 specializes and executes the recipe callables normally; their own dispatch,
 allocations, exceptions, and side effects are not erased by the graph compiler.
 
+One program also builds to one set of types when a generator evaluates its
+definition anew, as RKPPL's `build_kernel` does. Authoring names what the author
+left unnamed (a lifted cell invariant, a computed endpoint binding, a plate's
+computed argument) by the definition's fingerprint and the name's position in
+the expansion, because such a name reaches types: a recipe's split nodes carry
+their ports as a type parameter. The fingerprint reads the definition's
+structure and authored names; literal values, line numbers, a generator's own
+generated numbering and fresh module names do not change it. Two definitions
+with one fingerprint then spell the same names, as one definition called twice
+always has, and stay two computations: a value is identified by its id, each
+value gets its own local whatever it is called, and common-subexpression merging
+reads a provenance token that stays unique per definition. A graph's value ids
+come from a process-global counter, so nothing a type reads may follow a
+dictionary keyed by them.
+
 Fresh authored definitions retain distinct provenance even when their source is
 identical: each authored operation carries a definition token, a value the plan,
 the source recipes and `lowered_recipes` keep. An operation's type is its
@@ -1696,6 +1711,18 @@ footprint)` checks that the partition reads no other label's positions of
 those ports, throwing `PartitionSeparabilityError` otherwise.
 ReactiveKernelsPPL builds its partition queries and compact gradients on
 these (`prepare_partition`, `prepare_partition_sampler`).
+
+Those queries also compute a value that reads only shared coordinates once and
+reuse it across partitions, when `partitioned` declares what a partition owns,
+or `partitioned = :none` declares that partitions own no parameter. Strict
+locality then applies to the rest of the program, and a declaration that names
+nothing leaves the value refused. A partition's full gradient runs a pullback
+through the reused values, so sweeping with `partition_value_and_gradient!` runs
+one per partition. `partition_batch_value_and_gradient!(s, g, u, labels; weights)`
+adds each label's derivative to one cotangent of those values and runs one
+pullback, so a batch costs its partitions' footprints plus that pullback. The
+pullback is still whole, so an ordinary whole-model gradient can be cheaper for
+most of a model's partitions.
 
 `plate_partition(…; plan = port)` declares one more HAVE port holding the
 partition's *plan*: the integer bookkeeping of a label (its positions, every

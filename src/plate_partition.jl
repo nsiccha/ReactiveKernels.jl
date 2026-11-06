@@ -67,9 +67,17 @@ function Base.showerror(io::IO, err::PartitionLocalityError)
           "per-position loop over vector or matrix rows, `vec` of a value with rows, a ",
           "field of a named tuple of data, a shape check that returns its argument, ",
           "a function whose package gives it a row method); ",
-          "see `partition_locality`. Pass `locality = :warn` ",
-          "to evaluate anyway.")
+          "see `partition_locality`. Pass `locality = :warn` to evaluate anyway, which ",
+          "computes each such value again for every cell or partition. ", _LOCALITY_SHARED_ROUTE)
 end
+
+# The route a value that reads only shared parameters has instead of being
+# computed for every partition, which `locality = :warn` would do.
+const _LOCALITY_SHARED_ROUTE =
+    "If it reads only shared parameters, ReactiveKernelsPPL's queries can compute it " *
+    "once and reuse it: declare what a partition owns, `partitioned = (:z,)` or " *
+    "`partitioned = (:z => labels,)`, or `partitioned = :none` when partitions own no " *
+    "parameter."
 
 function _locality_describe(entry)
     reason = entry.reason === :no_form ?
@@ -286,7 +294,8 @@ function _cell_locality_check!(p::Plan, d::_CellPushdowns)
             @warn "ReactiveKernels: evaluating `$cell` at its rows computes a value whole: " *
                   _locality_describe(root) *
                   ". Pass `locality = :error` to refuse it, or set the `cell_locality` " *
-                  "preference; `partition_locality` lists every value."
+                  "preference; `partition_locality` lists every value. " *
+                  _LOCALITY_SHARED_ROUTE
         end
     end
     nothing

@@ -82,24 +82,20 @@ end
     program = string(kernel_expr(gathered, assign_layout(gathered)))
     @test occursin("_ppl_lvx_c_g_axis_1 = _declared_codes(g, _ppl_levels(g))", program)
     @test !occursin("\"a\"", program)
+    # The build's identity reads the labels as the program does and holds none.
     built = build_kernel(plan)
-    quoted = Any[]
-    walk(x) = x isa QuoteNode ? push!(quoted, x.value) :
-        x isa Expr ? foreach(walk, x.args) : nothing
-    walk(built.program)
-    @test ["a", "b", "c"] in quoted
-    @test !occursin("_ppl_levels", string(built.program))
-    # The same labels bound in another order are the same program; other
-    # labels another (`test_rebinding_rows.jl` pins the refusal).
+    @test occursin("_ppl_levels", string(built.program))
+    @test !occursin("\"a\"", string(built.program))
+    # Other labels, in any order and any number, are the same program.
     same = ReactiveKernelsPPL._same_program
     @test same(built.program, build_kernel(m(; g = ["c", "b", "a", "b"]) | (; y)).program)
-    @test !same(built.program, build_kernel(m(; g = ["b", "a", "d", "a"]) | (; y)).program)
-    # A long label vector prints as its summary and ends in the difference.
-    wide = build_kernel(m(; g = string.("g", 1:40)) | (; y = zeros(40))).program
-    other = build_kernel(m(; g = string.("h", 1:40)) | (; y = zeros(40))).program
-    difference = ReactiveKernelsPPL._program_difference(wide, other)
-    @test occursin("<40-element Vector{String}: g1, g10, g11", difference)
-    @test occursin("(32 more), g8, g9>", difference)
+    @test same(built.program, build_kernel(m(; g = ["b", "a", "d", "a"]) | (; y)).program)
+    # A long quoted array prints as its summary and ends in the difference.
+    def(v) = Expr(:function, :(f(x)), Expr(:block, Expr(:(=), :present, QuoteNode(v))))
+    difference = ReactiveKernelsPPL._program_difference(
+        def(string.("g", 1:40)), def(string.("h", 1:40)))
+    @test occursin("<40-element Vector{String}: g1, g2, g3", difference)
+    @test occursin("(32 more), g39, g40>", difference)
     @test !occursin("g20", difference)
 end
 

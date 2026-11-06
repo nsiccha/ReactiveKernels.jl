@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.99
+## 0.1.101
 
 - A partition sampler or query with a cached shared prefix (`partitioned=`)
   keeps a plate read through a type guard at each partition's rows. One example
@@ -31,6 +31,31 @@ are recorded in the git history only.
   queries are prepared with. Its prefix and residual keep the branch, so each
   point type they are prepared for proves its own arm. Values and gradients are
   unchanged. A unit's gradient now costs its own rows, not the whole plate.
+
+## 0.1.100
+
+- `PartitionLocalityError` and the `locality = :warn` warning name the route for
+  a value that reads only shared parameters: `partitioned` in the queries of
+  ReactiveKernelsPPL 0.1.111, or `partitioned = :none` when partitions own no
+  parameter. The refusal also says that `locality = :warn` computes such a value
+  again for every cell or partition, instead of offering it as the only way on.
+
+## 0.1.99
+
+- Building one program twice in a process, as a generator does whenever it
+  evaluates its definition again, gives the types the first build gave, so the
+  second build compiles nothing more. `@kernel` named what the author left
+  unnamed (a lifted cell invariant, a computed endpoint binding, a plate's
+  computed argument) with `gensym`, whose counter moves on between builds, and
+  those names reach types: a split recipe carries its ports in its type, an
+  endpoint call its signature. Each build then had new types, and every reader
+  of them compiled again. A generated name is now a function of the definition
+  and of its position in the expansion, in the shape of a `gensym`. A source
+  operation's provenance token is a field of its key instead of a type
+  parameter. A bound plate's axes and a child snapshot's values no longer
+  follow value-id order, which differs between builds.
+- Two definitions of one source still stay two computations, and a binding
+  from another program is still refused. Values and gradients are unchanged.
 
 ## 0.1.98
 
