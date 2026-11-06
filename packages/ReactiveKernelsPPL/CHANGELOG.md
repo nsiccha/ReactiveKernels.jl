@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.109
+
+- `prepare_sampler(...; nonallocating = true)` keeps one type across the values
+  of a bound number, as the ordinary sampler does since 0.1.105. Rebinding one
+  build with other numbers reuses the compiled density and gradient instead of
+  compiling them again, and each query still owns its buffers. Requires
+  ReactiveKernels 0.1.99.
+
 ## 0.1.108
 
 - Sizes and data-derived numbers stay data in the generated program, never one

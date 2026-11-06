@@ -456,9 +456,11 @@ ordinary sampler's. The density is usually faster, and loses less when another
 allocating process shares the CPU core; the reverse gradient is faster on some
 programs and slower on others, so measure both on the model you fit. The
 query keeps the buffers, which is why a query serves one caller at a time.
-Native forward batching does not apply,
-and ReactiveKernels does not build retained outputs over a non-allocating
-kernel yet, so `retain` fails there.
+Its type, like the ordinary sampler's, does not depend on the values of bound
+numbers: another binding of the same build reuses the compiled density and
+gradient, and each query still owns its buffers. Native forward batching does
+not apply, and ReactiveKernels does not build retained outputs over a
+non-allocating kernel yet, so `retain` fails there.
 """
 function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real};
         backend, on_error = nothing, retain::Tuple = (), warm::Bool = false,
