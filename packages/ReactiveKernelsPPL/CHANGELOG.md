@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.109
+## 0.1.110
 
 - One `build_kernel` now also serves a binding with other level labels, or
   another number of them: `prepare_query`, `prepare_sampler` and the cell and
@@ -33,6 +33,16 @@ are recorded in the git history only.
   stayed one binding's literal: the check that a size reads data took `end` for
   a name, and the bind-time evaluator could not evaluate it. Both now treat
   `end` and `begin` in an index as Julia does.
+
+## 0.1.109
+
+- Lowering one source twice gives one set of generated names (a selected
+  argument, an index, a destructured value, a density port), so with
+  ReactiveKernels 0.1.99 two builds of one model in a process share their
+  types and the second compiles nothing more. A name is a function of the
+  source and its position in the lowering, instead of `gensym`. A submodel
+  called twice still has its names apart: one lowering counts once over its
+  submodels. Requires ReactiveKernels 0.1.99.
 
 ## 0.1.108
 

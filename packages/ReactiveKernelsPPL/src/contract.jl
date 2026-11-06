@@ -2573,7 +2573,9 @@ function _guard_missing_observation_argument(name, ex, plan, columns)
     skipped = _guarded_argument_is_bound(ex, columns) ? 0 : 0.0
     guarded = deepcopy(ex)
     inputs, lambda = guarded.args
-    lane = gensym(:_rkppl_argument_present)
+    # Named by its position among the cell's formals: it is local to this cell,
+    # and a binding of one program spells one type (snag `gensym-in-kernel-54164b85`).
+    lane = Symbol("##_rkppl_argument_present#", length(lambda.args[1].args))
     push!(inputs.args, QuoteNode(present))
     push!(lambda.args[1].args, lane)
     lambda.args[2] = Expr(:block, LineNumberNode(0, :rkppl_plate),
