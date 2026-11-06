@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.93
+## 0.1.95
 
 - A bound number's value no longer changes a prepared derivative's type.
   `prepare_ad` rewrites the generated body when a bound value is a tuple or a
@@ -27,6 +27,15 @@ are recorded in the git history only.
   a scale), now cross as hidden operands like the arrays do. Values and
   derivatives are unchanged. A leaf that holds pointers but no array (a `Ref`, a
   `String`) stays a literal of the rebuild.
+- A program that took that rewrite no longer has those numbers folded into its
+  compiled derivative, so its gradient computes what they had folded away. A
+  bound response scale then computes `log(scale)` on every row in the gradient,
+  as it already did in the primal and in every program without the rewrite. On
+  12 blocks of 2000 rows a gradient took 113 us with the numbers in the body and
+  271 us without them, at one load in one process. Bound prior numbers, which
+  run above their loop, cost about 6 percent. Lifting that work out of the loop
+  is tracked by snag `bound-response-s-9739d33d`.
+
 ## 0.1.94
 
 - A cell or partition query of a tuple-valued plate whose readers read different

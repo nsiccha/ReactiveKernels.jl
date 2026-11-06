@@ -16,13 +16,22 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.105
+## 0.1.106
 
 - `prepare_sampler` has one type across the values of a bound number, such as a
   prior's location or scale, as `prepare_query` already had. Rebinding one build
   with other numbers reuses the compiled gradient instead of compiling it again;
   another row count does too, on the same gather schedule. Requires
-  ReactiveKernels 0.1.93. Values and gradients are unchanged.
+  ReactiveKernels 0.1.95. Values and gradients are unchanged.
+- A gather with a bound response scale, such as `y .~ Normal.(z[idx], noise)`,
+  gives up a gradient speedup it only had while the number was spelled in the
+  generated code: `log(noise)` now runs on every row there, as it already did in
+  the density and in programs without a gather (ReactiveKernels 0.1.95 has the
+  numbers; snag `bound-response-s-9739d33d` tracks lifting it out of the loop).
+  A prior's numbers are computed above their loop and cost about 6 percent.
+
+## 0.1.105
+
 - Binding refuses a fixed `nu` or `zi` outside its support on every spelling. A
   `ZeroInflatedPoisson.(rate, z)` or `StudentT.(nu, mu, s)` column, in a dotted
   observation or a `@plate` cell, a computed argument (`z ./ 2`) and a definition
