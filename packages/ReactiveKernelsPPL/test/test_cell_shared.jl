@@ -86,21 +86,7 @@ const _CS_READS_SUM = @rkppl begin
         y[k] ~ Normal(log1p(sum(rate[rows[k]])) + w[grp[k]], sigma)
     end
 end
-# Static Reverse refuses `_local_cell_rows`' read of a base or an active row on
-# the Enzyme dogfood line too (Enzyme snag `static-reverse-m-c913effd`). Runs `f()`
-# and records only that refusal as broken. Drop this with the repair.
-function _cs_mixed_read(f)
-    try
-        f()
-    catch err
-        err isa Enzyme.Compiler.EnzymeRuntimeActivityError || rethrow()
-        message = sprint(showerror, err)
-        @test occursin("Mismatched activity", message)
-        @test occursin("_local_cell_rows", message)
-        @test_broken false
-    end
-    nothing
-end
+@isdefined(_static_enzyme) || include("static_enzyme.jl")
 
 const _CS_REVERSE = AutoEnzyme(; mode = Enzyme.Reverse)
 const _CS_SECOND = SecondOrder(_CS_REVERSE, AutoEnzyme(; mode = Enzyme.Forward))
@@ -478,7 +464,9 @@ end
     c = prepare_compact_cell_ad(prepare_ad, built, bound, :y, u, [4, 5], _CS_REVERSE;
         partitioned = :z => collect(1:4), locality = :ignore)
     @test c.shared.cache.positions == [1]
-    _cs_mixed_read() do
+    # `_local_cell_rows` picks each row from the gathered base or the active
+    # vector (static_enzyme.jl). Dogfood validation requires the gradient.
+    _static_enzyme() do
         for i in (1, 1, 2, 3)
             selection = 3 .+ data.rows[i]
             mu = u[1 + data.grp[i]] + sum(u[selection])
