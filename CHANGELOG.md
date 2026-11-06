@@ -16,6 +16,22 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.99
+
+- A partition sampler or query with a cached shared prefix (`partitioned=`)
+  keeps a plate read through a type guard at each partition's rows. One example
+  is a per-state field plate whose cells call an opaque helper over parameter
+  arrays, read as `eltype(cells) <: Real ? cells : throw(...)` (the guard
+  BayesianRegressionModels writes for an offset of a plate output). The split
+  had decided the guard from the declared packed type `AbstractVector{Float64}`.
+  Over that type the helper infers `Any`, so the guard kept no arm, and the
+  plate, the guard and everything after them were lifted into the prefix. Every
+  partition gradient then pulled back through all of the plate's cells. The
+  split now decides this for a dense `Vector{Float64}` point, the type these
+  queries are prepared with. Its prefix and residual keep the branch, so each
+  point type they are prepared for proves its own arm. Values and gradients are
+  unchanged. A unit's gradient now costs its own rows, not the whole plate.
+
 ## 0.1.98
 
 - A plate cell whose lazy branch is decided by bound data, such as a response
