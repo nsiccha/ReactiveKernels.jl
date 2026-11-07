@@ -16,6 +16,24 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.112
+
+- A prepared body with two or more top-level plates runs each plate's loop as
+  a program of its own (`_PlateProgram`), which the body calls where the plate
+  stood. Compiled into one function, the loops did not vectorize alike: LLVM
+  vectorized the first and left the others scalar. An RKPPL model with Normal
+  likelihoods over 2000 rows each, measured on gordito (Julia 1.10.12), took
+  0.22–0.30, 0.69–0.70, 0.96–1.60 and 1.13–1.21 ns per row and likelihood
+  with 1, 2, 4 and 8 likelihoods; it now takes 0.20–0.25 at every count.
+  Values, gradients, allocations and compile times are unchanged, and a body
+  with one plate keeps its loop inline as before. `code_expr` prints each plate
+  program in place as `(function (args...) … end)(args...)`. Ordinary AD
+  differentiates the body with its plate loops inline: a reverse sweep
+  vectorizes nothing, and registered Enzyme refuses a bound array passed beside
+  an active value in a plate program's argument tuple. Only `prepare`d bodies
+  do this, and only plates that keep no per-cell tables; a `passes` transform
+  sees the plates inline.
+
 ## 0.1.111
 
 - Reverts 0.1.110. A data-bound plate branch again prepares only the arms its

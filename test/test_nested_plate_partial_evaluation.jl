@@ -32,7 +32,8 @@ function oracle(groups, cuts, x)
     total, slope
 end
 
-head_count(ex, head) = ex isa Expr ?
+head_count(ex, head) = ex isa ReactiveKernels._PlateProgram ? head_count(ex.ast, head) :
+    ex isa Expr ?
     (ex.head === head) + sum(arg -> head_count(arg, head), ex.args; init=0) : 0
 scalar_caches(kernel) = [r.op.value for r in kernel.plan.recipes
     if r.op isa ReactiveKernels._BoundConstant && r.op.value isa Vector{Float64}]

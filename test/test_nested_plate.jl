@@ -361,3 +361,59 @@ end
     shadowed = prepare(N.ShadowedFold.shadowed_logsumexp)
     @test shadowed([0.3, -1.2, 2.5]) ≈ 2 * (0.3 - 1.2 + 2.5)
 end
+
+# A body with two or more top-level plates runs each plate's loop as a program
+# of its own (`_PlateProgram`): compiled into one function, only the first of
+# several large loops vectorized (snag `sampler-type-dif-ea945700`). A body
+# with one plate keeps its loop inline. Values, pointwise outputs and native
+# Reverse gradients are those of the inline lowering, which AD differentiates.
+module PlatePrograms
+using ReactiveKernels
+@kernel two_plates(x::Vector{Float64}, y::Vector{Float64}, a::Float64, b::Float64) = begin
+    first_cells = plate(x) do xi
+        -0.5 * (xi - a)^2
+    end
+    second_cells = plate(y) do yi
+        -0.5 * (yi - b)^2 - log(2.0)
+    end
+    total::Float64 = sum(first_cells) + sum(second_cells)
+    return total
+end
+@kernel one_plate(x::Vector{Float64}, a::Float64) = begin
+    cells = plate(x) do xi
+        -0.5 * (xi - a)^2
+    end
+    total::Float64 = sum(cells)
+    return total
+end
+end
+
+@testset "a body of several plates runs each loop as a program of its own" begin
+    P = PlatePrograms
+    RK = ReactiveKernels
+    programs(ex) = ex isa RK._PlateProgram ? 1 + programs(ex.ast) :
+        ex isa Expr ? sum(programs, ex.args; init = 0) : 0
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    x = collect(range(-1.0, 2.0; length = 7))
+    y = collect(range(0.5, 3.0; length = 5))
+    reference(x, y, a, b) = sum(-0.5 .* (x .- a) .^ 2) + sum(-0.5 .* (y .- b) .^ 2 .- log(2.0))
+    k = prepare(P.two_plates; have = (:x, :y, :a, :b))
+    @test programs(code_expr(k)) == 2
+    @test programs(code_expr(prepare(P.one_plate; have = (:x, :a)))) == 0
+    @test k(x, y, 0.3, 1.1) ≈ reference(x, y, 0.3, 1.1)
+    # The printed program is the code that runs, each plate's loop included.
+    @test NestedPlates.head_count(code_expr(k), :for) == 2
+    ad = prepare_ad(k, backend, x, y, 0.3, 1.1; active = (:a, :b))
+    value, gradient = ReactiveKernels.ad_value_and_gradient(ad, x, y, 0.3, 1.1)
+    @test value ≈ reference(x, y, 0.3, 1.1)
+    @test collect(gradient) ≈ [sum(x .- 0.3), sum(y .- 1.1)]
+    # Bound data, and a pointwise output the body returns beside a total.
+    bound = prepare(P.two_plates; have = (:x, :y, :a, :b), bound = (; x, y))
+    @test bound(0.3, 1.1) ≈ reference(x, y, 0.3, 1.1)
+    pointwise = prepare(P.two_plates; have = (:x, :y, :a, :b), want = (:first_cells, :total))
+    cells, total = pointwise(x, y, 0.3, 1.1)
+    @test cells ≈ -0.5 .* (x .- 0.3) .^ 2
+    @test total ≈ reference(x, y, 0.3, 1.1)
+    # Empty domains.
+    @test k(Float64[], Float64[], 0.3, 1.1) == 0.0
+end

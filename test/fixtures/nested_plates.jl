@@ -256,7 +256,10 @@ logsumexp(values) = sum(values)
 end
 end
 
-head_count(ex, head) = ex isa Expr ?
+# A plate loop that runs as a program of its own (`_PlateProgram`) is counted
+# in that program's code.
+head_count(ex, head) = ex isa ReactiveKernels._PlateProgram ? head_count(ex.ast, head) :
+    ex isa Expr ?
     Int(ex.head === head) + sum(x -> head_count(x, head), ex.args; init=0) : 0
 allocated(k::K, args::Vararg{Any,N}) where {K,N} = @allocated k(args...)
 end

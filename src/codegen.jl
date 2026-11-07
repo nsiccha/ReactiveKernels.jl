@@ -4855,6 +4855,205 @@ Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recip
        footprint_programs, footprint_captures, lhs)
 end
 
+# ---------------------------------------------------------------------------
+# Plate programs: each top-level plate loop of a prepared body in a function of
+# its own.
+#
+# Compiled within a body that holds other large plate loops, a loop that
+# vectorizes alone ran scalar: LLVM duplicated the first loop of the body to
+# vectorize it and left the next ones as they were. An RKPPL program with
+# Normal likelihoods over 2000 rows each took 0.22–0.30 ns per row and
+# likelihood with one likelihood, 0.69–0.70 with two and 1.13–1.21 with eight
+# (snag `sampler-type-dif-ea945700`). In a function of its own every loop
+# compiles as a lone loop does: 0.20–0.25 ns at every count.
+#
+# The plate lowering marks each top-level plate's statements (`_PlateBlock`)
+# when asked to (`plate_programs`, set by `_prepare_plan_body`). Once the whole
+# body is lowered, `_extract_plate_programs` turns each marked block of a body
+# with two or more of them into a call of a `_PlateProgram` (a body with one
+# keeps it inline, as before): a function over the names the block reads that the
+# body binds, with each literal `__callables__[k]` it reads passed as an
+# argument of its own (so the callables table the body reads stays
+# `_native_table`'s), returning the names the block binds that the rest of the
+# body reads. `_compile` compiles each `_PlateProgram` as it compiles the body.
+# A block that rebinds a name the rest of the body binds stays inline.
+
+# The first statement of a marked plate block.
+struct _PlateBlock end
+
+"""
+    _PlateProgram(ast)
+
+A plate loop's own function (`ast`, a function expression), called in a
+lowered body where the plate's statements stood. `_compile` replaces it with
+the compiled function; `code_expr` prints its code.
+"""
+struct _PlateProgram
+    ast::Expr
+end
+Base.show(io::IO, program::_PlateProgram) = print(io, '(', program.ast, ')')
+Base.:(==)(a::_PlateProgram, b::_PlateProgram) = a.ast == b.ast
+Base.hash(program::_PlateProgram, h::UInt) = hash(program.ast, hash(_PlateProgram, h))
+
+_plate_block(block::Expr) = Expr(:block, _PlateBlock(), block.args...)
+_is_plate_block(node) = node isa Expr && node.head === :block &&
+    !isempty(node.args) && first(node.args) isa _PlateBlock
+
+# Every symbol `node` names, in first-occurrence order; quoted data and the
+# block `skip` are left out.
+function _program_symbols!(found::Vector{Symbol}, seen::Set{Symbol}, node, skip = nothing)
+    if node isa Symbol
+        node in seen || (push!(seen, node); push!(found, node))
+    elseif node isa Expr && node.head !== :quote && node !== skip
+        for arg in node.args
+            _program_symbols!(found, seen, arg, skip)
+        end
+    end
+    found
+end
+
+# The names `node` binds: assignment targets, loop and `let` variables, and,
+# with `declarations`, names declared `local` without a value.
+function _program_bound!(found::Set{Symbol}, node, skip = nothing; declarations::Bool = true)
+    node isa Expr && node.head !== :quote && node !== skip || return found
+    if node.head === :(=)
+        _program_bound_target!(found, node.args[1])
+    elseif node.head === :local && declarations
+        foreach(arg -> _program_bound_target!(found, arg), node.args)
+    end
+    for arg in node.args
+        _program_bound!(found, arg, skip; declarations)
+    end
+    found
+end
+_program_bound_target!(found, name::Symbol) = push!(found, name)
+function _program_bound_target!(found, target::Expr)
+    if target.head === :(::)
+        _program_bound_target!(found, target.args[1])
+    elseif target.head === :tuple
+        foreach(arg -> _program_bound_target!(found, arg), target.args)
+    elseif target.head === :(=)
+        _program_bound_target!(found, target.args[1])
+    end
+    found
+end
+_program_bound_target!(found, _) = found
+
+_program_parameter(arg::Symbol) = arg
+_program_parameter(arg::Expr) = arg.head === :(::) ? _program_parameter(arg.args[1]) : nothing
+_program_parameter(arg) = nothing
+
+# `node` with each literal `__callables__[k]` replaced by its argument name in
+# `slots` (assigned in first-occurrence order).
+function _program_slot_arguments(node, slots::Vector{Pair{Int,Symbol}})
+    slot = _callable_slot(node)
+    if slot !== nothing
+        index = findfirst(pair -> first(pair) == slot, slots)
+        index === nothing && (push!(slots, slot => Symbol("##plate_callable#", slot));
+                              index = length(slots))
+        return last(slots[index])
+    end
+    node isa Expr && node.head !== :quote || return node
+    Expr(node.head, Any[_program_slot_arguments(arg, slots) for arg in node.args]...)
+end
+
+# `ast` with each marked plate block (`_PlateBlock`) a call of its own
+# `_PlateProgram`, or its statements inline where it rebinds a name the rest of
+# the body binds.
+function _extract_plate_programs(ast::Expr)
+    ast.head in (:function, :->) && length(ast.args) == 2 &&
+        ast.args[1] isa Expr && ast.args[1].head === :tuple || return ast
+    parameters = Set{Symbol}()
+    for arg in ast.args[1].args
+        name = _program_parameter(arg)
+        name === nothing || push!(parameters, name)
+    end
+    blocks = Expr[]
+    collect_blocks(node) = node isa Expr && node.head !== :quote &&
+        (_is_plate_block(node) ? push!(blocks, node) : foreach(collect_blocks, node.args))
+    collect_blocks(ast.args[2])
+    isempty(blocks) && return ast
+    replacements = IdDict{Expr,Any}()
+    for block in blocks
+        statements = block.args[2:end]
+        # A lone plate loop compiles as a lone loop already.
+        if length(blocks) == 1
+            replacements[block] = Expr(:block, statements...)
+            continue
+        end
+        inside = _program_bound!(Set{Symbol}(), block)
+        outside_bound = _program_bound!(Set{Symbol}(), ast.args[2], block;
+                                        declarations = false)
+        outside_used = Set(_program_symbols!(Symbol[], Set{Symbol}(), ast.args[2], block))
+        if !isdisjoint(inside, outside_bound) || !isdisjoint(inside, parameters)
+            replacements[block] = Expr(:block, statements...)
+            continue
+        end
+        outputs = Symbol[name for name in
+                         _program_symbols!(Symbol[], Set{Symbol}(), block)
+                         if name in inside && name in outside_used]
+        slots = Pair{Int,Symbol}[]
+        rewritten = Any[_program_slot_arguments(statement, slots) for statement in statements]
+        reads = _program_symbols!(Symbol[], Set{Symbol}(), Expr(:block, rewritten...))
+        free = Symbol[name for name in reads
+                      if !(name in inside) && (name in parameters || name in outside_bound)]
+        result = isempty(outputs) ? nothing :
+            length(outputs) == 1 ? only(outputs) : Expr(:tuple, outputs...)
+        program = _PlateProgram(Expr(:function,
+            Expr(:tuple, free..., (last(pair) for pair in slots)...),
+            Expr(:block, rewritten..., result)))
+        call = Expr(:call, program, free...,
+                    (Expr(:ref, _CALLABLES_ARG, first(pair)) for pair in slots)...)
+        replacements[block] = isempty(outputs) ? call :
+            Expr(:(=), length(outputs) == 1 ? only(outputs) : Expr(:tuple, outputs...), call)
+    end
+    replace_blocks(node) = node isa Expr && node.head !== :quote ?
+        get(replacements, node) do
+            Expr(node.head, Any[replace_blocks(arg) for arg in node.args]...)
+        end : node
+    Expr(ast.head, ast.args[1], replace_blocks(ast.args[2]))
+end
+
+# `node` with each call of a `_PlateProgram` replaced by that program's
+# statements over the call's arguments: the body `_extract_plate_programs` was
+# given. Ordinary AD differentiates this body (`_ad_inline_plate_programs`).
+function _inline_plate_programs(node)
+    if node isa Expr && node.head === :(=) && node.args[2] isa Expr &&
+            node.args[2].head === :call && first(node.args[2].args) isa _PlateProgram
+        return _inline_plate_program(node.args[2])
+    elseif node isa Expr && node.head === :call && first(node.args) isa _PlateProgram
+        return _inline_plate_program(node)
+    elseif node isa Expr && node.head !== :quote
+        return Expr(node.head, Any[_inline_plate_programs(arg) for arg in node.args]...)
+    end
+    node
+end
+function _inline_plate_program(call::Expr)
+    program = first(call.args)::_PlateProgram
+    parameters = program.ast.args[1].args
+    mapping = Dict{Symbol,Any}()
+    for (parameter, argument) in zip(parameters, call.args[2:end])
+        parameter === argument || (mapping[parameter] = argument)
+    end
+    statements = program.ast.args[2].args[1:end-1]
+    Expr(:block, Any[_substitute_symbols(statement, mapping) for statement in statements]...)
+end
+_substitute_symbols(node::Symbol, mapping) = get(mapping, node, node)
+_substitute_symbols(node::Expr, mapping) = node.head === :quote ? node :
+    Expr(node.head, Any[_substitute_symbols(arg, mapping) for arg in node.args]...)
+_substitute_symbols(node, mapping) = node
+
+_has_plate_programs(node) = node isa _PlateProgram ||
+    node isa Expr && node.head !== :quote && any(_has_plate_programs, node.args)
+
+# `ast` with each `_PlateProgram` compiled as `_compile` compiles `ast`.
+function _compile_plate_programs(ast, context::Module, native_context::GlobalRef)
+    ast isa _PlateProgram && return _compile(ast.ast, context, native_context)
+    ast isa Expr && ast.head !== :quote || return ast
+    Expr(ast.head, Any[_compile_plate_programs(arg, context, native_context)
+                       for arg in ast.args]...)
+end
+
 # A recipe output authored with a type (`weights::Vector{Float64} = ...`) is
 # emitted as a typed local of the NATIVE product: Julia converts the assigned
 # value to the declared type (an identity for a value already of that type, a
@@ -5062,7 +5261,8 @@ function _lower_with_ops_collecting(p::Plan;
                          partition_plan::Bool = false,
                          inline_sources::Bool = _inline_sources_enabled(),
                          shares::Vector{Pair{Int,Symbol}} = Pair{Int,Symbol}[],
-                         cell_have_types = nothing)
+                         cell_have_types = nothing,
+                         plate_programs::Bool = false)
     # The footprint variant (`partition_footprint`, plate_partition.jl): the
     # body records every read of a HAVE port and returns them instead of the
     # wanted values.
@@ -5292,14 +5492,20 @@ function _lower_with_ops_collecting(p::Plan;
                     callvalues, pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
                     input_type_hints = hints)
             else
+                # A plate program of its own (`_extract_plate_programs`) where
+                # the body is compiled whole and keeps no cell tables.
+                own_program = plate_programs && cells === nothing &&
+                    get(task_local_storage(), _CELL_TABLES, nothing) === nothing
+                plate_body = own_program ? Expr(:block) : body
                 _lower_authored_plate_native!(
-                    body, runtime_ops, runtime_recipes, r.op, callargs, callvalues,
+                    plate_body, runtime_ops, runtime_recipes, r.op, callargs, callvalues,
                     pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
                     total_fold,
                     element_type = plate_element_types ?
                         first(_declared_array_layout(valtype(pointwise))) : nothing,
                     input_type_hints = type_hints === nothing ? nothing :
                         Any[type_hints[canon_id(g, v.id)] for v in r.inputs])
+                own_program && push!(body.args, _plate_block(plate_body))
             end
             continue
         end
@@ -6549,6 +6755,7 @@ end
 # unchanged, as `@_native_context` below does: its hygiene qualifies the globals.
 # A package whose lowered bodies name its own functions compiles them this way.
 function _compile(ast::Expr, context::Module, native_context::GlobalRef)
+    ast = _compile_plate_programs(ast, context, native_context)
     ast = _distinguish_module_generations(
         _canonical_embedded(_canonical_locals(_canonical_globals(ast))))
     f = RuntimeGeneratedFunction(context, context, ast)
@@ -8195,13 +8402,15 @@ function _prepare_plan_body(p::Plan; passes = (), bound = (), on_error = nothing
     record = _plan_exemplar_record(exemplars)
     native_ast, constants, callables, recipes = _sharing_cell_plans() do
         _with_plan_exemplars(record) do
-            _lower_with_ops(lowered_plan; exemplar_types)
+            _lower_with_ops(lowered_plan; exemplar_types, plate_programs = true)
         end
     end
     # A plan port typed on the exemplars is called with plans of that type.
     exemplar_types = _plan_typed_exemplars(exemplar_types, record)
     exact_signature = exemplar_types === nothing ? Nothing : Tuple{exemplar_types...}
     isempty(passes) || (native_ast = transform(native_ast, passes...))
+    # Each top-level plate loop in a function of its own (`_PlateProgram`).
+    native_ast = _extract_plate_programs(native_ast)
     # The callables the final body reads; a pass may read one the lowering's
     # body did not (`test_ad.jl`, a source transform over the scan metadata).
     callables = _native_table(native_ast, callables)
