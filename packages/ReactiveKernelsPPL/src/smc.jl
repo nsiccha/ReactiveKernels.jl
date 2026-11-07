@@ -321,7 +321,8 @@ and is rejected rather than omitted. This support can conservatively include
 whole arrays for compound scalar expressions such as `z[1]^2`; direct scalar
 index reads use native locality lowering. Fresh-factor discovery inherits
 [`density_factors`](@ref)'s
-explicit limitations for noncentered scans and stochastic scans inside cells.
+explicit limitation for stochastic scans inside cells; a top-level scan's prior is
+one atomic event, so a window cannot take only some of its steps fresh.
 The likelihood must satisfy native partition locality. Sparse observations
 selecting elements of simplex/ordered slice-transformed arrays currently lack
 an observation row lowering and are rejected; their fresh atomic priors are

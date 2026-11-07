@@ -217,6 +217,31 @@ function prepare_query(built, plan::StructuralPlan, preset::Symbol;
         on_error, exemplars)
 end
 
+"""
+    prepare_query(built, plan, values::Tuple{Vararg{Symbol}}; on_error = nothing,
+                  exemplars = nothing)
+
+Prepare the authored `values` of the model by name, over the same sampler
+boundary as a preset: a definition (`h_out = h[T]`), a recurrence's carried
+array, a per-index output of a `@plate` (`h_out[g] = …`). The kernel maps an
+unconstrained vector to their values, a tuple in that order; one name gives its
+value itself, as one WANT of `ReactiveKernels.prepare` does. A workflow preset
+name is refused (query it with the `Symbol` method). The same tuple is a
+`prepare_query_ad` preset for pullbacks and pushforwards:
+`prepare_query_ad(prepare_ad_pullback, built, plan, (:h_out,), backend, 1.0, u0)`.
+"""
+function prepare_query(built, plan::StructuralPlan, values::Tuple{Vararg{Symbol}};
+        on_error = nothing, exemplars = nothing)
+    isempty(values) && throw(ContractValidationError(
+        "[query] name at least one authored value"))
+    for name in values
+        haskey(WORKFLOW_WANTS, name) && throw(ContractValidationError(
+            "[query] $name is a workflow preset, not an authored value; query it as " *
+            "`prepare_query(built, plan, :$name)`"))
+    end
+    return _prepare_wants(built, plan, values; on_error, exemplars)
+end
+
 # Prepare the built graph over the sampler boundary for one WANT node or a
 # tuple of them (a tuple-WANT kernel returns a tuple in that order).
 function _prepare_wants(built, plan::StructuralPlan, want;
@@ -246,7 +271,8 @@ end
 _same_layout(a::LayoutTable, b::LayoutTable) = a.total == b.total &&
     length(a.entries) == length(b.entries) &&
     all(x.name === y.name && x.offset == y.offset && x.size == y.size &&
-        isequal(x.labels, y.labels) for (x, y) in zip(a.entries, b.entries))
+        isequal(x.labels, y.labels) for (x, y) in zip(a.entries, b.entries)) &&
+    isequal(a.axis_labels, b.axis_labels)
 
 # A built graph evaluates the program its build generated. A binding that
 # generates the same program (other row counts, parameter extents, level labels
@@ -605,14 +631,17 @@ gradient, (hv,), (tv,) = ad_gradient_hvp_and_third(t, (v,), u)  # tv = ∇(vᵀ 
 
 Gradients, Hessian-vector products and third-order derivatives need a scalar
 preset (`:sampler`, `:likelihood`, `:prior`, `:log_jacobian`); pullbacks and
-pushforwards also accept `:pointwise` and `:observations`. Directions with
+pushforwards also accept `:pointwise`, `:observations` and a tuple of authored
+value names (`(:h_out,)`, see `prepare_query`), whose seed has the shape of
+their values. Directions with
 disjoint supports over `coordinate_names(built.layout)` compress
 block-structured Jacobians, Hessians and third-order contractions (see
 `ReactiveKernels.prepare_ad_hvp` and `ReactiveKernels.prepare_ad_third`). The
 backend's packages must be loaded in the calling session.
 """
 function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
-        preset::Symbol, backend, exemplars...; on_error = nothing)
+        preset::Union{Symbol,Tuple{Vararg{Symbol}}}, backend, exemplars...;
+        on_error = nothing)
     built = _binding_build(built, plan)
     layout = built.layout::LayoutTable
     isempty(exemplars) && throw(ContractValidationError(

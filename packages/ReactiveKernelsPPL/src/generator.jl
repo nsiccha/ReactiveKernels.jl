@@ -5600,9 +5600,15 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable;
     for raw in plan.scans
         sc = _resolve_scan(plan, raw)
         if _is_noncentered_scan(sc)
-            density_sites === nothing || throw(ContractValidationError(
-                "[query] authored density factors for noncentered scans are not implemented"))
             _scan_noncentered_prior!(stmts, nodes, sc, plan)
+            density_sites === nothing && continue
+            # The sampled seeds and steps condition on each other through the
+            # trajectory, so the scan's prior is one atomic event owning its
+            # packed block, as a joint law is.
+            zname = _scan_innovation_name(sc)
+            i = findfirst(e -> e.kind === :scan && e.name === zname, layout.entries)
+            i === nothing || _record_density!(density_sites, stmts, :prior, zname, nodes[end];
+                owner = layout.entries[i])
             continue
         end
         gap = _scan_shape_gap(sc)
