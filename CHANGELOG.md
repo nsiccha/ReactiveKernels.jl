@@ -16,6 +16,29 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.108
+
+- A program that calls a child kernel in a generator term, a loop or a lazy arm
+  keeps one prepared type across builds. Such a call embeds objects in the
+  compiled body: the child's source operations, spliced into the caller's
+  source, and a child prepared when its caller is defined, either called under
+  the arm or captured by an operation (an object's in-place endpoint such as
+  `prepared standardized`). The body's content id reads every field of what it
+  embeds, and some fields named the build: an operation's definition token and
+  module, and a prepared child's plan, lowered recipes and value ids. A
+  generator that evaluates every build in a fresh module, as
+  BayesianRegressionModels does, therefore prepared another sampler type for
+  every build of the same program and binding, and compiled it again: an ODL
+  archive target's sampler, rebuilt with the same binding or another data
+  value. The body now embeds an execution copy of each object, of the same
+  type: an operation keeps its record, call identity and throw-stripped twin
+  with one token and no module, and a prepared child keeps its compiled body
+  and tables with an empty plan and recipes and canonical value ids. An object
+  that reaches state a call could write (a `Ref`, a cache cell, a `Core.Box`)
+  is embedded as before. The plan and `code_expr` keep the original objects. A
+  Julia-owned closure (a generator or comprehension body) that holds such
+  objects shares its type across builds the same way.
+
 ## 0.1.107
 
 - A caller that keeps one `partition_plan` per label can make equal arrays of

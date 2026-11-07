@@ -205,6 +205,137 @@ end
     @test isdisjoint(names(types1), names(_det_types(other)))
 end
 
+# A child called in a generator term or under a lazy arm is spliced into the
+# caller's source as its operations' objects (`_kernel_inline_endpoint_call`),
+# and each carries its definition's token and module. A generator such as BRM
+# evaluates both definitions in a fresh module per build, so these differed in
+# every build, and `RuntimeGeneratedFunctions` hashes every field of an embedded
+# object into the body's id: each build prepared another type (snag
+# `sampler-runtimeg-13afd928`, an ODL archive sampler).
+_DET_SPLICED_DEFINITIONS = (
+    :(@kernel _det_spliced_child(y::Float64, mu::Float64, s::Float64) = begin
+        r::Float64 = -abs2((y - mu) / s) / 2 - log(s)
+        return r
+    end),
+    :(@kernel _det_spliced_parent(ys::Vector{Float64}, limit::Float64, mu::Float64,
+                                  s::Float64) = begin
+        total::Float64 = sum(_det_spliced_child(ys[i], mu, s) for i in eachindex(ys))
+        tail::Float64 = limit < mu ? _det_spliced_child(limit, mu, s) : log(s)
+        return total + tail
+    end))
+
+function _det_spliced_build()
+    mod = Module(gensym(:DetBuild))
+    Core.eval(mod, :(using ReactiveKernels))
+    foreach(definition -> Core.eval(mod, definition), _DET_SPLICED_DEFINITIONS)
+    Core.eval(mod, :_det_spliced_parent)
+end
+
+# The source operations a lowered body embeds as objects.
+function _det_embedded_ops!(found, node)
+    value = node isa QuoteNode ? node.value : node
+    value isa ReactiveKernels._KernelSourceOp && return push!(found, value)
+    node isa Expr && foreach(arg -> _det_embedded_ops!(found, arg), node.args)
+    found
+end
+_det_embedded_ops(ast) = _det_embedded_ops!(Any[], ast)
+
+@testset "a spliced child's operations do not name their build" begin
+    RK = ReactiveKernels
+    spec1, spec2 = _det_spliced_build(), _det_spliced_build()
+    k1, k2 = prepare(spec1), prepare(spec2)
+    # The comparison means something only if the bodies embed operations whose
+    # token and module differ between the builds.
+    ops1, ops2 = _det_embedded_ops(code_expr(k1)), _det_embedded_ops(code_expr(k2))
+    @test !isempty(ops1) && length(ops1) == length(ops2)
+    @test all(getfield(a, :token) !== getfield(b, :token) for (a, b) in zip(ops1, ops2))
+    @test all(getfield(a, :mod) isa Module && getfield(a, :mod) !== getfield(b, :mod)
+              for (a, b) in zip(ops1, ops2))
+    @test typeof(k1) === typeof(k2)
+    @test typeof(k1.f) === typeof(k2.f)
+    child(y, mu, s) = -abs2((y - mu) / s) / 2 - log(s)
+    ys = [0.5, -1.0, 2.0]
+    for (limit, mu, s) in ((0.2, 1.0, 0.7), (1.5, 1.0, 0.7))
+        expected = sum(child(y, mu, s) for y in ys) +
+                   (limit < mu ? child(limit, mu, s) : log(s))
+        @test k1(ys, limit, mu, s) == k2(ys, limit, mu, s)
+        @test k1(ys, limit, mu, s) ≈ expected
+    end
+    # The body keeps each operation's record, form, call identity and twin, and
+    # drops only the token and module.
+    for op in ops1
+        copy = RK._embedded_execution_copy(op)
+        @test typeof(copy) === typeof(op)
+        @test getfield(copy, :f) === getfield(op, :f)
+        @test getfield(copy, :form) === getfield(op, :form)
+        @test getfield(copy, :call_identity) === getfield(op, :call_identity)
+        @test getfield(copy, :token) === RK._EMBEDDED_SOURCE_TOKEN
+        @test getfield(copy, :mod) === nothing
+    end
+    twin = RK._kernel_with_ignored_throws(first(ops1), first(ops2))
+    copied = RK._embedded_execution_copy(twin)
+    @test getfield(getfield(copied, :ignored_throws), :token) === RK._EMBEDDED_SOURCE_TOKEN
+    @test getfield(getfield(copied, :ignored_throws), :mod) === nothing
+    @test getfield(getfield(copied, :ignored_throws), :f) === getfield(first(ops2), :f)
+    # Everything else a body embeds is left as it is.
+    ast = :(f($(QuoteNode(1.5)), $(QuoteNode(:x)), y))
+    @test RK._canonical_embedded(ast) == ast
+    @test RK._canonical_embedded(ast).args[2] === ast.args[2]
+    # An embedded object that reaches state a call could write keeps its build's
+    # names, so two builds never share it.
+    stateful = (first(ops1), Ref(1.0))
+    @test RK._canonical_embedded(:(f($(QuoteNode(stateful))))).args[2].value === stateful
+    data = (first(ops1), [1.0, 2.0])
+    copied_data = RK._canonical_embedded(:(f($(QuoteNode(data))))).args[2].value
+    @test getfield(copied_data[1], :token) === RK._EMBEDDED_SOURCE_TOKEN
+    @test copied_data[2] === data[2]
+end
+
+# A child holding a plate, called under a lazy arm, is prepared when its caller
+# is defined and embedded in the caller's body whole (`_KernelPreparedChild`):
+# its plan and recipes carry the value ids of its build.
+_DET_ARM_CHILD_DEFINITIONS = (
+    :(@kernel _det_arm_child(ys::Vector{Float64}, mu::Float64) = begin
+        out::Vector{Float64} = plate(ys) do y
+            -abs2(y - mu) / 2
+        end
+        return sum(out)
+    end),
+    :(@kernel _det_arm_parent(ys::Vector{Float64}, limit::Float64, mu::Float64) = begin
+        tail::Float64 = limit < mu ? _det_arm_child(ys, mu) : 0.0
+        return tail
+    end))
+
+function _det_arm_build()
+    mod = Module(gensym(:DetBuild))
+    Core.eval(mod, :(using ReactiveKernels))
+    foreach(definition -> Core.eval(mod, definition), _DET_ARM_CHILD_DEFINITIONS)
+    Core.eval(mod, :_det_arm_parent)
+end
+
+@testset "a prepared child under a lazy arm does not name its build" begin
+    RK = ReactiveKernels
+    k1, k2 = prepare(_det_arm_build()), prepare(_det_arm_build())
+    children(ast) = (found = Any[];
+        walk(n) = (n isa QuoteNode && n.value isa RK._KernelPreparedChild && push!(found, n.value);
+                   n isa Expr && foreach(walk, n.args));
+        walk(ast); found)
+    c1, c2 = children(code_expr(k1)), children(code_expr(k2))
+    @test length(c1) == 1 && length(c2) == 1
+    @test only(c1).kernel.plan.have != only(c2).kernel.plan.have  # distinct builds' value ids
+    @test typeof(k1) === typeof(k2)
+    ys = [0.5, 1.0, -0.25]
+    @test k1(ys, 0.2, 1.0) == k2(ys, 0.2, 1.0)
+    @test k1(ys, 0.2, 1.0) ≈ sum(-abs2(y - 1.0) / 2 for y in ys)
+    @test k1(ys, 2.0, 1.0) == 0.0
+    # The body's copy calls the same compiled child.
+    copy = RK._embedded_execution_copy(only(c1))
+    @test typeof(copy) === typeof(only(c1))
+    @test copy.kernel.f === only(c1).kernel.f
+    @test copy(ys, 1.0) == only(c1)(ys, 1.0)
+    @test isempty(copy.kernel.plan.recipes)
+end
+
 @testset "a generated name is a function of the definition and its position" begin
     RK = ReactiveKernels
     fingerprint = RK._kernel_source_fingerprint

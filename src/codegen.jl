@@ -6548,7 +6548,8 @@ end
 # unchanged, as `@_native_context` below does: its hygiene qualifies the globals.
 # A package whose lowered bodies name its own functions compiles them this way.
 function _compile(ast::Expr, context::Module, native_context::GlobalRef)
-    ast = _distinguish_module_generations(_canonical_locals(_canonical_globals(ast)))
+    ast = _distinguish_module_generations(
+        _canonical_embedded(_canonical_locals(_canonical_globals(ast))))
     f = RuntimeGeneratedFunction(context, context, ast)
     image = _image_program(f)
     image === nothing || return image
@@ -6614,6 +6615,133 @@ function _canonical_locals(ast::Expr)
         node isa Expr || return node
         node.head === :quote && return node
         Expr(node.head, map(walk, node.args)...)
+    end
+    walk(ast)
+end
+
+# A body embeds objects: a composed call splices the source operations of the
+# endpoint it inlines into its own source (`$(QuoteNode(op))`,
+# `_kernel_inline_endpoint_call`), a lazy arm calls a child prepared when its
+# caller was defined (`_KernelPreparedChild`), and a spliced operation's record
+# holds the values its source captured, a prepared child among them (an
+# object's in-place endpoint, `prepared standardized`). `RuntimeGeneratedFunctions`
+# hashes every field of what a body embeds into the body's content id, which
+# the callable's type carries. Some of those fields name the build rather than
+# the computation: a source operation's definition token (the process-global
+# `gensym` counter, which composition merges recipes on) and its module (BRM
+# creates one per build, `##RKEmittedModels#N`), and a prepared child's plan,
+# lowered AST and recipes, whose value ids come from a process-global counter
+# whose namespace's count changes with every value allocated. So every build of
+# one program compiled another body of another type, and every reader of it
+# compiled again (snag `sampler-runtimeg-13afd928`: an ODL archive sampler, one
+# new type per build of the same binding).
+#
+# The body therefore embeds an execution copy of each object, of the same type:
+# what a call reads (a source operation's record, form, call identity and
+# throw-stripped twin; a prepared kernel's compiled body and its tables) is
+# kept and copied in turn, and what names the build is replaced. A source
+# operation takes one token and no module, a value an id in a namespace that
+# allocates nothing, numbered in order of first occurrence in the body, and a
+# prepared kernel an empty plan, AST and recipes. Captured values and data stay,
+# so bodies that run different code or read different values keep different
+# ids. Two bodies that agree up to these names share one cached body, whose
+# objects are the first one's. That is sound only for objects no call writes,
+# so an object that reaches mutable state other than an array of bits or an
+# expression (a `Ref`, a cache cell, a `Core.Box`, a dictionary) is embedded as
+# it is: its body keeps its own id, as before. An array of bits is data, which a
+# kernel only reads, and an expression is code.
+# The plan, `lowered_recipes` and `code_expr` keep the original objects.
+const _EMBEDDED_SOURCE_TOKEN = :rk_srcop
+const _EXECUTION_NAMESPACE = ValueNamespace(UInt(0))
+const _EXECUTION_PLAN = Plan(Graph(), Value[], Value[], Recipe[], Dict{ValueId,Recipe}(),
+                             0.0, Recipe[])
+const _EXECUTION_RECIPE = Recipe(0, (), (), nothing, 0.0, nothing, false)
+const _EXECUTION_AST = Expr(:block)
+
+# One body's copies: value ids and generated names in order of first
+# occurrence, each object copied once, and whether a copy reached state.
+mutable struct _ExecutionCopier
+    ids::Dict{ValueId,Int}
+    names::Dict{Symbol,Symbol}
+    copies::IdDict{Any,Any}
+    stateful::Bool
+end
+_ExecutionCopier() = _ExecutionCopier(Dict{ValueId,Int}(), Dict{Symbol,Symbol}(),
+                                      IdDict{Any,Any}(), false)
+
+# The execution copy of `x` alone.
+_embedded_execution_copy(@nospecialize(x)) = _execution_copy(_ExecutionCopier(), x)
+
+Base.@nospecializeinfer function _execution_copy(c::_ExecutionCopier, @nospecialize(x))
+    # Julia declares these mutable, but nothing writes them.
+    x isa Union{Symbol,String,Module,Type} && return x
+    T = typeof(x)
+    if ismutabletype(T)
+        # Data and code; anything else may be written by a call.
+        x isa Array && isbitstype(eltype(x)) || x isa Expr || (c.stateful = true)
+        return x
+    end
+    (isbitstype(T) || !isstructtype(T)) && return x
+    haskey(c.copies, x) && return c.copies[x]
+    y = _execution_copy_object(c, x)
+    c.copies[x] = y
+    y
+end
+
+# An immutable object with each field copied; the object itself when no field changes.
+Base.@nospecializeinfer function _execution_copy_object(c::_ExecutionCopier, @nospecialize(x))
+    n = nfields(x)
+    fields = Vector{Any}(undef, n)
+    changed = false
+    for i in 1:n
+        isdefined(x, i) || return x
+        field = getfield(x, i)
+        copy = _execution_copy(c, field)
+        changed |= copy !== field
+        fields[i] = copy
+    end
+    changed ? _kernel_new_instance(typeof(x), Tuple(fields)) : x
+end
+
+_execution_name(c::_ExecutionCopier, name::Symbol) =
+    _lowering_gensym(name) ? get!(c.names, name) do
+        Symbol(replace(String(name), r"#\d+" => ""), '#', length(c.names) + 1)
+    end : name
+
+Base.@nospecializeinfer _execution_copy_object(c::_ExecutionCopier,
+                                               @nospecialize(id::ValueId)) =
+    ValueId(_EXECUTION_NAMESPACE, get!(() -> length(c.ids) + 1, c.ids, id))
+
+Base.@nospecializeinfer _execution_copy_object(c::_ExecutionCopier,
+                                               @nospecialize(v::Value)) =
+    _kernel_new_instance(typeof(v), (_execution_copy(c, getfield(v, :id)),
+                                     _execution_name(c, getfield(v, :name))))
+
+Base.@nospecializeinfer function _execution_copy_object(c::_ExecutionCopier,
+                                                        @nospecialize(op::_KernelSourceOp))
+    _KernelSourceOp(Val(_EMBEDDED_SOURCE_TOKEN), Val(getfield(op, :form)),
+                    _execution_copy(c, getfield(op, :f)),
+                    _execution_copy(c, getfield(op, :ignored_throws)),
+                    _execution_copy(c, getfield(op, :call_identity)), nothing)
+end
+
+# `ast` with each object it embeds replaced by its execution copy, unless the
+# copy reached state.
+function _canonical_embedded(ast::Expr)
+    function embedded(value)
+        c = _ExecutionCopier()
+        copy = _execution_copy(c, value)
+        c.stateful ? value : copy
+    end
+    function walk(node)
+        if node isa QuoteNode
+            value = embedded(node.value)
+            return value === node.value ? node : QuoteNode(value)
+        end
+        node isa Union{Symbol,LineNumberNode,GlobalRef,Number,String,Nothing} && return node
+        node isa Expr || return embedded(node)
+        node.head === :quote && return node
+        Expr(node.head, Any[walk(arg) for arg in node.args]...)
     end
     walk(ast)
 end
@@ -7020,6 +7148,21 @@ end
 # The `exact_signature` a prepared kernel was built with.
 _exact_signature(@nospecialize(kernel::PreparedKernel)) =
     (typeof(kernel)::DataType).parameters[7]
+
+# A prepared kernel a body embeds (`_canonical_embedded`): a call reads its
+# compiled body and tables, which are copied in turn; its plan, AST, lowered
+# recipes and rebinding name the build it was prepared in and are replaced by
+# empty ones of the same types.
+Base.@nospecializeinfer function _execution_copy_object(c::_ExecutionCopier,
+                                                        @nospecialize(k::PreparedKernel))
+    recipes = getfield(k, :lowered_recipes)
+    all(r -> r isa Recipe, recipes) || (c.stateful = true; return k)
+    _executed_prepared_kernel(
+        _execution_copy(c, getfield(k, :f)), _execution_copy(c, getfield(k, :constants)),
+        _execution_copy(c, getfield(k, :callables)), _execution_copy(c, getfield(k, :inputs)),
+        _execution_copy(c, getfield(k, :outputs)), _EXECUTION_PLAN, _EXECUTION_AST,
+        ntuple(_ -> _EXECUTION_RECIPE, length(recipes)), _exact_signature(k), nothing)
+end
 
 # One operation per lowered recipe of a prepared kernel (`_table_ops`).
 Base.@nospecializeinfer _kernel_ops(@nospecialize(kernel::PreparedKernel)) =
