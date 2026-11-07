@@ -16,6 +16,29 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.117
+
+- A partition query or sampler (`prepare_partition`,
+  `prepare_partition_sampler`) keeps less per label. A label's plan held its
+  rows and gathered data once for every statement reading them, and a
+  shared-prefix sampler keeps two plans per label; on BRM's minibatch SVI
+  target for a toy with one station per unit, one label's four plans held 82
+  small arrays with 11 distinct contents. Equal arrays of the plans of one
+  preparation are now one object (ReactiveKernels 0.1.106). The plans are also
+  stored once per label, in a label-indexed `AbstractDict` (`q.plans` and
+  `s.plans` read as before), where a `Dict` kept about two inline slots of each.
+- A density catalogue (`density_factors`) no longer keeps a copy of its
+  binding's data. It kept one to refuse a selection's query after an in-place
+  change of the bound data, and now keeps a hash of every element of it
+  instead, which refuses the same queries.
+- Measured on that SVI target (BRM `2c9500f4`, 128 to 512 units, live heap with
+  each object counted once): the partition sampler from 5.6 to 3.1 KB per unit
+  (6.4 to 2.7 KB with `field_states = :units`), its value query from 2.8 to 1.8
+  KB, the model's own value query from 2.0 to 1.1 KB, and the catalogue's copy,
+  2.5 KB per unit, is gone. Values and gradients are unchanged. Per-unit factor
+  queries (`prepare_query_ad(...; coordinates = :support)`, about 7 KB per unit
+  there) are unchanged.
+
 ## 0.1.116
 
 - Authored-factor queries (`prepare_query` and `prepare_query_ad` over
