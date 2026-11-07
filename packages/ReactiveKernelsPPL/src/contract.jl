@@ -708,9 +708,9 @@ thresholds, or a shared simplex), packed as one contiguous block:
   a finite positive literal), packing K(K−1)/2 thetas.
 
 `size` is the constrained length (K−1 for thresholds, K for a simplex),
-or a data-only expression resolved at bind. `nothing` fills from a linked
-response or concentration. Element prior arguments may be scalar literals,
-data or declared values. K=1 is uniform: zero-length
+or a bound name or data-only expression resolved at bind. `nothing` fills
+from a linked response or concentration. Element prior arguments may be
+scalar literals, data or declared values. K=1 is uniform: zero-length
 threshold vectors carry no statements/prior/Jacobian, a 1-simplex is
 the constant `[1.0]`, and a 1×1 LKJ factor packs zero thetas
 (constraining to `[1.0]` with a `0.0` prior node — Stan's K=1 LKJ).
@@ -721,17 +721,18 @@ struct VectorParameter
     name::ParamName
     family::Symbol
     args::NamedTuple
-    size::Union{Nothing,Int,Expr}
+    size::Union{Nothing,Int,Symbol,Expr}
     label::Symbol
     # Retain whole-value sizing dependencies after `size` resolves at bind.
-    extent_expr::Union{Nothing,Expr}
+    extent_expr::Union{Nothing,Symbol,Expr}
 end
 VectorParameter(name::ParamName, family::Symbol, args::NamedTuple,
-    size::Union{Nothing,Int,Expr}, label::Symbol) =
-    VectorParameter(name, family, args, size, label, size isa Expr ? size : nothing)
+    size::Union{Nothing,Int,Symbol,Expr}, label::Symbol) =
+    VectorParameter(name, family, args, size, label,
+        size isa Union{Symbol,Expr} ? size : nothing)
 """Provenance defaults to the parameter's own name."""
 VectorParameter(name::ParamName, family::Symbol, args::NamedTuple,
-    size::Union{Nothing,Int,Expr}) =
+    size::Union{Nothing,Int,Symbol,Expr}) =
     VectorParameter(name, family, args, size, name)
 
 """
@@ -4392,7 +4393,7 @@ const _JOINT_FACTOR_FAMILIES = (:positive_exponential, :cholesky_corr_lkj)
 # `_validate_responses`. Vector declarations can have several readers.
 function _validate_vector_parameters(plan::StructuralPlan)
     for p in plan.vector_parameters
-        p.size isa Expr && !haskey(_VECTOR_ELEMENT_FAMILIES, p.family) &&
+        p.size isa Union{Symbol,Expr} && !haskey(_VECTOR_ELEMENT_FAMILIES, p.family) &&
             _fail(p.label, "family $(p.family) needs a concrete integer size")
         haskey(VECTOR_ARITY, p.family) || _fail(p.label,
             "vector family $(p.family) unknown (admitted: ordered_normal, " *
@@ -4467,7 +4468,7 @@ function _validate_vector_parameters(plan::StructuralPlan)
                 nu isa Real && nu <= 0 && _fail(p.label,
                     "element prior degrees of freedom must be positive")
             end
-            p.size === nothing || p.size isa Expr || p.size >= 0 || _fail(p.label,
+            p.size === nothing || p.size isa Union{Symbol,Expr} || p.size >= 0 || _fail(p.label,
                 "threshold size must be ≥ 0, got $(p.size)")
         end
     end
@@ -9177,7 +9178,7 @@ function _resolve_vector_extent(p::VectorParameter, plan, columns, responses)
         name = responses[reader].response
         haskey(columns,name) || _fail(p.label,"vector $(p.name) length needs bound data $name")
         extent = length(DataAPI.levels(columns[name])) - 1
-    elseif extent isa Expr
+    elseif extent isa Union{Symbol,Expr}
         definitions = Dict(a.name => a.expr for a in
             (plan === nothing ? () : _definitions(plan)))
         active = Set{Symbol}()

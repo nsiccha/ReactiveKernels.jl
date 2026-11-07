@@ -321,6 +321,52 @@ _extent_support(n) = (geometry = (n = n,),)
         @test occursin("view(unconstrained, 1:2)",
             string(kernel_expr(fit, build_kernel(fit).layout)))
     end
+    @testset "a bound name sizes ordered and stopping thresholds" begin
+        # BRM binds a threshold count beside the data, as it binds an array
+        # axis or an LKJ dimension (snag `rkppl-threshold-932a2e27`). The bare
+        # name is that count; the program reads it like `K - 1` above.
+        cumulative_lp(c, eta, k) = k == 1 ? log(logistic(c[1] - eta)) :
+            k == length(c) + 1 ? log1p(-logistic(c[end] - eta)) :
+            log(logistic(c[k] - eta) - logistic(c[k - 1] - eta))
+        stopping_lp(t, eta, k) =
+            sum((log1p(-logistic(t[j] - eta)) for j in 1:k-1); init = 0.0) +
+            (k == length(t) + 1 ? 0.0 : log(logistic(t[k] - eta)))
+        data = [(n_cuts = 2, x = [0.4, -0.3, 0.9], k = [1, 2, 3]),
+            (n_cuts = 3, x = [0.4, -0.3, 0.9, 0.1], k = [1, 2, 3, 4])]
+        want(lp, name) = (v, d) -> _normals(v.b) + _normals(v[name]) +
+            sum(lp.(Ref(v[name]), v.b .* d.x, d.k))
+        for (source, lp, name) in (
+                (quote
+                    b ~ Normal(0, 1)
+                    c ~ Ordered(Normal(0, 1), n_cuts)
+                    k .~ OrderedLogistic.(b .* x, Ref(c))
+                end, cumulative_lp, :c),
+                (quote
+                    b ~ Normal(0, 1)
+                    c ~ Ordered(Normal(0, 1), n_cuts)
+                    k .~ Ordinal.(Cumulative(), LogitLink(), b .* x, Ref(c))
+                end, cumulative_lp, :c),
+                (quote
+                    b ~ Normal(0, 1)
+                    t[1:n_cuts] .~ Normal.(0, 1)
+                    k .~ Ordinal.(StoppingRatio(), LogitLink(), b .* x, Ref(t))
+                end, stopping_lp, :t))
+            programs = _extent_check(source, data, want(lp, name); conditioned = (:k,))
+            @test occursin("n_cuts", string(first(programs)))
+            plan = lower_rkppl(source, first(data); conditioned = (:k,))
+            for bad in (1.5, -1, true)
+                @test_throws "length must be a nonnegative integer" bind_data(plan,
+                    merge(first(data), (n_cuts = bad,)))
+            end
+        end
+        # A sampled value cannot set the structural coordinate pack at bind.
+        live = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                c ~ Ordered(Normal(0, 1), a)
+                k .~ OrderedLogistic.(0.0, Ref(c))
+            end, (k = [1, 2, 3],); conditioned = (:k,))
+        @test_throws "needs data-only value a" bind_data(live, (k = [1, 2, 3],))
+    end
     @testset "data-derived transform bounds are inputs, not numbers" begin
         programs = _extent_check(quote
                 floor_ = minimum(x) / 2
