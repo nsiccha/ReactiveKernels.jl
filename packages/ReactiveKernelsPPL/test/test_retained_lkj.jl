@@ -147,7 +147,9 @@ end
 end
 
 @testset "declared LKJ factors retain triangular iteration" begin
-    counts = Int[]
+    # A literal K and a data K are two declarations: each keeps one emitted
+    # body for every K (a data K reads its dimension, `test_bound_array_extents.jl`).
+    counts = Dict(false => Int[], true => Int[])
     for literal in (false, true), eta in (1.0, 2.3), K in (1, 2, 4, 8)
         fx = _rlkj_case(K, eta; literal)
         original = deepcopy(fx.data)
@@ -158,10 +160,9 @@ end
         @test coordinate_names(fx.built.layout) == [Symbol("L.", i) for i in eachindex(u)]
         k = prepare_query(fx.built, fx.bound, :sampler)
         @test Base.invokelatest(k, u) ≈ _rlkj_oracle(fx, u) rtol = 1e-12
-        factor = Base.invokelatest(prepare, fx.built.spec;
-            have = :unconstrained, want = :L)
+        # A data K is read from the data, so the cut names it (`rkppl-use` §14).
+        L = _query(fx.built.spec, fx.bound, :L, u)
         # Exact arithmetic/packing parity, including the empty K=1 slice.
-        L = Base.invokelatest(factor, u)
         @test L == lkj_chol_constrain(u, K)
         @test istril(L)
         @test all(i -> sum(abs2, L[i, :]) ≈ 1, 1:K)
@@ -175,9 +176,9 @@ end
         @test grad ≈ _rlkj_gradient(fx, u) rtol = 1e-10 atol = 1e-11
         @test fx.data == original
         @test u == [0.3 * sin(i) for i in eachindex(u)]
-        K > 1 && push!(counts, length(fx.built.spec.graph.recipes))
+        K > 1 && push!(counts[literal], length(fx.built.spec.graph.recipes))
     end
-    @test allequal(counts)
+    @test all(allequal, values(counts))
 end
 
 @testset "conditioned LKJ factors retain the same diagonal prior" begin

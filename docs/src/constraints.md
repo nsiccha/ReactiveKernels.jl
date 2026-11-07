@@ -159,9 +159,10 @@ compilation, not the model's source, and it binds no generated program to a size
 RKPPL's generated program reads packed positions, axis lengths, scan lengths,
 ordered level counts and data-derived transform bounds from the data it already
 has, so one program serves every extent and value of one declaration
-(`test_bound_array_extents.jl`), and so does an external law's packed range and
-shape (`test_graph_geometry.jl`). Known remaining paths, which are limitations
-to fix and not precedents, are listed under ReactiveKernelsPPL 0.1.108 in its
+(`test_bound_array_extents.jl`), including a declared LKJ factor's dimension,
+and so does an external law's packed range and shape (`test_graph_geometry.jl`).
+Known remaining paths, which are limitations to fix and not precedents, are
+listed under ReactiveKernelsPPL 0.1.108 in its
 changelog, less those a later entry removes. A prepared type may still depend on which data-bound branch arms
 have lanes ("Data-bound branches in plate cells"), which the lazy-branch
 constraint above requires.
