@@ -16,6 +16,28 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.113
+
+- `prepare_partition` and `prepare_partition_sampler` lower their partition
+  kernels from the exemplar point (`u0`) and the first label, as
+  `prepare_cell_query` already lowers its kernel from `u0`. A value whose
+  producer branches on a type, such as BRM's `flatten_cells`
+  (`eltype(cells) <: Number ? cells : reduce(vcat, cells)`), now takes its typed
+  arm and is computed at each partition's rows. A response that reads such a
+  collected plate value whole, `y .~ Normal.(flatten_cells(cells), sd)`, then
+  reads only its own partition's coordinates, as the cell query's footprint of
+  the same cells already said. Before, the value was computed whole:
+  `locality = :error` refused it, and with `partitioned` each partition read
+  every unit's coordinates of that value and was refused with
+  `PartitionSeparabilityError`.
+- **Breaking:** a `PartitionQuery`'s `q.kernel` is typed for a
+  `Vector{Float64}` point and the first label's type, as a `CellQuery`'s kernel
+  is. `q(u, label)` still takes any point and label type, preparing a kernel for
+  a new pair once. A direct `q.kernel(u, label, plan)` call, and
+  `ReactiveKernels.partition_footprint(q.kernel, u, label, nothing)`, need such a
+  point and label: convert the point with `Vector{Float64}(u)`. A key column with
+  no label is refused by name.
+
 ## 0.1.112
 
 - `prepare_sampler(...; nonallocating = true)` keeps one type across the values
