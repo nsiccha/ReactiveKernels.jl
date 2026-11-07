@@ -738,7 +738,11 @@ or a bound-only cell value that the pass has already evaluated per lane.
 
 1. The condition is evaluated once per lane, and the lanes are grouped by
    outcome.
-2. The plate becomes one plate per taken arm, each over that arm's lanes.
+2. The plate becomes one plate per arm, each over that arm's lanes. An arm
+   that no lane takes is a plate over no lanes, so the prepared program
+   follows the cell and not this binding's outcomes: data that moves every
+   lane into one arm, or an empty domain, keeps the type of a binding whose
+   lanes take both arms.
 3. The plate's arguments follow the arm's lanes:
    - bound arguments are gathered during preparation;
    - live arguments are gathered at run time by constant lane indices; native
@@ -764,7 +768,8 @@ own as described below) that holds work over shared plate arguments or bound
 values becomes that graph's recipes in its plate, as in the native
 shared-condition lowering. Its work over a live shared argument therefore runs
 once per call, above the lane loop, and only when some lane takes the arm. Its
-work over bound values runs at preparation, on the arm's lanes only: under
+work over bound values runs at preparation, on the arm's lanes only, and not
+at all for an arm without lanes: under
 `noise > 0 ? normal(mu, noise).logpdf(y) : -Inf` with `noise` and `y` bound,
 `log(noise)` is one value of the binding, read at run time like any other bound
 value, and a nonpositive `noise` takes the fallback arm without evaluating it.
@@ -780,12 +785,15 @@ receives one:
 - every lane evaluates exactly the arm it takes;
 - gathers inside an arm are in bounds by construction.
 
-An empty bound domain has no lanes to group. It runs no cell and evaluates no
-condition. Its result is empty, with the element type inferred from the
-authored native cell, as in Julia's empty broadcast.
+An empty bound domain has no lanes to group. It is split like any other, into
+arm plates over no lanes, and evaluates no per-lane condition and no cell. Its
+result is empty, with the element type inferred from the authored native cell,
+as in Julia's empty broadcast.
 
-The number of arm plates is bounded by the cell's branch structure, never by
-the data. A condition that reads a live value stays an ordinary lazy branch.
+The number of arm plates is fixed by the cell's branch structure, never by
+the data. A lane-invariant condition, one that reads bound numbers alone,
+still selects its arm statically, so another value of such a number that
+selects the other arm prepares another program. A condition that reads a live value stays an ordinary lazy branch.
 This includes the shape of a live array, such as `length(c)` of a runtime
 input. Only one-dimensional plate domains are split.
 

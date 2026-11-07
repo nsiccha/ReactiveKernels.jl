@@ -16,6 +16,27 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.109
+
+- A plate cell's lazy branch whose condition reads bound data keeps one
+  prepared program whichever arms the binding's lanes take. Preparation splits
+  such a plate into one plate per arm; it used to drop an arm that no lane
+  takes and to leave a plate with no lanes unsplit, so data whose lanes all
+  took one arm, or that had none, prepared another program and compiled again:
+  an RKPPL censored response with a bound scale, for example, whose rows were
+  all observed or all at their censoring bound. Every arm is now a plate, over
+  no lanes when none takes it, and a domain of no lanes is split too. Such an
+  arm evaluates nothing: its shared work stays behind the plate's nonempty
+  guard, and its work over bound values, such as `log(s)` of a bound scale, is
+  not run at preparation, so an invalid value on an arm no lane takes still
+  never throws. An arm of one lane now splits a nested branch as arms of more
+  lanes or none do. Values and gradients are unchanged. A binding whose lanes
+  all take one arm pays for the other arm's empty plate and reads its live
+  arguments through lane indices, as a mixed binding always has. A condition
+  that reads bound numbers alone still selects its arm at preparation, and a
+  bound singleton beside live arguments of unknown length (a plate of one row)
+  still prepares its own program.
+
 ## 0.1.108
 
 - A program that calls a child kernel in a generator term, a loop or a lazy arm

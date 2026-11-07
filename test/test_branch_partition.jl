@@ -92,12 +92,16 @@ end
         C.arm_calls[] = 0
         @test bound(x) ≈ reference_guarded(x, y)
         @test C.arm_calls[] == count(>(0), y)
-        # A one-sided condition selects its arm statically: one plate, no branch.
+        # Lanes that all take one arm keep both arm plates, the other over no
+        # lanes, so the program is the one a mixed binding prepares.
         ypos = abs.(y) .+ 0.5
         one = prepare(C.guarded; have = (:x, :y), want = :total, bound = (; y = ypos))
-        @test length(plates(one.plan)) == 1
-        @test !has_branch(plate_body(only(plates(one.plan))))
+        @test length(plates(one.plan)) == 2
+        @test !any(r -> has_branch(plate_body(r)), plates(one.plan))
+        @test typeof(one) == typeof(bound)
+        C.arm_calls[] = 0
         @test one(x) ≈ reference_guarded(x, ypos)
+        @test C.arm_calls[] == length(x)
     end
 
     @testset "a taken arm's shared work runs once per call" begin
@@ -110,13 +114,16 @@ end
         @test C.arm_calls[] == 1
         ypos = abs.(y) .+ 0.5
         one = prepare(C.guarded_counted_shared; have, want = :total, bound = (; y = ypos))
-        @test length(plates(one.plan)) == 1
+        @test length(plates(one.plan)) == 2
+        @test typeof(one) == typeof(bound)
         C.arm_calls[] = 0
         @test one(x, 2.5) ≈ ref(x, ypos, 2.5)
         @test C.arm_calls[] == 1
-        # No lane takes the arm: its shared work is not evaluated.
+        # No lane takes the arm: its plate has no lanes and its shared work is
+        # not evaluated, even where it would throw (`log(-1.0)`).
         yneg = -abs.(y)
         none = prepare(C.guarded_counted_shared; have, want = :total, bound = (; y = yneg))
+        @test typeof(none) == typeof(bound)
         C.arm_calls[] = 0
         @test none(x, -1.0) ≈ ref(x, yneg, 1.0)
         @test C.arm_calls[] == 0
@@ -279,11 +286,13 @@ end
         pointwise = prepare(C.constant_fallback; have = (:x, :y),
                             want = :pointwise, bound = (; y))
         @test pointwise(x) ≈ [yi > 0 ? xi * yi : 1.0 for (xi, yi) in zip(x, y)]
-        # All lanes take the constant arm: selected statically, still per lane.
+        # All lanes take the constant arm, still per lane; the other arm's
+        # plate has no lanes.
         yneg = -abs.(y)
         allconst = prepare(C.constant_fallback; have = (:x, :y), want = :total,
                            bound = (; y = yneg))
-        @test length(plates(allconst.plan)) == 1
+        @test length(plates(allconst.plan)) == 2
+        @test typeof(allconst) == typeof(bound)
         @test allconst(x) ≈ length(x)
     end
 
@@ -313,6 +322,104 @@ end
                 [yi > 0 ? log(xi * yi) : xi - 1.0 for (xi, yi) in zip(x, y)]
             @test bound(x) ≈ expected
         end
+    end
+end
+
+# One program serves every binding of a data-bound branch, whichever arms its
+# lanes take, an empty domain included: an arm no lane takes is a plate over no
+# lanes. A prepared type that followed the outcomes made another binding of the
+# same program compile again (snag `sampler-type-dif-ea945700`: censored soil
+# rows that were all detected, or all censored, recompiled ODL's sampler).
+@testset "one prepared type whichever arms the lanes take" begin
+    C = BranchPartition
+    RK = ReactiveKernels
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    plates(p) = filter(r -> r.op isa RK._AuthoredPlateOp, p.recipes)
+    has_branch(p) = any(r -> r.op isa RK._KernelSourceOp &&
+                             r.op.f isa RK._KernelBranch, p.recipes)
+    x = [0.5, 1.5, 2.0, 0.25, 3.0]
+    lanes = (; mixed = [1.0, -2.0, 0.5, -1.0, 2.0], then = [1.0, 2.0, 0.5, 1.0, 2.0],
+             other = -[1.0, 2.0, 0.5, 1.0, 2.0])
+    cell(xi, yi) = yi > 0 ? log(xi * yi) : xi - 1.0
+    for want in (:total, :pointwise)
+        prepared = Dict(name => prepare(C.guarded; have = (:x, :y), want,
+                                        bound = (; y))
+                        for (name, y) in pairs(lanes))
+        empty = prepare(C.guarded; have = (:x, :y), want, bound = (; y = Float64[]))
+        @test allequal(typeof.([values(prepared)..., empty]))
+        for (name, y) in pairs(lanes)
+            k = prepared[name]
+            @test length(plates(k.plan)) == 2
+            @test !any(r -> has_branch(plate_body(r)), plates(k.plan))
+            # Only the taken arm is evaluated, on its own lanes.
+            C.arm_calls[] = 0
+            @test k(x) ≈ (want === :total ? sum(cell.(x, y)) : cell.(x, y))
+            @test C.arm_calls[] == count(>(0), y)
+        end
+        @test empty(Float64[]) == (want === :total ? 0.0 : Float64[])
+        want === :total || continue
+        ads = Dict(name => prepare_ad(k, backend, x; active = :x)
+                   for (name, k) in prepared)
+        @test allequal(typeof.(collect(values(ads))))
+        for (name, y) in pairs(lanes)
+            value, gradient = RK.ad_value_and_gradient!(ads[name], similar(x), x)
+            @test value ≈ sum(cell.(x, y))
+            @test gradient ≈ [yi > 0 ? inv(xi) : 1.0 for (xi, yi) in zip(x, y)]
+        end
+        ad = prepare_ad(empty, backend, Float64[]; active = :x)
+        @test RK.ad_value_and_gradient!(ad, Float64[], Float64[]) == (0.0, Float64[])
+    end
+
+    # Nested arms: every arm of every level is a plate, also where no lane
+    # reaches it, and a nested condition is still evaluated on its lanes only
+    # (the interior arm reads `cuts[l - 1]`, out of bounds on first-level lanes).
+    eta = [0.3, -0.2, 0.9, 0.1, -0.4, 0.6, 0.2, -0.7]
+    w = [1.0, 0.5, 2.0, 1.5, 1.0, 0.25, 1.0, 2.0]
+    cuts = [-1.0, 0.0, 1.5]
+    K = length(cuts) + 1
+    leveled(level) = sum(wi * (l == 1 ? cuts[1] - e :
+        (l == K ? e - cuts[end] : cuts[l] * e - cuts[l - 1]))
+        for (l, e, wi) in zip(level, eta, w); init = 0.0)
+    levels = ([1, 2, 4, 3, 1, 4, 2, 3], [1, 4, 4, 1, 1, 4, 1, 4], fill(1, 8),
+              [2, 3, 2, 3, 2, 3, 2, 3], fill(4, 8))
+    have = (:eta, :level, :cuts, :w, :nlev)
+    nested = [prepare(C.leveled; have, want = :total,
+                      bound = (; level, w, nlev = K, cuts)) for level in levels]
+    @test allequal(typeof.(nested))
+    for (k, level) in zip(nested, levels)
+        @test length(plates(k.plan)) == 3
+        @test k(eta) ≈ leveled(level)
+        value, gradient = RK.ad_value_and_gradient!(
+            prepare_ad(k, backend, eta; active = :eta), similar(eta), eta)
+        @test value ≈ leveled(level)
+        @test gradient ≈ [wi * (l == 1 ? -1.0 : l == K ? 1.0 : cuts[l])
+                          for (l, wi) in zip(level, w)]
+    end
+    empty_levels = prepare(C.leveled; have, want = :total,
+                           bound = (; level = Int[], w = Float64[], nlev = K, cuts))
+    @test typeof(empty_levels) == typeof(first(nested))
+    @test empty_levels(Float64[]) == 0.0
+
+    # A reassembled pointwise vector gathered by a second split plate, with
+    # every lane observed and with none.
+    mu = [0.3, -0.1, 0.2, 0.05, 0.7]
+    xc = [0.2, -1.0, 0.5, 1.5, -0.3]
+    yc = [0.1, 0.0, 0.4, -0.2, 0.0]
+    chained(xs, obs) = sum(o ? -0.5 * (yi - (m + sqrt(xi)))^2 : 0.0
+                           for (m, xi, yi, o) in zip(mu, xs, yc, obs))
+    # `sqrt` throws on the negative `x` of the unobserved lanes.
+    cases = ((xc, [true, false, true, true, false]), (abs.(xc), fill(true, 5)),
+             (xc, fill(false, 5)))
+    chains = [prepare(C.chained_arms; bound = (; x = xs, y = yc, obs))
+              for (xs, obs) in cases]
+    @test allequal(typeof.(chains))
+    for (k, (xs, obs)) in zip(chains, cases)
+        @test k(mu) ≈ chained(xs, obs)
+        value, gradient = RK.ad_value_and_gradient!(
+            prepare_ad(k, backend, mu; active = :mu), similar(mu), mu)
+        @test value ≈ chained(xs, obs)
+        @test gradient ≈ [o ? yi - (m + sqrt(xi)) : 0.0
+                          for (m, xi, yi, o) in zip(mu, xs, yc, obs)]
     end
 end
 
@@ -432,11 +539,13 @@ end
         C.arm_calls[] = 0
         @test k(m) == -Inf
         @test C.arm_calls[] == 0
+        mixed_type = typeof(k)
         allvalid = abs.(scales) .+ 0.25
         C.arm_calls[] = 0
         k = prepare(C.guarded_lane_scale; have = (:y, :m, :s), want = :total,
                     bound = (; y, s = allvalid))
         @test C.arm_calls[] == length(y)
+        @test typeof(k) == mixed_type
         C.arm_calls[] = 0
         @test k(m) ≈ sum(nlogpdf(yi, m, si) for (yi, si) in zip(y, allvalid))
         value, gradient = reverse_gradient(k, m)
@@ -455,11 +564,19 @@ end
         C.arm_calls[] = 0
         @test k(m) ≈ expected
         @test C.arm_calls[] == 0
-        # No lane takes the arm, so even an invalid scale is never read.
+        mixed_type = typeof(k)
+        # No lane takes the arm, so even an invalid scale is never read: the
+        # arm's plate has no lanes and its `log(s)` is not evaluated. The
+        # program is still the mixed binding's.
         C.arm_calls[] = 0
         k = prepare(C.missing_guard_scale; have = (:y, :m, :s, :g), want = :total,
                     bound = (; y, s = -1.0, g = ones(Int, length(y))))
+        @test C.arm_calls[] == 0
         @test k(m) == 0.0
+        @test C.arm_calls[] == 0
+        @test typeof(k) == mixed_type
+        value, gradient = reverse_gradient(k, m)
+        @test (value, gradient) == (0.0, 0.0)
         @test C.arm_calls[] == 0
 
         # The cell's shape follows the program, not the number of lanes.
