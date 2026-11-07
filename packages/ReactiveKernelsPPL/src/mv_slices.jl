@@ -234,7 +234,7 @@ function _covariance_cholesky!(F::Matrix{Float64}, Sigma::AbstractMatrix{Float64
     end
     # The upper triangle is zeroed before the factor loop, not inside it:
     # stores to `F` between the loop's reads of `F` make native Enzyme reverse
-    # record those reads on its tape (384 B per gradient at k = 11).
+    # record those reads on its tape (704 B per gradient at k = 20).
     for j in 2:k, i in 1:(j - 1)
         F[i, j] = 0.0
     end

@@ -30,7 +30,7 @@ are recorded in the git history only.
   for the shapes of 0.1.119. Values and gradients are unchanged.
 - The `MvNormal` factor zeroes its upper triangle before the factor loop
   rather than inside it. Native Enzyme reverse otherwise put the loop's reads
-  on its tape, 384 B per gradient at K = 11.
+  on its tape, 704 B per gradient at K = 20.
 - One vector's slice rows are a reshaped view rather than a reshaped
   `Vector`, which builds an array object.
 - The ReactiveKernels compat floor is 0.1.108.
