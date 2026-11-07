@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.113
+
+- An ordered or threshold vector's length may be a bare bound name, as an array
+  axis and an `LKJCholesky` dimension already may: `c ~ Ordered(Normal(0, 1), n)`
+  and `t[1:n] .~ Normal.(0, 1)` with `n` an integer bound beside the data, read
+  by `OrderedLogistic`, cumulative and stopping-ratio `Ordinal` responses. Before,
+  lowering refused it with "length must be a nonnegative integer or a data-only
+  expression", although `Int(n)` passed. The program reads `n` from the binding,
+  so one build serves every count. A fractional, negative, Boolean or sampled
+  value fails at binding.
+
 ## 0.1.112
 
 - `prepare_sampler(...; nonallocating = true)` keeps one type across the values
