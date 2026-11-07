@@ -1438,6 +1438,27 @@ function _partition_separate_statement(@nospecialize(s))
     s.head === :(=) && return Expr(:(=), s.args[1], _partition_separate_call(s.args[2]))
     s.head in (:call, :let, :block) ? _partition_separate_call(s) : s
 end
+
+# The wrapper above buys compile time on wide bodies and costs warm time on
+# small ones, where each wrapped statement is its own differentiated call with
+# its own tape: first-gradient CPU was unchanged at 8 synthetic blocks while the
+# warm gradient got 15% slower. Leaving bodies below this size whole, together
+# with one plan reference per label (`_ad_plan_argument`), took a one-subject
+# gradient from 1.64-1.87 to 1.24-1.47 µs on a 10-row PK cell (45 wrapped
+# statements) and from 7.6-8.3 to 6.0-6.5 µs on a joint cell (83), first
+# gradients unchanged (snag `partition-gradie-38d830a4`). So a body is separated
+# only when it has at least this many wrapped statements: a count of the
+# program's statements, never of its data.
+const _PARTITION_SEPARATE_MIN = 128
+function _partition_separate_body(main::Vector; minimum::Int = _PARTITION_SEPARATE_MIN)
+    separated = map(_partition_separate_statement, main)
+    sum(_partition_wrapped_count, separated; init = 0) >= minimum ? separated : main
+end
+function _partition_wrapped_count(@nospecialize(x))
+    x isa Expr || return 0
+    own = x.head === :call && x.args[1] == GlobalRef(@__MODULE__, :_partition_statement_call)
+    Int(own) + sum(_partition_wrapped_count, x.args; init = 0)
+end
 # `_PLAN_MODE` / `_plan_mode()` (graphops.jl): set while `partition_plan_kernel(spec; …)`
 # prepares; the lowering then emits the plan body instead of the partition's.
 
@@ -1913,7 +1934,7 @@ function _partition_plan_lowering(p::Plan, body::Expr, argexprs, runtime_ops, nm
         push!(reads, Expr(:(=), name, Expr(:call, GlobalRef(Core, :getfield), _PLAN_ARG,
                                              QuoteNode(field))))
     end
-    Expr(:block, reads..., map(_partition_separate_statement, main)...)
+    Expr(:block, reads..., _partition_separate_body(main)...)
 end
 
 _partition_plan_label(label, tables::Tuple) =

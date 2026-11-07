@@ -1371,30 +1371,46 @@ preparation: all cells whose key equals a label, as one compiled pass
 `q(u, label)`. Not thread-safe: prepare one per thread.
 """
 # Each label's plan, by label: a dictionary of the labels' positions and a
-# vector of the plans. A plan is a named tuple of a few hundred bytes held
-# inline, and a `Dict{Any,T}` keeps about two slots of it per label (snag
+# vector of the plans. A plan is a named tuple of a few hundred bytes, and a
+# `Dict{Any,T}` keeps about two slots of it per label (snag
 # per-unit-partiti-9d46c6de); here each plan has one. Reads are a dictionary's.
+# Each plan is held in the reference a differentiated call takes it behind
+# (RK's `_PartitionPlanRef`, a compile-time measure for wide plans), so a
+# gradient passes that reference (`_label_plan_ref`, RK `_ad_plan_argument`)
+# instead of RK boxing the plan anew on every call: 672 of 3,168 bytes of a
+# one-subject gradient on a 10-row cell (snag partition-gradie-38d830a4).
+# Reading a plan returns the named tuple.
 struct _LabelPlans{T} <: AbstractDict{Any,T}
     positions::Dict{Any,Int}
-    plans::Vector{T}
+    plans::Vector{ReactiveKernels._PartitionPlanRef{T}}
 end
+@inline _label_plan(d::_LabelPlans, i::Int) = getfield(@inbounds(d.plans[i]), :plan)
 Base.length(d::_LabelPlans) = length(d.plans)
 Base.haskey(d::_LabelPlans, label) = haskey(d.positions, label)
 function Base.getindex(d::_LabelPlans, label)
     i = get(d.positions, label, 0)
     i == 0 && throw(KeyError(label))
-    @inbounds d.plans[i]
+    _label_plan(d, i)
 end
 Base.get(d::_LabelPlans, label, default) =
-    (i = get(d.positions, label, 0); i == 0 ? default : @inbounds d.plans[i])
+    (i = get(d.positions, label, 0); i == 0 ? default : _label_plan(d, i))
 Base.get(f::Union{Function,Type}, d::_LabelPlans, label) =
-    (i = get(d.positions, label, 0); i == 0 ? f() : @inbounds d.plans[i])
+    (i = get(d.positions, label, 0); i == 0 ? f() : _label_plan(d, i))
 function Base.iterate(d::_LabelPlans, state...)
     next = iterate(d.positions, state...)
     next === nothing && return nothing
     (label, i), state = next
-    (label => d.plans[i]), state
+    (label => _label_plan(d, i)), state
 end
+# The reference holding `label`'s plan.
+function _label_plan_ref(d::_LabelPlans, label)
+    i = get(d.positions, label, 0)
+    i == 0 && throw(KeyError(label))
+    @inbounds d.plans[i]
+end
+# The plan argument `label`'s differentiated call takes from `plans`.
+_partition_plan_argument(ad, plans::_LabelPlans, label) =
+    ReactiveKernels._ad_plan_argument(_partition_ad(ad, label), _label_plan_ref(plans, label))
 
 mutable struct PartitionQuery{K,L,T,C,S}
     const kernel::K
@@ -1517,10 +1533,10 @@ function _partition_plans_each(plan_of, labels;
     # it at lookup rather than boxing the plan again on every evaluation.
     plan_type = only(types)
     positions = Dict{Any,Int}()
-    plans = plan_type[]
+    plans = ReactiveKernels._PartitionPlanRef{plan_type}[]
     for (label, plan) in zip(labels, each)
         haskey(positions, label) && continue
-        push!(plans, plan)
+        push!(plans, ReactiveKernels._PartitionPlanRef(plan))
         positions[label] = length(plans)
     end
     _LabelPlans{plan_type}(positions, plans), plan_type
@@ -2172,7 +2188,7 @@ function partition_value_and_gradient!(s::PartitionSampler, g::AbstractVector,
         _latest_value(_shared_partition_gradient!, s, g, u, label, shared), g)
     if !_compact(s)
         value = _latest_value(_partition_gradient!, s, g, label, u, label,
-                              _partition_plan_of(s, label))
+                              _partition_plan_argument_of(s, label))
         if !shared
             local_index = 1
             for position in eachindex(g)
@@ -2191,7 +2207,7 @@ function partition_value_and_gradient!(s::PartitionSampler, g::AbstractVector,
         s.active[k] = u[position]
     end
     value = _latest_value(_partition_gradient!, s, s.gradient, label, u, s.active, s.slots, label,
-                          _partition_plan_of(s, label))
+                          _partition_plan_argument_of(s, label))
     for (k, position) in enumerate(footprint)
         g[k] = s.gradient[s.slots[position]]
     end
@@ -2522,7 +2538,7 @@ function _shared_partition_gradient!(s::PartitionSampler, g, u, label, shared)
     cache = s.prefix
     cached = _refresh_partition_prefix!(cache, u)
     shared || return _local_partition_gradient!(s, g, u, label, cache.local_state, cached)
-    plan = _partition_plan_of(s, label)
+    plan = _partition_plan_argument_of(s, label)
     ad = _partition_ad(s.ad, label)
     if _compact(s)
         selection = s.selections[label]
@@ -2543,7 +2559,8 @@ function _local_partition_gradient!(s, g, u, label, state::_PartitionLocal, cach
         state.active[i] = u[position]
     end
     value, _ = ad_value_and_gradient!(_partition_ad(state.ad, label), state.gradient,
-        u, state.active, state.slots, label, state.plans[label], cached...)
+        u, state.active, state.slots, label,
+        _partition_plan_argument(state.ad, state.plans, label), cached...)
     footprint = _partition_gradient_footprint(s, label, false)
     _compact(s) || fill!(g, 0)
     for (i, position) in enumerate(footprint)
@@ -2584,10 +2601,15 @@ function _shared_partition_evaluate!(s, g, u, label, shared,
 end
 
 # The plan of `label` for the sampler's differentiated kernel.
-_partition_plan_of(s::PartitionSampler, label) = get(s.plans, label) do
+_partition_plan_of(s::PartitionSampler, label) =
+    get(() -> _partition_no_label(s, label), s.plans, label)
+# The plan argument of `label`'s differentiated call (`_partition_plan_argument`).
+_partition_plan_argument_of(s::PartitionSampler, label) =
+    (haskey(s.plans, label) || _partition_no_label(s, label);
+     _partition_plan_argument(s.ad, s.plans, label))
+@noinline _partition_no_label(s::PartitionSampler, label) =
     throw(ContractValidationError("[query] no partition has the label $(repr(label)); " *
         "the labels are $(join(repr.(s.labels), ", "))"))
-end
 
 # Point the slot map at `selection` when it differs from the one in force.
 function _select_partition!(s::Union{PartitionSampler,_PartitionLocal}, selection::Vector{Int})
