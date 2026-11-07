@@ -4909,8 +4909,8 @@ end
 # `__constants__[k]` it reads passed as an argument of its own, returning the
 # names the block binds that the rest of the body reads. A name both bind,
 # such as the running total, enters and leaves. `_compile` compiles each
-# `_PlateProgram` as it compiles the body, behind a `_PlateCall`, and ordinary
-# AD differentiates the body as it runs: through each program.
+# `_PlateProgram` as it compiles the body, behind a `_PlateCall`; ordinary AD
+# differentiates the body with the programs inline (`_ad_inline_plate_programs`).
 
 # The first statement of a marked plate block. `condition`, when not
 # `nothing`, is the expression under which the block's program runs: the
@@ -4942,14 +4942,12 @@ Base.deepcopy_internal(program::_PlateProgram, ::IdDict) = program
     _PlateCall(program)
 
 A compiled plate program as the body calls it: a call never inlined, with each
-operand a positional argument of its own. A runtime-generated function's own
-call method takes its operands as one argument tuple, and native Enzyme Reverse
-(the registered release) refuses a bound array stored in that tuple beside an
+operand a positional argument of its own, entering the generated body as
+`_native_body_call_expr` does. A runtime-generated function's own call method
+packs its operands into one argument tuple on every call, and native Enzyme
+Reverse (the registered release) refuses a bound array stored there beside an
 active value (`EnzymeRuntimeActivityError`, ReactiveKernelsPPL
-`test_precompiled_build.jl`). Through positional arguments a gradient
-differentiates each plate loop as the function of its own the primal runs, so
-its loops vectorize as the primal's do. The generated body is entered as
-`_native_body_call_expr` enters one.
+`test_precompiled_build.jl`).
 """
 struct _PlateCall{F}
     program::F
@@ -5152,6 +5150,39 @@ function _extract_plate_programs(ast::Expr)
         end : node
     Expr(ast.head, ast.args[1], replace_blocks(ast.args[2]))
 end
+
+# `node` with each call of a `_PlateProgram` replaced by that program's
+# statements over the call's arguments: the body `_extract_plate_programs` was
+# given, the guard of a program's call kept. Ordinary AD differentiates this
+# body (`_ad_inline_plate_programs`).
+function _inline_plate_programs(node)
+    if node isa Expr && node.head === :(=) && node.args[2] isa Expr &&
+            node.args[2].head === :call && first(node.args[2].args) isa _PlateProgram
+        return _inline_plate_program(node.args[2])
+    elseif node isa Expr && node.head === :call && first(node.args) isa _PlateProgram
+        return _inline_plate_program(node)
+    elseif node isa Expr && node.head !== :quote
+        return Expr(node.head, Any[_inline_plate_programs(arg) for arg in node.args]...)
+    end
+    node
+end
+function _inline_plate_program(call::Expr)
+    program = first(call.args)::_PlateProgram
+    parameters = program.ast.args[1].args
+    mapping = Dict{Symbol,Any}()
+    for (parameter, argument) in zip(parameters, call.args[2:end])
+        parameter === argument || (mapping[parameter] = argument)
+    end
+    statements = program.ast.args[2].args[1:end-1]
+    Expr(:block, Any[_substitute_symbols(statement, mapping) for statement in statements]...)
+end
+_substitute_symbols(node::Symbol, mapping) = get(mapping, node, node)
+_substitute_symbols(node::Expr, mapping) = node.head === :quote ? node :
+    Expr(node.head, Any[_substitute_symbols(arg, mapping) for arg in node.args]...)
+_substitute_symbols(node, mapping) = node
+
+_has_plate_programs(node) = node isa _PlateProgram ||
+    node isa Expr && node.head !== :quote && any(_has_plate_programs, node.args)
 
 # `ast` with each `_PlateProgram` compiled as `_compile` compiles `ast`.
 function _compile_plate_programs(ast, context::Module, native_context::GlobalRef)

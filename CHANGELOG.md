@@ -22,12 +22,9 @@ are recorded in the git history only.
   invariants above it and the preparation of the arguments the cells read.
   The body keeps the plate's setup and calls the program only when the domain
   has cells, so a plate over no rows calls none.
-- Native gradients run through the plate programs, so a gradient's loops
-  vectorize as the primal's do: with several Normal likelihoods over 2000
-  rows each, the gradient's cost per row and likelihood no longer grows with
-  their number. A plate program is called with each operand as an argument of
-  its own (`_PlateCall`), which the registered Enzyme release accepts where
-  it refused 0.1.112's argument tuple.
+- A plate program is called with each operand as an argument of its own
+  (`_PlateCall`) instead of one argument tuple per call. Gradients still
+  differentiate the plate loops inline.
 - A data-bound branch partition no longer keeps the bound arguments it
   gathers onto its arms, nor a level's gathered copies that a nested level
   gathers again: they were constants of the prepared program and operands of

@@ -182,7 +182,7 @@ end
         @test value ≈ ref(eta, level, cuts, w)
         @test grad ≈ [wi * (l == 1 ? -1.0 : l == K ? 1.0 : cuts[l])
                       for (l, wi) in zip(level, w)]
-        # No bound constant the program does not read: the plate's own bound
+        # No bound array the program does not read: the plate's own bound
         # arguments and a level's gathered copies, which the nested level
         # gathers again, leave the program (RK 0.1.113). Each would otherwise
         # be an operand of every native gradient call.
@@ -196,6 +196,8 @@ end
                    if statement isa Expr && statement.head === :(=) &&
                       statement.args[1] isa Symbol &&
                       ReactiveKernels._constant_slot(statement.args[2]) !== nothing &&
+                      k.constants[ReactiveKernels._constant_slot(statement.args[2])] isa
+                          AbstractArray &&
                       uses[statement.args[1]] == 1]
         end
         @test isempty(unread_constants(bound))

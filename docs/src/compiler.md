@@ -1064,12 +1064,17 @@ over 2000 rows each took 0.22–0.30 ns per row and likelihood with one
 likelihood, 0.69–0.70 with two and 1.13–1.21 with eight; with a program per
 loop it takes 0.20–0.25 at every count.
 
-Ordinary AD differentiates the body as it runs, through each program, so the
-gradient's loops vectorize as the primal's do (from ReactiveKernels 0.1.113).
 A program is called through `_PlateCall`, which takes each operand as a
-positional argument: a runtime-generated function's own call method takes its
-operands as one tuple, and Enzyme's static activity analysis refuses a bound
-array stored there beside an active value.
+positional argument: a runtime-generated function's own call method packs its
+operands into one tuple on every call, and Enzyme's static activity analysis
+refuses a bound array stored there beside an active value.
+
+Ordinary AD differentiates the body with its plate loops inline. Differentiated
+through `_PlateCall` as functions of their own, the gradient's loops vectorized
+as the primal's do (two to eight Normal likelihoods over 2000 rows each: 28–33%
+faster per gradient), but each program call cost native Reverse a fixed amount,
+which made small models slower: an RKPPL censored response over 10 mixed rows
+went from 296 to 567 ns per gradient.
 
 Only bodies prepared by `prepare` do this, and only plates that keep no
 per-cell tables. A transform `pass` given to `prepare` sees the plate loops

@@ -221,12 +221,31 @@ function _ad_native_callables(kernel::PreparedKernel)
     end
 end
 
+# The kernel ordinary AD differentiates. A body whose plate loops run as plate
+# programs (`_PlateProgram`, codegen.jl) is differentiated with those loops
+# inline, as it was lowered. Differentiated as functions of their own, through
+# `_PlateCall`'s positional operands, the programs' loops vectorized in the
+# gradient too (two to eight Normal likelihoods over 2000 rows each: 28–33%
+# faster per gradient), but every program call cost native Reverse a fixed
+# amount: an RKPPL censored response over 10 rows, mixed, went 296 → 567 ns per
+# gradient (snag `sampler-type-dif-ea945700`).
+Base.@nospecializeinfer function _ad_inline_plate_programs(@nospecialize(kernel::PreparedKernel))
+    _has_plate_programs(kernel.ast) || return kernel
+    ast = _inline_plate_programs(kernel.ast)
+    native = compile(ast)
+    f = kernel.f isa _ArrayFunction ? _ArrayFunction(native) : native
+    _executed_prepared_kernel(f, kernel.constants, kernel.callables, kernel.inputs,
+        kernel.outputs, kernel.plan, ast, kernel.lowered_recipes,
+        _exact_signature(kernel), kernel.rebinding)
+end
+
 # Building the adapter is preparation work. Inferring it for a program's
 # complete constant/callable tables compiles another large native method
 # before the backend ever sees the differentiated call.
 Base.@nospecializeinfer function _ad_kernel_call(
         @nospecialize(kernel::PreparedKernel), @nospecialize(args::Tuple),
         ::Val{I}) where {I}
+    kernel = _ad_inline_plate_programs(kernel)
     if kernel.f isa _ArrayFunction
         callables = _ad_native_callables(kernel)
         constants = kernel.constants
