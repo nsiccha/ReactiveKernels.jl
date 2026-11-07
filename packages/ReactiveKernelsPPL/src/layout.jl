@@ -1827,6 +1827,23 @@ function _vector_size_read(plan::StructuralPlan, tests, e::LayoutEntry)
     return _checked_read(tests, packed, e.size)
 end
 
+# A declared LKJ factor's dimension as the program reads it: its authored `K`,
+# when that reads data. The factor's statements, its prior and the blocks packed
+# after it then read the dimension and its `K(K - 1)/2` partials from the data,
+# so one program serves every dimension (snag `rkppl-lkjcholesk-e8d4d0d6`).
+_lkj_dim_read(plan::StructuralPlan, tests, p::ArrayParameter, K::Int) =
+    _array_dim_read(plan, tests, p.dims[1], K)
+
+# The names of a data-read LKJ dimension and of its partials count, `[K, P]`.
+_lkj_axis_name(L::Symbol) = Symbol(:_ppl_axis1_, L)
+_lkj_count_name(L::Symbol) = Symbol(:_ppl_lkj_count_, L)
+function _lkj_axes_reads!(reads::Vector{Expr}, L::Symbol, K)
+    K = _named_read!(reads, _lkj_axis_name(L), K)
+    P = _named_read!(reads, _lkj_count_name(L),
+        Expr(:call, GlobalRef(Base, :div), :($K * ($K - 1)), 2))
+    return Any[K, P]
+end
+
 # Whether an entry's program reads `positions`. Scalars, per-coordinate positive
 # vectors and LKJ scalar edges and stacks read one literal coordinate per
 # statement.
@@ -1948,6 +1965,10 @@ function _entry_reads!(reads, plan, tests, e::LayoutEntry, at, scan, bound_reads
         size = i === nothing ? e.size : _plate_rows_read(plan, tests, plan.plate_parameters[i], e.size)
     elseif e.kind === :vector
         size = _vector_size_read(plan, tests, e)
+    elseif e.kind === :cholesky_corr
+        K = _lkj_dim_read(plan, tests, _array_param(plan, e.name), e.dims[1])
+        axes = K isa Int ? nothing : _lkj_axes_reads!(reads, e.name, K)
+        size = axes === nothing ? e.size : axes[2]
     elseif e.kind === :scan
         T = _scan_read_length(plan, scan, _scan_length(plan, scan))
         size = T isa Int ? e.size : !_is_noncentered_scan(scan) ? T :
