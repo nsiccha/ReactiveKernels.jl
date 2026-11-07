@@ -313,7 +313,7 @@ end
 # A censored response with a bound scale per row partitions its rows by the
 # guards it is written with (`sig > 0`, `y < lim`, `y <= lim`), and every arm
 # is a plate, also one no row takes: one program and one sampler type serve
-# rows that are all observed, all censored, a mix, or none (RK 0.1.109, snag
+# rows that are all observed, all censored, a mix, or none (RK 0.1.110, snag
 # `sampler-type-dif-ea945700`: ODL's soil rows all detected, or all below
 # their detection limit, compiled the sampler again).
 @testset "censored rows: one sampler type whichever rows are censored" begin
