@@ -355,6 +355,7 @@ function _expand_cell_array_latents(st, taken, scope::_CellLatentScope)
         prefix = Symbol(:_rkppl_latent_, name)
         site, dims = fresh(prefix), fresh(Symbol(prefix, :_dims))
         offsets, count = fresh(Symbol(prefix, :_offsets)), fresh(Symbol(prefix, :_size))
+        blocks = fresh(Symbol(prefix, :_blocks))
         shape = _cell_broadcast_shape(shapes)
         dimscells = fresh(Symbol(prefix, :_shapes))
         push!(prelude, Expr(:(=), dimscells, column(Expr(:call,
@@ -363,6 +364,8 @@ function _expand_cell_array_latents(st, taken, scope::_CellLatentScope)
             GlobalRef(@__MODULE__, :_ppl_cell_latent_shapes), QuoteNode(name), dimscells)))
         push!(prelude, Expr(:(=), offsets,
             Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_latent_offsets), dims)))
+        push!(prelude, Expr(:(=), blocks,
+            Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_blocks), offsets)))
         push!(prelude, Expr(:(=), count,
             Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_latent_size), offsets)))
         # A shared number broadcasts against the packed array as written;
@@ -384,8 +387,15 @@ function _expand_cell_array_latents(st, taken, scope::_CellLatentScope)
         push!(prelude, Expr(:call, :.~, Expr(:ref, site, Expr(:call, :(:), 1, count)), object))
         pos = fresh(Symbol(prefix, :_cell))
         push!(cells, Expr(:(=), pos, position))
+        # The block as a view in a statement of its own: constructing it reads
+        # no coordinates, and the footprint maps the cell's reads of it to
+        # this index's positions (`_ppl_cell_blocks`). Nested in the value's
+        # call, the packed array would be that call's operand, read whole.
+        block = fresh(Symbol(prefix, :_block))
+        push!(cells, Expr(:(=), block,
+            Expr(:call, GlobalRef(Base, :view), site, :($blocks[$pos]))))
         push!(cells, Expr(:(=), c.args[2], Expr(:call,
-            GlobalRef(@__MODULE__, :_ppl_cell_latent_block), site, offsets, dims, pos)))
+            GlobalRef(@__MODULE__, :_ppl_cell_latent_block), block, :($dims[$pos]))))
         _push_cell_local!(cx, pos, position)
         cx.arrays[name] = (dims, pos)
         sites[site] = (name, dims)
@@ -539,14 +549,14 @@ function _expand_cell_joint_latents(st, taken, data::Set{Symbol}, mod::Module,
         push!(prelude, Expr(:(=), sizecells, column(deepcopy(g.unconstrained))))
         push!(prelude, Expr(:(=), offsets, Expr(:call, ref(:_ppl_cell_joint_offsets),
             QuoteNode(name), sizecells)))
-        push!(prelude, Expr(:(=), blocks, Expr(:call, ref(:_ppl_cell_joint_blocks), offsets)))
+        push!(prelude, Expr(:(=), blocks, Expr(:call, ref(:_ppl_cell_blocks), offsets)))
         push!(prelude, Expr(:(=), count, Expr(:call, ref(:_ppl_cell_latent_size), offsets)))
         push!(prelude, Expr(:call, :.~, Expr(:ref, site, Expr(:call, :(:), 1, count)),
             :(Flat.())))
         geometry_expr = Expr(:call, ref(:sampling_geometry), call.args[1],
             Expr(:tuple, (_sampling_ast_literal(a) for a in call.args[2:end])...), Expr(:tuple))
         function endpoint(f, edge)
-            # A view: constructing it reads no coordinates (`_ppl_cell_joint_blocks`).
+            # A view: constructing it reads no coordinates (`_ppl_cell_blocks`).
             block = Expr(:call, GlobalRef(Base, :view), site, :($blocks[$pos]))
             graph = _sampling_graph_call(g, edge, geometry_expr,
                 Any[block, :($shapes[$pos]), positional...], keywords)
@@ -712,16 +722,17 @@ end
 _ppl_cell_joint_block(site, offsets, pos::Int) =
     view(site, (offsets[pos] + 1):offsets[pos + 1])
 
-# Each index's packed block, as data: a bound table exposes a cell's packed
-# read to the graph compiler, whereas a range computed in the cell stays in
-# the residual. The cell reads its block through a view (the endpoint `block`
-# above), so an observation that selects entries reads only those
-# coordinates, and so does its strict footprint. The table holds unit ranges:
-# a view indexed by an integer vector loaded from data is a container of
-# constant memory beside the active packed vector, which native Enzyme
+# Each index's packed block of a cell latent, dotted or joint, as data: a
+# bound table exposes a cell's packed read to the graph compiler, whereas a
+# range computed in the cell stays in the residual. The cell reads its block
+# through a view, `view(site, blocks[pos])`, so its strict footprint is that
+# block, not every index's coordinates; an observation that selects entries
+# of a joint latent's identity value reads only those. The table holds unit
+# ranges: a view indexed by an integer vector loaded from data is a container
+# of constant memory beside the active packed vector, which native Enzyme
 # Reverse rejects (docs/src/constraints.md); a range holds no array.
-# The geometry receives the selected block, never the unrelated cells.
-_ppl_cell_joint_blocks(offsets) =
+# A joint geometry receives the selected block, never the unrelated cells.
+_ppl_cell_blocks(offsets) =
     UnitRange{Int}[(offsets[k] + 1):offsets[k + 1] for k in 1:length(offsets)-1]
 
 # A cell's constrained value of its joint latent: the geometry's `constrain`
@@ -765,15 +776,13 @@ end
 ReactiveKernels._checked_alias_validator(::typeof(_ppl_cell_joint_checked)) =
     _ppl_cell_joint_check_rows
 
-# A cell's block of the packed array: a number, a vector, or an array of
-# its dimensions. The packed values are read in place.
-_ppl_cell_latent_block(site, offsets, dims::AbstractVector{<:Tuple}, pos::Int) =
-    _ppl_cell_latent_value(site, offsets, dims[pos], pos)
-_ppl_cell_latent_value(site, offsets, ::Tuple{}, pos::Int) = site[offsets[pos] + 1]
-_ppl_cell_latent_value(site, offsets, ::Tuple{Int}, pos::Int) =
-    view(site, (offsets[pos] + 1):offsets[pos + 1])
-_ppl_cell_latent_value(site, offsets, dims::Tuple, pos::Int) =
-    reshape(view(site, (offsets[pos] + 1):offsets[pos + 1]), dims)
+# A dotted cell latent's value at an index, from the view of its packed block
+# (`_ppl_cell_blocks`): a number, the vector itself, or an array of its
+# dimensions. The packed values are read in place. Only the view reaches the
+# packed array, so a footprint reads this index's block, never another's.
+_ppl_cell_latent_block(block, ::Tuple{}) = block[1]
+_ppl_cell_latent_block(block, ::Tuple{Int}) = block
+_ppl_cell_latent_block(block, dims::Tuple) = reshape(block, dims)
 
 # --- Draws: one array per index under the authored name ------------------
 

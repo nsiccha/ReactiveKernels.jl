@@ -287,6 +287,7 @@ const _PPL_TEST_FILES = (
     "test_query_footprints.jl",
     "test_row_methods.jl",
     "test_cell_joint_footprints.jl",
+    "test_cell_vector_latent_footprints.jl",
     "test_compact_cell_derivatives.jl",
     "test_cell_factors.jl",
     "test_cell_factor_values.jl",
