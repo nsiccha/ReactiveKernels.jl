@@ -16,6 +16,56 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.103
+
+- A non-allocating kernel no longer has its own type per preparation.
+  `prepare_nonallocating` compiled the kernel's constants, callables and caches
+  into its generated body, with a token per preparation so that two kernels never
+  shared a slot. Each preparation was then another type and another compile, and
+  a bound number's value was a literal of that body. The body now holds code only,
+  and each call passes it one reference to the kernel's tables and caches.
+  Preparations of one program share one body and one type across the values of a
+  bound number, so ReactiveKernelsPPL's `prepare_sampler(...; nonallocating = true)`
+  keeps one type, as the ordinary sampler does since 0.1.95. Each kernel still
+  owns its slots, and a `deepcopy` now owns its own; it used to share them with
+  the original through the body.
+- Another preparation of such a program no longer compiles its primal, which took
+  1.1 s per preparation on 12 gather blocks and 8.4 s on 48. The density reads
+  bound numbers at run time instead of as literals. Against the old body, in one
+  process at one load, a gather or regression with a bound scale took 1.05 to 1.24
+  times as long at 120 and 2000 rows, a gather with a sampled scale 1.02 to 1.06
+  times, and bound priors, group plates and scans 0.58 to 1.02 times; every case
+  stayed faster than the ordinary kernel. A plate
+  of array cells, whose body Julia does not inline, costs 117 ns per call against
+  67 ns.
+
+## 0.1.102
+
+- A partition sampler or query with a cached shared prefix (`partitioned=`)
+  keeps a plate read through a type guard at each partition's rows. One example
+  is a per-state field plate whose cells call an opaque helper over parameter
+  arrays, read as `eltype(cells) <: Real ? cells : throw(...)` (the guard
+  BayesianRegressionModels writes for an offset of a plate output). The split
+  had decided the guard from the declared packed type `AbstractVector{Float64}`.
+  Over that type the helper infers `Any`, so the guard kept no arm, and the
+  plate, the guard and everything after them were lifted into the prefix. Every
+  partition gradient then pulled back through all of the plate's cells. The
+  split now decides this for a dense `Vector{Float64}` point, the type these
+  queries are prepared with. Its prefix and residual keep the branch, so each
+  point type they are prepared for proves its own arm. Values and gradients are
+  unchanged. A unit's gradient now costs its own rows, not the whole plate.
+
+## 0.1.101
+
+- A read-only gather of a `Vector` by a `Vector{Int}` (`_readonly_gather`, which
+  RKPPL's `theta[child[j]]` in a dotted plate cell reaches) no longer runs
+  `Base.view`'s alias check, as a gather of a packed slice already did not. The
+  result type is unchanged, and the gather still checks bounds. On a ragged
+  nested plate over a computed parameter, such as a non-centered PosteriorDB
+  Bones with `theta = 36 .* z`, value and gradient took 1.37 to 1.39 times the
+  hand-written loop on Julia 1.12 and 1.13, and now take about the same as it.
+  Julia 1.10 is unchanged, and so are values and gradients.
+
 ## 0.1.100
 
 - `PartitionLocalityError` and the `locality = :warn` warning name the route for

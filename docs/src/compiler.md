@@ -640,6 +640,11 @@ has the same prepared type and reuses the compiled derivative. A binding that
 changes a value's type, or moves an index run between its flat and grouped
 schedules, is another program and compiles once more.
 
+A non-allocating kernel follows it too. Its generated body holds code only: each
+call passes one reference to the kernel's constants, callables and caches, so
+preparations of one program share one body and one type, and each kernel still
+owns its slots.
+
 The graph holds these entries itself, so they live exactly as long as the
 graph: a graph authored as a module constant keeps them for the process, a
 graph built per request drops them with it, and a mutation of the graph starts
@@ -1417,6 +1422,16 @@ declarations retain narrower inferred types. This lets a scalar plate stay
 local through an opaque numerical helper whose result is inferable for the
 actual array type but not for an abstract array interface. Exemplar values
 and lengths are not specialized into the emitted body.
+
+A partition query or sampler with a cached shared prefix (`partitioned=`)
+decides which values stay at a partition's rows before any exemplar is
+lowered. It decides that for a dense packed point, `Vector{Float64}`, the type
+these queries are prepared with. A guard such as `eltype(cells) <: Real ?
+cells : throw(...)` around a plate whose cells call such a helper keeps the
+plate at the partition's rows. Otherwise the plate is lifted into the prefix,
+and every partition gradient's prefix pullback runs over all of its cells. The
+prefix and residual plans keep the branch itself, so each argument type they
+are prepared for proves its own arm.
 
 A captured array read can remain inside a lazy condition, including a guard
 that skips index zero. Building its row window requests only valid positions;

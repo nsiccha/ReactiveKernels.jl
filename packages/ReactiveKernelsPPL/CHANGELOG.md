@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.112
+## 0.1.113
 
 - An external law's packed range and the shape its `constrain` and `logjac`
   endpoints receive are read from the data, like a declared array's: BRM's
@@ -41,6 +41,14 @@ are recorded in the git history only.
   kept the literal.
 - Of the paths 0.1.108 lists as literal, an external law's geometry shape and
   size no longer are, except when the extent reads an observation.
+
+## 0.1.112
+
+- `prepare_sampler(...; nonallocating = true)` keeps one type across the values
+  of a bound number, as the ordinary sampler does since 0.1.105. Rebinding one
+  build with other numbers reuses the compiled density and gradient instead of
+  compiling them again, and each query still owns its buffers. Requires
+  ReactiveKernels 0.1.103.
 
 ## 0.1.111
 
