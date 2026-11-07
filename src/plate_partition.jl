@@ -2045,3 +2045,73 @@ function partition_plan(kernel::PreparedKernel, args...)
     end
     Base.invokelatest(planner, args...)
 end
+
+# A caller that keeps one plan per label (RKPPL's partition queries and
+# samplers, which keep up to two plan sets per label) keeps many equal small
+# arrays: the rows of a label read by several statements, the same rows and
+# gathered data in the plan of a residual and of its conditional kernel. On a
+# one-unit-per-label toy, the 4 plans of one label held 82 such arrays and 11
+# distinct ones (snag `per-unit-partiti-9d46c6de`). A plan is read-only label
+# bookkeeping (`_partition_plan_split` keeps every value the body writes, and its
+# aliases, in the body), so equal arrays can be one object. A pool is used for
+# the plans of one preparation and then dropped: it keeps nothing alive itself.
+struct _PartitionPlanPool
+    # An array already seen => its canonical array, so an array every plan
+    # shares (a whole bound column) is compared by content once.
+    seen::IdDict{Any,Any}
+    # (type, size, array) => the canonical array of that content.
+    contents::Dict{Any,Any}
+end
+_PartitionPlanPool() = _PartitionPlanPool(IdDict{Any,Any}(), Dict{Any,Any}())
+
+"""
+    _intern_partition_plan(pool::_PartitionPlanPool, plan) -> plan
+
+`plan` (a `partition_plan` result) with each array of plain bits that holds the
+same content as one already in `pool` replaced by that array, descending
+through tuples, named tuples, views and broadcast extrusions. The result has
+the type of `plan`, equal values and the same reads.
+"""
+function _intern_partition_plan(pool::_PartitionPlanPool, plan::T) where {T}
+    # `partition_labels` holds the label's rows of each partition table, which
+    # the body compares with the table's own rows by identity
+    # (`_partition_plan_label_matches`). Keep them, and make them the arrays
+    # the other fields share.
+    labels = plan isa NamedTuple && haskey(plan, :partition_labels) ? plan.partition_labels : nothing
+    labels === nothing || _plan_register!(pool, labels)
+    interned = labels === nothing ? _plan_intern(pool, plan) :
+        merge(_plan_intern(pool, Base.structdiff(plan, NamedTuple{(:partition_labels,)})),
+            (; partition_labels = labels))
+    interned isa T || throw(ArgumentError(
+        "internal: interning a partition plan changed its type to $(typeof(interned))"))
+    interned
+end
+# Record the arrays of `x` as canonical where no array of their content is yet,
+# without replacing any of them.
+_plan_register!(::_PartitionPlanPool, x) = nothing
+_plan_register!(pool::_PartitionPlanPool, x::Union{Tuple,NamedTuple}) =
+    foreach(v -> _plan_register!(pool, v), x)
+function _plan_register!(pool::_PartitionPlanPool, x::Array{T}) where {T}
+    isbitstype(T) || return nothing
+    haskey(pool.seen, x) && return nothing
+    pool.seen[x] = x
+    get!(pool.contents, (typeof(x), size(x), x), x)
+    nothing
+end
+_plan_intern(::_PartitionPlanPool, x) = x
+_plan_intern(pool::_PartitionPlanPool, x::Tuple) = map(v -> _plan_intern(pool, v), x)
+_plan_intern(pool::_PartitionPlanPool, x::NamedTuple{K}) where {K} =
+    NamedTuple{K}(_plan_intern(pool, Tuple(x)))
+function _plan_intern(pool::_PartitionPlanPool, x::Array{T}) where {T}
+    isbitstype(T) || return x
+    get!(pool.seen, x) do
+        get!(pool.contents, (typeof(x), size(x), x), x)
+    end::typeof(x)
+end
+function _plan_intern(pool::_PartitionPlanPool, x::SubArray{T,N,P,I,L}) where {T,N,P,I,L}
+    parent = _plan_intern(pool, Base.parent(x))
+    indices = _plan_intern(pool, x.indices)
+    SubArray{T,N,P,I,L}(parent, indices, x.offset1, x.stride1)
+end
+_plan_intern(pool::_PartitionPlanPool, x::Base.Broadcast.Extruded) =
+    typeof(x)(_plan_intern(pool, x.x), x.keeps, x.defaults)
