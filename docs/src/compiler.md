@@ -1777,12 +1777,20 @@ allowing ordinary Reverse through the overlay's choice of base or active data.
 reference: as a by-value aggregate of every field, it made LLVM's constant
 propagation take a steeply growing share of the first gradient's compile time
 as the plan widened. Callers still pass, and `partition_plan` still returns,
-the named tuple.
-A statement of a planned body with an array operand calls through one
+the named tuple. That reference is made per call unless the caller passes one:
+ReactiveKernelsPPL keeps each label's plan in one such reference
+(`_LabelPlans`), and its partition samplers pass it (`_ad_plan_argument`), so a
+gradient call copies no plan.
+In a planned body with at least `_PARTITION_SEPARATE_MIN` (128) such
+statements, a statement with an array operand calls through one
 `@noinline` wrapper, which compiles once per signature, so Enzyme and LLVM do
 not analyse every array operation as part of one function. Scalar statements
 and plate loops stay inline. This shows in `code_expr` as
-`_partition_statement_call`. A type or function argument of such a statement
+`_partition_statement_call`. A smaller body stays one function: there the
+wrapper saves no compile time, and each wrapped statement becomes its own
+differentiated call with its own tape, which a one-subject cell pays on every
+gradient. The count is of the program's statements, never of its data.
+A type or function argument of such a statement
 crosses the wrapper in a carrier (`_PartitionType`, `_PartitionFunction`):
 Julia compiles a `Vararg{Any}` position holding a type as `::Type`, and one
 holding a function the method does not call as `::Function`, so without it
