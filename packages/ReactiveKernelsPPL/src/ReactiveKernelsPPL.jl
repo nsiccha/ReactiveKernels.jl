@@ -88,6 +88,8 @@ export prepare_partition, PartitionQuery, prepare_partition_sampler, PartitionSa
 # function; its name is ReactiveKernels' export.
 export prepare_slices, SliceSampler, slice_labels, slice_coordinates,
     slice_value_and_gradient!, slice_problem, SliceProblem
+export prepare_joined_windows, JoinedWindows, joined_coordinates, joined_point,
+    window_points, joined_value_and_gradient!, joined_problem, JoinedWindowsProblem
 export prepare_compact_cell_sampler, CompactCellSampler, prepare_compact_cell_ad, CompactCellAD
 export prepare_cell_factors, CellFactors, cell_reductions, reduction_rows,
     prepare_cell_factor_query, CellFactorQuery, prepare_cell_factor_ad, CellFactorAD
@@ -138,6 +140,7 @@ include("cell_shared.jl")
 include("cell_batch.jl")
 include("density_factors.jl")
 include("slices.jl")
+include("windows.jl")
 include("predictive.jl")
 include("discrete_latents.jl")
 include("smc.jl")
