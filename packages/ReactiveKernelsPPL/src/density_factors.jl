@@ -596,6 +596,9 @@ must come from one catalogue. The batch checks its bound program once, then
 shares one packed exemplar across preparation. With `coordinates = :support`,
 each returned `FactorQueryAD` owns a compact derivative workspace; fixed row
 and coordinate metadata use storage proportional to the selected supports.
+Selections with one structure (the same kinds and sites, each read whole or
+by cells) share one prepared program, so a query keeps only its own entries,
+row plan, slots and workspace, never a copy of the model graph.
 Empty selections return zero-valued queries; an empty batch returns no queries.
 Single-selection calls retain their bound-program validation.
 """
