@@ -89,7 +89,7 @@ If a backend cannot preserve the required semantics, report the unsupported
 case and isolate the failure instead of adopting an eager workaround.
 
 When a plate cell's branch condition reads bound data only, preparation
-evaluates it per lane and splits the plate into one plate per arm (see
+evaluates it per lane and splits the plate into one plate per taken arm (see
 the [compiler](compiler.md), "Data-bound branches in plate cells"). This is
 the lazy semantics made structural: each lane still evaluates only its own
 arm, and no backend receives the branch.
@@ -163,12 +163,9 @@ has, so one program serves every extent and value of one declaration
 and so does an external law's packed range and shape (`test_graph_geometry.jl`).
 Known remaining paths, which are limitations to fix and not precedents, are
 listed under ReactiveKernelsPPL 0.1.108 in its
-changelog, less those a later entry removes. A data-bound branch in a plate
-cell keeps one prepared type whichever arms the lanes take, an empty domain
-included, from ReactiveKernels 0.1.110: an arm without lanes is a plate over
-no lanes, which keeps the lazy-branch constraint above because it evaluates
-nothing. A lane-invariant condition still selects its arm statically ("Data-bound
-branches in plate cells"), a remaining limitation.
+changelog, less those a later entry removes. A prepared type may still depend on which data-bound branch arms
+have lanes ("Data-bound branches in plate cells"), which the lazy-branch
+constraint above requires.
 
 ## Derivative rules come from one mathematical graph, never by hand
 

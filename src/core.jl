@@ -1553,8 +1553,7 @@ OWN free ports, selected from the recipe's ordered arguments by the position
 tuples `CI`/`TI`/`EI`; a nested branch arm is itself a `_KernelBranch` over
 every argument. Plate partial evaluation reads them: a condition whose ports
 are all bound data is evaluated per lane at preparation, and the plate splits
-into one plate per arm, over no lanes for an arm no lane takes
-(`_partition_plate_recipe`).
+into one plate per taken arm (`_partition_plate_recipe`).
 
 In a plate cell, a leaf arm may also carry its own graph, `then_spec` /
 `else_spec`: a `KernelSpec` over the arm's ports (by name) whose one output is
