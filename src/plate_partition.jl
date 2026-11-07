@@ -914,6 +914,31 @@ function _partition_prefix_positions(p::Plan, name::Symbol)
     sort!(unique!(positions))
 end
 
+# The values a dense packed point keeps at rows, added to `row_values` (ids of
+# `declared`). The declared packed input `AbstractVector{Float64}` cannot decide
+# a type-selected branch (`_type_selected_branch`) whose condition reads a value
+# computed from parameter views: an opaque helper reading an abstract view
+# infers `Any`. A guard such as `eltype(cells) <: Real ? cells : throw(...)` then
+# keeps no arm and no row form, and the split would lift its whole cone into the
+# prefix, whose pullback every partition gradient repeats. Decide which values
+# stay at rows with the dense stand-in each query is prepared with, but keep the
+# declared plan, branch included: every argument type's preparation of the
+# prefix or residual proves its own arm. Value ids are allocated globally, so a
+# value either analysis creates is simply absent from the other.
+function _partition_dense_rows!(row_values, lowered::Plan, declared::Plan)
+    any(r -> r.op isa _KernelSourceOp && r.op.f isa _KernelBranch, declared.recipes) ||
+        return row_values
+    types = Any[valtype(v) for v in lowered.have]
+    dense = Any[_cell_standin_type(T) for T in types]
+    isequal(dense, types) && return row_values
+    _, cells = _cell_outlined_pushdowns(lowered; argument_types = dense)
+    cells === nothing && return row_values
+    for cid in cells.pushed
+        haskey(declared.graph.values, cid) && push!(row_values, canon_id(declared.graph, cid))
+    end
+    row_values
+end
+
 # Split a selected, bound-data plan without replanning its producers. The
 # original HAVE boundary stays on the residual; shared intermediates enter
 # as additional ordinary HAVE values, so their cotangents can be propagated
@@ -929,10 +954,12 @@ function _partition_shared_parts(p::Plan, partitioned; varying = (), preserve_ro
     row_values = Set{ValueId}()
     row_types = Dict{ValueId,Any}()
     if preserve_rows
-        p, cells = _cell_outlined_pushdowns(_lowering_plan(p))
+        lowered = _lowering_plan(p)
+        p, cells = _cell_outlined_pushdowns(lowered)
         if cells !== nothing
             union!(row_values, cells.pushed)
             row_types = cells.types
+            _partition_dense_rows!(row_values, lowered, p)
         end
     end
     cidof(v) = canon_id(p.graph, v.id)

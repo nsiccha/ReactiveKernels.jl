@@ -1418,6 +1418,16 @@ local through an opaque numerical helper whose result is inferable for the
 actual array type but not for an abstract array interface. Exemplar values
 and lengths are not specialized into the emitted body.
 
+A partition query or sampler with a cached shared prefix (`partitioned=`)
+decides which values stay at a partition's rows before any exemplar is
+lowered. It decides that for a dense packed point, `Vector{Float64}`, the type
+these queries are prepared with. A guard such as `eltype(cells) <: Real ?
+cells : throw(...)` around a plate whose cells call such a helper keeps the
+plate at the partition's rows. Otherwise the plate is lifted into the prefix,
+and every partition gradient's prefix pullback runs over all of its cells. The
+prefix and residual plans keep the branch itself, so each argument type they
+are prepared for proves its own arm.
+
 A captured array read can remain inside a lazy condition, including a guard
 that skips index zero. Building its row window requests only valid positions;
 the authored condition and indexing expression remain in the cell. An active
