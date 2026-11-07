@@ -30,12 +30,20 @@ are recorded in the git history only.
   guard, and its work over bound values, such as `log(s)` of a bound scale, is
   not run at preparation, so an invalid value on an arm no lane takes still
   never throws. An arm of one lane now splits a nested branch as arms of more
-  lanes or none do. Values and gradients are unchanged. A binding whose lanes
-  all take one arm pays for the other arm's empty plate and reads its live
-  arguments through lane indices, as a mixed binding always has. A condition
-  that reads bound numbers alone still selects its arm at preparation, and a
-  bound singleton beside live arguments of unknown length (a plate of one row)
-  still prepares its own program.
+  lanes or none do. Values and gradients are unchanged.
+- A binding whose lanes all take one arm now runs the program a mixed binding
+  runs: the taken arm reads its live arguments through lane indices beside the
+  other arm's empty plate, where it used to be one unsplit plate, and its
+  first gradient also compiles the arm no lane takes. For an RKPPL censored
+  Normal response with a bound scale and every row observed, measured on
+  gordito (Julia 1.10.12): density 0.47 → 3.2–4.3 µs and gradient
+  4.1 → 6.0–8.2 µs at 2000 rows, and `prepare_sampler` with its first gradient
+  in a fresh process 14–15 → 32–33 s at 200 rows. Those are what the same
+  model with half its rows censored takes, before and after this change
+  (13 µs, 32 µs; 31–36 s).
+- A condition that reads bound numbers alone still selects its arm at
+  preparation, and a bound singleton beside live arguments of unknown length
+  (a plate of one row) still prepares its own program.
 
 ## 0.1.108
 
