@@ -347,4 +347,86 @@ end
     @test_throws "its shape there is (2,)" prepare_query(built,bound,:sampler)(zeros(2))
 end
 
+# A field whose coordinate count is a property of bound data, as BRM's GMRF
+# laws declare it (`support.geometry.ncoordinates`). One law constrains through
+# a composed graph, the other through ordinary host functions, which see the
+# shape the program passes them.
+struct PropertyField{S}
+    support::S
+end
+ReactiveKernelsPPL.sampling_geometry(::Type{PropertyField}, args, shape) =
+    let n = :($(args[1]).geometry.n)
+        ParameterGeometry(isempty(shape) ? (n,) : shape, n; support=:real,
+            constrain=identity_coordinates, unconstrain=identity_coordinates,
+            logjac=zero_jacobian)
+    end
+ReactiveKernelsPPL.sampling_logdensity(::PropertyField, w) = -sum(abs2, w)/2
+struct HostPropertyField{S}
+    support::S
+end
+host_field_coordinates(u, shape, support) = reshape(copy(u), shape)
+host_field_jacobian(u, shape, support) = 0.0
+ReactiveKernelsPPL.sampling_geometry(::Type{HostPropertyField}, args, shape) =
+    let n = :($(args[1]).geometry.n)
+        ParameterGeometry(isempty(shape) ? (n,) : shape, n; support=:real,
+            constrain=host_field_coordinates, unconstrain=host_field_coordinates,
+            logjac=host_field_jacobian)
+    end
+ReactiveKernelsPPL.sampling_logdensity(::HostPropertyField, w) = -sum(abs2, w)/2
+# The support is a value the model computes from data, as BRM's is.
+field_support(n) = (geometry=(n=n,),)
+
+# An external law's packed range and the shape its endpoints receive read their
+# extent from the data (user principle
+# `ODLPlaus:precompile/decisions/2026-11-06T01-09-46-212-0ikeidi`; snag
+# `gmrf-field-packe-ab48cb09`): every extent generates the same program, and the
+# first binding's build serves the others, derivative included.
+@testset "an external law reads its extent from the data" begin
+    backend = DI.AutoEnzyme(;mode=Enzyme.Reverse)
+    program(bound, built) = Base.remove_linenums!(kernel_expr(bound, built.layout))
+    # The empty extent included: the first build serves it too.
+    for law in (:identity, :nonlinear, :coupled)
+        fxs = [fixture(n; law) for n in (3, 17, 0)]
+        sources = [program(fx.bound, fx.built) for fx in fxs]
+        @test allequal(sources)
+        @test occursin("(_ppl_axis1_w,)", string(sources[1]))
+        for fx in fxs
+            expected = oracle(fx, fx.u, law).posterior
+            @test prepare_query(first(fxs).built, fx.bound, :sampler)(fx.u) ≈ expected
+            sampler = prepare_sampler(first(fxs).built, fx.bound, fx.u; backend)
+            value, gradient = sampler_value_and_gradient!(sampler, similar(fx.u), fx.u)
+            @test value ≈ expected
+            @test gradient ≈ finite_gradient(u->oracle(fx,u,law).posterior, fx.u) rtol=1e-7
+        end
+    end
+    for law in (:PropertyField, :HostPropertyField)
+        datas = [(; N=n, k=[1, n, 1], y=[0.3, -0.2, 0.5]) for n in (2, 5)]
+        ast = quote
+            support = field_support(N)
+            w[1:support.geometry.n] ~ $law(support)
+            y .~ Normal.(w[k], 1)
+        end
+        plan = lower_rkppl(ast, first(datas); mod=@__MODULE__, conditioned=(:y,))
+        bounds = [bind_data(plan, d) for d in datas]
+        builds = build_kernel.(bounds)
+        sources = map(program, bounds, builds)
+        @test sources[1] == sources[2]
+        text = string(sources[1])
+        @test occursin("_ppl_axis1_w::Int = Base.getproperty(Base.getproperty(support, :geometry), :n)", text)
+        # A composed graph reads the rows partitions follow; a host callback
+        # gets an owned copy (Enzyme snag `enzyme-autodiff-e13097c4`).
+        @test occursin(law === :PropertyField ? "unconstrained[1:_ppl_last_w]" :
+            "collect(view(unconstrained, 1:_ppl_last_w))", text)
+        for (bound, d) in zip(bounds, datas)
+            density(u) = -sum(abs2, u)/2 + sum(-log(2pi)/2 .- (d.y .- u[d.k]).^2 ./ 2)
+            u = [0.1i for i in 1:d.N]
+            @test prepare_query(first(builds), bound, :sampler)(u) ≈ density(u)
+            sampler = prepare_sampler(first(builds), bound, u; backend)
+            value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+            @test value ≈ density(u)
+            @test gradient ≈ finite_gradient(density, u) rtol=1e-7
+        end
+    end
+end
+
 end

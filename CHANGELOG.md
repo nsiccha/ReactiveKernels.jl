@@ -24,7 +24,7 @@ are recorded in the git history only.
   preparing one footprint kernel per type. Before, such a call threw the
   kernel's exemplar-type `ArgumentError`. `partition_footprint_kernel(kernel)`
   and the kernel itself stay typed for their exemplars. ReactiveKernelsPPL
-  0.1.113 prepares its partition kernels from exemplars and relies on this for
+  0.1.114 prepares its partition kernels from exemplars and relies on this for
   labels of mixed types.
 
 ## 0.1.103

@@ -312,6 +312,33 @@ end
     end
 end
 
+# A plate of open-RHS latents over data reads its rows from the binding, so
+# every row count generates one program and one build serves every binding
+# (snag `gmrf-field-packe-ab48cb09`).
+@testset "open RHS plate rows over data stay data" begin
+    ast = quote
+        a ~ Normal(0, 1)
+        @plate for i in eachindex(x)
+            b[i] ~ ExternalSamplingFixtures.ShiftExp(a)
+        end
+        y .~ Normal.(a .+ b .* x, 1)
+    end
+    datas = [Dict{Symbol,Any}(:x=>collect(range(0.2, 0.6; length=n)), :y=>fill(0.4, n))
+        for n in (2, 5)]
+    plan = lower_rkppl(ast, first(datas); mod=@__MODULE__, conditioned=(:y,))
+    bounds = [bind_data(plan, d) for d in datas]
+    builds = build_kernel.(bounds)
+    sources = [Base.remove_linenums!(kernel_expr(b, built.layout)) for (b, built) in zip(bounds, builds)]
+    @test sources[1] == sources[2]
+    for (bound, d) in zip(bounds, datas)
+        x, y = d[:x], d[:y]
+        oracle = w -> -log(2pi)/2-w[1]^2/2 + sum(-exp(w[i+1]) + w[i+1] +
+            ExternalSamplingFixtures.normal_lpdf(y[i], w[1]+(w[1]+exp(w[i+1]))*x[i])
+            for i in eachindex(x))
+        _external_gradient(first(builds), bound, vcat(0.2, fill(-0.4, length(x))), oracle)
+    end
+end
+
 @testset "RHS values, rebinding and missing capabilities" begin
     ast = quote
         a ~ Normal(0, 1)
