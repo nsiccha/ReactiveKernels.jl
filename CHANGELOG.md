@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.111
+
+- Reverts 0.1.110. A data-bound plate branch again prepares only the arms its
+  lanes take, so a binding whose lanes all take one arm runs its unsplit plate
+  again (an RKPPL censored Normal response with a bound scale and every row
+  observed: density back to 0.47 µs from 3–4 µs at 2000 rows), and another
+  pattern of taken arms again prepares, and compiles, its own program. The
+  one-program behaviour returns once split arms keep that speed.
+
 ## 0.1.110
 
 - A plate cell's lazy branch whose condition reads bound data keeps one
