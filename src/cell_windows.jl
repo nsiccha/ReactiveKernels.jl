@@ -3258,12 +3258,17 @@ _cell_members(t::_CellRegions, key::Int) = key > 0 ? Int[key] : t.sets[key]
 # whose blocks are therefore placed first. An unguarded statement may read a
 # guarded key's request rows: they are exported as no rows when its members are
 # empty, since then none of them asks for rows. Each member's last block assigns
-# its sum zero otherwise (`defaults`). Returns the statements and the key owning
-# each name bound under a guard, or `nothing` when a statement reads values of
-# disjoint members, or an unguarded statement reads a guarded value other than
-# request rows.
+# its sum zero otherwise (`defaults`). A statement binds the names it assigns
+# and those it writes in place (`_cell_written_names`, over the operation table
+# `ops`): a plate's buffer allocated unguarded and filled under a guard is that
+# guard's value, so its readers follow the fill instead of reading the buffer
+# before the guarded block runs (snag `cell-joined-rows-1ab77c3c`). Returns the
+# statements and the key owning each name bound under a guard, or `nothing` when
+# a statement reads values of disjoint members, or an unguarded statement reads
+# a guarded value other than request rows.
 function _cell_guard_group(statements::Vector{Any}, t::_CellRegions,
-                           preludes::Dict{Int,Vector{Any}}, defaults::Dict{Int,Any})
+                           preludes::Dict{Int,Vector{Any}}, defaults::Dict{Int,Any},
+                           ops)
     length(t.tags) == length(statements) ||
         error("internal: $(length(t.tags)) tags for $(length(statements)) group statements")
     owned = copy(t.symbols)
@@ -3329,7 +3334,7 @@ function _cell_guard_group(statements::Vector{Any}, t::_CellRegions,
             push!(out, st)
         else
             push!(pending[key], st)
-            foreach(name -> owned[name] = key, _assigned_names!(Set{Symbol}(), st))
+            foreach(name -> owned[name] = key, _cell_written_names(st, ops))
         end
     end
     for key in order(keys(pending))
@@ -3342,6 +3347,12 @@ function _cell_guard_group(statements::Vector{Any}, t::_CellRegions,
     end
     out, owned
 end
+
+# The names statement `st` binds: those it assigns, and those it writes in place
+# (an indexed or property write, an updating or broadcast assignment, a mutating
+# call's arguments; `_written_plan_symbols`).
+_cell_written_names(st, ops) = union!(_assigned_names!(Set{Symbol}(), st),
+    _written_plan_symbols(Any[st], _symbol_refs!(Set{Symbol}(), st), ops; reassign = false))
 
 # The read expression of a footprint entry under its guards, and those guards.
 function _footprint_entry_parts(kind, expr)
