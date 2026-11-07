@@ -176,7 +176,11 @@ end
     # log-Jacobian, the simplex and ordered transforms, and an `MvNormal`
     # covariance's factor and solve. The density is measured on the kernel:
     # the query's own call returns its value through a world-age barrier
-    # (`SamplerQuery`), which boxes the number it returns.
+    # (`SamplerQuery`), which boxes the number it returns. The simplex,
+    # ordered and `MvNormal` destinations come from RKPPL's MutatingFunctions
+    # extension; an environment whose manifest predates it allocates here.
+    @test Base.get_extension(ReactiveKernelsPPL,
+        :ReactiveKernelsPPLMutatingFunctionsExt) !== nothing
     for (label, plan) in _na_sampler_cases()
         @testset "$label" begin
             built = build_kernel(plan)
