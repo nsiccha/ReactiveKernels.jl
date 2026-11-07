@@ -156,3 +156,32 @@ end
         @test gradient ≈ ref_gradient rtol = 1e-12
     end
 end
+
+# The same gather over a parameter the model computes: `theta` is a `Vector` the
+# model fills, not a slice of the packed point. The density equals the direct
+# model's at `theta = 2z` up to the change of scale, so the exact oracle holds.
+const _CIG_COMPUTED = @rkppl begin
+    z[1:nrater] .~ Normal.(0, 1)
+    theta = 2 .* z
+    @plate for j in eachindex(nlevel)
+        score[j] .~ Ordinal.(Cumulative(), LogitLink(), theta[rater[j]],
+            Ref(cuts[j]), disc[j])
+    end
+end
+
+@testset "dotted cell gathers of a computed vector: values and gradients" begin
+    d = _cig_data(9, 6)
+    saved = deepcopy(d)
+    fx = _cig_prepare(_CIG_COMPUTED, d)
+    @test occursin("_ppl_cell_gather(theta", string(kernel_expr(fx.bound, fx.built.layout)))
+    for shift in (0.0, 0.35)
+        z = fx.u .+ shift
+        value, gradient = sampler_value_and_gradient!(fx.sampler, similar(z), z)
+        ref_value, ref_gradient = _cig_ordinal_oracle(2 .* z, d)
+        ref_value += d.nrater * log(2)
+        @test value ≈ ref_value rtol = 1e-13
+        @test gradient ≈ 2 .* ref_gradient rtol = 1e-12
+        @test fx.sampler(z) ≈ ref_value rtol = 1e-13
+    end
+    @test isequal(d, saved)
+end
