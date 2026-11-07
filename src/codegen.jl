@@ -5528,7 +5528,8 @@ function _lower_with_ops_collecting(p::Plan;
              Expr(:tuple, (nm(w) for w in p.want)...)
     _footprint_recording() &&
         (retval = _footprint_return(p, cells, names, declared, body;
-            guards = Dict(id => region_guards[owner] for (id, owner) in regions)))
+            guards = Dict(id => region_guards[owner] for (id, owner) in regions),
+            recipes = runtime_recipes))
     push!(body.args, Expr(:return, retval))
     # Compose before index runs duplicate a cell body into grouped/flat arms;
     # otherwise those mutually exclusive definitions appear to escape here.

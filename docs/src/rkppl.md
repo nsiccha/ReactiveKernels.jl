@@ -315,7 +315,9 @@ densities on increasing vectors, with no factorial normalizer.
 `c ~ Ordered(Flat(), n)` is Stan's `ordered[n] c;` with no prior statement:
 its elements have zero density, leaving the ordering transform's Jacobian.
 
-Ordered extents may be data-only expressions, including
+Ordered extents may be bound integer names, such as `n_cuts` in
+`c ~ Ordered(Normal(0, 1), n_cuts)` or `t[1:n_cuts] .~ Normal.(0, 1)`, or
+data-only expressions, including
 `length(levels(x)) - 1`, `length(levels(y)) - 2` and
 `length(unique(y)) - 1`. Binding evaluates the actual nonnegative integer
 extent even when a Gaussian response reads the vector. An ordinal response

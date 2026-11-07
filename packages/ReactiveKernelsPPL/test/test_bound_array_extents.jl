@@ -154,6 +154,8 @@ function _extent_check(source, datasets, want; conditioned = (:y,), same_type = 
 end
 
 _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
+# A value the model computes from data, as BRM's field support is.
+_extent_support(n) = (geometry = (n = n,),)
 
 @testset "one program for every extent of every packed block" begin
     @testset "one-axis arrays, the empty extent, and blocks packed after them" begin
@@ -221,6 +223,19 @@ _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
         level_builds = build_kernel.(level_bound)
         @test ==(map((b, l) -> Base.remove_linenums!(kernel_expr(b, l.layout)), level_bound, level_builds)...)
         @test ==(map((b, l) -> typeof(prepare_query(l, b, :sampler)), level_bound, level_builds)...)
+    end
+    @testset "an extent read through a property of bound data" begin
+        # `support.geometry.n` is a property of a value, as the model reads it,
+        # not a module path (snag `gmrf-field-packe-ab48cb09`).
+        programs = _extent_check(quote
+                support = _extent_support(N)
+                z[1:support.geometry.n] .~ Normal.(0, 1)
+                y .~ Normal.(z[k], 1.0)
+            end,
+            [(N = n, k = [1, n], y = [0.9, 1.0]) for n in (2, 5)],
+            (v, d) -> _normals(v.z) + sum(logpdf.(Normal.(v.z[d.k], 1.0), d.y)))
+        @test occursin("Base.getproperty(Base.getproperty(support, :geometry), :n)",
+            string(first(programs)))
     end
     @testset "plate latents, the empty loop included" begin
         loop = quote
@@ -305,6 +320,52 @@ _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
         fit = bind_data(inferred, (k = [1, 2, 3],))
         @test occursin("view(unconstrained, 1:2)",
             string(kernel_expr(fit, build_kernel(fit).layout)))
+    end
+    @testset "a bound name sizes ordered and stopping thresholds" begin
+        # BRM binds a threshold count beside the data, as it binds an array
+        # axis or an LKJ dimension (snag `rkppl-threshold-932a2e27`). The bare
+        # name is that count; the program reads it like `K - 1` above.
+        cumulative_lp(c, eta, k) = k == 1 ? log(logistic(c[1] - eta)) :
+            k == length(c) + 1 ? log1p(-logistic(c[end] - eta)) :
+            log(logistic(c[k] - eta) - logistic(c[k - 1] - eta))
+        stopping_lp(t, eta, k) =
+            sum((log1p(-logistic(t[j] - eta)) for j in 1:k-1); init = 0.0) +
+            (k == length(t) + 1 ? 0.0 : log(logistic(t[k] - eta)))
+        data = [(n_cuts = 2, x = [0.4, -0.3, 0.9], k = [1, 2, 3]),
+            (n_cuts = 3, x = [0.4, -0.3, 0.9, 0.1], k = [1, 2, 3, 4])]
+        want(lp, name) = (v, d) -> _normals(v.b) + _normals(v[name]) +
+            sum(lp.(Ref(v[name]), v.b .* d.x, d.k))
+        for (source, lp, name) in (
+                (quote
+                    b ~ Normal(0, 1)
+                    c ~ Ordered(Normal(0, 1), n_cuts)
+                    k .~ OrderedLogistic.(b .* x, Ref(c))
+                end, cumulative_lp, :c),
+                (quote
+                    b ~ Normal(0, 1)
+                    c ~ Ordered(Normal(0, 1), n_cuts)
+                    k .~ Ordinal.(Cumulative(), LogitLink(), b .* x, Ref(c))
+                end, cumulative_lp, :c),
+                (quote
+                    b ~ Normal(0, 1)
+                    t[1:n_cuts] .~ Normal.(0, 1)
+                    k .~ Ordinal.(StoppingRatio(), LogitLink(), b .* x, Ref(t))
+                end, stopping_lp, :t))
+            programs = _extent_check(source, data, want(lp, name); conditioned = (:k,))
+            @test occursin("n_cuts", string(first(programs)))
+            plan = lower_rkppl(source, first(data); conditioned = (:k,))
+            for bad in (1.5, -1, true)
+                @test_throws "length must be a nonnegative integer" bind_data(plan,
+                    merge(first(data), (n_cuts = bad,)))
+            end
+        end
+        # A sampled value cannot set the structural coordinate pack at bind.
+        live = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                c ~ Ordered(Normal(0, 1), a)
+                k .~ OrderedLogistic.(0.0, Ref(c))
+            end, (k = [1, 2, 3],); conditioned = (:k,))
+        @test_throws "needs data-only value a" bind_data(live, (k = [1, 2, 3],))
     end
     @testset "data-derived transform bounds are inputs, not numbers" begin
         programs = _extent_check(quote
@@ -410,6 +471,50 @@ _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
             reads = Base.invokelatest(partition_footprint, q.kernel, u, 2).unconstrained
             @test sort!(collect(reads)) == [ids[2]; [n + ids[2] + n * (j - 1) for j in 1:k]]
         end
+    end
+    @testset "a partition footprint reads this binding's packed positions" begin
+        # Snag `partition-plan-n-2b8a0d4a`: `W` and `b` start where the level-sized
+        # `Z` ends, a position read from the binding. The footprint kernel spliced
+        # those positions into its body, so every binding with another level count
+        # compiled the footprint again (10-17 s per ODL binding).
+        plan = lower_rkppl(quote
+                sigma ~ Exponential(1)
+                Z[levels(group), 1:2] .~ Normal.(0, 1)
+                W[levels(group)] .~ Normal.(0, 1)
+                b ~ Normal(0, 1)
+                mu = b .+ Z[group, 1] .+ x .* Z[group, 2] .+ W[group]
+                y .~ Normal.(mu, sigma)
+            end, (:group, :subject, :x, :y); conditioned = (:y,))
+        footprint_functions = map(((2, 3, 4, 5), (3, 1, 2, 2, 7, 1))) do sizes
+            G = length(sizes)
+            group = [g for (g, n) in enumerate(sizes) for _ in 1:n]
+            bound = bind_data(plan, (; group, subject = cld.(group, 2),
+                x = sin.(eachindex(group)), y = cos.(eachindex(group))))
+            built = build_kernel(bound)
+            q = prepare_partition(built, bound, :y; by = :subject,
+                partitioned = (:Z => [cld(g, 2) for g in 1:G],))
+            u = [0.3sin(i) for i in 1:built.layout.total]
+            fp = Base.invokelatest(ReactiveKernels.partition_footprint_kernel, q.kernel)
+            # The same lowering with every coordinate selected: positions this
+            # binding's lowering computes, as before the fix.
+            everything = :unconstrained =>
+                ReactiveKernels._FootprintSelection(trues(built.layout.total))
+            literal = Base.invokelatest(ReactiveKernels._partition_footprint_kernel,
+                q.kernel, everything)
+            first_of(name) = only(e.offset for e in built.layout.entries if e.name === name)
+            Zpos(g) = [first_of(:Z) - 1 + g + G * (j - 1) for j in 1:2]
+            for label in partition_labels(q)
+                reads = Base.invokelatest(fp, u, label, nothing).unconstrained
+                @test reads == Base.invokelatest(literal, u, label, nothing).unconstrained
+                @test first_of(:sigma) in reads && first_of(:b) in reads
+                @test first_of(:W) + G - 1 in reads
+                @test all(g -> Zpos(g) ⊆ reads, filter(g -> cld(g, 2) == label, 1:G))
+                @test all(g -> isdisjoint(Zpos(g), reads), filter(g -> cld(g, 2) != label, 1:G))
+            end
+            fp.f
+        end
+        # One footprint body for both level counts: its type is its generated code.
+        @test ==(typeof.(footprint_functions)...)
     end
     @testset "one retained build serves larger, smaller and empty bindings in turn" begin
         # The reporter's sequence (`ODLPlaus:precompile`, RK `bcb8134e`).

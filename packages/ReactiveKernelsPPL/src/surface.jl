@@ -12885,16 +12885,17 @@ function _levels_count(ex)
     return (ex.args[2].args[2], k)
 end
 
-# A vector's literal extent or data-only Julia expression. The exact linked
-# default retains `nothing` in the unbound IR; binding evaluates DataAPI
-# levels before the response reads its support.
+# A vector's literal extent, bound name or data-only Julia expression, as an
+# array axis and an LKJ dimension take it. Binding evaluates a name or an
+# expression. The exact linked default retains `nothing` in the unbound IR;
+# binding evaluates DataAPI levels before the response reads its support.
 function _threshold_size(lhs::Symbol, n, response::Union{Nothing,Symbol})
     n isa Base.BitInteger && n >= 0 && return Int(n)
     # Retain the historical inferred representation for the exact linked
     # default; bind resolves it from DataAPI levels, including unused levels.
     response !== nothing && _levels_count(n) == (response, 1) && return nothing
-    n isa Expr && return n
-    _sfail("vector $lhs length must be a nonnegative integer or a data-only expression, got $(repr(n))")
+    n isa Union{Symbol,Expr} && return n
+    _sfail("vector $lhs length must be a nonnegative integer, a bound name or a data-only expression, got $(repr(n))")
 end
 
 _resolve_extent_levels(ex) = ex isa Expr ? Expr(ex.head,
