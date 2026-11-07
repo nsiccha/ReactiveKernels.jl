@@ -16,6 +16,38 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.105
+
+- Another binding of one program no longer compiles its partition footprint
+  kernel again (`partition_footprint`, `partition_footprint_kernel`, and the
+  footprints ReactiveKernelsPPL's `prepare_partition` and
+  `prepare_partition_sampler` compute at preparation). The footprint lowering
+  computed the positions of a read through bound data from this binding's data
+  and wrote them into the generated body as a literal: a block's packed range
+  when its start or end is a bound number (RKPPL's positions of every block
+  after a data-sized one), and the positions of a gather by a bound index. A
+  binding with other sizes then had another body and another compile. In one
+  process binding an ODL model to four station networks, that body was the only
+  model code each later binding compiled, in a preparation that spent 10 to 17 s
+  compiling. The body
+  now reads those numbers and indices from the kernel's constants table when the
+  footprint runs, so every binding shares one body. Footprints are unchanged.
+  A footprint restricted to a selection of positions (ReactiveKernelsPPL's
+  `partition_footprint_kernel(q; shared = false)`) keeps its literal positions,
+  projected onto the selection once, because its body holds the selection
+  itself.
+
+## 0.1.104
+
+- `partition_footprint(kernel, args...)` of a kernel prepared from `exemplars`
+  takes arguments of other types too (another label type, a view of the point):
+  it returns the footprint of the same plan lowered from those arguments' types,
+  preparing one footprint kernel per type. Before, such a call threw the
+  kernel's exemplar-type `ArgumentError`. `partition_footprint_kernel(kernel)`
+  and the kernel itself stay typed for their exemplars. ReactiveKernelsPPL
+  0.1.114 prepares its partition kernels from exemplars and relies on this for
+  labels of mixed types.
+
 ## 0.1.103
 
 - A non-allocating kernel no longer has its own type per preparation.

@@ -336,7 +336,18 @@ _external_keywords(args) = Any[k for a in _external_authored_arguments(args)
 _external_constructor(args) = _external_call(args) ? args.rhs.args[1] : args.rhs
 _sampling_rhs_broadcast(rhs::Union{AbstractArray,Tuple,Ref}) = rhs
 _sampling_rhs_broadcast(rhs) = Ref(rhs)
+# The packed coordinates an endpoint receives, a fresh owned vector. A composed
+# graph endpoint and a plate read `unconstrained[a:b]`, whose rows the cell and
+# partition analyses follow.
 _external_u(e) = :(unconstrained[$(_entry_range(e))])
+# A host callback's coordinates, opaque to those analyses. A range the program
+# reads from data copies through `collect(view(...))`: when it is empty at run
+# time, Enzyme's ReverseWithPrimal returns a wrong primal (never a wrong
+# gradient) for `unconstrained[2:last]` and `copy(view(...))` passed to such a
+# call, so a sampler would report a wrong density (Enzyme snag
+# `enzyme-autodiff-e13097c4`). A literal range keeps `getindex`.
+_external_host_u(e) = e.positions === nothing ? _external_u(e) :
+    Expr(:call, GlobalRef(Base, :collect), _entry_view(e))
 _external_geometry_name(e) = Symbol(:_ppl_geometry_, e.name)
 # The authored argument expressions, rebuilt as source that evaluates to them.
 # That source reaches every object holding the program, the layout and the plan
@@ -362,15 +373,18 @@ function _external_geometry_expr(e)
         _external_constructor(e.sampling), Expr(:tuple, (_sampling_ast_literal(a) for a in _external_authored_arguments(e.sampling))...),
         Expr(:tuple, (_sampling_ast_literal(d) for d in e.sampling.geometry.shape)...))
 end
+# The shape the program passes the endpoints: the axes it reads from data
+# (`_layout_reads`), else this binding's literal axes.
+_external_shape(e) = Expr(:tuple, something(e.axes, e.dims)...)
 function _external_edge(e, edge)
     endpoint = edge === :_sampling_constrain ? :constrain : :logjac
     graph = _sampling_graph_call(e.sampling.geometry, endpoint,
         _external_geometry_expr(e),
-        Any[_external_u(e), Expr(:tuple, e.dims...), _external_arguments(e.sampling)...],
+        Any[_external_u(e), _external_shape(e), _external_arguments(e.sampling)...],
         _external_keywords(e.sampling))
     graph === nothing || return graph
     return _external_endpoint_call(GlobalRef(@__MODULE__, edge),
-        Any[_external_geometry_name(e), _external_u(e), Expr(:tuple, e.dims...),
+        Any[_external_geometry_name(e), _external_host_u(e), _external_shape(e),
             _external_arguments(e.sampling)...], _external_keywords(e.sampling))
 end
 
