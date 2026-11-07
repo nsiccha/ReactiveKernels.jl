@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.104
+
+- `partition_footprint(kernel, args...)` of a kernel prepared from `exemplars`
+  takes arguments of other types too (another label type, a view of the point):
+  it returns the footprint of the same plan lowered from those arguments' types,
+  preparing one footprint kernel per type. Before, such a call threw the
+  kernel's exemplar-type `ArgumentError`. `partition_footprint_kernel(kernel)`
+  and the kernel itself stay typed for their exemplars. ReactiveKernelsPPL
+  0.1.113 prepares its partition kernels from exemplars and relies on this for
+  labels of mixed types.
+
 ## 0.1.103
 
 - A non-allocating kernel no longer has its own type per preparation.

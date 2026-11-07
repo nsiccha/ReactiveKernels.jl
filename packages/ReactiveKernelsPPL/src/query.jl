@@ -1661,12 +1661,13 @@ therefore typed for a `Vector{Float64}` point and a label of the first label's
 type; `q(u, label)` prepares a kernel for any other point or label type once.
 
 For a value-only query's packed-coordinate footprint, call
-`ReactiveKernels.partition_footprint(q.kernel, u, label, nothing).unconstrained`
-with such a point and label.
+`ReactiveKernels.partition_footprint(q.kernel, u, label, nothing).unconstrained`,
+which takes any point and label type.
 The final `nothing` supplies the plan port; the footprint kernel computes its
 own row bookkeeping. A result of `:whole` means all positions of `u`.
 For repeated calls, prepare `ReactiveKernels.partition_footprint_kernel(q.kernel)`
-once and call it with `(u, label, nothing)` through `Base.invokelatest`.
+once and call it with `(u, label, nothing)` through `Base.invokelatest`; it is
+typed like `q.kernel`.
 This does not prepare AD. For individual cell supports, use the
 [`prepare_cell_query`](@ref) footprint recipe: preparing a partition with one
 label per cell would retain a partition plan for every cell.

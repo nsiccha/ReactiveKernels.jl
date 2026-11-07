@@ -1103,6 +1103,9 @@ function _footprint_selected(port::AbstractVector, records::Tuple, selection::_F
 end
 
 const _FOOTPRINT_KERNELS = IdDict{Any,Any}()
+# Per kernel prepared from exemplars, the footprint kernels of other argument
+# types (`partition_footprint`), by the arguments' types.
+const _FOOTPRINT_RETYPED = IdDict{Any,Dict{Any,Any}}()
 const _FOOTPRINT_LOCK = ReentrantLock()
 
 """
@@ -1134,10 +1137,22 @@ set, a conservative support for its gradient; numerical zeros and
 cancellations do not remove positions. This also works on a `plate_cell`
 kernel, with its cell index among `args`. For a planned partition, pass
 `nothing` in the plan port: footprint lowering computes its own bookkeeping.
+
+A kernel prepared from `exemplars` is typed for exactly their types, and so is
+its [`partition_footprint_kernel`](@ref). Called with arguments of other types
+(another label type, a view of the point), `partition_footprint` returns the
+footprint of the same plan lowered from those arguments' types, which is what
+a kernel prepared from them would read; it prepares that once per type.
 """
 function partition_footprint(kernel::PreparedKernel, args...)
     footprint = lock(_FOOTPRINT_LOCK) do
-        get!(() -> partition_footprint_kernel(kernel), _FOOTPRINT_KERNELS, kernel)
+        typed = get!(() -> partition_footprint_kernel(kernel), _FOOTPRINT_KERNELS, kernel)
+        signature = _exact_signature(typed)
+        signature === Nothing || args isa signature ||
+            length(args) != fieldcount(signature) || return get!(
+            () -> _partition_footprint_kernel(kernel, nothing; argument_types = map(typeof, args)),
+            get!(() -> Dict{Any,Any}(), _FOOTPRINT_RETYPED, kernel), typeof(args))
+        typed
     end
     Base.invokelatest(footprint, args...)
 end
@@ -1152,7 +1167,7 @@ prepares it once here and holds it itself. Call a freshly prepared kernel
 through `Base.invokelatest` when crossing Julia's world-age boundary.
 """
 partition_footprint_kernel(kernel::PreparedKernel) = _partition_footprint_kernel(kernel, nothing)
-function _partition_footprint_kernel(kernel::PreparedKernel, selection)
+function _partition_footprint_kernel(kernel::PreparedKernel, selection; argument_types = nothing)
     # A plate several cells read is composed into them first: each composed
     # cell's reads are recorded at that cell's positions
     # (`_footprint_capture_program`), and their union is what computing the
@@ -1163,7 +1178,9 @@ function _partition_footprint_kernel(kernel::PreparedKernel, selection)
     # Row demand uses the value kernel's type evidence and retains its call
     # guard, except for a plan port: footprints recompute that bookkeeping
     # and ignore the supplied plan (the documented placeholder is nothing).
-    exemplar_types = _plan_port_exemplar_types(p, kernel, Any)
+    # `argument_types` replaces that evidence with other arguments' types.
+    exemplar_types = argument_types === nothing ? _plan_port_exemplar_types(p, kernel, Any) :
+        _plan_port_types(p, Any[argument_types...], Any)
     exact_signature = exemplar_types === nothing ? Nothing : Tuple{exemplar_types...}
     ast, constants, callables, recipes = _sharing_cell_plans() do
         _lower_with_ops(p; footprint = true, footprint_selection = selection, exemplar_types)
@@ -1179,7 +1196,10 @@ end
 function _plan_port_exemplar_types(p::Plan, kernel::PreparedKernel, T)
     signature = _exact_signature(kernel)
     signature === Nothing && return nothing
-    types = Any[fieldtypes(signature)...]
+    _plan_port_types(p, Any[fieldtypes(signature)...], T)
+end
+# `types`, one per HAVE port of `p`, with the type at every plan port replaced by `T`.
+function _plan_port_types(p::Plan, types::Vector{Any}, T)
     for r in p.recipes
         r.op isa _AuthoredPlateCellOp && r.op.plan !== nothing || continue
         position = findfirst(v -> v.name === r.op.plan, p.have)

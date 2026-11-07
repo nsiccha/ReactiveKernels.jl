@@ -33,10 +33,13 @@ are recorded in the git history only.
 - **Breaking:** a `PartitionQuery`'s `q.kernel` is typed for a
   `Vector{Float64}` point and the first label's type, as a `CellQuery`'s kernel
   is. `q(u, label)` still takes any point and label type, preparing a kernel for
-  a new pair once. A direct `q.kernel(u, label, plan)` call, and
-  `ReactiveKernels.partition_footprint(q.kernel, u, label, nothing)`, need such a
-  point and label: convert the point with `Vector{Float64}(u)`. A key column with
-  no label is refused by name.
+  a new pair once, and so does
+  `ReactiveKernels.partition_footprint(q.kernel, u, label, nothing)` (ReactiveKernels
+  0.1.104). A direct `q.kernel(u, label, plan)` call and a held
+  `partition_footprint_kernel(q.kernel)` need that point and label type: call
+  `q(u, label)` or `partition_footprint` instead. A key column with no label is
+  refused by name.
+- Requires ReactiveKernels 0.1.104.
 
 ## 0.1.112
 
