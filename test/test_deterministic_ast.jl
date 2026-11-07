@@ -281,6 +281,59 @@ _det_embedded_ops(ast) = _det_embedded_ops!(Any[], ast)
     ast = :(f($(QuoteNode(1.5)), $(QuoteNode(:x)), y))
     @test RK._canonical_embedded(ast) == ast
     @test RK._canonical_embedded(ast).args[2] === ast.args[2]
+    # An embedded object that reaches state a call could write keeps its build's
+    # names, so two builds never share it.
+    stateful = (first(ops1), Ref(1.0))
+    @test RK._canonical_embedded(:(f($(QuoteNode(stateful))))).args[2].value === stateful
+    data = (first(ops1), [1.0, 2.0])
+    copied_data = RK._canonical_embedded(:(f($(QuoteNode(data))))).args[2].value
+    @test getfield(copied_data[1], :token) === RK._EMBEDDED_SOURCE_TOKEN
+    @test copied_data[2] === data[2]
+end
+
+# A child holding a plate, called under a lazy arm, is prepared when its caller
+# is defined and embedded in the caller's body whole (`_KernelPreparedChild`):
+# its plan and recipes carry the value ids of its build.
+_DET_ARM_CHILD_DEFINITIONS = (
+    :(@kernel _det_arm_child(ys::Vector{Float64}, mu::Float64) = begin
+        out::Vector{Float64} = plate(ys) do y
+            -abs2(y - mu) / 2
+        end
+        return sum(out)
+    end),
+    :(@kernel _det_arm_parent(ys::Vector{Float64}, limit::Float64, mu::Float64) = begin
+        tail::Float64 = limit < mu ? _det_arm_child(ys, mu) : 0.0
+        return tail
+    end))
+
+function _det_arm_build()
+    mod = Module(gensym(:DetBuild))
+    Core.eval(mod, :(using ReactiveKernels))
+    foreach(definition -> Core.eval(mod, definition), _DET_ARM_CHILD_DEFINITIONS)
+    Core.eval(mod, :_det_arm_parent)
+end
+
+@testset "a prepared child under a lazy arm does not name its build" begin
+    RK = ReactiveKernels
+    k1, k2 = prepare(_det_arm_build()), prepare(_det_arm_build())
+    children(ast) = (found = Any[];
+        walk(n) = (n isa QuoteNode && n.value isa RK._KernelPreparedChild && push!(found, n.value);
+                   n isa Expr && foreach(walk, n.args));
+        walk(ast); found)
+    c1, c2 = children(code_expr(k1)), children(code_expr(k2))
+    @test length(c1) == 1 && length(c2) == 1
+    @test only(c1).kernel.plan.have != only(c2).kernel.plan.have  # distinct builds' value ids
+    @test typeof(k1) === typeof(k2)
+    ys = [0.5, 1.0, -0.25]
+    @test k1(ys, 0.2, 1.0) == k2(ys, 0.2, 1.0)
+    @test k1(ys, 0.2, 1.0) ≈ sum(-abs2(y - 1.0) / 2 for y in ys)
+    @test k1(ys, 2.0, 1.0) == 0.0
+    # The body's copy calls the same compiled child.
+    copy = RK._embedded_execution_copy(only(c1))
+    @test typeof(copy) === typeof(only(c1))
+    @test copy.kernel.f === only(c1).kernel.f
+    @test copy(ys, 1.0) == only(c1)(ys, 1.0)
+    @test isempty(copy.kernel.plan.recipes)
 end
 
 @testset "a generated name is a function of the definition and its position" begin
