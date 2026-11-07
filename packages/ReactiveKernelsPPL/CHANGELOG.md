@@ -16,6 +16,25 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.124
+
+- With MutatingFunctions loaded, through the new weak dependency and
+  `ReactiveKernelsPPLMutatingFunctionsExt`, the non-allocating sampler
+  (`prepare_sampler(...; nonallocating = true)`) also reuses buffers for:
+  - the simplex transform, the vector and its log-Jacobian;
+  - the ordered transform;
+  - an `MvNormal` covariance's Cholesky factor and the slices' solved margins.
+
+  A warmed density (`q.kernel(u)`) and gradient then allocate nothing for
+  Dirichlet parameters, ordered vectors and `MvNormal` likelihoods, as well as
+  for the shapes of 0.1.119. Values and gradients are unchanged.
+- The `MvNormal` factor zeroes its upper triangle before the factor loop
+  rather than inside it. Native Enzyme reverse otherwise put the loop's reads
+  on its tape, 704 B per gradient at K = 20.
+- One vector's slice rows are a reshaped view rather than a reshaped
+  `Vector`, which builds an array object.
+- The ReactiveKernels compat floor is 0.1.113.
+
 ## 0.1.123
 
 - A compact authored-factor query (`prepare_query_ad(...; coordinates)`) keeps

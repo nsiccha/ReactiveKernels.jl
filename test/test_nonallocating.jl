@@ -13,8 +13,35 @@ function kernel_allocations(k, x, y)
     k(x, y)
     @allocated k(x, y)
 end
+function kernel_allocations(k, x, y, z)
+    k(x, y, z)
+    @allocated k(x, y, z)
+end
 
 include(joinpath(@__DIR__, "fixtures", "nonallocating_called_ops.jl"))
+
+module TracedStepsFixture
+using ReactiveKernels
+@traceable function centered_squares(x, w)
+    n, total = length(x), sum(x)
+    c = x .- total / n
+    c .* c .* w
+end
+const SPEC = @kernel traced_steps(x::Vector{Float64}, w::Float64) = begin
+    y::Vector{Float64} = centered_squares(x, w)
+    out::Float64 = sum(y)
+end
+end
+
+module TracedDispatchFixture
+using ReactiveKernels
+@traceable scaled(x, s) = x .* s
+scaled(x::Vector{Float64}, s::Float64) = x .* (2 * s)
+const SPEC = @kernel traced_dispatch(x::Vector{Float64}, s::Float64) = begin
+    y::Vector{Float64} = scaled(x, s)
+    out::Float64 = sum(y)
+end
+end
 
 # Fused captured sources resolve their free symbols in the authoring module.
 # This module deliberately shadows `vcat`; a name-based Base.vcat rewrite would
@@ -305,6 +332,48 @@ end
         @test kernel_allocations(k, A, 0.3) == 0
         # A matrix that is not square keeps LinearAlgebra's error.
         @test_throws DimensionMismatch k([1.0 2.0 3.0; 4.0 5.0 6.0], 0.3)
+    end
+
+    @testset "a traced helper's statements fill buffers of their own" begin
+        # A `@traceable` helper of assignments, a tuple assignment and a final
+        # expression: each array it builds becomes a step with a buffer.
+        spec = TracedStepsFixture.SPEC
+        ordinary = prepare(spec; have = (:x, :w), want = :out)
+        k = prepare_nonallocating(spec; have = (:x, :w), want = :out)
+        x = [sin(3i) for i in 1:40]
+        @test k(x, 0.7) == ordinary(x, 0.7)
+        @test k(2 .* x, 1.3) == ordinary(2 .* x, 1.3)
+        @test kernel_allocations(k, x, 0.7) == 0
+    end
+
+    @testset "a branch's arms fill buffers of their own" begin
+        # An authored `if` whose taken arm builds an array: each arm decomposes
+        # into its own steps, which run only when the arm is taken.
+        spec = @kernel branch_steps(x::Vector{Float64}, w::Vector{Float64},
+                                    valid::Bool) = begin
+            out::Float64 = if valid
+                sum(w .* log.(x))
+            else
+                -Inf
+            end
+        end
+        ordinary = prepare(spec; have = (:x, :w, :valid), want = :out)
+        k = prepare_nonallocating(spec; have = (:x, :w, :valid), want = :out)
+        x, w = [0.5 + 0.1i for i in 1:12], [cos(i) for i in 1:12]
+        @test k(x, w, true) == ordinary(x, w, true)
+        @test k(x, w, false) == ordinary(x, w, false) == -Inf
+        @test kernel_allocations(k, x, w, true) == 0
+    end
+
+    @testset "a traced helper's source stands only for its own method" begin
+        # A more specific plain method is the one these arguments call, so the
+        # generic method's recorded source must not replace it.
+        spec = TracedDispatchFixture.SPEC
+        ordinary = prepare(spec; have = (:x, :s), want = :out)
+        k = prepare_nonallocating(spec; have = (:x, :s), want = :out)
+        x = [cos(i) for i in 1:10]
+        @test ordinary(x, 0.5) == sum(x .* 1.0)
+        @test k(x, 0.5) == ordinary(x, 0.5)
     end
 
     @testset "postfix adjoint stays lazy inside broadcasts" begin

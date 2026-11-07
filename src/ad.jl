@@ -608,6 +608,12 @@ end
     return f(args...)
 end
 
+# A matrix plus a `UniformScaling` (`K + sigma * I`) fills the cache as the
+# primal step does (`_uniform_add_into!`), not through `A + J`, which would
+# allocate the matrix and its shadow on every gradient.
+@inline _ad_na_arith_loop!(slot::Base.RefValue, ::typeof(+), A::Matrix,
+                           J::UniformScaling) = _uniform_add_into!(slot[], A, J)
+
 @inline _ad_na_arith_matches(cache::Array{T,N}, args) where {T,N} =
     length(args) >= 2 && all(a -> a isa Array{T,N}, args) &&
     all(a -> Base.axes(a) == Base.axes(args[1]), args) &&

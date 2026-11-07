@@ -16,6 +16,32 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.113
+
+- A non-allocating kernel (`prepare_nonallocating`, and through it
+  ReactiveKernelsPPL's `prepare_sampler(...; nonallocating = true)`) gives more
+  array results a buffer of its own, with the same values:
+  - the arrays a `@traceable` helper builds when its body is straight-line:
+    assignments (`x = value`, `a, b = x, y`), calls run for their effect (an
+    argument check) and a final expression. This includes a helper whose own
+    result is a number or a tuple, such as a density;
+  - each arm of an authored `if`/`elseif`, decomposed into steps that run only
+    when that arm is taken;
+  - a call with a registered `MutatingFunctions.apply!!` method whose result
+    is a tuple holding an array, such as a transformed vector and its
+    log-Jacobian. The slot is stored again only when the result's arrays
+    change, since storing the tuple in it boxes it;
+  - a broadcast that plate cells only index and that is not composed lazily,
+    such as `log.(w)` read as `logw[z]`;
+  - the gradient of `A + s * I`, which allocated the matrix and its shadow
+    on every call.
+- Fixed: in a non-allocating kernel, a `@traceable` helper's recorded source
+  replaced a more specific plain method of the same function, such as a
+  `Float64` specialization, so the kernel computed the generic method's
+  result. The source now stands for a call only when its method is the one
+  the call dispatches to. `_traceable_source` returns that method's signature
+  as a fourth element.
+
 ## 0.1.112
 
 - A prepared body with two or more top-level plates runs each plate's loop as
