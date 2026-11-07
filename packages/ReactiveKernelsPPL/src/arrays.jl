@@ -1308,6 +1308,24 @@ function _array_labels(name::Symbol, dims::Vector{Int})
     return [Symbol(name, ".", i, ".", j) for j in 1:dims[2] for i in 1:dims[1]]
 end
 
+# The bound labels of each declared array's label axes (`levels(g)`,
+# `unique(g)`, a data vector), with their selection applied, in the order the
+# array's positions follow; `nothing` for a positional axis. Arrays without a
+# label axis are omitted. `coordinate_identities` reads them; the program never
+# does, so labels stay data of the binding.
+function _array_axis_labels(plan::StructuralPlan)
+    out = Dict{Symbol,Vector{Any}}()
+    for p in plan.array_parameters
+        (p.name in plan.conditioned || p.family === :external) && continue
+        axes = Any[_is_levels_dim(d) ?
+            _apply_subset(collect(Any, _array_axis_levels(plan, p.name, p.label, d)),
+                LevelMap(p.name, d.args[2], [], :levels, _levels_subset(d))) :
+            nothing for d in p.dims]
+        any(!isnothing, axes) && (out[p.name] = axes)
+    end
+    out
+end
+
 """Append the packed layout entries of the plan's array parameters
 starting at `offset`; returns the next free offset."""
 function _array_layout_entries!(entries::Vector{LayoutEntry},

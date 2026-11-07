@@ -269,7 +269,17 @@ struct LayoutTable
     cell_geometries::Dict{Symbol,CellGeometry}
     # The program's named data-derived positions and axis lengths (`_layout_reads`).
     reads::Vector{Expr}
+    # A declared array's bound axis labels (`_array_axis_labels`): one entry per
+    # constrained axis, the labels of a `levels(g)`, `unique(g)` or data-vector
+    # axis, `nothing` for a positional one. Arrays with no label axis are absent.
+    axis_labels::Dict{Symbol,Vector{Any}}
 end
+LayoutTable(entries::Vector{LayoutEntry}, total::Int, paths::Dict{Symbol,Tuple{Vararg{Symbol}}},
+        bound_values::Dict{Symbol,Any}, bound_exprs::Dict{Symbol,Any},
+        cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}},
+        cell_geometries::Dict{Symbol,CellGeometry}, reads::Vector{Expr}) =
+    LayoutTable(entries, total, paths, bound_values, bound_exprs, cell_latents,
+        cell_geometries, reads, Dict{Symbol,Vector{Any}}())
 LayoutTable(entries::Vector{LayoutEntry}, total::Int, paths::Dict{Symbol,Tuple{Vararg{Symbol}}},
         bound_values::Dict{Symbol,Any}, bound_exprs::Dict{Symbol,Any},
         cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}},
@@ -557,7 +567,7 @@ function assign_layout(plan::StructuralPlan)
         merge!(Dict{Symbol,Any}(plan.columns), _definition_memo(plan),
             pairs(_frozen_graph_values(plan))),
         Dict{Symbol,Any}(a.name => a.expr for a in _definitions(plan)),
-        plan.cell_latents, plan.cell_geometries, reads)
+        plan.cell_latents, plan.cell_geometries, reads, _array_axis_labels(plan))
 end
 
 """Constrained length of a `:vector` entry: simplex packs K−1 logits
@@ -1024,6 +1034,71 @@ function coordinate_names(layout::LayoutTable)
         end
     end
     return names
+end
+
+"""
+    coordinate_identities(layout) -> Vector{@NamedTuple{path::Tuple{Vararg{Symbol}}, index::Tuple}}
+
+One identity per packed coordinate, in packed order, that names what the
+coordinate means rather than where the binding put it, so the same coordinate
+of two bindings of one program (a slice and the whole, one window and the next)
+compares equal:
+
+- `path` is the authored path, as in [`parameter_metadata`](@ref): `(:b,)`, or
+  `(:z, :b)` inside a submodel.
+- `index` has one entry per packed axis. An axis declared `levels(g)`,
+  `unique(g)` or as a data vector holds that axis's bound label (the level of
+  `g`, with the declaration's selection applied); any other axis holds its
+  one-based position. A scalar's index is `()`. A legacy coefficient holds its
+  design label. The packed axis of a slice transform (a simplex or ordered row
+  or column) is positional; its other axis keeps its labels. Coordinates of a
+  joint cell latent or cell geometry are positional within their array.
+
+So `z[levels(station)] .~ Normal.(0, s)` packs `(path = (:z,), index =
+("st-05",))` wherever `st-05` falls in that binding's `levels(station)`, while
+[`coordinate_names`](@ref) names its position (`z.2` in one binding, `z.4` in
+another). Labels are data: comparing identities across bindings assumes the
+same level values mean the same thing in both.
+"""
+function coordinate_identities(layout::LayoutTable)
+    T = @NamedTuple{path::Tuple{Vararg{Symbol}}, index::Tuple}
+    ids = Vector{T}(undef, layout.total)
+    for e in layout.entries
+        path = _smc_output_path(layout, e)
+        indices = _entry_identity_indices(layout, e)
+        length(indices) == e.size || throw(DimensionMismatch(
+            "coordinate identities of $(e.name): $(length(indices)) for $(e.size) coordinates"))
+        for (j, index) in enumerate(indices)
+            ids[e.offset + j - 1] = T((path, index))
+        end
+    end
+    ids
+end
+
+function _entry_identity_indices(layout::LayoutTable, e::LayoutEntry)
+    e.kind === :coefficient && return Tuple[(label,) for label in e.labels]
+    e.kind === :sampled && e.size == 1 && return Tuple[()]
+    if e.kind === :array && !haskey(layout.cell_latents, e.name) &&
+            !haskey(layout.cell_geometries, e.name)
+        labels = get(layout.axis_labels, e.name, nothing)
+        if _is_lkj_stack(e.transform)
+            # `L.i.k`: partial i of level k, levels along the third axis.
+            K, S = e.dims[1], e.dims[3]
+            third = labels === nothing ? nothing : labels[3]
+            return Tuple[(i, third === nothing ? k : third[k])
+                for k in 1:S for i in 1:(K * (K - 1) ÷ 2)]
+        end
+        packed = _is_slice_transform(e.transform) ?
+            _slice_packed_dims(e.transform, e.dims) : collect(e.dims)
+        prod(packed; init = 1) == e.size || return Tuple[(j,) for j in 1:e.size]
+        event = !_is_slice_transform(e.transform) ? 0 :
+            _slice_transform_orientation(e.transform) isa _SliceRows ? 2 : 1
+        axis(a, i) = labels === nothing || a == event || labels[a] === nothing ? i :
+            labels[a][i]
+        return Tuple[ntuple(a -> axis(a, I[a]), length(packed))
+            for I in CartesianIndices(Tuple(packed))]
+    end
+    Tuple[(j,) for j in 1:e.size]
 end
 
 # Coefficient entries grouped by predictor in offset order (split
