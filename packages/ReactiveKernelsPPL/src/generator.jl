@@ -1532,7 +1532,8 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
         end
         push!(points, p.name => Symbol(:_ppl_pw_prior_, p.name))
     end
-    _array_prior_stmts!(stmts, terms, observed, gathers; context = plan, pointwise = points)
+    _array_prior_stmts!(stmts, terms, observed, gathers; context = plan, pointwise = points,
+        layout)
     _declare_observation_densities!(stmts, points)
     push!(stmts, :(likelihood::Float64 = $(_sum_terms(terms))))
     names = first.(points)
@@ -4789,7 +4790,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
     append!(stmts, scanstmts)
     append!(terms, scannodes)
     # Declared array parameters (`arrays.jl`).
-    _array_prior_stmts!(stmts, terms, plan, gathers; context, density_sites)
+    _array_prior_stmts!(stmts, terms, plan, gathers; context, density_sites, layout)
     push!(stmts, :(prior::Float64 = $(_sum_terms(terms))))
     return stmts
 end

@@ -1,6 +1,7 @@
 using DifferentiationInterface
 using Distributions
 using Enzyme
+using LinearAlgebra: Cholesky, LowerTriangular, UpperTriangular
 using LogExpFunctions: logistic
 using ReactiveKernels
 using ReactiveKernelsPPL
@@ -223,6 +224,74 @@ _extent_support(n) = (geometry = (n = n,),)
         level_builds = build_kernel.(level_bound)
         @test ==(map((b, l) -> Base.remove_linenums!(kernel_expr(b, l.layout)), level_bound, level_builds)...)
         @test ==(map((b, l) -> typeof(prepare_query(l, b, :sampler)), level_bound, level_builds)...)
+    end
+    @testset "an LKJ factor's dimension and the blocks packed after it" begin
+        # A data dimension K sizes the factor's K(K - 1)/2 partials, its loops,
+        # its prior's normalizer and diagonal, and the blocks packed after it;
+        # the program reads them all from the data (snag `rkppl-lkjcholesk-e8d4d0d6`).
+        lkj_factor(L, uplo) = uplo === 'U' ? Cholesky(UpperTriangular(L)) :
+            Cholesky(LowerTriangular(L))
+        lkj_prior(L, eta, uplo) = size(L, 1) == 1 ? 0.0 :
+            logpdf(LKJCholesky(size(L, 1), eta, uplo), lkj_factor(L, uplo))
+        response(L, uplo) = uplo === 'U' ? L[1, end] : L[end, 1]
+        want(eta, uplo) = (v, d) -> lkj_prior(v.L, eta === nothing ? d.eta : eta, uplo) +
+            _normals(v.w) + sum(logpdf.(Normal.(response(v.L, uplo) .* d.x .+ v.w[1], 0.7), d.y))
+        # A scalar packs first, so the factor's block starts after it, as BRM's
+        # field scales precede its correlation factor.
+        shifted(eta, uplo) = (v, d) -> logpdf(Normal(), v.a) + lkj_prior(v.L, eta === nothing ? d.eta : eta, uplo) +
+            _normals(v.w) + sum(logpdf.(Normal.(response(v.L, uplo) .* d.x .+ v.w[1] .+ v.a, 0.7), d.y))
+        x, y = [0.3, -0.5, 0.7], [0.1, -0.2, 0.3]
+        for (K, eta, uplo, data) in (
+                (:K, :eta, 'L', [(K = K, eta = eta, x, y) for (K, eta) in ((2, 1.7), (3, 0.8), (5, 2.3))]),
+                (:K, 2.0, 'L', [(K = K, x, y) for K in (2, 4)]),
+                (:K, 1.0, 'L', [(K = K, x, y) for K in (2, 4)]),
+                (:K, :eta, 'U', [(K = K, eta = 1.4, x, y) for K in (2, 3)]),
+                (:(length(channels)), :eta, 'L', [(channels = collect(1:K), eta = 1.4, x, y) for K in (2, 3)]))
+            source = quote
+                a ~ Normal(0, 1)
+                L ~ LKJCholesky($K, $eta, $uplo)
+                w[1:2] .~ Normal.(0, 1)
+                y .~ Normal.($(uplo === 'U' ? :(L[1, end]) : :(L[end, 1])) .* x .+ w[1] .+ a, 0.7)
+            end
+            programs = _extent_check(source, data, shifted(eta isa Symbol ? nothing : eta, uplo))
+            text = string(first(programs))
+            @test occursin("_ppl_lkj_count_L::Int = Base.div(", text)
+            @test occursin("_ppl_last_L::Int = 1 + _ppl_lkj_count_L", text)
+            @test occursin("view(unconstrained, 2:_ppl_last_L)", text)
+            @test occursin("_ppl_first_w::Int = _ppl_last_L + 1", text)
+            # The factor's loops read the dimension and its partials count.
+            dim = K isa Symbol ? "K" : "_ppl_axis1_L"
+            @test occursin("ones(Float64, $dim)", text)
+            @test occursin("for p = 1:_ppl_lkj_count_L", text)
+            @test occursin("for i = 2:$dim", text)
+        end
+        # K = 1 packs nothing, and a conditioned factor packs no block at all;
+        # both read the dimension from the data, as the sampled factor does. A
+        # factor packed from 1 ends at its partials count.
+        programs = _extent_check(quote
+                L ~ LKJCholesky(K, eta)
+                w[1:2] .~ Normal.(0, 1)
+                y .~ Normal.(L[end, 1] .* x .+ w[1], 0.7)
+            end,
+            [(K = K, eta = 1.4, x, y) for K in (1, 3)], want(nothing, 'L'); same_type = false)
+        @test occursin("_ppl_first_w::Int = _ppl_lkj_count_L + 1", string(first(programs)))
+        observed = [(K = K, eta = 1.4, L = lkj_chol_constrain(fill(0.2, K * (K - 1) ÷ 2), K), x, y)
+            for K in (2, 4)]
+        programs = _extent_check(quote
+                L ~ LKJCholesky(K, eta)
+                y .~ Normal.(L[end, 1] .* x, 0.7)
+            end,
+            observed, (v, d) -> lkj_prior(d.L, d.eta, 'L') +
+                sum(logpdf.(Normal.(d.L[end, 1] .* d.x, 0.7), d.y)); conditioned = (:y, :L))
+        @test occursin("for i = 2:K", string(first(programs)))
+        # A literal dimension is the program it always was.
+        literal = bind_data(lower_rkppl(quote
+                L ~ LKJCholesky(3, eta)
+                y .~ Normal.(L[end, 1] .* x, 0.7)
+            end, (eta = 1.4, x, y); conditioned = (:y,)), (eta = 1.4, x, y))
+        text = string(kernel_expr(literal, build_kernel(literal).layout))
+        @test occursin("view(unconstrained, 1:3)", text)
+        @test !occursin("_ppl_lkj_count_L", text)
     end
     @testset "an extent read through a property of bound data" begin
         # `support.geometry.n` is a property of a value, as the model reads it,

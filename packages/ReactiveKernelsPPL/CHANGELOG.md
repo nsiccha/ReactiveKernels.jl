@@ -16,6 +16,27 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.116
+
+- A declared `L ~ LKJCholesky(K, eta)` factor whose dimension `K` reads data
+  (a bound integer such as `channels`, `length(channels)`, `size(M, 2)` or a
+  definition) is read by the program: its packed range, the `K(K - 1)/2`
+  partials count (`_ppl_lkj_count_L`), the transform, Jacobian and prior loops,
+  the prior's normalizer, and the positions of every block packed after it.
+  Every `K` of one declaration now generates the same `kernel_expr` and one
+  `build_kernel` serves every binding, conditioned factors included. Before,
+  the program spelled `K`, so each dimension generated its own program and
+  shifted the literal positions of the blocks after it. A literal `K` keeps
+  the program it always had. With a literal `eta`, a data `K` computes the
+  normalizer in the program (`lkj_logconst`'s general formula, which equals its
+  `eta == 1` branch to rounding). This removes "an LKJ array's dimension" from
+  the 0.1.108 list of paths that stay literal; per-level LKJ stacks keep their
+  literal `K`, and LKJ scalar edges and stacks keep their literal coordinates.
+- **Breaking:** a raw `ReactiveKernels.prepare(built.spec; have = (:unconstrained,),
+  want = :L)` cut of a factor whose `K` reads data now needs that data, as a cut
+  of a data-sized array already does: name it in `have` or pass it as `bound`
+  (`rkppl-use` section 14). A literal `K` needs nothing new.
+
 ## 0.1.115
 
 - An ordered or threshold vector's length may be a bare bound name, as an array
