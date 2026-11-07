@@ -250,7 +250,9 @@ restrictions/truncations are not built yet.
 a vector literal containing live values, or an array-valued definition.
 `Dirichlet(K, a)` takes a literal dimension and a live scalar concentration.
 The concentration shape determines the simplex size at binding; it does not
-replicate the density body. Concentrations must be positive.
+replicate the density body. When the concentration is bound data, or computed
+from it, the program reads its length, so one build serves every length.
+Concentrations must be positive.
 
 Dynamic Normal, Cauchy and Weibull truncation and hierarchical Dirichlet
 support native primal and reverse execution. Gamma, Beta and InverseGamma

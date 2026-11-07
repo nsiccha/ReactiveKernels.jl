@@ -1514,7 +1514,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
             _hidden_state_entry!(stmts, latents, uncovered_latents, plan, p)
     end
     for p in observed.vector_parameters
-        _vector_parameter_prior_stmts!(stmts, terms, p)
+        _vector_parameter_prior_stmts!(stmts, terms, plan, p)
         value = p.family === :vector_normal ?
             (p.size == 0 ? :(zeros(0)) : Symbol(:_ppl_pw_prior_, p.name)) :
             Symbol(:_ppl_prior_, p.name)
@@ -4750,7 +4750,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
     # joint-factor scales/Cholesky): one plate-sum or broadcast per vector
     # (bound plans carry concrete sizes). Empty packs contribute 0.0.
     for p in plan.vector_parameters
-        _vector_parameter_prior_stmts!(stmts, terms, p)
+        _vector_parameter_prior_stmts!(stmts, terms, plan, p)
         if density_sites !== nothing
             independent = haskey(_VECTOR_ELEMENT_FAMILIES, p.family) &&
                 !_is_ordered_parameter(p.family)
@@ -5090,9 +5090,11 @@ end
 # elementwise Exponential over the scale scalars (a literal scale inlines;
 # a sampled hyperparameter resolves as a body local) and the shared LKJ
 # node over the Cholesky scalars. None of the leveled (data-sized) forms
-# grows with the vector length.
+# grows with the vector length. A simplex checks its concentration against
+# its length as the layout reads it, so a bound concentration's length stays
+# an input of the program, not a number in it.
 function _vector_parameter_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
-        p::VectorParameter)
+        plan::StructuralPlan, p::VectorParameter)
     m = p.size
     m === nothing && throw(ContractValidationError(
         "[generator] vector parameter $(p.name) has unresolved size " *
@@ -5116,9 +5118,10 @@ function _vector_parameter_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         normalizer = Symbol(:_ppl_dirichlet_normalizer_, p.name)
         powers = Symbol(:_ppl_dirichlet_powers_, p.name)
         lgamma = GlobalRef(DistributionKernelSources, :loggamma)
+        k = _vector_length_read(_read_tests(plan), p)
         push!(stmts, :($concentration = $arg))
         push!(stmts, :($valid = begin
-            _check_slice_vector_arg("the Dirichlet concentration", $concentration, 1, $m)
+            _check_slice_vector_arg("the Dirichlet concentration", $concentration, 1, $k)
             all(isfinite.($concentration) .& ($concentration .> 0))
         end))
         push!(stmts, :($normalizer = if $valid
