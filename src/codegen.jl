@@ -4617,7 +4617,7 @@ function _lower_guarded_cell_group!(outer_body::Expr, runtime_ops, runtime_recip
         foreach(v -> owner[canon_id(g, v.id)] = key, r.outputs)
     end
     symbols = Dict{Symbol,Int}()
-    for key in keys, name in _assigned_names!(Set{Symbol}(), region_bodies[key])
+    for key in keys, name in _cell_written_names(region_bodies[key], runtime_ops)
         symbols[name] = key
     end
     state = _CellRegions(owner, Dict{Int,Any}(k => region_guards[k] for k in keys), sets,
@@ -4639,7 +4639,8 @@ function _lower_guarded_cell_group!(outer_body::Expr, runtime_ops, runtime_recip
     end
     guards = collect(values(state.guards))
     placed = _cell_guard_group(body.args, state,
-        Dict{Int,Vector{Any}}(k => region_bodies[k].args for k in keys), defaults)
+        Dict{Int,Vector{Any}}(k => region_bodies[k].args for k in keys), defaults,
+        runtime_ops)
     if placed === nothing
         foreach(k -> append!(outer_body.args, region_bodies[k].args), _cell_region_order(keys, sets))
         append!(outer_body.args, body.args)
