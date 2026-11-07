@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.101
+## 0.1.102
 
 - A partition sampler or query with a cached shared prefix (`partitioned=`)
   keeps a plate read through a type guard at each partition's rows. One example
@@ -31,6 +31,17 @@ are recorded in the git history only.
   queries are prepared with. Its prefix and residual keep the branch, so each
   point type they are prepared for proves its own arm. Values and gradients are
   unchanged. A unit's gradient now costs its own rows, not the whole plate.
+
+## 0.1.101
+
+- A read-only gather of a `Vector` by a `Vector{Int}` (`_readonly_gather`, which
+  RKPPL's `theta[child[j]]` in a dotted plate cell reaches) no longer runs
+  `Base.view`'s alias check, as a gather of a packed slice already did not. The
+  result type is unchanged, and the gather still checks bounds. On a ragged
+  nested plate over a computed parameter, such as a non-centered PosteriorDB
+  Bones with `theta = 36 .* z`, value and gradient took 1.37 to 1.39 times the
+  hand-written loop on Julia 1.12 and 1.13, and now take about the same as it.
+  Julia 1.10 is unchanged, and so are values and gradients.
 
 ## 0.1.100
 

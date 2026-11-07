@@ -394,4 +394,25 @@ end
     end
     @test bytes[2] < 2bytes[1]
 end
+
+# A gather of a computed vector reads what `view` reads and has its type, without
+# `view`'s per-call alias check: nothing writes either side of a read-only gather.
+@testset "read-only gather of a Vector" begin
+    source = [10.0, 20.0, 30.0, 40.0]
+    rows = [4, 1, 1]
+    gathered = ReactiveKernels._readonly_gather(source, rows)
+    @test typeof(gathered) === typeof(view(source, rows))
+    @test gathered == [40.0, 10.0, 10.0]
+    @test parent(gathered) === source
+    @test parentindices(gathered)[1] === rows
+    @test isempty(ReactiveKernels._readonly_gather(source, Int[]))
+    @test_throws BoundsError ReactiveKernels._readonly_gather(source, [1, 5])
+    @test_throws BoundsError ReactiveKernels._readonly_gather(source, [0])
+    # Indices that are the parent's own storage still read the right entries.
+    self = [2, 1, 3]
+    @test ReactiveKernels._readonly_gather(self, self) == [1, 2, 3]
+    # Everything else keeps Base's view: a boolean mask and a range index.
+    @test ReactiveKernels._readonly_gather(source, [true, false, true, false]) == [10.0, 30.0]
+    @test ReactiveKernels._readonly_gather(source, 2:3) == [20.0, 30.0]
+end
 end
