@@ -16,6 +16,22 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.106
+
+- A program that calls a child kernel in a generator term, a loop or a lazy arm
+  keeps one prepared type across builds. Such a call splices the child's
+  operations into the caller's source as objects, and the compiled body embedded
+  each with its definition token and the module it was written in. A generator
+  that evaluates every build in a fresh module, as BayesianRegressionModels does,
+  made both differ per build, and the body's content id reads every field, so
+  each build of the same program and binding prepared another sampler type and
+  compiled it again: an ODL archive target's sampler, rebuilt with the same
+  binding or another data value. The body now embeds each operation with one
+  token and no module, keeping its record, call identity and throw-stripped
+  twin; the plan and `code_expr` keep the original operations. A Julia-owned
+  closure (a generator or comprehension body) that holds such an operation
+  shares its type across builds the same way.
+
 ## 0.1.105
 
 - Another binding of one program no longer compiles its partition footprint

@@ -361,7 +361,12 @@ function over its captured values, its parameter names in the record's type;
 the token and the module stay on the recipe's operation), so identical
 fresh builds reuse operation and derivative types without merging their graph
 identities or caching bound data, and a prepared kernel's callables table
-holds the records themselves. A capture-free operation table stays
+holds the records themselves. A child called in a generator term, a loop or a
+lazy arm is spliced into its caller's source as its operations themselves, and
+the compiled body embeds them; the body keeps each operation's record, form,
+call identity and throw-stripped twin, but one token and no module, because
+the content id of a runtime-generated function reads every field of what its
+body embeds. A capture-free operation table stays
 free of heap references that Enzyme would otherwise have to prove read-only in
 the differentiated callable. Bodies with local functions, generators, exception
 scopes, or boxed lexical cells retain Julia's native closure, called with a

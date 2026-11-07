@@ -6548,7 +6548,8 @@ end
 # unchanged, as `@_native_context` below does: its hygiene qualifies the globals.
 # A package whose lowered bodies name its own functions compiles them this way.
 function _compile(ast::Expr, context::Module, native_context::GlobalRef)
-    ast = _distinguish_module_generations(_canonical_locals(_canonical_globals(ast)))
+    ast = _distinguish_module_generations(
+        _canonical_embedded(_canonical_locals(_canonical_globals(ast))))
     f = RuntimeGeneratedFunction(context, context, ast)
     image = _image_program(f)
     image === nothing || return image
@@ -6614,6 +6615,45 @@ function _canonical_locals(ast::Expr)
         node isa Expr || return node
         node.head === :quote && return node
         Expr(node.head, map(walk, node.args)...)
+    end
+    walk(ast)
+end
+
+# A composed call splices the source operations of the endpoint it inlines
+# into its own source as objects (`$(QuoteNode(op))`,
+# `_kernel_inline_endpoint_call`), and lowering keeps them in the body. Such an
+# operation carries provenance beside its record: a definition token from the
+# process-global `gensym` counter, which composition merges recipes on, and
+# the module its source was written in, which BRM creates anew for every build
+# (`##RKEmittedModels#N`). `RuntimeGeneratedFunctions` hashes every field of an
+# object a body embeds into the body's content id, so each build of one program
+# compiled another body of another callable type, and every reader of it
+# compiled again (snag `sampler-runtimeg-13afd928`: an ODL archive sampler, one
+# new type per build of the same binding). The call reads only the record
+# (`_kernel_source_call` calls `op.f`), so the body keeps an execution copy:
+# one token and no module. The record, its captured values, the call identity
+# and the throw-stripped twin's record are kept, so bodies that run different
+# code or read different values keep different ids.
+const _EMBEDDED_SOURCE_TOKEN = :rk_srcop
+
+_embedded_execution_copy(x) = x
+Base.@nospecializeinfer function _embedded_execution_copy(
+        @nospecialize(op::_KernelSourceOp))
+    _KernelSourceOp(Val(_EMBEDDED_SOURCE_TOKEN), Val(getfield(op, :form)),
+                    getfield(op, :f),
+                    _embedded_execution_copy(getfield(op, :ignored_throws)),
+                    getfield(op, :call_identity), nothing)
+end
+
+function _canonical_embedded(ast::Expr)
+    function walk(node)
+        if node isa QuoteNode
+            value = _embedded_execution_copy(node.value)
+            return value === node.value ? node : QuoteNode(value)
+        end
+        node isa Expr || return _embedded_execution_copy(node)
+        node.head === :quote && return node
+        Expr(node.head, Any[walk(arg) for arg in node.args]...)
     end
     walk(ast)
 end

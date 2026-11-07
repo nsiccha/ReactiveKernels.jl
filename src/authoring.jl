@@ -3538,9 +3538,11 @@ end
 # executable types and compiled its readers and kernels again (snag
 # `compiled-reader-be3cadbb`: the arms of a branch in a kernel BRM evaluates
 # into a fresh module per build). A closure whose source, up to
-# generated names and the owners of its qualified globals (`_canonical_globals`),
-# equals an earlier closure's, from a module that binds every unqualified name
-# the source mentions to the same value, takes that closure's type,
+# generated names, the owners of its qualified globals (`_canonical_globals`)
+# and the provenance of the source operations a composed call spliced into it
+# (`_canonical_embedded`), equals an earlier closure's, from a module that
+# binds every unqualified name the source mentions to the same value, takes
+# that closure's type,
 # holding its own captured values: the two lower to the same method and read
 # the same bindings. A package image records its closures, so a build after
 # loading the image takes the image's types and runs the code it compiled.
@@ -3553,7 +3555,7 @@ Base.@nospecializeinfer function _kernel_shared_closure(@nospecialize(f), source
     home = parentmodule(T)
     names = _kernel_mentioned_names!(Set{Symbol}(), source)
     key = (:closure, RuntimeGeneratedFunctions.expr_to_id(
-        _canonical_locals(_canonical_globals(source))))
+        _canonical_embedded(_canonical_locals(_canonical_globals(source)))))
     entry = _image_shared_closure(key, home, names)
     if entry === nothing
         entry = @lock _SHARED_CLOSURES_LOCK begin
