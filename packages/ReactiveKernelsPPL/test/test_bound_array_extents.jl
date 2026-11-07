@@ -123,8 +123,9 @@ _extent_central(f, u; h = 1e-6) =
 # Each binding's density from the host's constrained values and log-Jacobian,
 # which do not read the generated program: `(constrained, data) -> density`
 # without the Jacobian.
-function _extent_check(source, datasets, want; conditioned = (:y,), same_type = true)
-    plan = lower_rkppl(source, first(datasets); conditioned)
+function _extent_check(source, datasets, want; conditioned = (:y,), same_type = true,
+        mod::Module = Main)
+    plan = lower_rkppl(source, first(datasets); conditioned, mod)
     bound = [bind_data(plan, d) for d in datasets]
     builds = build_kernel.(bound)
     programs = [Base.remove_linenums!(kernel_expr(b, built.layout))
@@ -156,6 +157,13 @@ end
 _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
 # A value the model computes from data, as BRM's field support is.
 _extent_support(n) = (geometry = (n = n,),)
+# BRM's monotonic effect: a simplex over the steps between ordered levels, with
+# its concentration an argument bound beside the data.
+@rkppl _extent_monotonic(c, alpha, loc, scale) = begin
+    simplex_incr ~ Dirichlet(alpha)
+    beta ~ Normal(loc, scale)
+    return beta .* cumsum(vcat(0.0, simplex_incr))[c]
+end
 
 @testset "one program for every extent of every packed block" begin
     @testset "one-axis arrays, the empty extent, and blocks packed after them" begin
@@ -366,6 +374,33 @@ _extent_support(n) = (geometry = (n = n,),)
                 k .~ OrderedLogistic.(0.0, Ref(c))
             end, (k = [1, 2, 3],); conditioned = (:k,))
         @test_throws "needs data-only value a" bind_data(live, (k = [1, 2, 3],))
+    end
+    @testset "a bound concentration's length sizes a simplex" begin
+        # The simplex has its concentration's length. The program reads that
+        # length both to pack the coordinates and to check the concentration,
+        # so 3 and 4 levels are one program (snag `rkppl-dirichlet-09d87c95`).
+        data = [(alpha = [1.0, 2.0], k = [1, 3, 2], y = [0.1, -0.2, 0.4]),
+            (alpha = [1.0, 2.0, 1.5], k = [1, 4, 2], y = [0.1, -0.2, 0.4])]
+        steps(beta, s, k) = beta .* cumsum(vcat(0.0, s))[k]
+        programs = _extent_check(quote
+                b ~ Normal(0, 1)
+                s ~ Dirichlet(alpha)
+                y .~ Normal.(b .* cumsum(vcat(0.0, s))[k], 1.0)
+            end, data,
+            (v, d) -> logpdf(Normal(), v.b) + logpdf(Dirichlet(d.alpha), v.s) +
+                sum(logpdf.(Normal.(steps(v.b, v.s, d.k), 1.0), d.y)))
+        @test occursin("_ppl_dirichlet_alpha_s, 1, length(alpha))", string(first(programs)))
+        # BRM emits the simplex inside a component whose argument is the bound
+        # concentration.
+        programs = _extent_check(quote
+                mo ~ _extent_monotonic(k, alpha, 0.0, 1.0)
+                y .~ Normal.(mo, 1.0)
+            end, data,
+            (v, d) -> logpdf(Normal(), v.mo.beta) +
+                logpdf(Dirichlet(d.alpha), v.mo.simplex_incr) +
+                sum(logpdf.(Normal.(steps(v.mo.beta, v.mo.simplex_incr, d.k), 1.0), d.y));
+            mod = @__MODULE__)
+        @test occursin("1, length(alpha))", string(first(programs)))
     end
     @testset "data-derived transform bounds are inputs, not numbers" begin
         programs = _extent_check(quote

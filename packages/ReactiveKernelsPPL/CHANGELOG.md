@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.117
+
+- A simplex whose `Dirichlet` concentration is bound data, such as
+  `s ~ Dirichlet(alpha)` with `alpha` bound beside the data or BRM's monotonic
+  effect with its concentration as an input, keeps one program for every
+  concentration length. The packed coordinates already read `length(alpha)`;
+  the concentration check now reads it too, where it used to write this
+  binding's length as a number, so a build for 3 levels served no binding with 4.
+
 ## 0.1.116
 
 - Authored-factor queries (`prepare_query` and `prepare_query_ad` over
