@@ -290,6 +290,24 @@ end
     cache
 end
 
+# The native body's `vcat` of numbers and dense vectors (`_native_vcat`), the
+# step a vector literal of numbers concatenates through: the operands fill a
+# matching vector cache in order, as `_native_vcat` fills its fresh vector.
+# Another element type or length, an operand that may share memory with the
+# cache, or other operands return the step's own result instead.
+@inline function MutatingFunctions.apply!!(
+        cache::Vector{T},
+        op::ReactiveKernels._ConcatenateStep{typeof(ReactiveKernels._native_vcat)},
+        a::ReactiveKernels._NativeColumnOperand,
+        rest::Vararg{ReactiveKernels._NativeColumnOperand,N}) where {T,N}
+    args = (a, rest...)
+    isbitstype(T) && Base.promote_eltypeof(args...) === T || return op.f(args...)
+    n = ReactiveKernels._native_cat_height_sum(args)
+    length(cache) == n || return op.f(args...)
+    ReactiveKernels._lane_vcat_aliases(cache, args) && return op.f(args...)
+    ReactiveKernels._native_vcat_copy!(cache, n, 0, args)
+end
+
 # One-dimensional gather without constructing the view object: contiguous
 # ranges copy with offsets, anything else 1-D copies elementwise in index
 # order — both bit-identical to `x[idx]`, whose bounds behavior they preserve
