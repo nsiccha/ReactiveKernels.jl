@@ -1044,6 +1044,30 @@ This is dependency-stratified map-plus-reduce/collect. It is not a general scan,
 fold with loop-carried state, segmented reduction, parallel reduction,
 associative tree reduction, or an effect-ordering construct.
 
+#### One program per plate loop
+
+A prepared body with two or more top-level plates compiles each plate's loop as
+a program of its own (`_PlateProgram`), which the body calls where the plate
+stood. The call passes what the loop reads from the body, and the program
+returns its pointwise vector and its total. `code_expr` prints each such
+program in place, as `(function (args...) … end)(args...)`. A body with one
+plate keeps its loop inline, as before.
+
+Compiled into one function, the loops did not vectorize alike: LLVM vectorized
+the first and left the others scalar. An RKPPL model with Normal likelihoods
+over 2000 rows each took 0.22–0.30 ns per row and likelihood with one
+likelihood, 0.69–0.70 with two and 1.13–1.21 with eight; with a program per
+loop it takes 0.20–0.25 at every count. Values, gradients, allocations and
+compile times are unchanged.
+
+Ordinary AD differentiates the body with its plate loops inline. A reverse
+sweep vectorizes nothing, and Enzyme's static activity analysis refuses a bound
+array passed beside an active value in a plate program's argument tuple.
+
+Only bodies prepared by `prepare` do this, and only plates that keep no
+per-cell tables. A transform `pass` given to `prepare` sees the plate loops
+inline, before they become programs.
+
 ### Nested observation plates
 
 An authored plate cell can contain another authored plate. Native lowering

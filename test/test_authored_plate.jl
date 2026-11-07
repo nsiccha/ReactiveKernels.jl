@@ -389,6 +389,7 @@ _authored_plate_steady_allocated(kernel, a, b, c) =
     @allocated kernel(a, b, c)
 
 function _authored_plate_head_count(node, head)
+    node isa ReactiveKernels._PlateProgram && return _authored_plate_head_count(node.ast, head)
     node isa Expr || return 0
     (node.head === head ? 1 : 0) +
         sum(_authored_plate_head_count(child, head) for child in node.args)
