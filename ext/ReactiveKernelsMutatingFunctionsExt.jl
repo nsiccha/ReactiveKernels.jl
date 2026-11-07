@@ -1,6 +1,10 @@
 module ReactiveKernelsMutatingFunctionsExt
 
 using ReactiveKernels
+# The name the core's body entry (`ReactiveKernels._native_body_call_expr`)
+# emits, for the nested plate driver below.
+using ReactiveKernels: RuntimeGeneratedFunctions
+import LinearAlgebra
 import MutatingFunctions
 
 mutable struct _NestedPlateCache{K,R}
@@ -34,6 +38,17 @@ end
     index = gensym(:plate_index)
     cellargs = [i in A ? wrapped[i] :
         :(Base.Broadcast._broadcast_getindex($(wrapped[i]), $index)) for i in 1:N]
+    # Enter the cell kernel's body directly, as `_nonallocating_call` does, not
+    # through the kernel's call: the enclosing kernel's own `_nonallocating_call`
+    # would otherwise reach itself through this cell. Inference does not cache a
+    # method in such a cycle, and Julia 1.13 then calls the enclosing
+    # `_nonallocating_call` through boxed arguments: a copy of the whole kernel
+    # and its argument tuple on every call (832 B for a plate of scan cells).
+    # The cell kernel is prepared over exactly these operands.
+    cell = gensym(:cell_kernel)
+    F = fieldtype(fieldtype(C, :kernel), :f)
+    body = ReactiveKernels._native_body_call_expr(F, :(getfield($cell, :f)),
+        Any[:(getfield($cell, :tables)), cellargs...])
     quote
         $(Expr(:meta, :inline))
         $(bindings...)
@@ -42,8 +57,9 @@ end
         isempty(combined_axes) && throw(ArgumentError(
             "an authored plate requires at least one non-Ref batched argument"))
         result = _authored_plate_array_cache(cache.result, combined_axes)
+        $cell = cache.kernel
         for $index in CartesianIndices(combined_axes)
-            value = cache.kernel($(cellargs...))
+            value = $body
             if isassigned(result, $index) && axes(result[$index]) == axes(value)
                 copyto!(result[$index], value)
             else
@@ -269,6 +285,26 @@ end
     cache
 end
 
+# A square dense matrix plus a `UniformScaling` (`K + sigma * I`), as
+# LinearAlgebra computes it: a copy of the matrix with `λ` added along its
+# diagonal, into a matching cache. Copied element by element, the loop native
+# Enzyme reverse differentiates. Another shape, element type or a cache that
+# may share memory with the matrix takes Base's own call, and its errors.
+@inline function _uniform_add_into!(cache::Matrix{T}, A::Matrix{T},
+                                    J::LinearAlgebra.UniformScaling) where {T}
+    (Base.promote_op(+, T, typeof(J.λ)) === T && size(A, 1) == size(A, 2) &&
+     size(cache) == size(A) && !Base.mightalias(cache, A)) || return A + J
+    @inbounds for i in eachindex(A)
+        cache[i] = A[i]
+    end
+    @inbounds for i in 1:size(A, 1)
+        cache[i, i] += J.λ
+    end
+    cache
+end
+@inline MutatingFunctions.apply!!(cache::Matrix{T}, ::typeof(+), A::Matrix{T},
+        J::LinearAlgebra.UniformScaling) where {T} = _uniform_add_into!(cache, A, J)
+
 @inline function MutatingFunctions.apply!!(
         cache::Array{T,N}, ::typeof(-), a::Array{T,N}, b::Array{T,N}) where {T,N}
     _add_destination_matches(cache, (a, b)) || return a - b
@@ -288,6 +324,37 @@ end
         offset += rows
     end
     cache
+end
+
+# `vcat` of dense vectors of the cache's element type into a vector cache:
+# the operands' rows in order, through the native body's unrolled copy
+# (`_native_vcat_copy!`) rather than a loop over the operand tuple, whose
+# per-operand views and loads native Enzyme reverse records on its tape on
+# every gradient call. Other operands take the general method above.
+@inline function MutatingFunctions.apply!!(
+        cache::Vector{T}, op::ReactiveKernels._ConcatenateStep{typeof(vcat)},
+        a::ReactiveKernels._NativeVector,
+        rest::Vararg{ReactiveKernels._NativeVector,N}) where {T,N}
+    args = (a, rest...)
+    all(x -> eltype(x) === T, args) || return op.f(args...)
+    n = ReactiveKernels._native_cat_height_sum(args)
+    length(cache) == n || return op.f(args...)
+    ReactiveKernels._lane_vcat_aliases(cache, args) && return op.f(args...)
+    ReactiveKernels._native_vcat_copy!(cache, n, 0, args)
+end
+
+# `copy` of a contiguous view of a vector, as RKPPL reads each scalar layout
+# entry (`copy(view(unconstrained, i:i))`): the same values through the native
+# body's element copy. Base's generic `copyto!` from a view iterates paired
+# index ranges whose state native Enzyme reverse records on its tape on every
+# gradient call (144 B per copy). A cache of another length or one that may
+# share memory with the view takes the step's own result.
+@inline function MutatingFunctions.apply!!(
+        cache::Vector{T}, ::typeof(copy),
+        A::ReactiveKernels._NativeVectorView) where {T}
+    eltype(A) === T && length(cache) == length(A) || return copy(A)
+    Base.mightalias(cache, A) && return copy(A)
+    ReactiveKernels._native_vcat_copy!(cache, length(cache), 0, (A,))
 end
 
 # The native body's `vcat` of numbers and dense vectors (`_native_vcat`), the

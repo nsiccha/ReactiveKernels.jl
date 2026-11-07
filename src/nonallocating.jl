@@ -184,6 +184,12 @@ function _nonalloc_resolve_function(mod::Module, callee)
         r === nothing && return nothing
         return (something(r), GlobalRef(mod, callee))
     end
+    # A generated source names its helpers by `GlobalRef` (RKPPL's gathers).
+    if callee isa GlobalRef
+        r = _nonalloc_resolve_const(callee.mod, callee.name)
+        r === nothing && return nothing
+        return (something(r), callee)
+    end
     callee isa Expr && callee.head === :. && length(callee.args) == 2 &&
         callee.args[2] isa QuoteNode || return nothing
     owner = if callee.args[1] isa Symbol
@@ -247,12 +253,20 @@ function _decompose(ctx::_FusedDecomposition, node, allow_lazy_broadcast::Bool)
         resolved === nothing && return nothing
         return (GlobalRef(ctx.mod, node), typeof(something(resolved)))
     end
+    # A generated source's global by `GlobalRef` (`LinearAlgebra.I`): the
+    # constant it names, as a bare name resolves above.
+    if node isa GlobalRef
+        resolved = _nonalloc_resolve_const(node.mod, node.name)
+        resolved === nothing && return nothing
+        return (node, typeof(something(resolved)))
+    end
     node isa Expr || return (node, typeof(node))
     if node.head === :call && !isempty(node.args)
         callee = node.args[1]
-        callee isa Symbol || callee isa Expr || return nothing
-        callee isa Expr &&
-            _nonalloc_resolve_function(ctx.mod, callee) === nothing &&
+        callee isa Symbol || callee isa Expr || callee isa GlobalRef ||
+            return nothing
+        callee isa Symbol ||
+            _nonalloc_resolve_function(ctx.mod, callee) !== nothing ||
             return nothing
         base = callee isa Symbol ? _nonalloc_undotted(callee) : nothing
         base === nothing ||
@@ -398,11 +412,61 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
     # destination convention; without a guarded step, keep the whole-recipe
     # fallback rather than risking a stale destination on a shape change.
     (f === Base.:\ || f === Base.:/) && return nothing
+    _nonalloc_destination(ctx.cache_apply, f, T, types) &&
+        return (_emit_step!(ctx, f, T, args...), T)
+    # A `@traceable` helper decomposes as its recorded source over these
+    # arguments, as other source-reading compilers translate it.
+    traced = _decompose_traceable(ctx, f, args, types)
+    traced === nothing || return traced
     # A call without a destination-passing method returns its own result,
     # which may alias an argument: run it inline, never as a cache step.
-    _nonalloc_destination(ctx.cache_apply, f, T, types) ||
-        return (Expr(:call, fref, args...), T)
-    (_emit_step!(ctx, f, T, args...), T)
+    (Expr(:call, fref, args...), T)
+end
+
+# The authored body of the `@traceable` method that arguments of `types` call
+# (`_traceable_source`), decomposed with its formals bound to the decomposed
+# arguments and its globals resolved in its own module. Each argument is
+# evaluated once, as in the call. `nothing`, with no step added, when the body
+# is outside the grammar: the caller then runs the call itself.
+function _decompose_traceable(ctx::_FusedDecomposition, f, args, types)
+    all(t -> t isa Type, types) || return nothing
+    source = _traceable_source(typeof(f), types...)
+    source === nothing && return nothing
+    names, body, mod = source
+    length(names) == length(args) || return nothing
+    body = _nonalloc_single_expression(body)
+    body === nothing && return nothing
+    marks = (length(ctx.stmts), length(ctx.ops), length(ctx.caches))
+    bound = Any[]
+    for arg in args
+        if arg isa Symbol || arg isa GlobalRef || !(arg isa Expr)
+            push!(bound, arg)
+        else
+            tmp = gensym(:traced_argument)
+            push!(ctx.stmts, Expr(:(=), tmp, arg))
+            push!(bound, tmp)
+        end
+    end
+    inner = _FusedDecomposition(mod, Dict{Symbol,Any}(zip(names, bound)),
+                                Dict{Symbol,Any}(zip(names, types)),
+                                ctx.stmts, ctx.ops, ctx.caches, ctx.offset,
+                                ctx.cache_apply)
+    d = _decompose(inner, body, false)
+    d === nothing || return d
+    resize!(ctx.stmts, marks[1])
+    resize!(ctx.ops, marks[2])
+    resize!(ctx.caches, marks[3])
+    nothing
+end
+
+# A body's one expression, past line numbers and a single-statement block.
+function _nonalloc_single_expression(ex)
+    while ex isa Expr && ex.head === :block
+        exprs = filter(a -> !(a isa LineNumberNode), ex.args)
+        length(exprs) == 1 || return nothing
+        ex = only(exprs)
+    end
+    ex isa LineNumberNode ? nothing : ex
 end
 
 # A preparation-constant reduction axis: an `Int`, `Colon`, or a tuple of
@@ -833,11 +897,38 @@ function _nonalloc_step!(prog::_StepProgram, r::Recipe, i::Int,
         !(r.op isa _KernelSourceOp) && _nonalloc_is_lazy(op) && return Any[stmt]
     end
     slot_type = T isa Type && isconcretetype(T) ? T : valtype(only(r.outputs))
-    slot = _nonalloc_destination(prog.cache_apply, op, slot_type, argtypes) ?
-           _nonalloc_slot(op, slot_type) : nothing
-    slot === nothing && return Any[stmt]
-    prog.caches[i] = slot
-    Any[Expr(:(=), lhs, _step_call(i, callargs...))]
+    if _nonalloc_destination(prog.cache_apply, op, slot_type, argtypes)
+        slot = _nonalloc_slot(op, slot_type)
+        slot === nothing && return Any[stmt]
+        prog.caches[i] = slot
+        return Any[Expr(:(=), lhs, _step_call(i, callargs...))]
+    end
+    if !r.effectful && !(r.op isa _KernelSourceOp)
+        dec = _decompose_traceable_recipe!(prog, op, callargs, argtypes, lhs)
+        if dec !== nothing
+            types[lhs] = dec[2]
+            return dec[1]
+        end
+    end
+    Any[stmt]
+end
+
+# A pure recipe whose operation is a `@traceable` helper, such as RKPPL's
+# gather of a ranged response operand, decomposes as the helper's source
+# (`_decompose_traceable`), so its array results get steps with buffers of
+# their own instead of a fresh result on every call.
+function _decompose_traceable_recipe!(prog::_StepProgram, op, callargs,
+                                      input_types, lhs)
+    ctx = _FusedDecomposition(@__MODULE__, Dict{Symbol,Any}(), Dict{Symbol,Any}(),
+                              Any[], Any[], Any[], length(prog.ops),
+                              prog.cache_apply)
+    d = _decompose_traceable(ctx, op, collect(Any, callargs), collect(Any, input_types))
+    d === nothing && return nothing
+    append!(prog.ops, ctx.ops)
+    append!(prog.caches, ctx.caches)
+    stmts = ctx.stmts
+    push!(stmts, Expr(:(=), lhs, d[1]))
+    (stmts, d[2])
 end
 
 function _nonalloc_mentions!(names::Set{Symbol}, node)

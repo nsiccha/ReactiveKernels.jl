@@ -1937,7 +1937,8 @@ _mi_row_value(x::Number, i) = x
 @traceable _mi_row_value(x::AbstractVector, i) = x[i]
 
 _ppl_range_values(x::Number, indices) = x
-_ppl_range_values(x::AbstractArray, indices) = x[indices]
+# Its source lets a non-allocating kernel gather into a buffer of its own.
+@traceable _ppl_range_values(x::AbstractArray, indices) = x[indices]
 
 # `ones(n) .* x` without the ones operand: a number fills the rows, and a
 # vector already holding one Float64 per row is that location value itself,
