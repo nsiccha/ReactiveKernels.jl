@@ -9,12 +9,12 @@ const _REVERSE = ReactiveKernels.DifferentiationInterface.AutoEnzyme(; mode = En
 # whose `unalias` reaches Base's default `dataids`, `objectid(A)`, so the overlay's
 # stack slot goes to an opaque runtime call. In a body large enough that the tuple
 # of constant operands stays on the stack, the overlay's base pointer is then a
-# load from that tuple, and native Reverse refuses to store it into the overlay
-# (`EnzymeRuntimeActivityError`) although it only ever holds a `Const` argument.
-# The derivative is defined: the compact form agrees with the full one wherever
-# Enzyme accepts it. The repair belongs in Enzyme (snag `static-reverse-o-c5bf409d`),
-# so the compact gradient here is either exact or this refusal, recorded as broken.
-# The law is a generic space-time precision; only its graph's size matters here.
+# load from that tuple. Native Reverse refused to store it into the overlay
+# (`EnzymeRuntimeActivityError`) although it only ever holds a `Const` argument,
+# until Enzyme's dogfood line repaired that (snag `static-reverse-o-c5bf409d`,
+# merged as `0147c6f`). This pins the compact gradient under plain static Reverse
+# against the full query's. The law is a generic space-time precision; only its
+# graph's size matters here.
 struct OverlayViewField{S,T,L,G}
     spatial_length::S
     temporal_length::T
@@ -153,21 +153,10 @@ _toy_geometry(N, T) = (; permutation = collect(1:N), mass = ones(N), gptr = coll
     q = only(prepare_query_ad(prepare_ad, built, plan, [selection], _REVERSE, u;
         coordinates = :support))
     @test q.coordinates == factor_support(selection; u0 = u)
-    outcome = try
-        ad_value_and_gradient(q, u, u[q.coordinates])
-    catch err
-        err isa Enzyme.Compiler.EnzymeRuntimeActivityError || rethrow()
-        err
-    end
-    if outcome isa Exception
-        @test occursin("Mismatched activity", sprint(showerror, outcome))
-        @test_broken false
-    else
-        compact_value, compact_gradient = outcome
-        @test compact_value ≈ full_value
-        @test compact_gradient ≈ full_gradient[q.coordinates]
-        @test all(iszero, full_gradient[setdiff(eachindex(u), q.coordinates)])
-    end
+    compact_value, compact_gradient = ad_value_and_gradient(q, u, u[q.coordinates])
+    @test compact_value ≈ full_value
+    @test compact_gradient ≈ full_gradient[q.coordinates]
+    @test all(iszero, full_gradient[setdiff(eachindex(u), q.coordinates)])
     @test u == original
 end
 
