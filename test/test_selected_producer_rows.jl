@@ -70,6 +70,11 @@ const HAVE = (:paths, :a, :b, :p, :rows, :t)
     end
     @test all(e.status !== :whole for e in partition_locality(query))
     @test_throws ArgumentError partition_footprint_kernel(query)(traced, a, b, 2, rows, 1)
+    # `partition_footprint` lowers a footprint for arguments of other types.
+    for t in eachindex(rows)
+        footprint = partition_footprint(query, traced, a, b, 2, rows, t)
+        @test footprint.a == [2] && footprint.b == [2]
+    end
     bound = prepare(spec; have=HAVE, want=:terms_cell, bound=(; paths, b, rows))
     @test all(e.status !== :whole for e in partition_locality(bound))
     @test partition_footprint(bound, a, 2, 1).a == [2]

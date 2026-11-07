@@ -156,6 +156,80 @@ end
     @test costs[1] == costs[2]
 end
 
+# A partition's kernels are lowered from the exemplar and a label, as a cell
+# query's are, so they take the collector's scalar arm too: each unit reads
+# only its own effects, although the response reads the collected location and
+# its scale whole (snag whole-vector-res-64373f39). Without that type evidence
+# the location was computed whole, so every unit read every unit's `z`.
+const PARTITIONED_COLLECTED = quote
+    beta ~ Normal(0, 1)
+    z[levels(unit)] .~ Normal.(0, 1)
+    s[levels(unit)] .~ Normal.(0, 0.5)
+    @plate for i in eachindex(x)
+        signal_cells[i] = beta * x[i] + z[unit[i]]
+    end
+    signal = collect_cells(signal_cells)
+    sd = exp.(s[unit])
+    y .~ Normal.(signal, sd)
+end
+
+@testset "partitions take the collector's typed arm and read their own unit" begin
+    unit = [1, 2, 3, 1, 2, 3, 2, 1]
+    n = length(unit)
+    data = (; unit, name = ["unit $g" for g in unit],
+        x = collect(range(-1.0, 1.0; length = n)), y = collect(range(0.3, -0.4; length = n)))
+    bound = bind_data(lower_rkppl(PARTITIONED_COLLECTED, data; conditioned=(:y,),
+        mod=@__MODULE__), data)
+    built = build_kernel(bound)
+    names = String.(coordinate_names(built.layout))
+    at(prefix) = findall(name -> startswith(name, prefix), names)
+    beta, z, s = only(at("beta")), at("z"), at("s")
+    u = collect(range(-0.3, 0.4; length = built.layout.total))
+    density(u, g) = sum(i -> logpdf(Normal(u[beta] * data.x[i] + u[z[g]], exp(u[s[g]])),
+        data.y[i]), findall(==(g), unit))
+    function gradient_of(u, g)
+        gradient = zeros(length(u))
+        for i in findall(==(g), unit)
+            sd = exp(u[s[g]])
+            residual = data.y[i] - (u[beta] * data.x[i] + u[z[g]])
+            gradient[beta] += residual * data.x[i] / sd^2
+            gradient[z[g]] += residual / sd^2
+            gradient[s[g]] += residual^2 / sd^2 - 1
+        end
+        gradient
+    end
+    own(g) = sort([beta, z[g], s[g]])
+    full = prepare_query(built, bound, :likelihood)
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    for partitioned in ((), (:z, :s))
+        q = prepare_partition(built, bound, :y; by=:unit, locality=:error, partitioned)
+        @test all(entry -> entry.status !== :whole, partition_locality(q))
+        @test sum(g -> q(u, g), partition_labels(q)) ≈ full(u)
+        for g in 1:3
+            @test q(u, g) ≈ density(u, g)
+            @test q(view(u, :), g) ≈ density(u, g)
+            @test ReactiveKernels.partition_footprint(q.kernel, u, g, nothing).unconstrained == own(g)
+        end
+        for compact in (true, false)
+            sampler = prepare_partition_sampler(built, bound, :y, u; by=:unit, backend,
+                compact, partitioned, locality=:error)
+            for g in 1:3
+                @test partition_footprint(sampler, g) == own(g)
+                gradient = zeros(compact ? 3 : length(u))
+                value, _ = partition_value_and_gradient!(sampler, gradient, u, g)
+                @test value ≈ density(u, g)
+                @test gradient ≈ (compact ? gradient_of(u, g)[own(g)] : gradient_of(u, g))
+            end
+        end
+    end
+    # A label of another type lowers the same way.
+    labels = ["unit $g" for g in 1:3]
+    q = prepare_partition(built, bound, :y; by=:name, locality=:error,
+        partitioned=(:z => labels, :s => labels))
+    @test ReactiveKernels.partition_footprint(q.kernel, u, "unit 2", nothing).unconstrained == own(2)
+    @test q(u, "unit 2") ≈ density(u, 2)
+end
+
 @testset "cell queries retain Cartesian positions with exact packed types" begin
     data = (; y=reshape(collect(0.1:0.1:0.6), 2, 3))
     source = quote
