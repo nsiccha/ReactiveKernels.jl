@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.113
+## 0.1.115
 
 - An ordered or threshold vector's length may be a bare bound name, as an array
   axis and an `LKJCholesky` dimension already may: `c ~ Ordered(Normal(0, 1), n)`
@@ -26,6 +26,57 @@ are recorded in the git history only.
   expression", although `Int(n)` passed. The program reads `n` from the binding,
   so one build serves every count. A fractional, negative, Boolean or sampled
   value fails at binding.
+
+## 0.1.114
+
+- `prepare_partition` and `prepare_partition_sampler` lower their partition
+  kernels from the exemplar point (`u0`) and the first label, as
+  `prepare_cell_query` already lowers its kernel from `u0`. A value whose
+  producer branches on a type, such as BRM's `flatten_cells`
+  (`eltype(cells) <: Number ? cells : reduce(vcat, cells)`), now takes its typed
+  arm and is computed at each partition's rows. A response that reads such a
+  collected plate value whole, `y .~ Normal.(flatten_cells(cells), sd)`, then
+  reads only its own partition's coordinates, as the cell query's footprint of
+  the same cells already said. Before, the value was computed whole:
+  `locality = :error` refused it, and with `partitioned` each partition read
+  every unit's coordinates of that value and was refused with
+  `PartitionSeparabilityError`.
+- **Breaking:** a `PartitionQuery`'s `q.kernel` is typed for a
+  `Vector{Float64}` point and the first label's type, as a `CellQuery`'s kernel
+  is. `q(u, label)` still takes any point and label type, preparing a kernel for
+  a new pair once, and so does
+  `ReactiveKernels.partition_footprint(q.kernel, u, label, nothing)` (ReactiveKernels
+  0.1.104). A direct `q.kernel(u, label, plan)` call and a held
+  `partition_footprint_kernel(q.kernel)` need that point and label type: call
+  `q(u, label)` or `partition_footprint` instead. A key column with no label is
+  refused by name.
+- Requires ReactiveKernels 0.1.104.
+
+## 0.1.113
+
+- An external law's packed range and the shape its `constrain` and `logjac`
+  endpoints receive are read from the data, like a declared array's: BRM's
+  GMRF field `field[1:support.geometry.ncoordinates] ~ law(…)` reads
+  `unconstrained[4:_ppl_last_field]` and `(_ppl_axis1_field,)`, where 0.1.108
+  spliced this binding's `unconstrained[4:15], (12,)`. Every
+  station and read count of such a field now generates the same `kernel_expr`,
+  and one `build_kernel` serves every binding, the empty field included. The
+  same holds for a `@plate` of open-RHS latents over data
+  (`@plate for i in eachindex(x)`). Snag `gmrf-field-packe-ab48cb09`.
+- The endpoints still receive a fresh `Vector`. For a host (non-`@kernel`)
+  endpoint, a data-read range copies with `collect(view(…))` rather than
+  `unconstrained[a:b]`: when that range is empty at run time, Enzyme's
+  `ReverseWithPrimal` returns a wrong value (not gradient) for `getindex` and
+  `copy(view(…))` there, so `prepare_sampler` would report a wrong density for
+  an empty field (Enzyme snag `enzyme-autodiff-e13097c4`). Composed `@kernel`
+  endpoints and plates keep `unconstrained[a:b]`, whose rows cell and partition
+  queries follow.
+- An extent read through a property of bound data, `z[1:support.geometry.n]`
+  or a geometry's packed count `:($(args[1]).geometry.n)`, reads that value.
+  0.1.108 took the dotted read for a module path, which names no data, and so
+  kept the literal.
+- Of the paths 0.1.108 lists as literal, an external law's geometry shape and
+  size no longer are, except when the extent reads an observation.
 
 ## 0.1.112
 
