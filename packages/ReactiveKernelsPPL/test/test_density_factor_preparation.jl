@@ -138,6 +138,7 @@ end
             y[i] ~ Normal(r[g[i]] * x[i], sigma)
         end
     end
+    stored_graphs = Int[]
     for J in (8, 64)
         n = 4J
         plan = model(; J, x = sin.(1:n), g = repeat(1:J; inner = 4)) | (; y = 0.3 .* cos.(1:n))
@@ -149,9 +150,9 @@ end
         stored = length(data.graphs)
         queries = prepare_query_ad(prepare_ad, built, plan, selections,
             _FACTOR_PREPARATION_REVERSE, u; coordinates = :support)
-        # One query graph and one row-plan graph, whatever the number of
-        # selections: the binding keeps no per-selection graph.
-        @test length(data.graphs) - stored <= 2
+        # The binding gains the row-plan graph, the query graph and the site's
+        # footprint kernel, whatever the number of selections.
+        push!(stored_graphs, length(data.graphs) - stored)
         @test length(getfield(c, :structures)) == 2
         @test length(unique(objectid(q.prepared.kernel.plan.graph) for q in queries)) == 1
         names = coordinate_names(built.layout)
@@ -178,4 +179,5 @@ end
         @test ad_value_and_gradient(full[2], u)[1] ≈
             ad_value_and_gradient(queries[2], u, u[queries[2].coordinates])[1]
     end
+    @test stored_graphs[1] == stored_graphs[2] <= 3
 end
