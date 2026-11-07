@@ -16,6 +16,24 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.109
+
+- A partition sum lowered under an owner guard reads a plate its group fills
+  under that guard only after the fill. A group of guarded sums (0.1.90)
+  places each statement under the guard of what it reads, and moved a name
+  under a guard only when the guarded statement assigned it. A plate's buffer
+  is allocated before its fill loop, and that loop writes it in place
+  (`buffer[i] = v`), so a buffer allocated unguarded and filled under a guard
+  stayed unguarded. Its readers then ran before the guarded block, reading
+  rows that were never assigned. This hit the local partition derivative
+  (`partition_value_and_gradient!(…; shared = false)`) of a model with a
+  unit-owned non-centered completion beside a centered shared one, BRM's
+  `mi(a) ~ Normal(mu_a, 1)` with `mi(b) ~ LogNormal(0.5, 0.3)`: its primal
+  and derivative raised `UndefRefError` in `_cell_joined_rows` (snag
+  `cell-joined-rows-1ab77c3c`). An in-place write (an indexed or property
+  write, an updating or broadcast assignment, a mutating call) now binds the
+  written name as an assignment does, so its readers follow the guarded fill.
+
 ## 0.1.108
 
 - A program that calls a child kernel in a generator term, a loop or a lazy arm
