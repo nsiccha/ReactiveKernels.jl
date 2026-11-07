@@ -221,30 +221,12 @@ function _ad_native_callables(kernel::PreparedKernel)
     end
 end
 
-# The kernel ordinary AD differentiates. A body whose plate loops run as plate
-# programs (`_PlateProgram`, codegen.jl) is differentiated with those loops
-# inline, as it was lowered: a plate program receives the body's values as one
-# argument tuple, and registered Enzyme Reverse refuses a bound array stored
-# there beside an active value (`EnzymeRuntimeActivityError`, ReactiveKernelsPPL
-# `test_precompiled_build.jl`). A reverse sweep runs no vectorized loop, so the
-# gradient loses nothing the plate programs give the primal.
-Base.@nospecializeinfer function _ad_inline_plate_programs(@nospecialize(kernel::PreparedKernel))
-    _has_plate_programs(kernel.ast) || return kernel
-    ast = _inline_plate_programs(kernel.ast)
-    native = compile(ast)
-    f = kernel.f isa _ArrayFunction ? _ArrayFunction(native) : native
-    _executed_prepared_kernel(f, kernel.constants, kernel.callables, kernel.inputs,
-        kernel.outputs, kernel.plan, ast, kernel.lowered_recipes,
-        _exact_signature(kernel), kernel.rebinding)
-end
-
 # Building the adapter is preparation work. Inferring it for a program's
 # complete constant/callable tables compiles another large native method
 # before the backend ever sees the differentiated call.
 Base.@nospecializeinfer function _ad_kernel_call(
         @nospecialize(kernel::PreparedKernel), @nospecialize(args::Tuple),
         ::Val{I}) where {I}
-    kernel = _ad_inline_plate_programs(kernel)
     if kernel.f isa _ArrayFunction
         callables = _ad_native_callables(kernel)
         constants = kernel.constants
@@ -3182,7 +3164,12 @@ thread-safe; use one per concurrent caller.
         Expr(:tuple, (:(
             _ad_active_point_component(getfield(args, $index)))
             for index in indices)...)
+    # Inline, so a caller holding `prepared` in a field reads only the parts
+    # the call needs: passed whole, the prepared object, its kernel's tables
+    # and lowered recipes included, is copied on every call (about 135 ns for
+    # a 13.7 KB object, snag `sampler-type-dif-ea945700`).
     quote
+        $(Expr(:meta, :inline))
         length(inputs(prepared.kernel)) == $N || throw(ArgumentError(
             "selected HAVE boundary expects " *
             string(length(inputs(prepared.kernel))) *
@@ -3199,7 +3186,7 @@ function ad_value_and_gradient!(
     _ad_prepared_value_and_gradient!(prepared, gradient, point, contexts)
 end
 
-function _ad_prepared_value_and_gradient!(prepared, gradient, point, contexts)
+@inline function _ad_prepared_value_and_gradient!(prepared, gradient, point, contexts)
     DifferentiationInterface.value_and_gradient!(
         prepared.call, gradient, prepared.preparation, prepared.backend,
         point, contexts...)

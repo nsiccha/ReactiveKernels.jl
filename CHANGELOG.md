@@ -16,6 +16,30 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.113
+
+- A plate program (0.1.112) is now only the plate's cell work: its loop, the
+  invariants above it and the preparation of the arguments the cells read.
+  The body keeps the plate's setup and calls the program only when the domain
+  has cells, so a plate over no rows calls none.
+- Native gradients run through the plate programs, so a gradient's loops
+  vectorize as the primal's do: with several Normal likelihoods over 2000
+  rows each, the gradient's cost per row and likelihood no longer grows with
+  their number. A plate program is called with each operand as an argument of
+  its own (`_PlateCall`), which the registered Enzyme release accepts where
+  it refused 0.1.112's argument tuple.
+- A data-bound branch partition no longer keeps the bound arguments it
+  gathers onto its arms, nor a level's gathered copies that a nested level
+  gathers again: they were constants of the prepared program and operands of
+  every native gradient call.
+- A prepared gradient called through an object that holds it, such as an
+  RKPPL sampler query, no longer copies the whole prepared object, its
+  kernel's tables and lowered recipes included, on every call.
+- On Julia 1.13 a lowered body holding plate programs compares equal to its
+  `deepcopy`: a deep copy keeps each plate program, whose expression nothing
+  changes once built. Julia 1.13 compares an expression's leaves that are not
+  expressions by identity.
+
 ## 0.1.112
 
 - A prepared body with two or more top-level plates runs each plate's loop as

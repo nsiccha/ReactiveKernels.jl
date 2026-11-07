@@ -1797,6 +1797,20 @@ function _partition_arm_hoists(variant::Plan, cell_ids, lane_roots, shared_roots
     end
 end
 
+# A partition gathers each bound argument of a plate onto every arm, level by
+# level, at binding: the plate's own bound arguments, and a level's gathered
+# copies a nested partition gathers again, are then read by no recipe. Kept,
+# each would remain a constant of the prepared program, and an operand of
+# every native gradient call (snag `sampler-type-dif-ea945700`). Which ones
+# follows from the arms the partition built, never from the values they hold.
+function _partition_unread_bound(g, recipes::Vector{Recipe}, want)
+    read = Set{ValueId}(canon_id(g, v.id) for r in recipes for v in r.inputs)
+    union!(read, (canon_id(g, v.id) for v in want))
+    filter(recipes) do r
+        !(r.op isa _BoundConstant) || any(o -> canon_id(g, o.id) in read, r.outputs)
+    end
+end
+
 function _partition_sum_consumer(consumers)
     length(consumers) == 1 || return nothing
     r = only(consumers)
@@ -1823,6 +1837,7 @@ function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     changed = false
     whole = false
+    any_partition = false
     signature = Any[]
     keyed = rewrites !== nothing
     # A worklist: an arm plate emitted by the branch partition is examined
@@ -1858,6 +1873,7 @@ function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId
         end
         changed = true
         keyed = false
+        any_partition = true
         if partitioned.rewrite !== nothing
             id, combined = partitioned.rewrite
             pending[findfirst(q -> q.id == id, pending)] = combined
@@ -1865,6 +1881,7 @@ function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId
         prepend!(pending, partitioned.expansion)
     end
     changed || return p, ()
+    any_partition && (recipes = _partition_unread_bound(copied, recipes, p.want))
     template = Plan(copied, p.have, p.want, p.recipes, p.producer,
                     p.cost, p.candidates)
     specialized = _partial_subplan(template, p.have, p.want, recipes)

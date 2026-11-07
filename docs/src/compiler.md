@@ -1046,23 +1046,30 @@ associative tree reduction, or an effect-ordering construct.
 
 #### One program per plate loop
 
-A prepared body with two or more top-level plates compiles each plate's loop as
-a program of its own (`_PlateProgram`), which the body calls where the plate
-stood. The call passes what the loop reads from the body, and the program
-returns its pointwise vector and its total. `code_expr` prints each such
-program in place, as `(function (args...) … end)(args...)`. A body with one
-plate keeps its loop inline, as before.
+A prepared body with two or more top-level plates compiles each plate's cell
+work as a program of its own (`_PlateProgram`): the loop over the cells, the
+invariants computed above it, and the preparation of the arguments only the
+cells read. The body keeps the plate's setup (its arguments, axes, element
+type, pointwise buffer and total seed) and calls the program where the loop
+stood, only when the domain has cells. The call passes what the loop reads
+from the body, each literal entry of the constants and callables tables as an
+argument of its own; the running total enters and leaves the program, and the
+pointwise buffer is filled in place. `code_expr` prints each such program in
+place, as `(function (args...) … end)(args...)`. A body with one plate keeps
+its loop inline, as before.
 
 Compiled into one function, the loops did not vectorize alike: LLVM vectorized
 the first and left the others scalar. An RKPPL model with Normal likelihoods
 over 2000 rows each took 0.22–0.30 ns per row and likelihood with one
 likelihood, 0.69–0.70 with two and 1.13–1.21 with eight; with a program per
-loop it takes 0.20–0.25 at every count. Values, gradients, allocations and
-compile times are unchanged.
+loop it takes 0.20–0.25 at every count.
 
-Ordinary AD differentiates the body with its plate loops inline. A reverse
-sweep vectorizes nothing, and Enzyme's static activity analysis refuses a bound
-array passed beside an active value in a plate program's argument tuple.
+Ordinary AD differentiates the body as it runs, through each program, so the
+gradient's loops vectorize as the primal's do (from ReactiveKernels 0.1.113).
+A program is called through `_PlateCall`, which takes each operand as a
+positional argument: a runtime-generated function's own call method takes its
+operands as one tuple, and Enzyme's static activity analysis refuses a bound
+array stored there beside an active value.
 
 Only bodies prepared by `prepare` do this, and only plates that keep no
 per-cell tables. A transform `pass` given to `prepare` sees the plate loops

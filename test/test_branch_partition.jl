@@ -182,6 +182,25 @@ end
         @test value ≈ ref(eta, level, cuts, w)
         @test grad ≈ [wi * (l == 1 ? -1.0 : l == K ? 1.0 : cuts[l])
                       for (l, wi) in zip(level, w)]
+        # No bound constant the program does not read: the plate's own bound
+        # arguments and a level's gathered copies, which the nested level
+        # gathers again, leave the program (RK 0.1.113). Each would otherwise
+        # be an operand of every native gradient call.
+        function unread_constants(k)
+            ast = code_expr(k)
+            uses = Dict{Symbol,Int}()
+            tally(node) = node isa Symbol ? (uses[node] = get(uses, node, 0) + 1) :
+                node isa Expr && node.head !== :quote && foreach(tally, node.args)
+            tally(ast)
+            Symbol[statement.args[1] for statement in ast.args[2].args
+                   if statement isa Expr && statement.head === :(=) &&
+                      statement.args[1] isa Symbol &&
+                      ReactiveKernels._constant_slot(statement.args[2]) !== nothing &&
+                      uses[statement.args[1]] == 1]
+        end
+        @test isempty(unread_constants(bound))
+        @test isempty(unread_constants(bound6))
+        @test isempty(unread_constants(live_eta))
     end
 
     @testset "reverse through a reassembled plate gathered by a second split plate" begin
