@@ -432,10 +432,15 @@ function _decompose_traceable(ctx::_FusedDecomposition, f, args, types)
     all(t -> t isa Type, types) || return nothing
     source = _traceable_source(typeof(f), types...)
     source === nothing && return nothing
+    # The source is the `@traceable` method's. A more specific plain method
+    # (a `Float64` specialization, say) is the one these arguments call, so
+    # the source applies only when no other method does.
+    length(methods(f, Tuple{types...})) == 1 || return nothing
     names, body, mod = source
     length(names) == length(args) || return nothing
-    body = _nonalloc_single_expression(body)
-    body === nothing && return nothing
+    lines = _nonalloc_straight_line(body)
+    lines === nothing && return nothing
+    statements, body = lines
     marks = (length(ctx.stmts), length(ctx.ops), length(ctx.caches))
     bound = Any[]
     for arg in args
@@ -451,7 +456,8 @@ function _decompose_traceable(ctx::_FusedDecomposition, f, args, types)
                                 Dict{Symbol,Any}(zip(names, types)),
                                 ctx.stmts, ctx.ops, ctx.caches, ctx.offset,
                                 ctx.cache_apply)
-    d = _decompose(inner, body, false)
+    d = all(st -> _decompose_traced_statement!(inner, st), statements) ?
+        _decompose(inner, body, false) : nothing
     d === nothing || return d
     resize!(ctx.stmts, marks[1])
     resize!(ctx.ops, marks[2])
@@ -459,14 +465,64 @@ function _decompose_traceable(ctx::_FusedDecomposition, f, args, types)
     nothing
 end
 
-# A body's one expression, past line numbers and a single-statement block.
-function _nonalloc_single_expression(ex)
+# A body's statements before its final expression, past line numbers and
+# nested blocks: `(statements, final)`, or `nothing` for an empty body.
+function _nonalloc_straight_line(ex)
     while ex isa Expr && ex.head === :block
         exprs = filter(a -> !(a isa LineNumberNode), ex.args)
-        length(exprs) == 1 || return nothing
+        isempty(exprs) && return nothing
+        length(exprs) == 1 || return (exprs[1:end-1], exprs[end])
         ex = only(exprs)
     end
-    ex isa LineNumberNode ? nothing : ex
+    ex isa LineNumberNode ? nothing : (Any[], ex)
+end
+
+# One statement of a traced body, run where the helper's call runs it: an
+# assignment `x = value` or `a, b = x, y` binds its names to the decomposed
+# values, each evaluated once, and a call (an argument check, say) runs for
+# its effect. `false` for anything else, such as a loop or a branch.
+function _decompose_traced_statement!(ctx::_FusedDecomposition, st)
+    st isa Expr || return false
+    if st.head === :(=) && st.args[1] isa Symbol
+        return _bind_traced!(ctx, st.args[1], st.args[2])
+    elseif st.head === :(=) && st.args[1] isa Expr && st.args[1].head === :tuple &&
+           st.args[2] isa Expr && st.args[2].head === :tuple &&
+           length(st.args[1].args) == length(st.args[2].args) &&
+           all(n -> n isa Symbol, st.args[1].args)
+        # Every right-hand value is evaluated before any name is bound.
+        values = Any[]
+        for value in st.args[2].args
+            d = _decompose(ctx, value, false)
+            d === nothing && return false
+            push!(values, _traced_value!(ctx, d))
+        end
+        for (name, value) in zip(st.args[1].args, values)
+            ctx.argmap[name], ctx.argtypes[name] = value
+        end
+        return true
+    elseif st.head === :call
+        d = _decompose(ctx, st, false)
+        d === nothing && return false
+        d[1] isa Symbol || push!(ctx.stmts, Expr(:(=), gensym(:traced_statement), d[1]))
+        return true
+    end
+    false
+end
+
+function _bind_traced!(ctx::_FusedDecomposition, name::Symbol, value)
+    d = _decompose(ctx, value, false)
+    d === nothing && return false
+    ctx.argmap[name], ctx.argtypes[name] = _traced_value!(ctx, d)
+    true
+end
+
+# A decomposed value as an operand later statements read: a name or a
+# constant as it is, any other expression evaluated once, here.
+function _traced_value!(ctx::_FusedDecomposition, (expr, T))
+    (expr isa Symbol || expr isa GlobalRef || !(expr isa Expr)) && return (expr, T)
+    tmp = gensym(:traced_value)
+    push!(ctx.stmts, Expr(:(=), tmp, expr))
+    (tmp, T)
 end
 
 # A preparation-constant reduction axis: an `Int`, `Colon`, or a tuple of

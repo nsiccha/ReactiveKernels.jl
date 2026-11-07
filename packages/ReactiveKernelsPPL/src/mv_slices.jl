@@ -82,43 +82,67 @@ end
 # ── multivariate normal slices ───────────────────────────────────────
 
 # Forward substitution across every slice at once, with the margin axis
-# leading. Unsolved rows of Z are zero; the full row product therefore sums exactly
-# the already solved margins. No body is duplicated for either data axis.
-# X and F remain read-only; Z is fresh and local until construction finishes.
-@traceable function _lower_solve_rows_logpdf(X, F, logdet)
-    groups, k = size(X)
+# leading: `Z[:, g]` solves `F z = x_g`. Unsolved rows of Z are zero; the full
+# row product therefore sums exactly the already solved margins. No body is
+# duplicated for either data axis. X and F remain read-only; Z is fresh and
+# local until construction finishes.
+@traceable function _lower_solve_rows(X, F)
+    input = permutedims(X)
+    Z = zero(input)
+    for i in 1:size(X, 2)
+        residual = input[i, :] - vec(F[i, :]' * Z)
+        Z[i, :] = residual ./ F[i, i]
+    end
+    Z
+end
+
+# The density of the slices from their solved margins `Z`.
+@traceable function _solved_rows_logpdf(Z, logdet)
+    k, groups = size(Z)
     if groups == 0
         0.0
     else
-        input = permutedims(X)
-        Z = zero(input)
-        for i in 1:k
-            residual = input[i, :] - vec(F[i, :]' * Z)
-            Z[i, :] = residual ./ F[i, i]
-        end
         -0.5sum(abs2, Z) - groups*(0.5k*log(2pi)+logdet)
     end
 end
 
+@traceable _lower_solve_rows_logpdf(X, F, logdet) =
+    _solved_rows_logpdf(_lower_solve_rows(X, F), logdet)
+
 # Forward substitution over `Float64` storage. The generic row form above
 # allocates five temporaries per margin. Here every slice solves into one
-# fresh buffer, `Z[i, g] = (X[g, i] - Σ_{j<i} F[i, j] Z[j, g]) / F[i, i]`,
+# buffer of its own, `Z[i, g] = (X[g, i] - Σ_{j<i} F[i, j] Z[j, g]) / F[i, i]`,
 # each entry written once, so native reverse records no overwritten storage.
-function _lower_solve_rows_logpdf(X::AbstractMatrix{Float64},
-        F::AbstractMatrix{Float64}, logdet::Float64)
+# A non-allocating kernel passes its previous result as that buffer
+# (`ReactiveKernelsPPLMutatingFunctionsExt`).
+function _lower_solve_rows(X::AbstractMatrix{Float64}, F::AbstractMatrix{Float64})
     groups, k = size(X)
-    groups == 0 && return 0.0
+    return _lower_solve_rows!(Matrix{Float64}(undef, k, groups), X, F)
+end
+
+function _lower_solve_rows!(Z::Matrix{Float64}, X::AbstractMatrix{Float64},
+        F::AbstractMatrix{Float64})
+    groups, k = size(X)
+    groups == 0 && return Z
     size(F) == (k, k) || throw(DimensionMismatch("slices have length $k, " *
         "but the factor has size $(size(F))"))
-    Z = Matrix{Float64}(undef, k, groups)
-    squares = 0.0
     @inbounds for g in 1:groups, i in 1:k
         s = X[g, i]
         for j in 1:(i - 1)
             s -= F[i, j] * Z[j, g]
         end
-        z = s / F[i, i]
-        Z[i, g] = z
+        Z[i, g] = s / F[i, i]
+    end
+    return Z
+end
+
+# Σ z² in the order the solve writes the margins.
+function _solved_rows_logpdf(Z::AbstractMatrix{Float64}, logdet::Float64)
+    k, groups = size(Z)
+    groups == 0 && return 0.0
+    squares = 0.0
+    @inbounds for g in 1:groups, i in 1:k
+        z = Z[i, g]
         squares += z * z
     end
     return -0.5squares - groups * (0.5k * log(2pi) + logdet)
@@ -192,16 +216,23 @@ end
 # The same factor over `Float64` storage, column by column (Cholesky–Crout),
 # with the triangular bounds the generic form above replaces by guarded
 # full-length loops: `k³/3` multiply-adds instead of `k³` branches, each
-# entry written once. Checks and messages are the generic form's.
-function _covariance_cholesky(Sigma::AbstractMatrix{Float64}, k)
+# entry written once. Checks and messages are the generic form's. A
+# non-allocating kernel passes its previous factor as `F`
+# (`ReactiveKernelsPPLMutatingFunctionsExt`).
+_covariance_cholesky(Sigma::AbstractMatrix{Float64}, k) =
+    _covariance_cholesky!(Matrix{Float64}(undef, k, k), Sigma, k)
+
+function _covariance_cholesky!(F::Matrix{Float64}, Sigma::AbstractMatrix{Float64}, k)
     size(Sigma) == (k, k) || throw(DimensionMismatch("MvNormal slices " *
         "have length $k, but the covariance has size $(size(Sigma))"))
     for j in 1:k, i in (j + 1):k
         ReactiveKernels._runtime_check(abs(Sigma[i, j] - Sigma[j, i]) <= 1e-8,
             ArgumentError("MvNormal covariance is not symmetric"))
     end
-    F = zeros(Float64, k, k)
     @inbounds for j in 1:k
+        for i in 1:(j - 1)
+            F[i, j] = 0.0
+        end
         d = Sigma[j, j]
         for p in 1:(j - 1)
             d -= F[j, p] * F[j, p]
@@ -246,11 +277,16 @@ execution both check the factor at runtime.
     groups, k = _slice_count(o, B), _slice_length(o, B)
     _check_slice_vector_arg("the MvNormal mean", mu, groups, k)
     F = _covariance_cholesky(Sigma, k)
+    return _mvnormal_slices_core(o, B, mu, F, _factor_diagonal_logdet(F, k))
+end
+
+# Σ log F[i, i] of the factor `_covariance_cholesky` built, which checked it.
+@traceable function _factor_diagonal_logdet(F, k)
     logdet = 0.0
     for i in 1:k
         logdet += log(F[i, i])
     end
-    return _mvnormal_slices_core(o, B, mu, F, logdet)
+    return logdet
 end
 
 @doc """

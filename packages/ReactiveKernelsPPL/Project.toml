@@ -18,6 +18,7 @@ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 [weakdeps]
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
 LogDensityProblems = "6fdf6af0-433a-55f7-b3ed-c6c6e0b8df7c"
+MutatingFunctions = "8a4c2d94-4b3b-4f9e-be63-a3c0cd816e3a"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 SequentialMonteCarlo = "8c675823-c5d5-50f8-acb2-29aff48dfc1d"
 Treebars = "e1e568c4-3a56-40a4-95fa-9b9c6c16fccb"
@@ -27,6 +28,7 @@ WarmupHMC = "60658175-6863-4866-a322-ab51a11c0cfe"
 ReactiveKernelsPPLDistributionsExt = "Distributions"
 ReactiveKernelsPPLSMCExt = ["LogDensityProblems", "Random", "SequentialMonteCarlo", "WarmupHMC", "Treebars"]
 ReactiveKernelsPPLFilterExt = ["Distributions", "Random", "SequentialMonteCarlo"]
+ReactiveKernelsPPLMutatingFunctionsExt = "MutatingFunctions"
 ReactiveKernelsPPLLogDensityProblemsExt = "LogDensityProblems"
 
 [compat]
@@ -38,6 +40,7 @@ Enzyme = "0.13"
 LinearAlgebra = "1"
 LogExpFunctions = "0.3, 1.0.2"
 LogDensityProblems = "2"
+MutatingFunctions = "0.1"
 Random = "1"
 SequentialMonteCarlo = "0.7"
 Serialization = "1"

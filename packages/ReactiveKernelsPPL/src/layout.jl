@@ -597,9 +597,14 @@ function ordered_constrain(u::AbstractVector{<:Real})
 end
 
 # The packed sampler input stays read-only. Native execution builds the
-# constrained vector in one fresh buffer, then reuses it for the prefix sum.
-@inline function _ordered_constrain_native(u::AbstractVector{Float64})
-    y = Vector{Float64}(undef, length(u))
+# constrained vector in one buffer of its own, then reuses it for the prefix
+# sum. A non-allocating kernel passes its previous result as that buffer
+# (`ReactiveKernelsPPLMutatingFunctionsExt`).
+@inline _ordered_constrain_native(u::AbstractVector{Float64}) =
+    _ordered_constrain_native!(Vector{Float64}(undef, length(u)), u)
+
+@inline function _ordered_constrain_native!(y::Vector{Float64},
+                                            u::AbstractVector{Float64})
     isempty(u) && return y
     y[1] = u[1]
     @inbounds @simd for i in 2:length(u)
@@ -614,14 +619,20 @@ end
 @inline _ordered_constrain_kernel(u::AbstractVector{Float64}, lo::Int, hi::Int) =
     _ordered_constrain_native(view(u, lo:hi))
 
-# Build the native simplex and its log-Jacobian in one pass. Only the fresh
-# result is written; the packed coordinates remain read-only. The loop count
+# Build the native simplex and its log-Jacobian in one pass. Only the result
+# buffer is written; the packed coordinates remain read-only. The loop count
 # is the runtime block length, including when that length came from bound data.
-@inline function _simplex_constrain_logjac_native(u::AbstractVector{Float64},
-                                                  lo::Int, hi::Int)
+@inline _simplex_constrain_logjac_native(u::AbstractVector{Float64},
+                                         lo::Int, hi::Int) =
+    _simplex_constrain_logjac_native!(Vector{Float64}(undef, hi - lo + 2),
+                                      u, lo, hi)
+
+# The same pass into `p`, of length `hi - lo + 2`, which a non-allocating
+# kernel passes as its previous result.
+@inline function _simplex_constrain_logjac_native!(p::Vector{Float64},
+        u::AbstractVector{Float64}, lo::Int, hi::Int)
     n = hi - lo + 1
     K = n + 1
-    p = Vector{Float64}(undef, K)
     lr = 0.0
     jac = 0.0
     @inbounds for j in 1:n

@@ -75,6 +75,24 @@ end
     slot[] = MutatingFunctions.apply!!(slot[], op, args...)
 end
 
+# A step whose result is a tuple of a buffer and numbers, such as RKPPL's
+# simplex and its log-Jacobian, keeps that tuple in a `Union{Nothing,T}`
+# slot, which stores it boxed: storing every call's result would allocate the
+# box every call. The slot is the destination offered to `apply!!`, which
+# reads its buffers, never its numbers, so a result that kept the slot's
+# buffers is not stored again. The differentiated driver below never stores.
+@inline function cache_apply!(slot::Base.RefValue{Union{Nothing,T}}, op,
+                              args...) where {T<:Tuple}
+    cache = slot[]
+    result = MutatingFunctions.apply!!(cache, op, args...)
+    _keeps_buffers(cache, result) || (slot[] = result)
+    result
+end
+
+@inline _keeps_buffers(cache, result) = false
+@inline _keeps_buffers(cache::T, result::T) where {T<:Tuple} =
+    all(map((c, r) -> isbits(c) || c === r, cache, result))
+
 # The differentiated program's driver (`ReactiveKernels._ad_na_cache_driver`):
 # its slots are seeded and read-only. `apply!!` fills the slot's buffer when
 # the result fits it and returns any other result, which is not kept. A nested
