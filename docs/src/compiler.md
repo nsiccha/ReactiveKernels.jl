@@ -1073,8 +1073,8 @@ Ordinary AD differentiates the body with its plate loops inline. Differentiated
 through `_PlateCall` as functions of their own, the gradient's loops vectorized
 as the primal's do (two to eight Normal likelihoods over 2000 rows each: 28–33%
 faster per gradient), but each program call cost native Reverse a fixed amount,
-which made small models slower: an RKPPL censored response over 10 mixed rows
-went from 296 to 567 ns per gradient.
+which made small models slower: an RKPPL censored response over 10 rows, all
+censored, went from 426 to 544 ns per gradient.
 
 Only bodies prepared by `prepare` do this, and only plates that keep no
 per-cell tables. A transform `pass` given to `prepare` sees the plate loops

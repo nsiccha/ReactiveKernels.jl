@@ -25,13 +25,6 @@ are recorded in the git history only.
 - A plate program is called with each operand as an argument of its own
   (`_PlateCall`) instead of one argument tuple per call. Gradients still
   differentiate the plate loops inline.
-- A data-bound branch partition no longer keeps the bound arguments it
-  gathers onto its arms, nor a level's gathered copies that a nested level
-  gathers again: they were constants of the prepared program and operands of
-  every native gradient call.
-- A prepared gradient called through an object that holds it, such as an
-  RKPPL sampler query, no longer copies the whole prepared object, its
-  kernel's tables and lowered recipes included, on every call.
 - On Julia 1.13 a lowered body holding plate programs compares equal to its
   `deepcopy`: a deep copy keeps each plate program, whose expression nothing
   changes once built. Julia 1.13 compares an expression's leaves that are not

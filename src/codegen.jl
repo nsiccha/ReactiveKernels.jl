@@ -5155,26 +5155,49 @@ end
 # statements over the call's arguments: the body `_extract_plate_programs` was
 # given, the guard of a program's call kept. Ordinary AD differentiates this
 # body (`_ad_inline_plate_programs`).
-function _inline_plate_programs(node)
+function _inline_plate_programs(ast)
+    declared = Set{Symbol}()
+    _program_local_declarations!(declared, ast)
+    _inline_plate_programs(ast, declared)
+end
+function _inline_plate_programs(node, declared::Set{Symbol})
     if node isa Expr && node.head === :(=) && node.args[2] isa Expr &&
             node.args[2].head === :call && first(node.args[2].args) isa _PlateProgram
-        return _inline_plate_program(node.args[2])
+        return _inline_plate_program(node.args[2], declared)
     elseif node isa Expr && node.head === :call && first(node.args) isa _PlateProgram
-        return _inline_plate_program(node)
+        return _inline_plate_program(node, declared)
     elseif node isa Expr && node.head !== :quote
-        return Expr(node.head, Any[_inline_plate_programs(arg) for arg in node.args]...)
+        return Expr(node.head, Any[_inline_plate_programs(arg, declared) for arg in node.args]...)
     end
     node
 end
-function _inline_plate_program(call::Expr)
+# A program declares again a name the body declares (`_extract_plate_programs`);
+# inline, the body's own declaration stands, and a second typed one would not
+# compile.
+function _inline_plate_program(call::Expr, declared::Set{Symbol})
     program = first(call.args)::_PlateProgram
     parameters = program.ast.args[1].args
     mapping = Dict{Symbol,Any}()
     for (parameter, argument) in zip(parameters, call.args[2:end])
         parameter === argument || (mapping[parameter] = argument)
     end
-    statements = program.ast.args[2].args[1:end-1]
+    redeclaration(statement) = statement isa Expr && statement.head === :local &&
+        all(target -> _program_parameter(target) in declared, statement.args)
+    statements = Any[statement for statement in program.ast.args[2].args[1:end-1]
+                     if !redeclaration(statement)]
     Expr(:block, Any[_substitute_symbols(statement, mapping) for statement in statements]...)
+end
+# The names `node` declares `local`, outside its plate programs.
+function _program_local_declarations!(found::Set{Symbol}, node)
+    node isa Expr && node.head !== :quote || return found
+    if node.head === :local
+        for target in node.args
+            name = _program_parameter(target)
+            name === nothing || push!(found, name)
+        end
+    end
+    foreach(arg -> _program_local_declarations!(found, arg), node.args)
+    found
 end
 _substitute_symbols(node::Symbol, mapping) = get(mapping, node, node)
 _substitute_symbols(node::Expr, mapping) = node.head === :quote ? node :

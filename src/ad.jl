@@ -227,8 +227,8 @@ end
 # `_PlateCall`'s positional operands, the programs' loops vectorized in the
 # gradient too (two to eight Normal likelihoods over 2000 rows each: 28–33%
 # faster per gradient), but every program call cost native Reverse a fixed
-# amount: an RKPPL censored response over 10 rows, mixed, went 296 → 567 ns per
-# gradient (snag `sampler-type-dif-ea945700`).
+# amount: an RKPPL censored response over 10 rows, all censored, went 426 →
+# 544 ns per gradient (snag `sampler-type-dif-ea945700`).
 Base.@nospecializeinfer function _ad_inline_plate_programs(@nospecialize(kernel::PreparedKernel))
     _has_plate_programs(kernel.ast) || return kernel
     ast = _inline_plate_programs(kernel.ast)
@@ -3183,12 +3183,7 @@ thread-safe; use one per concurrent caller.
         Expr(:tuple, (:(
             _ad_active_point_component(getfield(args, $index)))
             for index in indices)...)
-    # Inline, so a caller holding `prepared` in a field reads only the parts
-    # the call needs: passed whole, the prepared object, its kernel's tables
-    # and lowered recipes included, is copied on every call (about 135 ns for
-    # a 13.7 KB object, snag `sampler-type-dif-ea945700`).
     quote
-        $(Expr(:meta, :inline))
         length(inputs(prepared.kernel)) == $N || throw(ArgumentError(
             "selected HAVE boundary expects " *
             string(length(inputs(prepared.kernel))) *
@@ -3205,7 +3200,7 @@ function ad_value_and_gradient!(
     _ad_prepared_value_and_gradient!(prepared, gradient, point, contexts)
 end
 
-@inline function _ad_prepared_value_and_gradient!(prepared, gradient, point, contexts)
+function _ad_prepared_value_and_gradient!(prepared, gradient, point, contexts)
     DifferentiationInterface.value_and_gradient!(
         prepared.call, gradient, prepared.preparation, prepared.backend,
         point, contexts...)
