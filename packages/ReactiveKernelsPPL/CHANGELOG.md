@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.116
+
+- Authored-factor queries (`prepare_query` and `prepare_query_ad` over
+  `select_factors` selections) prepare one program per selection structure of a
+  catalogue, meaning the same kinds and sites, each read whole or by cells, and
+  rebind it for each selection. A query keeps its own entries, row plan,
+  coordinate slots and derivative workspace. Neither the query nor the binding
+  keeps a copy of the model graph, which each selection used to leave in the
+  binding (about two per selection, for the binding's lifetime). On a toy with
+  one scalar prior per unit, 1,024 per-unit
+  `prepare_query_ad(...; coordinates = :support)` queries kept 4.3 MB instead of
+  159 MB and prepared in 7.8 ms per unit instead of 70 ms, with the same values
+  and gradients.
+
 ## 0.1.115
 
 - An ordered or threshold vector's length may be a bare bound name, as an array

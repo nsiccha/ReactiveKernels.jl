@@ -125,3 +125,59 @@ end
     end
     @test bodies[1] == bodies[2]
 end
+
+@testset "selections of one structure share one prepared program" begin
+    # Snag prepare-query-ad-96b98277: each selection copied the catalogue
+    # graph, and the copies stayed alive in the binding's data store and in
+    # every query, so retained memory grew by a model graph per selection.
+    model = @rkppl begin
+        sd_r ~ Exponential(1.0)
+        r[1:J] .~ Normal.(0.0, sd_r)
+        sigma ~ Exponential(1.0)
+        @plate for i in eachindex(y)
+            y[i] ~ Normal(r[g[i]] * x[i], sigma)
+        end
+    end
+    stored_graphs = Int[]
+    for J in (8, 64)
+        n = 4J
+        plan = model(; J, x = sin.(1:n), g = repeat(1:J; inner = 4)) | (; y = 0.3 .* cos.(1:n))
+        built = build_kernel(plan)
+        u = 0.1 .* sin.(1:built.layout.total)
+        c = density_factors(built, plan)
+        selections = [select_factors(c; kind = :prior, site = :r, entries = j) for j in 1:J]
+        data = getfield(plan, :data_values)
+        stored = length(data.graphs)
+        queries = prepare_query_ad(prepare_ad, built, plan, selections,
+            _FACTOR_PREPARATION_REVERSE, u; coordinates = :support)
+        # The binding gains the row-plan graph, the query graph and the site's
+        # footprint kernel, whatever the number of selections.
+        push!(stored_graphs, length(data.graphs) - stored)
+        @test length(getfield(c, :structures)) == 2
+        @test length(unique(objectid(q.prepared.kernel.plan.graph) for q in queries)) == 1
+        names = coordinate_names(built.layout)
+        at(name) = only(findall(==(name), names))
+        for j in (1, J)
+            q = queries[j]
+            sd, rj = at(:sd_r), at(Symbol("r.", j))
+            @test q.coordinates == sort([sd, rj])
+            for shift in (0.0, 0.21)
+                point = u .+ shift
+                s, r = exp(point[sd]), point[rj]
+                value, gradient = ad_value_and_gradient(q, point, point[q.coordinates])
+                @test value ≈ -0.5log(2pi) - log(s) - r^2 / (2s^2)
+                oracle = zeros(length(point))
+                oracle[sd] = -1 + r^2 / s^2
+                oracle[rj] = -r / s^2
+                @test gradient ≈ oracle[q.coordinates]
+            end
+        end
+        # The uncompacted spelling shares its program in the same way.
+        full = prepare_query_ad(prepare_ad, built, plan, selections[1:2],
+            _FACTOR_PREPARATION_REVERSE, u)
+        @test full[1].prepared.kernel.plan.graph === full[2].prepared.kernel.plan.graph
+        @test ad_value_and_gradient(full[2], u)[1] ≈
+            ad_value_and_gradient(queries[2], u, u[queries[2].coordinates])[1]
+    end
+    @test stored_graphs[1] == stored_graphs[2] <= 3
+end
