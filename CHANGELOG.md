@@ -16,6 +16,35 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.110
+
+- A plate cell's lazy branch whose condition reads bound data keeps one
+  prepared program whichever arms the binding's lanes take. Preparation splits
+  such a plate into one plate per arm; it used to drop an arm that no lane
+  takes and to leave a plate with no lanes unsplit, so data whose lanes all
+  took one arm, or that had none, prepared another program and compiled again:
+  an RKPPL censored response with a bound scale, for example, whose rows were
+  all observed or all at their censoring bound. Every arm is now a plate, over
+  no lanes when none takes it, and a domain of no lanes is split too. Such an
+  arm evaluates nothing: its shared work stays behind the plate's nonempty
+  guard, and its work over bound values, such as `log(s)` of a bound scale, is
+  not run at preparation, so an invalid value on an arm no lane takes still
+  never throws. An arm of one lane now splits a nested branch as arms of more
+  lanes or none do. Values and gradients are unchanged.
+- A binding whose lanes all take one arm now runs the program a mixed binding
+  runs: the taken arm reads its live arguments through lane indices beside the
+  other arm's empty plate, where it used to be one unsplit plate, and its
+  first gradient also compiles the arm no lane takes. For an RKPPL censored
+  Normal response with a bound scale and every row observed, measured on
+  gordito (Julia 1.10.12): density 0.47 → 3.2–4.3 µs and gradient
+  4.1 → 6.0–8.2 µs at 2000 rows, and `prepare_sampler` with its first gradient
+  in a fresh process 14–15 → 32–33 s at 200 rows. Those are what the same
+  model with half its rows censored takes, before and after this change
+  (13 µs, 32 µs; 31–36 s).
+- A condition that reads bound numbers alone still selects its arm at
+  preparation, and a bound singleton beside live arguments of unknown length
+  (a plate of one row) still prepares its own program.
+
 ## 0.1.109
 
 - A partition sum lowered under an owner guard reads a plate its group fills
