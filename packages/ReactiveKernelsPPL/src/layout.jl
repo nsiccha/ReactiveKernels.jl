@@ -1815,16 +1815,21 @@ function _external_reads(plan::StructuralPlan, tests, e::LayoutEntry)
     return dims, size
 end
 
-# A threshold or simplex vector's packed length as the program reads it: its
-# authored extent, when that reads data. A count inferred from a response stays
+# A threshold or simplex vector's length as the program reads it: its authored
+# extent, when that reads data, such as `length(alpha)` for a simplex whose
+# concentration `alpha` is bound. A count inferred from a response stays
 # literal: the response can be absent, and it can declare unobserved levels.
+function _vector_length_read(tests, p::VectorParameter)
+    p.extent_expr === nothing && return p.size
+    return _checked_read(tests, p.extent_expr, p.size)
+end
+
+# The same vector's packed length: a simplex packs one coordinate fewer.
 function _vector_size_read(plan::StructuralPlan, tests, e::LayoutEntry)
     i = findfirst(p -> p.name === e.name, plan.vector_parameters)
     i === nothing && return e.size
-    extent = plan.vector_parameters[i].extent_expr
-    extent === nothing && return e.size
-    packed = e.transform === :simplex ? _read_add(extent, -1) : extent
-    return _checked_read(tests, packed, e.size)
+    read = _vector_length_read(tests, plan.vector_parameters[i])
+    return e.transform === :simplex ? _read_add(read, -1) : read
 end
 
 # A declared LKJ factor's dimension as the program reads it: its authored `K`,

@@ -676,12 +676,21 @@ end
     @test_throws ArgumentError partition_plan(planned, d.u, 6, nothing)
     @test_throws ArgumentError planned(d.u, 2, plans[1])
     @test_throws ArgumentError planned(d.u, 6, plans[1])
-    # A statement with an array operand compiles once per signature, behind a
-    # `@noinline` wrapper. Scalar statements and plate loops stay inline. This
-    # changes compile time only: the values above are the unplanned kernel's.
+    # In a wide body, a statement with an array operand compiles once per
+    # signature, behind a `@noinline` wrapper. Scalar statements and plate loops
+    # stay inline. This changes compile time only: the values above are the
+    # unplanned kernel's. A body with fewer wrapped statements than
+    # `_PARTITION_SEPARATE_MIN`, such as this one, stays one function: there the
+    # wrapper only costs warm time (snag partition-gradie-38d830a4).
     let mentions(x, s) = x === s || (x isa GlobalRef && x.name === s) ||
             (x isa Expr && any(a -> mentions(a, s), x.args))
-        @test mentions(ReactiveKernels.code_expr(planned), :_partition_statement_call)
+        @test !mentions(ReactiveKernels.code_expr(planned), :_partition_statement_call)
+        body = Any[:(y = f(a, b)), :(z = g(y)), :(for i in r; w = h(a); end)]
+        wrapped = ReactiveKernels._partition_separate_body(body; minimum = 2)
+        @test count(s -> mentions(s, :_partition_statement_call), wrapped) == 2
+        @test wrapped[3] === body[3]
+        @test ReactiveKernels._partition_separate_body(body; minimum = 3) == body
+        @test ReactiveKernels._partition_separate_body(body) == body
     end
     separated(T...) = occursin("_partition_array_call", string(first(only(
         code_typed(ReactiveKernels._partition_statement_call, T)))))

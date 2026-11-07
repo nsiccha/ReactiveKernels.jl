@@ -1239,6 +1239,17 @@ end
 (b::_ADPlanBoxing{P})(args...; kwargs...) where {P} =
     _ad_box_plan(getfield(b, :resolver)(args...; kwargs...), Val(P))
 
+# The plan argument a prepared operator takes for a plan its caller holds behind
+# a reference. An operator that boxes its plan takes the reference itself, which
+# `_ad_box_plan` passes on unchanged, so a caller that keeps each label's plan in
+# one reference (ReactiveKernelsPPL's `_LabelPlans`) copies no plan per call
+# (snag `partition-gradie-38d830a4`). Any other operator takes the plan. The
+# choice is by the operator's type, so it folds at compile time.
+_ad_plan_argument(op::PreparedADOperator, ref::_PartitionPlanRef) =
+    getfield(op, :resolver) isa _ADPlanBoxing ? ref : getfield(ref, :plan)
+_ad_plan_argument(op, ref::_PartitionPlanRef) = getfield(ref, :plan)
+_ad_plan_argument(op, plan) = plan
+
 # A pullback passes its cotangent exemplar `seed`: for array outputs or several
 # selected WANT ports it differentiates the seeded inner product (`_ADSeededCall`), whose
 # port values are kept for `ad_value_and_pullback` when `keep_values`.

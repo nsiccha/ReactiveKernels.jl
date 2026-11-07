@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.108
+## 0.1.112
 
 - A non-allocating kernel (`prepare_nonallocating`, and through it
   ReactiveKernelsPPL's `prepare_sampler(...; nonallocating = true)`) gives more
@@ -41,6 +41,85 @@ are recorded in the git history only.
   result. The source now stands for a call only when its method is the one
   the call dispatches to. `_traceable_source` returns that method's signature
   as a fourth element.
+
+## 0.1.111
+
+- Reverts 0.1.110. A data-bound plate branch again prepares only the arms its
+  lanes take, so a binding whose lanes all take one arm runs its unsplit plate
+  again (an RKPPL censored Normal response with a bound scale and every row
+  observed: density back to 0.47 µs from 3–4 µs at 2000 rows), and another
+  pattern of taken arms again prepares, and compiles, its own program. The
+  one-program behaviour returns once split arms keep that speed.
+
+## 0.1.110
+
+- A plate cell's lazy branch whose condition reads bound data keeps one
+  prepared program whichever arms the binding's lanes take. Preparation splits
+  such a plate into one plate per arm; it used to drop an arm that no lane
+  takes and to leave a plate with no lanes unsplit, so data whose lanes all
+  took one arm, or that had none, prepared another program and compiled again:
+  an RKPPL censored response with a bound scale, for example, whose rows were
+  all observed or all at their censoring bound. Every arm is now a plate, over
+  no lanes when none takes it, and a domain of no lanes is split too. Such an
+  arm evaluates nothing: its shared work stays behind the plate's nonempty
+  guard, and its work over bound values, such as `log(s)` of a bound scale, is
+  not run at preparation, so an invalid value on an arm no lane takes still
+  never throws. An arm of one lane now splits a nested branch as arms of more
+  lanes or none do. Values and gradients are unchanged.
+- A binding whose lanes all take one arm now runs the program a mixed binding
+  runs: the taken arm reads its live arguments through lane indices beside the
+  other arm's empty plate, where it used to be one unsplit plate, and its
+  first gradient also compiles the arm no lane takes. For an RKPPL censored
+  Normal response with a bound scale and every row observed, measured on
+  gordito (Julia 1.10.12): density 0.47 → 3.2–4.3 µs and gradient
+  4.1 → 6.0–8.2 µs at 2000 rows, and `prepare_sampler` with its first gradient
+  in a fresh process 14–15 → 32–33 s at 200 rows. Those are what the same
+  model with half its rows censored takes, before and after this change
+  (13 µs, 32 µs; 31–36 s).
+- A condition that reads bound numbers alone still selects its arm at
+  preparation, and a bound singleton beside live arguments of unknown length
+  (a plate of one row) still prepares its own program.
+
+## 0.1.109
+
+- A partition sum lowered under an owner guard reads a plate its group fills
+  under that guard only after the fill. A group of guarded sums (0.1.90)
+  places each statement under the guard of what it reads, and moved a name
+  under a guard only when the guarded statement assigned it. A plate's buffer
+  is allocated before its fill loop, and that loop writes it in place
+  (`buffer[i] = v`), so a buffer allocated unguarded and filled under a guard
+  stayed unguarded. Its readers then ran before the guarded block, reading
+  rows that were never assigned. This hit the local partition derivative
+  (`partition_value_and_gradient!(…; shared = false)`) of a model with a
+  unit-owned non-centered completion beside a centered shared one, BRM's
+  `mi(a) ~ Normal(mu_a, 1)` with `mi(b) ~ LogNormal(0.5, 0.3)`: its primal
+  and derivative raised `UndefRefError` in `_cell_joined_rows` (snag
+  `cell-joined-rows-1ab77c3c`). An in-place write (an indexed or property
+  write, an updating or broadcast assignment, a mutating call) now binds the
+  written name as an assignment does, so its readers follow the guarded fill.
+
+## 0.1.108
+
+- A program that calls a child kernel in a generator term, a loop or a lazy arm
+  keeps one prepared type across builds. Such a call embeds objects in the
+  compiled body: the child's source operations, spliced into the caller's
+  source, and a child prepared when its caller is defined, either called under
+  the arm or captured by an operation (an object's in-place endpoint such as
+  `prepared standardized`). The body's content id reads every field of what it
+  embeds, and some fields named the build: an operation's definition token and
+  module, and a prepared child's plan, lowered recipes and value ids. A
+  generator that evaluates every build in a fresh module, as
+  BayesianRegressionModels does, therefore prepared another sampler type for
+  every build of the same program and binding, and compiled it again: an ODL
+  archive target's sampler, rebuilt with the same binding or another data
+  value. The body now embeds an execution copy of each object, of the same
+  type: an operation keeps its record, call identity and throw-stripped twin
+  with one token and no module, and a prepared child keeps its compiled body
+  and tables with an empty plan and recipes and canonical value ids. An object
+  that reaches state a call could write (a `Ref`, a cache cell, a `Core.Box`)
+  is embedded as before. The plan and `code_expr` keep the original objects. A
+  Julia-owned closure (a generator or comprehension body) that holds such
+  objects shares its type across builds the same way.
 
 ## 0.1.107
 

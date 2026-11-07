@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.121
+## 0.1.123
 
 - With MutatingFunctions loaded, through the new weak dependency and
   `ReactiveKernelsPPLMutatingFunctionsExt`, the non-allocating sampler
@@ -33,7 +33,51 @@ are recorded in the git history only.
   on its tape, 704 B per gradient at K = 20.
 - One vector's slice rows are a reshaped view rather than a reshaped
   `Vector`, which builds an array object.
-- The ReactiveKernels compat floor is 0.1.108.
+- The ReactiveKernels compat floor is 0.1.112.
+
+## 0.1.122
+
+- Windows of one recurrence, fitted apart, can be joined through their boundary
+  state (multiple shooting): `prepare_joined_windows(built, plans, us; boundary
+  = :h_out => :h_in, backend)` takes one binding of a program per window, in
+  time order, and returns a `JoinedWindows`. `h_in` is a declared parameter the
+  window's `@scan` starts from (`h[1] = h_in`), `h_out` an authored value, the
+  state at the window's end (`h_out = h[T]`, or a per-index output of a `@plate`
+  of recurrences). The joined log density feeds each window's output to the
+  next window's input entry with the same `coordinate_identities` (a level label
+  or the position), drops a fed entry's prior and Jacobian, and counts every
+  coordinate held by an earlier window (a global, a unit's static) once, so
+  windows that cover a series one after another have the series' value and
+  gradient; gradients flow back through each output. `joined_value_and_gradient!`,
+  `joined_point`, `window_points`, `joined_coordinates` and `joined_problem` (a
+  `LogDensityProblems` target, `JoinedWindowsProblem`) read and evaluate it. A
+  scan's sampled steps, the inputs and the parameters named in `locals` belong
+  to their window only. Not built: a plate of stochastic recurrences (the
+  density catalogue below refuses its cell scans), boundary inputs with joint
+  supports (a simplex) or bounds that read parameters.
+- `prepare_query(built, plan, (:a, :b))` evaluates authored values by name (a
+  definition, a carried array, a per-index output), the tuple of their values
+  (one name gives its value itself), and `prepare_query_ad` takes the same tuple
+  for pullbacks and pushforwards.
+- `density_factors` catalogues a model with a top-level non-centered `@scan`
+  (a deterministic or assigned seed, several carried arrays, innovations): the
+  scan's sampled seeds and steps are one atomic prior event owning its packed
+  block, as a joint law is. It used to refuse the whole model, and so did
+  `prepare_slices` and selective SMC windows built on it.
+- A binding whose level labels differ from the build's, with the same packed
+  shape, now keeps its own labels in a query's layout (`q.layout` of
+  `prepare_sampler`, `prepare_slices`, and so `coordinate_identities` of it).
+  It used to report the build's labels, so a unit could be matched to another
+  binding's unit at the same position.
+
+## 0.1.121
+
+- A simplex whose `Dirichlet` concentration is bound data, such as
+  `s ~ Dirichlet(alpha)` with `alpha` bound beside the data or BRM's monotonic
+  effect with its concentration as an input, keeps one program for every
+  concentration length. The packed coordinates already read `length(alpha)`;
+  the concentration check now reads it too, where it used to write this
+  binding's length as a number, so a build for 3 levels served no binding with 4.
 
 ## 0.1.120
 

@@ -361,7 +361,16 @@ function over its captured values, its parameter names in the record's type;
 the token and the module stay on the recipe's operation), so identical
 fresh builds reuse operation and derivative types without merging their graph
 identities or caching bound data, and a prepared kernel's callables table
-holds the records themselves. A capture-free operation table stays
+holds the records themselves. A child called in a generator term, a loop or a
+lazy arm reaches the compiled body as objects: its operations spliced into the
+caller's source, or the child prepared when the caller is defined. The content
+id of a runtime-generated function reads every field of what its body embeds,
+so the body embeds an execution copy of each, of the same type: what a call
+reads (an operation's record, call identity and throw-stripped twin; a
+prepared child's compiled body and tables) is kept, while definition tokens,
+modules, a prepared child's plan and recipes, and value ids are made the same
+in every build. An object that reaches state a call could write is embedded
+as it is, so two builds never share it. A capture-free operation table stays
 free of heap references that Enzyme would otherwise have to prove read-only in
 the differentiated callable. Bodies with local functions, generators, exception
 scopes, or boxed lexical cells retain Julia's native closure, called with a
@@ -1768,12 +1777,20 @@ allowing ordinary Reverse through the overlay's choice of base or active data.
 reference: as a by-value aggregate of every field, it made LLVM's constant
 propagation take a steeply growing share of the first gradient's compile time
 as the plan widened. Callers still pass, and `partition_plan` still returns,
-the named tuple.
-A statement of a planned body with an array operand calls through one
+the named tuple. That reference is made per call unless the caller passes one:
+ReactiveKernelsPPL keeps each label's plan in one such reference
+(`_LabelPlans`), and its partition samplers pass it (`_ad_plan_argument`), so a
+gradient call copies no plan.
+In a planned body with at least `_PARTITION_SEPARATE_MIN` (128) such
+statements, a statement with an array operand calls through one
 `@noinline` wrapper, which compiles once per signature, so Enzyme and LLVM do
 not analyse every array operation as part of one function. Scalar statements
 and plate loops stay inline. This shows in `code_expr` as
-`_partition_statement_call`. A type or function argument of such a statement
+`_partition_statement_call`. A smaller body stays one function: there the
+wrapper saves no compile time, and each wrapped statement becomes its own
+differentiated call with its own tape, which a one-subject cell pays on every
+gradient. The count is of the program's statements, never of its data.
+A type or function argument of such a statement
 crosses the wrapper in a carrier (`_PartitionType`, `_PartitionFunction`):
 Julia compiles a `Vararg{Any}` position holding a type as `::Type`, and one
 holding a function the method does not call as `::Function`, so without it
