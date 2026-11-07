@@ -155,6 +155,9 @@ end
         push!(stored_graphs, length(data.graphs) - stored)
         @test length(getfield(c, :structures)) == 2
         @test length(unique(objectid(q.prepared.kernel.plan.graph) for q in queries)) == 1
+        # Snag per-unit-partiti-9d46c6de: the catalogue reads the binding's own
+        # arrays; it keeps no copy of them.
+        @test getfield(c, :binding).x === plan.columns[:x]
         names = coordinate_names(built.layout)
         at(name) = only(findall(==(name), names))
         for j in (1, J)

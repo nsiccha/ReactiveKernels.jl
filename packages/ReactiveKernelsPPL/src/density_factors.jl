@@ -209,6 +209,49 @@ function _density_coordinates(s::_DensitySite, plan, layout)
     _density_coordinates(e, s.count, plan)
 end
 
+# A hash of every element of a binding's data, recursively: equal for data that
+# is `isequal`, and different, but for a 64-bit collision, after any in-place
+# change of an entry. Julia's own `hash` of a large array reads only some of its
+# elements, so it cannot detect every change.
+_binding_fingerprint(x) = _fingerprint(x, UInt(0x9d46c6de), IdDict{Any,Nothing}())
+_fingerprint(x::Union{Number,AbstractString,Symbol,Nothing,Missing,Type}, h::UInt, _) = hash(x, h)
+function _fingerprint(x::AbstractArray, h::UInt, seen)
+    h = hash(typeof(x), hash(size(x), h))
+    for v in x
+        h = _fingerprint(v, h, seen)
+    end
+    h
+end
+function _fingerprint(x::AbstractDict, h::UInt, seen)
+    h = hash(typeof(x), hash(length(x), h))
+    for (k, v) in x
+        h = _fingerprint(v, _fingerprint(k, h, seen), seen)
+    end
+    h
+end
+function _fingerprint(x::Union{Tuple,NamedTuple}, h::UInt, seen)
+    h = hash(keys(x), h)
+    for v in x
+        h = _fingerprint(v, h, seen)
+    end
+    h
+end
+function _fingerprint(x, h::UInt, seen)
+    T = typeof(x)
+    h = hash(T, h)
+    isstructtype(T) && nfields(x) > 0 || return hash(x, h)
+    # A mutable record reached again (a cycle, or shared twice) adds its
+    # identity, not its fields again.
+    if ismutable(x)
+        haskey(seen, x) && return hash(objectid(x), h)
+        seen[x] = nothing
+    end
+    for i in 1:nfields(x)
+        h = isdefined(x, i) ? _fingerprint(getfield(x, i), h, seen) : hash(i, h)
+    end
+    h
+end
+
 "A binding-scoped catalogue of authored prior and coordinate-Jacobian factors."
 struct DensityFactors{B,P,S,H,D}
     built::B
@@ -216,6 +259,8 @@ struct DensityFactors{B,P,S,H,D}
     spec::S
     have::H
     binding::D
+    # The content of `binding` when the catalogue was made (`_binding_fingerprint`).
+    fingerprint::UInt
     sites::Vector{_DensitySite}
     coordinates::Vector{_DensityCoordinates}
     support_exemplar::Vector{Float64}
@@ -278,7 +323,12 @@ function density_factors(built, plan::StructuralPlan)
     def = _pointwise_arithmetic_plates(plan, def)
     def = _name_plate_cells(def, _location_value_aliases(plan, def))
     spec = _eval_kernel_def(def)
-    binding = deepcopy(_query_bound(plan))
+    # The catalogue reads the binding's own data. A copy of it, kept to detect a
+    # later in-place change, held a second copy of every bound array for the
+    # catalogue's lifetime (snag per-unit-partiti-9d46c6de); its fingerprint
+    # detects the same changes.
+    binding = _query_bound(plan)
+    fingerprint = _binding_fingerprint(binding)
     # Bind the catalogue before cutting cells from it. This lets ordinary
     # partial evaluation hoist data-only cell indices once, even when a later
     # selection fuses a plate into a single cell and drops its other outputs.
@@ -298,7 +348,7 @@ function density_factors(built, plan::StructuralPlan)
         spec = ReactiveKernels.KernelSpec(g, copy(spec.ports), copy(spec.port_order),
             copy(spec.have_names), copy(spec.want_names), nothing)
     end
-    DensityFactors(built, plan, spec, _query_have(plan), binding, sites, coordinates,
+    DensityFactors(built, plan, spec, _query_have(plan), binding, fingerprint, sites, coordinates,
         zeros(built.layout.total),
         Dict{Tuple{Symbol,Symbol,Int},Any}(), ReentrantLock(),
         Dict{Any,Any}(), ReentrantLock())
@@ -390,7 +440,7 @@ end
 function _check_factor_binding(built, plan, c)
     _check_built_program(built, plan)
     _same_program(built.program, c.built.program) &&
-        isequal(_query_bound(plan), c.binding) || throw(ContractValidationError(
+        _binding_fingerprint(_query_bound(plan)) == c.fingerprint || throw(ContractValidationError(
         "[query] density selection belongs to another program or data binding"))
     nothing
 end
