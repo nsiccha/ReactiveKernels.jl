@@ -1,10 +1,17 @@
 using ReactiveKernels
 using MutatingFunctions
+using LinearAlgebra: I
 using Test
 
 function kernel_allocations(k, x)
     k(x)
     @allocated k(x)
+end
+# A local varargs closure boxes its argument tuple on Julia 1.10 (16 B for a
+# matrix and a number), so two-argument kernels are measured through this.
+function kernel_allocations(k, x, y)
+    k(x, y)
+    @allocated k(x, y)
 end
 
 include(joinpath(@__DIR__, "fixtures", "nonallocating_called_ops.jl"))
@@ -281,6 +288,23 @@ end
         println("NONALLOCATING_ALLOC_BYTES\tqualified_calls_large\t", large)
         @test small == large
         @test small <= 512
+    end
+
+    @testset "a matrix plus a scaled identity fills its cache" begin
+        # `K + s * I`, as a covariance with a nugget is written: LinearAlgebra's
+        # copy-then-add-the-diagonal, into the step's own matrix.
+        spec = @kernel shifted_matrix(A::Matrix{Float64}, s::Float64) = begin
+            K::Matrix{Float64} = 2.0 .* A + s * I
+            out::Float64 = sum(K)
+        end
+        ordinary = prepare(spec; have = (:A, :s), want = :out)
+        k = prepare_nonallocating(spec; have = (:A, :s), want = :out)
+        A = [sin(i + 2j) for i in 1:7, j in 1:7]
+        @test k(A, 0.3) == ordinary(A, 0.3)
+        @test k(A, 1.7) == ordinary(A, 1.7)
+        @test kernel_allocations(k, A, 0.3) == 0
+        # A matrix that is not square keeps LinearAlgebra's error.
+        @test_throws DimensionMismatch k([1.0 2.0 3.0; 4.0 5.0 6.0], 0.3)
     end
 
     @testset "postfix adjoint stays lazy inside broadcasts" begin
