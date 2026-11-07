@@ -269,6 +269,9 @@ struct DensityFactors{B,P,S,H,D}
     # One query graph per selection structure (`_density_structure_spec`).
     structures::Dict{Any,Any}
     structure_lock::ReentrantLock
+    # One prepared program per structure and boundary, which every derivative
+    # query of that structure calls with its own selection (`_density_kernel`).
+    kernels::Dict{Any,Any}
 end
 
 Base.length(c::DensityFactors) = sum(s.count for s in c.sites; init = 0)
@@ -351,7 +354,7 @@ function density_factors(built, plan::StructuralPlan)
     DensityFactors(built, plan, spec, _query_have(plan), binding, fingerprint, sites, coordinates,
         zeros(built.layout.total),
         Dict{Tuple{Symbol,Symbol,Int},Any}(), ReentrantLock(),
-        Dict{Any,Any}(), ReentrantLock())
+        Dict{Any,Any}(), ReentrantLock(), Dict{Any,Any}())
 end
 
 "A set of authored atomic events from one density catalogue."
@@ -467,24 +470,32 @@ end
 # Selections of one structure share one query graph: the sites they read
 # whole (`totals`), the sites they read as partitioned cells (`plates`),
 # whether folded data-only cells add a constant, the row plan's type and the
-# compact overlay. Entries, row plans, constants and coordinate slots are
-# bound per selection, so RK prepares each structure once and rebinds its
-# compiled template for every selection (`prepare(…; bound)` keeps that work
-# per graph). A graph copied per selection kept a whole catalogue graph alive
-# in every query and in the binding's data store.
+# compact overlay. A graph copied per selection kept a whole catalogue graph
+# alive in every query and in the binding's data store.
+#
+# A value query (`prepare_query`) binds its selection's entries, row plan,
+# constant and coordinate slots, so RK rebinds the structure's compiled
+# template for every selection (`prepare(…; bound)` keeps that work per graph).
+# A compact derivative query (`prepare_query_ad(...; coordinates)`, `runtime`)
+# passes them on each call instead, so every query of the structure calls one
+# prepared program: a rebound program is a kernel, plan and constants table of
+# its own, 9.9 KB of heap per query for one scalar prior against 4.0 KB (snag
+# per-unit-partiti-9d46c6de). Its memberships are constant per selection
+# (`plan_constant`), so the program's own plan kernel plans each selection's
+# rows once.
 function _density_structure_spec(c::DensityFactors, plan, totals::Tuple, plates::Tuple,
-        constant::Bool, locality, rowplan, compact::Bool)
-    key = (totals, plates, constant, locality, rowplan, compact)
+        constant::Bool, locality, rowplan, compact::Bool; runtime::Bool = false)
+    key = (totals, plates, constant, locality, rowplan, compact, runtime)
     lock(c.structure_lock) do
         get!(c.structures, key) do
             _build_density_structure_spec(c, plan, totals, plates, constant, locality,
-                rowplan, compact)
+                rowplan, compact, runtime)
         end
     end
 end
 
 function _build_density_structure_spec(c, plan, totals, plates, constant, locality,
-        rowplan, compact)
+        rowplan, compact, runtime = false)
     spec = ReactiveKernels._copy_cell_factor_spec(c.spec)
     terms = Symbol[c.sites[j].total for j in totals]
     if !isempty(plates)
@@ -497,7 +508,8 @@ function _build_density_structure_spec(c, plan, totals, plates, constant, locali
         end
         spec = plate_partition(spec, Symbol[c.sites[j].plate for j in plates]; by,
             index = _DENSITY_LABEL, name = _DENSITY_PARTITION, locality,
-            plan = rowplan === nothing ? _DENSITY_PLAN : _DENSITY_PLAN => rowplan)
+            plan = rowplan === nothing ? _DENSITY_PLAN : _DENSITY_PLAN => rowplan,
+            plan_constant = runtime ? Tuple(_density_membership(j) for j in plates) : ())
         push!(terms, _DENSITY_PARTITION)
     end
     if constant
@@ -529,13 +541,19 @@ function _build_density_structure_spec(c, plan, totals, plates, constant, locali
     spec
 end
 
+# The query of a selection: its structure's graph (`spec`), boundary (`have`,
+# `want`) and `bound` data. With `runtime`, `bound` holds the binding's data
+# only, and `context` holds the selection's own values, the call arguments
+# after the packed point, in `have` order.
 function _density_selection_spec(built, plan, selection; locality, on_error, u0,
-        checked = false, compact = false)
+        checked = false, compact = false, runtime = false)
     checked || _check_factor_selection(built, plan, selection)
     c = selection.catalogue
     totals, plates = Int[], Int[]
     constant, folded = 0.0, false
     bindings = Pair{Symbol,Any}[pairs(_query_bound(plan))...]
+    context = Any[]
+    select!(pair) = runtime ? push!(context, last(pair)) : push!(bindings, pair)
     for (j, s) in enumerate(c.sites)
         entries = [f.entry - s.offset for f in selection if f.kind === s.kind &&
             f.site === s.site && s.offset < f.entry <= s.offset + s.count]
@@ -547,14 +565,22 @@ function _density_selection_spec(built, plan, selection; locality, on_error, u0,
             folded = true
         else
             membership = ReactiveKernels._PartitionIndex(Dict(true => sort!(unique!(entries))), s.count)
-            push!(bindings, _density_membership(j) => membership)
+            select!(_density_membership(j) => membership)
             push!(plates, j)
         end
     end
     totals, plates = Tuple(totals), Tuple(plates)
     have = (_query_have(plan)..., (_density_membership(j) for j in plates)...)
     rowplan = nothing
-    if !isempty(plates)
+    plan_index = nothing
+    if !isempty(plates) && runtime
+        # The program's own plan kernel plans each selection
+        # (`_density_kernel`); its argument stays `nothing` until then.
+        select!(_DENSITY_LABEL => true)
+        select!(_DENSITY_PLAN => nothing)
+        plan_index = length(context)
+        have = (have..., _DENSITY_LABEL, _DENSITY_PLAN)
+    elseif !isempty(plates)
         planner_spec = _density_structure_spec(c, plan, (), plates, false, locality,
             nothing, false)
         planner = Base.invokelatest(_prepare_cached_partition, plan, planner_spec;
@@ -568,11 +594,42 @@ function _density_selection_spec(built, plan, selection; locality, on_error, u0,
         have = (have..., _DENSITY_LABEL, _DENSITY_PLAN)
     end
     if folded
-        push!(bindings, _DENSITY_CONSTANT => constant)
+        select!(_DENSITY_CONSTANT => constant)
         have = (have..., _DENSITY_CONSTANT)
     end
-    spec = _density_structure_spec(c, plan, totals, plates, folded, locality, rowplan, compact)
-    (; spec, have, bound = (; bindings...), want = _DENSITY_TOTAL, binding = plan)
+    spec = _density_structure_spec(c, plan, totals, plates, folded, locality, rowplan, compact;
+        runtime)
+    (; spec, have, bound = (; bindings...), want = _DENSITY_TOTAL, binding = plan,
+        context = Tuple(context), plan_index)
+end
+
+# The program a structure's derivative queries share, prepared once for this
+# boundary and the binding's data from the arguments of the first selection
+# (`args`, `nothing` at the plan port), as `prepare_partition` prepares its
+# kernel; and that program's plan kernel. Another selection of the structure
+# has arguments of the same types.
+function _density_kernel(c::DensityFactors, plan, spec, have, want, bound, on_error, args)
+    key = (objectid(spec), have, want, on_error, typeof(args))
+    lock(c.structure_lock) do
+        get!(c.kernels, key) do
+            kernel = Base.invokelatest(_prepare_cached, plan, spec; have, want, bound,
+                on_error, exemplars = args)
+            (; kernel, planner = Ref{Any}(nothing))
+        end
+    end
+end
+
+# The selection's call arguments with its plan, from the shared program's own
+# plan kernel (`partition_plan`), when it reads cells.
+function _density_context(c::DensityFactors, shared, q, args::Tuple)
+    q.plan_index === nothing && return q.context
+    planner = lock(c.structure_lock) do
+        shared.planner[] === nothing && (shared.planner[] =
+            Base.invokelatest(ReactiveKernels.partition_plan_kernel, shared.kernel))
+        shared.planner[]
+    end
+    plan_value = Base.invokelatest(planner, args...)
+    Base.setindex(q.context, plan_value, q.plan_index)
 end
 
 "Prepare the sum of selected authored density events, callable with a packed point."
@@ -688,19 +745,25 @@ end
 function _prepare_factor_query_ad(prepare_operator, built, plan, selection, backend,
         exemplars, u0; on_error, locality, coordinates)
     compact = coordinates !== nothing
+    # A compact query passes its selection on each call to its structure's
+    # shared program. A dense query keeps a rebound program per selection, as
+    # its derivative is over the whole packed vector anyway.
     q = _density_selection_spec(built, plan, selection; locality, on_error, u0,
-        checked = true, compact)
+        checked = true, compact, runtime = compact)
+    c = selection.catalogue
     if compact
         selected = coordinates === :support ? _factor_support(selection, u0) : collect(Int, coordinates)
         _check_compact_cell_indices(u0, selected, selected, built.layout.total)
         have = (:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots,
             (n for n in q.have if n !== :unconstrained)...)
-        slots = _fixed_cell_slots(built.layout.total, selected)
-        bound = merge(q.bound, (; _ppl_cell_slots = slots))
-        kernel = Base.invokelatest(_prepare_cached, plan, q.spec; have, want = q.want, bound, on_error)
-        prepared = Base.invokelatest(prepare_operator, kernel, backend,
-            Base.front(exemplars)..., u0, u0[selected]; active = :_ppl_cell_active)
-        return FactorQueryAD(prepared, built.layout, selected)
+        point = (u0, u0[selected], _fixed_cell_slots(built.layout.total, selected))
+        shared = _density_kernel(c, plan, q.spec, have, q.want, q.bound, on_error,
+            (point..., q.context...))
+        context = (last(point), _density_context(c, shared, q, (point..., q.context...))...)
+        prepared = Base.invokelatest(prepare_operator, shared.kernel, backend,
+            Base.front(exemplars)..., Base.front(point)..., context...;
+            active = :_ppl_cell_active)
+        return FactorQueryAD(prepared, built.layout, selected, context)
     end
     kernel = Base.invokelatest(_prepare_cached, plan, q.spec; have = q.have, want = q.want,
         bound = q.bound, on_error)
@@ -718,11 +781,16 @@ ReactiveKernels derivative verbs take `(base, active)` last, where `base` is the
 read-only full point and `active` supplies these coordinates. Directions and
 gradient outputs have the compact length. Prepare one operator per caller.
 """
-struct FactorQueryAD{P,L}
+struct FactorQueryAD{P,L,C}
     prepared::P
     layout::L
     coordinates::Vector{Int}
+    # The selection's own arguments of the structure's shared program (its
+    # coordinate slots, cell memberships, row plan and folded constant), which
+    # every call appends after `(base, active)`.
+    context::C
 end
+FactorQueryAD(prepared, layout, coordinates) = FactorQueryAD(prepared, layout, coordinates, ())
 for verb in (:ad_gradient, :ad_value_and_gradient, :ad_value_and_gradient!,
         :ad_pullback, :ad_value_and_pullback, :ad_value_and_pullback!,
         :ad_pushforward, :ad_value_and_pushforward,
@@ -737,5 +805,5 @@ function _factor_ad_call(verb::F, q::FactorQueryAD, args::Vararg{Any,N}) where {
     base, active = args[N - 1], args[N]
     length(base) == q.layout.total && length(active) == length(q.coordinates) ||
         throw(DimensionMismatch("compact factor derivative point has the wrong length"))
-    verb(q.prepared, args...)
+    verb(q.prepared, args..., q.context...)
 end
