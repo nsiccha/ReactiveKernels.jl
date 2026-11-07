@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.107
+
+- A caller that keeps one `partition_plan` per label can make equal arrays of
+  those plans one object: `_intern_partition_plan(pool, plan)` with a pool
+  `_PartitionPlanPool()` per preparation (internal, `src/plate_partition.jl`).
+  It replaces each array of plain bits that has the content of an array already
+  in the pool by that array, through tuples, named tuples, views and broadcast
+  extrusions, and keeps the plan's type and values. A plan's `partition_labels`
+  is kept as it is, because the planned body compares a label's rows with its
+  partition table's own rows by identity; its arrays become the ones the other
+  fields share. ReactiveKernelsPPL 0.1.120 interns every plan set it prepares.
+
 ## 0.1.106
 
 - A non-allocating kernel (`prepare_nonallocating`, and through it

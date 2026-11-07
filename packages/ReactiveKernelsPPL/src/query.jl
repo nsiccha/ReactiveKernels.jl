@@ -1370,6 +1370,32 @@ preparation: all cells whose key equals a label, as one compiled pass
 (RK `plate_partition`). Construct with [`prepare_partition`](@ref); call as
 `q(u, label)`. Not thread-safe: prepare one per thread.
 """
+# Each label's plan, by label: a dictionary of the labels' positions and a
+# vector of the plans. A plan is a named tuple of a few hundred bytes held
+# inline, and a `Dict{Any,T}` keeps about two slots of it per label (snag
+# per-unit-partiti-9d46c6de); here each plan has one. Reads are a dictionary's.
+struct _LabelPlans{T} <: AbstractDict{Any,T}
+    positions::Dict{Any,Int}
+    plans::Vector{T}
+end
+Base.length(d::_LabelPlans) = length(d.plans)
+Base.haskey(d::_LabelPlans, label) = haskey(d.positions, label)
+function Base.getindex(d::_LabelPlans, label)
+    i = get(d.positions, label, 0)
+    i == 0 && throw(KeyError(label))
+    @inbounds d.plans[i]
+end
+Base.get(d::_LabelPlans, label, default) =
+    (i = get(d.positions, label, 0); i == 0 ? default : @inbounds d.plans[i])
+Base.get(f::Union{Function,Type}, d::_LabelPlans, label) =
+    (i = get(d.positions, label, 0); i == 0 ? f() : @inbounds d.plans[i])
+function Base.iterate(d::_LabelPlans, state...)
+    next = iterate(d.positions, state...)
+    next === nothing && return nothing
+    (label, i), state = next
+    (label => d.plans[i]), state
+end
+
 mutable struct PartitionQuery{K,L,T,C,S}
     const kernel::K
     const layout::L
@@ -1379,7 +1405,7 @@ mutable struct PartitionQuery{K,L,T,C,S}
     # Each label's plan (`ReactiveKernels.partition_plan`), computed at
     # preparation; a label without one is planned on the spot, which refuses
     # a label no observation has.
-    const plans::Dict{Any,T}
+    const plans::_LabelPlans{T}
     const prefix::C
     # `kernel` and its kernels for other argument types (`_PartitionKernels`).
     const kernels::S
@@ -1478,16 +1504,26 @@ const _PARTITION_PORT = :_ppl_partition
 const _PLAN_PORT = :_ppl_partition_plan
 # Every label's plan (`plan_of(label)`, from RK's `partition_plan` of the
 # kernel that evaluates it), and the one type of those plans, which the kernel
-# typed its plan port with when its exemplars were lowered.
-function _partition_plans_each(plan_of, labels)
-    plans = Dict{Any,Any}(label => plan_of(label) for label in labels)
-    types = unique!(Any[typeof(plan) for plan in values(plans)])
+# typed its plan port with when its exemplars were lowered. Equal arrays of the
+# plans share one object (`pool`; pass one pool to every plan set of a
+# preparation): a label's plans hold its rows many times over.
+function _partition_plans_each(plan_of, labels;
+        pool = ReactiveKernels._PartitionPlanPool())
+    each = Any[ReactiveKernels._intern_partition_plan(pool, plan_of(label)) for label in labels]
+    types = unique!(Any[typeof(plan) for plan in each])
     length(types) == 1 || throw(ContractValidationError(
         "[query] the partition plans have several types: $(join(types, ", "))"))
     # Preparation already requires one plan type across all labels. Preserve
     # it at lookup rather than boxing the plan again on every evaluation.
     plan_type = only(types)
-    Dict{Any,plan_type}(plans), plan_type
+    positions = Dict{Any,Int}()
+    plans = plan_type[]
+    for (label, plan) in zip(labels, each)
+        haskey(positions, label) && continue
+        push!(plans, plan)
+        positions[label] = length(plans)
+    end
+    _LabelPlans{plan_type}(positions, plans), plan_type
 end
 const _PARTITION_TOTAL = :_ppl_partition_total
 
@@ -1764,7 +1800,7 @@ mutable struct PartitionSampler{K,P,L,C,T,B}
     const active::Vector{Float64}
     const gradient::Vector{Float64}
     # Each label's plan of the differentiated kernel (`partition_plan`).
-    const plans::Dict{Any,T}
+    const plans::_LabelPlans{T}
     const prefix::C
     # The backend and active ports a batch's additive operators are prepared
     # from, on the first batch: a sampler that never runs one pays nothing.
@@ -2340,7 +2376,7 @@ struct _PartitionLocal{A,T}
     slots::Vector{Int32}
     active::Vector{Float64}
     gradient::Vector{Float64}
-    plans::Dict{Any,T}
+    plans::_LabelPlans{T}
 end
 
 mutable struct _PartitionPrefix{K,A,V,L}
@@ -2385,7 +2421,8 @@ function _prepare_value_prefix(parts, layout, coordinate_labels, exemplar, on_er
 end
 
 function _prepare_partition_local(parts, layout, labels, exemplar, footprints,
-        coordinate_labels, cached, backend, on_error)
+        coordinate_labels, cached, backend, on_error;
+        pool = ReactiveKernels._PartitionPlanPool())
     # Padding must remain local too: the prefix is constant only with respect
     # to local coordinates, including unused slots in a shorter partition.
     selections = _partition_selections(footprints;
@@ -2403,7 +2440,7 @@ function _prepare_partition_local(parts, layout, labels, exemplar, footprints,
     plan = _conditional_cell_plan(_compact_partition_plan(parts.residual; whole_footprint=false))
     kernel = Base.invokelatest(prepare, plan; exemplars=args, on_error)
     planner = Base.invokelatest(ReactiveKernels.partition_plan_kernel, kernel)
-    plans, _ = _partition_plans_each(labels) do label
+    plans, _ = _partition_plans_each(labels; pool) do label
         selection = selections[label]
         Base.invokelatest(planner, exemplar, exemplar[selection],
             _compact_cell_slots(layout.total, selection), label, nothing, cached...)
@@ -2436,7 +2473,8 @@ function _prepare_shared_partition_sampler(kernel, parts, layout, names, by, lab
     residual_plan = compact ? _compact_partition_plan(parts.residual) : parts.residual
     residual = Base.invokelatest(prepare, residual_plan; exemplars = args, on_error)
     planner = Base.invokelatest(ReactiveKernels.partition_plan_kernel, residual)
-    plans, _ = _partition_plans_each(labels) do label
+    pool = ReactiveKernels._PartitionPlanPool()
+    plans, _ = _partition_plans_each(labels; pool) do label
         label_args = compact ? (exemplar, exemplar[selections[label]],
             _compact_cell_slots(layout.total, selections[label]), label, nothing, cached...) :
             (exemplar, label, nothing, cached...)
@@ -2455,7 +2493,7 @@ function _prepare_shared_partition_sampler(kernel, parts, layout, names, by, lab
         Base.invokelatest(prepare_ad, label_kernel, backend, label_args...; active = selector)
     end
     local_state = _prepare_partition_local(parts, layout, labels, exemplar,
-        local_footprints, coordinate_labels, cached, backend, on_error)
+        local_footprints, coordinate_labels, cached, backend, on_error; pool)
     cache = _PartitionPrefix(initial.kernel, prefix_ad, initial.positions, initial.point,
         initial.slots, cached, local_state, true)
     PartitionSampler(kernel, ad, layout, names, by, labels, exemplar, footprints,
