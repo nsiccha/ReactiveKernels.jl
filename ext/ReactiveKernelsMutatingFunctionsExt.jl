@@ -303,25 +303,11 @@ end
     cache
 end
 
-# A square dense matrix plus a `UniformScaling` (`K + sigma * I`), as
-# LinearAlgebra computes it: a copy of the matrix with `λ` added along its
-# diagonal, into a matching cache. Copied element by element, the loop native
-# Enzyme reverse differentiates. Another shape, element type or a cache that
-# may share memory with the matrix takes Base's own call, and its errors.
-@inline function _uniform_add_into!(cache::Matrix{T}, A::Matrix{T},
-                                    J::LinearAlgebra.UniformScaling) where {T}
-    (Base.promote_op(+, T, typeof(J.λ)) === T && size(A, 1) == size(A, 2) &&
-     size(cache) == size(A) && !Base.mightalias(cache, A)) || return A + J
-    @inbounds for i in eachindex(A)
-        cache[i] = A[i]
-    end
-    @inbounds for i in 1:size(A, 1)
-        cache[i, i] += J.λ
-    end
-    cache
-end
+# A square dense matrix plus a `UniformScaling` (`K + sigma * I`), into a
+# matching cache (`ReactiveKernels._uniform_add_into!`).
 @inline MutatingFunctions.apply!!(cache::Matrix{T}, ::typeof(+), A::Matrix{T},
-        J::LinearAlgebra.UniformScaling) where {T} = _uniform_add_into!(cache, A, J)
+        J::LinearAlgebra.UniformScaling) where {T} =
+    ReactiveKernels._uniform_add_into!(cache, A, J)
 
 @inline function MutatingFunctions.apply!!(
         cache::Array{T,N}, ::typeof(-), a::Array{T,N}, b::Array{T,N}) where {T,N}

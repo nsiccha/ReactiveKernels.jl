@@ -37,10 +37,13 @@ _slice_length(::_SliceWhole, b) = length(b)
 @inline _slice_entry(::_SliceWhole, b, g, i) = b[i]
 
 # The slices as the rows of a matrix (one slice per row) — the layout the
-# vectorized densities below reduce over. Fresh for columns.
+# vectorized densities below reduce over. Fresh for columns. One vector is a
+# 1×K row over its own storage: a reshaped view, which, unlike `reshape` of a
+# `Vector`, builds no array object.
 _slice_rows(::_SliceRows, B) = B
 _slice_rows(::_SliceCols, B) = permutedims(B)
-_slice_rows(::_SliceWhole, b) = reshape(b, 1, length(b))
+_slice_rows(::_SliceWhole, b) = _row_of(b)
+_row_of(v::AbstractVector) = reshape(view(v, :), 1, length(v))
 
 # ── per-slice arguments ──────────────────────────────────────────────
 
@@ -67,7 +70,7 @@ _arg_count(a::_PerSlice) = _slice_count(a.orientation, a.value)
 
 # A vector argument as a 1×K row (shared: broadcasts over the slices) or
 # a G×K matrix (per slice).
-_arg_rows(v::AbstractVector) = reshape(v, 1, length(v))
+_arg_rows(v::AbstractVector) = _row_of(v)
 _arg_rows(a::_PerSlice) = _slice_rows(a.orientation, a.value)
 
 @traceable function _check_slice_vector_arg(what, a, groups, k)
@@ -229,10 +232,13 @@ function _covariance_cholesky!(F::Matrix{Float64}, Sigma::AbstractMatrix{Float64
         ReactiveKernels._runtime_check(abs(Sigma[i, j] - Sigma[j, i]) <= 1e-8,
             ArgumentError("MvNormal covariance is not symmetric"))
     end
+    # The upper triangle is zeroed before the factor loop, not inside it:
+    # stores to `F` between the loop's reads of `F` make native Enzyme reverse
+    # record those reads on its tape (384 B per gradient at k = 11).
+    for j in 2:k, i in 1:(j - 1)
+        F[i, j] = 0.0
+    end
     @inbounds for j in 1:k
-        for i in 1:(j - 1)
-            F[i, j] = 0.0
-        end
         d = Sigma[j, j]
         for p in 1:(j - 1)
             d -= F[j, p] * F[j, p]

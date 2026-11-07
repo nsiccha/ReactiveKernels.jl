@@ -155,6 +155,27 @@ function _static_type(f, argtypes...)
     T === Union{} ? Any : T
 end
 
+# A square dense matrix plus a `UniformScaling` (`K + sigma * I`), as
+# LinearAlgebra computes it: a copy of the matrix with `λ` added along its
+# diagonal, into a matching cache. Copied element by element, the loop native
+# Enzyme reverse differentiates. Another shape, element type or a cache that
+# may share memory with the matrix takes Base's own call, and its errors. The
+# primal step (the MutatingFunctions extension's `apply!!`) and the
+# differentiated one (`_ad_na_arith_loop!`) both fill through it.
+@inline function _uniform_add_into!(cache::Matrix{T}, A::Matrix{T},
+                                    J::UniformScaling) where {T}
+    (Base.promote_op(+, T, typeof(J.λ)) === T && size(A, 1) == size(A, 2) &&
+     size(cache) == size(A) && !Base.mightalias(cache, A)) || return A + J
+    @inbounds for i in eachindex(A)
+        cache[i] = A[i]
+    end
+    @inbounds for i in 1:size(A, 1)
+        cache[i, i] += J.λ
+    end
+    cache
+end
+@inline _uniform_add_into!(cache, A, J::UniformScaling) = A + J
+
 _nonalloc_slot(::Type{T}) where {T} = Ref{Union{Nothing,T}}(nothing)
 _nonalloc_slot(op, ::Type{T}) where {T} = _nonalloc_slot(T)
 
@@ -287,7 +308,45 @@ function _decompose(ctx::_FusedDecomposition, node, allow_lazy_broadcast::Bool)
     node.head === :. && length(node.args) == 2 &&
         return _decompose_dotcall(ctx, node.args[1], node.args[2],
                                   allow_lazy_broadcast)
+    (node.head === :if || node.head === :elseif) && 2 <= length(node.args) <= 3 &&
+        return _decompose_branch(ctx, node)
     nothing
+end
+
+# `if c; a; else; b; end`, as an authored branch (`_KernelBranch`) spells it:
+# the condition, then each arm decomposed into statements of its own, which
+# run only when the arm is taken. A missing `else` arm is `nothing`.
+function _decompose_branch(ctx::_FusedDecomposition, node::Expr)
+    marks = (length(ctx.ops), length(ctx.caches))
+    parts = Any[]
+    types = Any[]
+    for (i, part) in enumerate(node.args)
+        d = _decompose_arm(ctx, part)
+        if d === nothing
+            resize!(ctx.ops, marks[1])
+            resize!(ctx.caches, marks[2])
+            return nothing
+        end
+        push!(parts, d[1])
+        i == 1 || push!(types, d[2])
+    end
+    length(node.args) == 2 && push!(types, Nothing)
+    (Expr(node.head, parts...), Union{types...})
+end
+
+# One arm (or condition) of a branch as a block of its own statements and its
+# value. Its names stay inside it.
+function _decompose_arm(ctx::_FusedDecomposition, ex)
+    lines = _nonalloc_straight_line(ex)
+    lines === nothing && return nothing
+    statements, final = lines
+    arm = _FusedDecomposition(ctx.mod, copy(ctx.argmap), copy(ctx.argtypes),
+                              Any[], ctx.ops, ctx.caches, ctx.offset,
+                              ctx.cache_apply)
+    all(st -> _decompose_traced_statement!(arm, st), statements) || return nothing
+    d = _decompose(arm, final, false)
+    d === nothing && return nothing
+    (isempty(arm.stmts) ? d[1] : Expr(:block, arm.stmts..., d[1]), d[2])
 end
 
 # `f.(args)` parses as `Expr(:., f, Expr(:tuple, ...))` — unlike operator-dot
@@ -383,15 +442,22 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
     decomposed === nothing && return nothing
     args, types = decomposed
     T = _static_type(f, types...)
-    if (isconcretetype(T) && isbitstype(T)) || _nonalloc_is_lazy(f)
-        return (Expr(:call, fref, args...), T)
-    end
-    if T isa DataType && isconcretetype(T) && !ismutabletype(T)
+    _nonalloc_is_lazy(f) && return (Expr(:call, fref, args...), T)
+    bits = isconcretetype(T) && isbitstype(T)
+    if bits || T isa DataType && isconcretetype(T) && !ismutabletype(T)
         # An immutable value owns no reusable buffer: a cache step would only
         # store it back through the passthrough fallback, so emit the
         # construction inline exactly as the fused closure would run it. This
         # covers wrapper structs, tuples, and other immutable constructors;
         # mutable results (arrays, refs, dicts) keep their cache steps below.
+        # A registered destination method of an immutable result fills the
+        # buffers it holds (RKPPL's simplex and its log-Jacobian), and a
+        # `@traceable` helper's body may build arrays of its own (an
+        # `MvNormal` density's factor).
+        !bits && _nonalloc_destination(ctx.cache_apply, f, T, types) &&
+            return (_emit_step!(ctx, f, T, args...), T)
+        traced = _decompose_traceable(ctx, f, args, types)
+        traced === nothing || return traced
         return (Expr(:call, fref, args...), T)
     end
     T isa Type || return nothing
@@ -466,16 +532,21 @@ function _decompose_traceable(ctx::_FusedDecomposition, f, args, types)
 end
 
 # A body's statements before its final expression, past line numbers and
-# nested blocks: `(statements, final)`, or `nothing` for an empty body.
+# nested blocks: `(statements, final)`, or `nothing` for an empty body. A
+# final `return x` is its value `x`.
 function _nonalloc_straight_line(ex)
     while ex isa Expr && ex.head === :block
         exprs = filter(a -> !(a isa LineNumberNode), ex.args)
         isempty(exprs) && return nothing
-        length(exprs) == 1 || return (exprs[1:end-1], exprs[end])
+        length(exprs) == 1 ||
+            return (exprs[1:end-1], _nonalloc_returned(exprs[end]))
         ex = only(exprs)
     end
-    ex isa LineNumberNode ? nothing : (Any[], ex)
+    ex isa LineNumberNode ? nothing : (Any[], _nonalloc_returned(ex))
 end
+
+_nonalloc_returned(ex) = ex isa Expr && ex.head === :return &&
+    length(ex.args) == 1 ? only(ex.args) : ex
 
 # One statement of a traced body, run where the helper's call runs it: an
 # assignment `x = value` or `a, b = x, y` binds its names to the decomposed
@@ -735,7 +806,9 @@ function _decompose_fused_recipe!(prog::_StepProgram, r::Recipe, callargs,
     kernel_sourceop_form(op) === :fused || return nothing
     # The source reads its inputs by its parameter names, not by the input
     # values' names (`_lane_source_params`); a capturing source keeps its step.
-    params = _lane_source_params(getfield(op, :f), r)
+    # A lazy branch's source is its `if`, over its all-in-one closure's
+    # parameters (`_lane_source_callable`).
+    params = _lane_source_params(_lane_source_callable(getfield(op, :f)), r)
     params === nothing && return nothing
     ctx = _FusedDecomposition(_kernel_endpoint_source_module(op),
                               _lane_source_arguments(params, callargs),
@@ -919,11 +992,45 @@ function _nonalloc_statement!(prog::_StepProgram, recipes::Tuple,
     stmt isa Expr && stmt.head === :(=) && stmt.args[1] isa Symbol &&
         stmt.args[2] isa Expr && stmt.args[2].head === :call || return Any[stmt]
     call = stmt.args[2]
+    call.args[1] == GlobalRef(@__MODULE__, :_cell_array_broadcast) &&
+        length(call.args) == 2 &&
+        return _nonalloc_cell_broadcast!(prog, types, stmt.args[1], call.args[2], stmt)
     i = _callable_slot(call.args[1])
     i !== nothing && 1 <= i <= length(recipes) &&
         length(recipes[i].outputs) == 1 || return Any[stmt]
     _nonalloc_step!(prog, recipes[i], i, types, stmt.args[1],
                     call.args[2:end], stmt)
+end
+
+# A broadcast that plate cells only index is spelled `_cell_array_broadcast(bc)`
+# (`_lower_cell_arrays_native`): lazy over total arithmetic on dense floating
+# storage, otherwise materialized fresh, as `log.(w)` is. When its operand types
+# make it materialize, it becomes a materialization step with a buffer of its
+# own, which `copyto!`s the same elements.
+function _nonalloc_cell_broadcast!(prog::_StepProgram, types::Dict{Symbol,Any},
+                                   lhs::Symbol, bc, stmt)
+    BT = _nonalloc_expr_type(types, bc)
+    T = BT isa Type ? _static_type(_cell_array_broadcast, BT) : Any
+    T isa DataType && isconcretetype(T) && T <: Array || return Any[stmt]
+    j = _step!(prog, _MaterializeStep(), _nonalloc_slot(T))
+    types[lhs] = T
+    Any[Expr(:(=), lhs, _step_call(j,
+        Expr(:call, GlobalRef(@__MODULE__, :_cell_array_materialize), bc)))]
+end
+
+# The static type of a program expression over names of known value types:
+# `Any` when a name, a callee or a call's result is unknown.
+function _nonalloc_expr_type(types::Dict{Symbol,Any}, ex)
+    ex isa Symbol && return get(types, ex, Any)
+    ex isa GlobalRef && return isdefined(ex.mod, ex.name) && isconst(ex.mod, ex.name) ?
+        typeof(getglobal(ex.mod, ex.name)) : Any
+    ex isa QuoteNode && return typeof(ex.value)
+    ex isa Expr || return typeof(ex)
+    ex.head === :call && ex.args[1] isa GlobalRef || return Any
+    f = ex.args[1]
+    isdefined(f.mod, f.name) && isconst(f.mod, f.name) || return Any
+    _static_type(getglobal(f.mod, f.name),
+                 (_nonalloc_expr_type(types, a) for a in ex.args[2:end])...)
 end
 
 # The step rule: fused captured sources decompose into destination-passing
@@ -949,7 +1056,18 @@ function _nonalloc_step!(prog::_StepProgram, r::Recipe, i::Int,
                 return dec[1]
             end
         end
-        isconcretetype(T) && isbitstype(T) && return Any[stmt]
+        if isconcretetype(T) && isbitstype(T)
+            # A `@traceable` helper with a numeric result may still build
+            # arrays in its body.
+            if !(r.op isa _KernelSourceOp)
+                dec = _decompose_traceable_recipe!(prog, op, callargs, argtypes, lhs)
+                if dec !== nothing
+                    types[lhs] = dec[2]
+                    return dec[1]
+                end
+            end
+            return Any[stmt]
+        end
         !(r.op isa _KernelSourceOp) && _nonalloc_is_lazy(op) && return Any[stmt]
     end
     slot_type = T isa Type && isconcretetype(T) ? T : valtype(only(r.outputs))
