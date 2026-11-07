@@ -36,10 +36,12 @@ end
             collect(select_factors(c; site = :b, entries = i)))) for i in 1:n]
         preparation_bases = Vector{Float64}[]
         preparation_actives = Vector{Float64}[]
-        function record_prepare(kernel, backend, base, active; kwargs...)
+        # A compact query's operator takes its selection's arguments (coordinate
+        # slots, cell memberships, row plan) after `(base, active)`.
+        function record_prepare(kernel, backend, base, active, selection...; kwargs...)
             push!(preparation_bases, base)
             push!(preparation_actives, active)
-            prepare_ad(kernel, backend, base, active; kwargs...)
+            prepare_ad(kernel, backend, base, active, selection...; kwargs...)
         end
         queries = prepare_query_ad(record_prepare, built, plan, selections,
             _FACTOR_PREPARATION_REVERSE, u; coordinates = :support)
@@ -52,7 +54,7 @@ end
         if n == 3
             audit = FactorPreparationAudit.TypeStabilityAudit
             q = first(queries)
-            @test isempty(audit.ad_call_findings(q.prepared, u, u[q.coordinates];
+            @test isempty(audit.ad_call_findings(q.prepared, u, u[q.coordinates], q.context...;
                 recurse = audit.rk_or_generated(ReactiveKernelsPPL)))
             full = only(prepare_query_ad(prepare_ad, built, plan, selections[1:1],
                 _FACTOR_PREPARATION_REVERSE, u))
@@ -153,10 +155,16 @@ end
         # The binding gains the row-plan graph, the query graph and the site's
         # footprint kernel, whatever the number of selections.
         push!(stored_graphs, length(data.graphs) - stored)
-        @test length(getfield(c, :structures)) == 2
+        # One query graph; the shared program plans its selections itself, so
+        # compact queries build no separate planner graph.
+        @test length(getfield(c, :structures)) == 1
         @test length(unique(objectid(q.prepared.kernel.plan.graph) for q in queries)) == 1
-        # Snag per-unit-partiti-9d46c6de: the catalogue reads the binding's own
-        # arrays; it keeps no copy of them.
+        # Snag per-unit-partiti-9d46c6de: the queries of one structure call one
+        # prepared program with their own selection, instead of a program
+        # rebound per selection (a kernel, plan and constants table each).
+        @test length(unique(objectid(q.prepared.kernel.plan.recipes) for q in queries)) == 1
+        @test all(q -> !isempty(q.context), queries)
+        # The catalogue reads the binding's own arrays; it keeps no copy of them.
         @test getfield(c, :binding).x === plan.columns[:x]
         names = coordinate_names(built.layout)
         at(name) = only(findall(==(name), names))
@@ -202,7 +210,7 @@ end
         _FACTOR_PREPARATION_REVERSE, u; coordinates = :support))
     @test q.coordinates == collect(1:sites)
     audit = FactorPreparationAudit.TypeStabilityAudit
-    @test isempty(audit.ad_call_findings(q.prepared, u, u[q.coordinates];
+    @test isempty(audit.ad_call_findings(q.prepared, u, u[q.coordinates], q.context...;
         recurse = audit.rk_or_generated(ReactiveKernelsPPL)))
     value, gradient = ad_value_and_gradient(q, u, u[q.coordinates])
     @test value ≈ -sites * 0.5log(2pi) - sum(abs2, u) / 2

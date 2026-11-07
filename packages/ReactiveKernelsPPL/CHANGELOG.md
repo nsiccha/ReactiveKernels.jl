@@ -16,6 +16,21 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.123
+
+- A compact authored-factor query (`prepare_query_ad(...; coordinates)`) keeps
+  much less per query. The queries of one selection structure now call that
+  structure's one prepared program, with their own selection (cell
+  memberships, row plan, coordinate slots, folded constant) as call arguments.
+  Before, each query rebound its own copy of the program: a kernel, plan and
+  constants table per query. A dense query (no `coordinates`) still rebinds per
+  selection. Values and gradients are unchanged.
+- **Breaking** for a custom `prepare_operator` of a compact query: it now receives the selection's
+  arguments after `(base, active)` and must pass them on, as `prepare_ad` and
+  the other ReactiveKernels operators do. The query's own verbs
+  (`ad_value_and_gradient(q, base, active)` and the rest) append them. A direct
+  call of `q.prepared` passes `q.context` after `(base, active)`.
+
 ## 0.1.122
 
 - Windows of one recurrence, fitted apart, can be joined through their boundary
