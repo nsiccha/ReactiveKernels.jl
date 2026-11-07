@@ -1308,6 +1308,33 @@ function _array_labels(name::Symbol, dims::Vector{Int})
     return [Symbol(name, ".", i, ".", j) for j in 1:dims[2] for i in 1:dims[1]]
 end
 
+# The bound labels of each declared array's label axes (`levels(g)`,
+# `unique(g)`, a data vector), with their selection applied, in the order the
+# array's positions follow, and of each positional twin `1:length(levels(g))`,
+# whose positions are the levels of `g` in `levels(g)` order; `nothing` for any
+# other axis, including `1:length(levels(g)) - k`, which does not say which
+# levels it leaves out. Arrays without such an axis are omitted.
+# `coordinate_identities` reads them; the program never does, so labels stay
+# data of the binding.
+function _array_axis_labels(plan::StructuralPlan)
+    out = Dict{Symbol,Vector{Any}}()
+    for p in plan.array_parameters
+        (p.name in plan.conditioned || p.family === :external) && continue
+        axes = Any[_array_axis_identity_labels(plan, p, d) for d in p.dims]
+        any(!isnothing, axes) && (out[p.name] = axes)
+    end
+    out
+end
+
+function _array_axis_identity_labels(plan::StructuralPlan, p::ArrayParameter, d)
+    _is_levels_dim(d) && return _apply_subset(
+        collect(Any, _array_axis_levels(plan, p.name, p.label, d)),
+        LevelMap(p.name, d.args[2], [], :levels, _levels_subset(d)))
+    count = _levels_count(d)
+    (count === nothing || last(count) != 0) && return nothing
+    collect(Any, _array_axis_levels(plan, p.name, p.label, first(count)))
+end
+
 """Append the packed layout entries of the plan's array parameters
 starting at `offset`; returns the next free offset."""
 function _array_layout_entries!(entries::Vector{LayoutEntry},

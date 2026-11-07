@@ -541,6 +541,50 @@ _extent_support(n) = (geometry = (n = n,),)
             @test sort!(collect(reads)) == [ids[2]; [n + ids[2] + n * (j - 1) for j in 1:k]]
         end
     end
+    @testset "a partition footprint reads this binding's packed positions" begin
+        # Snag `partition-plan-n-2b8a0d4a`: `W` and `b` start where the level-sized
+        # `Z` ends, a position read from the binding. The footprint kernel spliced
+        # those positions into its body, so every binding with another level count
+        # compiled the footprint again (10-17 s per ODL binding).
+        plan = lower_rkppl(quote
+                sigma ~ Exponential(1)
+                Z[levels(group), 1:2] .~ Normal.(0, 1)
+                W[levels(group)] .~ Normal.(0, 1)
+                b ~ Normal(0, 1)
+                mu = b .+ Z[group, 1] .+ x .* Z[group, 2] .+ W[group]
+                y .~ Normal.(mu, sigma)
+            end, (:group, :subject, :x, :y); conditioned = (:y,))
+        footprint_functions = map(((2, 3, 4, 5), (3, 1, 2, 2, 7, 1))) do sizes
+            G = length(sizes)
+            group = [g for (g, n) in enumerate(sizes) for _ in 1:n]
+            bound = bind_data(plan, (; group, subject = cld.(group, 2),
+                x = sin.(eachindex(group)), y = cos.(eachindex(group))))
+            built = build_kernel(bound)
+            q = prepare_partition(built, bound, :y; by = :subject,
+                partitioned = (:Z => [cld(g, 2) for g in 1:G],))
+            u = [0.3sin(i) for i in 1:built.layout.total]
+            fp = Base.invokelatest(ReactiveKernels.partition_footprint_kernel, q.kernel)
+            # The same lowering with every coordinate selected: positions this
+            # binding's lowering computes, as before the fix.
+            everything = :unconstrained =>
+                ReactiveKernels._FootprintSelection(trues(built.layout.total))
+            literal = Base.invokelatest(ReactiveKernels._partition_footprint_kernel,
+                q.kernel, everything)
+            first_of(name) = only(e.offset for e in built.layout.entries if e.name === name)
+            Zpos(g) = [first_of(:Z) - 1 + g + G * (j - 1) for j in 1:2]
+            for label in partition_labels(q)
+                reads = Base.invokelatest(fp, u, label, nothing).unconstrained
+                @test reads == Base.invokelatest(literal, u, label, nothing).unconstrained
+                @test first_of(:sigma) in reads && first_of(:b) in reads
+                @test first_of(:W) + G - 1 in reads
+                @test all(g -> Zpos(g) ⊆ reads, filter(g -> cld(g, 2) == label, 1:G))
+                @test all(g -> isdisjoint(Zpos(g), reads), filter(g -> cld(g, 2) != label, 1:G))
+            end
+            fp.f
+        end
+        # One footprint body for both level counts: its type is its generated code.
+        @test ==(typeof.(footprint_functions)...)
+    end
     @testset "one retained build serves larger, smaller and empty bindings in turn" begin
         # The reporter's sequence (`ODLPlaus:precompile`, RK `bcb8134e`).
         data(n) = (n = n, prior_mu = -0.2, prior_sd = 0.3, observation_sd = 0.7,

@@ -698,9 +698,12 @@ end
 # The return expression of a footprint body: each HAVE port's name, value and
 # recorded reads, plus the reads of the recipes the window emitter never
 # saw (computed whole: a bound-indexed gather or literal range view reads
-# constant positions, anything else the whole port).
+# constant positions, anything else the whole port). `recipes` are the
+# lowering's table recipes (`runtime_recipes`): a position read from bound
+# data is then read from the constants table when the footprint runs, so
+# the body of one program is the same for every binding.
 function _footprint_return(p::Plan, cells, names, declared = nothing, body = nothing;
-                           guards = Dict{Int,Any}())
+                           guards = Dict{Int,Any}(), recipes = ())
     recording = task_local_storage(_FOOTPRINT)
     g = p.graph
     cidof(v) = canon_id(g, v.id)
@@ -714,6 +717,17 @@ function _footprint_return(p::Plan, cells, names, declared = nothing, body = not
     selected_port = selection === nothing ? nothing :
         findfirst(port -> port.name == first(selection), p.have)
     selected_cid = selected_port === nothing ? nothing : cidof(p.have[selected_port])
+    # A selection is itself one query's data in this body (`QuoteNode(selected)`
+    # below), and its constant reads are projected onto it here, once, so a
+    # local cell footprint never enumerates a large shared block per call.
+    # Without one, bound positions stay runtime reads of the constants table.
+    slots = IdDict{Recipe,Int}()
+    if selection === nothing
+        for (k, r) in enumerate(recipes)
+            r.op isa _BoundConstant && (slots[r] = k)
+        end
+    end
+    slot(r) = get(slots, r, nothing)
     reads = Dict(cid => copy(entries) for (cid, entries) in recording.records)
     guard = nothing
     record(cid, kind, expr) = push!(get!(() -> Tuple{Symbol,Any}[], reads, cid),
@@ -756,7 +770,8 @@ function _footprint_return(p::Plan, cells, names, declared = nothing, body = not
             elseif literal !== nothing && first(literal) == s
                 record(cid, :literal, last(literal))
             else
-                constant = f === nothing ? nothing : _footprint_constant(r, f, s, producers, cidof)
+                constant = f === nothing ? nothing :
+                    _footprint_constant(r, f, s, producers, cidof, slot)
                 constant === nothing && (constant = _footprint_inline_positions(r, s))
                 if constant !== nothing && cid == selected_cid
                     positions = Int[]
@@ -782,35 +797,54 @@ end
 
 # The constant positions a recipe computed whole reads of its input `s`, when
 # its form gathers that input by a bound index or views a literal range of it;
-# `nothing` otherwise (the input is read whole).
-function _footprint_constant(r::Recipe, f::_CellForm, s::Int, producers, cidof)
+# `nothing` otherwise (the input is read whole). A bound index or endpoint
+# (RKPPL's binding-supplied packed positions) is as fixed for one binding as a
+# literal, but it is the binding's data: where `slot` gives its position in the
+# constants table, the positions are an expression reading it there, so
+# another binding of the program reuses the footprint's compiled body. Only
+# the value's type decides the form. Without a slot (a selected footprint,
+# whose body holds its selection anyway), they are this binding's positions.
+function _footprint_constant(r::Recipe, f::_CellForm, s::Int, producers, cidof,
+                             slot = _ -> nothing)
+    bound(producer) = (k = slot(producer); k === nothing ? producer.op.value :
+                                                           Expr(:ref, _CONSTANTS_ARG, k))
     role = f.roles[s]
     if role in (:gather, :linear_gather)
-        positions = Int[]
+        indices = Any[]
         for (k, via) in zip(f.indices[s], f.vias[s])
             producer = get(producers, cidof(r.inputs[k]), nothing)
             producer !== nothing && producer.op isa _BoundConstant || return nothing
-            index = producer.op.value
-            index isa AbstractArray{<:Integer} || return nothing
+            producer.op.value isa AbstractArray{<:Integer} || return nothing
             role === :linear_gather || return nothing
             via == 0 || return nothing
-            append!(positions, vec(index))
+            push!(indices, bound(producer))
         end
-        return positions
+        all(index -> index isa AbstractArray, indices) &&
+            return _footprint_bound_positions(indices...)
+        return Expr(:call, GlobalRef(@__MODULE__, :_footprint_bound_positions), indices...)
     elseif role === :range_source && f.kind === :range_view
-        # An endpoint read from bound data (RKPPL's binding-supplied packed
-        # positions) is as fixed for this binding as a literal one.
         parts = map(f.literal) do part
             part isa Int && return part
             producer = get(producers, cidof(r.inputs[part.input]), nothing)
             producer !== nothing && producer.op isa _BoundConstant &&
                 producer.op.value isa Integer || return nothing
-            Int(producer.op.value)
+            value = bound(producer)
+            value isa Integer ? Int(value) : Expr(:call, GlobalRef(Base, :Int), value)
         end
         any(isnothing, parts) && return nothing
-        return _cell_range(parts)
+        all(part -> part isa Int, parts) && return _cell_range(parts)
+        return Expr(:call, GlobalRef(@__MODULE__, :_cell_range), Expr(:tuple, parts...))
     end
     nothing
+end
+# The positions gathers by bound integer indices read: each index's entries in
+# linear order, one after another.
+function _footprint_bound_positions(indices::AbstractArray{<:Integer}...)
+    positions = Int[]
+    for index in indices
+        append!(positions, vec(index))
+    end
+    positions
 end
 
 # A recipe that reads one literal position of an input, `a = u[12]` (RKPPL's
