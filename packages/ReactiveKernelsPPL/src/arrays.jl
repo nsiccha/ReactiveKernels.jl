@@ -1632,8 +1632,11 @@ ReactiveKernels._cell_row_method(::typeof(_ppl_lkj_upper)) =
     (; at = _ppl_lkj_upper_rows, rows = (), dims = (3, 3))
 
 function _lkj_array_transform_statements(e::LayoutEntry)
-    L, K = e.name, e.dims[1]
-    P = K * (K - 1) ÷ 2
+    L = e.name
+    # A dimension read from the data names it and its partials count
+    # (`_lkj_axes_reads!`); a literal one spells both.
+    K, P = e.axes === nothing ? (e.dims[1], e.dims[1] * (e.dims[1] - 1) ÷ 2) :
+        (e.axes[1], e.axes[2])
     z, lj = _lkj_array_partials(L), _lkj_array_logjac(L)
     diagonal = _lkj_array_diagonal(L)
     raw = _lkj_array_raw(L)
@@ -1691,26 +1694,51 @@ function _lkj_array_prior_terms(L::Symbol, K::Int, eta::Float64;
     end)
 end
 
-# Normalization depends only on eta, so keep it separate from the factor's
-# diagonal. Preparation evaluates it once when eta is bound or constant;
-# live shapes retain their own loop and ordinary generated derivatives.
-function _lkj_array_normalizer_terms(K::Int, eta::Symbol)
+# Normalization depends only on eta and K, so keep it separate from the
+# factor's diagonal. Preparation evaluates it once when eta is bound or
+# constant; live shapes retain their own loop and ordinary generated
+# derivatives. `K` is a literal or the name of a data read; a literal folds.
+function _lkj_normalizer_loop(K::Union{Int,Symbol}, eta)
     lgamma = GlobalRef(DistributionKernelSources, :loggamma)
-    return :(if isfinite($eta) && $eta > 0
-        let
-            total = $(K - 1) * $lgamma($eta + $(0.5 * (K - 1)))
-            for k in 1:$(K - 1)
-                total = total - 0.5 * k * $(log(pi)) -
-                    $lgamma($eta + 0.5 * ($(K - 1) - k))
-            end
-            total
+    Km1 = _read_add(K, -1)
+    half = K isa Int ? 0.5 * (K - 1) : :(0.5 * $Km1)
+    return :(let
+        total = $Km1 * $lgamma($eta + $half)
+        for k in 1:$Km1
+            total = total - 0.5 * k * $(log(pi)) -
+                $lgamma($eta + 0.5 * ($Km1 - k))
         end
+        total
+    end)
+end
+
+function _lkj_array_normalizer_terms(K::Union{Int,Symbol}, eta::Symbol)
+    return :(if isfinite($eta) && $eta > 0
+        $(_lkj_normalizer_loop(K, eta))
     else
         -Inf
     end)
 end
 
-function _lkj_array_diagonal_terms(L::Symbol, K::Int, eta::Symbol;
+# A literal shape with a dimension read from the data: the normalizer is
+# computed from that dimension (`lkj_logconst`'s general branch, the same value
+# at `eta == 1`), and the diagonal keeps the literal prior's terms.
+_lkj_array_normalizer_terms(K::Symbol, eta::Float64) = _lkj_normalizer_loop(K, eta)
+
+function _lkj_array_diagonal_terms(L::Symbol, K::Symbol, eta::Float64;
+        intrinsic_pair::Bool = false, diagonal::Union{Nothing,Symbol} = nothing)
+    entry = diagonal === nothing ? :($L[i, i]) : :($diagonal[i])
+    term = _lkj_prior_diagonal(:(log($entry)), K, :i, eta)
+    return :(let
+        total = 0.0
+        for i in 2:$K
+            total += $term
+        end
+        total
+    end)
+end
+
+function _lkj_array_diagonal_terms(L::Symbol, K::Union{Int,Symbol}, eta::Symbol;
         intrinsic_pair::Bool = false, diagonal::Union{Nothing,Symbol} = nothing)
     entry = diagonal === nothing ? :($L[i, i]) : :($diagonal[i])
     # A declared literal 2 × 2 factor has one diagonal contribution. Its
@@ -1842,10 +1870,24 @@ function _array_level_index_statements(plan::StructuralPlan,
     return stmts
 end
 
+# The dimension an LKJ factor's prior reads: the one its packed block reads
+# (`_lkj_axes_reads!`), or, for a conditioned factor, which packs nothing, its
+# authored dimension read here by the same rule. A literal stays a literal.
+function _lkj_prior_dim!(stmts::Vector{Expr}, layout, plan::StructuralPlan,
+        p::ArrayParameter, K::Int)
+    i = layout === nothing ? nothing :
+        findfirst(e -> e.name === p.name && e.kind === :cholesky_corr, layout.entries)
+    i === nothing || return something(layout.entries[i].axes, Any[K])[1]
+    p.name in plan.conditioned || return K
+    return _named_read!(stmts, _lkj_axis_name(p.name),
+        _lkj_dim_read(plan, _read_tests(plan), p, K))
+end
+
 # Prior nodes `_ppl_prior_<name>` of the plan's array parameters.
 function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         plan::StructuralPlan, needed::Set{Tuple{Symbol,Symbol,Int}};
-        context = plan, pointwise = Pair{Symbol,Any}[], density_sites = nothing)
+        context = plan, pointwise = Pair{Symbol,Any}[], density_sites = nothing,
+        layout = nothing)
     for p in plan.array_parameters
         dims = _array_dims(plan, p)
         node = Symbol(:_ppl_prior_, p.name)
@@ -1884,10 +1926,11 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             factor_diagonal = p.name in plan.conditioned ? nothing :
                 _lkj_array_diagonal(p.name)
             eta = p.args.arg1
-            if eta isa Symbol
+            K = _lkj_prior_dim!(stmts, layout, context, p, dims[1])
+            if eta isa Symbol || !(K isa Int)
                 normalizer, diagonal = Symbol(node, :_normalizer), Symbol(node, :_diagonal)
-                push!(stmts, :($normalizer::Float64 = $(_lkj_array_normalizer_terms(dims[1], eta))),
-                    :($diagonal::Float64 = $(_lkj_array_diagonal_terms(p.name, dims[1], eta;
+                push!(stmts, :($normalizer::Float64 = $(_lkj_array_normalizer_terms(K, eta))),
+                    :($diagonal::Float64 = $(_lkj_array_diagonal_terms(p.name, K, eta;
                         intrinsic_pair = p.dims == Any[2, 2], diagonal = factor_diagonal))),
                     :($node::Float64 = $normalizer + $diagonal))
             else
