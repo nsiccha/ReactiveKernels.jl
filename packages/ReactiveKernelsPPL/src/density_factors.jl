@@ -221,6 +221,9 @@ struct DensityFactors{B,P,S,H,D}
     support_exemplar::Vector{Float64}
     support_kernels::Dict{Tuple{Symbol,Symbol,Int},Any}
     support_lock::ReentrantLock
+    # One query graph per selection structure (`_density_structure_spec`).
+    structures::Dict{Any,Any}
+    structure_lock::ReentrantLock
 end
 
 Base.length(c::DensityFactors) = sum(s.count for s in c.sites; init = 0)
@@ -297,7 +300,8 @@ function density_factors(built, plan::StructuralPlan)
     end
     DensityFactors(built, plan, spec, _query_have(plan), binding, sites, coordinates,
         zeros(built.layout.total),
-        Dict{Tuple{Symbol,Symbol,Int},Any}(), ReentrantLock())
+        Dict{Tuple{Symbol,Symbol,Int},Any}(), ReentrantLock(),
+        Dict{Any,Any}(), ReentrantLock())
 end
 
 "A set of authored atomic events from one density catalogue."
@@ -394,6 +398,9 @@ end
 const _DENSITY_TOTAL = :_ppl_density_selected
 const _DENSITY_LABEL = :_ppl_density_label
 const _DENSITY_PLAN = :_ppl_density_plan
+const _DENSITY_PARTITION = :_ppl_density_partition
+const _DENSITY_CONSTANT = :_ppl_density_constant
+_density_membership(j::Int) = Symbol(:_ppl_density_membership_, j)
 
 # Catalogue preparation can fold a whole data-only density plate. Its bound
 # cells still identify independent events, but no authored plate remains to
@@ -407,64 +414,46 @@ function _density_bound_cells(c::DensityFactors, s::_DensitySite)
     op isa ReactiveKernels._BoundConstant ? op.value : nothing
 end
 
-function _density_selection_spec(built, plan, selection; locality, on_error, u0,
-        checked = false)
-    checked || _check_factor_selection(built, plan, selection)
-    c = selection.catalogue
+# Selections of one structure share one query graph: the sites they read
+# whole (`totals`), the sites they read as partitioned cells (`plates`),
+# whether folded data-only cells add a constant, the row plan's type and the
+# compact overlay. Entries, row plans, constants and coordinate slots are
+# bound per selection, so RK prepares each structure once and rebinds its
+# compiled template for every selection (`prepare(…; bound)` keeps that work
+# per graph). A graph copied per selection kept a whole catalogue graph alive
+# in every query and in the binding's data store.
+function _density_structure_spec(c::DensityFactors, plan, totals::Tuple, plates::Tuple,
+        constant::Bool, locality, rowplan, compact::Bool)
+    key = (totals, plates, constant, locality, rowplan, compact)
+    lock(c.structure_lock) do
+        get!(c.structures, key) do
+            _build_density_structure_spec(c, plan, totals, plates, constant, locality,
+                rowplan, compact)
+        end
+    end
+end
+
+function _build_density_structure_spec(c, plan, totals, plates, constant, locality,
+        rowplan, compact)
     spec = ReactiveKernels._copy_cell_factor_spec(c.spec)
-    terms = Symbol[]
-    constant_terms = Float64[]
-    plates = Symbol[]
-    by = Dict{Symbol,Symbol}()
-    bindings = Pair{Symbol,Any}[pairs(_query_bound(plan))...]
-    for (j, s) in enumerate(c.sites)
-        entries = [f.entry - s.offset for f in selection if f.kind === s.kind &&
-            f.site === s.site && s.offset < f.entry <= s.offset + s.count]
-        isempty(entries) && continue
-        if s.plate === nothing
-            push!(terms, s.total)
-        elseif (cells = _density_bound_cells(c, s)) !== nothing
-            push!(constant_terms, sum(i -> cells[i], entries; init = 0.0))
-        else
-            key = Symbol(:_ppl_density_membership_, j)
-            spec.ports[key] = value!(spec.graph, key, ReactiveKernels._PartitionIndex{Bool})
-            push!(spec.port_order, key)
-            membership = ReactiveKernels._PartitionIndex(Dict(true => sort!(unique!(entries))), s.count)
-            push!(bindings, key => membership)
-            by[s.plate] = key
-            push!(plates, s.plate)
-        end
-    end
-    have = (_query_have(plan)..., (by[p] for p in plates)...)
+    terms = Symbol[c.sites[j].total for j in totals]
     if !isempty(plates)
-        summed = :_ppl_density_partition
-        spec = plate_partition(spec, plates; by, index = _DENSITY_LABEL,
-            name = summed, locality, plan = _DENSITY_PLAN)
-        planning_have = (have..., _DENSITY_LABEL, _DENSITY_PLAN)
-        planner = Base.invokelatest(_prepare_cached_partition, plan, spec;
-            have = planning_have, want = summed, bound = (; bindings...), on_error)
-        rowplan = Base.invokelatest(planner, u0, true, nothing)
-        # Rebuild with the concrete plan type: ordinary native AD sees the
-        # exact prepared structure, and evaluation performs no membership scan.
-        spec = ReactiveKernels._copy_cell_factor_spec(c.spec)
-        for p in plates
-            key = by[p]
+        by = Dict{Symbol,Symbol}()
+        for j in plates
+            key = _density_membership(j)
             spec.ports[key] = value!(spec.graph, key, ReactiveKernels._PartitionIndex{Bool})
             push!(spec.port_order, key)
+            by[c.sites[j].plate] = key
         end
-        spec = plate_partition(spec, plates; by, index = _DENSITY_LABEL,
-            name = summed, locality, plan = _DENSITY_PLAN => typeof(rowplan))
-        push!(terms, summed)
-        push!(bindings, _DENSITY_LABEL => true, _DENSITY_PLAN => rowplan)
-        have = (have..., _DENSITY_LABEL, _DENSITY_PLAN)
+        spec = plate_partition(spec, Symbol[c.sites[j].plate for j in plates]; by,
+            index = _DENSITY_LABEL, name = _DENSITY_PARTITION, locality,
+            plan = rowplan === nothing ? _DENSITY_PLAN : _DENSITY_PLAN => rowplan)
+        push!(terms, _DENSITY_PARTITION)
     end
-    if !isempty(constant_terms)
-        name = :_ppl_density_constant
-        constant = value!(spec.graph, name, Float64)
-        spec.ports[name] = constant
-        push!(spec.port_order, name)
-        add!(spec.graph, () => constant, ReactiveKernels._BoundConstant(sum(constant_terms)))
-        push!(terms, name)
+    if constant
+        spec.ports[_DENSITY_CONSTANT] = value!(spec.graph, _DENSITY_CONSTANT, Float64)
+        push!(spec.port_order, _DENSITY_CONSTANT)
+        push!(terms, _DENSITY_CONSTANT)
     end
     output = value!(spec.graph, _DENSITY_TOTAL, Float64)
     spec.ports[_DENSITY_TOTAL] = output
@@ -474,6 +463,53 @@ function _density_selection_spec(built, plan, selection; locality, on_error, u0,
     else
         add!(spec.graph, Tuple(spec[t] for t in terms) => output, +)
     end
+    compact && _compact_overlay!(spec, plan)
+    spec
+end
+
+function _density_selection_spec(built, plan, selection; locality, on_error, u0,
+        checked = false, compact = false)
+    checked || _check_factor_selection(built, plan, selection)
+    c = selection.catalogue
+    totals, plates = Int[], Int[]
+    constant, folded = 0.0, false
+    bindings = Pair{Symbol,Any}[pairs(_query_bound(plan))...]
+    for (j, s) in enumerate(c.sites)
+        entries = [f.entry - s.offset for f in selection if f.kind === s.kind &&
+            f.site === s.site && s.offset < f.entry <= s.offset + s.count]
+        isempty(entries) && continue
+        if s.plate === nothing
+            push!(totals, j)
+        elseif (cells = _density_bound_cells(c, s)) !== nothing
+            constant += sum(i -> cells[i], entries; init = 0.0)
+            folded = true
+        else
+            membership = ReactiveKernels._PartitionIndex(Dict(true => sort!(unique!(entries))), s.count)
+            push!(bindings, _density_membership(j) => membership)
+            push!(plates, j)
+        end
+    end
+    totals, plates = Tuple(totals), Tuple(plates)
+    have = (_query_have(plan)..., (_density_membership(j) for j in plates)...)
+    rowplan = nothing
+    if !isempty(plates)
+        planner_spec = _density_structure_spec(c, plan, (), plates, false, locality,
+            nothing, false)
+        planner = Base.invokelatest(_prepare_cached_partition, plan, planner_spec;
+            have = (have..., _DENSITY_LABEL, _DENSITY_PLAN), want = _DENSITY_PARTITION,
+            bound = (; bindings...), on_error)
+        plan_value = Base.invokelatest(planner, u0, true, nothing)
+        # The final graph types its plan port: ordinary native AD sees the
+        # exact prepared structure, and evaluation performs no membership scan.
+        rowplan = typeof(plan_value)
+        push!(bindings, _DENSITY_LABEL => true, _DENSITY_PLAN => plan_value)
+        have = (have..., _DENSITY_LABEL, _DENSITY_PLAN)
+    end
+    if folded
+        push!(bindings, _DENSITY_CONSTANT => constant)
+        have = (have..., _DENSITY_CONSTANT)
+    end
+    spec = _density_structure_spec(c, plan, totals, plates, folded, locality, rowplan, compact)
     (; spec, have, bound = (; bindings...), want = _DENSITY_TOTAL, binding = plan)
 end
 
@@ -586,11 +622,12 @@ end
 
 function _prepare_factor_query_ad(prepare_operator, built, plan, selection, backend,
         exemplars, u0; on_error, locality, coordinates)
-    q = _density_selection_spec(built, plan, selection; locality, on_error, u0, checked = true)
-    if coordinates !== nothing
+    compact = coordinates !== nothing
+    q = _density_selection_spec(built, plan, selection; locality, on_error, u0,
+        checked = true, compact)
+    if compact
         selected = coordinates === :support ? _factor_support(selection, u0) : collect(Int, coordinates)
         _check_compact_cell_indices(u0, selected, selected, built.layout.total)
-        _compact_overlay!(q.spec, plan)
         have = (:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots,
             (n for n in q.have if n !== :unconstrained)...)
         slots = _fixed_cell_slots(built.layout.total, selected)
