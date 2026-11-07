@@ -498,11 +498,16 @@ function _decompose_traceable(ctx::_FusedDecomposition, f, args, types)
     all(t -> t isa Type, types) || return nothing
     source = _traceable_source(typeof(f), types...)
     source === nothing && return nothing
+    names, body, mod, traced = source
     # The source is the `@traceable` method's. A more specific plain method
     # (a `Float64` specialization, say) is the one these arguments call, so
-    # the source applies only when no other method does.
-    length(methods(f, Tuple{types...})) == 1 || return nothing
-    names, body, mod = source
+    # the source stands for the call only when its method is the one called.
+    called = try
+        which(f, Tuple{types...})
+    catch
+        return nothing
+    end
+    called.sig == traced || return nothing
     length(names) == length(args) || return nothing
     lines = _nonalloc_straight_line(body)
     lines === nothing && return nothing

@@ -3404,12 +3404,15 @@ macro _record_source(def)
 end
 
 """
-    _traceable_source(::Type{typeof(f)}, argument_types...) -> (names, body, module) or nothing
+    _traceable_source(::Type{typeof(f)}, argument_types...) -> (names, body, module, signature) or nothing
 
 The authored source of the `@traceable` method of `f` that arguments of
-`argument_types` call: its formal names, its body and the module the body's
-globals resolve in. Source-reading compilers (`jax_source`) translate the
-helper from it. `nothing` for a function without a `@traceable` method.
+`argument_types` call: its formal names, its body, the module the body's
+globals resolve in, and the method's signature type. Source-reading compilers
+(`jax_source`) translate the helper from it. A more specific plain method of
+`f` is the one native execution calls; comparing its `which(...).sig` with the
+signature tells the two apart. `nothing` for a function without a
+`@traceable` method.
 """
 _traceable_source(@nospecialize(args...)) = nothing
 
@@ -3420,20 +3423,30 @@ _traceable_source(@nospecialize(args...)) = nothing
 function _traceable_source_method(callee, formals, wheres, body, mod)
     params = Any[]
     names = Symbol[]
+    bounds = Any[]
     for formal in formals
-        formal isa Symbol && (push!(params, :(::Type)); push!(names, formal); continue)
+        formal isa Symbol && (push!(params, :(::Type)); push!(names, formal);
+                              push!(bounds, GlobalRef(Core, :Any)); continue)
         formal isa Expr && formal.head === :(::) && length(formal.args) == 2 &&
             formal.args[1] isa Symbol || return Any[]
         push!(params, Expr(:(::), Expr(:curly, :Type, Expr(:<:, formal.args[2]))))
         push!(names, formal.args[1])
+        push!(bounds, formal.args[2])
     end
     signature = Expr(:call, GlobalRef(@__MODULE__, :_traceable_source),
                      Expr(:(::), Expr(:curly, :Type, Expr(:call, GlobalRef(Core, :typeof), callee))),
                      params...)
+    # The method's own signature type, built once where it is defined: inside
+    # the source method its `where` names are bound to the matched types.
+    method_type = Expr(:curly, GlobalRef(Core, :Tuple),
+                       Expr(:call, GlobalRef(Core, :typeof), callee), bounds...)
     for layer in reverse(wheres)
         signature = Expr(:where, signature, layer...)
+        method_type = Expr(:where, method_type, layer...)
     end
-    Any[Expr(:(=), signature, Expr(:tuple, QuoteNode(Tuple(names)), QuoteNode(body), mod))]
+    held = gensym(:traceable_signature)
+    Any[Expr(:const, Expr(:(=), held, method_type)),
+        Expr(:(=), signature, Expr(:tuple, QuoteNode(Tuple(names)), QuoteNode(body), mod, held))]
 end
 
 # The body with its tail-position `return`s replaced by their values, as a

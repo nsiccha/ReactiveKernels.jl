@@ -13,6 +13,10 @@ function kernel_allocations(k, x, y)
     k(x, y)
     @allocated k(x, y)
 end
+function kernel_allocations(k, x, y, z)
+    k(x, y, z)
+    @allocated k(x, y, z)
+end
 
 include(joinpath(@__DIR__, "fixtures", "nonallocating_called_ops.jl"))
 
@@ -340,6 +344,25 @@ end
         @test k(x, 0.7) == ordinary(x, 0.7)
         @test k(2 .* x, 1.3) == ordinary(2 .* x, 1.3)
         @test kernel_allocations(k, x, 0.7) == 0
+    end
+
+    @testset "a branch's arms fill buffers of their own" begin
+        # An authored `if` whose taken arm builds an array: each arm decomposes
+        # into its own steps, which run only when the arm is taken.
+        spec = @kernel branch_steps(x::Vector{Float64}, w::Vector{Float64},
+                                    valid::Bool) = begin
+            out::Float64 = if valid
+                sum(w .* log.(x))
+            else
+                -Inf
+            end
+        end
+        ordinary = prepare(spec; have = (:x, :w, :valid), want = :out)
+        k = prepare_nonallocating(spec; have = (:x, :w, :valid), want = :out)
+        x, w = [0.5 + 0.1i for i in 1:12], [cos(i) for i in 1:12]
+        @test k(x, w, true) == ordinary(x, w, true)
+        @test k(x, w, false) == ordinary(x, w, false) == -Inf
+        @test kernel_allocations(k, x, w, true) == 0
     end
 
     @testset "a traced helper's source stands only for its own method" begin

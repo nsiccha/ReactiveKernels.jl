@@ -174,9 +174,9 @@ end
     # trajectory after its initial values, a ranged gather into a group plate,
     # a coefficient vector of scalar parameters, an interval transform's
     # log-Jacobian, the simplex and ordered transforms, and an `MvNormal`
-    # covariance's factor and solve. The density is measured on the kernel: the query's own call
-    # returns its value through a world-age barrier (`SamplerQuery`), which
-    # boxes the number it returns.
+    # covariance's factor and solve. The density is measured on the kernel:
+    # the query's own call returns its value through a world-age barrier
+    # (`SamplerQuery`), which boxes the number it returns.
     for (label, plan) in _na_sampler_cases()
         @testset "$label" begin
             built = build_kernel(plan)
