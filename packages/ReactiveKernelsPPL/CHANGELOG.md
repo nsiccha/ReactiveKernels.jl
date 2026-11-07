@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.117
+## 0.1.118
 
 - `prepare_sampler(...; nonallocating = true)` with ReactiveKernels 0.1.106
   allocates nothing per call, after warm-up, in its density kernel
@@ -29,6 +29,45 @@ are recorded in the git history only.
   transforms and an `MvNormal` covariance's Cholesky factor. `q(u)` itself
   returns its number through the world-age barrier, which boxes it (16 B).
   The ReactiveKernels compat floor is 0.1.106.
+
+## 0.1.117
+
+- **Slices of one bound model.** `prepare_slices(built, plan, observations, u0;
+  by, backend)` prepares the model restricted to the cells whose label (as
+  `prepare_partition_sampler`'s `by` gives it) is in a chosen set, for example
+  one region of a national binding.
+  - A slice's density is its cells, plus every authored prior and Jacobian term
+    that owns a coordinate they reach, with the coordinates those terms read added
+    in turn. Each term counts once, however many labels reach it.
+  - `slice_coordinates(slices, labels)` gives the slice's packed positions in
+    the whole binding; nothing outside them is read or differentiated, and other
+    labels' cells are not evaluated.
+  - `slice_value_and_gradient!(slices, g, u, labels; compact = true)` evaluates
+    one label or a collection of them. `slice_problem(slices, labels; base)` is a
+    first-order `LogDensityProblems` target over the compact coordinates, through
+    the new `ReactiveKernelsPPLLogDensityProblemsExt`.
+  - The binding is prepared once, and another label set reuses its compiled
+    kernels.
+  - For units nested in the labels, a label's slice equals the model bound to
+    that label's data alone, in value and gradient.
+  - A density that owns no coordinate and reads coordinates both inside and
+    outside a slice is refused for that slice with a `ContractValidationError`.
+- **`coordinate_identities(layout)`.** It names each packed coordinate by its
+  authored path and an index holding the bound label of a `levels(g)`,
+  `unique(g)` or data-vector axis, or the level at each position of the
+  positional twin `1:length(levels(g))` (BRM's group effects); other axes,
+  `1:length(levels(g)) - k` included, keep positions. The same coordinate of
+  two bindings therefore compares equal where `coordinate_names` gives its
+  position. `LayoutTable` keeps a declared array's bound axis labels for this
+  in a new last field, `axis_labels`; its existing constructors are unchanged.
+  `coordinate_names` is unchanged.
+- **A factor selection of many sites prepares a concretely typed program.**
+  `prepare_query` and `prepare_query_ad` add a selection's site totals two at a
+  time, left to right, instead of in one `+` over all of them. Julia does not
+  infer Base's varargs `+` past 32 operands, so a selection of more sites (a
+  slice's prior on a real model) left a call dispatched at run time in the
+  prepared program, which RK warned about. The sum and its rounding are
+  unchanged.
 
 ## 0.1.116
 

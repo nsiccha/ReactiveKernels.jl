@@ -460,8 +460,20 @@ function _build_density_structure_spec(c, plan, totals, plates, constant, locali
     push!(spec.port_order, _DENSITY_TOTAL)
     if isempty(terms)
         add!(spec.graph, () => output, () -> 0.0)
+    elseif length(terms) == 1
+        add!(spec.graph, (spec[only(terms)],) => output, +)
     else
-        add!(spec.graph, Tuple(spec[t] for t in terms) => output, +)
+        # Two terms per `+`, left to right as Base folds `+(a, b, c...)`: a
+        # selection can hold dozens of sites (a slice's prior), and Julia does
+        # not infer Base's varargs fold past 32 operands, which would leave a
+        # call dispatched at run time in the prepared program.
+        partial = spec[terms[1]]
+        for k in 2:length(terms)
+            sum_k = k == length(terms) ? output :
+                value!(spec.graph, Symbol(_DENSITY_TOTAL, :_, k), Float64)
+            add!(spec.graph, (partial, spec[terms[k]]) => sum_k, +)
+            partial = sum_k
+        end
     end
     compact && _compact_overlay!(spec, plan)
     spec

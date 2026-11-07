@@ -276,6 +276,7 @@ const _PPL_TEST_FILES = (
     "test_shared_prefix_world_age.jl",
     "test_scalar_partition_reads.jl",
     "test_partition_by.jl",
+    "test_slices.jl",
     "test_cell_kernel_design.jl",
     "test_cell_type_branches.jl",
     "test_cell_tuple_geometry.jl",
