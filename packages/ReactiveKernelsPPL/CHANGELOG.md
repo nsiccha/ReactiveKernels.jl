@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.119
+
+- `prepare_sampler(...; nonallocating = true)` with ReactiveKernels 0.1.106
+  allocates nothing per call, after warm-up, in its density kernel
+  (`q.kernel(u)`) and its gradient (`sampler_value_and_gradient!`) for a
+  design-matrix product, a coefficient vector of scalar parameters, a `@scan`
+  trajectory, a ranged response gather (a plate over `eachindex(y)`) and an
+  interval-bounded vector. Values and gradients are unchanged. The gather
+  `_ppl_range_values` is `@traceable`, so the non-allocating kernel gathers
+  into a buffer of its own. Still allocating: the simplex and ordered
+  transforms and an `MvNormal` covariance's Cholesky factor. `q(u)` itself
+  returns its number through the world-age barrier, which boxes it (16 B).
+  The ReactiveKernels compat floor is 0.1.106.
+
 ## 0.1.118
 
 - A declared `L ~ LKJCholesky(K, eta)` factor whose dimension `K` reads data

@@ -51,18 +51,46 @@ _na_groups = @rkppl begin
     end
 end
 
+# Interval-bounded scalar coefficients beside three data columns: RKPPL
+# gathers their constrained values into one coefficient vector,
+# `vcat([a], [b], [c], [d])`, for a design-matrix product.
+_na_affine = @rkppl begin
+    a ~ Uniform(-5, 5)
+    b ~ Uniform(-5, 5)
+    c ~ Uniform(-5, 5)
+    d ~ Uniform(-5, 5)
+    rate = a .+ b .* x1 .+ c .* x2 .+ d .* x3
+    n .~ Poisson.(exp.(rate))
+end
+
+# An interval-bounded coefficient vector: its log-Jacobian broadcasts over the
+# negated unconstrained values, `log1pexp.(-u)`.
+_na_bounded = @rkppl begin
+    alpha ~ Normal(0, 10)
+    beta[axes(X, 2)] .~ Uniform.(-5, 5)
+    sigma ~ HalfCauchy(2.5)
+    mu = alpha .+ X * beta
+    y .~ Normal.(mu, sigma)
+end
+
 const _NA_X = [sin(0.7i + j) for i in 1:60, j in 1:3]
 const _NA_Y = [0.5 + 0.8 * _NA_X[i, 1] - 0.3 * _NA_X[i, 2] + 0.2 * cos(1.3i) for i in 1:60]
 const _NA_SERIES = [sin(0.3t) + 0.1 * cos(2.1t) for t in 1:80]
+const _NA_COUNTS = [round(Int, exp(0.3 + 0.5 * _NA_X[i, 1] - 0.2 * _NA_X[i, 2])) for i in 1:60]
 
 _na_sampler_cases() = (
     ("matrix-vector regression", _na_regression(; X = _NA_X) | (; y = _NA_Y)),
     ("scan recurrence", _na_recurrence(; T = length(_NA_SERIES)) | (; y = _NA_SERIES)),
     ("group plate", _na_groups(; sigma = [1.5, 0.8, 2.0, 1.1, 0.9]) |
         (; y = [0.4, -1.2, 2.3, 0.1, 0.7])),
+    ("scalar coefficients", _na_affine(; x1 = _NA_X[:, 1], x2 = _NA_X[:, 2],
+        x3 = _NA_X[:, 3]) | (; n = _NA_COUNTS)),
+    ("interval-bounded coefficients", _na_bounded(; X = _NA_X) | (; y = _NA_Y)),
 )
 
 _na_density_bytes(q, u) = (q(u); q(u); @allocated q(u))
+_na_gradient_bytes(q, g, u) = (sampler_value_and_gradient!(q, g, u);
+    sampler_value_and_gradient!(q, g, u); @allocated sampler_value_and_gradient!(q, g, u))
 
 @testset "non-allocating sampler equals the ordinary sampler" begin
     for (label, plan) in _na_sampler_cases()
@@ -105,6 +133,25 @@ end
     @test ordinary >= 60 * sizeof(Float64)
     @test reused < ordinary
     @test reused < 60 * sizeof(Float64)
+end
+
+@testset "a warmed non-allocating density and gradient allocate nothing" begin
+    # Each shape of `_na_sampler_cases`: a design-matrix product, a scan
+    # trajectory after its initial values, a ranged gather into a group plate,
+    # a coefficient vector of scalar parameters and an interval transform's
+    # log-Jacobian. The density is measured on the kernel: the query's own call
+    # returns its value through a world-age barrier (`SamplerQuery`), which
+    # boxes the number it returns.
+    for (label, plan) in _na_sampler_cases()
+        @testset "$label" begin
+            built = build_kernel(plan)
+            u = [0.1 * sin(k) for k in 1:built.layout.total]
+            q = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND,
+                warm = true, nonallocating = true)
+            @test Base.invokelatest(_na_density_bytes, q.kernel, u) == 0
+            @test Base.invokelatest(_na_gradient_bytes, q, zeros(length(u)), u) == 0
+        end
+    end
 end
 
 @testset "a bound number's value keeps the non-allocating sampler's type" begin

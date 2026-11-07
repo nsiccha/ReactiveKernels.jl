@@ -16,6 +16,29 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.106
+
+- A non-allocating kernel (`prepare_nonallocating`, and through it
+  ReactiveKernelsPPL's `prepare_sampler(...; nonallocating = true)`) gives more
+  array results a buffer of its own instead of allocating them on every call,
+  with the same values:
+  - `vcat` of vector literals of numbers beside vectors (`vcat([a], [b], v)`),
+    the coefficient vector and scan trajectory ReactiveKernelsPPL writes;
+  - the unary minus of an array inside a dotted call (`log1pexp.(-u)`), now
+    part of the broadcast instead of a negated copy;
+  - a `@traceable` helper whose body is one expression, decomposed over its
+    arguments as `jax_source` translates it, and functions and constants a
+    generated source names by `GlobalRef`;
+  - a square dense matrix plus a `UniformScaling` (`K + sigma * I`).
+
+  Its gradient no longer allocates for `vcat` of dense vectors or `copy` of a
+  contiguous view: both copy element by element, where native Enzyme reverse
+  recorded Base's loops on its tape on every call.
+- On Julia 1.13, a non-allocating kernel holding a plate of kernel cells (a scan
+  per column, for example) no longer copies itself to the heap on every call:
+  832 B per call for a plate of three scans since 0.1.103. The plate now enters
+  each cell's body directly. Julia 1.10 was not affected.
+
 ## 0.1.105
 
 - Another binding of one program no longer compiles its partition footprint
