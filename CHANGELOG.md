@@ -16,6 +16,29 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.103
+
+- A non-allocating kernel no longer has its own type per preparation.
+  `prepare_nonallocating` compiled the kernel's constants, callables and caches
+  into its generated body, with a token per preparation so that two kernels never
+  shared a slot. Each preparation was then another type and another compile, and
+  a bound number's value was a literal of that body. The body now holds code only,
+  and each call passes it one reference to the kernel's tables and caches.
+  Preparations of one program share one body and one type across the values of a
+  bound number, so ReactiveKernelsPPL's `prepare_sampler(...; nonallocating = true)`
+  keeps one type, as the ordinary sampler does since 0.1.95. Each kernel still
+  owns its slots, and a `deepcopy` now owns its own; it used to share them with
+  the original through the body.
+- Another preparation of such a program no longer compiles its primal, which took
+  1.1 s per preparation on 12 gather blocks and 8.4 s on 48. The density reads
+  bound numbers at run time instead of as literals. Against the old body, in one
+  process at one load, a gather or regression with a bound scale took 1.05 to 1.24
+  times as long at 120 and 2000 rows, a gather with a sampled scale 1.02 to 1.06
+  times, and bound priors, group plates and scans 0.58 to 1.02 times; every case
+  stayed faster than the ordinary kernel. A plate
+  of array cells, whose body Julia does not inline, costs 117 ns per call against
+  67 ns.
+
 ## 0.1.102
 
 - A partition sampler or query with a cached shared prefix (`partitioned=`)

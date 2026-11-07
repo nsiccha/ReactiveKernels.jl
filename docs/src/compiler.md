@@ -640,6 +640,11 @@ has the same prepared type and reuses the compiled derivative. A binding that
 changes a value's type, or moves an index run between its flat and grouped
 schedules, is another program and compiles once more.
 
+A non-allocating kernel follows it too. Its generated body holds code only: each
+call passes one reference to the kernel's constants, callables and caches, so
+preparations of one program share one body and one type, and each kernel still
+owns its slots.
+
 The graph holds these entries itself, so they live exactly as long as the
 graph: a graph authored as a module constant keeps them for the process, a
 graph built per request drops them with it, and a mutation of the graph starts
