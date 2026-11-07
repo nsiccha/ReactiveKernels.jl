@@ -61,7 +61,8 @@ export build_kernel, kernel_expr
 export jax_source
 export model_view, RKPPLModelView
 export DesignShape, DesignBlock, design_shape, coefficient_priors
-export LayoutTable, LayoutEntry, assign_layout, coordinate_names, parameter_metadata
+export LayoutTable, LayoutEntry, assign_layout, coordinate_names, coordinate_identities,
+    parameter_metadata
 export constrain, unconstrain, logjac, support_of
 export ordered_constrain, ordered_unconstrain, ordered_logjac
 export simplex_constrain, simplex_unconstrain, simplex_logjac
@@ -85,6 +86,8 @@ export prepare_partition, PartitionQuery, prepare_partition_sampler, PartitionSa
     partition_value_and_gradient!, partition_batch_value_and_gradient!, partition_labels
 # `partition_footprint(s::PartitionSampler, label)` extends ReactiveKernels'
 # function; its name is ReactiveKernels' export.
+export prepare_slices, SliceSampler, slice_labels, slice_coordinates,
+    slice_value_and_gradient!, slice_problem, SliceProblem
 export prepare_compact_cell_sampler, CompactCellSampler, prepare_compact_cell_ad, CompactCellAD
 export prepare_cell_factors, CellFactors, cell_reductions, reduction_rows,
     prepare_cell_factor_query, CellFactorQuery, prepare_cell_factor_ad, CellFactorAD
@@ -134,6 +137,7 @@ include("cell_factors.jl")
 include("cell_shared.jl")
 include("cell_batch.jl")
 include("density_factors.jl")
+include("slices.jl")
 include("predictive.jl")
 include("discrete_latents.jl")
 include("smc.jl")

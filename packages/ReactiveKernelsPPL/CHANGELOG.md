@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.117
+## 0.1.121
 
 - A simplex whose `Dirichlet` concentration is bound data, such as
   `s ~ Dirichlet(alpha)` with `alpha` bound beside the data or BRM's monotonic
@@ -24,6 +24,103 @@ are recorded in the git history only.
   concentration length. The packed coordinates already read `length(alpha)`;
   the concentration check now reads it too, where it used to write this
   binding's length as a number, so a build for 3 levels served no binding with 4.
+
+## 0.1.120
+
+- A partition query or sampler (`prepare_partition`,
+  `prepare_partition_sampler`) keeps less per label. A label's plan held its
+  rows and gathered data once for every statement reading them, and a
+  shared-prefix sampler keeps two plans per label; on BRM's minibatch SVI
+  target for a toy with one station per unit, one label's four plans held 82
+  small arrays with 11 distinct contents. Equal arrays of the plans of one
+  preparation are now one object (ReactiveKernels 0.1.107). The plans are also
+  stored once per label, in a label-indexed `AbstractDict` (`q.plans` and
+  `s.plans` read as before), where a `Dict` kept about two inline slots of each.
+- A density catalogue (`density_factors`) no longer keeps a copy of its
+  binding's data. It kept one to refuse a selection's query after an in-place
+  change of the bound data, and now keeps a hash of every element of it
+  instead, which refuses the same queries.
+- Measured on that SVI target (BRM `2c9500f4`, 128 to 512 units, live heap with
+  each object counted once): the partition sampler from 5.6 to 3.1 KB per unit
+  (6.4 to 2.7 KB with `field_states = :units`), its value query from 2.8 to 1.8
+  KB, the model's own value query from 2.0 to 1.1 KB, and the catalogue's copy,
+  2.5 KB per unit, is gone. Values and gradients are unchanged. Per-unit factor
+  queries (`prepare_query_ad(...; coordinates = :support)`, about 7 KB per unit
+  there) are unchanged.
+
+## 0.1.119
+
+- `prepare_sampler(...; nonallocating = true)` with ReactiveKernels 0.1.106
+  allocates nothing per call, after warm-up, in its density kernel
+  (`q.kernel(u)`) and its gradient (`sampler_value_and_gradient!`) for a
+  design-matrix product, a coefficient vector of scalar parameters, a `@scan`
+  trajectory, a ranged response gather (a plate over `eachindex(y)`) and an
+  interval-bounded vector. Values and gradients are unchanged. The gather
+  `_ppl_range_values` is `@traceable`, so the non-allocating kernel gathers
+  into a buffer of its own. Still allocating: the simplex and ordered
+  transforms and an `MvNormal` covariance's Cholesky factor. `q(u)` itself
+  returns its number through the world-age barrier, which boxes it (16 B).
+  The ReactiveKernels compat floor is 0.1.106.
+
+## 0.1.118
+
+- A declared `L ~ LKJCholesky(K, eta)` factor whose dimension `K` reads data
+  (a bound integer such as `channels`, `length(channels)`, `size(M, 2)` or a
+  definition) is read by the program: its packed range, the `K(K - 1)/2`
+  partials count (`_ppl_lkj_count_L`), the transform, Jacobian and prior loops,
+  the prior's normalizer, and the positions of every block packed after it.
+  Every `K` of one declaration now generates the same `kernel_expr` and one
+  `build_kernel` serves every binding, conditioned factors included. Before,
+  the program spelled `K`, so each dimension generated its own program and
+  shifted the literal positions of the blocks after it. A literal `K` keeps
+  the program it always had. With a literal `eta`, a data `K` computes the
+  normalizer in the program (`lkj_logconst`'s general formula, which equals its
+  `eta == 1` branch to rounding). This removes "an LKJ array's dimension" from
+  the 0.1.108 list of paths that stay literal; per-level LKJ stacks keep their
+  literal `K`, and LKJ scalar edges and stacks keep their literal coordinates.
+- **Breaking:** a raw `ReactiveKernels.prepare(built.spec; have = (:unconstrained,),
+  want = :L)` cut of a factor whose `K` reads data now needs that data, as a cut
+  of a data-sized array already does: name it in `have` or pass it as `bound`
+  (`rkppl-use` section 14). A literal `K` needs nothing new.
+
+## 0.1.117
+
+- **Slices of one bound model.** `prepare_slices(built, plan, observations, u0;
+  by, backend)` prepares the model restricted to the cells whose label (as
+  `prepare_partition_sampler`'s `by` gives it) is in a chosen set, for example
+  one region of a national binding.
+  - A slice's density is its cells, plus every authored prior and Jacobian term
+    that owns a coordinate they reach, with the coordinates those terms read added
+    in turn. Each term counts once, however many labels reach it.
+  - `slice_coordinates(slices, labels)` gives the slice's packed positions in
+    the whole binding; nothing outside them is read or differentiated, and other
+    labels' cells are not evaluated.
+  - `slice_value_and_gradient!(slices, g, u, labels; compact = true)` evaluates
+    one label or a collection of them. `slice_problem(slices, labels; base)` is a
+    first-order `LogDensityProblems` target over the compact coordinates, through
+    the new `ReactiveKernelsPPLLogDensityProblemsExt`.
+  - The binding is prepared once, and another label set reuses its compiled
+    kernels.
+  - For units nested in the labels, a label's slice equals the model bound to
+    that label's data alone, in value and gradient.
+  - A density that owns no coordinate and reads coordinates both inside and
+    outside a slice is refused for that slice with a `ContractValidationError`.
+- **`coordinate_identities(layout)`.** It names each packed coordinate by its
+  authored path and an index holding the bound label of a `levels(g)`,
+  `unique(g)` or data-vector axis, or the level at each position of the
+  positional twin `1:length(levels(g))` (BRM's group effects); other axes,
+  `1:length(levels(g)) - k` included, keep positions. The same coordinate of
+  two bindings therefore compares equal where `coordinate_names` gives its
+  position. `LayoutTable` keeps a declared array's bound axis labels for this
+  in a new last field, `axis_labels`; its existing constructors are unchanged.
+  `coordinate_names` is unchanged.
+- **A factor selection of many sites prepares a concretely typed program.**
+  `prepare_query` and `prepare_query_ad` add a selection's site totals two at a
+  time, left to right, instead of in one `+` over all of them. Julia does not
+  infer Base's varargs `+` past 32 operands, so a selection of more sites (a
+  slice's prior on a real model) left a call dispatched at run time in the
+  prepared program, which RK warned about. The sum and its rounding are
+  unchanged.
 
 ## 0.1.116
 

@@ -155,6 +155,9 @@ end
         push!(stored_graphs, length(data.graphs) - stored)
         @test length(getfield(c, :structures)) == 2
         @test length(unique(objectid(q.prepared.kernel.plan.graph) for q in queries)) == 1
+        # Snag per-unit-partiti-9d46c6de: the catalogue reads the binding's own
+        # arrays; it keeps no copy of them.
+        @test getfield(c, :binding).x === plan.columns[:x]
         names = coordinate_names(built.layout)
         at(name) = only(findall(==(name), names))
         for j in (1, J)
@@ -180,4 +183,28 @@ end
             ad_value_and_gradient(queries[2], u, u[queries[2].coordinates])[1]
     end
     @test stored_graphs[1] == stored_graphs[2] <= 3
+end
+
+@testset "a selection of many sites prepares a concretely typed program" begin
+    # Snag slices-of-one-bo-c43eb9ee: a slice's prior on ODL v2 selects dozens
+    # of sites. Their totals were added by one `+`, which Julia does not infer
+    # past 32 operands, so the prepared program dispatched it at run time.
+    sites = 40
+    ast = Expr(:block, (:($(Symbol(:a_, k)) ~ Normal(0.0, 1.0)) for k in 1:sites)...,
+        :(y .~ Normal.(a_1, 1.0)))
+    data = (; y = [0.1, -0.2])
+    plan = bind_data(lower_rkppl(ast, data; conditioned = (:y,), mod = @__MODULE__), data)
+    built = build_kernel(plan)
+    @test built.layout.total == sites
+    u = 0.1 .* sin.(1:sites)
+    selection = select_factors(density_factors(built, plan); kind = :prior)
+    q = only(prepare_query_ad(prepare_ad, built, plan, [selection],
+        _FACTOR_PREPARATION_REVERSE, u; coordinates = :support))
+    @test q.coordinates == collect(1:sites)
+    audit = FactorPreparationAudit.TypeStabilityAudit
+    @test isempty(audit.ad_call_findings(q.prepared, u, u[q.coordinates];
+        recurse = audit.rk_or_generated(ReactiveKernelsPPL)))
+    value, gradient = ad_value_and_gradient(q, u, u[q.coordinates])
+    @test value ≈ -sites * 0.5log(2pi) - sum(abs2, u) / 2
+    @test gradient ≈ -u
 end
