@@ -1048,8 +1048,12 @@ compares equal:
   `(:z, :b)` inside a submodel.
 - `index` has one entry per packed axis. An axis declared `levels(g)`,
   `unique(g)` or as a data vector holds that axis's bound label (the level of
-  `g`, with the declaration's selection applied); any other axis holds its
-  one-based position. A scalar's index is `()`. A legacy coefficient holds its
+  `g`, with the declaration's selection applied). So does the positional twin
+  `1:length(levels(g))`, whose positions are the levels of `g` in `levels(g)`
+  order, as in BRM's group effects (`z[1:length(levels(g)), 1:K]`, read at each
+  row's level position). Any other axis holds its one-based position, including
+  `1:length(levels(g)) - k`, which does not say which levels it leaves out. A
+  scalar's index is `()`. A legacy coefficient holds its
   design label. The packed axis of a slice transform (a simplex or ordered row
   or column) is positional; its other axis keeps its labels. Coordinates of a
   joint cell latent or cell geometry are positional within their array.

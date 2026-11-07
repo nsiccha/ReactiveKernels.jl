@@ -194,4 +194,57 @@ end
     @test gs ≈ g
 end
 
+
+# BRM emits a group's effects as rows of the positional twin `1:length(levels(g))`
+# inside a block and gathers them by level position. Those rows are the levels of
+# `g`, in `levels(g)` order, so their identities carry the level.
+@rkppl twin_effects(g, scale) = begin
+    z[1:length(levels(g))] .~ Normal.(0, scale)
+    z
+end
+
+const TWIN = quote
+    mu ~ Normal(0, 2)
+    sigma ~ Exponential(1)
+    s ~ Exponential(1)
+    b ~ twin_effects(unit, sigma)
+    @plate for k in eachindex(y)
+        y[k] ~ Normal(mu + b[unit_position[k]], s)
+    end
+end
+
+twin_data(keep) = (u = DATA.unit[keep];
+    (; unit = u, unit_position = Int.(indexin(u, sort(unique(u)))), y = DATA.y[keep]))
+
+@testset "a positional twin's rows are identified by their levels" begin
+    whole_bound, whole = bind(TWIN, twin_data(eachindex(DATA.y)))
+    ids = coordinate_identities(whole.layout)
+    @test allunique(ids)
+    @test [only(id.index) for id in ids if id.path == (:b, :z)] == sort(unique(DATA.unit))
+    # `1:length(levels(g)) - k` does not say which levels it omits: positional.
+    dropped = quote
+        c[1:length(levels(g)) - 1] .~ Normal.(0, 1)
+        y .~ Normal.(sum(c), 1)
+    end
+    _, built = bind(dropped, (; g = ["b", "a", "c"], y = [0.1, 0.2, 0.3]))
+    @test [id.index for id in coordinate_identities(built.layout) if id.path == (:c,)] == [(1,), (2,)]
+
+    u = collect(range(-0.3, 0.4; length = whole.layout.total))
+    slices = prepare_slices(whole, whole_bound, :y, u; by = (; y = REGION), backend = BACKEND)
+    for region in ("south", "north")
+        keep = findall(==(region), REGION)
+        own_bound, own = bind(TWIN, twin_data(keep))
+        at = positions_in(whole, own)
+        sampler = prepare_sampler(own, own_bound, u[at]; backend = BACKEND)
+        g_own = zeros(length(at))
+        v_own, _ = sampler_value_and_gradient!(sampler, g_own, u[at])
+        c = slice_coordinates(slices, region)
+        @test c == sort(at)
+        g = zeros(length(c))
+        v, _ = slice_value_and_gradient!(slices, g, u, region)
+        @test v ≈ v_own
+        @test g[searchsortedfirst.(Ref(c), at)] ≈ g_own
+    end
+end
+
 end

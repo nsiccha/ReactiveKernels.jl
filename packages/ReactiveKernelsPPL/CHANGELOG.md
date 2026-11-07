@@ -40,11 +40,20 @@ are recorded in the git history only.
     outside a slice is refused for that slice with a `ContractValidationError`.
 - **`coordinate_identities(layout)`.** It names each packed coordinate by its
   authored path and an index holding the bound label of a `levels(g)`,
-  `unique(g)` or data-vector axis (positions elsewhere). The same coordinate of
+  `unique(g)` or data-vector axis, or the level at each position of the
+  positional twin `1:length(levels(g))` (BRM's group effects); other axes,
+  `1:length(levels(g)) - k` included, keep positions. The same coordinate of
   two bindings therefore compares equal where `coordinate_names` gives its
   position. `LayoutTable` keeps a declared array's bound axis labels for this
   in a new last field, `axis_labels`; its existing constructors are unchanged.
   `coordinate_names` is unchanged.
+- **A factor selection of many sites prepares a concretely typed program.**
+  `prepare_query` and `prepare_query_ad` add a selection's site totals two at a
+  time, left to right, instead of in one `+` over all of them. Julia does not
+  infer Base's varargs `+` past 32 operands, so a selection of more sites (a
+  slice's prior on a real model) left a call dispatched at run time in the
+  prepared program, which RK warned about. The sum and its rounding are
+  unchanged.
 
 ## 0.1.116
 
