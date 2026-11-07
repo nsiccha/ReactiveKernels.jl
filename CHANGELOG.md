@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.99
+## 0.1.103
 
 - A non-allocating kernel no longer has its own type per preparation.
   `prepare_nonallocating` compiled the kernel's constants, callables and caches
@@ -38,6 +38,58 @@ are recorded in the git history only.
   stayed faster than the ordinary kernel. A plate
   of array cells, whose body Julia does not inline, costs 117 ns per call against
   67 ns.
+
+## 0.1.102
+
+- A partition sampler or query with a cached shared prefix (`partitioned=`)
+  keeps a plate read through a type guard at each partition's rows. One example
+  is a per-state field plate whose cells call an opaque helper over parameter
+  arrays, read as `eltype(cells) <: Real ? cells : throw(...)` (the guard
+  BayesianRegressionModels writes for an offset of a plate output). The split
+  had decided the guard from the declared packed type `AbstractVector{Float64}`.
+  Over that type the helper infers `Any`, so the guard kept no arm, and the
+  plate, the guard and everything after them were lifted into the prefix. Every
+  partition gradient then pulled back through all of the plate's cells. The
+  split now decides this for a dense `Vector{Float64}` point, the type these
+  queries are prepared with. Its prefix and residual keep the branch, so each
+  point type they are prepared for proves its own arm. Values and gradients are
+  unchanged. A unit's gradient now costs its own rows, not the whole plate.
+
+## 0.1.101
+
+- A read-only gather of a `Vector` by a `Vector{Int}` (`_readonly_gather`, which
+  RKPPL's `theta[child[j]]` in a dotted plate cell reaches) no longer runs
+  `Base.view`'s alias check, as a gather of a packed slice already did not. The
+  result type is unchanged, and the gather still checks bounds. On a ragged
+  nested plate over a computed parameter, such as a non-centered PosteriorDB
+  Bones with `theta = 36 .* z`, value and gradient took 1.37 to 1.39 times the
+  hand-written loop on Julia 1.12 and 1.13, and now take about the same as it.
+  Julia 1.10 is unchanged, and so are values and gradients.
+
+## 0.1.100
+
+- `PartitionLocalityError` and the `locality = :warn` warning name the route for
+  a value that reads only shared parameters: `partitioned` in the queries of
+  ReactiveKernelsPPL 0.1.111, or `partitioned = :none` when partitions own no
+  parameter. The refusal also says that `locality = :warn` computes such a value
+  again for every cell or partition, instead of offering it as the only way on.
+
+## 0.1.99
+
+- Building one program twice in a process, as a generator does whenever it
+  evaluates its definition again, gives the types the first build gave, so the
+  second build compiles nothing more. `@kernel` named what the author left
+  unnamed (a lifted cell invariant, a computed endpoint binding, a plate's
+  computed argument) with `gensym`, whose counter moves on between builds, and
+  those names reach types: a split recipe carries its ports in its type, an
+  endpoint call its signature. Each build then had new types, and every reader
+  of them compiled again. A generated name is now a function of the definition
+  and of its position in the expansion, in the shape of a `gensym`. A source
+  operation's provenance token is a field of its key instead of a type
+  parameter. A bound plate's axes and a child snapshot's values no longer
+  follow value-id order, which differs between builds.
+- Two definitions of one source still stay two computations, and a binding
+  from another program is still refused. Values and gradients are unchanged.
 
 ## 0.1.98
 

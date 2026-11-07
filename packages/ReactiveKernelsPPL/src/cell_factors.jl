@@ -30,8 +30,8 @@ A sum whose summands read another sum (a density total over `dose .* f.(t)`, wit
 `dose` a sum) is no reduction: it stays in the outer factor, which reads the inner
 sum from its sum vector and computes the total at its own rows.
 
-Pass `partitioned = :z, u0 = u` to cache shared-only whole-array producers
-before factoring. Values refresh when the shared coordinates change. Compact
+Pass `partitioned = :z, u0 = u` (or `partitioned = :none` when cells own no
+parameter) to cache shared-only whole-array producers before factoring. Values refresh when the shared coordinates change. Compact
 factor AD then selects only partitioned coordinates. Mixed shared derivatives
 use [`prepare_cell_accumulator`](@ref) and [`cell_pullback!`](@ref); operators
 prepared from this factor family share one prefix cache and pullback pass.

@@ -1020,9 +1020,16 @@ _with_frozen(plan::StructuralPlan, frozen::FrozenValues) = _with(plan; frozen)
 # `values`: the data values when lowering from values, which show the
 # values that hold one array per index (`_value_array_entries`); lowering
 # from names alone cannot see them.
+#
+# What lowering names reaches types, through the ports of the kernel it generates,
+# so one source lowers to one set of names (`ReactiveKernels._kernel_gensym`; snag
+# `gensym-in-kernel-54164b85`).
 _lower_rkppl(ast, data_names, scalars::Set{Symbol}, mod::Module; conditioned=(),
         values::Union{Nothing,AbstractDict} = nothing)::StructuralPlan =
-    Base.invokelatest(_lower_rkppl_latest, ast, data_names, scalars, mod; conditioned, values)
+    ReactiveKernels._within_kernel_names(ast) do
+        Base.invokelatest(_lower_rkppl_latest, ast, data_names, scalars, mod;
+            conditioned, values)
+    end
 
 function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
         mod::Module; conditioned=(), values::Union{Nothing,AbstractDict} = nothing)::StructuralPlan
@@ -1832,7 +1839,7 @@ function _desugar_cell_destructuring(cells)
     out = Any[]
     for c in cells
         _is_destructuring(c) || (push!(out, c); continue)
-        value = gensym(:_rkppl_destructured)
+        value = ReactiveKernels._kernel_gensym(:_rkppl_destructured)
         push!(out, Expr(:(=), value, c.args[2]))
         for (i, nm) in enumerate(c.args[1].args)
             push!(out, Expr(:(=), nm, Expr(:call,
@@ -4517,7 +4524,7 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
     # variable, so arithmetic over them vectorizes in the desugar).
     pidx = Set{Symbol}()
     if any(c -> _cell_uses_index_value(c, ivar), cells)
-        indexname = gensym(:_rkppl_index)
+        indexname = ReactiveKernels._kernel_gensym(:_rkppl_index)
         indices = rkind[1] === :coloncall ? rkind[2] :
             rkind[1] === :eachindex ? Expr(:call, GlobalRef(Base, :eachindex), rkind[2]) :
             Expr(:call, GlobalRef(Base, :axes), rkind[2], rkind[3])
@@ -4681,7 +4688,7 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             end
             if _expr_has_sym(ex, ivar) || any(n -> _expr_has_sym(ex, n), lnames) ||
                     _retained_cell_expr(ex, ivar, Set{Symbol}())
-                nm = gensym(:_rkppl_selected)
+                nm = ReactiveKernels._kernel_gensym(:_rkppl_selected)
                 _is_broadcast_sample(c) &&
                     (ex = _cell_index_vector_gather(ex, ivar, data, locals, arrays))
                 key = _categorical_key_column(ex, locals, ivar, data)
@@ -4772,9 +4779,9 @@ end
 # The per-index value `nm` is that reference, not a copy of the vector.
 function _keyed_cell_value!(out, values, nm::Symbol, locals, rhs,
         ivar::Symbol, indices, key::Symbol, plate_defs::Set{Symbol})
-    cells = gensym(:_rkppl_key_cells)
-    codes = gensym(:_rkppl_key_codes)
-    perkey = gensym(:_rkppl_key_values)
+    cells = ReactiveKernels._kernel_gensym(:_rkppl_key_cells)
+    codes = ReactiveKernels._kernel_gensym(:_rkppl_key_codes)
+    perkey = ReactiveKernels._kernel_gensym(:_rkppl_key_values)
     push!(out, Expr(:(=), cells,
         Expr(:call, GlobalRef(@__MODULE__, :_ppl_key_cells), key, indices)))
     push!(out, Expr(:(=), codes,
@@ -5149,7 +5156,7 @@ function _emit_cell_values!(out, values::_CellValues, plate_defs)
         for (k, e) in enumerate(entries))
     for fused in _shared_cell_groups(values)
         named = [e for e in entries[fused] if !Base.isgensym(e.name)]
-        cell = isempty(named) ? gensym(:_rkppl_selected) :
+        cell = isempty(named) ? ReactiveKernels._kernel_gensym(:_rkppl_selected) :
             Symbol(:_rkppl_cell_, something(first(named).part_of, first(named).name))
         push!(plate_defs, cell)
         shared = column(cell, _fused_cell_statements(values, fused),
@@ -7437,7 +7444,7 @@ function _generative_stream_stmts(stmts, ret, data)
             if source === nothing
                 push!(out, Expr(:call, :~, ret, _undot_cell_object(obj)))
             else
-                ivar = gensym(:_rkppl_stream_index)
+                ivar = ReactiveKernels._kernel_gensym(:_rkppl_stream_index)
                 cell = Expr(:call, :~, Expr(:ref, ret, ivar),
                     _undot_cell_object(indexed(obj, ivar)))
                 push!(out, Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
@@ -7897,14 +7904,15 @@ end
 
 # Value-position symbols (call heads and dotted function names excluded):
 # coefficient-discipline scans must not mistake `log` in `log.(z)` for a
-# coefficient named `log`.
+# coefficient named `log`. `end` and `begin` are positions of the value they
+# index, wherever they sit in the index (`levels(g)[2:end]`), never names.
 function _value_symbols(ex)
     out = Set{Symbol}()
     _value_symbols!(out, ex)
     return out
 end
 function _value_symbols!(out::Set{Symbol}, ex)
-    ex isa Symbol && return push!(out, ex)
+    ex isa Symbol && return _is_endpoint(ex) ? nothing : push!(out, ex)
     ex isa Expr || return nothing
     ex.head === :generator && return (_generator_symbols!(_value_symbols!, out, ex); nothing)
     # A keyword argument's name is not a value (`f(x; k = 4)`).

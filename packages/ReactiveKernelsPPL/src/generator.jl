@@ -50,7 +50,7 @@ function _build_kernel_latest(plan::StructuralPlan)
     layout = assign_layout(plan)
     def = kernel_expr(plan, layout)
     spec = _eval_kernel_def(def)
-    return (; spec, layout, program = _program_identity(def, plan))
+    return (; spec, layout, program = _program_identity(def))
 end
 
 """
@@ -62,7 +62,9 @@ be a binding with nothing left to observe (`model(; x)`), read as
 `bind_data(binding)`, exactly as [`build_kernel`](@ref) reads it.
 """
 function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model)
-    def = Base.invokelatest(_kernel_expr_latest, plan, layout; name)
+    def = ReactiveKernels._within_kernel_names(name) do
+        Base.invokelatest(_kernel_expr_latest, plan, layout; name)
+    end
     def = _elide_named_location_aliases(plan, def)
     def = _pointwise_arithmetic_plates(plan, def)
     return _name_plate_cells(def, _location_value_aliases(plan, def))
@@ -148,29 +150,11 @@ end
 # the identity. Compare the results with `_same_program`: Julia's Expr
 # equality need not compare embedded array literals by value.
 #
-# With the binding, each level axis's labels call (`_ppl_levels(h)`,
-# `_ppl_unique(h)`, `_ppl_values(h)`; `_axis_labels_expr`) is replaced by its
-# value over the binding's column as quoted data: the labels are the
-# program's, as the layout and the level codes are sized by them, while the
-# compiled code holds none of them (a binding with other labels is refused
-# by `prepare_query`, `rkppl-use` §14).
-function _program_identity(def, plan::StructuralPlan)
-    labels(x) = x
-    labels(x::Expr) = _is_level_labels_call(x) ?
-        QuoteNode(_level_axis_labels(plan, x.args[1], x.args[2])) :
-        Expr(x.head, Any[labels(a) for a in x.args]...)
-    return _program_identity(labels(def))
-end
-
-_is_level_labels_call(x::Expr) = x.head === :call && length(x.args) == 2 &&
-    x.args[1] in _LEVEL_LABEL_FUNCTIONS && x.args[2] isa Symbol
-
-# The value `_ppl_levels(h)` / `_ppl_unique(h)` / `_ppl_values(h)` takes on the
-# binding: the same function over the bound column (each returns a fresh
-# vector, so the identity aliases no binder-owned metadata).
-_level_axis_labels(plan::StructuralPlan, fn::Symbol, h::Symbol) =
-    getfield(@__MODULE__, fn)(_vector_column(plan.columns, h, :plan, "level axis column"))
-
+# A level axis's labels are not part of it. The program reads them from the
+# binding (`_ppl_levels(h)`, `_ppl_unique(h)`, `_ppl_values(h)`;
+# `_axis_labels_expr`), and everything sized by them reads their count, so a
+# binding with other labels evaluates correctly on the same build. A path that
+# still holds a label-derived literal differs here, and is refused.
 function _program_identity(def)
     names = Dict{Symbol,Symbol}()
     modules = IdDict{Module,Symbol}()
@@ -2372,7 +2356,7 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
             # the log-sum expression hides its independent recipes from
             # plate scheduling. Keep these statements inside the support
             # guard below, including their argument bindings.
-            density = gensym(:_ppl_component_density)
+            density = ReactiveKernels._kernel_gensym(:_ppl_component_density)
             push!(component_statements, :($density = $lpdf))
             lpdf = density
         end

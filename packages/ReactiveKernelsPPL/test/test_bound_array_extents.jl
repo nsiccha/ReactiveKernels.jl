@@ -210,9 +210,8 @@ _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
             [(g = 2, ids = [1, 2], y = [0.9, 1.0]), (g = 4, ids = [1, 4], y = [0.9, 1.0])],
             (v, d) -> sum(logpdf(Dirichlet(ones(3)), Vector(r)) for r in eachrow(v.P)) +
                 _normals(v.w) + sum(logpdf.(Normal.(v.P[d.ids, 1] .+ v.w[1], 1.0), d.y)))
-        # A selection of an array's axes: the levels are the binding's. Other
-        # labels keep the program, and `_program_identity` asks for their own
-        # build (`rkppl-use` section 14).
+        # A selection of an array's axes: the levels are the binding's, and other
+        # labels keep the program and its build (`rkppl-use` section 14).
         plan = lower_rkppl(quote
                 b[levels(g)] .~ Normal.(0, 1)
                 y .~ Normal.(b[g], 1.0)
@@ -457,5 +456,135 @@ _normals(x) = sum(logpdf.(Normal(), x); init = 0.0)
             end, (n = 2, y = [0.9]); conditioned = (:y,))
         bound = bind_data(plan, (n = 4, y = [0.9]))
         @test build_kernel(bind_data(bound, (n = 2, y = [0.9]))).layout.total == 2
+    end
+end
+
+# A level axis's labels are data: another number of them, or other labels, keeps
+# the program, its type and its build (user question on station counts, and
+# decision `ReactiveKernels:snag.rkppl-sized-vect-69604d32/decisions/2026-11-06T18-01-39-643-18hmyfb`).
+_level_code(g, labels) = [findfirst(==(x), labels) for x in g]
+
+@testset "one build serves other level labels" begin
+    @testset "a gather over levels, by count, label and row order" begin
+        source = quote
+            a ~ Normal(0, 1)
+            c[levels(g)] .~ Normal.(0, 1)
+            y .~ Normal.(a .+ c[g], 1.0)
+        end
+        want = (v, d) -> logpdf(Normal(), v.a) + _normals(v.c) +
+            sum(logpdf.(Normal.(v.a .+ v.c[_level_code(d.g, sort(unique(d.g)))], 1.0), d.y))
+        y(n) = [0.2sin(i) for i in 1:n]
+        _extent_check(source, [
+            (g = ["s1", "s2", "s3", "s1"], y = y(4)),
+            (g = ["s1", "s2", "s3", "s4", "s5", "s1"], y = y(6)),
+            (g = ["a", "b", "c", "a"], y = y(4)),
+            (g = ["c", "b", "a"], y = y(3)),
+            (g = ["s1", "s2"], y = y(2))], want)
+        # Numbers as labels: 2, 3, 4 is not 1, 2, 3.
+        _extent_check(source, [(g = [1, 2, 3, 1], y = y(4)), (g = [2, 3, 4, 2], y = y(4))], want)
+    end
+    @testset "first-occurrence labels and a selection of the levels" begin
+        first_seen = quote
+            c[unique(g)] .~ Normal.(0, 1)
+            y .~ Normal.(c[g], 1.0)
+        end
+        _extent_check(first_seen, [
+            (g = ["b", "a", "b"], y = [0.1, 0.2, 0.3]),
+            (g = ["z", "x", "y", "z"], y = [0.1, 0.2, 0.3, 0.4])],
+            (v, d) -> _normals(v.c) +
+                sum(logpdf.(Normal.(v.c[_level_code(d.g, unique(d.g))], 1.0), d.y)))
+        selected = quote
+            c[levels(g)[2:end]] .~ Normal.(0, 1)
+            y .~ Normal.(1.0, 1.0)
+        end
+        _extent_check(selected, [
+            (g = ["a", "b", "c"], y = [0.1, 0.2]),
+            (g = ["p", "q", "r", "s", "t"], y = [0.1, 0.2])],
+            (v, d) -> _normals(v.c) + sum(logpdf.(Normal(1.0, 1.0), d.y)))
+    end
+    @testset "a data vector as an axis, and a plate over levels" begin
+        over_values = quote
+            c[ids] .~ Normal.(0, 1)
+            y .~ Normal.(sum(c), 1.0)
+        end
+        _extent_check(over_values, [
+            (ids = [10, 20], y = [0.1, 0.2]),
+            (ids = [30, 40, 50, 60], y = [0.1, 0.2])],
+            (v, d) -> _normals(v.c) + sum(logpdf.(Normal(sum(v.c), 1.0), d.y)))
+        plate = quote
+            @plate for k in levels(g)
+                c[k] ~ Normal(0, 1)
+            end
+            y .~ Normal.(c[g], 1.0)
+        end
+        _extent_check(plate, [
+            (g = ["a", "b", "a"], y = [0.1, 0.2, 0.3]),
+            (g = ["p", "q", "r", "s"], y = [0.1, 0.2, 0.3, 0.4])],
+            (v, d) -> _normals(v.c) +
+                sum(logpdf.(Normal.(v.c[_level_code(d.g, sort(unique(d.g)))], 1.0), d.y)))
+    end
+    @testset "a reused build names this binding's coordinates" begin
+        # A declared array's coordinates are positions (`c.1`), whatever the labels.
+        source = quote
+            c[levels(g)] .~ Normal.(0, 1)
+            y .~ Normal.(c[g], 1.0)
+        end
+        plan = lower_rkppl(source, (g = ["a", "b"], y = [0.1, 0.2]); conditioned = (:y,))
+        fit, other = bind_data(plan, (g = ["a", "b"], y = [0.1, 0.2])),
+            bind_data(plan, (g = ["p", "q"], y = [0.1, 0.2]))
+        built = build_kernel(fit)
+        @test coordinate_names(ReactiveKernelsPPL._binding_build(built, other).layout) ==
+            coordinate_names(build_kernel(other).layout) == [Symbol("c.1"), Symbol("c.2")]
+        @test ReactiveKernelsPPL._binding_build(built, fit) === built
+        # A factor term's coefficients are named by their levels (`mu.g_b`), so
+        # a reused build takes this binding's names, and its values are this
+        # binding's own build's.
+        y4 = [0.1, 0.2, 0.3, 0.4]
+        factor = StructuralPlan(
+            LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :sigma,
+                nothing, ResponseEvidence(:none, nothing, nothing), :y_resp)],
+            PredictorSpec[PredictorSpec(:mu, IdentityLink,
+                TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(), :Intercept,
+                        :intercept),
+                    TermSpec(FactorTerm, [:g], NamedTuple(), :g, :g_term)], :mu)],
+            PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
+                PopulationPrior(:mu, :g, 0.0, 0.5)],
+            SampledParameter[SampledParameter(:sigma, :exponential, (arg1 = 1.0,),
+                nothing, :sigma)],
+            AssignmentSpec[], Dict{Symbol,AbstractVector}(:y => y4,
+                :g => ["a", "b", "c", "a"]), 4;
+            levelmaps = LevelMap[LevelMap(:mu, :g, ["b", "c"], :levels, (2, :end))])
+        fbuilt = build_kernel(factor)
+        relabeled = bind_data(factor, Dict{Symbol,AbstractVector}(:y => y4,
+            :g => ["p", "q", "r", "p"]))
+        fown = build_kernel(relabeled)
+        reused = ReactiveKernelsPPL._binding_build(fbuilt, relabeled)
+        @test coordinate_names(fbuilt.layout) ==
+            [Symbol("mu.Intercept"), Symbol("mu.g_b"), Symbol("mu.g_c"), :sigma]
+        @test coordinate_names(reused.layout) == coordinate_names(fown.layout) ==
+            [Symbol("mu.Intercept"), Symbol("mu.g_q"), Symbol("mu.g_r"), :sigma]
+        u = [0.3, 0.1, -0.2, 0.0]
+        @test Base.invokelatest(prepare_query(fbuilt, relabeled, :sampler), u) ≈
+            Base.invokelatest(prepare_query(fown, relabeled, :sampler), u)
+    end
+    @testset "a cell and a partition read this binding's labels" begin
+        source = quote
+            c[levels(g)] .~ Normal.(0, 1)
+            @plate for i in eachindex(y)
+                y[i] ~ Normal(c[g[i]], 1.0)
+            end
+        end
+        fit_data = (g = ["a", "b", "a"], y = [0.1, 0.2, 0.3])
+        other_data = (g = ["p", "q", "r", "p"], y = [0.1, 0.2, 0.3, 0.4])
+        plan = lower_rkppl(source, fit_data; conditioned = (:y,))
+        fit, other = bind_data(plan, fit_data), bind_data(plan, other_data)
+        built, own = build_kernel(fit), build_kernel(other)
+        u = [0.3, -0.2, 0.5]
+        reused_cell = prepare_cell_query(built, other, :y; locality = :error, u0 = u)
+        own_cell = prepare_cell_query(own, other, :y; locality = :error, u0 = u)
+        @test [reused_cell(u, i) for i in 1:4] ≈ [own_cell(u, i) for i in 1:4]
+        by = (; y = other_data.g)
+        @test partition_labels(prepare_partition(built, other, :y; by)) ==
+            partition_labels(prepare_partition(own, other, :y; by))
     end
 end
