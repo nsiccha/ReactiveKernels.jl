@@ -611,7 +611,10 @@ end
                 reads = Base.invokelatest(fp, u, label, nothing).unconstrained
                 @test reads == Base.invokelatest(literal, u, label, nothing).unconstrained
                 @test first_of(:sigma) in reads && first_of(:b) in reads
-                @test first_of(:W) + G - 1 in reads
+                # `W[group]` is a factor term read by level code: each
+                # partition reads its own groups' entries only.
+                @test all(g -> first_of(:W) - 1 + g in reads, filter(g -> cld(g, 2) == label, 1:G))
+                @test all(g -> !(first_of(:W) - 1 + g in reads), filter(g -> cld(g, 2) != label, 1:G))
                 @test all(g -> Zpos(g) ⊆ reads, filter(g -> cld(g, 2) == label, 1:G))
                 @test all(g -> isdisjoint(Zpos(g), reads), filter(g -> cld(g, 2) != label, 1:G))
             end

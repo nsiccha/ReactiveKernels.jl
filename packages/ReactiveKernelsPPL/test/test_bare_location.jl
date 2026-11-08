@@ -894,19 +894,17 @@ end
     @test _value_posterior(prog, cols, q) ≈ want rtol = 1e-12
     _check_gradient(built.spec, bound, u)
 
-    # The offset sum fuses into one plate that reads the gather in place:
-    # three row vectors per evaluation remain (the offset plate's output and
-    # the `c[levels(h)]` factor term's design product plus its sum), against
-    # five before gathers had axes.
+    # The offset sum fuses into one plate that reads the gather in place, and
+    # the `c[levels(h)]` factor term reads its coefficients by level code, so
+    # the whole location runs in the observation plate's cells.
     n = 1000
     big = Dict{Symbol,Any}(:y => collect(range(-1, 1; length = n)),
         :x => collect(range(0, 2; length = n)), :g => mod1.(1:n, 3),
         :h => ["u", "v", "w"][mod1.(1:n, 3)], :K => 3)
     _, _, qb, ub = _rows_sampler(prog, big; native_forward_batch = false)
     @test _rows_primal_bytes(qb, ub) < 4 * 8n
-    # Capability gap: the whole location fused into the observation plate,
-    # with no row vector per evaluation.
-    @test_broken _rows_primal_bytes(qb, ub) < 4n
+    # No row vector per evaluation.
+    @test _rows_primal_bytes(qb, ub) < 4n
 end
 
 # These are independent Julia spellings of scalar + gathered values. The

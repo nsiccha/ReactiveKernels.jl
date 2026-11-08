@@ -143,19 +143,27 @@ end
     end
 end
 
-@testset "shared cache does not bypass existing foreign-read rejection" begin
-    # Inline factor terms currently become a dense one-hot design product,
-    # which reads every level (tracked separately by todo 0mtcwfj).
+@testset "an inline factor term partitions by its own levels" begin
+    # An inline factor term reads its coefficients by level code (todo
+    # 0mtcwfj), so each subject's partition reads only its own level. Its
+    # dummy product used to read every level, and the partition was refused.
     model = quote
         z[levels(subject)] .~ Normal.(0, 1)
         y .~ Normal.(z[subject], 1)
     end
     data = (; subject=[1, 1, 2, 2, 3], y=[0.1, 0.3, -0.2, 0.5, -0.1])
     bound, built = build_model(model, data)
+    u = [0.2, 0.1, -0.3]
     for compact in (true, false)
-        @test_throws ReactiveKernels.PartitionSeparabilityError prepare_partition_sampler(
-            built, bound, :y, [0.2, 0.1, -0.3]; by=:subject,
+        sampler = prepare_partition_sampler(built, bound, :y, u; by=:subject,
             backend=BACKEND, compact, partitioned=:z)
+        for label in 1:3
+            @test partition_footprint(sampler, label) == [label]
+            gradient = zeros(compact ? 1 : length(u))
+            partition_value_and_gradient!(sampler, gradient, u, label)
+            expected = sum(data.y[data.subject .== label] .- u[label])
+            @test (compact ? only(gradient) : gradient[label]) ≈ expected
+        end
     end
 end
 

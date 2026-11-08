@@ -90,9 +90,9 @@ end
                     partitioned = nonlinear ? (:eta,) : (), locality = :error)
                 for label in (1, 2)
                     footprint = partition_footprint(sampler, label)
-                    # The affine model uses a dense design and physically reads
-                    # all coefficients. The nonlinear gather reads only its unit.
-                    @test footprint == (nonlinear ? [1, 2, 2 + label] : collect(1:4))
+                    # Both gather their unit's coefficient: the affine factor
+                    # term by level code, the nonlinear model explicitly.
+                    @test footprint == [1, 2, 2 + label]
                     gradient = zeros(compact ? length(footprint) : length(u))
                     value, _ = partition_value_and_gradient!(sampler, gradient, u, label)
                     rows = findall(==(label), data.label)
