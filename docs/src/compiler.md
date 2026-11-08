@@ -1207,7 +1207,8 @@ these producers:
   through, and such a column read alone;
 - `hcat(a, b, ...)` of inputs, such as a design matrix with a computed column;
 - `vcat(a, b, ...)` of inputs and number literals, such as a completed
-  covariate `vcat(free, grouped)[lookup]` or a padded field `vcat(phi, 0.0)`.
+  covariate `vcat(free, grouped)[lookup]` or a padded field `vcat(phi, 0.0)` or
+  `vcat(phi, 0)`.
   A row of it is a row of exactly one operand, so each operand is computed at
   the rows that fall in it, and an operand none falls in is computed at no
   rows. Matrices stack along their first axis; their other dimensions must

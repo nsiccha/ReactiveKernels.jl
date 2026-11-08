@@ -856,6 +856,27 @@ end
     end
 end
 
+# A number among a `vcat`'s operands is that number: `0` has no input's position
+# and `1` holds the first's, against the density computed by hand (snag
+# `cell-vcat-litera-04f008d6`).
+@testset "cell query: an integer literal among a vcat's operands" begin
+    data = (; row = [1, 3, 2, 3, 1, 2], y = [0.3, 0.1, -0.2, 0.4, 0.2, -0.1])
+    @testset "vcat(frac, $literal)" for literal in (0, 1, 2, 0.0, 1.0)
+        ast = quote
+            frac[1:2] .~ Normal.(0, 1)
+            padded = vcat(frac, $literal)
+            @plate for i in eachindex(y)
+                y[i] ~ Normal(padded[row[i]], 1)
+            end
+        end
+        bound, built = _cq_bound(ast, data, (:y,))
+        q = prepare_cell_query(built, bound, :y)
+        u = [0.7, 0.2]
+        @test [q(u, i) for i in eachindex(data.y)] ≈
+              logpdf.(Normal.(vcat(u, literal)[data.row], 1), data.y)
+    end
+end
+
 # A joint population effect for several responses, as BRM emits it (snag
 # `column-read-lowe-24508269`): a design with a gathered computed column, a
 # submodel returning `X * beta` and one definition per response column. RKPPL
