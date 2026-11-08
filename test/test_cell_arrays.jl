@@ -415,4 +415,195 @@ end
     @test ReactiveKernels._readonly_gather(source, [true, false, true, false]) == [10.0, 30.0]
     @test ReactiveKernels._readonly_gather(source, 2:3) == [20.0, 30.0]
 end
+
+# A broadcast that a nested plate reads as one of its lanes composes into that
+# plate's cells: each cell evaluates its own entry, so a group stores no array.
+@kernel lane_series(b::Vector{Vector{Float64}}, y::Vector{Vector{Float64}},
+                    off::Vector{Float64}, s::Float64) = begin
+    values = plate(eachindex(y)) do g
+        m = off[g] .+ s .* b[g]
+        terms = plate(m, y[g]) do mi, yi
+            abs2(yi - mi)
+        end
+        sum(terms)
+    end
+    total = sum(values)
+    return total
+end
+# A function that can throw keeps its eager materialization: its error comes
+# before the plate, also when that plate reads no entry.
+@kernel lane_eager(b::Vector{Vector{Float64}}, y::Vector{Vector{Float64}}) = begin
+    values = plate(eachindex(y)) do g
+        m = log.(b[g])
+        terms = plate(m, y[g]) do mi, yi
+            yi * mi
+        end
+        sum(terms)
+    end
+    total = sum(values)
+    return total
+end
+# A reader that is not a plate lane keeps the value stored.
+@kernel lane_escapes(b::Vector{Vector{Float64}}, y::Vector{Vector{Float64}}, s::Float64) = begin
+    values = plate(eachindex(y)) do g
+        m = s .* b[g]
+        terms = plate(m, y[g]) do mi, yi
+            yi * mi
+        end
+        sum(terms) + opaque_sum(m)
+    end
+    total = sum(values)
+    return total
+end
+lane_series_value(b, y, off, s) =
+    sum((sum(abs2, y[g] .- (off[g] .+ s .* b[g]); init=0.0) for g in eachindex(y)); init=0.0)
+lane_series_off(b, y, off, s) = [-2sum(y[g] .- (off[g] .+ s .* b[g]); init=0.0) for g in eachindex(y)]
+lane_series_s(b, y, off, s) =
+    sum((-2sum(b[g] .* (y[g] .- (off[g] .+ s .* b[g])); init=0.0) for g in eachindex(y)); init=0.0)
+function lane_series_bytes(width)
+    b = [fill(0.1g, width) for g in 1:3]; y = [fill(0.2, width) for _ in 1:3]
+    off = fill(0.3, 3)
+    k = prepare(lane_series)
+    ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), b, y, off, 0.7; active=:off)
+    k(b, y, off, 0.7), ad_gradient(ad, b, y, off, 0.7)
+    ((@allocated k(b, y, off, 0.7)), (@allocated ad_gradient(ad, b, y, off, 0.7)))
+end
+
+@testset "a broadcast read as a nested plate's lane composes into its cells" begin
+    k = prepare(lane_series)
+    @test occursin("_cell_array_broadcast", string(code_expr(k)))
+    s = 0.7
+    for (b, y) in (([[0.2, -0.4, 0.9], [0.5], Float64[]], [[0.1, 0.3, -0.2], [1.5], Float64[]]),
+                   # A one-entry lane is extended over the other lane, as broadcasting does.
+                   ([[0.4], [0.2, 0.6]], [[0.1, 0.3, -0.2], [0.5, 0.25]]),
+                   (Vector{Float64}[], Vector{Float64}[]))
+        off = collect(0.1 .* eachindex(y))
+        @test k(b, y, off, s) ≈ lane_series_value(b, y, off, s)
+        ad_off = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), b, y, off, s; active=:off)
+        @test ad_gradient(ad_off, b, y, off, s) ≈ lane_series_off(b, y, off, s)
+        ad_s = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), b, y, off, s; active=:s)
+        @test ad_gradient(ad_s, b, y, off, s) ≈ lane_series_s(b, y, off, s)
+    end
+    # Unequal lanes still fail as broadcasting them fails.
+    @test_throws DimensionMismatch k([[0.2, 0.4]], [[0.1, 0.2, 0.3]], [0.0], s)
+    # No array is stored per group: neither the value nor its gradient
+    # allocates more for wider groups.
+    @test lane_series_bytes(4) == lane_series_bytes(64)
+    # A function that can throw is materialized at its own statement, so its
+    # error comes first (`_cell_array_broadcast` admits total functions only).
+    eager = prepare(lane_eager)
+    @test eager([[1.0, 2.0]], [[0.5, 0.25]]) ≈ 0.25log(2.0)
+    @test_throws DomainError eager([[1.0], [-1.0]], [[0.5], Float64[]])
+    # A value that another reader receives whole stays stored.
+    escapes = prepare(lane_escapes)
+    @test !occursin("_cell_array_broadcast", string(code_expr(escapes)))
+    @test escapes([[0.2, 0.4]], [[0.5, 0.25]], 0.5) ≈ (0.5 * 0.1 + 0.25 * 0.2) + (0.1 + 0.2)
+end
+
+# A group's gather of a computed vector, read only through a broadcast that a
+# nested plate reads as its lane, borrows the vector instead of copying it.
+@kernel lane_gather(w::Vector{Vector{Float64}}, traj::Vector{Int}, rows,
+                    y::Vector{Vector{Float64}}, k::Float64, off::Vector{Float64}) = begin
+    wv = plate(w) do wt
+        exp(k) .* wt
+    end
+    values = plate(eachindex(y)) do g
+        c = wv[traj[g]][rows[g]]
+        m = off[g] .+ c
+        terms = plate(m, y[g]) do mi, yi
+            abs2(yi - mi)
+        end
+        sum(terms)
+    end
+    total = sum(values)
+    return total
+end
+# The same gather, also returned whole from each cell, keeps its copy.
+@kernel lane_gather_escapes(w::Vector{Vector{Float64}}, traj::Vector{Int},
+                            rows::Vector{Vector{Int}}, k::Float64) = begin
+    wv = plate(w) do wt
+        exp(k) .* wt
+    end
+    picked = plate(eachindex(rows)) do g
+        wv[traj[g]][rows[g]]
+    end
+    return picked
+end
+lane_gather_value(w, traj, rows, y, k, off) = sum((sum(abs2,
+    y[g] .- (off[g] .+ exp(k) .* w[traj[g]][rows[g]]); init=0.0) for g in eachindex(y)); init=0.0)
+lane_gather_k(w, traj, rows, y, k, off) = sum((-2sum(exp(k) .* w[traj[g]][rows[g]] .*
+    (y[g] .- (off[g] .+ exp(k) .* w[traj[g]][rows[g]])); init=0.0) for g in eachindex(y)); init=0.0)
+function lane_gather_bytes(width)
+    w = [collect(range(0.1, 1.0; length=80)), collect(range(-0.5, 0.4; length=80))]
+    traj = [1, 2, 1]; rows = [collect(1:width), collect(2:width+1), collect(3:width+2)]
+    y = [fill(0.2, width) for _ in 1:3]; off = [0.1, -0.2, 0.3]
+    k = prepare(lane_gather)
+    ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), w, traj, rows, y, 0.3, off; active=:k)
+    k(w, traj, rows, y, 0.3, off), ad_gradient(ad, w, traj, rows, y, 0.3, off)
+    ((@allocated k(w, traj, rows, y, 0.3, off)), (@allocated ad_gradient(ad, w, traj, rows, y, 0.3, off)))
+end
+
+@testset "a gather read only entry by entry borrows its source" begin
+    k = prepare(lane_gather)
+    @test occursin("_cell_array_gather", string(code_expr(k)))
+    w = [collect(0.1:0.1:1.0), collect(-0.5:0.1:0.4)]
+    traj = [1, 2, 1]; off = [0.1, -0.2, 0.3]
+    for (rows, y) in (([[1, 3, 3, 7], [10, 2], Int[]], [[0.1, 0.4, -0.3, 0.2], [0.5, -0.1], Float64[]]),
+                      # A range index keeps Julia's copying gather; the values agree.
+                      ([2:4, 1:2, 5:5], [[0.1, 0.4, -0.3], [0.5, -0.1], [0.2]]))
+        @test k(w, traj, rows, y, 0.3, off) ≈ lane_gather_value(w, traj, rows, y, 0.3, off)
+        ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), w, traj, rows, y, 0.3, off; active=:k)
+        @test ad_gradient(ad, w, traj, rows, y, 0.3, off) ≈ lane_gather_k(w, traj, rows, y, 0.3, off)
+    end
+    # Every index is checked at the gather, as Julia's indexing checks it.
+    @test_throws BoundsError k(w, traj, [[1, 11], [1], Int[]],
+        [[0.1, 0.2], [0.3], Float64[]], 0.3, off)
+    # Neither the value nor its gradient allocates more for wider groups.
+    @test lane_gather_bytes(4) == lane_gather_bytes(64)
+    # A gather returned whole is an owned copy, as authored.
+    escapes = prepare(lane_gather_escapes)
+    @test !occursin("_cell_array_gather", string(code_expr(escapes)))
+    picked = escapes(w, traj, [[1, 2], [3], Int[]], 0.0)
+    @test picked == [w[1][[1, 2]], w[2][[3]], Float64[]]
+    @test all(p -> p isa Vector{Float64}, picked)
+end
+
+# A summed plate whose cell is its lane's entry reads the composed value in the
+# running total itself, a name the plate assigns twice (seed, then each cell).
+@kernel lane_entry_total(b::Vector{Vector{Float64}}, s::Float64) = begin
+    values = plate(eachindex(b)) do g
+        m = s .* b[g]
+        terms = plate(m) do mi
+            mi
+        end
+        sum(terms)
+    end
+    total = sum(values)
+    return total
+end
+@kernel gather_entry_total(w::Vector{Float64}, rows::Vector{Vector{Int}}, s::Float64) = begin
+    scaled = s .* w
+    values = plate(eachindex(rows)) do g
+        c = scaled[rows[g]]
+        terms = plate(c) do ci
+            ci
+        end
+        sum(terms)
+    end
+    total = sum(values)
+    return total
+end
+
+@testset "a running total that reads a composed lane keeps its seed" begin
+    b = [[0.2, 0.4], Float64[], [1.0]]
+    k = prepare(lane_entry_total)
+    @test k(b, 0.5) ≈ 0.5 * 1.6
+    ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), b, 0.5; active=:s)
+    @test ad_gradient(ad, b, 0.5) ≈ 1.6
+    w = [0.1, 0.2, 0.3, 0.4]; rows = [[1, 4], Int[], [2, 2, 3]]
+    g = prepare(gather_entry_total)
+    @test g(w, rows, 2.0) ≈ 2.0 * (0.5 + 0.7)
+    adg = prepare_ad(g, AutoEnzyme(; mode=Enzyme.Reverse), w, rows, 2.0; active=:s)
+    @test ad_gradient(adg, w, rows, 2.0) ≈ 1.2
+end
 end

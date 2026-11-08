@@ -810,14 +810,18 @@ ReactiveKernels derivative verbs take `(base, active)` last, where `base` is the
 read-only full point and `active` supplies these coordinates. Directions and
 gradient outputs have the compact length. Prepare one operator per caller.
 """
-struct FactorQueryAD{P,L,C}
-    prepared::P
-    layout::L
-    coordinates::Vector{Int}
+# Mutable, as the other query types are (`SamplerQuery`): `Base.invokelatest`
+# passes each argument as a boxed reference, so an immutable query was copied to
+# the heap with its prepared operator on every call (9 KB and 12× the direct
+# call's time for a three-coordinate factor). A mutable query crosses uncopied.
+mutable struct FactorQueryAD{P,L,C}
+    const prepared::P
+    const layout::L
+    const coordinates::Vector{Int}
     # The selection's own arguments of the structure's shared program (its
     # coordinate slots, cell memberships, row plan and folded constant), which
     # every call appends after `(base, active)`.
-    context::C
+    const context::C
 end
 FactorQueryAD(prepared, layout, coordinates) = FactorQueryAD(prepared, layout, coordinates, ())
 for verb in (:ad_gradient, :ad_value_and_gradient, :ad_value_and_gradient!,
