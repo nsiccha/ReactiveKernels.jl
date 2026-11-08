@@ -1010,7 +1010,8 @@ end
     isconcretetype(T) && C === typeof(seed)
 
 # The indices after a scan's peeled first step, which every native scan loop
-# iterates, here and in the generated lowering. For a unit range they are the
+# that peels (`_scan_unpeeled`) iterates, here and in the generated lowering.
+# For a unit range they are the
 # unit range that starts one later; other index collections drop the first.
 # Both give the same indices. Native Enzyme reverse can fail on the
 # `Iterators.drop` loop of a scan nested in another scan's step, both in one

@@ -16,6 +16,26 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.127
+
+- A scan whose step keeps its types runs every step in its loop. A native scan
+  ran its first step before the loop (peeled it) to type a result whose output
+  type inference cannot fix, and to give the loop the carry type that step
+  returns. When the step's inferred output type is concrete and it returns the
+  seed's carry type, the peel did no work, and on Julia 1.10 Enzyme Reverse of
+  the peeled loop cost 5–8% more than the same loop without it, for a cause
+  Enzyme could not locate. Such a scan now starts its loop at the first index:
+  in a plate cell, at top level, in a demand-driven slice, with `history =`, and
+  when the scan operation runs outside a generated body. Values are unchanged.
+  A scan whose carry changes type at its first step (an `Int` seed summing
+  `Float64`s), whose output type is not concrete, or whose fused plate consumer
+  sums cells that are not numbers keeps the peel. `code_expr` shows both forms;
+  the types select one at compile time, and only it is compiled. On Julia
+  1.10.12 with Enzyme dogfood `b5daa2ac`, the Reverse gradient of an ARMA(1,1)
+  scan cell's generated function went from 1.05–1.11 to 0.96–1.01 times an
+  inlined hand loop, and a 3-state HMM filter cell from 1.08–1.10 to 1.01–1.02
+  times (`benchmark/scan_plate_cell_reverse.jl`).
+
 ## 0.1.126
 
 - A plate cell's slice is read in place when its reader hands another argument

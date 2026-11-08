@@ -63,6 +63,19 @@
 # shadow and cache pointers once per entry of its reverse loop (libEnzyme
 # c01fbb0c, not landed) removes those reloads but not the cost, so the cause of
 # the remainder is unknown (Enzyme decision 08gyjzn).
+#
+# RK 0.1.127 lowers a scan whose step keeps its types without the peel. On
+# Julia 1.10.12 with dogfood b5daa2ac, at host load 8-13, two runs of RK at
+# c891c3c9 interleaved with two of RK 0.1.127 gave: the ARMA cell 1.06-1.09
+# times the inlined hand loop (c891c3c9: 1.12-1.15), 20.2-20.4 / 216.4-216.5 us
+# at T = 120 / 1320 (21.7-22.4 / 225.7-228.1 us); with its generated function
+# differentiated directly, 0.96-1.01 times (1.05-1.11, and 1.00-1.03 for the
+# edited copy without the peel); the HMM cell 1.01-1.02 times the inlined hand
+# loop (1.08-1.10); the washout cell 0.99-1.02 (0.99-1.04); the top-level scan
+# 1.04-1.05 (1.02-1.04). On Julia 1.12.7 with dogfood 439590b1, two pairs: the
+# ARMA cell 0.99-1.03 times the inlined hand loop (1.00-1.04), HMM 1.01-1.02
+# (1.02-1.05), washout 0.88-0.95 (0.86-0.95). Preparing a small ARMA cell and
+# taking its first gradient took 5.5-5.6 s (5.6-5.8 s).
 using Enzyme, Random, Printf
 using ReactiveKernels
 const DI = ReactiveKernels.DifferentiationInterface
