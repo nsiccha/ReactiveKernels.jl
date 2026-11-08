@@ -1254,6 +1254,67 @@ plate program of a prepared kernel, whether its gradient is the generated
 reverse and otherwise why not. Forward-mode and higher-order operators keep
 differentiating the program with the backend.
 
+### Slices a cell only reads
+
+A plate cell that passes a slice to a function copies it at every cell, and
+native reverse also allocates the copy's shadow and adds its adjoint back into
+the parent's:
+
+```julia
+coefficients = reshape(z, blocks, width)
+field = plate(block, coordinates) do b, c
+    row = coefficients[b, :]
+    state(frequency, row, c)
+end
+```
+
+When preparation can prove that every reader of the slice only reads it, the
+cell reads it through a `view` instead (`_readonly_slice`, printed as such by
+`code_expr`). The proof is per callee and uses concrete types, so it needs the
+evidence `prepare(...; exemplars)` supplies; `prepare_sampler` and the cell
+queries pass it. It has two parts, and both must hold:
+
+- **The callee only reads the view.** A walk over the optimized typed code
+  follows every value derived from the argument until it holds no reference.
+  It knows only reads: anything else that meets a derived value (a store, a
+  foreign call, a dynamic call, a `try`) ends the proof, and so does returning
+  it. A callee's own buffers are not derived, so a callee that writes a local
+  vector still qualifies, which Julia's effect analysis does not establish.
+- **The callee cannot tell a view from a copy.** The walk above reads code that
+  has already selected the view's branch and method, so the lowered body of each
+  user-level frame is read too. The argument may only reach Base's array
+  interface (`getindex`, `size`, `length`, `axes`, `iterate`, `maximum`, ...) or
+  a user function whose methods admit a view and a copy alike and whose own body
+  passes this test. Base's other functions end the proof, and so do
+  `x isa Vector`, `typeof(x)`, `parent(x)` and a `Vector` method beside an
+  `AbstractVector` one.
+
+The reader must also infer one concrete result type over the view and the copy,
+the slice's elements must be bits values, and the slice must not be the cell's
+result. A bound array keeps its copy: `bound=` holds the caller's data.
+
+Any refusal keeps the copy, so it costs what the program cost before and can
+never change a value. That includes a dotted call or BLAS over the slice, whose
+alias test or foreign call the walk does not follow, and a closure capturing the
+slice. It also includes a slice nested in a call of a `@kernel` plate
+(`state(frequency, coefficients[b, :], c)`), which is one recipe with that call;
+`@rkppl` splits such a slice into a recipe of its own, so a model's cells qualify.
+Scan steps, plates nested in a cell and position residuals (which keep their lane
+slots) also keep their copies. A plate a cell query or partition computes at its
+rows reads its slices in place like any other, including one row of a value computed
+only at those rows (`_CellWindow`); a gather of several rows of such a value keeps
+its copy.
+Set `RK_READONLY_SLICES=0` to keep every copy, as a comparison baseline.
+
+Values are the copy's bit for bit. The interface leaves out `sum` and `prod`:
+Base may fold a view in another order than an array (a matrix slice `A[I, :]`
+on every version, and on Julia 1.13 a row too), so a reader that sums the slice
+keeps its copy. Gradients can differ from the copy's in the last bit. The view's
+adjoint accumulates straight into the parent's shadow, where Enzyme's contracted
+derivative arithmetic (the dogfood default, `nsz` and `contract`) may fuse a
+multiply-add that the copy's shadow rounds twice. Under strict derivative
+arithmetic (`Enzyme.API.fast_math_flags!()`) the gradients are identical.
+
 ### Nested observation plates
 
 An authored plate cell can contain another authored plate. Native lowering

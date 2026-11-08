@@ -16,6 +16,31 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.124
+
+- A plate cell reads a slice in place when every call that reads it provably
+  only reads it. A row, column or gather passed to a function (`row = A[i, :]`
+  then `f(a, row)`, and any `@rkppl` cell `f(a, A[i, :])`, which RKPPL splits
+  so) allocated a copy per cell, and native reverse its shadow, so a row read by
+  an opaque function was the largest single item of a large field model's
+  gradient. Preparation with `exemplars` (`prepare_sampler` and the partition
+  and cell queries pass them) now proves from the callee's code that it writes
+  nothing derived from the slice, does not return it, and cannot tell a view
+  from a copy, and then emits `view`. On a toy model of that shape a gradient
+  takes 0.41 to 0.54 of the time, and its bytes stop growing with the row; a
+  partition's unit gradient, the path SVI runs, is read in place too. Values are
+  the copy's bit for bit. Gradients can differ in the last bit where Enzyme's
+  contracted derivative arithmetic (the dogfood default) fuses a multiply-add
+  into the parent's shadow, and are identical under strict arithmetic. A callee
+  the proof cannot follow keeps its copy, which costs what it cost: a dotted
+  call or BLAS over the slice, `sum` or `prod` of it (Base may fold a view in
+  another order), a closure capturing it, a callee with a `Vector` method beside
+  its generic one. Scan steps, plates nested in a cell, a slice nested in a
+  `@kernel` plate's call and a gather of several rows of a value a cell query
+  computes only at its rows also keep their copies. `RK_READONLY_SLICES=0` keeps
+  every copy, for comparison. See "Slices a cell only reads" in the compiler
+  guide.
+
 ## 0.1.123
 
 - `prepare_nonallocating`, and through it

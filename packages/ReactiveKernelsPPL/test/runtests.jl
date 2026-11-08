@@ -270,6 +270,7 @@ const _PPL_TEST_FILES = (
     "test_partition_prefix.jl",
     "test_partition_prefix_strict.jl",
     "test_partition_prefix_branches.jl",
+    "test_readonly_cell_slices.jl",
     "test_partition_batch.jl",
     "test_partition_local_storage.jl",
     "test_partition_plan_sharing.jl",
