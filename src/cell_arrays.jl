@@ -197,6 +197,7 @@ function _cell_array_aliases(x, names)
     x.head === :call && length(x.args) == 2 &&
         _cell_array_function(first(x.args)) === identity &&
         return _cell_array_aliases(x.args[2], names)
+    _cell_array_lane(x, names) && return true
     if x.head === :if
         arms = x.args[2:end]
         return any(a -> _cell_array_aliases(a, names), arms) &&
@@ -204,6 +205,50 @@ function _cell_array_aliases(x, names)
     end
     x.head === :block && return !isempty(x.args) && _cell_array_aliases(last(x.args), names)
     false
+end
+# A native plate reads each lane argument through broadcast preparation: the
+# argument itself (`Base.broadcastable` of an array is the array), its
+# `Extruded` wrapper (`Broadcast.preprocess(nothing, ·)`), and the plate's
+# axis marker, which is the first lane that is an axis. Each of these results
+# holds the array whole, so it is an alias; its readers are then checked like
+# any other. The plate itself reads it only through shape queries and one
+# `_broadcast_getindex` per cell coordinate (`_cell_array_lane_reads`).
+function _cell_array_lane(x, names)
+    x isa Expr && x.head === :call || return false
+    fn = _cell_array_function(first(x.args))
+    named(a) = a isa Symbol && a in names
+    fn === Base.broadcastable && length(x.args) == 2 && return named(x.args[2])
+    fn === Base.Broadcast.preprocess && length(x.args) == 3 &&
+        x.args[2] === nothing && return named(x.args[3])
+    if fn === _authored_plate_marker
+        atomic = _cell_array_marker_atomic(x)
+        atomic === nothing && return false
+        return any(((i, a),) -> !(i in atomic) && named(a), enumerate(x.args[3:end]))
+    end
+    false
+end
+function _cell_array_marker_atomic(x)
+    length(x.args) >= 2 || return nothing
+    marker = x.args[2]
+    marker isa Expr && marker.head === :call &&
+        _cell_array_function(marker.args[1]) === Val &&
+        length(marker.args) == 2 && marker.args[2] isa QuoteNode || return nothing
+    atomic = marker.args[2].value
+    atomic isa Tuple ? atomic : nothing
+end
+# The plate's own reads of a lane: shape and type queries over the whole
+# value, and the entry at a cell coordinate that names no candidate.
+function _cell_array_lane_reads(fn, x, names)
+    named(a) = a isa Symbol && a in names
+    free(args) = all(a -> !_cell_array_has(a, names), args)
+    if fn === _authored_plate_is_axis || fn === _plate_unconditional_root
+        return length(x.args) == 2 && named(x.args[2])
+    elseif fn === _plate_dependency_changed || fn === _plate_total_seed
+        return length(x.args) >= 3 && named(last(x.args)) && free(x.args[2:end-1])
+    elseif fn === Base.Broadcast._broadcast_getindex
+        return length(x.args) >= 3 && named(x.args[2]) && free(x.args[3:end])
+    end
+    nothing
 end
 function _cell_array_throws(x)
     x isa Expr || return false
@@ -233,15 +278,21 @@ function _cell_array_reads(x, names; alias=false, internal=false)
         elseif fn === _cell_array_broadcast
             return _cell_array_broadcast_reads(x.args[2], names)
         elseif internal && fn === _authored_plate_marker
-            marker = x.args[2]
-            if marker isa Expr && marker.head === :call &&
-                    _cell_array_function(marker.args[1]) === Val &&
-                    length(marker.args) == 2 && marker.args[2] isa QuoteNode
-                atomic = marker.args[2].value
-                return atomic isa Tuple && all(enumerate(x.args[3:end])) do (i, a)
-                    i in atomic || !_cell_array_has(a, names)
-                end
+            # An atomic argument is read inside the cell, where those reads
+            # are checked. A lane that is a candidate is a bare name: the
+            # marker's result may be that array, so it is an alias.
+            atomic = _cell_array_marker_atomic(x)
+            atomic === nothing || return all(enumerate(x.args[3:end])) do (i, a)
+                i in atomic || !_cell_array_has(a, names) || a isa Symbol
             end
+        elseif internal && (fn === Base.broadcastable || fn === Base.Broadcast.preprocess)
+            return alias && _cell_array_lane(x, names)
+        else
+            # An entry or a shape query cannot observe the representation, so
+            # it is a reader also inside an inlined recipe's source, whose
+            # arguments carry the plate's lane reads.
+            lane = _cell_array_lane_reads(fn, x, names)
+            lane === nothing || return lane
         end
         return all(a -> _cell_array_reads(a, names; internal), x.args)
     elseif x.head === :if

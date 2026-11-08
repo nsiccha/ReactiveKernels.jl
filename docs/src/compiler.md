@@ -1272,9 +1272,13 @@ Work that varies per outer coordinate cannot move out of the loop. When such a
 cell computes an `hcat` or a broadcast whose only readers index it or query
 its shape, including readers in an embedded kernel's nested plates, native
 lowering reads its entries through those readers instead of storing it per
-cell. A value computed before the loop and read only that way in its cells is
-composed the same way. For example, `present = p .* offsets[event]` followed by
-`components = hcat(present, absent)` builds neither array per event. The graph
+cell. A nested plate that reads the value as one of its lanes is such a reader:
+each inner cell evaluates its own entry. A value computed before the loop and
+read only that way in its cells is composed the same way. For example,
+`present = p .* offsets[event]` followed by
+`components = hcat(present, absent)` builds neither array per event, and
+`m = off[g] .+ s .* x[g]` read by `plate(m, y[g]) do mi, yi … end` builds no
+`m` per group. The graph
 and its queries keep both authored values, and ordinary Enzyme Reverse
 differentiates the composed reads without a derivative rule. Shape checks and
 declarations still run at the authored statement, and scalar reads keep bounds

@@ -415,4 +415,88 @@ end
     @test ReactiveKernels._readonly_gather(source, [true, false, true, false]) == [10.0, 30.0]
     @test ReactiveKernels._readonly_gather(source, 2:3) == [20.0, 30.0]
 end
+
+# A broadcast that a nested plate reads as one of its lanes composes into that
+# plate's cells: each cell evaluates its own entry, so a group stores no array.
+@kernel lane_series(b::Vector{Vector{Float64}}, y::Vector{Vector{Float64}},
+                    off::Vector{Float64}, s::Float64) = begin
+    values = plate(eachindex(y)) do g
+        m = off[g] .+ s .* b[g]
+        terms = plate(m, y[g]) do mi, yi
+            abs2(yi - mi)
+        end
+        sum(terms)
+    end
+    total = sum(values)
+    return total
+end
+# A function that can throw keeps its eager materialization: its error comes
+# before the plate, also when that plate reads no entry.
+@kernel lane_eager(b::Vector{Vector{Float64}}, y::Vector{Vector{Float64}}) = begin
+    values = plate(eachindex(y)) do g
+        m = log.(b[g])
+        terms = plate(m, y[g]) do mi, yi
+            yi * mi
+        end
+        sum(terms)
+    end
+    total = sum(values)
+    return total
+end
+# A reader that is not a plate lane keeps the value stored.
+@kernel lane_escapes(b::Vector{Vector{Float64}}, y::Vector{Vector{Float64}}, s::Float64) = begin
+    values = plate(eachindex(y)) do g
+        m = s .* b[g]
+        terms = plate(m, y[g]) do mi, yi
+            yi * mi
+        end
+        sum(terms) + opaque_sum(m)
+    end
+    total = sum(values)
+    return total
+end
+lane_series_value(b, y, off, s) =
+    sum((sum(abs2, y[g] .- (off[g] .+ s .* b[g]); init=0.0) for g in eachindex(y)); init=0.0)
+lane_series_off(b, y, off, s) = [-2sum(y[g] .- (off[g] .+ s .* b[g]); init=0.0) for g in eachindex(y)]
+lane_series_s(b, y, off, s) =
+    sum((-2sum(b[g] .* (y[g] .- (off[g] .+ s .* b[g])); init=0.0) for g in eachindex(y)); init=0.0)
+function lane_series_bytes(width)
+    b = [fill(0.1g, width) for g in 1:3]; y = [fill(0.2, width) for _ in 1:3]
+    off = fill(0.3, 3)
+    k = prepare(lane_series)
+    ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), b, y, off, 0.7; active=:off)
+    k(b, y, off, 0.7), ad_gradient(ad, b, y, off, 0.7)
+    ((@allocated k(b, y, off, 0.7)), (@allocated ad_gradient(ad, b, y, off, 0.7)))
+end
+
+@testset "a broadcast read as a nested plate's lane composes into its cells" begin
+    k = prepare(lane_series)
+    @test occursin("_cell_array_broadcast", string(code_expr(k)))
+    s = 0.7
+    for (b, y) in (([[0.2, -0.4, 0.9], [0.5], Float64[]], [[0.1, 0.3, -0.2], [1.5], Float64[]]),
+                   # A one-entry lane is extended over the other lane, as broadcasting does.
+                   ([[0.4], [0.2, 0.6]], [[0.1, 0.3, -0.2], [0.5, 0.25]]),
+                   (Vector{Float64}[], Vector{Float64}[]))
+        off = collect(0.1 .* eachindex(y))
+        @test k(b, y, off, s) ≈ lane_series_value(b, y, off, s)
+        ad_off = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), b, y, off, s; active=:off)
+        @test ad_gradient(ad_off, b, y, off, s) ≈ lane_series_off(b, y, off, s)
+        ad_s = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), b, y, off, s; active=:s)
+        @test ad_gradient(ad_s, b, y, off, s) ≈ lane_series_s(b, y, off, s)
+    end
+    # Unequal lanes still fail as broadcasting them fails.
+    @test_throws DimensionMismatch k([[0.2, 0.4]], [[0.1, 0.2, 0.3]], [0.0], s)
+    # No array is stored per group: neither the value nor its gradient
+    # allocates more for wider groups.
+    @test lane_series_bytes(4) == lane_series_bytes(64)
+    # A function that can throw is materialized at its own statement, so its
+    # error comes first (`_cell_array_broadcast` admits total functions only).
+    eager = prepare(lane_eager)
+    @test eager([[1.0, 2.0]], [[0.5, 0.25]]) ≈ 0.25log(2.0)
+    @test_throws DomainError eager([[1.0], [-1.0]], [[0.5], Float64[]])
+    # A value that another reader receives whole stays stored.
+    escapes = prepare(lane_escapes)
+    @test !occursin("_cell_array_broadcast", string(code_expr(escapes)))
+    @test escapes([[0.2, 0.4]], [[0.5, 0.25]], 0.5) ≈ (0.5 * 0.1 + 0.25 * 0.2) + (0.1 + 0.2)
+end
 end
