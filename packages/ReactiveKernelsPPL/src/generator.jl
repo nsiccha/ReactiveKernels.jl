@@ -216,6 +216,13 @@ function _pointwise_known(state::_PointwiseValue)
     ax = _OS.value_axes(state.info)
     return ax !== nothing && only(ax) isa Base.OneTo
 end
+# A matrix whose one-based axes are known: a column `A[:, k]` of it is a
+# vector of known length that a cell may read in place.
+function _pointwise_known_matrix(state::_PointwiseValue)
+    _OS.value_rank(state.info) === 2 || return false
+    ax = _OS.value_axes(state.info)
+    return ax !== nothing && all(a -> a isa Base.OneTo, ax)
+end
 
 function _pointwise_call(ex, states, bound_names)
     info = ReactiveKernels._call_value_info(ex,
@@ -233,6 +240,87 @@ function _pointwise_leaf(ex, values::Dict{Symbol,_PointwiseValue})
             [base, _PointwiseValue(_OS.known_info(ex.args[2]), false)], keys(values))
     end
     return _pointwise_unknown(ex, values)
+end
+
+# An undotted call inside a dotted expression is evaluated once, before the
+# broadcast, as Julia evaluates it: `exp(log_sd) .* z[g]` computes one
+# `exp(log_sd)`, and `X * b` one product. As a plate input it keeps that single
+# evaluation. Its shape comes from OutputSignatures over its arguments' known
+# shapes; an argument of unknown shape, a keyword or a splat leaves it unknown.
+function _pointwise_call_leaf(ex, values, bound_names)
+    state = _pointwise_leaf(ex, values)
+    _pointwise_known(state) && return state
+    Meta.isexpr(ex, :call) && length(ex.args) >= 2 || return state
+    fn = ex.args[1]
+    fn isa Symbol && startswith(String(fn), ".") && return state
+    states = _PointwiseValue[]
+    for a in ex.args[2:end]
+        Meta.isexpr(a, (:kw, :parameters, :...)) && return _pointwise_unknown(ex, values)
+        part = a isa Expr ? _pointwise_call_leaf(a, values, bound_names) :
+            _pointwise_leaf(a, values)
+        _pointwise_known(part) || _pointwise_known_matrix(part) ||
+            return _pointwise_unknown(ex, values)
+        push!(states, part)
+    end
+    return _pointwise_call(ex, states, bound_names)
+end
+
+# A column gather `A[idx, k]` of a known matrix by a known integer index
+# vector and a literal column: a vector of `idx`'s length.
+function _pointwise_column_gather(ex, values, indices, bound_names)
+    Meta.isexpr(ex, :ref, 3) && ex.args[1] isa Symbol && ex.args[2] isa Symbol &&
+        ex.args[3] isa Integer || return nothing
+    base = get(values, ex.args[1], _POINTWISE_UNKNOWN)
+    _pointwise_known_matrix(base) || return nothing
+    idx = get(indices, ex.args[2], nothing)
+    idx === nothing && return nothing
+    state = _pointwise_call(ex, [base, _PointwiseValue(idx, false),
+        _PointwiseValue(_OS.known_info(ex.args[3]), false)], bound_names)
+    _pointwise_vector(state) && _pointwise_known(state) || return nothing
+    return state
+end
+
+# The borrowed view a recognized gather reads: `_readonly_gather(v, idx)` for
+# `v[idx]`; for `A[idx, k]`, the same gather of the column `A[:, k]`, read in
+# place by its own statement `_ppl_column_A_k = Base.view(A, :, k)`
+# (`columns`, inserted by `_pointwise_column_statements!`). Each is a form RK's
+# cell windows read at a cell's rows: a column read, and a linear gather of
+# an input. Both check bounds as the authored indexing does.
+function _pointwise_gather_expr(ex, columns::Dict{Tuple{Symbol,Int},Symbol},
+        bound_names)
+    length(ex.args) == 2 && return :(ReactiveKernels._readonly_gather($(ex.args...)))
+    base, idx, k = ex.args
+    column = get!(columns, (base, k)) do
+        name = Symbol(:_ppl_column_, base, :_, k)
+        while name in bound_names || name in values(columns)
+            name = Symbol(name, :_)
+        end
+        name
+    end
+    return :(ReactiveKernels._readonly_gather($column, $idx))
+end
+
+# Insert each column view a recognized gather reads right after the statement
+# that defines its matrix (or first, for bound data), when a statement still
+# reads it.
+function _pointwise_column_statements!(stmts, columns)
+    isempty(columns) && return stmts
+    defined_at(name) = findfirst(stmts) do st
+        Meta.isexpr(st, :(=), 2) || return false
+        lhs = st.args[1]
+        (Meta.isexpr(lhs, :(::), 2) ? lhs.args[1] : lhs) === name
+    end
+    inserts = Tuple{Int,Expr}[]
+    for ((base, k), column) in columns
+        any(st -> _pointwise_occurrences(st, column) > 0, stmts) || continue
+        at = something(defined_at(base), 0)
+        push!(inserts, (at, :($column = Base.view($base, :, $k))))
+    end
+    sort!(inserts; by = first, rev = true)
+    for (at, st) in inserts
+        insert!(stmts, at + 1, st)
+    end
+    return stmts
 end
 
 # A concatenated numeric value may subsequently be gathered by observation
@@ -263,14 +351,16 @@ function _pointwise_concat_state(rhs, values, bound_names)
     return _pointwise_call(rhs, parts, bound_names)
 end
 
-function _pointwise_tree!(inputs, formals, ex, values, columns, gathers, bound_names)
+function _pointwise_tree!(inputs, formals, ex, values, indices, gathers, bound_names,
+        columns = Dict{Tuple{Symbol,Int},Symbol}())
     if ex isa Symbol && haskey(gathers, ex)
-        return _pointwise_tree!(inputs, formals, gathers[ex], values, columns, gathers, bound_names)
+        return _pointwise_tree!(inputs, formals, gathers[ex], values, indices, gathers,
+            bound_names, columns)
     end
     if Meta.isexpr(ex, :., 2) && ex.args[1] === :exp &&
             Meta.isexpr(ex.args[2], :tuple, 1)
         term, state = _pointwise_tree!(inputs, formals, only(ex.args[2].args),
-            values, columns, gathers, bound_names)
+            values, indices, gathers, bound_names, columns)
         result = _pointwise_call(ex, [state], bound_names)
         _pointwise_known(result) || return nothing, result
         return Expr(:call, :exp, term), result
@@ -281,7 +371,8 @@ function _pointwise_tree!(inputs, formals, ex, values, columns, gathers, bound_n
         terms = Any[]
         states = _PointwiseValue[]
         for a in ex.args[2:end]
-            term, state = _pointwise_tree!(inputs, formals, a, values, columns, gathers, bound_names)
+            term, state = _pointwise_tree!(inputs, formals, a, values, indices, gathers,
+                bound_names, columns)
             _pointwise_known(state) || return nothing, state
             push!(terms, term)
             push!(states, state)
@@ -291,22 +382,22 @@ function _pointwise_tree!(inputs, formals, ex, values, columns, gathers, bound_n
         return Expr(:call, _POINTWISE_ARITHMETIC[ex.args[1]], terms...),
             result
     end
+    column = _pointwise_column_gather(ex, values, indices, bound_names)
     leaf, state = if Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol &&
             ex.args[2] isa Symbol
         base = get(values, ex.args[1], _POINTWISE_UNKNOWN)
-        idx = get(columns, ex.args[2], nothing)
-        if _pointwise_vector(base) &&
-                idx isa Vector{<:Integer} && !(eltype(idx) <: Bool) &&
-                axes(idx, 1) == Base.OneTo(length(idx))
+        idx = get(indices, ex.args[2], nothing)
+        if _pointwise_vector(base) && idx !== nothing
             # This arithmetic cell reads scalar entries from the borrowed view.
-            :(ReactiveKernels._readonly_gather($(ex.args...))),
-                _pointwise_call(ex,
-                    [base, _PointwiseValue(_OS.value_info(idx), false)], bound_names)
+            _pointwise_gather_expr(ex, columns, bound_names),
+                _pointwise_call(ex, [base, _PointwiseValue(idx, false)], bound_names)
         else
             ex, _pointwise_unknown(ex, values)
         end
+    elseif column !== nothing
+        _pointwise_gather_expr(ex, columns, bound_names), column
     else
-        ex, _pointwise_leaf(ex, values)
+        ex, _pointwise_call_leaf(ex, values, bound_names)
     end
     _pointwise_known(state) || return nothing, state
     leaf isa Number && return leaf, state
@@ -319,12 +410,42 @@ function _pointwise_tree!(inputs, formals, ex, values, columns, gathers, bound_n
     return formals[i], state
 end
 
-function _pointwise_rhs(ex, values, columns, gathers, bound_names)
+# The shape of a dotted expression the tree did not lower (an operand that is
+# a matrix, for instance): the broadcast's own result, never one operand's.
+function _pointwise_shape(ex, values, indices, gathers, bound_names)
+    ex isa Symbol && haskey(gathers, ex) && return values[ex]
+    shape(a) = _pointwise_shape(a, values, indices, gathers, bound_names)
+    if Meta.isexpr(ex, :., 2) && Meta.isexpr(ex.args[2], :tuple)
+        return _pointwise_call(ex, _PointwiseValue[shape(a) for a in ex.args[2].args],
+            bound_names)
+    elseif Meta.isexpr(ex, :call) && !isempty(ex.args) &&
+            haskey(_POINTWISE_ARITHMETIC, ex.args[1])
+        return _pointwise_call(ex, _PointwiseValue[shape(a) for a in ex.args[2:end]],
+            bound_names)
+    end
+    column = _pointwise_column_gather(ex, values, indices, bound_names)
+    column === nothing || return column
+    if Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol && ex.args[2] isa Symbol &&
+            haskey(indices, ex.args[2])
+        return _pointwise_call(ex, [_pointwise_leaf(ex.args[1], values),
+            _PointwiseValue(indices[ex.args[2]], false)], bound_names)
+    end
+    return _pointwise_call_leaf(ex, values, bound_names)
+end
+
+function _pointwise_rhs(ex, values, indices, gathers, bound_names,
+        columns = Dict{Tuple{Symbol,Int},Symbol}())
     inputs, formals = Any[], Symbol[]
-    body, state = _pointwise_tree!(inputs, formals, ex, values, columns, gathers, bound_names)
+    body, state = _pointwise_tree!(inputs, formals, ex, values, indices, gathers,
+        bound_names, columns)
     # A failed numerical query may have stopped before visiting a live operand.
     # Dependence follows the whole source expression independently of shape.
-    state = _PointwiseValue(state.info, _pointwise_live(ex, values))
+    live = _pointwise_live(ex, values)
+    # An expression the tree did not lower keeps its authored form; only its
+    # shape is recorded for the statements that read it.
+    body === nothing && return ex, _PointwiseValue(
+        _pointwise_shape(ex, values, indices, gathers, bound_names).info, live)
+    state = _PointwiseValue(state.info, live)
     _pointwise_vector(state) && state.live && _pointwise_known(state) || return ex, state
     plate = Expr(:do, Expr(:call, :plate, inputs...),
         Expr(:->, Expr(:tuple, formals...), Expr(:block, body)))
@@ -390,6 +511,32 @@ function _pointwise_readonly_uses(stmts, name, seen = Set{Symbol}(); vector = tr
     return true
 end
 
+# The integer positions a gather `v[name]` in an arithmetic cell may read through
+# a borrowed view, with their value metadata: a bound integer column with
+# one-based axes, or a level-code vector. A level-code vector is the
+# compiler-owned data-only value `_ppl_lvx_… = _declared_codes(g, labels)`
+# (`_array_level_index_statements`): one `Int` position per entry of the bound
+# column `g`, which bind-time coverage validation proves lies on the level axis.
+function _pointwise_index_infos(plan::StructuralPlan, stmts, bound_names)
+    indices = Dict{Symbol,_OS.ValueInfo}()
+    for (name, idx) in plan.columns
+        idx isa Vector{<:Integer} && !(eltype(idx) <: Bool) &&
+            axes(idx, 1) == Base.OneTo(length(idx)) || continue
+        indices[name] = _OS.value_info(idx)
+    end
+    for st in stmts
+        Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol || continue
+        name, rhs = st.args
+        startswith(String(name), "_ppl_lvx_") || continue
+        Meta.isexpr(rhs, :call, 3) && rhs.args[1] === :_declared_codes &&
+            rhs.args[1] ∉ bound_names && rhs.args[2] isa Symbol || continue
+        column = get(plan.columns, rhs.args[2], nothing)
+        column isa AbstractVector || continue
+        indices[name] = _OS.vector_info(Int, length(column))
+    end
+    return indices
+end
+
 function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
     stmts = def.args[2].args
     values = Dict{Symbol,_PointwiseValue}()
@@ -400,8 +547,10 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
         name = Meta.isexpr(lhs, :(::), 2) ? lhs.args[1] : lhs
         name isa Symbol && push!(bound_names, name)
     end
+    indices = _pointwise_index_infos(plan, stmts, bound_names)
     gathers = Dict{Symbol,Expr}()
     gather_stmts = Dict{Symbol,Expr}()
+    columns = Dict{Tuple{Symbol,Int},Symbol}()
     for (name, value) in plan.columns
         values[name] = _PointwiseValue(_OS.value_info(value), false)
     end
@@ -425,16 +574,26 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
                     container_type = AbstractVector{Float64}), true)
             end
             continue
+        elseif Meta.isexpr(declared, :curly) &&
+                declared.args == Any[:AbstractMatrix, :Float64]
+            dims = _value_axes(plan, name; data_axes = true)
+            values[name] = _PointwiseValue(
+                dims !== nothing && length(dims) == 2 && all(d -> d isa Int, dims) ?
+                    _OS.matrix_info(Float64, dims...;
+                        container_type = AbstractMatrix{Float64}) :
+                    _OS.matrix_info(Float64; container_type = AbstractMatrix{Float64}),
+                true)
+            continue
         end
         if Meta.isexpr(rhs, :ref, 2) &&
                 rhs.args[1] isa Symbol && rhs.args[2] isa Symbol
             base = get(values, rhs.args[1], _POINTWISE_UNKNOWN)
-            idx = get(plan.columns, rhs.args[2], nothing)
-            state = idx === nothing ? _POINTWISE_UNKNOWN : _pointwise_call(rhs,
-                [base, _PointwiseValue(_OS.value_info(idx), false)], bound_names)
-            if _pointwise_vector(state) && _pointwise_known(state) &&
-                    idx isa Vector{<:Integer} && !(eltype(idx) <: Bool) &&
-                    axes(idx, 1) == Base.OneTo(length(idx))
+            idx = get(indices, rhs.args[2], nothing)
+            # A linear gather of a vector only: `_readonly_gather` borrows a
+            # vector, and a matrix's linear read keeps its authored indexing.
+            state = idx === nothing || !_pointwise_vector(base) ? _POINTWISE_UNKNOWN :
+                _pointwise_call(rhs, [base, _PointwiseValue(idx, false)], bound_names)
+            if _pointwise_vector(state) && _pointwise_known(state)
                 # Recognition is transactional: substitute inside arithmetic
                 # only when the entire consumer lowers to a typed plate.
                 gathers[name] = rhs
@@ -443,6 +602,13 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
                 continue
             end
         end
+        column = _pointwise_column_gather(rhs, values, indices, bound_names)
+        if column !== nothing
+            gathers[name] = rhs
+            gather_stmts[name] = st
+            values[name] = column
+            continue
+        end
         concat = _pointwise_concat_state(rhs, values, bound_names)
         if _pointwise_vector(concat) && _pointwise_known(concat)
             values[name] = concat
@@ -450,15 +616,21 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
         end
         if Meta.isexpr(rhs, :call) && !isempty(rhs.args) &&
                 haskey(_POINTWISE_ARITHMETIC, rhs.args[1])
-            candidate, state = _pointwise_rhs(rhs, values, plan.columns, gathers, bound_names)
+            candidate, state = _pointwise_rhs(rhs, values, indices, gathers, bound_names,
+                columns)
             values[name] = state
             st.args[2] = candidate
         elseif rhs isa Symbol && haskey(values, rhs)
             values[name] = values[rhs]
         else
             # A scalar coordinate remains a shared plate input. Its ordinary
-            # indexed read retains the original bounds check.
+            # indexed read retains the original bounds check. Any other value
+            # keeps its statement; only its shape is recorded, so that dotted
+            # arithmetic reading it (`pop .+ ranef` over `pop = X * b`) can
+            # still lower to a plate.
             state = _pointwise_concat_part(rhs, values, bound_names)
+            _pointwise_known(state) ||
+                (state = _pointwise_call_leaf(rhs, values, bound_names))
             values[name] = state
         end
     end
@@ -467,8 +639,9 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
         # A representation-sensitive consumer retains the ordinary copied node;
         # recognized arithmetic still borrows directly from its parent.
         _pointwise_readonly_uses(stmts, name) || continue
-        gather_stmts[name].args[2] = :(ReactiveKernels._readonly_gather($(rhs.args...)))
+        gather_stmts[name].args[2] = _pointwise_gather_expr(rhs, columns, bound_names)
     end
+    _pointwise_column_statements!(stmts, columns)
     return def
 end
 
@@ -1061,7 +1234,8 @@ function _predictor_statements(plan::StructuralPlan)
         end
         terms = Any[]
         if _broadcast_affine(plan, pred)
-            append!(terms, _affine_block_terms(plan, shape; broadcast = true))
+            append!(terms, _affine_block_terms(plan, shape; broadcast = true,
+                pre = stmts))
         elseif shape.width > 0
             push!(terms, :($(design_name(pred.name)) * $(_affine_block_name(pred))))
         end
@@ -1143,10 +1317,14 @@ _coef_coord(coef::Symbol, k::Int) = :($coef[$k])
 
 # Broadcast affine blocks against their coefficient coordinates while
 # retaining the authored axes. Factor and matrix blocks use their own
-# coefficient slices in design order.
+# coefficient slices in design order. With `pre`, a predictor whose factor
+# terms gather by level code (`_factor_gather_affine`) takes
+# `_factor_gather_terms!` instead, which pushes its code statements to `pre`.
 function _affine_block_terms(plan::StructuralPlan, shape::DesignShape;
-        broadcast::Bool = false)
+        broadcast::Bool = false, pre::Union{Nothing,Vector{Expr}} = nothing)
     pred = only(p for p in plan.predictors if p.name === shape.predictor)
+    pre === nothing || !_factor_gather_affine(plan, pred) ||
+        return _factor_gather_terms!(pre, pred, shape)
     coef = _affine_block_name(pred)
     terms = Any[]
     k = 1
@@ -1174,6 +1352,38 @@ function _affine_block_terms(plan::StructuralPlan, shape::DesignShape;
     return terms
 end
 
+
+# The summands of a predictor with a factor term (`_factor_gather_affine`):
+# every intercept, covariate and factor term reads its own declared parameter
+# (sign applied), so no summand names a coefficient position or a level count.
+# A factor term `c[g]` is the level gather `c[codes]` with
+# `codes = _declared_codes(g, axis)` (pushed to `pre`), the form a value
+# gather `z[g]` lowers to: one gather per row, where its dummies were an N×J
+# product. Its axis holds every row's label (`_factor_axis_covers_rows`).
+function _factor_gather_terms!(pre::Vector{Expr}, pred::PredictorSpec,
+        shape::DesignShape)
+    length(shape.blocks) == length(pred.terms) || throw(ContractValidationError(
+        "[generator] predictor $(pred.name): $(length(shape.blocks)) design " *
+        "blocks for $(length(pred.terms)) terms"))
+    terms = Any[]
+    for (i, (t, b)) in enumerate(zip(pred.terms, shape.blocks))
+        t.kind in (InterceptTerm, ContinuousTerm, FactorTerm) || continue
+        b.width == 0 && continue
+        value = t.options.parameter
+        value = t.options.sign == 1 ? value : :(-$value)
+        if t.kind === InterceptTerm
+            push!(terms, value)
+        elseif t.kind === ContinuousTerm
+            push!(terms, :($(b.column) .* $value))
+        else
+            codes = Symbol(:_ppl_lvx_, pred.name, :_, b.column, :_factor_, i)
+            push!(pre, :($codes = _declared_codes($(b.column), $(b.axis))))
+            gathered = :($(t.options.parameter)[$codes])
+            push!(terms, t.options.sign == 1 ? gathered : :(0.0 .- $gathered))
+        end
+    end
+    return terms
+end
 
 function _scan_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
     o = t.options

@@ -70,8 +70,9 @@ end
     # a literal of the generated code (decision 1id2a4o: two 10,950-label
     # literals were 60 s and 45 s of the ArbeitsplatzAtlas prefix compile).
     program = string(kernel_expr(plan, assign_layout(plan)))
-    # This location is an affine design: the factor contrast reads the labels.
-    @test occursin("permutedims(_ppl_levels(g))", program)
+    # This location is an affine predictor: its factor term reads the labels
+    # through its level codes.
+    @test occursin(r"_ppl_lvx_\w+_factor_\d+ = _declared_codes\(g, _ppl_levels\(g\)\)", program)
     @test !occursin("\"a\"", program)
     # A gather outside a design reads them through its level codes.
     gathered = (@rkppl begin
