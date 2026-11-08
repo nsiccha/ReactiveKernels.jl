@@ -16,6 +16,22 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.129
+
+- A `@plate` output whose cell reads no per-index value, such as
+  `c[i] = exp(log_a)` or `c[i] = 0.5`, holds one value per index, as the Julia
+  loop leaves it: over three indices `c` is three entries, so a later plate's
+  `c[i]`, `length(c)` and `sum(c)` read them all. Before, `c` was the bare
+  scalar: a later plate's `c[2]` raised `BoundsError: attempt to access
+  Float64 at index [2]`, and `sum(c)` and `length(c)` returned one entry's
+  value with no error, so a density reading them was wrong (snag
+  `plate-output-of-c4a0ca87`). It is one RK plate over the plate's indices,
+  read from the data when the model runs, and RK evaluates its shared work once
+  per call. Plates lowered through whole-array broadcasts were affected, such
+  as one whose cells only compute values or draw per-index latents; a plate
+  whose cells observe data already kept one value per index
+  (`test_invariant_plate_outputs.jl`).
+
 ## 0.1.128
 
 - Under `prepare_sampler(...; nonallocating = true)`, a program that factors a
