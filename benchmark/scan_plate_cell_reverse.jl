@@ -48,6 +48,19 @@
 # time by about a third and the peeled RK cell's by less, so the ARMA cell takes
 # 1.01-1.19 times the inlined hand loop, where it took 0.93-1.04 on 5e2cd2bb.
 # An edited copy of the generated code without the peel takes 0.96-1.06 times.
+#
+# Dogfood b5daa2ac (libEnzyme 10018598) repairs that snag's hand-written peeled
+# loop, but RK's scan carries a NamedTuple and forms no such phi, so this
+# benchmark is unchanged. On Julia 1.10.12 with RK 0.1.126, at host load 16-25,
+# four runs on b5daa2ac interleaved with four on 439590b1 (two each before and
+# after RK's plate-fusion merge b7fac51d, which changes neither measurably) gave
+# the washout cell 0.96-1.06 (439590b1: 0.98-1.06), the HMM cell 0.97-1.01
+# (0.97-1.01), and the ARMA cell 1.12-1.18 times the inlined hand loop
+# (1.09-1.15). Differentiating the generated function directly, the ARMA cell
+# takes 1.00-1.14 times the inlined hand loop on b5daa2ac (1.01-1.12 on
+# 439590b1), and the edited copy without the peel is 3-10% faster than the code
+# as generated. The remainder is Enzyme's placement of shadow and cache lookups
+# in the peeled scan's reverse loop (Enzyme todo 08khey3).
 using Enzyme, Random, Printf
 using ReactiveKernels
 const DI = ReactiveKernels.DifferentiationInterface

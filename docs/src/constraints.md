@@ -758,15 +758,23 @@ only, no ReactiveKernels code) isolate the remaining backend limitations:
   and HMM cells 0.87 to 1.04 times, and turning `EnzymeReverseLoopEntryMerges`
   off in the same binary brings the washout cell back to 1.07 to 1.15 times.
   One Enzyme cost remains on that line. RK lowers an authored scan with its first
-  step peeled, and Enzyme's reverse of a peeled loop costs up to 14% more than
+  step peeled, and Enzyme's reverse of a peeled loop cost up to 14% more than
   the plain loop, in one placement or the other depending on the derivative
   fast-math flags (Enzyme snag `enzyme-reverse-o-919a1558`). Dogfood `6bcd8ab`'s
   `nsz` and `contract` flags cut an inlined hand loop's gradient time by about a
-  third and the peeled RK cell's by less, so the ARMA cell takes 1.01 to 1.19
-  times the inlined hand loop, where it took 0.93 to 1.04 times on `5e2cd2bb`.
-  An edited copy of its generated code without the peel takes 0.96 to 1.06
-  times. On Julia 1.12 and 1.13 the reverse pass rebuilds each path's gathered
-  slice and output instead of keeping them (Enzyme todo `1nw1luu`). There, on
+  third and the peeled RK cell's by less, so on `439590b1` the ARMA cell takes
+  1.01 to 1.19 times the inlined hand loop, where it took 0.93 to 1.04 times on
+  `5e2cd2bb`. Dogfood `b5daa2ac` repairs the peeled loop for a hand-written loop
+  whose carry is read from an array (Enzyme's `data_phi_loads` repair), but
+  RK's scan carries a `NamedTuple` and forms no such phi, so its derivative is
+  unchanged. On Julia 1.10.12 with RK 0.1.126, in runs interleaved between the
+  two, the ARMA cell takes 1.00 to 1.18 times the inlined hand loop on
+  `b5daa2ac` and 1.01 to 1.15 times on `439590b1`, and an edited copy of its
+  generated code without the peel is 3 to 10% faster than the code as
+  generated. What remains is Enzyme's placement of the shadow and cache lookups
+  in the peeled scan's reverse loop (Enzyme todo `08khey3`). On Julia 1.12 and
+  1.13 the reverse pass rebuilds each path's gathered slice and output instead
+  of keeping them (Enzyme todo `1nw1luu`). There, on
   dogfood `439590b1` with Julia 1.12.7, the Enzyme-only washout shape costs 1.11
   to 1.23 times and the RK cells 0.79 to 0.99 times the hand loop.
   `repro_enzyme_nested_loop_reverse.jl` and `repro_enzyme_peeled_loop_reverse.jl`
