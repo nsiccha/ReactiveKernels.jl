@@ -563,8 +563,8 @@ end
 
 # A factor term `c[g]` of an affine predictor reads its coefficients by level
 # code, one gather per row, instead of multiplying full-rank dummies, an N×J
-# product per evaluation. A row whose label is off the factor's axis reads the
-# padded zero, as its all-zero dummy row did.
+# product per evaluation. Its intercept and covariate read their own
+# parameters, so the program names no coefficient position or level count.
 @testset "a factor term gathers its coefficients by level code" begin
     bare = @rkppl begin
         a ~ Normal(0, 2)
@@ -602,7 +602,8 @@ end
         reference_built = build_kernel(reference)
         source = sprint(show, Base.remove_linenums!(deepcopy(kernel_expr(plan, built.layout))))
         @test !occursin("isequal.(", source)
-        @test occursin("_ppl_factor_codes(g, ", source)
+        @test occursin(r"_ppl_lvx_mu_g_factor_\d+ = _declared_codes\(g, _ppl_levels\(g\)\)", source)
+        @test !occursin(r"_ppl_affine_coef_mu\[\d+\]", source)
         @test coordinate_names(built.layout) == coordinate_names(reference_built.layout)
         params = (; a = 0.2, b = -0.4, sd = 0.9, c = [0.1 * sin(k) for k in 1:J])
         u = collect(Float64, unconstrain(built.layout, params))
@@ -631,7 +632,35 @@ end
             sum(logpdf(Normal(params.c[codes[i]], 0.8), y[i]) for i in 1:n)
         @test Base.invokelatest(lone_q, v) ≈ expected rtol = 1e-12
     end
-    # The density allocates the padded coefficients (J + 1 entries), not an
-    # N×J design: 228 more rows and 57 more levels cost far less than a design.
-    @test bytes[2] - bytes[1] < 8 * 240 * 60 ÷ 10
+    # No N×J design, and no row-length value either.
+    @test bytes[2] - bytes[1] <= 64
+    # Other labels, in any number, are the same program.
+    programs = map((["a", "b", "a"], ["q", "r", "s", "t", "q"])) do g
+        p = bare(; g, x = [0.1i for i in eachindex(g)]) | (; y = zeros(length(g)))
+        build_kernel(p).program
+    end
+    @test ReactiveKernelsPPL._same_program(programs...)
+end
+
+# A factor over a subset of its column's levels leaves rows off its axis.
+# Those rows contribute zero, as their all-zero dummy rows do, so such a factor
+# keeps the design path.
+@testset "a factor over a level subset keeps zero rows off its axis" begin
+    model = @rkppl begin
+        a ~ Normal(0, 2)
+        c[levels(g)[2:end]] .~ Normal.(0, 1)
+        mu = a .+ c[g]
+        y .~ Normal.(mu, 0.7)
+    end
+    g = ["a", "b", "c", "b", "a", "c", "c"]
+    y = [0.1, -0.2, 0.3, 0.05, -0.1, 0.2, 0.4]
+    plan = model(; g) | (; y)
+    built = build_kernel(plan)
+    params = (; a = 0.3, c = [0.4, -0.25])
+    u = collect(Float64, unconstrain(built.layout, params))
+    q = prepare_query(built, plan, :sampler)
+    effect = Dict("a" => 0.0, "b" => 0.4, "c" => -0.25)
+    expected = logpdf(Normal(0, 2), 0.3) + sum(logpdf.(Normal(), params.c)) +
+        sum(logpdf(Normal(0.3 + effect[l], 0.7), v) for (l, v) in zip(g, y))
+    @test Base.invokelatest(q, u) ≈ expected rtol = 1e-12
 end

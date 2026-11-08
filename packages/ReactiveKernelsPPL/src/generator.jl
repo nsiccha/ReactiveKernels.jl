@@ -528,8 +528,7 @@ function _pointwise_index_infos(plan::StructuralPlan, stmts, bound_names)
         Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol || continue
         name, rhs = st.args
         startswith(String(name), "_ppl_lvx_") || continue
-        Meta.isexpr(rhs, :call, 3) &&
-            rhs.args[1] in (:_declared_codes, :_ppl_factor_codes) &&
+        Meta.isexpr(rhs, :call, 3) && rhs.args[1] === :_declared_codes &&
             rhs.args[1] ∉ bound_names && rhs.args[2] isa Symbol || continue
         column = get(plan.columns, rhs.args[2], nothing)
         column isa AbstractVector || continue
@@ -856,7 +855,7 @@ import ..positive_bijector, ..unit_bijector
 # In-model grouping encoder (`_ppl_lvx_<…>` nodes call it with the raw
 # column and the axis's labels) and the label values of a level axis
 # (`preprocessing.jl`).
-import .._declared_codes, .._ppl_factor_codes, .._ppl_levels, .._ppl_unique, .._ppl_values
+import .._declared_codes, .._ppl_levels, .._ppl_unique, .._ppl_values
 # Stopping-ratio stage-lane tables (data-only recipes over the bound
 # response; `preprocessing.jl`).
 import .._ordinal_stage_obs, .._ordinal_stage_idx, .._ordinal_effects_matrix
@@ -1318,15 +1317,14 @@ _coef_coord(coef::Symbol, k::Int) = :($coef[$k])
 
 # Broadcast affine blocks against their coefficient coordinates while
 # retaining the authored axes. Factor and matrix blocks use their own
-# coefficient slices in design order. With `pre`, a factor block reads its
-# slice by level code: `_ppl_fpad_<pred>_<k>[codes]` over the padded slice
-# `vcat(0.0, view(coef, k:k+w-1))` and `codes = _ppl_factor_codes(column,
-# axis)`, the statements pushed to `pre`. That is one gather per row, where
-# the dummy product is an N×J matrix product; a row off the axis reads the
-# pad's zero, as its all-zero dummy row does.
+# coefficient slices in design order. With `pre`, a predictor whose factor
+# terms gather by level code (`_factor_gather_affine`) takes
+# `_factor_gather_terms!` instead, which pushes its code statements to `pre`.
 function _affine_block_terms(plan::StructuralPlan, shape::DesignShape;
         broadcast::Bool = false, pre::Union{Nothing,Vector{Expr}} = nothing)
     pred = only(p for p in plan.predictors if p.name === shape.predictor)
+    pre === nothing || !_factor_gather_affine(plan, pred) ||
+        return _factor_gather_terms!(pre, pred, shape)
     coef = _affine_block_name(pred)
     terms = Any[]
     k = 1
@@ -1341,17 +1339,8 @@ function _affine_block_terms(plan::StructuralPlan, shape::DesignShape;
             k += 1
         elseif b.kind === FactorTerm
             w = b.width
-            if pre === nothing
-                push!(terms, :($(_contrast_expr(b)) *
-                    $(:(view($coef, $k:$(k + w - 1))))))
-            elseif w > 0
-                pad = Symbol(:_ppl_fpad_, shape.predictor, :_, k)
-                codes = Symbol(:_ppl_lvx_, shape.predictor, :_, b.column, :_factor_, k)
-                push!(pre, :($pad::AbstractVector{Float64} =
-                    vcat(0.0, view($coef, $k:$(k + w - 1)))))
-                push!(pre, :($codes = _ppl_factor_codes($(b.column), $(b.axis))))
-                push!(terms, :($pad[$codes]))
-            end
+            push!(terms, :($(_contrast_expr(b)) *
+                $(:(view($coef, $k:$(k + w - 1))))))
             k += w
         elseif b.kind === MatrixTerm
             w = b.width
@@ -1363,6 +1352,38 @@ function _affine_block_terms(plan::StructuralPlan, shape::DesignShape;
     return terms
 end
 
+
+# The summands of a predictor with a factor term (`_factor_gather_affine`):
+# every intercept, covariate and factor term reads its own declared parameter
+# (sign applied), so no summand names a coefficient position or a level count.
+# A factor term `c[g]` is the level gather `c[codes]` with
+# `codes = _declared_codes(g, axis)` (pushed to `pre`), the form a value
+# gather `z[g]` lowers to: one gather per row, where its dummies were an N×J
+# product. Its axis holds every row's label (`_factor_axis_covers_rows`).
+function _factor_gather_terms!(pre::Vector{Expr}, pred::PredictorSpec,
+        shape::DesignShape)
+    length(shape.blocks) == length(pred.terms) || throw(ContractValidationError(
+        "[generator] predictor $(pred.name): $(length(shape.blocks)) design " *
+        "blocks for $(length(pred.terms)) terms"))
+    terms = Any[]
+    for (i, (t, b)) in enumerate(zip(pred.terms, shape.blocks))
+        t.kind in (InterceptTerm, ContinuousTerm, FactorTerm) || continue
+        b.width == 0 && continue
+        value = t.options.parameter
+        value = t.options.sign == 1 ? value : :(-$value)
+        if t.kind === InterceptTerm
+            push!(terms, value)
+        elseif t.kind === ContinuousTerm
+            push!(terms, :($(b.column) .* $value))
+        else
+            codes = Symbol(:_ppl_lvx_, pred.name, :_, b.column, :_factor_, i)
+            push!(pre, :($codes = _declared_codes($(b.column), $(b.axis))))
+            gathered = :($(t.options.parameter)[$codes])
+            push!(terms, t.options.sign == 1 ? gathered : :(0.0 .- $gathered))
+        end
+    end
+    return terms
+end
 
 function _scan_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
     o = t.options
