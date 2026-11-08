@@ -16,6 +16,118 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.119
+
+- New, opt-in: `branch_arms = :all`, a `prepare` keyword and the
+  `[ReactiveKernels]` preference `branch_arms = "all"` in a project's
+  `LocalPreferences.toml` (default `"taken"`, today's behaviour). With it, a
+  plate cell's lazy branch whose condition reads bound data keeps one prepared
+  program whichever arms the binding's lanes take. Every arm is a plate, over
+  no lanes when none takes it, and a domain of no lanes is split too, so data
+  whose lanes all take one arm, or that has none, prepares the program a mixed
+  binding prepares: an RKPPL censored response with a bound scale keeps one
+  sampler type whether its rows are all observed, all censored, mixed or
+  absent. An arm without lanes evaluates nothing: it calls no plate program,
+  its shared work stays behind the plate's nonempty guard, and its work over
+  bound values, such as `log(s)` of a bound scale, is not run at preparation,
+  so an invalid value on an arm no lane takes still never throws. An arm of one
+  lane splits a nested branch as arms of more lanes or none do. Reassembling a
+  pointwise vector whose lanes all took one arm skips the gather. A gradient
+  differentiates a plate program over 64 cells or more through its call, so
+  its loop vectorizes, and a smaller one inline. Values and gradients are
+  unchanged.
+- Its cost, measured on gordito against 0.1.114: an RKPPL censored response
+  over 10 rows, all observed, takes 48 ns per density and 171 ns per sampler
+  gradient (31 and 82 ns by default), and over 200 rows 106 and 613 ns (60 and
+  482 ns). Over 2000 rows it costs what the default does, and several Normal
+  likelihoods over 2000 rows each take 28–33% less per gradient. Every arm is
+  compiled: that model's first gradient over 200 rows took 29.5 s (14.7 s).
+- This is 0.1.110's change (reverted in 0.1.111), now opt-in on the user's
+  decision; by default nothing changes. A condition that reads bound numbers
+  alone still selects its arm at preparation, and a bound singleton beside
+  live arguments of unknown length (a plate of one row) still prepares its own
+  program. With the generated plate reverse on as well (`with_plate_reverse`),
+  an eligible program takes its rule either way.
+- Fixed: a plate program no longer treats a named-tuple field's or a keyword's
+  name as a variable. Since 0.1.113, a body with two or more plates whose cells
+  built `(location = m, scale = s)` could raise ``UndefVarError: `location` not
+  defined``, as an RKPPL `:observations` query over a ragged plate did.
+
+## 0.1.118
+
+- A number among the operands of a `vcat` that a plate cell or a cell query
+  reads (`padded = vcat(frac, 0)`, `padded[row[i]]`) is that number, whichever
+  integer it is. The cell took an `Int` for the position of one of the `vcat`'s
+  inputs. A value no input holds, such as `0`, failed preparation with a
+  `BoundsError`. A value an input holds, such as `1` in `vcat(frac, 1)`, gave
+  **wrong values with no error**: that operand read the input again instead of
+  the number, and a read past the `vcat`'s end returned a value instead of
+  throwing. A cell's values disagreed with the whole program's from 0.1.16,
+  when these forms were added, until now. Any other number type was already
+  right, and the whole program is unaffected (snag
+  `cell-vcat-litera-04f008d6`).
+
+## 0.1.117
+
+- Preparation computes numerically fragile compositions in their stable form:
+  `log(exp(x))` as `x`, `log(logistic(x))` as `loglogistic(x)`, `log(1 + x)` as
+  `log1p(x)`, `exp(x) - 1` as `expm1(x)`, `log(1 + exp(x))` as `log1pexp(x)`,
+  `log(exp(a) + exp(b))` and `log(sum(exp.(x)))` as log-sum-exps,
+  `y / exp(x)` as `y * exp(-x)`, and the rest of the table on the compiler page
+  ("Stable rewrites"). The written form is finite only while its intermediate
+  is representable, and its ordinary reverse forms `0 * Inf = NaN` at the edges:
+  `log(exp(u))` at `u < -745` or `u > 709`. The stable form agrees with it to
+  within rounding wherever it is finite, and stays finite, with a finite
+  derivative, beyond. Errors, lazy branches and non-`Real` operands keep the
+  written program, and result types are unchanged. The rewrite applies across
+  statements, inside plate cells and inside a cell's lazy-branch arms. A
+  sampled positive scale's `exp` and the law's `log(scale)` now meet as `u`,
+  and `bernoulli(logistic(η))` is as exact as `bernoulli(; logit = η)`
+  (`-20.000000002061153` at η = 20, y = false, where it gave `-20.00000002003398`,
+  and `-40.0` at η = 40, where it gave `-Inf`). Results change in their last
+  bits wherever a rule fires.
+- `prepare`, `prepare!` and `prepare_ad(::KernelSpec, …)` take `simplify`:
+  `false` compiles the literal arithmetic, and `nothing` (the default) takes
+  the enclosing preparation's setting, else the project preference
+  `[ReactiveKernels] simplify`, else `true`. Cached preparations are kept per
+  setting.
+- Not yet covered: `prepare_nonallocating`, the reactive compiler, the batched
+  lowering and `jax_source`, values read per row from a gathered or zipped
+  array, and `@traceable` helper bodies. Opaque functions are never rewritten.
+
+## 0.1.116
+
+- A generated reverse for summed plate programs, opt-in: with the
+  `plate_reverse` preference set to `"on"`, or inside
+  `with_plate_reverse(f)`, a prepared gradient differentiates each summed plate
+  program with a reverse generated from the program's own code instead of the
+  backend's reverse over its loop. The output adjoint of a sum reaches every
+  cell unchanged, so the reverse is one pass over the cells: each cell runs
+  forward and then its own reverse sweep, shared values' adjoints accumulate
+  across cells, a batched operand's cotangent is added into its shadow at the
+  cell (a gathered operand's shadow scatters it), and invariants hoisted above
+  the loop are swept once after it. Partials come from DiffRules; lazy branches
+  stay lazy. The primal is the program itself, unchanged. A plate the
+  generator does not differentiate keeps the backend's reverse;
+  `plate_reverse_report(kernel)` names, for each plate program, whether it took
+  the generated reverse and otherwise why not.
+- New dependency: DiffRules.
+
+## 0.1.115
+
+- A footprint (`partition_footprint`, a cell query's or a partition's) maps
+  the reads of a view held in a typed local whose type inference cannot prove,
+  such as `x::AbstractVector{Float64} = view(u, 8:15)` of an abstractly typed
+  port in a kernel that owns a plate. Assigning the view converts it to the
+  declared type; the footprint decides when it is evaluated whether that is the
+  view itself (the view already has the type) or a copy, which reads every
+  viewed position. Before, any such view counted as a copy, so every reader of
+  it read the whole range: a ReactiveKernelsPPL dotted cell latent read every
+  index's block in its cell once the cell also read a value computed from
+  parameters (snag `dotted-cell-late-3789b8ea`). A declared type the view does
+  not have (`head::Vector{Float64} = view(u, 2:4)`) still reads every viewed
+  position. Values and gradients are unchanged (`test_view_footprints.jl`).
+
 ## 0.1.114
 
 - A plate program (0.1.112) is now only the plate's cell work: its loop, the

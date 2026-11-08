@@ -684,9 +684,9 @@ end
 # product `A * v` of exactly two inputs (0 otherwise): with a matrix `A` and a
 # vector `v`, its full axes are `(axes(A, 1),)`. `indices[j]` are every index
 # input a gather source `j` is read by (`A[I]` and `A[J]` in one expression
-# read `A` at the rows of both). `parts` are a `vcat`'s operands in order: an
-# input position, or a number literal; an input read as a `vcat` operand has
-# role `:part`. `vias[j][m]` is the shared index array an authored plate reads
+# read `A` at the rows of both). `parts` are a `vcat`'s operands in order: a
+# `_CellInputLiteral` naming an input, or a number literal; an input read as a
+# `vcat` operand has role `:part`. `vias[j][m]` is the shared index array an authored plate reads
 # source `j` through at its `m`th index (`v[w[q]]`, `q` the element of index
 # input `indices[j][m]`), 0 for a direct read; that index array has role `:via`.
 # A `:program_gather` uses the scalar body's integer index program, held in
@@ -1064,7 +1064,8 @@ function _cell_form(r::Recipe; outlined::Bool = false)
             push!(uses[position[arg]], :part)
             push!(leaves, position[arg])
         end
-        parts = Any[arg isa Symbol ? position[arg] : arg for arg in native.args[2:end]]
+        parts = Any[arg isa Symbol ? _CellInputLiteral(position[arg]) : arg
+                    for arg in native.args[2:end]]
     elseif native isa Expr && native.head === :call && length(native.args) >= 3 &&
            _cell_base_product(native.args[1], mod, params) &&
            native.args[2] isa Symbol && haskey(position, native.args[2])
@@ -1125,8 +1126,10 @@ function _cell_form(r::Recipe; outlined::Bool = false)
         Any[get(tails, j, nothing) for j in eachindex(params)], reduction)
 end
 
-# A literal of a range bound or a reshape dimension: an integer, or a scalar
-# input read whole, by its position (`_cell_literal_parts`).
+# An input, by its position, where a form's slot holds an input or a literal: a
+# range bound or reshape dimension (`_cell_literal_parts`, a scalar read whole),
+# a row method's argument, a `vcat` operand. Its type tells it from a literal,
+# which may be any integer: `vcat(a, 1)` has the operands `a` and the number 1.
 struct _CellInputLiteral
     input::Int
 end
@@ -2861,11 +2864,12 @@ function _cell_split_tuple_plates(p::Plan)
     cid(v) = canon_id(old, v.id)
     boundary = Set(cid(v) for v in vcat(p.have, p.want))
     splits = Dict{Int,Any}()
+    positions = _recipe_readers_if_plates(old, p.recipes)
     for producer in p.recipes
         producer.op isa _AuthoredPlateLike && length(producer.outputs) == 1 || continue
         output = cid(only(producer.outputs))
         output in boundary && continue
-        readers = Recipe[r for r in p.recipes if any(v -> cid(v) == output, r.inputs)]
+        readers = Recipe[p.recipes[at] for at in _readers_of(positions, output)]
         reads = Any[_plate_entries_read(old, Recipe[r], output) for r in readers]
         any(isnothing, reads) && continue
         groups = unique(reads)
@@ -3594,8 +3598,8 @@ end
 function _cell_vcat_part_shapes!(e::_CellEmitter, r::Recipe, f::_CellForm)
     d = e.pushdowns
     shapes = map(f.parts) do part
-        part isa Int || return Expr(:tuple)
-        input = canon_id(d.graph, r.inputs[part].id)
+        part isa _CellInputLiteral || return Expr(:tuple)
+        input = canon_id(d.graph, r.inputs[part.input].id)
         input in d.pushed ? _cell_shape!(e, input) :
             _cell_leaf_shape_expr(e, input)
     end
@@ -3707,10 +3711,10 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
         starts = _cell_bind!(e, :cell_starts,
             Expr(:call, _cell_ref(:_cell_vcat_starts), _cell_vcat_part_shapes!(e, r, f)))
         e.reads[cid] = Any[starts; map(enumerate(f.parts)) do (k, part)
-            part isa Int || return nothing
+            part isa _CellInputLiteral || return nothing
             local_rows = _cell_bind!(e, :cell_row,
                 Expr(:call, _cell_ref(:_cell_vcat_part_rows), starts, k, U))
-            input = canon_id(d.graph, r.inputs[part].id)
+            input = canon_id(d.graph, r.inputs[part.input].id)
             input in d.pushed && _cell_request!(e, input, local_rows)
             local_rows
         end]
@@ -3998,8 +4002,8 @@ function _cell_vcat_window!(e::_CellEmitter, cid::ValueId, r::Recipe, f::_CellFo
     push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row), shape, U, e.sorted))
     starts, locals = e.reads[cid][1], e.reads[cid][2:end]
     parts = map(zip(f.parts, locals)) do (part, local_rows)
-        part isa Int || return part
-        input = canon_id(d.graph, r.inputs[part].id)
+        part isa _CellInputLiteral || return part
+        input = canon_id(d.graph, r.inputs[part.input].id)
         input in d.pushed ? _cell_take!(e, input, local_rows) :
             _cell_operand_row!(e, input, local_rows)
     end

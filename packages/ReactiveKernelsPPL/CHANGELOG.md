@@ -16,6 +16,28 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.128
+
+- Under `prepare_sampler(...; nonallocating = true)`, a program that factors a
+  sampled covariance (`MvNormal` with a computed covariance, such as a Gaussian
+  process) keeps the non-allocating density, still 0 B, but differentiates the
+  ordinary program, so its gradient allocates what the ordinary gradient does
+  (7 KB on a 3-parameter Gaussian process). With every array of that density in
+  a reused buffer, reverse mode tapes them, and the gradient took 1.4 to 3 times
+  the ordinary one. Values and gradients are unchanged. This narrows 0.1.124's
+  0 B gradient for these programs.
+
+## 0.1.127
+
+- Requires ReactiveKernels 0.1.115. A dotted cell latent's cell reads only its
+  own block (0.1.126) also when the cell reads a value computed from
+  parameters, such as a location `mu = mu_Intercept .+ tau .* z[g]` read as
+  `mu[i]`, in one cell or written to a plate output that a second plate
+  observes (BRM's emitted program). Before, every index's footprint held every
+  index's coordinates of the latent there (snag `dotted-cell-late-3789b8ea`).
+  Values and ordinary Reverse gradients are unchanged
+  (`test_cell_vector_latent_footprints.jl`).
+
 ## 0.1.126
 
 - A dotted cell latent, `x[i] .~ D.(args…)` in a `@plate` cell, is read in

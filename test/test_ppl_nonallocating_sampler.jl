@@ -188,7 +188,18 @@ end
             q = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND,
                 warm = true, nonallocating = true)
             @test Base.invokelatest(_na_density_bytes, q.kernel, u) == 0
-            @test Base.invokelatest(_na_gradient_bytes, q, zeros(length(u)), u) == 0
+            bytes = Base.invokelatest(_na_gradient_bytes, q, zeros(length(u)), u)
+            if label == "Gaussian process"
+                # A factored sampled covariance differentiates the ordinary
+                # program (decision `0tqz3lo`), so its gradient allocates what
+                # the ordinary gradient does, and no more.
+                ordinary = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND,
+                    warm = true)
+                @test 0 < bytes <= Base.invokelatest(_na_gradient_bytes, ordinary,
+                    zeros(length(u)), u)
+            else
+                @test bytes == 0
+            end
         end
     end
 end

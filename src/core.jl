@@ -89,6 +89,8 @@ function __init__()
     push!(Base.package_callbacks, _register_image_programs)
     # This process reads its own project's type-stability preferences.
     foreach(preference -> preference[] = nothing, _TYPE_STABILITY_PREFERENCES)
+    # and its own `simplify` preference (`stable_rewrites.jl`).
+    _SIMPLIFY_PREFERENCE[] = nothing
     nothing
 end
 
@@ -1553,7 +1555,8 @@ OWN free ports, selected from the recipe's ordered arguments by the position
 tuples `CI`/`TI`/`EI`; a nested branch arm is itself a `_KernelBranch` over
 every argument. Plate partial evaluation reads them: a condition whose ports
 are all bound data is evaluated per lane at preparation, and the plate splits
-into one plate per taken arm (`_partition_plate_recipe`).
+into one plate per taken arm, or with `branch_arms = :all` into one plate per
+arm, over no lanes for an arm no lane takes (`_partition_plate_recipe`).
 
 In a plate cell, a leaf arm may also carry its own graph, `then_spec` /
 `else_spec`: a `KernelSpec` over the arm's ports (by name) whose one output is
