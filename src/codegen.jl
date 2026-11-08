@@ -8430,7 +8430,11 @@ Base.@nospecializeinfer function _prepare(p::Plan, ast::Expr,
                                           @nospecialize(constants::Tuple),
                                           @nospecialize(callables::Tuple),
                                           @nospecialize(recipes::Tuple);
-                                          exact_signature::Type = Nothing)
+                                          exact_signature::Type = Nothing,
+                                          simplified::Bool = false)
+    # Every program compiled here gets the stable rewrites once, unless its
+    # preparation already applied them (`_prepare_plan_body`).
+    simplified || !_simplify() || (ast = _stable_rewrites(ast, recipes))
     _prepared_kernel(compile(ast), constants, callables, Tuple(p.have), Tuple(p.want),
         p, ast, recipes; exact_signature)
 end
@@ -8609,6 +8613,22 @@ the declared port types; only plate lowering reads the exemplar evidence.
 Lengths and values are not baked into
 the program. A graph prepared with exemplars is compiled afresh.
 
+Preparation computes numerically fragile compositions in their stable form
+(`simplify = true`, the default): `log(exp(u))` as `u`, `log(logistic(x))` as
+`loglogistic(x)`, `log(1 + x)` as `log1p(x)`, `y / exp(u)` as `y * exp(-u)`,
+`log(exp(a) + exp(b))` as a log-sum-exp, and the rest of the table on the
+compiler page ("Stable rewrites"). The literal composition is finite only where
+its intermediate is representable, and its ordinary reverse forms `0 * Inf` at
+the edges; the stable form agrees with it to within rounding wherever it is
+finite and stays finite, with a finite derivative, beyond. Errors, lazy branches
+and non-`Real` operands keep the literal program. The rewrite applies across
+statements and inside plate cells, to compositions the generated program
+spells (recipe sources, a law's hoisted terms); it never sees inside an opaque
+function. `simplify = false` compiles the literal arithmetic; `nothing` takes
+the setting of an enclosing preparation, else the project's ReactiveKernels
+preference `simplify` (`Preferences.set_preferences!(ReactiveKernels,
+"simplify" => false)`), else `true`. Cached preparations are kept per setting.
+
 Selected authored plates with a single plate consumer are composed during
 lowering, eliminating the intermediate array. Named ports remain in `p`: asking
 for an intermediate, supplying it as HAVE, or selecting another consumer keeps
@@ -8653,12 +8673,14 @@ nested ones included, and cached preparations are kept per setting.
 """
 function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
                  exemplars = nothing, type_stability = nothing,
-                 type_stability_level = nothing, _data_cache = nothing)
-    _with_type_stability(type_stability, type_stability_level) do
-        kernel = _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
-                               exemplars, _data_cache)
-        _check_uninferred_values(kernel)
-        kernel
+                 type_stability_level = nothing, simplify = nothing, _data_cache = nothing)
+    _with_simplify(simplify) do
+        _with_type_stability(type_stability, type_stability_level) do
+            kernel = _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
+                                   exemplars, _data_cache)
+            _check_uninferred_values(kernel)
+            kernel
+        end
     end
 end
 
@@ -8706,6 +8728,10 @@ function _prepare_plan_body(p::Plan; passes = (), bound = (), on_error = nothing
     # A plan port typed on the exemplars is called with plans of that type.
     exemplar_types = _plan_typed_exemplars(exemplar_types, record)
     exact_signature = exemplar_types === nothing ? Nothing : Tuple{exemplar_types...}
+    # The stable rewrites (`stable_rewrites.jl`) read the body while its plate
+    # loops are still inline, so a cell's term can read the value a
+    # transformation outside the plate was computed from.
+    _simplify() && (native_ast = _stable_rewrites(native_ast, recipes))
     isempty(passes) || (native_ast = transform(native_ast, passes...))
     # Each top-level plate loop in a function of its own (`_PlateProgram`).
     native_ast = _extract_plate_programs(native_ast)
@@ -8713,7 +8739,8 @@ function _prepare_plan_body(p::Plan; passes = (), bound = (), on_error = nothing
     # body did not (`test_ad.jl`, a source transform over the scan metadata).
     callables = _native_table(native_ast, callables)
     _owns_array_regions(p) ||
-        return _prepare(p, native_ast, constants, callables, recipes; exact_signature)
+        return _prepare(p, native_ast, constants, callables, recipes; exact_signature,
+                        simplified = true)
 
     native = compile(native_ast)
     _prepared_kernel(_ArrayFunction(native), constants, callables, Tuple(p.have),
@@ -8722,16 +8749,18 @@ end
 
 function prepare(g::Graph; have = (), want = (), passes = (), bound = (),
                  on_error = nothing, exemplars = nothing, type_stability = nothing,
-                 type_stability_level = nothing, _data_cache = nothing)
+                 type_stability_level = nothing, simplify = nothing, _data_cache = nothing)
     # One type for every selection's width before the closure captures them.
     haves, wants, binding = _value_list(have), _value_list(want), _bound_list(bound)
-    _with_type_stability(type_stability, type_stability_level) do
-        exemplars === nothing && _reuses_bound_preparation(binding, passes) &&
-            return _graph_bound_preparation(g, haves, wants, passes, binding, on_error;
+    _with_simplify(simplify) do
+        _with_type_stability(type_stability, type_stability_level) do
+            exemplars === nothing && _reuses_bound_preparation(binding, passes) &&
+                return _graph_bound_preparation(g, haves, wants, passes, binding, on_error;
+                    _data_cache)
+            p = plan(g; have = haves, want = wants)
+            prepare(p; passes = passes, bound = binding, on_error = on_error, exemplars,
                 _data_cache)
-        p = plan(g; have = haves, want = wants)
-        prepare(p; passes = passes, bound = binding, on_error = on_error, exemplars,
-            _data_cache)
+        end
     end
 end
 
