@@ -4967,12 +4967,23 @@ _has_plate_block(node) = _is_plate_block(node) ||
 
 # Every symbol `node` names, in first-occurrence order; quoted data and the
 # block `skip` are left out.
-function _program_symbols!(found::Vector{Symbol}, seen::Set{Symbol}, node, skip = nothing)
+function _program_symbols!(found::Vector{Symbol}, seen::Set{Symbol}, node, skip = nothing;
+                           declarations::Bool = true)
     if node isa Symbol
         node in seen || (push!(seen, node); push!(found, node))
     elseif node isa Expr && node.head !== :quote && node !== skip
+        if node.head === :local && !declarations
+            # A declaration names its variable without reading it; its type
+            # annotation is read.
+            for target in node.args
+                target isa Expr && target.head === :(::) &&
+                    foreach(arg -> _program_symbols!(found, seen, arg, skip; declarations),
+                            target.args[2:end])
+            end
+            return found
+        end
         for arg in node.args
-            _program_symbols!(found, seen, arg, skip)
+            _program_symbols!(found, seen, arg, skip; declarations)
         end
     end
     found
@@ -5097,7 +5108,11 @@ function _extract_plate_programs(ast::Expr)
         inside = _program_bound!(Set{Symbol}(), block)
         outside_bound = _program_bound!(Set{Symbol}(), ast.args[2], block;
                                         declarations = false)
-        outside_used = Set(_program_symbols!(Symbol[], Set{Symbol}(), ast.args[2], block))
+        # A name the rest of the body only declares is not a result: a cell
+        # loop's lane slot, declared before the plate and assigned only when
+        # a lane computes it, would otherwise be read on return unassigned.
+        outside_used = Set(_program_symbols!(Symbol[], Set{Symbol}(), ast.args[2], block;
+                                             declarations = false))
         # A name the body binds and the block rebinds, such as a plate's
         # running total, enters the program as an argument and leaves it as a
         # result. A rebound parameter of the body keeps the block inline.
