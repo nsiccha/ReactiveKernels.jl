@@ -367,7 +367,7 @@ end
 # several large loops vectorized (snag `sampler-type-dif-ea945700`). A body
 # with one plate keeps its loop inline. Values, pointwise outputs and native
 # Reverse gradients are those of the inline lowering, which AD differentiates;
-# a plate whose domain is empty calls no program (RK 0.1.113).
+# a plate whose domain is empty calls no program (RK 0.1.114).
 module PlatePrograms
 using ReactiveKernels
 @kernel two_plates(x::Vector{Float64}, y::Vector{Float64}, a::Float64, b::Float64) = begin

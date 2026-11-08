@@ -75,6 +75,24 @@ end
     slot[] = MutatingFunctions.apply!!(slot[], op, args...)
 end
 
+# A step whose result is a tuple of a buffer and numbers, such as RKPPL's
+# simplex and its log-Jacobian, keeps that tuple in a `Union{Nothing,T}`
+# slot, which stores it boxed: storing every call's result would allocate the
+# box every call. The slot is the destination offered to `apply!!`, which
+# reads its buffers, never its numbers, so a result that kept the slot's
+# buffers is not stored again. The differentiated driver below never stores.
+@inline function cache_apply!(slot::Base.RefValue{Union{Nothing,T}}, op,
+                              args...) where {T<:Tuple}
+    cache = slot[]
+    result = MutatingFunctions.apply!!(cache, op, args...)
+    _keeps_buffers(cache, result) || (slot[] = result)
+    result
+end
+
+@inline _keeps_buffers(cache, result) = false
+@inline _keeps_buffers(cache::T, result::T) where {T<:Tuple} =
+    all(map((c, r) -> isbits(c) || c === r, cache, result))
+
 # The differentiated program's driver (`ReactiveKernels._ad_na_cache_driver`):
 # its slots are seeded and read-only. `apply!!` fills the slot's buffer when
 # the result fits it and returns any other result, which is not kept. A nested
@@ -285,25 +303,11 @@ end
     cache
 end
 
-# A square dense matrix plus a `UniformScaling` (`K + sigma * I`), as
-# LinearAlgebra computes it: a copy of the matrix with `λ` added along its
-# diagonal, into a matching cache. Copied element by element, the loop native
-# Enzyme reverse differentiates. Another shape, element type or a cache that
-# may share memory with the matrix takes Base's own call, and its errors.
-@inline function _uniform_add_into!(cache::Matrix{T}, A::Matrix{T},
-                                    J::LinearAlgebra.UniformScaling) where {T}
-    (Base.promote_op(+, T, typeof(J.λ)) === T && size(A, 1) == size(A, 2) &&
-     size(cache) == size(A) && !Base.mightalias(cache, A)) || return A + J
-    @inbounds for i in eachindex(A)
-        cache[i] = A[i]
-    end
-    @inbounds for i in 1:size(A, 1)
-        cache[i, i] += J.λ
-    end
-    cache
-end
+# A square dense matrix plus a `UniformScaling` (`K + sigma * I`), into a
+# matching cache (`ReactiveKernels._uniform_add_into!`).
 @inline MutatingFunctions.apply!!(cache::Matrix{T}, ::typeof(+), A::Matrix{T},
-        J::LinearAlgebra.UniformScaling) where {T} = _uniform_add_into!(cache, A, J)
+        J::LinearAlgebra.UniformScaling) where {T} =
+    ReactiveKernels._uniform_add_into!(cache, A, J)
 
 @inline function MutatingFunctions.apply!!(
         cache::Array{T,N}, ::typeof(-), a::Array{T,N}, b::Array{T,N}) where {T,N}

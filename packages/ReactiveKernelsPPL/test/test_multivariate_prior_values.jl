@@ -221,8 +221,13 @@ end
     @test P._covariance_cholesky(S, 3) ≈ cholesky(S).L rtol = 1e-14
     @test P._covariance_cholesky(fill(4.0, 1, 1), 1) == [2.0;;]
     F = P._covariance_cholesky(S, 3)
-    generic_solve(X, F, d) = invoke(P._lower_solve_rows_logpdf, Tuple{Any,Any,Any}, X, F, d)
+    # The factor into a buffer of its own is the fresh factor, bit for bit.
+    @test P._covariance_cholesky!(fill(NaN, 3, 3), S, 3) == F
+    generic_rows(X, F) = invoke(P._lower_solve_rows, Tuple{Any,Any}, X, F)
+    generic_density(Z, d) = invoke(P._solved_rows_logpdf, Tuple{Any,Any}, Z, d)
+    generic_solve(X, F, d) = generic_density(generic_rows(X, F), d)
     for X in ([0.3 -0.2 0.5], [0.3 -0.2 0.5; 0.1 0.4 -0.6], zeros(0, 3))
+        @test P._lower_solve_rows(X, F) ≈ generic_rows(X, F) rtol = 1e-14
         @test P._lower_solve_rows_logpdf(X, F, 0.7) ≈ generic_solve(X, F, 0.7) rtol = 1e-14
     end
     # refused: a covariance must be symmetric positive definite (distribution domain, P3)

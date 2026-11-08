@@ -10,6 +10,7 @@ using ReactiveKernelsPPL
 using MutatingFunctions
 using DifferentiationInterface: AutoEnzyme
 import Enzyme
+using LinearAlgebra: I
 using Test
 
 const NA_SAMPLER_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
@@ -73,10 +74,40 @@ _na_bounded = @rkppl begin
     y .~ Normal.(mu, sigma)
 end
 
+# A simplex: its stick-breaking transform returns the weights and their
+# log-Jacobian together.
+_na_simplex = @rkppl begin
+    w ~ Dirichlet(4, 1.5)
+    z .~ Categorical(w)
+end
+
+# An ordered vector: its transform is a prefix sum of exponentials.
+_na_ordered = @rkppl begin
+    m ~ Ordered(Normal(0, 3), 2)
+    sd ~ HalfNormal(1)
+    v .~ Normal.(m[1] .+ m[2] .* t, sd)
+end
+
+# A Gaussian process: the density factors the covariance and solves against
+# the factor.
+_na_process = @rkppl begin
+    ell ~ Gamma(4, 0.5)
+    amp ~ HalfNormal(1.5)
+    noise ~ HalfNormal(0.7)
+    C = amp^2 .* exp.(-D ./ (2 * ell^2)) + noise * I
+    r[axes(D, 1)] ~ MvNormal(zeros(n), C)
+end
+
 const _NA_X = [sin(0.7i + j) for i in 1:60, j in 1:3]
 const _NA_Y = [0.5 + 0.8 * _NA_X[i, 1] - 0.3 * _NA_X[i, 2] + 0.2 * cos(1.3i) for i in 1:60]
 const _NA_SERIES = [sin(0.3t) + 0.1 * cos(2.1t) for t in 1:80]
 const _NA_COUNTS = [round(Int, exp(0.3 + 0.5 * _NA_X[i, 1] - 0.2 * _NA_X[i, 2])) for i in 1:60]
+const _NA_LABELS = [1 + mod(3i + i ÷ 5, 4) for i in 1:40]
+const _NA_T = [0.1i for i in 1:30]
+const _NA_V = [0.2 + 0.7 * _NA_T[i] + 0.3 * sin(1.7i) for i in 1:30]
+const _NA_POSITIONS = [0.37i + 0.2 * sin(i) for i in 1:9]
+const _NA_D = [(a - b)^2 for a in _NA_POSITIONS, b in _NA_POSITIONS]
+const _NA_R = [sin(0.8x) + 0.1 * cos(5x) for x in _NA_POSITIONS]
 
 _na_sampler_cases() = (
     ("matrix-vector regression", _na_regression(; X = _NA_X) | (; y = _NA_Y)),
@@ -86,6 +117,9 @@ _na_sampler_cases() = (
     ("scalar coefficients", _na_affine(; x1 = _NA_X[:, 1], x2 = _NA_X[:, 2],
         x3 = _NA_X[:, 3]) | (; n = _NA_COUNTS)),
     ("interval-bounded coefficients", _na_bounded(; X = _NA_X) | (; y = _NA_Y)),
+    ("simplex", _na_simplex() | (; z = _NA_LABELS)),
+    ("ordered vector", _na_ordered(; t = _NA_T) | (; v = _NA_V)),
+    ("Gaussian process", _na_process(; D = _NA_D, n = length(_NA_R)) | (; r = _NA_R)),
 )
 
 _na_density_bytes(q, u) = (q(u); q(u); @allocated q(u))
@@ -138,10 +172,15 @@ end
 @testset "a warmed non-allocating density and gradient allocate nothing" begin
     # Each shape of `_na_sampler_cases`: a design-matrix product, a scan
     # trajectory after its initial values, a ranged gather into a group plate,
-    # a coefficient vector of scalar parameters and an interval transform's
-    # log-Jacobian. The density is measured on the kernel: the query's own call
-    # returns its value through a world-age barrier (`SamplerQuery`), which
-    # boxes the number it returns.
+    # a coefficient vector of scalar parameters, an interval transform's
+    # log-Jacobian, the simplex and ordered transforms, and an `MvNormal`
+    # covariance's factor and solve. The density is measured on the kernel:
+    # the query's own call returns its value through a world-age barrier
+    # (`SamplerQuery`), which boxes the number it returns. The simplex,
+    # ordered and `MvNormal` destinations come from RKPPL's MutatingFunctions
+    # extension; an environment whose manifest predates it allocates here.
+    @test Base.get_extension(ReactiveKernelsPPL,
+        :ReactiveKernelsPPLMutatingFunctionsExt) !== nothing
     for (label, plan) in _na_sampler_cases()
         @testset "$label" begin
             built = build_kernel(plan)

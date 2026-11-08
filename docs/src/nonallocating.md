@@ -97,18 +97,31 @@ expression into primitive steps at preparation time:
   steps (`maximum(m; dims = 2)` reuses its result buffer); a `dims` value
   read from a port or computed at runtime is outside this grammar;
 - every other call with a registered `apply!!` method for its concrete cache
-  and argument types becomes its own cache step; a call without one runs
-  inline, as written.
+  and argument types becomes its own cache step, including a method whose
+  result is a tuple holding an array (a transformed vector and its
+  log-Jacobian); the kernel stores such a tuple again only when its arrays
+  change, since storing it boxes it;
+- a call to a `@traceable` helper decomposes as the helper's recorded source
+  when its body is straight-line (assignments `x = value` and
+  `a, b = x, y`, calls run for their effect such as an argument check, and a
+  final value or `return`), so the arrays it builds get buffers of their own.
+  The source stands for the call only when the recorded method is the one the
+  arguments dispatch to: a more specific plain method of the same function
+  (a `Float64` specialization, say) runs as written;
+- an authored `if`/`elseif` whose condition and arms are themselves
+  straight-line decomposes arm by arm: each arm's steps run only when that arm
+  is taken, and a missing `else` arm returns `nothing`;
+- a call without any of these forms runs inline, as written.
 
 Free symbols in the captured expression resolve against the authoring module's
 own `const` bindings — the exact functions the fused closure would call, never
 name-based guesses. Module-qualified callees (`Pkg.f`) resolve through the same
 rule: every path segment must itself be a `const` module binding. Any source
-shape outside this grammar (control flow, a non-`const` global, a call through
-a port, keyword calls other than constant-`dims` reductions) runs as one
-operation, which preserves the original closure semantics unchanged — a
-`cumsum(m; dims = 2)` recipe therefore still computes correctly while re-running
-its allocating twin.
+shape outside this grammar (a loop, a branch whose arms are not straight-line,
+a non-`const` global, a call through a port, keyword calls other than
+constant-`dims` reductions) runs as one operation, which preserves the
+original closure semantics unchanged — a `cumsum(m; dims = 2)` recipe
+therefore still computes correctly while re-running its allocating twin.
 
 The program around these steps is the native program ordinary `prepare`
 compiles: plate chains compose, a plate reduction such as `sum` over an authored
