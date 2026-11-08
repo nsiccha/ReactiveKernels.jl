@@ -134,22 +134,7 @@ function _prune_ungroundable_candidates!(g::Graph, have::Set{ValueId}, cand::Vec
     for vid in sort!(collect(keys(by_value)))
         ids = by_value[vid]
         length(ids) > 1 || continue
-        available = copy(have)
-        changed = true
-        while changed
-            changed = false
-            for rid in cand
-                r = g.recipes[rid]
-                all(input -> canon_id(g, input.id) in available, r.inputs) || continue
-                for output in r.outputs
-                    cid = canon_id(g, output.id)
-                    cid == vid && continue
-                    cid in available && continue
-                    push!(available, cid)
-                    changed = true
-                end
-            end
-        end
+        _, available = _executable_prefix(g, cand, have; withheld = vid)
         for rid in ids
             r = g.recipes[rid]
             all(output -> (cid = canon_id(g, output.id); cid == vid || cid in have),
@@ -172,37 +157,87 @@ mutable struct _Search
     best_cost::Float64
     best_len::Int
     saw_cyclic_complete::Bool
+    # The candidates producing each value, ascending (`candidates` is), and
+    # the recipes the search has selected: a step finds a value's producers
+    # without scanning every candidate, and tests selection without scanning
+    # the selection.
+    producers::Dict{ValueId,Vector{Int}}
+    chosen::Set{Int}
+    # The selection's obligations in order, every want and then each selected
+    # recipe's inputs, and how many selected recipes produce each value: a
+    # step finds its first uncovered obligation without recomputing what the
+    # selection produces and the whole frontier (`_produced`, `_frontier`).
+    obligations::Vector{ValueId}
+    made::Dict{ValueId,Int}
+end
+function _Search(g::Graph, have::Set{ValueId}, want::Vector{ValueId}, candidates::Vector{Int})
+    producers = Dict{ValueId,Vector{Int}}()
+    for rid in candidates, o in g.recipes[rid].outputs
+        ids = get!(Vector{Int}, producers, canon_id(g, o.id))
+        isempty(ids) || last(ids) != rid || continue
+        push!(ids, rid)
+    end
+    _Search(g, have, want, candidates, nothing, Inf, typemax(Int), false, producers, Set{Int}(),
+            copy(want), Dict{ValueId,Int}())
+end
+_made(s::_Search, v::ValueId) = v in s.have || get(s.made, v, 0) > 0
+function _select!(s::_Search, selected::Vector{Int}, rid::Int)
+    push!(selected, rid)
+    push!(s.chosen, rid)
+    r = s.g.recipes[rid]
+    for o in r.outputs
+        cid = canon_id(s.g, o.id)
+        s.made[cid] = get(s.made, cid, 0) + 1
+    end
+    for input in r.inputs
+        push!(s.obligations, canon_id(s.g, input.id))
+    end
+end
+function _unselect!(s::_Search, selected::Vector{Int}, rid::Int)
+    r = s.g.recipes[rid]
+    resize!(s.obligations, length(s.obligations) - length(r.inputs))
+    for o in r.outputs
+        s.made[canon_id(s.g, o.id)] -= 1
+    end
+    delete!(s.chosen, rid)
+    pop!(selected)
 end
 
-# Syntactic coverage by HAVE plus selected outputs, not executable availability.
-function _produced(s::_Search, selected::Vector{Int})
-    p = copy(s.have)
-    for rid in selected, o in s.g.recipes[rid].outputs
-        push!(p, canon_id(s.g, o.id))
+# The candidates producing any value of `frontier` and not yet selected or
+# `excluded`, in candidate order.
+function _frontier_producers(s::_Search, frontier, excluded)
+    found = Int[]
+    for v in frontier
+        append!(found, get(s.producers, v, ()))
     end
-    p
+    filter!(rid -> !(rid in s.chosen) && !(rid in excluded), unique!(sort!(found)))
 end
 
 function _frontier(s::_Search, selected::Vector{Int}, produced::Set{ValueId})
     f = ValueId[]
+    seen = Set{ValueId}()
     for w in s.want
-        (w in produced) || (w in f) || push!(f, w)
+        (w in produced) || (w in seen) || (push!(seen, w); push!(f, w))
     end
     for rid in selected, inp in s.g.recipes[rid].inputs
         cid = canon_id(s.g, inp.id)
-        (cid in produced) || (cid in f) || push!(f, cid)
+        (cid in produced) || (cid in seen) || (push!(seen, cid); push!(f, cid))
     end
     f
 end
 
+# `open`: every obligation before it is covered. The selection only grows below
+# a step, so a child resumes the scan for an uncovered obligation where its
+# parent's ended.
 function _search!(s::_Search, selected::Vector{Int}, cost::Float64,
-                  excluded::Set{Int} = Set{Int}())
+                  excluded::Set{Int} = Set{Int}(), open::Int = 1)
     # Prune: costs are non-negative, so a branch cannot beat the incumbent.
     (cost > s.best_cost) && return
     (cost == s.best_cost && length(selected) >= s.best_len) && return
-    produced = _produced(s, selected)
-    frontier = _frontier(s, selected, produced)
-    if isempty(frontier)
+    while open <= length(s.obligations) && _made(s, s.obligations[open])
+        open += 1
+    end
+    if open > length(s.obligations)
         # Output coverage alone can hide a cycle. Execute the selected prefix
         # from HAVE; only a fully executable selection may become the incumbent.
         order, available = _executable_prefix(s.g, selected, s.have)
@@ -229,20 +264,15 @@ function _search!(s::_Search, selected::Vector{Int}, cost::Float64,
         _, reachable = _executable_prefix(s.g, allowed, s.have)
         all(v -> v in reachable, frontier) || return
     else
-        # Ordinary backward expansion only needs one uncovered obligation.
-        resize!(frontier, 1)
+        # Ordinary backward expansion only needs one uncovered obligation:
+        # the first of the frontier (`_frontier`).
+        frontier = ValueId[s.obligations[open]]
     end
-    alternatives = Int[]
-    for rid in s.candidates
-        (rid in selected) && continue
-        (rid in excluded) && continue
-        any(o -> canon_id(s.g, o.id) in frontier, s.g.recipes[rid].outputs) || continue
-        push!(alternatives, rid)
-    end
+    alternatives = _frontier_producers(s, frontier, excluded)
     for rid in alternatives
-        push!(selected, rid)
-        _search!(s, selected, cost + s.g.recipes[rid].cost, excluded)
-        pop!(selected)
+        _select!(s, selected, rid)
+        _search!(s, selected, cost + s.g.recipes[rid].cost, excluded, open)
+        _unselect!(s, selected, rid)
         # Partition completions by their first included alternative. Later
         # branches exclude earlier alternatives, avoiding factorial revisits
         # of the same subset through different grounding orders.
@@ -266,24 +296,76 @@ end
 # valid order possible. Instead, execute any recipe whose inputs are currently
 # available, adding all of its outputs to the availability frontier.
 # Returns the executable prefix and its available values, including on a stall.
-function _executable_prefix(g::Graph, selected::Vector{Int}, have::Set{ValueId})
+# The order always executes the smallest ready recipe id. Each recipe counts the
+# inputs it still waits for and the ready ones wait in a min-heap, rather than
+# every step rescanning every remaining recipe, which made ordering quadratic.
+# A `withheld` value is never made available (`_prune_ungroundable_candidates!`).
+function _executable_prefix(g::Graph, selected::Vector{Int}, have::Set{ValueId};
+                            withheld::Union{Nothing,ValueId} = nothing)
     available = copy(have)
-    remaining = Set(selected)
+    missing = Dict{Int,Int}()
+    waiting = Dict{ValueId,Vector{Int}}()
+    ready = Int[]
+    for rid in selected
+        haskey(missing, rid) && continue
+        count = 0
+        for input in g.recipes[rid].inputs
+            cid = canon_id(g, input.id)
+            cid in available && continue
+            readers = get!(Vector{Int}, waiting, cid)
+            isempty(readers) || last(readers) != rid || continue
+            push!(readers, rid)
+            count += 1
+        end
+        missing[rid] = count
+        count == 0 && _heap_push!(ready, rid)
+    end
     order = Int[]
-    while !isempty(remaining)
-        ready = sort!([
-            rid for rid in remaining
-            if all(inp -> canon_id(g, inp.id) in available, g.recipes[rid].inputs)
-        ])
-        isempty(ready) && break
-        rid = first(ready)
-        delete!(remaining, rid)
+    while !isempty(ready)
+        rid = _heap_pop!(ready)
         push!(order, rid)
         for output in g.recipes[rid].outputs
-            push!(available, canon_id(g, output.id))
+            cid = canon_id(g, output.id)
+            cid == withheld && continue
+            cid in available && continue
+            push!(available, cid)
+            for reader in get(waiting, cid, ())
+                (missing[reader] -= 1) == 0 && _heap_push!(ready, reader)
+            end
         end
     end
     order, available
+end
+
+# A binary min-heap of ids held in a vector.
+function _heap_push!(heap::Vector{Int}, x::Int)
+    push!(heap, x)
+    i = length(heap)
+    while i > 1
+        parent = i >> 1
+        heap[parent] <= x && break
+        heap[i] = heap[parent]
+        i = parent
+    end
+    heap[i] = x
+    heap
+end
+function _heap_pop!(heap::Vector{Int})
+    top = heap[1]
+    x = pop!(heap)
+    n = length(heap)
+    n == 0 && return top
+    i = 1
+    while true
+        child = 2i
+        child > n && break
+        child < n && heap[child + 1] < heap[child] && (child += 1)
+        heap[child] >= x && break
+        heap[i] = heap[child]
+        i = child
+    end
+    heap[i] = x
+    top
 end
 
 # Full-plan validation still requires every selected recipe to execute.
@@ -300,21 +382,30 @@ end
 # the number of alternative producers when every recipe shares one cost).
 # Returns `nothing` when no complete acyclic selection is reachable this way,
 # in which case planning proceeds exactly as before.
+# Each round covers every obligation open when it starts, so the next round's
+# frontier is the uncovered inputs of the recipes the round selected, in order:
+# the same frontier `_frontier` recomputes from the whole selection.
 function _seed_greedy_incumbent!(s::_Search)
     selected = Int[]
     selected_set = Set{Int}()
     produced = copy(s.have)
+    obligations = copy(s.want)
+    start = 1
     while true
-        frontier = _frontier(s, selected, produced)
+        frontier = ValueId[]
+        seen = Set{ValueId}()
+        for v in view(obligations, start:length(obligations))
+            (v in produced) || (v in seen) || (push!(seen, v); push!(frontier, v))
+        end
+        start = length(obligations) + 1
         isempty(frontier) && break
         progressed = false
         for v in frontier
             v in produced && continue
             best_rid = nothing
             best_key = nothing
-            for rid in s.candidates
+            for rid in get(s.producers, v, ())
                 rid in selected_set && continue
-                any(o -> canon_id(s.g, o.id) == v, s.g.recipes[rid].outputs) || continue
                 key = (s.g.recipes[rid].cost, rid)
                 (best_key === nothing || key < best_key) || continue
                 best_key = key
@@ -325,6 +416,9 @@ function _seed_greedy_incumbent!(s::_Search)
             push!(selected_set, best_rid)
             for o in s.g.recipes[best_rid].outputs
                 push!(produced, canon_id(s.g, o.id))
+            end
+            for input in s.g.recipes[best_rid].inputs
+                push!(obligations, canon_id(s.g, input.id))
             end
             progressed = true
         end
@@ -363,7 +457,7 @@ function plan(g::Graph; have = (), want = ())
     want_ids = [canon_id(g, v.id) for v in wants]
 
     cand_ids = _candidate_recipes(g, have_ids, want_ids)
-    s = _Search(g, have_ids, want_ids, cand_ids, nothing, Inf, typemax(Int), false)
+    s = _Search(g, have_ids, want_ids, cand_ids)
     _seed_greedy_incumbent!(s)
     _search!(s, Int[], 0.0)
 

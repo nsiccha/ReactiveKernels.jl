@@ -245,7 +245,7 @@ end
 Base.@nospecializeinfer function _ad_kernel_call(
         @nospecialize(kernel::PreparedKernel), @nospecialize(args::Tuple),
         ::Val{I}) where {I}
-    kernel = _ad_inline_plate_programs(kernel)
+    kernel = _ad_inline_plate_programs(kernel, I)
     if kernel.f isa _ArrayFunction
         callables = _ad_native_callables(kernel)
         constants = kernel.constants
@@ -2163,14 +2163,16 @@ function prepare_ad(spec::KernelSpec,
                     args...; active, want, bound = NamedTuple(),
                     retain::Tuple = (), warm::Bool = false,
                     native_forward_batch::Bool = false, type_stability = nothing,
-                    type_stability_level = nothing, kwargs...)
-    _with_type_stability(type_stability, type_stability_level) do
-        kernel, resolver, keywords =
-            _ad_spec_boundary(spec, want, bound, kwargs; retain)
-        native_forward_batch ?
-            _prepare_native_forward_batch_ad(kernel, resolver, backend, args,
-                keywords, active; retain, warm) :
-            _prepare_ad(kernel, resolver, backend, args, keywords, active; retain, warm)
+                    type_stability_level = nothing, simplify = nothing, kwargs...)
+    _with_simplify(simplify) do
+        _with_type_stability(type_stability, type_stability_level) do
+            kernel, resolver, keywords =
+                _ad_spec_boundary(spec, want, bound, kwargs; retain)
+            native_forward_batch ?
+                _prepare_native_forward_batch_ad(kernel, resolver, backend, args,
+                    keywords, active; retain, warm) :
+                _prepare_ad(kernel, resolver, backend, args, keywords, active; retain, warm)
+        end
     end
 end
 
