@@ -245,7 +245,7 @@ end
 Base.@nospecializeinfer function _ad_kernel_call(
         @nospecialize(kernel::PreparedKernel), @nospecialize(args::Tuple),
         ::Val{I}) where {I}
-    kernel = _ad_inline_plate_programs(kernel)
+    kernel = _ad_inline_plate_programs(kernel, I)
     if kernel.f isa _ArrayFunction
         callables = _ad_native_callables(kernel)
         constants = kernel.constants

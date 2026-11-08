@@ -16,6 +16,24 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.115
+
+- A generated reverse for summed plate programs, opt-in: with the
+  `plate_reverse` preference set to `"on"`, or inside
+  `with_plate_reverse(f)`, a prepared gradient differentiates each summed plate
+  program with a reverse generated from the program's own code instead of the
+  backend's reverse over its loop. The output adjoint of a sum reaches every
+  cell unchanged, so the reverse is one pass over the cells: each cell runs
+  forward and then its own reverse sweep, shared values' adjoints accumulate
+  across cells, a batched operand's cotangent is added into its shadow at the
+  cell (a gathered operand's shadow scatters it), and invariants hoisted above
+  the loop are swept once after it. Partials come from DiffRules; lazy branches
+  stay lazy. The primal is the program itself, unchanged. A plate the
+  generator does not differentiate keeps the backend's reverse;
+  `plate_reverse_report(kernel)` names, for each plate program, whether it took
+  the generated reverse and otherwise why not.
+- New dependency: DiffRules.
+
 ## 0.1.114
 
 - A plate program (0.1.112) is now only the plate's cell work: its loop, the
