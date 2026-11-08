@@ -778,12 +778,19 @@ only, no ReactiveKernels code) isolate the remaining backend limitations:
   Enzyme's measurement with the same script, the peeled scan takes 1.05 to 1.08
   times the unpeeled one, which takes 1.005 to 1.03 times the inlined hand loop.
   The cause is unknown, and Enzyme stopped there (Enzyme decision `08gyjzn`).
+  From ReactiveKernels 0.1.128 a scan whose step keeps its types, a concrete
+  output type and the seed's carry type, runs without the peel, whose two jobs
+  (typing the output and the carry) it does not need. On Julia 1.10.12 with
+  dogfood `b5daa2ac`, the ARMA cell's generated function then takes 0.96 to
+  1.01 times the inlined hand loop, against 1.05 to 1.11 times before, and the
+  HMM cell 1.01 to 1.02 times, against 1.08 to 1.10. The washout cell is
+  unchanged at 0.99 to 1.02 times its hand loop.
   On Julia 1.12 and 1.13 the reverse pass rebuilds each path's gathered slice
   and output instead of keeping them (Enzyme todo `1nw1luu`). There, on
   dogfood `439590b1` with Julia 1.12.7, the Enzyme-only washout shape costs 1.11
   to 1.23 times and the RK cells 0.79 to 0.99 times the hand loop.
   `repro_enzyme_nested_loop_reverse.jl` and `repro_enzyme_peeled_loop_reverse.jl`
   reproduce each shape with Enzyme only. `scan_plate_cell_reverse.jl` measures
-  the RK cells against their hand loops. RK's lowering is unchanged: the costs
-  that were located were Enzyme's and are repaired there, and the peeled scan's
-  remaining cost has no located cause.
+  the RK cells against their hand loops. RK's plate lowering is unchanged: the
+  costs located in its loop nests were Enzyme's and are repaired there. The
+  peel's cost has no located cause; RK drops the peel where it does no work.

@@ -417,8 +417,11 @@ rejects it (`EnzymeRuntimeActivityError`;
 keeps the branch as authored. Registered Enzyme 0.13.216 still rejects it on
 Julia 1.10; the Enzyme dogfood line differentiates it from `d2892e7`, which
 gives a fresh allocation that no active data reaches a zero shadow (see
-`constraints.md`, the lazy branch whose arms differ in activity). Native scans
-iterate the indices after their peeled first step as a unit range. Iterating
+`constraints.md`, the lazy branch whose arms differ in activity). A native scan
+whose step keeps its types, a concrete output type and the seed's carry type,
+runs every step in one loop over its indices (from ReactiveKernels 0.1.128).
+Any other native scan runs its first step before the loop, to type its result
+or its carry, and iterates the indices after it as a unit range. Iterating
 them with `Iterators.drop` made Enzyme raise `OutOfMemoryError` from the
 second outer step on whenever the inner sequence was empty and the same at
 every outer step (`benchmark/repro_enzyme_guarded_inner_loop_cache.jl`).

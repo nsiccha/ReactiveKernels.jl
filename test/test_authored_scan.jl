@@ -739,3 +739,50 @@ end
     @test ReactiveKernels._inline_shifted_local(Symbol("#p_α#op1"), 2) ===
           Symbol("#p_α#op3")
 end
+
+@testset "a scan peels its first step only when that step changes the types" begin
+    unpeeled = ReactiveKernels._scan_unpeeled
+    @test unpeeled(Float64, Float64, 0.0)
+    @test !unpeeled(Float64, Float64, 0)          # an Int seed becomes a Float64 carry
+    @test !unpeeled(Float64, Real, 0.0)           # no concrete output type
+    @test !unpeeled(Any, Float64, 0.0)            # the carry is not inferred
+    nt = (; previous = 0.0, error = 0.0)
+    @test unpeeled(typeof(nt), Float64, nt)
+
+    # The host scan loop decides from the types inference gives the step.
+    step(c, x) = (c + x, float(c))
+    @test ReactiveKernels._scan_step_types(step, Float64, Float64) == (Float64, Float64)
+    @test ReactiveKernels._scan_step_types(step, Int, Float64) == (Float64, Float64)
+    xs = [1.0, 2.0, 3.0]
+    for seed in (0.0, 0)                          # unpeeled, then peeled
+        @test ReactiveKernels._scan_loop(step, seed, (xs,), ()) == [0.0, 1.0, 3.0]
+        @test ReactiveKernels._scan_loop(step, seed, (xs,), (), Val(true)) ==
+            [0.0, 0.0, 1.0, 3.0]
+        @test ReactiveKernels._scan_loop(step, seed, (Float64[],), ()) == Float64[]
+        @test ReactiveKernels._scan_loop(step, seed, (Float64[],), (), Val(true)) == [0.0]
+        history_step(c, x, h) = (c + x, c + x)
+        @test ReactiveKernels._scan_history_loop(history_step, seed, 0.0, (xs,), ()) ==
+            [1.0, 3.0, 6.0]
+    end
+
+    # Generated code carries the same decision; both arms give the reference.
+    q = [0.2, 0.7, -0.3]
+    k = prepare(authored_scan_arma; want = :errors)
+    @test occursin("_scan_unpeeled", string(code_expr(k)))
+    for series in (Float64[], [0.5], sin.(1:9))
+        @test k(q, series) ≈ _authored_scan_reference(q, series)
+    end
+    @kernel retyped_carry_scan(xs) = begin
+        running = scan(xs; init = 0) do carry, x
+            next = carry + x
+            (next, 2next)
+        end
+        return running
+    end
+    retyped = prepare(retyped_carry_scan)
+    @test retyped([0.5, 1.0, 2.0]) == [1.0, 3.0, 7.0]
+    @test retyped([1, 2, 3]) == [2, 6, 12]
+    @test only(Base.return_types(retyped, Tuple{Vector{Float64}})) == Vector{Float64}
+    @test only(Base.return_types(k, Tuple{Vector{Float64},Vector{Float64}})) ==
+        Vector{Float64}
+end

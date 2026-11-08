@@ -63,6 +63,34 @@ end
     return objective
 end
 
+# An `Int` seed whose carry becomes `Float64` keeps the peeled first step
+# (`_scan_unpeeled`); the same scan seeded with `0.0` runs every step in its loop.
+@kernel summed_retyped(xs, gain) = begin
+    history = scan(xs; init=0) do carry, x
+        next = carry + x*gain
+        (next, next)
+    end
+    total = sum(history)
+    return total
+end
+
+@testset "a scan whose carry changes type keeps ordinary reverse AD" begin
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    gain = 0.7
+    for n in (0, 1, 5)
+        xs = sin.(1:n)
+        prefix = cumsum(xs)
+        for kernel in (summed, summed_retyped)
+            k = prepare(kernel; want=:total)
+            ad = prepare_ad(k, backend, xs, gain; active=:gain)
+            got, gradient = ad_value_and_gradient(ad, xs, gain)
+            @test k(xs, gain) ≈ gain*sum(prefix) atol=1e-12
+            @test got ≈ gain*sum(prefix) atol=1e-12
+            @test gradient ≈ sum(prefix) atol=1e-12
+        end
+    end
+end
+
 @testset "empty scans keep ordinary reverse AD" begin
     backend = AutoEnzyme(; mode=Enzyme.Reverse)
     gain = 0.7
