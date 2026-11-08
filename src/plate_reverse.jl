@@ -148,6 +148,8 @@ function _pr_flatten!(stmts::Vector{Any}, ex, ctx::_PRCtx)
         return nothing
     elseif Meta.isexpr(ex, :call)
         f, fref = _pr_resolve_lenient(ex.args[1], ctx)
+        expanded = _pr_expand_stable_helper(f, ex.args[2:end], ctx)
+        expanded === nothing || return _pr_flatten!(stmts, expanded, ctx)
         args = Any[_pr_flatten!(stmts, a, ctx) for a in ex.args[2:end]]
         lhs = _pr_tmp!(ctx)
         push!(stmts, _PRCall(lhs, f, fref, args))
@@ -171,6 +173,85 @@ function _pr_flatten!(stmts::Vector{Any}, ex, ctx::_PRCtx)
         return lhs
     end
     _pr_fail("unsupported expression `$(sprint(show, ex))`")
+end
+
+# A stable-rewrite helper call (`_rk_log_of(_native_exp, u)`, emitted by
+# `src/stable_rewrites.jl`) expanded into the body of the method its operands
+# select, read from Julia's lowered code of that method: the helper is its own
+# single source, and the primitives of its stable form (`float`, `log1pexp`,
+# `expm1`, …) take their partials as any other call does. An operand the
+# generator cannot type is a cell value, which this generator takes to be a
+# real scalar throughout (`Float64` selects the same `Real` method). Returns
+# `nothing` for any other call, and for a method body with control flow, which
+# then keeps the helper call (and fails only if its derivative is needed).
+function _pr_expand_stable_helper(f, argexprs, ctx::_PRCtx)
+    f isa Function && any(h -> h === f, _RK_STABLE_HELPERS) || return nothing
+    types = Any[_pr_operand_type(a, ctx) for a in argexprs]
+    match = Base._which(Tuple{typeof(f),types...})
+    cis = Base.code_lowered(f, Tuple{types...})
+    length(cis) == 1 || return nothing
+    ci = only(cis)
+    block = Any[]
+    slots = Dict{Int,Any}(1 => f)
+    for (i, a) in enumerate(argexprs)
+        s = _pr_tmp!(ctx, :rw_arg)
+        push!(block, :($s = $a))
+        slots[i + 1] = s
+    end
+    ssa = Dict{Int,Any}()
+    function conv(x)
+        x isa Core.SSAValue && return ssa[x.id]
+        x isa Core.SlotNumber && return slots[x.id]
+        x isa Core.Argument && return slots[x.n]
+        Meta.isexpr(x, :static_parameter) && return match.sparams[x.args[1]]
+        x isa Expr && return Expr(x.head, Any[conv(a) for a in x.args]...)
+        x
+    end
+    for (k, st) in enumerate(ci.code)
+        if st isa Core.ReturnNode
+            isdefined(st, :val) || return nothing
+            push!(block, conv(st.val))
+            return Expr(:block, block...)
+        elseif st isa Union{Core.GotoNode,Core.GotoIfNot} || Meta.isexpr(st, :enter) ||
+               Meta.isexpr(st, :leave)
+            return nothing
+        elseif st === nothing || st isa Core.NewvarNode || Meta.isexpr(st, :meta) ||
+               Meta.isexpr(st, :inbounds) || Meta.isexpr(st, :loopinfo)
+            ssa[k] = nothing
+        elseif Meta.isexpr(st, :(=), 2) && st.args[1] isa Core.SlotNumber
+            s = _pr_tmp!(ctx, :rw)
+            push!(block, :($s = $(conv(st.args[2]))))
+            slots[st.args[1].id] = s
+            ssa[k] = s
+        elseif Meta.isexpr(st, :call, 3) && st.args[1] == GlobalRef(Base, :getproperty) &&
+               st.args[2] isa GlobalRef && st.args[3] isa QuoteNode &&
+               isdefined(st.args[2].mod, st.args[2].name) &&
+               getglobal(st.args[2].mod, st.args[2].name) isa Module
+            # `M.f`, a module member: the reference itself.
+            ssa[k] = GlobalRef(getglobal(st.args[2].mod, st.args[2].name), st.args[3].value)
+        elseif Meta.isexpr(st, :call)
+            s = _pr_tmp!(ctx, :rw)
+            push!(block, :($s = $(conv(st))))
+            ssa[k] = s
+        else
+            ssa[k] = conv(st)
+        end
+    end
+    nothing
+end
+
+# The type of a helper operand as the generator can know it: a constant
+# (function, literal, `Val(k)`), else a real scalar cell value.
+function _pr_operand_type(a, ctx::_PRCtx)
+    a isa Number && return typeof(a)
+    if a isa GlobalRef
+        isdefined(a.mod, a.name) && return typeof(getglobal(a.mod, a.name))
+    elseif a isa Symbol && haskey(ctx.values, a)
+        return typeof(ctx.values[a])
+    elseif Meta.isexpr(a, :call, 2) && a.args[1] == GlobalRef(Base, :Val) && a.args[2] isa Integer
+        return Val{a.args[2]}
+    end
+    Float64
 end
 
 # ---------------------------------------------------------------- partials
@@ -205,6 +286,8 @@ function _pr_result_partials(f, y, args)
         return Any[p == 2 ? :(2 * $(args[1])) : :($p * $(args[1])^$(p - 1)), nothing]
     end
     f === Base.float && return Any[1.0]
+    # `convert(T, x)` to a float type (a stable form's `_rw_float`).
+    f === Base.convert && length(args) == 2 && return Any[nothing, 1.0]
     if f === Base.:*
         # n-ary product: ∂/∂a_k = ∏_{j≠k} a_j
         return Any[length(args) == 2 ? args[3-k] :
@@ -281,7 +364,8 @@ function _pr_activity!(active::Set{Symbol}, stmts)
         if s isa _PRAlias
             s.rhs isa Symbol && s.rhs in active && push!(active, s.lhs)
         elseif s isa _PRCall
-            s.f in _PR_NONDIFF && continue
+            # `_rw_float` computes a stable form's float type.
+            (s.f in _PR_NONDIFF || s.f === _rw_float) && continue
             any(a -> a isa Symbol && a in active, s.args) && push!(active, s.lhs)
         elseif s isa _PRBranch
             _pr_activity!(active, s.then_stmts)

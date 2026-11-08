@@ -1199,7 +1199,11 @@ every cell unchanged, so that reverse is one pass over the cells:
 Each call's partials come from DiffRules, the table ForwardDiff and
 ReverseDiff use, or for a call whose derivative reads its own result (`exp`,
 `sqrt`) and for RK's own arithmetic, from the generator's spelling through
-that result. No rule attaches to a function this repository does not own. Lazy
+that result. A stable rewrite's helper call (`_rk_log_of(exp, u)` for
+`log(exp(u))`, see "Stable rewrites" above) is expanded into the method its
+operands select, read from that method's lowered code, so its stable form's
+primitives take their partials in the same way. No rule attaches to a function
+this repository does not own. Lazy
 branches stay lazy: each arm's reverse runs inside that arm, under the
 condition the forward stored. The primal is the program itself, so values are
 unchanged.

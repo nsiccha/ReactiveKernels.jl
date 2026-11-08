@@ -69,6 +69,58 @@ _prv_rules(report) = count(r -> last(r) == "rule", report)
         @test any(r -> first(r) === :_ppl_lik_y_resp && last(r) == "rule", report)
     end
 
+    @testset "stable rewrites: sigma = exp(u) at the edges of exp" begin
+        # The stable rewrites (on by default) compute the Normal law's
+        # log(scale) of sigma = exp(u) as a `_rk_*_of` helper call. The
+        # generated reverse expands each helper into the method its operands
+        # select (todo 0mcy364), so the plate keeps the rule, and its gradient
+        # follows the stable form where exp(u) overflows or underflows.
+        rng = MersenneTwister(12)
+        N, J = 7, 3
+        x = _prv_stdz(randn(rng, N))
+        g = [mod1(i, J) for i in 1:N]
+        y = 1 .+ 0.5 .* x .+ (0.7 .* randn(rng, J))[g] .+ randn(rng, N)
+        built, bound = _prv_build(quote
+            a ~ Normal(0, 5)
+            b ~ Normal(0, 1)
+            sd ~ Exponential(1)
+            sigma ~ Exponential(1)
+            z[1:J] .~ Normal.(0, 1)
+            mu = a .+ b .* x .+ sd .* z[g]
+            y .~ Normal.(mu, sigma)
+        end, Dict(:y => y, :x => x, :g => g, :J => J), (:y, :x, :g, :J))
+        k = findfirst(==(:sigma), coordinate_names(built.layout))
+        @test k !== nothing
+        n = built.layout.total
+        p0 = 0.4 .* randn(MersenneTwister(3), n)
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)
+        q0 = with_plate_reverse(false) do
+            prepare_sampler(built, bound, p0; backend)
+        end
+        q1 = with_plate_reverse(true) do
+            prepare_sampler(built, bound, p0; backend)
+        end
+        report = with_plate_reverse(true) do
+            plate_reverse_report(q1.kernel)
+        end
+        @test any(r -> first(r) === :_ppl_lik_y_resp && last(r) == "rule", report)
+        same(a, b) = isequal(a, b) || isapprox(a, b; rtol = 1e-9, atol = 1e-12)
+        g0, g1 = similar(p0), similar(p0)
+        # At u = ±800 the Exponential(1) prior's own -exp(u) term over- or
+        # underflows whatever the likelihood does, so there the rule is held
+        # to the backend's value and gradient only; where the model is finite,
+        # so must the gradient be.
+        for u in (-800.0, -40.0, 0.5, 700.0, 800.0)
+            p = copy(p0)
+            p[k] = u
+            v0, _ = sampler_value_and_gradient!(q0, g0, p)
+            v1, _ = sampler_value_and_gradient!(q1, g1, p)
+            @test isequal(v1, v0) || isapprox(v1, v0; rtol = 1e-12)
+            @test all(same.(g1, g0))
+            abs(u) < 800 && @test all(isfinite, g1)
+        end
+    end
+
     @testset "gauss_fe: design product feeding the plate" begin
         rng = MersenneTwister(11)
         N, K = 300, 3
