@@ -487,6 +487,13 @@ numbers: another binding of the same build reuses the compiled density and
 gradient, and each query still owns its buffers. Native forward batching does
 not apply, and ReactiveKernels does not build retained outputs over a
 non-allocating kernel yet, so `retain` fails there.
+
+A program that factors a sampled covariance (`MvNormal` with a computed
+covariance, such as a Gaussian process) keeps the non-allocating density but
+differentiates the ordinary program, and its gradient allocates what the
+ordinary gradient does. With every array of that density reused, reverse mode
+must tape them, because it cannot prove one buffer disjoint from another:
+the gradient took 1.4 to 3 times the ordinary one.
 """
 function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real};
         backend, on_error = nothing, retain::Tuple = (), warm::Bool = false,
@@ -507,19 +514,35 @@ function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real}
             (workflow_wants(:sampler), wants...); on_error,
             exemplars = exemplar)), wants
     end
+    # A factored sampled covariance differentiates the ordinary program.
+    ordinary_gradient = nonallocating && isempty(wants) && _factors_covariance(kern)
     if nonallocating
-        kern = Base.invokelatest(ReactiveKernels.prepare_nonallocating, kern, u)
-        gradient_kernel = isempty(wants) ? kern :
-            Base.invokelatest(ReactiveKernels.prepare_nonallocating, gradient_kernel, u)
+        density_kernel = Base.invokelatest(ReactiveKernels.prepare_nonallocating, kern, u)
+        ordinary_gradient || (gradient_kernel = isempty(wants) ? density_kernel :
+            Base.invokelatest(ReactiveKernels.prepare_nonallocating, gradient_kernel, u))
+        kern = density_kernel
     end
     # The non-allocating `prepare_ad` method takes no forward-batching keyword.
-    forward = nonallocating ? (;) : (; native_forward_batch = native_forward_batch &&
+    forward = nonallocating && !ordinary_gradient ? (;) :
+        (; native_forward_batch = native_forward_batch &&
         isempty(wants) && ReactiveKernels._native_forward_batch_eligible(
             backend, gradient_kernel, u))
     prep = Base.invokelatest(prepare_ad, gradient_kernel, backend,
         u; active = :unconstrained, retain = wants, warm, forward...)
     return SamplerQuery(kern, prep, layout)
 end
+
+# Whether a program factors a covariance: a recipe, in any plate or scan body,
+# calls the `MvNormal` slices density, whose `@traceable` body calls
+# `_covariance_cholesky`. `prepare_sampler` keeps its gradient on the ordinary
+# program under `nonallocating = true` (decision `0tqz3lo`): the covariance, its
+# factor and its solved margins would otherwise all sit in reused buffers that
+# reverse mode tapes, as `Enzyme.API.printperf!` reports.
+_source_mentions(ex, name::Symbol) = ex === name ||
+    (ex isa Expr && any(a -> _source_mentions(a, name), ex.args))
+_factors_covariance(kernel) = any(entry ->
+        _source_mentions(entry.recipe.source, :_mvnormal_slices_logpdf),
+    ReactiveKernels.recipe_inventory(kernel))
 
 # The WANT nodes for retained presets. The sampler density is the gradient's
 # own value, so it is not a retained output.

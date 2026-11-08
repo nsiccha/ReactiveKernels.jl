@@ -134,18 +134,20 @@ end
 
 function prepare!(cache::PreparationCache, g::Graph; have = (), want = (),
                   passes = (), bound = (), on_error = nothing, type_stability = nothing,
-                  type_stability_level = nothing)
+                  type_stability_level = nothing, simplify = nothing)
     # One type for every selection's width before the closures capture them.
     haves, wants, binding = _value_list(have), _value_list(want), _bound_list(bound)
-    _with_type_stability(type_stability, type_stability_level) do
-        binding === () || return _prepare_bound!(cache, g, haves, wants, passes, binding,
-                                                 objectid(g); on_error)
-        key = (objectid(g), g.version, _sig(g, haves), _sig(g, wants),
-               Tuple(objectid(p) for p in passes), on_error, _type_stability(),
-               _type_stability_level(), _plan_mode())
-        lock(cache.lock) do
-            get!(cache.kernels, key) do
-                prepare(g; have = haves, want = wants, passes = passes, on_error = on_error)
+    _with_simplify(simplify) do
+        _with_type_stability(type_stability, type_stability_level) do
+            binding === () || return _prepare_bound!(cache, g, haves, wants, passes, binding,
+                                                     objectid(g); on_error)
+            key = (objectid(g), g.version, _sig(g, haves), _sig(g, wants),
+                   Tuple(objectid(p) for p in passes), on_error, _type_stability(),
+                   _type_stability_level(), _plan_mode(), _simplify())
+            lock(cache.lock) do
+                get!(cache.kernels, key) do
+                    prepare(g; have = haves, want = wants, passes = passes, on_error = on_error)
+                end
             end
         end
     end
@@ -206,7 +208,7 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     # the same graph and binding.
     key = (:bound, graph_key, g.version, _sig(g, have), _sig(g, want),
            _sig(g, ports), Tuple(_pass_key(p) for p in passes), on_error,
-           _type_stability(), _type_stability_level(), _plan_mode())
+           _type_stability(), _type_stability_level(), _plan_mode(), _simplify())
     # Locked blocks, not `lock(...) do` closures: a closure's type holds the
     # types it captures (here the signatures in `key`, and below the hoisted
     # values), so it compiled once per program and width.
