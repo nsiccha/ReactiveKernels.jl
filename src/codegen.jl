@@ -4471,11 +4471,12 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         end
         if nonempty || isempty(invariants.args)
             program ? push!(body.args, _plate_block(execution,
-                                                    nonempty ? nothing : has_cells)) :
+                                                    nonempty ? nothing : has_cells,
+                                                    output_axes)) :
                 append!(body.args, execution.args)
         else
             push!(body.args, Expr(:if, has_cells,
-                program ? _plate_block(execution) : execution))
+                program ? _plate_block(execution, nothing, output_axes) : execution))
         end
     end
     # Fallback runtime narrowing of the pointwise container. `plate_eltype`
@@ -4917,6 +4918,7 @@ end
 # lowering left the block unguarded, which as inline code it needs no guard.
 struct _PlateBlock
     condition::Any
+    axes::Union{Symbol,Nothing}   # the body's name for the plate's axes, if known
 end
 
 """
@@ -4928,10 +4930,15 @@ the compiled function; `code_expr` prints its code.
 """
 struct _PlateProgram
     ast::Expr
+    # The body's name for the plate's axes when the program is the plate's cell
+    # work (`_PlateBlock`), else `nothing`; see `_inline_plate_programs`.
+    axes::Union{Symbol,Nothing}
 end
+_PlateProgram(ast::Expr) = _PlateProgram(ast, nothing)
 Base.show(io::IO, program::_PlateProgram) = print(io, '(', program.ast, ')')
-Base.:(==)(a::_PlateProgram, b::_PlateProgram) = a.ast == b.ast
-Base.hash(program::_PlateProgram, h::UInt) = hash(program.ast, hash(_PlateProgram, h))
+Base.:(==)(a::_PlateProgram, b::_PlateProgram) = a.ast == b.ast && a.axes === b.axes
+Base.hash(program::_PlateProgram, h::UInt) =
+    hash(program.ast, hash(program.axes, hash(_PlateProgram, h)))
 # A plate program is a value: nothing changes its expression once it is built.
 # A deep copy of a body keeps the program itself, so the copy compares equal on
 # Julia 1.13, whose `Expr` comparison takes a leaf that is not an expression by
@@ -4958,8 +4965,8 @@ end
 # refuses past 32 with a warning.
 const _PLATE_CALL_MAX_ARGUMENTS = 64
 
-_plate_block(block::Expr, condition = nothing) =
-    Expr(:block, _PlateBlock(condition), block.args...)
+_plate_block(block::Expr, condition = nothing, axes = nothing) =
+    Expr(:block, _PlateBlock(condition, axes), block.args...)
 _is_plate_block(node) = node isa Expr && node.head === :block &&
     !isempty(node.args) && first(node.args) isa _PlateBlock
 _has_plate_block(node) = _is_plate_block(node) ||
@@ -5151,7 +5158,8 @@ function _extract_plate_programs(ast::Expr)
             length(outputs) == 1 ? only(outputs) : Expr(:tuple, outputs...)
         program = _PlateProgram(Expr(:function,
             Expr(:tuple, free..., (last(pair) for pair in slots)...),
-            Expr(:block, redeclared..., rewritten..., result)))
+            Expr(:block, redeclared..., rewritten..., result)),
+            first(block.args).axes)
         call = Expr(:call, program, free..., (copy(first(pair)) for pair in slots)...)
         call = isempty(outputs) ? call :
             Expr(:(=), length(outputs) == 1 ? only(outputs) : Expr(:tuple, outputs...), call)
@@ -5178,14 +5186,29 @@ end
 function _inline_plate_programs(node, declared::Set{Symbol})
     if node isa Expr && node.head === :(=) && node.args[2] isa Expr &&
             node.args[2].head === :call && first(node.args[2].args) isa _PlateProgram
-        return _inline_plate_program(node.args[2], declared)
+        return _plate_program_or_inline(node, node.args[2], declared)
     elseif node isa Expr && node.head === :call && first(node.args) isa _PlateProgram
-        return _inline_plate_program(node, declared)
+        return _plate_program_or_inline(node, node, declared)
     elseif node isa Expr && node.head !== :quote
         return Expr(node.head, Any[_inline_plate_programs(arg, declared) for arg in node.args]...)
     end
     node
 end
+# A program over a plate's cells is differentiated through its call when the
+# plate has many cells and inline when it has few: through the call its loop
+# vectorizes in the gradient as in the primal, while each call costs native
+# Reverse a fixed amount that a small plate does not repay (snag
+# `sampler-type-dif-ea945700`). A program whose axes the body does not name
+# (a whole plate lowered another way) stays inline.
+function _plate_program_or_inline(node::Expr, call::Expr, declared::Set{Symbol})
+    inline = _inline_plate_program(call, declared)
+    axes = (first(call.args)::_PlateProgram).axes
+    axes === nothing && return inline
+    Expr(:if, Expr(:call, GlobalRef(@__MODULE__, :_plate_ad_inline), axes), inline, node)
+end
+const _PLATE_AD_PROGRAM_CELLS = 64
+@inline _plate_ad_inline(axes) = length(CartesianIndices(axes)) < _PLATE_AD_PROGRAM_CELLS
+
 # A program declares again a name the body declares (`_extract_plate_programs`);
 # inline, the body's own declaration stands, and a second typed one would not
 # compile.
