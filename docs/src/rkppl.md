@@ -855,7 +855,11 @@ matrix of known size: the cells read `b`'s column in place. An undotted
 call inside dotted arithmetic runs once before the broadcast, as Julia runs
 it, so `exp(log_sd) .* z[g]` and `X * beta .+ b[g, 1]` fuse too. The design
 product `X * beta` stays one product of observation length, and the cells
-read its entries. Unbound indices and opaque
+read its entries. A factor term of an affine predictor, `c[g]` in
+`mu = a .+ b .* x .+ c[g]` with `c[levels(g)]` declared, reads its
+coefficients by level code as well, one gather per row, never through a
+matrix of full-rank dummies. A row whose label is not on the factor's axis
+contributes zero. Unbound indices and opaque
 array results keep unknown dimensions. Known dimensions enable fusion;
 other matrix gathers and sums can still materialize.
 
