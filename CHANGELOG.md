@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.119
+## 0.1.120
 
 - A derivative rule whose data input is a structure (a record or tuple holding
   arrays) differentiates in a planned partition body of
@@ -31,6 +31,43 @@ are recorded in the git history only.
   inline. A child kernel prepared for a lazy arm forwarded its operands the same
   way and failed the same way with a rule in its body; it has the same methods
   (snag `derivativerule-r-0d7e245c`).
+
+## 0.1.119
+
+- New, opt-in: `branch_arms = :all`, a `prepare` keyword and the
+  `[ReactiveKernels]` preference `branch_arms = "all"` in a project's
+  `LocalPreferences.toml` (default `"taken"`, today's behaviour). With it, a
+  plate cell's lazy branch whose condition reads bound data keeps one prepared
+  program whichever arms the binding's lanes take. Every arm is a plate, over
+  no lanes when none takes it, and a domain of no lanes is split too, so data
+  whose lanes all take one arm, or that has none, prepares the program a mixed
+  binding prepares: an RKPPL censored response with a bound scale keeps one
+  sampler type whether its rows are all observed, all censored, mixed or
+  absent. An arm without lanes evaluates nothing: it calls no plate program,
+  its shared work stays behind the plate's nonempty guard, and its work over
+  bound values, such as `log(s)` of a bound scale, is not run at preparation,
+  so an invalid value on an arm no lane takes still never throws. An arm of one
+  lane splits a nested branch as arms of more lanes or none do. Reassembling a
+  pointwise vector whose lanes all took one arm skips the gather. A gradient
+  differentiates a plate program over 64 cells or more through its call, so
+  its loop vectorizes, and a smaller one inline. Values and gradients are
+  unchanged.
+- Its cost, measured on gordito against 0.1.114: an RKPPL censored response
+  over 10 rows, all observed, takes 48 ns per density and 171 ns per sampler
+  gradient (31 and 82 ns by default), and over 200 rows 106 and 613 ns (60 and
+  482 ns). Over 2000 rows it costs what the default does, and several Normal
+  likelihoods over 2000 rows each take 28–33% less per gradient. Every arm is
+  compiled: that model's first gradient over 200 rows took 29.5 s (14.7 s).
+- This is 0.1.110's change (reverted in 0.1.111), now opt-in on the user's
+  decision; by default nothing changes. A condition that reads bound numbers
+  alone still selects its arm at preparation, and a bound singleton beside
+  live arguments of unknown length (a plate of one row) still prepares its own
+  program. With the generated plate reverse on as well (`with_plate_reverse`),
+  an eligible program takes its rule either way.
+- Fixed: a plate program no longer treats a named-tuple field's or a keyword's
+  name as a variable. Since 0.1.113, a body with two or more plates whose cells
+  built `(location = m, scale = s)` could raise ``UndefVarError: `location` not
+  defined``, as an RKPPL `:observations` query over a ragged plate did.
 
 ## 0.1.118
 

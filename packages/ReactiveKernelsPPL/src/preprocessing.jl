@@ -212,6 +212,40 @@ function _scalar_column_plate_eligible(plan::StructuralPlan, pred::PredictorSpec
     end
 end
 
+# A predictor with a factor term reads that term's coefficients by level code
+# (`_factor_gather_terms!`): one gather per row. Its full-rank dummies would
+# make the design product an N×J matrix product in every evaluation. Each of
+# its intercept, covariate and factor terms reads its own declared parameter,
+# so the program holds no coefficient position, which would grow with a
+# factor's level count. Matrix terms keep the design path, and so does a
+# factor whose axis may leave a row off it (`_factor_axis_covers_rows`).
+function _factor_gather_affine(plan::StructuralPlan, pred::PredictorSpec)
+    any(t -> t.kind === FactorTerm, pred.terms) || return false
+    return all(pred.terms) do t
+        t.kind in (InterceptTerm, ContinuousTerm, FactorTerm, MatrixTerm) || return true
+        t.kind !== MatrixTerm && _parameter_term(t) || return false
+        t.kind !== FactorTerm || _factor_axis_covers_rows(plan, pred, t)
+    end
+end
+
+# Whether every row's label of a factor term lies on its axis, so its level
+# code (`_declared_codes`) is a position of the coefficient vector: the axis
+# is its own column's complete label set. `unique` and a values axis hold
+# every entry, and `levels` every entry that is not `missing`. A row off a
+# subset of the axis contributes zero (`_validate_levelmaps_data`) and keeps
+# the design path, as a column that may hold `missing` does.
+function _factor_axis_covers_rows(plan::StructuralPlan, pred::PredictorSpec,
+        t::TermSpec)
+    col = only(t.columns)
+    m = _find_levelmap(plan.levelmaps, pred.name, col)
+    m === nothing && return false
+    m.subset === Colon() || return false
+    m.source in (:unique, :values) && return true
+    m.source === :levels || return false
+    x = get(plan.columns, col, nothing)
+    return x isa AbstractVector && !(Missing <: eltype(x))
+end
+
 # Affine predictors with singleton, non-vector or live derived operands
 # use per-block coefficient expressions. This retains
 # Julia's broadcast axes and avoids mixing bound and active columns in a
@@ -226,6 +260,7 @@ function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
         !any(r -> r.mi_jobs !== nothing, plan.responses) && return true
     _uses_structured_observation_axes(plan) && return false
     _scalar_valued_predictor(plan, pred) && return true
+    _factor_gather_affine(plan, pred) && return true
     # An intercept added to a vector expression remains a scalar broadcast.
     # Turning it into a ones-column matrix product creates a needless GEMV
     # and its reverse-mode tape, even when the other summand is already a

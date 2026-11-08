@@ -883,6 +883,31 @@ An empty bound domain has no lanes to group. It runs no cell and evaluates no
 condition. Its result is empty, with the element type inferred from the
 authored native cell, as in Julia's empty broadcast.
 
+So by default the prepared program follows this binding's outcomes: data that
+moves every lane into one arm, or an empty domain, prepares another program
+than a binding whose lanes take both arms. With `branch_arms = :all` (from
+ReactiveKernels 0.1.119, opt-in) every arm is a plate, over no lanes for an arm
+no lane takes, and an empty domain is split too, so one program serves every
+binding of a cell: an RKPPL censored response keeps one sampler type whether
+its rows are all observed, all censored, mixed or absent. An arm without lanes
+evaluates nothing: it calls no plate program, its shared work stays behind its
+plate's nonempty guard, and its work over bound values is not run at
+preparation. An arm of one lane splits a nested branch as arms of more lanes
+or none do. The setting is the `[ReactiveKernels]` preference `branch_arms`
+(`"taken"`, the default, or `"all"`) in a project's `LocalPreferences.toml`,
+read at the first preparation of a process, or `prepare`'s `branch_arms`
+keyword (`:taken` or `:all`), which governs every preparation inside it. Under
+`:all` a gradient also differentiates a plate program over 64 cells or more
+through its call, so its loop vectorizes, and a smaller one inline.
+
+The arms no lane takes cost a small model each call: gordito, an RKPPL censored
+response over 10 rows, all observed, took 48 ns per density and 171 ns per
+sampler gradient against 31 and 82 ns by default, and over 200 rows 106 ns and
+613 ns against 60 and 482 ns. Over 2000 rows the cost vanishes, and several
+likelihoods over 2000 rows each take 28–33% less per gradient. Every arm is
+compiled: a first gradient of that model over 200 rows took 29.5 s against
+14.7 s.
+
 The number of arm plates is bounded by the cell's branch structure, never by
 the data. A condition that reads a live value stays an ordinary lazy branch.
 This includes the shape of a live array, such as `length(c)` of a runtime

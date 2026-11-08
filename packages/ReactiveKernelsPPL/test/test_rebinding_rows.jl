@@ -309,3 +309,88 @@ end
     @test_throws "in the data arguments" prepare_query(
         build_kernel(scalar() | (; y)), scalar() | (; y = [1, 2, 3]), :likelihood)
 end
+
+# A censored response with a bound scale per row partitions its rows by the
+# guards it is written with (`sig > 0`, `y < lim`, `y <= lim`). With
+# ReactiveKernels' `branch_arms = :all` (its `[ReactiveKernels]` preference;
+# here the scope the preference sets) every arm is a plate, also one no row
+# takes: one program and one sampler type serve rows that are all observed,
+# all censored, a mix, or none (RK 0.1.119, snag `sampler-type-dif-ea945700`:
+# ODL's soil rows all detected, or all below their detection limit, compiled
+# the sampler again). By default a binding whose rows all take one arm
+# prepares a program of its own.
+@testset "censored rows: one sampler type whichever rows are censored" begin
+    ReactiveKernels._with_branch_arms(:all) do
+        m = @rkppl begin
+            mu ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            y .~ censored.(Normal.(mu .+ b .* x, sig), lim, Inf)
+        end
+        x = [0.1, -0.3, 0.4, 0.2]
+        sig = [0.7, 1.1, 0.9, 1.3]
+        y = [0.5, -1.0, 1.2, 0.3]
+        cases = (; mixed = [-5.0, -1.0, 0.0, -2.0], observed = fill(-5.0, 4),
+                 censored = copy(y))
+        u = [0.2, -0.1]
+        density(nt, x, sig, y, lim) = logpdf(Normal(0, 1), nt.mu) + logpdf(Normal(0, 1), nt.b) +
+            sum((yi <= li ? logcdf : logpdf)(Normal(nt.mu + nt.b * xi, si), yi)
+                for (xi, si, yi, li) in zip(x, sig, y, lim); init = 0.0)
+        gradient(nt, x, sig, y, lim) = sum(
+            (yi <= li ? -exp(logpdf(Normal(), z) - logcdf(Normal(), z)) / si : z / si) .*
+                [1.0, xi]
+            for (xi, si, yi, li) in zip(x, sig, y, lim)
+            for z in ((yi - nt.mu - nt.b * xi) / si,); init = [0.0, 0.0]) .-
+            [nt.mu, nt.b]
+        first_bound = m(; x, sig, lim = cases.mixed) | (; y)
+        built = build_kernel(first_bound)
+        sampler_type = typeof(prepare_query(built, first_bound, :sampler))
+        bindings = [(m(; x, sig, lim) | (; y), (x, sig, y, lim)) for lim in values(cases)]
+        push!(bindings, (m(; x = Float64[], sig = Float64[], lim = Float64[]) | (; y = Float64[]),
+                         (Float64[], Float64[], Float64[], Float64[])))
+        for (bound, data) in bindings
+            own = build_kernel(bound)
+            nt = constrain(own.layout, u)
+            for kernel in (built, own)
+                query = prepare_query(kernel, bound, :sampler)
+                @test typeof(query) == sampler_type
+                @test Base.invokelatest(query, u) ≈ density(nt, data...) rtol = 1e-12
+                sampler = prepare_sampler(kernel, bound, u; backend = _RR_BACKEND)
+                g = similar(u)
+                value, _ = sampler_value_and_gradient!(sampler, g, u)
+                @test value ≈ density(nt, data...) rtol = 1e-12
+                @test g ≈ gradient(nt, data...) rtol = 1e-10
+            end
+        end
+        # With the generated plate reverse on as well: an arm's program takes a
+        # rule, or the choice between its call and inline, over a few rows and
+        # over more than a program's call needs.
+        for rows in (4, 80)
+            xs = collect(range(-1.0, 1.0; length = rows))
+            sigs = fill(0.9, rows)
+            ys = 0.3 .* xs
+            lims = [isodd(i) ? ys[i] : -5.0 for i in 1:rows]
+            bound = m(; x = xs, sig = sigs, lim = lims) | (; y = ys)
+            own = build_kernel(bound)
+            nt = constrain(own.layout, u)
+            sampler = ReactiveKernels.with_plate_reverse(true) do
+                prepare_sampler(own, bound, u; backend = _RR_BACKEND)
+            end
+            g = similar(u)
+            value, _ = sampler_value_and_gradient!(sampler, g, u)
+            @test value ≈ density(nt, xs, sigs, ys, lims) rtol = 1e-12
+            @test g ≈ gradient(nt, xs, sigs, ys, lims) rtol = 1e-10
+        end
+    end
+    # By default a binding whose rows are all observed prepares its own program.
+    m = @rkppl begin
+        mu ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        y .~ censored.(Normal.(mu .+ b .* x, sig), lim, Inf)
+    end
+    x = [0.1, -0.3, 0.4, 0.2]; sig = [0.7, 1.1, 0.9, 1.3]; y = [0.5, -1.0, 1.2, 0.3]
+    mixed = m(; x, sig, lim = [-5.0, -1.0, 0.0, -2.0]) | (; y)
+    observed = m(; x, sig, lim = fill(-5.0, 4)) | (; y)
+    built = build_kernel(mixed)
+    @test typeof(prepare_query(built, observed, :sampler)) !=
+          typeof(prepare_query(built, mixed, :sampler))
+end

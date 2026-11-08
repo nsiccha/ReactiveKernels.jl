@@ -5342,7 +5342,9 @@ function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                  want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
                  bound = NamedTuple(), on_error = nothing,
                  exemplars = nothing, type_stability = nothing,
-                 type_stability_level = nothing, simplify = nothing, _data_cache = nothing)
+                 type_stability_level = nothing, branch_arms = nothing,
+                 simplify = nothing, _data_cache = nothing)
+    _with_branch_arms(branch_arms) do
     _with_simplify(simplify) do
         _with_type_stability(type_stability, type_stability_level) do
             isempty(bound) || return prepare(spec.graph;
@@ -5355,6 +5357,7 @@ function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
             have === _KERNEL_DEFAULT_BOUNDARY || return prepared
             _kernel_signature_callable(prepared, spec.call_signature)
         end
+    end
     end
 end
 

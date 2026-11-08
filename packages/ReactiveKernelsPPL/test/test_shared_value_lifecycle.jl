@@ -75,7 +75,7 @@ end
         z[levels(unit)] .~ Normal.(0, 1)
         eta = z[unit]
         # The explicit intermediate matches the existing no-prefix sampler
-        # fixture; direct affine factor ownership is tracked by 0mtcwfj.
+        # fixture.
         mu = 0.0 .+ eta
         y .~ Normal.(mu, 1)
     end
@@ -84,9 +84,14 @@ end
         eta = z[unit]
         y .~ Normal.(eta, 1)
     end
+    # A factor term reads its unit's coefficient by level code (todo 0mtcwfj),
+    # so it partitions like the explicit intermediate.
     factor_bound, factor_built = build_model(model_factor, data)
-    @test_throws ReactiveKernels.PartitionSeparabilityError prepare_partition(
-        factor_built, factor_bound, :y; by=:unit, partitioned=:z)
+    factor_part = prepare_partition(factor_built, factor_bound, :y;
+        by=:unit, partitioned=:z)
+    @test all(label -> ReactiveKernels.partition_footprint(factor_part.kernel,
+        [0.2, -0.1, 0.3], label, nothing).unconstrained == [label],
+        partition_labels(factor_part))
     local_bound, local_built = build_model(model_local, data)
     local_u = [0.2, -0.1, 0.3]
     local_cell = prepare_cell_query(local_built, local_bound, :y;

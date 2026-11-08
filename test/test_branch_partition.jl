@@ -316,6 +316,117 @@ end
     end
 end
 
+# With `branch_arms = :all`, one program serves every binding of a data-bound
+# branch, whichever arms its lanes take, an empty domain included: an arm no
+# lane takes is a plate over no lanes (RK 0.1.119). A prepared type that followed the outcomes made another binding of the
+# same program compile again (snag `sampler-type-dif-ea945700`: censored soil
+# rows that were all detected, or all censored, recompiled ODL's sampler).
+@testset "one prepared type whichever arms the lanes take" begin
+    prepare = (args...; kwargs...) -> ReactiveKernels.prepare(args...; branch_arms = :all, kwargs...)
+    C = BranchPartition
+    RK = ReactiveKernels
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    plates(p) = filter(r -> r.op isa RK._AuthoredPlateOp, p.recipes)
+    has_branch(p) = any(r -> r.op isa RK._KernelSourceOp &&
+                             r.op.f isa RK._KernelBranch, p.recipes)
+    x = [0.5, 1.5, 2.0, 0.25, 3.0]
+    lanes = (; mixed = [1.0, -2.0, 0.5, -1.0, 2.0], then = [1.0, 2.0, 0.5, 1.0, 2.0],
+             other = -[1.0, 2.0, 0.5, 1.0, 2.0])
+    cell(xi, yi) = yi > 0 ? log(xi * yi) : xi - 1.0
+    for want in (:total, :pointwise)
+        prepared = Dict(name => prepare(C.guarded; have = (:x, :y), want,
+                                        bound = (; y))
+                        for (name, y) in pairs(lanes))
+        empty = prepare(C.guarded; have = (:x, :y), want, bound = (; y = Float64[]))
+        @test allequal(typeof.([values(prepared)..., empty]))
+        for (name, y) in pairs(lanes)
+            k = prepared[name]
+            @test length(plates(k.plan)) == 2
+            @test !any(r -> has_branch(plate_body(r)), plates(k.plan))
+            # Only the taken arm is evaluated, on its own lanes.
+            C.arm_calls[] = 0
+            @test k(x) ≈ (want === :total ? sum(cell.(x, y)) : cell.(x, y))
+            @test C.arm_calls[] == count(>(0), y)
+        end
+        @test empty(Float64[]) == (want === :total ? 0.0 : Float64[])
+        want === :total || continue
+        ads = Dict(name => prepare_ad(k, backend, x; active = :x)
+                   for (name, k) in prepared)
+        @test allequal(typeof.(collect(values(ads))))
+        for (name, y) in pairs(lanes)
+            value, gradient = RK.ad_value_and_gradient!(ads[name], similar(x), x)
+            @test value ≈ sum(cell.(x, y))
+            @test gradient ≈ [yi > 0 ? inv(xi) : 1.0 for (xi, yi) in zip(x, y)]
+        end
+        ad = prepare_ad(empty, backend, Float64[]; active = :x)
+        @test RK.ad_value_and_gradient!(ad, Float64[], Float64[]) == (0.0, Float64[])
+    end
+
+    # Nested arms: every arm of every level is a plate, also where no lane
+    # reaches it, and a nested condition is still evaluated on its lanes only
+    # (the interior arm reads `cuts[l - 1]`, out of bounds on first-level lanes).
+    eta = [0.3, -0.2, 0.9, 0.1, -0.4, 0.6, 0.2, -0.7]
+    w = [1.0, 0.5, 2.0, 1.5, 1.0, 0.25, 1.0, 2.0]
+    cuts = [-1.0, 0.0, 1.5]
+    K = length(cuts) + 1
+    leveled(level) = sum(wi * (l == 1 ? cuts[1] - e :
+        (l == K ? e - cuts[end] : cuts[l] * e - cuts[l - 1]))
+        for (l, e, wi) in zip(level, eta, w); init = 0.0)
+    levels = ([1, 2, 4, 3, 1, 4, 2, 3], [1, 4, 4, 1, 1, 4, 1, 4], fill(1, 8),
+              [2, 3, 2, 3, 2, 3, 2, 3], fill(4, 8))
+    have = (:eta, :level, :cuts, :w, :nlev)
+    nested = [prepare(C.leveled; have, want = :total,
+                      bound = (; level, w, nlev = K, cuts)) for level in levels]
+    @test allequal(typeof.(nested))
+    for (k, level) in zip(nested, levels)
+        @test length(plates(k.plan)) == 3
+        @test k(eta) ≈ leveled(level)
+        value, gradient = RK.ad_value_and_gradient!(
+            prepare_ad(k, backend, eta; active = :eta), similar(eta), eta)
+        @test value ≈ leveled(level)
+        @test gradient ≈ [wi * (l == 1 ? -1.0 : l == K ? 1.0 : cuts[l])
+                          for (l, wi) in zip(level, w)]
+    end
+    empty_levels = prepare(C.leveled; have, want = :total,
+                           bound = (; level = Int[], w = Float64[], nlev = K, cuts))
+    @test typeof(empty_levels) == typeof(first(nested))
+    @test empty_levels(Float64[]) == 0.0
+
+    # A reassembled pointwise vector gathered by a second split plate, with
+    # every lane observed and with none.
+    mu = [0.3, -0.1, 0.2, 0.05, 0.7]
+    xc = [0.2, -1.0, 0.5, 1.5, -0.3]
+    yc = [0.1, 0.0, 0.4, -0.2, 0.0]
+    chained(xs, obs) = sum(o ? -0.5 * (yi - (m + sqrt(xi)))^2 : 0.0
+                           for (m, xi, yi, o) in zip(mu, xs, yc, obs))
+    # `sqrt` throws on the negative `x` of the unobserved lanes.
+    cases = ((xc, [true, false, true, true, false]), (abs.(xc), fill(true, 5)),
+             (xc, fill(false, 5)))
+    chains = [prepare(C.chained_arms; bound = (; x = xs, y = yc, obs))
+              for (xs, obs) in cases]
+    @test allequal(typeof.(chains))
+    for (k, (xs, obs)) in zip(chains, cases)
+        @test k(mu) ≈ chained(xs, obs)
+        value, gradient = RK.ad_value_and_gradient!(
+            prepare_ad(k, backend, mu; active = :mu), similar(mu), mu)
+        @test value ≈ chained(xs, obs)
+        @test gradient ≈ [o ? yi - (m + sqrt(xi)) : 0.0
+                          for (m, xi, yi, o) in zip(mu, xs, yc, obs)]
+    end
+    # By default a binding whose lanes all take one arm prepares its own
+    # program, as before 0.1.119; a value other than `:taken` or `:all` is
+    # refused.
+    let x = [0.5, 1.5, 2.0], y = [1.0, -2.0, 0.5]
+        own = ReactiveKernels.prepare(C.guarded; have = (:x, :y), want = :total,
+                                      bound = (; y = abs.(y)))
+        mixed = ReactiveKernels.prepare(C.guarded; have = (:x, :y), want = :total,
+                                        bound = (; y))
+        @test typeof(own) != typeof(mixed)
+        @test_throws ArgumentError ReactiveKernels.prepare(C.guarded; have = (:x, :y),
+            want = :total, bound = (; y), branch_arms = :some)
+    end
+end
+
 # A constructed endpoint under a lazy branch arm lowers in its arm: each taken
 # arm carries its own endpoint evaluation, the arm stays lazy (an endpoint
 # that is invalid off-arm never evaluates there), and the inlined math keeps

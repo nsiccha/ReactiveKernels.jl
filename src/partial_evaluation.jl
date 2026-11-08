@@ -1136,6 +1136,18 @@ Base.@nospecializeinfer function _partial_plate_analysis(
     end
 end
 
+# The value an empty bound domain caches for a cell value that every cell would
+# share (a recipe over atomic bound inputs alone, such as `log(s)` of a bound
+# scale), wrapped in `Some`. The original plate visits no cell and skips its
+# shared work, so this recipe is never evaluated, which keeps `log` of an
+# invalid scale from throwing for an arm that no lane takes. The value only
+# gives the rewritten plate the operand a nonempty domain gives it, and no cell
+# reads it. `nothing` when `T` has no such value without evaluating anything;
+# the plate is then left as it is.
+_empty_domain_shared(::Type{T}) where {T} =
+    T <: Number && hasmethod(zero, Tuple{Type{T}}) ? Some(zero(T)) :
+    isbitstype(T) ? Some(Ref{T}()[]) : nothing
+
 # A cached cell value of every cell of a plate's bound domain, in cell order.
 # The loop is its own method, compiled for the batch's type: in the untyped
 # pass below each cell was a dynamic `getindex` and `setindex!` with a boxed
@@ -1207,10 +1219,18 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     # bound inputs. Without a bound domain, retain its per-cell execution.
     isempty(arguments) && return nothing
 
-    # A known empty domain has no data-dependent cells to evaluate. Keeping the
-    # original plate also preserves its empty-result typing and error behavior.
+    # With `branch_arms = :all`, a known empty domain is rewritten as a
+    # nonempty one is, so that one program's prepared type does not depend on
+    # whether its data has cells (a data-bound branch arm no lane takes, or an
+    # empty likelihood). It evaluates nothing: its per-cell values are empty
+    # and a value shared by every cell is a typed placeholder
+    # (`_empty_domain_shared`) that no cell reads, as the original plate visits
+    # no cell and skips its shared work. Otherwise a known empty domain has no
+    # data-dependent cells to evaluate, and keeping the original plate also
+    # preserves its empty-result typing and error behavior.
     bound_axes = _partial_bound_axes(bound_arguments)
-    any(isempty, bound_axes) && return nothing
+    empty_domain = any(isempty, bound_axes)
+    empty_domain && !_all_branch_arms() && return nothing
     fixed_domain = all(enumerate(recipe.inputs)) do (index, input)
         index in atomic_inputs || haskey(known, canon_id(g, input.id)) ||
             _partial_plate_live_domain(valtype(input), bound_axes)
@@ -1250,7 +1270,13 @@ Base.@nospecializeinfer function _partial_plate_recipe(
             batch = Base.Broadcast.instantiate(Base.broadcasted(r.op, args...))
             cid = canon_id(inner.graph, only(r.outputs).id)
             if isempty(axes(batch))
-                arguments[cid] = Ref(batch[CartesianIndex()])
+                arguments[cid] = if empty_domain
+                    placeholder = _empty_domain_shared(analysis.cell_types[cid])
+                    placeholder === nothing && return nothing
+                    Ref(something(placeholder))
+                else
+                    Ref(batch[CartesianIndex()])
+                end
             else
                 # Preserve the broadcast container and concrete element type.
                 # Bool results may use packed BitArrays; bound-array
@@ -1274,7 +1300,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
             # inactive-arm derivative to NaN under ordinary reverse. As for
             # a speculative evaluation that throws, this only declines the
             # new lift; it does not reject or change the authored arithmetic.
-            key = get(analysis.speculative, current, nothing)
+            key = empty_domain ? nothing : get(analysis.speculative, current, nothing)
             if key !== nothing && first(key) in (:nested_recipe, :nested_node) &&
                     analysis.cell_types[cid] <: Union{AbstractFloat,Complex{<:AbstractFloat}}
                 data = arguments[cid]
@@ -1421,11 +1447,12 @@ end
 # its parts (`_KernelBranch`). When every port of the condition is bound data
 # (a bound plate argument, or a bound-only cell value the cache pass above
 # turned into one), the condition is evaluated per lane here, the lanes are
-# split by outcome, and the plate becomes one plate per taken arm over its own
-# lanes — so no backend ever receives that branch, no lane evaluates an arm it
-# does not take, and every gather inside an arm is in bounds by construction
-# (docs/src/constraints.md). The number of arm plates is bounded by the cell's
-# branch structure, never by the data; lane-subset sizes only change shapes.
+# split by outcome, and the plate becomes one plate per arm over its own lanes,
+# which are none for an arm no lane takes — so no backend ever receives that
+# branch, no lane evaluates an arm it does not take, and every gather inside an
+# arm is in bounds by construction (docs/src/constraints.md). The number of arm
+# plates is fixed by the cell's branch structure, never by the data; lane-subset
+# sizes only change shapes.
 
 """
     _LaneGather(n)
@@ -1504,12 +1531,24 @@ vector, and Base's `vcat` of it beside a live arm of the same element type
 can fail native Enzyme reverse (`EnzymeRuntimeActivityError`,
 docs/src/constraints.md).
 """
-struct _LaneAssemble end
+struct _LaneAssemble{W} end
+_LaneAssemble() = _LaneAssemble{false}()
 # `Vararg{Any,N}` specializes on the arm count; an unspecialized `parts...`
 # left `vcat(parts...)` a run-time `Core._apply_iterate` call in every
 # evaluation of a partitioned plate.
-(::_LaneAssemble)(order, parts::Vararg{Any,N}) where {N} =
+# With `branch_arms = :all` (`_LaneAssemble{true}`), one arm can hold every
+# lane: its lanes are then `1:n` in order (arm lanes are sorted), so `order` is
+# the identity and the concatenation is the result, and a binding whose lanes
+# all take one arm pays no gather. Otherwise an arm no lane takes has no plate,
+# so no part holds every lane.
+(::_LaneAssemble{false})(order, parts::Vararg{Any,N}) where {N} =
     _native_vcat(parts...)[order]
+function (::_LaneAssemble{true})(order, parts::Vararg{Any,N}) where {N}
+    joined = _native_vcat(parts...)
+    _lane_whole_part(length(order), parts...) ? joined : joined[order]
+end
+_lane_whole_part(n, parts::Vararg{Any,N}) where {N} =
+    any(part -> length(part) == n, parts)
 _readable_callee(::_LaneAssemble) = :lane_assemble
 _opname(::_LaneAssemble) = "lane_assemble"
 
@@ -1524,15 +1563,16 @@ struct _LaneAnchored{F}
 end
 @inline (arm::_LaneAnchored)(anchor, args...) = arm.f(args...)
 
-_partition_plate_recipe(g, recipe, known, op, pending, want, fresh) = nothing
+_partition_plate_recipe(g, recipe, known, op, pending, want, fresh, lane_lengths) = nothing
 # Branch partitioning likewise consumes the operation metadata dynamically;
 # its residual operation still retains the precise generated kernel type.
 Base.@nospecializeinfer function _partition_plate_recipe(
         g, recipe, known, @nospecialize(op::_AuthoredPlateOp),
-        pending::Vector{Recipe}, want, fresh)
+        pending::Vector{Recipe}, want, fresh, lane_lengths::Dict{ValueId,Int})
     atomic_inputs = typeof(op).parameters[2]
     inner = _plate_cell_kernel(op).plan
     length(inner.have) == length(recipe.inputs) || return nothing
+    all_arms = _all_branch_arms()
     length(inner.want) == 1 || return nothing
     _plate_cell_ops_length(op) == length(inner.recipes) || return nothing
     length(recipe.outputs) == 1 || return nothing
@@ -1549,11 +1589,21 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     n = nothing
     singleton_axis = false
     unknown_axis = false
+    # The lane count of live arguments an enclosing partition gathered onto
+    # this arm plate's lanes (`lane_lengths`).
+    gathered = nothing
     for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
         cid = canon_id(g, outer.id)
         if !haskey(known, cid)
-            index in atomic_inputs || valtype(outer) <: Number ||
-                (unknown_axis = true)
+            k = index in atomic_inputs || !all_arms ? nothing :
+                get(lane_lengths, cid, nothing)
+            if k === nothing
+                index in atomic_inputs || valtype(outer) <: Number ||
+                    (unknown_axis = true)
+            else
+                gathered === nothing || gathered == k || return nothing
+                gathered = k
+            end
             continue
         end
         data = known[cid]
@@ -1570,11 +1620,19 @@ Base.@nospecializeinfer function _partition_plate_recipe(
         bound[canon_id(inner.graph, input.id)] =
             index in atomic_inputs ? Ref(data) : data
     end
+    # An arm plate's live lane arguments have its lane count, so they fix its
+    # domain whatever that count is: a nested branch in an arm of one lane is
+    # split as in an arm of several or of none.
+    if gathered !== nothing && !unknown_axis
+        n === nothing && (n = gathered)
+        n == gathered || return nothing
+    end
     # A bound singleton is the complete domain when every other live
     # operand is shared/scalar. Keep broadcast expansion conservative when
     # an unbound lane array could determine a larger domain.
     n === nothing && singleton_axis && !unknown_axis && (n = 1)
-    (n === nothing || n == 0) && return nothing
+    n === nothing && return nothing
+    n == 0 && !all_arms && return nothing
 
     # The first branch recipe whose condition reads bound data only.
     target = nothing
@@ -1589,14 +1647,26 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     target === nothing && return nothing
     branch_recipe, cond_ports = target
     native = getfield(branch_recipe.op, :f)
-    pred = broadcast(native.condition, (bound[cid] for cid in cond_ports)...)
-    arms = if pred isa Bool
-        # A lane-invariant condition selects its arm statically.
-        pred ? [(:then, collect(1:n))] : [(:else, collect(1:n))]
+    # Every arm becomes a plate, also one that no lane takes, and a domain of
+    # no lanes splits into two such plates without evaluating its condition:
+    # the prepared program follows the cell, not which arms this binding's
+    # lanes take, so another binding of the same program keeps its type. An
+    # arm with no lanes runs no cell; its plate skips its shared work, and its
+    # work over bound values evaluates nothing (`_partial_plate_recipe`).
+    lane_condition = any(cid -> bound[cid] isa AbstractArray, cond_ports)
+    arms = if n == 0 && lane_condition
+        [(:then, Int[]), (:else, Int[])]
     else
-        pred isa AbstractVector{Bool} && length(pred) == n || return nothing
-        filter(arm -> !isempty(last(arm)),
-            [(:then, findall(pred)), (:else, findall(!, pred))])
+        pred = broadcast(native.condition, (bound[cid] for cid in cond_ports)...)
+        if pred isa Bool
+            # A lane-invariant condition selects its arm statically.
+            pred ? [(:then, collect(1:n))] : [(:else, collect(1:n))]
+        else
+            pred isa AbstractVector{Bool} && length(pred) == n || return nothing
+            # With `branch_arms = :taken`, only an arm some lane takes is a plate.
+            taken = [(:then, findall(pred)), (:else, findall(!, pred))]
+            all_arms ? taken : filter(arm -> !isempty(last(arm)), taken)
+        end
     end
 
     # An arm computed only from shared values (a constant fallback such as
@@ -1735,6 +1805,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
                 end
                 v = value!(g, Symbol(:lane_, side, :_, outer.name),
                            _lane_gather_type(n, valtype(outer)))
+                lane_lengths[canon_id(g, v.id)] = length(lanes)
                 push!(expansion, Recipe(fresh(), (outer, idx), (v,),
                     _LaneGather(n), 0.0, nothing, false))
                 push!(arguments, v)
@@ -1774,7 +1845,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
         0.0, nothing, false))
     known[canon_id(g, order_value.id)] = order
     push!(expansion, Recipe(fresh(), (order_value, arm_outputs...), (pointwise,),
-        _LaneAssemble(), 0.0, nothing, false))
+        _LaneAssemble{all_arms}(), 0.0, nothing, false))
     (; expansion, rewrite = nothing)
 end
 
@@ -1825,6 +1896,8 @@ function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId
     whole = false
     signature = Any[]
     keyed = rewrites !== nothing
+    # The lane count of each live argument a partition gathers onto an arm.
+    lane_lengths = Dict{ValueId,Int}()
     # A worklist: an arm plate emitted by the branch partition is examined
     # again (a nested arm or a further branch in its cell), and a rewritten
     # `sum` consumer replaces the original later in the queue.
@@ -1851,7 +1924,7 @@ function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId
             r = specialized.recipe
         end
         partitioned = _partition_plate_recipe(copied, r, known, r.op, pending,
-                                              p.want, fresh)
+                                              p.want, fresh, lane_lengths)
         if partitioned === nothing
             push!(recipes, r)
             continue
