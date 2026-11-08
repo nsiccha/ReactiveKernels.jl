@@ -176,18 +176,38 @@ end
     end
     @test full_gradient ≈ central rtol = 1e-6 atol = 1e-8
 
+    support = factor_support(selection; u0 = u)
     q = only(prepare_query_ad(prepare_ad, built, plan, [selection], _REVERSE, u;
         coordinates = :support))
-    # Its shared program reads the compact overlay at a partition's rows, the shape
-    # whose native Reverse needs dogfood repair `const_slot_reloads` on Julia 1.10,
-    # so preparation checked the loaded Enzyme for it.
+    # Every coordinate the factors read has a slot, so the partition of the plates
+    # `tau` and `z` reads their rows from the active vector at slots its plan
+    # computes, never through the overlay (snag compact-factor-q-abfa7a8e).
     @test q.prepared.kernel isa ReactiveKernels.PreparedKernel
-    @test ReactiveKernels._reads_lazy_view_rows(q.prepared.kernel)
-    @test q.coordinates == factor_support(selection; u0 = u)
+    @test !ReactiveKernels._reads_lazy_view_rows(q.prepared.kernel)
+    @test q.coordinates == support
     compact_value, compact_gradient = ad_value_and_gradient(q, u, u[q.coordinates])
     @test compact_value ≈ full_value
     @test compact_gradient ≈ full_gradient[q.coordinates]
     @test all(iszero, full_gradient[setdiff(eachindex(u), q.coordinates)])
+    # Explicit coordinates that cover the support read the rows the same way.
+    covering = only(prepare_query_ad(prepare_ad, built, plan, [selection], _REVERSE, u;
+        coordinates = support))
+    @test !ReactiveKernels._reads_lazy_view_rows(covering.prepared.kernel)
+    @test last(ad_value_and_gradient(covering, u, u[support])) ≈ compact_gradient
+
+    # Coordinates that leave `z[1]` to the base: the partition reads the packed
+    # point at its rows through the overlay, a `view` whose native Reverse needs
+    # dogfood repair `const_slot_reloads` on Julia 1.10, so preparation checked the
+    # loaded Enzyme for it.
+    z1 = only(e.offset for e in built.layout.entries if e.name === :z)
+    partial = setdiff(support, [z1])
+    p = only(prepare_query_ad(prepare_ad, built, plan, [selection], _REVERSE, u;
+        coordinates = partial))
+    @test ReactiveKernels._reads_lazy_view_rows(p.prepared.kernel)
+    @test p.coordinates == partial
+    partial_value, partial_gradient = ad_value_and_gradient(p, u, u[partial])
+    @test partial_value ≈ full_value
+    @test partial_gradient ≈ full_gradient[partial]
     @test u == original
 end
 
