@@ -3879,7 +3879,8 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
         pointwise_lhs, total_lhs; recycled = nothing,
         input_type_hints = nothing, element_type = nothing, into::Bool = false,
-        total_fold = sum, program::Bool = false, readonly_slices = Set{Int}())
+        total_fold = sum, program::Bool = false, readonly_slices = Set{Int}(),
+        batch = nothing)
     # `into`: `pointwise_lhs` already holds a buffer at least as long as the
     # plate, of its element type; the cells are written into it in place and
     # the binding is left alone (a strip refill, `_lower_authored_scan_strips!`).
@@ -4037,7 +4038,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         inner_kernel, atomic, callargs, callvalues, raw_arguments,
         prepared_arguments, marker, output_axes, pointwise_lhs, total_lhs;
         recycled, input_type_hints, element_type, into, total_fold, program,
-        deferred, readonly_slices)
+        deferred, readonly_slices, batch)
     # No program took the prepared arguments: prepare them where they stood.
     deferred === nothing || isempty(deferred) ||
         splice!(body.args, deferred_at:deferred_at-1, deferred)
@@ -4057,7 +4058,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         input_type_hints = nothing, element_type = nothing, into::Bool = false,
         unswitch::Bool = true, cells::Bool = true, nonempty::Bool = false,
         types = nothing, total_fold = sum, program::Bool = false,
-        deferred = nothing, readonly_slices = Set{Int}())
+        deferred = nothing, readonly_slices = Set{Int}(), batch = nothing)
     inner = getfield(inner_kernel, :plan)
     if unswitch
         branch = _plate_shared_branch(inner_kernel, atomic, callargs, callvalues)
@@ -4118,7 +4119,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         plate_eltype, index, previous, first_coordinate, root_positions,
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
         lane_arms; nonempty, total_fold, runtime_ops, runtime_recipes, program,
-        deferred, readonly_slices)
+        deferred, readonly_slices, batch = element_type === nothing ? batch : nothing)
 end
 
 # Append a cell kernel's operations to the table and build the type expression
@@ -4200,7 +4201,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
         lane_arms; nonempty::Bool = false, total_fold = sum,
         runtime_ops, runtime_recipes, program::Bool = false, deferred = nothing,
-        readonly_slices = Set{Int}())
+        readonly_slices = Set{Int}(), batch = nothing)
     groups = nested === nothing ? _authored_plate_recipe_groups(
         inner, dependencies, root_positions, atomic, callvalues) :
         [(Set{ValueId}(), nested.invariants)]
@@ -4541,8 +4542,30 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     if cells
         append!(body.args, declarations)
         execution = Expr(:block, invariants.args...)
+        # The batched tiles of a plate of products (plate_batching.jl), for
+        # the plain cell loop only: a strip refill, lane slots, cell tables,
+        # scheduled groups, branch arms, scan slices, shared calls, nested
+        # plates and a scheduled prefix keep it.
+        batched = batch isa _PlateBatchPlan && batch.inner === inner && nested === nothing &&
+            !has_scheduled_groups && isempty(lane_arms) && !into && recycled === nothing &&
+            cell_slots === nothing && !stores_cells && isempty(slices) && !parallel_cells &&
+            isempty(shares) && total_fold === sum
+        # A statement the batched tiles run cell by cell, as the loop body does,
+        # its batched inputs read from `reads`.
+        function residual!(block, recipe_index, reads)
+            recipe = inner.recipes[recipe_index]
+            out = locals[canon_id(inner.graph, only(recipe.outputs).id)]
+            args = Any[get(() -> _authored_plate_scalar_ref(inner, locals, callargs,
+                               callvalues, prepared_arguments, atomic, input, index, true),
+                           reads, canon_id(inner.graph, input.id))
+                       for input in recipe.inputs]
+            lower_recipe!(block, recipe_index, args, out,
+                Expr(:ref, _CALLABLES_ARG, op_offset + recipe_index), true)
+        end
         if reduction === nothing
-            push!(execution.args, cell_loop)
+            push!(execution.args, batched ? _lower_plate_batched_native(batch, inner, locals,
+                callargs, raw_arguments, output_axes, pointwise_lhs, accumulator, cell_loop,
+                index, residual!) : cell_loop)
         else
             push!(execution.args, _lower_plate_reduction_native(reduction.kind,
                 reduction, inner, locals, callargs, callvalues, raw_arguments,
@@ -4615,7 +4638,7 @@ end
 # observations, so computes a value they share once, as the whole kernel does
 # (snag `partition-over-s-c28c8326`). One member lowers exactly as one cell.
 Base.@nospecializeinfer function _lower_authored_plate_cells!(
-        body, runtime_ops, runtime_recipes, members; windows = nothing)
+        body, runtime_ops, runtime_recipes, members; windows = nothing, batches = nothing)
     # In a group with guarded members (`_CellRegions`), a guarded member's
     # bookkeeping follows what it reads and its plate runs under its guard.
     ids = Int[recipe.id for (recipe, _, _) in members]
@@ -4675,14 +4698,16 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
     end
     for (id, s) in zip(ids, states)
         _cell_forced(windows, _cell_member_force(windows, id, true)) do
-            _lower_authored_plate_cell_state!(body, runtime_ops, runtime_recipes, s, windows)
+            _lower_authored_plate_cell_state!(body, runtime_ops, runtime_recipes, s, windows;
+                batch = batches === nothing ? nothing : get(batches, id, nothing))
         end
     end
     body
 end
 
 # One cell's footprint reads and plate, once its slices are taken.
-function _lower_authored_plate_cell_state!(body, runtime_ops, runtime_recipes, s, windows)
+function _lower_authored_plate_cell_state!(body, runtime_ops, runtime_recipes, s, windows;
+                                           batch = nothing)
     for (cid, batched, via) in s.footprint_captures
         _footprint_record_capture!(windows.pushdowns, cid,
             _cell_capture_element(s.slices[batched], via == 0 ? nothing : s.slices[via];
@@ -4695,8 +4720,9 @@ function _lower_authored_plate_cell_state!(body, runtime_ops, runtime_recipes, s
                            :gathered, reads)
     end
     if s.partition
+        # A partition's rows run batched like its plate (plate_batching.jl).
         _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
-            s.plate, s.slices, s.plate_values, nothing, s.lhs)
+            s.plate, s.slices, s.plate_values, nothing, s.lhs; batch)
         return
     end
     pointwise = gensym(:cell_pointwise)
@@ -5795,6 +5821,14 @@ function _lower_with_ops_collecting(p::Plan;
                         _readonly_value_types(p, exemplar_types))
                     cells.readonly[r.id] = _readonly_cell_slices(p, r, readonly_value_types)
                 end
+                # At the rows a partition reads, its rows run batched too
+                # (plate_batching.jl).
+                if exemplar_types !== nothing && !plate_element_types && _plate_batch_candidate(r)
+                    readonly_value_types === nothing && (readonly_value_types =
+                        _readonly_value_types(p, exemplar_types))
+                    plan = _plate_batch_plan(p, r, readonly_value_types)
+                    plan === nothing || (cells.batch[r.id] = plan)
+                end
                 _lower_authored_plate_native!(
                     Expr(:block), runtime_ops, runtime_recipes, r.op, callargs,
                     callvalues, nm(pointwise), nothing)
@@ -5874,11 +5908,20 @@ function _lower_with_ops_collecting(p::Plan;
                         _readonly_value_types(p, exemplar_types))
                     readonly_slices = _readonly_cell_slices(p, r, readonly_value_types)
                 end
+                # The batched tiles of a plate of products (plate_batching.jl):
+                # planned from the exemplars' types, never for the
+                # non-allocating step (`plate_element_types`).
+                batch = nothing
+                if exemplar_types !== nothing && !plate_element_types && _plate_batch_candidate(r)
+                    readonly_value_types === nothing && (readonly_value_types =
+                        _readonly_value_types(p, exemplar_types))
+                    batch = _plate_batch_plan(p, r, readonly_value_types)
+                end
                 _lower_authored_plate_native!(
                     plate_body, runtime_ops, runtime_recipes, r.op, callargs, callvalues,
                     pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
                     total_fold, program = own_program,
-                    readonly_slices,
+                    readonly_slices, batch,
                     element_type = plate_element_types ?
                         first(_declared_array_layout(valtype(pointwise))) : nothing,
                     input_type_hints = type_hints === nothing ? nothing :
@@ -5927,7 +5970,22 @@ function _lower_with_ops_collecting(p::Plan;
                         for v in p.have if v.name in r.op.plan_constant))
                 continue
             end
-            _lower_authored_plate_cells!(body, runtime_ops, runtime_recipes, members;
+            # A partition's members run their rows batched where their plates
+            # have a batched form (plate_batching.jl).
+            batches = nothing
+            if r.op.rows && exemplar_types !== nothing && !plate_element_types
+                for (m, _, _) in members
+                    m.op isa _AuthoredPlateCellOp && m.op.rows &&
+                        _plate_batch_candidate(m.op.plate) || continue
+                    readonly_value_types === nothing && (readonly_value_types =
+                        _readonly_value_types(p, exemplar_types))
+                    plan = _plate_batch_plan(p, m.op.plate, m.inputs[2:end], readonly_value_types)
+                    plan === nothing && continue
+                    batches === nothing && (batches = Dict{Int,Any}())
+                    batches[m.id] = plan
+                end
+            end
+            _lower_authored_plate_cells!(body, runtime_ops, runtime_recipes, members; batches,
                 windows = cells === nothing ? nothing :
                     _CellEmitter(body, cells, names, runtime_ops, runtime_recipes;
                                  sorted = r.op.rows,

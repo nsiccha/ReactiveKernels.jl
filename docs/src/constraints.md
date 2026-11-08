@@ -778,7 +778,7 @@ only, no ReactiveKernels code) isolate the remaining backend limitations:
   Enzyme's measurement with the same script, the peeled scan takes 1.05 to 1.08
   times the unpeeled one, which takes 1.005 to 1.03 times the inlined hand loop.
   The cause is unknown, and Enzyme stopped there (Enzyme decision `08gyjzn`).
-  From ReactiveKernels 0.1.127 a scan whose step keeps its types, a concrete
+  From ReactiveKernels 0.1.128 a scan whose step keeps its types, a concrete
   output type and the seed's carry type, runs without the peel, whose two jobs
   (typing the output and the carry) it does not need. On Julia 1.10.12 with
   dogfood `b5daa2ac`, the ARMA cell's generated function then takes 0.96 to

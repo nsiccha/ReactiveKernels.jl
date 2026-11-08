@@ -1994,8 +1994,9 @@ struct _CellPushdowns
     slots::Dict{Int,Int}
     plates::Dict{Int,Any}
     # Per plate recipe, the cell recipes whose slices it reads in place
-    # (`_readonly_cell_slices`).
+    # (`_readonly_cell_slices`), and its batched form (`_plate_batch_plan`).
     readonly::Dict{Int,Set{Int}}
+    batch::Dict{Int,Any}
     order::Dict{Int,Int}
     # The locality record (`_cell_locality`, plate_partition.jl): every value
     # a reader asked for at rows, with `(reader recipe id, role)` per ask;
@@ -2291,7 +2292,7 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
     recipes = Set(only(producers[cid]).id for cid in pushed)
     _CellPushdowns(g, types, views, pushed, recipes,
         Dict(cid => only(producers[cid]) for cid in pushed), forms, captures, batched,
-        Dict{Int,Int}(), Dict{Int,Any}(), Dict{Int,Set{Int}}(),
+        Dict{Int,Int}(), Dict{Int,Any}(), Dict{Int,Set{Int}}(), Dict{Int,Any}(),
         Dict(r.id => k for (k, r) in enumerate(p.recipes)),
         requests, refused, dropped, untyped)
 end
@@ -3975,7 +3976,8 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
         window = gensym(:cell_rows)
         _lower_authored_plate_native!(e.body, e.runtime_ops[1:offset],
             e.runtime_recipes[1:offset], r.op, args, d.plates[r.id], window, nothing;
-            readonly_slices = get(d.readonly, r.id, Set{Int}()))
+            readonly_slices = get(d.readonly, r.id, Set{Int}()),
+            batch = get(d.batch, r.id, nothing))
         return window
     end
     if f.kind === :checked
