@@ -425,6 +425,27 @@ end
         @test_throws ArgumentError ReactiveKernels.prepare(C.guarded; have = (:x, :y),
             want = :total, bound = (; y), branch_arms = :some)
     end
+    # By default too, a condition no lane varies is decided as for a domain
+    # with lanes, so a plate over no rows prepares the plate over rows (snag
+    # `empty-plate-samp-ef647a0d`). Its arm's work over the bound scale is not
+    # evaluated, an invalid scale included, and a condition that throws keeps
+    # the plate, which visits no cell.
+    let have = (:y, :m, :s), want = :total
+        full = ReactiveKernels.prepare(C.guarded_scale; have, want,
+                                       bound = (; y = [0.5, 1.5], s = 1.5))
+        C.arm_calls[] = 0
+        none = ReactiveKernels.prepare(C.guarded_scale; have, want,
+                                       bound = (; y = Float64[], s = 1.5))
+        @test typeof(none) == typeof(full)
+        @test none(0.3) == 0.0
+        invalid = ReactiveKernels.prepare(C.guarded_scale; have, want,
+                                          bound = (; y = Float64[], s = -1.0))
+        @test invalid(0.3) == 0.0
+        @test C.arm_calls[] == 0
+        thrown = ReactiveKernels.prepare(C.throwing_condition; have, want,
+                                         bound = (; y = Float64[], s = -1.0))
+        @test thrown(0.3) == 0.0
+    end
 end
 
 # A constructed endpoint under a lazy branch arm lowers in its arm: each taken

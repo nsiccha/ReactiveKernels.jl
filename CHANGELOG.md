@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.122
+## 0.1.123
 
 - `prepare_nonallocating`, and through it
   `prepare_sampler(...; nonallocating = true)`, now runs the stable rewrites
@@ -33,6 +33,28 @@ are recorded in the git history only.
   setting.
 - A rewritten dotted call (`log.(exp.(x))`) no longer allocates its inner
   function as a `Ref` on each call, in `prepare` too.
+
+## 0.1.122
+
+- A plate over no rows prepares the program the same plate over rows
+  prepares, by default (no `branch_arms` setting needed). The pass that caches
+  a plate cell's work over bound data per lane at preparation used to leave a
+  plate with an empty bound domain as authored, so a binding with no rows (an
+  RKPPL `@plate` whose data column is empty, such as a region without spectra)
+  prepared another program, another sampler type and another compile than a
+  binding with rows. It now rewrites an empty domain as it rewrites a nonempty
+  one. It evaluates nothing: the cached per-cell values are empty, and a value
+  every cell would share is a typed placeholder that no cell reads. Such a
+  value now also has a placeholder when it is an array (a data column a cell
+  reads whole gets an empty one of its type) or a tuple or named tuple of
+  values that have one; with `branch_arms = :all`, 0.1.119 left the plate as
+  authored for these. Values and gradients are unchanged, and a binding with
+  rows prepares exactly the program it prepared before. A shared value of
+  another type (a struct holding arrays) still keeps the authored plate.
+  A branch whose condition no lane varies, such as the support guard of a
+  written scale, is decided for a plate over no rows as for one over rows; a
+  condition that throws there keeps the plate. A branch its lanes decide still
+  prepares a program per arm pattern unless `branch_arms = :all` (0.1.119).
 
 ## 0.1.121
 

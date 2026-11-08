@@ -394,3 +394,71 @@ end
     @test typeof(prepare_query(built, observed, :sampler)) !=
           typeof(prepare_query(built, mixed, :sampler))
 end
+
+# A `@plate` over no rows prepares the sampler type of the same program over
+# rows, by default (no `branch_arms` setting): RK rewrites an empty bound
+# domain as it rewrites a nonempty one (RK 0.1.122). The shape is ODL's
+# spectrum plates (snag `empty-plate-samp-ef647a0d`): a cell calling a plain
+# helper whose branch reads a data column, times a group effect gathered by a
+# bound index. Each cell reads its data columns whole, so the empty domain
+# needs an empty column as the placeholder of a value every cell shares. Its
+# Länder with no spectrum rows compiled the sampler again.
+_rr_pick(kind, a, b) = kind == 1 ? 2.0 * a : exp(b)
+
+@testset "a plate over no rows: one sampler type with plates over rows" begin
+    grouped = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        g[1:nlab] .~ Normal.(0, 1)
+        @plate for j in eachindex(y)
+            mean[j] = exp(g[lab[j]]) * _rr_pick(kind[j], a, b)
+            y[j] ~ Normal(mean[j], 1.0)
+        end
+    end
+    plain = @rkppl begin
+        a ~ Normal(0, 1)
+        @plate for j in eachindex(y)
+            mean[j] = 2.0 * a
+            y[j] ~ Normal(mean[j], 1.0)
+        end
+    end
+    _rr_grouped_density(nt, kind, lab, y) =
+        logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
+        sum(gi -> logpdf(Normal(0, 1), gi), nt.g; init = 0.0) +
+        sum(logpdf(Normal(exp(nt.g[l]) * _rr_pick(k, nt.a, nt.b), 1.0), yj)
+            for (k, l, yj) in zip(kind, lab, y); init = 0.0)
+    _rr_plain_density(nt, kind, lab, y) = logpdf(Normal(0, 1), nt.a) +
+        sum(yj -> logpdf(Normal(2.0 * nt.a, 1.0), yj), y; init = 0.0)
+    cases = [([1, 2, 2, 1, 2, 1], [1, 2, 1, 2, 2, 1], 2), ([2], [1], 1),
+             (Int[], Int[], 1), (Int[], Int[], 0)]
+    for (model, density, grouped_data) in ((grouped, _rr_grouped_density, true),
+                                           (plain, _rr_plain_density, false))
+        bind_case(kind, lab, nlab) = begin
+            y = [0.3 + 0.1i for i in eachindex(kind)]
+            data = grouped_data ? model(; kind, lab, nlab) : model(; kind)
+            (data | (; y), y)
+        end
+        first_bound, _ = bind_case(cases[1]...)
+        built = build_kernel(first_bound)
+        sampler_type = typeof(prepare_query(built, first_bound, :sampler))
+        for (kind, lab, nlab) in cases
+            bound, y = bind_case(kind, lab, nlab)
+            own = build_kernel(bound)
+            n = length(coordinate_names(own.layout))
+            u = [0.1i - 0.2 for i in 1:n]
+            f(v) = density(constrain(own.layout, v), kind, lab, y)
+            fd = [(f(u .+ 1e-6 .* (1:n .== i)) - f(u .- 1e-6 .* (1:n .== i))) / 2e-6
+                  for i in 1:n]
+            for kernel in (built, own)
+                query = prepare_query(kernel, bound, :sampler)
+                @test typeof(query) == sampler_type
+                @test Base.invokelatest(query, u) ≈ f(u) rtol = 1e-12
+                sampler = prepare_sampler(kernel, bound, u; backend = _RR_BACKEND)
+                g = similar(u)
+                value, _ = sampler_value_and_gradient!(sampler, g, u)
+                @test value ≈ f(u) rtol = 1e-12
+                @test g ≈ fd rtol = 1e-6 atol = 1e-8
+            end
+        end
+    end
+end

@@ -163,7 +163,10 @@ has, so one program serves every extent and value of one declaration
 and so does an external law's packed range and shape (`test_graph_geometry.jl`).
 Known remaining paths, which are limitations to fix and not precedents, are
 listed under ReactiveKernelsPPL 0.1.108 in its
-changelog, less those a later entry removes. By default a prepared type still
+changelog, less those a later entry removes. A plate over no rows prepares
+the program and type the same plate over rows prepares (ReactiveKernels
+0.1.122), unless a value every cell shares has no typed placeholder (a struct
+holding arrays), a remaining limitation. By default a prepared type still
 depends on which data-bound branch arms have lanes ("Data-bound branches in
 plate cells"). With `branch_arms = :all` (from ReactiveKernels 0.1.119, opt-in,
 for a small per-call cost on small models) an arm without lanes is a plate
