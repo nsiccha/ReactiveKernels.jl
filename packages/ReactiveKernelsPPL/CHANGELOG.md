@@ -16,6 +16,23 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.131
+
+- A compact factor query (`prepare_query_ad(...; coordinates)`) whose
+  coordinates cover its factors' support, as `coordinates = :support` always
+  does, reads a parameter block at a partition's rows from the active vector,
+  at slots its plan computes once per query. Before, every element read went
+  through the packed overlay: a lookup in the sparse slot map and a branch.
+  Gradients are bit-identical in the measured models; values agree to within
+  rounding (relative 1e-15).
+  Native Enzyme Reverse, Julia 1.10.12: a 2048-entry hierarchical prior's
+  gradient takes 7–9 µs instead of 80–89 µs and its value 1–2 µs instead of
+  66–78 µs; 256 eight-entry unit queries of it take a median 23–27 µs per
+  sweep instead of 42–45 µs (snag `compact-factor-q-abfa7a8e`). Coordinates
+  that leave a coordinate the factors read to the base keep the overlay read,
+  and the Enzyme check of 0.1.130 now applies only to them. The rebound program
+  before 0.1.123 read the overlay the same way, so this was not a regression.
+
 ## 0.1.130
 
 - Preparing a compact factor query (`prepare_query_ad(...; coordinates)`) whose

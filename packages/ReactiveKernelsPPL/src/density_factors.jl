@@ -483,19 +483,30 @@ end
 # per-unit-partiti-9d46c6de). Its memberships are constant per selection
 # (`plan_constant`), so the program's own plan kernel plans each selection's
 # rows once.
+#
+# With `slots`, the query's coordinates cover every coordinate its factors read
+# (`coordinates = :support` always does), so its slot map is constant per
+# selection as well: the plan then also computes the active vector's slots of
+# the rows a partition reads the packed point at (`_cell_lazy_rows`), and the
+# body reads those rows as a plain view of the active vector. Without it, each
+# element read goes through the overlay, a sparse slot lookup and a branch, as
+# coordinates that leave a read coordinate to the base need.
 function _density_structure_spec(c::DensityFactors, plan, totals::Tuple, plates::Tuple,
-        constant::Bool, locality, rowplan, compact::Bool; runtime::Bool = false)
-    key = (totals, plates, constant, locality, rowplan, compact, runtime)
+        constant::Bool, locality, rowplan, compact::Bool; runtime::Bool = false,
+        slots::Bool = false)
+    # Only a compact program that reads cells takes the slot map into its plan.
+    slots &= compact && runtime && !isempty(plates)
+    key = (totals, plates, constant, locality, rowplan, compact, runtime, slots)
     lock(c.structure_lock) do
         get!(c.structures, key) do
             _build_density_structure_spec(c, plan, totals, plates, constant, locality,
-                rowplan, compact, runtime)
+                rowplan, compact, runtime, slots)
         end
     end
 end
 
 function _build_density_structure_spec(c, plan, totals, plates, constant, locality,
-        rowplan, compact, runtime = false)
+        rowplan, compact, runtime = false, slots = false)
     spec = ReactiveKernels._copy_cell_factor_spec(c.spec)
     terms = Symbol[c.sites[j].total for j in totals]
     if !isempty(plates)
@@ -509,7 +520,8 @@ function _build_density_structure_spec(c, plan, totals, plates, constant, locali
         spec = plate_partition(spec, Symbol[c.sites[j].plate for j in plates]; by,
             index = _DENSITY_LABEL, name = _DENSITY_PARTITION, locality,
             plan = rowplan === nothing ? _DENSITY_PLAN : _DENSITY_PLAN => rowplan,
-            plan_constant = runtime ? Tuple(_density_membership(j) for j in plates) : ())
+            plan_constant = runtime ? (Tuple(_density_membership(j) for j in plates)...,
+                (slots ? (:_ppl_cell_slots,) : ())...) : ())
         push!(terms, _DENSITY_PARTITION)
     end
     if constant
@@ -544,9 +556,10 @@ end
 # The query of a selection: its structure's graph (`spec`), boundary (`have`,
 # `want`) and `bound` data. With `runtime`, `bound` holds the binding's data
 # only, and `context` holds the selection's own values, the call arguments
-# after the packed point, in `have` order.
+# after the packed point, in `have` order. `slots` says the compact slot map
+# gives every coordinate the selection reads a slot (`_density_structure_spec`).
 function _density_selection_spec(built, plan, selection; locality, on_error, u0,
-        checked = false, compact = false, runtime = false)
+        checked = false, compact = false, runtime = false, slots = false)
     checked || _check_factor_selection(built, plan, selection)
     c = selection.catalogue
     totals, plates = Int[], Int[]
@@ -598,7 +611,7 @@ function _density_selection_spec(built, plan, selection; locality, on_error, u0,
         have = (have..., _DENSITY_CONSTANT)
     end
     spec = _density_structure_spec(c, plan, totals, plates, folded, locality, rowplan, compact;
-        runtime)
+        runtime, slots)
     (; spec, have, bound = (; bindings...), want = _DENSITY_TOTAL, binding = plan,
         context = Tuple(context), plan_index)
 end
@@ -745,22 +758,29 @@ end
 function _prepare_factor_query_ad(prepare_operator, built, plan, selection, backend,
         exemplars, u0; on_error, locality, coordinates)
     compact = coordinates !== nothing
+    covered = false
+    if compact
+        selected = coordinates === :support ? _factor_support(selection, u0) : collect(Int, coordinates)
+        _check_compact_cell_indices(u0, selected, selected, built.layout.total)
+        # Every coordinate the factors read has a slot, so a partition reads its
+        # rows from the active vector at slots its plan computes.
+        covered = coordinates === :support || issubset(_factor_support(selection, u0), selected)
+    end
     # A compact query passes its selection on each call to its structure's
     # shared program. A dense query keeps a rebound program per selection, as
     # its derivative is over the whole packed vector anyway.
     q = _density_selection_spec(built, plan, selection; locality, on_error, u0,
-        checked = true, compact, runtime = compact)
+        checked = true, compact, runtime = compact, slots = covered)
     c = selection.catalogue
     if compact
-        selected = coordinates === :support ? _factor_support(selection, u0) : collect(Int, coordinates)
-        _check_compact_cell_indices(u0, selected, selected, built.layout.total)
         have = (:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots,
             (n for n in q.have if n !== :unconstrained)...)
         point = (u0, u0[selected], _fixed_cell_slots(built.layout.total, selected))
         shared = _density_kernel(c, plan, q.spec, have, q.want, q.bound, on_error,
             (point..., q.context...))
         context = (last(point), _density_context(c, shared, q, (point..., q.context...))...)
-        # A program that reads the compact overlay at a partition's rows takes a
+        # A program that reads the compact overlay at a partition's rows (its
+        # coordinates leave a coordinate the factors read to the base) takes a
         # `view` of it there, which native Enzyme on Julia 1.10 can need dogfood
         # repair `const_slot_reloads` to differentiate (rkppl-use §14, "Enzyme
         # floor"). The loaded Enzyme is checked before the derivative is prepared.

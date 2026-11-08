@@ -1054,8 +1054,9 @@ ReactiveKernels._native_mul_operand(::_CompactCellPoint) = true
 function ReactiveKernels._cell_lazy_rows(::typeof(_compact_cell_point), inputs, rows, bind,
                                          constant)
     # Only where the slot map is constant per label (a partition, which reads
-    # its footprint only); a cell sampler's selection varies per call and may
-    # leave rows to the base.
+    # its footprint only, or a factor query whose coordinates cover its
+    # support); a cell sampler's selection varies per call and may leave rows
+    # to the base.
     constant(inputs[3]) || return nothing
     slots = bind(:cell_positions,
                  Expr(:call, GlobalRef(@__MODULE__, :_overlay_slots), inputs[3], rows))
