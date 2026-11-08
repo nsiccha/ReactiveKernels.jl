@@ -46,7 +46,12 @@ are recorded in the git history only.
   decision; by default nothing changes. A condition that reads bound numbers
   alone still selects its arm at preparation, and a bound singleton beside
   live arguments of unknown length (a plate of one row) still prepares its own
-  program.
+  program. With the generated plate reverse on as well (`with_plate_reverse`),
+  an eligible program takes its rule either way.
+- Fixed: a plate program no longer treats a named-tuple field's or a keyword's
+  name as a variable. Since 0.1.113, a body with two or more plates whose cells
+  built `(location = m, scale = s)` could raise ``UndefVarError: `location` not
+  defined``, as an RKPPL `:observations` query over a ragged plate did.
 
 ## 0.1.117
 

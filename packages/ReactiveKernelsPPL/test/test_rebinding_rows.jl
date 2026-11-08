@@ -361,6 +361,25 @@ end
                 @test g ≈ gradient(nt, data...) rtol = 1e-10
             end
         end
+        # With the generated plate reverse on as well: an arm's program takes a
+        # rule, or the choice between its call and inline, over a few rows and
+        # over more than a program's call needs.
+        for rows in (4, 80)
+            xs = collect(range(-1.0, 1.0; length = rows))
+            sigs = fill(0.9, rows)
+            ys = 0.3 .* xs
+            lims = [isodd(i) ? ys[i] : -5.0 for i in 1:rows]
+            bound = m(; x = xs, sig = sigs, lim = lims) | (; y = ys)
+            own = build_kernel(bound)
+            nt = constrain(own.layout, u)
+            sampler = ReactiveKernels.with_plate_reverse(true) do
+                prepare_sampler(own, bound, u; backend = _RR_BACKEND)
+            end
+            g = similar(u)
+            value, _ = sampler_value_and_gradient!(sampler, g, u)
+            @test value ≈ density(nt, xs, sigs, ys, lims) rtol = 1e-12
+            @test g ≈ gradient(nt, xs, sigs, ys, lims) rtol = 1e-10
+        end
     end
     # By default a binding whose rows are all observed prepares its own program.
     m = @rkppl begin

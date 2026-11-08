@@ -423,3 +423,60 @@ end
     @test value ≈ reference(Float64[], y, 0.3, 1.1)
     @test collect(gradient) ≈ [0.0, sum(y .- 1.1)]
 end
+
+# A named-tuple field's or a keyword's name is a label, neither read nor bound by
+# a plate program. Counted as an assignment, a cell's `(location = m, scale = s)`
+# made `location` a result of the program whenever the rest of the body also named
+# it, and the program's return raised `UndefVarError` (an RKPPL `:observations`
+# query over a ragged plate, todo `0xiwc52`).
+@testset "a label in a plate's cell is no name of the plate program" begin
+    RK = ReactiveKernels
+    block(statement) = RK._plate_block(Expr(:block, statement))
+    function programs(ast)
+        found = RK._PlateProgram[]
+        visit(node) = node isa RK._PlateProgram ? push!(found, node) :
+            node isa Expr && foreach(visit, node.args)
+        visit(RK._extract_plate_programs(ast))
+        found
+    end
+    compiled(program) = Core.eval(@__MODULE__, program.ast)
+    parameters(program) = program.ast.args[1].args
+
+    # The same field in two plates and after them: only the assigned name returns.
+    labelled = programs(Expr(:function, Expr(:tuple, :x, :y), Expr(:block,
+        block(:(first_fields = (location = x, scale = y))),
+        block(:(second_fields = (location = y, scale = x))),
+        :(return (location = first_fields.location, scale = second_fields.scale)))))
+    @test length(labelled) == 2
+    @test parameters(first(labelled)) == [:x, :y]
+    @test Base.invokelatest(compiled(first(labelled)), 1.0, 2.0) == (location = 1.0, scale = 2.0)
+    @test Base.invokelatest(compiled(last(labelled)), 2.0, 1.0) == (location = 1.0, scale = 2.0)
+
+    # A variable of that name is still one: bound by the first plate, it leaves
+    # that program as its result and enters the second as an argument.
+    variable = programs(Expr(:function, Expr(:tuple, :x, :y), Expr(:block,
+        block(:(location = x + y)),
+        block(:(fields = (location = location, scale = x))),
+        :(return (location, fields)))))
+    @test parameters(first(variable)) == [:x, :y]
+    @test Base.invokelatest(compiled(first(variable)), 1.0, 2.0) == 3.0
+    @test parameters(last(variable)) == [:location, :x]
+    @test Base.invokelatest(compiled(last(variable)), 3.0, 1.0) == (location = 3.0, scale = 1.0)
+
+    # A label before a plate does not bind the name that plate assigns: the later
+    # program computes `location` and takes no such argument.
+    ordered = programs(Expr(:function, Expr(:tuple, :x, :y), Expr(:block,
+        block(:(fields = (location = x, scale = y))),
+        block(:(location = y + 1.0)),
+        :(return (fields, location)))))
+    @test parameters(last(ordered)) == [:y]
+    @test Base.invokelatest(compiled(last(ordered)), 2.0) == 3.0
+
+    # A keyword's name bound later in the body is not read by the plate before it.
+    keyword = programs(Expr(:function, Expr(:tuple, :x, :y), Expr(:block,
+        block(:(cells = hypot(x; scale = y))),
+        block(:(others = y)),
+        :(scale = cells + others),
+        :(return scale))))
+    @test parameters(first(keyword)) == [:x, :y]
+end

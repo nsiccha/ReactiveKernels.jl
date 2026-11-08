@@ -5014,6 +5014,15 @@ _is_plate_block(node) = node isa Expr && node.head === :block &&
 _has_plate_block(node) = _is_plate_block(node) ||
     node isa Expr && node.head !== :quote && any(_has_plate_block, node.args)
 
+# The children of `node` that evaluate. A named-tuple field's or a keyword's name
+# is a label, neither read nor bound: a cell's `(location = m, scale = s)` assigns
+# no `location`, so no program may return one (todo `0xiwc52`).
+function _program_evaluated(node::Expr)
+    node.head === :kw && return node.args[2:end]
+    node.head === :tuple || return node.args
+    Any[arg isa Expr && arg.head === :(=) ? arg.args[2] : arg for arg in node.args]
+end
+
 # Every occurrence of a symbol in `node`, in order, passed to `f`; quoted data
 # and the block `skip` are left out.
 function _program_each_symbol(f, node, skip = nothing; declarations::Bool = true)
@@ -5030,7 +5039,7 @@ function _program_each_symbol(f, node, skip = nothing; declarations::Bool = true
             end
             return nothing
         end
-        for arg in node.args
+        for arg in _program_evaluated(node)
             _program_each_symbol(f, arg, skip; declarations)
         end
     end
@@ -5070,7 +5079,7 @@ function _program_bound!(found, node, skip = nothing; declarations::Bool = true)
     elseif node.head === :local && declarations
         foreach(arg -> _program_bound_target!(found, arg), node.args)
     end
-    for arg in node.args
+    for arg in _program_evaluated(node)
         _program_bound!(found, arg, skip; declarations)
     end
     found
@@ -5117,7 +5126,7 @@ function _program_timeline!(t::_ProgramTimeline, node, clock, names::Set{Symbol}
         get!(t.entered, node, entered)
         t.occurrences[node] = get(t.occurrences, node, 0) + 1
     end
-    for arg in node.args
+    for arg in _program_evaluated(node)
         _program_timeline!(t, arg, clock, names)
     end
     done = clock[] += 1
