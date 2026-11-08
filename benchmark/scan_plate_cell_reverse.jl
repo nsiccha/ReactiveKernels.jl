@@ -13,28 +13,41 @@
 #
 # Arms are timed in shuffled order every round; ratios are paired per round
 # (median [IQR]). Gradients agree with the hand loop's to 1e-8. The Enzyme-only
-# shapes behind the costs are in repro_enzyme_nested_loop_reverse.jl.
+# shapes behind the costs are in repro_enzyme_nested_loop_reverse.jl and
+# repro_enzyme_peeled_loop_reverse.jl.
 #
-# Recorded on gordito, 2026-11-08, RK 0.1.119, one thread, one CPU, 30 rounds,
-# at host load 25-33 on 32 CPUs, as each arm's median ratio to the hand loop
-# (washout: G=38 T=120 / G=113 T=120 / G=38 T=1320; ARMA, HMM: G=38 T=120 /
-# T=1320; top-level scan: T=4560 / T=50160):
+# Recorded on gordito, 2026-11-08, one thread, one CPU, 30 rounds, at host load
+# 25-39 on 32 CPUs, as each arm's median ratio to the hand loop (washout: G=38
+# T=120 / G=113 T=120 / G=38 T=1320; ARMA, HMM: G=38 T=120 / T=1320, against the
+# path in a @noinline callee; top-level scan: T=4560 / T=50160). The dogfood
+# 439590b1 column on Julia 1.10.12 is the median of four runs, the others one:
 #
-#                         Julia 1.10.12      Julia 1.10.12        Julia 1.12.7
-#                         dogfood c9ab4c9    dogfood 5e2cd2bb     dogfood 5e2cd2bb
-#                         libEnzyme 42a2ee9a libEnzyme 576e674a   libEnzyme 576e674a
-#   washout scan cell     1.72 / 1.76 / 1.75 1.08 / 1.11 / 1.16   0.98 / 1.00 / 1.10
+#                         Julia 1.10.12      Julia 1.10.12      Julia 1.10.12      Julia 1.12.7
+#                         dogfood c9ab4c9    dogfood 5e2cd2bb   dogfood 439590b1   dogfood 439590b1
+#                         libEnzyme 42a2ee9a libEnzyme 576e674a libEnzyme 10018598 libEnzyme 10018598
+#                         RK 0.1.119         RK 0.1.119         RK 0.1.124         RK 0.1.124
+#   washout scan cell     1.72 / 1.76 / 1.75 1.08 / 1.11 / 1.16 1.01 / 1.04 / 1.02 0.85 / 0.85 / 0.95
 #   washout, cell calling
-#   the hand loop         1.03 / 1.03 / 1.02 1.05 / 1.05 / 1.06   1.02 / 1.04 / 1.03
-#   ARMA(1,1) scan cell   1.10 / 1.08        0.89 / 0.94          0.78 / 0.88
-#   HMM scan cell         1.30 / 1.32        0.93 / 0.98          0.96 / 0.99
-#   top-level scan        1.07 / 1.03        1.10 / 1.09          1.00 / 1.02
+#   the hand loop         1.03 / 1.03 / 1.02 1.05 / 1.05 / 1.06 1.06 / 1.06 / 1.04 1.01 / 1.05 / 1.05
+#   ARMA(1,1) scan cell   1.10 / 1.08        0.89 / 0.94        0.89 / 1.01        0.79 / 0.86
+#   ARMA(1,1) hand loop,
+#   path inlined          0.93 / 0.98        0.88 / 0.94        0.77 / 0.89        0.76 / 0.84
+#   HMM scan cell         1.30 / 1.32        0.93 / 0.98        0.98 / 1.01        0.94 / 0.99
+#   top-level scan        1.07 / 1.03        1.10 / 1.09        1.07 / 1.04        1.03 / 1.04
 #
-# Runs on RK 0.1.118 earlier the same day, at load 22-70, gave the same
-# picture. Most of the washout cell's remainder is Enzyme's cost for its active
-# per-path weights computed through a branch (Enzyme snag
-# enzyme-reverse-i-6fb5e335); the ARMA and HMM cells' outer values reach the
-# inner loop without one.
+# Dogfood 439590b1 repairs the washout cell's remainder on Julia 1.10: its
+# per-path deposit weights are active values computed through a branch, and
+# Enzyme now rebuilds them once per entry of the inner loop's reverse (Enzyme
+# snag enzyme-reverse-i-6fb5e335). With EnzymeReverseLoopEntryMerges off, the
+# same binary gives 1.07 / 1.15 / 1.09, and dogfood 5e2cd2bb on RK 0.1.124 gives
+# 1.09-1.11 / 1.13-1.14 / 1.13-1.18. One cost remains on 439590b1. RK lowers a
+# scan with its first step peeled, and Enzyme's reverse of a peeled loop costs
+# 5-14% more than the plain loop, in one placement or the other depending on
+# the derivative fast-math flags (Enzyme snag enzyme-reverse-o-919a1558).
+# Dogfood 6bcd8ab's nsz and contract flags cut the inlined hand loop's gradient
+# time by about a third and the peeled RK cell's by less, so the ARMA cell takes
+# 1.01-1.19 times the inlined hand loop, where it took 0.93-1.04 on 5e2cd2bb.
+# An edited copy of the generated code without the peel takes 0.96-1.06 times.
 using Enzyme, Random, Printf
 using ReactiveKernels
 const DI = ReactiveKernels.DifferentiationInterface

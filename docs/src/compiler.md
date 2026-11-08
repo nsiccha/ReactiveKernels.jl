@@ -650,16 +650,16 @@ written. Two cases are also not reached yet:
   `scale[g[i]]` in a cell);
 - `@traceable` helper bodies.
 
-The pass applies to `prepare` and what it compiles, not yet to
-`prepare_nonallocating`, the reactive compiler, the batched lowering or
-`jax_source`. Generated-code display (`code_expr`) shows the rewritten program,
-which is the program that runs. `kernel_graph`, `explain` and the plan show the
-authored recipes.
+The pass applies to `prepare`, `prepare_nonallocating` and what they compile,
+not yet to the reactive compiler, the batched lowering or `jax_source`.
+Generated-code display (`code_expr`) shows the rewritten program, which is the
+program that runs. `kernel_graph`, `explain` and the plan show the authored
+recipes.
 
 **Turning it off.** `prepare(…; simplify = false)` (also `prepare!`,
-`prepare_ad`) compiles the literal arithmetic. `nothing`, the default, takes
-the setting of an enclosing preparation, else the project's preference, else
-`true`:
+`prepare_ad`, `prepare_nonallocating`) compiles the literal arithmetic.
+`nothing`, the default, takes the setting of an enclosing preparation, else the
+project's preference, else `true`:
 
 ```julia
 Preferences.set_preferences!(ReactiveKernels, "simplify" => false)
@@ -696,6 +696,15 @@ over a bound vector of counts is computed once per outer cell, leaving its
 multiplication by a live parameter in the evaluator. A nested recipe that
 still reads a live input remains in the cell. This does not expose the body
 of an opaque child call inside a lazy branch for partial evaluation.
+
+A plate whose bound domain is empty, a binding with no rows, is rewritten as
+a binding with rows is (from ReactiveKernels 0.1.122), so it prepares the same
+program and the same prepared type. It evaluates nothing: its cached per-cell
+values are empty, and a value every cell would share, which the authored plate
+computes only once it has a cell, is a typed placeholder that no cell reads (a
+number's zero, an empty array of a data column's type, a tuple of such
+values). A shared value of another type, such as a struct holding arrays,
+keeps the authored plate.
 
 Cells with equal bound data share their cached values. A call whose
 cell-varying arguments include an array or a record runs once per distinct
@@ -880,8 +889,12 @@ receives one:
 - gathers inside an arm are in bounds by construction.
 
 An empty bound domain has no lanes to group. It runs no cell and evaluates no
-condition. Its result is empty, with the element type inferred from the
-authored native cell, as in Julia's empty broadcast.
+condition its lanes would decide. A condition no lane varies, over literals or
+bound numbers alone (the support guard of a written scale), is decided as for a
+domain with lanes, so the plate over no rows is the plate over rows; if
+evaluating it throws, the plate keeps its branch, which no cell reaches. Its
+result is empty, with the element type inferred from the authored native cell,
+as in Julia's empty broadcast.
 
 So by default the prepared program follows this binding's outcomes: data that
 moves every lane into one arm, or an empty domain, prepares another program
@@ -1216,7 +1229,8 @@ every cell unchanged, so that reverse is one pass over the cells:
   adjoint;
 - the adjoints of shared values (scalars, invariants hoisted above the loop)
   accumulate across cells, and the hoisted invariants are swept once after the
-  loop;
+  loop. A cell value divided by an invariant multiplies by the divisor's
+  inverse, which is hoisted with the divisor;
 - a batched operand's cotangent is added into its shadow at the cell. A
   gathered operand, such as `_readonly_gather(z, g)`, is a view, so its shadow
   scatters the cotangent into `z`'s, repeated indices included.
@@ -1224,7 +1238,11 @@ every cell unchanged, so that reverse is one pass over the cells:
 Each call's partials come from DiffRules, the table ForwardDiff and
 ReverseDiff use, or for a call whose derivative reads its own result (`exp`,
 `sqrt`) and for RK's own arithmetic, from the generator's spelling through
-that result. No rule attaches to a function this repository does not own. Lazy
+that result. A stable rewrite's helper call (`_rk_log_of(exp, u)` for
+`log(exp(u))`, see "Stable rewrites" above) is expanded into the method its
+operands select, read from that method's lowered code, so its stable form's
+primitives take their partials in the same way. No rule attaches to a function
+this repository does not own. Lazy
 branches stay lazy: each arm's reverse runs inside that arm, under the
 condition the forward stored. The primal is the program itself, so values are
 unchanged.
@@ -1235,6 +1253,80 @@ batched operand such as a tuple). [`plate_reverse_report`](@ref) names, for each
 plate program of a prepared kernel, whether its gradient is the generated
 reverse and otherwise why not. Forward-mode and higher-order operators keep
 differentiating the program with the backend.
+
+### Slices a cell only reads
+
+A plate cell that passes a slice to a function copies it at every cell, and
+native reverse also allocates the copy's shadow and adds its adjoint back into
+the parent's:
+
+```julia
+coefficients = reshape(z, blocks, width)
+field = plate(block, coordinates) do b, c
+    row = coefficients[b, :]
+    state(frequency, row, c)
+end
+```
+
+When preparation can prove that every reader of the slice only reads it, the
+cell reads it through a `view` instead (`_readonly_slice`, printed as such by
+`code_expr`). The proof is per callee and uses concrete types, so it needs the
+evidence `prepare(...; exemplars)` supplies; `prepare_sampler` and the cell
+queries pass it. It has two parts, and both must hold:
+
+- **The callee only reads the view.** A walk over the optimized typed code
+  follows every value derived from the argument until it holds no reference.
+  It knows only reads: anything else that meets a derived value (a store, a
+  foreign call, a dynamic call, a `try`) ends the proof, and so does returning
+  it. A callee's own buffers and its other arguments are not derived, so a
+  callee that writes a local vector, or hands another argument to BLAS
+  (`correlation * raw`), still qualifies, which Julia's effect analysis does not
+  establish. That holds for a vararg frame too, such as the callable an
+  authored cell call runs through: when its body reads the argument tuple only
+  element by element, the walk follows the slice's element alone. A call's
+  result counts as derived only when the callee may return a value derived from
+  the slice, so a callee may return a fresh vector it computed from the slice's
+  values, as a vector-valued cell does.
+- **The callee cannot tell a view from a copy.** The walk above reads code that
+  has already selected the view's branch and method, so the lowered body of each
+  user-level frame is read too. The argument may only reach Base's array
+  interface (`getindex`, `size`, `length`, `axes`, `iterate`, `maximum`, ...) or
+  a user function whose methods admit a view and a copy alike and whose own body
+  passes this test. Base's other functions end the proof, and so do
+  `x isa Vector`, `typeof(x)`, `parent(x)` and a `Vector` method beside an
+  `AbstractVector` one.
+
+The reader must also infer one concrete result type over the view and the copy,
+the slice's elements must be bits values, and the slice must not be the cell's
+result. A bound array keeps its copy: `bound=` holds the caller's data.
+
+Any refusal keeps the copy, so it costs what the program cost before and can
+never change a value. That includes a dotted call or BLAS over the slice, whose
+alias test or foreign call the walk does not follow, and a closure capturing the
+slice. It also includes a slice nested in a call of a `@kernel` plate
+(`state(frequency, coefficients[b, :], c)`), which is one recipe with that call;
+`@rkppl` splits such a slice into a recipe of its own, so a model's cells qualify.
+Scan steps, plates nested in a cell and position residuals (which keep their lane
+slots) also keep their copies. A plate a cell query or partition computes at its
+rows reads its slices in place like any other, including one row of a value computed
+only at those rows (`_CellWindow`); a gather of several rows of such a value keeps
+its copy.
+Set `RK_READONLY_SLICES=0` to keep every copy, as a comparison baseline.
+
+To see why a slice keeps its copy, set `JULIA_DEBUG=ReactiveKernels` before
+preparing. Preparation then logs each refused slice at the debug level (group
+`:readonly_slices`): the slice, the reason, the reader and, when the read-only
+proof refused, each frame that refused, innermost first, with the statement of
+its optimized code it stopped at.
+
+Values are the copy's bit for bit. The interface leaves out `sum` and `prod`:
+Base may fold a view in another order than an array (a matrix slice `A[I, :]`
+on every version, and on Julia 1.13 a row too), so a reader that sums the slice
+keeps its copy. Gradients can differ from the copy's in the last bit. The view's
+adjoint accumulates straight into the parent's shadow, where Enzyme's contracted
+derivative arithmetic (the dogfood default, `nsz` and `contract`) may fuse a
+multiply-add that the copy's shadow rounds twice. Under strict derivative
+arithmetic (`Enzyme.API.fast_math_flags!()`) the gradients are identical.
 
 ### Nested observation plates
 
@@ -1995,11 +2087,13 @@ and plate loops stay inline. This shows in `code_expr` as
 wrapper saves no compile time, and each wrapped statement becomes its own
 differentiated call with its own tape, which a one-subject cell pays on every
 gradient. The count is of the program's statements, never of its data.
-A type or function argument of such a statement
-crosses the wrapper in a carrier (`_PartitionType`, `_PartitionFunction`):
-Julia compiles a `Vararg{Any}` position holding a type as `::Type`, and one
-holding a function the method does not call as `::Function`, so without it
-the wrapper dispatched the statement at run time.
+The wrapper has one positional method per operand count, as `_PlateCall` does,
+and a statement with more operands stays inline. Through a `Vararg{Any}`
+method Julia would compile a position holding a type as `::Type`, and one
+holding a function the method does not call as `::Function`, and dispatch the
+statement at run time. Its one argument tuple also hides a structured operand's
+activity from Enzyme, so a derivative rule would receive its bound data record
+`Duplicated` rather than `Const`.
 `plan_constant`
 names HAVE ports whose values are constant per label (not data for the plan),
 and a lazy view of inputs may serve its rows from its parts

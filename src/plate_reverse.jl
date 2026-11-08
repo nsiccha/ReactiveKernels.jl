@@ -148,6 +148,8 @@ function _pr_flatten!(stmts::Vector{Any}, ex, ctx::_PRCtx)
         return nothing
     elseif Meta.isexpr(ex, :call)
         f, fref = _pr_resolve_lenient(ex.args[1], ctx)
+        expanded = _pr_expand_stable_helper(f, ex.args[2:end], ctx)
+        expanded === nothing || return _pr_flatten!(stmts, expanded, ctx)
         args = Any[_pr_flatten!(stmts, a, ctx) for a in ex.args[2:end]]
         lhs = _pr_tmp!(ctx)
         push!(stmts, _PRCall(lhs, f, fref, args))
@@ -171,6 +173,85 @@ function _pr_flatten!(stmts::Vector{Any}, ex, ctx::_PRCtx)
         return lhs
     end
     _pr_fail("unsupported expression `$(sprint(show, ex))`")
+end
+
+# A stable-rewrite helper call (`_rk_log_of(_native_exp, u)`, emitted by
+# `src/stable_rewrites.jl`) expanded into the body of the method its operands
+# select, read from Julia's lowered code of that method: the helper is its own
+# single source, and the primitives of its stable form (`float`, `log1pexp`,
+# `expm1`, …) take their partials as any other call does. An operand the
+# generator cannot type is a cell value, which this generator takes to be a
+# real scalar throughout (`Float64` selects the same `Real` method). Returns
+# `nothing` for any other call, and for a method body with control flow, which
+# then keeps the helper call (and fails only if its derivative is needed).
+function _pr_expand_stable_helper(f, argexprs, ctx::_PRCtx)
+    f isa Function && any(h -> h === f, _RK_STABLE_HELPERS) || return nothing
+    types = Any[_pr_operand_type(a, ctx) for a in argexprs]
+    match = Base._which(Tuple{typeof(f),types...})
+    cis = Base.code_lowered(f, Tuple{types...})
+    length(cis) == 1 || return nothing
+    ci = only(cis)
+    block = Any[]
+    slots = Dict{Int,Any}(1 => f)
+    for (i, a) in enumerate(argexprs)
+        s = _pr_tmp!(ctx, :rw_arg)
+        push!(block, :($s = $a))
+        slots[i + 1] = s
+    end
+    ssa = Dict{Int,Any}()
+    function conv(x)
+        x isa Core.SSAValue && return ssa[x.id]
+        x isa Core.SlotNumber && return slots[x.id]
+        x isa Core.Argument && return slots[x.n]
+        Meta.isexpr(x, :static_parameter) && return match.sparams[x.args[1]]
+        x isa Expr && return Expr(x.head, Any[conv(a) for a in x.args]...)
+        x
+    end
+    for (k, st) in enumerate(ci.code)
+        if st isa Core.ReturnNode
+            isdefined(st, :val) || return nothing
+            push!(block, conv(st.val))
+            return Expr(:block, block...)
+        elseif st isa Union{Core.GotoNode,Core.GotoIfNot} || Meta.isexpr(st, :enter) ||
+               Meta.isexpr(st, :leave)
+            return nothing
+        elseif st === nothing || st isa Core.NewvarNode || Meta.isexpr(st, :meta) ||
+               Meta.isexpr(st, :inbounds) || Meta.isexpr(st, :loopinfo)
+            ssa[k] = nothing
+        elseif Meta.isexpr(st, :(=), 2) && st.args[1] isa Core.SlotNumber
+            s = _pr_tmp!(ctx, :rw)
+            push!(block, :($s = $(conv(st.args[2]))))
+            slots[st.args[1].id] = s
+            ssa[k] = s
+        elseif Meta.isexpr(st, :call, 3) && st.args[1] == GlobalRef(Base, :getproperty) &&
+               st.args[2] isa GlobalRef && st.args[3] isa QuoteNode &&
+               isdefined(st.args[2].mod, st.args[2].name) &&
+               getglobal(st.args[2].mod, st.args[2].name) isa Module
+            # `M.f`, a module member: the reference itself.
+            ssa[k] = GlobalRef(getglobal(st.args[2].mod, st.args[2].name), st.args[3].value)
+        elseif Meta.isexpr(st, :call)
+            s = _pr_tmp!(ctx, :rw)
+            push!(block, :($s = $(conv(st))))
+            ssa[k] = s
+        else
+            ssa[k] = conv(st)
+        end
+    end
+    nothing
+end
+
+# The type of a helper operand as the generator can know it: a constant
+# (function, literal, `Val(k)`), else a real scalar cell value.
+function _pr_operand_type(a, ctx::_PRCtx)
+    a isa Number && return typeof(a)
+    if a isa GlobalRef
+        isdefined(a.mod, a.name) && return typeof(getglobal(a.mod, a.name))
+    elseif a isa Symbol && haskey(ctx.values, a)
+        return typeof(ctx.values[a])
+    elseif Meta.isexpr(a, :call, 2) && a.args[1] == GlobalRef(Base, :Val) && a.args[2] isa Integer
+        return Val{a.args[2]}
+    end
+    Float64
 end
 
 # ---------------------------------------------------------------- partials
@@ -205,6 +286,8 @@ function _pr_result_partials(f, y, args)
         return Any[p == 2 ? :(2 * $(args[1])) : :($p * $(args[1])^$(p - 1)), nothing]
     end
     f === Base.float && return Any[1.0]
+    # `convert(T, x)` to a float type (a stable form's `_rw_float`).
+    f === Base.convert && length(args) == 2 && return Any[nothing, 1.0]
     if f === Base.:*
         # n-ary product: ∂/∂a_k = ∏_{j≠k} a_j
         return Any[length(args) == 2 ? args[3-k] :
@@ -281,7 +364,8 @@ function _pr_activity!(active::Set{Symbol}, stmts)
         if s isa _PRAlias
             s.rhs isa Symbol && s.rhs in active && push!(active, s.lhs)
         elseif s isa _PRCall
-            s.f in _PR_NONDIFF && continue
+            # `_rw_float` computes a stable form's float type.
+            (s.f in _PR_NONDIFF || s.f === _rw_float) && continue
             any(a -> a isa Symbol && a in active, s.args) && push!(active, s.lhs)
         elseif s isa _PRBranch
             _pr_activity!(active, s.then_stmts)
@@ -475,11 +559,54 @@ function _pr_assignments!(out, ex)
     out
 end
 
+# The dataflow of `ex` as `target => source` pairs, for activity: its
+# assignments, plus every in-place write, whose array depends on what it
+# writes (`x[i] = v`, and a `f!(x, …)` call by Julia's naming convention), and
+# the parameters of an inlined function call, which alias their arguments both
+# ways. The native lowering allocates a pointwise plate's output with
+# `_plate_similar_output` and fills it inside such a call
+# (`buf[index] = value`), so an assignment-only analysis would take a buffer of
+# active values for a constant and drop its gradient (ODL's calibrated hourly
+# amplitudes, todo 093ym5a). Over-approximating activity only costs a fallback.
+function _pr_dataflow!(out, ex)
+    ex isa Expr || return out
+    ex.head === :quote && return out
+    if ex.head === :(=) && length(ex.args) == 2
+        lhs = ex.args[1]
+        if lhs isa Symbol || Meta.isexpr(lhs, :(::), 2) && lhs.args[1] isa Symbol
+            push!(out, (lhs isa Symbol ? lhs : lhs.args[1]) => ex.args[2])
+        elseif Meta.isexpr(lhs, :ref) && lhs.args[1] isa Symbol
+            push!(out, lhs.args[1] => ex.args[2])
+        end
+    elseif ex.head === :call
+        f = ex.args[1]
+        name = f isa Symbol ? f : f isa GlobalRef ? f.name :
+               Meta.isexpr(f, :., 2) && f.args[2] isa QuoteNode ? f.args[2].value : nothing
+        if name isa Symbol && endswith(String(name), "!") && length(ex.args) >= 2 &&
+                ex.args[2] isa Symbol
+            push!(out, ex.args[2] => Expr(:tuple, ex.args[3:end]...))
+        end
+        if Meta.isexpr(f, :function, 2) || Meta.isexpr(f, :->, 2)
+            ps = f.args[1]
+            for (p, a) in zip(Meta.isexpr(ps, :tuple) ? ps.args : Any[ps], ex.args[2:end])
+                pn = _pr_param_name(p)
+                pn isa Symbol && a isa Symbol && pn !== a || continue
+                push!(out, pn => a)
+                push!(out, a => pn)
+            end
+        end
+    end
+    for a in ex.args
+        _pr_dataflow!(out, a)
+    end
+    out
+end
+
 # Every symbol that depends on an active parameter (a fixed point over the
-# body's assignments; `let` bindings are assignments too).
+# body's dataflow; `let` bindings are assignments too).
 function _pr_program_activity(body, active_params, mod, values)
     active = Set{Symbol}(active_params)
-    pairs = _pr_assignments!(Pair{Symbol,Any}[], body)
+    pairs = _pr_dataflow!(Pair{Symbol,Any}[], body)
     changed = true
     while changed
         changed = false
@@ -638,6 +765,27 @@ function _pr_invariant_statements(stmts, st, cellvars::Set{Symbol})
     invariant
 end
 
+# Rewrite each cell-varying `lhs = x / d` with an invariant divisor `d` as
+# `lhs = x * lhs_inverse` after `lhs_inverse = inv(d)`, and add the inverse to
+# `invariant`, so it is hoisted above the loop with the divisor.
+function _pr_hoist_inverse_divisors(stmts, invariant::Set{Symbol}, cellvars::Set{Symbol})
+    out = Any[]
+    for s in stmts
+        if s isa _PRCall && s.f === Base.:/ && length(s.args) == 2 && !(s.lhs in invariant)
+            d = s.args[2]
+            if !(d isa Symbol) || d in invariant || !(d in cellvars)
+                inverse = Symbol(s.lhs, :_inverse)
+                push!(out, _PRCall(inverse, Base.inv, GlobalRef(Base, :inv), Any[d]))
+                push!(out, _PRCall(s.lhs, Base.:*, GlobalRef(Base, :*), Any[s.args[1], inverse]))
+                push!(invariant, inverse)
+                continue
+            end
+        end
+        push!(out, s)
+    end
+    out
+end
+
 # Specialise `stmts` with each known condition symbol fixed to a Bool: a branch
 # whose condition is known keeps only its taken arm.
 function _pr_fold(stmts, known::Dict{Symbol,Bool})
@@ -735,6 +883,10 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
         folded = _pr_fold(Any[s isa _PRCall && haskey(known, s.lhs) ? _PRAlias(s.lhs, known[s.lhs]) : s
                               for s in stmts], known)
         inv2 = _pr_invariant_statements(folded, st, cellvars)
+        # A cell value divided by an invariant one multiplies by the divisor's
+        # inverse, computed once above the loop. This recomputed forward only
+        # feeds partials; the primal value is the program's own.
+        folded = _pr_hoist_inverse_divisors(folded, inv2, cellvars)
         hoisted = Any[s for s in folded if (s isa _PRAlias || s isa _PRCall) && s.lhs in inv2]
         inloop = Any[s for s in folded if !((s isa _PRAlias || s isa _PRCall) && s.lhs in inv2)]
         active = copy(st.active)
@@ -742,13 +894,18 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
             _pr_mark_reads!(active, folded, st)
             _pr_activity!(active, folded)
         end
-        # The cell's forward: hoisted invariants above the loop, the rest in it;
-        # the reverse sweep covers every statement (an invariant's adjoint is
-        # per cell, through its in-loop uses).
+        # The cell's forward: hoisted invariants above the loop, the rest in it.
         forward_in = _pr_forward_exprs(inloop)
         forward_pre = _pr_forward_exprs(hoisted)
         reverse = Any[]
+        after = Any[]
+        # A hoisted invariant is a shared value of the loop: its adjoint
+        # accumulates across cells from its in-loop uses, and its own reverse
+        # runs once, after the loop.
+        hoisted_active = Symbol[s.lhs for s in hoisted if s.lhs in active]
+        init = Any[:($(_pr_bar(h)) = 0.0) for h in hoisted_active]
         defined = Set{Symbol}(_pr_bar(s) for s in st.outer if !(s in st.totals))
+        union!(defined, (_pr_bar(h) for h in hoisted_active))
         if result isa Symbol && result in active
             rbar = _pr_bar(result)
             push!(reverse, :($rbar = $(_pr_bar(total))))
@@ -756,14 +913,17 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
             leaf = s -> _pr_is_read(s, st) && s.lhs in active ?
                 :($(GlobalRef(@__MODULE__, :_pr_shadow_add!))(
                     $(st.shadow[st.prepared[s.args[1]]]), $linear, $(_pr_bar(s.lhs)))) : nothing
-            _pr_reverse_exprs!(reverse, folded, active, defined; leaf, touched = st.touched)
+            _pr_reverse_exprs!(reverse, inloop, active, copy(defined); leaf, touched = st.touched)
+            _pr_reverse_exprs!(after, hoisted, active, copy(defined); touched = st.touched)
         end
         quote
             $(forward_pre...)
+            $(init...)
             @inbounds for $linear in $range
                 $(forward_in...)
                 $(reverse...)
             end
+            $(after...)
         end
     end
     isempty(keys_) && return variant(())
@@ -994,9 +1154,9 @@ with_plate_reverse(f, enabled::Bool = true) =
 # The parameter names of a kernel body `function (__constants__, __callables__, ports...)`.
 _pr_param_name(p) = p isa Symbol ? p : Meta.isexpr(p, :(::)) ? p.args[1] : nothing
 
-# Symbols of `body` that depend on `active` (outer dataflow over assignments).
+# Symbols of `body` that depend on `active` (outer dataflow, `_pr_dataflow!`).
 function _pr_body_activity(body, active::Set{Symbol})
-    pairs = _pr_assignments!(Pair{Symbol,Any}[], body)
+    pairs = _pr_dataflow!(Pair{Symbol,Any}[], body)
     changed = true
     while changed
         changed = false

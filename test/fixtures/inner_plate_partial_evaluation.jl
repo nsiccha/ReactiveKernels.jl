@@ -133,6 +133,18 @@ end
     total::Float64 = sum(pointwise)
 end
 
+# A bound column every cell reads whole, as RKPPL passes a data column that a
+# cell indexes: its value is shared by every cell and is an array, not a number.
+@kernel atomic_column(q::Float64, data, column) = begin
+    pointwise = plate(data, q) do d, parameter
+        scaled::Vector{Float64} = 2.0 .* column
+        transformed::Float64 = counted_log(d) + sum(scaled)
+        result::Float64 = transformed * parameter
+        result
+    end
+    total::Float64 = sum(pointwise)
+end
+
 @kernel chain(q::Float64, data, observations) = begin
     means = plate(data, q) do d, parameter
         transformed::Float64 = counted_log(d)

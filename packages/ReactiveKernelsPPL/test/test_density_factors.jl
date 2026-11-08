@@ -214,6 +214,9 @@ end
     @test sort(unique(recording.reads)) == support
     ad = prepare_query_ad(prepare_ad, built, plan, jac, _FACTOR_REVERSE, u;
         coordinates = :support)
+    # This program reads scalars of the compact overlay, never the overlay at a
+    # partition's rows, so no Enzyme dogfood repair is checked for it.
+    @test !ReactiveKernels._reads_lazy_view_rows(ad.prepared.kernel)
     for shift in (0.0, 0.2)
         active = u[support] .+ shift
         point = copy(u)

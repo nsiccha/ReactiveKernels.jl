@@ -699,10 +699,10 @@ end
     @test ReactiveKernels._partition_statement_call(sum, [1.0, 2.0]) === 3.0
     @test ReactiveKernels._partition_statement_call(+, 1.0, 2.0) === 3.0
     # Julia compiles a `Vararg{Any}` position holding a type as `::Type`, and one
-    # holding a function the method does not call as `::Function`. The wrapper
-    # read the type and dispatched `similar` (or `map`) at run time; BRM's NLME
-    # partition sampler warned on it (snag partition-array-bb24ae62). The
-    # wrapper RK actually invokes is audited here, not only its inferred result.
+    # holding a function the method does not call as `::Function`. A wrapper of
+    # that form read the type and dispatched `similar` (or `map`) at run time;
+    # BRM's NLME partition sampler warned on it (snag partition-array-bb24ae62).
+    # The wrapper RK actually invokes is audited here, not only its inferred result.
     let x = [1.0, 2.0], output_axes = (Base.OneTo(3),), scale = 2.0
         statement = ReactiveKernels._partition_statement_call
         audit(T...) = ReactiveKernels._code_findings(statement, T)

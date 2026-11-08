@@ -539,30 +539,35 @@ end
 
 function ReactiveKernels.prepare_nonallocating(p::ReactiveKernels.Plan,
                                                exemplars...;
-                                               passes = (), bound = ())
-    # As ordinary `prepare`: cell-only producers compose before the bound split.
-    bound === () ||
-        (p = ReactiveKernels._fuse_authored_plate_chains(p; cells_only = true))
-    p = ReactiveKernels._partial_apply(p, bound)
-    have_types = ReactiveKernels._nonalloc_exemplar_types(p, exemplars)
-    ReactiveKernels._prepare_nonallocating(p, cache_apply!; have_types,
-        exact_signature = have_types !== nothing, passes)
+                                               passes = (), bound = (),
+                                               simplify = nothing)
+    ReactiveKernels._with_simplify(simplify) do
+        # As ordinary `prepare`: cell-only producers compose before the bound split.
+        fused = bound === () ? p :
+            ReactiveKernels._fuse_authored_plate_chains(p; cells_only = true)
+        applied = ReactiveKernels._partial_apply(fused, bound)
+        have_types = ReactiveKernels._nonalloc_exemplar_types(applied, exemplars)
+        ReactiveKernels._prepare_nonallocating(applied, cache_apply!; have_types,
+            exact_signature = have_types !== nothing, passes)
+    end
 end
 
 function ReactiveKernels.prepare_nonallocating(g::ReactiveKernels.Graph,
                                                 exemplars...;
                                                 have = (), want = (), passes = (),
-                                                bound = ())
+                                                bound = (), simplify = nothing)
     p = ReactiveKernels.plan(g; have = have, want = want)
     ReactiveKernels.prepare_nonallocating(p, exemplars...; passes = passes,
-                                          bound = bound)
+                                          bound = bound, simplify = simplify)
 end
 
 # The natural consumer call after benchmarking an ordinary prepared kernel:
 # reuse its already-selected plan.
 function ReactiveKernels.prepare_nonallocating(k::ReactiveKernels.PreparedKernel,
-                                                exemplars...; passes = ())
-    ReactiveKernels.prepare_nonallocating(k.plan, exemplars...; passes = passes)
+                                                exemplars...; passes = (),
+                                                simplify = nothing)
+    ReactiveKernels.prepare_nonallocating(k.plan, exemplars...; passes = passes,
+                                          simplify = simplify)
 end
 
 end # module ReactiveKernelsMutatingFunctionsExt

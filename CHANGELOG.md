@@ -16,6 +16,150 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.126
+
+- A plate cell's slice is read in place when its reader hands another argument
+  to BLAS or a foreign call, or returns a fresh array. The read-only proof
+  follows the slice through the callee's optimized code, but an authored cell
+  call (any `@rkppl` or BRM cell `f(a, A[i, :])`) runs through a callable that
+  takes its arguments as one vararg tuple, and the proof followed that whole
+  tuple: every array argument counted as the slice, so a callee that only
+  indexes its row and mixes its result with another argument
+  (`correlation * raw`, a `gemv!` on `correlation`) kept a copy per cell. The
+  proof now follows only the slice's element of a tuple the body reads element
+  by element; a tuple used any other way is followed whole, as before. And it
+  counted any array a call returned as derived from the slice, so a
+  vector-valued cell (the result of `correlation * raw`) kept its copy too; a
+  call's result is now derived only when the callee may return a value derived
+  from the slice. The slice itself is held to the same rules as before: no
+  write, store, return or foreign call.
+- Preparation logs why a slice keeps its copy. With
+  `JULIA_DEBUG=ReactiveKernels`, each refused slice is logged at the debug
+  level (group `:readonly_slices`) with the reason, its reader and, when the
+  read-only proof refused, each frame that refused and the statement of its
+  optimized code it stopped at. See "Slices a cell only reads" in the compiler
+  guide.
+
+## 0.1.125
+
+- A program that native Enzyme differentiates only with a repair on Enzyme's
+  `dogfood` line can name that repair before its derivative is prepared
+  (`_require_enzyme_repairs(backend, repairs, requester, floor)`; the Enzyme
+  extension supplies it). On Julia 1.10, with an Enzyme backend (`AutoEnzyme`,
+  or a `SecondOrder` holding one), it calls `Enzyme.require_dogfood_repairs`
+  where Enzyme reports its repairs (dogfood from `a68104d`), which throws
+  `Enzyme.DogfoodRepairMissing` naming each missing one. Where Enzyme cannot
+  report them (a registered release, older dogfood) it warns once per requester,
+  naming the floor, and lets the derivative be prepared. Other backends and
+  Julia versions are not checked.
+- `_reads_lazy_view_rows(kernel)` says whether a prepared program reads a lazy
+  view (`_cell_lazy_view`) at a cell's rows through `_cell_source_rows`, that is,
+  takes a `view` of the lazy array itself at those rows. On Julia 1.10 native
+  Enzyme can need dogfood repair `const_slot_reloads` for that shape: in a large
+  enough program it raises `EnzymeRuntimeActivityError` without it (snag
+  `rk-partition-pat-8d339a5f`). The check finds the shape, not the size.
+
+## 0.1.124
+
+- A plate cell reads a slice in place when every call that reads it provably
+  only reads it. A row, column or gather passed to a function (`row = A[i, :]`
+  then `f(a, row)`, and any `@rkppl` cell `f(a, A[i, :])`, which RKPPL splits
+  so) allocated a copy per cell, and native reverse its shadow, so a row read by
+  an opaque function was the largest single item of a large field model's
+  gradient. Preparation with `exemplars` (`prepare_sampler` and the partition
+  and cell queries pass them) now proves from the callee's code that it writes
+  nothing derived from the slice, does not return it, and cannot tell a view
+  from a copy, and then emits `view`. On a toy model of that shape a gradient
+  takes 0.41 to 0.54 of the time, and its bytes stop growing with the row; a
+  partition's unit gradient, the path SVI runs, is read in place too. Values are
+  the copy's bit for bit. Gradients can differ in the last bit where Enzyme's
+  contracted derivative arithmetic (the dogfood default) fuses a multiply-add
+  into the parent's shadow, and are identical under strict arithmetic. A callee
+  the proof cannot follow keeps its copy, which costs what it cost: a dotted
+  call or BLAS over the slice, `sum` or `prod` of it (Base may fold a view in
+  another order), a closure capturing it, a callee with a `Vector` method beside
+  its generic one. Scan steps, plates nested in a cell, a slice nested in a
+  `@kernel` plate's call and a gather of several rows of a value a cell query
+  computes only at its rows also keep their copies. `RK_READONLY_SLICES=0` keeps
+  every copy, for comparison. See "Slices a cell only reads" in the compiler
+  guide.
+
+## 0.1.123
+
+- `prepare_nonallocating`, and through it
+  `prepare_sampler(...; nonallocating = true)`, now runs the stable rewrites
+  `prepare` runs: a composition such as `log(exp(u))`, `log.(exp.(x))`,
+  `log(1 / (1 + exp(-u)))` or a branch arm's `log(s)` of `s = exp(u)` is
+  computed in its stable form, inside its buffered steps too. A non-allocating
+  kernel's values and ordinary-Reverse gradients change where `exp` overflows
+  or underflows, from `NaN` or an infinity to the finite value `prepare` gives,
+  and by rounding elsewhere: they now agree with `prepare` bitwise on the four
+  PosteriorDB models that differed.
+- New: `prepare_nonallocating` takes `simplify`, as `prepare` does;
+  `simplify = false` or the project's `simplify` preference keeps the literal
+  program. A `PreparedKernel` argument contributes its plan, not its own
+  setting.
+- A rewritten dotted call (`log.(exp.(x))`) no longer allocates its inner
+  function as a `Ref` on each call, in `prepare` too.
+
+## 0.1.122
+
+- A plate over no rows prepares the program the same plate over rows
+  prepares, by default (no `branch_arms` setting needed). The pass that caches
+  a plate cell's work over bound data per lane at preparation used to leave a
+  plate with an empty bound domain as authored, so a binding with no rows (an
+  RKPPL `@plate` whose data column is empty, such as a region without spectra)
+  prepared another program, another sampler type and another compile than a
+  binding with rows. It now rewrites an empty domain as it rewrites a nonempty
+  one. It evaluates nothing: the cached per-cell values are empty, and a value
+  every cell would share is a typed placeholder that no cell reads. Such a
+  value now also has a placeholder when it is an array (a data column a cell
+  reads whole gets an empty one of its type) or a tuple or named tuple of
+  values that have one; with `branch_arms = :all`, 0.1.119 left the plate as
+  authored for these. Values and gradients are unchanged, and a binding with
+  rows prepares exactly the program it prepared before. A shared value of
+  another type (a struct holding arrays) still keeps the authored plate.
+  A branch whose condition no lane varies, such as the support guard of a
+  written scale, is decided for a plate over no rows as for one over rows; a
+  condition that throws there keeps the plate. A branch its lanes decide still
+  prepares a program per arm pattern unless `branch_arms = :all` (0.1.119).
+
+## 0.1.121
+
+- The opt-in generated summed-plate reverse (`with_plate_reverse`, preference
+  `plate_reverse = "on"`) no longer returns a wrong gradient. Before, a plate
+  program reading an array that another plate filled in place
+  (`_plate_similar_output`, then `buf[index] = value`), or an operand Enzyme
+  differentiated but the generated reverse did not, got a zero cotangent with
+  no error. On ODLPlaus's SH v5 model 798 of 890 gradient coordinates were
+  wrong. Its activity analysis now follows in-place writes, and any call
+  whose active operands the generated reverse does not cover takes Enzyme's
+  ordinary reverse, so a coverage gap costs speed, never correctness. Plate
+  programs with more than 32 operands, and lazy cell-broadcast operands
+  (`MixedDuplicated`), no longer fail.
+- With the stable rewrites (0.1.117, on by default), plates where a rewrite
+  fires take the generated reverse again: each `_rk_*_of` helper call is
+  expanded into the method its operands select.
+- Hoisted cell invariants are swept once after the loop, and a division by
+  an invariant multiplies by its hoisted inverse: about 1.17x faster on a
+  Gaussian random-intercept plate.
+
+## 0.1.120
+
+- A derivative rule whose data input is a structure (a record or tuple holding
+  arrays) differentiates in a planned partition body of
+  `_PARTITION_SEPARATE_MIN` or more statements, with either spelling of that
+  input: `geometry = nothing`, or a cotangent port that returns `nothing`. The
+  wrapper such a body calls its array statements through took its operands as
+  one tuple, which hid the structure's constant activity from Enzyme. Reverse
+  then failed with `no method matching _accumulate!(::Record, ::Nothing)` for
+  the port spelling and `data-only input requires Const` for the declared one,
+  and a body with fewer statements passed. The wrapper now has one positional
+  method per operand count, and a statement with more than 64 operands stays
+  inline. A child kernel prepared for a lazy arm forwarded its operands the same
+  way and failed the same way with a rule in its body; it has the same methods
+  (snag `derivativerule-r-0d7e245c`).
+
 ## 0.1.119
 
 - New, opt-in: `branch_arms = :all`, a `prepare` keyword and the

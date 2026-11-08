@@ -16,6 +16,53 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.131
+
+- A compact factor query (`prepare_query_ad(...; coordinates)`) whose
+  coordinates cover its factors' support, as `coordinates = :support` always
+  does, reads a parameter block at a partition's rows from the active vector,
+  at slots its plan computes once per query. Before, every element read went
+  through the packed overlay: a lookup in the sparse slot map and a branch.
+  Gradients are bit-identical in the measured models; values agree to within
+  rounding (relative 1e-15).
+  Native Enzyme Reverse, Julia 1.10.12: a 2048-entry hierarchical prior's
+  gradient takes 7–9 µs instead of 80–89 µs and its value 1–2 µs instead of
+  66–78 µs; 256 eight-entry unit queries of it take a median 23–27 µs per
+  sweep instead of 42–45 µs (snag `compact-factor-q-abfa7a8e`). Coordinates
+  that leave a coordinate the factors read to the base keep the overlay read,
+  and the Enzyme check of 0.1.130 now applies only to them. The rebound program
+  before 0.1.123 read the overlay the same way, so this was not a regression.
+
+## 0.1.130
+
+- Preparing a compact factor query (`prepare_query_ad(...; coordinates)`) whose
+  program reads a parameter block at a partition's rows checks the loaded
+  Enzyme first, on Julia 1.10 with an Enzyme backend. Its native
+  differentiation can need dogfood repair `const_slot_reloads` (dogfood
+  `0147c6f`): in a large enough program the first gradient raised a misleading
+  `EnzymeRuntimeActivityError` without it, after the whole preparation (snag
+  `rk-partition-pat-8d339a5f`). Dogfood from `a68104d` reports its repairs, so
+  a missing one throws `Enzyme.DogfoodRepairMissing` at preparation. Registered
+  Enzyme and older dogfood cannot report them and get one warning naming the
+  floor. A query that reads the overlay only by scalars, and other Julia
+  versions, are not checked. Needs ReactiveKernels 0.1.125.
+
+## 0.1.129
+
+- A `@plate` output whose cell reads no per-index value, such as
+  `c[i] = exp(log_a)` or `c[i] = 0.5`, holds one value per index, as the Julia
+  loop leaves it: over three indices `c` is three entries, so a later plate's
+  `c[i]`, `length(c)` and `sum(c)` read them all. Before, `c` was the bare
+  scalar: a later plate's `c[2]` raised `BoundsError: attempt to access
+  Float64 at index [2]`, and `sum(c)` and `length(c)` returned one entry's
+  value with no error, so a density reading them was wrong (snag
+  `plate-output-of-c4a0ca87`). It is one RK plate over the plate's indices,
+  read from the data when the model runs, and RK evaluates its shared work once
+  per call. Plates lowered through whole-array broadcasts were affected, such
+  as one whose cells only compute values or draw per-index latents; a plate
+  whose cells observe data already kept one value per index
+  (`test_invariant_plate_outputs.jl`).
+
 ## 0.1.128
 
 - Under `prepare_sampler(...; nonallocating = true)`, a program that factors a

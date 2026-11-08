@@ -50,7 +50,64 @@ end
     y_dot::Vector{Float64} = zero(y)
     return y, y_dot
 end
+
+# A record of the kinds a fitted footprint holds: floats and indices in arrays, a
+# lookup table and a count.
+struct Footprint
+    weights::Vector{Float64}
+    index::Vector{Int32}
+    lookup::Dict{Int,Int}
+    count::Int
 end
+
+@kernel declared_record(x::Vector{Float64}, s::Float64, geometry,
+        x_dot::Vector{Float64}, s_dot::Float64, y_bar::Float64) = begin
+    y::Float64 = s * sum(x .* geometry.weights)
+    y_dot::Float64 = s_dot * sum(x .* geometry.weights) + s * sum(x_dot .* geometry.weights)
+    x_bar::Vector{Float64} = (y_bar * s) .* geometry.weights
+    s_bar::Float64 = y_bar * sum(x .* geometry.weights)
+    return y, y_dot, x_bar, s_bar
+end
+
+@kernel record_port(x::Vector{Float64}, s::Float64, geometry, y_bar::Float64) = begin
+    y::Float64 = s * sum(x .* geometry.weights)
+    x_bar::Vector{Float64} = (y_bar * s) .* geometry.weights
+    s_bar::Float64 = y_bar * sum(x .* geometry.weights)
+    geometry_bar = nothing
+    return y, x_bar, s_bar, geometry_bar
+end
+
+const declared_rule = derivative_rule(declared_record; primal = :y,
+    directions = (x = :x_dot, s = :s_dot, geometry = nothing), tangent = :y_dot,
+    covector = :y_bar, cotangents = (x = :x_bar, s = :s_bar, geometry = nothing),
+    name = :declared_record)
+
+# A child kernel holding a plate stays its own prepared call in a lazy arm.
+@kernel rule_child(x, s, geometry) = begin
+    extra = plate(eachindex(x)) do i
+        return 0.0 * x[i]
+    end
+    z = declared_rule(x, s, geometry) + sum(extra)
+    return z
+end
+@kernel rule_parent(x, s, geometry) = begin
+    y = s > 0.0 ? rule_child(x, s, geometry) : 0.0
+    return y
+end
+end
+
+# A wide planned body's statement (`_partition_statement_call`), with its data
+# passed whole, rebuilt from bound leaves as an externalized body does, or as a
+# named tuple.
+const _RECORD_LOOKUP = Dict(1 => 2)
+_record_whole(rule, x, s, geometry) =
+    ReactiveKernels._partition_statement_call(rule, x, s, geometry) + sum(abs2, x)
+_record_rebuilt(rule, x, s, weights, index, count) =
+    ReactiveKernels._partition_statement_call(rule, x, s,
+        DerivativeRuleDataGraphs.Footprint(weights, index, _RECORD_LOOKUP, count)) + sum(abs2, x)
+_record_tuple(rule, x, s, weights, index, count) =
+    ReactiveKernels._partition_statement_call(rule, x, s,
+        (; weights, inner = (weights, index), count)) + sum(abs2, x)
 
 @testset "declared data-only derivative inputs" begin
     graphs = DerivativeRuleDataGraphs
@@ -174,6 +231,50 @@ end
     @test forward_cut(fixed_fwd, data) == (data.weights, zero(data.weights))
     @test ChainRulesCore.frule((NoTangent(), NoTangent()), fixed_fwd, data) ==
         (data.weights, zero(data.weights))
+end
+
+@testset "a rule's data structure stays Const through a wrapped statement" begin
+    # In a body of `_PARTITION_SEPARATE_MIN` or more statements. A wrapper taking
+    # its operands as one tuple hid the structure's activity from Enzyme, so the
+    # declared form refused it and the port form could not accumulate `nothing`
+    # (snag derivativerule-r-0d7e245c). A declared rule accepts only `Const`, so
+    # its exact gradients show what the annotation was.
+    graphs = DerivativeRuleDataGraphs
+    declared = graphs.declared_rule
+    port = derivative_rule(graphs.record_port; primal = :y, covector = :y_bar,
+        cotangents = (x = :x_bar, s = :s_bar, geometry = :geometry_bar), name = :record_port)
+    x, xd, s, sd = [1.0, 2.0, 3.0], [0.5, -1.0, 2.0], 2.0, 0.25
+    weights, index, count = [0.5, 0.25, 2.0], Int32[1, 2, 3], 3
+    record = graphs.Footprint(weights, index, _RECORD_LOOKUP, count)
+    shapes = ((_record_whole, (record,)), (_record_rebuilt, (weights, index, count)),
+              (_record_tuple, (weights, index, count)))
+    for rule in (declared, port), (body, data) in shapes
+        dx = zero(x)
+        result = Enzyme.autodiff(Reverse, Const(body), Active, Const(rule),
+            Duplicated(x, dx), Active(s), map(Const, data)...)
+        @test dx ≈ s .* weights .+ 2 .* x
+        @test result[1][3] ≈ sum(x .* weights)
+    end
+    for (body, data) in shapes
+        @test only(Enzyme.autodiff(Forward, Const(body), Duplicated, Const(declared),
+            Duplicated(x, xd), Duplicated(s, sd), map(Const, data)...)) ≈
+            sd * sum(x .* weights) + s * sum(xd .* weights) + 2 * dot(x, xd)
+    end
+    # A caller who does ask for the data's derivative is still refused.
+    @test_throws r"data-only input :geometry requires Const" Enzyme.autodiff(
+        Reverse, Const(_record_whole), Active, Const(declared), Const(x), Active(s),
+        Duplicated(record, graphs.Footprint(zero(weights), index, _RECORD_LOOKUP, count)))
+    # A statement past the wrapper's positional methods stays inline.
+    many = ntuple(_ -> [1.0], ReactiveKernels._PLATE_CALL_MAX_ARGUMENTS + 1)
+    @test ReactiveKernels._partition_statement_call(vcat, many...) == fill(1.0, length(many))
+    # The same through a child kernel prepared for a lazy arm, on the public route.
+    parent = prepare(graphs.rule_parent; have = (:x, :s, :geometry), want = :y,
+                     bound = (; geometry = record))
+    ad = prepare_ad(parent, AutoEnzyme(; mode = Reverse), x, s; active = :x)
+    @test ad_gradient(ad, x, s) ≈ s .* weights
+    # A child past those methods still forwards its operands.
+    child = ReactiveKernels._KernelPreparedChild(:vcat_child, vcat, nothing)
+    @test child(many...) == fill(1.0, length(many))
 end
 
 module DerivativeRuleTestGraphs
