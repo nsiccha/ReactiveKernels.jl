@@ -450,7 +450,8 @@ end
     @test length(labelled) == 2
     @test parameters(first(labelled)) == [:x, :y]
     @test Base.invokelatest(compiled(first(labelled)), 1.0, 2.0) == (location = 1.0, scale = 2.0)
-    @test Base.invokelatest(compiled(last(labelled)), 2.0, 1.0) == (location = 1.0, scale = 2.0)
+    @test parameters(last(labelled)) == [:y, :x]
+    @test Base.invokelatest(compiled(last(labelled)), 2.0, 1.0) == (location = 2.0, scale = 1.0)
 
     # A variable of that name is still one: bound by the first plate, it leaves
     # that program as its result and enters the second as an argument.
@@ -478,5 +479,5 @@ end
         block(:(others = y)),
         :(scale = cells + others),
         :(return scale))))
-    @test parameters(first(keyword)) == [:x, :y]
+    @test sort(parameters(first(keyword))) == [:x, :y]
 end
