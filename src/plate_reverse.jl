@@ -559,11 +559,54 @@ function _pr_assignments!(out, ex)
     out
 end
 
+# The dataflow of `ex` as `target => source` pairs, for activity: its
+# assignments, plus every in-place write, whose array depends on what it
+# writes (`x[i] = v`, and a `f!(x, …)` call by Julia's naming convention), and
+# the parameters of an inlined function call, which alias their arguments both
+# ways. The native lowering allocates a pointwise plate's output with
+# `_plate_similar_output` and fills it inside such a call
+# (`buf[index] = value`), so an assignment-only analysis would take a buffer of
+# active values for a constant and drop its gradient (ODL's calibrated hourly
+# amplitudes, todo 093ym5a). Over-approximating activity only costs a fallback.
+function _pr_dataflow!(out, ex)
+    ex isa Expr || return out
+    ex.head === :quote && return out
+    if ex.head === :(=) && length(ex.args) == 2
+        lhs = ex.args[1]
+        if lhs isa Symbol || Meta.isexpr(lhs, :(::), 2) && lhs.args[1] isa Symbol
+            push!(out, (lhs isa Symbol ? lhs : lhs.args[1]) => ex.args[2])
+        elseif Meta.isexpr(lhs, :ref) && lhs.args[1] isa Symbol
+            push!(out, lhs.args[1] => ex.args[2])
+        end
+    elseif ex.head === :call
+        f = ex.args[1]
+        name = f isa Symbol ? f : f isa GlobalRef ? f.name :
+               Meta.isexpr(f, :., 2) && f.args[2] isa QuoteNode ? f.args[2].value : nothing
+        if name isa Symbol && endswith(String(name), "!") && length(ex.args) >= 2 &&
+                ex.args[2] isa Symbol
+            push!(out, ex.args[2] => Expr(:tuple, ex.args[3:end]...))
+        end
+        if Meta.isexpr(f, :function, 2) || Meta.isexpr(f, :->, 2)
+            ps = f.args[1]
+            for (p, a) in zip(Meta.isexpr(ps, :tuple) ? ps.args : Any[ps], ex.args[2:end])
+                pn = _pr_param_name(p)
+                pn isa Symbol && a isa Symbol && pn !== a || continue
+                push!(out, pn => a)
+                push!(out, a => pn)
+            end
+        end
+    end
+    for a in ex.args
+        _pr_dataflow!(out, a)
+    end
+    out
+end
+
 # Every symbol that depends on an active parameter (a fixed point over the
-# body's assignments; `let` bindings are assignments too).
+# body's dataflow; `let` bindings are assignments too).
 function _pr_program_activity(body, active_params, mod, values)
     active = Set{Symbol}(active_params)
-    pairs = _pr_assignments!(Pair{Symbol,Any}[], body)
+    pairs = _pr_dataflow!(Pair{Symbol,Any}[], body)
     changed = true
     while changed
         changed = false
@@ -1078,9 +1121,9 @@ with_plate_reverse(f, enabled::Bool = true) =
 # The parameter names of a kernel body `function (__constants__, __callables__, ports...)`.
 _pr_param_name(p) = p isa Symbol ? p : Meta.isexpr(p, :(::)) ? p.args[1] : nothing
 
-# Symbols of `body` that depend on `active` (outer dataflow over assignments).
+# Symbols of `body` that depend on `active` (outer dataflow, `_pr_dataflow!`).
 function _pr_body_activity(body, active::Set{Symbol})
-    pairs = _pr_assignments!(Pair{Symbol,Any}[], body)
+    pairs = _pr_dataflow!(Pair{Symbol,Any}[], body)
     changed = true
     while changed
         changed = false

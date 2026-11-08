@@ -121,6 +121,60 @@ _prv_rules(report) = count(r -> last(r) == "rule", report)
         end
     end
 
+    @testset "a pointwise plate's buffer, filled in place, feeding the likelihoods" begin
+        # `mu` has two readers, so the lowering allocates it
+        # (`_plate_similar_output`) and a pointwise plate fills it in place
+        # (`mu[index] = value`). The rule's activity analysis must see that
+        # write: an assignment-only analysis took the buffer for a constant
+        # and returned no gradient through it (ODL's calibrated hourly
+        # amplitudes, todo 093ym5a).
+        rng = MersenneTwister(31)
+        N, J = 120, 6
+        x = _prv_stdz(randn(rng, N))
+        g = [mod1(i, J) for i in 1:N]
+        y1 = 1 .+ 0.5 .* x .+ randn(rng, N)
+        y2 = 1 .+ 0.5 .* x .+ 2 .* randn(rng, N)
+        built, bound = _prv_build(quote
+            a ~ Normal(0, 5)
+            b ~ Normal(0, 1)
+            s1 ~ Exponential(1)
+            s2 ~ Exponential(1)
+            z[1:J] .~ Normal.(0, 1)
+            mu = a .+ b .* x .+ z[g]
+            y1 .~ Normal.(mu, s1)
+            y2 .~ Normal.(mu, s2)
+        end, Dict(:y1 => y1, :y2 => y2, :x => x, :g => g, :J => J), (:y1, :y2, :x, :g, :J))
+        n = built.layout.total
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)
+        p0 = 0.4 .* randn(MersenneTwister(4), n)
+        q1 = with_plate_reverse(true) do
+            prepare_sampler(built, bound, p0; backend)
+        end
+        @test occursin("_plate_similar_output", string(q1.kernel.ast))
+        report = _prv_compare(built, bound)
+        @info "plate reverse: pointwise buffer" report
+        @test count(r -> last(r) == "rule", report) >= 2
+    end
+
+    @testset "a plate program with more operands than map unrolls" begin
+        # 24 covariates, each with its own coefficient: the likelihood's plate
+        # program takes about 50 operands. Past 32, `map` over the operand
+        # tuple loses its element types; the Enzyme adapter must still infer
+        # the rule's primal and tape (ODL's SH program, about 40 operands).
+        rng = MersenneTwister(21)
+        N, K = 60, 24
+        xs = [Symbol(:x, k) for k in 1:K]
+        bs = [Symbol(:b, k) for k in 1:K]
+        data = Dict{Symbol,Any}(xs[k] => _prv_stdz(randn(rng, N)) for k in 1:K)
+        data[:y] = 1 .+ sum(0.1 .* data[xs[k]] for k in 1:K) .+ randn(rng, N)
+        mu = foldl((acc, k) -> :($acc .+ $(bs[k]) .* $(xs[k])), 1:K; init = :a)
+        model = Expr(:block, :(a ~ Normal(0, 5)), (:($(bs[k]) ~ Normal(0, 1)) for k in 1:K)...,
+                     :(sigma ~ Exponential(1)), :(mu = $mu), :(y .~ Normal.(mu, sigma)))
+        built, bound = _prv_build(model, data, (:y, xs...))
+        report = _prv_compare(built, bound)
+        @test any(r -> first(r) === :_ppl_lik_y_resp && last(r) == "rule", report)
+    end
+
     @testset "gauss_fe: design product feeding the plate" begin
         rng = MersenneTwister(11)
         N, K = 300, 3
