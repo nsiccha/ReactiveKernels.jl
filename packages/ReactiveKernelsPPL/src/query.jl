@@ -834,7 +834,7 @@ function prepare_cell_query(built, plan::StructuralPlan, observations;
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_cell_query requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
-    names = observations isa Symbol ? (observations,) : Tuple(Symbol.(observations))
+    names = _query_observations(built, plan, observations)
     isempty(names) && throw(ContractValidationError(
         "[query] prepare_cell_query needs at least one observation name"))
     _refuse_absent_cells(plan, names)
@@ -866,24 +866,49 @@ end
 
 const _CELL_PORT = :_ppl_cell
 
-# Each observation's cell plate (its per-index totals when the loop observes
-# one array per index), one `plate_cell` value per plate at the shared position
-# port, and their sum when there are several. The plates are named in the
-# program the build recorded, which `_check_built_program` proved `plan`
-# generates; only a graph made outside `build_kernel` has the program
-# generated again.
-function _cell_query_spec(built, plan::StructuralPlan, names; locality = nothing)
-    locality in (nothing, :error, :warn, :ignore) || throw(ContractValidationError(
-        "[query] locality must be :error, :warn, :ignore or nothing; got $(repr(locality))"))
+# The program's body and its observations in the program's order: the fields
+# of its `pointwise` statement, each with the node that computes it. The
+# program is the one the build recorded, which `_check_built_program` proved
+# `plan` generates; only a graph made outside `build_kernel` has it generated
+# again.
+function _program_pointwise(built, plan::StructuralPlan)
     def = hasproperty(built, :program) ? built.program : kernel_expr(plan, built.layout)
     body = def.args[2].args
     statement = findfirst(st -> Meta.isexpr(st, :(=), 2) && st.args[1] === :pointwise, body)
-    pointwise = Dict{Symbol,Any}()
+    fields = Pair{Symbol,Any}[]
     if statement !== nothing && Meta.isexpr(body[statement].args[2], :tuple)
         for field in body[statement].args[2].args
-            pointwise[field.args[1]] = field.args[2]
+            push!(fields, field.args[1] => field.args[2])
         end
     end
+    body, fields
+end
+
+# The observations a cell or partition query names, in the program's order.
+# The query sums their cells or partitions in that order, so naming the same
+# observations in another order prepares the same program and type. A caller
+# whose order follows its data still reuses one compiled program: BRM's NLME
+# partition named one program's observations in two orders for two bindings
+# that differ only in which plates have rows (snag `derived-kernels-b8900b11`).
+# A name the program does not observe keeps its place after them, for the
+# refusal that names it.
+function _query_observations(built, plan::StructuralPlan, observations)
+    names = observations isa Symbol ? (observations,) : Tuple(Symbol.(observations))
+    length(names) < 2 && return names
+    _, fields = _program_pointwise(built, plan)
+    rank = Dict(first(field) => i for (i, field) in enumerate(fields))
+    Tuple(sort!(collect(names); by = name -> get(rank, name, length(fields) + 1),
+        alg = Base.Sort.MergeSort))
+end
+
+# Each observation's cell plate (its per-index totals when the loop observes
+# one array per index), one `plate_cell` value per plate at the shared position
+# port, and their sum when there are several, in the order of `names`.
+function _cell_query_spec(built, plan::StructuralPlan, names; locality = nothing)
+    locality in (nothing, :error, :warn, :ignore) || throw(ContractValidationError(
+        "[query] locality must be :error, :warn, :ignore or nothing; got $(repr(locality))"))
+    body, fields = _program_pointwise(built, plan)
+    pointwise = Dict{Symbol,Any}(fields)
     assigned = Set{Symbol}()
     for st in body
         Meta.isexpr(st, :(=), 2) || continue
@@ -1196,7 +1221,7 @@ function _prepare_compact_cell(caller::Symbol, built, plan::StructuralPlan, obse
     isbound(plan) || throw(ContractValidationError(
         "[query] $caller requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
-    names = observations isa Symbol ? (observations,) : Tuple(Symbol.(observations))
+    names = _query_observations(built, plan, observations)
     isempty(names) && throw(ContractValidationError(
         "[query] $caller needs at least one observation name"))
     _refuse_absent_cells(plan, names)
@@ -1657,15 +1682,8 @@ function _partition_query_spec(built, plan::StructuralPlan, names, keys_by_name;
                                plan_constant = ())
     locality in (nothing, :error, :warn, :ignore) || throw(ContractValidationError(
         "[query] locality must be :error, :warn, :ignore or nothing; got $(repr(locality))"))
-    def = hasproperty(built, :program) ? built.program : kernel_expr(plan, built.layout)
-    body = def.args[2].args
-    statement = findfirst(st -> Meta.isexpr(st, :(=), 2) && st.args[1] === :pointwise, body)
-    pointwise = Dict{Symbol,Any}()
-    if statement !== nothing && Meta.isexpr(body[statement].args[2], :tuple)
-        for field in body[statement].args[2].args
-            pointwise[field.args[1]] = field.args[2]
-        end
-    end
+    body, fields = _program_pointwise(built, plan)
+    pointwise = Dict{Symbol,Any}(fields)
     assigned = Set{Symbol}()
     for st in body
         Meta.isexpr(st, :(=), 2) || continue
@@ -1783,7 +1801,7 @@ function prepare_partition(built, plan::StructuralPlan, observations; by,
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_partition requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
-    names = observations isa Symbol ? (observations,) : Tuple(Symbol.(observations))
+    names = _query_observations(built, plan, observations)
     isempty(names) && throw(ContractValidationError(
         "[query] prepare_partition needs at least one observation name"))
     _refuse_absent_cells(plan, names)
@@ -2117,7 +2135,7 @@ function prepare_partition_sampler(built, plan::StructuralPlan, observations,
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_partition_sampler requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
-    names = observations isa Symbol ? (observations,) : Tuple(Symbol.(observations))
+    names = _query_observations(built, plan, observations)
     isempty(names) && throw(ContractValidationError(
         "[query] prepare_partition_sampler needs at least one observation name"))
     _refuse_absent_cells(plan, names)
