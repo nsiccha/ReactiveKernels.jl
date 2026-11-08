@@ -1167,7 +1167,11 @@ end
     # Every value is at the partition's rows, shared, or an input.
     report = ReactiveKernels.partition_locality(q.kernel)
     @test all(e.status !== :whole for e in report)
-    @test only(e.status for e in report if e.value === :mu) === :rows
+    # The level gather `eta = z[group]` and the location `mu` fuse into the
+    # observation cells, so neither is a vector of the partition's rows; the
+    # gathered parameter is read at those rows.
+    @test !any(e.value in (:eta, :_ppl_offset_mu, :mu) for e in report)
+    @test only(e.status for e in report if e.value === :z) === :rows
     # The gradient of one subject's density is the full likelihood gradient
     # on the coordinates it reads and zero elsewhere.
     # Ordinary Reverse is required for both dense and compact samplers.

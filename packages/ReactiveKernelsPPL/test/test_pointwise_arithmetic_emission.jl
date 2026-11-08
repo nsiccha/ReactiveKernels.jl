@@ -398,3 +398,165 @@ _gather_vector_only(x::Vector{Float64}) = 2 .* x
     @test !Base.mightalias(selected_copy, u)
     @test transformed == 2 .* u[idx]
 end
+
+# A level-axis gather `z[g]` reads level codes, a compiler-owned data-only
+# vector (`_ppl_lvx_… = _declared_codes(g, labels)`), not a bound integer
+# column. The codes are one integer position per entry of `g`, so the gather
+# borrows a view inside the arithmetic cell, and the scaled effect fuses into
+# the likelihood plate instead of materializing a copied gather and a product
+# of observation length.
+@testset "a level-coded gather joins the likelihood plate" begin
+    leveled = @rkppl begin
+        a ~ Normal(0, 2)
+        b ~ Normal(0, 1)
+        sd ~ LogNormal(0, 0.5)
+        sigma ~ LogNormal(0, 0.5)
+        z[levels(g)] .~ Normal.(0, 1)
+        mu = a .+ b .* x .+ sd .* z[g]
+        y .~ Normal.(mu, sigma)
+    end
+    coded = @rkppl begin
+        a ~ Normal(0, 2)
+        b ~ Normal(0, 1)
+        sd ~ LogNormal(0, 0.5)
+        sigma ~ LogNormal(0, 0.5)
+        z[1:J] .~ Normal.(0, 1)
+        mu = a .+ b .* x .+ sd .* z[idx]
+        y .~ Normal.(mu, sigma)
+    end
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    bytes = Int[]
+    for g in (["a"], ["b", "a", "b", "c", "a", "c"],
+              [string("g", mod1(i, 4)) for i in 1:60])
+        n = length(g)
+        labels = sort(unique(g))
+        idx = [findfirst(==(v), labels) for v in g]
+        x = [0.2 + 0.03i for i in 1:n]
+        y = [-0.4 + 0.05i for i in 1:n]
+        saved = deepcopy((g, x, y))
+        plan = leveled(; g, x) | (; y)
+        reference = coded(; J = length(labels), idx, x) | (; y)
+        built = build_kernel(plan)
+        reference_built = build_kernel(reference)
+        source = sprint(show, Base.remove_linenums!(deepcopy(kernel_expr(plan, built.layout))))
+        @test occursin("ReactiveKernels._readonly_gather(z, _ppl_lvx_z_g_axis_1)", source)
+        @test occursin(r"_rkppl_synth_\d+ = plate\(", source)
+        params = (; a = 0.25, b = -0.35, sd = 0.8, sigma = 1.1,
+                  z = [-0.3 + 0.1k for k in eachindex(labels)])
+        u = collect(Float64, unconstrain(built.layout, params))
+        @test u == collect(Float64, unconstrain(reference_built.layout, params))
+        sampler = prepare_sampler(built, plan, u; backend)
+        control = prepare_sampler(reference_built, reference, u; backend)
+        emitted = sprint(show, Base.remove_linenums!(deepcopy(code_expr(sampler.kernel))))
+        @test !occursin("_native_broadcast_materialize", emitted)
+        gradient, control_gradient = similar(u), similar(u)
+        for shift in (0.0, 0.15)
+            point = u .+ shift
+            value, _ = sampler_value_and_gradient!(sampler, gradient, point)
+            control_value, _ = sampler_value_and_gradient!(control, control_gradient, point)
+            @test value ≈ control_value rtol = 1e-12
+            @test sampler(point) ≈ control_value rtol = 1e-12
+            @test gradient ≈ control_gradient rtol = 1e-12 atol = 1e-12
+        end
+        @test (g, x, y) == saved
+        n == 1 || push!(bytes, _pointwise_primal_bytes(sampler.kernel, u))
+    end
+    # The density no longer allocates per observation.
+    @test bytes[2] - bytes[1] <= 64
+end
+
+# An undotted call inside dotted arithmetic is evaluated once, before the
+# broadcast. As a plate input it keeps that single evaluation, so
+# `exp(log_sd) .* z[g]` fuses into the likelihood plate.
+@testset "an undotted call operand joins a pointwise plate" begin
+    model = @rkppl begin
+        a ~ Normal(0, 2)
+        log_sd ~ Normal(0, 1)
+        z[levels(g)] .~ Normal.(0, 1)
+        mu = a .+ exp(log_sd) .* z[g]
+        y .~ Normal.(mu, 1.3)
+    end
+    bytes = Int[]
+    for n in (6, 60)
+        g = [string("g", mod1(i, 3)) for i in 1:n]
+        y = [0.1 * i - 0.2 for i in 1:n]
+        plan = model(; g) | (; y)
+        built = build_kernel(plan)
+        source = sprint(show, Base.remove_linenums!(deepcopy(kernel_expr(plan, built.layout))))
+        @test occursin(r"_rkppl_synth_\d+ = plate\(exp\(log_sd\), ", source)
+        u = collect(Float64, unconstrain(built.layout, (; a = 0.3, log_sd = -0.2,
+            z = [0.4, -0.1, 0.25])))
+        sampler = prepare_sampler(built, plan, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        emitted = sprint(show, Base.remove_linenums!(deepcopy(code_expr(sampler.kernel))))
+        @test !occursin("_native_broadcast_materialize", emitted)
+        codes = [findfirst(==(v), sort(unique(g))) for v in g]
+        oracle(v) = let a = v[1], sd = exp(v[2]), z = v[3:5]
+            logpdf(Normal(0, 2), a) + logpdf(Normal(0, 1), v[2]) +
+                sum(logpdf.(Normal(), z)) +
+                sum(logpdf(Normal(a + sd * z[codes[i]], 1.3), y[i]) for i in 1:n)
+        end
+        gradient = similar(u)
+        value, _ = sampler_value_and_gradient!(sampler, gradient, u)
+        @test value ≈ oracle(u) rtol = 1e-12
+        for k in eachindex(u)
+            up, down = copy(u), copy(u)
+            up[k] += 1e-6
+            down[k] -= 1e-6
+            @test gradient[k] ≈ (oracle(up) - oracle(down)) / 2e-6 atol = 2e-6
+        end
+        push!(bytes, _pointwise_primal_bytes(sampler.kernel, u))
+    end
+    @test bytes[2] - bytes[1] <= 64
+end
+
+# A design product and a matrix-column gather, the spelling BRM emits for a
+# varying intercept (`pop = X * beta`, `ranef = b[g_level, 1]`). The product
+# stays one BLAS product; the column gather borrows a view of the column, and
+# their sum fuses into the likelihood plate.
+@testset "a design product plus a matrix-column gather joins the likelihood plate" begin
+    model = @rkppl begin
+        beta[1:2] .~ Normal.(0, 1)
+        sd ~ LogNormal(0, 0.5)
+        Z[1:J, 1:1] .~ Normal.(0, 1)
+        b = Z .* sd
+        pop = X * beta
+        ranef = b[gi, 1]
+        mu = pop .+ ranef
+        y .~ Normal.(mu, 0.9)
+    end
+    bytes = Int[]
+    for n in (8, 80)
+        gi = [mod1(3i, 4) for i in 1:n]
+        X = hcat(ones(n), [0.05 * i - 0.3 for i in 1:n])
+        y = [0.07 * i - 0.5 for i in 1:n]
+        saved = deepcopy((gi, X, y))
+        plan = model(; J = 4, gi, X) | (; y)
+        built = build_kernel(plan)
+        source = sprint(show, Base.remove_linenums!(deepcopy(kernel_expr(plan, built.layout))))
+        @test occursin("_ppl_column_b_1 = Base.view(b, :, 1)", source)
+        @test occursin("ranef = ReactiveKernels._readonly_gather(_ppl_column_b_1, gi)", source)
+        @test occursin(r"_ppl_offset_mu = plate\(pop, ReactiveKernels\._readonly_gather\(", source)
+        params = (; beta = [0.4, -0.7], sd = 1.2, Z = reshape([0.3, -0.2, 0.1, 0.5], 4, 1))
+        u = collect(Float64, unconstrain(built.layout, params))
+        sampler = prepare_sampler(built, plan, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        oracle(v) = let c = constrain(built.layout, v)
+            location = X * c.beta .+ (c.Z .* c.sd)[gi, 1]
+            sum(logpdf.(Normal(), c.beta)) + logpdf(LogNormal(0, 0.5), c.sd) +
+                sum(logpdf.(Normal(), c.Z)) + log(c.sd) +
+                sum(logpdf(Normal(location[i], 0.9), y[i]) for i in 1:n)
+        end
+        gradient = similar(u)
+        value, _ = sampler_value_and_gradient!(sampler, gradient, u)
+        @test value ≈ oracle(u) rtol = 1e-12
+        for k in eachindex(u)
+            up, down = copy(u), copy(u)
+            up[k] += 1e-6
+            down[k] -= 1e-6
+            @test gradient[k] ≈ (oracle(up) - oracle(down)) / 2e-6 atol = 2e-6
+        end
+        @test (gi, X, y) == saved
+        push!(bytes, _pointwise_primal_bytes(sampler.kernel, u))
+    end
+    # Only the design product's vector grows with the observations.
+    @test bytes[2] - bytes[1] <= 8 * (80 - 8) + 64
+end
