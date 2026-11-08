@@ -650,16 +650,16 @@ written. Two cases are also not reached yet:
   `scale[g[i]]` in a cell);
 - `@traceable` helper bodies.
 
-The pass applies to `prepare` and what it compiles, not yet to
-`prepare_nonallocating`, the reactive compiler, the batched lowering or
-`jax_source`. Generated-code display (`code_expr`) shows the rewritten program,
-which is the program that runs. `kernel_graph`, `explain` and the plan show the
-authored recipes.
+The pass applies to `prepare`, `prepare_nonallocating` and what they compile,
+not yet to the reactive compiler, the batched lowering or `jax_source`.
+Generated-code display (`code_expr`) shows the rewritten program, which is the
+program that runs. `kernel_graph`, `explain` and the plan show the authored
+recipes.
 
 **Turning it off.** `prepare(…; simplify = false)` (also `prepare!`,
-`prepare_ad`) compiles the literal arithmetic. `nothing`, the default, takes
-the setting of an enclosing preparation, else the project's preference, else
-`true`:
+`prepare_ad`, `prepare_nonallocating`) compiles the literal arithmetic.
+`nothing`, the default, takes the setting of an enclosing preparation, else the
+project's preference, else `true`:
 
 ```julia
 Preferences.set_preferences!(ReactiveKernels, "simplify" => false)
