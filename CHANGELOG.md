@@ -16,6 +16,30 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.115
+
+- A plate cell's lazy branch whose condition reads bound data keeps one
+  prepared program whichever arms the binding's lanes take, again. This is
+  0.1.110's change, reverted in 0.1.111 because a binding whose lanes all take
+  one arm ran up to 8 times slower; 0.1.112's plate programs remove that
+  cause. Preparation splits such a plate into one
+  plate per arm. Every arm is a plate, over no lanes when none takes it, and a
+  domain of no lanes is split too, so data whose lanes all take one arm, or
+  that has none, prepares the program a mixed binding prepares: an RKPPL
+  censored response with a bound scale keeps one sampler type whether its rows
+  are all observed, all censored, mixed or absent. An arm without lanes
+  evaluates nothing: its shared work stays behind the plate's nonempty guard,
+  and its work over bound values, such as `log(s)` of a bound scale, is not run
+  at preparation, so an invalid value on an arm no lane takes still never
+  throws. An arm of one lane splits a nested branch as arms of more lanes or
+  none do. Reassembling a pointwise vector whose lanes all took one arm skips
+  the gather. Values and gradients are unchanged.
+- A first gradient also compiles the arms no lane takes: a binding whose
+  lanes all take one arm compiles what a mixed binding compiles.
+- A condition that reads bound numbers alone still selects its arm at
+  preparation, and a bound singleton beside live arguments of unknown length
+  (a plate of one row) still prepares its own program.
+
 ## 0.1.114
 
 - A plate program (0.1.112) is now only the plate's cell work: its loop, the

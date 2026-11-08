@@ -54,10 +54,13 @@ end
     @test last(exposed(x, q)) ≈ x .+ q[1]
     @test count(r -> r.op isa RK._AuthoredPlateOp, exposed.plan.recipes) == 3
 
+    # Every lane takes one arm: the other arm is a plate over no lanes, and
+    # the program is the mixed binding's.
     all_true = prepare(C.chain; bound = (; y = fill(true, length(y))))
-    @test count(r -> r.op isa RK._AuthoredPlateOp, all_true.plan.recipes) == 1
+    @test count(r -> r.op isa RK._AuthoredPlateOp, all_true.plan.recipes) == 2
     @test all_true(x, q) ≈ sum((x .+ q[1]) .^ 2)
     mixed = prepare(C.chain; bound = (; y))
+    @test typeof(all_true) == typeof(mixed)
     @test_throws DimensionMismatch mixed([0.1, 0.2], q)
 
     cache = PreparationCache()
