@@ -1191,7 +1191,8 @@ every cell unchanged, so that reverse is one pass over the cells:
   adjoint;
 - the adjoints of shared values (scalars, invariants hoisted above the loop)
   accumulate across cells, and the hoisted invariants are swept once after the
-  loop;
+  loop. A cell value divided by an invariant multiplies by the divisor's
+  inverse, which is hoisted with the divisor;
 - a batched operand's cotangent is added into its shadow at the cell. A
   gathered operand, such as `_readonly_gather(z, g)`, is a view, so its shadow
   scatters the cotangent into `z`'s, repeated indices included.

@@ -765,6 +765,27 @@ function _pr_invariant_statements(stmts, st, cellvars::Set{Symbol})
     invariant
 end
 
+# Rewrite each cell-varying `lhs = x / d` with an invariant divisor `d` as
+# `lhs = x * lhs_inverse` after `lhs_inverse = inv(d)`, and add the inverse to
+# `invariant`, so it is hoisted above the loop with the divisor.
+function _pr_hoist_inverse_divisors(stmts, invariant::Set{Symbol}, cellvars::Set{Symbol})
+    out = Any[]
+    for s in stmts
+        if s isa _PRCall && s.f === Base.:/ && length(s.args) == 2 && !(s.lhs in invariant)
+            d = s.args[2]
+            if !(d isa Symbol) || d in invariant || !(d in cellvars)
+                inverse = Symbol(s.lhs, :_inverse)
+                push!(out, _PRCall(inverse, Base.inv, GlobalRef(Base, :inv), Any[d]))
+                push!(out, _PRCall(s.lhs, Base.:*, GlobalRef(Base, :*), Any[s.args[1], inverse]))
+                push!(invariant, inverse)
+                continue
+            end
+        end
+        push!(out, s)
+    end
+    out
+end
+
 # Specialise `stmts` with each known condition symbol fixed to a Bool: a branch
 # whose condition is known keeps only its taken arm.
 function _pr_fold(stmts, known::Dict{Symbol,Bool})
@@ -862,6 +883,10 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
         folded = _pr_fold(Any[s isa _PRCall && haskey(known, s.lhs) ? _PRAlias(s.lhs, known[s.lhs]) : s
                               for s in stmts], known)
         inv2 = _pr_invariant_statements(folded, st, cellvars)
+        # A cell value divided by an invariant one multiplies by the divisor's
+        # inverse, computed once above the loop. This recomputed forward only
+        # feeds partials; the primal value is the program's own.
+        folded = _pr_hoist_inverse_divisors(folded, inv2, cellvars)
         hoisted = Any[s for s in folded if (s isa _PRAlias || s isa _PRCall) && s.lhs in inv2]
         inloop = Any[s for s in folded if !((s isa _PRAlias || s isa _PRCall) && s.lhs in inv2)]
         active = copy(st.active)
@@ -869,13 +894,18 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
             _pr_mark_reads!(active, folded, st)
             _pr_activity!(active, folded)
         end
-        # The cell's forward: hoisted invariants above the loop, the rest in it;
-        # the reverse sweep covers every statement (an invariant's adjoint is
-        # per cell, through its in-loop uses).
+        # The cell's forward: hoisted invariants above the loop, the rest in it.
         forward_in = _pr_forward_exprs(inloop)
         forward_pre = _pr_forward_exprs(hoisted)
         reverse = Any[]
+        after = Any[]
+        # A hoisted invariant is a shared value of the loop: its adjoint
+        # accumulates across cells from its in-loop uses, and its own reverse
+        # runs once, after the loop.
+        hoisted_active = Symbol[s.lhs for s in hoisted if s.lhs in active]
+        init = Any[:($(_pr_bar(h)) = 0.0) for h in hoisted_active]
         defined = Set{Symbol}(_pr_bar(s) for s in st.outer if !(s in st.totals))
+        union!(defined, (_pr_bar(h) for h in hoisted_active))
         if result isa Symbol && result in active
             rbar = _pr_bar(result)
             push!(reverse, :($rbar = $(_pr_bar(total))))
@@ -883,14 +913,17 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
             leaf = s -> _pr_is_read(s, st) && s.lhs in active ?
                 :($(GlobalRef(@__MODULE__, :_pr_shadow_add!))(
                     $(st.shadow[st.prepared[s.args[1]]]), $linear, $(_pr_bar(s.lhs)))) : nothing
-            _pr_reverse_exprs!(reverse, folded, active, defined; leaf, touched = st.touched)
+            _pr_reverse_exprs!(reverse, inloop, active, copy(defined); leaf, touched = st.touched)
+            _pr_reverse_exprs!(after, hoisted, active, copy(defined); touched = st.touched)
         end
         quote
             $(forward_pre...)
+            $(init...)
             @inbounds for $linear in $range
                 $(forward_in...)
                 $(reverse...)
             end
+            $(after...)
         end
     end
     isempty(keys_) && return variant(())
