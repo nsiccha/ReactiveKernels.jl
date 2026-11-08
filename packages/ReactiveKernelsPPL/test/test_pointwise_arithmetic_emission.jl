@@ -560,3 +560,78 @@ end
     # Only the design product's vector grows with the observations.
     @test bytes[2] - bytes[1] <= 8 * (80 - 8) + 64
 end
+
+# A factor term `c[g]` of an affine predictor reads its coefficients by level
+# code, one gather per row, instead of multiplying full-rank dummies, an N×J
+# product per evaluation. A row whose label is off the factor's axis reads the
+# padded zero, as its all-zero dummy row did.
+@testset "a factor term gathers its coefficients by level code" begin
+    bare = @rkppl begin
+        a ~ Normal(0, 2)
+        b ~ Normal(0, 1)
+        sd ~ LogNormal(0, 0.5)
+        c[levels(g)] .~ Normal.(0, sd)
+        mu = a .+ b .* x .+ c[g]
+        y .~ Normal.(mu, 0.8)
+    end
+    aliased = @rkppl begin
+        a ~ Normal(0, 2)
+        b ~ Normal(0, 1)
+        sd ~ LogNormal(0, 0.5)
+        c[levels(g)] .~ Normal.(0, sd)
+        cg = c[g]
+        mu = a .+ b .* x .+ cg
+        y .~ Normal.(mu, 0.8)
+    end
+    alone = @rkppl begin
+        sd ~ LogNormal(0, 0.5)
+        c[levels(g)] .~ Normal.(0, sd)
+        mu = c[g]
+        y .~ Normal.(mu, 0.8)
+    end
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    bytes = Int[]
+    for (n, J) in ((12, 3), (240, 60))
+        g = [string("g", lpad(mod1(7i, J), 3, '0')) for i in 1:n]
+        x = [0.03 * i - 0.2 for i in 1:n]
+        y = [0.05 * i - 0.4 for i in 1:n]
+        saved = deepcopy((g, x, y))
+        plan = bare(; g, x) | (; y)
+        reference = aliased(; g, x) | (; y)
+        built = build_kernel(plan)
+        reference_built = build_kernel(reference)
+        source = sprint(show, Base.remove_linenums!(deepcopy(kernel_expr(plan, built.layout))))
+        @test !occursin("isequal.(", source)
+        @test occursin("_ppl_factor_codes(g, ", source)
+        @test coordinate_names(built.layout) == coordinate_names(reference_built.layout)
+        params = (; a = 0.2, b = -0.4, sd = 0.9, c = [0.1 * sin(k) for k in 1:J])
+        u = collect(Float64, unconstrain(built.layout, params))
+        sampler = prepare_sampler(built, plan, u; backend)
+        control = prepare_sampler(reference_built, reference, u; backend)
+        gradient, control_gradient = similar(u), similar(u)
+        for shift in (0.0, 0.1)
+            point = u .+ shift
+            value, _ = sampler_value_and_gradient!(sampler, gradient, point)
+            control_value, _ = sampler_value_and_gradient!(control, control_gradient, point)
+            @test value ≈ control_value rtol = 1e-12
+            @test gradient ≈ control_gradient rtol = 1e-12 atol = 1e-12
+        end
+        @test (g, x, y) == saved
+        push!(bytes, _pointwise_primal_bytes(sampler.kernel, u))
+        # A predictor that is the factor term alone is the gathered view.
+        lone = alone(; g) | (; y)
+        lone_built = build_kernel(lone)
+        lone_source = sprint(show, Base.remove_linenums!(deepcopy(kernel_expr(lone, lone_built.layout))))
+        @test !occursin("isequal.(", lone_source)
+        v = collect(Float64, unconstrain(lone_built.layout, (; sd = 0.9, c = params.c)))
+        lone_q = prepare_query(lone_built, lone, :sampler)
+        codes = [findfirst(==(l), sort(unique(g))) for l in g]
+        expected = logpdf(LogNormal(0, 0.5), 0.9) + log(0.9) +
+            sum(logpdf.(Normal.(0, 0.9), params.c)) +
+            sum(logpdf(Normal(params.c[codes[i]], 0.8), y[i]) for i in 1:n)
+        @test Base.invokelatest(lone_q, v) ≈ expected rtol = 1e-12
+    end
+    # The density allocates the padded coefficients (J + 1 entries), not an
+    # N×J design: 228 more rows and 57 more levels cost far less than a design.
+    @test bytes[2] - bytes[1] < 8 * 240 * 60 ÷ 10
+end

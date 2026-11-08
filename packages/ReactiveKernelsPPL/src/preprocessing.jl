@@ -226,6 +226,10 @@ function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
         !any(r -> r.mi_jobs !== nothing, plan.responses) && return true
     _uses_structured_observation_axes(plan) && return false
     _scalar_valued_predictor(plan, pred) && return true
+    # A factor block reads its coefficients by level code
+    # (`_affine_block_terms`): one gather per row. Its full-rank dummies would
+    # make the design product an N×J matrix product in every evaluation.
+    any(t -> t.kind === FactorTerm, pred.terms) && return true
     # An intercept added to a vector expression remains a scalar broadcast.
     # Turning it into a ones-column matrix product creates a needless GEMV
     # and its reverse-mode tape, even when the other summand is already a
@@ -385,6 +389,24 @@ ReactiveKernels.@_record_source function _declared_codes(x::AbstractVector, leve
     codes = zeros(Int, length(x))
     for (i, v) in enumerate(x)
         codes[i] = get(positions, v, 0)
+    end
+    return codes
+end
+
+"""
+    _ppl_factor_codes(x, levels) -> Vector{Int}
+
+One plus the position of each element of factor column `x` among a factor
+block's `levels` (`_declared_codes`). `vcat(0.0, coefficients)[codes]` then
+reads the coefficient of each row's level, and zero for a row whose label is
+not on the axis, as the block's dummy row `isequal.(x, permutedims(levels))`
+does. Both inputs are bound data, so the call folds under `bound=`.
+"""
+ReactiveKernels.@_record_source function _ppl_factor_codes(x::AbstractVector,
+        levels::AbstractVector)
+    codes = _declared_codes(x, levels)
+    for i in eachindex(codes)
+        codes[i] += 1
     end
     return codes
 end

@@ -524,13 +524,13 @@ function _pointwise_index_infos(plan::StructuralPlan, stmts, bound_names)
             axes(idx, 1) == Base.OneTo(length(idx)) || continue
         indices[name] = _OS.value_info(idx)
     end
-    :_declared_codes in bound_names && return indices
     for st in stmts
         Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol || continue
         name, rhs = st.args
         startswith(String(name), "_ppl_lvx_") || continue
-        Meta.isexpr(rhs, :call, 3) && rhs.args[1] === :_declared_codes &&
-            rhs.args[2] isa Symbol || continue
+        Meta.isexpr(rhs, :call, 3) &&
+            rhs.args[1] in (:_declared_codes, :_ppl_factor_codes) &&
+            rhs.args[1] ∉ bound_names && rhs.args[2] isa Symbol || continue
         column = get(plan.columns, rhs.args[2], nothing)
         column isa AbstractVector || continue
         indices[name] = _OS.vector_info(Int, length(column))
@@ -856,7 +856,7 @@ import ..positive_bijector, ..unit_bijector
 # In-model grouping encoder (`_ppl_lvx_<…>` nodes call it with the raw
 # column and the axis's labels) and the label values of a level axis
 # (`preprocessing.jl`).
-import .._declared_codes, .._ppl_levels, .._ppl_unique, .._ppl_values
+import .._declared_codes, .._ppl_factor_codes, .._ppl_levels, .._ppl_unique, .._ppl_values
 # Stopping-ratio stage-lane tables (data-only recipes over the bound
 # response; `preprocessing.jl`).
 import .._ordinal_stage_obs, .._ordinal_stage_idx, .._ordinal_effects_matrix
@@ -1235,7 +1235,8 @@ function _predictor_statements(plan::StructuralPlan)
         end
         terms = Any[]
         if _broadcast_affine(plan, pred)
-            append!(terms, _affine_block_terms(plan, shape; broadcast = true))
+            append!(terms, _affine_block_terms(plan, shape; broadcast = true,
+                pre = stmts))
         elseif shape.width > 0
             push!(terms, :($(design_name(pred.name)) * $(_affine_block_name(pred))))
         end
@@ -1317,9 +1318,14 @@ _coef_coord(coef::Symbol, k::Int) = :($coef[$k])
 
 # Broadcast affine blocks against their coefficient coordinates while
 # retaining the authored axes. Factor and matrix blocks use their own
-# coefficient slices in design order.
+# coefficient slices in design order. With `pre`, a factor block reads its
+# slice by level code: `_ppl_fpad_<pred>_<k>[codes]` over the padded slice
+# `vcat(0.0, view(coef, k:k+w-1))` and `codes = _ppl_factor_codes(column,
+# axis)`, the statements pushed to `pre`. That is one gather per row, where
+# the dummy product is an N×J matrix product; a row off the axis reads the
+# pad's zero, as its all-zero dummy row does.
 function _affine_block_terms(plan::StructuralPlan, shape::DesignShape;
-        broadcast::Bool = false)
+        broadcast::Bool = false, pre::Union{Nothing,Vector{Expr}} = nothing)
     pred = only(p for p in plan.predictors if p.name === shape.predictor)
     coef = _affine_block_name(pred)
     terms = Any[]
@@ -1335,8 +1341,17 @@ function _affine_block_terms(plan::StructuralPlan, shape::DesignShape;
             k += 1
         elseif b.kind === FactorTerm
             w = b.width
-            push!(terms, :($(_contrast_expr(b)) *
-                $(:(view($coef, $k:$(k + w - 1))))))
+            if pre === nothing
+                push!(terms, :($(_contrast_expr(b)) *
+                    $(:(view($coef, $k:$(k + w - 1))))))
+            elseif w > 0
+                pad = Symbol(:_ppl_fpad_, shape.predictor, :_, k)
+                codes = Symbol(:_ppl_lvx_, shape.predictor, :_, b.column, :_factor_, k)
+                push!(pre, :($pad::AbstractVector{Float64} =
+                    vcat(0.0, view($coef, $k:$(k + w - 1)))))
+                push!(pre, :($codes = _ppl_factor_codes($(b.column), $(b.axis))))
+                push!(terms, :($pad[$codes]))
+            end
             k += w
         elseif b.kind === MatrixTerm
             w = b.width
