@@ -16,6 +16,26 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.118
+
+- The opt-in generated summed-plate reverse (`with_plate_reverse`, preference
+  `plate_reverse = "on"`) no longer returns a wrong gradient. Before, a plate
+  program reading an array that another plate filled in place
+  (`_plate_similar_output`, then `buf[index] = value`), or an operand Enzyme
+  differentiated but the generated reverse did not, got a zero cotangent with
+  no error. On ODLPlaus's SH v5 model 798 of 890 gradient coordinates were
+  wrong. Its activity analysis now follows in-place writes, and any call
+  whose active operands the generated reverse does not cover takes Enzyme's
+  ordinary reverse, so a coverage gap costs speed, never correctness. Plate
+  programs with more than 32 operands, and lazy cell-broadcast operands
+  (`MixedDuplicated`), no longer fail.
+- With the stable rewrites (0.1.117, on by default), plates where a rewrite
+  fires take the generated reverse again: each `_rk_*_of` helper call is
+  expanded into the method its operands select.
+- Hoisted cell invariants are swept once after the loop, and a division by
+  an invariant multiplies by its hoisted inverse: about 1.17x faster on a
+  Gaussian random-intercept plate.
+
 ## 0.1.117
 
 - Preparation computes numerically fragile compositions in their stable form:
