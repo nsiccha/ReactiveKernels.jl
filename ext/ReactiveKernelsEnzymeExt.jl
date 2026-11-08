@@ -16,7 +16,7 @@ using ReactiveKernels: _stage_residual_sources, _rule_activity, _derivative_inpu
 import ReactiveKernels
 import Enzyme
 using Enzyme: Const, Active, Duplicated, DuplicatedNoNeed, BatchDuplicated,
-    BatchDuplicatedNoNeed
+    BatchDuplicatedNoNeed, MixedDuplicated
 using Enzyme.EnzymeCore: Annotation
 import Enzyme.EnzymeRules
 using Enzyme.EnzymeRules: FwdConfig, RevConfig, AugmentedReturn, needs_primal,
@@ -504,7 +504,7 @@ using ReactiveKernels: _PlateSumRule, _pr_scalar_positions, _pr_batched_position
 function EnzymeRules.augmented_primal(
         config::RevConfig, rule::Const{<:_PlateSumRule}, ::Type{RT},
         args::Vararg{Annotation,N}) where {RT,N}
-    values = map(a -> a.val, args)
+    values = _pr_values(args)
     primal = rule.val(values...)
     if RT <: Const || all(a -> a isa Const, args)
         return AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, nothing)
@@ -512,6 +512,13 @@ function EnzymeRules.augmented_primal(
     tape = _pr_tape(Val(overwritten(config)), values)
     AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, tape)
 end
+
+# The operands' values, unrolled. A plate program can take more operands than
+# `map` over a tuple unrolls (32): past that, `map` loses the element types, the
+# primal and tape types are no longer inferred, and Enzyme refuses the rule's
+# `AugmentedReturn` (ODL's SH program, about 40 operands).
+@generated _pr_values(args::Tuple) =
+    Expr(:tuple, (:(getfield(args, $i).val) for i in 1:length(args.parameters))...)
 
 # The tape holds a copy of each array operand Enzyme may overwrite before the
 # reverse pass (`F` counts the function object at position 1) and nothing
@@ -569,9 +576,27 @@ end
 # floats: its cotangent accumulates in a vector and returns as a tuple.
 _pr_tuple_operand(::Type{<:Active{T}}) where {T} = T <: Tuple{Vararg{AbstractFloat}}
 _pr_tuple_operand(::Type) = false
-@generated function _pr_supported(::Val{B}, args::Tuple) where {B}
-    all(b -> !(args.parameters[b] <: Active) || _pr_tuple_operand(args.parameters[b]), B) ?
-        :(true) : :(false)
+# Whether the generated reverse returns or accumulates the cotangent of every
+# operand Enzyme treats as active. The rule was generated for the operands its
+# own activity analysis marked active (scalar positions `S`, batched `B`); an
+# operand Enzyme also differentiates outside them would otherwise get a zero
+# cotangent, which is a wrong gradient. Such a call differentiates the program
+# with Enzyme's ordinary reverse instead.
+# A batched operand is covered only as a plain array shadow: a `MixedDuplicated`
+# operand (a struct of active scalars and arrays, such as a cell broadcast
+# `a .+ v`) has a shadow the generated reverse does not write.
+@generated function _pr_covers(::Val{S}, ::Val{B}, args::Tuple) where {S,B}
+    for (i, T) in enumerate(args.parameters)
+        T <: Const && continue
+        if T <: Active
+            i in S || (i in B && _pr_tuple_operand(T)) || return :(false)
+        elseif T <: Union{Duplicated,DuplicatedNoNeed,BatchDuplicated,BatchDuplicatedNoNeed}
+            i in B || return :(false)
+        else
+            return :(false)
+        end
+    end
+    :(true)
 end
 
 struct _PRSeeded{F,T}
@@ -583,14 +608,21 @@ end
 @inline _pr_rewrap(a::Active, v) = Active(v)
 @inline _pr_rewrap(a::Union{Duplicated,DuplicatedNoNeed}, v) = Duplicated(v, a.dval)
 @inline _pr_rewrap(a::Const, v) = Const(v)
+# Its shadow is a reference the ordinary reverse accumulates into in place.
+@inline _pr_rewrap(a::MixedDuplicated, v) = MixedDuplicated(v, a.dval)
 
 # The reverse's return type for these annotations: the value type of each
 # Active operand, `nothing` for every other.
 @generated _pr_return_type(args::Tuple) = Tuple{(T <: Active ? T.parameters[1] : Nothing
                                                 for T in args.parameters)...}
 
+# Each annotation rewrapped around its operand value, unrolled (see `_pr_values`).
+@generated _pr_rewrapped(args::Tuple, values::Tuple) =
+    Expr(:tuple, (:(_pr_rewrap(getfield(args, $i), getfield(values, $i)))
+                  for i in 1:length(args.parameters))...)
+
 function _pr_ordinary_reverse(program::F, ȳ, tape, args::Tuple) where {F}
-    annotations = map(_pr_rewrap, args, tape)
+    annotations = _pr_rewrapped(args, tape)
     first(Enzyme.autodiff(Enzyme.Reverse, Const(_PRSeeded(program, ȳ)), Active,
                           annotations...))::_pr_return_type(args)
 end
@@ -605,11 +637,15 @@ function EnzymeRules.reverse(
         return _pr_reverse_return(Val(()), args, ())
     end
     operands = _pr_operands(tape, args)
-    if width(config) == 1 && !_pr_supported(Val(B), args)
+    covered = _pr_covers(Val(S), Val(B), args)
+    if width(config) == 1 && !covered
         ȳ = dret isa Active ? dret.val : dret
         return _pr_ordinary_reverse(r.program, ȳ, operands, args)
     end
     W = width(config)
+    covered || throw(ArgumentError(
+        "plate reverse: a batched (width $W) reverse of a plate program with an active " *
+        "operand the generated reverse does not differentiate; prepare without `with_plate_reverse`"))
     if W == 1
         ȳ = dret isa Active ? dret.val : dret
         shadows = _pr_shadows(Val(B), args, Val(1), 1)

@@ -195,6 +195,15 @@ end
 @inline _rk_log1m_sigmoid(c1::Real, c2::Real, ::_RwExp, u::Real) =
     convert(_rw_float(c1, c2, u), LogExpFunctions.log1mlogistic(u))
 
+# Every helper the pass emits, by identity, for code that reads a rewritten
+# program: the generated plate reverse expands each call into the method its
+# operands select (`_pr_expand_stable_helper`, `src/plate_reverse.jl`).
+# LOCKSTEP: each `_rw_emit(…, :_rk_…)` helper name below.
+const _RK_STABLE_HELPERS = (_rk_log_of, _rk_log1p_of, _rk_log1p_neg_of, _rk_log_one_minus_of,
+    _rk_log_one_plus, _rk_log_one_plus_of, _rk_log_add_of, _rk_log_sum_of, _rk_logit_of,
+    _rk_log_odds_of, _rk_exp_log_of, _rk_minus_one_of, _rk_inv_of, _rk_div_by_of, _rk_pow_of,
+    _rk_sqrt_of, _rk_log_sigmoid, _rk_log1m_sigmoid)
+
 # --- recognising calls --------------------------------------------------------
 
 # A call as the pass reads it: the callee's function object, its argument

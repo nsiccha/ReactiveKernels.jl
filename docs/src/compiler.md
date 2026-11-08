@@ -1216,7 +1216,8 @@ every cell unchanged, so that reverse is one pass over the cells:
   adjoint;
 - the adjoints of shared values (scalars, invariants hoisted above the loop)
   accumulate across cells, and the hoisted invariants are swept once after the
-  loop;
+  loop. A cell value divided by an invariant multiplies by the divisor's
+  inverse, which is hoisted with the divisor;
 - a batched operand's cotangent is added into its shadow at the cell. A
   gathered operand, such as `_readonly_gather(z, g)`, is a view, so its shadow
   scatters the cotangent into `z`'s, repeated indices included.
@@ -1224,7 +1225,11 @@ every cell unchanged, so that reverse is one pass over the cells:
 Each call's partials come from DiffRules, the table ForwardDiff and
 ReverseDiff use, or for a call whose derivative reads its own result (`exp`,
 `sqrt`) and for RK's own arithmetic, from the generator's spelling through
-that result. No rule attaches to a function this repository does not own. Lazy
+that result. A stable rewrite's helper call (`_rk_log_of(exp, u)` for
+`log(exp(u))`, see "Stable rewrites" above) is expanded into the method its
+operands select, read from that method's lowered code, so its stable form's
+primitives take their partials in the same way. No rule attaches to a function
+this repository does not own. Lazy
 branches stay lazy: each arm's reverse runs inside that arm, under the
 condition the forward stored. The primal is the program itself, so values are
 unchanged.
