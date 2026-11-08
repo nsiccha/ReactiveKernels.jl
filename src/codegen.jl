@@ -4501,10 +4501,22 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
             !has_scheduled_groups && isempty(lane_arms) && !into && recycled === nothing &&
             cell_slots === nothing && !stores_cells && isempty(slices) && !parallel_cells &&
             isempty(shares) && total_fold === sum
+        # A statement the batched tiles run cell by cell, as the loop body does,
+        # its batched inputs read from `reads`.
+        function residual!(block, recipe_index, reads)
+            recipe = inner.recipes[recipe_index]
+            out = locals[canon_id(inner.graph, only(recipe.outputs).id)]
+            args = Any[get(() -> _authored_plate_scalar_ref(inner, locals, callargs,
+                               callvalues, prepared_arguments, atomic, input, index, true),
+                           reads, canon_id(inner.graph, input.id))
+                       for input in recipe.inputs]
+            lower_recipe!(block, recipe_index, args, out,
+                Expr(:ref, _CALLABLES_ARG, op_offset + recipe_index), true)
+        end
         if reduction === nothing
             push!(execution.args, batched ? _lower_plate_batched_native(batch, inner, locals,
-                callargs, raw_arguments, output_axes, pointwise_lhs, accumulator, cell_loop) :
-                cell_loop)
+                callargs, raw_arguments, output_axes, pointwise_lhs, accumulator, cell_loop,
+                index, residual!) : cell_loop)
         else
             push!(execution.args, _lower_plate_reduction_native(reduction.kind,
                 reduction, inner, locals, callargs, callvalues, raw_arguments,
@@ -5759,6 +5771,14 @@ function _lower_with_ops_collecting(p::Plan;
                     readonly_value_types === nothing && (readonly_value_types =
                         _readonly_value_types(p, exemplar_types))
                     cells.readonly[r.id] = _readonly_cell_slices(p, r, readonly_value_types)
+                end
+                # At the rows a partition reads, its rows run batched too
+                # (plate_batching.jl).
+                if exemplar_types !== nothing && !plate_element_types && _plate_batch_candidate(r)
+                    readonly_value_types === nothing && (readonly_value_types =
+                        _readonly_value_types(p, exemplar_types))
+                    plan = _plate_batch_plan(p, r, readonly_value_types)
+                    plan === nothing || (cells.batch[r.id] = plan)
                 end
                 _lower_authored_plate_native!(
                     Expr(:block), runtime_ops, runtime_recipes, r.op, callargs,

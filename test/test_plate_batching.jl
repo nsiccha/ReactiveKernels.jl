@@ -87,12 +87,34 @@ end
     return out
 end
 
-# A cell statement without a batched form: the cell loop runs.
+# A statement without a batched form runs cell by cell inside each tile, after
+# the batched ones: a helper of the cell's vector. (`@rkppl` fuses a field with
+# its observations' densities, whose lazy-branch laws run so; its test is
+# ReactiveKernelsPPL's `test_batched_field_plates.jl`.) A lazy branch whose arms
+# are graphs of their own (a lane branch, below) keeps the cell loop for now.
 pick(v) = v[1] > 0 ? v : -v
-@kernel unbatched(W::Matrix{Float64}, x::Vector{Vector{Float64}}) = begin
+@kernel helper(W::Matrix{Float64}, x::Vector{Vector{Float64}}) = begin
     out = plate(x) do v
         w = W * v
         sum(pick(w))
+    end
+    return out
+end
+@kernel branched(W::Matrix{Float64}, x::Vector{Vector{Float64}}, y::Vector{Float64}) = begin
+    out = plate(x, y) do v, t
+        w = W * v
+        s = sum(abs2, w)
+        t > 0 ? -0.5 * (t - s)^2 : -Inf
+    end
+    total = sum(out)
+    return total
+end
+
+# A product of a matrix that differs by cell has no batched form: the cell loop.
+@kernel per_cell_matrix(u::Vector{Float64}, x::Vector{Vector{Float64}}) = begin
+    out = plate(x) do v
+        M = reshape(v, 2, 2)
+        sum(M * u)
     end
     return out
 end
@@ -211,16 +233,28 @@ end
     @test _close(viewed(W, u, x, s, 2), viewed_baseline(W, u, x, s, 2))
 end
 
+@testset "a statement without a batched form runs cell by cell inside the tile" begin
+    W = [0.3 -0.2 0.5; 0.1 0.4 -0.3]
+    x = [[0.1i, -0.2, 0.05i] for i in 1:300]
+    y = [isodd(i) ? 0.2i : -1.0 for i in 1:300]
+    helper = prepare(B.helper; exemplars = (W, x))
+    @test _batched(helper)
+    @test _close(helper(W, x), [sum(B.pick(W * v)) for v in x])
+    # A lane branch: the cell loop.
+    branched = prepare(B.branched; exemplars = (W, x, y))
+    @test !_batched(branched)
+    @test branched(W, x, y) == -Inf
+end
+
 @testset "plates without a product, without a form, or without exemplars keep the cell loop" begin
     a, b = collect(0.1:0.1:2.0), collect(2.0:-0.1:0.1)
     numbers = prepare(B.numbers; exemplars = (a, b))
     @test !_batched(numbers)
     @test numbers(a, b) == exp.(a) .* b .+ 1.0
-    W = [0.3 -0.2; 0.1 0.4]
-    x = [[0.1i, -0.2] for i in 1:10]
-    unbatched = prepare(B.unbatched; exemplars = (W, x))
-    @test !_batched(unbatched)
-    @test unbatched(W, x) == [sum(B.pick(W * v)) for v in x]
-    args = _field_arguments(; rows = 10)
+    u = [0.5, -0.25]
+    x = [[0.1i, -0.2, 0.3, 0.05i] for i in 1:10]
+    matrices = prepare(B.per_cell_matrix; exemplars = (u, x))
+    @test !_batched(matrices)
+    @test matrices(u, x) == [sum(reshape(v, 2, 2) * u) for v in x]
     @test !_batched(prepare(B.field))
 end

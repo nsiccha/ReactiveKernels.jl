@@ -1367,14 +1367,22 @@ A statement that varies by cell has a batched form when it is built from:
   and `v[k]` of a cell's vector at a shared integer;
 - any other call of a function of the cell's numbers, called at every cell.
 
-The plate is batched when every statement that varies by cell has a form, the
-cell's result is a number or a `Vector` of numbers, and at least one statement
-is a product of a shared matrix and a cell's vector. The batched tiles run when
-the call's argument types are the exemplars', every argument the cells read
-spans the plate's one axis, and the vectors one argument holds all have one
-length; any other call runs the cell loop, as does any other plate.
+A statement without a form, and every statement that reads one, runs cell by
+cell inside the tile after the batched ones, as the cell loop runs it, reading a
+batched value at its cell's row (a vector as the copy of its row). That is how
+an `@rkppl` plate runs, whose cells end in their observations' densities. The
+plate is batched when at least one statement is a product of a shared matrix
+and a cell's vector, and the cell's result is a number, a `Vector` of numbers or
+a statement run cell by cell; a plate holding a nested plate, a scan, a shared
+call or a lane branch (a lazy branch whose arms are graphs of their own) keeps
+the cell loop. The batched tiles run when the plate has at least 16 cells, the
+call's shared arguments have the exemplars' types and its other arguments their
+element types, every argument the cells read spans the plate's one axis, and
+the vectors one argument holds all have one length; otherwise the cell loop
+runs.
 
-A partition (`plate_partition`) runs its rows batched the same way: its
+A partition (`plate_partition`), and a plate a cell query or partition computes
+at the rows its readers read, run those rows batched the same way: their
 arguments are views of the plate's, whose elements have the plate's types. A
 query of one cell runs that cell alone.
 
@@ -1383,7 +1391,7 @@ products and the row sums add in another order. Set `RK_BATCHED_PLATES=0` to
 keep the cell loop, as a comparison baseline; `JULIA_DEBUG=ReactiveKernels`
 logs each plate planned batched (group `:plate_batching`) with its statements
 that vary by cell. Not batched yet: the non-allocating step, the opt-in plate
-reverse, lazy branches, plates and scans in a cell, and a matrix that differs
+reverse, lane branches, plates and scans in a cell, and a matrix that differs
 per cell, such as a coefficient row selected by the cell's block and reshaped
 (`reshape(coefficients[b, :], C, :)`).
 

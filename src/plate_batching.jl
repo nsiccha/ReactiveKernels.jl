@@ -40,32 +40,40 @@
 # - any other call of a function of the cell's numbers (and shared values, each
 #   read whole) is that call at every cell, as a broadcast.
 #
-# Anything else keeps the cell loop: a plate is batched only when every
-# statement that varies by cell has a form, the cell's result is a number or a
-# `Vector` of numbers, and at least one statement is a product of a shared matrix
-# and a cell's vector (a plate of numbers vectorizes as a cell loop already).
+# A statement without a form, and every statement that reads one, runs cell by
+# cell inside the tile after the batched ones, as the cell loop runs it, reading
+# a batched value at the cell's row (a vector as the copy of its row): an
+# `@rkppl` plate fuses a field with its observations' densities, whose laws are
+# lazy branches. A plate is batched when at least one statement is a product of
+# a shared matrix and a cell's vector (a plate of numbers vectorizes as a cell
+# loop already), the cell's result is a number, a `Vector` of numbers or a
+# statement run cell by cell, and it holds no nested plate, scan or shared call.
 #
 # The plan is decided at preparation from the exemplars' concrete types, as the
 # in-place slice proof is (`readonly_slices.jl`), and the batched tiles run only
-# where the call's shared arguments are of those types and the elements of the
-# arguments the cells read one by one are of theirs, every argument the cells read
+# where the plate has at least 16 cells (`_PLATE_BATCH_MIN`), the call's shared
+# arguments are of those types and the elements of the arguments the cells read
+# one by one are of theirs, every argument the cells read
 # spans the plate's one axis, and every vector argument holds vectors of one
 # length; otherwise the cell loop runs. Values agree with the cell loop to
 # rounding, not bit for bit: the products and the row sums add in another order.
 # `RK_BATCHED_PLATES=0` keeps the cell loop (the comparison baseline), and
 # `JULIA_DEBUG=ReactiveKernels` logs each plate planned batched (group
-# `:plate_batching`) with the statements that vary by cell. Not
-# batched: the non-allocating step, the opt-in plate reverse, a plate's cell
-# query of one cell (one row gains nothing), a cell read at the rows a cell
-# window computes, branch arms, nested plates and scans, and a cell matrix
-# selected by the cell's index (a coefficient row of a block, `coefficients[b, :]`
-# reshaped); the last is a later increment. A partition (`plate_partition`)
-# runs its rows batched: its arguments are views of the plate's, of the same
-# element types.
+# `:plate_batching`) with its batched statements and those run cell by cell.
+# Not batched: the non-allocating step, the opt-in plate reverse, lane branch
+# arms, and a cell matrix selected by the cell's index (a coefficient row of a
+# block, `coefficients[b, :]` reshaped), a later increment. A partition
+# (`plate_partition`) and a plate a cell window computes at the rows its
+# readers read run those rows batched: their arguments are views of the
+# plate's, of the same element types.
 _plate_batching_enabled() = get(ENV, "RK_BATCHED_PLATES", "1") != "0"
 
 # Cells per tile: one product per tile and statement.
 const _PLATE_BATCH_TILE = 256
+# The fewest cells the tiles run for: a query of a few rows (one cell's window)
+# gains nothing from a product over them.
+const _PLATE_BATCH_MIN = 16
+@inline _plate_batch_enough(output_axes) = length(only(output_axes)) >= _PLATE_BATCH_MIN
 
 # One batched statement: the cell plan's recipe at `recipe`, whose output
 # `output` is `kind` (`:scalar`, a number per cell, or `:vector`, a vector per
@@ -76,17 +84,24 @@ struct _PlateBatchStep
     kind::Symbol
     names::Vector{Symbol}
     body::Any
+    products::Int
 end
 
 # The batched form of one plate: its cell plan (`inner`, the identity the
 # lowering checks), each argument's role (`:scalar` and `:vector` vary by cell,
 # `:shared` is read whole), the argument types it was planned for, the batched
-# statements in plan order, and the cell result's kind.
+# statements in plan order, the cell's other statements that vary by cell
+# (`residual`, run cell by cell inside each tile after the batched ones, as the
+# cell loop runs them), the batched values those read with their kinds
+# (`reads`), and where the cell's result comes from: a batched statement
+# (`:scalar` or `:vector`) or a residual one (`:cell`).
 struct _PlateBatchPlan
     inner::Plan
     inputs::Vector{Symbol}
     types::Vector{Any}
     steps::Vector{_PlateBatchStep}
+    residual::Vector{Int}
+    reads::Dict{ValueId,Symbol}
     want::Symbol
 end
 
@@ -97,7 +112,9 @@ _plate_batch_candidate(op::_AuthoredPlateOp) = _plate_batching_enabled() &&
     !_plate_reverse_enabled() && any(_batch_has_product, getfield(op.kernel, :plan).recipes)
 _batch_has_product(q::Recipe) = q.op === Base.:* || _batch_source_has_product(q.source)
 _batch_source_has_product(ex) = ex isa Expr && ((ex.head === :call && length(ex.args) >= 3 &&
-    ex.args[1] === :*) || any(_batch_source_has_product, ex.args))
+    _batch_star(ex.args[1])) || any(_batch_source_has_product, ex.args))
+_batch_star(f) = f === :* || (f isa GlobalRef && f.name === :*) ||
+    (Meta.isexpr(f, :., 2) && f.args[2] == QuoteNode(:*))
 
 # A shared value's kind from its type.
 Base.@nospecializeinfer function _batch_shared_kind(@nospecialize(T))
@@ -148,41 +165,57 @@ function _plate_batch_plan(p::Plan, op::_AuthoredPlateOp, values, types)
     end
     any(_batch_varies, inputs) || return nothing
     steps = _PlateBatchStep[]
-    products = Ref(0)
+    residual = Int[]
+    by_cell = Set{ValueId}()
     for (index, q) in enumerate(inner.recipes)
         length(q.outputs) == 1 || return nothing
+        # Nested plates and scans and shared calls keep their own lowerings.
+        q.op isa Union{_AuthoredPlateOp,_AuthoredScanOp,_SharedCall} && return nothing
         output = canon_id(cg, only(q.outputs).id)
         ins = ValueId[canon_id(cg, v.id) for v in q.inputs]
-        all(cid -> haskey(kinds, cid), ins) || return nothing
+        all(cid -> haskey(kinds, cid) || cid in by_cell, ins) || return nothing
         T = get(cell_types, output, Any)
-        if !any(cid -> _batch_varies(first(kinds[cid])), ins)
+        if !any(cid -> cid in by_cell || _batch_varies(first(kinds[cid])), ins)
             # A plate invariant: computed once, above the cells.
             kinds[output] = (_batch_shared_kind(T), T)
             continue
         end
-        q.effectful && return nothing
-        step = _plate_batch_step(q, index, output, ins, kinds, products)
-        step === nothing && return nothing
-        T isa Type && isconcretetype(T) || return nothing
-        fits = step.kind === :scalar ? T <: Number : T <: AbstractVector{<:Number}
-        fits || return nothing
-        kinds[output] = (step.kind, T)
-        push!(steps, step)
+        step = q.effectful || any(in(by_cell), ins) ? nothing :
+            _plate_batch_step(q, index, output, ins, kinds)
+        if step !== nothing && T isa Type && isconcretetype(T) &&
+           (step.kind === :scalar ? T <: Number : T <: AbstractVector{<:Number})
+            kinds[output] = (step.kind, T)
+            push!(steps, step)
+        else
+            # Without a batched form the statement runs cell by cell, inside
+            # the tile, and so does every statement that reads it.
+            push!(residual, index)
+            push!(by_cell, output)
+        end
     end
-    products[] > 0 || return nothing
+    any(step -> step.products > 0, steps) || return nothing
+    batched = Dict(step.output => step.kind for step in steps)
+    reads = Dict{ValueId,Symbol}()
+    for index in residual, v in inner.recipes[index].inputs
+        cid = canon_id(cg, v.id)
+        haskey(batched, cid) || continue
+        # A cell reads a vector as the copy of its row.
+        batched[cid] === :vector && !(last(kinds[cid]) <: Vector) && return nothing
+        reads[cid] = batched[cid]
+    end
     want = canon_id(cg, only(inner.want).id)
-    k = findfirst(step -> step.output == want, steps)
-    k === nothing && return nothing
-    kind = steps[k].kind
+    kind = want in by_cell ? :cell : get(batched, want, nothing)
+    kind === nothing && return nothing
     # A vector result is stored as a copy of its row.
     kind === :vector && !(last(kinds[want]) <: Vector) && return nothing
-    @debug "ReactiveKernels: a plate runs as matrix products over tiles of its cells" statements =
-        Any[_lane_strip_lines(inner.recipes[step.recipe].source) for step in steps] _group = :plate_batching
-    _PlateBatchPlan(inner, inputs, outer, steps, kind)
+    @debug "ReactiveKernels: a plate runs as matrix products over tiles of its cells" batched =
+        Any[_lane_strip_lines(inner.recipes[step.recipe].source) for step in steps] by_cell =
+        Any[_lane_strip_lines(inner.recipes[index].source) for index in residual] _group = :plate_batching
+    _PlateBatchPlan(inner, inputs, outer, steps, residual, reads, kind)
 end
 
 # The batched statement of cell recipe `q`, or `nothing`.
-function _plate_batch_step(q::Recipe, index::Int, output::ValueId, ins, kinds, products)
+function _plate_batch_step(q::Recipe, index::Int, output::ValueId, ins, kinds)
     op = q.op
     if op isa _KernelSourceOp
         analyzed = _cell_source(q)
@@ -215,8 +248,8 @@ function _plate_batch_step(q::Recipe, index::Int, output::ValueId, ins, kinds, p
     renamed = Dict{Symbol,Symbol}(name => gensym(Symbol(:batch_, name)) for name in params)
     qualified = _inline_qualify(body, mod, renamed)
     qualified === nothing && return nothing
-    products[] += context.products
-    _PlateBatchStep(index, output, kind, Symbol[renamed[name] for name in params], qualified)
+    _PlateBatchStep(index, output, kind, Symbol[renamed[name] for name in params], qualified,
+                    context.products)
 end
 
 # `GlobalRef` to a function's own binding, or `nothing`.
@@ -276,12 +309,43 @@ function _batch_callee(c::_BatchContext, callee)
     elseif callee isa GlobalRef
         isdefined(callee.mod, callee.name) && isconst(callee.mod, callee.name) || return nothing
         value = Some(getglobal(callee.mod, callee.name))
+    elseif Meta.isexpr(callee, :., 2) && callee.args[2] isa QuoteNode
+        # A qualified name, `M.f`, as `@rkppl` spells a model module's callee.
+        m = _batch_module(c, callee.args[1])
+        name = callee.args[2].value
+        m isa Module && name isa Symbol && isdefined(m, name) && isconst(m, name) ||
+            return nothing
+        value = Some(getglobal(m, name))
     else
         return nothing
     end
     value === nothing && return nothing
     f = something(value)
     f isa Function ? f : nothing
+end
+
+# The module a qualifier names, or `nothing`.
+function _batch_module(c::_BatchContext, ex)
+    ex isa Module && return ex
+    if ex isa Symbol
+        haskey(c.env, ex) && return nothing
+        _global_isconst(c.mod, ex) || return nothing
+        value = _global_value(c.mod, ex)
+        return value !== nothing && something(value) isa Module ? something(value) : nothing
+    end
+    if ex isa GlobalRef
+        isdefined(ex.mod, ex.name) && isconst(ex.mod, ex.name) || return nothing
+        value = getglobal(ex.mod, ex.name)
+        return value isa Module ? value : nothing
+    end
+    if Meta.isexpr(ex, :., 2) && ex.args[2] isa QuoteNode
+        m = _batch_module(c, ex.args[1])
+        name = ex.args[2].value
+        m isa Module && name isa Symbol && isdefined(m, name) && isconst(m, name) || return nothing
+        value = getglobal(m, name)
+        return value isa Module ? value : nothing
+    end
+    nothing
 end
 
 _batch_parts(c, args) = (parts = Any[_batch_expr(c, a) for a in args];
@@ -502,7 +566,7 @@ end
 # local.
 function _lower_plate_batched_native(plan::_PlateBatchPlan, inner::Plan, locals,
                                      callargs, raw_arguments, output_axes,
-                                     pointwise_lhs, accumulator, cell_loop)
+                                     pointwise_lhs, accumulator, cell_loop, index, residual!)
     graph = inner.graph
     have = Dict(canon_id(graph, v.id) => position for (position, v) in enumerate(inner.have))
     varying = [k for k in eachindex(plan.inputs) if plan.inputs[k] !== :shared]
@@ -515,7 +579,8 @@ function _lower_plate_batched_native(plan::_PlateBatchPlan, inner::Plan, locals,
                     plan.inputs[k] === :shared ? callargs[k] : raw_arguments[k])
                for k in eachindex(plan.inputs)]
     ready = Expr(:&&, foldl((a, b) -> Expr(:&&, a, b), fits),
-        Expr(:&&, Expr(:call, GlobalRef(@__MODULE__, :_plate_one_axis), output_axes),
+        Expr(:&&, Expr(:&&, Expr(:call, GlobalRef(@__MODULE__, :_plate_one_axis), output_axes),
+                       Expr(:call, GlobalRef(@__MODULE__, :_plate_batch_enough), output_axes)),
              Expr(:&&, Expr(:call, GlobalRef(@__MODULE__, :_plate_spans), output_axes,
                             (raw_arguments[k] for k in varying)...),
                   Expr(:call, GlobalRef(@__MODULE__, :_plate_batch_uniform),
@@ -544,10 +609,26 @@ function _lower_plate_batched_native(plan::_PlateBatchPlan, inner::Plan, locals,
         push!(tile.args, :($name = $(Expr(:let, Expr(:block, bindings...), step.body))))
         batched[step.output] = name
     end
-    result = batched[canon_id(graph, only(inner.want).id)]
+    want = canon_id(graph, only(inner.want).id)
     t, cell, value = gensym.((:batch_t, :batch_cell, :batch_value))
-    store = Expr(:block, :($cell = $rows[$t]),
-        :($value = $(plan.want === :scalar ? :($result[$t]) : :($result[$t, :]))))
+    store = Expr(:block, :($cell = $rows[$t]))
+    if !isempty(plan.residual)
+        # The statements without a batched form, cell by cell as the cell loop
+        # runs them, each batched value read at the cell's row.
+        push!(store.args, :($index = $(GlobalRef(Base, :CartesianIndex))($cell)))
+        reads = Dict{ValueId,Any}()
+        for (cid, kind) in plan.reads
+            name = gensym(:batch_row)
+            push!(store.args, :($name = $(kind === :scalar ? :($(batched[cid])[$t]) :
+                                          :($(batched[cid])[$t, :]))))
+            reads[cid] = name
+        end
+        for recipe_index in plan.residual
+            residual!(store, recipe_index, reads)
+        end
+    end
+    push!(store.args, :($value = $(plan.want === :cell ? locals[want] :
+        plan.want === :scalar ? :($(batched[want])[$t]) : :($(batched[want])[$t, :]))))
     pointwise_lhs === nothing ||
         push!(store.args, _inbounds_expr(:($pointwise_lhs[$cell] = $value)))
     accumulator === nothing || push!(store.args, :($accumulator =

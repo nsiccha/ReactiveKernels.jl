@@ -31,18 +31,23 @@ are recorded in the git history only.
   and vectors; `A * v`; the products, sums, differences and quotients Julia
   defines between the cell's numbers, vectors and shared numbers; `sum(v)`
   and `sum(f, v)`; `y[i, :]`, `y[i]`, `y[i, j]` at the cell's integer and
-  `v[k]` at a shared one; other functions of the cell's numbers. A plate is
-  batched when every statement that varies by cell has such a form, its cell
-  is a number or a `Vector`, and one statement is a shared matrix times a
-  cell's vector; it runs batched when the call's types are the exemplars',
-  its arguments span its one axis and each vector argument's vectors share a
-  length. Anything else runs the cell loop.
-- A partition (`plate_partition`) runs its rows batched the same way.
+  `v[k]` at a shared one; other functions of the cell's numbers. A statement
+  without such a form, and any statement reading one, runs cell by cell inside
+  each tile, so an `@rkppl` plate whose cells end in their observations'
+  densities runs batched through `prepare_sampler`. A plate is batched when one
+  statement is a shared matrix times a cell's vector and it holds no nested
+  plate, scan, shared call or lane branch; its tiles run for 16 cells or more
+  when the call's types are the exemplars' (elements, for the cells'
+  arguments), its arguments span its one axis and each vector argument's
+  vectors share a length. Anything else runs the cell loop.
+- A partition (`plate_partition`), and a plate computed at the rows a cell query
+  or partition reads, run those rows batched the same way.
 - Values and gradients of a batched plate agree with the cell loop to
   rounding, not bit for bit. `RK_BATCHED_PLATES=0` keeps the cell loop, and
   `JULIA_DEBUG=ReactiveKernels` logs each plate planned batched. The
-  non-allocating step, the opt-in plate reverse, one-cell queries, branches,
-  nested plates and scans, and per-cell matrices keep the cell loop for now.
+  non-allocating step, the opt-in plate reverse, one-cell queries, lane
+  branches, nested plates and scans, and per-cell matrices keep the cell loop
+  for now.
   "Plates of products run as matrix products" in the compiler guide has the
   rules.
 
