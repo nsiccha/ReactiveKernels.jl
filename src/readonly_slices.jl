@@ -188,12 +188,13 @@ function _reads_only_statement!(memo, code::Core.CodeInfo, i::Int, statement, de
 end
 
 # The array interface: what these return for a view and for its copy is one
-# meaning, whichever method computes it. Nothing here hands the caller the
-# container's storage, type or parent.
+# value, bit for bit, whichever method computes it. Nothing here hands the caller
+# the container's storage, type or parent. `sum` and `prod` are not in it: Base
+# may fold a view in another order than an array (a slice it cannot index
+# linearly, and on Julia 1.13 a row too), so their last bits can differ.
 const _READONLY_INTERFACE = (Base.getindex, Base.size, Base.length, Base.axes, Base.eachindex,
     Base.firstindex, Base.lastindex, Base.iterate, Base.first, Base.last, Base.eltype,
-    Base.ndims, Base.isempty, Base.sum, Base.prod, Base.maximum, Base.minimum, Base.copy,
-    Base.collect)
+    Base.ndims, Base.isempty, Base.maximum, Base.minimum, Base.copy, Base.collect)
 _readonly_interface(@nospecialize(f)) = any(g -> f === g, _READONLY_INTERFACE)
 
 # A frame's callee: a global, directly or through the statement that reads it.

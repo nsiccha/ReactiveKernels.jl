@@ -10,7 +10,7 @@ module ReadonlySliceCallees
 import LinearAlgebra
 export wave, buffered, through_helper, loops, aliases, writes, helper_writes, fills, stashes,
     returns_row, returns_wrapped, branches, reads_parent, names_type, methods_differ,
-    vector_only, helper_branches, dotted, through_blas, closes_over
+    vector_only, helper_branches, dotted, through_blas, closes_over, sums, total_of
 
 # The reported shape: one row of a coefficient array, read once per coefficient.
 function wave(frequency, coefficients, coordinate)
@@ -36,7 +36,7 @@ function loops(frequency, coefficients, coordinate)
     for v in coefficients
         total += v * coordinate
     end
-    total + sum(coefficients)
+    total
 end
 aliases(frequency, coefficients, coordinate) = (row = coefficients; coordinate * row[1])
 
@@ -86,6 +86,18 @@ through_blas(frequency, coefficients, coordinate) =
     LinearAlgebra.dot(coefficients, coefficients) * coordinate
 closes_over(frequency, coefficients, coordinate) =
     sum(i -> coefficients[i] * coordinate, 1:length(coefficients))
+# Base may fold a view in another order than an array (on Julia 1.13 even a row),
+# so `sum` of the slice keeps the copy, and its value, bit for bit.
+sums(frequency, coefficients, coordinate) = sum(coefficients) * coordinate
+
+# An in-order total that reads its argument only through `iterate`.
+function total_of(x)
+    total = 0.0
+    for v in x
+        total += v
+    end
+    total
+end
 end
 
 module ReadonlySliceKernels
@@ -98,7 +110,8 @@ _total(x::Tuple) = sum(_total, x)
 
 for callee in (:wave, :buffered, :through_helper, :loops, :aliases, :writes, :helper_writes,
         :fills, :stashes, :returns_row, :returns_wrapped, :branches, :reads_parent, :names_type,
-        :methods_differ, :vector_only, :helper_branches, :dotted, :through_blas, :closes_over)
+        :methods_differ, :vector_only, :helper_branches, :dotted, :through_blas, :closes_over,
+        :sums)
     name = Symbol(:rows_, callee)
     @eval @kernel $name(z::AbstractVector{Float64}, frequency::Matrix{Float64}, block::Vector{Int},
                         coordinate::Vector{Float64}, blocks::Int) = begin
@@ -118,7 +131,7 @@ end
     coefficients = reshape(z, blocks, length(z) ÷ blocks)
     field = plate(column, coordinate) do k, c
         col = coefficients[:, k]
-        sum(col) * c
+        total_of(col) * c
     end
     total = sum(field)
     return total
@@ -126,7 +139,7 @@ end
 @kernel gathers(z::Vector{Float64}, groups::Vector{Vector{Int}}, coordinate::Vector{Float64}) = begin
     field = plate(groups, coordinate) do rows, c
         gathered = z[rows]
-        sum(gathered) * c
+        total_of(gathered) * c
     end
     total = sum(field)
     return total
@@ -137,7 +150,7 @@ end
     span = 2:3
     field = plate(block, coordinate) do b, c
         part = coefficients[b, span]
-        sum(part) * c
+        total_of(part) * c
     end
     total = sum(field)
     return total
@@ -197,6 +210,12 @@ end
 const K = ReadonlySliceKernels
 _in_place(kernel) = occursin("_readonly_slice", sprint(print, code_expr(kernel)))
 _baseline(f) = withenv(f, "RK_READONLY_SLICES" => "0")
+# Values are compared bit for bit. A gradient can differ from the copy's in its
+# last bit: the view's adjoint accumulates straight into the parent's shadow,
+# where Enzyme's contracted derivative arithmetic (the dogfood default, `nsz` and
+# `contract`) may fuse a multiply-add that the copy's shadow rounds twice. Under
+# strict derivative arithmetic (`Enzyme.API.fast_math_flags!()`) they are identical.
+_same_gradient(a, b) = isapprox(a, b; rtol = 1e-13)
 
 function _rows_arguments(; n = 6, blocks = 2, F = 3)
     z = collect(range(-0.3, 0.3; length = blocks * 2F))
@@ -210,7 +229,7 @@ const BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 const IN_PLACE = (:wave, :buffered, :through_helper, :loops, :aliases)
 const REFUSED = (:writes, :helper_writes, :fills, :stashes, :returns_row, :returns_wrapped,
                  :branches, :reads_parent, :names_type, :methods_differ, :vector_only,
-                 :helper_branches, :dotted, :through_blas, :closes_over)
+                 :helper_branches, :dotted, :through_blas, :closes_over, :sums)
 
 @testset "a slice only reads in place when the proof holds" begin
     # A view of the shape a plate cell reads.
@@ -247,7 +266,7 @@ end
     value, gradient = ad_value_and_gradient(ad, args...)
     value_copied, gradient_copied = ad_value_and_gradient(ad_copied, args...)
     @test value == value_copied
-    @test gradient == gradient_copied
+    @test _same_gradient(gradient, gradient_copied)
     @test args[1] == z
 end
 
@@ -285,7 +304,8 @@ end
         in_place || continue
         ad = prepare_ad(prepared, BACKEND, args...; active = :z)
         ad_copied = prepare_ad(copied, BACKEND, args...; active = :z)
-        @test ad_value_and_gradient(ad, args...)[2] == ad_value_and_gradient(ad_copied, args...)[2]
+        @test _same_gradient(ad_value_and_gradient(ad, args...)[2],
+                             ad_value_and_gradient(ad_copied, args...)[2])
     end
     # One reader that writes keeps the copy for both.
     args = (z, frequency, block, coordinate, 2)

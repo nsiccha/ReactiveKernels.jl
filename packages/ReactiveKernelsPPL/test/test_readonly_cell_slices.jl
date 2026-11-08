@@ -53,6 +53,13 @@ end
 sampler(fix) = prepare_sampler(fix.built, fix.bound, fix.u; backend = BACKEND)
 copying(fix) = withenv(() -> sampler(fix), "RK_READONLY_SLICES" => "0")
 in_place(q) = occursin("_readonly_slice", sprint(print, code_expr(q.kernel)))
+# Values are compared bit for bit. A gradient can differ from the copy's in its
+# last bit: the view's adjoint accumulates straight into the parent's shadow,
+# where Enzyme's contracted derivative arithmetic (the dogfood default, `nsz` and
+# `contract`) may fuse a multiply-add that the copy's shadow rounds twice. Under
+# strict derivative arithmetic (`Enzyme.API.fast_math_flags!()`) they are identical.
+# A callee that keeps its copy runs the same program, so its gradient is exact.
+same_gradient(a, b) = isapprox(a, b; rtol = 1e-13)
 
 @testset "a field row an opaque function only reads is read in place" begin
     fix = fixture(:wave)
@@ -62,9 +69,10 @@ in_place(q) = occursin("_readonly_slice", sprint(print, code_expr(q.kernel)))
     u = copy(fix.u)
     @test q(fix.u) == reference(fix.u)
     g, g_reference = zero(u), zero(u)
-    @test sampler_value_and_gradient!(q, g, fix.u) ==
-          sampler_value_and_gradient!(reference, g_reference, fix.u)
-    @test g == g_reference
+    value, _ = sampler_value_and_gradient!(q, g, fix.u)
+    value_reference, _ = sampler_value_and_gradient!(reference, g_reference, fix.u)
+    @test value == value_reference
+    @test same_gradient(g, g_reference)
     @test fix.u == u
     # Against central differences, at another point.
     point = u .+ 0.05 .* sin.(eachindex(u))
@@ -121,7 +129,7 @@ partition(fix) = prepare_partition_sampler(fix.built, fix.bound, :y, fix.u; by =
         value, _ = partition_value_and_gradient!(sampler, g, fix.u, label)
         value_reference, _ = partition_value_and_gradient!(reference, g_reference, fix.u, label)
         @test value == value_reference
-        @test g == g_reference
+        @test same_gradient(g, g_reference)
     end
     fp = partition_footprint(sampler, 3)
     g = zeros(length(fp))

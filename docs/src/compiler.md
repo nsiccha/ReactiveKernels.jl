@@ -1270,10 +1270,11 @@ queries pass it. It has two parts, and both must hold:
 - **The callee cannot tell a view from a copy.** The walk above reads code that
   has already selected the view's branch and method, so the lowered body of each
   user-level frame is read too. The argument may only reach Base's array
-  interface (`getindex`, `size`, `length`, `axes`, `iterate`, `sum`, ...) or a
-  function whose methods admit a view and a copy alike. `x isa Vector`,
-  `typeof(x)` and `parent(x)` end the proof, and so does a `Vector` method beside
-  an `AbstractVector` one.
+  interface (`getindex`, `size`, `length`, `axes`, `iterate`, `maximum`, ...) or
+  a user function whose methods admit a view and a copy alike and whose own body
+  passes this test. Base's other functions end the proof, and so do
+  `x isa Vector`, `typeof(x)`, `parent(x)` and a `Vector` method beside an
+  `AbstractVector` one.
 
 The reader must also infer one concrete result type over the view and the copy,
 the slice's elements must be bits values, and the slice must not be the cell's
@@ -1292,10 +1293,14 @@ only at those rows (`_CellWindow`); a gather of several rows of such a value kee
 its copy.
 Set `RK_READONLY_SLICES=0` to keep every copy, as a comparison baseline.
 
-Base's interface means one thing for both containers, but not always to the last
-bit. `sum` folds a view that Base cannot index linearly in order, and an array
-pairwise, so a sum over a matrix slice `A[I, :]` can differ from the copy's in
-its last bits. A row or a column reads linearly and sums identically.
+Values are the copy's bit for bit. The interface leaves out `sum` and `prod`:
+Base may fold a view in another order than an array (a matrix slice `A[I, :]`
+on every version, and on Julia 1.13 a row too), so a reader that sums the slice
+keeps its copy. Gradients can differ from the copy's in the last bit. The view's
+adjoint accumulates straight into the parent's shadow, where Enzyme's contracted
+derivative arithmetic (the dogfood default, `nsz` and `contract`) may fuse a
+multiply-add that the copy's shadow rounds twice. Under strict derivative
+arithmetic (`Enzyme.API.fast_math_flags!()`) the gradients are identical.
 
 ### Nested observation plates
 
