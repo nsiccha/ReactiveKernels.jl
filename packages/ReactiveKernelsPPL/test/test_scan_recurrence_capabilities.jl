@@ -280,6 +280,15 @@ end
         z = draws[only(e.name for e in f.built.layout.entries if e.kind === :scan)]
         if kind === :walk
             @test all(data[:lo] .< z[[1, 2, (5:(n + 2))...]] .< data[:hi])
+            # Adjacent seeds with one transform and its bounds share one block:
+            # the two bounded `h` seeds, the two flat `g` seeds, then a block
+            # per step statement when there are steps.
+            ze = only(e for e in f.built.layout.entries if e.kind === :scan)
+            @test [(b.size, b.transform) for b in ze.scan_blocks] ==
+                [(2, :interval), (2, :identity), ((n > 2 ? [(n - 2, :interval), (n - 2, :identity)] : [])...)]
+            # Every step samples its state, so each trajectory is its seeds and
+            # its own slice of the latent vector: the program folds nothing.
+            @test !occursin(r"\bscan\(", string(f.built.program))
         elseif kind === :centered
             @test all(0 .< z[2:end] .< draws.ub)
         else
