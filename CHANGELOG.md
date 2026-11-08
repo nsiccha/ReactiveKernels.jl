@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.122
+## 0.1.124
 
 - A plate cell reads a slice in place when every call that reads it provably
   only reads it. A row, column or gather passed to a function (`row = A[i, :]`
@@ -40,6 +40,46 @@ are recorded in the git history only.
   computes only at its rows also keep their copies. `RK_READONLY_SLICES=0` keeps
   every copy, for comparison. See "Slices a cell only reads" in the compiler
   guide.
+
+## 0.1.123
+
+- `prepare_nonallocating`, and through it
+  `prepare_sampler(...; nonallocating = true)`, now runs the stable rewrites
+  `prepare` runs: a composition such as `log(exp(u))`, `log.(exp.(x))`,
+  `log(1 / (1 + exp(-u)))` or a branch arm's `log(s)` of `s = exp(u)` is
+  computed in its stable form, inside its buffered steps too. A non-allocating
+  kernel's values and ordinary-Reverse gradients change where `exp` overflows
+  or underflows, from `NaN` or an infinity to the finite value `prepare` gives,
+  and by rounding elsewhere: they now agree with `prepare` bitwise on the four
+  PosteriorDB models that differed.
+- New: `prepare_nonallocating` takes `simplify`, as `prepare` does;
+  `simplify = false` or the project's `simplify` preference keeps the literal
+  program. A `PreparedKernel` argument contributes its plan, not its own
+  setting.
+- A rewritten dotted call (`log.(exp.(x))`) no longer allocates its inner
+  function as a `Ref` on each call, in `prepare` too.
+
+## 0.1.122
+
+- A plate over no rows prepares the program the same plate over rows
+  prepares, by default (no `branch_arms` setting needed). The pass that caches
+  a plate cell's work over bound data per lane at preparation used to leave a
+  plate with an empty bound domain as authored, so a binding with no rows (an
+  RKPPL `@plate` whose data column is empty, such as a region without spectra)
+  prepared another program, another sampler type and another compile than a
+  binding with rows. It now rewrites an empty domain as it rewrites a nonempty
+  one. It evaluates nothing: the cached per-cell values are empty, and a value
+  every cell would share is a typed placeholder that no cell reads. Such a
+  value now also has a placeholder when it is an array (a data column a cell
+  reads whole gets an empty one of its type) or a tuple or named tuple of
+  values that have one; with `branch_arms = :all`, 0.1.119 left the plate as
+  authored for these. Values and gradients are unchanged, and a binding with
+  rows prepares exactly the program it prepared before. A shared value of
+  another type (a struct holding arrays) still keeps the authored plate.
+  A branch whose condition no lane varies, such as the support guard of a
+  written scale, is decided for a plate over no rows as for one over rows; a
+  condition that throws there keeps the plate. A branch its lanes decide still
+  prepares a program per arm pattern unless `branch_arms = :all` (0.1.119).
 
 ## 0.1.121
 

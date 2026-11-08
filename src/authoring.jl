@@ -5395,15 +5395,15 @@ end
 function prepare_nonallocating(spec::KernelSpec, exemplars...;
                                have = _KERNEL_DEFAULT_BOUNDARY,
                                want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
-                               bound = NamedTuple())
+                               bound = NamedTuple(), simplify = nothing)
     isempty(bound) || return prepare_nonallocating(spec.graph, exemplars...;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),
-        passes = passes, bound = _kernel_bound_pairs(spec, bound))
+        passes = passes, bound = _kernel_bound_pairs(spec, bound), simplify)
     prepared = prepare_nonallocating(spec.graph, exemplars...;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),
-        passes = passes)
+        passes = passes, simplify)
     have === _KERNEL_DEFAULT_BOUNDARY || return prepared
     _kernel_signature_callable(prepared, spec.call_signature)
 end

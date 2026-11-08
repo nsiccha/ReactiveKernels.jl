@@ -8827,8 +8827,8 @@ function prepare(g::Graph; have = (), want = (), passes = (), bound = (),
 end
 
 """
-    prepare_nonallocating(p::Plan, exemplars...; passes=()) -> NonAllocatingKernel
-    prepare_nonallocating(g::Graph, exemplars...; have, want, passes=()) -> NonAllocatingKernel
+    prepare_nonallocating(p::Plan, exemplars...; passes=(), simplify=nothing) -> NonAllocatingKernel
+    prepare_nonallocating(g::Graph, exemplars...; have, want, passes=(), simplify=nothing) -> NonAllocatingKernel
 
 Optional MutatingFunctions-backed preparation interface. Install and load
 `MutatingFunctions` alongside `ReactiveKernels` to activate the package
@@ -8841,6 +8841,10 @@ keeps: each materialized authored plate or scan output fills a buffer kept
 across calls, and every other operation with a destination-passing form goes
 through `MutatingFunctions.apply!!` and a persistent per-step cache. User
 `passes` run on the native program before this final transform.
+
+`simplify` selects the stable rewrites as for [`prepare`](@ref), and they reach
+the buffered steps. A `PreparedKernel` argument contributes its plan, not its
+own setting: pass `simplify = false` here too to keep a literal program.
 
 A step keeps a cache only when its result is fresh storage that a
 destination-passing method fills: the decomposition's own steps below, or an

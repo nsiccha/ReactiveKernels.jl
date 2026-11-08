@@ -211,6 +211,15 @@ end
     total::Float64 = sum(pointwise)
 end
 
+# A condition over a bound number whose evaluation can throw.
+@kernel throwing_condition(y::Vector{Float64}, m::Float64, s::Float64) = begin
+    pointwise = plate(y, m, s) do yi, mi, si
+        cell::Float64 = log(si) > 0 ? mi * yi : yi
+        cell
+    end
+    total::Float64 = sum(pointwise)
+end
+
 # The scale's port undeclared, as a plate reading any bound number has it.
 @kernel guarded_scale_undeclared(y::Vector{Float64}, m::Float64, s) = begin
     pointwise = plate(y, m, s) do yi, mi, si

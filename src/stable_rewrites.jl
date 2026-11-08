@@ -39,9 +39,9 @@
 # call that nothing reads any more is removed: kept, its reverse could still
 # form `0 * Inf`. Dotted calls (`log.(exp.(u))`) are rewritten elementwise.
 #
-# Scope. This covers the program `prepare` compiles (and so `prepare_ad`, the
-# RKPPL queries and samplers), inside plate cells included. Not yet covered:
-# `prepare_nonallocating`, the reactive compiler, the batched lowering and
+# Scope. This covers the programs `prepare` and `prepare_nonallocating` compile
+# (and so `prepare_ad`, the RKPPL queries and samplers), inside plate cells
+# included. Not yet covered: the reactive compiler, the batched lowering and
 # `jax_source`; opaque native functions are never visible to it.
 
 # --- the setting -------------------------------------------------------------
@@ -86,6 +86,15 @@ const _RwNonNegative = Union{typeof(exp),typeof(_native_exp),typeof(abs),typeof(
 
 # The float type the authored arithmetic over these operands produces.
 _rw_float(xs...) = float(promote_type(map(typeof, xs)...))
+
+# The inner callable of a dotted helper call, `_rk_log_of.(exp, x)`. Base
+# broadcasts a function as a mutable `RefValue`, which a consumer that is not
+# inlined, such as a non-allocating step's `apply!!`, allocates on every call;
+# this immutable `Ref` is the same zero-dimensional operand.
+struct _RwFn{F} <: Ref{F}
+    f::F
+end
+Base.getindex(x::_RwFn) = x.f
 
 # `log(f(x))`.
 @inline _rk_log_of(f::F, x) where {F} = log(f(x))
@@ -416,6 +425,16 @@ function _rw_arm_view(ctx::_RwContext, callee, args::Vector{Any}, env)
     _rw_view(_rw_substitute(_rw_qualify(arm, mod), subst), ctx, env)
 end
 
+# A dotted call as the native lowering and the non-allocating decomposition spell it.
+_rw_is_broadcasted(f) = f === _native_broadcasted || f === Base.Broadcast.broadcasted
+# `__cache_apply__(__caches__[j], __callables__[j], bc)` whose step `j` only
+# materializes `bc` (`_step_call`, `_MaterializeStep`).
+function _rw_materialize_step(ex::Expr, ctx::_RwContext)
+    ex.head === :call && length(ex.args) == 4 && ex.args[1] === _CACHE_APPLY_ARG || return false
+    k = _callable_slot(ex.args[3])
+    k !== nothing && 1 <= k <= length(ctx.recipes) && ctx.recipes[k] isa _MaterializeStep
+end
+
 # The call `ex` makes, or `nothing`.
 function _rw_view(ex, ctx::_RwContext, env)
     ex isa Expr || return nothing
@@ -428,12 +447,16 @@ function _rw_view(ex, ctx::_RwContext, env)
     args = Any[ex.args[2:end]...]
     slot = _callable_slot(callee)
     slot === nothing || return _rw_table_view(ctx, slot, args)
+    # A broadcast a non-allocating step materializes into its buffer.
+    _rw_materialize_step(ex, ctx) &&
+        return (inner = _rw_view(last(args), ctx, env);
+                inner !== nothing && inner.broadcast ? inner : nothing)
     f = _rw_resolve(callee, @__MODULE__)
     f === nothing && return nothing
     if f === _native_broadcast_materialize && length(args) == 1
         inner = _rw_view(args[1], ctx, env)
         return inner !== nothing && inner.broadcast ? inner : nothing
-    elseif f === _native_broadcasted && !isempty(args)
+    elseif _rw_is_broadcasted(f) && !isempty(args)
         g = _rw_resolve(args[1], @__MODULE__)
         return g === nothing ? nothing : _RwView(g, Any[args[2:end]...], true)
     end
@@ -466,8 +489,11 @@ _rw_fits(outer::_RwView, inner::_RwView) = outer.broadcast || !inner.broadcast
 # The rewritten call, in the outer call's form.
 _rw_emit(ctx::_RwContext, outer::_RwView, helper::Symbol, args...) = outer.broadcast ?
     Expr(:call, GlobalRef(@__MODULE__, :_native_broadcasted), _rw_helper(helper),
-         map(a -> _rw_fresh(ctx, a), args)...) :
+         map(a -> _rw_dotted_operand(_rw_fresh(ctx, a)), args)...) :
     Expr(:call, _rw_helper(helper), map(a -> _rw_fresh(ctx, a), args)...)
+# A function operand (`_rw_ref`) of a dotted helper call as an immutable `_RwFn`.
+_rw_dotted_operand(a) = a isa GlobalRef && _rw_resolve(a, @__MODULE__) isa Function ?
+    Expr(:call, GlobalRef(@__MODULE__, :_RwFn), a) : a
 
 # The inner call of one operand when it is `f(x)` with `f` among `fs` and `x`
 # readable at the site: `(view, x)`, else `nothing`.
@@ -855,7 +881,9 @@ end
 # Whether `rhs` is a call of a pure, total inner function of the rules over
 # names and literals, whose statement can go once nothing reads its name.
 function _rw_pure(rhs, ctx::_RwContext)
+    rhs isa Symbol && return true
     rhs isa Expr || return false
+    _rw_materialize_step(rhs, ctx) && return _rw_pure(last(rhs.args), ctx)
     if rhs.head === :let
         length(rhs.args) == 2 || return false
         bindings, body = rhs.args
@@ -874,7 +902,7 @@ function _rw_pure(rhs, ctx::_RwContext)
     slot = _callable_slot(rhs.args[1])
     if slot !== nothing
         # A table call of the raw function (`p = logistic(e)` in a cell).
-        1 <= slot <= length(ctx.recipes) || return false
+        1 <= slot <= length(ctx.recipes) && ctx.recipes[slot] isa Recipe || return false
         op = ctx.recipes[slot].op
         return (_rw_is_exp(op) || op === LogExpFunctions.logistic) &&
                all(simple, rhs.args[2:end])
@@ -882,7 +910,7 @@ function _rw_pure(rhs, ctx::_RwContext)
     f = _rw_resolve(rhs.args[1], @__MODULE__)
     if f === _native_broadcast_materialize
         return length(rhs.args) == 2 && _rw_pure(rhs.args[2], ctx)
-    elseif f === _native_broadcasted
+    elseif _rw_is_broadcasted(f)
         length(rhs.args) >= 2 || return false
         g = _rw_resolve(rhs.args[2], @__MODULE__)
         return (_rw_is_exp(g) || g === LogExpFunctions.logistic) &&
@@ -940,9 +968,9 @@ end
     _stable_rewrites(ast::Expr, recipes::Tuple) -> Expr
 
 The generated function `ast` with its numerically fragile compositions in their
-stable forms (the file header). `recipes` are the lowered recipes, one per
-position of the callables table the body calls through. Returns `ast` itself
-when nothing applies.
+stable forms (the file header). `recipes` holds what each position of the
+callables table the body calls through runs: a lowered recipe, or a
+non-allocating step. Returns `ast` itself when nothing applies.
 """
 function _stable_rewrites(ast::Expr, recipes::Tuple)
     ast.head in (:function, :->) && length(ast.args) == 2 &&

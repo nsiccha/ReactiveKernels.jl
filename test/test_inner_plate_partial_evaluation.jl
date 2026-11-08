@@ -160,6 +160,45 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         @test C.calls[] == 3
     end
 
+    # A binding with no rows prepares the program a binding with rows
+    # prepares, by default: sizes are data, not program structure (user rule
+    # `0ikeidi`; snag `empty-plate-samp-ef647a0d`, where an ODL region with no
+    # spectra rows got its own sampler type). The empty domain evaluates
+    # nothing; a value every cell would share is a typed placeholder, an empty
+    # array for a bound column read whole.
+    @testset "an empty bound domain prepares the program of a nonempty one" begin
+        column = [0.1, 0.2]
+        for (spec, extra) in ((C.counted, (;)), (C.atomic, (; coefficients = column)),
+                              (C.atomic_column, (; column)))
+            full = prepare(spec; bound = (; data = [1.0, 2.0, 4.0], extra...))
+            C.calls[] = 0
+            none = prepare(spec; bound = (; data = Float64[], extra...))
+            @test C.calls[] == 0
+            @test typeof(none) == typeof(full)
+            @test none(2.0) == 0.0
+            @test full(2.0) == prepare(spec)(2.0, [1.0, 2.0, 4.0], values(extra)...)
+            @test C.calls[] == 3
+        end
+        # Without a branch_arms setting and with either one.
+        for arms in (:taken, :all)
+            types = RK._with_branch_arms(arms) do
+                map(data -> typeof(prepare(C.atomic_column; bound = (; data, column))),
+                    (Float64[], [1.0], [1.0, 2.0, 4.0]))
+            end
+            @test allequal(types)
+        end
+        @test something(RK._empty_domain_shared(Vector{Int})) == Int[]
+        @test something(RK._empty_domain_shared(Vector{Int})) isa Vector{Int}
+        @test size(something(RK._empty_domain_shared(Matrix{Float64}))) == (0, 0)
+        pair = something(RK._empty_domain_shared(Tuple{Float64,Vector{Vector{Int}}}))
+        @test pair isa Tuple{Float64,Vector{Vector{Int}}} && pair == (0.0, Vector{Int}[])
+        named = something(RK._empty_domain_shared(@NamedTuple{a::Int, b::Vector{Float64}}))
+        @test named isa @NamedTuple{a::Int, b::Vector{Float64}} && isempty(named.b)
+        @test RK._empty_domain_shared(Tuple{Int,Vector}) === nothing
+        @test RK._empty_domain_shared(Tuple{Int,AbstractVector{Int}}) === nothing
+        @test RK._empty_domain_shared(Base.RefValue{Vector{Int}}) === nothing
+    end
+
     @testset "numeric scalars, atomic data and source granularity" begin
         data = [1.0, 2.0, 4.0]
         bound = prepare(C.affine; bound = (; data, a = 2.0, b = 1.0))
