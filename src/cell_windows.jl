@@ -2861,7 +2861,7 @@ function _cell_split_tuple_plates(p::Plan)
     cid(v) = canon_id(old, v.id)
     boundary = Set(cid(v) for v in vcat(p.have, p.want))
     splits = Dict{Int,Any}()
-    positions = _recipe_readers(old, p.recipes)
+    positions = _recipe_readers_if_plates(old, p.recipes)
     for producer in p.recipes
         producer.op isa _AuthoredPlateLike && length(producer.outputs) == 1 || continue
         output = cid(only(producer.outputs))

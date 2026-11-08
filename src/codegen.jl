@@ -2100,7 +2100,7 @@ function _drop_unread_plate_entries(p::Plan)
     boundary = Set(canon_id(g, v.id) for v in vcat(p.have, p.want))
     recipes = collect(p.recipes)
     # A sliced plate keeps its inputs, so the readers stay current.
-    readers = _recipe_readers(g, recipes)
+    readers = _recipe_readers_if_plates(g, recipes)
     changed = false
     for (index, producer) in enumerate(recipes)
         producer.op isa _AuthoredPlateLike && length(producer.outputs) == 1 || continue
@@ -2142,6 +2142,10 @@ function _remove_readers!(readers, g::Graph, r::Recipe, index)
         delete!(readers[canon_id(g, v.id)], index)
     end
 end
+# Only a plate's readers are ever asked for: a plan without one builds no index.
+_recipe_readers_if_plates(g::Graph, recipes) =
+    any(r -> r !== nothing && r.op isa _AuthoredPlateLike, recipes) ?
+        _recipe_readers(g, recipes) : Dict{ValueId,Set{Int}}()
 # The positions of the recipes reading `cid`, ascending.
 _readers_of(readers, cid) = haskey(readers, cid) ? sort!(collect(readers[cid])) : Int[]
 
@@ -2350,7 +2354,7 @@ function _fuse_authored_plate_chains(original::Plan; cells_only = false,
     recipes = Union{Nothing,Recipe}[p.recipes...]
     boundary = Set(canon_id(p.graph, v.id) for v in vcat(p.have, p.want))
     changed = p !== original
-    readers = _recipe_readers(p.graph, recipes)
+    readers = _recipe_readers_if_plates(p.graph, recipes)
     function set_recipe!(index, recipe)
         old = recipes[index]
         old === nothing || _remove_readers!(readers, p.graph, old, index)
