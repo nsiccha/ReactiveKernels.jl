@@ -567,4 +567,43 @@ end
     @test picked == [w[1][[1, 2]], w[2][[3]], Float64[]]
     @test all(p -> p isa Vector{Float64}, picked)
 end
+
+# A summed plate whose cell is its lane's entry reads the composed value in the
+# running total itself, a name the plate assigns twice (seed, then each cell).
+@kernel lane_entry_total(b::Vector{Vector{Float64}}, s::Float64) = begin
+    values = plate(eachindex(b)) do g
+        m = s .* b[g]
+        terms = plate(m) do mi
+            mi
+        end
+        sum(terms)
+    end
+    total = sum(values)
+    return total
+end
+@kernel gather_entry_total(w::Vector{Float64}, rows::Vector{Vector{Int}}, s::Float64) = begin
+    scaled = s .* w
+    values = plate(eachindex(rows)) do g
+        c = scaled[rows[g]]
+        terms = plate(c) do ci
+            ci
+        end
+        sum(terms)
+    end
+    total = sum(values)
+    return total
+end
+
+@testset "a running total that reads a composed lane keeps its seed" begin
+    b = [[0.2, 0.4], Float64[], [1.0]]
+    k = prepare(lane_entry_total)
+    @test k(b, 0.5) ≈ 0.5 * 1.6
+    ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), b, 0.5; active=:s)
+    @test ad_gradient(ad, b, 0.5) ≈ 1.6
+    w = [0.1, 0.2, 0.3, 0.4]; rows = [[1, 4], Int[], [2, 2, 3]]
+    g = prepare(gather_entry_total)
+    @test g(w, rows, 2.0) ≈ 2.0 * (0.5 + 0.7)
+    adg = prepare_ad(g, AutoEnzyme(; mode=Enzyme.Reverse), w, rows, 2.0; active=:s)
+    @test ad_gradient(adg, w, rows, 2.0) ≈ 1.2
+end
 end

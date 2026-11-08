@@ -336,6 +336,9 @@ function _cell_array_statement_producer(x)
     x isa Expr && x.head === :ref && length(x.args) == 2 &&
         !Meta.isexpr(x.args[2], :...) &&
         !_cell_array_has(x.args[2], Set((:end, :begin))) || return nothing
+    # A literal position is one entry, and the program's tables are read whole.
+    x.args[2] isa Integer && return nothing
+    x.args[1] in (:__constants__, :__callables__) && return nothing
     Expr(:call, _cell_array_ref(:_cell_array_gather), x.args[1], x.args[2])
 end
 function _cell_array_producer(x)
@@ -442,7 +445,9 @@ function _lower_cell_arrays_native(body::Expr, recipes)
                 ex.head in (:quote, :inert) && return
                 if ex.head === :(=) && length(ex.args) == 2 && ex.args[1] isa Symbol
                     lhs = ex.args[1]
-                    rhs = get(sources, lhs, ex.args[2])
+                    # `sources` holds a name's last assignment; a name assigned
+                    # more than once (a plate's running total) is read here.
+                    rhs = lhs in repeated ? ex.args[2] : get(sources, lhs, ex.args[2])
                     valid[] = _cell_array_reads(rhs, aliases; alias=lhs in aliases,
                         internal=rhs === ex.args[2])
                 elseif ex.head === :local && length(ex.args) == 1 &&
@@ -473,7 +478,8 @@ function _lower_cell_arrays_native(body::Expr, recipes)
             rhs = get(replacements, lhs, ex.args[2])
             # Inline the verified source of descriptor consumers. Their original
             # source closures can carry concrete array argument annotations.
-            if _cell_array_has(get(sources, lhs, rhs), changed)
+            # (Only a name assigned once: `sources` holds its statement.)
+            if !(lhs in repeated) && _cell_array_has(get(sources, lhs, rhs), changed)
                 rhs = sources[lhs]
             end
             if lhs in changed && haskey(declarations, lhs)
