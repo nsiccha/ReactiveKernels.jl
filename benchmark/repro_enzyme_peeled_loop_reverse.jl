@@ -17,12 +17,16 @@
 #   nomerge  Enzyme.API.EnzymeSetCLBool(:EnzymeReverseLoopEntryMerges, false)
 #
 # Recorded on gordito, 2026-11-08, Julia 1.10.12, one thread, one CPU, at host
-# load 25-29 on 32 CPUs: peeled / plain gradient time, median of 30 paired,
+# load 20-29 on 32 CPUs: peeled / plain gradient time, median of 30 paired,
 # shuffled rounds, at G = 38 paths with T = 120 / T = 1320 steps. Allocation is
 # the same for both forms (122.0 KB inlined, 164.6 KB @noinline at T = 120). The
 # primal of RK's peeled ARMA cell is within 2% of the plain hand loop's.
 #
 #                                         inlined        @noinline
+#   dogfood b5daa2ac (libEnzyme 10018598), two default runs, one strict
+#     default (nsz + contract)            1.01 / 1.01    0.96 / 0.96
+#                                         1.06 / 1.05    0.98 / 0.98
+#     strict                              0.94 / 0.91    1.05 / 1.06
 #   dogfood 439590b1 (libEnzyme 10018598)
 #     default (nsz + contract)            1.07 / 1.06    1.02 / 1.03
 #     strict                              0.96 / 0.94    1.11 / 1.14
@@ -30,10 +34,21 @@
 #   dogfood 5e2cd2bb (libEnzyme 576e674a)
 #     default (no derivative flags yet)   0.98 / 0.95    1.10 / 1.13
 #
-# The peeled loop costs up to 14% more in reverse in one placement or the
-# other under every configuration, so the cost is Enzyme's: Enzyme snag
+# On 439590b1 the peeled loop costs up to 14% more in reverse in one placement
+# or the other under every configuration, so the cost is Enzyme's: Enzyme snag
 # enzyme-reverse-o-919a1558. A second default run on 439590b1 gave 1.08 / 1.05
-# and 1.03 / 1.02.
+# and 1.03 / 1.02. Enzyme's investigation of that snag found that nomerge gives
+# these loops the same final code as the default, so that row differs from the
+# default by run-to-run variance only (up to 0.08 between processes).
+#
+# Dogfood b5daa2ac (Enzyme's data_phi_loads repair, Julia 1.10 at default
+# bounds) keeps the peeled carry a phi of values. Run interleaved with it at
+# load 20-23, 439590b1 gave 1.08 / 1.03 and 1.07 / 1.07 inlined, 0.96 / 0.96
+# and 0.96 / 0.99 @noinline, and 0.96 / 0.93 and 1.11 / 1.14 strict. What
+# remains inlined is two loads per reverse step, the tape pointer and y's data
+# pointer, that LLVM does not hoist. Under --check-bounds=yes the repair does
+# not apply (Enzyme todo 16d9hce). RK's generated scan forms no such phi and is
+# unchanged by it (scan_plate_cell_reverse.jl, Enzyme todo 08khey3).
 using Enzyme, Random, Printf, Statistics
 
 const CONFIG = get(ENV, "ENZYME_CONFIG", "default")
