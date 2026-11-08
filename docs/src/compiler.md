@@ -1351,8 +1351,8 @@ it, every statement runs once per tile, and `A * v` is one product
 `V * transpose(A)` per tile. It is the native counterpart of the `jax.vmap` a
 plate becomes in the [JAX target](jax.md). For the cell above with 64 features
 (one thread, Julia 1.10.12, native Enzyme reverse), the batched gradient cost
-4.7 ms against 30.8 ms for the same plate's cell loop at 1,444 cells × 38
-channels, and 33.3 ms against 197.5 ms at 15,796 cells × 2 channels.
+4.4 ms against 31.0 ms for the same plate's cell loop at 1,444 cells × 38
+channels, and 30.3 ms against 117.8 ms at 15,796 cells × 2 channels.
 
 A statement that varies by cell has a batched form when it is built from:
 

@@ -24,8 +24,8 @@ are recorded in the git history only.
   over the tile and each cell's vector one row of a matrix, every statement
   runs once per tile, and `A * v` is one `V * transpose(A)` per tile, the
   native counterpart of the JAX target's `jax.vmap` of a plate. A
-  random-Fourier-feature field of 1,444 cells × 38 channels took 4.7 ms per
-  gradient against 30.8 ms for its cell loop (snag
+  random-Fourier-feature field of 1,444 cells × 38 channels took 4.4 ms per
+  gradient against 31.0 ms for its cell loop (snag
   `plate-of-per-row-d1b4ed43`, decision `0tpji4i`).
 - Batched: dotted calls over the cell's numbers and vectors and shared numbers
   and vectors; `A * v`; the products, sums, differences and quotients Julia
