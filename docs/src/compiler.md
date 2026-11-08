@@ -1328,6 +1328,73 @@ derivative arithmetic (the dogfood default, `nsz` and `contract`) may fuse a
 multiply-add that the copy's shadow rounds twice. Under strict derivative
 arithmetic (`Enzyme.API.fast_math_flags!()`) the gradients are identical.
 
+### Plates of products run as matrix products
+
+A plate cell runs its statements once per cell. When a statement multiplies a
+vector of the cell's own by a matrix every cell shares, that is one
+matrix-vector product per cell, and native Enzyme reverse differentiates it as
+one:
+
+```julia
+dens = plate(idx, coordinates) do i, c
+    phase = transpose(frequency ./ lengths) * c
+    raw = Zc * cos.(phase) .+ Zs * sin.(phase)
+    value = (correlation * raw) .* scale
+    -0.5 * sum(abs2, value .- y[i, :])
+end
+```
+
+With exemplars (`prepare(...; exemplars)`, which `prepare_sampler` passes),
+such a plate runs its cells together, 256 at a time: each cell's number is one
+entry of a vector over the tile and each cell's vector one row of a matrix over
+it, every statement runs once per tile, and `A * v` is one product
+`V * transpose(A)` per tile. It is the native counterpart of the `jax.vmap` a
+plate becomes in the [JAX target](jax.md). For the cell above with 64 features
+(one thread, Julia 1.10.12, native Enzyme reverse), the batched gradient cost
+4.4 ms against 31.0 ms for the same plate's cell loop at 1,444 cells × 38
+channels, and 30.3 ms against 117.8 ms at 15,796 cells × 2 channels.
+
+A statement that varies by cell has a batched form when it is built from:
+
+- dotted calls and operators over the cell's numbers and vectors and shared
+  numbers and vectors (a shared vector is read as a row);
+- `A * v` of a shared matrix and a cell's vector, and the products, sums,
+  differences and quotients of a cell's numbers and vectors with numbers that
+  Julia defines (`s * v`, `v + w`, `v / s`; a vector plus a number stays
+  undefined);
+- `sum(v)` and `sum(f, v)` of a cell's vector;
+- `y[i, :]`, `y[i]` and `y[i, j]` of a shared array at the cell's integer `i`,
+  and `v[k]` of a cell's vector at a shared integer;
+- any other call of a function of the cell's numbers, called at every cell.
+
+A statement without a form, and every statement that reads one, runs cell by
+cell inside the tile after the batched ones, as the cell loop runs it, reading a
+batched value at its cell's row (a vector as the copy of its row). That is how
+an `@rkppl` plate runs, whose cells end in their observations' densities. The
+plate is batched when at least one statement is a product of a shared matrix
+and a cell's vector, and the cell's result is a number, a `Vector` of numbers or
+a statement run cell by cell; a plate holding a nested plate, a scan, a shared
+call or a lane branch (a lazy branch whose arms are graphs of their own) keeps
+the cell loop. The batched tiles run when the plate has at least 16 cells, the
+call's shared arguments have the exemplars' types and its other arguments their
+element types, every argument the cells read spans the plate's one axis, and
+the vectors one argument holds all have one length; otherwise the cell loop
+runs.
+
+A partition (`plate_partition`), and a plate a cell query or partition computes
+at the rows its readers read, run those rows batched the same way: their
+arguments are views of the plate's, whose elements have the plate's types. A
+query of one cell runs that cell alone.
+
+Values and gradients agree with the cell loop to rounding, not bit for bit: the
+products and the row sums add in another order. Set `RK_BATCHED_PLATES=0` to
+keep the cell loop, as a comparison baseline; `JULIA_DEBUG=ReactiveKernels`
+logs each plate planned batched (group `:plate_batching`) with its statements
+that vary by cell. Not batched yet: the non-allocating step, the opt-in plate
+reverse, lane branches, plates and scans in a cell, and a matrix that differs
+per cell, such as a coefficient row selected by the cell's block and reshaped
+(`reshape(coefficients[b, :], C, :)`).
+
 ### Nested observation plates
 
 An authored plate cell can contain another authored plate. Native lowering

@@ -16,6 +16,41 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.127
+
+- A plate whose cells multiply a vector of their own by a matrix every cell
+  shares runs as matrix products over tiles of 256 cells, given exemplars
+  (`prepare_sampler` passes them). Each cell's number is one entry of a vector
+  over the tile and each cell's vector one row of a matrix, every statement
+  runs once per tile, and `A * v` is one `V * transpose(A)` per tile, the
+  native counterpart of the JAX target's `jax.vmap` of a plate. A
+  random-Fourier-feature field of 1,444 cells × 38 channels took 4.4 ms per
+  gradient against 31.0 ms for its cell loop (snag
+  `plate-of-per-row-d1b4ed43`, decision `0tpji4i`).
+- Batched: dotted calls over the cell's numbers and vectors and shared numbers
+  and vectors; `A * v`; the products, sums, differences and quotients Julia
+  defines between the cell's numbers, vectors and shared numbers; `sum(v)`
+  and `sum(f, v)`; `y[i, :]`, `y[i]`, `y[i, j]` at the cell's integer and
+  `v[k]` at a shared one; other functions of the cell's numbers. A statement
+  without such a form, and any statement reading one, runs cell by cell inside
+  each tile, so an `@rkppl` plate whose cells end in their observations'
+  densities runs batched through `prepare_sampler`. A plate is batched when one
+  statement is a shared matrix times a cell's vector and it holds no nested
+  plate, scan, shared call or lane branch; its tiles run for 16 cells or more
+  when the call's types are the exemplars' (elements, for the cells'
+  arguments), its arguments span its one axis and each vector argument's
+  vectors share a length. Anything else runs the cell loop.
+- A partition (`plate_partition`), and a plate computed at the rows a cell query
+  or partition reads, run those rows batched the same way.
+- Values and gradients of a batched plate agree with the cell loop to
+  rounding, not bit for bit. `RK_BATCHED_PLATES=0` keeps the cell loop, and
+  `JULIA_DEBUG=ReactiveKernels` logs each plate planned batched. The
+  non-allocating step, the opt-in plate reverse, one-cell queries, lane
+  branches, nested plates and scans, and per-cell matrices keep the cell loop
+  for now.
+  "Plates of products run as matrix products" in the compiler guide has the
+  rules.
+
 ## 0.1.126
 
 - A plate cell's slice is read in place when its reader hands another argument
