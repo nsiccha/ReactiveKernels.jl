@@ -16,6 +16,22 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.132
+
+- A cell or partition query evaluates the observations it names in the
+  program's order (the order its observations are authored in), whatever order
+  the caller lists them in: `prepare_partition`, `prepare_partition_sampler`,
+  `prepare_cell_query`, `prepare_compact_cell_sampler` and
+  `prepare_compact_cell_ad`. Naming the same observations in another order now
+  prepares the same program and type, and gives bitwise the same values and
+  gradients. Before, each order was its own program. BRM's NLME partition named
+  one ODL program's three observations in two orders for two bindings that
+  differ only in which plates have rows, so a package image built on one
+  binding compiled the NLME partition kernels again for the other (snag
+  `derived-kernels-b8900b11`). The query's `observations` field holds that
+  order. A caller that listed observations in another order sums their terms in
+  another order than before: its value can differ in the last bits.
+
 ## 0.1.131
 
 - A compact factor query (`prepare_query_ad(...; coordinates)`) whose

@@ -92,7 +92,7 @@ function _prepare_shared_compact_ad(prepare_operator, built, plan, observations,
         "[query] prepare_compact_cell_ad requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
     _check_compact_cell_indices(base0, indices0, indices0, built.layout.total)
-    names = observations isa Symbol ? (observations,) : Tuple(Symbol.(observations))
+    names = _query_observations(built, plan, observations)
     isempty(names) && throw(ContractValidationError("[query] at least one observation is required"))
     _refuse_absent_cells(plan, names)
     spec, want = _cell_query_spec(built, plan, names; locality)

@@ -79,6 +79,62 @@ end
     end
 end
 
+# Naming a query's observations in another order prepares the same program and
+# type: they are evaluated in the program's order whatever the caller lists.
+# BRM's NLME partition named one ODL program's observations in two orders for
+# two bindings that differ only in which plates have rows, so one package image
+# served only one of them (snag `derived-kernels-b8900b11`). Which key column an
+# observation reads never changed the type; the order did.
+@testset "the observations' order does not change the program" begin
+    bound, built = build()
+    u = [0.2, -0.3, 0.1, 0.4]
+    by = (; lower = :lower_unit, limit = :limit_unit)
+    queries = [prepare_partition(built, bound, names; by, locality = :error)
+               for names in (NAMES, reverse(NAMES))]
+    @test typeof(queries[1]) === typeof(queries[2])
+    @test queries[1].observations == queries[2].observations == NAMES
+    @test [queries[1](u, label) for label in 1:3] == [queries[2](u, label) for label in 1:3]
+    @test [queries[1](u, label) for label in 1:3] ≈ [density(u, label) for label in 1:3]
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for compact in (true, false), partitioned in ((), (:z => [1, 2, 3],))
+        samplers = [prepare_partition_sampler(built, bound, names, u; by, backend, compact,
+                        partitioned, locality = :error) for names in (NAMES, reverse(NAMES))]
+        @test typeof(samplers[1]) === typeof(samplers[2])
+        for label in 1:3
+            g = [zeros(compact ? length(partition_footprint(s, label)) : length(u))
+                 for s in samplers]
+            values = [first(partition_value_and_gradient!(s, gi, u, label))
+                      for (s, gi) in zip(samplers, g)]
+            @test values[1] == values[2]
+            @test g[1] == g[2]
+            @test values[1] ≈ density(u, label)
+        end
+    end
+    # A cell query of two observations of one row count, in either order.
+    data = (; a_obs = [0.1, -0.2, 0.3], b_obs = [1.0, 0.8, -0.3])
+    two = bind_data(lower_rkppl(quote
+            a ~ Normal(0, 1)
+            a_obs .~ Normal.(a, 1.0)
+            b_obs .~ Normal.(2a, 1.0)
+        end, data; conditioned = (:a_obs, :b_obs), mod = @__MODULE__), data)
+    built_two = build_kernel(two)
+    cells = [prepare_cell_query(built_two, two, names) for names in
+             ((:a_obs, :b_obs), (:b_obs, :a_obs))]
+    @test typeof(cells[1]) === typeof(cells[2])
+    @test [cells[1]([0.3], i) for i in 1:3] == [cells[2]([0.3], i) for i in 1:3]
+    @test cells[1]([0.3], 2) ≈ -(log(2pi) + (data.a_obs[2] - 0.3)^2) / 2 -
+                                (log(2pi) + (data.b_obs[2] - 0.6)^2) / 2
+    # A name the program does not observe is still refused by name.
+    err = try
+        prepare_partition(built, bound, (:nope, :lower); by = (; nope = :lower_unit,
+            lower = :lower_unit), locality = :error)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ContractValidationError
+end
+
 @testset "partition keys: refused by name" begin
     bound, built = build()
     function refusal(by; names = :lower)
