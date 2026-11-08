@@ -92,6 +92,92 @@ block(fx, i) = [1; collect(fx.offsets[i] + 1:fx.offsets[i + 1])]
     end
 end
 
+# A location computed from parameters, read in the cell beside the block (BRM's
+# `mu_Intercept .+ ranef[win]`). The query then computes a plate for it, so its
+# lowering holds the packed latent in a typed local, `AbstractVector{Float64}`,
+# whose view inference cannot type; the footprint decides at run time that the
+# local is the view itself (snag `dotted-cell-late-3789b8ea`). Both in one cell
+# and in BRM's emitted pair of plates: the latent's cell writes the location
+# into a plate output, which a second plate observes.
+const COMPUTED = quote
+    sigma ~ Exponential(1)
+    s ~ Exponential(1)
+    tau ~ Exponential(1)
+    z[1:G] .~ Normal.(0, 1)
+    mu = tau .* z[g]
+    @plate for i in eachindex(y)
+        x[i] .~ Normal.(loc[i], s)
+        x_cell = x[i]
+        y[i] .~ Normal.(mu[i] .+ x_cell, sigma)
+    end
+end
+const TWO_PLATES = quote
+    sigma ~ Exponential(1)
+    s ~ Exponential(1)
+    tau ~ Exponential(1)
+    z[1:G] .~ Normal.(0, 1)
+    mu = tau .* z[g]
+    @plate for i in eachindex(loc)
+        x[i] .~ Normal.(loc[i], s)
+        x_cell = x[i]
+        a[i] .~ Normal.(0.0, 1.0)
+        a_cell = a[i]
+        out[i] = (mu[i] .+ a_cell) .+ x_cell
+    end
+    @plate for i in eachindex(y)
+        y[i] .~ Normal.(out[i], sigma)
+    end
+end
+
+@testset "a dotted cell latent beside a computed location reads only its own block" begin
+    for (ast, shared) in ((COMPUTED, false), (TWO_PLATES, true)),
+            loc in ([[0.1, -0.2], [0.3], [0.0, 0.4, -0.1], [0.2, 0.2]],
+                    [[0.1, -0.2], Float64[], [0.3]])
+        n = length(loc)
+        data = (; loc, G = n, g = collect(1:n),
+            y = [0.3 .* sin.(1:length(l)) .+ 0.1i for (i, l) in enumerate(loc)])
+        bound = bind_data(lower_rkppl(ast, data; conditioned = (:y,),
+            mod = @__MODULE__), data)
+        built = build_kernel(bound)
+        u = [0.05 + 0.07k for k in 1:built.layout.total]
+        names = string.(coordinate_names(built.layout))
+        at(name) = only(findall(==(name), names))
+        own(i) = sort!([at("sigma"); at("tau"); at("z.$i");
+            [at("x.$i.$j") for j in eachindex(loc[i])];
+            shared ? [at("a.$i")] : Int[]])
+        function observation(v, i)
+            location = exp(v[at("tau")]) * v[at("z.$i")] .+
+                [v[at("x.$i.$j")] for j in eachindex(loc[i])]
+            shared && (location = location .+ v[at("a.$i")])
+            sum(logpdf.(Normal.(location, exp(v[at("sigma")])), data.y[i]); init = 0.0)
+        end
+        saved = deepcopy((data, u))
+        cell = prepare_cell_query(built, bound, :y; locality = :error)
+        footprint = partition_footprint_kernel(cell.kernel)
+        partition = prepare_partition(built, bound, :y; by = :y => :g, locality = :error)
+        # As BRM's NLME view prepares it: the group effect is per label.
+        labelled = prepare_partition(built, bound, (:y,); by = (; y = :g),
+            locality = :error, partitioned = (:z => Union{Missing,Int}[1:n;],), u0 = u)
+        ad = prepare_ad(cell.kernel, AutoEnzyme(; mode = Enzyme.Reverse), u, 1;
+            active = :unconstrained)
+        for i in 1:n
+            read = Base.invokelatest(footprint, u, i).unconstrained
+            @test read == own(i)
+            @test partition_footprint(partition.kernel, u, i, nothing).unconstrained == own(i)
+            @test partition_footprint(labelled.kernel, u, i, nothing).unconstrained == own(i)
+            expected = observation(u, i)
+            @test Base.invokelatest(cell, u, i) ≈ expected
+            @test partition(u, i) ≈ expected
+            @test labelled(u, i) ≈ expected
+            value, gradient = ad_value_and_gradient(ad, u, i)
+            @test value ≈ expected
+            @test gradient ≈ central(v -> observation(v, i), u) atol = 1e-8 rtol = 1e-6
+            @test issubset(findall(!iszero, gradient), read)
+        end
+        @test (data, u) == saved
+    end
+end
+
 @testset "matrix and number blocks read their own coordinates" begin
     # A matrix per index keeps its dimensions; its cell still reads its block.
     A = [[1.0 2.0; 3.0 4.0], [5.0 6.0 7.0]]

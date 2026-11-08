@@ -165,7 +165,7 @@ Known remaining paths, which are limitations to fix and not precedents, are
 listed under ReactiveKernelsPPL 0.1.108 in its
 changelog, less those a later entry removes. By default a prepared type still
 depends on which data-bound branch arms have lanes ("Data-bound branches in
-plate cells"). With `branch_arms = :all` (from ReactiveKernels 0.1.115, opt-in,
+plate cells"). With `branch_arms = :all` (from ReactiveKernels 0.1.116, opt-in,
 for a small per-call cost on small models) an arm without lanes is a plate
 over no lanes, which keeps the lazy-branch constraint above because it
 evaluates nothing, and one type serves every binding. A lane-invariant

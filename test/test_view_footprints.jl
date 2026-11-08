@@ -309,6 +309,29 @@ end
     value = second + sum(w)
     return value
 end
+# An abstract declared type the view already has converts it to itself, though
+# inference over the abstract port types the view `Any` (RKPPL's packed
+# `x::AbstractVector{Float64} = view(unconstrained, …)` beside a plate, snag
+# `dotted-cell-late-3789b8ea`). A wider declared type that a copy could also
+# satisfy still converts the view to itself.
+@kernel typed_view(u::AbstractVector{Float64}, c::Vector{Float64}) = begin
+    head::AbstractVector{Float64} = view(u, 2:4)
+    w = plate(c) do x
+        return 2x
+    end
+    second = head[2]
+    value = second + sum(w)
+    return value
+end
+@kernel wide_typed_view(u::AbstractVector{Float64}, c::Vector{Float64}) = begin
+    head::AbstractArray = view(u, 2:4)
+    w = plate(c) do x
+        return 2x
+    end
+    second = head[2]
+    value = second + sum(w)
+    return value
+end
 
 # A field of existing storage is existing storage: a cell reads a named
 # tuple's vector field at its rows. A property that `getproperty` computes
@@ -401,7 +424,8 @@ end
 
 @testset "footprints through typed and untyped views" begin
     u, c = collect(0.1:0.1:0.6), [1.0, 2.0]
-    for (k, expected) in ((typed_copy, [2, 3, 4]), (untyped_view, [3]))
+    for (k, expected) in ((typed_copy, [2, 3, 4]), (untyped_view, [3]),
+                          (typed_view, [3]), (wide_typed_view, [3]))
         kernel = prepare(k; have = (:u, :c), want = :value)
         tracked = ReadVector(copy(u))
         @test kernel(tracked, c) ≈ u[3] + 6.0
