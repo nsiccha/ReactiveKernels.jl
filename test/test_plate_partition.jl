@@ -1200,3 +1200,25 @@ const _PP_SHARED_HAVE = (:u, :g, :y, :z, :subject, :other)
     prepare(_pp_shared; have = _PP_SHARED_HAVE, want = :total)(args(d)...)
     @test _PP_SHARED_CALLS[] == length(d.subject)
 end
+
+# A plan holds one table per plate or factor, of several table types. Its label
+# check is inferred however many tables it holds, allocates nothing, still
+# throws on other labels, and is no part of a derivative: differentiating
+# through it once ran Enzyme's runtime-dispatch rules on every gradient, and
+# failed type analysis outright on a long plan of mixed tables.
+@testset "plate_partition: the label check of a long mixed plan" begin
+    no_rows = ReactiveKernels._PARTITION_NO_ROWS
+    tables = ntuple(k -> isodd(k) ? Dict(1 => [k, k + 1], 2 => [k]) : Dict(1 => k:k+2, 2 => k:k), 40)
+    plan = (tables, map(t -> get(t, 1, no_rows), tables))
+    check = ReactiveKernels._partition_plan_labels_check
+    bytes(planned, labels) = @allocated check(planned, labels)
+    bytes((plan,), (1,))
+    @test bytes((plan,), (1,)) == 0
+    @test_throws ArgumentError check(((tables, map(t -> get(t, 2, no_rows), tables)),), (1,))
+    @test_throws ArgumentError check((plan,), (2,))
+    @test check((), ()) === nothing
+    checked(x, planned, labels) = (check(planned, labels); sum(abs2, x))
+    x = [0.5, -1.0, 2.0]; dx = zero(x)
+    Enzyme.autodiff(Enzyme.Reverse, checked, Active, Duplicated(x, dx), Const((plan,)), Const((1,)))
+    @test dx == 2 .* x
+end

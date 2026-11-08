@@ -1945,17 +1945,39 @@ end
 
 _partition_plan_label(label, tables::Tuple) =
     (tables, map(table -> get(table, label, _PARTITION_NO_ROWS), tables))
-@inline function _partition_plan_label_matches(plan, label)
-    tables, rows = plan
-    all(map((table, expected) -> get(table, label, _PARTITION_NO_ROWS) === expected,
-            tables, rows))
+# Both comparisons are unrolled over their tuples, one `getfield` per table:
+# a plan holds one table per plate or factor, of several table types, and
+# neither `map` nor tail recursion over a long tuple of mixed types is
+# inferred, so the check dispatched and allocated on every call (5 to 19 µs
+# for 40 tables).
+@generated function _partition_rows_match(tables::Tuple, rows::Tuple, label)
+    n = fieldcount(tables)
+    fieldcount(rows) == n || return :(false)
+    n == 0 && return :(true)
+    foldr((a, b) -> :($a && $b), [:(get(getfield(tables, $i), label,
+        _PARTITION_NO_ROWS) === getfield(rows, $i)) for i in 1:n])
+end
+@inline _partition_plan_label_matches(plan, label) =
+    _partition_rows_match(plan[1], plan[2], label)
+@generated function _partition_plans_match(planned::Tuple, current::Tuple)
+    n = fieldcount(planned)
+    fieldcount(current) == n || return :(false)
+    n == 0 && return :(true)
+    foldr((a, b) -> :($a && $b), [:(_partition_plan_label_matches(getfield(planned, $i),
+        getfield(current, $i))) for i in 1:n])
 end
 @inline function _partition_plan_labels_check(planned, current)
-    all(map(_partition_plan_label_matches, planned, current)) || throw(ArgumentError(
+    _partition_plans_match(planned, current) || throw(ArgumentError(
         "partition plan: labels $(repr(current)) differ from the plan's labels; " *
         "compute the plan for these labels (`partition_plan`)"))
     nothing
 end
+# The check returns `nothing` and reads only integer tables: nothing about it
+# is differentiable, so Enzyme treats the call as constant. Differentiated, the
+# check over a long plan of mixed table types ran through Enzyme's
+# runtime-dispatch rules on every gradient (2% of a partitioned SVI update) or
+# failed type analysis outright. The check itself still runs and throws.
+EnzymeCore.EnzymeRules.inactive(::typeof(_partition_plan_labels_check), args...) = nothing
 
 # The concrete named-tuple type the plan function returns, found by one
 # evaluation at preparation: on the exemplars when `prepare` received them
