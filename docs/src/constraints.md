@@ -732,3 +732,29 @@ only, no ReactiveKernels code) isolate the remaining backend limitations:
   `test_density_factor_overlay_views.jl` asserts the exact compact gradient. No
   activity configuration or derivative rule is involved, and RK's emission is
   unchanged.
+- Native Enzyme Reverse of an inner loop inlined into an outer loop that reads
+  the inner loop's output costs more than the same inner loop in a `@noinline`
+  callee. Values and gradients are the same either way. ReactiveKernels' native
+  plate lowering inlines each plate cell into the plate loop, so an authored
+  `scan` inside a plate cell has this shape. Before Enzyme dogfood `5e2cd2bb`
+  (libEnzyme `576e674a`, Enzyme snag `enzyme-reverse-n-69c10c81`), Enzyme on
+  Julia 1.10 taped each gathered element and weight per step, plus the next
+  gather's indices per path. It also rebuilt the cell's output per path only to
+  read its length. Measured on Julia 1.10.12 with RK 0.1.119, the gradient of
+  ODL's two-state washout step, written as an RK `scan` in a plate cell, took
+  1.72 to 1.76 times that of the same step as a hand loop, with dogfood
+  `c9ab4c9`. ARMA(1,1) and 3-state HMM scan cells took 1.08 to 1.32 times. With
+  dogfood `5e2cd2bb`, the ARMA and HMM cells take 0.89 to 0.98 times. The
+  washout cell takes 1.08 to 1.16 times, against 1.05 to 1.06 for an RK plate
+  cell that calls the hand loop. Most of the washout cell's remainder is
+  Enzyme's: its per-path deposit weights are active values computed through a
+  branch, and that shape alone still costs 1.11 to 1.18 times when inlined
+  (Enzyme snag `enzyme-reverse-i-6fb5e335`). Branch-free active weights cost
+  nothing extra. On Julia 1.12 and 1.13 the reverse pass rebuilds each path's
+  gathered slice and output instead of keeping them (Enzyme todo `1nw1luu`).
+  There the Enzyme-only washout shape costs 1.08 to 1.30 times, and the RK cells
+  0.78 to 1.10 times the hand loop, with dogfood `5e2cd2bb` on Julia 1.12.7.
+  `repro_enzyme_nested_loop_reverse.jl` reproduces each shape with Enzyme only.
+  `scan_plate_cell_reverse.jl` measures the RK cells against their hand loops.
+  RK's lowering is unchanged, because the repair belongs in Enzyme, where the
+  cost originates.
