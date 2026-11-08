@@ -15,26 +15,28 @@
 # branch (`dend`/`dmean` of the active decay, which branch on `lambda < 0.1`)
 # and once branch-free.
 #
-# Recorded on gordito, 2026-11-08, one thread, one CPU, at host load 23-26:
+# Recorded on gordito, 2026-11-08, one thread, one CPU, at host load 23-31:
 # ratio = inlined / @noinline, median of 30 paired, shuffled rounds, at
 # G = 38 paths with T = 120 / T = 1320 steps; then the inlined form's warm
 # allocation against the @noinline form's at T = 120.
 #
-#                           Julia 1.10.12        Julia 1.10.12        Julia 1.12.7
-#                           dogfood c9ab4c9      dogfood 5e2cd2bb     dogfood 5e2cd2bb
-#                           libEnzyme 42a2ee9a   libEnzyme 576e674a   libEnzyme 576e674a
-#   scalar AR               1.19 / 1.14          0.96 / 1.00          0.95 / 1.00
-#   washout, const weights  1.76 / 1.90          0.99 / 1.01          1.23 / 1.19
-#   washout, active branch  2.05 / 1.86          1.11 / 1.14          1.30 / 1.25
-#   washout, active, no br. 2.26 / 2.22          0.99 / 1.02          1.11 / 1.08
-#   washout alloc (KB)      419.5 vs 308.6       306.0 vs 308.6       438.0 vs 302.3
+#                           Julia 1.10.12      Julia 1.10.12      Julia 1.10.12      Julia 1.12.7
+#                           dogfood c9ab4c9    dogfood 5e2cd2bb   dogfood 439590b1   dogfood 439590b1
+#                           libEnzyme 42a2ee9a libEnzyme 576e674a libEnzyme 10018598 libEnzyme 10018598
+#   scalar AR               1.19 / 1.14        0.96 / 1.00        0.98 / 0.99        0.98 / 1.05
+#   washout, const weights  1.76 / 1.90        0.99 / 1.01        0.99 / 1.00        1.18 / 1.20
+#   washout, active branch  2.05 / 1.86        1.11 / 1.14        0.97 / 1.02        1.15 / 1.23
+#   washout, active, no br. 2.26 / 2.22        0.99 / 1.02        0.98 / 1.00        1.11 / 1.13
+#   washout alloc (KB)      419.5 vs 308.6     306.0 vs 308.6     306.0 vs 308.6     438.0 vs 302.3
 #
 # Dogfood 5e2cd2bb repairs the extra tape and the per-path rebuild of the
-# output on Julia 1.10 (Enzyme snag enzyme-reverse-n-69c10c81). Two costs
-# remain: on Julia 1.10, active per-path weights computed through a branch
-# (Enzyme snag enzyme-reverse-i-6fb5e335); and on Julia 1.12 and 1.13, the
-# reverse pass rebuilds each path's gathered slice and output instead of
-# keeping them (Enzyme todo 1nw1luu). Gradients agree in every row.
+# output on Julia 1.10 (Enzyme snag enzyme-reverse-n-69c10c81). Dogfood
+# 439590b1 repairs the active per-path weights computed through a branch on
+# Julia 1.10: they are rebuilt once per entry of the inner loop's reverse
+# (Enzyme snag enzyme-reverse-i-6fb5e335); with EnzymeReverseLoopEntryMerges
+# off, the same binary gives 1.11 / 1.17 on that row. On Julia 1.12 and 1.13
+# the reverse pass still rebuilds each path's gathered slice and output instead
+# of keeping them (Enzyme todo 1nw1luu). Gradients agree in every row.
 using Enzyme, Random, Printf
 
 # Deposit weights of ODL's washout step: series near zero, closed form above.

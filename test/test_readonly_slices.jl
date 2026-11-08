@@ -30,6 +30,8 @@ function buffered(frequency, coefficients, coordinate)
     sum(raw)
 end
 inner(x, k) = x[k] + x[1] + length(x)
+# A fresh vector of a slice's values, from a frame of its own.
+@noinline fresh_of(x) = [x[1], x[2]]
 through_helper(frequency, coefficients, coordinate) = coordinate * inner(coefficients, 2)
 function loops(frequency, coefficients, coordinate)
     total = 0.0
@@ -249,6 +251,35 @@ const REFUSED = (:writes, :helper_writes, :fills, :stashes, :returns_row, :retur
     @test !reads(x -> try; x[100]; catch e; e isa BoundsError ? 1.0 : 2.0; end, V)
     # A frame with no unique method is no proof.
     @test !ReactiveKernels._reads_only(Tuple{typeof(ReadonlySliceCallees.vector_only),Any,V,Any}, 3)
+
+    # Snag readonly-slice-r-cc6a354e: a vararg frame, the shape of every authored
+    # cell call (`_KernelSource`), follows only the slice's element of its argument
+    # tuple, as a fixed-arity frame follows only its argument. So another argument
+    # handed to BLAS does not end the proof for the slice.
+    M = [1.0 2.0; 3.0 4.0]
+    second(f) = ReactiveKernels._reads_only(Tuple{typeof(f),Matrix{Float64},V}, 3)
+    mixes(M, x) = sum(M * [x[1], x[2]])
+    forwards(args...) = mixes(args[1], args[2])
+    @test second(mixes) && second(forwards)
+    @test forwards(M, view(A, 2, :)) == mixes(M, view(A, 2, :))
+    # Its own element still may not be written, stored or returned, and a tuple
+    # used other than by constant `getfield` is followed whole.
+    @test !second((args...) -> (args[2][1] = 0.0; 1.0))
+    @test !second((args...) -> args[2])
+    @test !second((args...) -> (push!(ReadonlySliceCallees.STASH, args); 1.0))
+    @test !second((args...) -> (args, 1.0))
+    empty!(ReadonlySliceCallees.STASH)
+    # A call's result is derived from the slice only when the callee may return
+    # something derived from it: a fresh vector computed from its values (a
+    # vector-valued cell) is not, and what a helper hands back of it is.
+    fresh(M, x) = M * [x[1], x[2]]
+    @test second(fresh) && second((args...) -> fresh(args[1], args[2]))
+    @test second((M, x) -> ReadonlySliceCallees.fresh_of(x))
+    @test second((M, x) -> M * ReadonlySliceCallees.fresh_of(x))
+    @test second((M, x) -> ReadonlySliceCallees.inner(x, 2) * M)
+    @test second((M, x) -> identity(x)[1] * M)
+    @test !second((M, x) -> identity(x))
+    @test !second((M, x) -> (identity(x)[1] = 0.0; M))
 end
 
 @testset "every reader must only read: $callee" for callee in IN_PLACE
