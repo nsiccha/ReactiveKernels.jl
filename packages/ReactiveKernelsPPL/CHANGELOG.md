@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.128
+
+- Under `prepare_sampler(...; nonallocating = true)`, a program that factors a
+  sampled covariance (`MvNormal` with a computed covariance, such as a Gaussian
+  process) keeps the non-allocating density, still 0 B, but differentiates the
+  ordinary program, so its gradient allocates what the ordinary gradient does
+  (7 KB on a 3-parameter Gaussian process). With every array of that density in
+  a reused buffer, reverse mode tapes them, and the gradient took 1.4 to 3 times
+  the ordinary one. Values and gradients are unchanged. This narrows 0.1.124's
+  0 B gradient for these programs.
+
 ## 0.1.127
 
 - Requires ReactiveKernels 0.1.115. A dotted cell latent's cell reads only its

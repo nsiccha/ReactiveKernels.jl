@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.118
+## 0.1.119
 
 - New, opt-in: `branch_arms = :all`, a `prepare` keyword and the
   `[ReactiveKernels]` preference `branch_arms = "all"` in a project's
@@ -52,6 +52,20 @@ are recorded in the git history only.
   name as a variable. Since 0.1.113, a body with two or more plates whose cells
   built `(location = m, scale = s)` could raise ``UndefVarError: `location` not
   defined``, as an RKPPL `:observations` query over a ragged plate did.
+
+## 0.1.118
+
+- A number among the operands of a `vcat` that a plate cell or a cell query
+  reads (`padded = vcat(frac, 0)`, `padded[row[i]]`) is that number, whichever
+  integer it is. The cell took an `Int` for the position of one of the `vcat`'s
+  inputs. A value no input holds, such as `0`, failed preparation with a
+  `BoundsError`. A value an input holds, such as `1` in `vcat(frac, 1)`, gave
+  **wrong values with no error**: that operand read the input again instead of
+  the number, and a read past the `vcat`'s end returned a value instead of
+  throwing. A cell's values disagreed with the whole program's from 0.1.16,
+  when these forms were added, until now. Any other number type was already
+  right, and the whole program is unaffected (snag
+  `cell-vcat-litera-04f008d6`).
 
 ## 0.1.117
 

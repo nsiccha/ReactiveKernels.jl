@@ -886,7 +886,7 @@ authored native cell, as in Julia's empty broadcast.
 So by default the prepared program follows this binding's outcomes: data that
 moves every lane into one arm, or an empty domain, prepares another program
 than a binding whose lanes take both arms. With `branch_arms = :all` (from
-ReactiveKernels 0.1.118, opt-in) every arm is a plate, over no lanes for an arm
+ReactiveKernels 0.1.119, opt-in) every arm is a plate, over no lanes for an arm
 no lane takes, and an empty domain is split too, so one program serves every
 binding of a cell: an RKPPL censored response keeps one sampler type whether
 its rows are all observed, all censored, mixed or absent. An arm without lanes
@@ -1363,7 +1363,8 @@ these producers:
   through, and such a column read alone;
 - `hcat(a, b, ...)` of inputs, such as a design matrix with a computed column;
 - `vcat(a, b, ...)` of inputs and number literals, such as a completed
-  covariate `vcat(free, grouped)[lookup]` or a padded field `vcat(phi, 0.0)`.
+  covariate `vcat(free, grouped)[lookup]` or a padded field `vcat(phi, 0.0)` or
+  `vcat(phi, 0)`.
   A row of it is a row of exactly one operand, so each operand is computed at
   the rows that fall in it, and an operand none falls in is computed at no
   rows. Matrices stack along their first axis; their other dimensions must
