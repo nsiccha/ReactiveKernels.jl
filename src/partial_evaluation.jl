@@ -1142,11 +1142,28 @@ end
 # shared work, so this recipe is never evaluated, which keeps `log` of an
 # invalid scale from throwing for an arm that no lane takes. The value only
 # gives the rewritten plate the operand a nonempty domain gives it, and no cell
-# reads it. `nothing` when `T` has no such value without evaluating anything;
-# the plate is then left as it is.
+# reads it. A bound array read whole by every cell, such as a data column that
+# each cell indexes, gets an empty array of its type, and a tuple or named
+# tuple gets one placeholder per field. `nothing` when `T` has no such value
+# without evaluating anything; the plate is then left as it is.
 _empty_domain_shared(::Type{T}) where {T} =
     T <: Number && hasmethod(zero, Tuple{Type{T}}) ? Some(zero(T)) :
-    isbitstype(T) ? Some(Ref{T}()[]) : nothing
+    isbitstype(T) ? Some(Ref{T}()[]) : _empty_domain_container(T)
+
+_empty_domain_container(::Type) = nothing
+_empty_domain_container(::Type{Array{E,N}}) where {E,N} =
+    Some(Array{E,N}(undef, ntuple(_ -> 0, Val(N))))
+function _empty_domain_container(::Type{T}) where {T<:Tuple}
+    isconcretetype(T) || return nothing
+    fields = map(_empty_domain_shared, fieldtypes(T))
+    any(isnothing, fields) && return nothing
+    value = map(something, fields)
+    value isa T ? Some(value) : nothing
+end
+function _empty_domain_container(::Type{NamedTuple{names,T}}) where {names,T}
+    fields = _empty_domain_container(T)
+    fields === nothing ? nothing : Some(NamedTuple{names}(something(fields)))
+end
 
 # A cached cell value of every cell of a plate's bound domain, in cell order.
 # The loop is its own method, compiled for the batch's type: in the untyped
@@ -1219,18 +1236,16 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     # bound inputs. Without a bound domain, retain its per-cell execution.
     isempty(arguments) && return nothing
 
-    # With `branch_arms = :all`, a known empty domain is rewritten as a
-    # nonempty one is, so that one program's prepared type does not depend on
-    # whether its data has cells (a data-bound branch arm no lane takes, or an
-    # empty likelihood). It evaluates nothing: its per-cell values are empty
-    # and a value shared by every cell is a typed placeholder
-    # (`_empty_domain_shared`) that no cell reads, as the original plate visits
-    # no cell and skips its shared work. Otherwise a known empty domain has no
-    # data-dependent cells to evaluate, and keeping the original plate also
-    # preserves its empty-result typing and error behavior.
+    # A known empty domain is rewritten as a nonempty one is, whatever
+    # `branch_arms` says, so that one program's prepared type does not depend
+    # on whether its data has cells (a plate over no rows, a data-bound branch
+    # arm no lane takes, or an empty likelihood; user rule `0ikeidi`). It
+    # evaluates nothing: its per-cell values are empty and a value shared by
+    # every cell is a typed placeholder (`_empty_domain_shared`) that no cell
+    # reads, as the original plate visits no cell and skips its shared work.
+    # A shared value without a placeholder keeps the original plate.
     bound_axes = _partial_bound_axes(bound_arguments)
     empty_domain = any(isempty, bound_axes)
-    empty_domain && !_all_branch_arms() && return nothing
     fixed_domain = all(enumerate(recipe.inputs)) do (index, input)
         index in atomic_inputs || haskey(known, canon_id(g, input.id)) ||
             _partial_plate_live_domain(valtype(input), bound_axes)
@@ -1632,7 +1647,6 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     # an unbound lane array could determine a larger domain.
     n === nothing && singleton_axis && !unknown_axis && (n = 1)
     n === nothing && return nothing
-    n == 0 && !all_arms && return nothing
 
     # The first branch recipe whose condition reads bound data only.
     target = nothing
@@ -1653,11 +1667,23 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     # lanes take, so another binding of the same program keeps its type. An
     # arm with no lanes runs no cell; its plate skips its shared work, and its
     # work over bound values evaluates nothing (`_partial_plate_recipe`).
+    #
+    # With `branch_arms = :taken`, a domain of no lanes keeps a branch its lanes
+    # would decide. A condition no lane varies, such as a written scale's
+    # support guard (`1.0 > 0`), is decided as for a domain with lanes, so the
+    # plate over no rows is the one over rows (`_partial_plate_recipe`). A domain
+    # of no lanes runs no cell, so such a condition that throws keeps the plate.
     lane_condition = any(cid -> bound[cid] isa AbstractArray, cond_ports)
+    n == 0 && lane_condition && !all_arms && return nothing
     arms = if n == 0 && lane_condition
         [(:then, Int[]), (:else, Int[])]
     else
-        pred = broadcast(native.condition, (bound[cid] for cid in cond_ports)...)
+        pred = try
+            broadcast(native.condition, (bound[cid] for cid in cond_ports)...)
+        catch err
+            n == 0 && !(err isa InterruptException) || rethrow()
+            return nothing
+        end
         if pred isa Bool
             # A lane-invariant condition selects its arm statically.
             pred ? [(:then, collect(1:n))] : [(:else, collect(1:n))]
