@@ -3563,7 +3563,12 @@ end
 # plate.
 function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots;
                                      recycled = nothing, slot_inlines::Bool = false,
-                                     shared::Union{Nothing,Symbol} = nothing)
+                                     shared::Union{Nothing,Symbol} = nothing,
+                                     readonly_slice::Bool = false)
+    # A slice whose readers only read it (`_readonly_cell_slices`). A position
+    # residual keeps its lane slot.
+    readonly_slice && shared === nothing && recycled === nothing &&
+        return _readonly_slice_statements!(body, recipe, args, out)
     # A shared call with the cell loop's table for it (`shared`): the step
     # returns the table and the cell's value.
     if shared !== nothing
@@ -3825,7 +3830,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
         pointwise_lhs, total_lhs; recycled = nothing,
         input_type_hints = nothing, element_type = nothing, into::Bool = false,
-        total_fold = sum, program::Bool = false)
+        total_fold = sum, program::Bool = false, readonly_slices = Set{Int}())
     # `into`: `pointwise_lhs` already holds a buffer at least as long as the
     # plate, of its element type; the cells are written into it in place and
     # the binding is left alone (a strip refill, `_lower_authored_scan_strips!`).
@@ -3983,7 +3988,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         inner_kernel, atomic, callargs, callvalues, raw_arguments,
         prepared_arguments, marker, output_axes, pointwise_lhs, total_lhs;
         recycled, input_type_hints, element_type, into, total_fold, program,
-        deferred)
+        deferred, readonly_slices)
     # No program took the prepared arguments: prepare them where they stood.
     deferred === nothing || isempty(deferred) ||
         splice!(body.args, deferred_at:deferred_at-1, deferred)
@@ -4003,7 +4008,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         input_type_hints = nothing, element_type = nothing, into::Bool = false,
         unswitch::Bool = true, cells::Bool = true, nonempty::Bool = false,
         types = nothing, total_fold = sum, program::Bool = false,
-        deferred = nothing)
+        deferred = nothing, readonly_slices = Set{Int}())
     inner = getfield(inner_kernel, :plan)
     if unswitch
         branch = _plate_shared_branch(inner_kernel, atomic, callargs, callvalues)
@@ -4064,7 +4069,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         plate_eltype, index, previous, first_coordinate, root_positions,
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
         lane_arms; nonempty, total_fold, runtime_ops, runtime_recipes, program,
-        deferred)
+        deferred, readonly_slices)
 end
 
 # Append a cell kernel's operations to the table and build the type expression
@@ -4145,7 +4150,8 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         plate_eltype, index, previous, first_coordinate, root_positions,
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
         lane_arms; nonempty::Bool = false, total_fold = sum,
-        runtime_ops, runtime_recipes, program::Bool = false, deferred = nothing)
+        runtime_ops, runtime_recipes, program::Bool = false, deferred = nothing,
+        readonly_slices = Set{Int}())
     groups = nested === nothing ? _authored_plate_recipe_groups(
         inner, dependencies, root_positions, atomic, callvalues) :
         [(Set{ValueId}(), nested.invariants)]
@@ -4212,7 +4218,8 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     # instances, 5.5 s of the atlas `problem` stage). Captured through
     # `Ref{Any}` cells, one closure type serves every plate.
     captured = Ref{Any}((; inner_kernel, atomic, callargs, callvalues,
-                           prepared_arguments, slices, sliced_scans, scan_offsets))
+                           prepared_arguments, slices, sliced_scans, scan_offsets,
+                           readonly_slices))
     # Each call that cells with equal arguments share (shared_cell_calls.jl)
     # keeps its table in a local the cell loop carries: `nothing` until the
     # first cell that keys it, one table per evaluation of this plate.
@@ -4240,7 +4247,8 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
             block, inner.recipes[recipe_index], args, out, operation,
             get(getfield(c, :scan_offsets), recipe_index, nothing); recycled = slot_of(recipe_index),
             slot_inlines = _inline_sources_enabled(),
-            shared = looped ? get(shares, inner.recipes[recipe_index].id, nothing) : nothing)
+            shared = looped ? get(shares, inner.recipes[recipe_index].id, nothing) : nothing,
+            readonly_slice = inner.recipes[recipe_index].id in getfield(c, :readonly_slices))
         scan_index, demand = getfield(c, :slices)[recipe_index]
         scan_recipe = inner.recipes[scan_index]
         scan_args = Any[_authored_plate_scalar_ref(
@@ -5637,6 +5645,7 @@ function _lower_with_ops_collecting(p::Plan;
     pending_slices = Dict{Int,Any}()
     inferred_plate_types = nothing
     inferred_exemplar_types = nothing
+    readonly_value_types = nothing
     declared = Set{Symbol}()
     declare_types = declare
     # HAVE is authoritative, and the first selected producer of any other
@@ -5732,6 +5741,11 @@ function _lower_with_ops_collecting(p::Plan;
                 # strip member, and lower it at each of those rows.
                 cells.slots[r.id] = length(runtime_ops)
                 cells.plates[r.id] = callvalues
+                if exemplar_types !== nothing && _readonly_slice_candidate(r)
+                    readonly_value_types === nothing && (readonly_value_types =
+                        _readonly_value_types(p, exemplar_types))
+                    cells.readonly[r.id] = _readonly_cell_slices(p, r, readonly_value_types)
+                end
                 _lower_authored_plate_native!(
                     Expr(:block), runtime_ops, runtime_recipes, r.op, callargs,
                     callvalues, nm(pointwise), nothing)
@@ -5805,10 +5819,17 @@ function _lower_with_ops_collecting(p::Plan;
                 own_program = plate_programs && cells === nothing &&
                     get(task_local_storage(), _CELL_TABLES, nothing) === nothing
                 plate_body = own_program ? Expr(:block) : body
+                readonly_slices = Set{Int}()
+                if exemplar_types !== nothing && _readonly_slice_candidate(r)
+                    readonly_value_types === nothing && (readonly_value_types =
+                        _readonly_value_types(p, exemplar_types))
+                    readonly_slices = _readonly_cell_slices(p, r, readonly_value_types)
+                end
                 _lower_authored_plate_native!(
                     plate_body, runtime_ops, runtime_recipes, r.op, callargs, callvalues,
                     pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
                     total_fold, program = own_program,
+                    readonly_slices,
                     element_type = plate_element_types ?
                         first(_declared_array_layout(valtype(pointwise))) : nothing,
                     input_type_hints = type_hints === nothing ? nothing :

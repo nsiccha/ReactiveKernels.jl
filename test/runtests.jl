@@ -68,6 +68,7 @@ const _MATRIX_CORE_TESTS = (
     "test_plate.jl",
     "test_authored_plate.jl",
     "test_plate_unread_entries.jl",
+    "test_readonly_slices.jl",
     "test_plate_entry_split.jl",
     "test_plate_fusion_reconvergence.jl",
     "test_nested_plate.jl",
