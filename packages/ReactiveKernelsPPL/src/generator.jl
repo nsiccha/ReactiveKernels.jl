@@ -5496,6 +5496,18 @@ function _scan_reconstruction_statements(plan::StructuralPlan,
             end
             continue
         end
+        # Every step statement samples its carried array (`a[t] ~ D`): the
+        # slice holds each state's values themselves, so a trajectory is its
+        # seeds followed by its own innovation range, and nothing is folded.
+        if all(st -> st.kind === :sample && st.indexed, s.step)
+            for a in s.states
+                r = ranges[findfirst(st -> st.target === a, innov)]
+                seeds = [_scan_init_name(a, k) for k in 1:m]
+                push!(stmts, :($a = vcat([$(seeds...)],
+                    view($zname, $(first(r)):$(last(r))))))
+            end
+            continue
+        end
         history = _scan_has_history(s)
         if length(s.states) == 1
             a = only(s.states)
