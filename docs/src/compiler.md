@@ -697,6 +697,15 @@ multiplication by a live parameter in the evaluator. A nested recipe that
 still reads a live input remains in the cell. This does not expose the body
 of an opaque child call inside a lazy branch for partial evaluation.
 
+A plate whose bound domain is empty, a binding with no rows, is rewritten as
+a binding with rows is (from ReactiveKernels 0.1.122), so it prepares the same
+program and the same prepared type. It evaluates nothing: its cached per-cell
+values are empty, and a value every cell would share, which the authored plate
+computes only once it has a cell, is a typed placeholder that no cell reads (a
+number's zero, an empty array of a data column's type, a tuple of such
+values). A shared value of another type, such as a struct holding arrays,
+keeps the authored plate.
+
 Cells with equal bound data share their cached values. A call whose
 cell-varying arguments include an array or a record runs once per distinct
 argument tuple, and the cells with that tuple hold the same result object. The
@@ -880,8 +889,12 @@ receives one:
 - gathers inside an arm are in bounds by construction.
 
 An empty bound domain has no lanes to group. It runs no cell and evaluates no
-condition. Its result is empty, with the element type inferred from the
-authored native cell, as in Julia's empty broadcast.
+condition its lanes would decide. A condition no lane varies, over literals or
+bound numbers alone (the support guard of a written scale), is decided as for a
+domain with lanes, so the plate over no rows is the plate over rows; if
+evaluating it throws, the plate keeps its branch, which no cell reaches. Its
+result is empty, with the element type inferred from the authored native cell,
+as in Julia's empty broadcast.
 
 So by default the prepared program follows this binding's outcomes: data that
 moves every lane into one arm, or an empty domain, prepares another program
