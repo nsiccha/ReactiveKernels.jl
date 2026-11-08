@@ -76,6 +76,24 @@ end
     geometry_bar = nothing
     return y, x_bar, s_bar, geometry_bar
 end
+
+const declared_rule = derivative_rule(declared_record; primal = :y,
+    directions = (x = :x_dot, s = :s_dot, geometry = nothing), tangent = :y_dot,
+    covector = :y_bar, cotangents = (x = :x_bar, s = :s_bar, geometry = nothing),
+    name = :declared_record)
+
+# A child kernel holding a plate stays its own prepared call in a lazy arm.
+@kernel rule_child(x, s, geometry) = begin
+    extra = plate(eachindex(x)) do i
+        return 0.0 * x[i]
+    end
+    z = declared_rule(x, s, geometry) + sum(extra)
+    return z
+end
+@kernel rule_parent(x, s, geometry) = begin
+    y = s > 0.0 ? rule_child(x, s, geometry) : 0.0
+    return y
+end
 end
 
 # A wide planned body's statement (`_partition_statement_call`), with its data
@@ -222,10 +240,7 @@ end
     # (snag derivativerule-r-0d7e245c). A declared rule accepts only `Const`, so
     # its exact gradients show what the annotation was.
     graphs = DerivativeRuleDataGraphs
-    declared = derivative_rule(graphs.declared_record; primal = :y,
-        directions = (x = :x_dot, s = :s_dot, geometry = nothing), tangent = :y_dot,
-        covector = :y_bar, cotangents = (x = :x_bar, s = :s_bar, geometry = nothing),
-        name = :declared_record)
+    declared = graphs.declared_rule
     port = derivative_rule(graphs.record_port; primal = :y, covector = :y_bar,
         cotangents = (x = :x_bar, s = :s_bar, geometry = :geometry_bar), name = :record_port)
     x, xd, s, sd = [1.0, 2.0, 3.0], [0.5, -1.0, 2.0], 2.0, 0.25
@@ -252,6 +267,14 @@ end
     # A statement past the wrapper's positional methods stays inline.
     many = ntuple(_ -> [1.0], ReactiveKernels._PLATE_CALL_MAX_ARGUMENTS + 1)
     @test ReactiveKernels._partition_statement_call(vcat, many...) == fill(1.0, length(many))
+    # The same through a child kernel prepared for a lazy arm, on the public route.
+    parent = prepare(graphs.rule_parent; have = (:x, :s, :geometry), want = :y,
+                     bound = (; geometry = record))
+    ad = prepare_ad(parent, AutoEnzyme(; mode = Reverse), x, s; active = :x)
+    @test ad_gradient(ad, x, s) ≈ s .* weights
+    # A child past those methods still forwards its operands.
+    child = ReactiveKernels._KernelPreparedChild(:vcat_child, vcat, nothing)
+    @test child(many...) == fill(1.0, length(many))
 end
 
 module DerivativeRuleTestGraphs

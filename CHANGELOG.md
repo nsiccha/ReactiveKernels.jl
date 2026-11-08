@@ -28,7 +28,9 @@ are recorded in the git history only.
   the port spelling and `data-only input requires Const` for the declared one,
   and a body with fewer statements passed. The wrapper now has one positional
   method per operand count, and a statement with more than 64 operands stays
-  inline (snag `derivativerule-r-0d7e245c`).
+  inline. A child kernel prepared for a lazy arm forwarded its operands the same
+  way and failed the same way with a rule in its body; it has the same methods
+  (snag `derivativerule-r-0d7e245c`).
 
 ## 0.1.118
 
