@@ -760,6 +760,15 @@ function _prepare_factor_query_ad(prepare_operator, built, plan, selection, back
         shared = _density_kernel(c, plan, q.spec, have, q.want, q.bound, on_error,
             (point..., q.context...))
         context = (last(point), _density_context(c, shared, q, (point..., q.context...))...)
+        # A program that reads the compact overlay at a partition's rows takes a
+        # `view` of it there, which native Enzyme on Julia 1.10 can need dogfood
+        # repair `const_slot_reloads` to differentiate (rkppl-use §14, "Enzyme
+        # floor"). The loaded Enzyme is checked before the derivative is prepared.
+        shared.kernel isa ReactiveKernels.PreparedKernel &&
+            ReactiveKernels._reads_lazy_view_rows(shared.kernel) &&
+            ReactiveKernels._require_enzyme_repairs(backend, (:const_slot_reloads,),
+                "a compact factor query that reads a parameter block at a partition's rows",
+                "dogfood 0147c6f")
         prepared = Base.invokelatest(prepare_operator, shared.kernel, backend,
             Base.front(exemplars)..., Base.front(point)..., context...;
             active = :_ppl_cell_active)
