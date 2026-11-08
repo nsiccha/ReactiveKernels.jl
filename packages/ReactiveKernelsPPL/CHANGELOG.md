@@ -16,6 +16,26 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.125
+
+- Fixes wrong Reverse gradients from 0.1.124 for multivariate normal
+  densities. The value was right; the gradient lost the density's
+  contribution, or returned uninitialized memory for it. Measured cases:
+  - slice priors `eachrow(B[…]) .~ MvNormal(mu, Sigma)` and
+    `.~ MvNormalCholesky(mu, F)` beside a `@plate`, such as correlated group
+    effects with a sampled scale and LKJ factor (the slice prior alone was
+    right);
+  - `MvNormal` with a sampled covariance, observed in a plate cell or as one
+    vector (a Gaussian process, with no plate).
+
+  0.1.124 handed fresh `undef` storage for the slices' solved margins and the
+  covariance factor to a helper Julia does not inline, a shape Enzyme
+  differentiates wrongly here (Enzyme snag `rkppl-mvnormal-s-1df3d9b3`). The
+  helpers now start from zeroed storage. Values are unchanged. The
+  non-allocating sampler still reuses those buffers, and its gradients are
+  now right too. A dependant that fits such models with 0.1.124 should take
+  0.1.125 as its floor.
+
 ## 0.1.124
 
 - With MutatingFunctions loaded, through the new weak dependency and

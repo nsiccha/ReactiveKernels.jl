@@ -118,9 +118,17 @@ end
 # each entry written once, so native reverse records no overwritten storage.
 # A non-allocating kernel passes its previous result as that buffer
 # (`ReactiveKernelsPPLMutatingFunctionsExt`).
+#
+# The fresh buffer is zeroed although the solve writes every entry. When
+# `Matrix{Float64}(undef, …)` goes to the non-inlined `_lower_solve_rows!` and
+# comes back, Enzyme (dogfood and stock libEnzyme alike) returns a wrong
+# Reverse gradient in larger kernels, a `@plate` beside the slices among them,
+# often uninitialized shadow memory. Zeroed storage gives the right gradient
+# (snag `ran-packages-rea-d8d16659`; Enzyme snag `rkppl-mvnormal-s-1df3d9b3`;
+# `test_mv_slices_reverse.jl`).
 function _lower_solve_rows(X::AbstractMatrix{Float64}, F::AbstractMatrix{Float64})
     groups, k = size(X)
-    return _lower_solve_rows!(Matrix{Float64}(undef, k, groups), X, F)
+    return _lower_solve_rows!(zeros(Float64, k, groups), X, F)
 end
 
 function _lower_solve_rows!(Z::Matrix{Float64}, X::AbstractMatrix{Float64},
@@ -221,9 +229,11 @@ end
 # full-length loops: `k³/3` multiply-adds instead of `k³` branches, each
 # entry written once. Checks and messages are the generic form's. A
 # non-allocating kernel passes its previous factor as `F`
-# (`ReactiveKernelsPPLMutatingFunctionsExt`).
+# (`ReactiveKernelsPPLMutatingFunctionsExt`). The fresh factor is zeroed for
+# the reason `_lower_solve_rows` gives: with `undef` storage an active
+# covariance's Reverse gradient is wrong.
 _covariance_cholesky(Sigma::AbstractMatrix{Float64}, k) =
-    _covariance_cholesky!(Matrix{Float64}(undef, k, k), Sigma, k)
+    _covariance_cholesky!(zeros(Float64, k, k), Sigma, k)
 
 function _covariance_cholesky!(F::Matrix{Float64}, Sigma::AbstractMatrix{Float64}, k)
     size(Sigma) == (k, k) || throw(DimensionMismatch("MvNormal slices " *
