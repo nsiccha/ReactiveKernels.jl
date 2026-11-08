@@ -1393,29 +1393,29 @@ end
 # Scalar statements stay inline (`_partition_statement_call`), and so do plate loops:
 # moving them into separate functions in one module made compile time worse.
 #
-# Julia compiles a `Vararg{Any}` position that holds a type as `::Type`, and one
-# that holds a function the method does not call as `::Function`. The compiled
-# wrapper would then read the type's parameter and dispatch the statement at run
-# time: `_plate_similar_output(marker, T, axes)` called `similar` dynamically and
-# allocated on every evaluation (snag `partition-array-bb24ae62`). So each such
-# argument crosses the wrapper in a carrier whose concrete type holds it, and
-# the wrapper unwraps it before the call.
-struct _PartitionType{T} end
-struct _PartitionFunction{F}
-    f::F
+# One positional method per operand count, each operand's type a parameter of its
+# own (`_PlateCall` has the same methods). A `Vararg{Any}` method would lose two
+# things. It takes its operands as one tuple, and Enzyme cannot prove a structure
+# stored there constant, even one passed to it as `Const`: a derivative rule received
+# its bound data record `Duplicated`, with a fresh zero shadow of each floating-point
+# field on every call, and refused it or could not accumulate its cotangent (snag
+# `derivativerule-r-0d7e245c`). And Julia compiles a `Vararg{Any}` position that holds
+# a type as `::Type`, and one that holds a function the method does not call as
+# `::Function`, so the wrapper read the type's parameter and dispatched the statement
+# at run time: `_plate_similar_output(marker, T, axes)` called `similar` dynamically
+# and allocated on every evaluation (snag `partition-array-bb24ae62`).
+for count in 0:_PLATE_CALL_MAX_ARGUMENTS
+    local arguments = Any[Symbol("argument", index) for index in 1:count]
+    local types = Any[Symbol("Argument", index) for index in 1:count]
+    local typed = Any[:($a::$T) for (a, T) in zip(arguments, types)]
+    @eval @noinline _partition_array_call(f::F, $(typed...)) where {F,$(types...)} =
+        f($(arguments...))
 end
-@inline _partition_carry(x) = x
-@inline _partition_carry(::Type{T}) where {T} = _PartitionType{T}()
-@inline _partition_carry(f::Function) = _PartitionFunction(f)
-@inline _partition_uncarry(x) = x
-@inline _partition_uncarry(::_PartitionType{T}) where {T} = T
-@inline _partition_uncarry(f::_PartitionFunction) = getfield(f, :f)
-@noinline @generated _partition_array_call(f::F, args::Vararg{Any,N}) where {F,N} =
-    :(f($((:(_partition_uncarry(args[$i])) for i in 1:N)...)))
 @inline @generated function _partition_statement_call(f, args::Vararg{Any,N}) where {N}
     array = any(T -> T <: Union{AbstractArray,Base.Broadcast.Broadcasted}, args)
-    array || return :(f(args...))
-    :(_partition_array_call(f, $((:(_partition_carry(args[$i])) for i in 1:N)...)))
+    # Past the positional methods a call would need one argument tuple again.
+    (array && N <= _PLATE_CALL_MAX_ARGUMENTS) || return :(f(args...))
+    :(_partition_array_call(f, args...))
 end
 _partition_has_loop(@nospecialize(x)) =
     x isa Expr && (x.head in (:for, :while) || any(_partition_has_loop, x.args))

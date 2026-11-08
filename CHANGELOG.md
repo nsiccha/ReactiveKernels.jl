@@ -16,6 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.119
+
+- A derivative rule whose data input is a structure (a record or tuple holding
+  arrays) differentiates in a planned partition body of
+  `_PARTITION_SEPARATE_MIN` or more statements, with either spelling of that
+  input: `geometry = nothing`, or a cotangent port that returns `nothing`. The
+  wrapper such a body calls its array statements through took its operands as
+  one tuple, which hid the structure's constant activity from Enzyme. Reverse
+  then failed with `no method matching _accumulate!(::Record, ::Nothing)` for
+  the port spelling and `data-only input requires Const` for the declared one,
+  and a body with fewer statements passed. The wrapper now has one positional
+  method per operand count, and a statement with more than 64 operands stays
+  inline (snag `derivativerule-r-0d7e245c`).
+
 ## 0.1.118
 
 - A number among the operands of a `vcat` that a plate cell or a cell query

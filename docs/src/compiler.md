@@ -1961,11 +1961,13 @@ and plate loops stay inline. This shows in `code_expr` as
 wrapper saves no compile time, and each wrapped statement becomes its own
 differentiated call with its own tape, which a one-subject cell pays on every
 gradient. The count is of the program's statements, never of its data.
-A type or function argument of such a statement
-crosses the wrapper in a carrier (`_PartitionType`, `_PartitionFunction`):
-Julia compiles a `Vararg{Any}` position holding a type as `::Type`, and one
-holding a function the method does not call as `::Function`, so without it
-the wrapper dispatched the statement at run time.
+The wrapper has one positional method per operand count, as `_PlateCall` does,
+and a statement with more operands stays inline. Through a `Vararg{Any}`
+method Julia would compile a position holding a type as `::Type`, and one
+holding a function the method does not call as `::Function`, and dispatch the
+statement at run time. Its one argument tuple also hides a structured operand's
+activity from Enzyme, so a derivative rule would receive its bound data record
+`Duplicated` rather than `Const`.
 `plan_constant`
 names HAVE ports whose values are constant per label (not data for the plan),
 and a lazy view of inputs may serve its rows from its parts
