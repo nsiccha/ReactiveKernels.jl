@@ -337,6 +337,44 @@ end
 # prior, transform, and bound-data read follows its ordinary primal path. This
 # changes the AD algorithm and therefore requires an explicit opt-in without
 # an explicit backend mode. It never overrides a requested reverse mode.
+# `ReactiveKernels._require_enzyme_repairs`. The repairs its callers name concern
+# Julia 1.10's LLVM (typed pointers); later Julia versions differentiate those
+# programs with registered Enzyme. Dogfood from `a68104d` reports the repairs it
+# carries (`Enzyme.require_dogfood_repairs` throws `Enzyme.DogfoodRepairMissing`
+# naming each missing one). Registered Enzyme and older dogfood cannot report
+# them, so they get one warning naming the floor, and the derivative is prepared
+# anyway: such a pin may carry the repair (`enzyme-use`, "Stating a dogfood floor").
+# The warning is given once per process for each requester and set of repairs.
+_enzyme_backend(::ReactiveKernels.DifferentiationInterface.AutoEnzyme) = true
+_enzyme_backend(backend) = nameof(typeof(backend)) in (:SecondOrder, :MixedMode) &&
+    any(f -> _enzyme_backend(getfield(backend, f)), fieldnames(typeof(backend)))
+
+const _UNREPORTED_REPAIRS_WARNED = Set{Tuple{String,Tuple{Vararg{Symbol}}}}()
+const _UNREPORTED_REPAIRS_LOCK = ReentrantLock()
+
+function ReactiveKernels._require_enzyme_repairs(
+        backend::ReactiveKernels.DifferentiationInterface.AbstractADType,
+        repairs::Tuple{Vararg{Symbol}}, requester::AbstractString, floor::AbstractString)
+    VERSION < v"1.11-" && _enzyme_backend(backend) || return nothing
+    if isdefined(Enzyme, :require_dogfood_repairs)
+        Enzyme.require_dogfood_repairs(repairs...; requester)
+        return nothing
+    end
+    key = (String(requester), repairs)
+    first = lock(_UNREPORTED_REPAIRS_LOCK) do
+        key in _UNREPORTED_REPAIRS_WARNED && return false
+        push!(_UNREPORTED_REPAIRS_WARNED, key)
+        true
+    end
+    first && @warn string(uppercasefirst(requester), " can need Enzyme ", floor,
+        " or later for native differentiation on Julia 1.10 (dogfood repair ",
+        join(repairs, ", "), "). This Enzyme cannot report its dogfood repairs: it is a ",
+        "registered release or a dogfood commit before a68104d. If the first gradient ",
+        "fails (an EnzymeRuntimeActivityError, for example), move Enzyme to the dogfood ",
+        "tip; runtime activity is not the fix (enzyme-use, \"Stating a dogfood floor\").")
+    nothing
+end
+
 const _FORWARD_BATCH_MODE = Enzyme.set_abi(Enzyme.ForwardWithPrimal, Enzyme.InlineABI)
 const _AutomaticModeEnzyme = ReactiveKernels.DifferentiationInterface.AutoEnzyme{Nothing}
 

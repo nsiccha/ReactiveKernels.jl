@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.125
+
+- A program that native Enzyme differentiates only with a repair on Enzyme's
+  `dogfood` line can name that repair before its derivative is prepared
+  (`_require_enzyme_repairs(backend, repairs, requester, floor)`; the Enzyme
+  extension supplies it). On Julia 1.10, with an Enzyme backend (`AutoEnzyme`,
+  or a `SecondOrder` holding one), it calls `Enzyme.require_dogfood_repairs`
+  where Enzyme reports its repairs (dogfood from `a68104d`), which throws
+  `Enzyme.DogfoodRepairMissing` naming each missing one. Where Enzyme cannot
+  report them (a registered release, older dogfood) it warns once per requester,
+  naming the floor, and lets the derivative be prepared. Other backends and
+  Julia versions are not checked.
+- `_reads_lazy_view_rows(kernel)` says whether a prepared program reads a lazy
+  view (`_cell_lazy_view`) at a cell's rows through `_cell_source_rows`, that is,
+  takes a `view` of the lazy array itself at those rows. On Julia 1.10 native
+  Enzyme can need dogfood repair `const_slot_reloads` for that shape: in a large
+  enough program it raises `EnzymeRuntimeActivityError` without it (snag
+  `rk-partition-pat-8d339a5f`). The check finds the shape, not the size.
+
 ## 0.1.124
 
 - A plate cell reads a slice in place when every call that reads it provably

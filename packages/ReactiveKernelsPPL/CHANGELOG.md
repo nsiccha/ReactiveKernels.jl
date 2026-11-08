@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.130
+
+- Preparing a compact factor query (`prepare_query_ad(...; coordinates)`) whose
+  program reads a parameter block at a partition's rows checks the loaded
+  Enzyme first, on Julia 1.10 with an Enzyme backend. Its native
+  differentiation can need dogfood repair `const_slot_reloads` (dogfood
+  `0147c6f`): in a large enough program the first gradient raised a misleading
+  `EnzymeRuntimeActivityError` without it, after the whole preparation (snag
+  `rk-partition-pat-8d339a5f`). Dogfood from `a68104d` reports its repairs, so
+  a missing one throws `Enzyme.DogfoodRepairMissing` at preparation. Registered
+  Enzyme and older dogfood cannot report them and get one warning naming the
+  floor. A query that reads the overlay only by scalars, and other Julia
+  versions, are not checked. Needs ReactiveKernels 0.1.125.
+
 ## 0.1.129
 
 - A `@plate` output whose cell reads no per-index value, such as

@@ -2059,6 +2059,71 @@ function _prepare_native_forward_batch_ad(kernel, resolver, backend,
     throw(ArgumentError("native forward batching requires AutoEnzyme() with no explicit mode and Enzyme loaded"))
 end
 
+# Native Enzyme differentiates some programs only with a repair that Enzyme's
+# `dogfood` line carries and no registered release does (`enzyme-use`, "Stating
+# a dogfood floor"). A caller whose program can need repairs names them here
+# before it prepares the derivative, with the feature that can need them
+# (`requester`) and the first dogfood commit that carries them (`floor`). The
+# optional Enzyme extension checks an Enzyme backend on the Julia versions those
+# repairs concern; without it nothing is checked.
+_require_enzyme_repairs(backend, repairs::Tuple{Vararg{Symbol}},
+    requester::AbstractString, floor::AbstractString) = nothing
+
+# Whether a program reads a lazy view (`_cell_lazy_view`) at a cell's rows through
+# `_cell_source_rows`: the view's own `_cell_lazy_rows` did not serve those rows,
+# because its parts are not constant per label, so the program takes a `view` of
+# the lazy array itself at them (`_cell_rows_view`). On Julia 1.10, native Enzyme
+# can need a dogfood repair to differentiate that `view` of a struct held on the
+# stack: in a large enough program it raises `EnzymeRuntimeActivityError` without
+# one (`rkppl-use` §14, "Enzyme floor"). This finds the shape, not the size, so a
+# program it names may still differentiate without the repair. The program read is
+# the one AD differentiates, plate programs inline (`_ad_inline_plate_programs`).
+_reads_lazy_view_rows(kernel::PreparedKernel) = _reads_lazy_view_rows(
+    _has_plate_programs(kernel.ast) ? _inline_plate_programs(kernel.ast) : kernel.ast)
+function _reads_lazy_view_rows(ast::Expr)
+    lazy = _lazy_view_names!(Set{Symbol}(), ast)
+    !isempty(lazy) && _reads_rows_of(lazy, ast)
+end
+_lazy_view_callee(@nospecialize(f)) = f isa GlobalRef && isdefined(f.mod, f.name) &&
+    _cell_lazy_view(getglobal(f.mod, f.name))
+_is_ref_to(@nospecialize(f), name::Symbol) = f isa GlobalRef && f.mod === (@__MODULE__) &&
+    f.name === name
+# Names bound to a lazy view's result, and the names they are rebound to (`x = v`,
+# `let x = v`). The program is straight-line, so a name is bound before it is read.
+function _lazy_view_names!(lazy::Set{Symbol}, @nospecialize(x))
+    x isa Expr || return lazy
+    if x.head === :(=)
+        lhs, rhs = x.args[1], x.args[2]
+        lhs isa Expr && lhs.head === :(::) && (lhs = lhs.args[1])
+        if lhs isa Symbol && (rhs isa Expr && rhs.head === :call && _lazy_view_callee(rhs.args[1]) ||
+                              rhs isa Symbol && rhs in lazy)
+            push!(lazy, lhs)
+        end
+    end
+    for a in x.args
+        _lazy_view_names!(lazy, a)
+    end
+    lazy
+end
+# `_cell_source_rows(source, rows)`, or `_partition_statement_call(_cell_source_rows,
+# source, rows)` in a partition body, with `source` one of those names.
+function _reads_rows_of(lazy::Set{Symbol}, @nospecialize(x))
+    x isa Expr || return false
+    if x.head === :call
+        a = x.args
+        source = if _is_ref_to(a[1], :_partition_statement_call) && length(a) >= 3 &&
+                    _is_ref_to(a[2], :_cell_source_rows)
+            a[3]
+        elseif _is_ref_to(a[1], :_cell_source_rows) && length(a) >= 2
+            a[2]
+        else
+            nothing
+        end
+        source isa Symbol && source in lazy && return true
+    end
+    any(a -> _reads_rows_of(lazy, a), x.args)
+end
+
 _prepare_ad_pullback(kernel::_ADKernel, resolver,
                      backend::DifferentiationInterface.AbstractADType,
                      seed, args::Tuple, kwargs::NamedTuple, active) =

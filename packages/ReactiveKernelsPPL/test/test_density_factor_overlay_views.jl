@@ -120,6 +120,32 @@ _toy_geometry(N, T) = (; permutation = collect(1:N), mass = ones(N), gptr = coll
     columns = collect(1:N), stiffness = ones(N), times = collect(0.0:T-1), nchannels = 1,
     ncoordinates = N * T)
 
+# `ReactiveKernels._require_enzyme_repairs`, which the compact query below calls:
+# Enzyme backends only, on Julia 1.10 only. Where Enzyme reports its dogfood
+# repairs it refuses a missing one; where it cannot, it warns once per requester.
+@testset "the Enzyme repair check of a compact query names its floor" begin
+    DI = ReactiveKernels.DifferentiationInterface
+    check(backend, repairs) = ReactiveKernels._require_enzyme_repairs(backend, repairs,
+        "a test of the repair check", "dogfood 0147c6f")
+    second = DI.SecondOrder(_REVERSE, DI.AutoEnzyme(; mode = Enzyme.Forward))
+    @test check(nothing, (:no_such_repair,)) === nothing
+    @test check(DI.AutoForwardDiff(), (:no_such_repair,)) === nothing
+    if VERSION >= v"1.11-"
+        @test check(_REVERSE, (:no_such_repair,)) === nothing
+        @test check(second, (:no_such_repair,)) === nothing
+    elseif isdefined(Enzyme, :require_dogfood_repairs)
+        @test check(_REVERSE, (:const_slot_reloads,)) === nothing
+        @test_throws Enzyme.DogfoodRepairMissing check(_REVERSE, (:no_such_repair,))
+        @test_throws Enzyme.DogfoodRepairMissing check(second, (:no_such_repair,))
+    else
+        @test_logs (:warn, r"can need Enzyme dogfood 0147c6f or later") check(_REVERSE,
+            (:const_slot_reloads,))
+        @test_logs min_level = Base.CoreLogging.Warn check(_REVERSE, (:const_slot_reloads,))
+        @test_logs (:warn, r"repair const_slot_reloads, other") check(second,
+            (:const_slot_reloads, :other))
+    end
+end
+
 @testset "a compact factor query beside a plate read through a view" begin
     model = @rkppl begin
         mesh = _toy_geometry(N, T)
@@ -152,6 +178,11 @@ _toy_geometry(N, T) = (; permutation = collect(1:N), mass = ones(N), gptr = coll
 
     q = only(prepare_query_ad(prepare_ad, built, plan, [selection], _REVERSE, u;
         coordinates = :support))
+    # Its shared program reads the compact overlay at a partition's rows, the shape
+    # whose native Reverse needs dogfood repair `const_slot_reloads` on Julia 1.10,
+    # so preparation checked the loaded Enzyme for it.
+    @test q.prepared.kernel isa ReactiveKernels.PreparedKernel
+    @test ReactiveKernels._reads_lazy_view_rows(q.prepared.kernel)
     @test q.coordinates == factor_support(selection; u0 = u)
     compact_value, compact_gradient = ad_value_and_gradient(q, u, u[q.coordinates])
     @test compact_value ≈ full_value
