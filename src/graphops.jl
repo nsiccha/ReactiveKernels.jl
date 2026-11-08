@@ -260,14 +260,15 @@ for graph_key in (Nothing, UInt64)
         error("no _prepare_bound! method for a $graph_key graph key")
 end
 # A cache hit compares its key with the stored one. Signatures are vectors, so
-# one key type serves every port count (here without passes).
+# one key type serves every port count (here without passes). The last
+# element is `_branch_arms()`, which a key type change here must follow.
 for on_error in (Nothing, Symbol)
     S = Vector{ValueId}
     for graph_key in (Nothing, UInt64)
-        K = Tuple{Symbol,graph_key,Int,S,S,S,Tuple{},on_error,Symbol,Symbol,Bool}
+        K = Tuple{Symbol,graph_key,Int,S,S,S,Tuple{},on_error,Symbol,Symbol,Bool,Symbol}
         precompile(isequal, (K, K)) || error("no isequal method for bound key $K")
     end
-    K = Tuple{UInt64,Int,S,S,Tuple{},on_error,Symbol,Symbol,Bool}
+    K = Tuple{UInt64,Int,S,S,Tuple{},on_error,Symbol,Symbol,Bool,Symbol}
     precompile(isequal, (K, K)) || error("no isequal method for cache key $K")
 end
 for template in (_BoundTemplate, PreparedKernel, Nothing)
