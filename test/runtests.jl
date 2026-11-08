@@ -43,6 +43,7 @@ const _MATRIX_CORE_TESTS = (
     "test_derivative_rules.jl",
     "test_derivative_rule_multioutput.jl",
     "test_expm_rule.jl",
+    "test_stable_rewrites.jl",
     "test_symmetric_eigen_rules.jl",
     "test_cholesky.jl",
     "test_gaussian_projection.jl",
