@@ -60,7 +60,7 @@ end
     mixed = prepare(C.chain; bound = (; y))
     @test_throws DimensionMismatch mixed([0.1, 0.2], q)
     # With `branch_arms = :all` the arm no lane takes is a plate over no lanes,
-    # and the program is the mixed binding's (RK 0.1.116).
+    # and the program is the mixed binding's (RK 0.1.118).
     every = prepare(C.chain; bound = (; y = fill(true, length(y))), branch_arms = :all)
     @test count(r -> r.op isa RK._AuthoredPlateOp, every.plan.recipes) == 2
     @test every(x, q) ≈ sum((x .+ q[1]) .^ 2)

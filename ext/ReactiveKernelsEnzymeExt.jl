@@ -489,4 +489,145 @@ function ReactiveKernels._ad_accumulate_backend!(backend::_AccumulatingEnzyme,
         Enzyme.Const(weight), annotations...))
 end
 
+
+# ------------------------------------------------ generated plate reverse ----
+# `_PlateSumRule` (src/plate_reverse.jl): a summed plate program with a reverse
+# generated from its own code. The augmented primal runs the program, so the
+# primal is unchanged; the reverse pass runs the generated reverse once per
+# lane with the covector, which adds each batched operand's cotangent into its
+# shadow and returns the scalar operands' cotangents. A call whose activity
+# the generated reverse does not take differentiates the program with
+# Enzyme's ordinary reverse instead.
+
+using ReactiveKernels: _PlateSumRule, _pr_scalar_positions, _pr_batched_positions
+
+function EnzymeRules.augmented_primal(
+        config::RevConfig, rule::Const{<:_PlateSumRule}, ::Type{RT},
+        args::Vararg{Annotation,N}) where {RT,N}
+    values = map(a -> a.val, args)
+    primal = rule.val(values...)
+    if RT <: Const || all(a -> a isa Const, args)
+        return AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, nothing)
+    end
+    tape = _pr_tape(Val(overwritten(config)), values)
+    AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, tape)
+end
+
+# The tape holds a copy of each array operand Enzyme may overwrite before the
+# reverse pass (`F` counts the function object at position 1) and nothing
+# else: the reverse pass reads every other operand from its annotation, so a
+# call whose operands stay intact keeps an empty tape and allocates none.
+@generated function _pr_tape(::Val{F}, values::Tuple) where {F}
+    Expr(:tuple, (F[i+1] && T <: AbstractArray ? :(copy(getfield(values, $i))) : :nothing
+                  for (i, T) in enumerate(values.parameters))...)
+end
+# The operand values for the reverse pass: the tape's copy where it holds one.
+@generated function _pr_operands(tape::Tuple, args::Tuple)
+    Expr(:tuple, (tape.parameters[i] === Nothing ? :(getfield(args, $i).val) :
+                  :(getfield(tape, $i)) for i in 1:length(args.parameters))...)
+end
+
+# The shadow of each batched operand, for lane `w` (`nothing` for a constant one).
+@generated function _pr_shadows(::Val{B}, args::Tuple, ::Val{W}, w) where {B,W}
+    Expr(:tuple, (:(_pr_shadow(getfield(args, $b), Val($W), w)) for b in B)...)
+end
+
+@inline _pr_shadow(arg::Union{Duplicated,DuplicatedNoNeed}, ::Val{1}, w) = arg.dval
+@inline _pr_shadow(arg::Union{BatchDuplicated,BatchDuplicatedNoNeed}, ::Val, w) = arg.dval[w]
+@inline _pr_shadow(arg::Active{<:Tuple}, ::Val{1}, w) = zeros(eltype(arg.val), length(arg.val))
+@inline _pr_shadow(arg, ::Val, w) = nothing
+
+# The reverse's return: the cotangent of each Active operand (zero for one the
+# rule does not differentiate), `nothing` for every other annotation.
+@generated function _pr_reverse_return(::Val{S}, args::Tuple, cot::Tuple,
+        ::Val{B} = Val(()), shadows::Tuple = ()) where {S,B}
+    exprs = Any[]
+    for (i, T) in enumerate(args.parameters)
+        j = findfirst(==(i), B)
+        if T <: Active && j !== nothing && _pr_tuple_operand(T)
+            # A tuple operand: its cotangent is the vector the reverse filled.
+            V = T.parameters[1]
+            n = length(V.parameters)
+            # Unrolled: a generated function's body holds no closure.
+            elements = Any[:(@inbounds getfield(shadows, $j)[$k]) for k in 1:n]
+            push!(exprs, :(convert($V, $(Expr(:tuple, elements...)))::$V))
+        elseif T <: Active
+            k = findfirst(==(i), S)
+            push!(exprs, k === nothing ? :(zero(getfield(args, $i).val)) :
+                  :(convert($(T.parameters[1]), getfield(cot, $k))::$(T.parameters[1])))
+        else
+            push!(exprs, :nothing)
+        end
+    end
+    Expr(:tuple, exprs...)
+end
+
+# A batched operand Enzyme passes as `Active` (an immutable collection such as
+# a tuple) has no shadow to add into. Such a call differentiates the program
+# with Enzyme's ordinary reverse instead, seeded with the covector.
+# A batched operand passed as `Active` is supported when it is a tuple of
+# floats: its cotangent accumulates in a vector and returns as a tuple.
+_pr_tuple_operand(::Type{<:Active{T}}) where {T} = T <: Tuple{Vararg{AbstractFloat}}
+_pr_tuple_operand(::Type) = false
+@generated function _pr_supported(::Val{B}, args::Tuple) where {B}
+    all(b -> !(args.parameters[b] <: Active) || _pr_tuple_operand(args.parameters[b]), B) ?
+        :(true) : :(false)
+end
+
+struct _PRSeeded{F,T}
+    program::F
+    seed::T
+end
+@inline (s::_PRSeeded)(args::Vararg{Any,N}) where {N} = s.seed * s.program(args...)
+
+@inline _pr_rewrap(a::Active, v) = Active(v)
+@inline _pr_rewrap(a::Union{Duplicated,DuplicatedNoNeed}, v) = Duplicated(v, a.dval)
+@inline _pr_rewrap(a::Const, v) = Const(v)
+
+# The reverse's return type for these annotations: the value type of each
+# Active operand, `nothing` for every other.
+@generated _pr_return_type(args::Tuple) = Tuple{(T <: Active ? T.parameters[1] : Nothing
+                                                for T in args.parameters)...}
+
+function _pr_ordinary_reverse(program::F, ȳ, tape, args::Tuple) where {F}
+    annotations = map(_pr_rewrap, args, tape)
+    first(Enzyme.autodiff(Enzyme.Reverse, Const(_PRSeeded(program, ȳ)), Active,
+                          annotations...))::_pr_return_type(args)
+end
+
+function EnzymeRules.reverse(
+        config::RevConfig, rule::Const{<:_PlateSumRule}, dret, tape,
+        args::Vararg{Annotation,N}) where {N}
+    r = rule.val
+    S = _pr_scalar_positions(r)
+    B = _pr_batched_positions(r)
+    if tape === nothing
+        return _pr_reverse_return(Val(()), args, ())
+    end
+    operands = _pr_operands(tape, args)
+    if width(config) == 1 && !_pr_supported(Val(B), args)
+        ȳ = dret isa Active ? dret.val : dret
+        return _pr_ordinary_reverse(r.program, ȳ, operands, args)
+    end
+    W = width(config)
+    if W == 1
+        ȳ = dret isa Active ? dret.val : dret
+        shadows = _pr_shadows(Val(B), args, Val(1), 1)
+        cot = r.reverse(operands..., ȳ, shadows...)
+        return _pr_reverse_return(Val(S), args, cot, Val(B), shadows)
+    end
+    lanes = ntuple(Val(W)) do w
+        ȳ = dret.val[w]
+        shadows = _pr_shadows(Val(B), args, Val(W), w)
+        r.reverse(operands..., ȳ, shadows...)
+    end
+    # Active scalars of a batched call take one cotangent per lane.
+    ntuple(Val(N)) do i
+        a = args[i]
+        a isa Active || return nothing
+        k = findfirst(==(i), S)
+        ntuple(w -> k === nothing ? zero(a.val[w]) : lanes[w][k], Val(W))
+    end
+end
+
 end # module

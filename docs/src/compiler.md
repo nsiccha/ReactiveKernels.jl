@@ -246,7 +246,9 @@ a cycle with no executable grounding or an effectful-only route, fails with a
 
 The planner does not do algebraic simplification, constant folding, common
 subexpression discovery from Julia code, shape inference, symbolic
-differentiation, or runtime profiling.
+differentiation, or runtime profiling. Preparation does apply one fixed table of
+stable rewrites to the program it compiles, after planning and lowering (see
+"Stable rewrites" below); the plan, its recipes and the graph are unchanged.
 
 ### 3. Structural common-subexpression elimination
 
@@ -570,6 +572,103 @@ value, because those kernels declare their typed locals. Each warning is
 issued once per process. It is logged in the group `:type_stability`, so a
 logger can filter it.
 
+### Stable rewrites
+
+A positive value often enters a program as `exp(u)`, for example through
+RKPPL's positive transform or BRM's exp link, and is read back on the log
+scale: a law's `log(scale)`, an author's `-log(rate)`. Computed as written,
+`log(exp(u))` is `u` only while `exp(u)` is representable, which holds for
+`-745 < u < 709`. Outside that range the value is `-Inf` or `Inf`. The ordinary
+reverse pass, `(1 / exp(u)) * exp(u)`, is `0 * Inf = NaN` at those edges, even
+where the density downstream stays finite.
+
+Every preparation (`prepare`, `prepare!`, `prepare_ad`, and through them the
+RKPPL queries and samplers) therefore computes such compositions in their
+stable form before the program is compiled. Enzyme then differentiates the
+stable form with its ordinary reverse mode; no derivative is authored. The
+table (`src/stable_rewrites.jl`):
+
+| Written | Computed as |
+| --- | --- |
+| `log(exp(x))` | `x` |
+| `log(logistic(x))`, `log(1 / (1 + exp(-x)))` | `loglogistic(x)` |
+| `log1p(-logistic(x))`, `log(1 - logistic(x))`, `log1p(-(1 / (1 + exp(-x))))` | `log1mlogistic(x)` |
+| `logit(logistic(x))`, `log(p) - log1p(-p)` of `p = logistic(x)` | `x` |
+| `log(1 + x)` | `log1p(x)` |
+| `exp(x) - 1` | `expm1(x)` |
+| `log(1 + exp(x))`, `log1p(exp(x))` | `log1pexp(x)` |
+| `log1p(-exp(x))`, `log(1 - exp(x))` | `log1mexp(x)` |
+| `log(exp(a) + exp(b))` | a log-sum-exp with the literal tie derivative (1/2, 1/2) |
+| `log(sum(exp.(x)))` | the maximum-shifted log-sum-exp |
+| `inv(exp(x))`, `y / exp(x)`, `exp(x)^k`, `sqrt(exp(x))` | `exp(-x)`, `y * exp(-x)`, `exp(k * x)`, `exp(x / 2)` |
+| `exp(log(p))` of `p = exp(…)`, `abs(…)`, `abs2(…)` or `logistic(…)` | `p` |
+
+A rewrite is admitted only under these rules:
+
+- It is the same real function wherever the written form is defined.
+- Wherever the written form's floating-point value is finite, the rewrite
+  agrees with it, and with its ordinary-reverse derivative, to within that
+  form's own rounding.
+- It may be finite where the written form overflows, underflows or forms
+  `0 * Inf`. That is its purpose.
+- It raises every error the written form raises. `log(1 + x)` still throws for
+  `x < -1`, and `exp(log(x))` is rewritten only for a producer that is proven
+  non-negative.
+- It never evaluates a lazy branch's arm eagerly or moves a guard.
+
+"Within rounding" applies to the rewritten subexpression. A downstream
+computation that amplifies rounding, such as the cosine of a phase of `1e130`,
+can differ in its output, as it would under any reordering of floating-point
+arithmetic.
+
+**What the rewrite sees.** The pass recognizes a call by the resolved identity
+of its callee, never by its name. A callee bound to a non-constant global is
+never matched. Both ends of a composition are found:
+
+- within one expression;
+- across statements, when the inner value is assigned once by a statement that
+  dominates the use;
+- inside plate cells, including a law's hoisted term that reads a value
+  computed outside the plate (`sigma = exp(u)` read by a Normal law's
+  `log(scale)`), and a cell's own read of its argument;
+- inside the leaf arms of a cell's lazy branch, arm by arm, so the branch stays
+  lazy. `bernoulli(logistic(η)).logpdf(y)`'s arms `log(p)` and `log1p(-p)`
+  read `η`, and the probability form is as exact as `bernoulli(; logit = η)`;
+- elementwise, for dotted calls (`log.(exp.(u))`).
+
+The rewritten call dispatches on its operands: a `Real` operand gets the stable
+form, and any other type, such as a matrix exponential or a custom number,
+runs the written composition. The pass needs no type information, and the
+result type is the written form's. A statement of the inner call that nothing
+reads any more is removed. Kept alive, its reverse could still form `0 * Inf`.
+
+**What it does not see.** The pass cannot see inside an opaque function: a plain
+Julia function or a StanBlocks `@deffun` called from a recipe is compiled as
+written. Two cases are also not reached yet:
+
+- values read per row from a gathered or zipped array (`exp.(eta)` read as
+  `scale[g[i]]` in a cell);
+- `@traceable` helper bodies.
+
+The pass applies to `prepare` and what it compiles, not yet to
+`prepare_nonallocating`, the reactive compiler, the batched lowering or
+`jax_source`. Generated-code display (`code_expr`) shows the rewritten program,
+which is the program that runs. `kernel_graph`, `explain` and the plan show the
+authored recipes.
+
+**Turning it off.** `prepare(…; simplify = false)` (also `prepare!`,
+`prepare_ad`) compiles the literal arithmetic. `nothing`, the default, takes
+the setting of an enclosing preparation, else the project's preference, else
+`true`:
+
+```julia
+Preferences.set_preferences!(ReactiveKernels, "simplify" => false)
+```
+
+That writes `[ReactiveKernels] simplify = false` to the project's
+`LocalPreferences.toml`, which applies to every preparation, including those
+other packages make for it. Cached preparations are kept per setting.
+
 ### Preparation-time partial evaluation
 
 When some HAVE values stay fixed across many calls, `bound` opts into a
@@ -787,7 +886,7 @@ authored native cell, as in Julia's empty broadcast.
 So by default the prepared program follows this binding's outcomes: data that
 moves every lane into one arm, or an empty domain, prepares another program
 than a binding whose lanes take both arms. With `branch_arms = :all` (from
-ReactiveKernels 0.1.116, opt-in) every arm is a plate, over no lanes for an arm
+ReactiveKernels 0.1.118, opt-in) every arm is a plate, over no lanes for an arm
 no lane takes, and an empty domain is split too, so one program serves every
 binding of a cell: an RKPPL censored response keeps one sampler type whether
 its rows are all observed, all censored, mixed or absent. An arm without lanes
@@ -1104,6 +1203,38 @@ censored, went from 426 to 544 ns per gradient.
 Only bodies prepared by `prepare` do this, and only plates that keep no
 per-cell tables. A transform `pass` given to `prepare` sees the plate loops
 inline, before they become programs.
+
+#### A generated reverse for summed plate programs
+
+With the `plate_reverse` preference set to `"on"`, or inside
+[`with_plate_reverse`](@ref), a gradient does not differentiate a summed plate
+program inline. It calls the program through an RK-owned rule whose reverse is
+generated from the program's own code. The output adjoint of a sum reaches
+every cell unchanged, so that reverse is one pass over the cells:
+
+- each cell runs forward, then its own reverse sweep, seeded with the total's
+  adjoint;
+- the adjoints of shared values (scalars, invariants hoisted above the loop)
+  accumulate across cells, and the hoisted invariants are swept once after the
+  loop;
+- a batched operand's cotangent is added into its shadow at the cell. A
+  gathered operand, such as `_readonly_gather(z, g)`, is a view, so its shadow
+  scatters the cotangent into `z`'s, repeated indices included.
+
+Each call's partials come from DiffRules, the table ForwardDiff and
+ReverseDiff use, or for a call whose derivative reads its own result (`exp`,
+`sqrt`) and for RK's own arithmetic, from the generator's spelling through
+that result. No rule attaches to a function this repository does not own. Lazy
+branches stay lazy: each arm's reverse runs inside that arm, under the
+condition the forward stored. The primal is the program itself, so values are
+unchanged.
+
+A plate the generator cannot differentiate keeps the backend's reverse, as
+does a call whose operands the generated reverse does not take (an immutable
+batched operand such as a tuple). [`plate_reverse_report`](@ref) names, for each
+plate program of a prepared kernel, whether its gradient is the generated
+reverse and otherwise why not. Forward-mode and higher-order operators keep
+differentiating the program with the backend.
 
 ### Nested observation plates
 

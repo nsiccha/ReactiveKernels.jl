@@ -25,6 +25,7 @@ using Random
 import DifferentiationInterface
 import EnzymeCore
 import Preferences
+import DiffRules
 using PrecompileTools: @setup_workload, @compile_workload
 RuntimeGeneratedFunctions.init(@__MODULE__)
 
@@ -61,6 +62,7 @@ include("cell_arrays.jl")
 include("error_policy.jl")
 include("ad.jl")
 include("ad_accumulation.jl")
+include("plate_reverse.jl")
 include("derivative_rules.jl")
 include("kernel_stateful.jl")
 include("reactive.jl")
@@ -68,6 +70,7 @@ include("stateful.jl")
 include("visualization.jl")
 include("display.jl")
 include("expm_rule.jl")
+include("stable_rewrites.jl")
 include("symmetric_eigen_rules.jl")
 include("affine_logistic.jl")
 include("cholesky.jl")
@@ -91,6 +94,7 @@ export PreparedADAccumulator, prepare_ad_accumulator, ad_accumulator_storage, ad
 export ad_value_gradient_and_retained, ad_value_gradient_and_retained!,
     ad_retains_primal_sweep
 export prepare_ad_pullback, ad_pullback
+export with_plate_reverse, plate_reverse_report
 export ScalarDerivativeRule, scalar_derivative_rule, derivative_cut
 export DerivativeRule, derivative_rule, forward_cut, reverse_cut, reverse_residuals
 export rk_expm, rk_symmetric_eigvals, rk_symmetric_eigvecs

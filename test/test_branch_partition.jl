@@ -318,7 +318,7 @@ end
 
 # With `branch_arms = :all`, one program serves every binding of a data-bound
 # branch, whichever arms its lanes take, an empty domain included: an arm no
-# lane takes is a plate over no lanes (RK 0.1.116). A prepared type that followed the outcomes made another binding of the
+# lane takes is a plate over no lanes (RK 0.1.118). A prepared type that followed the outcomes made another binding of the
 # same program compile again (snag `sampler-type-dif-ea945700`: censored soil
 # rows that were all detected, or all censored, recompiled ODL's sampler).
 @testset "one prepared type whichever arms the lanes take" begin
@@ -414,7 +414,7 @@ end
                           for (m, xi, yi, o) in zip(mu, xs, yc, obs)]
     end
     # By default a binding whose lanes all take one arm prepares its own
-    # program, as before 0.1.116; a value other than `:taken` or `:all` is
+    # program, as before 0.1.118; a value other than `:taken` or `:all` is
     # refused.
     let x = [0.5, 1.5, 2.0], y = [1.0, -2.0, 0.5]
         own = ReactiveKernels.prepare(C.guarded; have = (:x, :y), want = :total,

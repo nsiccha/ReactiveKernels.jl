@@ -315,7 +315,7 @@ end
 # ReactiveKernels' `branch_arms = :all` (its `[ReactiveKernels]` preference;
 # here the scope the preference sets) every arm is a plate, also one no row
 # takes: one program and one sampler type serve rows that are all observed,
-# all censored, a mix, or none (RK 0.1.116, snag `sampler-type-dif-ea945700`:
+# all censored, a mix, or none (RK 0.1.118, snag `sampler-type-dif-ea945700`:
 # ODL's soil rows all detected, or all below their detection limit, compiled
 # the sampler again). By default a binding whose rows all take one arm
 # prepares a program of its own.

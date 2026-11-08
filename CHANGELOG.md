@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.116
+## 0.1.118
 
 - New, opt-in: `branch_arms = :all`, a `prepare` keyword and the
   `[ReactiveKernels]` preference `branch_arms = "all"` in a project's
@@ -47,6 +47,52 @@ are recorded in the git history only.
   alone still selects its arm at preparation, and a bound singleton beside
   live arguments of unknown length (a plate of one row) still prepares its own
   program.
+
+## 0.1.117
+
+- Preparation computes numerically fragile compositions in their stable form:
+  `log(exp(x))` as `x`, `log(logistic(x))` as `loglogistic(x)`, `log(1 + x)` as
+  `log1p(x)`, `exp(x) - 1` as `expm1(x)`, `log(1 + exp(x))` as `log1pexp(x)`,
+  `log(exp(a) + exp(b))` and `log(sum(exp.(x)))` as log-sum-exps,
+  `y / exp(x)` as `y * exp(-x)`, and the rest of the table on the compiler page
+  ("Stable rewrites"). The written form is finite only while its intermediate
+  is representable, and its ordinary reverse forms `0 * Inf = NaN` at the edges:
+  `log(exp(u))` at `u < -745` or `u > 709`. The stable form agrees with it to
+  within rounding wherever it is finite, and stays finite, with a finite
+  derivative, beyond. Errors, lazy branches and non-`Real` operands keep the
+  written program, and result types are unchanged. The rewrite applies across
+  statements, inside plate cells and inside a cell's lazy-branch arms. A
+  sampled positive scale's `exp` and the law's `log(scale)` now meet as `u`,
+  and `bernoulli(logistic(η))` is as exact as `bernoulli(; logit = η)`
+  (`-20.000000002061153` at η = 20, y = false, where it gave `-20.00000002003398`,
+  and `-40.0` at η = 40, where it gave `-Inf`). Results change in their last
+  bits wherever a rule fires.
+- `prepare`, `prepare!` and `prepare_ad(::KernelSpec, …)` take `simplify`:
+  `false` compiles the literal arithmetic, and `nothing` (the default) takes
+  the enclosing preparation's setting, else the project preference
+  `[ReactiveKernels] simplify`, else `true`. Cached preparations are kept per
+  setting.
+- Not yet covered: `prepare_nonallocating`, the reactive compiler, the batched
+  lowering and `jax_source`, values read per row from a gathered or zipped
+  array, and `@traceable` helper bodies. Opaque functions are never rewritten.
+
+## 0.1.116
+
+- A generated reverse for summed plate programs, opt-in: with the
+  `plate_reverse` preference set to `"on"`, or inside
+  `with_plate_reverse(f)`, a prepared gradient differentiates each summed plate
+  program with a reverse generated from the program's own code instead of the
+  backend's reverse over its loop. The output adjoint of a sum reaches every
+  cell unchanged, so the reverse is one pass over the cells: each cell runs
+  forward and then its own reverse sweep, shared values' adjoints accumulate
+  across cells, a batched operand's cotangent is added into its shadow at the
+  cell (a gathered operand's shadow scatters it), and invariants hoisted above
+  the loop are swept once after it. Partials come from DiffRules; lazy branches
+  stay lazy. The primal is the program itself, unchanged. A plate the
+  generator does not differentiate keeps the backend's reverse;
+  `plate_reverse_report(kernel)` names, for each plate program, whether it took
+  the generated reverse and otherwise why not.
+- New dependency: DiffRules.
 
 ## 0.1.115
 
