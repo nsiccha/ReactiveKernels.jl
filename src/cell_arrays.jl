@@ -121,6 +121,15 @@ end
 end
 @inline _cell_array_broadcast(x) = _native_broadcast_materialize(x)
 
+# A gather whose readers only take its entries or its shape. A dense floating
+# vector read at an integer vector is borrowed: `_readonly_gather` checks every
+# index before returning, as `x[I]` does, and nothing writes either side while
+# the gather is read (effectful regions keep their copies). Every other source
+# or index is Julia's indexing, unchanged.
+@inline _cell_array_gather(x, I) = x[I]
+@inline _cell_array_gather(x::Union{Vector{Float32},Vector{Float64}}, I::Vector{Int}) =
+    _readonly_gather(x, I)
+
 # A declaration still converts values as authored. A same-element, same-rank
 # dense Array declaration can keep the internal recipe representation; all
 # other declarations materialize and convert normally.
@@ -245,7 +254,8 @@ function _cell_array_lane_reads(fn, x, names)
         return length(x.args) == 2 && named(x.args[2])
     elseif fn === _plate_dependency_changed || fn === _plate_total_seed
         return length(x.args) >= 3 && named(last(x.args)) && free(x.args[2:end-1])
-    elseif fn === Base.Broadcast._broadcast_getindex
+    elseif fn === Base.Broadcast._broadcast_getindex || fn === _cell_array_gather
+        # A gather of a composed value is its indexing (`_cell_array_select`).
         return length(x.args) >= 3 && named(x.args[2]) && free(x.args[3:end])
     end
     nothing
@@ -316,6 +326,18 @@ function _cell_array_broadcast_reads(x, names)
         all(a -> _cell_array_broadcast_reads(a, names), x.args[3:end])
 end
 
+# A statement whose value is one gather `x[I]`, read only entry by entry,
+# borrows `x` (`_cell_array_gather`). Only a whole statement: a gather inside
+# another expression keeps Julia's indexing. An index naming `end` or `begin`
+# keeps it too, since that syntax means `x`'s own extent.
+function _cell_array_statement_producer(x)
+    producer = _cell_array_producer(x)
+    producer === nothing || return producer
+    x isa Expr && x.head === :ref && length(x.args) == 2 &&
+        !Meta.isexpr(x.args[2], :...) &&
+        !_cell_array_has(x.args[2], Set((:end, :begin))) || return nothing
+    Expr(:call, _cell_array_ref(:_cell_array_gather), x.args[1], x.args[2])
+end
 function _cell_array_producer(x)
     x isa Expr && x.head === :call || return nothing
     fn = _cell_array_function(first(x.args))
@@ -336,6 +358,20 @@ function _cell_array_child(x)
     x
 end
 
+function _cell_array_elementwise_operands!(out, ex::Expr)
+    fn = _cell_array_function(first(ex.args))
+    if fn === _native_broadcasted || fn === Base.Broadcast.broadcasted
+        for a in ex.args[3:end]
+            a isa Symbol && push!(out, a)
+        end
+    elseif fn === _authored_plate_marker
+        for a in ex.args[3:end]
+            a isa Symbol && push!(out, a)
+        end
+    end
+    out
+end
+
 # Analyze flattened native def/use, including calls whose source belongs to a
 # different embedded kernel. Keep names and executable tables unchanged. A
 # returned value or unknown reader makes the candidate ineligible.
@@ -348,6 +384,10 @@ function _lower_cell_arrays_native(body::Expr, recipes)
     declarations = Dict{Symbol,Any}()
     repeated = Set{Symbol}()
     ordered = Symbol[]
+    # The names some dotted call or plate reads entry by entry: only those
+    # gathers are candidates, so the per-candidate check stays off the many
+    # scalar reads `x[i]` of a cell body.
+    elementwise = Set{Symbol}()
     _index_run_visit(body) do ex
         if ex.head === :(=) && length(ex.args) == 2 && ex.args[1] isa Symbol
             name = ex.args[1]
@@ -355,11 +395,20 @@ function _lower_cell_arrays_native(body::Expr, recipes)
             haskey(statements, name) && push!(repeated, name)
             statements[name] = ex
             sources[name] = _cell_array_expand_call(ex.args[2], recipes)
+        elseif ex.head === :call
+            _cell_array_elementwise_operands!(elementwise, ex)
         elseif ex.head === :local && length(ex.args) == 1
             typed = only(ex.args)
             typed isa Expr && typed.head === :(::) && typed.args[1] isa Symbol &&
                 (declarations[typed.args[1]] = typed.args[2])
         end
+    end
+    # An inlined recipe's raw statement names its `let` locals; its expanded
+    # source names the values it reads.
+    for source in values(sources)
+        source isa Expr || continue
+        _index_run_visit(ex -> ex.head === :call &&
+            _cell_array_elementwise_operands!(elementwise, ex), source)
     end
     replacements = Dict{Symbol,Any}()
     changed = Set{Symbol}()
@@ -370,8 +419,10 @@ function _lower_cell_arrays_native(body::Expr, recipes)
         progress = false
         for name in candidates
             name in changed && continue
-            producer = _cell_array_producer(sources[name])
+            producer = _cell_array_statement_producer(sources[name])
             producer === nothing && continue
+            _cell_array_function(first(producer.args)) === _cell_array_gather &&
+                !(name in elementwise) && continue
             aliases = Set([name])
             grew = true
             while grew

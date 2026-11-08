@@ -1278,7 +1278,12 @@ read only that way in its cells is composed the same way. For example,
 `present = p .* offsets[event]` followed by
 `components = hcat(present, absent)` builds neither array per event, and
 `m = off[g] .+ s .* x[g]` read by `plate(m, y[g]) do mi, yi … end` builds no
-`m` per group. The graph
+`m` per group. A cell statement `c = w[rows[g]]` that such readers alone read
+borrows `w` when `w` is a dense `Float32`/`Float64` vector and the index an
+integer vector: every index is checked at the statement, as Julia's indexing
+checks it, and nothing writes `w` while the cell reads it (effectful regions
+keep their copies). Any other source or index, and a gather the cell returns
+or passes whole to another reader, keeps Julia's copying `getindex`. The graph
 and its queries keep both authored values, and ordinary Enzyme Reverse
 differentiates the composed reads without a derivative rule. Shape checks and
 declarations still run at the authored statement, and scalar reads keep bounds

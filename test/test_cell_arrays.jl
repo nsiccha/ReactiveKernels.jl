@@ -499,4 +499,72 @@ end
     @test !occursin("_cell_array_broadcast", string(code_expr(escapes)))
     @test escapes([[0.2, 0.4]], [[0.5, 0.25]], 0.5) ≈ (0.5 * 0.1 + 0.25 * 0.2) + (0.1 + 0.2)
 end
+
+# A group's gather of a computed vector, read only through a broadcast that a
+# nested plate reads as its lane, borrows the vector instead of copying it.
+@kernel lane_gather(w::Vector{Vector{Float64}}, traj::Vector{Int}, rows,
+                    y::Vector{Vector{Float64}}, k::Float64, off::Vector{Float64}) = begin
+    wv = plate(w) do wt
+        exp(k) .* wt
+    end
+    values = plate(eachindex(y)) do g
+        c = wv[traj[g]][rows[g]]
+        m = off[g] .+ c
+        terms = plate(m, y[g]) do mi, yi
+            abs2(yi - mi)
+        end
+        sum(terms)
+    end
+    total = sum(values)
+    return total
+end
+# The same gather, also returned whole from each cell, keeps its copy.
+@kernel lane_gather_escapes(w::Vector{Vector{Float64}}, traj::Vector{Int},
+                            rows::Vector{Vector{Int}}, k::Float64) = begin
+    wv = plate(w) do wt
+        exp(k) .* wt
+    end
+    picked = plate(eachindex(rows)) do g
+        wv[traj[g]][rows[g]]
+    end
+    return picked
+end
+lane_gather_value(w, traj, rows, y, k, off) = sum((sum(abs2,
+    y[g] .- (off[g] .+ exp(k) .* w[traj[g]][rows[g]]); init=0.0) for g in eachindex(y)); init=0.0)
+lane_gather_k(w, traj, rows, y, k, off) = sum((-2sum(exp(k) .* w[traj[g]][rows[g]] .*
+    (y[g] .- (off[g] .+ exp(k) .* w[traj[g]][rows[g]])); init=0.0) for g in eachindex(y)); init=0.0)
+function lane_gather_bytes(width)
+    w = [collect(range(0.1, 1.0; length=80)), collect(range(-0.5, 0.4; length=80))]
+    traj = [1, 2, 1]; rows = [collect(1:width), collect(2:width+1), collect(3:width+2)]
+    y = [fill(0.2, width) for _ in 1:3]; off = [0.1, -0.2, 0.3]
+    k = prepare(lane_gather)
+    ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), w, traj, rows, y, 0.3, off; active=:k)
+    k(w, traj, rows, y, 0.3, off), ad_gradient(ad, w, traj, rows, y, 0.3, off)
+    ((@allocated k(w, traj, rows, y, 0.3, off)), (@allocated ad_gradient(ad, w, traj, rows, y, 0.3, off)))
+end
+
+@testset "a gather read only entry by entry borrows its source" begin
+    k = prepare(lane_gather)
+    @test occursin("_cell_array_gather", string(code_expr(k)))
+    w = [collect(0.1:0.1:1.0), collect(-0.5:0.1:0.4)]
+    traj = [1, 2, 1]; off = [0.1, -0.2, 0.3]
+    for (rows, y) in (([[1, 3, 3, 7], [10, 2], Int[]], [[0.1, 0.4, -0.3, 0.2], [0.5, -0.1], Float64[]]),
+                      # A range index keeps Julia's copying gather; the values agree.
+                      ([2:4, 1:2, 5:5], [[0.1, 0.4, -0.3], [0.5, -0.1], [0.2]]))
+        @test k(w, traj, rows, y, 0.3, off) ≈ lane_gather_value(w, traj, rows, y, 0.3, off)
+        ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), w, traj, rows, y, 0.3, off; active=:k)
+        @test ad_gradient(ad, w, traj, rows, y, 0.3, off) ≈ lane_gather_k(w, traj, rows, y, 0.3, off)
+    end
+    # Every index is checked at the gather, as Julia's indexing checks it.
+    @test_throws BoundsError k(w, traj, [[1, 11], [1], Int[]],
+        [[0.1, 0.2], [0.3], Float64[]], 0.3, off)
+    # Neither the value nor its gradient allocates more for wider groups.
+    @test lane_gather_bytes(4) == lane_gather_bytes(64)
+    # A gather returned whole is an owned copy, as authored.
+    escapes = prepare(lane_gather_escapes)
+    @test !occursin("_cell_array_gather", string(code_expr(escapes)))
+    picked = escapes(w, traj, [[1, 2], [3], Int[]], 0.0)
+    @test picked == [w[1][[1, 2]], w[2][[3]], Float64[]]
+    @test all(p -> p isa Vector{Float64}, picked)
+end
 end
