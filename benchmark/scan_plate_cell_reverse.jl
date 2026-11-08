@@ -59,8 +59,10 @@
 # (1.09-1.15). Differentiating the generated function directly, the ARMA cell
 # takes 1.00-1.14 times the inlined hand loop on b5daa2ac (1.01-1.12 on
 # 439590b1), and the edited copy without the peel is 3-10% faster than the code
-# as generated. The remainder is Enzyme's placement of shadow and cache lookups
-# in the peeled scan's reverse loop (Enzyme todo 08khey3).
+# as generated. An Enzyme prototype that loads the peeled scan's loop-invariant
+# shadow and cache pointers once per entry of its reverse loop (libEnzyme
+# c01fbb0c, not landed) removes those reloads but not the cost, so the cause of
+# the remainder is unknown (Enzyme decision 08gyjzn).
 using Enzyme, Random, Printf
 using ReactiveKernels
 const DI = ReactiveKernels.DifferentiationInterface
