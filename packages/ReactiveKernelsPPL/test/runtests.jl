@@ -154,6 +154,7 @@ const _PPL_TEST_FILES = (
 
     "test_retained_lkj.jl",
     "test_array_slices.jl",
+    "test_mv_slices_reverse.jl",
     "test_array_axis_gathers.jl",
     "test_array_data_values.jl",
     "test_whole_value_audit.jl",
