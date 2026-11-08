@@ -1278,8 +1278,15 @@ queries pass it. It has two parts, and both must hold:
   follows every value derived from the argument until it holds no reference.
   It knows only reads: anything else that meets a derived value (a store, a
   foreign call, a dynamic call, a `try`) ends the proof, and so does returning
-  it. A callee's own buffers are not derived, so a callee that writes a local
-  vector still qualifies, which Julia's effect analysis does not establish.
+  it. A callee's own buffers and its other arguments are not derived, so a
+  callee that writes a local vector, or hands another argument to BLAS
+  (`correlation * raw`), still qualifies, which Julia's effect analysis does not
+  establish. That holds for a vararg frame too, such as the callable an
+  authored cell call runs through: when its body reads the argument tuple only
+  element by element, the walk follows the slice's element alone. A call's
+  result counts as derived only when the callee may return a value derived from
+  the slice, so a callee may return a fresh vector it computed from the slice's
+  values, as a vector-valued cell does.
 - **The callee cannot tell a view from a copy.** The walk above reads code that
   has already selected the view's branch and method, so the lowered body of each
   user-level frame is read too. The argument may only reach Base's array
@@ -1305,6 +1312,12 @@ rows reads its slices in place like any other, including one row of a value comp
 only at those rows (`_CellWindow`); a gather of several rows of such a value keeps
 its copy.
 Set `RK_READONLY_SLICES=0` to keep every copy, as a comparison baseline.
+
+To see why a slice keeps its copy, set `JULIA_DEBUG=ReactiveKernels` before
+preparing. Preparation then logs each refused slice at the debug level (group
+`:readonly_slices`): the slice, the reason, the reader and, when the read-only
+proof refused, each frame that refused, innermost first, with the statement of
+its optimized code it stopped at.
 
 Values are the copy's bit for bit. The interface leaves out `sum` and `prod`:
 Base may fold a view in another order than an array (a matrix slice `A[I, :]`

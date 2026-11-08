@@ -16,6 +16,30 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.125
+
+- A plate cell's slice is read in place when its reader hands another argument
+  to BLAS or a foreign call, or returns a fresh array. The read-only proof
+  follows the slice through the callee's optimized code, but an authored cell
+  call (any `@rkppl` or BRM cell `f(a, A[i, :])`) runs through a callable that
+  takes its arguments as one vararg tuple, and the proof followed that whole
+  tuple: every array argument counted as the slice, so a callee that only
+  indexes its row and mixes its result with another argument
+  (`correlation * raw`, a `gemv!` on `correlation`) kept a copy per cell. The
+  proof now follows only the slice's element of a tuple the body reads element
+  by element; a tuple used any other way is followed whole, as before. And it
+  counted any array a call returned as derived from the slice, so a
+  vector-valued cell (the result of `correlation * raw`) kept its copy too; a
+  call's result is now derived only when the callee may return a value derived
+  from the slice. The slice itself is held to the same rules as before: no
+  write, store, return or foreign call.
+- Preparation logs why a slice keeps its copy. With
+  `JULIA_DEBUG=ReactiveKernels`, each refused slice is logged at the debug
+  level (group `:readonly_slices`) with the reason, its reader and, when the
+  read-only proof refused, each frame that refused and the statement of its
+  optimized code it stopped at. See "Slices a cell only reads" in the compiler
+  guide.
+
 ## 0.1.124
 
 - A plate cell reads a slice in place when every call that reads it provably

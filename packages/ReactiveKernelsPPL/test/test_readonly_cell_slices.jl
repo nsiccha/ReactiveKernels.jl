@@ -25,8 +25,40 @@ end
 branches(frequency, scales, amplitude, coefficients, coordinate) =
     coefficients isa Vector ? wave(frequency, scales, amplitude, coefficients, coordinate) :
     0.0 * amplitude
+# Snag readonly-slice-r-cc6a354e: a callee that only indexes the row and hands
+# another argument to BLAS (`transpose(frequency) * raw`, a `gemv!`), as a
+# channel-mixing field does with its correlation factor.
+function mixes(frequency, scales, amplitude, coefficients, coordinate)
+    D, F = size(frequency)
+    raw = zeros(D)
+    for j in 1:F, d in 1:D
+        phase = frequency[d, j] * coordinate[d] / scales[d]
+        raw[d] += coefficients[2j - 1] * cos(phase) + coefficients[2j] * sin(phase)
+    end
+    amplitude * sum(transpose(frequency) * raw) / sqrt(F)
+end
+# The same with a vector-valued cell, the channel field's shape: its result is a
+# fresh vector, which holds nothing of the row.
+function channels(frequency, scales, amplitude, coefficients, coordinate)
+    D, F = size(frequency)
+    raw = zeros(D)
+    for j in 1:F, d in 1:D
+        phase = frequency[d, j] * coordinate[d] / scales[d]
+        raw[d] += coefficients[2j - 1] * cos(phase) + coefficients[2j] * sin(phase)
+    end
+    transpose(frequency) * raw * amplitude / sqrt(F)
+end
+first_of(v) = v[1]
+# Reads the row only through the interface, but a caught exception could hold it.
+caught(frequency, scales, amplitude, coefficients, coordinate) =
+    try
+        wave(frequency, scales, amplitude, coefficients, coordinate)
+    catch
+        0.0 * amplitude
+    end
 
-function fixture(callee; nstates = 40, blocks = 4, F = 6, D = 3)
+function fixture(callee; nstates = 40, blocks = 4, F = 6, D = 3,
+        read = callee === :channels ? :(first_of(field[i])) : :(field[i]))
     width = 2F
     data = (; block = [mod1(s, blocks) for s in 1:nstates],
         coordinates = [cos.(s .* (1:D) ./ 5) for s in 1:nstates],
@@ -42,7 +74,7 @@ function fixture(callee; nstates = 40, blocks = 4, F = 6, D = 3)
             field[s] = $callee(frequency, scales, amplitude, coefficients[block[s], :], coordinates[s])
         end
         @plate for i in eachindex(y)
-            y[i] ~ Normal(field[i], sigma)
+            y[i] ~ Normal($read, sigma)
         end
     end
     bound = bind_data(lower_rkppl(model, data; conditioned = (:y,), mod = @__MODULE__), data)
@@ -61,8 +93,9 @@ in_place(q) = occursin("_readonly_slice", sprint(print, code_expr(q.kernel)))
 # A callee that keeps its copy runs the same program, so its gradient is exact.
 same_gradient(a, b) = isapprox(a, b; rtol = 1e-13)
 
-@testset "a field row an opaque function only reads is read in place" begin
-    fix = fixture(:wave)
+@testset "a field row an opaque function only reads is read in place: $callee" for callee in
+        (:wave, :mixes, :channels)
+    fix = fixture(callee)
     q, reference = sampler(fix), copying(fix)
     @test in_place(q)
     @test !in_place(reference)
@@ -147,6 +180,35 @@ partition(fix) = prepare_partition_sampler(fix.built, fix.bound, :y, fix.u; by =
     @test partition_value_and_gradient!(sampler, g, fix.u, 2)[1] ==
           partition_value_and_gradient!(reference, g_reference, fix.u, 2)[1]
     @test g == g_reference
+end
+
+# A consumer can see why a slice keeps its copy: the preparation logs it at the
+# debug level (`JULIA_DEBUG=ReactiveKernels`), with the reader and each frame that
+# refused the proof.
+@testset "the preparation log says why a slice keeps its copy" begin
+    # The primal query: the slice is decided there, and no gradient is needed.
+    primal(fix) = ReactiveKernels._kernel_latest_prepared(ReactiveKernelsPPL.prepare_query(
+        fix.built, fix.bound, :sampler; exemplars = (fix.u,)))
+    kept(callee) = begin
+        logs, kernel = Test.collect_test_logs(() -> primal(fixture(callee));
+            min_level = Base.CoreLogging.Debug)
+        (; kernel), filter(log -> log.group === :readonly_slices, logs)
+    end
+    # A write is not the array interface, so the first gate refuses it.
+    q, logs = kept(:writes)
+    @test !in_place(q)
+    @test length(logs) == 1
+    @test occursin("its reader could tell a view from a copy", logs[1].message)
+    @test occursin("writes", string(logs[1].kwargs[:reader]))
+    # The read-only proof names each frame that refused, and its statement.
+    q, logs = kept(:caught)
+    @test !in_place(q)
+    @test length(logs) == 1
+    @test occursin("its reader is not proved to only read it", logs[1].message)
+    @test occursin("caught", logs[1].kwargs[:refused])
+    q, logs = kept(:wave)
+    @test in_place(q)
+    @test isempty(logs)
 end
 
 @testset "$callee keeps its copy and its value" for callee in (:writes, :branches)

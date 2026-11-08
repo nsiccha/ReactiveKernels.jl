@@ -27,6 +27,7 @@
 # - the view's type is concrete and is not the copy's.
 #
 # Anything else keeps the copy, so a refusal costs what the program costs today.
+# `JULIA_DEBUG=ReactiveKernels` logs why a slice keeps its copy (`_readonly_keeps_copy`).
 # A position residual keeps its lane slots (`_lane_source_expr`), and a scan
 # step and a plate nested in a cell keep their own lowering.
 # A slice nested in a call is one recipe with that call and not a slice recipe;
@@ -63,7 +64,24 @@ _readonly_slices_enabled() = get(ENV, "RK_READONLY_SLICES", "1") != "0"
 # derived from it until the value holds no reference. Only reads are known;
 # anything else that meets a derived value refuses, so an IR form this walk does
 # not know costs the copy and never a wrong value.
-const _ReadOnlyMemo = Dict{Tuple{Any,Int},Bool}
+#
+# A frame's verdict on its argument is `:reads` (it only reads it, and returns
+# nothing derived from it), `:returns` (it only reads it, but may return a value
+# derived from it) or `:refuse` (no proof). A caller counts a call's result as
+# derived only when the callee may return one, so a callee that computes a fresh
+# vector from the slice's values and returns it (a vector-valued cell) only reads
+# the slice.
+#
+# The memo holds each frame's verdict, and every frame that refused with the
+# statement it refused at, innermost first, for the preparation log
+# (`_readonly_keeps_copy`).
+struct _ReadOnlyMemo
+    verdicts::Dict{Tuple{Any,Int},Symbol}
+    refusals::Vector{Any}
+end
+_ReadOnlyMemo() = _ReadOnlyMemo(Dict{Tuple{Any,Int},Symbol}(), Any[])
+_readonly_refuse!(memo::_ReadOnlyMemo, @nospecialize(sig), position::Int, @nospecialize(at)) =
+    (push!(memo.refusals, (; sig, position, at)); :refuse)
 
 # Bits values with no pointer: a value of this type cannot reach the argument.
 _readonly_holds_no_reference(@nospecialize(T)) =
@@ -100,51 +118,101 @@ or anything derived from it, stores it, or passes it to code the walk cannot
 read, and the call does not return it. `true` is a proof; `false` means no proof.
 """
 _reads_only(@nospecialize(sig::Type{<:Tuple}), position::Int) =
-    _reads_only!(_ReadOnlyMemo(), sig, position, true)
+    _reads_only!(_ReadOnlyMemo(), sig, position) === :reads
 
-function _reads_only!(memo::_ReadOnlyMemo, @nospecialize(sig), position::Int, entry::Bool)
+# The verdict of the call of signature `sig` on its argument at `position`.
+function _reads_only!(memo::_ReadOnlyMemo, @nospecialize(sig), position::Int)
     key = (sig, position)
-    haskey(memo, key) && return memo[key]
-    # A recursive call adds no sink beyond the ones its frames show.
-    memo[key] = true
-    memo[key] = _reads_only_frame!(memo, sig, position, entry)
+    verdicts = memo.verdicts
+    haskey(verdicts, key) && return verdicts[key]
+    # A recursive call adds no sink beyond the ones its frames show, but its
+    # result may be derived until its frame has been read.
+    verdicts[key] = :returns
+    verdicts[key] = _reads_only_frame!(memo, sig, position)
 end
 
-function _reads_only_frame!(memo::_ReadOnlyMemo, @nospecialize(sig), position::Int, entry::Bool)
+function _reads_only_frame!(memo::_ReadOnlyMemo, @nospecialize(sig), position::Int)
     typed = Base.code_typed_by_type(sig; optimize = true)
-    length(typed) == 1 || return false
+    length(typed) == 1 || return _readonly_refuse!(memo, sig, position, "no unique typed body")
     code = first(only(typed))
-    code isa Core.CodeInfo || return false
-    # A vararg method holds its trailing arguments in one tuple slot.
+    code isa Core.CodeInfo || return _readonly_refuse!(memo, sig, position, "no typed body")
     method = try
         Base._which(sig).method
     catch
-        return false
+        return _readonly_refuse!(memo, sig, position, "no unique method")
     end
-    slot = method.isva && position >= method.nargs ? Int(method.nargs) : position
-    derived = Set{Any}((Core.Argument(slot),))
+    derived = _readonly_argument_roots(code, method, position)
     changed = true
     while changed
         changed = false
         for (i, statement) in enumerate(code.code)
-            verdict = _reads_only_statement!(memo, code, i, statement, derived, entry)
-            verdict === :refuse && return false
+            verdict = _reads_only_statement!(memo, code, i, statement, derived)
+            verdict === :refuse && return _readonly_refuse!(memo, sig, position,
+                (; statement = Core.SSAValue(i), code = statement))
             if verdict === :derived && !(Core.SSAValue(i) in derived)
                 push!(derived, Core.SSAValue(i))
                 changed = true
             end
         end
     end
-    return true
+    returns = any(s -> s isa Core.ReturnNode && isdefined(s, :val) && s.val in derived, code.code)
+    return returns ? :returns : :reads
 end
 
-function _reads_only_statement!(memo, code::Core.CodeInfo, i::Int, statement, derived, entry::Bool)
+# The values the walk starts from: the argument at `position`. A vararg method
+# holds its trailing arguments in one tuple slot. When the body reads that tuple
+# only by constant `getfield`, as a forwarding shim does (`_KernelSource`, the
+# callable of every authored cell call), the walk starts from the reads of the one
+# element at `position`, and the tuple's other elements are the frame's other
+# arguments, as a fixed-arity method's are. Tracking the whole tuple instead made
+# every array argument of the call count as the slice, so a callee that passed
+# another array to BLAS (`correlation * raw`) kept the slice's copy. Any other
+# use of the tuple (a splat, a dynamic index, the tuple itself) tracks it whole.
+function _readonly_argument_roots(code::Core.CodeInfo, method::Method, position::Int)
+    nargs = Int(method.nargs)
+    method.isva && position >= nargs || return Set{Any}((Core.Argument(position),))
+    slot = Core.Argument(nargs)
+    element = position - nargs + 1
+    roots = Set{Any}()
+    for (i, statement) in enumerate(code.code)
+        _readonly_mentions(statement, slot) || continue
+        k = _readonly_tuple_element(statement, slot)
+        k === nothing && return Set{Any}((slot,))
+        k == element && push!(roots, Core.SSAValue(i))
+    end
+    roots
+end
+
+# The constant index of a statement `getfield(slot, k)` (with or without its
+# bounds-check flag), else `nothing`.
+function _readonly_tuple_element(@nospecialize(statement), slot::Core.Argument)
+    statement isa Expr && statement.head === :call || return nothing
+    args = statement.args
+    length(args) in (3, 4) && args[2] === slot && args[3] isa Int &&
+        _readonly_callee(args[1]) === Core.getfield || return nothing
+    length(args) == 3 || args[4] isa Bool || return nothing
+    args[3]::Int
+end
+
+# Whether an optimized IR statement uses `slot` anywhere.
+_readonly_mentions(@nospecialize(x), slot::Core.Argument) = x === slot
+_readonly_mentions(x::Expr, slot::Core.Argument) = any(a -> _readonly_mentions(a, slot), x.args)
+_readonly_mentions(x::Core.ReturnNode, slot::Core.Argument) =
+    isdefined(x, :val) && _readonly_mentions(x.val, slot)
+_readonly_mentions(x::Core.PiNode, slot::Core.Argument) = _readonly_mentions(x.val, slot)
+_readonly_mentions(x::Core.GotoIfNot, slot::Core.Argument) = _readonly_mentions(x.cond, slot)
+_readonly_mentions(x::Core.UpsilonNode, slot::Core.Argument) =
+    isdefined(x, :val) && _readonly_mentions(x.val, slot)
+_readonly_mentions(x::Union{Core.PhiNode,Core.PhiCNode}, slot::Core.Argument) =
+    any(k -> isassigned(x.values, k) && _readonly_mentions(x.values[k], slot), eachindex(x.values))
+
+function _reads_only_statement!(memo, code::Core.CodeInfo, i::Int, statement, derived)
     is_derived(x) = x in derived
     result(any_derived) = any_derived && !_readonly_holds_no_reference(
         Core.Compiler.widenconst(code.ssavaluetypes[i])) ? :derived : :clean
     if statement isa Core.ReturnNode
-        # A nested frame's result is tracked by its caller.
-        return entry && isdefined(statement, :val) && is_derived(statement.val) ? :refuse : :clean
+        # What a frame returns is its verdict (`_reads_only_frame!`).
+        return :clean
     elseif statement isa Core.PhiNode
         values = statement.values
         return result(any(k -> isassigned(values, k) && is_derived(values[k]), eachindex(values)))
@@ -164,8 +232,9 @@ function _reads_only_statement!(memo, code::Core.CodeInfo, i::Int, statement, de
             mi = _readonly_method_instance(args[1])
             uses = [k for k in 2:length(args) if is_derived(args[k])]
             isempty(uses) && return :clean
-            all(k -> _reads_only!(memo, mi.specTypes, k - 1, false), uses) || return :refuse
-            return result(true)
+            verdicts = [_reads_only!(memo, mi.specTypes, k - 1) for k in uses]
+            any(==(:refuse), verdicts) && return :refuse
+            return result(any(==(:returns), verdicts))
         elseif statement.head === :call
             any(is_derived, @view args[2:end]) || return :clean
             f = _readonly_callee(args[1])
@@ -384,59 +453,95 @@ function _readonly_cell_slices(p::Plan, r::Recipe, types)
         form = _readonly_slice_form(q)
         form === nothing && continue
         slice = canon_id(cell_graph, only(q.outputs).id)
-        slice in result && continue
-        canon_id(cell_graph, q.inputs[form.array].id) in bound_ports && continue
+        slice in result && (_readonly_keeps_copy(q, "the slice is the cell's result"); continue)
+        canon_id(cell_graph, q.inputs[form.array].id) in bound_ports &&
+            (_readonly_keeps_copy(q, "its array is bound data (`bound=`)"); continue)
         types_of_q = input_types(q)
         A = types_of_q[form.array]
-        A isa Type && isconcretetype(A) && A <: AbstractArray && isbitstype(eltype(A)) || continue
+        A isa Type && isconcretetype(A) && A <: AbstractArray && isbitstype(eltype(A)) ||
+            (_readonly_keeps_copy(q, "its array's type is not a concrete array of bits " *
+                "values (a preparation without `exemplars` types none)"; array = A); continue)
         index_types = Any[_readonly_part_type(part, types_of_q) for part in form.parts]
-        all(T -> T isa Type && isconcretetype(T), index_types) || continue
+        all(T -> T isa Type && isconcretetype(T), index_types) ||
+            (_readonly_keeps_copy(q, "an index type is not concrete"; index_types); continue)
+        # A scalar read is a number, not a slice.
         all(T -> T <: Integer, index_types) && continue
         copied = get(cell_types, slice, Any)
         viewed = Core.Compiler.return_type(_readonly_slice, Tuple{A,index_types...})
         copied isa Type && isconcretetype(copied) && isconcretetype(viewed) &&
-            viewed !== copied || continue
+            viewed !== copied || (_readonly_keeps_copy(q, "the copy's or the view's type is " *
+                "not concrete, or they are one type"; copied, viewed); continue)
         readers = [reader for reader in inner.recipes
                    if any(v -> canon_id(cell_graph, v.id) == slice, reader.inputs)]
         isempty(readers) && continue
-        all(reader -> _readonly_reader(reader, input_types(reader), slice, cell_graph,
-                                       viewed, copied), readers) && push!(marked, q.id)
+        refusal = nothing
+        for reader in readers
+            refusal = _readonly_reader(reader, input_types(reader), slice, cell_graph,
+                                       viewed, copied)
+            refusal === nothing || (_readonly_keeps_copy(q, refusal.why;
+                reader = _lane_strip_lines(reader.source), viewed,
+                refused = _readonly_refusals_text(refusal.frames)); break)
+        end
+        refusal === nothing && push!(marked, q.id)
     end
     marked
 end
 
+# The preparation log's account of a slice that keeps its copy, for a reader who
+# expected a view: `JULIA_DEBUG=ReactiveKernels` shows it. Logging macros evaluate
+# their values only when the level is enabled, so this costs nothing otherwise.
+_readonly_keeps_copy(q::Recipe, why::String; detail...) =
+    @debug "ReactiveKernels: a plate cell keeps its copy of a slice: $why" slice =
+        _lane_strip_lines(q.source) detail... _group = :readonly_slices
+
+# Each frame that refused the proof, innermost first: its signature, the argument
+# the walk followed, and the statement of its optimized code it refused at.
+_readonly_refusals_text(frames) = join((string("argument ", frame.position, " of ",
+    frame.sig, ": ", frame.at isa String ? frame.at :
+        string(frame.at.statement, " = ", frame.at.code)) for frame in frames), "\n")
+
 # Whether `reader`, an authored call or an exact bare call (whose operation is the
 # function itself), only reads the value `slice` over `viewed`, cannot tell it from
-# `copied`, and computes the same concrete type of result over both.
+# `copied`, and computes the same concrete type of result over both: `nothing` when
+# it does, else why not (`why`) and the frames that refused the proof (`frames`).
 function _readonly_reader(reader::Recipe, input_types, slice, cell_graph,
                           @nospecialize(viewed), @nospecialize(copied))
-    length(reader.outputs) == 1 || return false
-    all(T -> T isa Type, input_types) || return false
+    refuse(why) = (; why, frames = ())
+    length(reader.outputs) == 1 || return refuse("its reader has several outputs")
+    all(T -> T isa Type, input_types) || return refuse("its reader's input types are unknown")
     op = reader.op
     positions = [k for (k, v) in enumerate(reader.inputs) if canon_id(cell_graph, v.id) == slice]
     seen = Set{Any}()
     f = if op isa _KernelSourceOp
-        getfield(op, :f) isa _KernelBranch && return false
+        getfield(op, :f) isa _KernelBranch && return refuse("its reader is a branch")
         closure = _lane_source_closure(reader)
-        closure === nothing && return false
+        closure === nothing && return refuse("its reader's source has captures")
         _, params, mod = closure
         source = _lane_strip_lines(reader.source)
         all(k -> _source_reads_through_interface(source, params[k], mod, viewed, copied, seen),
-            positions) || return false
+            positions) || return refuse("its reader could tell a view from a copy " *
+                "(it uses the slice other than through the array interface)")
         _lane_source_callable(getfield(op, :f))
     elseif op isa Function
         all(k -> _reads_through_interface(op, k, length(input_types), viewed, copied, seen),
-            positions) || return false
+            positions) || return refuse("its reader could tell a view from a copy " *
+                "(it uses the slice other than through the array interface)")
         op
     else
-        return false
+        return refuse("its reader is not a call")
     end
     over(T) = Tuple{Any[k in positions ? T : input_types[k] for k in eachindex(input_types)]...}
     result = Core.Compiler.return_type(f, over(viewed))
-    isconcretetype(result) && result === Core.Compiler.return_type(f, over(copied)) || return false
+    isconcretetype(result) && result === Core.Compiler.return_type(f, over(copied)) ||
+        return refuse("its reader does not infer one concrete result type over the view " *
+            "and the copy")
     signature = Tuple{typeof(f), over(viewed).parameters...}
     memo = _ReadOnlyMemo()
-    all(k -> _reads_only!(memo, signature, k + 1, true), positions)
+    verdicts = [_reads_only!(memo, signature, k + 1) for k in positions]
+    all(==(:reads), verdicts) && return nothing
+    any(==(:refuse), verdicts) || return refuse("its reader may return the slice, or a " *
+        "value that holds it")
+    (; why = "its reader is not proved to only read it (`_reads_only`)", frames = memo.refusals)
 end
 
 # The statement that reads the slice in place: `_readonly_slice(A, i...)` over the
