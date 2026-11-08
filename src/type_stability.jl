@@ -302,6 +302,15 @@ end
 _type_stability_choices(::Val{:type_stability}) = (:warn, :error)
 _type_stability_choices(::Val{:type_stability_level}) = (:all, :rk, :values)
 _type_stability_choices(::Val{:cell_locality}) = (:warn, :error, :ignore)
+# - `branch_arms`: which arms of a data-bound plate branch a binding prepares
+#   (snag `sampler-type-dif-ea945700`, user decision `0rxpyqg`: opt-in).
+#   `:taken`, the default, prepares a plate per arm some lane takes, so the
+#   program follows which arms a binding's lanes take. `:all` prepares every
+#   arm, over no lanes for an arm none takes, so one program serves every
+#   binding, and differentiates a plate program over many cells through its
+#   call (`_inline_plate_programs`); a small censored model pays per call for
+#   its arms no lane takes.
+_type_stability_choices(::Val{:branch_arms}) = (:taken, :all)
 
 function _type_stability_choice(setting::Val{S}, value) where {S}
     choices = _type_stability_choices(setting)
@@ -317,7 +326,7 @@ end
 # `__init__` forgets values read while an image was generated.
 const _TYPE_STABILITY_PREFERENCES =
     (Ref{Union{Nothing,Symbol}}(nothing), Ref{Union{Nothing,Symbol}}(nothing),
-     Ref{Union{Nothing,Symbol}}(nothing))
+     Ref{Union{Nothing,Symbol}}(nothing), Ref{Union{Nothing,Symbol}}(nothing))
 _type_stability_preference_cache(::Val{:type_stability}) = _TYPE_STABILITY_PREFERENCES[1]
 _type_stability_preference_cache(::Val{:type_stability_level}) =
     _TYPE_STABILITY_PREFERENCES[2]
@@ -325,6 +334,7 @@ _type_stability_preference_cache(::Val{:type_stability_level}) =
 # and cached the same way.
 _type_stability_preference_cache(::Val{:cell_locality}) = _TYPE_STABILITY_PREFERENCES[3]
 _cell_locality_preference() = _type_stability_preference(Val(:cell_locality))
+_type_stability_preference_cache(::Val{:branch_arms}) = _TYPE_STABILITY_PREFERENCES[4]
 
 function _type_stability_preference(setting::Val{S}) where {S}
     cache = _type_stability_preference_cache(setting)
@@ -342,6 +352,7 @@ end
 # makes, nested ones included (a child kernel's, a bound residual's).
 _type_stability_scope(::Val{:type_stability}) = :ReactiveKernels_type_stability
 _type_stability_scope(::Val{:type_stability_level}) = :ReactiveKernels_type_stability_level
+_type_stability_scope(::Val{:branch_arms}) = :ReactiveKernels_branch_arms
 
 # A setting of the preparation in progress: the innermost enclosing keyword,
 # else the preference.
@@ -350,6 +361,11 @@ _type_stability_setting(setting::Val) = get(() -> _type_stability_preference(set
                                             _type_stability_scope(setting))
 _type_stability() = _type_stability_setting(Val(:type_stability))
 _type_stability_level() = _type_stability_setting(Val(:type_stability_level))
+_branch_arms() = _type_stability_setting(Val(:branch_arms))
+_all_branch_arms() = _branch_arms() === :all
+# `f()` with every preparation inside it given `branch_arms`; `nothing` keeps
+# the enclosing setting.
+_with_branch_arms(f, value) = _with_type_stability_setting(f, Val(:branch_arms), value)
 
 # `f()` with every preparation inside it checked with the given settings;
 # `nothing` keeps the enclosing one.

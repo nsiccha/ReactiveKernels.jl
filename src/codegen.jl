@@ -4462,6 +4462,9 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         has_cells = Expr(:call, GlobalRef(Base, :!),
             Expr(:call, GlobalRef(Base, :isempty),
                 Expr(:call, GlobalRef(Base, :CartesianIndices), output_axes)))
+        # With `branch_arms = :all` a gradient may differentiate the program
+        # through its call (`_inline_plate_programs`), which needs its axes.
+        program_axes = _all_branch_arms() ? output_axes : nothing
         if program
             prepend!(execution.args, carried)
             if deferred !== nothing
@@ -4472,11 +4475,11 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         if nonempty || isempty(invariants.args)
             program ? push!(body.args, _plate_block(execution,
                                                     nonempty ? nothing : has_cells,
-                                                    output_axes)) :
+                                                    program_axes)) :
                 append!(body.args, execution.args)
         else
             push!(body.args, Expr(:if, has_cells,
-                program ? _plate_block(execution, nothing, output_axes) : execution))
+                program ? _plate_block(execution, nothing, program_axes) : execution))
         end
     end
     # Fallback runtime narrowing of the pointwise container. `plate_eltype`
@@ -8575,12 +8578,15 @@ nested ones included, and cached preparations are kept per setting.
 """
 function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
                  exemplars = nothing, type_stability = nothing,
-                 type_stability_level = nothing, _data_cache = nothing)
-    _with_type_stability(type_stability, type_stability_level) do
-        kernel = _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
-                               exemplars, _data_cache)
-        _check_uninferred_values(kernel)
-        kernel
+                 type_stability_level = nothing, branch_arms = nothing,
+                 _data_cache = nothing)
+    _with_branch_arms(branch_arms) do
+        _with_type_stability(type_stability, type_stability_level) do
+            kernel = _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
+                                   exemplars, _data_cache)
+            _check_uninferred_values(kernel)
+            kernel
+        end
     end
 end
 
@@ -8644,16 +8650,19 @@ end
 
 function prepare(g::Graph; have = (), want = (), passes = (), bound = (),
                  on_error = nothing, exemplars = nothing, type_stability = nothing,
-                 type_stability_level = nothing, _data_cache = nothing)
+                 type_stability_level = nothing, branch_arms = nothing,
+                 _data_cache = nothing)
     # One type for every selection's width before the closure captures them.
     haves, wants, binding = _value_list(have), _value_list(want), _bound_list(bound)
-    _with_type_stability(type_stability, type_stability_level) do
-        exemplars === nothing && _reuses_bound_preparation(binding, passes) &&
-            return _graph_bound_preparation(g, haves, wants, passes, binding, on_error;
+    _with_branch_arms(branch_arms) do
+        _with_type_stability(type_stability, type_stability_level) do
+            exemplars === nothing && _reuses_bound_preparation(binding, passes) &&
+                return _graph_bound_preparation(g, haves, wants, passes, binding, on_error;
+                    _data_cache)
+            p = plan(g; have = haves, want = wants)
+            prepare(p; passes = passes, bound = binding, on_error = on_error, exemplars,
                 _data_cache)
-        p = plan(g; have = haves, want = wants)
-        prepare(p; passes = passes, bound = binding, on_error = on_error, exemplars,
-            _data_cache)
+        end
     end
 end
 

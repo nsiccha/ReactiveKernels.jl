@@ -92,16 +92,12 @@ end
         C.arm_calls[] = 0
         @test bound(x) ≈ reference_guarded(x, y)
         @test C.arm_calls[] == count(>(0), y)
-        # Lanes that all take one arm keep both arm plates, the other over no
-        # lanes, so the program is the one a mixed binding prepares.
+        # A one-sided condition selects its arm statically: one plate, no branch.
         ypos = abs.(y) .+ 0.5
         one = prepare(C.guarded; have = (:x, :y), want = :total, bound = (; y = ypos))
-        @test length(plates(one.plan)) == 2
-        @test !any(r -> has_branch(plate_body(r)), plates(one.plan))
-        @test typeof(one) == typeof(bound)
-        C.arm_calls[] = 0
+        @test length(plates(one.plan)) == 1
+        @test !has_branch(plate_body(only(plates(one.plan))))
         @test one(x) ≈ reference_guarded(x, ypos)
-        @test C.arm_calls[] == length(x)
     end
 
     @testset "a taken arm's shared work runs once per call" begin
@@ -114,16 +110,13 @@ end
         @test C.arm_calls[] == 1
         ypos = abs.(y) .+ 0.5
         one = prepare(C.guarded_counted_shared; have, want = :total, bound = (; y = ypos))
-        @test length(plates(one.plan)) == 2
-        @test typeof(one) == typeof(bound)
+        @test length(plates(one.plan)) == 1
         C.arm_calls[] = 0
         @test one(x, 2.5) ≈ ref(x, ypos, 2.5)
         @test C.arm_calls[] == 1
-        # No lane takes the arm: its plate has no lanes and its shared work is
-        # not evaluated, even where it would throw (`log(-1.0)`).
+        # No lane takes the arm: its shared work is not evaluated.
         yneg = -abs.(y)
         none = prepare(C.guarded_counted_shared; have, want = :total, bound = (; y = yneg))
-        @test typeof(none) == typeof(bound)
         C.arm_calls[] = 0
         @test none(x, -1.0) ≈ ref(x, yneg, 1.0)
         @test C.arm_calls[] == 0
@@ -286,13 +279,11 @@ end
         pointwise = prepare(C.constant_fallback; have = (:x, :y),
                             want = :pointwise, bound = (; y))
         @test pointwise(x) ≈ [yi > 0 ? xi * yi : 1.0 for (xi, yi) in zip(x, y)]
-        # All lanes take the constant arm, still per lane; the other arm's
-        # plate has no lanes.
+        # All lanes take the constant arm: selected statically, still per lane.
         yneg = -abs.(y)
         allconst = prepare(C.constant_fallback; have = (:x, :y), want = :total,
                            bound = (; y = yneg))
-        @test length(plates(allconst.plan)) == 2
-        @test typeof(allconst) == typeof(bound)
+        @test length(plates(allconst.plan)) == 1
         @test allconst(x) ≈ length(x)
     end
 
@@ -325,12 +316,13 @@ end
     end
 end
 
-# One program serves every binding of a data-bound branch, whichever arms its
-# lanes take, an empty domain included: an arm no lane takes is a plate over no
-# lanes. A prepared type that followed the outcomes made another binding of the
+# With `branch_arms = :all`, one program serves every binding of a data-bound
+# branch, whichever arms its lanes take, an empty domain included: an arm no
+# lane takes is a plate over no lanes (RK 0.1.115). A prepared type that followed the outcomes made another binding of the
 # same program compile again (snag `sampler-type-dif-ea945700`: censored soil
 # rows that were all detected, or all censored, recompiled ODL's sampler).
 @testset "one prepared type whichever arms the lanes take" begin
+    prepare = (args...; kwargs...) -> ReactiveKernels.prepare(args...; branch_arms = :all, kwargs...)
     C = BranchPartition
     RK = ReactiveKernels
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
@@ -420,6 +412,18 @@ end
         @test value ≈ chained(xs, obs)
         @test gradient ≈ [o ? yi - (m + sqrt(xi)) : 0.0
                           for (m, xi, yi, o) in zip(mu, xs, yc, obs)]
+    end
+    # By default a binding whose lanes all take one arm prepares its own
+    # program, as before 0.1.115; a value other than `:taken` or `:all` is
+    # refused.
+    let x = [0.5, 1.5, 2.0], y = [1.0, -2.0, 0.5]
+        own = ReactiveKernels.prepare(C.guarded; have = (:x, :y), want = :total,
+                                      bound = (; y = abs.(y)))
+        mixed = ReactiveKernels.prepare(C.guarded; have = (:x, :y), want = :total,
+                                        bound = (; y))
+        @test typeof(own) != typeof(mixed)
+        @test_throws ArgumentError ReactiveKernels.prepare(C.guarded; have = (:x, :y),
+            want = :total, bound = (; y), branch_arms = :some)
     end
 end
 
@@ -539,13 +543,11 @@ end
         C.arm_calls[] = 0
         @test k(m) == -Inf
         @test C.arm_calls[] == 0
-        mixed_type = typeof(k)
         allvalid = abs.(scales) .+ 0.25
         C.arm_calls[] = 0
         k = prepare(C.guarded_lane_scale; have = (:y, :m, :s), want = :total,
                     bound = (; y, s = allvalid))
         @test C.arm_calls[] == length(y)
-        @test typeof(k) == mixed_type
         C.arm_calls[] = 0
         @test k(m) ≈ sum(nlogpdf(yi, m, si) for (yi, si) in zip(y, allvalid))
         value, gradient = reverse_gradient(k, m)
@@ -564,19 +566,11 @@ end
         C.arm_calls[] = 0
         @test k(m) ≈ expected
         @test C.arm_calls[] == 0
-        mixed_type = typeof(k)
-        # No lane takes the arm, so even an invalid scale is never read: the
-        # arm's plate has no lanes and its `log(s)` is not evaluated. The
-        # program is still the mixed binding's.
+        # No lane takes the arm, so even an invalid scale is never read.
         C.arm_calls[] = 0
         k = prepare(C.missing_guard_scale; have = (:y, :m, :s, :g), want = :total,
                     bound = (; y, s = -1.0, g = ones(Int, length(y))))
-        @test C.arm_calls[] == 0
         @test k(m) == 0.0
-        @test C.arm_calls[] == 0
-        @test typeof(k) == mixed_type
-        value, gradient = reverse_gradient(k, m)
-        @test (value, gradient) == (0.0, 0.0)
         @test C.arm_calls[] == 0
 
         # The cell's shape follows the program, not the number of lanes.

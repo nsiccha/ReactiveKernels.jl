@@ -1219,14 +1219,18 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     # bound inputs. Without a bound domain, retain its per-cell execution.
     isempty(arguments) && return nothing
 
-    # A known empty domain is rewritten as a nonempty one is, so that one
-    # program's prepared type does not depend on whether its data has cells (a
-    # data-bound branch arm no lane takes, or an empty likelihood). It
-    # evaluates nothing: its per-cell values are empty and a value shared by
-    # every cell is a typed placeholder (`_empty_domain_shared`) that no cell
-    # reads, as the original plate visits no cell and skips its shared work.
+    # With `branch_arms = :all`, a known empty domain is rewritten as a
+    # nonempty one is, so that one program's prepared type does not depend on
+    # whether its data has cells (a data-bound branch arm no lane takes, or an
+    # empty likelihood). It evaluates nothing: its per-cell values are empty
+    # and a value shared by every cell is a typed placeholder
+    # (`_empty_domain_shared`) that no cell reads, as the original plate visits
+    # no cell and skips its shared work. Otherwise a known empty domain has no
+    # data-dependent cells to evaluate, and keeping the original plate also
+    # preserves its empty-result typing and error behavior.
     bound_axes = _partial_bound_axes(bound_arguments)
     empty_domain = any(isempty, bound_axes)
+    empty_domain && !_all_branch_arms() && return nothing
     fixed_domain = all(enumerate(recipe.inputs)) do (index, input)
         index in atomic_inputs || haskey(known, canon_id(g, input.id)) ||
             _partial_plate_live_domain(valtype(input), bound_axes)
@@ -1527,14 +1531,19 @@ vector, and Base's `vcat` of it beside a live arm of the same element type
 can fail native Enzyme reverse (`EnzymeRuntimeActivityError`,
 docs/src/constraints.md).
 """
-struct _LaneAssemble end
+struct _LaneAssemble{W} end
+_LaneAssemble() = _LaneAssemble{false}()
 # `Vararg{Any,N}` specializes on the arm count; an unspecialized `parts...`
 # left `vcat(parts...)` a run-time `Core._apply_iterate` call in every
 # evaluation of a partitioned plate.
-# When one arm holds every lane, its lanes are `1:n` in order (arm lanes are
-# sorted), so `order` is the identity and the concatenation is the result: a
-# binding whose lanes all take one arm pays no gather.
-function (::_LaneAssemble)(order, parts::Vararg{Any,N}) where {N}
+# With `branch_arms = :all` (`_LaneAssemble{true}`), one arm can hold every
+# lane: its lanes are then `1:n` in order (arm lanes are sorted), so `order` is
+# the identity and the concatenation is the result, and a binding whose lanes
+# all take one arm pays no gather. Otherwise an arm no lane takes has no plate,
+# so no part holds every lane.
+(::_LaneAssemble{false})(order, parts::Vararg{Any,N}) where {N} =
+    _native_vcat(parts...)[order]
+function (::_LaneAssemble{true})(order, parts::Vararg{Any,N}) where {N}
     joined = _native_vcat(parts...)
     _lane_whole_part(length(order), parts...) ? joined : joined[order]
 end
@@ -1563,6 +1572,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     atomic_inputs = typeof(op).parameters[2]
     inner = _plate_cell_kernel(op).plan
     length(inner.have) == length(recipe.inputs) || return nothing
+    all_arms = _all_branch_arms()
     length(inner.want) == 1 || return nothing
     _plate_cell_ops_length(op) == length(inner.recipes) || return nothing
     length(recipe.outputs) == 1 || return nothing
@@ -1585,7 +1595,8 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
         cid = canon_id(g, outer.id)
         if !haskey(known, cid)
-            k = index in atomic_inputs ? nothing : get(lane_lengths, cid, nothing)
+            k = index in atomic_inputs || !all_arms ? nothing :
+                get(lane_lengths, cid, nothing)
             if k === nothing
                 index in atomic_inputs || valtype(outer) <: Number ||
                     (unknown_axis = true)
@@ -1621,6 +1632,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     # an unbound lane array could determine a larger domain.
     n === nothing && singleton_axis && !unknown_axis && (n = 1)
     n === nothing && return nothing
+    n == 0 && !all_arms && return nothing
 
     # The first branch recipe whose condition reads bound data only.
     target = nothing
@@ -1651,7 +1663,9 @@ Base.@nospecializeinfer function _partition_plate_recipe(
             pred ? [(:then, collect(1:n))] : [(:else, collect(1:n))]
         else
             pred isa AbstractVector{Bool} && length(pred) == n || return nothing
-            [(:then, findall(pred)), (:else, findall(!, pred))]
+            # With `branch_arms = :taken`, only an arm some lane takes is a plate.
+            taken = [(:then, findall(pred)), (:else, findall(!, pred))]
+            all_arms ? taken : filter(arm -> !isempty(last(arm)), taken)
         end
     end
 
@@ -1831,7 +1845,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
         0.0, nothing, false))
     known[canon_id(g, order_value.id)] = order
     push!(expansion, Recipe(fresh(), (order_value, arm_outputs...), (pointwise,),
-        _LaneAssemble(), 0.0, nothing, false))
+        _LaneAssemble{all_arms}(), 0.0, nothing, false))
     (; expansion, rewrite = nothing)
 end
 

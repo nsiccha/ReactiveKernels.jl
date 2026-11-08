@@ -738,11 +738,7 @@ or a bound-only cell value that the pass has already evaluated per lane.
 
 1. The condition is evaluated once per lane, and the lanes are grouped by
    outcome.
-2. The plate becomes one plate per arm, each over that arm's lanes. An arm
-   that no lane takes is a plate over no lanes, so the prepared program
-   follows the cell and not this binding's outcomes: data that moves every
-   lane into one arm, or an empty domain, keeps the type of a binding whose
-   lanes take both arms.
+2. The plate becomes one plate per taken arm, each over that arm's lanes.
 3. The plate's arguments follow the arm's lanes:
    - bound arguments are gathered during preparation;
    - live arguments are gathered at run time by constant lane indices; native
@@ -768,8 +764,7 @@ own as described below) that holds work over shared plate arguments or bound
 values becomes that graph's recipes in its plate, as in the native
 shared-condition lowering. Its work over a live shared argument therefore runs
 once per call, above the lane loop, and only when some lane takes the arm. Its
-work over bound values runs at preparation, on the arm's lanes only, and not
-at all for an arm without lanes: under
+work over bound values runs at preparation, on the arm's lanes only: under
 `noise > 0 ? normal(mu, noise).logpdf(y) : -Inf` with `noise` and `y` bound,
 `log(noise)` is one value of the binding, read at run time like any other bound
 value, and a nonpositive `noise` takes the fallback arm without evaluating it.
@@ -785,15 +780,37 @@ receives one:
 - every lane evaluates exactly the arm it takes;
 - gathers inside an arm are in bounds by construction.
 
-An empty bound domain has no lanes to group. It is split like any other, into
-arm plates over no lanes, and evaluates no per-lane condition and no cell. Its
-result is empty, with the element type inferred from the authored native cell,
-as in Julia's empty broadcast.
+An empty bound domain has no lanes to group. It runs no cell and evaluates no
+condition. Its result is empty, with the element type inferred from the
+authored native cell, as in Julia's empty broadcast.
 
-The number of arm plates is fixed by the cell's branch structure, never by
-the data. A lane-invariant condition, one that reads bound numbers alone,
-still selects its arm statically, so another value of such a number that
-selects the other arm prepares another program. A condition that reads a live value stays an ordinary lazy branch.
+So by default the prepared program follows this binding's outcomes: data that
+moves every lane into one arm, or an empty domain, prepares another program
+than a binding whose lanes take both arms. With `branch_arms = :all` (from
+ReactiveKernels 0.1.115, opt-in) every arm is a plate, over no lanes for an arm
+no lane takes, and an empty domain is split too, so one program serves every
+binding of a cell: an RKPPL censored response keeps one sampler type whether
+its rows are all observed, all censored, mixed or absent. An arm without lanes
+evaluates nothing: it calls no plate program, its shared work stays behind its
+plate's nonempty guard, and its work over bound values is not run at
+preparation. An arm of one lane splits a nested branch as arms of more lanes
+or none do. The setting is the `[ReactiveKernels]` preference `branch_arms`
+(`"taken"`, the default, or `"all"`) in a project's `LocalPreferences.toml`,
+read at the first preparation of a process, or `prepare`'s `branch_arms`
+keyword (`:taken` or `:all`), which governs every preparation inside it. Under
+`:all` a gradient also differentiates a plate program over 64 cells or more
+through its call, so its loop vectorizes, and a smaller one inline.
+
+The arms no lane takes cost a small model each call: gordito, an RKPPL censored
+response over 10 rows, all observed, took 48 ns per density and 171 ns per
+sampler gradient against 31 and 82 ns by default, and over 200 rows 106 ns and
+613 ns against 60 and 482 ns. Over 2000 rows the cost vanishes, and several
+likelihoods over 2000 rows each take 28–33% less per gradient. Every arm is
+compiled: a first gradient of that model over 200 rows took 29.5 s against
+14.7 s.
+
+The number of arm plates is bounded by the cell's branch structure, never by
+the data. A condition that reads a live value stays an ordinary lazy branch.
 This includes the shape of a live array, such as `length(c)` of a runtime
 input. Only one-dimensional plate domains are split.
 
