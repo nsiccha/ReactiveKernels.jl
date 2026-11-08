@@ -1110,6 +1110,15 @@ function _decompose_traceable_recipe!(prog::_StepProgram, op, callargs,
     (stmts, d[2])
 end
 
+# The cache slots a program reads.
+function _nonalloc_cache_reads!(slots::Set{Int}, node)
+    node isa Expr || return slots
+    j = _table_slot(node, _CACHES_ARG)
+    j === nothing ? foreach(arg -> _nonalloc_cache_reads!(slots, arg), node.args) :
+        push!(slots, j)
+    slots
+end
+
 function _nonalloc_mentions!(names::Set{Symbol}, node)
     if node isa Symbol
         push!(names, node)
@@ -1206,6 +1215,18 @@ function _nonallocating_program(p::Plan; have_types = nothing,
     body = Expr(:block)
     for stmt in ast.args[2].args
         append!(body.args, _nonalloc_statement!(prog, recipes, types, stmt))
+    end
+    # The same stable forms as `prepare` (`stable_rewrites.jl`). After the step
+    # rule, whose decomposition spells out the fused sources `prepare` inlines:
+    # the pass reads a composition or a branch's arm only from its expression.
+    if _simplify()
+        body = _stable_rewrites(Expr(:function, ast.args[1], body),
+            (recipes..., prog.ops[length(recipes)+1:end]...)).args[2]
+        # A step it removed holds no buffer.
+        read = _nonalloc_cache_reads!(Set{Int}(), body)
+        for j in eachindex(prog.caches)
+            j in read || (prog.caches[j] = nothing)
+        end
     end
     # A value the native lowering never materializes (a summed plate, a scan
     # streamed into its plate, a row computed in a cell) leaves its lane unused.

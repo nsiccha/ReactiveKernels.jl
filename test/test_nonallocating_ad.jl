@@ -761,3 +761,32 @@ end
     @test ReactiveKernels._ad_na_arith_loop!(slot, -, [1.0, 1.0], [2.0, 2.0]) == [-1.0, -1.0]
     @test slot[] === buffer
 end
+
+# A dotted composition's stable form is what the differentiated program runs:
+# the same gradient as `prepare` where `exp` overflows, and a step the rewrite
+# removed (`a` below) needs no seeding.
+@kernel naad_stable_fused(x::Vector{Float64}) = begin
+    out = log.(exp.(x))
+    return sum(out)
+end
+@kernel naad_stable_dotted(x::Vector{Float64}) = begin
+    a = exp.(x)
+    b = log.(a)
+    return sum(b)
+end
+@testset "prepare_ad over stable rewrites of a NonAllocatingKernel" begin
+    x = [800.0, -800.0, 1.5]
+    for spec in (naad_stable_fused, naad_stable_dotted)
+        prep = prepare_ad(prepare(spec), NA_AD_BACKEND, x; active = :x)
+        prepna = prepare_ad(prepare_nonallocating(spec, x), NA_AD_BACKEND, x; active = :x)
+        literal = prepare_ad(prepare_nonallocating(spec, x; simplify = false),
+                             NA_AD_BACKEND, x; active = :x)
+        g, gna, gliteral = zero(x), zero(x), zero(x)
+        v, _ = ad_value_and_gradient!(prep, g, x)
+        vna, _ = ad_value_and_gradient!(prepna, gna, x)
+        vliteral, _ = ad_value_and_gradient!(literal, gliteral, x)
+        @test isequal(vna, v) && vna == 1.5
+        @test isequal(gna, g) && gna == [1.0, 1.0, 1.0]
+        @test isnan(vliteral) && any(isnan, gliteral)
+    end
+end

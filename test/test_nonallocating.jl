@@ -1,5 +1,6 @@
 using ReactiveKernels
 using MutatingFunctions
+using ReactiveKernels: LogExpFunctions
 using LinearAlgebra: I
 using Test
 
@@ -694,4 +695,59 @@ end
                        @allocated plain([3.0, 3.0, 3.0], dval))
     bound_allocated = kernel_allocations(bound, [3.0, 3.0, 3.0])
     @test bound_allocated <= plain_allocated
+end
+
+# `prepare_nonallocating` computes the stable forms `prepare` does
+# (`stable_rewrites.jl`), and `simplify = false` in scope keeps the written form.
+# Each spelling the step rule keeps differently from `prepare`: a top-level
+# statement, a fused source that decomposes (a composition, a branch), a fused
+# dotted call and two dotted statements, which fill buffers.
+@kernel na_stable_roundtrip(u::Float64) = begin
+    a = exp(u)
+    b = log(a)
+    return LogExpFunctions.log1pexp(-b)
+end
+@kernel na_stable_sigmoid(u::Float64) = begin
+    theta = 1 / (1 + exp(-u))
+    a = log(theta)
+    b = log1p(-theta)
+    return a + b
+end
+@kernel na_stable_guard(u::Float64) = begin
+    s = exp(u)
+    logged = s <= 0 ? -Inf : log(s)
+    return logged
+end
+@kernel na_stable_fused(x::Vector{Float64}) = begin
+    out = log.(exp.(x))
+    return sum(out)
+end
+@kernel na_stable_dotted(x::Vector{Float64}) = begin
+    a = exp.(x)
+    b = log.(a)
+    return sum(b)
+end
+@testset "stable rewrites reach a non-allocating kernel" begin
+    # With the value where the written program overflows and the stable one does not.
+    for (spec, edge) in ((na_stable_roundtrip, -800.0), (na_stable_sigmoid, -800.0),
+                         (na_stable_guard, 800.0))
+        kernel = prepare(spec)
+        reused = prepare_nonallocating(spec, 0.0)
+        literal = prepare_nonallocating(spec, 0.0; simplify = false)
+        for v in (-800.0, -30.0, 0.0, 3.0, 710.0, 800.0)
+            @test isequal(reused(v), kernel(v))
+        end
+        @test isfinite(reused(edge))
+        @test !isfinite(literal(edge))
+    end
+    x = [800.0, -800.0, 1.5]
+    for spec in (na_stable_fused, na_stable_dotted)
+        kernel = prepare(spec)
+        reused = prepare_nonallocating(spec, x)
+        literal = prepare_nonallocating(spec, x; simplify = false)
+        @test isequal(reused(x), kernel(x)) && reused(x) == 1.5
+        @test isnan(literal(x))
+        # The rewritten elements still fill the step's buffer.
+        @test kernel_allocations(reused, x) == 0
+    end
 end

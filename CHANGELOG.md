@@ -16,6 +16,24 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.122
+
+- `prepare_nonallocating`, and through it
+  `prepare_sampler(...; nonallocating = true)`, now runs the stable rewrites
+  `prepare` runs: a composition such as `log(exp(u))`, `log.(exp.(x))`,
+  `log(1 / (1 + exp(-u)))` or a branch arm's `log(s)` of `s = exp(u)` is
+  computed in its stable form, inside its buffered steps too. A non-allocating
+  kernel's values and ordinary-Reverse gradients change where `exp` overflows
+  or underflows, from `NaN` or an infinity to the finite value `prepare` gives,
+  and by rounding elsewhere: they now agree with `prepare` bitwise on the four
+  PosteriorDB models that differed.
+- New: `prepare_nonallocating` takes `simplify`, as `prepare` does;
+  `simplify = false` or the project's `simplify` preference keeps the literal
+  program. A `PreparedKernel` argument contributes its plan, not its own
+  setting.
+- A rewritten dotted call (`log.(exp.(x))`) no longer allocates its inner
+  function as a `Ref` on each call, in `prepare` too.
+
 ## 0.1.121
 
 - The opt-in generated summed-plate reverse (`with_plate_reverse`, preference
