@@ -2861,11 +2861,12 @@ function _cell_split_tuple_plates(p::Plan)
     cid(v) = canon_id(old, v.id)
     boundary = Set(cid(v) for v in vcat(p.have, p.want))
     splits = Dict{Int,Any}()
+    positions = _recipe_readers_if_plates(old, p.recipes)
     for producer in p.recipes
         producer.op isa _AuthoredPlateLike && length(producer.outputs) == 1 || continue
         output = cid(only(producer.outputs))
         output in boundary && continue
-        readers = Recipe[r for r in p.recipes if any(v -> cid(v) == output, r.inputs)]
+        readers = Recipe[p.recipes[at] for at in _readers_of(positions, output)]
         reads = Any[_plate_entries_read(old, Recipe[r], output) for r in readers]
         any(isnothing, reads) && continue
         groups = unique(reads)

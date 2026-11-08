@@ -1295,7 +1295,9 @@ argument gives every index its entries, and a matrix per index keeps its
 dimensions. Outside the plate, `log_T` holds one array per index. Inside
 the cell, `log_T[i]` reads that index's coordinates in place, so a strict cell
 query's or a partition's footprint, and its compact gradient, hold only that
-index's coordinates (from ReactiveKernelsPPL 0.1.126). Not built yet for a
+index's coordinates (from ReactiveKernelsPPL 0.1.126; from 0.1.127 also
+when the cell reads a value computed from parameters, such as `mu[i]` of
+`mu = tau .* z[g]`). Not built yet for a
 prior that transforms its coordinates (a positive or bounded family, such as
 `LogNormal`): that cell still reads every index's coordinates.
 `coordinate_names` reads `log_T.1.1 … log_T.2.2` (index, then entry,

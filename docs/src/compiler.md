@@ -1179,6 +1179,38 @@ Only bodies prepared by `prepare` do this, and only plates that keep no
 per-cell tables. A transform `pass` given to `prepare` sees the plate loops
 inline, before they become programs.
 
+#### A generated reverse for summed plate programs
+
+With the `plate_reverse` preference set to `"on"`, or inside
+[`with_plate_reverse`](@ref), a gradient does not differentiate a summed plate
+program inline. It calls the program through an RK-owned rule whose reverse is
+generated from the program's own code. The output adjoint of a sum reaches
+every cell unchanged, so that reverse is one pass over the cells:
+
+- each cell runs forward, then its own reverse sweep, seeded with the total's
+  adjoint;
+- the adjoints of shared values (scalars, invariants hoisted above the loop)
+  accumulate across cells, and the hoisted invariants are swept once after the
+  loop;
+- a batched operand's cotangent is added into its shadow at the cell. A
+  gathered operand, such as `_readonly_gather(z, g)`, is a view, so its shadow
+  scatters the cotangent into `z`'s, repeated indices included.
+
+Each call's partials come from DiffRules, the table ForwardDiff and
+ReverseDiff use, or for a call whose derivative reads its own result (`exp`,
+`sqrt`) and for RK's own arithmetic, from the generator's spelling through
+that result. No rule attaches to a function this repository does not own. Lazy
+branches stay lazy: each arm's reverse runs inside that arm, under the
+condition the forward stored. The primal is the program itself, so values are
+unchanged.
+
+A plate the generator cannot differentiate keeps the backend's reverse, as
+does a call whose operands the generated reverse does not take (an immutable
+batched operand such as a tuple). [`plate_reverse_report`](@ref) names, for each
+plate program of a prepared kernel, whether its gradient is the generated
+reverse and otherwise why not. Forward-mode and higher-order operators keep
+differentiating the program with the backend.
+
 ### Nested observation plates
 
 An authored plate cell can contain another authored plate. Native lowering
@@ -1838,7 +1870,10 @@ recording. Constructing a view reads none of its parent: a view
 `view(u, 1:length(u))`) contributes the parent positions its readers read,
 mapped through the view's indices. A typed local whose declared type the
 view does not have (`head::Vector{Float64} = view(u, 2:4)`) converts it into
-a copy, which reads every viewed position. A plate cell's shared array read
+a copy, which reads every viewed position. One whose type the view has
+converts it to itself; where inference cannot tell from the port types, as for
+`head::AbstractVector{Float64} = view(u, 2:4)` of an `AbstractVector{Float64}`
+port, the footprint decides it from the arguments it is evaluated with. A plate cell's shared array read
 through views and shape checks that return their argument
 (`_footprint_checked_alias`) is read at the positions the cell's own
 selections reach, computed per cell from those index maps alone, including

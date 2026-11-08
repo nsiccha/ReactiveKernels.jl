@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.115
+## 0.1.117
 
 - Preparation computes numerically fragile compositions in their stable form:
   `log(exp(x))` as `x`, `log(logistic(x))` as `loglogistic(x)`, `log(1 + x)` as
@@ -43,6 +43,39 @@ are recorded in the git history only.
 - Not yet covered: `prepare_nonallocating`, the reactive compiler, the batched
   lowering and `jax_source`, values read per row from a gathered or zipped
   array, and `@traceable` helper bodies. Opaque functions are never rewritten.
+
+## 0.1.116
+
+- A generated reverse for summed plate programs, opt-in: with the
+  `plate_reverse` preference set to `"on"`, or inside
+  `with_plate_reverse(f)`, a prepared gradient differentiates each summed plate
+  program with a reverse generated from the program's own code instead of the
+  backend's reverse over its loop. The output adjoint of a sum reaches every
+  cell unchanged, so the reverse is one pass over the cells: each cell runs
+  forward and then its own reverse sweep, shared values' adjoints accumulate
+  across cells, a batched operand's cotangent is added into its shadow at the
+  cell (a gathered operand's shadow scatters it), and invariants hoisted above
+  the loop are swept once after it. Partials come from DiffRules; lazy branches
+  stay lazy. The primal is the program itself, unchanged. A plate the
+  generator does not differentiate keeps the backend's reverse;
+  `plate_reverse_report(kernel)` names, for each plate program, whether it took
+  the generated reverse and otherwise why not.
+- New dependency: DiffRules.
+
+## 0.1.115
+
+- A footprint (`partition_footprint`, a cell query's or a partition's) maps
+  the reads of a view held in a typed local whose type inference cannot prove,
+  such as `x::AbstractVector{Float64} = view(u, 8:15)` of an abstractly typed
+  port in a kernel that owns a plate. Assigning the view converts it to the
+  declared type; the footprint decides when it is evaluated whether that is the
+  view itself (the view already has the type) or a copy, which reads every
+  viewed position. Before, any such view counted as a copy, so every reader of
+  it read the whole range: a ReactiveKernelsPPL dotted cell latent read every
+  index's block in its cell once the cell also read a value computed from
+  parameters (snag `dotted-cell-late-3789b8ea`). A declared type the view does
+  not have (`head::Vector{Float64} = view(u, 2:4)`) still reads every viewed
+  position. Values and gradients are unchanged (`test_view_footprints.jl`).
 
 ## 0.1.114
 
