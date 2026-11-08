@@ -771,13 +771,19 @@ only, no ReactiveKernels code) isolate the remaining backend limitations:
   two, the ARMA cell takes 1.00 to 1.18 times the inlined hand loop on
   `b5daa2ac` and 1.01 to 1.15 times on `439590b1`, and an edited copy of its
   generated code without the peel is 3 to 10% faster than the code as
-  generated. What remains is Enzyme's placement of the shadow and cache lookups
-  in the peeled scan's reverse loop (Enzyme todo `08khey3`). On Julia 1.12 and
-  1.13 the reverse pass rebuilds each path's gathered slice and output instead
-  of keeping them (Enzyme todo `1nw1luu`). There, on
+  generated. The peeled scan's reverse loop reloads its loop-invariant shadow
+  and cache pointers on every step. An Enzyme prototype that loads them once
+  per entry of that loop (libEnzyme `c01fbb0c`, not landed) removes them from
+  the derivative but leaves the time unchanged, so they are not the cost. In
+  Enzyme's measurement with the same script, the peeled scan takes 1.05 to 1.08
+  times the unpeeled one, which takes 1.005 to 1.03 times the inlined hand loop.
+  The cause is unknown, and Enzyme stopped there (Enzyme decision `08gyjzn`).
+  On Julia 1.12 and 1.13 the reverse pass rebuilds each path's gathered slice
+  and output instead of keeping them (Enzyme todo `1nw1luu`). There, on
   dogfood `439590b1` with Julia 1.12.7, the Enzyme-only washout shape costs 1.11
   to 1.23 times and the RK cells 0.79 to 0.99 times the hand loop.
   `repro_enzyme_nested_loop_reverse.jl` and `repro_enzyme_peeled_loop_reverse.jl`
   reproduce each shape with Enzyme only. `scan_plate_cell_reverse.jl` measures
-  the RK cells against their hand loops. RK's lowering is unchanged, because the
-  repair belongs in Enzyme, where the cost originates.
+  the RK cells against their hand loops. RK's lowering is unchanged: the costs
+  that were located were Enzyme's and are repaired there, and the peeled scan's
+  remaining cost has no located cause.
