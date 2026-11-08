@@ -2099,12 +2099,14 @@ function _drop_unread_plate_entries(p::Plan)
     g = p.graph
     boundary = Set(canon_id(g, v.id) for v in vcat(p.have, p.want))
     recipes = collect(p.recipes)
+    # A sliced plate keeps its inputs, so the readers stay current.
+    readers = _recipe_readers_if_plates(g, recipes)
     changed = false
     for (index, producer) in enumerate(recipes)
         producer.op isa _AuthoredPlateLike && length(producer.outputs) == 1 || continue
         cid = canon_id(g, only(producer.outputs).id)
         cid in boundary && continue
-        read = _plate_entries_read(g, recipes, cid)
+        read = _plate_entries_read(g, recipes, cid, _readers_of(readers, cid))
         read === nothing && continue
         sliced = _plate_keeping_entries(producer, read)
         sliced === nothing && continue
@@ -2116,13 +2118,46 @@ function _drop_unread_plate_entries(p::Plan)
     Plan(g, p.have, p.want, recipes, producer, p.cost, p.candidates)
 end
 
+# The positions of the recipes reading each canonical value, so that finding a
+# value's readers costs its readers rather than a scan of every recipe (a scan
+# per plate made plate fusion quadratic in the plan). `nothing` entries are
+# removed recipes. Callers that replace a recipe update it through
+# `_remove_readers!` and `_add_readers!`.
+function _recipe_readers(g::Graph, recipes)
+    readers = Dict{ValueId,Set{Int}}()
+    for (index, r) in enumerate(recipes)
+        r === nothing || _add_readers!(readers, g, r, index)
+    end
+    readers
+end
+# Loops over the abstractly typed inputs, not `foreach`, which would compile
+# once per input tuple type.
+function _add_readers!(readers, g::Graph, r::Recipe, index)
+    for v in r.inputs
+        push!(get!(Set{Int}, readers, canon_id(g, v.id)), index)
+    end
+end
+function _remove_readers!(readers, g::Graph, r::Recipe, index)
+    for v in r.inputs
+        delete!(readers[canon_id(g, v.id)], index)
+    end
+end
+# Only a plate's readers are ever asked for: a plan without one builds no index.
+_recipe_readers_if_plates(g::Graph, recipes) =
+    any(r -> r !== nothing && r.op isa _AuthoredPlateLike, recipes) ?
+        _recipe_readers(g, recipes) : Dict{ValueId,Set{Int}}()
+# The positions of the recipes reading `cid`, ascending.
+_readers_of(readers, cid) = haskey(readers, cid) ? sort!(collect(readers[cid])) : Int[]
+
 # The tuple entries the readers of plate output `cid` read, or `nothing` when
 # one reads it otherwise: every reader must be a plate (or one cell of one)
-# zipping it, whose cell reads it only as `t[k]` with a literal `k`.
-function _plate_entries_read(g::Graph, recipes, cid)
+# zipping it, whose cell reads it only as `t[k]` with a literal `k`. `positions`
+# narrows the recipes searched for readers (`_readers_of`).
+function _plate_entries_read(g::Graph, recipes, cid, positions = eachindex(recipes))
     read = Set{Int}()
     found = false
-    for r in recipes
+    for at in positions
+        r = recipes[at]
         any(v -> canon_id(g, v.id) == cid, r.inputs) || continue
         found = true
         cell = r.op isa _AuthoredPlateCellLike
@@ -2319,8 +2354,15 @@ function _fuse_authored_plate_chains(original::Plan; cells_only = false,
     recipes = Union{Nothing,Recipe}[p.recipes...]
     boundary = Set(canon_id(p.graph, v.id) for v in vcat(p.have, p.want))
     changed = p !== original
-    # A plate's output, unless it is a boundary value, and the recipes that
-    # read it.
+    readers = _recipe_readers_if_plates(p.graph, recipes)
+    function set_recipe!(index, recipe)
+        old = recipes[index]
+        old === nothing || _remove_readers!(readers, p.graph, old, index)
+        recipe === nothing || _add_readers!(readers, p.graph, recipe, index)
+        recipes[index] = recipe
+    end
+    # A plate's output, unless it is a boundary value, and the positions of the
+    # recipes that read it, ascending.
     function consumers_of(index)
         producer = recipes[index]
         producer === nothing && return nothing
@@ -2328,10 +2370,7 @@ function _fuse_authored_plate_chains(original::Plan; cells_only = false,
         length(producer.outputs) == 1 || return nothing
         cid = canon_id(p.graph, only(producer.outputs).id)
         cid in boundary && return nothing
-        consumers = findall(recipes) do candidate
-            candidate === nothing && return false
-            any(input -> canon_id(p.graph, input.id) == cid, candidate.inputs)
-        end
+        consumers = _readers_of(readers, cid)
         all(>(index), consumers) || return nothing
         return cid, consumers
     end
@@ -2351,8 +2390,8 @@ function _fuse_authored_plate_chains(original::Plan; cells_only = false,
             cells_only && !(recipes[only(consumers)].op isa _AuthoredPlateCellLike) && continue
             composed = _compose_plate_into(p.graph, recipes[index], recipes[only(consumers)], cid)
             composed === nothing && continue
-            recipes[only(consumers)] = composed
-            recipes[index] = nothing
+            set_recipe!(only(consumers), composed)
+            set_recipe!(index, nothing)
             progressed = true
         end
         # A plate read only by cells of other plates composes into each cell,
@@ -2372,8 +2411,8 @@ function _fuse_authored_plate_chains(original::Plan; cells_only = false,
             composed = [_compose_plate_into(p.graph, recipes[index], recipes[c], cid)
                 for c in consumers]
             any(isnothing, composed) && continue
-            recipes[consumers] = composed
-            recipes[index] = nothing
+            foreach(set_recipe!, consumers, composed)
+            set_recipe!(index, nothing)
             progressed = true
         end
         changed |= progressed
@@ -4965,33 +5004,56 @@ _is_plate_block(node) = node isa Expr && node.head === :block &&
 _has_plate_block(node) = _is_plate_block(node) ||
     node isa Expr && node.head !== :quote && any(_has_plate_block, node.args)
 
-# Every symbol `node` names, in first-occurrence order; quoted data and the
-# block `skip` are left out.
-function _program_symbols!(found::Vector{Symbol}, seen::Set{Symbol}, node, skip = nothing;
-                           declarations::Bool = true)
+# Every occurrence of a symbol in `node`, in order, passed to `f`; quoted data
+# and the block `skip` are left out.
+function _program_each_symbol(f, node, skip = nothing; declarations::Bool = true)
     if node isa Symbol
-        node in seen || (push!(seen, node); push!(found, node))
+        f(node)
     elseif node isa Expr && node.head !== :quote && node !== skip
         if node.head === :local && !declarations
             # A declaration names its variable without reading it; its type
             # annotation is read.
             for target in node.args
                 target isa Expr && target.head === :(::) &&
-                    foreach(arg -> _program_symbols!(found, seen, arg, skip; declarations),
+                    foreach(arg -> _program_each_symbol(f, arg, skip; declarations),
                             target.args[2:end])
             end
-            return found
+            return nothing
         end
         for arg in node.args
-            _program_symbols!(found, seen, arg, skip; declarations)
+            _program_each_symbol(f, arg, skip; declarations)
         end
+    end
+    nothing
+end
+# Every symbol `node` names, in first-occurrence order (`_program_each_symbol`).
+function _program_symbols!(found::Vector{Symbol}, seen::Set{Symbol}, node, skip = nothing;
+                           declarations::Bool = true)
+    _program_each_symbol(node, skip; declarations) do name
+        name in seen || (push!(seen, name); push!(found, name))
     end
     found
 end
 
+# How often each name occurs: `push!` counts one occurrence, indexing reads a
+# count. It collects with `_program_bound!` and `_program_each_symbol`.
+struct _ProgramNameCounts
+    counts::Dict{Symbol,Int}
+end
+_ProgramNameCounts() = _ProgramNameCounts(Dict{Symbol,Int}())
+Base.push!(c::_ProgramNameCounts, name::Symbol) =
+    (c.counts[name] = get(c.counts, name, 0) + 1; c)
+Base.getindex(c::_ProgramNameCounts, name::Symbol) = get(c.counts, name, 0)
+function _program_symbol_counts(node; declarations::Bool = true)
+    counts = _ProgramNameCounts()
+    _program_each_symbol(name -> push!(counts, name), node; declarations)
+    counts
+end
+
 # The names `node` binds: assignment targets, loop and `let` variables, and,
-# with `declarations`, names declared `local` without a value.
-function _program_bound!(found::Set{Symbol}, node, skip = nothing; declarations::Bool = true)
+# with `declarations`, names declared `local` without a value. `found` is a set
+# or `_ProgramNameCounts`.
+function _program_bound!(found, node, skip = nothing; declarations::Bool = true)
     node isa Expr && node.head !== :quote && node !== skip || return found
     if node.head === :(=)
         _program_bound_target!(found, node.args[1])
@@ -5016,43 +5078,70 @@ function _program_bound_target!(found, target::Expr)
 end
 _program_bound_target!(found, _) = found
 
-# The names `node` binds before evaluation reaches `block` within it; `true`
-# once it is reached.
-function _program_bound_before!(found::Set{Symbol}, node, block)
-    node === block && return true
-    node isa Expr && node.head !== :quote || return false
-    if _program_contains(node, block)
-        for arg in node.args
-            _program_bound_before!(found, arg, block) && return true
-        end
-        return true
-    end
-    _program_bound!(found, node; declarations = false)
-    false
+# When evaluation of a body reaches each of its plate blocks, and when its
+# bindings and `local` declarations complete, from one walk of the body. What
+# evaluation runs before it reaches a block is exactly the subtrees the walk
+# completes before it enters the block, so one walk answers, for every block,
+# what one walk of the body per block answered before. That made plate
+# program extraction quadratic in the number of plates.
+struct _ProgramDeclarations
+    done::Vector{Int}      # completion of each `local` declaration of the name, ascending
+    target::Vector{Any}    # the latest-entered declaration among those completed by then
+    entered::Vector{Int}   # and when the walk entered it
 end
-# The `local` declarations `node` makes before evaluation reaches `block`
-# within it, by name: a cell loop's carried state (`_plate_lane_branch_slots!`),
-# say, which the loop assigns and must outlive one iteration.
-function _program_declared_before!(found::Dict{Symbol,Any}, node, block)
-    node === block && return true
-    node isa Expr && node.head !== :quote || return false
-    if _program_contains(node, block)
-        for arg in node.args
-            _program_declared_before!(found, arg, block) && return true
-        end
-        return true
+struct _ProgramTimeline
+    entered::IdDict{Expr,Int}      # when the walk first enters each plate block
+    occurrences::IdDict{Expr,Int}  # how often each plate block occurs in the body
+    bound::Dict{Symbol,Int}        # when a binding of each name first completes
+    declared::Dict{Symbol,_ProgramDeclarations}
+end
+function _program_timeline(body)
+    timeline = _ProgramTimeline(IdDict{Expr,Int}(), IdDict{Expr,Int}(),
+                                Dict{Symbol,Int}(), Dict{Symbol,_ProgramDeclarations}())
+    _program_timeline!(timeline, body, Ref(0), Set{Symbol}())
+end
+function _program_timeline!(t::_ProgramTimeline, node, clock, names::Set{Symbol})
+    node isa Expr && node.head !== :quote || return t
+    entered = clock[] += 1
+    if _is_plate_block(node)
+        get!(t.entered, node, entered)
+        t.occurrences[node] = get(t.occurrences, node, 0) + 1
     end
-    if node.head === :local
+    for arg in node.args
+        _program_timeline!(t, arg, clock, names)
+    end
+    done = clock[] += 1
+    if node.head === :(=)
+        # A binding as `_program_bound!` reads it, without declarations.
+        for name in _program_bound_target!(empty!(names), node.args[1])
+            get!(t.bound, name, done)
+        end
+    elseif node.head === :local
         for target in node.args
             name = _program_parameter(target)
-            name === nothing || (found[name] = target)
+            name === nothing && continue
+            d = get!(() -> _ProgramDeclarations(Int[], Any[], Int[]), t.declared, name)
+            latest = isempty(d.entered) || entered >= last(d.entered)
+            push!(d.done, done)
+            push!(d.target, latest ? target : last(d.target))
+            push!(d.entered, latest ? entered : last(d.entered))
         end
     end
-    foreach(arg -> _program_declared_before!(found, arg, block), node.args)
-    false
+    t
 end
-_program_contains(node, block) = node === block ||
-    node isa Expr && node.head !== :quote && any(arg -> _program_contains(arg, block), node.args)
+# Whether the body binds `name` before evaluation reaches `block`.
+_program_bound_before(t::_ProgramTimeline, block::Expr, name::Symbol) =
+    get(t.bound, name, typemax(Int)) < t.entered[block]
+# The last `local` declaration of `name` the body makes before evaluation
+# reaches `block`, or `nothing`: a cell loop's carried state
+# (`_plate_lane_branch_slots!`), say, which the loop assigns and must outlive
+# one iteration.
+function _program_declared_before(t::_ProgramTimeline, block::Expr, name::Symbol)
+    d = get(t.declared, name, nothing)
+    d === nothing && return nothing
+    k = searchsortedlast(d.done, t.entered[block])
+    k == 0 ? nothing : d.target[k]
+end
 
 _program_parameter(arg::Symbol) = arg
 _program_parameter(arg::Expr) = arg.head === :(::) ? _program_parameter(arg.args[1]) : nothing
@@ -5098,6 +5187,15 @@ function _extract_plate_programs(ast::Expr)
     collect_blocks(ast.args[2])
     isempty(blocks) && return ast
     replacements = IdDict{Expr,Any}()
+    body = ast.args[2]
+    if length(blocks) > 1
+        # What each block asks of the rest of the body, from one walk of it
+        # (`_program_timeline`). A name occurs outside a block when the body
+        # holds more of its occurrences than the block's occurrences do.
+        timeline = _program_timeline(body)
+        body_bound = _program_bound!(_ProgramNameCounts(), body; declarations = false)
+        body_used = _program_symbol_counts(body; declarations = false)
+    end
     for block in blocks
         statements = block.args[2:end]
         # A lone plate loop compiles as a lone loop already.
@@ -5106,13 +5204,12 @@ function _extract_plate_programs(ast::Expr)
             continue
         end
         inside = _program_bound!(Set{Symbol}(), block)
-        outside_bound = _program_bound!(Set{Symbol}(), ast.args[2], block;
-                                        declarations = false)
+        times = timeline.occurrences[block]
+        block_bound = _program_bound!(_ProgramNameCounts(), block; declarations = false)
         # A name the rest of the body only declares is not a result: a cell
         # loop's lane slot, declared before the plate and assigned only when
         # a lane computes it, would otherwise be read on return unassigned.
-        outside_used = Set(_program_symbols!(Symbol[], Set{Symbol}(), ast.args[2], block;
-                                             declarations = false))
+        block_used = _program_symbol_counts(block; declarations = false)
         # A name the body binds and the block rebinds, such as a plate's
         # running total, enters the program as an argument and leaves it as a
         # result. A rebound parameter of the body keeps the block inline.
@@ -5122,25 +5219,25 @@ function _extract_plate_programs(ast::Expr)
         end
         outputs = Symbol[name for name in
                          _program_symbols!(Symbol[], Set{Symbol}(), block)
-                         if name in inside && name in outside_used]
+                         if name in inside && body_used[name] > times * block_used[name]]
         slots = Pair{Expr,Symbol}[]
         rewritten = Any[_program_slot_arguments(statement, slots) for statement in statements]
-        before = Set{Symbol}()
-        _program_bound_before!(before, ast.args[2], block)
         # A name the body declares and the block assigns, but which no
         # assignment binds before it, is declared again at the program's own
         # function scope, where the block's loop would otherwise make it a
         # local of one iteration.
-        declared = Dict{Symbol,Any}()
-        _program_declared_before!(declared, ast.args[2], block)
-        redeclared = Any[Expr(:local, declared[name]) for name in
-                         _program_symbols!(Symbol[], Set{Symbol}(), block)
-                         if haskey(declared, name) && name in inside && !(name in before)]
+        redeclared = Any[]
+        for name in _program_symbols!(Symbol[], Set{Symbol}(), block)
+            target = _program_declared_before(timeline, block, name)
+            target !== nothing && name in inside &&
+                !_program_bound_before(timeline, block, name) &&
+                push!(redeclared, Expr(:local, target))
+        end
         reads = _program_symbols!(Symbol[], Set{Symbol}(),
                                   Expr(:block, redeclared..., rewritten...))
         free = Symbol[name for name in reads
-                      if name in inside ? name in before :
-                         name in parameters || name in outside_bound]
+                      if name in inside ? _program_bound_before(timeline, block, name) :
+                         name in parameters || body_bound[name] > times * block_bound[name]]
         # Past `_PLATE_CALL_MAX_ARGUMENTS` operands a call would need one
         # argument tuple again (`_PlateCall`): such a block stays inline.
         if length(free) + length(slots) > _PLATE_CALL_MAX_ARGUMENTS
@@ -7005,7 +7102,11 @@ function _canonical_locals(ast::Expr)
         node isa Symbol && return _lowering_gensym(node) ? canonical(node) : node
         node isa Expr || return node
         node.head === :quote && return node
-        Expr(node.head, map(walk, node.args)...)
+        # `Any[...]`, not `map`: `map` collects into an array of the first
+        # argument's type and widens it at each argument of another, which
+        # over a body's embedded plate calls (`_PlateCall`) took a fifth of a
+        # large program's preparation.
+        Expr(node.head, Any[walk(arg) for arg in node.args]...)
     end
     walk(ast)
 end
@@ -7315,7 +7416,7 @@ function _native_parameter_names(original, qualified)
         node isa Symbol && return get(names, node, node)
         node isa Expr || return node
         node.head === :quote && return node
-        Expr(node.head, map(restore, node.args)...)
+        Expr(node.head, Any[restore(arg) for arg in node.args]...)
     end
     restore(qualified)
 end

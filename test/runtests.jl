@@ -26,6 +26,7 @@ const _MATRIX_CORE_TESTS = (
     "test_stateless.jl",
     "test_planner_groundability.jl",
     "test_planner_cyclic_ad.jl",
+    "test_planning_scaling.jl",
     "test_lower_with_ops.jl",
     "test_declared_output_types.jl",
     "test_partial_evaluation.jl",
