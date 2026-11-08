@@ -301,6 +301,7 @@ const _PPL_TEST_FILES = (
     "test_cell_factor_nested.jl",
     "test_cell_batch.jl",
     "test_logistic_values.jl",
+    "test_plate_reverse.jl",
 )
 
 include("sharding.jl")
