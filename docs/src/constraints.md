@@ -769,9 +769,9 @@ only, no ReactiveKernels code) isolate the remaining backend limitations:
   RK's scan carries a `NamedTuple` and forms no such phi, so its derivative is
   unchanged. On Julia 1.10.12 with RK 0.1.126, in runs interleaved between the
   two, the ARMA cell takes 1.00 to 1.18 times the inlined hand loop on
-  `b5daa2ac` and 1.04 to 1.15 times on `439590b1`, and an edited copy of its
-  generated code without the peel is 3 to 7% faster than the code as generated
-  on both. What remains is Enzyme's placement of the shadow and cache lookups
+  `b5daa2ac` and 1.01 to 1.15 times on `439590b1`, and an edited copy of its
+  generated code without the peel is 3 to 10% faster than the code as
+  generated. What remains is Enzyme's placement of the shadow and cache lookups
   in the peeled scan's reverse loop (Enzyme todo `08khey3`). On Julia 1.12 and
   1.13 the reverse pass rebuilds each path's gathered slice and output instead
   of keeping them (Enzyme todo `1nw1luu`). There, on
