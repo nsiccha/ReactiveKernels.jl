@@ -883,6 +883,31 @@ An empty bound domain has no lanes to group. It runs no cell and evaluates no
 condition. Its result is empty, with the element type inferred from the
 authored native cell, as in Julia's empty broadcast.
 
+So by default the prepared program follows this binding's outcomes: data that
+moves every lane into one arm, or an empty domain, prepares another program
+than a binding whose lanes take both arms. With `branch_arms = :all` (from
+ReactiveKernels 0.1.119, opt-in) every arm is a plate, over no lanes for an arm
+no lane takes, and an empty domain is split too, so one program serves every
+binding of a cell: an RKPPL censored response keeps one sampler type whether
+its rows are all observed, all censored, mixed or absent. An arm without lanes
+evaluates nothing: it calls no plate program, its shared work stays behind its
+plate's nonempty guard, and its work over bound values is not run at
+preparation. An arm of one lane splits a nested branch as arms of more lanes
+or none do. The setting is the `[ReactiveKernels]` preference `branch_arms`
+(`"taken"`, the default, or `"all"`) in a project's `LocalPreferences.toml`,
+read at the first preparation of a process, or `prepare`'s `branch_arms`
+keyword (`:taken` or `:all`), which governs every preparation inside it. Under
+`:all` a gradient also differentiates a plate program over 64 cells or more
+through its call, so its loop vectorizes, and a smaller one inline.
+
+The arms no lane takes cost a small model each call: gordito, an RKPPL censored
+response over 10 rows, all observed, took 48 ns per density and 171 ns per
+sampler gradient against 31 and 82 ns by default, and over 200 rows 106 ns and
+613 ns against 60 and 482 ns. Over 2000 rows the cost vanishes, and several
+likelihoods over 2000 rows each take 28–33% less per gradient. Every arm is
+compiled: a first gradient of that model over 200 rows took 29.5 s against
+14.7 s.
+
 The number of arm plates is bounded by the cell's branch structure, never by
 the data. A condition that reads a live value stays an ordinary lazy branch.
 This includes the shape of a live array, such as `length(c)` of a runtime
@@ -1343,7 +1368,8 @@ these producers:
   through, and such a column read alone;
 - `hcat(a, b, ...)` of inputs, such as a design matrix with a computed column;
 - `vcat(a, b, ...)` of inputs and number literals, such as a completed
-  covariate `vcat(free, grouped)[lookup]` or a padded field `vcat(phi, 0.0)`.
+  covariate `vcat(free, grouped)[lookup]` or a padded field `vcat(phi, 0.0)` or
+  `vcat(phi, 0)`.
   A row of it is a row of exactly one operand, so each operand is computed at
   the rows that fall in it, and an operand none falls in is computed at no
   rows. Matrices stack along their first axis; their other dimensions must
@@ -1965,11 +1991,13 @@ and plate loops stay inline. This shows in `code_expr` as
 wrapper saves no compile time, and each wrapped statement becomes its own
 differentiated call with its own tape, which a one-subject cell pays on every
 gradient. The count is of the program's statements, never of its data.
-A type or function argument of such a statement
-crosses the wrapper in a carrier (`_PartitionType`, `_PartitionFunction`):
-Julia compiles a `Vararg{Any}` position holding a type as `::Type`, and one
-holding a function the method does not call as `::Function`, so without it
-the wrapper dispatched the statement at run time.
+The wrapper has one positional method per operand count, as `_PlateCall` does,
+and a statement with more operands stays inline. Through a `Vararg{Any}`
+method Julia would compile a position holding a type as `::Type`, and one
+holding a function the method does not call as `::Function`, and dispatch the
+statement at run time. Its one argument tuple also hides a structured operand's
+activity from Enzyme, so a derivative rule would receive its bound data record
+`Duplicated` rather than `Const`.
 `plan_constant`
 names HAVE ports whose values are constant per label (not data for the plan),
 and a lazy view of inputs may serve its rows from its parts

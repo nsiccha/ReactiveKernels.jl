@@ -856,6 +856,27 @@ end
     end
 end
 
+# A number among a `vcat`'s operands is that number: `0` has no input's position
+# and `1` holds the first's, against the density computed by hand (snag
+# `cell-vcat-litera-04f008d6`).
+@testset "cell query: an integer literal among a vcat's operands" begin
+    data = (; row = [1, 3, 2, 3, 1, 2], y = [0.3, 0.1, -0.2, 0.4, 0.2, -0.1])
+    @testset "vcat(frac, $literal)" for literal in (0, 1, 2, 0.0, 1.0)
+        ast = quote
+            frac[1:2] .~ Normal.(0, 1)
+            padded = vcat(frac, $literal)
+            @plate for i in eachindex(y)
+                y[i] ~ Normal(padded[row[i]], 1)
+            end
+        end
+        bound, built = _cq_bound(ast, data, (:y,))
+        q = prepare_cell_query(built, bound, :y)
+        u = [0.7, 0.2]
+        @test [q(u, i) for i in eachindex(data.y)] ≈
+              logpdf.(Normal.(vcat(u, literal)[data.row], 1), data.y)
+    end
+end
+
 # A joint population effect for several responses, as BRM emits it (snag
 # `column-read-lowe-24508269`): a design with a gathered computed column, a
 # submodel returning `X * beta` and one definition per response column. RKPPL
@@ -1167,7 +1188,11 @@ end
     # Every value is at the partition's rows, shared, or an input.
     report = ReactiveKernels.partition_locality(q.kernel)
     @test all(e.status !== :whole for e in report)
-    @test only(e.status for e in report if e.value === :mu) === :rows
+    # The level gather `eta = z[group]` and the location `mu` fuse into the
+    # observation cells, so neither is a vector of the partition's rows; the
+    # gathered parameter is read at those rows.
+    @test !any(e.value in (:eta, :_ppl_offset_mu, :mu) for e in report)
+    @test only(e.status for e in report if e.value === :z) === :rows
     # The gradient of one subject's density is the full likelihood gradient
     # on the coordinates it reads and zero elsewhere.
     # Ordinary Reverse is required for both dense and compact samplers.

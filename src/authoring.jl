@@ -1828,9 +1828,20 @@ _KernelPreparedChild(name::Symbol, kernel::PreparedKernel) =
 # reverse on Julia 1.10 fails on the caller once the child's body is inlined
 # there: `EnzymeRuntimeActivityError`, or a crash, for a scan child in a plate
 # cell. As a call, the child is differentiated like any other callee.
-# `Vararg{Any,N}` specializes the forwarding on the argument count: an
-# unspecialized `args...` would box the arguments and dispatch at run time,
-# which made a three-cell plate over a scan child five times slower.
+# One positional method per operand count, each operand's type a parameter of
+# its own (`_PlateCall` has the same methods). An unspecialized `args...` would
+# box the arguments and dispatch at run time, which made a three-cell plate over
+# a scan child five times slower. A `Vararg` method takes them as one tuple,
+# which hides a structured operand's activity from Enzyme: a derivative rule in
+# the child received its bound data record `Duplicated` (snag
+# `derivativerule-r-0d7e245c`). Only a call past these methods takes that tuple.
+for count in 0:_PLATE_CALL_MAX_ARGUMENTS
+    local arguments = Any[Symbol("argument", index) for index in 1:count]
+    local types = Any[Symbol("Argument", index) for index in 1:count]
+    local typed = Any[:($a::$T) for (a, T) in zip(arguments, types)]
+    @eval @noinline (child::_KernelPreparedChild)($(typed...)) where {$(types...)} =
+        child.kernel($(arguments...))
+end
 @noinline (child::_KernelPreparedChild)(args::Vararg{Any,N}) where {N} =
     child.kernel(args...)
 
@@ -5331,7 +5342,9 @@ function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                  want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
                  bound = NamedTuple(), on_error = nothing,
                  exemplars = nothing, type_stability = nothing,
-                 type_stability_level = nothing, simplify = nothing, _data_cache = nothing)
+                 type_stability_level = nothing, branch_arms = nothing,
+                 simplify = nothing, _data_cache = nothing)
+    _with_branch_arms(branch_arms) do
     _with_simplify(simplify) do
         _with_type_stability(type_stability, type_stability_level) do
             isempty(bound) || return prepare(spec.graph;
@@ -5344,6 +5357,7 @@ function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
             have === _KERNEL_DEFAULT_BOUNDARY || return prepared
             _kernel_signature_callable(prepared, spec.call_signature)
         end
+    end
     end
 end
 

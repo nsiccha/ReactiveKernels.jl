@@ -1851,3 +1851,95 @@ end
     @test err isa ArgumentError
     @test occursin("axis 3 has length 2", sprint(showerror, err))
 end
+
+# A number among a `vcat`'s operands is that number, whichever number it is: an
+# integer is never the position of an input (snag `cell-vcat-litera-04f008d6`).
+# `0` and `3` are no input's position; `1` and `2` are those of `a` and `b`. The
+# float spellings were always right and pin that nothing else moved.
+const _CELL_LITERAL_VCATS = map(enumerate(((:a, 0), (:a, 1), (:a, 3), (:a, 0.0), (:a, 1.0),
+        (1, :a), (0, :a), (:a, :b, 0), (:a, :b, 1), (:a, :b, 2), (:a, 1, :b),
+        (1, 2, 3), (0, 1.5, 3)))) do (n, operands)
+    name = Symbol(:_cell_literal_vcat_, n)
+    @eval @kernel $name(y, lookup::Vector{Int}, a::Vector{Float64}) = begin
+        b = a .* 2.0
+        padded = vcat($(operands...))
+        mu = padded[lookup]
+        dens = plate(mu, y) do mi, yi
+            -(yi - mi)^2 / 2
+        end
+        return dens
+    end
+    (; spec = getfield(@__MODULE__, name), operands)
+end
+
+_cell_literal_case(operands) = only(c for c in _CELL_LITERAL_VCATS if c.operands === operands)
+
+@kernel _cell_literal_ints(y, lookup::Vector{Int}, n::Vector{Int}) = begin
+    padded = vcat(n, 0)
+    mu = padded[lookup]
+    dens = plate(mu, y) do mi, yi
+        mi
+    end
+    return dens
+end
+
+@testset "plate_cell: a number among vcat operands is that number" begin
+    have = (:y, :lookup, :a)
+    a = [0.7, 0.2]
+    stack(operands, a) = vcat(map(o -> o === :a ? a : o === :b ? 2 .* a : o, operands)...)
+    cell(spec) = prepare(plate_cell(spec, :dens; index = :i); have = (have..., :i),
+        want = :dens_cell)
+    @testset "vcat($(join(case.operands, ", ")))" for case in _CELL_LITERAL_VCATS
+        stacked = stack(case.operands, a)
+        height = length(stacked)
+        lookup = [height:-1:1; 1:height]
+        y = cos.(eachindex(lookup))
+        full = prepare(case.spec; have, want = :dens)
+        k = cell(case.spec)
+        reference = -(y .- stacked[lookup]) .^ 2 ./ 2
+        @test full(y, lookup, a) ≈ reference
+        @test [k(y, lookup, a, i) for i in eachindex(y)] ≈ reference
+        # The last row is the operands' own: a read past it fails as the whole
+        # program's does, rather than falling in a second copy of an input.
+        beyond = [lookup[1:end-1]; height + 1]
+        @test_throws BoundsError full(y, beyond, a)
+        @test_throws BoundsError k(y, beyond, a, length(y))
+    end
+
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    @testset "gradient of vcat($(join(operands, ", ")))" for operands in ((:a, 1), (1, :a), (:a, :b, 2))
+        k = cell(_cell_literal_case(operands).spec)
+        stacked = stack(operands, a)
+        lookup = collect(eachindex(stacked))
+        y = cos.(lookup)
+        for i in lookup
+            ad = prepare_ad(k, backend, y, lookup, a, i; active = :a)
+            value, da = ad_value_and_gradient(ad, y, lookup, a, i)
+            @test value ≈ -(y[i] - stacked[i])^2 / 2
+            for j in eachindex(a)
+                e = setindex!(zero(a), 1.0, j)
+                @test da[j] ≈ _cell_central(h -> k(y, lookup, a .+ h .* e, i), 0.0) atol = 1e-6
+            end
+        end
+    end
+
+    # The literal costs no row: the `vcat` still runs at the rows the cell reads.
+    k = cell(_cell_literal_case((:a, 1)).spec)
+    pushed = let lp = ReactiveKernels._lowering_plan(k.plan),
+                 cells = ReactiveKernels._cell_pushdowns(lp)
+        Set(String(cells.producer[c].outputs[1].name) for c in cells.pushed)
+    end
+    @test "padded" in pushed
+    allocated(n) = let a = collect(range(0.1, 0.6; length = n)), lookup = [n + 1, 1, 2]
+        k(cos.(1:3), lookup, a, 1); @allocated k(cos.(1:3), lookup, a, 1)
+    end
+    @test allocated(30) == allocated(30_000)
+
+    # Its type joins the operands' as `vcat`'s does: integers stay integers.
+    n = [7, 8]
+    lookup = [3, 1, 2]
+    ints = prepare(plate_cell(_cell_literal_ints, :dens; index = :i);
+        have = (:y, :lookup, :n, :i), want = :dens_cell)
+    @test [ints(zeros(3), lookup, n, i) for i in 1:3] == [0, 7, 8]
+    @test ints(zeros(3), lookup, n, 1) isa Int
+end
