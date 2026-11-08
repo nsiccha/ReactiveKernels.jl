@@ -163,9 +163,14 @@ has, so one program serves every extent and value of one declaration
 and so does an external law's packed range and shape (`test_graph_geometry.jl`).
 Known remaining paths, which are limitations to fix and not precedents, are
 listed under ReactiveKernelsPPL 0.1.108 in its
-changelog, less those a later entry removes. A prepared type may still depend on which data-bound branch arms
-have lanes ("Data-bound branches in plate cells"), which the lazy-branch
-constraint above requires.
+changelog, less those a later entry removes. By default a prepared type still
+depends on which data-bound branch arms have lanes ("Data-bound branches in
+plate cells"). With `branch_arms = :all` (from ReactiveKernels 0.1.119, opt-in,
+for a small per-call cost on small models) an arm without lanes is a plate
+over no lanes, which keeps the lazy-branch constraint above because it
+evaluates nothing, and one type serves every binding. A lane-invariant
+condition, one that reads bound numbers alone, still selects its arm
+statically, a remaining limitation.
 
 ## Derivative rules come from one mathematical graph, never by hand
 
