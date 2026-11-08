@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.115
+## 0.1.116
 
 - A generated reverse for summed plate programs, opt-in: with the
   `plate_reverse` preference set to `"on"`, or inside
@@ -33,6 +33,21 @@ are recorded in the git history only.
   `plate_reverse_report(kernel)` names, for each plate program, whether it took
   the generated reverse and otherwise why not.
 - New dependency: DiffRules.
+
+## 0.1.115
+
+- A footprint (`partition_footprint`, a cell query's or a partition's) maps
+  the reads of a view held in a typed local whose type inference cannot prove,
+  such as `x::AbstractVector{Float64} = view(u, 8:15)` of an abstractly typed
+  port in a kernel that owns a plate. Assigning the view converts it to the
+  declared type; the footprint decides when it is evaluated whether that is the
+  view itself (the view already has the type) or a copy, which reads every
+  viewed position. Before, any such view counted as a copy, so every reader of
+  it read the whole range: a ReactiveKernelsPPL dotted cell latent read every
+  index's block in its cell once the cell also read a value computed from
+  parameters (snag `dotted-cell-late-3789b8ea`). A declared type the view does
+  not have (`head::Vector{Float64} = view(u, 2:4)`) still reads every viewed
+  position. Values and gradients are unchanged (`test_view_footprints.jl`).
 
 ## 0.1.114
 

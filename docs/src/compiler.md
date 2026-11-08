@@ -1771,7 +1771,10 @@ recording. Constructing a view reads none of its parent: a view
 `view(u, 1:length(u))`) contributes the parent positions its readers read,
 mapped through the view's indices. A typed local whose declared type the
 view does not have (`head::Vector{Float64} = view(u, 2:4)`) converts it into
-a copy, which reads every viewed position. A plate cell's shared array read
+a copy, which reads every viewed position. One whose type the view has
+converts it to itself; where inference cannot tell from the port types, as for
+`head::AbstractVector{Float64} = view(u, 2:4)` of an `AbstractVector{Float64}`
+port, the footprint decides it from the arguments it is evaluated with. A plate cell's shared array read
 through views and shape checks that return their argument
 (`_footprint_checked_alias`) is read at the positions the cell's own
 selections reach, computed per cell from those index maps alone, including
