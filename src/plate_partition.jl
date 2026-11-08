@@ -749,7 +749,7 @@ function _footprint_return(p::Plan, cells, names, declared = nothing, body = not
         any(o -> cidof(o) in pushed, r.outputs) && continue
         typed = declared === nothing ||
             any(o -> get(names, cidof(o), nothing) in declared, r.outputs)
-        access = _footprint_access(r; typed)
+        access = _footprint_access(r; typed, checked = true)
         view = access !== nothing && access.kind === :view ? access : nothing
         f = _cell_form(r)
         literal = f === nothing ? _footprint_literal_read(r) : nothing
@@ -760,13 +760,19 @@ function _footprint_return(p::Plan, cells, names, declared = nothing, body = not
                         (r.inputs..., only(r.outputs)))
                 mapping = Dict{Symbol,Any}(view.params[j] => names[cidof(v)]
                                           for (j, v) in enumerate(r.inputs))
+                # The view itself, before its typed local converts it.
+                raw = _footprint_replace(view.native, mapping)
                 mapping[view.params[s]] = Expr(:call, GlobalRef(Base, :LinearIndices), names[cid])
                 indexmap = _footprint_replace(view.native, mapping)
                 out = cidof(only(r.outputs))
                 entries = Expr(:tuple, (_footprint_entry(k, e)
                     for (k, e) in get(reads, out, Tuple{Symbol,Any}[]))...)
-                record(cid, :gathered, Expr(:call,
-                    GlobalRef(@__MODULE__, :_footprint_view_positions), indexmap, names[out], entries))
+                positions = view.declared_check === nothing ?
+                    Expr(:call, GlobalRef(@__MODULE__, :_footprint_view_positions),
+                        indexmap, names[out], entries) :
+                    Expr(:call, GlobalRef(@__MODULE__, :_footprint_typed_view_positions),
+                        raw, view.declared_check, indexmap, names[out], entries)
+                record(cid, :gathered, positions)
             elseif literal !== nothing && first(literal) == s
                 record(cid, :literal, last(literal))
             else

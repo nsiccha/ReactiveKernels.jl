@@ -23,7 +23,12 @@ _checked_alias_validator(f) = nothing
 # the declared one (`x::Vector{Float64} = view(...)`), so a typed view or
 # alias keeps its parent's identity only when inference proves the operation
 # returns the declared type. A read's conversion reads only the read entries.
-function _footprint_access(r::Recipe; typed::Bool = true)
+# `checked`: the caller can decide at run time a typed view that inference
+# neither proves nor rules out, as a view of an abstractly typed port
+# (`view(::AbstractVector{Float64}, 2:4)` infers `Any`) assigned to an
+# abstract declared type. Its `declared_check` is then that declared type
+# (`_footprint_typed_view_positions`); it is `nothing` when no check is due.
+function _footprint_access(r::Recipe; typed::Bool = true, checked::Bool = false)
     length(r.outputs) == 1 && !r.effectful || return nothing
     analyzed = _cell_native(r)
     if analyzed === nothing
@@ -48,15 +53,21 @@ function _footprint_access(r::Recipe; typed::Bool = true)
            alias > 0 ? :alias : nothing
     kind === nothing && return nothing
     declared = valtype(only(r.outputs))
+    declared_check = nothing
     if typed && kind !== :read && declared !== Any
         inferred = only(_recipe_inferred_output_types(r, Any[valtype(v) for v in r.inputs]))
-        inferred <: declared || return nothing
+        if !(inferred <: declared)
+            checked && kind === :view && typeintersect(inferred, declared) !== Union{} ||
+                return nothing
+            declared_check = declared
+        end
     end
     arg = kind === :alias ? alias + 1 : 2
     length(native.args) >= arg || return nothing
     slot = findfirst(==(native.args[arg]), params)
     slot === nothing && return nothing
-    (; kind, slot, native, params, mod = analyzed === nothing ? nothing : last(analyzed))
+    (; kind, slot, native, params, mod = analyzed === nothing ? nothing : last(analyzed),
+       declared_check)
 end
 
 # Calls that read only an array's shape. An index map (`LinearIndices`, or a
@@ -341,3 +352,12 @@ function _footprint_view_positions(indexmap, view, records)
     positions = _footprint_positions(view, records)
     positions === :whole ? collect(vec(indexmap)) : vec(indexmap)[positions]
 end
+
+# The same through a typed local of declared type `D` that inference could not
+# type: assigning `raw`, the view itself, converts it to `D`. That conversion is
+# the identity when the view already is a `D` (Base's `convert(::Type{T},
+# x::T) = x`), so its readers' positions map to the parent; otherwise it is a
+# copy, which reads every viewed position. Decided here, from the arguments
+# the footprint is evaluated with, as the value kernel decides it from its own.
+_footprint_typed_view_positions(raw, ::Type{D}, indexmap, view, records) where {D} =
+    raw isa D ? _footprint_view_positions(indexmap, view, records) : collect(vec(indexmap))
