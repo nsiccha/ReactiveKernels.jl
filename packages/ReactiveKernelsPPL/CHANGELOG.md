@@ -16,6 +16,44 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.126
+
+- A dotted cell latent, `x[i] .~ D.(args…)` in a `@plate` cell, is read in
+  its cell through a view of its own block of the packed vector, indexed by a
+  bound table of unit ranges, as a joint cell latent's block is. A strict
+  cell query's footprint, a partition's footprint (`prepare_partition(…; by)`)
+  and their compact gradients then hold that index's coordinates only. Before,
+  every index read every index's coordinates, so a consumer that assigns
+  coordinates to units by footprint (BRM's SVI and NLME views) kept them all
+  global, and a compact gradient per label carried the whole latent. Values,
+  ordinary Reverse gradients, draws and the emitted program's independence
+  of the data's size are unchanged (`test_cell_vector_latent_footprints.jl`).
+- Not built yet: a latent whose prior transforms its coordinates (a
+  positive or bounded family, such as `LogNormal`) still reads every index's
+  coordinates. Its cell views the constrained vector, a plate over the whole
+  latent, and the cell windows do not compute that plate at a view's rows; a
+  top-level `view(x, r[i])` of such a vector reads all of it the same way.
+
+## 0.1.125
+
+- Fixes wrong Reverse gradients from 0.1.124 for multivariate normal
+  densities. The value was right; the gradient lost the density's
+  contribution, or returned uninitialized memory for it. Measured cases:
+  - slice priors `eachrow(B[…]) .~ MvNormal(mu, Sigma)` and
+    `.~ MvNormalCholesky(mu, F)` beside a `@plate`, such as correlated group
+    effects with a sampled scale and LKJ factor (the slice prior alone was
+    right);
+  - `MvNormal` with a sampled covariance, observed in a plate cell or as one
+    vector (a Gaussian process, with no plate).
+
+  0.1.124 handed fresh `undef` storage for the slices' solved margins and the
+  covariance factor to a helper Julia does not inline, a shape Enzyme
+  differentiates wrongly here (Enzyme snag `rkppl-mvnormal-s-1df3d9b3`). The
+  helpers now start from zeroed storage. Values are unchanged. The
+  non-allocating sampler still reuses those buffers, and its gradients are
+  now right too. A dependant that fits such models with 0.1.124 should take
+  0.1.125 as its floor.
+
 ## 0.1.124
 
 - With MutatingFunctions loaded, through the new weak dependency and

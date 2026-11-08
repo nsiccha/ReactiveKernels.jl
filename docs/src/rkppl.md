@@ -1292,7 +1292,12 @@ included). The arguments may read sampled values, as in
 from data read per index, from cell locals computed from data, from scalar
 parameters and from the dotted arithmetic between them. A shared array
 argument gives every index its entries, and a matrix per index keeps its
-dimensions. Outside the plate, `log_T` holds one array per index.
+dimensions. Outside the plate, `log_T` holds one array per index. Inside
+the cell, `log_T[i]` reads that index's coordinates in place, so a strict cell
+query's or a partition's footprint, and its compact gradient, hold only that
+index's coordinates (from ReactiveKernelsPPL 0.1.126). Not built yet for a
+prior that transforms its coordinates (a positive or bounded family, such as
+`LogNormal`): that cell still reads every index's coordinates.
 `coordinate_names` reads `log_T.1.1 … log_T.2.2` (index, then entry,
 column-major), `constrain` returns one array per index, and `unconstrain`
 and `restore_draws` take and give that shape. Arguments that are numbers at

@@ -217,11 +217,16 @@ LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
     labels::Vector{Symbol}, offset::Int, size::Int, transform::Symbol) =
     LayoutEntry(kind, predictor, name, labels, offset, size, transform, NaN, NaN)
 
-# One block per sampled seed / body statement, independent of the number of
-# iterations. Native and generated transforms use the existing bijectors,
-# with the support a `truncated` / `restricted` / half prior states.
+# One block per sampled body statement, independent of the number of
+# iterations, and one per run of adjacent sampled seeds that share a transform
+# and its bounds: a seed is one coordinate, so such a run is one transformed
+# vector rather than one vector per seed. Native and generated transforms use
+# the existing bijectors, with the support a `truncated` / `restricted` / half
+# prior states. A seed block's size is its number of seeds (the authored setup
+# statements, never a data length); `_entry_reads!` relies on it.
 function _scan_layout_entry(plan, s, name, offset, T)
     blocks = LayoutEntry[]
+    seed_run = false # the last block holds seeds and may take the next one
     pos = offset
     for st in (s.setup..., s.step...)
         st.kind === :sample || continue
@@ -243,6 +248,16 @@ function _scan_layout_entry(plan, s, name, offset, T)
             lo, hi = _layout_bound(plan, lo), _layout_bound(plan, hi)
             bound_reads = _data_bound_reads(authored, lo, hi)
         end
+        if st isa ScanSetup && seed_run && (last_block = blocks[end];
+                last_block.transform === transform && isequal(last_block.lo, lo) &&
+                isequal(last_block.hi, hi) && isequal(last_block.bound_reads, bound_reads))
+            blocks[end] = LayoutEntry(:plate, nothing, last_block.name, Symbol[],
+                last_block.offset, last_block.size + 1, transform, lo, hi, Int[],
+                LayoutEntry[], nothing, nothing, nothing, bound_reads)
+            pos += 1
+            continue
+        end
+        seed_run = st isa ScanSetup
         blockname = Symbol(name, :_block_, length(blocks) + 1)
         push!(blocks, LayoutEntry(:plate, nothing, blockname, Symbol[], pos,
             width, transform, lo, hi, Int[], LayoutEntry[], nothing, nothing, nothing,
@@ -1935,16 +1950,20 @@ function _entry_reads!(reads, plan, tests, e::LayoutEntry, at, scan, bound_reads
     end
     axes = nothing
     if !isempty(e.scan_blocks)
-        # One block per sampled statement: a seed is one coordinate, a step
-        # statement one per iteration.
+        # A seed block holds `b.size` seeds of one coordinate each
+        # (`_scan_layout_entry`); a step block holds one statement, one
+        # coordinate per iteration.
         T = _scan_read_length(plan, scan, _scan_length(plan, scan))
         steps = _read_add(T, -(scan.lo - 1))
         sampled = [st for st in (scan.setup..., scan.step...) if st.kind === :sample &&
             (st isa ScanSetup || _scan_length(plan, scan) > scan.lo - 1)]
         blocks = LayoutEntry[]
-        for (b, st) in zip(e.scan_blocks, sampled)
+        k = 1
+        for b in e.scan_blocks
+            st = sampled[k]
+            k += st isa ScanSetup ? b.size : 1
             start, stop, next = at isa Int && T isa Int ? (nothing, nothing, _read_add(at, b.size)) :
-                _block_reads!(reads, b.name, at, st isa ScanSetup ? 1 : steps)
+                _block_reads!(reads, b.name, at, st isa ScanSetup ? b.size : steps)
             push!(blocks, LayoutEntry(b.kind, b.predictor, b.name, b.labels, b.offset, b.size,
                 b.transform, b.lo, b.hi, b.dims, b.scan_blocks, b.sampling,
                 start === nothing ? nothing : (start, stop), nothing,
