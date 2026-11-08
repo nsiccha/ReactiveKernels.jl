@@ -16,7 +16,7 @@ using ReactiveKernels: _stage_residual_sources, _rule_activity, _derivative_inpu
 import ReactiveKernels
 import Enzyme
 using Enzyme: Const, Active, Duplicated, DuplicatedNoNeed, BatchDuplicated,
-    BatchDuplicatedNoNeed
+    BatchDuplicatedNoNeed, MixedDuplicated
 using Enzyme.EnzymeCore: Annotation
 import Enzyme.EnzymeRules
 using Enzyme.EnzymeRules: FwdConfig, RevConfig, AugmentedReturn, needs_primal,
@@ -582,13 +582,18 @@ _pr_tuple_operand(::Type) = false
 # operand Enzyme also differentiates outside them would otherwise get a zero
 # cotangent, which is a wrong gradient. Such a call differentiates the program
 # with Enzyme's ordinary reverse instead.
+# A batched operand is covered only as a plain array shadow: a `MixedDuplicated`
+# operand (a struct of active scalars and arrays, such as a cell broadcast
+# `a .+ v`) has a shadow the generated reverse does not write.
 @generated function _pr_covers(::Val{S}, ::Val{B}, args::Tuple) where {S,B}
     for (i, T) in enumerate(args.parameters)
         T <: Const && continue
         if T <: Active
             i in S || (i in B && _pr_tuple_operand(T)) || return :(false)
-        else
+        elseif T <: Union{Duplicated,DuplicatedNoNeed,BatchDuplicated,BatchDuplicatedNoNeed}
             i in B || return :(false)
+        else
+            return :(false)
         end
     end
     :(true)
@@ -603,6 +608,8 @@ end
 @inline _pr_rewrap(a::Active, v) = Active(v)
 @inline _pr_rewrap(a::Union{Duplicated,DuplicatedNoNeed}, v) = Duplicated(v, a.dval)
 @inline _pr_rewrap(a::Const, v) = Const(v)
+# Its shadow is a reference the ordinary reverse accumulates into in place.
+@inline _pr_rewrap(a::MixedDuplicated, v) = MixedDuplicated(v, a.dval)
 
 # The reverse's return type for these annotations: the value type of each
 # Active operand, `nothing` for every other.

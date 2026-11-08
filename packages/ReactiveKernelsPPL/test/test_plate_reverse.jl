@@ -48,6 +48,27 @@ end
 
 _prv_rules(report) = count(r -> last(r) == "rule", report)
 
+# Group cells gathering per-row values that stay a lazy cell broadcast
+# (`mu = a .+ b[group]`, `_cell_array_broadcast`; test_cell_composed_gathers.jl):
+# such an operand reaches a plate program as a struct of an active scalar and an
+# array, which Enzyme passes as `MixedDuplicated`. The rule does not write that
+# shadow, so the call must take Enzyme's ordinary reverse, never a zero.
+const _PRV_CELL_BROADCAST = @rkppl begin
+    b[1:ngroup] .~ Normal.(0, 1)
+    a ~ Normal(0, 1)
+    s0 ~ Normal(0, 1)
+    s1 ~ Normal(0, 1)
+    mu = a .+ b[group]
+    sigma = exp.(s0 .+ s1 .* x)
+    @plate for i = eachindex(rows)
+        loc[i] = mu[rows[i]]
+        scale[i] = sigma[rows[i]]
+    end
+    @plate for i = eachindex(y)
+        y[i] .~ Normal.(loc[i], scale[i])
+    end
+end
+
 @testset "generated summed-plate reverse" begin
     @testset "gauss_ri: gathered offset, guarded Normal density (N = $N)" for (N, J) in
             ((1, 1), (7, 3), (200, 5), (2000, 50))
@@ -154,6 +175,19 @@ _prv_rules(report) = count(r -> last(r) == "rule", report)
         report = _prv_compare(built, bound)
         @info "plate reverse: pointwise buffer" report
         @test count(r -> last(r) == "rule", report) >= 2
+    end
+
+    @testset "a lazy cell broadcast operand (MixedDuplicated)" begin
+        ngroup, n = 6, 90
+        group = [mod1(r, ngroup) for r in 1:n]
+        rows = [findall(==(g), group) for g in 1:ngroup]
+        x = [cos(2pi * r / 7) for r in 1:n]
+        yrow = [0.3 + 0.5 * x[r] + 0.2 * sin(3r) for r in 1:n]
+        bound = _PRV_CELL_BROADCAST(; ngroup, group, rows, x) | (; y = [yrow[r] for r in rows])
+        built = build_kernel(bound)
+        report = _prv_compare(built, bound)
+        @info "plate reverse: lazy cell broadcast" report
+        @test !isempty(report)
     end
 
     @testset "a plate program with more operands than map unrolls" begin
