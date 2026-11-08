@@ -1328,6 +1328,65 @@ derivative arithmetic (the dogfood default, `nsz` and `contract`) may fuse a
 multiply-add that the copy's shadow rounds twice. Under strict derivative
 arithmetic (`Enzyme.API.fast_math_flags!()`) the gradients are identical.
 
+### Plates of products run as matrix products
+
+A plate cell runs its statements once per cell. When a statement multiplies a
+vector of the cell's own by a matrix every cell shares, that is one
+matrix-vector product per cell, and native Enzyme reverse differentiates it as
+one:
+
+```julia
+dens = plate(idx, coordinates) do i, c
+    phase = transpose(frequency ./ lengths) * c
+    raw = Zc * cos.(phase) .+ Zs * sin.(phase)
+    value = (correlation * raw) .* scale
+    -0.5 * sum(abs2, value .- y[i, :])
+end
+```
+
+With exemplars (`prepare(...; exemplars)`, which `prepare_sampler` passes),
+such a plate runs its cells together, 256 at a time: each cell's number is one
+entry of a vector over the tile and each cell's vector one row of a matrix over
+it, every statement runs once per tile, and `A * v` is one product
+`V * transpose(A)` per tile. It is the native counterpart of the `jax.vmap` a
+plate becomes in the [JAX target](jax.md). For the cell above with 64 features
+(one thread, Julia 1.10.12, native Enzyme reverse), the batched gradient cost
+4.7 ms against 30.8 ms for the same plate's cell loop at 1,444 cells × 38
+channels, and 33.3 ms against 197.5 ms at 15,796 cells × 2 channels.
+
+A statement that varies by cell has a batched form when it is built from:
+
+- dotted calls and operators over the cell's numbers and vectors and shared
+  numbers and vectors (a shared vector is read as a row);
+- `A * v` of a shared matrix and a cell's vector, and the products, sums,
+  differences and quotients of a cell's numbers and vectors with numbers that
+  Julia defines (`s * v`, `v + w`, `v / s`; a vector plus a number stays
+  undefined);
+- `sum(v)` and `sum(f, v)` of a cell's vector;
+- `y[i, :]`, `y[i]` and `y[i, j]` of a shared array at the cell's integer `i`,
+  and `v[k]` of a cell's vector at a shared integer;
+- any other call of a function of the cell's numbers, called at every cell.
+
+The plate is batched when every statement that varies by cell has a form, the
+cell's result is a number or a `Vector` of numbers, and at least one statement
+is a product of a shared matrix and a cell's vector. The batched tiles run when
+the call's argument types are the exemplars', every argument the cells read
+spans the plate's one axis, and the vectors one argument holds all have one
+length; any other call runs the cell loop, as does any other plate.
+
+A partition (`plate_partition`) runs its rows batched the same way: its
+arguments are views of the plate's, whose elements have the plate's types. A
+query of one cell runs that cell alone.
+
+Values and gradients agree with the cell loop to rounding, not bit for bit: the
+products and the row sums add in another order. Set `RK_BATCHED_PLATES=0` to
+keep the cell loop, as a comparison baseline; `JULIA_DEBUG=ReactiveKernels`
+logs each plate planned batched (group `:plate_batching`) with its statements
+that vary by cell. Not batched yet: the non-allocating step, the opt-in plate
+reverse, lazy branches, plates and scans in a cell, and a matrix that differs
+per cell, such as a coefficient row selected by the cell's block and reshaped
+(`reshape(coefficients[b, :], C, :)`).
+
 ### Nested observation plates
 
 An authored plate cell can contain another authored plate. Native lowering
