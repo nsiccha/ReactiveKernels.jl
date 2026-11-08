@@ -987,11 +987,27 @@ end
 # The per-step output type of a scan step applied to these argument types. An
 # empty sequence runs no step, so its (empty) result is typed the way Base's
 # `accumulate` types one: by inference, `Any` when inference cannot tell.
-function _scan_step_output_type(step, argument_types...)
+_scan_step_output_type(step, argument_types...) =
+    _scan_step_types(step, argument_types...)[2]
+
+# The carry and per-step output types of one step applied to these argument
+# types, each `Any` when inference cannot tell.
+function _scan_step_types(step, argument_types...)
     R = Base.promote_op(step, argument_types...)
     R isa DataType && R <: Tuple && length(R.parameters) == 2 ?
-        fieldtype(R, 2) : Any
+        (fieldtype(R, 1), fieldtype(R, 2)) : (Any, Any)
 end
+
+# A scan runs its first step outside the loop (peels it) only when that step
+# has work to do there: typing a result whose output type inference cannot
+# fix, or giving the loop the carry type the first step returns when it
+# differs from the seed's. When the output type is concrete and the step
+# returns the seed's carry type, every step has the same types, and the loop
+# starts at the first index. On Julia 1.10 Enzyme Reverse of the peeled loop
+# costs 5-8% more than the same loop without the peel, for no located cause
+# (`benchmark/scan_plate_cell_reverse.jl`, `docs/src/constraints.md`).
+@inline _scan_unpeeled(::Type{C}, ::Type{T}, seed) where {C,T} =
+    isconcretetype(T) && C === typeof(seed)
 
 # The indices after a scan's peeled first step, which every native scan loop
 # iterates, here and in the generated lowering. For a unit range they are the
@@ -1037,10 +1053,18 @@ end
 @inline function _scan_loop(step, init, iterated::Tuple, shared::Tuple,
                             ::Val{false} = Val(false))
     idx = eachindex(iterated...)
-    T = _scan_step_output_type(
+    C, T = _scan_step_types(
         step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...)
     result = isconcretetype(T) ? similar(first(iterated), T) : nothing
     isempty(idx) && return result === nothing ? similar(first(iterated), T) : result
+    if result !== nothing && _scan_unpeeled(C, T, init)
+        carry = init
+        for i in idx
+            carry, out = step(carry, map(xs -> xs[i], iterated)..., shared...)
+            result[i] = out
+        end
+        return result
+    end
     i1 = first(idx)
     carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared...)
     result === nothing && (result = similar(first(iterated), typeof(out1)))
@@ -1055,12 +1079,22 @@ end
 @inline function _scan_loop(step, init, iterated::Tuple, shared::Tuple, ::Val{true})
     idx = eachindex(iterated...)
     allocate(T) = similar(first(iterated), promote_type(typeof(init), T), length(idx) + 1)
-    T = _scan_step_output_type(
+    C, T = _scan_step_types(
         step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...)
     result = isconcretetype(T) ? allocate(T) : nothing
     if isempty(idx)
         result === nothing && (result = allocate(T))
         result[1] = init
+        return result
+    end
+    if result !== nothing && _scan_unpeeled(C, T, init)
+        result[1] = init
+        carry, position = init, 1
+        for i in idx
+            carry, out = step(carry, map(xs -> xs[i], iterated)..., shared...)
+            position += 1
+            result[position] = out
+        end
         return result
     end
     i1 = first(idx)
@@ -1527,6 +1561,19 @@ function _scan_history_loop(step, init, fill, iterated::Tuple, shared::Tuple)
     offset = _scan_history_offset(fill)
     earlier = _scan_history_views(result)
     isempty(idx) && return result
+    # The result's element type is the history's, so only the carry needs the
+    # first step (`_scan_unpeeled`).
+    C, _ = _scan_step_types(step, typeof(init), map(eltype, iterated)...,
+                            map(typeof, shared)..., typeof(earlier))
+    if C === typeof(init)
+        carry = init
+        for i in idx
+            carry, out = step(carry, map(xs -> xs[i], iterated)..., shared..., earlier)
+            carry = _scan_history_carry(carry)
+            _scan_history_record!(result, offset, i, out)
+        end
+        return result
+    end
     i1 = first(idx)
     carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared..., earlier)
     carry = _scan_history_carry(carry)

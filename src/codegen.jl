@@ -851,13 +851,18 @@ end
 # scans recursing (`_body_types!`). A step that owns a plate, scan or embedded
 # kernel declares its typed locals (`_lower_with_ops`), so a concrete declared
 # type is the value's type there.
-function _scan_step_output_type!(runtime_ops, runtime_recipes, step, input_types,
-                                 base)
+_scan_step_output_type!(runtime_ops, runtime_recipes, step, input_types, base) =
+    _scan_step_types!(runtime_ops, runtime_recipes, step, input_types, base)[2]
+
+# The same leaf-operation types of the step's carry (its first WANT) and
+# per-step output; the carry's is `nothing` when the chain does not reach it.
+function _scan_step_types!(runtime_ops, runtime_recipes, step, input_types, base)
     p = step.plan
     types = _body_types!(runtime_ops, runtime_recipes, p,
         Any[recipe.op for recipe in p.recipes], p.recipes, input_types, base;
         declared = _owns_array_regions(p))
-    types[canon_id(p.graph, p.want[2].id)]
+    (get(types, canon_id(p.graph, p.want[1].id), nothing),
+     types[canon_id(p.graph, p.want[2].id)])
 end
 
 # Cold type-only slots for a scan step that is not plain, appended by both
@@ -883,19 +888,22 @@ end
 # operation infers exactly inside the enclosing generated body. A step that is
 # not plain is typed from the cold slots `_scan_type_slots!` placed at
 # `type_offset`, re-deriving the same layout; `nothing` without them.
-function _authored_scan_step_output_type(step, input_types, offset;
-                                         type_offset = nothing)
+_authored_scan_step_output_type(step, input_types, offset; type_offset = nothing) =
+    _authored_scan_step_types(step, input_types, offset; type_offset)[2]
+
+# The same static types of the step's carry (first WANT) and per-step output
+# (second), each `nothing` when the chain does not reach it.
+function _authored_scan_step_types(step, input_types, offset; type_offset = nothing)
     p = step.plan
     if !_scan_step_is_plain(step)
-        type_offset === nothing && return nothing
-        return _scan_step_output_type!(Any[], Recipe[], step, input_types,
-                                       type_offset)
+        type_offset === nothing && return (nothing, nothing)
+        return _scan_step_types!(Any[], Recipe[], step, input_types, type_offset)
     end
     types = Dict{ValueId,Any}(canon_id(p.graph, v.id) => T
                           for (v, T) in zip(p.have, input_types))
     for (i, recipe) in enumerate(p.recipes)
         all(v -> haskey(types, canon_id(p.graph, v.id)), recipe.inputs) ||
-            return nothing
+            return (nothing, nothing)
         T = _slot_type_expr(recipe, offset + i,
                             (types[canon_id(p.graph, v.id)] for v in recipe.inputs))
         if length(recipe.outputs) == 1
@@ -907,8 +915,9 @@ function _authored_scan_step_output_type(step, input_types, offset;
             end
         end
     end
-    length(p.want) == 2 || return nothing
-    get(types, canon_id(p.graph, p.want[2].id), nothing)
+    length(p.want) == 2 || return (nothing, nothing)
+    (get(types, canon_id(p.graph, p.want[1].id), nothing),
+     get(types, canon_id(p.graph, p.want[2].id), nothing))
 end
 
 # These roots are compiler-generated type queries, not arbitrary user code.
@@ -993,10 +1002,11 @@ function _authored_scan_step(op::_AuthoredScanOp, callargs, offset, index, carry
     for i in shared_positions
         push!(step_input_types, Expr(:call, typeof_ref, callargs[i]))
     end
-    inferred_output_type = something(
-        _authored_scan_step_output_type(step, step_input_types, offset;
-                                        type_offset), Any)
-    (; seqs, xs, step_body, inferred_output_type)
+    carry_type, output_type = _authored_scan_step_types(step, step_input_types,
+                                                        offset; type_offset)
+    inferred_output_type = something(output_type, Any)
+    inferred_carry_type = something(carry_type, Any)
+    (; seqs, xs, step_body, inferred_output_type, inferred_carry_type)
 end
 
 # Inline the scalar step into the ordered native loop. Calling the nested
@@ -1029,8 +1039,9 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
         body, op, callargs, lhs, offset; recycled)
     indices, index, carry, output, output_type, position = gensym.((:scan_indices,
         :scan_index, :scan_carry, :scan_output, :scan_output_type, :scan_position))
-    (; seqs, xs, step_body, inferred_output_type) = _authored_scan_step(
-        op, callargs, offset, index, carry, output; strips, type_offset)
+    (; seqs, xs, step_body, inferred_output_type, inferred_carry_type) =
+        _authored_scan_step(op, callargs, offset, index, carry, output; strips,
+                            type_offset)
     typeof_ref = GlobalRef(Base, :typeof)
     invariant = Any[]
     # `typing` runs before the emptiness branch: it binds the inferred output
@@ -1043,8 +1054,13 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     typing = Expr(:block)
     empty_output, initial_output = Expr(:block), Expr(:block)
     loop_output, final_output = Expr(:block), Expr(:block)
-    inferred_output_type = only(_bind_native_type_exprs!(typing, [inferred_output_type]))
+    inferred_output_type, inferred_carry_type = _bind_native_type_exprs!(
+        typing, [inferred_output_type, inferred_carry_type])
     push!(typing.args, :($output_type = $inferred_output_type))
+    # The conditions under which the loop starts at the first index instead of
+    # after a peeled first step (`_scan_unpeeled`).
+    unpeeled_conditions = Any[:($(GlobalRef(@__MODULE__, :_scan_unpeeled))(
+        $inferred_carry_type, $output_type, $(callargs[1])))]
     concrete = gensym(:scan_concrete_output)
     push!(typing.args, :($concrete = $(GlobalRef(Base, :isconcretetype))($output_type)))
     push!(initial_output.args, :($output_type = $typeof_ref($output)))
@@ -1113,6 +1129,9 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
         for block in (typing, initial_output)
             push!(block.args, :($plate_eltype = $cell_type))
         end
+        # Without the peel the total starts at its zero, as the empty arm's
+        # does; a cell type that is not a number may have none.
+        push!(unpeeled_conditions, :($plate_eltype <: $(Number)))
         if pointwise_lhs !== nothing
             allocation = :($(GlobalRef(Base, :similar))($xs, $plate_eltype))
             buffer!(pointwise_lhs, pointwise_recycled === nothing ? allocation :
@@ -1161,6 +1180,8 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
             push!(final_output.args, :($(term.lhs) = $accumulator))
         end
     end
+    unpeeled = gensym(:scan_unpeeled)
+    push!(typing.args, :($unpeeled = $(foldl((a, b) -> :($a && $b), unpeeled_conditions))))
     # `eachindex(seqs...)` throws `DimensionMismatch` unless every iterated
     # sequence shares axes, giving the lockstep length check for free.
     push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($(seqs...))))
@@ -1195,34 +1216,41 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
         body = Expr(:block, terminal_init.args...)
         push!(outer_body.args, Expr(:if, ready, body, fallback))
     end
-    nonempty = Expr(:block)
-    push!(nonempty.args, :($carry = $(callargs[1])))
-    push!(nonempty.args, :($index = $(GlobalRef(Base, :first))($indices)))
-    append!(nonempty.args, step_body.args)
-    append!(nonempty.args, initial_output.args)
-    if strips === nothing
-        push!(nonempty.args, Expr(:for,
-            :($index = $(GlobalRef(@__MODULE__, :_scan_rest))($indices)),
-            Expr(:block, step_body.args..., loop_output.args...)))
-    else
-        # The rest of the first strip, then one strip at a time: refill the
-        # strip, then run its steps in a loop of their own, so the refill
-        # never sits inside the loop that carries the recurrence.
-        lo, hi, last_index = strips.lo, strips.hi, gensym(:scan_last)
+    # The loops over the remaining steps after `first_steps`'s: one loop over
+    # `rest` without strips; with strips, the rest of the first strip, then one
+    # strip at a time: refill the strip, then run its steps in a loop of their
+    # own, so the refill never sits inside the loop that carries the recurrence.
+    function loops!(block, rest, first_strip)
         steps(range) = Expr(:for, :($index = $range),
             Expr(:block, copy(step_body).args..., copy(Expr(:block, loop_output.args...)).args...))
-        push!(nonempty.args, :($last_index = $(GlobalRef(Base, :last))($indices)))
-        push!(nonempty.args, steps(:(($(GlobalRef(Base, :first))($indices) + 1):$hi)))
-        push!(nonempty.args, :($lo = $hi + 1))
-        push!(nonempty.args, Expr(:while, :($lo <= $last_index), Expr(:block,
+        strips === nothing && return push!(block.args, steps(rest))
+        lo, hi, last_index = strips.lo, strips.hi, gensym(:scan_last)
+        push!(block.args, :($last_index = $(GlobalRef(Base, :last))($indices)))
+        push!(block.args, steps(:($first_strip:$hi)))
+        push!(block.args, :($lo = $hi + 1))
+        push!(block.args, Expr(:while, :($lo <= $last_index), Expr(:block,
             :($hi = $(GlobalRef(Base, :min))(
                 $lo + $(GlobalRef(@__MODULE__, :_PLATE_STRIP)) - 1, $last_index)),
             copy(strips.refill).args...,
             steps(:($lo:$hi)),
             :($lo = $hi + 1))))
     end
+    first_index = :($(GlobalRef(Base, :first))($indices))
+    nonempty = Expr(:block)
+    push!(nonempty.args, :($carry = $(callargs[1])))
+    push!(nonempty.args, :($index = $first_index))
+    append!(nonempty.args, step_body.args)
+    append!(nonempty.args, initial_output.args)
+    loops!(nonempty, :($(GlobalRef(@__MODULE__, :_scan_rest))($indices)),
+           :($first_index + 1))
+    # Without the peel the buffers, seeds and totals start as the empty arm's
+    # do, and every step runs in the loop.
+    flat = Expr(:block, copy(empty_output).args...)
+    push!(flat.args, :($carry = $(callargs[1])))
+    lhs !== nothing && _scan_includes_init(op) && push!(flat.args, :($position = 1))
+    loops!(flat, indices, first_index)
     push!(body.args, Expr(:if, :($(GlobalRef(Base, :isempty))($indices)),
-                          empty_output, nonempty))
+                          empty_output, Expr(:block, Expr(:if, unpeeled, flat, nonempty))))
     append!(body.args, final_output.args)
     outer_body
 end
@@ -1244,8 +1272,8 @@ function _lower_authored_scan_slice_native!(body, op::_AuthoredScanOp, callargs,
         offset, demand, reader_args, lhs, reader_call; type_offset = nothing)
     indices, index, carry, output = gensym.((:scan_indices, :scan_index,
         :scan_carry, :scan_output))
-    (; seqs, xs, step_body, inferred_output_type) = _authored_scan_step(
-        op, callargs, offset, index, carry, output; type_offset)
+    (; seqs, xs, step_body, inferred_output_type, inferred_carry_type) =
+        _authored_scan_step(op, callargs, offset, index, carry, output; type_offset)
     init = Int(_scan_includes_init(op))
     seed = callargs[1]
     # Evaluate each reader argument once, as its call would.
@@ -1269,7 +1297,8 @@ function _lower_authored_scan_slice_native!(body, op::_AuthoredScanOp, callargs,
     push!(ordinary.args, Expr(:(=), lhs, Expr(:call, reader_call, ordinary_args...)))
 
     typing = Expr(:block)
-    output_type = only(_bind_native_type_exprs!(typing, [inferred_output_type]))
+    output_type, carry_type = _bind_native_type_exprs!(
+        typing, [inferred_output_type, inferred_carry_type])
     append!(body.args, typing.args)
     push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($(seqs...))))
     push!(body.args, :($element_type = $(init == 1 ?
@@ -1298,14 +1327,19 @@ function _lower_authored_scan_slice_native!(body, op::_AuthoredScanOp, callargs,
             Expr(:block, step_at(:($position - $init)).args..., store(position, output))))
     else
         # Steps 1 through the last demanded one, the first peeled so the carry
-        # takes the step's type, as in the ordinary loop.
+        # takes the step's type, as in the ordinary loop, unless the step
+        # returns the seed's carry type (`_scan_unpeeled`; the output type is
+        # concrete here).
         last_step = gensym(:scan_slice_last_step)
-        steps = Expr(:block, :($carry = $seed), step_at(1).args...,
-            :($position = $(1 + init)),
-            :($position >= $lo && $(store(position, output))),
-            Expr(:for, :($slot = 2:$last_step), Expr(:block, step_at(slot).args...,
-                :($position = $slot + $init),
-                :($position >= $lo && $(store(position, output))))))
+        stored(at) = Expr(:block, step_at(at).args...,
+            :($position = $at + $init),
+            :($position >= $lo && $(store(position, output))))
+        peeled = Expr(:block, :($carry = $seed), stored(1).args...,
+            Expr(:for, :($slot = 2:$last_step), stored(slot)))
+        flat = Expr(:block, :($carry = $seed),
+            Expr(:for, :($slot = 1:$last_step), stored(slot)))
+        steps = Expr(:if, :($(GlobalRef(@__MODULE__, :_scan_unpeeled))(
+            $carry_type, $output_type, $seed)), flat, peeled)
         push!(demanded.args, :($last_step = $hi - $init))
         push!(demanded.args, Expr(:if, :($lo <= $hi && $last_step >= 1), steps))
     end
@@ -1375,14 +1409,29 @@ function _lower_authored_scan_history_native!(body, op::_AuthoredScanOp, callarg
         $((recycled === nothing ? () : (recycled,))...), $(first(seqs)), $fill_value)))
     push!(body.args, :($start = $(module_ref(:_scan_history_offset))($fill_value)))
     push!(body.args, :($earlier = $(module_ref(:_scan_history_views))($lhs)))
+    # The result's element type is the history's, so only the carry needs the
+    # peeled first step: none when the step returns the seed's carry type
+    # (`_scan_unpeeled`). A step that is not plain has no type chain here and
+    # keeps the peel.
+    typeof_ref, eltype_ref = GlobalRef(Base, :typeof), GlobalRef(Base, :eltype)
+    input_types = Any[:($typeof_ref($(callargs[1])))]
+    append!(input_types, Any[:($eltype_ref($(callargs[i]))) for i in iterated_positions])
+    append!(input_types, Any[:($typeof_ref($(callargs[i]))) for i in shared_positions])
+    push!(input_types, :($typeof_ref($earlier)))
+    carry_type = something(first(_authored_scan_step_types(step, input_types, offset)), Any)
+    typing = Expr(:block)
+    carry_type = only(_bind_native_type_exprs!(typing, [carry_type]))
+    append!(body.args, typing.args)
     nonempty = Expr(:block,
         :($carry = $(callargs[1])),
         :($index = $(GlobalRef(Base, :first))($indices)),
         step_body..., record...,
         Expr(:for, :($index = $(GlobalRef(@__MODULE__, :_scan_rest))($indices)),
              Expr(:block, step_body..., record...)))
-    push!(body.args, Expr(:if,
-        :(!$(GlobalRef(Base, :isempty))($indices)), nonempty))
+    flat = Expr(:block, :($carry = $(callargs[1])),
+        Expr(:for, :($index = $indices), Expr(:block, step_body..., record...)))
+    push!(body.args, Expr(:if, :(!$(GlobalRef(Base, :isempty))($indices)),
+        Expr(:block, Expr(:if, :($carry_type === $typeof_ref($(callargs[1]))), flat, nonempty))))
     body
 end
 
