@@ -4525,12 +4525,9 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
     pidx = Set{Symbol}()
     if any(c -> _cell_uses_index_value(c, ivar), cells)
         indexname = ReactiveKernels._kernel_gensym(:_rkppl_index)
-        indices = rkind[1] === :coloncall ? rkind[2] :
-            rkind[1] === :eachindex ? Expr(:call, GlobalRef(Base, :eachindex), rkind[2]) :
-            Expr(:call, GlobalRef(Base, :axes), rkind[2], rkind[3])
-        indexvalues = Expr(:call, GlobalRef(Base, :collect), indices)
         push!(out, Expr(:(=), indexname,
-            _plate_column_call(ivar, Pair{Symbol,Any}[], ivar, nothing; indices=indexvalues)))
+            _plate_column_call(ivar, Pair{Symbol,Any}[], ivar, nothing;
+                indices = _plate_index_values(rkind))))
         push!(plate_defs, indexname)
         push!(pidx, indexname)
         cells = Any[_cell_index_values(c, ivar, indexname) for c in cells]
@@ -4540,6 +4537,16 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
             params, pidx)...)
     end
     return out, ctx, params
+end
+
+# The indices a non-level plate iterates, read from its authored iterator
+# when the model runs, as one vector: `collect(eachindex(x))`,
+# `collect(axes(x, d))` or `collect(a:b)`.
+function _plate_index_values(rkind)
+    iterator = rkind[1] === :coloncall ? rkind[2] :
+        rkind[1] === :eachindex ? Expr(:call, GlobalRef(Base, :eachindex), rkind[2]) :
+        Expr(:call, GlobalRef(Base, :axes), rkind[2], rkind[3])
+    return Expr(:call, GlobalRef(Base, :collect), iterator)
 end
 
 # A named simplex keeps the optimized shared-Categorical response. An
@@ -4611,10 +4618,7 @@ end
 function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
         broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
         arrays::Set{Symbol} = Set{Symbol}())
-    iterator = rkind[1] === :coloncall ? rkind[2] :
-        rkind[1] === :eachindex ? Expr(:call, GlobalRef(Base, :eachindex), rkind[2]) :
-        Expr(:call, GlobalRef(Base, :axes), rkind[2], rkind[3])
-    indices = Expr(:call, GlobalRef(Base, :collect), iterator)
+    indices = _plate_index_values(rkind)
     locals = Pair{Symbol,Any}[]
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
@@ -5000,14 +5004,7 @@ _has_crossed_cell_index(ex) = ex isa Expr &&
 function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
         plate_defs::Set{Symbol})
     axis = rkind[1] === :levels ? rkind[2] : nothing
-    indices = if axis === nothing
-        iterator = rkind[1] === :coloncall ? rkind[2] :
-            rkind[1] === :eachindex ? Expr(:call, GlobalRef(Base, :eachindex), rkind[2]) :
-            Expr(:call, GlobalRef(Base, :axes), rkind[2], rkind[3])
-        Expr(:call, GlobalRef(Base, :collect), iterator)
-    else
-        nothing
-    end
+    indices = axis === nothing ? _plate_index_values(rkind) : nothing
     locals = Pair{Symbol,Any}[]
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
@@ -5447,6 +5444,17 @@ function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx, params,
         setdiff!(bares, plate_defs)
         push!(ctx, (col, line, bares))
         rhs, per = _dotify_cell(c.args[2], ivar, pidx, false)
+        if !per && lc isa Expr
+            # An output that reads no per-index value still holds one value
+            # per index, as the Julia loop leaves it (snag
+            # `plate-output-of-c4a0ca87`): `c[i] = exp(a)` over three
+            # indices is three entries, so `c[2]`, `length(c)` and `sum(c)`
+            # read them. One RK plate over the plate's indices computes it;
+            # RK evaluates the cell's shared work once per call.
+            rhs = _plate_column_call(ivar, Pair{Symbol,Any}[], rhs, nothing;
+                indices = _plate_index_values(rkind))
+            per = true
+        end
         per && push!(pidx, col)
         return [Expr(:(=), col, rhs)]
     end

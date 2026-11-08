@@ -1042,7 +1042,11 @@ plate reads its live iterator.
 
 Cell locals belong to their cell, as a Julia loop body's locals do: two
 plates may each bind `m`. A statement outside the plate cannot read a cell
-local; assign it to an indexed output (`c[i] = m`) and read `c`.
+local; assign it to an indexed output (`c[i] = m`) and read `c`. An indexed
+output holds one value per index also when its cell reads no per-index value:
+`c[i] = exp(log_a)` over three indices is three entries, so `c[2]`,
+`length(c)` and `sum(c)` read them, and `exp(log_a)` is evaluated once per
+call.
 
 A cell runs once per index however many values it defines. Indexed outputs
 that share cell locals (`m = f(t[i], a); c[i] = m; r[i] = 2 .* m`), the
