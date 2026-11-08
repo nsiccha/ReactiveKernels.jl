@@ -223,11 +223,12 @@ end
 
 # The kernel ordinary AD differentiates. A body whose plate loops run as plate
 # programs (`_PlateProgram`, codegen.jl) is differentiated with those loops
-# inline, as it was lowered: a plate program receives the body's values as one
-# argument tuple, and registered Enzyme Reverse refuses a bound array stored
-# there beside an active value (`EnzymeRuntimeActivityError`, ReactiveKernelsPPL
-# `test_precompiled_build.jl`). A reverse sweep runs no vectorized loop, so the
-# gradient loses nothing the plate programs give the primal.
+# inline, as it was lowered. Differentiated as functions of their own, through
+# `_PlateCall`'s positional operands, the programs' loops vectorized in the
+# gradient too (two to eight Normal likelihoods over 2000 rows each: 28–33%
+# faster per gradient), but every program call cost native Reverse a fixed
+# amount: an RKPPL censored response over 10 rows, all censored, went 426 →
+# 544 ns per gradient (snag `sampler-type-dif-ea945700`).
 Base.@nospecializeinfer function _ad_inline_plate_programs(@nospecialize(kernel::PreparedKernel))
     _has_plate_programs(kernel.ast) || return kernel
     ast = _inline_plate_programs(kernel.ast)

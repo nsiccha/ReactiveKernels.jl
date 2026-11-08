@@ -16,6 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.114
+
+- A plate program (0.1.112) is now only the plate's cell work: its loop, the
+  invariants above it and the preparation of the arguments the cells read.
+  The body keeps the plate's setup and calls the program only when the domain
+  has cells, so a plate over no rows calls none.
+- A plate program is called with each operand as an argument of its own
+  (`_PlateCall`) instead of one argument tuple per call. Gradients still
+  differentiate the plate loops inline.
+- On Julia 1.13 a lowered body holding plate programs compares equal to its
+  `deepcopy`: a deep copy keeps each plate program, whose expression nothing
+  changes once built. Julia 1.13 compares an expression's leaves that are not
+  expressions by identity.
+
 ## 0.1.113
 
 - A non-allocating kernel (`prepare_nonallocating`, and through it
