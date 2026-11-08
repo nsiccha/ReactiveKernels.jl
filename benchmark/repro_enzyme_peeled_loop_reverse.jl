@@ -48,7 +48,7 @@
 # remains inlined is two loads per reverse step, the tape pointer and y's data
 # pointer, that LLVM does not hoist. Under --check-bounds=yes the repair does
 # not apply (Enzyme todo 16d9hce). RK's generated scan forms no such phi and is
-# unchanged by it (scan_plate_cell_reverse.jl, Enzyme todo 08khey3).
+# unchanged by it (scan_plate_cell_reverse.jl).
 using Enzyme, Random, Printf, Statistics
 
 const CONFIG = get(ENV, "ENZYME_CONFIG", "default")
