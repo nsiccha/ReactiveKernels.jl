@@ -110,6 +110,15 @@ Base.getindex(v::FactorReadVector, i::Int) = (push!(v.reads, i); v.values[i])
                 -1 + (residual / values.scale)^2, -residual / values.scale^2]
             @test gradient ≈ analytic
         end
+        # The world-age barrier passes the query by reference: it copies
+        # nothing per call beyond the boxed result (an immutable query was
+        # copied whole with its prepared operator, about 9 KB per call).
+        active = u[support]
+        direct() = ReactiveKernels.ad_value_and_gradient(compact.prepared, u, active,
+            compact.context...)
+        wrapped() = ad_value_and_gradient(compact, u, active)
+        direct(); wrapped()
+        @test (@allocated wrapped()) - (@allocated direct()) < 256
         all_prior = prepare_query(built, plan, select_factors(c; kind = :prior); u0 = u)
         all_jac = prepare_query(built, plan, select_factors(c; kind = :log_jacobian); u0 = u)
         @test all_prior(u) ≈ prepare_query(built, plan, :prior)(u)
