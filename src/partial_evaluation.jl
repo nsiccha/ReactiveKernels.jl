@@ -1567,17 +1567,6 @@ _lane_whole_part(n, parts::Vararg{Any,N}) where {N} =
 _readable_callee(::_LaneAssemble) = :lane_assemble
 _opname(::_LaneAssemble) = "lane_assemble"
 
-"""
-    _LaneAnchored(f)
-
-An arm body that reads no lane argument, given one it ignores so that plate
-lowering evaluates it once per lane.
-"""
-struct _LaneAnchored{F}
-    f::F
-end
-@inline (arm::_LaneAnchored)(anchor, args...) = arm.f(args...)
-
 _partition_plate_recipe(g, recipe, known, op, pending, want, fresh, lane_lengths) = nothing
 # Branch partitioning likewise consumes the operation metadata dynamically;
 # its residual operation still retains the precise generated kernel type.
@@ -1695,21 +1684,17 @@ Base.@nospecializeinfer function _partition_plate_recipe(
         end
     end
 
-    # An arm computed only from shared values (a constant fallback such as
-    # `-Inf`) does not vary per lane; as its own plate its cell would be one
-    # scalar rather than one value per lane. Such an arm is anchored to a
-    # bound lane argument (`_LaneAnchored`, which ignores it) so the native
-    # loop evaluates it per lane. Known lane
-    # values: bound lane-length vectors and live arguments declared as arrays,
-    # plus every cell value computed from one.
+    # Known lane values: bound lane-length vectors and live arguments declared
+    # as arrays, plus every cell value computed from one. The arm's recipes
+    # keep their actual dependencies: the plate's arguments retain its domain
+    # even when the arm reads only shared values. Its loop repeats that shared
+    # result per lane and skips all cell work when the domain is empty.
     lane_values = Set{ValueId}()
-    anchor = nothing
     for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
         index in atomic_inputs && continue
         cid = canon_id(inner.graph, input.id)
         if haskey(bound, cid)
             bound[cid] isa AbstractArray && length(bound[cid]) == n || continue
-            anchor === nothing && (anchor = input)
         else
             valtype(outer) <: AbstractArray || continue
         end
@@ -1757,19 +1742,13 @@ Base.@nospecializeinfer function _partition_plate_recipe(
         positions = typeof(native).parameters[side === :then ? 2 : 3]
         arm_f = getfield(native, side === :then ? :then_arm : :else_arm)
         arm_inputs = Value[branch_recipe.inputs[i] for i in positions]
-        anchored = !any(v -> canon_id(inner.graph, v.id) in lane_values, arm_inputs)
-        spliced = anchored ||
-            getfield(graphs, side === :then ? :then_spec : :else_spec) === nothing ?
+        spliced = getfield(graphs, side === :then ? :then_spec : :else_spec) === nothing ?
             nothing : _plate_branch_arm_kernel(inner, branch_index, side, graphs, names)
         spliced === nothing ||
             _partition_arm_hoists(spliced.plan, cell_ids, lane_roots, shared_roots,
                                   bound_roots) ||
             (spliced = nothing)
         kernel = if spliced === nothing
-            if anchored
-                arm_f = _LaneAnchored(arm_f)
-                pushfirst!(arm_inputs, anchor)
-            end
             arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form), arm_f,
                                      nothing, nothing,
                                      _kernel_endpoint_source_module(branch_recipe.op))
