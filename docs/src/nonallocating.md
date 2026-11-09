@@ -7,15 +7,16 @@ Main.ReactiveKernelsDocs.render_review_status(:review_pending_nonallocating)
 `prepare_nonallocating` changes how a kernel runs, not what it computes. It ships
 as an optional extension, so the base ReactiveKernels package keeps no hard
 dependency on MutatingFunctions (which is not registered yet) and still installs
-on its own on Julia 1.10.
+on its own on Julia 1.10. ReactiveKernelsPPL depends on it, and its sampler is
+non-allocating by default ([`prepare_sampler`](rkppl.md)).
 
-Install the reviewed MutatingFunctions revision and load both packages to
-activate the extension:
+Install the reviewed MutatingFunctions revision, the one ReactiveKernelsPPL's
+`[sources]` pins, and load both packages to activate the extension:
 
 ```julia
 using Pkg
 Pkg.add(url = "https://github.com/nsiccha/MutatingFunctions.jl",
-        rev = "4fc41b1c7b774133ceaacc4ff3c34c67b15b87b2")
+        rev = "02eb981b9770e767f47a7fda287fcbfb9531d587")
 
 using ReactiveKernels, MutatingFunctions
 ```
@@ -247,6 +248,6 @@ revision used above:
 julia --startup-file=no test/run_nonallocating_integration.jl
 ```
 
-This creates a temporary consumer environment, installs MutatingFunctions from
-the public URL at the pinned commit, develops the current ReactiveKernels tree,
-and runs the allocation/API tests.
+This creates a temporary consumer environment, develops MutatingFunctions from
+a checkout of the public URL at that pinned commit and the current
+ReactiveKernels tree, and runs the allocation/API tests.

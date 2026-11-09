@@ -16,6 +16,31 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.133
+
+- The sampler is non-allocating by default: `prepare_sampler`'s
+  `nonallocating` now defaults to `:auto`, which prepares the density and its
+  gradient over `ReactiveKernels.prepare_nonallocating`. Values and gradients
+  equal the ordinary sampler's; across 25 PosteriorDB models they are bitwise
+  equal, the gradient takes 0.977 of the ordinary time and the density 0.946
+  (geometric means under load), and the gradient allocates nothing except
+  where a sampled covariance is factored. `:auto` keeps the ordinary sampler
+  for `retain`, `native_forward_batch = true`, backends other than
+  reverse-mode `AutoEnzyme`, programs with a destructuring assignment (a
+  multi-output recipe), the opt-in plate reverse and programs whose plates run
+  as matrix products (RK's batched plates, which a non-allocating program runs
+  cell by cell). `nonallocating = true`
+  requires the non-allocating sampler, as before, and `nonallocating = false`
+  prepares the ordinary one. A query's type now holds a `NonAllocatingKernel`
+  by default; code that read `q.kernel` as a `PreparedKernel` passes
+  `nonallocating = false`.
+- MutatingFunctions is a dependency, no longer an optional one, so the default
+  needs no `using MutatingFunctions`. It is unregistered: `[sources]` pins it
+  by git URL, and an environment on Julia 1.10, which ignores `[sources]`,
+  adds `https://github.com/nsiccha/MutatingFunctions.jl` itself.
+  `ReactiveKernelsPPLMutatingFunctionsExt` no longer exists; its methods are
+  part of the package.
+
 ## 0.1.132
 
 - A cell or partition query evaluates the observations it names in the

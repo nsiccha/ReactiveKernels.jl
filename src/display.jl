@@ -176,6 +176,7 @@ _body_plan(op::_AuthoredScanOp) = op.kernel.plan
     recipe_inventory(graph::Graph)
     recipe_inventory(plan::Plan)
     recipe_inventory(kernel::PreparedKernel)
+    recipe_inventory(kernel::NonAllocatingKernel)
 
 Every recipe of a program and, recursively, of each plate and scan body, as a
 `Vector` of `(; kind, depth, parent, recipe)` entries in depth-first order: a
@@ -202,6 +203,7 @@ recipe_inventory(spec::KernelSpec) = recipe_inventory(kernel_graph(spec))
 recipe_inventory(g::Graph) = _recipe_inventory(g.recipes)
 recipe_inventory(p::Plan) = _recipe_inventory(p.recipes)
 recipe_inventory(k::PreparedKernel) = recipe_inventory(k.plan)
+recipe_inventory(k::NonAllocatingKernel) = recipe_inventory(k.plan)
 
 const _InventoryEntry = NamedTuple{(:kind, :depth, :parent, :recipe),
                                    Tuple{Symbol,Int,Int,Recipe}}

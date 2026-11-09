@@ -1,10 +1,9 @@
 using Pkg
-using UUIDs
 include(joinpath(@__DIR__, "..", "deps", "source_dependencies.jl"))
 
-const MUTATING_FUNCTIONS_URL = "https://github.com/nsiccha/MutatingFunctions.jl"
-const MUTATING_FUNCTIONS_REV = "4fc41b1c7b774133ceaacc4ff3c34c67b15b87b2"
-const MUTATING_FUNCTIONS_UUID = UUID("8a4c2d94-4b3b-4f9e-be63-a3c0cd816e3a")
+# MutatingFunctions comes from ReactiveKernelsPPL's source pin
+# (`rk_source_dependencies`), the revision every setup entrypoint uses.
+const MUTATING_FUNCTIONS_REV = rk_source_pins()["MutatingFunctions"]["rev"]
 
 root = normpath(joinpath(@__DIR__, ".."))
 testfiles = [joinpath(@__DIR__, "test_nonallocating.jl"),
@@ -22,11 +21,6 @@ testfiles = [joinpath(@__DIR__, "test_nonallocating.jl"),
 
 mktempdir() do env
     Pkg.activate(env)
-    Pkg.add(PackageSpec(url = MUTATING_FUNCTIONS_URL,
-                        rev = MUTATING_FUNCTIONS_REV))
-    dep = Pkg.dependencies()[MUTATING_FUNCTIONS_UUID]
-    dep.git_revision == MUTATING_FUNCTIONS_REV || error(
-        "expected MutatingFunctions revision $(MUTATING_FUNCTIONS_REV), got $(dep.git_revision)")
     # test_batched_nonallocating.jl exercises the reverse-mode gradient path, so
     # the integration environment also needs the AD and benchmarking stack.
     # test_ppl_glm_nonallocating_ad.jl needs the PPL surface plus Distributions
@@ -42,7 +36,7 @@ mktempdir() do env
     Pkg.develop(path = joinpath(root, "packages", "ReactiveKernelsPPLExamples"))
     Pkg.instantiate()
 
-    println("NONALLOCATING_DEP\tMutatingFunctions\t", dep.git_revision)
+    println("NONALLOCATING_DEP\tMutatingFunctions\t", MUTATING_FUNCTIONS_REV)
     julia = Base.julia_cmd()
     for testfile in testfiles
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $testfile`)

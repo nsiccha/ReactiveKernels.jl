@@ -435,7 +435,7 @@ function _latest_value(f::F, query, args::Vararg{Any,N}) where {F,N}
 end
 
 """
-    prepare_sampler(built, plan, u0::AbstractVector{<:Real}; backend, on_error = nothing, retain = (), warm = false, native_forward_batch = false, nonallocating = false) -> SamplerQuery
+    prepare_sampler(built, plan, u0::AbstractVector{<:Real}; backend, on_error = nothing, retain = (), warm = false, native_forward_batch = false, nonallocating = :auto) -> SamplerQuery
 
 Prepare a reusable [`SamplerQuery`](@ref): the `:sampler`-cut value kernel
 plus a `prepare_ad` gradient with `active = :unconstrained`. `u0` is a
@@ -472,24 +472,39 @@ reverse mode, wider, effectful, scan, and retained-output programs keep the
 ordinary reverse preparation. The opt-in forward preparation keeps a reverse
 operator for a later input with a different active shape.
 
-`nonallocating = true` prepares the density and its gradient over
-`ReactiveKernels.prepare_nonallocating`, which needs `using MutatingFunctions`
-in the calling session. Every operation with a destination-passing form then
-writes into a buffer the query owns: an evaluation reuses the same memory
-instead of allocating fresh observation-length intermediates (matrix-vector
-products, plate outputs) on every call. Values and gradients equal the
-ordinary sampler's. The density is usually faster, and loses less when another
-allocating process shares the CPU core; the reverse gradient is faster on some
-programs and slower on others, so measure both on the model you fit. The
-query keeps the buffers, which is why a query serves one caller at a time.
-Its type, like the ordinary sampler's, does not depend on the values of bound
-numbers: another binding of the same build reuses the compiled density and
-gradient, and each query still owns its buffers. Native forward batching does
-not apply, and ReactiveKernels does not build retained outputs over a
-non-allocating kernel yet, so `retain` fails there.
+The sampler is non-allocating by default. `nonallocating = :auto` prepares
+the density and its gradient over `ReactiveKernels.prepare_nonallocating`
+unless the request needs the ordinary sampler:
+- `retain`: ReactiveKernels does not build retained outputs over a
+  non-allocating kernel yet;
+- `native_forward_batch = true`: forward batching does not apply;
+- a backend other than reverse-mode `AutoEnzyme`: a dual-number backend cannot
+  run the non-allocating gradient;
+- a program with a multi-output recipe (a destructuring assignment), which a
+  non-allocating kernel does not take;
+- the opt-in plate reverse (`ReactiveKernels.with_plate_reverse`), which
+  differentiates the ordinary program;
+- a program whose plates run as matrix products (ReactiveKernels' batched
+  plates), which a non-allocating program runs cell by cell.
+
+`nonallocating = true` requires it, and those requests then fail;
+`nonallocating = false` prepares the ordinary sampler.
+
+A non-allocating sampler writes every operation with a destination-passing form
+into a buffer the query owns: an evaluation reuses the same memory instead of
+allocating fresh observation-length intermediates (matrix-vector products,
+plate outputs) on every call. Values and gradients equal the ordinary
+sampler's. The density is usually faster, and loses less when another
+allocating process shares the CPU core; the reverse gradient is faster on most
+programs and slower on some, so measure both on the model you fit
+(`nonallocating = false`). The query keeps the buffers, which is why a query
+serves one caller at a time. Its type, like the ordinary sampler's, does not
+depend on the values of bound numbers: another binding of the same build
+reuses the compiled density and gradient, and each query still owns its
+buffers.
 
 A program that factors a sampled covariance (`MvNormal` with a computed
-covariance, such as a Gaussian process) keeps the non-allocating density but
+covariance, such as a Gaussian process) keeps a non-allocating density but
 differentiates the ordinary program, and its gradient allocates what the
 ordinary gradient does. With every array of that density reused, reverse mode
 must tape them, because it cannot prove one buffer disjoint from another:
@@ -497,7 +512,10 @@ the gradient took 1.4 to 3 times the ordinary one.
 """
 function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real};
         backend, on_error = nothing, retain::Tuple = (), warm::Bool = false,
-        native_forward_batch::Bool = false, nonallocating::Bool = false)
+        native_forward_batch::Bool = false, nonallocating::Union{Bool,Symbol} = :auto)
+    choice = nonallocating
+    nonallocating = _sampler_nonallocating(choice, backend, retain,
+                                           native_forward_batch)
     built = _binding_build(built, plan)
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
@@ -514,6 +532,14 @@ function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real}
             (workflow_wants(:sampler), wants...); on_error,
             exemplars = exemplar)), wants
     end
+    # `:auto` also keeps the ordinary sampler for a program a non-allocating
+    # kernel cannot take, while the opt-in plate reverse is on, which
+    # differentiates ordinary programs, and for a program whose plates run as
+    # matrix products, which a non-allocating program runs cell by cell.
+    choice === :auto && nonallocating && (nonallocating =
+        ReactiveKernels._nonallocating_plan_supported(kern.plan) &&
+        !ReactiveKernels._plate_reverse_enabled() &&
+        !ReactiveKernels._runs_batched_plates(kern))
     # A factored sampled covariance differentiates the ordinary program.
     ordinary_gradient = nonallocating && isempty(wants) && _factors_covariance(kern)
     if nonallocating
@@ -530,6 +556,17 @@ function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real}
     prep = Base.invokelatest(prepare_ad, gradient_kernel, backend,
         u; active = :unconstrained, retain = wants, warm, forward...)
     return SamplerQuery(kern, prep, layout)
+end
+
+# `nonallocating = :auto` (decision `0nxki1e`): the non-allocating sampler
+# wherever it applies, the ordinary one where the request needs it.
+_sampler_nonallocating(choice::Bool, backend, retain::Tuple, forward_batch::Bool) = choice
+function _sampler_nonallocating(choice::Symbol, backend, retain::Tuple,
+                                forward_batch::Bool)
+    choice === :auto || throw(ArgumentError(
+        "`nonallocating` must be `true`, `false` or `:auto`; got $(repr(choice))"))
+    isempty(retain) && !forward_batch &&
+        ReactiveKernels._nonallocating_ad_default(backend)
 end
 
 # Whether a program factors a covariance: a recipe, in any plate or scan body,

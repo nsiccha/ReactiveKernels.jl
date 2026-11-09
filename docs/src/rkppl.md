@@ -1538,15 +1538,21 @@ Wider, effectful, scan and retained-output programs keep ordinary reverse.
 The optional path can allocate more tangent storage; measure both on the
 model you fit, and identify the mode used when reporting results.
 
-`prepare_sampler(...; nonallocating = true)` (with `using MutatingFunctions`)
+The sampler is non-allocating by default (`nonallocating = :auto`): it
 prepares the density and its gradient over
 `ReactiveKernels.prepare_nonallocating`. The query owns the buffers its
 operations write into, so repeated evaluations reuse the same memory instead
 of allocating observation-length intermediates on every call. That matters
 most when several sampler processes share a host, for example one process per
 chain. Values and gradients equal the ordinary sampler's; the density is
-usually faster, while the reverse gradient is faster on some programs and
-slower on others, so measure both on the model you fit.
+usually faster, while the reverse gradient is faster on most programs and
+slower on some, so measure both on the model you fit. `nonallocating = false`
+prepares the ordinary sampler. Under `:auto`, `retain`,
+`native_forward_batch = true`, backends other than reverse-mode `AutoEnzyme`,
+programs with a destructuring assignment (a multi-output recipe), the opt-in
+plate reverse and programs whose plates run as matrix products (batched plates,
+which a non-allocating program runs cell by cell) get the ordinary sampler;
+`nonallocating = true` requires the non-allocating one.
 
 - `:sampler` is the posterior preset; `:posterior` is the generated node's
   name, not a preset.

@@ -303,6 +303,12 @@ ReactiveKernels.ad_retains_primal_sweep(
     ::ReactiveKernels.DifferentiationInterface.AutoEnzyme{
         <:Union{Nothing,Enzyme.ReverseMode}}) = true
 
+# RKPPL's sampler prepares the non-allocating kernel by default for the same
+# reverse-mode backends (`ReactiveKernels._nonallocating_ad_default`).
+ReactiveKernels._nonallocating_ad_default(
+    ::ReactiveKernels.DifferentiationInterface.AutoEnzyme{
+        <:Union{Nothing,Enzyme.ReverseMode}}) = true
+
 # ------------------------------------------------- atomic shadow updates ----
 
 # Enzyme compiles every shadow accumulation as an atomic update whenever the

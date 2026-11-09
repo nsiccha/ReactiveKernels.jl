@@ -1,11 +1,28 @@
 using Pkg, TOML
 
 # Julia 1.10 ignores Project.toml [sources]. Supply the same exact source pins
-# to the batched Pkg.develop calls used by the repository's setup entrypoints.
-# Checkouts live beside the active environment so later test processes can
-# reuse its manifest. Each revision has its own immutable directory.
-function rk_source_dependencies(; project = joinpath(@__DIR__, "..", "Project.toml"))
-    sources = TOML.parsefile(project)["sources"]
+# to the batched Pkg.develop calls used by the repository's setup entrypoints:
+# the core package's and ReactiveKernelsPPL's (MutatingFunctions), which must
+# agree where both pin one package. Checkouts live beside the active
+# environment so later test processes can reuse its manifest. Each revision has
+# its own immutable directory.
+const RK_SOURCE_PROJECTS = (joinpath(@__DIR__, "..", "Project.toml"),
+    joinpath(@__DIR__, "..", "packages", "ReactiveKernelsPPL", "Project.toml"))
+
+function rk_source_pins(projects = RK_SOURCE_PROJECTS)
+    sources = Dict{String,Any}()
+    for project in projects
+        for (name, source) in get(TOML.parsefile(project), "sources", Dict())
+            get(sources, name, source) == source || error(
+                "$name is pinned twice with different sources: $(sources[name]) and $source ($project)")
+            sources[name] = source
+        end
+    end
+    return sources
+end
+
+function rk_source_dependencies(; projects = RK_SOURCE_PROJECTS)
+    sources = rk_source_pins(projects)
     root = joinpath(dirname(Base.active_project()), ".rk-deps")
     mkpath(root)
     specs = PackageSpec[]
