@@ -117,7 +117,7 @@ end
 # buffer of its own, `Z[i, g] = (X[g, i] - Σ_{j<i} F[i, j] Z[j, g]) / F[i, i]`,
 # each entry written once, so native reverse records no overwritten storage.
 # A non-allocating kernel passes its previous result as that buffer
-# (`ReactiveKernelsPPLMutatingFunctionsExt`).
+# (`src/mutating.jl`).
 #
 # The fresh buffer is zeroed although the solve writes every entry. When
 # `Matrix{Float64}(undef, …)` goes to the non-inlined `_lower_solve_rows!` and
@@ -229,7 +229,7 @@ end
 # full-length loops: `k³/3` multiply-adds instead of `k³` branches, each
 # entry written once. Checks and messages are the generic form's. A
 # non-allocating kernel passes its previous factor as `F`
-# (`ReactiveKernelsPPLMutatingFunctionsExt`). The fresh factor is zeroed for
+# (`src/mutating.jl`). The fresh factor is zeroed for
 # the reason `_lower_solve_rows` gives: with `undef` storage an active
 # covariance's Reverse gradient is wrong.
 _covariance_cholesky(Sigma::AbstractMatrix{Float64}, k) =

@@ -8705,10 +8705,16 @@ end
         "with $(map(typeof, args)). Prepare another kernel from exemplars of " *
         "the new types"))
 
+# Whether `prepare_nonallocating` can prepare `p`: every recipe has one output
+# (a destructuring assignment's recipe has several). RKPPL's sampler reads it
+# to keep the ordinary sampler for such a program under `nonallocating = :auto`.
+_nonallocating_plan_supported(p::Plan) = all(r -> length(r.outputs) == 1, p.recipes)
+
 function _prepare_nonallocating(p::Plan, cache_apply; have_types=nothing,
                                 exact_signature::Bool=false, passes=())
-    for r in p.recipes
-        length(r.outputs) == 1 || throw(ArgumentError(
+    if !_nonallocating_plan_supported(p)
+        r = first(r for r in p.recipes if length(r.outputs) != 1)
+        throw(ArgumentError(
             "prepare_nonallocating requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
     end
     rewritten, constants, callables, caches = _nonallocating_program(p; have_types,

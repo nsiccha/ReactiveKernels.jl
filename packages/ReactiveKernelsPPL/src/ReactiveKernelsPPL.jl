@@ -28,6 +28,7 @@ using LogExpFunctions: logaddexp, log1pexp, logit
 using Statistics: mean, std, var
 using SparseArrays: sparsevec
 using PrecompileTools: @setup_workload, @compile_workload
+import MutatingFunctions
 
 export ColumnRef, ParamName, ColumnData
 export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
@@ -156,6 +157,7 @@ include("scan.jl")
 include("cell_scan.jl")
 include("cell_latent.jl")
 include("observed_scan.jl")
+include("mutating.jl")
 
 include("precompile.jl")
 

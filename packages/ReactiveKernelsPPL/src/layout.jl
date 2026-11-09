@@ -614,7 +614,7 @@ end
 # The packed sampler input stays read-only. Native execution builds the
 # constrained vector in one buffer of its own, then reuses it for the prefix
 # sum. A non-allocating kernel passes its previous result as that buffer
-# (`ReactiveKernelsPPLMutatingFunctionsExt`).
+# (`src/mutating.jl`).
 @inline _ordered_constrain_native(u::AbstractVector{Float64}) =
     _ordered_constrain_native!(Vector{Float64}(undef, length(u)), u)
 

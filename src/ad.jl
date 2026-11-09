@@ -650,6 +650,14 @@ function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
             step_tainted = step_tainted || arg_tainted
             step_free = step_free && arg_free
         end
+        if caches[step] isa Base.RefValue && caches[step][] === nothing
+            # A step the exemplar call never ran (an untaken branch arm) has no
+            # buffer to offer: it allocates there, as the ordinary program does,
+            # and keeps no slot (as an unfilled lane, `_ad_na_concretize_cache`).
+            push!(elided, step)
+            return Expr(:call, Expr(:ref, _CALLABLES_ARG, step), rewritten...),
+                step_tainted, !step_tainted && step_free
+        end
         if !step_tainted && caches[step] isa Base.RefValue
             if step_free && !isempty(callargs)
                 # The step's seeded value, appended to the constants table.
@@ -663,8 +671,11 @@ function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
             return Expr(:call, Expr(:ref, _CALLABLES_ARG, step), rewritten...),
                 false, step_free
         end
+        # An array-valued plate's slot holds its cell kernel and their arrays
+        # (the MutatingFunctions extension's nested plate cache), not one
+        # array: its own driver fills it, below.
         if step_tainted && ops[step] isa _AuthoredPlateOp &&
-           caches[step] isa Base.RefValue
+           caches[step] isa Base.RefValue && caches[step][] isa AbstractArray
             # Hoist the nested cell kernel out of the constant operation table
             # into a direct literal: calling a closure-held nested RGF under
             # reverse-mode Enzyme trips activity analysis, while the identical
@@ -1589,6 +1600,14 @@ differences), carries dual numbers, or restores mutated memory in its reverse
 pass (Mooncake) must stay `false`.
 """
 ad_retains_primal_sweep(::DifferentiationInterface.AbstractADType) = false
+
+# Whether a non-allocating kernel's gradient (`prepare_ad` over a
+# `NonAllocatingKernel`) is the one RKPPL's sampler selects by default for
+# `backend` (`prepare_sampler(...; nonallocating = :auto)`). The engine's
+# package extension declares it, as for `ad_retains_primal_sweep`: ReactiveKernels'
+# Enzyme extension, for reverse-mode `AutoEnzyme`, the backend that default was
+# measured with. A dual-number backend cannot run that gradient at all.
+_nonallocating_ad_default(::DifferentiationInterface.AbstractADType) = false
 
 function _ad_require_retaining_backend(
         backend::DifferentiationInterface.AbstractADType, retain::Tuple)

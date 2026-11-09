@@ -1,10 +1,11 @@
-# `prepare_sampler(...; nonallocating = true)`: the sampler density and its
-# reverse gradient prepared over `prepare_nonallocating`. The query owns the
-# buffers its operations write into, so an evaluation reuses them instead of
+# The non-allocating sampler (`prepare_sampler`'s default, `nonallocating =
+# :auto`, and `nonallocating = true`): the sampler density and its reverse
+# gradient prepared over `prepare_nonallocating`. The query owns the buffers
+# its operations write into, so an evaluation reuses them instead of
 # allocating observation-length intermediates. Values and gradients equal the
-# ordinary sampler's. Runs only through `test/run_nonallocating_integration.jl`,
-# not the default suite, because it needs the unregistered MutatingFunctions
-# weak dependency.
+# ordinary sampler's (`nonallocating = false`). Runs through
+# `test/run_nonallocating_integration.jl`, whose environment pins the
+# unregistered MutatingFunctions.
 using ReactiveKernels
 using ReactiveKernelsPPL
 using MutatingFunctions
@@ -132,7 +133,8 @@ _na_gradient_bytes(q, g, u) = (sampler_value_and_gradient!(q, g, u);
             built = build_kernel(plan)
             n = built.layout.total
             us = [[0.1 * sin(k + s) for k in 1:n] for s in 0:2]
-            q = prepare_sampler(built, plan, us[1]; backend = NA_SAMPLER_BACKEND, warm = true)
+            q = prepare_sampler(built, plan, us[1]; backend = NA_SAMPLER_BACKEND, warm = true,
+                nonallocating = false)
             qna = prepare_sampler(built, plan, us[1]; backend = NA_SAMPLER_BACKEND,
                 warm = true, nonallocating = true)
             @test qna.kernel isa NonAllocatingKernel
@@ -157,7 +159,7 @@ end
     plan = first(_na_sampler_cases())[2]
     built = build_kernel(plan)
     u = [0.1 * sin(k) for k in 1:built.layout.total]
-    q = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND)
+    q = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND, nonallocating = false)
     qna = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND, nonallocating = true)
     ordinary = Base.invokelatest(_na_density_bytes, q, u)
     reused = Base.invokelatest(_na_density_bytes, qna, u)
@@ -177,10 +179,10 @@ end
     # covariance's factor and solve. The density is measured on the kernel:
     # the query's own call returns its value through a world-age barrier
     # (`SamplerQuery`), which boxes the number it returns. The simplex,
-    # ordered and `MvNormal` destinations come from RKPPL's MutatingFunctions
-    # extension; an environment whose manifest predates it allocates here.
-    @test Base.get_extension(ReactiveKernelsPPL,
-        :ReactiveKernelsPPLMutatingFunctionsExt) !== nothing
+    # ordered and `MvNormal` destinations are RKPPL's own `apply!!` methods
+    # (`src/mutating.jl`).
+    @test hasmethod(MutatingFunctions.apply!!, Tuple{Vector{Float64},
+        typeof(ReactiveKernelsPPL._ordered_constrain_kernel), Vector{Float64}, Int, Int})
     for (label, plan) in _na_sampler_cases()
         @testset "$label" begin
             built = build_kernel(plan)
@@ -194,7 +196,7 @@ end
                 # program (decision `0tqz3lo`), so its gradient allocates what
                 # the ordinary gradient does, and no more.
                 ordinary = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND,
-                    warm = true)
+                    warm = true, nonallocating = false)
                 @test 0 < bytes <= Base.invokelatest(_na_gradient_bytes, ordinary,
                     zeros(length(u)), u)
             else
@@ -312,7 +314,8 @@ end
         qB = prepare_sampler(built, bound(B), u; backend = NA_SAMPLER_BACKEND,
             nonallocating = true)
         @test typeof(qA) === typeof(qB)
-        ordinary = prepare_sampler(built, bound(B), u; backend = NA_SAMPLER_BACKEND)
+        ordinary = prepare_sampler(built, bound(B), u; backend = NA_SAMPLER_BACKEND,
+            nonallocating = false)
         g, gna = similar(u), similar(u)
         value, _ = sampler_value_and_gradient!(ordinary, g, u)
         value_na, _ = sampler_value_and_gradient!(qB, gna, u)
@@ -333,7 +336,7 @@ end
     # the preparation stays the ordinary reverse one and agrees.
     qf = prepare_sampler(built, plan, u; backend = AutoEnzyme(),
         nonallocating = true, native_forward_batch = true)
-    q = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND)
+    q = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND, nonallocating = false)
     g, gf = zeros(length(u)), zeros(length(u))
     @test first(sampler_value_and_gradient!(qf, gf, u)) ≈
         first(sampler_value_and_gradient!(q, g, u)) rtol = 1e-12
@@ -342,4 +345,48 @@ end
     # ReactiveKernels yet (capability gap, not a refused shape).
     @test_broken (prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND,
         nonallocating = true, retain = (:pointwise,)); true)
+end
+
+# The default, `nonallocating = :auto` (decision `0nxki1e`): the non-allocating
+# sampler with reverse-mode `AutoEnzyme`, the ordinary one where the request
+# needs it, and the same values either way.
+@testset "the sampler is non-allocating by default" begin
+    plan = first(_na_sampler_cases())[2]
+    built = build_kernel(plan)
+    u = [0.1 * sin(k) for k in 1:built.layout.total]
+    ordinary = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND,
+        nonallocating = false)
+    @test !(ordinary.kernel isa NonAllocatingKernel)
+    g = zeros(length(u))
+    value, _ = sampler_value_and_gradient!(ordinary, g, u)
+    agrees(q) = (gq = zeros(length(u)); vq = first(sampler_value_and_gradient!(q, gq, u));
+        isapprox(vq, value; rtol = 1e-12) && isapprox(gq, g; rtol = 1e-10, atol = 1e-12))
+    for backend in (NA_SAMPLER_BACKEND, AutoEnzyme())
+        q = prepare_sampler(built, plan, u; backend)
+        @test q.kernel isa NonAllocatingKernel
+        @test typeof(q) === typeof(prepare_sampler(built, plan, u; backend,
+            nonallocating = :auto))
+        @test agrees(q)
+    end
+    # The requests that keep the ordinary sampler under `:auto`.
+    retained = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND,
+        retain = (:pointwise,))
+    @test !(retained.kernel isa NonAllocatingKernel)
+    @test agrees(retained)
+    batched = prepare_sampler(built, plan, u; backend = AutoEnzyme(),
+        native_forward_batch = true)
+    @test !(batched.kernel isa NonAllocatingKernel)
+    @test agrees(batched)
+    forward = prepare_sampler(built, plan, u; backend = AutoEnzyme(; mode = Enzyme.Forward))
+    @test !(forward.kernel isa NonAllocatingKernel)
+    @test agrees(forward)
+    # The opt-in plate reverse differentiates the ordinary program; its own
+    # gradients are `test_plate_reverse.jl`'s. (A destructuring assignment's
+    # program: `test_destructuring.jl`.)
+    reversed = ReactiveKernels.with_plate_reverse() do
+        prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND)
+    end
+    @test !(reversed.kernel isa NonAllocatingKernel)
+    @test_throws ArgumentError prepare_sampler(built, plan, u;
+        backend = NA_SAMPLER_BACKEND, nonallocating = :always)
 end

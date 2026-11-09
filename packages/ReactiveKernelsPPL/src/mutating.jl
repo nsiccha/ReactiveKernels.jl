@@ -1,18 +1,11 @@
-module ReactiveKernelsPPLMutatingFunctionsExt
-
 # Destination forms of RKPPL's own array-valued helpers. A non-allocating
-# kernel (`ReactiveKernels.prepare_nonallocating`, and through it
-# `prepare_sampler(...; nonallocating = true)`) keeps a buffer for a step only
-# when a registered `MutatingFunctions.apply!!` method fills it. Each method
-# below receives the step's previous result, writes the new one into its
-# storage with the loops the ordinary helper runs, so values are bitwise
-# unchanged, and falls back to the ordinary helper when the shape changed.
-
-import MutatingFunctions
-using ReactiveKernelsPPL: _ordered_constrain_kernel, _ordered_constrain_native!,
-    _simplex_constrain_logjac_kernel, _simplex_constrain_logjac_native!,
-    _covariance_cholesky, _covariance_cholesky!, _lower_solve_rows,
-    _lower_solve_rows!
+# kernel (`ReactiveKernels.prepare_nonallocating`, which the sampler prepares
+# by default: `prepare_sampler(...; nonallocating = :auto)`) keeps a buffer for
+# a step only when a registered `MutatingFunctions.apply!!` method fills it.
+# Each method below receives the step's previous result, writes the new one
+# into its storage with the loops the ordinary helper runs, so values are
+# bitwise unchanged, and falls back to the ordinary helper when the shape
+# changed.
 
 @inline function MutatingFunctions.apply!!(y::Vector{Float64},
         ::typeof(_ordered_constrain_kernel), u::AbstractVector{Float64},
@@ -45,6 +38,4 @@ end
     size(Z) == reverse(size(X)) && !Base.mightalias(Z, X) &&
         !Base.mightalias(Z, F) || return _lower_solve_rows(X, F)
     _lower_solve_rows!(Z, X, F)
-end
-
 end

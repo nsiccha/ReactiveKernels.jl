@@ -16,6 +16,27 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.129
+
+- `prepare_ad` over a `NonAllocatingKernel` differentiates a plate whose cells
+  return arrays: it raised `MethodError: no method matching
+  size(::_NestedPlateCache)`.
+- `prepare_ad` over a `NonAllocatingKernel` differentiates a program whose
+  exemplar call left a branch arm untaken: a step in that arm allocates, as
+  the ordinary program does. It raised `ArgumentError: AD preparation over a
+  non-allocating kernel requires every retained cache slot to be seeded`.
+- A non-allocating kernel reads the buffer an authored plate or scan output
+  keeps through a slot typed by that output's array type, so the program is
+  concretely typed (it was a `Ref{Any}`).
+- New: `recipe_inventory(::NonAllocatingKernel)`, as for a `PreparedKernel`.
+- `ReactiveKernels._nonallocating_ad_default(backend)`,
+  `ReactiveKernels._nonallocating_plan_supported(plan)` and
+  `ReactiveKernels._runs_batched_plates(kernel)`, internal: whether
+  ReactiveKernelsPPL's sampler prepares a non-allocating kernel by default for
+  `backend` (the Enzyme extension declares it for reverse-mode `AutoEnzyme`),
+  for `plan`, and for an ordinary program that runs a plate as matrix
+  products. ReactiveKernelsPPL 0.1.133 reads them.
+
 ## 0.1.128
 
 - A scan whose step keeps its types runs every step in its loop. A native scan

@@ -22,7 +22,12 @@ function ReactiveKernels._nested_plate_cache(op::ReactiveKernels._AuthoredPlateO
     all(r -> length(r.outputs) == 1, p.recipes) || return nothing
     cell = ReactiveKernels._prepare_nonallocating(p, cache_apply!;
         have_types=celltypes)
-    result = Array{T,N}(undef, ntuple(_ -> 0, N)...)
+    # The plate keeps an owned copy of each cell's result (`cache_apply!`), so
+    # its elements have the copy's type: a cell that reads a slice in place
+    # returns a `SubArray`, which the plate stores as the `Vector` it copies to.
+    R = Base.promote_op(copy, T)
+    isconcretetype(R) || return nothing
+    result = Array{R,N}(undef, ntuple(_ -> 0, N)...)
     Ref(_NestedPlateCache(cell, result))
 end
 

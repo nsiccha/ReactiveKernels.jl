@@ -1232,9 +1232,14 @@ function _nonallocating_program(p::Plan; have_types = nothing,
     # streamed into its plate, a row computed in a cell) leaves its lane unused.
     mentioned = _nonalloc_mentions!(Set{Symbol}(), body)
     lanes = Any[]
-    for (_, lane) in recycle
+    for (cid, lane) in recycle
         lane in mentioned || continue
-        j = _step!(prog, _NonallocLane(), Ref{Any}(nothing))
+        # Typed by the value's inferred array type, so the program reads it
+        # concretely (`_lane_reuse`); an uninferred value keeps a `Ref{Any}`.
+        A = get(values, cid, Any)
+        slot = A isa Type && A <: Array && isconcretetype(A) ?
+            Base.RefValue{Union{Nothing,A}}(nothing) : Ref{Any}(nothing)
+        j = _step!(prog, _NonallocLane(), slot)
         push!(lanes, Expr(:(=), lane, Expr(:ref, _CACHES_ARG, j)))
     end
     prepend!(body.args, lanes)

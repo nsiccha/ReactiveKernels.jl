@@ -70,6 +70,16 @@ _plate_batching_enabled() = get(ENV, "RK_BATCHED_PLATES", "1") != "0"
 
 # Cells per tile: one product per tile and statement.
 const _PLATE_BATCH_TILE = 256
+
+# Whether a prepared program runs a plate as matrix products: every batched
+# plate's tile loop reads `_PLATE_BATCH_TILE`. A non-allocating program's plates
+# run cell by cell (its lowering keeps `plate_element_types`), so RKPPL's sampler
+# keeps an ordinary program that batches under `nonallocating = :auto`.
+_runs_batched_plates(k) = _reads_batch_tile(code_expr(k))
+_reads_batch_tile(x) = x isa GlobalRef && x.mod === (@__MODULE__) && x.name === :_PLATE_BATCH_TILE
+_reads_batch_tile(ex::Expr) = any(_reads_batch_tile, ex.args)
+# An extracted plate's body (`_extract_plate_programs`) holds its tile loop.
+_reads_batch_tile(program::_PlateProgram) = _reads_batch_tile(program.ast)
 # The fewest cells the tiles run for: a query of a few rows (one cell's window)
 # gains nothing from a product over them.
 const _PLATE_BATCH_MIN = 16

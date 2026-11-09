@@ -1215,10 +1215,20 @@ end
     buffer = slot[]
     buffer isa Array{T,N} && axes(buffer) == output_axes ? buffer : nothing
 end
+# A non-allocating program's lane slot typed by its value's array type
+# (`_nonallocating_program`): the same reuse, read concretely. A buffer of
+# another type is not kept.
+@inline function _lane_reuse(slot::Base.RefValue{Union{Nothing,A}}, ::Type{T},
+                             output_axes::NTuple{N,Any}) where {A<:Array,T,N}
+    buffer = slot[]
+    buffer isa Array{T,N} && axes(buffer) == output_axes ? buffer : nothing
+end
 # Record a freshly allocated buffer in a slot; other recycled values (WANT
 # scratch, destination columns, `nothing`) are owned by the position driver.
 @inline _lane_keep!(recycled, value) = value
 @inline _lane_keep!(slot::Base.RefValue{Any}, value) = (slot[] = value; value)
+@inline _lane_keep!(slot::Base.RefValue{Union{Nothing,A}}, value) where {A<:Array} =
+    (value isa A && (slot[] = value); value)
 
 # The intermediates of a plate cell in a position residual keep lane slots
 # across cells (`_plate_nested_native!`), but the cell's result is stored by
@@ -1377,11 +1387,16 @@ _lane_may_reference(::Tuple{}, @nospecialize(buffer)) = false
 #   loads conservatively (about 1 µs per gradient on small models), and a
 #   merged buffer lost its derivative in scans. That program keeps the
 #   exemplar's shapes and element types; another one fails loudly.
+# - Each allocation argument has a type parameter of its own: Julia does not
+#   specialize a method on an untyped argument that holds a type (the element
+#   type `similar` receives), so the allocation inferred as `Any` there.
 const _LANE_ACQUIRE_ARITIES = 1:4
 for arity in _LANE_ACQUIRE_ARITIES
     args = [Symbol(:allocation_argument_, i) for i in 1:arity]
+    params = [Symbol(:AllocationArgument, i) for i in 1:arity]
+    typed = [:($a::$P) for (a, P) in zip(args, params)]
     @eval @noinline function _lane_acquire(recycled, ::Type{T}, output_axes,
-                                           allocate::F, $(args...)) where {T,F}
+                                           allocate::F, $(typed...)) where {T,F,$(params...)}
         buffer = _lane_reuse(recycled, T, output_axes)
         buffer === nothing ? _lane_keep!(recycled, allocate($(args...))) : buffer
     end

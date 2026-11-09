@@ -488,20 +488,23 @@ end
         Base.invokelatest(observations, -u)
         @test isequal(first, before)
     end
-    # Fewer bytes than separate products under native Enzyme reverse.
-    bytes = map((:named, :separate)) do kind
+    # Fewer bytes than separate products under native Enzyme reverse, for the
+    # ordinary sampler; the default, non-allocating one allocates nothing for
+    # either.
+    bytes = map(Iterators.product((:named, :separate), (false, :auto))) do (kind, mode)
         case = _ma_column_case(kind, 200)
         plan = lower_rkppl(case.ast, Set(keys(case.data));
             conditioned = (:y1, :y2), mod = @__MODULE__)
         bound = bind_data(plan, case.data)
         built = build_kernel(bound)
         u = [0.1sin(i) for i in 1:built.layout.total]
-        q = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        q = prepare_sampler(built, bound, u; backend = _GEN_BACKEND, nonallocating = mode)
         g = similar(u)
         sampler_value_and_gradient!(q, g, u)
         @allocated sampler_value_and_gradient!(q, g, u)
     end
-    @test bytes[1] < bytes[2]
+    @test bytes[1, 1] < bytes[2, 1]
+    @test bytes[1, 2] == bytes[2, 2] == 0
 end
 
 # `B * v` contracts `v` with the columns of the matrix `B`, as in Julia. A
