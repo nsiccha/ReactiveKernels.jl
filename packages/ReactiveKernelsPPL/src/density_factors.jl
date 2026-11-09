@@ -799,6 +799,15 @@ function _prepare_factor_query_ad(prepare_operator, built, plan, selection, back
         prepared = Base.invokelatest(prepare_operator, shared.kernel, backend,
             Base.front(exemplars)..., Base.front(point)..., context...;
             active = :_ppl_cell_active)
+        # The selection keeps its plan behind one reference, which an operator
+        # that boxes its plan takes unchanged (`ReactiveKernels._ad_plan_argument`,
+        # as `_LabelPlans` does): boxing it on every call allocated the reference
+        # each time, 64 B for one plate and 368 B for three. Its position is one
+        # past the selection's own, after the slot map `context` starts with.
+        q.plan_index === nothing || (context = Base.setindex(context,
+            ReactiveKernels._ad_plan_argument(prepared,
+                ReactiveKernels._PartitionPlanRef(context[q.plan_index + 1])),
+            q.plan_index + 1))
         return FactorQueryAD(prepared, built.layout, selected, context)
     end
     kernel = Base.invokelatest(_prepare_cached, plan, q.spec; have = q.have, want = q.want,
