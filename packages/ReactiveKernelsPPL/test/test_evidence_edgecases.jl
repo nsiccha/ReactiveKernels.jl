@@ -36,3 +36,78 @@ end
         end
     end
 end
+
+# rkppl-use §9: "`-Inf`/`Inf` removes a bound", also per row of bound data
+# (snag rkppl-censored-v-43aaa6f9: one response vector with a per-row
+# detection limit, `-Inf` on its measured rows).
+const _INF_BOUND_LO = [-Inf, 0.0, -Inf, 0.2, -Inf, 0.0]
+const _INF_BOUND_HI = [Inf, Inf, 2.0, 2.0, Inf, 1.5]
+
+@testset "infinite bound data removes its side's bound on its rows" begin
+    normal(q) = EvidenceD.Normal(q.a, q.s)
+    poisson(q) = EvidenceD.Poisson(exp(q.a))
+    # The sampler density includes the log-Jacobian `log(s)` of `s = exp(u)`.
+    prior(q) = hasproperty(q, :s) ?
+        EvidenceD.logpdf(EvidenceD.Normal(0, 2), q.a) +
+            EvidenceD.logpdf(EvidenceD.Exponential(1.0), q.s) + log(q.s) :
+        EvidenceD.logpdf(EvidenceD.Normal(0, 1), q.a)
+    nq, pq = (a = 0.7, s = 0.6), (a = 0.4,)
+    np = (:(a ~ Normal(0, 2)), :(s ~ Exponential(1.0)))
+    pp = (:(a ~ Normal(0, 1)),)
+    cases = (
+        # The reporter's law: a lower detection limit on some rows only.
+        (np, :(censored.(Normal.(a, s), lo, Inf)), Dict(:y => [1.2, 0.9, 0.5, 1.4, 0.5, 1.1],
+            :lo => [-Inf, -Inf, 0.5, -Inf, 0.5, -Inf]), nq, normal,
+            (d, y, i, D) -> EvidenceD.logpdf(EvidenceD.censored(d, D[:lo][i], Inf), y)),
+        (np, :(censored.(Normal.(a, s), lo, hi)), Dict(:y => [1.2, 0.9, 0.5, 1.4, -0.5, 1.5],
+            :lo => _INF_BOUND_LO, :hi => _INF_BOUND_HI), nq, normal,
+            (d, y, i, D) -> EvidenceD.logpdf(EvidenceD.censored(d, D[:lo][i], D[:hi][i]), y)),
+        # The truncation normalizer of a row without a bound is that of the open side.
+        (np, :(truncated.(Normal.(a, s), lo, hi)), Dict(:y => [1.2, 0.9, 0.5, 1.4, -0.5, 1.1],
+            :lo => _INF_BOUND_LO, :hi => _INF_BOUND_HI), nq, normal,
+            (d, y, i, D) -> EvidenceD.logpdf(EvidenceD.truncated(d, D[:lo][i], D[:hi][i]), y)),
+        # A scalar datum removes the bound for every row.
+        (np, :(truncated.(Normal.(a, s), lo, 2.0)), Dict(:y => [1.2, 0.9, -0.5], :lo => -Inf), nq, normal,
+            (d, y, i, D) -> EvidenceD.logpdf(EvidenceD.truncated(d, -Inf, 2.0), y)),
+        # An `Inf` interval upper end is the right-censored event (y, Inf).
+        (np, :(interval_censored.(Normal.(a, s), hi)), Dict(:y => [1.2, 0.9, 0.5, 1.4, 0.5, 1.1],
+            :hi => [2.0, Inf, 1.0, Inf, 0.9, Inf]), nq, normal,
+            (d, y, i, D) -> log(EvidenceD.cdf(d, D[:hi][i]) - EvidenceD.cdf(d, y))),
+        # Discrete endpoints never convert an infinity to an integer.
+        (pp, :(truncated.(Poisson.(exp.(a .+ 0 .* x)), lo, hi)), Dict(:y => [0, 3, 2, 5, 1, 4],
+            :lo => [-Inf, 1.0, -Inf, 2.0, -Inf, 1.0], :hi => [Inf, Inf, 4.0, Inf, 3.0, Inf],
+            :x => zeros(6)), pq, poisson,
+            (d, y, i, D) -> EvidenceD.logpdf(EvidenceD.truncated(d, D[:lo][i], D[:hi][i]), y)),
+        (pp, :(censored.(Poisson.(exp.(a .+ 0 .* x)), lo, hi)), Dict(:y => [0, 1, 2, 5, 3, 4],
+            :lo => [-Inf, 1.0, -Inf, 2.0, -Inf, 1.0], :hi => [Inf, Inf, 4.0, Inf, 3.0, Inf],
+            :x => zeros(6)), pq, poisson,
+            (d, y, i, D) -> EvidenceD.logpdf(EvidenceD.censored(d, D[:lo][i], D[:hi][i]), y)),
+        (pp, :(interval_censored.(Poisson.(exp.(a .+ 0 .* x)), hi)), Dict(:y => [0, 1, 2, 3, 1, 0],
+            :hi => [2.0, Inf, 4.0, Inf, 3.0, Inf], :x => zeros(6)), pq, poisson,
+            (d, y, i, D) -> log(EvidenceD.cdf(d, D[:hi][i]) - EvidenceD.cdf(d, y))),
+    )
+    for (priors, law, data, q, dist, reference) in cases
+        expr = Expr(:block, priors..., :(y .~ $law))
+        bound, built, k, u = _evidence_query(expr, data, q)
+        ll = sum(reference(dist(q), y, i, data) for (i, y) in enumerate(data[:y]))
+        Base.invokelatest() do
+            @test k(u) ≈ prior(q) + ll atol = 1e-10
+            sampler = prepare_sampler(built, bound, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+            value, g = sampler_value_and_gradient!(sampler, similar(u), u)
+            fd = [(k(u .+ 1e-6 .* (1:length(u) .== j)) - k(u .- 1e-6 .* (1:length(u) .== j))) / 2e-6
+                  for j in eachindex(u)]
+            @test all(isfinite, g)
+            @test g ≈ fd rtol = 1e-5 atol = 1e-6
+        end
+    end
+    # refused: NaN and the opposite infinity bound nothing (rkppl-use §9)
+    expr = quote a ~ Normal(0, 1); y .~ censored.(Normal.(a, 1.0), lo, hi) end
+    for (lo, hi) in (([NaN, -Inf], [Inf, Inf]), ([Inf, -Inf], [Inf, Inf]),
+                     ([-Inf, -Inf], [Inf, -Inf]), ([-Inf, -Inf], [Inf, NaN]))
+        data = Dict(:y => [0.1, 0.2], :lo => lo, :hi => hi)
+        @test_throws "finite numerics" bind_data(lower_rkppl(expr, data; conditioned = (:y,)), data)
+    end
+    expr = quote a ~ Normal(0, 1); y .~ truncated.(Normal.(a, 1.0), lo, 2.0) end
+    data = Dict(:y => [0.1, 0.2], :lo => Inf)
+    @test_throws "must be finite or -Inf" bind_data(lower_rkppl(expr, data; conditioned = (:y,)), data)
+end
