@@ -16,13 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.133
+## 0.1.134
 
 - `jax_source(spec; data, definitions)`: a definition may read a raw data
   value that is no input of the program (a value the program reads only
   through a copy, `_rkppl_value_r => :r`). `prepare_data` takes it as a
   parameter, typed by its value in `data`. ReactiveKernelsPPL 0.1.142 uses
   this so `prepare_data` asks for authored names only.
+
+## 0.1.133
+
+- A scan with two or more outputs (two carried arrays, or a carried array and
+  a sampled innovation) reads each trajectory out of its shared recurrence
+  through a column plate. That plate's row is now named by the source, like
+  the scan's seeds and steps, instead of with `gensym`'s process counter. An
+  `@rkppl` declaration holding such a scan, in a `@plate` cell or at top
+  level, bound again to the same data or at other sizes now gives an equal
+  `kernel_expr`, as ReactiveKernelsPPL 0.1.136 states for what a model call
+  generates. Built types, values and gradients are unchanged: two builds of
+  one binding already shared their types. Snag `kernel-expr-scan-1a8411f4`.
 
 ## 0.1.132
 
