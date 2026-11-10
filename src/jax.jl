@@ -2418,6 +2418,34 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
         v === nothing && _jax_error("broadcasting `", f, "`", _jax_where(ctx))
         return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args))
     end
+    # A function of each vector of a padded vector of vectors (`Diagonal.(rows)`
+    # of a ragged plate's per-cell arguments) maps over the rows, each a padded
+    # vector of its length, as a plate maps its cells: Julia applies `f` to
+    # each row, not to each number.
+    if length(args) == 1 && ctx.host === nothing && _jax_ragged(only(args).T) &&
+       ndims(only(args).T) == 1 && eltype(only(args).T) <: AbstractVector{<:Number} &&
+       !isempty(only(args).extent)
+        x = only(args)
+        outer = ctx.scope
+        fname = _jax_fresh(ctx, :row_function)
+        inner = _JaxScope(outer)
+        inner.indent = outer.indent + 1
+        row = _jax_identifier(inner.used, :row)
+        n = _jax_identifier(inner.used, :row_length)
+        saved = copy(ctx.locals)
+        ctx.scope = inner
+        v = try
+            _jax_call(ctx, f, [_PyVal(row, eltype(x.T), false, n)])
+        finally
+            ctx.scope = outer
+            empty!(ctx.locals); merge!(ctx.locals, saved)
+        end
+        push!(outer.lines, "    "^outer.indent * "def " * fname * "(" * row * ", " * n * "):")
+        append!(outer.lines, inner.lines)
+        push!(outer.lines, "    "^inner.indent * "return " * v.code)
+        return _PyVal("jax.vmap(" * fname * ")(" * x.code * ", " * x.extent * ")", Vector{v.T},
+                      false, x.extent)
+    end
     # Any other scalar function: a module-level function translated once over
     # scalar arguments, vectorized over the operands.
     name = _jax_scalar_function!(ctx, f, eltypes)

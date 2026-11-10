@@ -274,6 +274,13 @@ const _JAX_CASES = (
             y[g] ~ MvNormal(fill(mu, length(y[g])), s^2 * I(length(y[g])))
         end
     end))() | (; y = [[0.1, 0.2, 0.0], Float64[], [0.0, 0.1]]),
+    # A diagonal covariance per cell (`Diagonal.(rows)` of the cells' vectors).
+    mvnormal_diagonal = () -> (@rkppl(begin
+        mu ~ Normal(0, 1); s ~ Exponential(1.0)
+        @plate for g in eachindex(y)
+            y[g] ~ MvNormal(fill(mu, length(y[g])), Diagonal(fill(s^2, length(y[g]))))
+        end
+    end))() | (; y = [[0.1, 0.2, 0.0], [0.3], [0.0, 0.1]]),
     # A dense covariance literal per cell.
     mvnormal_dense = () -> (@rkppl(begin
         mu ~ Normal(0, 1); s ~ Exponential(1.0); r ~ Uniform(-0.5, 0.5)
