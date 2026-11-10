@@ -47,6 +47,7 @@ const _PPL_TEST_FILES = (
     "test_emitted_names.jl",
     "test_native_generator_capture.jl",
     "test_native_matrix_cell_reverse.jl",
+    "test_lognormal_statistics_reverse.jl",
     "test_concurrent_build.jl",
     "test_fresh_module.jl",
     "test_precompiled_build.jl",

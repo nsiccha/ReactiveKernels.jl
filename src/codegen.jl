@@ -7214,6 +7214,7 @@ function _compile(ast::Expr, context::Module, native_context::GlobalRef)
     cache_module = something(_image_target_module(), context)
     cache_module === context && return RuntimeGeneratedFunctions.drop_expr(f)
     Base.invokelatest(RuntimeGeneratedFunctions.init, cache_module)
+    _mark_generated_callfunc_recursion!(cache_module)
     # The cache and generated method must share an owner on Julia 1.12: a
     # generator defined in an older dependency cannot read new global bindings.
     # Julia's macro hygiene resolves globals in `context` while preserving
@@ -8593,6 +8594,81 @@ end
     throw(ArgumentError("this kernel was prepared from exemplar argument " *
         "types $(Tuple(fieldtypes(S))) and was called with $(map(typeof, args)); " *
         "prepare another kernel for the new types"))
+
+# A prepared child a body calls (`_KernelPreparedChild`, a plate cell's or a
+# lazy arm's kernel) is entered through the same methods as its caller:
+# `_prepared_call`, an `_ArrayFunction`'s call, `_native_array_body_call` and
+# the generated function's `generated_callfunc`. Julia's inference treats each
+# such recurring method edge as possible unbounded recursion and limits the
+# inner signature, as for nested source operations (`core.jl`,
+# `_mark_source_call_recursion!`). Whether it does depends on what the
+# inference cache already holds: inferred cold, a prepared child that owns a
+# plate or scan, called inside a lazy arm, infers `Any` while the same call
+# infers concretely once its pieces were inferred at top level. Native
+# preparation usually leaves them inferred; Enzyme infers in a cache of its
+# own, so the derivative met the abstract value: a LogNormal `var()` read by
+# a plate over observation rows failed static Reverse with
+# `EnzymeRuntimeActivityError`, and one computed in a plate cell gave a
+# `Vector{Any}` cell buffer (snags `native-lognormal-a666a8e1`,
+# `native-truncated-9d7d9eda`). Each nesting level is a different prepared
+# program (a program can call only programs that already exist), so the
+# recursion is well founded unless the inner callee is the outer one or its
+# type contains the outer's, which keep Julia's default limiting.
+_prepared_callee_type(@nospecialize(T)) = T isa DataType &&
+    (T <: PreparedKernel || T <: _ArrayFunction || T <: _PrecompileWarmFunction ||
+     T <: RuntimeGeneratedFunctions.RuntimeGeneratedFunction)
+
+# The prepared program a prepared-call signature runs: its first parameter
+# that is one.
+function _prepared_call_identity(@nospecialize(sig))
+    tuple = Base.unwrap_unionall(sig)
+    tuple isa DataType || return nothing
+    for parameter in tuple.parameters
+        _prepared_callee_type(parameter) && return parameter
+    end
+    return nothing
+end
+
+# The `recursion_relation` of the prepared-call methods (arguments as for
+# `_source_call_recursion_well_founded`).
+function _prepared_call_recursion_well_founded(
+        @nospecialize(method), @nospecialize(callee),
+        @nospecialize(sig), @nospecialize(parent_sig))
+    inner = _prepared_call_identity(sig)
+    outer = _prepared_call_identity(parent_sig)
+    (inner === nothing || outer === nothing) && return false
+    return inner !== outer && !_type_mentions(inner, outer)
+end
+
+# The `generated_callfunc` methods in `mod`: the one
+# `RuntimeGeneratedFunctions.init(mod)` defines for the generated functions
+# cached there, and in ReactiveKernels also its `_PrecompileWarmFunction`
+# method. Only modules whose cache ReactiveKernels creates are marked, so the
+# generated functions of other packages keep Julia's default limiting.
+function _mark_generated_callfunc_recursion!(mod::Module)
+    hasfield(Method, :recursion_relation) || return nothing
+    for method in methods(RuntimeGeneratedFunctions.generated_callfunc)
+        method.module === mod || continue
+        isdefined(method, :recursion_relation) &&
+            method.recursion_relation === _prepared_call_recursion_well_founded &&
+            continue
+        method.recursion_relation = _prepared_call_recursion_well_founded
+    end
+    return nothing
+end
+
+# Every ReactiveKernels method a prepared child re-enters. Run once all of
+# them are defined (`ReactiveKernels.jl`); `_compile` marks the
+# `generated_callfunc` of each package cache it creates.
+function _mark_prepared_call_recursion!()
+    hasfield(Method, :recursion_relation) || return nothing
+    for method in (methods(_prepared_call)..., methods(_native_array_body_call)...,
+                   which(Tuple{_ArrayFunction,Any,Any,Vararg{Any}}))
+        method.recursion_relation = _prepared_call_recursion_well_founded
+    end
+    _mark_generated_callfunc_recursion!(@__MODULE__)
+    return nothing
+end
 
 # The compiled body's type is new for every prepared kernel, so specializing
 # this assembly step on it would compile code that is never reused.

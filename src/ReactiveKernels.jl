@@ -127,6 +127,7 @@ export prepare_reactive, prepare_reactive_nonallocating, statevalue, touch!, mut
 export reactive_program
 
 _mark_source_call_recursion!()
+_mark_prepared_call_recursion!()
 
 include("deepcopy_code.jl")
 include("precompile.jl")
