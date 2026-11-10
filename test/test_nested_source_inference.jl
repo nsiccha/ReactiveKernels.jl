@@ -166,3 +166,136 @@ end
         end
     end
 end
+
+# A prepared child that owns a plate, whose cell calls a child with a lazy arm
+# into a scan child, called itself inside a lazy arm: the shape of
+# DistributionKernels' one-sided LogNormal `var()`. Each call re-enters the
+# prepared-call methods. Inferred cold, as Enzyme infers in a cache of its
+# own, the parent inferred `Any` although native inference, warmed by
+# preparation, was concrete; an RKPPL sampler whose observation plate read
+# that value failed static Reverse (snag `native-lognormal-a666a8e1`).
+module PreparedChildInferenceFixtures
+using ReactiveKernels
+const NODES = (0.1, 0.4, 0.7, 0.95)
+const WEIGHTS = (0.3, 0.3, 0.25, 0.15)
+
+@kernel tail_fraction(z::Float64) = begin
+    n::Int = ceil(Int, 6 + 4 / (abs(z) + 1))
+    path = scan(n:-1:2, Ref(z); init = 1.0) do t, k, z
+        next = k / (abs(z) + 1 + t)
+        (next, next)
+    end
+    t::Float64 = last(path)
+    return t
+end
+@kernel cell_value(z::Float64) = begin
+    result::Float64 = if z < 0.5
+        1 - z^2 / 10
+    else
+        tail_fraction(z)
+    end
+    return result
+end
+@kernel quadrature(c::Float64, s::Float64) = begin
+    nodes = NODES
+    weights = WEIGHTS
+    terms = plate(nodes, weights, Ref(c), Ref(s)) do x, w, c, s
+        w * (cell_value(c + s * x) + cell_value(c - s * x))
+    end
+    return s^2 * sum(terms)
+end
+@kernel lazy_parent(c::Float64, s::Float64) = begin
+    result::Float64 = if s <= 2.0
+        quadrature(c, s)
+    else
+        s^2
+    end
+    return result
+end
+@kernel parent_density(q::Vector{Float64}) = begin
+    return lazy_parent(q[1], exp(q[2]))
+end
+
+function tail_reference(z)
+    n = ceil(Int, 6 + 4 / (abs(z) + 1))
+    t = 1.0
+    for k in n:-1:2
+        t = k / (abs(z) + 1 + t)
+    end
+    t
+end
+cell_reference(z) = z < 0.5 ? 1 - z^2 / 10 : tail_reference(z)
+quadrature_reference(c, s) = s^2 * sum(w * (cell_reference(c + s * x) +
+    cell_reference(c - s * x)) for (x, w) in zip(NODES, WEIGHTS))
+parent_reference(c, s) = s <= 2.0 ? quadrature_reference(c, s) : s^2
+end
+
+@testset "A prepared child in a lazy arm infers concretely in a cold interpreter" begin
+    F = PreparedChildInferenceFixtures
+    # A fresh Enzyme interpreter cache: cold for every method above, whatever
+    # native inference holds (Enzyme's own `test/inference_recursion.jl`).
+    cold() = Enzyme.Compiler.Interpreter.EnzymeInterpreter(
+        VERSION >= v"1.11.0-DEV.1552" ? gensym(:prepared_child_inference) :
+            Enzyme.Compiler.GPUCompiler.CodeCache(),
+        nothing, Base.get_world_counter(), false, false, false)
+    for (spec, reference) in ((F.quadrature, F.quadrature_reference),
+                              (F.lazy_parent, F.parent_reference))
+        k = prepare(spec)
+        @test only(Base.code_typed(k, (Float64, Float64);
+                                   interp = cold(), optimize = false))[2] === Float64
+        for (c, s) in ((0.3, 0.7), (-1.2, 1.5), (0.4, 2.5))
+            @test Base.invokelatest(k, c, s) ≈ reference(c, s)
+        end
+    end
+
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    k = prepare(F.parent_density)
+    for q in ([0.3, log(0.7)], [-1.2, log(1.5)])
+        before = copy(q)
+        ad = prepare_ad(k, backend, q; active=:q)
+        value, gradient = Base.invokelatest(ad_value_and_gradient, ad, q)
+        h = 1e-6
+        central = map(1:2) do i
+            up, down = copy(q), copy(q)
+            up[i] += h
+            down[i] -= h
+            (F.parent_reference(up[1], exp(up[2])) -
+             F.parent_reference(down[1], exp(down[2]))) / 2h
+        end
+        @test value ≈ F.parent_reference(q[1], exp(q[2]))
+        @test gradient ≈ central rtol=1e-6
+        @test q == before
+    end
+end
+
+@testset "Prepared-call recursion relation" begin
+    RK = ReactiveKernels
+    F = PreparedChildInferenceFixtures
+    relation = RK._prepared_call_recursion_well_founded
+    inner, outer = prepare(F.cell_value), prepare(F.quadrature)
+    I, O = typeof(inner), typeof(outer)
+    call = typeof(RK._prepared_call)
+    # A different prepared program called inside another is well founded.
+    @test relation(nothing, nothing, Tuple{call,I,Tuple{Float64},Val{1}},
+                   Tuple{call,O,Tuple{Float64,Float64},Val{2}})
+    # The same program again, and a call that is not a prepared call, keep
+    # Julia's default limiting.
+    @test !relation(nothing, nothing, Tuple{call,O,Tuple{Float64,Float64},Val{2}},
+                    Tuple{call,O,Tuple{Int,Float64},Val{2}})
+    @test !relation(nothing, nothing, Tuple{typeof(sin),Float64},
+                    Tuple{call,O,Tuple{Float64,Float64},Val{2}})
+    if hasfield(Method, :recursion_relation)
+        marked = [methods(RK._prepared_call)..., methods(RK._native_array_body_call)...,
+                  which(Tuple{RK._ArrayFunction,Any,Any,Vararg{Any}})]
+        @test all(method -> method.recursion_relation === relation, marked)
+        # The generated-function methods of ReactiveKernels' own cache; those
+        # of other modules keep Julia's default.
+        own = filter(method -> method.module === RK,
+            collect(methods(RK.RuntimeGeneratedFunctions.generated_callfunc)))
+        @test !isempty(own)
+        @test all(method -> method.recursion_relation === relation, own)
+        @test all(method -> !isdefined(method, :recursion_relation),
+            filter(method -> method.module === RK.RuntimeGeneratedFunctions,
+                   collect(methods(RK.RuntimeGeneratedFunctions.generated_callfunc))))
+    end
+end
