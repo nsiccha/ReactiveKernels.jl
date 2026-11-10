@@ -36,8 +36,9 @@ are recorded in the git history only.
   the last bits. An authored plate computed at rows, and any value a plate
   reads as a lane, keep their one-row arrays. On an RKPPL partition sampler
   over one cell per subject (24 subjects, 10 observations each), one subject's
-  local gradient went from 2.20 µs / 1,232 B to 0.47 µs / 592 B (todo
-  `1yggoad`).
+  local gradient went from 1.22–1.28 µs / 1,232 B to 0.45–0.47 µs / 592 B,
+  6.2–6.4 to 2.3–2.4 times its share of a whole-model gradient, with bitwise
+  equal values and gradients (todo `1yggoad`).
 
 ## 0.1.135
 

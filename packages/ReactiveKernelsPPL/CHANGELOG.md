@@ -24,10 +24,12 @@ are recorded in the git history only.
   0.1.136, now the compat floor), and computes the subject-level values its
   cell reads there as numbers instead of one-element arrays. Values are equal
   (a design row times its coefficients is summed in column order, so a value
-  through it can differ in the last bits). On BRM's `unit_cost.jl` PK toy (24
-  subjects, 10 observations), one subject's local partition gradient went from
-  29 to 17 allocations (2,144 to 1,248 bytes per call). Partitions whose keys
-  repeat a label are unchanged. Todo `1yggoad`.
+  through it can differ in the last bits). On BRM's `unit_cost.jl` toys (24
+  subjects), one subject's local partition gradient went from 2,144 to 1,248
+  bytes (PK) and 9,440 to 7,712 bytes (joint PK/QT), and its time from 2.0–2.3
+  to 1.4–1.6 (PK) and 4.2–4.3 to 3.4–3.6 (joint) times its share of a
+  whole-cohort sweep, with bitwise equal values and gradients. Partitions
+  whose keys repeat a label are unchanged. Todo `1yggoad`.
 
 ## 0.1.142
 
