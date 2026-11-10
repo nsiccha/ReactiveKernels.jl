@@ -489,6 +489,17 @@ end
     return total
 end
 
+# RK's tie-exact `logaddexp` (mixture densities) and integer `div` (a mode
+# index `div(b - 1, k) % m + 1`).
+@kernel jax_tie_div(x::Vector{Float64}, a::Float64, k::Int) = begin
+    lse = plate(x) do xi
+        ReactiveKernels._tie_exact_logaddexp(a * xi, -xi)
+    end
+    q = div(length(x) - 1, k) % 3 + 1
+    total = sum(lse) + q * a
+    return total
+end
+
 # Scans whose step reads the outputs so far (`history`): a vector of leading
 # entries, and a scalar fill read up to the step's own index.
 @kernel jax_history_leading(xs::Vector{Float64}, a::Float64) = begin
@@ -785,6 +796,7 @@ end
     M = [1.0 2.0; 3.0 4.0; 5.0 6.0]
     cases = ((jax_scan_tuple, (:a, :xs), (0.5, xs)), (jax_scan_named, (:a, :xs), (0.5, xs)),
              (jax_history_leading, (:a, :xs), (0.7, xs)), (jax_history_indexed, (:a, :xs), (0.7, xs)),
+             (jax_tie_div, (:a, :x, :k), (0.7, xs, 2)),
              (jax_scan_merge, (:a, :xs, :u0), (0.5, xs, 1.0)), (jax_dims, (:a, :M), (0.5, M)))
     srcs = [jax_source(k; have, want = :total) for (k, have, _) in cases]
     @test !occursin(".shape[0] - 1][", string(srcs[2]))

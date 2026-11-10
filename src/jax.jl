@@ -1528,6 +1528,9 @@ const _JAX_ELEMENTWISE = Dict{Any,String}(
     _native_exp => "jnp.exp",
     sinpi => "_rk_sinpi", cospi => "_rk_cospi",
 )
+# RK's own tie-exact `logaddexp` (mixture and log-sum-exp folds): JAX's has
+# its values, non-finite inputs included, and the (1/2, 1/2) gradient at a tie.
+_jax_elementwise(::typeof(_tie_exact_logaddexp)) = "jnp.logaddexp"
 # LogExpFunctions functions that only some of its supported versions define.
 for (name, py) in ((:log1msq, "_rk_log1msq"), (:logcosh, "_rk_logcosh"),
                    (:log2mexp, "_rk_log2mexp"), (:cexpexp, "_rk_cexpexp"),
@@ -1790,6 +1793,23 @@ for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp
         _jax_result($f, args, $name * "(" * x.code * ")")
     end
 end
+# `div(a, b)` of integers truncates toward zero, as Julia's does (lowered
+# code reaches it as `checked_sdiv_int`): Python integers when both are
+# known while tracing, else `jax.lax.div`.
+function _jax_function_call(ctx::_JaxContext, ::typeof(div), args::Vector{_PyVal})
+    length(args) == 2 && all(a -> a.T isa Type && a.T <: Integer, args) ||
+        return _jax_traceable_or_lowered(ctx, div, args)
+    a, b = args
+    if _jax_known(ctx, a) && _jax_known(ctx, b)
+        code = "(abs(" * a.code * ") // abs(" * b.code * ") * (1 if (" * a.code * " >= 0) == (" *
+               b.code * " >= 0) else -1))"
+        return _PyVal(code, Int, true)
+    end
+    ctx.host === nothing || _jax_error("`div` of host values that are not known", _jax_where(ctx))
+    _PyVal("jax.lax.div(jnp.asarray(" * a.code * ", dtype=jnp.int64), jnp.asarray(" * b.code *
+           ", dtype=jnp.int64))", Int)
+end
+
 # `merge(a, b)` of named tuples (tuples of their fields, in order): each
 # field of the merged type from the last argument that has it.
 function _jax_function_call(ctx::_JaxContext, ::typeof(merge), args::Vector{_PyVal})

@@ -36,6 +36,9 @@ are recorded in the git history only.
   entry at its length, and `vcat` of values before a padded vector adds their
   lengths to its extent. Such a cell's scan raised `ConcretizationTypeError`
   in Python (a traced `jnp.arange` stop).
+- RK's tie-exact `logaddexp` (mixture densities) translates as
+  `jnp.logaddexp`, and integer `div` (lowered as `checked_sdiv_int`, as in an
+  HSGP mode index) truncates toward zero as in Julia.
 - `sum(x; init)` and `prod(x; init)` translate; `sinpi` and `cospi` translate,
   their argument reduced to `[-1, 1]` first. `sum`, `prod`, `maximum` and
   `minimum` with `dims = d` reduce that axis and keep it, as Julia does.
