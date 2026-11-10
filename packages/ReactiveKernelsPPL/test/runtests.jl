@@ -197,6 +197,7 @@ const _PPL_TEST_FILES = (
     "test_scan_recurrence_capabilities.jl",
     "test_scan_history.jl",
     "test_stochastic_cell_scan.jl",
+    "test_cell_scan_tuple_carry.jl",
     "test_cell_vector_latents.jl",
     "test_cell_joint_latents.jl",
     "test_observed_scan.jl",
