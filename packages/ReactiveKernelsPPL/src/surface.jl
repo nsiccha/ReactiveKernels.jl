@@ -6803,6 +6803,21 @@ _is_doc_macro(m) =
     (Meta.isexpr(m, :., 2) && first(m.args) in (:Core, :Base) &&
         last(m.args) isa QuoteNode && last(m.args).value === Symbol("@doc"))
 
+# A docstring documents a declaration. `@plate` and `@scan` blocks are loops
+# that bind no name of their own, and Julia refuses to document a loop
+# (`cannot document the following expression`), so the docstring is refused
+# here, naming it, rather than being read as a nested block.
+function _block_docstring_message(text::String, macro_name::Symbol)
+    first_line = first(split(text, '\n'))
+    shown = length(first_line) > 48 ? first(first_line, 45) * "..." : first_line
+    stmt = macro_name === Symbol("@plate") ? "y[i] ~ ..." : "h[t] ~ ..."
+    return "docstring $(repr(shown)) before a `$macro_name` block: a " *
+        "docstring documents a `~`, `.~` or `=` declaration, and a " *
+        "`$macro_name` block is a loop, which Julia does not document. " *
+        "Write the docstring before a declaration inside the block (above " *
+        "`$stmt`), where it is retained, or use a `#` comment"
+end
+
 function _unwrap_trivia(st::Expr)
     while st.head === :macrocall
         if st.args[1] === Symbol("@plate") && length(st.args) == 4
@@ -6816,6 +6831,8 @@ function _unwrap_trivia(st::Expr)
                 st.args[end] isa Expr ||
                 _sfail("only `@doc \"...\" <statement>` docstring form " *
                        "unwraps here")
+            _is_block_macro(st.args[end]) &&
+                _sfail(_block_docstring_message(st.args[3], st.args[end].args[1]))
             st = st.args[end]
             continue
         end
@@ -8069,9 +8086,6 @@ function _reject_statement(st::Expr)
     elseif head in (:function, :macro, :return, :local, :global, :struct,
         :module, :import, :using, :export)
         return _sfail("`$head` does not lower at model level")
-    elseif head === :macrocall && !isempty(st.args) &&
-            st.args[1] === Symbol("@plate")
-        return _sfail("docstrings on `@plate` blocks do not lower")
     end
     return _sfail("unsupported model statement $(repr(st)) " *
                   "(only `~`, `.~`, `=` and reserved macros lower)")

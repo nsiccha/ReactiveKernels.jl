@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.138
+
+- A docstring written before a top-level `@plate` or `@scan` block now fails
+  with a `SurfaceLoweringError` that quotes the docstring and says to write it
+  before a declaration inside the block (where it is retained) or to use a `#`
+  comment. It used to fail saying `@plate` is only admitted at model top level
+  (nested plates do not lower), or that `@scan` must not be nested inside
+  another macro, although the block was at top level. A docstring on a loop
+  stays refused, as in Julia (`cannot document the following expression`).
+  Models that lowered before lower unchanged. Snag `rkppl-docstring-454e2a8c`.
+
 ## 0.1.137
 
 - An undotted `*` beside a value that may be an array stays Julia's product.
