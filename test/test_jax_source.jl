@@ -184,6 +184,31 @@ end
     return y
 end
 
+# `clamp` is translated from Base's own straight-line code, whose
+# `convert(promote_type(...), x)` passes a type as a value (snag
+# `jax-source-clamp-af26e700`). The cell is an HSGP basis function of a
+# clamped input; `clamp.(x, 0, 1)` converts integer bounds.
+@kernel jax_clamp(x::Vector{Float64}, lo::Float64, hi::Float64, w::Float64) = begin
+    v = plate(x) do xi
+        sin(sqrt(w) * ((clamp(xi, lo, hi) - 0.5) + 2.0)) / sqrt(2.0)
+    end
+    c = clamp.(x, 0, 1)
+    s = sum(v) + sum(c .^ 2)
+    return s
+end
+@kernel jax_clamp_scalar(t::Float64) = begin
+    y = 3.0 * clamp(t, -1.0, 2.0)
+    return y
+end
+# Type arguments that a plain helper's lowered code passes as values: a global
+# (`Int`, `Float64`) and a type-level call (`promote_type`).
+jax_test_typed(x) = floor(Int, x) * sum(ones(promote_type(typeof(x), Int), 2)) +
+                    convert(Float64, 3)
+@kernel jax_typed(x::Float64) = begin
+    y = jax_test_typed(x)
+    return y
+end
+
 # A straight-line plain helper, translated from its lowered code: its literal
 # powers and `eltype` are type values there (`Val{2}`, `Float64`), which bind
 # no Python local.
@@ -617,6 +642,15 @@ end
     @test [f.name for f in multi.functions] == ["log_density", "both", "named"]
     @test occursin("DIMENSION = 2", string(multi))
     @test occursin("return {\"density\": ", string(multi))
+    # `clamp` keeps Julia's two `ifelse` selections; `jnp.clip` would give a
+    # bound tie half the derivative.
+    clamped = string(jax_source(jax_clamp; have = (:x, :lo, :hi, :w), want = :s))
+    @test occursin("jnp.where(", clamped)
+    @test !occursin("jnp.clip", clamped)
+    @test !occursin(r"<[a-z]", clamped)
+    typed = string(jax_source(jax_typed; have = (:x,), want = :y))
+    @test occursin("jnp.floor(x)", typed)
+    @test !occursin(r"<[a-z]", typed)
 end
 
 @testset "jax_source: refused constructs" begin
@@ -715,6 +749,27 @@ end
         g(rho) = native(rho, R, 0.3)
         @test r.value ≈ g(0.7) rtol = 1e-12
         @test r.grad ≈ only(rk_fd_gradient(u -> g(only(u)), [0.7])) rtol = 1e-6
+
+        native = prepare(jax_clamp; have = (:x, :lo, :hi, :w), want = :s)
+        src = jax_source(jax_clamp; have = (:x, :lo, :hi, :w), want = :s)
+        xc = [0.1, -0.3, 0.9, 1.4, 0.25, 0.0, 1.0]
+        @test rk_jax_evaluate(src, "kernel", (xc, 0.0, 1.0, 0.7)).value ≈
+              native(xc, 0.0, 1.0, 0.7) rtol = 1e-12
+        # No entry at a bound, where finite differences are one-sided.
+        xg = xc[1:5]
+        r = rk_jax_evaluate(src, "kernel", (xg, 0.0, 1.0, 0.7); grad = true)
+        @test r.grad ≈ rk_fd_gradient(u -> native(u, 0.0, 1.0, 0.7), xg) rtol = 1e-6
+        # At a bound Julia's `clamp` returns `x` (its `ifelse` selects it), so
+        # the derivative there is the inner one, 3.
+        src = jax_source(jax_clamp_scalar; have = (:t,), want = :y)
+        for (t, d) in ((0.5, 3.0), (-1.5, 0.0), (2.5, 0.0), (-1.0, 3.0), (2.0, 3.0))
+            r = rk_jax_evaluate(src, "kernel", (t,); grad = true)
+            @test r.value ≈ 3.0 * clamp(t, -1.0, 2.0) rtol = 1e-12
+            @test r.grad ≈ d rtol = 1e-12
+        end
+        native = prepare(jax_typed; have = (:x,), want = :y)
+        src = jax_source(jax_typed; have = (:x,), want = :y)
+        @test rk_jax_evaluate(src, "kernel", (2.7,)).value ≈ native(2.7) rtol = 1e-12
     end
 end
 
