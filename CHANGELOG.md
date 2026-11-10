@@ -16,6 +16,29 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.130
+
+- New: `plate_partition(…; single = true)` declares that every key holds each
+  label exactly once, so a partition is one cell of each named plate (one
+  subject's cell of a plate over subjects). The partition then runs that cell
+  at one `Int` row, as `plate_cell` does, instead of over a vector of one row.
+  A key that holds a label zero or several times throws `ArgumentError` at
+  evaluation. Without `single`, partitions are unchanged.
+- A plate cell, and a partition with `single = true`, computes the values it
+  reads at its one row as numbers where it can, instead of one-element arrays
+  with an Enzyme shadow each. A capture the cell reads outside every branch at
+  one position per cell asks for that one row as an `Int`; a value of one
+  element per row read there only by such reads or by other such values is a
+  number: a pointwise expression, a product `A * w` with a vector `w`, a column
+  `A[:, k]`, a direct gather `v[I]` or `A[I, k]` and a `vcat` of numbers and
+  vectors. Values are equal; a product row `A[r, :] * w` is summed in column
+  order, so values and gradients through it can differ from Base's product in
+  the last bits. An authored plate computed at rows, and any value a plate
+  reads as a lane, keep their one-row arrays. On an RKPPL partition sampler
+  over one cell per subject (24 subjects, 10 observations each), one subject's
+  local gradient went from 2.20 µs / 1,232 B to 0.47 µs / 592 B (todo
+  `1yggoad`).
+
 ## 0.1.129
 
 - `prepare_ad` over a `NonAllocatingKernel` differentiates a plate whose cells

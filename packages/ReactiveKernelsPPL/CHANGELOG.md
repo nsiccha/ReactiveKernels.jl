@@ -16,6 +16,19 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.140
+
+- A partition query or sampler whose keys hold each label once, such as one
+  `@plate` cell per subject partitioned by subject, runs each partition as
+  that one cell at one row (ReactiveKernels `plate_partition(…; single = true)`,
+  0.1.130, now the compat floor), and computes the subject-level values its
+  cell reads there as numbers instead of one-element arrays. Values are equal
+  (a design row times its coefficients is summed in column order, so a value
+  through it can differ in the last bits). On BRM's `unit_cost.jl` PK toy (24
+  subjects, 10 observations), one subject's local partition gradient went from
+  29 to 17 allocations (2,144 to 1,248 bytes per call). Partitions whose keys
+  repeat a label are unchanged. Todo `1yggoad`.
+
 ## 0.1.139
 
 - Base's named numbers are those numbers: `Inf`, `NaN`, `pi`, `π`, `ℯ` and the
