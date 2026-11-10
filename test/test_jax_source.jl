@@ -218,6 +218,29 @@ jax_test_plain(w, x) = zero(eltype(x)) + sum(x) * w^2 + w^-1
     return s
 end
 
+# A plain helper's lowered code reads module globals (`M.f` is
+# `getproperty(M, :f)`), builds `Val` tags, and forwards a Vararg method's
+# arguments with a splat (`Core._apply_iterate`). StanBlocks' `@deffun`
+# methods do all of it: `StanBlocks.jcall(Val{:f}(), _JuliaCallScope{M}(),
+# args...)` finds `f` with `getglobal(M, :f)` and splats the arguments into it
+# (snag jax-source-stanb-06917e13).
+module JaxTestDispatch
+struct Scope{M} end
+callee(::Scope{M}, ::Val{name}) where {M,name} = getglobal(M, name)
+call(tag::Val, scope::Scope, args::Vararg{Any,N}) where {N} = callee(scope, tag)(args...)
+scaled(x, w) = JaxTestDispatch.call(Val{:*}(), Scope{Base}(), x, w)
+applied(f, x) = f(x) + x
+pair_sum(x, w) = (t = (x, w); +(t...))
+end
+jax_test_dispatch(w, x) =
+    JaxTestDispatch.call(Val{:scaled}(), JaxTestDispatch.Scope{JaxTestDispatch}(), w, sum(x)) +
+    JaxTestDispatch.call(Val(:applied), JaxTestDispatch.Scope{JaxTestDispatch}(), sin, w) +
+    JaxTestDispatch.pair_sum(w, x[1])
+@kernel jax_dispatch(w::Float64, x::Vector{Float64}) = begin
+    s = jax_test_dispatch(w, x)
+    return s
+end
+
 @traceable jax_test_count(x::AbstractVector, n::Integer) = begin
     acc = zero(eltype(x))
     for i in 1:n
@@ -696,6 +719,12 @@ end
     plain = string(jax_source(jax_plain; have = (:w, :x), want = :s))
     @test occursin("w ** 2", plain)
     @test !occursin(r"<[a-z]", plain)
+    # Module reads, `Val` tags and Vararg splats resolve while emitting: only
+    # the arithmetic they reach is emitted.
+    dispatch = string(jax_source(jax_dispatch; have = (:w, :x), want = :s))
+    @test occursin("jnp.sin(w)", dispatch)
+    @test !occursin(r"<[a-z]", dispatch)
+    @test !occursin("None", dispatch)
     # Static guards are Python conditionals over NumPy values, not `lax.cond`.
     guarded = string(jax_source(jax_literal_guard; have = (:x,), want = :t))
     @test occursin("np.isfinite(", guarded)
@@ -790,6 +819,11 @@ end
         r = rk_jax_evaluate(src, "kernel", (0.7, x); grad = true)
         @test r.value ≈ native(0.7, x) rtol = 1e-12
         @test r.grad ≈ 2 * 0.7 * sum(x) - 0.7^-2 rtol = 1e-10
+        native = prepare(jax_dispatch; have = (:w, :x), want = :s)
+        src = jax_source(jax_dispatch; have = (:w, :x), want = :s)
+        r = rk_jax_evaluate(src, "kernel", (0.7, x); grad = true)
+        @test r.value ≈ native(0.7, x) rtol = 1e-12
+        @test r.grad ≈ sum(x) + cos(0.7) + 2 rtol = 1e-10
         x6 = [x; 1.5]
         native = prepare(jax_reshapes; have = (:a, :x), want = :total)
         src = jax_source(jax_reshapes; have = (:a, :x), want = :total)
