@@ -2052,6 +2052,14 @@ rows. Native Enzyme Reverse differentiates it with the label a constant, and
 a vector input's gradient is nonzero only on the positions the partition
 reads. A plate whose domain is not one-dimensional is refused at evaluation.
 
+`plate_partition(…; single = true)` declares that every key holds each label
+exactly once: a partition is then one cell of each named plate (one subject's
+cell of a plate over subjects), and it runs that cell at one `Int` row, as
+`plate_cell` runs its cell, instead of over a vector of one row. A key that
+holds a label zero or several times throws `ArgumentError` at evaluation.
+ReactiveKernelsPPL passes it when every key column of a partition query is
+unique and the keys hold the same labels.
+
 `partition_footprint(kernel, args...)` returns, for each HAVE port, the
 sorted linear positions the evaluation with those arguments reads, or
 `:whole` for a port read whole: the body is lowered once more in a mode that
@@ -2179,7 +2187,19 @@ A partition's windows hold their rows sorted and unique, the union of what
 their readers ask for, and a read finds its row by bisection: a partition of
 r cells reading a value row by row costs O(r log r), never O(r²), and a value
 gathered at the rows of many cells is computed once per distinct row. A
-single cell's windows hold its few rows as read. A literal
+single cell's windows hold its few rows as read. A cell that reads a capture
+outside every branch at one position per cell asks for that one row as an
+`Int` (a read a branch may skip asks for the in-bounds rows, which an inactive
+invalid index leaves empty). A value of one element per row asked for at one
+such row only by those reads, or by other values computed this way, is
+computed as one number instead of a one-element array: a pointwise
+expression over numbers, vectors read at the row, columns `A[:, k]` and the
+left factor of `A * w` with a vector `w` (read through a non-allocating row
+`_CellRow`), direct gathers `v[I]` and `A[I, k]` with the index as a number, a
+product `A * w`, and a `vcat` of numbers and vectors. Its window then holds
+that number, and neither it nor its Enzyme shadow is allocated. An authored
+plate computed at rows, and any value a plate reads as a lane, keeps its
+one-row array. A literal
 range `A[lo:hi]` or a reshape computed at rows reads a vector source only
 (linear positions of a matrix are not its rows): a matrix source is refused
 by name (`:operands`), an untyped one checked at evaluation.
