@@ -191,7 +191,9 @@ end
 # ODL JAX handoff: a Python caller rebinds raw data without Julia). A scalar
 # data value `s` reaches the program as the definition
 # `s = _bound_value(_rkppl_value_s)`: the caller passes `s`, and
-# `_rkppl_value_s` is that value. A derived definition whose binding guards
+# `_rkppl_value_s` is that value; likewise the observed value of a
+# conditioned declaration `y`, `_rkppl_conditioned_y`, is the `y` the caller
+# passes. A derived definition whose binding guards
 # missing observations (a presence mask spliced from the data) is not
 # translated: `prepare_data` takes it as an input, listed in `UNTRANSLATED`.
 # Frozen definitions (`frozen_values`) stay inputs, as their values come from
@@ -216,6 +218,14 @@ function _jax_data_definitions(plan::StructuralPlan, names)
             # only through the copy (`v = a .* r`).
             authored = Symbol(chopprefix(str, "_rkppl_value_"))
             _is_bound_value_call(get(exprs, authored, nothing)) && (found[nm] = authored)
+        elseif startswith(str, "_rkppl_conditioned_")
+            # The observed value of a conditioned declaration
+            # (`y ~ LogDensity(f, …)` bound `| (; y)`), which the program
+            # reads as `y = _rkppl_conditioned_y`: the caller passes it by
+            # its authored name, as it passes a response.
+            authored = Symbol(chopprefix(str, "_rkppl_conditioned_"))
+            authored in _conditioned_inputs(plan) && _conditioned_input(authored) === nm &&
+                !(authored in available) && (found[nm] = authored)
         elseif haskey(exprs, nm) && !_is_bound_value_call(exprs[nm])
             found[nm] = definition(nm)
         end
