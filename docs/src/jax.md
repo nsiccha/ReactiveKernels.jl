@@ -72,7 +72,8 @@ The module's functions are:
 - `constrain`, a `dict` of every declared parameter's constrained value plus
   each value named in `values`.
 
-The functions take `unconstrained` followed by the prepared inputs. Each
+The functions take `unconstrained` and the prepared data by keyword,
+`f(unconstrained, **prepared)`. Each
 has a docstring and type annotations, and the model's own docstrings (see
 `rkppl_documentation`) appear in the module docstring and, for each value
 `constrain` returns, in its docstring.

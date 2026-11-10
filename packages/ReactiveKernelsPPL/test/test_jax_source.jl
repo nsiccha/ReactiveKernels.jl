@@ -46,6 +46,17 @@ end
     z[1:K] .~ Normal.(0, 1)
     return z .* tau
 end
+@rkppl jax_ppl_walk(T) = begin
+    sigma ~ Exponential(1.0)
+    @scan begin
+        level[1] = 0.0
+        for t in 2:T
+            z ~ Normal(0, 1)
+            level[t] = level[t - 1] + sigma * z
+        end
+    end
+    return level
+end
 @rkppl jax_ppl_masked_effect(x) = begin
     mask = Float64.(x .> 0)
     a ~ Normal(0, 1)
@@ -403,4 +414,38 @@ end
         @test all(p -> occursin(": ", p), split(params, ", "))
     end
     @test !occursin(r"^def rk_"m, text)
+end
+
+# `constrain` returns what native `constrain(layout, u)` does: a submodel's
+# values nested under it, and a parameter with no coordinates in this binding
+# as an empty array (one module for every binding). The functions take
+# `(unconstrained, **prepared)` (user GO 08jy2dh).
+@testset "jax_source(built, plan): constrain as native, keyword prepared data" begin
+    walk = (@rkppl(begin
+        lv ~ jax_ppl_walk(T)
+        s ~ Exponential(1.0)
+        y .~ Normal.(lv, s)
+    end))(; T = 6) | (; y = sin.(1:6))
+    mk(X) = (@rkppl(begin
+        a ~ Normal(0, 1)
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        y .~ Normal.(a .+ X * b, 1)
+    end))(; X) | (; y = [0.1, -0.2, 0.3, 0.0, 0.5])
+    empty, two = mk(zeros(5, 0)), mk(collect(reshape(0.1:0.1:1.0, 5, 2)))
+    wsrc = jax_source(build_kernel(walk), walk)
+    esrc = jax_source(build_kernel(empty), empty)
+    @test string(esrc) == string(jax_source(build_kernel(two), two))
+    @test occursin("def log_density(unconstrained: ArrayLike, **prepared: ArrayLike) -> jax.Array:",
+                   string(wsrc))
+    if rk_jax_available()
+        built = build_kernel(walk)
+        u = 0.1 .* collect(1:built.layout.total)
+        native = ReactiveKernelsPPL.constrain(built.layout, u)
+        r = rk_jax_evaluate(wsrc, "constrain", (u, jax_raw_data(walk, wsrc)...); prepare = true).value
+        @test sort(collect(keys(r))) == ["lv", "s"]
+        @test r["lv"]["sigma"] ≈ native.lv.sigma
+        @test r["lv"]["_ppl_scan_z_level"] ≈ native.lv._ppl_scan_z_level
+        r = rk_jax_evaluate(esrc, "constrain", ([0.2], jax_raw_data(empty, esrc)...); prepare = true).value
+        @test r["a"] ≈ 0.2 && isempty(r["b"])
+    end
 end

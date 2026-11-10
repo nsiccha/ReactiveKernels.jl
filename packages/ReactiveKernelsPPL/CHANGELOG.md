@@ -48,6 +48,16 @@ are recorded in the git history only.
   have translations (`_ppl_rows`, `_observed_scan_cell_bound`,
   `_ppl_cell_scan_position`, `_ppl_cell_scan_nsteps`); the cell's scan
   bound check is a runtime check.
+- **Breaking for `jax_source` callers:** the module's functions take
+  `(unconstrained, **prepared)`: the prepared data is passed by keyword, as
+  `f(u, **m.prepare_data(**raw))` already did, and positional prepared
+  arguments are no longer accepted (user GO `08jy2dh`). The signatures name
+  no internal values.
+- `constrain` returns what native `constrain(layout, u)` does: a submodel's
+  values nested under its name (`{"lv": {"sigma": …}}`, was `"lv.sigma"`),
+  and a parameter with no coordinates in this binding (`b[axes(X, 2)]` with
+  no columns) as an empty array, which it left out, so the module differed
+  between bindings.
 - A module's functions have docstrings (what each computes, how to call it)
   and type annotations. The model's own docstrings (`rkppl_documentation`)
   are listed in the module docstring, and `constrain`'s docstring lists each

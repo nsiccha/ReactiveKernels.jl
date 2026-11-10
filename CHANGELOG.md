@@ -57,6 +57,11 @@ are recorded in the git history only.
   reads resolve to the program's definitions before any global function; and
   `DATA` and the `prepare_data` `JAXFunction` name its parameters as Python
   spells them. On the host, `plate(xs...) do … end` over data is a map.
+- With `data`, a module's functions take `(unconstrained, **prepared)` and
+  read the prepared inputs inside, so their signatures name what the caller
+  supplies (user GO `08jy2dh`); positional prepared arguments are no longer
+  accepted. A function's WANT may be a nested `NamedTuple`, returned as nested
+  `dict`s.
 - `jax_source(...; function_docs)`: a `NamedTuple` of function name => text
   gives functions their docstrings; every module function has one and
   annotates its parameters (`ArrayLike`) and result. Module-level helpers

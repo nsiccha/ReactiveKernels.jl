@@ -3065,7 +3065,9 @@ jax_source(p::Plan; types = nothing, name = :kernel, constants = NamedTuple(),
 
 _jax_want_names(w::Symbol) = (w,)
 _jax_want_names(w::Tuple) = w
-_jax_want_names(w::NamedTuple) = Tuple(values(w))
+# A `NamedTuple` WANT may nest (`(lv = (sigma = :x, level = :y), s = :s)`): the
+# function returns nested `dict`s; its values are the leaves, in order.
+_jax_want_names(w::NamedTuple) = Tuple(n for v in values(w) for n in _jax_want_names(v))
 _jax_want_names(w) = throw(ArgumentError(
     "jax_source: a function's WANT is a value name, a tuple of names or a NamedTuple; got `$w`"))
 
@@ -3235,7 +3237,8 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     all_names = [remaining_names; prepared_names]
     for (fname, (rp, w)) in split.residuals
         lines, f = _jax_function!(mod, fname, rp, Tuple(all_types), w; names = all_names,
-                                  doc = get(function_docs, fname, nothing))
+                                  doc = get(function_docs, fname, nothing),
+                                  keyword_from = length(remaining_names))
         push!(bodies, join(lines, "\n"))
         push!(functions, f)
     end
@@ -3266,7 +3269,8 @@ _jax_meta_rank(@nospecialize(T)) = T isa Type && T <: AbstractArray ? ndims(T) :
 
 # One function `fname` over plan `p`, returning WANT `w` in its shape.
 function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool = true,
-                        host::Bool = false, names = nothing, doc = nothing)
+                        host::Bool = false, names = nothing, doc = nothing,
+                        keyword_from::Union{Nothing,Int} = nothing)
     argtypes = _jax_have_types(p, types)
     name = reserve ? _jax_identifier(mod.used, fname) : String(fname)
     scope = _JaxScope()
@@ -3313,17 +3317,27 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
     _jax_plan!(ctx, p)
     wants = [_jax_returned(ctx, _jax_lookup(ctx, p.graph, v)) for v in p.want]
     returned = if w isa NamedTuple
-        "{" * join(("\"" * string(k) * "\": " * v.code for (k, v) in zip(keys(w), wants)), ", ") * "}"
+        _jax_nested_dict(w, Iterators.Stateful(wants))
     elseif w isa Symbol
         only(wants).code
     else
         _jax_tuple_code(wants)
     end
-    # A module function is annotated and documented; a helper is not.
+    # A module function is annotated and documented; a helper is not. With
+    # `keyword_from`, the inputs after the first `keyword_from` are the
+    # prepared data, taken as `**prepared` (user GO `08jy2dh`): the signature
+    # names only what the caller supplies, and the body reads its inputs.
     if reserve
-        signature = join((pn * ": " * _jax_annotation(T) for (pn, T) in inputs), ", ")
+        shown = keyword_from === nothing ? inputs : inputs[1:keyword_from]
+        signature = join((pn * ": " * _jax_annotation(T) for (pn, T) in shown), ", ")
+        keyword_from === nothing || (signature *= ", **prepared: ArrayLike")
         lines = String["def " * name * "(" * signature * ") -> " * _jax_return_annotation(w, wants) * ":"]
         push!(lines, _jax_docstring(something(doc, _jax_default_doc(w)), "    "))
+        if keyword_from !== nothing
+            for (pn, _) in inputs[keyword_from+1:end]
+                push!(lines, "    " * pn * " = prepared[\"" * pn * "\"]")
+            end
+        end
     else
         lines = String["def " * name * "(" * join(params, ", ") * "):"]
     end
@@ -3352,8 +3366,14 @@ _jax_default_doc(w::NamedTuple) = "Compute a dict of " *
     join(("`" * string(k) * "`" for k in keys(w)), ", ") * " from the inputs."
 # A Python docstring at `indent`, its text kept as written.
 _jax_docstring(text::AbstractString, indent::AbstractString) =
-    indent * "\"\"\"" * replace(rstrip(text), "\"\"\"" => "\\\"\"\"", "\n" => "\n" * indent) *
-    (occursin('\n', rstrip(text)) ? "\n" * indent : "") * "\"\"\""
+    replace(indent * "\"\"\"" * replace(rstrip(text), "\"\"\"" => "\\\"\"\"", "\n" => "\n" * indent) *
+            (occursin('\n', rstrip(text)) ? "\n" * indent : "") * "\"\"\"", r"\n[ ]+\n" => "\n\n")
+
+# A (nested) `NamedTuple` WANT as `dict`s of the values `wants` yields in order.
+_jax_nested_dict(w::NamedTuple, wants) =
+    "{" * join(("\"" * string(k) * "\": " *
+                (v isa NamedTuple ? _jax_nested_dict(v, wants) : popfirst!(wants).code)
+                for (k, v) in pairs(w)), ", ") * "}"
 
 # A returned named tuple is a `dict` keyed by its field names.
 function _jax_returned(ctx::_JaxContext, v::_PyVal)

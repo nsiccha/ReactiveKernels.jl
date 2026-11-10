@@ -46,11 +46,17 @@ function ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan;
     data = _query_bound(plan)
     types = merge((; unconstrained = Vector{Float64}),
                   NamedTuple{keys(data)}(map(typeof, Tuple(data))))
-    # An empty parameter (zero coordinates, such as the thresholds of a
-    # two-category ordinal response) has no value in the program.
-    parameters = [entry.name for entry in built.layout.entries if entry.size > 0]
+    # Every parameter the program has a value of, also an empty one whose size
+    # reads data (`b[axes(X, 2)]` with no columns), so one module serves every
+    # binding; a structurally empty one (the thresholds of a two-category
+    # ordinal response) has no value in the program.
+    parameters = [entry.name for entry in built.layout.entries
+                  if entry.size > 0 || haskey(built.spec.ports, entry.name)]
     returned = Symbol[parameters; collect(Symbol, values)]
-    constrained = NamedTuple{Tuple(returned)}(Tuple(returned))
+    # `constrain` returns what native `constrain(layout, u)` does: a value in
+    # a submodel's scope (`lv.sigma`) nested under the submodel (`lv`).
+    paths = [get(built.layout.name_paths, name, (name,)) for name in returned]
+    constrained = _jax_nested_want(paths, returned)
     functions = (log_density = workflow_wants(:sampler),
                  log_prior = workflow_wants(:prior),
                  log_likelihood = workflow_wants(:likelihood),
@@ -77,7 +83,7 @@ function ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan;
     # The model's own docstrings (`rkppl_documentation`), by author path.
     authored = rkppl_documentation(plan)
     documented(path) = join((d.markdown for d in authored if d.path == path), "\n")
-    entry(name) = (text = documented((name,)); "- `" * String(name) * "`" *
+    entry(path) = (text = documented(path); "- `" * join(String.(path), ".") * "`" *
                    (isempty(text) ? "" : ": " * replace(strip(text), "\n" => "\n  ")))
     model_docs = isempty(authored) ? "" : "\n\nModel documentation:\n\n" *
         join(("- `" * join(String.(d.path), ".") * "`: " * replace(strip(d.markdown), "\n" => "\n  ")
@@ -96,12 +102,30 @@ function ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan;
         log_likelihood = "The log likelihood of the observations" * over,
         log_jacobian = "The log Jacobian of the constraining transforms" * over,
         constrain = "The constrained value of each parameter, and of each requested value," *
-            over * " Returns a dict:\n\n" * join(map(entry, returned), "\n"))
+            over * " Returns a dict, a submodel's values nested under its name:\n\n" *
+            join(map(entry, paths), "\n"))
     src = _absent_refusal(plan, built.spec, have, :posterior) do
         jax_source(built.spec; have, functions, types, constants, doc = module_doc, data,
                    definitions, keep = Tuple(sizes), function_docs)
     end
     _jax_with_layout(src, built.layout)
+end
+
+# A nested `NamedTuple` of the program's `names`, keyed by their author
+# `paths` (`(:lv, :sigma)` under `lv`), in first-appearance order.
+function _jax_nested_want(paths, names)
+    keys_ = Symbol[]
+    groups = Dict{Symbol,Vector{Int}}()
+    for (i, p) in enumerate(paths)
+        haskey(groups, first(p)) || (push!(keys_, first(p)); groups[first(p)] = Int[])
+        push!(groups[first(p)], i)
+    end
+    vals = map(keys_) do k
+        idx = groups[k]
+        length(idx) == 1 && length(paths[only(idx)]) == 1 ? names[only(idx)] :
+            _jax_nested_want([paths[i][2:end] for i in idx], names[idx])
+    end
+    NamedTuple{Tuple(keys_)}(Tuple(vals))
 end
 
 # The names of the data values a layout reads its positions and axis lengths
