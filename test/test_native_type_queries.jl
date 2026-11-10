@@ -134,7 +134,9 @@ end
     for depth in (4, 8, 16)
         reader = prepare(F.scanned(depth))
         ast = code_expr(reader)
-        @test F.count_head(ast, :for) == 1
+        # The loop after the peeled first step and the loop over every step
+        # (`_scan_unpeeled`, from RK 0.1.128); the step's types compile one.
+        @test F.count_head(ast, :for) == 2
         statements = ast.args[2].args
         position = only(i for (i, ex) in enumerate(statements) if ex isa Expr &&
             ex.head === :if && ex.args[1] isa Expr &&
