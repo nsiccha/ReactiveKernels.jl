@@ -2839,7 +2839,7 @@ translation raises a [`JAXEmissionError`](@ref) naming its recipe.
 function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                     want = nothing, functions = nothing, types = nothing,
                     name = :kernel, constants = NamedTuple(), doc = nothing, data = nothing,
-                    definitions = nothing)
+                    definitions = nothing, keep = ())
     functions === nothing && want === nothing && (want = _KERNEL_DEFAULT_BOUNDARY)
     if functions === nothing
         functions = NamedTuple{(Symbol(name),)}((want,))
@@ -2850,13 +2850,13 @@ function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
         "jax_source: `functions` must be a nonempty NamedTuple of function name => WANT"))
     plans = [fname => (plan(spec; have, want = _jax_want_names(w)), w)
              for (fname, w) in pairs(functions)]
-    _jax_module_source(plans, types, constants, doc; data, definitions)
+    _jax_module_source(plans, types, constants, doc; data, definitions, keep)
 end
 
 jax_source(p::Plan; types = nothing, name = :kernel, constants = NamedTuple(),
-           doc = nothing, data = nothing, definitions = nothing) =
+           doc = nothing, data = nothing, definitions = nothing, keep = ()) =
     _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
-                       types, constants, doc; data, definitions)
+                       types, constants, doc; data, definitions, keep)
 
 _jax_want_names(w::Symbol) = (w,)
 _jax_want_names(w::Tuple) = w
@@ -2874,12 +2874,15 @@ _jax_want_names(w) = throw(ArgumentError(
 # would otherwise be values only Julia computes). A definition without a host
 # translation, or one given as a `JAXEmissionError` (the reason it has none),
 # stays a `prepare_data` input, named with that reason in the module constant
-# `UNTRANSLATED`.
+# `UNTRANSLATED`. `keep` names data-only values `prepare_data` also returns
+# (the functions take them too), for a caller that reads them.
 function _jax_module_source(plans, types, constants, doc; data = nothing,
-                            definitions = nothing)
+                            definitions = nothing, keep = ())
     if data === nothing
         definitions === nothing || isempty(definitions) || throw(ArgumentError(
             "jax_source: `definitions` compute data values, so they need `data`"))
+        isempty(keep) || throw(ArgumentError(
+            "jax_source: `keep` names values of `prepare_data`, so it needs `data`"))
         return _jax_module_text(plans, types, constants, doc, nothing)
     end
     data isa NamedTuple || data isa Tuple && all(d -> d isa Symbol, data) ||
@@ -2901,7 +2904,7 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
     while true
         try
             return _jax_module_text(plans, types, constants, doc,
-                                    (data, excluded, defs, untranslated))
+                                    (data, excluded, defs, untranslated, keep))
         catch e
             if e isa _HostUnsupportedDefinition && !haskey(untranslated, e.name)
                 untranslated[e.name] = e.error
@@ -2931,9 +2934,9 @@ function _jax_module_text(plans, types, constants, doc, prepare)
             push!(functions, f)
         end
     else
-        data, excluded, defs, untranslated = prepare
+        data, excluded, defs, untranslated, keep = prepare
         meta = _jax_prepared_functions!(mod, bodies, functions, plans, types, data, excluded,
-                                        defs, untranslated)
+                                        defs, untranslated; keep)
         constants = merge(constants, meta)
     end
     constant_lines = String[]
@@ -2973,9 +2976,9 @@ end
 # prepared input's dtype, rank and raggedness).
 function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, types, data,
                                   excluded, defs = nothing,
-                                  untranslated = Dict{Symbol,JAXEmissionError}())
+                                  untranslated = Dict{Symbol,JAXEmissionError}(); keep = ())
     ports = data isa NamedTuple ? Set(keys(data)) : Set(data)
-    split = _jax_prepare_split(plans, ports, excluded)
+    split = _jax_prepare_split(plans, ports, excluded; keep)
     p1 = first(plans).second[1]
     # Raw data enters host code, so its types need not be concrete (a column
     # with missing values); the functions' inputs must be.

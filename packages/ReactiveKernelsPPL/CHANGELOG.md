@@ -32,6 +32,15 @@ are recorded in the git history only.
   missing observations. A response with missing values still passes its
   presence mask as `_rkppl_present_<name>`. Frozen definitions
   (`frozen_values`) stay inputs. Needs ReactiveKernels 0.1.130.
+- **Breaking for `jax_source` callers:** a module whose parameter sizes read
+  data (a `levels(g)` axis, a scan over a data length) no longer states the
+  emitting binding's `DIMENSION` and `PARAMETERS`, which differed between
+  datasets of one program. The new functions `dimension(prepared)` and
+  `parameters(prepared)` give them for the data `prepare_data` returned; a
+  module whose layout reads no data keeps the constants too. Use
+  `m.dimension(prepared)` in place of `m.DIMENSION`.
+- The functions jit with the prepared data as arguments: a prepared integer
+  that sets a shape is a `StaticInt` (ReactiveKernels 0.1.130).
 
 ## 0.1.133
 

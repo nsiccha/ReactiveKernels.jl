@@ -142,10 +142,12 @@ const _JAX_CASES = (
     src = jax_source(built, plan; values = (:mu,))
     text = string(src)
     @test [f.name for f in src.functions] ==
-          ["prepare_data", "log_density", "log_prior", "log_likelihood", "log_jacobian", "constrain"]
+          ["prepare_data", "log_density", "log_prior", "log_likelihood", "log_jacobian", "constrain",
+           "dimension", "parameters"]
     # `prepare_data` takes the raw data; the functions, the prepared inputs.
     @test first.(src.functions[1].inputs) == ["x", "y"]
-    @test all(f -> first.(f.inputs) == ["unconstrained", "x", "y"], src.functions[2:end])
+    @test all(f -> first.(f.inputs) == ["unconstrained", "x", "y"], src.functions[2:6])
+    @test all(f -> first.(f.inputs) == ["prepared"], src.functions[7:8])
     @test occursin("DIMENSION = 3", text)
     @test occursin("PARAMETERS = {\"a\": {\"start\": 0, \"stop\": 1", text)
     @test occursin("\"s\": {\"start\": 2, \"stop\": 3, \"transform\": \"exp\"", text)
@@ -171,6 +173,10 @@ end
         r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
                             grad = true, prepare = true)
         @test r.value ≈ query(u) rtol = 1e-10
+        # jit with the prepared data as arguments: one executable per shape;
+        # an integer that sets a shape is static (`StaticInt`).
+        @test rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
+                              prepare = :arguments).value ≈ query(u) rtol = 1e-10
         reference = rk_fd_gradient(query, u)
         @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
     end
@@ -223,6 +229,30 @@ end
                                 grad = true, prepare = true)
             @test r.value ≈ query(u) rtol = 1e-12
             @test r.grad ≈ rk_fd_gradient(query, u) rtol = 1e-6
+        end
+    end
+end
+
+# A layout whose sizes follow the data (a level axis, a scan's length) is not
+# stated in the module: `dimension(prepared)` and `parameters(prepared)` read
+# it from the prepared data, so one module text serves every binding.
+@testset "jax_source(built, plan): layout from the prepared data" begin
+    mk(labels) = (@rkppl(begin
+        a ~ Normal(0, 1); tau ~ Exponential(1.0); s ~ Exponential(1.0)
+        c[levels(g)] .~ Normal.(0, tau)
+        y .~ Normal.(a .+ c[g], s)
+    end))(; g = labels) | (; y = collect(range(-1, 1; length = length(labels))))
+    small, large = mk(["a", "b", "c", "a"]), mk(["a", "b", "c", "d", "e", "a", "e"])
+    src = jax_source(build_kernel(small), small)
+    @test string(jax_source(build_kernel(large), large)) == string(src)
+    @test !occursin("DIMENSION", string(src))
+    @test occursin("def dimension(prepared):", string(src))
+    if rk_jax_available()
+        for (p, total, levels) in ((small, 6, 3), (large, 8, 5))
+            r = rk_jax_layout(src, jax_raw_data(p, src))
+            @test r.dimension == total == build_kernel(p).layout.total
+            @test r.parameters["c"] == (start = 3, stop = total, dims = (levels,))
+            @test r.parameters["s"] == (start = 2, stop = 3, dims = ())
         end
     end
 end

@@ -74,10 +74,15 @@ The module's functions are:
 
 The functions take `unconstrained` followed by the prepared inputs.
 
-Its constants describe the inputs:
-- `DIMENSION`, the length of `unconstrained`;
-- `PARAMETERS`, each parameter's 0-based `start`/`stop` in `unconstrained`,
-  its transform and its dimensions;
+Two functions of the prepared data describe the parameters, since their
+sizes can follow the data (a level axis, a series length):
+- `dimension(prepared)`, the length of `unconstrained`;
+- `parameters(prepared)`, each parameter's 0-based `start`/`stop` in
+  `unconstrained`, its transform and its dimensions.
+
+When no parameter's size reads data, the constants `DIMENSION` and
+`PARAMETERS` state the same. The module's other constants describe the
+inputs:
 - `DATA`, each of `prepare_data`'s parameters' dtype and rank, and whether
   it is ragged;
 - `UNTRANSLATED`, each data-only definition `prepare_data` takes as an input
@@ -102,7 +107,7 @@ import model  # the module jax_source wrote
 prepared = model.prepare_data(x=x, y=y)  # the bound data, once per dataset
 potential = lambda u: -model.log_density(u, **prepared)
 mcmc = MCMC(NUTS(potential_fn=potential), num_warmup=500, num_samples=1000)
-mcmc.run(jax.random.PRNGKey(0), init_params=jnp.zeros(model.DIMENSION))
+mcmc.run(jax.random.PRNGKey(0), init_params=jnp.zeros(model.dimension(prepared)))
 draws = jax.vmap(lambda u: model.constrain(u, **prepared))(mcmc.get_samples())
 ```
 
@@ -141,7 +146,11 @@ JAX code:
   listed with its reason in the module's `UNTRANSLATED`.
 
 The functions' inputs have static shapes, so they also run under `jax.jit`
-with the prepared data as arguments.
+with the prepared data as arguments: `jax.jit(model.log_density)(u,
+**prepared)`. An integer of the prepared data that sets a shape (a parameter
+block's end, a scan's length, a level count) is a `StaticInt`, an `int` that
+`jax.jit` treats as static; a new value traces the function again, as a new
+array shape does.
 
 ## What the translation keeps
 

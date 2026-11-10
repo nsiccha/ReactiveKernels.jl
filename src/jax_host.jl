@@ -884,6 +884,27 @@ end
 
 # The host-side helper that pads a ragged value (a list of arrays) for the
 # JAX functions.
+# A prepared integer scalar (a parameter block's end, a scan length, a level
+# count) sets shapes in the functions, so JAX must know it while it traces,
+# also when the prepared data are `jax.jit` arguments. `prepare_data` returns
+# it as a `StaticInt`: an `int` that `jax.jit` treats as static (a pytree
+# node without leaves), retracing only for a new value.
+const _JAX_STATIC_INT = """
+class StaticInt(int):
+    \"\"\"An integer of the prepared data that sets a shape.
+
+    It is an `int` everywhere, and `jax.jit` treats it as static, so the
+    functions jit with the prepared data as arguments; a new value traces
+    them again.
+    \"\"\"
+
+    def __repr__(self):
+        return "StaticInt(%d)" % int(self)
+
+
+jax.tree_util.register_pytree_node(StaticInt, lambda s: ((), int(s)), lambda v, _: StaticInt(v))
+"""
+
 const _JAX_PAD_ROWS = """
 def _rk_pad_rows(rows):
     # A ragged value as the functions take it: the padded array (each row
@@ -907,7 +928,7 @@ data alone (in an order that computes each after its inputs), the boundary
 values the functions read from them, and each function's residual plan over
 its remaining ports followed by those values.
 """
-function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}())
+function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); keep = ())
     p1 = first(plans).second[1]
     g = p1.graph
     prefix = Recipe[]
@@ -956,6 +977,20 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}())
             push!(constants, v)
         end
         push!(boundaries, (fname, p, w, residual))
+    end
+    # The data values `keep` names are boundary values too, which
+    # `prepare_data` returns although no function reads them (the layout's
+    # data-derived positions, read by the caller).
+    for name in keep
+        found = [o for r in prefix for o in r.outputs if o.name === name]
+        isempty(found) && append!(found, (v for v in p1.have if v.name === name && v.name in data_ports))
+        v = isempty(found) ? nothing : first(found)
+        v === nothing && throw(ArgumentError(
+            "jax_source: `keep` names `$name`, which is no data-only value of the program"))
+        cid = canon_id(g, v.id)
+        cid in seen_values && continue
+        push!(seen_values, cid)
+        push!(constants, v)
     end
     # Only the recipes the boundary values need run in `prepare_data`.
     needed = Set{ValueId}(canon_id(g, v.id) for v in constants)
@@ -1062,6 +1097,13 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
         elseif _host_is_numeric_array(T)
             push!(entries, "\"" * name * "\": np.asarray(" * v.code * ", dtype=" *
                            _host_dtype(eltype(T)) * ")")
+        elseif T isa Type && T <: Integer
+            if !haskey(mod.helper_names, (:helper, "StaticInt"))
+                mod.helper_names[(:helper, "StaticInt")] = "StaticInt"
+                push!(mod.used, "StaticInt")
+                push!(mod.helpers, rstrip(_JAX_STATIC_INT))
+            end
+            push!(entries, "\"" * name * "\": StaticInt(" * v.code * ")")
         else
             push!(entries, "\"" * name * "\": " * v.code)
         end

@@ -27,6 +27,13 @@ are recorded in the git history only.
   without a host translation, or given as a `JAXEmissionError` naming the
   reason, with that reason; such a definition stays a `prepare_data` input.
   ReactiveKernelsPPL 0.1.134 passes a binding's data-only definitions.
+- `jax_source(spec; data, keep)`: `prepare_data` also returns the data-only
+  values `keep` names (the functions take them too).
+- `prepare_data` returns each integer scalar it prepares as a `StaticInt`, an
+  `int` that `jax.jit` treats as static, so the functions jit with the
+  prepared data as arguments (`jax.jit(f)(u, **prepared)`). A block end or a
+  scan length was a traced argument there, and slicing by it raised
+  `IndexError: Array slice indices must have static start/stop/step`.
 - `jax_source` translates a derivative rule's primal cut again (DistributionKernels'
   `loggamma` and `logbeta`, so RKPPL's `NegativeBinomial2`, `BetaBinomial2`,
   `Gamma`-family and other densities that call them). Since 0.1.27 a lowering's
