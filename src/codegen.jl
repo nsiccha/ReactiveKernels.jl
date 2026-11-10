@@ -4537,7 +4537,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     if parallel_cells
         cell_loop = _scheduled_prefix_loop!(runtime_ops, runtime_recipes, body,
             invariants, declarations, loopbody, callargs, index, previous,
-            first_coordinate, shares, output_axes)
+            first_coordinate, shares, output_axes; deferred)
     end
     if cells
         append!(body.args, declarations)

@@ -137,3 +137,46 @@ end
     @test slot === table
     @test result == [1.0, 2.0]
 end
+
+@testset "scheduled prefix chunks receive the prepared arguments their cells read" begin
+    # A prefix plate's cells read each array argument prepared for broadcast,
+    # and a body with plate programs prepares it where the cell work starts.
+    # Each scheduled chunk is a function of its own, which read that prepared
+    # argument as an unbound name: `UndefVarError: ##plate_prepared#k` whenever
+    # a reader with two or more workers entered the prefix (snag
+    # `web-sim-bruno-la-eb5f8859`). The suite runs on one thread, where a
+    # reader never enters the prefix, so the prefix is also called directly
+    # with each worker budget.
+    @kernel scheduled_prefix_prepared(position, data, omega2, width) = begin
+        weights = plate(data, omega2, width) do x, o, w
+            o * exp(-0.5 * (w * x)^2)
+        end
+        shifted = plate(data) do x
+            x + 1.0
+        end
+        result = position .* (sum(weights) + sum(shifted))
+    end
+    data, omega2, width = collect(1.0:7.0), 0.3, 1.2
+    expected = (; weights = [omega2 * exp(-0.5 * (width * x)^2) for x in data],
+                shifted = data .+ 1.0)
+    schedule = NativeScheduling(chunk_size=1, workers=4)
+    serial = vectorize(scheduled_prefix_prepared; batched=:position)
+    scheduled = vectorize(scheduled_prefix_prepared; batched=:position, schedule)
+    positions = [1.0, 2.0, 3.0, 4.0]
+    @test scheduled(positions, data, omega2, width) ≈ serial(positions, data, omega2, width)
+    @test serial(positions, data, omega2, width) ≈
+          positions .* (sum(expected.weights) + sum(expected.shifted))
+    raw = scheduled isa ReactiveKernels._KernelSignatureCallable ? scheduled.target : scheduled
+    values = (; data, omega2, width)
+    args = map(port -> getfield(values, port.name), ReactiveKernels.inputs(raw.prefix))
+    names = map(port -> port.name, ReactiveKernels.outputs(raw.prefix))
+    for workers in (1, 3)
+        result = task_local_storage(ReactiveKernels._SCHEDULED_PREFIX_WORKERS, workers) do
+            raw.prefix(args...)
+        end
+        result = length(names) == 1 ? (result,) : result
+        for (name, value) in zip(names, result)
+            @test value ≈ getfield(expected, name)
+        end
+    end
+end
