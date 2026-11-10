@@ -236,7 +236,16 @@ A function that a recipe calls is translated if:
 
 A package adds a translation for its own function with a method of
 `ReactiveKernels._jax_elementwise` (a scalar function's `jax` name) or
-`ReactiveKernels._jax_function_call`.
+`ReactiveKernels._jax_function_call`. A package's plain helper with branches
+that native code must keep as written records its source with
+`ReactiveKernels.@_record_source` (a leading `@inline` stays).
+
+Shape tests decide while tracing. Shapes are known then, and so are the
+prepared integers (`StaticInt`s); `size(x, d)` past `x`'s rank, or of a
+number, is 1. So `ndims(x) <= 3 && size(x, 1) in (1, K)` selects its arm in
+Python, and a `throw` in the other arm raises then. An index that Julia
+requires to be 1 (`v[i, 1, 1]` of a vector, `s[1, 1, 1]` of a number) is
+checked and dropped.
 
 ## Limits
 
@@ -254,7 +263,8 @@ recipe and the construct:
   input's;
 - plates of rank above one over ragged data;
 - `reshape` of a ragged value (its padding has no shape);
-- `history` scans.
+- `history` scans over a padded (ragged) sequence or with a named-tuple
+  history.
 
 Frozen definitions (`frozen_values`) come from another binding, so
 `prepare_data` takes their values, as `DATA` lists them.

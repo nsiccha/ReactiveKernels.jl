@@ -907,15 +907,18 @@ jax.tree_util.register_pytree_node(StaticInt, lambda s: ((), int(s)), lambda v, 
 """
 
 const _JAX_PAD_ROWS = """
-def _rk_pad_rows(rows):
+def _rk_pad_rows(rows, dtype):
     # A ragged value as the functions take it: the padded array (each row
-    # repeats its last entry), the lengths, and the positions of the valid
-    # entries in the flattened padded array, whose length is the total.
-    rows = [np.asarray(r) for r in rows]
+    # repeats its last entry; an empty row is zeros), the lengths, and the
+    # positions of the valid entries in the flattened padded array, whose
+    # length is the total. `dtype` is the element type the program declares,
+    # so an empty row (`[]`) keeps an integer column integer.
+    rows = [np.asarray(r, dtype=dtype) for r in rows]
     lengths = np.asarray([r.shape[0] for r in rows], dtype=np.int64)
     width = max([1] + [int(n) for n in lengths])
     padded = np.stack([np.pad(r, (0, width - r.shape[0]), mode="edge") if r.shape[0] > 0
-                       else np.zeros(width) for r in rows]) if rows else np.zeros((0, width))
+                       else np.zeros(width, dtype=dtype) for r in rows]) if rows \
+        else np.zeros((0, width), dtype=dtype)
     flat = np.flatnonzero(np.arange(width)[None, :] < lengths[:, None])
     return padded, lengths, flat
 """
@@ -1045,7 +1048,8 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
         param = _jax_param_name(scope.used, v.name; stable = false)
         push!(param_names, param)
         known[v.name] = _PyVal(param, T, true)
-        _jax_ragged(T) ? _jax_emit!(ctx, param * " = [np.asarray(a) for a in " * param * "]") :
+        _jax_ragged(T) ? _jax_emit!(ctx, param * " = [np.asarray(a, dtype=" *
+                                    _host_dtype(eltype(eltype(T))) * ") for a in " * param * "]") :
             _jax_is_array(T) && _jax_emit!(ctx, param * " = np.asarray(" * param * ", dtype=" *
                                            _host_dtype(eltype(T)) * ")")
     end
@@ -1096,7 +1100,8 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
             padded = _jax_fresh(ctx, Symbol(name, :_padded))
             lengths = _jax_fresh(ctx, Symbol(name, :_lengths))
             flat = _jax_fresh(ctx, Symbol(name, :_flat))
-            _jax_emit!(ctx, padded * ", " * lengths * ", " * flat * " = _rk_pad_rows(" * v.code * ")")
+            _jax_emit!(ctx, padded * ", " * lengths * ", " * flat * " = _rk_pad_rows(" * v.code *
+                            ", " * _host_dtype(eltype(eltype(T))) * ")")
             push!(entries, "\"" * name * "\": " * padded, "\"" * name * "_lengths\": " * lengths,
                   "\"" * name * "_flat\": " * flat)
         elseif _host_is_numeric_array(T)

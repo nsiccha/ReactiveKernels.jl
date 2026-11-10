@@ -16,6 +16,40 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.132
+
+- `jax_source`: the hidden-Markov laws of ReactiveKernelsDistributionKernels
+  0.1.5 translate (`normal_hmm_log_weights_logdensity` and its siblings under
+  `LogDensity`). The forward pass is a `jax.lax.scan` with `history`, and the
+  folds over the states are `jax.lax.fori_loop`s, so one module serves every
+  number of steps and states. What it takes, all generic:
+  - a shape test decides while tracing. Prepared integers are `StaticInt`s,
+    so the functions know them then; `size(x, d)` past `x`'s rank, or of a
+    number, is 1; comparisons of integer literals fold, so a conditional on
+    one takes its arm alone; `x in t` over a tuple of numbers is Python's
+    `in` when both are known, else `jnp.isin`;
+  - an index Julia requires to be 1 (past an array's rank, `v[i, 1, 1]`, or of
+    a number, `s[1, 1, 1]`) is checked, while tracing when it is known then,
+    else as a runtime check, and dropped;
+  - `dropdims(x; dims = d)` translates.
+- `@_record_source` accepts a leading `@inline`, which the method keeps.
+- In `prepare_data`, `stack(rows; dims)` of a plate of vectors is `np.stack`.
+  The plate is a list of arrays on the host, so a later `raw_basis[:, b]`
+  raised `TypeError` (BRM's HSGP basis with `orthogonal_to`).
+- RK's tie-exact `logaddexp` (mixture densities) translates as
+  `jnp.logaddexp`, and integer `div` (lowered as `checked_sdiv_int`, as in an
+  HSGP mode index) truncates toward zero as in Julia.
+- A scan with `history` translates (a vector of leading entries or a number):
+  `jax.lax.scan` carries the result vector and writes step `j`'s output at its
+  entry; an index of `eachindex(x)` is bounded by the sequence's length, so a
+  generator over `1:j-1` runs to that bound, masked. `j ± c` keeps a static
+  bound. A ragged column's empty row keeps the column's element type when
+  padded (an integer index column stayed float and could not index), and a
+  ragged value a function returns in a `dict` comes with `<name>_lengths`.
+- Generated module helpers drop the `_rk_` prefix (`_standardized`,
+  `_isequal_np`), so a generated helper never takes a fixed helper's name: a
+  module defined `_rk_isequal_np` twice and `prepare_data` recursed.
+
 ## 0.1.131
 
 - A non-allocating program differentiates under native Enzyme reverse through

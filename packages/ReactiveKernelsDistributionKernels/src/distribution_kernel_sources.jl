@@ -1475,15 +1475,18 @@ end
 # dominates by more than about 37 in log space, as between well-separated
 # states, each fold step costs one `exp`; a max-shifted `log(sum(exp(...)))`
 # costs K `exp`s and a `log` per cell, whatever the separation.
-@inline _hmm_index(x, axis, i) = size(x, axis) == 1 ? 1 : i
-@inline _hmm_at(x, a, b, c) =
+# `@_record_source` keeps these plain helpers' source for `jax_source`, which
+# decides their shape tests while tracing; execution is the methods as written.
+ReactiveKernels.@_record_source @inline _hmm_index(x, axis, i) = size(x, axis) == 1 ? 1 : i
+ReactiveKernels.@_record_source @inline _hmm_at(x, a, b, c) =
     x[_hmm_index(x, 1, a), _hmm_index(x, 2, b), _hmm_index(x, 3, c)]
-_hmm_broadcasts(x, a, b, c) = ndims(x) <= 3 && size(x, 1) in (1, a) &&
-    size(x, 2) in (1, b) && size(x, 3) in (1, c)
+ReactiveKernels.@_record_source _hmm_broadcasts(x, a, b, c) = ndims(x) <= 3 &&
+    size(x, 1) in (1, a) && size(x, 2) in (1, b) && size(x, 3) in (1, c)
 
 # The log of the weighted sum over the K predecessors of state j at `step`,
 # whose forward values start after `previous` in the history.
-@inline function _hmm_incoming(earlier, previous, log_transition, j, step, K)
+ReactiveKernels.@_record_source @inline function _hmm_incoming(earlier, previous,
+        log_transition, j, step, K)
     total = earlier[previous + 1] + _hmm_at(log_transition, 1, j, step)
     for i in 2:K
         total = ReactiveKernels._tie_exact_logaddexp(total,
@@ -1491,7 +1494,7 @@ _hmm_broadcasts(x, a, b, c) = ndims(x) <= 3 && size(x, 1) in (1, a) &&
     end
     total
 end
-@inline function _hmm_total(forward, offset, K)
+ReactiveKernels.@_record_source @inline function _hmm_total(forward, offset, K)
     total = forward[offset + 1]
     for k in 2:K
         total = ReactiveKernels._tie_exact_logaddexp(total, forward[offset + k])
@@ -1499,10 +1502,11 @@ end
     total
 end
 
-_hmm_checked_emissions(log_emissions, K) = K >= 1 && ndims(log_emissions) == 2 &&
+ReactiveKernels.@_record_source _hmm_checked_emissions(log_emissions, K) =
+    K >= 1 && ndims(log_emissions) == 2 &&
     size(log_emissions, 2) == K ? log_emissions :
     throw(DimensionMismatch("log emissions must be steps × states, one column per initial weight"))
-_hmm_checked_transition(log_transition, K, T) =
+ReactiveKernels.@_record_source _hmm_checked_transition(log_transition, K, T) =
     _hmm_broadcasts(log_transition, K, K, max(T - 1, 1)) ? log_transition :
     throw(DimensionMismatch("transition weights must broadcast over states × states × (steps - 1)"))
 
@@ -1561,7 +1565,8 @@ end
 
 # The log of the weighted sum over the K successors of a step, through step
 # `s`'s emissions, when the transition does not depend on the destination.
-@inline function _hmm_rest(later, following, log_emissions, s, K)
+ReactiveKernels.@_record_source @inline function _hmm_rest(later, following,
+        log_emissions, s, K)
     total = log_emissions[s, 1] + later[following + 1]
     for j in 2:K
         total = ReactiveKernels._tie_exact_logaddexp(total,
@@ -1570,8 +1575,8 @@ end
     total
 end
 # The same sum out of state i at step t, through every destination's move.
-@inline function _hmm_outgoing(later, following, log_emissions, log_transition, i,
-        t, K)
+ReactiveKernels.@_record_source @inline function _hmm_outgoing(later, following,
+        log_emissions, log_transition, i, t, K)
     total = _hmm_at(log_transition, i, 1, t) + log_emissions[t + 1, 1] +
         later[following + 1]
     for j in 2:K
@@ -1638,7 +1643,8 @@ end
 # to each cell's family object through its `log_scale` port. With cells to
 # visit, every element is read by some cell; an empty plate takes no log, as
 # before.
-@inline _hmm_log_scales(scales, cells) = cells == 0 ? float.(scales) : log.(scales)
+ReactiveKernels.@_record_source @inline _hmm_log_scales(scales, cells) =
+    cells == 0 ? float.(scales) : log.(scales)
 
 # Each emission family's steps × states log emissions: the law and its
 # state-posterior twin read the same matrix.

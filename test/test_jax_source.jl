@@ -366,6 +366,13 @@ end
     total = sum(flat .* flat) + length(flat)
     return total
 end
+# A broadcast `isequal` on the host: its generated scalar helper must not
+# take the name of the fixed `_rk_isequal` helper's host twin.
+@kernel jax_prep_isequal(g::Vector{String}, theta::Float64) = begin
+    hits = isequal.(g, "b")
+    total = theta * sum(hits)
+    return total
+end
 # `get!` as a statement: its write runs although its value is discarded.
 ReactiveKernels.@_record_source function jax_prep_declared(x::AbstractVector, levels::AbstractVector)
     positions = Dict{eltype(levels),Int}()
@@ -479,6 +486,75 @@ end
 @kernel jax_dims(M::Matrix{Float64}, a::Float64) = begin
     f = vec(sum(a .* M; dims = 2)) .+ vec(maximum(M; dims = 1))[1]
     total = sum(f .^ 2)
+    return total
+end
+
+# RK's tie-exact `logaddexp` (mixture densities) and integer `div` (a mode
+# index `div(b - 1, k) % m + 1`).
+@kernel jax_tie_div(x::Vector{Float64}, a::Float64, k::Int) = begin
+    lse = plate(x) do xi
+        ReactiveKernels._tie_exact_logaddexp(a * xi, -xi)
+    end
+    q = div(length(x) - 1, k) % 3 + 1
+    total = sum(lse) + q * a
+    return total
+end
+
+# Scans whose step reads the outputs so far (`history`): a vector of leading
+# entries, and a scalar fill read up to the step's own index.
+@kernel jax_history_leading(xs::Vector{Float64}, a::Float64) = begin
+    ys = scan(xs; init = 0.0, history = [1.0, 2.0]) do carry, x, earlier
+        (carry, a * x + sum(earlier))
+    end
+    total = sum(ys .^ 2)
+    return total
+end
+@kernel jax_history_indexed(xs::Vector{Float64}, a::Float64) = begin
+    ys = scan(xs, eachindex(xs); init = 0.0, history = 0.0) do carry, x, j, earlier
+        s = sum(earlier[i] * a for i in 1:j-1; init = 0.0)
+        (carry + x, x + s)
+    end
+    total = sum(ys)
+    return total
+end
+
+# Recorded `@inline` helpers (`@_record_source`): a shape test with `in` and
+# `&&`, decided while tracing, and a fold over a data length, run as a loop.
+ReactiveKernels.@_record_source @inline jax_fits(x, n) = ndims(x) <= 2 && size(x, 1) in (1, n)
+ReactiveKernels.@_record_source @inline function jax_fold(x, n)
+    total = x[1]
+    for i in 2:n
+        total = ReactiveKernels._tie_exact_logaddexp(total, x[i])
+    end
+    total
+end
+@kernel jax_shape_fold(x::Vector{Float64}, a::Float64) = begin
+    n = length(x)
+    checked = jax_fits(x, n) ? a .* x : throw(DimensionMismatch("x must have n rows"))
+    total = jax_fold(checked, n)
+    return total
+end
+# Julia's unit indices: past a vector's rank (a literal and a computed one),
+# of a number, and `size` past the rank; `dropdims` of a summed axis.
+@kernel jax_unit_index(x::Vector{Float64}, a::Float64) = begin
+    cells = plate(eachindex(x)) do i
+        x[i, 1] * a[1, 1] + x[i, (i - 1) ÷ length(x) + 1] + size(x, 2)
+    end
+    M = reshape(cells, 2, length(cells) ÷ 2)
+    total = sum(dropdims(sum(M; dims = 1); dims = 1) .^ 2)
+    return total
+end
+# `stack` in `prepare_data`: on the host a plate of vectors is a list of
+# arrays (BRM's HSGP basis, `raw_basis[:, b]`).
+@kernel jax_prep_stack(x::Vector{Float64}, a::Float64) = begin
+    rows = plate(x) do xi
+        plate(1:3) do b
+            xi * b
+        end
+    end
+    M = stack(rows; dims = 1)
+    col = M[:, 2]
+    total = a * sum(col)
     return total
 end
 
@@ -721,6 +797,9 @@ end
     bounded_src = jax_source(jax_obj_bounded; have = (:location, :scale, :x, :lo), want = :total)
     g = ["b", "c", "a", "b", "a"]
     declared = jax_source(jax_prep_declared_sum; have = (:theta, :g), want = :total, data = (; g))
+    iseq = jax_source(jax_prep_isequal; have = (:theta, :g), want = :total, data = (; g))
+    @test length(collect(eachmatch(r"^def (\w+)\("m, string(iseq)))) ==
+          length(unique(m[1] for m in eachmatch(r"^def (\w+)\("m, string(iseq))))
     @test occursin(".setdefault(", string(declared))
     if !rk_jax_available()
         @test_skip false
@@ -743,6 +822,7 @@ end
             @test r.value ≈ native(0.3, 1.7, x, lo) rtol = 1e-12
             @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), 1.7, x, lo), [0.3])) rtol = 1e-6
         end
+        @test rk_jax_evaluate(iseq, "kernel", (0.5, g); prepare = true).value ≈ 1.0
         theta = [0.5, -1.5, 2.5]
         native = prepare(jax_prep_declared_sum; have = (:theta, :g), want = :total)
         r = rk_jax_evaluate(declared, "kernel", (theta, g); grad = true, prepare = true)
@@ -751,13 +831,21 @@ end
     end
 end
 
-@testset "jax_source: tuple scan outputs, merge and dims" begin
+@testset "jax_source: tuple scan outputs, history scans, merge and dims" begin
     xs = [1.0, 2.0, 3.0, -0.5]
     M = [1.0 2.0; 3.0 4.0; 5.0 6.0]
     cases = ((jax_scan_tuple, (:a, :xs), (0.5, xs)), (jax_scan_named, (:a, :xs), (0.5, xs)),
-             (jax_scan_merge, (:a, :xs, :u0), (0.5, xs, 1.0)), (jax_dims, (:a, :M), (0.5, M)))
+             (jax_history_leading, (:a, :xs), (0.7, xs)), (jax_history_indexed, (:a, :xs), (0.7, xs)),
+             (jax_tie_div, (:a, :x, :k), (0.7, xs, 2)),
+             (jax_scan_merge, (:a, :xs, :u0), (0.5, xs, 1.0)), (jax_dims, (:a, :M), (0.5, M)),
+             (jax_shape_fold, (:a, :x), (0.7, xs)), (jax_unit_index, (:a, :x), (0.7, xs)))
     srcs = [jax_source(k; have, want = :total) for (k, have, _) in cases]
     @test !occursin(".shape[0] - 1][", string(srcs[2]))
+    fold = string(srcs[end - 1])
+    @test occursin(" in (1, ", fold) && occursin("jax.lax.fori_loop(", fold)
+    @test occursin("jnp.squeeze(", string(srcs[end]))
+    stacked = jax_source(jax_prep_stack; have = (:a, :x), want = :total, data = (; x = xs))
+    @test occursin("np.stack(", string(stacked))
     if !rk_jax_available()
         @test_skip false
     else
@@ -767,5 +855,8 @@ end
             @test r.value ≈ native(args...) rtol = 1e-12
             @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), args[2:end]...), [args[1]])) rtol = 1e-6
         end
+        native = prepare(jax_prep_stack; have = (:a, :x), want = :total)
+        r = rk_jax_evaluate(stacked, "kernel", (0.7, xs); grad = true, prepare = true)
+        @test r.value ≈ native(0.7, xs) rtol = 1e-12
     end
 end
