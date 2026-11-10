@@ -46,13 +46,32 @@ function _evidence_logmass(logcdf, logccdf, lo, hi)
         $(_evidence_logdifference(logcdf(hi), logcdf(lo))))
 end
 
+# A literal infinite bound is no bound (`nothing`) from parsing on. A bound
+# read at run time (data, a sampled value or a definition) can still be its
+# side's infinity: data `-Inf` below or `Inf` above removes that bound on its
+# rows. Such a side selects the one-sided mass lazily, so neither the value
+# nor the derivative reads an infinite endpoint, and a discrete endpoint
+# never converts one to an integer. `lo`/`hi` are the bounds as read; `below`
+# and `at` the endpoints the mass is taken at (`nothing`: that side is open).
+_evidence_runtime_bound(b) = b !== nothing && !(b isa Real)
+
+function _evidence_open_logmass(logcdf, logccdf, lo, below, hi, at)
+    _evidence_runtime_bound(lo) && return :($lo == -Inf ?
+        $(_evidence_open_logmass(logcdf, logccdf, nothing, nothing, hi, at)) :
+        $(_evidence_open_logmass(logcdf, logccdf, nothing, below, hi, at)))
+    _evidence_runtime_bound(hi) && return :($hi == Inf ?
+        $(_evidence_open_logmass(logcdf, logccdf, lo, below, nothing, nothing)) :
+        $(_evidence_open_logmass(logcdf, logccdf, lo, below, nothing, at)))
+    return _evidence_logmass(logcdf, logccdf, below, at)
+end
+
 _evidence_cell(::Val{:none}, base, y, lo, hi, cdf, ccdf, discrete) = base
 
 function _evidence_cell(::Val{:truncated}, base, y, lo, hi, cdf, ccdf, discrete;
         logcdf=b -> _evidence_logtail(cdf(b)), logccdf=b -> _evidence_logtail(ccdf(b)))
     below = lo === nothing ? nothing : _evidence_below(lo, discrete)
     at = hi === nothing ? nothing : _evidence_at(hi, discrete)
-    result = :($base - $(_evidence_logmass(logcdf, logccdf, below, at)))
+    result = :($base - $(_evidence_open_logmass(logcdf, logccdf, lo, below, hi, at)))
     hi === nothing || (result = :($y > $hi ? -Inf : $result))
     lo === nothing || (result = :($y < $lo ? -Inf : $result))
     if lo !== nothing && hi !== nothing
@@ -79,8 +98,9 @@ end
 
 function _evidence_cell(::Val{:interval_censored}, base, y, lo, hi, cdf, ccdf, discrete;
         logcdf=b -> _evidence_logtail(cdf(b)), logccdf=b -> _evidence_logtail(ccdf(b)))
-    mass = _evidence_logmass(logcdf, logccdf,
-        _evidence_at(y, discrete), _evidence_at(hi, discrete))
+    # An `Inf` upper end is the right-censored event `(y, Inf)`.
+    mass = _evidence_open_logmass(logcdf, logccdf, nothing,
+        _evidence_at(y, discrete), hi, _evidence_at(hi, discrete))
     return :($y < $hi ? $mass : -Inf)
 end
 
