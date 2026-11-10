@@ -142,6 +142,15 @@ JAX code:
   (`rows[i][j] = r`) is written in place too: with no copy when the source
   built the list from allocations (`[Vector{Int}(undef, n[k]) for k in …]`),
   else after a copy of the list and its elements.
+- `sort`, `unique`, `searchsortedfirst` and `searchsortedlast` of a vector of
+  numbers or strings order as Julia's `isless` does: -0.0 before 0.0, every
+  `NaN` last; `unique` keeps the first value of each `isequal` class, in
+  order, and the searches return 1-based indices, bisecting (a list is
+  searched in place, as `first` and `last` read it). `sort!` and `unique!`
+  rewrite a list in place, so it may grow on; `sort!` sorts an array in place
+  (after a copy if the source did not allocate it). A NumPy array keeps its
+  length, so `unique!` of one has no host translation; `unique!` of a
+  temporary (`unique!(sort(x))`) has.
 - A condition decided while emitting (`eltype(x) <: Integer`, the length of a
   tuple) takes its arm alone in an `if`, `elseif`, `? :`, `&&` or `||`: the
   other arm is not translated, as Julia never runs it, so its calls need no
@@ -152,7 +161,8 @@ JAX code:
 - Values that read no data (literals, a prior's scale) stay in the functions,
   where JAX folds them.
 - A data-only recipe without a host translation stays in the functions; a
-  comment in `prepare_data` names it.
+  comment in `prepare_data` names it and the reason. When the functions
+  cannot compute it either, the `JAXEmissionError` names both reasons.
 - `definitions = [name => expression, …]` (with `data`) computes data
   values on the host before that prefix, from the other data values;
   `prepare_data` then takes what the expressions read instead of the values
