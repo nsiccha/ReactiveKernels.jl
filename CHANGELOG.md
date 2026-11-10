@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.143
+
+- `jax_source` keeps a tuple or `NamedTuple` local that a loop or a branch
+  carries as a tuple. A loop in a recipe or a `@traceable` helper over such a
+  local (`s = i <= n ? f(s) : s`) used to start its `fori_loop` from one array
+  of the tuple, so the module failed in Python with `true_fun output is a
+  <class 'tuple'> but false_fun output is a pytree leaf` or a carry-structure
+  `TypeError`. Each element now enters with its own dtype, and past a ragged
+  row's length each element keeps its value (snag
+  `jax-source-tuple-6f1e9e4c`).
+
 ## 0.1.142
 
 - `jax_source` translates `besselix(nu, x)` and `besseli(nu, x)`
