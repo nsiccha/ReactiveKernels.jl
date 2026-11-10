@@ -159,6 +159,26 @@ end
             @test gradient[i] ≈ Float64(target) atol=1e-12 rtol=1e-12
         end
     end
+    # The structural zero written as a literal (`fill(-Inf, length(eta))`,
+    # rkppl-use §1/§2) is the same law as the column bound as data.
+    literal = bind_data(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        g ~ Normal(0, 10)
+        w ~ Beta(2, 2)
+        @plate for i in eachindex(events)
+            eta = a .+ g .* previous[i]
+            events[i] ~ LogDensity(bernoulli_logit_product_mixture_logdensity,
+                hcat(eta, fill(-Inf, length(eta))), [w, 1 - w])
+        end
+    end, (; events, previous); mod=@__MODULE__, conditioned=(:events,)),
+        (; events, previous))
+    literal_sampler = prepare_sampler(build_kernel(literal), literal, [0.3, 1.5, 0.2];
+        backend=DI.AutoEnzyme(; mode=Enzyme.Reverse))
+    for unconstrained in ([0.3, 1.5, 0.2], [0.3, 40.0, 0.2], [-0.4, -45.0, -0.6])
+        @test sampler_value_and_gradient!(literal_sampler, similar(unconstrained),
+                unconstrained) ==
+            sampler_value_and_gradient!(sampler, similar(unconstrained), unconstrained)
+    end
 end
 
 # The event-invariant component matrix and weights are computed once, and the

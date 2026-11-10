@@ -3018,6 +3018,56 @@ _resolve_module_calls(::Nothing, ::Module, ::Set{Symbol}, where) =
 _resolve_module_calls(::Missing, ::Module, ::Set{Symbol}, where) =
     GlobalRef(Base, :missing)
 
+# Base's named numbers keep Julia's meaning. Julia has no literal syntax for
+# an infinity, a NaN or an irrational, so `Inf`, `NaN`, `pi`, `π`, `ℯ` and
+# the typed `Inf32`, `NaN16`, … are how an author writes those numbers: each
+# reads as the number, exactly like `0.5`, and an irrational as its Float64
+# value. The table is Base's exported numeric constants.
+const _BASE_NUMBERS = let numbers = Dict{Symbol,Number}()
+    for name in names(Base)
+        isdefined(Base, name) && isconst(Base, name) || continue
+        value = getfield(Base, name)
+        value isa Number || continue
+        numbers[name] = value isa AbstractIrrational ? Float64(value) : value
+    end
+    numbers
+end
+
+# The number a Base number's name reads, or `nothing`. A model name with the
+# same spelling shadows it, and so does a model-module binding of its own,
+# as any Julia binding would. (A module's own numeric constant is an input
+# name that data binds, `_resolve_value_name`.)
+function _base_number(name::Symbol, mod::Module, model_names::AbstractSet)
+    number = get(_BASE_NUMBERS, name, nothing)
+    number === nothing && return nothing
+    name in model_names && return nothing
+    isdefined(mod, name) && which(mod, name) ∉ (Base, Base.MathConstants) &&
+        return nothing
+    return number
+end
+
+# `ex` with each Base number's name (and a signed one, `-Inf`) replaced by
+# its literal, and nothing else changed: keyword names stay names.
+function _base_number_literals(ex, mod::Module, model_names::AbstractSet)
+    if ex isa Symbol
+        number = _base_number(ex, mod, model_names)
+        return number === nothing ? ex : number
+    end
+    ex isa Expr && ex.head !== :quote || return ex
+    if ex.head === :call && length(ex.args) == 2 && ex.args[1] in (:-, :+) &&
+            ex.args[2] isa Symbol
+        number = _base_number(ex.args[2], mod, model_names)
+        number === nothing || return ex.args[1] === :- ? -number : number
+    end
+    ex.head === :kw && length(ex.args) == 2 && return Expr(:kw, ex.args[1],
+        _base_number_literals(ex.args[2], mod, model_names))
+    # A call's head is a function, never a number.
+    from = ex.head === :call ? 2 : 1
+    return Expr(ex.head, ex.args[1:from-1]...,
+        Any[_base_number_literals(a, mod, model_names)
+            for a in ex.args[from:end]]...)
+end
+
 # A free value name that no model name spells (data, definitions,
 # declarations and binders shadow it) reads its constant binding in the
 # model module, as a free name in a Julia function body reads its module's
@@ -3058,12 +3108,20 @@ function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where;
         values::Bool = true)
     # Names only: an interpolated `missing` value compares as `missing`.
     if ex isa Symbol
-        ex in (:pi, :π) && ex ∉ names && return Float64(pi)
+        number = _base_number(ex, mod, names)
+        number === nothing || return number
         ex in (:nothing, :missing) && ex ∉ names && return GlobalRef(Base, ex)
         return values ? _resolve_value_name(ex, mod, names) : ex
     end
     ex isa Expr || return ex
     ex.head === :quote && return ex
+    # A signed Base number is its literal, as Julia reads `-1.0`: `-Inf` stays
+    # a literal wherever one is read (a truncation or censoring bound).
+    if ex.head === :call && length(ex.args) == 2 && ex.args[1] in (:-, :+) &&
+            ex.args[2] isa Symbol
+        number = _base_number(ex.args[2], mod, names)
+        number === nothing || return ex.args[1] === :- ? -number : number
+    end
     ex = ReactiveKernels._array_literal_call(ex)
     # `a <: b` and `a >: b` are the calls Julia lowers them to.
     ex.head in (:<:, :>:) && length(ex.args) == 2 &&
@@ -3294,6 +3352,9 @@ function _observation_call_definitions(ast::Expr, data::Set{Symbol},
                     name!(value, stem, role)
                 end
                 rhs = _map_rhs_arguments(rhs) do value, head, position, nargs
+                    # Base's numbers are literals here too, so the predictor
+                    # analysis reads `exp.(ifelse.(f, -Inf, 0.0))` as written.
+                    value = _base_number_literals(value, mod, names)
                     _bind_module_calls(value) do call
                         role = call === value ?
                             _argument_role(head, position, nargs) : nothing
@@ -9789,9 +9850,9 @@ end
 
 function _lower_argument_value(lhs, slot, value, ctx)
     value isa Real && return value
-    value === :Inf && return Inf
-    value in (:pi, :π) && value ∉ ctx.taken && return Float64(pi)
     if value isa Symbol
+        number = _base_number(value, ctx.mod, ctx.taken)
+        number === nothing || return number
         value in ctx.taken || _sfail("response $lhs $slot references " *
             "undeclared name $value")
         haskey(ctx.matrices, value) && _sfail("response $lhs $slot " *
@@ -9809,7 +9870,7 @@ function _lower_argument_value(lhs, slot, value, ctx)
         ctx.shape_env, "response $lhs $slot")
     rhs = _argument_value_calls(rhs)
     for name in _value_symbols(rhs)
-        name in ctx.taken || name in (:pi, :Inf) || _sfail(
+        name in ctx.taken || _sfail(
             "response $lhs $slot references undeclared name $name")
     end
     folded = _fold_literal(rhs)
@@ -12285,7 +12346,10 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
         Set{Symbol}(p[1] for p in plate_specs))
     out = Pair{Symbol,Any}[nm => rhs for (nm, rhs) in det]
     memo = Dict{Symbol,Symbol}()
+    # A bare Base number (`Normal(0, pi)`) is its literal; other names stay.
+    base_number(a) = a isa Symbol && (r = resolve(a)) isa Number ? r : a
     function bind(lhs::Symbol, stem::Symbol, a; scalar_only=true)
+        a = base_number(a)
         a isa Expr && !_is_signed_inf(a) && a.head !== :vect &&
             a.head !== :parameters && a.head !== :kw || return a
         f = _fold_literal(a)
@@ -12338,6 +12402,7 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
     # value they hold; a dotted prior's list of per-slice vectors
     # (`D.([v1, v2])`) stays a list.
     function whole_value(lhs, stem, a, dotted::Bool, dims)
+        a = base_number(a)
         a isa Expr && !_is_signed_inf(a) &&
             !(a.head in (:parameters, :kw)) || return a
         if _is_ref_call(a) || _is_slice_iterator(a)
