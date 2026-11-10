@@ -16,6 +16,19 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.149
+
+- Shared-prefix cell and partition derivatives work when a shared value that
+  cells read is a `NamedTuple` with scalar fields, such as a source record
+  `(; min_dose, …, weights, normalizer)`: `cell_pullback!` with
+  `prepare_cell_pullback` / `prepare_cell_accumulator`, and
+  `partition_value_and_gradient!` / `partition_batch_value_and_gradient!` of a
+  `prepare_partition_sampler` with partitioned coordinates. They threw
+  `MethodError: no method matching _zero_cell_shadow!(::Float64)` (the cell
+  pullback and the batch) or `ArgumentError: broadcasting over dictionaries
+  and NamedTuples is reserved` (one label's gradient) (snag
+  `rkppl-zero-cell-a7c54028`). Requires ReactiveKernels 0.1.149.
+
 ## 0.1.148
 
 - `jax_source(built, plan)`: a multivariate normal observed per plate cell

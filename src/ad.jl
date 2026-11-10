@@ -149,14 +149,22 @@ _ad_selector_indices(indices::Tuple) = indices
 # point that mixes duplicated storage (arrays) and active scalars. Represent a
 # scalar component as mutable scalar storage so the whole tuple is duplicated,
 # then unwrap it at the RK callable boundary and restore its cotangent before
-# returning to the caller.
+# returning to the caller. A scalar field of a tuple or NamedTuple port is a
+# scalar leaf too: left immutable, an accumulating reverse pass could neither
+# zero nor add into its shadow (snag rkppl-zero-cell-a7c54028).
 _ad_active_point_component(value::Number) = Ref(value)
+_ad_active_point_component(value::Union{Tuple,NamedTuple}) =
+    map(_ad_active_point_component, value)
 _ad_active_point_component(value) = value
 _ad_active_value(value::Base.RefValue) = value[]
+_ad_active_value(value::Union{Tuple,NamedTuple}) = map(_ad_active_value, value)
 _ad_active_value(value) = value
 
 _ad_restore_cotangent(::Base.RefValue, cotangent::Base.RefValue) = cotangent[]
 function _ad_restore_cotangent(point::Tuple, cotangent::Tuple)
+    map(_ad_restore_cotangent, point, cotangent)
+end
+function _ad_restore_cotangent(point::NamedTuple{N}, cotangent::NamedTuple{N}) where {N}
     map(_ad_restore_cotangent, point, cotangent)
 end
 _ad_restore_cotangent(point, cotangent) = cotangent
@@ -1280,9 +1288,10 @@ _ad_plan_argument(op::PreparedADOperator, ref::_PartitionPlanRef) =
 _ad_plan_argument(op, ref::_PartitionPlanRef) = getfield(ref, :plan)
 _ad_plan_argument(op, plan) = plan
 
-# A pullback passes its cotangent exemplar `seed`: for array outputs or several
-# selected WANT ports it differentiates the seeded inner product (`_ADSeededCall`), whose
-# port values are kept for `ad_value_and_pullback` when `keep_values`.
+# A pullback passes its cotangent exemplar `seed`: for array, tuple or NamedTuple
+# outputs or several selected WANT ports it differentiates the seeded inner product
+# (`_ADSeededCall`), whose port values are kept for `ad_value_and_pullback` when
+# `keep_values`.
 function _ad_call(kernel::_ADKernel, resolved::Tuple, active;
                   scalar_output::Bool = true, retain::Tuple = (),
                   seed = nothing, keep_values::Bool = false)
@@ -1304,7 +1313,10 @@ function _ad_call(kernel::_ADKernel, resolved::Tuple, active;
     if call isa _ADConstantCall
         seed === nothing || _ad_check_seed(kernel, seed, _ad_call_exemplar(
             call, resolved, external_values, active_selector))
-    elseif seed !== nothing && (seed isa AbstractArray || length(outputs(kernel)) > 1)
+    elseif seed !== nothing && (seed isa Union{AbstractArray,Tuple,NamedTuple} ||
+                                length(outputs(kernel)) > 1)
+        # A structured cotangent of one port is seeded too: DI's Enzyme
+        # pullback broadcasts over the seed, which a NamedTuple refuses.
         call, external_values = _ad_seeded_call(
             kernel, call, external_values, resolved, active_selector, seed,
             keep_values)
@@ -1750,8 +1762,9 @@ _ad_operator_preparation(::Val{:pullback}, ::_ADConstantCall, backend, point,
 _ad_operator_preparation(::Val{:pushforward}, ::_ADConstantCall, backend, point,
                          seeds, contexts) = nothing
 
-# A pullback hands `_ad_call` its seed, which differentiates array outputs or
-# several WANT ports as their seeded inner product (`_ADSeededCall`).
+# A pullback hands `_ad_call` its seed, which differentiates array, tuple or
+# NamedTuple outputs or several WANT ports as their seeded inner product
+# (`_ADSeededCall`).
 _ad_operator_seeding(::Val{:pullback}, seeds, backend) =
     (; seed = only(seeds), keep_values = ad_retains_primal_sweep(backend))
 _ad_operator_seeding(::Val, seeds, backend) = (;)
@@ -1974,6 +1987,8 @@ _ad_tangent_shape(value) = string(typeof(value))
 # A tuple selector's scalar components cross DI as mutable `Ref` storage
 # (`_ad_active_point_component`); tangents follow the same representation.
 _ad_tangent_point(point::Tuple, tangent::Tuple) =
+    map(_ad_tangent_point, point, tangent)
+_ad_tangent_point(point::NamedTuple{N}, tangent::NamedTuple{N}) where {N} =
     map(_ad_tangent_point, point, tangent)
 _ad_tangent_point(::Base.RefValue, tangent::Number) = Ref(tangent)
 _ad_tangent_point(point, tangent) = tangent

@@ -75,3 +75,65 @@ end
     @test_throws ArgumentError prepare_ad_accumulator(cut, reverse, x, copy(x);
         active=:point)
 end
+
+@testset "Scalar fields of a NamedTuple port and a NamedTuple WANT" begin
+    # A tuple selector holds every scalar leaf as `Ref` storage, a field of a
+    # NamedTuple port included, so the whole point is duplicated and an
+    # accumulator adds into each field. A NamedTuple-valued WANT takes its
+    # cotangent through the seeded inner product (snag rkppl-zero-cell-a7c54028).
+    source_type = NamedTuple{(:scale, :weights, :offset),
+        Tuple{Float64,Vector{Float64},Float64}}
+    graph = Graph()
+    x = value!(graph, :x, Vector{Float64})
+    source = value!(graph, :source, source_type)
+    density = value!(graph, :density, Float64)
+    add!(graph, (x, source) => density,
+         (q, s) -> s.scale * q[1]^2 + sum(s.weights) * q[1] + s.offset^2)
+    kernel = prepare(graph; have = (x, source), want = density)
+    reverse = AutoEnzyme(; mode = Enzyme.Reverse)
+    xv, src = [0.5], (; scale = 2.0, weights = [1.0, 0.5], offset = 0.75)
+    expected_x = [2 * src.scale * xv[1] + sum(src.weights)]
+    expected_source = (; scale = xv[1]^2, weights = fill(xv[1], 2),
+        offset = 2 * src.offset)
+
+    g = ad_gradient(kernel, reverse, xv, src; active = (:x, :source))
+    @test g[1] ≈ expected_x
+    @test g[2] isa NamedTuple{(:scale, :weights, :offset)}
+    @test g[2].scale ≈ expected_source.scale
+    @test g[2].weights ≈ expected_source.weights
+    @test g[2].offset ≈ expected_source.offset
+    prepared = prepare_ad(kernel, reverse, xv, src; active = (:x, :source))
+    value, h = ad_value_and_gradient(prepared, xv, src)
+    @test value ≈ src.scale * xv[1]^2 + sum(src.weights) * xv[1] + src.offset^2
+    @test h[2].scale ≈ expected_source.scale
+    @test h[2].offset ≈ expected_source.offset
+
+    q = prepare_ad_accumulator(kernel, reverse, xv, src; active = (:x, :source))
+    storage = ad_accumulator_storage(q, xv, src)
+    @test storage[2].scale isa Base.RefValue{Float64}
+    @test storage[2].offset isa Base.RefValue{Float64}
+    for _ in 1:2
+        ad_accumulate!(q, storage, nothing, 0.5, xv, src)
+    end
+    @test storage[1] ≈ expected_x
+    @test storage[2].scale[] ≈ expected_source.scale
+    @test storage[2].weights ≈ expected_source.weights
+    @test storage[2].offset[] ≈ expected_source.offset
+
+    # A NamedTuple of scalars and an array as the one WANT of a pullback.
+    produced = Graph()
+    beta = value!(produced, :beta, Vector{Float64})
+    record = value!(produced, :record,
+        NamedTuple{(:scale, :weights), Tuple{Float64,Vector{Float64}}})
+    add!(produced, beta => record, b -> (; scale = exp(b[1]), weights = b .* b))
+    producer = prepare(produced; have = beta, want = record)
+    b = [0.3, -0.4]
+    seed = (; scale = 1.5, weights = [2.0, -1.0])
+    expected_b = [seed.scale * exp(b[1]), 0.0] .+ 2 .* b .* seed.weights
+    @test ad_pullback(producer, reverse, seed, b; active = :beta) ≈ expected_b
+    pullback = prepare_ad_pullback(producer, reverse, seed, b; active = :beta)
+    @test ad_pullback(pullback, seed, b) ≈ expected_b
+    other = (; scale = -0.5, weights = [0.25, 4.0])
+    @test ad_pullback(pullback, other, b) ≈
+        [other.scale * exp(b[1]), 0.0] .+ 2 .* b .* other.weights
+end

@@ -86,6 +86,19 @@ const _CS_READS_SUM = @rkppl begin
         y[k] ~ Normal(log1p(sum(rate[rows[k]])) + w[grp[k]], sigma)
     end
 end
+# A shared value that is a NamedTuple of scalars beside a matrix, as a BRM
+# PK source record is (snag rkppl-zero-cell-a7c54028).
+_cs_source(grid, beta) = (; scale = exp(beta), weights = reshape(grid .* beta, :, 1),
+    offset = beta^2 / 2)
+_cs_source_rate(source, k) = source.scale * exp(source.weights[k, 1]) + source.offset
+const _CS_NAMED = @rkppl begin
+    beta ~ Normal(0, 1)
+    z[levels(id)] .~ Normal.(0, 1)
+    source = _cs_source(grid, beta)
+    @plate for k in eachindex(y)
+        y[k] ~ Poisson(exp(z[id[k]]) * _cs_source_rate(source, k))
+    end
+end
 @isdefined(_static_enzyme) || include("static_enzyme.jl")
 
 const _CS_REVERSE = AutoEnzyme(; mode = Enzyme.Reverse)
@@ -552,4 +565,59 @@ end
         (curvature(hi) - curvature(lo)) / (2epsilon)
     end
     @test gradient ≈ fd rtol = 2e-8 atol = 2e-8
+end
+
+@testset "A shared NamedTuple value with scalar fields" begin
+    n = 4
+    data = (; id = collect(1:n), grid = collect(range(-0.7, 0.9; length = n)),
+        y = mod.(1:n, 4))
+    bound = _CS_NAMED(; data.id, data.grid) | (; data.y)
+    built = build_kernel(bound)
+    u = collect(range(-0.2, 0.3; length = built.layout.total))
+    fd(f, point) = map(eachindex(point)) do j
+        hi, lo = copy(point), copy(point)
+        hi[j] += 1e-5; lo[j] -= 1e-5
+        (f(hi) - f(lo)) / 2e-5
+    end
+    q = prepare_compact_cell_ad(prepare_ad_third, built, bound, :y, u, [2],
+        _CS_THIRD, ([0.6],); partitioned = :z, locality = :error)
+    @test only(q.shared.cache.values) isa NamedTuple{(:scale, :weights, :offset)}
+    p = prepare_cell_pullback(q, _CS_REVERSE, u)
+    reference = prepare_cell_query(built, bound, :y; locality = :ignore)
+    weights = [0.3, -0.4, 1.2, 0.8]
+    for (order, backend) in ((0, _CS_REVERSE), (1, _CS_SECOND), (2, _CS_THIRD))
+        a = prepare_cell_accumulator(q, backend, u; order)
+        gradient = zeros(length(u))
+        cell_pullback!(gradient, p, u) do batch
+            for i in 1:n
+                accumulate_cell!(batch, a, order == 0 ? nothing : [0.6],
+                    weights[i], u[[i+1]], [i+1], i)
+            end
+        end
+        contraction(point) = sum(1:n) do i
+            order == 0 && return weights[i] * reference(point, i)
+            g, (hv,), _ = ad_gradient_hvp_and_third(q, ([0.6],),
+                point, point[[i+1]], [i+1], i)
+            weights[i] * 0.6 * only(order == 1 ? g : hv)
+        end
+        @test gradient ≈ fd(contraction, u) rtol = 1e-7 atol = 1e-8
+        @test gradient[1] != 0
+    end
+
+    partition = prepare_partition(built, bound, :y; by = :id, locality = :ignore)
+    for compact in (false, true)
+        sampler = prepare_partition_sampler(built, bound, :y, u; by = :id,
+            backend = _CS_REVERSE, compact, locality = :error, partitioned = :z)
+        @test sampler.prefix !== nothing
+        for label in 1:n
+            footprint = partition_footprint(sampler, label)
+            g = zeros(compact ? length(footprint) : length(u))
+            partition_value_and_gradient!(sampler, g, u, label)
+            expected = fd(point -> partition(point, label), u)
+            @test g ≈ (compact ? expected[footprint] : expected) rtol = 1e-7 atol = 1e-8
+        end
+        g = zeros(length(u))
+        partition_batch_value_and_gradient!(sampler, g, u, collect(1:n))
+        @test g ≈ fd(point -> sum(label -> partition(point, label), 1:n), u) rtol = 1e-7 atol = 1e-8
+    end
 end
