@@ -630,6 +630,34 @@ end
     total = sum(per)
     return total
 end
+# The same through a kernel called by another kernel (both spliced into the
+# cell), over the group index with the tables passed whole: the distinct
+# values' plate and a scan over each group's positions stay in the cell.
+@kernel jax_cell_inner(x, w, k) = begin
+    levels = jax_order_levels(x, x)
+    idx = jax_order_positions(levels, x)
+    decay = plate(levels) do d
+        exp(-k * d)
+    end
+    trace = scan(idx, w; init = 0.0) do carry, s, a
+        next = carry * decay[s] + a
+        (next, next)
+    end
+    return trace
+end
+@kernel jax_cell_outer(x, w, k) = begin
+    inner = jax_cell_inner(x, w, k)
+    return inner
+end
+@kernel jax_cell_nested(XS::Vector{Vector{Float64}}, WS::Vector{Vector{Float64}},
+                        Y::Vector{Vector{Float64}}, k::Float64) = begin
+    per = plate(eachindex(XS), Ref(XS), Ref(WS), Ref(Y)) do i, xs, ws, ys
+        v = jax_cell_outer(xs[i], ws[i], k)
+        sum(abs2, ys[i] .- v)
+    end
+    total = sum(per)
+    return total
+end
 # A cell recipe neither the host nor the functions compute.
 @kernel jax_cell_unique_array(X::Vector{Vector{Float64}}, a::Float64) = begin
     per = plate(X) do x
@@ -1439,6 +1467,14 @@ end
     shared = jax_source(jax_cell_order_shared; have = (:theta, :x), want = :total, data = (; x))
     @test !occursin(" for element", string(shared))
     @test haskey(shared.prepared, :levels)
+    # Through spliced kernels, gathered by the group index.
+    XS = [[0.5, 1.0, 0.5], [2.0, 1.0, 2.0, 3.0, 0.5], [1.5], [0.25, 0.25]]
+    WS = [[1.0, 0.0, 0.5], [0.0, 2.0, 0.0, 0.0, 1.0], [1.0], [0.3, 0.0]]
+    YN = [[0.9, 0.6, 0.7], [0.1, 1.8, 0.4, 0.05, 1.0], [0.8], [0.3, 0.2]]
+    nested = jax_source(jax_cell_nested; have = (:k, :XS, :WS, :Y), want = :total,
+                        data = (; XS, WS, Y = YN))
+    @test all(n -> haskey(nested.prepared, n), (Symbol("inner.levels"), Symbol("inner.idx")))
+    @test occursin("jax.lax.scan(", split(string(nested), "\ndef kernel")[2])
     # A cell recipe neither side computes: the error names both reasons.
     err = try
         jax_source(jax_cell_unique_array; have = (:a, :X), want = :total, data = (; X))
@@ -1462,6 +1498,10 @@ end
         r = rk_jax_evaluate(rows, "kernel", (0.7, x, R); grad = true, prepare = true)
         @test r.value ≈ native(0.7, x, R) rtol = 1e-12
         @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x, R), [0.7])) rtol = 1e-6
+        native = prepare(jax_cell_nested; have = (:k, :XS, :WS, :Y), want = :total)
+        r = rk_jax_evaluate(nested, "kernel", (0.7, XS, WS, YN); grad = true, prepare = true)
+        @test r.value ≈ native(0.7, XS, WS, YN) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), XS, WS, YN), [0.7])) rtol = 1e-6
         native = prepare(jax_cell_order_shared; have = (:theta, :x), want = :total)
         theta = [0.3, -0.2, 0.9]
         r = rk_jax_evaluate(shared, "kernel", (theta, x); grad = true, prepare = true)
