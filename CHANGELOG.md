@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.137
+## 0.1.139
 
 - `jax_source` follows a plain helper's lowered code through module-qualified
   calls (`M.f(x)`, lowered `getproperty(M, :f)`), `getglobal(M, name)` of a
@@ -32,6 +32,33 @@ are recorded in the git history only.
   `logistic_dose_response` and `biexponential_rates`). A `@deffun` whose body
   has a loop or an `if` stays a plain helper with loops or branches, which has
   no translation.
+
+## 0.1.138
+
+- `jax_source`: a gather through a ragged integer row is padded as the row is
+  (snag `jax-ragged-index-b8420d16`). In a plate cell, `xs[rs[i]]`, `xs[r]` or
+  `view(xs, r)` with `R::Vector{Vector{Int}}` lost the row's lengths, so the
+  cell's reduction summed the padding entries, silently: the JAX value
+  repeated each row's last index up to the longest row (2.093 where native
+  gives 1.352), and an empty row added `x[end]`. Its gradient took the same
+  extra terms. The gathered value now carries the row's lengths, and every
+  reduction of it masks them.
+- `sum(f, v)`, `dot(u, v)` and `u' * v` of a padded (ragged) row now mask its
+  padding as `sum(v)` does; they summed it, also for a ragged input's own row.
+- A row of a ragged value read through `getindex`/`view` in lowered code keeps
+  its lengths, as `x[i]` in source does.
+- A gather through a ragged row beside another kept dimension (`M[r, :]`)
+  raises `JAXEmissionError`: its padding would sit on an inner axis that no
+  reduction masks. Its JAX value used to sum the padding.
+
+## 0.1.137
+
+- `jax_source`: a scan whose step outputs a named tuple of numbers and
+  numeric vectors (a K-state filter's `(lpd, w, m)`) translates. Each vector
+  field stacks as the `(steps, K)` array of its rows, as `jax.lax.scan`
+  stacks it; `steps[t].w`, `steps[end].m` and generators over the steps read
+  it as native does. It raised "a scan whose step outputs … has no JAX
+  translation yet".
 
 ## 0.1.136
 

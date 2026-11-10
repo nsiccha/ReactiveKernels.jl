@@ -69,6 +69,14 @@ function _jax_extent(args)
 end
 # A padded vector's valid-entry mask.
 _jax_mask(v::_PyVal) = "(jnp.arange(" * _py_atom(v.code) * ".shape[0]) < " * v.extent * ")"
+# The code of `v` as a reduction reads it: a padded vector's (or its
+# adjoint's) padding replaced by the reduction's identity `neutral`.
+function _jax_masked(v::_PyVal, neutral::AbstractString)
+    isempty(v.extent) && return v.code
+    v.T isa Type && (v.T <: AbstractVector || v.T <: LinearAlgebra.Adjoint{<:Any,<:AbstractVector}) ||
+        return v.code
+    "jnp.where(" * _jax_mask(v) * ", " * v.code * ", " * neutral * ")"
+end
 
 # The Python keywords and module names an emitted identifier must not take.
 const _JAX_RESERVED = Set{String}(split("""
@@ -539,7 +547,7 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
     if lhs isa Expr && lhs.head === :ref && lhs.args[1] isa Symbol && haskey(ctx.locals, lhs.args[1])
         # `A[i] = v`: a functional update rebinding `A`.
         target = ctx.locals[lhs.args[1]]
-        indexed = _jax_index(ctx, target, lhs.args[2:end])
+        indexed = _jax_index(ctx, target, lhs.args[2:end]; target = true)
         position = indexed.code[ncodeunits(target.code)+1:end]
         name = _jax_fresh(ctx, lhs.args[1])
         _jax_emit!(ctx, name * " = " * _py_atom(target.code) * ".at" * position * ".set(" * v.code * ")")
@@ -655,8 +663,9 @@ function _jax_unit_indices!(ctx::_JaxContext, indices, what::AbstractString)
     end
 end
 
-# Index `x` with Julia indices `indices` (source expressions).
-function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
+# Index `x` with Julia indices `indices` (source expressions). An assignment
+# `target` reads the position only, so its gather carries no extent.
+function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
     if ctx.host !== nothing
         v = _host_index(ctx, x, indices)
         v === nothing || return v
@@ -683,9 +692,11 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
             _jax_error("indexing a vector of tuples with several indices", _jax_where(ctx))
         E = eltype(x.T)
         parts = [_jax_index(ctx, _jax_column(x, k), indices) for k in 1:fieldcount(E)]
-        scalar = all(v -> _jax_is_scalar(v.T), parts)
-        return _PyVal(_jax_tuple_code(parts), scalar ? E : Vector{E}, false,
-                      scalar ? "" : parts[1].extent)
+        # An element reads each field's value; a slice, each field's column.
+        element = all(k -> parts[k].T == fieldtype(E, k), 1:fieldcount(E))
+        number = findfirst(k -> fieldtype(E, k) <: Number, 1:fieldcount(E))
+        return _PyVal(_jax_tuple_code(parts), element ? E : Vector{E}, false,
+                      element || number === nothing ? "" : parts[number].extent)
     end
     N = ndims(x.T)
     # Linear indexing reads the array in Julia's column-major order.
@@ -704,10 +715,12 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
         _jax_error("indexing a rank-", N, " array with ", length(indices),
                    " indices", _jax_where(ctx))
     parts = String[]
+    values = Union{Nothing,_PyVal}[]
     kept = 0
     for (dim, index) in enumerate(indices)
-        part, keeps = _jax_index_part(ctx, x, dim, index)
+        part, keeps, value = _jax_index_part(ctx, x, dim, index)
         push!(parts, part)
+        push!(values, value)
         kept += keeps
     end
     E = eltype(x.T)
@@ -721,39 +734,50 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
     if !isempty(x.extent) && kept > 0
         # A gather from a padded group vector by an index vector: the indices
         # are valid entries, and the result is padded as the index is.
-        gather = length(indices) == 1 ? _jax_bound_expr(ctx, x, 1, indices[1]) : nothing
+        gather = length(indices) == 1 ? values[1] : nothing
         gather !== nothing && _jax_is_array(gather.T) && eltype(gather.T) <: Integer ||
             _jax_error("slicing a padded group vector has no JAX translation", _jax_where(ctx))
         return _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false, gather.extent)
     end
-    _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false, kept > 0 ? _jax_index_extent(ctx, indices) : "")
+    _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false,
+           target ? "" : _jax_gather_extent(ctx, values, kept))
 end
-# The extent of a gather result: its index vector's, when that is padded.
-_jax_index_extent(ctx, indices) = ""
+# The extent of a gather: the lengths of its index vector, when that is padded
+# (a ragged row, or a range to a data length), since the gathered entries are
+# padded as the index is and reductions of them mask the rest. A padded index
+# beside another kept dimension would pad an inner axis, which nothing masks.
+function _jax_gather_extent(ctx::_JaxContext, values, kept::Int)
+    padded = [v for v in values if v !== nothing && _jax_is_array(v.T) && !isempty(v.extent)]
+    isempty(padded) && return ""
+    kept == 1 || _jax_error("a gather by a padded (ragged) index vector beside another ",
+                            "kept dimension has no JAX translation", _jax_where(ctx))
+    only(padded).extent
+end
 
-# One index position: the Python index text and whether it keeps a dimension.
+# One index position: the Python index text, whether it keeps a dimension,
+# and the index's value (`nothing` for a literal colon or a written range).
 function _jax_index_part(ctx::_JaxContext, x::_PyVal, dim::Int, index)
-    index === :(:) && return (":", 1)
-    index == :(Colon()) && return (":", 1)
+    index === :(:) && return (":", 1, nothing)
+    index == :(Colon()) && return (":", 1, nothing)
     if index isa Expr && index.head === :call && index.args[1] === :(:) &&
        length(index.args) == 3
         lo = _jax_bound_expr(ctx, x, dim, index.args[2])
         hi = _jax_bound_expr(ctx, x, dim, index.args[3])
-        return (_jax_minus_one(lo) * ":" * hi.code, 1)
+        return (_jax_minus_one(lo) * ":" * hi.code, 1, nothing)
     end
     i = _jax_bound_expr(ctx, x, dim, index)
-    i.T === Colon && return (":", 1)
-    _jax_is_scalar(i.T) && i.T <: Integer && return (_jax_minus_one(i), 0)
+    i.T === Colon && return (":", 1, i)
+    _jax_is_scalar(i.T) && i.T <: Integer && return (_jax_minus_one(i), 0, i)
     if _jax_is_array(i.T) && eltype(i.T) <: Integer
         ndims(i.T) == 1 || _jax_error("a gather by a rank-", ndims(i.T), " index array",
                                       _jax_where(ctx))
-        return (_py_infix("-", [i.code, "1"]), 1)
+        return (_py_infix("-", [i.code, "1"]), 1, i)
     end
     if i.T isa Type && i.T <: AbstractUnitRange
         m = match(r"^jnp\.arange\((.*), (.*)\)$", i.code)
         m === nothing || return (_jax_minus_one(_PyVal(m.captures[1], Int)) * ":" *
-                                 _jax_minus_one(_PyVal(m.captures[2], Int)), 1)
-        return (_py_infix("-", [i.code, "1"]), 1)
+                                 _jax_minus_one(_PyVal(m.captures[2], Int)), 1, i)
+        return (_py_infix("-", [i.code, "1"]), 1, i)
     end
     _jax_error("the index `", index, "` (of type `", i.T, "`) has no JAX translation",
                _jax_where(ctx))
@@ -1778,7 +1802,8 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(*), args::Vector{_PyVal})
     a, b = args
     if _jax_is_array(a.T) && _jax_is_array(b.T)
         a.T <: LinearAlgebra.Adjoint{<:Any,<:AbstractVector} && ndims(b.T) == 1 &&
-            return _jax_result(*, args, "jnp.dot(" * a.code * ", " * b.code * ")")
+            return _jax_result(*, args, "jnp.dot(" * _jax_masked(a, "0") * ", " *
+                                        _jax_masked(b, "0") * ")")
         ndims(a.T) == 1 && b.T <: LinearAlgebra.Adjoint{<:Any,<:AbstractVector} &&
             return _jax_result(*, args, "jnp.outer(" * a.code * ", " * b.code * ")")
         return _jax_result(*, args, _py_infix("@", [a.code, b.code]))
@@ -1834,7 +1859,9 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal
     length(args) == 1 && return _jax_result(sum, args, "jnp.sum(" * args[1].code * ")")
     length(args) == 2 && _jax_is_array(args[2].T) || _jax_error("this `sum` call", _jax_where(ctx))
     mapped = _jax_broadcast(ctx, _jax_function_of(args[1]), [args[2]])
-    _PyVal("jnp.sum(" * mapped.code * ")", eltype(mapped.T))
+    # `f` of a padded vector's padding is not part of the sum.
+    masked = _jax_ragged(args[2].T) ? mapped : _PyVal(mapped.code, mapped.T, false, args[2].extent)
+    _PyVal("jnp.sum(" * _jax_masked(masked, "0") * ")", eltype(mapped.T))
 end
 for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp.inf"),
                            (minimum, "jnp.min", "jnp.inf"))
@@ -2018,7 +2045,8 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(convert), args::Vector{_P
     _jax_traceable_or_lowered(ctx, convert, args)
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(LinearAlgebra.dot), args::Vector{_PyVal})
-    _jax_result(LinearAlgebra.dot, args, "jnp.vdot(" * _jax_args(args) * ")")
+    _jax_result(LinearAlgebra.dot, args,
+                "jnp.vdot(" * join((_jax_masked(a, "0") for a in args), ", ") * ")")
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(vcat), args::Vector{_PyVal})
     v = _jax_result(vcat, args, "jnp.concatenate([" * join(
@@ -2155,7 +2183,14 @@ function _jax_index_values(ctx::_JaxContext, x::_PyVal, indices::Vector{_PyVal})
         end
     end
     E = eltype(x.T)
-    _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", kept == 0 ? E : Array{E,kept})
+    code = _py_atom(x.code) * "[" * join(parts, ", ") * "]"
+    T = kept == 0 ? E : Array{E,kept}
+    # Rows of a ragged value keep their lengths, as `x[i]` does (`_jax_index`).
+    if _jax_ragged(x.T)
+        isempty(x.extent) && _jax_error("a ragged array without its lengths", _jax_where(ctx))
+        return _PyVal(code, T, false, x.extent * "[" * join(parts, ", ") * "]")
+    end
+    _PyVal(code, T, false, _jax_gather_extent(ctx, indices, kept))
 end
 
 # A range value, `a:b`: the array of its elements.
@@ -3054,13 +3089,23 @@ end
 
 _jax_numeric_namedtuple(@nospecialize(T)) = T isa Type && T <: NamedTuple && isconcretetype(T) &&
     fieldcount(T) > 0 && all(F -> F <: Number, fieldtypes(T))
-# A vector of named numbers or of numeric tuples is held as the tuple of its
-# columns, as `jax.lax.scan` stacks a step's outputs.
+# Named numbers and numeric vectors (a scan step's output `(lpd, w)` with
+# `w::Vector`), stacked field by field.
+_jax_stacked_namedtuple(@nospecialize(T)) = T isa Type && T <: NamedTuple &&
+    isconcretetype(T) && fieldcount(T) > 0 &&
+    all(F -> F <: Number || F <: AbstractVector{<:Number} && isconcretetype(F), fieldtypes(T))
+# A vector of named numbers (or numeric vectors) or of numeric tuples is held
+# as the tuple of its columns, as `jax.lax.scan` stacks a step's outputs; a
+# vector field's column is the dense array of its rows, one per element.
 _jax_columns(@nospecialize(T)) = T isa Type && T <: AbstractVector &&
-    (_jax_numeric_namedtuple(eltype(T)) || _jax_numeric_tuple(eltype(T)))
-_jax_column(x::_PyVal, k::Integer) =
-    _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", Vector{fieldtype(eltype(x.T), k)},
-           x.static, x.extent)
+    (_jax_stacked_namedtuple(eltype(T)) || _jax_numeric_tuple(eltype(T)))
+function _jax_column(x::_PyVal, k::Integer)
+    F = fieldtype(eltype(x.T), k)
+    code = _py_atom(x.code) * "[" * string(k - 1) * "]"
+    # A vector field's rows all have the stacked width.
+    _PyVal(code, Vector{F}, x.static, F <: Number ? x.extent :
+           "jnp.full((" * code * ".shape[0],), " * code * ".shape[1])")
+end
 _jax_numeric_tuple(@nospecialize(T)) = T isa Type && T <: Tuple && fieldcount(T) > 0 &&
     isconcretetype(eltype(T)) && eltype(T) <: Number
 _jax_unref(@nospecialize(T)) = T isa Type && T <: Base.RefValue ? eltype(T) : T
@@ -3149,6 +3194,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     # named tuples is the tuple of its columns, as `jax.lax.scan` returns it,
     # and a plate over it maps every column.
     E <: Number || (_jax_numeric_namedtuple(E) || _jax_numeric_tuple(E)) && !I ||
+        _jax_stacked_namedtuple(E) && !I && isempty(extent) ||
         _jax_error("a scan whose step outputs `", E, "` has no JAX translation yet",
                    _jax_where(ctx))
     # Padded outputs carry the extent; a vector of named numbers is the tuple
