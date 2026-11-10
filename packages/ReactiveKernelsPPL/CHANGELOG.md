@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.134
+## 0.1.135
 
 - The full-model sampler query is a LogDensityProblems target. With
   `LogDensityProblems` loaded, a `SamplerQuery` from `prepare_sampler`
@@ -28,6 +28,21 @@ are recorded in the git history only.
   `MethodError` and only `slice_problem` and `joined_problem` targets existed.
   A query still serves one caller at a time: give each concurrent chain its
   own query, or let a sampler deep-copy one per chain.
+
+## 0.1.134
+
+- Bound data for `censored`, `truncated` and `interval_censored` evidence may
+  hold its side's infinity: a `-Inf` lower or `Inf` upper entry removes that
+  bound for its row, and a scalar datum removes it for every row, as a literal
+  `-Inf`/`Inf` does. One response vector with a per-row detection limit
+  (`censored.(Normal.(mu, s), lo, Inf)` with `lo[i] = -Inf` on measured rows)
+  now binds; an `Inf` interval upper end is the right-censored event
+  `(y, Inf)`. A truncation normalizer or interval mass over a bound read at
+  run time selects the one-sided mass lazily on such rows, so values and
+  gradients are those of Distributions.jl's law without the bound, and a
+  discrete endpoint never converts an infinity to an integer. NaN, and the
+  opposite infinity (`Inf` below, `-Inf` above), are still refused at binding.
+  Snag `rkppl-censored-v-43aaa6f9`.
 
 ## 0.1.133
 
