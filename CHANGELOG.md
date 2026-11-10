@@ -36,6 +36,15 @@ are recorded in the git history only.
   call's arguments, such as a literal order, with a method of
   `ReactiveKernels._jax_elementwise_call(ctx, f, args)`. It is applied to
   scalars and, broadcast, elementwise to arrays.
+- A keyword call in a plain helper's lowered code, `Core.kwcall(NamedTuple{
+  names}(values), f, args...)`, translates as the same call in source does:
+  `vec(sum(lambda; dims = 2))` (the shape of BRM's `hsgp_sqrt_spd`) is
+  `jnp.sum(..., keepdims=True)` raveled. It raised "a type applied to a
+  computed parameter", which named no keyword call; a keyword call RK has no
+  translation for now raises "keyword arguments to `f` have no JAX
+  translation", naming the function (BRM's periodic basis helper
+  `_brm_hsgp_basis_state(...; anchor, mask)`, snag
+  `jax-source-perio-96f952a3`).
 
 ## 0.1.139
 

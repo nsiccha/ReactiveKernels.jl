@@ -253,7 +253,9 @@ A function that a recipe calls is translated if:
 - it is defined with `@traceable`, in which case its authored body is
   translated (in `prepare_data`, as a host function);
 - it is a prepared kernel, which becomes a module-level function of its plan;
-- or it is a plain function whose lowered code is straight-line.
+- or it is a plain function whose lowered code is straight-line. A keyword
+  call in it (`sum(x; dims = 2)`) translates as the same call in source does;
+  one with no translation raises naming the function.
 
 In that lowered code, module-qualified calls (`M.f(x)`), `getglobal(M, name)`
 of a module and name known while emitting, `Val` tags (`Val(:f)`,

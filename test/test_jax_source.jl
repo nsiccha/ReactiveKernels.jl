@@ -1227,3 +1227,40 @@ end
         @test r.grad ≈ native(1.0, hp, xp) rtol = 1e-12
     end
 end
+
+# Keyword calls in a plain helper's lowered code (snag
+# jax-source-perio-96f952a3), `Core.kwcall(NamedTuple{names}(values), f,
+# args...)`: the call with those keyword arguments, as source spells it. The
+# shape of BRM's `hsgp_sqrt_spd`, a spectral scale over a basis' frequencies.
+jax_kw_sqrt_spd(lambda, sigma, rho) =
+    sigma .* exp.(-0.25 .* (rho * rho) .* vec(sum(lambda; dims = 2)))
+@kernel jax_kw_plain(rho::Float64, lambda::Matrix{Float64}) = begin
+    scale = jax_kw_sqrt_spd(lambda, 1.3, rho)
+    s = sum(scale)
+    return s
+end
+# A keyword call RK has no translation for names the keyword call (BRM's
+# periodic basis read "a type applied to a computed parameter").
+jax_kw_inner(x, k; anchor = nothing, mask = nothing) = x .* k
+jax_kw_outer(x, k) = jax_kw_inner(x, k; anchor = nothing, mask = nothing)
+@kernel jax_kw_refused(k::Float64, x::Vector{Float64}) = begin
+    b = jax_kw_outer(x, k)
+    s = sum(b)
+    return s
+end
+
+@testset "jax_source: keyword calls in a plain helper" begin
+    src = jax_source(jax_kw_plain; have = (:rho, :lambda), want = :s)
+    @test occursin("jnp.sum(lambda_, axis=2 - 1, keepdims=True)", string(src))
+    @test_throws "keyword arguments to `jax_kw_inner` have no JAX translation" jax_source(
+        jax_kw_refused; have = (:k, :x), want = :s)
+    if !rk_jax_available()
+        @test_skip false
+    else
+        lambda = [0.1 0.4; 0.9 1.6; 2.5 0.3]
+        native = prepare(jax_kw_plain; have = (:rho, :lambda), want = :s)
+        r = rk_jax_evaluate(src, "kernel", (0.7, lambda); grad = true)
+        @test r.value ≈ native(0.7, lambda) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), lambda), [0.7])) rtol = 1e-6
+    end
+end
