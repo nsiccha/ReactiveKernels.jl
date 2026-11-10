@@ -16,6 +16,32 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.151
+
+- `jax_source(spec; data, definitions)` takes a data-only value of the
+  program from its definition when the program's recipe of it has no
+  translation on the host or in the functions, or when a value `keep` names
+  reads it. The value is then an input of `prepare_data`, listed in
+  `UNTRANSLATED`, and `prepare_data` computes what the program reads from it
+  (its fields, a block's extent, a gather). Before, `g = prep(labels)` with
+  `prep` untranslatable and read as `g.n` and `g.pos` raised
+  ``ArgumentError: jax_source: `keep` names `_ppl_axis1_z`, which is no
+  data-only value of the program``, or, without `keep`, `JAXEmissionError`
+  ("`prepare_data` does not compute it on the host either"). A module that
+  emitted before is unchanged unless its `UNTRANSLATED` named a definition
+  that was no input (below).
+- A named-tuple input of `prepare_data` is a `dict` by field name, or its
+  values in field order; `prepare_data` reads each field as it reads a data
+  input of that type.
+- `UNTRANSLATED` lists only definitions `prepare_data` takes as inputs.
+  Before, it also listed one that no input replaced, and a definition reading
+  it gave the reason "`g` is not defined in module `Main`"; that reason now
+  names the definition it reads and why that has no translation.
+- `definitions` that no data input reads, directly or through another
+  definition, are no longer computed in `prepare_data`.
+- Snag `jax-source-refus-8c6ed1ec` (BRM `rkppl_model(:car_icar)` and
+  `(:car_bym2)`).
+
 ## 0.1.150
 
 - `jax_source`: a function broadcast over a padded vector of vectors

@@ -35,6 +35,11 @@ _rk_py_input(x::AbstractArray{<:Number}) = "np.asarray(" * _rk_py(x) * ", dtype=
 # A raw ragged input (for `prepare_data`) is a list of arrays.
 _rk_py_input(x::AbstractVector{<:AbstractVector{<:Number}}) =
     "[" * join(map(_rk_py_input, x), ", ") * "]"
+# A named tuple (the value of a definition `prepare_data` takes as an input,
+# `UNTRANSLATED`) is a dict by field name.
+_rk_py_input(x::NamedTuple) =
+    "{" * join((repr(String(k)) * ": " * _rk_py_input(v) for (k, v) in pairs(x)), ", ") * "}"
+_rk_py_input(x::Tuple) = "(" * join(map(_rk_py_input, x), ", ") * (length(x) == 1 ? ",)" : ")")
 _rk_py_input(x) = _rk_py(x)
 
 const _RK_JAX_DRIVER = raw"""
