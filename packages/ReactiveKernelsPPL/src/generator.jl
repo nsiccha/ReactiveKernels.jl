@@ -4858,6 +4858,14 @@ function _factor_density_statements!(stmts, terms, plan; context = plan,
         pointwise = nothing, density_sites = nothing)
     for factor in plan.factors
         node = Symbol(:_ppl_factor_, factor.name)
+        if factor isa ArrayParameter
+            value = _vector_factor_statements!(stmts, factor, context, node)
+            push!(terms, node)
+            pointwise === nothing || push!(pointwise, factor.name => value)
+            # One factor site: the value's extent is known only when it runs.
+            _record_density!(density_sites, stmts, :prior, factor.name, node; owner = nothing)
+            continue
+        end
         density = _sampled_prior_expr(factor; conditioned = true,
             float64_args = _float64_inputs(context, values(factor.args)))
         push!(stmts, :($node::Float64 = $density))
@@ -4866,6 +4874,43 @@ function _factor_density_statements!(stmts, terms, plan; context = plan,
         _record_density!(density_sites, stmts, :prior, factor.name, node; owner = nothing)
     end
     return nothing
+end
+
+# The density of a vector definition's value: a declared array's prior with
+# the definition's graph value in place of packed coordinates, so it adds no
+# coordinate, transform or Jacobian. An elementwise law sums one support-
+# checked density per entry in one plate (`d .~ Normal.(m, s)`); a joint law
+# is the one-vector slice density (`d ~ MvNormal(m, S)`). Returns the value
+# a pointwise query reads: the per-entry densities, or the joint density.
+function _vector_factor_statements!(stmts::Vector{Expr}, factor::ArrayParameter,
+        context, node::Symbol)
+    if _is_slice_array(factor)
+        density = _slice_prior_call!(stmts, factor)
+        push!(stmts, :($node::Float64 = $density))
+        return node
+    end
+    pw = Symbol(:_ppl_pw_factor_, factor.name)
+    arg_values = Any[]
+    float64_inputs = _float64_inputs(context, values(factor.args))
+    for (i, a) in enumerate(values(factor.args))
+        if a isa Real || a isa Symbol
+            push!(arg_values, a)
+            continue
+        end
+        local_name = Symbol(:_ppl_farg_, factor.name, :_, i)
+        val = if _is_array_literal(a)
+            push!(float64_inputs, local_name)
+            _float64_array_literal(a)
+        else
+            a
+        end
+        push!(stmts, :($local_name = $val))
+        push!(arg_values, local_name)
+    end
+    _vector_prior_stmts!(stmts, Any[], factor.name, factor.family,
+        NamedTuple{keys(factor.args)}(Tuple(arg_values)), factor.support_override;
+        conditioned = true, float64_inputs, node, pw)
+    return pw
 end
 
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
@@ -5069,9 +5114,9 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         name::Symbol, family::Symbol, args::NamedTuple,
         support::SupportOverride; conditioned = false, rows = nothing,
         float64_variate::Bool = false, label::Symbol = name,
-        float64_inputs = (), cell_names = Dict{Symbol,Symbol}())
-    node = Symbol(:_ppl_prior_, label)
-    pw = Symbol(:_ppl_pw_prior_, label)
+        float64_inputs = (), cell_names = Dict{Symbol,Symbol}(),
+        node::Symbol = Symbol(:_ppl_prior_, label),
+        pw::Symbol = Symbol(:_ppl_pw_prior_, label))
     if family === :flat
         # An improper density contributes zero; evaluating a posterior does
         # not request a draw from the unnormalizable prior.

@@ -16,6 +16,24 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.145
+
+- A vector definition that reads a sampled value and no observed
+  (conditioned) data carries a density factor, as a scalar definition
+  already did: `d .~ Normal.(0, s)` adds
+  `sum(logpdf.(Normal.(0, s), d))` to `prior` (one support-checked density
+  per entry, any built-in scalar family), and `d ~ MvNormal(m, S)` or
+  `d ~ MvNormalCholesky(m, L)` adds the joint density. Neither adds a
+  coordinate or transform; a conditioned factor enters `likelihood`. Both
+  were refused at lowering ("responses derive from bound data only",
+  "needs a scalar definition"). A `.~` over a definition of data alone is
+  still an observation, and one reading observed data and a sampled value
+  is still refused. `StructuralPlan.factors` holds `ArrayParameter`
+  factors beside the scalar `SampledParameter` ones.
+- An inline broadcast over data as a gather index (`cs[start .+ size]`) is
+  the same index vector as its named definition; it was refused as an index
+  "by literal positions or `:`". Snag `rkppl-vector-val-c101b992`.
+
 ## 0.1.144
 
 - Independent ICAR fields over one graph: `eachrow(phi[1:K, 1:N]) .~
