@@ -69,6 +69,14 @@ function _jax_extent(args)
 end
 # A padded vector's valid-entry mask.
 _jax_mask(v::_PyVal) = "(jnp.arange(" * _py_atom(v.code) * ".shape[0]) < " * v.extent * ")"
+# The code of `v` as a reduction reads it: a padded vector's (or its
+# adjoint's) padding replaced by the reduction's identity `neutral`.
+function _jax_masked(v::_PyVal, neutral::AbstractString)
+    isempty(v.extent) && return v.code
+    v.T isa Type && (v.T <: AbstractVector || v.T <: LinearAlgebra.Adjoint{<:Any,<:AbstractVector}) ||
+        return v.code
+    "jnp.where(" * _jax_mask(v) * ", " * v.code * ", " * neutral * ")"
+end
 
 # The Python keywords and module names an emitted identifier must not take.
 const _JAX_RESERVED = Set{String}(split("""
@@ -539,7 +547,7 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
     if lhs isa Expr && lhs.head === :ref && lhs.args[1] isa Symbol && haskey(ctx.locals, lhs.args[1])
         # `A[i] = v`: a functional update rebinding `A`.
         target = ctx.locals[lhs.args[1]]
-        indexed = _jax_index(ctx, target, lhs.args[2:end])
+        indexed = _jax_index(ctx, target, lhs.args[2:end]; target = true)
         position = indexed.code[ncodeunits(target.code)+1:end]
         name = _jax_fresh(ctx, lhs.args[1])
         _jax_emit!(ctx, name * " = " * _py_atom(target.code) * ".at" * position * ".set(" * v.code * ")")
@@ -655,8 +663,9 @@ function _jax_unit_indices!(ctx::_JaxContext, indices, what::AbstractString)
     end
 end
 
-# Index `x` with Julia indices `indices` (source expressions).
-function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
+# Index `x` with Julia indices `indices` (source expressions). An assignment
+# `target` reads the position only, so its gather carries no extent.
+function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
     if ctx.host !== nothing
         v = _host_index(ctx, x, indices)
         v === nothing || return v
@@ -706,10 +715,12 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
         _jax_error("indexing a rank-", N, " array with ", length(indices),
                    " indices", _jax_where(ctx))
     parts = String[]
+    values = Union{Nothing,_PyVal}[]
     kept = 0
     for (dim, index) in enumerate(indices)
-        part, keeps = _jax_index_part(ctx, x, dim, index)
+        part, keeps, value = _jax_index_part(ctx, x, dim, index)
         push!(parts, part)
+        push!(values, value)
         kept += keeps
     end
     E = eltype(x.T)
@@ -723,39 +734,50 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
     if !isempty(x.extent) && kept > 0
         # A gather from a padded group vector by an index vector: the indices
         # are valid entries, and the result is padded as the index is.
-        gather = length(indices) == 1 ? _jax_bound_expr(ctx, x, 1, indices[1]) : nothing
+        gather = length(indices) == 1 ? values[1] : nothing
         gather !== nothing && _jax_is_array(gather.T) && eltype(gather.T) <: Integer ||
             _jax_error("slicing a padded group vector has no JAX translation", _jax_where(ctx))
         return _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false, gather.extent)
     end
-    _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false, kept > 0 ? _jax_index_extent(ctx, indices) : "")
+    _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false,
+           target ? "" : _jax_gather_extent(ctx, values, kept))
 end
-# The extent of a gather result: its index vector's, when that is padded.
-_jax_index_extent(ctx, indices) = ""
+# The extent of a gather: the lengths of its index vector, when that is padded
+# (a ragged row, or a range to a data length), since the gathered entries are
+# padded as the index is and reductions of them mask the rest. A padded index
+# beside another kept dimension would pad an inner axis, which nothing masks.
+function _jax_gather_extent(ctx::_JaxContext, values, kept::Int)
+    padded = [v for v in values if v !== nothing && _jax_is_array(v.T) && !isempty(v.extent)]
+    isempty(padded) && return ""
+    kept == 1 || _jax_error("a gather by a padded (ragged) index vector beside another ",
+                            "kept dimension has no JAX translation", _jax_where(ctx))
+    only(padded).extent
+end
 
-# One index position: the Python index text and whether it keeps a dimension.
+# One index position: the Python index text, whether it keeps a dimension,
+# and the index's value (`nothing` for a literal colon or a written range).
 function _jax_index_part(ctx::_JaxContext, x::_PyVal, dim::Int, index)
-    index === :(:) && return (":", 1)
-    index == :(Colon()) && return (":", 1)
+    index === :(:) && return (":", 1, nothing)
+    index == :(Colon()) && return (":", 1, nothing)
     if index isa Expr && index.head === :call && index.args[1] === :(:) &&
        length(index.args) == 3
         lo = _jax_bound_expr(ctx, x, dim, index.args[2])
         hi = _jax_bound_expr(ctx, x, dim, index.args[3])
-        return (_jax_minus_one(lo) * ":" * hi.code, 1)
+        return (_jax_minus_one(lo) * ":" * hi.code, 1, nothing)
     end
     i = _jax_bound_expr(ctx, x, dim, index)
-    i.T === Colon && return (":", 1)
-    _jax_is_scalar(i.T) && i.T <: Integer && return (_jax_minus_one(i), 0)
+    i.T === Colon && return (":", 1, i)
+    _jax_is_scalar(i.T) && i.T <: Integer && return (_jax_minus_one(i), 0, i)
     if _jax_is_array(i.T) && eltype(i.T) <: Integer
         ndims(i.T) == 1 || _jax_error("a gather by a rank-", ndims(i.T), " index array",
                                       _jax_where(ctx))
-        return (_py_infix("-", [i.code, "1"]), 1)
+        return (_py_infix("-", [i.code, "1"]), 1, i)
     end
     if i.T isa Type && i.T <: AbstractUnitRange
         m = match(r"^jnp\.arange\((.*), (.*)\)$", i.code)
         m === nothing || return (_jax_minus_one(_PyVal(m.captures[1], Int)) * ":" *
-                                 _jax_minus_one(_PyVal(m.captures[2], Int)), 1)
-        return (_py_infix("-", [i.code, "1"]), 1)
+                                 _jax_minus_one(_PyVal(m.captures[2], Int)), 1, i)
+        return (_py_infix("-", [i.code, "1"]), 1, i)
     end
     _jax_error("the index `", index, "` (of type `", i.T, "`) has no JAX translation",
                _jax_where(ctx))
@@ -1780,7 +1802,8 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(*), args::Vector{_PyVal})
     a, b = args
     if _jax_is_array(a.T) && _jax_is_array(b.T)
         a.T <: LinearAlgebra.Adjoint{<:Any,<:AbstractVector} && ndims(b.T) == 1 &&
-            return _jax_result(*, args, "jnp.dot(" * a.code * ", " * b.code * ")")
+            return _jax_result(*, args, "jnp.dot(" * _jax_masked(a, "0") * ", " *
+                                        _jax_masked(b, "0") * ")")
         ndims(a.T) == 1 && b.T <: LinearAlgebra.Adjoint{<:Any,<:AbstractVector} &&
             return _jax_result(*, args, "jnp.outer(" * a.code * ", " * b.code * ")")
         return _jax_result(*, args, _py_infix("@", [a.code, b.code]))
@@ -1836,7 +1859,9 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal
     length(args) == 1 && return _jax_result(sum, args, "jnp.sum(" * args[1].code * ")")
     length(args) == 2 && _jax_is_array(args[2].T) || _jax_error("this `sum` call", _jax_where(ctx))
     mapped = _jax_broadcast(ctx, _jax_function_of(args[1]), [args[2]])
-    _PyVal("jnp.sum(" * mapped.code * ")", eltype(mapped.T))
+    # `f` of a padded vector's padding is not part of the sum.
+    masked = _jax_ragged(args[2].T) ? mapped : _PyVal(mapped.code, mapped.T, false, args[2].extent)
+    _PyVal("jnp.sum(" * _jax_masked(masked, "0") * ")", eltype(mapped.T))
 end
 for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp.inf"),
                            (minimum, "jnp.min", "jnp.inf"))
@@ -2020,7 +2045,8 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(convert), args::Vector{_P
     _jax_traceable_or_lowered(ctx, convert, args)
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(LinearAlgebra.dot), args::Vector{_PyVal})
-    _jax_result(LinearAlgebra.dot, args, "jnp.vdot(" * _jax_args(args) * ")")
+    _jax_result(LinearAlgebra.dot, args,
+                "jnp.vdot(" * join((_jax_masked(a, "0") for a in args), ", ") * ")")
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(vcat), args::Vector{_PyVal})
     v = _jax_result(vcat, args, "jnp.concatenate([" * join(
@@ -2157,7 +2183,14 @@ function _jax_index_values(ctx::_JaxContext, x::_PyVal, indices::Vector{_PyVal})
         end
     end
     E = eltype(x.T)
-    _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", kept == 0 ? E : Array{E,kept})
+    code = _py_atom(x.code) * "[" * join(parts, ", ") * "]"
+    T = kept == 0 ? E : Array{E,kept}
+    # Rows of a ragged value keep their lengths, as `x[i]` does (`_jax_index`).
+    if _jax_ragged(x.T)
+        isempty(x.extent) && _jax_error("a ragged array without its lengths", _jax_where(ctx))
+        return _PyVal(code, T, false, x.extent * "[" * join(parts, ", ") * "]")
+    end
+    _PyVal(code, T, false, _jax_gather_extent(ctx, indices, kept))
 end
 
 # A range value, `a:b`: the array of its elements.
@@ -2241,6 +2274,8 @@ end
 # A Julia type called as a function: a conversion.
 function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
     isempty(args) && Base.issingletontype(T) && return _PyVal("None", T)
+    # `Val(:name)`, `Val(2)`: the singleton of a parameter known while emitting.
+    T === Val && length(args) == 1 && return _PyVal("None", Val{_jax_static_parameter(ctx, only(args))})
     if ctx.host !== nothing
         v = _host_construct(ctx, T, args)
         v === nothing || return v
@@ -2503,7 +2538,9 @@ const _JAX_LOWERING_STACK = Any[]
 
 function _jax_lowered_call(ctx::_JaxContext, f, args::Vector{_PyVal})
     f isa Function || return nothing
-    types = Any[a.T for a in args]
+    # A function, type or module passed on as an argument (lowered code reads
+    # globals as `_JaxCallable`s) dispatches on its own type.
+    types = Any[a.T isa _JaxCallable ? Core.Typeof(a.T.f) : a.T for a in args]
     all(T -> T isa Type, types) || return nothing
     key = (f, Tuple(types))
     key in _JAX_LOWERING_STACK && _jax_error("the function `", f, "` calls itself with argument ",
@@ -2532,10 +2569,27 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
                    "or give it a `ReactiveKernels._jax_function_call` method")
     mod = parentmodule(f)
     ssa = Vector{Any}(undef, length(ci.code))
-    slots = Dict{Int,_PyVal}(i + 1 => a for (i, a) in enumerate(args))
+    m = try
+        which(f, Tuple{types...})
+    catch
+        nothing
+    end
+    # A Vararg method's last slot holds its trailing arguments as one tuple.
+    # `splats` keeps them as values, so a splat of that slot (`g(args...)`,
+    # lowered `Core._apply_iterate`) passes them on as they came.
+    nfixed = m !== nothing && m.isva ? Int(m.nargs) - 2 : length(args)
+    slots = Dict{Int,_PyVal}(i + 1 => a for (i, a) in enumerate(args[1:nfixed]))
+    splats = Dict{Int,Vector{_PyVal}}()
+    if nfixed < length(args) || (m !== nothing && m.isva)
+        rest = args[nfixed+1:end]
+        # A function or type among them has no Python value, so the tuple
+        # exists only to be splatted (`value` refuses any other read of it).
+        any(a -> a.T isa _JaxCallable, rest) ||
+            (slots[nfixed + 2] = _jax_call_positional(ctx, tuple, rest))
+        splats[nfixed + 2] = rest
+    end
     # The method's static parameters (`where T`), as the call's types bind them.
     sparams = try
-        m = which(f, Tuple{types...})
         ccall(:jl_type_intersection_with_env, Any, (Any, Any),
               Tuple{typeof(f), types...}, m.sig)[2]
     catch
@@ -2548,6 +2602,10 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
              _jax_global_value(ctx, sparams[x.args[1]], :parameter) :
              _jax_error("an unbound static parameter in `", f, "`", _jax_where(ctx))) :
         x isa Core.SlotNumber ? (haskey(slots, x.id) ? slots[x.id] :
+                                 haskey(splats, x.id) ?
+                                 _jax_error("the Vararg arguments of `", f, "` hold a function ",
+                                            "or type and are read other than splatted",
+                                            _jax_where(ctx)) :
                                  _jax_error("an unassigned local in `", f, "`")) :
         x isa Core.Argument ? slots[x.n] :
         x isa Expr && x.head === :new ? _jax_lowered_new(ctx, value(x.args[1]), length(x.args)) :
@@ -2561,11 +2619,13 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
             return st.val isa Core.SSAValue || st.val isa Core.SlotNumber ||
                    st.val isa Core.Argument ? value(st.val) : value(st.val)
         elseif st isa Expr && st.head === :(=)
-            v = value_of_rhs(ctx, st.args[2], value, mod)
-            slots[(st.args[1]::Core.SlotNumber).id] = v
+            v = value_of_rhs(ctx, st.args[2], value, mod, splats)
+            id = (st.args[1]::Core.SlotNumber).id
+            slots[id] = v
+            delete!(splats, id)
             ssa[i] = v
         elseif st isa Expr && st.head === :call
-            ssa[i] = value_of_rhs(ctx, st, value, mod)
+            ssa[i] = value_of_rhs(ctx, st, value, mod, splats)
         elseif st isa Expr && st.head in (:meta, :code_coverage_effect, :inbounds, :boundscheck)
             ssa[i] = nothing
         elseif st === nothing || st isa LineNumberNode
@@ -2576,14 +2636,40 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
     end
     _jax_error("the lowered code of `", f, "` does not return", _jax_where(ctx))
 end
-function value_of_rhs(ctx::_JaxContext, rhs, value, mod)
+function value_of_rhs(ctx::_JaxContext, rhs, value, mod, splats = Dict{Int,Vector{_PyVal}}())
     rhs isa Expr && rhs.head === :call || return value(rhs)
     callee = rhs.args[1]
     g = callee isa GlobalRef ? getglobal(callee.mod, callee.name) :
         callee isa Core.SSAValue || callee isa Core.SlotNumber || callee isa Core.Argument ?
             _jax_callable(value(callee)) :
         callee isa QuoteNode ? callee.value : callee
+    g === Core._apply_iterate &&
+        return _jax_bind!(ctx, :t, _jax_lowered_splat(ctx, rhs.args[2:end], value, splats))
     _jax_bind!(ctx, :t, _jax_call(ctx, g, _PyVal[value(a) for a in rhs.args[2:end]]))
+end
+# `g(xs...)` in lowered code, `Core._apply_iterate(iterate, g, xs...)`: each
+# splatted collection is a tuple of known length, a Vararg method's trailing
+# arguments (`splats`) or a tuple value, and its elements are `g`'s arguments.
+function _jax_lowered_splat(ctx::_JaxContext, args, value, splats)
+    _jax_function_of(value(args[1])) === iterate ||
+        _jax_error("a splat that iterates with `", args[1], "` has no JAX translation",
+                   _jax_where(ctx))
+    g = _jax_function_of(value(args[2]))
+    elements = _PyVal[]
+    for x in args[3:end]
+        id = x isa Core.SlotNumber ? x.id : x isa Core.Argument ? x.n : 0
+        if haskey(splats, id)
+            append!(elements, splats[id])
+            continue
+        end
+        v = value(x)
+        v.T isa Type && v.T <: Tuple && _jax_is_tuple(v.T) ||
+            _jax_error("splatting a `", v.T, "` has no JAX translation", _jax_where(ctx))
+        for k in 1:fieldcount(v.T)
+            push!(elements, _jax_tuple_element(ctx, v, _PyVal(string(k), Int, true)))
+        end
+    end
+    _jax_call(ctx, g, elements)
 end
 # `%new(T)` of a function without captures (an anonymous `(i, j) -> i` passed
 # on): its type carries it.
@@ -2618,14 +2704,37 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(Base.literal_pow), args
     n = p.T.parameters[1]
     _PyVal(_py_infix("**", [x.code, string(n)]), _jax_return_type(^, Any[x.T, typeof(n)]))
 end
+# A symbol known while emitting: a quoted `:name` in lowered code, or a symbol
+# constant such as a static parameter's (a Python string literal).
+function _jax_static_symbol(ctx::_JaxContext, v::_PyVal)
+    v.T === Symbol || _jax_error("`", v.code, "` is not a symbol known while emitting",
+                                 _jax_where(ctx))
+    Symbol(startswith(v.code, ':') ? v.code[2:end] : Meta.parse(v.code)::String)
+end
+# A module's global, read while emitting as lowered code reads it: functions,
+# types and modules pass as themselves, data as values (`_jax_global_value`).
+function _jax_module_global(ctx::_JaxContext, m::Module, name::Symbol, read)
+    isdefined(m, name) ||
+        _jax_error("`", name, "` is not defined in module `", m, "`", _jax_where(ctx))
+    _jax_global_value(ctx, read(m, name), name)
+end
 function _jax_call_positional(ctx::_JaxContext, ::typeof(getproperty), args::Vector{_PyVal})
     x, field = args
-    name = Symbol(strip(field.code, ['"', ':']))
+    name = _jax_static_symbol(ctx, field)
+    # `StanBlocks.jcall` in lowered code is `getproperty(StanBlocks, :jcall)`.
+    x.T isa _JaxCallable{Module} && return _jax_module_global(ctx, x.T.f, name, getproperty)
     x.T isa Type && x.T <: NamedTuple || _jax_error("the field read `", name, "` on `", x.T, "`",
                                                     _jax_where(ctx))
     k = findfirst(==(name), fieldnames(x.T))
     k === nothing && _jax_error("`", x.T, "` has no field `", name, "`", _jax_where(ctx))
     _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", fieldtype(x.T, k))
+end
+# `getglobal(M, name)` of a module and a name known while emitting (a method's
+# static parameters `where {M,name}`).
+function _jax_call_positional(ctx::_JaxContext, ::typeof(getglobal), args::Vector{_PyVal})
+    length(args) == 2 && args[1].T isa _JaxCallable{Module} ||
+        _jax_error("`getglobal` of a module not known while emitting", _jax_where(ctx))
+    _jax_module_global(ctx, args[1].T.f, _jax_static_symbol(ctx, args[2]), getglobal)
 end
 # A tuple element by a static index (lowered `getindex`/`getfield`, and
 # `first`/`last`), or an array's first or last element.
@@ -2665,14 +2774,17 @@ for (f, position) in ((first, 1), (last, 0))
 end
 
 function _jax_call_positional(ctx::_JaxContext, ::typeof(Core.apply_type), args::Vector{_PyVal})
-    parts = map(args) do a
-        a.T isa _JaxCallable && return a.T.f
-        m = match(r"^-?[0-9]+$", a.code)
-        m === nothing && _jax_error("a type applied to a computed parameter", _jax_where(ctx))
-        parse(Int, a.code)
-    end
-    T = Core.apply_type(parts...)
+    T = Core.apply_type(map(a -> _jax_static_parameter(ctx, a), args)...)
     _PyVal("<type>", _JaxCallable(T))
+end
+# A type parameter known while emitting: a type, function or module, a symbol
+# (`Val{:name}`) or an integer literal.
+function _jax_static_parameter(ctx::_JaxContext, a::_PyVal)
+    a.T isa _JaxCallable && return a.T.f
+    a.T === Symbol && return _jax_static_symbol(ctx, a)
+    m = match(r"^-?[0-9]+$", a.code)
+    m === nothing && _jax_error("a type applied to a computed parameter", _jax_where(ctx))
+    parse(Int, a.code)
 end
 _jax_call_positional(ctx::_JaxContext, c::_JaxCallable, args::Vector{_PyVal}) =
     _jax_call(ctx, c.f, args)

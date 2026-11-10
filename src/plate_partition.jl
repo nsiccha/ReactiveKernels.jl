@@ -412,6 +412,33 @@ const _PARTITION_NO_ROWS = Int[]
 _readable_callee(::_PartitionLanes) = :partition_lanes
 _opname(::_PartitionLanes) = "partition_lanes"
 
+"""
+    _PartitionLane(key)
+
+The lanes of a plate whose key holds every label of the partition exactly
+once (`plate_partition(…; single = true)`): `lane(table, label, cells)` is the
+one position of `label`, as a one-element vector like `_PartitionLanes`', and
+throws `ArgumentError` for a label with none or several. The plate's lowering
+reads this recipe to run the partition as that one cell, at an `Int` row
+(`_partition_single`), so its values are computed at one row of known count.
+"""
+struct _PartitionLane
+    key::Symbol
+end
+@inline function (lane::_PartitionLane)(table::Dict{K,Vector{Int}}, label, ::Int) where {K}
+    rows = get(table, label, _PARTITION_NO_ROWS)
+    length(rows) == 1 || _partition_lane_error(lane.key, label, length(rows))
+    rows
+end
+@noinline _partition_lane_error(key, label, n) = throw(ArgumentError(
+    "plate_partition: the key :$key was declared to hold every label once (`single = true`), " *
+    "but it holds $(repr(label)) $n times"))
+_readable_callee(::_PartitionLane) = :partition_lane
+_opname(::_PartitionLane) = "partition_lane"
+
+# The operations giving a partition's lanes.
+_partition_lanes_op(@nospecialize(op)) = op isa Union{_PartitionLanes,_PartitionLane}
+
 # What a partition's rows check reads beside the domain and the rows: the name
 # of the key's entry count in the emitted body and the key's name. `nothing`
 # when the lanes are no recipe of this plan: a label bound at preparation folds
@@ -421,12 +448,41 @@ function _partition_cells_arguments(windows, recipe::Recipe)
     lanes = canon_id(g, first(recipe.inputs).id)
     for id in producers_of(g, lanes)
         r = g.recipes[id]
-        r.op isa _PartitionLanes || continue
+        _partition_lanes_op(r.op) || continue
         cells = get(windows.names, canon_id(g, r.inputs[3].id), nothing)
         cells === nothing && return nothing
         return (cells, QuoteNode(r.op.key))
     end
     nothing
+end
+
+# Whether partition cell `recipe` runs one cell per label: its lanes are a
+# `_PartitionLane` recipe of this graph. Lanes folded at preparation keep the
+# rows form.
+function _partition_single(windows, recipe::Recipe)
+    windows === nothing && return false
+    g = windows.pushdowns.graph
+    lanes = canon_id(g, first(recipe.inputs).id)
+    any(id -> g.recipes[id].op isa _PartitionLane, producers_of(g, lanes))
+end
+
+# The row of a partition of one cell per label, from its lanes
+# (`_PartitionLane` checked their count), and its check against the plate's
+# one-dimensional domain and the key's entry count.
+@inline _partition_row(rows::Vector{Int}) = (length(rows) == 1 || _partition_row_error(rows);
+                                             @inbounds rows[1])
+@noinline _partition_row_error(rows) = throw(ArgumentError(
+    "plate_partition: a partition of one cell per label has $(length(rows)) cells"))
+@inline function _partition_check_rows(shape::Tuple, row::Int)
+    length(shape) == 1 || throw(ArgumentError(
+        "plate_partition: a partition runs over a one-dimensional plate domain; " *
+        "this plate's domain has $(length(shape)) dimensions"))
+    _cell_check_row(shape, row)
+end
+@inline function _partition_check_rows(shape::Tuple, row::Int, cells::Int, key::Symbol)
+    length(shape) == 1 && length(first(shape)) != cells &&
+        _partition_cells_error(cells, length(first(shape)), key)
+    _partition_check_rows(shape, row)
 end
 
 """
@@ -492,7 +548,7 @@ end
 """
     plate_partition(spec::KernelSpec, plates; by, index = :partition, name = :partition_total,
                     locality = :error, partitioned = (), plan = nothing,
-                    plan_constant = ()) -> KernelSpec
+                    plan_constant = (), single = false) -> KernelSpec
 
 A new kernel in which the value `name` is the sum of the cells of the authored
 plates named in `plates` (one name or several) whose key equals the label held
@@ -537,6 +593,14 @@ at evaluation. `plan_constant` names
 additional HAVE ports whose values the caller guarantees are constant per
 label while reusing a plan.
 
+`single = true` declares that every key holds each label of the partition
+exactly once, so a partition is one cell of each named plate (one subject's
+cell of a plate over subjects). The partition then runs that cell at one row,
+as [`plate_cell`](@ref) does: the values it reads at rows are computed at that
+row only, and values of one element per row can stay numbers instead of
+one-element arrays. A label that a key holds once is unchanged; a key that
+holds a label zero or several times throws `ArgumentError` at evaluation.
+
 The default boundary of the result is the original HAVE ports plus `index`,
 and the WANT `name`. `spec` is unchanged. `index` may name an existing HAVE
 port of `spec` to partition several specs at the same label.
@@ -545,7 +609,7 @@ function plate_partition(spec::KernelSpec, plates; by,
                          index::Symbol = :partition, name::Symbol = :partition_total,
                          locality::Union{Nothing,Symbol} = :error, partitioned = (),
                          plan::Union{Nothing,Symbol,Pair{Symbol,<:Type}} = nothing,
-                         plan_constant::Tuple{Vararg{Symbol}} = ())
+                         plan_constant::Tuple{Vararg{Symbol}} = (), single::Bool = false)
     locality in (nothing, :error, :warn, :ignore) || throw(ArgumentError(
         "plate_partition: locality must be :error, :warn, :ignore or nothing; got $(repr(locality))"))
     plan_port, plan_type = plan isa Pair ? (first(plan), last(plan)) : (plan, Any)
@@ -613,7 +677,8 @@ function plate_partition(spec::KernelSpec, plates; by,
     for (plate, recipe, table, counted) in zip(names, recipes, tables, cell_counts)
         lanes = value!(copied, Symbol(:_partition_rows_, plate), Vector{Int})
         _add_recipe!(copied, (table, checked, counted), (lanes,),
-                     _PartitionLanes(keys_by_plate[plate]), 0.0, nothing, false, nothing)
+                     (single ? _PartitionLane : _PartitionLanes)(keys_by_plate[plate]),
+                     0.0, nothing, false, nothing)
         T = valtype(only(recipe.op.kernel.plan.want))
         total = length(names) == 1 ? _kernel_declare!(copied, ports, order, name, T) :
             value!(copied, Symbol(:_partition_, plate), T)
@@ -1343,7 +1408,7 @@ function _partition_label_of(p::Plan, partition::Recipe, args)
                                         canon_id(g, only(r.outputs).id) == cid, p.recipes);
                      q === nothing ? nothing : p.recipes[q])
     r = producer(lanes)
-    r !== nothing && r.op isa _PartitionLanes || return nothing
+    r !== nothing && _partition_lanes_op(r.op) || return nothing
     checked = producer(canon_id(g, r.inputs[2].id))
     checked !== nothing && checked.op isa _PartitionLabel || return nothing
     port = canon_id(g, first(checked.inputs).id)
@@ -1474,7 +1539,7 @@ end
 # kind: an index column, a data column, a design matrix) is computed once per
 # label. Plates, scans and cells stay in the body.
 _plan_eligible_op(op) = op isa Union{_PartitionTable,_PartitionCells,_PartitionLabel,
-                                     _PartitionLanes,_BoundConstant,_KernelSourceOp,
+                                     _PartitionLanes,_PartitionLane,_BoundConstant,_KernelSourceOp,
                                      _TypeOperation} ||
                         op isa Function
 # Whether a bound value is index bookkeeping (as against data); informational.

@@ -9,11 +9,13 @@ const RK_JAX_PYTHON = get(ENV, "RK_JAX_PYTHON", "")
 rk_jax_available() = !isempty(RK_JAX_PYTHON) && isfile(RK_JAX_PYTHON)
 
 # A ragged input (one vector per group) crosses as its padded array and
-# lengths, as the module's `pad_ragged` builds them.
+# lengths, as the module's `pad_ragged` builds them. An empty row is zeros of
+# the column's element type, so an integer index column stays integer.
 function rk_jax_pad(x::AbstractVector{<:AbstractVector})
     lengths = length.(x)
     width = max(1, maximum(lengths; init = 0))
-    [isempty(r) ? 0.0 : r[min(i, length(r))] for r in x, i in 1:width], lengths
+    E = eltype(eltype(x))
+    E[isempty(r) ? zero(E) : r[min(i, length(r))] for r in x, i in 1:width], lengths
 end
 rk_jax_inputs(args) = Any[a for x in args
     for a in (x isa AbstractVector{<:AbstractVector} ? rk_jax_pad(x) : (x,))]

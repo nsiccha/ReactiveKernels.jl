@@ -1,5 +1,6 @@
 using ReactiveKernels
 using Test
+using LinearAlgebra: dot
 using LogExpFunctions: log1mexp
 
 include(joinpath(@__DIR__, "jax_python.jl"))
@@ -218,6 +219,29 @@ jax_test_plain(w, x) = zero(eltype(x)) + sum(x) * w^2 + w^-1
     return s
 end
 
+# A plain helper's lowered code reads module globals (`M.f` is
+# `getproperty(M, :f)`), builds `Val` tags, and forwards a Vararg method's
+# arguments with a splat (`Core._apply_iterate`). StanBlocks' `@deffun`
+# methods do all of it: `StanBlocks.jcall(Val{:f}(), _JuliaCallScope{M}(),
+# args...)` finds `f` with `getglobal(M, :f)` and splats the arguments into it
+# (snag jax-source-stanb-06917e13).
+module JaxTestDispatch
+struct Scope{M} end
+callee(::Scope{M}, ::Val{name}) where {M,name} = getglobal(M, name)
+call(tag::Val, scope::Scope, args::Vararg{Any,N}) where {N} = callee(scope, tag)(args...)
+scaled(x, w) = JaxTestDispatch.call(Val{:*}(), Scope{Base}(), x, w)
+applied(f, x) = f(x) + x
+pair_sum(x, w) = (t = (x, w); +(t...))
+end
+jax_test_dispatch(w, x) =
+    JaxTestDispatch.call(Val{:scaled}(), JaxTestDispatch.Scope{JaxTestDispatch}(), w, sum(x)) +
+    JaxTestDispatch.call(Val(:applied), JaxTestDispatch.Scope{JaxTestDispatch}(), sin, w) +
+    JaxTestDispatch.pair_sum(w, x[1])
+@kernel jax_dispatch(w::Float64, x::Vector{Float64}) = begin
+    s = jax_test_dispatch(w, x)
+    return s
+end
+
 @traceable jax_test_count(x::AbstractVector, n::Integer) = begin
     acc = zero(eltype(x))
     for i in 1:n
@@ -389,6 +413,42 @@ end
     flat = eltype(cells) <: Number ? cells : eltype(cells) <: AbstractVector ?
         (isempty(cells) ? eltype(eltype(cells))[] : reduce(vcat, cells)) : cells
     total = sum(flat .* flat) + length(flat)
+    return total
+end
+# A gather through a ragged integer row is padded as the row is, so the
+# cell's reduction counts its valid entries only (snag jax-ragged-index-b8420d16):
+# by the group index, by the row itself, and through `view` (the call form).
+@kernel jax_gather_indexed(x::Vector{Float64}, R::Vector{Vector{Int}}, a::Float64) = begin
+    lp = plate(eachindex(R), Ref(R), Ref(x)) do i, rs, xs
+        sum(a .* xs[rs[i]] .^ 2)
+    end
+    total = sum(lp)
+    return total
+end
+@kernel jax_gather_rows(x::Vector{Float64}, R::Vector{Vector{Int}}, a::Float64) = begin
+    lp = plate(R, Ref(x), Ref(a)) do r, xs, a
+        v = xs[r]
+        w = view(xs, r)
+        sum(abs2, v) + dot(v, w) + v' * w + a * prod(v) + length(w)
+    end
+    total = sum(lp)
+    return total
+end
+# Reductions of a ragged row itself that take a function or two operands.
+@kernel jax_ragged_row_sums(a::Float64, Y::Vector{Vector{Float64}}) = begin
+    lp = plate(Y, Ref(a)) do y, a
+        w = a .* y
+        sum(abs2, w) + dot(w, y) + w' * y
+    end
+    total = sum(lp)
+    return total
+end
+# A gather through a ragged row beside a whole axis would pad an inner axis.
+@kernel jax_gather_matrix_rows(M::Matrix{Float64}, R::Vector{Vector{Int}}, b::Vector{Float64}) = begin
+    lp = plate(R, Ref(M), Ref(b)) do r, Ms, bs
+        sum(Ms[r, :] * bs)
+    end
+    total = sum(lp)
     return total
 end
 # A broadcast `isequal` on the host: its generated scalar helper must not
@@ -711,6 +771,12 @@ end
     plain = string(jax_source(jax_plain; have = (:w, :x), want = :s))
     @test occursin("w ** 2", plain)
     @test !occursin(r"<[a-z]", plain)
+    # Module reads, `Val` tags and Vararg splats resolve while emitting: only
+    # the arithmetic they reach is emitted.
+    dispatch = string(jax_source(jax_dispatch; have = (:w, :x), want = :s))
+    @test occursin("jnp.sin(w)", dispatch)
+    @test !occursin(r"<[a-z]", dispatch)
+    @test !occursin("None", dispatch)
     # Static guards are Python conditionals over NumPy values, not `lax.cond`.
     guarded = string(jax_source(jax_literal_guard; have = (:x,), want = :t))
     @test occursin("np.isfinite(", guarded)
@@ -763,6 +829,10 @@ end
     # refused: Julia itself rejects two `:` dimensions (`DimensionMismatch`).
     @test_throws DimensionMismatch prepare(jax_two_colons; have = (:x,), want = :total)([1.0, 2.0])
     @test_throws "more than one `Colon`" jax_source(jax_two_colons; have = (:x,), want = :total)
+    # refused: a gather through a ragged row beside a whole axis pads an inner
+    # axis that no reduction masks (its JAX value used to sum the padding).
+    @test_throws "beside another kept dimension" jax_source(jax_gather_matrix_rows;
+        have = (:b, :M, :R), want = :total)
 end
 
 @testset "jax_source: values and gradients" begin
@@ -805,6 +875,11 @@ end
         r = rk_jax_evaluate(src, "kernel", (0.7, x); grad = true)
         @test r.value ≈ native(0.7, x) rtol = 1e-12
         @test r.grad ≈ 2 * 0.7 * sum(x) - 0.7^-2 rtol = 1e-10
+        native = prepare(jax_dispatch; have = (:w, :x), want = :s)
+        src = jax_source(jax_dispatch; have = (:w, :x), want = :s)
+        r = rk_jax_evaluate(src, "kernel", (0.7, x); grad = true)
+        @test r.value ≈ native(0.7, x) rtol = 1e-12
+        @test r.grad ≈ sum(x) + cos(0.7) + 2 rtol = 1e-10
         x6 = [x; 1.5]
         native = prepare(jax_reshapes; have = (:a, :x), want = :total)
         src = jax_source(jax_reshapes; have = (:a, :x), want = :total)
@@ -1042,5 +1117,43 @@ end
         native = prepare(jax_prep_stack; have = (:a, :x), want = :total)
         r = rk_jax_evaluate(stacked, "kernel", (0.7, xs); grad = true, prepare = true)
         @test r.value ≈ native(0.7, xs) rtol = 1e-12
+    end
+end
+
+@testset "jax_source: reductions of gathers through ragged rows" begin
+    # The gathered entries carry the row's lengths: the emitted cell masks.
+    direct = string(jax_source(jax_gather_rows; have = (:x, :R, :a), want = :total))
+    @test occursin("jnp.where((jnp.arange(", direct)
+    @test occursin("jnp.vdot(jnp.where(", direct)
+    x = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+    Y = [[0.5, 1.0], [2.0], [0.1, 0.2, 0.3]]
+    if !rk_jax_available()
+        @test_skip false
+    else
+        # Rows of different lengths, and an empty row (padded with index 0,
+        # which reads a valid entry that the mask then drops).
+        for R in ([[2, 5], [1, 3, 7], [4]], [[2, 5], [1, 3, 7], [4], Int[]])
+            for k in (jax_gather_indexed, jax_gather_rows)
+                native = prepare(k; have = (:x, :R, :a), want = :total)
+                expected = native(x, R, 1.3)
+                fd = rk_fd_gradient(u -> native(u, R, 1.3), x)
+                plain = jax_source(k; have = (:x, :R, :a), want = :total)
+                r = rk_jax_evaluate(plain, "kernel", (x, R, 1.3); grad = true)
+                @test r.value ≈ expected rtol = 1e-12
+                @test r.grad ≈ fd rtol = 1e-6 atol = 1e-9
+                prepared = jax_source(k; have = (:x, :R, :a), want = :total, data = (; R, a = 1.3))
+                r = rk_jax_evaluate(prepared, "kernel", (x, R, 1.3); grad = true, prepare = true)
+                @test r.value ≈ expected rtol = 1e-12
+                @test r.grad ≈ fd rtol = 1e-6 atol = 1e-9
+            end
+        end
+        native = prepare(jax_ragged_row_sums; have = (:a, :Y), want = :total)
+        for src in (jax_source(jax_ragged_row_sums; have = (:a, :Y), want = :total),
+                    jax_source(jax_ragged_row_sums; have = (:a, :Y), want = :total, data = (; Y)))
+            prep = occursin("def prepare_data", string(src))
+            r = rk_jax_evaluate(src, "kernel", (0.7, Y); grad = true, prepare = prep)
+            @test r.value ≈ native(0.7, Y) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), Y), [0.7])) rtol = 1e-6
+        end
     end
 end

@@ -1331,3 +1331,67 @@ end
     ou = zeros(obuilt.layout.total)
     @test oq(ou, 1) + oq(ou, 2) ≈ Base.invokelatest(prepare_query(obuilt, obound, :likelihood), ou)
 end
+
+# One `@plate` cell per subject (a key holding each subject once): the partition
+# runs that cell at one row (RK `plate_partition(…; single = true)`), and the
+# subject's predictor, read by the cell at its row, is computed as one number
+# (todo `ReactiveKernels/todos/2026-10-29T15-55-57-327-1yggoad`).
+const _CQ_ONE_CELL = quote
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    beta[axes(X, 2)] .~ Normal.(0, 1)
+    tau[1:2] .~ Exponential.(1)
+    L ~ LKJCholesky(2, 2.0)
+    z[levels(subject), 1:2] .~ Normal.(0, 1)
+    F = tau .* transpose(L)
+    b = z * F
+    log_k = a .+ X * beta .+ b[:, 1]
+    log_v = 3.0 .+ b[:, 2]
+    @plate for i in eachindex(dv)
+        k = exp(log_k[i])
+        v = exp(log_v[i])
+        dv[i] .~ Normal.(dose[i] / v .* exp.(-k .* t[i]), sigma)
+    end
+end
+
+@testset "partition query: one cell per subject runs at one row" begin
+    n = 4
+    t = [collect(range(0.5, 6.0; length = 2 + j % 3)) for j in 1:n]
+    data = (; subject = ["s$j" for j in 1:n], X = [sin(i + 2j) for i in 1:n, j in 1:2],
+            dose = [80.0, 100.0, 120.0, 90.0], t,
+            dv = [3 .* exp.(-0.2 .* tj) .+ 0.1 .* cos.(tj) for tj in t])
+    bound, built = _cq_bound(_CQ_ONE_CELL, data, (:dv,))
+    u = collect(range(-0.4, 0.5; length = built.layout.total))
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    s = prepare_partition_sampler(built, bound, :dv, u; by = :subject, backend,
+                                  partitioned = (:z,), locality = :error)
+    labels = partition_labels(s)
+    @test labels == data.subject
+    # The local kernel runs one row, and its predictor is a number there.
+    kernel = ReactiveKernelsPPL._partition_ad(s.prefix.local_state.ad, first(labels)).kernel
+    planner = Base.invokelatest(ReactiveKernels.partition_plan_kernel, kernel)
+    @test occursin("_partition_row(", string(code_expr(planner)))
+    @test occursin("_cell_scalar_operand(", string(code_expr(kernel)))
+    # Values: the partitions sum to the likelihood. Gradients: each subject's
+    # local gradient is the likelihood's on its own coordinates, and its full
+    # gradient is the dense partition sampler's.
+    likelihood = Base.invokelatest(prepare_query(built, bound, :likelihood), u)
+    full = prepare_ad(prepare_query(built, bound, :likelihood), backend, u; active = :unconstrained)
+    _, gfull = Base.invokelatest(ad_value_and_gradient, full, u)
+    dense = prepare_partition_sampler(built, bound, :dv, u; by = :subject, backend,
+                                      partitioned = (:z,), compact = false)
+    total = 0.0
+    for label in labels
+        footprint = partition_footprint(s, label; shared = false)
+        g = zeros(length(footprint))
+        value, _ = partition_value_and_gradient!(s, g, u, label; shared = false)
+        total += value
+        @test g ≈ gfull[footprint] rtol = 1e-10
+        fp = partition_footprint(s, label)
+        gc, gd = zeros(length(fp)), zeros(length(u))
+        @test first(partition_value_and_gradient!(s, gc, u, label)) ≈ value
+        partition_value_and_gradient!(dense, gd, u, label)
+        @test gc ≈ gd[fp] rtol = 1e-10
+    end
+    @test total ≈ likelihood
+end

@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.138
+## 0.1.141
 
 - A `vectorize` or `prepare_batched` reader with a `NativeScheduling` of two
   or more workers runs its data-only prefix plates again when a plate's cells
@@ -26,6 +26,65 @@ are recorded in the git history only.
   `TaskFailedException`), whatever the program. A one-thread process never
   enters the prefix, so it showed only with two or more threads (snag
   `web-sim-bruno-la-eb5f8859`).
+
+## 0.1.140
+
+- New: `plate_partition(…; single = true)` declares that every key holds each
+  label exactly once, so a partition is one cell of each named plate (one
+  subject's cell of a plate over subjects). The partition then runs that cell
+  at one `Int` row, as `plate_cell` does, instead of over a vector of one row.
+  A key that holds a label zero or several times throws `ArgumentError` at
+  evaluation. Without `single`, partitions are unchanged.
+- A plate cell, and a partition with `single = true`, computes the values it
+  reads at its one row as numbers where it can, instead of one-element arrays
+  with an Enzyme shadow each. A capture the cell reads outside every branch at
+  one position per cell asks for that one row as an `Int`; a value of one
+  element per row read there only by such reads or by other such values is a
+  number: a pointwise expression, a product `A * w` with a vector `w`, a column
+  `A[:, k]`, a direct gather `v[I]` or `A[I, k]` and a `vcat` of numbers and
+  vectors. Values are equal; a product row `A[r, :] * w` is summed in column
+  order, so values and gradients through it can differ from Base's product in
+  the last bits. An authored plate computed at rows, and any value a plate
+  reads as a lane, keep their one-row arrays. On an RKPPL partition sampler
+  over one cell per subject (24 subjects, 10 observations each), one subject's
+  local gradient went from 1.22–1.28 µs / 1,232 B to 0.45–0.47 µs / 592 B,
+  6.2–6.4 to 2.3–2.4 times its share of a whole-model gradient, with bitwise
+  equal values and gradients (todo `1yggoad`).
+
+## 0.1.139
+
+- `jax_source` follows a plain helper's lowered code through module-qualified
+  calls (`M.f(x)`, lowered `getproperty(M, :f)`), `getglobal(M, name)` of a
+  module and name known while emitting, `Val` tags (`Val(:f)`, `Val{:f}()`),
+  Vararg methods and their splats (`f(args...)`, lowered
+  `Core._apply_iterate`), and functions or types passed on as arguments.
+  StanBlocks `@deffun @juliacompat` functions call each callee as
+  `StanBlocks.jcall(Val{:f}(), _JuliaCallScope{M}(), args...)`, so one whose
+  body is straight-line now translates to the arithmetic it reaches; before,
+  every one raised `JAXEmissionError: the field read jcall on
+  ReactiveKernels._JaxCallable{Module}(StanBlocks)` (snag
+  `jax-source-stanb-06917e13`: BrunoPMX's `pk_generator`,
+  `logistic_dose_response` and `biexponential_rates`). A `@deffun` whose body
+  has a loop or an `if` stays a plain helper with loops or branches, which has
+  no translation.
+
+## 0.1.138
+
+- `jax_source`: a gather through a ragged integer row is padded as the row is
+  (snag `jax-ragged-index-b8420d16`). In a plate cell, `xs[rs[i]]`, `xs[r]` or
+  `view(xs, r)` with `R::Vector{Vector{Int}}` lost the row's lengths, so the
+  cell's reduction summed the padding entries, silently: the JAX value
+  repeated each row's last index up to the longest row (2.093 where native
+  gives 1.352), and an empty row added `x[end]`. Its gradient took the same
+  extra terms. The gathered value now carries the row's lengths, and every
+  reduction of it masks them.
+- `sum(f, v)`, `dot(u, v)` and `u' * v` of a padded (ragged) row now mask its
+  padding as `sum(v)` does; they summed it, also for a ragged input's own row.
+- A row of a ragged value read through `getindex`/`view` in lowered code keeps
+  its lengths, as `x[i]` in source does.
+- A gather through a ragged row beside another kept dimension (`M[r, :]`)
+  raises `JAXEmissionError`: its padding would sit on an inner axis that no
+  reduction masks. Its JAX value used to sum the padding.
 
 ## 0.1.137
 

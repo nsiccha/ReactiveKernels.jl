@@ -1749,11 +1749,19 @@ function _partition_query_spec(built, plan::StructuralPlan, names, keys_by_name;
         push!(plates, node)
         keys_by_plate[node] = keys_by_name[name]
     end
+    # When every key holds each label once, a partition is one cell of each
+    # plate (one subject's cell of a plate over subjects): RK then runs it at
+    # one row, so the values it reads there need no one-element arrays.
+    # A key that is no data column of the plan (a port its caller binds, as
+    # SMC's row windows do) keeps the rows form.
+    key_columns = [get(plan.columns, keys_by_name[name], nothing) for name in names]
+    single = !any(isnothing, key_columns) && all(k -> allunique(vec(k)), key_columns) &&
+        all(k -> issetequal(vec(k), vec(first(key_columns))), key_columns)
     spec = try
         plate_partition(built.spec, plates; by = keys_by_plate, index = _PARTITION_PORT,
                         name = _PARTITION_TOTAL, locality, partitioned,
                         plan = plan_type === Any ? _PLAN_PORT : _PLAN_PORT => plan_type,
-                        plan_constant)
+                        plan_constant, single)
     catch err
         err isa ArgumentError || rethrow()
         throw(ContractValidationError("[query] the observations have no partitionable " *

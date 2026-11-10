@@ -175,6 +175,71 @@ end
     @test partition.op.rows
 end
 
+# One cell per label: a plate over subjects whose cell reads its subject's
+# predictor `log_k[i]` (a capture), partitioned by a key holding each subject
+# once. `single = true` runs the partition as that one cell at an `Int` row,
+# and the predictor, read only there, is computed as one number: its operands
+# are numbers, and the design matrix row is read through `_CellRow` (todo
+# `ReactiveKernels/todos/2026-10-29T15-55-57-327-1yggoad`).
+@kernel _pp_one_cell(u::AbstractVector{Float64}, X::AbstractMatrix{Float64},
+                     ids::AbstractVector{Int}, t::AbstractVector{Vector{Float64}},
+                     y::AbstractVector{Vector{Float64}}, subject::AbstractVector{Int}) = begin
+    a::Float64 = u[1]
+    beta::AbstractVector{Float64} = view(u, 2:3)
+    z::AbstractVector{Float64} = view(u, 4:8)
+    log_k = a .+ X * beta .+ z
+    dens = plate(ids, t, y) do i, ti, yi
+        lk = log_k[i]
+        sum(-(yi .- exp.(-exp(lk) .* ti)) .^ 2 ./ 2)
+    end
+    total = sum(dens)
+    return total
+end
+
+@testset "plate_partition: one cell per label (`single = true`)" begin
+    n = 5
+    d = (; u = [0.2, -0.3, 0.5, 0.1, -0.2, 0.4, -0.1, 0.3],
+           X = [sin(i + j) for i in 1:n, j in 1:2], ids = collect(1:n),
+           t = [collect(range(0.5, 4.0; length = 2 + i % 3)) for i in 1:n],
+           y = [cos.(range(0.1, 1.0; length = 2 + i % 3)) for i in 1:n],
+           subject = collect(1:n))
+    have = (:u, :X, :ids, :t, :y, :subject, :label)
+    bound = (; d.X, d.ids, d.t, d.y, d.subject)
+    rows = prepare(plate_partition(_pp_one_cell, :dens; by = :subject, index = :label);
+                   have, want = :partition_total, bound)
+    single = prepare(plate_partition(_pp_one_cell, :dens; by = :subject, index = :label,
+                                     single = true);
+                     have, want = :partition_total, bound)
+    dens = prepare(_pp_one_cell; have = (:u, :X, :ids, :t, :y, :subject), want = :dens)(
+        d.u, d.X, d.ids, d.t, d.y, d.subject)
+    for s in 1:n
+        @test single(d.u, s) ≈ rows(d.u, s) rtol = 1e-14
+        @test single(d.u, s) ≈ dens[s] rtol = 1e-14
+    end
+    # The partition runs at one row, and its predictor is one number there.
+    source = string(code_expr(single))
+    @test occursin("_partition_row(", source)
+    @test occursin("_cell_scalar_operand(", source) && occursin("_CellRow(", source)
+    @test !occursin("_cell_scalar_operand(", string(code_expr(rows)))
+    single(d.u, 2); rows(d.u, 2)
+    @test (@allocated single(d.u, 2)) < (@allocated rows(d.u, 2))
+    # Native Reverse through the one-cell partition agrees with the rows form.
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for s in (1, 4)
+        g1, g2 = similar(d.u), similar(d.u)
+        v1, _ = ad_value_and_gradient!(prepare_ad(single, backend, d.u, s; active = :u), g1, d.u, s)
+        v2, _ = ad_value_and_gradient!(prepare_ad(rows, backend, d.u, s; active = :u), g2, d.u, s)
+        @test v1 ≈ v2 rtol = 1e-14
+        @test g1 ≈ g2 rtol = 1e-12
+        @test findall(!iszero, g1) == [1, 2, 3, 3 + s]
+    end
+    # A key that holds a label twice is refused by name.
+    twice = prepare(plate_partition(_pp_one_cell, :dens; by = :subject, index = :label,
+                                    single = true);
+                    have, want = :partition_total)
+    @test_throws "holds 1 2 times" twice(d.u, d.X, d.ids, d.t, d.y, [1, 1, 2, 3, 4], 1)
+end
+
 # Rung 2: two plates with different row sets and keys. An observation plate
 # over rows reads a completed covariate (`vcat(observed, drawn)[order]`, the
 # shape of a completion) and a group block through a product; a totals plate
