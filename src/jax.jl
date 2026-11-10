@@ -2070,11 +2070,11 @@ _jax_companion_module(::RuntimeGeneratedFunctions.RuntimeGeneratedFunction{A,C,M
 _jax_companion_module(_, f) = _kernel_endpoint_source_module(f)
 function _jax_source_call(ctx::_JaxContext,
         f::Union{_KernelSource,_KernelSplit,_KernelReduction}, args::Vector{_PyVal}, mod)
-    params, body = _jax_op_body(f)
+    params, body, captures = _jax_op_body(f)
     length(params) == length(args) ||
         _jax_error("an embedded operation takes ", length(params), " arguments, not ",
                    length(args), _jax_where(ctx))
-    v = _jax_source_expr(ctx, body, params, args, mod, _jax_captures(f))
+    v = _jax_source_expr(ctx, body, params, args, mod, captures)
     _jax_bind!(ctx, :value, v)
 end
 # A lazy branch called as a value (a cell's branch spliced into its plate's
@@ -2090,18 +2090,43 @@ function _jax_source_call(ctx::_JaxContext, b::_KernelBranch{CI,TI,EI},
 end
 _jax_source_call(ctx::_JaxContext, f, args::Vector{_PyVal}, mod) = _jax_call(ctx, f, args)
 
-# The parameters and body of a source function: its runtime-generated body
-# when it has one (its first parameter is the captures), else its source.
+# The parameters, body and captures of a source function: its
+# runtime-generated body when it has one, else its source. The generated
+# body's first parameter is the captures environment, which a leading `let`
+# unpacks (`name = Core.getfield(environment, :c)`, `_kernel_source_function`);
+# the translation reads each such name as that capture instead.
 function _jax_op_body(f::_KernelSource)
     f.companion === nothing &&
         _jax_error("an embedded operation whose source Julia owns has no generated body")
     ex = _program_expression(f.companion)
     ex isa Expr && ex.head === :-> || _jax_error("an unexpected generated body `", ex, "`")
     params = ex.args[1] isa Expr ? Symbol[a for a in ex.args[1].args] : Symbol[ex.args[1]]
-    params[2:end], ex.args[2]
+    body, captures = _jax_unpack_captures(ex.args[2], first(params), f.captures)
+    params[2:end], body, captures
 end
-_jax_op_body(f::_KernelSplit) = _jax_op_body(f.call)
-_jax_op_body(f::_KernelReduction) = _jax_op_body(f.call)
+_jax_op_body(f::Union{_KernelSplit,_KernelReduction}) = _jax_op_body(f.call)
+function _jax_unpack_captures(body, environment::Symbol, captures)
+    inner = body
+    while inner isa Expr && inner.head === :block &&
+          count(a -> !(a isa LineNumberNode), inner.args) == 1
+        inner = only(a for a in inner.args if !(a isa LineNumberNode))
+    end
+    inner isa Expr && inner.head === :let || return body, captures
+    bindings = inner.args[1]
+    list = bindings isa Expr && bindings.head === :block ?
+        Any[b for b in bindings.args if !(b isa LineNumberNode)] : Any[bindings]
+    reads = map(list) do b
+        b isa Expr && b.head === :(=) && b.args[1] isa Symbol || return nothing
+        r = b.args[2]
+        Meta.isexpr(r, :call, 3) && r.args[2] === environment && r.args[3] isa QuoteNode &&
+            (r.args[1] === getfield || r.args[1] == GlobalRef(Core, :getfield) ||
+             r.args[1] === :getfield) || return nothing
+        b.args[1] => r.args[3].value::Symbol
+    end
+    any(isnothing, reads) && return body, captures
+    names = Tuple(first.(reads))
+    inner.args[2], NamedTuple{names}(Tuple(getfield(captures, c) for c in last.(reads)))
+end
 _jax_op_body(f) = _jax_error("an embedded operation `", typeof(f), "` without its source")
 
 # A derivative rule called as a function: its primal cut, which `jax.grad`
@@ -2138,7 +2163,8 @@ end
 # A prepared kernel called as a function (a distribution endpoint a helper
 # calls): a module-level function translated from its plan, once per kernel
 # and argument types.
-function _jax_call_positional(ctx::_JaxContext, k::PreparedKernel, args::Vector{_PyVal})
+function _jax_call_positional(ctx::_JaxContext, k::PreparedKernel, args::Vector{_PyVal},
+                              hint::Symbol = length(k.plan.want) == 1 ? only(k.plan.want).name : :kernel)
     p = k.plan
     length(p.have) == length(args) ||
         _jax_error("a prepared kernel of ", length(p.have), " inputs called with ",
@@ -2148,7 +2174,6 @@ function _jax_call_positional(ctx::_JaxContext, k::PreparedKernel, args::Vector{
     key = (:kernel, objectid(k), types, host)
     name = get(ctx.mod.helper_names, key, nothing)
     if name === nothing
-        hint = length(p.want) == 1 ? only(p.want).name : :kernel
         name = _jax_identifier(ctx.mod.used, Symbol("_rk_", hint, host ? "_np" : ""))
         ctx.mod.helper_names[key] = name
         lines, f = _jax_function!(ctx.mod, name, p, Tuple(types),
@@ -2161,6 +2186,11 @@ function _jax_call_positional(ctx::_JaxContext, k::PreparedKernel, args::Vector{
     T = length(f.outputs) == 1 ? last(only(f.outputs)) : Tuple{(last(o) for o in f.outputs)...}
     _jax_bind!(ctx, :value, _PyVal(name * "(" * _jax_args(args) * ")", T))
 end
+
+# A prepared child a source calls (a distribution's `standardized` step):
+# its prepared kernel, named after the child.
+_jax_call_positional(ctx::_JaxContext, c::_KernelPreparedChild, args::Vector{_PyVal}) =
+    _jax_call_positional(ctx, c.kernel, args, c.name)
 
 # A `@traceable` helper: its authored body over the arguments, as the compiled
 # path reads it. Its locals are scoped to the call.
@@ -2437,6 +2467,7 @@ function _jax_closure_module(f)
 end
 _jax_source_captures(op::_KernelSourceOp) = _jax_captures(op.f)
 _jax_captures(f::_KernelSource) = f.captures
+_jax_captures(f::Union{_KernelSplit,_KernelReduction}) = _jax_captures(f.call)
 _jax_captures(f) = nothing
 
 # Translate `source` with `names[i]` bound to `inputs[i]`.
@@ -2467,9 +2498,12 @@ function _jax_branch(ctx::_JaxContext, recipe::Recipe, b::_KernelBranch, inputs)
         source.head === :&& ? (source.args[2], false) : (true, source.args[2])
     env = Dict{Symbol,_PyVal}(zip(names, inputs))
     mod = _jax_source_module(recipe.op)
-    condition = _jax_source_expr(ctx, source.args[1], names, inputs, mod, nothing)
+    # The branch's source closes over the values its record captured (a
+    # distribution's `prepared standardized` child, say).
+    captures = _jax_captures(b.call)
+    condition = _jax_source_expr(ctx, source.args[1], names, inputs, mod, captures)
     arm(spec, ex) = spec isa Plan ? () -> _jax_arm_plan(ctx, spec, env) :
-        () -> _jax_source_expr(ctx, ex, names, inputs, mod, nothing)
+        () -> _jax_source_expr(ctx, ex, names, inputs, mod, captures)
     _jax_conditional(ctx, condition, arm(b.then_spec, then_ex), arm(b.else_spec, else_ex))
 end
 

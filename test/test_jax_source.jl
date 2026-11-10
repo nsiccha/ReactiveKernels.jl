@@ -418,6 +418,36 @@ jax_test_row(v::AbstractVector) = reshape(view(v, :), 1, length(v))
     return total
 end
 
+# A kernel object whose method calls its own endpoint in a lazy arm (the
+# shape of a location-scale family's CDF): the arm's source captures the
+# prepared endpoint, and a cell that reaches it through another branch (a
+# censoring bound) calls the generated body that unpacks those captures.
+@kernel jax_obj_square() = begin
+    logcdf(z::Float64)::Float64 = -z^2
+end
+@kernel jax_obj_scaled(standard, location::Float64, scale::Float64) = begin
+    standardized(x::Float64)::Float64 = (x - location) / scale
+    logcdf(x::Float64)::Float64 = begin
+        z::Float64 = scale == 0 && x == location ? inv(scale) : standardized(x)
+        standard.logcdf(z)
+    end
+end
+@kernel jax_obj_law = jax_obj_scaled(jax_obj_square)
+@kernel jax_obj_scores(x::Vector{Float64}, location::Float64, scale::Float64) = begin
+    values = plate(x) do xi
+        jax_obj_law(location, scale).logcdf(xi)
+    end
+    total = sum(values)
+    return total
+end
+@kernel jax_obj_bounded(x::Vector{Float64}, location::Float64, scale::Float64, lo::Float64) = begin
+    values = plate(x) do xi
+        xi <= lo ? jax_obj_law(location, scale).logcdf(lo) : -(xi - location)^2
+    end
+    total = sum(values)
+    return total
+end
+
 @testset "jax_source: structure" begin
     src = jax_source(jax_plate_scan; have = (:a, :y, :x, :b, :logsigma), want = :total)
     text = string(src)
@@ -649,10 +679,12 @@ end
     end
 end
 
-@testset "jax_source: rule primals, positional views and statement writes" begin
+@testset "jax_source: rule primals, captured endpoints, positional views and statement writes" begin
     x = [0.4, 1.3, 2.2, 0.7]
     rule_src = jax_source(jax_rule_plate; have = (:a, :x), want = :total)
     view_src = jax_source(jax_view_row; have = (:a, :x), want = :total)
+    obj_src = jax_source(jax_obj_scores; have = (:location, :x, :scale), want = :total)
+    bounded_src = jax_source(jax_obj_bounded; have = (:location, :scale, :x, :lo), want = :total)
     g = ["b", "c", "a", "b", "a"]
     declared = jax_source(jax_prep_declared_sum; have = (:theta, :g), want = :total, data = (; g))
     @test occursin(".setdefault(", string(declared))
@@ -667,6 +699,16 @@ end
         r = rk_jax_evaluate(view_src, "kernel", (0.3, x); grad = true)
         @test r.value ≈ native(0.3, x) rtol = 1e-12
         @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x), [0.3])) rtol = 1e-6
+        native = prepare(jax_obj_scores; have = (:location, :x, :scale), want = :total)
+        r = rk_jax_evaluate(obj_src, "kernel", (0.3, x, 1.7); grad = true)
+        @test r.value ≈ native(0.3, x, 1.7) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x, 1.7), [0.3])) rtol = 1e-6
+        native = prepare(jax_obj_bounded; have = (:location, :scale, :x, :lo), want = :total)
+        for lo in (0.5, 3.0)
+            r = rk_jax_evaluate(bounded_src, "kernel", (0.3, 1.7, x, lo); grad = true)
+            @test r.value ≈ native(0.3, 1.7, x, lo) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), 1.7, x, lo), [0.3])) rtol = 1e-6
+        end
         theta = [0.5, -1.5, 2.5]
         native = prepare(jax_prep_declared_sum; have = (:theta, :g), want = :total)
         r = rk_jax_evaluate(declared, "kernel", (theta, g); grad = true, prepare = true)

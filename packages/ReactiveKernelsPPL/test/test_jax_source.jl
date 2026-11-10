@@ -100,6 +100,22 @@ const _JAX_CASES = (
         s ~ Exponential(1)
         y .~ Normal.(B[1, g] .+ B[2, g] .* x, s)
     end))(; x = _JAX_X, g = _JAX_G) | (; y = _JAX_Y),
+    # Evidence wrappers read the family's CDFs, whose lazy arms call a
+    # prepared endpoint (`standardized`): a detection limit, interval
+    # readings, a truncated response and truncated priors.
+    censored_normal = () -> (@rkppl(begin
+        a ~ Normal(0, 2); b ~ Normal(0, 2); s ~ Exponential(1.0)
+        y .~ censored.(Normal.(a .+ b .* x, s), lod, Inf)
+    end))(; x = _JAX_X, lod = 0.0) | (; y = max.(_JAX_Y, 0.0)),
+    interval_censored = () -> (@rkppl(begin
+        a ~ Normal(0, 2); b ~ Normal(0, 2); s ~ Exponential(1.0)
+        y .~ interval_censored.(Normal.(a .+ b .* x, s), hi)
+    end))(; x = _JAX_X, hi = floor.(_JAX_Y) .+ 1) | (; y = floor.(_JAX_Y)),
+    truncated = () -> (@rkppl(begin
+        m ~ truncated(Normal(0, 1), 0, Inf); s ~ Exponential(1.0)
+        p ~ truncated(Beta(2, 2), 0.1, 0.9)
+        y .~ truncated.(LogNormal.(m .* p, s), 0.01, 100.0)
+    end))(;) | (; y = clamp.(exp.(0.3 .* _JAX_X), 0.02, 50.0)),
     ragged_recurrence = () -> (@rkppl(begin
         rho ~ LogNormal(log(0.7), 0.3); kappa ~ LogNormal(log(0.3), 1.0)
         b0 ~ Normal(0.1, 0.1); tau ~ Exponential(0.05); s ~ Exponential(0.05)

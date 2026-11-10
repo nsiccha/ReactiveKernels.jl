@@ -24,6 +24,14 @@ are recorded in the git history only.
   callables table holds each operation's source record rather than the
   operation, and the emitter refused the record with `JAXEmissionError: a
   source part ... called without its operation`.
+- `jax_source` translates the CDF-based evidence of the location-scale
+  families: `censored`, `interval_censored` and `truncated` responses and
+  truncated priors. Their lazy arms call a prepared endpoint
+  (`standardized`) that the arm's source captures; the emitter did not pass a
+  branch's captures, did not read the captures a generated body unpacks
+  (`##captures#1 is not defined`), and had no translation for a prepared
+  child called as a function, which now becomes a module-level function named
+  after it (`_rk_standardized`).
 - `prepare_data` keeps the write of a `get!` whose value the source discards
   (a statement `get!(d, k, v)`). It dropped the call, so RKPPL's level codes of
   a string or categorical grouping column were all 0 and the JAX log density
