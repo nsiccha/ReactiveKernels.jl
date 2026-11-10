@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.141
+
+- A `vectorize` or `prepare_batched` reader with a `NativeScheduling` of two
+  or more workers runs its data-only prefix plates again when a plate's cells
+  read an array argument. From 0.1.114 each scheduled chunk of such a plate
+  read the argument's broadcast preparation as an unbound name and the call
+  failed with `UndefVarError: ##plate_prepared#k not defined` (inside a
+  `TaskFailedException`), whatever the program. A one-thread process never
+  enters the prefix, so it showed only with two or more threads (snag
+  `web-sim-bruno-la-eb5f8859`).
+
 ## 0.1.140
 
 - New: `plate_partition(…; single = true)` declares that every key holds each
