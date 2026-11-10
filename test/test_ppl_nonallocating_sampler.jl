@@ -155,6 +155,86 @@ _na_gradient_bytes(q, g, u) = (sampler_value_and_gradient!(q, g, u);
     end
 end
 
+# A vector parameter stacked on a matrix parameter, `vcat(permutedims(c), D)`,
+# as a class mixture's ordered first row of means over free rows (snag
+# `rkppl-vcat-of-pa-decf6725`): native Enzyme reverse refused the
+# non-allocating gradient. An ordered vector, a plain vector and its adjoint.
+# An ordered vector is a fresh `Vector`, so its row is a `Matrix` beside the
+# parameter block's reshaped view: Base's `vcat` of these, the step's result
+# for a buffer of another shape, is refused by registered Enzyme (0.13.219)
+# even where it never runs (`IllegalTypeAnalysisException` in `_typed_vcat`).
+# The Enzyme dogfood line repairs it (Enzyme decision `0prqqvj`).
+# `rejectable` pins that rejection broken for the ordered vector; the plain
+# vector's row (a reshaped view like the block) and its adjoint must
+# differentiate everywhere.
+function _na_gradient_or_rejected(q, g, u; rejectable::Bool)
+    try
+        sampler_value_and_gradient!(q, g, u)
+    catch err
+        rejectable && err isa Enzyme.Compiler.IllegalTypeAnalysisException || rethrow()
+        nothing
+    end
+end
+@kernel _na_column_score(a, b, C) = begin
+    x = [a, b]
+    total = -0.5 * sum((x .- C) .^ 2)
+    return total
+end
+_na_stacked_ordered = @rkppl begin
+    c ~ Ordered(Normal(0, 1), K)
+    D[1:1, 1:K] .~ Normal.(0, 1)
+    C = vcat(permutedims(c), D)
+    @plate for i in eachindex(a)
+        a[i] ~ LogDensity(_na_column_score, b[i], C)
+    end
+end
+_na_stacked_vector = @rkppl begin
+    c[1:K] .~ Normal.(0, 1)
+    D[1:1, 1:K] .~ Normal.(0, 1)
+    C = vcat(permutedims(c), D)
+    @plate for i in eachindex(a)
+        a[i] ~ LogDensity(_na_column_score, b[i], C)
+    end
+end
+_na_stacked_adjoint = @rkppl begin
+    c[1:K] .~ Normal.(0, 1)
+    D[1:1, 1:K] .~ Normal.(0, 1)
+    C = vcat(c', D)
+    @plate for i in eachindex(a)
+        a[i] ~ LogDensity(_na_column_score, b[i], C)
+    end
+end
+
+@testset "a vector stacked on a matrix parameter differentiates natively" begin
+    for (label, model, rejectable) in (("ordered vector", _na_stacked_ordered, true),
+                                       ("vector", _na_stacked_vector, false),
+                                       ("adjoint", _na_stacked_adjoint, false))
+        @testset "$label" begin
+            plan = model(; b = [0.1, 0.2, 0.3], K = 2) | (; a = [0.0, 0.5, -0.2])
+            built = build_kernel(plan)
+            n = built.layout.total
+            us = [[0.1 * sin(k + s) for k in 1:n] for s in 0:2]
+            q = prepare_sampler(built, plan, us[1]; backend = NA_SAMPLER_BACKEND,
+                nonallocating = false)
+            qna = prepare_sampler(built, plan, us[1]; backend = NA_SAMPLER_BACKEND,
+                nonallocating = true)
+            @test qna.kernel isa NonAllocatingKernel
+            for u in us
+                g, gna = zeros(n), zeros(n)
+                value, _ = sampler_value_and_gradient!(q, g, u)
+                result = _na_gradient_or_rejected(qna, gna, u; rejectable)
+                if result === nothing
+                    @test_broken result !== nothing
+                else
+                    value_na, _ = result
+                    @test value_na ≈ value rtol = 1e-12
+                    @test gna ≈ g rtol = 1e-10 atol = 1e-12
+                end
+            end
+        end
+    end
+end
+
 @testset "non-allocating sampler density reuses its buffers" begin
     plan = first(_na_sampler_cases())[2]
     built = build_kernel(plan)

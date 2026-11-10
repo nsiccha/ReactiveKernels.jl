@@ -574,6 +574,14 @@ only, no ReactiveKernels code) isolate the remaining backend limitations:
   flatten plate results with exactly this fold), runs at preparation and is
   never differentiated. The local Enzyme `dogfood` line repairs Base's
   concatenation inside Enzyme, so there the fold differentiates unchanged.
+  A non-allocating program's `vcat` step returns Base's `vcat` for a buffer
+  of another shape, so a fresh `Matrix` row beside a parameter block's
+  reshaped view there fails native reverse on registered Enzyme 0.13.219
+  even where that call never runs
+  (`IllegalTypeAnalysisException` in `_typed_vcat`). The dogfood line's
+  concatenation overrides differentiate it (Enzyme decision `0prqqvj`);
+  `test_nonallocating_ad.jl` and `test_ppl_nonallocating_sampler.jl` pin
+  the registered rejection.
 - Native Enzyme 0.13.210 reverse on Julia 1.12.7 cannot compile Base's
   `hvcat` of a block literal that mixes scalars with arrays, such as
   `[A v; 0 0 1]` (`IllegalTypeAnalysisException` in `hvncat_fill!`), even

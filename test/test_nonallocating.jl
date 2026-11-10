@@ -335,6 +335,40 @@ end
         @test_throws DimensionMismatch k([1.0 2.0 3.0; 4.0 5.0 6.0], 0.3)
     end
 
+    @testset "vcat of operands of different array types fills its cache" begin
+        # A fresh row over a parameter block read in place, as
+        # `vcat(permutedims(c), D)` stacks them: a `Matrix` beside a reshaped
+        # view (snag `rkppl-vcat-of-pa-decf6725`). Its step fills the cache
+        # through inferred code, as do operands the native copy does not lay
+        # out (an adjoint row, three-dimensional blocks).
+        op = ReactiveKernels._ConcatenateStep(vcat)
+        u = collect(1.0:8.0)
+        row = [10.0 20.0]
+        block = reshape(view(u, 1:4), 2, 2)
+        cache = zeros(3, 2)
+        @test (@inferred MutatingFunctions.apply!!(cache, op, row, block)) === cache
+        @test cache == vcat(row, block)
+        @test (@allocated MutatingFunctions.apply!!(cache, op, row, block)) == 0
+        c = [5.0, 6.0]
+        @test (@inferred MutatingFunctions.apply!!(cache, op, c', block)) === cache
+        @test cache == vcat(c', block)
+        cube = zeros(3, 2, 2)
+        top = ones(1, 2, 2)
+        rest = reshape(view(u, 1:8), 2, 2, 2)
+        @test (@inferred MutatingFunctions.apply!!(cube, op, top, rest)) === cube
+        @test cube == vcat(top, rest)
+        # Another height, or an operand that shares the cache's memory, takes
+        # the step's own result; operands of other widths keep Base's error.
+        taller = MutatingFunctions.apply!!(cache, op, row, row, block)
+        @test taller !== cache && taller == vcat(row, row, block)
+        shared = reshape(view(vec(cache), 1:4), 2, 2)
+        expected = vcat(row, shared)
+        aliased = MutatingFunctions.apply!!(cache, op, row, shared)
+        @test aliased !== cache && aliased == expected
+        @test_throws DimensionMismatch MutatingFunctions.apply!!(
+            cache, op, [1.0 2.0 3.0], block)
+    end
+
     @testset "a traced helper's statements fill buffers of their own" begin
         # A `@traceable` helper of assignments, a tuple assignment and a final
         # expression: each array it builds becomes a step with a buffer.
