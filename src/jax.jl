@@ -108,9 +108,13 @@ mutable struct _JaxModule
     # graph, `host_graph`) to the functions: its host translation's error.
     host_reasons::Dict{Int,JAXEmissionError}
     host_graph::Any
+    # The names `jax_source`'s `definitions` give a value of: a data-only
+    # recipe of one of them that neither side translates takes its value from
+    # the definition instead (`_JaxPromote`).
+    host_definitions::Set{Symbol}
 end
 _JaxModule() = _JaxModule(String[], Dict{Any,Any}(), Set{String}(), 0,
-                          Dict{Int,JAXEmissionError}(), nothing)
+                          Dict{Int,JAXEmissionError}(), nothing, Set{Symbol}())
 
 # Translation state: the module, the current function scope, the current
 # recipe (for messages) and the module that resolves its source's globals.
@@ -851,7 +855,8 @@ end
 
 # Short-circuit operators: a static left side decides while tracing, so the
 # right side runs only when Julia's would (a guard `n == k || throw(...)`); a
-# traced left side combines both sides, whose right side must not throw.
+# traced left side combines both sides, and a throw on the right side is a
+# check masked by the left (`_jax_call_positional(ctx, throw, ...)`).
 _jax_expr(ctx::_JaxContext, ::Val{:&&}, ex) = _jax_short_circuit(ctx, ex, false)
 _jax_expr(ctx::_JaxContext, ::Val{:||}, ex) = _jax_short_circuit(ctx, ex, true)
 function _jax_short_circuit(ctx::_JaxContext, ex, is_or::Bool)
@@ -863,12 +868,18 @@ function _jax_short_circuit(ctx::_JaxContext, ex, is_or::Bool)
         return is_or ? _jax_conditional(ctx, a, decided, rest) :
                        _jax_conditional(ctx, a, rest, decided)
     end
+    # The right side runs where Julia's would, so a check in it (or a throw,
+    # which is one) is masked by that: `a` for `&&`, `!a` for `||`.
     ctx.traced_branches += 1
     b = try
-        _jax_expr(ctx, ex.args[2])
+        _jax_with_guard(() -> _jax_expr(ctx, ex.args[2]), ctx.scope,
+                        is_or ? "jnp.logical_not(" * a.code * ")" : a.code)
     finally
         ctx.traced_branches -= 1
     end
+    # A right side that throws (`scale >= 0 || throw(...)`) is its check, and
+    # the value is the left side's wherever the module does not raise.
+    b.T === Union{} && return a
     _PyVal((is_or ? "jnp.logical_or(" : "jnp.logical_and(") * a.code * ", " * b.code * ")", Bool)
 end
 
@@ -1291,13 +1302,17 @@ function _jax_if(ctx::_JaxContext, ex, value::Bool)
     before = Dict(n => ctx.locals[n] for n in carried)
     arm(body) = () -> begin
         v = translate(body)
-        parts = [v.T === Nothing || v.T === Union{} ? "None" : v.code]
+        # An arm that throws carries nothing out: the branch is the other arm.
+        v.T === Union{} && return v
+        parts = [v.T === Nothing ? "None" : v.code]
         for n in carried
             push!(parts, _jax_carry_value(ctx, ctx.locals[n]).code)
         end
         _PyVal("(" * join(parts, ", ") * ")", Tuple{_jax_typeof(v), (before[n].T for n in carried)...})
     end
-    result = _jax_bind!(ctx, :branch, _jax_conditional(ctx, condition, arm(ex.args[2]), arm(otherwise)))
+    branch = _jax_conditional(ctx, condition, arm(ex.args[2]), arm(otherwise))
+    branch.T === Union{} && return branch
+    result = _jax_bind!(ctx, :branch, branch)
     for (k, n) in enumerate(carried)
         b = before[n]
         ctx.locals[n] = _PyVal(_py_atom(result.code) * "[" * string(k) * "]", b.T, false, b.extent, b.limit)
@@ -1345,21 +1360,37 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
         return _jax_bind!(ctx, :value, _PyVal("(" * then_arm.code * "() if " * condition.code *
                                                " else " * else_arm.code * "())", T,
                                                then_arm.static && else_arm.static))
+    # An arm that throws (`scale >= 0 ? scale : throw(...)`) has no value: it
+    # is its check, masked by its condition, and the branch is the other arm.
+    # Where the check passes the other arm is the one Julia takes; where it
+    # fails the module raises, so nothing computed there is returned.
+    if then_arm.T === Union{} || else_arm.T === Union{}
+        throwing, valued = then_arm.T === Union{} ? (then_arm, else_arm) : (else_arm, then_arm)
+        _jax_emit!(ctx, throwing.code * "()")
+        valued.T === Union{} || return _jax_bind!(ctx, :value, _PyVal(valued.code * "()", T))
+        _jax_emit!(ctx, valued.code * "()")
+        return _PyVal("None", Union{}, true)
+    end
     branch = _PyVal("jax.lax.cond(" * condition.code * ", " * then_arm.code * ", " *
                     else_arm.code * ")", T)
     # An arm with a runtime check runs even when the branch value is unused.
     _JAX_EFFECTS[] == effects ? branch : _jax_bind!(ctx, :branch, branch)
 end
-# `throw` in a branch decided while tracing raises then; a data-dependent
-# throw has no counterpart inside a traced JAX function.
+# `throw` in a branch decided while tracing raises then. Under conditions that
+# depend on data it is `_runtime_check(false, e)` there: a check masked by
+# those conditions, which raises when the module runs on values that take the
+# throwing arm, as the native program throws on them.
 function _jax_call_positional(ctx::_JaxContext, ::typeof(throw), args::Vector{_PyVal})
-    ctx.traced_branches == 0 || _jax_error(
-        "a throw that depends on data has no JAX translation", _jax_where(ctx))
-    e = only(args)
-    message = e.T isa Type && e.T <: Exception && e.code != "None" ? e.code : repr(string(e.T))
-    _jax_emit!(ctx, "raise ValueError(" * message * ")")
+    message = _jax_exception_message(only(args))
+    if ctx.traced_branches == 0
+        _jax_emit!(ctx, "raise ValueError(" * message * ")")
+    else
+        _jax_masked_check(ctx, nothing, message)
+    end
     _PyVal("None", Union{}, true)
 end
+_jax_exception_message(e::_PyVal) =
+    e.T isa Type && e.T <: Exception && e.code != "None" ? e.code : repr(string(e.T))
 # A domain check (`_runtime_check(valid, error)`), retained at execution: a
 # check decided while tracing raises then; any other is a host callback that
 # raises when JAX runs it, which `jax.jit`, `vmap` and `grad` keep. Under a
@@ -1378,26 +1409,62 @@ def _rk_check(valid, message):
 """
 function _jax_call_positional(ctx::_JaxContext, ::typeof(_runtime_check), args::Vector{_PyVal})
     valid, e = args
-    message = e.T isa Type && e.T <: Exception && e.code != "None" ? e.code : repr(string(e.T))
+    message = _jax_exception_message(e)
     ctx.host === nothing || return _host_check(ctx, valid, message)
     if valid.static
         error_arm = () -> _jax_call(ctx, throw, [_PyVal(message, ErrorException)])
         _jax_conditional(ctx, valid, () -> _PyVal("None", Nothing), error_arm)
         return _PyVal("None", Nothing, true)
     end
+    _jax_masked_check(ctx, valid, message)
+    _PyVal("None", Nothing, true)
+end
+# A check of `valid` (`nothing`: a throw, which no value passes) where the
+# code runs: it holds where any data-dependent condition the code runs under
+# is false.
+function _jax_masked_check(ctx::_JaxContext, valid::Union{Nothing,_PyVal}, message::AbstractString)
     guards = String[]
     for (scope, guard) in _JAX_GUARDS
         _jax_scope_within(ctx.scope, scope) || _jax_error(
-            "a runtime check in a helper called under a condition that depends on data ",
+            valid === nothing ? "a throw" : "a runtime check",
+            " in a helper called under a condition that depends on data ",
             "has no JAX translation", _jax_where(ctx))
         push!(guards, guard)
     end
-    held = isempty(guards) ? valid.code : "jnp.logical_or(" * valid.code * ", jnp.logical_not(" *
-        foldl((a, b) -> "jnp.logical_and(" * a * ", " * b * ")", guards) * "))"
+    taken = isempty(guards) ? nothing :
+        foldl((a, b) -> "jnp.logical_and(" * a * ", " * b * ")", guards)
+    held = if valid === nothing
+        # Every traced condition records its guard, so a throw has one.
+        taken === nothing && _jax_error("a throw that depends on data has no JAX translation",
+                                        _jax_where(ctx))
+        _jax_not(taken)
+    else
+        taken === nothing ? valid.code : "jnp.logical_or(" * valid.code * ", " * _jax_not(taken) * ")"
+    end
     name = _jax_helper!(ctx, "_rk_check", _JAX_CHECK)
     _jax_emit!(ctx, name * "(" * held * ", " * message * ")")
     _JAX_EFFECTS[] += 1
-    _PyVal("None", Nothing, true)
+    nothing
+end
+# `jnp.logical_not` of `code`, cancelling a negation `code` already is (the
+# mask of an `else` arm, whose guard is the negated condition).
+function _jax_not(code::AbstractString)
+    prefix = "jnp.logical_not("
+    if startswith(code, prefix) && endswith(code, ")")
+        inner = code[nextind(code, lastindex(prefix)):prevind(code, lastindex(code))]
+        _jax_balanced(inner) && return inner
+    end
+    prefix * code * ")"
+end
+# Whether every parenthesis in `code` closes within it (so `code` is one
+# operand, not the tail of `a) and (b`).
+function _jax_balanced(code::AbstractString)
+    depth = 0
+    for c in code
+        depth += c == '(' ? 1 : c == ')' ? -1 : 0
+        depth < 0 && return false
+    end
+    depth == 0
 end
 
 # Runtime checks emitted so far: a branch whose arms emit one is kept.
@@ -1416,9 +1483,16 @@ function _jax_with_guard(f, scope::_JaxScope, guard::AbstractString)
 end
 _jax_scope_within(s::_JaxScope, ancestor::_JaxScope) =
     s === ancestor || (s.parent !== nothing && _jax_scope_within(s.parent, ancestor))
-# An exception value: its message, for `throw`.
-_jax_call_positional(ctx::_JaxContext, T::Type{<:Exception}, args::Vector{_PyVal}) =
-    _PyVal(isempty(args) ? "None" : args[1].code, T, true)
+# An exception value: its message, for `throw` and `_runtime_check`: the first
+# string argument (`DomainError(x, "message")` reads its second), else a first
+# argument known while tracing, else none, which names the type. A traced
+# value is never the message: a check's message is a constant of the module.
+function _jax_call_positional(ctx::_JaxContext, T::Type{<:Exception}, args::Vector{_PyVal})
+    i = findfirst(a -> a.T isa Type && a.T <: AbstractString, args)
+    message = i !== nothing ? args[i].code :
+        !isempty(args) && args[1].static ? args[1].code : "None"
+    _PyVal(message, T, true)
+end
 
 # String interpolation, as Python string concatenation.
 function _jax_expr(ctx::_JaxContext, ::Val{:string}, ex)
@@ -1653,8 +1727,9 @@ for (name, py) in ((:log1msq, "_rk_log1msq"), (:logcosh, "_rk_logcosh"),
         (_JAX_ELEMENTWISE[getglobal(LogExpFunctions, name)] = py)
 end
 # Two-argument `atan` is `arctan2`; the table keys one name per function, so
-# its arity selects the name.
-const _JAX_BINARY_NAMES = Dict{Any,String}(atan => "jnp.arctan2")
+# its arity selects the name. Two-argument `hypot` is `jnp.hypot` (Base's own
+# promotes mixed arguments through a tuple, which has no translation).
+const _JAX_BINARY_NAMES = Dict{Any,String}(atan => "jnp.arctan2", hypot => "jnp.hypot")
 
 # Small helpers the emitted module defines when it uses them: stable forms of
 # LogExpFunctions functions whose `jax.numpy` spelling is not one call.
@@ -2325,8 +2400,17 @@ function _jax_index_values(ctx::_JaxContext, x::_PyVal, indices::Vector{_PyVal})
     _PyVal(code, T, false, _jax_gather_extent(ctx, indices, kept))
 end
 
-# A range value, `a:b`: the array of its elements.
+# A range value, `a:b`: the array of its elements. JAX arrays have static
+# shapes, so an end that is data needs a static limit (a padded group's
+# length); otherwise the range is refused here rather than emitted as a
+# `jnp.arange` that JAX rejects when it traces the module.
 function _jax_call_positional(ctx::_JaxContext, ::Colon, args::Vector{_PyVal})
+    a, b = args[1], args[end]
+    limited = !isempty(b.limit) && (length(args) == 2 || args[2].code == "1")
+    _jax_known(ctx, a) && (_jax_known(ctx, b) || limited) ||
+        _jax_error("a range whose length depends on data has no JAX translation (its ",
+                   "stop needs a static limit, its start and step must be static)",
+                   _jax_where(ctx))
     if length(args) == 3
         a, step, b = args
         step.code == "1" && return _jax_call_positional(ctx, Colon(), [a, b])
@@ -2500,6 +2584,34 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
             _jax_scalar_or_elementwise(ctx, f, scalars)
         v === nothing && _jax_error("broadcasting `", f, "`", _jax_where(ctx))
         return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args))
+    end
+    # A function of each vector of a padded vector of vectors (`Diagonal.(rows)`
+    # of a ragged plate's per-cell arguments) maps over the rows, each a padded
+    # vector of its length, as a plate maps its cells: Julia applies `f` to
+    # each row, not to each number.
+    if length(args) == 1 && ctx.host === nothing && _jax_ragged(only(args).T) &&
+       ndims(only(args).T) == 1 && eltype(only(args).T) <: AbstractVector{<:Number} &&
+       !isempty(only(args).extent)
+        x = only(args)
+        outer = ctx.scope
+        fname = _jax_fresh(ctx, :row_function)
+        inner = _JaxScope(outer)
+        inner.indent = outer.indent + 1
+        row = _jax_identifier(inner.used, :row)
+        n = _jax_identifier(inner.used, :row_length)
+        saved = copy(ctx.locals)
+        ctx.scope = inner
+        v = try
+            _jax_call(ctx, f, [_PyVal(row, eltype(x.T), false, n)])
+        finally
+            ctx.scope = outer
+            empty!(ctx.locals); merge!(ctx.locals, saved)
+        end
+        push!(outer.lines, "    "^outer.indent * "def " * fname * "(" * row * ", " * n * "):")
+        append!(outer.lines, inner.lines)
+        push!(outer.lines, "    "^inner.indent * "return " * v.code)
+        return _PyVal("jax.vmap(" * fname * ")(" * x.code * ", " * x.extent * ")", Vector{v.T},
+                      false, x.extent)
     end
     # Any other scalar function: a module-level function translated once over
     # scalar arguments, vectorized over the operands.
@@ -3040,11 +3152,13 @@ function _jax_plan_recipe!(ctx::_JaxContext, p::Plan, recipe::Recipe)
     ctx.host === nothing && p.graph === ctx.mod.host_graph &&
         haskey(ctx.mod.host_reasons, recipe.id) || return _jax_plan_recipe_body!(ctx, p, recipe)
     # A data-only recipe `prepare_data` left to the functions: when they cannot
-    # compute it either, the error names both reasons.
+    # compute it either, the error names both reasons, unless a definition
+    # gives its values (`_JaxPromote`).
     try
         _jax_plan_recipe_body!(ctx, p, recipe)
     catch e
         e isa JAXEmissionError || rethrow()
+        _jax_promotable(ctx.mod.host_definitions, recipe) && throw(_JaxPromote(recipe.id))
         throw(JAXEmissionError(rstrip(e.message, '.') * ". The recipe reads data alone, " *
                                "and `prepare_data` does not compute it on the host either: " *
                                ctx.mod.host_reasons[recipe.id].message))
@@ -3693,10 +3807,17 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
     # A definition given as a `JAXEmissionError` (its reason) is not translated.
     untranslated = Dict{Symbol,JAXEmissionError}(n => ex for (n, ex) in something(defs, ())
                                                  if ex isa JAXEmissionError)
+    # Data-only recipes whose values the definitions give instead, as data
+    # inputs of the program: each one's recipe has no host translation, and
+    # the functions cannot compute it either, or a value `keep` names reads it
+    # (`g = prep(labels)`, whose field `g.n` sizes a block).
+    promoted = Set{Int}()
+    defined = Set{Symbol}(first(d) for d in something(defs, ()))
     while true
         try
             return _jax_module_text(plans, types, constants, doc,
-                                    (data, excluded, defs, untranslated, keep, reasons);
+                                    (data, excluded, defs, untranslated, keep, reasons,
+                                     promoted);
                                     function_docs)
         catch e
             if e isa _HostUnsupportedDefinition && !haskey(untranslated, e.name)
@@ -3704,11 +3825,54 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
             elseif e isa _HostUnsupported && !(e.recipe in excluded)
                 push!(excluded, e.recipe)
                 reasons[e.recipe] = e.error
+            elseif e isa _JaxPromote && !(e.recipe in promoted)
+                push!(promoted, e.recipe)
+            elseif e isa _KeepUnavailable
+                more = setdiff(_jax_upstream_recipes(plans, e.name, excluded, defined), promoted)
+                isempty(more) && throw(ArgumentError(
+                    "jax_source: `keep` names `$(e.name)`, which is no data-only value of the program"))
+                union!(promoted, more)
             else
                 rethrow()
             end
         end
     end
+end
+
+# A data-only recipe left to the functions (`_HostUnsupported`) that they
+# cannot compute either, and whose values all have definitions.
+struct _JaxPromote <: Exception
+    recipe::Int
+end
+# A value `keep` names that no data-only recipe computes.
+struct _KeepUnavailable <: Exception
+    name::Symbol
+end
+_jax_promotable(defined, r::Recipe) = !isempty(r.outputs) && all(o -> o.name in defined, r.outputs)
+
+# The `excluded` recipes upstream of the values named `name` in `plans` whose
+# values all have definitions (`defined`).
+function _jax_upstream_recipes(plans, name::Symbol, excluded, defined)
+    found = Set{Int}()
+    for (_, (p, _)) in plans
+        g = p.graph
+        producer = Dict{ValueId,Recipe}()
+        for r in p.recipes, o in r.outputs
+            get!(producer, canon_id(g, o.id), r)
+        end
+        queue = [canon_id(g, o.id) for r in p.recipes for o in r.outputs if o.name === name]
+        seen = Set{ValueId}()
+        while !isempty(queue)
+            id = pop!(queue)
+            id in seen && continue
+            push!(seen, id)
+            r = get(producer, id, nothing)
+            r === nothing && continue
+            r.id in excluded && _jax_promotable(defined, r) && push!(found, r.id)
+            foreach(v -> push!(queue, canon_id(g, v.id)), r.inputs)
+        end
+    end
+    found
 end
 
 const _JAX_HOST_HEADER = """
@@ -3728,11 +3892,12 @@ function _jax_module_text(plans, types, constants, doc, prepare; function_docs =
             push!(functions, f)
         end
     else
-        data, excluded, defs, untranslated, keep, reasons = prepare
+        data, excluded, defs, untranslated, keep, reasons, promoted = prepare
         merge!(mod.host_reasons, reasons)
         mod.host_graph = first(plans).second[1].graph
+        defs === nothing || union!(mod.host_definitions, (first(d) for d in defs))
         meta = _jax_prepared_functions!(mod, bodies, functions, plans, types, data, excluded,
-                                        defs, untranslated; keep, function_docs)
+                                        defs, untranslated; keep, function_docs, promoted)
         constants = merge(constants, meta)
     end
     constant_lines = String[]
@@ -3770,12 +3935,14 @@ function _jax_module_text(plans, types, constants, doc, prepare; function_docs =
 end
 
 # The symbols an expression reads, in order of first appearance (a call's
-# function and a field name included; callers keep the ones they know).
+# function included; callers keep the ones they know). A field read `g.n`
+# reads `g`; a dotted call `cos.(angle)` reads `cos` and its arguments.
 function _jax_symbols_read!(out::Vector{Symbol}, ex)
     if ex isa Symbol
         ex in out || push!(out, ex)
     elseif ex isa Expr
-        foreach(a -> _jax_symbols_read!(out, a), ex.head === :. ? ex.args[1:1] : ex.args)
+        field = ex.head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode
+        foreach(a -> _jax_symbols_read!(out, a), field ? ex.args[1:1] : ex.args)
     end
     out
 end
@@ -3786,8 +3953,27 @@ end
 function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, types, data,
                                   excluded, defs = nothing,
                                   untranslated = Dict{Symbol,JAXEmissionError}(); keep = (),
-                                  function_docs = NamedTuple())
+                                  function_docs = NamedTuple(), promoted = Set{Int}())
     ports = data isa NamedTuple ? Set(keys(data)) : Set(data)
+    # A promoted recipe's values (`_JaxPromote`) are data inputs of every
+    # function, which its definitions give: the recipe is not run.
+    if !isempty(promoted)
+        values = Value[]
+        seen = Set{ValueId}()
+        for (_, (p, _)) in plans, r in p.recipes
+            r.id in promoted || continue
+            for o in r.outputs
+                cid = canon_id(p.graph, o.id)
+                cid in seen && continue
+                push!(seen, cid)
+                push!(values, o)
+            end
+        end
+        plans = [fname => (_partial_subplan(p, [p.have; values], p.want,
+                                            Recipe[r for r in p.recipes if !(r.id in promoted)]), w)
+                 for (fname, (p, w)) in plans]
+        ports = union(ports, (v.name for v in values))
+    end
     split = _jax_prepare_split(plans, ports, excluded; keep)
     p1 = first(plans).second[1]
     # Raw data enters host code, so its types need not be concrete (a column
@@ -3796,16 +3982,32 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     for (k, v) in enumerate(p1.have)
         have_types[v.name] = data isa NamedTuple && haskey(data, v.name) ? typeof(data[v.name]) :
             types isa NamedTuple && haskey(types, v.name) ? types[v.name] :
-            types isa Tuple ? types[k] : valtype(v)
+            types isa Tuple && k <= length(types) ? types[k] : valtype(v)
     end
     for v in split.remaining
         _concrete_value_type(have_types[v.name]) || throw(ArgumentError(
             "jax_source: the HAVE value `$(v.name)` has type `$(have_types[v.name])`; pass a " *
             "concrete type with `types`"))
     end
-    # The definitions the host computes, in order: those with a translation.
+    # The definitions the host computes, in order: those with a translation
+    # that a data input reads, directly or through other definitions (one of
+    # a value the program computes is read only once it is promoted).
+    needed = Set{Symbol}(v.name for v in split.raw)
+    if defs !== nothing
+        by_name = Dict{Symbol,Any}(defs)
+        queue = collect(needed)
+        while !isempty(queue)
+            nm = pop!(queue)
+            haskey(untranslated, nm) && continue
+            ex = get(by_name, nm, nothing)
+            ex === nothing && continue
+            for r in _jax_symbols_read!(Symbol[], ex)
+                haskey(by_name, r) && !(r in needed) && (push!(needed, r); push!(queue, r))
+            end
+        end
+    end
     computed = defs === nothing ? Pair{Symbol,Any}[] :
-        Pair{Symbol,Any}[d for d in defs if !haskey(untranslated, first(d))]
+        Pair{Symbol,Any}[d for d in defs if !haskey(untranslated, first(d)) && first(d) in needed]
     defined = Set{Symbol}(first.(computed))
     params = Any[v for v in split.raw if !(v.name in defined)]
     raw_types = Any[have_types[v.name] for v in params]
@@ -3845,7 +4047,8 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     end
     lines, prepared_types, param_names = _jax_prepare_function!(mod, split, raw_types,
         prepared_names, native;
-        params, definitions = [(n, ex, get(have_types, n, nothing)) for (n, ex) in computed])
+        params, definitions = [(n, ex, get(have_types, n, nothing)) for (n, ex) in computed],
+        untranslated)
     push!(bodies, join(lines, "\n"))
     # The inputs by the names `prepare_data` takes them (a name that is no
     # Python identifier, such as a submodel's `v.mask`, is spelled `v_mask`).
@@ -3873,7 +4076,8 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
                                ragged = _jax_ragged(T))
                          for (n, T) in zip(param_names, raw_types)],
                  UNTRANSLATED = Dict{String,String}(String(n) => untranslated[n].message
-                     for (n, _) in defs if haskey(untranslated, n))))
+                     for (n, _) in defs if haskey(untranslated, n) &&
+                         any(v -> v.name === n, params))))
 end
 
 # A value's dtype and rank, as module metadata describes an input.
