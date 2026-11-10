@@ -2838,7 +2838,8 @@ translation raises a [`JAXEmissionError`](@ref) naming its recipe.
 """
 function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                     want = nothing, functions = nothing, types = nothing,
-                    name = :kernel, constants = NamedTuple(), doc = nothing, data = nothing)
+                    name = :kernel, constants = NamedTuple(), doc = nothing, data = nothing,
+                    definitions = nothing)
     functions === nothing && want === nothing && (want = _KERNEL_DEFAULT_BOUNDARY)
     if functions === nothing
         functions = NamedTuple{(Symbol(name),)}((want,))
@@ -2849,13 +2850,13 @@ function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
         "jax_source: `functions` must be a nonempty NamedTuple of function name => WANT"))
     plans = [fname => (plan(spec; have, want = _jax_want_names(w)), w)
              for (fname, w) in pairs(functions)]
-    _jax_module_source(plans, types, constants, doc; data)
+    _jax_module_source(plans, types, constants, doc; data, definitions)
 end
 
 jax_source(p::Plan; types = nothing, name = :kernel, constants = NamedTuple(),
-           doc = nothing, data = nothing) =
+           doc = nothing, data = nothing, definitions = nothing) =
     _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
-                       types, constants, doc; data)
+                       types, constants, doc; data, definitions)
 
 _jax_want_names(w::Symbol) = (w,)
 _jax_want_names(w::Tuple) = w
@@ -2865,18 +2866,50 @@ _jax_want_names(w) = throw(ArgumentError(
 
 # With `data`, the module's data-only prefix is `prepare_data` (`jax_host.jl`);
 # a recipe without a host translation is left to the JAX functions.
-function _jax_module_source(plans, types, constants, doc; data = nothing)
-    data === nothing && return _jax_module_text(plans, types, constants, doc, nothing)
+#
+# `definitions`, an ordered collection of `name => expression`, computes data
+# HAVE values on the host from the other data HAVE values, before the prefix:
+# the module's `prepare_data` then takes the data those expressions read in
+# place of the values they define (a binder's data-only definitions, which
+# would otherwise be values only Julia computes). A definition without a host
+# translation, or one given as a `JAXEmissionError` (the reason it has none),
+# stays a `prepare_data` input, named with that reason in the module constant
+# `UNTRANSLATED`.
+function _jax_module_source(plans, types, constants, doc; data = nothing,
+                            definitions = nothing)
+    if data === nothing
+        definitions === nothing || isempty(definitions) || throw(ArgumentError(
+            "jax_source: `definitions` compute data values, so they need `data`"))
+        return _jax_module_text(plans, types, constants, doc, nothing)
+    end
     data isa NamedTuple || data isa Tuple && all(d -> d isa Symbol, data) ||
         throw(ArgumentError("jax_source: `data` is a tuple of HAVE names or a NamedTuple " *
                             "of their values"))
+    defs = definitions === nothing ? nothing :
+        Pair{Symbol,Any}[Symbol(first(d)) => last(d) for d in definitions]
+    if defs !== nothing
+        ports = data isa NamedTuple ? Set(keys(data)) : Set(data)
+        for (n, _) in defs
+            n in ports || throw(ArgumentError(
+                "jax_source: the definition `$n` does not name a `data` value"))
+        end
+    end
     excluded = Set{Int}()
+    # A definition given as a `JAXEmissionError` (its reason) is not translated.
+    untranslated = Dict{Symbol,JAXEmissionError}(n => ex for (n, ex) in something(defs, ())
+                                                 if ex isa JAXEmissionError)
     while true
         try
-            return _jax_module_text(plans, types, constants, doc, (data, excluded))
+            return _jax_module_text(plans, types, constants, doc,
+                                    (data, excluded, defs, untranslated))
         catch e
-            e isa _HostUnsupported && !(e.recipe in excluded) || rethrow()
-            push!(excluded, e.recipe)
+            if e isa _HostUnsupportedDefinition && !haskey(untranslated, e.name)
+                untranslated[e.name] = e.error
+            elseif e isa _HostUnsupported && !(e.recipe in excluded)
+                push!(excluded, e.recipe)
+            else
+                rethrow()
+            end
         end
     end
 end
@@ -2898,8 +2931,9 @@ function _jax_module_text(plans, types, constants, doc, prepare)
             push!(functions, f)
         end
     else
-        data, excluded = prepare
-        meta = _jax_prepared_functions!(mod, bodies, functions, plans, types, data, excluded)
+        data, excluded, defs, untranslated = prepare
+        meta = _jax_prepared_functions!(mod, bodies, functions, plans, types, data, excluded,
+                                        defs, untranslated)
         constants = merge(constants, meta)
     end
     constant_lines = String[]
@@ -2938,7 +2972,8 @@ end
 # constants `INPUTS` (the functions' parameters) and `PREPARED` (each
 # prepared input's dtype, rank and raggedness).
 function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, types, data,
-                                  excluded)
+                                  excluded, defs = nothing,
+                                  untranslated = Dict{Symbol,JAXEmissionError}())
     ports = data isa NamedTuple ? Set(keys(data)) : Set(data)
     split = _jax_prepare_split(plans, ports, excluded)
     p1 = first(plans).second[1]
@@ -2955,7 +2990,12 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
             "jax_source: the HAVE value `$(v.name)` has type `$(have_types[v.name])`; pass a " *
             "concrete type with `types`"))
     end
-    raw_types = Any[have_types[v.name] for v in split.raw]
+    # The definitions the host computes, in order: those with a translation.
+    computed = defs === nothing ? Pair{Symbol,Any}[] :
+        Pair{Symbol,Any}[d for d in defs if !haskey(untranslated, first(d))]
+    defined = Set{Symbol}(first.(computed))
+    params = Value[v for v in split.raw if !(v.name in defined)]
+    raw_types = Any[have_types[v.name] for v in params]
     used = Set{String}()
     remaining_names = [_jax_param_name(used, v.name) for v in split.remaining]
     prepared_names = String[]
@@ -2975,10 +3015,11 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
             nothing
         end
     end
-    lines, prepared_types = _jax_prepare_function!(mod, split, raw_types, prepared_names, native)
+    lines, prepared_types = _jax_prepare_function!(mod, split, raw_types, prepared_names, native;
+        params, definitions = [(n, ex, have_types[n]) for (n, ex) in computed])
     push!(bodies, join(lines, "\n"))
     push!(functions, JAXFunction("prepare_data",
-        [String(v.name) => T for (v, T) in zip(split.raw, raw_types)],
+        [String(v.name) => T for (v, T) in zip(params, raw_types)],
         [n => T for (n, T) in zip(prepared_names, prepared_types)]))
     all_types = Any[[have_types[v.name] for v in split.remaining]; prepared_types]
     all_names = [remaining_names; prepared_names]
@@ -2987,9 +3028,19 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
         push!(bodies, join(lines, "\n"))
         push!(functions, f)
     end
-    (INPUTS = Tuple(first(io) for io in functions[2].inputs),
-     PREPARED = [n => (dtype = _jax_dtype_name(T), ndim = _jax_meta_rank(T), ragged = _jax_ragged(T))
-                 for (n, T) in zip(prepared_names, prepared_types)])
+    meta = (INPUTS = Tuple(first(io) for io in functions[2].inputs),
+            PREPARED = [n => (dtype = _jax_dtype_name(T), ndim = _jax_meta_rank(T),
+                              ragged = _jax_ragged(T))
+                        for (n, T) in zip(prepared_names, prepared_types)])
+    defs === nothing && return meta
+    # With definitions, `DATA` describes `prepare_data`'s own parameters, and
+    # `UNTRANSLATED` the definitions it takes as inputs (none when every
+    # definition has a host translation).
+    merge(meta, (DATA = [String(v.name) => (dtype = _jax_dtype_name(T), ndim = _jax_meta_rank(T),
+                                           ragged = _jax_ragged(T))
+                         for (v, T) in zip(params, raw_types)],
+                 UNTRANSLATED = Dict{String,String}(String(n) => untranslated[n].message
+                     for (n, _) in defs if haskey(untranslated, n))))
 end
 
 # A value's dtype and rank, as module metadata describes an input.

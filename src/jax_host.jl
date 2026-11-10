@@ -984,25 +984,57 @@ struct _HostUnsupported <: Exception
     recipe::Int
     error::JAXEmissionError
 end
+# A data definition (`jax_source`'s `definitions`) without a host translation:
+# `prepare_data` takes its value as an input instead.
+struct _HostUnsupportedDefinition <: Exception
+    name::Symbol
+    error::JAXEmissionError
+end
 
 # `prepare_data` over the raw data ports of `split`: the host code of its
 # prefix, returning a `dict` of the boundary values under `names` (a ragged
 # value padded, with its `<name>_lengths`). `types` are the boundary values'
 # types, or `nothing` for the types the translation infers. Returns the
 # function's lines and the boundary values' types.
-function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types)
+function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
+                                params = split.plan.have, definitions = ())
     p = split.plan
     scope = _JaxScope()
     ctx = _JaxContext(mod, scope, nothing, Main, Dict{Symbol,_PyVal}(), nothing)
     ctx.host = _HostState()
-    params = String[]
-    for (v, T) in zip(p.have, raw_types)
+    param_names = String[]
+    known = Dict{Symbol,_PyVal}()
+    for (v, T) in zip(params, raw_types)
         param = _jax_param_name(scope.used, v.name)
-        push!(params, param)
-        scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, true)
+        push!(param_names, param)
+        known[v.name] = _PyVal(param, T, true)
         _jax_ragged(T) ? _jax_emit!(ctx, param * " = [np.asarray(a) for a in " * param * "]") :
             _jax_is_array(T) && _jax_emit!(ctx, param * " = np.asarray(" * param * ", dtype=" *
                                            _host_dtype(eltype(T)) * ")")
+    end
+    # The data definitions, in order, over the parameters and the definitions
+    # before them. A value takes the type the binding's own value has.
+    for (name, ex, T) in definitions
+        ctx.locals = copy(known)
+        first_line = length(scope.lines) + 1
+        local_name = try
+            v = _jax_expr(ctx, ex)
+            local_name = _jax_fresh(ctx, name)
+            _jax_emit!(ctx, local_name * " = " * (_host_is_numeric_array(T) ?
+                "np.asarray(" * v.code * ", dtype=" * _host_dtype(eltype(T)) * ")" : v.code))
+            # Host text, as each recipe's (`_host_lines!`).
+            _host_lines!(ctx, first_line)
+            local_name
+        catch e
+            e isa JAXEmissionError || rethrow()
+            throw(_HostUnsupportedDefinition(name, e))
+        finally
+            ctx.locals = Dict{Symbol,_PyVal}()
+        end
+        known[name] = _PyVal(local_name, T, true)
+    end
+    for v in p.have
+        scope.values[canon_id(p.graph, v.id)] = known[v.name]
     end
     for recipe in p.recipes
         try
@@ -1034,7 +1066,7 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types)
             push!(entries, "\"" * name * "\": " * v.code)
         end
     end
-    lines = String["def prepare_data(" * join(params, ", ") * "):"]
+    lines = String["def prepare_data(" * join(param_names, ", ") * "):"]
     push!(lines, "    \"\"\"The functions' data inputs, computed from the raw data once per dataset.\"\"\"")
     for r in split.excluded
         push!(lines, "    # Computed by the functions (no host translation): " * _recipe_line(r))

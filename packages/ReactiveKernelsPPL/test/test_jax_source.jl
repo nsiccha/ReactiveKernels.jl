@@ -20,6 +20,14 @@ include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
     return W
 end
 
+# The data the caller bound, in `prepare_data`'s order: every input is a
+# name the caller wrote (a column, a scalar value), never a value only the
+# Julia binder computes.
+function jax_raw_data(plan, src)
+    names = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
+    Tuple(plan.columns[Symbol(n)] for n in names)
+end
+
 const _JAX_RNG = Xoshiro(20261024)
 const _JAX_N = 30
 const _JAX_X = randn(_JAX_RNG, _JAX_N)
@@ -160,8 +168,8 @@ end
         src = jax_source(built, plan)
         query = prepare_query(built, plan, :sampler)
         u = 0.2 .* randn(Xoshiro(7), built.layout.total)
-        data = ReactiveKernelsPPL._query_bound(plan)
-        r = rk_jax_evaluate(src, "log_density", (u, Tuple(data)...); grad = true, prepare = true)
+        r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
+                            grad = true, prepare = true)
         @test r.value ≈ query(u) rtol = 1e-10
         reference = rk_fd_gradient(query, u)
         @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
@@ -180,5 +188,41 @@ end
         @test r.value["a"] ≈ 0.9
         @test r.value["s"] ≈ 0.4
         @test r.value["mu"] ≈ 0.9 .+ 1.8 .* _JAX_X
+    end
+end
+
+# `prepare_data` takes the data the caller binds, by the names the model
+# reads them: scalar values and covariates, never the binder's internal
+# copies or the data-only definitions it evaluates (`w`), which the module
+# computes on the host. One module serves other sizes and values.
+@testset "jax_source(built, plan): prepare_data takes the bound data" begin
+    model = @rkppl begin
+        a ~ Normal(a_loc, a_scale)
+        s ~ Exponential(1.0)
+        w = cos.(x ./ period)
+        y .~ Normal.(a .+ w, s)
+    end
+    bind(n, a_loc, a_scale, period) = let x = collect(range(0, 2; length = n))
+        model(; x, a_loc, a_scale, period) | (; y = 1 .+ cos.(x ./ 3) .+ 0.1 .* sin.(1:n))
+    end
+    plan = bind(6, 0.0, 2.0, 3.0)
+    built = build_kernel(plan)
+    src = jax_source(built, plan)
+    @test first.(src.functions[1].inputs) == ["a_loc", "a_scale", "period", "x", "y"]
+    @test occursin("UNTRANSLATED = {}", string(src))
+    @test occursin("np.cos(x / period)", string(src))
+    other = bind(11, 0.5, 1.5, 4.0)
+    @test string(jax_source(build_kernel(other), other)) == string(src)
+    if !rk_jax_available()
+        @test_skip false
+    else
+        for p in (plan, other)
+            query = prepare_query(built, p, :sampler)
+            u = [0.3, -0.2]
+            r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(p, src)...);
+                                grad = true, prepare = true)
+            @test r.value ≈ query(u) rtol = 1e-12
+            @test r.grad ≈ rk_fd_gradient(query, u) rtol = 1e-6
+        end
     end
 end

@@ -16,6 +16,23 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.134
+
+- **Breaking for `jax_source` callers:** a module's `prepare_data` takes the
+  data the caller binds, by the names the model reads (columns and scalar
+  values such as a prior scale or a period), and computes the data-only
+  definitions `bind_data` evaluates (`w = cos.(x ./ period)`) itself, in host
+  NumPy. It took the binding's internal copies of scalar values
+  (`_rkppl_value_<name>`) and those definitions' values, which only Julia
+  computed, so a Python caller could not bind new data. Pass the same names
+  the model is bound with: `m.prepare_data(**raw)`. `DATA` describes those
+  parameters. A definition without a host translation stays an input, named
+  with the reason in the new module constant `UNTRANSLATED` (`{}` when every
+  definition is computed); so does a derived definition whose binding guards
+  missing observations. A response with missing values still passes its
+  presence mask as `_rkppl_present_<name>`. Frozen definitions
+  (`frozen_values`) stay inputs. Needs ReactiveKernels 0.1.130.
+
 ## 0.1.133
 
 - The sampler is non-allocating by default: `prepare_sampler`'s

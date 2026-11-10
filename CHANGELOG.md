@@ -18,6 +18,15 @@ are recorded in the git history only.
 
 ## 0.1.130
 
+- `jax_source(spec; data, definitions)`: `definitions`, an ordered collection
+  of `name => expression`, computes data values in `prepare_data` from the
+  other data values, in host NumPy, before the program's data-only prefix.
+  `prepare_data` then takes the data those expressions read in place of the
+  values they define. With `definitions`, the module also has `DATA` (its
+  parameters' dtype, rank and raggedness) and `UNTRANSLATED`: each definition
+  without a host translation, or given as a `JAXEmissionError` naming the
+  reason, with that reason; such a definition stays a `prepare_data` input.
+  ReactiveKernelsPPL 0.1.134 passes a binding's data-only definitions.
 - `jax_source` translates a derivative rule's primal cut again (DistributionKernels'
   `loggamma` and `logbeta`, so RKPPL's `NegativeBinomial2`, `BetaBinomial2`,
   `Gamma`-family and other densities that call them). Since 0.1.27 a lowering's

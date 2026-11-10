@@ -62,9 +62,11 @@ module_source = jax_source(built, plan; values = (:mu,))
 ```
 
 The module's functions are:
-- `prepare_data`, which takes the data columns, in sorted name order or by
-  name, and returns the functions' data inputs as a `dict` (see
-  [Data preparation](#Data-preparation));
+- `prepare_data`, which takes the data the model is bound with, by the
+  names the model reads (columns and scalar values, in sorted name order or
+  by name), and returns the functions' data inputs as a `dict` (see
+  [Data preparation](#Data-preparation)). It computes the data-only
+  definitions `bind_data` evaluates, such as `w = cos.(x ./ period)`, itself;
 - `log_density`, the sampler's target (prior, likelihood and log Jacobian);
 - its parts, `log_prior`, `log_likelihood` and `log_jacobian`;
 - `constrain`, a `dict` of every declared parameter's constrained value plus
@@ -76,7 +78,13 @@ Its constants describe the inputs:
 - `DIMENSION`, the length of `unconstrained`;
 - `PARAMETERS`, each parameter's 0-based `start`/`stop` in `unconstrained`,
   its transform and its dimensions;
-- `DATA`, each data column's dtype and rank, and whether it is ragged;
+- `DATA`, each of `prepare_data`'s parameters' dtype and rank, and whether
+  it is ragged;
+- `UNTRANSLATED`, each data-only definition `prepare_data` takes as an input
+  instead of computing it, with the reason: one without a host translation,
+  or a derived definition whose binding guards missing observations. It is
+  `{}` when every definition is computed. A response with missing values
+  also passes its presence mask, `_rkppl_present_<name>`;
 - `PREPARED`, the same for each prepared input;
 - `INPUTS`, the functions' parameters in order.
 
@@ -91,7 +99,7 @@ import jax, jax.numpy as jnp
 from numpyro.infer import MCMC, NUTS
 import model  # the module jax_source wrote
 
-prepared = model.prepare_data(x=x, y=y)  # raw columns, once per dataset
+prepared = model.prepare_data(x=x, y=y)  # the bound data, once per dataset
 potential = lambda u: -model.log_density(u, **prepared)
 mcmc = MCMC(NUTS(potential_fn=potential), num_warmup=500, num_samples=1000)
 mcmc.run(jax.random.PRNGKey(0), init_params=jnp.zeros(model.DIMENSION))
@@ -125,6 +133,12 @@ JAX code:
   where JAX folds them.
 - A data-only recipe without a host translation stays in the functions; a
   comment in `prepare_data` names it.
+- `definitions = [name => expression, …]` (with `data`) computes data
+  values on the host before that prefix, from the other data values;
+  `prepare_data` then takes what the expressions read instead of the values
+  they define. `jax_source(built, plan)` passes the binding's data-only
+  definitions this way. One without a host translation stays an input,
+  listed with its reason in the module's `UNTRANSLATED`.
 
 The functions' inputs have static shapes, so they also run under `jax.jit`
 with the prepared data as arguments.
@@ -222,6 +236,5 @@ recipe and the construct:
 - `reshape` of a ragged value (its padding has no shape);
 - `history` scans.
 
-Preparation that `bind_data` does before the program runs (a binder's own
-level coding, frozen definitions) is not in the program, so `prepare_data`
-takes its results: the bound columns, as `DATA` lists them.
+Frozen definitions (`frozen_values`) come from another binding, so
+`prepare_data` takes their values, as `DATA` lists them.
