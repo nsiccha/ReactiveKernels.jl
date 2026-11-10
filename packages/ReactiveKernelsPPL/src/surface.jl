@@ -12783,10 +12783,10 @@ function _mv_head(rhs)
     return h
 end
 
-# Multivariate normals also declare one vector (`b[1:K] ~ MvNormal(...)`),
-# and an ICAR field is only ever one node vector (`phi[1:N] ~ ICAR(node1,
-# node2)`); a simplex and an ordered vector keep their unsized declarations
-# (`phi ~ Dirichlet(alpha)`, `c ~ Ordered(Normal(0, 1), K)`).
+# Multivariate normals and an ICAR field also declare one vector
+# (`b[1:K] ~ MvNormal(...)`, `phi[1:N] ~ ICAR(node1, node2)`); a simplex and
+# an ordered vector keep their unsized declarations (`phi ~ Dirichlet(alpha)`,
+# `c ~ Ordered(Normal(0, 1), K)`).
 _mv_vector_head(rhs) = _mv_head(rhs) in (:MvNormalCholesky, :MvNormal, :ICAR)
 
 _is_slice_iterator(a) = a isa Expr && a.head === :call &&
@@ -12910,10 +12910,15 @@ function _mv_slice_args(::Val{:Dirichlet}, what, args)
         args[1]),)
 end
 # An ICAR edge list: one integer node index per edge, read whole. It is
-# data (or a data-only definition), checked at binding.
+# data (or a data-only definition), checked at binding. The rows or columns
+# of an array are independent fields over one shared graph, so a per-field
+# edge list (`ICAR.(eachrow(E1), …)`) is refused.
 function _icar_edge_arg(what, role, a)
     (a isa Real || a isa Bool) && _sfail("$what: the `ICAR` $role is an " *
         "integer node vector with one entry per edge, got the scalar $(repr(a))")
+    _is_slice_iterator(a) && _sfail("$what: every `ICAR` field shares one " *
+        "edge list, `ICAR(node1, node2)`; a graph per field " *
+        "($(repr(a))) is not built")
     a isa Expr || a isa Symbol || _sfail("$what: `ICAR` $role $(repr(a)) " *
         "is not a value")
     return a
@@ -12962,9 +12967,6 @@ function _lower_array_slices(lhs, dims::Vector{Any}, slices::Symbol, rhs,
             "got $(repr(rhs))" * (h isa Symbol ? " (an elementwise prior " *
             "is `$lhs[a, b] .~ $h.(…)`)" : ""))
     end
-    head === :ICAR && slices !== :vector && _sfail("$what: an `ICAR` " *
-        "field is one node vector, `$lhs[1:N] ~ ICAR(node1, node2)`; " *
-        "rows or columns of independent ICAR fields are not built yet")
     dotted = rhs.head === :.
     dotted && !(rhs.args[2] isa Expr && rhs.args[2].head === :tuple) &&
         _sfail("$what: malformed broadcast $(repr(rhs))")

@@ -273,6 +273,41 @@ const _JAX_CASES = (
     end))(; log_transition = log.([0.9 0.1; 0.2 0.8]), log_initial = log.([0.5, 0.5])) |
         (; y = sin.(1:20)),
 )
+# ICAR priors (snag independent-icar-2e025fad): one field over a graph, and K
+# independent fields over the same graph as the rows or the columns of one
+# array, K and N data. Each translates its edge plate (and field plate).
+const _JAX_ICAR_NODE1 = [1, 1, 2, 3, 4, 5, 2]
+const _JAX_ICAR_NODE2 = [2, 3, 4, 4, 5, 6, 5]
+const _JAX_ICAR_K = repeat(1:3, inner = 6)
+const _JAX_ICAR_N = repeat(1:6, outer = 3)
+const _JAX_ICAR_CASES = (
+    icar_field = () -> (@rkppl(begin
+        a ~ Normal(0, 1); s ~ Exponential(1.0)
+        phi[1:N] ~ ICAR(node1, node2)
+        phi_sum = sum(phi)
+        phi_sum ~ Normal(0, 0.001 * N)
+        y .~ Normal.(a .+ phi, s)
+    end))(; N = 6, node1 = _JAX_ICAR_NODE1, node2 = _JAX_ICAR_NODE2) | (; y = sin.(1:6)),
+    icar_rows = () -> (@rkppl(begin
+        a ~ Normal(0, 1); s ~ Exponential(1.0)
+        eachrow(phi[1:K, 1:N]) .~ ICAR(node1, node2)
+        @plate for i in eachindex(k)
+            mu[i] = a + phi[k[i], n[i]]
+        end
+        y .~ Normal.(mu, s)
+    end))(; K = 3, N = 6, node1 = _JAX_ICAR_NODE1, node2 = _JAX_ICAR_NODE2,
+           k = _JAX_ICAR_K, n = _JAX_ICAR_N) | (; y = sin.(1:18)),
+    icar_cols = () -> (@rkppl(begin
+        a ~ Normal(0, 1); s ~ Exponential(1.0)
+        eachcol(phi[1:N, 1:K]) .~ ICAR(node1, node2)
+        @plate for i in eachindex(k)
+            mu[i] = a + phi[n[i], k[i]]
+        end
+        y .~ Normal.(mu, s)
+    end))(; K = 3, N = 6, node1 = _JAX_ICAR_NODE1, node2 = _JAX_ICAR_NODE2,
+           k = _JAX_ICAR_K, n = _JAX_ICAR_N) | (; y = sin.(1:18)),
+)
+
 # The same law with one location per state, so the state count is data.
 function _jax_hmm_states(T, K)
     m = @rkppl begin
@@ -328,6 +363,25 @@ end
         # an integer that sets a shape is static (`StaticInt`).
         @test rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
                               prepare = :arguments).value ≈ query(u) rtol = 1e-10
+        reference = rk_fd_gradient(query, u)
+        @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
+    end
+end
+
+@testset "jax_source(built, plan): ICAR priors ($name)" for name in keys(_JAX_ICAR_CASES)
+    plan = _JAX_ICAR_CASES[name]()
+    built = build_kernel(plan)
+    src = jax_source(built, plan)
+    @test occursin("UNTRANSLATED = {}", string(src))
+    if !rk_jax_available()
+        @info "RK_JAX_PYTHON is not set: JAX parity for $name skipped"
+        @test_skip false
+    else
+        query = prepare_query(built, plan, :sampler)
+        u = 0.2 .* randn(Xoshiro(7), built.layout.total)
+        r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
+                            grad = true, prepare = true)
+        @test r.value ≈ query(u) rtol = 1e-10
         reference = rk_fd_gradient(query, u)
         @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
     end

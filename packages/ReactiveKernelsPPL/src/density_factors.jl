@@ -115,8 +115,11 @@ function _density_slice_plate!(stmts, plan, p, density, dims)
     else
         slice(kind, p.name, dims; flat = _array_flat_name(p.name, 2))
     end
+    # An ICAR field's law takes the field, then its node vectors, with no
+    # orientation: each cell evaluates one field's `icar_logdensity`.
+    icar = _slice_stem(p) === :icar
     args = Any[]
-    for a in density.args[4:end]
+    for a in density.args[(icar ? 3 : 4):end]
         if Meta.isexpr(a, :call) && a.args[1] === :_PerSlice
             rows = a.args[2] == :(_SliceRows())
             value = a.args[3]
@@ -133,7 +136,9 @@ function _density_slice_plate!(stmts, plan, p, density, dims)
             push!(args, _dovar(length(inputs)))
         end
     end
-    cell = Expr(:call, density.args[1], :(_SliceWhole()), variate, args...)
+    cell = icar ? Expr(:call, GlobalRef(DistributionKernelSources,
+        :icar_logdensity), variate, args...) :
+        Expr(:call, density.args[1], :(_SliceWhole()), variate, args...)
     pw = Symbol(:_ppl_density_slices_, p.name)
     append!(stmts, _plate_sum_stmts(pw, Symbol(pw, :_sum), inputs, cell))
     pw

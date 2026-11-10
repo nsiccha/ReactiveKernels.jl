@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.6
+
+- Add `icar_rows_logdensity(phi, node1, node2)` and
+  `icar_cols_logdensity(phi, node1, node2)`: independent unit-scale ICAR
+  fields over one graph, the rows (field `k` is `phi[k, :]`) or the columns
+  (field `k` is `phi[:, k]`) of a matrix. The density is the sum of
+  `icar_logdensity` over the fields, computed in one plate over the edges
+  with a plate over the fields inside each edge cell; no per-edge or
+  per-field vector is filled.
+
 ## 0.1.5
 
 - The hidden-Markov laws and their state-posterior twins' helpers record
