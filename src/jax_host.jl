@@ -701,8 +701,12 @@ function _host_call(ctx::_JaxContext, f, positional, kwargs)
         return c
     end
     default = _jax_expr(ctx, positional[3])
-    _PyVal(c.code * (f === get ? ".get(" : ".setdefault(") * key.code * ", " * default.code * ")",
-           Base.valtype(c.T), true)
+    v = _PyVal(c.code * (f === get ? ".get(" : ".setdefault(") * key.code * ", " * default.code * ")",
+               Base.valtype(c.T), true)
+    # `get!` writes the dictionary: bind it where it runs, so the write
+    # happens even when the source discards its value (a statement
+    # `get!(d, k, v)`), and before any later read of `d`.
+    f === get! ? _jax_bind!(ctx, :value, v) : v
 end
 
 function _host_length(ctx::_JaxContext, x::_PyVal)

@@ -16,6 +16,24 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.130
+
+- `jax_source` translates a derivative rule's primal cut again (DistributionKernels'
+  `loggamma` and `logbeta`, so RKPPL's `NegativeBinomial2`, `BetaBinomial2`,
+  `Gamma`-family and other densities that call them). Since 0.1.27 a lowering's
+  callables table holds each operation's source record rather than the
+  operation, and the emitter refused the record with `JAXEmissionError: a
+  source part ... called without its operation`.
+- `prepare_data` keeps the write of a `get!` whose value the source discards
+  (a statement `get!(d, k, v)`). It dropped the call, so RKPPL's level codes of
+  a string or categorical grouping column were all 0 and the JAX log density
+  read the wrong coefficients without an error.
+- `view`, `Base.maybeview` and `getindex` called with values in a plain
+  helper's lowered code translate as a gather, including a `:` (whole-axis)
+  index: `reshape(view(v, :), 1, length(v))` (RKPPL's multivariate normal slice
+  priors under `LKJCholesky`). A whole-axis slice of a ragged value raises a
+  `JAXEmissionError`.
+
 ## 0.1.129
 
 - `prepare_ad` over a `NonAllocatingKernel` differentiates a plate whose cells

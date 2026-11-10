@@ -1860,7 +1860,12 @@ function _jax_index_values(ctx::_JaxContext, x::_PyVal, indices::Vector{_PyVal})
     parts = String[]
     kept = 0
     for i in indices
-        if i.T isa Type && i.T <: Integer
+        if _jax_is_colon(i)
+            # A whole axis; a ragged value's padding would show through it.
+            isempty(x.extent) ||
+                _jax_error("a whole-axis slice of a ragged value", _jax_where(ctx))
+            push!(parts, ":"); kept += 1
+        elseif i.T isa Type && i.T <: Integer
             push!(parts, _jax_minus_one(i))
         elseif _jax_is_array(i.T) && eltype(i.T) <: Integer && ndims(i.T) == 1
             push!(parts, _py_infix("-", [i.code, "1"])); kept += 1
@@ -2047,10 +2052,22 @@ eltype_or_self(@nospecialize(T)) = T isa Type && T <: AbstractArray ? eltype(T) 
 # with the operation's module for the names the body leaves to it.
 _jax_call_positional(ctx::_JaxContext, op::_KernelSourceOp, args::Vector{_PyVal}) =
     _jax_source_call(ctx, op.f, args, _kernel_endpoint_source_module(op))
+# A source record called without its operation: a lowering's callables table
+# holds the record, not the `_KernelSourceOp` around it (`_lowering_tables`),
+# so a derivative rule's primal cut calls its records directly.
 _jax_call_positional(ctx::_JaxContext,
                      f::Union{_KernelSource,_KernelSplit,_KernelReduction,_KernelBranch},
                      args::Vector{_PyVal}) =
-    _jax_error("a source part `", typeof(f), "` called without its operation", _jax_where(ctx))
+    _jax_source_call(ctx, f, args, _jax_record_module(f))
+# The module whose names a record's generated body leaves unqualified: the
+# context its companion was compiled in, else the module of its authored code.
+_jax_record_module(f::Union{_KernelSplit,_KernelReduction}) = _jax_record_module(f.call)
+_jax_record_module(f::_KernelSource) = _jax_companion_module(f.companion, f)
+_jax_record_module(f) = _kernel_endpoint_source_module(f)
+_jax_companion_module(c::_PrecompileWarmFunction, f) = _jax_companion_module(c.f, f)
+_jax_companion_module(::RuntimeGeneratedFunctions.RuntimeGeneratedFunction{A,C,M},
+                      f) where {A,C,M} = parentmodule(M)
+_jax_companion_module(_, f) = _kernel_endpoint_source_module(f)
 function _jax_source_call(ctx::_JaxContext,
         f::Union{_KernelSource,_KernelSplit,_KernelReduction}, args::Vector{_PyVal}, mod)
     params, body = _jax_op_body(f)
@@ -2298,11 +2315,14 @@ function _jax_tuple_element(ctx::_JaxContext, x::_PyVal, i::_PyVal)
     _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", fieldtype(x.T, k), x.static)
 end
 _jax_is_tuple(@nospecialize(T)) = T isa Type && T <: Union{Tuple,NamedTuple} && isconcretetype(T)
-function _jax_call_positional(ctx::_JaxContext, f::Union{typeof(getindex),typeof(getfield)},
-                              args::Vector{_PyVal})
+# Indexing called with values (lowered code). A view is the gather: JAX
+# arrays are values, as the indexing spelling `view(x, i)` already reads.
+function _jax_call_positional(ctx::_JaxContext,
+        f::Union{typeof(getindex),typeof(getfield),typeof(view),typeof(Base.maybeview)},
+        args::Vector{_PyVal})
     x = args[1]
     _jax_is_tuple(x.T) && length(args) >= 2 && return _jax_tuple_element(ctx, x, args[2])
-    f === getindex && _jax_is_array(x.T) && return _jax_index_values(ctx, x, args[2:end])
+    f !== getfield && _jax_is_array(x.T) && return _jax_index_values(ctx, x, args[2:end])
     _jax_function_call(ctx, f, args)
 end
 for (f, position) in ((first, 1), (last, 0))
