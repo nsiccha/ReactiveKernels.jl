@@ -26,10 +26,13 @@ end
 # Julia binder computes.
 function jax_raw_data(plan, src)
     names = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
-    # A value the program reads only through its bound copy is passed by its
-    # authored name; the plan holds it as `_rkppl_value_<name>`.
-    Tuple(get(() -> plan.columns[Symbol("_rkppl_value_", n)], plan.columns, Symbol(n))
-          for n in names)
+    # A value the program reads only through its bound copy, and the observed
+    # value of a conditioned declaration, are passed by their authored names;
+    # the plan holds them as `_rkppl_value_<name>` and
+    # `_rkppl_conditioned_<name>`.
+    internal(n) = get(() -> plan.columns[Symbol("_rkppl_value_", n)], plan.columns,
+                      Symbol("_rkppl_conditioned_", n))
+    Tuple(get(() -> internal(n), plan.columns, Symbol(n)) for n in names)
 end
 
 # A data helper with a loop and no recorded source: no host translation.
@@ -533,6 +536,54 @@ end
             query = prepare_query(built, plan, :sampler)
             u = 0.2 .* randn(Xoshiro(3), built.layout.total)
             r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
+                                grad = true, prepare = true)
+            @test r.value ≈ query(u) rtol = 1e-10
+            reference = rk_fd_gradient(query, u)
+            @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
+        end
+    end
+end
+
+# A conditioned declaration's observed value (`y ~ LogDensity(f, …)` bound
+# `| (; y)`, a parameter fixed `| (; a)`; ODLProject:ap1, snag
+# jax-source-names-d71253f7): the binding holds it as `_rkppl_conditioned_y`,
+# and `prepare_data` takes it by its authored name. The module runs from the
+# authored data alone.
+@testset "jax_source(built, plan): authored names for conditioned declarations" begin
+    hmm = @rkppl begin
+        mu ~ Normal(0.0, 1.0)
+        step ~ Normal(0.0, 1.0)
+        sigma ~ Exponential(1.0)
+        locations = reshape(permutedims(hcat(mu .+ step .+ z, mu .+ z)), 2, 1, N)
+        scales = reshape(permutedims(hcat(sigma .+ z, sigma .+ z)), 2, 1, N)
+        y ~ LogDensity(normal_hmm_log_weights_logdensity, locations, scales, log_transition, log_initial)
+    end
+    fixed = @rkppl begin
+        a ~ Normal(0, 1); s ~ Exponential(1.0)
+        y .~ Normal.(a .+ x, s)
+    end
+    N = 4
+    T = repeat(log.([0.7 0.3; 0.4 0.6]), 1, 1, N - 1)
+    cases = (
+        ((; N, z = 0.1 .* (1:N), log_transition = T, log_initial = log.([0.6, 0.4])),
+         (; y = [0.3, 0.1, -0.4, 0.2]), hmm, ["N", "log_initial", "log_transition", "y", "z"]),
+        ((; x = [0.1, -0.3, 0.5]), (; a = 0.8, y = [0.2, -0.1, 0.9]), fixed, ["a", "x", "y"]))
+    for (data, observed, model, expected) in cases
+        plan = model(; data...) | observed
+        @test any(startswith("_rkppl_conditioned_") ∘ String, keys(plan.columns))
+        built = build_kernel(plan)
+        src = jax_source(built, plan)
+        names = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
+        @test sort(names) == expected
+        text = string(src)
+        @test !occursin("def prepare_data(_rkppl_conditioned_", text)
+        @test !occursin("\"_rkppl_conditioned_", text)
+        @test occursin("UNTRANSLATED = {}", text)
+        if rk_jax_available()
+            authored = merge(data, observed)
+            query = prepare_query(built, plan, :sampler)
+            u = 0.2 .* randn(Xoshiro(5), built.layout.total)
+            r = rk_jax_evaluate(src, "log_density", (u, (authored[Symbol(n)] for n in names)...);
                                 grad = true, prepare = true)
             @test r.value ≈ query(u) rtol = 1e-10
             reference = rk_fd_gradient(query, u)
