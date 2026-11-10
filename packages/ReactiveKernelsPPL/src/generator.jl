@@ -870,6 +870,7 @@ import .._dirichlet_slices_logpdf, .._ordered_normal_slices_logpdf
 import .._check_slice_vector_arg
 import .._mvnormal_cholesky_slices_pointwise, .._mvnormal_slices_pointwise
 import .._dirichlet_slices_pointwise, .._ordered_normal_slices_pointwise
+import .._icar_slices_pointwise
 import .._simplex_slices_constrain, .._simplex_slices_logjac
 import .._ordered_slices_constrain, .._ordered_slices_logjac
 end

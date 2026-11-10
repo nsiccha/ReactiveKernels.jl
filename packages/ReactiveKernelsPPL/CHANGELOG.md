@@ -16,6 +16,34 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.144
+
+- Independent ICAR fields over one graph: `eachrow(phi[1:K, 1:N]) .~
+  ICAR(node1, node2)` (field `k` is `phi[k, :]`) and `eachcol(phi[1:N, 1:K])
+  .~ ICAR(node1, node2)` (field `k` is `phi[:, k]`), with `K` and `N` data.
+  Each field has its own unit-scale ICAR prior over the shared edge list; the
+  density is the graph law `icar_rows_logdensity` / `icar_cols_logdensity`,
+  native and Enzyme Reverse, one density factor per field, and it translates
+  through `jax_source`. Lowering refused both with "rows or columns of
+  independent ICAR fields are not built yet". A per-field edge list
+  (`ICAR.(eachrow(E), …)`) is refused. Requires
+  ReactiveKernelsDistributionKernels 0.1.6. Snag `independent-icar-2e025fad`.
+
+## 0.1.143
+
+- A partition query or sampler whose keys hold each label once, such as one
+  `@plate` cell per subject partitioned by subject, runs each partition as
+  that one cell at one row (ReactiveKernels `plate_partition(…; single = true)`,
+  0.1.140, now the compat floor), and computes the subject-level values its
+  cell reads there as numbers instead of one-element arrays. Values are equal
+  (a design row times its coefficients is summed in column order, so a value
+  through it can differ in the last bits). On BRM's `unit_cost.jl` toys (24
+  subjects), one subject's local partition gradient went from 2,144 to 1,248
+  bytes (PK) and 9,440 to 7,712 bytes (joint PK/QT), and its time from 2.0–2.3
+  to 1.4–1.6 (PK) and 4.2–4.3 to 3.4–3.6 (joint) times its share of a
+  whole-cohort sweep, with bitwise equal values and gradients. Partitions
+  whose keys repeat a label are unchanged. Todo `1yggoad`.
+
 ## 0.1.142
 
 - `jax_source(built, plan)`: a data value the program reads only through its

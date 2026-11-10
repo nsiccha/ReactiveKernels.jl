@@ -62,9 +62,14 @@ end
 
 # Extract the native loop, retaining its hoisted values and operation tables.
 # Each chunk owns its coordinate cache; cells write disjoint output indices.
+# `deferred` holds the preparation of the arguments only the cells read, which
+# a plate program runs where its cell work starts (`_lower_authored_plate_native!`):
+# it is not in `body` yet, but it runs before this loop's call, so a chunk
+# receives the prepared arguments it reads. Without them a chunk read each one
+# as an unbound name (snag `web-sim-bruno-la-eb5f8859`).
 function _scheduled_prefix_loop!(runtime_ops, runtime_recipes, body, invariants,
         declarations, loopbody, callargs, index, previous, first_coordinate,
-        shares, output_axes)
+        shares, output_axes; deferred = nothing)
     domain, range, linear = gensym(:domain), gensym(:range), gensym(:linear)
     chunk = Expr(:block, :($previous = nothing), :($first_coordinate = true),
         declarations...,
@@ -72,6 +77,7 @@ function _scheduled_prefix_loop!(runtime_ops, runtime_recipes, body, invariants,
             Expr(:block, :($index = $domain[$linear]), loopbody.args...)),
         :(return nothing))
     bound = _local_symbols!(Set{Symbol}(), body)
+    deferred === nothing || foreach(statement -> _local_symbols!(bound, statement), deferred)
     _local_symbols!(bound, invariants)
     foreach(arg -> _source_symbols!(bound, arg), callargs)
     union!(bound, (_CONSTANTS_ARG, _CALLABLES_ARG))

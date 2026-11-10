@@ -31,12 +31,13 @@ end
 # slices). `:rows` / `:cols` slice a two-axis array, `:vector` is a
 # one-axis array drawn once; simplex and ordered slices are two-axis only
 # (their one-vector forms are `phi ~ Dirichlet(alpha)`,
-# `c ~ Ordered(Normal(m, s), K)`), and an ICAR field is one vector only.
+# `c ~ Ordered(Normal(m, s), K)`). ICAR fields are one vector or the rows /
+# columns of an array, independent fields over one shared graph.
 const _MV_SLICE_FAMILIES = Dict{Symbol,Tuple{Symbol,Symbol}}(
     Symbol(stem, :_, sl) => (stem, sl)
     for (stem, sls) in ((:mvnormal_cholesky, (:rows, :cols, :vector)),
         (:mvnormal, (:rows, :cols, :vector)), (:dirichlet, (:rows, :cols)),
-        (:ordered_normal, (:rows, :cols)), (:icar, (:vector,)))
+        (:ordered_normal, (:rows, :cols)), (:icar, (:rows, :cols, :vector)))
     for sl in sls)
 
 _is_slice_array(p::ArrayParameter) = haskey(_MV_SLICE_FAMILIES, p.family)
@@ -438,7 +439,11 @@ function _validate_array_slices(plan::StructuralPlan, p::ArrayParameter)
         end
         if role === :edges
             # An edge list is data: a name or a data-only expression, or a
-            # literal vector of node indices. Binding checks its values.
+            # literal vector of node indices, shared by every field. Binding
+            # checks its values.
+            _is_slice_iterator(a) && _fail(p.label, "array $(p.name): " *
+                "every `ICAR` field shares one edge list, got the per-field " *
+                "$(repr(a))")
             if a isa Expr && a.head === :vect
                 all(x -> x isa Integer && !(x isa Bool) && x >= 1, a.args) ||
                     _fail(p.label, "array $(p.name): an `ICAR` node vector " *
@@ -547,7 +552,8 @@ function _validate_array_slices_data(plan::StructuralPlan, p::ArrayParameter,
 end
 
 # The edge list of `phi[1:N] ~ ICAR(node1, node2)` is bound data: two
-# integer vectors of one length whose entries are node indices of `phi`.
+# integer vectors of one length whose entries are node indices of `phi`
+# (`N`: the length of each field, also for rows or columns of fields).
 # Data-only expressions evaluate here, as for any other data-only value.
 function _validate_icar_edges(plan::StructuralPlan, p::ArrayParameter, N::Int)
     edges = map(values(p.args)) do a
@@ -2056,8 +2062,7 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
                     pointwise = value, count)
             elseif p.name in plan.conditioned
                 value = Symbol(:_ppl_pointwise_, p.name)
-                density = copy(density)
-                density.args[1] = Symbol(replace(string(density.args[1]), "_logpdf" => "_pointwise"))
+                density = _slice_pointwise_call(p, density)
                 push!(stmts, :($value = $density))
                 push!(pointwise, p.name => value)
             end
@@ -2150,9 +2155,27 @@ function _slice_prior_call!(stmts::Vector{Expr}, p::ArrayParameter)
     return :($(_slice_density(Val(_slice_stem(p))))($o, $(p.name), $(vals...)))
 end
 
-# An ICAR field's density is RK's graph law `icar_logdensity`, called
-# directly so its edge plate composes into the model graph. Its ports are
-# names: the field, then the two node vectors.
+# The per-slice densities of a slice array (one per row / column), from its
+# summed density call: the family's `_pointwise` twin over the same
+# arguments. ICAR fields evaluate each field's law (`_icar_slices_pointwise`).
+function _slice_pointwise_call(p::ArrayParameter, density::Expr)
+    if _slice_stem(p) === :icar
+        o = _orientation_expr(_slice_orientation(_slice_kind(p)))
+        return Expr(:call, :_icar_slices_pointwise, o, density.args[2:end]...)
+    end
+    density = copy(density)
+    density.args[1] = Symbol(replace(string(density.args[1]), "_logpdf" => "_pointwise"))
+    return density
+end
+
+# An ICAR field's density is RK's graph law, called directly so its edge
+# plate composes into the model graph: `icar_logdensity` for one field,
+# `icar_rows_logdensity` / `icar_cols_logdensity` for the rows / columns of
+# an array, the sum of their independent fields' densities over the shared
+# edge list. Its ports are names: the field(s), then the two node vectors.
+_icar_law(::Val{:vector}) = :icar_logdensity
+_icar_law(::Val{:rows}) = :icar_rows_logdensity
+_icar_law(::Val{:cols}) = :icar_cols_logdensity
 function _icar_prior_call!(stmts::Vector{Expr}, p::ArrayParameter)
     ports = Any[p.name]
     for (i, a) in enumerate(values(p.args))
@@ -2164,8 +2187,8 @@ function _icar_prior_call!(stmts::Vector{Expr}, p::ArrayParameter)
             push!(ports, local_name)
         end
     end
-    return Expr(:call, GlobalRef(DistributionKernelSources, :icar_logdensity),
-        ports...)
+    return Expr(:call, GlobalRef(DistributionKernelSources,
+        _icar_law(Val(_slice_kind(p)))), ports...)
 end
 
 _slice_value_expr(a) = _is_array_literal(a) ? _float64_array_literal(a) :

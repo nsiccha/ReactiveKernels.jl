@@ -170,7 +170,7 @@ export hmm_state_posterior, normal_hmm_state_posterior, exponential_hmm_state_po
 export hmm_log_weights_state_posterior, normal_hmm_log_weights_state_posterior,
     exponential_hmm_log_weights_state_posterior
 export hmm_state_posterior_name, draw_hmm_states, draw_hmm_states!
-export icar_logdensity
+export icar_logdensity, icar_rows_logdensity, icar_cols_logdensity
 export categorical_logit, categorical_logit_ref
 export poisson, gamma, beta, binomial, negative_binomial2
 export beta_binomial
@@ -1841,6 +1841,42 @@ end
     squares = plate(node1, checked_node2) do i, j
         difference = phi[i] - phi[j]
         difference * difference
+    end
+    total = sum(squares)
+    return -0.5 * total
+end
+
+# K independent ICAR fields over one graph, the rows (`icar_rows_logdensity`,
+# field k = `phi[k, :]`) or the columns (`icar_cols_logdensity`, field k =
+# `phi[:, k]`) of one matrix: the sum of the K unit-scale ICAR densities, each
+# over the same edge list. The edge plate is the outer one, as in
+# `icar_logdensity`, and each edge cell sums its K squared differences over an
+# inner plate of the fields; both sums are total-only readers, so neither a
+# per-edge nor a per-field vector is filled. With no fields (K = 0) or no
+# edges the density is zero.
+@kernel icar_rows_logdensity(phi, node1, node2) = begin
+    checked_node2 = length(node2) == length(node1) ? node2 :
+        throw(DimensionMismatch("node1 and node2 must list the same number of edges"))
+    squares = plate(node1, checked_node2) do i, j
+        fields = plate(1:size(phi, 1)) do k
+            difference = phi[k, i] - phi[k, j]
+            difference * difference
+        end
+        sum(fields)
+    end
+    total = sum(squares)
+    return -0.5 * total
+end
+
+@kernel icar_cols_logdensity(phi, node1, node2) = begin
+    checked_node2 = length(node2) == length(node1) ? node2 :
+        throw(DimensionMismatch("node1 and node2 must list the same number of edges"))
+    squares = plate(node1, checked_node2) do i, j
+        fields = plate(1:size(phi, 2)) do k
+            difference = phi[i, k] - phi[j, k]
+            difference * difference
+        end
+        sum(fields)
     end
     total = sum(squares)
     return -0.5 * total

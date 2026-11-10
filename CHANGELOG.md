@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.140
+## 0.1.142
 
 - `jax_source` translates `besselix(nu, x)` and `besseli(nu, x)`
   (SpecialFunctions) of any order, a data value or one the program computes
@@ -45,6 +45,41 @@ are recorded in the git history only.
   translation", naming the function (BRM's periodic basis helper
   `_brm_hsgp_basis_state(...; anchor, mask)`, snag
   `jax-source-perio-96f952a3`).
+
+## 0.1.141
+
+- A `vectorize` or `prepare_batched` reader with a `NativeScheduling` of two
+  or more workers runs its data-only prefix plates again when a plate's cells
+  read an array argument. From 0.1.114 each scheduled chunk of such a plate
+  read the argument's broadcast preparation as an unbound name and the call
+  failed with `UndefVarError: ##plate_prepared#k not defined` (inside a
+  `TaskFailedException`), whatever the program. A one-thread process never
+  enters the prefix, so it showed only with two or more threads (snag
+  `web-sim-bruno-la-eb5f8859`).
+
+## 0.1.140
+
+- New: `plate_partition(…; single = true)` declares that every key holds each
+  label exactly once, so a partition is one cell of each named plate (one
+  subject's cell of a plate over subjects). The partition then runs that cell
+  at one `Int` row, as `plate_cell` does, instead of over a vector of one row.
+  A key that holds a label zero or several times throws `ArgumentError` at
+  evaluation. Without `single`, partitions are unchanged.
+- A plate cell, and a partition with `single = true`, computes the values it
+  reads at its one row as numbers where it can, instead of one-element arrays
+  with an Enzyme shadow each. A capture the cell reads outside every branch at
+  one position per cell asks for that one row as an `Int`; a value of one
+  element per row read there only by such reads or by other such values is a
+  number: a pointwise expression, a product `A * w` with a vector `w`, a column
+  `A[:, k]`, a direct gather `v[I]` or `A[I, k]` and a `vcat` of numbers and
+  vectors. Values are equal; a product row `A[r, :] * w` is summed in column
+  order, so values and gradients through it can differ from Base's product in
+  the last bits. An authored plate computed at rows, and any value a plate
+  reads as a lane, keep their one-row arrays. On an RKPPL partition sampler
+  over one cell per subject (24 subjects, 10 observations each), one subject's
+  local gradient went from 1.22–1.28 µs / 1,232 B to 0.45–0.47 µs / 592 B,
+  6.2–6.4 to 2.3–2.4 times its share of a whole-model gradient, with bitwise
+  equal values and gradients (todo `1yggoad`).
 
 ## 0.1.139
 
