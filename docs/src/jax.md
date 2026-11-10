@@ -239,7 +239,11 @@ A function that a recipe calls is translated if:
 - it has a `jax.numpy` counterpart (Base and LogExpFunctions functions, and
   SpecialFunctions through the package extension). `logbeta` is a helper the
   module defines, since `jax.scipy.special.betaln` (JAX 0.12) is accurate to
-  about 1e-6 in float64 once an argument reaches 8;
+  about 1e-6 in float64 once an argument reaches 8. So is `besselix(nu, x)`
+  (and `besseli`) of an order other than a literal 0 or 1, which JAX has no
+  function for: the power series below order 25 and x = 30, else the uniform
+  expansion in large order and the downward recurrence, within about 4e-13
+  of SciPy relative; `prepare_data` uses SciPy's `ive`;
 - it is a conversion that takes a type: `convert(T, x)` or `T(x)` to a float
   or integer type, `floor(Int, x)`, `ones(T, n)`. The type may come from a
   literal, a global or `where T` parameter in lowered code, or a type-level
@@ -249,7 +253,9 @@ A function that a recipe calls is translated if:
 - it is defined with `@traceable`, in which case its authored body is
   translated (in `prepare_data`, as a host function);
 - it is a prepared kernel, which becomes a module-level function of its plan;
-- or it is a plain function whose lowered code is straight-line.
+- or it is a plain function whose lowered code is straight-line. A keyword
+  call in it (`sum(x; dims = 2)`) translates as the same call in source does;
+  one with no translation raises naming the function.
 
 In that lowered code, module-qualified calls (`M.f(x)`), `getglobal(M, name)`
 of a module and name known while emitting, `Val` tags (`Val(:f)`,
@@ -261,10 +267,11 @@ args...)`): one whose body is straight-line translates to the arithmetic it
 reaches (ReactiveKernels 0.1.139).
 
 A package adds a translation for its own function with a method of
-`ReactiveKernels._jax_elementwise` (a scalar function's `jax` name) or
-`ReactiveKernels._jax_function_call`. A package's plain helper with branches
-that native code must keep as written records its source with
-`ReactiveKernels.@_record_source` (a leading `@inline` stays).
+`ReactiveKernels._jax_elementwise` (a scalar function's `jax` name),
+`ReactiveKernels._jax_elementwise_call` (one that reads the call's arguments,
+such as a literal order) or `ReactiveKernels._jax_function_call`. A package's
+plain helper with branches that native code must keep as written records its
+source with `ReactiveKernels.@_record_source` (a leading `@inline` stays).
 
 Shape tests decide while tracing. Shapes are known then, and so are the
 prepared integers (`StaticInt`s); `size(x, d)` past `x`'s rank, or of a
@@ -294,6 +301,11 @@ recipe and the construct:
   whose padding would sit on an inner axis;
 - `history` scans over a padded (ragged) sequence or with a named-tuple
   history.
+
+In the JAX functions `besselix` and `besseli` of a negative non-integer order
+are NaN (Julia's need the Bessel function K; `prepare_data`, with SciPy,
+computes them), and their derivative in the order is NaN for every order, as
+Julia's derivative rule gives.
 
 Frozen definitions (`frozen_values`) come from another binding, so
 `prepare_data` takes their values, as `DATA` lists them.
