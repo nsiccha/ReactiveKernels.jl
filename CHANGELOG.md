@@ -16,6 +16,30 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.145
+
+- `jax_source`: `jax.grad` through a `logaddexp` whose two inputs are both
+  `-Inf` is finite, as natively. A hidden-Markov law
+  (`hmm_log_weights_logdensity` and its kin) whose transition weights have a
+  state that no move reaches at some step (a `-Inf` weight; a left-to-right
+  chain) had the right value and a gradient that was NaN in every entry
+  (snag `jax-grad-of-the-3dac142a`). Both `logaddexp`s, ReactiveKernels'
+  tie-exact one (mixture and log-sum-exp folds, the hidden-Markov forward
+  pass) and `LogExpFunctions.logaddexp`, were `jnp.logaddexp`, whose
+  derivative at a tie of two `-inf`s is NaN; reverse mode multiplies even
+  the zero cotangent of such an absorbed term by it. Both are now the
+  module's `_rk_logaddexp` helper, the tie-exact form written as JAX
+  selections: the same values, non-finite inputs included, the (1/2, 1/2)
+  derivative at a finite tie as before, and at an infinite tie, whose value
+  is its first argument, (1, 0), as both give natively.
+- `jax_source`: likewise `LogExpFunctions.logsumexp` of a traced vector whose
+  entries are all `-Inf` (a hand-written forward pass over such a state):
+  `jsp.logsumexp`'s derivative there is NaN. It is now the module's
+  `_rk_logsumexp` helper, the maximum-shifted log-sum-exp: the same values,
+  the softmax derivative at finite entries, and the maximum itself, with the
+  derivative 0, when that is not finite, as native Enzyme gives. Host and
+  static values, which are never differentiated, keep SciPy's `logsumexp`.
+
 ## 0.1.144
 
 - `jax_source(...; data)`: `prepare_data` translates `sort`, `sort!`,

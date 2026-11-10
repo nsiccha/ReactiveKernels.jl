@@ -1,7 +1,7 @@
 using ReactiveKernels
 using Test
 using LinearAlgebra: dot
-using LogExpFunctions: log1mexp
+using LogExpFunctions: log1mexp, logaddexp, logsumexp
 using SpecialFunctions: besseli, besselix
 
 include(joinpath(@__DIR__, "jax_python.jl"))
@@ -845,6 +845,35 @@ end
     total = jax_fold(checked, n)
     return total
 end
+# Log-sum-exp terms whose inputs are all -Inf (snag jax-grad-of-the-3dac142a:
+# a hidden-Markov state that no move reaches, log weight -Inf): such a term is
+# -Inf, the next one absorbs it, and the gradient stays finite, as natively.
+# A plate cell with both `logaddexp`s, and the fold above over a data length.
+@kernel jax_unreached_cells(x::Vector{Float64}, a::Float64, w::Vector{Float64}) = begin
+    cells = plate(eachindex(x)) do i
+        unreached = ReactiveKernels._tie_exact_logaddexp(a * x[i] + w[i], w[i])
+        also = logaddexp(a * x[i] + w[i], w[i])
+        ReactiveKernels._tie_exact_logaddexp(a * x[i], unreached) + logaddexp(-a, also)
+    end
+    total = sum(cells)
+    return total
+end
+@kernel jax_unreached_fold(x::Vector{Float64}, a::Float64, w::Vector{Float64}) = begin
+    terms = a .* x .+ w
+    total = logaddexp(-a, jax_fold(terms, length(terms)))
+    return total
+end
+# The same through `logsumexp`: of a plate it reads alone (native streams it)
+# and of a broadcast, -Inf when every entry is.
+@kernel jax_unreached_lse(x::Vector{Float64}, a::Float64, w::Vector{Float64}) = begin
+    cells = plate(eachindex(x)) do i
+        a * x[i] + w[i]
+    end
+    streamed = logsumexp(cells)
+    direct = logsumexp(a .* x .+ w)
+    total = logaddexp(a, streamed) + logaddexp(-a, direct)
+    return total
+end
 # Julia's unit indices: past a vector's rank (a literal and a computed one),
 # of a number, and `size` past the rank; `dropdims` of a summed axis.
 @kernel jax_unit_index(x::Vector{Float64}, a::Float64) = begin
@@ -1322,6 +1351,91 @@ end
         native = prepare(jax_prep_stack; have = (:a, :x), want = :total)
         r = rk_jax_evaluate(stacked, "kernel", (0.7, xs); grad = true, prepare = true)
         @test r.value ≈ native(0.7, xs) rtol = 1e-12
+    end
+end
+
+@testset "jax_source: log-sum-exp whose inputs are all -Inf" begin
+    x = [1.0, 2.0, 3.0, -0.5]
+    # Each `w` but the last has a cell, a fold step or a log-sum-exp whose
+    # inputs are all -Inf; the last has no -Inf at all.
+    ws = ([0.0, -Inf, 0.5, -Inf], [-Inf, -Inf, 0.0, -Inf], fill(-Inf, 4), [0.3, -0.2, 0.0, 0.1])
+    have = (:a, :x, :w)
+    kernels = (jax_unreached_cells, jax_unreached_fold, jax_unreached_lse)
+    for k in kernels
+        text = string(jax_source(k; have, want = :total))
+        # Both `logaddexp`s are the module's `_rk_logaddexp` and `logsumexp`
+        # its `_rk_logsumexp`, never `jnp.logaddexp` or `jsp.logsumexp`, whose
+        # derivatives there are NaN.
+        @test occursin("def _rk_logaddexp(", text) && !occursin("jnp.logaddexp", text)
+        @test !occursin("jsp.logsumexp", text)
+    end
+    @test occursin("def _rk_logsumexp(", string(jax_source(jax_unreached_lse; have, want = :total)))
+    if !rk_jax_available()
+        @test_skip false
+    else
+        for k in kernels, w in ws
+            src = jax_source(k; have, want = :total)
+            native = prepare(k; have, want = :total)
+            r = rk_jax_evaluate(src, "kernel", (0.7, x, w); grad = true)
+            @test isfinite(r.value)
+            @test r.value ≈ native(0.7, x, w) rtol = 1e-12
+            @test isfinite(r.grad)
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x, w), [0.7])) rtol = 1e-6 atol = 1e-9
+        end
+        # `_rk_logsumexp`: the values of LogExpFunctions' `logsumexp`, no
+        # entries and non-finite ones included; the softmax at finite entries;
+        # when every entry is -Inf, the derivative 0, as native Enzyme's.
+        for v in ([0.3, -1.2, 2.0], [0.5, 0.5], [0.0, -Inf], fill(-Inf, 3), Float64[],
+                  [Inf, 0.0], [NaN, 0.0])
+            program = """
+                import jax, numpy as np
+                jax.config.update("jax_enable_x64", True)
+                import jax.numpy as jnp
+                $(ReactiveKernels._JAX_PRELUDE["_rk_logsumexp"])
+                v = np.asarray($(_rk_py(v)), dtype=np.float64)
+                g = jax.grad(_rk_logsumexp)(v)
+                print(repr(float(_rk_logsumexp(v))), *(repr(float(d)) for d in g))
+                """
+            out = parse.(Float64, split(read(`$RK_JAX_PYTHON -c $program`, String)))
+            value, g = out[1], out[2:end]
+            expected = logsumexp(v)
+            @test isfinite(expected) ? isapprox(value, expected; rtol = 1e-15) :
+                  isequal(value, expected)
+            if all(isfinite, v)
+                @test g ≈ exp.(v .- expected) rtol = 1e-14
+            elseif !isempty(v) && all(==(-Inf), v)
+                @test all(iszero, g)
+            end
+        end
+        # `_rk_logaddexp`: the values of both `logaddexp`s, non-finite inputs
+        # and ties included, and the derivatives of `_tie_exact_logaddexp`:
+        # (1/2, 1/2) at a finite tie, (1, 0) at an infinite one.
+        same(g, d) = isnan(d) ? isnan(g) : g == d
+        for (u, v, du, dv) in ((0.3, 0.3, 0.5, 0.5), (-Inf, -Inf, 1.0, 0.0), (Inf, Inf, 1.0, 0.0),
+                               (1.0, -Inf, 1.0, 0.0), (-Inf, 1.0, 0.0, 1.0), (Inf, -Inf, 1.0, 0.0),
+                               (2.0, -1.0, 0.0, 0.0), (NaN, 1.0, NaN, NaN))
+            program = """
+                import jax, numpy as np
+                jax.config.update("jax_enable_x64", True)
+                import jax.numpy as jnp
+                $(ReactiveKernels._JAX_PRELUDE["_rk_logaddexp"])
+                u, v = np.float64($(_rk_py(u))), np.float64($(_rk_py(v)))
+                g = jax.grad(_rk_logaddexp, argnums=(0, 1))(u, v)
+                print(repr(float(_rk_logaddexp(u, v))), repr(float(g[0])), repr(float(g[1])))
+                """
+            value, gu, gv = parse.(Float64, split(read(`$RK_JAX_PYTHON -c $program`, String)))
+            for expected in (logaddexp(u, v), ReactiveKernels._tie_exact_logaddexp(u, v))
+                @test isfinite(expected) ? isapprox(value, expected; rtol = 1e-15) :
+                      isequal(value, expected)
+            end
+            if isfinite(u) && isfinite(v) && u != v
+                # A finite non-tie: the derivatives of log(exp(u) + exp(v)).
+                @test gu ≈ exp(u - value) rtol = 1e-14
+                @test gv ≈ exp(v - value) rtol = 1e-14
+            else
+                @test same(gu, du) && same(gv, dv)
+            end
+        end
     end
 end
 

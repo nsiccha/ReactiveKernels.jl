@@ -272,6 +272,17 @@ const _JAX_CASES = (
         y ~ LogDensity(normal_hmm_log_weights_logdensity, locations, s, log_transition, log_initial)
     end))(; log_transition = log.([0.9 0.1; 0.2 0.8]), log_initial = log.([0.5, 0.5])) |
         (; y = sin.(1:20)),
+    # Structural zeros (snag jax-grad-of-the-3dac142a): a left-to-right chain
+    # (state 2 never returns to state 1) starting in state 1, where no move
+    # reaches state 2 at step 2, so its incoming log-sum-exp folds two -Inf.
+    # `jnp.logaddexp` made every gradient entry NaN there.
+    hmm_unreached = () -> (@rkppl(begin
+        a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+        locations = [a, b]
+        y ~ LogDensity(normal_hmm_log_weights_logdensity, locations, s, log_transition, log_initial)
+    end))(; log_transition = cat([log(0.5) -Inf; -Inf -Inf], [log(0.5) log(0.5); -Inf 0.0],
+                                 [log(0.5) log(0.5); -Inf 0.0]; dims = 3),
+           log_initial = [0.0, -Inf]) | (; y = [0.3, 0.1, -0.4, 0.2]),
 )
 # ICAR priors (snag independent-icar-2e025fad): one field over a graph, and K
 # independent fields over the same graph as the rows or the columns of one
