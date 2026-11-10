@@ -1961,6 +1961,22 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(in), args::Vector{_PyVal}
     _PyVal("jnp.isin(" * x.code * ", jnp.asarray(" * t.code * "))", Bool)
 end
 
+# A matrix literal of numbers (`[a b; c d]`, lowered `hvcat((2, 2), a, b, c, d)`)
+# with a literal row shape.
+function _jax_function_call(ctx::_JaxContext, ::typeof(hvcat), args::Vector{_PyVal})
+    m = match(r"^\(([0-9]+(?:, [0-9]+)*),?\)$", args[1].code)
+    xs = args[2:end]
+    m !== nothing && all(a -> a.T isa Type && a.T <: Number, xs) ||
+        return _jax_traceable_or_lowered(ctx, hvcat, args)
+    widths = parse.(Int, split(m.captures[1], ", "))
+    allequal(widths) && sum(widths) == length(xs) ||
+        _jax_error("`hvcat` with rows of unequal widths", _jax_where(ctx))
+    rows = [xs[sum(widths[1:i-1]; init = 0)+1:sum(widths[1:i])] for i in eachindex(widths)]
+    np = ctx.host === nothing ? "jnp." : "np."
+    code = np * "array([" * join(("[" * join((x.code for x in r), ", ") * "]" for r in rows), ", ") * "])"
+    _PyVal(code, Matrix{promote_type((x.T for x in xs)...)}, all(x -> x.static, xs))
+end
+
 # `merge(a, b)` of named tuples (tuples of their fields, in order): each
 # field of the merged type from the last argument that has it.
 function _jax_function_call(ctx::_JaxContext, ::typeof(merge), args::Vector{_PyVal})
@@ -2343,6 +2359,21 @@ function _jax_allocation_size(ctx::_JaxContext, n::_PyVal)
                _jax_where(ctx))
 end
 
+# `I(n)` (a `UniformScaling` called with a size): the n×n identity, scaled.
+# When `n` is data with a static bound (a ragged cell's length) the matrix is
+# allocated at the bound, its rows and columns past `n` padding the extent
+# marks, as a padded vector's are.
+function _jax_call_positional(ctx::_JaxContext, J::LinearAlgebra.UniformScaling,
+                              args::Vector{_PyVal})
+    length(args) == 1 && args[1].T isa Type && args[1].T <: Integer ||
+        _jax_error("`I` called with `", join((a.T for a in args), ", "), "`", _jax_where(ctx))
+    size, extent = _jax_allocation_size(ctx, only(args))
+    np = ctx.host === nothing ? "jnp." : "np."
+    code = np * "eye(" * size * ")"
+    J.λ == true || (code = _py_infix("*", [_jax_literal(J.λ).code, code]))
+    _PyVal(code, typeof(J(1)), false, extent)
+end
+
 # A Julia type called as a function: a conversion.
 function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
     isempty(args) && Base.issingletontype(T) && return _PyVal("None", T)
@@ -2359,6 +2390,13 @@ function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
     if ctx.host !== nothing
         v = _host_construct(ctx, T, args)
         v === nothing || return v
+    end
+    # `Diagonal(v)` of a vector: the dense diagonal matrix (padded alike).
+    if T === LinearAlgebra.Diagonal && length(args) == 1 && args[1].T isa Type &&
+       args[1].T <: AbstractVector{<:Number}
+        v = only(args)
+        return _PyVal("jnp.diag(" * v.code * ")", LinearAlgebra.Diagonal{eltype(v.T),v.T}, false,
+                      v.extent)
     end
     if T <: AbstractArray && !isempty(args) && args[1].T === UndefInitializer
         dims = args[2:end]
@@ -3190,8 +3228,11 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         _jax_emit!(ctx, result * " = " * call)
         return [_PyVal(result, Vector{E})]
     end
-    if E <: AbstractVector
-        R == 1 || _jax_error("a plate of rank ", R, " whose cell returns a vector", _jax_where(ctx))
+    # A cell returning a vector (or a square matrix, a law's covariance in a
+    # ragged cell) stacks along a new leading axis; a padded cell result
+    # carries its length (its size) per cell.
+    if E <: AbstractVector || E <: AbstractMatrix
+        R == 1 || _jax_error("a plate of rank ", R, " whose cell returns an array", _jax_where(ctx))
         result = _jax_fresh(ctx, :plate_value)
         lengths = _jax_fresh(ctx, :plate_lengths)
         if only(with_length)

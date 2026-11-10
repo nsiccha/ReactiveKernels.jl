@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.146
+
+- `jax_source`: `I(n)` (a `UniformScaling` called with a size) is the n×n
+  identity, padded to its static bound when `n` is data; `Diagonal(v)` of a
+  vector is the dense diagonal matrix; a matrix literal of numbers
+  (`[a b; c d]`, `hvcat`) translates; and a plate whose cell returns a
+  square matrix stacks the matrices, each cell's size its extent, as a cell
+  returning a vector does.
+
 ## 0.1.145
 
 - `jax_source` translates `cumsum(x; dims = d)` as `jnp.cumsum` along the

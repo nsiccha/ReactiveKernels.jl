@@ -1,4 +1,4 @@
-using ReactiveKernels, ReactiveKernelsPPL, Random, Test
+using ReactiveKernels, ReactiveKernelsPPL, Random, Test, LinearAlgebra
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal_hmm_log_weights_logdensity
 
 include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
@@ -302,6 +302,21 @@ const _JAX_CASES = (
     # A hidden-Markov law (ODLProject:ap1): shape checks decided while
     # tracing, a history scan over the (step, state) cells, and folds over
     # the states as loops.
+    # A multivariate normal per ragged cell (an empty row included): a
+    # Cholesky factor of the cell's leading block, its padding an identity.
+    mvnormal_cells = () -> (@rkppl(begin
+        mu ~ Normal(0, 1); s ~ Exponential(1.0)
+        @plate for g in eachindex(y)
+            y[g] ~ MvNormal(fill(mu, length(y[g])), s^2 * I(length(y[g])))
+        end
+    end))() | (; y = [[0.1, 0.2, 0.0], Float64[], [0.0, 0.1]]),
+    # A dense covariance literal per cell.
+    mvnormal_dense = () -> (@rkppl(begin
+        mu ~ Normal(0, 1); s ~ Exponential(1.0); r ~ Uniform(-0.5, 0.5)
+        @plate for g in eachindex(y)
+            y[g] ~ MvNormal(fill(mu, 2), [s^2 r*s^2; r*s^2 s^2])
+        end
+    end))() | (; y = [[0.1, 0.2], [0.3, -0.1], [0.0, 0.1]]),
     hmm_law = () -> (@rkppl(begin
         a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
         locations = [a, b]

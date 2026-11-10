@@ -16,6 +16,16 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.148
+
+- `jax_source(built, plan)`: a multivariate normal observed per plate cell
+  (`y[g] ~ MvNormal(mu, Sigma)`, `MvNormalCholesky`) translates, ragged cells
+  and empty rows included: the density through the lower Cholesky factor of
+  the cell's leading block, its padding an identity block, with a runtime
+  check that the covariance is positive definite, as native has. The cell's
+  `LogDensity` value translates as the call of its law. Requires
+  ReactiveKernels 0.1.146.
+
 ## 0.1.147
 
 - `jax_source(built, plan)`: `prepare_data` takes a conditioned
