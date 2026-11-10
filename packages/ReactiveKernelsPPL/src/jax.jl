@@ -86,6 +86,13 @@ function ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan;
         ex isa Symbol && !haskey(data, ex) && haskey(data, nm) &&
             (data = merge(data, NamedTuple{(ex,)}((data[nm],))))
     end
+    # A definition that is no data value of the program (`g = prep(labels)`,
+    # read as `g.n`) and has no host translation is an input of `prepare_data`
+    # in its place: the binding's own value types it.
+    for (nm, _) in definitions
+        haskey(data, nm) || !_holds_bound_value(plan, plan.columns, nm) ||
+            (data = merge(data, NamedTuple{(nm,)}((_bound_value(plan, plan.columns, nm),))))
+    end
     defined = Set{Symbol}(first.(definitions))
     # The model's own docstrings (`rkppl_documentation`), by author path.
     authored = rkppl_documentation(plan)
@@ -229,6 +236,19 @@ function _jax_data_definitions(plan::StructuralPlan, names)
         elseif haskey(exprs, nm) && !_is_bound_value_call(exprs[nm])
             found[nm] = definition(nm)
         end
+    end
+    # The data-only values the program computes from a definition and the
+    # binding holds no column of (`g = prep(labels)`, whose fields `g.n` and
+    # `g.pos` the program reads): when the program's recipe of one has no
+    # translation, `jax_source` takes the value from its definition instead
+    # (and `prepare_data` drops one nothing reads). A frozen value is never
+    # recomputed from its expression.
+    held = plan.data_values === nothing ? Symbol[] :
+        lock(() -> collect(Symbol, keys(plan.data_values.values)), plan.data_values.lock)
+    for nm in held
+        nm in available || haskey(found, nm) || haskey(plan.frozen.values, nm) ||
+            !haskey(exprs, nm) || _is_bound_value_call(exprs[nm]) ||
+            (found[nm] = definition(nm))
     end
     # The definitions those read that are not data values of the program
     # (`angle = x ./ period` read only by a definition `cos.(angle)`): host

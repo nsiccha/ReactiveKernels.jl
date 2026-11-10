@@ -92,7 +92,11 @@ inputs:
 - `UNTRANSLATED`, each data-only definition `prepare_data` takes as an input
   instead of computing it, with the reason: one without a host translation,
   or a derived definition whose binding guards missing observations. It is
-  `{}` when every definition is computed. A model whose `UNTRANSLATED` is
+  `{}` when every definition is computed. A definition the program reads by
+  its fields (`g = prep(labels)`, read as `g.n` and `g.pos`, a named tuple)
+  is such an input too when `prep` has no translation: pass it as a `dict` by
+  field name (or its values in field order), and `prepare_data` computes the
+  fields the program reads from it, a declared array's extent included. A model whose `UNTRANSLATED` is
   not empty is **not supported for standalone preparation from raw data**:
   supplying the Julia binder's values for those inputs runs it, but that is
   not a standalone module, so a consumer's standalone check asserts
@@ -168,7 +172,13 @@ JAX code:
   `prepare_data` then takes what the expressions read instead of the values
   they define. `jax_source(built, plan)` passes the binding's data-only
   definitions this way. One without a host translation stays an input,
-  listed with its reason in the module's `UNTRANSLATED`.
+  listed with its reason in the module's `UNTRANSLATED`. A definition may
+  also name a data-only value the program computes rather than reads as
+  data (a named tuple an untranslatable helper returns): when the program's
+  recipe of that value has no translation on the host or in the functions,
+  or a value `keep` names reads it, the value comes from its definition, so
+  `prepare_data` computes what the program reads from it. A definition no
+  data input reads is not computed.
 
 The functions' inputs have static shapes, so they also run under `jax.jit`
 with the prepared data as arguments: `jax.jit(model.log_density)(u,

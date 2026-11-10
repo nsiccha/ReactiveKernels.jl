@@ -108,9 +108,13 @@ mutable struct _JaxModule
     # graph, `host_graph`) to the functions: its host translation's error.
     host_reasons::Dict{Int,JAXEmissionError}
     host_graph::Any
+    # The names `jax_source`'s `definitions` give a value of: a data-only
+    # recipe of one of them that neither side translates takes its value from
+    # the definition instead (`_JaxPromote`).
+    host_definitions::Set{Symbol}
 end
 _JaxModule() = _JaxModule(String[], Dict{Any,Any}(), Set{String}(), 0,
-                          Dict{Int,JAXEmissionError}(), nothing)
+                          Dict{Int,JAXEmissionError}(), nothing, Set{Symbol}())
 
 # Translation state: the module, the current function scope, the current
 # recipe (for messages) and the module that resolves its source's globals.
@@ -3040,11 +3044,13 @@ function _jax_plan_recipe!(ctx::_JaxContext, p::Plan, recipe::Recipe)
     ctx.host === nothing && p.graph === ctx.mod.host_graph &&
         haskey(ctx.mod.host_reasons, recipe.id) || return _jax_plan_recipe_body!(ctx, p, recipe)
     # A data-only recipe `prepare_data` left to the functions: when they cannot
-    # compute it either, the error names both reasons.
+    # compute it either, the error names both reasons, unless a definition
+    # gives its values (`_JaxPromote`).
     try
         _jax_plan_recipe_body!(ctx, p, recipe)
     catch e
         e isa JAXEmissionError || rethrow()
+        _jax_promotable(ctx.mod.host_definitions, recipe) && throw(_JaxPromote(recipe.id))
         throw(JAXEmissionError(rstrip(e.message, '.') * ". The recipe reads data alone, " *
                                "and `prepare_data` does not compute it on the host either: " *
                                ctx.mod.host_reasons[recipe.id].message))
@@ -3693,10 +3699,17 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
     # A definition given as a `JAXEmissionError` (its reason) is not translated.
     untranslated = Dict{Symbol,JAXEmissionError}(n => ex for (n, ex) in something(defs, ())
                                                  if ex isa JAXEmissionError)
+    # Data-only recipes whose values the definitions give instead, as data
+    # inputs of the program: each one's recipe has no host translation, and
+    # the functions cannot compute it either, or a value `keep` names reads it
+    # (`g = prep(labels)`, whose field `g.n` sizes a block).
+    promoted = Set{Int}()
+    defined = Set{Symbol}(first(d) for d in something(defs, ()))
     while true
         try
             return _jax_module_text(plans, types, constants, doc,
-                                    (data, excluded, defs, untranslated, keep, reasons);
+                                    (data, excluded, defs, untranslated, keep, reasons,
+                                     promoted);
                                     function_docs)
         catch e
             if e isa _HostUnsupportedDefinition && !haskey(untranslated, e.name)
@@ -3704,11 +3717,54 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
             elseif e isa _HostUnsupported && !(e.recipe in excluded)
                 push!(excluded, e.recipe)
                 reasons[e.recipe] = e.error
+            elseif e isa _JaxPromote && !(e.recipe in promoted)
+                push!(promoted, e.recipe)
+            elseif e isa _KeepUnavailable
+                more = setdiff(_jax_upstream_recipes(plans, e.name, excluded, defined), promoted)
+                isempty(more) && throw(ArgumentError(
+                    "jax_source: `keep` names `$(e.name)`, which is no data-only value of the program"))
+                union!(promoted, more)
             else
                 rethrow()
             end
         end
     end
+end
+
+# A data-only recipe left to the functions (`_HostUnsupported`) that they
+# cannot compute either, and whose values all have definitions.
+struct _JaxPromote <: Exception
+    recipe::Int
+end
+# A value `keep` names that no data-only recipe computes.
+struct _KeepUnavailable <: Exception
+    name::Symbol
+end
+_jax_promotable(defined, r::Recipe) = !isempty(r.outputs) && all(o -> o.name in defined, r.outputs)
+
+# The `excluded` recipes upstream of the values named `name` in `plans` whose
+# values all have definitions (`defined`).
+function _jax_upstream_recipes(plans, name::Symbol, excluded, defined)
+    found = Set{Int}()
+    for (_, (p, _)) in plans
+        g = p.graph
+        producer = Dict{ValueId,Recipe}()
+        for r in p.recipes, o in r.outputs
+            get!(producer, canon_id(g, o.id), r)
+        end
+        queue = [canon_id(g, o.id) for r in p.recipes for o in r.outputs if o.name === name]
+        seen = Set{ValueId}()
+        while !isempty(queue)
+            id = pop!(queue)
+            id in seen && continue
+            push!(seen, id)
+            r = get(producer, id, nothing)
+            r === nothing && continue
+            r.id in excluded && _jax_promotable(defined, r) && push!(found, r.id)
+            foreach(v -> push!(queue, canon_id(g, v.id)), r.inputs)
+        end
+    end
+    found
 end
 
 const _JAX_HOST_HEADER = """
@@ -3728,11 +3784,12 @@ function _jax_module_text(plans, types, constants, doc, prepare; function_docs =
             push!(functions, f)
         end
     else
-        data, excluded, defs, untranslated, keep, reasons = prepare
+        data, excluded, defs, untranslated, keep, reasons, promoted = prepare
         merge!(mod.host_reasons, reasons)
         mod.host_graph = first(plans).second[1].graph
+        defs === nothing || union!(mod.host_definitions, (first(d) for d in defs))
         meta = _jax_prepared_functions!(mod, bodies, functions, plans, types, data, excluded,
-                                        defs, untranslated; keep, function_docs)
+                                        defs, untranslated; keep, function_docs, promoted)
         constants = merge(constants, meta)
     end
     constant_lines = String[]
@@ -3770,12 +3827,14 @@ function _jax_module_text(plans, types, constants, doc, prepare; function_docs =
 end
 
 # The symbols an expression reads, in order of first appearance (a call's
-# function and a field name included; callers keep the ones they know).
+# function included; callers keep the ones they know). A field read `g.n`
+# reads `g`; a dotted call `cos.(angle)` reads `cos` and its arguments.
 function _jax_symbols_read!(out::Vector{Symbol}, ex)
     if ex isa Symbol
         ex in out || push!(out, ex)
     elseif ex isa Expr
-        foreach(a -> _jax_symbols_read!(out, a), ex.head === :. ? ex.args[1:1] : ex.args)
+        field = ex.head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode
+        foreach(a -> _jax_symbols_read!(out, a), field ? ex.args[1:1] : ex.args)
     end
     out
 end
@@ -3786,8 +3845,27 @@ end
 function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, types, data,
                                   excluded, defs = nothing,
                                   untranslated = Dict{Symbol,JAXEmissionError}(); keep = (),
-                                  function_docs = NamedTuple())
+                                  function_docs = NamedTuple(), promoted = Set{Int}())
     ports = data isa NamedTuple ? Set(keys(data)) : Set(data)
+    # A promoted recipe's values (`_JaxPromote`) are data inputs of every
+    # function, which its definitions give: the recipe is not run.
+    if !isempty(promoted)
+        values = Value[]
+        seen = Set{ValueId}()
+        for (_, (p, _)) in plans, r in p.recipes
+            r.id in promoted || continue
+            for o in r.outputs
+                cid = canon_id(p.graph, o.id)
+                cid in seen && continue
+                push!(seen, cid)
+                push!(values, o)
+            end
+        end
+        plans = [fname => (_partial_subplan(p, [p.have; values], p.want,
+                                            Recipe[r for r in p.recipes if !(r.id in promoted)]), w)
+                 for (fname, (p, w)) in plans]
+        ports = union(ports, (v.name for v in values))
+    end
     split = _jax_prepare_split(plans, ports, excluded; keep)
     p1 = first(plans).second[1]
     # Raw data enters host code, so its types need not be concrete (a column
@@ -3796,16 +3874,32 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     for (k, v) in enumerate(p1.have)
         have_types[v.name] = data isa NamedTuple && haskey(data, v.name) ? typeof(data[v.name]) :
             types isa NamedTuple && haskey(types, v.name) ? types[v.name] :
-            types isa Tuple ? types[k] : valtype(v)
+            types isa Tuple && k <= length(types) ? types[k] : valtype(v)
     end
     for v in split.remaining
         _concrete_value_type(have_types[v.name]) || throw(ArgumentError(
             "jax_source: the HAVE value `$(v.name)` has type `$(have_types[v.name])`; pass a " *
             "concrete type with `types`"))
     end
-    # The definitions the host computes, in order: those with a translation.
+    # The definitions the host computes, in order: those with a translation
+    # that a data input reads, directly or through other definitions (one of
+    # a value the program computes is read only once it is promoted).
+    needed = Set{Symbol}(v.name for v in split.raw)
+    if defs !== nothing
+        by_name = Dict{Symbol,Any}(defs)
+        queue = collect(needed)
+        while !isempty(queue)
+            nm = pop!(queue)
+            haskey(untranslated, nm) && continue
+            ex = get(by_name, nm, nothing)
+            ex === nothing && continue
+            for r in _jax_symbols_read!(Symbol[], ex)
+                haskey(by_name, r) && !(r in needed) && (push!(needed, r); push!(queue, r))
+            end
+        end
+    end
     computed = defs === nothing ? Pair{Symbol,Any}[] :
-        Pair{Symbol,Any}[d for d in defs if !haskey(untranslated, first(d))]
+        Pair{Symbol,Any}[d for d in defs if !haskey(untranslated, first(d)) && first(d) in needed]
     defined = Set{Symbol}(first.(computed))
     params = Any[v for v in split.raw if !(v.name in defined)]
     raw_types = Any[have_types[v.name] for v in params]
@@ -3845,7 +3939,8 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     end
     lines, prepared_types, param_names = _jax_prepare_function!(mod, split, raw_types,
         prepared_names, native;
-        params, definitions = [(n, ex, get(have_types, n, nothing)) for (n, ex) in computed])
+        params, definitions = [(n, ex, get(have_types, n, nothing)) for (n, ex) in computed],
+        untranslated)
     push!(bodies, join(lines, "\n"))
     # The inputs by the names `prepare_data` takes them (a name that is no
     # Python identifier, such as a submodel's `v.mask`, is spelled `v_mask`).
@@ -3873,7 +3968,8 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
                                ragged = _jax_ragged(T))
                          for (n, T) in zip(param_names, raw_types)],
                  UNTRANSLATED = Dict{String,String}(String(n) => untranslated[n].message
-                     for (n, _) in defs if haskey(untranslated, n))))
+                     for (n, _) in defs if haskey(untranslated, n) &&
+                         any(v -> v.name === n, params))))
 end
 
 # A value's dtype and rank, as module metadata describes an input.

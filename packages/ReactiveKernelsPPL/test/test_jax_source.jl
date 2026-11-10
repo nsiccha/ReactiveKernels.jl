@@ -29,10 +29,18 @@ function jax_raw_data(plan, src)
     # A value the program reads only through its bound copy, and the observed
     # value of a conditioned declaration, are passed by their authored names;
     # the plan holds them as `_rkppl_value_<name>` and
-    # `_rkppl_conditioned_<name>`.
-    internal(n) = get(() -> plan.columns[Symbol("_rkppl_value_", n)], plan.columns,
-                      Symbol("_rkppl_conditioned_", n))
-    Tuple(get(() -> internal(n), plan.columns, Symbol(n)) for n in names)
+    # `_rkppl_conditioned_<name>`. A definition `prepare_data` takes as an
+    # input (`UNTRANSLATED`) is the binding's own value of it (a submodel's
+    # `r.g` is the input `r_g`).
+    held = plan.data_values === nothing ? Symbol[] : collect(keys(plan.data_values.values))
+    function value(n)
+        for k in (Symbol(n), Symbol("_rkppl_value_", n), Symbol("_rkppl_conditioned_", n))
+            haskey(plan.columns, k) && return plan.columns[k]
+        end
+        ReactiveKernelsPPL._bound_value(plan, plan.columns,
+            only(h for h in held if replace(String(h), "." => "_") == n))
+    end
+    Tuple(value(n) for n in names)
 end
 
 # A data helper with a loop and no recorded source: no host translation.
@@ -657,6 +665,97 @@ end
             @test r.value ≈ query(u) rtol = 1e-12
             @test r.grad ≈ rk_fd_gradient(query, u) rtol = 1e-6
         end
+    end
+end
+
+# A data-only value the program computes with a helper that has no
+# translation (it fills a `Dict` in a loop) and reads by its fields, as BRM's
+# `car_graph` bodies do: the value is an input of `prepare_data`, named in
+# `UNTRANSLATED` and passed as a dict by field name, and `prepare_data`
+# computes its field reads (a block's extent, a gather, a named definition)
+# from it (snag jax-source-refus-8c6ed1ec).
+function jax_ppl_levels_of(labels)
+    d = Dict{String,Int}()
+    for l in labels
+        get!(d, l, length(d) + 1)
+    end
+    nodes = sort!(collect(keys(d)))
+    (; n = length(d), pos = [d[l] for l in labels], nodes,
+       scale = [1.0 + 0.5 * i for i in 1:length(d)])
+end
+@rkppl jax_ppl_level_effects(labels) = begin
+    g = jax_ppl_levels_of(labels)
+    z[1:g.n] .~ Normal.(0, 1)
+    return z[g.pos]
+end
+@testset "jax_source(built, plan): a definition without a translation, read by its fields" begin
+    models = (
+        # The extent and the gather read `g` (the extent only through the layout).
+        extent = labels -> (@rkppl(begin
+            g = jax_ppl_levels_of(labels)
+            z[1:g.n] .~ Normal.(0, 1)
+            y .~ Normal.(z[g.pos], 1)
+        end))(; labels),
+        # A named field read: `n` was the input, with a wrong reason, and `g` was
+        # listed though no input.
+        named = labels -> (@rkppl(begin
+            g = jax_ppl_levels_of(labels)
+            n = g.n
+            z[1:n] .~ Normal.(0, 1)
+            y .~ Normal.(sum(z), 1)
+        end))(; labels),
+        # A float field scales the field, as BYM2's `inv_scale` does.
+        scaled = labels -> (@rkppl(begin
+            g = jax_ppl_levels_of(labels)
+            s ~ Exponential(1.0)
+            z[1:g.n] .~ Normal.(0, 1)
+            y .~ Normal.((s .* sqrt.(g.scale) .* z)[g.pos], 1)
+        end))(; labels),
+        # In a submodel's scope, whose `r.g` is the input `r_g`.
+        submodel = labels -> (@rkppl(begin
+            s ~ Exponential(1.0)
+            r ~ jax_ppl_level_effects(labels)
+            y .~ Normal.(r, s)
+        end))(; labels),
+    )
+    small = (labels = ["a", "b", "a", "c"], y = [0.1, -0.2, 0.3, 0.0])
+    large = (labels = ["q", "r", "s", "q", "t", "r"], y = [0.5, 0.1, -0.3, 0.2, 0.0, 1.0])
+    for (name, model) in pairs(models)
+        plan, other = (model(d.labels) | (; d.y) for d in (small, large))
+        built = build_kernel(plan)
+        src = jax_source(built, plan)
+        text = string(src)
+        g = name === :submodel ? "r.g" : "g"
+        inputs = first.(src.functions[1].inputs)
+        @test replace(g, "." => "_") in inputs
+        # The field reads are computed, not inputs.
+        @test !("n" in inputs) && !any(startswith("_"), inputs)
+        @test occursin("UNTRANSLATED = {\"" * g * "\": \"the function `jax_ppl_levels_of` " *
+                       "has loops or branches", text)
+        # One module serves every binding.
+        @test string(jax_source(build_kernel(other), other)) == text
+        rk_jax_available() || (@test_skip false; continue)
+        for p in (plan, other)
+            b = build_kernel(p)
+            query = prepare_query(b, p, :sampler)
+            u = collect(range(-0.4, 0.6; length = b.layout.total))
+            r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(p, src)...);
+                                grad = true, prepare = true)
+            @test r.value ≈ query(u) rtol = 1e-12
+            @test r.grad ≈ rk_fd_gradient(query, u) rtol = 1e-6
+            @test rk_jax_layout(src, jax_raw_data(p, src)).dimension == b.layout.total
+        end
+    end
+    # The value may also be given as its fields in order.
+    if rk_jax_available()
+        plan = models.extent(small.labels) | (; small.y)
+        src = jax_source(build_kernel(plan), plan)
+        query = prepare_query(build_kernel(plan), plan, :sampler)
+        data = jax_raw_data(plan, src)
+        u = [0.3, -0.2, 0.5]
+        r = rk_jax_evaluate(src, "log_density",
+                            (u, (d isa NamedTuple ? Tuple(d) : d for d in data)...); prepare = true)
+        @test r.value ≈ query(u) rtol = 1e-12
     end
 end
 
