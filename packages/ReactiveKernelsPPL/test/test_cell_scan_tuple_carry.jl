@@ -2,7 +2,7 @@
 # NamedTuple carry: its lags read `carry.s_lag1`. A step that passes such a
 # lag to a module function (`add(s[t - 1], z[t - 1])`, or `+` bound to a module
 # function as BRM's RK emission binds it) reads the step's local `carry`, as in
-# Julia, not a module path. Lowering refused this before RKPPL 0.1.137 with
+# Julia, not a module path. Lowering refused this before RKPPL 0.1.141 with
 # "qualifies a call with `:carry`, which is not a module visible in …"
 # (snag `a-brm-plate-cell-bf665a16`). Lambda arguments, lambda locals and
 # generator iteration names are lexical names of their body.

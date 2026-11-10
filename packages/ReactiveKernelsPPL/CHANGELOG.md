@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.137
+## 0.1.141
 
 - A `@plate` cell `@scan` that carries two or more arrays, or one array at a
   lag depth above 1, may pass a lag to a module function
@@ -28,6 +28,103 @@ are recorded in the git history only.
   generator's iteration names are now lexical names of their body when
   lowering resolves calls, as in Julia; a name no scope binds is still checked
   as a module path. Snag `a-brm-plate-cell-bf665a16`.
+
+## 0.1.140
+
+- **Breaking for `jax_source` callers:** a module's `prepare_data` takes the
+  data the caller binds, by the names the model reads (columns and scalar
+  values such as a prior scale or a period), and computes the data-only
+  definitions `bind_data` evaluates (`w = cos.(x ./ period)`) itself, in host
+  NumPy. It took the binding's internal copies of scalar values
+  (`_rkppl_value_<name>`) and those definitions' values, which only Julia
+  computed, so a Python caller could not bind new data. Pass the same names
+  the model is bound with: `m.prepare_data(**raw)`. `DATA` describes those
+  parameters. A definition without a host translation stays an input, named
+  with the reason in the new module constant `UNTRANSLATED` (`{}` when every
+  definition is computed); so does a derived definition whose binding guards
+  missing observations. A response with missing values still passes its
+  presence mask as `_rkppl_present_<name>`. Frozen definitions
+  (`frozen_values`) stay inputs. Needs ReactiveKernels 0.1.130.
+- **Breaking for `jax_source` callers:** a module whose parameter sizes read
+  data (a `levels(g)` axis, a scan over a data length) no longer states the
+  emitting binding's `DIMENSION` and `PARAMETERS`, which differed between
+  datasets of one program. The new functions `dimension(prepared)` and
+  `parameters(prepared)` give them for the data `prepare_data` returned; a
+  module whose layout reads no data keeps the constants too. Use
+  `m.dimension(prepared)` in place of `m.DIMENSION`.
+- The functions jit with the prepared data as arguments: a prepared integer
+  that sets a shape is a `StaticInt` (ReactiveKernels 0.1.130).
+- `jax_source` translates per-group recurrences over series of different
+  lengths: an observed `@scan` in a `@plate` cell, a deterministic one over a
+  ragged input, and one with a draw per step (a random walk per group), and a
+  ragged `@plate` whose cell reads a per-group value. RKPPL's own helpers
+  have translations (`_ppl_rows`, `_observed_scan_cell_bound`,
+  `_ppl_cell_scan_position`, `_ppl_cell_scan_nsteps`); the cell's scan
+  bound check is a runtime check.
+- **Breaking for `jax_source` callers:** the module's functions take
+  `(unconstrained, **prepared)`: the prepared data is passed by keyword, as
+  `f(u, **m.prepare_data(**raw))` already did, and positional prepared
+  arguments are no longer accepted (user GO `08jy2dh`). The signatures name
+  no internal values.
+- `constrain` returns what native `constrain(layout, u)` does: a submodel's
+  values nested under its name (`{"lv": {"sigma": …}}`, was `"lv.sigma"`),
+  and a parameter with no coordinates in this binding (`b[axes(X, 2)]` with
+  no columns) as an empty array, which it left out, so the module differed
+  between bindings.
+- A module's functions have docstrings (what each computes, how to call it)
+  and type annotations. The model's own docstrings (`rkppl_documentation`)
+  are listed in the module docstring, and `constrain`'s docstring lists each
+  returned value with its docstring.
+- `prepare_data` computes chained data-only definitions (`angle = x ./ period`
+  read by `cos.(angle)`) and a submodel's (`v.mask`): a name was resolved as a
+  global function (`Base.angle`) or reported undefined. A layout whose block
+  ends in a submodel's scope (`b_g.z`, BRM's group effects) is read under its
+  `prepare_data` key; it raised `the layout reads ..., which prepare_data does
+  not return`.
+
+## 0.1.139
+
+- Base's named numbers are those numbers: `Inf`, `NaN`, `pi`, `π`, `ℯ` and the
+  typed `Inf32`, `NaN16`, … (Base's exported numeric constants) read as the
+  numbers they name, like a literal `0.5`, wherever a model reads a value:
+  data-only and parameter-dependent definitions
+  (`w = ifelse.(flag .> 0.5, -Inf, 0.0)`), inline response arguments, plate
+  cells, prior arguments (`Normal(0, pi)`), bounds and submodel bodies. `-Inf`
+  is the literal, and an irrational reads as its Float64 value, as `pi` did. A
+  model name with the same spelling, or the model module's own binding of it,
+  shadows them; a module's own numeric constant is still an input name that
+  data binds. Before, only `Inf` in a bound and `pi` inside an expression
+  resolved: `bind_data` refused the others with `assignment references unknown
+  name Inf` (`array plate column reads unknown name Inf` in a cell, `arg arg2
+  references unknown name pi` for a bare prior argument). Snag
+  `rkppl-assignment-88ffa090`.
+
+## 0.1.138
+
+- A docstring written before a top-level `@plate` or `@scan` block now fails
+  with a `SurfaceLoweringError` that quotes the docstring and says to write it
+  before a declaration inside the block (where it is retained) or to use a `#`
+  comment. It used to fail saying `@plate` is only admitted at model top level
+  (nested plates do not lower), or that `@scan` must not be nested inside
+  another macro, although the block was at top level. A docstring on a loop
+  stays refused, as in Julia (`cannot document the following expression`).
+  Models that lowered before lower unchanged. Snag `rkppl-docstring-454e2a8c`.
+
+## 0.1.137
+
+- An undotted `*` beside a value that may be an array stays Julia's product.
+  A per-observation matrix the model computes (an observation vector
+  broadcast against a data matrix, `(c .* r) .* U`), named or inline, times a
+  vector of data (`w`, quadrature weights) is the matrix-vector product: one
+  value per observation, with `w` read whole. Lowering used to refuse it
+  ("combines vectors without dots"). **Correctness:** `U * w` over data only,
+  and `D * wn` with weights a model function computes (`wn = normalized(w)`),
+  were rewritten to the elementwise `.*`, which failed with a
+  `DimensionMismatch` at the first evaluation when the matrix was not square,
+  and computed another density when it was; both now compute Julia's
+  product. A vector times a vector (`r * c`, each one value
+  per observation) is refused at binding, as Julia refuses it. Snag
+  `rkppl-vector-dat-85351195`.
 
 ## 0.1.136
 

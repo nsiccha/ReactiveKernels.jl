@@ -3773,6 +3773,7 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
         _is_data_matvec(ex, plan) &&
             return _collect_data_matvec!(refs, ex, plan, label, bound)
         if _is_computed_row_product(ex, plan)
+            bound && _check_whole_product!(ex, plan, label)
             _collect_vector_refs!(refs, ex.args[2], plan, label, bound)
             _collect_opaque_refs!(refs, ex.args[3], plan, label, bound)
             return nothing
@@ -8038,6 +8039,7 @@ function _whole_value_reads(defs, raw::AbstractSet{Symbol},
         pinned::AbstractSet{Symbol}; matrices::AbstractSet{Symbol} = raw)
     names = Set{Symbol}(first(d) for d in defs)
     known = union(Set{Symbol}(raw), names)
+    matrices = _product_matrix_closure(defs, matrices)
     reads = Dict{Symbol,Tuple{Set{Symbol},Set{Symbol}}}()
     for (nm, ex) in defs
         w, p = Set{Symbol}(), Set{Symbol}()
@@ -8172,10 +8174,41 @@ end
 # reads have no observation axis either.
 const _NO_MATRIX_OPERANDS = Set{Symbol}()
 _matrix_product_operand(ex::Symbol, matrices::AbstractSet{Symbol}) = ex in matrices
-_matrix_product_operand(ex::Expr, ::AbstractSet{Symbol}) =
-    ex.head === :call && length(ex.args) > 1 &&
-    (ex.args[1] === :hcat || ex.args[1] === GlobalRef(Base, :hcat))
+# An inline `hcat`, or Julia arithmetic over a value that can hold a matrix:
+# `(c .* r) .* U` and `1 ./ (1 .+ D)` keep `U`'s and `D`'s columns, so
+# `((c .* r) .* U) * w` contracts `w` with them exactly as `U * w` does.
+function _matrix_product_operand(ex::Expr, matrices::AbstractSet{Symbol})
+    if ex.head === :call && length(ex.args) > 1
+        fn = ex.args[1]
+        (fn === :hcat || fn === GlobalRef(Base, :hcat)) && return true
+        fn in ELEMENTWISE_OPS || fn in (:+, :-, :*, :/) || return false
+        return any(a -> _matrix_product_operand(a, matrices), ex.args[2:end])
+    elseif _is_dotted_call(ex)
+        return any(a -> _matrix_product_operand(a, matrices), ex.args[2].args)
+    elseif ex.head === Symbol("'") && length(ex.args) == 1
+        return _matrix_product_operand(ex.args[1], matrices)
+    end
+    return false
+end
 _matrix_product_operand(_, ::AbstractSet{Symbol}) = false
+
+# `matrices` plus every definition among `defs` (`name => expr`) whose value
+# can hold a matrix by the rule above (`D = (c .* r) .* U`), so naming the
+# matrix of a product never changes how its vector is read.
+function _product_matrix_closure(defs, matrices::AbstractSet{Symbol})
+    out = Set{Symbol}(matrices)
+    changed = true
+    while changed
+        changed = false
+        for (nm, ex) in defs
+            nm in out && continue
+            _matrix_product_operand(ex, out) || continue
+            push!(out, nm)
+            changed = true
+        end
+    end
+    return out
+end
 
 # Drop from `out` every Symbol `x` holds, at any depth.
 _drop_held_names!(out::Set{Symbol}, x::Symbol) = (delete!(out, x); nothing)
