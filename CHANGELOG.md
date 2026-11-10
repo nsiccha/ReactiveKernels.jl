@@ -26,7 +26,7 @@ are recorded in the git history only.
   parameters' dtype, rank and raggedness) and `UNTRANSLATED`: each definition
   without a host translation, or given as a `JAXEmissionError` naming the
   reason, with that reason; such a definition stays a `prepare_data` input.
-  ReactiveKernelsPPL 0.1.136 passes a binding's data-only definitions.
+  ReactiveKernelsPPL 0.1.137 passes a binding's data-only definitions.
 - `jax_source(spec; data, keep)`: `prepare_data` also returns the data-only
   values `keep` names (the functions take them too).
 - A scan over a range whose end is data with a static bound (a group's

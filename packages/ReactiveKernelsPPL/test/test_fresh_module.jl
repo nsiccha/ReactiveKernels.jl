@@ -428,4 +428,52 @@ end
     end
     @test Base.invokelatest(query, u) ≈ expected
 end
+
+# A model call (`model(; data) | (; y)`) lowers through `_lower_model`, not
+# `lower_rkppl`. What it names (a cell scan's seeds, a selected cell argument)
+# follows the source as well, so one declaration bound at two sizes generates
+# one `kernel_expr`, and two builds of one binding share their types
+# (snag `kernel-expr-of-a-26ed1e5c`).
+@testset "a model call lowers one source to one set of generated names" begin
+    model = @rkppl begin
+        a ~ Normal(0, 1)
+        @plate for g in eachindex(y)
+            @scan begin
+                h[1] = x[1, g]
+                for t in 2:H
+                    h[t] = a * h[t - 1] + x[t, g]
+                end
+            end
+            y[g] .~ Normal.(h[idx[g]], 1)
+        end
+    end
+    bound(G, H) = (x = reshape(collect(range(-1.0, 1.0; length = H * G)), H, G);
+        idx = [collect(1:2:H) for _ in 1:G];
+        model(; x, H, idx) | (; y = [fill(0.1, length(i)) for i in idx]))
+    small, large = bound(2, 5), bound(3, 7)
+    small_built, large_built = build_kernel(small), build_kernel(large)
+    source = kernel_expr(small, small_built.layout)
+    generated = Set(m.match for m in eachmatch(r"##[A-Za-z_0-9]+#\d+", string(source)))
+    @test any(n -> startswith(n, "##h_seed1#"), generated)
+    @test any(n -> startswith(n, "##_rkppl_selected#"), generated)
+    @test source == kernel_expr(large, large_built.layout)
+
+    # A selected argument's name reaches the split nodes' types, so two builds
+    # of one binding share them only if the model call names it by its source.
+    selected = @rkppl begin
+        z[levels(g)] .~ Normal.(0.0, 1.0)
+        s ~ Exponential(1.0)
+        @plate for k in eachindex(y)
+            d = log1p(exp(z[g[k]]) * w[k])
+            y[k] ~ Normal(d + cos(x[k]), exp(d) + s)
+        end
+    end
+    data = (; x = [-0.5, 0.0, 0.5, 1.0], w = [0.1, 0.2, 0.3, 0.4], g = [1, 1, 2, 2])
+    observed = (; y = [-1.0, 0.1, 1.0, 0.4])
+    operations(spec) = Set(string(typeof(r.op)) for r in spec.graph.recipes)
+    one = build_kernel(selected(; data...) | observed)
+    two = build_kernel(selected(; data...) | observed)
+    @test any(occursin("##_rkppl_selected#", t) for t in operations(one.spec))
+    @test operations(one.spec) == operations(two.spec)
+end
 end
