@@ -16,6 +16,23 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.135
+
+- Base's named numbers are those numbers: `Inf`, `NaN`, `pi`, `π`, `ℯ` and the
+  typed `Inf32`, `NaN16`, … (Base's exported numeric constants) read as the
+  numbers they name, like a literal `0.5`, wherever a model reads a value:
+  data-only and parameter-dependent definitions
+  (`w = ifelse.(flag .> 0.5, -Inf, 0.0)`), inline response arguments, plate
+  cells, prior arguments (`Normal(0, pi)`), bounds and submodel bodies. `-Inf`
+  is the literal, and an irrational reads as its Float64 value, as `pi` did. A
+  model name with the same spelling, or the model module's own binding of it,
+  shadows them; a module's own numeric constant is still an input name that
+  data binds. Before, only `Inf` in a bound and `pi` inside an expression
+  resolved: `bind_data` refused the others with `assignment references unknown
+  name Inf` (`array plate column reads unknown name Inf` in a cell, `arg arg2
+  references unknown name pi` for a bare prior argument). Snag
+  `rkppl-assignment-88ffa090`.
+
 ## 0.1.134
 
 - Bound data for `censored`, `truncated` and `interval_censored` evidence may
