@@ -366,6 +366,84 @@ fscale_naad(a, b) = a * b
     @test na_bytes < dataflow_bytes
 end
 
+# `vcat` of operands of different array types: a fresh row (a `Matrix` or an
+# adjoint) or a view's row over a parameter block read in place as a reshaped
+# view, as an RKPPL model's `vcat(permutedims(c), D)` stacks them (snag
+# `rkppl-vcat-of-pa-decf6725`). The step filled its cache through a loop over
+# the operand tuple, which the type-stability check flagged and native Enzyme
+# reverse refused (`IllegalTypeAnalysisException`, `EnzymeNoTypeError`).
+#
+# Registered Enzyme (0.13.219) also refuses Base's own `vcat` of a fresh
+# `Matrix` row beside a reshaped view, the step's result for a buffer of
+# another shape, even where that call never runs (`IllegalTypeAnalysisException`
+# in `_typed_vcat`). The Enzyme dogfood line's concatenation overrides take
+# views, reshapes and transposes of arrays (Enzyme decision `0prqqvj`), and
+# there every kernel below differentiates. The repair is Enzyme's:
+# `rejectable` names the kernels with a fresh `Matrix` row, whose rejection is
+# pinned broken; any other error, or a rejection of the view or adjoint row,
+# still fails.
+function _naad_vcat_gradient_or_rejected(prepared, g, u; rejectable::Bool)
+    try
+        ad_value_and_gradient!(prepared, g, u)
+    catch err
+        rejectable && err isa Enzyme.Compiler.IllegalTypeAnalysisException || rethrow()
+        nothing
+    end
+end
+@kernel naad_vcat_fresh_row(u::Vector{Float64}, y::Matrix{Float64}) = begin
+    c::Vector{Float64} = exp.(u[1:2])
+    D = reshape(view(u, 3:4), 1, 2)
+    C = vcat(permutedims(c), D)
+    total::Float64 = -0.5 * sum((y .- C) .^ 2)
+end
+@kernel naad_vcat_view_row(u::Vector{Float64}, y::Matrix{Float64}) = begin
+    c = view(u, 1:2)
+    D = reshape(view(u, 3:4), 1, 2)
+    C = vcat(permutedims(c), D)
+    total::Float64 = -0.5 * sum((y .- C) .^ 2)
+end
+@kernel naad_vcat_adjoint_row(u::Vector{Float64}, y::Matrix{Float64}) = begin
+    c::Vector{Float64} = exp.(u[1:2])
+    D = reshape(view(u, 3:4), 1, 2)
+    C = vcat(c', D)
+    total::Float64 = -0.5 * sum((y .- C) .^ 2)
+end
+@kernel naad_vcat_three(u::Vector{Float64}, y::Matrix{Float64}) = begin
+    c::Vector{Float64} = exp.(u[1:2])
+    D = reshape(view(u, 3:6), 2, 2)
+    E::Matrix{Float64} = reshape(u[7:8], 1, 2) .* 2.0
+    C = vcat(permutedims(c), D, E)
+    total::Float64 = -0.5 * sum((y .- C) .^ 2)
+end
+@testset "native Reverse through vcat of operands of different array types" begin
+    include(joinpath(@__DIR__, "fixtures", "nonallocating_called_ops.jl"))
+    u = [0.1, -0.2, 0.3, 0.4, -0.5, 0.6, 0.7, -0.8]
+    for (spec, rows, rejectable) in ((naad_vcat_fresh_row, 2, true),
+                                     (naad_vcat_view_row, 2, false),
+                                     (naad_vcat_adjoint_row, 2, false),
+                                     (naad_vcat_three, 4, true))
+        y = reshape(collect(range(-1.0, 1.0; length = 2rows)), rows, 2)
+        kb = prepare(spec; have = (:u, :y), want = :total, bound = (; y))
+        kbna = prepare_nonallocating(kb, u)
+        @test any(op -> op isa ReactiveKernels._ConcatenateStep{typeof(vcat)},
+                  called_ops(kbna))
+        prep = prepare_ad(kb, NA_AD_BACKEND, u; active = :u)
+        prepna = prepare_ad(kbna, NA_AD_BACKEND, u; active = :u,
+                            type_stability = :error)
+        g, gna = similar(u), similar(u)
+        v, _ = ad_value_and_gradient!(prep, g, u)
+        result = _naad_vcat_gradient_or_rejected(prepna, gna, u; rejectable)
+        if result === nothing
+            @test_broken result !== nothing
+        else
+            vna, _ = result
+            @test vna ≈ v rtol = 1e-12
+            @test gna ≈ g rtol = 1e-12
+            @test gna ≈ naad_findiff(kb, u) rtol = 1e-6 atol = 1e-8
+        end
+    end
+end
+
 @testset "bound-only steps fold once per preparation" begin
     spec = @kernel fold_mixed_naad(m, v, a) = begin
         t = m * v .+ a
