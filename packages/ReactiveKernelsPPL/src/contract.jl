@@ -1057,9 +1057,13 @@ the names that cell reads per index; when the bound response holds one
 array per index, each cell broadcasts over its own entries.
 `named_values` keeps each authored alias the lowering absorbed addressable
 by its name: `name => node` binds `name` to the graph value `node`.
-`factors` are scalar distribution densities on deterministic assignments;
-they add no coordinate or transform and contribute to `prior`, or to
-`likelihood` when explicitly conditioned.
+`factors` are distribution densities on deterministic definitions; they add
+no coordinate or transform and contribute to `prior`, or to `likelihood`
+when explicitly conditioned. A [`SampledParameter`](@ref) factor is a
+scalar density (`d ~ Normal(m, s)`); an [`ArrayParameter`](@ref) factor is
+the density of a vector definition, elementwise (`d .~ Normal.(m, s)`, a
+built-in scalar family with no dims) or joint (`d ~ MvNormal(m, S)`, the
+`<stem>_vector` slice family).
 `cell_priors` names scalar sums of conditional draw densities computed by
 retained cell scans; their coordinates and transforms belong to ordinary
 array parameters.
@@ -1096,7 +1100,7 @@ struct StructuralPlan
     external_observations::Vector{SampledParameter}
     cell_broadcasts::Dict{Symbol,Vector{Symbol}}
     named_values::Vector{Pair{Symbol,Symbol}}
-    factors::Vector{SampledParameter}
+    factors::Vector{Union{SampledParameter,ArrayParameter}}
     # Scalar graph values containing conditional priors emitted inside cells.
     cell_priors::Vector{Symbol}
     # Data-only definitions a binding takes by value (`bind_data(…; frozen)`).
@@ -1346,7 +1350,8 @@ function StructuralPlan(
         external_observations::Vector{SampledParameter} = SampledParameter[],
         cell_broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
         named_values::Vector{Pair{Symbol,Symbol}} = Pair{Symbol,Symbol}[],
-        factors::Vector{SampledParameter} = SampledParameter[],
+        factors::AbstractVector{<:Union{SampledParameter,ArrayParameter}} =
+            Union{SampledParameter,ArrayParameter}[],
         cell_priors::Vector{Symbol} = Symbol[],
         frozen::FrozenValues = FrozenValues(),
         cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}} =
@@ -4083,6 +4088,9 @@ end
 function _validate_parameters(plan::StructuralPlan)
     names = _union_names(plan)
     for p in (plan.parameters..., plan.factors...)
+        # A vector factor validates as the density of a value
+        # (`_validate_factors`).
+        p isa ArrayParameter && continue
         if p.family === :external
             _validate_external_parameter(plan, p)
             continue
@@ -4125,6 +4133,7 @@ function _validate_factors(plan::StructuralPlan)
     for f in plan.factors
         f.name in definitions || _fail(f.label,
             "a deterministic density factor needs an assignment for $(f.name)")
+        f isa ArrayParameter && _validate_vector_factor(plan, f)
     end
     scalar_definitions = Set(a.name for a in plan.assignments)
     for name in plan.cell_priors
@@ -7795,7 +7804,10 @@ function _preparation_data_names(plan, nodes, raw, onlydata, names;
     for factor in plan.factors
         for input in (factor.name, values(factor.args)...,
                 _support_args(factor.support_override)...)
-            dependencies!(runtime, input)
+            # A vector factor's argument may be an expression over names.
+            for name in _value_symbols(input)
+                dependencies!(runtime, name)
+            end
         end
     end
     prepared = intersect(names, wholedefs, runtime)

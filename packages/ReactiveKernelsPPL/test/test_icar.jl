@@ -1,6 +1,6 @@
 module ICARTests
 using Test, ReactiveKernels, ReactiveKernelsPPL
-using Distributions: Beta, Normal, Poisson, logpdf, truncated
+using Distributions: Beta, Exponential, Normal, Poisson, logpdf, truncated
 import DifferentiationInterface as DI
 import Enzyme
 
@@ -219,10 +219,184 @@ end
         phi[1:3] ~ ICAR(node1)
         y .~ Poisson.(exp.(phi))
     end)
-    # Not built yet: rows or columns of independent ICAR fields.
-    @test_broken (lower(quote
+    # refused: the fields of an array share one graph; a per-field edge list
+    # (a graph per row) is a different prior, not built.
+    @test_throws "shares one edge list" lower(quote
+        eachrow(P[1:2, 1:3]) .~ ICAR.(eachrow(node1), Ref(node2))
+        y .~ Poisson.(exp.(P[1, :]))
+    end)
+    # refused: an `eachrow` declaration broadcasts over the fields (`.~`).
+    @test_throws "broadcasts over the slices" lower(quote
+        eachrow(P[1:2, 1:3]) ~ ICAR(node1, node2)
+        y .~ Poisson.(exp.(P[1, :]))
+    end)
+    # Rows or columns of independent ICAR fields over one shared graph.
+    @test lower(quote
         eachrow(P[1:2, 1:3]) .~ ICAR(node1, node2)
         y .~ Poisson.(exp.(P[1, :]))
-    end); true)
+    end) isa StructuralPlan
+    @test lower(quote
+        eachcol(P[1:3, 1:2]) .~ ICAR.(Ref(node1), Ref(node2))
+        y .~ Poisson.(exp.(P[:, 1]))
+    end) isa StructuralPlan
+end
+
+# K independent ICAR fields over one graph: the rows (`eachrow`) or the
+# columns (`eachcol`) of one array, each field its own unit-scale ICAR prior
+# over the shared edge list, K and N bound as data (snag
+# independent-icar-2e025fad).
+const FIELDS = (
+    rows = quote
+        beta0 ~ Normal(0, 1)
+        s ~ Exponential(1.0)
+        eachrow(phi[1:K, 1:N]) .~ ICAR(node1, node2)
+        @plate for i in eachindex(k)
+            eta[i] = log(E[i]) + beta0 + s * phi[k[i], n[i]]
+        end
+        y .~ Poisson.(exp.(eta))
+    end,
+    cols = quote
+        beta0 ~ Normal(0, 1)
+        s ~ Exponential(1.0)
+        eachcol(phi[1:N, 1:K]) .~ ICAR(node1, node2)
+        @plate for i in eachindex(k)
+            eta[i] = log(E[i]) + beta0 + s * phi[n[i], k[i]]
+        end
+        y .~ Poisson.(exp.(eta))
+    end,
+)
+
+function fields_data(K, r, c)
+    node1, node2 = lattice(r, c)
+    N = r * c
+    k = repeat(1:K, inner = N)
+    n = repeat(1:N, outer = K)
+    E = [0.6 + 0.1 * mod(i, 7) for i in 1:(K * N)]
+    y = [mod(3i, 5) for i in 1:(K * N)]
+    return (; K, N, node1, node2, k, n, E, y)
+end
+
+bind_fields(orientation, d) = bind_data(lower_rkppl(FIELDS[orientation], d;
+    mod = @__MODULE__, conditioned = (:y,)), d)
+
+# The K fields as rows, whichever orientation declared them.
+field_rows(orientation, phi) = orientation === :rows ? phi : permutedims(phi)
+
+function fields_oracle(orientation, c, d)
+    P = field_rows(orientation, c.phi)
+    prior = logpdf(Normal(0, 1), c.beta0) + logpdf(Exponential(1.0), c.s) +
+        sum(icar_oracle(P[k, :], d.node1, d.node2) for k in 1:d.K)
+    rate = exp.(log.(d.E) .+ c.beta0 .+ c.s .* [P[k, n] for (k, n) in zip(d.k, d.n)])
+    return prior, sum(logpdf.(Poisson.(rate), d.y))
+end
+
+@testset "ICAR fields ($orientation): K independent priors over one graph" for orientation in (:rows, :cols)
+    d = fields_data(3, 2, 3)
+    bound = bind_fields(orientation, d)
+    built = build_kernel(bound)
+    names = coordinate_names(built.layout)
+    # Centered: the entries are the coordinates, column-major.
+    dims = orientation === :rows ? (d.K, d.N) : (d.N, d.K)
+    @test names[3:end] == [Symbol("phi.", i, ".", j) for j in 1:dims[2] for i in 1:dims[1]]
+    code = string(kernel_expr(bound, built.layout))
+    @test occursin("icar_$(orientation)_logdensity(phi, node1, node2)", code)
+    prior = prepare_query(built, bound, :prior)
+    likelihood = prepare_query(built, bound, :likelihood)
+    for u in (collect(range(-0.4, 0.5; length = length(names))),
+            [0.3, -0.2, 0.2 .* sin.(1:(d.K * d.N))...])
+        c = constrain(built.layout, u)
+        @test size(c.phi) == dims
+        p, l = fields_oracle(orientation, c, d)
+        @test Base.invokelatest(prior, u) ≈ p rtol = 1e-12
+        @test Base.invokelatest(likelihood, u) ≈ l rtol = 1e-12
+    end
+end
+
+@testset "ICAR fields equal one field over K disjoint copies of the graph" begin
+    # The block-diagonal route a model needed before (one field over K copies
+    # of the edges) has the same density at the same values.
+    d = fields_data(3, 2, 3)
+    blk1 = reduce(vcat, [d.node1 .+ (k - 1) * d.N for k in 1:d.K])
+    blk2 = reduce(vcat, [d.node2 .+ (k - 1) * d.N for k in 1:d.K])
+    # Field k is the k-th block of N nodes: observation (k, n) reads node
+    # (k - 1) * N + n.
+    block = (; d..., blk1, blk2, flat = (d.k .- 1) .* d.N .+ d.n)
+    single = bind_data(lower_rkppl(quote
+        psi[1:(K * N)] ~ ICAR(blk1, blk2)
+        y .~ Poisson.(exp.(log.(E) .+ psi[flat]))
+    end, block; mod = @__MODULE__, conditioned = (:y,)), block)
+    rows = bind_data(lower_rkppl(quote
+        eachrow(phi[1:K, 1:N]) .~ ICAR(node1, node2)
+        @plate for i in eachindex(k)
+            eta[i] = log(E[i]) + phi[k[i], n[i]]
+        end
+        y .~ Poisson.(exp.(eta))
+    end, d; mod = @__MODULE__, conditioned = (:y,)), d)
+    q_single = prepare_query(build_kernel(single), single, :sampler)
+    q_rows = prepare_query(build_kernel(rows), rows, :sampler)
+    phi = [0.1 * sin(3i + j) for i in 1:d.K, j in 1:d.N]
+    # The block field lists field 1's nodes, then field 2's, …: the rows of
+    # `phi` one after another.
+    @test Base.invokelatest(q_rows, vec(phi)) ≈
+        Base.invokelatest(q_single, vec(permutedims(phi))) rtol = 1e-12
+end
+
+@testset "ICAR fields ($orientation): native Enzyme Reverse" for orientation in (:rows, :cols)
+    d = fields_data(2, 2, 2)
+    bound = bind_fields(orientation, d)
+    built = build_kernel(bound)
+    n = length(coordinate_names(built.layout))
+    u = [0.2, 0.3, 0.3 .* sin.(1:(n - 2))...]
+    sampler = prepare_sampler(built, bound, u;
+        backend = DI.AutoEnzyme(; mode = Enzyme.Reverse))
+    fd_check(sampler, u)
+end
+
+@testset "ICAR fields ($orientation): one retained structure as K and N grow" for orientation in (:rows, :cols)
+    shapes = map((fields_data(2, 2, 3), fields_data(5, 7, 4))) do d
+        bound = bind_fields(orientation, d)
+        built = build_kernel(bound)
+        u = zeros(length(coordinate_names(built.layout)))
+        sampler = prepare_sampler(built, bound, u;
+            backend = DI.AutoEnzyme(; mode = Enzyme.Reverse))
+        structure(sampler.kernel)
+    end
+    @test shapes[1] == shapes[2]
+end
+
+@testset "ICAR fields: edge lists checked at binding against the field length" begin
+    ast = quote
+        eachrow(phi[1:K, 1:N]) .~ ICAR(node1, node2)
+        @plate for i in eachindex(k)
+            eta[i] = phi[k[i], n[i]]
+        end
+        y .~ Poisson.(exp.(eta))
+    end
+    bind(data) = bind_data(lower_rkppl(ast, data; mod = @__MODULE__,
+        conditioned = (:y,)), data)
+    base = (; K = 2, N = 3, k = [1, 2], n = [1, 3], y = [1, 0])
+    @test bind((; base..., node1 = [1, 2], node2 = [2, 3])) isa StructuralPlan
+    # A node is an index into one field (1:N), not into the K × N array.
+    @test_throws ContractValidationError bind((; base..., node1 = [1, 2], node2 = [2, 4]))
+    @test_throws ContractValidationError bind((; base..., node1 = [1, 2], node2 = [2]))
+end
+
+@testset "ICAR fields: one density factor per field" begin
+    d = fields_data(3, 2, 3)
+    bound = bind_fields(:rows, d)
+    built = build_kernel(bound)
+    catalogue = density_factors(built, bound)
+    @test length(select_factors(catalogue; site = :phi)) == d.K
+    e = only(e for e in built.layout.entries if e.name === :phi)
+    u = [0.2sin(i) for i in 1:built.layout.total]
+    for k in 1:d.K
+        selected = select_factors(catalogue; site = :phi, entries = k)
+        # Field k reads its own row: one coordinate per node.
+        # (`offset` is the one-based position of the array's first entry.)
+        @test factor_coordinates(selected) == e.offset .+ ((k - 1) .+ d.K .* (0:(d.N - 1)))
+        q = prepare_query(built, bound, selected; u0 = u)
+        c = constrain(built.layout, u)
+        @test q(u) ≈ icar_oracle(c.phi[k, :], d.node1, d.node2) rtol = 1e-12
+    end
 end
 end

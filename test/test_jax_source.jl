@@ -2,6 +2,7 @@ using ReactiveKernels
 using Test
 using LinearAlgebra: dot
 using LogExpFunctions: log1mexp
+using SpecialFunctions: besseli, besselix
 
 include(joinpath(@__DIR__, "jax_python.jl"))
 
@@ -96,6 +97,75 @@ end
 @kernel jax_doubling(x::Float64) = begin
     y = jax_test_doubling(x)
     return y
+end
+
+# A tuple or `NamedTuple` local that a loop or a branch carries stays a tuple,
+# each element coerced alone (snag jax-source-tuple-6f1e9e4c): rebound by a
+# data-dependent conditional, with an integer field, past a ragged row's
+# length, assigned in an `if` arm, and carried by a `while` loop.
+@traceable function jax_test_tuple_loop(s::Tuple, w::Real, n::Integer, m::Integer)
+    s = (s[1] + w, s[2])
+    for i in 2:m
+        s = i <= n ? (0.9 * s[1] + w * s[2], 0.5 * s[2] + s[1]) : s
+    end
+    s
+end
+@kernel jax_tuple_loop(w::Float64, x::Float64, n::Int) = begin
+    s = jax_test_tuple_loop((x, 1.0), w, n, 4)
+    t = s[1] + 2 * s[2]
+    return t
+end
+@traceable function jax_test_named_loop(w::Real, m::Integer)
+    s = (level = w, count = 0)
+    for i in 1:m
+        s = (level = 0.5 * s.level + w, count = s.count + i)
+    end
+    s.level * s.count
+end
+@kernel jax_named_loop(w::Float64) = begin
+    t = jax_test_named_loop(w, 3)
+    return t
+end
+@traceable function jax_test_row_loop(r::AbstractVector, a::Real)
+    s = (0.0, 1.0)
+    for t in eachindex(r)
+        s = (s[1] + a * r[t] * s[2], 0.5 * s[2])
+    end
+    s[1] + s[2]
+end
+@kernel jax_tuple_rows(a::Float64, R::Vector{Vector{Float64}}) = begin
+    lp = plate(R) do r
+        jax_test_row_loop(r, a)
+    end
+    total = sum(lp)
+    return total
+end
+@traceable function jax_test_tuple_branch(x::Real)
+    s = (x, 2.0)
+    if x > 0
+        s = (s[2], s[1])
+    end
+    k = 0
+    while k < 3
+        s = (s[1] * 0.5, s[2] + x)
+        k = k + 1
+    end
+    s[1] - s[2]
+end
+@kernel jax_tuple_branch(x::Float64) = begin
+    t = jax_test_tuple_branch(x)
+    return t
+end
+@traceable function jax_test_tuple_while(x::Real)
+    h = (one(x), 0)
+    while h[1] < x
+        h = (2 * h[1], h[2] + 1)
+    end
+    h[2] * h[1]
+end
+@kernel jax_tuple_while(x::Float64) = begin
+    t = jax_test_tuple_while(x)
+    return t
 end
 
 # Typed allocations, `hcat`, `permutedims`, a numeric-type broadcast, and a
@@ -827,6 +897,20 @@ end
     @test occursin("jax.lax.fori_loop(", traced)
     @test occursin("jax.lax.cond(", traced)
     @test occursin("jax.lax.while_loop(", string(jax_source(jax_doubling; have = (:x,), want = :y)))
+    # A tuple carry enters the loop as a tuple of coerced elements, the
+    # structure the body returns, never as one array of the tuple.
+    tupled = string(jax_source(jax_tuple_loop; have = (:w, :x, :n), want = :t))
+    @test occursin("((jnp.asarray(s[0], dtype=jnp.float64), jnp.asarray(s[1], dtype=jnp.float64)),)",
+                   tupled)
+    @test !occursin("jnp.asarray(s, ", tupled)
+    named = string(jax_source(jax_named_loop; have = (:w,), want = :t))
+    @test occursin("jnp.asarray(s[1], dtype=jnp.int64)", named)
+    # Past a row's length each element keeps its value (`jnp.where` of a
+    # tuple would stack it into an array).
+    rows = string(jax_source(jax_tuple_rows; have = (:a, :R), want = :total))
+    @test occursin(r"\(\(jnp\.where\(t <= r_n, s_3\[0\], s_2\[0\]\), jnp\.where\(t <= r_n, s_3\[1\], s_2\[1\]\)\),\)",
+                   rows)
+    @test occursin("jax.lax.while_loop(", string(jax_source(jax_tuple_while; have = (:x,), want = :t)))
     plain = string(jax_source(jax_plain; have = (:w, :x), want = :s))
     @test occursin("w ** 2", plain)
     @test !occursin(r"<[a-z]", plain)
@@ -928,6 +1012,29 @@ end
               only(rk_fd_gradient(u -> native(only(u)), [0.3])) rtol = 1e-6
         native = prepare(jax_doubling; have = (:x,), want = :y)
         src = jax_source(jax_doubling; have = (:x,), want = :y)
+        @test rk_jax_evaluate(src, "kernel", (37.0,)).value ≈ native(37.0) rtol = 1e-12
+        # Tuple carries (snag jax-source-tuple-6f1e9e4c): values and gradients
+        # with the conditional taken for some steps, none, and all.
+        native = prepare(jax_tuple_loop; have = (:w, :x, :n), want = :t)
+        src = jax_source(jax_tuple_loop; have = (:w, :x, :n), want = :t)
+        for (x0, n) in ((0.7, 3), (0.7, 1), (1.1, 4))
+            r = rk_jax_evaluate(src, "kernel", (0.3, x0, n); grad = true)
+            @test r.value ≈ native(0.3, x0, n) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x0, n), [0.3])) rtol = 1e-6
+        end
+        R = [[1.0, 2.0, 3.0], [0.5], [-1.0, 0.25]]
+        for (kernel, have, want, args) in ((jax_named_loop, (:w,), :t, (0.4,)),
+                                           (jax_tuple_rows, (:a, :R), :total, (0.6, R)),
+                                           (jax_tuple_branch, (:x,), :t, (0.8,)),
+                                           (jax_tuple_branch, (:x,), :t, (-0.6,)))
+            native = prepare(kernel; have, want)
+            src = jax_source(kernel; have, want)
+            r = rk_jax_evaluate(src, "kernel", args; grad = true)
+            @test r.value ≈ native(args...) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), args[2:end]...), [args[1]])) rtol = 1e-6
+        end
+        native = prepare(jax_tuple_while; have = (:x,), want = :t)
+        src = jax_source(jax_tuple_while; have = (:x,), want = :t)
         @test rk_jax_evaluate(src, "kernel", (37.0,)).value ≈ native(37.0) rtol = 1e-12
         native = prepare(jax_plain; have = (:w, :x), want = :s)
         src = jax_source(jax_plain; have = (:w, :x), want = :s)
@@ -1253,5 +1360,111 @@ end
             @test r.value ≈ native(0.7, Y) rtol = 1e-12
             @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), Y), [0.7])) rtol = 1e-6
         end
+    end
+end
+
+# Modified Bessel functions of any order (snag jax-source-perio-96f952a3): a
+# periodic Hilbert-space GP basis weights harmonic `j` by
+# `besselix(j, 1 / rho^2)`, with the harmonics a data value.
+@kernel jax_bessel_values(nu::Vector{Float64}, x::Vector{Float64}) = begin
+    scaled = besselix.(nu, x)
+    plain = besseli.(nu, x)
+    return scaled
+end
+@kernel jax_bessel_scale(rho::Float64, h::Vector{Float64}, sigma::Float64) = begin
+    a = 1 / rho^2
+    s = sum(log.(sigma .* besselix.(h, a))) + besselix(3, a) + besseli(0, rho) + besseli(2.5, rho)
+    return s
+end
+# A data-only recipe: `prepare_data` computes it with SciPy.
+@kernel jax_bessel_prepared(w::Float64, h::Vector{Float64}, x::Vector{Float64}) = begin
+    basis = besselix.(h, x)
+    s = w * sum(basis)
+    return s
+end
+
+@testset "jax_source: modified Bessel functions of any order" begin
+    values = string(jax_source(jax_bessel_values; have = (:nu, :x), want = :scaled))
+    @test occursin("_rk_besselix(nu, x)", values)
+    @test occursin("jax.custom_jvp", values)
+    plain = string(jax_source(jax_bessel_values; have = (:nu, :x), want = :plain))
+    @test occursin("_rk_besseli(nu, x)", plain) && occursin("def _rk_besselix(", plain)
+    scale = string(jax_source(jax_bessel_scale; have = (:rho, :h, :sigma), want = :s))
+    # A literal order 0 or 1 stays jax.scipy.special's own function.
+    @test occursin("jsp.i0(", scale) && occursin("_rk_besselix(3, ", scale)
+    prepared = jax_source(jax_bessel_prepared; have = (:w, :h, :x), want = :s,
+                          data = (; h = [1.0, 2.0], x = [0.5, 3.0]))
+    @test occursin("ssp.ive(", string(prepared))
+    @test !occursin("_rk_besselix", string(prepared))
+    if !rk_jax_available()
+        @test_skip false
+    else
+        # Orders on both sides of the expansion's order 25 and x on both
+        # sides of the series' x = 30; negative x and orders where Julia
+        # defines them.
+        nus = [0.0, 0.5, 1.0, 2.0, 3.5, 7.0, 12.0, 24.5, 25.0, 40.0, 120.0]
+        xs = [1e-6, 0.3, 2.0, 9.0, 29.5, 31.0, 80.0, 400.0, 5e3, 1e6]
+        nu = [repeat(nus; inner = length(xs)); 3.0; 4.0; -2.0; -3.0; 0.0]
+        x = [repeat(xs; outer = length(nus)); -7.0; -0.4; 2.5; 50.0; 0.0]
+        # Unscaled, past x ~ 700 Julia's `besseli` throws on overflow (JAX's is
+        # Inf), so it is compared where it is finite.
+        finite = abs.(x) .<= 400
+        for (want, nu, x) in ((:scaled, nu, x), (:plain, nu[finite], x[finite]))
+            native = prepare(jax_bessel_values; have = (:nu, :x), want)(nu, x)
+            src = jax_source(jax_bessel_values; have = (:nu, :x), want)
+            got = rk_jax_evaluate(src, "kernel", (nu, x)).value
+            @test all(isapprox(g, n; rtol = 1e-12) || g == n for (g, n) in zip(got, native))
+        end
+        native = prepare(jax_bessel_scale; have = (:rho, :h, :sigma), want = :s)
+        src = jax_source(jax_bessel_scale; have = (:rho, :h, :sigma), want = :s)
+        h = [1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]
+        for rho in (0.05, 0.3, 0.9, 2.0)
+            r = rk_jax_evaluate(src, "kernel", (rho, h, 1.3); grad = true)
+            @test r.value ≈ native(rho, h, 1.3) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), h, 1.3), [rho])) rtol = 1e-6
+        end
+        native = prepare(jax_bessel_prepared; have = (:w, :h, :x), want = :s)
+        hp, xp = [0.0, 1.0, 2.5, 30.0], [0.2, 4.0, 45.0, 12.0]
+        src = jax_source(jax_bessel_prepared; have = (:w, :h, :x), want = :s, data = (; h = hp, x = xp))
+        r = rk_jax_evaluate(src, "kernel", (0.7, hp, xp); grad = true, prepare = true)
+        @test r.value ≈ native(0.7, hp, xp) rtol = 1e-12
+        @test r.grad ≈ native(1.0, hp, xp) rtol = 1e-12
+    end
+end
+
+# Keyword calls in a plain helper's lowered code (snag
+# jax-source-perio-96f952a3), `Core.kwcall(NamedTuple{names}(values), f,
+# args...)`: the call with those keyword arguments, as source spells it. The
+# shape of BRM's `hsgp_sqrt_spd`, a spectral scale over a basis' frequencies.
+jax_kw_sqrt_spd(lambda, sigma, rho) =
+    sigma .* exp.(-0.25 .* (rho * rho) .* vec(sum(lambda; dims = 2)))
+@kernel jax_kw_plain(rho::Float64, lambda::Matrix{Float64}) = begin
+    scale = jax_kw_sqrt_spd(lambda, 1.3, rho)
+    s = sum(scale)
+    return s
+end
+# A keyword call RK has no translation for names the keyword call (BRM's
+# periodic basis read "a type applied to a computed parameter").
+jax_kw_inner(x, k; anchor = nothing, mask = nothing) = x .* k
+jax_kw_outer(x, k) = jax_kw_inner(x, k; anchor = nothing, mask = nothing)
+@kernel jax_kw_refused(k::Float64, x::Vector{Float64}) = begin
+    b = jax_kw_outer(x, k)
+    s = sum(b)
+    return s
+end
+
+@testset "jax_source: keyword calls in a plain helper" begin
+    src = jax_source(jax_kw_plain; have = (:rho, :lambda), want = :s)
+    @test occursin("jnp.sum(lambda_, axis=2 - 1, keepdims=True)", string(src))
+    @test_throws "keyword arguments to `jax_kw_inner` have no JAX translation" jax_source(
+        jax_kw_refused; have = (:k, :x), want = :s)
+    if !rk_jax_available()
+        @test_skip false
+    else
+        lambda = [0.1 0.4; 0.9 1.6; 2.5 0.3]
+        native = prepare(jax_kw_plain; have = (:rho, :lambda), want = :s)
+        r = rk_jax_evaluate(src, "kernel", (0.7, lambda); grad = true)
+        @test r.value ≈ native(0.7, lambda) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), lambda), [0.7])) rtol = 1e-6
     end
 end

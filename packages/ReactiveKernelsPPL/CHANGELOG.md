@@ -16,6 +16,37 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.145
+
+- A vector definition that reads a sampled value and no observed
+  (conditioned) data carries a density factor, as a scalar definition
+  already did: `d .~ Normal.(0, s)` adds
+  `sum(logpdf.(Normal.(0, s), d))` to `prior` (one support-checked density
+  per entry, any built-in scalar family), and `d ~ MvNormal(m, S)` or
+  `d ~ MvNormalCholesky(m, L)` adds the joint density. Neither adds a
+  coordinate or transform; a conditioned factor enters `likelihood`. Both
+  were refused at lowering ("responses derive from bound data only",
+  "needs a scalar definition"). A `.~` over a definition of data alone is
+  still an observation, and one reading observed data and a sampled value
+  is still refused. `StructuralPlan.factors` holds `ArrayParameter`
+  factors beside the scalar `SampledParameter` ones.
+- An inline broadcast over data as a gather index (`cs[start .+ size]`) is
+  the same index vector as its named definition; it was refused as an index
+  "by literal positions or `:`". Snag `rkppl-vector-val-c101b992`.
+
+## 0.1.144
+
+- Independent ICAR fields over one graph: `eachrow(phi[1:K, 1:N]) .~
+  ICAR(node1, node2)` (field `k` is `phi[k, :]`) and `eachcol(phi[1:N, 1:K])
+  .~ ICAR(node1, node2)` (field `k` is `phi[:, k]`), with `K` and `N` data.
+  Each field has its own unit-scale ICAR prior over the shared edge list; the
+  density is the graph law `icar_rows_logdensity` / `icar_cols_logdensity`,
+  native and Enzyme Reverse, one density factor per field, and it translates
+  through `jax_source`. Lowering refused both with "rows or columns of
+  independent ICAR fields are not built yet". A per-field edge list
+  (`ICAR.(eachrow(E), …)`) is refused. Requires
+  ReactiveKernelsDistributionKernels 0.1.6. Snag `independent-icar-2e025fad`.
+
 ## 0.1.143
 
 - A partition query or sampler whose keys hold each label once, such as one

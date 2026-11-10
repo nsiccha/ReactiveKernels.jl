@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.142
+## 0.1.144
 
 - `jax_source(...; data)`: `prepare_data` translates `sort`, `sort!`,
   `unique`, `unique!`, `searchsortedfirst` and `searchsortedlast` of vectors
@@ -35,6 +35,47 @@ are recorded in the git history only.
   that names it gives the reason, and when the JAX functions cannot compute it
   either, their `JAXEmissionError` names the host reason as well. Before, the
   error named only the functions' reason.
+
+## 0.1.143
+
+- `jax_source` keeps a tuple or `NamedTuple` local that a loop or a branch
+  carries as a tuple. A loop in a recipe or a `@traceable` helper over such a
+  local (`s = i <= n ? f(s) : s`) used to start its `fori_loop` from one array
+  of the tuple, so the module failed in Python with `true_fun output is a
+  <class 'tuple'> but false_fun output is a pytree leaf` or a carry-structure
+  `TypeError`. Each element now enters with its own dtype, and past a ragged
+  row's length each element keeps its value (snag
+  `jax-source-tuple-6f1e9e4c`).
+
+## 0.1.142
+
+- `jax_source` translates `besselix(nu, x)` and `besseli(nu, x)`
+  (SpecialFunctions) of any order, a data value or one the program computes
+  included (snag `jax-source-perio-96f952a3`): a periodic Hilbert-space GP
+  weights harmonic `j` by `besselix(j, 1 / rho^2)`. Any order but 0 and 1
+  raised "`besselix` of an order other than a literal 0 or 1". A literal
+  order 0 or 1 is still `jsp.i0e` and its kin. Any other order in the JAX
+  functions is the module's `_rk_besselix` helper (JAX 0.12 has no
+  general-order function): the power series, or the uniform expansion in
+  large order followed by the downward recurrence, within about 4e-13 of
+  SciPy relative for orders 0 to 1000; `jax.grad` in `x` is the recurrence
+  identity, and a derivative in the order is NaN, as Julia's derivative rule
+  gives. `prepare_data` and values known while emitting use SciPy's `ive` and
+  `iv`. A negative integer order and, for an integer order, a negative `x`
+  follow Julia; a negative non-integer order is NaN in the JAX functions.
+- A package can register a scalar function's translation that reads the
+  call's arguments, such as a literal order, with a method of
+  `ReactiveKernels._jax_elementwise_call(ctx, f, args)`. It is applied to
+  scalars and, broadcast, elementwise to arrays.
+- A keyword call in a plain helper's lowered code, `Core.kwcall(NamedTuple{
+  names}(values), f, args...)`, translates as the same call in source does:
+  `vec(sum(lambda; dims = 2))` (the shape of BRM's `hsgp_sqrt_spd`) is
+  `jnp.sum(..., keepdims=True)` raveled. It raised "a type applied to a
+  computed parameter", which named no keyword call; a keyword call RK has no
+  translation for now raises "keyword arguments to `f` have no JAX
+  translation", naming the function (BRM's periodic basis helper
+  `_brm_hsgp_basis_state(...; anchor, mask)`, snag
+  `jax-source-perio-96f952a3`).
 
 ## 0.1.141
 

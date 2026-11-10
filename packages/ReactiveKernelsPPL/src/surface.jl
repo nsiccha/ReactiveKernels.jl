@@ -719,7 +719,7 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     pinned = setdiff(Set{Symbol}(keys(values)), data)
     plan = _lower_rkppl_once(ast, data, m.mod;
         submodel_scopes = scopes, conditioned = observed_parameters,
-        array_entries = setdiff(array_entries, pinned))
+        array_entries = setdiff(array_entries, pinned), observing)
     for name in _conditioned_inputs(plan)
         values[_conditioned_input(name)] = pop!(values, name)
     end
@@ -1062,7 +1062,8 @@ function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
     ast, data = _scalar_value_definitions(ast, data, setdiff(scalars, observed_parameters))
     ast = _indexed_observation_definitions(ast, data)
     plan = _lower_rkppl_once(ast, data, mod;
-        submodel_scopes = scopes, conditioned = observed_parameters, array_entries)
+        submodel_scopes = scopes, conditioned = observed_parameters, array_entries,
+        observing)
     return _with(plan; documentation)
 
 end
@@ -1129,7 +1130,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         conditioned::Set{Symbol} = Set{Symbol}(),
         value_defs::Set{Symbol} = Set{Symbol}(),
         shared_defs::Set{Symbol} = Set{Symbol}(),
-        array_entries::Set{Symbol} = Set{Symbol}())
+        array_entries::Set{Symbol} = Set{Symbol}(),
+        observing::Set{Symbol} = Set{Symbol}())
     input_data = data
     ast = _fold_literal_positions(ast)
     # A `@scan` carried array that is observed data observes its entries
@@ -1140,6 +1142,13 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts,
         cell_priors, cell_latents, cell_geometries =
         _partition_statements(ast, data; array_entries, mod)
+    sample, factors = _vector_density_factors(sample, factors, det, data,
+        plate_specs, scans, intersect(observing, data))
+    # A vector factor conditioned by name enters `likelihood`, as a
+    # conditioned scalar factor does. Its `.~` is no conditioned declaration
+    # before this classification (a `.~` over data-only values observes them).
+    conditioned = union(conditioned, intersect(observing,
+        Set{Symbol}(s.lhs for s in factors if s.broadcast || s.slices === :vector)))
     for name in conditioned
         any(f -> f.lhs === name, factors) && continue
         input = _conditioned_input(name)
@@ -1538,11 +1547,25 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     union!(paramsyms, declared_syms)
     prepend!(dirichlets, declared_vectors)
     prepend!(arrays, declared_arrays)
-    factor_params = SampledParameter[]
+    factor_params = Union{SampledParameter,ArrayParameter}[]
     for s in factors
+        if s.broadcast || s.slices === :vector
+            # A vector definition's elementwise or joint density: the
+            # arguments of a declared array's prior, over the value.
+            p = s.broadcast ?
+                _lower_array_parameter(s.lhs, Any[], s.rhs, owned_coefs, ctx,
+                    paramsyms) :
+                _lower_array_slices(s.lhs, Any[], :vector, s.rhs, owned_coefs,
+                    paramsyms)
+            push!(factor_params, p)
+            push!(paramsyms, p.name)
+            continue
+        end
         detshape[s.lhs] === :scalar || _sfail(
             "deterministic density factor $(s.lhs) needs a scalar definition; " *
-            "use `.~` to observe a data-derived vector")
+            "a vector definition takes an elementwise factor " *
+            "(`$(s.lhs) .~ Normal.(0, s)`) or a joint `MvNormal` / " *
+            "`MvNormalCholesky` factor, or `.~` observes a data-derived vector")
         _external_rhs(s.rhs) && _sfail(
             "deterministic density factor $(s.lhs) needs an admitted scalar distribution")
         p = _lower_parameter(s.lhs, s.rhs, owned_coefs, ctx.matrices)
@@ -1657,7 +1680,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     if !isempty(retained)
         return _lower_rkppl_once(ast, input_data, mod;
             submodel_scopes, conditioned, value_defs = union(value_defs, retained),
-            shared_defs, array_entries)
+            shared_defs, array_entries, observing)
     end
     # A definition with no coefficient structure (`mu = base .* rise(base)`
     # over a retained `base`) is one value, not a predictor over a column
@@ -1671,7 +1694,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     if !isempty(whole)
         return _lower_rkppl_once(ast, input_data, mod;
             submodel_scopes, conditioned, value_defs = union(value_defs, whole),
-            shared_defs, array_entries)
+            shared_defs, array_entries, observing)
     end
     # A predictor location inlines the definitions it reads. As in Julia,
     # a computed definition is instead one named value that its readers
@@ -1686,7 +1709,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         return _lower_rkppl_once(ast, input_data, mod;
             submodel_scopes, conditioned,
             value_defs = union(value_defs, columns),
-            shared_defs = union(shared_defs, setdiff(shared, columns)), array_entries)
+            shared_defs = union(shared_defs, setdiff(shared, columns)), array_entries,
+            observing)
     end
     assigns = AssignmentSpec[]
     derived = VectorAssignmentSpec[]
@@ -1915,7 +1939,8 @@ _is_module_value_call(ex) =
 const _WHOLE_READ_FNS = (:size, :axes, :levels, :eachindex, :Ref)
 const _ADDITIVE_OPS = (:+, :-, :.+, :.-)
 
-# An inline data-only index expression is the same bind-time value as its named
+# An inline data-only index expression (a module call, a gather, or a
+# broadcast such as `start .+ size`) is the same bind-time value as its named
 # definition. Give it a hygienic name before observation-axis analysis,
 # which then routes it through the existing data-definition materializer.
 # Only ordinary value compositions are visited: a lazy arm or loop keeps
@@ -1930,8 +1955,12 @@ function _hoist_data_gather_indices!(sample, det, data, taken; resolve = identit
         # opaque module call loses that shape before observation validation.
         _literal_row_range(ex) && return ex
         value = resolve(ex)
-        (_contains_module_call(value) || value.head === :ref) &&
-            _data_only(value, data, detmap) || return ex
+        # A broadcast over data (`start .+ size`) is an index vector exactly
+        # as its named definition is.
+        computed = _contains_module_call(value) || value.head === :ref ||
+            ((_is_dotted_operator_call(value) || _is_dotted_call(value)) &&
+                !isempty(_value_symbols(value)))
+        computed && _data_only(value, data, detmap) || return ex
         return get!(names, value) do
             k = length(names) + 1
             nm = Symbol(:_rkppl_index_, k)
@@ -3510,6 +3539,65 @@ end
 # adjoint. Names, literals, property paths and chained reads stay as written.
 _gathered_value(ex) = ex isa Expr &&
     (ex.head === :call || ex.head === Symbol("'") || _is_dotted_call(ex))
+
+# Data classifies statements on definitions too. A `.~` over a definition
+# whose value is a function of the model's values (it reads a sampled
+# declaration, a plate latent or a scan state, directly or through other
+# definitions, and no observed data) is a density factor on that value,
+# exactly as `~` is on a scalar definition: it adds the elementwise density
+# to `prior` (or to `likelihood` when conditioned), with no coordinate or
+# transform. Structure data (an incidence matrix, index vectors) may enter
+# the value. An undotted joint law on such a definition
+# (`d ~ MvNormal(m, S)`) is the one-vector slice density of its value; it
+# takes the multivariate prior's argument naming. A definition of data alone
+# stays an observation (a derived response), and one reading observed data
+# (`observed`: the conditioned data names) together with a sampled value
+# keeps the observation contract's refusal: a likelihood term on
+# transformed observations is not a prior factor.
+function _vector_density_factors(sample, factors, det, data, plate_specs, scans,
+        observed::Set{Symbol})
+    detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
+    model = Set{Symbol}(s.lhs for s in sample
+        if s.lhs ∉ data && !haskey(detmap, s.lhs))
+    union!(model, (nm for (nm, _, _, _) in plate_specs))
+    union!(model, (st for s in scans for st in s.states))
+    factor_value(nm) = haskey(detmap, nm) &&
+        _reads_any(detmap[nm], model, detmap) &&
+        !_reads_any(detmap[nm], observed, detmap)
+    keep = SampleStmt[]
+    for s in sample
+        if s.broadcast && s.lhs ∉ data && s.range === nothing &&
+                s.levels === nothing && s.matrix === nothing &&
+                s.dims === nothing && s.slices === nothing &&
+                !_external_rhs(s.rhs) && factor_value(s.lhs)
+            any(f -> f.lhs === s.lhs, factors) && _sfail(
+                "deterministic density factor $(s.lhs) is stated twice")
+            push!(factors, s)
+        else
+            push!(keep, s)
+        end
+    end
+    for (i, s) in enumerate(factors)
+        !s.broadcast && _mv_head(s.rhs) in (:MvNormal, :MvNormalCholesky) &&
+            factor_value(s.lhs) || continue
+        factors[i] = SampleStmt(s.lhs, s.rhs, false, nothing, nothing,
+            nothing, nothing, :vector)
+    end
+    return keep, factors
+end
+
+# Whether `ex` reads any of `names`, directly or through the definitions it
+# reads.
+function _reads_any(ex, names::Set{Symbol}, detmap,
+        seen::Set{Symbol} = Set{Symbol}())
+    for s in _value_symbols(ex)
+        s in names && return true
+        haskey(detmap, s) && !(s in seen) || continue
+        push!(seen, s)
+        _reads_any(detmap[s], names, detmap, seen) && return true
+    end
+    return false
+end
 
 # Data-only: every value the expression reads is data or a data-only
 # definition (literals and function values aside).
@@ -5883,8 +5971,10 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
     lhs = c.args[2]
     lhs isa Symbol && _sfail("bare per-cell sample `$lhs ~ ...` does not " *
                              "lower — index the latent (`$lhs[$ivar] ~ ...`) " *
-                             "for a per-cell parameter, or write a shared " *
-                             "prior outside the plate")
+                             "for a per-cell parameter, write a shared " *
+                             "prior outside the plate, or state a density " *
+                             "factor on a vector definition's entries " *
+                             "outside the plate (`d .~ Normal.(0, s)`)")
     (lhs isa Expr && lhs.head === :ref && length(lhs.args) >= 2 &&
         lhs.args[1] isa Symbol && lhs.args[2] === ivar &&
         all(a -> a isa Integer && !(a isa Bool) && a >= 1, lhs.args[3:end])) ||
@@ -12507,14 +12597,18 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
         if s.slices in (:rows, :cols, :vector)
             rhs = hoist_multivariate(s.lhs, rhs, s.dims)
         elseif s.broadcast
-            # Only sized coefficient-vector priors; other `.~` are
-            # responses (data or derived) whose arguments are locations.
-            s.levels === nothing && s.matrix === nothing && continue
+            # Only sized coefficient-vector priors and density factors on
+            # vector definitions (`d .~ Normal.(0, 2 .* s)`, whose computed
+            # arguments may be vectors); other `.~` are responses (data or
+            # derived) whose arguments are locations.
+            factor = s.lhs in factor_names
+            factor || s.levels !== nothing || s.matrix !== nothing || continue
             rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
                 rhs.args[2] isa Expr && rhs.args[2].head === :tuple &&
                 rhs.args[1] in _HOIST_FAMILIES || continue
             args = rhs.args[2].args
-            new = hoist_args(s.lhs, args; role = family_role(rhs.args[1]))
+            new = hoist_args(s.lhs, args; scalar_only = !factor,
+                role = family_role(rhs.args[1]))
             new === args && continue
             rhs = Expr(:., rhs.args[1], Expr(:tuple, new...))
         else
@@ -12783,10 +12877,10 @@ function _mv_head(rhs)
     return h
 end
 
-# Multivariate normals also declare one vector (`b[1:K] ~ MvNormal(...)`),
-# and an ICAR field is only ever one node vector (`phi[1:N] ~ ICAR(node1,
-# node2)`); a simplex and an ordered vector keep their unsized declarations
-# (`phi ~ Dirichlet(alpha)`, `c ~ Ordered(Normal(0, 1), K)`).
+# Multivariate normals and an ICAR field also declare one vector
+# (`b[1:K] ~ MvNormal(...)`, `phi[1:N] ~ ICAR(node1, node2)`); a simplex and
+# an ordered vector keep their unsized declarations (`phi ~ Dirichlet(alpha)`,
+# `c ~ Ordered(Normal(0, 1), K)`).
 _mv_vector_head(rhs) = _mv_head(rhs) in (:MvNormalCholesky, :MvNormal, :ICAR)
 
 _is_slice_iterator(a) = a isa Expr && a.head === :call &&
@@ -12910,10 +13004,15 @@ function _mv_slice_args(::Val{:Dirichlet}, what, args)
         args[1]),)
 end
 # An ICAR edge list: one integer node index per edge, read whole. It is
-# data (or a data-only definition), checked at binding.
+# data (or a data-only definition), checked at binding. The rows or columns
+# of an array are independent fields over one shared graph, so a per-field
+# edge list (`ICAR.(eachrow(E1), …)`) is refused.
 function _icar_edge_arg(what, role, a)
     (a isa Real || a isa Bool) && _sfail("$what: the `ICAR` $role is an " *
         "integer node vector with one entry per edge, got the scalar $(repr(a))")
+    _is_slice_iterator(a) && _sfail("$what: every `ICAR` field shares one " *
+        "edge list, `ICAR(node1, node2)`; a graph per field " *
+        "($(repr(a))) is not built")
     a isa Expr || a isa Symbol || _sfail("$what: `ICAR` $role $(repr(a)) " *
         "is not a value")
     return a
@@ -12962,9 +13061,6 @@ function _lower_array_slices(lhs, dims::Vector{Any}, slices::Symbol, rhs,
             "got $(repr(rhs))" * (h isa Symbol ? " (an elementwise prior " *
             "is `$lhs[a, b] .~ $h.(…)`)" : ""))
     end
-    head === :ICAR && slices !== :vector && _sfail("$what: an `ICAR` " *
-        "field is one node vector, `$lhs[1:N] ~ ICAR(node1, node2)`; " *
-        "rows or columns of independent ICAR fields are not built yet")
     dotted = rhs.head === :.
     dotted && !(rhs.args[2] isa Expr && rhs.args[2].head === :tuple) &&
         _sfail("$what: malformed broadcast $(repr(rhs))")
