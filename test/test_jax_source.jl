@@ -239,6 +239,54 @@ end
     return m
 end
 
+# A throw under a condition that depends on data is a runtime check masked by
+# that condition (snag jax-source-refus-05f10f2c, the scale guard of
+# ReactiveKernelsDistributionKernels' LogNormal moments): a ternary whose
+# other arm is the value, a `||` guard, an `if` arm beside one that assigns,
+# and a throw in a vmapped cell under two conditions, which must hold for the
+# lanes that take neither.
+@traceable function jax_test_checked_log(x::Real)
+    x > 0 || throw(DomainError(x, "x must be positive"))
+    return log(x)
+end
+@traceable function jax_test_checked_rate(x::Real, r::Real)
+    y = x
+    if r > 0
+        y = x * r
+    else
+        throw(ArgumentError("rate must be positive"))
+    end
+    return y
+end
+@kernel jax_throw_ternary(x::Vector{Float64}, s::Float64) = begin
+    checked = s >= 0 ? s : throw(DomainError(s, "scale must be nonnegative"))
+    total = sum(x) * checked + checked^2
+    return total
+end
+@kernel jax_throw_cells(x::Vector{Float64}, r::Float64, s::Float64) = begin
+    lp = plate(x) do xi
+        xi > 0 ? (xi < 100 ? log(xi) : throw(DomainError(xi, "xi is too large"))) : -xi
+    end
+    total = sum(lp) + jax_test_checked_log(r) + jax_test_checked_rate(r, s)
+    return total
+end
+
+# `hypot` of mixed argument types (Base promotes through a tuple), and a scan
+# whose sequence is a range of data length, which JAX cannot shape.
+@kernel jax_hypot_mixed(x::Float64) = begin
+    h = hypot(x + 2, 3)
+    return h
+end
+@kernel jax_data_range(z::Float64) = begin
+    n::Int = ceil(Int, 6 + 120 / z)
+    path = scan(n:-1:2, Ref(z); init = 1.0) do t, k, z
+        next = k / (z + t)
+        (next, next)
+    end
+    t = last(path)
+    return t
+end
+
 # A plain helper whose source is recorded for `jax_source` as written.
 "The logarithm above one, the offset below it."
 ReactiveKernels.@_record_source function jax_test_recorded(x)
@@ -1017,6 +1065,12 @@ end
     # axis that no reduction masks (its JAX value used to sum the padding).
     @test_throws "beside another kept dimension" jax_source(jax_gather_matrix_rows;
         have = (:b, :M, :R), want = :total)
+    # refused: a scan over a range whose start is computed from a parameter
+    # has no static length; it used to emit a `jnp.arange` of a traced value,
+    # which JAX rejects when it traces the module.
+    @test prepare(jax_data_range; have = (:z,), want = :t)(3.0) isa Float64
+    @test_throws "a range whose length depends on data" jax_source(jax_data_range;
+        have = (:z,), want = :t)
 end
 
 # Plain helpers translated from their lowered code (`end`, a dimension another
@@ -1641,5 +1695,51 @@ end
                             "kernel", (0.7, a, B, w, y, z); grad = true)
         @test r.value ≈ native(0.7, a, B, w, y, z) rtol = 1e-12
         @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), a, B, w, y, z), [0.7])) rtol = 1e-6
+    end
+end
+
+# A throw under a data-dependent condition is a runtime check masked by that
+# condition, so it raises exactly where the native kernel throws (snag
+# jax-source-refus-05f10f2c). A ternary whose other arm is the value emits no
+# `lax.cond`: the check, then that arm.
+@testset "jax_source: a throw that depends on data is a masked runtime check" begin
+    ternary = string(jax_source(jax_throw_ternary; have = (:x, :s), want = :total))
+    @test occursin("_rk_check(s >= 0, \"scale must be nonnegative\")", ternary)
+    @test !occursin("jax.lax.cond(", ternary)
+    cells = string(jax_source(jax_throw_cells; have = (:x, :r, :s), want = :total))
+    # The cell's check holds for lanes that take either outer arm.
+    @test occursin("_rk_check(jnp.logical_not(jnp.logical_and(", cells)
+    @test occursin("\"xi is too large\"", cells)
+    @test occursin("\"x must be positive\"", cells) && occursin("\"rate must be positive\"", cells)
+    @test occursin("jnp.hypot(", string(jax_source(jax_hypot_mixed; have = (:x,), want = :h)))
+    if !rk_jax_available()
+        @test_skip false
+    else
+        x = [0.5, -1.0, 3.0, -200.0]
+        for (kernel, have, args) in ((jax_throw_ternary, (:x, :s), (x, 0.7)),
+                                     (jax_throw_ternary, (:x, :s), (x, 0.0)),
+                                     (jax_throw_cells, (:x, :r, :s), (x, 0.7, 1.3)))
+            native = prepare(kernel; have, want = :total)
+            r = rk_jax_evaluate(jax_source(kernel; have, want = :total), "kernel", args; grad = true)
+            @test r.value ≈ native(args...) rtol = 1e-12
+            @test r.grad ≈ rk_fd_gradient(u -> native(u, args[2:end]...), args[1]) rtol = 1e-6
+        end
+        native = prepare(jax_hypot_mixed; have = (:x,), want = :h)
+        r = rk_jax_evaluate(jax_source(jax_hypot_mixed; have = (:x,), want = :h), "kernel", (0.7,);
+                            grad = true)
+        @test r.value ≈ native(0.7) rtol = 1e-14
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u)), [0.7])) rtol = 1e-6
+        # Each check raises with its message where the native kernel throws.
+        src = jax_source(jax_throw_ternary; have = (:x, :s), want = :total)
+        @test_throws DomainError prepare(jax_throw_ternary; have = (:x, :s), want = :total)(x, -0.5)
+        @test_throws "scale must be nonnegative" rk_jax_evaluate(src, "kernel", (x, -0.5))
+        src = jax_source(jax_throw_cells; have = (:x, :r, :s), want = :total)
+        native = prepare(jax_throw_cells; have = (:x, :r, :s), want = :total)
+        for (args, message, E) in (((vcat(x, 250.0), 0.7, 1.3), "xi is too large", DomainError),
+                                   ((x, -0.7, 1.3), "x must be positive", DomainError),
+                                   ((x, 0.7, -1.3), "rate must be positive", ArgumentError))
+            @test_throws E native(args...)
+            @test_throws message rk_jax_evaluate(src, "kernel", args)
+        end
     end
 end

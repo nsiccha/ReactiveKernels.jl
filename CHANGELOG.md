@@ -16,6 +16,36 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.149
+
+- `jax_source`: a `throw` under a condition that depends on data translates
+  as a runtime check, masked by its conditions, instead of refusing the
+  module with "a throw that depends on data has no JAX translation". So the
+  `mean()` of ReactiveKernelsDistributionKernels' one-sided LogNormal moment
+  objects (`lower_truncated_lognormal`, `upper_truncated_lognormal`, and a
+  LogNormal's own mean as the lower one at a bound of 0), whose scale guard
+  is `scale >= 0 ? scale : throw(DomainError(...))`, now emits (snag
+  `jax-source-refus-05f10f2c`). The module raises on exactly the values the
+  native program throws on: a ternary or `if` whose other arm is the value is
+  the check followed by that arm (no `jax.lax.cond`), `x > 0 || throw(...)`
+  is a check of `x > 0`, and a throw in a vmapped cell holds for the lanes
+  that do not take its arm. The right side of a traced `&&`/`||` is now
+  masked by its left side, so a runtime check there no longer fails for
+  lanes that never run it. An exception's message is its first string
+  argument (`DomainError(x, "message")` used to raise with `x`); a throw or
+  check in a helper called under its caller's data-dependent condition is
+  still refused.
+- `jax_source`: two-argument `hypot` is `jnp.hypot`, also with mixed argument
+  types (`hypot(c + 2, 3)` used to be refused inside Base's `promote`).
+- `jax_source`: a range whose ends are data with no static limit (a scan over
+  `n:-1:2` with `n` computed from a parameter) is refused with a
+  `JAXEmissionError` naming the recipe. It used to emit a `jnp.arange` of a
+  traced value, a module that JAX rejected only when it traced it.
+- The LogNormal variances (`var()` of the moment objects above) are still
+  refused: a plate child spliced under a lazy arm (`_logmills_quadrature`)
+  reaches the module without its plan, and the continued fraction's length is
+  data.
+
 ## 0.1.148
 
 - `jax_source`: `jax.grad` through a `logaddexp` whose two inputs are both
