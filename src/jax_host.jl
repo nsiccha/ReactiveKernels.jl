@@ -642,12 +642,13 @@ function _host_generator_reduce(ctx::_JaxContext, f, gen::Expr, kwargs)
 end
 
 # `map(xs...) do args... body end`: the body as a function of one element of
-# each collection, called on each.
+# each collection, called on each. A `plate` over data (a binder's data-only
+# column, such as a per-group step count) is the same map on the host.
 function _host_do(ctx::_JaxContext, ex)
     call, lambda = ex.args
     call isa Expr && call.head === :call && lambda isa Expr && lambda.head === :-> ||
         _jax_error("the do-block `", ex, "` has no host translation", _jax_where(ctx))
-    _jax_resolve(ctx, call.args[1]) === map ||
+    _jax_resolve(ctx, call.args[1]) in (map, plate) ||
         _jax_error("a do-block on `", call.args[1], "` has no host translation", _jax_where(ctx))
     params = lambda.args[1]
     names = params isa Symbol ? Symbol[params] : Symbol[p for p in params.args]
@@ -701,8 +702,12 @@ function _host_call(ctx::_JaxContext, f, positional, kwargs)
         return c
     end
     default = _jax_expr(ctx, positional[3])
-    _PyVal(c.code * (f === get ? ".get(" : ".setdefault(") * key.code * ", " * default.code * ")",
-           Base.valtype(c.T), true)
+    v = _PyVal(c.code * (f === get ? ".get(" : ".setdefault(") * key.code * ", " * default.code * ")",
+               Base.valtype(c.T), true)
+    # `get!` writes the dictionary: bind it where it runs, so the write
+    # happens even when the source discards its value (a statement
+    # `get!(d, k, v)`), and before any later read of `d`.
+    f === get! ? _jax_bind!(ctx, :value, v) : v
 end
 
 function _host_length(ctx::_JaxContext, x::_PyVal)
@@ -853,7 +858,7 @@ function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, m
     key = (:host_traceable, objectid(f), Tuple(types))
     name = get(ctx.mod.helper_names, key, nothing)
     if name === nothing
-        name = _jax_identifier(ctx.mod.used, Symbol("_rk_", nameof_or(f), "_np"))
+        name = _jax_private_identifier(ctx.mod.used, Symbol("_rk_", nameof_or(f), "_np"))
         ctx.mod.helper_names[key] = name
         scope = _JaxScope()
         params = [_jax_identifier(scope.used, n) for n in names]
@@ -880,6 +885,27 @@ end
 
 # The host-side helper that pads a ragged value (a list of arrays) for the
 # JAX functions.
+# A prepared integer scalar (a parameter block's end, a scan length, a level
+# count) sets shapes in the functions, so JAX must know it while it traces,
+# also when the prepared data are `jax.jit` arguments. `prepare_data` returns
+# it as a `StaticInt`: an `int` that `jax.jit` treats as static (a pytree
+# node without leaves), retracing only for a new value.
+const _JAX_STATIC_INT = """
+class StaticInt(int):
+    \"\"\"An integer of the prepared data that sets a shape.
+
+    It is an `int` everywhere, and `jax.jit` treats it as static, so the
+    functions jit with the prepared data as arguments; a new value traces
+    them again.
+    \"\"\"
+
+    def __repr__(self):
+        return "StaticInt(%d)" % int(self)
+
+
+jax.tree_util.register_pytree_node(StaticInt, lambda s: ((), int(s)), lambda v, _: StaticInt(v))
+"""
+
 const _JAX_PAD_ROWS = """
 def _rk_pad_rows(rows):
     # A ragged value as the functions take it: the padded array (each row
@@ -903,7 +929,7 @@ data alone (in an order that computes each after its inputs), the boundary
 values the functions read from them, and each function's residual plan over
 its remaining ports followed by those values.
 """
-function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}())
+function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); keep = ())
     p1 = first(plans).second[1]
     g = p1.graph
     prefix = Recipe[]
@@ -953,6 +979,20 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}())
         end
         push!(boundaries, (fname, p, w, residual))
     end
+    # The data values `keep` names are boundary values too, which
+    # `prepare_data` returns although no function reads them (the layout's
+    # data-derived positions, read by the caller).
+    for name in keep
+        found = [o for r in prefix for o in r.outputs if o.name === name]
+        isempty(found) && append!(found, (v for v in p1.have if v.name === name && v.name in data_ports))
+        v = isempty(found) ? nothing : first(found)
+        v === nothing && throw(ArgumentError(
+            "jax_source: `keep` names `$name`, which is no data-only value of the program"))
+        cid = canon_id(g, v.id)
+        cid in seen_values && continue
+        push!(seen_values, cid)
+        push!(constants, v)
+    end
     # Only the recipes the boundary values need run in `prepare_data`.
     needed = Set{ValueId}(canon_id(g, v.id) for v in constants)
     kept = Recipe[]
@@ -980,25 +1020,61 @@ struct _HostUnsupported <: Exception
     recipe::Int
     error::JAXEmissionError
 end
+# A data definition (`jax_source`'s `definitions`) without a host translation:
+# `prepare_data` takes its value as an input instead.
+struct _HostUnsupportedDefinition <: Exception
+    name::Symbol
+    error::JAXEmissionError
+end
 
 # `prepare_data` over the raw data ports of `split`: the host code of its
 # prefix, returning a `dict` of the boundary values under `names` (a ragged
 # value padded, with its `<name>_lengths`). `types` are the boundary values'
 # types, or `nothing` for the types the translation infers. Returns the
 # function's lines and the boundary values' types.
-function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types)
+function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
+                                params = split.plan.have, definitions = ())
     p = split.plan
     scope = _JaxScope()
     ctx = _JaxContext(mod, scope, nothing, Main, Dict{Symbol,_PyVal}(), nothing)
     ctx.host = _HostState()
-    params = String[]
-    for (v, T) in zip(p.have, raw_types)
-        param = _jax_param_name(scope.used, v.name)
-        push!(params, param)
-        scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, true)
+    param_names = String[]
+    known = Dict{Symbol,_PyVal}()
+    for (v, T) in zip(params, raw_types)
+        # The caller passes the data by these names: keep them exactly.
+        param = _jax_param_name(scope.used, v.name; stable = false)
+        push!(param_names, param)
+        known[v.name] = _PyVal(param, T, true)
         _jax_ragged(T) ? _jax_emit!(ctx, param * " = [np.asarray(a) for a in " * param * "]") :
             _jax_is_array(T) && _jax_emit!(ctx, param * " = np.asarray(" * param * ", dtype=" *
                                            _host_dtype(eltype(T)) * ")")
+    end
+    # The data definitions, in order, over the parameters and the definitions
+    # before them. A data value takes the type the binding's own value has; a
+    # local of the definitions (`T0 === nothing`), the translation's.
+    for (name, ex, T0) in definitions
+        ctx.locals = copy(known)
+        first_line = length(scope.lines) + 1
+        T = T0
+        local_name = try
+            v = _jax_expr(ctx, ex)
+            T === nothing && (T = v.T)
+            local_name = _jax_fresh(ctx, name)
+            _jax_emit!(ctx, local_name * " = " * (_host_is_numeric_array(T) ?
+                "np.asarray(" * v.code * ", dtype=" * _host_dtype(eltype(T)) * ")" : v.code))
+            # Host text, as each recipe's (`_host_lines!`).
+            _host_lines!(ctx, first_line)
+            local_name
+        catch e
+            e isa JAXEmissionError || rethrow()
+            throw(_HostUnsupportedDefinition(name, e))
+        finally
+            ctx.locals = Dict{Symbol,_PyVal}()
+        end
+        known[name] = _PyVal(local_name, T, true)
+    end
+    for v in p.have
+        scope.values[canon_id(p.graph, v.id)] = known[v.name]
     end
     for recipe in p.recipes
         try
@@ -1026,16 +1102,27 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types)
         elseif _host_is_numeric_array(T)
             push!(entries, "\"" * name * "\": np.asarray(" * v.code * ", dtype=" *
                            _host_dtype(eltype(T)) * ")")
+        elseif T isa Type && T <: Integer
+            if !haskey(mod.helper_names, (:helper, "StaticInt"))
+                mod.helper_names[(:helper, "StaticInt")] = "StaticInt"
+                push!(mod.used, "StaticInt")
+                push!(mod.helpers, rstrip(_JAX_STATIC_INT))
+            end
+            push!(entries, "\"" * name * "\": StaticInt(" * v.code * ")")
         else
             push!(entries, "\"" * name * "\": " * v.code)
         end
     end
-    lines = String["def prepare_data(" * join(params, ", ") * "):"]
-    push!(lines, "    \"\"\"The functions' data inputs, computed from the raw data once per dataset.\"\"\"")
+    signature = join((n * ": " * (_jax_ragged(T) ? "list" : _jax_annotation(T))
+                      for (n, T) in zip(param_names, raw_types)), ", ")
+    lines = String["def prepare_data(" * signature * ") -> dict:"]
+    push!(lines, "    \"\"\"The functions' data inputs, computed from the raw data once per dataset.\n\n" *
+                 "    Pass the data by the names the model reads them; a list of arrays is a ragged\n" *
+                 "    column. Call the other functions with the result: `f(u, **prepared)`.\n    \"\"\"")
     for r in split.excluded
         push!(lines, "    # Computed by the functions (no host translation): " * _recipe_line(r))
     end
     append!(lines, scope.lines)
     push!(lines, "    return {" * join(entries, ", ") * "}")
-    lines, types
+    lines, types, param_names
 end

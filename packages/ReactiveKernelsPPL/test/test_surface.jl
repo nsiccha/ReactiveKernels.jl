@@ -3661,13 +3661,30 @@ end
             Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
                 Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                     Expr(:block, :(y[i] ~ Normal.(mu[i], s)))))), Dn; conditioned = Dn)
-    # Docstrings on plates do not lower; @scan stays reserved.
+    # A docstring before a top-level @plate or @scan block is refused naming
+    # the docstring, not read as a nested block (snag rkppl-docstring-454e2a8c).
     plate = Expr(:macrocall, Symbol("@plate"), LineNumberNode(2),
         Expr(:for, Expr(:(=), :i, :(eachindex(y))),
             Expr(:block, :(y[i] ~ Normal.(mu[i], s)))))
-    doc = Expr(:macrocall, Symbol("@doc"), LineNumberNode(1), "docs", plate)
-    # refused: @doc on a loop is a Julia error ('cannot document the following expression') (P3)
-    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block, doc), Dn; conditioned = Dn)
+    scan = Expr(:macrocall, Symbol("@scan"), LineNumberNode(2), quote
+        h[1] ~ Normal(0, 1)
+        for t in 2:T
+            h[t] ~ Normal(h[t-1], 1)
+        end
+    end)
+    for (block, name) in ((plate, "@plate"), (scan, "@scan"))
+        doc = Expr(:macrocall, Symbol("@doc"), LineNumberNode(1), "docs", block)
+        err = try
+            lower_rkppl(Expr(:block, doc), Dn; conditioned = Dn)
+            nothing
+        catch e
+            e
+        end
+        # refused: @doc on a loop is a Julia error ('cannot document the following expression') (P3)
+        @test err isa SurfaceLoweringError &&
+            occursin("docstring \"docs\" before a `$name` block", err.message) &&
+            !occursin("nested", err.message)
+    end
     # refused: malformed @scan (no for recurrence); comment '@scan stays reserved' is stale
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
         Expr(:macrocall, Symbol("@scan"), LineNumberNode(1),
