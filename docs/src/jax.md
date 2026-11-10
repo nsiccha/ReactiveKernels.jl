@@ -185,7 +185,8 @@ The translation follows the [core constraints](constraints.md):
   masks the reduction.
 - **Loops** written in a recipe or a `@traceable` helper are
   `jax.lax.fori_loop` (`while` loops are `jax.lax.while_loop`). Their carry
-  is the locals the body assigns, and an
+  is the locals the body assigns, each with a fixed dtype; a tuple or
+  `NamedTuple` local stays a tuple, its elements typed one by one. An
   indexed write `A[i] = v` is `A.at[i].set(v)`.
 - **Static conditions** decide while JAX traces: shapes, literals, and guards
   such as `n == k || throw(...)`. A function of such values is computed with
