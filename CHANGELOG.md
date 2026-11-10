@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.131
+## 0.1.132
 
 - `jax_source`: the hidden-Markov laws of ReactiveKernelsDistributionKernels
   0.1.5 translate (`normal_hmm_log_weights_logdensity` and its siblings under
@@ -49,6 +49,24 @@ are recorded in the git history only.
 - Generated module helpers drop the `_rk_` prefix (`_standardized`,
   `_isequal_np`), so a generated helper never takes a fixed helper's name: a
   module defined `_rk_isequal_np` twice and `prepare_data` recursed.
+
+## 0.1.131
+
+- A non-allocating program differentiates under native Enzyme reverse through
+  a `vcat` of operands of different array types, such as a vector parameter
+  stacked on a matrix parameter, `vcat(permutedims(c), D)`, or `vcat(c', D)`
+  (snag `rkppl-vcat-of-pa-decf6725`). The `vcat` step filled its buffer
+  through a loop over the operands, which the type-stability check reported
+  ("The prepared program's entry call is not type stable", at
+  `_vcat_destination_matches`) and native Enzyme reverse refused with
+  `IllegalTypeAnalysisException` or `EnzymeNoTypeError`. The step now checks
+  and copies its operands one inlined call per operand, and dense matrix
+  operands fill a matrix buffer through the native body's `vcat` copy.
+  Registered Enzyme (0.13.219) still refuses the step for a fresh `Matrix`
+  row beside a reshaped view, as an ordered vector's row is: it cannot
+  compile Base's `vcat` of them, the step's result for a buffer of another
+  shape, even where that call never runs. The Enzyme dogfood line
+  differentiates it.
 
 ## 0.1.130
 
