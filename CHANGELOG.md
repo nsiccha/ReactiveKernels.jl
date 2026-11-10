@@ -16,6 +16,27 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.140
+
+- `jax_source` translates `besselix(nu, x)` and `besseli(nu, x)`
+  (SpecialFunctions) of any order, a data value or one the program computes
+  included (snag `jax-source-perio-96f952a3`): a periodic Hilbert-space GP
+  weights harmonic `j` by `besselix(j, 1 / rho^2)`. Any order but 0 and 1
+  raised "`besselix` of an order other than a literal 0 or 1". A literal
+  order 0 or 1 is still `jsp.i0e` and its kin. Any other order in the JAX
+  functions is the module's `_rk_besselix` helper (JAX 0.12 has no
+  general-order function): the power series, or the uniform expansion in
+  large order followed by the downward recurrence, within about 4e-13 of
+  SciPy relative for orders 0 to 1000; `jax.grad` in `x` is the recurrence
+  identity, and a derivative in the order is NaN, as Julia's derivative rule
+  gives. `prepare_data` and values known while emitting use SciPy's `ive` and
+  `iv`. A negative integer order and, for an integer order, a negative `x`
+  follow Julia; a negative non-integer order is NaN in the JAX functions.
+- A package can register a scalar function's translation that reads the
+  call's arguments, such as a literal order, with a method of
+  `ReactiveKernels._jax_elementwise_call(ctx, f, args)`. It is applied to
+  scalars and, broadcast, elementwise to arrays.
+
 ## 0.1.139
 
 - `jax_source` follows a plain helper's lowered code through module-qualified

@@ -2,6 +2,7 @@ using ReactiveKernels
 using Test
 using LinearAlgebra: dot
 using LogExpFunctions: log1mexp
+using SpecialFunctions: besseli, besselix
 
 include(joinpath(@__DIR__, "jax_python.jl"))
 
@@ -1155,5 +1156,74 @@ end
             @test r.value ≈ native(0.7, Y) rtol = 1e-12
             @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), Y), [0.7])) rtol = 1e-6
         end
+    end
+end
+
+# Modified Bessel functions of any order (snag jax-source-perio-96f952a3): a
+# periodic Hilbert-space GP basis weights harmonic `j` by
+# `besselix(j, 1 / rho^2)`, with the harmonics a data value.
+@kernel jax_bessel_values(nu::Vector{Float64}, x::Vector{Float64}) = begin
+    scaled = besselix.(nu, x)
+    plain = besseli.(nu, x)
+    return scaled
+end
+@kernel jax_bessel_scale(rho::Float64, h::Vector{Float64}, sigma::Float64) = begin
+    a = 1 / rho^2
+    s = sum(log.(sigma .* besselix.(h, a))) + besselix(3, a) + besseli(0, rho) + besseli(2.5, rho)
+    return s
+end
+# A data-only recipe: `prepare_data` computes it with SciPy.
+@kernel jax_bessel_prepared(w::Float64, h::Vector{Float64}, x::Vector{Float64}) = begin
+    basis = besselix.(h, x)
+    s = w * sum(basis)
+    return s
+end
+
+@testset "jax_source: modified Bessel functions of any order" begin
+    values = string(jax_source(jax_bessel_values; have = (:nu, :x), want = :scaled))
+    @test occursin("_rk_besselix(nu, x)", values)
+    @test occursin("jax.custom_jvp", values)
+    plain = string(jax_source(jax_bessel_values; have = (:nu, :x), want = :plain))
+    @test occursin("_rk_besseli(nu, x)", plain) && occursin("def _rk_besselix(", plain)
+    scale = string(jax_source(jax_bessel_scale; have = (:rho, :h, :sigma), want = :s))
+    # A literal order 0 or 1 stays jax.scipy.special's own function.
+    @test occursin("jsp.i0(", scale) && occursin("_rk_besselix(3, ", scale)
+    prepared = jax_source(jax_bessel_prepared; have = (:w, :h, :x), want = :s,
+                          data = (; h = [1.0, 2.0], x = [0.5, 3.0]))
+    @test occursin("ssp.ive(", string(prepared))
+    @test !occursin("_rk_besselix", string(prepared))
+    if !rk_jax_available()
+        @test_skip false
+    else
+        # Orders on both sides of the expansion's order 25 and x on both
+        # sides of the series' x = 30; negative x and orders where Julia
+        # defines them.
+        nus = [0.0, 0.5, 1.0, 2.0, 3.5, 7.0, 12.0, 24.5, 25.0, 40.0, 120.0]
+        xs = [1e-6, 0.3, 2.0, 9.0, 29.5, 31.0, 80.0, 400.0, 5e3, 1e6]
+        nu = [repeat(nus; inner = length(xs)); 3.0; 4.0; -2.0; -3.0; 0.0]
+        x = [repeat(xs; outer = length(nus)); -7.0; -0.4; 2.5; 50.0; 0.0]
+        # Unscaled, past x ~ 700 Julia's `besseli` throws on overflow (JAX's is
+        # Inf), so it is compared where it is finite.
+        finite = abs.(x) .<= 400
+        for (want, nu, x) in ((:scaled, nu, x), (:plain, nu[finite], x[finite]))
+            native = prepare(jax_bessel_values; have = (:nu, :x), want)(nu, x)
+            src = jax_source(jax_bessel_values; have = (:nu, :x), want)
+            got = rk_jax_evaluate(src, "kernel", (nu, x)).value
+            @test all(isapprox(g, n; rtol = 1e-12) || g == n for (g, n) in zip(got, native))
+        end
+        native = prepare(jax_bessel_scale; have = (:rho, :h, :sigma), want = :s)
+        src = jax_source(jax_bessel_scale; have = (:rho, :h, :sigma), want = :s)
+        h = [1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]
+        for rho in (0.05, 0.3, 0.9, 2.0)
+            r = rk_jax_evaluate(src, "kernel", (rho, h, 1.3); grad = true)
+            @test r.value ≈ native(rho, h, 1.3) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), h, 1.3), [rho])) rtol = 1e-6
+        end
+        native = prepare(jax_bessel_prepared; have = (:w, :h, :x), want = :s)
+        hp, xp = [0.0, 1.0, 2.5, 30.0], [0.2, 4.0, 45.0, 12.0]
+        src = jax_source(jax_bessel_prepared; have = (:w, :h, :x), want = :s, data = (; h = hp, x = xp))
+        r = rk_jax_evaluate(src, "kernel", (0.7, hp, xp); grad = true, prepare = true)
+        @test r.value ≈ native(0.7, hp, xp) rtol = 1e-12
+        @test r.grad ≈ native(1.0, hp, xp) rtol = 1e-12
     end
 end

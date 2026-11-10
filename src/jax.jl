@@ -1695,6 +1695,17 @@ function _jax_elementwise(f)
     haskey(_JAX_PRELUDE, name) ? name => _JAX_PRELUDE[name] : name
 end
 
+"""
+    _jax_elementwise_call(ctx, f, args) -> Union{Nothing,_PyVal}
+
+The translation of the scalar function `f` called on `args` when it depends
+on the arguments themselves, not only on `f` (a literal order selecting a
+`jax.scipy.special` function), or `nothing`. It is applied to scalars and, in
+a broadcast, elementwise to arrays, so its code must act elementwise. A
+package adds one for its own function with a method of this function.
+"""
+_jax_elementwise_call(ctx::_JaxContext, f, args::Vector{_PyVal}) = nothing
+
 function _jax_elementwise_name(ctx::_JaxContext, f, args::Vector{_PyVal})
     length(args) == 2 && haskey(_JAX_BINARY_NAMES, f) && return _JAX_BINARY_NAMES[f]
     translation = _jax_elementwise(f)
@@ -1736,6 +1747,8 @@ function _jax_scalar_or_elementwise(ctx::_JaxContext, f, args::Vector{_PyVal})
     if f === (^) && length(args) == 2 && !_jax_is_array(args[1].T)
         return _jax_result(f, args, _py_infix("**", [args[1].code, args[2].code]))
     end
+    v = _jax_elementwise_call(ctx, f, args)
+    v === nothing || return v
     name = _jax_elementwise_name(ctx, f, args)
     name === nothing && return nothing
     _jax_result(f, args, name * "(" * _jax_args(args) * ")")
@@ -2329,6 +2342,8 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
     E = _jax_return_type(f, eltypes)
     T = R == 0 ? E : Array{E,R}
     scalars = [_PyVal(p.code, eltype_or_self(p.T)) for p in padded]
+    v = _jax_elementwise_call(ctx, f, scalars)
+    v === nothing || return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args))
     if haskey(_JAX_INFIX, f) || f === (*) || f === (^) ||
        _jax_elementwise_name(ctx, f, scalars) !== nothing
         v = f === (*) ? _PyVal(_py_infix("*", [p.code for p in padded]), E) :
