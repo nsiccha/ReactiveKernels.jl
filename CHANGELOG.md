@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.136
+## 0.1.140
 
 - New: `plate_partition(…; single = true)` declares that every key holds each
   label exactly once, so a partition is one cell of each named plate (one
@@ -39,6 +39,66 @@ are recorded in the git history only.
   local gradient went from 1.22–1.28 µs / 1,232 B to 0.45–0.47 µs / 592 B,
   6.2–6.4 to 2.3–2.4 times its share of a whole-model gradient, with bitwise
   equal values and gradients (todo `1yggoad`).
+
+## 0.1.139
+
+- `jax_source` follows a plain helper's lowered code through module-qualified
+  calls (`M.f(x)`, lowered `getproperty(M, :f)`), `getglobal(M, name)` of a
+  module and name known while emitting, `Val` tags (`Val(:f)`, `Val{:f}()`),
+  Vararg methods and their splats (`f(args...)`, lowered
+  `Core._apply_iterate`), and functions or types passed on as arguments.
+  StanBlocks `@deffun @juliacompat` functions call each callee as
+  `StanBlocks.jcall(Val{:f}(), _JuliaCallScope{M}(), args...)`, so one whose
+  body is straight-line now translates to the arithmetic it reaches; before,
+  every one raised `JAXEmissionError: the field read jcall on
+  ReactiveKernels._JaxCallable{Module}(StanBlocks)` (snag
+  `jax-source-stanb-06917e13`: BrunoPMX's `pk_generator`,
+  `logistic_dose_response` and `biexponential_rates`). A `@deffun` whose body
+  has a loop or an `if` stays a plain helper with loops or branches, which has
+  no translation.
+
+## 0.1.138
+
+- `jax_source`: a gather through a ragged integer row is padded as the row is
+  (snag `jax-ragged-index-b8420d16`). In a plate cell, `xs[rs[i]]`, `xs[r]` or
+  `view(xs, r)` with `R::Vector{Vector{Int}}` lost the row's lengths, so the
+  cell's reduction summed the padding entries, silently: the JAX value
+  repeated each row's last index up to the longest row (2.093 where native
+  gives 1.352), and an empty row added `x[end]`. Its gradient took the same
+  extra terms. The gathered value now carries the row's lengths, and every
+  reduction of it masks them.
+- `sum(f, v)`, `dot(u, v)` and `u' * v` of a padded (ragged) row now mask its
+  padding as `sum(v)` does; they summed it, also for a ragged input's own row.
+- A row of a ragged value read through `getindex`/`view` in lowered code keeps
+  its lengths, as `x[i]` in source does.
+- A gather through a ragged row beside another kept dimension (`M[r, :]`)
+  raises `JAXEmissionError`: its padding would sit on an inner axis that no
+  reduction masks. Its JAX value used to sum the padding.
+
+## 0.1.137
+
+- `jax_source`: a scan whose step outputs a named tuple of numbers and
+  numeric vectors (a K-state filter's `(lpd, w, m)`) translates. Each vector
+  field stacks as the `(steps, K)` array of its rows, as `jax.lax.scan`
+  stacks it; `steps[t].w`, `steps[end].m` and generators over the steps read
+  it as native does. It raised "a scan whose step outputs … has no JAX
+  translation yet".
+
+## 0.1.136
+
+- `jax_source`'s `prepare_data` writes an element of an array that a list or
+  dictionary holds, `rows[i][j] = r` (snag `jax-host-nested-6a304948`); it
+  raised `JAXEmissionError: the assignment target (rows[i])[counts[i]] has no
+  host translation`. The write is in place: with no copy when the source built
+  the list from allocations (`[Vector{Int}(undef, n[k]) for k in …]`, a
+  count-then-fill partition), else after one copy of the list and its
+  elements, so a source never writes its inputs.
+- In `prepare_data`, an `if`, `elseif`, `&&` or `||` whose condition is
+  decided while emitting (`eltype(x) <: Integer`, `length(t) > 0` of a tuple)
+  translates its taken arm alone, as `? :` and the JAX functions already did.
+  Both arms were translated, so an untaken arm with no method for these types
+  (`Int128(maximum(x))` of strings) raised a raw `ErrorException: type
+  TypeofBottom has no field parameters` from `jax_source`.
 
 ## 0.1.135
 

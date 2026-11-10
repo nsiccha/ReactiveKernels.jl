@@ -138,7 +138,14 @@ JAX code:
   nothing is unrolled.
 - A vector built with `push!` is a list; dictionaries are `dict`s; an array a
   source writes by index is written in place, after a copy if the source did
-  not allocate it.
+  not allocate it. An element of an array that a list or dictionary holds
+  (`rows[i][j] = r`) is written in place too: with no copy when the source
+  built the list from allocations (`[Vector{Int}(undef, n[k]) for k in …]`),
+  else after a copy of the list and its elements.
+- A condition decided while emitting (`eltype(x) <: Integer`, the length of a
+  tuple) takes its arm alone in an `if`, `elseif`, `? :`, `&&` or `||`: the
+  other arm is not translated, as Julia never runs it, so its calls need no
+  method for these types.
 - A ragged column is a list of arrays. A ragged prepared value reaches the
   functions padded, with its `<name>_lengths` and `<name>_flat` (the
   positions of its entries in the flattened padded array).
@@ -215,8 +222,12 @@ The interface conventions:
   padded array plus a `<name>_lengths` input; `prepare_data` builds both from
   a list of arrays (without `data`, the module's `pad_ragged` does). Padding
   repeats each row's last entry, so padded slots hold valid values.
-  Reductions mask by length, and a loop over a group's entries keeps its carry
-  past the group's length. `reduce(vcat, cells)` of a ragged value drops the
+  Reductions mask by length (`sum`, also `sum(f, v)`, `prod`, `maximum`,
+  `minimum`, `logsumexp`, `dot(u, v)`, `u' * v`, `length` and generators),
+  and a loop over a group's entries keeps its carry past the group's length.
+  A gather through a ragged integer row (`x[r]`, `x[rows[i]]`, `view(x, r)`)
+  is padded as the row is: an empty row reads `x[end]` in its padding, which
+  the mask drops. `reduce(vcat, cells)` of a ragged value drops the
   padding; its length, the total, is the length of `<name>_flat` of the
   prepared input whose lengths the cells have (a plate over its rows, or over
   its group index).
@@ -240,6 +251,15 @@ A function that a recipe calls is translated if:
 - it is a prepared kernel, which becomes a module-level function of its plan;
 - or it is a plain function whose lowered code is straight-line.
 
+In that lowered code, module-qualified calls (`M.f(x)`), `getglobal(M, name)`
+of a module and name known while emitting, `Val` tags (`Val(:f)`,
+`Val{:f}()`), Vararg methods and their splats (`f(args...)`), and functions or
+types passed on as arguments resolve while emitting, so a call that reaches
+its callee this way is followed into it. StanBlocks `@deffun @juliacompat`
+functions are such calls (`StanBlocks.jcall(Val{:f}(), _JuliaCallScope{M}(),
+args...)`): one whose body is straight-line translates to the arithmetic it
+reaches (ReactiveKernels 0.1.139).
+
 A package adds a translation for its own function with a method of
 `ReactiveKernels._jax_elementwise` (a scalar function's `jax` name) or
 `ReactiveKernels._jax_function_call`. A package's plain helper with branches
@@ -258,7 +278,8 @@ checked and dropped.
 These shapes have no translation; each raises a `JAXEmissionError` naming the
 recipe and the construct:
 
-- a plain helper with loops or branches that is not `@traceable`;
+- a plain helper with loops or branches that is not `@traceable`, including
+  a StanBlocks `@deffun` whose body has a loop or an `if`;
 - in the JAX functions, a loop whose trip count is data with no static bound
   (JAX loops and arrays need static shapes), and a `throw` that depends on
   data (a runtime check is the form that has one); `prepare_data` runs both;
@@ -269,6 +290,8 @@ recipe and the construct:
   input's;
 - plates of rank above one over ragged data;
 - `reshape` of a ragged value (its padding has no shape);
+- a gather through a ragged row beside another kept dimension (`M[r, :]`),
+  whose padding would sit on an inner axis;
 - `history` scans over a padded (ragged) sequence or with a named-tuple
   history.
 

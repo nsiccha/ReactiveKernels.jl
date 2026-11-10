@@ -21,7 +21,7 @@ are recorded in the git history only.
 - A partition query or sampler whose keys hold each label once, such as one
   `@plate` cell per subject partitioned by subject, runs each partition as
   that one cell at one row (ReactiveKernels `plate_partition(…; single = true)`,
-  0.1.136, now the compat floor), and computes the subject-level values its
+  0.1.140, now the compat floor), and computes the subject-level values its
   cell reads there as numbers instead of one-element arrays. Values are equal
   (a design row times its coefficients is summed in column order, so a value
   through it can differ in the last bits). On BRM's `unit_cost.jl` toys (24
