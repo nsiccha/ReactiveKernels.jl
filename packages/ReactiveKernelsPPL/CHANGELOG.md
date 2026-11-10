@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.135
+## 0.1.139
 
 - Base's named numbers are those numbers: `Inf`, `NaN`, `pi`, `π`, `ℯ` and the
   typed `Inf32`, `NaN16`, … (Base's exported numeric constants) read as the
@@ -32,6 +32,58 @@ are recorded in the git history only.
   name Inf` (`array plate column reads unknown name Inf` in a cell, `arg arg2
   references unknown name pi` for a bare prior argument). Snag
   `rkppl-assignment-88ffa090`.
+
+## 0.1.138
+
+- A docstring written before a top-level `@plate` or `@scan` block now fails
+  with a `SurfaceLoweringError` that quotes the docstring and says to write it
+  before a declaration inside the block (where it is retained) or to use a `#`
+  comment. It used to fail saying `@plate` is only admitted at model top level
+  (nested plates do not lower), or that `@scan` must not be nested inside
+  another macro, although the block was at top level. A docstring on a loop
+  stays refused, as in Julia (`cannot document the following expression`).
+  Models that lowered before lower unchanged. Snag `rkppl-docstring-454e2a8c`.
+
+## 0.1.137
+
+- An undotted `*` beside a value that may be an array stays Julia's product.
+  A per-observation matrix the model computes (an observation vector
+  broadcast against a data matrix, `(c .* r) .* U`), named or inline, times a
+  vector of data (`w`, quadrature weights) is the matrix-vector product: one
+  value per observation, with `w` read whole. Lowering used to refuse it
+  ("combines vectors without dots"). **Correctness:** `U * w` over data only,
+  and `D * wn` with weights a model function computes (`wn = normalized(w)`),
+  were rewritten to the elementwise `.*`, which failed with a
+  `DimensionMismatch` at the first evaluation when the matrix was not square,
+  and computed another density when it was; both now compute Julia's
+  product. A vector times a vector (`r * c`, each one value
+  per observation) is refused at binding, as Julia refuses it. Snag
+  `rkppl-vector-dat-85351195`.
+
+## 0.1.136
+
+- A model call (`model(; data)`, `model(; data) | (; y)`, `@rkppl data begin
+  … end`) names what its lowering generates (a cell `@scan`'s seeds, a
+  selected cell argument, a destructured value) by the declaration's source,
+  as `lower_rkppl` has since 0.1.109, instead of with `gensym`'s process
+  counter. One declaration rebound at other sizes now gives an equal
+  `kernel_expr`, and two builds of one binding share their types, so the
+  second compiles nothing more where such a name reaches a type (a selected
+  argument in a split node). Values and gradients are unchanged. Snag
+  `kernel-expr-of-a-26ed1e5c`.
+
+## 0.1.135
+
+- The full-model sampler query is a LogDensityProblems target. With
+  `LogDensityProblems` loaded, a `SamplerQuery` from `prepare_sampler`
+  implements `dimension` (`layout.total`), `capabilities`
+  (`LogDensityOrder{1}`), `logdensity` (`q(u)`) and `logdensity_and_gradient`,
+  which returns a fresh gradient vector on every call, so it can be passed to
+  WarmupHMC, Pathfinder or an optimizer directly. A point of another length is
+  a `DimensionMismatch`. Before this, `LogDensityProblems.dimension(q)` was a
+  `MethodError` and only `slice_problem` and `joined_problem` targets existed.
+  A query still serves one caller at a time: give each concurrent chain its
+  own query, or let a sampler deep-copy one per chain.
 
 ## 0.1.134
 

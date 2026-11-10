@@ -661,8 +661,15 @@ end
 # Julia 1.12 also versions global bindings. A builder may eval a named
 # KernelSpec or import a submodel immediately before lowering; resolve the
 # complete program in one latest-world scope, without a caller-side barrier.
+#
+# A model call names what it lowers by its source, as `_lower_rkppl` does, not by
+# a process counter: a declaration rebound at other sizes spells the same
+# `kernel_expr`, and two builds of one binding share their types (snags
+# `gensym-in-kernel-54164b85`, `kernel-expr-of-a-26ed1e5c`).
 _lower_model(m::RKPPLModel, supplied; conditioned = keys(m.conditioned)) =
-    Base.invokelatest(_lower_model_latest, m, supplied; conditioned)
+    ReactiveKernels._within_kernel_names(m.ast) do
+        Base.invokelatest(_lower_model_latest, m, supplied; conditioned)
+    end
 
 function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.conditioned))
     values = merge(copy(m.fixed), Dict{Symbol,ColumnData}(pairs(supplied)), m.conditioned)
@@ -1308,8 +1315,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     prior_defs = Pair{Symbol,Any}[Symbol(:_ppl_prior_input_, s.lhs) => s.rhs
         for s in sample if s.lhs in sized_decls]
     # Data and `hcat` values can be the matrix of a product `M * v`, whose
-    # vector `v` is read whole (`_matrix_product_operand`).
-    product_matrices = union(data, matrix_values)
+    # vector `v` is read whole (`_matrix_product_operand`), and so can a
+    # definition computed from one (`D = (c .* r) .* U`).
+    product_matrices = _product_matrix_closure(det, union(data, matrix_values))
     # A statement's whole reads (the vector of a product, a gathered value)
     # are whole exactly as in its named definition.
     statement_whole = Set{Symbol}()
@@ -2476,8 +2484,13 @@ function _canonical_expr(ex, data, detmap, detshape, env, where;
         # predictor classification (which checks the coefficient
         # declaration); anything else with a matrix operand already
         # failed above.
+        # `v * s` equals `v .* s` only for a number `s`: the other
+        # operand must be one (`_maybe_array_operand`), or this is
+        # Julia's product (`D * w` contracts `w` with `D`'s columns).
         if fn === :* && :matrix ∉ argshapes && :array ∉ argshapes &&
-                (argshapes[1] === :vector) != (argshapes[2] === :vector)
+                (argshapes[1] === :vector) != (argshapes[2] === :vector) &&
+                !_maybe_array_operand(args[argshapes[1] === :vector ? 2 : 1],
+                    detmap, env)
             return Expr(:call, :.*, args...)
         elseif fn === :/ && argshapes[1] === :vector &&
                 argshapes[2] === :scalar
@@ -2490,6 +2503,50 @@ function _canonical_expr(ex, data, detmap, detshape, env, where;
         return Expr(:call, :.-, args...)
     end
     return Expr(ex.head, ex.args[1], args...)
+end
+
+# Can `ex`, which this analysis shapes `:scalar`, hold an array? A
+# whole-value data input, a declared array, a module call's result or a
+# module constant has the shape Julia gives it at evaluation, which
+# lowering does not know; so has anything computed from one, except a
+# reduction or a positional read. A sampled scalar, a literal and a number
+# a module binds are numbers. `*` beside such an operand is Julia's product,
+# which equals the elementwise `.*` only for a number.
+function _maybe_array_operand(ex, detmap, env::_ShapeEnv,
+        active::Set{Symbol} = Set{Symbol}())
+    ex isa Number && return false
+    if ex isa GlobalRef
+        isdefined(ex.mod, ex.name) || return true
+        return !(getfield(ex.mod, ex.name) isa Number)
+    end
+    if ex isa Symbol
+        (ex in env.values || ex in env.matrices) && return true
+        haskey(detmap, ex) || return false
+        ex in active && return false
+        push!(active, ex)
+        r = _maybe_array_operand(detmap[ex], detmap, env, active)
+        delete!(active, ex)
+        return r
+    end
+    ex isa Expr || return false
+    any_arg(args) = any(a -> _maybe_array_operand(a, detmap, env, active), args)
+    if ex.head === :call && !isempty(ex.args)
+        fn = ex.args[1]
+        fn isa GlobalRef && return true
+        # `sum(v)` is a number; `sum(v; dims = 2)` keeps an axis.
+        fn in REDUCTION_FNS && return any(a -> Meta.isexpr(a, (:parameters, :kw)),
+            ex.args[2:end])
+        return any_arg(ex.args[2:end])
+    elseif ex.head === :ref
+        return !all(_is_scalar_position, ex.args[2:end]) ||
+            !(ex.args[1] isa Symbol)
+    elseif _is_dotted_call(ex)
+        ex.args[1] isa GlobalRef && return true
+        return any_arg(ex.args[2].args)
+    elseif ex.head === Symbol("'")
+        return _maybe_array_operand(ex.args[1], detmap, env, active)
+    end
+    return true
 end
 
 # Canonicalization and predictor classification use the same definition
@@ -6807,6 +6864,21 @@ _is_doc_macro(m) =
     (Meta.isexpr(m, :., 2) && first(m.args) in (:Core, :Base) &&
         last(m.args) isa QuoteNode && last(m.args).value === Symbol("@doc"))
 
+# A docstring documents a declaration. `@plate` and `@scan` blocks are loops
+# that bind no name of their own, and Julia refuses to document a loop
+# (`cannot document the following expression`), so the docstring is refused
+# here, naming it, rather than being read as a nested block.
+function _block_docstring_message(text::String, macro_name::Symbol)
+    first_line = first(split(text, '\n'))
+    shown = length(first_line) > 48 ? first(first_line, 45) * "..." : first_line
+    stmt = macro_name === Symbol("@plate") ? "y[i] ~ ..." : "h[t] ~ ..."
+    return "docstring $(repr(shown)) before a `$macro_name` block: a " *
+        "docstring documents a `~`, `.~` or `=` declaration, and a " *
+        "`$macro_name` block is a loop, which Julia does not document. " *
+        "Write the docstring before a declaration inside the block (above " *
+        "`$stmt`), where it is retained, or use a `#` comment"
+end
+
 function _unwrap_trivia(st::Expr)
     while st.head === :macrocall
         if st.args[1] === Symbol("@plate") && length(st.args) == 4
@@ -6820,6 +6892,8 @@ function _unwrap_trivia(st::Expr)
                 st.args[end] isa Expr ||
                 _sfail("only `@doc \"...\" <statement>` docstring form " *
                        "unwraps here")
+            _is_block_macro(st.args[end]) &&
+                _sfail(_block_docstring_message(st.args[3], st.args[end].args[1]))
             st = st.args[end]
             continue
         end
@@ -8073,9 +8147,6 @@ function _reject_statement(st::Expr)
     elseif head in (:function, :macro, :return, :local, :global, :struct,
         :module, :import, :using, :export)
         return _sfail("`$head` does not lower at model level")
-    elseif head === :macrocall && !isempty(st.args) &&
-            st.args[1] === Symbol("@plate")
-        return _sfail("docstrings on `@plate` blocks do not lower")
     end
     return _sfail("unsupported model statement $(repr(st)) " *
                   "(only `~`, `.~`, `=` and reserved macros lower)")
@@ -10800,8 +10871,13 @@ function _composed_trigger(rhs, ctx)
             Set{Symbol}())
         sb = _shape_of(b, ctx.data, ctx.detmap, Dict{Symbol,Symbol}(),
             Set{Symbol}())
-        return (sa === :scalar && _composed_has_sub(b, ctx, true)) ||
-               (sb === :scalar && _composed_has_sub(a, ctx, true))
+        # Julia's product with a value that may be an array (`D * w`,
+        # `w = normalized(x)`) is not an elementwise scaling: it stays one
+        # per-observation value (`_maybe_array_operand`).
+        scaling(s, x) = s === :scalar &&
+            !_maybe_array_operand(x, ctx.detmap, ctx.shape_env)
+        return (scaling(sa, a) && _composed_has_sub(b, ctx, true)) ||
+               (scaling(sb, b) && _composed_has_sub(a, ctx, true))
     elseif op === :.+ || op ===:.-
         # An operand that composes on its own (a product over a sub, or
         # a name bound to a composition) makes the whole sum composed.
@@ -10991,6 +11067,15 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         # product `z * lam * tau` folds left like Julia's `*`.
         lhs = length(args) == 2 ? args[1] :
             Expr(:call, :*, args[1:end-1]...)
+        # Julia's product with a value that may be an array (`D * w`) is
+        # one per-observation value, read as a column like a gather.
+        if any(x -> _canon_shape(x, ctx) === :scalar &&
+                _maybe_array_operand(x, ctx.detmap, ctx.shape_env),
+                (lhs, args[end]))
+            column = _extract_column(pname, Expr(:call, :*, lhs, args[end]), ctx)
+            push!(datas, column)
+            return column
+        end
         return _extract_composed_tree(pname, Expr(:call, :.*, lhs,
             args[end]), ctx, subs, scalars, datas)
     elseif op === :- && length(args) == 1
