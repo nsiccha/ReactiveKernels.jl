@@ -62,21 +62,42 @@ module_source = jax_source(built, plan; values = (:mu,))
 ```
 
 The module's functions are:
-- `prepare_data`, which takes the data columns, in sorted name order or by
-  name, and returns the functions' data inputs as a `dict` (see
-  [Data preparation](#Data-preparation));
+- `prepare_data`, which takes the data the model is bound with, by the
+  names the model reads (columns and scalar values, in sorted name order or
+  by name), and returns the functions' data inputs as a `dict` (see
+  [Data preparation](#Data-preparation)). It computes the data-only
+  definitions `bind_data` evaluates, such as `w = cos.(x ./ period)`, itself;
 - `log_density`, the sampler's target (prior, likelihood and log Jacobian);
 - its parts, `log_prior`, `log_likelihood` and `log_jacobian`;
 - `constrain`, a `dict` of every declared parameter's constrained value plus
   each value named in `values`.
 
-The functions take `unconstrained` followed by the prepared inputs.
+The functions take `unconstrained` and the prepared data by keyword,
+`f(unconstrained, **prepared)`. Each
+has a docstring and type annotations, and the model's own docstrings (see
+`rkppl_documentation`) appear in the module docstring and, for each value
+`constrain` returns, in its docstring.
 
-Its constants describe the inputs:
-- `DIMENSION`, the length of `unconstrained`;
-- `PARAMETERS`, each parameter's 0-based `start`/`stop` in `unconstrained`,
-  its transform and its dimensions;
-- `DATA`, each data column's dtype and rank, and whether it is ragged;
+Two functions of the prepared data describe the parameters, since their
+sizes can follow the data (a level axis, a series length):
+- `dimension(prepared)`, the length of `unconstrained`;
+- `parameters(prepared)`, each parameter's 0-based `start`/`stop` in
+  `unconstrained`, its transform and its dimensions.
+
+When no parameter's size reads data, the constants `DIMENSION` and
+`PARAMETERS` state the same. The module's other constants describe the
+inputs:
+- `DATA`, each of `prepare_data`'s parameters' dtype and rank, and whether
+  it is ragged;
+- `UNTRANSLATED`, each data-only definition `prepare_data` takes as an input
+  instead of computing it, with the reason: one without a host translation,
+  or a derived definition whose binding guards missing observations. It is
+  `{}` when every definition is computed. A model whose `UNTRANSLATED` is
+  not empty is **not supported for standalone preparation from raw data**:
+  supplying the Julia binder's values for those inputs runs it, but that is
+  not a standalone module, so a consumer's standalone check asserts
+  `UNTRANSLATED == {}`. A response with missing values also passes its
+  presence mask, `_rkppl_present_<name>`;
 - `PREPARED`, the same for each prepared input;
 - `INPUTS`, the functions' parameters in order.
 
@@ -91,10 +112,10 @@ import jax, jax.numpy as jnp
 from numpyro.infer import MCMC, NUTS
 import model  # the module jax_source wrote
 
-prepared = model.prepare_data(x=x, y=y)  # raw columns, once per dataset
+prepared = model.prepare_data(x=x, y=y)  # the bound data, once per dataset
 potential = lambda u: -model.log_density(u, **prepared)
 mcmc = MCMC(NUTS(potential_fn=potential), num_warmup=500, num_samples=1000)
-mcmc.run(jax.random.PRNGKey(0), init_params=jnp.zeros(model.DIMENSION))
+mcmc.run(jax.random.PRNGKey(0), init_params=jnp.zeros(model.dimension(prepared)))
 draws = jax.vmap(lambda u: model.constrain(u, **prepared))(mcmc.get_samples())
 ```
 
@@ -125,16 +146,29 @@ JAX code:
   where JAX folds them.
 - A data-only recipe without a host translation stays in the functions; a
   comment in `prepare_data` names it.
+- `definitions = [name => expression, …]` (with `data`) computes data
+  values on the host before that prefix, from the other data values;
+  `prepare_data` then takes what the expressions read instead of the values
+  they define. `jax_source(built, plan)` passes the binding's data-only
+  definitions this way. One without a host translation stays an input,
+  listed with its reason in the module's `UNTRANSLATED`.
 
 The functions' inputs have static shapes, so they also run under `jax.jit`
-with the prepared data as arguments.
+with the prepared data as arguments: `jax.jit(model.log_density)(u,
+**prepared)`. An integer of the prepared data that sets a shape (a parameter
+block's end, a scan's length, a level count) is a `StaticInt`, an `int` that
+`jax.jit` treats as static; a new value traces the function again, as a new
+array shape does.
 
 ## What the translation keeps
 
 The translation follows the [core constraints](constraints.md):
 
 - **Plates** are `jax.vmap` of the cell, with shared operands unmapped.
-- **Scans** are `jax.lax.scan` of the step.
+- **Scans** are `jax.lax.scan` of the step. A scan whose range ends at a
+  group's length in a ragged plate cell (`for t in 2:length(y[g])`) runs to
+  the longest group's length: past a group's own length its carry keeps its
+  value and its outputs are padding, which reductions mask.
 - **Lazy branches** are `jax.lax.cond` of their arms. Under `vmap`, JAX
   evaluates both arms of a condition that differs between cells and selects.
   Each lane's untaken arm reads its inputs through `stop_gradient`, so a NaN
@@ -222,6 +256,5 @@ recipe and the construct:
 - `reshape` of a ragged value (its padding has no shape);
 - `history` scans.
 
-Preparation that `bind_data` does before the program runs (a binder's own
-level coding, frozen definitions) is not in the program, so `prepare_data`
-takes its results: the bound columns, as `DATA` lists them.
+Frozen definitions (`frozen_values`) come from another binding, so
+`prepare_data` takes their values, as `DATA` lists them.

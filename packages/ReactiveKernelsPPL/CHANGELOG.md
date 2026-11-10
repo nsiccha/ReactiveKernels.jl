@@ -16,6 +16,59 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.140
+
+- **Breaking for `jax_source` callers:** a module's `prepare_data` takes the
+  data the caller binds, by the names the model reads (columns and scalar
+  values such as a prior scale or a period), and computes the data-only
+  definitions `bind_data` evaluates (`w = cos.(x ./ period)`) itself, in host
+  NumPy. It took the binding's internal copies of scalar values
+  (`_rkppl_value_<name>`) and those definitions' values, which only Julia
+  computed, so a Python caller could not bind new data. Pass the same names
+  the model is bound with: `m.prepare_data(**raw)`. `DATA` describes those
+  parameters. A definition without a host translation stays an input, named
+  with the reason in the new module constant `UNTRANSLATED` (`{}` when every
+  definition is computed); so does a derived definition whose binding guards
+  missing observations. A response with missing values still passes its
+  presence mask as `_rkppl_present_<name>`. Frozen definitions
+  (`frozen_values`) stay inputs. Needs ReactiveKernels 0.1.130.
+- **Breaking for `jax_source` callers:** a module whose parameter sizes read
+  data (a `levels(g)` axis, a scan over a data length) no longer states the
+  emitting binding's `DIMENSION` and `PARAMETERS`, which differed between
+  datasets of one program. The new functions `dimension(prepared)` and
+  `parameters(prepared)` give them for the data `prepare_data` returned; a
+  module whose layout reads no data keeps the constants too. Use
+  `m.dimension(prepared)` in place of `m.DIMENSION`.
+- The functions jit with the prepared data as arguments: a prepared integer
+  that sets a shape is a `StaticInt` (ReactiveKernels 0.1.130).
+- `jax_source` translates per-group recurrences over series of different
+  lengths: an observed `@scan` in a `@plate` cell, a deterministic one over a
+  ragged input, and one with a draw per step (a random walk per group), and a
+  ragged `@plate` whose cell reads a per-group value. RKPPL's own helpers
+  have translations (`_ppl_rows`, `_observed_scan_cell_bound`,
+  `_ppl_cell_scan_position`, `_ppl_cell_scan_nsteps`); the cell's scan
+  bound check is a runtime check.
+- **Breaking for `jax_source` callers:** the module's functions take
+  `(unconstrained, **prepared)`: the prepared data is passed by keyword, as
+  `f(u, **m.prepare_data(**raw))` already did, and positional prepared
+  arguments are no longer accepted (user GO `08jy2dh`). The signatures name
+  no internal values.
+- `constrain` returns what native `constrain(layout, u)` does: a submodel's
+  values nested under its name (`{"lv": {"sigma": …}}`, was `"lv.sigma"`),
+  and a parameter with no coordinates in this binding (`b[axes(X, 2)]` with
+  no columns) as an empty array, which it left out, so the module differed
+  between bindings.
+- A module's functions have docstrings (what each computes, how to call it)
+  and type annotations. The model's own docstrings (`rkppl_documentation`)
+  are listed in the module docstring, and `constrain`'s docstring lists each
+  returned value with its docstring.
+- `prepare_data` computes chained data-only definitions (`angle = x ./ period`
+  read by `cos.(angle)`) and a submodel's (`v.mask`): a name was resolved as a
+  global function (`Base.angle`) or reported undefined. A layout whose block
+  ends in a submodel's scope (`b_g.z`, BRM's group effects) is read under its
+  `prepare_data` key; it raised `the layout reads ..., which prepare_data does
+  not return`.
+
 ## 0.1.139
 
 - Base's named numbers are those numbers: `Inf`, `NaN`, `pi`, `π`, `ℯ` and the

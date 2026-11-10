@@ -108,6 +108,38 @@ function rk_jax_evaluate(src::JAXSource, name, args; grad::Bool = false, prepare
     end
     _rk_jax_unarray(Base.eval(Module(), Meta.parse(output)))
 end
+const _RK_JAX_LAYOUT_DRIVER = raw"""
+import importlib.util, sys
+import numpy as np
+spec = importlib.util.spec_from_file_location("rk_module", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+exec(open(sys.argv[2]).read())
+prepared = module.prepare_data(*ARGS)
+params = module.parameters(prepared)
+print("(dimension = %d, parameters = Dict(%s))" % (module.dimension(prepared), ", ".join(
+    '"%s" => (start = %d, stop = %d, dims = (%s))' % (k, v["start"], v["stop"],
+        "".join("%d," % d for d in v["dims"])) for k, v in params.items())))
+"""
+
+"""
+    rk_jax_layout(src, data) -> (; dimension, parameters)
+
+`dimension(prepared)` and `parameters(prepared)` of an RKPPL module for the
+raw `data` (`prepare_data`'s inputs, in order): the length of
+`unconstrained` and each parameter's `(start, stop, dims)`.
+"""
+function rk_jax_layout(src::JAXSource, data)
+    dir = mktempdir()
+    module_path = joinpath(dir, "rk_module.py")
+    write(module_path, src)
+    args_path = joinpath(dir, "args.py")
+    write(args_path, "ARGS = [" * join(map(_rk_py_input, Any[data...]), ", ") * "]\n")
+    driver = joinpath(dir, "layout.py")
+    write(driver, _RK_JAX_LAYOUT_DRIVER)
+    Base.eval(Module(), Meta.parse(read(`$RK_JAX_PYTHON $driver $module_path $args_path`, String)))
+end
+
 _rk_jax_unarray(x::AbstractVector) = all(v -> v isa Number, x) ? Float64[v for v in x] :
     [_rk_jax_unarray(v) for v in x]
 _rk_jax_unarray(x::NamedTuple) = map(_rk_jax_unarray, x)
