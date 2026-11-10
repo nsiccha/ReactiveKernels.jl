@@ -661,8 +661,15 @@ end
 # Julia 1.12 also versions global bindings. A builder may eval a named
 # KernelSpec or import a submodel immediately before lowering; resolve the
 # complete program in one latest-world scope, without a caller-side barrier.
+#
+# A model call names what it lowers by its source, as `_lower_rkppl` does, not by
+# a process counter: a declaration rebound at other sizes spells the same
+# `kernel_expr`, and two builds of one binding share their types (snags
+# `gensym-in-kernel-54164b85`, `kernel-expr-of-a-26ed1e5c`).
 _lower_model(m::RKPPLModel, supplied; conditioned = keys(m.conditioned)) =
-    Base.invokelatest(_lower_model_latest, m, supplied; conditioned)
+    ReactiveKernels._within_kernel_names(m.ast) do
+        Base.invokelatest(_lower_model_latest, m, supplied; conditioned)
+    end
 
 function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.conditioned))
     values = merge(copy(m.fixed), Dict{Symbol,ColumnData}(pairs(supplied)), m.conditioned)

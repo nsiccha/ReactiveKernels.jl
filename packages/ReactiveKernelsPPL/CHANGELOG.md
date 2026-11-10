@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.135
+## 0.1.137
 
 - An undotted `*` beside a value that may be an array stays Julia's product.
   A per-observation matrix the model computes (an observation vector
@@ -31,6 +31,31 @@ are recorded in the git history only.
   product. A vector times a vector (`r * c`, each one value
   per observation) is refused at binding, as Julia refuses it. Snag
   `rkppl-vector-dat-85351195`.
+
+## 0.1.136
+
+- A model call (`model(; data)`, `model(; data) | (; y)`, `@rkppl data begin
+  … end`) names what its lowering generates (a cell `@scan`'s seeds, a
+  selected cell argument, a destructured value) by the declaration's source,
+  as `lower_rkppl` has since 0.1.109, instead of with `gensym`'s process
+  counter. One declaration rebound at other sizes now gives an equal
+  `kernel_expr`, and two builds of one binding share their types, so the
+  second compiles nothing more where such a name reaches a type (a selected
+  argument in a split node). Values and gradients are unchanged. Snag
+  `kernel-expr-of-a-26ed1e5c`.
+
+## 0.1.135
+
+- The full-model sampler query is a LogDensityProblems target. With
+  `LogDensityProblems` loaded, a `SamplerQuery` from `prepare_sampler`
+  implements `dimension` (`layout.total`), `capabilities`
+  (`LogDensityOrder{1}`), `logdensity` (`q(u)`) and `logdensity_and_gradient`,
+  which returns a fresh gradient vector on every call, so it can be passed to
+  WarmupHMC, Pathfinder or an optimizer directly. A point of another length is
+  a `DimensionMismatch`. Before this, `LogDensityProblems.dimension(q)` was a
+  `MethodError` and only `slice_problem` and `joined_problem` targets existed.
+  A query still serves one caller at a time: give each concurrent chain its
+  own query, or let a sampler deep-copy one per chain.
 
 ## 0.1.134
 
