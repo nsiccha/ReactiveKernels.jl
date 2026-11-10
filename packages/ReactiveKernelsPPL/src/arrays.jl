@@ -1243,7 +1243,81 @@ function _is_computed_row_product(ex, plan::StructuralPlan)
     D, w = ex.args[2], ex.args[3]
     computed = D isa Symbol ? _is_derived(plan, D) && !_is_bind_data_derived(plan, D) :
         _is_vector_valued(D, plan)
-    return computed && !_is_vector_valued(w, plan)
+    return computed && (!_is_vector_valued(w, plan) || _whole_product_vector(w, plan))
+end
+
+# The vector of a product `D * w` that reads data whole: data and data-only
+# values with no observation axis (quadrature weights `w`, `w ./ sum(w)`,
+# `normalized(w)`), beside model-level values. Lowering read them whole
+# (`_classify_reads!`); with data bound, the model-level input rule
+# confirms it (`_bound_model_level_inputs`), so a per-observation column
+# here stays a vector, and `D * x` the vector product Julia refuses.
+function _whole_product_vector(w, plan::StructuralPlan)
+    syms = _expr_value_symbols(w)
+    isempty(syms) && return false
+    names = _all_name_set(plan)
+    bound = !isempty(plan.columns)
+    inputs, wholedefs = bound ? _bound_model_level_inputs(plan) :
+        (Set{Symbol}(), Set{Symbol}())
+    for s in syms
+        if !(s in names) && !_is_derived(plan, s)
+            # Raw data: observation-free only when read whole.
+            bound && !(s in inputs) && return false
+        elseif _is_derived(plan, s)
+            # A data-only definition read whole (`wn = normalized(w)`).
+            _is_bind_data_derived(plan, s) || return false
+            bound && !(s in wholedefs) && !(s in inputs) && return false
+        else
+            _is_vector_valued(s, plan) && return false
+        end
+    end
+    return true
+end
+
+# With data bound, `D * w` over a vector of data `w` is Julia's
+# matrix-vector product only when `D` can hold a matrix: a bound data
+# matrix, a definition computed from one (`(c .* r) .* U`), a module value.
+# A vector `D` (every column it reads a bound vector) times a vector is the
+# product Julia refuses, reported here instead of at evaluation.
+function _check_whole_product!(ex, plan::StructuralPlan, label)
+    D, w = ex.args[2], ex.args[3]
+    _is_vector_valued(w, plan) || return nothing
+    any(s -> haskey(plan.columns, s) && plan.columns[s] isa AbstractArray,
+        _expr_value_symbols(w)) || return nothing
+    _may_hold_matrix(D, plan) && return nothing
+    return _fail(label, "`$(repr(ex))` multiplies two vectors: as in Julia, " *
+        "`*` over two vectors is not elementwise — write the interaction " *
+        "dotted (`x .* z`); `D * w` with a data matrix `D` (or one computed " *
+        "from it) contracts `w` with its columns")
+end
+
+# Can `ex` hold a matrix once data are bound? False only when every value it
+# reads elementwise is a number, a scalar parameter or a bound vector.
+function _may_hold_matrix(ex, plan::StructuralPlan, active = Set{Symbol}())
+    ex isa Number && return false
+    if ex isa Symbol
+        haskey(plan.columns, ex) && return !(plan.columns[ex] isa Union{Number,AbstractVector})
+        ex in active && return false
+        i = findfirst(d -> d.name === ex, plan.derived)
+        j = findfirst(a -> a.name === ex, plan.assignments)
+        rhs = i !== nothing ? plan.derived[i].expr :
+            j !== nothing ? plan.assignments[j].expr : nothing
+        # A parameter is a number; a plate latent or scan state a vector.
+        rhs === nothing && return _is_array_param(plan, ex)
+        push!(active, ex)
+        r = _may_hold_matrix(rhs, plan, active)
+        delete!(active, ex)
+        return r
+    end
+    ex isa Expr || return true
+    if _is_dotted_call(ex)
+        ex.args[1] isa GlobalRef && return true
+        return any(a -> _may_hold_matrix(a, plan, active), ex.args[2].args)
+    elseif ex.head === :call && !isempty(ex.args) && ex.args[1] isa Symbol &&
+            (ex.args[1] in ELEMENTWISE_OPS || ex.args[1] in (:+, :-))
+        return any(a -> _may_hold_matrix(a, plan, active), ex.args[2:end])
+    end
+    return true
 end
 
 # A derived column the model computes at bind from data alone (a module
