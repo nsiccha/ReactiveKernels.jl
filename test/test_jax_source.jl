@@ -422,6 +422,88 @@ end
     total = a * sum(row .* row) + a^2 * sum(rows[1, :])
     return total
 end
+# A count-then-fill row partition (BRM's): the elements of a list of arrays
+# the source allocates are written in place, with no copy.
+@traceable function jax_prep_fill(groups::AbstractVector, cells::AbstractVector)
+    lookup = Dict{eltype(cells),Int}()
+    for k in eachindex(cells)
+        lookup[cells[k]] = k
+    end
+    counts = zeros(Int, length(cells))
+    for r in eachindex(groups)
+        i = get(lookup, groups[r], 0)
+        if i != 0
+            counts[i] += 1
+        end
+    end
+    rows = [Vector{Int}(undef, counts[k]) for k in eachindex(cells)]
+    for k in eachindex(counts)
+        counts[k] = 0
+    end
+    for r in eachindex(groups)
+        i = get(lookup, groups[r], 0)
+        if i != 0
+            counts[i] += 1
+            rows[i][counts[i]] = r
+        end
+    end
+    rows
+end
+@kernel jax_prep_partition(groups::Vector{String}, cells::Vector{String}, a::Float64) = begin
+    rows = jax_prep_fill(groups, cells)
+    sizes = plate(rows) do r
+        a * length(r) + sum(r)
+    end
+    total = sum(sizes)
+    return total
+end
+# Elements written in a list whose arrays the source did not allocate itself
+# (here arithmetic on an input's rows): the list and its elements are copied
+# first, as an input array is before its first write.
+@traceable function jax_prep_rescale(R::AbstractVector)
+    rows = [2 .* R[k] for k in eachindex(R)]
+    for k in eachindex(rows)
+        for j in eachindex(rows[k])
+            rows[k][j] = rows[k][j] * j
+        end
+    end
+    rows
+end
+@kernel jax_prep_rescaled(R::Vector{Vector{Float64}}, a::Float64) = begin
+    rows = jax_prep_rescale(R)
+    cells = plate(rows) do r
+        a * sum(r)
+    end
+    total = sum(cells)
+    return total
+end
+# Conditions decided while emitting (type tests, a tuple's length) take their
+# arm alone in an `if`, `elseif`, `? :`, `&&` and `||`: the untaken arms have
+# no method for string labels (`Int128` of a string).
+@traceable jax_prep_label_span(x::AbstractVector) = Int128(maximum(x)) - Int128(minimum(x))
+@traceable function jax_prep_label_count(x::AbstractVector, axes::Tuple)
+    if eltype(x) <: Integer
+        n = Int(jax_prep_label_span(x)) + length(x)
+    elseif length(axes) > 0
+        n = Int(jax_prep_label_span(x))
+    else
+        n = length(x)
+    end
+    length(axes) > 0 && jax_prep_label_span(x) > 0 && (n = 0)
+    wide = eltype(x) <: AbstractString || jax_prep_label_span(x) > 4
+    m = eltype(x) <: Integer ? jax_prep_label_span(x) : 2
+    n + m + 10 * wide
+end
+@kernel jax_prep_labels(g::Vector{String}, a::Float64) = begin
+    n = jax_prep_label_count(g, ())
+    total = a * n
+    return total
+end
+@kernel jax_prep_int_labels(g::Vector{Int}, a::Float64) = begin
+    n = jax_prep_label_count(g, ())
+    total = a * n
+    return total
+end
 
 # A derivative rule called from a plate cell: the JAX module computes its
 # primal cut, whose operations a lowering's table holds as source records.
@@ -813,6 +895,22 @@ end
     host_reshape = split(split(string(reshaped), "def prepare_data")[2], "\ndef kernel")[1]
     @test occursin("np.reshape(x, (1, -1), order=\"F\")", host_reshape)
     @test !occursin("jnp.", host_reshape)
+    # Element writes into a list of arrays (snag jax-host-nested-6a304948):
+    # in place where the source allocated the arrays, after a copy otherwise.
+    labels_g = ["s2", "s1", "s2", "s3", "s1", "s9", "s2"]
+    labels_c = ["s1", "s2", "s3", "s4"]
+    partition = jax_source(jax_prep_partition; have = (:a, :groups, :cells), want = :total,
+                           data = (; groups = labels_g, cells = labels_c))
+    @test occursin(r"rows\w*\[i\w* - 1\]\[counts\w*\[i\w* - 1\] - 1\] = r", string(partition))
+    @test !occursin("_rk_deepcopy", string(partition))
+    rescaled = jax_source(jax_prep_rescaled; have = (:a, :R), want = :total, data = (; R))
+    @test occursin(r"rows\w* = _rk_deepcopy_np\(rows\w*\)", string(rescaled))
+    # Only the taken arm of a decided condition is translated.
+    labels = jax_source(jax_prep_labels; have = (:a, :g), want = :total, data = (; g))
+    @test !occursin("label_span", string(labels))
+    int_labels = jax_source(jax_prep_int_labels; have = (:a, :g), want = :total,
+                            data = (; g = [4, 9, 2]))
+    @test occursin("label_span", string(int_labels))
     if !rk_jax_available()
         @test_skip false
     else
@@ -856,6 +954,18 @@ end
         # A loop whose trip count is data runs on the host.
         counted = jax_source(jax_data_count; have = (:x, :n), want = :s, data = (x = [1.0, 2.0, 4.0], n = 2))
         @test occursin("for i in range(1, n + 1):", string(counted))
+        native = prepare(jax_prep_partition; have = (:a, :groups, :cells), want = :total)
+        @test rk_jax_evaluate(partition, "kernel", (0.7, labels_g, labels_c); prepare = true).value ≈
+              native(0.7, labels_g, labels_c) rtol = 1e-12
+        native = prepare(jax_prep_rescaled; have = (:a, :R), want = :total)
+        r = rk_jax_evaluate(rescaled, "kernel", (0.7, R); grad = true, prepare = true)
+        @test r.value ≈ native(0.7, R) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), R), [0.7])) rtol = 1e-6
+        native = prepare(jax_prep_labels; have = (:a, :g), want = :total)
+        @test rk_jax_evaluate(labels, "kernel", (0.5, g); prepare = true).value ≈ native(0.5, g) rtol = 1e-12
+        native = prepare(jax_prep_int_labels; have = (:a, :g), want = :total)
+        @test rk_jax_evaluate(int_labels, "kernel", (0.5, [4, 9, 2]); prepare = true).value ≈
+              native(0.5, [4, 9, 2]) rtol = 1e-12
     end
 end
 

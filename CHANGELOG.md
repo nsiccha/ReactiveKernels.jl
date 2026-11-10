@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.136
+## 0.1.137
 
 - `jax_source`: a scan whose step outputs a named tuple of numbers and
   numeric vectors (a K-state filter's `(lpd, w, m)`) translates. Each vector
@@ -24,6 +24,22 @@ are recorded in the git history only.
   stacks it; `steps[t].w`, `steps[end].m` and generators over the steps read
   it as native does. It raised "a scan whose step outputs … has no JAX
   translation yet".
+
+## 0.1.136
+
+- `jax_source`'s `prepare_data` writes an element of an array that a list or
+  dictionary holds, `rows[i][j] = r` (snag `jax-host-nested-6a304948`); it
+  raised `JAXEmissionError: the assignment target (rows[i])[counts[i]] has no
+  host translation`. The write is in place: with no copy when the source built
+  the list from allocations (`[Vector{Int}(undef, n[k]) for k in …]`, a
+  count-then-fill partition), else after one copy of the list and its
+  elements, so a source never writes its inputs.
+- In `prepare_data`, an `if`, `elseif`, `&&` or `||` whose condition is
+  decided while emitting (`eltype(x) <: Integer`, `length(t) > 0` of a tuple)
+  translates its taken arm alone, as `? :` and the JAX functions already did.
+  Both arms were translated, so an untaken arm with no method for these types
+  (`Int128(maximum(x))` of strings) raised a raw `ErrorException: type
+  TypeofBottom has no field parameters` from `jax_source`.
 
 ## 0.1.135
 

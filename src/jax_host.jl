@@ -23,13 +23,15 @@
 mutable struct _HostState
     frame::Set{String}   # Python names of this frame's locals: rebinding them is safe
     safe::Set{String}    # names holding arrays this frame allocated: written in place
+    deep::Set{String}    # names holding collections whose elements this frame
+                         # allocated: their elements written in place
     lists::Set{String}   # names holding Python lists (`push!` targets)
     in_function::Bool    # a function body, where `return` is a statement
     depth::Int           # nesting in conditionals and loops
     returns::Vector{Any} # the types an explicit `return` returns
 end
 _HostState(frame::Set{String} = Set{String}(); in_function::Bool = false) =
-    _HostState(frame, Set{String}(), Set{String}(), in_function, 0, Any[])
+    _HostState(frame, Set{String}(), Set{String}(), Set{String}(), in_function, 0, Any[])
 
 # --- text -----------------------------------------------------------------------------
 
@@ -140,6 +142,14 @@ const _HOST_ALLOCATIONS = ("jnp.zeros(", "jnp.ones(", "jnp.full(", "np.zeros(", 
                            "np.full(", "np.empty(")
 _host_fresh(code::AbstractString) = code in ("[]", "{}") || endswith(code, ".copy()") ||
     any(p -> startswith(code, p) && _host_one_call(code), _HOST_ALLOCATIONS)
+# A list of allocations (`[np.zeros(n) for k in ...]`): each element is a
+# fresh array (a list, a dictionary), so its elements may be written in place.
+function _host_fresh_elements(code::AbstractString)
+    startswith(code, "[") && endswith(code, "]") || return false
+    clauses = findfirst(" for ", code)
+    clauses === nothing && return false
+    _host_fresh(code[nextind(code, 1):prevind(code, first(clauses))])
+end
 # `code` is one call, not a call followed by more operations.
 function _host_one_call(code::AbstractString)
     depth = 0
@@ -157,7 +167,9 @@ function _host_bind!(ctx::_JaxContext, lhs::Symbol, v::_PyVal)
     name = _host_name!(ctx, lhs)
     name == v.code || _jax_emit!(ctx, name * " = " * v.code)
     v.code == "[]" || v.code in h.lists ? push!(h.lists, name) : delete!(h.lists, name)
-    _host_fresh(v.code) || v.code in h.safe ? push!(h.safe, name) : delete!(h.safe, name)
+    deep = _host_fresh_elements(v.code) || v.code in h.deep
+    deep ? push!(h.deep, name) : delete!(h.deep, name)
+    deep || _host_fresh(v.code) || v.code in h.safe ? push!(h.safe, name) : delete!(h.safe, name)
     ctx.locals[lhs] = _PyVal(name, v.T, true)
     nothing
 end
@@ -166,8 +178,22 @@ function _host_assign!(ctx::_JaxContext, lhs, v::_PyVal)
     lhs isa Symbol && return _host_bind!(ctx, lhs, v)
     lhs isa Expr && lhs.head === :ref && lhs.args[1] isa Symbol && haskey(ctx.locals, lhs.args[1]) &&
         return _host_write!(ctx, lhs, v)
+    root = _host_ref_root(lhs)
+    root === nothing || haskey(ctx.locals, root) && return _host_nested_write!(ctx, lhs, root, v)
     _jax_error("the assignment target `", lhs, "` has no host translation", _jax_where(ctx))
 end
+
+# The local an indexed target `A[i][j]` writes into (`A`), and how many
+# indexings deep (2); `nothing` and 0 for any other target.
+function _host_ref_depth(lhs)
+    depth = 0
+    while lhs isa Expr && lhs.head === :ref
+        lhs = lhs.args[1]
+        depth += 1
+    end
+    lhs isa Symbol ? (lhs, depth) : (nothing, 0)
+end
+_host_ref_root(lhs) = (r = _host_ref_depth(lhs); last(r) >= 2 ? first(r) : nothing)
 
 # Make local `s` an array this frame may write: a copy, unless it allocated it.
 function _host_own!(ctx::_JaxContext, s::Symbol)
@@ -198,9 +224,49 @@ function _host_write!(ctx::_JaxContext, lhs::Expr, v::_PyVal)
     nothing
 end
 
-# The locals `exs` assign and the arrays they write by index.
+const _HOST_DEEPCOPY = """
+def _rk_deepcopy(x):
+    # A copy of a collection and of its elements, whose elements the source
+    # then writes in place.
+    import copy
+    return copy.deepcopy(x)
+"""
+# Make local `s` a collection whose elements this frame may write: a copy of
+# it and its elements, unless it allocated them (a list of allocations).
+function _host_own_deep!(ctx::_JaxContext, s::Symbol)
+    v = ctx.locals[s]
+    v.code in ctx.host.deep && return v
+    name = _host_name!(ctx, s)
+    _jax_emit!(ctx, name * " = " * _jax_helper!(ctx, "_rk_deepcopy", _HOST_DEEPCOPY) *
+                    "(" * v.code * ")")
+    v.code in ctx.host.lists && push!(ctx.host.lists, name)
+    push!(ctx.host.safe, name)
+    push!(ctx.host.deep, name)
+    ctx.locals[s] = _PyVal(name, v.T, true)
+end
+
+# `A[i][j] = v`: an element of an array that a collection holds (a list of
+# arrays this source builds), written in place.
+function _host_nested_write!(ctx::_JaxContext, lhs::Expr, root::Symbol, v::_PyVal)
+    _host_own_deep!(ctx, root)
+    inner = _jax_expr(ctx, lhs.args[1])
+    if inner.T isa Type && inner.T <: AbstractDict
+        length(lhs.args) == 2 || _jax_error("a dictionary key of several indices", _jax_where(ctx))
+        key = _jax_expr(ctx, lhs.args[2])
+        _jax_emit!(ctx, _py_atom(inner.code) * "[" * key.code * "] = " * v.code)
+        return
+    end
+    indexed = _jax_index(ctx, inner, lhs.args[2:end])
+    startswith(indexed.code, _py_atom(inner.code) * "[") ||
+        _jax_error("the indexed write `", lhs, "` has no host translation", _jax_where(ctx))
+    _jax_emit!(ctx, indexed.code * " = " * v.code)
+    nothing
+end
+
+# The locals `exs` assign, the arrays they write by index, and the
+# collections whose elements they write by index (`A[i][j] = v`).
 function _host_targets(exs)
-    assigned, written = Set{Symbol}(), Set{Symbol}()
+    assigned, written, nested = Set{Symbol}(), Set{Symbol}(), Set{Symbol}()
     walk(ex) = begin
         ex isa Expr || return
         ex.head in (:quote, :inert, :->, :function) && return
@@ -208,10 +274,9 @@ function _host_targets(exs)
             target = ex.args[1]
             target isa Expr && target.head === :(::) && (target = target.args[1])
             if target isa Expr && target.head === :ref
-                while target isa Expr && target.head === :ref
-                    target = target.args[1]
-                end
-                target isa Symbol && push!(written, target)
+                root, depth = _host_ref_depth(target)
+                root === nothing || push!(written, root)
+                depth >= 2 && push!(nested, root)
             elseif target isa Symbol
                 push!(assigned, target)
             elseif target isa Expr && target.head === :tuple
@@ -221,7 +286,7 @@ function _host_targets(exs)
         foreach(walk, ex.args)
     end
     foreach(walk, exs)
-    assigned, written
+    assigned, written, nested
 end
 
 # Before a loop or conditional: the outer locals its body assigns take names
@@ -229,12 +294,14 @@ end
 # writes are made this frame's own here, not on each pass. A conditional's new
 # locals take their names here too, so both arms assign the same one.
 function _host_prepare!(ctx::_JaxContext, bodies; conditional::Bool = false)
-    assigned, written = _host_targets(bodies)
+    assigned, written, nested = _host_targets(bodies)
     for s in sort!(collect(union(assigned, written)))
         if haskey(ctx.locals, s)
             v = ctx.locals[s]
             v.T isa _JaxCallable && continue
-            if s in written && !(v.T isa Type && v.T <: AbstractDict)
+            if s in nested
+                _host_own_deep!(ctx, s)
+            elseif s in written && !(v.T isa Type && v.T <: AbstractDict)
                 _host_own!(ctx, s)
             elseif !(v.code in ctx.host.frame)
                 name = _host_name!(ctx, s)
@@ -292,6 +359,7 @@ _jax_typeof_T(@nospecialize(T)) = T isa Type ? T : Any
 # An `if` (`value`: its value is used).
 function _host_if(ctx::_JaxContext, ex, value::Bool)
     condition = _jax_expr(ctx, ex.args[1])
+    condition.code in ("True", "False") && return _host_decided_if(ctx, ex, condition, value)
     _host_prepare!(ctx, ex.args[2:end]; conditional = true)
     before = copy(ctx.locals)
     values = Set(keys(ctx.scope.values))
@@ -318,8 +386,25 @@ function _host_if(ctx::_JaxContext, ex, value::Bool)
     for s in first(_host_targets(ex.args[2:end]))
         haskey(ctx.locals, s) || continue
         delete!(ctx.host.safe, ctx.locals[s].code)
+        delete!(ctx.host.deep, ctx.locals[s].code)
     end
     value ? _PyVal(result, _host_join(T1, T2), true) : _PyVal("None", Nothing, true)
+end
+# An `if` whose condition is decided while emitting (`eltype(x) <: Integer`,
+# `length(t) > 0` of a tuple) takes its arm alone, in line: Julia never runs
+# the other, whose calls may have no method for these types. As in an arm, a
+# recipe's `return` there has no host translation.
+function _host_decided_if(ctx::_JaxContext, ex, condition::_PyVal, value::Bool)
+    taken = condition.code == "True" ? ex.args[2] : length(ex.args) >= 3 ? ex.args[3] : nothing
+    taken === nothing && return _PyVal("None", Nothing, true)
+    ctx.host.depth += 1
+    try
+        value && return _jax_expr(ctx, taken)
+        _jax_effect(ctx, taken)
+        _PyVal("None", Nothing, true)
+    finally
+        ctx.host.depth -= 1
+    end
 end
 function _host_restore!(ctx::_JaxContext, before, values)
     empty!(ctx.locals); merge!(ctx.locals, before)
@@ -348,6 +433,10 @@ end
 # `a && b`, `a || b`: the right side runs only when Julia's does.
 function _host_short_circuit(ctx::_JaxContext, ex, is_or::Bool)
     a = _jax_expr(ctx, ex.args[1])
+    # A left side decided while emitting is the value, or runs the right side
+    # alone.
+    a.code == (is_or ? "True" : "False") && return a
+    a.code == (is_or ? "False" : "True") && return _jax_expr(ctx, ex.args[2])
     b, lines = _host_capture(() -> _jax_expr(ctx, ex.args[2]), ctx)
     isempty(lines) && b.T !== Union{} &&
         return _PyVal(_py_infix(is_or ? "or" : "and", [a.code, b.code]), _host_join(Bool, b.T), true)

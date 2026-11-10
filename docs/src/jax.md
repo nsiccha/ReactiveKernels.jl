@@ -138,7 +138,14 @@ JAX code:
   nothing is unrolled.
 - A vector built with `push!` is a list; dictionaries are `dict`s; an array a
   source writes by index is written in place, after a copy if the source did
-  not allocate it.
+  not allocate it. An element of an array that a list or dictionary holds
+  (`rows[i][j] = r`) is written in place too: with no copy when the source
+  built the list from allocations (`[Vector{Int}(undef, n[k]) for k in …]`),
+  else after a copy of the list and its elements.
+- A condition decided while emitting (`eltype(x) <: Integer`, the length of a
+  tuple) takes its arm alone in an `if`, `elseif`, `? :`, `&&` or `||`: the
+  other arm is not translated, as Julia never runs it, so its calls need no
+  method for these types.
 - A ragged column is a list of arrays. A ragged prepared value reaches the
   functions padded, with its `<name>_lengths` and `<name>_flat` (the
   positions of its entries in the flattened padded array).
