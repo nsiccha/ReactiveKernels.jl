@@ -16,6 +16,40 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.131
+
+- `jax_source`: the hidden-Markov laws of ReactiveKernelsDistributionKernels
+  0.1.5 translate (`normal_hmm_log_weights_logdensity` and its siblings under
+  `LogDensity`). The forward pass is a `jax.lax.scan` with `history`, and the
+  folds over the states are `jax.lax.fori_loop`s, so one module serves every
+  number of steps and states. What it takes, all generic:
+  - a shape test decides while tracing. Prepared integers are `StaticInt`s,
+    so the functions know them then; `size(x, d)` past `x`'s rank, or of a
+    number, is 1; comparisons of integer literals fold, so a conditional on
+    one takes its arm alone; `x in t` over a tuple of numbers is Python's
+    `in` when both are known, else `jnp.isin`;
+  - an index Julia requires to be 1 (past an array's rank, `v[i, 1, 1]`, or of
+    a number, `s[1, 1, 1]`) is checked, while tracing when it is known then,
+    else as a runtime check, and dropped;
+  - `dropdims(x; dims = d)` translates.
+- `@_record_source` accepts a leading `@inline`, which the method keeps.
+- In `prepare_data`, `stack(rows; dims)` of a plate of vectors is `np.stack`.
+  The plate is a list of arrays on the host, so a later `raw_basis[:, b]`
+  raised `TypeError` (BRM's HSGP basis with `orthogonal_to`).
+- RK's tie-exact `logaddexp` (mixture densities) translates as
+  `jnp.logaddexp`, and integer `div` (lowered as `checked_sdiv_int`, as in an
+  HSGP mode index) truncates toward zero as in Julia.
+- A scan with `history` translates (a vector of leading entries or a number):
+  `jax.lax.scan` carries the result vector and writes step `j`'s output at its
+  entry; an index of `eachindex(x)` is bounded by the sequence's length, so a
+  generator over `1:j-1` runs to that bound, masked. `j ± c` keeps a static
+  bound. A ragged column's empty row keeps the column's element type when
+  padded (an integer index column stayed float and could not index), and a
+  ragged value a function returns in a `dict` comes with `<name>_lengths`.
+- Generated module helpers drop the `_rk_` prefix (`_standardized`,
+  `_isequal_np`), so a generated helper never takes a fixed helper's name: a
+  module defined `_rk_isequal_np` twice and `prepare_data` recursed.
+
 ## 0.1.130
 
 - `jax_source(spec; data, definitions)`: `definitions`, an ordered collection
@@ -26,7 +60,7 @@ are recorded in the git history only.
   parameters' dtype, rank and raggedness) and `UNTRANSLATED`: each definition
   without a host translation, or given as a `JAXEmissionError` naming the
   reason, with that reason; such a definition stays a `prepare_data` input.
-  ReactiveKernelsPPL 0.1.137 passes a binding's data-only definitions.
+  ReactiveKernelsPPL 0.1.140 passes a binding's data-only definitions.
 - `jax_source(spec; data, keep)`: `prepare_data` also returns the data-only
   values `keep` names (the functions take them too).
 - A scan over a range whose end is data with a static bound (a group's
@@ -36,9 +70,6 @@ are recorded in the git history only.
   entry at its length, and `vcat` of values before a padded vector adds their
   lengths to its extent. Such a cell's scan raised `ConcretizationTypeError`
   in Python (a traced `jnp.arange` stop).
-- RK's tie-exact `logaddexp` (mixture densities) translates as
-  `jnp.logaddexp`, and integer `div` (lowered as `checked_sdiv_int`, as in an
-  HSGP mode index) truncates toward zero as in Julia.
 - `sum(x; init)` and `prod(x; init)` translate; `sinpi` and `cospi` translate,
   their argument reduced to `[-1, 1]` first. `sum`, `prod`, `maximum` and
   `minimum` with `dims = d` reduce that axis and keep it, as Julia does.
@@ -60,13 +91,6 @@ are recorded in the git history only.
   reads resolve to the program's definitions before any global function; and
   `DATA` and the `prepare_data` `JAXFunction` name its parameters as Python
   spells them. On the host, `plate(xs...) do … end` over data is a map.
-- A scan with `history` translates (a vector of leading entries or a number):
-  `jax.lax.scan` carries the result vector and writes step `j`'s output at its
-  entry; an index of `eachindex(x)` is bounded by the sequence's length, so a
-  generator over `1:j-1` runs to that bound, masked. `j ± c` keeps a static
-  bound. A ragged column's empty row keeps the column's element type when
-  padded (an integer index column stayed float and could not index), and a
-  ragged value a function returns in a `dict` comes with `<name>_lengths`.
 - With `data`, a module's functions take `(unconstrained, **prepared)` and
   read the prepared inputs inside, so their signatures name what the caller
   supplies (user GO `08jy2dh`); positional prepared arguments are no longer
@@ -75,8 +99,7 @@ are recorded in the git history only.
 - `jax_source(...; function_docs)`: a `NamedTuple` of function name => text
   gives functions their docstrings; every module function has one and
   annotates its parameters (`ArrayLike`) and result. Module-level helpers
-  are private (`_standardized`, was `rk_standardized`); a generated helper
-  never takes a fixed helper's `_rk_` name.
+  are private (`_rk_standardized`, was `rk_standardized`).
 - `prepare_data` returns each integer scalar it prepares as a `StaticInt`, an
   `int` that `jax.jit` treats as static, so the functions jit with the
   prepared data as arguments (`jax.jit(f)(u, **prepared)`). A block end or a

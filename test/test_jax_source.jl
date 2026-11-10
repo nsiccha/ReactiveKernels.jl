@@ -518,6 +518,46 @@ end
     return total
 end
 
+# Recorded `@inline` helpers (`@_record_source`): a shape test with `in` and
+# `&&`, decided while tracing, and a fold over a data length, run as a loop.
+ReactiveKernels.@_record_source @inline jax_fits(x, n) = ndims(x) <= 2 && size(x, 1) in (1, n)
+ReactiveKernels.@_record_source @inline function jax_fold(x, n)
+    total = x[1]
+    for i in 2:n
+        total = ReactiveKernels._tie_exact_logaddexp(total, x[i])
+    end
+    total
+end
+@kernel jax_shape_fold(x::Vector{Float64}, a::Float64) = begin
+    n = length(x)
+    checked = jax_fits(x, n) ? a .* x : throw(DimensionMismatch("x must have n rows"))
+    total = jax_fold(checked, n)
+    return total
+end
+# Julia's unit indices: past a vector's rank (a literal and a computed one),
+# of a number, and `size` past the rank; `dropdims` of a summed axis.
+@kernel jax_unit_index(x::Vector{Float64}, a::Float64) = begin
+    cells = plate(eachindex(x)) do i
+        x[i, 1] * a[1, 1] + x[i, (i - 1) ÷ length(x) + 1] + size(x, 2)
+    end
+    M = reshape(cells, 2, length(cells) ÷ 2)
+    total = sum(dropdims(sum(M; dims = 1); dims = 1) .^ 2)
+    return total
+end
+# `stack` in `prepare_data`: on the host a plate of vectors is a list of
+# arrays (BRM's HSGP basis, `raw_basis[:, b]`).
+@kernel jax_prep_stack(x::Vector{Float64}, a::Float64) = begin
+    rows = plate(x) do xi
+        plate(1:3) do b
+            xi * b
+        end
+    end
+    M = stack(rows; dims = 1)
+    col = M[:, 2]
+    total = a * sum(col)
+    return total
+end
+
 @testset "jax_source: structure" begin
     src = jax_source(jax_plate_scan; have = (:a, :y, :x, :b, :logsigma), want = :total)
     text = string(src)
@@ -797,9 +837,15 @@ end
     cases = ((jax_scan_tuple, (:a, :xs), (0.5, xs)), (jax_scan_named, (:a, :xs), (0.5, xs)),
              (jax_history_leading, (:a, :xs), (0.7, xs)), (jax_history_indexed, (:a, :xs), (0.7, xs)),
              (jax_tie_div, (:a, :x, :k), (0.7, xs, 2)),
-             (jax_scan_merge, (:a, :xs, :u0), (0.5, xs, 1.0)), (jax_dims, (:a, :M), (0.5, M)))
+             (jax_scan_merge, (:a, :xs, :u0), (0.5, xs, 1.0)), (jax_dims, (:a, :M), (0.5, M)),
+             (jax_shape_fold, (:a, :x), (0.7, xs)), (jax_unit_index, (:a, :x), (0.7, xs)))
     srcs = [jax_source(k; have, want = :total) for (k, have, _) in cases]
     @test !occursin(".shape[0] - 1][", string(srcs[2]))
+    fold = string(srcs[end - 1])
+    @test occursin(" in (1, ", fold) && occursin("jax.lax.fori_loop(", fold)
+    @test occursin("jnp.squeeze(", string(srcs[end]))
+    stacked = jax_source(jax_prep_stack; have = (:a, :x), want = :total, data = (; x = xs))
+    @test occursin("np.stack(", string(stacked))
     if !rk_jax_available()
         @test_skip false
     else
@@ -809,5 +855,8 @@ end
             @test r.value ≈ native(args...) rtol = 1e-12
             @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), args[2:end]...), [args[1]])) rtol = 1e-6
         end
+        native = prepare(jax_prep_stack; have = (:a, :x), want = :total)
+        r = rk_jax_evaluate(stacked, "kernel", (0.7, xs); grad = true, prepare = true)
+        @test r.value ≈ native(0.7, xs) rtol = 1e-12
     end
 end

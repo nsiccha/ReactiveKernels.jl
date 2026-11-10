@@ -637,6 +637,21 @@ function _jax_expr(ctx::_JaxContext, ::Val{:ref}, ex)
     _jax_index(ctx, x, ex.args[2:end])
 end
 
+# Indices that Julia requires to be 1 (past an array's rank, or of a
+# number): a literal 1 needs nothing, any other index a check that it is 1
+# (while tracing when it is known then, else when the program runs).
+function _jax_unit_indices!(ctx::_JaxContext, indices, what::AbstractString)
+    for index in indices
+        v = _jax_expr(ctx, index)
+        v.T isa Type && v.T <: Integer ||
+            _jax_error("indexing ", what, " by a `", v.T, "`", _jax_where(ctx))
+        v.code == "1" && continue
+        _jax_call(ctx, _runtime_check,
+                  [_PyVal("(" * v.code * " == 1)", Bool, _jax_known(ctx, v)),
+                   _PyVal(repr("BoundsError: an index of " * what * " must be 1"), BoundsError)])
+    end
+end
+
 # Index `x` with Julia indices `indices` (source expressions).
 function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
     if ctx.host !== nothing
@@ -651,6 +666,11 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
         extent = isempty(x.extent) ? "" : x.extent * "[" * string(k - 1) * "]"
         return _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", T, false,
                       _jax_is_array(T) ? extent : "")
+    end
+    # A number indexed by ones is itself (`s[1, 1, 1]`, as Julia's).
+    if x.T isa Type && x.T <: Number
+        _jax_unit_indices!(ctx, indices, "a number")
+        return x
     end
     _jax_is_array(x.T) || _jax_error("indexing a value of type `", x.T, "`", _jax_where(ctx))
     # A vector of (named) numbers is the tuple of its columns (a scan's
@@ -669,6 +689,12 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
     if length(indices) == 1 && N > 1 && !_jax_ragged(x.T) && isempty(x.extent)
         flat = _PyVal("jnp.ravel(" * x.code * ", order=\"F\")", Vector{eltype(x.T)}, x.static)
         return _jax_index(ctx, flat, indices)
+    end
+    # Julia accepts indices past the rank that are 1 (`v[i, 1, 1]`): one
+    # known while tracing is checked then, and dropped.
+    if length(indices) > N >= 1 && !_jax_ragged(x.T) && isempty(x.extent)
+        _jax_unit_indices!(ctx, indices[N+1:end], "a rank-" * string(N) * " array past its rank")
+        indices = indices[1:N]
     end
     length(indices) == N ||
         (length(indices) == 1 && N == 1) ||
@@ -1461,8 +1487,23 @@ function _jax_call(ctx::_JaxContext,
     _jax_call(ctx, f === sum ? (+) : (*), [last(only(kw)), reduced])
 end
 
+# `dropdims(x; dims = d)`: `x` without its axis `d`, of length one.
+function _jax_call(ctx::_JaxContext, ::typeof(dropdims), args::Vector{_PyVal}, kw)
+    x = only(args)
+    length(kw) == 1 && first(only(kw)) === :dims ||
+        _jax_error("`dropdims` without one `dims` keyword", _jax_where(ctx))
+    d = last(only(kw))
+    _jax_is_array(x.T) && isempty(x.extent) && !_jax_ragged(x.T) && _jax_known(ctx, d) &&
+        d.T isa Type && d.T <: Integer ||
+        _jax_error("`dropdims` over `dims` of a `", x.T, "`", _jax_where(ctx))
+    np = ctx.host === nothing ? "jnp." : "np."
+    _PyVal(np * "squeeze(" * x.code * ", axis=" * _py_infix("-", [d.code, "1"]) * ")",
+           Array{eltype(x.T),ndims(x.T) - 1}, x.static)
+end
+
 # `stack(rows; dims)` of a vector of equal-length vectors, held as the 2-D
-# array of its rows: a matrix with those rows (`dims = 1`) or columns.
+# array of its rows: a matrix with those rows (`dims = 1`) or columns. On the
+# host a plate of vectors is a list of arrays, which `np.stack` joins.
 function _jax_call(ctx::_JaxContext, ::typeof(stack), args::Vector{_PyVal}, kw)
     x = only(args)
     T = x.T
@@ -1471,6 +1512,9 @@ function _jax_call(ctx::_JaxContext, ::typeof(stack), args::Vector{_PyVal}, kw)
     dims = isempty(kw) ? "2" : (only(kw).first === :dims ? only(kw).second.code :
         _jax_error("the keyword `", only(kw).first, "` of `stack`", _jax_where(ctx)))
     dims in ("1", "2") || _jax_error("`stack` along dimension ", dims, _jax_where(ctx))
+    ctx.host === nothing ||
+        return _PyVal("np.stack(" * x.code * ", axis=" * (dims == "1" ? "0" : "1") * ")",
+                      Matrix{eltype(eltype(T))}, x.static)
     if !isempty(x.extent)
         lengths = x.extent
         _jax_call(ctx, _runtime_check, [_PyVal("jnp.all(" * lengths * " == " * lengths * "[0])", Bool),
@@ -1641,7 +1685,13 @@ const _JAX_INFIX = Dict{Any,String}((+) => "+", (-) => "-", (/) => "/", (<) => "
     (<=) => "<=", (>=) => ">=", (==) => "==", (!=) => "!=", (&) => "&", (|) => "|",
     xor => "^")
 
+# A comparison of integer literals (a rank, `size(v, 2) == 1` of a vector)
+# is known while emitting, so a conditional on it takes its arm alone.
+const _JAX_COMPARISONS = ((==), (!=), (<), (<=), (>), (>=))
+_jax_int_literal(v::_PyVal) = occursin(r"^-?[0-9]+$", v.code)
 function _jax_scalar_or_elementwise(ctx::_JaxContext, f, args::Vector{_PyVal})
+    any(c -> c === f, _JAX_COMPARISONS) && length(args) == 2 && all(_jax_int_literal, args) &&
+        return _jax_literal(f(parse(Int, args[1].code), parse(Int, args[2].code)))
     if haskey(_JAX_INFIX, f)
         op = _JAX_INFIX[f]
         length(args) == 1 && f === (-) && return _jax_result(f, args, _py_negate(args[1].code))
@@ -1810,6 +1860,25 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(div), args::Vector{_PyVal
            ", dtype=jnp.int64))", Int)
 end
 
+# `x in t` for a scalar `x` and a tuple of scalars `t`: Python's `in` when
+# both are known while tracing (a shape test `size(x, 1) in (1, K)` decides
+# then), else `jnp.isin`.
+function _jax_function_call(ctx::_JaxContext, ::typeof(in), args::Vector{_PyVal})
+    length(args) == 2 || return _jax_traceable_or_lowered(ctx, in, args)
+    x, t = args
+    scalar(T) = T isa Type && (T <: Number || T <: Bool)
+    t.T isa Type && t.T <: Tuple && !(t.T <: NamedTuple) && isconcretetype(t.T) &&
+        scalar(x.T) && all(i -> scalar(fieldtype(t.T, i)), 1:fieldcount(t.T)) ||
+        return _jax_traceable_or_lowered(ctx, in, args)
+    m = match(r"^\((-?[0-9]+(?:, -?[0-9]+)*),?\)$", t.code)
+    _jax_int_literal(x) && m !== nothing &&
+        return _jax_literal(parse(Int, x.code) in parse.(Int, split(m.captures[1], ", ")))
+    _jax_known(ctx, x) && _jax_known(ctx, t) &&
+        return _PyVal("(" * x.code * " in " * t.code * ")", Bool, x.static && t.static)
+    ctx.host === nothing || _jax_error("`in` of host values that are not known", _jax_where(ctx))
+    _PyVal("jnp.isin(" * x.code * ", jnp.asarray(" * t.code * "))", Bool)
+end
+
 # `merge(a, b)` of named tuples (tuples of their fields, in order): each
 # field of the merged type from the last argument that has it.
 function _jax_function_call(ctx::_JaxContext, ::typeof(merge), args::Vector{_PyVal})
@@ -1878,7 +1947,13 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(size), args::Vector{_PyVa
     length(args) == 2 || return _PyVal(shape, NTuple{_jax_rank(args[1].T),Int}, true)
     d = match(r"^[0-9]+$", args[2].code)
     d === nothing && _jax_error("`size` with a computed dimension", _jax_where(ctx))
-    _PyVal(shape * "[" * string(parse(Int, args[2].code) - 1) * "]", Int, true)
+    # Past an array's rank Julia's `size` is 1 (a vector is a 1-column
+    # matrix), and so is every size of a number.
+    k = parse(Int, args[2].code)
+    args[1].T isa Type && (args[1].T <: Number ||
+                           args[1].T <: AbstractArray && k > _jax_rank(args[1].T)) &&
+        return _PyVal("1", Int, true)
+    _PyVal(shape * "[" * string(k - 1) * "]", Int, true)
 end
 _jax_function_call(ctx::_JaxContext, ::typeof(identity), args::Vector{_PyVal}) = only(args)
 # `rem(x, y, mode)`: the remainder of the division rounded by `mode`.
@@ -3441,7 +3516,11 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
                 mod.helper_names[(:flat, extent)] = flat
             end
         end
-        scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, false, extent)
+        # A prepared integer is a `StaticInt` (`prepare_data`), an `int` under
+        # `jax.jit` too, so it is known while tracing (a shape test on it
+        # decides then).
+        static = names !== nothing && T isa Type && T <: Integer
+        scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, static, extent)
         # Callers may pass NumPy arrays; JAX indexes only its own arrays by a
         # traced index.
         if _jax_is_array(T) && (eltype(T) <: Number || _jax_ragged(T))

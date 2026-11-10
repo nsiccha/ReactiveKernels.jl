@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.5
+
+- The hidden-Markov laws and their state-posterior twins' helpers record
+  their sources (`ReactiveKernels.@_record_source`), so ReactiveKernels'
+  `jax_source` (0.1.131) translates the laws. Native execution is unchanged;
+  the helpers stay `@inline`. Requires ReactiveKernels 0.1.131.
+
 ## 0.1.4
 
 - Add a state-posterior twin for each hidden Markov law, taking the law's own

@@ -1,4 +1,5 @@
 using ReactiveKernels, ReactiveKernelsPPL, Random, Test
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal_hmm_log_weights_logdensity
 
 include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
 
@@ -259,7 +260,26 @@ const _JAX_CASES = (
             y[i] .~ Normal.(mu, s)
         end
     end))(; P = 4, R = _JAX_R) | (; y = _JAX_YR),
+    # A hidden-Markov law (ODLProject:ap1): shape checks decided while
+    # tracing, a history scan over the (step, state) cells, and folds over
+    # the states as loops.
+    hmm_law = () -> (@rkppl(begin
+        a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+        locations = [a, b]
+        y ~ LogDensity(normal_hmm_log_weights_logdensity, locations, s, log_transition, log_initial)
+    end))(; log_transition = log.([0.9 0.1; 0.2 0.8]), log_initial = log.([0.5, 0.5])) |
+        (; y = sin.(1:20)),
 )
+# The same law with one location per state, so the state count is data.
+function _jax_hmm_states(T, K)
+    m = @rkppl begin
+        s ~ Exponential(1.0)
+        mu[axes(log_initial, 1)] .~ Normal.(0, 1)
+        y ~ LogDensity(normal_hmm_log_weights_logdensity, mu, s, log_transition, log_initial)
+    end
+    stay = [k == j ? 0.8 : 0.2 / (K - 1) for k in 1:K, j in 1:K]
+    m(; log_transition = log.(stay), log_initial = fill(log(1 / K), K)) | (; y = sin.(1:T))
+end
 
 @testset "jax_source(built, plan): module" begin
     plan = _JAX_CASES.gaussian()
@@ -305,6 +325,30 @@ end
         # an integer that sets a shape is static (`StaticInt`).
         @test rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
                               prepare = :arguments).value ≈ query(u) rtol = 1e-10
+        reference = rk_fd_gradient(query, u)
+        @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
+    end
+end
+
+@testset "jax_source(built, plan): one hidden-Markov module across steps and states" begin
+    plans = [_jax_hmm_states(T, K) for (T, K) in ((20, 2), (7, 2), (9, 3))]
+    srcs = [jax_source(build_kernel(p), p) for p in plans]
+    texts = string.(srcs)
+    # Steps and states are data: one module text, the folds over the states
+    # are loops and the forward pass is a scan.
+    @test texts[1] == texts[2] == texts[3]
+    @test occursin("jax.lax.fori_loop(", texts[1]) && occursin("jax.lax.scan(", texts[1])
+    @test occursin("UNTRANSLATED = {}", texts[1])
+    if !rk_jax_available()
+        @test_skip false
+    else
+        plan, src = plans[3], srcs[3]
+        built = build_kernel(plan)
+        query = prepare_query(built, plan, :sampler)
+        u = 0.2 .* randn(Xoshiro(11), built.layout.total)
+        r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
+                            grad = true, prepare = true)
+        @test r.value ≈ query(u) rtol = 1e-10
         reference = rk_fd_gradient(query, u)
         @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
     end
