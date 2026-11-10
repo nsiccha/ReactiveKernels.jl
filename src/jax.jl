@@ -1164,13 +1164,10 @@ function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
         isempty(bound) ? _jax_statements(ctx, statements; value = false) :
             _jax_with_guard(() -> _jax_statements(ctx, statements; value = false),
                             inner, index * " <= " * bound)
-        # Past a data-dependent bound the scalar carry stays as it was; an
-        # array written by index there writes only padded entries.
         map(zip(carried, initial)) do (n, v)
             new = ctx.locals[n]
-            bound == "" || _jax_is_array(v.T) ? new.code :
-                "jnp.where(" * index * " <= " * bound * ", " * new.code * ", " *
-                _jax_carry_old(names, carried, n) * ")"
+            bound == "" ? new.code : _jax_carry_select(ctx, index * " <= " * bound, new.code,
+                                                       _jax_carry_old(names, carried, n), v.T)
         end
     finally
         ctx.scope = outer
@@ -1191,12 +1188,35 @@ function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
 end
 _jax_carry_old(names, carried, n) = names[findfirst(==(n), carried)]
 
-# A loop carry enters with a fixed dtype, as `fori_loop` requires.
+# A loop carry enters with a fixed dtype, as `fori_loop` requires. A tuple
+# (or `NamedTuple`) stays a Python tuple, its elements coerced one by one, so
+# it has the structure the loop body and a branch's arms return.
 function _jax_carry_value(ctx::_JaxContext, v::_PyVal)
     _jax_is_array(v.T) && return v
+    if _jax_is_tuple(v.T)
+        t = _jax_bind!(ctx, :carried, v).code
+        parts = [_jax_carry_value(ctx, _PyVal(_py_atom(t) * "[" * string(k - 1) * "]",
+                                              fieldtype(v.T, k)))
+                 for k in 1:fieldcount(v.T)]
+        return _PyVal(_jax_tuple_code(parts), v.T, false, v.extent, v.limit)
+    end
     T = v.T isa Type ? v.T : Float64
-    dtype = T <: Bool ? "jnp.bool_" : T <: Integer ? "jnp.int64" : "jnp.float64"
-    _PyVal("jnp.asarray(" * v.code * ", dtype=" * dtype * ")", T, false, "", "")
+    _PyVal("jnp.asarray(" * v.code * ", dtype=" * _jax_dtype(T) * ")", T, false, "", "")
+end
+
+# Past a loop's data-dependent bound (`kept` is false there) the carry keeps
+# its value `old`, of type `T`: a scalar is selected, a tuple element by
+# element; an array written by index there writes only padded entries, so it
+# passes as it is.
+function _jax_carry_select(ctx::_JaxContext, kept::AbstractString, new::AbstractString,
+                           old::AbstractString, @nospecialize(T))
+    _jax_is_array(T) && return new
+    _jax_is_tuple(T) || return "jnp.where(" * kept * ", " * new * ", " * old * ")"
+    t = _jax_bind!(ctx, :carried, _PyVal(new, T)).code
+    _jax_tuple_code([_PyVal(_jax_carry_select(ctx, kept, _py_atom(t) * "[" * string(k - 1) * "]",
+                                              _py_atom(old) * "[" * string(k - 1) * "]",
+                                              fieldtype(T, k)), Any)
+                     for k in 1:fieldcount(T)])
 end
 
 # The locals a loop body assigns, including arrays it writes by index.

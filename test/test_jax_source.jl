@@ -99,6 +99,75 @@ end
     return y
 end
 
+# A tuple or `NamedTuple` local that a loop or a branch carries stays a tuple,
+# each element coerced alone (snag jax-source-tuple-6f1e9e4c): rebound by a
+# data-dependent conditional, with an integer field, past a ragged row's
+# length, assigned in an `if` arm, and carried by a `while` loop.
+@traceable function jax_test_tuple_loop(s::Tuple, w::Real, n::Integer, m::Integer)
+    s = (s[1] + w, s[2])
+    for i in 2:m
+        s = i <= n ? (0.9 * s[1] + w * s[2], 0.5 * s[2] + s[1]) : s
+    end
+    s
+end
+@kernel jax_tuple_loop(w::Float64, x::Float64, n::Int) = begin
+    s = jax_test_tuple_loop((x, 1.0), w, n, 4)
+    t = s[1] + 2 * s[2]
+    return t
+end
+@traceable function jax_test_named_loop(w::Real, m::Integer)
+    s = (level = w, count = 0)
+    for i in 1:m
+        s = (level = 0.5 * s.level + w, count = s.count + i)
+    end
+    s.level * s.count
+end
+@kernel jax_named_loop(w::Float64) = begin
+    t = jax_test_named_loop(w, 3)
+    return t
+end
+@traceable function jax_test_row_loop(r::AbstractVector, a::Real)
+    s = (0.0, 1.0)
+    for t in eachindex(r)
+        s = (s[1] + a * r[t] * s[2], 0.5 * s[2])
+    end
+    s[1] + s[2]
+end
+@kernel jax_tuple_rows(a::Float64, R::Vector{Vector{Float64}}) = begin
+    lp = plate(R) do r
+        jax_test_row_loop(r, a)
+    end
+    total = sum(lp)
+    return total
+end
+@traceable function jax_test_tuple_branch(x::Real)
+    s = (x, 2.0)
+    if x > 0
+        s = (s[2], s[1])
+    end
+    k = 0
+    while k < 3
+        s = (s[1] * 0.5, s[2] + x)
+        k = k + 1
+    end
+    s[1] - s[2]
+end
+@kernel jax_tuple_branch(x::Float64) = begin
+    t = jax_test_tuple_branch(x)
+    return t
+end
+@traceable function jax_test_tuple_while(x::Real)
+    h = (one(x), 0)
+    while h[1] < x
+        h = (2 * h[1], h[2] + 1)
+    end
+    h[2] * h[1]
+end
+@kernel jax_tuple_while(x::Float64) = begin
+    t = jax_test_tuple_while(x)
+    return t
+end
+
 # Typed allocations, `hcat`, `permutedims`, a numeric-type broadcast, and a
 # postfix on a compound operand (`size(x .- w, 1)`).
 @kernel jax_alloc(x::Vector{Float64}, w::Float64) = begin
@@ -769,6 +838,20 @@ end
     @test occursin("jax.lax.fori_loop(", traced)
     @test occursin("jax.lax.cond(", traced)
     @test occursin("jax.lax.while_loop(", string(jax_source(jax_doubling; have = (:x,), want = :y)))
+    # A tuple carry enters the loop as a tuple of coerced elements, the
+    # structure the body returns, never as one array of the tuple.
+    tupled = string(jax_source(jax_tuple_loop; have = (:w, :x, :n), want = :t))
+    @test occursin("((jnp.asarray(s[0], dtype=jnp.float64), jnp.asarray(s[1], dtype=jnp.float64)),)",
+                   tupled)
+    @test !occursin("jnp.asarray(s, ", tupled)
+    named = string(jax_source(jax_named_loop; have = (:w,), want = :t))
+    @test occursin("jnp.asarray(s[1], dtype=jnp.int64)", named)
+    # Past a row's length each element keeps its value (`jnp.where` of a
+    # tuple would stack it into an array).
+    rows = string(jax_source(jax_tuple_rows; have = (:a, :R), want = :total))
+    @test occursin(r"\(\(jnp\.where\(t <= r_n, s_3\[0\], s_2\[0\]\), jnp\.where\(t <= r_n, s_3\[1\], s_2\[1\]\)\),\)",
+                   rows)
+    @test occursin("jax.lax.while_loop(", string(jax_source(jax_tuple_while; have = (:x,), want = :t)))
     plain = string(jax_source(jax_plain; have = (:w, :x), want = :s))
     @test occursin("w ** 2", plain)
     @test !occursin(r"<[a-z]", plain)
@@ -870,6 +953,29 @@ end
               only(rk_fd_gradient(u -> native(only(u)), [0.3])) rtol = 1e-6
         native = prepare(jax_doubling; have = (:x,), want = :y)
         src = jax_source(jax_doubling; have = (:x,), want = :y)
+        @test rk_jax_evaluate(src, "kernel", (37.0,)).value ≈ native(37.0) rtol = 1e-12
+        # Tuple carries (snag jax-source-tuple-6f1e9e4c): values and gradients
+        # with the conditional taken for some steps, none, and all.
+        native = prepare(jax_tuple_loop; have = (:w, :x, :n), want = :t)
+        src = jax_source(jax_tuple_loop; have = (:w, :x, :n), want = :t)
+        for (x0, n) in ((0.7, 3), (0.7, 1), (1.1, 4))
+            r = rk_jax_evaluate(src, "kernel", (0.3, x0, n); grad = true)
+            @test r.value ≈ native(0.3, x0, n) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x0, n), [0.3])) rtol = 1e-6
+        end
+        R = [[1.0, 2.0, 3.0], [0.5], [-1.0, 0.25]]
+        for (kernel, have, want, args) in ((jax_named_loop, (:w,), :t, (0.4,)),
+                                           (jax_tuple_rows, (:a, :R), :total, (0.6, R)),
+                                           (jax_tuple_branch, (:x,), :t, (0.8,)),
+                                           (jax_tuple_branch, (:x,), :t, (-0.6,)))
+            native = prepare(kernel; have, want)
+            src = jax_source(kernel; have, want)
+            r = rk_jax_evaluate(src, "kernel", args; grad = true)
+            @test r.value ≈ native(args...) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), args[2:end]...), [args[1]])) rtol = 1e-6
+        end
+        native = prepare(jax_tuple_while; have = (:x,), want = :t)
+        src = jax_source(jax_tuple_while; have = (:x,), want = :t)
         @test rk_jax_evaluate(src, "kernel", (37.0,)).value ≈ native(37.0) rtol = 1e-12
         native = prepare(jax_plain; have = (:w, :x), want = :s)
         src = jax_source(jax_plain; have = (:w, :x), want = :s)
