@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.136
+
+- A model call (`model(; data)`, `model(; data) | (; y)`, `@rkppl data begin
+  … end`) names what its lowering generates (a cell `@scan`'s seeds, a
+  selected cell argument, a destructured value) by the declaration's source,
+  as `lower_rkppl` has since 0.1.109, instead of with `gensym`'s process
+  counter. One declaration rebound at other sizes now gives an equal
+  `kernel_expr`, and two builds of one binding share their types, so the
+  second compiles nothing more where such a name reaches a type (a selected
+  argument in a split node). Values and gradients are unchanged. Snag
+  `kernel-expr-of-a-26ed1e5c`.
+
 ## 0.1.135
 
 - The full-model sampler query is a LogDensityProblems target. With
