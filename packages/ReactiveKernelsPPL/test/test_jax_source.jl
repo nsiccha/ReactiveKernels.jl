@@ -241,6 +241,14 @@ const _JAX_CASES = (
             y[g] .~ Normal.(h, 1)
         end
     end))() | (; y = [_JAX_YR[1], [0.3], _JAX_YR[3]]),
+    # A ragged integer index column with an empty row (a group with no
+    # readings): its padding keeps the column integer.
+    empty_index_row = () -> (@rkppl(begin
+        a ~ Normal(0, 1)
+        @plate for g in eachindex(idx)
+            y[g] .~ Normal.(a .* x[idx[g]], 1)
+        end
+    end))(; x = [0.1, 0.4, -0.2, 0.3], idx = [[1, 3], Int[], [2]]) | (; y = [[0.2, 0.1], Float64[], [0.9]]),
     ragged_recurrence = () -> (@rkppl(begin
         rho ~ LogNormal(log(0.7), 0.3); kappa ~ LogNormal(log(0.3), 1.0)
         b0 ~ Normal(0.1, 0.1); tau ~ Exponential(0.05); s ~ Exponential(0.05)
@@ -271,7 +279,7 @@ const _JAX_CASES = (
     @test occursin("return {\"a\": ", text)
     ragged = _JAX_CASES.ragged_recurrence()
     rsrc = jax_source(build_kernel(ragged), ragged)
-    @test occursin("def _rk_pad_rows(rows):", string(rsrc))
+    @test occursin("def _rk_pad_rows(rows, dtype):", string(rsrc))
     @test "R_lengths" in first.(rsrc.functions[2].inputs)
     @test occursin("\"ragged\": True", string(rsrc))
     @test occursin("jax.lax.fori_loop(", string(rsrc))
@@ -447,5 +455,24 @@ end
         @test r["lv"]["_ppl_scan_z_level"] ≈ native.lv._ppl_scan_z_level
         r = rk_jax_evaluate(esrc, "constrain", ([0.2], jax_raw_data(empty, esrc)...); prepare = true).value
         @test r["a"] ≈ 0.2 && isempty(r["b"])
+    end
+end
+
+# A per-index value of a ragged plate comes back from `constrain` padded,
+# with its lengths beside it, so a caller can strip the padding.
+@testset "jax_source(built, plan): ragged values in constrain" begin
+    plan = (@rkppl(begin
+        a ~ Normal(0, 1)
+        @plate for g in eachindex(y)
+            mu[g] = a .+ x[g]
+            y[g] .~ Normal.(mu[g], 1)
+        end
+    end))(; x = [[0.1, 0.2, 0.3], [0.5], [0.0, 1.0]]) | (; y = [[0.2, 0.1, 0.0], [0.4], [0.3, 0.2]])
+    src = jax_source(build_kernel(plan), plan; values = (:mu,))
+    if rk_jax_available()
+        r = rk_jax_evaluate(src, "constrain", ([0.3], jax_raw_data(plan, src)...); prepare = true).value
+        lengths = Int.(r["mu_lengths"])
+        @test lengths == [3, 1, 2]
+        @test [r["mu"][g][1:n] for (g, n) in enumerate(lengths)] ≈ [[0.4, 0.5, 0.6], [0.8], [0.3, 1.3]]
     end
 end

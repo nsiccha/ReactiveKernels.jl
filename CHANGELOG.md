@@ -57,6 +57,13 @@ are recorded in the git history only.
   reads resolve to the program's definitions before any global function; and
   `DATA` and the `prepare_data` `JAXFunction` name its parameters as Python
   spells them. On the host, `plate(xs...) do … end` over data is a map.
+- A scan with `history` translates (a vector of leading entries or a number):
+  `jax.lax.scan` carries the result vector and writes step `j`'s output at its
+  entry; an index of `eachindex(x)` is bounded by the sequence's length, so a
+  generator over `1:j-1` runs to that bound, masked. `j ± c` keeps a static
+  bound. A ragged column's empty row keeps the column's element type when
+  padded (an integer index column stayed float and could not index), and a
+  ragged value a function returns in a `dict` comes with `<name>_lengths`.
 - With `data`, a module's functions take `(unconstrained, **prepared)` and
   read the prepared inputs inside, so their signatures name what the caller
   supplies (user GO `08jy2dh`); positional prepared arguments are no longer

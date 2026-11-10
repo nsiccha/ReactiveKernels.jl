@@ -254,7 +254,8 @@ recipe and the construct:
   input's;
 - plates of rank above one over ragged data;
 - `reshape` of a ragged value (its padding has no shape);
-- `history` scans.
+- `history` scans over a padded (ragged) sequence or with a named-tuple
+  history.
 
 Frozen definitions (`frozen_values`) come from another binding, so
 `prepare_data` takes their values, as `DATA` lists them.

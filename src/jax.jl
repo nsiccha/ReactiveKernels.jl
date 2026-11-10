@@ -1670,9 +1670,26 @@ function _jax_call_positional(ctx::_JaxContext, f::Function, args::Vector{_PyVal
        (f === (/) && length(args) == 2 && !_jax_is_array(args[2].T)) ||
        (f === (*) && count(a -> _jax_is_array(a.T), args) <= 1)
         v = _jax_scalar_or_elementwise(ctx, f, args)
-        v === nothing || return v
+        v === nothing || return _jax_shifted_limit(f, args, v)
     end
     _jax_function_call(ctx, f, args)
+end
+
+# `j ± c` of an integer `j` with a static bound and a static integer `c`
+# keeps a bound (`j - 1` of a step index is at most its bound, `j + c` at most
+# the bound plus `c`), so a loop up to it still runs to a static limit.
+function _jax_shifted_limit(f, args::Vector{_PyVal}, v::_PyVal)
+    (f === (+) || f === (-)) && length(args) == 2 && isempty(v.limit) && !v.static || return v
+    a, b = args
+    a.T isa Type && a.T <: Integer && b.T isa Type && b.T <: Integer || return v
+    if !isempty(a.limit) && b.static && (f === (+) || occursin(r"^[0-9]+$", b.code))
+        limit = f === (-) ? a.limit : _py_infix("+", [a.limit, b.code])
+    elseif f === (+) && !isempty(b.limit) && a.static
+        limit = _py_infix("+", [b.limit, a.code])
+    else
+        return v
+    end
+    _PyVal(v.code, v.T, v.static, v.extent, limit)
 end
 
 # A call with array semantics, or of a function translated from its own
@@ -2862,7 +2879,11 @@ _jax_unref_val(v::_PyVal) = v
 # closure.
 function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                      op::_AuthoredScanOp{K,A,I,H}, inputs) where {K,A,I,H}
-    H && _jax_error("a scan with `history` has no JAX translation yet", _jax_where(ctx))
+    if H
+        ctx.host === nothing ||
+            _jax_error("a scan with `history` has no host translation yet", _jax_where(ctx))
+        return _jax_history_scan(ctx, recipe, op, inputs)
+    end
     ctx.host === nothing || return _host_scan(ctx, recipe, op, inputs)
     body = op.kernel.plan
     iterated = [i for i in 2:length(inputs) if !(i in A)]
@@ -2882,7 +2903,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     for (k, i) in enumerate(iterated)
         name = _jax_identifier(inner.used, have[1 + k].name)
         push!(unpack, name)
-        inner.values[canon_id(body.graph, have[1 + k].id)] = _PyVal(name, types[1 + k])
+        inner.values[canon_id(body.graph, have[1 + k].id)] = _jax_scan_element(name, inputs[i])
     end
     for (k, i) in enumerate(shared)
         inner.values[canon_id(body.graph, have[1 + length(iterated) + k].id)] = inputs[i]
@@ -2943,6 +2964,95 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     [_PyVal(result, Vector{E}, false, extent)]
 end
 
+# One element of a scan's sequence, as its step reads it. An index of
+# `eachindex(x)`/`axes(x, d)` (`Base.OneTo`) is at most the sequence's length,
+# a static bound, so a loop or generator up to it runs to that bound, masked.
+function _jax_scan_element(name::AbstractString, seq::_PyVal)
+    E = eltype(seq.T)
+    seq.T isa Type && seq.T <: Base.OneTo && isempty(seq.extent) || return _PyVal(name, E)
+    _PyVal(name, E, false, "", _py_atom(seq.code) * ".shape[0]")
+end
+
+# A scan with `history` (its step reads the outputs written so far, `earlier`):
+# `jax.lax.scan` over the sequences and the step index, carrying the step's
+# carry and the result vector. That vector starts as `h₀` filled to the
+# sequences' length, or as the leading entries followed by zeros; step `j`
+# writes entry `offset + j` (`.at[].set`, stored as the vector's element
+# type) and reads the whole vector, as natively. Linear in the steps.
+function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
+                           op::_AuthoredScanOp{K,A,I,H}, inputs) where {K,A,I,H}
+    body = op.kernel.plan
+    history, args = inputs[end], inputs[1:end-1]
+    iterated = [i for i in 2:length(args) if !(i in A)]
+    shared = [i for i in 2:length(args) if i in A]
+    isempty(iterated) && _jax_error("a history scan without a sequence", _jax_where(ctx))
+    any(i -> !isempty(args[i].extent), iterated) &&
+        _jax_error("a history scan over a padded sequence has no JAX translation yet",
+                   _jax_where(ctx))
+    HT = history.T
+    E = HT isa Type && HT <: Number ? HT :
+        HT isa Type && HT <: AbstractVector{<:Number} ? eltype(HT) :
+        _jax_error("a scan `history` of type `", HT, "` has no JAX translation yet",
+                   _jax_where(ctx))
+    dtype = E <: Bool ? "jnp.bool_" : E <: Integer ? "jnp.int64" : "jnp.float64"
+    steps = _py_atom(args[iterated[1]].code) * ".shape[0]"
+    buffer = _jax_fresh(ctx, :history)
+    offset = if HT <: Number
+        _jax_emit!(ctx, buffer * " = jnp.full((" * steps * ",), " * history.code * ", dtype=" *
+                        dtype * ")")
+        "0"
+    else
+        _jax_emit!(ctx, buffer * " = jnp.concatenate([jnp.asarray(" * history.code * ", dtype=" *
+                        dtype * "), jnp.zeros((" * steps * ",), dtype=" * dtype * ")])")
+        _py_atom(history.code) * ".shape[0]"
+    end
+    step = _jax_fresh(ctx, :step)
+    state = _jax_fresh(ctx, :state)
+    xs = _jax_fresh(ctx, :xs)
+    outer = ctx.scope
+    inner = _JaxScope(outer)
+    inner.indent = outer.indent + 1
+    push!(inner.used, state, xs)
+    carry = _jax_identifier(inner.used, :carry)
+    earlier = _jax_identifier(inner.used, :earlier)
+    have = body.have
+    inner.values[canon_id(body.graph, have[1].id)] = _PyVal(carry, args[1].T)
+    unpack = String[]
+    for (k, i) in enumerate(iterated)
+        name = _jax_identifier(inner.used, have[1 + k].name)
+        push!(unpack, name)
+        inner.values[canon_id(body.graph, have[1 + k].id)] = _jax_scan_element(name, args[i])
+    end
+    position = _jax_identifier(inner.used, :position)
+    push!(unpack, position)
+    for (k, i) in enumerate(shared)
+        inner.values[canon_id(body.graph, have[1 + length(iterated) + k].id)] = args[i]
+    end
+    inner.values[canon_id(body.graph, have[end].id)] = _PyVal(earlier, Vector{E})
+    recipe_saved = ctx.recipe
+    ctx.scope = inner
+    wants = try
+        _jax_emit!(ctx, carry * ", " * earlier * " = " * state)
+        _jax_emit!(ctx, join(unpack, ", ") * (length(unpack) == 1 ? "," : "") * " = " * xs)
+        _jax_plan!(ctx, body)
+        [_jax_lookup(ctx, body.graph, v) for v in body.want]
+    finally
+        ctx.scope = outer
+        ctx.recipe = recipe_saved
+    end
+    _jax_typeof(wants[2]) <: Number || _jax_error("a history scan whose step outputs `",
+        _jax_typeof(wants[2]), "` has no JAX translation yet", _jax_where(ctx))
+    push!(outer.lines, "    "^outer.indent * "def " * step * "(" * state * ", " * xs * "):")
+    append!(outer.lines, inner.lines)
+    push!(outer.lines, "    "^inner.indent * "return (" * wants[1].code * ", " * earlier *
+          ".at[" * _py_infix("+", [offset, position]) * "].set(" * wants[2].code * ")), None")
+    seqs = String[[args[i].code for i in iterated]; "jnp.arange(" * steps * ")"]
+    result = _jax_fresh(ctx, :scan_result)
+    _jax_emit!(ctx, "(_, " * result * "), _ = jax.lax.scan(" * step * ", (" * args[1].code *
+                    ", " * buffer * "), (" * join(seqs, ", ") * "))")
+    [_PyVal(result, Vector{E})]
+end
+
 # --- module -------------------------------------------------------------------------
 
 """
@@ -2990,10 +3100,13 @@ def pad_ragged(arrays: list) -> tuple:
     \"\"\"
     import numpy as np
     rows = [np.asarray(a) for a in arrays]
+    kinds = [r.dtype for r in rows if r.shape[0] > 0]
+    dtype = np.result_type(*kinds) if kinds else np.float64
+    rows = [r.astype(dtype) for r in rows]
     lengths = np.asarray([r.shape[0] for r in rows], dtype=np.int64)
     width = max([1] + [int(n) for n in lengths])
     padded = np.stack([np.pad(r, (0, width - r.shape[0]), mode="edge") if r.shape[0] > 0
-                       else np.zeros(width) for r in rows])
+                       else np.zeros(width, dtype=dtype) for r in rows])
     return padded, lengths
 """
 
@@ -3370,10 +3483,20 @@ _jax_docstring(text::AbstractString, indent::AbstractString) =
             (occursin('\n', rstrip(text)) ? "\n" * indent : "") * "\"\"\"", r"\n[ ]+\n" => "\n\n")
 
 # A (nested) `NamedTuple` WANT as `dict`s of the values `wants` yields in order.
-_jax_nested_dict(w::NamedTuple, wants) =
-    "{" * join(("\"" * string(k) * "\": " *
-                (v isa NamedTuple ? _jax_nested_dict(v, wants) : popfirst!(wants).code)
-                for (k, v) in pairs(w)), ", ") * "}"
+# A padded (ragged) value comes with its lengths, under `<key>_lengths`.
+function _jax_nested_dict(w::NamedTuple, wants)
+    entries = String[]
+    for (k, v) in pairs(w)
+        if v isa NamedTuple
+            push!(entries, "\"" * string(k) * "\": " * _jax_nested_dict(v, wants))
+            continue
+        end
+        x = popfirst!(wants)
+        push!(entries, "\"" * string(k) * "\": " * x.code)
+        isempty(x.extent) || push!(entries, "\"" * string(k) * "_lengths\": " * x.extent)
+    end
+    "{" * join(entries, ", ") * "}"
+end
 
 # A returned named tuple is a `dict` keyed by its field names.
 function _jax_returned(ctx::_JaxContext, v::_PyVal)

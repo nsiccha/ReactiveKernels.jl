@@ -482,6 +482,24 @@ end
     return total
 end
 
+# Scans whose step reads the outputs so far (`history`): a vector of leading
+# entries, and a scalar fill read up to the step's own index.
+@kernel jax_history_leading(xs::Vector{Float64}, a::Float64) = begin
+    ys = scan(xs; init = 0.0, history = [1.0, 2.0]) do carry, x, earlier
+        (carry, a * x + sum(earlier))
+    end
+    total = sum(ys .^ 2)
+    return total
+end
+@kernel jax_history_indexed(xs::Vector{Float64}, a::Float64) = begin
+    ys = scan(xs, eachindex(xs); init = 0.0, history = 0.0) do carry, x, j, earlier
+        s = sum(earlier[i] * a for i in 1:j-1; init = 0.0)
+        (carry + x, x + s)
+    end
+    total = sum(ys)
+    return total
+end
+
 @testset "jax_source: structure" begin
     src = jax_source(jax_plate_scan; have = (:a, :y, :x, :b, :logsigma), want = :total)
     text = string(src)
@@ -751,10 +769,11 @@ end
     end
 end
 
-@testset "jax_source: tuple scan outputs, merge and dims" begin
+@testset "jax_source: tuple scan outputs, history scans, merge and dims" begin
     xs = [1.0, 2.0, 3.0, -0.5]
     M = [1.0 2.0; 3.0 4.0; 5.0 6.0]
     cases = ((jax_scan_tuple, (:a, :xs), (0.5, xs)), (jax_scan_named, (:a, :xs), (0.5, xs)),
+             (jax_history_leading, (:a, :xs), (0.7, xs)), (jax_history_indexed, (:a, :xs), (0.7, xs)),
              (jax_scan_merge, (:a, :xs, :u0), (0.5, xs, 1.0)), (jax_dims, (:a, :M), (0.5, M)))
     srcs = [jax_source(k; have, want = :total) for (k, have, _) in cases]
     @test !occursin(".shape[0] - 1][", string(srcs[2]))
