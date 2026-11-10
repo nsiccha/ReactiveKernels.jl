@@ -592,6 +592,54 @@ end
     return total
 end
 
+# A plate cell's data-only recipes that only the host computes (snag
+# jax-source-cell-a3ec8540): each group's sorted distinct values and each
+# entry's position among them, read by a plate over the distinct values with
+# a parameter. Over ragged groups, over the group index with gathered rows,
+# and over a parameter vector with the data passed whole (once, not per cell).
+@kernel jax_cell_order(X::Vector{Vector{Float64}}, Y::Vector{Vector{Float64}}, k::Float64) = begin
+    per = plate(X, Y) do x, y
+        levels = jax_order_levels(x, x)
+        idx = jax_order_positions(levels, x)
+        decay = plate(levels) do d
+            exp(-k * d)
+        end
+        sum(abs2, y .- decay[idx])
+    end
+    total = sum(per)
+    return total
+end
+@kernel jax_cell_order_rows(x::Vector{Float64}, R::Vector{Vector{Int}}, k::Float64) = begin
+    per = plate(eachindex(R), Ref(R), Ref(x)) do i, rs, xs
+        v = xs[rs[i]]
+        levels = jax_order_levels(v, v)
+        idx = jax_order_positions(levels, v)
+        decay = plate(levels) do d
+            exp(-k * d)
+        end
+        sum(abs2, v .- decay[idx])
+    end
+    total = sum(per)
+    return total
+end
+@kernel jax_cell_order_shared(theta::Vector{Float64}, x::Vector{Float64}) = begin
+    per = plate(theta, Ref(x)) do t, xs
+        levels = jax_order_levels(xs, xs)
+        t * sum(levels) + t^2 * length(levels)
+    end
+    total = sum(per)
+    return total
+end
+# A cell recipe neither the host nor the functions compute.
+@kernel jax_cell_unique_array(X::Vector{Vector{Float64}}, a::Float64) = begin
+    per = plate(X) do x
+        d = jax_order_dedupe(x)
+        a * sum(d)
+    end
+    total = sum(per)
+    return total
+end
+
 # A gather through a ragged integer row is padded as the row is, so the
 # cell's reduction counts its valid entries only (snag jax-ragged-index-b8420d16):
 # by the group index, by the row itself, and through `view` (the call form).
@@ -1360,6 +1408,65 @@ end
         r = rk_jax_evaluate(src, "kernel", (theta, x, extra, z); grad = true, prepare = true)
         @test r.value ≈ native(theta, x, extra, z) rtol = 1e-12
         @test r.grad ≈ rk_fd_gradient(t -> native(t, x, extra, z), theta) rtol = 1e-6
+    end
+end
+
+@testset "jax_source: a plate cell's data-only recipes in prepare_data" begin
+    X = [[0.5, 1.0, 0.5], [2.0, 1.0, 2.0, 3.0, 0.5], [1.5]]
+    Y = [[0.3, 0.2, 0.4], [0.1, 0.25, 0.2, 0.05, 0.6], [0.2]]
+    src = jax_source(jax_cell_order; have = (:k, :X, :Y), want = :total, data = (; X, Y))
+    text = string(src)
+    host_part = split(split(text, "def prepare_data")[2], "\ndef kernel")[1]
+    device_part = split(text, "\ndef kernel")[2]
+    # `prepare_data` computes them in a loop over the cells; the plate reads
+    # each cell's values as ragged inputs of its own.
+    @test occursin(r"\[cell_data\w*\(element\w*\) for element\w* in X\]", host_part)
+    @test all(n -> haskey(src.prepared, n), (:levels, :idx))
+    @test occursin("\"levels_lengths\"", host_part) && occursin("\"idx_lengths\"", host_part)
+    @test !occursin("_np(", device_part)
+    # One plate for every function of the module, split once.
+    both = jax_source(jax_cell_order; have = (:k, :X, :Y), data = (; X, Y),
+                      functions = (total = :total, per = :per))
+    @test count("def cell_data", string(both)) == 1
+    @test [f.name for f in both.functions] == ["prepare_data", "total", "per"]
+    # Over the group index, the gathered rows: the gather stays in the cell
+    # (the host also computes it, for the recipes it feeds).
+    x = [0.5, 1.0, 2.0, 3.0, 0.25]
+    R = [[1, 2, 1], [3, 2, 3, 4, 1], [5]]
+    rows = jax_source(jax_cell_order_rows; have = (:k, :x, :R), want = :total, data = (; x, R))
+    @test all(n -> haskey(rows.prepared, n), (:levels, :idx))
+    # Data passed whole: computed once, passed whole to every cell.
+    shared = jax_source(jax_cell_order_shared; have = (:theta, :x), want = :total, data = (; x))
+    @test !occursin(" for element", string(shared))
+    @test haskey(shared.prepared, :levels)
+    # A cell recipe neither side computes: the error names both reasons.
+    err = try
+        jax_source(jax_cell_unique_array; have = (:a, :X), want = :total, data = (; X))
+        nothing
+    catch e
+        e
+    end
+    @test err isa JAXEmissionError
+    @test occursin("`prepare_data` does not compute it on the host either", err.message)
+    @test occursin("`unique!` of `v`", err.message)
+    if !rk_jax_available()
+        @test_skip false
+    else
+        native = prepare(jax_cell_order; have = (:k, :X, :Y), want = :total)
+        for mode in (true, :arguments)
+            r = rk_jax_evaluate(src, "kernel", (0.7, X, Y); grad = true, prepare = mode)
+            @test r.value ≈ native(0.7, X, Y) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), X, Y), [0.7])) rtol = 1e-6
+        end
+        native = prepare(jax_cell_order_rows; have = (:k, :x, :R), want = :total)
+        r = rk_jax_evaluate(rows, "kernel", (0.7, x, R); grad = true, prepare = true)
+        @test r.value ≈ native(0.7, x, R) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x, R), [0.7])) rtol = 1e-6
+        native = prepare(jax_cell_order_shared; have = (:theta, :x), want = :total)
+        theta = [0.3, -0.2, 0.9]
+        r = rk_jax_evaluate(shared, "kernel", (theta, x); grad = true, prepare = true)
+        @test r.value ≈ native(theta, x) rtol = 1e-12
+        @test r.grad ≈ rk_fd_gradient(t -> native(t, x), theta) rtol = 1e-6
     end
 end
 

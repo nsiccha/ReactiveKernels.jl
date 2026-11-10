@@ -167,6 +167,19 @@ JAX code:
 - A data-only recipe without a host translation stays in the functions; a
   comment in `prepare_data` names it and the reason. When the functions
   cannot compute it either, the `JAXEmissionError` names both reasons.
+- A plate whose cell also reads parameters runs in the functions, cell and
+  all. A recipe of its cell that reads only the plate's data (a bound
+  column, or a value `prepare_data` computes) and that the functions cannot
+  compute (a `@traceable` helper that builds a list with `push!`, sorts, or
+  loops to a data length) runs in `prepare_data` instead, as a loop over the
+  cells. Each of its values the rest of the cell reads becomes an input of
+  the plate, one per cell: a vector per cell is ragged (padded, with its
+  `<name>_lengths`). When the recipe reads only data passed whole to every
+  cell (`Ref(x)`), it runs once and its value is passed whole. A cell recipe
+  the functions can compute stays in the cell, so a length it reads from a
+  padded row keeps that row's static bound. This applies to a top-level
+  plate's own cell recipes; one in a plate nested inside the cell, a scan
+  step or a branch arm stays where it is.
 - `definitions = [name => expression, …]` (with `data`) computes data
   values on the host before that prefix, from the other data values;
   `prepare_data` then takes what the expressions read instead of the values

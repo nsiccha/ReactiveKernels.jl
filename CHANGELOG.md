@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.153
+
+- `jax_source` with `data`: a recipe of a top-level plate's cell that reads
+  only the plate's data and that the JAX functions cannot compute (a
+  `@traceable` helper that builds a list with `push!`, sorts, or loops to a
+  data length) now runs in `prepare_data`, as a loop over the cells, and the
+  plate reads its values as inputs of its own, one per cell (a vector per
+  cell is ragged). It used to be translated as JAX code and raised
+  `JAXEmissionError` (`the function fpiseq has no JAX translation`, say),
+  although the same recipes at the top level ran on the host. A recipe the
+  functions can compute stays in the cell, so modules that emitted before are
+  unchanged (snag `jax-source-cell-a3ec8540`).
+
 ## 0.1.152
 
 - Reverse AD over a tuple of active ports (`active = (:a, :b)`) holds each
