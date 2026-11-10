@@ -519,6 +519,21 @@ end
     end
 end
 
+# Row `row` of a `vcat` of numbers and vectors from its operands' rows
+# (`_cell_vcat_window!`'s parts): the entry of the operand holding it, of the
+# `vcat`'s element type.
+@inline function _cell_vcat_one(row::Integer, starts::Tuple, parts::Tuple)
+    T = Base.promote_eltypeof(parts...)
+    convert(T, _cell_vcat_one(row, starts, parts, 1))
+end
+@inline _cell_vcat_one(row, starts, ::Tuple{}, k) = throw(BoundsError(starts, row))
+@inline function _cell_vcat_one(row, starts, parts::Tuple, k)
+    starts[k] < row <= starts[k + 1] && return _cell_vcat_entry(first(parts))
+    _cell_vcat_one(row, starts, Base.tail(parts), k + 1)
+end
+@inline _cell_vcat_entry(part::Number) = part
+@inline _cell_vcat_entry(part::AbstractArray) = only(part)
+
 # The rows several gather indices read, joined in order (a tuple of single rows
 # and vectors: the comprehension, which native Enzyme Reverse types; a sized
 # loop over the mixed tuple does not pass its type analysis).
@@ -3772,22 +3787,41 @@ end
 # or rows read as numbers (`_CellRow`).
 function _cell_scalar_eligible(e::_CellEmitter, cid::ValueId, r::Recipe, f::_CellForm)
     d = e.pushdowns
-    f.kind === :pointwise && e.unions[cid] in e.one && !(cid in e.arrays) &&
-        get(d.types, cid, Any) <: AbstractVector || return false
+    f.kind in (:pointwise, :columns, :product, :vcat) && e.unions[cid] in e.one &&
+        !(cid in e.arrays) && get(d.types, cid, Any) <: AbstractVector || return false
     # An authored plate lowers its own loop over its arguments' rows
     # (`_lower_authored_plate_native!`); a helper or position map reads them
     # through its own row program.
     r.op isa _AuthoredPlateOp && return false
     f.rowmap === nothing || return false
     type_of(j) = get(d.types, canon_id(d.graph, r.inputs[j].id), Any)
+    # A `vcat` of numbers and vectors: its row is one of its operands' entries.
+    f.kind === :vcat && return all(f.parts) do part
+        part isa _CellInputLiteral || return part isa Number
+        type_of(part.input) <: Union{Number,AbstractVector}
+    end
+    # A product `A * w` with a vector `w` (two operands): its row is a number.
+    if f.kind === :product
+        f.operand == 0 && return false
+        type_of(f.operand) <: AbstractVector || return false
+    end
     for (j, role) in enumerate(f.roles)
-        if role === :leaf
+        if role in (:leaf, :index)
             type_of(j) <: Union{Number,AbstractVector} || return false
         elseif role === :column
             type_of(j) <: AbstractArray || return false
         elseif role === :factor_leaf
             type_of(j) <: AbstractMatrix && type_of(f.gather_index[j]) <: AbstractVector ||
                 return false
+        elseif role === :factor
+            type_of(j) <: AbstractMatrix || return false
+        elseif role in (:gather, :linear_gather)
+            # One direct index; a row read keeps no whole axis.
+            length(f.indices[j]) == 1 && only(f.vias[j]) == 0 || return false
+            type_of(only(f.indices[j])) <: AbstractVector{<:Integer} || return false
+            role === :linear_gather && !(type_of(j) <: AbstractVector) && return false
+            f.tails[j] === nothing ||
+                all(part -> !any(t -> t isa Colon, last(part)), f.tails[j]) || return false
         elseif !(role in (:whole, :scalar))
             return false
         end
@@ -3845,6 +3879,7 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
     f = d.forms[r.id]
     U = e.unions[cid]
     if f.kind === :vcat
+        _cell_scalar_eligible(e, cid, r, f) && push!(e.scalar, cid)
         starts = _cell_bind!(e, :cell_starts,
             Expr(:call, _cell_ref(:_cell_vcat_starts), _cell_vcat_part_shapes!(e, r, f)))
         e.reads[cid] = Any[starts; map(enumerate(f.parts)) do (k, part)
@@ -3901,7 +3936,7 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
         elseif role in (:leaf, :index, :column) && icid in d.pushed
             reads[j] = _cell_request!(e, icid, _cell_bind_row!(e, U, _cell_canon(e,
                 Expr(:call, _cell_ref(:_cell_leaf_row), _cell_shape!(e, icid), U)));
-                scalar = scalar && role === :leaf)
+                scalar = scalar && role in (:leaf, :index))
         elseif role in (:gather, :linear_gather) && icid in d.pushed
             # The rows every gather index reads (`_cell_gather_rows` joins
             # those of several indices).
@@ -3921,7 +3956,9 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
             role === :gather ||
                 (at = Expr(:call, _cell_ref(r.op isa _AuthoredPlateOp ?
                     :_cell_capture_rows : :_cell_linear_row), _cell_shape!(e, icid), at))
-            reads[j] = _cell_request!(e, icid, _cell_bind!(e, :cell_row, _cell_canon(e, at)))
+            # A scalar value's one direct gather reads one row of its source.
+            reads[j] = _cell_request!(e, icid, scalar ? _cell_bind_row!(e, U, _cell_canon(e, at)) :
+                _cell_bind!(e, :cell_row, _cell_canon(e, at)); scalar)
         elseif role === :factor_leaf
             # The rows of the product `A * w` this operand broadcasts: rows of `A`.
             reads[j] = _cell_bind_row!(e, U, _cell_canon(e, Expr(:call,
@@ -4159,17 +4196,46 @@ function _cell_scalar_window!(e::_CellEmitter, cid::ValueId, r::Recipe, f::_Cell
             push!(args, pushed ?
                 Expr(:call, _cell_ref(:_cell_scalar_row), _cell_take!(e, icid, reads[j])) :
                 _cell_scalar_operand!(e, icid, U, :_cell_operand_row))
-        elseif role === :factor_leaf
+        elseif role === :factor_leaf || role === :factor
             pushed || _footprint_record!(icid, :rows, reads[j])
             push!(args, pushed ?
                 Expr(:call, _cell_ref(:_cell_scalar_row), _cell_take!(e, icid, reads[j])) :
                 Expr(:call, _cell_ref(:_CellRow), e.names[icid], reads[j]))
+        elseif role === :index
+            push!(args, pushed ?
+                Expr(:call, _cell_ref(:_cell_scalar_value), _cell_take!(e, icid, reads[j])) :
+                _cell_scalar_operand!(e, icid, U, :_cell_scalar_operand))
+        elseif role in (:gather, :linear_gather) && pushed
+            # Read at one position (`w[i]`, `w[i, k...]`) by the number index.
+            push!(args, _cell_bind!(e, :cell_window, Expr(:call, _cell_ref(:_CellWindow),
+                e.data[icid], e.unions[icid], role === :gather ? nothing : _cell_shape!(e, icid),
+                e.sorted)))
+        elseif role in (:gather, :linear_gather)
+            index = canon_id(d.graph, r.inputs[only(f.indices[j])].id)
+            _footprint_record!(icid, role === :gather ? :gathered_rows : :gathered,
+                _cell_operand_row!(e, index, U))
+            push!(args, e.names[icid])
         else
             _footprint_record!(icid, :whole, nothing)
             push!(args, e.names[icid])
         end
     end
     _cell_bind!(e, :cell_rows, _slot_call_expr(r, d.slots[r.id], args))
+end
+
+# A `vcat` at one row: the entry of the operand holding it (`_cell_vcat_one`),
+# each operand at its own rows as `_cell_vcat_window!` reads them.
+function _cell_scalar_vcat!(e::_CellEmitter, cid::ValueId, r::Recipe, f::_CellForm, U::Symbol)
+    d = e.pushdowns
+    starts, locals = e.reads[cid][1], e.reads[cid][2:end]
+    parts = map(zip(f.parts, locals)) do (part, local_rows)
+        part isa _CellInputLiteral || return part
+        input = canon_id(d.graph, r.inputs[part.input].id)
+        input in d.pushed ? _cell_take!(e, input, local_rows) :
+            _cell_operand_row!(e, input, local_rows)
+    end
+    _cell_bind!(e, :cell_rows, Expr(:call, _cell_ref(:_cell_vcat_one), U, starts,
+        Expr(:tuple, parts...)))
 end
 
 # An unpushed operand at one row as a number (`read = :_cell_scalar_operand`)
@@ -4196,6 +4262,7 @@ function _cell_vcat_window!(e::_CellEmitter, cid::ValueId, r::Recipe, f::_CellFo
     d = e.pushdowns
     shape = _cell_shape!(e, cid)
     push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row), shape, U, e.sorted))
+    cid in e.scalar && return _cell_scalar_vcat!(e, cid, r, f, U)
     starts, locals = e.reads[cid][1], e.reads[cid][2:end]
     parts = map(zip(f.parts, locals)) do (part, local_rows)
         part isa _CellInputLiteral || return part
