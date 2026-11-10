@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.147
+
+- `jax_source` keeps Julia's grouping when an operand after the first is an
+  expression of the operator's own Python precedence level. Python's `*`, `/`
+  and `@` share one level and associate left, so `a .* ((B ./ c) * w)` used
+  to emit `a * B / c @ w`, which is `((a * B) / c) @ w`: a broadcast error
+  (`operands could not be broadcast together`) when `B` is not square, a
+  wrong value when it is. It now emits `a * (B / c @ w)`. `a + (b - c)` and
+  `a * (b * c)` keep their parentheses too, since floating-point `+` and `*`
+  are not associative (snag `jax-source-drops-410c82c2`).
+
 ## 0.1.146
 
 - `jax_source`: `I(n)` (a `UniformScaling` called with a size) is the n×n

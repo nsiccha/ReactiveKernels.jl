@@ -302,9 +302,12 @@ function _py_infix(op::AbstractString, operands::AbstractVector{<:AbstractString
     end
     parts = map(enumerate(operands)) do (k, x)
         q = _py_precedence(x)
-        # Comparisons do not chain as Julia's binary calls mean them.
-        needs = q < p || (k > 1 && q == p && op in ("-", "/", "//", "%", "@")) ||
-                (p == 5 && q == 5)
+        # Python's binary operators associate left, so a later operand of the
+        # same level keeps its parentheses: `*`, `/` and `@` share one level
+        # (`a * (B @ w)` is not `(a * B) @ w`), and floating-point `+` and `*`
+        # are not associative either. Comparisons do not chain as Julia's
+        # binary calls mean them.
+        needs = q < p || (k > 1 && q == p) || (p == 5 && q == 5)
         needs ? "(" * x * ")" : x
     end
     join(parts, " " * op * " ")
