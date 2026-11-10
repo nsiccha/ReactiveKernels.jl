@@ -235,6 +235,19 @@ end
 @inline Base.getindex(w::_CellWindow, i::Integer, j::Union{Integer,Colon},
                       rest::Union{Integer,Colon}...) =
     w.data[_cell_local_row(w, i, (i, j, rest...)), j, rest...]
+# A window holding one number (`_cell_scalar_window!`) reads it as the
+# one-element vector it stands for would: an element, or a one-element array
+# along each whole axis `:` that the read keeps.
+@inline Base.getindex(w::_CellWindow{<:Number}, i::Integer, j::Union{Integer,Colon},
+                      rest::Union{Integer,Colon}...) =
+    _cell_number_read(w.data, _cell_local_row(w, i, (i, j, rest...)), j, rest...)
+@inline _cell_number_read(x::Number, i::Integer, j::Integer...) = x[i, j...]
+@inline function _cell_number_read(x::Number, i::Integer, j::Union{Integer,Colon}...)
+    all(k -> k isa Colon || k == 1, j) || throw(BoundsError(x, (i, j...)))
+    fill(x, ntuple(_ -> 1, count(k -> k isa Colon, j))...)
+end
+@inline _lane_gathered(x::Number, i::Integer, j::Union{Integer,Colon}...) =
+    _cell_number_read(x, i, j...)
 # A dotted call consumes this row before the slice can escape. Delegate to
 # the same checked read-in-place path as a dense operand. Ordinary indexing
 # above keeps its owning copy and concrete dispatch semantics.
@@ -315,6 +328,51 @@ end
 end
 @inline _cell_rows_view(arg::AbstractArray{<:Any,N}, position::Integer) where {N} =
     view(arg, position:position, ntuple(_ -> Colon(), Val(N - 1))...)
+
+# A value computed as one number at one row (`_cell_scalar_window!`) reads its
+# operands at that row: a number as itself, a vector (or tuple) as its element
+# at `position` (`_cell_slice_positions`, which extrudes a one-row operand), a
+# pushed operand's one-row window as its one element.
+@inline _cell_scalar_operand(x, ::Nothing) = x
+@inline _cell_scalar_operand(x::AbstractArray{<:Any,0}, ::Nothing) = x[]
+@inline _cell_scalar_operand(x::Union{AbstractVector,Tuple}, position::Integer) = x[position]
+@inline _cell_scalar_value(x) = x
+@inline _cell_scalar_value(x::AbstractArray) = only(x)
+
+"""
+    _CellRow(parent, row)
+
+Row `row` of the array `parent`, as a value computed as one number at one row
+reads it (`_cell_scalar_window!`): a column `r[:, k...]` is the number
+`parent[row, k...]`, and the product `r * w` with a vector `w` is the number
+`sum(parent[row, k] * w[k] for k)`, in that order. Nothing else reads it. The
+row is bounds-checked on construction, as the row view it stands for is.
+"""
+struct _CellRow{A<:AbstractArray}
+    parent::A
+    row::Int
+    @inline function _CellRow(parent::A, row::Integer) where {A<:AbstractArray}
+        checkbounds(parent, row, ntuple(_ -> Colon(), Val(ndims(parent) - 1))...)
+        new{A}(parent, Int(row))
+    end
+end
+@inline Base.getindex(r::_CellRow, ::Colon, k::Integer...) = r.parent[r.row, k...]
+@inline function _native_mul(r::_CellRow{<:AbstractMatrix}, w::AbstractVector)
+    A = r.parent
+    axes(A, 2) == axes(w, 1) || throw(DimensionMismatch(
+        "matrix row has $(size(A, 2)) columns, vector has length $(length(w))"))
+    T = Base.promote_op(LinearAlgebra.matprod, eltype(A), eltype(w))
+    total = zero(T)
+    for k in axes(A, 2)
+        total += A[r.row, k] * w[k]
+    end
+    total
+end
+@inline Base.:*(r::_CellRow{<:AbstractMatrix}, w::AbstractVector) = _native_mul(r, w)
+# An operand row read as numbers (`_cell_scalar_operand!`), and a pushed
+# operand's one-row window as that row.
+@inline _cell_operand_row(x::AbstractArray, position::Integer) = _CellRow(x, position)
+@inline _cell_scalar_row(x::AbstractArray) = _CellRow(x, firstindex(x, 1))
 
 # The full axes of a matrix-vector product `A * v`.
 @inline _cell_factor_shape(A::AbstractMatrix) = (axes(A, 1),)
@@ -607,6 +665,27 @@ end
     domain = CartesianIndices(shape)
     Int[_cell_linear_row(shape, q) for q in
         (positions isa Integer ? (positions,) : positions) if checkbounds(Bool, domain, q)]
+end
+
+# The one row holding linear position `q` of a capture every cell reads there
+# unconditionally (`_cell_capture_one`): an out-of-bounds position throws
+# `BoundsError` here, as the read itself would.
+@inline _cell_capture_row(shape::Tuple, q::Integer) = _cell_linear_row(shape, q)
+
+# Whether the cell of `plate` reads its capture at argument `position` only at
+# one position per cell and outside every branch: each read `v[q]` needs no
+# branch proof (`_cell_capture_reader` without `branch_read`), and `q` is the
+# element of the batched argument `batched`, an array of integers. Such a read
+# requests one `Int` row (`_cell_capture_row`). A read the body may skip keeps
+# the vector of in-bounds rows, which an inactive out-of-bounds read leaves
+# empty (`_cell_capture_rows`).
+function _cell_capture_one(d, plate, plate_values, position::Int, batched::Int)
+    get(d.types, canon_id(d.graph, plate_values[batched].id), Any) <:
+        AbstractArray{<:Integer} || return false
+    atomic = typeof(plate).parameters[2]
+    inner = plate.kernel.plan
+    roots = ValueId[canon_id(inner.graph, v.id) for v in inner.have]
+    _cell_capture_reader(inner, roots, atomic, roots[position]) !== nothing
 end
 
 @inline function _cell_capture_via_rows(source, positions)
@@ -2699,7 +2778,7 @@ function _cell_scalar_plates(p::Plan; argument_types = nothing,
     for r in p.recipes
         r.id in partitions || continue
         lanes = get(p.producer, cid(first(r.inputs)), nothing)
-        lanes !== nothing && lanes.op isa _PartitionLanes && push!(covered, cid(first(lanes.inputs)))
+        lanes !== nothing && _partition_lanes_op(lanes.op) && push!(covered, cid(first(lanes.inputs)))
     end
     complete = !isempty(tables) && issubset(tables, covered)
     complete && length(partitions) == 1 && return p
@@ -3450,6 +3529,14 @@ struct _CellEmitter
     constant::Set{Symbol}
     # A group with guarded members (`_CellRegions`), or `nothing`.
     regions::Union{Nothing,_CellRegions}
+    # The names bound to one `Int` row (a cell's unconditional capture read,
+    # `_cell_capture_request!`, and the rows derived from it), whose values
+    # are each computed at one row.
+    one::Set{Symbol}
+    # The values computed as one number at one row (`_cell_scalar_eligible`),
+    # and the values some reader needs as an array of rows.
+    scalar::Set{ValueId}
+    arrays::Set{ValueId}
 end
 _CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes; sorted::Bool = false,
              constant::Set{Symbol} = Set{Symbol}(),
@@ -3457,7 +3544,8 @@ _CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes; sorted::Bool 
     _CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes,
         Dict{ValueId,Symbol}(), Dict{ValueId,Symbol}(), Dict{Tuple{ValueId,Symbol},Symbol}(),
         Dict{ValueId,Vector{Symbol}}(), Dict{ValueId,Symbol}(),
-        Dict{ValueId,Vector{Any}}(), Dict{ValueId,Symbol}(), sorted, constant, regions)
+        Dict{ValueId,Vector{Any}}(), Dict{ValueId,Symbol}(), sorted, constant, regions,
+        Set{Symbol}(), Set{ValueId}(), Set{ValueId}())
 
 # The member that owns value `cid` in a group with guarded members, else
 # `_CELL_UNGUARDED`.
@@ -3656,11 +3744,55 @@ function _cell_compute_operand_row!(e::_CellEmitter, cid::ValueId, row::Symbol)
 end
 
 # Asks for pushed value `cid` at rows `row` (one row or an integer vector).
-function _cell_request!(e::_CellEmitter, cid::ValueId, row::Symbol)
+# A reader that accepts a number for a value of one element per row at one row
+# says so (`scalar`); any other request needs the rows as an array.
+function _cell_request!(e::_CellEmitter, cid::ValueId, row::Symbol; scalar::Bool = false)
     rows = get!(() -> Symbol[], e.requests, cid)
     row in rows || push!(rows, row)
     e.regions === nothing || push!(e.regions.requested, row)
+    scalar || push!(e.arrays, cid)
     row
+end
+
+# Binds `row`, the rows of an operand at reader rows `at`, and records it as
+# one `Int` row when `at` is one.
+function _cell_bind_row!(e::_CellEmitter, at::Symbol, row)
+    name = _cell_bind!(e, :cell_row, row)
+    at in e.one && push!(e.one, name)
+    name
+end
+
+# Whether pushed value `cid` is computed as one number at its one row: a
+# pointwise value of one element per row (a vector), requested at one `Int`
+# row by readers that all accept a number (a cell's capture, another such
+# value), whose operands are numbers, vectors read at the row, columns
+# `A[:, k...]` of an array, the left factor `A` of a product `A * w` with a
+# vector `w`, or values read whole. The window then holds that number instead
+# of a one-element array; the operands become numbers (`_cell_scalar_operand`)
+# or rows read as numbers (`_CellRow`).
+function _cell_scalar_eligible(e::_CellEmitter, cid::ValueId, r::Recipe, f::_CellForm)
+    d = e.pushdowns
+    f.kind === :pointwise && e.unions[cid] in e.one && !(cid in e.arrays) &&
+        get(d.types, cid, Any) <: AbstractVector || return false
+    # An authored plate lowers its own loop over its arguments' rows
+    # (`_lower_authored_plate_native!`); a helper or position map reads them
+    # through its own row program.
+    r.op isa _AuthoredPlateOp && return false
+    f.rowmap === nothing || return false
+    type_of(j) = get(d.types, canon_id(d.graph, r.inputs[j].id), Any)
+    for (j, role) in enumerate(f.roles)
+        if role === :leaf
+            type_of(j) <: Union{Number,AbstractVector} || return false
+        elseif role === :column
+            type_of(j) <: AbstractArray || return false
+        elseif role === :factor_leaf
+            type_of(j) <: AbstractMatrix && type_of(f.gather_index[j]) <: AbstractVector ||
+                return false
+        elseif !(role in (:whole, :scalar))
+            return false
+        end
+    end
+    true
 end
 
 # The rows every request of `cid` reads: the one request, or their union.
@@ -3726,6 +3858,11 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
         return
     end
     reads = Vector{Any}(nothing, length(r.inputs))
+    # Its readers have all asked for it by now (readers come first), so
+    # whether it is one number at its row is decided here, and it asks for its
+    # operands at that row as numbers too.
+    scalar = _cell_scalar_eligible(e, cid, r, f)
+    scalar && push!(e.scalar, cid)
     for (j, input) in enumerate(r.inputs)
         icid = canon_id(d.graph, input.id)
         role = f.roles[j]
@@ -3762,8 +3899,9 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
             reads[j] = _cell_bind!(e, :cell_row, _cell_canon(e, at))
             icid in d.pushed && _cell_request!(e, icid, reads[j])
         elseif role in (:leaf, :index, :column) && icid in d.pushed
-            reads[j] = _cell_request!(e, icid, _cell_bind!(e, :cell_row, _cell_canon(e,
-                Expr(:call, _cell_ref(:_cell_leaf_row), _cell_shape!(e, icid), U))))
+            reads[j] = _cell_request!(e, icid, _cell_bind_row!(e, U, _cell_canon(e,
+                Expr(:call, _cell_ref(:_cell_leaf_row), _cell_shape!(e, icid), U)));
+                scalar = scalar && role === :leaf)
         elseif role in (:gather, :linear_gather) && icid in d.pushed
             # The rows every gather index reads (`_cell_gather_rows` joins
             # those of several indices).
@@ -3786,7 +3924,7 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
             reads[j] = _cell_request!(e, icid, _cell_bind!(e, :cell_row, _cell_canon(e, at)))
         elseif role === :factor_leaf
             # The rows of the product `A * w` this operand broadcasts: rows of `A`.
-            reads[j] = _cell_bind!(e, :cell_row, _cell_canon(e, Expr(:call,
+            reads[j] = _cell_bind_row!(e, U, _cell_canon(e, Expr(:call,
                 _cell_ref(:_cell_leaf_row), _cell_part_shape!(e, r, f, j), U)))
             icid in d.pushed && _cell_request!(e, icid, reads[j])
         elseif role === :factor
@@ -3860,6 +3998,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
         push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row),
             _cell_shape!(e, cid), U, e.sorted))
     end
+    cid in e.scalar && return _cell_scalar_window!(e, cid, r, f)
     reads = e.reads[cid]
     if f.kind === :vec
         # The source's rows, by its own window when it is pushed and as a
@@ -3999,6 +4138,56 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
     _cell_bind!(e, :cell_rows, call)
 end
 
+# A value computed as one number at its one row (`_cell_scalar_eligible`): its
+# operation over its operands there, each a number (`_cell_scalar_value`,
+# `_cell_scalar_operand`) or, for a column `A[:, k...]` or a product's left
+# factor `A`, that row of `A` read as numbers (`_CellRow`).
+function _cell_scalar_window!(e::_CellEmitter, cid::ValueId, r::Recipe, f::_CellForm)
+    d = e.pushdowns
+    U = e.unions[cid]
+    reads = e.reads[cid]
+    args = Any[]
+    for (j, input) in enumerate(r.inputs)
+        icid = canon_id(d.graph, input.id)
+        role = f.roles[j]
+        pushed = icid in d.pushed
+        if role === :leaf
+            push!(args, pushed ?
+                Expr(:call, _cell_ref(:_cell_scalar_value), _cell_take!(e, icid, reads[j])) :
+                _cell_scalar_operand!(e, icid, U, :_cell_scalar_operand))
+        elseif role === :column
+            push!(args, pushed ?
+                Expr(:call, _cell_ref(:_cell_scalar_row), _cell_take!(e, icid, reads[j])) :
+                _cell_scalar_operand!(e, icid, U, :_cell_operand_row))
+        elseif role === :factor_leaf
+            pushed || _footprint_record!(icid, :rows, reads[j])
+            push!(args, pushed ?
+                Expr(:call, _cell_ref(:_cell_scalar_row), _cell_take!(e, icid, reads[j])) :
+                Expr(:call, _cell_ref(:_CellRow), e.names[icid], reads[j]))
+        else
+            _footprint_record!(icid, :whole, nothing)
+            push!(args, e.names[icid])
+        end
+    end
+    _cell_bind!(e, :cell_rows, _slot_call_expr(r, d.slots[r.id], args))
+end
+
+# An unpushed operand at one row as a number (`read = :_cell_scalar_operand`)
+# or as that row read as numbers (`:_cell_operand_row`), positioned as
+# `_cell_operand_row!` positions it; memoized per operand, row and form.
+function _cell_scalar_operand!(e::_CellEmitter, cid::ValueId, row::Symbol, read::Symbol)
+    _footprint_record!(cid, :rows, row)
+    get!(e.rows, (cid, Symbol(read, row))) do
+        _cell_forced(e, _CELL_BY_READS) do
+            shape = _cell_bind!(e, :cell_shape, _cell_leaf_shape_expr(e, cid))
+            positions = _cell_bind!(e, :cell_positions,
+                Expr(:call, _cell_ref(:_cell_slice_positions), shape, row))
+            _cell_bind!(e, :cell_operand, Expr(:call, _cell_ref(read),
+                Expr(:call, GlobalRef(Base, :broadcastable), e.names[cid]), positions))
+        end
+    end
+end
+
 # The rows `U` of a pushed `vcat`: each operand at the rows of it they hold
 # (possibly none), by its own producer when it is pushed and as a view of its
 # whole value otherwise, then those rows in the order read.
@@ -4024,8 +4213,20 @@ end
 # `_cell_capture!` once the windows are emitted. A partition (`rows`) reads
 # the positions every element of its slice holds, joined
 # (`_cell_partition_positions`), or those `via` holds at them.
+#
+# A cell that reads the capture at one position per cell, outside every branch
+# (`_cell_capture_one`), requests that one row as an `Int` (`one`): its
+# window is then known to hold one row.
 function _cell_capture_request!(e::_CellEmitter, cid::ValueId, slice, via = nothing;
-                                rows::Bool = false)
+                                rows::Bool = false, one::Bool = false)
+    if one && via === nothing && !rows
+        position = _cell_bind!(e, :cell_read, _cell_capture_element(slice, nothing; rows))
+        row = _cell_bind!(e, :cell_row, _cell_canon(e,
+            Expr(:call, _cell_ref(:_cell_capture_row), _cell_shape!(e, cid), position)))
+        push!(e.one, row)
+        # The cell reads `v[q]` (or `v[q, j...]`) of it: a number serves.
+        return _cell_request!(e, cid, row; scalar = true)
+    end
     position = _cell_bind!(e, :cell_read, via === nothing ?
         _cell_capture_element(slice, nothing; rows) :
         Expr(:call, _cell_ref(:_cell_capture_via_rows), via, slice))
