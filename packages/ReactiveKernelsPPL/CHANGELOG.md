@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.135
+## 0.1.136
 
 - A model call (`model(; data)`, `model(; data) | (; y)`, `@rkppl data begin
   … end`) names what its lowering generates (a cell `@scan`'s seeds, a
@@ -27,6 +27,19 @@ are recorded in the git history only.
   second compiles nothing more where such a name reaches a type (a selected
   argument in a split node). Values and gradients are unchanged. Snag
   `kernel-expr-of-a-26ed1e5c`.
+
+## 0.1.135
+
+- The full-model sampler query is a LogDensityProblems target. With
+  `LogDensityProblems` loaded, a `SamplerQuery` from `prepare_sampler`
+  implements `dimension` (`layout.total`), `capabilities`
+  (`LogDensityOrder{1}`), `logdensity` (`q(u)`) and `logdensity_and_gradient`,
+  which returns a fresh gradient vector on every call, so it can be passed to
+  WarmupHMC, Pathfinder or an optimizer directly. A point of another length is
+  a `DimensionMismatch`. Before this, `LogDensityProblems.dimension(q)` was a
+  `MethodError` and only `slice_problem` and `joined_problem` targets existed.
+  A query still serves one caller at a time: give each concurrent chain its
+  own query, or let a sampler deep-copy one per chain.
 
 ## 0.1.134
 
