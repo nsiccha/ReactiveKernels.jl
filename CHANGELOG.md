@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.153
+## 0.1.154
 
 - `jax_source` with `data`: a recipe of a top-level plate's cell that reads
   only the plate's data and that the JAX functions cannot compute (a
@@ -28,6 +28,32 @@ are recorded in the git history only.
   although the same recipes at the top level ran on the host. A recipe the
   functions can compute stays in the cell, so modules that emitted before are
   unchanged (snag `jax-source-cell-a3ec8540`).
+
+## 0.1.153
+
+- A prepared child called inside another prepared program, such as a lazy
+  arm's call of a kernel that owns a plate or a scan, now infers concretely
+  however cold the inference cache is. Its call re-entered the prepared-call
+  methods (`_prepared_call`, an `_ArrayFunction`'s call,
+  `_native_array_body_call` and the generated function's
+  `generated_callfunc`), and Julia's inference limited each such recurring
+  edge as possible unbounded recursion, so in a cold cache the caller
+  inferred `Any`. Native preparation usually left the pieces inferred, but
+  Enzyme infers in a cache of its own: DistributionKernels'
+  `lower_truncated_lognormal`/`upper_truncated_lognormal` `var()` endpoint
+  (a quadrature plate in a lazy arm) inferred `Any` there. An RKPPL sampler
+  whose observation plate read that variance failed static
+  `AutoEnzyme(mode = Enzyme.Reverse)` with `EnzymeRuntimeActivityError`, and
+  one computing it in a plate cell failed with an `ArgumentError` about an
+  array of `Any` (snags `native-lognormal-a666a8e1`,
+  `native-truncated-9d7d9eda`). These methods now carry a
+  `recursion_relation`, as the source-call methods have since nested source
+  operations were made to infer (`41a1f4d30`): a call of a different prepared
+  program, whose type does not contain its caller's, is well founded. The same program again keeps
+  Julia's default limiting. Only the `generated_callfunc` methods of caches
+  ReactiveKernels creates (its own, and a package image's) are marked.
+  Emitted code is unchanged; the gradients are exact, as before at warm
+  caches.
 
 ## 0.1.152
 
