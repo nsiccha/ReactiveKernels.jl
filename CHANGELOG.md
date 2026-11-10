@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.135
+
+- `jax_source` translates `clamp` and `convert(T, x)` (snag
+  `jax-source-clamp-af26e700`). `clamp` is a straight-line Base function whose
+  lowered code converts its operands with `convert(promote_type(...), x)`,
+  and that `convert` had no translation, so a recipe calling `clamp` (the
+  `hsgp(...)` basis of a BRM model) raised `JAXEmissionError: the function
+  convert has no JAX translation`. `convert(T, x)` is now `x` when `x` is a
+  `T` already, and `T(x)` for a concrete float or integer `T`. `clamp` keeps
+  Julia's definition, two `jnp.where` selections, so at a bound its
+  derivative is the one Julia's `ifelse` gives (`jnp.clip` would halve it).
+- A type that lowered code or a type-level call passes as a value (`Int` read
+  as a global, a `where T` parameter, `promote_type(...)`) is now read as a
+  type by the calls that take one. In a plain helper, `floor(Int, x)` emitted
+  invalid Python (`jnp.floor(<callable>, x)`) and `ones(T, n)` was refused;
+  both now translate.
+
 ## 0.1.134
 
 - `jax_source(spec; data, definitions)`: a definition may read a raw data
