@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.137
+## 0.1.138
 
 - `jax_source`: a gather through a ragged integer row is padded as the row is
   (snag `jax-ragged-index-b8420d16`). In a plate cell, `xs[rs[i]]`, `xs[r]` or
@@ -33,6 +33,15 @@ are recorded in the git history only.
 - A gather through a ragged row beside another kept dimension (`M[r, :]`)
   raises `JAXEmissionError`: its padding would sit on an inner axis that no
   reduction masks. Its JAX value used to sum the padding.
+
+## 0.1.137
+
+- `jax_source`: a scan whose step outputs a named tuple of numbers and
+  numeric vectors (a K-state filter's `(lpd, w, m)`) translates. Each vector
+  field stacks as the `(steps, K)` array of its rows, as `jax.lax.scan`
+  stacks it; `steps[t].w`, `steps[end].m` and generators over the steps read
+  it as native does. It raised "a scan whose step outputs … has no JAX
+  translation yet".
 
 ## 0.1.136
 
