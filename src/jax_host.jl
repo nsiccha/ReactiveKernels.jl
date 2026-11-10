@@ -217,7 +217,7 @@ function _host_write!(ctx::_JaxContext, lhs::Expr, v::_PyVal)
         return
     end
     target = _host_own!(ctx, s)
-    indexed = _jax_index(ctx, target, lhs.args[2:end])
+    indexed = _jax_index(ctx, target, lhs.args[2:end]; target = true)
     startswith(indexed.code, target.code * "[") ||
         _jax_error("the indexed write `", lhs, "` has no host translation", _jax_where(ctx))
     _jax_emit!(ctx, indexed.code * " = " * v.code)
