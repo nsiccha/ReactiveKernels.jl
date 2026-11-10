@@ -135,6 +135,20 @@ _jax_emit!(ctx::_JaxContext, line::AbstractString) =
 _jax_stable_name(hint) =
     replace(replace(String(Symbol(hint)), r"#\d+" => ""), r"_\d{6,}(?=_|$)" => "")
 
+# A module-level helper's name: an identifier with one leading underscore,
+# so the module's public names are its documented functions alone.
+function _jax_private_identifier(used::Set{String}, hint)
+    base = _jax_identifier(Set{String}(), hint)
+    candidate = "_" * base
+    n = 1
+    while candidate in used
+        n += 1
+        candidate = string("_", base, "_", n)
+    end
+    push!(used, candidate)
+    candidate
+end
+
 function _jax_identifier(used::Set{String}, hint)
     text = replace(_jax_stable_name(hint), r"[^A-Za-z0-9_]" => "_")
     text = replace(text, r"_+" => "_")
@@ -2172,7 +2186,7 @@ function _jax_scalar_function!(ctx::_JaxContext, f, types)
     key = (:scalar, objectid(f), Tuple(types), host)
     haskey(ctx.mod.helper_names, key) && return ctx.mod.helper_names[key]
     hint = Symbol("_rk_", replace(string(nameof_or(f)), r"[^A-Za-z0-9_]" => "_"), host ? "_np" : "")
-    name = _jax_identifier(ctx.mod.used, hint)
+    name = _jax_private_identifier(ctx.mod.used, hint)
     ctx.mod.helper_names[key] = name
     scope = _JaxScope()
     params = [_jax_identifier(scope.used, Symbol(:x, i)) for i in eachindex(types)]
@@ -2319,7 +2333,7 @@ function _jax_call_positional(ctx::_JaxContext, k::PreparedKernel, args::Vector{
     key = (:kernel, objectid(k), types, host)
     name = get(ctx.mod.helper_names, key, nothing)
     if name === nothing
-        name = _jax_identifier(ctx.mod.used, Symbol("_rk_", hint, host ? "_np" : ""))
+        name = _jax_private_identifier(ctx.mod.used, Symbol("_rk_", hint, host ? "_np" : ""))
         ctx.mod.helper_names[key] = name
         lines, f = _jax_function!(ctx.mod, name, p, Tuple(types),
                                   length(p.want) == 1 ? only(p.want).name : Tuple(v.name for v in p.want);
@@ -2967,7 +2981,7 @@ Base.write(path::AbstractString, src::JAXSource) = write(path, src.text)
 # The host-side helper that turns a ragged input (one array per group) into
 # the padded array and lengths vector the functions take.
 const _JAX_PAD_RAGGED = """
-def pad_ragged(arrays):
+def pad_ragged(arrays: list) -> tuple:
     \"\"\"Pad a list of 1-D arrays into one 2-D array and its lengths vector.
 
     Each row repeats its last entry up to the longest length, so every padded
@@ -2984,10 +2998,13 @@ def pad_ragged(arrays):
 """
 
 const _JAX_HEADER = """
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg
 import jax.scipy.special as jsp
+from jax.typing import ArrayLike
 
 jax.config.update("jax_enable_x64", True)
 """
@@ -3007,6 +3024,9 @@ of them (the function returns a tuple) or a `NamedTuple` of key => value name
 (it returns a `dict`). `constants`, a `NamedTuple`, adds module-level
 constants (numbers, strings, symbols, vectors, tuples, named tuples and
 dictionaries of these), and `doc` replaces the module docstring.
+`function_docs`, a `NamedTuple` of function name => text, gives functions
+their docstrings; the others state what they compute. Module functions
+annotate their parameters (`ArrayLike`) and results.
 
 `types` gives each HAVE value's Julia type, as a `NamedTuple` by port name or
 a tuple in HAVE order; by default the ports' declared types are used, and
@@ -3023,7 +3043,7 @@ translation raises a [`JAXEmissionError`](@ref) naming its recipe.
 function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                     want = nothing, functions = nothing, types = nothing,
                     name = :kernel, constants = NamedTuple(), doc = nothing, data = nothing,
-                    definitions = nothing, keep = ())
+                    definitions = nothing, keep = (), function_docs = NamedTuple())
     functions === nothing && want === nothing && (want = _KERNEL_DEFAULT_BOUNDARY)
     if functions === nothing
         functions = NamedTuple{(Symbol(name),)}((want,))
@@ -3034,13 +3054,14 @@ function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
         "jax_source: `functions` must be a nonempty NamedTuple of function name => WANT"))
     plans = [fname => (plan(spec; have, want = _jax_want_names(w)), w)
              for (fname, w) in pairs(functions)]
-    _jax_module_source(plans, types, constants, doc; data, definitions, keep)
+    _jax_module_source(plans, types, constants, doc; data, definitions, keep, function_docs)
 end
 
 jax_source(p::Plan; types = nothing, name = :kernel, constants = NamedTuple(),
-           doc = nothing, data = nothing, definitions = nothing, keep = ()) =
+           doc = nothing, data = nothing, definitions = nothing, keep = (),
+           function_docs = NamedTuple()) =
     _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
-                       types, constants, doc; data, definitions, keep)
+                       types, constants, doc; data, definitions, keep, function_docs)
 
 _jax_want_names(w::Symbol) = (w,)
 _jax_want_names(w::Tuple) = w
@@ -3061,13 +3082,13 @@ _jax_want_names(w) = throw(ArgumentError(
 # `UNTRANSLATED`. `keep` names data-only values `prepare_data` also returns
 # (the functions take them too), for a caller that reads them.
 function _jax_module_source(plans, types, constants, doc; data = nothing,
-                            definitions = nothing, keep = ())
+                            definitions = nothing, keep = (), function_docs = NamedTuple())
     if data === nothing
         definitions === nothing || isempty(definitions) || throw(ArgumentError(
             "jax_source: `definitions` compute data values, so they need `data`"))
         isempty(keep) || throw(ArgumentError(
             "jax_source: `keep` names values of `prepare_data`, so it needs `data`"))
-        return _jax_module_text(plans, types, constants, doc, nothing)
+        return _jax_module_text(plans, types, constants, doc, nothing; function_docs)
     end
     data isa NamedTuple || data isa Tuple && all(d -> d isa Symbol, data) ||
         throw(ArgumentError("jax_source: `data` is a tuple of HAVE names or a NamedTuple " *
@@ -3083,7 +3104,7 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
     while true
         try
             return _jax_module_text(plans, types, constants, doc,
-                                    (data, excluded, defs, untranslated, keep))
+                                    (data, excluded, defs, untranslated, keep); function_docs)
         catch e
             if e isa _HostUnsupportedDefinition && !haskey(untranslated, e.name)
                 untranslated[e.name] = e.error
@@ -3101,21 +3122,21 @@ import numpy as np
 import scipy.special as ssp
 """
 
-function _jax_module_text(plans, types, constants, doc, prepare)
+function _jax_module_text(plans, types, constants, doc, prepare; function_docs = NamedTuple())
     mod = _JaxModule()
     union!(mod.used, ("jax", "jnp", "jsp", "np", "ssp", "scipy"))
     bodies = String[]
     functions = JAXFunction[]
     if prepare === nothing
         for (fname, (p, w)) in plans
-            lines, f = _jax_function!(mod, fname, p, types, w)
+            lines, f = _jax_function!(mod, fname, p, types, w; doc = get(function_docs, fname, nothing))
             push!(bodies, join(lines, "\n"))
             push!(functions, f)
         end
     else
         data, excluded, defs, untranslated, keep = prepare
         meta = _jax_prepared_functions!(mod, bodies, functions, plans, types, data, excluded,
-                                        defs, untranslated; keep)
+                                        defs, untranslated; keep, function_docs)
         constants = merge(constants, meta)
     end
     constant_lines = String[]
@@ -3157,7 +3178,8 @@ end
 # prepared input's dtype, rank and raggedness).
 function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, types, data,
                                   excluded, defs = nothing,
-                                  untranslated = Dict{Symbol,JAXEmissionError}(); keep = ())
+                                  untranslated = Dict{Symbol,JAXEmissionError}(); keep = (),
+                                  function_docs = NamedTuple())
     ports = data isa NamedTuple ? Set(keys(data)) : Set(data)
     split = _jax_prepare_split(plans, ports, excluded; keep)
     p1 = first(plans).second[1]
@@ -3212,7 +3234,8 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     all_types = Any[[have_types[v.name] for v in split.remaining]; prepared_types]
     all_names = [remaining_names; prepared_names]
     for (fname, (rp, w)) in split.residuals
-        lines, f = _jax_function!(mod, fname, rp, Tuple(all_types), w; names = all_names)
+        lines, f = _jax_function!(mod, fname, rp, Tuple(all_types), w; names = all_names,
+                                  doc = get(function_docs, fname, nothing))
         push!(bodies, join(lines, "\n"))
         push!(functions, f)
     end
@@ -3243,7 +3266,7 @@ _jax_meta_rank(@nospecialize(T)) = T isa Type && T <: AbstractArray ? ndims(T) :
 
 # One function `fname` over plan `p`, returning WANT `w` in its shape.
 function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool = true,
-                        host::Bool = false, names = nothing)
+                        host::Bool = false, names = nothing, doc = nothing)
     argtypes = _jax_have_types(p, types)
     name = reserve ? _jax_identifier(mod.used, fname) : String(fname)
     scope = _JaxScope()
@@ -3296,11 +3319,41 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
     else
         _jax_tuple_code(wants)
     end
-    lines = String["def " * name * "(" * join(params, ", ") * "):"]
+    # A module function is annotated and documented; a helper is not.
+    if reserve
+        signature = join((pn * ": " * _jax_annotation(T) for (pn, T) in inputs), ", ")
+        lines = String["def " * name * "(" * signature * ") -> " * _jax_return_annotation(w, wants) * ":"]
+        push!(lines, _jax_docstring(something(doc, _jax_default_doc(w)), "    "))
+    else
+        lines = String["def " * name * "(" * join(params, ", ") * "):"]
+    end
     append!(lines, scope.lines)
     push!(lines, "    return " * returned)
     lines, JAXFunction(name, inputs, [String(v.name) => x.T for (v, x) in zip(p.want, wants)])
 end
+
+# Python annotations of a module function's parameters and result: numbers
+# and arrays are JAX's `ArrayLike` (NumPy arrays and Python numbers too), a
+# function's result is a `jax.Array`, or the `dict`/`tuple` it returns.
+_jax_annotation(@nospecialize(T)) = T isa Type &&
+    (T <: Number || T <: AbstractArray && (eltype(T) <: Number || _jax_ragged(T))) ?
+    "ArrayLike" : "Any"
+function _jax_return_annotation(w, wants)
+    w isa NamedTuple && return "dict"
+    w isa Symbol || return "tuple"
+    T = only(wants).T
+    T isa Type && T <: NamedTuple ? "dict" : T isa Type && T <: Tuple ? "tuple" :
+        T isa Type && (T <: Number || T <: AbstractArray) ? "jax.Array" : "Any"
+end
+_jax_default_doc(w::Symbol) = "Compute `" * string(w) * "` from the inputs."
+_jax_default_doc(w::Tuple) = "Compute " * join(("`" * string(x) * "`" for x in w), ", ") *
+    " from the inputs, as a tuple."
+_jax_default_doc(w::NamedTuple) = "Compute a dict of " *
+    join(("`" * string(k) * "`" for k in keys(w)), ", ") * " from the inputs."
+# A Python docstring at `indent`, its text kept as written.
+_jax_docstring(text::AbstractString, indent::AbstractString) =
+    indent * "\"\"\"" * replace(rstrip(text), "\"\"\"" => "\\\"\"\"", "\n" => "\n" * indent) *
+    (occursin('\n', rstrip(text)) ? "\n" * indent : "") * "\"\"\""
 
 # A returned named tuple is a `dict` keyed by its field names.
 function _jax_returned(ctx::_JaxContext, v::_PyVal)

@@ -57,6 +57,10 @@ are recorded in the git history only.
   reads resolve to the program's definitions before any global function; and
   `DATA` and the `prepare_data` `JAXFunction` name its parameters as Python
   spells them. On the host, `plate(xs...) do … end` over data is a map.
+- `jax_source(...; function_docs)`: a `NamedTuple` of function name => text
+  gives functions their docstrings; every module function has one and
+  annotates its parameters (`ArrayLike`) and result. Module-level helpers
+  are private (`_rk_standardized`, was `rk_standardized`).
 - `prepare_data` returns each integer scalar it prepares as a `StaticInt`, an
   `int` that `jax.jit` treats as static, so the functions jit with the
   prepared data as arguments (`jax.jit(f)(u, **prepared)`). A block end or a

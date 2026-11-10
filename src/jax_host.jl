@@ -858,7 +858,7 @@ function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, m
     key = (:host_traceable, objectid(f), Tuple(types))
     name = get(ctx.mod.helper_names, key, nothing)
     if name === nothing
-        name = _jax_identifier(ctx.mod.used, Symbol("_rk_", nameof_or(f), "_np"))
+        name = _jax_private_identifier(ctx.mod.used, Symbol("_rk_", nameof_or(f), "_np"))
         ctx.mod.helper_names[key] = name
         scope = _JaxScope()
         params = [_jax_identifier(scope.used, n) for n in names]
@@ -1113,8 +1113,12 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
             push!(entries, "\"" * name * "\": " * v.code)
         end
     end
-    lines = String["def prepare_data(" * join(param_names, ", ") * "):"]
-    push!(lines, "    \"\"\"The functions' data inputs, computed from the raw data once per dataset.\"\"\"")
+    signature = join((n * ": " * (_jax_ragged(T) ? "list" : _jax_annotation(T))
+                      for (n, T) in zip(param_names, raw_types)), ", ")
+    lines = String["def prepare_data(" * signature * ") -> dict:"]
+    push!(lines, "    \"\"\"The functions' data inputs, computed from the raw data once per dataset.\n\n" *
+                 "    Pass the data by the names the model reads them; a list of arrays is a ragged\n" *
+                 "    column. Call the other functions with the result: `f(u, **prepared)`.\n    \"\"\"")
     for r in split.excluded
         push!(lines, "    # Computed by the functions (no host translation): " * _recipe_line(r))
     end

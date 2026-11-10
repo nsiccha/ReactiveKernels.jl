@@ -48,6 +48,10 @@ are recorded in the git history only.
   have translations (`_ppl_rows`, `_observed_scan_cell_bound`,
   `_ppl_cell_scan_position`, `_ppl_cell_scan_nsteps`); the cell's scan
   bound check is a runtime check.
+- A module's functions have docstrings (what each computes, how to call it)
+  and type annotations. The model's own docstrings (`rkppl_documentation`)
+  are listed in the module docstring, and `constrain`'s docstring lists each
+  returned value with its docstring.
 - `prepare_data` computes chained data-only definitions (`angle = x ./ period`
   read by `cos.(angle)`) and a submodel's (`v.mask`): a name was resolved as a
   global function (`Base.angle`) or reported undefined. A layout whose block

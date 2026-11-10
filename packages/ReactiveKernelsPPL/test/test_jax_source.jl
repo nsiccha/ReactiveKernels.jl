@@ -350,7 +350,7 @@ end
     src = jax_source(build_kernel(small), small)
     @test string(jax_source(build_kernel(large), large)) == string(src)
     @test !occursin("DIMENSION", string(src))
-    @test occursin("def dimension(prepared):", string(src))
+    @test occursin("def dimension(prepared: dict) -> int:", string(src))
     if rk_jax_available()
         for (p, total, levels) in ((small, 6, 3), (large, 8, 5))
             r = rk_jax_layout(src, jax_raw_data(p, src))
@@ -359,4 +359,33 @@ end
             @test r.parameters["s"] == (start = 2, stop = 3, dims = ())
         end
     end
+end
+
+# The module is a documented API: every public function states what it
+# computes and annotates its parameters and result, and the model's own
+# docstrings reach the module and `constrain` (ODL readability requirement).
+@testset "jax_source(built, plan): documented functions" begin
+    model = @rkppl begin
+        "Mean of the observations (unit: metre)."
+        mu ~ Normal(mu_loc, mu_scale)
+        "Observation noise scale (unit: metre)."
+        sigma ~ Exponential(sigma_prior)
+        "Shifted mean, an authored definition."
+        shifted = mu .+ offset
+        y .~ Normal.(shifted, sigma)
+    end
+    plan = model(; mu_loc = 0.0, mu_scale = 1.0, sigma_prior = 1.0,
+                 offset = [0.0, 0.5, 1.0]) | (; y = [0.1, -0.3, 0.5])
+    text = string(jax_source(build_kernel(plan), plan; values = (:shifted,)))
+    header = split(text, "\nimport")[1]
+    @test occursin("- `mu`: Mean of the observations (unit: metre).", header)
+    constrain_doc = split(split(text, "def constrain(")[2], "\"\"\"")[2]
+    @test occursin("- `sigma`: Observation noise scale (unit: metre).", constrain_doc)
+    @test occursin("- `shifted`: Shifted mean, an authored definition.", constrain_doc)
+    for line in filter(l -> startswith(l, "def "), split(text, "\n"))
+        @test occursin(") -> ", line)
+        params = match(r"\((.*)\)", line)[1]
+        @test all(p -> occursin(": ", p), split(params, ", "))
+    end
+    @test !occursin(r"^def rk_"m, text)
 end
