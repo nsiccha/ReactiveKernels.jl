@@ -72,7 +72,8 @@ are recorded in the git history only.
 - `jax_source(...; function_docs)`: a `NamedTuple` of function name => text
   gives functions their docstrings; every module function has one and
   annotates its parameters (`ArrayLike`) and result. Module-level helpers
-  are private (`_rk_standardized`, was `rk_standardized`).
+  are private (`_standardized`, was `rk_standardized`); a generated helper
+  never takes a fixed helper's `_rk_` name.
 - `prepare_data` returns each integer scalar it prepares as a `StaticInt`, an
   `int` that `jax.jit` treats as static, so the functions jit with the
   prepared data as arguments (`jax.jit(f)(u, **prepared)`). A block end or a

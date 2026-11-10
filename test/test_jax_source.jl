@@ -366,6 +366,13 @@ end
     total = sum(flat .* flat) + length(flat)
     return total
 end
+# A broadcast `isequal` on the host: its generated scalar helper must not
+# take the name of the fixed `_rk_isequal` helper's host twin.
+@kernel jax_prep_isequal(g::Vector{String}, theta::Float64) = begin
+    hits = isequal.(g, "b")
+    total = theta * sum(hits)
+    return total
+end
 # `get!` as a statement: its write runs although its value is discarded.
 ReactiveKernels.@_record_source function jax_prep_declared(x::AbstractVector, levels::AbstractVector)
     positions = Dict{eltype(levels),Int}()
@@ -739,6 +746,9 @@ end
     bounded_src = jax_source(jax_obj_bounded; have = (:location, :scale, :x, :lo), want = :total)
     g = ["b", "c", "a", "b", "a"]
     declared = jax_source(jax_prep_declared_sum; have = (:theta, :g), want = :total, data = (; g))
+    iseq = jax_source(jax_prep_isequal; have = (:theta, :g), want = :total, data = (; g))
+    @test length(collect(eachmatch(r"^def (\w+)\("m, string(iseq)))) ==
+          length(unique(m[1] for m in eachmatch(r"^def (\w+)\("m, string(iseq))))
     @test occursin(".setdefault(", string(declared))
     if !rk_jax_available()
         @test_skip false
@@ -761,6 +771,7 @@ end
             @test r.value ≈ native(0.3, 1.7, x, lo) rtol = 1e-12
             @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), 1.7, x, lo), [0.3])) rtol = 1e-6
         end
+        @test rk_jax_evaluate(iseq, "kernel", (0.5, g); prepare = true).value ≈ 1.0
         theta = [0.5, -1.5, 2.5]
         native = prepare(jax_prep_declared_sum; have = (:theta, :g), want = :total)
         r = rk_jax_evaluate(declared, "kernel", (theta, g); grad = true, prepare = true)

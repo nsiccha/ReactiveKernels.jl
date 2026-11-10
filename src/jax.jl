@@ -135,10 +135,14 @@ _jax_emit!(ctx::_JaxContext, line::AbstractString) =
 _jax_stable_name(hint) =
     replace(replace(String(Symbol(hint)), r"#\d+" => ""), r"_\d{6,}(?=_|$)" => "")
 
-# A module-level helper's name: an identifier with one leading underscore,
-# so the module's public names are its documented functions alone.
+# A generated module-level helper's name: an identifier with one leading
+# underscore, so the module's public names are its documented functions
+# alone. It drops an `rk_` prefix (`_standardized`): the fixed helpers own the
+# `_rk_` names (`_rk_isequal` and its host twin `_rk_isequal_np`), which they
+# take without consulting `used`, so a generated `_rk_isequal_np` shadowed
+# one and recursed.
 function _jax_private_identifier(used::Set{String}, hint)
-    base = _jax_identifier(Set{String}(), hint)
+    base = replace(_jax_identifier(Set{String}(), hint), r"^rk_" => "")
     candidate = "_" * base
     n = 1
     while candidate in used
