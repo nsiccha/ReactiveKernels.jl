@@ -451,6 +451,15 @@ vector is built. The derivatives are ordinary Enzyme derivatives of this
 graph. In a PPL model, `phi[1:N] ~ ICAR(node1, node2)` declares the field with
 this prior.
 
+`icar_rows_logdensity(phi, node1, node2)` and
+`icar_cols_logdensity(phi, node1, node2)` are the densities of independent
+fields over one graph: the rows (field `k` is `phi[k, :]`) or the columns
+(field `k` is `phi[:, k]`) of a matrix, summed. Each is the sum of
+`icar_logdensity` over its fields, computed in one plate over the edges with a
+plate over the fields inside each edge cell; neither builds a per-edge or a
+per-field vector. In a PPL model, `eachrow(phi[1:K, 1:N]) .~ ICAR(node1,
+node2)` and `eachcol(phi[1:N, 1:K]) .~ ICAR(node1, node2)` declare them.
+
 ## Positive-support and bounded families
 
 LogNormal, Exponential, Geometric, and Uniform illustrate shapes that are not all

@@ -968,7 +968,32 @@ node of the field. The entries of `phi` are its coordinates
 (`phi.1 … phi.N`), read in place. The density is the graph law
 `icar_logdensity` (see [Distributions](distributions.md)), one retained plate
 over the edges, and native Enzyme Reverse differentiates it without a custom
-rule. Rows or columns of independent ICAR fields are not built yet.
+rule.
+
+Several independent fields over the same graph, such as one spatial field per
+measured quantity, are the rows or the columns of one array, with the field
+count `K` as data:
+
+```julia
+eachrow(phi[1:K, 1:N]) .~ ICAR(node1, node2)   # field k is phi[k, :]
+eachcol(psi[1:N, 1:K]) .~ ICAR(node1, node2)   # field k is psi[:, k]
+```
+
+Every field has its own unit-scale ICAR prior over the one shared edge list,
+and the density is the sum of the `K` field densities: the same density as one
+field over `K` disjoint copies of the graph. The nodes index one field
+(`1:N`). The entries of the array are its coordinates (`phi.k.n`,
+column-major), read in place. The density is the graph law
+`icar_rows_logdensity` or `icar_cols_logdensity`: one retained plate over the
+edges with a plate over the fields inside it, whatever `K` and `N`. Each field
+is one density factor (`density_factors`), and the model translates through
+`jax_source`. A graph per field (`ICAR.(eachrow(E1), …)`), weighted edges and
+a scale inside the prior are not built.
+
+Each field is improper on its own, so each needs its own identifying
+constraint. A soft sum-to-zero per field is a density factor on the vector of
+field sums (`phi_sums .~ Normal.(0, s)`), which is not built yet: a density
+factor is admitted on a scalar definition only.
 
 ## Design matrices
 

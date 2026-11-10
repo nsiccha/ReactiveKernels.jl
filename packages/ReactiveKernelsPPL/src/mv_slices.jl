@@ -82,6 +82,28 @@ _arg_rows(a::_PerSlice) = _slice_rows(a.orientation, a.value)
     return nothing
 end
 
+# ── ICAR fields ──────────────────────────────────────────────────────
+
+# One unit-scale ICAR density per field (row / column) of `B` over the shared
+# edge list: field `g` is `-1/2 Σ_e (B_g[node1[e]] - B_g[node2[e]])²`, the
+# law `icar_logdensity` of that field alone. The per-slice values of a
+# conditioned field array; the summed density is the graph law
+# `icar_rows_logdensity` / `icar_cols_logdensity`.
+function _icar_slices_pointwise(o, B, node1, node2)
+    length(node2) == length(node1) || throw(DimensionMismatch(
+        "node1 and node2 must list the same number of edges"))
+    out = zeros(float(eltype(B)), _slice_count(o, B))
+    for g in eachindex(out)
+        total = zero(eltype(out))
+        for e in eachindex(node1, node2)
+            d = _slice_entry(o, B, g, node1[e]) - _slice_entry(o, B, g, node2[e])
+            total += d * d
+        end
+        out[g] = -0.5 * total
+    end
+    return out
+end
+
 # ── multivariate normal slices ───────────────────────────────────────
 
 # Forward substitution across every slice at once, with the margin axis
