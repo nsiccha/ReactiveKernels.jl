@@ -1,7 +1,7 @@
 name = "ReactiveKernels"
 uuid = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.149"
+version = "0.1.151"
 
 [deps]
 DiffRules = "b552c78f-8df3-52c6-915a-8e097449b14b"

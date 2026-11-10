@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.149
+## 0.1.151
 
 - `jax_source(built, plan)` emits a model whose data-only definition has no
   translation and is read by its fields, as BRM's
@@ -32,7 +32,7 @@ are recorded in the git history only.
   input and computes `n`; before, `n` was the input, and `UNTRANSLATED` also
   listed `g`, which was no input, with the reason "`g` is not defined in
   module `Main`" for `n`.
-- Requires ReactiveKernels 0.1.149. Snag `jax-source-refus-8c6ed1ec`.
+- Requires ReactiveKernels 0.1.151. Snag `jax-source-refus-8c6ed1ec`.
 
 ## 0.1.148
 

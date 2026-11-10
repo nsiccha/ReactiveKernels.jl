@@ -221,6 +221,15 @@ The translation follows the [core constraints](constraints.md):
   data-dependent condition a check is masked by it: JAX evaluates both arms
   of a vmapped condition, and the check holds for lanes that do not take its
   arm.
+- **A `throw` under a data-dependent condition** is such a check, one that no
+  value passes: it fails exactly where its conditions hold, so the module
+  raises on the values the native program throws on. A guard
+  `scale >= 0 ? scale : throw(DomainError(...))` is `_rk_check(scale >= 0,
+  ...)` followed by the other arm, with no `jax.lax.cond`; `x > 0 ||
+  throw(...)` is `_rk_check(x > 0, ...)`. Where the check passes, that other
+  arm is the one Julia takes; where it fails, the module raises and returns
+  nothing. The message is the exception's first string argument
+  (`DomainError`'s second).
 - **No unrolling.** Nothing iterates in Python, and sizes are read from the
   inputs (`x.shape[0]`). The same module serves every data size of the same
   program.
@@ -313,8 +322,12 @@ recipe and the construct:
 - a plain helper with loops or branches that is not `@traceable`, including
   a StanBlocks `@deffun` whose body has a loop or an `if`;
 - in the JAX functions, a loop whose trip count is data with no static bound
-  (JAX loops and arrays need static shapes), and a `throw` that depends on
-  data (a runtime check is the form that has one); `prepare_data` runs both;
+  (JAX loops and arrays need static shapes), and a range whose ends are data
+  with no static limit, such as a scan's sequence `n:-1:2`; `prepare_data`
+  runs both;
+- a `throw` or runtime check inside a helper that is called under a
+  data-dependent condition of its caller (the helper's own conditions mask
+  it; its caller's cannot);
 - `jax.grad` through a `while` loop (JAX differentiates `lax.while_loop`
   forward only; write a differentiated loop as a `for` over a range);
 - filtered comprehensions in the JAX functions (their length is data);

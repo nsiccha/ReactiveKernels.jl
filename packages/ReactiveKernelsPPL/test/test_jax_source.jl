@@ -1,5 +1,6 @@
 using ReactiveKernels, ReactiveKernelsPPL, Random, Test, LinearAlgebra
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal_hmm_log_weights_logdensity
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal_hmm_log_weights_logdensity,
+    lower_truncated_lognormal, upper_truncated_lognormal
 
 include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
 
@@ -318,6 +319,13 @@ const _JAX_CASES = (
             y[g] ~ MvNormal(fill(mu, length(y[g])), s^2 * I(length(y[g])))
         end
     end))() | (; y = [[0.1, 0.2, 0.0], Float64[], [0.0, 0.1]]),
+    # A diagonal covariance per cell (`Diagonal.(rows)` of the cells' vectors).
+    mvnormal_diagonal = () -> (@rkppl(begin
+        mu ~ Normal(0, 1); s ~ Exponential(1.0)
+        @plate for g in eachindex(y)
+            y[g] ~ MvNormal(fill(mu, length(y[g])), Diagonal(fill(s^2, length(y[g]))))
+        end
+    end))() | (; y = [[0.1, 0.2, 0.0], [0.3], [0.0, 0.1]]),
     # A dense covariance literal per cell.
     mvnormal_dense = () -> (@rkppl(begin
         mu ~ Normal(0, 1); s ~ Exponential(1.0); r ~ Uniform(-0.5, 0.5)
@@ -335,6 +343,23 @@ const _JAX_CASES = (
     # (state 2 never returns to state 1) starting in state 1, where no move
     # reaches state 2 at step 2, so its incoming log-sum-exp folds two -Inf.
     # `jnp.logaddexp` made every gradient entry NaN there.
+    # The LogNormal mean graphs guard their scale with a throw on a negative
+    # scale, a runtime check in the module (snag jax-source-refus-05f10f2c):
+    # the ordinary mean (a lower bound of 0) and one-sided truncated means of
+    # a plate's cells.
+    lognormal_mean = () -> (@rkppl(begin
+        mu ~ Normal(0, 1); log_sigma ~ Normal(0, 0.5)
+        m = lower_truncated_lognormal(mu, exp(log_sigma), 0.0).mean()
+        y ~ Normal(m, 0.5)
+    end))() | (; y = 1.3),
+    truncated_lognormal_means = () -> (@rkppl(begin
+        mu ~ Normal(0, 1); log_sigma ~ Normal(0, 1); log_bound ~ Normal(0, 1)
+        @plate for i in eachindex(y)
+            lower[i] = lower_truncated_lognormal(mu, exp(log_sigma), exp(log_bound)).mean()
+            upper[i] = upper_truncated_lognormal(mu, exp(log_sigma), exp(log_bound)).mean()
+            y[i] ~ Normal(lower[i] - upper[i], 0.5)
+        end
+    end))() | (; y = [1.4, 2.1, 0.6, 1.9]),
     hmm_unreached = () -> (@rkppl(begin
         a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
         locations = [a, b]
@@ -863,4 +888,18 @@ end
         @test lengths == [3, 1, 2]
         @test [r["mu"][g][1:n] for (g, n) in enumerate(lengths)] ≈ [[0.4, 0.5, 0.6], [0.8], [0.3, 1.3]]
     end
+end
+
+# The LogNormal variance graphs are still refused: a plate child spliced under
+# a lazy arm (`_logmills_quadrature`) reaches the module as an execution copy
+# without its plan, and the continued fraction's length is data (snag
+# jax-source-refus-05f10f2c, follow-ups filed on ReactiveKernels' queue).
+@testset "jax_source(built, plan): LogNormal variance graphs (not yet translated)" begin
+    plan = (@rkppl(begin
+        mu ~ Normal(0, 1); log_sigma ~ Normal(0, 0.5)
+        v = lower_truncated_lognormal(mu, exp(log_sigma), 0.0).var()
+        y ~ Normal(0.0, sqrt(v + 0.1))
+    end))() | (; y = 1.3)
+    built = build_kernel(plan)
+    @test_broken (jax_source(built, plan); true)
 end
