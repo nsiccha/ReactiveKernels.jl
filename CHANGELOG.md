@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.145
+## 0.1.148
 
 - `jax_source`: `jax.grad` through a `logaddexp` whose two inputs are both
   `-Inf` is finite, as natively. A hidden-Markov law
@@ -39,6 +39,46 @@ are recorded in the git history only.
   the softmax derivative at finite entries, and the maximum itself, with the
   derivative 0, when that is not finite, as native Enzyme gives. Host and
   static values, which are never differentiated, keep SciPy's `logsumexp`.
+
+## 0.1.147
+
+- `jax_source` keeps Julia's grouping when an operand after the first is an
+  expression of the operator's own Python precedence level. Python's `*`, `/`
+  and `@` share one level and associate left, so `a .* ((B ./ c) * w)` used
+  to emit `a * B / c @ w`, which is `((a * B) / c) @ w`: a broadcast error
+  (`operands could not be broadcast together`) when `B` is not square, a
+  wrong value when it is. It now emits `a * (B / c @ w)`. `a + (b - c)` and
+  `a * (b * c)` keep their parentheses too, since floating-point `+` and `*`
+  are not associative (snag `jax-source-drops-410c82c2`).
+
+## 0.1.146
+
+- `jax_source`: `I(n)` (a `UniformScaling` called with a size) is the n×n
+  identity, padded to its static bound when `n` is data; `Diagonal(v)` of a
+  vector is the dense diagonal matrix; a matrix literal of numbers
+  (`[a b; c d]`, `hvcat`) translates; and a plate whose cell returns a
+  square matrix stacks the matrices, each cell's size its extent, as a cell
+  returning a vector does.
+
+## 0.1.145
+
+- `jax_source` translates `cumsum(x; dims = d)` as `jnp.cumsum` along the
+  static axis `d`. Before, any keyword `cumsum` raised `JAXEmissionError`
+  ("keyword arguments to `cumsum` have no JAX translation"), so a recipe
+  such as BRM's monotonic-effects table
+  `cumsum(vcat(zeros(1, n), simplex_incr); dims = 1)` did not emit (snag
+  `jax-source-simpl-249ccdc6`).
+- Three constructs in a straight-line plain helper, translated from its
+  lowered code, now emit as they do in source:
+  - an index's `end` (`M[1:(end - 1), :]`, lowered to `lastindex`) is the
+    static dimension size. Before, the module failed in Python with a
+    `ConcretizationTypeError` while JAX traced it;
+  - `size(x, d)` takes a dimension that another helper returns and that is
+    static while JAX traces (`size(U, axis(o))`), past `x`'s rank 1 as for
+    a literal dimension. Before, it raised `JAXEmissionError` ("`size` with
+    a computed dimension");
+  - a dotted literal power (`x .^ 2`) is the elementwise power. Before, the
+    emitted module was not valid Python (`jnp.vectorize(...)(<callable>, ...)`).
 
 ## 0.1.144
 
