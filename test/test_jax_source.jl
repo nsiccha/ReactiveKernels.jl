@@ -1468,3 +1468,33 @@ end
         @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), lambda), [0.7])) rtol = 1e-6
     end
 end
+
+# Python's `*`, `/` and `@` share one precedence level and associate left, and
+# floating-point `+` is not associative: an operand after the first keeps its
+# parentheses when it is an expression of the operator's own level (snag
+# jax-source-drops-410c82c2). With `B` 3×2, `a * B / (1 + s * B) @ w` fails to
+# broadcast `a` against `B`; with `y == z` large, `s + y - z` is 0, not `s`.
+@kernel jax_grouped(s::Float64, a::Vector{Float64}, B::Matrix{Float64}, w::Vector{Float64},
+                    y::Vector{Float64}, z::Vector{Float64}) = begin
+    v = a .* ((B ./ (1 .+ s .* B)) * w)
+    c = s .+ (y .- z)
+    lp = sum(v) + sum(c)
+    return lp
+end
+
+@testset "jax_source: same-level operands keep their grouping" begin
+    src = string(jax_source(jax_grouped; have = (:s, :a, :B, :w, :y, :z), want = :lp))
+    @test occursin("a * (B / (1 + s * B) @ w)", src)
+    @test occursin("s + (y - z)", src)
+    if !rk_jax_available()
+        @test_skip false
+    else
+        a, B, w = [1.0, 2.0, 3.0], [1.0 4.0; 2.0 5.0; 3.0 6.0], [0.5, 0.25]
+        y = z = fill(1e20, 3)
+        native = prepare(jax_grouped; have = (:s, :a, :B, :w, :y, :z), want = :lp)
+        r = rk_jax_evaluate(jax_source(jax_grouped; have = (:s, :a, :B, :w, :y, :z), want = :lp),
+                            "kernel", (0.7, a, B, w, y, z); grad = true)
+        @test r.value ≈ native(0.7, a, B, w, y, z) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), a, B, w, y, z), [0.7])) rtol = 1e-6
+    end
+end
