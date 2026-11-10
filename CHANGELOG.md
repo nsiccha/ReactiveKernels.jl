@@ -37,7 +37,16 @@ are recorded in the git history only.
   lengths to its extent. Such a cell's scan raised `ConcretizationTypeError`
   in Python (a traced `jnp.arange` stop).
 - `sum(x; init)` and `prod(x; init)` translate; `sinpi` and `cospi` translate,
-  their argument reduced to `[-1, 1]` first.
+  their argument reduced to `[-1, 1]` first. `sum`, `prod`, `maximum` and
+  `minimum` with `dims = d` reduce that axis and keep it, as Julia does.
+- A scan whose steps output a tuple of numbers translates, as one of named
+  numbers already did; both are held as the tuple of their columns. Reading
+  such a vector by element (`out[end].level`) reads every column at that
+  index: the module read `out[out.shape[0] - 1][0]`, which fails in Python
+  with `AttributeError`. A generator over a vector's elements (`sum(o.square
+  for o in out)`, also over a plain or padded vector) is `jax.vmap` of the
+  element over it, and `merge` of named tuples translates (a scan seeded by
+  `merge(init, (b = 0.0,))`).
 - Generated Python names drop the counters that differ between builds of one
   program (a gensym's `#<n>`, a value id's long numeric suffix), so one
   declaration emits one module text.

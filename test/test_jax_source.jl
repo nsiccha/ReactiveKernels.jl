@@ -448,6 +448,40 @@ end
     return total
 end
 
+# A scan's per-step outputs that are tuples or named tuples (held as the
+# tuple of their columns), read by a generator, by an element (`out[end]`)
+# and by field; a scan seeded by `merge`; a reduction over `dims`.
+@kernel jax_scan_tuple(xs::Vector{Float64}, a::Float64) = begin
+    out = scan(xs; init = 0.0) do c, x
+        n = a * c + x
+        (n, (n, n * n))
+    end
+    total = sum(o[2] for o in out)
+    return total
+end
+@kernel jax_scan_named(xs::Vector{Float64}, a::Float64) = begin
+    out = scan(xs; init = 0.0) do c, x
+        n = a * c + x
+        (n, (level = n, square = n * n))
+    end
+    total = sum(o.square for o in out) + out[end].level
+    return total
+end
+@kernel jax_scan_merge(xs::Vector{Float64}, a::Float64, u0::Float64) = begin
+    init = (u = u0,)
+    out = scan(xs; init = merge(init, (b = 0.0,))) do c, x
+        n = (u = a * c.u + x, b = c.b + x)
+        (n, n.u + n.b)
+    end
+    total = sum(out)
+    return total
+end
+@kernel jax_dims(M::Matrix{Float64}, a::Float64) = begin
+    f = vec(sum(a .* M; dims = 2)) .+ vec(maximum(M; dims = 1))[1]
+    total = sum(f .^ 2)
+    return total
+end
+
 @testset "jax_source: structure" begin
     src = jax_source(jax_plate_scan; have = (:a, :y, :x, :b, :logsigma), want = :total)
     text = string(src)
@@ -714,5 +748,24 @@ end
         r = rk_jax_evaluate(declared, "kernel", (theta, g); grad = true, prepare = true)
         @test r.value ≈ native(theta, g) rtol = 1e-12
         @test r.grad ≈ rk_fd_gradient(t -> native(t, g), theta) rtol = 1e-6
+    end
+end
+
+@testset "jax_source: tuple scan outputs, merge and dims" begin
+    xs = [1.0, 2.0, 3.0, -0.5]
+    M = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+    cases = ((jax_scan_tuple, (:a, :xs), (0.5, xs)), (jax_scan_named, (:a, :xs), (0.5, xs)),
+             (jax_scan_merge, (:a, :xs, :u0), (0.5, xs, 1.0)), (jax_dims, (:a, :M), (0.5, M)))
+    srcs = [jax_source(k; have, want = :total) for (k, have, _) in cases]
+    @test !occursin(".shape[0] - 1][", string(srcs[2]))
+    if !rk_jax_available()
+        @test_skip false
+    else
+        for ((k, have, args), src) in zip(cases, srcs)
+            native = prepare(k; have, want = :total)
+            r = rk_jax_evaluate(src, "kernel", args; grad = true)
+            @test r.value ≈ native(args...) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), args[2:end]...), [args[1]])) rtol = 1e-6
+        end
     end
 end

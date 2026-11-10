@@ -635,6 +635,17 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
                       _jax_is_array(T) ? extent : "")
     end
     _jax_is_array(x.T) || _jax_error("indexing a value of type `", x.T, "`", _jax_where(ctx))
+    # A vector of (named) numbers is the tuple of its columns (a scan's
+    # stacked outputs): an element, or a slice, reads every column at it.
+    if _jax_columns(x.T)
+        length(indices) == 1 ||
+            _jax_error("indexing a vector of tuples with several indices", _jax_where(ctx))
+        E = eltype(x.T)
+        parts = [_jax_index(ctx, _jax_column(x, k), indices) for k in 1:fieldcount(E)]
+        scalar = all(v -> _jax_is_scalar(v.T), parts)
+        return _PyVal(_jax_tuple_code(parts), scalar ? E : Vector{E}, false,
+                      scalar ? "" : parts[1].extent)
+    end
     N = ndims(x.T)
     # Linear indexing reads the array in Julia's column-major order.
     if length(indices) == 1 && N > 1 && !_jax_ragged(x.T) && isempty(x.extent)
@@ -831,6 +842,58 @@ const _JAX_GENERATOR_REDUCTIONS = Dict{Any,Tuple{String,String}}(
     maximum => ("jnp.max", "-jnp.inf"), minimum => ("jnp.min", "jnp.inf"),
     any => ("jnp.any", "False"), all => ("jnp.all", "True"))
 
+# A loop or generator range `_jax_loop_range` reads: `a:b`, `eachindex(x)`,
+# `axes(x, 1)`.
+_jax_is_range_form(ctx::_JaxContext, iter) =
+    iter isa Expr && iter.head === :call &&
+    (iter.args[1] === :(:) && length(iter.args) == 3 ||
+     length(iter.args) >= 2 && _jax_resolve(ctx, iter.args[1]) in (eachindex, axes))
+
+# A generator over a vector's elements (`o.square for o in out`): `jax.vmap`
+# of the element over the vector, or over the columns of a vector of tuples;
+# a padded vector masks its padding as a filter does.
+function _jax_collection_values(ctx::_JaxContext, body, var::Symbol, iter, condition)
+    xs = _jax_expr(ctx, iter)
+    _jax_rank(xs.T) == 1 && !_jax_ragged(xs.T) ||
+        _jax_error("a generator over a `", xs.T, "`", _jax_where(ctx))
+    element = _jax_fresh(ctx, var)
+    fname = _jax_fresh(ctx, :element)
+    outer = ctx.scope
+    inner = _JaxScope(outer)
+    inner.indent = outer.indent + 1
+    push!(inner.used, element)
+    saved = copy(ctx.locals)
+    ctx.scope = inner
+    value, keep = try
+        ctx.locals[var] = _PyVal(element, eltype(xs.T))
+        (_jax_expr(ctx, body), condition === nothing ? nothing : _jax_expr(ctx, condition))
+    finally
+        ctx.scope = outer
+        empty!(ctx.locals); merge!(ctx.locals, saved)
+    end
+    push!(outer.lines, "    "^outer.indent * "def " * fname * "(" * element * "):")
+    append!(outer.lines, inner.lines)
+    push!(outer.lines, "    "^inner.indent * "return " *
+          (keep === nothing ? value.code : "(" * value.code * ", " * keep.code * ")"))
+    E = _jax_typeof(value)
+    E <: Number || _jax_error("a generator whose elements are `", E, "`", _jax_where(ctx))
+    values = _jax_fresh(ctx, :values)
+    masks = String[]
+    mapped = "jax.vmap(" * fname * ")(" * xs.code * ")"
+    if keep === nothing
+        _jax_emit!(ctx, values * " = " * mapped)
+    else
+        kept = _jax_fresh(ctx, :kept)
+        _jax_emit!(ctx, values * ", " * kept * " = " * mapped)
+        push!(masks, kept)
+    end
+    if !isempty(xs.extent)
+        n = _jax_function_call(ctx, length, [xs])
+        push!(masks, "(jnp.arange(" * n.limit * ") < " * n.code * ")")
+    end
+    _PyVal(values, Vector{E}), masks
+end
+
 function _jax_generator_values(ctx::_JaxContext, gen::Expr)
     body, spec = gen.args[1], gen.args[2]
     condition = nothing
@@ -840,6 +903,8 @@ function _jax_generator_values(ctx::_JaxContext, gen::Expr)
     spec isa Expr && spec.head === :(=) && spec.args[1] isa Symbol ||
         _jax_error("the generator `", gen, "` has no JAX translation", _jax_where(ctx))
     var = spec.args[1]
+    _jax_is_range_form(ctx, spec.args[2]) ||
+        return _jax_collection_values(ctx, body, var, spec.args[2], condition)
     lo, hi, bound = _jax_loop_range(ctx, spec.args[2])
     index = _jax_fresh(ctx, var)
     fname = _jax_fresh(ctx, :element)
@@ -1354,12 +1419,26 @@ function _jax_call(ctx::_JaxContext, f, args::Vector{_PyVal}, kw)
 end
 # `sum(x; init)` and `prod(x; init)`: the reduction combined with `init`,
 # which is also the value of an empty `x` (RKPPL's per-group counts).
-function _jax_call(ctx::_JaxContext, f::Union{typeof(sum),typeof(prod)},
+# `dims = d` (with `sum`, `prod`, `maximum`, `minimum`) reduces axis `d` and
+# keeps it, of length one, as Julia does.
+const _JAX_AXIS_REDUCTIONS = Dict{Any,String}(sum => "sum", prod => "prod",
+                                              maximum => "max", minimum => "min")
+function _jax_call(ctx::_JaxContext,
+                   f::Union{typeof(sum),typeof(prod),typeof(maximum),typeof(minimum)},
                    args::Vector{_PyVal}, kw)
     isempty(kw) && return _jax_call_positional(ctx, f, args)
-    length(kw) == 1 && first(only(kw)) === :init ||
-        _jax_error("keyword arguments to `", f, "` other than `init` have no JAX translation",
-                   _jax_where(ctx))
+    names = first.(kw)
+    if names == [:dims]
+        x, d = only(args), last(only(kw))
+        _jax_is_array(x.T) && isempty(x.extent) && _jax_known(ctx, d) && d.T isa Type &&
+            d.T <: Integer || _jax_error("`", f, "` over `dims` of a `", x.T, "`", _jax_where(ctx))
+        np = ctx.host === nothing ? "jnp." : "np."
+        return _PyVal(np * _JAX_AXIS_REDUCTIONS[f] * "(" * x.code * ", axis=" *
+                      _py_infix("-", [d.code, "1"]) * ", keepdims=True)", x.T)
+    end
+    f in (sum, prod) && names == [:init] ||
+        _jax_error("keyword arguments ", join(names, ", "), " to `", f,
+                   "` have no JAX translation", _jax_where(ctx))
     reduced = _jax_call_positional(ctx, f, args)
     _jax_call(ctx, f === sum ? (+) : (*), [last(only(kw)), reduced])
 end
@@ -1676,6 +1755,22 @@ for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp
         _jax_result($f, args, $name * "(" * x.code * ")")
     end
 end
+# `merge(a, b)` of named tuples (tuples of their fields, in order): each
+# field of the merged type from the last argument that has it.
+function _jax_function_call(ctx::_JaxContext, ::typeof(merge), args::Vector{_PyVal})
+    all(a -> a.T isa Type && a.T <: NamedTuple && isconcretetype(a.T), args) ||
+        return _jax_traceable_or_lowered(ctx, merge, args)
+    T = _jax_return_type(merge, Any[a.T for a in args])
+    T isa Type && T <: NamedTuple && isconcretetype(T) ||
+        _jax_error("`merge` of `", join((a.T for a in args), "`, `"), "`", _jax_where(ctx))
+    fields = map(fieldnames(T)) do name
+        a = args[findlast(a -> name in fieldnames(a.T), args)]
+        _PyVal(_py_atom(a.code) * "[" * string(findfirst(==(name), fieldnames(a.T)) - 1) * "]",
+               fieldtype(a.T, name))
+    end
+    _PyVal(_jax_tuple_code(collect(fields)), T)
+end
+
 function _jax_function_call(ctx::_JaxContext, ::typeof(vec), args::Vector{_PyVal})
     x = only(args)
     (_jax_rank(x.T) == 1 || _jax_ragged(x.T)) && return x
@@ -1716,6 +1811,7 @@ end
 function _jax_function_call(ctx::_JaxContext, ::typeof(length), args::Vector{_PyVal})
     x = only(args)
     ctx.host === nothing || return _host_length(ctx, x)
+    _jax_columns(x.T) && return _jax_function_call(ctx, length, [_jax_column(x, 1)])
     isempty(x.extent) || _jax_ragged(x.T) ||
         return _PyVal(x.extent, Int, false, "", _py_atom(x.code) * ".shape[0]")
     _jax_ragged(x.T) && return _PyVal(_py_atom(x.code) * ".shape[0]", Int, true)
@@ -2735,6 +2831,13 @@ end
 
 _jax_numeric_namedtuple(@nospecialize(T)) = T isa Type && T <: NamedTuple && isconcretetype(T) &&
     fieldcount(T) > 0 && all(F -> F <: Number, fieldtypes(T))
+# A vector of named numbers or of numeric tuples is held as the tuple of its
+# columns, as `jax.lax.scan` stacks a step's outputs.
+_jax_columns(@nospecialize(T)) = T isa Type && T <: AbstractVector &&
+    (_jax_numeric_namedtuple(eltype(T)) || _jax_numeric_tuple(eltype(T)))
+_jax_column(x::_PyVal, k::Integer) =
+    _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", Vector{fieldtype(eltype(x.T), k)},
+           x.static, x.extent)
 _jax_numeric_tuple(@nospecialize(T)) = T isa Type && T <: Tuple && fieldcount(T) > 0 &&
     isconcretetype(eltype(T)) && eltype(T) <: Number
 _jax_unref(@nospecialize(T)) = T isa Type && T <: Base.RefValue ? eltype(T) : T
@@ -2818,7 +2921,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     # A step output of named numbers stacks field by field: the vector of
     # named tuples is the tuple of its columns, as `jax.lax.scan` returns it,
     # and a plate over it maps every column.
-    E <: Number || _jax_numeric_namedtuple(E) && !I ||
+    E <: Number || (_jax_numeric_namedtuple(E) || _jax_numeric_tuple(E)) && !I ||
         _jax_error("a scan whose step outputs `", E, "` has no JAX translation yet",
                    _jax_where(ctx))
     # Padded outputs carry the extent; a vector of named numbers is the tuple
