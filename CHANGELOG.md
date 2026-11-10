@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.147
+
+- `jax_source`: a function broadcast over a padded vector of vectors
+  (`Diagonal.(rows)` of a ragged plate's per-cell vectors) applies to each
+  row, as Julia does, mapped over the rows with each row's length; it was
+  vectorized over the numbers. `y[g] ~ MvNormal(m, Diagonal(fill(s^2, n)))`
+  in a cell now translates.
+
 ## 0.1.146
 
 - `jax_source`: `I(n)` (a `UniformScaling` called with a size) is the n×n
