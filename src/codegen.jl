@@ -4659,9 +4659,12 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
         partition = first(states).partition
         waits(s, c) = any(((batched, via),) -> haskey(s.pushed_lanes, batched) ||
             (via != 0 && haskey(s.pushed_lanes, via)), c[3])
-        request!(emitter, s, (_, value, reads)) = foreach(reads) do (batched, via)
+        request!(emitter, s, (position, value, reads)) = foreach(reads) do (batched, via)
+            rows = partition && !s.single
             _cell_capture_request!(emitter, value, s.slices[batched],
-                via == 0 ? nothing : s.slices[via]; rows = partition)
+                via == 0 ? nothing : s.slices[via]; rows,
+                one = !rows && via == 0 &&
+                    _cell_capture_one(d, s.plate, s.plate_values, position, batched))
         end
         member(f, id) = _cell_forced(f, windows, _cell_member_force(windows, id, false))
         for (id, s) in zip(ids, states)
@@ -4711,7 +4714,7 @@ function _lower_authored_plate_cell_state!(body, runtime_ops, runtime_recipes, s
     for (cid, batched, via) in s.footprint_captures
         _footprint_record_capture!(windows.pushdowns, cid,
             _cell_capture_element(s.slices[batched], via == 0 ? nothing : s.slices[via];
-                rows = s.partition))
+                rows = s.partition && !s.single))
     end
     for (position, program) in s.footprint_programs
         reads = _footprint_plate_reads!(body, runtime_ops, runtime_recipes,
@@ -4895,6 +4898,9 @@ Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recip
     plate_args = callargs[2:end]
     plate_values = recipe.inputs[2:end]
     partition = op.rows
+    # A partition of one cell per label (`plate_partition(…; single = true)`)
+    # runs at one `Int` row, and reads its captures at one position as a cell.
+    single = partition && _partition_single(windows, recipe)
     pushed_lanes = Dict{Int,ValueId}()
     if windows !== nothing
         d = windows.pushdowns
@@ -4922,7 +4928,8 @@ Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recip
     domain = Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes), shape)
     if partition
         push!(body.args, Expr(:(=), cell,
-            Expr(:call, GlobalRef(@__MODULE__, :_partition_rows), index_arg)))
+            Expr(:call, GlobalRef(@__MODULE__, single ? :_partition_row : :_partition_rows),
+                 index_arg)))
         cells = windows === nothing ? nothing : _partition_cells_arguments(windows, recipe)
         push!(body.args, cells === nothing ?
             Expr(:call, GlobalRef(@__MODULE__, :_partition_check_rows), domain, cell) :
@@ -5004,8 +5011,8 @@ Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recip
             value in d.pushed && push!(captures, (position, value, reads))
         end
     end
-    (; plate, atomic, plate_values, partition, pushed_lanes, cell, slices, lane_rows, captures,
-       footprint_programs, footprint_captures, lhs)
+    (; plate, atomic, plate_values, partition, single, pushed_lanes, cell, slices, lane_rows,
+       captures, footprint_programs, footprint_captures, lhs)
 end
 
 # ---------------------------------------------------------------------------
