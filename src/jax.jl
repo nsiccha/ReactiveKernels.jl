@@ -1631,7 +1631,10 @@ const _JAX_ELEMENTWISE = Dict{Any,String}(
     min => "jnp.minimum", max => "jnp.maximum",
     rem => "jnp.fmod", mod => "jnp.mod",
     ifelse => "jnp.where", (!) => "jnp.logical_not",
-    LogExpFunctions.logaddexp => "jnp.logaddexp",
+    # Both `logaddexp`s, RK's tie-exact one (mixture and log-sum-exp folds,
+    # the hidden-Markov forward pass) included: see `_rk_logaddexp` below.
+    LogExpFunctions.logaddexp => "_rk_logaddexp",
+    _tie_exact_logaddexp => "_rk_logaddexp",
     LogExpFunctions.logistic => "jax.nn.sigmoid",
     LogExpFunctions.logit => "jsp.logit",
     LogExpFunctions.log1pexp => "jax.nn.softplus",
@@ -1641,9 +1644,6 @@ const _JAX_ELEMENTWISE = Dict{Any,String}(
     _native_exp => "jnp.exp",
     sinpi => "_rk_sinpi", cospi => "_rk_cospi",
 )
-# RK's own tie-exact `logaddexp` (mixture and log-sum-exp folds): JAX's has
-# its values, non-finite inputs included, and the (1/2, 1/2) gradient at a tie.
-_jax_elementwise(::typeof(_tie_exact_logaddexp)) = "jnp.logaddexp"
 # LogExpFunctions functions that only some of its supported versions define.
 for (name, py) in ((:log1msq, "_rk_log1msq"), (:logcosh, "_rk_logcosh"),
                    (:log2mexp, "_rk_log2mexp"), (:cexpexp, "_rk_cexpexp"),
@@ -1659,6 +1659,42 @@ const _JAX_BINARY_NAMES = Dict{Any,String}(atan => "jnp.arctan2")
 # Small helpers the emitted module defines when it uses them: stable forms of
 # LogExpFunctions functions whose `jax.numpy` spelling is not one call.
 const _JAX_PRELUDE = Dict{String,String}(
+    # `_tie_exact_logaddexp` (src/codegen.jl) as JAX selections, so ordinary
+    # `jax.grad` gives its derivatives: (1/2, 1/2) at a finite tie, and at an
+    # infinite tie, whose value is `x`, (1, 0). `jnp.logaddexp` has the
+    # same values, but its derivative at a tie of two `-inf`s (a hidden-Markov
+    # state that no move reaches) is NaN, and reverse mode multiplies even a
+    # zero cotangent by it, so one such term made every gradient entry NaN
+    # (snag jax-grad-of-the-3dac142a). Both arms see finite operands at a
+    # tie, so the unselected one never makes a NaN.
+    "_rk_logaddexp" => """
+def _rk_logaddexp(x, y):
+    # log(exp(x) + exp(y)), as ReactiveKernels' tie-exact logaddexp.
+    tie = jnp.isinf(x) & (x == y)
+    first = x >= y
+    high = jnp.where(tie, 0.0, jnp.where(first, x, y))
+    low = jnp.where(tie, 0.0, jnp.where(first, y, x))
+    return jnp.where(tie, x, high + jnp.log1p(jnp.exp(low - high)))
+""",
+    # The value of `LogExpFunctions.logsumexp`, shifted by the maximum as
+    # ReactiveKernels' `_rk_logsumexp` (src/stable_rewrites.jl) is, and the
+    # maximum itself when that is not finite (-inf for no entries). That
+    # maximum is rebuilt from comparisons, so it has no derivative: every
+    # entry -inf (a hand-written forward pass over a state no move reaches)
+    # gives the derivative 0, as native Enzyme's of `logsumexp` is, where
+    # `jsp.logsumexp`'s is NaN. The shift is differentiated, so at finite
+    # entries its two terms cancel to the softmax. The unselected sum sees
+    # no infinite exponent, so it never makes a NaN.
+    "_rk_logsumexp" => """
+def _rk_logsumexp(x):
+    # log(sum(exp(x))), shifted by the maximum.
+    top = jnp.max(x, initial=-jnp.inf)
+    finite = jnp.isfinite(top)
+    shift = jnp.where(finite, top, 0.0)
+    total = jnp.sum(jnp.exp(jnp.where(finite, x - shift, -jnp.inf)))
+    edge = jnp.where(top > 0, jnp.inf, jnp.where(top < 0, -jnp.inf, jnp.nan))
+    return jnp.where(finite, shift + jnp.log(jnp.where(finite, total, 1.0)), edge)
+""",
     "_rk_log1mexp" => """
 def _rk_log1mexp(x):
     # log(1 - exp(x)) for x <= 0 (LogExpFunctions.log1mexp).
@@ -2029,9 +2065,14 @@ end
 function _jax_function_call(ctx::_JaxContext, ::typeof(LogExpFunctions.logsumexp), args::Vector{_PyVal})
     length(args) == 1 || _jax_error("this `logsumexp` call", _jax_where(ctx))
     x = args[1]
-    isempty(x.extent) || return _PyVal("jsp.logsumexp(jnp.where(" * _jax_mask(x) * ", " * x.code *
+    # A traced value takes the module's `_rk_logsumexp`: `jsp.logsumexp`'s
+    # derivative is NaN when every entry is -inf (see that helper). Host and
+    # static values, never differentiated, keep SciPy's.
+    name = !x.static && ctx.host === nothing ?
+        _jax_helper!(ctx, "_rk_logsumexp", _JAX_PRELUDE["_rk_logsumexp"]) : "jsp.logsumexp"
+    isempty(x.extent) || return _PyVal(name * "(jnp.where(" * _jax_mask(x) * ", " * x.code *
                                        ", -jnp.inf))", eltype(x.T))
-    _jax_result(LogExpFunctions.logsumexp, args, "jsp.logsumexp(" * x.code * ")")
+    _jax_result(LogExpFunctions.logsumexp, args, name * "(" * x.code * ")")
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(length), args::Vector{_PyVal})
     x = only(args)
