@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.134
+
+- `jax_source(spec; data, definitions)`: a definition may read a raw data
+  value that is no input of the program (a value the program reads only
+  through a copy, `_rkppl_value_r => :r`). `prepare_data` takes it as a
+  parameter, typed by its value in `data`. ReactiveKernelsPPL 0.1.142 uses
+  this so `prepare_data` asks for authored names only.
+
 ## 0.1.133
 
 - A scan with two or more outputs (two carried arrays, or a carried array and

@@ -3387,6 +3387,17 @@ function _jax_module_text(plans, types, constants, doc, prepare; function_docs =
     JAXSource(join(lines, "\n") * "\n", functions, prepared)
 end
 
+# The symbols an expression reads, in order of first appearance (a call's
+# function and a field name included; callers keep the ones they know).
+function _jax_symbols_read!(out::Vector{Symbol}, ex)
+    if ex isa Symbol
+        ex in out || push!(out, ex)
+    elseif ex isa Expr
+        foreach(a -> _jax_symbols_read!(out, a), ex.head === :. ? ex.args[1:1] : ex.args)
+    end
+    out
+end
+
 # `prepare_data` and the functions over its results; returns the metadata
 # constants `INPUTS` (the functions' parameters) and `PREPARED` (each
 # prepared input's dtype, rank and raggedness).
@@ -3414,8 +3425,22 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     computed = defs === nothing ? Pair{Symbol,Any}[] :
         Pair{Symbol,Any}[d for d in defs if !haskey(untranslated, first(d))]
     defined = Set{Symbol}(first.(computed))
-    params = Value[v for v in split.raw if !(v.name in defined)]
+    params = Any[v for v in split.raw if !(v.name in defined)]
     raw_types = Any[have_types[v.name] for v in params]
+    # A definition may read a raw value the caller passes that is no input of
+    # the program (`_rkppl_value_r => :r`, when the program reads `r` only
+    # through its bound copy): a parameter too, typed by its value in `data`.
+    if data isa NamedTuple
+        inputs = Set{Symbol}(v.name for v in p1.have)
+        extra = Symbol[]
+        for (_, ex) in computed
+            _jax_symbols_read!(extra, ex)
+        end
+        for r in extra
+            r in inputs || r in defined || !haskey(data, r) || any(v -> v.name === r, params) ||
+                (push!(params, (; name = r)); push!(raw_types, typeof(data[r])))
+        end
+    end
     used = Set{String}()
     remaining_names = [_jax_param_name(used, v.name) for v in split.remaining]
     prepared_names = String[]
