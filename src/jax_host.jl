@@ -1258,8 +1258,9 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); 
         found = [o for r in prefix for o in r.outputs if o.name === name]
         isempty(found) && append!(found, (v for v in p1.have if v.name === name && v.name in data_ports))
         v = isempty(found) ? nothing : first(found)
-        v === nothing && throw(ArgumentError(
-            "jax_source: `keep` names `$name`, which is no data-only value of the program"))
+        # The caller refuses it, unless a definition gives a value it reads
+        # (`_jax_module_source`).
+        v === nothing && throw(_KeepUnavailable(name))
         cid = canon_id(g, v.id)
         cid in seen_values && continue
         push!(seen_values, cid)
@@ -1299,13 +1300,53 @@ struct _HostUnsupportedDefinition <: Exception
     error::JAXEmissionError
 end
 
+const _JAX_FIELDS = """
+def _rk_fields(x, names):
+    # A named-tuple input of `prepare_data` (the value of a definition it takes
+    # as an input, `UNTRANSLATED`): a dict by field name, or its values in
+    # field order.
+    if isinstance(x, dict):
+        return tuple(x[n] for n in names)
+    x = tuple(x)
+    if len(x) != len(names):
+        raise ValueError("expected the fields (%s), got %d values" % (", ".join(names), len(x)))
+    return x
+"""
+
+# A raw `prepare_data` input as the host code reads it: a numeric array as a
+# NumPy array of its element type, a ragged one as a list of them, and a named
+# tuple (the value of a definition without a host translation, `g =
+# prep(labels)`) as the tuple of its fields, each read the same way. Returns
+# the expression; a named tuple's fields are read into a local first.
+function _host_input!(ctx::_JaxContext, code::AbstractString, @nospecialize(T))
+    _jax_ragged(T) && return "[np.asarray(a, dtype=" * _host_dtype(eltype(eltype(T))) *
+        ") for a in " * code * "]"
+    _jax_is_array(T) && return "np.asarray(" * code * ", dtype=" * _host_dtype(eltype(T)) * ")"
+    T isa Type && T <: NamedTuple && isconcretetype(T) || return code
+    mod = ctx.mod
+    if !haskey(mod.helper_names, (:helper, "_rk_fields"))
+        mod.helper_names[(:helper, "_rk_fields")] = "_rk_fields"
+        push!(mod.used, "_rk_fields")
+        push!(mod.helpers, rstrip(_JAX_FIELDS))
+    end
+    names = String.(fieldnames(T))
+    fields = _jax_fresh(ctx, occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", code) ?
+                             Symbol(code, :_fields) : :fields)
+    _jax_emit!(ctx, fields * " = _rk_fields(" * code * ", (" * join(repr.(names), ", ") *
+                    (length(names) == 1 ? ",))" : "))"))
+    parts = [_host_input!(ctx, fields * "[" * string(k - 1) * "]", fieldtype(T, k))
+             for k in 1:fieldcount(T)]
+    "(" * join(parts, ", ") * (length(parts) == 1 ? ",)" : ")")
+end
+
 # `prepare_data` over the raw data ports of `split`: the host code of its
 # prefix, returning a `dict` of the boundary values under `names` (a ragged
 # value padded, with its `<name>_lengths`). `types` are the boundary values'
 # types, or `nothing` for the types the translation infers. Returns the
 # function's lines and the boundary values' types.
 function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
-                                params = split.plan.have, definitions = ())
+                                params = split.plan.have, definitions = (),
+                                untranslated = Dict{Symbol,JAXEmissionError}())
     p = split.plan
     scope = _JaxScope()
     ctx = _JaxContext(mod, scope, nothing, Main, Dict{Symbol,_PyVal}(), nothing)
@@ -1317,15 +1358,21 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
         param = _jax_param_name(scope.used, v.name; stable = false)
         push!(param_names, param)
         known[v.name] = _PyVal(param, T, true)
-        _jax_ragged(T) ? _jax_emit!(ctx, param * " = [np.asarray(a, dtype=" *
-                                    _host_dtype(eltype(eltype(T))) * ") for a in " * param * "]") :
-            _jax_is_array(T) && _jax_emit!(ctx, param * " = np.asarray(" * param * ", dtype=" *
-                                           _host_dtype(eltype(T)) * ")")
+        code = _host_input!(ctx, param, T)
+        code == param || _jax_emit!(ctx, param * " = " * code)
     end
     # The data definitions, in order, over the parameters and the definitions
     # before them. A data value takes the type the binding's own value has; a
     # local of the definitions (`T0 === nothing`), the translation's.
     for (name, ex, T0) in definitions
+        # One reading a definition without a host translation that is no input
+        # either (the caller gave no value of it) has none: it says why.
+        for r in _jax_symbols_read!(Symbol[], ex)
+            haskey(untranslated, r) && !haskey(known, r) &&
+                throw(_HostUnsupportedDefinition(name, JAXEmissionError(
+                    "it reads `" * string(r) * "`, which `prepare_data` neither computes " *
+                    "nor takes as an input: " * untranslated[r].message)))
+        end
         ctx.locals = copy(known)
         first_line = length(scope.lines) + 1
         T = T0
@@ -1387,7 +1434,8 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
             push!(entries, "\"" * name * "\": " * v.code)
         end
     end
-    signature = join((n * ": " * (_jax_ragged(T) ? "list" : _jax_annotation(T))
+    signature = join((n * ": " * (_jax_ragged(T) ? "list" :
+                                  T isa Type && T <: NamedTuple ? "dict" : _jax_annotation(T))
                       for (n, T) in zip(param_names, raw_types)), ", ")
     lines = String["def prepare_data(" * signature * ") -> dict:"]
     push!(lines, "    \"\"\"The functions' data inputs, computed from the raw data once per dataset.\n\n" *

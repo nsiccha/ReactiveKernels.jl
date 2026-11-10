@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.149
+## 0.1.152
 
 - Reverse AD over a tuple of active ports (`active = (:a, :b)`) holds each
   scalar field of a tuple or `NamedTuple` port as `Ref` storage, as it already
@@ -31,6 +31,70 @@ are recorded in the git history only.
   product, as for an array port. With reverse `AutoEnzyme` it threw
   `ArgumentError: broadcasting over dictionaries and NamedTuples is reserved`
   from DifferentiationInterface's Enzyme pullback.
+
+## 0.1.151
+
+- `jax_source(spec; data, definitions)` takes a data-only value of the
+  program from its definition when the program's recipe of it has no
+  translation on the host or in the functions, or when a value `keep` names
+  reads it. The value is then an input of `prepare_data`, listed in
+  `UNTRANSLATED`, and `prepare_data` computes what the program reads from it
+  (its fields, a block's extent, a gather). Before, `g = prep(labels)` with
+  `prep` untranslatable and read as `g.n` and `g.pos` raised
+  ``ArgumentError: jax_source: `keep` names `_ppl_axis1_z`, which is no
+  data-only value of the program``, or, without `keep`, `JAXEmissionError`
+  ("`prepare_data` does not compute it on the host either"). A module that
+  emitted before is unchanged unless its `UNTRANSLATED` named a definition
+  that was no input (below).
+- A named-tuple input of `prepare_data` is a `dict` by field name, or its
+  values in field order; `prepare_data` reads each field as it reads a data
+  input of that type.
+- `UNTRANSLATED` lists only definitions `prepare_data` takes as inputs.
+  Before, it also listed one that no input replaced, and a definition reading
+  it gave the reason "`g` is not defined in module `Main`"; that reason now
+  names the definition it reads and why that has no translation.
+- `definitions` that no data input reads, directly or through another
+  definition, are no longer computed in `prepare_data`.
+- Snag `jax-source-refus-8c6ed1ec` (BRM `rkppl_model(:car_icar)` and
+  `(:car_bym2)`).
+
+## 0.1.150
+
+- `jax_source`: a function broadcast over a padded vector of vectors
+  (`Diagonal.(rows)` of a ragged plate's per-cell vectors) applies to each
+  row, as Julia does, mapped over the rows with each row's length; it was
+  vectorized over the numbers. `y[g] ~ MvNormal(m, Diagonal(fill(s^2, n)))`
+  in a cell now translates.
+
+## 0.1.149
+
+- `jax_source`: a `throw` under a condition that depends on data translates
+  as a runtime check, masked by its conditions, instead of refusing the
+  module with "a throw that depends on data has no JAX translation". So the
+  `mean()` of ReactiveKernelsDistributionKernels' one-sided LogNormal moment
+  objects (`lower_truncated_lognormal`, `upper_truncated_lognormal`, and a
+  LogNormal's own mean as the lower one at a bound of 0), whose scale guard
+  is `scale >= 0 ? scale : throw(DomainError(...))`, now emits (snag
+  `jax-source-refus-05f10f2c`). The module raises on exactly the values the
+  native program throws on: a ternary or `if` whose other arm is the value is
+  the check followed by that arm (no `jax.lax.cond`), `x > 0 || throw(...)`
+  is a check of `x > 0`, and a throw in a vmapped cell holds for the lanes
+  that do not take its arm. The right side of a traced `&&`/`||` is now
+  masked by its left side, so a runtime check there no longer fails for
+  lanes that never run it. An exception's message is its first string
+  argument (`DomainError(x, "message")` used to raise with `x`); a throw or
+  check in a helper called under its caller's data-dependent condition is
+  still refused.
+- `jax_source`: two-argument `hypot` is `jnp.hypot`, also with mixed argument
+  types (`hypot(c + 2, 3)` used to be refused inside Base's `promote`).
+- `jax_source`: a range whose ends are data with no static limit (a scan over
+  `n:-1:2` with `n` computed from a parameter) is refused with a
+  `JAXEmissionError` naming the recipe. It used to emit a `jnp.arange` of a
+  traced value, a module that JAX rejected only when it traced it.
+- The LogNormal variances (`var()` of the moment objects above) are still
+  refused: a plate child spliced under a lazy arm (`_logmills_quadrature`)
+  reaches the module without its plan, and the continued fraction's length is
+  data.
 
 ## 0.1.148
 

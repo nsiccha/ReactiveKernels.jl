@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.149
+## 0.1.150
 
 - Shared-prefix cell and partition derivatives work when a shared value that
   cells read is a `NamedTuple` with scalar fields, such as a source record
@@ -27,7 +27,25 @@ are recorded in the git history only.
   `MethodError: no method matching _zero_cell_shadow!(::Float64)` (the cell
   pullback and the batch) or `ArgumentError: broadcasting over dictionaries
   and NamedTuples is reserved` (one label's gradient) (snag
-  `rkppl-zero-cell-a7c54028`). Requires ReactiveKernels 0.1.149.
+  `rkppl-zero-cell-a7c54028`). Requires ReactiveKernels 0.1.152.
+
+## 0.1.151
+
+- `jax_source(built, plan)` emits a model whose data-only definition has no
+  translation and is read by its fields, as BRM's
+  `graph = car_graph(area, from, to); phi[1:graph.n_struct] ~ ICAR(graph.node1,
+  graph.node2)` is. The definition (`graph`, a named tuple) is an input of
+  `prepare_data`, listed in `UNTRANSLATED` and passed as a `dict` by field name
+  (the binding's own value of it), and `prepare_data` computes the fields the
+  program reads, including a declared array's extent. Before, emission raised
+  ``ArgumentError: jax_source: `keep` names `_ppl_last_r.phi`, which is no
+  data-only value of the program``. In a submodel the input is spelled with
+  `_` (`r.graph` is `r_graph`).
+- `g = prep(labels); n = g.n` with `prep` untranslatable takes `g` as the
+  input and computes `n`; before, `n` was the input, and `UNTRANSLATED` also
+  listed `g`, which was no input, with the reason "`g` is not defined in
+  module `Main`" for `n`.
+- Requires ReactiveKernels 0.1.151. Snag `jax-source-refus-8c6ed1ec`.
 
 ## 0.1.148
 
