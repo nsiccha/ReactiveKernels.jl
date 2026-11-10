@@ -259,35 +259,56 @@ function _validate_array_parameters(plan::StructuralPlan)
         elseif _is_slice_array(p)
             _validate_array_slices(plan, p)
         else
-            haskey(SAMPLED_ARITY, p.family) || _fail(p.label,
-                "array $(p.name) family $(p.family) unknown (admitted: " *
-                "$(join(sort!(collect(keys(SAMPLED_ARITY))), ", ")), " *
-                "lkj_cholesky)")
-            want = ntuple(i -> Symbol(:arg, i), SAMPLED_ARITY[p.family])
-            Tuple(keys(p.args)) == want || _fail(p.label,
-                "array $(p.name) family $(p.family) takes positional keys " *
-                "$want, got $(Tuple(keys(p.args)))")
-            try
-                support_of(p.family, p.support_override)
-            catch err
-                err isa ContractValidationError || rethrow()
-                _fail(p.label, "array $(p.name): " * err.message)
-            end
-            for (k, a) in pairs(p.args)
-                _validate_array_arg(p, k, a)
-            end
-            if p.family === :uniform
-                lo, hi = p.args.arg1, p.args.arg2
-                all(x -> !(x isa Real) || isfinite(x), (lo, hi)) ||
-                    _fail(p.label, "array $(p.name): Uniform bounds must be finite")
-                if lo isa Real && hi isa Real
-                    lo < hi || _fail(p.label, "array $(p.name): " *
-                        "Uniform bounds need lo < hi")
-                end
-            end
+            _validate_elementwise_array(p)
         end
     end
     return nothing
+end
+
+# An elementwise prior's family, positional keys, support and arguments.
+function _validate_elementwise_array(p::ArrayParameter)
+    haskey(SAMPLED_ARITY, p.family) || _fail(p.label,
+        "array $(p.name) family $(p.family) unknown (admitted: " *
+        "$(join(sort!(collect(keys(SAMPLED_ARITY))), ", ")), " *
+        "lkj_cholesky)")
+    want = ntuple(i -> Symbol(:arg, i), SAMPLED_ARITY[p.family])
+    Tuple(keys(p.args)) == want || _fail(p.label,
+        "array $(p.name) family $(p.family) takes positional keys " *
+        "$want, got $(Tuple(keys(p.args)))")
+    try
+        support_of(p.family, p.support_override)
+    catch err
+        err isa ContractValidationError || rethrow()
+        _fail(p.label, "array $(p.name): " * err.message)
+    end
+    for (k, a) in pairs(p.args)
+        _validate_array_arg(p, k, a)
+    end
+    if p.family === :uniform
+        lo, hi = p.args.arg1, p.args.arg2
+        all(x -> !(x isa Real) || isfinite(x), (lo, hi)) ||
+            _fail(p.label, "array $(p.name): Uniform bounds must be finite")
+        if lo isa Real && hi isa Real
+            lo < hi || _fail(p.label, "array $(p.name): " *
+                "Uniform bounds need lo < hi")
+        end
+    end
+    return nothing
+end
+
+# A density factor on a vector definition (`d .~ Normal.(m, s)`,
+# `d ~ MvNormal(m, S)`): the arguments of a declared array's elementwise or
+# one-vector multivariate prior, over the definition's value. The value
+# fixes its extent, so a factor declares no axes.
+function _validate_vector_factor(plan::StructuralPlan, p::ArrayParameter)
+    isempty(p.dims) || _fail(p.label,
+        "density factor $(p.name) on a definition declares no axes")
+    _is_slice_array(p) || return _validate_elementwise_array(p)
+    _slice_kind(p) === :vector &&
+        _slice_stem(p) in (:mvnormal, :mvnormal_cholesky) || _fail(p.label,
+        "density factor $(p.name): a joint law on a vector definition is " *
+        "`MvNormal(mu, Sigma)` or `MvNormalCholesky(mu, F)`, got $(p.family)")
+    return _validate_array_slices(plan, p; check_axes = false)
 end
 
 _lkj_uplo(p::ArrayParameter) = get(p.args, :uplo, 'L')
@@ -420,9 +441,10 @@ _slice_noun(p::ArrayParameter) = _slice_kind(p) === :rows ? "rows" :
 # `zeros(K)` / `fill(a, K)`, array names or expressions over them, a
 # per-slice `eachrow(M)` / `eachcol(M)` of one — never per-observation
 # data or gathers.
-function _validate_array_slices(plan::StructuralPlan, p::ArrayParameter)
+function _validate_array_slices(plan::StructuralPlan, p::ArrayParameter;
+        check_axes::Bool = true)
     want = _slice_kind(p) === :vector ? 1 : 2
-    length(p.dims) == want || _fail(p.label, "array $(p.name) " *
+    !check_axes || length(p.dims) == want || _fail(p.label, "array $(p.name) " *
         "$(_slice_noun(p)) need $want axes, got $(length(p.dims))")
     roles = _slice_roles(p)
     keys(p.args) == keys(roles) || _fail(p.label, "array $(p.name) " *

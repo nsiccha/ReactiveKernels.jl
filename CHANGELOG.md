@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.143
+## 0.1.145
 
 - `jax_source` translates `cumsum(x; dims = d)` as `jnp.cumsum` along the
   static axis `d`. Before, any keyword `cumsum` raised `JAXEmissionError`
@@ -35,6 +35,37 @@ are recorded in the git history only.
     a computed dimension");
   - a dotted literal power (`x .^ 2`) is the elementwise power. Before, the
     emitted module was not valid Python (`jnp.vectorize(...)(<callable>, ...)`).
+
+## 0.1.144
+
+- `jax_source(...; data)`: `prepare_data` translates `sort`, `sort!`,
+  `unique`, `unique!`, `searchsortedfirst` and `searchsortedlast` of vectors
+  of numbers or strings, in Julia's `isless` order (-0.0 before 0.0, every
+  `NaN` last; `unique` keeps the first of each `isequal` class, in order;
+  1-based searches). `sort!` and `unique!` rewrite a `push!` list in place;
+  `unique!` of a NumPy array, whose length is fixed, has no host translation.
+  Before, a data-only helper calling one of them had no host translation, and
+  the JAX functions then refused it (snag `jax-host-sort-un-0edfe976`).
+- The host's `isequal` tells -0.0 from 0.0, as Julia's does.
+- A `push!` list that a helper, `return` or recipe ends with reaches its
+  caller as the array it stands for, not as a Python list. `first`, `last`
+  and the searches read a list in place: before, each read converted the
+  whole list, so a loop testing `last(v)` while it grows `v` was quadratic.
+- A data-only recipe without a host translation: the `prepare_data` comment
+  that names it gives the reason, and when the JAX functions cannot compute it
+  either, their `JAXEmissionError` names the host reason as well. Before, the
+  error named only the functions' reason.
+
+## 0.1.143
+
+- `jax_source` keeps a tuple or `NamedTuple` local that a loop or a branch
+  carries as a tuple. A loop in a recipe or a `@traceable` helper over such a
+  local (`s = i <= n ? f(s) : s`) used to start its `fori_loop` from one array
+  of the tuple, so the module failed in Python with `true_fun output is a
+  <class 'tuple'> but false_fun output is a pytree leaf` or a carry-structure
+  `TypeError`. Each element now enters with its own dtype, and past a ragged
+  row's length each element keeps its value (snag
+  `jax-source-tuple-6f1e9e4c`).
 
 ## 0.1.142
 

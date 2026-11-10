@@ -166,6 +166,19 @@ The definition is still assigned once; a second factor on the same name is
 rejected. Vector observations use `.~`. A caller-owned law instead observes
 the definition as one whole event (see caller-owned sampling laws below).
 
+A vector definition that reads a sampled value and no observed (conditioned)
+data carries a density factor the same way. `d .~ Normal.(0, s)` adds
+`sum(logpdf.(Normal.(0, s), d))` to the prior, one support-checked density
+per entry, and `d ~ MvNormal(m, S)` (or `MvNormalCholesky(m, L)`) adds the
+joint density of the value. A conditioned factor enters the likelihood. Neither adds a
+coordinate or a transform; the value's length is whatever the definition
+computes, so a data-dependent number of constraints needs no data-dependent
+source. Structure data such as an incidence matrix or index vectors may
+enter the value. A `.~` over a definition of data alone is still an
+observation of that value, and one over a definition reading both observed
+(conditioned) data and a sampled value is still refused: observed data
+cannot depend on a sampled value.
+
 Computing a scalar from data does not automatically condition its density.
 For `z = sum(log.(raw)); z ~ Normal(mu, 3)`, use
 `lower_rkppl(ast, (; raw); conditioned=(:z,))` to select an observation, or
@@ -662,7 +675,10 @@ generated values to sampler coordinates.
 - A `~` whose left-hand side is a bound data column is an observation. On an
   existing scalar definition a built-in family adds a density factor, while a
   caller-owned law observes the definition's whole value; otherwise it
-  declares a parameter.
+  declares a parameter. On a vector definition that reads a sampled value
+  and no observed data, `.~` with a built-in family and `~` with `MvNormal`
+  / `MvNormalCholesky` add density factors too; `.~` over a definition of
+  data alone observes it.
 - `Ordinal` permits an intercept alongside its thresholds, for both
   cumulative and stopping-ratio responses. Both declarations and their
   priors are translated as written.
@@ -961,6 +977,19 @@ convolved_re = sqrt(1 - rho) .* theta .+ sqrt(rho / scaling_factor) .* phi
 y .~ Poisson.(exp.(log.(E) .+ beta0 .+ sigma .* convolved_re))
 ```
 
+A graph with several connected components needs one constraint per
+component. With the components as data (`comp_start[c]`, `comp_size[c]`: the
+first node and the size of component `c`, nodes numbered by component), one
+elementwise factor on the vector of component sums states them all, so the
+same body serves any graph:
+
+```julia
+phi[1:N] ~ ICAR(node1, node2)
+cs = cumsum(vcat(0.0, phi))
+phi_sums = cs[comp_start .+ comp_size] .- cs[comp_start]
+phi_sums .~ Normal.(0, 0.001 .* comp_size)
+```
+
 The declaration sizes the field, so a node on no edge adds no term. The node
 vectors are integer data or data-only expressions such as `edges[:, 1]`.
 Binding checks that both have one entry per edge and that every entry is a
@@ -991,9 +1020,13 @@ is one density factor (`density_factors`), and the model translates through
 a scale inside the prior are not built.
 
 Each field is improper on its own, so each needs its own identifying
-constraint. A soft sum-to-zero per field is a density factor on the vector of
-field sums (`phi_sums .~ Normal.(0, s)`), which is not built yet: a density
-factor is admitted on a scalar definition only.
+constraint. One elementwise density factor on the vector of field sums states
+a soft sum-to-zero for every field, whatever `K`:
+
+```julia
+phi_sums = vec(sum(phi; dims = 2))
+phi_sums .~ Normal.(0, 0.001 * N)
+```
 
 ## Design matrices
 
