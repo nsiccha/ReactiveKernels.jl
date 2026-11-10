@@ -104,8 +104,13 @@ mutable struct _JaxModule
     helper_names::Dict{Any,Any}
     used::Set{String}
     counter::Int
+    # Why `prepare_data` leaves a data-only recipe (by id in the program's
+    # graph, `host_graph`) to the functions: its host translation's error.
+    host_reasons::Dict{Int,JAXEmissionError}
+    host_graph::Any
 end
-_JaxModule() = _JaxModule(String[], Dict{Any,Any}(), Set{String}(), 0)
+_JaxModule() = _JaxModule(String[], Dict{Any,Any}(), Set{String}(), 0,
+                          Dict{Int,JAXEmissionError}(), nothing)
 
 # Translation state: the module, the current function scope, the current
 # recipe (for messages) and the module that resolves its source's globals.
@@ -2903,10 +2908,26 @@ function _jax_plan!(ctx::_JaxContext, p::Plan)
     end
 end
 function _jax_plan_recipe!(ctx::_JaxContext, p::Plan, recipe::Recipe)
+    ctx.host === nothing && p.graph === ctx.mod.host_graph &&
+        haskey(ctx.mod.host_reasons, recipe.id) || return _jax_plan_recipe_body!(ctx, p, recipe)
+    # A data-only recipe `prepare_data` left to the functions: when they cannot
+    # compute it either, the error names both reasons.
+    try
+        _jax_plan_recipe_body!(ctx, p, recipe)
+    catch e
+        e isa JAXEmissionError || rethrow()
+        throw(JAXEmissionError(rstrip(e.message, '.') * ". The recipe reads data alone, " *
+                               "and `prepare_data` does not compute it on the host either: " *
+                               ctx.mod.host_reasons[recipe.id].message))
+    end
+end
+function _jax_plan_recipe_body!(ctx::_JaxContext, p::Plan, recipe::Recipe)
     inputs = _PyVal[_jax_lookup(ctx, p.graph, v) for v in recipe.inputs]
     ctx.recipe = recipe
     first_line = length(ctx.scope.lines) + 1
     outputs = _jax_recipe(ctx, p, recipe, recipe.op, inputs)
+    # On the host, a list a recipe ends with is the array it stands for.
+    ctx.host === nothing || (outputs = [_host_read(ctx, o) for o in outputs])
     length(outputs) == length(recipe.outputs) ||
         _jax_error("recipe produced ", length(outputs), " values for ",
                    length(recipe.outputs), " outputs", _jax_where(ctx))
@@ -3534,18 +3555,23 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
     defs = definitions === nothing ? nothing :
         Pair{Symbol,Any}[Symbol(first(d)) => last(d) for d in definitions]
     excluded = Set{Int}()
+    # Why each excluded recipe has no host translation: the module's comment
+    # names it, and so does an error the functions then raise in that recipe.
+    reasons = Dict{Int,JAXEmissionError}()
     # A definition given as a `JAXEmissionError` (its reason) is not translated.
     untranslated = Dict{Symbol,JAXEmissionError}(n => ex for (n, ex) in something(defs, ())
                                                  if ex isa JAXEmissionError)
     while true
         try
             return _jax_module_text(plans, types, constants, doc,
-                                    (data, excluded, defs, untranslated, keep); function_docs)
+                                    (data, excluded, defs, untranslated, keep, reasons);
+                                    function_docs)
         catch e
             if e isa _HostUnsupportedDefinition && !haskey(untranslated, e.name)
                 untranslated[e.name] = e.error
             elseif e isa _HostUnsupported && !(e.recipe in excluded)
                 push!(excluded, e.recipe)
+                reasons[e.recipe] = e.error
             else
                 rethrow()
             end
@@ -3570,7 +3596,9 @@ function _jax_module_text(plans, types, constants, doc, prepare; function_docs =
             push!(functions, f)
         end
     else
-        data, excluded, defs, untranslated, keep = prepare
+        data, excluded, defs, untranslated, keep, reasons = prepare
+        merge!(mod.host_reasons, reasons)
+        mod.host_graph = first(plans).second[1].graph
         meta = _jax_prepared_functions!(mod, bodies, functions, plans, types, data, excluded,
                                         defs, untranslated; keep, function_docs)
         constants = merge(constants, meta)
