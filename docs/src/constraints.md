@@ -784,7 +784,15 @@ only, no ReactiveKernels code) isolate the remaining backend limitations:
   dogfood `b5daa2ac`, the ARMA cell's generated function then takes 0.96 to
   1.01 times the inlined hand loop, against 1.05 to 1.11 times before, and the
   HMM cell 1.01 to 1.02 times, against 1.08 to 1.10. The washout cell is
-  unchanged at 0.99 to 1.02 times its hand loop.
+  unchanged at 0.99 to 1.02 times its hand loop. A scan whose carry is an
+  array with a fresh seed, such as `zeros(n)`, then meets the boundary of the
+  lazy-branch entry above in its loop. Its carry merges the seed, which
+  carries no derivative, with the steps' active results, and registered Enzyme
+  (0.13.219) rejects ordinary Reverse with `EnzymeRuntimeActivityError`.
+  Before 0.1.128 the peeled first step hid the merge. The Enzyme dogfood line
+  differentiates it (`b5daa2ac`). The repair belongs in Enzyme, and the
+  lowering stays as it is. `test_scan_plate_ad.jl` pins the registered
+  rejections as broken.
   On Julia 1.12 and 1.13 the reverse pass rebuilds each path's gathered slice
   and output instead of keeping them (Enzyme todo `1nw1luu`). There, on
   dogfood `439590b1` with Julia 1.12.7, the Enzyme-only washout shape costs 1.11

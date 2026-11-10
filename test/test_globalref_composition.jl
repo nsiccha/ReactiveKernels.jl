@@ -112,7 +112,10 @@ end
         @test p(0.3) ≈ cumsum(xs .* 1.3)
         push!(counts, loop_count(code_expr(p)))
     end
-    @test counts == [1, 1, 1]
+    # Bound data of every length emits the same loops: the scan's loop after
+    # its peeled first step and its loop over every step (`_scan_unpeeled`,
+    # from RK 0.1.128), of which the step's types compile one.
+    @test counts == [2, 2, 2]
 
     # Lazy arms and deferred lexical scopes must not be lifted to unconditional
     # caller recipes: their access and argument evaluation stay selected/local.

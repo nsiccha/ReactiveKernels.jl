@@ -420,6 +420,9 @@ gives a fresh allocation that no active data reaches a zero shadow (see
 `constraints.md`, the lazy branch whose arms differ in activity). A native scan
 whose step keeps its types, a concrete output type and the seed's carry type,
 runs every step in one loop over its indices (from ReactiveKernels 0.1.128).
+With an array seed such as `zeros(n)`, that loop's carry merges the seed with
+active results as the kept seed above does. Registered Enzyme rejects it the
+same way, and the dogfood line differentiates it.
 Any other native scan runs its first step before the loop, to type its result
 or its carry, and iterates the indices after it as a unit range. Iterating
 them with `Iterators.drop` made Enzyme raise `OutOfMemoryError` from the
