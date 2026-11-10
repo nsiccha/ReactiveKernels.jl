@@ -127,8 +127,16 @@ _jax_emit!(ctx::_JaxContext, line::AbstractString) =
     push!(ctx.scope.lines, "    "^ctx.scope.indent * line)
 
 # A fresh Python identifier derived from `hint`.
+# A generated name without the counters that differ between builds of one
+# program: a gensym's `#<n>` and a value id's long numeric suffix
+# (`scale_binding_641723669287000073`). Names then follow the program's
+# structure alone, so one declaration emits one module text, and the
+# numbering of repeated names (`cell_2`) follows the emission order.
+_jax_stable_name(hint) =
+    replace(replace(String(Symbol(hint)), r"#\d+" => ""), r"_\d{6,}(?=_|$)" => "")
+
 function _jax_identifier(used::Set{String}, hint)
-    text = replace(String(Symbol(hint)), r"[^A-Za-z0-9_]" => "_")
+    text = replace(_jax_stable_name(hint), r"[^A-Za-z0-9_]" => "_")
     text = replace(text, r"_+" => "_")
     text = strip(text, '_')
     isempty(text) && (text = "v")
@@ -146,8 +154,8 @@ end
 
 # An input's Python name: its own name when that is a free Python identifier
 # (so `prepare_data(**data)` takes the data's own keys), else a fresh one.
-function _jax_param_name(used::Set{String}, name)
-    text = String(Symbol(name))
+function _jax_param_name(used::Set{String}, name; stable::Bool = true)
+    text = stable ? _jax_stable_name(name) : String(Symbol(name))
     if occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", text) && !(text in _JAX_RESERVED) && !(text in used)
         push!(used, text)
         return text
@@ -1344,6 +1352,17 @@ function _jax_call(ctx::_JaxContext, f, args::Vector{_PyVal}, kw)
                               _jax_where(ctx))
     _jax_call_positional(ctx, f, args)
 end
+# `sum(x; init)` and `prod(x; init)`: the reduction combined with `init`,
+# which is also the value of an empty `x` (RKPPL's per-group counts).
+function _jax_call(ctx::_JaxContext, f::Union{typeof(sum),typeof(prod)},
+                   args::Vector{_PyVal}, kw)
+    isempty(kw) && return _jax_call_positional(ctx, f, args)
+    length(kw) == 1 && first(only(kw)) === :init ||
+        _jax_error("keyword arguments to `", f, "` other than `init` have no JAX translation",
+                   _jax_where(ctx))
+    reduced = _jax_call_positional(ctx, f, args)
+    _jax_call(ctx, f === sum ? (+) : (*), [last(only(kw)), reduced])
+end
 
 # `stack(rows; dims)` of a vector of equal-length vectors, held as the 2-D
 # array of its rows: a matrix with those rows (`dims = 1`) or columns.
@@ -1410,6 +1429,7 @@ const _JAX_ELEMENTWISE = Dict{Any,String}(
     LogExpFunctions.xlog1py => "jsp.xlog1py",
     LogExpFunctions.log1mexp => "_rk_log1mexp",
     _native_exp => "jnp.exp",
+    sinpi => "_rk_sinpi", cospi => "_rk_cospi",
 )
 # LogExpFunctions functions that only some of its supported versions define.
 for (name, py) in ((:log1msq, "_rk_log1msq"), (:logcosh, "_rk_logcosh"),
@@ -1439,6 +1459,17 @@ def _rk_log1mexp(x):
 def _rk_log1msq(x):
     # log(1 - x^2) (LogExpFunctions.log1msq).
     return jnp.log1p(-jnp.square(x))
+""",
+    "_rk_sinpi" => """
+def _rk_sinpi(x):
+    # sin(pi * x) (Base.sinpi), its argument reduced to [-1, 1] first, so a
+    # large x (a day count) keeps full precision.
+    return jnp.sin(jnp.pi * (x - 2.0 * jnp.round(x / 2.0)))
+""",
+    "_rk_cospi" => """
+def _rk_cospi(x):
+    # cos(pi * x) (Base.cospi), its argument reduced to [-1, 1] first.
+    return jnp.cos(jnp.pi * (x - 2.0 * jnp.round(x / 2.0)))
 """,
     "_rk_logcosh" => """
 def _rk_logcosh(x):
@@ -1749,9 +1780,19 @@ _jax_function_call(ctx::_JaxContext, ::typeof(float), args::Vector{_PyVal}) =
 function _jax_function_call(ctx::_JaxContext, ::typeof(LinearAlgebra.dot), args::Vector{_PyVal})
     _jax_result(LinearAlgebra.dot, args, "jnp.vdot(" * _jax_args(args) * ")")
 end
-_jax_function_call(ctx::_JaxContext, ::typeof(vcat), args::Vector{_PyVal}) =
-    _jax_result(vcat, args, "jnp.concatenate([" * join(
+function _jax_function_call(ctx::_JaxContext, ::typeof(vcat), args::Vector{_PyVal})
+    v = _jax_result(vcat, args, "jnp.concatenate([" * join(
         (_jax_is_array(a.T) ? a.code : "jnp.atleast_1d(" * a.code * ")" for a in args), ", ") * "])")
+    padded = findall(a -> !isempty(a.extent), args)
+    isempty(padded) && return v
+    # A padded vector last (a scan's steps after its seeds): the result's
+    # length is the entries before it plus its own; padding elsewhere would
+    # sit between valid entries.
+    padded == [length(args)] && _jax_rank(args[end].T) == 1 ||
+        _jax_error("`vcat` with a padded (ragged) value before other values", _jax_where(ctx))
+    before = String[_jax_is_array(a.T) ? _py_atom(a.code) * ".shape[0]" : "1" for a in args[1:end-1]]
+    _PyVal(v.code, v.T, v.static, _py_infix("+", [before; args[end].extent]))
+end
 # `reduce(vcat, cells)`: the cells' entries in order. On the host, a list of
 # arrays concatenated; under JAX an equal-length vector of vectors is a matrix,
 # read row by row, and a ragged one's padded entries are dropped: its valid
@@ -1890,6 +1931,14 @@ function _jax_call_positional(ctx::_JaxContext, ::Colon, args::Vector{_PyVal})
                       StepRange{Int,Int})
     end
     a, b = args
+    # A stop that is data with a static limit (a padded group's length): the
+    # range runs to the limit, and its extent is the number of entries up to
+    # the stop, as a padded value's (reductions and scans mask the rest).
+    if !_jax_known(ctx, b) && !isempty(b.limit) && _jax_known(ctx, a)
+        count = _py_infix("-", [_jax_plus_one(b), a.code])
+        return _PyVal("jnp.arange(" * a.code * ", " * _jax_plus_one(_PyVal(b.limit, Int)) * ")",
+                      UnitRange{Int}, false, count)
+    end
     _PyVal("jnp.arange(" * a.code * ", " * _jax_plus_one(b) * ")", UnitRange{Int})
 end
 _jax_plus_one(b::_PyVal) = match(r"^-?[0-9]+$", b.code) === nothing ?
@@ -2363,8 +2412,12 @@ for (f, position) in ((first, 1), (last, 0))
             k = $position == 1 ? 1 : fieldcount(x.T)
             return _jax_tuple_element(ctx, x, _PyVal(string(k), Int, true))
         end
-        _jax_is_array(x.T) && isempty(x.extent) && ndims(x.T) == 1 ||
+        _jax_is_array(x.T) && ndims(x.T) == 1 && !_jax_ragged(x.T) ||
             return _jax_traceable_or_lowered(ctx, $f, args)
+        # A padded vector's last entry is the one at its length.
+        isempty(x.extent) || $position == 1 ||
+            return _PyVal(_py_atom(x.code) * "[" * _py_infix("-", [x.extent, "1"]) * "]",
+                          eltype(x.T))
         _PyVal(_py_atom(x.code) * ($position == 1 ? "[0]" : "[-1]"), eltype(x.T))
     end
 end
@@ -2400,7 +2453,7 @@ function _jax_define!(ctx::_JaxContext, g::Graph, v::Value, val::_PyVal; bind::B
     if bind
         name = _jax_fresh(ctx, v.name)
         _jax_emit!(ctx, name * " = " * val.code)
-        val = _PyVal(name, val.T, val.static, val.extent)
+        val = _PyVal(name, val.T, val.static, val.extent, val.limit)
     end
     ctx.scope.values[id] = val
     val
@@ -2717,6 +2770,14 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     for (k, i) in enumerate(shared)
         inner.values[canon_id(body.graph, have[1 + length(iterated) + k].id)] = inputs[i]
     end
+    # A sequence padded past a data-dependent length (a group's range, run to
+    # its static limit) is scanned to the limit: past the length the carry
+    # stays as it was, and the outputs there are padding, which the result's
+    # extent masks, as a padded group's loop does.
+    padded_inputs = [i for i in iterated if !isempty(inputs[i].extent)]
+    extent = isempty(padded_inputs) ? "" : inputs[first(padded_inputs)].extent
+    position = isempty(extent) ? "" : _jax_identifier(inner.used, :position)
+    isempty(position) || push!(unpack, position)
     recipe_saved = ctx.recipe
     ctx.scope = inner
     wants = try
@@ -2728,11 +2789,23 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         ctx.scope = outer
         ctx.recipe = recipe_saved
     end
+    next_carry = wants[1].code
+    if !isempty(position)
+        C = _jax_typeof(wants[1])
+        live = position * " < " * extent
+        # Any carry (a number, an array, the named numbers of several carried
+        # values) keeps its previous value past the length, leaf by leaf.
+        next_carry = C <: Number || _jax_is_array(C) ?
+            "jnp.where(" * live * ", " * wants[1].code * ", " * carry * ")" :
+            "jax.tree_util.tree_map(lambda new, old: jnp.where(" * live * ", new, old), " *
+            wants[1].code * ", " * carry * ")"
+    end
     push!(outer.lines, "    "^outer.indent * "def " * step * "(" * carry * ", " * xs * "):")
     append!(outer.lines, inner.lines)
-    push!(outer.lines, "    "^inner.indent * "return " * wants[1].code * ", " * wants[2].code)
-    sequences = "(" * join((inputs[i].code for i in iterated), ", ") *
-                (length(iterated) == 1 ? ",)" : ")")
+    push!(outer.lines, "    "^inner.indent * "return " * next_carry * ", " * wants[2].code)
+    seqs = String[inputs[i].code for i in iterated]
+    isempty(position) || push!(seqs, "jnp.arange(" * _py_atom(inputs[iterated[1]].code) * ".shape[0])")
+    sequences = "(" * join(seqs, ", ") * (length(seqs) == 1 ? ",)" : ")")
     result = _jax_fresh(ctx, :scan_result)
     _jax_emit!(ctx, "_, " * result * " = jax.lax.scan(" * step * ", " * inputs[1].code *
                     ", " * sequences * ")")
@@ -2740,6 +2813,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     if I
         _jax_emit!(ctx, result * " = jnp.concatenate([jnp.atleast_1d(" * inputs[1].code *
                         "), " * result * "])")
+        isempty(extent) || (extent = _py_infix("+", [extent, "1"]))
     end
     # A step output of named numbers stacks field by field: the vector of
     # named tuples is the tuple of its columns, as `jax.lax.scan` returns it,
@@ -2747,7 +2821,9 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     E <: Number || _jax_numeric_namedtuple(E) && !I ||
         _jax_error("a scan whose step outputs `", E, "` has no JAX translation yet",
                    _jax_where(ctx))
-    [_PyVal(result, Vector{E})]
+    # Padded outputs carry the extent; a vector of named numbers is the tuple
+    # of its columns, each padded alike.
+    [_PyVal(result, Vector{E}, false, extent)]
 end
 
 # --- module -------------------------------------------------------------------------
@@ -2768,13 +2844,18 @@ end
     JAXSource
 
 The Python module [`jax_source`](@ref) emits: `text` is the module source and
-`functions` the [`JAXFunction`](@ref)s it defines. `write(path, src)` saves the
-module and `print(src)` shows it.
+`functions` the [`JAXFunction`](@ref)s it defines. `prepared` maps each value
+`prepare_data` returns, by its name in the program, to its key in that
+`dict` (a name that is no Python identifier, such as a submodel's
+`b_g.z`, has another key). `write(path, src)` saves the module and
+`print(src)` shows it.
 """
 struct JAXSource
     text::String
     functions::Vector{JAXFunction}
+    prepared::Dict{Symbol,String}
 end
+JAXSource(text::AbstractString, functions) = JAXSource(text, functions, Dict{Symbol,String}())
 Base.print(io::IO, src::JAXSource) = print(io, src.text)
 Base.show(io::IO, ::MIME"text/plain", src::JAXSource) = print(io, src.text)
 Base.write(io::IO, src::JAXSource) = write(io, src.text)
@@ -2888,15 +2969,10 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
     data isa NamedTuple || data isa Tuple && all(d -> d isa Symbol, data) ||
         throw(ArgumentError("jax_source: `data` is a tuple of HAVE names or a NamedTuple " *
                             "of their values"))
+    # A definition of a data value replaces that `prepare_data` input; one of
+    # another name is a host local the later definitions read.
     defs = definitions === nothing ? nothing :
         Pair{Symbol,Any}[Symbol(first(d)) => last(d) for d in definitions]
-    if defs !== nothing
-        ports = data isa NamedTuple ? Set(keys(data)) : Set(data)
-        for (n, _) in defs
-            n in ports || throw(ArgumentError(
-                "jax_source: the definition `$n` does not name a `data` value"))
-        end
-    end
     excluded = Set{Int}()
     # A definition given as a `JAXEmissionError` (its reason) is not translated.
     untranslated = Dict{Symbol,JAXEmissionError}(n => ex for (n, ex) in something(defs, ())
@@ -2968,7 +3044,9 @@ function _jax_module_text(plans, types, constants, doc, prepare)
         push!(lines, "")
         push!(lines, block)
     end
-    JAXSource(join(lines, "\n") * "\n", functions)
+    prepared = Dict{Symbol,String}(k[2] => v for (k, v) in mod.helper_names
+                                   if k isa Tuple && length(k) == 2 && k[1] === :prepared_name)
+    JAXSource(join(lines, "\n") * "\n", functions, prepared)
 end
 
 # `prepare_data` and the functions over its results; returns the metadata
@@ -3006,6 +3084,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
         name = _jax_param_name(used, v.name)
         push!(used, name * "_lengths", name * "_flat")
         push!(prepared_names, name)
+        mod.helper_names[(:prepared_name, v.name)] = name
     end
     # The boundary values' types: those of one binding's values, when `data`
     # gives them; else those the translation infers.
@@ -3018,11 +3097,14 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
             nothing
         end
     end
-    lines, prepared_types = _jax_prepare_function!(mod, split, raw_types, prepared_names, native;
-        params, definitions = [(n, ex, have_types[n]) for (n, ex) in computed])
+    lines, prepared_types, param_names = _jax_prepare_function!(mod, split, raw_types,
+        prepared_names, native;
+        params, definitions = [(n, ex, get(have_types, n, nothing)) for (n, ex) in computed])
     push!(bodies, join(lines, "\n"))
+    # The inputs by the names `prepare_data` takes them (a name that is no
+    # Python identifier, such as a submodel's `v.mask`, is spelled `v_mask`).
     push!(functions, JAXFunction("prepare_data",
-        [String(v.name) => T for (v, T) in zip(params, raw_types)],
+        [n => T for (n, T) in zip(param_names, raw_types)],
         [n => T for (n, T) in zip(prepared_names, prepared_types)]))
     all_types = Any[[have_types[v.name] for v in split.remaining]; prepared_types]
     all_names = [remaining_names; prepared_names]
@@ -3039,9 +3121,9 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     # With definitions, `DATA` describes `prepare_data`'s own parameters, and
     # `UNTRANSLATED` the definitions it takes as inputs (none when every
     # definition has a host translation).
-    merge(meta, (DATA = [String(v.name) => (dtype = _jax_dtype_name(T), ndim = _jax_meta_rank(T),
-                                           ragged = _jax_ragged(T))
-                         for (v, T) in zip(params, raw_types)],
+    merge(meta, (DATA = [n => (dtype = _jax_dtype_name(T), ndim = _jax_meta_rank(T),
+                               ragged = _jax_ragged(T))
+                         for (n, T) in zip(param_names, raw_types)],
                  UNTRANSLATED = Dict{String,String}(String(n) => untranslated[n].message
                      for (n, _) in defs if haskey(untranslated, n))))
 end

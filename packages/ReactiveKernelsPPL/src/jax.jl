@@ -100,13 +100,12 @@ end
 # `unconstrained` and each parameter's 0-based `start`/`stop`, transform and
 # dimensions, for the data `prepare_data` returned.
 function _jax_with_layout(src::ReactiveKernels.JAXSource, layout::LayoutTable)
-    prepare = only(f for f in src.functions if f.name == "prepare_data")
-    prepared = Set{String}(first.(prepare.outputs))
+    # A layout name in a submodel's scope (`_ppl_last_b_g.z`) has another key.
     function read(x)
         x isa Int && return string(x)
-        String(x) in prepared || throw(ContractValidationError(
+        haskey(src.prepared, x) || throw(ContractValidationError(
             "[jax] the layout reads `$x`, which `prepare_data` does not return"))
-        "int(prepared[\"" * String(x) * "\"])"
+        "int(prepared[\"" * src.prepared[x] * "\"])"
     end
     start(e) = e.positions === nothing ? string(e.offset - 1) :
         e.positions[1] isa Int ? string(e.positions[1] - 1) : read(e.positions[1]) * " - 1"
@@ -133,7 +132,8 @@ def parameters(prepared):
     ReactiveKernels.JAXSource(src.text * text,
         [src.functions;
          ReactiveKernels.JAXFunction("dimension", ["prepared" => Dict], ["dimension" => Int]);
-         ReactiveKernels.JAXFunction("parameters", ["prepared" => Dict], ["parameters" => Dict])])
+         ReactiveKernels.JAXFunction("parameters", ["prepared" => Dict], ["parameters" => Dict])],
+        src.prepared)
 end
 
 # The data-only definitions `bind_data` evaluated, as `prepare_data`
@@ -150,6 +150,14 @@ function _jax_data_definitions(plan::StructuralPlan, names)
     exprs, derived = _definition_exprs(plan)
     available = Set{Symbol}(names)
     found = Dict{Symbol,Any}()
+    function definition(nm)
+        ex = exprs[nm]
+        nm in derived && _guard_missing_observation_argument(nm, ex, plan, plan.columns) !== ex &&
+            return ReactiveKernels.JAXEmissionError(
+                "the binding guards the missing observations of `$nm` with a presence " *
+                "mask computed from the data: `prepare_data` takes `$nm` as an input")
+        ex
+    end
     for nm in available
         str = String(nm)
         if startswith(str, "_rkppl_value_")
@@ -157,14 +165,21 @@ function _jax_data_definitions(plan::StructuralPlan, names)
             authored in available && _is_bound_value_call(get(exprs, authored, nothing)) &&
                 (found[nm] = authored)
         elseif haskey(exprs, nm) && !_is_bound_value_call(exprs[nm])
-            ex = exprs[nm]
-            if nm in derived &&
-               _guard_missing_observation_argument(nm, ex, plan, plan.columns) !== ex
-                ex = ReactiveKernels.JAXEmissionError(
-                    "the binding guards the missing observations of `$nm` with a presence " *
-                    "mask computed from the data: `prepare_data` takes `$nm` as an input")
-            end
-            found[nm] = ex
+            found[nm] = definition(nm)
+        end
+    end
+    # The definitions those read that are not data values of the program
+    # (`angle = x ./ period` read only by a definition `cos.(angle)`): host
+    # locals of `prepare_data`, so a name never resolves to a global function.
+    queue = collect(keys(found))
+    while !isempty(queue)
+        ex = found[pop!(queue)]
+        ex isa ReactiveKernels.JAXEmissionError && continue
+        for r in (ex isa Symbol ? (ex,) : _definition_reads(ex))
+            (r in available || haskey(found, r) || !haskey(exprs, r)) && continue
+            _is_bound_value_call(exprs[r]) && continue
+            found[r] = definition(r)
+            push!(queue, r)
         end
     end
     # Dependency order: a definition after the definitions it reads.
@@ -265,6 +280,60 @@ ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
         ::typeof(_ppl_values), args::Vector{ReactiveKernels._PyVal}) =
     ReactiveKernels._PyVal("np.array(" * only(args).code * ")", only(args).T,
                            only(args).static)
+
+# `_ppl_rows(x, n)`: a number filled over `n` rows, or a vector broadcast
+# against them, as Julia's `ones(n) .* x` (a vector of the rows' length is
+# itself; a mismatched one fails the broadcast while JAX traces).
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_rows), args::Vector{ReactiveKernels._PyVal})
+    x, n = args
+    np = ctx.host === nothing ? "jnp" : "np"
+    code = ReactiveKernels._jax_is_array(x.T) ?
+        np * ".ones(" * n.code * ") * " * ReactiveKernels._py_atom(x.code) :
+        np * ".full((" * n.code * ",), " * x.code * ", dtype=" * np * ".float64)"
+    ReactiveKernels._PyVal(code, Vector{Float64}, false, x.extent)
+end
+
+# A cell scan's step count (`_ppl_cell_scan_nsteps`): the steps after its `m`
+# seeds, none when the bound is below them. Its bound is an integer by type.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_scan_nsteps), args::Vector{ReactiveKernels._PyVal})
+    T, m = args
+    T.T isa Type && T.T <: Integer || ReactiveKernels._jax_error(
+        "a cell scan's upper bound of type `", T.T, "` has no JAX translation",
+        ReactiveKernels._jax_where(ctx))
+    steps = ReactiveKernels._py_infix("-", [T.code, m.code])
+    ReactiveKernels._PyVal((ctx.host === nothing ? "jnp.maximum(" : "max(") * steps * ", 0)",
+                           Int, T.static && m.static)
+end
+
+# A cell's position in the plate's domain (`_ppl_cell_scan_position`): in a
+# unit range, the index's offset from its first entry, plus one.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_scan_position), args::Vector{ReactiveKernels._PyVal})
+    r, i = args
+    r.T isa Type && r.T <: AbstractUnitRange || ReactiveKernels._jax_error(
+        "a cell position in a domain of type `", r.T, "` has no JAX translation",
+        ReactiveKernels._jax_where(ctx))
+    first_entry = ReactiveKernels._py_atom(r.code) * "[0]"
+    ReactiveKernels._PyVal(ReactiveKernels._py_infix("+",
+        [ReactiveKernels._py_infix("-", [i.code, first_entry]), "1"]), Int, false)
+end
+
+# The bound of a cell's observed `@scan`: the cell's series must hold one
+# entry per scan index, checked when the module runs (a `DimensionMismatch`
+# natively, a raising runtime check here); the bound itself is `hi`.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_observed_scan_cell_bound), args::Vector{ReactiveKernels._PyVal})
+    name, _, value, hi = args
+    value.T isa Type && value.T <: _Absent && return hi
+    n = ReactiveKernels._jax_call(ctx, length, [value])
+    same = ReactiveKernels._jax_call(ctx, ==, [n, hi])
+    message = ReactiveKernels._PyVal(repr("observed `@scan` array " * strip(name.code, ['"', '\'']) *
+        " has a different number of entries than the scan writes"), DimensionMismatch)
+    ReactiveKernels._jax_call(ctx, ReactiveKernels._runtime_check, [same, message])
+    hi
+end
 
 # The broadcast row count of bound columns: their first-axis lengths are
 # shapes, known while JAX traces, and compatible (one, or a common length).

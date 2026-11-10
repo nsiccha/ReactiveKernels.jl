@@ -642,12 +642,13 @@ function _host_generator_reduce(ctx::_JaxContext, f, gen::Expr, kwargs)
 end
 
 # `map(xs...) do args... body end`: the body as a function of one element of
-# each collection, called on each.
+# each collection, called on each. A `plate` over data (a binder's data-only
+# column, such as a per-group step count) is the same map on the host.
 function _host_do(ctx::_JaxContext, ex)
     call, lambda = ex.args
     call isa Expr && call.head === :call && lambda isa Expr && lambda.head === :-> ||
         _jax_error("the do-block `", ex, "` has no host translation", _jax_where(ctx))
-    _jax_resolve(ctx, call.args[1]) === map ||
+    _jax_resolve(ctx, call.args[1]) in (map, plate) ||
         _jax_error("a do-block on `", call.args[1], "` has no host translation", _jax_where(ctx))
     params = lambda.args[1]
     names = params isa Symbol ? Symbol[params] : Symbol[p for p in params.args]
@@ -1040,7 +1041,8 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
     param_names = String[]
     known = Dict{Symbol,_PyVal}()
     for (v, T) in zip(params, raw_types)
-        param = _jax_param_name(scope.used, v.name)
+        # The caller passes the data by these names: keep them exactly.
+        param = _jax_param_name(scope.used, v.name; stable = false)
         push!(param_names, param)
         known[v.name] = _PyVal(param, T, true)
         _jax_ragged(T) ? _jax_emit!(ctx, param * " = [np.asarray(a) for a in " * param * "]") :
@@ -1048,12 +1050,15 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
                                            _host_dtype(eltype(T)) * ")")
     end
     # The data definitions, in order, over the parameters and the definitions
-    # before them. A value takes the type the binding's own value has.
-    for (name, ex, T) in definitions
+    # before them. A data value takes the type the binding's own value has; a
+    # local of the definitions (`T0 === nothing`), the translation's.
+    for (name, ex, T0) in definitions
         ctx.locals = copy(known)
         first_line = length(scope.lines) + 1
+        T = T0
         local_name = try
             v = _jax_expr(ctx, ex)
+            T === nothing && (T = v.T)
             local_name = _jax_fresh(ctx, name)
             _jax_emit!(ctx, local_name * " = " * (_host_is_numeric_array(T) ?
                 "np.asarray(" * v.code * ", dtype=" * _host_dtype(eltype(T)) * ")" : v.code))
@@ -1115,5 +1120,5 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
     end
     append!(lines, scope.lines)
     push!(lines, "    return {" * join(entries, ", ") * "}")
-    lines, types
+    lines, types, param_names
 end

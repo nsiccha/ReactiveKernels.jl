@@ -88,8 +88,12 @@ inputs:
 - `UNTRANSLATED`, each data-only definition `prepare_data` takes as an input
   instead of computing it, with the reason: one without a host translation,
   or a derived definition whose binding guards missing observations. It is
-  `{}` when every definition is computed. A response with missing values
-  also passes its presence mask, `_rkppl_present_<name>`;
+  `{}` when every definition is computed. A model whose `UNTRANSLATED` is
+  not empty is **not supported for standalone preparation from raw data**:
+  supplying the Julia binder's values for those inputs runs it, but that is
+  not a standalone module, so a consumer's standalone check asserts
+  `UNTRANSLATED == {}`. A response with missing values also passes its
+  presence mask, `_rkppl_present_<name>`;
 - `PREPARED`, the same for each prepared input;
 - `INPUTS`, the functions' parameters in order.
 
@@ -157,7 +161,10 @@ array shape does.
 The translation follows the [core constraints](constraints.md):
 
 - **Plates** are `jax.vmap` of the cell, with shared operands unmapped.
-- **Scans** are `jax.lax.scan` of the step.
+- **Scans** are `jax.lax.scan` of the step. A scan whose range ends at a
+  group's length in a ragged plate cell (`for t in 2:length(y[g])`) runs to
+  the longest group's length: past a group's own length its carry keeps its
+  value and its outputs are padding, which reductions mask.
 - **Lazy branches** are `jax.lax.cond` of their arms. Under `vmap`, JAX
   evaluates both arms of a condition that differs between cells and selects.
   Each lane's untaken arm reads its inputs through `stop_gradient`, so a NaN

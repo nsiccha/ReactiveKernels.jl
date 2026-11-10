@@ -41,6 +41,19 @@ are recorded in the git history only.
   `m.dimension(prepared)` in place of `m.DIMENSION`.
 - The functions jit with the prepared data as arguments: a prepared integer
   that sets a shape is a `StaticInt` (ReactiveKernels 0.1.130).
+- `jax_source` translates per-group recurrences over series of different
+  lengths: an observed `@scan` in a `@plate` cell, a deterministic one over a
+  ragged input, and one with a draw per step (a random walk per group), and a
+  ragged `@plate` whose cell reads a per-group value. RKPPL's own helpers
+  have translations (`_ppl_rows`, `_observed_scan_cell_bound`,
+  `_ppl_cell_scan_position`, `_ppl_cell_scan_nsteps`); the cell's scan
+  bound check is a runtime check.
+- `prepare_data` computes chained data-only definitions (`angle = x ./ period`
+  read by `cos.(angle)`) and a submodel's (`v.mask`): a name was resolved as a
+  global function (`Base.angle`) or reported undefined. A layout whose block
+  ends in a submodel's scope (`b_g.z`, BRM's group effects) is read under its
+  `prepare_data` key; it raised `the layout reads ..., which prepare_data does
+  not return`.
 
 ## 0.1.133
 

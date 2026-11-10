@@ -28,6 +28,30 @@ function jax_raw_data(plan, src)
     Tuple(plan.columns[Symbol(n)] for n in names)
 end
 
+# A data helper with a loop and no recorded source: no host translation.
+function jax_ppl_opaque_cumsum(x::AbstractVector)
+    out = similar(x, Float64)
+    acc = 0.0
+    for i in eachindex(x)
+        acc += x[i]
+        out[i] = acc
+    end
+    return out
+end
+
+# Submodels whose names reach the layout and the data in their own scope
+# (`b.z`, `v.mask`).
+@rkppl jax_ppl_group_effects(K) = begin
+    tau ~ LogNormal(0, 1)
+    z[1:K] .~ Normal.(0, 1)
+    return z .* tau
+end
+@rkppl jax_ppl_masked_effect(x) = begin
+    mask = Float64.(x .> 0)
+    a ~ Normal(0, 1)
+    return a .* mask
+end
+
 const _JAX_RNG = Xoshiro(20261024)
 const _JAX_N = 30
 const _JAX_X = randn(_JAX_RNG, _JAX_N)
@@ -124,6 +148,73 @@ const _JAX_CASES = (
         p ~ truncated(Beta(2, 2), 0.1, 0.9)
         y .~ truncated.(LogNormal.(m .* p, s), 0.01, 100.0)
     end))(;) | (; y = clamp.(exp.(0.3 .* _JAX_X), 0.02, 50.0)),
+    # A submodel's group effects: its block ends at a data-derived position
+    # named in the submodel's scope.
+    grouped_submodel = () -> (@rkppl(begin
+        a ~ Normal(0, 2); s ~ Exponential(1.0)
+        b ~ jax_ppl_group_effects(K)
+        y .~ Normal.(a .+ b[g], s)
+    end))(; K = 4, g = _JAX_G) | (; y = _JAX_Y),
+    # A submodel's data-only definition (`v.mask`), computed by prepare_data.
+    submodel_data = () -> (@rkppl(begin
+        v ~ jax_ppl_masked_effect(x)
+        y .~ Normal.(v, 1)
+    end))(; x = _JAX_X) | (; y = _JAX_Y),
+    # Chained data-only definitions, one named like a Base function, and
+    # `sinpi`/`cospi` of a data period.
+    chained_definitions = () -> (@rkppl(begin
+        a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+        angle = 2 .* x ./ period
+        y .~ Normal.(a .* sinpi.(angle) .+ b .* cospi.(angle) .+ cos.(angle), s)
+    end))(; x = _JAX_X, period = 7.0) | (; y = _JAX_Y),
+    # A ragged plate whose cell reads a per-group scalar.
+    ragged_group_means = () -> (@rkppl(begin
+        mu0 ~ Normal(0, 2); tau ~ Exponential(1.0); s ~ Exponential(1.0)
+        m[1:G] .~ Normal(mu0, tau)
+        @plate for i in eachindex(y)
+            y[i] .~ Normal.(m[i], s)
+        end
+    end))(; G = 4) | (; y = _JAX_YR),
+    # Per-group recurrences over series of different lengths: an observed
+    # AR(1), a deterministic recurrence of a ragged input, and a random walk
+    # with one innovation per step (a one-entry group included).
+    group_ar1 = () -> (@rkppl(begin
+        phi_raw ~ Normal(0, 1); sigma ~ Exponential(1.0)
+        phi = tanh(phi_raw)
+        @plate for g in eachindex(y)
+            @scan begin
+                y[g][1] ~ Normal(mu[g][1], sigma / sqrt(1 - phi^2))
+                for t in 2:length(y[g])
+                    y[g][t] ~ Normal(mu[g][t] + phi * (y[g][t - 1] - mu[g][t - 1]), sigma)
+                end
+            end
+        end
+    end))(; mu = [0.1 .* collect(1.0:length(r)) for r in _JAX_R]) | (; y = _JAX_YR),
+    group_recurrence = () -> (@rkppl(begin
+        a ~ Normal(0, 1)
+        @plate for g in eachindex(y)
+            @scan begin
+                h[1] = x[g][1]
+                for t in 2:length(x[g])
+                    h[t] = a * h[t - 1] + x[g][t]
+                end
+            end
+            y[g] .~ Normal.(h[idx[g]], 1)
+        end
+    end))(; x = _JAX_R, idx = [[1, length(r)] for r in _JAX_R]) | (; y = [[0.2, 0.1] for _ in _JAX_R]),
+    group_random_walk = () -> (@rkppl(begin
+        s ~ Exponential(1)
+        @plate for g in eachindex(y)
+            @scan begin
+                h[1] = 0.0
+                for t in 2:length(y[g])
+                    e ~ Normal(0, 1)
+                    h[t] = h[t - 1] + s * e
+                end
+            end
+            y[g] .~ Normal.(h, 1)
+        end
+    end))() | (; y = [_JAX_YR[1], [0.3], _JAX_YR[3]]),
     ragged_recurrence = () -> (@rkppl(begin
         rho ~ LogNormal(log(0.7), 0.3); kappa ~ LogNormal(log(0.3), 1.0)
         b0 ~ Normal(0.1, 0.1); tau ~ Exponential(0.05); s ~ Exponential(0.05)
@@ -170,6 +261,9 @@ end
         src = jax_source(built, plan)
         query = prepare_query(built, plan, :sampler)
         u = 0.2 .* randn(Xoshiro(7), built.layout.total)
+        # Standalone: `prepare_data` computes every data definition from the
+        # raw data (a nonempty `UNTRANSLATED` is not standalone support).
+        @test occursin("UNTRANSLATED = {}", string(src))
         r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
                             grad = true, prepare = true)
         @test r.value ≈ query(u) rtol = 1e-10
@@ -217,6 +311,16 @@ end
     @test first.(src.functions[1].inputs) == ["a_loc", "a_scale", "period", "x", "y"]
     @test occursin("UNTRANSLATED = {}", string(src))
     @test occursin("np.cos(x / period)", string(src))
+    # A data definition without a host translation is not computed: it is an
+    # input, named in `UNTRANSLATED`, so the module is not standalone.
+    opaque = (@rkppl(begin
+        a ~ Normal(0, 1); s ~ Exponential(1.0)
+        w = jax_ppl_opaque_cumsum(x)
+        y .~ Normal.(a .+ w, s)
+    end))(; x = [0.1, 0.2, 0.3]) | (; y = [0.5, 0.4, 0.8])
+    osrc = jax_source(build_kernel(opaque), opaque)
+    @test "w" in first.(osrc.functions[1].inputs)
+    @test occursin(r"UNTRANSLATED = \{\"w\": \".+\"\}", string(osrc))
     other = bind(11, 0.5, 1.5, 4.0)
     @test string(jax_source(build_kernel(other), other)) == string(src)
     if !rk_jax_available()

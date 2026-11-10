@@ -29,6 +29,25 @@ are recorded in the git history only.
   ReactiveKernelsPPL 0.1.134 passes a binding's data-only definitions.
 - `jax_source(spec; data, keep)`: `prepare_data` also returns the data-only
   values `keep` names (the functions take them too).
+- A scan over a range whose end is data with a static bound (a group's
+  length in a ragged plate cell, `for t in 2:length(y[g])`) runs to that
+  bound. Past the group's length its carry keeps its value and its outputs
+  are padding, which its extent masks; `last` of a padded vector reads the
+  entry at its length, and `vcat` of values before a padded vector adds their
+  lengths to its extent. Such a cell's scan raised `ConcretizationTypeError`
+  in Python (a traced `jnp.arange` stop).
+- `sum(x; init)` and `prod(x; init)` translate; `sinpi` and `cospi` translate,
+  their argument reduced to `[-1, 1]` first.
+- Generated Python names drop the counters that differ between builds of one
+  program (a gensym's `#<n>`, a value id's long numeric suffix), so one
+  declaration emits one module text.
+- `JAXSource` has a third field, `prepared`: each value `prepare_data`
+  returns, by its program name, to its key (`JAXSource(text, functions)`
+  still constructs one). With `definitions`, a definition of a name that is no
+  data value is a host local of `prepare_data`, so the names a definition
+  reads resolve to the program's definitions before any global function; and
+  `DATA` and the `prepare_data` `JAXFunction` name its parameters as Python
+  spells them. On the host, `plate(xs...) do … end` over data is a map.
 - `prepare_data` returns each integer scalar it prepares as a `StaticInt`, an
   `int` that `jax.jit` treats as static, so the functions jit with the
   prepared data as arguments (`jax.jit(f)(u, **prepared)`). A block end or a
