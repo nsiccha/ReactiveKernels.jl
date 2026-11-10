@@ -112,9 +112,19 @@ mutable struct _JaxModule
     # recipe of one of them that neither side translates takes its value from
     # the definition instead (`_JaxPromote`).
     host_definitions::Set{Symbol}
+    # Why `prepare_data` leaves a plate cell's data-only recipe to the
+    # functions, by (plate recipe id, cell recipe id) (`_jax_cell_split`,
+    # jax_host.jl).
+    cell_reasons::Dict{Tuple{Int,Int},JAXEmissionError}
+    # The recipes being emitted, outermost first, each with its plan; and for
+    # an emission error, that chain where it was raised (`_jax_plan_recipe!`).
+    path::Vector{Tuple{Plan,Recipe}}
+    failure_paths::IdDict{Any,Vector{Tuple{Plan,Recipe}}}
 end
 _JaxModule() = _JaxModule(String[], Dict{Any,Any}(), Set{String}(), 0,
-                          Dict{Int,JAXEmissionError}(), nothing, Set{Symbol}())
+                          Dict{Int,JAXEmissionError}(), nothing, Set{Symbol}(),
+                          Dict{Tuple{Int,Int},JAXEmissionError}(), Tuple{Plan,Recipe}[],
+                          IdDict{Any,Vector{Tuple{Plan,Recipe}}}())
 
 # Translation state: the module, the current function scope, the current
 # recipe (for messages) and the module that resolves its source's globals.
@@ -3148,7 +3158,23 @@ function _jax_plan!(ctx::_JaxContext, p::Plan)
         _jax_plan_recipe!(ctx, p, recipe)
     end
 end
+# Each emitted recipe is on `ctx.mod.path` while it is emitted; an emission
+# error records the path where it was raised, innermost recipe last, so the
+# caller can tell a plate cell's recipe from its plate (`_jax_cell_failure`).
 function _jax_plan_recipe!(ctx::_JaxContext, p::Plan, recipe::Recipe)
+    path = ctx.mod.path
+    push!(path, (p, recipe))
+    try
+        _jax_plan_recipe_reasoned!(ctx, p, recipe)
+    catch e
+        e isa JAXEmissionError && !haskey(ctx.mod.failure_paths, e) &&
+            (ctx.mod.failure_paths[e] = copy(path))
+        rethrow()
+    finally
+        pop!(path)
+    end
+end
+function _jax_plan_recipe_reasoned!(ctx::_JaxContext, p::Plan, recipe::Recipe)
     ctx.host === nothing && p.graph === ctx.mod.host_graph &&
         haskey(ctx.mod.host_reasons, recipe.id) || return _jax_plan_recipe_body!(ctx, p, recipe)
     # A data-only recipe `prepare_data` left to the functions: when they cannot
@@ -3813,11 +3839,17 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
     # (`g = prep(labels)`, whose field `g.n` sizes a block).
     promoted = Set{Int}()
     defined = Set{Symbol}(first(d) for d in something(defs, ()))
+    # A plate cell's data-only recipes the functions cannot compute, by plate
+    # recipe id: `prepare_data` computes them for every cell
+    # (`_jax_cell_split`, jax_host.jl). Those without a host translation
+    # either, with the reason, by (plate, cell recipe).
+    cells = Dict{Int,Set{Int}}()
+    cell_reasons = Dict{Tuple{Int,Int},JAXEmissionError}()
     while true
         try
             return _jax_module_text(plans, types, constants, doc,
                                     (data, excluded, defs, untranslated, keep, reasons,
-                                     promoted);
+                                     promoted, cells, cell_reasons);
                                     function_docs)
         catch e
             if e isa _HostUnsupportedDefinition && !haskey(untranslated, e.name)
@@ -3832,6 +3864,19 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
                 isempty(more) && throw(ArgumentError(
                     "jax_source: `keep` names `$(e.name)`, which is no data-only value of the program"))
                 union!(promoted, more)
+            elseif e isa _CellHostNeeded
+                # Each cell recipe is split off once; one that fails again is
+                # the functions' error.
+                (e.recipe in get(cells, e.plate, ()) ||
+                 haskey(cell_reasons, (e.plate, e.recipe))) && throw(e.error)
+                push!(get!(Set{Int}, cells, e.plate), e.recipe)
+            elseif e isa _HostUnsupportedCell
+                pending = get(cells, e.plate, Set{Int}())
+                any(r -> r in pending, e.recipes) || throw(e.error)
+                for r in e.recipes
+                    delete!(pending, r)
+                    cell_reasons[(e.plate, r)] = e.error
+                end
             else
                 rethrow()
             end
@@ -3892,12 +3937,13 @@ function _jax_module_text(plans, types, constants, doc, prepare; function_docs =
             push!(functions, f)
         end
     else
-        data, excluded, defs, untranslated, keep, reasons, promoted = prepare
+        data, excluded, defs, untranslated, keep, reasons, promoted, cells, cell_reasons = prepare
         merge!(mod.host_reasons, reasons)
+        merge!(mod.cell_reasons, cell_reasons)
         mod.host_graph = first(plans).second[1].graph
         defs === nothing || union!(mod.host_definitions, (first(d) for d in defs))
         meta = _jax_prepared_functions!(mod, bodies, functions, plans, types, data, excluded,
-                                        defs, untranslated; keep, function_docs, promoted)
+                                        defs, untranslated; keep, function_docs, promoted, cells)
         constants = merge(constants, meta)
     end
     constant_lines = String[]
@@ -3953,7 +3999,8 @@ end
 function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, types, data,
                                   excluded, defs = nothing,
                                   untranslated = Dict{Symbol,JAXEmissionError}(); keep = (),
-                                  function_docs = NamedTuple(), promoted = Set{Int}())
+                                  function_docs = NamedTuple(), promoted = Set{Int}(),
+                                  cells = Dict{Int,Set{Int}}())
     ports = data isa NamedTuple ? Set(keys(data)) : Set(data)
     # A promoted recipe's values (`_JaxPromote`) are data inputs of every
     # function, which its definitions give: the recipe is not run.
@@ -3974,7 +4021,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
                  for (fname, (p, w)) in plans]
         ports = union(ports, (v.name for v in values))
     end
-    split = _jax_prepare_split(plans, ports, excluded; keep)
+    split = _jax_prepare_split(plans, ports, excluded; keep, cells)
     p1 = first(plans).second[1]
     # Raw data enters host code, so its types need not be concrete (a column
     # with missing values); the functions' inputs must be.
@@ -4035,12 +4082,23 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
         mod.helper_names[(:prepared_name, v.name)] = name
     end
     # The boundary values' types: those of one binding's values, when `data`
-    # gives them; else those the translation infers.
+    # gives them; else those the translation infers. Plate cells' values that
+    # only `prepare_data` computes (`_JaxCellPrefix`) take the translation's.
     native = nothing
     if data isa NamedTuple && !isempty(split.constants)
+        g = split.plan.graph
+        hosted = Set{ValueId}(canon_id(g, o.id) for r in split.prefix
+                              if r.op isa _JaxCellPrefix for o in r.outputs)
+        computed_natively = Value[v for v in split.constants if !(canon_id(g, v.id) in hosted)]
+        native_plan = isempty(hosted) ? split.plan :
+            _partial_subplan(split.plan, split.raw, computed_natively,
+                             Recipe[r for r in split.prefix if !(r.op isa _JaxCellPrefix)])
         native = try
-            values = _prepare_plan(split.plan)((data[v.name] for v in split.raw)...)
-            Any[typeof(x) for x in _partial_prefix_values(split.constants, values)]
+            values = isempty(computed_natively) ? () :
+                _prepare_plan(native_plan)((data[v.name] for v in split.raw)...)
+            found = Dict{ValueId,Any}(canon_id(g, v.id) => typeof(x) for (v, x) in
+                zip(computed_natively, _partial_prefix_values(computed_natively, values)))
+            Any[get(found, canon_id(g, v.id), nothing) for v in split.constants]
         catch
             nothing
         end
@@ -4058,9 +4116,17 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     all_types = Any[[have_types[v.name] for v in split.remaining]; prepared_types]
     all_names = [remaining_names; prepared_names]
     for (fname, (rp, w)) in split.residuals
-        lines, f = _jax_function!(mod, fname, rp, Tuple(all_types), w; names = all_names,
-                                  doc = get(function_docs, fname, nothing),
-                                  keyword_from = length(remaining_names))
+        lines, f = try
+            _jax_function!(mod, fname, rp, Tuple(all_types), w; names = all_names,
+                           doc = get(function_docs, fname, nothing),
+                           keyword_from = length(remaining_names))
+        catch e
+            e isa JAXEmissionError || rethrow()
+            # A plate cell's data-only recipe the functions cannot compute:
+            # `prepare_data` computes it for every cell instead.
+            failure = _jax_cell_failure(mod, split, rp, e)
+            failure === nothing ? rethrow() : throw(failure)
+        end
         push!(bodies, join(lines, "\n"))
         push!(functions, f)
     end
