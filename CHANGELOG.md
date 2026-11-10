@@ -16,6 +16,22 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.152
+
+- Reverse AD over a tuple of active ports (`active = (:a, :b)`) holds each
+  scalar field of a tuple or `NamedTuple` port as `Ref` storage, as it already
+  held a scalar port. `ad_accumulator_storage` therefore gives such a field a
+  `Ref`, and `ad_accumulate!` adds into it. Before, a `NamedTuple` port with a
+  `Float64` field beside an array got immutable storage for that field, which
+  an accumulating pass could neither reset nor add into (snag
+  `rkppl-zero-cell-a7c54028`). `ad_gradient` and `ad_value_and_gradient`
+  still return plain `Float64` fields.
+- A pullback of one WANT port whose value is a tuple or `NamedTuple`
+  (`ad_pullback`, `prepare_ad_pullback`) differentiates the seeded inner
+  product, as for an array port. With reverse `AutoEnzyme` it threw
+  `ArgumentError: broadcasting over dictionaries and NamedTuples is reserved`
+  from DifferentiationInterface's Enzyme pullback.
+
 ## 0.1.151
 
 - `jax_source(spec; data, definitions)` takes a data-only value of the
