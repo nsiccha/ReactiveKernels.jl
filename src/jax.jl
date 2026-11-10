@@ -302,9 +302,12 @@ function _py_infix(op::AbstractString, operands::AbstractVector{<:AbstractString
     end
     parts = map(enumerate(operands)) do (k, x)
         q = _py_precedence(x)
-        # Comparisons do not chain as Julia's binary calls mean them.
-        needs = q < p || (k > 1 && q == p && op in ("-", "/", "//", "%", "@")) ||
-                (p == 5 && q == 5)
+        # Python's binary operators associate left, so a later operand of the
+        # same level keeps its parentheses: `*`, `/` and `@` share one level
+        # (`a * (B @ w)` is not `(a * B) @ w`), and floating-point `+` and `*`
+        # are not associative either. Comparisons do not chain as Julia's
+        # binary calls mean them.
+        needs = q < p || (k > 1 && q == p) || (p == 5 && q == 5)
         needs ? "(" * x * ")" : x
     end
     join(parts, " " * op * " ")
@@ -848,7 +851,8 @@ end
 
 # Short-circuit operators: a static left side decides while tracing, so the
 # right side runs only when Julia's would (a guard `n == k || throw(...)`); a
-# traced left side combines both sides, whose right side must not throw.
+# traced left side combines both sides, and a throw on the right side is a
+# check masked by the left (`_jax_call_positional(ctx, throw, ...)`).
 _jax_expr(ctx::_JaxContext, ::Val{:&&}, ex) = _jax_short_circuit(ctx, ex, false)
 _jax_expr(ctx::_JaxContext, ::Val{:||}, ex) = _jax_short_circuit(ctx, ex, true)
 function _jax_short_circuit(ctx::_JaxContext, ex, is_or::Bool)
@@ -860,12 +864,18 @@ function _jax_short_circuit(ctx::_JaxContext, ex, is_or::Bool)
         return is_or ? _jax_conditional(ctx, a, decided, rest) :
                        _jax_conditional(ctx, a, rest, decided)
     end
+    # The right side runs where Julia's would, so a check in it (or a throw,
+    # which is one) is masked by that: `a` for `&&`, `!a` for `||`.
     ctx.traced_branches += 1
     b = try
-        _jax_expr(ctx, ex.args[2])
+        _jax_with_guard(() -> _jax_expr(ctx, ex.args[2]), ctx.scope,
+                        is_or ? "jnp.logical_not(" * a.code * ")" : a.code)
     finally
         ctx.traced_branches -= 1
     end
+    # A right side that throws (`scale >= 0 || throw(...)`) is its check, and
+    # the value is the left side's wherever the module does not raise.
+    b.T === Union{} && return a
     _PyVal((is_or ? "jnp.logical_or(" : "jnp.logical_and(") * a.code * ", " * b.code * ")", Bool)
 end
 
@@ -1288,13 +1298,17 @@ function _jax_if(ctx::_JaxContext, ex, value::Bool)
     before = Dict(n => ctx.locals[n] for n in carried)
     arm(body) = () -> begin
         v = translate(body)
-        parts = [v.T === Nothing || v.T === Union{} ? "None" : v.code]
+        # An arm that throws carries nothing out: the branch is the other arm.
+        v.T === Union{} && return v
+        parts = [v.T === Nothing ? "None" : v.code]
         for n in carried
             push!(parts, _jax_carry_value(ctx, ctx.locals[n]).code)
         end
         _PyVal("(" * join(parts, ", ") * ")", Tuple{_jax_typeof(v), (before[n].T for n in carried)...})
     end
-    result = _jax_bind!(ctx, :branch, _jax_conditional(ctx, condition, arm(ex.args[2]), arm(otherwise)))
+    branch = _jax_conditional(ctx, condition, arm(ex.args[2]), arm(otherwise))
+    branch.T === Union{} && return branch
+    result = _jax_bind!(ctx, :branch, branch)
     for (k, n) in enumerate(carried)
         b = before[n]
         ctx.locals[n] = _PyVal(_py_atom(result.code) * "[" * string(k) * "]", b.T, false, b.extent, b.limit)
@@ -1342,21 +1356,37 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
         return _jax_bind!(ctx, :value, _PyVal("(" * then_arm.code * "() if " * condition.code *
                                                " else " * else_arm.code * "())", T,
                                                then_arm.static && else_arm.static))
+    # An arm that throws (`scale >= 0 ? scale : throw(...)`) has no value: it
+    # is its check, masked by its condition, and the branch is the other arm.
+    # Where the check passes the other arm is the one Julia takes; where it
+    # fails the module raises, so nothing computed there is returned.
+    if then_arm.T === Union{} || else_arm.T === Union{}
+        throwing, valued = then_arm.T === Union{} ? (then_arm, else_arm) : (else_arm, then_arm)
+        _jax_emit!(ctx, throwing.code * "()")
+        valued.T === Union{} || return _jax_bind!(ctx, :value, _PyVal(valued.code * "()", T))
+        _jax_emit!(ctx, valued.code * "()")
+        return _PyVal("None", Union{}, true)
+    end
     branch = _PyVal("jax.lax.cond(" * condition.code * ", " * then_arm.code * ", " *
                     else_arm.code * ")", T)
     # An arm with a runtime check runs even when the branch value is unused.
     _JAX_EFFECTS[] == effects ? branch : _jax_bind!(ctx, :branch, branch)
 end
-# `throw` in a branch decided while tracing raises then; a data-dependent
-# throw has no counterpart inside a traced JAX function.
+# `throw` in a branch decided while tracing raises then. Under conditions that
+# depend on data it is `_runtime_check(false, e)` there: a check masked by
+# those conditions, which raises when the module runs on values that take the
+# throwing arm, as the native program throws on them.
 function _jax_call_positional(ctx::_JaxContext, ::typeof(throw), args::Vector{_PyVal})
-    ctx.traced_branches == 0 || _jax_error(
-        "a throw that depends on data has no JAX translation", _jax_where(ctx))
-    e = only(args)
-    message = e.T isa Type && e.T <: Exception && e.code != "None" ? e.code : repr(string(e.T))
-    _jax_emit!(ctx, "raise ValueError(" * message * ")")
+    message = _jax_exception_message(only(args))
+    if ctx.traced_branches == 0
+        _jax_emit!(ctx, "raise ValueError(" * message * ")")
+    else
+        _jax_masked_check(ctx, nothing, message)
+    end
     _PyVal("None", Union{}, true)
 end
+_jax_exception_message(e::_PyVal) =
+    e.T isa Type && e.T <: Exception && e.code != "None" ? e.code : repr(string(e.T))
 # A domain check (`_runtime_check(valid, error)`), retained at execution: a
 # check decided while tracing raises then; any other is a host callback that
 # raises when JAX runs it, which `jax.jit`, `vmap` and `grad` keep. Under a
@@ -1375,26 +1405,62 @@ def _rk_check(valid, message):
 """
 function _jax_call_positional(ctx::_JaxContext, ::typeof(_runtime_check), args::Vector{_PyVal})
     valid, e = args
-    message = e.T isa Type && e.T <: Exception && e.code != "None" ? e.code : repr(string(e.T))
+    message = _jax_exception_message(e)
     ctx.host === nothing || return _host_check(ctx, valid, message)
     if valid.static
         error_arm = () -> _jax_call(ctx, throw, [_PyVal(message, ErrorException)])
         _jax_conditional(ctx, valid, () -> _PyVal("None", Nothing), error_arm)
         return _PyVal("None", Nothing, true)
     end
+    _jax_masked_check(ctx, valid, message)
+    _PyVal("None", Nothing, true)
+end
+# A check of `valid` (`nothing`: a throw, which no value passes) where the
+# code runs: it holds where any data-dependent condition the code runs under
+# is false.
+function _jax_masked_check(ctx::_JaxContext, valid::Union{Nothing,_PyVal}, message::AbstractString)
     guards = String[]
     for (scope, guard) in _JAX_GUARDS
         _jax_scope_within(ctx.scope, scope) || _jax_error(
-            "a runtime check in a helper called under a condition that depends on data ",
+            valid === nothing ? "a throw" : "a runtime check",
+            " in a helper called under a condition that depends on data ",
             "has no JAX translation", _jax_where(ctx))
         push!(guards, guard)
     end
-    held = isempty(guards) ? valid.code : "jnp.logical_or(" * valid.code * ", jnp.logical_not(" *
-        foldl((a, b) -> "jnp.logical_and(" * a * ", " * b * ")", guards) * "))"
+    taken = isempty(guards) ? nothing :
+        foldl((a, b) -> "jnp.logical_and(" * a * ", " * b * ")", guards)
+    held = if valid === nothing
+        # Every traced condition records its guard, so a throw has one.
+        taken === nothing && _jax_error("a throw that depends on data has no JAX translation",
+                                        _jax_where(ctx))
+        _jax_not(taken)
+    else
+        taken === nothing ? valid.code : "jnp.logical_or(" * valid.code * ", " * _jax_not(taken) * ")"
+    end
     name = _jax_helper!(ctx, "_rk_check", _JAX_CHECK)
     _jax_emit!(ctx, name * "(" * held * ", " * message * ")")
     _JAX_EFFECTS[] += 1
-    _PyVal("None", Nothing, true)
+    nothing
+end
+# `jnp.logical_not` of `code`, cancelling a negation `code` already is (the
+# mask of an `else` arm, whose guard is the negated condition).
+function _jax_not(code::AbstractString)
+    prefix = "jnp.logical_not("
+    if startswith(code, prefix) && endswith(code, ")")
+        inner = code[nextind(code, lastindex(prefix)):prevind(code, lastindex(code))]
+        _jax_balanced(inner) && return inner
+    end
+    prefix * code * ")"
+end
+# Whether every parenthesis in `code` closes within it (so `code` is one
+# operand, not the tail of `a) and (b`).
+function _jax_balanced(code::AbstractString)
+    depth = 0
+    for c in code
+        depth += c == '(' ? 1 : c == ')' ? -1 : 0
+        depth < 0 && return false
+    end
+    depth == 0
 end
 
 # Runtime checks emitted so far: a branch whose arms emit one is kept.
@@ -1413,9 +1479,16 @@ function _jax_with_guard(f, scope::_JaxScope, guard::AbstractString)
 end
 _jax_scope_within(s::_JaxScope, ancestor::_JaxScope) =
     s === ancestor || (s.parent !== nothing && _jax_scope_within(s.parent, ancestor))
-# An exception value: its message, for `throw`.
-_jax_call_positional(ctx::_JaxContext, T::Type{<:Exception}, args::Vector{_PyVal}) =
-    _PyVal(isempty(args) ? "None" : args[1].code, T, true)
+# An exception value: its message, for `throw` and `_runtime_check`: the first
+# string argument (`DomainError(x, "message")` reads its second), else a first
+# argument known while tracing, else none, which names the type. A traced
+# value is never the message: a check's message is a constant of the module.
+function _jax_call_positional(ctx::_JaxContext, T::Type{<:Exception}, args::Vector{_PyVal})
+    i = findfirst(a -> a.T isa Type && a.T <: AbstractString, args)
+    message = i !== nothing ? args[i].code :
+        !isempty(args) && args[1].static ? args[1].code : "None"
+    _PyVal(message, T, true)
+end
 
 # String interpolation, as Python string concatenation.
 function _jax_expr(ctx::_JaxContext, ::Val{:string}, ex)
@@ -1628,7 +1701,10 @@ const _JAX_ELEMENTWISE = Dict{Any,String}(
     min => "jnp.minimum", max => "jnp.maximum",
     rem => "jnp.fmod", mod => "jnp.mod",
     ifelse => "jnp.where", (!) => "jnp.logical_not",
-    LogExpFunctions.logaddexp => "jnp.logaddexp",
+    # Both `logaddexp`s, RK's tie-exact one (mixture and log-sum-exp folds,
+    # the hidden-Markov forward pass) included: see `_rk_logaddexp` below.
+    LogExpFunctions.logaddexp => "_rk_logaddexp",
+    _tie_exact_logaddexp => "_rk_logaddexp",
     LogExpFunctions.logistic => "jax.nn.sigmoid",
     LogExpFunctions.logit => "jsp.logit",
     LogExpFunctions.log1pexp => "jax.nn.softplus",
@@ -1638,9 +1714,6 @@ const _JAX_ELEMENTWISE = Dict{Any,String}(
     _native_exp => "jnp.exp",
     sinpi => "_rk_sinpi", cospi => "_rk_cospi",
 )
-# RK's own tie-exact `logaddexp` (mixture and log-sum-exp folds): JAX's has
-# its values, non-finite inputs included, and the (1/2, 1/2) gradient at a tie.
-_jax_elementwise(::typeof(_tie_exact_logaddexp)) = "jnp.logaddexp"
 # LogExpFunctions functions that only some of its supported versions define.
 for (name, py) in ((:log1msq, "_rk_log1msq"), (:logcosh, "_rk_logcosh"),
                    (:log2mexp, "_rk_log2mexp"), (:cexpexp, "_rk_cexpexp"),
@@ -1650,12 +1723,49 @@ for (name, py) in ((:log1msq, "_rk_log1msq"), (:logcosh, "_rk_logcosh"),
         (_JAX_ELEMENTWISE[getglobal(LogExpFunctions, name)] = py)
 end
 # Two-argument `atan` is `arctan2`; the table keys one name per function, so
-# its arity selects the name.
-const _JAX_BINARY_NAMES = Dict{Any,String}(atan => "jnp.arctan2")
+# its arity selects the name. Two-argument `hypot` is `jnp.hypot` (Base's own
+# promotes mixed arguments through a tuple, which has no translation).
+const _JAX_BINARY_NAMES = Dict{Any,String}(atan => "jnp.arctan2", hypot => "jnp.hypot")
 
 # Small helpers the emitted module defines when it uses them: stable forms of
 # LogExpFunctions functions whose `jax.numpy` spelling is not one call.
 const _JAX_PRELUDE = Dict{String,String}(
+    # `_tie_exact_logaddexp` (src/codegen.jl) as JAX selections, so ordinary
+    # `jax.grad` gives its derivatives: (1/2, 1/2) at a finite tie, and at an
+    # infinite tie, whose value is `x`, (1, 0). `jnp.logaddexp` has the
+    # same values, but its derivative at a tie of two `-inf`s (a hidden-Markov
+    # state that no move reaches) is NaN, and reverse mode multiplies even a
+    # zero cotangent by it, so one such term made every gradient entry NaN
+    # (snag jax-grad-of-the-3dac142a). Both arms see finite operands at a
+    # tie, so the unselected one never makes a NaN.
+    "_rk_logaddexp" => """
+def _rk_logaddexp(x, y):
+    # log(exp(x) + exp(y)), as ReactiveKernels' tie-exact logaddexp.
+    tie = jnp.isinf(x) & (x == y)
+    first = x >= y
+    high = jnp.where(tie, 0.0, jnp.where(first, x, y))
+    low = jnp.where(tie, 0.0, jnp.where(first, y, x))
+    return jnp.where(tie, x, high + jnp.log1p(jnp.exp(low - high)))
+""",
+    # The value of `LogExpFunctions.logsumexp`, shifted by the maximum as
+    # ReactiveKernels' `_rk_logsumexp` (src/stable_rewrites.jl) is, and the
+    # maximum itself when that is not finite (-inf for no entries). That
+    # maximum is rebuilt from comparisons, so it has no derivative: every
+    # entry -inf (a hand-written forward pass over a state no move reaches)
+    # gives the derivative 0, as native Enzyme's of `logsumexp` is, where
+    # `jsp.logsumexp`'s is NaN. The shift is differentiated, so at finite
+    # entries its two terms cancel to the softmax. The unselected sum sees
+    # no infinite exponent, so it never makes a NaN.
+    "_rk_logsumexp" => """
+def _rk_logsumexp(x):
+    # log(sum(exp(x))), shifted by the maximum.
+    top = jnp.max(x, initial=-jnp.inf)
+    finite = jnp.isfinite(top)
+    shift = jnp.where(finite, top, 0.0)
+    total = jnp.sum(jnp.exp(jnp.where(finite, x - shift, -jnp.inf)))
+    edge = jnp.where(top > 0, jnp.inf, jnp.where(top < 0, -jnp.inf, jnp.nan))
+    return jnp.where(finite, shift + jnp.log(jnp.where(finite, total, 1.0)), edge)
+""",
     "_rk_log1mexp" => """
 def _rk_log1mexp(x):
     # log(1 - exp(x)) for x <= 0 (LogExpFunctions.log1mexp).
@@ -2026,9 +2136,14 @@ end
 function _jax_function_call(ctx::_JaxContext, ::typeof(LogExpFunctions.logsumexp), args::Vector{_PyVal})
     length(args) == 1 || _jax_error("this `logsumexp` call", _jax_where(ctx))
     x = args[1]
-    isempty(x.extent) || return _PyVal("jsp.logsumexp(jnp.where(" * _jax_mask(x) * ", " * x.code *
+    # A traced value takes the module's `_rk_logsumexp`: `jsp.logsumexp`'s
+    # derivative is NaN when every entry is -inf (see that helper). Host and
+    # static values, never differentiated, keep SciPy's.
+    name = !x.static && ctx.host === nothing ?
+        _jax_helper!(ctx, "_rk_logsumexp", _JAX_PRELUDE["_rk_logsumexp"]) : "jsp.logsumexp"
+    isempty(x.extent) || return _PyVal(name * "(jnp.where(" * _jax_mask(x) * ", " * x.code *
                                        ", -jnp.inf))", eltype(x.T))
-    _jax_result(LogExpFunctions.logsumexp, args, "jsp.logsumexp(" * x.code * ")")
+    _jax_result(LogExpFunctions.logsumexp, args, name * "(" * x.code * ")")
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(length), args::Vector{_PyVal})
     x = only(args)
@@ -2281,8 +2396,17 @@ function _jax_index_values(ctx::_JaxContext, x::_PyVal, indices::Vector{_PyVal})
     _PyVal(code, T, false, _jax_gather_extent(ctx, indices, kept))
 end
 
-# A range value, `a:b`: the array of its elements.
+# A range value, `a:b`: the array of its elements. JAX arrays have static
+# shapes, so an end that is data needs a static limit (a padded group's
+# length); otherwise the range is refused here rather than emitted as a
+# `jnp.arange` that JAX rejects when it traces the module.
 function _jax_call_positional(ctx::_JaxContext, ::Colon, args::Vector{_PyVal})
+    a, b = args[1], args[end]
+    limited = !isempty(b.limit) && (length(args) == 2 || args[2].code == "1")
+    _jax_known(ctx, a) && (_jax_known(ctx, b) || limited) ||
+        _jax_error("a range whose length depends on data has no JAX translation (its ",
+                   "stop needs a static limit, its start and step must be static)",
+                   _jax_where(ctx))
     if length(args) == 3
         a, step, b = args
         step.code == "1" && return _jax_call_positional(ctx, Colon(), [a, b])

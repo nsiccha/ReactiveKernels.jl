@@ -16,13 +16,78 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.147
+## 0.1.150
 
 - `jax_source`: a function broadcast over a padded vector of vectors
   (`Diagonal.(rows)` of a ragged plate's per-cell vectors) applies to each
   row, as Julia does, mapped over the rows with each row's length; it was
   vectorized over the numbers. `y[g] ~ MvNormal(m, Diagonal(fill(s^2, n)))`
   in a cell now translates.
+
+## 0.1.149
+
+- `jax_source`: a `throw` under a condition that depends on data translates
+  as a runtime check, masked by its conditions, instead of refusing the
+  module with "a throw that depends on data has no JAX translation". So the
+  `mean()` of ReactiveKernelsDistributionKernels' one-sided LogNormal moment
+  objects (`lower_truncated_lognormal`, `upper_truncated_lognormal`, and a
+  LogNormal's own mean as the lower one at a bound of 0), whose scale guard
+  is `scale >= 0 ? scale : throw(DomainError(...))`, now emits (snag
+  `jax-source-refus-05f10f2c`). The module raises on exactly the values the
+  native program throws on: a ternary or `if` whose other arm is the value is
+  the check followed by that arm (no `jax.lax.cond`), `x > 0 || throw(...)`
+  is a check of `x > 0`, and a throw in a vmapped cell holds for the lanes
+  that do not take its arm. The right side of a traced `&&`/`||` is now
+  masked by its left side, so a runtime check there no longer fails for
+  lanes that never run it. An exception's message is its first string
+  argument (`DomainError(x, "message")` used to raise with `x`); a throw or
+  check in a helper called under its caller's data-dependent condition is
+  still refused.
+- `jax_source`: two-argument `hypot` is `jnp.hypot`, also with mixed argument
+  types (`hypot(c + 2, 3)` used to be refused inside Base's `promote`).
+- `jax_source`: a range whose ends are data with no static limit (a scan over
+  `n:-1:2` with `n` computed from a parameter) is refused with a
+  `JAXEmissionError` naming the recipe. It used to emit a `jnp.arange` of a
+  traced value, a module that JAX rejected only when it traced it.
+- The LogNormal variances (`var()` of the moment objects above) are still
+  refused: a plate child spliced under a lazy arm (`_logmills_quadrature`)
+  reaches the module without its plan, and the continued fraction's length is
+  data.
+
+## 0.1.148
+
+- `jax_source`: `jax.grad` through a `logaddexp` whose two inputs are both
+  `-Inf` is finite, as natively. A hidden-Markov law
+  (`hmm_log_weights_logdensity` and its kin) whose transition weights have a
+  state that no move reaches at some step (a `-Inf` weight; a left-to-right
+  chain) had the right value and a gradient that was NaN in every entry
+  (snag `jax-grad-of-the-3dac142a`). Both `logaddexp`s, ReactiveKernels'
+  tie-exact one (mixture and log-sum-exp folds, the hidden-Markov forward
+  pass) and `LogExpFunctions.logaddexp`, were `jnp.logaddexp`, whose
+  derivative at a tie of two `-inf`s is NaN; reverse mode multiplies even
+  the zero cotangent of such an absorbed term by it. Both are now the
+  module's `_rk_logaddexp` helper, the tie-exact form written as JAX
+  selections: the same values, non-finite inputs included, the (1/2, 1/2)
+  derivative at a finite tie as before, and at an infinite tie, whose value
+  is its first argument, (1, 0), as both give natively.
+- `jax_source`: likewise `LogExpFunctions.logsumexp` of a traced vector whose
+  entries are all `-Inf` (a hand-written forward pass over such a state):
+  `jsp.logsumexp`'s derivative there is NaN. It is now the module's
+  `_rk_logsumexp` helper, the maximum-shifted log-sum-exp: the same values,
+  the softmax derivative at finite entries, and the maximum itself, with the
+  derivative 0, when that is not finite, as native Enzyme gives. Host and
+  static values, which are never differentiated, keep SciPy's `logsumexp`.
+
+## 0.1.147
+
+- `jax_source` keeps Julia's grouping when an operand after the first is an
+  expression of the operator's own Python precedence level. Python's `*`, `/`
+  and `@` share one level and associate left, so `a .* ((B ./ c) * w)` used
+  to emit `a * B / c @ w`, which is `((a * B) / c) @ w`: a broadcast error
+  (`operands could not be broadcast together`) when `B` is not square, a
+  wrong value when it is. It now emits `a * (B / c @ w)`. `a + (b - c)` and
+  `a * (b * c)` keep their parentheses too, since floating-point `+` and `*`
+  are not associative (snag `jax-source-drops-410c82c2`).
 
 ## 0.1.146
 

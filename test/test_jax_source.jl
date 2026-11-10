@@ -1,7 +1,7 @@
 using ReactiveKernels
 using Test
 using LinearAlgebra: dot
-using LogExpFunctions: log1mexp
+using LogExpFunctions: log1mexp, logaddexp, logsumexp
 using SpecialFunctions: besseli, besselix
 
 include(joinpath(@__DIR__, "jax_python.jl"))
@@ -237,6 +237,54 @@ end
     end
     m = jax_test_checked_sum(lp)
     return m
+end
+
+# A throw under a condition that depends on data is a runtime check masked by
+# that condition (snag jax-source-refus-05f10f2c, the scale guard of
+# ReactiveKernelsDistributionKernels' LogNormal moments): a ternary whose
+# other arm is the value, a `||` guard, an `if` arm beside one that assigns,
+# and a throw in a vmapped cell under two conditions, which must hold for the
+# lanes that take neither.
+@traceable function jax_test_checked_log(x::Real)
+    x > 0 || throw(DomainError(x, "x must be positive"))
+    return log(x)
+end
+@traceable function jax_test_checked_rate(x::Real, r::Real)
+    y = x
+    if r > 0
+        y = x * r
+    else
+        throw(ArgumentError("rate must be positive"))
+    end
+    return y
+end
+@kernel jax_throw_ternary(x::Vector{Float64}, s::Float64) = begin
+    checked = s >= 0 ? s : throw(DomainError(s, "scale must be nonnegative"))
+    total = sum(x) * checked + checked^2
+    return total
+end
+@kernel jax_throw_cells(x::Vector{Float64}, r::Float64, s::Float64) = begin
+    lp = plate(x) do xi
+        xi > 0 ? (xi < 100 ? log(xi) : throw(DomainError(xi, "xi is too large"))) : -xi
+    end
+    total = sum(lp) + jax_test_checked_log(r) + jax_test_checked_rate(r, s)
+    return total
+end
+
+# `hypot` of mixed argument types (Base promotes through a tuple), and a scan
+# whose sequence is a range of data length, which JAX cannot shape.
+@kernel jax_hypot_mixed(x::Float64) = begin
+    h = hypot(x + 2, 3)
+    return h
+end
+@kernel jax_data_range(z::Float64) = begin
+    n::Int = ceil(Int, 6 + 120 / z)
+    path = scan(n:-1:2, Ref(z); init = 1.0) do t, k, z
+        next = k / (z + t)
+        (next, next)
+    end
+    t = last(path)
+    return t
 end
 
 # A plain helper whose source is recorded for `jax_source` as written.
@@ -857,6 +905,35 @@ end
     total = jax_fold(checked, n)
     return total
 end
+# Log-sum-exp terms whose inputs are all -Inf (snag jax-grad-of-the-3dac142a:
+# a hidden-Markov state that no move reaches, log weight -Inf): such a term is
+# -Inf, the next one absorbs it, and the gradient stays finite, as natively.
+# A plate cell with both `logaddexp`s, and the fold above over a data length.
+@kernel jax_unreached_cells(x::Vector{Float64}, a::Float64, w::Vector{Float64}) = begin
+    cells = plate(eachindex(x)) do i
+        unreached = ReactiveKernels._tie_exact_logaddexp(a * x[i] + w[i], w[i])
+        also = logaddexp(a * x[i] + w[i], w[i])
+        ReactiveKernels._tie_exact_logaddexp(a * x[i], unreached) + logaddexp(-a, also)
+    end
+    total = sum(cells)
+    return total
+end
+@kernel jax_unreached_fold(x::Vector{Float64}, a::Float64, w::Vector{Float64}) = begin
+    terms = a .* x .+ w
+    total = logaddexp(-a, jax_fold(terms, length(terms)))
+    return total
+end
+# The same through `logsumexp`: of a plate it reads alone (native streams it)
+# and of a broadcast, -Inf when every entry is.
+@kernel jax_unreached_lse(x::Vector{Float64}, a::Float64, w::Vector{Float64}) = begin
+    cells = plate(eachindex(x)) do i
+        a * x[i] + w[i]
+    end
+    streamed = logsumexp(cells)
+    direct = logsumexp(a .* x .+ w)
+    total = logaddexp(a, streamed) + logaddexp(-a, direct)
+    return total
+end
 # Julia's unit indices: past a vector's rank (a literal and a computed one),
 # of a number, and `size` past the rank; `dropdims` of a summed axis.
 @kernel jax_unit_index(x::Vector{Float64}, a::Float64) = begin
@@ -988,6 +1065,12 @@ end
     # axis that no reduction masks (its JAX value used to sum the padding).
     @test_throws "beside another kept dimension" jax_source(jax_gather_matrix_rows;
         have = (:b, :M, :R), want = :total)
+    # refused: a scan over a range whose start is computed from a parameter
+    # has no static length; it used to emit a `jnp.arange` of a traced value,
+    # which JAX rejects when it traces the module.
+    @test prepare(jax_data_range; have = (:z,), want = :t)(3.0) isa Float64
+    @test_throws "a range whose length depends on data" jax_source(jax_data_range;
+        have = (:z,), want = :t)
 end
 
 # Plain helpers translated from their lowered code (`end`, a dimension another
@@ -1356,6 +1439,91 @@ end
     end
 end
 
+@testset "jax_source: log-sum-exp whose inputs are all -Inf" begin
+    x = [1.0, 2.0, 3.0, -0.5]
+    # Each `w` but the last has a cell, a fold step or a log-sum-exp whose
+    # inputs are all -Inf; the last has no -Inf at all.
+    ws = ([0.0, -Inf, 0.5, -Inf], [-Inf, -Inf, 0.0, -Inf], fill(-Inf, 4), [0.3, -0.2, 0.0, 0.1])
+    have = (:a, :x, :w)
+    kernels = (jax_unreached_cells, jax_unreached_fold, jax_unreached_lse)
+    for k in kernels
+        text = string(jax_source(k; have, want = :total))
+        # Both `logaddexp`s are the module's `_rk_logaddexp` and `logsumexp`
+        # its `_rk_logsumexp`, never `jnp.logaddexp` or `jsp.logsumexp`, whose
+        # derivatives there are NaN.
+        @test occursin("def _rk_logaddexp(", text) && !occursin("jnp.logaddexp", text)
+        @test !occursin("jsp.logsumexp", text)
+    end
+    @test occursin("def _rk_logsumexp(", string(jax_source(jax_unreached_lse; have, want = :total)))
+    if !rk_jax_available()
+        @test_skip false
+    else
+        for k in kernels, w in ws
+            src = jax_source(k; have, want = :total)
+            native = prepare(k; have, want = :total)
+            r = rk_jax_evaluate(src, "kernel", (0.7, x, w); grad = true)
+            @test isfinite(r.value)
+            @test r.value ≈ native(0.7, x, w) rtol = 1e-12
+            @test isfinite(r.grad)
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x, w), [0.7])) rtol = 1e-6 atol = 1e-9
+        end
+        # `_rk_logsumexp`: the values of LogExpFunctions' `logsumexp`, no
+        # entries and non-finite ones included; the softmax at finite entries;
+        # when every entry is -Inf, the derivative 0, as native Enzyme's.
+        for v in ([0.3, -1.2, 2.0], [0.5, 0.5], [0.0, -Inf], fill(-Inf, 3), Float64[],
+                  [Inf, 0.0], [NaN, 0.0])
+            program = """
+                import jax, numpy as np
+                jax.config.update("jax_enable_x64", True)
+                import jax.numpy as jnp
+                $(ReactiveKernels._JAX_PRELUDE["_rk_logsumexp"])
+                v = np.asarray($(_rk_py(v)), dtype=np.float64)
+                g = jax.grad(_rk_logsumexp)(v)
+                print(repr(float(_rk_logsumexp(v))), *(repr(float(d)) for d in g))
+                """
+            out = parse.(Float64, split(read(`$RK_JAX_PYTHON -c $program`, String)))
+            value, g = out[1], out[2:end]
+            expected = logsumexp(v)
+            @test isfinite(expected) ? isapprox(value, expected; rtol = 1e-15) :
+                  isequal(value, expected)
+            if all(isfinite, v)
+                @test g ≈ exp.(v .- expected) rtol = 1e-14
+            elseif !isempty(v) && all(==(-Inf), v)
+                @test all(iszero, g)
+            end
+        end
+        # `_rk_logaddexp`: the values of both `logaddexp`s, non-finite inputs
+        # and ties included, and the derivatives of `_tie_exact_logaddexp`:
+        # (1/2, 1/2) at a finite tie, (1, 0) at an infinite one.
+        same(g, d) = isnan(d) ? isnan(g) : g == d
+        for (u, v, du, dv) in ((0.3, 0.3, 0.5, 0.5), (-Inf, -Inf, 1.0, 0.0), (Inf, Inf, 1.0, 0.0),
+                               (1.0, -Inf, 1.0, 0.0), (-Inf, 1.0, 0.0, 1.0), (Inf, -Inf, 1.0, 0.0),
+                               (2.0, -1.0, 0.0, 0.0), (NaN, 1.0, NaN, NaN))
+            program = """
+                import jax, numpy as np
+                jax.config.update("jax_enable_x64", True)
+                import jax.numpy as jnp
+                $(ReactiveKernels._JAX_PRELUDE["_rk_logaddexp"])
+                u, v = np.float64($(_rk_py(u))), np.float64($(_rk_py(v)))
+                g = jax.grad(_rk_logaddexp, argnums=(0, 1))(u, v)
+                print(repr(float(_rk_logaddexp(u, v))), repr(float(g[0])), repr(float(g[1])))
+                """
+            value, gu, gv = parse.(Float64, split(read(`$RK_JAX_PYTHON -c $program`, String)))
+            for expected in (logaddexp(u, v), ReactiveKernels._tie_exact_logaddexp(u, v))
+                @test isfinite(expected) ? isapprox(value, expected; rtol = 1e-15) :
+                      isequal(value, expected)
+            end
+            if isfinite(u) && isfinite(v) && u != v
+                # A finite non-tie: the derivatives of log(exp(u) + exp(v)).
+                @test gu ≈ exp(u - value) rtol = 1e-14
+                @test gv ≈ exp(v - value) rtol = 1e-14
+            else
+                @test same(gu, du) && same(gv, dv)
+            end
+        end
+    end
+end
+
 @testset "jax_source: reductions of gathers through ragged rows" begin
     # The gathered entries carry the row's lengths: the emitted cell masks.
     direct = string(jax_source(jax_gather_rows; have = (:x, :R, :a), want = :total))
@@ -1497,5 +1665,81 @@ end
         r = rk_jax_evaluate(src, "kernel", (0.7, lambda); grad = true)
         @test r.value ≈ native(0.7, lambda) rtol = 1e-12
         @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), lambda), [0.7])) rtol = 1e-6
+    end
+end
+
+# Python's `*`, `/` and `@` share one precedence level and associate left, and
+# floating-point `+` is not associative: an operand after the first keeps its
+# parentheses when it is an expression of the operator's own level (snag
+# jax-source-drops-410c82c2). With `B` 3×2, `a * B / (1 + s * B) @ w` fails to
+# broadcast `a` against `B`; with `y == z` large, `s + y - z` is 0, not `s`.
+@kernel jax_grouped(s::Float64, a::Vector{Float64}, B::Matrix{Float64}, w::Vector{Float64},
+                    y::Vector{Float64}, z::Vector{Float64}) = begin
+    v = a .* ((B ./ (1 .+ s .* B)) * w)
+    c = s .+ (y .- z)
+    lp = sum(v) + sum(c)
+    return lp
+end
+
+@testset "jax_source: same-level operands keep their grouping" begin
+    src = string(jax_source(jax_grouped; have = (:s, :a, :B, :w, :y, :z), want = :lp))
+    @test occursin("a * (B / (1 + s * B) @ w)", src)
+    @test occursin("s + (y - z)", src)
+    if !rk_jax_available()
+        @test_skip false
+    else
+        a, B, w = [1.0, 2.0, 3.0], [1.0 4.0; 2.0 5.0; 3.0 6.0], [0.5, 0.25]
+        y = z = fill(1e20, 3)
+        native = prepare(jax_grouped; have = (:s, :a, :B, :w, :y, :z), want = :lp)
+        r = rk_jax_evaluate(jax_source(jax_grouped; have = (:s, :a, :B, :w, :y, :z), want = :lp),
+                            "kernel", (0.7, a, B, w, y, z); grad = true)
+        @test r.value ≈ native(0.7, a, B, w, y, z) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), a, B, w, y, z), [0.7])) rtol = 1e-6
+    end
+end
+
+# A throw under a data-dependent condition is a runtime check masked by that
+# condition, so it raises exactly where the native kernel throws (snag
+# jax-source-refus-05f10f2c). A ternary whose other arm is the value emits no
+# `lax.cond`: the check, then that arm.
+@testset "jax_source: a throw that depends on data is a masked runtime check" begin
+    ternary = string(jax_source(jax_throw_ternary; have = (:x, :s), want = :total))
+    @test occursin("_rk_check(s >= 0, \"scale must be nonnegative\")", ternary)
+    @test !occursin("jax.lax.cond(", ternary)
+    cells = string(jax_source(jax_throw_cells; have = (:x, :r, :s), want = :total))
+    # The cell's check holds for lanes that take either outer arm.
+    @test occursin("_rk_check(jnp.logical_not(jnp.logical_and(", cells)
+    @test occursin("\"xi is too large\"", cells)
+    @test occursin("\"x must be positive\"", cells) && occursin("\"rate must be positive\"", cells)
+    @test occursin("jnp.hypot(", string(jax_source(jax_hypot_mixed; have = (:x,), want = :h)))
+    if !rk_jax_available()
+        @test_skip false
+    else
+        x = [0.5, -1.0, 3.0, -200.0]
+        for (kernel, have, args) in ((jax_throw_ternary, (:x, :s), (x, 0.7)),
+                                     (jax_throw_ternary, (:x, :s), (x, 0.0)),
+                                     (jax_throw_cells, (:x, :r, :s), (x, 0.7, 1.3)))
+            native = prepare(kernel; have, want = :total)
+            r = rk_jax_evaluate(jax_source(kernel; have, want = :total), "kernel", args; grad = true)
+            @test r.value ≈ native(args...) rtol = 1e-12
+            @test r.grad ≈ rk_fd_gradient(u -> native(u, args[2:end]...), args[1]) rtol = 1e-6
+        end
+        native = prepare(jax_hypot_mixed; have = (:x,), want = :h)
+        r = rk_jax_evaluate(jax_source(jax_hypot_mixed; have = (:x,), want = :h), "kernel", (0.7,);
+                            grad = true)
+        @test r.value ≈ native(0.7) rtol = 1e-14
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u)), [0.7])) rtol = 1e-6
+        # Each check raises with its message where the native kernel throws.
+        src = jax_source(jax_throw_ternary; have = (:x, :s), want = :total)
+        @test_throws DomainError prepare(jax_throw_ternary; have = (:x, :s), want = :total)(x, -0.5)
+        @test_throws "scale must be nonnegative" rk_jax_evaluate(src, "kernel", (x, -0.5))
+        src = jax_source(jax_throw_cells; have = (:x, :r, :s), want = :total)
+        native = prepare(jax_throw_cells; have = (:x, :r, :s), want = :total)
+        for (args, message, E) in (((vcat(x, 250.0), 0.7, 1.3), "xi is too large", DomainError),
+                                   ((x, -0.7, 1.3), "x must be positive", DomainError),
+                                   ((x, 0.7, -1.3), "rate must be positive", ArgumentError))
+            @test_throws E native(args...)
+            @test_throws message rk_jax_evaluate(src, "kernel", args)
+        end
     end
 end
