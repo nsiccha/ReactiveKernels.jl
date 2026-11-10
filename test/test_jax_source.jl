@@ -518,6 +518,21 @@ end
     return total
 end
 
+# A scan step output with vector fields (a K-state filter's `(lpd, w, m)`,
+# ODLProject:ap3): each vector field stacks as the (steps, K) array of rows.
+@kernel jax_scan_vector_fields(ys::Vector{Float64}, w0::Vector{Float64}, a::Float64) = begin
+    K = length(w0)
+    steps = scan(ys; init = (m = a .* w0, w = w0)) do st, y
+        nm = [0.5 * st.m[k] + a * y * k for k in 1:K]
+        raw = [st.w[k] * exp(-0.5 * (y - nm[k])^2) for k in 1:K]
+        lp = log(sum(raw))
+        nw = [raw[k] / sum(raw) for k in 1:K]
+        ((m = nm, w = nw), (lpd = lp, w = nw, m = nm))
+    end
+    total = sum(s.lpd for s in steps) + sum(steps[end].w .* steps[end].m)
+    return total
+end
+
 # Recorded `@inline` helpers (`@_record_source`): a shape test with `in` and
 # `&&`, decided while tracing, and a fold over a data length, run as a loop.
 ReactiveKernels.@_record_source @inline jax_fits(x, n) = ndims(x) <= 2 && size(x, 1) in (1, n)
@@ -838,12 +853,16 @@ end
              (jax_history_leading, (:a, :xs), (0.7, xs)), (jax_history_indexed, (:a, :xs), (0.7, xs)),
              (jax_tie_div, (:a, :x, :k), (0.7, xs, 2)),
              (jax_scan_merge, (:a, :xs, :u0), (0.5, xs, 1.0)), (jax_dims, (:a, :M), (0.5, M)),
-             (jax_shape_fold, (:a, :x), (0.7, xs)), (jax_unit_index, (:a, :x), (0.7, xs)))
+             (jax_shape_fold, (:a, :x), (0.7, xs)), (jax_unit_index, (:a, :x), (0.7, xs)),
+             (jax_scan_vector_fields, (:a, :ys, :w0), (0.7, xs, [0.2, 0.3, 0.5])))
     srcs = [jax_source(k; have, want = :total) for (k, have, _) in cases]
     @test !occursin(".shape[0] - 1][", string(srcs[2]))
-    fold = string(srcs[end - 1])
+    fold = string(srcs[end - 2])
     @test occursin(" in (1, ", fold) && occursin("jax.lax.fori_loop(", fold)
-    @test occursin("jnp.squeeze(", string(srcs[end]))
+    @test occursin("jnp.squeeze(", string(srcs[end - 1]))
+    # The whole output, its vector fields stacked.
+    @test occursin("jax.lax.scan(", string(jax_source(jax_scan_vector_fields;
+                                                      have = (:a, :ys, :w0), want = :steps)))
     stacked = jax_source(jax_prep_stack; have = (:a, :x), want = :total, data = (; x = xs))
     @test occursin("np.stack(", string(stacked))
     if !rk_jax_available()

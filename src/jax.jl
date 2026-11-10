@@ -680,9 +680,11 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
             _jax_error("indexing a vector of tuples with several indices", _jax_where(ctx))
         E = eltype(x.T)
         parts = [_jax_index(ctx, _jax_column(x, k), indices) for k in 1:fieldcount(E)]
-        scalar = all(v -> _jax_is_scalar(v.T), parts)
-        return _PyVal(_jax_tuple_code(parts), scalar ? E : Vector{E}, false,
-                      scalar ? "" : parts[1].extent)
+        # An element reads each field's value; a slice, each field's column.
+        element = all(k -> parts[k].T == fieldtype(E, k), 1:fieldcount(E))
+        number = findfirst(k -> fieldtype(E, k) <: Number, 1:fieldcount(E))
+        return _PyVal(_jax_tuple_code(parts), element ? E : Vector{E}, false,
+                      element || number === nothing ? "" : parts[number].extent)
     end
     N = ndims(x.T)
     # Linear indexing reads the array in Julia's column-major order.
@@ -2961,13 +2963,23 @@ end
 
 _jax_numeric_namedtuple(@nospecialize(T)) = T isa Type && T <: NamedTuple && isconcretetype(T) &&
     fieldcount(T) > 0 && all(F -> F <: Number, fieldtypes(T))
-# A vector of named numbers or of numeric tuples is held as the tuple of its
-# columns, as `jax.lax.scan` stacks a step's outputs.
+# Named numbers and numeric vectors (a scan step's output `(lpd, w)` with
+# `w::Vector`), stacked field by field.
+_jax_stacked_namedtuple(@nospecialize(T)) = T isa Type && T <: NamedTuple &&
+    isconcretetype(T) && fieldcount(T) > 0 &&
+    all(F -> F <: Number || F <: AbstractVector{<:Number} && isconcretetype(F), fieldtypes(T))
+# A vector of named numbers (or numeric vectors) or of numeric tuples is held
+# as the tuple of its columns, as `jax.lax.scan` stacks a step's outputs; a
+# vector field's column is the dense array of its rows, one per element.
 _jax_columns(@nospecialize(T)) = T isa Type && T <: AbstractVector &&
-    (_jax_numeric_namedtuple(eltype(T)) || _jax_numeric_tuple(eltype(T)))
-_jax_column(x::_PyVal, k::Integer) =
-    _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", Vector{fieldtype(eltype(x.T), k)},
-           x.static, x.extent)
+    (_jax_stacked_namedtuple(eltype(T)) || _jax_numeric_tuple(eltype(T)))
+function _jax_column(x::_PyVal, k::Integer)
+    F = fieldtype(eltype(x.T), k)
+    code = _py_atom(x.code) * "[" * string(k - 1) * "]"
+    # A vector field's rows all have the stacked width.
+    _PyVal(code, Vector{F}, x.static, F <: Number ? x.extent :
+           "jnp.full((" * code * ".shape[0],), " * code * ".shape[1])")
+end
 _jax_numeric_tuple(@nospecialize(T)) = T isa Type && T <: Tuple && fieldcount(T) > 0 &&
     isconcretetype(eltype(T)) && eltype(T) <: Number
 _jax_unref(@nospecialize(T)) = T isa Type && T <: Base.RefValue ? eltype(T) : T
@@ -3056,6 +3068,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     # named tuples is the tuple of its columns, as `jax.lax.scan` returns it,
     # and a plate over it maps every column.
     E <: Number || (_jax_numeric_namedtuple(E) || _jax_numeric_tuple(E)) && !I ||
+        _jax_stacked_namedtuple(E) && !I && isempty(extent) ||
         _jax_error("a scan whose step outputs `", E, "` has no JAX translation yet",
                    _jax_where(ctx))
     # Padded outputs carry the extent; a vector of named numbers is the tuple
