@@ -8,7 +8,8 @@ using DifferentiationInterface: AutoEnzyme
 # `Any`: an observation plate reading `var` failed static Reverse with
 # `EnzymeRuntimeActivityError`, and a plate cell computing it gave a
 # `Vector{Any}` cell buffer (snags `native-lognormal-a666a8e1`,
-# `native-truncated-9d7d9eda`; ReactiveKernels 0.1.149).
+# `native-truncated-9d7d9eda`). The prepared-call methods' recursion relation
+# (ReactiveKernels `src/codegen.jl`) keeps the call concrete.
 module LogNormalStatisticsReverse
 using ReactiveKernels, ReactiveKernelsPPL, SpecialFunctions
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
