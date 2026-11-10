@@ -66,6 +66,14 @@ end
     a ~ Normal(0, 1)
     return a .* mask
 end
+# BRM's monotonic-effects block (`mo()`, its RK emission): one increment
+# simplex per predictor as the columns of `simplex_incr`, and their cumulative
+# table (snag `jax-source-simpl-249ccdc6`).
+@rkppl jax_ppl_monotonic(alpha, nincr, ntargets) = begin
+    eachcol(simplex_incr[1:nincr, 1:ntargets]) .~ Dirichlet(alpha)
+    beta[1:ntargets] .~ Normal.(0, 1)
+    return cumsum(vcat(zeros(1, ntargets), simplex_incr); dims = 1) .* beta'
+end
 
 const _JAX_RNG = Xoshiro(20261024)
 const _JAX_N = 30
@@ -86,6 +94,15 @@ const _JAX_LIMIT = [isodd(i) ? -Inf : 1.0 for i in 1:_JAX_N]
 const _JAX_LOWER = [i % 3 == 0 ? -Inf : -6.0 for i in 1:_JAX_N]
 const _JAX_UPPER = [i % 4 == 0 ? Inf : 9.0 for i in 1:_JAX_N]
 const _JAX_INTERVAL = [isodd(i) ? Inf : y + 0.5 for (i, y) in enumerate(_JAX_Y)]
+
+# Two monotonic predictors of a factor with `levels` levels; two levels give
+# one increment, a one-entry simplex with no coordinates.
+jax_monotonic_plan(levels) = (@rkppl(begin
+    a ~ Normal(0, 2); s ~ Exponential(1.0)
+    mo ~ jax_ppl_monotonic(alpha, nincr, 2)
+    y .~ Normal.(a .+ mo[g, 1] .+ mo[g, 2] .* x, s)
+end))(; g = mod1.(_JAX_G, levels), x = _JAX_X, alpha = ones(levels - 1),
+       nincr = levels - 1) | (; y = _JAX_Y)
 
 const _JAX_CASES = (
     gaussian = () -> (@rkppl(begin
@@ -162,6 +179,22 @@ const _JAX_CASES = (
         s ~ Exponential(1)
         y .~ Normal.(B[1, g] .+ B[2, g] .* x, s)
     end))(; x = _JAX_X, g = _JAX_G) | (; y = _JAX_Y),
+    # Simplex slices (stick-breaking per column or row, a data concentration)
+    # and ordered slices: RKPPL's slice transforms and their log-Jacobians.
+    simplex_slices = () -> (@rkppl(begin
+        eachcol(S[1:3, 1:4]) .~ Dirichlet(alpha)
+        eachrow(P[1:4, 1:3]) .~ Dirichlet(ones(3))
+        b ~ Normal(0, 1); s ~ Exponential(1.0)
+        y .~ Normal.(b .* (S[1, g] .- P[g, 2]), s)
+    end))(; g = _JAX_G, alpha = [1.0, 2.0, 1.5]) | (; y = _JAX_Y),
+    ordered_slices = () -> (@rkppl(begin
+        eachcol(C[1:3, 1:4]) .~ Ordered(Normal(0, 2), 3)
+        eachrow(D[1:4, 1:2]) .~ Ordered(Normal(0, 2), 2)
+        s ~ Exponential(1.0)
+        y .~ Normal.(C[1, g] .+ C[3, g] .+ D[g, 2], s)
+    end))(; g = _JAX_G) | (; y = _JAX_Y),
+    monotonic = () -> jax_monotonic_plan(4),
+    monotonic_two_levels = () -> jax_monotonic_plan(2),
     # Evidence wrappers read the family's CDFs, whose lazy arms call a
     # prepared endpoint (`standardized`): a detection limit, interval
     # readings, a truncated response and truncated priors.
@@ -423,6 +456,30 @@ end
         @test r.value["a"] ≈ 0.9
         @test r.value["s"] ≈ 0.4
         @test r.value["mu"] ≈ 0.9 .+ 1.8 .* _JAX_X
+    end
+end
+
+# Slice-transformed matrices constrain as native `constrain` does: each
+# column or row a simplex or an ordered vector, a one-entry simplex the
+# constant 1 (snag `jax-source-simpl-249ccdc6`).
+@testset "jax_source(built, plan): slice transforms constrain as native" begin
+    if !rk_jax_available()
+        @test_skip false
+    else
+        rows(v) = permutedims(reduce(hcat, v))     # the module's nested rows
+        for (name, read) in ((:simplex_slices, x -> (x.S, x.P)), (:ordered_slices, x -> (x.C, x.D)),
+                             (:monotonic, x -> (x.mo.simplex_incr,)),
+                             (:monotonic_two_levels, x -> (x.mo.simplex_incr,)))
+            plan = _JAX_CASES[name]()
+            built = build_kernel(plan)
+            src = jax_source(built, plan)
+            u = 0.3 .* randn(Xoshiro(11), built.layout.total)
+            r = rk_jax_evaluate(src, "constrain", (u, jax_raw_data(plan, src)...); prepare = true).value
+            native = read(ReactiveKernelsPPL.constrain(built.layout, u))
+            jax = name in (:monotonic, :monotonic_two_levels) ? (rows(r["mo"]["simplex_incr"]),) :
+                Tuple(rows(r[k]) for k in (name === :simplex_slices ? ("S", "P") : ("C", "D")))
+            @test all(map((a, b) -> size(a) == size(b) && a ≈ b, jax, native))
+        end
     end
 end
 

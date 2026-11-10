@@ -243,7 +243,8 @@ A function that a recipe calls is translated if:
   (and `besseli`) of an order other than a literal 0 or 1, which JAX has no
   function for: the power series below order 25 and x = 30, else the uniform
   expansion in large order and the downward recurrence, within about 4e-13
-  of SciPy relative; `prepare_data` uses SciPy's `ive`;
+  of SciPy relative; `prepare_data` uses SciPy's `ive`. `cumsum(x; dims = d)`
+  is `jnp.cumsum` along the static axis `d`;
 - it is a conversion that takes a type: `convert(T, x)` or `T(x)` to a float
   or integer type, `floor(Int, x)`, `ones(T, n)`. The type may come from a
   literal, a global or `where T` parameter in lowered code, or a type-level
@@ -255,7 +256,10 @@ A function that a recipe calls is translated if:
 - it is a prepared kernel, which becomes a module-level function of its plan;
 - or it is a plain function whose lowered code is straight-line. A keyword
   call in it (`sum(x; dims = 2)`) translates as the same call in source does;
-  one with no translation raises naming the function.
+  one with no translation raises naming the function. An index's
+  `end` (`lastindex`) and a dimension another helper returns
+  (`size(U, axis(o))`) are static shapes, as in source, and a dotted literal
+  power (`x .^ 2`) is elementwise.
 
 In that lowered code, module-qualified calls (`M.f(x)`), `getglobal(M, name)`
 of a module and name known while emitting, `Val` tags (`Val(:f)`,

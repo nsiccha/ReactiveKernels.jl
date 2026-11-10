@@ -16,6 +16,21 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.145
+
+- `jax_source` translates simplex and ordered slice priors,
+  `eachcol(S[1:K, 1:G]) .~ Dirichlet(alpha)`, `eachrow(...)`, and
+  `... .~ Ordered(Normal(m, s), K)`, including the one-entry simplex (K = 1,
+  no coordinates). BRM's monotonic effects (`mo()`) declare their increment
+  simplices this way. Before, emission raised `JAXEmissionError` ("the
+  function `_simplex_slices_constrain` has loops or branches"; for ordered
+  slices, "a type applied to a computed parameter"). The slice transforms
+  `_simplex_slices_constrain`, `_simplex_slices_logjac`,
+  `_simplex_slices_breaks` and `_ordered_slices_constrain` are now
+  `@traceable`; native values and derivatives are unchanged. Requires
+  ReactiveKernels 0.1.143 (`cumsum(x; dims)`, `end` and static dimensions in
+  plain helpers). Snag `jax-source-simpl-249ccdc6`.
+
 ## 0.1.144
 
 - Independent ICAR fields over one graph: `eachrow(phi[1:K, 1:N]) .~

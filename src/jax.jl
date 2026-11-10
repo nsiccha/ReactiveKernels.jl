@@ -1528,6 +1528,20 @@ function _jax_call(ctx::_JaxContext, ::typeof(dropdims), args::Vector{_PyVal}, k
            Array{eltype(x.T),ndims(x.T) - 1}, x.static)
 end
 
+# `cumsum(x; dims = d)`: the running sum along axis `d`, a static integer, as
+# the axis reductions above take it.
+function _jax_call(ctx::_JaxContext, ::typeof(cumsum), args::Vector{_PyVal}, kw)
+    isempty(kw) && return _jax_call_positional(ctx, cumsum, args)
+    first.(kw) == [:dims] || _jax_error("keyword arguments ", join(first.(kw), ", "),
+        " to `cumsum` have no JAX translation", _jax_where(ctx))
+    x, d = only(args), last(only(kw))
+    _jax_is_array(x.T) && isempty(x.extent) && !_jax_ragged(x.T) && _jax_known(ctx, d) &&
+        d.T isa Type && d.T <: Integer ||
+        _jax_error("`cumsum` over `dims` of a `", x.T, "`", _jax_where(ctx))
+    np = ctx.host === nothing ? "jnp." : "np."
+    _PyVal(np * "cumsum(" * x.code * ", axis=" * _py_infix("-", [d.code, "1"]) * ")", x.T)
+end
+
 # `stack(rows; dims)` of a vector of equal-length vectors, held as the 2-D
 # array of its rows: a matrix with those rows (`dims = 1`) or columns. On the
 # host a plate of vectors is a list of arrays, which `np.stack` joins.
@@ -1985,18 +1999,38 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(length), args::Vector{_Py
     x.T isa Type && x.T <: Tuple && return _PyVal(string(fieldcount(x.T)), Int, true)
     _PyVal(_py_atom(x.code) * ".size", Int, true)
 end
+# `size(x, d)` of a literal dimension, or of one that is static while JAX traces
+# (an integer a helper returns, `size(U, _slice_dims(o))`); a dimension that
+# is data has no static shape entry.
 function _jax_function_call(ctx::_JaxContext, ::typeof(size), args::Vector{_PyVal})
     shape = ctx.host === nothing ? _py_atom(args[1].code) * ".shape" : "np.shape(" * args[1].code * ")"
     length(args) == 2 || return _PyVal(shape, NTuple{_jax_rank(args[1].T),Int}, true)
-    d = match(r"^[0-9]+$", args[2].code)
-    d === nothing && _jax_error("`size` with a computed dimension", _jax_where(ctx))
+    d = args[2]
+    T = args[1].T
     # Past an array's rank Julia's `size` is 1 (a vector is a 1-column
     # matrix), and so is every size of a number.
-    k = parse(Int, args[2].code)
-    args[1].T isa Type && (args[1].T <: Number ||
-                           args[1].T <: AbstractArray && k > _jax_rank(args[1].T)) &&
-        return _PyVal("1", Int, true)
-    _PyVal(shape * "[" * string(k - 1) * "]", Int, true)
+    if occursin(r"^[0-9]+$", d.code)
+        k = parse(Int, d.code)
+        T isa Type && (T <: Number || T <: AbstractArray && k > _jax_rank(T)) &&
+            return _PyVal("1", Int, true)
+        return _PyVal(shape * "[" * string(k - 1) * "]", Int, true)
+    end
+    _jax_known(ctx, d) && d.T isa Type && d.T <: Integer ||
+        _jax_error("`size` with a computed dimension", _jax_where(ctx))
+    T isa Type && T <: Number && return _PyVal("1", Int, true)
+    entry = shape * "[" * _py_infix("-", [d.code, "1"]) * "]"
+    T isa Type && T <: AbstractArray || return _PyVal(entry, Int, true)
+    _PyVal("(" * entry * " if " * _py_atom(d.code) * " <= " * string(_jax_rank(T)) *
+           " else 1)", Int, true)
+end
+# `lastindex` (the lowered `end` of `x[a:end]` in a plain helper): the length
+# or the dimension's size, static as `end` in source is. A padded (ragged)
+# value's dimension size is its padding's, so that form is refused.
+function _jax_function_call(ctx::_JaxContext, ::typeof(lastindex), args::Vector{_PyVal})
+    length(args) == 1 && return _jax_function_call(ctx, length, args)
+    isempty(args[1].extent) && !_jax_ragged(args[1].T) || _jax_error(
+        "`lastindex` along a dimension of a ragged value", _jax_where(ctx))
+    _jax_function_call(ctx, size, args)
 end
 _jax_function_call(ctx::_JaxContext, ::typeof(identity), args::Vector{_PyVal}) = only(args)
 # `rem(x, y, mode)`: the remainder of the division rounded by `mode`.
@@ -2368,6 +2402,19 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
         _host_dtype(E) * "])(" * _jax_args(padded) * ")", T)
     _PyVal("jnp.vectorize(" * name * ")(" * _jax_args(padded) * ")", T, false,
            R == 0 ? "" : _jax_extent(args))
+end
+
+# A dotted literal power in lowered code, `broadcasted(literal_pow, ^, x,
+# Val(n))` (`x .^ 2` in a plain helper): the elementwise power, as
+# `literal_pow` of a scalar is.
+function _jax_broadcast(ctx::_JaxContext, f::typeof(Base.literal_pow), args::Vector{_PyVal})
+    length(args) == 3 && args[3].T isa Type && args[3].T <: Val ||
+        _jax_error("broadcasting `", f, "`", _jax_where(ctx))
+    x, n = args[2], args[3].T.parameters[1]
+    R = _jax_rank(x.T)
+    E = _jax_return_type(^, Any[_jax_eltype(x.T), typeof(n)])
+    _PyVal(_py_infix("**", [x.code, string(n)]), R == 0 ? E : Array{E,R}, false,
+           R == 0 ? "" : x.extent)
 end
 
 # A module-level Python function computing `f` on scalars of `types`.
