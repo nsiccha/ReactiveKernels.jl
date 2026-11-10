@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.136
+
+- `jax_source`: a scan whose step outputs a named tuple of numbers and
+  numeric vectors (a K-state filter's `(lpd, w, m)`) translates. Each vector
+  field stacks as the `(steps, K)` array of its rows, as `jax.lax.scan`
+  stacks it; `steps[t].w`, `steps[end].m` and generators over the steps read
+  it as native does. It raised "a scan whose step outputs … has no JAX
+  translation yet".
+
 ## 0.1.135
 
 - `jax_source` translates `clamp` and `convert(T, x)` (snag
