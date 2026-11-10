@@ -26,7 +26,10 @@ end
 # Julia binder computes.
 function jax_raw_data(plan, src)
     names = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
-    Tuple(plan.columns[Symbol(n)] for n in names)
+    # A value the program reads only through its bound copy is passed by its
+    # authored name; the plan holds it as `_rkppl_value_<name>`.
+    Tuple(get(() -> plan.columns[Symbol("_rkppl_value_", n)], plan.columns, Symbol(n))
+          for n in names)
 end
 
 # A data helper with a loop and no recorded source: no host translation.
@@ -373,6 +376,60 @@ end
 # reads them: scalar values and covariates, never the binder's internal
 # copies or the data-only definitions it evaluates (`w`), which the module
 # computes on the host. One module serves other sizes and values.
+# A data scalar the program reads only through its bound copy
+# (`_rkppl_value_r`; ODLProject:ap1 and :ap3): `prepare_data` takes it by its
+# authored name and computes the copy.
+@testset "jax_source(built, plan): authored names for bound copies" begin
+    live = @rkppl begin
+        a[1:2] .~ Normal.(0, 1)
+        v = a .* r
+        f = vec(sum(v .* permutedims(node); dims = 2))
+        y .~ Normal.(f, 1)
+    end
+    shifted = @rkppl begin
+        sd ~ Exponential(1.0); z[1:G] .~ Normal.(0, 1)
+        m = m0 .+ s0 .* z
+        @plate for j in eachindex(idx)
+            y[j] .~ Normal.(m[j] .+ 0.0 .* idx[j], sd)
+        end
+    end
+    filtered = @rkppl begin
+        sd ~ Exponential(1.0)
+        @plate for j in eachindex(idx)
+            @scan begin
+                a[1] = x[1, j]
+                for t in 2:T
+                    a[t] = 0.5 * a[t - 1] + x[t, j]
+                end
+            end
+            y[j] .~ Normal.(a[idx[j]], sd)
+        end
+    end
+    yr = [[0.1, 0.2], [0.3], [0.0, 0.1, 0.2]]
+    cases = (
+        (live(; node = [0.2, 0.5, 0.9], r = 2.0) | (; y = [0.1, 0.2]), ["node", "r", "y"]),
+        (shifted(; G = 3, m0 = 0.5, s0 = 2.0, idx = [[1, 2], [3], [1, 1, 2]]) | (; y = yr),
+         ["G", "idx", "m0", "s0", "y"]),
+        (filtered(; T = 6, x = reshape(collect(1.0:18.0) ./ 10, 6, 3),
+                  idx = [[1, 2], [3], [6, 4, 2]]) | (; y = yr), ["T", "idx", "x", "y"]))
+    for (plan, expected) in cases
+        built = build_kernel(plan)
+        src = jax_source(built, plan)
+        names = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
+        @test sort(names) == expected
+        @test occursin("UNTRANSLATED = {}", string(src))
+        if rk_jax_available()
+            query = prepare_query(built, plan, :sampler)
+            u = 0.2 .* randn(Xoshiro(3), built.layout.total)
+            r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
+                                grad = true, prepare = true)
+            @test r.value ≈ query(u) rtol = 1e-10
+            reference = rk_fd_gradient(query, u)
+            @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
+        end
+    end
+end
+
 @testset "jax_source(built, plan): prepare_data takes the bound data" begin
     model = @rkppl begin
         a ~ Normal(a_loc, a_scale)

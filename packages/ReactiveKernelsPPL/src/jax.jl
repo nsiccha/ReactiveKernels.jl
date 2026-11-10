@@ -79,6 +79,13 @@ function ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan;
             for entry in built.layout.entries],
         data_meta...)
     definitions = _jax_data_definitions(plan, keys(data))
+    # The authored value behind a bound copy only the program reads
+    # (`_rkppl_value_r => :r`): the caller passes it, and `jax_source` types
+    # that parameter by this binding's value.
+    for (nm, ex) in definitions
+        ex isa Symbol && !haskey(data, ex) && haskey(data, nm) &&
+            (data = merge(data, NamedTuple{(ex,)}((data[nm],))))
+    end
     defined = Set{Symbol}(first.(definitions))
     # The model's own docstrings (`rkppl_documentation`), by author path.
     authored = rkppl_documentation(plan)
@@ -204,9 +211,11 @@ function _jax_data_definitions(plan::StructuralPlan, names)
     for nm in available
         str = String(nm)
         if startswith(str, "_rkppl_value_")
+            # The bound copy of a data value is that value, which the caller
+            # passes by its authored name, also when the program reads it
+            # only through the copy (`v = a .* r`).
             authored = Symbol(chopprefix(str, "_rkppl_value_"))
-            authored in available && _is_bound_value_call(get(exprs, authored, nothing)) &&
-                (found[nm] = authored)
+            _is_bound_value_call(get(exprs, authored, nothing)) && (found[nm] = authored)
         elseif haskey(exprs, nm) && !_is_bound_value_call(exprs[nm])
             found[nm] = definition(nm)
         end
