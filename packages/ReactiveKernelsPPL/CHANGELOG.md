@@ -16,18 +16,93 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.140
+## 0.1.143
 
 - A partition query or sampler whose keys hold each label once, such as one
   `@plate` cell per subject partitioned by subject, runs each partition as
   that one cell at one row (ReactiveKernels `plate_partition(…; single = true)`,
-  0.1.130, now the compat floor), and computes the subject-level values its
+  0.1.136, now the compat floor), and computes the subject-level values its
   cell reads there as numbers instead of one-element arrays. Values are equal
   (a design row times its coefficients is summed in column order, so a value
   through it can differ in the last bits). On BRM's `unit_cost.jl` PK toy (24
   subjects, 10 observations), one subject's local partition gradient went from
   29 to 17 allocations (2,144 to 1,248 bytes per call). Partitions whose keys
   repeat a label are unchanged. Todo `1yggoad`.
+
+## 0.1.142
+
+- `jax_source(built, plan)`: a data value the program reads only through its
+  bound copy (`v = a .* r`, a scan length `T`, `m0 .+ s0 .* z`) is a
+  `prepare_data` parameter by its authored name (`r`), which computes the
+  copy; `prepare_data` asked for `_rkppl_value_r`, so a caller holding the
+  authored data got a `KeyError`. `DATA` lists the authored name. Requires
+  ReactiveKernels 0.1.134.
+
+## 0.1.141
+
+- A `@plate` cell `@scan` that carries two or more arrays, or one array at a
+  lag depth above 1, may pass a lag to a module function
+  (`s[t] = add(s[t - 1], z[t - 1])`, or `+` bound to a module function as
+  BRM's RK emission binds it). Lowering refused it before with a
+  `SurfaceLoweringError` saying the definition "qualifies a call with
+  `:carry`, which is not a module visible in" the model's module: the step's
+  NamedTuple carry (`carry.s_lag1`) was read as a module path. A lambda's arguments and assigned locals and a
+  generator's iteration names are now lexical names of their body when
+  lowering resolves calls, as in Julia; a name no scope binds is still checked
+  as a module path. Snag `a-brm-plate-cell-bf665a16`.
+
+## 0.1.140
+
+- **Breaking for `jax_source` callers:** a module's `prepare_data` takes the
+  data the caller binds, by the names the model reads (columns and scalar
+  values such as a prior scale or a period), and computes the data-only
+  definitions `bind_data` evaluates (`w = cos.(x ./ period)`) itself, in host
+  NumPy. It took the binding's internal copies of scalar values
+  (`_rkppl_value_<name>`) and those definitions' values, which only Julia
+  computed, so a Python caller could not bind new data. Pass the same names
+  the model is bound with: `m.prepare_data(**raw)`. `DATA` describes those
+  parameters. A definition without a host translation stays an input, named
+  with the reason in the new module constant `UNTRANSLATED` (`{}` when every
+  definition is computed); so does a derived definition whose binding guards
+  missing observations. A response with missing values still passes its
+  presence mask as `_rkppl_present_<name>`. Frozen definitions
+  (`frozen_values`) stay inputs. Needs ReactiveKernels 0.1.130.
+- **Breaking for `jax_source` callers:** a module whose parameter sizes read
+  data (a `levels(g)` axis, a scan over a data length) no longer states the
+  emitting binding's `DIMENSION` and `PARAMETERS`, which differed between
+  datasets of one program. The new functions `dimension(prepared)` and
+  `parameters(prepared)` give them for the data `prepare_data` returned; a
+  module whose layout reads no data keeps the constants too. Use
+  `m.dimension(prepared)` in place of `m.DIMENSION`.
+- The functions jit with the prepared data as arguments: a prepared integer
+  that sets a shape is a `StaticInt` (ReactiveKernels 0.1.130).
+- `jax_source` translates per-group recurrences over series of different
+  lengths: an observed `@scan` in a `@plate` cell, a deterministic one over a
+  ragged input, and one with a draw per step (a random walk per group), and a
+  ragged `@plate` whose cell reads a per-group value. RKPPL's own helpers
+  have translations (`_ppl_rows`, `_observed_scan_cell_bound`,
+  `_ppl_cell_scan_position`, `_ppl_cell_scan_nsteps`); the cell's scan
+  bound check is a runtime check.
+- **Breaking for `jax_source` callers:** the module's functions take
+  `(unconstrained, **prepared)`: the prepared data is passed by keyword, as
+  `f(u, **m.prepare_data(**raw))` already did, and positional prepared
+  arguments are no longer accepted (user GO `08jy2dh`). The signatures name
+  no internal values.
+- `constrain` returns what native `constrain(layout, u)` does: a submodel's
+  values nested under its name (`{"lv": {"sigma": …}}`, was `"lv.sigma"`),
+  and a parameter with no coordinates in this binding (`b[axes(X, 2)]` with
+  no columns) as an empty array, which it left out, so the module differed
+  between bindings.
+- A module's functions have docstrings (what each computes, how to call it)
+  and type annotations. The model's own docstrings (`rkppl_documentation`)
+  are listed in the module docstring, and `constrain`'s docstring lists each
+  returned value with its docstring.
+- `prepare_data` computes chained data-only definitions (`angle = x ./ period`
+  read by `cos.(angle)`) and a submodel's (`v.mask`): a name was resolved as a
+  global function (`Base.angle`) or reported undefined. A layout whose block
+  ends in a submodel's scope (`b_g.z`, BRM's group effects) is read under its
+  `prepare_data` key; it raised `the layout reads ..., which prepare_data does
+  not return`.
 
 ## 0.1.139
 

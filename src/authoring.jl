@@ -3390,16 +3390,18 @@ _documentable(def) = Expr(:macrocall, GlobalRef(Core, Symbol("@__doc__")), nothi
 """
     @_record_source f(args...) = body
     @_record_source function f(args...) ... end
+    @_record_source @inline f(args...) = body
 
 Define the method as written and record its source for source-reading
 compilers (`jax_source`), as [`@traceable`](@ref) records it, without
 `@traceable`'s fold rewrite or throw-stripped twin: execution stays exactly
-the method's.
+the method's, including a leading `@inline`.
 """
 macro _record_source(def)
-    def isa Expr && def.head in (:(=), :function) && length(def.args) == 2 ||
+    method = _record_source_method(def)
+    method isa Expr && method.head in (:(=), :function) && length(method.args) == 2 ||
         throw(ArgumentError("@_record_source expects a method definition; got `$(def)`."))
-    signature = def.args[1]
+    signature = method.args[1]
     wheres = Any[]
     while signature isa Expr && signature.head === :where
         push!(wheres, signature.args[2:end])
@@ -3408,10 +3410,20 @@ macro _record_source(def)
     signature isa Expr && signature.head === :(::) && (signature = signature.args[1])
     signature isa Expr && signature.head === :call ||
         throw(ArgumentError("@_record_source expects a method definition; got `$(def)`."))
-    body = _traceable_tail_body(def.args[2], signature)
+    body = _traceable_tail_body(method.args[2], signature)
     source = _traceable_source_method(signature.args[1], signature.args[2:end], wheres, body,
                                       __module__)
     esc(Expr(:block, _documentable(def), source..., signature.args[1]))
+end
+
+# The method definition under a leading `@inline` (`Base.@inline` included),
+# which the defined method keeps; the recorded source is the method's.
+function _record_source_method(def)
+    while def isa Expr && def.head === :macrocall &&
+            def.args[1] in (Symbol("@inline"), :(Base.var"@inline"), GlobalRef(Base, Symbol("@inline")))
+        def = def.args[end]
+    end
+    def
 end
 
 """

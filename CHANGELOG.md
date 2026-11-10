@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.130
+## 0.1.136
 
 - New: `plate_partition(…; single = true)` declares that every key holds each
   label exactly once, so a partition is one cell of each named plate (one
@@ -38,6 +38,174 @@ are recorded in the git history only.
   over one cell per subject (24 subjects, 10 observations each), one subject's
   local gradient went from 2.20 µs / 1,232 B to 0.47 µs / 592 B (todo
   `1yggoad`).
+
+## 0.1.135
+
+- `jax_source` translates `clamp` and `convert(T, x)` (snag
+  `jax-source-clamp-af26e700`). `clamp` is a straight-line Base function whose
+  lowered code converts its operands with `convert(promote_type(...), x)`,
+  and that `convert` had no translation, so a recipe calling `clamp` (the
+  `hsgp(...)` basis of a BRM model) raised `JAXEmissionError: the function
+  convert has no JAX translation`. `convert(T, x)` is now `x` when `x` is a
+  `T` already, and `T(x)` for a concrete float or integer `T`. `clamp` keeps
+  Julia's definition, two `jnp.where` selections, so at a bound its
+  derivative is the one Julia's `ifelse` gives (`jnp.clip` would halve it).
+- A type that lowered code or a type-level call passes as a value (`Int` read
+  as a global, a `where T` parameter, `promote_type(...)`) is now read as a
+  type by the calls that take one. In a plain helper, `floor(Int, x)` emitted
+  invalid Python (`jnp.floor(<callable>, x)`) and `ones(T, n)` was refused;
+  both now translate.
+
+## 0.1.134
+
+- `jax_source(spec; data, definitions)`: a definition may read a raw data
+  value that is no input of the program (a value the program reads only
+  through a copy, `_rkppl_value_r => :r`). `prepare_data` takes it as a
+  parameter, typed by its value in `data`. ReactiveKernelsPPL 0.1.142 uses
+  this so `prepare_data` asks for authored names only.
+
+## 0.1.133
+
+- A scan with two or more outputs (two carried arrays, or a carried array and
+  a sampled innovation) reads each trajectory out of its shared recurrence
+  through a column plate. That plate's row is now named by the source, like
+  the scan's seeds and steps, instead of with `gensym`'s process counter. An
+  `@rkppl` declaration holding such a scan, in a `@plate` cell or at top
+  level, bound again to the same data or at other sizes now gives an equal
+  `kernel_expr`, as ReactiveKernelsPPL 0.1.136 states for what a model call
+  generates. Built types, values and gradients are unchanged: two builds of
+  one binding already shared their types. Snag `kernel-expr-scan-1a8411f4`.
+
+## 0.1.132
+
+- `jax_source`: the hidden-Markov laws of ReactiveKernelsDistributionKernels
+  0.1.5 translate (`normal_hmm_log_weights_logdensity` and its siblings under
+  `LogDensity`). The forward pass is a `jax.lax.scan` with `history`, and the
+  folds over the states are `jax.lax.fori_loop`s, so one module serves every
+  number of steps and states. What it takes, all generic:
+  - a shape test decides while tracing. Prepared integers are `StaticInt`s,
+    so the functions know them then; `size(x, d)` past `x`'s rank, or of a
+    number, is 1; comparisons of integer literals fold, so a conditional on
+    one takes its arm alone; `x in t` over a tuple of numbers is Python's
+    `in` when both are known, else `jnp.isin`;
+  - an index Julia requires to be 1 (past an array's rank, `v[i, 1, 1]`, or of
+    a number, `s[1, 1, 1]`) is checked, while tracing when it is known then,
+    else as a runtime check, and dropped;
+  - `dropdims(x; dims = d)` translates.
+- `@_record_source` accepts a leading `@inline`, which the method keeps.
+- In `prepare_data`, `stack(rows; dims)` of a plate of vectors is `np.stack`.
+  The plate is a list of arrays on the host, so a later `raw_basis[:, b]`
+  raised `TypeError` (BRM's HSGP basis with `orthogonal_to`).
+- RK's tie-exact `logaddexp` (mixture densities) translates as
+  `jnp.logaddexp`, and integer `div` (lowered as `checked_sdiv_int`, as in an
+  HSGP mode index) truncates toward zero as in Julia.
+- A scan with `history` translates (a vector of leading entries or a number):
+  `jax.lax.scan` carries the result vector and writes step `j`'s output at its
+  entry; an index of `eachindex(x)` is bounded by the sequence's length, so a
+  generator over `1:j-1` runs to that bound, masked. `j ± c` keeps a static
+  bound. A ragged column's empty row keeps the column's element type when
+  padded (an integer index column stayed float and could not index), and a
+  ragged value a function returns in a `dict` comes with `<name>_lengths`.
+- Generated module helpers drop the `_rk_` prefix (`_standardized`,
+  `_isequal_np`), so a generated helper never takes a fixed helper's name: a
+  module defined `_rk_isequal_np` twice and `prepare_data` recursed.
+
+## 0.1.131
+
+- A non-allocating program differentiates under native Enzyme reverse through
+  a `vcat` of operands of different array types, such as a vector parameter
+  stacked on a matrix parameter, `vcat(permutedims(c), D)`, or `vcat(c', D)`
+  (snag `rkppl-vcat-of-pa-decf6725`). The `vcat` step filled its buffer
+  through a loop over the operands, which the type-stability check reported
+  ("The prepared program's entry call is not type stable", at
+  `_vcat_destination_matches`) and native Enzyme reverse refused with
+  `IllegalTypeAnalysisException` or `EnzymeNoTypeError`. The step now checks
+  and copies its operands one inlined call per operand, and dense matrix
+  operands fill a matrix buffer through the native body's `vcat` copy.
+  Registered Enzyme (0.13.219) still refuses the step for a fresh `Matrix`
+  row beside a reshaped view, as an ordered vector's row is: it cannot
+  compile Base's `vcat` of them, the step's result for a buffer of another
+  shape, even where that call never runs. The Enzyme dogfood line
+  differentiates it.
+
+## 0.1.130
+
+- `jax_source(spec; data, definitions)`: `definitions`, an ordered collection
+  of `name => expression`, computes data values in `prepare_data` from the
+  other data values, in host NumPy, before the program's data-only prefix.
+  `prepare_data` then takes the data those expressions read in place of the
+  values they define. With `definitions`, the module also has `DATA` (its
+  parameters' dtype, rank and raggedness) and `UNTRANSLATED`: each definition
+  without a host translation, or given as a `JAXEmissionError` naming the
+  reason, with that reason; such a definition stays a `prepare_data` input.
+  ReactiveKernelsPPL 0.1.140 passes a binding's data-only definitions.
+- `jax_source(spec; data, keep)`: `prepare_data` also returns the data-only
+  values `keep` names (the functions take them too).
+- A scan over a range whose end is data with a static bound (a group's
+  length in a ragged plate cell, `for t in 2:length(y[g])`) runs to that
+  bound. Past the group's length its carry keeps its value and its outputs
+  are padding, which its extent masks; `last` of a padded vector reads the
+  entry at its length, and `vcat` of values before a padded vector adds their
+  lengths to its extent. Such a cell's scan raised `ConcretizationTypeError`
+  in Python (a traced `jnp.arange` stop).
+- `sum(x; init)` and `prod(x; init)` translate; `sinpi` and `cospi` translate,
+  their argument reduced to `[-1, 1]` first. `sum`, `prod`, `maximum` and
+  `minimum` with `dims = d` reduce that axis and keep it, as Julia does.
+- A scan whose steps output a tuple of numbers translates, as one of named
+  numbers already did; both are held as the tuple of their columns. Reading
+  such a vector by element (`out[end].level`) reads every column at that
+  index: the module read `out[out.shape[0] - 1][0]`, which fails in Python
+  with `AttributeError`. A generator over a vector's elements (`sum(o.square
+  for o in out)`, also over a plain or padded vector) is `jax.vmap` of the
+  element over it, and `merge` of named tuples translates (a scan seeded by
+  `merge(init, (b = 0.0,))`).
+- Generated Python names drop the counters that differ between builds of one
+  program (a gensym's `#<n>`, a value id's long numeric suffix), so one
+  declaration emits one module text.
+- `JAXSource` has a third field, `prepared`: each value `prepare_data`
+  returns, by its program name, to its key (`JAXSource(text, functions)`
+  still constructs one). With `definitions`, a definition of a name that is no
+  data value is a host local of `prepare_data`, so the names a definition
+  reads resolve to the program's definitions before any global function; and
+  `DATA` and the `prepare_data` `JAXFunction` name its parameters as Python
+  spells them. On the host, `plate(xs...) do … end` over data is a map.
+- With `data`, a module's functions take `(unconstrained, **prepared)` and
+  read the prepared inputs inside, so their signatures name what the caller
+  supplies (user GO `08jy2dh`); positional prepared arguments are no longer
+  accepted. A function's WANT may be a nested `NamedTuple`, returned as nested
+  `dict`s.
+- `jax_source(...; function_docs)`: a `NamedTuple` of function name => text
+  gives functions their docstrings; every module function has one and
+  annotates its parameters (`ArrayLike`) and result. Module-level helpers
+  are private (`_rk_standardized`, was `rk_standardized`).
+- `prepare_data` returns each integer scalar it prepares as a `StaticInt`, an
+  `int` that `jax.jit` treats as static, so the functions jit with the
+  prepared data as arguments (`jax.jit(f)(u, **prepared)`). A block end or a
+  scan length was a traced argument there, and slicing by it raised
+  `IndexError: Array slice indices must have static start/stop/step`.
+- `jax_source` translates a derivative rule's primal cut again (DistributionKernels'
+  `loggamma` and `logbeta`, so RKPPL's `NegativeBinomial2`, `BetaBinomial2`,
+  `Gamma`-family and other densities that call them). Since 0.1.27 a lowering's
+  callables table holds each operation's source record rather than the
+  operation, and the emitter refused the record with `JAXEmissionError: a
+  source part ... called without its operation`.
+- `jax_source` translates the CDF-based evidence of the location-scale
+  families: `censored`, `interval_censored` and `truncated` responses and
+  truncated priors. Their lazy arms call a prepared endpoint
+  (`standardized`) that the arm's source captures; the emitter did not pass a
+  branch's captures, did not read the captures a generated body unpacks
+  (`##captures#1 is not defined`), and had no translation for a prepared
+  child called as a function, which now becomes a module-level function named
+  after it (`_rk_standardized`).
+- `prepare_data` keeps the write of a `get!` whose value the source discards
+  (a statement `get!(d, k, v)`). It dropped the call, so RKPPL's level codes of
+  a string or categorical grouping column were all 0 and the JAX log density
+  read the wrong coefficients without an error.
+- `view`, `Base.maybeview` and `getindex` called with values in a plain
+  helper's lowered code translate as a gather, including a `:` (whole-axis)
+  index: `reshape(view(v, :), 1, length(v))` (RKPPL's multivariate normal slice
+  priors under `LKJCholesky`). A whole-axis slice of a ragged value raises a
+  `JAXEmissionError`.
 
 ## 0.1.129
 

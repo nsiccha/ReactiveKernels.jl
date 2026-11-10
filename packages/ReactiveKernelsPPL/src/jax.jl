@@ -9,8 +9,12 @@
 
 A Python module for the `build_kernel` output `built`, evaluating the program
 with `jax.numpy` over the sampler boundary: the packed unconstrained
-parameters, then the data columns of the binding `plan` in sorted name order
-(and its frozen definitions). Its functions:
+parameters, then the prepared data. Its functions:
+
+- `prepare_data(data...)`: the functions' data inputs, computed in host NumPy
+  from the data the model is bound with, by the names the model reads them
+  (sorted, or by name), including the data-only definitions `bind_data`
+  evaluates; frozen definitions are inputs too;
 
 - `log_density(unconstrained, data...)`: the `:sampler` value (prior,
   likelihood and log Jacobian), the log density a NumPyro or BlackJAX
@@ -23,7 +27,9 @@ parameters, then the data columns of the binding `plan` in sorted name order
 Module constants describe the inputs: `DIMENSION` (the length of
 `unconstrained`), `PARAMETERS` (each parameter's 0-based `start`/`stop` in
 `unconstrained`, its transform and dimensions), `INPUTS` (the parameter names
-in order) and `DATA` (each data input's dtype and rank).
+in order), `DATA` (each `prepare_data` parameter's dtype and rank) and
+`UNTRANSLATED` (each data-only definition `prepare_data` takes as an input
+instead of computing it, with the reason; `{}` when none).
 
 `plan` is any binding that generates the same program as `built`, as for
 [`prepare_query`](@ref); its values only type the inputs. Data arrays keep
@@ -40,36 +46,221 @@ function ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan;
     data = _query_bound(plan)
     types = merge((; unconstrained = Vector{Float64}),
                   NamedTuple{keys(data)}(map(typeof, Tuple(data))))
-    # An empty parameter (zero coordinates, such as the thresholds of a
-    # two-category ordinal response) has no value in the program.
-    parameters = [entry.name for entry in built.layout.entries if entry.size > 0]
+    # Every parameter the program has a value of, also an empty one whose size
+    # reads data (`b[axes(X, 2)]` with no columns), so one module serves every
+    # binding; a structurally empty one (the thresholds of a two-category
+    # ordinal response) has no value in the program.
+    parameters = [entry.name for entry in built.layout.entries
+                  if entry.size > 0 || haskey(built.spec.ports, entry.name)]
     returned = Symbol[parameters; collect(Symbol, values)]
-    constrained = NamedTuple{Tuple(returned)}(Tuple(returned))
+    # `constrain` returns what native `constrain(layout, u)` does: a value in
+    # a submodel's scope (`lv.sigma`) nested under the submodel (`lv`).
+    paths = [get(built.layout.name_paths, name, (name,)) for name in returned]
+    constrained = _jax_nested_want(paths, returned)
     functions = (log_density = workflow_wants(:sampler),
                  log_prior = workflow_wants(:prior),
                  log_likelihood = workflow_wants(:likelihood),
                  log_jacobian = workflow_wants(:log_jacobian),
                  constrain = constrained)
-    constants = (
+    # The layout's data-derived positions and axis lengths (`_layout_reads`):
+    # `prepare_data` returns them, and `dimension`/`parameters` read them, so
+    # the module states no binding's sizes. A layout that reads no data is
+    # also stated as the constants `DIMENSION` and `PARAMETERS`.
+    sizes = _jax_layout_names(built.layout)
+    data_meta = (DATA = [String(name) => (dtype = ReactiveKernels._jax_dtype_name(typeof(value)),
+                                          ndim = value isa AbstractArray ? ndims(value) : 0,
+                                          ragged = ReactiveKernels._jax_ragged(typeof(value)))
+                         for (name, value) in pairs(data)],)
+    constants = !isempty(sizes) ? data_meta : (
         DIMENSION = built.layout.total,
         PARAMETERS = [String(entry.name) => (
             start = entry.offset - 1, stop = entry.offset - 1 + entry.size,
             transform = String(entry.transform), dims = Tuple(entry.dims))
             for entry in built.layout.entries],
-        DATA = [String(name) => (dtype = ReactiveKernels._jax_dtype_name(typeof(value)),
-                                 ndim = value isa AbstractArray ? ndims(value) : 0,
-                                 ragged = ReactiveKernels._jax_ragged(typeof(value)))
-                for (name, value) in pairs(data)],
-    )
+        data_meta...)
+    definitions = _jax_data_definitions(plan, keys(data))
+    # The authored value behind a bound copy only the program reads
+    # (`_rkppl_value_r => :r`): the caller passes it, and `jax_source` types
+    # that parameter by this binding's value.
+    for (nm, ex) in definitions
+        ex isa Symbol && !haskey(data, ex) && haskey(data, nm) &&
+            (data = merge(data, NamedTuple{(ex,)}((data[nm],))))
+    end
+    defined = Set{Symbol}(first.(definitions))
+    # The model's own docstrings (`rkppl_documentation`), by author path.
+    authored = rkppl_documentation(plan)
+    documented(path) = join((d.markdown for d in authored if d.path == path), "\n")
+    entry(path) = (text = documented(path); "- `" * join(String.(path), ".") * "`" *
+                   (isempty(text) ? "" : ": " * replace(strip(text), "\n" => "\n  ")))
+    model_docs = isempty(authored) ? "" : "\n\nModel documentation:\n\n" *
+        join(("- `" * join(String.(d.path), ".") * "`: " * replace(strip(d.markdown), "\n" => "\n  ")
+              for d in authored if !isempty(d.path)), "\n")
     module_doc = doc === nothing ?
         "Generated by ReactiveKernelsPPL.jax_source from a built @rkppl program; " *
-        "do not edit.\n\nData: " * join(string.(keys(data)), ", ") * "." : doc
-    _absent_refusal(plan, built.spec, have, :posterior) do
-        jax_source(built.spec; have, functions, types, constants, doc = module_doc, data)
+        "do not edit.\n\nData: " *
+        join(string.(_jax_data_name.(k for k in keys(data) if !(k in defined))), ", ") * "." *
+        model_docs : doc
+    over = " at `unconstrained`, the packed unconstrained parameters (length " *
+        "`dimension(prepared)`), for the data `prepare_data` returned: `f(u, **prepared)`."
+    function_docs = (
+        log_density = "The log density a sampler targets" * over *
+            "\n\nThe sum of `log_prior`, `log_likelihood` and `log_jacobian`.",
+        log_prior = "The log prior density of the constrained parameters" * over,
+        log_likelihood = "The log likelihood of the observations" * over,
+        log_jacobian = "The log Jacobian of the constraining transforms" * over,
+        constrain = "The constrained value of each parameter, and of each requested value," *
+            over * " Returns a dict, a submodel's values nested under its name:\n\n" *
+            join(map(entry, paths), "\n"))
+    src = _absent_refusal(plan, built.spec, have, :posterior) do
+        jax_source(built.spec; have, functions, types, constants, doc = module_doc, data,
+                   definitions, keep = Tuple(sizes), function_docs)
     end
+    _jax_with_layout(src, built.layout)
 end
 
+# A nested `NamedTuple` of the program's `names`, keyed by their author
+# `paths` (`(:lv, :sigma)` under `lv`), in first-appearance order.
+function _jax_nested_want(paths, names)
+    keys_ = Symbol[]
+    groups = Dict{Symbol,Vector{Int}}()
+    for (i, p) in enumerate(paths)
+        haskey(groups, first(p)) || (push!(keys_, first(p)); groups[first(p)] = Int[])
+        push!(groups[first(p)], i)
+    end
+    vals = map(keys_) do k
+        idx = groups[k]
+        length(idx) == 1 && length(paths[only(idx)]) == 1 ? names[only(idx)] :
+            _jax_nested_want([paths[i][2:end] for i in idx], names[idx])
+    end
+    NamedTuple{Tuple(keys_)}(Tuple(vals))
+end
+
+# The names of the data values a layout reads its positions and axis lengths
+# from (`LayoutEntry.positions`, `.axes`; literals need none).
+function _jax_layout_names(layout::LayoutTable)
+    names = Symbol[]
+    for e in layout.entries
+        e.positions === nothing || append!(names, (x for x in e.positions if x isa Symbol))
+        e.axes === nothing || append!(names, (x for x in e.axes if x isa Symbol))
+    end
+    unique!(names)
+end
+
+# `dimension(prepared)` and `parameters(prepared)`: the length of
+# `unconstrained` and each parameter's 0-based `start`/`stop`, transform and
+# dimensions, for the data `prepare_data` returned.
+function _jax_with_layout(src::ReactiveKernels.JAXSource, layout::LayoutTable)
+    # A layout name in a submodel's scope (`_ppl_last_b_g.z`) has another key.
+    function read(x)
+        x isa Int && return string(x)
+        haskey(src.prepared, x) || throw(ContractValidationError(
+            "[jax] the layout reads `$x`, which `prepare_data` does not return"))
+        "int(prepared[\"" * src.prepared[x] * "\"])"
+    end
+    start(e) = e.positions === nothing ? string(e.offset - 1) :
+        e.positions[1] isa Int ? string(e.positions[1] - 1) : read(e.positions[1]) * " - 1"
+    stop(e) = e.positions === nothing ? string(e.offset - 1 + e.size) : read(e.positions[2])
+    tuple(xs) = isempty(xs) ? "()" : "(" * join(xs, ", ") * (length(xs) == 1 ? ",)" : ")")
+    dims(e) = e.axes === nothing ? tuple(string.(e.dims)) : tuple(map(read, e.axes))
+    entries = ["\"" * String(e.name) * "\": {\"start\": " * start(e) * ", \"stop\": " * stop(e) *
+               ", \"transform\": \"" * String(e.transform) * "\", \"dims\": " * dims(e) * "}"
+               for e in layout.entries]
+    total = isempty(layout.entries) ? "0" : stop(last(layout.entries))
+    text = """
+
+
+def dimension(prepared: dict) -> int:
+    \"\"\"The length of `unconstrained` for the data `prepared` (what `prepare_data` returned).\"\"\"
+    return $total
+
+
+def parameters(prepared: dict) -> dict:
+    \"\"\"Each parameter's 0-based `start`/`stop` in `unconstrained`, its transform and dimensions,
+    for the data `prepared` (what `prepare_data` returned).\"\"\"
+    return {$(join(entries, ", "))}
+"""
+    ReactiveKernels.JAXSource(src.text * text,
+        [src.functions;
+         ReactiveKernels.JAXFunction("dimension", ["prepared" => Dict], ["dimension" => Int]);
+         ReactiveKernels.JAXFunction("parameters", ["prepared" => Dict], ["parameters" => Dict])],
+        src.prepared)
+end
+
+# The data-only definitions `bind_data` evaluated, as `prepare_data`
+# computes them on the host from the data the caller binds (decision of the
+# ODL JAX handoff: a Python caller rebinds raw data without Julia). A scalar
+# data value `s` reaches the program as the definition
+# `s = _bound_value(_rkppl_value_s)`: the caller passes `s`, and
+# `_rkppl_value_s` is that value. A derived definition whose binding guards
+# missing observations (a presence mask spliced from the data) is not
+# translated: `prepare_data` takes it as an input, listed in `UNTRANSLATED`.
+# Frozen definitions (`frozen_values`) stay inputs, as their values come from
+# another binding.
+function _jax_data_definitions(plan::StructuralPlan, names)
+    exprs, derived = _definition_exprs(plan)
+    available = Set{Symbol}(names)
+    found = Dict{Symbol,Any}()
+    function definition(nm)
+        ex = exprs[nm]
+        nm in derived && _guard_missing_observation_argument(nm, ex, plan, plan.columns) !== ex &&
+            return ReactiveKernels.JAXEmissionError(
+                "the binding guards the missing observations of `$nm` with a presence " *
+                "mask computed from the data: `prepare_data` takes `$nm` as an input")
+        ex
+    end
+    for nm in available
+        str = String(nm)
+        if startswith(str, "_rkppl_value_")
+            # The bound copy of a data value is that value, which the caller
+            # passes by its authored name, also when the program reads it
+            # only through the copy (`v = a .* r`).
+            authored = Symbol(chopprefix(str, "_rkppl_value_"))
+            _is_bound_value_call(get(exprs, authored, nothing)) && (found[nm] = authored)
+        elseif haskey(exprs, nm) && !_is_bound_value_call(exprs[nm])
+            found[nm] = definition(nm)
+        end
+    end
+    # The definitions those read that are not data values of the program
+    # (`angle = x ./ period` read only by a definition `cos.(angle)`): host
+    # locals of `prepare_data`, so a name never resolves to a global function.
+    queue = collect(keys(found))
+    while !isempty(queue)
+        ex = found[pop!(queue)]
+        ex isa ReactiveKernels.JAXEmissionError && continue
+        for r in (ex isa Symbol ? (ex,) : _definition_reads(ex))
+            (r in available || haskey(found, r) || !haskey(exprs, r)) && continue
+            _is_bound_value_call(exprs[r]) && continue
+            found[r] = definition(r)
+            push!(queue, r)
+        end
+    end
+    # Dependency order: a definition after the definitions it reads.
+    order = Symbol[]
+    state = Dict{Symbol,Int}()
+    function visit(nm)
+        get(state, nm, 0) == 2 && return
+        get(state, nm, 0) == 1 && throw(ContractValidationError(
+            "[jax] the data definitions of `$nm` read each other"))
+        state[nm] = 1
+        ex = found[nm]
+        reads = ex isa Symbol ? Set{Symbol}([ex]) :
+            ex isa ReactiveKernels.JAXEmissionError ? Set{Symbol}() : _definition_reads(ex)
+        for r in sort!(collect(reads))
+            haskey(found, r) && visit(r)
+        end
+        state[nm] = 2
+        push!(order, nm)
+    end
+    foreach(visit, sort!(collect(keys(found))))
+    Pair{Symbol,Any}[nm => found[nm] for nm in order]
+end
+_jax_data_name(nm::Symbol) = nm
+
 # --- translations of RKPPL's own functions ---------------------------------------
+
+ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::Union{typeof(_bound_value),typeof(_bound_array_value)},
+        args::Vector{ReactiveKernels._PyVal}) = only(args)
 
 ReactiveKernels._jax_elementwise(::typeof(PPLGeneratedModels._ppl_logistic)) = "jax.nn.sigmoid"
 ReactiveKernels._jax_elementwise(::typeof(PPLGeneratedModels._ppl_normcdf)) = "jsp.ndtr"
@@ -141,6 +332,60 @@ ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
         ::typeof(_ppl_values), args::Vector{ReactiveKernels._PyVal}) =
     ReactiveKernels._PyVal("np.array(" * only(args).code * ")", only(args).T,
                            only(args).static)
+
+# `_ppl_rows(x, n)`: a number filled over `n` rows, or a vector broadcast
+# against them, as Julia's `ones(n) .* x` (a vector of the rows' length is
+# itself; a mismatched one fails the broadcast while JAX traces).
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_rows), args::Vector{ReactiveKernels._PyVal})
+    x, n = args
+    np = ctx.host === nothing ? "jnp" : "np"
+    code = ReactiveKernels._jax_is_array(x.T) ?
+        np * ".ones(" * n.code * ") * " * ReactiveKernels._py_atom(x.code) :
+        np * ".full((" * n.code * ",), " * x.code * ", dtype=" * np * ".float64)"
+    ReactiveKernels._PyVal(code, Vector{Float64}, false, x.extent)
+end
+
+# A cell scan's step count (`_ppl_cell_scan_nsteps`): the steps after its `m`
+# seeds, none when the bound is below them. Its bound is an integer by type.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_scan_nsteps), args::Vector{ReactiveKernels._PyVal})
+    T, m = args
+    T.T isa Type && T.T <: Integer || ReactiveKernels._jax_error(
+        "a cell scan's upper bound of type `", T.T, "` has no JAX translation",
+        ReactiveKernels._jax_where(ctx))
+    steps = ReactiveKernels._py_infix("-", [T.code, m.code])
+    ReactiveKernels._PyVal((ctx.host === nothing ? "jnp.maximum(" : "max(") * steps * ", 0)",
+                           Int, T.static && m.static)
+end
+
+# A cell's position in the plate's domain (`_ppl_cell_scan_position`): in a
+# unit range, the index's offset from its first entry, plus one.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_scan_position), args::Vector{ReactiveKernels._PyVal})
+    r, i = args
+    r.T isa Type && r.T <: AbstractUnitRange || ReactiveKernels._jax_error(
+        "a cell position in a domain of type `", r.T, "` has no JAX translation",
+        ReactiveKernels._jax_where(ctx))
+    first_entry = ReactiveKernels._py_atom(r.code) * "[0]"
+    ReactiveKernels._PyVal(ReactiveKernels._py_infix("+",
+        [ReactiveKernels._py_infix("-", [i.code, first_entry]), "1"]), Int, false)
+end
+
+# The bound of a cell's observed `@scan`: the cell's series must hold one
+# entry per scan index, checked when the module runs (a `DimensionMismatch`
+# natively, a raising runtime check here); the bound itself is `hi`.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_observed_scan_cell_bound), args::Vector{ReactiveKernels._PyVal})
+    name, _, value, hi = args
+    value.T isa Type && value.T <: _Absent && return hi
+    n = ReactiveKernels._jax_call(ctx, length, [value])
+    same = ReactiveKernels._jax_call(ctx, ==, [n, hi])
+    message = ReactiveKernels._PyVal(repr("observed `@scan` array " * strip(name.code, ['"', '\'']) *
+        " has a different number of entries than the scan writes"), DimensionMismatch)
+    ReactiveKernels._jax_call(ctx, ReactiveKernels._runtime_check, [same, message])
+    hi
+end
 
 # The broadcast row count of bound columns: their first-axis lengths are
 # shapes, known while JAX traces, and compatible (one, or a common length).

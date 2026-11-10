@@ -184,6 +184,31 @@ end
     return y
 end
 
+# `clamp` is translated from Base's own straight-line code, whose
+# `convert(promote_type(...), x)` passes a type as a value (snag
+# `jax-source-clamp-af26e700`). The cell is an HSGP basis function of a
+# clamped input; `clamp.(x, 0, 1)` converts integer bounds.
+@kernel jax_clamp(x::Vector{Float64}, lo::Float64, hi::Float64, w::Float64) = begin
+    v = plate(x) do xi
+        sin(sqrt(w) * ((clamp(xi, lo, hi) - 0.5) + 2.0)) / sqrt(2.0)
+    end
+    c = clamp.(x, 0, 1)
+    s = sum(v) + sum(c .^ 2)
+    return s
+end
+@kernel jax_clamp_scalar(t::Float64) = begin
+    y = 3.0 * clamp(t, -1.0, 2.0)
+    return y
+end
+# Type arguments that a plain helper's lowered code passes as values: a global
+# (`Int`, `Float64`) and a type-level call (`promote_type`).
+jax_test_typed(x) = floor(Int, x) * sum(ones(promote_type(typeof(x), Int), 2)) +
+                    convert(Float64, 3)
+@kernel jax_typed(x::Float64) = begin
+    y = jax_test_typed(x)
+    return y
+end
+
 # A straight-line plain helper, translated from its lowered code: its literal
 # powers and `eltype` are type values there (`Val{2}`, `Float64`), which bind
 # no Python local.
@@ -366,11 +391,195 @@ end
     total = sum(flat .* flat) + length(flat)
     return total
 end
+# A broadcast `isequal` on the host: its generated scalar helper must not
+# take the name of the fixed `_rk_isequal` helper's host twin.
+@kernel jax_prep_isequal(g::Vector{String}, theta::Float64) = begin
+    hits = isequal.(g, "b")
+    total = theta * sum(hits)
+    return total
+end
+# `get!` as a statement: its write runs although its value is discarded.
+ReactiveKernels.@_record_source function jax_prep_declared(x::AbstractVector, levels::AbstractVector)
+    positions = Dict{eltype(levels),Int}()
+    for (j, lv) in enumerate(levels)
+        get!(positions, lv, j)
+    end
+    codes = zeros(Int, length(x))
+    for (i, v) in enumerate(x)
+        codes[i] = get(positions, v, 0)
+    end
+    return codes
+end
+@kernel jax_prep_declared_sum(g::Vector{String}, theta::Vector{Float64}) = begin
+    codes = jax_prep_declared(g, ["c", "a", "b"])
+    total = sum(theta[codes] .^ 2)
+    return total
+end
 # Data-only reshapes with a `:` dimension (BRM's GP pair locations).
 @kernel jax_prep_reshapes(x::Vector{Float64}, a::Float64) = begin
     row = reshape(x, 1, :)
     rows = reshape(x, (2, :))
     total = a * sum(row .* row) + a^2 * sum(rows[1, :])
+    return total
+end
+
+# A derivative rule called from a plate cell: the JAX module computes its
+# primal cut, whose operations a lowering's table holds as source records.
+@kernel jax_rule_graph(a::Float64, b::Float64) = begin
+    s::Float64 = a + b
+    e::Float64 = exp(a * b)
+    y::Float64 = e + log(s)
+    dy_da::Float64 = b * e + 1 / s
+    dy_db::Float64 = a * e + 1 / s
+    return y, dy_da, dy_db
+end
+const jax_test_rule = scalar_derivative_rule(jax_rule_graph; primal = :y,
+    partials = (a = :dy_da, b = :dy_db), name = :jax_test_rule)
+@kernel jax_rule_plate(x::Vector{Float64}, a::Float64) = begin
+    lp = plate(x) do xi
+        jax_test_rule(a, xi)
+    end
+    total = sum(lp)
+    return total
+end
+# `view(v, :)` in a plain helper's lowered code (a whole-axis slice).
+jax_test_row(v::AbstractVector) = reshape(view(v, :), 1, length(v))
+@kernel jax_view_row(x::Vector{Float64}, a::Float64) = begin
+    r = jax_test_row(a .* x)
+    total = sum(r * transpose(r))
+    return total
+end
+
+# A kernel object whose method calls its own endpoint in a lazy arm (the
+# shape of a location-scale family's CDF): the arm's source captures the
+# prepared endpoint, and a cell that reaches it through another branch (a
+# censoring bound) calls the generated body that unpacks those captures.
+@kernel jax_obj_square() = begin
+    logcdf(z::Float64)::Float64 = -z^2
+end
+@kernel jax_obj_scaled(standard, location::Float64, scale::Float64) = begin
+    standardized(x::Float64)::Float64 = (x - location) / scale
+    logcdf(x::Float64)::Float64 = begin
+        z::Float64 = scale == 0 && x == location ? inv(scale) : standardized(x)
+        standard.logcdf(z)
+    end
+end
+@kernel jax_obj_law = jax_obj_scaled(jax_obj_square)
+@kernel jax_obj_scores(x::Vector{Float64}, location::Float64, scale::Float64) = begin
+    values = plate(x) do xi
+        jax_obj_law(location, scale).logcdf(xi)
+    end
+    total = sum(values)
+    return total
+end
+@kernel jax_obj_bounded(x::Vector{Float64}, location::Float64, scale::Float64, lo::Float64) = begin
+    values = plate(x) do xi
+        xi <= lo ? jax_obj_law(location, scale).logcdf(lo) : -(xi - location)^2
+    end
+    total = sum(values)
+    return total
+end
+
+# A scan's per-step outputs that are tuples or named tuples (held as the
+# tuple of their columns), read by a generator, by an element (`out[end]`)
+# and by field; a scan seeded by `merge`; a reduction over `dims`.
+@kernel jax_scan_tuple(xs::Vector{Float64}, a::Float64) = begin
+    out = scan(xs; init = 0.0) do c, x
+        n = a * c + x
+        (n, (n, n * n))
+    end
+    total = sum(o[2] for o in out)
+    return total
+end
+@kernel jax_scan_named(xs::Vector{Float64}, a::Float64) = begin
+    out = scan(xs; init = 0.0) do c, x
+        n = a * c + x
+        (n, (level = n, square = n * n))
+    end
+    total = sum(o.square for o in out) + out[end].level
+    return total
+end
+@kernel jax_scan_merge(xs::Vector{Float64}, a::Float64, u0::Float64) = begin
+    init = (u = u0,)
+    out = scan(xs; init = merge(init, (b = 0.0,))) do c, x
+        n = (u = a * c.u + x, b = c.b + x)
+        (n, n.u + n.b)
+    end
+    total = sum(out)
+    return total
+end
+@kernel jax_dims(M::Matrix{Float64}, a::Float64) = begin
+    f = vec(sum(a .* M; dims = 2)) .+ vec(maximum(M; dims = 1))[1]
+    total = sum(f .^ 2)
+    return total
+end
+
+# RK's tie-exact `logaddexp` (mixture densities) and integer `div` (a mode
+# index `div(b - 1, k) % m + 1`).
+@kernel jax_tie_div(x::Vector{Float64}, a::Float64, k::Int) = begin
+    lse = plate(x) do xi
+        ReactiveKernels._tie_exact_logaddexp(a * xi, -xi)
+    end
+    q = div(length(x) - 1, k) % 3 + 1
+    total = sum(lse) + q * a
+    return total
+end
+
+# Scans whose step reads the outputs so far (`history`): a vector of leading
+# entries, and a scalar fill read up to the step's own index.
+@kernel jax_history_leading(xs::Vector{Float64}, a::Float64) = begin
+    ys = scan(xs; init = 0.0, history = [1.0, 2.0]) do carry, x, earlier
+        (carry, a * x + sum(earlier))
+    end
+    total = sum(ys .^ 2)
+    return total
+end
+@kernel jax_history_indexed(xs::Vector{Float64}, a::Float64) = begin
+    ys = scan(xs, eachindex(xs); init = 0.0, history = 0.0) do carry, x, j, earlier
+        s = sum(earlier[i] * a for i in 1:j-1; init = 0.0)
+        (carry + x, x + s)
+    end
+    total = sum(ys)
+    return total
+end
+
+# Recorded `@inline` helpers (`@_record_source`): a shape test with `in` and
+# `&&`, decided while tracing, and a fold over a data length, run as a loop.
+ReactiveKernels.@_record_source @inline jax_fits(x, n) = ndims(x) <= 2 && size(x, 1) in (1, n)
+ReactiveKernels.@_record_source @inline function jax_fold(x, n)
+    total = x[1]
+    for i in 2:n
+        total = ReactiveKernels._tie_exact_logaddexp(total, x[i])
+    end
+    total
+end
+@kernel jax_shape_fold(x::Vector{Float64}, a::Float64) = begin
+    n = length(x)
+    checked = jax_fits(x, n) ? a .* x : throw(DimensionMismatch("x must have n rows"))
+    total = jax_fold(checked, n)
+    return total
+end
+# Julia's unit indices: past a vector's rank (a literal and a computed one),
+# of a number, and `size` past the rank; `dropdims` of a summed axis.
+@kernel jax_unit_index(x::Vector{Float64}, a::Float64) = begin
+    cells = plate(eachindex(x)) do i
+        x[i, 1] * a[1, 1] + x[i, (i - 1) ÷ length(x) + 1] + size(x, 2)
+    end
+    M = reshape(cells, 2, length(cells) ÷ 2)
+    total = sum(dropdims(sum(M; dims = 1); dims = 1) .^ 2)
+    return total
+end
+# `stack` in `prepare_data`: on the host a plate of vectors is a list of
+# arrays (BRM's HSGP basis, `raw_basis[:, b]`).
+@kernel jax_prep_stack(x::Vector{Float64}, a::Float64) = begin
+    rows = plate(x) do xi
+        plate(1:3) do b
+            xi * b
+        end
+    end
+    M = stack(rows; dims = 1)
+    col = M[:, 2]
+    total = a * sum(col)
     return total
 end
 
@@ -433,6 +642,15 @@ end
     @test [f.name for f in multi.functions] == ["log_density", "both", "named"]
     @test occursin("DIMENSION = 2", string(multi))
     @test occursin("return {\"density\": ", string(multi))
+    # `clamp` keeps Julia's two `ifelse` selections; `jnp.clip` would give a
+    # bound tie half the derivative.
+    clamped = string(jax_source(jax_clamp; have = (:x, :lo, :hi, :w), want = :s))
+    @test occursin("jnp.where(", clamped)
+    @test !occursin("jnp.clip", clamped)
+    @test !occursin(r"<[a-z]", clamped)
+    typed = string(jax_source(jax_typed; have = (:x,), want = :y))
+    @test occursin("jnp.floor(x)", typed)
+    @test !occursin(r"<[a-z]", typed)
 end
 
 @testset "jax_source: refused constructs" begin
@@ -531,6 +749,27 @@ end
         g(rho) = native(rho, R, 0.3)
         @test r.value ≈ g(0.7) rtol = 1e-12
         @test r.grad ≈ only(rk_fd_gradient(u -> g(only(u)), [0.7])) rtol = 1e-6
+
+        native = prepare(jax_clamp; have = (:x, :lo, :hi, :w), want = :s)
+        src = jax_source(jax_clamp; have = (:x, :lo, :hi, :w), want = :s)
+        xc = [0.1, -0.3, 0.9, 1.4, 0.25, 0.0, 1.0]
+        @test rk_jax_evaluate(src, "kernel", (xc, 0.0, 1.0, 0.7)).value ≈
+              native(xc, 0.0, 1.0, 0.7) rtol = 1e-12
+        # No entry at a bound, where finite differences are one-sided.
+        xg = xc[1:5]
+        r = rk_jax_evaluate(src, "kernel", (xg, 0.0, 1.0, 0.7); grad = true)
+        @test r.grad ≈ rk_fd_gradient(u -> native(u, 0.0, 1.0, 0.7), xg) rtol = 1e-6
+        # At a bound Julia's `clamp` returns `x` (its `ifelse` selects it), so
+        # the derivative there is the inner one, 3.
+        src = jax_source(jax_clamp_scalar; have = (:t,), want = :y)
+        for (t, d) in ((0.5, 3.0), (-1.5, 0.0), (2.5, 0.0), (-1.0, 3.0), (2.0, 3.0))
+            r = rk_jax_evaluate(src, "kernel", (t,); grad = true)
+            @test r.value ≈ 3.0 * clamp(t, -1.0, 2.0) rtol = 1e-12
+            @test r.grad ≈ d rtol = 1e-12
+        end
+        native = prepare(jax_typed; have = (:x,), want = :y)
+        src = jax_source(jax_typed; have = (:x,), want = :y)
+        @test rk_jax_evaluate(src, "kernel", (2.7,)).value ≈ native(2.7) rtol = 1e-12
     end
 end
 
@@ -602,5 +841,77 @@ end
         # A loop whose trip count is data runs on the host.
         counted = jax_source(jax_data_count; have = (:x, :n), want = :s, data = (x = [1.0, 2.0, 4.0], n = 2))
         @test occursin("for i in range(1, n + 1):", string(counted))
+    end
+end
+
+@testset "jax_source: rule primals, captured endpoints, positional views and statement writes" begin
+    x = [0.4, 1.3, 2.2, 0.7]
+    rule_src = jax_source(jax_rule_plate; have = (:a, :x), want = :total)
+    view_src = jax_source(jax_view_row; have = (:a, :x), want = :total)
+    obj_src = jax_source(jax_obj_scores; have = (:location, :x, :scale), want = :total)
+    bounded_src = jax_source(jax_obj_bounded; have = (:location, :scale, :x, :lo), want = :total)
+    g = ["b", "c", "a", "b", "a"]
+    declared = jax_source(jax_prep_declared_sum; have = (:theta, :g), want = :total, data = (; g))
+    iseq = jax_source(jax_prep_isequal; have = (:theta, :g), want = :total, data = (; g))
+    @test length(collect(eachmatch(r"^def (\w+)\("m, string(iseq)))) ==
+          length(unique(m[1] for m in eachmatch(r"^def (\w+)\("m, string(iseq))))
+    @test occursin(".setdefault(", string(declared))
+    if !rk_jax_available()
+        @test_skip false
+    else
+        native = prepare(jax_rule_plate; have = (:a, :x), want = :total)
+        r = rk_jax_evaluate(rule_src, "kernel", (0.3, x); grad = true)
+        @test r.value ≈ native(0.3, x) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x), [0.3])) rtol = 1e-6
+        native = prepare(jax_view_row; have = (:a, :x), want = :total)
+        r = rk_jax_evaluate(view_src, "kernel", (0.3, x); grad = true)
+        @test r.value ≈ native(0.3, x) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x), [0.3])) rtol = 1e-6
+        native = prepare(jax_obj_scores; have = (:location, :x, :scale), want = :total)
+        r = rk_jax_evaluate(obj_src, "kernel", (0.3, x, 1.7); grad = true)
+        @test r.value ≈ native(0.3, x, 1.7) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x, 1.7), [0.3])) rtol = 1e-6
+        native = prepare(jax_obj_bounded; have = (:location, :scale, :x, :lo), want = :total)
+        for lo in (0.5, 3.0)
+            r = rk_jax_evaluate(bounded_src, "kernel", (0.3, 1.7, x, lo); grad = true)
+            @test r.value ≈ native(0.3, 1.7, x, lo) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), 1.7, x, lo), [0.3])) rtol = 1e-6
+        end
+        @test rk_jax_evaluate(iseq, "kernel", (0.5, g); prepare = true).value ≈ 1.0
+        theta = [0.5, -1.5, 2.5]
+        native = prepare(jax_prep_declared_sum; have = (:theta, :g), want = :total)
+        r = rk_jax_evaluate(declared, "kernel", (theta, g); grad = true, prepare = true)
+        @test r.value ≈ native(theta, g) rtol = 1e-12
+        @test r.grad ≈ rk_fd_gradient(t -> native(t, g), theta) rtol = 1e-6
+    end
+end
+
+@testset "jax_source: tuple scan outputs, history scans, merge and dims" begin
+    xs = [1.0, 2.0, 3.0, -0.5]
+    M = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+    cases = ((jax_scan_tuple, (:a, :xs), (0.5, xs)), (jax_scan_named, (:a, :xs), (0.5, xs)),
+             (jax_history_leading, (:a, :xs), (0.7, xs)), (jax_history_indexed, (:a, :xs), (0.7, xs)),
+             (jax_tie_div, (:a, :x, :k), (0.7, xs, 2)),
+             (jax_scan_merge, (:a, :xs, :u0), (0.5, xs, 1.0)), (jax_dims, (:a, :M), (0.5, M)),
+             (jax_shape_fold, (:a, :x), (0.7, xs)), (jax_unit_index, (:a, :x), (0.7, xs)))
+    srcs = [jax_source(k; have, want = :total) for (k, have, _) in cases]
+    @test !occursin(".shape[0] - 1][", string(srcs[2]))
+    fold = string(srcs[end - 1])
+    @test occursin(" in (1, ", fold) && occursin("jax.lax.fori_loop(", fold)
+    @test occursin("jnp.squeeze(", string(srcs[end]))
+    stacked = jax_source(jax_prep_stack; have = (:a, :x), want = :total, data = (; x = xs))
+    @test occursin("np.stack(", string(stacked))
+    if !rk_jax_available()
+        @test_skip false
+    else
+        for ((k, have, args), src) in zip(cases, srcs)
+            native = prepare(k; have, want = :total)
+            r = rk_jax_evaluate(src, "kernel", args; grad = true)
+            @test r.value ≈ native(args...) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), args[2:end]...), [args[1]])) rtol = 1e-6
+        end
+        native = prepare(jax_prep_stack; have = (:a, :x), want = :total)
+        r = rk_jax_evaluate(stacked, "kernel", (0.7, xs); grad = true, prepare = true)
+        @test r.value ≈ native(0.7, xs) rtol = 1e-12
     end
 end

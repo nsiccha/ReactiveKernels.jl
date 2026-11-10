@@ -3161,6 +3161,28 @@ function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where;
         end
         return Expr(:call, ex.args[1], Expr(:tuple, resolved...), ex.args[3:end]...)
     end
+    # A lambda's arguments and the locals its body assigns, and a generator's
+    # iteration names, are lexical names inside it, as in Julia. A cell
+    # `@scan` step (`scan(...) do carry, t … end`) passing its tuple carry's
+    # lag `carry.s_lag1` to a module function reads that local's property;
+    # `carry` is not a module path (snag `a-brm-plate-cell-bf665a16`).
+    if ex.head === :-> && length(ex.args) == 2
+        inner = union(names, _lambda_locals(ex))
+        return Expr(:->, Any[_resolve_module_calls(a, mod, inner, where;
+            values = false) for a in ex.args]...)
+    end
+    if ex.head === :generator && length(ex.args) >= 2
+        inner = union(names, _generator_binders(ex))
+        scoped(a, n) = _resolve_module_calls(a, mod, n, where; values = false)
+        # An iteration range is evaluated outside the generator's names.
+        clause(c) = Meta.isexpr(c, :(=), 2) ?
+            Expr(:(=), c.args[1], scoped(c.args[2], names)) : scoped(c, names)
+        clauses = map(ex.args[2:end]) do it
+            Meta.isexpr(it, :filter) && !isempty(it.args) || return clause(it)
+            Expr(:filter, scoped(it.args[1], inner), map(clause, it.args[2:end])...)
+        end
+        return Expr(:generator, scoped(ex.args[1], inner), clauses...)
+    end
     if ex.head === :call && !isempty(ex.args)
         head = _julia_reduction_call(ex.args[1], ex.args[2:end]) ?
             _julia_reduction_ref(ex.args[1]) :
@@ -5451,9 +5473,8 @@ function _cell_free_syms!(out::Set{Symbol}, ex)
         if ex.head === :generator
             _generator_symbols!(_cell_free_syms!, out, ex)
         elseif ex.head === :-> && length(ex.args) == 2
-            bound = _binder_symbols!(Set{Symbol}(), ex.args[1])
-            _lambda_assigned!(bound, ex.args[2])
-            union!(out, setdiff!(_cell_free_syms!(Set{Symbol}(), ex.args[2]), bound))
+            union!(out, setdiff!(_cell_free_syms!(Set{Symbol}(), ex.args[2]),
+                _lambda_locals(ex)))
         elseif ex.head === :call && !isempty(ex.args)
             _constructed_endpoint_head(ex.args[1]) &&
                 _cell_free_syms!(out, ex.args[1].args[1])
@@ -5474,6 +5495,11 @@ function _cell_free_syms!(out::Set{Symbol}, ex)
     end
     return out
 end
+
+# The names local to a lambda `args -> body`: its arguments and the names
+# its body assigns.
+_lambda_locals(ex::Expr) =
+    _lambda_assigned!(_binder_symbols!(Set{Symbol}(), ex.args[1]), ex.args[2])
 
 # Names a lambda body assigns (its locals), outside nested lambdas.
 _lambda_assigned!(out, ex) = out

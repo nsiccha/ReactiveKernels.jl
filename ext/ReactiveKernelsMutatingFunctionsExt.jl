@@ -255,15 +255,35 @@ const _LA = ReactiveKernels.LinearAlgebra
     op(A, B)
 end
 
-@inline function _vcat_destination_matches(cache::Array{T,N}, args) where {T,N}
-    all(a -> a isa AbstractArray{T,N}, args) || return false
-    trailing = ntuple(d -> size(cache, d + 1), N - 1)
-    rows = 0
-    for a in args
-        ntuple(d -> size(a, d + 1), N - 1) == trailing || return false
-        rows += size(a, 1)
-    end
-    size(cache, 1) == rows
+# Whether `vcat(args...)` fits the cache: every operand an
+# `AbstractArray{T,N}` with the cache's trailing sizes, their heights summing
+# to the cache's. The operands of one `vcat` are often of different array
+# types (a fresh `Matrix` row over a parameter block read in place as a
+# reshaped view), so the checks run over the operand tuple one inlined call
+# per operand: a loop over it reads each operand as a `Union` and builds its
+# size closure at run time, which the type-stability check reports and native
+# Enzyme reverse rejects (snag `rkppl-vcat-of-pa-decf6725`).
+@inline _vcat_trailing_size(a, ::Val{M}) where {M} =
+    ntuple(d -> size(a, d + 1), Val(M))
+@inline _vcat_operands_fit(::Type{T}, ::Val{N}, trailing, ::Tuple{}) where {T,N} =
+    true
+@inline _vcat_operands_fit(::Type{T}, ::Val{N}, trailing,
+                           args::Tuple) where {T,N} =
+    first(args) isa AbstractArray{T,N} &&
+    _vcat_trailing_size(first(args), Val(N - 1)) == trailing &&
+    _vcat_operands_fit(T, Val(N), trailing, Base.tail(args))
+@inline _vcat_destination_matches(cache::Array{T,N}, args) where {T,N} =
+    _vcat_operands_fit(T, Val(N), _vcat_trailing_size(cache, Val(N - 1)), args) &&
+    size(cache, 1) == ReactiveKernels._native_cat_height_sum(args)
+
+# Copy each operand's rows into the cache in order, one call per operand.
+@inline _vcat_copy_rows!(cache::Array, row, ::Tuple{}) = cache
+@inline function _vcat_copy_rows!(cache::Array{T,N}, row,
+                                  args::Tuple) where {T,N}
+    a = first(args)
+    rows = size(a, 1)
+    copyto!(view(cache, row+1:row+rows, ntuple(_ -> Colon(), Val(N - 1))...), a)
+    _vcat_copy_rows!(cache, row + rows, Base.tail(args))
 end
 
 # Elementwise `+`/`-` over dense arrays. `Base.+`/`Base.-` on arrays check
@@ -325,14 +345,29 @@ end
         cache::Array{T,N}, op::ReactiveKernels._ConcatenateStep{typeof(vcat)},
         args...) where {T,N}
     _vcat_destination_matches(cache, args) || return op.f(args...)
-    offset = 0
-    for a in args
-        rows = size(a, 1)
-        copyto!(view(cache, offset+1:offset+rows,
-                     ntuple(_ -> Colon(), N - 1)...), a)
-        offset += rows
-    end
-    cache
+    _vcat_copy_rows!(cache, 0, args)
+end
+
+# `vcat` of dense matrices of the cache's element type (a `Matrix`, or a
+# contiguous parameter block reshaped to one, `_NativeMatrix`) into a matrix
+# cache: the operands' rows in order through the native body's unrolled copy,
+# as for vectors below, rather than a view of the cache per operand, which
+# native Enzyme reverse records on its tape on every gradient call. Operands
+# of other widths, or one that may share memory with the cache, return the
+# step's own result. Other operands take the general method above.
+@inline function MutatingFunctions.apply!!(
+        cache::Matrix{T}, op::ReactiveKernels._ConcatenateStep{typeof(vcat)},
+        a::ReactiveKernels._NativeMatrix,
+        rest::Vararg{ReactiveKernels._NativeMatrix,N}) where {T,N}
+    args = (a, rest...)
+    all(x -> eltype(x) === T, args) || return op.f(args...)
+    width = size(a, 2)
+    size(cache, 2) == width && ReactiveKernels._native_cat_widths_equal(width, rest) ||
+        return op.f(args...)
+    n = ReactiveKernels._native_cat_height_sum(args)
+    size(cache, 1) == n || return op.f(args...)
+    ReactiveKernels._lane_vcat_aliases(cache, args) && return op.f(args...)
+    ReactiveKernels._native_vcat_copy!(cache, n, 0, args)
 end
 
 # `vcat` of dense vectors of the cache's element type into a vector cache:
