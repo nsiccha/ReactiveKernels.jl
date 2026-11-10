@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.142
+
+- `jax_source(built, plan)`: a data value the program reads only through its
+  bound copy (`v = a .* r`, a scan length `T`, `m0 .+ s0 .* z`) is a
+  `prepare_data` parameter by its authored name (`r`), which computes the
+  copy; `prepare_data` asked for `_rkppl_value_r`, so a caller holding the
+  authored data got a `KeyError`. `DATA` lists the authored name. Requires
+  ReactiveKernels 0.1.133.
+
 ## 0.1.141
 
 - A `@plate` cell `@scan` that carries two or more arrays, or one array at a
