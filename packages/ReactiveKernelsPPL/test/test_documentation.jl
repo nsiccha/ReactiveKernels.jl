@@ -191,6 +191,56 @@ end
     @test textat(plans[1], (:z,)) == ["Per-cell component.", "Reusable **leaf** definition."]
     @test textat(plans[1], (:z, :b)) == ["A local coefficient."]
     @test textat(plans[1], (:y,)) == ["Cell observation."]
+
+    # refused: a docstring before the @plate block itself documents no
+    # declaration; @doc on a loop is a Julia error ('cannot document the
+    # following expression') (P3). The message names the docstring and the
+    # supported placement instead of reading the plate as nested (snag
+    # rkppl-docstring-454e2a8c, the reporter's model).
+    err = try
+        @eval @rkppl begin
+            a ~ Normal(0, 1)
+            "Each group's observations."
+            @plate for i in eachindex(y)
+                y[i] ~ Normal(a, 1)
+            end
+        end
+        nothing
+    catch e
+        e isa LoadError ? e.error : e
+    end
+    @test err isa SurfaceLoweringError &&
+        occursin("docstring \"Each group's observations.\" before a `@plate` block",
+            err.message) &&
+        occursin("before a declaration inside the block", err.message) &&
+        !occursin("nested", err.message)
+    long = repeat("x", 60) * "\nsecond line"
+    scan_doc = Expr(:block, Expr(:macrocall, GlobalRef(Core, Symbol("@doc")),
+        LineNumberNode(1), long, Expr(:macrocall, Symbol("@scan"),
+            LineNumberNode(2), quote
+                h[1] ~ Normal(0, 1)
+                for t in 2:T
+                    h[t] ~ Normal(h[t-1], 1)
+                end
+            end)))
+    err = try
+        RKPPLModel(scan_doc, @__MODULE__)
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError &&
+        occursin("docstring \"$(repeat("x", 45))...\" before a `@scan` block",
+            err.message)
+    # The supported placement: the same text before the declaration inside.
+    inside = @rkppl begin
+        a ~ Normal(0, 1)
+        @plate for i in eachindex(y)
+            "Each group's observations."
+            y[i] ~ Normal(a, 1)
+        end
+    end
+    @test textat(inside() | (; y=[0.1, 0.2]), (:y,)) == ["Each group's observations."]
 end
 
 @testset "scan setup and step documentation" begin

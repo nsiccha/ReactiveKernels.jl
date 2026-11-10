@@ -16,7 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.137
+## 0.1.141
+
+- A `@plate` cell `@scan` that carries two or more arrays, or one array at a
+  lag depth above 1, may pass a lag to a module function
+  (`s[t] = add(s[t - 1], z[t - 1])`, or `+` bound to a module function as
+  BRM's RK emission binds it). Lowering refused it before with a
+  `SurfaceLoweringError` saying the definition "qualifies a call with
+  `:carry`, which is not a module visible in" the model's module: the step's
+  NamedTuple carry (`carry.s_lag1`) was read as a module path. A lambda's arguments and assigned locals and a
+  generator's iteration names are now lexical names of their body when
+  lowering resolves calls, as in Julia; a name no scope binds is still checked
+  as a module path. Snag `a-brm-plate-cell-bf665a16`.
+
+## 0.1.140
 
 - **Breaking for `jax_source` callers:** a module's `prepare_data` takes the
   data the caller binds, by the names the model reads (columns and scalar
@@ -68,6 +81,50 @@ are recorded in the git history only.
   ends in a submodel's scope (`b_g.z`, BRM's group effects) is read under its
   `prepare_data` key; it raised `the layout reads ..., which prepare_data does
   not return`.
+
+## 0.1.139
+
+- Base's named numbers are those numbers: `Inf`, `NaN`, `pi`, `π`, `ℯ` and the
+  typed `Inf32`, `NaN16`, … (Base's exported numeric constants) read as the
+  numbers they name, like a literal `0.5`, wherever a model reads a value:
+  data-only and parameter-dependent definitions
+  (`w = ifelse.(flag .> 0.5, -Inf, 0.0)`), inline response arguments, plate
+  cells, prior arguments (`Normal(0, pi)`), bounds and submodel bodies. `-Inf`
+  is the literal, and an irrational reads as its Float64 value, as `pi` did. A
+  model name with the same spelling, or the model module's own binding of it,
+  shadows them; a module's own numeric constant is still an input name that
+  data binds. Before, only `Inf` in a bound and `pi` inside an expression
+  resolved: `bind_data` refused the others with `assignment references unknown
+  name Inf` (`array plate column reads unknown name Inf` in a cell, `arg arg2
+  references unknown name pi` for a bare prior argument). Snag
+  `rkppl-assignment-88ffa090`.
+
+## 0.1.138
+
+- A docstring written before a top-level `@plate` or `@scan` block now fails
+  with a `SurfaceLoweringError` that quotes the docstring and says to write it
+  before a declaration inside the block (where it is retained) or to use a `#`
+  comment. It used to fail saying `@plate` is only admitted at model top level
+  (nested plates do not lower), or that `@scan` must not be nested inside
+  another macro, although the block was at top level. A docstring on a loop
+  stays refused, as in Julia (`cannot document the following expression`).
+  Models that lowered before lower unchanged. Snag `rkppl-docstring-454e2a8c`.
+
+## 0.1.137
+
+- An undotted `*` beside a value that may be an array stays Julia's product.
+  A per-observation matrix the model computes (an observation vector
+  broadcast against a data matrix, `(c .* r) .* U`), named or inline, times a
+  vector of data (`w`, quadrature weights) is the matrix-vector product: one
+  value per observation, with `w` read whole. Lowering used to refuse it
+  ("combines vectors without dots"). **Correctness:** `U * w` over data only,
+  and `D * wn` with weights a model function computes (`wn = normalized(w)`),
+  were rewritten to the elementwise `.*`, which failed with a
+  `DimensionMismatch` at the first evaluation when the matrix was not square,
+  and computed another density when it was; both now compute Julia's
+  product. A vector times a vector (`r * c`, each one value
+  per observation) is refused at binding, as Julia refuses it. Snag
+  `rkppl-vector-dat-85351195`.
 
 ## 0.1.136
 
