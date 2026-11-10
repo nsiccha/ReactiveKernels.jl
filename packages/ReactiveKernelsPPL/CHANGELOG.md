@@ -16,6 +16,22 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.135
+
+- An undotted `*` beside a value that may be an array stays Julia's product.
+  A per-observation matrix the model computes (an observation vector
+  broadcast against a data matrix, `(c .* r) .* U`), named or inline, times a
+  vector of data (`w`, quadrature weights) is the matrix-vector product: one
+  value per observation, with `w` read whole. Lowering used to refuse it
+  ("combines vectors without dots"). **Correctness:** `U * w` over data only,
+  and `D * wn` with weights a model function computes (`wn = normalized(w)`),
+  were rewritten to the elementwise `.*`, which failed with a
+  `DimensionMismatch` at the first evaluation when the matrix was not square,
+  and computed another density when it was; both now compute Julia's
+  product. A vector times a vector (`r * c`, each one value
+  per observation) is refused at binding, as Julia refuses it. Snag
+  `rkppl-vector-dat-85351195`.
+
 ## 0.1.134
 
 - Bound data for `censored`, `truncated` and `interval_censored` evidence may

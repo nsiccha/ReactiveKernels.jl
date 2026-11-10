@@ -133,6 +133,7 @@ const _PPL_TEST_FILES = (
     "test_icar.jl",
     "test_model_level_hcat.jl",
     "test_computed_row_products.jl",
+    "test_whole_vector_products.jl",
     "test_names.jl",
     "test_plates.jl",
     "test_plate_categorical.jl",
