@@ -324,7 +324,8 @@ _host_outer_locals(ctx::_JaxContext, before) =
 # --- statements -----------------------------------------------------------------------
 
 function _host_return(ctx::_JaxContext, ex)
-    v = _jax_expr(ctx, ex.args[1])
+    # A list returned (`return push!(v, x)`) leaves as the array it stands for.
+    v = _host_read(ctx, _jax_expr(ctx, ex.args[1]))
     ctx.host.in_function || ctx.host.depth == 0 ||
         _jax_error("a `return` inside a conditional or loop of a recipe's source has no ",
                    "host translation", _jax_where(ctx))
@@ -637,7 +638,7 @@ function _host_nested_function!(ctx::_JaxContext, hint, params::Vector{Symbol}, 
         for (p, n, T) in zip(params, names, types)
             ctx.locals[p] = _PyVal(n, T, true)
         end
-        build()
+        _host_read(ctx, build())
     finally
         ctx.scope = outer
         empty!(ctx.locals); merge!(ctx.locals, saved[1])
@@ -764,6 +765,10 @@ end
 # Calls that read a collection in place; `nothing` for any other.
 function _host_call(ctx::_JaxContext, f, positional, kwargs)
     isempty(kwargs) || return nothing
+    (f === sort! || f === unique!) && length(positional) == 1 &&
+        return _host_rewrite!(ctx, f, positional[1])
+    listed = _host_list_read(ctx, f, positional)
+    listed === nothing || return listed
     if f === push! || f === append!
         length(positional) >= 2 || return nothing
         c = _host_raw(ctx, positional[1])
@@ -851,12 +856,186 @@ end
 # Scalar predicates of the host's values.
 const _HOST_ISEQUAL = """
 def _rk_isequal(a, b):
-    # Julia's isequal on scalars: NaN equals NaN, and missing (None) equals
-    # only missing.
+    # Julia's isequal on scalars: NaN equals NaN, -0.0 differs from 0.0, and
+    # missing (None) equals only missing.
     if a is None or b is None:
         return a is b
-    return bool(a == b) or (a != a and b != b)
+    if a != a and b != b:
+        return True
+    if not bool(a == b):
+        return False
+    if isinstance(a, (int, float, np.number)) and isinstance(b, (int, float, np.number)) and a == 0:
+        return bool(np.signbit(a) == np.signbit(b))
+    return True
 """
+
+# --- order: sort, unique, searchsortedfirst --------------------------------------------
+
+# Julia's `isless` order on the host. A float array orders by integer keys:
+# -0.0 before 0.0 and every NaN last, with equal keys exactly for the values
+# `isequal` treats as equal, so `sort`, `unique` and `searchsortedfirst`
+# agree with Julia's on every value. Integer and string arrays are their own
+# keys.
+const _HOST_ORDER = Dict{Symbol,Pair{String,String}}(
+    :key => "_rk_order_key_np" => """
+def _rk_order_key_np(x):
+    # Julia's isless order of an array as sortable keys: a float is an integer
+    # key, -0.0 before 0.0 and every NaN last, equal for values isequal treats
+    # as equal. Integer and string arrays are their own keys.
+    x = np.asarray(x)
+    if x.dtype.kind != "f":
+        return x
+    bits = np.where(np.isnan(x), np.nan, x).astype(np.float64).view(np.int64)
+    return np.where(bits < 0, bits ^ np.int64(0x7FFFFFFFFFFFFFFF), bits)
+""",
+    :sort => "_rk_sort_np" => """
+def _rk_sort_np(x):
+    # Julia's sort of a vector: ascending in isless order, equal values in
+    # their order.
+    x = np.asarray(x)
+    return x[np.argsort(_rk_order_key_np(x), kind="stable")]
+""",
+    :unique => "_rk_unique_np" => """
+def _rk_unique_np(x):
+    # Julia's unique of a vector: the first value of each isequal class, in
+    # order.
+    x = np.asarray(x)
+    _, first = np.unique(_rk_order_key_np(x), return_index=True)
+    return x[np.sort(first)]
+""",
+    :isless => "_rk_isless_key_np" => """
+def _rk_isless_key_np(a):
+    # One value's place in Julia's isless order: every NaN last, -0.0 before
+    # 0.0, equal places for values isequal treats as equal.
+    if isinstance(a, (float, np.floating)):
+        return (1, 0.0, 0) if a != a else (0, a, 0 if np.signbit(a) else 1)
+    return (0, a, 1)
+""",
+    :search => "_rk_searchsorted_np" => """
+def _rk_searchsorted_np(v, x, side):
+    # The number of entries of the sorted vector v (an array or a list) before
+    # x in isless order (side "left"), or before or equal to it ("right"):
+    # Julia's searchsortedfirst(v, x) - 1 and searchsortedlast(v, x). A
+    # bisection, so O(log n) comparisons.
+    import bisect
+    search = bisect.bisect_left if side == "left" else bisect.bisect_right
+    return search(v, _rk_isless_key_np(x), key=_rk_isless_key_np)
+""")
+const _HOST_ORDER_KEYS = Dict(:sort => (:key, :sort), :unique => (:key, :unique),
+                              :search => (:isless, :search))
+
+# The host helper `which` (with the order key it calls), defined once.
+function _host_order_helper!(ctx::_JaxContext, which::Symbol)
+    name = ""
+    for k in _HOST_ORDER_KEYS[which]
+        name, text = _HOST_ORDER[k]
+        key = (:helper, name)
+        haskey(ctx.mod.helper_names, key) && continue
+        ctx.mod.helper_names[key] = name
+        push!(ctx.mod.used, name)
+        push!(ctx.mod.helpers, rstrip(text))
+    end
+    name
+end
+
+# The element type of a vector `f` orders on the host: numbers and strings,
+# which order as Julia's `isless` does.
+function _host_ordered_eltype(ctx::_JaxContext, f, @nospecialize(T))
+    E = T isa Type && T <: AbstractVector ? eltype(T) : nothing
+    E isa Type && (E <: Real || E <: AbstractString) && return E
+    _jax_error("`", f, "` of a `", T, "` has no host translation (vectors of numbers or ",
+               "strings order on the host)", _jax_where(ctx))
+end
+
+function _host_order_call(ctx::_JaxContext, f, which::Symbol, args::Vector{_PyVal})
+    length(args) == 1 ||
+        _jax_error("`", f, "` with ", length(args), " arguments has no host translation",
+                   _jax_where(ctx))
+    E = _host_ordered_eltype(ctx, f, args[1].T)
+    _PyVal(_host_order_helper!(ctx, which) * "(" * args[1].code * ")", Vector{E}, true)
+end
+for (f, which) in ((sort, :sort), (unique, :unique))
+    @eval function _jax_call_positional(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal})
+        ctx.host === nothing &&
+            return invoke(_jax_call_positional, Tuple{_JaxContext,Function,Vector{_PyVal}},
+                          ctx, $f, args)
+        _host_order_call(ctx, $f, $(QuoteNode(which)), args)
+    end
+end
+# `searchsortedfirst(v, x)` and `searchsortedlast(v, x)`, 1-based as Julia's:
+# a bisection of `v` (an array, or a list searched in place).
+function _host_search(ctx::_JaxContext, f, v::_PyVal, x::_PyVal)
+    _host_ordered_eltype(ctx, f, v.T)
+    X = x.T
+    X isa Type && (X <: Real || X <: AbstractString) ||
+        _jax_error("`", f, "` of a `", X, "` value has no host translation (a number or a ",
+                   "string has)", _jax_where(ctx))
+    _PyVal(_host_order_helper!(ctx, :search) * "(" * v.code * ", " * x.code *
+           (f === searchsortedfirst ? ", \"left\") + 1" : ", \"right\")"), Int, true)
+end
+for f in (searchsortedfirst, searchsortedlast)
+    @eval function _jax_call_positional(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal})
+        ctx.host === nothing &&
+            return invoke(_jax_call_positional, Tuple{_JaxContext,Function,Vector{_PyVal}},
+                          ctx, $f, args)
+        length(args) == 2 ||
+            _jax_error("`", $f, "` with ", length(args), " arguments has no host translation ",
+                       "(`", $f, "(v, x)` has)", _jax_where(ctx))
+        _host_search(ctx, $f, args[1], args[2])
+    end
+end
+
+# A local list read in place where Julia reads one entry or searches it, so a
+# loop that reads it as it grows (`last(v)` of a run test) stays linear rather
+# than converting the whole list on each pass; `nothing` for any other call.
+function _host_list_read(ctx::_JaxContext, f, positional)
+    s = isempty(positional) ? nothing : positional[1]
+    s isa Symbol && haskey(ctx.locals, s) && ctx.locals[s].code in ctx.host.lists ||
+        return nothing
+    c = ctx.locals[s]
+    if (f === first || f === last) && length(positional) == 1
+        return _PyVal(_py_atom(c.code) * (f === last ? "[-1]" : "[0]"), _jax_eltype(c.T), true)
+    elseif (f === searchsortedfirst || f === searchsortedlast) && length(positional) == 2
+        return _host_search(ctx, f, c, _jax_expr(ctx, positional[2]))
+    end
+    nothing
+end
+
+# The local an argument names, or that a call rewriting a local in place
+# returns (`sort!(v)` in `unique!(sort!(v))`), with its value; `nothing` and
+# the value for any other expression (a temporary such as `copy(x)`).
+function _host_target(ctx::_JaxContext, ex)
+    ex isa Symbol && haskey(ctx.locals, ex) && return ex, ctx.locals[ex]
+    v = _jax_expr(ctx, ex)
+    for (s, l) in ctx.locals
+        l.code == v.code && return s, l
+    end
+    nothing, v
+end
+
+# `sort!(v)`, `unique!(v)`: Julia rewrites `v` and returns it. A vector this
+# source builds with `push!` (a list) is rewritten in place and stays a list,
+# so every name for it sees the result and it may grow on. An array is
+# sorted in place, made this frame's own first as any write does; a NumPy
+# array keeps its length, so `unique!` of one has no host translation. A
+# temporary's rewritten value is the result.
+function _host_rewrite!(ctx::_JaxContext, f, ex)
+    s, c = _host_target(ctx, ex)
+    E = _host_ordered_eltype(ctx, f, c.T)
+    helper = _host_order_helper!(ctx, f === sort! ? :sort : :unique)
+    s === nothing && return _PyVal(helper * "(" * _host_read(ctx, c).code * ")", Vector{E}, true)
+    if c.code in ctx.host.lists
+        _jax_emit!(ctx, c.code * "[:] = " * helper * "(" * _host_read(ctx, c).code * ").tolist()")
+        return c
+    end
+    f === unique! &&
+        _jax_error("`unique!` of `", s, "`, an array that this source does not build with ",
+                   "`push!` (`T[]`), has no host translation: a NumPy array keeps its length",
+                   _jax_where(ctx))
+    v = _host_own!(ctx, s)
+    _jax_emit!(ctx, v.code * "[:] = " * helper * "(" * v.code * ")")
+    v
+end
 function _jax_call_positional(ctx::_JaxContext, ::typeof(isequal), args::Vector{_PyVal})
     ctx.host === nothing && return _jax_function_call(ctx, isequal, args)
     name = _jax_helper!(ctx, "_rk_isequal", _HOST_ISEQUAL)
@@ -956,7 +1135,8 @@ function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, m
                                                 for (n, p, T) in zip(names, params, types)),
                             nothing)
         inner.host = _HostState(Set{String}(params); in_function = true)
-        v = _jax_expr(inner, body)
+        # A list it ends with (`unique!(sort!(v))`) leaves as an array.
+        v = _host_read(inner, _jax_expr(inner, body))
         lines = String["def " * name * "(" * join(params, ", ") * "):"]
         append!(lines, scope.lines)
         v.T === Union{} || push!(lines, "    return " * v.code)
@@ -1215,6 +1395,9 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
                  "    column. Call the other functions with the result: `f(u, **prepared)`.\n    \"\"\"")
     for r in split.excluded
         push!(lines, "    # Computed by the functions (no host translation): " * _recipe_line(r))
+        reason = get(mod.host_reasons, r.id, nothing)
+        reason === nothing ||
+            push!(lines, "    #   " * replace(reason.message, r"\s*\n\s*" => " "))
     end
     append!(lines, scope.lines)
     push!(lines, "    return {" * join(entries, ", ") * "}")

@@ -26,10 +26,13 @@ end
 # Julia binder computes.
 function jax_raw_data(plan, src)
     names = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
-    # A value the program reads only through its bound copy is passed by its
-    # authored name; the plan holds it as `_rkppl_value_<name>`.
-    Tuple(get(() -> plan.columns[Symbol("_rkppl_value_", n)], plan.columns, Symbol(n))
-          for n in names)
+    # A value the program reads only through its bound copy, and the observed
+    # value of a conditioned declaration, are passed by their authored names;
+    # the plan holds them as `_rkppl_value_<name>` and
+    # `_rkppl_conditioned_<name>`.
+    internal(n) = get(() -> plan.columns[Symbol("_rkppl_value_", n)], plan.columns,
+                      Symbol("_rkppl_conditioned_", n))
+    Tuple(get(() -> internal(n), plan.columns, Symbol(n)) for n in names)
 end
 
 # A data helper with a loop and no recorded source: no host translation.
@@ -66,6 +69,14 @@ end
     a ~ Normal(0, 1)
     return a .* mask
 end
+# BRM's monotonic-effects block (`mo()`, its RK emission): one increment
+# simplex per predictor as the columns of `simplex_incr`, and their cumulative
+# table (snag `jax-source-simpl-249ccdc6`).
+@rkppl jax_ppl_monotonic(alpha, nincr, ntargets) = begin
+    eachcol(simplex_incr[1:nincr, 1:ntargets]) .~ Dirichlet(alpha)
+    beta[1:ntargets] .~ Normal.(0, 1)
+    return cumsum(vcat(zeros(1, ntargets), simplex_incr); dims = 1) .* beta'
+end
 
 const _JAX_RNG = Xoshiro(20261024)
 const _JAX_N = 30
@@ -86,6 +97,15 @@ const _JAX_LIMIT = [isodd(i) ? -Inf : 1.0 for i in 1:_JAX_N]
 const _JAX_LOWER = [i % 3 == 0 ? -Inf : -6.0 for i in 1:_JAX_N]
 const _JAX_UPPER = [i % 4 == 0 ? Inf : 9.0 for i in 1:_JAX_N]
 const _JAX_INTERVAL = [isodd(i) ? Inf : y + 0.5 for (i, y) in enumerate(_JAX_Y)]
+
+# Two monotonic predictors of a factor with `levels` levels; two levels give
+# one increment, a one-entry simplex with no coordinates.
+jax_monotonic_plan(levels) = (@rkppl(begin
+    a ~ Normal(0, 2); s ~ Exponential(1.0)
+    mo ~ jax_ppl_monotonic(alpha, nincr, 2)
+    y .~ Normal.(a .+ mo[g, 1] .+ mo[g, 2] .* x, s)
+end))(; g = mod1.(_JAX_G, levels), x = _JAX_X, alpha = ones(levels - 1),
+       nincr = levels - 1) | (; y = _JAX_Y)
 
 const _JAX_CASES = (
     gaussian = () -> (@rkppl(begin
@@ -162,6 +182,22 @@ const _JAX_CASES = (
         s ~ Exponential(1)
         y .~ Normal.(B[1, g] .+ B[2, g] .* x, s)
     end))(; x = _JAX_X, g = _JAX_G) | (; y = _JAX_Y),
+    # Simplex slices (stick-breaking per column or row, a data concentration)
+    # and ordered slices: RKPPL's slice transforms and their log-Jacobians.
+    simplex_slices = () -> (@rkppl(begin
+        eachcol(S[1:3, 1:4]) .~ Dirichlet(alpha)
+        eachrow(P[1:4, 1:3]) .~ Dirichlet(ones(3))
+        b ~ Normal(0, 1); s ~ Exponential(1.0)
+        y .~ Normal.(b .* (S[1, g] .- P[g, 2]), s)
+    end))(; g = _JAX_G, alpha = [1.0, 2.0, 1.5]) | (; y = _JAX_Y),
+    ordered_slices = () -> (@rkppl(begin
+        eachcol(C[1:3, 1:4]) .~ Ordered(Normal(0, 2), 3)
+        eachrow(D[1:4, 1:2]) .~ Ordered(Normal(0, 2), 2)
+        s ~ Exponential(1.0)
+        y .~ Normal.(C[1, g] .+ C[3, g] .+ D[g, 2], s)
+    end))(; g = _JAX_G) | (; y = _JAX_Y),
+    monotonic = () -> jax_monotonic_plan(4),
+    monotonic_two_levels = () -> jax_monotonic_plan(2),
     # Evidence wrappers read the family's CDFs, whose lazy arms call a
     # prepared endpoint (`standardized`): a detection limit, interval
     # readings, a truncated response and truncated priors.
@@ -441,6 +477,30 @@ end
     end
 end
 
+# Slice-transformed matrices constrain as native `constrain` does: each
+# column or row a simplex or an ordered vector, a one-entry simplex the
+# constant 1 (snag `jax-source-simpl-249ccdc6`).
+@testset "jax_source(built, plan): slice transforms constrain as native" begin
+    if !rk_jax_available()
+        @test_skip false
+    else
+        rows(v) = permutedims(reduce(hcat, v))     # the module's nested rows
+        for (name, read) in ((:simplex_slices, x -> (x.S, x.P)), (:ordered_slices, x -> (x.C, x.D)),
+                             (:monotonic, x -> (x.mo.simplex_incr,)),
+                             (:monotonic_two_levels, x -> (x.mo.simplex_incr,)))
+            plan = _JAX_CASES[name]()
+            built = build_kernel(plan)
+            src = jax_source(built, plan)
+            u = 0.3 .* randn(Xoshiro(11), built.layout.total)
+            r = rk_jax_evaluate(src, "constrain", (u, jax_raw_data(plan, src)...); prepare = true).value
+            native = read(ReactiveKernelsPPL.constrain(built.layout, u))
+            jax = name in (:monotonic, :monotonic_two_levels) ? (rows(r["mo"]["simplex_incr"]),) :
+                Tuple(rows(r[k]) for k in (name === :simplex_slices ? ("S", "P") : ("C", "D")))
+            @test all(map((a, b) -> size(a) == size(b) && a ≈ b, jax, native))
+        end
+    end
+end
+
 # `prepare_data` takes the data the caller binds, by the names the model
 # reads them: scalar values and covariates, never the binder's internal
 # copies or the data-only definitions it evaluates (`w`), which the module
@@ -491,6 +551,54 @@ end
             query = prepare_query(built, plan, :sampler)
             u = 0.2 .* randn(Xoshiro(3), built.layout.total)
             r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
+                                grad = true, prepare = true)
+            @test r.value ≈ query(u) rtol = 1e-10
+            reference = rk_fd_gradient(query, u)
+            @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
+        end
+    end
+end
+
+# A conditioned declaration's observed value (`y ~ LogDensity(f, …)` bound
+# `| (; y)`, a parameter fixed `| (; a)`; ODLProject:ap1, snag
+# jax-source-names-d71253f7): the binding holds it as `_rkppl_conditioned_y`,
+# and `prepare_data` takes it by its authored name. The module runs from the
+# authored data alone.
+@testset "jax_source(built, plan): authored names for conditioned declarations" begin
+    hmm = @rkppl begin
+        mu ~ Normal(0.0, 1.0)
+        step ~ Normal(0.0, 1.0)
+        sigma ~ Exponential(1.0)
+        locations = reshape(permutedims(hcat(mu .+ step .+ z, mu .+ z)), 2, 1, N)
+        scales = reshape(permutedims(hcat(sigma .+ z, sigma .+ z)), 2, 1, N)
+        y ~ LogDensity(normal_hmm_log_weights_logdensity, locations, scales, log_transition, log_initial)
+    end
+    fixed = @rkppl begin
+        a ~ Normal(0, 1); s ~ Exponential(1.0)
+        y .~ Normal.(a .+ x, s)
+    end
+    N = 4
+    T = repeat(log.([0.7 0.3; 0.4 0.6]), 1, 1, N - 1)
+    cases = (
+        ((; N, z = 0.1 .* (1:N), log_transition = T, log_initial = log.([0.6, 0.4])),
+         (; y = [0.3, 0.1, -0.4, 0.2]), hmm, ["N", "log_initial", "log_transition", "y", "z"]),
+        ((; x = [0.1, -0.3, 0.5]), (; a = 0.8, y = [0.2, -0.1, 0.9]), fixed, ["a", "x", "y"]))
+    for (data, observed, model, expected) in cases
+        plan = model(; data...) | observed
+        @test any(startswith("_rkppl_conditioned_") ∘ String, keys(plan.columns))
+        built = build_kernel(plan)
+        src = jax_source(built, plan)
+        names = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
+        @test sort(names) == expected
+        text = string(src)
+        @test !occursin("def prepare_data(_rkppl_conditioned_", text)
+        @test !occursin("\"_rkppl_conditioned_", text)
+        @test occursin("UNTRANSLATED = {}", text)
+        if rk_jax_available()
+            authored = merge(data, observed)
+            query = prepare_query(built, plan, :sampler)
+            u = 0.2 .* randn(Xoshiro(5), built.layout.total)
+            r = rk_jax_evaluate(src, "log_density", (u, (authored[Symbol(n)] for n in names)...);
                                 grad = true, prepare = true)
             @test r.value ≈ query(u) rtol = 1e-10
             reference = rk_fd_gradient(query, u)

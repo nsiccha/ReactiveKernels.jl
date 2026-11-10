@@ -142,6 +142,15 @@ JAX code:
   (`rows[i][j] = r`) is written in place too: with no copy when the source
   built the list from allocations (`[Vector{Int}(undef, n[k]) for k in …]`),
   else after a copy of the list and its elements.
+- `sort`, `unique`, `searchsortedfirst` and `searchsortedlast` of a vector of
+  numbers or strings order as Julia's `isless` does: -0.0 before 0.0, every
+  `NaN` last; `unique` keeps the first value of each `isequal` class, in
+  order, and the searches return 1-based indices, bisecting (a list is
+  searched in place, as `first` and `last` read it). `sort!` and `unique!`
+  rewrite a list in place, so it may grow on; `sort!` sorts an array in place
+  (after a copy if the source did not allocate it). A NumPy array keeps its
+  length, so `unique!` of one has no host translation; `unique!` of a
+  temporary (`unique!(sort(x))`) has.
 - A condition decided while emitting (`eltype(x) <: Integer`, the length of a
   tuple) takes its arm alone in an `if`, `elseif`, `? :`, `&&` or `||`: the
   other arm is not translated, as Julia never runs it, so its calls need no
@@ -152,7 +161,8 @@ JAX code:
 - Values that read no data (literals, a prior's scale) stay in the functions,
   where JAX folds them.
 - A data-only recipe without a host translation stays in the functions; a
-  comment in `prepare_data` names it.
+  comment in `prepare_data` names it and the reason. When the functions
+  cannot compute it either, the `JAXEmissionError` names both reasons.
 - `definitions = [name => expression, …]` (with `data`) computes data
   values on the host before that prefix, from the other data values;
   `prepare_data` then takes what the expressions read instead of the values
@@ -244,7 +254,8 @@ A function that a recipe calls is translated if:
   (and `besseli`) of an order other than a literal 0 or 1, which JAX has no
   function for: the power series below order 25 and x = 30, else the uniform
   expansion in large order and the downward recurrence, within about 4e-13
-  of SciPy relative; `prepare_data` uses SciPy's `ive`;
+  of SciPy relative; `prepare_data` uses SciPy's `ive`. `cumsum(x; dims = d)`
+  is `jnp.cumsum` along the static axis `d`;
 - it is a conversion that takes a type: `convert(T, x)` or `T(x)` to a float
   or integer type, `floor(Int, x)`, `ones(T, n)`. The type may come from a
   literal, a global or `where T` parameter in lowered code, or a type-level
@@ -256,7 +267,10 @@ A function that a recipe calls is translated if:
 - it is a prepared kernel, which becomes a module-level function of its plan;
 - or it is a plain function whose lowered code is straight-line. A keyword
   call in it (`sum(x; dims = 2)`) translates as the same call in source does;
-  one with no translation raises naming the function.
+  one with no translation raises naming the function. An index's
+  `end` (`lastindex`) and a dimension another helper returns
+  (`size(U, axis(o))`) are static shapes, as in source, and a dotted literal
+  power (`x .^ 2`) is elementwise.
 
 In that lowered code, module-qualified calls (`M.f(x)`), `getglobal(M, name)`
 of a module and name known while emitting, `Val` tags (`Val(:f)`,

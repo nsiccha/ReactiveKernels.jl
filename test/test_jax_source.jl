@@ -485,6 +485,65 @@ end
     total = sum(flat .* flat) + length(flat)
     return total
 end
+# Order on the host (snag jax-host-sort-un-0edfe976): the sorted distinct
+# values of a data column, built with `push!` and an `isequal` run test, then
+# each entry's 1-based position among them.
+@traceable function jax_order_levels(x, extra)
+    levels = Float64[]
+    for j in eachindex(x)
+        v = convert(Float64, x[j])
+        if isempty(levels) || !isequal(v, last(levels))
+            push!(levels, v)
+        end
+    end
+    for j in eachindex(extra)
+        push!(levels, extra[j])
+    end
+    unique!(sort!(levels))
+end
+@traceable function jax_order_positions(levels, x)
+    idx = zeros(Int, length(x))
+    for j in eachindex(x)
+        idx[j] = searchsortedfirst(levels, x[j])
+    end
+    idx
+end
+# Julia's `isless` and `isequal` on signed zeros and NaN, which NumPy's own
+# `sort`, `unique` and `searchsorted` do not follow.
+@traceable function jax_order_signs(z)
+    s = sort(z)
+    o = copy(z)
+    sort!(o)
+    zeros_equal = 0
+    for v in z
+        if isequal(v, 0.0)
+            zeros_equal += 1
+        end
+    end
+    length(unique(z)) + 10 * searchsortedfirst(s, 0.0) + 100 * searchsortedlast(o, 0.0) +
+        1000 * zeros_equal + 10000 * length(unique!(sort(z)))
+end
+@kernel jax_prep_order(x::Vector{Float64}, extra::Vector{Float64}, z::Vector{Float64},
+                       theta::Vector{Float64}) = begin
+    levels = jax_order_levels(x, extra)
+    idx = jax_order_positions(levels, x)
+    upto = [searchsortedlast(levels, v) for v in x]
+    signs = jax_order_signs(z)
+    total = sum(theta[idx]) + sum(levels) + sum(upto) * theta[1] + signs * theta[2]
+    return total
+end
+# `unique!` of a NumPy array, which keeps its length: no host translation, and
+# the JAX functions cannot compute the recipe either.
+@traceable function jax_order_dedupe(x)
+    v = sort(x)
+    unique!(v)
+end
+@kernel jax_prep_unique_array(x::Vector{Float64}, a::Float64) = begin
+    d = jax_order_dedupe(x)
+    total = a * sum(d)
+    return total
+end
+
 # A gather through a ragged integer row is padded as the row is, so the
 # cell's reduction counts its valid entries only (snag jax-ragged-index-b8420d16):
 # by the group index, by the row itself, and through `view` (the call form).
@@ -725,6 +784,18 @@ end
     total = sum(f .^ 2)
     return total
 end
+# Straight-line plain helpers, translated from their lowered code: `end` in an
+# index (`lastindex`), a dimension a helper returns, and a dotted literal
+# power; and `cumsum` along a dimension (snag `jax-source-simpl-249ccdc6`).
+jax_test_axis() = 1
+jax_test_head(M) = M[1:(end - 1), :]
+jax_test_rows(M) = size(M, jax_test_axis())
+jax_test_squares(M) = sum(M .^ 2)
+@kernel jax_plain_shapes(a::Float64, M::Matrix{Float64}) = begin
+    C = cumsum(jax_test_head(a .* M); dims = 1)
+    total = jax_test_squares(C) + jax_test_rows(M) * a
+    return total
+end
 
 # RK's tie-exact `logaddexp` (mixture densities) and integer `div` (a mode
 # index `div(b - 1, k) % m + 1`).
@@ -917,6 +988,25 @@ end
     # axis that no reduction masks (its JAX value used to sum the padding).
     @test_throws "beside another kept dimension" jax_source(jax_gather_matrix_rows;
         have = (:b, :M, :R), want = :total)
+end
+
+# Plain helpers translated from their lowered code (`end`, a dimension another
+# helper returns, a dotted literal power) and `cumsum` along a dimension (snag
+# `jax-source-simpl-249ccdc6`).
+@testset "jax_source: plain-helper shapes and cumsum dims" begin
+    M = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+    src = jax_source(jax_plain_shapes; have = (:a, :M), want = :total)
+    text = string(src)
+    @test occursin("jnp.cumsum(", text) && occursin(", axis=", text)
+    @test occursin(" ** 2", text) && !occursin("vectorize", text)
+    if !rk_jax_available()
+        @test_skip false
+    else
+        native = prepare(jax_plain_shapes; have = (:a, :M), want = :total)
+        r = rk_jax_evaluate(src, "kernel", (0.5, M); grad = true)
+        @test r.value ≈ native(0.5, M) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), M), [0.5])) rtol = 1e-6
+    end
 end
 
 @testset "jax_source: values and gradients" begin
@@ -1148,6 +1238,45 @@ end
         native = prepare(jax_prep_int_labels; have = (:a, :g), want = :total)
         @test rk_jax_evaluate(int_labels, "kernel", (0.5, [4, 9, 2]); prepare = true).value ≈
               native(0.5, [4, 9, 2]) rtol = 1e-12
+    end
+end
+
+@testset "jax_source: sort, unique and searchsorted in prepare_data" begin
+    x = [0.5, 0.5, 2.0, 1.0, 1.0, 0.5]
+    extra = [3.0, 1.0]
+    z = [0.0, NaN, -0.0, 1.0, NaN, 0.0, -2.0]
+    src = jax_source(jax_prep_order; have = (:theta, :x, :extra, :z), want = :total,
+                     data = (; x, extra, z))
+    host_part = split(split(string(src), "def prepare_data")[2], "\ndef kernel")[1]
+    @test !occursin("Computed by the functions", host_part)
+    # The host helpers `prepare_data` calls sort, deduplicate and search.
+    @test all(h -> occursin(h, string(src)), ("= _rk_sort_np(", "= _rk_unique_np(",
+                                              "_rk_searchsorted_np(levels"))
+    # The list is rewritten in place, so it stays the list `push!` built; the
+    # run test reads its last entry in place, not a copy per pass.
+    @test occursin(r"levels\w*\[:\] = _rk_sort_np\(", string(src))
+    @test occursin(r"levels\w*\[-1\]", string(src))
+    @test !occursin("jnp.", host_part)
+    # A NumPy array keeps its length: `unique!` of one is refused on the host,
+    # and the functions' error names that reason as well as their own.
+    err = try
+        jax_source(jax_prep_unique_array; have = (:a, :x), want = :total, data = (; x))
+        nothing
+    catch e
+        e
+    end
+    @test err isa JAXEmissionError
+    @test occursin("`prepare_data` does not compute it on the host either", err.message)
+    @test occursin("`unique!` of `v`", err.message)
+    if !rk_jax_available()
+        @test_skip false
+    else
+        theta = collect(1.0:6.0) ./ 7
+        native = prepare(jax_prep_order; have = (:theta, :x, :extra, :z), want = :total)
+        @test jax_order_signs(z) == 5 + 30 + 400 + 2000 + 50000
+        r = rk_jax_evaluate(src, "kernel", (theta, x, extra, z); grad = true, prepare = true)
+        @test r.value ≈ native(theta, x, extra, z) rtol = 1e-12
+        @test r.grad ≈ rk_fd_gradient(t -> native(t, x, extra, z), theta) rtol = 1e-6
     end
 end
 
