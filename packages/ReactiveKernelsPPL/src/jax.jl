@@ -191,7 +191,9 @@ end
 # ODL JAX handoff: a Python caller rebinds raw data without Julia). A scalar
 # data value `s` reaches the program as the definition
 # `s = _bound_value(_rkppl_value_s)`: the caller passes `s`, and
-# `_rkppl_value_s` is that value. A derived definition whose binding guards
+# `_rkppl_value_s` is that value; likewise the observed value of a
+# conditioned declaration `y`, `_rkppl_conditioned_y`, is the `y` the caller
+# passes. A derived definition whose binding guards
 # missing observations (a presence mask spliced from the data) is not
 # translated: `prepare_data` takes it as an input, listed in `UNTRANSLATED`.
 # Frozen definitions (`frozen_values`) stay inputs, as their values come from
@@ -216,6 +218,14 @@ function _jax_data_definitions(plan::StructuralPlan, names)
             # only through the copy (`v = a .* r`).
             authored = Symbol(chopprefix(str, "_rkppl_value_"))
             _is_bound_value_call(get(exprs, authored, nothing)) && (found[nm] = authored)
+        elseif startswith(str, "_rkppl_conditioned_")
+            # The observed value of a conditioned declaration
+            # (`y ~ LogDensity(f, …)` bound `| (; y)`), which the program
+            # reads as `y = _rkppl_conditioned_y`: the caller passes it by
+            # its authored name, as it passes a response.
+            authored = Symbol(chopprefix(str, "_rkppl_conditioned_"))
+            authored in _conditioned_inputs(plan) && _conditioned_input(authored) === nm &&
+                !(authored in available) && (found[nm] = authored)
         elseif haskey(exprs, nm) && !_is_bound_value_call(exprs[nm])
             found[nm] = definition(nm)
         end
@@ -257,6 +267,79 @@ end
 _jax_data_name(nm::Symbol) = nm
 
 # --- translations of RKPPL's own functions ---------------------------------------
+
+# A law constructed in a cell (`y[g] ~ MvNormal(mu, Sigma)` lowers to
+# `sampling_logdensity(LogDensity(f, args...), y[g])`): a value whose only use
+# is its log density, `f(y[g], args...)`, translated where it is read.
+struct _JaxLogDensity
+    f::Any
+    args::Vector{ReactiveKernels._PyVal}
+end
+ReactiveKernels._jax_call_positional(ctx::ReactiveKernels._JaxContext, ::Type{LogDensity},
+        args::Vector{ReactiveKernels._PyVal}) =
+    ReactiveKernels._PyVal("None", _JaxLogDensity(ReactiveKernels._jax_function_of(args[1]),
+                                                  args[2:end]), true)
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(sampling_logdensity), args::Vector{ReactiveKernels._PyVal})
+    d = args[1].T
+    d isa _JaxLogDensity && length(args) == 2 ||
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, sampling_logdensity, args)
+    ReactiveKernels._jax_call(ctx, d.f, ReactiveKernels._PyVal[args[2]; d.args])
+end
+
+# A multivariate normal log density through the lower Cholesky factor, with
+# a validity flag the caller checks at run time, as native execution checks
+# the covariance. `n` is the count of entries a padded (ragged) vector holds,
+# or `None`: the padding then reads as an identity block with zero residual,
+# which adds nothing to the density.
+const _JAX_MVNORMAL = """
+def _rkppl_mvnormal_logpdf(x, mu, S, n, factor):
+    d = x - mu
+    k = d.shape[0]
+    if n is not None:
+        m = jnp.arange(k) < n
+        d = jnp.where(m, d, 0.0)
+        S = jnp.where(m[:, None] & m[None, :], S, jnp.eye(k))
+    else:
+        n = k
+    L = jnp.tril(S) if factor else jnp.linalg.cholesky(S)
+    diag = jnp.diagonal(L)
+    ok = jnp.all(jnp.isfinite(L)) & jnp.all(diag > 0)
+    safe = jnp.where(ok, L, jnp.eye(k))
+    z = jax.scipy.linalg.solve_triangular(safe, d, lower=True)
+    value = (-0.5 * jnp.dot(z, z) - jnp.sum(jnp.log(jnp.diagonal(safe)))
+             - 0.5 * n * jnp.log(2 * jnp.pi))
+    return value, ok
+"""
+function _jax_mvnormal(ctx::ReactiveKernels._JaxContext, args, factor::Bool, what)
+    length(args) == 3 && all(a -> ReactiveKernels._jax_is_array(a.T), args) ||
+        return nothing
+    x, mu, S = args
+    ctx.host === nothing || ReactiveKernels._jax_error("`", what, "` in host code",
+                                                        ReactiveKernels._jax_where(ctx))
+    ReactiveKernels._jax_helper!(ctx, "_rkppl_mvnormal_logpdf", _JAX_MVNORMAL)
+    n = something(findfirst(!isempty, (x.extent, mu.extent, S.extent)), 0)
+    count = n == 0 ? "None" : (x.extent, mu.extent, S.extent)[n]
+    pair = ReactiveKernels._jax_bind!(ctx, :mvnormal, ReactiveKernels._PyVal(
+        "_rkppl_mvnormal_logpdf(" * x.code * ", " * mu.code * ", " * S.code * ", " * count *
+        ", " * (factor ? "True" : "False") * ")", Tuple{Float64,Bool}))
+    ReactiveKernels._jax_call(ctx, ReactiveKernels._runtime_check,
+        [ReactiveKernels._PyVal(pair.code * "[1]", Bool),
+         ReactiveKernels._PyVal(repr(what * ": the " * (factor ? "factor" : "covariance") *
+                                     " is not positive definite"), DomainError)])
+    ReactiveKernels._PyVal(pair.code * "[0]", Float64)
+end
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_mvnormal_logdensity), args::Vector{ReactiveKernels._PyVal})
+    v = _jax_mvnormal(ctx, args, false, "MvNormal")
+    v === nothing ? ReactiveKernels._jax_traceable_or_lowered(ctx, _ppl_mvnormal_logdensity, args) : v
+end
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_mvnormal_cholesky_logdensity), args::Vector{ReactiveKernels._PyVal})
+    v = _jax_mvnormal(ctx, args, true, "MvNormalCholesky")
+    v === nothing ?
+        ReactiveKernels._jax_traceable_or_lowered(ctx, _ppl_mvnormal_cholesky_logdensity, args) : v
+end
 
 ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
         ::Union{typeof(_bound_value),typeof(_bound_array_value)},

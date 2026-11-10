@@ -455,10 +455,12 @@ function _ordered_normal_slices_pointwise(o, B, m, s)
 end
 
 # Ordered slices: the first entry, then cumulative exp-increments along
-# each slice (the vector `ordered_constrain`, per slice).
-_ordered_slices_constrain(::_SliceRows, U) =
+# each slice (the vector `ordered_constrain`, per slice). The ordered and
+# simplex slice transforms are `@traceable`: `jax_source` translates their
+# keyword `cumsum` and the simplex's one-entry branch from the authored body.
+@traceable _ordered_slices_constrain(o::_SliceRows, U) =
     cumsum(hcat(U[:, 1:1], exp.(U[:, 2:end])); dims = 2)
-_ordered_slices_constrain(::_SliceCols, U) =
+@traceable _ordered_slices_constrain(o::_SliceCols, U) =
     cumsum(vcat(U[1:1, :], exp.(U[2:end, :])); dims = 1)
 _ordered_slices_logjac(::_SliceRows, U) = sum(U[:, 2:end])
 _ordered_slices_logjac(::_SliceCols, U) = sum(U[2:end, :])
@@ -486,7 +488,7 @@ _slice_width(o, U) = size(U, _slice_dims(o))
 _simplex_offsets(::_SliceRows, K) = permutedims(log.(K .- (1:(K - 1))))
 _simplex_offsets(::_SliceCols, K) = log.(K .- (1:(K - 1)))
 
-function _simplex_slices_breaks(o, U)
+@traceable function _simplex_slices_breaks(o, U)
     K = _slice_width(o, U) + 1
     z = 1.0 ./ (1.0 .+ exp.(-(U .+ _simplex_offsets(o, K))))
     l = log1p.(-z)
@@ -498,15 +500,23 @@ _slice_ones(::_SliceCols, G) = ones(1, G)
 _simplex_lr_head(::_SliceRows, lr) = lr[:, 1:(end - 1)]
 _simplex_lr_head(::_SliceCols, lr) = lr[1:(end - 1), :]
 
-function _simplex_slices_constrain(o, U)
-    _slice_width(o, U) == 0 && return _slice_ones(o, _slice_count(o, U))
-    z, _, lr = _simplex_slices_breaks(o, U)
-    return exp.(lr) .* _slice_hcat(o, z, 1.0 .+ _slice_zero(o, U))
+# The slice width is a shape, so the one-entry branch is decided while JAX
+# traces, as it is decided natively.
+@traceable function _simplex_slices_constrain(o, U)
+    if _slice_width(o, U) == 0
+        _slice_ones(o, _slice_count(o, U))
+    else
+        z, _, lr = _simplex_slices_breaks(o, U)
+        exp.(lr) .* _slice_hcat(o, z, 1.0 .+ _slice_zero(o, U))
+    end
 end
-function _simplex_slices_logjac(o, U)
-    _slice_width(o, U) == 0 && return 0.0
-    z, l, lr = _simplex_slices_breaks(o, U)
-    return sum(_simplex_lr_head(o, lr) .+ log.(z) .+ l)
+@traceable function _simplex_slices_logjac(o, U)
+    if _slice_width(o, U) == 0
+        0.0
+    else
+        z, l, lr = _simplex_slices_breaks(o, U)
+        sum(_simplex_lr_head(o, lr) .+ log.(z) .+ l)
+    end
 end
 # Host inverse: per slice, the vector `simplex_unconstrain`.
 _simplex_slices_unconstrain(::_SliceRows, X) =
