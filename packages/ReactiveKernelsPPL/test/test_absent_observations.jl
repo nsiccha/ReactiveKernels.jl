@@ -339,7 +339,11 @@ end
         y .~ interval_censored.(Normal.(a .+ x, 1.0), hi)
     end
     plan = lower_rkppl(src, (:x, :hi, :y); conditioned = (:y,), mod = @__MODULE__)
-    @test_throws "finite numerics" bind_data(plan, Dict{Symbol,Any}(:x => X, :hi => fill(Inf, 8)))
+    # refused: a NaN upper end bounds nothing (rkppl-use §9: only `Inf` removes it)
+    @test_throws "finite numerics" bind_data(plan, Dict{Symbol,Any}(:x => X, :hi => fill(NaN, 8)))
+    # An `Inf` upper end removes the bound (right censoring).
+    @test bind_data(plan, Dict{Symbol,Any}(:x => X, :hi => fill(Inf, 8))).columns[:y] isa
+        ReactiveKernelsPPL._Absent
 end
 
 _ao_shift_cells(t, a) = [a .+ ti for ti in t]

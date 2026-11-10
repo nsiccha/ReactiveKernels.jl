@@ -7336,13 +7336,20 @@ function _bound_values(bound, side, r::LikelihoodSpec, plan::StructuralPlan)
     # Live bounds are validated by the generated cell; bound data retain
     # their Julia broadcast axes and are gathered once for packed outcomes.
     value === nothing && return nothing
+    # Parsing turns a literal infinity into a missing side (`nothing`).
+    bound isa Real && !isfinite(bound) && _fail(r.label, "$side bound must be finite")
+    # Bound data may hold its side's infinity (`-Inf` below, `Inf` above):
+    # it removes that bound, for every row or for the rows holding it, as
+    # the literal spelling does. NaN and the opposite infinity bound nothing.
+    open = side === :lower ? -Inf : Inf
+    valid(x) = isfinite(x) || x == open
     if value isa Real
-        isfinite(value) || _fail(r.label, "$side bound must be finite")
+        valid(value) || _fail(r.label, "$side bound must be finite or $open (no $side bound)")
         return Float64(value)
     end
     value = _response_slot_column(plan, r, bound, "$side bound")
-    eltype(value) <: Real && all(isfinite, value) ||
-        _fail(r.label, "$side bound must contain finite numerics")
+    eltype(value) <: Real && all(valid, value) ||
+        _fail(r.label, "$side bound must contain finite numerics or $open (no $side bound)")
     return value
 end
 

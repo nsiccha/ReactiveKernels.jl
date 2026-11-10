@@ -66,6 +66,11 @@ const _JAX_YR = [0.1 .+ 0.05 .* jax_ppl_recurrence(R, 0.7, 0.3) .+ 0.01 .* randn
 const _JAX_TRIALS = rand(_JAX_RNG, 10:20, _JAX_N)
 const _JAX_SUCCESSES = [rand(_JAX_RNG, 0:n) for n in _JAX_TRIALS]
 const _JAX_HURDLE = [rand(_JAX_RNG) < 0.3 ? 0 : rand(_JAX_RNG, 1:5) for _ in 1:_JAX_N]
+# Per-row evidence bounds, infinite on the rows without one (rkppl-use §9).
+const _JAX_LIMIT = [isodd(i) ? -Inf : 1.0 for i in 1:_JAX_N]
+const _JAX_LOWER = [i % 3 == 0 ? -Inf : -6.0 for i in 1:_JAX_N]
+const _JAX_UPPER = [i % 4 == 0 ? Inf : 9.0 for i in 1:_JAX_N]
+const _JAX_INTERVAL = [isodd(i) ? Inf : y + 0.5 for (i, y) in enumerate(_JAX_Y)]
 
 const _JAX_CASES = (
     gaussian = () -> (@rkppl(begin
@@ -122,6 +127,16 @@ const _JAX_CASES = (
         a ~ Normal(0, 1); e ~ Normal(0, 1)
         y .~ HurdlePoisson.(exp.(a .+ 0.2 .* x), logistic.(e .+ 0.1 .* x))
     end))(; x = _JAX_X) | (; y = _JAX_HURDLE),
+    # Evidence bounds read as data, `-Inf`/`Inf` on rows without a bound.
+    infinite_limits = () -> (@rkppl(begin
+        a ~ Normal(0, 5); b ~ Normal(0, 2); s ~ Exponential(1.0)
+        mu = a .+ b .* x
+        y .~ censored.(Normal.(mu, s), lo, Inf)
+        t .~ truncated.(Normal.(mu, s), lower, upper)
+        w .~ interval_censored.(Normal.(mu, s), hi)
+    end))(; x = _JAX_X, lo = _JAX_LIMIT, lower = _JAX_LOWER, upper = _JAX_UPPER,
+           hi = _JAX_INTERVAL) | (; y = max.(_JAX_Y, _JAX_LIMIT),
+           t = clamp.(_JAX_Y, -5.9, 8.9), w = _JAX_Y),
     # An LKJ Cholesky factor (a loop whose branch arms differ in value type),
     # and multivariate normal slices with their runtime factor checks.
     lkj = () -> (@rkppl(begin
