@@ -16,6 +16,24 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.137
+
+- `jax_source`: a gather through a ragged integer row is padded as the row is
+  (snag `jax-ragged-index-b8420d16`). In a plate cell, `xs[rs[i]]`, `xs[r]` or
+  `view(xs, r)` with `R::Vector{Vector{Int}}` lost the row's lengths, so the
+  cell's reduction summed the padding entries, silently: the JAX value
+  repeated each row's last index up to the longest row (2.093 where native
+  gives 1.352), and an empty row added `x[end]`. Its gradient took the same
+  extra terms. The gathered value now carries the row's lengths, and every
+  reduction of it masks them.
+- `sum(f, v)`, `dot(u, v)` and `u' * v` of a padded (ragged) row now mask its
+  padding as `sum(v)` does; they summed it, also for a ragged input's own row.
+- A row of a ragged value read through `getindex`/`view` in lowered code keeps
+  its lengths, as `x[i]` in source does.
+- A gather through a ragged row beside another kept dimension (`M[r, :]`)
+  raises `JAXEmissionError`: its padding would sit on an inner axis that no
+  reduction masks. Its JAX value used to sum the padding.
+
 ## 0.1.136
 
 - `jax_source`'s `prepare_data` writes an element of an array that a list or
