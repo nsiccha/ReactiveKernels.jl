@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.139
+
+- `jax_source` follows a plain helper's lowered code through module-qualified
+  calls (`M.f(x)`, lowered `getproperty(M, :f)`), `getglobal(M, name)` of a
+  module and name known while emitting, `Val` tags (`Val(:f)`, `Val{:f}()`),
+  Vararg methods and their splats (`f(args...)`, lowered
+  `Core._apply_iterate`), and functions or types passed on as arguments.
+  StanBlocks `@deffun @juliacompat` functions call each callee as
+  `StanBlocks.jcall(Val{:f}(), _JuliaCallScope{M}(), args...)`, so one whose
+  body is straight-line now translates to the arithmetic it reaches; before,
+  every one raised `JAXEmissionError: the field read jcall on
+  ReactiveKernels._JaxCallable{Module}(StanBlocks)` (snag
+  `jax-source-stanb-06917e13`: BrunoPMX's `pk_generator`,
+  `logistic_dose_response` and `biexponential_rates`). A `@deffun` whose body
+  has a loop or an `if` stays a plain helper with loops or branches, which has
+  no translation.
+
 ## 0.1.138
 
 - `jax_source`: a gather through a ragged integer row is padded as the row is

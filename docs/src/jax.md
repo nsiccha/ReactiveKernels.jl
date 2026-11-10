@@ -251,6 +251,15 @@ A function that a recipe calls is translated if:
 - it is a prepared kernel, which becomes a module-level function of its plan;
 - or it is a plain function whose lowered code is straight-line.
 
+In that lowered code, module-qualified calls (`M.f(x)`), `getglobal(M, name)`
+of a module and name known while emitting, `Val` tags (`Val(:f)`,
+`Val{:f}()`), Vararg methods and their splats (`f(args...)`), and functions or
+types passed on as arguments resolve while emitting, so a call that reaches
+its callee this way is followed into it. StanBlocks `@deffun @juliacompat`
+functions are such calls (`StanBlocks.jcall(Val{:f}(), _JuliaCallScope{M}(),
+args...)`): one whose body is straight-line translates to the arithmetic it
+reaches (ReactiveKernels 0.1.139).
+
 A package adds a translation for its own function with a method of
 `ReactiveKernels._jax_elementwise` (a scalar function's `jax` name) or
 `ReactiveKernels._jax_function_call`. A package's plain helper with branches
@@ -269,7 +278,8 @@ checked and dropped.
 These shapes have no translation; each raises a `JAXEmissionError` naming the
 recipe and the construct:
 
-- a plain helper with loops or branches that is not `@traceable`;
+- a plain helper with loops or branches that is not `@traceable`, including
+  a StanBlocks `@deffun` whose body has a loop or an `if`;
 - in the JAX functions, a loop whose trip count is data with no static bound
   (JAX loops and arrays need static shapes), and a `throw` that depends on
   data (a runtime check is the form that has one); `prepare_data` runs both;
