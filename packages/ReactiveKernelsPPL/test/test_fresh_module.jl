@@ -476,4 +476,46 @@ end
     @test any(occursin("##_rkppl_selected#", t) for t in operations(one.spec))
     @test operations(one.spec) == operations(two.spec)
 end
+
+# A scan with two or more outputs (two carried arrays, or a carried array and a
+# sampled innovation) reads each trajectory out of one shared recurrence through
+# a column plate, `ReactiveKernels._scan_column_expr`. Its row is named by the
+# source too, so binding one declaration again, at the same or at other sizes,
+# spells one `kernel_expr` (snag `kernel-expr-scan-1a8411f4`).
+@testset "a scan's trajectory columns are named by the source" begin
+    model = @rkppl begin
+        s ~ Exponential(1.0)
+        step ~ Exponential(1.0)
+        @plate for g in eachindex(idx)
+            @scan begin
+                a[1] = x[1, g]
+                b[1] = 0.0
+                for t in 2:H
+                    a[t] = 0.5 * a[t - 1] + x[t, g]
+                    b[t] = 0.9 * b[t - 1] + a[t - 1]
+                end
+            end
+            @scan begin
+                l[1] = 0.0
+                for k in 2:K
+                    e ~ Normal(0, 1)
+                    l[k] = l[k - 1] + step * e
+                end
+            end
+            y[g] .~ Normal.(a[idx[g]] .+ b[idx[g]] .+ l[day[g]], s)
+        end
+    end
+    function bound(G, H)
+        x = reshape(collect(range(-1.0, 1.0; length = H * G)), H, G)
+        idx = [collect(g:H) for g in 1:G]
+        day = [cld.(i, 3) for i in idx]
+        model(; x, H, idx, day, K = cld(H, 3)) | (; y = [fill(0.1, length(i)) for i in idx])
+    end
+    source(b) = kernel_expr(b, build_kernel(b).layout)
+    small = source(bound(2, 5))
+    generated = Set(m.match for m in eachmatch(r"##[A-Za-z_0-9]+#\d+", string(small)))
+    @test count(n -> startswith(n, "##scan_row#"), generated) >= 2
+    @test small == source(bound(2, 5))
+    @test small == source(bound(3, 7))
+end
 end
