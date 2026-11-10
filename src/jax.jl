@@ -440,8 +440,11 @@ _jax_value(ctx::_JaxContext, x, hint) = Base.issingletontype(typeof(x)) ?
                _jax_where(ctx))
 _jax_is_singleton_value(v::_PyVal) = v.T isa Type && v.T !== Nothing && !(v.T <: Function) &&
     Base.issingletontype(v.T)
-_jax_type_of_value(v::_PyVal) = v.T isa Type && v.T <: Type && !(v.T isa UnionAll) ?
-    v.T.parameters[1] : nothing
+# The type a type value carries: `Type{T}` from source, or a callable type from
+# lowered code and type-level calls (`Float64` read as a global, a `where T`
+# parameter, `promote_type(...)`), as `clamp`'s `convert(T, x)` passes it.
+_jax_type_of_value(v::_PyVal) = v.T isa _JaxCallable ? (v.T.f isa Type ? v.T.f : nothing) :
+    v.T isa Type && v.T <: Type && !(v.T isa UnionAll) ? v.T.parameters[1] : nothing
 _jax_dtype(@nospecialize(E)) = E <: Bool ? "jnp.bool_" : E <: Integer ? "jnp.int64" : "jnp.float64"
 
 _jax_expr(ctx::_JaxContext, ::Val{H}, ex) where {H} =
@@ -2005,6 +2008,17 @@ for (f, op) in (((===), " is "), ((!==), " is not "))
 end
 _jax_function_call(ctx::_JaxContext, ::typeof(float), args::Vector{_PyVal}) =
     _jax_result(float, args, "jnp.asarray(" * only(args).code * ", dtype=jnp.float64)")
+# `convert(T, x)`: `x` itself when it is a `T` already (`convert(::Type{T}, x::T)`
+# returns `x`), else, to a concrete float or integer type, the conversion `T(x)`.
+function _jax_function_call(ctx::_JaxContext, ::typeof(convert), args::Vector{_PyVal})
+    T = length(args) == 2 ? _jax_type_of_value(args[1]) : nothing
+    x = args[end]
+    T isa Type && x.T isa Type || return _jax_traceable_or_lowered(ctx, convert, args)
+    x.T <: T && return x
+    isconcretetype(T) && (T <: AbstractFloat || T <: Integer && T !== Bool) && x.T <: Real &&
+        return _jax_call_positional(ctx, T, [x])
+    _jax_traceable_or_lowered(ctx, convert, args)
+end
 function _jax_function_call(ctx::_JaxContext, ::typeof(LinearAlgebra.dot), args::Vector{_PyVal})
     _jax_result(LinearAlgebra.dot, args, "jnp.vdot(" * _jax_args(args) * ")")
 end

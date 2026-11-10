@@ -16,13 +16,42 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.133
+## 0.1.135
+
+- `jax_source` translates `clamp` and `convert(T, x)` (snag
+  `jax-source-clamp-af26e700`). `clamp` is a straight-line Base function whose
+  lowered code converts its operands with `convert(promote_type(...), x)`,
+  and that `convert` had no translation, so a recipe calling `clamp` (the
+  `hsgp(...)` basis of a BRM model) raised `JAXEmissionError: the function
+  convert has no JAX translation`. `convert(T, x)` is now `x` when `x` is a
+  `T` already, and `T(x)` for a concrete float or integer `T`. `clamp` keeps
+  Julia's definition, two `jnp.where` selections, so at a bound its
+  derivative is the one Julia's `ifelse` gives (`jnp.clip` would halve it).
+- A type that lowered code or a type-level call passes as a value (`Int` read
+  as a global, a `where T` parameter, `promote_type(...)`) is now read as a
+  type by the calls that take one. In a plain helper, `floor(Int, x)` emitted
+  invalid Python (`jnp.floor(<callable>, x)`) and `ones(T, n)` was refused;
+  both now translate.
+
+## 0.1.134
 
 - `jax_source(spec; data, definitions)`: a definition may read a raw data
   value that is no input of the program (a value the program reads only
   through a copy, `_rkppl_value_r => :r`). `prepare_data` takes it as a
   parameter, typed by its value in `data`. ReactiveKernelsPPL 0.1.142 uses
   this so `prepare_data` asks for authored names only.
+
+## 0.1.133
+
+- A scan with two or more outputs (two carried arrays, or a carried array and
+  a sampled innovation) reads each trajectory out of its shared recurrence
+  through a column plate. That plate's row is now named by the source, like
+  the scan's seeds and steps, instead of with `gensym`'s process counter. An
+  `@rkppl` declaration holding such a scan, in a `@plate` cell or at top
+  level, bound again to the same data or at other sizes now gives an equal
+  `kernel_expr`, as ReactiveKernelsPPL 0.1.136 states for what a model call
+  generates. Built types, values and gradients are unchanged: two builds of
+  one binding already shared their types. Snag `kernel-expr-scan-1a8411f4`.
 
 ## 0.1.132
 

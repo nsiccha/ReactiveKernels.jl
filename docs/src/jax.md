@@ -229,6 +229,12 @@ A function that a recipe calls is translated if:
   SpecialFunctions through the package extension). `logbeta` is a helper the
   module defines, since `jax.scipy.special.betaln` (JAX 0.12) is accurate to
   about 1e-6 in float64 once an argument reaches 8;
+- it is a conversion that takes a type: `convert(T, x)` or `T(x)` to a float
+  or integer type, `floor(Int, x)`, `ones(T, n)`. The type may come from a
+  literal, a global or `where T` parameter in lowered code, or a type-level
+  call (`promote_type(...)`, `eltype(x)`), so Base functions built on these
+  translate too: `clamp` is its own definition, two `jnp.where` selections,
+  whose derivative at a bound is Julia's (`jnp.clip` would halve it);
 - it is defined with `@traceable`, in which case its authored body is
   translated (in `prepare_data`, as a host function);
 - it is a prepared kernel, which becomes a module-level function of its plan;

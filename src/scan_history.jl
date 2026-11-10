@@ -197,11 +197,13 @@ _history_has_reads(reads) = any(r -> !isempty(r.history), reads)
 
 # Both front ends expose one recurrence result through named columns. The
 # projection is itself a transparent, retained plate, not a replay of the step.
+# Its row is named by the source, like the scan's seeds and steps, so a
+# declaration rebound spells one `kernel_expr` (snag `kernel-expr-scan-1a8411f4`).
 _scan_named_tuple_expr(names, value) = Expr(:tuple,
     (Expr(:(=), name, value(name)) for name in names)...)
 
 function _scan_column_expr(rows, name)
-    row = gensym(:scan_row)
+    row = _kernel_gensym(:scan_row)
     Expr(:do, Expr(:call, GlobalRef(@__MODULE__, :plate), rows),
         Expr(:(->), Expr(:tuple, row),
             Expr(:block, Expr(:., row, QuoteNode(name)))))

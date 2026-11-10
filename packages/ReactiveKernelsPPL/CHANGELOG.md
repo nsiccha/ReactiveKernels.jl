@@ -23,7 +23,7 @@ are recorded in the git history only.
   `prepare_data` parameter by its authored name (`r`), which computes the
   copy; `prepare_data` asked for `_rkppl_value_r`, so a caller holding the
   authored data got a `KeyError`. `DATA` lists the authored name. Requires
-  ReactiveKernels 0.1.133.
+  ReactiveKernels 0.1.134.
 
 ## 0.1.141
 
