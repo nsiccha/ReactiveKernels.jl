@@ -784,6 +784,18 @@ end
     total = sum(f .^ 2)
     return total
 end
+# Straight-line plain helpers, translated from their lowered code: `end` in an
+# index (`lastindex`), a dimension a helper returns, and a dotted literal
+# power; and `cumsum` along a dimension (snag `jax-source-simpl-249ccdc6`).
+jax_test_axis() = 1
+jax_test_head(M) = M[1:(end - 1), :]
+jax_test_rows(M) = size(M, jax_test_axis())
+jax_test_squares(M) = sum(M .^ 2)
+@kernel jax_plain_shapes(a::Float64, M::Matrix{Float64}) = begin
+    C = cumsum(jax_test_head(a .* M); dims = 1)
+    total = jax_test_squares(C) + jax_test_rows(M) * a
+    return total
+end
 
 # RK's tie-exact `logaddexp` (mixture densities) and integer `div` (a mode
 # index `div(b - 1, k) % m + 1`).
@@ -976,6 +988,25 @@ end
     # axis that no reduction masks (its JAX value used to sum the padding).
     @test_throws "beside another kept dimension" jax_source(jax_gather_matrix_rows;
         have = (:b, :M, :R), want = :total)
+end
+
+# Plain helpers translated from their lowered code (`end`, a dimension another
+# helper returns, a dotted literal power) and `cumsum` along a dimension (snag
+# `jax-source-simpl-249ccdc6`).
+@testset "jax_source: plain-helper shapes and cumsum dims" begin
+    M = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+    src = jax_source(jax_plain_shapes; have = (:a, :M), want = :total)
+    text = string(src)
+    @test occursin("jnp.cumsum(", text) && occursin(", axis=", text)
+    @test occursin(" ** 2", text) && !occursin("vectorize", text)
+    if !rk_jax_available()
+        @test_skip false
+    else
+        native = prepare(jax_plain_shapes; have = (:a, :M), want = :total)
+        r = rk_jax_evaluate(src, "kernel", (0.5, M); grad = true)
+        @test r.value ≈ native(0.5, M) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), M), [0.5])) rtol = 1e-6
+    end
 end
 
 @testset "jax_source: values and gradients" begin

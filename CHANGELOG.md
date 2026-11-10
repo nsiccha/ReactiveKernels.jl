@@ -16,6 +16,26 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.145
+
+- `jax_source` translates `cumsum(x; dims = d)` as `jnp.cumsum` along the
+  static axis `d`. Before, any keyword `cumsum` raised `JAXEmissionError`
+  ("keyword arguments to `cumsum` have no JAX translation"), so a recipe
+  such as BRM's monotonic-effects table
+  `cumsum(vcat(zeros(1, n), simplex_incr); dims = 1)` did not emit (snag
+  `jax-source-simpl-249ccdc6`).
+- Three constructs in a straight-line plain helper, translated from its
+  lowered code, now emit as they do in source:
+  - an index's `end` (`M[1:(end - 1), :]`, lowered to `lastindex`) is the
+    static dimension size. Before, the module failed in Python with a
+    `ConcretizationTypeError` while JAX traced it;
+  - `size(x, d)` takes a dimension that another helper returns and that is
+    static while JAX traces (`size(U, axis(o))`), past `x`'s rank 1 as for
+    a literal dimension. Before, it raised `JAXEmissionError` ("`size` with
+    a computed dimension");
+  - a dotted literal power (`x .^ 2`) is the elementwise power. Before, the
+    emitted module was not valid Python (`jnp.vectorize(...)(<callable>, ...)`).
+
 ## 0.1.144
 
 - `jax_source(...; data)`: `prepare_data` translates `sort`, `sort!`,
