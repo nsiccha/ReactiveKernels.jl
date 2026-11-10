@@ -29,7 +29,7 @@ are recorded in the git history only.
   and NamedTuples is reserved` (one label's gradient) (snag
   `rkppl-zero-cell-a7c54028`). Requires ReactiveKernels 0.1.152.
 
-## 0.1.151
+## 0.1.149
 
 - `jax_source(built, plan)` emits a model whose data-only definition has no
   translation and is read by its fields, as BRM's
