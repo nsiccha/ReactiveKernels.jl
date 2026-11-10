@@ -16,6 +16,19 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.141
+
+- A `@plate` cell `@scan` that carries two or more arrays, or one array at a
+  lag depth above 1, may pass a lag to a module function
+  (`s[t] = add(s[t - 1], z[t - 1])`, or `+` bound to a module function as
+  BRM's RK emission binds it). Lowering refused it before with a
+  `SurfaceLoweringError` saying the definition "qualifies a call with
+  `:carry`, which is not a module visible in" the model's module: the step's
+  NamedTuple carry (`carry.s_lag1`) was read as a module path. A lambda's arguments and assigned locals and a
+  generator's iteration names are now lexical names of their body when
+  lowering resolves calls, as in Julia; a name no scope binds is still checked
+  as a module path. Snag `a-brm-plate-cell-bf665a16`.
+
 ## 0.1.140
 
 - **Breaking for `jax_source` callers:** a module's `prepare_data` takes the

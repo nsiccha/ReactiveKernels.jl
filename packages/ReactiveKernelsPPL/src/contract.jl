@@ -7527,27 +7527,28 @@ _constructed_endpoint_call(ex) =
 # the names of `ex` to `set`.
 function _generator_symbols!(walk, out::Set{Symbol}, ex::Expr)
     inner = Set{Symbol}()
-    binders = Set{Symbol}()
     for it in ex.args[2:end]
-        iters = it
-        if Meta.isexpr(it, :filter) && !isempty(it.args)
-            walk(inner, it.args[1])
-            iters = Expr(:block, it.args[2:end]...)
-        else
-            iters = Expr(:block, it)
-        end
-        for i in iters.args
-            if Meta.isexpr(i, :(=)) && length(i.args) == 2
-                walk(out, i.args[2])
-                _binder_symbols!(binders, i.args[1])
-            else
-                walk(out, i)
-            end
+        Meta.isexpr(it, :filter) && !isempty(it.args) && walk(inner, it.args[1])
+        for i in _generator_clauses(it)
+            walk(out, Meta.isexpr(i, :(=)) && length(i.args) == 2 ? i.args[2] : i)
         end
     end
     walk(inner, ex.args[1])
-    union!(out, setdiff(inner, binders))
+    union!(out, setdiff(inner, _generator_binders(ex)))
     return out
+end
+
+# The iteration clauses of one generator argument (`s = r`, or those a
+# `:filter` wraps), and the iteration names a generator binds.
+_generator_clauses(it) = Meta.isexpr(it, :filter) && !isempty(it.args) ?
+    it.args[2:end] : Any[it]
+function _generator_binders(ex::Expr)
+    binders = Set{Symbol}()
+    for it in ex.args[2:end], i in _generator_clauses(it)
+        Meta.isexpr(i, :(=)) && length(i.args) == 2 &&
+            _binder_symbols!(binders, i.args[1])
+    end
+    return binders
 end
 
 _binder_symbols!(out::Set{Symbol}, b::Symbol) = push!(out, b)
