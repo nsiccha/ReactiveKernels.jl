@@ -1495,6 +1495,17 @@ constrain(built.layout, u)               # named constrained values
 restore_draws(built.layout, U)           # U: layout.total × draws
 ```
 
+With `LogDensityProblems` loaded, the query is a first-order LogDensityProblems
+target over all `layout.total` coordinates (`dimension`, `logdensity`,
+`logdensity_and_gradient`, each gradient a fresh vector), so WarmupHMC,
+Pathfinder or an optimizer takes it directly. A query serves one caller at a
+time, so give each concurrent chain its own:
+
+```julia
+targets = [prepare_sampler(built, plan, u; backend) for _ in rngs]
+fits = adaptive_warmup_mcmc(rngs, targets; n_draws = 1000)   # WarmupHMC
+```
+
 ### Families of authored density queries
 
 `density_factors(built, plan)` inventories the model's original prior and

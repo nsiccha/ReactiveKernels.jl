@@ -406,6 +406,13 @@ The call paths below carry a `Base.invokelatest` barrier.
 
 The barrier copies nothing: a gradient call allocates only what the prepared
 gradient itself allocates, and a value call adds one boxed `Float64`.
+
+With `LogDensityProblems` loaded, a query is a first-order LogDensityProblems
+target over all `layout.total` packed coordinates, for WarmupHMC, Pathfinder
+or an optimizer: it implements `dimension`, `capabilities`
+(`LogDensityOrder{1}`), `logdensity` (`q(u)`) and `logdensity_and_gradient`,
+which returns a fresh gradient vector on every call. Give each concurrent
+chain its own query; a `deepcopy` is an independent query.
 """
 mutable struct SamplerQuery{K,P,L}
     const kernel::K
