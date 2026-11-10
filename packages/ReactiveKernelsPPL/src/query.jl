@@ -1292,6 +1292,7 @@ function _compact_overlay!(spec, plan::StructuralPlan)
     end
     add!(spec.graph, (spec[:_ppl_cell_base], spec[:_ppl_cell_active],
         spec[:_ppl_cell_slots]) => spec[:unconstrained], _compact_cell_point)
+    _check_overlay_base!(spec.graph, spec[:unconstrained], spec[:_ppl_cell_base])
     filter!(!=(:unconstrained), spec.have_names)
     prepend!(spec.have_names, [:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots])
     filter!(n -> n ∉ _absent_inputs(plan), spec.have_names)
@@ -2476,7 +2477,8 @@ end
 function _compact_partition_plan(p::ReactiveKernels.Plan; whole_footprint::Bool=true)
     old = p.graph
     graph = Graph(copy(old.values), copy(old.recipes),
-        Dict(id => copy(ids) for (id, ids) in old.producers), copy(old.aliases), old.version, nothing)
+        Dict(id => copy(ids) for (id, ids) in old.producers), copy(old.aliases), old.version, nothing,
+        copy(old.checks))
     overlay = map((:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots),
                   (AbstractVector{Float64}, AbstractVector{Float64}, AbstractVector{Int32})) do name, type
         any(v -> v.name === name, values(graph.values)) && throw(ContractValidationError(
@@ -2484,6 +2486,7 @@ function _compact_partition_plan(p::ReactiveKernels.Plan; whole_footprint::Bool=
         value!(graph, name, type)
     end
     packed = only(v for v in p.have if v.name === :unconstrained)
+    _check_overlay_base!(graph, packed, first(overlay))
     point = whole_footprint ? _compact_cell_point : _local_cell_point
     recipe = ReactiveKernels._add_recipe!(graph, overlay, (packed,), point,
         1.0, nothing, false, ReactiveKernels._NO_KERNEL_SOURCE)

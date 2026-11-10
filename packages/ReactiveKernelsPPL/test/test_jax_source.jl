@@ -838,6 +838,16 @@ end
             @test r.parameters["c"] == (start = 3, stop = total, dims = (levels,))
             @test r.parameters["s"] == (start = 2, stop = 3, dims = ())
         end
+        # A point holds one binding's coordinates: the module refuses another
+        # length, as native cuts do (snag `rk-prepared-cut-0e0b98ed`).
+        u = 0.1 .* collect(1:6)
+        query = prepare_query(build_kernel(small), small, :sampler)
+        @test rk_jax_evaluate(src, "log_density", (u, jax_raw_data(small, src)...);
+            prepare = true).value ≈ query(u) rtol = 1e-10
+        for n in (5, 8)
+            @test_throws "packed length" rk_jax_evaluate(src, "log_density",
+                (0.1 .* collect(1:n), jax_raw_data(small, src)...); prepare = true)
+        end
     end
 end
 

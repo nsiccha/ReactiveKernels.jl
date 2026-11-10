@@ -2482,7 +2482,7 @@ function _cell_outline(p::Plan, outlines::Dict{Int,Any})
     isempty(outlines) && return p, Set{Int}()
     g = p.graph
     copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers), copy(g.aliases),
-                   g.version)
+                   g.version, nothing, copy(g.checks))
     next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     recipes = Recipe[]
@@ -2518,7 +2518,7 @@ function _cell_expand_selected(p::Plan, blocked, types)
     isempty(selected) && return p
     old = p.graph
     g = Graph(copy(old.values), copy(old.recipes), copy(old.producers),
-              copy(old.aliases), old.version)
+              copy(old.aliases), old.version, nothing, copy(old.checks))
     next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
     freshid() = (id = next_id[]; next_id[] -= 1; id)
     recipes = Recipe[]
@@ -2713,7 +2713,7 @@ function _cell_scalar_reads(p::Plan; argument_types = nothing)
     # Copy even without an outline: a literal index needs a new graph value.
     old = q.graph
     g = Graph(copy(old.values), copy(old.recipes), copy(old.producers),
-              copy(old.aliases), old.version)
+              copy(old.aliases), old.version, nothing, copy(old.checks))
     types = _cell_value_types(q; argument_types, outlined)
     next_id = minimum((r.id for r in q.recipes); init = 0) - 1
     recipes = Recipe[]
@@ -2849,7 +2849,7 @@ function _cell_scalar_plates(p::Plan; argument_types = nothing,
     end
     isempty(lifted) && return p
     g = Graph(copy(p.graph.values), copy(p.graph.recipes), copy(p.graph.producers),
-        copy(p.graph.aliases), p.graph.version)
+        copy(p.graph.aliases), p.graph.version, nothing, copy(p.graph.checks))
     replacements = Dict(id => Value{AbstractVector{types[id]}}(id, g.values[id].name)
         for id in lifted)
     for (id, v) in replacements
@@ -2979,7 +2979,7 @@ function _cell_split_tuple_plates(p::Plan)
     end
     isempty(splits) && return p
     g = Graph(copy(old.values), copy(old.recipes), copy(old.producers),
-              copy(old.aliases), old.version)
+              copy(old.aliases), old.version, nothing, copy(old.checks))
     next_id = minimum((r.id for r in p.recipes); init = 0) - 1
     # The part each reader of a split plate reads instead, by reader and plate output.
     finals = Dict{Tuple{Int,ValueId},Value}()

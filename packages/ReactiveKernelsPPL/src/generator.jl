@@ -50,6 +50,7 @@ function _build_kernel_latest(plan::StructuralPlan)
     layout = assign_layout(plan)
     def = kernel_expr(plan, layout)
     spec = _eval_kernel_def(def)
+    _register_packed_check!(spec, layout)
     return (; spec, layout, program = _program_identity(def))
 end
 

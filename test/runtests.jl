@@ -111,6 +111,7 @@ const _MATRIX_CORE_TESTS = (
     "test_plate_partition.jl",
     "test_partition_prefix.jl",
     "test_partition_prefix_types.jl",
+    "test_input_checks.jl",
     "test_authored_loops.jl",
     "test_jax_source.jl",
     "test_scan_columns.jl",
