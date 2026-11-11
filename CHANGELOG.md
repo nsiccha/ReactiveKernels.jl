@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.165
+
+- `jax_source`: a plate's cell knows a shared operand that is known while JAX
+  traces (a prepared integer, a literal, a shape) as such, as the code
+  outside the plate does. `jax.vmap` passes an operand it does not map to
+  the cell unchanged, so a prepared integer `H` stays its `StaticInt` there,
+  also under `jax.jit`. A cell recipe that reads a parameter beside `H` now
+  translates: a range `2:H` (a generator `sum(b * x[t, j] for t in 2:H)`),
+  an allocation `fill(b, H)` and a `@traceable` helper's loop to `H` raised
+  `JAXEmissionError` (`a range whose length depends on data`, `an array whose
+  length depends on data`, `a loop whose trip count depends on data`)
+  because the cell took `H` as a traced value. A data-only cell recipe such
+  as a scan's `2:H` translated since 0.1.154 by running in `prepare_data`;
+  it now stays in the cell, so the module no longer prepares a copy of the
+  range. A shape test on such an operand in a cell decides while tracing
+  (snag `jax-source-refus-206a8219`).
+
 ## 0.1.164
 
 - A plate cell whose value is one broadcast of 32 or more operands, such as
