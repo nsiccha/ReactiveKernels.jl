@@ -121,7 +121,7 @@ _host_emit_lines!(ctx::_JaxContext, lines, extra::Int = 0) =
 # --- locals ---------------------------------------------------------------------------
 
 # A local read as a value: a list is read as an array.
-_host_read(ctx::_JaxContext, v::_PyVal) = v.code in ctx.host.lists ?
+_host_read(ctx::_JaxContext, v::_PyVal) = ctx.host !== nothing && v.code in ctx.host.lists ?
     _PyVal("np.asarray(" * v.code * ", dtype=" * _host_dtype(_jax_eltype(v.T)) * ")", v.T, true) : v
 # A local read in place (appended to, indexed, measured, iterated).
 _host_raw(ctx::_JaxContext, ex) = ex isa Symbol && haskey(ctx.locals, ex) ? ctx.locals[ex] :
@@ -504,20 +504,28 @@ function _host_iterable(ctx::_JaxContext, iter)
         args = iter.args[2:end]
         if f === Colon() && length(args) == 2
             lo, hi = _jax_expr(ctx, args[1]), _jax_expr(ctx, args[2])
+            foreach(v -> _jax_python_value(ctx, v), (lo, hi))
             return "range(" * lo.code * ", " * _jax_plus_one(hi) * ")", Int
         elseif f === Colon() && length(args) == 3
             lo, step, hi = (_jax_expr(ctx, a) for a in args)
+            foreach(v -> _jax_python_value(ctx, v), (lo, step, hi))
             stop = "(" * hi.code * ") + (1 if " * step.code * " > 0 else -1)"
             return "range(" * lo.code * ", " * stop * ", " * step.code * ")", Int
         elseif (f === eachindex || f === keys || f === values || f === pairs) && length(args) == 1
             x = _host_raw(ctx, args[1])
+            f in (eachindex, keys) || _jax_python_value(ctx, x)
             if x.T isa Type && x.T <: AbstractDict
+                _jax_python_value(ctx, x)
                 f === pairs && return x.code * ".items()", Tuple{Base.keytype(x.T),Base.valtype(x.T)}
                 f === values && return x.code * ".values()", Base.valtype(x.T)
                 return x.code * ".keys()", Base.keytype(x.T)
             end
             f === values && return x.code, _jax_eltype(x.T)
             f === pairs && return "enumerate(" * x.code * ", 1)", Tuple{Int,_jax_eltype(x.T)}
+            if f === eachindex && _jax_is_array(x.T)
+                n = _jax_python_value(ctx, _jax_function_call(ctx, length, [x]))
+                return "range(1, " * _jax_plus_one(n) * ")", Int
+            end
             return "range(1, len(" * x.code * ") + 1)", Int
         elseif f === axes && length(args) == 2
             x = _host_raw(ctx, args[1])
@@ -534,6 +542,7 @@ function _host_iterable(ctx::_JaxContext, iter)
         end
     end
     x = _host_raw(ctx, iter)
+    _jax_python_value(ctx, x)
     T = x.T
     T isa Type && T <: AbstractDict && return x.code * ".items()", Tuple{Base.keytype(T),Base.valtype(T)}
     T isa Type && T <: Tuple && return x.code, promote_type(fieldtypes(T)...)
@@ -544,11 +553,20 @@ function _host_iterable(ctx::_JaxContext, iter)
     x.code, eltype(T)
 end
 
+# Host preparation may read all concrete data. A Python iterator in a JAX
+# function may read only values available while tracing; converting a tracer
+# to a string would otherwise silently print the tracer instead of its value.
+function _jax_python_value(ctx::_JaxContext, v::_PyVal)
+    ctx.host !== nothing || v.static ||
+        _jax_error("a Python iterable or string operation needs values known while JAX traces", _jax_where(ctx))
+    v
+end
+
 # Bind a loop's target (`i`, `(i, v)`) to fresh locals of element type `E`.
 function _host_targets!(ctx::_JaxContext, lhs, @nospecialize(E))
     if lhs isa Symbol
         name = _jax_fresh(ctx, lhs)
-        push!(ctx.host.frame, name)
+        ctx.host === nothing || push!(ctx.host.frame, name)
         ctx.locals[lhs] = _PyVal(name, E, true)
         return name
     end
@@ -632,13 +650,13 @@ function _host_nested_function!(ctx::_JaxContext, hint, params::Vector{Symbol}, 
     inner.indent = outer.indent + 1
     names = [_jax_identifier(inner.used, p) for p in params]
     saved = (copy(ctx.locals), ctx.host)
-    ctx.host = _HostState(Set{String}(names); in_function = true)
+    ctx.host = saved[2] === nothing ? nothing : _HostState(Set{String}(names); in_function = true)
     ctx.scope = inner
     v = try
         for (p, n, T) in zip(params, names, types)
             ctx.locals[p] = _PyVal(n, T, true)
         end
-        _host_read(ctx, build())
+        _jax_python_value(ctx, _host_read(ctx, build()))
     finally
         ctx.scope = outer
         empty!(ctx.locals); merge!(ctx.locals, saved[1])
@@ -652,7 +670,7 @@ end
 
 # The clauses of a generator (`for i in r if c`), its element's Python
 # expression and type. Iterables after the first must be expressions.
-function _host_generator(ctx::_JaxContext, gen::Expr)
+function _host_generator(ctx::_JaxContext, gen::Expr; column_major::Bool = false)
     body = gen.args[1]
     specs = Any[gen.args[2:end]...]
     condition = nothing
@@ -672,6 +690,19 @@ function _host_generator(ctx::_JaxContext, gen::Expr)
             push!(clauses, header)
             append!(bound, _host_target_symbols(spec.args[1]))
         end
+        if column_major && length(specs) > 1
+            # Julia's product iterator varies its first index fastest. Python
+            # product varies the last; reverse both inputs and yielded tuples.
+            # Each input is evaluated once, in authored order.
+            product = _jax_helper!(ctx, "_rk_product", raw"""
+def _rk_product(*iterables):
+    import itertools
+    return (tuple(reversed(item)) for item in itertools.product(*reversed(iterables)))
+""")
+            parts = [split(c[5:end], " in "; limit = 2) for c in clauses]
+            clauses = ["for (" * join(first.(parts), ", ") * ") in " * product *
+                       "(" * join(last.(parts), ", ") * ")"]
+        end
         element, E = _host_inline_or_function(ctx, :element, bound, body)
         if condition !== nothing
             test, _ = _host_inline_or_function(ctx, :keep, bound, condition)
@@ -689,6 +720,7 @@ _host_target_symbols(lhs) = lhs isa Symbol ? Symbol[lhs] :
 # statements, else a call of a nested function of the targets.
 function _host_inline_or_function(ctx::_JaxContext, hint, bound::Vector{Symbol}, ex)
     v, lines = _host_capture(() -> _jax_expr(ctx, ex), ctx)
+    _jax_python_value(ctx, v)
     isempty(lines) && return v.code, v.T
     names = [ctx.locals[s].code for s in bound]
     types = Any[ctx.locals[s].T for s in bound]
