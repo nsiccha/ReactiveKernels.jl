@@ -4684,9 +4684,9 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
     # names only what the caller supplies, and the body reads its inputs.
     if reserve
         shown = keyword_from === nothing ? inputs : inputs[1:keyword_from]
-        signature = join((pn * ": " * _jax_annotation(T) for (pn, T) in shown), ", ")
-        keyword_from === nothing || (signature *= ", **prepared: ArrayLike")
-        lines = String["def " * name * "(" * signature * ") -> " * _jax_return_annotation(w, wants) * ":"]
+        signature = [pn * ": " * _jax_annotation(T) for (pn, T) in shown]
+        keyword_from === nothing || push!(signature, "**prepared: ArrayLike")
+        lines = String["def " * name * "(" * join(signature, ", ") * ") -> " * _jax_return_annotation(w, wants) * ":"]
         push!(lines, _jax_docstring(something(doc, _jax_default_doc(w)), "    "))
         if keyword_from !== nothing
             for (pn, _) in inputs[keyword_from+1:end]

@@ -1455,6 +1455,66 @@ end
     end
 end
 
+@kernel jax_all_prepared(x::Vector{Float64}) = begin
+    result = sum(x)
+    doubled = 2 * result
+    return result, doubled
+end
+
+@testset "jax_source: all inputs prepared" begin
+    src = jax_source(jax_all_prepared; have = (:x,), want = :result, data = (:x,))
+    multiple = jax_source(jax_all_prepared; have = (:x,),
+        functions = (total = :result, both = (:result, :doubled)), data = (:x,))
+    @test occursin("def kernel(**prepared: ArrayLike)", string(src))
+    @test occursin("def total(**prepared: ArrayLike)", string(multiple))
+    @test occursin("def both(**prepared: ArrayLike)", string(multiple))
+    @test first.(src.functions[1].inputs) == ["x"]
+    @test first.(src.functions[2].inputs) == ["result"]
+
+    # Data sizes and values do not change the emitted program, including an
+    # empty input. Preparation computes the sum once per dataset on the host.
+    datasets = (Float64[], [1.25], collect(-9.0:9.0) .+ 0.25)
+    native = prepare(jax_all_prepared; have = (:x,), want = :result)
+    for x in datasets
+        @test string(jax_source(jax_all_prepared; have = (:x,), want = :result,
+                               data = (; x))) == string(src)
+    end
+    if !rk_jax_available()
+        @test_skip false
+    else
+        mktempdir() do dir
+            single_path = joinpath(dir, "all_prepared.py")
+            multiple_path = joinpath(dir, "multiple_prepared.py")
+            write(single_path, src)
+            write(multiple_path, multiple)
+            program = """
+                import importlib.util, py_compile
+                import jax, numpy as np
+                def load(path):
+                    py_compile.compile(path, doraise=True)
+                    spec = importlib.util.spec_from_file_location("prepared_module", path)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    return module
+                single = load($(_rk_py(single_path)))
+                multiple = load($(_rk_py(multiple_path)))
+                for raw, expected in zip($(_rk_py(collect(datasets))), $(_rk_py([native(x) for x in datasets]))):
+                    x = np.asarray(raw, dtype=np.float64)
+                    original = x.copy()
+                    prepared = single.prepare_data(x=x)
+                    assert float(single.kernel(**prepared)) == expected
+                    assert float(jax.jit(single.kernel)(**prepared)) == expected
+                    assert float(jax.grad(lambda p: single.kernel(**p))(prepared)["result"]) == 1.0
+                    prepared = multiple.prepare_data(x=x)
+                    assert float(jax.jit(multiple.total)(**prepared)) == expected
+                    assert tuple(map(float, jax.jit(multiple.both)(**prepared))) == (expected, 2 * expected)
+                    np.testing.assert_array_equal(x, original)
+                """
+            @test success(`$RK_JAX_PYTHON -c $program`)
+        end
+    end
+end
+
 @testset "jax_source: prepare_data" begin
     g = ["b", "a", "c", "a", "b", "b"]
     y = [1, 3, 2, 0, 3, 1]

@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.172
+
+- `jax_source` emits valid Python when every input is host-prepared data.
+  The generated functions take `(**prepared)` without a leading comma, so
+  `prepared = prepare_data(x=...)` followed by `kernel(**prepared)` works
+  even when there are no remaining positional inputs.
+
 ## 0.1.171
 
 - Partition plans retain label-only row bookkeeping inside an outer conditional,
