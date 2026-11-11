@@ -36,3 +36,45 @@ A dotted cell latent, `v[i] .~ D.(args…)` with a length per index that data de
 Only supported operations can be emitted. Translation errors identify an unsupported operation instead of substituting a different computation. JAX compilation, device placement and differentiation belong to the Python consumer.
 
 The [Eight-schools example](eight-schools.md) explains the model and coordinate boundary that a PPL export must preserve.
+
+## Helpers with loops and branches
+
+A helper that a recipe calls is translated from its source when the emitter has it. An `@traceable` helper records its own source: a `for` loop becomes `jax.lax.fori_loop`, an `if` becomes `jax.lax.cond`, and `A[i] = v` becomes `A.at[i].set(v)`. A plain helper is translated from its lowered code, which must be straight-line.
+
+A method that a package generates, such as one its macro writes into the caller's module, cannot carry `@traceable`. The generating package keeps the method's source as a `TraceableSource` (argument names, body, and the module whose globals the body reads) and hands it over through a provider. It registers the provider with `register_source_provider!`, once, from the `__init__` of the package extension that loads with ReactiveKernels. The emitter asks the provider for a call that has no other translation and no `@traceable` source, with the function and the `Tuple` type of the argument types. The provider answers `nothing` or the source of the method those arguments call natively.
+
+The example below stands in for such a package. Its macro defines the method and keeps its source.
+
+```@example jax
+const GENERATED = Dict{Any,TraceableSource}()
+
+macro generate(def)
+    call, body = def.args
+    names = Tuple(arg.args[1] for arg in call.args[2:end])
+    source = TraceableSource(names, body, __module__)
+    :($(esc(def)); GENERATED[$(esc(call.args[1]))] = $source)
+end
+
+@generate function decay_sum(x::Vector{Float64}, rate::Float64)
+    total = zero(rate)
+    for i in 1:3
+        total = total + x[i] * exp(-i * rate)
+    end
+    if rate > 0
+        total = total / rate
+    end
+    return total
+end
+
+provide_source(f, argument_types) = get(GENERATED, f, nothing)
+register_source_provider!(provide_source)
+
+@kernel decayed(x::Vector{Float64}, rate::Float64) = begin
+    value = decay_sum(x, rate)
+    return value
+end
+
+print(jax_source(decayed; have = (:x, :rate), want = :value))
+```
+
+The body follows the rules of an `@traceable` body: a `return` only at its end, and in the JAX functions no `break` or `continue` and a `for` over one range. `prepare_data` runs the body as host Python, which takes both. A provider's source is read only by `jax_source`; native execution runs the method itself.

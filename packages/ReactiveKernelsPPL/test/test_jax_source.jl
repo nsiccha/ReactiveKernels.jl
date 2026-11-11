@@ -140,6 +140,23 @@ const _JAX_INTERVAL = [isodd(i) ? Inf : y + 0.5 for (i, y) in enumerate(_JAX_Y)]
 
 # Two monotonic predictors of a factor with `levels` levels; two levels give
 # one increment, a one-entry simplex with no coordinates.
+const _JAX_PLATE_SCAN = @rkppl begin
+    a ~ Normal(0, 1)
+    @plate for j in eachindex(y)
+        @scan begin
+            s[1] = x[1, j]
+            for t in 2:H
+                s[t] = 0.5 * s[t - 1] + x[t, j]
+            end
+        end
+        y[j] ~ Normal(a + s[H], 1)
+    end
+end
+function jax_plate_scan_plan(H, J)
+    rng = Xoshiro(H + 10J)
+    _JAX_PLATE_SCAN(; x = randn(rng, H, J), H) | (; y = randn(rng, J))
+end
+
 jax_monotonic_plan(levels) = (@rkppl(begin
     a ~ Normal(0, 2); s ~ Exponential(1.0)
     mo ~ jax_ppl_monotonic(alpha, nincr, 2)
@@ -410,6 +427,33 @@ const _JAX_CASES = (
     end))(; log_transition = cat([log(0.5) -Inf; -Inf -Inf], [log(0.5) log(0.5); -Inf 0.0],
                                  [log(0.5) log(0.5); -Inf 0.0]; dims = 3),
            log_initial = [0.0, -Inf]) | (; y = [0.3, 0.1, -0.4, 0.2]),
+    # A plate cell's scan over `2:H`, `H` a top-level data integer the cells
+    # share: a `StaticInt` of the prepared data, static in the cell too (snag
+    # jax-source-refus-206a8219). A cell recipe that reads a parameter beside
+    # `H` (a range and an allocation to `H`), which `prepare_data` cannot
+    # compute; and a per-cell stop `n[g]`, whose ranges `prepare_data`
+    # computes per cell (padded).
+    plate_scan_shared_length = () -> jax_plate_scan_plan(5, 3),
+    plate_shared_length_parameter = () -> (@rkppl(begin
+        b ~ Normal(0, 1)
+        @plate for j in eachindex(y)
+            m = sum(b * x[t, j] for t in 2:H) + sum(fill(b, H)) / H
+            y[j] ~ Normal(m, 1)
+        end
+    end))(; x = _JAX_XM[1:6, :], H = 6) | (; y = _JAX_X[1:3]),
+    plate_scan_per_cell_length = () -> (@rkppl(begin
+        a ~ Normal(0, 1)
+        @plate for g in eachindex(y)
+            @scan begin
+                s[1] = x[g][1]
+                for t in 2:n[g]
+                    s[t] = 0.5 * s[t - 1] + x[g][t]
+                end
+            end
+            y[g] ~ Normal(a + s[n[g]], 1)
+        end
+    end))(; x = [[0.1, 0.4, -0.2], [0.3, 0.2], [-0.5, 0.1, 0.6, 0.2]], n = [3, 2, 4]) |
+        (; y = [0.2, -0.1, 0.4]),
     # Each row's features reach the law as a padded row, so the feature
     # matrix is padded along its first axis.
     feature_mixture = () -> (@rkppl(begin
@@ -1029,6 +1073,23 @@ end
         @test lengths == [3, 1, 2]
         @test [r["mu"][g][1:n] for (g, n) in enumerate(lengths)] ≈ [[0.4, 0.5, 0.6], [0.8], [0.3, 1.3]]
     end
+end
+
+# A cell's scan over `2:H`, `H` the shared data integer (snag
+# jax-source-refus-206a8219): the cell reads `H` as the `StaticInt`
+# `prepare_data` returns, which `jax.vmap` passes to it unmapped, so the range
+# stays in the cell as a static `jnp.arange` (no prepared copy of it) and one
+# module serves every size. Parity: `_JAX_CASES.plate_scan_shared_length`.
+@testset "jax_source(built, plan): a cell's scan over a shared data length" begin
+    texts = map(((5, 3), (8, 4))) do (H, J)
+        plan = jax_plate_scan_plan(H, J)
+        string(jax_source(build_kernel(plan), plan))
+    end
+    @test texts[1] == texts[2]
+    @test occursin(r"\"H\": StaticInt\(H\w*\)", texts[1])
+    @test occursin(r"jax\.vmap\(cell, in_axes=\(0, None, None, None\)\)\(\w+, x, H, a\)", texts[1])
+    @test occursin(r"scan_argument = jnp\.arange\(2, H\w* \+ 1\)", texts[1])
+    @test !occursin("\"scan_argument\"", texts[1])
 end
 
 # The LogNormal variance graphs are still refused: a plate child spliced under

@@ -2978,12 +2978,15 @@ end
 _jax_call_positional(ctx::_JaxContext, c::_KernelPreparedChild, args::Vector{_PyVal}) =
     _jax_call_positional(ctx, c.kernel, args, c.name)
 
-# A `@traceable` helper: its authored body over the arguments, as the compiled
+# A `@traceable` helper, or a method whose source a registered provider
+# supplies: its authored body over the arguments, as the compiled
 # path reads it. Its locals are scoped to the call.
 function _jax_traceable_call(ctx::_JaxContext, f, args::Vector{_PyVal})
     types = Any[a.T for a in args]
     all(T -> T isa Type, types) || return nothing
     source = _traceable_source(typeof(f), types...)
+    # A method a package generates: its source from a registered provider.
+    source === nothing && (source = _provided_source(f, types))
     source === nothing && return nothing
     names, body, mod = source
     length(names) == length(args) || return nothing
@@ -3026,7 +3029,9 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
               (st isa Expr && st.head in (:enter, :leave, :pop_exception)), ci.code) &&
         _jax_error("the function `", f, "` has loops or branches, so its lowered code is ",
                    "not translated", _jax_where(ctx), ". Author it as a kernel, ",
-                   "or give it a `ReactiveKernels._jax_function_call` method")
+                   "or give it a `ReactiveKernels._jax_function_call` method; for a method ",
+                   "a package generates, the package supplies its source with ",
+                   "`ReactiveKernels.register_source_provider!`")
     mod = parentmodule(f)
     ssa = Vector{Any}(undef, length(ci.code))
     m = try
@@ -3474,9 +3479,12 @@ end
 # WANT values the result. `types` are the parameters' Julia types; a parameter
 # with `extents[i]` true is padded and takes its length (or lengths) as an
 # extra parameter after it. A WANT with an extent returns its length too.
+# A parameter with `statics[i]` true is known while JAX traces (its caller
+# passes it a value that is).
 # Returns the function name, the WANT values and which of them return a length.
 function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
-                             extents = fill(false, length(p.have)))
+                             extents = fill(false, length(p.have)),
+                             statics = fill(false, length(p.have)))
     name = _jax_fresh(ctx, hint)
     outer = ctx.scope
     inner = _JaxScope(outer)
@@ -3490,7 +3498,7 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
             extent = _jax_identifier(inner.used, Symbol(v.name, :_n))
             push!(names, extent)
         end
-        inner.values[canon_id(p.graph, v.id)] = _PyVal(param, types[i], false, extent)
+        inner.values[canon_id(p.graph, v.id)] = _PyVal(param, types[i], statics[i], extent)
     end
     recipe = ctx.recipe
     ctx.scope = inner
@@ -3543,6 +3551,14 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     padded = [mapped[i] && !ragged[i] && !isempty(v.extent) for (i, v) in enumerate(inputs)]
     cell_types = Any[mapped[i] ? eltype(v.T) : _jax_unref(v.T) for (i, v) in enumerate(inputs)]
     cell_extents = Bool[ragged[i] for i in eachindex(inputs)]
+    # `jax.vmap` hands an argument it does not map (`in_axes` `None`) to the
+    # cell unchanged, also under `jax.jit`: a Python or NumPy value stays
+    # one, and a `StaticInt` of the prepared data stays static (measured with
+    # JAX 0.12.0.1). So a shared argument known while tracing is known in the
+    # cell too: a range, an allocation, a loop or a shape test on a prepared
+    # integer (`sum(b * x[t] for t in 2:H)`, `fill(b, H)`) is static there as
+    # it is outside the plate, also in a recipe that reads a parameter.
+    cell_statics = Bool[!mapped[i] && v.static for (i, v) in enumerate(inputs)]
     # A lazy branch in the cell stays a `lax.cond`. Under `vmap`, JAX batches a
     # `lax.cond` whose condition differs between cells by evaluating both arms
     # and selecting; each lane's untaken arm reads its inputs through
@@ -3551,7 +3567,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     # selects `stop_gradient` inputs per arm; a vmapped `cond(x > 0, log(x), 0)`
     # at x = 0 has gradient 0, where `jnp.where` gives NaN).
     cell, wants, with_length, cell_params = _jax_plan_function!(ctx, :cell, body, cell_types;
-                                                                extents = cell_extents)
+                                                                extents = cell_extents,
+                                                                statics = cell_statics)
     want = only(wants)
     E = _jax_typeof(want)
     axes = String[]

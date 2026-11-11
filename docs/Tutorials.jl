@@ -14,7 +14,7 @@ function DocumenterVitepress.vitepress_assets(::BuildAssets)
     # The writer moves executed outputs into .documenter before this hook.
     generated = joinpath(ROOT, "build", ".documenter", "generated-assets")
     mkpath(generated)
-    cp(AlgebraOfVega.vega_vendor_dir(), joinpath(generated, "_aov"); force=true)
+    cp(AlgebraOfVega.vega_vendor_dir(), joinpath(generated, "aov"); force=true)
     cp(joinpath(ROOT, "build", ".documenter", "receipts"),
         joinpath(generated, "receipts"); force=true)
     return [generated]
@@ -45,7 +45,8 @@ end
 
 # AoV owns its runtime and theme behavior. The build copies these vendor assets
 # through the public vega_head/vega_vendor_dir surface, never into tracked files.
-figure_assets() = AlgebraOfVega.vega_head(; source=:vendor, base="./_aov", runtime=:linked)
+# GitHub Pages filters underscore-prefixed directories during Jekyll processing.
+figure_assets() = AlgebraOfVega.vega_head(; source=:vendor, base="./aov", runtime=:linked)
 
 function generated(kernel)
     print(Base.remove_linenums!(deepcopy(code_expr(kernel))))

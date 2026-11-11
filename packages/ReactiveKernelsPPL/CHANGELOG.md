@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.156
+## 0.1.157
 
 - `jax_source` of a program with a dotted `@plate` cell latent,
   `v[i] .~ D.(args…)` whose length per index comes from data (BRM's
@@ -29,12 +29,29 @@ are recorded in the git history only.
   _ppl_cell_blocks has loops or branches`) on a fresh binding, and after a
   native query emitted a module that took the block table and the other
   helper values as inputs the binding's data do not hold (snag
-  `jax-source-of-a-30375424`). Requires ReactiveKernels 0.1.160.
+  `jax-source-of-a-30375424`). Requires ReactiveKernels 0.1.166.
 - Not built yet, and refused with `JAXEmissionError` naming the case: an
   argument that reads a sampled array at the index (`b[i] .~ Normal.(a[i], 1)`
   with `a[i]` a cell latent, `Normal.(m[rows[i]], 1)` with `m` sampled), and
   an array of rank 2 or more at each index. Arguments of data beside scalar
   parameters translate.
+
+## 0.1.156
+
+- New `rescore_smc_checkpoint(target, checkpoint; previous = nothing,
+  rtol = 1e-10)` re-anchors an `smc_checkpoint` on the current host. A
+  checkpoint written on one host could not be resumed on another whose CPU
+  code generation differs (AVX-512 versus AVX2): `resume_smc` compares the
+  recomputed endpoint scores bit for bit, and those hosts round the same
+  log density 1–2 ulp apart (snag `smc-checkpoint-c-396259c8`). The new
+  function runs every `resume_smc` check, accepts scores within
+  `abs(new - old) <= rtol * max(abs(old), 1)`, and returns a copy carrying
+  this host's scores and an appended `rescored` record
+  `(; changed, max_abs, max_rel, rtol, codegen)`. `resume_smc` stays exact.
+- A refused `resume_smc` now names how many endpoint scores differ and the
+  largest deviation with its particle, and points to
+  `rescore_smc_checkpoint` when the deviation is within its default `rtol`.
+  The `resume_smc` docstring states the code-generation requirement.
 
 ## 0.1.155
 

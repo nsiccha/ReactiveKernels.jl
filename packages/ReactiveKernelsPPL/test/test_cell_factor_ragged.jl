@@ -113,3 +113,79 @@ end
     @test length(cell_reductions(factors)) == 1
     @test_throws PartitionLocalityError prepare_cell_factor_query(factors, 1)
 end
+
+# The shape BRM emits for a nested (subject > unit) model: a per-subject cell
+# reads a per-subject gather at its own row and a unit-level array at its
+# ragged rows (snag cell-factor-ad-r-b4e2a0f4). The outer factor's exemplar
+# sums are a total-only plate over that cell's observations, downstream of the
+# plate cell; the cell's gathers must keep their row forms there.
+_cfr_flatten(cells) = reduce(vcat, cells; init=Float64[])
+const _CFR_NESTED = @rkppl begin
+    a ~ Normal(0, 1)
+    s ~ Exponential(1)
+    zs[levels(subject)] .~ Normal.(0, 1)
+    zu[levels(unit)] .~ Normal.(0, 1)
+    mu = a .+ s .* zs[subject]
+    unit_shift = zu[unit]
+    sigma ~ Exponential(1)
+    @plate for i in eachindex(subject)
+        pred_cell = mu[i] .+ unit_shift[rows[i]]
+        pred_cells[i] = pred_cell
+        pred_argument_y_1[i] = pred_cell
+    end
+    pred = _cfr_flatten(pred_cells)
+    @plate for i in eachindex(y)
+        y[i] .~ Normal.(pred_argument_y_1[i], sigma)
+    end
+end
+
+function _cfr_nested_oracle(built, data, u, cell, term)
+    p = constrain(built.layout, u)
+    row = data.rows[cell][term]
+    mu = p.a + p.s * p.zs[data.subject[cell]] + p.zu[data.unit[row]]
+    logpdf(Normal(mu, p.sigma), data.y[cell][term])
+end
+
+@testset "outer factor AD of a nested cell reads its gathers at the cell's rows" begin
+    rows = [[1, 2], [3, 4, 5], [6]]
+    data = (; subject=[2, 1, 3], unit=[1, 2, 3, 4, 5, 6], rows,
+            y=[0.1 .* sin.(r) for r in rows])
+    bound = _CFR_NESTED(; data.subject, data.unit, data.rows) | (; data.y)
+    built = build_kernel(bound)
+    u = collect(range(-0.3, 0.4; length=built.layout.total))
+    factors = prepare_cell_factors(built, bound, :y; locality=:error)
+    @test length(cell_reductions(factors)) == 1
+    term = prepare_cell_factor_query(factors, 1)
+    outer = prepare_cell_factor_query(factors, :outer)
+    whole = prepare_query(built, bound, :pointwise)(u).y
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    fd(f, x, k) = (plus = copy(x); minus = copy(x); plus[k] += 1e-6; minus[k] -= 1e-6;
+                   (f(plus) - f(minus)) / 2e-6)
+    for cell in eachindex(rows)
+        values = [term(u, cell, j) for j in eachindex(rows[cell])]
+        @test values ≈ [_cfr_nested_oracle(built, data, u, cell, j) for j in eachindex(rows[cell])]
+        sums = [sum(values)]
+        @test outer(u, sums, cell) ≈ sum(whole[cell])
+        # The reporter's call: the outer factor's derivative, prepared with this
+        # cell's exemplar sums, which evaluate the cell's gathers at its rows.
+        selection = [1]
+        ad = prepare_cell_factor_ad(prepare_ad, factors, :outer, u, selection, backend;
+                                    cell0=cell)
+        @test ad.exemplar_sums ≈ sums
+        value, (sum_gradient, gradient) = ad_value_and_gradient(ad, u, sums, u[selection],
+                                                               selection, cell)
+        @test value ≈ outer(u, sums, cell)
+        @test sum_gradient ≈ [fd(x -> outer(u, x, cell), sums, 1)] rtol=1e-6
+        @test gradient ≈ [fd(x -> outer(x, sums, cell), u, k) for k in selection] atol=1e-8
+        # A summand's derivative reads the same gathers at its term's row.
+        j = length(rows[cell])
+        footprint = partition_footprint_kernel(term.kernel)
+        indices = Base.invokelatest(footprint, u, cell, j).unconstrained
+        term_ad = prepare_cell_factor_ad(prepare_ad, factors, 1, u, indices, backend;
+                                         cell0=cell, term0=j)
+        value, gradient = ad_value_and_gradient(term_ad, u, u[indices], indices, cell, j)
+        @test value ≈ _cfr_nested_oracle(built, data, u, cell, j)
+        @test gradient ≈ [fd(x -> _cfr_nested_oracle(built, data, x, cell, j), u, k)
+                          for k in indices] rtol=1e-6 atol=1e-8
+    end
+end
