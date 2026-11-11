@@ -390,6 +390,55 @@ Base.IndexStyle(::Type{<:_CellOne}) = IndexLinear()
 @inline _cell_lane_one(x) = x
 @inline _cell_lane_one(x::Number) = _CellOne(x)
 
+"""
+    _CellOneRow(values)
+
+A matrix value's one row, as the 1×K matrix over `values`, its K entries in
+column order. This is a reshape's row at one row (`_cell_reshape_window`). It
+is immutable and allocates nothing. Its product with a matrix is the row
+`_CellRowProduct`, whose entries are computed where they are read.
+"""
+struct _CellOneRow{T,V<:AbstractVector{T}} <: AbstractMatrix{T}
+    values::V
+end
+Base.size(r::_CellOneRow) = (1, length(r.values))
+Base.IndexStyle(::Type{<:_CellOneRow}) = IndexLinear()
+@inline function Base.getindex(r::_CellOneRow, k::Int)
+    @boundscheck checkbounds(r, k)
+    @inbounds r.values[k]
+end
+
+"""
+    _CellRowProduct(row, factor)
+
+The one row of `A * factor`, where `row` holds the entries of `A`'s row (a
+vector). Entry `k` is `sum(row[j] * factor[j, k] for j)`, added in turn to a
+zero start, as `_native_mul`'s own loop orders them. It is computed when read,
+so a row whose readers read some of its entries computes those only, and no
+array or Enzyme shadow is allocated for it.
+"""
+struct _CellRowProduct{T,R<:AbstractVector,M<:AbstractMatrix} <: AbstractMatrix{T}
+    row::R
+    factor::M
+end
+Base.size(p::_CellRowProduct) = (1, size(p.factor, 2))
+Base.IndexStyle(::Type{<:_CellRowProduct}) = IndexLinear()
+@inline function Base.getindex(p::_CellRowProduct{T}, k::Int) where {T}
+    @boundscheck checkbounds(p, k)
+    row, factor = p.row, p.factor
+    total = zero(T)
+    @inbounds for (i, j) in zip(eachindex(row), axes(factor, 1))
+        total += row[i] * factor[j, k]
+    end
+    total
+end
+@inline function _native_mul(r::_CellOneRow{TA}, factor::AbstractMatrix{TB}) where {TA<:Real,TB<:Real}
+    length(r.values) == size(factor, 1) || throw(DimensionMismatch(
+        "matrix row has $(length(r.values)) columns, matrix has $(size(factor, 1)) rows"))
+    T = Base.promote_op(LinearAlgebra.matprod, TA, TB)
+    _CellRowProduct{T,typeof(r.values),typeof(factor)}(r.values, factor)
+end
+
 # An operand row read as numbers (`_cell_scalar_operand!`), and a pushed
 # operand's one-row window as that row.
 @inline _cell_operand_row(x::AbstractArray, position::Integer) = _CellRow(x, position)
@@ -758,6 +807,9 @@ end
     Int[row + first(dims) * (j - 1) for j in 1:prod(Base.tail(dims); init = 1) for row in rows]
 @inline _cell_reshape_window(data, row::Integer, dims::Tuple) =
     reshape(data, 1, Base.tail(dims)...)
+# A matrix's one row: the row itself, not a reshaped copy of its header.
+@inline _cell_reshape_window(data::AbstractVector, row::Integer, dims::Tuple{Any,Any}) =
+    _CellOneRow(data)
 @inline _cell_reshape_window(data, rows::Vector{Int}, dims::Tuple) =
     reshape(data, length(rows), Base.tail(dims)...)
 
@@ -3873,11 +3925,13 @@ end
 # rows, and its storage, depend on whether the rows agree.
 function _cell_union!(e::_CellEmitter, cid::ValueId)
     rows = e.requests[cid]
-    if e.sorted && length(rows) > 1 && all(in(e.one), rows) && !(cid in e.arrays)
+    if e.sorted && length(rows) > 1 && all(in(e.one), rows)
         d = e.pushdowns
         r = d.producer[cid]
         e.unions[cid] = first(rows)
-        if _cell_scalar_eligible(e, cid, r, d.forms[r.id])
+        f = d.forms[r.id]
+        if (!(cid in e.arrays) && _cell_scalar_eligible(e, cid, r, f)) ||
+                _cell_row_eligible(e, cid, f)
             e.instances[cid] = copy(rows)
             return e.unions[cid]
         end
@@ -3886,6 +3940,15 @@ function _cell_union!(e::_CellEmitter, cid::ValueId)
         _cell_bind!(e, :cell_rows_union, Expr(:call,
             _cell_ref(e.sorted ? :_cell_union_rows_sorted : :_cell_union_rows), rows...))
 end
+
+# Whether pushed matrix value `cid`, asked for at several `Int` rows, is held as
+# one row per request (`_cell_union!`'s instances): a reshape's row
+# (`_CellOneRow`) or a product's (`_CellRowProduct` for a matrix right factor).
+# Each window is then a row at one `Int` row, read at its own row by its reader,
+# instead of an array over the union of rows that may be one row.
+_cell_row_eligible(e::_CellEmitter, cid::ValueId, f::_CellForm) =
+    f.kind in (:reshape, :product) && f.rowmap === nothing &&
+    get(e.pushdowns.types, cid, Any) <: AbstractMatrix
 
 # The earlier instance holding row `row` (`earlier` are their rows, in order),
 # or 0 when none does: integer bookkeeping a partition's plan computes once per

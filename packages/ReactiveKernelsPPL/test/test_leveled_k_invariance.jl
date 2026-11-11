@@ -1,4 +1,4 @@
-# Core constraint 1 (docs/src/constraints.md) for the leveled families: a
+# Core constraint 1 (CONTRIBUTING.md) for the leveled families: a
 # data-inferred level count K must not replicate emitted statements. The
 # emitted program at two level counts must be the SAME expression once
 # literal constants are abstracted (level counts, data lengths, and the

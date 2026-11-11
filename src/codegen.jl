@@ -1257,7 +1257,9 @@ end
 
 # A scan read only through `trajectory[lo:hi]` (`_authored_scan_slice_demand`)
 # runs only the steps that slice reads and writes their outputs straight into
-# the slice's result, emitted where the reader is. It stops after the last
+# the slice's result, emitted where the reader is. One read through
+# `trajectory[k]`, `last(trajectory)` or `first(trajectory)` (`demand.scalar`)
+# keeps only the output of step `k` in the reader's scalar result: no buffer. It stops after the last
 # demanded step; a `carry_free` step (one that reads neither its carry nor
 # history) also skips every step before the first demanded one. The steps it
 # skips compute only values nothing reads, as plan selection drops unread
@@ -1309,39 +1311,75 @@ function _lower_authored_scan_slice_native!(body, op::_AuthoredScanOp, callargs,
     push!(body.args, :($hi = $hi_ex))
 
     vector_ref = GlobalRef(Base, :Vector)
-    store(at, value) = _inbounds_expr(:($lhs[$at - $lo + 1] = $value))
-    demanded = Expr(:block)
-    push!(demanded.args, :($lo <= $hi && !(1 <= $lo && $hi <= $trajectory_length) &&
-        $(GlobalRef(Core, :throw))($(GlobalRef(Core, :BoundsError))(
-            $vector_ref{$element_type}(undef, $trajectory_length), ($lo:$hi,)))))
-    push!(demanded.args, :($lhs = $vector_ref{$element_type}(undef,
-        $(GlobalRef(Base, :max))($hi - $lo + 1, 0))))
-    init == 1 && push!(demanded.args, :($lo == 1 && $hi >= 1 && $(store(1, seed))))
     step_at(k) = Expr(:block, :($index = $(_inbounds_value(:($indices[$k])))),
                       copy(step_body).args...)
-    if demand.carry_free
-        # Each output depends on its own step: run exactly the demanded ones.
-        first_position = :($(GlobalRef(Base, :max))($lo, $(1 + init)))
-        push!(demanded.args, :($carry = $seed))
-        push!(demanded.args, Expr(:for, Expr(:(=), position, :($first_position:$hi)),
-            Expr(:block, step_at(:($position - $init)).args..., store(position, output))))
+    unpeeled = :($(GlobalRef(@__MODULE__, :_scan_unpeeled))(
+        $carry_type, $output_type, $seed))
+    demanded = Expr(:block)
+    if demand.scalar
+        # One element `trajectory[k]` (`lo == hi == k`): the steps through `k`
+        # (only step `k` when carry-free) run, and only the last output is
+        # kept, as the trajectory would store it: converted to its element
+        # type, the seed itself at `k == 1` when the seed is included. An index
+        # outside the trajectory throws the `BoundsError` of indexing it.
+        convert_ref = GlobalRef(Base, :convert)
+        push!(demanded.args, :(1 <= $lo <= $trajectory_length ||
+            $(GlobalRef(Core, :throw))($(GlobalRef(Core, :BoundsError))(
+                $vector_ref{$element_type}(undef, $trajectory_length), ($lo,)))))
+        last_step = gensym(:scan_element_step)
+        push!(demanded.args, :($last_step = $lo - $init))
+        steps = Expr(:block, :($carry = $seed))
+        if demand.carry_free
+            append!(steps.args, step_at(last_step).args)
+        else
+            # Steps 1 through `k`, the first peeled as in the slice loop below
+            # unless the step returns the seed's carry type. Either way the
+            # step that writes the kept output runs outside a loop or last in
+            # it, so `output` holds it afterwards.
+            peeled = Expr(:block, step_at(1).args...,
+                Expr(:for, :($slot = 2:$last_step), step_at(slot)))
+            flat = Expr(:block, Expr(:for, :($slot = 1:($last_step - 1)), step_at(slot)),
+                step_at(last_step).args...)
+            push!(steps.args, Expr(:if, unpeeled, flat, peeled))
+        end
+        push!(steps.args, :($lhs = $convert_ref($element_type, $output)))
+        if init == 1
+            push!(demanded.args, Expr(:if, :($last_step == 0),
+                :($lhs = $convert_ref($element_type, $seed)), steps))
+        else
+            append!(demanded.args, steps.args)
+        end
     else
-        # Steps 1 through the last demanded one, the first peeled so the carry
-        # takes the step's type, as in the ordinary loop, unless the step
-        # returns the seed's carry type (`_scan_unpeeled`; the output type is
-        # concrete here).
-        last_step = gensym(:scan_slice_last_step)
-        stored(at) = Expr(:block, step_at(at).args...,
-            :($position = $at + $init),
-            :($position >= $lo && $(store(position, output))))
-        peeled = Expr(:block, :($carry = $seed), stored(1).args...,
-            Expr(:for, :($slot = 2:$last_step), stored(slot)))
-        flat = Expr(:block, :($carry = $seed),
-            Expr(:for, :($slot = 1:$last_step), stored(slot)))
-        steps = Expr(:if, :($(GlobalRef(@__MODULE__, :_scan_unpeeled))(
-            $carry_type, $output_type, $seed)), flat, peeled)
-        push!(demanded.args, :($last_step = $hi - $init))
-        push!(demanded.args, Expr(:if, :($lo <= $hi && $last_step >= 1), steps))
+        store(at, value) = _inbounds_expr(:($lhs[$at - $lo + 1] = $value))
+        push!(demanded.args, :($lo <= $hi && !(1 <= $lo && $hi <= $trajectory_length) &&
+            $(GlobalRef(Core, :throw))($(GlobalRef(Core, :BoundsError))(
+                $vector_ref{$element_type}(undef, $trajectory_length), ($lo:$hi,)))))
+        push!(demanded.args, :($lhs = $vector_ref{$element_type}(undef,
+            $(GlobalRef(Base, :max))($hi - $lo + 1, 0))))
+        init == 1 && push!(demanded.args, :($lo == 1 && $hi >= 1 && $(store(1, seed))))
+        if demand.carry_free
+            # Each output depends on its own step: run exactly the demanded ones.
+            first_position = :($(GlobalRef(Base, :max))($lo, $(1 + init)))
+            push!(demanded.args, :($carry = $seed))
+            push!(demanded.args, Expr(:for, Expr(:(=), position, :($first_position:$hi)),
+                Expr(:block, step_at(:($position - $init)).args..., store(position, output))))
+        else
+            # Steps 1 through the last demanded one, the first peeled so the
+            # carry takes the step's type, as in the ordinary loop, unless the
+            # step returns the seed's carry type (`_scan_unpeeled`; the output
+            # type is concrete here).
+            last_step = gensym(:scan_slice_last_step)
+            stored(at) = Expr(:block, step_at(at).args...,
+                :($position = $at + $init),
+                :($position >= $lo && $(store(position, output))))
+            peeled = Expr(:block, :($carry = $seed), stored(1).args...,
+                Expr(:for, :($slot = 2:$last_step), stored(slot)))
+            flat = Expr(:block, :($carry = $seed),
+                Expr(:for, :($slot = 1:$last_step), stored(slot)))
+            steps = Expr(:if, unpeeled, flat, peeled)
+            push!(demanded.args, :($last_step = $hi - $init))
+            push!(demanded.args, Expr(:if, :($lo <= $hi && $last_step >= 1), steps))
+        end
     end
     ready = :($(GlobalRef(Base, :isconcretetype))($element_type) &&
               $lo isa $Int && $hi isa $Int &&
@@ -1653,19 +1691,23 @@ function _authored_scan_terminal_minima(p::Plan, scan_recipe::Recipe)
     terminal
 end
 
-# A scan read only through one slice `trajectory[lo:hi]`, whose other steps
+# A scan read only through one slice `trajectory[lo:hi]`, or one element
+# `trajectory[k]`, `last(trajectory)` or `first(trajectory)`, whose other steps
 # compute nothing that is read (`_lower_authored_scan_slice_native!`). Returns
-# `(; reader, position, lo, hi, params, mod, carry_free)` or `nothing`.
+# `(; reader, position, lo, hi, params, mod, carry_free, scalar)` or `nothing`.
 #
 # The scan has no `history` and a pure step; its result is no WANT and is read
 # by exactly one recipe, as exactly one of that recipe's inputs (`position`).
 # The reader is a pure ordinary source operation (`_lane_source_closure`)
 # whose native body is `x[lo:hi]` for the scan's parameter `x`, with Base's
 # `:` and bounds that do not read `x` (`begin`/`end` there are the
-# trajectory's first and last index). No effectful recipe runs between the
-# scan and its reader, where the slice is emitted. `carry_free`: the step
-# reads neither its carry nor history, so each output depends on its own step
-# only.
+# trajectory's first and last index). An element read is the one-element
+# demand `lo = hi = k` with `scalar = true`: `x[k]` for an index `k` that does
+# not read `x`, `last(x)` (`x[end]`, as Base defines it for an array) and
+# `first(x)` (`x[begin]`), with Base's `last` and `first`. No effectful recipe
+# runs between the scan and its reader, where the slice is emitted.
+# `carry_free`: the step reads neither its carry nor history, so each output
+# depends on its own step only.
 function _authored_scan_slice_demand(p::Plan, scan_recipe::Recipe)
     op = scan_recipe.op
     op isa _AuthoredScanOp && !_scan_has_history(op) || return nothing
@@ -1682,20 +1724,45 @@ function _authored_scan_slice_demand(p::Plan, scan_recipe::Recipe)
     length(positions) == 1 || return nothing
     position = only(positions)
     closure = _lane_source_closure(reader)
-    closure === nothing && return nothing
-    _, params, mod = closure
-    source = _lane_expand_dot(_lane_strip_lines(reader.source), mod)
-    source isa Expr && !_lane_has_macro(source) || return nothing
-    native = _lane_strip_lines(_kernel_native_body(source, mod, Set{Symbol}(params)))
-    native isa Expr && native.head === :ref && length(native.args) == 2 &&
-        native.args[1] === params[position] || return nothing
-    range = native.args[2]
-    range isa Expr && range.head === :call && length(range.args) == 3 &&
-        _kernel_resolve_binding(mod, range.args[1]) === Base.:(:) || return nothing
-    lo, hi = range.args[2], range.args[3]
-    params[position] in _source_symbols!(Set{Symbol}(), Expr(:tuple, lo, hi)) &&
+    if closure === nothing
+        # A bare call `last(x)` or `first(x)` is a plain operation on its
+        # input, not an authored source: read it as the same native body over
+        # a placeholder name.
+        params = Symbol[Symbol(:argument, i) for i in eachindex(reader.inputs)]
+        mod = @__MODULE__
+        native = _scan_element_native(reader, position, params)
+        native === nothing && return nothing
+    else
+        _, params, mod = closure
+        source = _lane_expand_dot(_lane_strip_lines(reader.source), mod)
+        source isa Expr && !_lane_has_macro(source) || return nothing
+        native = _lane_strip_lines(_kernel_native_body(source, mod, Set{Symbol}(params)))
+    end
+    native isa Expr || return nothing
+    trajectory = params[position]
+    if native.head === :ref && length(native.args) == 2 && native.args[1] === trajectory
+        index = native.args[2]
+        if index isa Expr && index.head === :call && !isempty(index.args) &&
+                _kernel_resolve_binding(mod, index.args[1]) === Base.:(:)
+            length(index.args) == 3 || return nothing
+            lo, hi, scalar = index.args[2], index.args[3], false
+        else
+            # `x[:]` is the whole trajectory, not an element.
+            index === :(:) && return nothing
+            lo = hi = index
+            scalar = true
+        end
+    elseif native.head === :call && length(native.args) == 2 && native.args[2] === trajectory
+        accessor = _kernel_resolve_binding(mod, native.args[1])
+        accessor === Base.last || accessor === Base.first || return nothing
+        lo = hi = accessor === Base.last ? :end : :begin
+        scalar = true
+    else
         return nothing
-    demand = (; reader, position, lo, hi, params, mod, carry_free = false)
+    end
+    trajectory in _source_symbols!(Set{Symbol}(), Expr(:tuple, lo, hi)) &&
+        return nothing
+    demand = (; reader, position, lo, hi, params, mod, carry_free = false, scalar)
     # The bounds must be expressible over the reader's arguments.
     placeholders = Any[gensym(:argument) for _ in reader.inputs]
     any(isnothing, _scan_slice_bound_exprs(demand, placeholders, :length)) &&
@@ -1710,6 +1777,17 @@ function _authored_scan_slice_demand(p::Plan, scan_recipe::Recipe)
     carry_free = canon_id(step.graph, step.want[2].id) != carry &&
         !any(r -> any(v -> canon_id(step.graph, v.id) == carry, r.inputs), step.recipes)
     (; demand..., carry_free)
+end
+
+# The native body of a bare element read `last(x)` or `first(x)` of the scan,
+# the reader's only input, named `params[1]`; `nothing` for any other
+# operation. (`x[k]` and `x[end]` are authored sources, read through
+# `_lane_source_closure`.)
+function _scan_element_native(reader::Recipe, position, params)
+    op = reader.op
+    position == 1 && length(reader.inputs) == 1 &&
+        (op === Base.last || op === Base.first) || return nothing
+    Expr(:call, op === Base.last ? :last : :first, params[1])
 end
 
 # The slice bounds of `demand` over the reader's call arguments, with `end`
@@ -3116,7 +3194,7 @@ end
 # like any other cell invariant, and evaluated only when that arm is taken.
 # Each lane still evaluates only its own arm, and an empty domain evaluates no
 # condition and no arm, so the authored lazy semantics are unchanged
-# (docs/src/constraints.md "Preserve lazy branches").
+# (CONTRIBUTING.md "Preserve lazy branches").
 #
 # The condition must read plate arguments that are statically shared: an
 # atomic operand or a `Number`. A cell holding a nested plate or scan, an
