@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.151
+
+- `model_view`'s `text/html` rendering carries a scoped style, so a generated
+  program wider than its host page scrolls horizontally inside its listing
+  instead of widening the page (a 3,900 px document at a 1,400 px viewport on
+  the documentation's Eight schools page). The retired-construct diagnostics
+  for the PK heads and `linear_pk_log_f` name the downstream domain package
+  instead of a specific consumer package.
+
 ## 0.1.150
 
 - Shared-prefix cell and partition derivatives work when a shared value that
