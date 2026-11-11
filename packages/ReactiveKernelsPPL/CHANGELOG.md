@@ -16,6 +16,29 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.155
+
+- Compact-cell Hessian-vector products and the mixed derivatives of a cell
+  pullback work for a cell that reads many shared values:
+  `prepare_compact_cell_ad` with `prepare_ad_hvp` or `prepare_ad_third` and
+  `partitioned` coordinates, then `ad_gradient_and_hvp` or `cell_pullback!`
+  with `prepare_cell_accumulator` at orders 1 and 2. Each shared value is an
+  inactive input of the cell's derivative, and from about 28 of them both
+  Hessian-vector compositions raised `EnzymeRuntimeActivityError`. BRM's
+  sparse Laplace raised it from NLMEEstimation's `check_protocol` on a model
+  whose cells read 33 shared values (snag `varyingsource3-b-82246291`).
+  Requires ReactiveKernels 0.1.158.
+
+## 0.1.154
+
+- A selective SMC window (`prepare_smc_window(…; coordinates = :auto)`) whose
+  fresh prior reads a data-valued scale through a named definition, as BRM
+  emits it (`z_prior_scale = s; z[1:n] .~ Normal.(z_prior_mean,
+  z_prior_scale)` with `s` bound as data), now prepares, with the same
+  density and gradient as the direct `Normal.(m, s)`. It threw `cannot merge
+  structural aliases for value :z_prior_scale: Number does not match Float64`
+  (snag `selective-fresh-96f7fe96`). Requires ReactiveKernels 0.1.156.
+
 ## 0.1.153
 
 - A packed point of another length is refused, not read. Every cut of a built

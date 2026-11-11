@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.156
+## 0.1.161
 
 - A native scan whose trajectory is read only through one element,
   `trajectory[k]`, `last(trajectory)` or `first(trajectory)`, runs the steps
@@ -38,6 +38,90 @@ are recorded in the git history only.
   (`lower_truncated_lognormal`, `upper_truncated_lognormal`) allocate nothing
   per call, where it allocated about 3–7 KB, and cut its time and its Enzyme
   Reverse gradient's by a third to a half (snag `dk-one-sided-log-c73f7aba`).
+
+## 0.1.160
+
+- New: `register_source_provider!(provider)` and `TraceableSource(argument_names,
+  body, mod)`, so a package that generates a method (a macro that writes it
+  into its caller's module) can hand `jax_source` the method's Julia source.
+  `jax_source` asks each registered provider, `provider(f, argument_types)`,
+  for a call that has no translation of its own and no `@traceable` source,
+  and translates the body it returns as it translates an `@traceable` body:
+  `jax.lax.fori_loop` for a `for` loop, `jax.lax.cond` for an `if`,
+  `.at[i].set` for `A[i] = v`, and host Python in `prepare_data`. Before,
+  such a method stopped `jax_source` with `JAXEmissionError: the function
+  ... has loops or branches`. Register the provider once, from the
+  `__init__` of the package's extension on ReactiveKernels. Native
+  execution, `prepare` and the compiled paths never read the source (snag
+  `register-generat-a22e2325`, decision `0os7s7u`).
+
+## 0.1.159
+
+- `jax_source`: a matrix padded along a ragged row, such as a mixture law's
+  `cell = (x .- centres) ./ scales` for `x = vcat(x1, x_rest)` with `x_rest`
+  one row of per-row features, now reduces in the JAX functions.
+  `sum(cell; dims = 1)` (and `prod`, `maximum` and `minimum` over `dims`)
+  raised `JAXEmissionError` (`sum over dims of a Matrix{Float64}`); it now
+  sums the row's entries only. A whole-array `sum(cell)` or `sum(f, cell)`
+  emitted but read the padding as entries, a wrong value whenever rows have
+  different lengths, and `maximum(cell)` failed in Python; both now mask the
+  padded axis. The translation records which axes of an array the padding
+  covers (a broadcast keeps its operands', a transpose swaps them, an outer
+  product `x * x'` and `I(n)` cover both), and `vec` of such a matrix puts its
+  valid entries first. A reduction or `vec` of a padded array whose padded
+  axes it does not record (a matrix product with a padded operand) now raises
+  `JAXEmissionError` instead of reading the padding (snag
+  `jax-source-sum-c-bcfa9d53`).
+
+## 0.1.158
+
+- Hessian-vector products and third-order derivatives (`prepare_ad_hvp`,
+  `prepare_ad_third`, `prepare_ad_accumulator` at orders 1 and 2) work for a
+  kernel with many inactive HAVE ports, under both reverse over forward and
+  forward over reverse. From about 28 such ports they raised
+  `EnzymeRuntimeActivityError` ("Constant memory is stored (or returned) to a
+  differentiable variable"). Each inactive port crossed the backend as its own
+  `Constant` context, and from 32 contexts DifferentiationInterface and
+  Enzyme splat them through a heap tuple; inside a nested derivative that
+  tuple stores the constant operands beside the active point. Past 16 plain
+  inactive operands, they now cross as one `Constant` tuple, as the hidden
+  bound operands already do. An RKPPL compact cell takes each shared value
+  it reads as such a port, so BRM's sparse Laplace raised this for a model
+  whose cells read 33 of them (snag `varyingsource3-b-82246291`). Kernels with
+  at most 16 plain inactive operands differentiate exactly as before.
+
+## 0.1.157
+
+- A plate cell, and a partition with `single = true`, runs an authored plate
+  that it reads at its one row as that plate's one cell. The value is held in a
+  non-allocating one-element vector, instead of a plate computed over a
+  one-row array. A vector it reads as a lane, computed as a number at that
+  row, is read as one too.
+- In a partition, a value asked for at several such rows (two one-cell
+  members of one subject, each reading the subject's predictor at its own
+  row) is one number per row asked for, instead of an array over their union.
+  Each after the first is computed only when no earlier one has its row, so a
+  row asked for twice is still computed once. The program does not depend on
+  whether the rows agree. Values and gradients are unchanged: on BRM's
+  `unit_cost.jl` toys (24 subjects) they are bitwise equal to the previous
+  version for every subject, and the joint PK/QT model's local gradient went
+  from 113 to 87 allocations (todo `1yggoad`).
+- Fixed: a `vcat` read at one row converts each entry to the `vcat`'s element
+  type. An integer literal beside floating-point operands gave a `Union` that
+  native Enzyme Reverse refused.
+
+## 0.1.156
+
+- A plate that reads a bound value through an undeclared name for it
+  (`t = s`, with `s::Float64` bound) now keeps that value's declared type
+  when its preparation is copied and composed. Bound preparation used to
+  type the plate's operand `t` as `Number`, so a graph built from the
+  prepared recipes held `t::Number` beside `s::Float64`, and `merge` refused
+  it with `cannot merge structural aliases for value :t: Number does not match
+  Float64`. RKPPL builds its factor catalogue that way, so a selective SMC
+  window whose fresh prior reads a data-valued scale through such a name
+  (BRM's `log_rate_prior_scale = offset_scale`) failed to prepare (snag
+  `selective-fresh-96f7fe96`).
 
 ## 0.1.155
 
@@ -1597,8 +1681,9 @@ are recorded in the git history only.
   `m` and is longer than `m` evaluates `f.(view(x, 1:m))[k]`. Values are
   unchanged bit for bit and `f` runs on no element the authored form leaves
   unread; reverse-mode derivatives agree up to floating-point rounding where
-  an index repeats. See `docs/src/compiler.md`, "Elementwise calls over a
-  data-indexed gather".
+  an index repeats. See "Elementwise calls over a data-indexed gather" in
+  `docs/src/compiler.md` at revision `4d462ef4170948f2e77e3fa80cda5be5c2b6dc02`,
+  before the documentation rewrite removed that page.
 
 ## 0.1.63
 

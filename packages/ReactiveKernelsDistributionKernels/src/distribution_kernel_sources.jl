@@ -12,7 +12,7 @@ import SpecialFunctions
 # through ReactiveKernels' own extension) are generated from the
 # activity-selected cuts of the same graph — no backend-specific derivative
 # code anywhere, and no rule on a function this package does not own
-# (docs/src/constraints.md, "Derivative rules come from one mathematical
+# (CONTRIBUTING.md, "Derivative rules come from one mathematical
 # graph, never by hand"). Every distribution and GLM source calls THESE names,
 # never SpecialFunctions' directly.
 @kernel loggamma_graph(x::Float64) = begin
@@ -447,7 +447,7 @@ const _HALF_CAUCHY_BASE = ReactiveKernels._kernel_latest_prepared(prepare(CAUCHY
 #     primal is finite (e.g. p = 1, observed = true has logpdf log(1) = 0).
 #     The branch is LAZY (`observed ? log(p) : log1p(-p)`): only the selected
 #     side is evaluated and differentiated, so the complement's singular log
-#     never runs (docs/src/constraints.md). Exact impossible events (p = 1 &
+#     never runs (CONTRIBUTING.md). Exact impossible events (p = 1 &
 #     observed = false, p = 0 & observed = true) still return -Inf.
 const BERNOULLI_KERNEL_SOURCE = raw"""
 using LogExpFunctions: log1pexp
@@ -843,7 +843,7 @@ end
 # load-bearing on this). The log1p form is algebraically identical and
 # NaN-free at the mu = 0 / mu = Inf edges; the support guard and the
 # `observed == 0` tail are LAZY branches, so nothing is evaluated on an
-# invalid side (docs/src/constraints.md). No cdf/quantile (discrete
+# invalid side (CONTRIBUTING.md). No cdf/quantile (discrete
 # inversion); only `logpdf` is exposed.
 const NEGATIVE_BINOMIAL2_KERNEL_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
@@ -878,7 +878,7 @@ end
 # cross-backend absolute-value comparison is load-bearing on this),
 # spelled directly in the (r, p) HAVE — no (alpha, beta) round trip. The
 # support guard is a LAZY branch, so nothing is evaluated on an invalid
-# side (docs/src/constraints.md). No cdf/quantile (discrete inversion);
+# side (CONTRIBUTING.md). No cdf/quantile (discrete inversion);
 # only `logpdf` is exposed (the NB2 precedent).
 const NEGATIVE_BINOMIAL_KERNEL_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
@@ -915,7 +915,7 @@ end
 # authoritative log-scale HAVE route (the Poisson `log_rate` precedent),
 # so a log-link predictor supplies it directly with no `log(exp())`
 # round trip. The support guard is a LAZY branch, so nothing is
-# evaluated on an invalid side (docs/src/constraints.md). `cdf` and
+# evaluated on an invalid side (CONTRIBUTING.md). `cdf` and
 # `quantile` are closed-form (the exponential precedent).
 const WEIBULL_KERNEL_SOURCE = raw"""
 @kernel weibull(k::Float64, theta::Float64) = begin
@@ -1066,7 +1066,7 @@ end
 # load-bearing on this). `log_rate` is the canonical GLM/log-link HAVE
 # route; `rate` is the equivalent linear representation. The support
 # guard and the `observed == 0` arm are LAZY branches, so nothing is
-# evaluated on an invalid side (docs/src/constraints.md): the zero arm
+# evaluated on an invalid side (CONTRIBUTING.md): the zero arm
 # never forms `y * log_rate` (which is NaN at rate == 0 via `0 * -Inf`).
 # No cdf/quantile (discrete inversion); only `logpdf` is exposed.
 const ZERO_INFLATED_POISSON_KERNEL_SOURCE = raw"""
@@ -1118,7 +1118,7 @@ end
 # `logit`/`p`/`logp`/`log1mp` nodes mirror `binomial` verbatim
 # (including its boundary behavior); the mixture arms mirror
 # `zero_inflated_poisson`. Branches are LAZY ternaries
-# (docs/src/constraints.md): the zero arm never forms `y * logp`, the
+# (CONTRIBUTING.md): the zero arm never forms `y * logp`, the
 # positive arm never forms the zero mixture. No cdf/quantile (discrete
 # inversion); only `logpdf` is exposed.
 const ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE = raw"""

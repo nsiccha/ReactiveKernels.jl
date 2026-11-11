@@ -730,7 +730,7 @@ _ppl_cell_joint_block(site, offsets, pos::Int) =
 # of a joint latent's identity value reads only those. The table holds unit
 # ranges: a view indexed by an integer vector loaded from data is a container
 # of constant memory beside the active packed vector, which native Enzyme
-# Reverse rejects (docs/src/constraints.md); a range holds no array.
+# Reverse rejects (CONTRIBUTING.md); a range holds no array.
 # A joint geometry receives the selected block, never the unrelated cells.
 _ppl_cell_blocks(offsets) =
     UnitRange{Int}[(offsets[k] + 1):offsets[k + 1] for k in 1:length(offsets)-1]

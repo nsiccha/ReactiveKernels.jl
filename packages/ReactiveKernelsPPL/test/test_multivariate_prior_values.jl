@@ -180,7 +180,7 @@ end
             @test occursin("Function argument passed to autodiff cannot be proven readonly",
                            sprint(showerror, outcome))
             # Upstream Enzyme readonly-proof gap (snag readonly-proof-f-34071c89);
-            # drop with docs/src/constraints.md once a registered Enzyme repairs it.
+            # drop with CONTRIBUTING.md once a registered Enzyme repairs it.
             @test_broken false
         elseif outcome isa Exception
             throw(outcome)

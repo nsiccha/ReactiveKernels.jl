@@ -519,6 +519,8 @@ end
 # nested gather's reverse pass more than a third of the whole gradient.
 @inline _readonly_gather(array::AbstractVector, indices::AbstractVector{<:Integer}) =
     view(array, indices)
+# One position (a cell's gather read as a number): that element.
+@inline _readonly_gather(array::AbstractVector, index::Integer) = array[index]
 @inline function _readonly_gather(
         array::Union{Vector,SubArray{Float64,1,Vector{Float64},Tuple{UnitRange{Int}},true}},
         indices::Vector{Int})
@@ -1005,7 +1007,7 @@ end
 # returns the seed's carry type, every step has the same types, and the loop
 # starts at the first index. On Julia 1.10 Enzyme Reverse of the peeled loop
 # costs 5-8% more than the same loop without the peel, for no located cause
-# (`docs/src/constraints.md`).
+# (`CONTRIBUTING.md`).
 @inline _scan_unpeeled(::Type{C}, ::Type{T}, seed) where {C,T} =
     isconcretetype(T) && C === typeof(seed)
 

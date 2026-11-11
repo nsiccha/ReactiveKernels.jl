@@ -167,7 +167,7 @@ docs_example = (;
 
 # The summed Normal identity-link GLM log density (Stan's
 # `normal_id_glm_lpdf`) as an owned numerical primitive whose derivatives are
-# authored once in this graph (docs/src/constraints.md, "Derivative rules come
+# authored once in this graph (CONTRIBUTING.md, "Derivative rules come
 # from one mathematical graph, never by hand"); the Enzyme adapter is generated
 # from its activity-selected cuts. With r = y - X*beta and ss = r'r:
 #   lp = -ss/2σ² - n(log σ + log(2π)/2)

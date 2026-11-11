@@ -3538,32 +3538,129 @@ function _traceable_source_method(callee, formals, wheres, body, mod)
 end
 
 # The body with its tail-position `return`s replaced by their values, as a
-# source-reading compiler translates it.  Any other `return` is rejected.
-function _traceable_tail_body(ex, signature)
+# source-reading compiler translates it.  Any other `return` is rejected;
+# `owner` names what recorded the body in that error.
+function _traceable_tail_body(ex, signature, owner = "@traceable")
     if ex isa Expr && ex.head === :return
-        return _traceable_no_return(isempty(ex.args) ? nothing : only(ex.args), signature)
+        return _traceable_no_return(isempty(ex.args) ? nothing : only(ex.args), signature, owner)
     elseif ex isa Expr && ex.head === :block
         position = findlast(arg -> !(arg isa LineNumberNode), ex.args)
         position === nothing && return ex
-        args = Any[i == position ? _traceable_tail_body(arg, signature) :
-                   _traceable_no_return(arg, signature)
+        args = Any[i == position ? _traceable_tail_body(arg, signature, owner) :
+                   _traceable_no_return(arg, signature, owner)
                    for (i, arg) in enumerate(ex.args)]
         return Expr(:block, args...)
     elseif ex isa Expr && ex.head in (:if, :elseif)
-        return Expr(ex.head, _traceable_no_return(ex.args[1], signature),
-            (_traceable_tail_body(arg, signature) for arg in ex.args[2:end])...)
+        return Expr(ex.head, _traceable_no_return(ex.args[1], signature, owner),
+            (_traceable_tail_body(arg, signature, owner) for arg in ex.args[2:end])...)
     end
-    _traceable_no_return(ex, signature)
+    _traceable_no_return(ex, signature, owner)
 end
 
-function _traceable_no_return(ex, signature)
+function _traceable_no_return(ex, signature, owner = "@traceable")
     ex isa Expr || return ex
     ex.head in (:->, :function, :quote, :inert) && return ex
     ex.head === :return && throw(ArgumentError(
-        "@traceable does not support a `return` before the end of `$(signature)`; " *
+        "$owner does not support a `return` before the end of `$(signature)`; " *
         "write the branch as an expression (`condition ? a : b`)."))
-    foreach(arg -> _traceable_no_return(arg, signature), ex.args)
+    foreach(arg -> _traceable_no_return(arg, signature, owner), ex.args)
     ex
+end
+
+"""
+    TraceableSource(argument_names, body, mod::Module)
+
+The Julia source of one method, as a package that generates the method hands
+it to `jax_source` through [`register_source_provider!`](@ref): the method's
+formal names in order, its body, and the module whose globals the body reads.
+`jax_source` translates a call of the method from this body as it translates
+an [`@traceable`](@ref) body: a `for` loop becomes `jax.lax.fori_loop`, an
+`if` becomes `jax.lax.cond`, `A[i] = v` becomes `A.at[i].set(v)`, and
+`prepare_data` runs the body as host Python with Python loops and branches.
+
+The body is one expression whose value is the method's result. A `return` at
+its end is allowed; a `return` before the end throws an `ArgumentError` here,
+so write that branch as an expression (`condition ? a : b`). Code that runs
+inside the JAX functions takes the subset an `@traceable` body takes there:
+no `break` or `continue`, and a `for` binds one name over one range.
+`prepare_data` takes both. Static parameters of the method (`where T`) are not bound: the body
+reads its arguments and the globals of `mod`.
+
+Native execution, `prepare` and the compiled paths never read the source: the
+method itself runs there.
+"""
+struct TraceableSource
+    argument_names::Tuple{Vararg{Symbol}}
+    body::Any
+    mod::Module
+    function TraceableSource(argument_names, body, mod::Module)
+        names = Tuple(argument_names)
+        for name in names
+            name isa Symbol || throw(ArgumentError(
+                "TraceableSource takes the method's argument names as `Symbol`s; got `$(repr(name))`."))
+        end
+        allunique(names) || throw(ArgumentError(
+            "TraceableSource got the argument name `$(first(n for n in names if count(==(n), names) > 1))` twice."))
+        new(names, _traceable_tail_body(body, Expr(:tuple, names...), "TraceableSource"), mod)
+    end
+end
+
+const _SOURCE_PROVIDERS = Any[]
+const _SOURCE_PROVIDERS_LOCK = ReentrantLock()
+
+"""
+    register_source_provider!(provider) -> provider
+
+Register `provider` to supply the Julia source of methods that `jax_source`
+has no other source for, so their loops and branches translate. For a method
+that a package generates, such as one a macro writes into its caller's module,
+the method's author cannot write [`@traceable`](@ref); the generating package
+supplies the source instead.
+
+When `jax_source` meets a call of a function `f` with no translation of its
+own and no `@traceable` method for the call, it calls
+`provider(f, argument_types)`, with `argument_types` the `Tuple` type of the
+call's argument types, in the JAX functions and in `prepare_data` alike. The
+provider returns `nothing` when it has no source for that call, or the
+[`TraceableSource`](@ref) of the method that arguments of those types call
+natively, so the translation computes what native execution computes.
+Providers are asked in the order they were registered, and the first source
+wins. A call that no provider answers is translated from its lowered code,
+which must be straight-line. An error the provider throws propagates out of
+`jax_source`.
+
+Register a provider once, from the `__init__` of the package extension that
+loads with ReactiveKernels; registering the same provider again changes
+nothing. A provider only hands over source: nothing is evaluated, and native
+execution is unchanged.
+"""
+function register_source_provider!(provider)
+    Base.@lock _SOURCE_PROVIDERS_LOCK begin
+        any(p -> p === provider, _SOURCE_PROVIDERS) || push!(_SOURCE_PROVIDERS, provider)
+    end
+    provider
+end
+
+# The source a registered provider supplies for a call of `f` with arguments of
+# `types`, as `(names, body, module)` (the first entries of what
+# `_traceable_source` returns), or `nothing` when no provider has one.
+function _provided_source(f, types)
+    providers = Base.@lock _SOURCE_PROVIDERS_LOCK copy(_SOURCE_PROVIDERS)
+    isempty(providers) && return nothing
+    argument_types = Tuple{types...}
+    for provider in providers
+        source = provider(f, argument_types)
+        source === nothing && continue
+        source isa TraceableSource || throw(ArgumentError(
+            "the source provider `$(provider)` returned a `$(typeof(source))` for `$(f)` with " *
+            "argument types $(argument_types); a provider returns `nothing` or a `TraceableSource`."))
+        length(source.argument_names) == length(types) || throw(ArgumentError(
+            "the source provider `$(provider)` returned a source over " *
+            "$(length(source.argument_names)) arguments $(source.argument_names) for a call of " *
+            "`$(f)` with $(length(types)), argument types $(argument_types)."))
+        return (source.argument_names, source.body, source.mod)
+    end
+    nothing
 end
 
 function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
@@ -3910,7 +4007,7 @@ end
 #
 # Only strict positions are entered: a branch, short-circuit, generator,
 # closure, `let` or macro call keeps its own evaluation, so a node never runs
-# where the authored expression would not (docs/src/constraints.md, "Preserve
+# where the authored expression would not (CONTRIBUTING.md, "Preserve
 # lazy branches"); its whole enclosing call can still be a node. A dotted call
 # keeps its nested dotted calls fused; its eager operands can be nodes. The
 # decomposition is a function of the expression and its argument names alone,

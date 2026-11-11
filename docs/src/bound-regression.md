@@ -34,7 +34,7 @@ The generated view exposes the selected dependencies. A reader can inspect which
 Tutorials.html(visualize(plan(regression)))
 ```
 
-The callable's generated expression is also available. It is printed using Julia's expression printer, with source line annotations removed from a copy. Names or operations in this output have not been replaced with a hand-written sketch.
+The callable's generated expression is also available. It is printed using Julia's expression printer, with source line annotations removed from a copy. Every name and operation shown is one the callable executes.
 
 ```@example regression
 Tutorials.generated(loss)
@@ -85,7 +85,7 @@ Tutorials.figure(plot, "regression-response",
 
 ## Diagnostics
 
-An output should demonstrate the property being checked. Here the residual definition and scalar reduction can be checked directly against ordinary array arithmetic. The displayed discrepancies measure agreement rather than merely report that a callable was constructed. The assertions stop the build if either relationship changes.
+The residual definition and the scalar reduction are compared directly against ordinary array arithmetic. Each displayed discrepancy is an absolute difference from that reference, the largest one for the residual vector. The assertions stop the build if either relationship changes.
 
 ```@example regression
 residual_error = maximum(abs, residual - (y - prediction))
