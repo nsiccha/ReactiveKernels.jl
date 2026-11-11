@@ -15,7 +15,7 @@
 #     JULIA_NUM_THREADS=1 julia --project=<env with Enzyme> repro_enzyme_thread_atomic_add.jl
 #     JULIA_NUM_THREADS=8 julia --project=<env with Enzyme> repro_enzyme_thread_atomic_add.jl
 #
-# Recorded on gordito (AMD Ryzen 9 9950X), Julia 1.10.12 with
+# Recorded on a Linux fleet host (AMD Ryzen 9 9950X), Julia 1.10.12 with
 # `-C znver3,+avx512f,+avx512dq,+avx512cd,+avx512bw,+avx512vl`, Enzyme 0.13.216
 # and 0.13.206, 2026-10-13 (best time per gradient, bytes per gradient, atomic
 # updates in the derivative module):

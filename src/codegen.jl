@@ -2990,7 +2990,7 @@ end
 # of one element are independent. Here the cells of one tile take their seed,
 # then each element in turn: one contiguous pass `acc = add_sum(acc, term)`
 # over the tile per element, which vectorizes across cells. Every cell's value
-# is the authored fold in the authored order, bitwise. Measured on gordito
+# is the authored fold in the authored order, bitwise. Measured on a Linux fleet host
 # (Julia 1.10.12, 16321 cells): `w[j] / (t + s[j])` 3.2-3.5 -> 0.32-0.35
 # ns/cell over 3 elements and 8.9-9.3 -> 1.16-1.24 over 12; a term calling
 # `exp` gains nothing and loses up to 13 % over 12 elements, which is why only
@@ -3462,7 +3462,7 @@ Base.@nospecializeinfer function _plate_branch_arm_kernel(
     # A shallow structural copy keeps the cell's values and operations; only its
     # registry gains the arm's values.
     copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers),
-                   copy(g.aliases), g.version)
+                   copy(g.aliases), g.version, nothing, copy(g.checks))
     next_id = Ref(minimum((q.id for q in inner.recipes); init = 0) - 1)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     replacement = if spec === nothing
@@ -3880,10 +3880,16 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         pointwise_lhs, total_lhs; recycled = nothing,
         input_type_hints = nothing, element_type = nothing, into::Bool = false,
         total_fold = sum, program::Bool = false, readonly_slices = Set{Int}(),
-        batch = nothing)
+        batch = nothing, cell::Union{Nothing,Symbol} = nothing)
     # `into`: `pointwise_lhs` already holds a buffer at least as long as the
     # plate, of its element type; the cells are written into it in place and
     # the binding is left alone (a strip refill, `_lower_authored_scan_strips!`).
+    # `cell`: the plate has exactly one cell (a plate computed at one row of a
+    # cell, `_cell_window!`), whose value is bound to `cell`; there is no
+    # pointwise buffer and no total.
+    cell === nothing || pointwise_lhs === nothing && total_lhs === nothing ||
+        throw(ArgumentError("internal: a one-cell plate has no pointwise or total output"))
+    cell === nothing || push!(body.args, Expr(:local, cell))
     inner_kernel = op.kernel
     inner = getfield(inner_kernel, :plan)
     length(inner.want) == 1 || throw(ArgumentError(
@@ -4038,7 +4044,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         inner_kernel, atomic, callargs, callvalues, raw_arguments,
         prepared_arguments, marker, output_axes, pointwise_lhs, total_lhs;
         recycled, input_type_hints, element_type, into, total_fold, program,
-        deferred, readonly_slices, batch)
+        deferred, readonly_slices, batch, cell)
     # No program took the prepared arguments: prepare them where they stood.
     deferred === nothing || isempty(deferred) ||
         splice!(body.args, deferred_at:deferred_at-1, deferred)
@@ -4058,7 +4064,10 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         input_type_hints = nothing, element_type = nothing, into::Bool = false,
         unswitch::Bool = true, cells::Bool = true, nonempty::Bool = false,
         types = nothing, total_fold = sum, program::Bool = false,
-        deferred = nothing, readonly_slices = Set{Int}(), batch = nothing)
+        deferred = nothing, readonly_slices = Set{Int}(), batch = nothing,
+        cell = nothing)
+    # One cell (`cell`): a shared branch is decided at that cell, in the loop.
+    unswitch &= cell === nothing
     inner = getfield(inner_kernel, :plan)
     if unswitch
         branch = _plate_shared_branch(inner_kernel, atomic, callargs, callvalues)
@@ -4119,7 +4128,8 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         plate_eltype, index, previous, first_coordinate, root_positions,
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
         lane_arms; nonempty, total_fold, runtime_ops, runtime_recipes, program,
-        deferred, readonly_slices, batch = element_type === nothing ? batch : nothing)
+        deferred, readonly_slices,
+        batch = element_type === nothing && cell === nothing ? batch : nothing, cell)
 end
 
 # Append a cell kernel's operations to the table and build the type expression
@@ -4201,7 +4211,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
         lane_arms; nonempty::Bool = false, total_fold = sum,
         runtime_ops, runtime_recipes, program::Bool = false, deferred = nothing,
-        readonly_slices = Set{Int}(), batch = nothing)
+        readonly_slices = Set{Int}(), batch = nothing, cell = nothing)
     groups = nested === nothing ? _authored_plate_recipe_groups(
         inner, dependencies, root_positions, atomic, callvalues) :
         [(Set{ValueId}(), nested.invariants)]
@@ -4485,6 +4495,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     # (`_lower_plate_reduction_native`) already assume.
     pointwise_lhs === nothing ||
         push!(loopbody.args, _inbounds_expr(:($pointwise_lhs[$index] = $scalar_result)))
+    cell === nothing || push!(loopbody.args, :($cell = $scalar_result))
     if accumulator !== nothing
         add = Expr(:call, GlobalRef(@__MODULE__, :_plate_total_add),
                    accumulator, scalar_result)
@@ -4659,12 +4670,16 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
         partition = first(states).partition
         waits(s, c) = any(((batched, via),) -> haskey(s.pushed_lanes, batched) ||
             (via != 0 && haskey(s.pushed_lanes, via)), c[3])
+        # The row each capture is asked for at, when it is read at one
+        # position, so a value computed once per row serves its own row.
+        capture_rows = Dict{Tuple{Any,Int},Symbol}()
         request!(emitter, s, (position, value, reads)) = foreach(reads) do (batched, via)
             rows = partition && !s.single
-            _cell_capture_request!(emitter, value, s.slices[batched],
+            row = _cell_capture_request!(emitter, value, s.slices[batched],
                 via == 0 ? nothing : s.slices[via]; rows,
-                one = !rows && via == 0 &&
+                one = !rows && via == 0 && length(reads) == 1 &&
                     _cell_capture_one(d, s.plate, s.plate_values, position, batched))
+            capture_rows[(s.lhs, position)] = row
         end
         member(f, id) = _cell_forced(f, windows, _cell_member_force(windows, id, false))
         for (id, s) in zip(ids, states)
@@ -4676,7 +4691,13 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
         for (id, s) in zip(ids, states)
             member(id) do
                 for (position, lane_row) in s.lane_rows
-                    taken = _cell_take!(windows, s.pushed_lanes[position], lane_row)
+                    # A vector computed as a number at the one row is taken
+                    # as its one-element vector; a value that is a number
+                    # stays one (the plate reads it whole).
+                    lane = s.pushed_lanes[position]
+                    taken = _cell_take!(windows, lane, lane_row)
+                    lane in windows.scalar &&
+                        (taken = Expr(:call, GlobalRef(@__MODULE__, :_cell_lane_one), taken))
                     s.slices[position] = partition ? taken :
                         Expr(:call, GlobalRef(@__MODULE__, :_cell_batched_slice), taken, s.cell)
                 end
@@ -4694,7 +4715,8 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
             member(id) do
                 for c in s.captures
                     position, value = c[1], c[2]
-                    s.slices[position] = _cell_capture!(waits(s, c) ? later : windows, value)
+                    s.slices[position] = _cell_capture!(waits(s, c) ? later : windows, value,
+                        get(capture_rows, (s.lhs, position), nothing))
                 end
             end
         end
@@ -4752,7 +4774,7 @@ _cell_forced(f, ::Nothing, ::Int) = f()
 # (`_cell_partition_regions`): each such member's region (`region_bodies`), the
 # work only it reads and its plate run under its nonempty-row guard, and its sum
 # is zero otherwise, so an empty member neither computes nor reads its work
-# (snag `absent-odl-vecto-d98e48bf`). Values the members share are still
+# (snag `empty-vector regression`). Values the members share are still
 # computed once, at the union of their rows. Statements reading only labels and
 # bound data stay unguarded, where a partition's plan computes them per label.
 # When the statements cannot be so placed (`_cell_guard_group`), the group
@@ -4951,10 +4973,14 @@ Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recip
         end
         if haskey(pushed_lanes, position)
             value = pushed_lanes[position]
+            # At one `Int` row (a cell, a one-cell partition) the lane may be a
+            # number, taken as its one-element vector (`_cell_lane_one`).
+            one = !partition || single
+            one && push!(windows.one, row)
             lane_rows[position] = _cell_request!(windows, value,
-                _cell_bind!(windows, :cell_row,
+                _cell_bind_row!(windows, row,
                     Expr(:call, GlobalRef(@__MODULE__, :_cell_leaf_row),
-                        _cell_shape!(windows, value), row)))
+                        _cell_shape!(windows, value), row)); scalar = one)
             push!(slices, nothing)
             continue
         end
@@ -5688,6 +5714,9 @@ function _lower_with_ops_collecting(p::Plan;
     # A plate several cells read that fusion left for this lowering
     # (`_shared_cell_producer`) is composed into those cells when nothing
     # computes it at their rows: without pushdowns, or when they refuse it.
+    # The input checks of the plan as given: the cell rewrites below may
+    # rebuild it over a copied graph, which carries no checks.
+    input_checks = p.checks
     cells = nothing
     if inline_embedded && pushdowns && type_hints === nothing
         pushdowns_of(q) = _cell_compose_unpushed(q, _cell_pushdowns(q;
@@ -5766,8 +5795,32 @@ function _lower_with_ops_collecting(p::Plan;
     for (key, set) in region_sets
         region_guards[key] = foldl((a, b) -> Expr(:||, a, b), (region_guards[m] for m in set))
     end
+    # Input checks (`InputCheck`) run before any recipe when they read only
+    # inputs and literals, and before the return when they read a value this
+    # body computes. A footprint body records reads and runs none.
+    checking = !_footprint_recording() && !isempty(input_checks)
+    if checking
+        have_cids = Set(canon_id(g, v.id) for v in p.have)
+        at_entry(c) = all(a -> !(a isa Value) || canon_id(g, a.id) in have_cids, c.args)
+        check_call(c) = Expr(:call, GlobalRef(@__MODULE__, :_input_check),
+            GlobalRef(parentmodule(c.f), nameof(c.f)),
+            (a isa Value ? nm(a) : a for a in c.args)...)
+        for c in input_checks
+            at_entry(c) && push!(body.args, check_call(c))
+        end
+    end
+    # The others run as soon as the body has computed their arguments.
+    pending_checks = checking ? InputCheck[c for c in input_checks if !at_entry(c)] :
+        InputCheck[]
+    check_ready(c) = all(a -> !(a isa Value) || canon_id(g, a.id) in assigned, c.args)
     outer_body = body
     for r in p.recipes
+        if !isempty(pending_checks)
+            for c in pending_checks
+                check_ready(c) && push!(outer_body.args, check_call(c))
+            end
+            filter!(!check_ready, pending_checks)
+        end
         owner = get(regions, r.id, 0)
         body = owner == 0 ? outer_body : region_bodies[owner]
         recording === nothing || (recording.guard = get(region_guards, owner, nothing))
@@ -6181,6 +6234,9 @@ function _lower_with_ops_collecting(p::Plan;
     recording === nothing || (recording.guard = nothing)
     all(((group, pending),) -> length(pending) == length(group), cell_pending) ||
         error("internal: a group of plate cells was not lowered completely")
+    for c in pending_checks
+        push!(body.args, check_call(c))
+    end
     retval = length(p.want) == 1 ? nm(p.want[1]) :
              Expr(:tuple, (nm(w) for w in p.want)...)
     _footprint_recording() &&
@@ -7296,7 +7352,7 @@ end
 # lowered AST and recipes, whose value ids come from a process-global counter
 # whose namespace's count changes with every value allocated. So every build of
 # one program compiled another body of another type, and every reader of it
-# compiled again (snag `sampler-runtimeg-13afd928`: an ODL archive sampler, one
+# compiled again (snag `sampler-runtimeg-13afd928`: an downstream archive sampler, one
 # new type per build of the same binding).
 #
 # The body therefore embeds an execution copy of each object, of the same type:
@@ -7551,10 +7607,8 @@ end
 # recipe's outputs. Generated code orders values this way, never by identity: a
 # `ValueId` orders by the key of the namespace that allocated it, and that key
 # differs in every process. A program composed of values a package image made
-# and values made at run time (Bruno's simulator: its summary graph and its
-# model) ordered them one way while the image was generated and another at run
-# time, so the image's compiled reader did not apply (snag
-# `compiled-reader-be3cadbb`).
+# and values made at run time must preserve its ordering so that the image's
+# compiled reader also applies at run time.
 function _declaration_order(p::Plan, ids)
     wanted = Set{ValueId}(ids)
     order = ValueId[]
@@ -8038,7 +8092,7 @@ _bound_operand_leaves(value) =
 # immutable that holds one, such as a range or a scale. Spelled in the body, it
 # would make each value another generated function, so another type, and a new
 # compile of the whole derivative (snag `prepare-sampler-e69f1b38`; the user's
-# direction on numeric values, `ODLPlaus:precompile` decision
+# direction on numeric values, `runtime-values requirement` decision
 # `2026-11-06T01-09-46-212-0ikeidi`). Tuples and records never reach this as a
 # whole. Anything else, a singleton or a name such as a `Symbol` or a type, has
 # no number to keep out of the body and stays a literal of the rebuild.
@@ -8818,7 +8872,7 @@ end
 # the kernel and not to the shared code. A body that held its caches would need
 # its own identity per kernel, so its own type and compile per preparation; one
 # that held bound numbers would specialize on their values (the user's direction
-# on numeric values, `ODLPlaus:precompile` decision
+# on numeric values, `runtime-values requirement` decision
 # `2026-11-06T01-09-46-212-0ikeidi`).
 function _nonallocating_body(ast::Expr)
     read(name, field) = Expr(:(=), name,

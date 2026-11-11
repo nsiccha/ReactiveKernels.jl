@@ -92,15 +92,10 @@ output into the window that produced it. A prior that a later window computes
 from its own rows differently (a scale from all its rows) is counted as the
 first window holding the coordinate computes it.
 
-```julia
-built = build_kernel(plans[1])
-joined = prepare_joined_windows(built, plans, us; boundary = :h_out => :h_in,
-    backend = AutoEnzyme(; mode = Enzyme.Reverse))
-x = joined_point(joined, us)            # the windows' coordinates, joined
-value, g = joined_value_and_gradient!(joined, zeros(length(x)), x)
-window_points(joined, x)                # each window's packed point, inputs fed
-joined_coordinates(joined)              # (; window, position, path, index)
-```
+Use [`joined_point`](@ref) to pack the window points and
+[`joined_value_and_gradient!`](@ref) to evaluate their joint density.
+[`window_points`](@ref) recovers each window point with its boundary inputs;
+[`joined_coordinates`](@ref) identifies the retained coordinates.
 """
 function prepare_joined_windows(built, plans::AbstractVector{<:StructuralPlan},
         u0s::AbstractVector{<:AbstractVector{<:Real}}; boundary, backend, locals = (),

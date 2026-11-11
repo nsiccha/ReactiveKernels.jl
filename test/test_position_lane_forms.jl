@@ -199,7 +199,7 @@ end
 end
 
 # A cell that expands a short live vector across a longer data-indexed one
-# (snag bruno-lpk-genera-3087b1c9): the slices that a dotted call reads as
+# uses the slices that a dotted call reads as
 # operands are read in place by the fused broadcast (`_lane_gathered`), and a
 # nested `vcat` of a number and a slice fills a lane slot (`_lane_vcat`,
 # todo 00zzurd), so a borrowed read allocates nothing per cell and position.

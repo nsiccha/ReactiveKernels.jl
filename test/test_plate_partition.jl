@@ -240,6 +240,128 @@ end
     @test_throws "holds 1 2 times" twice(d.u, d.X, d.ids, d.t, d.y, [1, 1, 2, 3, 4], 1)
 end
 
+# A per-subject authored plate (tuple cells) captured by the subject's
+# observation cell: at one row it runs its one cell, whose value is held in a
+# `_CellOne`, and its batched argument `log_k`, a number there, is read as one.
+@kernel _pp_one_cell_plate(u::AbstractVector{Float64}, X::AbstractMatrix{Float64},
+                           ids::AbstractVector{Int}, t::AbstractVector{Vector{Float64}},
+                           y::AbstractVector{Vector{Float64}},
+                           subject::AbstractVector{Int}) = begin
+    a::Float64 = u[1]
+    beta::AbstractVector{Float64} = view(u, 2:3)
+    z::AbstractVector{Float64} = view(u, 4:8)
+    log_k = a .+ X * beta .+ z
+    rates = plate(log_k) do lk
+        (exp(lk), exp(-lk / 2))
+    end
+    dens = plate(ids, t, y) do i, ti, yi
+        k, v = rates[i]
+        sum(-(yi .- v .* exp.(-k .* ti)) .^ 2 ./ 2)
+    end
+    total = sum(dens)
+    return total
+end
+
+@testset "plate_partition: a per-subject plate at one row runs its one cell" begin
+    n = 5
+    d = (; u = [0.2, -0.3, 0.5, 0.1, -0.2, 0.4, -0.1, 0.3],
+           X = [sin(i + j) for i in 1:n, j in 1:2], ids = collect(1:n),
+           t = [collect(range(0.5, 4.0; length = 2 + i % 3)) for i in 1:n],
+           y = [cos.(range(0.1, 1.0; length = 2 + i % 3)) for i in 1:n],
+           subject = collect(1:n))
+    have = (:u, :X, :ids, :t, :y, :subject, :label)
+    bound = (; d.X, d.ids, d.t, d.y, d.subject)
+    rows = prepare(plate_partition(_pp_one_cell_plate, :dens; by = :subject, index = :label);
+                   have, want = :partition_total, bound)
+    single = prepare(plate_partition(_pp_one_cell_plate, :dens; by = :subject, index = :label,
+                                     single = true);
+                     have, want = :partition_total, bound)
+    dens = prepare(_pp_one_cell_plate; have = (:u, :X, :ids, :t, :y, :subject), want = :dens)(
+        d.u, d.X, d.ids, d.t, d.y, d.subject)
+    for s in 1:n
+        @test single(d.u, s) ≈ rows(d.u, s) rtol = 1e-14
+        @test single(d.u, s) ≈ dens[s] rtol = 1e-14
+    end
+    @test occursin("_CellOne(", string(code_expr(single)))
+    single(d.u, 3); rows(d.u, 3)
+    @test (@allocated single(d.u, 3)) < (@allocated rows(d.u, 3))
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for s in (2, 5)
+        g1, g2 = similar(d.u), similar(d.u)
+        v1, _ = ad_value_and_gradient!(prepare_ad(single, backend, d.u, s; active = :u), g1, d.u, s)
+        v2, _ = ad_value_and_gradient!(prepare_ad(rows, backend, d.u, s; active = :u), g2, d.u, s)
+        @test v1 ≈ v2 rtol = 1e-14
+        @test g1 ≈ g2 rtol = 1e-12
+        @test findall(!iszero, g1) == [1, 2, 3, 3 + s]
+    end
+end
+
+# Two one-cell members reading one predictor as a batched argument, each at its
+# own row of it. The second member lists the subjects in another order, so a
+# label's two rows differ for some labels and agree for others. The predictor
+# is one number per member row, and a row both members read is computed once
+# (`_cell_instance_window!`), as the rows form computes it once at their union.
+const _PP_RATE_CALLS = Ref(0)
+_pp_counted_rate(x) = (_PP_RATE_CALLS[] += 1; exp(x))
+@kernel _pp_two_members(u::AbstractVector{Float64}, X::AbstractMatrix{Float64},
+                        t::AbstractVector{Vector{Float64}}, y::AbstractVector{Vector{Float64}},
+                        y2::AbstractVector{Float64}, subject::AbstractVector{Int},
+                        subject2::AbstractVector{Int}) = begin
+    a::Float64 = u[1]
+    beta::AbstractVector{Float64} = view(u, 2:3)
+    z::AbstractVector{Float64} = view(u, 4:8)
+    k = _pp_counted_rate.(a .+ X * beta .+ z)
+    dens = plate(k, t, y) do ki, ti, yi
+        sum(-(yi .- exp.(-ki .* ti)) .^ 2 ./ 2)
+    end
+    dens2 = plate(k, y2) do ki, yi
+        -(yi - ki)^2 / 2
+    end
+    total = sum(dens) + sum(dens2)
+    return total
+end
+
+@testset "plate_partition: one predictor at two members' rows, each row computed once" begin
+    n = 5
+    d = (; u = [0.2, -0.3, 0.5, 0.1, -0.2, 0.4, -0.1, 0.3],
+           X = [sin(i + j) for i in 1:n, j in 1:2],
+           t = [collect(range(0.5, 4.0; length = 2 + i % 3)) for i in 1:n],
+           y = [cos.(range(0.1, 1.0; length = 2 + i % 3)) for i in 1:n],
+           y2 = [0.5 + 0.1i for i in 1:n], subject = collect(1:n), subject2 = [2, 1, 3, 5, 4])
+    have = (:u, :X, :t, :y, :y2, :subject, :subject2, :label)
+    bound = (; d.X, d.t, d.y, d.y2, d.subject, d.subject2)
+    spec(single) = plate_partition(_pp_two_members, (:dens, :dens2);
+        by = (dens = :subject, dens2 = :subject2), index = :label, single)
+    rows = prepare(spec(false); have, want = :partition_total, bound)
+    single = prepare(spec(true); have, want = :partition_total, bound)
+    dens, dens2 = prepare(_pp_two_members; have = have[1:end-1], want = (:dens, :dens2))(
+        d.u, d.X, d.t, d.y, d.y2, d.subject, d.subject2)
+    for s in 1:n
+        r2 = findfirst(==(s), d.subject2)
+        @test single(d.u, s) ≈ dens[s] + dens2[r2] rtol = 1e-14
+        @test single(d.u, s) ≈ rows(d.u, s) rtol = 1e-14
+        # Label 3 is row 3 of both members: one evaluation of its predictor.
+        for k in (single, rows)
+            _PP_RATE_CALLS[] = 0
+            k(d.u, s)
+            @test _PP_RATE_CALLS[] == (r2 == s ? 1 : 2)
+        end
+    end
+    @test occursin("_cell_instance_source(", string(code_expr(single)))
+    single(d.u, 3); rows(d.u, 3)
+    @test (@allocated single(d.u, 3)) < (@allocated rows(d.u, 3))
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for s in (1, 3)
+        g1, g2 = similar(d.u), similar(d.u)
+        v1, _ = ad_value_and_gradient!(prepare_ad(single, backend, d.u, s; active = :u), g1, d.u, s)
+        v2, _ = ad_value_and_gradient!(prepare_ad(rows, backend, d.u, s; active = :u), g2, d.u, s)
+        @test v1 ≈ v2 rtol = 1e-14
+        @test g1 ≈ g2 rtol = 1e-12
+        r2 = findfirst(==(s), d.subject2)
+        @test findall(!iszero, g1) == sort!(unique([1, 2, 3, 3 + s, 3 + r2]))
+    end
+end
+
 # Rung 2: two plates with different row sets and keys. An observation plate
 # over rows reads a completed covariate (`vcat(observed, drawn)[order]`, the
 # shape of a completion) and a group block through a product; a totals plate

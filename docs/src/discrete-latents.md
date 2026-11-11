@@ -1,132 +1,145 @@
-# Discrete latent variables
+# Conditional latent states
 
-A model with a discrete latent, such as a hidden Markov model's state path, a
-mixture's component labels or a change point, is often sampled by Gibbs
-sampling: a gradient-based sampler moves the continuous parameters while
-another sampler moves the discrete latents, for example Turing's
-`Gibbs(HMC(…, :m, :T), PG(…, :s))`, whose particle Gibbs step on the states
-becomes sticky when its particles degenerate.
+This example simulates a hidden Markov chain with two states and a continuous observation at each step. The transition matrix favors staying in the current state. Each state has its own normal emission mean, with a shared known observation scale. The model sums over the latent path when evaluating its density. Afterward, a conditional-latent query recovers state probabilities at supplied values of the continuous parameters; no statistical fit runs in this documentation build.
 
-`@rkppl` takes the other exact route. The observation's law sums the discrete
-latent out, so the sampler (NUTS on `prepare_sampler`, see
-[Writing models with `@rkppl`](rkppl.md)) sees only the continuous parameters, on their exact marginal posterior. The
-latents are then recovered per posterior draw: `prepare_discrete_latents`
-computes their exact posterior given the parameters, and
-`discrete_latent_draws` draws them from it. A parameter draw with its latent
-draw is an exact draw from the joint posterior; no particle approximation and
-no alternation between blocks is involved.
+## Data
 
-`prepare_discrete_latents` covers two summed-out latents:
+A seeded random number generator makes the simulated observations reproducible. The state sequence is retained only as a diagnostic because it is known in this simulated dataset. The inference query receives the observations, not the generating states.
 
-- a whole-event hidden Markov observation, `y ~ LogDensity(law, …)` with one of
-  the RK hidden Markov laws (`normal_hmm_logdensity`,
-  `exponential_hmm_logdensity`, `hmm_logdensity` and their log-weight twins);
-- a plain finite-mixture response, `y .~ MixtureModel.(…)`.
+```@example latents
+using ReactiveKernelsPPL, Random, AlgebraOfVega
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal_hmm_logdensity
+using Main.Tutorials
 
-Any other summed-out latent is recovered as an authored value of the model,
-as the change-point example below shows.
-
-Each example on this page runs at docs-build time, exactly as displayed. The
-same files are checked against independent references by ReactiveKernelsPPL's
-`test_discrete_latents.jl`. They evaluate the latents at the data-generating
-parameters; in a fit, use each posterior draw instead (see "Over posterior
-draws" below).
-
-## A hidden Markov model
-
-The model of Turing's Bayesian HMM tutorial: three states, each emitting
-around its own mean, with Dirichlet transition rows.
-
-```@eval
-Main.DiscreteLatentDocs.render_source("hmm.jl")
+rng = Xoshiro(2019)
+transition = [0.90 0.10; 0.10 0.90]
+means = [0.0, 2.0]
+noise = 0.7
+steps = 40
+states = zeros(Int, steps)
+states[1] = rand(rng, 1:length(means))
+for t in 2:steps
+    states[t] = min(searchsortedfirst(
+        cumsum(transition[states[t - 1], :]), rand(rng)), length(means))
+end
+y = means[states] + noise * randn(rng, steps)
+(; observations=y, generating_states=states)
 ```
 
-```@eval
-Main.DiscreteLatentDocs.render_hmm()
+The observation scale allows the emission distributions to overlap. A single observation can therefore leave uncertainty about its state even when the transition matrix and emission means are known. Neighboring observations provide further information through the transition model. The example keeps those parameters fixed at their generating values so that this conditional uncertainty is separate from uncertainty about the parameters themselves.
+
+## Model
+
+Each transition row has a Dirichlet prior. The emission means have normal priors. The distribution kernel used for the observations evaluates the marginalized hidden Markov likelihood, with a uniform initial-state distribution. The state count, prior settings and observation scale enter through the model binding.
+
+```@example latents
+model = @rkppl begin
+    eachrow(T[1:K, 1:K]) .~ Dirichlet(concentration)
+    m[1:K] .~ Normal.(mean_prior, mean_scale)
+    y ~ LogDensity(normal_hmm_logdensity, m, noise, T, initial)
+end
+
+K = length(means)
+bound = model(;
+    K, concentration=ones(K) ./ K,
+    mean_prior=means, mean_scale=1.0, noise,
+    initial=ones(K) ./ K,
+) | (; y)
+built = build_kernel(bound)
+u = unconstrain(built.layout, (; T=transition, m=means))
+target = prepare_query(built, bound, :sampler)
+target(u)
 ```
 
-`posterior.probabilities[t, k]` is the probability of state `k` at step `t`
-given the whole sequence (forward-backward smoothing).
-`posterior.log_filtered[t, k]` is its log probability given the first `t`
-steps alone, and `posterior.log_transition` holds the log transition weights
-the law reads. Those last two are the arguments of the path's law:
-`discrete_latent_draws` draws the last state from its filtered probabilities,
-then each earlier state given its successor (forward filtering, backward
-sampling), with `rng` as the only source of randomness.
+The sampler-facing vector contains continuous transition and emission parameters. It does not contain a discrete coordinate for every step. Summing out the path preserves a continuous density for those parameters while retaining a separate query for the conditional states.
 
-Each hidden Markov law has a state-posterior twin with the same arguments,
-which the query calls on the observation's own arguments:
-`normal_hmm_state_posterior` for `normal_hmm_logdensity`, and so on. The law
-and its twin share one forward pass; the twin adds a backward history scan
-over the (step, state) cells:
+The generated model view shows the program used for these queries. Its dependency graph and generated expressions come from the built model rather than a second authored representation of the hidden Markov calculation.
 
-```@eval
-Main.DiscreteLatentDocs.render_kernel("_hmm_log_weights_forward")
+```@example latents
+Tutorials.html(model_view(built; bound))
 ```
 
-```@eval
-Main.DiscreteLatentDocs.render_kernel("hmm_log_weights_state_posterior")
+## Conditional probabilities
+
+Prepare the discrete-latent query once, then evaluate it at the unconstrained parameter vector. The returned response field contains probabilities for every step and state, together with the filtered and transition quantities used for path draws.
+
+```@example latents
+latents = prepare_discrete_latents(built, bound)
+posterior = latents(u).y
+probabilities = posterior.probabilities
+most_probable = [argmax(probabilities[t, :]) for t in eachindex(y)]
+(; probabilities, most_probable)
 ```
 
-A law of another emission family (a module-visible `@kernel` that fills the
-log emissions and returns `hmm_logdensity(…)`) has no twin the query knows. Author its
-posterior as a value instead, `states = hmm_state_posterior(log_emissions,
-transition, initial)`, and draw from it with `draw_hmm_states(rng, states)`.
+These are conditional state probabilities given the complete observation sequence and the supplied parameter values. They are not probabilities averaged over a posterior distribution of transition matrices or emission means. An application with parameter draws can evaluate the same prepared query at those draws and combine the results using the averaging appropriate to its inference task.
 
-## A Gaussian mixture
+The figure follows the probability of the second state across the sequence. Values between the extremes expose remaining state uncertainty. Abrupt changes can correspond to evidence for a transition, while observations near the overlap of the emission distributions can leave a less certain assignment. The figure is generated from the returned probability matrix.
 
-The one-dimensional form of Turing's Gaussian mixture tutorial, which samples
-the assignments with particle Gibbs:
-
-```@eval
-Main.DiscreteLatentDocs.render_source("mixture.jl")
+```@example latents
+plot = data((; step=collect(eachindex(y)), probability=probabilities[:, 2])) *
+    mapping(:step => "Sequence step (index)",
+            :probability => "Conditional probability of state 2") *
+    visual(Lines; color="#2a78d6")
+Tutorials.figure(plot, "conditional-states",
+    "Conditional probability of state 2 given the complete observation sequence and the supplied transition and emission parameters.")
 ```
 
-```@eval
-Main.DiscreteLatentDocs.render_mixture()
+## Diagnostics
+
+Each row must be a probability distribution. Check normalization, finiteness and nonnegativity before interpreting its largest entry. The displayed row-sum error quantifies the normalization check; the assertions make the build fail if the returned object violates the probability contract.
+
+```@example latents
+row_sum_error = maximum(abs, vec(sum(probabilities; dims=2)) .- 1)
+minimum_probability = minimum(probabilities)
+@assert all(isfinite, probabilities)
+@assert minimum_probability >= 0
+@assert row_sum_error < 1e-12
+(; row_sum_error, minimum_probability)
 ```
 
-`memberships[i, k]` is the probability that observation `i` came from
-component `k`: the weighted component densities the likelihood sums,
-normalized. The rows follow the response's order. Each observation's
-component is drawn independently.
+A conditional draw samples an entire path, preserving dependencies between steps. Drawing each state's marginal independently would generally produce a different distribution over paths. The API therefore exposes a path-draw operation alongside the probability query.
 
-Mixtures with evidence (censoring, truncation), weights, missing entries,
-ranges, packed rows or one array per `@plate` index are refused by
-`prepare_discrete_latents`, naming the response; so are hidden Markov
-observations inside `@plate` cells.
-
-## A change point
-
-A switch year is summed out by an ordinary model function. Its posterior is
-then an authored value, which any query of the model can read:
-
-```@eval
-Main.DiscreteLatentDocs.render_source("changepoint.jl")
+```@example latents
+path = discrete_latent_draws(latents, u, Xoshiro(1)).y
+@assert length(path) == length(y)
+@assert all(s -> 1 <= s <= K, path)
+(; path, valid_states=all(s -> 1 <= s <= K, path))
 ```
 
-```@eval
-Main.DiscreteLatentDocs.render_changepoint()
+A modal state at each step is a collection of marginal decisions. It need not be the most probable complete path, and it need not equal a sampled path. The two outputs answer different questions. Likewise, matching the generating states in this simulated dataset would not establish calibration across datasets; that would require a separate simulation study with an explicit design.
+
+## Query lifetime
+
+The prepared query is reusable for parameter vectors with the same layout. A changed observation sequence requires a compatible new binding and query preparation. Keep the layout attached to the built model: constructing a vector from an assumed parameter order risks evaluating a valid numerical vector with the wrong interpretation.
+
+The [probabilistic-graph guide](rkppl.md) explains this binding and coordinate boundary. The [scan guide](scan.md) introduces sequential recurrences at the core graph level, while the [PPL reference](ppl-api.md) documents the conditional-latent result and path-draw interfaces. Distribution-specific latent queries may return different structures; use the contract of the selected observation distribution.
+
+```@example latents
+Tutorials.receipt("discrete-latents"; checks=(
+    row_sum_error, minimum_probability,
+    valid_states=all(s -> 1 <= s <= K, path),
+))
 ```
 
-## Over posterior draws
+## State labels
 
-With posterior draws `U` of the parameters (one per column, from any sampler
-on `prepare_sampler(built, plan, u0)`), one latent draw per parameter draw
-gives draws from the joint posterior:
+State labels identify rows and columns of the transition matrix and entries of the emission-mean vector. The probability column selected for the figure uses that same ordering. Relabeling states consistently leaves the observation model unchanged but changes which label appears on the plotted column. Keep this correspondence when combining results across parameter draws; an inconsistent permutation would average probabilities for different states.
 
-```julia
-using Random
-rng = Xoshiro(1)
-paths = [discrete_latent_draws(latents, u, rng).y for u in eachcol(U)]
-state_probabilities = sum(latents(u).y.probabilities for u in eachcol(U)) ./ size(U, 2)
+This example avoids that ambiguity by evaluating a single supplied parameter point with named generating values. The retained simulated path helps explain the data construction, but the normalization and path-validity diagnostics do not depend on recovering that particular random path. They check the conditional-query contract on its own terms.
+
+```@raw html
+<details><summary>Reproduce</summary>
 ```
 
-Averaging the conditional probabilities over the draws, as in the last line,
-estimates each step's posterior state probabilities with less Monte Carlo
-error than counting the drawn paths.
+The seed and supplied parameters appear above. Run these shell commands from the repository root.
 
-`discrete_latents_node(built)` names the graph value the query evaluates. WANT
-it in a cut of `built.spec` and `vectorize` that cut over the draws; its leaves
-are numeric arrays, stacked on a trailing draw axis, and
-`discrete_latent_draws(value, rng; position = k)` draws the latents of draw `k`.
+```sh
+julia --project=docs docs/instantiate.jl
+julia --project=docs docs/make.jl
+```
+
+Download the <a href="./receipts/discrete-latents.toml" download>execution receipt</a>. The [research README](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/docs-history/README.md) describes the location of historical experiments.
+
+```@raw html
+</details>
+```

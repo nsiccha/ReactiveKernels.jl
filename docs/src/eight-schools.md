@@ -1,239 +1,163 @@
-# Declarative PPL kernel: eight schools
+# Eight schools
 
-```@eval
-Main.ReactiveKernelsDocs.render_result_assets()
+The data are estimated treatment effects and their reported standard errors from the [public Stan eight-schools example](https://github.com/stan-dev/example-models/blob/master/misc/eight_schools/eight_schools.data.R), in test-score units. Each school has an unknown effect, with a common population location and scale. This page evaluates the centered hierarchical model at supplied parameter values. It does not fit a posterior. Keeping the parameter point explicit makes the density decomposition, support transformation and observation contributions directly checkable.
+
+## Model
+
+A normal population distribution connects the school effects. The population location has a normal prior, and the positive population scale has a half-Cauchy prior. The observed effect in each school has a normal likelihood with its reported standard error. Prior settings are bound inputs; changing those numerical values does not require authoring another model.
+
+```@example schools
+using ReactiveKernelsPPL, Distributions, AlgebraOfVega
+using Main.Tutorials
+
+y = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
+sigma = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
+prior_location = 0.0
+prior_scale = 5.0
+
+model = @rkppl begin
+    mu ~ Normal(prior_location, prior_scale)
+    tau ~ truncated(Cauchy(prior_location, prior_scale), 0, Inf)
+    theta[axes(y, 1)] .~ Normal.(mu, tau)
+    y .~ Normal.(theta, sigma)
+end
+
+bound = model(; sigma, prior_location, prior_scale) | (; y)
+built = build_kernel(bound)
+point = (; mu=5.0, tau=3.0, theta=fill(5.0, length(y)))
+u = unconstrain(built.layout, point)
+(; coordinate_names=coordinate_names(built.layout), unconstrained=u)
 ```
 
-`ReactiveKernels` has no built-in probabilistic-programming semantics. This
-example assembles the model from reusable declarative distribution kernels,
-ordinary transforms, and `plate`. PPL evaluation policies then reduce to named
-graph-output selection: the equivalent of Wren's `Params`, `LogPrior`, and
-`LogLikelihood` accumulators is one
-`want = (:parameters, :prior, :likelihood)` boundary.
+The layout supplies the coordinate order and transformations. The positive population scale needs an unconstrained representation, while the location and school effects remain real-valued. Constructing coordinates through the layout keeps the example independent of a guessed packing order. The displayed vector is a parameter point, not a posterior draw or an estimate derived from the observations.
 
-The complete runnable source is
-[`packages/ReactiveKernelsPPLExamples/src/eight_schools.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPLExamples/src/eight_schools.jl).
-It implements the centered model
+The generated model view exposes the actual program and its graph. The source of each model term remains available for inspection beside the queries that consume it.
 
-```math
-\begin{aligned}
-\mu &\sim \operatorname{Normal}(0, 5), \\
-\tau &\sim \operatorname{HalfCauchy}(0, 5), \\
-\theta_j &\sim \operatorname{Normal}(\mu, \tau), \\
-y_j &\sim \operatorname{Normal}(\theta_j, \sigma_j).
-\end{aligned}
+```@example schools
+Tutorials.html(model_view(built; bound))
 ```
 
-The unconstrained vector is `(μ, log_τ, θ₁, …, θ₈)`. Only `τ` needs a support
-transform. The graph declares both `τ = exp(log_τ)` and `log_τ = log(τ)`, so a
-query may start from either representation; an explicit HAVE value cuts the
-opposite recipe. The log absolute Jacobian determinant for an unconstrained
-query is `log_τ`.
+## Density components
 
-The one model graph exposes the packed `unconstrained` input, named latent ports
-`μ`/`log_τ`/`θ`, constrained `parameters`, `log_jacobian`, `prior`,
-`unconstrained_prior`, `likelihood`, `pointwise`, `constrained_logdensity`, and
-`posterior`. The constrained joint is `prior + likelihood`; its unconstrained
-counterpart and `unconstrained_prior` additionally include `log_jacobian`.
-Preparing a different HAVE/WANT boundary changes only the generated backward
-slice; it does not select a second model implementation.
+Prepare the sampler target and its named components separately. Each query selects a boundary from the generated graph. There is no independently maintained implementation of the prior or likelihood for these queries.
 
-The constrained `parameters` port has **two producers** — this is RK's *multiple
-paths to the same port*. One assignment builds the constrained parameters alone;
-a second builds them together with the log Jacobian, sharing the one transform.
-The Jacobian also has a standalone producer. The planner therefore takes the
-parameters-only path for a constrain-only query, the joint producer when both
-outputs are requested, and the single-output Jacobian path for a packed posterior
-query. The latter keeps that sampler-facing plan compatible with RK's public
-single-output-recipe nonallocating pass. No macro is involved: ordinary
-assignments declare all three alternatives.
-
-```text
-                              ┌─ parameters                     (constrain-only)
-unconstrained ─ split ─ τ ────┼─ log_jacobian                  (posterior)
-                              └─ (parameters, log_jacobian)     (both requested)
-
-parameters ──► reusable Normal/Cauchy kernels ──► log prior
-          ──► reusable Normal kernel ─ plate ─┬─► pointwise log likelihoods
-                                              └─► fused log-likelihood sum
-          ──► new-group prediction
-
-log prior ────────────────────► unconstrained prior (+ log Jacobian)
-     └─ + log likelihood ─────► constrained log density
-                                └─ + log Jacobian ─► unconstrained log posterior
-```
-
-The block below is the authored model, executed verbatim while the documentation
-is built, and it is the single source authority used by both the tests and this
-build. Every model-level operation is visible there: the split is plain
-indexing, the transform is `exp(log_τ)`, and ordinary
-`normal(...).logpdf(...)` / `cauchy(...).logpdf(...)` calls include the reusable
-distribution objects transparently. The PPL source does not re-author either
-density formula and does not prepare helper factor or plate kernels.
-Constrained parameters and the new-group prediction are plain `NamedTuple`s, not
-custom types.
-
-Each batched term is authored once as `pointwise = plate(...) do ... end`, with
-an ordinary `sum(pointwise)` consumer in the same graph. A total-only query
-emits a scalar accumulator loop directly, without building a pointwise vector;
-asking for `pointwise` materializes only that requested result. These are static
-prepared boundaries over one authored plate node.
-
-The hierarchical prior already contains both `τ = exp(log_τ)` and `log_τ`.
-Each effects Normal binds both named ports as authoritative HAVE values, so RK
-uses `τ` for standardization and `log_τ` for normalization without recomputing
-or validating either representation. The half-Cauchy hyperprior independently
-retains its fixed scale `5`.
-
-The three Wren-style outputs are likewise not three RK-specific accumulator
-types. They are a static tuple of graph nodes:
-
-```julia
-requested_nodes = (:parameters, :prior, :likelihood)
-evaluation_kernel = prepare(model;
-    have = (:μ, :log_τ, :θ, :observations, :observation_scales),
-    want = requested_nodes)
-
-parameters, prior, likelihood =
-    evaluation_kernel(μ, log_τ, θ, observations, observation_scales)
-```
-
-Because selection happens during planning, the generated kernel contains only
-the backward slice needed for those nodes. In particular, it uses the fused
-likelihood reduction and prunes the pointwise collector, Jacobian, posterior, and
-prediction branches. An eventual PPL-to-RK transpiler only needs to retain the
-mapping from PPL results to these named ports; RK handles extraction. The packed `unconstrained`
-vector and the named latent ports are alternate HAVE boundaries over that same
-graph, not alternate implementations of the mathematics.
-
-That gives the standard joint-density views without wrapper models. A
-constrained-space call supplies `parameters = (; μ, τ, θ)` and asks for
-`constrained_logdensity`; an unconstrained-space call supplies the packed
-`unconstrained` vector and asks for the distinguished `posterior` return. The former computes
-`log_τ = log(τ)` once for the distribution normalization terms and prunes the
-transform Jacobian; the latter uses the supplied `log_τ`, computes `τ`, and adds
-the Jacobian. Prior-only, likelihood-only, and pointwise-only are further slices
-of this same graph.
-
-The unconstrained posterior uses that same RK-generated transform, prior, and
-the two authored plate nodes for school effects and observations. Preparation
-fuses each sum into its traversal and emits one flat posterior kernel; there is
-no separately handwritten fused evaluator or nested `PreparedKernel`.
-
-The panel below shows three views of this model: **Raw input** (the source), a
-readable **Generated kernel** derived from the executed kernel and selected
-plan, and the **Compute DAG** (`visualize(evaluation_kernel.plan)`). The exact
-compiled AST remains available as `code_expr(evaluation_kernel)`. **Compare all** shows the
-views side by side.
-
-```@eval
-Main.ReactiveKernelsDocs.execute_ppl_example(
-    @__MODULE__, :EightSchoolsExample, :EIGHT_SCHOOLS_SOURCE;
-    setup = Main.ReactiveKernelsDocs.setup_eight_schools!,
+```@example schools
+target = prepare_query(built, bound, :sampler)
+prior = prepare_query(built, bound, :prior)
+likelihood = prepare_query(built, bound, :likelihood)
+jacobian = prepare_query(built, bound, :log_jacobian)
+components = (
+    prior=prior(u),
+    likelihood=likelihood(u),
+    log_jacobian=jacobian(u),
+    target=target(u),
 )
+@assert components.target ≈
+    components.prior + components.likelihood + components.log_jacobian
+components
 ```
 
-## Primal capability and log-density performance
+The log Jacobian belongs to the density in unconstrained coordinates. It is not another observation term. Comparing a constrained-space reference with the sampler target therefore requires adding that transformation term. Omitting it would test a different target even if the prior and likelihood themselves agreed.
 
-The cross-receipt contract has ten RK configurations: ordinary native primal,
-nonallocating native primal, Reactant primal, native value-and-gradient, and
-Reactant value-and-gradient, each with data unbound or fixed at preparation.
-The fixed-data form is the public partial-evaluation path (`bound =
-(; observations, observation_scales)`). The sampler headline is the packed
-unconstrained vector to the full joint, and all ten headline cells must work.
-Nonallocating AD and nonallocating Reactant are deliberately absent because
-those public kernel types do not compose yet; the suite validators reject any
-receipt that silently invents such a surface. ReactiveKernels has since removed
-its Reactant path; the Reactant configurations' receipts stay as recorded.
+The pointwise query retains the likelihood contribution for each observed school. Summing these values recovers the likelihood query. Because the observations are conditionally independent given the school effects, each entry corresponds to one observed effect and its reported uncertainty.
 
-The receipt prepares the exact authored graph above from three useful
-starting boundaries and asks for four model outcomes. `Packed unconstrained`
-matches a sampler's linked parameter vector. `Constrained parameters` starts
-after support transforms. `Likelihood inputs only` supplies just `θ`, the
-observations, and their scales, allowing RK to prune every prior and transform.
-
-The RK cells are HAVE/WANT cuts of one graph, not wrapper models. The manual
-cells are direct handwritten Julia controls. Turing uses its native public
-interfaces: a fixed-transform `LogDensityFunction` for packed parameters,
-`logjoint` / `logprior` / `loglikelihood` for constrained parameters, and
-`pointwise_loglikelihoods` for pointwise values. Blank cells stay blank when no
-matching public Turing boundary exists; the benchmark does not invent an
-equivalent helper. Setup, graph preparation, parameter linking, and transform
-discovery are outside the timed region. The page leads with the sampler-relevant
-packed boundary, split into separate joint, prior, summed-likelihood, and
-pointwise plots and compact baseline-relative tables. The complete boundary ×
-configuration matrix, unsupported cells, setup costs, and raw rounds remain in
-the receipt rather than dominating the comparison view.
-
-The centered Turing baseline uses `filldist(Normal(μ, τ), J)` for the school
-effects. That is the same independent-normal model as
-`MvNormal(fill(μ, J), τ^2 * I)`, while avoiding construction of a mean vector
-and dense multivariate-normal machinery; it is the reasonable optimized Turing
-form rather than an intentionally slow comparator.
-
-```@eval
-Main.ReactiveKernelsDocs.render_eight_schools_primal_benchmarks()
+```@example schools
+pointwise = prepare_query(built, bound, :pointwise)
+contributions = pointwise(u).y
+@assert sum(contributions) ≈ components.likelihood
+(; contributions, sum=sum(contributions), likelihood=components.likelihood)
 ```
 
-PracticalBayes is included above as an ordinary comparator series. Its
-exact-pin harness runs in a separately resolved environment and maps its public
-packed-joint rows onto this same comparison schema. The complete public-API
-matrix and provenance remain in
-[`practicalbayes-comparison-v1.toml`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/receipts/practicalbayes-comparison-v1.toml).
+The figure displays these computed contributions. A lower value means that the observed effect receives a lower log density at this parameter point, taking its standard error into account. It is not a ranking of schools by treatment effectiveness, and it is not a posterior predictive check. The differences combine the standardized residual with the normalizing term associated with each uncertainty.
 
-Displayed runtimes and allocation units use three significant digits. Every
-supported receipt cell comes from ten independent BenchmarkTools minimum-time
-rounds and must agree numerically with the handwritten control before timing.
-
-### Baseline implementations
-
-```@eval
-Main.ReactiveKernelsDocs.render_eight_schools_primal_baselines()
+```@example schools
+plot = data((; school=string.(eachindex(y)), contribution=contributions)) *
+    mapping(:school => "School (index)",
+            :contribution => "Log likelihood contribution (natural-log units)") *
+    visual(BarPlot; color="#2a78d6")
+Tutorials.figure(plot, "school-contributions",
+    "Likelihood contributions at the supplied parameter point; each bar is one observed school, including its reported standard error.")
 ```
 
-```@eval
-Main.ReactiveKernelsDocs.render_practicalbayes_eight_schools_baseline()
+## Diagnostics
+
+Use Distributions to evaluate the constrained-space prior and likelihood independently of the generated graph. The reference includes the population priors and every conditional school-effect density. The likelihood uses the supplied school effects and observation standard errors.
+
+```@example schools
+reference_prior =
+    logpdf(Normal(prior_location, prior_scale), point.mu) +
+    logpdf(truncated(Cauchy(prior_location, prior_scale), 0, Inf), point.tau) +
+    sum(logpdf.(Normal.(point.mu, point.tau), point.theta))
+reference_likelihood = sum(logpdf.(Normal.(point.theta, sigma), y))
+prior_error = abs(components.prior - reference_prior)
+likelihood_error = abs(components.likelihood - reference_likelihood)
+@assert components.prior ≈ reference_prior
+@assert components.likelihood ≈ reference_likelihood
+(; prior_error, likelihood_error)
 ```
 
-Reproduce the pinned receipt from a clean detached checkout:
+A coordinate round trip checks a different boundary. It verifies that converting the structured parameter point to unconstrained coordinates and back recovers the values used by the reference calculation. This check would catch a mismatched layout even when a density happened to remain finite.
+
+```@example schools
+recovered = constrain(built.layout, u)
+roundtrip_error = maximum((
+    abs(recovered.mu - point.mu),
+    abs(recovered.tau - point.tau),
+    maximum(abs, recovered.theta - point.theta),
+))
+@assert recovered.mu ≈ point.mu
+@assert recovered.tau ≈ point.tau
+@assert recovered.theta ≈ point.theta
+(; recovered, roundtrip_error)
+```
+
+## Another parameter point
+
+The prepared queries accept another vector with the same coordinate structure. Changing the population location changes its prior and the conditional prior for the school effects. Holding the school effects fixed leaves the observation likelihood unchanged. This distinction is visible in the returned values below.
+
+```@example schools
+other_point = merge(point, (; mu=8.0))
+other_u = unconstrain(built.layout, other_point)
+changed = (
+    prior_before=prior(u), prior_after=prior(other_u),
+    likelihood_before=likelihood(u), likelihood_after=likelihood(other_u),
+)
+@assert changed.likelihood_before == changed.likelihood_after
+@assert changed.prior_before != changed.prior_after
+changed
+```
+
+The [probabilistic-graph guide](rkppl.md) explains binding and query preparation, and the [differentiation guide](automatic-differentiation.md) introduces the active-input boundary. A sampling application would differentiate the complete unconstrained target and supply its own sampling algorithm and convergence checks. The evaluations here establish the target's components; they do not establish sampler performance or posterior accuracy.
+
+```@example schools
+Tutorials.receipt("eight-schools"; checks=(
+    prior_error, likelihood_error, roundtrip_error,
+    decomposition=components.target ≈
+        components.prior + components.likelihood + components.log_jacobian,
+))
+```
+
+## Interpretation of the boundary
+
+The school effects connect the observation likelihood to the population parameters through their conditional prior. The graph therefore distinguishes two kinds of changes that can look similar in source code. Updating a school effect changes its observation contribution and its conditional prior. Updating only the population location changes the hierarchical prior while leaving the observation distribution at the supplied school effects unchanged. The preceding output checks the latter case directly.
+
+Known standard errors are data in this model. They are not estimates produced by this program, and the model does not include a sampling distribution for those standard errors. A different scientific model could treat uncertainty estimates differently, but it would need a corresponding declaration and a different target. Similarly, a centered and a noncentered parameterization can describe the same constrained model while exposing different unconstrained coordinates and Jacobian terms.
+
+The example uses a finite, interior parameter point so every displayed component can be compared numerically. This does not test all boundary behavior of the half-Cauchy transform. A production inference workflow should inspect its own initial points and diagnostics, especially when the population scale approaches its support boundary. Those checks belong to the sampling workflow; the present build checks the declared model and the consistency of its prepared queries.
+
+```@raw html
+<details><summary>Reproduce</summary>
+```
+
+Run from the repository root. All displayed components and the figure are generated during this build.
 
 ```sh
-julia --startup-file=no benchmark/eight_schools_primal_comparison.jl \
-  --output=benchmark/receipts/eight-schools-primal-v2.toml
-julia --startup-file=no benchmark/receipts/validate_eight_schools_primal.jl \
-  benchmark/receipts/eight-schools-primal-v2.toml
+julia --project=docs docs/instantiate.jl
+julia --project=docs docs/make.jl
 ```
 
-Asking only for constrained parameters selects the parameters-only producer, so
-the split, transform, and assembly run while the joint (Jacobian-bearing)
-producer and every posterior recipe disappear:
+Download the <a href="./receipts/eight-schools.toml" download>execution receipt</a>. Historical compiler and performance experiments are described in the [research README](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/docs-history/README.md).
 
-```julia
-constrain_kernel = prepare(model;
-    have = :unconstrained,
-    want = :parameters)
-parameters = constrain_kernel(q)
-```
-
-Generated quantities can start at an already-constrained boundary. In this
-query, planning removes the unconstrained transform, Jacobian, prior, likelihood,
-and posterior recipes, leaving only the prediction:
-
-```julia
-generated_kernel = prepare(model;
-    have = (:parameters, :new_group_scale, :prediction_innovations),
-    want = :new_group)
-
-prediction = generated_kernel(parameters, 12.0, [0.25, -1.0])
-```
-
-Prediction takes standard-normal innovations as inputs rather than drawing
-random numbers inside a recipe. That preserves the graph's purity: a caller can
-draw fresh innovations, replay fixed ones, or batch them using the same prepared
-kernel without hiding an effect from the planner.
-
-Run the walkthrough from the repository root:
-
-```sh
-julia --project=packages -e 'using ReactiveKernelsPPLExamples; ReactiveKernelsPPLExamples.EightSchoolsExample.demo()'
+```@raw html
+</details>
 ```

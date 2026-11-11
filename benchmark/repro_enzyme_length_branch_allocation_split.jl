@@ -24,7 +24,7 @@
 # mixed-activity handler gives a fresh allocation that no active data reaches
 # a zero shadow. The same split underlies
 # `repro_enzyme_branch_allocation_phi.jl`.
-# Recorded on gordito, Enzyme 0.13.210, Enzyme_jll 0.0.301, Julia 1.10.12 and
+# Recorded on a Linux fleet host, Enzyme 0.13.210, Enzyme_jll 0.0.301, Julia 1.10.12 and
 # 1.12.7, 2026-10-07.
 using Enzyme
 

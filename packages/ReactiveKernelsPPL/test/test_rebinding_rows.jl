@@ -316,7 +316,7 @@ end
 # here the scope the preference sets) every arm is a plate, also one no row
 # takes: one program and one sampler type serve rows that are all observed,
 # all censored, a mix, or none (RK 0.1.119, snag `sampler-type-dif-ea945700`:
-# ODL's soil rows all detected, or all below their detection limit, compiled
+# a downstream application’s soil rows all detected, or all below their detection limit, compiled
 # the sampler again). By default a binding whose rows all take one arm
 # prepares a program of its own.
 @testset "censored rows: one sampler type whichever rows are censored" begin
@@ -397,7 +397,7 @@ end
 
 # A `@plate` over no rows prepares the sampler type of the same program over
 # rows, by default (no `branch_arms` setting): RK rewrites an empty bound
-# domain as it rewrites a nonempty one (RK 0.1.122). The shape is ODL's
+# domain as it rewrites a nonempty one (RK 0.1.122). The shape is a downstream application’s
 # spectrum plates (snag `empty-plate-samp-ef647a0d`): a cell calling a plain
 # helper whose branch reads a data column, times a group effect gathered by a
 # bound index. Each cell reads its data columns whole, so the empty domain

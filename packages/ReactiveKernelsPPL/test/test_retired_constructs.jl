@@ -156,7 +156,7 @@ end
             error
         end
         @test err isa SurfaceLoweringError
-        @test occursin("RKPPLBench", sprint(showerror, err))
+        @test occursin("downstream", sprint(showerror, err))
         @test !isdefined(ReactiveKernelsPPL, name)
     end
     for ast in (quote

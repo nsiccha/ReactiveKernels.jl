@@ -266,6 +266,9 @@ end
 # `MethodError`.
 @inline _readonly_gather(w::_CellWindow{<:Any,<:Any,<:Tuple{Any}},
                          indices::AbstractVector{<:Integer}) = w[indices]
+# A value computed as a number at one row reads its gather with the index as a
+# number (`_cell_scalar_window!`): the element at that position.
+@inline _readonly_gather(w::_CellWindow{<:Any,<:Any,<:Tuple{Any}}, index::Integer) = w[index]
 # `view(v, I)` of a vector has the linear gather's form (`_cell_form`): at a
 # cell's rows it reads the window's rows `I` as that gather does. Values are
 # read-only in a cell, so these rows serve as the view.
@@ -369,6 +372,24 @@ end
     total
 end
 @inline Base.:*(r::_CellRow{<:AbstractMatrix}, w::AbstractVector) = _native_mul(r, w)
+"""
+    _CellOne(value)
+
+The one-element vector holding `value`: a value computed at one row whose
+element is not a number held as a number (an authored plate's cell, a tuple),
+or a number read as a plate's batched argument, which needs an axis. It is
+immutable and allocates nothing; reading it at 1 is `value`.
+"""
+struct _CellOne{T} <: AbstractVector{T}
+    value::T
+end
+Base.size(::_CellOne) = (1,)
+Base.IndexStyle(::Type{<:_CellOne}) = IndexLinear()
+@inline Base.getindex(x::_CellOne, i::Int) = (i == 1 || throw(BoundsError(x, i)); x.value)
+# A plate's batched argument at one row: a number becomes its one-element vector.
+@inline _cell_lane_one(x) = x
+@inline _cell_lane_one(x::Number) = _CellOne(x)
+
 # An operand row read as numbers (`_cell_scalar_operand!`), and a pushed
 # operand's one-row window as that row.
 @inline _cell_operand_row(x::AbstractArray, position::Integer) = _CellRow(x, position)
@@ -522,14 +543,16 @@ end
 # Row `row` of a `vcat` of numbers and vectors from its operands' rows
 # (`_cell_vcat_window!`'s parts): the entry of the operand holding it, of the
 # `vcat`'s element type.
-@inline function _cell_vcat_one(row::Integer, starts::Tuple, parts::Tuple)
-    T = Base.promote_eltypeof(parts...)
-    convert(T, _cell_vcat_one(row, starts, parts, 1))
-end
-@inline _cell_vcat_one(row, starts, ::Tuple{}, k) = throw(BoundsError(starts, row))
-@inline function _cell_vcat_one(row, starts, parts::Tuple, k)
-    starts[k] < row <= starts[k + 1] && return _cell_vcat_entry(first(parts))
-    _cell_vcat_one(row, starts, Base.tail(parts), k + 1)
+# Every branch converts to that type, so the result is never a `Union` (an
+# integer literal beside a float operand), which native Reverse refuses.
+@inline _cell_vcat_one(row::Integer, starts::Tuple, parts::Tuple) =
+    _cell_vcat_one(Base.promote_eltypeof(parts...), row, starts, parts, 1)
+@inline _cell_vcat_one(::Type{T}, row, starts, ::Tuple{}, k) where {T} =
+    _cell_vcat_row_error(starts, row)
+@noinline _cell_vcat_row_error(starts, row) = throw(BoundsError(starts, row))
+@inline function _cell_vcat_one(::Type{T}, row, starts, parts::Tuple, k) where {T}
+    starts[k] < row <= starts[k + 1] && return convert(T, _cell_vcat_entry(first(parts)))::T
+    _cell_vcat_one(T, row, starts, Base.tail(parts), k + 1)
 end
 @inline _cell_vcat_entry(part::Number) = part
 @inline _cell_vcat_entry(part::AbstractArray) = only(part)
@@ -2482,7 +2505,7 @@ function _cell_outline(p::Plan, outlines::Dict{Int,Any})
     isempty(outlines) && return p, Set{Int}()
     g = p.graph
     copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers), copy(g.aliases),
-                   g.version)
+                   g.version, nothing, copy(g.checks))
     next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     recipes = Recipe[]
@@ -2518,7 +2541,7 @@ function _cell_expand_selected(p::Plan, blocked, types)
     isempty(selected) && return p
     old = p.graph
     g = Graph(copy(old.values), copy(old.recipes), copy(old.producers),
-              copy(old.aliases), old.version)
+              copy(old.aliases), old.version, nothing, copy(old.checks))
     next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
     freshid() = (id = next_id[]; next_id[] -= 1; id)
     recipes = Recipe[]
@@ -2713,7 +2736,7 @@ function _cell_scalar_reads(p::Plan; argument_types = nothing)
     # Copy even without an outline: a literal index needs a new graph value.
     old = q.graph
     g = Graph(copy(old.values), copy(old.recipes), copy(old.producers),
-              copy(old.aliases), old.version)
+              copy(old.aliases), old.version, nothing, copy(old.checks))
     types = _cell_value_types(q; argument_types, outlined)
     next_id = minimum((r.id for r in q.recipes); init = 0) - 1
     recipes = Recipe[]
@@ -2849,7 +2872,7 @@ function _cell_scalar_plates(p::Plan; argument_types = nothing,
     end
     isempty(lifted) && return p
     g = Graph(copy(p.graph.values), copy(p.graph.recipes), copy(p.graph.producers),
-        copy(p.graph.aliases), p.graph.version)
+        copy(p.graph.aliases), p.graph.version, nothing, copy(p.graph.checks))
     replacements = Dict(id => Value{AbstractVector{types[id]}}(id, g.values[id].name)
         for id in lifted)
     for (id, v) in replacements
@@ -2950,7 +2973,7 @@ end
 # for. A tuple-valued plate then computes every entry at every such row, so a
 # reader of one entry also runs the statements only another entry needs and reads
 # their inputs, such as another partition's coordinates (snag
-# `absent-odl-vecto-d98e48bf`). When its readers read different constant entries
+# `empty-vector regression`). When its readers read different constant entries
 # (`t[k]`), the plate is split by which of those readers' entry sets each statement
 # serves. Each statement goes to the one part for exactly that set, and a part
 # reads earlier parts' values as ordinary batched lanes, so row demand reaches a
@@ -2979,7 +3002,7 @@ function _cell_split_tuple_plates(p::Plan)
     end
     isempty(splits) && return p
     g = Graph(copy(old.values), copy(old.recipes), copy(old.producers),
-              copy(old.aliases), old.version)
+              copy(old.aliases), old.version, nothing, copy(old.checks))
     next_id = minimum((r.id for r in p.recipes); init = 0) - 1
     # The part each reader of a split plate reads instead, by reader and plate output.
     finals = Dict{Tuple{Int,ValueId},Value}()
@@ -3552,6 +3575,12 @@ struct _CellEmitter
     # and the values some reader needs as an array of rows.
     scalar::Set{ValueId}
     arrays::Set{ValueId}
+    # A number asked for at several `Int` rows is computed once per row, as an
+    # instance, instead of at a vector of their union (`_cell_union!`): its
+    # rows, and each instance's reads and window.
+    instances::Dict{ValueId,Vector{Symbol}}
+    instance_reads::Dict{Tuple{ValueId,Symbol},Vector{Any}}
+    instance_data::Dict{Tuple{ValueId,Symbol},Any}
 end
 _CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes; sorted::Bool = false,
              constant::Set{Symbol} = Set{Symbol}(),
@@ -3560,7 +3589,8 @@ _CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes; sorted::Bool 
         Dict{ValueId,Symbol}(), Dict{ValueId,Symbol}(), Dict{Tuple{ValueId,Symbol},Symbol}(),
         Dict{ValueId,Vector{Symbol}}(), Dict{ValueId,Symbol}(),
         Dict{ValueId,Vector{Any}}(), Dict{ValueId,Symbol}(), sorted, constant, regions,
-        Set{Symbol}(), Set{ValueId}(), Set{ValueId}())
+        Set{Symbol}(), Set{ValueId}(), Set{ValueId}(), Dict{ValueId,Vector{Symbol}}(),
+        Dict{Tuple{ValueId,Symbol},Vector{Any}}(), Dict{Tuple{ValueId,Symbol},Any}())
 
 # The member that owns value `cid` in a group with guarded members, else
 # `_CELL_UNGUARDED`.
@@ -3789,10 +3819,13 @@ function _cell_scalar_eligible(e::_CellEmitter, cid::ValueId, r::Recipe, f::_Cel
     d = e.pushdowns
     f.kind in (:pointwise, :columns, :product, :vcat) && e.unions[cid] in e.one &&
         !(cid in e.arrays) && get(d.types, cid, Any) <: AbstractVector || return false
-    # An authored plate lowers its own loop over its arguments' rows
-    # (`_lower_authored_plate_native!`); a helper or position map reads them
-    # through its own row program.
-    r.op isa _AuthoredPlateOp && return false
+    # An authored plate at one row runs its one cell and keeps that cell's
+    # value (`_lower_authored_plate_native!(…; cell)`): its batched arguments
+    # are read at the row as numbers or one-row arrays.
+    r.op isa _AuthoredPlateOp && return all(enumerate(f.roles)) do (j, role)
+        role === :leaf || return true
+        get(d.types, canon_id(d.graph, r.inputs[j].id), Any) <: Union{Number,AbstractVector}
+    end
     f.rowmap === nothing || return false
     type_of(j) = get(d.types, canon_id(d.graph, r.inputs[j].id), Any)
     # A `vcat` of numbers and vectors: its row is one of its operands' entries.
@@ -3829,17 +3862,89 @@ function _cell_scalar_eligible(e::_CellEmitter, cid::ValueId, r::Recipe, f::_Cel
     true
 end
 
-# The rows every request of `cid` reads: the one request, or their union.
+# The rows every request of `cid` reads: the one request, or their union. In a
+# partition, a value that is a number at one row, asked for at several `Int`
+# rows only by readers that accept a number, is held as one number per request
+# instead (two one-cell plates of one subject each read its predictor at their
+# own row): its instances (`_cell_activate!`). An instance whose row an earlier
+# one holds is that instance's number, so each row is still computed once
+# (`_cell_instance_window!`). A single cell's windows keep their rows as read:
+# there the instances' requests would make the union of an upstream value's
+# rows, and its storage, depend on whether the rows agree.
 function _cell_union!(e::_CellEmitter, cid::ValueId)
     rows = e.requests[cid]
+    if e.sorted && length(rows) > 1 && all(in(e.one), rows) && !(cid in e.arrays)
+        d = e.pushdowns
+        r = d.producer[cid]
+        e.unions[cid] = first(rows)
+        if _cell_scalar_eligible(e, cid, r, d.forms[r.id])
+            e.instances[cid] = copy(rows)
+            return e.unions[cid]
+        end
+    end
     e.unions[cid] = length(rows) == 1 ? only(rows) :
         _cell_bind!(e, :cell_rows_union, Expr(:call,
             _cell_ref(e.sorted ? :_cell_union_rows_sorted : :_cell_union_rows), rows...))
 end
 
+# The earlier instance holding row `row` (`earlier` are their rows, in order),
+# or 0 when none does: integer bookkeeping a partition's plan computes once per
+# label.
+@inline function _cell_instance_source(row::Integer, earlier::Tuple)
+    for (j, other) in enumerate(earlier)
+        other == row && return j
+    end
+    0
+end
+
+# Instance `k` (> 1) of pushed value `cid` (`_cell_union!`): computed only when
+# no earlier instance holds its row (`_cell_instance_source`), and otherwise
+# that instance's number, so a row two readers ask for is computed once. The
+# window's statements go under that guard. Names they bind are not memoized
+# past it (shapes, operand rows), and the reads they record for a footprint are
+# conditional on it, since the earlier instance's reads cover them otherwise.
+function _cell_instance_window!(e::_CellEmitter, cid::ValueId, k::Int, owner::Int)
+    rows = e.instances[cid]
+    source = _cell_forced(e, _CELL_BY_READS) do
+        _cell_bind!(e, :cell_instance_source, Expr(:call, _cell_ref(:_cell_instance_source),
+            rows[k], Expr(:tuple, rows[1:k-1]...)))
+    end
+    t = e.regions
+    # Tag every statement emitted so far, so the window's own are the tail.
+    t === nothing || _cell_force!(e, t.forced)
+    before = length(e.body.args)
+    memo = (copy(e.shapes), copy(e.original_types), copy(e.rows))
+    recording = get(task_local_storage(), _FOOTPRINT, nothing)
+    snapshot = recording === nothing ? nothing :
+        Dict(c => length(entries) for (c, entries) in recording.records)
+    value = _cell_forced(() -> _cell_window!(e, cid), e, owner)
+    inner = splice!(e.body.args, before+1:length(e.body.args))
+    t === nothing || resize!(t.tags, before)
+    for (field, saved) in zip((e.shapes, e.original_types, e.rows), memo)
+        empty!(field)
+        merge!(field, saved)
+    end
+    fresh() = Expr(:call, GlobalRef(Base, :(==)), source, 0)
+    if recording !== nothing
+        for (c, entries) in recording.records, j in get(snapshot, c, 0)+1:length(entries)
+            entries[j] = (:conditional, (fresh(), entries[j]...))
+        end
+    end
+    held = e.instance_data[(cid, rows[1])]
+    for j in k-1:-1:2
+        held = Expr(:if, Expr(:call, GlobalRef(Base, :(==)), source, j),
+            e.instance_data[(cid, rows[j])], held)
+    end
+    # Placed as the window itself is (`owner`).
+    _cell_forced(e, owner) do
+        _cell_bind!(e, :cell_instance, Expr(:if, fresh(), Expr(:block, inner..., value), held))
+    end
+end
+
 # The data of pushed value `cid` at rows `row`, one of its requests: its
 # window when that request is the window's rows, else those rows of it.
 function _cell_take!(e::_CellEmitter, cid::ValueId, row::Symbol)
+    _cell_activate!(e, cid, row)
     e.unions[cid] === row && return e.data[cid]
     positions = _cell_bind!(e, :cell_positions,
         Expr(:call, _cell_ref(:_cell_take_positions), e.unions[cid], row, e.sorted))
@@ -3860,14 +3965,38 @@ function _cell_emit_windows!(e::_CellEmitter)
         push!(processed, cid)
         _cell_forced(e, _cell_bookkeeping(e, cid)) do
             _cell_union!(e, cid)
-            _cell_request_inputs!(e, cid)
+            for row in get(e.instances, cid, (nothing,))
+                row === nothing || (e.unions[cid] = row)
+                _cell_request_inputs!(e, cid)
+                row === nothing || (e.instance_reads[(cid, row)] = e.reads[cid])
+            end
         end
     end
     # A value one guarded member owns is computed only under its guard.
     for cid in sort!(processed; by = c -> d.order[d.producer[c].id])
-        e.data[cid] = _cell_forced(() -> _cell_window!(e, cid), e, _cell_owner(e, cid))
+        if haskey(e.instances, cid)
+            owner = _cell_owner(e, cid)
+            for (k, row) in enumerate(e.instances[cid])
+                e.unions[cid] = row
+                e.reads[cid] = e.instance_reads[(cid, row)]
+                e.instance_data[(cid, row)] = k == 1 ?
+                    _cell_forced(() -> _cell_window!(e, cid), e, owner) :
+                    _cell_instance_window!(e, cid, k, owner)
+            end
+        else
+            e.data[cid] = _cell_forced(() -> _cell_window!(e, cid), e, _cell_owner(e, cid))
+        end
     end
     e
+end
+
+# Makes the instance of `cid` at `row` the value's window before a reader at
+# that row reads it (a value computed once per row, `_cell_union!`).
+function _cell_activate!(e::_CellEmitter, cid::ValueId, row)
+    haskey(e.instances, cid) || return
+    e.unions[cid] = row
+    e.data[cid] = e.instance_data[(cid, row)]
+    nothing
 end
 
 # The rows value `cid`'s window reads of each of its inputs, at its union rows
@@ -3937,6 +4066,18 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
             reads[j] = _cell_request!(e, icid, _cell_bind_row!(e, U, _cell_canon(e,
                 Expr(:call, _cell_ref(:_cell_leaf_row), _cell_shape!(e, icid), U)));
                 scalar = scalar && role in (:leaf, :index))
+        elseif role in (:gather, :linear_gather) && icid in d.pushed && scalar &&
+                r.op isa _AuthoredPlateOp && length(f.indices[j]) == 1 &&
+                only(f.vias[j]) == 0 &&
+                _cell_capture_one(d, r.op, r.inputs, j, only(f.indices[j]))
+            # A plate at one row reads its capture at its index argument's one
+            # element, outside every branch: that capture's one `Int` row.
+            index = canon_id(d.graph, r.inputs[only(f.indices[j])].id)
+            at = Expr(:call, GlobalRef(Base, :only), _cell_operand_row!(e, index, U))
+            row = _cell_bind!(e, :cell_row, _cell_canon(e,
+                Expr(:call, _cell_ref(:_cell_capture_row), _cell_shape!(e, icid), at)))
+            push!(e.one, row)
+            reads[j] = _cell_request!(e, icid, row; scalar = true)
         elseif role in (:gather, :linear_gather) && icid in d.pushed
             # The rows every gather index reads (`_cell_gather_rows` joins
             # those of several indices).
@@ -3956,9 +4097,11 @@ function _cell_request_inputs!(e::_CellEmitter, cid::ValueId)
             role === :gather ||
                 (at = Expr(:call, _cell_ref(r.op isa _AuthoredPlateOp ?
                     :_cell_capture_rows : :_cell_linear_row), _cell_shape!(e, icid), at))
-            # A scalar value's one direct gather reads one row of its source.
-            reads[j] = _cell_request!(e, icid, scalar ? _cell_bind_row!(e, U, _cell_canon(e, at)) :
-                _cell_bind!(e, :cell_row, _cell_canon(e, at)); scalar)
+            # A scalar value's one direct gather reads one row of its source;
+            # a plate's capture rows stay a vector of the in-bounds rows.
+            one = scalar && !(r.op isa _AuthoredPlateOp)
+            reads[j] = _cell_request!(e, icid, one ? _cell_bind_row!(e, U, _cell_canon(e, at)) :
+                _cell_bind!(e, :cell_row, _cell_canon(e, at)); scalar = one)
         elseif role === :factor_leaf
             # The rows of the product `A * w` this operand broadcasts: rows of `A`.
             reads[j] = _cell_bind_row!(e, U, _cell_canon(e, Expr(:call,
@@ -4035,7 +4178,8 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
         push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row),
             _cell_shape!(e, cid), U, e.sorted))
     end
-    cid in e.scalar && return _cell_scalar_window!(e, cid, r, f)
+    # A plate at one row runs its one cell below (`_lower_authored_plate_native!`).
+    cid in e.scalar && !(r.op isa _AuthoredPlateOp) && return _cell_scalar_window!(e, cid, r, f)
     reads = e.reads[cid]
     if f.kind === :vec
         # The source's rows, by its own window when it is pushed and as a
@@ -4072,6 +4216,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
                 _cell_operand_row!(e, icid, U))
         elseif role in (:gather, :linear_gather, :program_gather) && icid in d.pushed
             shape = role === :gather ? nothing : _cell_shape!(e, icid)
+            _cell_activate!(e, icid, reads[j])
             window = Any[e.data[icid], e.unions[icid], shape, e.sorted]
             # One index lane read directly: its entries' positions in the
             # window's rows are computed apart from the gather (once per label
@@ -4149,6 +4294,19 @@ function _cell_window!(e::_CellEmitter, cid::ValueId)
         # The plate over these one-row arguments, with the table slots reserved
         # at its own position (`_lower_with_ops`).
         offset = d.slots[r.id]
+        if cid in e.scalar
+            # One cell: its value, held in a one-element vector; a number read
+            # as a batched argument keeps an axis there.
+            for (j, input) in enumerate(r.inputs)
+                f.roles[j] === :leaf && canon_id(d.graph, input.id) in d.pushed &&
+                    (args[j] = Expr(:call, _cell_ref(:_cell_lane_one), args[j]))
+            end
+            value = gensym(:cell_one)
+            _lower_authored_plate_native!(e.body, e.runtime_ops[1:offset],
+                e.runtime_recipes[1:offset], r.op, args, d.plates[r.id], nothing, nothing;
+                readonly_slices = get(d.readonly, r.id, Set{Int}()), cell = value)
+            return _cell_bind!(e, :cell_rows, Expr(:call, _cell_ref(:_CellOne), value))
+        end
         window = gensym(:cell_rows)
         _lower_authored_plate_native!(e.body, e.runtime_ops[1:offset],
             e.runtime_recipes[1:offset], r.op, args, d.plates[r.id], window, nothing;
@@ -4207,6 +4365,7 @@ function _cell_scalar_window!(e::_CellEmitter, cid::ValueId, r::Recipe, f::_Cell
                 _cell_scalar_operand!(e, icid, U, :_cell_scalar_operand))
         elseif role in (:gather, :linear_gather) && pushed
             # Read at one position (`w[i]`, `w[i, k...]`) by the number index.
+            _cell_activate!(e, icid, reads[j])
             push!(args, _cell_bind!(e, :cell_window, Expr(:call, _cell_ref(:_CellWindow),
                 e.data[icid], e.unions[icid], role === :gather ? nothing : _cell_shape!(e, icid),
                 e.sorted)))
@@ -4317,6 +4476,8 @@ end
 @inline _cell_partition_positions(slice) = _cell_joined_rows(identity, slice)
 
 # The window a cell reads in place of pushed capture `cid`.
-_cell_capture!(e::_CellEmitter, cid::ValueId) = _cell_bind!(e, :cell_capture,
+_cell_capture!(e::_CellEmitter, cid::ValueId, row = nothing) =
+    (_cell_activate!(e, cid, row); _cell_capture_window!(e, cid))
+_cell_capture_window!(e::_CellEmitter, cid::ValueId) = _cell_bind!(e, :cell_capture,
     Expr(:call, _cell_ref(:_CellWindow), e.data[cid], e.unions[cid], _cell_shape!(e, cid),
          e.sorted))

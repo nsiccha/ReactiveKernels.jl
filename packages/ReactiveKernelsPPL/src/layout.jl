@@ -288,7 +288,18 @@ struct LayoutTable
     # constrained axis, the labels of a `levels(g)`, `unique(g)` or data-vector
     # axis, `nothing` for a positional one. Arrays with no label axis are absent.
     axis_labels::Dict{Symbol,Vector{Any}}
+    # `total` as the program reads it (`_layout_reads`): the number when no
+    # position reads data, else the name of the read that computes it. The
+    # program checks its packed input's length against it (`_ppl_check_packed`).
+    packed_total::Union{Int,Symbol}
 end
+LayoutTable(entries::Vector{LayoutEntry}, total::Int, paths::Dict{Symbol,Tuple{Vararg{Symbol}}},
+        bound_values::Dict{Symbol,Any}, bound_exprs::Dict{Symbol,Any},
+        cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}},
+        cell_geometries::Dict{Symbol,CellGeometry}, reads::Vector{Expr},
+        axis_labels::Dict{Symbol,Vector{Any}}) =
+    LayoutTable(entries, total, paths, bound_values, bound_exprs, cell_latents,
+        cell_geometries, reads, axis_labels, total)
 LayoutTable(entries::Vector{LayoutEntry}, total::Int, paths::Dict{Symbol,Tuple{Vararg{Symbol}}},
         bound_values::Dict{Symbol,Any}, bound_exprs::Dict{Symbol,Any},
         cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}},
@@ -565,7 +576,7 @@ function assign_layout(plan::StructuralPlan)
     # simplexes reuse the `:cholesky_corr` / `:vector` edges, elementwise
     # arrays pack one `:array` block each.
     offset = _array_layout_entries!(entries, plan, offset)
-    entries, reads = _layout_reads(plan, entries)
+    entries, reads, packed_total = _layout_reads(plan, entries)
     # A dotted cell latent's packed array draws under its authored name.
     paths = _scope_layout_paths(plan)
     for (site, (name, _)) in plan.cell_latents
@@ -582,7 +593,8 @@ function assign_layout(plan::StructuralPlan)
         merge!(Dict{Symbol,Any}(plan.columns), _definition_memo(plan),
             pairs(_frozen_graph_values(plan))),
         Dict{Symbol,Any}(a.name => a.expr for a in _definitions(plan)),
-        plan.cell_latents, plan.cell_geometries, reads, _array_axis_labels(plan))
+        plan.cell_latents, plan.cell_geometries, reads, _array_axis_labels(plan),
+        packed_total)
 end
 
 """Constrained length of a `:vector` entry: simplex packs K−1 logits
@@ -1666,6 +1678,43 @@ function _logjac_elt(e::LayoutEntry, u)
     return log(oftype(u, e.hi - e.lo)) - log1pexp(-u) - log1pexp(u)
 end
 
+# The program's check of its packed point (snag `rk-prepared-cut-0e0b98ed`):
+# `unconstrained` must hold the binding's packed total. A point of another
+# length would otherwise be read with this binding's positions, so a longer one
+# (a draw of a binding with more levels) silently gives values from the wrong
+# coordinates, and a shorter one fails only at whichever read passes its end.
+# The total is data the program reads like every position (`_layout_reads`), so
+# one program still serves every extent. ReactiveKernels runs it at the entry of
+# every cut that reads `unconstrained` (`ReactiveKernels.input_check!`, in
+# `_register_packed_check!`); it reads only the point's length.
+function _ppl_check_packed(unconstrained, total::Integer)
+    length(unconstrained) == total || _packed_length_error(length(unconstrained), total)
+    return nothing
+end
+@noinline _packed_length_error(n, total) = throw(ContractValidationError(
+    "[layout] packed length $n ≠ layout total $total: a packed point holds the " *
+    "coordinates of the binding whose layout packed it; match another binding's " *
+    "coordinates by `coordinate_identities(layout)`"))
+
+# Register the packed point's check on a program's graph.
+_register_packed_check!(spec, layout::LayoutTable) =
+    ReactiveKernels.input_check!(spec, :unconstrained, _ppl_check_packed,
+        :unconstrained, layout.packed_total)
+
+# A compact overlay computes the packed point from a base the caller passes
+# (`_compact_cell_point(base, active, slots)`, as long as `base`), so the cut
+# takes `base` instead of `unconstrained`: `base` gets the packed point's checks.
+function _check_overlay_base!(graph::ReactiveKernels.Graph, packed::ReactiveKernels.Value,
+        base::ReactiveKernels.Value)
+    id = ReactiveKernels.canon_id(graph, packed.id)
+    swap(a) = a isa ReactiveKernels.Value && ReactiveKernels.canon_id(graph, a.id) == id ? base : a
+    for c in collect(graph.checks)
+        ReactiveKernels.canon_id(graph, c.input) == id || continue
+        push!(graph.checks, ReactiveKernels.InputCheck(base.id, c.f, map(swap, c.args)))
+    end
+    graph
+end
+
 """
     coordinate_read(offset) -> Expr
 
@@ -1689,7 +1738,7 @@ _entry_view(e::LayoutEntry) = :(view(unconstrained, $(_entry_range(e))))
 
 # Sizes and data-derived numbers stay data in the generated program, never this
 # binding's literals (user principle
-# `ODLPlaus:precompile/decisions/2026-11-06T01-09-46-212-0ikeidi`). Layout reads
+# `runtime-values requirement`). Layout reads
 # them from the values the program already has: a block sized `1:n` is
 # `view(unconstrained, 1:n)`, and the next block starts after it. One program
 # then serves every extent and value of one declaration; a raw cut supplies the
@@ -1929,7 +1978,11 @@ function _layout_reads(plan::StructuralPlan, entries::Vector{LayoutEntry})
         entry, at = _entry_reads!(reads, plan, tests, e, at, get(scans, e.name, nothing), bound_reads)
         push!(out, entry)
     end
-    return out, reads
+    # The packed total, the position before `at`: the last block's own last
+    # position when it ends the layout, a literal when no position reads data.
+    last = Meta.isexpr(at, :call, 3) && at.args[1] === :+ && at.args[3] === 1 ?
+        at.args[2] : _read_add(at, -1)
+    return out, reads, _named_read!(reads, :_ppl_packed_total, last)
 end
 
 # The first read at `at`, and the read after a block of `size` coordinates.

@@ -27,7 +27,9 @@ logit(p)=log(p)-log1p(-p); logaddexp(a,b)=(m=max(a,b); m+log1p(exp(-abs(a-b))));
 jnum(x::Integer)=string(x); jnum(x::Real)=(v=Float64(x); isinteger(v) ? string(Int(v))*".0" : repr(v))
 jvec(v)="["*join(jnum.(v),",")*"]"; jmat(M)="["*join([jvec(view(M,i,:)) for i in 1:size(M,1)],",")*"]"; jobj(p)="{"*join(["\"$k\":$v" for (k,v) in p],",")*"}"
 stan_model(src,dj,tag)=(d=mktempdir();f=joinpath(d,"$tag.stan");write(f,src);BridgeStan.StanModel(f,dj))
-const PDB = "/home/n/.julia/artifacts/f45397e9120c2d7e26bf6aff8c7aa810779a7e1b/posteriordb-1.0.0/posterior_database"
+const PDB = get(ENV, "POSTERIORDB_PATH") do
+    error("Set POSTERIORDB_PATH to the public posterior_database directory")
+end
 const ART = joinpath(PDB, "models", "stan")
 stan_shas=Dict{String,String}()
 # posteriordb REFERENCE Stan, compiled verbatim from the artifact bytes (SHA recorded).

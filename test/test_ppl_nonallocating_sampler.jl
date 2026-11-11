@@ -287,7 +287,7 @@ end
 end
 
 @testset "a bound number's value keeps the non-allocating sampler's type" begin
-    # The user's direction on numeric values (`ODLPlaus:precompile` decision
+    # The user's direction on numeric values (`runtime-values requirement` decision
     # `2026-11-06T01-09-46-212-0ikeidi`): another value is a runtime input, so
     # it reuses the compiled density and gradient. `z[idx]` gives the gather its
     # index-run metadata, a tuple of arrays and numbers.

@@ -681,20 +681,9 @@ preparation to apply — `prepare_ad`, `prepare_ad_pullback`,
 function's arguments after its backend, ending with an unconstrained exemplar
 `u0` of length `layout.total`:
 
-```julia
-second_order = SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
-                           AutoEnzyme(; mode = Enzyme.Forward))
-q = prepare_query_ad(prepare_ad_hvp, built, plan, :sampler, second_order, (v,), u0)
-gradient, (hv,) = ad_gradient_and_hvp(q, (v,), u)
-
-j = prepare_query_ad(prepare_ad_pushforward, built, plan, :observations,
-                     AutoEnzyme(; mode = Enzyme.Forward), (v,), u0)
-observations, (jv,) = ad_value_and_pushforward(j, (v,), u)
-
-third_order = SecondOrder(second_order, AutoEnzyme(; mode = Enzyme.Forward))
-t = prepare_query_ad(prepare_ad_third, built, plan, :sampler, third_order, (v,), u0)
-gradient, (hv,), (tv,) = ad_gradient_hvp_and_third(t, (v,), u)  # tv = ∇(vᵀ H v)
-```
+Choose `prepare_ad_hvp` with a second-order backend for Hessian-vector
+products, `prepare_ad_pushforward` for directional outputs, or
+`prepare_ad_third` with a nested backend for third-order contractions.
 
 Gradients, Hessian-vector products and third-order derivatives need a scalar
 preset (`:sampler`, `:likelihood`, `:prior`, `:log_jacobian`); pullbacks and
@@ -848,12 +837,9 @@ observation. `plan` must generate the program `built` was built from, as for
 
 For the packed coordinates a cell reads, use RK's structural footprint API:
 
-```julia
-q = prepare_cell_query(built, plan, :y; locality = :error)
-footprint = ReactiveKernels.partition_footprint_kernel(q.kernel)
-read = Base.invokelatest(footprint, u, i).unconstrained
-indices = read === :whole ? collect(eachindex(u)) : read
-```
+Prepare `ReactiveKernels.partition_footprint_kernel(q.kernel)` and evaluate
+it at the packed point and cell position. Its `unconstrained` field is either
+a vector of read positions or `:whole`.
 
 Prepare `q` and `footprint` once per selected observation (or observations
 sharing a cell position), then vary `i`. This needs no AD preparation, cell
@@ -1292,6 +1278,7 @@ function _compact_overlay!(spec, plan::StructuralPlan)
     end
     add!(spec.graph, (spec[:_ppl_cell_base], spec[:_ppl_cell_active],
         spec[:_ppl_cell_slots]) => spec[:unconstrained], _compact_cell_point)
+    _check_overlay_base!(spec.graph, spec[:unconstrained], spec[:_ppl_cell_base])
     filter!(!=(:unconstrained), spec.have_names)
     prepend!(spec.have_names, [:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots])
     filter!(n -> n ∉ _absent_inputs(plan), spec.have_names)
@@ -1356,20 +1343,12 @@ apply (`prepare_ad`, `prepare_ad_pullback`, `prepare_ad_pushforward`,
 between the backend and the point: the directions for an HVP or a third-order
 derivative, each of the selection's length.
 
-```julia
-so = SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),   # reverse over forward
-                 AutoEnzyme(; mode = Enzyme.Forward))
-directions = ntuple(k -> onehot(k, m), m)                # m = length(indices0)
-h = prepare_compact_cell_ad(prepare_ad_hvp, built, plan, :y, u, indices0, so, directions)
-gradient, columns = ad_gradient_and_hvp(h, directions, u, active, indices, i)
+For a Hessian block, supply one unit direction per selected coordinate to
+`prepare_ad_hvp`. For a third-order contraction, supply the requested
+direction to `prepare_ad_third`.
 
-t = prepare_compact_cell_ad(prepare_ad_third, built, plan, :y, u, indices0,
-                            SecondOrder(so, AutoEnzyme(; mode = Enzyme.Forward)), (v,))
-gradient, (hv,), (tv,) = ad_gradient_hvp_and_third(t, (v,), u, active, indices, i)
-```
-
-With the `m` unit directions, the HVP columns are the cell's `m × m` Hessian
-block over its selection, from one call. `tv = ∇(vᵀ H v)` is the third-order
+With one unit direction per selected coordinate, the HVP columns form the cell's Hessian
+block over its selection, from one call. The returned vector `∇(vᵀ H v)` is the third-order
 contraction `D³ℓ[v, v, ·]` over the selection. At evaluation the selection may
 change, as for the compact sampler: the active vector and the selection keep
 the exemplar's type and length, and so do the directions. `locality` is as for
@@ -1914,7 +1893,7 @@ end
 """
     PartitionSampler
 
-A [`PartitionQuery`](@ref) with its `prepare_ad` gradient: compact, over each
+A `PartitionQuery` with its `prepare_ad` gradient: compact, over each
 partition's footprint (the packed coordinates it reads), or dense over the
 whole packed vector. Construct with [`prepare_partition_sampler`](@ref); use
 [`partition_value_and_gradient!`](@ref), [`partition_batch_value_and_gradient!`](@ref)
@@ -2476,7 +2455,8 @@ end
 function _compact_partition_plan(p::ReactiveKernels.Plan; whole_footprint::Bool=true)
     old = p.graph
     graph = Graph(copy(old.values), copy(old.recipes),
-        Dict(id => copy(ids) for (id, ids) in old.producers), copy(old.aliases), old.version, nothing)
+        Dict(id => copy(ids) for (id, ids) in old.producers), copy(old.aliases), old.version, nothing,
+        copy(old.checks))
     overlay = map((:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots),
                   (AbstractVector{Float64}, AbstractVector{Float64}, AbstractVector{Int32})) do name, type
         any(v -> v.name === name, values(graph.values)) && throw(ContractValidationError(
@@ -2484,6 +2464,7 @@ function _compact_partition_plan(p::ReactiveKernels.Plan; whole_footprint::Bool=
         value!(graph, name, type)
     end
     packed = only(v for v in p.have if v.name === :unconstrained)
+    _check_overlay_base!(graph, packed, first(overlay))
     point = whole_footprint ? _compact_cell_point : _local_cell_point
     recipe = ReactiveKernels._add_recipe!(graph, overlay, (packed,), point,
         1.0, nothing, false, ReactiveKernels._NO_KERNEL_SOURCE)

@@ -17,7 +17,7 @@
 # `set_runtime_activity(Reverse)` differentiates every case. This is the shape
 # of a ReactiveKernels plate whose cell returns its unbound argument's element
 # (`plate(groups) do g; g end`, `identity(g)`, `s.xs`).
-# Recorded on gordito, Julia 1.10.12 and 1.12.7, Enzyme 0.13.210 / Enzyme_jll
+# Recorded on a Linux fleet host, Julia 1.10.12 and 1.12.7, Enzyme 0.13.210 / Enzyme_jll
 # 0.0.301 and Enzyme `dogfood` 07ebfe22, 2026-10-08.
 using Enzyme
 

@@ -195,7 +195,7 @@ end
 
 # The data-only definitions `bind_data` evaluated, as `prepare_data`
 # computes them on the host from the data the caller binds (decision of the
-# ODL JAX handoff: a Python caller rebinds raw data without Julia). A scalar
+# downstream JAX handoff: a Python caller rebinds raw data without Julia). A scalar
 # data value `s` reaches the program as the definition
 # `s = _bound_value(_rkppl_value_s)`: the caller passes `s`, and
 # `_rkppl_value_s` is that value; likewise the observed value of a
@@ -488,6 +488,20 @@ function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
         " has a different number of entries than the scan writes"), DimensionMismatch)
     ReactiveKernels._jax_call(ctx, ReactiveKernels._runtime_check, [same, message])
     hi
+end
+
+# The program's check of its packed point (`_ppl_check_packed`): the
+# `unconstrained` input holds the binding's packed total, checked when the
+# module runs.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_check_packed), args::Vector{ReactiveKernels._PyVal})
+    point, total = args
+    n = ReactiveKernels._jax_call(ctx, length, [point])
+    same = ReactiveKernels._jax_call(ctx, ==, [n, total])
+    message = ReactiveKernels._PyVal(repr("[layout] packed length ≠ layout total: a " *
+        "packed point holds the coordinates of the binding whose layout packed it"),
+        ContractValidationError)
+    ReactiveKernels._jax_call(ctx, ReactiveKernels._runtime_check, [same, message])
 end
 
 # The broadcast row count of bound columns: their first-axis lengths are

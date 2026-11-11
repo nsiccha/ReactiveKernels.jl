@@ -130,17 +130,7 @@ arguments in signature order and whose WANT ports include the primal output
 `primal::Symbol` and one partial derivative per input, named in
 `partials::NamedTuple` (input name => WANT port name, in signature order).
 
-```julia
-@kernel loggamma_graph(x::Float64) = begin
-    y::Float64 = SpecialFunctions.loggamma(x)
-    dy_dx::Float64 = SpecialFunctions.digamma(x)
-    return y, dy_dx
-end
-const loggamma = scalar_derivative_rule(
-    loggamma_graph; primal = :y, partials = (x = :dy_dx,), name = :loggamma)
-```
-
-The result computes `loggamma(x)` through the graph's primal cut (the partial
+The returned callable evaluates the graph's primal cut (the partial
 is pruned), and every AD backend with a ReactiveKernels extension loaded
 treats it as a primitive whose reverse and forward rules are generated from
 the activity-selected cuts (see [`derivative_cut`](@ref)): no backend-specific
@@ -616,22 +606,7 @@ optionally, one direction port per input and one covector port; its WANT
 ports include the primal output and, matching the supplied branches, the
 tangent output and one cotangent output per input.
 
-```julia
-@kernel matvec_rule(A::Matrix{Float64}, x::Vector{Float64},
-        A_dot::Matrix{Float64}, x_dot::Vector{Float64},
-        y_bar::Vector{Float64}) = begin
-    y::Vector{Float64} = A * x
-    y_dot::Vector{Float64} = A_dot * x + A * x_dot
-    A_bar::Matrix{Float64} = y_bar * transpose(x)
-    x_bar::Vector{Float64} = transpose(A) * y_bar
-    return y, y_dot, A_bar, x_bar
-end
-const matvec = derivative_rule(matvec_rule; primal = :y,
-    directions = (A = :A_dot, x = :x_dot), tangent = :y_dot,
-    covector = :y_bar, cotangents = (A = :A_bar, x = :x_bar), name = :matvec)
-```
-
-`matvec(A, x)` is the primal cut. The forward branch (`directions` +
+Calling the returned rule evaluates the primal cut. The forward branch (`directions` +
 `tangent`) and the reverse branch (`covector` + `cotangents`) are each
 optional, but at least one must be given; every AD adapter is generated from
 the cuts of this one graph, attached to the returned callable. Inputs are the

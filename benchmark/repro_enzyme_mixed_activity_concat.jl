@@ -21,11 +21,11 @@
 # Base's generic `cat(...; dims)` differentiates on Julia 1.10.12 / Enzyme
 # 0.13.209 but fails the same way on Julia 1.12.7 / Enzyme 0.13.210.  An
 # `@rkppl` design matrix `hcat(ones(n), x, exp.(a .* x))` hits the Base
-# methods (snag `rkppl-hcat-desig-3016966b`).  Recorded on gordito,
+# methods (snag `rkppl-hcat-desig-3016966b`).  Recorded on a Linux fleet host,
 # 2026-10-05, with both version pairs above.  The local Enzyme `dogfood` line
 # overrides Base's concatenation inside Enzyme: at `82c07be` every case here
 # differentiates on Julia 1.10.12, while Enzyme 0.13.210 fails all eight
-# (gordito, 2026-10-08, snag `inner-plate-pe-d-5575dbdb`).  No released
+# (a Linux fleet host, 2026-10-08, snag `inner-plate-pe-d-5575dbdb`).  No released
 # Enzyme carries that repair.
 using Enzyme
 

@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.155
+## 0.1.158
 
 - Hessian-vector products and third-order derivatives (`prepare_ad_hvp`,
   `prepare_ad_third`, `prepare_ad_accumulator` at orders 1 and 2) work for a
@@ -32,6 +32,63 @@ are recorded in the git history only.
   it reads as such a port, so BRM's sparse Laplace raised this for a model
   whose cells read 33 of them (snag `varyingsource3-b-82246291`). Kernels with
   at most 16 plain inactive operands differentiate exactly as before.
+
+## 0.1.157
+
+- A plate cell, and a partition with `single = true`, runs an authored plate
+  that it reads at its one row as that plate's one cell. The value is held in a
+  non-allocating one-element vector, instead of a plate computed over a
+  one-row array. A vector it reads as a lane, computed as a number at that
+  row, is read as one too.
+- In a partition, a value asked for at several such rows (two one-cell
+  members of one subject, each reading the subject's predictor at its own
+  row) is one number per row asked for, instead of an array over their union.
+  Each after the first is computed only when no earlier one has its row, so a
+  row asked for twice is still computed once. The program does not depend on
+  whether the rows agree. Values and gradients are unchanged: on BRM's
+  `unit_cost.jl` toys (24 subjects) they are bitwise equal to the previous
+  version for every subject, and the joint PK/QT model's local gradient went
+  from 113 to 87 allocations (todo `1yggoad`).
+- Fixed: a `vcat` read at one row converts each entry to the `vcat`'s element
+  type. An integer literal beside floating-point operands gave a `Union` that
+  native Enzyme Reverse refused.
+
+## 0.1.156
+
+- A plate that reads a bound value through an undeclared name for it
+  (`t = s`, with `s::Float64` bound) now keeps that value's declared type
+  when its preparation is copied and composed. Bound preparation used to
+  type the plate's operand `t` as `Number`, so a graph built from the
+  prepared recipes held `t::Number` beside `s::Float64`, and `merge` refused
+  it with `cannot merge structural aliases for value :t: Number does not match
+  Float64`. RKPPL builds its factor catalogue that way, so a selective SMC
+  window whose fresh prior reads a data-valued scale through such a name
+  (BRM's `log_rate_prior_scale = offset_scale`) failed to prepare (snag
+  `selective-fresh-96f7fe96`).
+
+## 0.1.155
+
+- `ReactiveKernels.input_check!(spec, input, f, args...)` checks a HAVE input
+  at the entry of every prepared cut of `spec` that takes it and reads it:
+  native, each `vectorize` lane, the primal of every derivative operator, a
+  non-allocating kernel and a `jax_source` module. The cut calls `f(args...)`,
+  where a `Symbol` names a value of the kernel (the input, or a value computed
+  from data such as a size) and anything else is passed as written. It runs
+  before any recipe when its arguments are inputs or bound data, otherwise as
+  soon as the cut has computed them; the cut computes them even when nothing
+  it returns needs them, and a split plan keeps them on the side that reads
+  the input. The check is not a recipe, so no read analysis (footprints,
+  partitions, cells, activity) sees it: it must read the input's shape alone.
+  A cut calls it as `ReactiveKernels._input_check(f, args...)`, which Enzyme
+  treats as constant, so a gradient never differentiates the check or its
+  error path; it prints that way in `code_expr`. A graph derived from the
+  kernel keeps the check on the same value: the copies a cut's preparation
+  makes, `plate_cell`, `plate_partition`, `compose`, `rename`, a call of the
+  kernel inside another and a stateful kernel's child (`InputCheck`,
+  `Graph.checks`, `Plan.checks`). Registering a check advances the graph's
+  version, so plans and caches made before it are not reused.
+  ReactiveKernelsPPL 0.1.153 uses it to refuse a packed point of another
+  binding's length. Snag `rk-prepared-cut-0e0b98ed`, decision `05x3m7a`.
 
 ## 0.1.154
 
@@ -285,8 +342,7 @@ are recorded in the git history only.
   read the argument's broadcast preparation as an unbound name and the call
   failed with `UndefVarError: ##plate_prepared#k not defined` (inside a
   `TaskFailedException`), whatever the program. A one-thread process never
-  enters the prefix, so it showed only with two or more threads (snag
-  `web-sim-bruno-la-eb5f8859`).
+  enters the prefix, so it showed only with two or more threads.
 
 ## 0.1.140
 
@@ -579,7 +635,7 @@ are recorded in the git history only.
   1.10.12 with Enzyme dogfood `b5daa2ac`, the Reverse gradient of an ARMA(1,1)
   scan cell's generated function went from 1.05–1.11 to 0.96–1.01 times an
   inlined hand loop, and a 3-state HMM filter cell from 1.08–1.10 to 1.01–1.02
-  times (`benchmark/scan_plate_cell_reverse.jl`).
+  times (historical benchmark).
 
 ## 0.1.127
 
@@ -731,7 +787,7 @@ are recorded in the git history only.
   program reading an array that another plate filled in place
   (`_plate_similar_output`, then `buf[index] = value`), or an operand Enzyme
   differentiated but the generated reverse did not, got a zero cotangent with
-  no error. On ODLPlaus's SH v5 model 798 of 890 gradient coordinates were
+  no error. On a downstream application SH v5 model 798 of 890 gradient coordinates were
   wrong. Its activity analysis now follows in-place writes, and any call
   whose active operands the generated reverse does not cover takes Enzyme's
   ordinary reverse, so a coverage gap costs speed, never correctness. Plate
@@ -780,7 +836,7 @@ are recorded in the git history only.
   differentiates a plate program over 64 cells or more through its call, so
   its loop vectorizes, and a smaller one inline. Values and gradients are
   unchanged.
-- Its cost, measured on gordito against 0.1.114: an RKPPL censored response
+- Its cost, measured on a Linux fleet host against 0.1.114: an RKPPL censored response
   over 10 rows, all observed, takes 48 ns per density and 171 ns per sampler
   gradient (31 and 82 ns by default), and over 200 rows 106 and 613 ns (60 and
   482 ns). Over 2000 rows it costs what the default does, and several Normal
@@ -918,7 +974,7 @@ are recorded in the git history only.
   a program of its own (`_PlateProgram`), which the body calls where the plate
   stood. Compiled into one function, the loops did not vectorize alike: LLVM
   vectorized the first and left the others scalar. An RKPPL model with Normal
-  likelihoods over 2000 rows each, measured on gordito (Julia 1.10.12), took
+  likelihoods over 2000 rows each, measured on a Linux fleet host (Julia 1.10.12), took
   0.22–0.30, 0.69–0.70, 0.96–1.60 and 1.13–1.21 ns per row and likelihood
   with 1, 2, 4 and 8 likelihoods; it now takes 0.20–0.25 at every count.
   Values, gradients, allocations and compile times are unchanged, and a body
@@ -959,7 +1015,7 @@ are recorded in the git history only.
   other arm's empty plate, where it used to be one unsplit plate, and its
   first gradient also compiles the arm no lane takes. For an RKPPL censored
   Normal response with a bound scale and every row observed, measured on
-  gordito (Julia 1.10.12): density 0.47 → 3.2–4.3 µs and gradient
+  a Linux fleet host (Julia 1.10.12): density 0.47 → 3.2–4.3 µs and gradient
   4.1 → 6.0–8.2 µs at 2000 rows, and `prepare_sampler` with its first gradient
   in a fresh process 14–15 → 32–33 s at 200 rows. Those are what the same
   model with half its rows censored takes, before and after this change
@@ -998,7 +1054,7 @@ are recorded in the git history only.
   module, and a prepared child's plan, lowered recipes and value ids. A
   generator that evaluates every build in a fresh module, as
   BayesianRegressionModels does, therefore prepared another sampler type for
-  every build of the same program and binding, and compiled it again: an ODL
+  every build of the same program and binding, and compiled it again: an downstream
   archive target's sampler, rebuilt with the same binding or another data
   value. The body now embeds an execution copy of each object, of the same
   type: an operation keeps its record, call identity and throw-stripped twin
@@ -1055,7 +1111,7 @@ are recorded in the git history only.
   when its start or end is a bound number (RKPPL's positions of every block
   after a data-sized one), and the positions of a gather by a bound index. A
   binding with other sizes then had another body and another compile. In one
-  process binding an ODL model to four station networks, that body was the only
+  process binding an downstream model to four station networks, that body was the only
   model code each later binding compiled, in a preparation that spent 10 to 17 s
   compiling. The body
   now reads those numbers and indices from the kernel's constants table when the
@@ -1988,7 +2044,7 @@ are recorded in the git history only.
   `(__constants__, __callables__, __caches__, __cache_apply__, ports...)`,
   caches indexed like the callables. Values, gradients, plans, recipes,
   `recipe_inventory` and `explain` are unchanged; `code_expr` prints the code
-  that runs. Measured on the ArbeitsplatzAtlas model: the log-density
+  that runs. Measured on a downstream application model: the log-density
   kernel's type text 2.58 MB with the table, 536 KB in 0.1.23, 494 KB now
   (1130 of its 3660 table positions are empty; the 1747 closures kept are
   the plate cells' operations, which the plate loops still type through
@@ -2089,7 +2145,7 @@ are recorded in the git history only.
   grammar keep their call through the slot. `RK_INLINE_SOURCES=0` keeps
   every call in the table for comparison. The plan, its recipes,
   `recipe_inventory` and `explain` are unchanged; `code_expr` prints the
-  code that runs. On the ArbeitsplatzAtlas model the log-density kernel's
+  code that runs. On a downstream application model the log-density kernel's
   table type shrinks from 2.58 MB to 548 KB of type text and the bound-data
   prefix's from 312 KB to 94 KB; the log density and the K=64 synthetic
   program's density and gradient are bitwise equal to the table's.
@@ -2099,7 +2155,7 @@ are recorded in the git history only.
   plate and scan predicates, partial evaluation's branch reads, the gather
   predicate), and the plate loop's recipe emitter has one closure type for
   every plate (its captures travel through a `Ref{Any}` cell). Measured side by
-  side on the ArbeitsplatzAtlas model, its `problem` stage (prepare, the
+  side on a downstream application model, its `problem` stage (prepare, the
   audit, `prepare_ad`) compiles 6,691 method instances in 103.5 s instead
   of 7,677 in 111.3 s, and a K=64 synthetic program's prepare takes 34.7 s
   instead of 38.2 s (1,638 instead of 2,219 methods).
@@ -2221,8 +2277,8 @@ are recorded in the git history only.
   result. A number has no rows to take, so the cell raised
   `MethodError: no method matching _cell_take_rows(::Float64, ::Vector{Int64}, ::Int64)`
   (a rank-0 array failed the same way). Each reader now reads the number
-  whole. BRM-emitted NLME programs raised it on ArbeitsplatzAtlas's whole
-  model. Values of other cells are unchanged.
+  whole. BRM-emitted NLME programs raised it on a downstream application's
+  whole model. Values of other cells are unchanged.
 
 ## 0.1.17
 
@@ -2260,18 +2316,17 @@ are recorded in the git history only.
   readers read. Earlier versions computed it, with everything upstream of it,
   once per set of rows read (a predictor gathered by two index vectors in two
   definitions ran twice).
-- Measured on ArbeitsplatzAtlas's BRM program (223,941 coordinates, BRM
-  0.2.63; gordito, Julia 1.10.12, one thread, at the zero point): one cell's
-  value reads 26,145 packed coordinates instead of 252,447 (`osm_pub`),
-  49,215 instead of 724,502 (`ba_n`) and about 50,000 instead of 713,760
-  (`gr_n`, `hh_n`); a warm value takes 0.36 ms instead of 4.1 ms (`osm_pub`)
-  and 0.50 ms instead of 17.1 ms (`ba_n`), a warm compact cell gradient 9.9 ms
-  instead of 30.2 ms and 23.0 ms instead of 74.1 ms. Preparing a cell costs
-  more: its first compact gradient compiles in 133–140 s instead of 54–72 s
-  (`ba_n`, `gr_n`), its first value in about 21 s instead of 8 s. A value an
-  ordinary function computes (BRM's grouped-shares values and CAR fields
-  there) is still computed whole in every cell, also as a `vcat` operand the
-  cell reads no row of, since the `vcat` needs its length.
+- Measured on a downstream application's BRM program (223,941 coordinates, BRM
+  0.2.63; a Linux fleet host, Julia 1.10.12, one thread, at the zero point): one cell's
+  value reads 26,145 packed coordinates instead of 252,447, another 49,215
+  instead of 724,502 and two more about 50,000 instead of 713,760; a warm
+  value takes 0.36 ms instead of 4.1 ms and 0.50 ms instead of 17.1 ms, a
+  warm compact cell gradient 9.9 ms instead of 30.2 ms and 23.0 ms instead
+  of 74.1 ms. Preparing a cell costs more: its first compact gradient
+  compiles in 133–140 s instead of 54–72 s, its first value in about 21 s
+  instead of 8 s. A value an ordinary function computes (BRM's grouped-shares
+  values and CAR fields there) is still computed whole in every cell, also as
+  a `vcat` operand the cell reads no row of, since the `vcat` needs its length.
 
 ## 0.1.15
 

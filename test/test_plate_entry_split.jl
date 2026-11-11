@@ -5,7 +5,7 @@ import Enzyme
 # for. A tuple plate whose readers read different entries is split by which of
 # them each statement serves, so a row runs only the statements something reads
 # there, and each statement still runs once per row (snag
-# `absent-odl-vecto-d98e48bf`).
+# `empty-vector regression`).
 module PlateEntrySplit
 using ReactiveKernels
 

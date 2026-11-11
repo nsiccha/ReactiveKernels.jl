@@ -2326,7 +2326,7 @@ argument types, so evaluations with those types run compiled code. It infers
 the prepared call, which builds a backend derivative compiled during type
 inference (`AutoEnzyme`) without stalling JIT compilation on other threads,
 then evaluates the gradient once at a copy of the exemplar. An array active
-input warms [`ad_value_and_gradient!`](@ref); any other warms
+input warms `ad_value_and_gradient!`; any other warms
 [`ad_value_and_gradient`](@ref). The default compiles at the first evaluation.
 
 With `AutoEnzyme()` (no explicit mode), `native_forward_batch = true` requests
@@ -2696,7 +2696,7 @@ end
     ad_value_and_gradient(prepared, args...; kwargs...)
 
 Compute a scalar value and gradient without requiring caller-owned gradient
-storage. This is the structured counterpart to [`ad_value_and_gradient!`](@ref):
+storage. This is the structured counterpart to `ad_value_and_gradient!`:
 it preserves DifferentiationInterface's returned cotangent structure, including
 `NamedTuple` active inputs supported by the backend.
 """
@@ -3161,30 +3161,17 @@ partial-evaluation pre-pass.
 
 Pass `SecondOrder(hvp_backend, pushforward_backend)`: the Hessian-vector
 backend differentiates the directional derivative `x -> Df(x)[v]` that the
-pushforward backend computes. Reverse over forward over forward,
-
-```julia
-SecondOrder(SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
-                        AutoEnzyme(; mode = Enzyme.Forward)),
-            AutoEnzyme(; mode = Enzyme.Forward))
-```
-
-extends [`prepare_ad_hvp`](@ref)'s reverse over forward by one forward layer
+pushforward backend computes. Reverse over forward over forward extends
+[`prepare_ad_hvp`](@ref)'s reverse over forward by one forward layer
 and also differentiates objectives that multiply a constant matrix by the
 active vector. Each direction costs one reverse sweep over a doubly
 forward-differentiated primal.
 
-Registered Enzyme returns NaN on some calls through a dense matrix product. Its
-forward-mode BLAS rules scale the product's tangent by `beta` instead of
-overwriting it when `beta == 0`, and the tangent buffer of a product of values
-constant at the outer levels (the direction `v` among them) is uninitialized
-memory. On Julia 1.10, OpenBLAS zero-fills a matrix-vector product's tangent,
-so those are exact there; on Julia 1.12 and later they are not, and
-matrix-matrix products can be NaN on every Julia version. The reproducer is
-`benchmark/repro_enzyme_forward_over_forward_view_matvec.jl`. The local Enzyme
-`dogfood` line overwrites the tangent from libEnzyme build `4be29b19`, and its
-third-order derivatives are then exact; no registered `Enzyme_jll` release
-carries the fix yet.
+Higher-order backend support depends on the operators and backend version.
+Dense products have exposed uninitialized tangent storage in Enzyme's nested
+forward rules. Check the required operator against an analytical derivative;
+`benchmark/repro_enzyme_forward_over_forward_view_matvec.jl` retains the
+development reproducer.
 
 Directions with disjoint supports compress, as for Hessian-vector products:
 when active coordinates fall into groups that never interact (per-subject
@@ -3392,7 +3379,7 @@ end
 """
     ad_value_gradient_and_retained!(prepared, gradient, args...; kwargs...)
 
-Like [`ad_value_and_gradient!`](@ref), for a [`PreparedADKernel`](@ref)
+Like `ad_value_and_gradient!`, for a [`PreparedADKernel`](@ref)
 prepared with `retain`: returns `(value, gradient, retained)`, where
 `retained` is a `NamedTuple` of the retained WANT values computed by the same
 primal sweep as `value`. No separate primal call runs. Each call stores fresh

@@ -17,7 +17,7 @@
 # corrupted data.  `set_runtime_activity(Reverse)` differentiates every case
 # below correctly.  This is the shape of a module function an `@rkppl`
 # model calls with a bound schedule column (snag
-# `interpolated-err-41772e14`).  Recorded on gordito, Enzyme 0.13.209,
+# `interpolated-err-41772e14`).  Recorded on a Linux fleet host, Enzyme 0.13.209,
 # Julia 1.10.11, 2026-10-02.
 using Enzyme
 

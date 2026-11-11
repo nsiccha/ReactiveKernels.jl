@@ -1,7 +1,5 @@
 using Test
 
-const REPOSITORY_ROOT = normpath(joinpath(@__DIR__, "..", "..", ".."))
-
 const PPL_SOURCE_CASES = (
     ("eight-schools.md", "eight_schools.jl", EightSchoolsExample,
      :EIGHT_SCHOOLS_SOURCE, :evaluate_eight_schools_source),
@@ -85,7 +83,7 @@ const PPL_SOURCE_CASES = (
      :HMM_DRIVE_1_SOURCE, :evaluate_hmm_drive_1_source),
 )
 
-# One displayed/executed authority kernel per registered case: a file carrying
+# One executed source kernel per registered case: a file carrying
 # two cases (the idiomatic and optimized MNIST models) declares exactly two.
 const _KERNELS_PER_EXAMPLE_FILE = Dict{String,Int}()
 for case in PPL_SOURCE_CASES
@@ -93,18 +91,13 @@ for case in PPL_SOURCE_CASES
         get(_KERNELS_PER_EXAMPLE_FILE, case[2], 0) + 1
 end
 
-@testset "PPL docs and tests share one source authority" begin
-    for (page_name, example_name, owner, source_name, evaluator_name) in
+@testset "PPL examples evaluate their source authority" begin
+    for (_, example_name, owner, source_name, evaluator_name) in
         PPL_SOURCE_CASES
-        page = read(joinpath(REPOSITORY_ROOT, "docs", "src", page_name), String)
         example = read(joinpath(@__DIR__, "..", "src", example_name), String)
         source = getfield(owner, source_name)
         evaluator = getfield(owner, evaluator_name)
 
-        @test occursin("execute_ppl_example(", page)
-        @test occursin(":$(nameof(owner)), :$source_name", page)
-        @test !occursin("raw\"\"\"", page)
-        @test occursin("packages/ReactiveKernelsPPLExamples/src/$example_name", page)
         @test length(findall("@kernel model(", example)) ==
               _KERNELS_PER_EXAMPLE_FILE[example_name]
         @test occursin("@kernel model(", source)
@@ -117,75 +110,13 @@ end
         @test Base.PkgId(artifact.sandbox) == Base.PkgId(owner)
         # `evaluator()` defines the authored recipe closures in a fresh sandbox.
         # Cross that dynamic-evaluation boundary in the latest world, exactly as
-        # the docs renderer does, so inlined source operations remain reusable on
+        # the source evaluator does, so inlined operations remain reusable on
         # Julia versions with stricter world-age enforcement.
         observed = Base.invokelatest(
             artifact.kernel, Tuple(artifact.inputs)...,
         )
         @test artifact.output == observed
         @test code_expr(artifact.kernel) === code_expr(artifact.kernel)
-    end
-
-    make_source = read(joinpath(REPOSITORY_ROOT, "docs", "make.jl"), String)
-    helper_source = read(
-        joinpath(REPOSITORY_ROOT, "docs", "kernel_examples.jl"), String,
-    )
-    rendered_contract_source = read(
-        joinpath(REPOSITORY_ROOT, "docs", "check_rendered.jl"), String,
-    )
-    @test occursin("warnonly = false", make_source)
-    @test !occursin("warnonly = Documenter.except(:eval_block)", make_source)
-    @test occursin("assert_ppl_examples_executed!()", make_source)
-    # The generated pane prints the compiled expression itself.
-    @test occursin("code_expr(artifact.kernel)", helper_source)
-    @test !occursin("_readable_expr", helper_source)
-    for name in (
-        :eight_schools_extraction,
-        :sum_to_zero_logdensity,
-        :linear_regression_density,
-        :beta_binomial_density,
-        :poisson_gamma_density,
-        :dugongs_density,
-        :arma11_density,
-        :garch11_density,
-        :hmm_example_density,
-        :hmm_gaussian_density,
-        :iohmm_reg_density,
-        :mnist_logistic_density,
-        :mnist_logistic_optimized_density,
-        :mvnormal_regression_density,
-        :bound_regression_density,
-        :lda_density,
-        :nn_rbm_density,
-        :irt_2pl_posterior,
-        :two_pl_latent_reg_irt_posterior,
-        :hier_2pl_posterior,
-        :gpcm_latent_reg_irt_posterior,
-        :grsm_latent_reg_irt_posterior,
-        :kronecker_gp_posterior,
-        :glmm1_model_posterior,
-        :bym2_offset_only_posterior,
-        :bones_model_posterior,
-        :multi_occupancy_posterior,
-    )
-        marker = ":" * string(name)
-        @test count(marker, helper_source) == 1
-    end
-
-    # The exact-once PPL execution gate is opt-in for shared executable docs.
-    # PPL walkthroughs must request the gate, while non-PPL executable pages
-    # are excluded from the posterior-walkthrough name registry.
-    @test occursin("haskey(_PPL_EXECUTION_COUNTS, name) || return nothing",
-                   helper_source)
-    @test occursin("gate && _record_ppl_execution!(executed.name)",
-                   helper_source)
-    @test occursin("execute_example(mod, code; result, setup = nothing, gate = true)",
-                   helper_source)
-
-    # Each latent/spatial page contributes exactly one executable source panel.
-    for page in ("glmm1.md", "bym2-offset-only.md", "bones.md",
-                 "multi-occupancy.md")
-        @test occursin("\"$page\" => 1", rendered_contract_source)
     end
 end
 

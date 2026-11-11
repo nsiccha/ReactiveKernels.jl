@@ -427,10 +427,4 @@ end
         @test_throws PlanningError plan(repeated_effect)
         @test calls[] == 0
     end
-
-    docs = read(joinpath(@__DIR__, "..", "docs", "src", "index.md"), String)
-    @test occursin("@kernel normal = location_scale(standard_normal)", docs)
-    @test occursin("logdensity::Float64 = normal.logpdf(x)", docs)
-    @test occursin("location = μ, scale = σ, log_scale = log_σ", docs)
-    @test occursin("have = (:x, :location, :log_scale), want = :logpdf", docs)
 end

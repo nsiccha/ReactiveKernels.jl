@@ -111,6 +111,7 @@ const _MATRIX_CORE_TESTS = (
     "test_plate_partition.jl",
     "test_partition_prefix.jl",
     "test_partition_prefix_types.jl",
+    "test_input_checks.jl",
     "test_authored_loops.jl",
     "test_jax_source.jl",
     "test_scan_columns.jl",
@@ -139,7 +140,6 @@ const _MATRIX_CORE_TESTS = (
 )
 
 const _MATRIX_ACCEPTANCE_RUNTIME_TESTS = (
-    "test_compiler_docs.jl",
     "test_nonallocating_core.jl",
     "test_composition_cse.jl",
     "test_deterministic_ast.jl",
