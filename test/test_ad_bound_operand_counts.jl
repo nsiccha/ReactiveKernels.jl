@@ -130,3 +130,91 @@ end)
     # A wide boundary costs what a narrow one does.
     @test bytes[40] <= bytes[4]
 end
+
+# Kernels with many inactive HAVE ports, evaluated once at file scope: `width`
+# vectors and `width` scalars passed at the call, a density that is nonlinear in
+# `q`, and a WANT port that reads the scalars alone.
+const _MANY_INACTIVE_PORTS = Dict(map((4, 40)) do width
+    vectors = [Symbol(:a, i) for i in 1:width]
+    scalars = [Symbol(:s, i) for i in 1:width]
+    terms = [:($s * exp(q[1] * $v[1]) + q[2] * q[2] * $v[2])
+             for (v, s) in zip(vectors, scalars)]
+    total = foldl((left, right) -> Expr(:call, :+, left, right), terms)
+    scales = foldl((left, right) -> Expr(:call, :+, left, right), scalars)
+    spec = @eval @kernel $(Symbol(:many_inactive_ports_, width))(
+            q::Vector{Float64}, $(vectors...), $(scalars...)) = begin
+        density::Float64 = $total
+        scale_sum::Float64 = $scales
+    end
+    args = ((([0.1i, -0.2i] for i in 1:width)...), ((0.01i for i in 1:width)...))
+    width => (spec, args)
+end)
+
+@testset "many inactive HAVE ports cross the backend packed" begin
+    # Each inactive HAVE port crossed as its own `Constant` context, beside the
+    # packed hidden operands above. An RKPPL cell that reads 33 shared values
+    # reached DifferentiationInterface's and Enzyme's 32-element limits, and
+    # inside a nested derivative their heap argument tuple stored the constant
+    # operands beside the active point: Enzyme refused both Hessian-vector
+    # compositions with `EnzymeRuntimeActivityError` (snag
+    # `varyingsource3-b-82246291`). Past `_AD_UNPACKED_OPERANDS` the plain
+    # values cross as one `Constant` tuple; below it the boundary is unchanged.
+    reverse = AutoEnzyme(; mode = Enzyme.Reverse)
+    forward = AutoEnzyme(; mode = Enzyme.Forward)
+    q, v = [0.3, -0.7], [0.6, -1.1]
+    for width in (4, 40)
+        spec, args = _MANY_INACTIVE_PORTS[width]
+        a = [0.1i for i in 1:width]
+        b = [-0.2i for i in 1:width]
+        s = [0.01i for i in 1:width]
+        e = exp.(q[1] .* a)
+        density = sum(s .* e) + q[2]^2 * sum(b)
+        gradient = [sum(a .* s .* e), 2q[2] * sum(b)]
+        hessian = [sum(a .^ 2 .* s .* e) 0.0; 0.0 2sum(b)]
+        third = [v[1]^2 * sum(a .^ 3 .* s .* e), 0.0]
+        packed = 2width > ReactiveKernels._AD_UNPACKED_OPERANDS
+
+        kernel = prepare(spec; want = :density)
+        prepared = prepare_ad(kernel, reverse, q, args...; active = :q)
+        _, contexts = ReactiveKernels._ad_prepared_arguments(
+            prepared, (q, args...), (;))
+        @test length(contexts) == (packed ? 1 : 2width)
+        @test (prepared.call isa ReactiveKernels._ADPackedOperandsCall) == packed
+        value, g = ad_value_and_gradient(prepared, q, args...)
+        @test value ≈ density
+        @test g ≈ gradient
+        pullback = prepare_ad_pullback(kernel, reverse, 1.5, q, args...; active = :q)
+        @test ad_pullback(pullback, 1.5, q, args...) ≈ 1.5 .* gradient
+        for second in (SecondOrder(reverse, forward), SecondOrder(forward, reverse))
+            hvp = prepare_ad_hvp(kernel, second, (v,), q, args...; active = :q)
+            hvp_gradient, (hv,) = ad_gradient_and_hvp(hvp, (v,), q, args...)
+            @test hvp_gradient ≈ gradient
+            @test hv ≈ hessian * v
+        end
+        thirds = prepare_ad_third(kernel,
+            SecondOrder(SecondOrder(reverse, forward), forward), (v,), q, args...;
+            active = :q)
+        third_gradient, (third_hv,), (d3,) =
+            ad_gradient_hvp_and_third(thirds, (v,), q, args...)
+        @test third_gradient ≈ gradient
+        @test third_hv ≈ hessian * v
+        @test d3 ≈ third
+
+        # A constant WANT port's box, a seeded pullback's and retained values'
+        # boxes ride after the pack.
+        both = prepare(spec; want = (:density, :scale_sum))
+        seeded = prepare_ad_pullback(both, reverse, (1.5, 2.0), q, args...;
+                                     active = :q)
+        values, cotangent = ad_value_and_pullback(seeded, (1.5, 2.0), q, args...)
+        @test values[1] ≈ density
+        @test values[2] ≈ sum(s)
+        @test cotangent ≈ 1.5 .* gradient
+        retaining = prepare_ad(both, reverse, q, args...; active = :q,
+                               retain = (:scale_sum,))
+        retained_value, retained_gradient, retained =
+            ad_value_gradient_and_retained(retaining, q, args...)
+        @test retained_value ≈ density
+        @test retained_gradient ≈ gradient
+        @test retained.scale_sum ≈ sum(s)
+    end
+end
