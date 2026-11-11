@@ -79,7 +79,7 @@ function _conditional_cell_plan(p::ReactiveKernels.Plan)
     recipes = RK.Recipe[RK.Recipe(i, r.inputs, r.outputs, r.op, r.cost,
         r.cse_key, r.effectful, r.source) for (i, r) in enumerate(p.recipes)]
     graph = Graph(copy(old.values), recipes, Dict{RK.ValueId,Vector{Int}}(),
-                  copy(old.aliases), old.version, nothing)
+                  copy(old.aliases), old.version, nothing, copy(old.checks))
     RK._reindex_producers!(graph)
     template = RK.Plan(graph, p.have, p.want, recipes, p.producer, p.cost, recipes)
     RK._partial_subplan(template, p.have, p.want, recipes)

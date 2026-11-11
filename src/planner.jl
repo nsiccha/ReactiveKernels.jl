@@ -32,6 +32,40 @@ struct Plan
     producer::Dict{ValueId,Recipe}   # value id => the recipe that produces it
     cost::Float64
     candidates::Vector{Recipe}       # all backward-reachable candidates (for explain)
+    # The graph's input checks this plan runs at entry (`_plan_checks`).
+    checks::Vector{InputCheck}
+end
+# Every plan, a derived one included, runs the input checks that apply to it.
+Plan(g::Graph, have, want, recipes, producer, cost, candidates) =
+    Plan(g, have, want, recipes, producer, cost, candidates,
+         _plan_checks(g, have, recipes, producer))
+
+# The graph's input checks a plan runs: those of a HAVE input that one of its
+# recipes reads, each of whose arguments is a HAVE value, a value the plan
+# produces or a literal. A check whose arguments the plan does not compute is
+# left out; `plan` selects them when it can (`_check_arguments`).
+function _plan_checks(g::Graph, have, recipes, producer)
+    isempty(g.checks) && return InputCheck[]
+    have_ids = Set(canon_id(g, v.id) for v in have)
+    available(a) = !(a isa Value) || (cid = canon_id(g, a.id); cid in have_ids || haskey(producer, cid))
+    InputCheck[c for c in g.checks if _check_reads(g, c, have_ids, recipes) && all(available, c.args)]
+end
+function _check_reads(g::Graph, c::InputCheck, have_ids, recipes)
+    input = canon_id(g, c.input)
+    input in have_ids && any(r -> any(v -> canon_id(g, v.id) == input, r.inputs), recipes)
+end
+# The arguments of the checks a selection would run that it does not compute.
+function _check_arguments(g::Graph, have_ids::Set{ValueId}, recipes, producer)
+    missing_ids = ValueId[]
+    for c in g.checks
+        _check_reads(g, c, have_ids, recipes) || continue
+        for a in c.args
+            a isa Value || continue
+            cid = canon_id(g, a.id)
+            cid in have_ids || haskey(producer, cid) || cid in missing_ids || push!(missing_ids, cid)
+        end
+    end
+    missing_ids
 end
 
 # --- backward reachability -------------------------------------------------
@@ -455,7 +489,22 @@ function plan(g::Graph; have = (), want = ())
     wants = _value_vector(want)
     have_ids = Set(canon_id(g, v.id) for v in haves)
     want_ids = [canon_id(g, v.id) for v in wants]
+    recipes, producer, cost, cand_ids = _plan_selection(g, have_ids, want_ids)
+    # An input check this selection runs also reads values it may not compute
+    # (a total read from data): select their producers too, when the boundary
+    # can compute them. They are not outputs.
+    extra = _check_arguments(g, have_ids, recipes, producer)
+    if !isempty(extra)
+        try
+            recipes, producer, cost, cand_ids = _plan_selection(g, have_ids, [want_ids; extra])
+        catch err
+            err isa PlanningError || rethrow()
+        end
+    end
+    Plan(g, haves, wants, recipes, producer, cost, [g.recipes[rid] for rid in cand_ids])
+end
 
+function _plan_selection(g::Graph, have_ids::Set{ValueId}, want_ids::Vector{ValueId})
     cand_ids = _candidate_recipes(g, have_ids, want_ids)
     s = _Search(g, have_ids, want_ids, cand_ids)
     _seed_greedy_incumbent!(s)
@@ -479,8 +528,7 @@ function plan(g::Graph; have = (), want = ())
         cid in have_ids && continue
         haskey(producer, cid) || (producer[cid] = r)
     end
-    Plan(g, haves, wants, recipes, producer, s.best_cost,
-         [g.recipes[rid] for rid in cand_ids])
+    recipes, producer, s.best_cost, cand_ids
 end
 
 # Diagnose why `want` cannot be produced: report the values on the missing

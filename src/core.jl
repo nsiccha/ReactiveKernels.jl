@@ -2139,6 +2139,37 @@ end
 end
 
 """
+    InputCheck(input, f, args)
+
+A check of a HAVE input, run once at the entry of every prepared cut that takes
+`input` and reads it: `f(args...)`, where each of `args` is a graph `Value` (the
+input among them) or a literal. It throws when the input does not fit, such as a
+packed parameter vector whose length is not its binding's packed total
+(ReactiveKernelsPPL), and returns `nothing`. It is not a recipe: no value
+depends on it and no read analysis (footprints, partitions, cells, activity)
+sees it, so it must read its input's shape alone, never its entries. Register
+one with `input_check!`.
+"""
+struct InputCheck
+    input::ValueId
+    f::Any
+    args::Tuple
+end
+
+# A cut runs an input check as `_input_check(f, args...)`. The check reads only
+# its input's shape and returns `nothing`, so nothing about it is
+# differentiable: Enzyme treats the call as constant, as it does
+# `_partition_plan_labels_check`. The check itself still runs and throws.
+# Differentiated, its error path entered the gradient: ReactiveKernelsPPL's
+# message rewrite (a regex `replace`) segfaulted Julia's GC lowering or failed
+# Enzyme's codegen type check.
+function _input_check(f::F, args...) where {F}
+    f(args...)
+    nothing
+end
+EnzymeCore.EnzymeRules.inactive(::typeof(_input_check), args...) = nothing
+
+"""
     Graph()
 
 A mutable builder collecting `Value`s and `Recipe`s plus the producer index the
@@ -2154,9 +2185,13 @@ mutable struct Graph
     # `prepare(…; bound)` (`_graph_preparations`, graphops.jl); `nothing` until
     # the first one. Not part of the graph's meaning.
     preparations::Any
+    # Checks of HAVE inputs that every cut taking them runs (`InputCheck`).
+    checks::Vector{InputCheck}
 end
 Graph(values, recipes, producers, aliases, version) =
-    Graph(values, recipes, producers, aliases, version, nothing)
+    Graph(values, recipes, producers, aliases, version, nothing, InputCheck[])
+Graph(values, recipes, producers, aliases, version, preparations) =
+    Graph(values, recipes, producers, aliases, version, preparations, InputCheck[])
 Graph() = Graph(Dict{ValueId,Value}(), Recipe[], Dict{ValueId,Vector{Int}}(),
                 Dict{ValueId,ValueId}(), 0)
 

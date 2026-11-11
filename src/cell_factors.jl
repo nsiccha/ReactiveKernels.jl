@@ -16,7 +16,7 @@ function _cell_factor_aliases(p::Plan, argument_types)
     isempty(redundant) && return p
     old = p.graph
     g = Graph(copy(old.values), Recipe[], Dict{ValueId,Vector{Int}}(),
-              copy(old.aliases), old.version, nothing)
+              copy(old.aliases), old.version, nothing, copy(old.checks))
     for r in p.recipes
         if r.id in redundant
             g.aliases[canon_id(g, only(r.outputs).id)] = canon_id(g, only(r.inputs).id)
@@ -49,7 +49,7 @@ function _cell_factor_typed_inputs(p::Plan)
                                 if valtype(v) !== valtype(g.values[cid(v)]))
     isempty(typed) && return p
     h = Graph(copy(g.values), Recipe[], Dict{ValueId,Vector{Int}}(), copy(g.aliases),
-              g.version, nothing)
+              g.version, nothing, copy(g.checks))
     for r in p.recipes
         inputs = Tuple(get(typed, cid(v), v) for v in r.inputs)
         _add_recipe!(h, inputs, r.outputs, r.op, r.cost, r.cse_key, r.effectful, r.source)
@@ -126,7 +126,7 @@ function _cell_factor_graph(p::Plan, original_ports, original_order;
     end
     original = p.graph
     g = Graph(copy(original.values), Recipe[], Dict{ValueId,Vector{Int}}(),
-              copy(original.aliases), original.version, nothing)
+              copy(original.aliases), original.version, nothing, copy(original.checks))
     ports, order = copy(original_ports), copy(original_order)
     for v in p.have
         ports[v.name] = v
@@ -302,7 +302,7 @@ end
 function _cell_factor_full_spec(spec::KernelSpec, prefix::Plan)
     old = spec.graph
     g = Graph(copy(old.values), Recipe[], Dict{ValueId,Vector{Int}}(),
-              copy(old.aliases), old.version, nothing)
+              copy(old.aliases), old.version, nothing, copy(old.checks))
     assigned = Set{ValueId}()
     for r in Iterators.flatten((prefix.recipes, old.recipes))
         all(v -> canon_id(g, v.id) in assigned, r.outputs) && continue
@@ -345,7 +345,7 @@ function _cell_factor_scalar_reads(spec::KernelSpec, cell_outputs; bound, locali
     end
     old = spec.graph
     g = Graph(copy(old.values), Recipe[], Dict{ValueId,Vector{Int}}(),
-              copy(old.aliases), old.version, nothing)
+              copy(old.aliases), old.version, nothing, copy(old.checks))
     cellvalues = Set{ValueId}()
     for r in p.recipes
         inputs, op = r.inputs, r.op
@@ -386,7 +386,7 @@ end
 function _copy_cell_factor_spec(spec::KernelSpec; omit = Set{ValueId}())
     old = spec.graph
     g = Graph(copy(old.values), Recipe[], Dict{ValueId,Vector{Int}}(),
-              copy(old.aliases), old.version, nothing)
+              copy(old.aliases), old.version, nothing, copy(old.checks))
     for r in old.recipes
         any(v -> v.id in omit, r.outputs) && continue
         _add_recipe!(g, r.inputs, r.outputs, r.op, r.cost, r.cse_key, r.effectful, r.source)

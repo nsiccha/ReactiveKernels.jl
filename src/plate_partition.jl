@@ -631,7 +631,7 @@ function plate_partition(spec::KernelSpec, plates; by,
         "plate_partition: the kernel already has a port :$name"))
     copied = Graph(copy(graph.values), copy(graph.recipes),
         Dict{ValueId,Vector{Int}}(id => copy(ids) for (id, ids) in graph.producers),
-        copy(graph.aliases), graph.version, nothing)
+        copy(graph.aliases), graph.version, nothing, copy(graph.checks))
     ports = copy(spec.ports)
     order = copy(spec.port_order)
     have_names = copy(spec.have_names)
