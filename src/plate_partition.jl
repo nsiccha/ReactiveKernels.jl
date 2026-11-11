@@ -1582,6 +1582,23 @@ function _plan_bookkeeping_type(@nospecialize(T))
     false
 end
 
+# Source recipes bind their arguments lexically before evaluating the call.
+# A let can join the plan when its bindings and body read only plan inputs.
+function _plan_let_eligible(ex, data, ops)
+    length(ex.args) == 2 || return false
+    bindings = Meta.isexpr(ex.args[1], :block) ? ex.args[1].args : Any[ex.args[1]]
+    scoped = copy(data)
+    for binding in bindings
+        binding isa LineNumberNode && continue
+        Meta.isexpr(binding, :(=), 2) && binding.args[1] isa Symbol || return false
+        _plan_eligible(binding.args[2], scoped, ops) || return false
+        delete!(scoped, binding.args[1])
+    end
+    body = ex.args[2]
+    statements = Meta.isexpr(body, :block) ? body.args : Any[body]
+    all(st -> st isa LineNumberNode || _plan_eligible(st, scoped, ops), statements)
+end
+
 # Whether `ex` reads nothing that varies per call: no data symbol (an unbound
 # HAVE port other than the label, or a value computed from one) and no
 # operation other than a plan-eligible pure operation. Bound data and
@@ -1589,6 +1606,7 @@ end
 function _plan_eligible(ex, data::Set{Symbol}, ops)
     ex isa Symbol && return !(ex in data)
     ex isa Expr || return true
+    ex.head === :let && return _plan_let_eligible(ex, data, ops)
     if ex.head === :call
         _plan_mutating_call(ex, ops) && return false
         # A type the body computes (`typeof`, `eltype`, `_promote_op`, a
@@ -1775,14 +1793,94 @@ function _written_plan_symbols(main, names::Set{Symbol}, ops; reassign = true)
     foreach(visit, main)
     written
 end
-function _partition_plan_classify(body::Expr, data_names, ops, forced::Set{Symbol})
+# Rename plan bindings without changing a let's lexical scope or field labels.
+function _plan_rename(ex, names)
+    ex isa Symbol && return get(names, ex, ex)
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert) && return ex
+    if ex.head === :let
+        bindings = Meta.isexpr(ex.args[1], :block) ? ex.args[1].args : Any[ex.args[1]]
+        scoped = copy(names)
+        renamed = map(bindings) do binding
+            binding isa LineNumberNode && return binding
+            lhs, rhs = binding.args
+            value = _plan_rename(rhs, scoped)
+            delete!(scoped, lhs)
+            Expr(:(=), lhs, value)
+        end
+        return Expr(:let, Expr(:block, renamed...), _plan_rename(ex.args[2], scoped))
+    elseif ex.head === :kw
+        return Expr(:kw, ex.args[1], _plan_rename(ex.args[2], names))
+    elseif ex.head === :. && ex.args[2] isa Union{Symbol,QuoteNode}
+        return Expr(:., _plan_rename(ex.args[1], names), ex.args[2])
+    end
+    Expr(ex.head, map(arg -> _plan_rename(arg, names), ex.args)...)
+end
+
+# Keep branch-local plan values behind the same label-only guard. A 0/1-element
+# vector retains the inferred tuple element type across branch occupancy.
+# The main guard stays in place.
+function _partition_guarded_plan(st, data, ops, forced)
+    Meta.isexpr(st, :if) && _plan_eligible(st.args[1], data, ops) || return nothing
+    cond = st.args[1]
+    arms = Any[st.args[2:end]...]
+    planned = Any[]
+    for k in eachindex(arms)
+        arm = arms[k]
+        arm isa Expr && arm.head === :block || continue
+        # Nested cached comprehensions lose concrete element inference on an
+        # empty outer branch. Leave nested branches in the original main body.
+        split = _partition_plan_classify(arm, data, ops, forced;
+                                         allow_shapes = false, allow_guards = false)
+        split === nothing && continue
+        plan, main, needed, _ = split
+        cache = gensym(:guarded_plan)
+        count = Expr(:if, cond, k == 1 ? 1 : 0, k == 1 ? 0 : 1)
+        domain = Expr(:call, GlobalRef(Base, :OneTo), count)
+        # Give the comprehension's bindings their own identities. Otherwise
+        # outer dependency scanning treats them as reads of the original
+        # branch locals, and Julia captures those locals in boxes.
+        locals = Set{Symbol}()
+        for statement in plan
+            Meta.isexpr(statement, :(=), 2) &&
+                _assigned_names!(locals, Expr(:(=), statement.args[1], nothing))
+        end
+        renamed = Dict(name => gensym(name) for name in locals)
+        element = _plan_rename(Expr(:block, plan..., Expr(:tuple, needed...)), renamed)
+        collect_plan = Expr(:comprehension, Expr(:generator, element,
+            Expr(:(=), gensym(:guarded_plan_index), domain)))
+        push!(planned, Expr(:(=), cache, collect_plan))
+        held = gensym(:guarded_plan_values)
+        declared = Set(needed)
+        declarations = Any[x for x in main if _declares_any(x, declared)]
+        filter!(x -> !_declares_any(x, declared), main)
+        reads = Any[Expr(:(=), held, Expr(:call, GlobalRef(Base, :only), cache))]
+        append!(reads, [Expr(:(=), name, Expr(:call, GlobalRef(Core, :getfield), held, j))
+                       for (j, name) in enumerate(needed)])
+        arms[k] = Expr(:block, declarations..., reads..., main...)
+    end
+    isempty(planned) ? nothing : (planned, Expr(:if, cond, arms...))
+end
+function _partition_plan_classify(body::Expr, data_names, ops, forced::Set{Symbol};
+                                  allow_shapes::Bool = true, allow_guards::Bool = true)
     # Every symbol the body assigns anywhere is data until a plan statement
     # assigns it, so a reference ahead of a later or nested assignment can
     # never leave the body; the hidden cache arguments are data too.
     data = union!(_assigned_names!(Set{Symbol}(), body), data_names,
                   (_CACHES_ARG, _CACHE_APPLY_ARG))
     kinds = Symbol[]
-    for st in body.args
+    statements = Any[]
+    for original in body.args
+        st = original
+        guarded = allow_guards ? _partition_guarded_plan(st, data, ops, forced) : nothing
+        if guarded !== nothing
+            planned, st = guarded
+            append!(statements, planned)
+            append!(kinds, fill(:plan, length(planned)))
+            for assignment in planned
+                delete!(data, assignment.args[1])
+            end
+        end
         kind = if st isa Expr && st.head === :(=) && st.args[1] isa Symbol &&
                   (_plan_type_local(st.args[1]) || st.args[1] in forced)
             :main
@@ -1791,7 +1889,7 @@ function _partition_plan_classify(body::Expr, data_names, ops, forced::Set{Symbo
             delete!(data, st.args[1])
             :plan
         elseif st isa Expr && st.head === :(=) && st.args[1] isa Symbol &&
-               _plan_shape_statement(st.args[2], data, ops)
+               allow_shapes && _plan_shape_statement(st.args[2], data, ops)
             delete!(data, st.args[1])
             :shape
         elseif st isa Expr && st.head === :call && _plan_eligible(st, data, ops)
@@ -1800,7 +1898,9 @@ function _partition_plan_classify(body::Expr, data_names, ops, forced::Set{Symbo
             :main
         end
         push!(kinds, kind)
+        push!(statements, st)
     end
+    body = Expr(:block, statements...)
     # Cache a shape read from active values only when another plan statement
     # needs it. In particular, a final plate's loop axes belong in the value
     # kernel: planning them would execute the entire active predictor just to
@@ -1873,6 +1973,7 @@ function _partition_plan_classify(body::Expr, data_names, ops, forced::Set{Symbo
     filter!(st -> !_declares_any(st, declared), main)
     (plan, Any[declarations..., main...], needed, fields)
 end
+
 _declares_any(st, names::Set{Symbol}) =
     st isa Expr && st.head === :local && !isempty(intersect(_assigned_names!(Set{Symbol}(), st), names))
 
