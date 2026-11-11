@@ -1,0 +1,10 @@
+reactivekernels_version = "0.1.154"
+julia_version = "1.10.13"
+page = "bound-regression"
+source_sha256 = "aabca1f1600ca1b8641081eb0def033d36c4eb0ab216355c8bad1ced47a422bd"
+
+[checks]
+residual_error = 0.0
+reduction_error = 0.0
+rebound_agrees = true
+bound_agrees = true

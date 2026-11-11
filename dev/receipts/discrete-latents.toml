@@ -1,0 +1,9 @@
+reactivekernels_version = "0.1.154"
+julia_version = "1.10.13"
+page = "discrete-latents"
+source_sha256 = "b4a0a8d7780042c674310c00bba56ef4579903f5fc824c475d125ffd214fe24b"
+
+[checks]
+minimum_probability = 7.567350976110723e-6
+valid_states = true
+row_sum_error = 2.19824158875781e-14
