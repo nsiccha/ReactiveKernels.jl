@@ -16,6 +16,23 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.156
+
+- New `rescore_smc_checkpoint(target, checkpoint; previous = nothing,
+  rtol = 1e-10)` re-anchors an `smc_checkpoint` on the current host. A
+  checkpoint written on one host could not be resumed on another whose CPU
+  code generation differs (AVX-512 versus AVX2): `resume_smc` compares the
+  recomputed endpoint scores bit for bit, and those hosts round the same
+  log density 1–2 ulp apart (snag `smc-checkpoint-c-396259c8`). The new
+  function runs every `resume_smc` check, accepts scores within
+  `abs(new - old) <= rtol * max(abs(old), 1)`, and returns a copy carrying
+  this host's scores and an appended `rescored` record
+  `(; changed, max_abs, max_rel, rtol, codegen)`. `resume_smc` stays exact.
+- A refused `resume_smc` now names how many endpoint scores differ and the
+  largest deviation with its particle, and points to
+  `rescore_smc_checkpoint` when the deviation is within its default `rtol`.
+  The `resume_smc` docstring states the code-generation requirement.
+
 ## 0.1.155
 
 - Compact-cell Hessian-vector products and the mixed derivatives of a cell
