@@ -1051,6 +1051,44 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(copy), args::Vector{_PyVa
     _PyVal(_py_atom(x.code) * ".copy()", x.T, true)
 end
 
+# --- axes tuples --------------------------------------------------------------------------
+#
+# On the host an axes tuple, `axes(x)`, is a Python tuple of `range(1, n + 1)`,
+# one per dimension: its lengths and entries are Julia's `Base.OneTo`s'. Data
+# shapes computed from data (a shape per plate cell) take this form.
+
+function _host_axes(ctx::_JaxContext, x::_PyVal)
+    x.T isa Type && x.T <: Number && return _PyVal("()", Tuple{}, true)
+    _jax_is_array(x.T) && !_jax_ragged(x.T) ||
+        _jax_error("`axes` of a `", x.T, "` has no host translation", _jax_where(ctx))
+    _PyVal("tuple(range(1, n + 1) for n in np.shape(" * x.code * "))",
+           NTuple{ndims(x.T),Base.OneTo{Int}}, true)
+end
+
+const _HOST_BROADCAST_SHAPE = """
+def _rk_broadcast_shape(*shapes):
+    # Julia's Broadcast.broadcast_shape of axes tuples: a length-1 axis
+    # stretches, the other lengths must agree.
+    out = []
+    for d in range(max([0] + [len(s) for s in shapes])):
+        lengths = set(len(s[d]) for s in shapes if d < len(s)) - {1}
+        if len(lengths) > 1:
+            raise ValueError("DimensionMismatch: arrays could not be broadcast to a common size")
+        out.append(range(1, (lengths.pop() if lengths else 1) + 1))
+    return tuple(out)
+"""
+function _jax_function_call(ctx::_JaxContext, ::typeof(Base.Broadcast.broadcast_shape),
+                            args::Vector{_PyVal})
+    ctx.host === nothing &&
+        return _jax_traceable_or_lowered(ctx, Base.Broadcast.broadcast_shape, args)
+    T = _jax_return_type(Base.Broadcast.broadcast_shape, Any[a.T for a in args])
+    T isa Type && T <: Tuple && isconcretetype(T) ||
+        _jax_error("`Broadcast.broadcast_shape` of `", join((a.T for a in args), "`, `"),
+                   "` has no host translation", _jax_where(ctx))
+    name = _jax_helper!(ctx, "_rk_broadcast_shape", _HOST_BROADCAST_SHAPE)
+    _PyVal(name * "(" * _jax_args(args) * ")", T, true)
+end
+
 # --- plates and scans -------------------------------------------------------------------
 
 # A plate over vectors: the cell as a function, called on each element.

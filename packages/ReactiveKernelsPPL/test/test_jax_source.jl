@@ -464,6 +464,34 @@ const _JAX_CASES = (
     end))(; x_rest = [[0.2, -0.1], [0.1, 0.4], [-0.4, 0.0], [0.3, 0.2]], D = 3, K = 2,
            zeros_dk = zeros(3, 2), scales = [1.0 0.5; 2.0 1.0; 0.7 1.3]) |
         (; x1 = [0.1, -0.3, 0.5, 0.2]),
+    # Dotted cell latents whose length per index comes from data: BRM's
+    # non-centred per-unit steps (one vector per index, a scalar scale, an
+    # empty index) and the shapes of their arguments, each computed by
+    # `prepare_data` (snag jax-source-of-a-30375424).
+    cell_latent_steps = () -> (@rkppl(begin
+        b0 ~ Normal(0, 1); tau ~ Exponential(1.0); s ~ Exponential(1.0)
+        m[1:G] .~ Normal(b0, 1)
+        @plate for i in eachindex(y)
+            z[i] .~ Normal.(zero_i[i], tau)
+            y[i] .~ Normal.(m[i] .+ sum(z[i]), s)
+        end
+    end))(; G = 4, zero_i = [zeros(2), zeros(1), Float64[], zeros(3)]) |
+        (; y = [[0.1, -0.2], [0.3], [0.2], [0.5, -0.1, 0.2]]),
+    cell_latent_shapes = () -> (@rkppl(begin
+        s ~ Exponential(1.0)
+        @plate for i in eachindex(y)
+            # a sum of per-index arrays, a gather of data at rows, a shared
+            # array argument, and a number at every index
+            w[i] .~ LogNormal.(log.(mu[i]) + off[i], 0.3)
+            v[i] .~ Normal.(log.(mu[i]) .+ x[rows[i]], 0.5)
+            c[i] .~ Normal.(shared, 1)
+            k[i] .~ Normal.(level[i], 1)
+            y[i] .~ Normal.(log.(w[i]) .+ v[i] .+ sum(c[i]) .+ k[i], s)
+        end
+    end))(; mu = [[1.0, 2.0], [0.5], [0.5, 1.5, 3.0]],
+           off = [[0.1, 0.0], [0.2], [0.0, 0.1, -0.1]], x = [0.3, -0.2, 0.1],
+           rows = [[1, 3], [2], [2, 2, 1]], shared = [0.1, 0.2], level = [0.1, -0.1, 0.4]) |
+        (; y = [[0.1, 0.7], [-0.6], [-0.5, 0.4, 1.1]]),
 )
 # ICAR priors (snag independent-icar-2e025fad): one field over a graph, and K
 # independent fields over the same graph as the rows or the columns of one
@@ -557,6 +585,57 @@ end
                               prepare = :arguments).value ≈ query(u) rtol = 1e-10
         reference = rk_fd_gradient(query, u)
         @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
+    end
+end
+
+# A dotted cell latent's helper values are data-only: `prepare_data` computes
+# them, so the module takes only the bound data, the same module whether or
+# not a native query filled the binding's values first (snag
+# jax-source-of-a-30375424: on a fresh binding `_ppl_cell_blocks` had no
+# translation, and after a query the block table was an input the caller
+# cannot supply).
+@testset "jax_source(built, plan): dotted cell latents are data-only in prepare_data" begin
+    for name in (:cell_latent_steps, :cell_latent_shapes)
+        cold, warm = _JAX_CASES[name](), _JAX_CASES[name]()
+        built = build_kernel(warm)
+        query = prepare_query(built, warm, :sampler)
+        query(0.1 .* ones(built.layout.total))
+        texts = [string(jax_source(build_kernel(p), p)) for p in (cold, warm)]
+        @test texts[1] == texts[2]
+        @test occursin("UNTRANSLATED = {}", texts[1])
+        src = jax_source(build_kernel(cold), cold)
+        inputs = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
+        @test !any(n -> startswith(n, "_rkppl_latent_"), inputs)
+        @test occursin("def prepare_data", texts[1]) && occursin("_blocks_lengths", texts[1])
+    end
+    # Not built yet, and refused rather than emitted: an argument that reads
+    # a sampled array at the index, whose entries the functions would join in
+    # packed order, and an array of rank 2 at each index (the RKPPL changelog names both).
+    sampled = (@rkppl(begin
+        s ~ Exponential(1.0)
+        @plate for i in eachindex(y)
+            a[i] .~ Normal.(loc[i], 1)
+            b[i] .~ Normal.(a[i], 0.5)
+            y[i] .~ Normal.(b[i], s)
+        end
+    end))(; loc = [[0.1, 0.2], [0.3]]) | (; y = [[0.1, -0.2], [0.3]])
+    matrices = (@rkppl(begin
+        s ~ Exponential(1.0)
+        @plate for i in eachindex(y)
+            M[i] .~ Normal.(A[i], 1)
+            y[i] ~ Normal(sum(M[i]), s)
+        end
+    end))(; A = [[0.1 0.2; 0.3 0.4], fill(0.5, 1, 3)]) | (; y = [0.4, -0.2])
+    for (plan, message) in ((sampled, "reads a sampled array at the index"),
+                            (matrices, "holding a rank-2 array at each index"))
+        err = try
+            jax_source(build_kernel(plan), plan)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ReactiveKernels.JAXEmissionError
+        @test err !== nothing && occursin(message, err.message)
     end
 end
 

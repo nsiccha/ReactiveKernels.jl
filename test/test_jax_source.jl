@@ -591,6 +591,18 @@ end
     total = a * sum(d)
     return total
 end
+# The shape of a broadcast of data arrays from their axes: `axes(x)` and
+# `Broadcast.broadcast_shape` run in `prepare_data` (snag
+# jax-source-of-a-30375424).
+@traceable function jax_broadcast_count(x, y)
+    shape = Base.Broadcast.broadcast_shape(axes(x), axes(y))
+    length(shape[1]) * length(shape[2])
+end
+@kernel jax_prep_axes(x::Matrix{Float64}, y::Vector{Float64}, a::Float64) = begin
+    n = jax_broadcast_count(x, y)
+    total = a * n
+    return total
+end
 
 # A plate cell's data-only recipes that only the host computes (snag
 # jax-source-cell-a3ec8540): each group's sorted distinct values and each
@@ -1540,6 +1552,30 @@ end
         r = rk_jax_evaluate(src, "kernel", (theta, x, extra, z); grad = true, prepare = true)
         @test r.value ≈ native(theta, x, extra, z) rtol = 1e-12
         @test r.grad ≈ rk_fd_gradient(t -> native(t, x, extra, z), theta) rtol = 1e-6
+    end
+end
+
+@testset "jax_source: axes tuples and broadcast_shape in prepare_data" begin
+    x = [1.0 2.0 3.0; 4.0 5.0 6.0]
+    src = jax_source(jax_prep_axes; have = (:a, :x, :y), want = :total,
+                     data = (; x, y = [0.5, 1.5]))
+    text = string(src)
+    host_part = split(split(text, "def prepare_data")[2], "\ndef kernel")[1]
+    @test !occursin("Computed by the functions", host_part)
+    @test occursin("= _jax_broadcast_count_np(x, y)", host_part)
+    # The helper's host twin: the axes tuples and their broadcast shape.
+    helper = split(split(text, "def _jax_broadcast_count_np(")[2], "\ndef ")[1]
+    @test occursin("_rk_broadcast_shape_np(", helper)
+    @test occursin("tuple(range(1, n + 1) for n in np.shape(", helper)
+    if !rk_jax_available()
+        @test_skip false
+    else
+        native = prepare(jax_prep_axes; have = (:a, :x, :y), want = :total)
+        # Equal lengths, and a length-1 axis that stretches.
+        for y in ([0.5, 1.5], [2.0])
+            r = rk_jax_evaluate(src, "kernel", (0.7, x, y); prepare = true)
+            @test r.value ≈ native(0.7, x, y)
+        end
     end
 end
 

@@ -2749,6 +2749,8 @@ _jax_function_call(ctx::_JaxContext, ::typeof(eachindex), args::Vector{_PyVal}) 
     _PyVal("jnp.arange(1, " * _jax_dim_code(ctx, args[1], 1) * " + 1)", Base.OneTo{Int}) :
     _jax_error("`eachindex` of `", args[1].T, "`", _jax_where(ctx))
 function _jax_function_call(ctx::_JaxContext, ::typeof(axes), args::Vector{_PyVal})
+    # On the host, `axes(x)` is the tuple of its ranges (`_host_axes`).
+    ctx.host === nothing || length(args) != 1 || return _host_axes(ctx, only(args))
     length(args) == 2 || _jax_error("`axes` without a dimension", _jax_where(ctx))
     d = match(r"^[0-9]+$", args[2].code)
     d === nothing && _jax_error("`axes` with a computed dimension", _jax_where(ctx))
