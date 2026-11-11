@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.175
+
+- `jax_source` preserves `Float32` in typed allocations, array literals and
+  conversions, loop/history buffers and host `prepare_data` arrays. Prepared
+  input metadata reports `float32` for those values. `Float64` keeps `float64`;
+  `float` no longer widens `Float32` inputs.
+
 ## 0.1.174
 
 - `jax_source(...; keep=...)` plans retained metadata from data alone, even

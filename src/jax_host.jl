@@ -92,7 +92,8 @@ function _host_lines!(ctx::_JaxContext, first::Int)
 end
 
 _host_dtype(@nospecialize(E)) = E isa Type && E <: Bool ? "np.bool_" :
-    E isa Type && E <: Integer ? "np.int64" : E isa Type && E <: AbstractFloat ? "np.float64" :
+    E isa Type && E <: Integer ? "np.int64" :
+    E isa Type && E <: AbstractFloat ? "np." * _jax_dtype_name(E) :
     "object"
 _host_is_numeric_array(@nospecialize(T)) = T isa Type && T <: AbstractArray && !_jax_ragged(T) &&
     eltype(T) isa Type && eltype(T) <: Number
@@ -882,7 +883,7 @@ function _host_construct(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
     length(args) == 1 && !_jax_is_array(args[1].T) || return nothing
     T <: Bool && return _PyVal("bool(" * args[1].code * ")", Bool, true)
     T <: Integer && return _PyVal("int(" * args[1].code * ")", T, true)
-    T <: AbstractFloat && return _PyVal("float(" * args[1].code * ")", T, true)
+    T <: AbstractFloat && return _PyVal(_host_dtype(T) * "(" * args[1].code * ")", T, true)
     nothing
 end
 

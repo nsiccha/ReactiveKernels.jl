@@ -12,6 +12,7 @@ include(joinpath(@__DIR__, "jax_python.jl"))
     end
     y
 end
+
 @kernel jax_tuple_buffer_kernel(x::Vector{Float64}) = begin
     y = jax_tuple_buffer(x)
     result = sum(y)
@@ -184,5 +185,223 @@ print("tuple allocation JIT, ranks, host preparation, gradients, empty and ragge
         end
     else
         @test_skip false # RK_JAX_PYTHON enables real execution and ordinary AD.
+    end
+end
+
+# Float32 is part of the authored allocation, not a request for a default float.
+@traceable function jax_float32_buffer(x::Vector{Float32})
+    y = Array{Float32}(undef, (length(x),))
+    if length(x) > 0
+        for i in 1:length(x)
+            y[i] = 2f0 * x[i]
+        end
+    end
+    y
+end
+@kernel jax_float32_buffer_kernel(x::Vector{Float32}, scale::Float32) = begin
+    y = jax_float32_buffer(x)
+    output = scale .* y
+    score = sum(abs2, output)
+    control = scale .* x
+    return (output, score, control)
+end
+
+@jax_allocation_source function jax_float32_matrix(x::Vector{Float32})
+    y = Matrix{Float32}(undef, (length(x), 2))
+    if length(x) > 0
+        for j in 1:2
+            for i in 1:length(x)
+                y[i, j] = j * x[i]
+            end
+        end
+    end
+    y
+end
+@traceable function jax_float32_sum(x::Vector{Float32})
+    total = Float32(0)
+    if length(x) > 0
+        for i in 1:length(x)
+            total = total + x[i]
+        end
+    end
+    total
+end
+@kernel jax_float32_matrix_kernel(x::Vector{Float32}, scale::Float32) = begin
+    y = jax_float32_matrix(x)
+    output = scale .* y
+    total = scale * jax_float32_sum(x)
+    return (output, total)
+end
+@kernel jax_float32_ragged(xs::Vector{Vector{Float32}}, scale::Float32) = begin
+    parts = plate(xs) do x
+        y = jax_float32_buffer(scale .* x)
+        sum(y)
+    end
+    result = sum(parts)
+    return result
+end
+@kernel jax_float32_history(x::Vector{Float32}, scale::Float32) = begin
+    ys = scan(x; init=zero(scale), history=Float32[1, 2]) do carry, xi, earlier
+        (carry, scale * xi + sum(earlier))
+    end
+    return ys
+end
+
+@testset "JAX Float32 buffer regression" begin
+    spec = jax_float32_buffer_kernel
+    exports = (array=:output, score=:score, control=:control)
+    device = jax_source(spec; have=(:x, :scale), functions=exports)
+    host = jax_source(spec; have=(:x, :scale), data=(:x,), functions=exports)
+    @test eltype(jax_float32_buffer(Float32[1, 2, 3])) === Float32
+    @test occursin("dtype=jnp.float32", string(device))
+    @test occursin("dtype=np.float32", string(host))
+    @test string(host) == string(jax_source(spec; have=(:x, :scale), data=(; x=ones(Float32, 19)),
+        functions=exports))
+    @test string(jax_source(spec; have=(:x, :scale), data=(; x=ones(Float32, 3)),
+        functions=exports)) == string(host)
+    native = prepare(spec; have=(:x, :scale), want=:output)
+    native_history = prepare(jax_float32_history; have=(:x, :scale), want=:ys)
+    for n in (0, 1, 3, 19)
+        x = collect(Float32, 1:n)
+        @test native(x, 0.5f0) == x
+        @test eltype(native(x, 0.5f0)) === Float32
+        @test jax_float32_sum(x) === sum(x)
+        @test jax_float32_matrix(x) == x .* Float32[1 2]
+        expected_history = Float32[1, 2]
+        for xi in x
+            push!(expected_history, 0.5f0 * xi + sum(expected_history))
+        end
+        @test native_history(x, 0.5f0) == expected_history
+    end
+    if rk_jax_available()
+        mktempdir() do dir
+            write(joinpath(dir, "device.py"), device)
+            write(joinpath(dir, "host.py"), host)
+            write(joinpath(dir, "matrix.py"), jax_source(jax_float32_matrix_kernel;
+                have=(:x, :scale), functions=(array=:output, total=:total)))
+            write(joinpath(dir, "matrix_host.py"), jax_source(jax_float32_matrix_kernel;
+                have=(:x, :scale), data=(:x,), functions=(array=:output, total=:total)))
+            write(joinpath(dir, "ragged.py"), jax_source(jax_float32_ragged;
+                have=(:xs, :scale), want=:result, data=(:xs,)))
+            write(joinpath(dir, "history.py"), jax_source(jax_float32_history;
+                have=(:x, :scale), want=:ys))
+            write(joinpath(dir, "check.py"), raw"""
+import jax
+import numpy as np
+import device, host, matrix, matrix_host, ragged, history
+assert all(v['dtype'] == 'float32' for v in host.PREPARED.values())
+def loop_count(jaxpr):
+    jaxpr = getattr(jaxpr, 'jaxpr', jaxpr)
+    count = 0
+    for eqn in jaxpr.eqns:
+        count += eqn.primitive.name in ('scan', 'while')
+        for child in eqn.params.values():
+            for part in child if isinstance(child, (tuple, list)) else (child,):
+                if hasattr(part, 'jaxpr') or hasattr(part, 'eqns'):
+                    count += loop_count(part)
+    return count
+assert [loop_count(jax.make_jaxpr(device.score)(np.ones(n, np.float32), np.float32(0.5)))
+        for n in (3, 70)] == [1, 1]
+for n in (0, 1, 3, 19):
+    x = np.arange(1, n + 1, dtype=np.float32)
+    saved = x.copy()
+    scale = np.float32(0.5)
+    prepared = host.prepare_data(x=x)
+    assert all(v.dtype == np.float32 for v in prepared.values()), prepared
+    for m, args in ((device, dict(x=x)), (host, prepared)):
+        for f in (m.array, jax.jit(m.array)):
+            result = f(scale=scale, **args)
+            assert result.dtype == np.float32, (m.__name__, result.dtype)
+            np.testing.assert_array_equal(result, x)
+        control = jax.jit(m.control)(scale=scale, **args)
+        assert control.dtype == np.float32
+        np.testing.assert_array_equal(control, scale * x)
+        derivative = jax.jit(jax.grad(lambda s: m.score(scale=s, **args)))(scale)
+        assert derivative.dtype == np.float32
+        np.testing.assert_allclose(derivative, 4 * np.sum(x**2), rtol=2e-6)
+    derivative = jax.jit(jax.grad(device.score))(x, scale)
+    assert derivative.dtype == np.float32
+    np.testing.assert_array_equal(derivative, 2 * x)
+    for m, args in ((matrix, dict(x=x)), (matrix_host, matrix_host.prepare_data(x=x))):
+        result = jax.jit(m.array)(scale=scale, **args)
+        assert result.dtype == np.float32 and result.shape == (n, 2)
+        np.testing.assert_array_equal(result, scale * x[:, None] * np.array([1, 2], np.float32))
+        total = jax.jit(m.total)(scale=scale, **args)
+        assert total.dtype == np.float32
+        np.testing.assert_allclose(total, scale * x.sum())
+        np.testing.assert_allclose(jax.jit(jax.grad(lambda s: m.total(scale=s, **args)))(scale), x.sum())
+    if n < 4:
+        expected = [np.float32(1), np.float32(2)]
+        for xi in x:
+            value = scale * xi + np.sum(expected, dtype=np.float32)
+            expected.append(value)
+        values = jax.jit(history.kernel)(x, scale)
+        assert values.dtype == np.float32
+        np.testing.assert_allclose(values, expected)
+    np.testing.assert_array_equal(x, saved)
+rows = [np.array([1, 2], np.float32), np.array([], np.float32), np.array([3], np.float32)]
+prepared = ragged.prepare_data(xs=rows)
+assert ragged.PREPARED['xs']['dtype'] == 'float32'
+assert prepared['xs'].dtype == np.float32
+np.testing.assert_allclose(jax.jit(ragged.kernel)(np.float32(0.5), **prepared), 6)
+np.testing.assert_allclose(jax.jit(jax.grad(ragged.kernel))(np.float32(0.5), **prepared), 12)
+print("Float32 allocation, host preparation, direct/JIT values and ordinary gradients passed")
+""")
+            @test success(pipeline(`$RK_JAX_PYTHON $(joinpath(dir, "check.py"))`;
+                stdout=stdout, stderr=stderr))
+        end
+    else
+        @test_skip false
+    end
+end
+
+for T in (:Float32, :Float64)
+    @eval @traceable function jax_floating_constructors(x::Vector{$T})
+        z = zeros($T, (length(x),))
+        o = ones($T, length(x))
+        f = fill($T(0.25), length(x))
+        converted = Array{$T}(x)
+        literal = $T[1, 2]
+        floated = float(x)
+        broadcasted = $T.(x)
+        (z, o, f, converted, literal, floated, broadcasted)
+    end
+end
+@kernel jax_floating_constructors_kernel(x) = begin
+    arrays = jax_floating_constructors(x)
+    return arrays
+end
+
+@testset "JAX floating constructor dtypes" begin
+    mktempdir() do dir
+        for (T, label) in ((Float32, "single"), (Float64, "double"))
+            spec = jax_floating_constructors_kernel
+            device = jax_source(spec; have=(:x,), want=:arrays, types=(; x=Vector{T}))
+            host = jax_source(spec; have=(:x,), want=:arrays, data=(; x=T[1, 2, 3]))
+            @test all(a -> eltype(a) === T, jax_floating_constructors(T[1, 2, 3]))
+            write(joinpath(dir, label * ".py"), device)
+            write(joinpath(dir, label * "_host.py"), host)
+        end
+        if rk_jax_available()
+            write(joinpath(dir, "check.py"), raw"""
+import jax
+import numpy as np
+import single, single_host, double, double_host
+for dtype, m, h in ((np.float32, single, single_host), (np.float64, double, double_host)):
+    for n in (0, 1, 7):
+        x = np.arange(n, dtype=dtype)
+        expected = (np.zeros(n), np.ones(n), np.full(n, 0.25), x, np.array([1, 2]), x, x)
+        prepared = h.prepare_data(x=x)
+        for actual in (m.kernel(x), jax.jit(m.kernel)(x), h.kernel(**prepared), jax.jit(h.kernel)(**prepared)):
+            for a, e in zip(actual, expected):
+                assert a.dtype == dtype, (m.__name__, a.dtype)
+                np.testing.assert_array_equal(a, e)
+print("Float32/Float64 allocation and conversion dtypes passed on device and host")
+""")
+            @test success(pipeline(`$RK_JAX_PYTHON $(joinpath(dir, "check.py"))`;
+                stdout=stdout, stderr=stderr))
+        else
+            @test_skip false
+        end
     end
 end
