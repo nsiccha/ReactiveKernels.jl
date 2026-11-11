@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.168
+
+- `jax_source` translates explicit `string(...)` calls through the same path
+  as string interpolation. Shape guards can build their diagnostic from
+  names and dimensions in recorded or provider-supplied helpers, including
+  host `prepare_data`; a failing guard retains its message. Symbol literals
+  in plain lowered helpers use the same Python representation as recorded
+  source.
+
 ## 0.1.167
 
 - `jax_source` computes numerically fragile compositions in their stable
