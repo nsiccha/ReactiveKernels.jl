@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.160
+
+- A cell latent whose plate iterates a sampled vector with a data-known
+  shape binds its counts and prior arguments through that shape, without
+  evaluating the sampled vector. Generated cell positions use the same
+  domain as the plate.
+- `jax_source` computes those plate extents from the authored data's runtime
+  axes. Python callers no longer supply the internal extent column, and one
+  emitted module serves changing uniform, ragged and empty cell sizes.
+  Requires ReactiveKernels 0.1.174.
+
 ## 0.1.159
 
 - `rescore_smc_tuning_checkpoint(target, partial_or_directory; previous,

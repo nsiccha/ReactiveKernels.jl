@@ -275,7 +275,8 @@ function _bound_data_value(plan, ex, name, what)
             "$what must depend only on bound data; unavailable $n")
         push!(active, n)
         v = _memoized_data(plan, n) do
-            _eval_value_expr(_resolve_extent_levels(expressions[n]), lookup, name)
+            expr = _bound_extent_indices(n, expressions[n], plan)
+            _eval_value_expr(_resolve_extent_levels(expr), lookup, name)
         end
         delete!(active, n)
         return v

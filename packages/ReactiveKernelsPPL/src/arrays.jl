@@ -646,15 +646,16 @@ _is_array_assignment(plan::StructuralPlan, name) = name isa Symbol &&
 # data_axes resolves declared dimensions to concrete lengths as well, without
 # evaluating any sampled value. A proved shape conflict reads as unavailable,
 # leaving Julia's own error to the evaluation, unless `throw_conflicts` asks
-# for it now (`DimensionMismatch`).
+# for it now (`DimensionMismatch`). `symbolic_data` preserves bound columns'
+# axes as runtime reads instead of current lengths, for portable preparation.
 _value_axes(plan::StructuralPlan, ex, seen::Set{Symbol} = Set{Symbol}();
-        data_axes::Bool = false, throw_conflicts::Bool = false) =
-    _declared_dims(_value_metadata(plan, ex, seen; data_axes, throw_conflicts))
+        data_axes::Bool = false, symbolic_data::Bool = false, throw_conflicts::Bool = false) =
+    _declared_dims(_value_metadata(plan, ex, seen; data_axes, symbolic_data, throw_conflicts))
 # A name's declared axes read the structure alone: once per structure.
 _value_axes(plan::StructuralPlan, ex::Symbol, seen::Set{Symbol} = Set{Symbol}();
-        data_axes::Bool = false, throw_conflicts::Bool = false) =
-    data_axes || !isempty(seen) ?
-        _declared_dims(_value_metadata(plan, ex, seen; data_axes, throw_conflicts)) :
+        data_axes::Bool = false, symbolic_data::Bool = false, throw_conflicts::Bool = false) =
+    data_axes || symbolic_data || !isempty(seen) ?
+        _declared_dims(_value_metadata(plan, ex, seen; data_axes, symbolic_data, throw_conflicts)) :
         _structural(plan, (:value_axes, ex, throw_conflicts); columns = :none) do
             _declared_dims(_value_metadata(plan, ex, seen; data_axes, throw_conflicts))
         end
@@ -712,15 +713,25 @@ ReactiveKernels._metadata_function(::typeof(PPLGeneratedModels._ppl_logistic)) =
 _position_metadata(i) = i === :(:) ? _OS.known_info(Colon()) :
     i isa Int ? _OS.known_info(i) : _OS.scalar_info(Int)
 
+# Shape reads for a portable data preparation program: the binding supplies
+# rank and element type, while every axis length remains a read of its input.
+_symbolic_data_metadata(value, name) = _OS.ValueInfo(; type_bound = typeof(value), axes = ())
+_symbolic_data_metadata(value::Number, name) = _OS.scalar_info(typeof(value))
+_symbolic_data_metadata(value::AbstractArray, name) = _OS.array_info(eltype(value),
+    (_OS.SymbolicAxis(:(axes($name, $d))) for d in 1:ndims(value))...;
+    container_type = typeof(value))
+
 _is_dotted_operator_call(ex) = Meta.isexpr(ex, :call) && !isempty(ex.args) &&
     ex.args[1] isa Symbol && ex.args[1] !== :. && startswith(String(ex.args[1]), ".")
 
 function _value_metadata(plan::StructuralPlan, ex, seen::Set{Symbol};
-        data_axes::Bool, throw_conflicts::Bool = false)
+        data_axes::Bool, symbolic_data::Bool = false, throw_conflicts::Bool = false)
     ex isa Number && return _OS.known_info(ex)
     if _is_bound_value_call(ex)
         # A caller's value: bound data supplies its type and shape.
         input = ex.args[2]
+        symbolic_data && input isa Symbol && haskey(plan.columns, input) &&
+            return _symbolic_data_metadata(plan.columns[input], input)
         data_axes && input isa Symbol && haskey(plan.columns, input) &&
             return _OS.value_info(plan.columns[input])
         return _is_bound_array_value_call(ex) ? _OS.ValueInfo() :
@@ -728,6 +739,8 @@ function _value_metadata(plan::StructuralPlan, ex, seen::Set{Symbol};
     end
     if ex isa Symbol
         ex in seen && return _OS.ValueInfo()
+        symbolic_data && haskey(plan.columns, ex) &&
+            return _symbolic_data_metadata(plan.columns[ex], ex)
         data_axes && haskey(plan.columns, ex) &&
             return _OS.value_info(plan.columns[ex])
         if _is_array_param(plan, ex)
@@ -768,10 +781,10 @@ function _value_metadata(plan::StructuralPlan, ex, seen::Set{Symbol};
             end
         end
         any(p -> p.name === ex, plan.parameters) && return _OS.scalar_info(Float64)
-        d = _find_definition(plan, ex; derived = data_axes)
+        d = _find_definition(plan, ex; derived = data_axes || symbolic_data)
         d === nothing && return _OS.ValueInfo()
         push!(seen, ex)
-        r = _value_metadata(plan, d.expr, seen; data_axes,
+        r = _value_metadata(plan, d.expr, seen; data_axes, symbolic_data,
             throw_conflicts)
         delete!(seen, ex)
         return r
@@ -779,7 +792,7 @@ function _value_metadata(plan::StructuralPlan, ex, seen::Set{Symbol};
     ex isa Expr || return _OS.ValueInfo()
     levelaxis = _level_plate_axis(ex)
     levelaxis === nothing || return _sampled_metadata(Any[:(levels($levelaxis))])
-    meta(a) = _value_metadata(plan, a, seen; data_axes, throw_conflicts)
+    meta(a) = _value_metadata(plan, a, seen; data_axes, symbolic_data, throw_conflicts)
     anchor = _matrix_intercept_anchor(ex)
     if anchor !== nothing
         a = _declared_dims(meta(anchor))
@@ -807,7 +820,7 @@ function _value_metadata(plan::StructuralPlan, ex, seen::Set{Symbol};
         _is_dotted_call(ex) || return _OS.ValueInfo()
         args = map(meta, ex.args[2].args)
         return _declared_broadcast(_source_call_metadata(ex, args), args, ex,
-            throw_conflicts)
+            throw_conflicts; runtime_axes = symbolic_data)
     end
     head === :ref && return _ref_metadata(plan, ex, meta, throw_conflicts)
     head === :call && !isempty(ex.args) || return _OS.ValueInfo()
@@ -824,7 +837,7 @@ function _value_metadata(plan::StructuralPlan, ex, seen::Set{Symbol};
     end
     r = _source_call_metadata(ex, args; kwargs)
     return _is_dotted_operator_call(ex) ?
-        _declared_broadcast(r, args, ex, throw_conflicts) :
+        _declared_broadcast(r, args, ex, throw_conflicts; runtime_axes = symbolic_data) :
         _metadata_result(r, ex, throw_conflicts)
 end
 
@@ -866,7 +879,19 @@ end
 # it — a level axis first, so a level gather on the result stays possible —
 # even where lengths alone cannot prove which named (or literal) axis the
 # broadcast has.
-function _declared_broadcast(r::_OS.CallInfo, args, ex, throw_conflicts::Bool)
+function _declared_broadcast(r::_OS.CallInfo, args, ex, throw_conflicts::Bool;
+        runtime_axes::Bool = false)
+    if runtime_axes
+        axs = [_OS.value_axes(a) for a in args]
+        any(isnothing, axs) && return _OS.ValueInfo()
+        for i in 1:maximum(length, axs; init = 0)
+            dimensions = [a[i] for a in axs if i <= length(a) && a[i] != Base.OneTo(1)]
+            # Distinct runtime axes may stretch a singleton or disagree.
+            # The declaration fallback below cannot choose one as their size.
+            any(a -> a isa _OS.SymbolicAxis, dimensions) &&
+                length(unique(_declared_dim.(dimensions))) > 1 && return _OS.ValueInfo()
+        end
+    end
     result = _metadata_result(r, ex, throw_conflicts)
     rax = _OS.value_axes(result)
     rax === nothing && return result

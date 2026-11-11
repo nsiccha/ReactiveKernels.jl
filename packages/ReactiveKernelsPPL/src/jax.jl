@@ -211,8 +211,20 @@ function _jax_data_definitions(plan::StructuralPlan, names)
     exprs, derived = _definition_exprs(plan)
     available = Set{Symbol}(names)
     found = Dict{Symbol,Any}()
-    definition(nm) = nm in derived ?
-        _guard_missing_observation_argument(nm, exprs[nm], plan, plan.columns) : exprs[nm]
+    definition(nm) = _bound_extent_indices(nm, nm in derived ?
+        _guard_missing_observation_argument(nm, exprs[nm], plan, plan.columns) : exprs[nm], plan)
+    # The native binder supplies these cell counts without evaluating a
+    # sampled value. Export the same shape calculation over the raw data so
+    # Python callers do not have to supply an internal binding column.
+    for (_, iterator) in _value_plate_iterators(plan)
+        input = _value_extent_input(iterator)
+        input in available || continue
+        shape = _value_axes(plan, iterator.args[2]; symbolic_data = true)
+        shape === nothing && continue
+        sizes = map(_array_axis_read, shape)
+        found[input] = length(iterator.args) == 2 ? foldl(_read_mul, sizes; init = 1) :
+            iterator.args[3] <= length(sizes) ? sizes[iterator.args[3]] : 1
+    end
     # Each response with a presence mask: its mask from the raw value, then
     # its stored values, ahead of every definition that reads them.
     missing_responses = Pair{Symbol,Any}[]

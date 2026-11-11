@@ -310,7 +310,7 @@ function _expand_cell_array_latents(st, taken, scope::_CellLatentScope)
         iterator.args[1] = GlobalRef(Base, iterator.args[1])
     end
     indices = Expr(:call, GlobalRef(Base, :collect), iterator)
-    position = Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_scan_position), domain, ivar)
+    position = Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_scan_position), iterator, ivar)
     cx = _CellShapes(ivar, scope, Pair{Symbol,Any}[], Set{Symbol}(), Set{Symbol}(),
         Dict{Symbol,Tuple{Symbol,Symbol}}(), Dict{Symbol,Any}())
     prelude, cells = Any[], Any[]

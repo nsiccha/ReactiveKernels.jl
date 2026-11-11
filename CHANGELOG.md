@@ -16,6 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.174
+
+- `jax_source(...; keep=...)` plans retained metadata from data alone, even
+  when no emitted function uses it or a function chooses an inverse producer
+  that reads parameters. Structural aliases share the prepared value. A
+  missing host translation reports the underlying operation.
+- Empty numeric plates skip their cell bodies during JAX tracing, including
+  indexed reads into empty shared arrays. Fully empty ragged rows have zero
+  padded width. Source remains independent of bound lengths.
+- A helper with no applicable Julia method now raises a `JAXEmissionError`
+  naming that call, rather than failing while inspecting the empty return
+  type. The public BRM documentation reproductions and remaining capability
+  boundaries are recorded under `benchmark/brm_docs_retained`.
+
 ## 0.1.173
 
 - `jax_source` preserves the rank of `Array{T}(undef, dims)` when `dims` is a

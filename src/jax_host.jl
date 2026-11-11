@@ -1255,7 +1255,7 @@ def _rk_pad_rows(rows, dtype):
     # so an empty row (`[]`) keeps an integer column integer.
     rows = [np.asarray(r, dtype=dtype) for r in rows]
     lengths = np.asarray([r.shape[0] for r in rows], dtype=np.int64)
-    width = max([1] + [int(n) for n in lengths])
+    width = max([0] + [int(n) for n in lengths])
     padded = np.stack([np.pad(r, (0, width - r.shape[0]), mode="edge") if r.shape[0] > 0
                        else np.zeros(width, dtype=dtype) for r in rows]) if rows \
         else np.zeros((0, width), dtype=dtype)
@@ -1571,20 +1571,21 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); 
             push!(seen_values, cid)
             push!(constants, v)
         end
-        push!(boundaries, (fname, p, w, residual))
+        w === nothing || push!(boundaries, (fname, p, w, residual))
     end
     # The data values `keep` names are boundary values too, which
     # `prepare_data` returns although no function reads them (the layout's
     # data-derived positions, read by the caller).
     for name in keep
+        cid = canon_id(g, _jax_keep_value(g, name).id)
         found = [o for r in prefix if !(r.op isa _JaxCellPrefix) for o in r.outputs
-                 if o.name === name]
-        isempty(found) && append!(found, (v for v in p1.have if v.name === name && v.name in data_ports))
+                 if canon_id(g, o.id) == cid]
+        isempty(found) && append!(found, (v for v in p1.have
+            if canon_id(g, v.id) == cid && v.name in data_ports))
         v = isempty(found) ? nothing : first(found)
         # The caller refuses it, unless a definition gives a value it reads
         # (`_jax_module_source`).
         v === nothing && throw(_KeepUnavailable(name))
-        cid = canon_id(g, v.id)
         cid in seen_values && continue
         push!(seen_values, cid)
         push!(constants, v)
