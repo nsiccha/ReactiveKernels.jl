@@ -16,6 +16,26 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.162
+
+- In a partition, a matrix value that several one-cell members ask for at
+  their own rows is now one row per requested row, as a number already was
+  (0.1.157). This covers a reshape of a parameter vector and its product with
+  a matrix, BRM's `b = z * transpose(tau .* L)` group effects. A reshape's row
+  at one row is the row itself (`_CellOneRow`), not a reshaped copy. Its
+  product with a matrix is a row whose entries are summed where they are
+  read, in the order of RK's own product loop. Neither allocates an array or
+  its Enzyme shadow. ReactiveKernelsPPL's compact overlay is read at the
+  requested rows without copying them.
+  - BRM's `unit_cost.jl` PK toy: the one-subject gradient takes about half
+    the time (1,248 → 624 B).
+  - The joint PK/QT toy allocates about 30% less (6,016 → 4,272 B), with no
+    clear change in time.
+  - Values and gradients on both toys are bitwise equal to 0.1.157.
+  - A product that the previous version left to BLAS for strided operands now
+    sums in RK's order instead. On an RKPPL model with `b = z * F` this moved
+    values by up to 3 ulp and gradients by up to 7 ulp (relative 9e-16).
+
 ## 0.1.161
 
 - A native scan whose trajectory is read only through one element,
