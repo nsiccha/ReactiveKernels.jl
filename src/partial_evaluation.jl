@@ -2196,6 +2196,14 @@ end
 # The residual recipes with each authored plate's batched bound arguments
 # narrowed to their binding's class. Only the argument's Value TYPE changes;
 # its identity, and every other recipe, are the boundary's own.
+#
+# A plate may read its argument through an undeclared alias label (`t = s`,
+# BRM's `z_prior_scale = scale`): the label has type `Any` and its class's
+# root carries the declaration. The narrowed type is taken within the root's
+# type too, so the label never claims a type its class does not have. Narrowing
+# the label alone gave `t::Number` beside `s::Float64`: a second declaration in
+# one alias class, which a graph rebuilt from these recipes keeps and
+# `merge` refuses (snag selective-fresh-96f7fe96).
 function _partial_narrow_plate_inputs(g::Graph, b::_PartialBoundary,
                                       @nospecialize(classes::Tuple))
     narrowed = Dict{ValueId,Any}()
@@ -2210,9 +2218,10 @@ function _partial_narrow_plate_inputs(g::Graph, b::_PartialBoundary,
         changed = false
         for (position, input) in enumerate(inputs)
             position in atomic && continue
-            class = get(narrowed, canon_id(g, input.id), nothing)
+            root = canon_id(g, input.id)
+            class = get(narrowed, root, nothing)
             class === nothing && continue
-            T = typeintersect(valtype(input), class)
+            T = typeintersect(typeintersect(valtype(input), valtype(g.values[root])), class)
             (T === valtype(input) || T === Union{}) && continue
             inputs[position] = Value{T}(input.id, input.name)
             changed = true
