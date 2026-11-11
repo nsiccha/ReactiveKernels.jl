@@ -16,6 +16,29 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.161
+
+- A native scan whose trajectory is read only through one element,
+  `trajectory[k]`, `last(trajectory)` or `first(trajectory)`, runs the steps
+  through `k` and keeps only that output: no trajectory is allocated. It
+  extends the slice-only demand `trajectory[lo:hi]`. The value and the
+  `BoundsError` of an index outside the trajectory are unchanged; every case
+  the slice demand keeps materialized (a WANT or another reader, `history`,
+  an effectful step, a non-concrete element type, a non-`Int` index, a
+  sequence that is neither a vector nor a range) stays materialized.
+- `sum(p)` or `logsumexp(p)` of an authored plate `p` written inside a larger
+  expression (`scale^2 * sum(terms)`) now streams the plate's total, as the
+  same fold written as its own statement did; the cells are no longer stored.
+  The total is the statement form's, bit for bit; against reducing the stored
+  cells as a vector, only the floating-point rounding of the reduction can
+  differ, as for every streamed plate total. A plate folded by two different
+  functions, by a fold statement with a declared type or the returned value,
+  or inside a branch or loop keeps its expression as written.
+- Together these make DistributionKernels' one-sided LogNormal `var()`
+  (`lower_truncated_lognormal`, `upper_truncated_lognormal`) allocate nothing
+  per call, where it allocated about 3–7 KB, and cut its time and its Enzyme
+  Reverse gradient's by a third to a half (snag `dk-one-sided-log-c73f7aba`).
+
 ## 0.1.160
 
 - New: `register_source_provider!(provider)` and `TraceableSource(argument_names,
