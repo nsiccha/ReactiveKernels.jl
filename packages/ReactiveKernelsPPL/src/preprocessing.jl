@@ -365,8 +365,8 @@ wherever a program reads an axis's labels, indexed by the axis's selection
 `permutedims(…)`, a level plate's values. Its input is bound data, so the
 call folds under `bound=`, and no label reaches compiled code: before, every
 label was spliced into the program as a literal, which LLVM compiled as one
-store per label (two 10,950-label statements took 60 s and 45 s on the
-ArbeitsplatzAtlas program). So a binding with other labels, or another number
+store per label (two 10,950-label statements took 60 s and 45 s on a
+downstream application program). So a binding with other labels, or another number
 of them, generates the same program and evaluates on the same build
 (`rkppl-use` §14).
 """
@@ -405,8 +405,8 @@ under `bound=` and the Enzyme reverse pass sees no new surface. Labels
 match through a dictionary (`isequal` and `hash`, as `Dict` compares:
 `missing`, `NaN`, `-0.0` and array labels keep their Julia meaning, and
 a categorical value finds its unwrapped label), so a column of n rows over
-K labels costs n lookups, not n × K comparisons: the 43,796-row Gemeinde
-columns of the ArbeitsplatzAtlas program took 1.2 s per preparation with
+K labels costs n lookups, not n × K comparisons: the 43,796-row region
+columns of a downstream application program took 1.2 s per preparation with
 the nested loop. Validated plans only: bind-time coverage validation
 proves every value occurs in `levels`, so the 0 fallback for uncovered
 values is unreachable in-graph (a loud bind error beats a silent wrong
@@ -500,11 +500,13 @@ _ordinal_stage_idx(y::AbstractVector{<:Integer}, K) =
 # packed cells: a number is shared by every element, and an array of the
 # declared size gives each element its own value, read column-major as the
 # array packs (`B[a, b] .~ Normal.(M, s)` draws `B[i, j]` from
-# `Normal(M[i, j], s)`). A size known at binding is checked there; this
+# `Normal(M[i, j], s)`). `dims` is the array's size as the program reads it
+# (`_array_cells_dims`): extents read from data, of any integer type the
+# array's reshape takes. A size known at binding is checked there; this
 # check covers values computed in the graph. The message is built out of
 # line, so the reshape itself stays inlinable.
-_array_prior_cells(a::Number, dims::Dims) = a
-@traceable function _array_prior_cells(a::AbstractArray, dims::Dims)
+_array_prior_cells(a::Number, dims::Tuple{Vararg{Integer}}) = a
+@traceable function _array_prior_cells(a::AbstractArray, dims::Tuple{Vararg{Integer}})
     size(a) == dims || _array_prior_cells_mismatch(size(a), dims)
     return vec(a)
 end

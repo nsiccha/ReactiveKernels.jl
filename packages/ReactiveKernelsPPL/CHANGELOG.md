@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.151
+## 0.1.154
 
 - A selective SMC window (`prepare_smc_window(…; coordinates = :auto)`) whose
   fresh prior reads a data-valued scale through a named definition, as BRM
@@ -24,7 +24,50 @@ are recorded in the git history only.
   z_prior_scale)` with `s` bound as data), now prepares, with the same
   density and gradient as the direct `Normal.(m, s)`. It threw `cannot merge
   structural aliases for value :z_prior_scale: Number does not match Float64`
-  (snag `selective-fresh-96f7fe96`). Requires ReactiveKernels 0.1.155.
+  (snag `selective-fresh-96f7fe96`). Requires ReactiveKernels 0.1.156.
+
+## 0.1.153
+
+- A packed point of another length is refused, not read. Every cut of a built
+  program that reads `unconstrained` (a raw `ReactiveKernels.prepare(built.spec;
+  have = (:unconstrained, …), want, bound)`, each lane of its `vectorize`d
+  form, `prepare_query`, the sampler and its gradient, cell, partition,
+  density-factor and cell-factor queries, predictive draws, a compact
+  overlay's base, a `jax_source` module) checks at each call that the point
+  holds the binding's packed total, and refuses another length with
+  `ContractValidationError: [layout] packed length 16 ≠ layout total 6: a
+  packed point holds the coordinates of the binding whose layout packed it;
+  match another binding's coordinates by coordinate_identities(layout)`. The
+  total is read from the binding's data like every block position (the last
+  block's `_ppl_last_<name>`, or a number when no position reads data), so one
+  program still serves every extent. Before, a point longer than the binding's
+  layout (a draw of a fit with more levels, evaluated on a design bound with
+  fewer) was read with the binding's positions, so every coordinate after a
+  level-sized block came silently from the wrong entry, and a shorter one
+  failed only with whichever `BoundsError` its reads reached. The check is a
+  ReactiveKernels input check (`input_check!`, ReactiveKernels 0.1.155, now the
+  compat floor), which reads the point's length alone. Snag
+  `rk-prepared-cut-0e0b98ed`, decision `05x3m7a`.
+
+## 0.1.152
+
+- A two-axis array whose prior takes a per-element argument
+  (`m[1:R, 1:K] .~ Normal.(loc, 1.0)` with `loc` an `R × K` matrix) generates
+  one program for every size. The argument's size check reads the extents the
+  array's own reshape reads (`_array_prior_cells(loc, (R, K))`); before, it
+  spelled one binding's size as a literal (`_array_prior_cells(loc, (2, 3))`),
+  so every `R` and `K` generated its own `kernel_expr` and `build_kernel`. A
+  data-only argument is still computed once at preparation, and an observed
+  (conditioned) array reads its own size. Snag `rkppl-per-elemen-c7b44344`.
+
+## 0.1.151
+
+- `model_view`'s `text/html` rendering carries a scoped style, so a generated
+  program wider than its host page scrolls horizontally inside its listing
+  instead of widening the page (a 3,900 px document at a 1,400 px viewport on
+  the documentation's Eight schools page). The retired-construct diagnostics
+  for the PK heads and `linear_pk_log_f` name the downstream domain package
+  instead of a specific consumer package.
 
 ## 0.1.150
 
@@ -332,7 +375,7 @@ are recorded in the git history only.
   `prepare_compact_cell_ad`. Naming the same observations in another order now
   prepares the same program and type, and gives bitwise the same values and
   gradients. Before, each order was its own program. BRM's NLME partition named
-  one ODL program's three observations in two orders for two bindings that
+  one downstream program's three observations in two orders for two bindings that
   differ only in which plates have rows, so a package image built on one
   binding compiled the NLME partition kernels again for the other (snag
   `derived-kernels-b8900b11`). The query's `observations` field holds that
@@ -1683,7 +1726,7 @@ are recorded in the git history only.
   `4e53855` nested panel (42,768 rows, 12 regions), compact evaluation and
   gradient take 2.55 ms versus 3.47 ms dense and 8.84 ms for BRM's unit path;
   the whole sweep's per-unit share is 1.15 ms (compact 2.22×). These are
-  interleaved minima over 15 rounds on gordito, Julia 1.10.12, one Julia
+  interleaved minima over 15 rounds on a Linux fleet host, Julia 1.10.12, one Julia
   thread, libEnzyme `782c9d95`; values and gradients pass independent checks.
   The 1.5× target remains unmet. The earlier 2.04× measurement used runtime
   activity and is not comparable ordinary-Reverse acceptance evidence.
@@ -1843,8 +1886,8 @@ are recorded in the git history only.
   folds under `bound=`, and `_declared_codes` matches labels through a
   dictionary instead of a nested loop. The labels are still the program's:
   a build's recorded program carries them as quoted data, so `prepare_query`
-  refuses a binding with other labels as before (`rkppl-use` §14). On the
-  ArbeitsplatzAtlas program, whose two Gemeinde columns hold 43,796 rows over
+  refuses a binding with other labels as before (`rkppl-use` §14). On a
+  downstream application program, whose two region columns hold 43,796 rows over
   10,950 labels each, the two level-code statements compiled for 60 s and
   45 s of the bound-data prefix's first call and matched for 1.2 s of its
   warm run. A `jax_source` module computes the labels in `prepare_data`

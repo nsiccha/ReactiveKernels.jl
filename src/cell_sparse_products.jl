@@ -122,7 +122,7 @@ function _cell_sparse_products(p::Plan; argument_types = nothing, outlined = Set
     end
     any(r -> product(r) !== nothing, p.recipes) || return p
     g = Graph(copy(old.values), copy(old.recipes), copy(old.producers),
-              copy(old.aliases), old.version)
+              copy(old.aliases), old.version, nothing, copy(old.checks))
     next_id = minimum((r.id for r in p.recipes); init = 0) - 1
     indexed = Dict{ValueId,Any}()
     recipes = Recipe[]

@@ -331,6 +331,7 @@ function density_factors(built, plan::StructuralPlan)
     def = _pointwise_arithmetic_plates(plan, def)
     def = _name_plate_cells(def, _location_value_aliases(plan, def))
     spec = _eval_kernel_def(def)
+    _register_packed_check!(spec, built.layout)
     # The catalogue reads the binding's own data. A copy of it, kept to detect a
     # later in-place change, held a second copy of every bound array for the
     # catalogue's lifetime (snag per-unit-partiti-9d46c6de); its fingerprint
@@ -348,7 +349,8 @@ function density_factors(built, plan::StructuralPlan)
         p = prepared.plan
         old = p.graph
         g = ReactiveKernels.Graph(copy(old.values), ReactiveKernels.Recipe[],
-            Dict{ReactiveKernels.ValueId,Vector{Int}}(), copy(old.aliases), old.version, nothing)
+            Dict{ReactiveKernels.ValueId,Vector{Int}}(), copy(old.aliases), old.version, nothing,
+            copy(old.checks))
         for r in p.recipes
             ReactiveKernels._add_recipe!(g, r.inputs, r.outputs, r.op, r.cost,
                 r.cse_key, r.effectful, r.source)

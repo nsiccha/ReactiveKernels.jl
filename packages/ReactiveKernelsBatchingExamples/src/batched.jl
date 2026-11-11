@@ -7,11 +7,11 @@
 # single traversal. No `Distributions.jl` call runs in the compute path; it is
 # an independent oracle only.
 #
-# This module holds the build-executed, `Distributions.jl`-free source rendered
-# in the docs. The zero-allocation value and gradient claims require the
+# This module holds historical batching examples. The zero-allocation value
+# and gradient checks require the
 # `MutatingFunctions` weak dependency and are proven separately in
 # `test/test_batched_nonallocating.jl` (run through
-# `test/run_nonallocating_integration.jl`); see also `docs/src/batched.md`.
+# `test/run_nonallocating_integration.jl`).
 module BatchedExamples
 
 export BATCHED_SOURCE, BATCHED_PRIMAL_SOURCE, BATCHED_AD_SOURCE

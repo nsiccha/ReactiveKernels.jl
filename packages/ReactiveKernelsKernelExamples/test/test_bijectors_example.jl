@@ -11,21 +11,7 @@ function _bijector_allocated(kernel::K, args::Vararg{Float64,N}) where {K,N}
 end
 
 @testset "bijectors as demand-planned RK kernels" begin
-    @testset "dedicated executable docs page" begin
-        root = normpath(joinpath(@__DIR__, "..", "..", ".."))
-        page = read(joinpath(root, "docs", "src", "bijectors.md"), String)
-        make = read(joinpath(root, "docs", "make.jl"), String)
-        checks = read(joinpath(root, "docs", "check_rendered.jl"), String)
-        index = read(joinpath(root, "docs", "src", "index.md"), String)
-
-        @test occursin(
-            "\"Bijectors\" => \"bijectors.md\"",
-            make,
-        )
-        @test occursin("BIJECTOR_DOCS_SOURCE", page)
-        @test occursin("execute_example", page)
-        @test occursin("\"bijectors.md\" => 1", checks)
-        @test occursin("[Bijectors and constrained parameters](bijectors.md)", index)
+    @testset "authored graph source" begin
         @test occursin("@kernel positive_bijector", BIJECTOR_KERNEL_SOURCE)
         @test occursin("@kernel unit_interval_bijector", BIJECTOR_KERNEL_SOURCE)
         @test occursin("@kernel fused_bijector_model", BIJECTOR_KERNEL_SOURCE)

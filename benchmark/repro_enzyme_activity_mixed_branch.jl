@@ -18,7 +18,7 @@
 # `set_runtime_activity(Reverse)` differentiates every case. So does the
 # Enzyme dogfood line from `d2892e7`, whose mixed-activity handler gives a
 # fresh allocation that no active data reaches a zero shadow.
-# Recorded on gordito, Julia 1.10.12, 2026-10-22: Enzyme 0.13.216 fails the
+# Recorded on a Linux fleet host, Julia 1.10.12, 2026-10-22: Enzyme 0.13.216 fails the
 # inline branch; dogfood `23b72c9` passes every case.
 using Enzyme
 

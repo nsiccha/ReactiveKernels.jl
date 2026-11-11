@@ -143,8 +143,7 @@ end
     # and a body with plate programs prepares it where the cell work starts.
     # Each scheduled chunk is a function of its own, which read that prepared
     # argument as an unbound name: `UndefVarError: ##plate_prepared#k` whenever
-    # a reader with two or more workers entered the prefix (snag
-    # `web-sim-bruno-la-eb5f8859`). The suite runs on one thread, where a
+    # a reader with two or more workers entered the prefix. The suite runs on one thread, where a
     # reader never enters the prefix, so the prefix is also called directly
     # with each worker budget.
     @kernel scheduled_prefix_prepared(position, data, omega2, width) = begin

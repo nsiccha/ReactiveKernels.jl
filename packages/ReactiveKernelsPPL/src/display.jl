@@ -113,7 +113,11 @@ end
 
 function Base.show(io::IO, mime::MIME"text/html", view::RKPPLModelView)
     esc = ReactiveKernels._html_escape
-    print(io, "<div class=\"rkppl-model-view\"><pre class=\"rkppl-model-view-header\">",
+    # Self-contained like the DAG widget's style: a generated program wider than
+    # the host page scrolls inside its listing instead of widening the page.
+    print(io, "<div class=\"rkppl-model-view\">",
+          "<style>.rkppl-model-view pre{overflow-x:auto}</style>",
+          "<pre class=\"rkppl-model-view-header\">",
           esc(sprint(_model_view_header, view)), "</pre>")
     for (field, title, call) in _MODEL_VIEW_SECTIONS
         content = getfield(view, field)

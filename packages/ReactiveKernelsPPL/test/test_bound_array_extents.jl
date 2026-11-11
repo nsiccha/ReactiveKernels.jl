@@ -3,6 +3,7 @@ using Distributions
 using Enzyme
 using LinearAlgebra: Cholesky, LowerTriangular, UpperTriangular
 using LogExpFunctions: logistic
+using Random
 using ReactiveKernels
 using ReactiveKernelsPPL
 using Test
@@ -114,7 +115,7 @@ end
 end
 
 # Sizes and data-derived numbers are runtime model inputs (user principle
-# `ODLPlaus:precompile/decisions/2026-11-06T01-09-46-212-0ikeidi`; snag
+# `runtime-values requirement`; snag
 # `rkppl-sized-vect-69604d32`): every extent of one declaration, and every value
 # of a data-derived transform bound, generates the same program and the same
 # prepared query type, and one build serves every binding.
@@ -221,6 +222,39 @@ end
             [(g = 2, ids = [1, 2], y = [0.9, 1.0]), (g = 4, ids = [1, 4], y = [0.9, 1.0])],
             (v, d) -> sum(logpdf(Dirichlet(ones(3)), Vector(r)) for r in eachrow(v.P)) +
                 _normals(v.w) + sum(logpdf.(Normal.(v.P[d.ids, 1] .+ v.w[1], 1.0), d.y)))
+        # A per-element prior argument is checked against the size the array's
+        # reshape reads, never one binding's numbers, so a data-only argument
+        # still folds at preparation (snag `rkppl-per-elemen-c7b44344`).
+        programs = _extent_check(quote
+                loc = row_loc .+ zeros(R, K)
+                m[1:R, 1:K] .~ Normal.(loc, 1.0)
+                y .~ Normal.(vec(sum(m; dims = 1))[group], 1.0)
+            end,
+            [(row_loc = [0.0, 1.0], R = 2, K = 3, group = [1, 2, 3, 1], y = [0.1, 0.2, 0.3, 0.4]),
+                (row_loc = [0.5, 1.5, -0.5], R = 3, K = 2, group = [1, 2, 2], y = [0.1, 0.2, 0.3])],
+            (v, d) -> sum(logpdf.(Normal.(d.row_loc .+ zeros(d.R, d.K), 1.0), v.m)) +
+                sum(logpdf.(Normal.(vec(sum(v.m; dims = 1))[d.group], 1.0), d.y)))
+        @test occursin("_array_prior_cells(loc, (R, K))", string(first(programs)))
+        data = (row_loc = [0.0, 1.0], R = 2, K = 3, group = [1, 2, 3, 1], y = [0.1, 0.2, 0.3, 0.4])
+        folded = bind_data(lower_rkppl(quote
+                loc = row_loc .+ zeros(R, K)
+                m[1:R, 1:K] .~ Normal.(loc, 1.0)
+                y .~ Normal.(vec(sum(m; dims = 1))[group], 1.0)
+            end, data; conditioned = (:y,)), data)
+        @test !occursin("_array_prior_cells", string(code_expr(
+            prepare_query(build_kernel(folded), folded, :sampler))))
+        # A value the graph computes is checked where it is computed, at the
+        # size the array's reshape reads.
+        _extent_check(quote
+                a ~ Normal(0, 1)
+                M = LOC .+ a
+                Z[1:r, 1:k] .~ Normal.(M, 1.0)
+                y .~ Normal.(Z[ids, 1], 1.0)
+            end,
+            [(LOC = [0.1 -0.2 0.3; 0.4 0.0 -0.1], r = 2, k = 3, ids = [1, 2, 1], y = [0.9, 1.0, 1.1]),
+                (LOC = [0.2 0.1; -0.3 0.5; 0.0 0.4], r = 3, k = 2, ids = [1, 3, 2], y = [0.9, 1.0, 1.1])],
+            (v, d) -> logpdf(Normal(0, 1), v.a) + sum(logpdf.(Normal.(d.LOC .+ v.a, 1.0), v.Z)) +
+                sum(logpdf.(Normal.(v.Z[d.ids, 1], 1.0), d.y)))
         # A selection of an array's axes: the levels are the binding's, and other
         # labels keep the program and its build (`rkppl-use` section 14).
         plan = lower_rkppl(quote
@@ -580,7 +614,7 @@ end
         # Snag `partition-plan-n-2b8a0d4a`: `W` and `b` start where the level-sized
         # `Z` ends, a position read from the binding. The footprint kernel spliced
         # those positions into its body, so every binding with another level count
-        # compiled the footprint again (10-17 s per ODL binding).
+        # compiled the footprint again (10-17 s per downstream binding).
         plan = lower_rkppl(quote
                 sigma ~ Exponential(1)
                 Z[levels(group), 1:2] .~ Normal.(0, 1)
@@ -624,7 +658,7 @@ end
         @test ==(typeof.(footprint_functions)...)
     end
     @testset "one retained build serves larger, smaller and empty bindings in turn" begin
-        # The reporter's sequence (`ODLPlaus:precompile`, RK `bcb8134e`).
+        # The reporter's sequence (`runtime-values requirement`, RK `bcb8134e`).
         data(n) = (n = n, prior_mu = -0.2, prior_sd = 0.3, observation_sd = 0.7,
             x = [0.5 + 0.1i for i in 1:n], y = [0.9 + 0.1i for i in 1:n])
         plan = lower_rkppl(quote
@@ -668,6 +702,94 @@ end
             end, (n = 2, y = [0.9]); conditioned = (:y,))
         bound = bind_data(plan, (n = 4, y = [0.9]))
         @test build_kernel(bind_data(bound, (n = 2, y = [0.9]))).layout.total == 2
+    end
+    @testset "a packed point of another length is refused, not read" begin
+        # Snag `rk-prepared-cut-0e0b98ed`: a cut of one build, bound with fewer
+        # levels than the build's, read the first coordinates of a fit-sized
+        # point with its own positions, so `w` came from the fit's `z[3:4]`.
+        # Every cut checks the point against the binding's packed total, read
+        # from data like every position (`ReactiveKernels.input_check!`).
+        fit = (J = 12, k = [1, 3], y = [0.2, -0.3])
+        small = (J = 2, k = [1, 2], y = [0.2, -0.3])
+        plan = lower_rkppl(quote
+                z[1:J] .~ Normal.(0, 1)
+                w[1:2] .~ Normal.(0, 1)
+                mu = w[1] .+ z[k]
+                y .~ Normal.(mu, 1.0)
+            end, fit; conditioned = (:y,))
+        built = build_kernel(bind_data(plan, fit))
+        bound = bind_data(plan, small)
+        layout = assign_layout(bound)
+        @test (built.layout.total, layout.total) == (14, 4)
+        long = collect(range(-0.5, 0.5; length = 14))
+        u = long[1:4]
+        refused(n, total) = "packed length $n ≠ layout total $total"
+        cut = Base.invokelatest(ReactiveKernels.prepare, built.spec;
+            have = (:unconstrained, keys(small)...), want = :w, bound = small)
+        @test Base.invokelatest(cut, u) == constrain(layout, u).w
+        @test_throws refused(14, 4) Base.invokelatest(cut, long)
+        # A shorter point is refused the same way, not by whichever read
+        # passes its end.
+        @test_throws refused(3, 4) Base.invokelatest(cut, u[1:3])
+        # The reporter's cut: the level-sized block supplied, so the program
+        # reads only the coordinates packed after it.
+        given = Base.invokelatest(ReactiveKernels.prepare, built.spec;
+            have = (:unconstrained, :z, keys(small)...), want = :mu, bound = small)
+        @test Base.invokelatest(given, u, zeros(2)) ≈ fill(constrain(layout, u).w[1], 2)
+        @test_throws refused(14, 4) Base.invokelatest(given, long, zeros(2))
+        # Without `bound=`, the total is read from the extent at run time.
+        live = Base.invokelatest(ReactiveKernels.prepare, built.spec;
+            have = (:unconstrained, :J), want = :w)
+        @test Base.invokelatest(live, u, 2) == constrain(layout, u).w
+        @test_throws refused(14, 4) Base.invokelatest(live, long, 2)
+        @test Base.invokelatest(live, long, 12) == constrain(built.layout, long).w
+        # Every lane of a vectorized cut is checked.
+        lanes = ReactiveKernels.vectorize(cut; batched = :unconstrained)
+        @test Base.invokelatest(lanes, hcat(u, 2u)) ==
+            hcat(constrain(layout, u).w, constrain(layout, 2u).w)
+        @test_throws refused(14, 4) Base.invokelatest(lanes, hcat(long, long))
+        # So is every query of the binding, at each call, not only its exemplar.
+        q = prepare_query(built, bound, :sampler)
+        @test Base.invokelatest(q, u) ≈ Base.invokelatest(prepare_query(
+            build_kernel(bound), bound, :sampler), u)
+        @test_throws refused(14, 4) Base.invokelatest(q, long)
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)
+        sampler = prepare_sampler(built, bound, u; backend)
+        @test sampler(u) ≈ Base.invokelatest(prepare_query(built, bound, :sampler), u)
+        @test_throws refused(14, 4) sampler(long)
+        @test_throws refused(14, 4) sampler_value_and_gradient!(sampler, zeros(14), long)
+        value, gradient = sampler_value_and_gradient!(sampler, zeros(4), u)
+        @test gradient ≈ _extent_central(x -> sampler(x), u) atol = 1e-5
+        # A cell query's kernel is cut from a copy of the graph, which keeps it.
+        cells = prepare_cell_query(built, bound, :y)
+        v = constrain(layout, u)
+        @test Base.invokelatest(cells, u, 2) ≈ logpdf(Normal(v.w[1] + v.z[small.k[2]], 1.0), small.y[2])
+        @test_throws refused(14, 4) Base.invokelatest(cells, long, 2)
+        # So are a partition's, a density factor's and predictive draws.
+        parts = prepare_partition(built, bound, :y; by = :k)
+        @test Base.invokelatest(parts, u, 2) ≈ logpdf(Normal(v.w[1] + v.z[2], 1.0), small.y[2])
+        @test_throws refused(14, 4) Base.invokelatest(parts, long, 2)
+        prior = prepare_query(built, bound, select_factors(density_factors(built, bound);
+            kind = :prior, site = :w); u0 = u)
+        @test Base.invokelatest(prior, u) ≈ sum(logpdf.(Normal(0, 1), v.w))
+        @test_throws refused(14, 4) Base.invokelatest(prior, long)
+        draws = prepare_predictive(built, bound)
+        @test length(Base.invokelatest(draws, u, Random.Xoshiro(1)).y) == 2
+        @test_throws refused(14, 4) Base.invokelatest(draws, long, Random.Xoshiro(1))
+        # A program whose positions read no data checks its literal total.
+        literal = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                w[1:2] .~ Normal.(0, 1)
+                y .~ Normal.(a .+ w[1], 1.0)
+            end, (y = [0.9, 1.0],); conditioned = (:y,))
+        literal_bound = bind_data(literal, (y = [0.9, 1.0],))
+        literal_built = build_kernel(literal_bound)
+        lq = prepare_query(literal_built, literal_bound, :sampler)
+        # The prepared code runs the check, with the literal total.
+        @test occursin("_ppl_check_packed, unconstrained, 3)", string(code_expr(lq)))
+        @test_throws refused(4, 3) Base.invokelatest(lq, zeros(4))
+        # A data-read total is the read the program already has.
+        @test occursin("_ppl_check_packed, unconstrained, ", string(code_expr(q)))
     end
 end
 

@@ -12,8 +12,8 @@ end
 runs dose-outer in the native lowering from RK `5a077572`: one pass over the
 observations per dose, each observation accumulating in the authored dose
 order, split at the window where the lag is in range when the lag advances by
-one per observation (checked per call). See `docs/src/batched.md` for the
-conditions. `run.jl` measures it against the same cell through an alias of
+one per observation (checked per call). The current lowering is implemented
+in `src/codegen.jl`. `run.jl` measures it against the same cell through an alias of
 `get` that the lowering does not recognize (the observation-outer cell loop),
 the filtered spelling, and the released in-place hand loop, on a lattice plan
 (`t - shift`) and on stored per-observation lag rows, plus the consumer's
@@ -24,7 +24,7 @@ cell loop before it is timed.
 julia --project=<environment with ReactiveKernels> run.jl
 ```
 
-## strato2, 2026-10-01
+## a Linux fleet host, 2026-10-01
 
 Julia 1.10.11, x86_64-linux-gnu, one thread, host load average ≈ 6 during the
 run; minimum over 300 calls; bytes for one call. RK at `5a077572`.

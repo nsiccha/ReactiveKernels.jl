@@ -211,7 +211,7 @@ end
 # evaluates both definitions in a fresh module per build, so these differed in
 # every build, and `RuntimeGeneratedFunctions` hashes every field of an embedded
 # object into the body's id: each build prepared another type (snag
-# `sampler-runtimeg-13afd928`, an ODL archive sampler).
+# `sampler-runtimeg-13afd928`, an downstream archive sampler).
 _DET_SPLICED_DEFINITIONS = (
     :(@kernel _det_spliced_child(y::Float64, mu::Float64, s::Float64) = begin
         r::Float64 = -abs2((y - mu) / s) / 2 - log(s)

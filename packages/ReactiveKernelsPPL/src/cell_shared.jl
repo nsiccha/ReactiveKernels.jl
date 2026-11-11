@@ -79,7 +79,7 @@ function _conditional_cell_plan(p::ReactiveKernels.Plan)
     recipes = RK.Recipe[RK.Recipe(i, r.inputs, r.outputs, r.op, r.cost,
         r.cse_key, r.effectful, r.source) for (i, r) in enumerate(p.recipes)]
     graph = Graph(copy(old.values), recipes, Dict{RK.ValueId,Vector{Int}}(),
-                  copy(old.aliases), old.version, nothing)
+                  copy(old.aliases), old.version, nothing, copy(old.checks))
     RK._reindex_producers!(graph)
     template = RK.Plan(graph, p.have, p.want, recipes, p.producer, p.cost, recipes)
     RK._partial_subplan(template, p.have, p.want, recipes)
@@ -190,14 +190,9 @@ elsewhere leaves the pass valid. A failed callback produces no output;
 the next call resets all accumulation storage. Calls cannot be nested or run
 concurrently on the same pullback.
 
-```julia
-cell_pullback!(gradient, pullback, u) do batch
-    for i in eachindex(cells)
-        accumulate_cell!(batch, third, directions[i], weights[i],
-                         active[i], indices[i], cells[i])
-    end
-end
-```
+Within `visit`, call [`accumulate_cell!`](@ref) with the current pullback,
+derivative operator, direction, weight, active coordinates, coordinate
+indices, and cell position.
 """
 function cell_pullback!(visit::F, gradient::AbstractVector{Float64}, p::CellPullback,
         u::AbstractVector{Float64}) where {F}

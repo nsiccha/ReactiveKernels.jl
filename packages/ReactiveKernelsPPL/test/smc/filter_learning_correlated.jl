@@ -112,7 +112,7 @@ end
 # A diagonal window boundary (max_reflections=0) treats the marginal widths of
 # mu and z as independent information, and every window contracts that
 # direction again (snag learning-filter-8c01d6de: about 1 % of the exact SD
-# after twelve windows on the ODLPlaus AP3 replay).
+# after twelve windows on the a downstream application AP3 replay).
 function ridge_target(G,s,location,covariance)
     data=(;y=Float64[],G)
     plan=bind_data(lower_rkppl(quote
