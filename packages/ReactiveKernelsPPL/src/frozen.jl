@@ -27,11 +27,8 @@ froze keeps its frozen value. The result also records the type and size of
 every data input those definitions read (never its values), so a binding
 that omits such an input still generates the same program.
 
-```julia
-fit = bind_data(plan, (; x, x_fit = x, y))
-state = frozen_values(fit, (:x_mean, :x_sd))
-design = bind_data(plan, (; x = xnew); frozen = state)   # no x_fit
-```
+Extract the data-only definitions from the fitted binding, then pass the
+result through `bind_data`'s `frozen` keyword when binding prediction data.
 """
 function frozen_values(plan::StructuralPlan, names)
     isbound(plan) || throw(ContractValidationError(

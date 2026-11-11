@@ -114,7 +114,7 @@ end
 end
 
 # Sizes and data-derived numbers are runtime model inputs (user principle
-# `ODLPlaus:precompile/decisions/2026-11-06T01-09-46-212-0ikeidi`; snag
+# `runtime-values requirement`; snag
 # `rkppl-sized-vect-69604d32`): every extent of one declaration, and every value
 # of a data-derived transform bound, generates the same program and the same
 # prepared query type, and one build serves every binding.
@@ -580,7 +580,7 @@ end
         # Snag `partition-plan-n-2b8a0d4a`: `W` and `b` start where the level-sized
         # `Z` ends, a position read from the binding. The footprint kernel spliced
         # those positions into its body, so every binding with another level count
-        # compiled the footprint again (10-17 s per ODL binding).
+        # compiled the footprint again (10-17 s per downstream binding).
         plan = lower_rkppl(quote
                 sigma ~ Exponential(1)
                 Z[levels(group), 1:2] .~ Normal.(0, 1)
@@ -624,7 +624,7 @@ end
         @test ==(typeof.(footprint_functions)...)
     end
     @testset "one retained build serves larger, smaller and empty bindings in turn" begin
-        # The reporter's sequence (`ODLPlaus:precompile`, RK `bcb8134e`).
+        # The reporter's sequence (`runtime-values requirement`, RK `bcb8134e`).
         data(n) = (n = n, prior_mu = -0.2, prior_sd = 0.3, observation_sd = 0.7,
             x = [0.5 + 0.1i for i in 1:n], y = [0.9 + 0.1i for i in 1:n])
         plan = lower_rkppl(quote

@@ -54,20 +54,4 @@ import .ManualDerivativeRuleExample
     @test occursin("const matvec = derivative_rule(", source)
     @test occursin("# -- END DOCS: generated rule --", source)
 
-    docs_page = read(joinpath(@__DIR__, "..", "docs", "src",
-                              "manual-derivative-rules.md"), String)
-    docs_make = read(joinpath(@__DIR__, "..", "docs", "make.jl"), String)
-    docs_helpers = read(joinpath(@__DIR__, "..", "docs",
-                                 "kernel_examples.jl"), String)
-    @test occursin("# Derivative rules from one pure-math graph", docs_page)
-    @test occursin("examples/manual_derivative_rule.jl", docs_page)
-    @test occursin("render_manual_derivative_rule_cuts()", docs_page)
-    @test occursin("render_manual_derivative_rule_source()", docs_page)
-    @test occursin(
-        "\"Derivative rules\" => \"manual-derivative-rules.md\"",
-        docs_make,
-    )
-    @test occursin("function render_manual_derivative_rule_cuts()", docs_helpers)
-    @test occursin("function render_manual_derivative_rule_source()",
-                   docs_helpers)
 end

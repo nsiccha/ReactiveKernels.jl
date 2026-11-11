@@ -89,15 +89,9 @@ An authored density that owns no coordinate and reads coordinates both inside
 and outside a slice cannot be assigned to it, and that slice is refused with a
 `ContractValidationError` naming the density.
 
-```julia
-slices = prepare_slices(built, plan, :y, u; by = (; y = region),
-    backend = AutoEnzyme(; mode = Enzyme.Reverse))
-c = slice_coordinates(slices, "south")
-g = zeros(length(c))
-value, g = slice_value_and_gradient!(slices, g, u, "south")
-value, g = slice_value_and_gradient!(slices, zeros(length(u)), u, ["south", "west"];
-    compact = false)
-```
+Pass a label or collection of labels to [`slice_coordinates`](@ref) and
+[`slice_value_and_gradient!`](@ref). The default gradient storage contains
+only the slice coordinates; `compact=false` writes into full packed storage.
 
 The binding is prepared once. Another label set uses the same compiled
 kernels: its cells are another plan of the partition kernels, and its prior

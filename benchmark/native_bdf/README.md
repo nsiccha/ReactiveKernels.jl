@@ -16,7 +16,7 @@ These public experiments investigate snag `native-bdf-origi-82b23b10`.
 They are research candidates, not installed package capabilities or an
 application replacement. No method is added to `StanBlocks.ode_bdf_tol`.
 The original application, its numerical controls, and its private source
-remain the responsibility of the existing BRM/RKPPLBench lanes.
+remain the responsibility of the existing downstream model packages.
 
 The exact uploaded public call fails with `MethodError` on Julia 1.10.12 and
 StanBlocks 0.2.1 at `4d3f6bff78d3b7b3638b612e55ddb4951f9ff125`.

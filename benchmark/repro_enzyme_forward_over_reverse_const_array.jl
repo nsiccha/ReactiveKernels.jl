@@ -16,7 +16,7 @@
 # an RKPPL program whose linear predictor lowers to a bound design matrix
 # times the coefficient view fails under forward over reverse and passes
 # under reverse over forward (`test/test_ad_tangent_operators.jl`).
-# Recorded on gordito, Enzyme 0.13.210, Enzyme_jll 0.0.301,
+# Recorded on a Linux fleet host, Enzyme 0.13.210, Enzyme_jll 0.0.301,
 # DifferentiationInterface 0.7.21, Julia 1.10.12, 2026-10-09.
 using Enzyme
 

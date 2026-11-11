@@ -24,7 +24,7 @@
 # carry, or with `scan_inner` not inlined, the gradient is correct. Runtime
 # activity does not change the outcome.
 #
-# Recorded on gordito, 2026-10-14, for `length(us) = 0` and three outer steps
+# Recorded on a Linux fleet host, 2026-10-14, for `length(us) = 0` and three outer steps
 # (expected gradient [1.0, 1.0, 1.0]):
 #   Julia 1.13.1 / 1.12.7, Enzyme 0.13.216 (Enzyme_jll 0.0.303):
 #     counted: OutOfMemoryError; iterated: OutOfMemoryError

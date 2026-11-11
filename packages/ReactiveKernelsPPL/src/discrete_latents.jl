@@ -143,12 +143,9 @@ posteriors; [`discrete_latent_draws`](@ref) draws the latents themselves, so
 parameter and latent draws together are exact draws from the joint
 posterior.
 
-```julia
-using Random
-latent = prepare_discrete_latents(built, bound)
-posterior = latent(u)                      # posterior.y.probabilities
-draws = discrete_latent_draws(latent, u, Xoshiro(1))   # draws.y::Vector{Int}
-```
+Call the prepared query at an unconstrained point to obtain the latent
+probabilities. Pass the query, point, and an explicit random-number generator
+to [`discrete_latent_draws`](@ref) for a sampled state path.
 
 A program with no summed-out latent has none to prepare, and one whose
 latents are not covered (hidden Markov observations in `@plate` cells or

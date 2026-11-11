@@ -16,7 +16,7 @@
 # that is not inlined into the outer loop also differentiates. Runtime activity
 # does not change any outcome. The failing allocation inside Enzyme's
 # derivative has not been localized.
-# Recorded on gordito, Julia 1.10.12, Enzyme 0.13.209 and 0.13.210 (Enzyme_jll
+# Recorded on a Linux fleet host, Julia 1.10.12, Enzyme 0.13.209 and 0.13.210 (Enzyme_jll
 # 0.0.301), 2026-10-07.
 using Enzyme
 

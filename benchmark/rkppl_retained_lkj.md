@@ -13,7 +13,7 @@ preparation cost: K=2 build allocations increased from 24 MB to 46 MB.
 
 Synthetic public data, Julia 1.10.12, Enzyme 0.13.209,
 DifferentiationInterface 0.7.21 and Reactant 0.2.290 on the shared CPU host
-`gordito`, 2026-10-03. No CPU affinity or isolated-host timing guarantee.
+`a Linux fleet host`, 2026-10-03. No CPU affinity or isolated-host timing guarantee.
 `rkppl_retained_lkj.jl` uses three Normal observations with
 `mu = L[K,1] .* x`, eta=2, and `u[i] = 0.2sin(i)`.
 The density and in-place gradient are warmed, then timed with the minimum

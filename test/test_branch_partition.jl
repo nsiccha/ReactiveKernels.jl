@@ -320,7 +320,7 @@ end
 # branch, whichever arms its lanes take, an empty domain included: an arm no
 # lane takes is a plate over no lanes (RK 0.1.119). A prepared type that followed the outcomes made another binding of the
 # same program compile again (snag `sampler-type-dif-ea945700`: censored soil
-# rows that were all detected, or all censored, recompiled ODL's sampler).
+# rows that were all detected, or all censored, recompiled a downstream application’s sampler).
 @testset "one prepared type whichever arms the lanes take" begin
     prepare = (args...; kwargs...) -> ReactiveKernels.prepare(args...; branch_arms = :all, kwargs...)
     C = BranchPartition

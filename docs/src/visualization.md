@@ -1,137 +1,42 @@
-# DAG visualization
+# Graph inspection
 
-ReactiveKernels keeps the computation graph separate from the kernel that runs,
-so drawing a graph is a planning-time step. It never runs inside a prepared
-kernel.
+Use `visualize` to inspect dependencies and the recipes selected by a plan. Print `code_expr` when the question concerns the emitted Julia program.
 
-## Quick use
+## Plan view
 
-```julia
-@kernel g(x, y) = begin
-    out = hypot(x, y)
+The graph below contains a value and its square. Selecting only the square retains the dependency on the value.
+
+```@example inspection
+using ReactiveKernels
+using Main.Tutorials
+
+@kernel shifted_square(x, shift) = begin
+    value = x + shift
+    squared = value^2
+    return squared
 end
-p = plan(g)
 
-p                                      # interactive HTML in a rich display
-visualize(p)                           # the configurable display object
-visualize(p; alternatives = true)     # add unselected candidates
-visualize(p; orientation = :vertical) # top-to-bottom instead of left-to-right
-
-save_visualization("plan.html", p)
-save_visualization("plan.svg", p)
-save_visualization("plan.dot", p)
-dot_source(p)
+selected = plan(shifted_square)
+Tutorials.html(visualize(selected))
 ```
 
-`Graph` supports the same calls and shows every registered recipe. A `Plan`
-shows only selected recipes by default, because that is usually the answer to
-“what will run?”. With `alternatives=true`, recipes that could have produced a
-wanted value but lost on cost stay visible as muted dashed nodes.
+The visualization is generated from the current plan. It is not a separately maintained diagram. A supplied intermediate input changes the plan boundary, so its producing recipe is no longer needed for that selection.
 
-The HTML view is rendered by
-[Cytoscape.js](https://js.cytoscape.org/) with the
-[ELK layered layout](https://github.com/kieler/elkjs): use **Fit**, **+**, and
-**−**, drag the canvas to pan, scroll to zoom at the pointer, or use `+`, `-`,
-and `0` from the focused canvas. Selecting a value or recipe focuses its local
-neighborhood and opens its full state, detail, and incoming/outgoing
-connections in the side inspector. The component keeps its navigation and
-inspection state when a docs page moves the original DOM node between layouts.
+## Generated expression
 
-The published VitePress site bundles all three pinned npm packages locally.
-Notebook, IDE, and standalone HTML displays load the same pinned browser
-packages on demand; if scripts or networking are unavailable, the embedded SVG
-remains visible instead of leaving an empty figure.
+Print the actual expression returned by the prepared callable. Removing line annotations from a copy improves readability without changing the displayed operations.
 
-Documentation code can embed the public object directly—there is no second
-graph model or rendering implementation to copy:
-
-```julia
-view = visualize(artifact.dag) # artifact.dag::Plan
-html = sprint(show, MIME"text/html"(), view)
+```@example inspection
+prepared = prepare(shifted_square; have=:value, want=:squared)
+Tutorials.generated(prepared)
 ```
 
-`showable(MIME"text/html"(), view)` is true. If a frontend does not support
-HTML, `image/svg+xml` remains the static rich-display fallback.
+The callable's output checks that the selected boundary consumes the supplied intermediate directly.
 
-## HTMXObjects fragments
-
-`DAGVisualization` also follows the ordinary HTML-showable child contract used
-by HTMXObjects. Inside an `@htmx` route, compose the visualization as a
-structural child:
-
-```julia
-using HTMXObjects
-
-@get dag() = h.div(visualize(plan))
+```@example inspection
+prepared(4.0)
 ```
 
-The returned fragment keeps the same library-backed fit, pan, zoom, and inspect
-behavior, with SVG fallback. A host can bundle Cytoscape.js, ELK, and
-cytoscape-elk just as these docs do; otherwise the fragment's pinned loader
-fetches them once. Do not stringify the view or wrap it in `HTMX.Raw`: `h.*`
-preserves HTML-showable children structurally, while `Raw` is reserved for
-complete, trusted JavaScript or CSS payloads. Use an ordinary layout container
-rather than a presentational `SemanticCard`, because the DAG contains
-interactive buttons.
+`dot_source` and `save_visualization` support exported graph views; see the [reference](api.md) for formats and keyword arguments. A saved view describes the plan that produced it and does not update when a different plan is prepared.
 
-## Text views
-
-`show` of a `Graph` in plain text lists its values (structurally equal values
-joined by `≡`) and its recipes, with each authored plate or scan body nested
-under its recipe. A recipe captured from `@kernel` source reads as
-`(inputs) -> source`, as it does in `explain(plan)` and in the diagram labels.
-The same walk is available as data: `recipe_inventory` returns one `(; kind,
-depth, parent, recipe)` entry per listed recipe, and `recipe_kind` classifies a
-single recipe as `:plate`, `:scan` or `:ordinary` (see [Inspecting
-structure](compiler.md#Inspecting-structure)).
-
-`code_expr(spec_or_plan)` and `code_expr(prepared)` return the generated
-Julia expression itself. Print that expression with Julia's ordinary printer;
-for a cleaner listing, remove only line-number nodes from a copy. A recipe's
-authored source runs in the body as a `let` over its arguments, a bound
-constant is read as `__constants__[k]`, and an operation without an inlinable
-source is called as `(__callables__[k])(…)`; the two tuples are available
-separately as `prepared.constants` and `prepared.callables`, one entry per
-lowered recipe. A printed expression that embeds an operation object may not
-parse on its own. The structural graph view explains names and recipes without
-altering this executable expression.
-
-```julia
-graph = kernel_graph(spec)
-show(stdout, MIME"text/plain"(), graph)   # values and recipes
-print(Base.remove_linenums!(deepcopy(code_expr(spec)))) # the planned program
-```
-
-## Reading a diagram
-
-The diagram has two kinds of node: values are ellipses and recipes are boxes,
-and every edge goes `value → recipe → value`. This keeps multi-input and
-multi-output recipes explicit instead of drawing ambiguous value-to-value edges.
-
-```@eval
-Main.ReactiveKernelsDocs.render_visualization_legend()
-```
-
-Canvas labels retain the complete value or operation name and wrap when needed.
-The node picker and inspector retain the full type, identity, cost, state, and
-incoming/outgoing names. When two values are recognized as the same (a shared
-subexpression), they share one node, which lists all their names.
-
-## Why HTML plus SVG plus DOT?
-
-The three formats serve different portability layers:
-
-```@eval
-Main.ReactiveKernelsDocs.render_visualization_surfaces()
-```
-
-Cytoscape.js owns the interactive graph renderer and event model; ELK owns the
-directed layered layout. ReactiveKernels' JavaScript is an adapter for semantic
-styling and inspection, not a home-grown layout engine. Mermaid is a good
-static diagram format but not as strong for structural inspection; React Flow
-would introduce React into the Vue-based docs host; Sigma targets much larger
-free-form networks. Graph editing and runtime profiling remain out of scope.
-
-Successful `Plan`s have no cycles. A raw `Graph` can still contain one; the
-built-in SVG still shows the nodes involved so the looping edges are visible,
-while DOT is available for a more detailed diagnostic layout.
+The [bound-regression example](bound-regression.md) places a generated dependency view beside its source, runtime outputs and numerical checks.

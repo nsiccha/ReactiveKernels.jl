@@ -2990,7 +2990,7 @@ end
 # of one element are independent. Here the cells of one tile take their seed,
 # then each element in turn: one contiguous pass `acc = add_sum(acc, term)`
 # over the tile per element, which vectorizes across cells. Every cell's value
-# is the authored fold in the authored order, bitwise. Measured on gordito
+# is the authored fold in the authored order, bitwise. Measured on a Linux fleet host
 # (Julia 1.10.12, 16321 cells): `w[j] / (t + s[j])` 3.2-3.5 -> 0.32-0.35
 # ns/cell over 3 elements and 8.9-9.3 -> 1.16-1.24 over 12; a term calling
 # `exp` gains nothing and loses up to 13 % over 12 elements, which is why only
@@ -4752,7 +4752,7 @@ _cell_forced(f, ::Nothing, ::Int) = f()
 # (`_cell_partition_regions`): each such member's region (`region_bodies`), the
 # work only it reads and its plate run under its nonempty-row guard, and its sum
 # is zero otherwise, so an empty member neither computes nor reads its work
-# (snag `absent-odl-vecto-d98e48bf`). Values the members share are still
+# (snag `empty-vector regression`). Values the members share are still
 # computed once, at the union of their rows. Statements reading only labels and
 # bound data stay unguarded, where a partition's plan computes them per label.
 # When the statements cannot be so placed (`_cell_guard_group`), the group
@@ -7296,7 +7296,7 @@ end
 # lowered AST and recipes, whose value ids come from a process-global counter
 # whose namespace's count changes with every value allocated. So every build of
 # one program compiled another body of another type, and every reader of it
-# compiled again (snag `sampler-runtimeg-13afd928`: an ODL archive sampler, one
+# compiled again (snag `sampler-runtimeg-13afd928`: an downstream archive sampler, one
 # new type per build of the same binding).
 #
 # The body therefore embeds an execution copy of each object, of the same type:
@@ -7551,10 +7551,8 @@ end
 # recipe's outputs. Generated code orders values this way, never by identity: a
 # `ValueId` orders by the key of the namespace that allocated it, and that key
 # differs in every process. A program composed of values a package image made
-# and values made at run time (Bruno's simulator: its summary graph and its
-# model) ordered them one way while the image was generated and another at run
-# time, so the image's compiled reader did not apply (snag
-# `compiled-reader-be3cadbb`).
+# and values made at run time must preserve its ordering so that the image's
+# compiled reader also applies at run time.
 function _declaration_order(p::Plan, ids)
     wanted = Set{ValueId}(ids)
     order = ValueId[]
@@ -8038,7 +8036,7 @@ _bound_operand_leaves(value) =
 # immutable that holds one, such as a range or a scale. Spelled in the body, it
 # would make each value another generated function, so another type, and a new
 # compile of the whole derivative (snag `prepare-sampler-e69f1b38`; the user's
-# direction on numeric values, `ODLPlaus:precompile` decision
+# direction on numeric values, `runtime-values requirement` decision
 # `2026-11-06T01-09-46-212-0ikeidi`). Tuples and records never reach this as a
 # whole. Anything else, a singleton or a name such as a `Symbol` or a type, has
 # no number to keep out of the body and stays a literal of the rebuild.
@@ -8818,7 +8816,7 @@ end
 # the kernel and not to the shared code. A body that held its caches would need
 # its own identity per kernel, so its own type and compile per preparation; one
 # that held bound numbers would specialize on their values (the user's direction
-# on numeric values, `ODLPlaus:precompile` decision
+# on numeric values, `runtime-values requirement` decision
 # `2026-11-06T01-09-46-212-0ikeidi`).
 function _nonallocating_body(ast::Expr)
     read(name, field) = Expr(:(=), name,
