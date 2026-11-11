@@ -16,6 +16,25 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.158
+
+- A response whose element type admits `missing`
+  (`Vector{Union{Missing,Float64}}`) is bound with its presence mask
+  `_rkppl_present_<y>` however many entries are missing, none included, and
+  a guarded observation argument reads that mask as data rather than as a
+  constant in the generated program. One program then serves every absence
+  pattern of that type: a binding with no missing entries runs the same
+  guarded likelihood as one with some, with the same values. A response
+  whose type does not admit `missing` is unchanged.
+- `jax_source`: such a response is passed to `prepare_data` as the caller
+  has it, by its authored name, with `None` for a missing entry;
+  `prepare_data` computes the presence mask and the stored values itself.
+  It used to take the internal `_rkppl_present_<y>` as a parameter, and only
+  when an entry was missing, so the module differed between none and some
+  missing entries. A derived value whose binding guards missing
+  observations is now computed by `prepare_data`, where it used to be an
+  input listed in `UNTRANSLATED`. Requires ReactiveKernels 0.1.167.
+
 ## 0.1.157
 
 - `jax_source` of a program with a dotted `@plate` cell latent,

@@ -26,7 +26,7 @@ density = prepare_query(built, bound, :sampler)
 density(u)
 ```
 
-The left side of `|` binds inputs. The right side observes declared variables and retains their densities as likelihood terms. Supplying a declared variable directly as a model-call keyword pins it instead: that declaration and its density are removed. Choose the operation that expresses the intended probability model.
+The left side of `|` binds inputs. The right side observes declared variables and retains their densities as likelihood terms. An observed response whose element type admits `missing` is bound with a presence mask, however many entries are missing, so one program serves every absence pattern and the likelihood skips the absent entries. Supplying a declared variable directly as a model-call keyword pins it instead: that declaration and its density are removed. Choose the operation that expresses the intended probability model.
 
 ## Coordinates
 

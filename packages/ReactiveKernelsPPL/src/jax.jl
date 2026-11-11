@@ -200,22 +200,29 @@ end
 # `s = _bound_value(_rkppl_value_s)`: the caller passes `s`, and
 # `_rkppl_value_s` is that value; likewise the observed value of a
 # conditioned declaration `y`, `_rkppl_conditioned_y`, is the `y` the caller
-# passes. A derived definition whose binding guards
-# missing observations (a presence mask spliced from the data) is not
-# translated: `prepare_data` takes it as an input, listed in `UNTRANSLATED`.
+# passes. A response whose type admits `missing` is passed as the caller has
+# it, its missing entries `None`: `prepare_data` computes its presence mask
+# `_rkppl_present_<y>` from it and then the stored values, as binding does
+# (`_prepare_missing_responses!`). A derived definition whose binding guards
+# missing observations is computed as guarded, reading that mask.
 # Frozen definitions (`frozen_values`) stay inputs, as their values come from
 # another binding.
 function _jax_data_definitions(plan::StructuralPlan, names)
     exprs, derived = _definition_exprs(plan)
     available = Set{Symbol}(names)
     found = Dict{Symbol,Any}()
-    function definition(nm)
-        ex = exprs[nm]
-        nm in derived && _guard_missing_observation_argument(nm, ex, plan, plan.columns) !== ex &&
-            return ReactiveKernels.JAXEmissionError(
-                "the binding guards the missing observations of `$nm` with a presence " *
-                "mask computed from the data: `prepare_data` takes `$nm` as an input")
-        ex
+    definition(nm) = nm in derived ?
+        _guard_missing_observation_argument(nm, exprs[nm], plan, plan.columns) : exprs[nm]
+    # Each response with a presence mask: its mask from the raw value, then
+    # its stored values, ahead of every definition that reads them.
+    missing_responses = Pair{Symbol,Any}[]
+    for nm in sort!(collect(available))
+        mask = _observed_mask_name(nm)
+        haskey(plan.columns, mask) || continue
+        mask in available &&
+            push!(missing_responses, mask => :($_rkppl_presence($nm)))
+        push!(missing_responses,
+              nm => :($_rkppl_fill_missing($nm, $(one(eltype(plan.columns[nm]))))))
     end
     for nm in available
         str = String(nm)
@@ -282,9 +289,33 @@ function _jax_data_definitions(plan::StructuralPlan, names)
         push!(order, nm)
     end
     foreach(visit, sort!(collect(keys(found))))
-    Pair{Symbol,Any}[nm => found[nm] for nm in order]
+    Pair{Symbol,Any}[missing_responses; [nm => found[nm] for nm in order]]
 end
 _jax_data_name(nm::Symbol) = nm
+
+# A response whose type admits `missing`, as `prepare_data` reads the raw
+# value the caller passes (missing entries `None`): its presence, and its
+# values with each missing entry `filler`, as binding stores them
+# (`_prepare_missing_responses!`, which fills with `one(T)`).
+_rkppl_presence(y::AbstractArray) = Array(.!ismissing.(y))
+_rkppl_fill_missing(y::AbstractArray, filler) = map(x -> ismissing(x) ? filler : x, y)
+const _JAX_PRESENCE = "np.vectorize(lambda v: v is not None, otypes=[bool])"
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_rkppl_presence), args::Vector{ReactiveKernels._PyVal})
+    ctx.host === nothing && ReactiveKernels._jax_error(
+        "a response's presence mask outside `prepare_data`", ReactiveKernels._jax_where(ctx))
+    ReactiveKernels._PyVal(_JAX_PRESENCE * "(np.asarray(" * only(args).code * ", dtype=object))",
+                           Any, true)
+end
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_rkppl_fill_missing), args::Vector{ReactiveKernels._PyVal})
+    ctx.host === nothing && ReactiveKernels._jax_error(
+        "a response's stored values outside `prepare_data`", ReactiveKernels._jax_where(ctx))
+    y, filler = args
+    raw = "np.asarray(" * y.code * ", dtype=object)"
+    ReactiveKernels._PyVal("np.where(" * _JAX_PRESENCE * "(" * raw * "), " * raw * ", " *
+                           filler.code * ")", Any, true)
+end
 
 # --- translations of RKPPL's own functions ---------------------------------------
 
