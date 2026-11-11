@@ -203,7 +203,7 @@ end
             y .~ Normal.(a, 1)
         end
         # refused: a declaration size is a nonnegative integer and is 1-based
-        # (docs/src/constraints.md preserves the authored Julia indexing).
+        # (CONTRIBUTING.md preserves the authored Julia indexing).
         @test_throws SurfaceLoweringError lower_rkppl(ast, data; conditioned = data)
     end
     for index in (0, 1, -1)

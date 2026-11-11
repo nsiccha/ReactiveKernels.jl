@@ -679,11 +679,14 @@ preparation to apply — `prepare_ad`, `prepare_ad_pullback`,
 `prepare_ad_pushforward`, `prepare_ad_hvp` or `prepare_ad_third` — and
 `exemplars` are that
 function's arguments after its backend, ending with an unconstrained exemplar
-`u0` of length `layout.total`:
+`u0` of length `layout.total`.
 
-Choose `prepare_ad_hvp` with a second-order backend for Hessian-vector
-products, `prepare_ad_pushforward` for directional outputs, or
-`prepare_ad_third` with a nested backend for third-order contractions.
+Choose `prepare_ad_hvp` with a second-order backend, such as
+`SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse), AutoEnzyme(; mode = Enzyme.Forward))`,
+and evaluate `ad_gradient_and_hvp(q, (v,), u)` for Hessian-vector products;
+`prepare_ad_pushforward` with a forward backend and `ad_value_and_pushforward`
+for directional outputs; or `prepare_ad_third` with a nested backend and
+`ad_gradient_hvp_and_third`, whose third output is the gradient of `vᵀ H v`.
 
 Gradients, Hessian-vector products and third-order derivatives need a scalar
 preset (`:sampler`, `:likelihood`, `:prior`, `:log_jacobian`); pullbacks and
@@ -836,8 +839,7 @@ observation. `plan` must generate the program `built` was built from, as for
 [`prepare_query`](@ref).
 
 For the packed coordinates a cell reads, use RK's structural footprint API:
-
-Prepare `ReactiveKernels.partition_footprint_kernel(q.kernel)` and evaluate
+prepare `ReactiveKernels.partition_footprint_kernel(q.kernel)` and evaluate
 it at the packed point and cell position. Its `unconstrained` field is either
 a vector of read positions or `:whole`.
 
@@ -1057,8 +1059,11 @@ end
 ReactiveKernels._cell_lazy_view(::typeof(_compact_cell_point)) = true
 
 # A conditional partition may read shared base coordinates beside its local
-# active coordinates. Its row form materializes only the requested rows, so
-# downstream reshapes and row reads do not retain the full packed base.
+# active coordinates. Its row form reads only the requested rows: the constant
+# base gathered at them, overlaid by the active vector where a row's slot maps
+# there (`_local_cell_rows`, a `_CompactCellPoint` over those rows). Nothing is
+# allocated for the active entries or their Enzyme shadow, and downstream
+# reshapes and row reads do not retain the full packed base.
 @inline _local_cell_point(base, active, slots) = _CompactCellPoint(base, active, slots)
 ReactiveKernels._cell_lazy_view(::typeof(_local_cell_point)) = true
 function ReactiveKernels._cell_lazy_rows(::typeof(_local_cell_point), inputs, rows, bind,
@@ -1071,14 +1076,8 @@ function ReactiveKernels._cell_lazy_rows(::typeof(_local_cell_point), inputs, ro
     base_rows = bind(:cell_base_rows, Expr(:ref, inputs[1], rows))
     Expr(:call, GlobalRef(@__MODULE__, :_local_cell_rows), base_rows, inputs[2], slots)
 end
-@inline function _local_cell_rows(base_rows::AbstractVector, active, slots::AbstractVector)
-    result = Vector{Float64}(undef, length(slots))
-    for i in eachindex(base_rows, slots)
-        slot = slots[i]
-        result[i] = iszero(slot) ? base_rows[i] : active[slot]
-    end
-    result
-end
+@inline _local_cell_rows(base_rows::AbstractVector, active, slots::AbstractVector) =
+    _CompactCellPoint(base_rows, active, slots)
 @inline _local_cell_rows(base_row::Float64, active, slot::Integer) =
     [iszero(slot) ? base_row : active[slot]]
 

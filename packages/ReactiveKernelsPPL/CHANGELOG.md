@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.155
+## 0.1.156
 
 - New `rescore_smc_checkpoint(target, checkpoint; previous = nothing,
   rtol = 1e-10)` re-anchors an `smc_checkpoint` on the current host. A
@@ -32,6 +32,19 @@ are recorded in the git history only.
   largest deviation with its particle, and points to
   `rescore_smc_checkpoint` when the deviation is within its default `rtol`.
   The `resume_smc` docstring states the code-generation requirement.
+
+## 0.1.155
+
+- Compact-cell Hessian-vector products and the mixed derivatives of a cell
+  pullback work for a cell that reads many shared values:
+  `prepare_compact_cell_ad` with `prepare_ad_hvp` or `prepare_ad_third` and
+  `partitioned` coordinates, then `ad_gradient_and_hvp` or `cell_pullback!`
+  with `prepare_cell_accumulator` at orders 1 and 2. Each shared value is an
+  inactive input of the cell's derivative, and from about 28 of them both
+  Hessian-vector compositions raised `EnzymeRuntimeActivityError`. BRM's
+  sparse Laplace raised it from NLMEEstimation's `check_protocol` on a model
+  whose cells read 33 shared values (snag `varyingsource3-b-82246291`).
+  Requires ReactiveKernels 0.1.158.
 
 ## 0.1.154
 

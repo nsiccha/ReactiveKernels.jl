@@ -27,9 +27,11 @@ Base.getindex(a::_CellArray) = getindex(_cell_array_materialize(a))
 end
 @inline Base.getindex(a::_CellArray, I::CartesianIndex) = getindex(a, Tuple(I)...)
 @inline _cell_array_materialize(a) = a
+# Base's `map` over a tuple of 32 or more operands goes through a heap vector
+# and loses the tuple's concrete type; the structural map keeps it.
 @inline _cell_array_materialize(bc::Base.Broadcast.Broadcasted) =
     Base.Broadcast.Broadcasted(bc.style, bc.f,
-        map(_cell_array_materialize, bc.args), bc.axes)
+        _native_broadcast_map(_cell_array_materialize, bc.args), bc.axes)
 
 struct _CellHcat{T,A} <: _CellArray{T,2}
     arguments::A
@@ -67,15 +69,26 @@ struct _CellBroadcast{T,N,B} <: _CellArray{T,N}
 end
 Base.axes(a::_CellBroadcast) = axes(a.broadcast)
 Base.size(a::_CellBroadcast) = map(length, axes(a))
-@inline _cell_array_materialize(a::_CellBroadcast) =
-    _native_broadcast_materialize(_cell_array_materialize(a.broadcast))
+@inline function _cell_array_materialize(a::_CellBroadcast{T}) where {T}
+    bc = _cell_array_materialize(a.broadcast)
+    _native_broadcast_wide(bc) || return _native_broadcast_materialize(bc)
+    # `bc` carries the axes `_cell_array_broadcast` computed from its operands,
+    # and the fresh output aliases none of them.
+    _native_broadcast_wide_copyto!(similar(bc, T), bc)
+end
 @inline function Base.getindex(a::_CellBroadcast{T,N}, I::Vararg{Int,M}) where {T,N,M}
     @boundscheck checkbounds(a, I...)
     index = M == N ? CartesianIndex(I) : M > N ?
         CartesianIndex(ntuple(i -> I[i], Val(N))) :
         CartesianIndices(axes(a))[LinearIndices(a)[I...]]
-    convert(T, a.broadcast[index])
+    convert(T, _cell_broadcast_entry(a.broadcast, index))
 end
+# Base's entry read splats the operand tuple, which Julia stops specializing
+# past 32 operands; a wide broadcast reads through the structural expansion.
+# `index` is in bounds of the operands' combined axes (checked above, as
+# Base's own read checks it), so the operand reads are too.
+@inline _cell_broadcast_entry(bc, index) = _native_broadcast_wide(bc) ?
+    (@inbounds _native_broadcast_getindex(bc, index)) : bc[index]
 
 # Delaying a user function or custom indexing could suppress an exception or
 # change observable effects at an unread element. Compose only total arithmetic
@@ -86,7 +99,12 @@ _cell_array_operand(x::SubArray{<:Union{Float32,Float64},<:Any,<:Array}) =
     all(i -> i isa Union{Int,Base.Slice{Base.OneTo{Int}},UnitRange{Int},Vector{Int}}, x.indices)
 _cell_array_operand(x::Union{Int,Int32,Bool}) = true
 _cell_array_operand(x::Base.Broadcast.Broadcasted) =
-    _cell_total_function(x.f) && all(_cell_array_operand, x.args)
+    _cell_total_function(x.f) && _cell_array_operands(x.args)
+# `all` over a tuple splats it, which Julia stops specializing past 32 operands.
+@inline @generated function _cell_array_operands(args::Tuple)
+    foldr((i, rest) -> :(_cell_array_operand(getfield(args, $i)) && $rest),
+          1:fieldcount(args); init=true)
+end
 _cell_total_function(f) = f === (+) || f === (-) || f === (*) || f === (/) ||
     f === exp || f === abs || f === abs2 || f === identity ||
     f === LogExpFunctions.logistic || f === LogExpFunctions.log1pexp
@@ -111,8 +129,8 @@ end
 @inline function _cell_array_broadcast(bc::Base.Broadcast.Broadcasted)
     if bc.style isa Base.Broadcast.DefaultArrayStyle &&
             _cell_array_operand(bc)
-        ready = Base.Broadcast.instantiate(bc)
-        T = Base.Broadcast.combine_eltypes(ready.f, ready.args)
+        ready = _cell_broadcast_instantiate(bc)
+        T = _cell_broadcast_eltype(ready)
         if (T === Float32 || T === Float64) && length(axes(ready)) == 1
             return _CellBroadcast{T,1,typeof(ready)}(ready)
         end
@@ -120,6 +138,17 @@ end
     _native_broadcast_materialize(_cell_array_materialize(bc))
 end
 @inline _cell_array_broadcast(x) = _native_broadcast_materialize(x)
+# Base's `instantiate` and `combine_eltypes` splat the operand tuple, which
+# Julia stops specializing past 32 operands (an n-ary `.+` of many terms). A
+# wide broadcast computes the same axes, with the same pairwise checks, and
+# the same element type through the structural expansions of
+# `_native_broadcast_materialize`. Here `bc` is the lazy descriptor, which
+# carries no axes yet.
+@inline _cell_broadcast_instantiate(bc) = _native_broadcast_wide(bc) ?
+    Base.Broadcast.Broadcasted(bc.style, bc.f, bc.args, _native_broadcast_axes(bc)) :
+    Base.Broadcast.instantiate(bc)
+@inline _cell_broadcast_eltype(bc) = _native_broadcast_wide(bc) ?
+    _native_broadcast_eltype(bc) : Base.Broadcast.combine_eltypes(bc.f, bc.args)
 
 # A gather whose readers only take its entries or its shape. A dense floating
 # vector read at an integer vector is borrowed: `_readonly_gather` checks every

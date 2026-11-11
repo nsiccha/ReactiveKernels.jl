@@ -21,6 +21,5 @@ const SITE_PAGES = [
         "Core API" => "api.md",
         "PPL API" => "ppl-api.md",
         "Distribution API" => "distribution-api.md",
-        "Core constraints" => "constraints.md",
     ],
 ]

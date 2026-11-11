@@ -362,6 +362,66 @@ end
     end
 end
 
+# A matrix value two one-cell members read at their own rows: a reshape of a
+# parameter view and its product with a matrix, read by column. Each is one
+# row per member row (`_cell_row_eligible`): the reshape's row is a 1×2 row
+# over its two entries (`_CellOneRow`), and the product's row is read where
+# its entries are read (`_CellRowProduct`), so neither allocates a 1×2 array.
+@kernel _pp_matrix_rows(u::AbstractVector{Float64}, y::AbstractVector{Vector{Float64}},
+                        y2::AbstractVector{Float64}, subject::AbstractVector{Int},
+                        subject2::AbstractVector{Int}) = begin
+    tau::AbstractVector{Float64} = view(u, 1:2)
+    zflat::AbstractVector{Float64} = view(u, 3:12)
+    z::AbstractMatrix{Float64} = reshape(zflat, 5, 2)
+    L::AbstractMatrix{Float64} = [1.0 0.2; 0.5 0.8]
+    F::AbstractMatrix{Float64} = transpose(tau .* L)
+    b = z * F
+    k1 = b[:, 1]
+    k2 = b[:, 2]
+    dens = plate(k1, y) do ki, yi
+        sum(-(yi .- ki) .^ 2 ./ 2)
+    end
+    dens2 = plate(k2, y2) do ki, yi
+        -(yi - ki)^2 / 2
+    end
+    total = sum(dens) + sum(dens2)
+    return total
+end
+
+@testset "plate_partition: a matrix's row at two members' rows is one row each" begin
+    n = 5
+    d = (; u = [0.9, 1.3, 0.2, -0.3, 0.5, 0.1, -0.2, 0.4, -0.1, 0.3, 0.6, -0.5],
+           y = [cos.(range(0.1, 1.0; length = 2 + i % 3)) for i in 1:n],
+           y2 = [0.5 + 0.1i for i in 1:n], subject = collect(1:n), subject2 = [2, 1, 3, 5, 4])
+    have = (:u, :y, :y2, :subject, :subject2, :label)
+    bound = (; d.y, d.y2, d.subject, d.subject2)
+    spec(single) = plate_partition(_pp_matrix_rows, (:dens, :dens2);
+        by = (dens = :subject, dens2 = :subject2), index = :label, single)
+    rows = prepare(spec(false); have, want = :partition_total, bound)
+    single = prepare(spec(true); have, want = :partition_total, bound)
+    dens, dens2 = prepare(_pp_matrix_rows; have = have[1:end-1], want = (:dens, :dens2))(
+        d.u, d.y, d.y2, d.subject, d.subject2)
+    for s in 1:n
+        r2 = findfirst(==(s), d.subject2)
+        @test single(d.u, s) ≈ dens[s] + dens2[r2] rtol = 1e-14
+        @test single(d.u, s) ≈ rows(d.u, s) rtol = 1e-14
+    end
+    code = string(code_expr(single))
+    @test occursin("_cell_instance_source(", code)
+    single(d.u, 3); rows(d.u, 3)
+    @test (@allocated single(d.u, 3)) < (@allocated rows(d.u, 3))
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for s in (1, 3)
+        g1, g2 = similar(d.u), similar(d.u)
+        v1, _ = ad_value_and_gradient!(prepare_ad(single, backend, d.u, s; active = :u), g1, d.u, s)
+        v2, _ = ad_value_and_gradient!(prepare_ad(rows, backend, d.u, s; active = :u), g2, d.u, s)
+        @test v1 ≈ v2 rtol = 1e-14
+        @test g1 ≈ g2 rtol = 1e-12
+        r2 = findfirst(==(s), d.subject2)
+        @test findall(!iszero, g1) == sort!(unique([1, 2, 2 + s, 7 + s, 2 + r2, 7 + r2]))
+    end
+end
+
 # Rung 2: two plates with different row sets and keys. An observation plate
 # over rows reads a completed covariate (`vcat(observed, drawn)[order]`, the
 # shape of a completion) and a group block through a product; a totals plate

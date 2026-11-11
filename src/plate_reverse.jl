@@ -13,7 +13,7 @@
 # (the established table ForwardDiff and ReverseDiff use) or, for RK's own
 # primitives and calls whose derivative is better spelled through their own
 # result, from the overrides below. No rule attaches to a function this
-# repository does not own (docs/src/constraints.md). The primal is the
+# repository does not own (CONTRIBUTING.md). The primal is the
 # program itself, unchanged; lazy branches stay lazy in the reverse too: each
 # arm's reverse runs inside that arm, under the stored condition.
 #

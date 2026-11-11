@@ -284,7 +284,7 @@ end
 # A scalar location or precision stays a scalar (rkppl-use §1), so the
 # observation plate hoists its cell invariant `logbeta(alpha, beta)` once.
 # Plain Reverse through that program meets Enzyme's readonly-proof gap
-# (docs/src/constraints.md, snag generic-betabino-8a854de2): registered
+# (CONTRIBUTING.md, snag generic-betabino-8a854de2): registered
 # 0.13.216 flags its own by-value copy of the callable (`innerparm`), and
 # dogfood 31d31ec, which accepts that copy, flags the hoisted rule call
 # (Enzyme snag readonly-proof-h-bcbe23d3). Dogfood 9d920e1f repairs both.
@@ -324,7 +324,7 @@ end
             end
             if outcome isa Enzyme.Compiler.EnzymeMutabilityException
                 @test occursin("cannot be proven readonly", sprint(showerror, outcome))
-                # Drop with docs/src/constraints.md once a registered Enzyme
+                # Drop with CONTRIBUTING.md once a registered Enzyme
                 # carries the readonly-proof repair.
                 @test_broken false
             elseif outcome isa Exception
