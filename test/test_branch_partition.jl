@@ -68,7 +68,7 @@ isdefined(@__MODULE__, :BranchPartition) ||
 end
 
 # A plate cell whose lazy branch reads bound data only is split at preparation
-# into one branch-free plate per taken arm (docs/src/constraints.md).
+# into one branch-free plate per taken arm (CONTRIBUTING.md).
 @testset "data-bound branch partitioning of authored plates" begin
     C = BranchPartition
     RK = ReactiveKernels

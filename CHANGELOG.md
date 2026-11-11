@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.158
+## 0.1.160
 
 - New: `register_source_provider!(provider)` and `TraceableSource(argument_names,
   body, mod)`, so a package that generates a method (a macro that writes it
@@ -31,6 +31,41 @@ are recorded in the git history only.
   `__init__` of the package's extension on ReactiveKernels. Native
   execution, `prepare` and the compiled paths never read the source (snag
   `register-generat-a22e2325`, decision `0os7s7u`).
+
+## 0.1.159
+
+- `jax_source`: a matrix padded along a ragged row, such as a mixture law's
+  `cell = (x .- centres) ./ scales` for `x = vcat(x1, x_rest)` with `x_rest`
+  one row of per-row features, now reduces in the JAX functions.
+  `sum(cell; dims = 1)` (and `prod`, `maximum` and `minimum` over `dims`)
+  raised `JAXEmissionError` (`sum over dims of a Matrix{Float64}`); it now
+  sums the row's entries only. A whole-array `sum(cell)` or `sum(f, cell)`
+  emitted but read the padding as entries, a wrong value whenever rows have
+  different lengths, and `maximum(cell)` failed in Python; both now mask the
+  padded axis. The translation records which axes of an array the padding
+  covers (a broadcast keeps its operands', a transpose swaps them, an outer
+  product `x * x'` and `I(n)` cover both), and `vec` of such a matrix puts its
+  valid entries first. A reduction or `vec` of a padded array whose padded
+  axes it does not record (a matrix product with a padded operand) now raises
+  `JAXEmissionError` instead of reading the padding (snag
+  `jax-source-sum-c-bcfa9d53`).
+
+## 0.1.158
+
+- Hessian-vector products and third-order derivatives (`prepare_ad_hvp`,
+  `prepare_ad_third`, `prepare_ad_accumulator` at orders 1 and 2) work for a
+  kernel with many inactive HAVE ports, under both reverse over forward and
+  forward over reverse. From about 28 such ports they raised
+  `EnzymeRuntimeActivityError` ("Constant memory is stored (or returned) to a
+  differentiable variable"). Each inactive port crossed the backend as its own
+  `Constant` context, and from 32 contexts DifferentiationInterface and
+  Enzyme splat them through a heap tuple; inside a nested derivative that
+  tuple stores the constant operands beside the active point. Past 16 plain
+  inactive operands, they now cross as one `Constant` tuple, as the hidden
+  bound operands already do. An RKPPL compact cell takes each shared value
+  it reads as such a port, so BRM's sparse Laplace raised this for a model
+  whose cells read 33 of them (snag `varyingsource3-b-82246291`). Kernels with
+  at most 16 plain inactive operands differentiate exactly as before.
 
 ## 0.1.157
 
@@ -1623,8 +1658,9 @@ are recorded in the git history only.
   `m` and is longer than `m` evaluates `f.(view(x, 1:m))[k]`. Values are
   unchanged bit for bit and `f` runs on no element the authored form leaves
   unread; reverse-mode derivatives agree up to floating-point rounding where
-  an index repeats. See `docs/src/compiler.md`, "Elementwise calls over a
-  data-indexed gather".
+  an index repeats. See "Elementwise calls over a data-indexed gather" in
+  `docs/src/compiler.md` at revision `4d462ef4170948f2e77e3fa80cda5be5c2b6dc02`,
+  before the documentation rewrite removed that page.
 
 ## 0.1.63
 

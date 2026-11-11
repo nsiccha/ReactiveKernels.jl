@@ -3116,7 +3116,7 @@ end
 # like any other cell invariant, and evaluated only when that arm is taken.
 # Each lane still evaluates only its own arm, and an empty domain evaluates no
 # condition and no arm, so the authored lazy semantics are unchanged
-# (docs/src/constraints.md "Preserve lazy branches").
+# (CONTRIBUTING.md "Preserve lazy branches").
 #
 # The condition must read plate arguments that are statically shared: an
 # atomic operand or a `Number`. A cell holding a nested plate or scan, an

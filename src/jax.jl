@@ -6,7 +6,7 @@
 # order, an ordinary recipe becomes one assignment translated from its authored
 # right-hand side, a plate becomes `jax.vmap` of its cell, a scan becomes
 # `jax.lax.scan` of its step and a lazy branch becomes `jax.lax.cond` of its
-# arms. Nothing is unrolled per element (`docs/src/constraints.md`, "Preserve
+# arms. Nothing is unrolled per element (`CONTRIBUTING.md`, "Preserve
 # data-dependent iteration"), and sizes are read from the inputs, so one
 # emitted module serves every data size of the same program. Gradients are
 # `jax.grad` of the emitted primal; derivative rules contribute only their
@@ -46,19 +46,28 @@ _jax_error(message...) = throw(JAXEmissionError(string(message...)))
 # `limit` is a static upper bound of a data-dependent integer (a padded group
 # vector's length is at most its padded size): loops run to it and arrays of
 # that length are allocated at it.
+#
+# `padded` records which Julia axes of an array of rank two or more its
+# `extent` pads, as a bitmask (bit `k - 1` for axis `k`): a padded vector
+# broadcast against a matrix pads the result's first axis, `I(n)` at a padded
+# size both. Zero where no translation recorded them; a vector pads its one
+# axis and an adjoint vector its second, by type (`_jax_padded_axes`).
 struct _PyVal
     code::String
     T::Any
     static::Bool
     extent::String
     limit::String
+    padded::Int
 end
-_PyVal(code::AbstractString, @nospecialize(T)) = _PyVal(String(code), T, false, "", "")
+_PyVal(code::AbstractString, @nospecialize(T)) = _PyVal(String(code), T, false, "", "", 0)
 _PyVal(code::AbstractString, @nospecialize(T), static::Bool) =
-    _PyVal(String(code), T, static, "", "")
+    _PyVal(String(code), T, static, "", "", 0)
 _PyVal(code::AbstractString, @nospecialize(T), static::Bool, extent::AbstractString) =
-    _PyVal(String(code), T, static, String(extent), "")
-_jax_static(v::_PyVal) = _PyVal(v.code, v.T, true, v.extent, v.limit)
+    _PyVal(String(code), T, static, String(extent), "", 0)
+_PyVal(code::AbstractString, @nospecialize(T), static::Bool, extent::AbstractString,
+       limit::AbstractString) = _PyVal(String(code), T, static, String(extent), String(limit), 0)
+_jax_static(v::_PyVal) = _PyVal(v.code, v.T, true, v.extent, v.limit, v.padded)
 _jax_ragged(@nospecialize(T)) = T isa Type && T <: AbstractArray && eltype(T) isa Type &&
     eltype(T) <: AbstractArray
 function _jax_extent(args)
@@ -69,13 +78,94 @@ function _jax_extent(args)
 end
 # A padded vector's valid-entry mask.
 _jax_mask(v::_PyVal) = "(jnp.arange(" * _py_atom(v.code) * ".shape[0]) < " * v.extent * ")"
-# The code of `v` as a reduction reads it: a padded vector's (or its
-# adjoint's) padding replaced by the reduction's identity `neutral`.
+# A vector or an adjoint (transposed) vector: stored as one 1-D array.
+_jax_vector_like(@nospecialize(T)) = T isa Type && (T <: AbstractVector ||
+    T <: Union{LinearAlgebra.Adjoint{<:Any,<:AbstractVector},
+               LinearAlgebra.Transpose{<:Any,<:AbstractVector}})
+# The Julia axes a padded value's `extent` pads, as a bitmask: those recorded
+# in `padded`, else a vector's one axis and an adjoint vector's second. Zero
+# for a value that is not padded, a ragged value (its lengths pad each row),
+# or an array whose padded axes no translation recorded.
+function _jax_padded_axes(v::_PyVal)
+    isempty(v.extent) && return 0
+    v.padded == 0 || return v.padded
+    T = v.T
+    T isa Type && !_jax_ragged(T) || return 0
+    T <: AbstractVector && return 1
+    _jax_vector_like(T) && return 2
+    0
+end
+# The padded axes of an elementwise combination of `args` (a broadcast aligns
+# their leading axes, as `+` of equal shapes does): the union of theirs when
+# one extent pads them all; zero (not recorded) when operands are padded by
+# different extents or an operand's padded axes are not known.
+function _jax_padded_union(args)
+    axes = 0
+    extent = ""
+    for a in args
+        isempty(a.extent) && continue
+        m = _jax_padded_axes(a)
+        m == 0 && return 0
+        isempty(extent) || extent == a.extent || return 0
+        extent = a.extent
+        axes |= m
+    end
+    axes
+end
+# The padded axes an elementwise function of `x` keeps: `x`'s, unless `x` is
+# an adjoint vector, whose result (typed a matrix) is stored with one axis.
+_jax_adjoint_vector(@nospecialize(T)) = _jax_vector_like(T) && !(T <: AbstractVector)
+_jax_padded_like(x::_PyVal) = _jax_adjoint_vector(x.T) ? 0 : _jax_padded_axes(x)
+# The padded axes of a broadcast of rank `R` over `args`, when its stored
+# array has all `R` axes: an operand other than an adjoint vector gives it
+# them (an adjoint vector alone keeps its one stored axis).
+_jax_broadcast_padded(args, R::Int) =
+    R >= 2 && any(a -> _jax_rank(a.T) > 0 && !_jax_adjoint_vector(a.T), args) ?
+    _jax_padded_union(args) : 0
+# An elementwise result over arrays of one shape (`A + B`, `-A`, `c * A`)
+# keeps their padded axes.
+function _jax_elementwise_result(f, args::Vector{_PyVal}, code::AbstractString)
+    v = _jax_result(f, args, code)
+    _jax_is_array(v.T) && !_jax_vector_like(v.T) || return v
+    _PyVal(v.code, v.T, v.static, v.extent, v.limit, _jax_padded_union(args))
+end
+# The valid-entry mask of a padded array over its padded axes `axes` (a
+# subset of `_jax_padded_axes(x)`), shaped to broadcast against the stored
+# array; `nothing` when its padded axes are not known. `x` is read once per
+# axis, so a caller binds it to a name first.
+function _jax_padded_mask(x::_PyVal, axes::Int = _jax_padded_axes(x))
+    axes == 0 && return nothing
+    _jax_vector_like(x.T) && return _jax_mask(x)
+    R = _jax_rank(x.T)
+    parts = String[]
+    for k in 1:R
+        axes & (1 << (k - 1)) == 0 && continue
+        push!(parts, "(jnp.arange(" * _py_atom(x.code) * ".shape[" * string(k - 1) * "]) < " *
+                     x.extent * ")[" * join((j == k ? ":" : "None" for j in 1:R), ", ") * "]")
+    end
+    join(parts, " & ")
+end
+# The code of `v` as a reduction reads it: a padded array's padding replaced
+# by the reduction's identity `neutral`. An array whose padded axes are not
+# known is read whole, as before they were recorded; `_jax_padded_reduced`
+# refuses it instead.
 function _jax_masked(v::_PyVal, neutral::AbstractString)
     isempty(v.extent) && return v.code
-    v.T isa Type && (v.T <: AbstractVector || v.T <: LinearAlgebra.Adjoint{<:Any,<:AbstractVector}) ||
-        return v.code
-    "jnp.where(" * _jax_mask(v) * ", " * v.code * ", " * neutral * ")"
+    mask = _jax_vector_like(v.T) ? _jax_mask(v) : _jax_padded_mask(v)
+    mask === nothing && return v.code
+    "jnp.where(" * mask * ", " * v.code * ", " * neutral * ")"
+end
+# `v` (an array) as a whole-array reduction reads it, padding replaced by
+# `neutral`; a padded array whose padded axes are not known raises, since
+# reading its padding as entries gives a wrong value.
+function _jax_padded_reduced(ctx, f, v::_PyVal, neutral::AbstractString)
+    isempty(v.extent) && return v.code
+    (_jax_vector_like(v.T) || !_jax_is_array(v.T)) &&
+        return "jnp.where(" * _jax_mask(v) * ", " * v.code * ", " * neutral * ")"
+    _jax_padded_axes(v) == 0 && _jax_error("`", f, "` of a padded `", v.T,
+        "` whose padded axes are not known", _jax_where(ctx))
+    x = _jax_bind!(ctx, :padded, v)
+    "jnp.where(" * _jax_padded_mask(x) * ", " * x.code * ", " * neutral * ")"
 end
 
 # The Python keywords and module names an emitted identifier must not take.
@@ -221,7 +311,7 @@ function _jax_bind!(ctx::_JaxContext, hint, v::_PyVal)
     (v.T isa _JaxCallable || occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", v.code)) && return v
     name = _jax_fresh(ctx, hint)
     _jax_emit!(ctx, name * " = " * v.code)
-    _PyVal(name, v.T, v.static, v.extent, v.limit)
+    _PyVal(name, v.T, v.static, v.extent, v.limit, v.padded)
 end
 
 # --- types and ranks ----------------------------------------------------------------
@@ -563,7 +653,7 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
         v.T isa _JaxCallable && (ctx.locals[lhs] = v; return)
         name = _jax_fresh(ctx, lhs)
         _jax_emit!(ctx, name * " = " * v.code)
-        ctx.locals[lhs] = _PyVal(name, v.T, v.static, v.extent, v.limit)
+        ctx.locals[lhs] = _PyVal(name, v.T, v.static, v.extent, v.limit, v.padded)
         return
     end
     if lhs isa Expr && lhs.head === :ref && lhs.args[1] isa Symbol && haskey(ctx.locals, lhs.args[1])
@@ -573,7 +663,8 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
         position = indexed.code[ncodeunits(target.code)+1:end]
         name = _jax_fresh(ctx, lhs.args[1])
         _jax_emit!(ctx, name * " = " * _py_atom(target.code) * ".at" * position * ".set(" * v.code * ")")
-        ctx.locals[lhs.args[1]] = _PyVal(name, target.T, false, target.extent, target.limit)
+        ctx.locals[lhs.args[1]] = _PyVal(name, target.T, false, target.extent, target.limit,
+                                         target.padded)
         return
     end
     if lhs isa Expr && lhs.head === :tuple
@@ -1186,7 +1277,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
         isempty(names) || _jax_emit!(ctx, "(" * join(names, ", ") * (length(names) == 1 ? ",)" : ")") *
                                          " = " * carry)
         for (n, name, v) in zip(carried, names, initial)
-            ctx.locals[n] = _PyVal(name, v.T, false, v.extent, v.limit)
+            ctx.locals[n] = _PyVal(name, v.T, false, v.extent, v.limit, v.padded)
         end
         ctx.locals[var] = _PyVal(index, Int)
         statements = body isa Expr && body.head === :block ? body.args : Any[body]
@@ -1211,7 +1302,8 @@ function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
                     fname * ", (" * join((v.code for v in initial), ", ") *
                     (length(initial) == 1 ? ",))" : "))"))
     for (k, (n, v)) in enumerate(zip(carried, initial))
-        ctx.locals[n] = _PyVal(result * "[" * string(k - 1) * "]", v.T, false, v.extent, v.limit)
+        ctx.locals[n] = _PyVal(result * "[" * string(k - 1) * "]", v.T, false, v.extent, v.limit,
+                               v.padded)
     end
     _PyVal("None", Nothing, true)
 end
@@ -1227,7 +1319,7 @@ function _jax_carry_value(ctx::_JaxContext, v::_PyVal)
         parts = [_jax_carry_value(ctx, _PyVal(_py_atom(t) * "[" * string(k - 1) * "]",
                                               fieldtype(v.T, k)))
                  for k in 1:fieldcount(v.T)]
-        return _PyVal(_jax_tuple_code(parts), v.T, false, v.extent, v.limit)
+        return _PyVal(_jax_tuple_code(parts), v.T, false, v.extent, v.limit, v.padded)
     end
     T = v.T isa Type ? v.T : Float64
     _PyVal("jnp.asarray(" * v.code * ", dtype=" * _jax_dtype(T) * ")", T, false, "", "")
@@ -1325,7 +1417,8 @@ function _jax_if(ctx::_JaxContext, ex, value::Bool)
     result = _jax_bind!(ctx, :branch, branch)
     for (k, n) in enumerate(carried)
         b = before[n]
-        ctx.locals[n] = _PyVal(_py_atom(result.code) * "[" * string(k) * "]", b.T, false, b.extent, b.limit)
+        ctx.locals[n] = _PyVal(_py_atom(result.code) * "[" * string(k) * "]", b.T, false, b.extent,
+                               b.limit, b.padded)
     end
     _PyVal(_py_atom(result.code) * "[0]", result.T isa Type && result.T <: Tuple ? fieldtype(result.T, 1) : Any)
 end
@@ -1613,8 +1706,10 @@ function _jax_call(ctx::_JaxContext,
     names = first.(kw)
     if names == [:dims]
         x, d = only(args), last(only(kw))
-        _jax_is_array(x.T) && isempty(x.extent) && _jax_known(ctx, d) && d.T isa Type &&
-            d.T <: Integer || _jax_error("`", f, "` over `dims` of a `", x.T, "`", _jax_where(ctx))
+        _jax_is_array(x.T) && _jax_known(ctx, d) && d.T isa Type && d.T <: Integer &&
+            (isempty(x.extent) || _jax_padded_dims_reducible(ctx, x, d)) ||
+            _jax_error("`", f, "` over `dims` of a `", x.T, "`", _jax_where(ctx))
+        isempty(x.extent) || return _jax_padded_dims_reduction(ctx, f, x, parse(Int, d.code))
         np = ctx.host === nothing ? "jnp." : "np."
         return _PyVal(np * _JAX_AXIS_REDUCTIONS[f] * "(" * x.code * ", axis=" *
                       _py_infix("-", [d.code, "1"]) * ", keepdims=True)", x.T)
@@ -1624,6 +1719,32 @@ function _jax_call(ctx::_JaxContext,
                    "` have no JAX translation", _jax_where(ctx))
     reduced = _jax_call_positional(ctx, f, args)
     _jax_call(ctx, f === sum ? (+) : (*), [last(only(kw)), reduced])
+end
+# A padded array reduces over `dims = d` when its padded axes are known, it is
+# stored with its own axes (not an adjoint vector's one) and `d` is an integer
+# literal, so the emitter knows whether `d` is a padded axis.
+function _jax_padded_dims_reducible(ctx::_JaxContext, x::_PyVal, d::_PyVal)
+    ctx.host === nothing && _jax_padded_axes(x) != 0 &&
+        (_jax_rank(x.T) == 1 || !_jax_vector_like(x.T)) || return false
+    k = tryparse(Int, d.code)
+    k !== nothing && 1 <= k <= _jax_rank(x.T)
+end
+# `f(x; dims = k)` of a padded array. Along a padded axis the padding is
+# replaced by `f`'s identity, so the reduction reads the valid entries only,
+# and the result is no longer padded along `k`; along another axis it keeps
+# its padding, which other reductions mask.
+const _JAX_REDUCTION_IDENTITIES = Dict{Any,String}(sum => "0.0", prod => "1.0",
+                                                   maximum => "-jnp.inf", minimum => "jnp.inf")
+function _jax_padded_dims_reduction(ctx::_JaxContext, f, x::_PyVal, k::Int)
+    axes = _jax_padded_axes(x)
+    bit = 1 << (k - 1)
+    x = _jax_bind!(ctx, :padded, x)
+    read = axes & bit == 0 ? x.code :
+        "jnp.where(" * _jax_padded_mask(x, bit) * ", " * x.code * ", " *
+        _JAX_REDUCTION_IDENTITIES[f] * ")"
+    rest = axes & ~bit
+    _PyVal("jnp." * _JAX_AXIS_REDUCTIONS[f] * "(" * read * ", axis=" * string(k - 1) *
+           ", keepdims=True)", x.T, false, rest == 0 ? "" : x.extent, "", rest)
 end
 
 # `dropdims(x; dims = d)`: `x` without its axis `d`, of length one.
@@ -1895,17 +2016,18 @@ function _jax_scalar_or_elementwise(ctx::_JaxContext, f, args::Vector{_PyVal})
         return _jax_literal(f(parse(Int, args[1].code), parse(Int, args[2].code)))
     if haskey(_JAX_INFIX, f)
         op = _JAX_INFIX[f]
-        length(args) == 1 && f === (-) && return _jax_result(f, args, _py_negate(args[1].code))
+        length(args) == 1 && f === (-) &&
+            return _jax_elementwise_result(f, args, _py_negate(args[1].code))
         length(args) == 1 && f === (+) && return args[1]
         length(args) >= 2 || return nothing
-        return _jax_result(f, args, _py_infix(op, [a.code for a in args]))
+        return _jax_elementwise_result(f, args, _py_infix(op, [a.code for a in args]))
     end
     if f === (*) && any(a -> a.T isa Type && a.T <: AbstractString, args)
         return _PyVal(_py_infix("+", [a.code for a in args]), String,
                       all(a -> a.static, args))
     end
     if f === (*) && count(a -> _jax_is_array(a.T), args) <= 1
-        return _jax_result(f, args, _py_infix("*", [a.code for a in args]))
+        return _jax_elementwise_result(f, args, _py_infix("*", [a.code for a in args]))
     end
     if f === (^) && length(args) == 2 && !_jax_is_array(args[1].T)
         return _jax_result(f, args, _py_infix("**", [args[1].code, args[2].code]))
@@ -1949,7 +2071,7 @@ function _jax_shifted_limit(f, args::Vector{_PyVal}, v::_PyVal)
     else
         return v
     end
-    _PyVal(v.code, v.T, v.static, v.extent, limit)
+    _PyVal(v.code, v.T, v.static, v.extent, limit, v.padded)
 end
 
 # A call with array semantics, or of a function translated from its own
@@ -1980,8 +2102,11 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(*), args::Vector{_PyVal})
         a.T <: LinearAlgebra.Adjoint{<:Any,<:AbstractVector} && ndims(b.T) == 1 &&
             return _jax_result(*, args, "jnp.dot(" * _jax_masked(a, "0") * ", " *
                                         _jax_masked(b, "0") * ")")
-        ndims(a.T) == 1 && b.T <: LinearAlgebra.Adjoint{<:Any,<:AbstractVector} &&
-            return _jax_result(*, args, "jnp.outer(" * a.code * ", " * b.code * ")")
+        if ndims(a.T) == 1 && b.T <: LinearAlgebra.Adjoint{<:Any,<:AbstractVector}
+            v = _jax_result(*, args, "jnp.outer(" * a.code * ", " * b.code * ")")
+            # Padded as `a .* b` is: `a` along the rows, `b` along the columns.
+            return _PyVal(v.code, v.T, v.static, v.extent, v.limit, _jax_padded_union(args))
+        end
         return _jax_result(*, args, _py_infix("@", [a.code, b.code]))
     end
     _jax_result(*, args, _py_infix("*", [a.code, b.code]))
@@ -1997,12 +2122,16 @@ _jax_function_call(ctx::_JaxContext, ::typeof(exp), args::Vector{_PyVal}) =
 # The native body's product companion computes Base's `*` (core.jl).
 _jax_function_call(ctx::_JaxContext, ::typeof(_native_mul), args::Vector{_PyVal}) =
     _jax_function_call(ctx, *, args)
-_jax_function_call(ctx::_JaxContext, ::typeof(adjoint), args::Vector{_PyVal}) =
-    _jax_result(adjoint, args, ndims(args[1].T) == 1 ? args[1].code :
-                "jnp.transpose(" * args[1].code * ")")
-_jax_function_call(ctx::_JaxContext, ::typeof(transpose), args::Vector{_PyVal}) =
-    _jax_result(transpose, args, ndims(args[1].T) == 1 ? args[1].code :
-                "jnp.transpose(" * args[1].code * ")")
+# A transposed padded matrix is padded along the swapped axes.
+for f in (adjoint, transpose)
+    @eval function _jax_function_call(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal})
+        x = args[1]
+        ndims(x.T) == 1 && return _jax_result($f, args, x.code)
+        v = _jax_result($f, args, "jnp.transpose(" * x.code * ")")
+        m = ndims(x.T) == 2 ? _jax_padded_like(x) : 0
+        _PyVal(v.code, v.T, v.static, v.extent, v.limit, (m & 1) << 1 | (m & 2) >> 1)
+    end
+end
 function _jax_function_call(ctx::_JaxContext, ::typeof(^), args::Vector{_PyVal})
     _jax_error("a matrix power has no JAX translation", _jax_where(ctx))
 end
@@ -2032,20 +2161,28 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal
         x = args[1]
         return _PyVal("jnp.sum(jnp.where(" * _jax_mask(x) * ", " * x.code * ", 0.0))", eltype(x.T))
     end
+    # A padded array of rank two or more: its valid entries, along each
+    # padded axis.
+    length(args) == 1 && !isempty(args[1].extent) && _jax_is_array(args[1].T) &&
+        !_jax_ragged(args[1].T) &&
+        return _PyVal("jnp.sum(" * _jax_padded_reduced(ctx, sum, args[1], "0.0") * ")",
+                      eltype(args[1].T))
     length(args) == 1 && return _jax_result(sum, args, "jnp.sum(" * args[1].code * ")")
     length(args) == 2 && _jax_is_array(args[2].T) || _jax_error("this `sum` call", _jax_where(ctx))
     mapped = _jax_broadcast(ctx, _jax_function_of(args[1]), [args[2]])
-    # `f` of a padded vector's padding is not part of the sum.
-    masked = _jax_ragged(args[2].T) ? mapped : _PyVal(mapped.code, mapped.T, false, args[2].extent)
-    _PyVal("jnp.sum(" * _jax_masked(masked, "0") * ")", eltype(mapped.T))
+    # `f` of a padded array's padding is not part of the sum.
+    _jax_ragged(args[2].T) && return _PyVal("jnp.sum(" * _jax_masked(mapped, "0") * ")",
+                                            eltype(mapped.T))
+    masked = _PyVal(mapped.code, mapped.T, false, args[2].extent, "", _jax_padded_axes(args[2]))
+    _PyVal("jnp.sum(" * _jax_padded_reduced(ctx, sum, masked, "0") * ")", eltype(mapped.T))
 end
 for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp.inf"),
                            (minimum, "jnp.min", "jnp.inf"))
     @eval function _jax_function_call(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal})
         length(args) == 1 || _jax_error("this `", $f, "` call", _jax_where(ctx))
         x = args[1]
-        isempty(x.extent) || return _PyVal($name * "(jnp.where(" * _jax_mask(x) * ", " * x.code *
-                                           ", " * $neutral * "))", eltype(x.T))
+        isempty(x.extent) || return _PyVal($name * "(" * _jax_padded_reduced(ctx, $f, x, $neutral) *
+                                           ")", eltype(x.T))
         _jax_result($f, args, $name * "(" * x.code * ")")
     end
 end
@@ -2121,7 +2258,26 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(vec), args::Vector{_PyVal
     x = only(args)
     (_jax_rank(x.T) == 1 || _jax_ragged(x.T)) && return x
     _jax_is_array(x.T) || _jax_error("`vec` of a `", x.T, "`", _jax_where(ctx))
-    _PyVal("jnp.ravel(" * x.code * ", order=\"F\")", Vector{eltype(x.T)})
+    E = eltype(x.T)
+    isempty(x.extent) && return _PyVal("jnp.ravel(" * x.code * ", order=\"F\")", Vector{E})
+    # An adjoint vector is stored as its vector, padded alike.
+    _jax_adjoint_vector(x.T) && return _PyVal(x.code, Vector{E}, false, x.extent)
+    # A padded array: its valid entries first, in Julia's column-major order
+    # (a stable sort on validity), the number of them the extent, and the
+    # last of them repeated as the padding, as a padded vector's is.
+    _jax_padded_axes(x) == 0 && _jax_error("`vec` of a padded `", x.T,
+        "` whose padded axes are not known", _jax_where(ctx))
+    x = _jax_bind!(ctx, :padded, x)
+    valid = _jax_fresh(ctx, :valid)
+    _jax_emit!(ctx, valid * " = jnp.ravel(jnp.broadcast_to(" * _jax_padded_mask(x) * ", " *
+                    x.code * ".shape), order=\"F\")")
+    count = _jax_fresh(ctx, :count)
+    _jax_emit!(ctx, count * " = jnp.sum(" * valid * ")")
+    entries = _jax_fresh(ctx, :entries)
+    _jax_emit!(ctx, entries * " = jnp.ravel(" * x.code * ", order=\"F\")[jnp.argsort(" *
+                    "jnp.logical_not(" * valid * "), stable=True)]")
+    _PyVal("jnp.where(jnp.arange(" * entries * ".shape[0]) < " * count * ", " * entries * ", " *
+           entries * "[" * count * " - 1])", Vector{E}, false, count)
 end
 # Julia reshapes in column-major order. A `Colon` dimension (`reshape(v, 1, :)`)
 # is the remaining length, NumPy's `-1`. The dimensions may be one tuple
@@ -2155,8 +2311,8 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(LogExpFunctions.logsumexp
     # static values, never differentiated, keep SciPy's.
     name = !x.static && ctx.host === nothing ?
         _jax_helper!(ctx, "_rk_logsumexp", _JAX_PRELUDE["_rk_logsumexp"]) : "jsp.logsumexp"
-    isempty(x.extent) || return _PyVal(name * "(jnp.where(" * _jax_mask(x) * ", " * x.code *
-                                       ", -jnp.inf))", eltype(x.T))
+    isempty(x.extent) || return _PyVal(name * "(" * _jax_padded_reduced(ctx, LogExpFunctions.logsumexp,
+                                                                     x, "-jnp.inf") * ")", eltype(x.T))
     _jax_result(LogExpFunctions.logsumexp, args, name * "(" * x.code * ")")
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(length), args::Vector{_PyVal})
@@ -2228,7 +2384,8 @@ for (f, name) in ((trunc, "jnp.trunc"), (floor, "jnp.floor"), (ceil, "jnp.ceil")
             return _jax_traceable_or_lowered(ctx, $f, args)
         x = args[2]
         _PyVal("jnp.asarray(" * $name * "(" * x.code * "), dtype=" * _jax_dtype(T) * ")",
-               _jax_is_array(x.T) ? Array{T,ndims(x.T)} : T, false, x.extent)
+               _jax_is_array(x.T) ? Array{T,ndims(x.T)} : T, false, x.extent, "",
+               _jax_padded_like(x))
     end
 end
 _jax_call_positional(ctx::_JaxContext, ::typeof(typeassert), args::Vector{_PyVal}) = args[1]
@@ -2509,7 +2666,7 @@ function _jax_call_positional(ctx::_JaxContext, J::LinearAlgebra.UniformScaling,
     np = ctx.host === nothing ? "jnp." : "np."
     code = np * "eye(" * size * ")"
     J.λ == true || (code = _py_infix("*", [_jax_literal(J.λ).code, code]))
-    _PyVal(code, typeof(J(1)), false, extent)
+    _PyVal(code, typeof(J(1)), false, extent, "", isempty(extent) ? 0 : 3)
 end
 
 # A Julia type called as a function: a conversion.
@@ -2534,7 +2691,7 @@ function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
        args[1].T <: AbstractVector{<:Number}
         v = only(args)
         return _PyVal("jnp.diag(" * v.code * ")", LinearAlgebra.Diagonal{eltype(v.T),v.T}, false,
-                      v.extent)
+                      v.extent, "", isempty(v.extent) ? 0 : 3)
     end
     if T <: AbstractArray && !isempty(args) && args[1].T === UndefInitializer
         dims = args[2:end]
@@ -2574,7 +2731,7 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
     if f isa Type && f <: Number && length(args) == 1
         x = only(args)
         return _PyVal("jnp.asarray(" * x.code * ", dtype=" * _jax_dtype(f) * ")",
-                      R == 0 ? f : Array{f,R}, false, x.extent)
+                      R == 0 ? f : Array{f,R}, false, x.extent, "", _jax_padded_like(x))
     end
     padded = map(args) do a
         r = _jax_rank(a.T)
@@ -2586,14 +2743,16 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
     T = R == 0 ? E : Array{E,R}
     scalars = [_PyVal(p.code, eltype_or_self(p.T)) for p in padded]
     v = _jax_elementwise_call(ctx, f, scalars)
-    v === nothing || return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args))
+    v === nothing || return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args), "",
+                                   _jax_broadcast_padded(args, R))
     if haskey(_JAX_INFIX, f) || f === (*) || f === (^) ||
        _jax_elementwise_name(ctx, f, scalars) !== nothing
         v = f === (*) ? _PyVal(_py_infix("*", [p.code for p in padded]), E) :
             f === (^) ? _PyVal(_py_infix("**", [padded[1].code, padded[2].code]), E) :
             _jax_scalar_or_elementwise(ctx, f, scalars)
         v === nothing && _jax_error("broadcasting `", f, "`", _jax_where(ctx))
-        return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args))
+        return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args), "",
+                      _jax_broadcast_padded(args, R))
     end
     # A function of each vector of a padded vector of vectors (`Diagonal.(rows)`
     # of a ragged plate's per-cell arguments) maps over the rows, each a padded
@@ -2630,7 +2789,7 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
     ctx.host === nothing || return _PyVal("np.vectorize(" * name * ", otypes=[" *
         _host_dtype(E) * "])(" * _jax_args(padded) * ")", T)
     _PyVal("jnp.vectorize(" * name * ")(" * _jax_args(padded) * ")", T, false,
-           R == 0 ? "" : _jax_extent(args))
+           R == 0 ? "" : _jax_extent(args), "", _jax_broadcast_padded(args, R))
 end
 
 # A dotted literal power in lowered code, `broadcasted(literal_pow, ^, x,
@@ -2643,7 +2802,7 @@ function _jax_broadcast(ctx::_JaxContext, f::typeof(Base.literal_pow), args::Vec
     R = _jax_rank(x.T)
     E = _jax_return_type(^, Any[_jax_eltype(x.T), typeof(n)])
     _PyVal(_py_infix("**", [x.code, string(n)]), R == 0 ? E : Array{E,R}, false,
-           R == 0 ? "" : x.extent)
+           R == 0 ? "" : x.extent, "", _jax_padded_like(x))
 end
 
 # A module-level Python function computing `f` on scalars of `types`.
@@ -3151,7 +3310,7 @@ function _jax_define!(ctx::_JaxContext, g::Graph, v::Value, val::_PyVal; bind::B
     if bind
         name = _jax_fresh(ctx, v.name)
         _jax_emit!(ctx, name * " = " * val.code)
-        val = _PyVal(name, val.T, val.static, val.extent, val.limit)
+        val = _PyVal(name, val.T, val.static, val.extent, val.limit, val.padded)
     end
     ctx.scope.values[id] = val
     val

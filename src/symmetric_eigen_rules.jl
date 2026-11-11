@@ -13,7 +13,7 @@
 # output authors the primal plus its forward (JVP) and reverse (VJP)
 # branches, and `derivative_rule` generates the owned callable plus every
 # AD-protocol adapter from that graph's cuts. No hand-written rule, no rule
-# on a foreign function (see `docs/src/constraints.md`). Each rule's primal
+# on a foreign function (see `CONTRIBUTING.md`). Each rule's primal
 # calls LAPACK once; the `ccall` itself is never differentiated.
 #
 # Mathematics (symmetric-eigenvalue perturbation theory, e.g. Giles 2008,

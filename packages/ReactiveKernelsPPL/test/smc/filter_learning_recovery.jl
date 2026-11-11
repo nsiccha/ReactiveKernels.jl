@@ -159,7 +159,7 @@ end
         window_length=24,ess_fraction=0.5,
         options=SMCOptions(stepsize=0.35,moves=2,max_tree_depth=1))
     # Equal weights on 32 copies of each of two values: member ESS reads 64,
-    # but only two parameter values carry the weight (AP3's collapse signature).
+    # but only two parameter values carry the weight (a collapsed cloud's signature).
     positions=reshape(repeat([0.9,1.1];inner=32),1,:)
     s=cloud(s,positions)
     next=filter_step(s,(;y=1.0))

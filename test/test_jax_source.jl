@@ -696,6 +696,37 @@ end
     total = sum(lp)
     return total
 end
+# Reductions of padded matrices (snag jax-source-sum-c-bcfa9d53). A ragged
+# row after a scalar, broadcast against a row of means, pads the first axis of
+# the matrix (a mixture law over a feature vector of any length); reductions
+# along it read the row's entries only, along the other axis they keep it.
+@kernel jax_padded_matrix_axes(m::Vector{Float64}, Y::Vector{Vector{Float64}}, c::Float64) = begin
+    lp = plate(Y, Ref(m), Ref(c)) do y, ms, cs
+        x = vcat(cs, y)
+        cell = -0.5 .* (x .- ms') .^ 2 .- log.(1.5 .+ ms')
+        score = vec(sum(cell; dims = 1))
+        peak = maximum(score)
+        rows = vec(maximum(cell; dims = 2))
+        flat = vec(cell)
+        least = minimum(cell; dims = 1)
+        across = sum(cell'; dims = 1)
+        peak + log(sum(exp.(score .- peak))) + sum(rows) + sum(flat .* flat[end]) +
+            sum(least) + sum(across) + sum(cell) + maximum(cell) + sum(abs2, cell)
+    end
+    total = sum(lp)
+    return total
+end
+# An outer product of a padded vector with itself is padded along both axes.
+@kernel jax_padded_matrix_outer(a::Float64, Y::Vector{Vector{Float64}}) = begin
+    lp = plate(Y, Ref(a)) do y, as
+        x = as .* y
+        xx = x * x'
+        rows = prod(xx ./ 2 .+ 1; dims = 2)
+        sum(sum(xx; dims = 1)) + sum(rows) + sum(vec(xx))
+    end
+    total = sum(lp)
+    return total
+end
 # A gather through a ragged row beside a whole axis would pad an inner axis.
 @kernel jax_gather_matrix_rows(M::Matrix{Float64}, R::Vector{Vector{Int}}, b::Vector{Float64}) = begin
     lp = plate(R, Ref(M), Ref(b)) do r, Ms, bs
@@ -1703,6 +1734,35 @@ end
                     jax_source(jax_ragged_row_sums; have = (:a, :Y), want = :total, data = (; Y)))
             prep = occursin("def prepare_data", string(src))
             r = rk_jax_evaluate(src, "kernel", (0.7, Y); grad = true, prepare = prep)
+            @test r.value ≈ native(0.7, Y) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), Y), [0.7])) rtol = 1e-6
+        end
+    end
+end
+
+@testset "jax_source: reductions of padded matrices along their padded axes" begin
+    # Snag jax-source-sum-c-bcfa9d53: `sum(cell; dims = 1)` of a matrix padded
+    # along its first axis raised, and a whole `sum(cell)` read the padding.
+    text = string(jax_source(jax_padded_matrix_axes; have = (:m, :Y, :c), want = :total))
+    @test occursin("jnp.sum(jnp.where((jnp.arange(", text)
+    @test occursin("stable=True", text)
+    # No two entries tie in a `maximum` or `minimum` (a kink, whose finite
+    # difference averages the two sides).
+    m = [0.3, -0.8, 1.05]
+    if !rk_jax_available()
+        @test_skip false
+    else
+        # Rows of different lengths, and an empty row (the matrix is the
+        # scalar's row alone).
+        for Y in ([[0.5, 1.0], [2.0], [0.1, 0.2, 0.3]], [[0.5, 1.0], Float64[], [-0.4]])
+            native = prepare(jax_padded_matrix_axes; have = (:m, :Y, :c), want = :total)
+            src = jax_source(jax_padded_matrix_axes; have = (:m, :Y, :c), want = :total)
+            r = rk_jax_evaluate(src, "kernel", (m, Y, 0.2); grad = true)
+            @test r.value ≈ native(m, Y, 0.2) rtol = 1e-12
+            @test r.grad ≈ rk_fd_gradient(u -> native(u, Y, 0.2), m) rtol = 1e-6 atol = 1e-9
+            native = prepare(jax_padded_matrix_outer; have = (:a, :Y), want = :total)
+            src = jax_source(jax_padded_matrix_outer; have = (:a, :Y), want = :total)
+            r = rk_jax_evaluate(src, "kernel", (0.7, Y); grad = true)
             @test r.value ≈ native(0.7, Y) rtol = 1e-12
             @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), Y), [0.7])) rtol = 1e-6
         end

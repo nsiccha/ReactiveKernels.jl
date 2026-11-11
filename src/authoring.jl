@@ -4007,7 +4007,7 @@ end
 #
 # Only strict positions are entered: a branch, short-circuit, generator,
 # closure, `let` or macro call keeps its own evaluation, so a node never runs
-# where the authored expression would not (docs/src/constraints.md, "Preserve
+# where the authored expression would not (CONTRIBUTING.md, "Preserve
 # lazy branches"); its whole enclosing call can still be a node. A dotted call
 # keeps its nested dotted calls fused; its eager operands can be nodes. The
 # decomposition is a function of the expression and its argument names alone,
