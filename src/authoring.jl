@@ -3492,11 +3492,13 @@ function _record_source_method(def)
 end
 
 """
-    _traceable_source(::Type{typeof(f)}, argument_types...) -> (names, body, module, signature) or nothing
+    _traceable_source(::Type{typeof(f)}, argument_types...) -> (names, body, module, signature, statics) or nothing
 
 The authored source of the `@traceable` method of `f` that arguments of
 `argument_types` call: its formal names, its body, the module the body's
-globals resolve in, and the method's signature type. Source-reading compilers
+globals resolve in, the method's signature type, and its `where` parameters as
+those types bind them (a named tuple; `nothing` for one they leave unbound),
+for a body that reads one (`exp(k * x)` of a `::Val{k}`). Source-reading compilers
 (`jax_source`) translate the helper from it. A more specific plain method of
 `f` is the one native execution calls; comparing its `which(...).sig` with the
 signature tells the two apart. `nothing` for a function without a
@@ -3512,9 +3514,13 @@ function _traceable_source_method(callee, formals, wheres, body, mod)
     params = Any[]
     names = Symbol[]
     bounds = Any[]
-    for formal in formals
+    for (k, formal) in enumerate(formals)
         formal isa Symbol && (push!(params, :(::Type)); push!(names, formal);
                               push!(bounds, GlobalRef(Core, :Any)); continue)
+        # An unnamed formal (`::typeof(exp)`, a method selected by an argument
+        # it never reads) takes a placeholder name.
+        formal isa Expr && formal.head === :(::) && length(formal.args) == 1 &&
+            (formal = Expr(:(::), Symbol("_unnamed_", k), formal.args[1]))
         formal isa Expr && formal.head === :(::) && length(formal.args) == 2 &&
             formal.args[1] isa Symbol || return Any[]
         push!(params, Expr(:(::), Expr(:curly, :Type, Expr(:<:, formal.args[2]))))
@@ -3533,8 +3539,16 @@ function _traceable_source_method(callee, formals, wheres, body, mod)
         method_type = Expr(:where, method_type, layer...)
     end
     held = gensym(:traceable_signature)
+    statics = Any[]
+    for layer in wheres, parameter in layer
+        parameter isa Expr && parameter.head in (:<:, :>:) && (parameter = parameter.args[1])
+        parameter isa Symbol || continue
+        push!(statics, Expr(:(=), parameter,
+                            Expr(:if, Expr(:isdefined, parameter), parameter, nothing)))
+    end
     Any[Expr(:const, Expr(:(=), held, method_type)),
-        Expr(:(=), signature, Expr(:tuple, QuoteNode(Tuple(names)), QuoteNode(body), mod, held))]
+        Expr(:(=), signature, Expr(:tuple, QuoteNode(Tuple(names)), QuoteNode(body), mod, held,
+                                   Expr(:tuple, statics...)))]
 end
 
 # The body with its tail-position `return`s replaced by their values, as a

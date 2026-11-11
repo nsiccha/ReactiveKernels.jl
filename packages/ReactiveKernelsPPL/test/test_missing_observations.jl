@@ -217,6 +217,28 @@ end
     end
 end
 
+# A response whose type admits `missing` has its presence mask however many
+# entries are missing, none included, and a guarded plate argument reads that
+# mask as data, never as a constant spliced into the program (todo 1lg85rv;
+# constraints: keep numeric values out of generated programs). One program
+# then serves every absence pattern.
+@testset "presence is a data column whatever the absence pattern" begin
+    for y in (Union{Missing,Float64}[0.1, 0.2, 0.4], Union{Missing,Float64}[0.1, missing, 0.4])
+        fx = _missing_fixture(y; plate=true)
+        @test fx.bound.columns[:_rkppl_present_y] == .!ismissing.(y)
+        exprs, derived = ReactiveKernelsPPL._definition_exprs(fx.bound)
+        guarded = [ReactiveKernelsPPL._guard_missing_observation_argument(k, ex, fx.bound,
+                       fx.bound.columns) for (k, ex) in exprs if k in derived]
+        @test any(g -> occursin("_rkppl_present_y", string(g)), guarded)
+        @test !any(g -> occursin("QuoteNode", string(g)), guarded)
+        value, gradient = sampler_value_and_gradient!(fx.sampler, similar(fx.u), fx.u)
+        @test value ≈ fx.oracle(fx.u)
+        @test gradient ≈ _missing_fd(fx.oracle, fx.u) rtol=1e-5 atol=1e-8
+    end
+    # A response with no `missing` in its type has no mask.
+    @test !haskey(_missing_fixture([0.1, 0.2, 0.4]; plate=true).bound.columns, :_rkppl_present_y)
+end
+
 @testset "presence guards use ordinary response family code" begin
     for kind in (:binomial, :bernoulli, :beta, :stopping, :invalid_missing_scale)
         fx = _missing_family_fixture(kind)

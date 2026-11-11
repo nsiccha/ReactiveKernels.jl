@@ -176,17 +176,21 @@ const _JAX_RESERVED = Set{String}(split("""
     range sum min max abs str int float bool print type object id iter next map zip
     all any round pow filter sorted set""" ))
 
-# One Python function body under construction.
+# One Python function body under construction. `links` maps an input of a
+# nested plan (a branch arm's, a plate cell's unmapped argument) to the
+# `(plan, value)` of the enclosing plan it is the same value as, so the
+# stable rewrites find that value's definition (`_jax_stable_definition`).
 mutable struct _JaxScope
     lines::Vector{String}
     indent::Int
     used::Set{String}
     values::Dict{ValueId,_PyVal}
     parent::Union{Nothing,_JaxScope}
+    links::Dict{ValueId,Any}
 end
 _JaxScope(parent::Union{Nothing,_JaxScope} = nothing) =
     _JaxScope(String[], 1, parent === nothing ? Set{String}() : copy(parent.used),
-              Dict{ValueId,_PyVal}(), parent)
+              Dict{ValueId,_PyVal}(), parent, Dict{ValueId,Any}())
 
 # The whole module: its helper definitions and module-level constants.
 mutable struct _JaxModule
@@ -1597,12 +1601,14 @@ function _jax_call_positional(ctx::_JaxContext, T::Type{<:Exception}, args::Vect
     _PyVal(message, T, true)
 end
 
-# String interpolation, as Python string concatenation.
-function _jax_expr(ctx::_JaxContext, ::Val{:string}, ex)
-    parts = [_jax_expr(ctx, a) for a in ex.args]
+# String calls and interpolation share the same translation, including in
+# exception messages. Do not lower `string` into Julia's printing machinery.
+function _jax_call_positional(ctx::_JaxContext, ::typeof(string), parts::Vector{_PyVal})
     _PyVal("\"\".join([" * join(("str(" * p.code * ")" for p in parts), ", ") * "])",
            String, all(p -> p.static, parts))
 end
+_jax_expr(ctx::_JaxContext, ::Val{:string}, ex) =
+    _jax_call_positional(ctx, string, _PyVal[_jax_expr(ctx, a) for a in ex.args])
 _jax_expr(ctx::_JaxContext, ::Val{:elseif}, ex) = _jax_expr(ctx, Val(:if),
     Expr(:if, ex.args[1] isa Expr && ex.args[1].head === :block ?
          ex.args[1].args[end] : ex.args[1], ex.args[2:end]...))
@@ -1846,6 +1852,8 @@ const _JAX_ELEMENTWISE = Dict{Any,String}(
     LogExpFunctions.xlogy => "jsp.xlogy",
     LogExpFunctions.xlog1py => "jsp.xlog1py",
     LogExpFunctions.log1mexp => "_rk_log1mexp",
+    LogExpFunctions.loglogistic => "jax.nn.log_sigmoid",
+    LogExpFunctions.log1mlogistic => "_rk_log1mlogistic",
     _native_exp => "jnp.exp",
     sinpi => "_rk_sinpi", cospi => "_rk_cospi",
 )
@@ -1865,6 +1873,11 @@ const _JAX_BINARY_NAMES = Dict{Any,String}(atan => "jnp.arctan2", hypot => "jnp.
 # Small helpers the emitted module defines when it uses them: stable forms of
 # LogExpFunctions functions whose `jax.numpy` spelling is not one call.
 const _JAX_PRELUDE = Dict{String,String}(
+    "_rk_log1mlogistic" => """
+def _rk_log1mlogistic(x):
+    # log(1 - logistic(x)) (LogExpFunctions.log1mlogistic).
+    return -jax.nn.softplus(x)
+""",
     # `_tie_exact_logaddexp` (src/codegen.jl) as JAX selections, so ordinary
     # `jax.grad` gives its derivatives: (1/2, 1/2) at a finite tie, and at an
     # infinite tie, whose value is `x`, (1, 0). `jnp.logaddexp` has the
@@ -2252,6 +2265,138 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(hvcat), args::Vector{_PyV
     code = np * "array([" * join(("[" * join((x.code for x in r), ", ") * "]" for r in rows), ", ") * "])"
     _PyVal(code, Matrix{promote_type((x.T for x in xs)...)}, all(x -> x.static, xs))
 end
+
+# A recipe's computation through RK's stable algebraic rewrites
+# (`stable_rewrites.jl`, on unless `simplify = false`), as native preparation
+# rewrites its inlined body: the same rule catalogue, over the recipe's
+# expression. Each input that a single-output recipe of this plan computed is
+# bound to that recipe's expression, so a composition across statements
+# (`v = exp(a)` read as `log(v)`) is found as native finds it, and the
+# rewrite reads the producer's operand where this scope holds it. Returns the
+# rewritten expression with the names and values it reads (the producers'
+# operands appended) and the module its free names resolve in, or `nothing`
+# when no rule applies. The helpers a rewrite introduces translate from their
+# recorded sources.
+function _jax_stable_rewrite(ctx::_JaxContext, p::Plan, recipe::Recipe, inputs)
+    _simplify() || return nothing
+    view = _jax_stable_view(recipe)
+    view === nothing && return nothing
+    # A function's call over its inputs composes only with their definitions.
+    _jax_stable_rewrite(ctx, p, view, recipe.inputs, inputs; alone = !(recipe.op isa Function))
+end
+# The same for expression `view.expr` over the values `operands` of plan `p`
+# (Python values `inputs`), named `view.names`: a recipe's, or a lazy arm's
+# expression over its branch's operands. `alone`: whether the expression can
+# be rewritten without definitions.
+function _jax_stable_rewrite(ctx::_JaxContext, p::Plan, view, operands, inputs; alone::Bool)
+    params = Symbol[view.names...]
+    values = _PyVal[inputs...]
+    definitions = Dict{Symbol,Any}()
+    for (name, v) in zip(view.names, operands)
+        # A parameter the source assigns again has no single definition.
+        name in view.assigned && continue
+        d = _jax_stable_definition(ctx, p, v, length(definitions) + 1)
+        d === nothing && continue
+        definitions[name] = d[1]
+        append!(params, d[2])
+        append!(values, d[3])
+    end
+    alone || !isempty(definitions) || return nothing
+    ast = Expr(:->, Expr(:tuple, params...), Expr(:block, view.expr))
+    rewritten = _stable_rewrites(ast, (), definitions)
+    rewritten === ast && return nothing
+    body = rewritten.args[2]
+    body = length(body.args) == 1 ? only(body.args) : body
+    (expr = _jax_unqualify(body, view.mod, view.assigned, view.names), names = params,
+     values = values, mod = view.mod)
+end
+
+# A recipe's computation as the stable rewrites read it: its expression, the
+# names it reads its inputs by (one per input, in order), the names it assigns
+# itself and the module its free names resolve in; else `nothing`. A source
+# operation's expression is its source, each called name qualified in that
+# module, so a rule matches the function the name means there (a module's own
+# `log` is not `Base.log`). A function operation's (the statement
+# `total = log(v)`) is the call of that function over its inputs.
+function _jax_stable_view(recipe::Recipe)
+    op = recipe.op
+    if op isa _KernelSourceOp
+        _has_source(recipe) && recipe.source isa Expr || return nothing
+        names = _recipe_source_names(recipe)
+        length(names) == length(recipe.inputs) || return nothing
+        return _jax_stable_view(recipe.source, names, _jax_source_module(op))
+    elseif op isa Function
+        names = Symbol[Symbol("#input#", i) for i in eachindex(recipe.inputs)]
+        return (expr = Expr(:call, op, names...), names = names, assigned = Set{Symbol}(),
+                mod = @__MODULE__)
+    end
+    nothing
+end
+
+# Source expression `ex` over `names` in module `mod`, as above.
+function _jax_stable_view(ex, names, mod::Module)
+    assigned = Set{Symbol}(keys(_rw_count!(Dict{Symbol,Int}(), ex)))
+    expr = _jax_qualify_callees(ex, mod, union(Set{Symbol}(names), assigned))
+    (expr = expr, names = names, assigned = assigned, mod = mod)
+end
+
+# The expression that computed `v`, when a single-output recipe of `p` with a
+# view (`_jax_stable_view`) did and this scope holds that recipe's inputs: its
+# input names renamed apart (the `k`-th definition), with those names and
+# their values; else `nothing`. A source operation's lazy branch or split is no
+# definition. An input of a nested plan (an arm's, a cell's unmapped argument)
+# is the enclosing plan's value it is linked to, whose operands the nested
+# Python function reads as a closure.
+function _jax_stable_definition(ctx::_JaxContext, p::Plan, v::Value, k::Int)
+    r = get(p.producer, canon_id(p.graph, v.id), nothing)
+    if r === nothing
+        link = _jax_link(ctx, p.graph, v)
+        return link === nothing ? nothing : _jax_stable_definition(ctx, link[1], link[2], k)
+    end
+    r isa Recipe && length(r.outputs) == 1 || return nothing
+    r.op isa _KernelSourceOp && !(r.op.f isa _KernelSource) && return nothing
+    view = _jax_stable_view(r)
+    view === nothing && return nothing
+    values = _PyVal[]
+    for u in r.inputs
+        val = _jax_find(ctx, p.graph, u)
+        val === nothing && return nothing
+        push!(values, val)
+    end
+    fresh = Symbol[Symbol("#stable_definition#", k, "#", i) for i in eachindex(view.names)]
+    _rw_substitute(view.expr, Dict{Symbol,Any}(zip(view.names, fresh))), fresh, values
+end
+
+# `ex` with each called name (`f(x)`, `f.(x)`) that `bound` does not bind
+# qualified in `mod`, so the rewrite matches the function the source calls.
+function _jax_qualify_callees(ex, mod::Module, bound)
+    ex isa Expr || return ex
+    (ex.head in _RW_OPAQUE || ex.head in _RW_CLOSURES) && return ex
+    args = Any[_jax_qualify_callees(a, mod, bound) for a in ex.args]
+    called = ex.head === :call && !isempty(args) ||
+             ex.head === :. && length(args) == 2 && args[2] isa Expr && args[2].head === :tuple
+    called && args[1] isa Symbol && !(args[1] in bound) && isdefined(mod, args[1]) &&
+        (args[1] = GlobalRef(mod, args[1]))
+    Expr(ex.head, args...)
+end
+# The rewritten source as the translation reads it: a name of `mod` that the
+# source does not bind itself is spelled bare again (the translation resolves
+# it in `mod`, and reads some calls, such as a range's `:`, by their spelling).
+_jax_unqualify(ex, mod::Module, assigned, names) =
+    _jax_unqualify(ex, mod, union(Set{Symbol}(names), assigned))
+function _jax_unqualify(ex, mod::Module, bound::Set{Symbol})
+    ex isa GlobalRef && return ex.mod === mod && !(ex.name in bound) ? ex.name : ex
+    ex isa Expr && !(ex.head in _RW_OPAQUE || ex.head in _RW_CLOSURES) || return ex
+    Expr(ex.head, Any[_jax_unqualify(a, mod, bound) for a in ex.args]...)
+end
+# RK's tie-exact `logsumexp` of a stable rewrite (`_rk_log_sum_of`), as
+# `LogExpFunctions.logsumexp` translates.
+_jax_function_call(ctx::_JaxContext, ::typeof(_rk_logsumexp), args::Vector{_PyVal}) =
+    _jax_function_call(ctx, LogExpFunctions.logsumexp, args)
+# `_rw_float(xs...)`: the float type of the operands' promotion, known while
+# emitting.
+_jax_function_call(ctx::_JaxContext, ::typeof(_rw_float), args::Vector{_PyVal}) =
+    _PyVal("None", Type{float(promote_type((a.T for a in args)...))}, true)
 
 # `merge(a, b)` of named tuples (tuples of their fields, in order): each
 # field of the merged type from the last argument that has it.
@@ -2997,17 +3142,31 @@ _jax_call_positional(ctx::_JaxContext, c::_KernelPreparedChild, args::Vector{_Py
 # supplies: its authored body over the arguments, as the compiled
 # path reads it. Its locals are scoped to the call.
 function _jax_traceable_call(ctx::_JaxContext, f, args::Vector{_PyVal})
-    types = Any[a.T for a in args]
+    # A function passed as an argument dispatches on its own type (a stable
+    # rewrite's `_rk_log_of(exp, x)` selects its `::typeof(exp)` method).
+    types = Any[a.T isa _JaxCallable ? Core.Typeof(a.T.f) : a.T for a in args]
     all(T -> T isa Type, types) || return nothing
     source = _traceable_source(typeof(f), types...)
     # A method a package generates: its source from a registered provider.
     source === nothing && (source = _provided_source(f, types))
     source === nothing && return nothing
     names, body, mod = source
+    length(source) >= 5 && (body = _jax_static_parameters(body, source[5]))
     length(names) == length(args) || return nothing
     ctx.host === nothing || return _host_function_call(ctx, f, collect(Symbol, names), body, mod, args)
     v = _jax_source_expr(ctx, body, collect(Symbol, names), args, mod, nothing)
     _jax_bind!(ctx, :value, v)
+end
+
+# `body` with the `where` parameters its method's call binds (`statics`, from
+# `_traceable_source`) spliced in as values: `exp(k * float(x))` of a
+# `::Val{k}` argument reads the literal `k`. A name the body assigns stays.
+function _jax_static_parameters(body, statics)
+    isempty(statics) && return body
+    assigned = keys(_rw_count!(Dict{Symbol,Int}(), body))
+    subst = Dict{Symbol,Any}(k => v for (k, v) in pairs(statics)
+                             if v !== nothing && !(k in assigned))
+    isempty(subst) ? body : _rw_substitute(body, subst)
 end
 
 # A plain Julia helper with no translation of its own: its lowered code, when
@@ -3091,7 +3250,6 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
         x isa Core.Argument ? slots[x.n] :
         x isa Expr && x.head === :new ? _jax_lowered_new(ctx, value(x.args[1]), length(x.args)) :
         x isa GlobalRef ? _jax_global_value(ctx, getglobal(x.mod, x.name), x.name) :
-        x isa QuoteNode && x.value isa Symbol ? _PyVal(":" * String(x.value), Symbol) :
         x isa QuoteNode ? _jax_global_value(ctx, x.value, :constant) :
         x isa Number ? _jax_literal(x) :
         _jax_global_value(ctx, x, :constant)
@@ -3313,13 +3471,30 @@ _jax_call_positional(ctx::_JaxContext, c::_JaxCallable, args::Vector{_PyVal}) =
 
 # The Python value of graph value `v` in the current scope chain.
 function _jax_lookup(ctx::_JaxContext, g::Graph, v::Value)
+    val = _jax_find(ctx, g, v)
+    val === nothing && _jax_error("the value `", v.name, "` is read before it is computed")
+    val
+end
+# The `(plan, value)` of an enclosing plan that the nested plan's input `v` is
+# (`_JaxScope`'s `links`), or `nothing`.
+function _jax_link(ctx::_JaxContext, g::Graph, v::Value)
+    id = canon_id(g, v.id)
+    scope = ctx.scope
+    while scope !== nothing
+        haskey(scope.links, id) && return scope.links[id]
+        scope = scope.parent
+    end
+    nothing
+end
+# The Python value of `v` in the current scope chain, or `nothing`.
+function _jax_find(ctx::_JaxContext, g::Graph, v::Value)
     id = canon_id(g, v.id)
     scope = ctx.scope
     while scope !== nothing
         haskey(scope.values, id) && return scope.values[id]
         scope = scope.parent
     end
-    _jax_error("the value `", v.name, "` is read before it is computed")
+    nothing
 end
 
 function _jax_define!(ctx::_JaxContext, g::Graph, v::Value, val::_PyVal; bind::Bool = true)
@@ -3411,18 +3586,28 @@ _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op, inputs) =
     _jax_error("the operation `", typeof(op), "` has no JAX translation", _jax_where(ctx))
 
 # A bare function identity (`+`, `sum`, `log`): its call on the inputs.
-_jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::Function, inputs) =
-    _jax_split_outputs(ctx, recipe, _jax_call(ctx, op, inputs))
+function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::Function, inputs)
+    # A call whose operands' definitions compose with it (`log(v)` of
+    # `v = exp(a)`): the stable form native computes.
+    stable = _jax_stable_rewrite(ctx, p, recipe, inputs)
+    stable === nothing && return _jax_split_outputs(ctx, recipe, _jax_call(ctx, op, inputs))
+    _jax_split_outputs(ctx, recipe, _jax_source_expr(ctx, stable.expr, stable.names,
+                                                     stable.values, stable.mod, nothing))
+end
 
 # An operation synthesized from authored source: translate that source over
 # the recipe's inputs, named as the source names them.
 function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_KernelSourceOp, inputs)
     f = op.f
     f isa _KernelBranch && return _jax_split_outputs(ctx, recipe,
-        _jax_branch(ctx, recipe, f, inputs))
+        _jax_branch(ctx, p, recipe, f, inputs))
     _has_source(recipe) || _jax_error("a source operation without its source", _jax_where(ctx))
-    v = _jax_source_expr(ctx, recipe.source, _recipe_source_names(recipe), inputs,
-                         _jax_source_module(op), _jax_source_captures(op))
+    stable = _jax_stable_rewrite(ctx, p, recipe, inputs)
+    v = stable === nothing ?
+        _jax_source_expr(ctx, recipe.source, _recipe_source_names(recipe), inputs,
+                         _jax_source_module(op), _jax_source_captures(op)) :
+        _jax_source_expr(ctx, stable.expr, stable.names, stable.values, stable.mod,
+                         _jax_source_captures(op))
     _jax_split_outputs(ctx, recipe, v)
 end
 
@@ -3456,7 +3641,7 @@ end
 # carries its own plan (a plate cell's arm, `then_spec`/`else_spec`) is that
 # plan; otherwise the arm is its authored source. `a && b` and `a || b` are
 # lazy branches whose second operand is an arm.
-function _jax_branch(ctx::_JaxContext, recipe::Recipe, b::_KernelBranch, inputs)
+function _jax_branch(ctx::_JaxContext, p::Plan, recipe::Recipe, b::_KernelBranch, inputs)
     source = recipe.source
     names = _recipe_source_names(recipe)
     source isa Expr && source.head in (:if, :&&, :||) ||
@@ -3469,17 +3654,37 @@ function _jax_branch(ctx::_JaxContext, recipe::Recipe, b::_KernelBranch, inputs)
     # distribution's `prepared standardized` child, say).
     captures = _jax_captures(b.call)
     condition = _jax_source_expr(ctx, source.args[1], names, inputs, mod, captures)
-    arm(spec, ex) = spec isa Plan ? () -> _jax_arm_plan(ctx, spec, env) :
-        () -> _jax_source_expr(ctx, ex, names, inputs, mod, captures)
+    # Each arm input is the branch's input of its name, for the stable rewrites.
+    links = Dict{Symbol,Any}(n => (p, v) for (n, v) in zip(names, recipe.inputs)
+                             if count(==(n), names) == 1)
+    arm(spec, ex) = spec isa Plan ? () -> _jax_arm_plan(ctx, spec, env, links) :
+        () -> _jax_arm_expr(ctx, p, recipe, ex, names, inputs, mod, captures)
     _jax_conditional(ctx, condition, arm(b.then_spec, then_ex), arm(b.else_spec, else_ex))
 end
 
-# An arm's plan, its HAVE ports bound by name to the branch's arguments.
-function _jax_arm_plan(ctx::_JaxContext, p::Plan, env::Dict{Symbol,_PyVal})
+# An arm written as an expression over the branch's arguments, through the
+# stable rewrites with the branch's operands' definitions (`log1p(-p)` of
+# `p = logistic(a)` before the branch), as native rewrites a leaf arm. It runs
+# when its arm is emitted, so the rewrite reads only values computed before
+# the branch.
+function _jax_arm_expr(ctx::_JaxContext, p::Plan, recipe::Recipe, ex, names, inputs, mod,
+                       captures)
+    stable = _simplify() && ex isa Expr && length(names) == length(recipe.inputs) ?
+        _jax_stable_rewrite(ctx, p, _jax_stable_view(ex, names, mod), recipe.inputs, inputs;
+                            alone = true) : nothing
+    stable === nothing && return _jax_source_expr(ctx, ex, names, inputs, mod, captures)
+    _jax_source_expr(ctx, stable.expr, stable.names, stable.values, stable.mod, captures)
+end
+
+# An arm's plan, its HAVE ports bound by name to the branch's arguments and
+# linked to the branch's inputs (`links`, by name).
+function _jax_arm_plan(ctx::_JaxContext, p::Plan, env::Dict{Symbol,_PyVal},
+                       links::Dict{Symbol,Any} = Dict{Symbol,Any}())
     for v in p.have
         haskey(env, v.name) || _jax_error("a branch arm reads `", v.name,
                                           "`, which the branch does not pass", _jax_where(ctx))
         ctx.scope.values[canon_id(p.graph, v.id)] = env[v.name]
+        haskey(links, v.name) && (ctx.scope.links[canon_id(p.graph, v.id)] = links[v.name])
     end
     recipe = ctx.recipe
     try
@@ -3499,7 +3704,8 @@ end
 # Returns the function name, the WANT values and which of them return a length.
 function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
                              extents = fill(false, length(p.have)),
-                             statics = fill(false, length(p.have)))
+                             statics = fill(false, length(p.have)),
+                             links = fill(nothing, length(p.have)))
     name = _jax_fresh(ctx, hint)
     outer = ctx.scope
     inner = _JaxScope(outer)
@@ -3514,6 +3720,7 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
             push!(names, extent)
         end
         inner.values[canon_id(p.graph, v.id)] = _PyVal(param, types[i], statics[i], extent)
+        links[i] === nothing || (inner.links[canon_id(p.graph, v.id)] = links[i])
     end
     recipe = ctx.recipe
     ctx.scope = inner
@@ -3581,9 +3788,15 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     # value nor the gradient (measured with JAX 0.12.0.1: the batched jaxpr
     # selects `stop_gradient` inputs per arm; a vmapped `cond(x > 0, log(x), 0)`
     # at x = 0 has gradient 0, where `jnp.where` gives NaN).
+    # An unmapped argument the cell reads unchanged is the plate's input, for
+    # the stable rewrites (a law's `log(scale)` of a `scale = exp(u)` computed
+    # outside the plate).
+    cell_links = Any[!mapped[i] && !ragged[i] && cell_types[i] === v.T ? (p, recipe.inputs[i]) :
+                     nothing for (i, v) in enumerate(inputs)]
     cell, wants, with_length, cell_params = _jax_plan_function!(ctx, :cell, body, cell_types;
                                                                 extents = cell_extents,
-                                                                statics = cell_statics)
+                                                                statics = cell_statics,
+                                                                links = cell_links)
     want = only(wants)
     E = _jax_typeof(want)
     axes = String[]
@@ -4004,7 +4217,9 @@ _jax_want_names(w) = throw(ArgumentError(
 # HAVE values on the host from the other data HAVE values, before the prefix:
 # the module's `prepare_data` then takes the data those expressions read in
 # place of the values they define (a binder's data-only definitions, which
-# would otherwise be values only Julia computes). A definition without a host
+# would otherwise be values only Julia computes). A definition that reads its
+# own name refines the raw value the caller passes under that name, which the
+# definitions before it read. A definition without a host
 # translation, or one given as a `JAXEmissionError` (the reason it has none),
 # stays a `prepare_data` input, named with that reason in the module constant
 # `UNTRANSLATED`. `keep` names data-only values `prepare_data` also returns
@@ -4255,8 +4470,13 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     computed = defs === nothing ? Pair{Symbol,Any}[] :
         Pair{Symbol,Any}[d for d in defs if !haskey(untranslated, first(d)) && first(d) in needed]
     defined = Set{Symbol}(first.(computed))
-    params = Any[v for v in split.raw if !(v.name in defined)]
-    raw_types = Any[have_types[v.name] for v in params]
+    # A definition that reads its own name refines the value the caller
+    # passes under that name (`y => fill(y)`, a response whose missing entries
+    # are `None`): that raw value stays a parameter, taken as the caller gives
+    # it, and the definitions before the refinement read it.
+    refined = Set{Symbol}(n for (n, ex) in computed if n in _jax_symbols_read!(Symbol[], ex))
+    params = Any[v for v in split.raw if !(v.name in defined) || v.name in refined]
+    raw_types = Any[v.name in refined ? Any : have_types[v.name] for v in params]
     # A definition may read a raw value the caller passes that is no input of
     # the program (`_rkppl_value_r => :r`, when the program reads `r` only
     # through its bound copy): a parameter too, typed by its value in `data`.

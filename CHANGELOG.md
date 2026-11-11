@@ -16,6 +16,46 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.168
+
+- `jax_source` translates explicit `string(...)` calls through the same path
+  as string interpolation. Shape guards can build their diagnostic from
+  names and dimensions in recorded or provider-supplied helpers, including
+  host `prepare_data`; a failing guard retains its message. Symbol literals
+  in plain lowered helpers use the same Python representation as recorded
+  source.
+
+## 0.1.167
+
+- `jax_source` computes numerically fragile compositions in their stable
+  form, as native preparation does by default (`simplify = false` keeps the
+  literal arithmetic in both).
+  An authored `log(exp(a))`, `log1p(exp(a))`, `log(exp(a) + exp(b))`,
+  `log1p(-logistic(a))` and the rest of the stable rewrite table now translate to the
+  stable forms native runs, whether the composition is one expression, spans
+  statements (`v = exp(a)` followed by `log(v)`), or reaches into a lazy arm
+  or a plate's cell. The module's value
+  and `jax.grad` stay finite where `exp(a)` overflows: at a = 800,
+  `log(exp(a))` was `Inf` with a `NaN` gradient, where native gives 800.
+  The stable helpers translate from their own Julia methods, so both
+  backends read one rule catalogue. `loglogistic` and `log1mlogistic`
+  translate too (`jax.nn.log_sigmoid`, `-jax.nn.softplus`). One
+  composition native rewrites is still translated as written: a law's term
+  on a value computed outside the law (`Normal(0, s)`'s `log(s)` of
+  `s = exp(a)`).
+- `ReactiveKernels.@_record_source` records a method whose argument has no
+  name (`f(::typeof(exp), x::Real)`, a method selected by an argument it
+  never reads). It used to record nothing for such a method.
+- `jax_source` translates a `@traceable` or `@_record_source` body that reads
+  its method's `where` parameter (`exp(k * x)` of a `::Val{k}` argument): the
+  parameter is the value the call binds. It used to raise ``k is not
+  defined``.
+- `jax_source` with `data`: a definition that reads its own name refines the
+  raw value the caller passes under that name (`y => fill(y)`). That value
+  stays a `prepare_data` parameter, taken as the caller gives it, and the
+  definitions before the refinement read it. ReactiveKernelsPPL uses it for
+  a response whose missing entries the caller passes as `None`.
+
 ## 0.1.166
 
 - `jax_source` with `data`: `prepare_data` computes `axes(x)` of a data array
