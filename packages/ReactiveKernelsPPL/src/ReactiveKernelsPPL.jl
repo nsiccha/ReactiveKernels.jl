@@ -102,7 +102,8 @@ export prepare_predictive, PredictiveQuery, PredictiveLaws, predictive_laws, pre
 export prepare_discrete_latents, DiscreteLatentQuery, discrete_latents_node,
     discrete_latent_draws
 export restore_draws
-export prepare_smc, smc, initialize_smc, update_smc, smc_step, smc_checkpoint, resume_smc
+export prepare_smc, smc, initialize_smc, update_smc, smc_step, smc_checkpoint, resume_smc,
+    rescore_smc_checkpoint
 export SMCReference, SMCOptions, SMCNonfiniteError, SMCDegeneracyError, rejuvenate_smc
 export SMCTuningSchedule, SMCTuningPartial, tune_smc, smc_reference
 export SMCCarriedReference, carry_smc, prepare_smc_window

@@ -864,9 +864,8 @@ function PPL.smc_checkpoint(state::SMCState)
         target_scores=_scores(state.target, state.positions, :target, state.temperature)))
 end
 
-function PPL.resume_smc(target::AbstractSMCTarget, checkpoint; previous=nothing, nthreads=nothing)
-    nthreads === nothing || (nthreads isa Integer && nthreads >= 1) ||
-        throw(ArgumentError("nthreads must be a positive integer or nothing"))
+# Every resume guard except the endpoint-score comparison, on a private copy.
+function _checked_checkpoint(target::AbstractSMCTarget, checkpoint, previous)
     cp = deepcopy(checkpoint)
     cp.schema_version == 1 || throw(ArgumentError("unsupported SMC checkpoint schema"))
     cp.versions == _versions() || throw(ArgumentError("SMC checkpoint Julia/package versions differ"))
@@ -885,9 +884,6 @@ function PPL.resume_smc(target::AbstractSMCTarget, checkpoint; previous=nothing,
     else
         throw(ArgumentError("unknown SMC checkpoint source"))
     end
-    _scores(source, cp.positions, :source, cp.temperature) == cp.source_scores &&
-        _scores(target, cp.positions, :target, cp.temperature) == cp.target_scores ||
-        throw(ArgumentError("SMC checkpoint endpoint densities differ; rebuild with the original code and data"))
     0 <= cp.temperature <= 1 && isfinite(cp.log_normalizer) ||
         throw(ArgumentError("invalid SMC checkpoint bridge state"))
     length(cp.weights) == n && all(==(1/n), cp.weights) ||
@@ -895,6 +891,76 @@ function PPL.resume_smc(target::AbstractSMCTarget, checkpoint; previous=nothing,
     length(cp.ancestors) == length(cp.lineage) == n &&
         all(i -> 1 <= i <= n, cp.ancestors) && all(i -> 1 <= i <= n, cp.lineage) ||
         throw(ArgumentError("invalid SMC checkpoint ancestry"))
+    length(cp.source_scores) == length(cp.target_scores) == n ||
+        throw(ArgumentError("invalid SMC checkpoint endpoint scores"))
+    return cp, source, target
+end
+
+# Recompute both endpoint scores on this host and measure how far they moved
+# from the stored ones. A score's deviation is scaled as
+# |new - old| / max(|old|, 1), the quantity `rtol` bounds.
+function _score_drift(cp, source, target)
+    scores = (; source=_scores(source, cp.positions, :source, cp.temperature),
+        target=_scores(target, cp.positions, :target, cp.temperature))
+    stored = (; source=cp.source_scores, target=cp.target_scores)
+    changed, max_abs, max_rel, worst = 0, 0.0, 0.0, nothing
+    for endpoint in (:source, :target), i in eachindex(scores[endpoint])
+        old, new = stored[endpoint][i], scores[endpoint][i]
+        isequal(old, new) && continue
+        changed += 1
+        deviation = Float64(abs(new - old))
+        scaled = isfinite(deviation) ? deviation / max(abs(old), 1) : Inf
+        max_abs = max(max_abs, deviation)
+        if worst === nothing || scaled > max_rel
+            max_rel, worst = scaled, (; endpoint, particle=i, old, new)
+        end
+    end
+    return (; scores, changed, total=2length(scores.target), max_abs, max_rel, worst)
+end
+
+function _drift_message(head, drift)
+    w = drift.worst
+    return string(head, ". ", drift.changed, " of ", drift.total,
+        " stored endpoint scores differ from this host's; the largest scaled ",
+        "deviation |Δ|/max(|score|, 1) is ", drift.max_rel, " (largest |Δ| ",
+        drift.max_abs, "), at particle ", w.particle, "'s ", w.endpoint,
+        " score: ", w.old, " stored, ", w.new, " here")
+end
+
+const _RESCORE_RTOL = 1e-10
+
+function PPL.rescore_smc_checkpoint(target::AbstractSMCTarget, checkpoint;
+        previous=nothing, rtol::Real=_RESCORE_RTOL)
+    isfinite(rtol) && rtol >= 0 ||
+        throw(ArgumentError("rtol must be a finite nonnegative number"))
+    cp, source, target = _checked_checkpoint(target, checkpoint, previous)
+    drift = _score_drift(cp, source, target)
+    drift.max_rel <= rtol || throw(ArgumentError(_drift_message(
+        "SMC checkpoint endpoint densities differ by more than rtol=$(Float64(rtol)); " *
+        "rebuild with the original code and data", drift)))
+    record = (; changed=drift.changed, max_abs=drift.max_abs, max_rel=drift.max_rel,
+        rtol=Float64(rtol), cpu=Sys.CPU_NAME)
+    rescored = haskey(cp, :rescored) ? vcat(cp.rescored, [record]) : [record]
+    return merge(cp, (; source_scores=drift.scores.source,
+        target_scores=drift.scores.target, rescored))
+end
+
+function PPL.resume_smc(target::AbstractSMCTarget, checkpoint; previous=nothing, nthreads=nothing)
+    nthreads === nothing || (nthreads isa Integer && nthreads >= 1) ||
+        throw(ArgumentError("nthreads must be a positive integer or nothing"))
+    cp, source, target = _checked_checkpoint(target, checkpoint, previous)
+    d, n = size(cp.positions)
+    drift = _score_drift(cp, source, target)
+    if drift.changed > 0
+        message = _drift_message(
+            "SMC checkpoint endpoint densities differ; rebuild with the original code and data", drift)
+        drift.max_rel <= _RESCORE_RTOL && (message *= string(". This is within ",
+            "rescore_smc_checkpoint's default rtol=", _RESCORE_RTOL, ", the size of ",
+            "roundoff from a host whose CPU code generation differs from the writer's; ",
+            "`rescore_smc_checkpoint(target, checkpoint; previous)` re-anchors the ",
+            "checkpoint on this host"))
+        throw(ArgumentError(message))
+    end
     options = if nthreads === nothing
         cp.options
     else

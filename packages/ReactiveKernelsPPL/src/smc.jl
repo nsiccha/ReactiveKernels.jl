@@ -731,8 +731,14 @@ restart and pass it to `resume_smc`; a data-update checkpoint also needs the
 old prepared target as `previous`. IDs, program/layout and endpoint densities
 are checked. Queries, compiled code and AD caches are never serialized.
 Exact seeded continuation requires the same Julia/package versions, data,
-model code and configuration. This API does not write files or promise atomic
-disk persistence. The caller owns file replacement and model/data retention.
+model code and configuration, and a host whose CPU code generation matches the
+writer's. `resume_smc` recomputes every particle's log density under both
+bridge endpoints and requires the stored values bit for bit, and a different
+instruction set (AVX-512 versus AVX2, for example) can round the same density
+differently in its last bits. Such a checkpoint is refused with its largest
+deviation named; `rescore_smc_checkpoint` re-anchors it on the new host.
+This API does not write files or promise atomic disk persistence. The caller
+owns file replacement and model/data retention.
 Omitting `nthreads` preserves the saved worker cap. Pass a positive integer,
 for example `nthreads=Threads.nthreads()`, to override only that cap; actual
 workers remain bounded by available default threads and particle count.
@@ -743,3 +749,33 @@ The checkpoint itself is unchanged.
 """
 function smc_checkpoint end
 function resume_smc end
+
+"""
+    rescore_smc_checkpoint(target, checkpoint; previous=nothing, rtol=1e-10)
+
+Re-anchor an `smc_checkpoint` on this host, so `resume_smc` accepts it here.
+Use it when a checkpoint written on one host is refused on another only because
+the two compile the same log density to different machine code, whose sums
+round differently in their last bits.
+
+Every `resume_smc` check runs first: checkpoint schema, Julia/package versions,
+target and `previous` signatures, positions, weights, bridge state and
+ancestry. Both endpoint scores are then recomputed for every particle, and each
+must satisfy `abs(new - old) <= rtol * max(abs(old), 1)`; otherwise an
+`ArgumentError` names the largest deviation and its particle. `rtol=0` accepts
+only identical scores.
+
+Returns a new checkpoint carrying this host's scores and a `rescored` vector
+with one record per re-anchoring: `(; changed, max_abs, max_rel, rtol, cpu)`,
+the count of changed scores, the largest absolute and scaled deviations, the
+tolerance and `Sys.CPU_NAME`. Earlier records are kept. The input is not
+modified. Persist the result yourself; every later `resume_smc` of it on this
+host keeps the exact check. Checkpoints taken from the resumed state carry no
+record.
+
+The tolerance is the price of crossing hosts: a change to the data or model
+that moves no score by more than `rtol` relative is accepted too. Measured
+cross-host drift (AVX-512 versus AVX2) was below 4e-16 relative, and a
+one-count change in one observation moves a score by order one.
+"""
+function rescore_smc_checkpoint end
