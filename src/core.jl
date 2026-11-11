@@ -519,6 +519,8 @@ end
 # nested gather's reverse pass more than a third of the whole gradient.
 @inline _readonly_gather(array::AbstractVector, indices::AbstractVector{<:Integer}) =
     view(array, indices)
+# One position (a cell's gather read as a number): that element.
+@inline _readonly_gather(array::AbstractVector, index::Integer) = array[index]
 @inline function _readonly_gather(
         array::Union{Vector,SubArray{Float64,1,Vector{Float64},Tuple{UnitRange{Int}},true}},
         indices::Vector{Int})
