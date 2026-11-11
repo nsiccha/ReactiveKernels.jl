@@ -1597,12 +1597,14 @@ function _jax_call_positional(ctx::_JaxContext, T::Type{<:Exception}, args::Vect
     _PyVal(message, T, true)
 end
 
-# String interpolation, as Python string concatenation.
-function _jax_expr(ctx::_JaxContext, ::Val{:string}, ex)
-    parts = [_jax_expr(ctx, a) for a in ex.args]
+# String calls and interpolation share the same translation, including in
+# exception messages. Do not lower `string` into Julia's printing machinery.
+function _jax_call_positional(ctx::_JaxContext, ::typeof(string), parts::Vector{_PyVal})
     _PyVal("\"\".join([" * join(("str(" * p.code * ")" for p in parts), ", ") * "])",
            String, all(p -> p.static, parts))
 end
+_jax_expr(ctx::_JaxContext, ::Val{:string}, ex) =
+    _jax_call_positional(ctx, string, _PyVal[_jax_expr(ctx, a) for a in ex.args])
 _jax_expr(ctx::_JaxContext, ::Val{:elseif}, ex) = _jax_expr(ctx, Val(:if),
     Expr(:if, ex.args[1] isa Expr && ex.args[1].head === :block ?
          ex.args[1].args[end] : ex.args[1], ex.args[2:end]...))
@@ -3076,7 +3078,6 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
         x isa Core.Argument ? slots[x.n] :
         x isa Expr && x.head === :new ? _jax_lowered_new(ctx, value(x.args[1]), length(x.args)) :
         x isa GlobalRef ? _jax_global_value(ctx, getglobal(x.mod, x.name), x.name) :
-        x isa QuoteNode && x.value isa Symbol ? _PyVal(":" * String(x.value), Symbol) :
         x isa QuoteNode ? _jax_global_value(ctx, x.value, :constant) :
         x isa Number ? _jax_literal(x) :
         _jax_global_value(ctx, x, :constant)

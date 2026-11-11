@@ -2177,3 +2177,95 @@ register_source_provider!(jax_test_provider)
     @test_throws "as `Symbol`s" TraceableSource(("x",), :x, @__MODULE__)
     @test_throws "the argument name `x` twice" TraceableSource((:x, :x), :x, @__MODULE__)
 end
+
+# Shape guards must translate their diagnostics without descending into
+# Julia's printing internals (snag jax-dimension-gu-a59f4726). Keep the guard
+# inside a helper, as generated source providers and ordinary callers do.
+@traceable function jax_test_check_dimension(x::Matrix{Float64}, axis::Int,
+                                           expected::Int, fname::Symbol, argname::Symbol)
+    actual = size(x, axis)
+    actual == expected || throw(DimensionMismatch(
+        string(fname, ": ", argname, " dimension ", axis, " is ", actual, ", expected ", expected)))
+    nothing
+end
+
+@traceable function jax_test_guarded_sum(x::Matrix{Float64})
+    jax_test_check_dimension(x, 1, 2, :guarded_sum, :x)
+    sum(x)
+end
+
+@kernel jax_dimension_guard(x::Matrix{Float64}) = begin
+    result = jax_test_guarded_sum(x)
+    return result
+end
+
+# A plain helper's lowered call and a provider's structured body reach the
+# same string translation. The expected dimension comes from another input.
+jax_test_dimension_message(actual, expected) =
+    string(:guarded_sum, ": x has ", actual, " rows, expected ", expected)
+@jax_test_generate function jax_test_provider_guard(x::Matrix{Float64}, reference::Matrix{Float64})
+    actual, expected = size(x, 1), size(reference, 1)
+    actual == expected || throw(DimensionMismatch(jax_test_dimension_message(actual, expected)))
+    sum(x)
+end
+
+@kernel jax_dimension_prep(a::Float64, x::Matrix{Float64}) = begin
+    checked = jax_test_guarded_sum(x)
+    result = a * checked
+    return result
+end
+
+@kernel jax_dimension_provider(a::Float64, x::Matrix{Float64}, reference::Matrix{Float64}) = begin
+    checked = jax_test_provider_guard(x, reference)
+    result = a * checked
+    return result
+end
+
+@testset "jax_source: string-built shape-guard diagnostics" begin
+    src = jax_source(jax_dimension_guard; have = (:x,), want = :result)
+    @test occursin("raise ValueError(", string(src))
+    @test !occursin("jax.lax.cond(", string(src))
+    native = prepare(jax_dimension_guard; have = (:x,), want = :result)
+    have = (:a, :x)
+    x = reshape(collect(1.0:6.0), 2, 3)
+    prep = jax_source(jax_dimension_prep; have, want = :result, data = (; x))
+    @test [f.name for f in prep.functions] == ["prepare_data", "kernel"]
+    try
+        JAX_PROVIDER_MODE[] = :on
+        provider = jax_source(jax_dimension_provider; have = (:a, :x, :reference), want = :result)
+        native_provider = prepare(jax_dimension_provider; have = (:a, :x, :reference), want = :result)
+        for n in (0, 1, 19)
+            data = reshape(collect(1.0:(2n)), 2, n)
+            # Neither values nor data extents are baked into the module.
+            @test string(jax_source(jax_dimension_prep; have, want = :result,
+                                    data = (; x = data))) == string(prep)
+            @test native(data) == sum(data)
+            if rk_jax_available()
+                @test rk_jax_evaluate(src, "kernel", (data,)).value == sum(data)
+                r = rk_jax_evaluate(prep, "kernel", (0.7, data); grad = true, prepare = :arguments)
+                @test r.value ≈ 0.7 * sum(data)
+                @test r.grad == sum(data)
+                # One provider module also accepts changed expected sizes
+                # and empty data, with ordinary JAX AD.
+                changed = n == 0 ? data : permutedims(data)
+                r = rk_jax_evaluate(provider, "kernel", (0.7, changed, changed); grad = true)
+                @test r.value ≈ native_provider(0.7, changed, changed)
+                @test r.grad == sum(changed)
+            end
+        end
+        bad = zeros(3, 4)
+        message = "guarded_sum: x dimension 1 is 3, expected 2"
+        @test_throws message native(bad)
+        @test_throws "guarded_sum: x has 3 rows, expected 2" native_provider(0.7, bad, x)
+        if rk_jax_available()
+            @test_throws message rk_jax_evaluate(src, "kernel", (bad,))
+            @test_throws message rk_jax_evaluate(prep, "kernel", (0.7, bad); prepare = true)
+            @test_throws "guarded_sum: x has 3 rows, expected 2" rk_jax_evaluate(
+                provider, "kernel", (0.7, bad, x))
+        else
+            @test_skip false
+        end
+    finally
+        JAX_PROVIDER_MODE[] = :off
+    end
+end
