@@ -1149,6 +1149,44 @@ end
     total = a * sum(col)
     return total
 end
+# Program-level kernels a data-only definition calls, as Julia runs it,
+# `prepare(spec)(args...)` (snag jax-source-data-ee25db34): a guarded running
+# mean, and positions among sorted levels by a plate whose cell calls a
+# `@traceable` search.
+@kernel jax_kspec_mean(values) = begin
+    mean = begin
+        isempty(values) && throw(ArgumentError("at least one value"))
+        fitted = float(values[1])
+        for count in 2:length(values)
+            fitted += float(values[count]) / count - fitted / count
+        end
+        fitted
+    end
+    return mean
+end
+@traceable function jax_kspec_position(levels, value)
+    lo, hi = 1, length(levels)
+    while lo < hi
+        mid = (lo + hi) ÷ 2
+        if levels[mid] < value
+            lo = mid + 1
+        else
+            hi = mid
+        end
+    end
+    lo
+end
+@kernel jax_kspec_positions(values, sorted_levels) = begin
+    positions = plate(values) do value
+        jax_kspec_position(sorted_levels, value)
+    end
+    return positions
+end
+@kernel jax_kspec_model(theta::Vector{Float64}, x::Vector{Float64}, xm::Float64,
+                        pos::Vector{Int}) = begin
+    total = sum(abs2, theta[1] .* (x .- xm) .+ theta[1 .+ pos])
+    return total
+end
 
 @testset "jax_source: structure" begin
     src = jax_source(jax_plate_scan; have = (:a, :y, :x, :b, :logsigma), want = :total)
@@ -1513,6 +1551,45 @@ end
         native = prepare(jax_prep_int_labels; have = (:a, :g), want = :total)
         @test rk_jax_evaluate(int_labels, "kernel", (0.5, [4, 9, 2]); prepare = true).value ≈
               native(0.5, [4, 9, 2]) rtol = 1e-12
+    end
+end
+
+# A data-only definition calling a program-level kernel (a binder's
+# `x_mean = covariate_mean(x)`): `prepare_data` computes it from the kernel's
+# plan, a host function, so the module takes only the raw data (snag
+# jax-source-data-ee25db34).
+@testset "jax_source: a data-only definition calling a program-level kernel" begin
+    x = [0.3, 1.1, 2.4, 0.8, 4.1]
+    g = [3.0, 1.0, 2.0, 3.0, 1.0]
+    levels = [1.0, 2.0, 3.0]
+    have = (:theta, :x, :xm, :pos)
+    data = (; x, xm = jax_kspec_mean(x), pos = jax_kspec_positions(g, levels), g, levels)
+    definitions = [:xm => :($jax_kspec_mean(x)), :pos => :($jax_kspec_positions(g, levels))]
+    src = jax_source(jax_kspec_model; have, want = :total, data, definitions)
+    text = string(src)
+    @test occursin("UNTRANSLATED = {}", text)
+    @test Set(first.(src.functions[1].inputs)) == Set(["x", "g", "levels"])
+    host_part = split(split(text, "def prepare_data")[2], "\ndef kernel")[1]
+    # Each kernel is a host function of its plan, named after its output.
+    @test occursin("def _mean_np(values):", text) && occursin("def _positions_np(values, sorted_levels):", text)
+    @test occursin("= _mean_np(x)", host_part) && occursin("= _positions_np(g, levels)", host_part)
+    # Called with no arguments, a kernel is a graph view (`spec()`, `extract`),
+    # not a value: the definition stays an input, with that reason.
+    view_src = jax_source(jax_kspec_model; have, want = :total, data,
+                          definitions = [:xm => :($jax_kspec_mean())])
+    @test occursin(r"UNTRANSLATED = \{\"xm\": \"the kernel .* is a graph view", string(view_src))
+    if !rk_jax_available()
+        @test_skip false
+    else
+        native = prepare(jax_kspec_model; have, want = :total)
+        theta = [0.6, 0.2, -0.4, 0.7]
+        # One module for every dataset: a second one of another length.
+        for (xs, gs) in ((x, g), ([1.5, 0.2, 3.3], [2.0, 2.0, 1.0]))
+            reference(t) = native(t, xs, jax_kspec_mean(xs), jax_kspec_positions(gs, levels))
+            r = rk_jax_evaluate(src, "kernel", (theta, xs, gs, levels); grad = true, prepare = true)
+            @test r.value ≈ reference(theta) rtol = 1e-12
+            @test r.grad ≈ rk_fd_gradient(reference, theta) rtol = 1e-6
+        end
     end
 end
 

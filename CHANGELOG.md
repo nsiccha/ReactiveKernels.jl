@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.169
+
+- `jax_source`: a call of an authored kernel (a `KernelSpec`) with positional
+  arguments is translated as Julia runs it, `prepare(spec)(args...)`: as that
+  prepared kernel, a module-level function of its plan. A data-only
+  definition calling a program-level `@kernel` (BRM's covariate anchors,
+  `x_fit_mean = brm_covariate_mean(x_fit)`) is now computed by
+  `prepare_data`, in a host function, so the module takes the raw data
+  alone. It used to be an input of `prepare_data`, listed in `UNTRANSLATED`
+  as "the function `KernelSpec(…)` has no JAX translation … or author it as
+  a kernel", although it was one. A kernel with keyword arguments or
+  defaults, or one called with no arguments (a graph view), raises a
+  `JAXEmissionError` that says so (snag `jax-source-data-ee25db34`).
+- `jax_source`: the error for a plain helper with loops or branches names
+  `@traceable` as the way to translate it, besides authoring a kernel or a
+  `ReactiveKernels._jax_function_call` method.
+
 ## 0.1.168
 
 - `jax_source` translates explicit `string(...)` calls through the same path
