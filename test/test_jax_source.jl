@@ -668,6 +668,27 @@ end
     return total
 end
 
+# A plate cell reads a shared data integer `H` beside a parameter (snag
+# jax-source-refus-206a8219): a range, an allocation and a helper's loop to
+# `H`. Each recipe reads `t`, so `prepare_data` cannot compute it; `H` is
+# known while tracing in the cell as outside it.
+@traceable function jax_shared_tail(t, x, n)
+    s = zero(t)
+    for i in 2:n
+        s += t * x[i]
+    end
+    s
+end
+@kernel jax_cell_shared_length(theta::Vector{Float64}, x::Vector{Float64}, H::Int) = begin
+    per = plate(theta, Ref(x)) do t, xs
+        g = sum(t * xs[i] for i in 2:H)
+        v = fill(t, H)
+        g + jax_shared_tail(t, xs, H) + sum(v)^2
+    end
+    total = sum(per)
+    return total
+end
+
 # A gather through a ragged integer row is padded as the row is, so the
 # cell's reduction counts its valid entries only (snag jax-ragged-index-b8420d16):
 # by the group index, by the row itself, and through `view` (the call form).
@@ -1538,6 +1559,31 @@ end
         r = rk_jax_evaluate(shared, "kernel", (theta, x); grad = true, prepare = true)
         @test r.value ≈ native(theta, x) rtol = 1e-12
         @test r.grad ≈ rk_fd_gradient(t -> native(t, x), theta) rtol = 1e-6
+    end
+end
+
+# `jax.vmap` passes the cell an argument it does not map unchanged, so the
+# `StaticInt` `H` of the prepared data is static in the cell: the range, the
+# allocation and the loop have static lengths (snag jax-source-refus-206a8219).
+@testset "jax_source: a plate cell reads a shared prepared integer as static" begin
+    x = [0.5, -1.0, 2.0, 0.25, 1.5, -0.75]
+    src = jax_source(jax_cell_shared_length; have = (:theta, :x, :H), want = :total,
+                     data = (; x, H = 5))
+    device_part = split(string(src), "\ndef kernel")[2]
+    @test occursin(r"jax\.vmap\(cell\w*, in_axes=\(0, None, None\)\)\(theta, x, H\)", device_part)
+    @test occursin(r"jnp\.arange\(2, H\w* \+ 1\)", device_part)
+    @test occursin(r"jnp\.full\(\(H\w*,\), t", device_part)
+    @test occursin(r"jax\.lax\.fori_loop\(2, H\w* \+ 1, ", device_part)
+    if !rk_jax_available()
+        @test_skip false
+    else
+        native = prepare(jax_cell_shared_length; have = (:theta, :x, :H), want = :total)
+        theta = [0.3, -0.2, 0.9]
+        for mode in (true, :arguments)
+            r = rk_jax_evaluate(src, "kernel", (theta, x, 5); grad = true, prepare = mode)
+            @test r.value ≈ native(theta, x, 5) rtol = 1e-12
+            @test r.grad ≈ rk_fd_gradient(t -> native(t, x, 5), theta) rtol = 1e-6
+        end
     end
 end
 
