@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.170
+
+- `jax_source` translates `join` and generators of values available while
+  JAX traces, including joined dimension-error diagnostics in recorded and
+  source-provider helpers. The emitted Python retains iteration, filters,
+  Julia's product iteration order and optional final delimiters. The same
+  translation supports concrete data values in host `prepare_data`.
+
 ## 0.1.169
 
 - `jax_source`: a call of an authored kernel (a `KernelSpec`) with positional

@@ -115,6 +115,7 @@ const _MATRIX_CORE_TESTS = (
     "test_input_checks.jl",
     "test_authored_loops.jl",
     "test_jax_source.jl",
+    "test_jax_join.jl",
     "test_jax_translations.jl",
     "test_scan_columns.jl",
     "test_scan_endpoint_scope.jl",

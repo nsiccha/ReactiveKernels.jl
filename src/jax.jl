@@ -793,7 +793,7 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
         k = indices[1]
         T = fieldtype(x.T, k)
         extent = isempty(x.extent) ? "" : x.extent * "[" * string(k - 1) * "]"
-        return _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", T, false,
+        return _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", T, x.static,
                       _jax_is_array(T) ? extent : "")
     end
     # A number indexed by ones is itself (`s[1, 1, 1]`, as Julia's).
@@ -1607,6 +1607,31 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(string), parts::Vector{
     _PyVal("\"\".join([" * join(("str(" * p.code * ")" for p in parts), ", ") * "])",
            String, all(p -> p.static, parts))
 end
+
+# Python strings are host values, including while JAX traces a shape guard.
+# Keep the iterable in the emitted program: its length never expands source.
+function _jax_call_positional(ctx::_JaxContext, ::typeof(join), args::Vector{_PyVal})
+    1 <= length(args) <= 3 || _jax_error("`join` expects an iterable and up to two delimiters", _jax_where(ctx))
+    foreach(a -> _jax_python_value(ctx, a), args)
+    delimiter = length(args) >= 2 ? args[2].code : "\"\""
+    values = "(str(_rk_item) for _rk_item in " * args[1].code * ")"
+    if length(args) < 3
+        return _PyVal(_py_atom(delimiter) * ".join(" * values * ")", String, true)
+    end
+    helper = _jax_helper!(ctx, "_rk_join", raw"""
+def _rk_join(items, delimiter, last):
+    parts = list(items)
+    if len(parts) < 2:
+        return delimiter.join(parts)
+    return delimiter.join(parts[:-1]) + last + parts[-1]
+""")
+    _PyVal(helper * "(" * values * ", " * delimiter * ", " * args[3].code * ")", String, true)
+end
+
+function _jax_expr(ctx::_JaxContext, ::Val{:generator}, ex)
+    element, clauses, _, _ = _host_generator(ctx, ex; column_major = true)
+    _PyVal("(" * element * " " * clauses * ")", Base.Generator, true)
+end
 _jax_expr(ctx::_JaxContext, ::Val{:string}, ex) =
     _jax_call_positional(ctx, string, _PyVal[_jax_expr(ctx, a) for a in ex.args])
 _jax_expr(ctx::_JaxContext, ::Val{:elseif}, ex) = _jax_expr(ctx, Val(:if),
@@ -2107,13 +2132,15 @@ ragged metadata, with the executable `examples/jax_translations.jl` example.
 _jax_function_call(ctx::_JaxContext, f, args::Vector{_PyVal}) =
     _jax_traceable_or_lowered(ctx, f, args)
 function _jax_traceable_or_lowered(ctx::_JaxContext, f, args::Vector{_PyVal})
+    # Recorded/provider source preserves the authored diagnostic even when
+    # Julia infers that the helper never returns.
+    v = _jax_traceable_call(ctx, f, args)
+    v === nothing || return v
     # A call Julia infers never returns is an error path (an out-of-line
     # `throw_mismatch(...)`): a Python `raise`, under the same rule as `throw`.
     if all(a -> a.T isa Type, args) && _jax_return_type(f, Any[a.T for a in args]) === Union{}
         return _jax_call(ctx, throw, [_PyVal(repr(string(nameof_or(f), " threw")), ErrorException)])
     end
-    v = _jax_traceable_call(ctx, f, args)
-    v === nothing || return v
     v = _jax_lowered_call(ctx, f, args)
     v === nothing || return v
     _jax_error("the function `", f, "` has no JAX translation for argument types (",
@@ -4715,6 +4742,7 @@ end
 
 # A returned named tuple is a `dict` keyed by its field names.
 function _jax_returned(ctx::_JaxContext, v::_PyVal)
+    v.T === Union{} && return v # an unconditional diagnostic has no returned fields
     v.T isa Type && v.T <: NamedTuple && fieldcount(v.T) > 0 || return v
     bound = _jax_bind!(ctx, :result, v)
     names = fieldnames(v.T)
