@@ -56,7 +56,8 @@ end
     record = only(anchored.rescored)
     @test record.changed == 4
     @test 0 < record.max_abs && 0 < record.max_rel < 1e-15
-    @test record.rtol == 1e-10 && record.cpu == Sys.CPU_NAME
+    @test record.rtol == 1e-10
+    @test record.codegen isa String && !isempty(record.codegen)
     buffer = IOBuffer()
     serialize(buffer, anchored)
     seekstart(buffer)

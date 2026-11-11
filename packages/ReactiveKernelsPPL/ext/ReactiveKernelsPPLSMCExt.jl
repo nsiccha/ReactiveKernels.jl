@@ -929,6 +929,16 @@ end
 
 const _RESCORE_RTOL = 1e-10
 
+# This process's code-generation target for the re-anchoring record: Julia's
+# `-C` option when one was given (a fleet launcher may pin one), else the CPU
+# LLVM detected, which can read "generic" for a CPU newer than Julia's LLVM.
+function _codegen_target()
+    option = Base.JLOptions().cpu_target
+    option == C_NULL && return Sys.CPU_NAME
+    target = unsafe_string(option)
+    return target == "native" ? Sys.CPU_NAME : target
+end
+
 function PPL.rescore_smc_checkpoint(target::AbstractSMCTarget, checkpoint;
         previous=nothing, rtol::Real=_RESCORE_RTOL)
     isfinite(rtol) && rtol >= 0 ||
@@ -939,7 +949,7 @@ function PPL.rescore_smc_checkpoint(target::AbstractSMCTarget, checkpoint;
         "SMC checkpoint endpoint densities differ by more than rtol=$(Float64(rtol)); " *
         "rebuild with the original code and data", drift)))
     record = (; changed=drift.changed, max_abs=drift.max_abs, max_rel=drift.max_rel,
-        rtol=Float64(rtol), cpu=Sys.CPU_NAME)
+        rtol=Float64(rtol), codegen=_codegen_target())
     rescored = haskey(cp, :rescored) ? vcat(cp.rescored, [record]) : [record]
     return merge(cp, (; source_scores=drift.scores.source,
         target_scores=drift.scores.target, rescored))

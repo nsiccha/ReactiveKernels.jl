@@ -766,9 +766,10 @@ must satisfy `abs(new - old) <= rtol * max(abs(old), 1)`; otherwise an
 only identical scores.
 
 Returns a new checkpoint carrying this host's scores and a `rescored` vector
-with one record per re-anchoring: `(; changed, max_abs, max_rel, rtol, cpu)`,
+with one record per re-anchoring: `(; changed, max_abs, max_rel, rtol, codegen)`,
 the count of changed scores, the largest absolute and scaled deviations, the
-tolerance and `Sys.CPU_NAME`. Earlier records are kept. The input is not
+tolerance, and this process's code-generation target (Julia's `-C` option when
+given, else `Sys.CPU_NAME`). Earlier records are kept. The input is not
 modified. Persist the result yourself; every later `resume_smc` of it on this
 host keeps the exact check. Checkpoints taken from the resumed state carry no
 record.

@@ -27,7 +27,7 @@ are recorded in the git history only.
   function runs every `resume_smc` check, accepts scores within
   `abs(new - old) <= rtol * max(abs(old), 1)`, and returns a copy carrying
   this host's scores and an appended `rescored` record
-  `(; changed, max_abs, max_rel, rtol, cpu)`. `resume_smc` stays exact.
+  `(; changed, max_abs, max_rel, rtol, codegen)`. `resume_smc` stays exact.
 - A refused `resume_smc` now names how many endpoint scores differ and the
   largest deviation with its particle, and points to
   `rescore_smc_checkpoint` when the deviation is within its default `rtol`.
