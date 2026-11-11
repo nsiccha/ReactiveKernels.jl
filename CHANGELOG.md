@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.159
+## 0.1.162
 
 - In a partition, a matrix value that several one-cell members ask for at
   their own rows is now one row per requested row, as a number already was
@@ -35,6 +35,63 @@ are recorded in the git history only.
   - A product that the previous version left to BLAS for strided operands now
     sums in RK's order instead. On an RKPPL model with `b = z * F` this moved
     values by up to 3 ulp and gradients by up to 7 ulp (relative 9e-16).
+
+## 0.1.161
+
+- A native scan whose trajectory is read only through one element,
+  `trajectory[k]`, `last(trajectory)` or `first(trajectory)`, runs the steps
+  through `k` and keeps only that output: no trajectory is allocated. It
+  extends the slice-only demand `trajectory[lo:hi]`. The value and the
+  `BoundsError` of an index outside the trajectory are unchanged; every case
+  the slice demand keeps materialized (a WANT or another reader, `history`,
+  an effectful step, a non-concrete element type, a non-`Int` index, a
+  sequence that is neither a vector nor a range) stays materialized.
+- `sum(p)` or `logsumexp(p)` of an authored plate `p` written inside a larger
+  expression (`scale^2 * sum(terms)`) now streams the plate's total, as the
+  same fold written as its own statement did; the cells are no longer stored.
+  The total is the statement form's, bit for bit; against reducing the stored
+  cells as a vector, only the floating-point rounding of the reduction can
+  differ, as for every streamed plate total. A plate folded by two different
+  functions, by a fold statement with a declared type or the returned value,
+  or inside a branch or loop keeps its expression as written.
+- Together these make DistributionKernels' one-sided LogNormal `var()`
+  (`lower_truncated_lognormal`, `upper_truncated_lognormal`) allocate nothing
+  per call, where it allocated about 3–7 KB, and cut its time and its Enzyme
+  Reverse gradient's by a third to a half (snag `dk-one-sided-log-c73f7aba`).
+
+## 0.1.160
+
+- New: `register_source_provider!(provider)` and `TraceableSource(argument_names,
+  body, mod)`, so a package that generates a method (a macro that writes it
+  into its caller's module) can hand `jax_source` the method's Julia source.
+  `jax_source` asks each registered provider, `provider(f, argument_types)`,
+  for a call that has no translation of its own and no `@traceable` source,
+  and translates the body it returns as it translates an `@traceable` body:
+  `jax.lax.fori_loop` for a `for` loop, `jax.lax.cond` for an `if`,
+  `.at[i].set` for `A[i] = v`, and host Python in `prepare_data`. Before,
+  such a method stopped `jax_source` with `JAXEmissionError: the function
+  ... has loops or branches`. Register the provider once, from the
+  `__init__` of the package's extension on ReactiveKernels. Native
+  execution, `prepare` and the compiled paths never read the source (snag
+  `register-generat-a22e2325`, decision `0os7s7u`).
+
+## 0.1.159
+
+- `jax_source`: a matrix padded along a ragged row, such as a mixture law's
+  `cell = (x .- centres) ./ scales` for `x = vcat(x1, x_rest)` with `x_rest`
+  one row of per-row features, now reduces in the JAX functions.
+  `sum(cell; dims = 1)` (and `prod`, `maximum` and `minimum` over `dims`)
+  raised `JAXEmissionError` (`sum over dims of a Matrix{Float64}`); it now
+  sums the row's entries only. A whole-array `sum(cell)` or `sum(f, cell)`
+  emitted but read the padding as entries, a wrong value whenever rows have
+  different lengths, and `maximum(cell)` failed in Python; both now mask the
+  padded axis. The translation records which axes of an array the padding
+  covers (a broadcast keeps its operands', a transpose swaps them, an outer
+  product `x * x'` and `I(n)` cover both), and `vec` of such a matrix puts its
+  valid entries first. A reduction or `vec` of a padded array whose padded
+  axes it does not record (a matrix product with a padded operand) now raises
+  `JAXEmissionError` instead of reading the padding (snag
+  `jax-source-sum-c-bcfa9d53`).
 
 ## 0.1.158
 

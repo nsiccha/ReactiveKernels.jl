@@ -3538,32 +3538,129 @@ function _traceable_source_method(callee, formals, wheres, body, mod)
 end
 
 # The body with its tail-position `return`s replaced by their values, as a
-# source-reading compiler translates it.  Any other `return` is rejected.
-function _traceable_tail_body(ex, signature)
+# source-reading compiler translates it.  Any other `return` is rejected;
+# `owner` names what recorded the body in that error.
+function _traceable_tail_body(ex, signature, owner = "@traceable")
     if ex isa Expr && ex.head === :return
-        return _traceable_no_return(isempty(ex.args) ? nothing : only(ex.args), signature)
+        return _traceable_no_return(isempty(ex.args) ? nothing : only(ex.args), signature, owner)
     elseif ex isa Expr && ex.head === :block
         position = findlast(arg -> !(arg isa LineNumberNode), ex.args)
         position === nothing && return ex
-        args = Any[i == position ? _traceable_tail_body(arg, signature) :
-                   _traceable_no_return(arg, signature)
+        args = Any[i == position ? _traceable_tail_body(arg, signature, owner) :
+                   _traceable_no_return(arg, signature, owner)
                    for (i, arg) in enumerate(ex.args)]
         return Expr(:block, args...)
     elseif ex isa Expr && ex.head in (:if, :elseif)
-        return Expr(ex.head, _traceable_no_return(ex.args[1], signature),
-            (_traceable_tail_body(arg, signature) for arg in ex.args[2:end])...)
+        return Expr(ex.head, _traceable_no_return(ex.args[1], signature, owner),
+            (_traceable_tail_body(arg, signature, owner) for arg in ex.args[2:end])...)
     end
-    _traceable_no_return(ex, signature)
+    _traceable_no_return(ex, signature, owner)
 end
 
-function _traceable_no_return(ex, signature)
+function _traceable_no_return(ex, signature, owner = "@traceable")
     ex isa Expr || return ex
     ex.head in (:->, :function, :quote, :inert) && return ex
     ex.head === :return && throw(ArgumentError(
-        "@traceable does not support a `return` before the end of `$(signature)`; " *
+        "$owner does not support a `return` before the end of `$(signature)`; " *
         "write the branch as an expression (`condition ? a : b`)."))
-    foreach(arg -> _traceable_no_return(arg, signature), ex.args)
+    foreach(arg -> _traceable_no_return(arg, signature, owner), ex.args)
     ex
+end
+
+"""
+    TraceableSource(argument_names, body, mod::Module)
+
+The Julia source of one method, as a package that generates the method hands
+it to `jax_source` through [`register_source_provider!`](@ref): the method's
+formal names in order, its body, and the module whose globals the body reads.
+`jax_source` translates a call of the method from this body as it translates
+an [`@traceable`](@ref) body: a `for` loop becomes `jax.lax.fori_loop`, an
+`if` becomes `jax.lax.cond`, `A[i] = v` becomes `A.at[i].set(v)`, and
+`prepare_data` runs the body as host Python with Python loops and branches.
+
+The body is one expression whose value is the method's result. A `return` at
+its end is allowed; a `return` before the end throws an `ArgumentError` here,
+so write that branch as an expression (`condition ? a : b`). Code that runs
+inside the JAX functions takes the subset an `@traceable` body takes there:
+no `break` or `continue`, and a `for` binds one name over one range.
+`prepare_data` takes both. Static parameters of the method (`where T`) are not bound: the body
+reads its arguments and the globals of `mod`.
+
+Native execution, `prepare` and the compiled paths never read the source: the
+method itself runs there.
+"""
+struct TraceableSource
+    argument_names::Tuple{Vararg{Symbol}}
+    body::Any
+    mod::Module
+    function TraceableSource(argument_names, body, mod::Module)
+        names = Tuple(argument_names)
+        for name in names
+            name isa Symbol || throw(ArgumentError(
+                "TraceableSource takes the method's argument names as `Symbol`s; got `$(repr(name))`."))
+        end
+        allunique(names) || throw(ArgumentError(
+            "TraceableSource got the argument name `$(first(n for n in names if count(==(n), names) > 1))` twice."))
+        new(names, _traceable_tail_body(body, Expr(:tuple, names...), "TraceableSource"), mod)
+    end
+end
+
+const _SOURCE_PROVIDERS = Any[]
+const _SOURCE_PROVIDERS_LOCK = ReentrantLock()
+
+"""
+    register_source_provider!(provider) -> provider
+
+Register `provider` to supply the Julia source of methods that `jax_source`
+has no other source for, so their loops and branches translate. For a method
+that a package generates, such as one a macro writes into its caller's module,
+the method's author cannot write [`@traceable`](@ref); the generating package
+supplies the source instead.
+
+When `jax_source` meets a call of a function `f` with no translation of its
+own and no `@traceable` method for the call, it calls
+`provider(f, argument_types)`, with `argument_types` the `Tuple` type of the
+call's argument types, in the JAX functions and in `prepare_data` alike. The
+provider returns `nothing` when it has no source for that call, or the
+[`TraceableSource`](@ref) of the method that arguments of those types call
+natively, so the translation computes what native execution computes.
+Providers are asked in the order they were registered, and the first source
+wins. A call that no provider answers is translated from its lowered code,
+which must be straight-line. An error the provider throws propagates out of
+`jax_source`.
+
+Register a provider once, from the `__init__` of the package extension that
+loads with ReactiveKernels; registering the same provider again changes
+nothing. A provider only hands over source: nothing is evaluated, and native
+execution is unchanged.
+"""
+function register_source_provider!(provider)
+    Base.@lock _SOURCE_PROVIDERS_LOCK begin
+        any(p -> p === provider, _SOURCE_PROVIDERS) || push!(_SOURCE_PROVIDERS, provider)
+    end
+    provider
+end
+
+# The source a registered provider supplies for a call of `f` with arguments of
+# `types`, as `(names, body, module)` (the first entries of what
+# `_traceable_source` returns), or `nothing` when no provider has one.
+function _provided_source(f, types)
+    providers = Base.@lock _SOURCE_PROVIDERS_LOCK copy(_SOURCE_PROVIDERS)
+    isempty(providers) && return nothing
+    argument_types = Tuple{types...}
+    for provider in providers
+        source = provider(f, argument_types)
+        source === nothing && continue
+        source isa TraceableSource || throw(ArgumentError(
+            "the source provider `$(provider)` returned a `$(typeof(source))` for `$(f)` with " *
+            "argument types $(argument_types); a provider returns `nothing` or a `TraceableSource`."))
+        length(source.argument_names) == length(types) || throw(ArgumentError(
+            "the source provider `$(provider)` returned a source over " *
+            "$(length(source.argument_names)) arguments $(source.argument_names) for a call of " *
+            "`$(f)` with $(length(types)), argument types $(argument_types)."))
+        return (source.argument_names, source.body, source.mod)
+    end
+    nothing
 end
 
 function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
@@ -4461,6 +4558,90 @@ function _kernel_lift_plate_expressions(statements, mod)
     result
 end
 
+# Lift a streamed fold of a plate, `sum(p)` or `logsumexp(p)` of a name `p`
+# that a `plate(...)` statement of the same body defines, out of a larger
+# straight-line expression (`scale^2 * sum(terms)`) into a statement of its
+# own, so that the plate sums its cells as it computes them instead of
+# storing them (`_authored_plate_total_recipe` reads a fold only as a whole
+# statement). The total is the statement form's, bit for bit; against reducing
+# the stored cells as a vector, only the rounding of the reduction can differ.
+# Each plate keeps at most one fold statement, which that selection requires:
+# every occurrence of one fold of `p` reads the same statement, an existing
+# untyped `name = sum(p)` included. A plate folded by more than one function,
+# or by a statement with a declared type or the returned value, keeps its
+# folds where they are. Branches, loops and other deferred scopes stay intact.
+function _kernel_lift_plate_folds(statements, mod)
+    mod === nothing && return statements
+    assignment(st) = st isa Expr && st.head === :(=)
+    named(lhs) = lhs isa Symbol ? lhs :
+        Meta.isexpr(lhs, :(::), 2) && lhs.args[1] isa Symbol ? lhs.args[1] : nothing
+    function plate_call(ex)
+        call = Meta.isexpr(ex, :do, 2) ? ex.args[1] : ex
+        Meta.isexpr(call, :call) && !isempty(call.args) &&
+            _kernel_resolve_binding(mod, call.args[1]) === plate
+    end
+    plates = Set{Symbol}()
+    for st in statements
+        assignment(st) || continue
+        name = named(st.args[1])
+        name !== nothing && plate_call(st.args[2]) && push!(plates, name)
+    end
+    isempty(plates) && return statements
+    # The fold function of `f(p)` for a plate `p`, or `nothing`.
+    function fold_function(ex)
+        Meta.isexpr(ex, :call, 2) && ex.args[2] isa Symbol && ex.args[2] in plates ||
+            return nothing
+        f = _kernel_resolve_binding(mod, ex.args[1])
+        f === sum || f === LogExpFunctions.logsumexp ? f : nothing
+    end
+    # The folds of each plate, whole statements and sub-expressions alike.
+    folds = Dict{Symbol,Set{Any}}()
+    whole = Dict{Tuple{Any,Symbol},Symbol}()
+    blocked = Set{Symbol}()
+    function collect!(ex)
+        ex isa Expr || return
+        f = fold_function(ex)
+        f === nothing || push!(get!(Set{Any}, folds, ex.args[2]), f)
+        _kernel_is_nonstraight_head(ex.head) && return
+        foreach(collect!, ex.args)
+    end
+    for st in statements
+        assignment(st) || continue
+        collect!(st.args[2])
+        f = fold_function(st.args[2])
+        f === nothing && continue
+        plate_name = st.args[2].args[2]
+        st.args[1] isa Symbol && st.args[1] !== _KERNEL_RETURN_PORT ?
+            (whole[(f, plate_name)] = st.args[1]) : push!(blocked, plate_name)
+    end
+    liftable(p) = !(p in blocked) && length(get(folds, p, ())) == 1
+    any(liftable, plates) || return statements
+    result = Any[]
+    for st in statements
+        lifted = Any[]
+        function rewrite(ex, root = false)
+            ex isa Expr || return ex
+            f = fold_function(ex)
+            if f !== nothing && !root && liftable(ex.args[2])
+                key = (f, ex.args[2])
+                name = get(whole, key, nothing)
+                if name === nothing
+                    name = whole[key] = _kernel_gensym(:plate_fold)
+                    push!(lifted, Expr(:(=), name, ex))
+                end
+                return name
+            end
+            _kernel_is_nonstraight_head(ex.head) && return ex
+            Expr(ex.head, (rewrite(arg) for arg in ex.args)...)
+        end
+        rewritten = assignment(st) ?
+            Expr(:(=), st.args[1], rewrite(st.args[2], true)) : st
+        append!(result, lifted)
+        push!(result, rewritten)
+    end
+    result
+end
+
 function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                         call_signature = nothing, mod::Union{Module,Nothing} = nothing;
                         nested_specs = Dict{Symbol,Any}(),
@@ -4472,8 +4653,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     block = _kernel_normalize_call_kwargs(_kernel_lift_nodes(block, mod))
     raw_statements = block isa Expr && block.head === :block ? block.args : Any[block]
     raw_statements = _kernel_desugar_loops(raw_statements, mod)
-    statements = _kernel_lift_plate_expressions(
-        _kernel_normalize_return_expressions(raw_statements), mod)
+    statements = _kernel_lift_plate_folds(_kernel_lift_plate_expressions(
+        _kernel_normalize_return_expressions(raw_statements), mod), mod)
     declarations = _kernel_enclosing_declarations(statements, signature_inputs)
     enclosing_ports = Set{Symbol}(name for (name, _) in declarations)
     scalar_ports = _kernel_scalar_ports(declarations, mod)
