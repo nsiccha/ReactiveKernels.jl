@@ -11,6 +11,7 @@ about a current release.
 | Native differential equations | [BDF experiments](native_bdf/README.md) |
 | Gaussian-process consumer | [Public motorcycle-data comparison](brm_hsgp/README.md) |
 | Gibbs experiments | [Prototype](gibbs_poc/README.md) |
+| Weak-component mixture inference | [Frozen SMC schedules and mode mass](smc_weak_component/README.md) |
 | Documentation history | [Research separation](docs-history/README.md) |
 
 Run a selected driver in the environment documented beside it. Write newly
