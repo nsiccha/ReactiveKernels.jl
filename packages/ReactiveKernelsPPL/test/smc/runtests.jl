@@ -262,6 +262,7 @@ end
     @test_throws SMCNonfiniteError smc(invalid.target; rng=Xoshiro(6),particles=8)
 end
 
+include("checkpoint_rescore.jl")
 include("nonfinite.jl")
 include("prepared_logdensity.jl")
 include("rejuvenation.jl")

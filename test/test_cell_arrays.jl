@@ -500,6 +500,55 @@ end
     @test escapes([[0.2, 0.4]], [[0.5, 0.25]], 0.5) ≈ (0.5 * 0.1 + 0.25 * 0.2) + (0.1 + 0.2)
 end
 
+# A composed broadcast of 32 or more operands, one n-ary `.+` of many terms
+# (snag plate-cell-n-ary-3391765b). Base's tuple `map`, `instantiate`, element
+# typing and entry read stop specializing there; the cell keeps a concrete,
+# type-stable program at every width, so ordinary Reverse differentiates it.
+macro wide_lane(name, width)
+    terms = [:(q[$i] .* xs[$i][g]) for i in 1:width]
+    m = Expr(:call, :.+, :(off[g]), terms...)
+    esc(:(@kernel $name(xs::Vector{Vector{Vector{Float64}}}, y::Vector{Vector{Float64}},
+                        off::Vector{Float64}, q::Vector{Float64}) = begin
+        values = plate(eachindex(y)) do g
+            m = $m
+            terms = plate(m, y[g]) do mi, yi
+                abs2(yi - mi)
+            end
+            sum(terms)
+        end
+        total = sum(values)
+        return total
+    end))
+end
+@wide_lane wide_lane31 31
+@wide_lane wide_lane32 32
+@wide_lane wide_lane40 40
+wide_lane_mean(xs, off, q, g) = off[g] .+ sum(q[k] .* xs[k][g] for k in eachindex(q))
+wide_lane_value(xs, y, off, q) = sum((sum(abs2, y[g] .- wide_lane_mean(xs, off, q, g); init=0.0)
+                                      for g in eachindex(y)); init=0.0)
+wide_lane_q(xs, y, off, q) = [sum((-2sum(xs[k][g] .* (y[g] .- wide_lane_mean(xs, off, q, g)); init=0.0)
+                                   for g in eachindex(y)); init=0.0) for k in eachindex(q)]
+
+@testset "a composed broadcast of 32 or more operands stays type stable" begin
+    lens = [3, 1, 0, 5]
+    for (width, spec) in ((31, wide_lane31), (32, wide_lane32), (40, wide_lane40))
+        xs = [[[0.01k * g + 0.1j for j in 1:lens[g]] for g in eachindex(lens)] for k in 1:width]
+        y = [[0.2j - 0.1g for j in 1:lens[g]] for g in eachindex(lens)]
+        off = 0.1 .* eachindex(lens)
+        q = 0.05 .* sin.(1:width)
+        k = prepare(spec; type_stability=:error)
+        @test occursin("_cell_array_broadcast", string(code_expr(k)))
+        @test k(xs, y, off, q) ≈ wide_lane_value(xs, y, off, q)
+        ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), xs, y, off, q;
+                        active=:q, type_stability=:error)
+        @test ad_gradient(ad, xs, y, off, q) ≈ wide_lane_q(xs, y, off, q)
+    end
+    # Unequal operands still fail as broadcasting them fails.
+    xs = [i == 40 ? [[0.1, 0.2, 0.3]] : [[0.1, 0.2]] for i in 1:40]
+    @test_throws DimensionMismatch prepare(wide_lane40)(
+        xs, [[0.1, 0.2]], [0.0], fill(0.1, 40))
+end
+
 # A group's gather of a computed vector, read only through a broadcast that a
 # nested plate reads as its lane, borrows the vector instead of copying it.
 @kernel lane_gather(w::Vector{Vector{Float64}}, traj::Vector{Int}, rows,
