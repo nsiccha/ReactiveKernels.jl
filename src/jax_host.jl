@@ -1192,6 +1192,236 @@ def _rk_pad_rows(rows, dtype):
     return padded, lengths, flat
 """
 
+# --- plate cells' data-only recipes -------------------------------------------------
+#
+# A top-level plate whose cell reads data (a bound input, or a value
+# `prepare_data` computes) runs whole in the functions. A data-only recipe of
+# its cell that the functions cannot compute (a `@traceable` helper that builds
+# a list, sorts, or loops to a data length) is computed by `prepare_data`
+# instead, as native preparation with bound data evaluates a cell's data-only
+# recipes once per cell (`_partial_plate_recipe`, partial_evaluation.jl): a
+# host loop over the cells calls a function of the data-only recipes it needs,
+# and the plate reads each cell's value as an input of its own. The values of
+# every cell are a list, so a vector per cell is a ragged input (padded, with
+# its lengths). A recipe the functions can compute stays in the cell, where a
+# length read from a padded row keeps the static limit the row gives it.
+#
+# Only a top-level plate's own cell recipes are split, not those of a plate
+# nested in the cell, a scan step or a branch arm.
+
+# The cell recipes of a plate that `prepare_data` computes: `plan` (HAVE the
+# plate's data inputs it reads, in order; WANT the values the rest of the
+# cell reads), each input passed whole (`Ref`) or iterated, whether it runs
+# per cell (it reads an iterated input) or once, the plate recipe's id, and
+# the ids of the cell recipes split off (`targets`).
+struct _JaxCellPrefix
+    plan::Plan
+    atomic::Vector{Bool}
+    percell::Bool
+    plate::Int
+    targets::Vector{Int}
+end
+
+# The id of the `prepare_data` recipe of plate `plate`'s cell values: apart
+# from every graph recipe's id.
+const _JAX_CELL_PREFIX_BASE = -(Int(1) << 40)
+_jax_cell_prefix_id(plate::Int) = _JAX_CELL_PREFIX_BASE - plate
+
+# A data-only recipe of a plate's cell that the functions cannot compute
+# (`plate` and `recipe` are recipe ids): the module is emitted again with
+# `prepare_data` computing it.
+struct _CellHostNeeded <: Exception
+    plate::Int
+    recipe::Int
+    error::JAXEmissionError
+end
+# Cell recipes split off to `prepare_data` (`recipes`) whose computation
+# there has no host translation (`error`): they stay in the cell.
+struct _HostUnsupportedCell <: Exception
+    plate::Int
+    recipes::Vector{Int}
+    error::JAXEmissionError
+end
+
+# Plate recipe `r` split so that `prepare_data` computes the cell recipes
+# `hoisted` (ids in the cell's graph): `(; prefix, plate)`, the `prepare_data`
+# recipe of their values and the plate reading them as inputs, or `nothing`
+# when none of them reads only the plate's data inputs (those whose canonical
+# id in `g` is in `dependent`).
+function _jax_cell_split(g::Graph, r::Recipe, dependent::Set{ValueId}, hoisted::Set{Int})
+    op = r.op
+    body = op.kernel.plan
+    atomic_inputs = typeof(op).parameters[2]
+    length(body.have) == length(r.inputs) || return nothing
+    cg = body.graph
+    data = Bool[canon_id(g, v.id) in dependent for v in r.inputs]
+    bound = Set{ValueId}(canon_id(cg, body.have[i].id) for i in eachindex(data) if data[i])
+    pre, _, _ = _partial_split(body, bound)
+    targets = Recipe[x for x in pre if x.id in hoisted]
+    isempty(targets) && return nothing
+    target_ids = Set{Int}(x.id for x in targets)
+    # The targets and the data-only recipes they read, transitively.
+    selected = copy(target_ids)
+    needed = Set{ValueId}(canon_id(cg, v.id) for x in targets for v in x.inputs)
+    for x in Iterators.reverse(pre)
+        x.id in selected && continue
+        any(o -> canon_id(cg, o.id) in needed, x.outputs) || continue
+        push!(selected, x.id)
+        foreach(v -> push!(needed, canon_id(cg, v.id)), x.inputs)
+    end
+    computed = Recipe[x for x in pre if x.id in selected]
+    # The rest of the cell, without the recipes only the targets read.
+    need = Set{ValueId}(canon_id(cg, v.id) for v in body.want)
+    rest = Recipe[]
+    for x in Iterators.reverse(body.recipes)
+        x.id in target_ids && continue
+        any(o -> canon_id(cg, o.id) in need, x.outputs) || continue
+        push!(rest, x)
+        foreach(v -> push!(need, canon_id(cg, v.id)), x.inputs)
+    end
+    reverse!(rest)
+    # The targets' values the rest reads, in order of first use.
+    produced = Set{ValueId}(canon_id(cg, o.id) for x in targets for o in x.outputs)
+    frontier = Value[]
+    seen = Set{ValueId}()
+    for v in Iterators.flatten(((v for x in rest for v in x.inputs), body.want))
+        cid = canon_id(cg, v.id)
+        cid in produced && !(cid in seen) || continue
+        push!(seen, cid)
+        push!(frontier, get(cg.values, cid, v))
+    end
+    isempty(frontier) && return nothing
+    # The plate's data inputs those recipes read: they run per cell when one
+    # of them is iterated, else once, their values passed to every cell whole.
+    read = Set{ValueId}(canon_id(cg, v.id) for x in computed for v in x.inputs)
+    inputs = Int[i for i in eachindex(data)
+                 if data[i] && canon_id(cg, body.have[i].id) in read]
+    atomic = Bool[i in atomic_inputs for i in inputs]
+    percell = !all(atomic)
+    plan = _partial_subplan(body, Value[body.have[i] for i in inputs], frontier, computed)
+    values = Value[Value(v.name, Any) for v in frontier]
+    prefix = Recipe(_jax_cell_prefix_id(r.id), Tuple(r.inputs[i] for i in inputs),
+                    Tuple(values),
+                    _JaxCellPrefix(plan, atomic, percell, r.id, Int[x.id for x in targets]),
+                    0.0, nothing, false)
+    cell = _partial_subplan(body, Value[body.have; frontier], body.want, rest)
+    kernel = (; plan = cell)
+    added = percell ? () : Tuple(length(r.inputs) .+ eachindex(values))
+    plate = Recipe(r.id, (r.inputs..., values...), r.outputs,
+                   _AuthoredPlateOp{typeof(kernel),(atomic_inputs..., added...)}(
+                       kernel, op.axis_checks),
+                   r.cost, r.cse_key, r.effectful, r.source)
+    (; prefix, plate)
+end
+
+# `_partial_constants` that also knows the values only `prepare_data`
+# computes (`hosted`, by id), which the program's graph does not hold.
+function _jax_partial_constants(p::Plan, owned::Set{ValueId}, residual::Vector{Recipe},
+                                hosted::Dict{ValueId,Value})
+    isempty(hosted) && return _partial_constants(p, owned, residual)
+    g = p.graph
+    constants = Value[]
+    seen = Set{ValueId}()
+    for v in Iterators.flatten(((v for r in residual for v in r.inputs), p.want))
+        cid = canon_id(g, v.id)
+        cid in owned && !(cid in seen) || continue
+        push!(seen, cid)
+        push!(constants, get(() -> g.values[cid], hosted, cid))
+    end
+    constants
+end
+
+# A plate cell's data-only recipes in `prepare_data`: a function of them,
+# called on each cell's data (or once, when they read no iterated input),
+# and each of its values for every cell as a list.
+function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_JaxCellPrefix, inputs)
+    ctx.host === nothing && _jax_error("a plate cell's data-only recipes outside `prepare_data`",
+                                       _jax_where(ctx))
+    inputs = [!op.atomic[i] && _jax_numeric_tuple(v.T) ?
+              _PyVal("np.stack(" * v.code * ")", Vector{eltype(v.T)}, true) : v
+              for (i, v) in enumerate(inputs)]
+    mapped = Bool[op.percell && !op.atomic[i] && _jax_is_array(v.T)
+                  for (i, v) in enumerate(inputs)]
+    op.percell && !any(mapped) && _jax_error("a plate cell's data-only recipes that read ",
+        "no array of its cells", _jax_where(ctx))
+    ranks = unique(_jax_rank(inputs[i].T) for i in eachindex(inputs) if mapped[i])
+    isempty(ranks) || ranks == [1] || _jax_error("a plate over arrays of rank ",
+        join(string.(ranks), ", "), " whose cell's data-only recipes have no host translation",
+        _jax_where(ctx))
+    types = Any[mapped[i] ? eltype(v.T) : _jax_unref(v.T) for (i, v) in enumerate(inputs)]
+    cell, wants, _ = _jax_plan_function!(ctx, :cell_data, op.plan, types)
+    targets = String[]
+    args = String[]
+    for (i, v) in enumerate(inputs)
+        if mapped[i]
+            t = _jax_fresh(ctx, :element)
+            push!(targets, t); push!(args, t)
+        else
+            push!(args, v.code)
+        end
+    end
+    call = cell * "(" * join(args, ", ") * ")"
+    n = length(wants)
+    if !op.percell
+        n == 1 && return [_PyVal(call, _jax_typeof(only(wants)), true)]
+        shared = _jax_bind!(ctx, :cell_data, _PyVal(call, Any, true))
+        return [_PyVal(shared.code * "[" * string(j - 1) * "]", _jax_typeof(wants[j]), true)
+                for j in 1:n]
+    end
+    sources = [inputs[i].code for i in eachindex(inputs) if mapped[i]]
+    iterable = length(sources) == 1 ? only(sources) : "zip(" * join(sources, ", ") * ")"
+    each = "[" * call * " for " * join(targets, ", ") * " in " * iterable * "]"
+    n == 1 && return [_host_collected(each, _jax_typeof(only(wants)))]
+    rows = _jax_bind!(ctx, :cell_data, _PyVal(each, Any, true))
+    row = _jax_fresh(ctx, :row)
+    [_host_collected("[" * row * "[" * string(j - 1) * "] for " * row * " in " * rows.code * "]",
+                     _jax_typeof(wants[j]))
+     for j in 1:n]
+end
+
+# The cell recipes split off by `op` that its host translation's error `e`
+# leaves to the functions: those reading the cell recipe that raised it,
+# transitively, or all of them when it was raised outside the cell's recipes.
+function _jax_cell_refused(mod::_JaxModule, op::_JaxCellPrefix, e::JAXEmissionError)
+    path = get(mod.failure_paths, e, Tuple{Plan,Recipe}[])
+    at = findfirst(step -> first(step) === op.plan, path)
+    at === nothing && return copy(op.targets)
+    g = op.plan.graph
+    failed = Set{ValueId}(canon_id(g, o.id) for o in last(path[at]).outputs)
+    refused = Set{Int}((last(path[at]).id,))
+    for x in op.plan.recipes
+        any(v -> canon_id(g, v.id) in failed, x.inputs) || continue
+        push!(refused, x.id)
+        foreach(o -> push!(failed, canon_id(g, o.id)), x.outputs)
+    end
+    targets = Int[t for t in op.targets if t in refused]
+    isempty(targets) ? copy(op.targets) : targets
+end
+
+# The error `e` of a module function `rp` (the residual plan of `split`)
+# raised by a data-only recipe of a top-level plate's cell: a
+# `_CellHostNeeded` for it, or, when `prepare_data` has no host translation
+# of it either, the error naming both reasons. `nothing` for any other.
+function _jax_cell_failure(mod::_JaxModule, split, rp::Plan, e::JAXEmissionError)
+    path = get(mod.failure_paths, e, nothing)
+    (path === nothing || length(path) < 2) && return nothing
+    (outer, plate), (cell, recipe) = path[1], path[2]
+    outer === rp && plate.op isa _AuthoredPlateOp && cell === plate.op.kernel.plan ||
+        return nothing
+    length(cell.have) == length(plate.inputs) || return nothing
+    g = rp.graph
+    prepared = Set{ValueId}(canon_id(g, v.id) for v in split.constants)
+    cg = cell.graph
+    bound = Set{ValueId}(canon_id(cg, cell.have[i].id) for i in eachindex(plate.inputs)
+                         if canon_id(g, plate.inputs[i].id) in prepared)
+    pre, _, _ = _partial_split(cell, bound)
+    any(x -> x.id == recipe.id, pre) || return nothing
+    reason = get(mod.cell_reasons, (plate.id, recipe.id), nothing)
+    reason === nothing && return _CellHostNeeded(plate.id, recipe.id, e)
+    JAXEmissionError(rstrip(e.message, '.') * ". The recipe reads data alone, and " *
+                     "`prepare_data` does not compute it on the host either: " * reason.message)
+end
+
 """
     _jax_prepare_split(plans, data_ports) -> (; prefix, constants, residual)
 
@@ -1201,7 +1431,8 @@ data alone (in an order that computes each after its inputs), the boundary
 values the functions read from them, and each function's residual plan over
 its remaining ports followed by those values.
 """
-function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); keep = ())
+function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); keep = (),
+                            cells = Dict{Int,Set{Int}}())
     p1 = first(plans).second[1]
     g = p1.graph
     prefix = Recipe[]
@@ -1209,6 +1440,10 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); 
     constants = Value[]
     seen_values = Set{ValueId}()
     boundaries = []
+    # The plates whose cells `prepare_data` computes in part (`cells`), split
+    # once for every function that has them.
+    rewrites = Dict{Int,Any}()
+    hosted = Dict{ValueId,Value}()
     for (fname, (p, w)) in plans
         bound = Value[v for v in p.have if v.name in data_ports]
         ids = Set{ValueId}(canon_id(g, v.id) for v in bound)
@@ -1237,12 +1472,28 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); 
             foreach(v -> push!(needed, canon_id(g, v.id)), r.inputs)
         end
         residual = [reverse!(kept); residual]
+        # A plate whose cell has data-only recipes the functions cannot
+        # compute: `prepare_data` computes them for every cell (a recipe after
+        # the producers of the plate's data inputs, which `pre` holds), and the
+        # plate reads their values as inputs.
+        for (k, r) in enumerate(residual)
+            haskey(cells, r.id) && r.op isa _AuthoredPlateOp || continue
+            _jax_cell_prefix_id(r.id) in excluded && continue
+            rewrite = get!(() -> _jax_cell_split(g, r, dependent, cells[r.id]), rewrites, r.id)
+            rewrite === nothing && continue
+            pre = [pre; rewrite.prefix]
+            residual[k] = rewrite.plate
+            for v in rewrite.prefix.outputs
+                push!(dependent, canon_id(g, v.id))
+                hosted[v.id] = v
+            end
+        end
         for r in pre
             r.id in seen_recipes && continue
             push!(seen_recipes, r.id)
             push!(prefix, r)
         end
-        boundary = _partial_constants(p, dependent, residual)
+        boundary = _jax_partial_constants(p, dependent, residual, hosted)
         for v in boundary
             cid = canon_id(g, v.id)
             cid in seen_values && continue
@@ -1255,7 +1506,8 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); 
     # `prepare_data` returns although no function reads them (the layout's
     # data-derived positions, read by the caller).
     for name in keep
-        found = [o for r in prefix for o in r.outputs if o.name === name]
+        found = [o for r in prefix if !(r.op isa _JaxCellPrefix) for o in r.outputs
+                 if o.name === name]
         isempty(found) && append!(found, (v for v in p1.have if v.name === name && v.name in data_ports))
         v = isempty(found) ? nothing : first(found)
         # The caller refuses it, unless a definition gives a value it reads
@@ -1401,11 +1653,16 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
             _jax_plan_recipe!(ctx, p, recipe)
         catch e
             e isa JAXEmissionError || rethrow()
-            throw(_HostUnsupported(recipe.id, e))
+            recipe.op isa _JaxCellPrefix || throw(_HostUnsupported(recipe.id, e))
+            throw(_HostUnsupportedCell(recipe.op.plate,
+                                       _jax_cell_refused(mod, recipe.op, e), e))
         end
     end
     values = [_jax_lookup(ctx, p.graph, v) for v in split.constants]
-    types = types === nothing ? Any[v.T for v in values] : types
+    # A value without a binding's type (`types[i] === nothing`, one only
+    # `prepare_data` computes) takes the translation's.
+    types = types === nothing ? Any[v.T for v in values] :
+        Any[T === nothing ? v.T : T for (v, T) in zip(values, types)]
     entries = String[]
     for (v, T, name) in zip(values, types, names)
         if _jax_ragged(T)

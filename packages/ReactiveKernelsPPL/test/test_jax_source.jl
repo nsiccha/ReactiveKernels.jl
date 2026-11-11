@@ -55,6 +55,27 @@ function jax_ppl_opaque_cumsum(x::AbstractVector)
     return out
 end
 
+# A group's sorted distinct times, built with `push!` and an `isequal` run
+# test, and each time's position among them: data-only cell recipes that only
+# `prepare_data` computes (snag jax-source-cell-a3ec8540).
+@traceable function jax_ppl_levels(x)
+    levels = Float64[]
+    for j in eachindex(x)
+        v = convert(Float64, x[j])
+        if isempty(levels) || !isequal(v, last(levels))
+            push!(levels, v)
+        end
+    end
+    unique!(sort!(levels))
+end
+@traceable function jax_ppl_positions(levels, x)
+    idx = zeros(Int, length(x))
+    for j in eachindex(x)
+        idx[j] = searchsortedfirst(levels, x[j])
+    end
+    idx
+end
+
 # Submodels whose names reach the layout and the data in their own scope
 # (`b.z`, `v.mask`).
 @rkppl jax_ppl_group_effects(K) = begin
@@ -333,6 +354,18 @@ const _JAX_CASES = (
             y[g] ~ MvNormal(fill(mu, 2), [s^2 r*s^2; r*s^2 s^2])
         end
     end))() | (; y = [[0.1, 0.2], [0.3, -0.1], [0.0, 0.1]]),
+    # Each group's distinct times and positions, computed per cell on the
+    # host, then a decay per distinct time.
+    cell_host_order = () -> (@rkppl(begin
+        k ~ Exponential(1.0); s ~ Exponential(1.0)
+        @plate for g in eachindex(y)
+            levels = jax_ppl_levels(t[g])
+            idx = jax_ppl_positions(levels, t[g])
+            decay = exp.(-k .* levels)
+            y[g] .~ Normal.(decay[idx], s)
+        end
+    end))(; t = [[0.5, 1.0, 0.5], [2.0, 1.0, 2.0, 3.0, 0.5], [1.5], [0.25, 0.25]]) |
+        (; y = [[0.6, 0.5, 0.7], [0.3, 0.45, 0.2, 0.1, 0.6], [0.4], [0.8, 0.85]]),
     hmm_law = () -> (@rkppl(begin
         a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
         locations = [a, b]
