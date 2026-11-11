@@ -443,7 +443,7 @@ _jax_literal(x::Symbol) = _PyVal(repr(String(x)), Symbol, true)
 function _jax_literal(x::AbstractArray{<:Real})
     T = eltype(x)
     body = _jax_nested_list(x)
-    dtype = T <: Bool ? "jnp.bool_" : T <: Integer ? "jnp.int64" : "jnp.float64"
+    dtype = _jax_dtype(T)
     _PyVal("jnp.asarray(" * body * ", dtype=" * dtype * ")", typeof(x))
 end
 # Python nesting is row-major: the outer list runs over the first dimension.
@@ -569,7 +569,8 @@ _jax_is_singleton_value(v::_PyVal) = v.T isa Type && v.T !== Nothing && !(v.T <:
 # parameter, `promote_type(...)`), as `clamp`'s `convert(T, x)` passes it.
 _jax_type_of_value(v::_PyVal) = v.T isa _JaxCallable ? (v.T.f isa Type ? v.T.f : nothing) :
     v.T isa Type && v.T <: Type && !(v.T isa UnionAll) ? v.T.parameters[1] : nothing
-_jax_dtype(@nospecialize(E)) = E <: Bool ? "jnp.bool_" : E <: Integer ? "jnp.int64" : "jnp.float64"
+_jax_dtype(@nospecialize(E)) = E <: Bool ? "jnp.bool_" : E <: Integer ? "jnp.int64" :
+    E <: AbstractFloat ? "jnp." * _jax_dtype_name(E) : "jnp.float64"
 
 _jax_expr(ctx::_JaxContext, ::Val{H}, ex) where {H} =
     _jax_error("the construct `", H, "` (`", ex, "`) has no JAX translation yet",
@@ -746,7 +747,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:ref}, ex)
        getglobal(ctx.source_module, head) isa Type
         T = getglobal(ctx.source_module, head)
         values = [_jax_expr(ctx, a) for a in ex.args[2:end]]
-        dtype = T <: Bool ? "jnp.bool_" : T <: Integer ? "jnp.int64" : "jnp.float64"
+        dtype = _jax_dtype(T)
         isempty(values) && ctx.host !== nothing && return _host_list(ctx, Vector{T})
         isempty(values) && return _PyVal("jnp.zeros((0,), dtype=" * dtype * ")", Vector{T})
         return _PyVal("jnp.asarray([" * join((v.code for v in values), ", ") *
@@ -2595,8 +2596,10 @@ for (f, op) in (((===), " is "), ((!==), " is not "))
         _PyVal("(" * a.code * $op * b.code * ")", Bool, true)
     end
 end
-_jax_function_call(ctx::_JaxContext, ::typeof(float), args::Vector{_PyVal}) =
-    _jax_result(float, args, "jnp.asarray(" * only(args).code * ", dtype=jnp.float64)")
+function _jax_function_call(ctx::_JaxContext, ::typeof(float), args::Vector{_PyVal})
+    E = float(_jax_eltype(only(args).T))
+    _jax_result(float, args, "jnp.asarray(" * only(args).code * ", dtype=" * _jax_dtype(E) * ")")
+end
 # `convert(T, x)`: `x` itself when it is a `T` already (`convert(::Type{T}, x::T)`
 # returns `x`), else, to a concrete float or integer type, the conversion `T(x)`.
 function _jax_function_call(ctx::_JaxContext, ::typeof(convert), args::Vector{_PyVal})
@@ -2897,7 +2900,7 @@ function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
         dims = _jax_dimension_values(args[2:end])
         E = eltype(T)
         E isa TypeVar && (E = Float64)
-        dtype = E <: Bool ? "jnp.bool_" : E <: Integer ? "jnp.int64" : "jnp.float64"
+        dtype = _jax_dtype(E)
         padded = _jax_vector_dims(ctx, T, dims)
         padded === nothing ||
             return _PyVal("jnp.zeros(" * padded[1] * ", dtype=" * dtype * ")", Vector{E}, false, padded[2])
@@ -2912,12 +2915,12 @@ function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
     if T <: AbstractArray && length(args) == 1 && _jax_is_array(args[1].T)
         E = T isa UnionAll ? eltype(Base.unwrap_unionall(T)) : eltype(T)
         E isa TypeVar && (E = eltype(args[1].T))
-        dtype = E <: Bool ? "jnp.bool_" : E <: Integer ? "jnp.int64" : "jnp.float64"
+        dtype = _jax_dtype(E)
         return _PyVal("jnp.asarray(" * args[1].code * ", dtype=" * dtype * ")",
                       Array{E,ndims(args[1].T)})
     end
     if T <: AbstractFloat && length(args) == 1
-        return _PyVal("jnp.asarray(" * args[1].code * ", dtype=jnp.float64)", T)
+        return _PyVal("jnp.asarray(" * args[1].code * ", dtype=" * _jax_dtype(T) * ")", T)
     end
     if T <: Integer && length(args) == 1
         return _PyVal("jnp.asarray(" * args[1].code * ", dtype=jnp.int64)", T)
@@ -4110,7 +4113,7 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
         HT isa Type && HT <: AbstractVector{<:Number} ? eltype(HT) :
         _jax_error("a scan `history` of type `", HT, "` has no JAX translation yet",
                    _jax_where(ctx))
-    dtype = E <: Bool ? "jnp.bool_" : E <: Integer ? "jnp.int64" : "jnp.float64"
+    dtype = _jax_dtype(E)
     steps = _py_atom(args[iterated[1]].code) * ".shape[0]"
     buffer = _jax_fresh(ctx, :history)
     offset = if HT <: Number
@@ -4702,6 +4705,7 @@ _jax_dtype_name(::Type{<:AbstractArray{T}}) where {T} = _jax_dtype_name(T)
 _jax_dtype_name(::Type{<:AbstractArray{<:AbstractArray{T}}}) where {T} = _jax_dtype_name(T)
 _jax_dtype_name(::Type{Bool}) = "bool"
 _jax_dtype_name(::Type{<:Integer}) = "int64"
+_jax_dtype_name(::Type{Float32}) = "float32"
 _jax_dtype_name(::Type{<:AbstractFloat}) = "float64"
 # Non-numeric values (level labels) cross as Python objects.
 _jax_dtype_name(@nospecialize(T)) = "object"
