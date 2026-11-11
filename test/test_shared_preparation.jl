@@ -315,6 +315,46 @@ end
     @test declined[2].ast === declined[1].ast
 end
 
+module AliasPlateFixture
+using ReactiveKernels
+@kernel scaled(x, s::Float64) = begin
+    t = s
+    values = plate(x, t) do xi, ti
+        xi * ti
+    end
+    total = sum(values)
+    return total
+end
+end
+
+# A plate that reads a bound value through an undeclared alias label (`t = s`,
+# BRM's `z_prior_scale = scale`) narrows the label within its class's declared
+# type. The label used to become `t::Number` beside `s::Float64`, a second
+# declaration in one alias class: a graph rebuilt from the residual (RKPPL's
+# factor catalogue) kept it, and `merge` refused it with `cannot merge
+# structural aliases for value :t` (snag selective-fresh-96f7fe96).
+@testset "a bound plate operand read through an alias keeps its class's type" begin
+    F = AliasPlateFixture
+    k = prepare(F.scaled; bound = (; s = 0.5))
+    @test k([1.0, 2.0]) == 1.5
+    g = k.plan.graph
+    labels = [v for r in k.plan.recipes if r.op isa ReactiveKernels._AuthoredPlateOp
+              for v in r.inputs if v.name === :t]
+    @test !isempty(labels)
+    @test all(v -> ReactiveKernels.valtype(v) ==
+                   ReactiveKernels.valtype(g.values[ReactiveKernels.canon_id(g, v.id)]), labels)
+    rebuilt = ReactiveKernels.Graph(copy(g.values), ReactiveKernels.Recipe[],
+        Dict{ReactiveKernels.ValueId,Vector{Int}}(), copy(g.aliases), g.version, nothing)
+    for r in k.plan.recipes
+        ReactiveKernels._add_recipe!(rebuilt, r.inputs, r.outputs, r.op, r.cost,
+            r.cse_key, r.effectful, r.source)
+    end
+    names = [:x, :s, :total]
+    spec = ReactiveKernels.KernelSpec(rebuilt, Dict(n => F.scaled.ports[n] for n in names),
+        names, [:x, :s], [:total], nothing)
+    @test merge(spec, spec) isa ReactiveKernels.KernelSpec
+end
+
 module FirstRebindingFixture
 using ReactiveKernels
 square(data) = data .^ 2

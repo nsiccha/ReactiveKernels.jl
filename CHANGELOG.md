@@ -16,6 +16,190 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.164
+
+- A plate cell whose value is one broadcast of 32 or more operands, such as
+  an n-ary `.+` of many `x_k[i] .* beta[k]` terms, and which a nested plate or
+  a vector likelihood reads entry by entry, is now type stable, so ordinary
+  Enzyme Reverse differentiates it. The cell's composed broadcast mapped,
+  instantiated, typed and read its operand tuple through Base, which stops
+  specializing a tuple at 32 elements: preparation warned that the entry call
+  is not type stable, and the gradient raised `EnzymeRuntimeActivityError`
+  (33 operands) or aborted the process with a GC error (32 operands). It now
+  uses the structural expansion a top-level wide broadcast already uses.
+  Broadcasts of fewer than 32 operands are unchanged (snag
+  `plate-cell-n-ary-3391765b`).
+
+## 0.1.163
+
+- With bound data, a gather that a plate cell or partition reads at its rows
+  keeps its row form when a total-only plate downstream of that cell also
+  reads it. Bound preparation gives a residual gather that feeds a
+  total-only plate a run schedule (`_readonly_gather_runs`). It used to give
+  one to every ancestor of that plate, including a gather that reaches it
+  only through a plate cell. A cell runs its plate at its own rows, where no
+  run schedule applies, and the rewritten gather had no row form. A cell
+  prepared with `locality = :error` then raised `PartitionLocalityError`
+  ("its producer `_readonly_gather_runs` has no row form"). RKPPL's
+  `prepare_cell_factor_ad(…, :outer, …)` raised it for a nested model whose
+  cell reads a per-subject gather, `mu[i]` with `mu = a .+ s .* z[subject]`,
+  because the exemplar sums it evaluates at preparation are such a plate.
+  This was BRM's sparse Laplace, `integrate = (:subject, :unit)`, in snag
+  `cell-factor-ad-r-b4e2a0f4`. The run schedule now stops at a plate cell. A
+  gather that also reaches the plate another way is read whole there, and
+  keeps its runs.
+
+## 0.1.162
+
+- In a partition, a matrix value that several one-cell members ask for at
+  their own rows is now one row per requested row, as a number already was
+  (0.1.157). This covers a reshape of a parameter vector and its product with
+  a matrix, BRM's `b = z * transpose(tau .* L)` group effects. A reshape's row
+  at one row is the row itself (`_CellOneRow`), not a reshaped copy. Its
+  product with a matrix is a row whose entries are summed where they are
+  read, in the order of RK's own product loop. Neither allocates an array or
+  its Enzyme shadow. ReactiveKernelsPPL's compact overlay is read at the
+  requested rows without copying them.
+  - BRM's `unit_cost.jl` PK toy: the one-subject gradient takes about half
+    the time (1,248 → 624 B).
+  - The joint PK/QT toy allocates about 30% less (6,016 → 4,272 B), with no
+    clear change in time.
+  - Values and gradients on both toys are bitwise equal to 0.1.157.
+  - A product that the previous version left to BLAS for strided operands now
+    sums in RK's order instead. On an RKPPL model with `b = z * F` this moved
+    values by up to 3 ulp and gradients by up to 7 ulp (relative 9e-16).
+
+## 0.1.161
+
+- A native scan whose trajectory is read only through one element,
+  `trajectory[k]`, `last(trajectory)` or `first(trajectory)`, runs the steps
+  through `k` and keeps only that output: no trajectory is allocated. It
+  extends the slice-only demand `trajectory[lo:hi]`. The value and the
+  `BoundsError` of an index outside the trajectory are unchanged; every case
+  the slice demand keeps materialized (a WANT or another reader, `history`,
+  an effectful step, a non-concrete element type, a non-`Int` index, a
+  sequence that is neither a vector nor a range) stays materialized.
+- `sum(p)` or `logsumexp(p)` of an authored plate `p` written inside a larger
+  expression (`scale^2 * sum(terms)`) now streams the plate's total, as the
+  same fold written as its own statement did; the cells are no longer stored.
+  The total is the statement form's, bit for bit; against reducing the stored
+  cells as a vector, only the floating-point rounding of the reduction can
+  differ, as for every streamed plate total. A plate folded by two different
+  functions, by a fold statement with a declared type or the returned value,
+  or inside a branch or loop keeps its expression as written.
+- Together these make DistributionKernels' one-sided LogNormal `var()`
+  (`lower_truncated_lognormal`, `upper_truncated_lognormal`) allocate nothing
+  per call, where it allocated about 3–7 KB, and cut its time and its Enzyme
+  Reverse gradient's by a third to a half (snag `dk-one-sided-log-c73f7aba`).
+
+## 0.1.160
+
+- New: `register_source_provider!(provider)` and `TraceableSource(argument_names,
+  body, mod)`, so a package that generates a method (a macro that writes it
+  into its caller's module) can hand `jax_source` the method's Julia source.
+  `jax_source` asks each registered provider, `provider(f, argument_types)`,
+  for a call that has no translation of its own and no `@traceable` source,
+  and translates the body it returns as it translates an `@traceable` body:
+  `jax.lax.fori_loop` for a `for` loop, `jax.lax.cond` for an `if`,
+  `.at[i].set` for `A[i] = v`, and host Python in `prepare_data`. Before,
+  such a method stopped `jax_source` with `JAXEmissionError: the function
+  ... has loops or branches`. Register the provider once, from the
+  `__init__` of the package's extension on ReactiveKernels. Native
+  execution, `prepare` and the compiled paths never read the source (snag
+  `register-generat-a22e2325`, decision `0os7s7u`).
+
+## 0.1.159
+
+- `jax_source`: a matrix padded along a ragged row, such as a mixture law's
+  `cell = (x .- centres) ./ scales` for `x = vcat(x1, x_rest)` with `x_rest`
+  one row of per-row features, now reduces in the JAX functions.
+  `sum(cell; dims = 1)` (and `prod`, `maximum` and `minimum` over `dims`)
+  raised `JAXEmissionError` (`sum over dims of a Matrix{Float64}`); it now
+  sums the row's entries only. A whole-array `sum(cell)` or `sum(f, cell)`
+  emitted but read the padding as entries, a wrong value whenever rows have
+  different lengths, and `maximum(cell)` failed in Python; both now mask the
+  padded axis. The translation records which axes of an array the padding
+  covers (a broadcast keeps its operands', a transpose swaps them, an outer
+  product `x * x'` and `I(n)` cover both), and `vec` of such a matrix puts its
+  valid entries first. A reduction or `vec` of a padded array whose padded
+  axes it does not record (a matrix product with a padded operand) now raises
+  `JAXEmissionError` instead of reading the padding (snag
+  `jax-source-sum-c-bcfa9d53`).
+
+## 0.1.158
+
+- Hessian-vector products and third-order derivatives (`prepare_ad_hvp`,
+  `prepare_ad_third`, `prepare_ad_accumulator` at orders 1 and 2) work for a
+  kernel with many inactive HAVE ports, under both reverse over forward and
+  forward over reverse. From about 28 such ports they raised
+  `EnzymeRuntimeActivityError` ("Constant memory is stored (or returned) to a
+  differentiable variable"). Each inactive port crossed the backend as its own
+  `Constant` context, and from 32 contexts DifferentiationInterface and
+  Enzyme splat them through a heap tuple; inside a nested derivative that
+  tuple stores the constant operands beside the active point. Past 16 plain
+  inactive operands, they now cross as one `Constant` tuple, as the hidden
+  bound operands already do. An RKPPL compact cell takes each shared value
+  it reads as such a port, so BRM's sparse Laplace raised this for a model
+  whose cells read 33 of them (snag `varyingsource3-b-82246291`). Kernels with
+  at most 16 plain inactive operands differentiate exactly as before.
+
+## 0.1.157
+
+- A plate cell, and a partition with `single = true`, runs an authored plate
+  that it reads at its one row as that plate's one cell. The value is held in a
+  non-allocating one-element vector, instead of a plate computed over a
+  one-row array. A vector it reads as a lane, computed as a number at that
+  row, is read as one too.
+- In a partition, a value asked for at several such rows (two one-cell
+  members of one subject, each reading the subject's predictor at its own
+  row) is one number per row asked for, instead of an array over their union.
+  Each after the first is computed only when no earlier one has its row, so a
+  row asked for twice is still computed once. The program does not depend on
+  whether the rows agree. Values and gradients are unchanged: on BRM's
+  `unit_cost.jl` toys (24 subjects) they are bitwise equal to the previous
+  version for every subject, and the joint PK/QT model's local gradient went
+  from 113 to 87 allocations (todo `1yggoad`).
+- Fixed: a `vcat` read at one row converts each entry to the `vcat`'s element
+  type. An integer literal beside floating-point operands gave a `Union` that
+  native Enzyme Reverse refused.
+
+## 0.1.156
+
+- A plate that reads a bound value through an undeclared name for it
+  (`t = s`, with `s::Float64` bound) now keeps that value's declared type
+  when its preparation is copied and composed. Bound preparation used to
+  type the plate's operand `t` as `Number`, so a graph built from the
+  prepared recipes held `t::Number` beside `s::Float64`, and `merge` refused
+  it with `cannot merge structural aliases for value :t: Number does not match
+  Float64`. RKPPL builds its factor catalogue that way, so a selective SMC
+  window whose fresh prior reads a data-valued scale through such a name
+  (BRM's `log_rate_prior_scale = offset_scale`) failed to prepare (snag
+  `selective-fresh-96f7fe96`).
+
+## 0.1.155
+
+- `ReactiveKernels.input_check!(spec, input, f, args...)` checks a HAVE input
+  at the entry of every prepared cut of `spec` that takes it and reads it:
+  native, each `vectorize` lane, the primal of every derivative operator, a
+  non-allocating kernel and a `jax_source` module. The cut calls `f(args...)`,
+  where a `Symbol` names a value of the kernel (the input, or a value computed
+  from data such as a size) and anything else is passed as written. It runs
+  before any recipe when its arguments are inputs or bound data, otherwise as
+  soon as the cut has computed them; the cut computes them even when nothing
+  it returns needs them, and a split plan keeps them on the side that reads
+  the input. The check is not a recipe, so no read analysis (footprints,
+  partitions, cells, activity) sees it: it must read the input's shape alone.
+  A cut calls it as `ReactiveKernels._input_check(f, args...)`, which Enzyme
+  treats as constant, so a gradient never differentiates the check or its
+  error path; it prints that way in `code_expr`. A graph derived from the
+  kernel keeps the check on the same value: the copies a cut's preparation
+  makes, `plate_cell`, `plate_partition`, `compose`, `rename`, a call of the
+  kernel inside another and a stateful kernel's child (`InputCheck`,
+  `Graph.checks`, `Plan.checks`). Registering a check advances the graph's
+  version, so plans and caches made before it are not reused.
+  ReactiveKernelsPPL 0.1.153 uses it to refuse a packed point of another
+  binding's length. Snag `rk-prepared-cut-0e0b98ed`, decision `05x3m7a`.
+
 ## 0.1.154
 
 - `jax_source` with `data`: a recipe of a top-level plate's cell that reads

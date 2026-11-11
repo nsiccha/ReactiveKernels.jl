@@ -95,6 +95,22 @@ end
         end
     end
 
+    # The variance's Mills-ratio quadrature and continued fractions run in
+    # place: a call allocates nothing, in its quadrature (small scale) and
+    # direct (large scale) regimes alike (snag dk-one-sided-log-c73f7aba).
+    @testset "one-sided variance allocates nothing" begin
+        allocated(f::F, args::Vararg{Any,N}) where {F,N} = @allocated f(args...)
+        for (object, boundname, args) in
+                ((lower_truncated_lognormal, :lower, ((-3.0,0.2,1.0), (0.0,2.0,0.5))),
+                 (upper_truncated_lognormal, :upper, ((3.0,0.2,10.0), (0.0,2.0,3.0))))
+            v = prepare(extract(object; have=(:location,:scale,boundname), want=:var))
+            for a in args
+                v(a...)
+                @test allocated(v, a...) == 0
+            end
+        end
+    end
+
     @testset "LogNormal log tails retain extreme probabilities" begin
         lcdf = prepare(extract(lognormal; have=(:x,:location,:scale),want=:logcdf))
         lccdf = prepare(extract(lognormal; have=(:x,:location,:scale),want=:logccdf))

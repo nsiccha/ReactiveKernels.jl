@@ -1059,8 +1059,11 @@ end
 ReactiveKernels._cell_lazy_view(::typeof(_compact_cell_point)) = true
 
 # A conditional partition may read shared base coordinates beside its local
-# active coordinates. Its row form materializes only the requested rows, so
-# downstream reshapes and row reads do not retain the full packed base.
+# active coordinates. Its row form reads only the requested rows: the constant
+# base gathered at them, overlaid by the active vector where a row's slot maps
+# there (`_local_cell_rows`, a `_CompactCellPoint` over those rows). Nothing is
+# allocated for the active entries or their Enzyme shadow, and downstream
+# reshapes and row reads do not retain the full packed base.
 @inline _local_cell_point(base, active, slots) = _CompactCellPoint(base, active, slots)
 ReactiveKernels._cell_lazy_view(::typeof(_local_cell_point)) = true
 function ReactiveKernels._cell_lazy_rows(::typeof(_local_cell_point), inputs, rows, bind,
@@ -1073,14 +1076,8 @@ function ReactiveKernels._cell_lazy_rows(::typeof(_local_cell_point), inputs, ro
     base_rows = bind(:cell_base_rows, Expr(:ref, inputs[1], rows))
     Expr(:call, GlobalRef(@__MODULE__, :_local_cell_rows), base_rows, inputs[2], slots)
 end
-@inline function _local_cell_rows(base_rows::AbstractVector, active, slots::AbstractVector)
-    result = Vector{Float64}(undef, length(slots))
-    for i in eachindex(base_rows, slots)
-        slot = slots[i]
-        result[i] = iszero(slot) ? base_rows[i] : active[slot]
-    end
-    result
-end
+@inline _local_cell_rows(base_rows::AbstractVector, active, slots::AbstractVector) =
+    _CompactCellPoint(base_rows, active, slots)
 @inline _local_cell_rows(base_row::Float64, active, slot::Integer) =
     [iszero(slot) ? base_row : active[slot]]
 
@@ -1280,6 +1277,7 @@ function _compact_overlay!(spec, plan::StructuralPlan)
     end
     add!(spec.graph, (spec[:_ppl_cell_base], spec[:_ppl_cell_active],
         spec[:_ppl_cell_slots]) => spec[:unconstrained], _compact_cell_point)
+    _check_overlay_base!(spec.graph, spec[:unconstrained], spec[:_ppl_cell_base])
     filter!(!=(:unconstrained), spec.have_names)
     prepend!(spec.have_names, [:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots])
     filter!(n -> n ∉ _absent_inputs(plan), spec.have_names)
@@ -2456,7 +2454,8 @@ end
 function _compact_partition_plan(p::ReactiveKernels.Plan; whole_footprint::Bool=true)
     old = p.graph
     graph = Graph(copy(old.values), copy(old.recipes),
-        Dict(id => copy(ids) for (id, ids) in old.producers), copy(old.aliases), old.version, nothing)
+        Dict(id => copy(ids) for (id, ids) in old.producers), copy(old.aliases), old.version, nothing,
+        copy(old.checks))
     overlay = map((:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots),
                   (AbstractVector{Float64}, AbstractVector{Float64}, AbstractVector{Int32})) do name, type
         any(v -> v.name === name, values(graph.values)) && throw(ContractValidationError(
@@ -2464,6 +2463,7 @@ function _compact_partition_plan(p::ReactiveKernels.Plan; whole_footprint::Bool=
         value!(graph, name, type)
     end
     packed = only(v for v in p.have if v.name === :unconstrained)
+    _check_overlay_base!(graph, packed, first(overlay))
     point = whole_footprint ? _compact_cell_point : _local_cell_point
     recipe = ReactiveKernels._add_recipe!(graph, overlay, (packed,), point,
         1.0, nothing, false, ReactiveKernels._NO_KERNEL_SOURCE)
