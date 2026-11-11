@@ -1982,9 +1982,12 @@ end
     _jax_elementwise(f) -> Union{Nothing,String,Pair{String,String}}
 
 The `jax.numpy` expression of the scalar function `f`, applied elementwise to
-arrays (`"jnp.exp"`), or `name => source` for a module-level helper `name`
+arrays when broadcast (`"jnp.exp"`), or `name => source` for a module-level helper `name`
 that `source` defines, or `nothing`. A package adds a translation for its own
 scalar function with a method of this function.
+An ordinary array call uses `_jax_function_call`: `exp(A)` and `exp.(A)`
+have different Julia semantics. See the JAX source guide's package translation
+contract for the whole-call hook, result metadata and host preparation.
 """
 function _jax_elementwise(f)
     name = get(_JAX_ELEMENTWISE, f, nothing)
@@ -2087,8 +2090,20 @@ function _jax_shifted_limit(f, args::Vector{_PyVal}, v::_PyVal)
     _PyVal(v.code, v.T, v.static, v.extent, limit, v.padded)
 end
 
-# A call with array semantics, or of a function translated from its own
-# graph or source.
+"""
+    _jax_function_call(ctx::_JaxContext, f, args::Vector{_PyVal}) -> _PyVal
+
+Translate a positional call, including one with Julia's whole-array semantics.
+A package specializes on `typeof(f)` for its own function. Each argument carries
+its Python expression (`code`) and Julia type (`T`); return a translated `_PyVal`,
+usually from `_jax_result(f, args, expression)`, not a string or `nothing`.
+The default method translates recorded/provider source or straight-line lowered
+code. It is reached after any applicable scalar/elementwise mapping.
+
+The hook also runs for host `prepare_data` (`ctx.host !== nothing`). The JAX
+source guide documents host spelling, helper definitions, static operands and
+ragged metadata, with the executable `examples/jax_translations.jl` example.
+"""
 _jax_function_call(ctx::_JaxContext, f, args::Vector{_PyVal}) =
     _jax_traceable_or_lowered(ctx, f, args)
 function _jax_traceable_or_lowered(ctx::_JaxContext, f, args::Vector{_PyVal})
@@ -3123,6 +3138,21 @@ end
 _jax_call_positional(ctx::_JaxContext, c::_KernelPreparedChild, args::Vector{_PyVal}) =
     _jax_call_positional(ctx, c.kernel, args, c.name)
 
+# An authored kernel called as a function, which Julia runs as
+# `prepare(spec)(args...)` (a binder's data-only definition `m = mean_of(x)`
+# calling a program-level `@kernel`): that prepared kernel, prepared once per
+# module. Called with no arguments, a kernel is a graph view, not a value; and
+# a kernel with keyword arguments or defaults fills them by its signature.
+function _jax_call_positional(ctx::_JaxContext, spec::KernelSpec, args::Vector{_PyVal})
+    isempty(args) && _jax_error("the kernel `", spec, "` called with no arguments is a ",
+                                "graph view, not a value", _jax_where(ctx))
+    k = get!(() -> prepare(spec), ctx.mod.helper_names, (:prepared_spec, objectid(spec)))
+    k isa PreparedKernel ||
+        _jax_error("the kernel `", spec, "` has keyword arguments or defaults; its call ",
+                   "has no JAX translation", _jax_where(ctx))
+    _jax_call_positional(ctx, k, args)
+end
+
 # A `@traceable` helper, or a method whose source a registered provider
 # supplies: its authored body over the arguments, as the compiled
 # path reads it. Its locals are scoped to the call.
@@ -3187,8 +3217,9 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
     any(st -> st isa Core.GotoNode || st isa Core.GotoIfNot ||
               (st isa Expr && st.head in (:enter, :leave, :pop_exception)), ci.code) &&
         _jax_error("the function `", f, "` has loops or branches, so its lowered code is ",
-                   "not translated", _jax_where(ctx), ". Author it as a kernel, ",
-                   "or give it a `ReactiveKernels._jax_function_call` method; for a method ",
+                   "not translated", _jax_where(ctx), ". Define it with `@traceable` (its ",
+                   "authored body is translated), author it as a kernel, or give it a ",
+                   "`ReactiveKernels._jax_function_call` method; for a method ",
                    "a package generates, the package supplies its source with ",
                    "`ReactiveKernels.register_source_provider!`")
     mod = parentmodule(f)

@@ -868,6 +868,79 @@ end
     end
 end
 
+# Data-only definitions calling program-level kernels, as BRM's emitted
+# covariate anchors and level positions do (`x_mean = brm_covariate_mean(x)`):
+# `prepare_data` computes them from the kernels' plans, so the module takes
+# only the raw data (snag jax-source-data-ee25db34). A guarded running mean,
+# and positions among sorted levels by a plate whose cell calls a
+# `@traceable` search.
+@kernel jax_ppl_kspec_mean(values) = begin
+    mean = begin
+        for i in 1:length(values)
+            isfinite(values[i]) || throw(ArgumentError("finite values"))
+        end
+        isempty(values) && throw(ArgumentError("at least one value"))
+        fitted = float(values[1])
+        for count in 2:length(values)
+            fitted += float(values[count]) / count - fitted / count
+        end
+        fitted
+    end
+    return mean
+end
+@traceable function jax_ppl_kspec_position(levels, value)
+    lo, hi = 1, length(levels)
+    while lo < hi
+        mid = (lo + hi) ÷ 2
+        if levels[mid] < value
+            lo = mid + 1
+        else
+            hi = mid
+        end
+    end
+    lo
+end
+@kernel jax_ppl_kspec_positions(values, sorted_levels) = begin
+    positions = ReactiveKernels.plate(values) do value
+        jax_ppl_kspec_position(sorted_levels, value)
+    end
+    return positions
+end
+@testset "jax_source(built, plan): data-only definitions calling program-level kernels" begin
+    model = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+        c[1:3] .~ Normal.(0, 1)
+        xm = jax_ppl_kspec_mean(x)
+        pos = jax_ppl_kspec_positions(g, levels)
+        y .~ Normal.(a .+ b .* (x .- xm) .+ c[pos], s)
+    end
+    bind(x, g) = model(; x, g, levels = [1.0, 2.0, 3.0]) | (; y = sin.(eachindex(x)))
+    plan = bind(collect(range(0.3, 4.1; length = 6)), [3.0, 1.0, 2.0, 3.0, 1.0, 2.0])
+    other = bind([1.5, 0.2, 3.3, 0.9], [2.0, 2.0, 1.0, 3.0])
+    built = build_kernel(plan)
+    src = jax_source(built, plan)
+    text = string(src)
+    @test occursin("UNTRANSLATED = {}", text)
+    inputs = first.(src.functions[1].inputs)
+    @test !("xm" in inputs) && !("pos" in inputs)
+    @test occursin("def _mean_np(", text) && occursin("def _positions_np(", text)
+    # One module serves every binding.
+    @test string(jax_source(build_kernel(other), other)) == text
+    if !rk_jax_available()
+        @test_skip false
+    else
+        for p in (plan, other)
+            b = build_kernel(p)
+            query = prepare_query(b, p, :sampler)
+            u = collect(range(-0.4, 0.6; length = b.layout.total))
+            r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(p, src)...);
+                                grad = true, prepare = true)
+            @test r.value ≈ query(u) rtol = 1e-12
+            @test r.grad ≈ rk_fd_gradient(query, u) rtol = 1e-6
+        end
+    end
+end
+
 # A data-only value the program computes with a helper that has no
 # translation (it fills a `Dict` in a loop) and reads by its fields, as BRM's
 # `car_graph` bodies do: the value is an input of `prepare_data`, named in
@@ -932,6 +1005,8 @@ end
         @test !("n" in inputs) && !any(startswith("_"), inputs)
         @test occursin("UNTRANSLATED = {\"" * g * "\": \"the function `jax_ppl_levels_of` " *
                        "has loops or branches", text)
+        # Its advice names `@traceable`, which a plain helper with loops needs.
+        @test occursin("Define it with `@traceable`", text)
         # One module serves every binding.
         @test string(jax_source(build_kernel(other), other)) == text
         rk_jax_available() || (@test_skip false; continue)
