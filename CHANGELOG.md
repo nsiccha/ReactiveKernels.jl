@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.170
+## 0.1.171
 
 - Partition plans retain label-only row bookkeeping inside an outer conditional,
   including source calls with lexical `let` arguments. Preparation evaluates
@@ -27,6 +27,14 @@ are recorded in the git history only.
   the one-subject gradient allocates about 28% less; paired subject calls were
   about 14% faster, or 10% after normalizing against each process's sweep.
   Values and ordinary Enzyme gradients matched the previous implementation.
+
+## 0.1.170
+
+- `jax_source` translates `join` and generators of values available while
+  JAX traces, including joined dimension-error diagnostics in recorded and
+  source-provider helpers. The emitted Python retains iteration, filters,
+  Julia's product iteration order and optional final delimiters. The same
+  translation supports concrete data values in host `prepare_data`.
 
 ## 0.1.169
 
