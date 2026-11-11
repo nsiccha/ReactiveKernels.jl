@@ -578,7 +578,7 @@ _affine_block_name(p::PredictorSpec) = _parameter_terms(p) ?
     PopulationPrior(predictor, addressee, family, location, scale[, nu])
 
 Per-addressee population prior addressed by `(predictor,
-column|:Intercept)`. `family` is one of [`POPULATION_FAMILIES`](@ref)
+column|:Intercept)`. `family` is one of `POPULATION_FAMILIES`
 (`:flat` contributes 0.0 — StanBlocks flat-token parity — and ignores
 location/scale/nu); `nu` is the StudentT degrees of freedom (`NaN`
 otherwise, always a literal). A factor source column address applies
@@ -742,7 +742,7 @@ One declared array-valued parameter: a plain value the model reads by
 name (`z`, `z[g]`, `z[1]`, `B * w`, `L[2, 1]`), never a hidden
 coefficient block. Two kinds of family:
 
-- An elementwise family (any [`SAMPLED_ARITY`](@ref) key): the
+- An elementwise family (any `SAMPLED_ARITY` key): the
   surface `z[1:K] .~ Normal.(mu, s)` — independent draws per element,
   with Distributions.jl `Normal.(…)` broadcast semantics. `args` use
   positional keys `(arg1, …)`; each is a Real literal, a Symbol (a scalar
@@ -845,7 +845,7 @@ One literal-index seed fill of a `@scan` carried array `target`, mirroring
 - `kind === :sample` — `target[index] ~ Dist(args…)`: a sampled seed.
   `family` is an internal family symbol (see the surface's
   `_PARAM_FAMILIES`), `args` the positional distribution-argument
-  expressions and `support` its [`SupportOverride`](@ref) (`restricted`,
+  expressions and `support` its `SupportOverride` (`restricted`,
   `truncated` and half priors, as for a scalar parameter); `expr` is
   `nothing`.
 - `kind === :assign` — `target[index] = expr`: a deterministic seed (a
@@ -948,7 +948,7 @@ order, `nothing` marking intercept-ones positions. Data/derived columns
 only (length-n by bind/construction); latent, scan, parameter, and
 nested-matrix names are rejected — the SB `me` mirror stays affine and
 nested `hcat` stays a follow-up. The generator emits each matrix once
-(`X = Float64.(hcat(...))`); [`MatrixTerm`](@ref)s reference it by name
+(`X = Float64.(hcat(...))`); `MatrixTerm`s reference it by name
 and splice `X * view(coef, ...)` matvecs. Width is static
 (`length(columns)`); the surface sizes coefficient vectors from it.
 
@@ -1047,7 +1047,7 @@ predictor Symbols allowed. `levelmaps` sizes every factor term
 (binder-evaluated values); `plate_parameters` carries per-cell latents,
 `vector_parameters` leveled-response latents (cutpoints/thresholds/simplexes),
 `scans` sequential-recurrence latents, and
-`matrices` user-bound design matrices referenced by [`MatrixTerm`](@ref)s
+`matrices` user-bound design matrices referenced by `MatrixTerm`s
 (empty for a plain population-GLM plan). `array_parameters` are the
 declared array-valued parameters ([`ArrayParameter`](@ref)) the model reads
 by name. `submodel_scopes` records lexical author paths separately from
@@ -1075,7 +1075,7 @@ definition holding each index's dimensions; draws show it as one array per
 index under that name.
 `cell_geometries` maps the packed array parameter of each undotted `@plate`
 cell latent with a caller-owned joint geometry (`c[i] ~ F(…)`) to its
-[`CellGeometry`](@ref ReactiveKernelsPPL.CellGeometry); draws show it as one
+`CellGeometry`; draws show it as one
 constrained value per index under the authored name.
 """
 struct StructuralPlan
@@ -1398,7 +1398,7 @@ function _find_matrix(plan::StructuralPlan, name::Symbol)
     return i === nothing ? nothing : plan.matrices[i]
 end
 
-"""Value matrices of `plan`: design matrices no [`MatrixTerm`](@ref) and no
+"""Value matrices of `plan`: design matrices no `MatrixTerm` and no
 GLM response reads. The program reads each as a matrix value, so
 [`bind_data`](@ref) builds it from its columns and binds it as data."""
 function _value_design_matrix_names(plan::StructuralPlan)

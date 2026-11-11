@@ -162,7 +162,7 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
 
     # A binding with no rows prepares the program a binding with rows
     # prepares, by default: sizes are data, not program structure (user rule
-    # `0ikeidi`; snag `empty-plate-samp-ef647a0d`, where an ODL region with no
+    # `0ikeidi`; snag `empty-plate-samp-ef647a0d`, where an downstream region with no
     # spectra rows got its own sampler type). The empty domain evaluates
     # nothing; a value every cell would share is a typed placeholder, an empty
     # array for a bound column read whole.

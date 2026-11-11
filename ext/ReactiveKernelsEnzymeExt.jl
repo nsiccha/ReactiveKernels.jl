@@ -560,7 +560,7 @@ end
 # The operands' values, unrolled. A plate program can take more operands than
 # `map` over a tuple unrolls (32): past that, `map` loses the element types, the
 # primal and tape types are no longer inferred, and Enzyme refuses the rule's
-# `AugmentedReturn` (ODL's SH program, about 40 operands).
+# `AugmentedReturn` (a downstream application’s SH program, about 40 operands).
 @generated _pr_values(args::Tuple) =
     Expr(:tuple, (:(getfield(args, $i).val) for i in 1:length(args.parameters))...)
 

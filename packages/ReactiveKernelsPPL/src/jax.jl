@@ -195,7 +195,7 @@ end
 
 # The data-only definitions `bind_data` evaluated, as `prepare_data`
 # computes them on the host from the data the caller binds (decision of the
-# ODL JAX handoff: a Python caller rebinds raw data without Julia). A scalar
+# downstream JAX handoff: a Python caller rebinds raw data without Julia). A scalar
 # data value `s` reaches the program as the definition
 # `s = _bound_value(_rkppl_value_s)`: the caller passes `s`, and
 # `_rkppl_value_s` is that value; likewise the observed value of a

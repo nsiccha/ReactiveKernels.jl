@@ -2950,7 +2950,7 @@ end
 # for. A tuple-valued plate then computes every entry at every such row, so a
 # reader of one entry also runs the statements only another entry needs and reads
 # their inputs, such as another partition's coordinates (snag
-# `absent-odl-vecto-d98e48bf`). When its readers read different constant entries
+# `empty-vector regression`). When its readers read different constant entries
 # (`t[k]`), the plate is split by which of those readers' entry sets each statement
 # serves. Each statement goes to the one part for exactly that set, and a part
 # reads earlier parts' values as ordinary batched lanes, so row demand reaches a

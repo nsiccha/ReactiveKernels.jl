@@ -1525,7 +1525,7 @@ end
     "argument must be a number or a lane vector, got $(typeof(x))"))
 # Callable structs have no `nameof`, so without these the readable
 # Generated-kernel pane would render the partition's sourceless lane recipes
-# as an opaque `operation(...)` (refused by docs/kernel_examples.jl).
+# as an opaque `operation(...)` rather than the actual lane operation.
 _readable_callee(::_LaneGather) = :lane_gather
 _opname(::_LaneGather) = "lane_gather"
 
@@ -1979,7 +1979,7 @@ subset of `p.have`. The data-only prefix — every recipe whose transitive
 inputs reach only bound ports — is prepared and executed exactly once, inside
 this call. The result is an ordinary residual `Plan` whose HAVE boundary is
 the remaining ports, with each hoisted value re-entering as a zero-input
-[`_BoundConstant`](@ref) recipe, so every preparation surface consumes it
+`_BoundConstant` recipe, so every preparation surface consumes it
 unchanged and per-call work contains no data-only recomputation.
 
 For a residual authored `plate(...) do` with a transparent scalar plan, named
@@ -2262,7 +2262,7 @@ end
 # — a request-time `bound=` per user interaction — that fixed cost dominates
 # once the compiled bodies themselves are content-cached (snag
 # prepare-with-bou-c237dc00: ~1.3 ms of the ~2.6 ms `prepare` of the ShinyRK
-# simulation graph on strato2, against ~1.25 ms of genuine bound-data
+# simulation graph on a Linux fleet host, against ~1.25 ms of genuine bound-data
 # mathematics in its prefix). A `_BoundEntry` keeps the planned boundary and
 # the compiled prefix kernel per (graph, boundary, bound-port set, passes),
 # and a `_BoundTemplate` keeps the compiled residual, so rebinding runs the

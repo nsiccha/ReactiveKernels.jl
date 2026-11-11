@@ -269,13 +269,9 @@ law, with `censored` and `truncated` evidence wrapped as RKPPL observes it
 interval-censored and packed responses, caller-owned sampling laws and
 conditioned declarations are refused, naming them.
 
-```julia
-using Distributions, Random
-pred = prepare_predictive(built, design)
-draws = pred(u, Xoshiro(1))            # keyed like :pointwise, shaped like the responses
-predictive_draws!(draws, pred, u, rng) # in place
-laws = predictive_laws(pred, u)        # lazy: one Distributions law per entry
-```
+Call the prepared query with a packed point and an explicit random-number
+generator. [`predictive_draws!`](@ref) fills existing response storage, and
+[`predictive_laws`](@ref) exposes the corresponding Distributions laws.
 """
 function prepare_predictive(built, plan::StructuralPlan; on_error = nothing)
     kernel = _prepare_wants(built, plan, predictive_node(built); on_error)
@@ -294,15 +290,9 @@ other. Then turn its value into laws or draws with [`predictive_laws`](@ref),
 [`predictive_draws`](@ref) or [`predictive_draws!`](@ref), given
 [`predictive_targets`](@ref).
 
-```julia
-node = predictive_node(built)
-targets = predictive_targets(built, design)
-cut = ReactiveKernels.prepare(ReactiveKernels.compose(built.spec, summary);
-    have = (:unconstrained, :b, data_ports...), want = (node, :summary))
-reader = ReactiveKernels.vectorize(cut; batched = (:unconstrained, :b))
-value, summary = reader(U, B, data...)
-predictive_draws(value, targets, rng; position = k)   # draw k's observations
-```
+Use [`predictive_targets`](@ref) for the binding and retain the node in the
+prepared cut. After vectorization, the `position` keyword of
+[`predictive_draws`](@ref) selects one draw.
 
 The value holds numbers only (one array per law argument), so a vectorized
 cut stacks it on its trailing draw axis; its layout is otherwise not part of

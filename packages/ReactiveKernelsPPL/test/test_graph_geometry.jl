@@ -378,7 +378,7 @@ field_support(n) = (geometry=(n=n,),)
 
 # An external law's packed range and the shape its endpoints receive read their
 # extent from the data (user principle
-# `ODLPlaus:precompile/decisions/2026-11-06T01-09-46-212-0ikeidi`; snag
+# `runtime-values requirement`; snag
 # `gmrf-field-packe-ab48cb09`): every extent generates the same program, and the
 # first binding's build serves the others, derivative included.
 @testset "an external law reads its extent from the data" begin

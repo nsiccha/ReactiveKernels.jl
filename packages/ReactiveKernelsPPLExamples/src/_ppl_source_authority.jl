@@ -29,7 +29,7 @@ consumer runs its own `prepare` on the composed graph. This is what each model
 module's `__init__` uses to build its `_<MODEL>_GRAPH_TEMPLATE`, so package load
 pays only the graph construction, not a full prepare+evaluate per model. The
 full path (default) still runs the whole source and is what tests and the docs
-build use, so the demo/self-check is exercised there. Measured (strato2,
+build use, so the demo/self-check is exercised there. Measured (a Linux fleet host,
 2026-09-08): the demo tail is ~76–88% of a per-model source eval (eight_schools
 1.83s of 2.4s, rate_2 5.35s of 6.1s, pipeline-warm), which is the bulk of the
 old ~600s `using ReactiveKernelsPPLExamples` load storm across ~89 modules.

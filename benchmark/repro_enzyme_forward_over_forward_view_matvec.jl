@@ -21,7 +21,7 @@
 # active there and does not. On Julia 1.10 OpenBLAS zero-fills the
 # matrix-vector tangent. The local Enzyme `dogfood` line fixes it from
 # libEnzyme build `4be29b19`.
-# Recorded on gordito, Enzyme 0.13.216, Enzyme_jll 0.0.303, 300 calls each,
+# Recorded on a Linux fleet host, Enzyme 0.13.216, Enzyme_jll 0.0.303, 300 calls each,
 # 2026-10-25:
 #   Julia 1.10.12: view 0 NaN, slice 0 NaN
 #   Julia 1.12.7:  view 14 NaN, slice 0 NaN

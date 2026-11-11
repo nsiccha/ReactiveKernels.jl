@@ -14,7 +14,7 @@ const CALLS = Ref(0)
 counted_exp(x) = (CALLS[] += 1; exp(x))
 counted_log(x) = (CALLS[] += 1; log(x))
 
-# Bruno's brm7 dose-amount shape: amounts at the event operations, scaled by
+# Amounts at the event operations, scaled by
 # the bioavailability of the dose each operation belongs to (position 1: none).
 @kernel amounts(log_F, op_amount, op_dose_pos, op_rows, dose_rows) = begin
     totals = plate(eachindex(op_rows)) do i

@@ -147,7 +147,7 @@ end
         # (`_plate_similar_output`) and a pointwise plate fills it in place
         # (`mu[index] = value`). The rule's activity analysis must see that
         # write: an assignment-only analysis took the buffer for a constant
-        # and returned no gradient through it (ODL's calibrated hourly
+        # and returned no gradient through it (a downstream application’s calibrated hourly
         # amplitudes, todo 093ym5a).
         rng = MersenneTwister(31)
         N, J = 120, 6
@@ -194,7 +194,7 @@ end
         # 24 covariates, each with its own coefficient: the likelihood's plate
         # program takes about 50 operands. Past 32, `map` over the operand
         # tuple loses its element types; the Enzyme adapter must still infer
-        # the rule's primal and tape (ODL's SH program, about 40 operands).
+        # the rule's primal and tape (a downstream application’s SH program, about 40 operands).
         rng = MersenneTwister(21)
         N, K = 60, 24
         xs = [Symbol(:x, k) for k in 1:K]

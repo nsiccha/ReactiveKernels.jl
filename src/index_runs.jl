@@ -8,7 +8,7 @@ const _IndexRunData = Tuple{Vector{Int},Vector{Int},Int,Bool}
 # Grouped cost is per cell plus per run; flat cost is per cell only. On the
 # production-path synthetic (centered hierarchical intercept, n=4096) the
 # crossover is a mean run of about 5 for the density and 2 for Reverse, and a
-# mean of 8 wins both by more than 20% (evidence: RKPPLBench todo 0arze4h).
+# mean of 8 wins both by more than 20% (evidence: run-length benchmark evidence).
 const _INDEX_RUN_MINIMUM_MEAN_LENGTH = 8
 
 # Unknown index representations retain the original gather and loop. A concrete

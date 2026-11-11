@@ -473,9 +473,7 @@ end
 # prepared program. Warn once per process for each finding and continue, or
 # refuse the preparation, naming every finding. The check reads only the
 # kernel's plan and calls it through inference, so it compiles once rather than
-# once per prepared kernel type: specialized on the type of a large program's
-# kernel, its compilation took a third of that program's first read (63 of
-# 187 s, Bruno's varyingsource3 simulator; snag `compiled-reader-be3cadbb`).
+# once per prepared kernel type.
 Base.@nospecializeinfer function _check_uninferred_values(@nospecialize(kernel), argument_types)
     mode, level = _type_stability(), _type_stability_level()
     values = _uninferred_values(kernel, argument_types)

@@ -365,8 +365,8 @@ wherever a program reads an axis's labels, indexed by the axis's selection
 `permutedims(…)`, a level plate's values. Its input is bound data, so the
 call folds under `bound=`, and no label reaches compiled code: before, every
 label was spliced into the program as a literal, which LLVM compiled as one
-store per label (two 10,950-label statements took 60 s and 45 s on the
-ArbeitsplatzAtlas program). So a binding with other labels, or another number
+store per label (two 10,950-label statements took 60 s and 45 s on a
+downstream application program). So a binding with other labels, or another number
 of them, generates the same program and evaluates on the same build
 (`rkppl-use` §14).
 """
@@ -405,8 +405,8 @@ under `bound=` and the Enzyme reverse pass sees no new surface. Labels
 match through a dictionary (`isequal` and `hash`, as `Dict` compares:
 `missing`, `NaN`, `-0.0` and array labels keep their Julia meaning, and
 a categorical value finds its unwrapped label), so a column of n rows over
-K labels costs n lookups, not n × K comparisons: the 43,796-row Gemeinde
-columns of the ArbeitsplatzAtlas program took 1.2 s per preparation with
+K labels costs n lookups, not n × K comparisons: the 43,796-row region
+columns of a downstream application program took 1.2 s per preparation with
 the nested loop. Validated plans only: bind-time coverage validation
 proves every value occurs in `levels`, so the 0 fallback for uncovered
 values is unreachable in-graph (a loud bind error beats a silent wrong

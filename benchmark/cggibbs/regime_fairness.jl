@@ -2,7 +2,7 @@
 # representative n<d correlated case, and see whether it CONVERGES to the NUTS
 # posterior and what its converged bulk-ESS/second is. (Its O(d) sweeps are cheap,
 # so a long chain is the advantage the paper leans on.)
-include("/home/n/.local/state/kb-agents-worktrees/ReactiveKernels-sampling-gibbs/benchmark/cggibbs/cggibbs_vs_nuts.jl")
+include(joinpath(@__DIR__, "cggibbs_vs_nuts.jl"))
 using Statistics: mean
 
 function fair()

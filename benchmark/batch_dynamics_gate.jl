@@ -126,7 +126,7 @@ end
 
 # ---- model registry -------------------------------------------------------
 # The pharmacokinetic example and its scientific oracle now live in
-# RKPPLBench/examples/posteriordb_pk/.
+# downstream domain-specific packages..
 const KNOWN_MODELS = ("lotka", "sir", "soil")
 const SEL = strip.(split(get(ENV, "DYNAMICS_MODELS", join(KNOWN_MODELS, ',')), ','))
 for s in SEL
