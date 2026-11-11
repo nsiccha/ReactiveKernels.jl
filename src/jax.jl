@@ -3157,6 +3157,12 @@ function _jax_plan!(ctx::_JaxContext, p::Plan)
     for recipe in p.recipes
         _jax_plan_recipe!(ctx, p, recipe)
     end
+    # The plan's input checks (`InputCheck`), once its values are known: each
+    # translates as its function's JAX translation, usually a runtime check.
+    for c in p.checks
+        _jax_call(ctx, c.f, _PyVal[a isa Value ? _jax_lookup(ctx, p.graph, a) :
+                                   _PyVal(repr(a), typeof(a), true) for a in c.args])
+    end
 end
 # Each emitted recipe is on `ctx.mod.path` while it is emitted; an emission
 # error records the path where it was raised, innermost recipe last, so the

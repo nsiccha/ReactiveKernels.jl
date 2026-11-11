@@ -99,6 +99,26 @@ const _CS_NAMED = @rkppl begin
         y[k] ~ Poisson(exp(z[id[k]]) * _cs_source_rate(source, k))
     end
 end
+# A cell that reads more shared values than DifferentiationInterface and
+# Enzyme splat statically: each crosses the cell's derivative as an inactive
+# HAVE port (snag varyingsource3-b-82246291). Cell k's mean is
+# (z[id[k]] + Σ_j grid[k] (beta + j)) / K.
+const _CS_MANY_K = 30
+_cs_shift(grid, beta, j) = grid .* (beta + j)
+const _CS_MANY = let body = Expr(:block, :(beta ~ Normal(0, 1)),
+                                 :(z[levels(id)] .~ Normal.(0, 1)))
+    for j in 1:_CS_MANY_K
+        push!(body.args, :($(Symbol(:w, j)) = _cs_shift(grid, beta, $j)))
+    end
+    mean = Expr(:call, :+, :(z[id[k]]), (:($(Symbol(:w, j))[k]) for j in 1:_CS_MANY_K)...)
+    loop = quote
+        @plate for k in eachindex(y)
+            y[k] ~ Normal($mean / $_CS_MANY_K, 1.0)
+        end
+    end
+    append!(body.args, loop.args)
+    @eval @rkppl $body
+end
 @isdefined(_static_enzyme) || include("static_enzyme.jl")
 
 const _CS_REVERSE = AutoEnzyme(; mode = Enzyme.Reverse)
@@ -619,5 +639,55 @@ end
         g = zeros(length(u))
         partition_batch_value_and_gradient!(sampler, g, u, collect(1:n))
         @test g ≈ fd(point -> sum(label -> partition(point, label), 1:n), u) rtol = 1e-7 atol = 1e-8
+    end
+end
+
+@testset "A cell that reads more shared values than the splat limit" begin
+    # Its compact Hessian-vector products raised `EnzymeRuntimeActivityError`
+    # under both compositions, as BRM's sparse Laplace runs them for NLME
+    # `check_protocol` (snag varyingsource3-b-82246291).
+    n, K = 4, _CS_MANY_K
+    data = (; id = collect(1:n), grid = collect(range(-0.7, 0.9; length = n)),
+        y = [0.1, -0.3, 0.5, 0.2])
+    bound = _CS_MANY(; data.id, data.grid) | (; data.y)
+    built = build_kernel(bound)
+    u = collect(range(-0.2, 0.3; length = built.layout.total))
+    cell_mean(point, i) = (point[i+1] + sum(point[1] + j for j in 1:K) * data.grid[i]) / K
+    fd(f, point) = map(eachindex(point)) do j
+        hi, lo = copy(point), copy(point)
+        hi[j] += 1e-5; lo[j] -= 1e-5
+        (f(hi) - f(lo)) / 2e-5
+    end
+    for second in (_CS_SECOND, SecondOrder(AutoEnzyme(; mode = Enzyme.Forward), _CS_REVERSE))
+        q = prepare_compact_cell_ad(prepare_ad_hvp, built, bound, :y, u, [2],
+            second, ([0.6],); partitioned = :z, locality = :error)
+        @test length(q.shared.cache.values) == K
+        for i in 1:n
+            g, (hv,) = ad_gradient_and_hvp(q, ([0.6],), u, u[[i+1]], [i+1], i)
+            @test only(g) ≈ (data.y[i] - cell_mean(u, i)) / K
+            @test only(hv) ≈ -0.6 / K^2
+        end
+    end
+
+    q = prepare_compact_cell_ad(prepare_ad_third, built, bound, :y, u, [2],
+        _CS_THIRD, ([0.6],); partitioned = :z, locality = :error)
+    p = prepare_cell_pullback(q, _CS_REVERSE, u)
+    weights = [0.3, -0.4, 1.2, 0.8]
+    for (order, backend) in ((0, _CS_REVERSE), (1, _CS_SECOND), (2, _CS_THIRD))
+        a = prepare_cell_accumulator(q, backend, u; order)
+        gradient = zeros(length(u))
+        cell_pullback!(gradient, p, u) do batch
+            for i in 1:n
+                accumulate_cell!(batch, a, order == 0 ? nothing : [0.6],
+                    weights[i], u[[i+1]], [i+1], i)
+            end
+        end
+        # The weighted cell value, first or second directional derivative
+        # along z_i with 0.6.
+        contraction(point) = sum(1:n) do i
+            order == 0 && return weights[i] * logpdf(Normal(cell_mean(point, i), 1.0), data.y[i])
+            weights[i] * (order == 1 ? 0.6 * (data.y[i] - cell_mean(point, i)) / K : -0.36 / K^2)
+        end
+        @test gradient ≈ fd(contraction, u) rtol = 1e-7 atol = 1e-8
     end
 end
