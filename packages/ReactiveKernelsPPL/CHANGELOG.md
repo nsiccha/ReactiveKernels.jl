@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.152
+
+- A two-axis array whose prior takes a per-element argument
+  (`m[1:R, 1:K] .~ Normal.(loc, 1.0)` with `loc` an `R × K` matrix) generates
+  one program for every size. The argument's size check reads the extents the
+  array's own reshape reads (`_array_prior_cells(loc, (R, K))`); before, it
+  spelled one binding's size as a literal (`_array_prior_cells(loc, (2, 3))`),
+  so every `R` and `K` generated its own `kernel_expr` and `build_kernel`. A
+  data-only argument is still computed once at preparation, and an observed
+  (conditioned) array reads its own size. Snag `rkppl-per-elemen-c7b44344`.
+
 ## 0.1.151
 
 - `model_view`'s `text/html` rendering carries a scoped style, so a generated
