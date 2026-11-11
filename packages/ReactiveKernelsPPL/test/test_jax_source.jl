@@ -107,6 +107,16 @@ end
     beta[1:ntargets] .~ Normal.(0, 1)
     return cumsum(vcat(zeros(1, ntargets), simplex_incr); dims = 1) .* beta'
 end
+# A mixture law over a feature vector of any length (snag
+# jax-source-sum-c-bcfa9d53): each row's features after its first, `vcat`ed
+# and compared with every component's centre, reduced over the features.
+ReactiveKernels.@kernel jax_ppl_feature_mixture(x1, x_rest, centres, scales) = begin
+    x = vcat(x1, x_rest)
+    cell = -0.5 .* ((x .- centres) ./ scales) .^ 2 .- log.(scales)
+    score = vec(sum(cell; dims = 1))
+    peak = maximum(score)
+    return peak + log(sum(exp.(score .- peak)))
+end
 
 const _JAX_RNG = Xoshiro(20261024)
 const _JAX_N = 30
@@ -400,6 +410,16 @@ const _JAX_CASES = (
     end))(; log_transition = cat([log(0.5) -Inf; -Inf -Inf], [log(0.5) log(0.5); -Inf 0.0],
                                  [log(0.5) log(0.5); -Inf 0.0]; dims = 3),
            log_initial = [0.0, -Inf]) | (; y = [0.3, 0.1, -0.4, 0.2]),
+    # Each row's features reach the law as a padded row, so the feature
+    # matrix is padded along its first axis.
+    feature_mixture = () -> (@rkppl(begin
+        centres[1:D, 1:K] .~ Normal.(zeros_dk, 1.0)
+        @plate for i in eachindex(x1)
+            x1[i] ~ LogDensity(jax_ppl_feature_mixture, x_rest[i], centres, scales)
+        end
+    end))(; x_rest = [[0.2, -0.1], [0.1, 0.4], [-0.4, 0.0], [0.3, 0.2]], D = 3, K = 2,
+           zeros_dk = zeros(3, 2), scales = [1.0 0.5; 2.0 1.0; 0.7 1.3]) |
+        (; x1 = [0.1, -0.3, 0.5, 0.2]),
 )
 # ICAR priors (snag independent-icar-2e025fad): one field over a graph, and K
 # independent fields over the same graph as the rows or the columns of one

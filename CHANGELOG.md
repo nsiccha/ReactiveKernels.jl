@@ -16,6 +16,24 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.155
+
+- `jax_source`: a matrix padded along a ragged row, such as a mixture law's
+  `cell = (x .- centres) ./ scales` for `x = vcat(x1, x_rest)` with `x_rest`
+  one row of per-row features, now reduces in the JAX functions.
+  `sum(cell; dims = 1)` (and `prod`, `maximum` and `minimum` over `dims`)
+  raised `JAXEmissionError` (`sum over dims of a Matrix{Float64}`); it now
+  sums the row's entries only. A whole-array `sum(cell)` or `sum(f, cell)`
+  emitted but read the padding as entries, a wrong value whenever rows have
+  different lengths, and `maximum(cell)` failed in Python; both now mask the
+  padded axis. The translation records which axes of an array the padding
+  covers (a broadcast keeps its operands', a transpose swaps them, an outer
+  product `x * x'` and `I(n)` cover both), and `vec` of such a matrix puts its
+  valid entries first. A reduction or `vec` of a padded array whose padded
+  axes it does not record (a matrix product with a padded operand) now raises
+  `JAXEmissionError` instead of reading the padding (snag
+  `jax-source-sum-c-bcfa9d53`).
+
 ## 0.1.154
 
 - `jax_source` with `data`: a recipe of a top-level plate's cell that reads
