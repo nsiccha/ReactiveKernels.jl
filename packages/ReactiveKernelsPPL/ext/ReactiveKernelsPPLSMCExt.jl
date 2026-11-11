@@ -250,8 +250,14 @@ end
 LogDensityProblems.dimension(t::BridgeTarget) = t.dimension
 LogDensityProblems.capabilities(::Type{<:BridgeTarget}) = LogDensityProblems.LogDensityOrder{1}()
 
+# Sampler queries and reference AD are prepared with Vector{Float64}. Retained
+# checkpoint points can arrive in another AbstractVector container.
+_bridge_position(u::Vector{Float64}) = u
+_bridge_position(u::AbstractVector) = Vector{Float64}(u)
+
 # Endpoints branch explicitly: 0 * -Inf must never contaminate the other end.
 function LogDensityProblems.logdensity(t::BridgeTarget, u)
+    u = _bridge_position(u)
     t.temperature == 1 && return _checked(_density(t.target, u), u, :target, t.temperature)
     t.temperature == 0 && return _checked(_density(t.source, u), u, :source, t.temperature)
     a = _checked(_density(t.source, u), u, :source, t.temperature)
@@ -260,6 +266,7 @@ function LogDensityProblems.logdensity(t::BridgeTarget, u)
 end
 
 function LogDensityProblems.logdensity_and_gradient(t::BridgeTarget, u)
+    u = _bridge_position(u)
     # Each mutation worker owns its sampler query and AD scratch. Each returned
     # gradient is fresh: WarmupHMC may retain it in a trajectory.
     a, b = t.temperature == 1 ? (t.target, nothing) :
@@ -899,9 +906,9 @@ end
 # Recompute both endpoint scores on this host and measure how far they moved
 # from the stored ones. A score's deviation is scaled as
 # |new - old| / max(|old|, 1), the quantity `rtol` bounds.
-function _score_drift(cp, source, target)
-    scores = (; source=_scores(source, cp.positions, :source, cp.temperature),
-        target=_scores(target, cp.positions, :target, cp.temperature))
+function _score_drift(cp, source, target; positions=cp.positions, temperature=cp.temperature)
+    scores = (; source=_scores(source, positions, :source, temperature),
+        target=_scores(target, positions, :target, temperature))
     stored = (; source=cp.source_scores, target=cp.target_scores)
     changed, max_abs, max_rel, worst = 0, 0.0, 0.0, nothing
     for endpoint in (:source, :target), i in eachindex(scores[endpoint])
@@ -918,12 +925,12 @@ function _score_drift(cp, source, target)
     return (; scores, changed, total=2length(scores.target), max_abs, max_rel, worst)
 end
 
-function _drift_message(head, drift)
+function _drift_message(head, drift; point="particle")
     w = drift.worst
     return string(head, ". ", drift.changed, " of ", drift.total,
         " stored endpoint scores differ from this host's; the largest scaled ",
         "deviation |Δ|/max(|score|, 1) is ", drift.max_rel, " (largest |Δ| ",
-        drift.max_abs, "), at particle ", w.particle, "'s ", w.endpoint,
+        drift.max_abs, "), at ", point, " ", w.particle, "'s ", w.endpoint,
         " score: ", w.old, " stored, ", w.new, " here")
 end
 

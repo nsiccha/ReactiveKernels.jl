@@ -499,8 +499,51 @@ unrelated directory contents. `resume=partial` optionally writes its continuatio
 to `checkpoint_dir`, allowing an explicitly selected saved boundary to be forked.
 Without a directory, an orderly stop still returns an in-memory checkpoint;
 unexpected exceptions or process loss then have no automatic disk recovery.
+If another CPU rounds the same scores differently, ordinary resume still
+refuses. Use [`rescore_smc_tuning_checkpoint`](@ref) to explicitly re-anchor
+the outer scores and active sampler payloads before resuming.
 """
 function tune_smc end
+
+"""
+    rescore_smc_tuning_checkpoint(target, partial::SMCTuningPartial;
+        previous=nothing, rtol=1e-10)
+    rescore_smc_tuning_checkpoint(target, input_dir::AbstractString;
+        output_dir=input_dir, previous=nothing, rtol=1e-10)
+
+Explicitly re-anchor an adaptive `tune_smc` continuation on this host.
+The partial form returns an independent `SMCTuningPartial`. The directory
+form reads `input_dir/tuning_latest.jls`, validates and re-anchors it, then
+atomically replaces `output_dir/tuning_latest.jls` and returns the partial.
+The default updates the input directory; name a different output directory
+to preserve its checkpoint. Unrelated files are preserved. Validation or
+re-scoring failure does not replace the destination checkpoint.
+
+Schema, Julia/package versions, target and previous-endpoint identities,
+phase and completed kernels retain the ordinary resume checks. Re-anchoring
+uses the saved tuning configuration; resume still checks the caller's keywords.
+Both endpoint scores at every saved probe must satisfy
+`abs(new-old) <= rtol*max(abs(old),1)`. `rtol` must be finite and nonnegative;
+zero requires numerical equality. An excessive deviation names the endpoint
+and probe. The returned checkpoint appends a `rescored` record with
+`changed`, `max_abs`, `max_rel`, `rtol` and `codegen` for these outer scores.
+
+Each active reference or grid pilot is independently re-scored through
+`WarmupHMC.rescore_warmup_checkpoint` at its saved temperature, including
+every active independent-grid pilot. WarmupHMC checks the current evaluation
+and recomputable retained pointwise gradients, refreshes them, and keeps its
+own persistent audit. RNG state, counters, completed work and compressed
+adaptation history remain unchanged. The original partial is never mutated.
+Requires WarmupHMC 0.2.18 or later.
+
+Resume with the original tuning keywords and `resume=anchored`, or with
+`checkpoint_dir=output_dir, resume=true`. Ordinary resume remains exact; this
+operation does not certify model/data identity, migrate older package-version
+checkpoints or promise identical future trajectories across CPUs. Keep the
+same model, data and coordinate frame. Deserialize only trusted checkpoints
+and do not concurrently advance or replace the same continuation.
+"""
+function rescore_smc_tuning_checkpoint end
 
 """
     smc_reference(state_or_schedule)

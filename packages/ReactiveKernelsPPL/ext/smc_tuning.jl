@@ -60,7 +60,8 @@ function _record_tuning(cp, event)
     return cp
 end
 
-function _validate_tuning_checkpoint(cp, target, previous, config)
+# Shared resume/re-anchoring guards, without the exact score comparison.
+function _checked_tuning_checkpoint(cp, target, previous, config)
     cp isa NamedTuple && hasproperty(cp, :kind) && cp.kind === :smc_tuning &&
         hasproperty(cp, :schema_version) &&
         cp.schema_version == (config.grid_start === :independent ? 2 : 1) ||
@@ -86,10 +87,69 @@ function _validate_tuning_checkpoint(cp, target, previous, config)
     valid_phase ||
         throw(ArgumentError("invalid SMC tuning checkpoint phase"))
     foreach(kernel -> _validate_kernel(kernel, _dimension(target)), cp.kernels)
-    _scores(source, cp.probes, :source, _tuning_temperature(cp)) == cp.source_scores &&
-        _scores(target, cp.probes, :target, _tuning_temperature(cp)) == cp.target_scores ||
-        throw(ArgumentError("SMC tuning checkpoint endpoint densities differ; use the original code and data"))
+    # Every stored score must participate in the comparison below.
+    size(cp.probes, 1) == _dimension(target) &&
+        length(cp.source_scores) == length(cp.target_scores) == size(cp.probes, 2) ||
+        throw(ArgumentError("invalid SMC tuning checkpoint probes or endpoint scores"))
     return source
+end
+
+_tuning_score_drift(cp, source, target) = _score_drift(cp, source, target;
+    positions=cp.probes, temperature=_tuning_temperature(cp))
+
+function _validate_tuning_checkpoint(cp, target, previous, config)
+    source = _checked_tuning_checkpoint(cp, target, previous, config)
+    drift = _tuning_score_drift(cp, source, target)
+    if drift.changed > 0
+        message = _drift_message("SMC tuning checkpoint endpoint densities differ; " *
+            "use the original code and data", drift; point="probe")
+        drift.max_rel <= _RESCORE_RTOL && (message *= string(
+            ". This is within rescore_smc_tuning_checkpoint's default rtol=", _RESCORE_RTOL,
+            "; `rescore_smc_tuning_checkpoint(target, partial_or_directory; previous)` ",
+            "explicitly re-anchors the checkpoint on this host"))
+        throw(ArgumentError(message))
+    end
+    return source
+end
+
+function _rescore_tuning_checkpoint(target, checkpoint, previous, rtol)
+    isfinite(rtol) && rtol >= 0 ||
+        throw(ArgumentError("rtol must be a finite nonnegative number"))
+    cp = deepcopy(checkpoint)
+    target = _execution_target(target)
+    source = _checked_tuning_checkpoint(cp, target, previous, cp.config)
+    drift = _tuning_score_drift(cp, source, target)
+    drift.max_rel <= rtol || throw(ArgumentError(_drift_message(
+        "SMC tuning checkpoint endpoint densities differ by more than rtol=$(Float64(rtol)); " *
+        "use the original code and data", drift; point="probe")))
+    reanchor(payload, beta) = WarmupHMC.rescore_warmup_checkpoint(
+        BridgeTarget(source, target, beta, _dimension(target)), payload; rtol)
+    warmup = cp.warmup === nothing ? nothing : reanchor(cp.warmup, _tuning_temperature(cp))
+    pilots = map(enumerate(cp.pilots)) do (i, pilot)
+        pilot.warmup === nothing && return pilot
+        return merge(pilot, (; warmup=reanchor(pilot.warmup, cp.config.temperatures[i])))
+    end
+    record = (; changed=drift.changed, max_abs=drift.max_abs, max_rel=drift.max_rel,
+        rtol=Float64(rtol), codegen=_codegen_target())
+    rescored = haskey(cp, :rescored) ? vcat(cp.rescored, [record]) : [record]
+    return merge(cp, (; warmup, pilots, source_scores=drift.scores.source,
+        target_scores=drift.scores.target, rescored))
+end
+
+function PPL.rescore_smc_tuning_checkpoint(target::AbstractSMCTarget, partial::SMCTuningPartial;
+        previous=nothing, rtol::Real=_RESCORE_RTOL)
+    cp = _rescore_tuning_checkpoint(target, partial.checkpoint, previous, rtol)
+    return SMCTuningPartial(cp, deepcopy(partial.progress))
+end
+
+function PPL.rescore_smc_tuning_checkpoint(target::AbstractSMCTarget, directory::AbstractString;
+        output_dir::AbstractString=directory, previous=nothing, rtol::Real=_RESCORE_RTOL)
+    path = joinpath(directory, _TUNING_CHECKPOINT_FILE)
+    isfile(path) || throw(ArgumentError("directory must contain tuning_latest.jls"))
+    cp = _rescore_tuning_checkpoint(target, deserialize(path), previous, rtol)
+    progress = isempty(cp.history) ? _tuning_event(cp, :pending) : last(cp.history)
+    _write_tuning_checkpoint(output_dir, cp)
+    return SMCTuningPartial(cp, deepcopy(progress))
 end
 
 function _tuning_schedule(cp, source)

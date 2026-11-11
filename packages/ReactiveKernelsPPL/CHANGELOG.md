@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.159
+
+- `rescore_smc_tuning_checkpoint(target, partial_or_directory; previous,
+  rtol=1e-10)` explicitly re-anchors adaptive tuning checkpoints on another
+  CPU. It checks saved endpoint probe scores and delegates each active
+  pilot's cached evaluation and retained gradients to WarmupHMC's public
+  re-scoring API, retaining RNG/adaptation progress and audit history.
+  Partial inputs return independent copies. Directory inputs atomically
+  replace `tuning_latest.jls` after validation; `output_dir` selects a
+  separate destination. Ordinary tuning resume remains exact and now
+  reports measured score drift. Requires WarmupHMC 0.2.18. This does not
+  migrate checkpoints across package versions or promise identical future
+  trajectories across CPUs.
+
 ## 0.1.158
 
 - A response whose element type admits `missing`
