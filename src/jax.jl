@@ -2671,13 +2671,20 @@ _jax_function_call(ctx::_JaxContext, ::typeof(one), args::Vector{_PyVal}) =
 
 _jax_function_call(ctx::_JaxContext, ::typeof(_readonly_gather), args::Vector{_PyVal}) =
     _jax_index_values(ctx, args[1], args[2:end])
+# Normalize a shape tuple before checking allocation sizes or deciding rank.
+function _jax_dimension_values(dims::Vector{_PyVal})
+    if length(dims) == 1 && dims[1].T isa Type && dims[1].T <: Tuple
+        shape = only(dims)
+        return [_PyVal(_py_atom(shape.code) * "[" * string(k - 1) * "]",
+                       fieldtype(shape.T, k), shape.static, "",
+                       isempty(shape.limit) ? "" : _py_atom(shape.limit) * "[" * string(k - 1) * "]")
+                for k in 1:fieldcount(shape.T)]
+    end
+    dims
+end
 # The dimensions of an allocation, given as integers or as one tuple of them.
 function _jax_dims(ctx::_JaxContext, f, dims::Vector{_PyVal})
-    if length(dims) == 1 && dims[1].T isa Type && dims[1].T <: Tuple
-        n = fieldcount(dims[1].T)
-        dims = [_PyVal(_py_atom(dims[1].code) * "[" * string(k - 1) * "]", fieldtype(dims[1].T, k))
-                for k in 1:n]
-    end
+    dims = _jax_dimension_values(dims)
     all(a -> a.T isa Type && a.T <: Integer, dims) ||
         _jax_error("`", f, "` with shape arguments of types ", Tuple(a.T for a in dims),
                    _jax_where(ctx))
@@ -2686,6 +2693,7 @@ end
 # A vector of a data-dependent length is allocated at its static bound and
 # padded, its length the value (as `Vector{T}(undef, n)`).
 function _jax_vector_dims(ctx::_JaxContext, f, dims::Vector{_PyVal})
+    dims = _jax_dimension_values(dims)
     length(dims) == 1 && dims[1].T isa Type && dims[1].T <: Integer || return nothing
     size, extent = _jax_allocation_size(ctx, only(dims))
     isempty(extent) ? nothing : ("(" * size * ",)", extent)
@@ -2883,12 +2891,20 @@ function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
                       v.extent, "", isempty(v.extent) ? 0 : 3)
     end
     if T <: AbstractArray && !isempty(args) && args[1].T === UndefInitializer
-        dims = args[2:end]
-        length(dims) == 1 || _jax_error("allocating a multidimensional array", _jax_where(ctx))
-        size, extent = _jax_allocation_size(ctx, only(dims))
-        E = T isa UnionAll ? Float64 : eltype(T)
+        dims = _jax_dimension_values(args[2:end])
+        E = eltype(T)
+        E isa TypeVar && (E = Float64)
         dtype = E <: Bool ? "jnp.bool_" : E <: Integer ? "jnp.int64" : "jnp.float64"
-        return _PyVal("jnp.zeros((" * size * ",), dtype=" * dtype * ")", Vector{E}, false, extent)
+        padded = _jax_vector_dims(ctx, T, dims)
+        padded === nothing ||
+            return _PyVal("jnp.zeros(" * padded[1] * ", dtype=" * dtype * ")", Vector{E}, false, padded[2])
+        shape, N = _jax_dims(ctx, T, dims)
+        # JAX requires concrete dimensions. A vector's bounded length is handled
+        # above; independently padded matrix axes need richer extent metadata.
+        all(d -> _jax_known(ctx, d), dims) ||
+            _jax_error("a multidimensional allocation whose shape depends on data has no JAX translation",
+                       _jax_where(ctx))
+        return _PyVal("jnp.zeros(" * shape * ", dtype=" * dtype * ")", Array{E,N})
     end
     if T <: AbstractArray && length(args) == 1 && _jax_is_array(args[1].T)
         E = T isa UnionAll ? eltype(Base.unwrap_unionall(T)) : eltype(T)
@@ -3411,7 +3427,12 @@ _jax_call_positional(ctx::_JaxContext, ::typeof(Base.broadcasted), args::Vector{
 _jax_call_positional(ctx::_JaxContext, ::typeof(Base.materialize), args::Vector{_PyVal}) = only(args)
 _jax_call_positional(ctx::_JaxContext, ::typeof(tuple), args::Vector{_PyVal}) =
     _PyVal(_jax_tuple_code(args), Tuple{(a.T for a in args)...}, all(a -> a.static, args),
-           _jax_tuple_extent(args))
+           _jax_tuple_extent(args), _jax_tuple_limit(args))
+# A shape tuple may carry a padded vector's length through a local or helper.
+# Its bound refers to the padded input shape, not an observed length literal.
+_jax_tuple_limit(args) = any(a -> !isempty(a.limit), args) &&
+    all(a -> a.T isa Type && a.T <: Integer && (a.static || !isempty(a.limit)), args) ?
+    _jax_tuple_code([_PyVal(a.static ? a.code : a.limit, a.T) for a in args]) : ""
 function _jax_call_positional(ctx::_JaxContext, ::typeof(Base.literal_pow), args::Vector{_PyVal})
     f, x, p = args
     p.T isa Type && p.T <: Val && !_jax_is_array(x.T) ||

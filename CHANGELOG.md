@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.173
+
+- `jax_source` preserves the rank of `Array{T}(undef, dims)` when `dims` is a
+  tuple literal, local or helper argument, and accepts multidimensional
+  allocations with separate dimensions. Tuple shapes retain bounded ragged
+  vector lengths. `Array{Int}` allocations keep integer elements in device code
+  and host `prepare_data` instead of being treated as `Float64` buffers.
+
 ## 0.1.172
 
 - `jax_source` emits valid Python when every input is host-prepared data.
