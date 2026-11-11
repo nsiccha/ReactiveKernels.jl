@@ -874,7 +874,8 @@ function _host_construct(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
         return _host_list(ctx, T isa UnionAll ? Vector{Any} : T)
     if T <: AbstractArray && !isempty(args) && args[1].T === UndefInitializer
         dims = args[2:end]
-        E = T isa UnionAll ? Float64 : eltype(T)
+        E = eltype(T)
+        E isa TypeVar && (E = Float64)
         shape, N = _jax_dims(ctx, T, dims)
         return _PyVal("np.zeros(" * shape * ", dtype=" * _host_dtype(E) * ")", Array{E,N}, true)
     end
