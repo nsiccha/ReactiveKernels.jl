@@ -2530,11 +2530,12 @@ function _prepare_missing_responses!(plan::StructuralPlan, columns::AbstractDict
         owned = Array{T}(undef, size(value))
         map!(x -> ismissing(x) ? one(T) : convert(T, x), owned, value)
         columns[name] = owned
-        if !all(present)
-            maskname = _observed_mask_name(name)
-            haskey(columns, maskname) && _fail(r.label, "data name $maskname is reserved for observation presence")
-            columns[maskname] = Array(present)
-        end
+        # A response whose type admits `missing` has its presence mask however
+        # many entries are missing, none included: the program reads the mask,
+        # so one program serves every absence pattern of that type.
+        maskname = _observed_mask_name(name)
+        haskey(columns, maskname) && _fail(r.label, "data name $maskname is reserved for observation presence")
+        columns[maskname] = Array(present)
     end
     return columns
 end
@@ -2563,12 +2564,19 @@ function _guard_missing_observation_argument(name, ex, plan, columns)
         collect(_eval_value_expr(indices, n -> columns[n], r.label)) == rows || return ex
         value = get(columns, r.response, nothing)
         value isa AbstractArray || return ex
-        mask = get(columns, _observed_mask_name(r.response), nothing)
-        mask === nothing && !(Missing <: eltype(value)) && return ex
-        mask === nothing && (mask = .!ismissing.(value))
-        all(mask) && return ex
-        selected = mask[rows, r.range.args[3:end]...]
-        present = present === nothing ? Array(selected) : present .| selected
+        maskname = _observed_mask_name(r.response)
+        # A bound response's presence is its mask column, which the program
+        # reads (a data value, never a constant spliced into the program). A
+        # definition evaluated while binding, before the mask exists, reads
+        # the presence of the raw value.
+        selected = if haskey(columns, maskname)
+            Expr(:ref, maskname, indices, r.range.args[3:end]...)
+        else
+            Missing <: eltype(value) || return ex
+            QuoteNode(Array((.!ismissing.(value))[rows, r.range.args[3:end]...]))
+        end
+        present = present === nothing ? selected :
+            Expr(:call, GlobalRef(Base, :broadcast), GlobalRef(Base, :|), present, selected)
     end
     # The skipped arm's value is never read: the density is guarded by the
     # same presence. A live argument is computed from the Float64 packed
@@ -2582,7 +2590,7 @@ function _guard_missing_observation_argument(name, ex, plan, columns)
     # Named by its position among the cell's formals: it is local to this cell,
     # and a binding of one program spells one type (snag `gensym-in-kernel-54164b85`).
     lane = Symbol("##_rkppl_argument_present#", length(lambda.args[1].args))
-    push!(inputs.args, QuoteNode(present))
+    push!(inputs.args, present)
     push!(lambda.args[1].args, lane)
     lambda.args[2] = Expr(:block, LineNumberNode(0, :rkppl_plate),
         Expr(:if, lane, lambda.args[2], skipped))

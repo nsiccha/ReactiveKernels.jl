@@ -97,49 +97,49 @@ end
 Base.getindex(x::_RwFn) = x.f
 
 # `log(f(x))`.
-@inline _rk_log_of(f::F, x) where {F} = log(f(x))
-@inline _rk_log_of(::_RwExp, x::Real) = float(x)
-@inline _rk_log_of(::typeof(LogExpFunctions.logistic), x::Real) =
+@_record_source @inline _rk_log_of(f::F, x) where {F} = log(f(x))
+@_record_source @inline _rk_log_of(::_RwExp, x::Real) = float(x)
+@_record_source @inline _rk_log_of(::typeof(LogExpFunctions.logistic), x::Real) =
     LogExpFunctions.loglogistic(x)
 
 # `log1p(f(x))`.
-@inline _rk_log1p_of(f::F, x) where {F} = log1p(f(x))
-@inline _rk_log1p_of(::_RwExp, x::Real) = LogExpFunctions.log1pexp(float(x))
+@_record_source @inline _rk_log1p_of(f::F, x) where {F} = log1p(f(x))
+@_record_source @inline _rk_log1p_of(::_RwExp, x::Real) = LogExpFunctions.log1pexp(float(x))
 
 # `log1p(-f(x))`.
-@inline _rk_log1p_neg_of(f::F, x) where {F} = log1p(-f(x))
-@inline _rk_log1p_neg_of(::typeof(LogExpFunctions.logistic), x::Real) =
+@_record_source @inline _rk_log1p_neg_of(f::F, x) where {F} = log1p(-f(x))
+@_record_source @inline _rk_log1p_neg_of(::typeof(LogExpFunctions.logistic), x::Real) =
     LogExpFunctions.log1mlogistic(x)
-@inline _rk_log1p_neg_of(::_RwExp, x::Real) = LogExpFunctions.log1mexp(float(x))
+@_record_source @inline _rk_log1p_neg_of(::_RwExp, x::Real) = LogExpFunctions.log1mexp(float(x))
 
 # `log(c - f(x))` with `c` a literal one.
-@inline _rk_log_one_minus_of(c, f::F, x) where {F} = log(c - f(x))
-@inline _rk_log_one_minus_of(c::Real, ::typeof(LogExpFunctions.logistic), x::Real) =
+@_record_source @inline _rk_log_one_minus_of(c, f::F, x) where {F} = log(c - f(x))
+@_record_source @inline _rk_log_one_minus_of(c::Real, ::typeof(LogExpFunctions.logistic), x::Real) =
     convert(_rw_float(c, LogExpFunctions.logistic(x)), LogExpFunctions.log1mlogistic(x))
-@inline _rk_log_one_minus_of(c::Real, ::_RwExp, x::Real) =
+@_record_source @inline _rk_log_one_minus_of(c::Real, ::_RwExp, x::Real) =
     LogExpFunctions.log1mexp(convert(_rw_float(c, x), x))
 
 # `log(c + y)` with `c` a literal one.
-@inline _rk_log_one_plus(c, y) = log(c + y)
-@inline _rk_log_one_plus(c::Real, y::Real) = log1p(convert(_rw_float(c, y), y))
+@_record_source @inline _rk_log_one_plus(c, y) = log(c + y)
+@_record_source @inline _rk_log_one_plus(c::Real, y::Real) = log1p(convert(_rw_float(c, y), y))
 
 # `log(c + f(x))` with `c` a literal one.
-@inline _rk_log_one_plus_of(c, f::F, x) where {F} = log(c + f(x))
-@inline _rk_log_one_plus_of(c::Real, ::_RwExp, x::Real) =
+@_record_source @inline _rk_log_one_plus_of(c, f::F, x) where {F} = log(c + f(x))
+@_record_source @inline _rk_log_one_plus_of(c::Real, ::_RwExp, x::Real) =
     LogExpFunctions.log1pexp(convert(_rw_float(c, x), x))
 
 # `log(f(a) + g(b))`. The stable form is `_tie_exact_logaddexp`, whose
 # derivative at a tie is the literal one, (1/2, 1/2).
-@inline _rk_log_add_of(f::F, a, g::G, b) where {F,G} = log(f(a) + g(b))
-@inline function _rk_log_add_of(::_RwExp, a::Real, ::_RwExp, b::Real)
+@_record_source @inline _rk_log_add_of(f::F, a, g::G, b) where {F,G} = log(f(a) + g(b))
+@_record_source @inline function _rk_log_add_of(::_RwExp, a::Real, ::_RwExp, b::Real)
     T = _rw_float(a, b)
     _tie_exact_logaddexp(convert(T, a), convert(T, b))
 end
 
 # `log(sum(f.(x)))`, the broadcast materialized as the native lowering does.
-@inline _rk_log_sum_of(f::F, x) where {F} =
+@_record_source @inline _rk_log_sum_of(f::F, x) where {F} =
     log(sum(_native_broadcast_materialize(_native_broadcasted(f, x))))
-@inline _rk_log_sum_of(::_RwExp, x::AbstractArray{<:Real}) = _rk_logsumexp(x)
+@_record_source @inline _rk_log_sum_of(::_RwExp, x::AbstractArray{<:Real}) = _rk_logsumexp(x)
 
 # The log-sum-exp of the entries of `x`, shifted by their maximum. Its value is
 # `log(sum(exp.(x)))` to within rounding, `-Inf` for no entries and the
@@ -159,55 +159,57 @@ function _rk_logsumexp(x::AbstractArray{<:Real})
 end
 
 # `logit(f(x))`.
-@inline _rk_logit_of(f::F, x) where {F} = LogExpFunctions.logit(f(x))
-@inline _rk_logit_of(::typeof(LogExpFunctions.logistic), x::Real) = float(x)
+@_record_source @inline _rk_logit_of(f::F, x) where {F} = LogExpFunctions.logit(f(x))
+@_record_source @inline _rk_logit_of(::typeof(LogExpFunctions.logistic), x::Real) = float(x)
 
 # `log(p) - log1p(-p)` with `p = f(x)`.
-@inline _rk_log_odds_of(f::F, x) where {F} = (p = f(x); log(p) - log1p(-p))
-@inline _rk_log_odds_of(::typeof(LogExpFunctions.logistic), x::Real) = float(x)
+@_record_source @inline _rk_log_odds_of(f::F, x) where {F} = (p = f(x); log(p) - log1p(-p))
+@_record_source @inline _rk_log_odds_of(::typeof(LogExpFunctions.logistic), x::Real) = float(x)
 
 # `exp(log(p))` where `p`'s producer is `f`: `p` itself when `f` gives a
 # non-negative value.
-@inline _rk_exp_log_of(::F, p) where {F} = exp(log(p))
-@inline _rk_exp_log_of(::_RwNonNegative, p::Real) = float(p)
+@_record_source @inline _rk_exp_log_of(::F, p) where {F} = exp(log(p))
+@_record_source @inline _rk_exp_log_of(::_RwNonNegative, p::Real) = float(p)
 
 # `f(x) - c` with `c` a literal one.
-@inline _rk_minus_one_of(f::F, x, c) where {F} = f(x) - c
-@inline _rk_minus_one_of(::_RwExp, x::Real, c::Real) = expm1(convert(_rw_float(c, x), x))
+@_record_source @inline _rk_minus_one_of(f::F, x, c) where {F} = f(x) - c
+@_record_source @inline _rk_minus_one_of(::_RwExp, x::Real, c::Real) = expm1(convert(_rw_float(c, x), x))
 
 # `inv(f(x))`.
-@inline _rk_inv_of(f::F, x) where {F} = inv(f(x))
-@inline _rk_inv_of(::_RwExp, x::Real) = exp(-float(x))
+@_record_source @inline _rk_inv_of(f::F, x) where {F} = inv(f(x))
+@_record_source @inline _rk_inv_of(::_RwExp, x::Real) = exp(-float(x))
 
 # `y / f(x)`.
-@inline _rk_div_by_of(y, f::F, x) where {F} = y / f(x)
-@inline _rk_div_by_of(y::Real, ::_RwExp, x::Real) = y * exp(-float(x))
+@_record_source @inline _rk_div_by_of(y, f::F, x) where {F} = y / f(x)
+@_record_source @inline _rk_div_by_of(y::Real, ::_RwExp, x::Real) = y * exp(-float(x))
 
 # `f(x)^k`: a literal integer power as Julia lowers it (`literal_pow`), any
 # other power as a call of `^`.
-@inline _rk_pow_of(f::F, x, ::Val{k}) where {F,k} = Base.literal_pow(^, f(x), Val(k))
-@inline _rk_pow_of(::_RwExp, x::Real, ::Val{k}) where {k} = exp(k * float(x))
-@inline _rk_pow_of(f::F, x, k) where {F} = f(x)^k
-@inline _rk_pow_of(::_RwExp, x::Real, k::Real) = exp(k * float(x))
+@_record_source @inline _rk_pow_of(f::F, x, ::Val{k}) where {F,k} = Base.literal_pow(^, f(x), Val(k))
+@_record_source @inline _rk_pow_of(::_RwExp, x::Real, ::Val{k}) where {k} = exp(k * float(x))
+@_record_source @inline _rk_pow_of(f::F, x, k) where {F} = f(x)^k
+@_record_source @inline _rk_pow_of(::_RwExp, x::Real, k::Real) = exp(k * float(x))
 
 # `sqrt(f(x))`.
-@inline _rk_sqrt_of(f::F, x) where {F} = sqrt(f(x))
-@inline _rk_sqrt_of(::_RwExp, x::Real) = exp(float(x) / 2)
+@_record_source @inline _rk_sqrt_of(f::F, x) where {F} = sqrt(f(x))
+@_record_source @inline _rk_sqrt_of(::_RwExp, x::Real) = exp(float(x) / 2)
 
 # The logistic function spelled out, `c1 / (c2 + f(-u))` with literal ones (an
 # RKPPL unit transform's `1 / (1 + exp(-u))`): `log` of it, and `log1p` of its
 # negation.
-@inline _rk_log_sigmoid(c1, c2, f::F, u) where {F} = log(c1 / (c2 + f(-u)))
-@inline _rk_log_sigmoid(c1::Real, c2::Real, ::_RwExp, u::Real) =
+@_record_source @inline _rk_log_sigmoid(c1, c2, f::F, u) where {F} = log(c1 / (c2 + f(-u)))
+@_record_source @inline _rk_log_sigmoid(c1::Real, c2::Real, ::_RwExp, u::Real) =
     convert(_rw_float(c1, c2, u), LogExpFunctions.loglogistic(u))
-@inline _rk_log1m_sigmoid(c1, c2, f::F, u) where {F} = log1p(-(c1 / (c2 + f(-u))))
-@inline _rk_log1m_sigmoid(c1::Real, c2::Real, ::_RwExp, u::Real) =
+@_record_source @inline _rk_log1m_sigmoid(c1, c2, f::F, u) where {F} = log1p(-(c1 / (c2 + f(-u))))
+@_record_source @inline _rk_log1m_sigmoid(c1::Real, c2::Real, ::_RwExp, u::Real) =
     convert(_rw_float(c1, c2, u), LogExpFunctions.log1mlogistic(u))
 
 # Every helper the pass emits, by identity, for code that reads a rewritten
 # program: the generated plate reverse expands each call into the method its
 # operands select (`_pr_expand_stable_helper`, `src/plate_reverse.jl`).
 # LOCKSTEP: each `_rw_emit(…, :_rk_…)` helper name below.
+# The helpers record their sources (`@_record_source`), so `jax_source`
+# translates the same stable forms native execution runs.
 const _RK_STABLE_HELPERS = (_rk_log_of, _rk_log1p_of, _rk_log1p_neg_of, _rk_log_one_minus_of,
     _rk_log_one_plus, _rk_log_one_plus_of, _rk_log_add_of, _rk_log_sum_of, _rk_logit_of,
     _rk_log_odds_of, _rk_exp_log_of, _rk_minus_one_of, _rk_inv_of, _rk_div_by_of, _rk_pow_of,
@@ -965,14 +967,19 @@ end
 # --- the pass -------------------------------------------------------------------
 
 """
-    _stable_rewrites(ast::Expr, recipes::Tuple) -> Expr
+    _stable_rewrites(ast::Expr, recipes::Tuple[, definitions]) -> Expr
 
 The generated function `ast` with its numerically fragile compositions in their
 stable forms (the file header). `recipes` holds what each position of the
 callables table the body calls through runs: a lowered recipe, or a
-non-allocating step. Returns `ast` itself when nothing applies.
+non-allocating step. `definitions` binds parameters of `ast` to the
+expressions that computed them before it, over other parameters of `ast` (a
+source-reading backend's earlier statements, `jax_source`), so a composition
+across them is found as one within the body is. Returns `ast` itself when
+nothing applies.
 """
-function _stable_rewrites(ast::Expr, recipes::Tuple)
+function _stable_rewrites(ast::Expr, recipes::Tuple,
+                          definitions::Dict{Symbol,Any} = Dict{Symbol,Any}())
     ast.head in (:function, :->) && length(ast.args) == 2 &&
         ast.args[1] isa Expr && ast.args[1].head === :tuple || return ast
     counts = _rw_count!(Dict{Symbol,Int}(), ast.args[2])
@@ -983,7 +990,7 @@ function _stable_rewrites(ast::Expr, recipes::Tuple)
         name === nothing || get(counts, name, 0) == 0 && push!(params, name)
     end
     ctx = _RwContext(recipes, counts, params, Ref(0))
-    body = _rw_expr(ast.args[2], ctx, Dict{Symbol,Any}())
+    body = _rw_expr(ast.args[2], ctx, copy(definitions))
     body isa Expr && body.head === :block || return ast
     body == ast.args[2] && return ast
     while _rw_drop_dead!(body, ctx, _rw_reads!(Dict{Symbol,Int}(), body))

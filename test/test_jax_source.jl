@@ -1,7 +1,7 @@
 using ReactiveKernels
 using Test
 using LinearAlgebra: dot
-using LogExpFunctions: log1mexp, logaddexp, logsumexp
+using LogExpFunctions: log1mexp, logaddexp, logistic, logsumexp
 using SpecialFunctions: besseli, besselix
 
 include(joinpath(@__DIR__, "jax_python.jl"))
@@ -1002,6 +1002,58 @@ end
     return total
 end
 
+# RK's stable rewrites (`simplify`) on an emitted recipe, as native: an
+# authored `log(exp(a))` stays finite where `exp(a)` overflows.
+@kernel jax_stable(a::Float64) = begin
+    total = log(exp(a)) + log1p(exp(a))
+    return total
+end
+# `log(exp(a) + exp(b))` is the tie-exact log-add-exp, as native.
+@kernel jax_stable_add(a::Float64, b::Float64) = begin
+    total = log(exp(a) + exp(b))
+    return total
+end
+# Across statements: a statement computing an input of another is its
+# definition there, as in native's inlined body.
+@kernel jax_stable_across(a::Float64) = begin
+    v = exp(a)
+    p = logistic(a)
+    total = log(v) + 2 * log1p(-p)
+    return total
+end
+# A lazy arm's read of a value computed before the branch, as native rewrites
+# a leaf arm: the arm stays lazy, and reads `a` instead of `p`.
+@kernel jax_stable_arm(a::Float64) = begin
+    p = logistic(a)
+    total = a > 0 ? log1p(-p) : log(p)
+    return total
+end
+# Powers of an exponential: the stable `_rk_pow_of(exp, a, Val(2))` reads its
+# method's `where` parameter `k`; `sqrt(exp(a))` is `exp(a / 2)`, finite at
+# a = 800, where `exp(a)` overflows.
+@kernel jax_stable_square(a::Float64) = begin
+    v = exp(a)
+    total = v^2 + sqrt(v)
+    return total
+end
+@kernel jax_stable_sqrt(a::Float64) = begin
+    v = exp(a)
+    total = sqrt(v)
+    return total
+end
+
+# A cell needs both the outer definition for log(exp(a)) and the shared
+# prepared length for its allocation. Neither may erase the other.
+@kernel jax_stable_static_cell(a::Float64, x::Vector{Float64}, H::Int) = begin
+    v = exp(a)
+    per = plate(x) do xi
+        z = log(v)
+        sum(fill(z + xi, H))
+    end
+    total = sum(per)
+    return total
+end
+
 # A scan step output with vector fields (a K-state filter's `(lpd, w, m)`):
 # each vector field stacks as the (steps, K) array of rows.
 @kernel jax_scan_vector_fields(ys::Vector{Float64}, w0::Vector{Float64}, a::Float64) = begin
@@ -1587,6 +1639,24 @@ end
     end
 end
 
+@testset "jax_source: stable cell rewrites preserve shared static lengths" begin
+    bindings = ((x = [0.5, -1.0], H = 2), (x = [0.5, -1.0, 2.0], H = 5))
+    sources = [jax_source(jax_stable_static_cell; have = (:a, :x, :H),
+                           want = :total, data) for data in bindings]
+    @test string(sources[1]) == string(sources[2])
+    if !rk_jax_available()
+        @test_skip false
+    else
+        native = prepare(jax_stable_static_cell; have = (:a, :x, :H), want = :total)
+        for (src, data) in zip(sources, bindings), mode in (true, :arguments)
+            r = rk_jax_evaluate(src, "kernel", (800.0, data.x, data.H);
+                                grad = true, prepare = mode)
+            @test r.value ≈ native(800.0, data.x, data.H) rtol = 1e-12
+            @test only(r.grad) ≈ length(data.x) * data.H rtol = 1e-12
+        end
+    end
+end
+
 @testset "jax_source: rule primals, captured endpoints, positional views and statement writes" begin
     x = [0.4, 1.3, 2.2, 0.7]
     rule_src = jax_source(jax_rule_plate; have = (:a, :x), want = :total)
@@ -1643,6 +1713,57 @@ end
     fold = string(srcs[end - 2])
     @test occursin(" in (1, ", fold) && occursin("jax.lax.fori_loop(", fold)
     @test occursin("jnp.squeeze(", string(srcs[end - 1]))
+    # Stable rewrites: finite at a = 800 with the native value and gradient;
+    # `simplify = false` keeps the literal composition, which overflows.
+    stable = jax_source(jax_stable; have = (:a,), want = :total)
+    literal = ReactiveKernels._with_simplify(false) do
+        jax_source(jax_stable; have = (:a,), want = :total)
+    end
+    @test occursin("_rk_", string(stable)) || !occursin("jnp.log(jnp.exp(", string(stable))
+    @test occursin("jnp.log(jnp.exp(", string(literal))
+    if rk_jax_available()
+        native = prepare(jax_stable; have = (:a,), want = :total)
+        r = rk_jax_evaluate(stable, "kernel", (800.0,); grad = true)
+        @test r.value ≈ native(800.0) rtol = 1e-12
+        @test only(r.grad) ≈ 2.0 rtol = 1e-12
+        @test rk_jax_evaluate(literal, "kernel", (800.0,)).value == Inf
+        add = jax_source(jax_stable_add; have = (:a, :b), want = :total)
+        native_add = prepare(jax_stable_add; have = (:a, :b), want = :total)
+        r = rk_jax_evaluate(add, "kernel", (800.0, 800.0); grad = true)
+        @test r.value ≈ native_add(800.0, 800.0) rtol = 1e-12
+        @test r.value ≈ 800 + log(2) rtol = 1e-12
+        @test only(r.grad) ≈ 0.5 rtol = 1e-12
+    end
+    across = jax_source(jax_stable_across; have = (:a,), want = :total)
+    literal_across = ReactiveKernels._with_simplify(false) do
+        jax_source(jax_stable_across; have = (:a,), want = :total)
+    end
+    @test !occursin("jnp.log1p(-", string(across))
+    @test occursin("jnp.log1p(-", string(literal_across))
+    if rk_jax_available()
+        native_across = prepare(jax_stable_across; have = (:a,), want = :total)
+        r = rk_jax_evaluate(across, "kernel", (800.0,); grad = true)
+        @test r.value ≈ native_across(800.0) rtol = 1e-12
+        @test r.value ≈ -800 rtol = 1e-12
+        @test only(r.grad) ≈ -1.0 rtol = 1e-12
+        arm = jax_source(jax_stable_arm; have = (:a,), want = :total)
+        @test occursin("jax.lax.cond(", string(arm))
+        native_arm = prepare(jax_stable_arm; have = (:a,), want = :total)
+        for (x, slope) in ((800.0, -1.0), (-800.0, 1.0))
+            r = rk_jax_evaluate(arm, "kernel", (x,); grad = true)
+            @test r.value ≈ native_arm(x) rtol = 1e-12
+            @test only(r.grad) ≈ slope rtol = 1e-12
+        end
+        square = jax_source(jax_stable_square; have = (:a,), want = :total)
+        r = rk_jax_evaluate(square, "kernel", (1.0,); grad = true)
+        @test r.value ≈ prepare(jax_stable_square; have = (:a,), want = :total)(1.0) rtol = 1e-12
+        @test only(r.grad) ≈ 2 * exp(2.0) + exp(0.5) / 2 rtol = 1e-12
+        root = jax_source(jax_stable_sqrt; have = (:a,), want = :total)
+        r = rk_jax_evaluate(root, "kernel", (800.0,); grad = true)
+        @test r.value ≈ prepare(jax_stable_sqrt; have = (:a,), want = :total)(800.0) rtol = 1e-12
+        @test r.value ≈ exp(400.0) rtol = 1e-12
+        @test only(r.grad) ≈ exp(400.0) / 2 rtol = 1e-12
+    end
     # The whole output, its vector fields stacked.
     @test occursin("jax.lax.scan(", string(jax_source(jax_scan_vector_fields;
                                                       have = (:a, :ys, :w0), want = :steps)))

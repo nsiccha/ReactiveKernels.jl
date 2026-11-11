@@ -1026,3 +1026,99 @@ end
     built = build_kernel(plan)
     @test_broken (jax_source(built, plan); true)
 end
+
+# RK's stable rewrites across statements: a positive value computed as
+# `s = exp(a)` and read back as `log(s)` stays finite in JAX where `exp(a)`
+# overflows, with native's value and gradient.
+@testset "jax_source(built, plan): stable rewrites across statements" begin
+    plan = (@rkppl(begin
+        a ~ Normal(0, 1)
+        s = exp(a)
+        v = log(s)
+        y .~ Normal.(v, 1)
+    end))() | (; y = [0.1, -0.3])
+    built = build_kernel(plan)
+    src = jax_source(built, plan)
+    query = prepare_query(built, plan, :sampler)
+    if rk_jax_available()
+        for u in ([1.0], [800.0])
+            r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
+                                grad = true, prepare = true)
+            @test r.value ≈ query(u) rtol = 1e-12
+            @test r.grad ≈ rk_fd_gradient(query, u) rtol = 1e-6
+        end
+    end
+end
+
+# A law's term on a value computed outside it: native reads `a` for
+# `Normal(0, s)`'s `log(s)` of `s = exp(a)`. In JAX the cell's arm calls the
+# law's endpoint, which is translated from its compiled lowered code, and the
+# stable rewrites do not read lowered code yet, so where `exp(a)` overflows the
+# module gives -Inf (docs/src/jax.md, "Stable rewrites").
+@testset "jax_source(built, plan): stable rewrites in a law's term" begin
+    plan = (@rkppl(begin
+        a ~ Normal(0, 1)
+        s = exp(a)
+        y .~ Normal.(0, s)
+    end))() | (; y = [0.1, -0.3])
+    built = build_kernel(plan)
+    src = jax_source(built, plan)
+    query = prepare_query(built, plan, :sampler)
+    if rk_jax_available()
+        r = rk_jax_evaluate(src, "log_density", ([1.0], jax_raw_data(plan, src)...);
+                            grad = true, prepare = true)
+        @test r.value ≈ query([1.0]) rtol = 1e-12
+        @test r.grad ≈ rk_fd_gradient(query, [1.0]) rtol = 1e-6
+        r = rk_jax_evaluate(src, "log_density", ([800.0], jax_raw_data(plan, src)...);
+                            grad = true, prepare = true)
+        @test_broken r.value ≈ query([800.0]) rtol = 1e-12
+    end
+end
+
+# A response whose type admits `missing` (todo 1lg85rv): one module however
+# many entries are missing, none included, at two sizes. `prepare_data` takes
+# the response as the caller has it (missing entries `None`) by its authored
+# name and computes the presence mask itself; the values match native.
+@testset "jax_source(built, plan): one module across missing response counts" begin
+    function missing_model(plate, y, x)
+        ast = plate ? quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1)
+            @plate for i in eachindex(y)
+                y[i] ~ Normal(a + b * x[i], 0.7)
+            end
+        end : quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1)
+            mu = a .+ b .* x
+            y .~ Normal.(mu, 0.7)
+        end
+        data = (; y, x)
+        bind_data(lower_rkppl(ast, data; conditioned = keys(data)), data)
+    end
+    ys = (Union{Missing,Float64}[0.1, 0.3, 0.4], Union{Missing,Float64}[0.1, missing, 0.4],
+          Union{Missing,Float64}[0.2, missing, 0.5, missing, -0.1],
+          Union{Missing,Float64}[0.2, 0.1, 0.5, 0.3, -0.1])
+    for plate in (false, true)
+        texts = String[]
+        for y in ys
+            x = collect(range(-0.4, 0.6; length = length(y)))
+            plan = missing_model(plate, y, x)
+            built = build_kernel(plan)
+            src = jax_source(built, plan)
+            push!(texts, string(src))
+            @test occursin("UNTRANSLATED = {}", string(src))
+            inputs = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
+            @test sort(inputs) == ["x", "y"]
+            if rk_jax_available()
+                query = prepare_query(built, plan, :sampler)
+                raw = Dict("x" => x, "y" => y)
+                for u in ([0.2, -0.3], [-0.5, 0.8])
+                    r = rk_jax_evaluate(src, "log_density", (u, (raw[n] for n in inputs)...);
+                                        grad = true, prepare = true)
+                    @test r.value ≈ query(u) rtol = 1e-12
+                    @test r.grad ≈ rk_fd_gradient(query, u) rtol = 1e-6
+                end
+            end
+        end
+        @test allequal(texts)
+    end
+end
