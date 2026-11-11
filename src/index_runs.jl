@@ -89,6 +89,12 @@ function _partial_index_runs(p::Plan,bound_values::Vector{Value})
     end
     isempty(needed) && return p
     for r in Iterators.reverse(p.recipes)
+        # A plate cell or partition runs its plate at its own rows, never over
+        # a whole index, so no run schedule can serve what it reads. Its
+        # arguments stay ordinary gathers, which keep their row forms there
+        # (snag cell-factor-ad-r-b4e2a0f4). A gather that also reaches the
+        # plate another way is read whole on that path, and keeps its runs.
+        r.op isa _AuthoredPlateCellOp && continue
         any(v->canon_id(g,v.id) in needed,r.outputs) || continue
         union!(needed,(canon_id(g,v.id) for v in r.inputs))
     end
