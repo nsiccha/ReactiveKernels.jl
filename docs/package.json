@@ -9,8 +9,6 @@
     "docs:preview": "vitepress preview build/.documenter"
   },
   "dependencies": {
-    "@nolebase/vitepress-plugin-enhanced-readabilities": "2.18.2",
-    "@nolebase/ui": "2.18.2",
     "@mathjax/src": "^4.1.2",
     "@mdit/plugin-mathjax": "^0.26.1",
     "@mdit/plugin-tex": "^0.24.1",
@@ -18,9 +16,6 @@
     "cytoscape-elk": "2.3.0",
     "elkjs": "0.9.3",
     "markdown-it-footnote": "^4.0.0",
-    "vega": "^5.33.0",
-    "vega-embed": "^6.29.0",
-    "vega-lite": "^5.23.0",
     "markdown-it": "^14.1.0",
     "vitepress": "^1.6.4",
     "vitepress-plugin-tabs": "^0.8.0"

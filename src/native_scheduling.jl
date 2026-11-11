@@ -65,8 +65,7 @@ end
 # `deferred` holds the preparation of the arguments only the cells read, which
 # a plate program runs where its cell work starts (`_lower_authored_plate_native!`):
 # it is not in `body` yet, but it runs before this loop's call, so a chunk
-# receives the prepared arguments it reads. Without them a chunk read each one
-# as an unbound name (snag `web-sim-bruno-la-eb5f8859`).
+# receives the prepared arguments it reads rather than unbound names.
 function _scheduled_prefix_loop!(runtime_ops, runtime_recipes, body, invariants,
         declarations, loopbody, callargs, index, previous, first_coordinate,
         shares, output_axes; deferred = nothing)

@@ -30,7 +30,7 @@
 # and allocates on an interactive thread. The script exits 1 on any mismatch;
 # a crash ends the process with the signal's status.
 #
-# Recorded on gordito (x86-64), Enzyme 0.13.216, Enzyme_jll 0.0.303,
+# Recorded on a Linux fleet host (x86-64), Enzyme 0.13.216, Enzyme_jll 0.0.303,
 # DifferentiationInterface 0.7.21, 2026-10-13, one 20 s run per row except
 # where two are listed:
 #     Julia    threads  model  allocating task  outcome

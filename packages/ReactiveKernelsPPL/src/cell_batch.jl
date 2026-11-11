@@ -16,12 +16,8 @@ Inside the callback, value queries and local structural footprints accept
 `batch` in place of `u`, without rescanning shared coordinates. No AD backend
 is needed. The callback's result is returned.
 
-```julia
-fp = partition_footprint_kernel(q; shared = false)
-with_cell_batch(q, u) do batch
-    [(q(batch, i), fp(batch, i).unconstrained) for i in cells]
-end
-```
+Prepare the structural footprint once with `shared=false`. Inside `visit`,
+pass the batch to both the value query and footprint kernel for each cell.
 
 A batch belongs to its owner's cache and expires when the callback exits,
 including on error. Changing a shared coordinate its prefix reads (every shared

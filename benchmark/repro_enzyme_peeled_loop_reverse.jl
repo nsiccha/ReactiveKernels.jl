@@ -16,7 +16,7 @@
 #   strict   Enzyme.API.fast_math_flags!()  (derivative arithmetic without nsz/contract)
 #   nomerge  Enzyme.API.EnzymeSetCLBool(:EnzymeReverseLoopEntryMerges, false)
 #
-# Recorded on gordito, 2026-11-08, Julia 1.10.12, one thread, one CPU, at host
+# Recorded on a Linux fleet host, 2026-11-08, Julia 1.10.12, one thread, one CPU, at host
 # load 20-29 on 32 CPUs: peeled / plain gradient time, median of 30 paired,
 # shuffled rounds, at G = 38 paths with T = 120 / T = 1320 steps. Allocation is
 # the same for both forms (122.0 KB inlined, 164.6 KB @noinline at T = 120). The
@@ -48,7 +48,7 @@
 # remains inlined is two loads per reverse step, the tape pointer and y's data
 # pointer, that LLVM does not hoist. Under --check-bounds=yes the repair does
 # not apply (Enzyme todo 16d9hce). RK's generated scan forms no such phi and is
-# unchanged by it (scan_plate_cell_reverse.jl).
+# unchanged by it (historical benchmark).
 using Enzyme, Random, Printf, Statistics
 
 const CONFIG = get(ENV, "ENZYME_CONFIG", "default")

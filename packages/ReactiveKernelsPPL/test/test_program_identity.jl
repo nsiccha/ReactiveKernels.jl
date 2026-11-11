@@ -68,7 +68,7 @@ end
     plan = m(; g) | (; y)
     # The program reads the axis's labels as a data-only value: no label is
     # a literal of the generated code (decision 1id2a4o: two 10,950-label
-    # literals were 60 s and 45 s of the ArbeitsplatzAtlas prefix compile).
+    # literals were 60 s and 45 s of a downstream application's prefix compile).
     program = string(kernel_expr(plan, assign_layout(plan)))
     # This location is an affine predictor: its factor term reads the labels
     # through its level codes.

@@ -190,14 +190,9 @@ elsewhere leaves the pass valid. A failed callback produces no output;
 the next call resets all accumulation storage. Calls cannot be nested or run
 concurrently on the same pullback.
 
-```julia
-cell_pullback!(gradient, pullback, u) do batch
-    for i in eachindex(cells)
-        accumulate_cell!(batch, third, directions[i], weights[i],
-                         active[i], indices[i], cells[i])
-    end
-end
-```
+Within `visit`, call [`accumulate_cell!`](@ref) with the current pullback,
+derivative operator, direction, weight, active coordinates, coordinate
+indices, and cell position.
 """
 function cell_pullback!(visit::F, gradient::AbstractVector{Float64}, p::CellPullback,
         u::AbstractVector{Float64}) where {F}

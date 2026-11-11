@@ -32,7 +32,7 @@
 # unaffected; a closure capturing data around an RK scan op or a prepared
 # scan kernel can fail in the same way. The prepared-scan call has also
 # differentiated exactly on Julia 1.13 in hosted CI, depending on optimized IR.
-# Recorded on gordito, Enzyme 0.13.210 and 0.13.213, Julia 1.12.7 and 1.13.1
+# Recorded on a Linux fleet host, Enzyme 0.13.210 and 0.13.213, Julia 1.12.7 and 1.13.1
 # (Julia 1.10.12 with Enzyme 0.13.210), 2026-10-08.
 using Enzyme
 

@@ -2897,7 +2897,7 @@ const _RETIRED_PREPARATION_HEADS = (:tps_basis, :cr_basis, :t2_basis,
 function _module_binding(m::Module, s::Symbol, where, shown)
     if !isdefined(m, s)
         s in _RETIRED_PREPARATION_HEADS && _sfail("$where: `$shown` is statistical preparation owned by BayesianRegressionModels.StatisticalPreparation; import the helper into the model module and call it as an ordinary function")
-        s in _RETIRED_PK_HEADS && _sfail("$where: `$shown` is downstream PK code; import its replacement from RKPPLBench and call it as an ordinary function")
+        s in _RETIRED_PK_HEADS && _sfail("$where: `$shown` is downstream PK code; import its replacement from the downstream domain package and call it as an ordinary function")
         haskey(_RETIRED_CONSTRUCT_MODELS, s) && _sfail("$where: the implicit `$shown` " *
             "construct is retired; write ordinary priors and values, or use " *
             "`BayesianRegressionModels.rkppl_model(:$(_RETIRED_CONSTRUCT_MODELS[s]))`")
@@ -2905,7 +2905,7 @@ function _module_binding(m::Module, s::Symbol, where, shown)
             "is owned by BayesianRegressionModels; obtain its ordinary body with " *
             "`BayesianRegressionModels.rkppl_model(:$s)` and bind it in the model module")
         s === :linear_pk_log_f && _sfail("$where: the PK-specific model `$shown` " *
-            "belongs to downstream RKPPLBench; import the consumer-owned submodel " *
+            "belongs to the downstream domain package; import the consumer-owned submodel " *
             "into the model module")
         s === :Horseshoe && _sfail("$where: the implicit `Horseshoe` " *
             "coefficient shortcut is retired; declare its priors and " *
@@ -7114,7 +7114,7 @@ function _resolve_submodel(rhs, mod::Module)
             "is owned by BayesianRegressionModels; obtain its ordinary body with " *
             "`BayesianRegressionModels.rkppl_model(:$head)` and bind it in the model module")
         head === :linear_pk_log_f && _sfail("the PK-specific model `$head` " *
-            "belongs to downstream RKPPLBench; import the consumer-owned submodel " *
+            "belongs to the downstream domain package; import the consumer-owned submodel " *
             "into the model module")
         return nothing
     end

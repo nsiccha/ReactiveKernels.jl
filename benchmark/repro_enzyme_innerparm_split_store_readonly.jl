@@ -34,7 +34,7 @@
 # 1.10.12), while
 # `AutoEnzyme(; mode = Enzyme.Reverse, function_annotation = Enzyme.Const)`
 # differentiates the same model exactly.
-# Recorded on gordito, Julia 1.10.12, 1.12.7 and 1.13.1 with Enzyme 0.13.216,
+# Recorded on a Linux fleet host, Julia 1.10.12, 1.12.7 and 1.13.1 with Enzyme 0.13.216,
 # and Julia 1.13.1 with Enzyme dogfood `3ede25b` (0.13.215), 2026-10-14: the
 # first row raises. Enzyme dogfood from `4c73c40c` (0.13.215) repairs the
 # proof: every row is exact on Julia 1.13.1, 2026-10-15.

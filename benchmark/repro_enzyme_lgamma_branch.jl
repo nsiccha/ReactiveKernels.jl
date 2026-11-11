@@ -13,7 +13,7 @@
 # sources therefore call its own `loggamma`/`logbeta`: derivative rules
 # generated from one pure-math graph each (`scalar_derivative_rule`), which
 # makes them Enzyme primitives; with them the gradient below matches central
-# differences.  Recorded on strato2, Enzyme 0.13.204 /
+# differences.  Recorded on a Linux fleet host, Enzyme 0.13.204 /
 # SpecialFunctions 2, Julia 1.10.11, 2026-09-23.
 using Enzyme, SpecialFunctions
 

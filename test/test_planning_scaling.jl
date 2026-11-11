@@ -4,11 +4,10 @@ using Random
 
 # Preparation must stay linear or log-linear in the size of the program, never
 # quadratic: the user's standing principle, review point
-# `scalable-never-quadratic` (ArbeitsplatzAtlas decision
-# 2026-10-29T13-38-08-479-0v0xrxl). Planning a program used to rescan every
+# `scalable-never-quadratic` (user decision `0v0xrxl`). Planning a program used to rescan every
 # recipe, or the whole selection, at every step, and plate program extraction
 # walked the whole body again for every plate block; both allocated
-# quadratically in the program (todo 0xis7be, ODL's per-call preparation). Four
+# quadratically in the program (todo 0xis7be, a downstream application’s per-call preparation). Four
 # times the program now allocates about four times as much; a quadratic step
 # would allocate about sixteen times as much.
 

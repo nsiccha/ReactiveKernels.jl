@@ -329,7 +329,7 @@ const _JAX_CASES = (
             y[i] .~ Normal.(mu, s)
         end
     end))(; P = 4, R = _JAX_R) | (; y = _JAX_YR),
-    # A hidden-Markov law (ODLProject:ap1): shape checks decided while
+    # A hidden-Markov law: shape checks decided while
     # tracing, a history scan over the (step, state) cells, and folds over
     # the states as loops.
     # A multivariate normal per ragged cell (an empty row included): a
@@ -583,7 +583,7 @@ end
 # copies or the data-only definitions it evaluates (`w`), which the module
 # computes on the host. One module serves other sizes and values.
 # A data scalar the program reads only through its bound copy
-# (`_rkppl_value_r`; ODLProject:ap1 and :ap3): `prepare_data` takes it by its
+# (`_rkppl_value_r`): `prepare_data` takes it by its
 # authored name and computes the copy.
 @testset "jax_source(built, plan): authored names for bound copies" begin
     live = @rkppl begin
@@ -637,8 +637,7 @@ end
 end
 
 # A conditioned declaration's observed value (`y ~ LogDensity(f, …)` bound
-# `| (; y)`, a parameter fixed `| (; a)`; ODLProject:ap1, snag
-# jax-source-names-d71253f7): the binding holds it as `_rkppl_conditioned_y`,
+# `| (; y)`, a parameter fixed `| (; a)`): the binding holds it as `_rkppl_conditioned_y`,
 # and `prepare_data` takes it by its authored name. The module runs from the
 # authored data alone.
 @testset "jax_source(built, plan): authored names for conditioned declarations" begin
@@ -853,7 +852,7 @@ end
 
 # The module is a documented API: every public function states what it
 # computes and annotates its parameters and result, and the model's own
-# docstrings reach the module and `constrain` (ODL readability requirement).
+# docstrings reach the module and `constrain` (downstream readability requirement).
 @testset "jax_source(built, plan): documented functions" begin
     model = @rkppl begin
         "Mean of the observations (unit: metre)."

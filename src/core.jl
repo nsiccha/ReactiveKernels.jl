@@ -1005,7 +1005,7 @@ end
 # returns the seed's carry type, every step has the same types, and the loop
 # starts at the first index. On Julia 1.10 Enzyme Reverse of the peeled loop
 # costs 5-8% more than the same loop without the peel, for no located cause
-# (`benchmark/scan_plate_cell_reverse.jl`, `docs/src/constraints.md`).
+# (`docs/src/constraints.md`).
 @inline _scan_unpeeled(::Type{C}, ::Type{T}, seed) where {C,T} =
     isconcretetype(T) && C === typeof(seed)
 

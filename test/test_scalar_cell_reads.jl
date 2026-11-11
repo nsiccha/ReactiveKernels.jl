@@ -449,7 +449,7 @@ end
 
 # Two partition sums sharing a pushed value (`s`) lower with one cell emitter.
 # Sum `a` has cells only in label 1 and alone reads a whole factor (`F`) and a
-# scalar (`tau`) of label-1 coordinates (snag `absent-odl-vecto-d98e48bf`).
+# scalar (`tau`) of label-1 coordinates (snag `empty-vector regression`).
 @kernel grouped_absent_factor(u::AbstractVector{Float64}, Z::AbstractMatrix{Float64},
                               L::AbstractMatrix{Float64}, rows::AbstractVector{Int},
                               arow::AbstractVector{Int}, y::AbstractVector{Float64},

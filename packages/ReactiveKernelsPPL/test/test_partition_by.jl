@@ -81,7 +81,7 @@ end
 
 # Naming a query's observations in another order prepares the same program and
 # type: they are evaluated in the program's order whatever the caller lists.
-# BRM's NLME partition named one ODL program's observations in two orders for
+# BRM's NLME partition named one downstream program's observations in two orders for
 # two bindings that differ only in which plates have rows, so one package image
 # served only one of them (snag `derived-kernels-b8900b11`). Which key column an
 # observation reads never changed the type; the order did.

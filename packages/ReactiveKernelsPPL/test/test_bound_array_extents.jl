@@ -115,7 +115,7 @@ end
 end
 
 # Sizes and data-derived numbers are runtime model inputs (user principle
-# `ODLPlaus:precompile/decisions/2026-11-06T01-09-46-212-0ikeidi`; snag
+# `runtime-values requirement`; snag
 # `rkppl-sized-vect-69604d32`): every extent of one declaration, and every value
 # of a data-derived transform bound, generates the same program and the same
 # prepared query type, and one build serves every binding.
@@ -222,6 +222,39 @@ end
             [(g = 2, ids = [1, 2], y = [0.9, 1.0]), (g = 4, ids = [1, 4], y = [0.9, 1.0])],
             (v, d) -> sum(logpdf(Dirichlet(ones(3)), Vector(r)) for r in eachrow(v.P)) +
                 _normals(v.w) + sum(logpdf.(Normal.(v.P[d.ids, 1] .+ v.w[1], 1.0), d.y)))
+        # A per-element prior argument is checked against the size the array's
+        # reshape reads, never one binding's numbers, so a data-only argument
+        # still folds at preparation (snag `rkppl-per-elemen-c7b44344`).
+        programs = _extent_check(quote
+                loc = row_loc .+ zeros(R, K)
+                m[1:R, 1:K] .~ Normal.(loc, 1.0)
+                y .~ Normal.(vec(sum(m; dims = 1))[group], 1.0)
+            end,
+            [(row_loc = [0.0, 1.0], R = 2, K = 3, group = [1, 2, 3, 1], y = [0.1, 0.2, 0.3, 0.4]),
+                (row_loc = [0.5, 1.5, -0.5], R = 3, K = 2, group = [1, 2, 2], y = [0.1, 0.2, 0.3])],
+            (v, d) -> sum(logpdf.(Normal.(d.row_loc .+ zeros(d.R, d.K), 1.0), v.m)) +
+                sum(logpdf.(Normal.(vec(sum(v.m; dims = 1))[d.group], 1.0), d.y)))
+        @test occursin("_array_prior_cells(loc, (R, K))", string(first(programs)))
+        data = (row_loc = [0.0, 1.0], R = 2, K = 3, group = [1, 2, 3, 1], y = [0.1, 0.2, 0.3, 0.4])
+        folded = bind_data(lower_rkppl(quote
+                loc = row_loc .+ zeros(R, K)
+                m[1:R, 1:K] .~ Normal.(loc, 1.0)
+                y .~ Normal.(vec(sum(m; dims = 1))[group], 1.0)
+            end, data; conditioned = (:y,)), data)
+        @test !occursin("_array_prior_cells", string(code_expr(
+            prepare_query(build_kernel(folded), folded, :sampler))))
+        # A value the graph computes is checked where it is computed, at the
+        # size the array's reshape reads.
+        _extent_check(quote
+                a ~ Normal(0, 1)
+                M = LOC .+ a
+                Z[1:r, 1:k] .~ Normal.(M, 1.0)
+                y .~ Normal.(Z[ids, 1], 1.0)
+            end,
+            [(LOC = [0.1 -0.2 0.3; 0.4 0.0 -0.1], r = 2, k = 3, ids = [1, 2, 1], y = [0.9, 1.0, 1.1]),
+                (LOC = [0.2 0.1; -0.3 0.5; 0.0 0.4], r = 3, k = 2, ids = [1, 3, 2], y = [0.9, 1.0, 1.1])],
+            (v, d) -> logpdf(Normal(0, 1), v.a) + sum(logpdf.(Normal.(d.LOC .+ v.a, 1.0), v.Z)) +
+                sum(logpdf.(Normal.(v.Z[d.ids, 1], 1.0), d.y)))
         # A selection of an array's axes: the levels are the binding's, and other
         # labels keep the program and its build (`rkppl-use` section 14).
         plan = lower_rkppl(quote
@@ -581,7 +614,7 @@ end
         # Snag `partition-plan-n-2b8a0d4a`: `W` and `b` start where the level-sized
         # `Z` ends, a position read from the binding. The footprint kernel spliced
         # those positions into its body, so every binding with another level count
-        # compiled the footprint again (10-17 s per ODL binding).
+        # compiled the footprint again (10-17 s per downstream binding).
         plan = lower_rkppl(quote
                 sigma ~ Exponential(1)
                 Z[levels(group), 1:2] .~ Normal.(0, 1)
@@ -625,7 +658,7 @@ end
         @test ==(typeof.(footprint_functions)...)
     end
     @testset "one retained build serves larger, smaller and empty bindings in turn" begin
-        # The reporter's sequence (`ODLPlaus:precompile`, RK `bcb8134e`).
+        # The reporter's sequence (`runtime-values requirement`, RK `bcb8134e`).
         data(n) = (n = n, prior_mu = -0.2, prior_sd = 0.3, observation_sd = 0.7,
             x = [0.5 + 0.1i for i in 1:n], y = [0.9 + 0.1i for i in 1:n])
         plan = lower_rkppl(quote

@@ -186,7 +186,7 @@ end
 
 Expand per-addressee [`PopulationPrior`](@ref)s to per-coefficient location
 and scale vectors in design-column order (via
-[`coefficient_prior_specs`](@ref)). A factor addressee fans out to its
+`coefficient_prior_specs`). A factor addressee fans out to its
 whole contrast block (one shared prior); a matrix block looks up each
 element addressee in turn (per-column priors).
 """

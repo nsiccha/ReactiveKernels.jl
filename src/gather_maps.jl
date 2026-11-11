@@ -2,11 +2,7 @@
 #
 # A dotted call `f.(x[k])` applies `f` once per element of the index `k`. When
 # `k` reads the elements of a shorter `x` repeatedly, `f` runs several times on
-# each of them: Bruno's generated brm7 simulator computes each subject's dose
-# amounts as `op_amount[op_rows[i]] .* exp.(vcat(0.0, log_F[dose_rows[i]])[
-# op_dose_pos[op_rows[i]] .+ 1])`, 488 exponentials of 9 values per subject and
-# draw (snag `data-only-subexp-c79363b3`). On the user's decision `1j3rv6f`
-# (option 1: on by default) RK applies `f` once per element of `x` and gathers
+# each of them. RK applies `f` once per element of `x` and gathers
 # afterwards, wherever the index is a value partial evaluation caches: under
 # `bound=`, and in a position reader's per-cell prefix (`_replicated_shared_cells`).
 #

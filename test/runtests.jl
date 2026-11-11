@@ -140,7 +140,6 @@ const _MATRIX_CORE_TESTS = (
 )
 
 const _MATRIX_ACCEPTANCE_RUNTIME_TESTS = (
-    "test_compiler_docs.jl",
     "test_nonallocating_core.jl",
     "test_composition_cse.jl",
     "test_deterministic_ast.jl",

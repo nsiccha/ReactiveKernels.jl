@@ -109,7 +109,7 @@ function bound_number_na_primal_bytes(k, q)
     @allocated k(q)
 end
 
-# The user's direction on numeric values (`ODLPlaus:precompile` decision
+# The user's direction on numeric values (`runtime-values requirement` decision
 # `2026-11-06T01-09-46-212-0ikeidi`): a bound number is a runtime input, so its
 # value is not part of a kernel's type and costs no compile.
 @testset "non-allocating preparations share a body, not their state" begin

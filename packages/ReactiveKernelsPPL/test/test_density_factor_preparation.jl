@@ -194,7 +194,7 @@ end
 end
 
 @testset "a selection of many sites prepares a concretely typed program" begin
-    # Snag slices-of-one-bo-c43eb9ee: a slice's prior on ODL v2 selects dozens
+    # Snag slices-of-one-bo-c43eb9ee: a slice's prior on downstream v2 selects dozens
     # of sites. Their totals were added by one `+`, which Julia does not infer
     # past 32 operands, so the prepared program dispatched it at run time.
     sites = 40

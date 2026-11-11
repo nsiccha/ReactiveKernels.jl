@@ -2044,7 +2044,7 @@ _array_type_annotation(T::Expr) =
 # inference through a helper (`*_scalar_logdensity`) or a censoring branch would
 # give `Any`. RK guards an observation sum with no cell for a label, and the
 # work only it reads, only for a known numeric sum (snag
-# `absent-odl-vecto-d98e48bf`). A grouped observation's pointwise plate returns
+# `empty-vector regression`). A grouped observation's pointwise plate returns
 # each group's densities; its `_totals` plate is the declared one.
 function _declare_observation_densities!(stmts, points)
     plates = Set{Symbol}(value for (_, value) in points if value isa Symbol)
