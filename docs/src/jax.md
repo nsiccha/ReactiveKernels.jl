@@ -78,3 +78,67 @@ print(jax_source(decayed; have = (:x, :rate), want = :value))
 ```
 
 The body follows the rules of an `@traceable` body: a `return` only at its end, and in the JAX functions no `break` or `continue` and a `for` over one range. `prepare_data` runs the body as host Python, which takes both. A provider's source is read only by `jax_source`; native execution runs the method itself.
+
+## Package translations
+
+A package extension can translate its own callable to an existing Python operation. These hooks run during source emission; they do not change Julia execution or register a derivative rule. Python differentiates the emitted primal with ordinary `jax.grad`.
+
+Use `ReactiveKernels._jax_elementwise(::typeof(f))` for scalar calls and `f.(xs)`. Return a Python callable name, a `name => source` pair defining that module-level helper, or `nothing` to leave translation to the other paths. This does **not** register an ordinary array call `f(A)`: Julia's `exp(A)` is a matrix exponential, while `exp.(A)` applies the scalar exponential to each entry. Treating them alike would change the computation.
+
+For a positional whole-function call, including an array-valued helper, define
+`_jax_function_call(ctx::_JaxContext, ::typeof(my_function), args::Vector{_PyVal})`.
+Qualify each RK name with `ReactiveKernels`; the executable example below shows
+the complete method.
+
+The underscored names in this section are the package extension interface. A method must include the context and vector annotations shown above so it is more specific than RK's generic method. It is selected before recorded or provider source and lowered-code translation, but after an applicable scalar/elementwise mapping. It translates positional calls; it does not itself register keyword handling.
+
+Each `args[i]` describes one positional argument, **not** an actual Julia or Python value. `code` is its Python expression and `T` its Julia type. Preserve expressions with parentheses when composing operators; a value may be an expression rather than a bare variable. Return a `_PyVal`, not a string or `nothing`. The generic hook translates source; an override needing that fallback calls `_jax_traceable_or_lowered(ctx, f, args)`.
+
+`_jax_result(f, args, expression)` infers the result's Julia type from `f` and the argument types, so an inferred matrix stays a matrix and subsequent matrix multiplication keeps its meaning. The Python expression must implement that native method's result and shape. Shapes and numerical inputs remain runtime expressions; the hook receives types, not sample data. For a whole-array call that is also elementwise and preserves the arrays' axes, `_jax_elementwise_result(f, args, expression)` additionally carries the padded-axis metadata.
+
+For translations that change shape or ragged structure, the complete result constructor is `_PyVal(code, T, static, extent, limit, padded)`. Short constructors default `static=false`, `extent=""`, `limit=""`, and `padded=0`.
+
+| Field | Meaning |
+| --- | --- |
+| `static::Bool` | Known as a Python value while JAX traces; it can decide Python control flow. A JAX array is not static merely because its inputs are constants. |
+| `extent::String` | Valid length of a padded row, or lengths of a ragged collection; empty for an unpadded value. |
+| `limit::String` | Static upper-bound expression of a data-dependent integer, for loops and allocation; empty when absent. |
+| `padded::Int` | Bitmask of padded Julia axes, bit `k-1` for axis `k`. A padded vector's single axis is implicit; matrices need their axes recorded. |
+
+`_jax_result` carries an input extent to an array result but does not derive new lengths or padding axes. A whole-array operation must account for padding in its mathematics and return metadata for its actual result; blindly copying an input's metadata is not correct for an arbitrary reduction, reshape, or matrix function. The matrix-exponential example below takes an ordinary dense matrix, not a padded ragged row.
+
+### Host preparation and helpers
+
+The same hook is used for `prepare_data`, with `ctx.host !== nothing`. RK rewrites `jnp.*` to `np.*`, `jsp.*` to `ssp.*` (SciPy special functions), and `jax.scipy.linalg.*` to `scipy.linalg.*`. `_jax_result` also uses these host spellings when all operands are static, keeping shape or literal arithmetic usable in Python guards. A translation requiring different host mathematics can branch on `ctx.host` and emit a NumPy/SciPy expression explicitly. Leftover device-only constructs such as `jax.lax` or `.at[...]` cannot form host preparation; the recipe stays in the device function or is reported as untranslated, according to the preparation boundary.
+
+For a Python helper definition, call `_jax_helper!(ctx, name, source)` and use its **returned name** in the expression. It emits the helper once and, in host mode, emits a rewritten NumPy twin whose name has an `_np` suffix. Names must be unique across the emitted module; repeated names identify the same helper. In device mode with all-static operands, use `_host_helper!(ctx, name, source)` when the helper has a host spelling: `_jax_result` cannot inspect a separately defined helper's body to discover JAX calls. `_jax_elementwise` pairs handle this selection automatically. A custom helper must not mutate its inputs; RK cannot make arbitrary Python text obey ownership rules or translate an independently written derivative.
+
+### Executable scalar and matrix example
+
+This file defines owned Julia helpers, their mappings, and the kernels that use them. The `triple` helper has a loop, so its mapping is what makes the call translatable. The matrix exponential demonstrates whole-array mathematics distinct from an elementwise mapping.
+
+```@example jax
+using Markdown # hide
+translation_file = joinpath(pkgdir(ReactiveKernels), "examples", "jax_translations.jl") # hide
+include(translation_file) # hide
+Markdown.parse("```julia\n" * read(translation_file, String) * "\n```") # hide
+```
+
+Emit scalar and matrix device calls, and a data-only matrix exponential in host preparation:
+
+```@example jax
+ex = JAXTranslationExample
+scalar_source = jax_source(ex.mapped; have=(:x,), want=:total, types=(x=Float64,))
+matrix_source = jax_source(ex.mapped_product; have=(:A, :v), want=:total)
+host_source = jax_source(ex.exponential; have=(:scale, :A), want=:total, data=(:A,))
+print(host_source)
+```
+
+After `write("matrix_model.py", host_source)`, run `python examples/jax_translations.py matrix_model.py` with a Python that has JAX and SciPy. This consumer checks the result and gradient against SciPy and checks that preparation returns NumPy arrays:
+
+```@example jax
+python_file = joinpath(pkgdir(ReactiveKernels), "examples", "jax_translations.py") # hide
+Markdown.parse("```python\n" * read(python_file, String) * "\n```") # hide
+```
+
+The repository's JAX tests execute these examples with `RK_JAX_PYTHON` enabled: direct and wrapped calls, matrix rank, changed sizes, host preparation, and ordinary gradients against native Julia. The documentation build executes the Julia examples; it displays the Python consumer's source.

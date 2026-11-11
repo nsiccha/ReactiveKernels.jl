@@ -1969,9 +1969,12 @@ end
     _jax_elementwise(f) -> Union{Nothing,String,Pair{String,String}}
 
 The `jax.numpy` expression of the scalar function `f`, applied elementwise to
-arrays (`"jnp.exp"`), or `name => source` for a module-level helper `name`
+arrays when broadcast (`"jnp.exp"`), or `name => source` for a module-level helper `name`
 that `source` defines, or `nothing`. A package adds a translation for its own
 scalar function with a method of this function.
+An ordinary array call uses `_jax_function_call`: `exp(A)` and `exp.(A)`
+have different Julia semantics. See the JAX source guide's package translation
+contract for the whole-call hook, result metadata and host preparation.
 """
 function _jax_elementwise(f)
     name = get(_JAX_ELEMENTWISE, f, nothing)
@@ -2074,8 +2077,20 @@ function _jax_shifted_limit(f, args::Vector{_PyVal}, v::_PyVal)
     _PyVal(v.code, v.T, v.static, v.extent, limit, v.padded)
 end
 
-# A call with array semantics, or of a function translated from its own
-# graph or source.
+"""
+    _jax_function_call(ctx::_JaxContext, f, args::Vector{_PyVal}) -> _PyVal
+
+Translate a positional call, including one with Julia's whole-array semantics.
+A package specializes on `typeof(f)` for its own function. Each argument carries
+its Python expression (`code`) and Julia type (`T`); return a translated `_PyVal`,
+usually from `_jax_result(f, args, expression)`, not a string or `nothing`.
+The default method translates recorded/provider source or straight-line lowered
+code. It is reached after any applicable scalar/elementwise mapping.
+
+The hook also runs for host `prepare_data` (`ctx.host !== nothing`). The JAX
+source guide documents host spelling, helper definitions, static operands and
+ragged metadata, with the executable `examples/jax_translations.jl` example.
+"""
 _jax_function_call(ctx::_JaxContext, f, args::Vector{_PyVal}) =
     _jax_traceable_or_lowered(ctx, f, args)
 function _jax_traceable_or_lowered(ctx::_JaxContext, f, args::Vector{_PyVal})
