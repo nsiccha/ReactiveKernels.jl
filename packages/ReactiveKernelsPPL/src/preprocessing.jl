@@ -500,11 +500,13 @@ _ordinal_stage_idx(y::AbstractVector{<:Integer}, K) =
 # packed cells: a number is shared by every element, and an array of the
 # declared size gives each element its own value, read column-major as the
 # array packs (`B[a, b] .~ Normal.(M, s)` draws `B[i, j]` from
-# `Normal(M[i, j], s)`). A size known at binding is checked there; this
+# `Normal(M[i, j], s)`). `dims` is the array's size as the program reads it
+# (`_array_cells_dims`): extents read from data, of any integer type the
+# array's reshape takes. A size known at binding is checked there; this
 # check covers values computed in the graph. The message is built out of
 # line, so the reshape itself stays inlinable.
-_array_prior_cells(a::Number, dims::Dims) = a
-@traceable function _array_prior_cells(a::AbstractArray, dims::Dims)
+_array_prior_cells(a::Number, dims::Tuple{Vararg{Integer}}) = a
+@traceable function _array_prior_cells(a::AbstractArray, dims::Tuple{Vararg{Integer}})
     size(a) == dims || _array_prior_cells_mismatch(size(a), dims)
     return vec(a)
 end

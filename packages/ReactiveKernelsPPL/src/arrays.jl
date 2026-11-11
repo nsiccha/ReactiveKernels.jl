@@ -1985,6 +1985,19 @@ function _lkj_prior_dim!(stmts::Vector{Expr}, layout, plan::StructuralPlan,
         _lkj_dim_read(plan, _read_tests(plan), p, K))
 end
 
+# The size a per-element argument of a two-axis prior is checked against
+# (`_array_prior_cells`), as the program reads it: the axes its packed block
+# is reshaped by (`_entry_axes`), which are data-only reads such as `R` or the
+# declared literal size, never one binding's numbers, so a data-only argument
+# still folds at preparation. A conditioned array packs nothing; it is data
+# and reads its own size.
+function _array_cells_dims(layout, p::ArrayParameter)
+    i = layout === nothing ? nothing :
+        findfirst(e -> e.name === p.name && e.kind === :array, layout.entries)
+    i === nothing && return :(size($(p.name)))
+    return Expr(:tuple, _entry_axes(layout.entries[i])...)
+end
+
 # Prior nodes `_ppl_prior_<name>` of the plan's array parameters.
 function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         plan::StructuralPlan, needed::Set{Tuple{Symbol,Symbol,Int}};
@@ -2119,7 +2132,8 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             else
                 _array_gather_rewrite(a, context, needed)
             end
-            cells && (val = :(_array_prior_cells($val, $(Tuple(dims)))))
+            cells && (val = :(_array_prior_cells($val,
+                $(_array_cells_dims(layout, p)))))
             push!(stmts, :($local_name = $val))
             push!(arg_values, local_name)
         end
