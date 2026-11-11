@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.171
+
+- Partition plans retain label-only row bookkeeping inside an outer conditional,
+  including source calls with lexical `let` arguments. Preparation evaluates
+  only the selected branch and stores its results; value and gradient calls
+  keep the original guard and read those results. Plan types remain independent
+  of branch occupancy. Active calculations, nested conditionals and writable
+  scratch storage retain their ordinary execution. On a synthetic joint model,
+  the one-subject gradient allocates about 28% less; paired subject calls were
+  about 14% faster, or 10% after normalizing against each process's sweep.
+  Values and ordinary Enzyme gradients matched the previous implementation.
+
 ## 0.1.170
 
 - `jax_source` translates `join` and generators of values available while
