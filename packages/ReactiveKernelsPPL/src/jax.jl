@@ -513,3 +513,191 @@ function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
     ReactiveKernels._PyVal(length(rows) == 1 ? only(rows) : "max(" * join(rows, ", ") * ")",
                            Int, true)
 end
+
+# --- dotted cell latents (`cell_latent.jl`) ----------------------------------------
+#
+# A dotted `@plate` cell latent, `v[i] .~ D.(args…)`, adds data-only values to
+# the program: each index's dimensions, the packed offsets and block table,
+# and the arguments' entries in packed order. `prepare_data` computes them in
+# host NumPy from the data (snag jax-source-of-a-30375424). The functions read
+# a cell's block through the table, padded rows of packed positions, as a
+# gather that reductions mask by the row's length.
+#
+# On the host a vector of dimension tuples is a tuple of integer columns, one
+# per dimension, as the functions index it (`ReactiveKernels._jax_columns`);
+# with no dimensions (a number at every index) it is a `cells × 0` array. An
+# axes tuple is a tuple of `range(1, n + 1)` (`ReactiveKernels._host_axes`).
+
+_jax_cell_dims_rank(ctx, @nospecialize(D), what) =
+    D isa Type && D <: Tuple && isconcretetype(D) && all(T -> T === Int, fieldtypes(D)) ?
+    fieldcount(D) : ReactiveKernels._jax_error(what, " of dimensions `", D,
+        "` has no host translation", ReactiveKernels._jax_where(ctx))
+
+# One index's dimensions, `map(length, axes)`.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_latent_dims), args::Vector{ReactiveKernels._PyVal})
+    ctx.host === nothing &&
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, _ppl_cell_latent_dims, args)
+    a = only(args)
+    a.T isa Type && a.T <: Tuple && isconcretetype(a.T) || ReactiveKernels._jax_error(
+        "the dimensions of axes `", a.T, "` have no host translation",
+        ReactiveKernels._jax_where(ctx))
+    ReactiveKernels._PyVal("tuple(len(a) for a in " * a.code * ")",
+                           NTuple{fieldcount(a.T),Int}, true)
+end
+
+# Every index's dimensions, as columns.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_latent_shapes), args::Vector{ReactiveKernels._PyVal})
+    ctx.host === nothing &&
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, _ppl_cell_latent_shapes, args)
+    cells = args[2]
+    # Different ranks at different indices (warned about natively) have no
+    # common columns.
+    N = _jax_cell_dims_rank(ctx, ReactiveKernels._jax_eltype(cells.T),
+                            "a cell latent whose indices hold arrays")
+    code = N == 0 ? "np.zeros((len(" * cells.code * "), 0), dtype=np.int64)" :
+        "tuple(np.asarray([int(d[k]) for d in " * cells.code * "], dtype=np.int64) " *
+        "for k in range(" * string(N) * "))"
+    ReactiveKernels._jax_bind!(ctx, :dims, ReactiveKernels._PyVal(code, Vector{NTuple{N,Int}}, true))
+end
+
+# `[0; cumsum(prod.(dims))]`.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_latent_offsets), args::Vector{ReactiveKernels._PyVal})
+    ctx.host === nothing &&
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, _ppl_cell_latent_offsets, args)
+    dims = only(args)
+    N = _jax_cell_dims_rank(ctx, ReactiveKernels._jax_eltype(dims.T), "the offsets of cells")
+    code = N == 0 ? "np.arange(len(" * dims.code * ") + 1, dtype=np.int64)" :
+        "np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(np.prod(np.stack(" *
+        dims.code * "), axis=0, dtype=np.int64))])"
+    ReactiveKernels._jax_bind!(ctx, :offsets, ReactiveKernels._PyVal(code, Vector{Int}, true))
+end
+
+# The block table: each index's packed positions, a ragged integer column the
+# functions take padded.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_blocks), args::Vector{ReactiveKernels._PyVal})
+    ctx.host === nothing &&
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, _ppl_cell_blocks, args)
+    o = ReactiveKernels._jax_bind!(ctx, :offsets, only(args)).code
+    code = "[np.arange(" * o * "[k] + 1, " * o * "[k + 1] + 1, dtype=np.int64) " *
+        "for k in range(len(" * o * ") - 1)]"
+    ReactiveKernels._jax_bind!(ctx, :blocks, ReactiveKernels._PyVal(code, Vector{UnitRange{Int}}, true))
+end
+
+# The axes of an earlier array latent of the cell at its position.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_latent_axes), args::Vector{ReactiveKernels._PyVal})
+    ctx.host === nothing &&
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, _ppl_cell_latent_axes, args)
+    dims, pos = args
+    N = _jax_cell_dims_rank(ctx, ReactiveKernels._jax_eltype(dims.T), "the axes of cells")
+    k = ReactiveKernels._jax_minus_one(pos)
+    code = "tuple(range(1, int(c[" * k * "]) + 1) for c in " * (N == 0 ? "()" : dims.code) * ")"
+    ReactiveKernels._PyVal(code, NTuple{N,Base.OneTo{Int}}, true)
+end
+
+# The axes of an array read at indices: the indices' axes in order.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_index_axes), args::Vector{ReactiveKernels._PyVal})
+    ctx.host === nothing &&
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, _ppl_cell_index_axes, args)
+    all(a -> a.T isa Type && a.T <: Tuple && isconcretetype(a.T), args) ||
+        ReactiveKernels._jax_error("index axes `", join((a.T for a in args), "`, `"),
+            "` have no host translation", ReactiveKernels._jax_where(ctx))
+    T = Tuple{(fieldtype(a.T, k) for a in args for k in 1:fieldcount(a.T))...}
+    ReactiveKernels._PyVal("(" * join(("*" * a.code for a in args), ", ") * ",)", T, true)
+end
+
+# The shape of an undotted `+`, `-`, `*` or `/` with an array operand. Which
+# operands are arrays is known from their types: one array beside numbers
+# keeps its axes, and several are a sum (`*` and `/` of several arrays fail
+# when the binding evaluates the shape, before any module is emitted).
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_latent_call_axes), args::Vector{ReactiveKernels._PyVal})
+    ctx.host === nothing &&
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, _ppl_cell_latent_call_axes, args)
+    axes = args[2:end]
+    all(a -> a.T isa Type && a.T <: Tuple && isconcretetype(a.T), axes) ||
+        ReactiveKernels._jax_error("operand axes `", join((a.T for a in axes), "`, `"),
+            "` have no host translation", ReactiveKernels._jax_where(ctx))
+    arrays = [a for a in axes if fieldcount(a.T) > 0]
+    isempty(arrays) && return ReactiveKernels._PyVal("()", Tuple{}, true)
+    length(arrays) == 1 && return only(arrays)
+    ReactiveKernels._jax_function_call(ctx, Base.Broadcast.broadcast_shape, arrays)
+end
+
+# A model value read at an index holds numbers: the binding checks the data
+# it reads (`_ppl_cell_number_entries`); its axes are the read's.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_number_entries), args::Vector{ReactiveKernels._PyVal})
+    ctx.host === nothing &&
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, _ppl_cell_number_entries, args)
+    last(args)
+end
+
+# Entries of a cell latent's argument that read sampled per-index arrays are
+# computed by the functions, per cell, and joined in packed order: that has
+# no JAX translation yet (an argument of data and scalar parameters has).
+_jax_cell_entries_unsupported(ctx) = ReactiveKernels._jax_error(
+    "a dotted cell latent whose argument reads a sampled array at the index ",
+    "(`b[i] .~ Normal.(a[i], 1)` with `a[i]` a cell latent, `Normal.(m[rows[i]], 1)` ",
+    "with `m` sampled) has no JAX translation yet; arguments computed from data alone, ",
+    "beside scalar parameters, translate", ReactiveKernels._jax_where(ctx))
+
+# One index's entries of an argument, broadcast to its dimensions, in
+# column-major order (NumPy broadcasts trailing dimensions, Julia leading
+# ones, so the value takes trailing singleton dimensions first).
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_latent_entries), args::Vector{ReactiveKernels._PyVal})
+    ctx.host === nothing && _jax_cell_entries_unsupported(ctx)
+    x, dims = args
+    N = _jax_cell_dims_rank(ctx, dims.T, "a cell latent argument")
+    shape = N == 0 ? "()" : dims.code
+    if ReactiveKernels._jax_is_array(x.T) && !ReactiveKernels._jax_ragged(x.T)
+        E = eltype(x.T)
+        k = N - ndims(x.T)
+        k >= 0 || ReactiveKernels._jax_error("a cell latent argument of rank ", ndims(x.T),
+            " in a ", N, "-dimensional value", ReactiveKernels._jax_where(ctx))
+        v = ReactiveKernels._jax_bind!(ctx, :argument, x).code
+        code = "np.broadcast_to(np.reshape(np.asarray(" * v * "), np.shape(" * v * ")" *
+            (k == 0 ? "" : " + (1,) * " * string(k)) * "), " * shape * ").ravel(order=\"F\")"
+    elseif x.T isa Type && x.T <: Number
+        E = x.T
+        code = "np.full(int(np.prod(" * shape * ", dtype=np.int64)), " * x.code * ")"
+    else
+        ReactiveKernels._jax_error("a cell latent argument of type `", x.T,
+            "` has no host translation", ReactiveKernels._jax_where(ctx))
+    end
+    ReactiveKernels._PyVal(code, Vector{E}, true)
+end
+
+# Every index's entries, in plate order, in one vector.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_latent_flatten), args::Vector{ReactiveKernels._PyVal})
+    ctx.host === nothing && _jax_cell_entries_unsupported(ctx)
+    cells = only(args)
+    C = ReactiveKernels._jax_eltype(cells.T)
+    E = C isa Type && C <: AbstractArray && eltype(C) <: Number ? eltype(C) : Float64
+    dtype = ReactiveKernels._host_dtype(E)
+    code = "np.concatenate([np.zeros(0, dtype=" * dtype * ")] + [np.ravel(np.asarray(c, dtype=" *
+        dtype * ")) for c in " * cells.code * "])"
+    ReactiveKernels._jax_bind!(ctx, :entries, ReactiveKernels._PyVal(code, Vector{E}, true))
+end
+
+# A cell's value of its latent from its block. A padded block (the table's
+# row) is a vector or a number at each index; an array of higher rank per
+# index has no JAX translation yet.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_latent_block), args::Vector{ReactiveKernels._PyVal})
+    block, dims = args
+    D = dims.T
+    ctx.host === nothing && !isempty(block.extent) && D isa Type && D <: Tuple &&
+        fieldcount(D) >= 2 && ReactiveKernels._jax_error("a dotted cell latent holding a ",
+            "rank-", fieldcount(D), " array at each index (`M[i] .~ Normal.(A[i], 1)` with ",
+            "matrices) has no JAX translation yet; a vector or a number per index translates",
+            ReactiveKernels._jax_where(ctx))
+    ReactiveKernels._jax_traceable_or_lowered(ctx, _ppl_cell_latent_block, args)
+end

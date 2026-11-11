@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.160
+
+- `jax_source` with `data`: `prepare_data` computes `axes(x)` of a data array
+  (the tuple of its ranges) and `Base.Broadcast.broadcast_shape` of such
+  tuples, so a data-only shape that a value's axes give, one per plate cell
+  say, runs on the host. Both used to raise `JAXEmissionError` there (`axes`
+  without a dimension; a function with branches). Device code is unchanged
+  (snag `jax-source-of-a-30375424`).
+
 ## 0.1.159
 
 - `jax_source`: a matrix padded along a ragged row, such as a mixture law's

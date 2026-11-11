@@ -16,6 +16,26 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.156
+
+- `jax_source` of a program with a dotted `@plate` cell latent,
+  `v[i] .~ D.(args…)` whose length per index comes from data (BRM's
+  non-centred per-unit steps, `z ~ Normal(zero_i[i], 1)` with one vector per
+  index): `prepare_data` now computes each index's dimensions, the packed
+  offsets, the block table and the arguments' entries in host NumPy, and the
+  functions read a cell's block through the padded table. The module takes
+  only the bound data (`UNTRANSLATED = {}`), with the native value and
+  gradient. It used to raise `JAXEmissionError` (`the function
+  _ppl_cell_blocks has loops or branches`) on a fresh binding, and after a
+  native query emitted a module that took the block table and the other
+  helper values as inputs the binding's data do not hold (snag
+  `jax-source-of-a-30375424`). Requires ReactiveKernels 0.1.160.
+- Not built yet, and refused with `JAXEmissionError` naming the case: an
+  argument that reads a sampled array at the index (`b[i] .~ Normal.(a[i], 1)`
+  with `a[i]` a cell latent, `Normal.(m[rows[i]], 1)` with `m` sampled), and
+  an array of rank 2 or more at each index. Arguments of data beside scalar
+  parameters translate.
+
 ## 0.1.155
 
 - Compact-cell Hessian-vector products and the mixed derivatives of a cell
