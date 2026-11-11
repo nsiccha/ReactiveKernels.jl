@@ -906,7 +906,7 @@ function _score_drift(cp, source, target)
     changed, max_abs, max_rel, worst = 0, 0.0, 0.0, nothing
     for endpoint in (:source, :target), i in eachindex(scores[endpoint])
         old, new = stored[endpoint][i], scores[endpoint][i]
-        isequal(old, new) && continue
+        old == new && continue
         changed += 1
         deviation = Float64(abs(new - old))
         scaled = isfinite(deviation) ? deviation / max(abs(old), 1) : Inf
