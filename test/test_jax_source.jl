@@ -874,8 +874,8 @@ end
     return total
 end
 
-# A scan step output with vector fields (a K-state filter's `(lpd, w, m)`,
-# ODLProject:ap3): each vector field stacks as the (steps, K) array of rows.
+# A scan step output with vector fields (a K-state filter's `(lpd, w, m)`):
+# each vector field stacks as the (steps, K) array of rows.
 @kernel jax_scan_vector_fields(ys::Vector{Float64}, w0::Vector{Float64}, a::Float64) = begin
     K = length(w0)
     steps = scan(ys; init = (m = a .* w0, w = w0)) do st, y

@@ -1689,7 +1689,7 @@ _entry_view(e::LayoutEntry) = :(view(unconstrained, $(_entry_range(e))))
 
 # Sizes and data-derived numbers stay data in the generated program, never this
 # binding's literals (user principle
-# `ODLPlaus:precompile/decisions/2026-11-06T01-09-46-212-0ikeidi`). Layout reads
+# `runtime-values requirement`). Layout reads
 # them from the values the program already has: a block sized `1:n` is
 # `view(unconstrained, 1:n)`, and the next block starts after it. One program
 # then serves every extent and value of one declaration; a raw cut supplies the

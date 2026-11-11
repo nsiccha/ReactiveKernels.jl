@@ -193,11 +193,8 @@ ordinary recipe. A body is always its plate's [`plate_body`](@ref) or its
 scan's [`scan_body`](@ref) plan. The inventory only reads its argument; nothing
 is planned, prepared or evaluated.
 
-For example, the plate and scan structure of a program as `(kind, depth)` pairs:
-
-```julia
-[(entry.kind, entry.depth) for entry in recipe_inventory(spec) if entry.kind !== :ordinary]
-```
+Filter entries whose `kind` is not `:ordinary` to inspect the nesting of
+plates and scans. Read `kind` and `depth` from those entries.
 """
 recipe_inventory(spec::KernelSpec) = recipe_inventory(kernel_graph(spec))
 recipe_inventory(g::Graph) = _recipe_inventory(g.recipes)

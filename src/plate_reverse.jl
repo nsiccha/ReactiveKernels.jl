@@ -566,7 +566,7 @@ end
 # ways. The native lowering allocates a pointwise plate's output with
 # `_plate_similar_output` and fills it inside such a call
 # (`buf[index] = value`), so an assignment-only analysis would take a buffer of
-# active values for a constant and drop its gradient (ODL's calibrated hourly
+# active values for a constant and drop its gradient (a downstream application’s calibrated hourly
 # amplitudes, todo 093ym5a). Over-approximating activity only costs a fallback.
 function _pr_dataflow!(out, ex)
     ex isa Expr || return out

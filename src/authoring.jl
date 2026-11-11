@@ -5784,7 +5784,7 @@ end
 Compose declarative specs by named ports. The default preserves the first
 spec's boundary through every merge. `boundary=:fragment` explicitly adopts
 the final spec's boundary. To join a port to a value of another name, rename
-the port first with [`ReactiveKernels.rename`](@ref rename).
+the port first with `ReactiveKernels.rename`.
 """
 function compose(first::KernelSpec, rest::KernelSpec...; boundary::Symbol = :base)
     boundary in (:base, :fragment) || throw(ArgumentError(
