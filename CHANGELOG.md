@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.163
+
+- With bound data, a gather that a plate cell or partition reads at its rows
+  keeps its row form when a total-only plate downstream of that cell also
+  reads it. Bound preparation gives a residual gather that feeds a
+  total-only plate a run schedule (`_readonly_gather_runs`). It used to give
+  one to every ancestor of that plate, including a gather that reaches it
+  only through a plate cell. A cell runs its plate at its own rows, where no
+  run schedule applies, and the rewritten gather had no row form. A cell
+  prepared with `locality = :error` then raised `PartitionLocalityError`
+  ("its producer `_readonly_gather_runs` has no row form"). RKPPL's
+  `prepare_cell_factor_ad(…, :outer, …)` raised it for a nested model whose
+  cell reads a per-subject gather, `mu[i]` with `mu = a .+ s .* z[subject]`,
+  because the exemplar sums it evaluates at preparation are such a plate.
+  This was BRM's sparse Laplace, `integrate = (:subject, :unit)`, in snag
+  `cell-factor-ad-r-b4e2a0f4`. The run schedule now stops at a plate cell. A
+  gather that also reaches the plate another way is read whole there, and
+  keeps its runs.
+
 ## 0.1.162
 
 - In a partition, a matrix value that several one-cell members ask for at
