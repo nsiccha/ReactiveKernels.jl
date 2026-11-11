@@ -3,7 +3,7 @@ using ReactiveKernels, DifferentiationInterface, Enzyme, Test
 
 # An endpoint call (a sibling, a bound child or an `inv`) in a lazy branch arm
 # of a kernel-object method is evaluated only when the arm is taken
-# (`docs/src/constraints.md`, "Preserve lazy branches"). It used to be hoisted
+# (`CONTRIBUTING.md`, "Preserve lazy branches"). It used to be hoisted
 # into its own recipe above the branch, so `f(-1.0)` ran `log(-1.0)` and threw
 # a `DomainError` (todo `ReactiveKernels:kernel-let/2026-10-13T10-32-37-142-0dsoym5`).
 @kernel guarded(scale::Float64) = begin
@@ -171,7 +171,7 @@ end
             end
             @test bound(0.0) == (n == 0 ? 0.0 : -Inf)
             # Growing bound data retains the same emitted loop/branch bodies.
-            # An empty domain may simplify them away (constraints.md).
+            # An empty domain may simplify them away (CONTRIBUTING.md).
             if n > 0
                 shape = regions(code_expr(bound))
                 @test shape == get!(structures, policy, shape)

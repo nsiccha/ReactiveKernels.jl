@@ -6,7 +6,7 @@
 # order, an ordinary recipe becomes one assignment translated from its authored
 # right-hand side, a plate becomes `jax.vmap` of its cell, a scan becomes
 # `jax.lax.scan` of its step and a lazy branch becomes `jax.lax.cond` of its
-# arms. Nothing is unrolled per element (`docs/src/constraints.md`, "Preserve
+# arms. Nothing is unrolled per element (`CONTRIBUTING.md`, "Preserve
 # data-dependent iteration"), and sizes are read from the inputs, so one
 # emitted module serves every data size of the same program. Gradients are
 # `jax.grad` of the emitted primal; derivative rules contribute only their

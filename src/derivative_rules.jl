@@ -1,6 +1,6 @@
 # Derivative rules generated from one pure-math graph.
 #
-# Policy (docs/src/constraints.md, "Derivative rules come from one mathematical
+# Policy (CONTRIBUTING.md, "Derivative rules come from one mathematical
 # graph, never by hand"): a numerical primitive's derivatives are authored ONCE
 # as an ordinary `@kernel` graph, and every AD-protocol adapter is generated
 # from activity-selected HAVE→WANT cuts of that graph, attached to a callable

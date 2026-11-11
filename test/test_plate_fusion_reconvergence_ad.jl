@@ -44,7 +44,7 @@ _diamond_reverse_bytes(ad::A, gradient, args::Vararg{Any,N}) where {A,N} =
         base = sum(q) .* x
         expected = sum(x .* (cos.(base) .- sin.(base)); init = 0.0)
         if VERSION < v"1.11-" && n == 0
-            # Enzyme boundary (`docs/src/constraints.md`,
+            # Enzyme boundary (`CONTRIBUTING.md`,
             # `benchmark/repro_enzyme_branch_allocation_phi.jl`): over the empty
             # sequence the two summed readers meet an empty, never written
             # allocation in one value, and registered Enzyme 0.13.216 fails
