@@ -16,6 +16,16 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.151
+
+- A selective SMC window (`prepare_smc_window(…; coordinates = :auto)`) whose
+  fresh prior reads a data-valued scale through a named definition, as BRM
+  emits it (`z_prior_scale = s; z[1:n] .~ Normal.(z_prior_mean,
+  z_prior_scale)` with `s` bound as data), now prepares, with the same
+  density and gradient as the direct `Normal.(m, s)`. It threw `cannot merge
+  structural aliases for value :z_prior_scale: Number does not match Float64`
+  (snag `selective-fresh-96f7fe96`). Requires ReactiveKernels 0.1.155.
+
 ## 0.1.150
 
 - Shared-prefix cell and partition derivatives work when a shared value that

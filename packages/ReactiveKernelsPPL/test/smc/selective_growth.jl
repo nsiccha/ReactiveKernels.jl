@@ -48,6 +48,44 @@ end
     @test F.EXT._density(next,[-0.2]) ≈ F.normal(-0.2,-0.3,0.7)+F.normal(0.1,-0.2,1) atol=1e-10
 end
 
+# BRM names a Gaussian vector prior's arguments (`z_prior_scale = s`). With the
+# scale bound as data, the fresh prior's plate reads it through that alias, and
+# preparing the window failed with `cannot merge structural aliases for value
+# :z_prior_scale: Number does not match Float64` (snag selective-fresh-96f7fe96).
+@testset "Fresh prior with a data-valued scale, named or read directly" begin
+    named=quote
+        m ~ Normal(0,4)
+        z_prior_mean = m
+        z_prior_scale = s
+        z[1:nb] .~ Normal.(z_prior_mean,z_prior_scale)
+        y .~ Normal.(z[block],1)
+    end
+    direct=quote
+        m ~ Normal(0,4)
+        z[1:nb] .~ Normal.(m,s)
+        y .~ Normal.(z[block],1)
+    end
+    function scaled(source,nb,block,y)
+        data=(; nb,block=Int.(block),y=Float64.(y),s=2.0)
+        plan=bind_data(lower_rkppl(source,data;conditioned=(:y,)),data)
+        (; built=build_kernel(plan),plan)
+    end
+    for source in (named,direct)
+        old=F.calibration(scaled(source,2,Int[],Float64[]),
+            SMCReference([1.0,-0.3,0.4],[0.5,0.7,0.9]))
+        t=F.window(scaled(source,3,[3],[3.0]),old)
+        c=smc_window_coordinates(t)
+        @test c.current_indices==[1,4]
+        @test c.active_old==[1]
+        @test c.fresh_slots==[2]
+        u,g=[1.2,2.4],zeros(2)
+        expected=F.normal(u[1],1.0,0.5)+F.normal(u[2],u[1],2)+F.normal(3,u[2],1)
+        @test F.EXT._density(t,u) ≈ expected atol=1e-12
+        @test F.EXT._gradient(t,g,u) ≈ expected atol=1e-12
+        @test g ≈ [-(u[1]-1)/0.25+(u[2]-u[1])/4, -(u[2]-u[1])/4+3-u[2]] atol=1e-10
+    end
+end
+
 @testset "Fresh transformed plate factors and Jacobians exactly once" begin
     source=quote
         z[1:nb] .~ LogNormal.(0,1)

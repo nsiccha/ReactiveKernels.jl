@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.155
+
+- A plate that reads a bound value through an undeclared name for it
+  (`t = s`, with `s::Float64` bound) now keeps that value's declared type
+  when its preparation is copied and composed. Bound preparation used to
+  type the plate's operand `t` as `Number`, so a graph built from the
+  prepared recipes held `t::Number` beside `s::Float64`, and `merge` refused
+  it with `cannot merge structural aliases for value :t: Number does not match
+  Float64`. RKPPL builds its factor catalogue that way, so a selective SMC
+  window whose fresh prior reads a data-valued scale through such a name
+  (BRM's `log_rate_prior_scale = offset_scale`) failed to prepare (snag
+  `selective-fresh-96f7fe96`).
+
 ## 0.1.154
 
 - `jax_source` with `data`: a recipe of a top-level plate's cell that reads
