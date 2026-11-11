@@ -16,6 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.164
+
+- A plate cell whose value is one broadcast of 32 or more operands, such as
+  an n-ary `.+` of many `x_k[i] .* beta[k]` terms, and which a nested plate or
+  a vector likelihood reads entry by entry, is now type stable, so ordinary
+  Enzyme Reverse differentiates it. The cell's composed broadcast mapped,
+  instantiated, typed and read its operand tuple through Base, which stops
+  specializing a tuple at 32 elements: preparation warned that the entry call
+  is not type stable, and the gradient raised `EnzymeRuntimeActivityError`
+  (33 operands) or aborted the process with a GC error (32 operands). It now
+  uses the structural expansion a top-level wide broadcast already uses.
+  Broadcasts of fewer than 32 operands are unchanged (snag
+  `plate-cell-n-ary-3391765b`).
+
 ## 0.1.163
 
 - With bound data, a gather that a plate cell or partition reads at its rows
