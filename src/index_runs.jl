@@ -100,7 +100,7 @@ function _partial_index_runs(p::Plan,bound_values::Vector{Value})
         !(canon_id(g,r.inputs[1].id) in dataonly) &&
         canon_id(g,r.inputs[2].id) in dataonly)
     isempty(eligible) && return p
-    copied=Graph(copy(g.values),copy(g.recipes),copy(g.producers),copy(g.aliases),g.version)
+    copied=Graph(copy(g.values),copy(g.recipes),copy(g.producers),copy(g.aliases),g.version, nothing, copy(g.checks))
     recipes=Recipe[]
     metadata=Dict{ValueId,Value}()
     fresh=minimum((r.id for r in p.recipes);init=0)-1

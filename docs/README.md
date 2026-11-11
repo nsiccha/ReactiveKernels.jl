@@ -34,7 +34,6 @@ by other packages is linked from the relevant example.
 - `api.md`: find exported core APIs grouped by task and type.
 - `ppl-api.md`: find exported PPL authoring, binding, coordinate and query APIs.
 - `distribution-api.md`: find distribution kernels and their public construction surface.
-- `constraints.md`: preserve the semantic and ownership requirements for implementations and examples.
 
 ## Build
 

@@ -102,6 +102,68 @@ KernelSpec(graph::Graph, ports::Dict{Symbol,Value}, port_order::Vector{Symbol},
            have_names::Vector{Symbol}, want_names::Vector{Symbol}) =
     KernelSpec(graph, ports, port_order, have_names, want_names, nothing)
 
+"""
+    input_check!(spec::KernelSpec, input::Symbol, f, args...) -> spec
+
+Check the HAVE input `input` at the entry of every prepared cut of `spec` that
+takes it and reads it: native, each `vectorize` lane, the primal of every
+derivative operator, non-allocating and JAX. The cut calls `f(args...)` once
+before it returns, where a `Symbol` in `args` names a value of the kernel (the
+input itself, or a value computed from data such as a size) and anything else
+is passed as written. `f` throws when the input does not fit and returns
+`nothing`. It must read the input's shape alone, never its entries: no read
+analysis (footprints, partitions, cells, activity) sees the check, so a check
+reading entries would hide those reads. `f` is a function bound to a global
+name, which the generated code calls (it prints in `code_expr`).
+
+A cut computes the values `args` name even when nothing it returns needs them,
+when it can compute them from its boundary. A split plan (bound data, a
+partition's prefix and residual, `vectorize`'s shared work) runs the check on
+the side that reads the input. A graph derived from this one (a query's cell
+or partition graph, `compose`, `rename`, a call of this kernel inside another)
+keeps the check on the same value, and runs it in each cut that takes that
+value as an input.
+
+ReactiveKernelsPPL checks that a model's packed point holds its binding's
+packed total: `input_check!(spec, :unconstrained, _ppl_check_packed,
+:unconstrained, total)`.
+"""
+function input_check!(spec::KernelSpec, input::Symbol, f, args...)
+    named(name) = haskey(spec.ports, name) ? spec.ports[name] :
+        _kernel_named_value(spec.graph, name)
+    target = named(input)
+    target === nothing && throw(ArgumentError(
+        "input_check!: `$input` is not a value of this kernel"))
+    f isa Function && isdefined(parentmodule(f), nameof(f)) &&
+        getglobal(parentmodule(f), nameof(f)) === f || throw(ArgumentError(
+            "input_check!: the check $(repr(f)) must be a function bound to a global name"))
+    resolved = Any[]
+    for a in args
+        value = a isa Symbol ? named(a) : a
+        value === nothing && throw(ArgumentError(
+            "input_check!: `$a` is not a value of this kernel"))
+        push!(resolved, value)
+    end
+    push!(spec.graph.checks, InputCheck(target.id, f, Tuple(resolved)))
+    # A plan, bound preparation or data cache made before the check would not
+    # run it: they key on the graph's version.
+    spec.graph.version += 1
+    spec.graph.preparations = nothing
+    spec
+end
+# The one value of `g` named `name`, or `nothing`.
+function _kernel_named_value(g::Graph, name::Symbol)
+    found = nothing
+    for v in values(g.values)
+        v.name === name || continue
+        cid = canon_id(g, v.id)
+        found === nothing || canon_id(g, found.id) == cid || throw(ArgumentError(
+            "input_check!: more than one value of this kernel is named `$name`"))
+        found = g.values[cid]
+    end
+    found
+end
+
 struct _KernelRequiredArgument end
 const _KERNEL_REQUIRED_ARGUMENT = _KernelRequiredArgument()
 
@@ -572,6 +634,9 @@ Base.@nospecializeinfer function _kernel_add!(
              recipe.op, recipe.cost, _kernel_provenance_key(recipe),
              recipe.effectful, recipe.source)
     end
+    # The child's input checks follow its values: one runs in a cut that takes
+    # the caller's actual as an input.
+    _kernel_clone_checks!(graph, cloned, child_graph)
     _reindex_producers!(graph)
 end
 
@@ -2735,7 +2800,7 @@ function _plate_cell_plan(p::Plan)
     g = p.graph
     graph = Graph(copy(g.values), copy(g.recipes),
         Dict{ValueId,Vector{Int}}(id => copy(ids) for (id, ids) in g.producers),
-        copy(g.aliases), g.version, nothing)
+        copy(g.aliases), g.version, nothing, copy(g.checks))
     recipes = Recipe[]
     for r in p.recipes
         if length(r.outputs) == 1
@@ -3845,7 +3910,7 @@ end
 #
 # Only strict positions are entered: a branch, short-circuit, generator,
 # closure, `let` or macro call keeps its own evaluation, so a node never runs
-# where the authored expression would not (docs/src/constraints.md, "Preserve
+# where the authored expression would not (CONTRIBUTING.md, "Preserve
 # lazy branches"); its whole enclosing call can still be a node. A dotted call
 # keeps its nested dotted calls fused; its eager operands can be nodes. The
 # decomposition is a function of the expression and its argument names alone,
@@ -5685,6 +5750,15 @@ function _kernel_clone_recipes!(graph::Graph, mapped::Dict{ValueId,Value},
     graph
 end
 
+# The input checks of `source` (`InputCheck`), on the values `mapped` clones.
+function _kernel_clone_checks!(graph::Graph, mapped::Dict{ValueId,Value}, source::Graph)
+    for c in source.checks
+        push!(graph.checks, InputCheck(mapped[c.input].id, c.f,
+            map(a -> a isa Value ? mapped[a.id] : a, c.args)))
+    end
+    graph
+end
+
 function _kernel_clone_aliases!(graph::Graph, mapped::Dict{ValueId,Value},
                                 spec::KernelSpec)
     relations = Tuple{ValueId,ValueId}[]
@@ -5771,6 +5845,8 @@ function Base.merge(base::KernelSpec, fragment::KernelSpec; boundary::Symbol = :
     _kernel_clone_aliases!(graph, fragment_values, fragment)
     _kernel_clone_recipes!(graph, base_values, base)
     _kernel_clone_recipes!(graph, fragment_values, fragment)
+    _kernel_clone_checks!(graph, base_values, base.graph)
+    _kernel_clone_checks!(graph, fragment_values, fragment.graph)
     _kernel_reindex_producers!(graph)
 
     chosen = boundary === :base ? base : fragment
@@ -5854,6 +5930,7 @@ Base.@nospecializeinfer function rename(@nospecialize(spec::KernelSpec),
     values = _kernel_clone_value_map!(graph, new_ports, spec, port_name)
     _kernel_clone_aliases!(graph, values, spec)
     _kernel_clone_recipes!(graph, values, spec)
+    _kernel_clone_checks!(graph, values, spec.graph)
     _kernel_reindex_producers!(graph)
     KernelSpec(graph, new_ports, new_order,
                Symbol[port_name(name) for name in getfield(spec, :have_names)],

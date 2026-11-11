@@ -134,7 +134,7 @@ nodes(x) = x isa Expr ? 1 + sum(nodes, x.args; init=0) : 1
         end
     end
     # Emission keeps data-driven iteration; a larger binding does not duplicate
-    # arm bodies (docs/src/constraints.md, "Keep sizes and numeric values out
+    # arm bodies (CONTRIBUTING.md, "Keep sizes and numeric values out
     # of generated programs").
     for spec in (guarded_total, normalized_total)
         sizes = map((7, 257)) do n

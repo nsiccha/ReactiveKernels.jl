@@ -345,7 +345,7 @@ end
 # stores pointers into constant memory in the fresh pointwise buffer, which
 # then feeds an active result. Enzyme's static activity analysis rejects that
 # buffer exactly as it rejects plain `map(identity, groups)`
-# (`benchmark/repro_enzyme_constant_element_container.jl`, docs/src/constraints.md).
+# (`benchmark/repro_enzyme_constant_element_container.jl`, CONTRIBUTING.md).
 struct AliasedSubject
     xs::Vector{Float64}
 end
@@ -517,7 +517,7 @@ end
 # group produced no values, a read of the active plate output otherwise. The
 # lowering keeps the branch as authored; registered Enzyme's static activity
 # analysis refuses the constant arm when it is taken
-# (`benchmark/repro_enzyme_activity_mixed_branch.jl`, docs/src/constraints.md).
+# (`benchmark/repro_enzyme_activity_mixed_branch.jl`, CONTRIBUTING.md).
 @kernel picked_squares(x, idx, n) = begin
     levels = plate(1:n) do t
         x[1] * t + x[2]

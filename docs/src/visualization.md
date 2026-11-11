@@ -20,7 +20,7 @@ selected = plan(shifted_square)
 Tutorials.html(visualize(selected))
 ```
 
-The visualization is generated from the current plan. It is not a separately maintained diagram. A supplied intermediate input changes the plan boundary, so its producing recipe is no longer needed for that selection.
+The visualization is generated from the current plan, so it changes whenever the plan does. A supplied intermediate input changes the plan boundary, so its producing recipe is no longer needed for that selection.
 
 ## Generated expression
 

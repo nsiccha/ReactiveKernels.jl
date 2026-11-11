@@ -6,7 +6,7 @@
 # authors the primal plus its forward (JVP) and reverse (VJP) branches, and
 # `derivative_rule` generates the owned callable plus every AD-protocol adapter
 # from that graph's cuts. No hand-written rule, no rule on a foreign function
-# (see `docs/src/constraints.md`).
+# (see `CONTRIBUTING.md`).
 #
 # Native authored calls resolving to Base.exp use this owned primitive for
 # Matrix{Float64}; `_native_exp` preserves Base dispatch on all other inputs.

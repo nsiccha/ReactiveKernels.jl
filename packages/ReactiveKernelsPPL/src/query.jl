@@ -679,11 +679,14 @@ preparation to apply — `prepare_ad`, `prepare_ad_pullback`,
 `prepare_ad_pushforward`, `prepare_ad_hvp` or `prepare_ad_third` — and
 `exemplars` are that
 function's arguments after its backend, ending with an unconstrained exemplar
-`u0` of length `layout.total`:
+`u0` of length `layout.total`.
 
-Choose `prepare_ad_hvp` with a second-order backend for Hessian-vector
-products, `prepare_ad_pushforward` for directional outputs, or
-`prepare_ad_third` with a nested backend for third-order contractions.
+Choose `prepare_ad_hvp` with a second-order backend, such as
+`SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse), AutoEnzyme(; mode = Enzyme.Forward))`,
+and evaluate `ad_gradient_and_hvp(q, (v,), u)` for Hessian-vector products;
+`prepare_ad_pushforward` with a forward backend and `ad_value_and_pushforward`
+for directional outputs; or `prepare_ad_third` with a nested backend and
+`ad_gradient_hvp_and_third`, whose third output is the gradient of `vᵀ H v`.
 
 Gradients, Hessian-vector products and third-order derivatives need a scalar
 preset (`:sampler`, `:likelihood`, `:prior`, `:log_jacobian`); pullbacks and
@@ -836,8 +839,7 @@ observation. `plan` must generate the program `built` was built from, as for
 [`prepare_query`](@ref).
 
 For the packed coordinates a cell reads, use RK's structural footprint API:
-
-Prepare `ReactiveKernels.partition_footprint_kernel(q.kernel)` and evaluate
+prepare `ReactiveKernels.partition_footprint_kernel(q.kernel)` and evaluate
 it at the packed point and cell position. Its `unconstrained` field is either
 a vector of read positions or `:whole`.
 
@@ -1278,6 +1280,7 @@ function _compact_overlay!(spec, plan::StructuralPlan)
     end
     add!(spec.graph, (spec[:_ppl_cell_base], spec[:_ppl_cell_active],
         spec[:_ppl_cell_slots]) => spec[:unconstrained], _compact_cell_point)
+    _check_overlay_base!(spec.graph, spec[:unconstrained], spec[:_ppl_cell_base])
     filter!(!=(:unconstrained), spec.have_names)
     prepend!(spec.have_names, [:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots])
     filter!(n -> n ∉ _absent_inputs(plan), spec.have_names)
@@ -2454,7 +2457,8 @@ end
 function _compact_partition_plan(p::ReactiveKernels.Plan; whole_footprint::Bool=true)
     old = p.graph
     graph = Graph(copy(old.values), copy(old.recipes),
-        Dict(id => copy(ids) for (id, ids) in old.producers), copy(old.aliases), old.version, nothing)
+        Dict(id => copy(ids) for (id, ids) in old.producers), copy(old.aliases), old.version, nothing,
+        copy(old.checks))
     overlay = map((:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots),
                   (AbstractVector{Float64}, AbstractVector{Float64}, AbstractVector{Int32})) do name, type
         any(v -> v.name === name, values(graph.values)) && throw(ContractValidationError(
@@ -2462,6 +2466,7 @@ function _compact_partition_plan(p::ReactiveKernels.Plan; whole_footprint::Bool=
         value!(graph, name, type)
     end
     packed = only(v for v in p.have if v.name === :unconstrained)
+    _check_overlay_base!(graph, packed, first(overlay))
     point = whole_footprint ? _compact_cell_point : _local_cell_point
     recipe = ReactiveKernels._add_recipe!(graph, overlay, (packed,), point,
         1.0, nothing, false, ReactiveKernels._NO_KERNEL_SOURCE)

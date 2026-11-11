@@ -225,6 +225,7 @@ struct _ChildSnapshot{S}
     recipes::Tuple{Vararg{Recipe}}
     producers::Tuple{Vararg{Tuple{ValueId,Tuple{Vararg{Int}}}}}
     aliases::Tuple{Vararg{Pair{ValueId,ValueId}}}
+    checks::Tuple{Vararg{InputCheck}}
     version::Int
     ports::Tuple{Vararg{Pair{Symbol,ValueId}}}
     port_order::Tuple{Vararg{Symbol}}
@@ -245,6 +246,7 @@ function _kernel_capture_child(name::Symbol, child::KernelSpec)
         Tuple(g.recipes),
         Tuple((id, Tuple(g.producers[id])) for id in sort!(collect(keys(g.producers)))),
         Tuple(k => v for (k, v) in g.aliases),
+        Tuple(g.checks),
         g.version,
         Tuple(k => v.id for (k, v) in child.ports),
         Tuple(child.port_order),
@@ -260,7 +262,8 @@ function _kernel_reconstruct(snap::_ChildSnapshot)
     recipes = Recipe[r for r in snap.recipes]
     producers = Dict{ValueId,Vector{Int}}(id => collect(idxs) for (id, idxs) in snap.producers)
     aliases = Dict{ValueId,ValueId}(p.first => p.second for p in snap.aliases)
-    graph = Graph(values, recipes, producers, aliases, snap.version)
+    graph = Graph(values, recipes, producers, aliases, snap.version, nothing,
+                  InputCheck[snap.checks...])
     ports = Dict{Symbol,Value}(p.first => values[p.second] for p in snap.ports)
     # `collect(Symbol, …)` (not bare `collect`) so an EMPTY boundary rebuilds as a
     # `Vector{Symbol}`, not a `Vector{Union{}}` — a ports-only Mode-2 spec has no wants.

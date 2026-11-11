@@ -35,7 +35,7 @@ The nested [ReactiveKernelsPPL package](packages/ReactiveKernelsPPL) adds
 probabilistic declarations, coordinate transformations and log-density queries.
 Core ReactiveKernels does not select an inference algorithm.
 
-Contributors must read the [core constraints](docs/src/constraints.md) before
+Contributors must read the [core constraints](CONTRIBUTING.md) before
 changing a lowering, extension or example. See [docs/README.md](docs/README.md)
 for the documentation build and [benchmark/README.md](benchmark/README.md) for
 research and performance experiments.

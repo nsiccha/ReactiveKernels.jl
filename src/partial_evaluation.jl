@@ -199,6 +199,15 @@ function _partial_constants(p::Plan, prefix_owned::Set{ValueId},
     for w in p.want
         consider(w)
     end
+    # A check of an input the residual reads runs there (`InputCheck`): its
+    # arguments cross the boundary as the residual's own reads do.
+    have_ids = Set(canon_id(g, v.id) for v in p.have)
+    for c in p.checks
+        _check_reads(g, c, have_ids, residual) || continue
+        for a in c.args
+            a isa Value && consider(a)
+        end
+    end
     constants
 end
 
@@ -524,7 +533,7 @@ function _partial_split_recipes(inner::Plan, bound::Set{ValueId}, excluded::Set{
             continue
         end
         copied === nothing && (copied = Graph(copy(g.values), copy(g.recipes),
-            copy(g.producers), copy(g.aliases), g.version))
+            copy(g.producers), copy(g.aliases), g.version, nothing, copy(g.checks)))
         _partial_emit_split!(recipes, readable, copied, r, parts, nodedata, fresh;
                              gather_maps = true)
     end
@@ -647,7 +656,7 @@ function _partial_speculate_recipes(inner::Plan, bound::Set{ValueId}, excluded::
             continue
         end
         copied === nothing && (copied = Graph(copy(g.values), copy(g.recipes),
-            copy(g.producers), copy(g.aliases), g.version))
+            copy(g.producers), copy(g.aliases), g.version, nothing, copy(g.checks)))
         values = Value[]
         for node in rebuilt.nodes
             value = value!(copied, Symbol(only(r.outputs).name, :_arm_part, length(values) + 1),
@@ -809,7 +818,7 @@ Base.@nospecializeinfer function _partial_speculate_graph_arm!(nodes, plans, nam
     end
     ag = arm.graph
     copied = Graph(copy(ag.values), copy(ag.recipes), copy(ag.producers),
-                   copy(ag.aliases), ag.version)
+                   copy(ag.aliases), ag.version, nothing, copy(ag.checks))
     renamed = Dict(canon_id(ag, v.id) => value!(copied,
         names[available[canon_id(ag, v.id)]], valtype(v)) for v in frontier)
     mapped(v) = get(renamed, canon_id(ag, v.id), v)
@@ -937,7 +946,7 @@ function _partial_nested_shared_recipes(inner::Plan, bound, bound_types,
             continue
         end
         copied === nothing && (copied = Graph(copy(g.values), copy(g.recipes),
-            copy(g.producers), copy(g.aliases), g.version))
+            copy(g.producers), copy(g.aliases), g.version, nothing, copy(g.checks)))
         ng = nested.inner.graph
         available = Dict(canon_id(ng, v.id) => input
             for (v, input) in zip(nested.inner.have, r.inputs))
@@ -1403,7 +1412,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
             fresh = () -> (id = next_id[]; next_id[] -= 1; id)
             ig = inner.graph
             ig = Graph(copy(ig.values), copy(ig.recipes), copy(ig.producers),
-                       copy(ig.aliases), ig.version)
+                       copy(ig.aliases), ig.version, nothing, copy(ig.checks))
             for v in frontier
                 index = findfirst(r -> first(r) == v, records)
                 if index === nothing
@@ -1465,7 +1474,7 @@ end
 # split by outcome, and the plate becomes one plate per arm over its own lanes,
 # which are none for an arm no lane takes — so no backend ever receives that
 # branch, no lane evaluates an arm it does not take, and every gather inside an
-# arm is in bounds by construction (docs/src/constraints.md). The number of arm
+# arm is in bounds by construction (CONTRIBUTING.md). The number of arm
 # plates is fixed by the cell's branch structure, never by the data; lane-subset
 # sizes only change shapes.
 
@@ -1544,7 +1553,7 @@ The concatenation is the native kernel body's (`_native_vcat`): an arm that
 reads no live value (a constant fallback such as `0.0`) yields a constant
 vector, and Base's `vcat` of it beside a live arm of the same element type
 can fail native Enzyme reverse (`EnzymeRuntimeActivityError`,
-docs/src/constraints.md).
+CONTRIBUTING.md).
 """
 struct _LaneAssemble{W} end
 _LaneAssemble() = _LaneAssemble{false}()
@@ -1892,7 +1901,7 @@ function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId
     # operations. Only its value registry is extended; no shared graph changes.
     g = p.graph
     copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers),
-                   copy(g.aliases), g.version)
+                   copy(g.aliases), g.version, nothing, copy(g.checks))
     known = Dict{ValueId,Any}(known)
     recipes = Recipe[]
     next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
@@ -2187,6 +2196,14 @@ end
 # The residual recipes with each authored plate's batched bound arguments
 # narrowed to their binding's class. Only the argument's Value TYPE changes;
 # its identity, and every other recipe, are the boundary's own.
+#
+# A plate may read its argument through an undeclared alias label (`t = s`,
+# BRM's `z_prior_scale = scale`): the label has type `Any` and its class's
+# root carries the declaration. The narrowed type is taken within the root's
+# type too, so the label never claims a type its class does not have. Narrowing
+# the label alone gave `t::Number` beside `s::Float64`: a second declaration in
+# one alias class, which a graph rebuilt from these recipes keeps and
+# `merge` refuses (snag selective-fresh-96f7fe96).
 function _partial_narrow_plate_inputs(g::Graph, b::_PartialBoundary,
                                       @nospecialize(classes::Tuple))
     narrowed = Dict{ValueId,Any}()
@@ -2201,9 +2218,10 @@ function _partial_narrow_plate_inputs(g::Graph, b::_PartialBoundary,
         changed = false
         for (position, input) in enumerate(inputs)
             position in atomic && continue
-            class = get(narrowed, canon_id(g, input.id), nothing)
+            root = canon_id(g, input.id)
+            class = get(narrowed, root, nothing)
             class === nothing && continue
-            T = typeintersect(valtype(input), class)
+            T = typeintersect(typeintersect(valtype(input), valtype(g.values[root])), class)
             (T === valtype(input) || T === Union{}) && continue
             inputs[position] = Value{T}(input.id, input.name)
             changed = true

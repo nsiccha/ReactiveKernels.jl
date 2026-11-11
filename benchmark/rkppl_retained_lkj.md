@@ -87,7 +87,7 @@ K=1 has zero coordinates, `[1.0;;]`, compiled density, and native empty
 gradients. Reactant 0.2.290 cannot export its empty AD buffer (`tensor.empty`)
 for compiled reverse; one acceptance pin records that exact existing boundary.
 Canonical `repro_reactant_empty_gradient.jl` isolates it without RK imports,
-and `docs/src/constraints.md` documents it. The reduced `only_enzyme` pipeline
+and `CONTRIBUTING.md` documents it. The reduced `only_enzyme` pipeline
 also leaves unsized tapes; correctness and reverse scaling use the default
 pipeline that compiles successfully.
 
