@@ -1,4 +1,4 @@
-reactivekernels_version = "0.1.164"
+reactivekernels_version = "0.1.165"
 julia_version = "1.10.13"
 page = "discrete-latents"
 source_sha256 = "b4a0a8d7780042c674310c00bba56ef4579903f5fc824c475d125ffd214fe24b"
