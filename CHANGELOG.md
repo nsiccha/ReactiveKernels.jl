@@ -16,6 +16,22 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.160
+
+- New: `register_source_provider!(provider)` and `TraceableSource(argument_names,
+  body, mod)`, so a package that generates a method (a macro that writes it
+  into its caller's module) can hand `jax_source` the method's Julia source.
+  `jax_source` asks each registered provider, `provider(f, argument_types)`,
+  for a call that has no translation of its own and no `@traceable` source,
+  and translates the body it returns as it translates an `@traceable` body:
+  `jax.lax.fori_loop` for a `for` loop, `jax.lax.cond` for an `if`,
+  `.at[i].set` for `A[i] = v`, and host Python in `prepare_data`. Before,
+  such a method stopped `jax_source` with `JAXEmissionError: the function
+  ... has loops or branches`. Register the provider once, from the
+  `__init__` of the package's extension on ReactiveKernels. Native
+  execution, `prepare` and the compiled paths never read the source (snag
+  `register-generat-a22e2325`, decision `0os7s7u`).
+
 ## 0.1.159
 
 - `jax_source`: a matrix padded along a ragged row, such as a mixture law's

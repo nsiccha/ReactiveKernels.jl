@@ -1950,3 +1950,148 @@ end
         end
     end
 end
+
+# A package that generates methods (StanBlocks' `@deffun @juliacompat` writes
+# them into its caller's module) keeps each method's source and hands it to
+# `jax_source` through a registered provider, since the method's author cannot
+# write `@traceable` on it (snag register-generat-a22e2325). The macro stands in
+# for such a package: it defines the method and keeps its source.
+const JAX_GENERATED_SOURCES = Dict{Any,TraceableSource}()
+macro jax_test_generate(def)
+    signature, body = def.args
+    names = Tuple(a isa Expr ? a.args[1] : a for a in signature.args[2:end])
+    source = TraceableSource(names, body, __module__)
+    quote
+        $(esc(def))
+        JAX_GENERATED_SOURCES[$(esc(signature.args[1]))] = $source
+    end
+end
+# A PK-propagator-like method: a loop over a fixed range writing into an
+# array, and a branch whose arms assign an outer local.
+@jax_test_generate function jax_test_propagator(dt::Real, x::AbstractVector)
+    T = promote_type(typeof(dt), eltype(x))
+    state = Vector{T}(undef, 3)
+    for i in 1:3
+        state[i] = x[i] * exp(-i * dt)
+    end
+    total = zero(T)
+    if dt > 0
+        total = sum(state) / (1 + dt)
+    else
+        total = sum(state)
+    end
+    return total
+end
+# A data-only method with a `break`, which only `prepare_data` translates.
+@jax_test_generate function jax_test_first_at(x::AbstractVector, target::Real)
+    found = 0
+    for i in eachindex(x)
+        if x[i] >= target
+            found = i
+            break
+        end
+    end
+    return found
+end
+@kernel jax_generated(dt::Float64, x::Vector{Float64}) = begin
+    y = jax_test_propagator(dt, x)
+    return y
+end
+@kernel jax_generated_prep(theta::Float64, x::Vector{Float64}) = begin
+    at = jax_test_first_at(x, 1.0)
+    total = theta * at
+    return total
+end
+# The provider answers by mode, so the refusal without a source and the
+# provider's contract are checked in the same process.
+const JAX_PROVIDER_MODE = Ref(:off)
+jax_test_provider(f, argument_types) =
+    JAX_PROVIDER_MODE[] === :off ? nothing :
+    JAX_PROVIDER_MODE[] === :wrong_type ? (:x, :(x + 1), @__MODULE__) :
+    JAX_PROVIDER_MODE[] === :wrong_arity ? TraceableSource((:x,), :(x + 1), @__MODULE__) :
+    get(JAX_GENERATED_SOURCES, f, nothing)
+register_source_provider!(jax_test_provider)
+
+@testset "jax_source: a generated method's source from a registered provider" begin
+    have = (:dt, :x)
+    # No source: the loop and the branch are refused, naming the hook.
+    JAX_PROVIDER_MODE[] = :off
+    err = try
+        jax_source(jax_generated; have, want = :y)
+    catch e
+        e
+    end
+    @test err isa JAXEmissionError
+    @test occursin("has loops or branches", sprint(showerror, err))
+    @test occursin("register_source_provider!", sprint(showerror, err))
+    x = [0.2, 0.7, 1.4, 0.3, 2.0]
+    try
+        JAX_PROVIDER_MODE[] = :on
+        text = string(jax_source(jax_generated; have, want = :y))
+        @test occursin("jax.lax.fori_loop(", text)
+        @test occursin("jax.lax.cond(", text)
+        @test occursin(".at[", text)
+        @test !occursin(r"^\s*for "m, text)
+        # In the JAX functions a `break` is refused; `prepare_data` runs it
+        # as host Python.
+        @test_throws "`break` has no JAX translation" jax_source(jax_generated_prep;
+            have = (:theta, :x), want = :total)
+        prep = jax_source(jax_generated_prep; have = (:theta, :x), want = :total, data = (; x))
+        @test [f.name for f in prep.functions] == ["prepare_data", "kernel"]
+        # The method is a host helper that `prepare_data` calls.
+        text = string(prep)
+        helper = split(split(text, "def _jax_test_first_at_np(")[2], "\n\n\n")[1]
+        @test occursin("break", helper) && !occursin("jnp.", helper)
+        @test occursin("_jax_test_first_at_np(x, 1.0)",
+                       split(split(text, "def prepare_data")[2], "\ndef kernel")[1])
+        # One module for every data length: the loop stays a loop.
+        @test string(jax_source(jax_generated_prep; have = (:theta, :x), want = :total,
+                                data = (; x = [x; x; x]))) == text
+        # Registering the same provider again changes nothing.
+        @test register_source_provider!(jax_test_provider) === jax_test_provider
+        @test count(p -> p === jax_test_provider, ReactiveKernels._SOURCE_PROVIDERS) == 1
+        if !rk_jax_available()
+            @test_skip false
+        else
+            native = prepare(jax_generated; have, want = :y)
+            src = jax_source(jax_generated; have, want = :y)
+            x3 = [0.4, -1.1, 0.9]
+            for dt in (0.6, -0.3)    # each arm of the branch
+                r = rk_jax_evaluate(src, "kernel", (dt, x3); grad = true)
+                @test r.value ≈ native(dt, x3) rtol = 1e-12
+                @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x3), [dt])) rtol = 1e-6
+            end
+            native = prepare(jax_generated_prep; have = (:theta, :x), want = :total)
+            @test rk_jax_evaluate(prep, "kernel", (0.7, x); prepare = true).value ≈
+                  native(0.7, x) rtol = 1e-12
+        end
+        # A provider returns `nothing` or a `TraceableSource` over the call's
+        # arguments; anything else is an error, not a silent fallback.
+        JAX_PROVIDER_MODE[] = :wrong_type
+        @test_throws "a provider returns `nothing` or a `TraceableSource`" jax_source(jax_generated;
+            have, want = :y)
+        JAX_PROVIDER_MODE[] = :wrong_arity
+        @test_throws "returned a source over 1 arguments" jax_source(jax_generated; have, want = :y)
+    finally
+        JAX_PROVIDER_MODE[] = :off
+    end
+    # Native execution never reads the source.
+    @test prepare(jax_generated; have, want = :y)(0.6, x) ≈ jax_test_propagator(0.6, x)
+    # `TraceableSource` takes a body as `@traceable` does: a `return` at its
+    # end is its value, one before the end is refused.
+    s = TraceableSource([:x, :n], quote
+        y = x * n
+        return y
+    end, @__MODULE__)
+    @test s.argument_names === (:x, :n) && s.mod === @__MODULE__
+    @test !occursin("return", string(s.body))
+    @test_throws "TraceableSource does not support a `return` before the end" TraceableSource((:x,),
+        quote
+            if x > 0
+                return x
+            end
+            -x
+        end, @__MODULE__)
+    @test_throws "as `Symbol`s" TraceableSource(("x",), :x, @__MODULE__)
+    @test_throws "the argument name `x` twice" TraceableSource((:x, :x), :x, @__MODULE__)
+end
