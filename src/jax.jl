@@ -2817,12 +2817,15 @@ end
 _jax_call_positional(ctx::_JaxContext, c::_KernelPreparedChild, args::Vector{_PyVal}) =
     _jax_call_positional(ctx, c.kernel, args, c.name)
 
-# A `@traceable` helper: its authored body over the arguments, as the compiled
+# A `@traceable` helper, or a method whose source a registered provider
+# supplies: its authored body over the arguments, as the compiled
 # path reads it. Its locals are scoped to the call.
 function _jax_traceable_call(ctx::_JaxContext, f, args::Vector{_PyVal})
     types = Any[a.T for a in args]
     all(T -> T isa Type, types) || return nothing
     source = _traceable_source(typeof(f), types...)
+    # A method a package generates: its source from a registered provider.
+    source === nothing && (source = _provided_source(f, types))
     source === nothing && return nothing
     names, body, mod = source
     length(names) == length(args) || return nothing
@@ -2865,7 +2868,9 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
               (st isa Expr && st.head in (:enter, :leave, :pop_exception)), ci.code) &&
         _jax_error("the function `", f, "` has loops or branches, so its lowered code is ",
                    "not translated", _jax_where(ctx), ". Author it as a kernel, ",
-                   "or give it a `ReactiveKernels._jax_function_call` method")
+                   "or give it a `ReactiveKernels._jax_function_call` method; for a method ",
+                   "a package generates, the package supplies its source with ",
+                   "`ReactiveKernels.register_source_provider!`")
     mod = parentmodule(f)
     ssa = Vector{Any}(undef, length(ci.code))
     m = try

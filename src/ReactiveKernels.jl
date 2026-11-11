@@ -117,7 +117,7 @@ export batched_ports, scalar_kernel
 export explain, code_expr, inputs, outputs, valtype
 export compose, extract, PreparationCache, prepare!, canon_id
 export KernelSpec, KernelObjectSpec, @kernel, @node, @traceable, kernel_graph, port
-export jax_source, JAXSource, JAXFunction, JAXEmissionError
+export jax_source, JAXSource, JAXFunction, JAXEmissionError, TraceableSource, register_source_provider!
 export DAGVisualization, visualize, dot_source, save_visualization
 export recipe_kind, recipe_inventory
 # Reactive layer
