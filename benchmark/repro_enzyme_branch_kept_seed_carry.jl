@@ -18,7 +18,7 @@
 # reading its last element also differentiates (`seeded_result`), with the
 # same value: an empty inner sequence leaves the seed there.
 # `set_runtime_activity(Reverse)` differentiates every case.
-# Recorded on gordito, Enzyme 0.13.209, Julia 1.10.12, 2026-10-07.
+# Recorded on a Linux fleet host, Enzyme 0.13.209, Julia 1.10.12, 2026-10-07.
 using Enzyme
 
 # An inner scan over the weights, seeded by the carry. Its empty arm returns

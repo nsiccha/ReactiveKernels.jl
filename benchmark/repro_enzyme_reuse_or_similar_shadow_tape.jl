@@ -21,7 +21,7 @@
 # step applies `broadcast!` into its slot, so under `--check-bounds=yes` both
 # gradients allocate in proportion to element count on Julia 1.12 and later
 # (`test_nonallocating_ad.jl`).
-# Recorded on gordito, Enzyme 0.13.216 (Enzyme_jll 0.0.303), 2026-10-13, with
+# Recorded on a Linux fleet host, Enzyme 0.13.216 (Enzyme_jll 0.0.303), 2026-10-13, with
 # `--check-bounds=yes`, as warm Julia 1.12.7 gradient bytes at
 # n = (8, 64, 512, 4096):
 #   loop, reuse-or-similar: (80, 544, 8384, 65728)

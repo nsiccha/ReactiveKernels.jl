@@ -19,7 +19,7 @@
 # `set_runtime_activity(Reverse)` differentiates every case. ReactiveKernels'
 # native scan lowering therefore allocates its buffers once, before the
 # emptiness branch, whenever the step's inferred output type is concrete.
-# Recorded on gordito, Enzyme 0.13.209, Julia 1.10.12, 2026-10-05.
+# Recorded on a Linux fleet host, Enzyme 0.13.209, Julia 1.10.12, 2026-10-05.
 using Enzyme
 
 function fill_steps!(u, xs, g)

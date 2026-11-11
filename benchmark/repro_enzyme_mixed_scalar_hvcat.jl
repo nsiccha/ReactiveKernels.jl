@@ -13,7 +13,7 @@
 # `_native_hvcat` (`src/core.jl`) without calling Base's methods, so `@kernel`
 # bodies differentiate on both versions (snag `native-bracket-f-09be44ed`);
 # the limitation stays with opaque helpers a kernel calls.  Recorded on
-# gordito, 2026-10-07, Enzyme 0.13.210.
+# a Linux fleet host, 2026-10-07, Enzyme 0.13.210.
 using Enzyme
 
 const A = [1.0 2.0; 3.0 4.0]
