@@ -1048,8 +1048,23 @@ function _bound_extent_indices(name::Symbol, ex, plan::StructuralPlan)
     input = _value_extent_input(it)
     haskey(plan.columns, input) && !haskey(plan.columns, it.args[2]) || return ex
     call = ex.args[1]
-    indices = Expr(:call, GlobalRef(Base, :collect), Expr(:call, :(:), 1, input))
-    return Expr(:do, Expr(:call, call.args[1], indices, call.args[3:end]...), ex.args[2])
+    domain = Expr(:call, :(:), 1, input)
+    indices = Expr(:call, GlobalRef(Base, :collect), domain)
+    # A generated cell-position lookup uses the same domain as its plate.
+    # Leaving the old iterator here would read a sampled value merely to
+    # address the cell's data-only shape and prior arguments.
+    function positions(x)
+        x isa Expr || return x
+        x.head in (:quote, :inert) && return x
+        if Meta.isexpr(x, :call, 3) &&
+                x.args[1] == GlobalRef(@__MODULE__, :_ppl_cell_scan_position) && x.args[2] == it
+            # The rewritten domain is 1:extent, so position equals index,
+            # including when the domain is empty (no first-element read).
+            return x.args[3]
+        end
+        Expr(x.head, map(positions, x.args)...)
+    end
+    return Expr(:do, Expr(:call, call.args[1], indices, call.args[3:end]...), positions(ex.args[2]))
 end
 
 # The generated scope's `logistic` names a distribution kernel. Values

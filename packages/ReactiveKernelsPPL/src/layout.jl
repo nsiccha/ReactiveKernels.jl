@@ -1826,20 +1826,25 @@ function _property_read(ex::Expr)
         for (i, a) in enumerate(ex.args)]...)
 end
 
+# An authored dimension as a runtime length expression.
+function _array_axis_read(d)
+    d isa Int && return d
+    if _is_levels_dim(d)
+        return _read_length(_axis_labels_expr(d))
+    elseif (cnt = _levels_count(d)) !== nothing
+        return _read_add(_read_length(_axis_labels_expr(:levels, cnt[1], Colon())), -cnt[2])
+    elseif _is_bound_extent_dim(d)
+        return _property_read(d)
+    else
+        return _read_size(d.args[2], d.args[3])
+    end
+end
+
 # An array axis as the program reads it; `value` is this binding's length.
 function _array_dim_read(plan::StructuralPlan, tests, d, value::Int)
     d isa Int && return d
-    if _is_levels_dim(d)
-        read = _read_length(_axis_labels_expr(d))
-    elseif (cnt = _levels_count(d)) !== nothing
-        read = _read_add(_read_length(_axis_labels_expr(:levels, cnt[1], Colon())), -cnt[2])
-    elseif _is_bound_extent_dim(d)
-        d isa Symbol && haskey(plan.columns, d) && !(plan.columns[d] isa Integer) && return value
-        read = _property_read(d)
-    else
-        read = _read_size(d.args[2], d.args[3])
-    end
-    return _checked_read(tests, read, value)
+    d isa Symbol && haskey(plan.columns, d) && !(plan.columns[d] isa Integer) && return value
+    return _checked_read(tests, _array_axis_read(d), value)
 end
 
 function _array_packed_reads(plan::StructuralPlan, tests, e::LayoutEntry)

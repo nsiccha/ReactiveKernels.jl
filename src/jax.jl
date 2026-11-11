@@ -2139,6 +2139,9 @@ function _jax_traceable_or_lowered(ctx::_JaxContext, f, args::Vector{_PyVal})
     # A call Julia infers never returns is an error path (an out-of-line
     # `throw_mismatch(...)`): a Python `raise`, under the same rule as `throw`.
     if all(a -> a.T isa Type, args) && _jax_return_type(f, Any[a.T for a in args]) === Union{}
+        hasmethod(f, Tuple{(a.T for a in args)...}) ||
+            _jax_error("the function `", f, "` has no applicable Julia method for argument types (",
+                       join((string(a.T) for a in args), ", "), ")", _jax_where(ctx))
         return _jax_call(ctx, throw, [_PyVal(repr(string(nameof_or(f), " threw")), ErrorException)])
     end
     v = _jax_lowered_call(ctx, f, args)
@@ -3877,6 +3880,20 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         call = "jax.vmap(" * call * ", in_axes=" * axes_text * ")"
     end
     call *= "(" * join(args, ", ") * ")"
+    # vmap traces its cell even with no mapped entries. An indexed read in
+    # that body can then fail on an empty shared array although Julia runs
+    # no cells. Shape tests are known to the backend while tracing; branch
+    # before calling vmap, without reading or evaluating a cell. Only equal
+    # mapped shapes take this path, preserving existing mismatch checks.
+    # Scan outputs with tuple-valued cells are stored column by column;
+    # their first column carries the mapped shape.
+    shapes = [_py_atom((_jax_columns(v.T) ? _jax_column(v, 1) : v).code) *
+              ".shape[:" * string(R) * "]"
+              for (i, v) in enumerate(inputs) if mapped[i]]
+    empty = "0 in " * first(shapes)
+    for shape in shapes[2:end]
+        empty *= " and " * shape * " == " * first(shapes)
+    end
     if E <: Tuple && !(E <: NamedTuple)
         R == 1 || _jax_error("a plate of rank ", R, " whose cell returns a tuple", _jax_where(ctx))
         result = _jax_fresh(ctx, :plate_value)
@@ -3893,6 +3910,13 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     # carries its length (its size) per cell.
     if E <: AbstractVector || E <: AbstractMatrix
         R == 1 || _jax_error("a plate of rank ", R, " whose cell returns an array", _jax_where(ctx))
+        if eltype(E) <: Number
+            empty_value = "jnp.zeros((" * join(fill("0", ndims(E) + 1), ", ") *
+                          "), dtype=" * _jax_dtype(eltype(E)) * ")"
+            only(with_length) && (empty_value = "(" * empty_value *
+                ", jnp.zeros((0,), dtype=jnp.int64))")
+            call = "(" * empty_value * " if " * empty * " else " * call * ")"
+        end
         result = _jax_fresh(ctx, :plate_value)
         lengths = _jax_fresh(ctx, :plate_lengths)
         if only(with_length)
@@ -3911,6 +3935,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     end
     E <: Number || _jax_error("a plate whose cell returns `", E, "` has no JAX translation yet",
                               _jax_where(ctx))
+    call = "(jnp.zeros(" * first(shapes) * ", dtype=" * _jax_dtype(E) * ") if " *
+           empty * " else " * call * ")"
     extent = _jax_extent(inputs[padded])
     [_PyVal(call, Array{E,R}, false, extent)]
 end
@@ -3958,7 +3984,7 @@ function _jax_column(x::_PyVal, k::Integer)
     _PyVal(code, Vector{F}, x.static, F <: Number ? x.extent :
            "jnp.full((" * code * ".shape[0],), " * code * ".shape[1])")
 end
-_jax_numeric_tuple(@nospecialize(T)) = T isa Type && T <: Tuple && fieldcount(T) > 0 &&
+_jax_numeric_tuple(@nospecialize(T)) = T isa Type && T <: Tuple && isconcretetype(T) && fieldcount(T) > 0 &&
     isconcretetype(eltype(T)) && eltype(T) <: Number
 _jax_unref(@nospecialize(T)) = T isa Type && T <: Base.RefValue ? eltype(T) : T
 _jax_unref_val(v::_PyVal) = v
@@ -4300,6 +4326,26 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
     data isa NamedTuple || data isa Tuple && all(d -> d isa Symbol, data) ||
         throw(ArgumentError("jax_source: `data` is a tuple of HAVE names or a NamedTuple " *
                             "of their values"))
+    if !isempty(keep)
+        p = first(plans).second[1]
+        ports = data isa NamedTuple ? keys(data) : data
+        bound = Value[v for v in p.have if v.name in ports]
+        retained = Value[]
+        for name in keep
+            push!(retained, _jax_keep_value(p.graph, name))
+        end
+        # Retained metadata has its own data-only cut. The function cuts may
+        # omit it, or select an inverse producer that reads a live parameter.
+        # A `nothing` WANT shape marks this as a host cut, not a Python function.
+        kept = try
+            plan(p.graph; have = bound, want = retained)
+        catch e
+            e isa PlanningError || rethrow()
+            throw(ArgumentError("jax_source: `keep` values must be computable from data alone: " *
+                                sprint(showerror, e)))
+        end
+        plans = [plans; gensym(:keep) => (kept, nothing)]
+    end
     # A definition of a data value replaces that `prepare_data` input; one of
     # another name is a host local the later definitions read.
     defs = definitions === nothing ? nothing :
@@ -4339,8 +4385,16 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
                 push!(promoted, e.recipe)
             elseif e isa _KeepUnavailable
                 more = setdiff(_jax_upstream_recipes(plans, e.name, excluded, defined), promoted)
-                isempty(more) && throw(ArgumentError(
-                    "jax_source: `keep` names `$(e.name)`, which is no data-only value of the program"))
+                if isempty(more)
+                    upstream = sort!(collect(_jax_upstream_recipes(plans, e.name, excluded, nothing)))
+                    for id in upstream
+                        haskey(reasons, id) || continue
+                        throw(JAXEmissionError("the retained data value `$(e.name)` has no host " *
+                            "translation: " * reasons[id].message))
+                    end
+                    throw(ArgumentError(
+                        "jax_source: `keep` names `$(e.name)`, which is no data-only value of the program"))
+                end
                 union!(promoted, more)
             elseif e isa _CellHostNeeded
                 # Each cell recipe is split off once; one that fails again is
@@ -4362,6 +4416,14 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
     end
 end
 
+# Keep names refer to authored values, including structural-CSE aliases whose
+# producer and prepared argument use a different name.
+function _jax_keep_value(g::Graph, name::Symbol)
+    found = [v for v in values(g.values) if v.name === name]
+    isempty(found) && throw(ArgumentError("jax_source: unknown `keep` value `$name`"))
+    only(found)
+end
+
 # A data-only recipe left to the functions (`_HostUnsupported`) that they
 # cannot compute either, and whose values all have definitions.
 struct _JaxPromote <: Exception
@@ -4374,7 +4436,8 @@ end
 _jax_promotable(defined, r::Recipe) = !isempty(r.outputs) && all(o -> o.name in defined, r.outputs)
 
 # The `excluded` recipes upstream of the values named `name` in `plans` whose
-# values all have definitions (`defined`).
+# values all have definitions (`defined`), or all excluded upstream recipes
+# when `defined === nothing` (to report the underlying host failure).
 function _jax_upstream_recipes(plans, name::Symbol, excluded, defined)
     found = Set{Int}()
     for (_, (p, _)) in plans
@@ -4383,7 +4446,7 @@ function _jax_upstream_recipes(plans, name::Symbol, excluded, defined)
         for r in p.recipes, o in r.outputs
             get!(producer, canon_id(g, o.id), r)
         end
-        queue = [canon_id(g, o.id) for r in p.recipes for o in r.outputs if o.name === name]
+        queue = [canon_id(g, _jax_keep_value(g, name).id)]
         seen = Set{ValueId}()
         while !isempty(queue)
             id = pop!(queue)
@@ -4391,7 +4454,7 @@ function _jax_upstream_recipes(plans, name::Symbol, excluded, defined)
             push!(seen, id)
             r = get(producer, id, nothing)
             r === nothing && continue
-            r.id in excluded && _jax_promotable(defined, r) && push!(found, r.id)
+            r.id in excluded && (defined === nothing || _jax_promotable(defined, r)) && push!(found, r.id)
             foreach(v -> push!(queue, canon_id(g, v.id)), r.inputs)
         end
     end
@@ -4563,6 +4626,11 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
         push!(used, name * "_lengths", name * "_flat")
         push!(prepared_names, name)
         mod.helper_names[(:prepared_name, v.name)] = name
+    end
+    for name in keep
+        cid = canon_id(p1.graph, _jax_keep_value(p1.graph, name).id)
+        index = findfirst(v -> canon_id(p1.graph, v.id) == cid, split.constants)
+        index === nothing || (mod.helper_names[(:prepared_name, name)] = prepared_names[index])
     end
     # The boundary values' types: those of one binding's values, when `data`
     # gives them; else those the translation infers. Plate cells' values that
