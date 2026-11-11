@@ -19,7 +19,7 @@
 # A literal statement is its literal (`shift::Float64 = -1.5`), an alias its
 # argument (`y = x`). The plan, its recipes and `Recipe.source` are untouched,
 # so `explain`, `recipe_inventory` and the structural graph read as before,
-# and `code_expr` shows the code that executes (`docs/src/constraints.md`).
+# and `code_expr` shows the code that executes (`CONTRIBUTING.md`).
 #
 # A recipe keeps its table call when its source is outside this emitter's
 # reach: an exact bare call (`cholesky(x)`, a raw function in the table), a

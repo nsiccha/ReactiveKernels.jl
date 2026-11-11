@@ -172,7 +172,7 @@ end
             @test outcome ≈ derivative atol=1e-12
         end
     elseif VERSION >= v"1.12"
-        # Upstream Enzyme readonly-proof gap; drop with docs/src/constraints.md.
+        # Upstream Enzyme readonly-proof gap; drop with CONTRIBUTING.md.
         @test_broken reverse_gradient(captured) ≈ derivative atol=1e-12
     else
         @test reverse_gradient(captured) ≈ derivative atol=1e-12
@@ -274,7 +274,7 @@ _loops(ex) = ex isa Expr ? Int(ex.head === :for) + sum(_loops, ex.args; init=0) 
 # loop, so an array seed (`zeros(n)`) meets the steps' active results in the
 # loop's carry. Registered Enzyme's static activity analysis rejects that merge
 # (`EnzymeRuntimeActivityError`); the Enzyme dogfood line differentiates it.
-# The repair is Enzyme's (`docs/src/constraints.md`, the scan-in-plate-cell
+# The repair is Enzyme's (`CONTRIBUTING.md`, the scan-in-plate-cell
 # entry). `rejectable` names the array-seeded kernels whose rejection is pinned
 # broken; any other error, or a rejection elsewhere, still fails.
 function _value_and_gradient_or_rejected(ad, args...; rejectable::Bool)

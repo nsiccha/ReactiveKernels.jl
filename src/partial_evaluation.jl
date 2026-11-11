@@ -1465,7 +1465,7 @@ end
 # split by outcome, and the plate becomes one plate per arm over its own lanes,
 # which are none for an arm no lane takes — so no backend ever receives that
 # branch, no lane evaluates an arm it does not take, and every gather inside an
-# arm is in bounds by construction (docs/src/constraints.md). The number of arm
+# arm is in bounds by construction (CONTRIBUTING.md). The number of arm
 # plates is fixed by the cell's branch structure, never by the data; lane-subset
 # sizes only change shapes.
 
@@ -1544,7 +1544,7 @@ The concatenation is the native kernel body's (`_native_vcat`): an arm that
 reads no live value (a constant fallback such as `0.0`) yields a constant
 vector, and Base's `vcat` of it beside a live arm of the same element type
 can fail native Enzyme reverse (`EnzymeRuntimeActivityError`,
-docs/src/constraints.md).
+CONTRIBUTING.md).
 """
 struct _LaneAssemble{W} end
 _LaneAssemble() = _LaneAssemble{false}()

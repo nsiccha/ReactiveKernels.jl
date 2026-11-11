@@ -238,7 +238,7 @@ end
         @test L_traced(z, K) ≈ _kron_L_from_z_K(z, K)
     end
     # The tracing implementations must stay loop-free: K is bound data, and
-    # constraints.md forbids trace-time unrolling a data-derived trip count.
+    # CONTRIBUTING.md forbids trace-time unrolling a data-derived trip count.
     # They are the source from the first `ReactiveKernels.traced` method to
     # `@kernel model` (comment lines start with `#`, so `^\s*for` only matches
     # code); the native loops before them are the positive control.
