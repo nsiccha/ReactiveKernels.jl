@@ -16,6 +16,29 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.153
+
+- A packed point of another length is refused, not read. Every cut of a built
+  program that reads `unconstrained` (a raw `ReactiveKernels.prepare(built.spec;
+  have = (:unconstrained, …), want, bound)`, each lane of its `vectorize`d
+  form, `prepare_query`, the sampler and its gradient, cell, partition,
+  density-factor and cell-factor queries, predictive draws, a compact
+  overlay's base, a `jax_source` module) checks at each call that the point
+  holds the binding's packed total, and refuses another length with
+  `ContractValidationError: [layout] packed length 16 ≠ layout total 6: a
+  packed point holds the coordinates of the binding whose layout packed it;
+  match another binding's coordinates by coordinate_identities(layout)`. The
+  total is read from the binding's data like every block position (the last
+  block's `_ppl_last_<name>`, or a number when no position reads data), so one
+  program still serves every extent. Before, a point longer than the binding's
+  layout (a draw of a fit with more levels, evaluated on a design bound with
+  fewer) was read with the binding's positions, so every coordinate after a
+  level-sized block came silently from the wrong entry, and a shorter one
+  failed only with whichever `BoundsError` its reads reached. The check is a
+  ReactiveKernels input check (`input_check!`, ReactiveKernels 0.1.155, now the
+  compat floor), which reads the point's length alone. Snag
+  `rk-prepared-cut-0e0b98ed`, decision `05x3m7a`.
+
 ## 0.1.152
 
 - A two-axis array whose prior takes a per-element argument

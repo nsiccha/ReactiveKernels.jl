@@ -16,6 +16,30 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.155
+
+- `ReactiveKernels.input_check!(spec, input, f, args...)` checks a HAVE input
+  at the entry of every prepared cut of `spec` that takes it and reads it:
+  native, each `vectorize` lane, the primal of every derivative operator, a
+  non-allocating kernel and a `jax_source` module. The cut calls `f(args...)`,
+  where a `Symbol` names a value of the kernel (the input, or a value computed
+  from data such as a size) and anything else is passed as written. It runs
+  before any recipe when its arguments are inputs or bound data, otherwise as
+  soon as the cut has computed them; the cut computes them even when nothing
+  it returns needs them, and a split plan keeps them on the side that reads
+  the input. The check is not a recipe, so no read analysis (footprints,
+  partitions, cells, activity) sees it: it must read the input's shape alone.
+  A cut calls it as `ReactiveKernels._input_check(f, args...)`, which Enzyme
+  treats as constant, so a gradient never differentiates the check or its
+  error path; it prints that way in `code_expr`. A graph derived from the
+  kernel keeps the check on the same value: the copies a cut's preparation
+  makes, `plate_cell`, `plate_partition`, `compose`, `rename`, a call of the
+  kernel inside another and a stateful kernel's child (`InputCheck`,
+  `Graph.checks`, `Plan.checks`). Registering a check advances the graph's
+  version, so plans and caches made before it are not reused.
+  ReactiveKernelsPPL 0.1.153 uses it to refuse a packed point of another
+  binding's length. Snag `rk-prepared-cut-0e0b98ed`, decision `05x3m7a`.
+
 ## 0.1.154
 
 - `jax_source` with `data`: a recipe of a top-level plate's cell that reads

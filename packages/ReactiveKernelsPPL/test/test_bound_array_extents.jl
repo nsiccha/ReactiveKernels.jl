@@ -3,6 +3,7 @@ using Distributions
 using Enzyme
 using LinearAlgebra: Cholesky, LowerTriangular, UpperTriangular
 using LogExpFunctions: logistic
+using Random
 using ReactiveKernels
 using ReactiveKernelsPPL
 using Test
@@ -701,6 +702,94 @@ end
             end, (n = 2, y = [0.9]); conditioned = (:y,))
         bound = bind_data(plan, (n = 4, y = [0.9]))
         @test build_kernel(bind_data(bound, (n = 2, y = [0.9]))).layout.total == 2
+    end
+    @testset "a packed point of another length is refused, not read" begin
+        # Snag `rk-prepared-cut-0e0b98ed`: a cut of one build, bound with fewer
+        # levels than the build's, read the first coordinates of a fit-sized
+        # point with its own positions, so `w` came from the fit's `z[3:4]`.
+        # Every cut checks the point against the binding's packed total, read
+        # from data like every position (`ReactiveKernels.input_check!`).
+        fit = (J = 12, k = [1, 3], y = [0.2, -0.3])
+        small = (J = 2, k = [1, 2], y = [0.2, -0.3])
+        plan = lower_rkppl(quote
+                z[1:J] .~ Normal.(0, 1)
+                w[1:2] .~ Normal.(0, 1)
+                mu = w[1] .+ z[k]
+                y .~ Normal.(mu, 1.0)
+            end, fit; conditioned = (:y,))
+        built = build_kernel(bind_data(plan, fit))
+        bound = bind_data(plan, small)
+        layout = assign_layout(bound)
+        @test (built.layout.total, layout.total) == (14, 4)
+        long = collect(range(-0.5, 0.5; length = 14))
+        u = long[1:4]
+        refused(n, total) = "packed length $n ≠ layout total $total"
+        cut = Base.invokelatest(ReactiveKernels.prepare, built.spec;
+            have = (:unconstrained, keys(small)...), want = :w, bound = small)
+        @test Base.invokelatest(cut, u) == constrain(layout, u).w
+        @test_throws refused(14, 4) Base.invokelatest(cut, long)
+        # A shorter point is refused the same way, not by whichever read
+        # passes its end.
+        @test_throws refused(3, 4) Base.invokelatest(cut, u[1:3])
+        # The reporter's cut: the level-sized block supplied, so the program
+        # reads only the coordinates packed after it.
+        given = Base.invokelatest(ReactiveKernels.prepare, built.spec;
+            have = (:unconstrained, :z, keys(small)...), want = :mu, bound = small)
+        @test Base.invokelatest(given, u, zeros(2)) ≈ fill(constrain(layout, u).w[1], 2)
+        @test_throws refused(14, 4) Base.invokelatest(given, long, zeros(2))
+        # Without `bound=`, the total is read from the extent at run time.
+        live = Base.invokelatest(ReactiveKernels.prepare, built.spec;
+            have = (:unconstrained, :J), want = :w)
+        @test Base.invokelatest(live, u, 2) == constrain(layout, u).w
+        @test_throws refused(14, 4) Base.invokelatest(live, long, 2)
+        @test Base.invokelatest(live, long, 12) == constrain(built.layout, long).w
+        # Every lane of a vectorized cut is checked.
+        lanes = ReactiveKernels.vectorize(cut; batched = :unconstrained)
+        @test Base.invokelatest(lanes, hcat(u, 2u)) ==
+            hcat(constrain(layout, u).w, constrain(layout, 2u).w)
+        @test_throws refused(14, 4) Base.invokelatest(lanes, hcat(long, long))
+        # So is every query of the binding, at each call, not only its exemplar.
+        q = prepare_query(built, bound, :sampler)
+        @test Base.invokelatest(q, u) ≈ Base.invokelatest(prepare_query(
+            build_kernel(bound), bound, :sampler), u)
+        @test_throws refused(14, 4) Base.invokelatest(q, long)
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)
+        sampler = prepare_sampler(built, bound, u; backend)
+        @test sampler(u) ≈ Base.invokelatest(prepare_query(built, bound, :sampler), u)
+        @test_throws refused(14, 4) sampler(long)
+        @test_throws refused(14, 4) sampler_value_and_gradient!(sampler, zeros(14), long)
+        value, gradient = sampler_value_and_gradient!(sampler, zeros(4), u)
+        @test gradient ≈ _extent_central(x -> sampler(x), u) atol = 1e-5
+        # A cell query's kernel is cut from a copy of the graph, which keeps it.
+        cells = prepare_cell_query(built, bound, :y)
+        v = constrain(layout, u)
+        @test Base.invokelatest(cells, u, 2) ≈ logpdf(Normal(v.w[1] + v.z[small.k[2]], 1.0), small.y[2])
+        @test_throws refused(14, 4) Base.invokelatest(cells, long, 2)
+        # So are a partition's, a density factor's and predictive draws.
+        parts = prepare_partition(built, bound, :y; by = :k)
+        @test Base.invokelatest(parts, u, 2) ≈ logpdf(Normal(v.w[1] + v.z[2], 1.0), small.y[2])
+        @test_throws refused(14, 4) Base.invokelatest(parts, long, 2)
+        prior = prepare_query(built, bound, select_factors(density_factors(built, bound);
+            kind = :prior, site = :w); u0 = u)
+        @test Base.invokelatest(prior, u) ≈ sum(logpdf.(Normal(0, 1), v.w))
+        @test_throws refused(14, 4) Base.invokelatest(prior, long)
+        draws = prepare_predictive(built, bound)
+        @test length(Base.invokelatest(draws, u, Random.Xoshiro(1)).y) == 2
+        @test_throws refused(14, 4) Base.invokelatest(draws, long, Random.Xoshiro(1))
+        # A program whose positions read no data checks its literal total.
+        literal = lower_rkppl(quote
+                a ~ Normal(0, 1)
+                w[1:2] .~ Normal.(0, 1)
+                y .~ Normal.(a .+ w[1], 1.0)
+            end, (y = [0.9, 1.0],); conditioned = (:y,))
+        literal_bound = bind_data(literal, (y = [0.9, 1.0],))
+        literal_built = build_kernel(literal_bound)
+        lq = prepare_query(literal_built, literal_bound, :sampler)
+        # The prepared code runs the check, with the literal total.
+        @test occursin("_ppl_check_packed, unconstrained, 3)", string(code_expr(lq)))
+        @test_throws refused(4, 3) Base.invokelatest(lq, zeros(4))
+        # A data-read total is the read the program already has.
+        @test occursin("_ppl_check_packed, unconstrained, ", string(code_expr(q)))
     end
 end
 

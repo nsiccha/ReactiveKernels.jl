@@ -785,3 +785,21 @@ end
         @test kernel_allocations(reused, x) == 0
     end
 end
+
+# An input check (`ReactiveKernels.input_check!`) runs in a non-allocating
+# kernel as in a prepared one (snag `rk-prepared-cut-0e0b98ed`).
+nonallocating_input_length(x, total) = (length(x) == total ||
+    throw(DimensionMismatch("packed length $(length(x)) ≠ total $total")); nothing)
+@kernel _nonallocating_checked(x::AbstractVector{Float64}, n::Int) = begin
+    stop::Int = n + 1
+    total = sum(view(x, 1:n)) + 10 * x[stop]
+end
+ReactiveKernels.input_check!(_nonallocating_checked, :x, nonallocating_input_length, :x, :stop)
+@testset "a non-allocating kernel runs its input checks" begin
+    x3 = [1.0, 2.0, 3.0]
+    cut = prepare(_nonallocating_checked; have = (:x, :n), want = :total, bound = (; n = 2))
+    reused = prepare_nonallocating(cut, x3)
+    @test reused(x3) == 33.0
+    @test_throws "packed length" reused([x3; 4.0])
+    @test_throws "packed length" reused(x3[1:2])
+end

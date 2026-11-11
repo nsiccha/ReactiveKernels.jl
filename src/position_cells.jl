@@ -54,7 +54,7 @@ function _replicated_shared_cells(p::Plan, shared::Set{ValueId})
     end
     kept = _shared_kept_values(p)
     copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers),
-                   copy(g.aliases), g.version)
+                   copy(g.aliases), g.version, nothing, copy(g.checks))
     next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     recipes = Recipe[]
@@ -136,7 +136,7 @@ Base.@nospecializeinfer function _replicated_split_plate(
 
     # Several values travel as one tuple per cell, read back by entry.
     cg = Graph(copy(ig.values), copy(ig.recipes), copy(ig.producers),
-               copy(ig.aliases), ig.version)
+               copy(ig.aliases), ig.version, nothing, copy(ig.checks))
     inner_id = Ref(minimum((q.id for q in inner.recipes); init = 0) - 1)
     inner_fresh() = (id = inner_id[]; inner_id[] -= 1; id)
     selected = _partial_frontier_prefix(inner, prefix, frontier)

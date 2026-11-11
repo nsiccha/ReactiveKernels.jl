@@ -3462,7 +3462,7 @@ Base.@nospecializeinfer function _plate_branch_arm_kernel(
     # A shallow structural copy keeps the cell's values and operations; only its
     # registry gains the arm's values.
     copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers),
-                   copy(g.aliases), g.version)
+                   copy(g.aliases), g.version, nothing, copy(g.checks))
     next_id = Ref(minimum((q.id for q in inner.recipes); init = 0) - 1)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     replacement = if spec === nothing
@@ -5688,6 +5688,9 @@ function _lower_with_ops_collecting(p::Plan;
     # A plate several cells read that fusion left for this lowering
     # (`_shared_cell_producer`) is composed into those cells when nothing
     # computes it at their rows: without pushdowns, or when they refuse it.
+    # The input checks of the plan as given: the cell rewrites below may
+    # rebuild it over a copied graph, which carries no checks.
+    input_checks = p.checks
     cells = nothing
     if inline_embedded && pushdowns && type_hints === nothing
         pushdowns_of(q) = _cell_compose_unpushed(q, _cell_pushdowns(q;
@@ -5766,8 +5769,32 @@ function _lower_with_ops_collecting(p::Plan;
     for (key, set) in region_sets
         region_guards[key] = foldl((a, b) -> Expr(:||, a, b), (region_guards[m] for m in set))
     end
+    # Input checks (`InputCheck`) run before any recipe when they read only
+    # inputs and literals, and before the return when they read a value this
+    # body computes. A footprint body records reads and runs none.
+    checking = !_footprint_recording() && !isempty(input_checks)
+    if checking
+        have_cids = Set(canon_id(g, v.id) for v in p.have)
+        at_entry(c) = all(a -> !(a isa Value) || canon_id(g, a.id) in have_cids, c.args)
+        check_call(c) = Expr(:call, GlobalRef(@__MODULE__, :_input_check),
+            GlobalRef(parentmodule(c.f), nameof(c.f)),
+            (a isa Value ? nm(a) : a for a in c.args)...)
+        for c in input_checks
+            at_entry(c) && push!(body.args, check_call(c))
+        end
+    end
+    # The others run as soon as the body has computed their arguments.
+    pending_checks = checking ? InputCheck[c for c in input_checks if !at_entry(c)] :
+        InputCheck[]
+    check_ready(c) = all(a -> !(a isa Value) || canon_id(g, a.id) in assigned, c.args)
     outer_body = body
     for r in p.recipes
+        if !isempty(pending_checks)
+            for c in pending_checks
+                check_ready(c) && push!(outer_body.args, check_call(c))
+            end
+            filter!(!check_ready, pending_checks)
+        end
         owner = get(regions, r.id, 0)
         body = owner == 0 ? outer_body : region_bodies[owner]
         recording === nothing || (recording.guard = get(region_guards, owner, nothing))
@@ -6181,6 +6208,9 @@ function _lower_with_ops_collecting(p::Plan;
     recording === nothing || (recording.guard = nothing)
     all(((group, pending),) -> length(pending) == length(group), cell_pending) ||
         error("internal: a group of plate cells was not lowered completely")
+    for c in pending_checks
+        push!(body.args, check_call(c))
+    end
     retval = length(p.want) == 1 ? nm(p.want[1]) :
              Expr(:tuple, (nm(w) for w in p.want)...)
     _footprint_recording() &&
