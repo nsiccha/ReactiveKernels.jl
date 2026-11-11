@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.155
+
+- Hessian-vector products and third-order derivatives (`prepare_ad_hvp`,
+  `prepare_ad_third`, `prepare_ad_accumulator` at orders 1 and 2) work for a
+  kernel with many inactive HAVE ports, under both reverse over forward and
+  forward over reverse. From about 28 such ports they raised
+  `EnzymeRuntimeActivityError` ("Constant memory is stored (or returned) to a
+  differentiable variable"). Each inactive port crossed the backend as its own
+  `Constant` context, and from 32 contexts DifferentiationInterface and
+  Enzyme splat them through a heap tuple; inside a nested derivative that
+  tuple stores the constant operands beside the active point. Past 16 plain
+  inactive operands, they now cross as one `Constant` tuple, as the hidden
+  bound operands already do. An RKPPL compact cell takes each shared value
+  it reads as such a port, so BRM's sparse Laplace raised this for a model
+  whose cells read 33 of them (snag `varyingsource3-b-82246291`). Kernels with
+  at most 16 plain inactive operands differentiate exactly as before.
+
 ## 0.1.154
 
 - `jax_source` with `data`: a recipe of a top-level plate's cell that reads

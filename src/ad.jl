@@ -1221,20 +1221,64 @@ function _ad_validate_kernel(kernel::_ADKernel, active_selector,
     nothing
 end
 
+# Inactive operands that cross the backend as one `Constant` context each.
+# Every inactive HAVE port is one, beside the packed hidden operands
+# (`_PackedOperandCall`), so a kernel with many HAVE ports, such as an RKPPL
+# cell that reads many shared values, reached 32 contexts. From 32,
+# DifferentiationInterface maps its contexts with Base's unspecialized `map`
+# and Enzyme's `autodiff` re-splats its annotations past Julia's 32-element
+# limit. A nested derivative runs those calls inside the differentiated code
+# (`_ADDirectionalDerivative` for reverse over forward, DI's inner gradient for
+# forward over reverse), where the heap tuple stores the constant operands
+# beside the active point: plain Enzyme refuses that
+# (`EnzymeRuntimeActivityError`, snag `varyingsource3-b-82246291`). Past this
+# many, the plain values cross as one `Constant` tuple instead, which
+# `_ADPackedOperandsCall` unpacks. A third-order derivative prepends six
+# contexts and the boxes of retained, seeded or constant ports up to two, so
+# 16 keeps every call below the limit; below it the boundary is as before.
+const _AD_UNPACKED_OPERANDS = 16
+
+# The ordinals, among the inactive operands, of the plain values that cross
+# packed, or `()` when there are at most `_AD_UNPACKED_OPERANDS`. Values that
+# already carry a DifferentiationInterface context (an owned `Cache`, a box)
+# always cross as themselves.
+function _ad_packed_ordinals(I, types::Tuple)
+    indices = _ad_selector_indices(I)
+    inactive = [types[index] for index in eachindex(types) if !(index in indices)]
+    plain = Tuple(ordinal for (ordinal, T) in enumerate(inactive)
+                  if !(T <: DifferentiationInterface.Context))
+    length(plain) > _AD_UNPACKED_OPERANDS ? plain : ()
+end
+
+# The context expressions of a differentiated call's inactive operands, for
+# the generated functions that build them: `types` are the operand types and
+# `operand(index)` reads operand `index`. Values that already carry a
+# DifferentiationInterface context wrapper (the non-allocating path's owned
+# `Cache`, a box) pass through untouched; raw boundary values become
+# `Constant` contexts, or past `_AD_UNPACKED_OPERANDS` one `Constant` tuple.
+# The pack leads and every other context keeps its order after it, so the
+# boxes appended last stay last.
+function _ad_context_exprs(I, types::Tuple, operand)
+    indices = _ad_selector_indices(I)
+    inactive = [index for index in eachindex(types) if !(index in indices)]
+    packed = _ad_packed_ordinals(I, types)
+    isempty(packed) && return Any[
+        types[index] <: DifferentiationInterface.Context ? operand(index) :
+            :(DifferentiationInterface.Constant($(operand(index))))
+        for index in inactive]
+    pack = Expr(:tuple, (operand(inactive[ordinal]) for ordinal in packed)...)
+    Any[:(DifferentiationInterface.Constant($pack));
+        Any[operand(inactive[ordinal])
+            for ordinal in eachindex(inactive) if !(ordinal in packed)]]
+end
+
 @generated function _ad_arguments(::Val{I}, args::A) where {I,A<:Tuple}
     N = fieldcount(A)
     indices = _ad_selector_indices(I)
     all(index -> 1 <= index <= N, indices) || return :(throw(ArgumentError(
         "invalid active input selector $I for $N kernel arguments")))
-    # Values that already carry a DifferentiationInterface context wrapper
-    # (the non-allocating path's owned `Cache`) pass through untouched; only
-    # raw boundary values become `Constant` contexts.
-    contexts = [
-        A.parameters[index] <: DifferentiationInterface.Context ?
-            :(getfield(args, $index)) :
-            :(DifferentiationInterface.Constant(getfield(args, $index)))
-        for index in 1:N if !(index in indices)
-    ]
+    contexts = _ad_context_exprs(I, Tuple(A.parameters),
+                                 index -> :(getfield(args, $index)))
     point = I isa Int ? :(getfield(args, $I)) :
         Expr(:tuple, (:(
             _ad_active_point_component(getfield(args, $index)))
@@ -1300,6 +1344,8 @@ function _ad_call(kernel::_ADKernel, resolved::Tuple, active;
                         scalar_output, retain)
     call, external_values =
         _ad_kernel_call(kernel, resolved, Val(active_selector))
+    call = _ad_packed_operands_call(call, active_selector,
+        (_ad_box_plan(resolved, Val(_ad_plan_position(kernel)))..., external_values...))
     constant = _ad_constant_outputs(
         kernel, active_selector, _ad_value_positions(kernel, scalar_output, retain))
     if !isempty(constant)
@@ -1343,6 +1389,41 @@ function _ad_call_exemplar(call, resolved::Tuple, external_values::Tuple,
         Val(active_selector), (resolved..., external_values...))
     call(point, map(DifferentiationInterface.unwrap, contexts)...)
 end
+
+# The kernel call behind a boundary whose plain inactive operands cross as one
+# `Constant` tuple (`_AD_UNPACKED_OPERANDS`). `P` are their ordinals among the
+# inactive operands. The pack arrives first; this reads each value back by a
+# literal field and passes every operand to the wrapped call in its original
+# order, as `_PackedOperandCall` does for hidden operands. Outer adapters
+# (constant, retained and seeded ports) strip their own boxes before calling it.
+struct _ADPackedOperandsCall{P,F}
+    call::F
+end
+
+@generated function (packed::_ADPackedOperandsCall{P})(
+        active, pack, contexts::Vararg{Any,N}) where {P,N}
+    operands = Any[]
+    next = 1
+    for ordinal in 1:(length(P) + N)
+        slot = findfirst(==(ordinal), P)
+        if slot === nothing
+            push!(operands, :(getfield(contexts, $next)))
+            next += 1
+        else
+            push!(operands, :(getfield(pack, $slot)))
+        end
+    end
+    :(Base.@inline getfield(packed, :call)(active, $(operands...)))
+end
+
+function _ad_packed_operands_call(call, active_selector, args::Tuple)
+    packed = _ad_packed_ordinals(active_selector, map(Core.Typeof, args))
+    isempty(packed) && return call
+    _kernel_new_instance(_ADPackedOperandsCall{packed,typeof(call)}, (call,))
+end
+
+_ad_hidden_operands(packed::_ADPackedOperandsCall, values) =
+    _ad_hidden_operands(packed.call, values)
 
 # WANT ports no active HAVE port reaches (`_ad_constant_outputs`). Bound partial
 # evaluation folds a port that reads bound data alone into a constant, which
@@ -3275,17 +3356,12 @@ thread-safe; use one per concurrent caller.
     indices = _ad_selector_indices(I)
     all(index -> 1 <= index <= N, indices) || return :(throw(ArgumentError(
         "prepared active input selector $I is invalid for $N arguments")))
-    contexts = [
-        :(DifferentiationInterface.Constant(getfield(args, $index)))
-        for index in 1:N if !(index in indices)
-    ]
-    append!(contexts, [
-        E.parameters[index] <: DifferentiationInterface.Context ?
-            :(getfield(prepared.external_values, $index)) :
-            :(DifferentiationInterface.Constant(
-                getfield(prepared.external_values, $index)))
-        for index in 1:fieldcount(E)
-    ])
+    # The same contexts `_ad_prepared_arguments` builds from
+    # `(args..., prepared.external_values...)`, without that splat.
+    # In the generator, the vararg `args` is the tuple of argument types.
+    contexts = _ad_context_exprs(I, (args..., fieldtypes(E)...),
+        index -> index <= N ? :(getfield(args, $index)) :
+            :(getfield(prepared.external_values, $(index - N))))
     point = I isa Int ? :(getfield(args, $I)) :
         Expr(:tuple, (:(
             _ad_active_point_component(getfield(args, $index)))
