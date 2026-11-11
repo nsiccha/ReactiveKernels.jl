@@ -3880,10 +3880,16 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         pointwise_lhs, total_lhs; recycled = nothing,
         input_type_hints = nothing, element_type = nothing, into::Bool = false,
         total_fold = sum, program::Bool = false, readonly_slices = Set{Int}(),
-        batch = nothing)
+        batch = nothing, cell::Union{Nothing,Symbol} = nothing)
     # `into`: `pointwise_lhs` already holds a buffer at least as long as the
     # plate, of its element type; the cells are written into it in place and
     # the binding is left alone (a strip refill, `_lower_authored_scan_strips!`).
+    # `cell`: the plate has exactly one cell (a plate computed at one row of a
+    # cell, `_cell_window!`), whose value is bound to `cell`; there is no
+    # pointwise buffer and no total.
+    cell === nothing || pointwise_lhs === nothing && total_lhs === nothing ||
+        throw(ArgumentError("internal: a one-cell plate has no pointwise or total output"))
+    cell === nothing || push!(body.args, Expr(:local, cell))
     inner_kernel = op.kernel
     inner = getfield(inner_kernel, :plan)
     length(inner.want) == 1 || throw(ArgumentError(
@@ -4038,7 +4044,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         inner_kernel, atomic, callargs, callvalues, raw_arguments,
         prepared_arguments, marker, output_axes, pointwise_lhs, total_lhs;
         recycled, input_type_hints, element_type, into, total_fold, program,
-        deferred, readonly_slices, batch)
+        deferred, readonly_slices, batch, cell)
     # No program took the prepared arguments: prepare them where they stood.
     deferred === nothing || isempty(deferred) ||
         splice!(body.args, deferred_at:deferred_at-1, deferred)
@@ -4058,7 +4064,10 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         input_type_hints = nothing, element_type = nothing, into::Bool = false,
         unswitch::Bool = true, cells::Bool = true, nonempty::Bool = false,
         types = nothing, total_fold = sum, program::Bool = false,
-        deferred = nothing, readonly_slices = Set{Int}(), batch = nothing)
+        deferred = nothing, readonly_slices = Set{Int}(), batch = nothing,
+        cell = nothing)
+    # One cell (`cell`): a shared branch is decided at that cell, in the loop.
+    unswitch &= cell === nothing
     inner = getfield(inner_kernel, :plan)
     if unswitch
         branch = _plate_shared_branch(inner_kernel, atomic, callargs, callvalues)
@@ -4119,7 +4128,8 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         plate_eltype, index, previous, first_coordinate, root_positions,
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
         lane_arms; nonempty, total_fold, runtime_ops, runtime_recipes, program,
-        deferred, readonly_slices, batch = element_type === nothing ? batch : nothing)
+        deferred, readonly_slices,
+        batch = element_type === nothing && cell === nothing ? batch : nothing, cell)
 end
 
 # Append a cell kernel's operations to the table and build the type expression
@@ -4201,7 +4211,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
         lane_arms; nonempty::Bool = false, total_fold = sum,
         runtime_ops, runtime_recipes, program::Bool = false, deferred = nothing,
-        readonly_slices = Set{Int}(), batch = nothing)
+        readonly_slices = Set{Int}(), batch = nothing, cell = nothing)
     groups = nested === nothing ? _authored_plate_recipe_groups(
         inner, dependencies, root_positions, atomic, callvalues) :
         [(Set{ValueId}(), nested.invariants)]
@@ -4485,6 +4495,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     # (`_lower_plate_reduction_native`) already assume.
     pointwise_lhs === nothing ||
         push!(loopbody.args, _inbounds_expr(:($pointwise_lhs[$index] = $scalar_result)))
+    cell === nothing || push!(loopbody.args, :($cell = $scalar_result))
     if accumulator !== nothing
         add = Expr(:call, GlobalRef(@__MODULE__, :_plate_total_add),
                    accumulator, scalar_result)
@@ -4659,12 +4670,16 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
         partition = first(states).partition
         waits(s, c) = any(((batched, via),) -> haskey(s.pushed_lanes, batched) ||
             (via != 0 && haskey(s.pushed_lanes, via)), c[3])
+        # The row each capture is asked for at, when it is read at one
+        # position, so a value computed once per row serves its own row.
+        capture_rows = Dict{Tuple{Any,Int},Symbol}()
         request!(emitter, s, (position, value, reads)) = foreach(reads) do (batched, via)
             rows = partition && !s.single
-            _cell_capture_request!(emitter, value, s.slices[batched],
+            row = _cell_capture_request!(emitter, value, s.slices[batched],
                 via == 0 ? nothing : s.slices[via]; rows,
-                one = !rows && via == 0 &&
+                one = !rows && via == 0 && length(reads) == 1 &&
                     _cell_capture_one(d, s.plate, s.plate_values, position, batched))
+            capture_rows[(s.lhs, position)] = row
         end
         member(f, id) = _cell_forced(f, windows, _cell_member_force(windows, id, false))
         for (id, s) in zip(ids, states)
@@ -4676,7 +4691,13 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
         for (id, s) in zip(ids, states)
             member(id) do
                 for (position, lane_row) in s.lane_rows
-                    taken = _cell_take!(windows, s.pushed_lanes[position], lane_row)
+                    # A vector computed as a number at the one row is taken
+                    # as its one-element vector; a value that is a number
+                    # stays one (the plate reads it whole).
+                    lane = s.pushed_lanes[position]
+                    taken = _cell_take!(windows, lane, lane_row)
+                    lane in windows.scalar &&
+                        (taken = Expr(:call, GlobalRef(@__MODULE__, :_cell_lane_one), taken))
                     s.slices[position] = partition ? taken :
                         Expr(:call, GlobalRef(@__MODULE__, :_cell_batched_slice), taken, s.cell)
                 end
@@ -4694,7 +4715,8 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
             member(id) do
                 for c in s.captures
                     position, value = c[1], c[2]
-                    s.slices[position] = _cell_capture!(waits(s, c) ? later : windows, value)
+                    s.slices[position] = _cell_capture!(waits(s, c) ? later : windows, value,
+                        get(capture_rows, (s.lhs, position), nothing))
                 end
             end
         end
@@ -4951,10 +4973,14 @@ Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recip
         end
         if haskey(pushed_lanes, position)
             value = pushed_lanes[position]
+            # At one `Int` row (a cell, a one-cell partition) the lane may be a
+            # number, taken as its one-element vector (`_cell_lane_one`).
+            one = !partition || single
+            one && push!(windows.one, row)
             lane_rows[position] = _cell_request!(windows, value,
-                _cell_bind!(windows, :cell_row,
+                _cell_bind_row!(windows, row,
                     Expr(:call, GlobalRef(@__MODULE__, :_cell_leaf_row),
-                        _cell_shape!(windows, value), row)))
+                        _cell_shape!(windows, value), row)); scalar = one)
             push!(slices, nothing)
             continue
         end

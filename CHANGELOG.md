@@ -16,6 +16,26 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.155
+
+- A plate cell, and a partition with `single = true`, runs an authored plate
+  that it reads at its one row as that plate's one cell. The value is held in a
+  non-allocating one-element vector, instead of a plate computed over a
+  one-row array. A vector it reads as a lane, computed as a number at that
+  row, is read as one too.
+- In a partition, a value asked for at several such rows (two one-cell
+  members of one subject, each reading the subject's predictor at its own
+  row) is one number per row asked for, instead of an array over their union.
+  Each after the first is computed only when no earlier one has its row, so a
+  row asked for twice is still computed once. The program does not depend on
+  whether the rows agree. Values and gradients are unchanged: on BRM's
+  `unit_cost.jl` toys (24 subjects) they are bitwise equal to the previous
+  version for every subject, and the joint PK/QT model's local gradient went
+  from 113 to 87 allocations (todo `1yggoad`).
+- Fixed: a `vcat` read at one row converts each entry to the `vcat`'s element
+  type. An integer literal beside floating-point operands gave a `Union` that
+  native Enzyme Reverse refused.
+
 ## 0.1.154
 
 - `jax_source` with `data`: a recipe of a top-level plate's cell that reads
