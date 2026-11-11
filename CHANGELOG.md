@@ -1550,8 +1550,9 @@ are recorded in the git history only.
   `m` and is longer than `m` evaluates `f.(view(x, 1:m))[k]`. Values are
   unchanged bit for bit and `f` runs on no element the authored form leaves
   unread; reverse-mode derivatives agree up to floating-point rounding where
-  an index repeats. See `docs/src/compiler.md`, "Elementwise calls over a
-  data-indexed gather".
+  an index repeats. See "Elementwise calls over a data-indexed gather" in
+  `docs/src/compiler.md` at revision `4d462ef4170948f2e77e3fa80cda5be5c2b6dc02`,
+  before the documentation rewrite removed that page.
 
 ## 0.1.63
 
