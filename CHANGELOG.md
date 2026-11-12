@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.211
+
+- `jax_source` translates broadcasts of padded (ragged) rows padded by
+  different lengths along the same axes, such as two per-row arguments of one
+  plate cell broadcast into one matrix (`(vcat(x1, x_rest) .- centres) ./
+  sqrt.(scales .^ 2 .+ vcat(s1, s_rest) .^ 2)`). The result is padded along
+  those axes by Julia's broadcast length, the rows' common length or the
+  other row's where one has length one, so `sum(cell; dims = 1)`, whole
+  reductions and `vec` of it mask its padding; before, its padded axes were
+  not recorded and those reductions raised; a vector broadcast of two such
+  rows read the first row's length, wrong where the other row is the longer
+  and the first has length one. Lengths Julia refuses to broadcast
+  (`DimensionMismatch`) are not checked, as for a padded row broadcast
+  against an unpadded array: a check would be a host callback in every
+  evaluation. Rows padding different axes by different lengths (`x .* s'`)
+  are still refused.
+
 ## 0.1.210
 
 - A summed plate whose rows are per-cell arrays runs once per distinct row
