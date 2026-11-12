@@ -1,0 +1,799 @@
+{
+  "environment": {
+    "date": "2026-11-12",
+    "host": "gordito",
+    "julia": "1.10.12-kb3",
+    "python": "3.14.4",
+    "jax": "0.12.0.1",
+    "platform": "cpu",
+    "x64": true,
+    "cpu_limit": 1,
+    "repeats": 9,
+    "canonical_base": "aab5993018cd0241487cdf0daaa379c2d9f49d5f",
+    "tested_commit": "dfdcdf295ad873f65794804a1f2bcb2377ad8040",
+    "native_ad": "Enzyme 0.13.219"
+  },
+  "baseline_8c": [
+    {
+      "module": "candidate",
+      "path": "/home/niko/scratch/kb-agent-tmp/ReactiveKerne-c9f9c204e1/hmm/candidate/hmm_4.py",
+      "sha256": "cd45ce43f582147986feaa4b0f4a8db90c27ddc2e9d08569fdc5943d015d0d20"
+    },
+    {
+      "module": "baseline",
+      "path": "/home/niko/scratch/kb-agent-tmp/ReactiveKerne-c9f9c204e1/hmm/hmm_4.py",
+      "sha256": "b3d0559a5b6e781a643fa86a54553ad37445d1bc6e8dcb457ba91e8130cf6bd4"
+    },
+    {
+      "jax": "0.12.0.1",
+      "platform": "cpu",
+      "x64": true
+    },
+    {
+      "N": 4,
+      "name": "row_reference",
+      "value_time": {
+        "median_ms": 0.00763,
+        "min_ms": 0.00705,
+        "temporary_bytes": 544
+      },
+      "grad_time": {
+        "median_ms": 0.0093,
+        "min_ms": 0.00885,
+        "temporary_bytes": 1464
+      },
+      "value": -11.02906876880931,
+      "gradient": [
+        0.6731574770705004,
+        -0.6432338321047099,
+        -2.3563464581960334,
+        1.2692002401988576
+      ],
+      "callback_regions": 0,
+      "scan_carry_sizes": [
+        2
+      ]
+    },
+    {
+      "N": 4,
+      "name": "candidate",
+      "value_time": {
+        "median_ms": 0.14728,
+        "min_ms": 0.085509,
+        "temporary_bytes": 1476
+      },
+      "grad_time": {
+        "median_ms": 0.143099,
+        "min_ms": 0.127239,
+        "temporary_bytes": 5448
+      },
+      "value": -11.02906876880931,
+      "gradient": [
+        0.6731574770705008,
+        -0.64323383210471,
+        -2.356346458196033,
+        1.2692002401988567
+      ],
+      "callback_regions": 1,
+      "scan_carry_sizes": [
+        1,
+        3,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "N": 4,
+      "name": "baseline",
+      "value_time": {
+        "median_ms": 0.485949,
+        "min_ms": 0.414429,
+        "temporary_bytes": 1156
+      },
+      "grad_time": {
+        "median_ms": 0.509708,
+        "min_ms": 0.480098,
+        "temporary_bytes": 4912
+      },
+      "value": -11.02906876880931,
+      "gradient": [
+        0.6731574770705008,
+        -0.64323383210471,
+        -2.356346458196033,
+        1.2692002401988567
+      ],
+      "callback_regions": 8,
+      "scan_carry_sizes": [
+        1,
+        8,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "N": 100,
+      "name": "row_reference",
+      "value_time": {
+        "median_ms": 0.03475,
+        "min_ms": 0.02208,
+        "temporary_bytes": 3488
+      },
+      "grad_time": {
+        "median_ms": 0.062849,
+        "min_ms": 0.02655,
+        "temporary_bytes": 10872
+      },
+      "value": -135.11980047459508,
+      "gradient": [
+        6.781541927969873,
+        -14.555255668871826,
+        -55.0137968395246,
+        0.2404450327298905
+      ],
+      "callback_regions": 0,
+      "scan_carry_sizes": [
+        2
+      ]
+    },
+    {
+      "N": 100,
+      "name": "candidate",
+      "value_time": {
+        "median_ms": 0.336419,
+        "min_ms": 0.193599,
+        "temporary_bytes": 13344
+      },
+      "grad_time": {
+        "median_ms": 0.367318,
+        "min_ms": 0.267149,
+        "temporary_bytes": 51272
+      },
+      "value": -135.11980047459508,
+      "gradient": [
+        6.781541927969877,
+        -14.555255668871832,
+        -55.0137968395246,
+        0.2404450327298865
+      ],
+      "callback_regions": 1,
+      "scan_carry_sizes": [
+        1,
+        3,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "N": 100,
+      "name": "baseline",
+      "value_time": {
+        "median_ms": 18.950636,
+        "min_ms": 16.462495,
+        "temporary_bytes": 13280
+      },
+      "grad_time": {
+        "median_ms": 18.765847,
+        "min_ms": 15.528817,
+        "temporary_bytes": 50608
+      },
+      "value": -135.11980047459508,
+      "gradient": [
+        6.781541927969877,
+        -14.555255668871832,
+        -55.0137968395246,
+        0.2404450327298865
+      ],
+      "callback_regions": 200,
+      "scan_carry_sizes": [
+        1,
+        200,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "N": 400,
+      "name": "row_reference",
+      "value_time": {
+        "median_ms": 0.483519,
+        "min_ms": 0.064549,
+        "temporary_bytes": 13088
+      },
+      "grad_time": {
+        "median_ms": 0.118349,
+        "min_ms": 0.05634,
+        "temporary_bytes": 40248
+      },
+      "value": -522.5189989493831,
+      "gradient": [
+        28.207593348913175,
+        -57.99987325144499,
+        -219.31387092008822,
+        -3.2589845369954493
+      ],
+      "callback_regions": 0,
+      "scan_carry_sizes": [
+        2
+      ]
+    },
+    {
+      "N": 400,
+      "name": "candidate",
+      "value_time": {
+        "median_ms": 0.244249,
+        "min_ms": 0.20249,
+        "temporary_bytes": 51744
+      },
+      "grad_time": {
+        "median_ms": 0.636288,
+        "min_ms": 0.596138,
+        "temporary_bytes": 197192
+      },
+      "value": -522.5189989493831,
+      "gradient": [
+        28.207593348913168,
+        -57.99987325144495,
+        -219.3138709200882,
+        -3.2589845369954347
+      ],
+      "callback_regions": 1,
+      "scan_carry_sizes": [
+        1,
+        3,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "N": 400,
+      "name": "baseline",
+      "value_time": {
+        "median_ms": 71.732218,
+        "min_ms": 59.738229,
+        "temporary_bytes": 51680
+      },
+      "grad_time": {
+        "median_ms": 62.41391,
+        "min_ms": 52.329024,
+        "temporary_bytes": 195376
+      },
+      "value": -522.5189989493831,
+      "gradient": [
+        28.207593348913168,
+        -57.99987325144495,
+        -219.3138709200882,
+        -3.2589845369954347
+      ],
+      "callback_regions": 800,
+      "scan_carry_sizes": [
+        1,
+        800,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "N": 1600,
+      "name": "row_reference",
+      "value_time": {
+        "median_ms": 0.19432,
+        "min_ms": 0.120479,
+        "temporary_bytes": 51488
+      },
+      "grad_time": {
+        "median_ms": 0.201169,
+        "min_ms": 0.14205,
+        "temporary_bytes": 157816
+      },
+      "value": -2072.2973829968273,
+      "gradient": [
+        111.91315177750262,
+        -231.7232917674538,
+        -877.0387665137611,
+        -16.912474248832662
+      ],
+      "callback_regions": 0,
+      "scan_carry_sizes": [
+        2
+      ]
+    },
+    {
+      "N": 1600,
+      "name": "candidate",
+      "value_time": {
+        "median_ms": 0.539168,
+        "min_ms": 0.377508,
+        "temporary_bytes": 205344
+      },
+      "grad_time": {
+        "median_ms": 6.424848,
+        "min_ms": 5.393372,
+        "temporary_bytes": 782664
+      },
+      "value": -2072.297382996827,
+      "gradient": [
+        111.91315177750265,
+        -231.72329176745342,
+        -877.0387665137602,
+        -16.912474248832652
+      ],
+      "callback_regions": 1,
+      "scan_carry_sizes": [
+        1,
+        3,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "N": 1600,
+      "name": "baseline",
+      "value_time": {
+        "median_ms": 306.257789,
+        "min_ms": 249.039472,
+        "temporary_bytes": 205280
+      },
+      "grad_time": {
+        "median_ms": 320.139642,
+        "min_ms": 284.292403,
+        "temporary_bytes": 776112
+      },
+      "value": -2072.297382996827,
+      "gradient": [
+        111.91315177750265,
+        -231.72329176745342,
+        -877.0387665137602,
+        -16.912474248832652
+      ],
+      "callback_regions": 3200,
+      "scan_carry_sizes": [
+        1,
+        3200,
+        1,
+        1,
+        1,
+        1
+      ]
+    }
+  ],
+  "reporter_e727": [
+    {
+      "module": "candidate",
+      "path": "/home/niko/scratch/kb-agent-tmp/ReactiveKerne-c9f9c204e1/hmm/candidate/hmm_4.py",
+      "sha256": "cd45ce43f582147986feaa4b0f4a8db90c27ddc2e9d08569fdc5943d015d0d20"
+    },
+    {
+      "module": "baseline",
+      "path": "/home/niko/scratch/kb-agent-tmp/ReactiveKerne-c9f9c204e1/hmm/reporter/out/jax/toy_hmm_100.py",
+      "sha256": "46385c0c242a3619be4a20c844a7d842af77f5132b6590d28fc96101df557d56"
+    },
+    {
+      "jax": "0.12.0.1",
+      "platform": "cpu",
+      "x64": true
+    },
+    {
+      "N": 100,
+      "request": "/home/niko/scratch/kb-agent-tmp/ReactiveKerne-c9f9c204e1/hmm/reporter/out/runs/toy_hmm_100.request.json",
+      "sha256": "83c9a78f19c10685facec0c9e74ca59907fead143bc368796fa50312d17f1b46"
+    },
+    {
+      "N": 100,
+      "name": "row_reference",
+      "value_time": {
+        "median_ms": 0.08449,
+        "min_ms": 0.02911,
+        "temporary_bytes": 3488
+      },
+      "grad_time": {
+        "median_ms": 0.17836,
+        "min_ms": 0.04619,
+        "temporary_bytes": 10872
+      },
+      "value": -159.9235571234333,
+      "gradient": [
+        -39.808308039971585,
+        -37.466835771430866,
+        35.987792804205604,
+        3.4623999053490744
+      ],
+      "callback_regions": 0,
+      "scan_carry_sizes": [
+        2
+      ]
+    },
+    {
+      "N": 100,
+      "name": "candidate",
+      "value_time": {
+        "median_ms": 0.258439,
+        "min_ms": 0.182339,
+        "temporary_bytes": 13344
+      },
+      "grad_time": {
+        "median_ms": 0.301459,
+        "min_ms": 0.22069,
+        "temporary_bytes": 51272
+      },
+      "value": -159.92355712343328,
+      "gradient": [
+        -39.808308039971614,
+        -37.46683577143087,
+        35.98779280420562,
+        3.4623999053490766
+      ],
+      "callback_regions": 1,
+      "scan_carry_sizes": [
+        1,
+        3,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "N": 100,
+      "name": "baseline",
+      "value_time": {
+        "median_ms": 27.227879,
+        "min_ms": 21.234369,
+        "temporary_bytes": 14728
+      },
+      "grad_time": {
+        "median_ms": 22.410025,
+        "min_ms": 16.788414,
+        "temporary_bytes": 48944
+      },
+      "value": -159.92355712343328,
+      "gradient": [
+        -39.808308039971614,
+        -37.46683577143087,
+        35.98779280420562,
+        3.462399905349072
+      ],
+      "callback_regions": 200,
+      "scan_carry_sizes": [
+        1,
+        200,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "N": 400,
+      "request": "/home/niko/scratch/kb-agent-tmp/ReactiveKerne-c9f9c204e1/hmm/reporter/out/runs/toy_hmm_400.request.json",
+      "sha256": "e71e20a241b120ec05a7c017d64d9fb436fec3f3cfbb563f018f53760666294d"
+    },
+    {
+      "N": 400,
+      "name": "row_reference",
+      "value_time": {
+        "median_ms": 0.116449,
+        "min_ms": 0.05324,
+        "temporary_bytes": 13088
+      },
+      "grad_time": {
+        "median_ms": 0.11035,
+        "min_ms": 0.0507,
+        "temporary_bytes": 40248
+      },
+      "value": -597.883459675401,
+      "gradient": [
+        -90.29486875684103,
+        -82.32851335493686,
+        108.46706337841121,
+        3.6709404878487386
+      ],
+      "callback_regions": 0,
+      "scan_carry_sizes": [
+        2
+      ]
+    },
+    {
+      "N": 400,
+      "name": "candidate",
+      "value_time": {
+        "median_ms": 0.634058,
+        "min_ms": 0.264539,
+        "temporary_bytes": 51744
+      },
+      "grad_time": {
+        "median_ms": 1.625574,
+        "min_ms": 0.699578,
+        "temporary_bytes": 197192
+      },
+      "value": -597.8834596754012,
+      "gradient": [
+        -90.29486875684086,
+        -82.32851335493699,
+        108.46706337841124,
+        3.670940487848719
+      ],
+      "callback_regions": 1,
+      "scan_carry_sizes": [
+        1,
+        3,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "N": 400,
+      "name": "baseline",
+      "value_time": {
+        "median_ms": 72.228907,
+        "min_ms": 58.652212,
+        "temporary_bytes": 57928
+      },
+      "grad_time": {
+        "median_ms": 84.194136,
+        "min_ms": 56.36121,
+        "temporary_bytes": 188912
+      },
+      "value": -597.8834596754012,
+      "gradient": [
+        -90.29486875684086,
+        -82.32851335493699,
+        108.46706337841124,
+        3.670940487848701
+      ],
+      "callback_regions": 800,
+      "scan_carry_sizes": [
+        1,
+        800,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "N": 1600,
+      "request": "/home/niko/scratch/kb-agent-tmp/ReactiveKerne-c9f9c204e1/hmm/reporter/out/runs/toy_hmm_1600.request.json",
+      "sha256": "bab793d2f576a870483e0e399ec5f69cb4303fe35ba99a216d3f800e7bfae4a2"
+    },
+    {
+      "N": 1600,
+      "name": "row_reference",
+      "value_time": {
+        "median_ms": 0.147389,
+        "min_ms": 0.1074,
+        "temporary_bytes": 51488
+      },
+      "grad_time": {
+        "median_ms": 0.186299,
+        "min_ms": 0.124219,
+        "temporary_bytes": 157816
+      },
+      "value": -2358.5529604448693,
+      "gradient": [
+        3.7809227280314714,
+        34.71878354121759,
+        416.0297385021921,
+        4.490818640530488
+      ],
+      "callback_regions": 0,
+      "scan_carry_sizes": [
+        2
+      ]
+    },
+    {
+      "N": 1600,
+      "name": "candidate",
+      "value_time": {
+        "median_ms": 0.522518,
+        "min_ms": 0.399918,
+        "temporary_bytes": 205344
+      },
+      "grad_time": {
+        "median_ms": 5.303623,
+        "min_ms": 5.087383,
+        "temporary_bytes": 782664
+      },
+      "value": -2358.5529604448693,
+      "gradient": [
+        3.780922728031461,
+        34.71878354121767,
+        416.02973850219195,
+        4.490818640531471
+      ],
+      "callback_regions": 1,
+      "scan_carry_sizes": [
+        1,
+        3,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "N": 1600,
+      "name": "baseline",
+      "value_time": {
+        "median_ms": 322.307955,
+        "min_ms": 261.650679,
+        "temporary_bytes": 230728
+      },
+      "grad_time": {
+        "median_ms": 300.828548,
+        "min_ms": 236.381504,
+        "temporary_bytes": 750448
+      },
+      "value": -2358.5529604448693,
+      "gradient": [
+        3.780922728031461,
+        34.71878354121767,
+        416.02973850219195,
+        4.490818640531339
+      ],
+      "callback_regions": 3200,
+      "scan_carry_sizes": [
+        1,
+        3200,
+        1,
+        1,
+        1,
+        1
+      ]
+    }
+  ],
+  "guarded_shared_array": [
+    {
+      "jax": "0.12.0.1",
+      "platform": "cpu",
+      "x64": true
+    },
+    {
+      "N": 100,
+      "program": "shared",
+      "min_ms": 0.01253,
+      "median_ms": 0.01411,
+      "temporary_bytes": 4800,
+      "gradient_scan_carry_shapes": [
+        [
+          []
+        ],
+        [
+          [
+            100
+          ],
+          []
+        ]
+      ]
+    },
+    {
+      "N": 100,
+      "program": "iterated",
+      "min_ms": 0.01247,
+      "median_ms": 0.01799,
+      "temporary_bytes": 3896,
+      "gradient_scan_carry_shapes": [
+        [
+          []
+        ],
+        [
+          []
+        ]
+      ]
+    },
+    {
+      "N": 400,
+      "program": "shared",
+      "min_ms": 0.034409,
+      "median_ms": 0.03932,
+      "temporary_bytes": 15424,
+      "gradient_scan_carry_shapes": [
+        [
+          []
+        ],
+        [
+          [
+            400
+          ],
+          []
+        ]
+      ]
+    },
+    {
+      "N": 400,
+      "program": "iterated",
+      "min_ms": 0.01611,
+      "median_ms": 0.01991,
+      "temporary_bytes": 12152,
+      "gradient_scan_carry_shapes": [
+        [
+          []
+        ],
+        [
+          []
+        ]
+      ]
+    },
+    {
+      "N": 1600,
+      "program": "shared",
+      "min_ms": 0.354249,
+      "median_ms": 0.459988,
+      "temporary_bytes": 58624,
+      "gradient_scan_carry_shapes": [
+        [
+          []
+        ],
+        [
+          [
+            1600
+          ],
+          []
+        ]
+      ]
+    },
+    {
+      "N": 1600,
+      "program": "iterated",
+      "min_ms": 0.043409,
+      "median_ms": 0.04547,
+      "temporary_bytes": 45752,
+      "gradient_scan_carry_shapes": [
+        [
+          []
+        ],
+        [
+          []
+        ]
+      ]
+    },
+    {
+      "N": 6400,
+      "program": "shared",
+      "min_ms": 4.827765,
+      "median_ms": 5.301253,
+      "temporary_bytes": 231424,
+      "gradient_scan_carry_shapes": [
+        [
+          []
+        ],
+        [
+          [
+            6400
+          ],
+          []
+        ]
+      ]
+    },
+    {
+      "N": 6400,
+      "program": "iterated",
+      "min_ms": 0.148299,
+      "median_ms": 0.176729,
+      "temporary_bytes": 180152,
+      "gradient_scan_carry_shapes": [
+        [
+          []
+        ],
+        [
+          []
+        ]
+      ]
+    }
+  ]
+}
