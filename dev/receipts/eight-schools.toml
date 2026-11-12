@@ -1,4 +1,4 @@
-reactivekernels_version = "0.1.176"
+reactivekernels_version = "0.1.177"
 julia_version = "1.10.13"
 page = "eight-schools"
 source_sha256 = "afeadf0a7d3705f623ddad00392f2a8b85f552bf1797a169a38282dffc0df891"
@@ -6,5 +6,5 @@ source_sha256 = "afeadf0a7d3705f623ddad00392f2a8b85f552bf1797a169a38282dffc0df89
 [checks]
 roundtrip_error = 4.440892098500626e-16
 prior_error = 7.105427357601002e-15
-likelihood_error = 0.0
+likelihood_error = 7.105427357601002e-15
 decomposition = true
