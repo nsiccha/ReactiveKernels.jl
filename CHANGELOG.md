@@ -16,6 +16,24 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.180
+
+- `jax_source`: `size` of a padded value, such as a ragged row in its plate
+  cell, is its length along the axes its padding pads, as `length` is, and
+  `size(x)` holds it too. Before, it was the padded width, the longest row's
+  length, so a helper sized by `size(x, 1)` (a StanBlocks `@juliacompat`
+  body's `vector[n]` argument) computed and returned that many entries with
+  no length: a row's mean `sum(x) / size(x, 1)` was wrong, and a column
+  derived from a shorter row was assembled with padding where Julia raises
+  `DimensionMismatch`. A padded value whose padded axes are not known now
+  raises for `size` instead.
+- A tuple-valued plate cell's field without a length (a field computed from
+  shared values, beside a padded one) has none in a later plate. Before,
+  that plate read the `None` the cell's lengths hold for it as the field's
+  length, so `reduce(hcat, ·)` of the field raised "the columns differ in
+  length" although every column filled the width (snag
+  jax-tuple-valued-1ead4c4c).
+
 ## 0.1.179
 
 - `jax_source` translates loops, generators, comprehensions and slices over

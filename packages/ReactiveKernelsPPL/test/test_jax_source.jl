@@ -1276,3 +1276,75 @@ end
         @test allequal(texts)
     end
 end
+
+# A dotted cell latent's derived field assembled with `reduce(hcat, ·)` (snag
+# jax-tuple-valued-1ead4c4c): the cell returns the latent block beside the
+# derived column, and the column's helper is sized by `size(e, 1)`, as a
+# StanBlocks `@juliacompat` body's `vector[nt]` argument is. Blocks of one
+# length assemble and match native; blocks of different lengths are Julia's
+# `DimensionMismatch`, and the module raises rather than reading padding. A
+# derived column computed from shared values has no length of its own, and
+# blocks of different lengths beside it still assemble.
+@traceable function jax_ppl_ar_path(eps, phi)
+    nt = size(eps, 1)
+    d = Array{typeof(phi * eps[1])}(undef, (nt,))
+    d[1] = eps[1] / sqrt(1 - phi^2)
+    for t in 2:nt
+        d[t] = phi * d[t - 1] + eps[t]
+    end
+    d
+end
+jax_ppl_column_total(columns, W) = sum(reduce(hcat, columns) .* W)
+@testset "jax_source(built, plan): a dotted cell latent's derived columns" begin
+    derived(zero_s, W) = (@rkppl(begin
+        phi ~ Beta(2.0, 8.0)
+        c[1:S] .~ Normal(0, 1)
+        @plate for s in eachindex(zero_s)
+            e[s] .~ Normal.(zero_s[s], 1.0)
+            w[s] = c[s] .+ jax_ppl_ar_path(e[s], phi)
+        end
+        total = jax_ppl_column_total(w, W)
+        y ~ Normal(total, 1.0)
+    end))(; S = length(zero_s), zero_s, W) | (; y = 0.3)
+    shared(zero_s, base, W) = (@rkppl(begin
+        a ~ Normal(0, 1)
+        c[1:S] .~ Normal(0, 1)
+        @plate for s in eachindex(zero_s)
+            e[s] .~ Normal.(zero_s[s], 1.0)
+            w[s] = (c[s] + sum(e[s])) .* base
+        end
+        total = jax_ppl_column_total(w, W)
+        y ~ Normal(a + total, 1.0)
+    end))(; S = length(zero_s), zero_s, base, W) | (; y = 0.3)
+    W = reshape(collect(1.0:12.0), 4, 3) ./ 10
+    cases = (derived([zeros(4), zeros(4), zeros(4)], W),
+             shared([zeros(4), zeros(2), zeros(3)], [0.5, -1.0], W[1:2, :]))
+    unequal = derived([zeros(4), zeros(2), zeros(4)], W)
+    if !rk_jax_available()
+        @test_skip false
+    else
+        for plan in cases
+            built = build_kernel(plan)
+            src = jax_source(built, plan)
+            query = prepare_query(built, plan, :sampler)
+            u = 0.2 .* randn(Xoshiro(7), built.layout.total)
+            r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
+                                grad = true, prepare = true)
+            @test r.value ≈ query(u) rtol = 1e-10
+            @test r.grad ≈ rk_fd_gradient(query, u) rtol = 1e-6
+        end
+        built = build_kernel(unequal)
+        u = 0.2 .* randn(Xoshiro(7), built.layout.total)
+        @test_throws DimensionMismatch prepare_query(built, unequal, :sampler)(u)
+        src = jax_source(built, unequal)
+        err = try
+            rk_jax_evaluate(src, "log_density", (u, jax_raw_data(unequal, src)...); prepare = true)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test err !== nothing &&
+              occursin("reduce(hcat, columns): the columns differ in length", sprint(showerror, err))
+    end
+end
