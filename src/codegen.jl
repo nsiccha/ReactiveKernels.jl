@@ -3267,8 +3267,8 @@ Base.@nospecializeinfer function _plate_shared_branch(
             callvalues, dependencies, root_positions)
         branch = _plate_branch_source_graphs(r, names, shared)
         _plate_branch_has_graph(branch) || continue
-        then_kernel = _plate_branch_arm_kernel(inner, index, :then, branch, names)
-        else_kernel = _plate_branch_arm_kernel(inner, index, :else, branch, names)
+        then_kernel = _plate_branch_arm_kernel(inner, index, :then, branch, names; shared)
+        else_kernel = _plate_branch_arm_kernel(inner, index, :else, branch, names; shared)
         (then_kernel === nothing || else_kernel === nothing) && continue
         return _PlateSharedBranch(index,
             Any[callargs[p] for p in condition_positions], then_kernel, else_kernel)
@@ -3408,6 +3408,15 @@ _kernel_ops(variant::_PlateArmVariant) =
 _plate_arm_plan(spec) = plan(spec)
 _plate_arm_plan(p::Plan) = p
 
+# Shared scalar evidence can arrive after an arm graph was authored. Split
+# its retained mixed recipes at that boundary, using the same decomposition
+# as partial evaluation. No value is evaluated, and captured callables and
+# any already prepared residual plan stay intact.
+function _plate_arm_shared_plan(spec, shared)
+    p = _plate_arm_plan(spec)
+    _partial_split_bound(p, Value[v for v in p.have if v.name in shared])
+end
+
 # A branch whose condition reads the cell takes its arm per cell, but an arm
 # with its own graph is inlined into the cell loop. Its recipes that read only
 # shared values run at the first cell that takes the arm and are reused by the
@@ -3470,7 +3479,7 @@ Base.@nospecializeinfer function _plate_lane_branch_slots!(
     elseif spec === nothing
         nothing
     else
-        armplan = _plate_arm_plan(spec)
+        armplan = _plate_arm_shared_plan(spec, shared)
         fits = all(port -> port.name in names, armplan.have) &&
             !any(port -> canon_id(armplan.graph, port.id) ==
                          canon_id(armplan.graph, only(armplan.want).id),
@@ -3576,7 +3585,8 @@ end
 # closure over its own ports (a nested branch stays a branch over every
 # argument, and is examined again), as in `_partition_plate_recipe`.
 Base.@nospecializeinfer function _plate_branch_arm_kernel(
-        inner::Plan, index::Int, side::Symbol, @nospecialize(native), names)
+        inner::Plan, index::Int, side::Symbol, @nospecialize(native), names;
+        shared = Set{Symbol}())
     r = inner.recipes[index]
     then = side === :then
     positions = (typeof(native)::DataType).parameters[then ? 2 : 3]
@@ -3596,7 +3606,8 @@ Base.@nospecializeinfer function _plate_branch_arm_kernel(
         Recipe[Recipe(r.id, Tuple(r.inputs[i] for i in positions), r.outputs,
                       arm_op, r.cost, nothing, false, r.source)]
     else
-        _plate_branch_arm_recipes!(copied, spec, r, names, fresh)
+        _plate_branch_arm_recipes!(copied, _plate_arm_shared_plan(spec, shared),
+                                  r, names, fresh)
     end
     replacement === nothing && return nothing
     recipes = Recipe[]
@@ -5785,20 +5796,25 @@ function _plate_inferred_input_types(p::Plan; exemplar_types = nothing,
     for recipe in p.recipes
         recipe.id in needed || continue
         inputs = Any[get(types, canon_id(g, v.id), Any) for v in recipe.inputs]
-        for (v, output_type) in zip(recipe.outputs,
-                                    _recipe_inferred_output_types(recipe, inputs))
+        # Infer a preceding plate through the same cell/body and allocation
+        # analysis as the native type audit. Its semantic fallback call is not
+        # the emitted program, and discarding the result type would hide scalar
+        # reads from that array (such as a mixture's shared scale aliases).
+        outputs = if recipe.op isa _AuthoredPlateOp && all(_concrete_value_type, inputs)
+            T = _checked_recipe_type!(_UninferredValue[], recipe.op, inputs, Symbol[])
+            _recipe_output_types(recipe, something(T, Any))
+        else
+            _recipe_inferred_output_types(recipe, inputs)
+        end
+        for (v, output_type) in zip(recipe.outputs, outputs)
             declared = valtype(v)
-            # The parent lowering enforces concretely declared locals. Keep
-            # that fact when inference of an earlier source closure is weaker;
-            # otherwise a later unannotated scalar such as `1 - omega` loses
-            # its Number proof even though `omega::Float64` is authoritative.
-            types[canon_id(g, v.id)] = if exemplar_types === nothing
-                _concrete_value_type(declared) &&
-                    !(recipe.op isa _BoundConstant) ? declared : output_type
-            else
+            # Typed locals can convert a producer's result. Keep a narrower
+            # inferred type only when it already satisfies the declaration;
+            # this also covers abstract array declarations. Bound constants
+            # retain their actual type, as they do in the parent lowering.
+            types[canon_id(g, v.id)] =
                 declared !== Any && !(recipe.op isa _BoundConstant) &&
                     !(output_type <: declared) ? declared : output_type
-            end
         end
     end
     types
@@ -6083,10 +6099,11 @@ function _lower_with_ops_collecting(p::Plan;
 
         if inline_embedded && r.op isa _AuthoredPlateOp
             callvalues = r.inputs
-            # Shared-branch arm slots use source-inferred scalar inputs;
-            # exemplars add rank evidence only. A nested cell's lowering
-            # (`type_hints`) infers them from the enclosing plate's operand
-            # types (`cell_have_types`), so a branch condition reading a
+            # The emitted body and its operation table are built together,
+            # so shared branches can use the exact HAVE types promised by
+            # exemplar preparation as well as declared input types. A nested
+            # cell's lowering (`type_hints`) infers them from its enclosing
+            # plate's operand types (`cell_have_types`), so a branch condition reading a
             # number the cell received is decided once per nested call.
             branch = any(q -> _plate_branch_operation(q.op),
                          r.op.kernel.plan.recipes)
@@ -6100,8 +6117,7 @@ function _lower_with_ops_collecting(p::Plan;
                         (inferred_exemplar_types =
                             _plate_inferred_input_types(p; exemplar_types))
                 end
-                scalars = branch ? inferred_plate_types :
-                    something(inferred_exemplar_types, inferred_plate_types)
+                scalars = something(inferred_exemplar_types, inferred_plate_types)
                 callvalues = _plate_inferred_values(g, r.inputs, scalars;
                     rank_types = inferred_exemplar_types)
             end
