@@ -786,3 +786,68 @@ end
     GC.gc(); GC.gc()
     @test data.value === nothing
 end
+
+module DirectCallFixture
+using ReactiveKernels
+@kernel mixture(x, centres, log_weights) = begin
+    score = -0.5 .* (x .- centres) .^ 2 .+ log_weights
+    peak = maximum(score)
+    total = peak + log(sum(exp.(score .- peak)))
+end
+@kernel square(x) = begin
+    y = x * x
+end
+@kernel shifted(x, y = 2.0) = begin
+    out = 3.0 * (x + y)
+end
+positive(x) = (x > 0 || throw(ArgumentError("x must be positive")); nothing)
+end
+
+# A positional call of a spec keeps its prepared kernel in the graph's cache.
+# It prepared on every call before: 1.0 ms per call of a five-input mixture
+# kernel against 0.36 µs for a held `prepare(spec)` (snag
+# direct-call-of-a-30927f43).
+@testset "a positional KernelSpec call prepares once per graph version" begin
+    D = DirectCallFixture
+    spec = D.mixture
+    x, c, lw = [0.1, 0.2], [0.0, 1.0], log.([0.4, 0.6])
+    expected = prepare(spec)(x, c, lw)
+    @test spec(x, c, lw) == expected
+    cache = ReactiveKernels._graph_preparations(spec.graph)
+    kernel = only(values(cache.kernels))
+    for _ in 1:3
+        @test spec(x, c, lw) == expected
+    end
+    @test ReactiveKernels._graph_preparations(spec.graph) === cache
+    @test only(values(cache.kernels)) === kernel
+    @test ReactiveKernels._kernel_direct_callable(spec) === kernel
+    # Other argument types call the same kernel, which Julia specializes.
+    @test spec(Float32[0.1, 0.2], c, lw) ≈ expected
+    @test only(values(cache.kernels)) === kernel
+    # A view with another boundary shares the graph and keeps its own kernel.
+    peak = spec(; want = :peak)
+    @test peak(x, c, lw) == prepare(spec; want = :peak)(x, c, lw)
+    @test length(cache.kernels) == 2
+    # A preparation setting is part of the key.
+    ReactiveKernels._with_simplify(!ReactiveKernels._simplify()) do
+        @test spec(x, c, lw) == expected
+    end
+    @test length(cache.kernels) == 3
+    @test spec(x, c, lw) == expected
+    @test length(cache.kernels) == 3
+
+    # Positional defaults still apply over the kept kernel.
+    @test D.shifted(1.0) == 9.0 && D.shifted(1.0, 1.0) == 6.0
+    @test length(ReactiveKernels._graph_preparations(D.shifted.graph).kernels) == 1
+
+    # A mutation of the graph prepares afresh: the check added after the
+    # first call runs on the next one.
+    square = D.square
+    @test square(-2.0) == 4.0
+    old = square.graph.preparations
+    ReactiveKernels.input_check!(square, :x, D.positive, :x)
+    @test_throws ArgumentError square(-2.0)
+    @test square(3.0) == 9.0
+    @test square.graph.preparations !== old
+    @test length(square.graph.preparations.cache.kernels) == 1
+end

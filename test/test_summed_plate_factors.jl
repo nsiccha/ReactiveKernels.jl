@@ -181,7 +181,10 @@ end
     q = [0.1, -0.4, 0.3]
     idx = repeat([1, 2, 3], inner = 16)
     y = [sin(i / 3) / 2 for i in eachindex(idx)]
-    k = prepare(gathered_normal; bound = (; idx, y))
+    # Bound least-squares statistics (`bound_statistics.jl`) would sum this
+    # plate's squared residuals without a loop; the factored loop is the one
+    # that runs without them.
+    k = prepare(gathered_normal; bound = (; idx, y), bound_statistics = false)
     literal = prepare(gathered_normal; bound = (; idx, y), simplify = false)
     @test _factored(k)
     @test occursin("run_partial", _code(k))

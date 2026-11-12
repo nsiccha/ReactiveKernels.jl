@@ -460,13 +460,13 @@ end
     forward = prepare_sampler(built, plan, u; backend = AutoEnzyme(; mode = Enzyme.Forward))
     @test !(forward.kernel isa NonAllocatingKernel)
     @test agrees(forward)
-    # The opt-in plate reverse differentiates the ordinary program; its own
-    # gradients are `test_plate_reverse.jl`'s. (A destructuring assignment's
-    # program: `test_destructuring.jl`.)
+    # Generated plate reverse composes with the default buffer reuse. Its
+    # installation and cache ownership are checked by the composition suite.
     reversed = ReactiveKernels.with_plate_reverse() do
         prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND)
     end
-    @test !(reversed.kernel isa NonAllocatingKernel)
+    @test reversed.kernel isa NonAllocatingKernel
+    @test agrees(reversed)
     @test_throws ArgumentError prepare_sampler(built, plan, u;
         backend = NA_SAMPLER_BACKEND, nonallocating = :always)
 end

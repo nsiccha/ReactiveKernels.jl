@@ -32,8 +32,9 @@ end
 
 A cache of prepared kernels keyed by graph identity+version and the ordered,
 canonicalized have/want signature plus pass identities (gist §17). Cache lookup
-happens only in `prepare!`, never on the hot path; a graph mutation bumps its
-version and so cannot return a stale kernel.
+happens only in `prepare!` and in a positional call of a `KernelSpec` (which
+keeps its kernel in the graph's own cache), never inside a prepared kernel; a
+graph mutation bumps its version and so cannot return a stale kernel.
 
 A bound preparation (`prepare!(cache, …; bound = …)`) is cached one level
 deeper: the planned boundary, the compiled data-only prefix and the compiled
@@ -134,28 +135,53 @@ end
 
 function prepare!(cache::PreparationCache, g::Graph; have = (), want = (),
                   passes = (), bound = (), on_error = nothing, type_stability = nothing,
-                  type_stability_level = nothing, branch_arms = nothing, simplify = nothing)
+                  type_stability_level = nothing, branch_arms = nothing, simplify = nothing,
+                  bound_statistics = nothing)
     # One type for every selection's width before the closures capture them.
     haves, wants, binding = _value_list(have), _value_list(want), _bound_list(bound)
     _with_branch_arms(branch_arms) do
-    _with_simplify(simplify) do
+    _with_settings(simplify, bound_statistics) do
         _with_type_stability(type_stability, type_stability_level) do
             binding === () || return _prepare_bound!(cache, g, haves, wants, passes, binding,
                                                      objectid(g); on_error)
-            key = (objectid(g), g.version, _sig(g, haves), _sig(g, wants),
-                   Tuple(objectid(p) for p in passes), on_error, _type_stability(),
-                   _type_stability_level(), _plan_mode(), _simplify(), _branch_arms())
-            lock(cache.lock) do
-                get!(cache.kernels, key) do
-                    prepare(g; have = haves, want = wants, passes = passes, on_error = on_error)
-                end
-            end
+            _prepare_unbound!(cache, g, haves, wants, passes, objectid(g); on_error)
         end
     end
     end
 end
 
-# The bound preparations plain `prepare(g; bound)` reuses. The graph holds them,
+# The key of `g`'s unbound kernel for one boundary, given its have and want
+# signatures (`_sig`). `graph_key` as for `_prepare_bound!`: `nothing` in the
+# graph's own cache, where a positional `KernelSpec` call keeps its kernel
+# (authoring.jl). The settings it reads are the effective ones of the
+# enclosing preparation, so a call under another setting prepares its own
+# kernel.
+Base.@nospecializeinfer _unbound_key(g::Graph, graph_key, have_sig::Vector{ValueId},
+                                     want_sig::Vector{ValueId}, @nospecialize(passes),
+                                     on_error) =
+    (graph_key, g.version, have_sig, want_sig, Tuple(_pass_key(p) for p in passes),
+     on_error, _type_stability(), _type_stability_level(), _plan_mode(), _simplify(),
+     _branch_arms())
+
+# The unbound kernel of `g` for one boundary, prepared at the first lookup of
+# its key.
+function _prepare_unbound!(cache::PreparationCache, g::Graph, @nospecialize(haves),
+                           @nospecialize(wants), @nospecialize(passes), graph_key;
+                           on_error = nothing)
+    key = _unbound_key(g, graph_key, _sig(g, haves), _sig(g, wants), passes, on_error)
+    @lock cache.lock begin
+        kernel = get(cache.kernels, key, nothing)
+        if kernel === nothing
+            kernel = prepare(g; have = haves, want = wants, passes = passes,
+                             on_error = on_error)
+            cache.kernels[key] = kernel
+        end
+        kernel
+    end
+end
+
+# The bound preparations plain `prepare(g; bound)` reuses, and the unbound
+# kernel a positional `KernelSpec` call runs. The graph holds them,
 # so they live exactly as long as it does, and a mutation (a new version)
 # starts afresh rather than keeping entries no lookup can reach. Their keys
 # leave out the graph's identity, which is implicit, and name each (singleton)
@@ -210,7 +236,8 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     # the same graph and binding.
     key = (:bound, graph_key, g.version, _sig(g, have), _sig(g, want),
            _sig(g, ports), Tuple(_pass_key(p) for p in passes), on_error,
-           _type_stability(), _type_stability_level(), _plan_mode(), _simplify(), _branch_arms())
+           _type_stability(), _type_stability_level(), _plan_mode(), _simplify(), _branch_arms(),
+           _bound_statistics())
     # Locked blocks, not `lock(...) do` closures: a closure's type holds the
     # types it captures (here the signatures in `key`, and below the hoisted
     # values), so it compiled once per program and width.
@@ -264,15 +291,17 @@ end
 # A cache hit compares its key with the stored one. Signatures are vectors, so
 # one key type serves every port count (here without passes). The last two
 # elements are `_simplify()` and `_branch_arms()`; a key type change here must
-# follow the key.
+# follow the key. A bound key ends in `_bound_statistics()`. The unbound key
+# with no graph identity is a positional `KernelSpec` call's: without it here,
+# a process's first repeated call compiled the comparison.
 for on_error in (Nothing, Symbol)
     S = Vector{ValueId}
     for graph_key in (Nothing, UInt64)
-        K = Tuple{Symbol,graph_key,Int,S,S,S,Tuple{},on_error,Symbol,Symbol,Bool,Bool,Symbol}
+        K = Tuple{Symbol,graph_key,Int,S,S,S,Tuple{},on_error,Symbol,Symbol,Bool,Bool,Symbol,Bool}
         precompile(isequal, (K, K)) || error("no isequal method for bound key $K")
+        K = Tuple{graph_key,Int,S,S,Tuple{},on_error,Symbol,Symbol,Bool,Bool,Symbol}
+        precompile(isequal, (K, K)) || error("no isequal method for cache key $K")
     end
-    K = Tuple{UInt64,Int,S,S,Tuple{},on_error,Symbol,Symbol,Bool,Bool,Symbol}
-    precompile(isequal, (K, K)) || error("no isequal method for cache key $K")
 end
 for template in (_BoundTemplate, PreparedKernel, Nothing)
     precompile(_bound_rebind, (_BoundEntry, template, Any, Any, Any)) ||
