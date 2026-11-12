@@ -138,14 +138,18 @@ function _evidence_integer_observation(ex, y)
     return Expr(ex.head, (_evidence_integer_observation(a, y) for a in ex.args)...)
 end
 
+# `levels` is a leveled family's class count: the bound `n_levels`, or an
+# expression the cell evaluates when the count is a run-time length
+# (categorical logit slices).
 function _wrap_evidence!(r, plan, pre, inputs, base;
-        cdf=nothing, ccdf=nothing, logcdf=nothing, logccdf=nothing)
+        cdf=nothing, ccdf=nothing, logcdf=nothing, logccdf=nothing,
+        levels=r.n_levels)
     r.evidence.kind === :none && return base
     # Parameter support remains outside the evidence computation. Its inactive
     # density, normalizer, tails and derivative work must stay unevaluated.
     if _evidence_density_guard(base) &&
             !(_dovar(1) in _expr_value_symbols(base.args[1]))
-        guarded = _wrap_evidence!(r, plan, pre, inputs, base.args[2]; cdf, ccdf, logcdf, logccdf)
+        guarded = _wrap_evidence!(r, plan, pre, inputs, base.args[2]; cdf, ccdf, logcdf, logccdf, levels)
         return Expr(:if, base.args[1], guarded, base.args[3])
     end
     family = r.family === MixtureFam ? something(r.mixture_family, GaussianFam) :
@@ -176,8 +180,7 @@ function _wrap_evidence!(r, plan, pre, inputs, base;
         base = _evidence_integer_observation(base, y)
         base = :((isfinite($y) && floor($y) == $y) ? $base : -Inf)
         if family in (CategoricalFam, CategoricalLogitFam, OrderedLogisticFam, OrdinalFam)
-            K = r.n_levels
-            base = :(1 <= $y <= $K ? $base : -Inf)
+            base = :(1 <= $y <= $levels ? $base : -Inf)
         end
     end
     bounds = map((r.evidence.lower, r.evidence.upper)) do b

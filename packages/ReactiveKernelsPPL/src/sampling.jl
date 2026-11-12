@@ -53,6 +53,19 @@ end
 LogDensity(f, args...; kwargs...) = LogDensity(f, args, (;kwargs...), Val(:packed))
 sampling_logdensity(d::LogDensity, value) = d.f(value, d.args...; d.kwargs...)
 
+# A reference-coded categorical over one observation's K−1 non-reference
+# logits (class 1 the zero reference), observed from a plate cell:
+# `y[i] ~ CategoricalLogit(E[i, :])`. It is RK's `categorical_logit_ref`
+# law, the observed logit minus `logaddexp(0, logsumexp(logits))`; a class
+# beyond the slice is outside the support.
+function _ppl_categorical_logit_logdensity(value::Integer,
+        nonreference::AbstractVector)
+    T = float(eltype(nonreference))
+    1 <= value <= length(nonreference) + 1 || return T(-Inf)
+    observed = value == 1 ? zero(T) : T(nonreference[value - 1])
+    return observed - logaddexp(zero(T), logsumexp(nonreference))
+end
+
 # A categorical probability vector computed in a plate cell is an ordinary
 # sampling RHS. Keep its matrix product or gather in the RK graph; only the
 # scalar observation lookup belongs in this density. The vector is checked
