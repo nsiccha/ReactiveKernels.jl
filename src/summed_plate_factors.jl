@@ -214,7 +214,7 @@ end
 # A plate cell's read of an argument at its index: one local per distinct read,
 # computed first in the cell.
 function _spf_read!(call::Expr, env, ctx::_SPFCtx)
-    _rw_resolve(call.args[1], @__MODULE__) === Base.Broadcast._broadcast_getindex ||
+    _rw_resolve(call.args[1], @__MODULE__) in (Base.Broadcast._broadcast_getindex, _plate_read) ||
         throw(_SPFAbort())
     for a in call.args[2:end]
         a === ctx.index && continue

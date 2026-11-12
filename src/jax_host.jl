@@ -91,6 +91,8 @@ function _host_lines!(ctx::_JaxContext, first::Int)
     end
 end
 
+# Host integers stay int64 in every module: NumPy computes the data with
+# them, and JAX converts them when a float32 module's functions read them.
 _host_dtype(@nospecialize(E)) = E isa Type && E <: Bool ? "np.bool_" :
     E isa Type && E <: Integer ? "np.int64" :
     E isa Type && E <: AbstractFloat ? "np." * _jax_dtype_name(E) :
@@ -1250,15 +1252,17 @@ function _host_function_input!(scope, params, passed, hint, v::_PyVal, T::_JaxAg
     _PyVal(v.code, _JaxAggregate(T.T, fields), true)
 end
 
-# A `@traceable` helper on the host: a module-level function of its body.
+# A `@traceable` helper on the host: a module-level function of its body. The
+# call's `args` select it; `inputs` are the values its formals `names` take
+# (a Vararg formal's is the tuple of the trailing arguments).
 function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, mod::Module,
-                             args::Vector{_PyVal})
+                             args::Vector{_PyVal}, inputs::Vector{_PyVal} = args)
     types = Any[_jax_argument_type(a) for a in args]
     key = (:host_traceable, objectid(f), Tuple(a.T for a in args))
     scope = _JaxScope()
     params, passed = String[], _PyVal[]
     locals = Dict{Symbol,_PyVal}(n => _host_function_input!(scope, params, passed, n, a)
-                                for (n, a) in zip(names, args))
+                                for (n, a) in zip(names, inputs))
     name = get(ctx.mod.helper_names, key, nothing)
     if name === nothing
         name = _jax_private_identifier(ctx.mod.used, Symbol("_rk_", nameof_or(f), "_np"))
@@ -1819,7 +1823,10 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
     end
     # The data definitions, in order, over the parameters and the definitions
     # before them. A data value takes the type the binding's own value has; a
-    # local of the definitions (`T0 === nothing`), the translation's.
+    # local of the definitions (`T0 === nothing`), the translation's. Their
+    # globals resolve in the module the caller names (`definitions_module`),
+    # never in whichever module called `jax_source`.
+    ctx.source_module = mod.definitions_module
     for (name, ex, T0) in definitions
         # One reading a definition without a host translation that is no input
         # either (the caller gave no value of it) has none: it says why.
@@ -1849,6 +1856,7 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
         end
         known[name] = _PyVal(local_name, T, true)
     end
+    ctx.source_module = Main
     for v in p.have
         scope.values[canon_id(p.graph, v.id)] = known[v.name]
     end

@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.200
+## 0.1.206
 
 - The opt-in generated summed-plate reverse (`with_plate_reverse`) is faster.
   Values and gradients are unchanged, apart from rounding.
@@ -36,6 +36,83 @@ are recorded in the git history only.
   - Among PosteriorDB ports whose likelihood the rule covers, Rats and the two
     `BLR` ports now differentiate 1.4–1.5× faster than the default
     preparation, and ARMA11 1.1× faster (Julia 1.13.1).
+
+## 0.1.205
+
+- `@traceable` takes a trailing Vararg argument: `args...`, `args::T...`,
+  `args::Vararg{T}` and `args::Vararg{T,N} where {N}`. Before, the
+  `Vararg{...}` forms failed to define the method (`TypeError: in TypeVar, in
+  upper bound, expected Type, got Vararg{Any, N}`), and `args...` recorded no
+  source, so `jax_source` refused a body with loops. The recorded source reads
+  the formal as the tuple of the trailing arguments, as the method does, in
+  `jax_source`'s functions and `prepare_data` and in non-allocating
+  preparation. In `jax_source`, a `where` count such as `N` reads as its
+  value.
+- `jax_source` translates `sum(f, t)` and `sum(f, t; init)` of a tuple `t`
+  (such as those arguments, or a literal `(a, b, c)`), in the functions and
+  in `prepare_data`: `f` of each element, added in order from `init`. The
+  fold follows the tuple's fixed length. Before, it raised a
+  `JAXEmissionError` ("this `sum` call").
+
+## 0.1.204
+
+- `jax_source` takes `float_type`, `Float64` (the default) or `Float32`: the
+  dtype of every float value the program does not type `Float32` itself, for
+  an accelerator whose float64 is slow. A `Float32` module casts its float
+  inputs to `float32`, its `prepare_data` returns `float32` data, its dtype
+  metadata says so, and it does not turn on JAX's 64-bit mode; its device
+  integers are JAX's default integer (`int32` without that mode). An `fma`,
+  which rounds once through a float64 product, still turns it on. It stays
+  float32 where another module turned 64-bit mode on: integers a float is
+  computed from alone (`log(k)`, `i / j`), NumPy-computed constants, `I(n)`,
+  scan carries and the literal arms of traced branches take its float type.
+  The `Float64` module of the same program is its reference, and is unchanged
+  (snag jax-source-float-5e6b7604).
+- A traced branch whose arm returns a static value (a literal, a NumPy
+  constant) returns it in the branch's float dtype where that dtype is
+  `float32`: `jax.lax.cond` refused a float64 literal arm beside a `float32`
+  one, also in a `Float32` program's `Float64` module.
+
+## 0.1.203
+
+- Nested native plates reuse elementary scalar work on an invariant array
+  across enclosing cells. For example, a whole-event Bernoulli mixture can
+  compute `log(p[j,k])` and `log1p(-p[j,k])` once per matrix entry instead of
+  once per observation. The same lowering handles logit expressions and
+  invariant subexpressions inside event-dependent arithmetic. Tables and loops
+  keep runtime sizes. Domain and storage checks retain the authored path for
+  singular live inputs, unsupported arrays and effectful regions; empty and
+  ragged domains retain their values, ordinary derivatives and access checks.
+
+## 0.1.202
+
+- `jax_source` generates scalar derivative-rule adapters from the same
+  activity-selected mathematical graph as native AD. Joint cuts and repeated
+  calls share their emitted helpers; inactive partials are not contracted.
+- Add the shared incomplete-beta fraction value/partials graph used by
+  distribution tails. First-order native and JAX gradients retain its partials
+  instead of a reverse tape of 300 fraction iterations.
+
+## 0.1.201
+
+- `jax_source(...; data, definitions, definitions_module = Main)`: the
+  definitions' globals, such as a call head `plate`, resolve in
+  `definitions_module`. A binder passes the module it evaluates its
+  definitions in, so the module it emits no longer depends on what the caller
+  imported. Before, they always resolved in `Main`, so a definition calling a
+  function the caller's `Main` did not see stayed a `prepare_data` input
+  (`UNTRANSLATED`: "`f` is not defined in module `Main`"), and one `Main`
+  defined differently was translated as that function. The default keeps the
+  previous behaviour for direct callers.
+
+## 0.1.200
+
+- Summed-plate factoring also recognizes the direct array reads introduced
+  in 0.1.194. In 0.1.196 only the broadcast-read loop was factored, so a
+  shared-scale Normal plate with matching array axes retained its per-cell
+  scale arithmetic, and a plate over one array was never factored. Both
+  direct and broadcast-read loops now take their shared factors and terms
+  out of the sum, with the same guarded fallback and ordinary reverse.
 
 ## 0.1.199
 
