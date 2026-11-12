@@ -121,6 +121,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_keep.jl",
     "test_jax_empty_plate.jl",
     "test_jax_translations.jl",
+    "test_jax_elementwise.jl",
     "test_scan_columns.jl",
     "test_scan_endpoint_scope.jl",
     "test_replica.jl",
