@@ -2793,6 +2793,11 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(/), args::Vector{_PyVal})
 end
 
 function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal})
+    # Fixed structural lag windows reduce a numeric tuple. JAX reductions
+    # require an array; tuples of arrays have different Julia sum semantics.
+    if length(args) == 1 && _jax_numeric_tuple(args[1].T)
+        return _jax_result(sum, args, "jnp.sum(jnp.asarray(" * args[1].code * "))")
+    end
     if length(args) == 1 && !isempty(args[1].extent) && _jax_rank(args[1].T) == 1
         x = args[1]
         return _PyVal("jnp.sum(jnp.where(" * _jax_mask(x) * ", " * x.code * ", 0.0))", eltype(x.T))
