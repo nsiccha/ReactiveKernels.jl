@@ -6325,6 +6325,9 @@ function _lower_with_ops_collecting(p::Plan;
     # Compose before index runs duplicate a cell body into grouped/flat arms;
     # otherwise those mutually exclusive definitions appear to escape here.
     inline_embedded && (body = _lower_cell_arrays_native(body, runtime_recipes))
+    # Shared factors and terms leave a summed plate's sum (summed_plate_factors.jl)
+    # before index runs group the cells that remain.
+    inline_embedded && (body = _lower_summed_plate_factors_native(body, runtime_ops))
     inline_embedded && (body = _lower_index_runs_native(body, runtime_ops))
     # A partition with a plan port reads its integer bookkeeping from the
     # port's value, computed once per label; in plan mode the body computes
@@ -9012,6 +9015,17 @@ function. `simplify = false` compiles the literal arithmetic; `nothing` takes
 the setting of an enclosing preparation, else the project's ReactiveKernels
 preference `simplify` (`Preferences.set_preferences!(ReactiveKernels,
 "simplify" => false)`), else `true`. Cached preparations are kept per setting.
+
+The same setting takes shared work out of a summed plate. When a cell's value
+is `a + c * t`, with `a` and `c` reading only values its cells share, the cells
+sum `t` alone and the plate adds `n * a + c * sum(t)` once: a Normal
+observation plate with one scale sums its squared residuals and divides by the
+scale once, and its ordinary reverse no longer accumulates the scale's
+derivative cell by cell. A law's guard on a shared value (`scale == 0` before
+a cell's own test) is decided once per call. The plate's own loop runs instead
+whenever such a guard holds, a shared factor is not a normal number, or the
+factored sum is not finite, so every finite value and its derivatives agree
+with the plate's own to rounding.
 
 Selected authored plates with a single plate consumer are composed during
 lowering, eliminating the intermediate array. Named ports remain in `p`: asking

@@ -16,6 +16,29 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.186
+
+- A summed plate takes shared work out of its sum (with the stable rewrites,
+  `simplify = true`, the default). When a cell's value is `a + c * t`, with
+  `a` and `c` reading only values its cells share, the cells sum `t` alone and
+  the plate adds `n * a + c * sum(t)` once. A Normal observation plate with
+  one scale (`y .~ Normal.(mu, sigma)`) now sums `(y - mu)^2` per cell and
+  takes `-0.5 / sigma^2`, `log(sigma)` and `0.5 * log(2pi)` once per call;
+  before, each cell divided by `sigma`, tested `sigma == 0` twice and
+  subtracted the hoisted `log(sigma)`, and the ordinary reverse accumulated
+  `sigma`'s derivative cell by cell, a serial chain that kept the reverse
+  loop scalar (snag normal-plate-kee-8322185b). Laplace, Cauchy, logistic and
+  Student-t plates with a shared scale take their additive terms out the same
+  way; the Laplace scale leaves the sum too. Values and derivatives change in
+  their last bits. The plate's own loop still runs, and gives its own values,
+  when a law's guard on a shared value holds (`sigma == 0`), when a shared
+  factor is zero, subnormal or not finite (a scale below about 1e-154 or above
+  about 1e154), or when the factored sum is not finite (a residual above
+  about 1e154). Where the density itself is not finite, the derivatives can
+  differ: at a scale so small that a Cauchy cell's `z^2` overflows, the
+  scale's derivative is NaN instead of the plate's own `-n / sigma`.
+  `simplify = false` keeps the plate's own loop.
+
 ## 0.1.185
 
 - `jax_source`: a `for` loop to a padded row's length, such as
