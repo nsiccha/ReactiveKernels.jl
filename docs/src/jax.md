@@ -45,7 +45,7 @@ The [Eight-schools example](eight-schools.md) explains the model and coordinate 
 
 ## Helpers with loops and branches
 
-A helper that a recipe calls is translated from its source when the emitter has it. An `@traceable` helper records its own source: a `for` loop becomes `jax.lax.fori_loop`, an `if` becomes `jax.lax.cond`, and `A[i] = v` becomes `A.at[i].set(v)`. A plain helper is translated from its lowered code, which must be straight-line.
+A helper translates from recorded source when available: `@traceable` records it; `for` becomes `jax.lax.fori_loop`, `if` becomes `jax.lax.cond`, and `A[i] = v` becomes `A.at[i].set(v)`. Plain lowered helpers support straight-line code and terminal forward branches, including size guards. They can create immutable closures and fold fixed argument lists with `Base.afoldl`. Broadcasting `Ref(x)` passes `x` whole to each call. Captures remain runtime inputs; host `prepare_data` uses the same translation.
 
 A method that a package generates, such as one its macro writes into the caller's module, cannot carry `@traceable`. The generating package keeps the method's source as a `TraceableSource` (argument names, body, and the module whose globals the body reads) and hands it over through a provider. It registers the provider with `register_source_provider!`, once, from the `__init__` of the package extension that loads with ReactiveKernels. The emitter asks the provider for a call that has no other translation and no `@traceable` source, with the function and the `Tuple` type of the argument types. The provider answers `nothing` or the source of the method those arguments call natively.
 

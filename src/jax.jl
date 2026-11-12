@@ -60,6 +60,24 @@ struct _PyVal
     limit::String
     padded::Int
 end
+struct _JaxCallable{F}
+    f::F
+end
+# Values assembled while translating retain their fields as translated values,
+# not Julia exemplars. In particular, numeric closure captures remain inputs.
+struct _JaxClosure <: Function
+    F::Type
+    captures::Vector{_PyVal}
+end
+struct _JaxAggregate
+    T::Type
+    fields::Vector{_PyVal}
+end
+_jax_callable_type(f) = Core.Typeof(f)
+_jax_callable_type(f::_JaxClosure) = f.F
+_jax_argument_type(v::_PyVal) = v.T isa _JaxCallable ? _jax_callable_type(v.T.f) :
+    v.T isa _JaxAggregate ? v.T.T : v.T
+_jax_translation_only(v::_PyVal) = v.T isa Union{_JaxCallable,_JaxAggregate}
 _PyVal(code::AbstractString, @nospecialize(T)) = _PyVal(String(code), T, false, "", "", 0)
 _PyVal(code::AbstractString, @nospecialize(T), static::Bool) =
     _PyVal(String(code), T, static, "", "", 0)
@@ -312,7 +330,7 @@ end
 # type or callable value (`Val{2}` of a lowered literal power) exists only
 # while translating.
 function _jax_bind!(ctx::_JaxContext, hint, v::_PyVal)
-    (v.T isa _JaxCallable || occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", v.code)) && return v
+    (_jax_translation_only(v) || occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", v.code)) && return v
     name = _jax_fresh(ctx, hint)
     _jax_emit!(ctx, name * " = " * v.code)
     _PyVal(name, v.T, v.static, v.extent, v.limit, v.padded)
@@ -327,7 +345,7 @@ _jax_eltype(@nospecialize(T)) = T isa Type && T <: AbstractArray ? eltype(T) : T
 
 function _jax_return_type(f, argtypes)
     T = try
-        Core.Compiler.return_type(f, Tuple{argtypes...})
+        Core.Compiler.return_type(Tuple{_jax_callable_type(f), argtypes...})
     catch
         Any
     end
@@ -655,7 +673,7 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
         return _host_assign!(ctx, lhs, v)
     if lhs isa Symbol
         # A type or callable value exists only while translating.
-        v.T isa _JaxCallable && (ctx.locals[lhs] = v; return)
+        _jax_translation_only(v) && (ctx.locals[lhs] = v; return)
         name = _jax_fresh(ctx, lhs)
         _jax_emit!(ctx, name * " = " * v.code)
         ctx.locals[lhs] = _PyVal(name, v.T, v.static, v.extent, v.limit, v.padded)
@@ -2833,7 +2851,7 @@ _jax_type_of(v::_PyVal) = v.T isa _JaxCallable ? v.T.f : v.T
 _jax_call_positional(ctx::_JaxContext, ::typeof(eltype), args::Vector{_PyVal}) =
     _jax_type_value(eltype(_jax_type_of(only(args))))
 _jax_call_positional(ctx::_JaxContext, ::typeof(typeof), args::Vector{_PyVal}) =
-    _jax_type_value(only(args).T)
+    _jax_type_value(_jax_argument_type(only(args)))
 _jax_call_positional(ctx::_JaxContext, ::typeof(promote_type), args::Vector{_PyVal}) =
     _jax_type_value(promote_type(map(_jax_type_of, args)...))
 function _jax_call_positional(ctx::_JaxContext, f::Union{typeof(one),typeof(zero)},
@@ -2875,6 +2893,11 @@ end
 # A Julia type called as a function: a conversion.
 function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
     isempty(args) && Base.issingletontype(T) && return _PyVal("None", T)
+    if (T === Ref || T === Base.RefValue) && length(args) == 1
+        x = _jax_bind!(ctx, :referenced, only(args))
+        R = Base.RefValue{_jax_argument_type(x)}
+        return _PyVal("<ref>", _JaxAggregate(R, [x]), x.static)
+    end
     # `Val(:name)`, `Val(2)`: the singleton of a parameter known while emitting.
     T === Val && length(args) == 1 && return _PyVal("None", Val{_jax_static_parameter(ctx, only(args))})
     # A keyword call's arguments in lowered code, `NamedTuple{names}((a, b))`:
@@ -2938,21 +2961,35 @@ _jax_function_of(v::_PyVal) = v.T isa _JaxCallable ? v.T.f :
 # lower-rank array operand trailing singleton axes up to the result's rank.
 function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
     R = maximum((_jax_rank(a.T) for a in args); init = 0)
+    referenced = [a.T isa _JaxAggregate && a.T.T <: Ref for a in args]
+    values = [ref ? only(a.T.fields) : a for (a, ref) in zip(args, referenced)]
     # A numeric type broadcast over a value converts it, `Float64.(x)`.
-    if f isa Type && f <: Number && length(args) == 1
+    if f isa Type && f <: Number && length(args) == 1 && !any(referenced)
         x = only(args)
         return _PyVal("jnp.asarray(" * x.code * ", dtype=" * _jax_dtype(f) * ")",
                       R == 0 ? f : Array{f,R}, false, x.extent, "", _jax_padded_like(x))
     end
-    padded = map(args) do a
+    padded = map(values, referenced) do a, ref
         r = _jax_rank(a.T)
-        0 < r < R ? _PyVal(_py_atom(a.code) * "[" * join(fill("...", 1), "") *
+        !ref && 0 < r < R ? _PyVal(_py_atom(a.code) * "[" * join(fill("...", 1), "") *
                            repeat(", None", R - r) * "]", a.T) : a
     end
-    eltypes = Any[_jax_eltype(a.T) for a in args]
+    eltypes = Any[ref ? _jax_argument_type(a) : _jax_eltype(_jax_argument_type(a))
+                 for (a, ref) in zip(values, referenced)]
     E = _jax_return_type(f, eltypes)
     T = R == 0 ? E : Array{E,R}
-    scalars = [_PyVal(p.code, eltype_or_self(p.T)) for p in padded]
+    scalars = [ref || _jax_translation_only(p) ? p : _PyVal(p.code, eltype_or_self(p.T))
+               for (p, ref) in zip(padded, referenced)]
+    # Ref arguments are whole scalar objects even when their payload is an
+    # array. A captured callable and these objects live in the enclosing
+    # Python scope, so their values and padding metadata are not lost in a
+    # module-level helper or accidentally vectorized by NumPy/JAX.
+    if any(referenced) || f isa _JaxClosure || any(_jax_translation_only, scalars)
+        R == 0 && return _jax_call(ctx, f, scalars)
+        code, E = _jax_captured_broadcast(ctx, f, scalars, padded, referenced)
+        return _PyVal(code, Array{E,R}, false, _jax_extent(args), "",
+                      _jax_broadcast_padded(args, R))
+    end
     v = _jax_elementwise_call(ctx, f, scalars)
     v === nothing || return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args), "",
                                    _jax_broadcast_padded(args, R))
@@ -3001,6 +3038,34 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
         _host_dtype(E) * "])(" * _jax_args(padded) * ")", T)
     _PyVal("jnp.vectorize(" * name * ")(" * _jax_args(padded) * ")", T, false,
            R == 0 ? "" : _jax_extent(args), "", _jax_broadcast_padded(args, R))
+end
+
+function _jax_captured_broadcast(ctx::_JaxContext, f, scalars, padded, referenced)
+    excluded = referenced .| _jax_translation_only.(scalars)
+    outer = ctx.scope
+    inner = _JaxScope(outer)
+    inner.indent = outer.indent + 1
+    name = _jax_fresh(ctx, :elementwise)
+    params = [_jax_identifier(inner.used, Symbol(:element, k)) for k in findall(!, excluded)]
+    inputs = copy(scalars)
+    for (k, param) in zip(findall(!, excluded), params)
+        inputs[k] = _PyVal(param, scalars[k].T, ctx.host !== nothing)
+    end
+    saved = copy(ctx.locals)
+    ctx.scope = inner
+    v = try
+        _jax_call(ctx, f, inputs)
+    finally
+        ctx.scope = outer
+        empty!(ctx.locals); merge!(ctx.locals, saved)
+    end
+    push!(outer.lines, "    "^outer.indent * "def " * name * "(" * join(params, ", ") * "):")
+    append!(outer.lines, inner.lines)
+    push!(outer.lines, "    "^inner.indent * "return " * v.code)
+    union!(outer.used, inner.used)
+    vectorize = ctx.host === nothing ? "jnp.vectorize(" * name * ")" :
+        "np.vectorize(" * name * ", otypes=[" * _host_dtype(v.T) * "])"
+    vectorize * "(" * _jax_args(padded[.!excluded]) * ")", v.T
 end
 
 # A dotted literal power in lowered code, `broadcasted(literal_pow, ^, x,
@@ -3208,7 +3273,7 @@ end
 function _jax_traceable_call(ctx::_JaxContext, f, args::Vector{_PyVal})
     # A function passed as an argument dispatches on its own type (a stable
     # rewrite's `_rk_log_of(exp, x)` selects its `::typeof(exp)` method).
-    types = Any[a.T isa _JaxCallable ? Core.Typeof(a.T.f) : a.T for a in args]
+    types = Any[_jax_argument_type(a) for a in args]
     all(T -> T isa Type, types) || return nothing
     source = _traceable_source(typeof(f), types...)
     # A method a package generates: its source from a registered provider.
@@ -3234,14 +3299,15 @@ function _jax_static_parameters(body, statics)
 end
 
 # A plain Julia helper with no translation of its own: its lowered code, when
-# that is straight-line (calls, constants and locals; no loops or branches).
+# that is straight-line or has terminal forward branches. Loops and joins
+# still require recorded source, whose structured control flow is retained.
 const _JAX_LOWERING_STACK = Any[]
 
 function _jax_lowered_call(ctx::_JaxContext, f, args::Vector{_PyVal})
     f isa Function || return nothing
     # A function, type or module passed on as an argument (lowered code reads
     # globals as `_JaxCallable`s) dispatches on its own type.
-    types = Any[a.T isa _JaxCallable ? Core.Typeof(a.T.f) : a.T for a in args]
+    types = Any[_jax_argument_type(a) for a in args]
     all(T -> T isa Type, types) || return nothing
     key = (f, Tuple(types))
     key in _JAX_LOWERING_STACK && _jax_error("the function `", f, "` calls itself with argument ",
@@ -3255,26 +3321,41 @@ function _jax_lowered_call(ctx::_JaxContext, f, args::Vector{_PyVal})
     end
 end
 
+_jax_lowered_code(f, types) = Base.code_lowered(f, Tuple{types...})
+function _jax_lowered_code(f::_JaxClosure, types)
+    m = which(Tuple{f.F, types...})
+    Base.hasgenerator(m) && return Core.CodeInfo[]
+    [Base.uncompressed_ast(m)]
+end
+function _jax_call_positional(ctx::_JaxContext, f::_JaxClosure, args::Vector{_PyVal})
+    v = _jax_lowered_call(ctx, f, args)
+    v === nothing && _jax_error("the captured callable `", f.F, "` has no JAX translation",
+                               _jax_where(ctx))
+    v
+end
+
 function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types)
     infos = try
-        Base.code_lowered(f, Tuple{types...})
+        _jax_lowered_code(f, types)
     catch
         return nothing
     end
     length(infos) == 1 || return nothing
     ci = only(infos)
-    any(st -> st isa Core.GotoNode || st isa Core.GotoIfNot ||
-              (st isa Expr && st.head in (:enter, :leave, :pop_exception)), ci.code) &&
+    any(enumerate(ci.code)) do (i, st)
+        st isa Core.GotoNode || (st isa Core.GotoIfNot && st.dest <= i) ||
+            (st isa Expr && st.head in (:enter, :leave, :pop_exception))
+    end &&
         _jax_error("the function `", f, "` has loops or branches, so its lowered code is ",
                    "not translated", _jax_where(ctx), ". Define it with `@traceable` (its ",
                    "authored body is translated), author it as a kernel, or give it a ",
                    "`ReactiveKernels._jax_function_call` method; for a method ",
                    "a package generates, the package supplies its source with ",
                    "`ReactiveKernels.register_source_provider!`")
-    mod = parentmodule(f)
+    mod = parentmodule(_jax_callable_type(f))
     ssa = Vector{Any}(undef, length(ci.code))
     m = try
-        which(f, Tuple{types...})
+        which(Tuple{_jax_callable_type(f), types...})
     catch
         nothing
     end
@@ -3283,6 +3364,7 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
     # lowered `Core._apply_iterate`) passes them on as they came.
     nfixed = m !== nothing && m.isva ? Int(m.nargs) - 2 : length(args)
     slots = Dict{Int,_PyVal}(i + 1 => a for (i, a) in enumerate(args[1:nfixed]))
+    slots[1] = _PyVal("<callable>", _JaxCallable(f))
     splats = Dict{Int,Vector{_PyVal}}()
     fields = Dict{Int,Vector{_PyVal}}()
     if nfixed < length(args) || (m !== nothing && m.isva)
@@ -3296,7 +3378,7 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
     # The method's static parameters (`where T`), as the call's types bind them.
     sparams = try
         ccall(:jl_type_intersection_with_env, Any, (Any, Any),
-              Tuple{typeof(f), types...}, m.sig)[2]
+              Tuple{_jax_callable_type(f), types...}, m.sig)[2]
     catch
         Core.svec()
     end
@@ -3313,33 +3395,52 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
                                             _jax_where(ctx)) :
                                  _jax_error("an unassigned local in `", f, "`")) :
         x isa Core.Argument ? slots[x.n] :
-        x isa Expr && x.head === :new ? _jax_lowered_new(ctx, value(x.args[1]), length(x.args)) :
+        x isa Expr && x.head === :new ? _jax_lowered_new(ctx, value(x.args[1]),
+                                                       _PyVal[value(a) for a in x.args[2:end]]) :
         x isa GlobalRef ? _jax_global_value(ctx, getglobal(x.mod, x.name), x.name) :
         x isa QuoteNode ? _jax_global_value(ctx, x.value, :constant) :
         x isa Number ? _jax_literal(x) :
         _jax_global_value(ctx, x, :constant)
-    for (i, st) in enumerate(ci.code)
-        if st isa Core.ReturnNode
-            return st.val isa Core.SSAValue || st.val isa Core.SlotNumber ||
-                   st.val isa Core.Argument ? value(st.val) : value(st.val)
-        elseif st isa Expr && st.head === :(=)
-            v = value_of_rhs(ctx, st.args[2], value, mod, splats, fields)
-            id = (st.args[1]::Core.SlotNumber).id
-            slots[id] = v
-            delete!(splats, id)
-            ssa[i] = v
-        elseif st isa Expr && st.head === :call
-            ssa[i] = value_of_rhs(ctx, st, value, mod, splats, fields)
-            _jax_lowered_fields!(fields, i, st, value)
-        elseif st isa Expr && st.head in (:meta, :code_coverage_effect, :inbounds, :boundscheck)
-            ssa[i] = nothing
-        elseif st === nothing || st isa LineNumberNode
-            ssa[i] = nothing
-        else
-            ssa[i] = value(st)
+    function region(start)
+        for i in start:length(ci.code)
+            st = ci.code[i]
+            if st isa Core.ReturnNode
+                return isdefined(st, :val) ? value(st.val) : _PyVal("None", Union{}, true)
+            elseif st isa Core.GotoIfNot
+                # A terminal branch (for example a shape guard) has no loop or
+                # control-flow join. Translate each returning region under the
+                # ordinary source conditional, including its lazy error effects.
+                condition = value(st.cond)
+                saved_ssa, saved_slots = copy(ssa), copy(slots)
+                saved_splats, saved_fields = copy(splats), copy(fields)
+                arm(next) = () -> begin
+                    copyto!(ssa, saved_ssa)
+                    empty!(slots); merge!(slots, saved_slots)
+                    empty!(splats); merge!(splats, saved_splats)
+                    empty!(fields); merge!(fields, saved_fields)
+                    region(next)
+                end
+                return _jax_conditional(ctx, condition, arm(i + 1), arm(Int(st.dest)))
+            elseif st isa Expr && st.head === :(=)
+                v = value_of_rhs(ctx, st.args[2], value, mod, splats, fields)
+                id = (st.args[1]::Core.SlotNumber).id
+                slots[id] = v
+                delete!(splats, id)
+                ssa[i] = v
+            elseif st isa Expr && st.head === :call
+                ssa[i] = value_of_rhs(ctx, st, value, mod, splats, fields)
+                _jax_lowered_fields!(fields, i, st, value)
+            elseif st isa Expr && st.head in (:meta, :code_coverage_effect, :inbounds, :boundscheck)
+                ssa[i] = nothing
+            elseif st === nothing || st isa LineNumberNode || st isa Core.NewvarNode
+                ssa[i] = nothing
+            else
+                ssa[i] = value(st)
+            end
         end
+        _jax_error("the lowered code of `", f, "` does not return", _jax_where(ctx))
     end
-    _jax_error("the lowered code of `", f, "` does not return", _jax_where(ctx))
+    region(1)
 end
 function value_of_rhs(ctx::_JaxContext, rhs, value, mod, splats = Dict{Int,Vector{_PyVal}}(),
                       fields = Dict{Int,Vector{_PyVal}}())
@@ -3400,6 +3501,10 @@ function _jax_lowered_splat(ctx::_JaxContext, args, value, splats)
             continue
         end
         v = value(x)
+        if v.T isa _JaxAggregate && v.T.T <: Tuple
+            append!(elements, v.T.fields)
+            continue
+        end
         v.T isa Type && v.T <: Tuple && _jax_is_tuple(v.T) ||
             _jax_error("splatting a `", v.T, "` has no JAX translation", _jax_where(ctx))
         for k in 1:fieldcount(v.T)
@@ -3408,21 +3513,19 @@ function _jax_lowered_splat(ctx::_JaxContext, args, value, splats)
     end
     _jax_call(ctx, g, elements)
 end
-# `%new(T)` of a function without captures (an anonymous `(i, j) -> i` passed
-# on): its type carries it.
-function _jax_lowered_new(ctx::_JaxContext, T::_PyVal, nargs::Int)
+# `%new(T, captures...)` retains the translated captures. No example values
+# are constructed, and no captured numerical value is specialized into source.
+function _jax_lowered_new(ctx::_JaxContext, T::_PyVal, captures::Vector{_PyVal})
     F = T.T isa _JaxCallable ? T.T.f : nothing
-    F isa Type && F <: Function && Base.issingletontype(F) && nargs == 1 ||
+    F isa DataType && F <: Function && !ismutabletype(F) && fieldcount(F) == length(captures) ||
         _jax_error("constructing a `", F, "` in lowered code has no JAX translation",
                    _jax_where(ctx))
-    _PyVal("None", F, true)
+    isempty(captures) && Base.issingletontype(F) && return _PyVal("None", F, true)
+    _PyVal("<closure>", _JaxCallable(_JaxClosure(F, captures)), false)
 end
 # A global read in lowered code: callables pass as themselves, data as values.
 _jax_global_value(ctx::_JaxContext, x, hint) = x isa Union{Function,Type,PreparedKernel,Module} ?
     _PyVal("<callable>", _JaxCallable{typeof(x)}(x)) : _jax_value(ctx, x, hint)
-struct _JaxCallable{F}
-    f::F
-end
 _jax_callable(v::_PyVal) = v.T isa _JaxCallable ? v.T.f :
     _jax_error("`", v.code, "` is called but is not a callable")
 
@@ -3431,9 +3534,21 @@ _jax_callable(v::_PyVal) = v.T isa _JaxCallable ? v.T.f :
 _jax_call_positional(ctx::_JaxContext, ::typeof(Base.broadcasted), args::Vector{_PyVal}) =
     _jax_broadcast(ctx, _jax_function_of(args[1]), args[2:end])
 _jax_call_positional(ctx::_JaxContext, ::typeof(Base.materialize), args::Vector{_PyVal}) = only(args)
-_jax_call_positional(ctx::_JaxContext, ::typeof(tuple), args::Vector{_PyVal}) =
-    _PyVal(_jax_tuple_code(args), Tuple{(a.T for a in args)...}, all(a -> a.static, args),
+# `afoldl` folds the fixed argument list, not an array's data-derived length.
+# Each call still goes through the scalar/source/lowered translation machinery.
+function _jax_call_positional(ctx::_JaxContext, ::typeof(Base.afoldl), args::Vector{_PyVal})
+    f = _jax_function_of(args[1])
+    foldl(args[3:end]; init = args[2]) do acc, x
+        _jax_call(ctx, f, [acc, x])
+    end
+end
+function _jax_call_positional(ctx::_JaxContext, ::typeof(tuple), args::Vector{_PyVal})
+    T = Tuple{(_jax_argument_type(a) for a in args)...}
+    any(_jax_translation_only, args) &&
+        return _PyVal("<tuple>", _JaxAggregate(T, args), all(a -> a.static, args))
+    _PyVal(_jax_tuple_code(args), T, all(a -> a.static, args),
            _jax_tuple_extent(args), _jax_tuple_limit(args))
+end
 # A shape tuple may carry a padded vector's length through a local or helper.
 # Its bound refers to the padded input shape, not an observed length literal.
 _jax_tuple_limit(args) = any(a -> !isempty(a.limit), args) &&
@@ -3484,6 +3599,7 @@ function _jax_tuple_element(ctx::_JaxContext, x::_PyVal, i::_PyVal)
     m = match(r"^[0-9]+$", i.code)
     m === nothing && _jax_error("a tuple read at a computed index", _jax_where(ctx))
     k = parse(Int, i.code)
+    x.T isa _JaxAggregate && return x.T.fields[k]
     _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", fieldtype(x.T, k), x.static)
 end
 _jax_is_tuple(@nospecialize(T)) = T isa Type && T <: Union{Tuple,NamedTuple} && isconcretetype(T)
@@ -3493,6 +3609,18 @@ function _jax_call_positional(ctx::_JaxContext,
         f::Union{typeof(getindex),typeof(getfield),typeof(view),typeof(Base.maybeview)},
         args::Vector{_PyVal})
     x = args[1]
+    if x.T isa _JaxCallable && x.T.f isa _JaxClosure && f === getfield
+        closure = x.T.f
+        field = args[2]
+        k = field.T === Symbol ? findfirst(==(_jax_static_symbol(ctx, field)), fieldnames(closure.F)) :
+            _jax_int_literal(field) ? parse(Int, field.code) : nothing
+        k === nothing && _jax_error("a closure field not known while emitting", _jax_where(ctx))
+        return closure.captures[k]
+    end
+    if x.T isa _JaxAggregate
+        x.T.T <: Tuple && length(args) == 2 && return _jax_tuple_element(ctx, x, args[2])
+        x.T.T <: Ref && f === getindex && length(args) == 1 && return only(x.T.fields)
+    end
     _jax_is_tuple(x.T) && length(args) >= 2 && return _jax_tuple_element(ctx, x, args[2])
     f !== getfield && _jax_is_array(x.T) && return _jax_index_values(ctx, x, args[2:end])
     _jax_function_call(ctx, f, args)
@@ -3524,6 +3652,7 @@ end
 # or an integer literal.
 function _jax_static_parameter(ctx::_JaxContext, a::_PyVal)
     a.T isa _JaxCallable && return a.T.f
+    a.T isa Type && a.T <: Function && Base.issingletontype(a.T) && return a.T.instance
     a.T === Symbol && return _jax_static_symbol(ctx, a)
     if a.static && a.T isa Type && a.T <: Tuple{Vararg{Symbol}}
         ex = Meta.parse(a.code)
@@ -4836,6 +4965,8 @@ end
 # A returned named tuple is a `dict` keyed by its field names.
 function _jax_returned(ctx::_JaxContext, v::_PyVal)
     v.T === Union{} && return v # an unconditional diagnostic has no returned fields
+    _jax_translation_only(v) && _jax_error("returning a callable or reference as a module output ",
+                                          "has no JAX translation", _jax_where(ctx))
     v.T isa Type && v.T <: NamedTuple && fieldcount(v.T) > 0 || return v
     bound = _jax_bind!(ctx, :result, v)
     names = fieldnames(v.T)

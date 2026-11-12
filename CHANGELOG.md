@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.176
+
+- `jax_source` translates immutable closures created inside plain helpers,
+  fixed-argument `Base.afoldl`, terminal forward guards, and scalar `Ref(x)`
+  broadcasting. Captured numerical values remain runtime inputs; array Ref
+  payloads remain whole objects. The same implementation serves JAX and host
+  `prepare_data`, retaining authored size checks and ordinary differentiation.
+
 ## 0.1.175
 
 - `jax_source` preserves `Float32` in typed allocations, array literals and

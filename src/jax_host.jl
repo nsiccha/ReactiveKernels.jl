@@ -162,7 +162,7 @@ function _host_one_call(code::AbstractString)
 end
 
 function _host_bind!(ctx::_JaxContext, lhs::Symbol, v::_PyVal)
-    v.T isa _JaxCallable && (ctx.locals[lhs] = v; return)
+    _jax_translation_only(v) && (ctx.locals[lhs] = v; return)
     v.T === Union{} && return
     h = ctx.host
     name = _host_name!(ctx, lhs)
@@ -299,7 +299,7 @@ function _host_prepare!(ctx::_JaxContext, bodies; conditional::Bool = false)
     for s in sort!(collect(union(assigned, written)))
         if haskey(ctx.locals, s)
             v = ctx.locals[s]
-            v.T isa _JaxCallable && continue
+            _jax_translation_only(v) && continue
             if s in nested
                 _host_own_deep!(ctx, s)
             elseif s in written && !(v.T isa Type && v.T <: AbstractDict)
