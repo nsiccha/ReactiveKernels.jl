@@ -16,6 +16,71 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.202
+
+- `jax_source` generates scalar derivative-rule adapters from the same
+  activity-selected mathematical graph as native AD. Joint cuts and repeated
+  calls share their emitted helpers; inactive partials are not contracted.
+- Add the shared incomplete-beta fraction value/partials graph used by
+  distribution tails. First-order native and JAX gradients retain its partials
+  instead of a reverse tape of 300 fraction iterations.
+
+## 0.1.201
+
+- `jax_source(...; data, definitions, definitions_module = Main)`: the
+  definitions' globals, such as a call head `plate`, resolve in
+  `definitions_module`. A binder passes the module it evaluates its
+  definitions in, so the module it emits no longer depends on what the caller
+  imported. Before, they always resolved in `Main`, so a definition calling a
+  function the caller's `Main` did not see stayed a `prepare_data` input
+  (`UNTRANSLATED`: "`f` is not defined in module `Main`"), and one `Main`
+  defined differently was translated as that function. The default keeps the
+  previous behaviour for direct callers.
+
+## 0.1.200
+
+- Summed-plate factoring also recognizes the direct array reads introduced
+  in 0.1.194. In 0.1.196 only the broadcast-read loop was factored, so a
+  shared-scale Normal plate with matching array axes retained its per-cell
+  scale arithmetic, and a plate over one array was never factored. Both
+  direct and broadcast-read loops now take their shared factors and terms
+  out of the sum, with the same guarded fallback and ordinary reverse.
+
+## 0.1.199
+
+- `jax_source` combines a plate's runtime validity checks across its active
+  lanes, including nested plates, before calling the host. Previously JAX
+  scheduled one callback per cell, which dominated the hidden-Markov model's
+  emission calculation. Inactive and padded lanes are masked, and an
+  active invalid value still raises the check's error.
+- A history scan whose reads have a provable bounded lag carries a rolling
+  buffer and lets `lax.scan` stack its outputs separately. This includes
+  previous-row recurrences with a data-sized row width, such as the HMM
+  forward pass. This bounds the primal history carry; gradients of shared
+  arrays can still carry full-sized buffers. Unknown history accesses keep
+  the full buffer; seeds and reads of unwritten entries keep their values.
+  Empty history scans skip their body, including its indexed reads.
+  Prepared integer bounds survive history-index tracking, so scanned ranges
+  can also bound nested loops.
+
+## 0.1.198
+
+- `jax_source` host preparation keeps helper function and type arguments in
+  the translator instead of emitting them as invalid Python literals. This
+  fixes data-only expressions such as `1 / sqrt(exp(x))`, including when `x`
+  comes from a scan. Nested helpers retain their callable identities; closure
+  captures and aggregate fields that hold numerical values remain runtime
+  arguments. Native arithmetic and data-dependent iteration are unchanged.
+
+## 0.1.197
+
+- Strict plate-cell queries recognize ordinary array addition and subtraction
+  through transparent helper functions on Julia 1.13. The row analysis follows
+  a constant function binding loaded into a separate lowered-code statement,
+  restoring helpers such as `add_arrays(a, b) = a + b`. Full-array shape checks,
+  custom dispatch checks, and rejection of mutable bindings or extra helper
+  work remain in effect.
+
 ## 0.1.196
 
 - A summed plate takes shared work out of its sum (with the stable rewrites,

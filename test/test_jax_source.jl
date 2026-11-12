@@ -1653,6 +1653,41 @@ end
     end
 end
 
+# A definition's globals resolve in `definitions_module`, by default `Main`: a
+# binder passes the module it evaluates its definitions in, so what it emits
+# does not depend on the caller's imports (snag jax-source-stand-a5129478:
+# RKPPL's `plate(...) do ... end` step counts were untranslated unless the
+# caller's Main had `using ReactiveKernels`).
+module JaxDefinitionScope
+jax_scope_mean(v) = sum(v) / length(v)
+end
+@testset "jax_source: definitions resolve their globals in definitions_module" begin
+    x = [0.3, 1.1, 2.4, 0.8, 4.1]
+    g = [3.0, 1.0, 2.0, 3.0, 1.0]
+    levels = [1.0, 2.0, 3.0]
+    have = (:theta, :x, :xm, :pos)
+    data = (; x, xm = jax_kspec_mean(x), pos = jax_kspec_positions(g, levels), g, levels)
+    definitions = [:xm => :(jax_scope_mean(x)), :pos => :($jax_kspec_positions(g, levels))]
+    @test !isdefined(Main, :jax_scope_mean)
+    unscoped = jax_source(jax_kspec_model; have, want = :total, data, definitions)
+    @test occursin("UNTRANSLATED = {\"xm\": \"`jax_scope_mean` is not defined in module `Main`",
+                   string(unscoped))
+    src = jax_source(jax_kspec_model; have, want = :total, data, definitions,
+                     definitions_module = JaxDefinitionScope)
+    @test occursin("UNTRANSLATED = {}", string(src))
+    @test Set(first.(src.functions[1].inputs)) == Set(["x", "g", "levels"])
+    if !rk_jax_available()
+        @test_skip false
+    else
+        native = prepare(jax_kspec_model; have, want = :total)
+        theta = [0.6, 0.2, -0.4, 0.7]
+        reference = native(theta, x, JaxDefinitionScope.jax_scope_mean(x),
+                           jax_kspec_positions(g, levels))
+        @test rk_jax_evaluate(src, "kernel", (theta, x, g, levels); prepare = true).value ≈
+              reference rtol = 1e-12
+    end
+end
+
 @testset "jax_source: sort, unique and searchsorted in prepare_data" begin
     x = [0.5, 0.5, 2.0, 1.0, 1.0, 0.5]
     extra = [3.0, 1.0]

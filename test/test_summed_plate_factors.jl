@@ -22,6 +22,13 @@ const RK = ReactiveKernels
     total::Float64 = sum(lp)
     return total
 end
+@kernel scalar_location_normal(y::Vector{Float64}, mu::Float64, sigma::Float64) = begin
+    lp = plate(y) do yi
+        normal(mu, sigma).logpdf(yi)
+    end
+    total::Float64 = sum(lp)
+    return total
+end
 @kernel shared_laplace(y::Vector{Float64}, mu::Vector{Float64}, sigma::Float64) = begin
     lp = plate(y, mu) do yi, mi
         laplace(mi, sigma).logpdf(yi)
@@ -135,6 +142,30 @@ const MU = [0.1, 0.0, 0.9, 2.0, -0.5, 0.7, -0.3]
     # cell adds, and the scale enters once.
     code = _code(prepare(shared_normal))
     @test occursin(r"factored_term\" = \(var\"[^\"]*factored_read_1\" - var\"[^\"]*factored_read_2\"\) \^ 2", code)
+end
+
+@testset "direct reads and broadcast extrusion both factor" begin
+    k = prepare(scalar_location_normal)
+    literal = prepare(scalar_location_normal; simplify = false)
+    @test _factored(k)
+    @test _loops(k.ast) == 2 * _loops(literal.ast)
+    for y in (Y, Float64[])
+        @test k(y, 0.2, 0.7) ≈ literal(y, 0.2, 0.7) rtol = 1e-14
+        g = Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(k), Enzyme.Active,
+            Enzyme.Const(y), Enzyme.Active(0.2), Enzyme.Active(0.7))[1]
+        gl = Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(literal), Enzyme.Active,
+            Enzyme.Const(y), Enzyme.Active(0.2), Enzyme.Active(0.7))[1]
+        @test g[2] ≈ gl[2] rtol = 1e-13
+        @test g[3] ≈ gl[3] rtol = 1e-13
+    end
+    k, literal = prepare(shared_normal), prepare(shared_normal; simplify = false)
+    @test _loops(k.ast) == 2 * _loops(literal.ast)
+    for mu in (MU, [0.2])
+        @test k(Y, mu, 0.7) ≈ literal(Y, mu, 0.7) rtol = 1e-14
+        g, gl = _gradient(k, Y, mu, 0.7), _gradient(literal, Y, mu, 0.7)
+        @test g[1] ≈ gl[1] rtol = 1e-13
+        @test g[2] ≈ gl[2] rtol = 1e-13
+    end
 end
 
 @testset "nothing to take out keeps the plate's loop" begin
