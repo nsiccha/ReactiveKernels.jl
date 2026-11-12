@@ -281,9 +281,11 @@ function _cell_array_lane_reads(fn, x, names)
     free(args) = all(a -> !_cell_array_has(a, names), args)
     if fn === _authored_plate_is_axis || fn === _plate_unconditional_root
         return length(x.args) == 2 && named(x.args[2])
-    elseif fn === _plate_dependency_changed || fn === _plate_total_seed
+    elseif fn === _plate_dependency_changed || fn === _plate_total_seed ||
+            fn === _plate_spans_axis
         return length(x.args) >= 3 && named(last(x.args)) && free(x.args[2:end-1])
-    elseif fn === Base.Broadcast._broadcast_getindex || fn === _cell_array_gather
+    elseif fn === Base.Broadcast._broadcast_getindex || fn === _plate_read ||
+            fn === _cell_array_gather
         # A gather of a composed value is its indexing (`_cell_array_select`).
         return length(x.args) >= 3 && named(x.args[2]) && free(x.args[3:end])
     end

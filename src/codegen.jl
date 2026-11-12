@@ -422,6 +422,22 @@ end
     output_axes
 end
 
+# Whether a plate's cells can read the batched argument `arg` (its
+# `Base.broadcastable` value) at their own coordinates: an array with exactly
+# the plate's axes, which broadcasting never extrudes. Anything else, a
+# `Broadcasted` or a tuple included, keeps its broadcast read
+# (`_plate_direct_read_loop`).
+@inline _plate_spans_axis(output_axes, arg::AbstractArray) = axes(arg) == output_axes
+@inline _plate_spans_axis(output_axes, arg) = false
+
+# A cell's read of such an array: its entry at the cell's own coordinate.
+# Base's `_broadcast_getindex` of an array is `A[newindex(A, I)]`, which still
+# tests every axis for length one at each read, so it is not this read.
+Base.@propagate_inbounds _plate_read(arg::AbstractArray, index) = arg[index]
+# Never reached: `_plate_spans_axis` is `false` for anything else.
+Base.@propagate_inbounds _plate_read(arg, index) =
+    Base.Broadcast._broadcast_getindex(arg, index)
+
 # Base's `combine_axes(a1, a2, …)` for a lowered plate's batched operands. The
 # lowered body reads each operand's `axes` and passes only those integer axis
 # tuples to `_plate_broadcast_shape`, which folds them exactly as Base does.
@@ -4638,9 +4654,10 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     # before an embedded kernel renames locals: late macro expansion can
     # interpret its renamed index as a module global.
     # A cell that fills lane slots carries state from one cell to the next.
-    if accumulator !== nothing && pointwise_lhs === nothing && total_fold === sum &&
-            !has_scheduled_groups && nested === nothing && isempty(released) &&
-            all(r -> !r.effectful, inner.recipes)
+    summed = accumulator !== nothing && pointwise_lhs === nothing && total_fold === sum &&
+        !has_scheduled_groups && nested === nothing && isempty(released) &&
+        all(r -> !r.effectful, inner.recipes)
+    if summed
         linear = gensym(:plate_linear)
         simd_body = Expr(:block,
             Expr(:(=), index, Expr(:call, GlobalRef(Base, :CartesianIndex), linear)),
@@ -4679,6 +4696,28 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
                        for input in recipe.inputs]
             lower_recipe!(block, recipe_index, args, out,
                 Expr(:ref, _CALLABLES_ARG, op_offset + recipe_index), true)
+        end
+        # A loop of cell arithmetic reads its batched arrays directly when
+        # they have the plate's axes (`_plate_direct_read_loop`). Only a summed
+        # loop, whose reverse is the one that does not vectorize, gets a
+        # second, direct-read copy; any loop over one batched argument reads it
+        # directly in its one loop. A cell with a nested plate or a scan would
+        # be compiled twice for little: its loop does not vectorize. A loop
+        # carrying lane slots, cell tables, shared call tables or scheduled
+        # groups from cell to cell keeps one loop, as does a scheduled prefix.
+        # The generated plate reverse (`plate_reverse.jl`) differentiates the
+        # loop as it is.
+        direct_reads = !parallel_cells && nested === nothing && cell === nothing &&
+            !has_scheduled_groups && isempty(slotted) && isempty(table_entries) &&
+            isempty(shares) && !any(r -> r.op isa _AuthoredScanOp, inner.recipes) &&
+            !_plate_reverse_enabled()
+        if reduction === nothing && !batched && direct_reads
+            shared_names = _mentioned_symbols!(Set{Symbol}(), Expr(:block, declarations...))
+            for name in (accumulator, pointwise_lhs, total_lhs)
+                name isa Symbol && push!(shared_names, name)
+            end
+            cell_loop = _plate_direct_read_loop(cell_loop, raw_arguments,
+                prepared_arguments, callvalues, output_axes, shared_names; copy = summed)
         end
         if reduction === nothing
             push!(execution.args, batched ? _lower_plate_batched_native(batch, inner, locals,
@@ -4733,6 +4772,84 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     total_lhs === nothing || push!(body.args, :($total_lhs =
         $(GlobalRef(@__MODULE__, :_plate_total_value))($accumulator)))
     body
+end
+
+# The cell loop, with each batched array it reads through broadcast extrusion
+# read directly instead whenever every one of them has exactly the plate's
+# axes, which the plate checks once per call; any other call runs the loop
+# as it is. A cell reads an extruded argument (`Broadcast.preprocess`) with
+# `_broadcast_getindex`, which selects, per dimension and at every read,
+# coordinate `i` or the argument's single entry. LLVM unswitches that select
+# out of the primal loop, but native Enzyme's reverse loop keeps it in the
+# address of every shadow load and store, and a store that may hit one entry
+# in every iteration does not vectorize: a Normal regression plate's gradient
+# took 2.4 times a hand loop's, and reading both arrays directly made it the
+# hand loop's (snag plate-reverse-lo-31fd6869). The copy reads the
+# `Base.broadcastable` value itself with `_plate_read`, its `getindex`. It
+# assumes no shape: a call or a rebinding whose arrays do not span the plate
+# takes the loop as it is. A tuple is never extruded and keeps its read. A
+# plate with one batched argument has that argument's axes, so its one loop
+# reads it directly, with no check and no copy.
+#
+# The copy names its own locals (`_plate_direct_local`): a name assigned in
+# both copies would no longer be a definition the stable rewrites read
+# through (`_rw_count!`). `shared` names what the loop assigns for code
+# outside it (its running total, the pointwise buffer, flags declared above
+# it); the copy keeps those.
+function _plate_direct_read_loop(cell_loop, raw_arguments, prepared_arguments,
+                                 callvalues, output_axes, shared; copy::Bool = true)
+    mapping = Dict{Symbol,Symbol}()
+    for name in _local_symbols!(Set{Symbol}(), cell_loop)
+        name in shared || !_lowering_gensym(name) ||
+            (mapping[name] = _plate_direct_local(name))
+    end
+    checks = Any[]
+    for (position, prepared) in enumerate(prepared_arguments)
+        prepared === nothing && continue
+        valtype(callvalues[position]) <: Tuple && continue
+        _mentions_symbol(cell_loop, prepared) || continue
+        mapping[prepared] = raw_arguments[position]
+        # One call per argument, never one call over all of them: a call
+        # splatting many arrays becomes a dynamic `_apply_iterate` that native
+        # Reverse rejects (`_plate_combined_axes_expr`).
+        push!(checks, Expr(:call, GlobalRef(@__MODULE__, :_plate_spans_axis),
+                           output_axes, raw_arguments[position]))
+    end
+    isempty(checks) && return cell_loop
+    direct = Set{Symbol}(raw for (prepared, raw) in mapping if prepared in prepared_arguments)
+    # One batched argument: the plate's axes are its own, so broadcasting never
+    # extrudes it, and the one loop reads it directly with no check.
+    if count(!isnothing, raw_arguments) == 1
+        reads = Dict{Symbol,Symbol}(prepared => raw for (prepared, raw) in mapping
+                                    if prepared in prepared_arguments)
+        return _plate_direct_reads(_substitute_symbols(cell_loop, reads), direct)
+    end
+    copy || return cell_loop
+    spans = foldl((left, right) -> Expr(:&&, left, right), checks)
+    Expr(:if, spans,
+         Expr(:block, _plate_direct_reads(_substitute_symbols(cell_loop, mapping), direct)),
+         Expr(:block, cell_loop))
+end
+
+# `node` with each cell read `_broadcast_getindex(arg, index)` of an argument
+# in `direct` read with `_plate_read` instead.
+function _plate_direct_reads(node, direct::Set{Symbol})
+    node isa Expr && node.head !== :quote || return node
+    if node.head === :call && length(node.args) == 3 &&
+            node.args[1] == GlobalRef(Base.Broadcast, :_broadcast_getindex) &&
+            node.args[2] isa Symbol && node.args[2] in direct
+        return Expr(:call, GlobalRef(@__MODULE__, :_plate_read), node.args[2], node.args[3])
+    end
+    Expr(node.head, Any[_plate_direct_reads(arg, direct) for arg in node.args]...)
+end
+
+# A generated local's name in the direct copy. An inline statement's local
+# keeps the recipe position it was named from (`_inline_local_parts`), which
+# the passes read; a `#` keeps either apart from every authored identifier.
+function _plate_direct_local(name::Symbol)
+    parts = _inline_local_parts(name)
+    parts === nothing ? Symbol(name, "#direct") :
+        Symbol(first(parts), "#direct#op", last(parts))
 end
 
 # A plate cell lowers as its plate over the one-cell slices of the plate's
@@ -5577,6 +5694,17 @@ _substitute_symbols(node::Symbol, mapping) = get(mapping, node, node)
 _substitute_symbols(node::Expr, mapping) = node.head === :quote ? node :
     Expr(node.head, Any[_substitute_symbols(arg, mapping) for arg in node.args]...)
 _substitute_symbols(node, mapping) = node
+_mentions_symbol(node::Symbol, name::Symbol) = node === name
+_mentions_symbol(node::Expr, name::Symbol) =
+    node.head !== :quote && any(arg -> _mentions_symbol(arg, name), node.args)
+_mentions_symbol(node, name::Symbol) = false
+_mentioned_symbols!(found::Set{Symbol}, node::Symbol) = push!(found, node)
+function _mentioned_symbols!(found::Set{Symbol}, node::Expr)
+    node.head === :quote && return found
+    foreach(arg -> _mentioned_symbols!(found, arg), node.args)
+    found
+end
+_mentioned_symbols!(found::Set{Symbol}, node) = found
 
 _has_plate_programs(node) = node isa _PlateProgram ||
     node isa Expr && node.head !== :quote && any(_has_plate_programs, node.args)
