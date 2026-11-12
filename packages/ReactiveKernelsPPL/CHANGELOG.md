@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.163
+
+- Require ReactiveKernels 0.1.194 and ReactiveKernelsDistributionKernels 0.1.7
+  for the shared incomplete-beta value/partials graph. Censored Student-t JAX
+  gradients use the generated scalar rule instead of reversing 300 fraction
+  iterations.
+
 ## 0.1.162
 
 - A density catalogue (`density_factors`) keeps an elementwise site as a plate

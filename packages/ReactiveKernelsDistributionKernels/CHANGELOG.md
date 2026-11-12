@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.7
+
+- Incomplete-beta and Student-t tails use ReactiveKernels' shared fraction
+  value/partials graph. Reflection selects the fraction's arguments before
+  its call, so batched JAX gradients avoid two reflected fraction evaluations
+  and a reverse tape over the iterations. Endpoint guards remain lazy.
+  Requires ReactiveKernels 0.1.194.
+
 ## 0.1.6
 
 - Add `icar_rows_logdensity(phi, node1, node2)` and

@@ -9,8 +9,8 @@
 # arms. Nothing is unrolled per element (`CONTRIBUTING.md`, "Preserve
 # data-dependent iteration"), and sizes are read from the inputs, so one
 # emitted module serves every data size of the same program. Gradients are
-# `jax.grad` of the emitted primal; derivative rules contribute only their
-# primal cut. Construct the emitter cannot translate raises a
+# `jax.grad` of the emitted callable; scalar derivative rules contribute
+# activity-selected cuts of their mathematical graph. A construct the emitter cannot translate raises a
 # `JAXEmissionError` naming the recipe and the construct.
 #
 # Conventions. Arrays keep Julia's dimension order (a Julia `n × p` matrix is
@@ -3853,20 +3853,25 @@ function _jax_unpack_captures(body, environment::Symbol, captures)
 end
 _jax_op_body(f) = _jax_error("an embedded operation `", typeof(f), "` without its source")
 
-# A derivative rule called as a function: its primal cut, which `jax.grad`
-# differentiates; the rule's partials are not needed.
+# Scalar rules retain their mathematical derivative authority in JAX. The
+# adapter contains only activity selection and the scalar chain rule.
 _jax_call_positional(ctx::_JaxContext,
         rule::ScalarDerivativeRule{Name,N,Inputs,Primal}, args::Vector{_PyVal}) where {Name,N,Inputs,Primal} =
-    _jax_rule_primal(ctx, rule, Primal, args)
+    _jax_scalar_rule(ctx, rule, args)
 _jax_call_positional(ctx::_JaxContext,
         rule::DerivativeRule{Name,N,Inputs,Primal}, args::Vector{_PyVal}) where {Name,N,Inputs,Primal} =
     _jax_rule_primal(ctx, rule, Primal, args)
 
 function _jax_rule_primal(ctx::_JaxContext, rule, Primal, args::Vector{_PyVal})
-    signature, steps, ret = Primal
+    value = _jax_rule_body(ctx, Primal, rule.primal_ops, args)
+    _PyVal(value.code, _jax_return_type(rule, Any[a.T for a in args]))
+end
+
+function _jax_rule_body(ctx::_JaxContext, spec, ops, args::Vector{_PyVal})
+    signature, steps, ret = spec
     env = Dict{Symbol,_PyVal}(zip(signature, args))
     for (output, index, arguments) in steps
-        op = rule.primal_ops[index]
+        op = ops[index]
         inputs = _PyVal[a isa Symbol ? env[a] : _jax_literal(a) for a in arguments]
         v = _jax_call(ctx, op, inputs)
         if output isa Symbol
@@ -3879,9 +3884,83 @@ function _jax_rule_primal(ctx::_JaxContext, rule, Primal, args::Vector{_PyVal})
             end
         end
     end
-    T = _jax_return_type(rule, Any[a.T for a in args])
-    ret isa Symbol ? _PyVal(env[ret].code, T) :
-        _PyVal(_jax_tuple_code([env[r] for r in ret]), T)
+    ret isa Symbol && return env[ret]
+    values = _PyVal[env[r] for r in ret]
+    _PyVal(_jax_tuple_code(values), Tuple{(v.T for v in values)...})
+end
+
+function _jax_rule_function!(ctx, name, spec, ops, types)
+    scope = _JaxScope()
+    params = [_jax_identifier(scope.used, Symbol(:x, i)) for i in eachindex(types)]
+    inner = _JaxContext(ctx.mod, scope, ctx.recipe, ctx.source_module,
+                        Dict{Symbol,_PyVal}(), nothing)
+    result = _jax_rule_body(inner, spec, ops,
+                           [_PyVal(p, T) for (p, T) in zip(params, types)])
+    lines = ["def " * name * "(" * join(params, ", ") * "):"]
+    append!(lines, scope.lines)
+    push!(lines, "    return " * result.code)
+    join(lines, "\n")
+end
+
+function _jax_scalar_rule(ctx::_JaxContext,
+        rule::ScalarDerivativeRule{Name,N,Inputs,Primal,Cuts},
+        args::Vector{_PyVal}) where {Name,N,Inputs,Primal,Cuts}
+    # Data preparation and literal/shape expressions need ordinary host values.
+    (ctx.host !== nothing || all(a -> a.static, args)) &&
+        return _jax_rule_primal(ctx, rule, Primal, args)
+    types = Tuple(a.T for a in args)
+    key = (:scalar_rule, objectid(rule), types)
+    name = get(ctx.mod.helper_names, key, nothing)
+    if name === nothing
+        name = _jax_private_identifier(ctx.mod.used, Symbol("_rk_", Name))
+        ctx.mod.helper_names[key] = name
+        primal = _jax_rule_function!(ctx, name, Primal, rule.primal_ops, types)
+        push!(ctx.mod.helpers, "@jax.custom_jvp\n" * primal)
+
+        # Joint recipes often serve several activity masks. Emit their body
+        # once, with the union of its requested outputs; each mask selects
+        # only its own partials. No numerical algorithm lives in this adapter.
+        groups = Dict{Any,Vector{Int}}()
+        for mask in eachindex(Cuts)
+            signature, steps, _ = Cuts[mask]
+            push!(get!(() -> Int[], groups,
+                       (signature, steps, rule.cut_ops[mask])), mask)
+        end
+        calls = Dict{Int,Tuple{String,Vector{Symbol}}}()
+        for masks in sort!(collect(values(groups)); by = first)
+            mask = first(masks)
+            outputs = unique(Symbol[r for m in masks for r in Cuts[m][3]])
+            signature, steps, _ = Cuts[mask]
+            cutname = _jax_private_identifier(ctx.mod.used, Symbol(name, "_partials_", mask))
+            push!(ctx.mod.helpers, _jax_rule_function!(ctx, cutname,
+                (signature, steps, Tuple(outputs)), rule.cut_ops[mask], types))
+            for m in masks
+                calls[m] = (cutname, outputs)
+            end
+        end
+        jvp = _jax_private_identifier(ctx.mod.used, Symbol(name, "_jvp"))
+        lines = ["def " * jvp * "(primals, tangents):",
+                 "    active = tuple(not isinstance(t, jax.custom_derivatives.SymbolicZero) for t in tangents)",
+                 "    mask = sum((1 << i) for i, a in enumerate(active) if a)",
+                 "    if mask == 0:",
+                 "        value = " * name * "(*primals)",
+                 "        return value, jnp.zeros_like(value)"]
+        for mask in eachindex(Cuts)
+            cutname, outputs = calls[mask]
+            ret = Cuts[mask][3]
+            indices = [i for i in 1:N if (mask >> (i - 1)) & 1 == 1]
+            terms = ["values[" * string(findfirst(==(ret[k + 1]), outputs) - 1) *
+                     "] * tangents[" * string(i - 1) * "]" for (k, i) in enumerate(indices)]
+            append!(lines, ["    if mask == " * string(mask) * ":",
+                "        values = " * cutname * "(*primals)",
+                "        return values[" * string(findfirst(==(ret[1]), outputs) - 1) *
+                "], " * join(terms, " + ")])
+        end
+        push!(lines, name * ".defjvp(" * jvp * ", symbolic_zeros=True)")
+        push!(ctx.mod.helpers, join(lines, "\n"))
+    end
+    _jax_bind!(ctx, :value,
+        _PyVal(name * "(" * _jax_args(args) * ")", _jax_return_type(rule, collect(types))))
 end
 
 # A prepared kernel called as a function (a distribution endpoint a helper
