@@ -303,7 +303,7 @@ function _rw_pure_read(x, ctx::_RwContext, env)
     parts = _rw_read_parts(x)
     parts === nothing && return false
     call = parts[2]
-    _rw_resolve(call.args[1], @__MODULE__) === Base.Broadcast._broadcast_getindex &&
+    _rw_resolve(call.args[1], @__MODULE__) in (Base.Broadcast._broadcast_getindex, _plate_read) &&
         all(a -> a isa Number || (a isa Symbol && (haskey(env, a) || a in ctx.params)),
             call.args[2:end])
 end

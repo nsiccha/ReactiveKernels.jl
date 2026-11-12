@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.186
+
+- A summed plate's cells read each batched array directly when every array
+  they read has exactly the plate's axes; the plate checks this once per call
+  and otherwise runs its loop as before. A plate over one batched array reads
+  it directly always, since that array has the plate's axes. Base's broadcast
+  read tests, at every read, whether each axis has length one, and native
+  Enzyme's reverse loop kept that test in the address of every shadow load
+  and store, so a summed plate's gradient did not vectorize: an `@rkppl`
+  regression `mu = X * beta; y .~ Normal.(mu, sigma)` (N = 1192, K = 2) took
+  1843–1932 ns per value and gradient against 770–797 ns for the hand loop,
+  and now takes 778 ns (gordito, Julia 1.13.1, Enzyme 0.13.219). Values and
+  gradients are unchanged, and nothing about shapes is fixed at preparation.
+  The direct-read copy compiles the summed loop a second time. A cell loop
+  with a nested plate or a scan, one carrying lane slots, cell tables, shared
+  call tables or scheduled groups (a multi-dimensional plate), and the opt-in
+  generated plate reverse keep their one loop as before (snag
+  plate-reverse-lo-31fd6869).
+
 ## 0.1.185
 
 - `jax_source`: a `for` loop to a padded row's length, such as
