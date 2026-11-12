@@ -41,8 +41,12 @@
 #
 # Scope. This covers the programs `prepare` and `prepare_nonallocating` compile
 # (and so `prepare_ad`, the RKPPL queries and samplers), inside plate cells
-# included. Not yet covered: the reactive compiler, the batched lowering and
-# `jax_source`; opaque native functions are never visible to it.
+# included; the batched lowering of `plate(spec; batched)` and the position
+# drivers of `vectorize`, where a value hoisted out of the loop stays computed
+# once (`hoisted`, `_replicated_part_ast`); each recipe of a compiled reactive
+# state (`stateful.jl`), whose values are slots a rewrite never reads past;
+# and `jax_source`, which translates the same rule catalogue
+# (`_jax_stable_rewrite`). Opaque native functions are never visible to it.
 
 # --- the setting -------------------------------------------------------------
 
@@ -207,7 +211,13 @@ struct _RwContext
     counts::Dict{Symbol,Int}    # assignments of each name in the program
     params::Set{Symbol}         # parameters the body never assigns
     reads::Base.RefValue{Int}   # moved cell reads so far (`_rw_fresh`)
+    hoisted::Bool               # a loop never reads a definition from outside it
 end
+
+# A name defined outside the loop being rewritten, under `hoisted`: readable
+# there, but its definition is not, so no rewrite moves the work that computed
+# it into the loop.
+struct _RwOuter end
 
 # The constant a callee expression names, or `nothing`. A binding that is not
 # constant can change between preparation and a call, so it never matches.
@@ -280,7 +290,7 @@ function _rw_pure_read(x, ctx::_RwContext, env)
     parts = _rw_read_parts(x)
     parts === nothing && return false
     call = parts[2]
-    _rw_resolve(call.args[1], @__MODULE__) === Base.Broadcast._broadcast_getindex &&
+    _rw_resolve(call.args[1], @__MODULE__) in (Base.Broadcast._broadcast_getindex, _plate_read) &&
         all(a -> a isa Number || (a isa Symbol && (haskey(env, a) || a in ctx.params)),
             call.args[2:end])
 end
@@ -805,7 +815,9 @@ function _rw_expr(ex, ctx::_RwContext, env::Dict{Symbol,Any})
         end
         return Expr(head, args...)
     elseif head === :for
-        return Expr(:for, ex.args[1], Any[_rw_expr(a, ctx, copy(env)) for a in ex.args[2:end]]...)
+        inner = ctx.hoisted ? Dict{Symbol,Any}(name => _RwOuter() for name in keys(env)) :
+                copy(env)
+        return Expr(:for, ex.args[1], Any[_rw_expr(a, ctx, copy(inner)) for a in ex.args[2:end]]...)
     elseif head === :(=) && length(ex.args) == 2
         return Expr(:(=), ex.args[1], _rw_expr(ex.args[2], ctx, env))
     elseif head === :local
@@ -944,7 +956,7 @@ end
 # --- the pass -------------------------------------------------------------------
 
 """
-    _stable_rewrites(ast::Expr, recipes::Tuple[, definitions]) -> Expr
+    _stable_rewrites(ast::Expr, recipes::Tuple[, definitions]; hoisted = false) -> Expr
 
 The generated function `ast` with its numerically fragile compositions in their
 stable forms (the file header). `recipes` holds what each position of the
@@ -952,11 +964,14 @@ callables table the body calls through runs: a lowered recipe, or a
 non-allocating step. `definitions` binds parameters of `ast` to the
 expressions that computed them before it, over other parameters of `ast` (a
 source-reading backend's earlier statements, `jax_source`), so a composition
-across them is found as one within the body is. Returns `ast` itself when
-nothing applies.
+across them is found as one within the body is. With `hoisted = true` a
+statement inside a loop reads a value defined outside it as it is, never
+through its definition: a value hoisted out of a loop stays computed once
+(`lower_batched`). Returns `ast` itself when nothing applies.
 """
 function _stable_rewrites(ast::Expr, recipes::Tuple,
-                          definitions::Dict{Symbol,Any} = Dict{Symbol,Any}())
+                          definitions::Dict{Symbol,Any} = Dict{Symbol,Any}();
+                          hoisted::Bool = false)
     ast.head in (:function, :->) && length(ast.args) == 2 &&
         ast.args[1] isa Expr && ast.args[1].head === :tuple || return ast
     counts = _rw_count!(Dict{Symbol,Int}(), ast.args[2])
@@ -966,7 +981,7 @@ function _stable_rewrites(ast::Expr, recipes::Tuple,
                arg isa Expr && arg.head === :(::) && arg.args[1] isa Symbol ? arg.args[1] : nothing
         name === nothing || get(counts, name, 0) == 0 && push!(params, name)
     end
-    ctx = _RwContext(recipes, counts, params, Ref(0))
+    ctx = _RwContext(recipes, counts, params, Ref(0), hoisted)
     body = _rw_expr(ast.args[2], ctx, copy(definitions))
     body isa Expr && body.head === :block || return ast
     body == ast.args[2] && return ast
