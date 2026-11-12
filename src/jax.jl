@@ -73,19 +73,21 @@ _PyVal(code::AbstractString, @nospecialize(T), static::Bool, extent::AbstractStr
        limit::AbstractString, padded::Int) =
     _PyVal(String(code), T, static, String(extent), String(limit), padded, nothing)
 # An integer array of the prepared data, `prepared[key]` (`position ===
-# nothing`), or an entry of one, `prepared[key][position] + offset`:
+# nothing`), or an entry of one, `scale * prepared[key][position] + offset`:
 # `position` is the gather's index code, or a token naming a plate cell's
-# entry, and `offset` a static integer. Entries of two arrays at one position
-# are entries of one record (`starts[r]:stops[r]`), so their difference is
+# entry, and `scale` and `offset` static integers (`2 * n[i] + 1` of two
+# interleaved reads per entry). Entries of two arrays at one position are
+# entries of one record (`starts[r]:stops[r]`), so their difference is
 # bounded by the arrays' largest difference, which `prepare_data` computes.
 struct _JaxOrigin
     key::String
     position::Union{Nothing,String}
     offset::String
     path::String
+    scale::String
 end
-_JaxOrigin(key::String, position::Union{Nothing,String}, offset::String) =
-    _JaxOrigin(key, position, offset, "")
+_JaxOrigin(key::String, position::Union{Nothing,String}, offset::String, path::String = "") =
+    _JaxOrigin(key, position, offset, path, "1")
 # A data-only cell recipe that can be moved to prepare_data if a later loop
 # needs a bound on its integer result. The existing host split does the work.
 struct _JaxCellData
@@ -1811,23 +1813,54 @@ function _jax_trip_bound(ctx::_JaxContext, lo::_PyVal, hi::_PyVal)
         throw(_CellHostNeeded(o.plate, o.recipe, JAXEmissionError(
             "a data-only integer used as a loop end needs a bound from `prepare_data`" * _jax_where(ctx))))
     end
+    # Ends at one position with one positive scale differ by that scale times
+    # the arrays' difference there, at most that times their largest one.
     count = if a isa _JaxOrigin && b isa _JaxOrigin && a.position !== nothing &&
-               a.position == b.position
-        span = _jax_prepared_bound!(ctx, :span, a.key, b.key)
+               a.position == b.position && a.scale == b.scale && _jax_static_sign(a.scale) > 0
+        span = _jax_scaled(a.scale, _jax_prepared_bound!(ctx, :span, a.key, b.key))
         _jax_offset(_jax_offset(span, "+", b.offset), "-", a.offset)
     else
         upper = hi.static ? hi.code : !isempty(hi.limit) ? hi.limit :
-            b isa _JaxOrigin && b.position !== nothing ?
-            _jax_offset(_jax_prepared_bound!(ctx, :max, b.key), "+", b.offset) : nothing
+            b isa _JaxOrigin && b.position !== nothing ? _jax_entry_bound(ctx, b, true) : nothing
         lower = lo.static ? lo.code : a isa _JaxOrigin && a.position !== nothing ?
-            _jax_offset(_jax_prepared_bound!(ctx, :min, a.key), "+", a.offset) : nothing
+            _jax_entry_bound(ctx, a, false) : nothing
         upper === nothing || lower === nothing ? nothing : _py_infix("-", [upper, lower])
     end
     count === nothing ? nothing : "max(" * _py_infix("+", [count, "1"]) * ", 0)"
 end
+# A static upper (`upper`) or lower bound of a prepared entry `o`,
+# `scale * prepared[key][i] + offset`: the scale times the array's largest
+# entry, or its least where the scale is negative (either where its sign is
+# known only while tracing), plus the offset.
+function _jax_entry_bound(ctx::_JaxContext, o::_JaxOrigin, upper::Bool)
+    sign = _jax_static_sign(o.scale)
+    extreme(kind) = _jax_scaled(o.scale, _jax_prepared_bound!(ctx, kind, o.key))
+    bound = sign > 0 ? extreme(upper ? :max : :min) :
+        sign < 0 ? extreme(upper ? :min : :max) :
+        (upper ? "max(" : "min(") * extreme(:max) * ", " * extreme(:min) * ")"
+    _jax_offset(bound, "+", o.offset)
+end
 # `code op offset`, a static integer offset; nothing added for a zero one.
 _jax_offset(code::AbstractString, op::AbstractString, offset::AbstractString) =
     offset == "0" ? code : _py_infix(op, [code, offset])
+# `scale * code`, a static integer scale; nothing multiplied for a unit one.
+_jax_scaled(scale::AbstractString, code::AbstractString) =
+    scale == "1" ? code : _py_infix("*", [scale, code])
+# The sign of a static integer's code when it is a literal, else 0 (known
+# only while tracing).
+function _jax_static_sign(code::AbstractString)
+    m = match(r"^-?[0-9]+$", code)
+    m === nothing ? 0 : sign(parse(Int, code))
+end
+# `x op y` of static integers' codes, folded when both are literals.
+function _jax_static_integer_op(op::AbstractString, x::AbstractString, y::AbstractString)
+    literal = r"^-?[0-9]+$"
+    if occursin(literal, x) && occursin(literal, y)
+        a, b = parse(Int, x), parse(Int, y)
+        return string(op == "+" ? a + b : op == "-" ? a - b : a * b)
+    end
+    _py_infix(op, [x, y])
+end
 
 # The name of a static bound of prepared integer arrays `keys` (`:min` and
 # `:max` of one array's entries, `:span` the largest difference of the second
@@ -2910,18 +2943,26 @@ function _jax_shifted_limit(f, args::Vector{_PyVal}, v::_PyVal)
     _jax_history_index_result(f, args, _jax_shifted_integer_limit(f, values, v))
 end
 function _jax_shifted_integer_limit(f, args::Vector{_PyVal}, v::_PyVal)
-    (f === (+) || f === (-)) && length(args) == 2 && isempty(v.limit) && !v.static || return v
+    isempty(v.limit) && !v.static || return v
+    all(a -> a.T isa Type && a.T <: Integer, args) || return v
+    f === (*) && return _jax_scaled_integer_limit(args, v)
+    # `-j` is `-1 * j`.
+    f === (-) && length(args) == 1 && return _jax_scaled_integer_limit([_jax_literal(-1), args[1]], v)
+    (f === (+) || f === (-)) && length(args) == 2 || return v
     a, b = args
-    a.T isa Type && a.T <: Integer && b.T isa Type && b.T <: Integer || return v
+    entry(x) = x.origin isa _JaxOrigin && x.origin.position !== nothing
     # An entry of the prepared data shifted by a static integer keeps its
     # origin, shifted: `stops[r] - 1` is at most the largest stop less one.
-    if a.origin isa _JaxOrigin && a.origin.position !== nothing && b.static
-        offset = a.origin.offset == "0" && f === (+) ? b.code :
-            _py_infix(f === (+) ? "+" : "-", [a.origin.offset, b.code])
-        return _jax_with_origin(v, _JaxOrigin(a.origin.key, a.origin.position, offset))
-    elseif f === (+) && b.origin isa _JaxOrigin && b.origin.position !== nothing && a.static
-        return _jax_with_origin(v, _JaxOrigin(b.origin.key, b.origin.position,
-                                              _jax_offset(a.code, "+", b.origin.offset)))
+    if entry(a) && b.static
+        o = a.origin
+        offset = o.offset == "0" && f === (+) ? b.code :
+            _py_infix(f === (+) ? "+" : "-", [o.offset, b.code])
+        return _jax_with_origin(v, _JaxOrigin(o.key, o.position, offset, o.path, o.scale))
+    elseif entry(b) && a.static
+        # `c - j` is `-1 * j + c`.
+        o = f === (-) ? _jax_scaled_origin(b.origin, "-1") : b.origin
+        return _jax_with_origin(v, _JaxOrigin(o.key, o.position, _jax_offset(a.code, "+", o.offset),
+                                              o.path, o.scale))
     end
     if !isempty(a.limit) && b.static && (f === (+) || occursin(r"^[0-9]+$", b.code))
         limit = f === (-) ? a.limit : _py_infix("+", [a.limit, b.code])
@@ -2932,6 +2973,23 @@ function _jax_shifted_integer_limit(f, args::Vector{_PyVal}, v::_PyVal)
     end
     _PyVal(v.code, v.T, v.static, v.extent, limit, v.padded, v.origin)
 end
+# `k * j` of static integers `k` and one integer `j` with a static bound
+# keeps a bound: an entry of the prepared data keeps its origin, scaled
+# (`2 * n[i]` is at most twice the largest entry), and a nonnegative literal
+# scales a static limit (`2 * length(r)` of a padded row).
+function _jax_scaled_integer_limit(args::Vector{_PyVal}, v::_PyVal)
+    count(a -> !a.static, args) == 1 && length(args) >= 2 || return v
+    j = only(a for a in args if !a.static)
+    k = foldl((x, y) -> _jax_static_integer_op("*", x, y), (a.code for a in args if a.static))
+    j.origin isa _JaxOrigin && j.origin.position !== nothing &&
+        return _jax_with_origin(v, _jax_scaled_origin(j.origin, k))
+    !isempty(j.limit) && occursin(r"^[0-9]+$", k) || return v
+    _PyVal(v.code, v.T, v.static, v.extent, _jax_scaled(k, j.limit), v.padded, v.origin)
+end
+# `k` times an entry's origin: its scale and offset times `k`.
+_jax_scaled_origin(o::_JaxOrigin, k::AbstractString) =
+    _JaxOrigin(o.key, o.position, o.offset == "0" ? "0" : _jax_static_integer_op("*", k, o.offset),
+               o.path, o.scale == "1" ? k : _jax_static_integer_op("*", k, o.scale))
 
 """
     _jax_function_call(ctx::_JaxContext, f, args::Vector{_PyVal}) -> _PyVal
