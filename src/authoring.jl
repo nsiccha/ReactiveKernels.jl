@@ -5719,7 +5719,7 @@ end
 """
     prepare_batched(spec::KernelSpec; batched, have=inputs(spec),
                     want=outputs(spec), passes=(), reuse=false,
-                    schedule=nothing) -> callable
+                    schedule=nothing, simplify=nothing) -> callable
 
 First-class position batching for a scalar `@kernel`. The named HAVE ports
 carry one shared trailing batch axis; all other HAVE ports are shared by every
@@ -5742,7 +5742,11 @@ The lifted kernel requires pure recipes and retains their internal loops and
 lazy branches. Native execution hoists shared-only recipes, including plates,
 scans and embedded kernels, and lowers both the hoisted prefix and the
 per-position residual as `prepare` lowers a scalar kernel, so an inline plate
-runs as its fused loop at every position. The default allocates fresh stacked outputs;
+runs as its fused loop at every position. Unless `simplify = false`, each part
+computes numerically fragile compositions in their stable form, as `prepare`
+does; a composition of a per-position value over a hoisted one (`log(s)` of a
+shared `s = exp(a)`) is computed as written, so the hoisted value is computed
+once. The default allocates fresh stacked outputs;
 retaining a result across calls is safe. It is not the allocation-free reducing
 `plate` contract.
 
@@ -5786,34 +5790,47 @@ function prepare_batched(spec::KernelSpec;
                          want = _KERNEL_DEFAULT_BOUNDARY,
                          passes = (),
                          reuse = false,
-                         schedule = nothing)
+                         schedule = nothing,
+                         simplify = nothing)
     selected_have = have === _KERNEL_DEFAULT_BOUNDARY ? inputs(spec) : have
     selected_want = want === _KERNEL_DEFAULT_BOUNDARY ? outputs(spec) : want
-    prepared = prepare(plan(spec; have = selected_have, want = selected_want);
-                       passes = passes)
-    replicated = vectorize(prepared; batched, reuse, schedule)
+    replicated = _with_simplify(simplify) do
+        prepared = prepare(plan(spec; have = selected_have, want = selected_want);
+                           passes = passes)
+        vectorize(prepared; batched, reuse, schedule)
+    end
     have === _KERNEL_DEFAULT_BOUNDARY || return replicated
     _kernel_signature_callable(replicated, spec.call_signature)
 end
 
 """
-    vectorize(kernel::PreparedKernel; batched, reuse=false, schedule=nothing) -> callable
+    vectorize(kernel::PreparedKernel; batched, reuse=false, schedule=nothing,
+              simplify=nothing) -> callable
     vectorize(spec::KernelSpec; batched, have=inputs(spec),
-              want=outputs(spec), passes=(), reuse=false, schedule=nothing) -> callable
+              want=outputs(spec), passes=(), reuse=false, schedule=nothing,
+              simplify=nothing) -> callable
 
 Lift a scalar kernel over position batching. This is the concise public spelling
 for [`prepare_batched`](@ref); `replica` remains the equivalent lower-level
 name. See that docstring for the batch-axis, output-shape, purity, and
 allocation contract.
 
+`simplify` is as for [`prepare`](@ref): unless it is `false`, the position
+driver computes numerically fragile compositions in their stable form. A
+`PreparedKernel` argument contributes its plan, not its setting, as for
+[`prepare_nonallocating`](@ref).
+
 For a native `reuse=true` result, `copy(kernel)` creates an independent execution
 instance with empty output buffers and the same prepared computation. See
 [`prepare_batched`](@ref) for its lifetime and concurrency contract.
 """
-function vectorize(kernel::PreparedKernel; batched, reuse = false, schedule = nothing)
+function vectorize(kernel::PreparedKernel; batched, reuse = false, schedule = nothing,
+                   simplify = nothing)
     # A kernel `prepare(…; bound)` rebound from a cached template reuses the
     # position drivers lowered for an earlier binding (bound_vectorize.jl).
-    _vectorize(kernel.rebinding, kernel, batched, reuse, schedule)
+    _with_simplify(simplify) do
+        _vectorize(kernel.rebinding, kernel, batched, reuse, schedule)
+    end
 end
 
 function vectorize(spec::KernelSpec;
@@ -5822,12 +5839,14 @@ function vectorize(spec::KernelSpec;
                    want = _KERNEL_DEFAULT_BOUNDARY,
                    passes = (),
                    reuse = false,
-                   schedule = nothing)
-    prepare_batched(spec; batched, have, want, passes, reuse, schedule)
+                   schedule = nothing,
+                   simplify = nothing)
+    prepare_batched(spec; batched, have, want, passes, reuse, schedule, simplify)
 end
 
-function vectorize(callable::_KernelSignatureCallable; batched, reuse = false, schedule = nothing)
-    replicated = vectorize(callable.target; batched, reuse, schedule)
+function vectorize(callable::_KernelSignatureCallable; batched, reuse = false,
+                   schedule = nothing, simplify = nothing)
+    replicated = vectorize(callable.target; batched, reuse, schedule, simplify)
     _kernel_signature_callable(replicated, callable.signature)
 end
 
@@ -5846,7 +5865,7 @@ scalar_kernel(kernel::BorrowedBatchedKernel) = scalar_kernel(kernel.target)
 scalar_kernel(kernel::_KernelSignatureCallable) = scalar_kernel(kernel.target)
 
 """
-    plate(spec::KernelSpec; have, want, batched, reduce = :+) -> PreparedKernel
+    plate(spec::KernelSpec; have, want, batched, reduce = :+, simplify = nothing) -> PreparedKernel
 
 Prepare a batched, loop-invariant-hoisting kernel from a scalar `@kernel` spec.
 The `batched` HAVE ports (a name or a collection of names) are passed as arrays;
@@ -5855,11 +5874,13 @@ single scalar `want` is mapped over the batched values and reduced (a sum by
 default). Pass `reduce = nothing` to collect the per-element wants instead.
 
 The generated map/reduction form is allocation-free for native reducing
-execution. See [`lower_batched`](@ref).
+execution. See [`lower_batched`](@ref). `simplify` is as for
+[`prepare`](@ref): unless it is `false`, numerically fragile compositions are
+computed in their stable form (`log(exp(u))` as `u`).
 """
-function plate(spec::KernelSpec; have, want, batched, reduce = :+)
+function plate(spec::KernelSpec; have, want, batched, reduce = :+, simplify = nothing)
     p = plan(spec; have = have, want = want)
-    _prepare_batched(p; batched = batched, reduce = reduce)
+    _prepare_batched(p; batched = batched, reduce = reduce, simplify = simplify)
 end
 
 """

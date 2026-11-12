@@ -422,6 +422,22 @@ end
     output_axes
 end
 
+# Whether a plate's cells can read the batched argument `arg` (its
+# `Base.broadcastable` value) at their own coordinates: an array with exactly
+# the plate's axes, which broadcasting never extrudes. Anything else, a
+# `Broadcasted` or a tuple included, keeps its broadcast read
+# (`_plate_direct_read_loop`).
+@inline _plate_spans_axis(output_axes, arg::AbstractArray) = axes(arg) == output_axes
+@inline _plate_spans_axis(output_axes, arg) = false
+
+# A cell's read of such an array: its entry at the cell's own coordinate.
+# Base's `_broadcast_getindex` of an array is `A[newindex(A, I)]`, which still
+# tests every axis for length one at each read, so it is not this read.
+Base.@propagate_inbounds _plate_read(arg::AbstractArray, index) = arg[index]
+# Never reached: `_plate_spans_axis` is `false` for anything else.
+Base.@propagate_inbounds _plate_read(arg, index) =
+    Base.Broadcast._broadcast_getindex(arg, index)
+
 # Base's `combine_axes(a1, a2, …)` for a lowered plate's batched operands. The
 # lowered body reads each operand's `axes` and passes only those integer axis
 # tuples to `_plate_broadcast_shape`, which folds them exactly as Base does.
@@ -1272,6 +1288,30 @@ end
 # call `reader_call` run.
 function _lower_authored_scan_slice_native!(body, op::_AuthoredScanOp, callargs,
         offset, demand, reader_args, lhs, reader_call; type_offset = nothing)
+    # Binding and source splitting can lift `lo:hi` into a reader argument.
+    # Its concrete type selects slice demand here; integer and other index
+    # arguments retain the existing element/fallback path. Inspect the range
+    # only inside its selected arm, and evaluate the argument just once.
+    if demand.index_position !== nothing
+        at = demand.index_position
+        argument = gensym(:scan_reader_index)
+        push!(body.args, :($argument = $(reader_args[at])))
+        arguments = Any[reader_args...]
+        arguments[at] = argument
+        element = merge(demand, (; index_position = nothing))
+        parameter = demand.params[at]
+        window = merge(element, (; scalar = false,
+            lo = Expr(:call, GlobalRef(Base, :first), parameter),
+            hi = Expr(:call, GlobalRef(Base, :last), parameter)))
+        range_body, element_body = Expr(:block), Expr(:block)
+        _lower_authored_scan_slice_native!(range_body, op, callargs, offset,
+            window, arguments, lhs, reader_call; type_offset)
+        _lower_authored_scan_slice_native!(element_body, op, callargs, offset,
+            element, arguments, lhs, reader_call; type_offset)
+        push!(body.args, Expr(:if, :($argument isa $(UnitRange{Int})),
+                             range_body, element_body))
+        return body
+    end
     indices, index, carry, output = gensym.((:scan_indices, :scan_index,
         :scan_carry, :scan_output))
     (; seqs, xs, step_body, inferred_output_type, inferred_carry_type) =
@@ -1694,7 +1734,9 @@ end
 # A scan read only through one slice `trajectory[lo:hi]`, or one element
 # `trajectory[k]`, `last(trajectory)` or `first(trajectory)`, whose other steps
 # compute nothing that is read (`_lower_authored_scan_slice_native!`). Returns
-# `(; reader, position, lo, hi, params, mod, carry_free, scalar)` or `nothing`.
+# `(; reader, position, lo, hi, params, mod, carry_free, scalar, index_position)`
+# or `nothing`. An index supplied as a reader argument can be either an
+# integer or a unit range; its runtime type chooses the matching demand.
 #
 # The scan has no `history` and a pure step; its result is no WANT and is read
 # by exactly one recipe, as exactly one of that recipe's inputs (`position`).
@@ -1740,6 +1782,7 @@ function _authored_scan_slice_demand(p::Plan, scan_recipe::Recipe)
     end
     native isa Expr || return nothing
     trajectory = params[position]
+    index_position = nothing
     if native.head === :ref && length(native.args) == 2 && native.args[1] === trajectory
         index = native.args[2]
         if index isa Expr && index.head === :call && !isempty(index.args) &&
@@ -1751,6 +1794,7 @@ function _authored_scan_slice_demand(p::Plan, scan_recipe::Recipe)
             index === :(:) && return nothing
             lo = hi = index
             scalar = true
+            index isa Symbol && (index_position = findfirst(==(index), params))
         end
     elseif native.head === :call && length(native.args) == 2 && native.args[2] === trajectory
         accessor = _kernel_resolve_binding(mod, native.args[1])
@@ -1762,7 +1806,8 @@ function _authored_scan_slice_demand(p::Plan, scan_recipe::Recipe)
     end
     trajectory in _source_symbols!(Set{Symbol}(), Expr(:tuple, lo, hi)) &&
         return nothing
-    demand = (; reader, position, lo, hi, params, mod, carry_free = false, scalar)
+    demand = (; reader, position, lo, hi, params, mod, carry_free = false,
+              scalar, index_position)
     # The bounds must be expressible over the reader's arguments.
     placeholders = Any[gensym(:argument) for _ in reader.inputs]
     any(isnothing, _scan_slice_bound_exprs(demand, placeholders, :length)) &&
@@ -3222,8 +3267,8 @@ Base.@nospecializeinfer function _plate_shared_branch(
             callvalues, dependencies, root_positions)
         branch = _plate_branch_source_graphs(r, names, shared)
         _plate_branch_has_graph(branch) || continue
-        then_kernel = _plate_branch_arm_kernel(inner, index, :then, branch, names)
-        else_kernel = _plate_branch_arm_kernel(inner, index, :else, branch, names)
+        then_kernel = _plate_branch_arm_kernel(inner, index, :then, branch, names; shared)
+        else_kernel = _plate_branch_arm_kernel(inner, index, :else, branch, names; shared)
         (then_kernel === nothing || else_kernel === nothing) && continue
         return _PlateSharedBranch(index,
             Any[callargs[p] for p in condition_positions], then_kernel, else_kernel)
@@ -3385,6 +3430,15 @@ _kernel_ops(variant::_PlateArmVariant) =
 _plate_arm_plan(spec) = plan(spec)
 _plate_arm_plan(p::Plan) = p
 
+# Shared scalar evidence can arrive after an arm graph was authored. Split
+# its retained mixed recipes at that boundary, using the same decomposition
+# as partial evaluation. No value is evaluated, and captured callables and
+# any already prepared residual plan stay intact.
+function _plate_arm_shared_plan(spec, shared)
+    p = _plate_arm_plan(spec)
+    _partial_split_bound(p, Value[v for v in p.have if v.name in shared])
+end
+
 # A branch whose condition reads the cell takes its arm per cell, but an arm
 # with its own graph is inlined into the cell loop. Its recipes that read only
 # shared values run at the first cell that takes the arm and are reused by the
@@ -3447,7 +3501,7 @@ Base.@nospecializeinfer function _plate_lane_branch_slots!(
     elseif spec === nothing
         nothing
     else
-        armplan = _plate_arm_plan(spec)
+        armplan = _plate_arm_shared_plan(spec, shared)
         fits = all(port -> port.name in names, armplan.have) &&
             !any(port -> canon_id(armplan.graph, port.id) ==
                          canon_id(armplan.graph, only(armplan.want).id),
@@ -3553,7 +3607,8 @@ end
 # closure over its own ports (a nested branch stays a branch over every
 # argument, and is examined again), as in `_partition_plate_recipe`.
 Base.@nospecializeinfer function _plate_branch_arm_kernel(
-        inner::Plan, index::Int, side::Symbol, @nospecialize(native), names)
+        inner::Plan, index::Int, side::Symbol, @nospecialize(native), names;
+        shared = Set{Symbol}())
     r = inner.recipes[index]
     then = side === :then
     positions = (typeof(native)::DataType).parameters[then ? 2 : 3]
@@ -3573,7 +3628,8 @@ Base.@nospecializeinfer function _plate_branch_arm_kernel(
         Recipe[Recipe(r.id, Tuple(r.inputs[i] for i in positions), r.outputs,
                       arm_op, r.cost, nothing, false, r.source)]
     else
-        _plate_branch_arm_recipes!(copied, spec, r, names, fresh)
+        _plate_branch_arm_recipes!(copied, _plate_arm_shared_plan(spec, shared),
+                                  r, names, fresh)
     end
     replacement === nothing && return nothing
     recipes = Recipe[]
@@ -4631,9 +4687,10 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     # before an embedded kernel renames locals: late macro expansion can
     # interpret its renamed index as a module global.
     # A cell that fills lane slots carries state from one cell to the next.
-    if accumulator !== nothing && pointwise_lhs === nothing && total_fold === sum &&
-            !has_scheduled_groups && nested === nothing && isempty(released) &&
-            all(r -> !r.effectful, inner.recipes)
+    summed = accumulator !== nothing && pointwise_lhs === nothing && total_fold === sum &&
+        !has_scheduled_groups && nested === nothing && isempty(released) &&
+        all(r -> !r.effectful, inner.recipes)
+    if summed
         linear = gensym(:plate_linear)
         simd_body = Expr(:block,
             Expr(:(=), index, Expr(:call, GlobalRef(Base, :CartesianIndex), linear)),
@@ -4672,6 +4729,28 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
                        for input in recipe.inputs]
             lower_recipe!(block, recipe_index, args, out,
                 Expr(:ref, _CALLABLES_ARG, op_offset + recipe_index), true)
+        end
+        # A loop of cell arithmetic reads its batched arrays directly when
+        # they have the plate's axes (`_plate_direct_read_loop`). Only a summed
+        # loop, whose reverse is the one that does not vectorize, gets a
+        # second, direct-read copy; any loop over one batched argument reads it
+        # directly in its one loop. A cell with a nested plate or a scan would
+        # be compiled twice for little: its loop does not vectorize. A loop
+        # carrying lane slots, cell tables, shared call tables or scheduled
+        # groups from cell to cell keeps one loop, as does a scheduled prefix.
+        # The generated plate reverse (`plate_reverse.jl`) differentiates the
+        # loop as it is.
+        direct_reads = !parallel_cells && nested === nothing && cell === nothing &&
+            !has_scheduled_groups && isempty(slotted) && isempty(table_entries) &&
+            isempty(shares) && !any(r -> r.op isa _AuthoredScanOp, inner.recipes) &&
+            !_plate_reverse_enabled()
+        if reduction === nothing && !batched && direct_reads
+            shared_names = _mentioned_symbols!(Set{Symbol}(), Expr(:block, declarations...))
+            for name in (accumulator, pointwise_lhs, total_lhs)
+                name isa Symbol && push!(shared_names, name)
+            end
+            cell_loop = _plate_direct_read_loop(cell_loop, raw_arguments,
+                prepared_arguments, callvalues, output_axes, shared_names; copy = summed)
         end
         if reduction === nothing
             push!(execution.args, batched ? _lower_plate_batched_native(batch, inner, locals,
@@ -4726,6 +4805,84 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     total_lhs === nothing || push!(body.args, :($total_lhs =
         $(GlobalRef(@__MODULE__, :_plate_total_value))($accumulator)))
     body
+end
+
+# The cell loop, with each batched array it reads through broadcast extrusion
+# read directly instead whenever every one of them has exactly the plate's
+# axes, which the plate checks once per call; any other call runs the loop
+# as it is. A cell reads an extruded argument (`Broadcast.preprocess`) with
+# `_broadcast_getindex`, which selects, per dimension and at every read,
+# coordinate `i` or the argument's single entry. LLVM unswitches that select
+# out of the primal loop, but native Enzyme's reverse loop keeps it in the
+# address of every shadow load and store, and a store that may hit one entry
+# in every iteration does not vectorize: a Normal regression plate's gradient
+# took 2.4 times a hand loop's, and reading both arrays directly made it the
+# hand loop's (snag plate-reverse-lo-31fd6869). The copy reads the
+# `Base.broadcastable` value itself with `_plate_read`, its `getindex`. It
+# assumes no shape: a call or a rebinding whose arrays do not span the plate
+# takes the loop as it is. A tuple is never extruded and keeps its read. A
+# plate with one batched argument has that argument's axes, so its one loop
+# reads it directly, with no check and no copy.
+#
+# The copy names its own locals (`_plate_direct_local`): a name assigned in
+# both copies would no longer be a definition the stable rewrites read
+# through (`_rw_count!`). `shared` names what the loop assigns for code
+# outside it (its running total, the pointwise buffer, flags declared above
+# it); the copy keeps those.
+function _plate_direct_read_loop(cell_loop, raw_arguments, prepared_arguments,
+                                 callvalues, output_axes, shared; copy::Bool = true)
+    mapping = Dict{Symbol,Symbol}()
+    for name in _local_symbols!(Set{Symbol}(), cell_loop)
+        name in shared || !_lowering_gensym(name) ||
+            (mapping[name] = _plate_direct_local(name))
+    end
+    checks = Any[]
+    for (position, prepared) in enumerate(prepared_arguments)
+        prepared === nothing && continue
+        valtype(callvalues[position]) <: Tuple && continue
+        _mentions_symbol(cell_loop, prepared) || continue
+        mapping[prepared] = raw_arguments[position]
+        # One call per argument, never one call over all of them: a call
+        # splatting many arrays becomes a dynamic `_apply_iterate` that native
+        # Reverse rejects (`_plate_combined_axes_expr`).
+        push!(checks, Expr(:call, GlobalRef(@__MODULE__, :_plate_spans_axis),
+                           output_axes, raw_arguments[position]))
+    end
+    isempty(checks) && return cell_loop
+    direct = Set{Symbol}(raw for (prepared, raw) in mapping if prepared in prepared_arguments)
+    # One batched argument: the plate's axes are its own, so broadcasting never
+    # extrudes it, and the one loop reads it directly with no check.
+    if count(!isnothing, raw_arguments) == 1
+        reads = Dict{Symbol,Symbol}(prepared => raw for (prepared, raw) in mapping
+                                    if prepared in prepared_arguments)
+        return _plate_direct_reads(_substitute_symbols(cell_loop, reads), direct)
+    end
+    copy || return cell_loop
+    spans = foldl((left, right) -> Expr(:&&, left, right), checks)
+    Expr(:if, spans,
+         Expr(:block, _plate_direct_reads(_substitute_symbols(cell_loop, mapping), direct)),
+         Expr(:block, cell_loop))
+end
+
+# `node` with each cell read `_broadcast_getindex(arg, index)` of an argument
+# in `direct` read with `_plate_read` instead.
+function _plate_direct_reads(node, direct::Set{Symbol})
+    node isa Expr && node.head !== :quote || return node
+    if node.head === :call && length(node.args) == 3 &&
+            node.args[1] == GlobalRef(Base.Broadcast, :_broadcast_getindex) &&
+            node.args[2] isa Symbol && node.args[2] in direct
+        return Expr(:call, GlobalRef(@__MODULE__, :_plate_read), node.args[2], node.args[3])
+    end
+    Expr(node.head, Any[_plate_direct_reads(arg, direct) for arg in node.args]...)
+end
+
+# A generated local's name in the direct copy. An inline statement's local
+# keeps the recipe position it was named from (`_inline_local_parts`), which
+# the passes read; a `#` keeps either apart from every authored identifier.
+function _plate_direct_local(name::Symbol)
+    parts = _inline_local_parts(name)
+    parts === nothing ? Symbol(name, "#direct") :
+        Symbol(first(parts), "#direct#op", last(parts))
 end
 
 # A plate cell lowers as its plate over the one-cell slices of the plate's
@@ -5085,7 +5242,11 @@ Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recip
             continue
         end
         slice = gensym(:cell_argument)
-        push!(body.args, Expr(:(=), slice, partition ?
+        # A lane viewing a vector at a range reads that vector at the positions
+        # of its rows, which a partition's plan computes (`_cell_lane_range_rows`).
+        served = partition && !single ?
+            _cell_lane_range_rows(windows, plate_values[position], cell) : nothing
+        push!(body.args, Expr(:(=), slice, served !== nothing ? served : partition ?
             Expr(:call, GlobalRef(@__MODULE__, :_cell_row_slice), raw[position], cell) :
             Expr(:call, GlobalRef(@__MODULE__, :_plate_cell_slice), raw[position], cell)))
         push!(slices, slice)
@@ -5566,6 +5727,17 @@ _substitute_symbols(node::Symbol, mapping) = get(mapping, node, node)
 _substitute_symbols(node::Expr, mapping) = node.head === :quote ? node :
     Expr(node.head, Any[_substitute_symbols(arg, mapping) for arg in node.args]...)
 _substitute_symbols(node, mapping) = node
+_mentions_symbol(node::Symbol, name::Symbol) = node === name
+_mentions_symbol(node::Expr, name::Symbol) =
+    node.head !== :quote && any(arg -> _mentions_symbol(arg, name), node.args)
+_mentions_symbol(node, name::Symbol) = false
+_mentioned_symbols!(found::Set{Symbol}, node::Symbol) = push!(found, node)
+function _mentioned_symbols!(found::Set{Symbol}, node::Expr)
+    node.head === :quote && return found
+    foreach(arg -> _mentioned_symbols!(found, arg), node.args)
+    found
+end
+_mentioned_symbols!(found::Set{Symbol}, node) = found
 
 _has_plate_programs(node) = node isa _PlateProgram ||
     node isa Expr && node.head !== :quote && any(_has_plate_programs, node.args)
@@ -5646,20 +5818,25 @@ function _plate_inferred_input_types(p::Plan; exemplar_types = nothing,
     for recipe in p.recipes
         recipe.id in needed || continue
         inputs = Any[get(types, canon_id(g, v.id), Any) for v in recipe.inputs]
-        for (v, output_type) in zip(recipe.outputs,
-                                    _recipe_inferred_output_types(recipe, inputs))
+        # Infer a preceding plate through the same cell/body and allocation
+        # analysis as the native type audit. Its semantic fallback call is not
+        # the emitted program, and discarding the result type would hide scalar
+        # reads from that array (such as a mixture's shared scale aliases).
+        outputs = if recipe.op isa _AuthoredPlateOp && all(_concrete_value_type, inputs)
+            T = _checked_recipe_type!(_UninferredValue[], recipe.op, inputs, Symbol[])
+            _recipe_output_types(recipe, something(T, Any))
+        else
+            _recipe_inferred_output_types(recipe, inputs)
+        end
+        for (v, output_type) in zip(recipe.outputs, outputs)
             declared = valtype(v)
-            # The parent lowering enforces concretely declared locals. Keep
-            # that fact when inference of an earlier source closure is weaker;
-            # otherwise a later unannotated scalar such as `1 - omega` loses
-            # its Number proof even though `omega::Float64` is authoritative.
-            types[canon_id(g, v.id)] = if exemplar_types === nothing
-                _concrete_value_type(declared) &&
-                    !(recipe.op isa _BoundConstant) ? declared : output_type
-            else
+            # Typed locals can convert a producer's result. Keep a narrower
+            # inferred type only when it already satisfies the declaration;
+            # this also covers abstract array declarations. Bound constants
+            # retain their actual type, as they do in the parent lowering.
+            types[canon_id(g, v.id)] =
                 declared !== Any && !(recipe.op isa _BoundConstant) &&
                     !(output_type <: declared) ? declared : output_type
-            end
         end
     end
     types
@@ -5944,10 +6121,11 @@ function _lower_with_ops_collecting(p::Plan;
 
         if inline_embedded && r.op isa _AuthoredPlateOp
             callvalues = r.inputs
-            # Shared-branch arm slots use source-inferred scalar inputs;
-            # exemplars add rank evidence only. A nested cell's lowering
-            # (`type_hints`) infers them from the enclosing plate's operand
-            # types (`cell_have_types`), so a branch condition reading a
+            # The emitted body and its operation table are built together,
+            # so shared branches can use the exact HAVE types promised by
+            # exemplar preparation as well as declared input types. A nested
+            # cell's lowering (`type_hints`) infers them from its enclosing
+            # plate's operand types (`cell_have_types`), so a branch condition reading a
             # number the cell received is decided once per nested call.
             branch = any(q -> _plate_branch_operation(q.op),
                          r.op.kernel.plan.recipes)
@@ -5961,8 +6139,7 @@ function _lower_with_ops_collecting(p::Plan;
                         (inferred_exemplar_types =
                             _plate_inferred_input_types(p; exemplar_types))
                 end
-                scalars = branch ? inferred_plate_types :
-                    something(inferred_exemplar_types, inferred_plate_types)
+                scalars = something(inferred_exemplar_types, inferred_plate_types)
                 callvalues = _plate_inferred_values(g, r.inputs, scalars;
                     rank_types = inferred_exemplar_types)
             end
@@ -6347,6 +6524,9 @@ function _lower_with_ops_collecting(p::Plan;
     # Compose before index runs duplicate a cell body into grouped/flat arms;
     # otherwise those mutually exclusive definitions appear to escape here.
     inline_embedded && (body = _lower_cell_arrays_native(body, runtime_recipes))
+    # Shared factors and terms leave a summed plate's sum (summed_plate_factors.jl)
+    # before index runs group the cells that remain.
+    inline_embedded && (body = _lower_summed_plate_factors_native(body, runtime_ops))
     inline_embedded && (body = _lower_index_runs_native(body, runtime_ops))
     # A partition with a plan port reads its integer bookkeeping from the
     # port's value, computed once per label; in plan mode the body computes
@@ -6812,12 +6992,18 @@ function _replicated_parts(p::Plan, analysis)
        residual = _partial_subplan(p, vcat(mapped_have, constants), p.want, residual))
 end
 
-# Lower one part as `prepare` lowers a scalar kernel. Every output is declared,
-# as the position driver always did.
-_replicated_part_ast(part::Plan; recycle = Pair{ValueId,Symbol}[],
-                     cell_slots = nothing, cell_tables = nothing) =
-    _lower_with_ops(_lowering_plan(part); declare = true, recycle, cell_slots,
-                    cell_tables)
+# Lower one part as `prepare` lowers a scalar kernel, stable rewrites included
+# (`stable_rewrites.jl`). Every output is declared, as the position driver
+# always did. The pass reads one part at a time: a residual statement reads a
+# prefix value as the input it is, so a composition across the two parts
+# (`log(s)` per position of a shared `s = exp(a)`) is computed as written.
+function _replicated_part_ast(part::Plan; recycle = Pair{ValueId,Symbol}[],
+                              cell_slots = nothing, cell_tables = nothing)
+    ast, constants, callables, recipes = _lower_with_ops(_lowering_plan(part);
+        declare = true, recycle, cell_slots, cell_tables)
+    _simplify() && (ast = _stable_rewrites(ast, recipes))
+    ast, constants, callables, recipes
+end
 
 # A bound constant keeps its exact value type (a bound view stays a view).
 function _replicated_declares(p::Plan, value::Value)
@@ -7106,15 +7292,15 @@ function lower_batched(p::Plan; batched, reduce = :+)
         prepared_arguments[cid] = gensym(Symbol(:plate_prepared_, value.name))
     end
 
-    # `_broadcast_getindex` implements Julia's scalar, Ref, and singleton
-    # projection at the current Cartesian coordinate.
-    function argref(input)
-        cid = canon_id(g, input.id)
-        haskey(prepared_arguments, cid) || return nm(input)
-        Expr(:call, GlobalRef(Base.Broadcast, :_broadcast_getindex),
-             prepared_arguments[cid], index)
+    # Recipe `k`'s statement over `args`: its authored source, as `lower` emits
+    # it (`inline_sources.jl`), else its call or constant through the tables.
+    function callexpr(k, r, args = Any[nm(input) for input in r.inputs])
+        if _inline_sources_enabled()
+            inlined = _inline_source_form(r, args, k)
+            inlined === nothing || return inlined[1]
+        end
+        _slot_call_expr(r, k, args)
     end
-    callexpr(k, r) = _slot_call_expr(r, k, (argref(inp) for inp in r.inputs))
 
     argexprs = Any[_CONSTANTS_ARG, _CALLABLES_ARG]
     for v in p.have
@@ -7153,8 +7339,16 @@ function lower_batched(p::Plan; batched, reduce = :+)
         push!(body.args, Expr(:(=), nm(out), callexpr(k, r)))
     end
 
+    # The batch-dependent recipes, grouped by the batched ports they depend on:
+    # one group recomputes under one condition, its recipes in plan order, its
+    # batched ports read once at the current coordinate. A recipe depends on
+    # the ports of each recipe it reads, so ordering the groups by their number
+    # of ports keeps every producer ahead of its consumers. Within a group a
+    # recipe's statement follows its producers' in one block, where the stable
+    # rewrites can read them (`stable_rewrites.jl`).
     loopbody = Expr(:block)
     loop_assigned = copy(assigned)
+    groups = Dict{Set{ValueId},Vector{Int}}()
     for (k, r) in enumerate(p.recipes)
         roots = analysis.recipe_dependencies[k]
         isempty(roots) && continue
@@ -7163,13 +7357,38 @@ function lower_batched(p::Plan; batched, reduce = :+)
         cid in loop_assigned && continue
         push!(loop_assigned, cid)
         push!(body.args, Expr(:local, Expr(:(::), nm(out), valtype(out))))
+        push!(get!(() -> Int[], groups, roots), k)
+    end
+    for (roots, members) in sort!(collect(groups);
+                                  by = group -> (length(first(group)), first(last(group))))
+        block = Expr(:block)
+        reads = Dict{ValueId,Symbol}()
+        for k in members
+            r = p.recipes[k]
+            args = Any[]
+            for input in r.inputs
+                cid = canon_id(g, input.id)
+                if haskey(prepared_arguments, cid)
+                    # `_broadcast_getindex` implements Julia's scalar, Ref, and
+                    # singleton projection at the current Cartesian coordinate.
+                    push!(args, get!(reads, cid) do
+                        element = gensym(Symbol(:plate_element_, input.name))
+                        push!(block.args, Expr(:(=), element,
+                            Expr(:call, GlobalRef(Base.Broadcast, :_broadcast_getindex),
+                                 prepared_arguments[cid], index)))
+                        element
+                    end)
+                else
+                    push!(args, nm(input))
+                end
+            end
+            push!(block.args, Expr(:(=), nm(only(r.outputs)), callexpr(k, r, args)))
+        end
         changed = foldl((left, right) -> Expr(:||, left, right),
             (Expr(:call, GlobalRef(@__MODULE__, :_plate_dependency_changed),
                   index, previous, prepared_arguments[root])
              for root in sort!(collect(roots); by = root -> have_rank[root])))
-        condition = Expr(:||, first_coordinate, changed)
-        push!(loopbody.args,
-              Expr(:if, condition, Expr(:(=), nm(out), callexpr(k, r))))
+        push!(loopbody.args, Expr(:if, Expr(:||, first_coordinate, changed), block))
     end
 
     want = analysis.want
@@ -8840,23 +9059,28 @@ Base.@nospecializeinfer function _prepare(p::Plan, ast::Expr,
 end
 
 """
-    _prepare_batched(p::Plan; batched, reduce = :+) -> PreparedKernel
+    _prepare_batched(p::Plan; batched, reduce = :+, simplify = nothing) -> PreparedKernel
 
 Internal constructor for public plate authoring. It compiles the
-allocation-free native loop.
+allocation-free native loop, with the stable rewrites (`stable_rewrites.jl`)
+unless `simplify = false` or the project preference turns them off.
 """
-function _prepare_batched(p::Plan; batched, reduce = :+)
+function _prepare_batched(p::Plan; batched, reduce = :+, simplify = nothing)
     batched_names = Set{Symbol}(batched isa Symbol ? (batched,) : batched)
     input_index = findfirst(v -> v.name in batched_names, p.have)
     input_index === nothing && throw(ArgumentError(
         "lower_batched: none of the have ports are batched (batched = $(sort(collect(batched_names))))"))
 
     native_ast = lower_batched(p; batched = batched, reduce = reduce)
+    recipes = Tuple(p.recipes)
+    _with_simplify(simplify) do
+        _simplify() && (native_ast = _stable_rewrites(native_ast, recipes; hoisted = true))
+    end
     native = compile(native_ast)
     constants, callables = _lowering_tables(Any[r.op for r in p.recipes])
     callables = _native_table(native_ast, callables)
     _prepared_kernel(_ArrayFunction(native), constants, callables, Tuple(p.have),
-                     Tuple(p.want), p, native_ast, Tuple(p.recipes))
+                     Tuple(p.want), p, native_ast, recipes)
 end
 
 # The optional MutatingFunctions extension uses one typed cache cell per
@@ -9022,8 +9246,8 @@ the program. A graph prepared with exemplars is compiled afresh.
 Preparation computes numerically fragile compositions in their stable form
 (`simplify = true`, the default): `log(exp(u))` as `u`, `log(logistic(x))` as
 `loglogistic(x)`, `log(1 + x)` as `log1p(x)`, `y / exp(u)` as `y * exp(-u)`,
-`log(exp(a) + exp(b))` as a log-sum-exp, and the rest of the table on the
-compiler page ("Stable rewrites"). The literal composition is finite only where
+`log(exp(a) + exp(b))` as a log-sum-exp, and the rest of the rule table in
+`src/stable_rewrites.jl`. The literal composition is finite only where
 its intermediate is representable, and its ordinary reverse forms `0 * Inf` at
 the edges; the stable form agrees with it to within rounding wherever it is
 finite and stays finite, with a finite derivative, beyond. Errors, lazy branches
@@ -9034,6 +9258,21 @@ function. `simplify = false` compiles the literal arithmetic; `nothing` takes
 the setting of an enclosing preparation, else the project's ReactiveKernels
 preference `simplify` (`Preferences.set_preferences!(ReactiveKernels,
 "simplify" => false)`), else `true`. Cached preparations are kept per setting.
+The same setting governs [`prepare_nonallocating`](@ref), [`plate`](@ref) over
+a scalar spec, [`vectorize`](@ref) and [`prepare_reactive`](@ref), which take
+`simplify` too, and [`jax_source`](@ref), which reads the enclosing setting or
+the preference.
+
+The same setting takes shared work out of a summed plate. When a cell's value
+is `a + c * t`, with `a` and `c` reading only values its cells share, the cells
+sum `t` alone and the plate adds `n * a + c * sum(t)` once: a Normal
+observation plate with one scale sums its squared residuals and divides by the
+scale once, and its ordinary reverse no longer accumulates the scale's
+derivative cell by cell. A law's guard on a shared value (`scale == 0` before
+a cell's own test) is decided once per call. The plate's own loop runs instead
+whenever such a guard holds, a shared factor is not a normal number, or the
+factored sum is not finite, so every finite value and its derivatives agree
+with the plate's own to rounding.
 
 Selected authored plates with a single plate consumer are composed during
 lowering, eliminating the intermediate array. Named ports remain in `p`: asking

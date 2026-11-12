@@ -326,6 +326,133 @@ end
     @test !isapprox(literal([20.0], [false]), direct([20.0], [false]); rtol = 1e-12)
 end
 
+# The other preparations that compile their own programs: a compiled reactive
+# state, `plate(spec; batched)` and position batching (`vectorize`). Each
+# computes the stable form `prepare` computes and keeps the literal under
+# `simplify = false` (todo `1vfxr65`).
+@kernel stable_one_statement(u::Float64) = begin
+    out::Float64 = log1pexp(-log(exp(u)))
+end
+
+const _EDGES = (-800.0, 710.0, 800.0)
+_edge_value(u) = log1p(exp(-big(u)))
+_edge_derivative(u) = -1 / (1 + exp(big(u)))
+
+# The reactive getter of `want` at `u`, and its derivative in `u`.
+function _reactive_value(program, want, u)
+    state = program(u)
+    get!(state, statevalue(program, want))
+end
+_reactive_derivative(program, want, u) = Enzyme.autodiff(Enzyme.Reverse,
+    Enzyme.Const(x -> _reactive_value(program, want, x)), Enzyme.Active,
+    Enzyme.Active(u))[1][1]
+
+@testset "a compiled reactive state rewrites each recipe's own source" begin
+    program = prepare_reactive(stable_one_statement)
+    literal = prepare_reactive(stable_one_statement; simplify = false)
+    out = stable_one_statement.out
+    for u in _EDGES
+        @test _close(_reactive_value(program, out, u), _edge_value(u))
+        @test _close(_reactive_derivative(program, out, u), _edge_derivative(u))
+        @test _reactive_value(program, out, u) == prepare(stable_one_statement)(u)
+    end
+    @test _reactive_value(literal, out, -800.0) == Inf
+    @test isnan(_reactive_derivative(literal, out, 800.0))
+    # The getters call the recipe through the table either way; the table
+    # holds the rewritten source.
+    getter(p) = p.getters[RK._slot_index(statevalue(p, out))]
+    @test getter(program).ast == getter(literal).ast
+    @test only(getter(program).callables) isa RK._StableRecipeOp
+    @test !(only(getter(literal).callables) isa RK._StableRecipeOp)
+    # Every value of a reactive state is a slot `freeze!` can set, so a
+    # composition across two values is computed as written: `r = log(s)` reads
+    # `s`'s slot.
+    roundtrip = prepare_reactive(stable_roundtrip)
+    state = roundtrip(800.0)
+    @test get!(state, statevalue(roundtrip, stable_roundtrip.r)) == Inf
+    freeze!(state, statevalue(roundtrip, stable_roundtrip.s), 2.0)
+    @test get!(state, statevalue(roundtrip, stable_roundtrip.r)) == log(2.0)
+    @test all(op -> !(op isa RK._StableRecipeOp),
+              first(roundtrip.getters).callables)
+end
+
+# `plate(spec; batched)` reduces into a value of the want's declared type.
+@kernel stable_batched_chain(u::Float64, c::Float64) = begin
+    s::Float64 = exp(u)
+    r::Float64 = log(s)
+    out::Float64 = log1pexp(-r) + c
+end
+@kernel stable_batched_scale(y::Float64, u::Float64) = begin
+    sigma::Float64 = exp(u)
+    log_sigma::Float64 = log(sigma)
+    lp::Float64 = -log_sigma - (y / sigma)^2 / 2
+end
+
+# The statements of `k`'s program before its loop, and the loop's body.
+function _around_loop(k)
+    body = code_expr(k).args[2].args
+    at = findfirst(s -> s isa Expr && s.head === :for, body)
+    body[1:(at - 1)], body[at].args[2]
+end
+
+@testset "plate(spec; batched): the stable forms, hoisted values still hoisted" begin
+    k = plate(stable_batched_chain; have = (:u, :c), want = :out, batched = :u)
+    literal = plate(stable_batched_chain; have = (:u, :c), want = :out, batched = :u,
+                    simplify = false)
+    collected = plate(stable_batched_chain; have = (:u, :c), want = :out, batched = :u,
+                      reduce = nothing)
+    us = collect(_EDGES)
+    @test all(_close.(collected(us, 0.0), _edge_value.(us)))
+    @test _close(k(us, 0.0), sum(_edge_value, us))
+    du = zero(us)
+    Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(k), Enzyme.Active,
+                    Enzyme.Duplicated(copy(us), du), Enzyme.Const(0.0))
+    @test all(_close.(du, _edge_derivative.(us)))
+    @test literal([-800.0], 0.0) == Inf
+    @test occursin("_rk_log_of", _code(k)) && !occursin("_rk_", _code(literal))
+    for u in (-30.0, -1.0, 0.0, 3.0, 40.0)
+        @test k([u, u + 1], 0.5) ≈ literal([u, u + 1], 0.5) rtol = 1e-14
+    end
+    # A shared scale is computed once, above the loop. A composition inside
+    # that region is rewritten; one the loop reads per element keeps reading
+    # the hoisted value, so no exponential runs per element.
+    k = plate(stable_batched_scale; have = (:y, :u), want = :lp, batched = :y)
+    literal = plate(stable_batched_scale; have = (:y, :u), want = :lp, batched = :y,
+                    simplify = false)
+    before, loop = _around_loop(k)
+    @test occursin("_rk_log_of", string(before))
+    @test occursin("_native_exp", string(before))
+    @test !occursin("exp", string(loop)) && !occursin("_rk_", string(loop))
+    ys = [0.3, -1.2, 2.0]
+    @test _close(k(ys, 800.0), -3 * big(800.0))
+    @test literal(ys, 800.0) == -Inf
+    @test k(ys, 0.7) ≈ literal(ys, 0.7) rtol = 1e-14
+end
+
+@testset "vectorize: each part of the position driver" begin
+    scalar = prepare(stable_roundtrip)
+    v = vectorize(scalar; batched = :u)
+    literal = vectorize(scalar; batched = :u, simplify = false)
+    us = collect(_EDGES)
+    @test v isa RK.GraphReplicatedKernel
+    @test all(_close.(v(us), _edge_value.(us)))
+    du = zero(us)
+    Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(x -> sum(v(x))), Enzyme.Active,
+                    Enzyme.Duplicated(copy(us), du))
+    @test all(_close.(du, _edge_derivative.(us)))
+    @test v(us) == map(scalar, us)
+    @test occursin("_rk_log_of", _code(v)) && !occursin("_rk_", _code(literal))
+    @test literal([-800.0]) == [Inf]
+    # The setting reaches `prepare_batched`'s scalar kernel and driver alike.
+    @test prepare_batched(stable_roundtrip; batched = :u, simplify = false)([-800.0]) ==
+          [Inf]
+    # A shared scale: the prefix computes it once and its own `log` stably; the
+    # per-position residual reads the hoisted value.
+    s = vectorize(prepare(stable_batched_scale); batched = :y)
+    ys = [0.3, -1.2, 2.0]
+    @test all(_close.(s(ys, 800.0), -big(800.0)))
+end
+
 @kernel stable_guarded(x::Float64) = begin
     out = x > 0 ? log(exp(sqrt(x))) : 0.0
     return out

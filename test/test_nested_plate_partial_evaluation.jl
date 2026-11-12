@@ -33,7 +33,14 @@ function oracle(groups, cuts, x)
     total, slope
 end
 
+# A summed plate's loop has a direct-read copy taken when its arrays span the
+# plate (`ReactiveKernels._plate_direct_read_loop`); it is the same loop, so
+# only the loop it copies is counted.
+_spans_check(c) = c isa Expr && (c.head === :&& ? _spans_check(c.args[1]) :
+    c.head === :call && c.args[1] == GlobalRef(ReactiveKernels, :_plate_spans_axis))
 head_count(ex, head) = ex isa ReactiveKernels._PlateProgram ? head_count(ex.ast, head) :
+    ex isa Expr && ex.head === :if && length(ex.args) == 3 && _spans_check(ex.args[1]) ?
+    head_count(ex.args[3], head) :
     ex isa Expr ?
     (ex.head === head) + sum(arg -> head_count(arg, head), ex.args; init=0) : 0
 scalar_caches(kernel) = [r.op.value for r in kernel.plan.recipes
